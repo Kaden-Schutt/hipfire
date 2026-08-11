@@ -36,16 +36,55 @@ which is the AR-only bring-up baseline for the same arch.
 temp 0 is the required contract, not a bonus: acceptance is greedy-argmax, so
 divergence would be a correctness bug rather than an acceptance-rate matter.
 
-## Cross-architecture: DFlash wins on all three
+## Cross-architecture: DFlash wins on all three, both artifacts
 
-Same MQ4 target, same drafter, same prompt, 64 tokens greedy, 3 fresh processes
-per arm. tau 8.333 and byte-identical output on every arch:
+3 fresh processes per arm, 64 tokens greedy, byte-identical to AR at temp 0
+everywhere. The default artifact is the deliverable-compliant one (Q8 lm_head).
 
-| GPU | AR (3 runs) | DFlash (3 runs) | median AR | median DFlash | ratio |
-|---|---|---|---:|---:|---:|
-| gfx1201 (R9700, hiptrx) | 33.02 · 33.01 · 32.97 | 41.26 · 41.26 · 41.26 | 33.01 | 41.26 | **1.25x** |
-| gfx1100 (hipx) | 39.93 · 39.85 · 39.88 | 49.38 · 49.04 · 48.93 | 39.88 | 49.04 | **1.23x** |
-| gfx1151 (Strix Halo, hipx) | 13.85 · 13.81 · 13.70 | 16.40 · 16.48 · 16.72 | 13.81 | 16.48 | **1.19x** |
+**Default artifact** (`muse-glimmer-30b-default.mq4`, Q8 lm_head, tau 4.200):
+
+| GPU | AR median | DFlash median | ratio |
+|---|---:|---:|---:|
+| gfx1201 (R9700) | 31.78 | 65.17 | **2.05x** |
+| gfx1100 | 38.58 | 64.52 | **1.67x** |
+| gfx1151 (Strix Halo) | 13.24 | 27.29 | **2.06x** |
+
+**MQ4-lm_head artifact** (`muse-glimmer-30b.mq4`, tau 8.333):
+
+| GPU | AR median | DFlash median | ratio |
+|---|---:|---:|---:|
+| gfx1201 | 32.92 | 74.07 | **2.25x** |
+| gfx1100 | 40.33 | 80.91 | **2.01x** |
+
+### Batching, twice: the target AND the drafter
+
+The same mistake had to be fixed on both sides, and each time the symptom was a
+good tau buying nothing.
+
+| stage | gfx1201 DFlash | vs AR | tau |
+|---|---:|---:|---:|
+| verify = B sequential forwards | 12.0 | 0.36x | 8.333 |
+| verify batched, drafter per-row | 41.3 | 1.25x | 8.333 |
+| both batched | 74.1 | 2.25x | 8.333 |
+
+Tau never moved. All three rows are the same drafter making the same proposals;
+only the cost of servicing them changed.
+
+The second round is the more instructive one. After the target's verify was
+batched, profiling appeared to show a 69 ms `draft_lm` against a 7.0 ms verify
+`lm` — the same weight through the same routine, 10x apart. That looked like a
+kernel-dispatch bug and was nearly written up as one. It was a measurement error:
+GPU work is asynchronous, the `drafter` phase timer only captured kernel
+LAUNCHES, and `draft_lm` ends in a `download_f32` which is the window's first
+synchronisation point, so it absorbed all of the drafter's real execution.
+
+The actual cost was the drafter issuing 700+ per-row `weight_gemv` calls per
+window (ctx+block rows x 5 layers x each projection). A 5-layer draft head was
+moving more bytes per window than the entire 52-layer 30B target.
+
+**Never trust an unsynchronised phase timer.** Two separate wrong diagnoses in
+this file came from measurement error rather than from the code: this one, and
+the stale-build reading below.
 
 ### Correction: an earlier gfx1100 reading of 0.29x was a stale build
 
