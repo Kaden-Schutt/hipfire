@@ -30,8 +30,8 @@
 use crate::config::{GlimmerConfig, GlimmerLayerType};
 use crate::glimmer::{GLIMMER_MAX_SPEC_BLOCK, GlimmerState, GlimmerWeights};
 use hipfire_runtime::llama::{
-    fused_rmsnorm_rotate_for_mq, rotate_x_mq_batched_for, weight_gemv,
-    weight_gemv_prerotated, EmbeddingFormat, WeightTensor,
+    fused_rmsnorm_rotate_for_mq, fused_rmsnorm_rotate_mq_batched_for,
+    rotate_x_mq_batched_for, weight_gemv, weight_gemv_prerotated, EmbeddingFormat, WeightTensor,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -841,10 +841,16 @@ pub fn verify_block_with_capture(
         let need_shared = shared_rot_enabled()
             && hipfire_dispatch::types::dtype_rotation_plan(lw.q_proj.gpu_dtype) != hipfire_dispatch::types::RotationPlan::None;
         if need_shared {
-            // One rmsnorm + one rotate for the four projections sharing the same input.
-            gpu.rmsnorm_batched(&x, &lw.input_layernorm, &nrm, b, dim, rms_eps).map_err(|e| format!("glimmer batch L{layer_idx} input rmsnorm: {e:?}"))?;
-            rotate_x_mq_batched_for(gpu, &lw.q_proj, &nrm, &x_rot, dim, b).map_err(|e| format!("glimmer batch L{layer_idx} input rotate: {e:?}"))?;
-            // Prerotated GEMMs share x_rot (no re-rotation). Q8 would use nrm directly.
+            // Fused rmsnorm+FWHT: one launch writes x_rot directly from x, saving the
+            // separate rmsnorm_batched + rotate_x_mq_batched pair (104 launches per
+            // window). Byte-identical to the two-step sequence. Uses the batched
+            // fused helper which handles AWQ sidecars internally.
+            fused_rmsnorm_rotate_mq_batched_for(
+                gpu, &x, &lw.input_layernorm, &lw.q_proj, &x_rot, dim, rms_eps, b,
+            )
+            .map_err(|e| format!("glimmer batch L{layer_idx} fused input rmsnorm+rotate: {e:?}"))?;
+            // Prerotated GEMMs share x_rot (no re-rotation). Q8 would use nrm directly
+            // but this branch is only taken for rotating dtypes (MQ), so Q8 not present.
             proj_gemm_batched_prerotated(gpu, &lw.q_proj, &nrm, &x_rot, &q, b, "q_proj")?;
             proj_gemm_batched_prerotated(gpu, &lw.k_proj, &nrm, &x_rot, &k, b, "k_proj")?;
             proj_gemm_batched_prerotated(gpu, &lw.v_proj, &nrm, &x_rot, &v, b, "v_proj")?;
@@ -916,8 +922,10 @@ pub fn verify_block_with_capture(
         let ffn_shared = shared_rot_enabled()
             && hipfire_dispatch::types::dtype_rotation_plan(lw.gate_proj.gpu_dtype) != hipfire_dispatch::types::RotationPlan::None;
         if ffn_shared {
-            gpu.rmsnorm_batched(&x, &lw.pre_feedforward_layernorm, &nrm, b, dim, rms_eps).map_err(|e| format!("glimmer batch L{layer_idx} pre_ffn rmsnorm: {e:?}"))?;
-            rotate_x_mq_batched_for(gpu, &lw.gate_proj, &nrm, &x_rot, dim, b).map_err(|e| format!("glimmer batch L{layer_idx} pre_ffn rotate: {e:?}"))?;
+            fused_rmsnorm_rotate_mq_batched_for(
+                gpu, &x, &lw.pre_feedforward_layernorm, &lw.gate_proj, &x_rot, dim, rms_eps, b,
+            )
+            .map_err(|e| format!("glimmer batch L{layer_idx} fused pre_ffn rmsnorm+rotate: {e:?}"))?;
             proj_gemm_batched_prerotated(gpu, &lw.gate_proj, &nrm, &x_rot, &gate_ffn, b, "gate_proj")?;
             proj_gemm_batched_prerotated(gpu, &lw.up_proj, &nrm, &x_rot, &up_ffn, b, "up_proj")?;
         } else {
