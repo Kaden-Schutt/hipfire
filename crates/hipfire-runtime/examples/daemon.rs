@@ -29123,6 +29123,14 @@ fn generate_muse_glimmer(
         // (covers vocab-registered specials) plus a single-id encode probe
         // for tokenizers that expose the string via encode.
         for candidate in [
+            // Muse Glimmer's own turn boundaries. `eos_token` in
+            // tokenizer_config is `<|end_of_text|>` (200001), but the model
+            // ends a TURN with `<|eom|>` (200007) — observed emitting it and
+            // then looping because it was not a stop. `<|eot|>` (200008) is the
+            // sibling. Both must stop, or decode runs to max_tokens.
+            "<|eom|>",
+            "<|eot|>",
+            "<|end_of_text|>",
             "<end_of_turn>",
             "<|end_of_turn|>",
             "<|im_end|>",
