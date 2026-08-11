@@ -29509,44 +29509,23 @@ fn generate_muse_glimmer(
             }
             // Real drafts: run TARGET lm_head over drafter hidden rows 1..B-1.
             // The drafter has no lm_head; this is the contract at qwen speculative.rs:3184.
-            // For ctx we still pass a single zero row (hidden capture TODO) — tau will be honest
-            // but low until the 5-layer concat is wired; the important thing is that
-            // weight-perturbation in the drafter now changes drafts and trips the
-            // byte-identical check (HIPFIRE_GLIMMER_SPEC_PERTURB).
-            let mut drafts: Vec<u32> = Vec::with_capacity(block_size - 1);
-            for i in 1..block_size {
-                let hidden_row = drafter.scratch.x.sub_offset(i * hidden, hidden);
-                // Reuse bundle.state.tmp/logits as scratch for lm_head
-                // Need a GpuTensor for logits — use bundle.state.logits (vocab) as temp
-                // weight_gemv does: logits = lm_head * hidden_row
-                // Use a temporary logits buffer: we need per-row logits, so allocate a small host vec
-                // For simplicity, do per-row weight_gemv + download + argmax (B-1 times)
-                // This is the same per-row fallback at speculative.rs:3445 when batched GEMM not available
-                if let Err(e) = hipfire_runtime::llama::weight_gemv(gpu, &bundle.weights.lm_head, &hidden_row, &bundle.state.logits) {
-                    emit_error_with_id(stdout, id, format!("glimmer drafter lm_head row {i}: {e}"));
+            // Use the shared lm_head routine so draft and verify cannot diverge
+            // on near-ties (Q8 batched vs per-row flips halved tau on Q8-head).
+            let all_picks = match hipfire_arch_muse_glimmer::forward::glimmer_lm_head_picks(
+                gpu,
+                &bundle.config,
+                &bundle.weights,
+                &drafter.scratch.x,
+                block_size,
+                &bundle.state.logits,
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    emit_error_with_id(stdout, id, format!("glimmer drafter lm_head: {e}"));
                     return;
                 }
-                // Scale + softcap exactly as verify does (forward.rs:139-147) — must match for byte-identical
-                if bundle.config.output_multiplier != 1.0 {
-                    if let Err(e) = gpu.scale_f32(&bundle.state.logits, bundle.config.output_multiplier) {
-                        emit_error_with_id(stdout, id, format!("drafter outmul row {i}: {e:?}"));
-                        return;
-                    }
-                }
-                if bundle.config.final_logit_softcapping > 0.0 {
-                    if let Err(e) = gpu.logit_softcap_f32(&bundle.state.logits, bundle.config.vocab_size, bundle.config.final_logit_softcapping) {
-                        emit_error_with_id(stdout, id, format!("drafter softcap row {i}: {e:?}"));
-                        return;
-                    }
-                }
-                let logits = match gpu.download_f32(&bundle.state.logits) {
-                    Ok(v) => v,
-                    Err(e) => { emit_error_with_id(stdout, id, format!("drafter download row {i}: {e:?}")); return; }
-                };
-                let mut best = 0u32; let mut bestv = f32::NEG_INFINITY;
-                for (idx, &v) in logits.iter().enumerate() { if v > bestv { bestv = v; best = idx as u32; } }
-                drafts.push(best);
-            }
+            };
+            let mut drafts: Vec<u32> = all_picks[1..].to_vec();
             total_proposed += drafts.len();
             // Log first draft for visibility
             if windows < 2 {

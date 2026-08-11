@@ -42,6 +42,13 @@ fn shared_rot_enabled() -> bool {
     std::env::var("HIPFIRE_GLIMMER_SHARED_ROT").as_deref() != Ok("0")
 }
 
+fn batched_lm_head_enabled() -> bool {
+    !matches!(
+        std::env::var("HIPFIRE_GLIMMER_BATCHED_LM_HEAD").ok().as_deref(),
+        Some("0") | Some("off") | Some("false")
+    )
+}
+
 // ───────────────────────────── Decode ─────────────────────────────
 
 /// Decode one token; returns the full logits vector.
@@ -598,6 +605,88 @@ fn proj_gemm_batched_prerotated(
         }
     }
 }
+/// Shared lm_head routine for draft and verify. `hidden_batch` is [B*hidden]
+/// already RMSNormed (the lm_head input). Returns argmax picks for rows
+/// [0..batch) in order. Uses batched Q8 path when enabled and dtype is
+/// Q8_0 (`gemm_q8_0_batched_chunked` + per-row scale/softcap), otherwise
+/// per-row `weight_gemv` fallback (explicit, no approximation). This is the
+/// single source of truth for draft and verify so they cannot diverge on
+/// near-ties due to different accumulation order (the Q8 vs per-row flip that
+/// halved tau on the Q8-head artifact).
+pub fn glimmer_lm_head_picks(
+    gpu: &mut Gpu,
+    cfg: &GlimmerConfig,
+    weights: &GlimmerWeights,
+    hidden_batch: &GpuTensor,
+    batch: usize,
+    logits_scratch: &GpuTensor,
+) -> Result<Vec<u32>, String> {
+    let dim = cfg.dim;
+    let vocab = cfg.vocab_size;
+    let is_q8_lm = weights.lm_head.gpu_dtype == DType::Q8_0 && batched_lm_head_enabled();
+    let mut picks = Vec::with_capacity(batch);
+    if is_q8_lm {
+        // Batched Q8: one GEMM reads lm_head once for all B rows (WMMA on gfx12).
+        // Fallback to per-row if batched disabled via HIPFIRE_GLIMMER_BATCHED_LM_HEAD=0.
+        let logits_b = gpu
+            .alloc_tensor(&[batch * vocab], DType::F32)
+            .map_err(|e| format!("glimmer lm_head_picks alloc logits_b: {e:?}"))?;
+        gpu.gemm_q8_0_batched_chunked(&weights.lm_head.buf, hidden_batch, &logits_b, vocab, dim, batch)
+            .map_err(|e| format!("glimmer lm_head_picks q8 batched: {e:?}"))?;
+        for i in 0..batch {
+            let row = logits_b.sub_offset(i * vocab, vocab);
+            if cfg.output_multiplier != 1.0 && !abl("HIPFIRE_GLIMMER_NO_OUTMUL") {
+                gpu.scale_f32(&row, cfg.output_multiplier)
+                    .map_err(|e| format!("glimmer lm_head_picks scale row {i}: {e:?}"))?;
+            }
+            if cfg.final_logit_softcapping > 0.0 && !abl("HIPFIRE_GLIMMER_NO_SOFTCAP") {
+                gpu.logit_softcap_f32(&row, vocab, cfg.final_logit_softcapping)
+                    .map_err(|e| format!("glimmer lm_head_picks softcap row {i}: {e:?}"))?;
+            }
+            gpu.hip
+                .memcpy_dtod_at(&logits_scratch.buf, 0, &row.buf, 0, vocab * 4)
+                .map_err(|e| format!("glimmer lm_head_picks copy row {i}: {e:?}"))?;
+            let host = gpu
+                .download_f32(logits_scratch)
+                .map_err(|e| format!("glimmer lm_head_picks download row {i}: {e:?}"))?;
+            let pick = host
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .map(|(idx, _)| idx as u32)
+                .unwrap();
+            picks.push(pick);
+        }
+        gpu.free_tensor(logits_b).ok();
+    } else {
+        // MQ4 and disabled-Q8: per-row weight_gemv (re-streams lm_head B times).
+        // Explicit fallback - same as draft side, so near-tie argmax cannot flip.
+        for i in 0..batch {
+            let hidden_row = hidden_batch.sub_offset(i * dim, dim);
+            weight_gemv(gpu, &weights.lm_head, &hidden_row, logits_scratch)
+                .map_err(|e| format!("glimmer lm_head_picks row {i}: {e}"))?;
+            if cfg.output_multiplier != 1.0 && !abl("HIPFIRE_GLIMMER_NO_OUTMUL") {
+                gpu.scale_f32(logits_scratch, cfg.output_multiplier)
+                    .map_err(|e| format!("glimmer lm_head_picks scale row {i}: {e:?}"))?;
+            }
+            if cfg.final_logit_softcapping > 0.0 && !abl("HIPFIRE_GLIMMER_NO_SOFTCAP") {
+                gpu.logit_softcap_f32(logits_scratch, vocab, cfg.final_logit_softcapping)
+                    .map_err(|e| format!("glimmer lm_head_picks softcap row {i}: {e:?}"))?;
+            }
+            let host = gpu
+                .download_f32(logits_scratch)
+                .map_err(|e| format!("glimmer lm_head_picks download row {i}: {e:?}"))?;
+            let pick = host
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .map(|(idx, _)| idx as u32)
+                .unwrap();
+            picks.push(pick);
+        }
+    }
+    Ok(picks)
+}
 
 // ─── Batched verify core ─────────────────────────────────────────────
 
@@ -852,58 +941,11 @@ pub fn verify_block_with_capture(
     }
     state.n_tokens = seq_len;
 
-    // ── Final norm + lm_head per position → picks ──
+    // ── Final norm + lm_head per position → picks (shared with draft) ──
     let normed = alloc(gpu, b * dim, "normed")?;
     gpu.rmsnorm_batched(&x, &weights.final_norm, &normed, b, dim, rms_eps).map_err(|e| format!("glimmer batch final rmsnorm: {e:?}"))?;
 
-    let mut picks = Vec::with_capacity(b);
-    // lm_head: vocab 202048 MQ4G256 → batched MQ4 path faults at this width on gfx12 (illegal access),
-    // same as gemma4's deliberate per-row fallback for MQ4 lm_head. Keep per-row scalar path explicitly.
-    // Q8 lm_head would use batched gemm_q8_0_batched_chunked (WMMA) and batched argmax; not the case here.
-    // This caps the win: lm_head re-streams ~700 MB B times.
-    let is_q8_lm = weights.lm_head.gpu_dtype == DType::Q8_0;
-    if is_q8_lm {
-        // Batched Q8 path (not taken for Glimmer's MQ4 lm_head, kept for completeness)
-        let vocab = cfg.vocab_size;
-        let logits_b = alloc(gpu, b * vocab, "logits_b")?;
-        gpu.gemm_q8_0_batched_chunked(&weights.lm_head.buf, &normed, &logits_b, vocab, dim, b).map_err(|e| format!("glimmer batch lm_head q8: {e:?}"))?;
-        // Scale + softcap batched would be per-row elementwise; do scaling on logits_b if needed.
-        // For argmax, use per-row host download to stay simple (batched argmax kernel exists but not needed).
-        // Fall through to per-row download for picks (still batched GEMM saved weight streaming).
-        for i in 0..b {
-            let logits_row = logits_b.sub_offset(i * vocab, vocab);
-            if cfg.output_multiplier != 1.0 && !abl("HIPFIRE_GLIMMER_NO_OUTMUL") {
-                gpu.scale_f32(&logits_row, cfg.output_multiplier).map_err(|e| format!("glimmer batch lm scale row {i}: {e:?}"))?;
-            }
-            if cfg.final_logit_softcapping > 0.0 && !abl("HIPFIRE_GLIMMER_NO_SOFTCAP") {
-                gpu.logit_softcap_f32(&logits_row, vocab, cfg.final_logit_softcapping).map_err(|e| format!("glimmer batch lm softcap row {i}: {e:?}"))?;
-            }
-            // Download this row's logits for argmax
-            // Need to download via a single-row buffer: copy slice to state.logits then download
-            // But logits_b row is contiguous; we can download via a temporary alloc and slice.
-            // Use hip memcpy to state.logits then download
-            gpu.hip.memcpy_dtod_at(&state.logits.buf, 0, &logits_b.buf, i * vocab * 4, vocab * 4).map_err(|e| format!("glimmer batch lm copy row {i}: {e:?}"))?;
-            let host = gpu.download_f32(&state.logits).map_err(|e| format!("glimmer batch lm download row {i}: {e:?}"))?;
-            let pick = host.iter().enumerate().max_by(|a,b| a.1.partial_cmp(b.1).unwrap()).map(|(idx,_)| idx as u32).unwrap();
-            picks.push(pick);
-        }
-        gpu.free_tensor(logits_b).ok();
-    } else {
-        // MQ4 fallback: per-row weight_gemv (re-streams lm_head B times). Explicit fallback dtypes: MQ4G256 etc. No batched kernel.
-        for i in 0..b {
-            let norm_row = normed.sub_offset(i * dim, dim);
-            weight_gemv(gpu, &weights.lm_head, &norm_row, &state.logits).map_err(|e| format!("glimmer batch lm_head row {i}: {e}"))?;
-            if cfg.output_multiplier != 1.0 && !abl("HIPFIRE_GLIMMER_NO_OUTMUL") {
-                gpu.scale_f32(&state.logits, cfg.output_multiplier).map_err(|e| format!("glimmer batch lm scale row {i}: {e:?}"))?;
-            }
-            if cfg.final_logit_softcapping > 0.0 && !abl("HIPFIRE_GLIMMER_NO_SOFTCAP") {
-                gpu.logit_softcap_f32(&state.logits, cfg.vocab_size, cfg.final_logit_softcapping).map_err(|e| format!("glimmer batch lm softcap row {i}: {e:?}"))?;
-            }
-            let host = gpu.download_f32(&state.logits).map_err(|e| format!("glimmer batch lm download row {i}: {e:?}"))?;
-            let pick = host.iter().enumerate().max_by(|a,b| a.1.partial_cmp(b.1).unwrap()).map(|(idx,_)| idx as u32).unwrap();
-            picks.push(pick);
-        }
-    }
+    let picks = glimmer_lm_head_picks(gpu, cfg, weights, &normed, b, &state.logits)?;
 
     // Free batched scratch
     for t in [x, residual, nrm, x_rot, q, k, v, attn_gate, attn_out, o_rot, o_out, gate_ffn, up_ffn, ffn_hidden, ffn_out, down_rot, pos_array, normed] {

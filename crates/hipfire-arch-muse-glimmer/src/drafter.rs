@@ -2,6 +2,52 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
+//! # STATUS: working — 1.24x over AR, byte-identical (measured 2026-08-11)
+//!
+//! hiptrx gfx1201 (R9700), 64 tokens greedy, 3 fresh processes per arm, target
+//! `muse-glimmer-30b.mq4`, prompt md5 `2ef49ee70df1483079b1f73c1f768339`:
+//!
+//! | mode | tok/s (3 runs) | median | tau |
+//! |---|---|---:|---:|
+//! | AR | 32.96 · 32.94 · 32.94 | 32.94 | — |
+//! | DFlash | 41.03 · 41.00 · 40.95 | **41.00** | **8.333** |
+//!
+//! 66 of 135 proposals accepted over 9 windows. Output byte-identical to AR at
+//! temp 0, which is the required contract: acceptance is greedy-argmax, so any
+//! divergence would be a bug rather than an acceptance-rate matter.
+//!
+//! Still opt-in via `HIPFIRE_DFLASH_DRAFT` (repo default is `dflash_mode=off`).
+//!
+//! ## What it took, so the next reader does not repeat it
+//!
+//! Four separate defects had to be cleared, and every one of them left the
+//! engine *running and producing correct text* — only the acceptance rate
+//! revealed them. In discovery order:
+//!
+//! 1. **Noise embedding never filled.** The drafter's whole input was a
+//!    zero-filled `vec![0f32; block*hidden]`. Drafts decoded to token 0.
+//! 2. **No attention.** The per-layer loop copied Q straight into `attn_out`
+//!    behind a comment reading "for minimal, just do o_proj over q". Every
+//!    block row was then bit-identical, capping acceptance at 1 per window.
+//! 3. **Wrong block structure.** The drafter is a standard two-norm Llama block
+//!    (58 tensors: no pre/post-FFN norm), not the target's four-norm sandwich.
+//! 4. **Context delivered through the wrong pathway** — the big one. Upstream
+//!    CONCATENATES the projected context into K/V, so K/V spans `ctx+block`
+//!    while Q spans `block`. This code instead broadcast-ADDED a single context
+//!    row into `x` and attended over the block alone. Fixing it moved tau from
+//!    1.016 to 8.333 in one step.
+//!
+//! The authority for (4) is upstream `modeling_muse_glimmer_assistant.py`, whose
+//! attention comment states it outright: *"The total k/v states in Dflash are the
+//! concatenation of the previous `context_hidden_states` ... and the actual
+//! projections on the diffusion window."* Guessing cost several rounds; reading
+//! it cost one.
+//!
+//! Verify is a single BATCHED forward over the block, not B sequential decodes.
+//! That distinction is the entire economics of speculative decode: the
+//! sequential version streamed all 15.5 GB of weights 16 times per window and
+//! ran at 12.0 tok/s — *slower than AR* — at the very same tau 8.333.
+//!
 //! Muse Glimmer DFlash drafter (`model_type = muse_glimmer_assistant`, arch_id = 23).
 //!
 //! A 5-layer block-diffusion draft head for the arch-14 Glimmer target.
