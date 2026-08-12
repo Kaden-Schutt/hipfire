@@ -510,22 +510,67 @@ impl GlimmerState {
 
         // Two Q8 KV caches: one slot per layer of the matching type.
         // Both have identical head_dim=128 geometry; split is logical.
-        let kv_sliding = KvCache::new_gpu_q8(
-            gpu,
-            cfg.n_sliding_layers(),
-            cfg.n_kv_heads,
-            cfg.head_dim,
-            max_seq,
-        )
-        .map_err(|e| format!("glimmer: sliding kv cache: {e:?}"))?;
-        let kv_full = KvCache::new_gpu_q8(
-            gpu,
-            cfg.n_full_layers(),
-            cfg.n_kv_heads,
-            cfg.head_dim,
-            max_seq,
-        )
-        .map_err(|e| format!("glimmer: full kv cache: {e:?}"))?;
+        //
+        // VMM backend by default. The contiguous constructor allocates every
+        // slot of max_seq for all 52 layers up front, which is what caps
+        // context on a 16 GB card: weights are 15.5 GB and KV is nearly the
+        // whole remainder (52 x max_seq x 544 B = 3.71 GB at 131072, against
+        // ~490 MB of headroom). The VMM path reserves VIRTUAL address space
+        // and maps physical pages only as the context actually reaches them
+        // (alloc_vmm_tensor with initial_mapped_bytes = 0, then
+        // ensure_mapped_capacity as n_tokens grows).
+        //
+        // Crucially this needs NO kernel change: the reserve is one linear
+        // virtual range, so `k_cache + t * stride` and `scores[t]` keep
+        // indexing absolutely. A window-sized ring buffer would have required
+        // wraparound in every consumer; this does not.
+        //
+        // Precedent: DeepSeek4 (hipfire-arch-deepseek4/src/forward.rs:1813).
+        // `HIPFIRE_GLIMMER_KV_VMM=0` falls back to the contiguous allocator.
+        let use_vmm = std::env::var("HIPFIRE_GLIMMER_KV_VMM")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(true);
+        let (kv_sliding, kv_full) = if use_vmm {
+            let sliding_layers = vec![true; cfg.n_sliding_layers()];
+            let full_layers = vec![true; cfg.n_full_layers()];
+            let s = KvCache::new_gpu_q8_vmm_capped_filtered(
+                gpu,
+                &sliding_layers,
+                cfg.n_kv_heads,
+                cfg.head_dim,
+                max_seq,
+                max_seq,
+            )
+            .map_err(|e| format!("glimmer: sliding kv cache (vmm): {e:?}"))?;
+            let f = KvCache::new_gpu_q8_vmm_capped_filtered(
+                gpu,
+                &full_layers,
+                cfg.n_kv_heads,
+                cfg.head_dim,
+                max_seq,
+                max_seq,
+            )
+            .map_err(|e| format!("glimmer: full kv cache (vmm): {e:?}"))?;
+            (s, f)
+        } else {
+            let s = KvCache::new_gpu_q8(
+                gpu,
+                cfg.n_sliding_layers(),
+                cfg.n_kv_heads,
+                cfg.head_dim,
+                max_seq,
+            )
+            .map_err(|e| format!("glimmer: sliding kv cache: {e:?}"))?;
+            let f = KvCache::new_gpu_q8(
+                gpu,
+                cfg.n_full_layers(),
+                cfg.n_kv_heads,
+                cfg.head_dim,
+                max_seq,
+            )
+            .map_err(|e| format!("glimmer: full kv cache: {e:?}"))?;
+            (s, f)
+        };
 
         // Per-layer slot mapping: sequential count within each type.
         let mut kv_slot_for_layer = Vec::with_capacity(cfg.n_layers);

@@ -502,6 +502,11 @@ fn glimmer_layer_decode(
         GlimmerLayerType::Sliding => &mut state.kv_sliding,
         GlimmerLayerType::Full => &mut state.kv_full,
     };
+    // Map physical pages up to the position about to be written. No-op on the
+    // contiguous backend (fast_mapped_token_capacity returns None) and a cheap
+    // early-out once the prefix is already mapped, so it is safe unconditional.
+    kv.ensure_mapped_capacity(gpu, state.pos_host[0] as usize + 1)
+        .map_err(|e| format!("glimmer L{layer_idx}: kv map: {e:?}"))?;
     gpu.kv_cache_write_q8_0(&kv.k_gpu[kv_slot], &state.k, &state.pos_buf, n_kv, head_dim)
         .map_err(|e| format!("glimmer L{layer_idx}: kv write k: {e:?}"))?;
     gpu.kv_cache_write_q8_0(&kv.v_gpu[kv_slot], &state.v, &state.pos_buf, n_kv, head_dim)
@@ -1641,6 +1646,18 @@ fn prefill_chunk_batched(
             }
         }
 
+        // This chunk writes positions [position, position+b). Map that prefix
+        // before the batched write. Scoped so the mutable borrow ends before
+        // the aliasing immutable borrow below. No-op on the contiguous backend.
+        {
+            let kv_mut = match cfg.layer_types[layer_idx] {
+                GlimmerLayerType::Sliding => &mut state.kv_sliding,
+                GlimmerLayerType::Full => &mut state.kv_full,
+            };
+            kv_mut
+                .ensure_mapped_capacity(gpu, position as usize + b)
+                .map_err(|e| format!("glimmer prefill L{layer_idx} kv map: {e:?}"))?;
+        }
         let kv = match cfg.layer_types[layer_idx] {
             GlimmerLayerType::Sliding => &state.kv_sliding,
             GlimmerLayerType::Full => &state.kv_full,
