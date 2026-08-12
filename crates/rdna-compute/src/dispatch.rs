@@ -3556,6 +3556,13 @@ impl Gpu {
             }
         }
 
+        // Exact parallel-sampler modules used by sample_top_p_pf. Sources are
+        // the same string rewrites as runtime (see sampling.rs helpers) so the
+        // compile-cache hash hits on first token instead of hipcc JIT.
+        for (name, src) in crate::sampling::sample_top_p_parallel_precompile_specs() {
+            specs.push((name, src));
+        }
+
         // Convert to (&str, &str) for the batch API
         let batch: Vec<(&str, &str)> = specs
             .iter()
@@ -3595,6 +3602,9 @@ impl Gpu {
                 // Arch-variant HFQ4 GEMV modules all expose the same symbol.
                 n if n.starts_with("gemv_hfq4g256_rdna") => vec!["gemv_hfq4g256"],
                 n if n.starts_with("gemv_hfq4g256_gfx") => vec!["gemv_hfq4g256"],
+                "fused_qkvza_hfq4g256_k2048_gfx1100" => {
+                    vec!["fused_qkvza_hfq4g256_k2048"]
+                }
                 // Multi-row RDNA3 modules expose three entry points per .hsaco
                 "gemv_hfq4g256_multirow_rdna3" => vec![
                     "gemv_hfq4g256_multirow_r2",
@@ -3618,6 +3628,26 @@ impl Gpu {
                 "gemv_hfq4g256_moe_down_indexed_batched_wave64" => {
                     vec!["gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_batched_wave64"]
                 }
+                "sample_top_p_parallel" => vec![
+                    "sample_apply_repeat_penalty",
+                    "sample_topk_partial",
+                    "sample_topk_finalize",
+                ],
+                "sample_top_p_parallel_w64" => vec![
+                    "sample_apply_repeat_penalty_w64",
+                    "sample_topk_partial_w64",
+                    "sample_topk_finalize_w64",
+                ],
+                "sample_top_p_parallel_fast21" => vec![
+                    "sample_apply_repeat_penalty_fast21",
+                    "sample_topk_partial_fast21",
+                    "sample_topk_finalize_fast21",
+                ],
+                "sample_top_p_parallel_fast65" => vec![
+                    "sample_apply_repeat_penalty_fast65",
+                    "sample_topk_partial_fast65",
+                    "sample_topk_finalize_fast65",
+                ],
                 other => vec![other],
             };
             // Compile and ensure the module is loaded once.

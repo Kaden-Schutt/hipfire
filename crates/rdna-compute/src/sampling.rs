@@ -38,6 +38,60 @@ fn sample_fast_stable_enabled() -> bool {
     })
 }
 
+/// HIP source for the default parallel sampler module (`sample_top_p_parallel`,
+/// TOP_K 20). Shared by runtime ensure_kernel and `precompile_qwen35` so the
+/// cache hash is identical.
+pub(crate) fn sample_top_p_parallel_src() -> String {
+    kernels::SAMPLE_TOP_P_PARALLEL_SRC.replace("#define TOP_K 64", "#define TOP_K 20")
+}
+
+/// HIP source for the wide parallel sampler (`sample_top_p_parallel_w64`).
+/// Renames the three entry points; leaves TOP_K at the on-disk default 64.
+pub(crate) fn sample_top_p_parallel_w64_src() -> String {
+    kernels::SAMPLE_TOP_P_PARALLEL_SRC
+        .replace(
+            "sample_apply_repeat_penalty",
+            "sample_apply_repeat_penalty_w64",
+        )
+        .replace("sample_topk_partial", "sample_topk_partial_w64")
+        .replace("sample_topk_finalize", "sample_topk_finalize_w64")
+}
+
+/// HIP source for a fast-stable parallel sampler module.
+/// `top_k_width` is 21 (fast21) or 65 (fast65); `suffix` is the symbol suffix
+/// (`fast21` / `fast65`). Must stay byte-identical to the runtime rewrite.
+pub(crate) fn sample_top_p_parallel_fast_src(top_k_width: usize, suffix: &str) -> String {
+    let top_k_define = format!(
+        "#define TOP_K {}\n#define SAMPLE_FAST_STABLE 1",
+        top_k_width
+    );
+    let fn_penalty = format!("sample_apply_repeat_penalty_{suffix}");
+    let fn_partial = format!("sample_topk_partial_{suffix}");
+    let fn_finalize = format!("sample_topk_finalize_{suffix}");
+    kernels::SAMPLE_TOP_P_PARALLEL_SRC
+        .replace("#define TOP_K 64", &top_k_define)
+        .replace("sample_apply_repeat_penalty", &fn_penalty)
+        .replace("sample_topk_partial", &fn_partial)
+        .replace("sample_topk_finalize", &fn_finalize)
+}
+
+/// All exact parallel-sampler module identities used by `sample_top_p_pf`,
+/// for admission into `precompile_qwen35`'s compile_batch.
+pub(crate) fn sample_top_p_parallel_precompile_specs() -> [(&'static str, String); 4] {
+    [
+        ("sample_top_p_parallel", sample_top_p_parallel_src()),
+        ("sample_top_p_parallel_w64", sample_top_p_parallel_w64_src()),
+        (
+            "sample_top_p_parallel_fast21",
+            sample_top_p_parallel_fast_src(21, "fast21"),
+        ),
+        (
+            "sample_top_p_parallel_fast65",
+            sample_top_p_parallel_fast_src(65, "fast65"),
+        ),
+    ]
+}
+
 impl Gpu {
     /// Compute max softmax probability on GPU. Downloads 4 bytes instead of vocab×4.
     pub fn max_prob(
@@ -364,15 +418,9 @@ impl Gpu {
             || !self.functions.contains_key(fn_finalize)
         {
             let src: String = if wide {
-                kernels::SAMPLE_TOP_P_PARALLEL_SRC
-                    .replace(
-                        "sample_apply_repeat_penalty",
-                        "sample_apply_repeat_penalty_w64",
-                    )
-                    .replace("sample_topk_partial", "sample_topk_partial_w64")
-                    .replace("sample_topk_finalize", "sample_topk_finalize_w64")
+                sample_top_p_parallel_w64_src()
             } else {
-                kernels::SAMPLE_TOP_P_PARALLEL_SRC.replace("#define TOP_K 64", "#define TOP_K 20")
+                sample_top_p_parallel_src()
             };
             self.ensure_kernel(m, &src, fn_penalty)?;
             self.ensure_kernel(m, &src, fn_partial)?;
@@ -537,7 +585,7 @@ impl Gpu {
         // TOP_K = request_cap + 1 (boundary sentinel). Narrow path stays at 21
         // so top_k<=20 remains byte-identical; wide path uses 65 for 21..=64.
         let top_k_width: usize = if top_k_req <= 20 { 21 } else { 65 };
-        let (module, fn_penalty, fn_partial, fn_finalize) = if top_k_width == 21 {
+        let (module, _fn_penalty, fn_partial, fn_finalize) = if top_k_width == 21 {
             (
                 "sample_top_p_parallel_fast21",
                 "sample_apply_repeat_penalty_fast21",
@@ -554,15 +602,12 @@ impl Gpu {
         };
 
         if !self.functions.contains_key(fn_partial) || !self.functions.contains_key(fn_finalize) {
-            let top_k_define = format!(
-                "#define TOP_K {}\n#define SAMPLE_FAST_STABLE 1",
-                top_k_width
-            );
-            let src = kernels::SAMPLE_TOP_P_PARALLEL_SRC
-                .replace("#define TOP_K 64", &top_k_define)
-                .replace("sample_apply_repeat_penalty", fn_penalty)
-                .replace("sample_topk_partial", fn_partial)
-                .replace("sample_topk_finalize", fn_finalize);
+            let suffix = if top_k_width == 21 {
+                "fast21"
+            } else {
+                "fast65"
+            };
+            let src = sample_top_p_parallel_fast_src(top_k_width, suffix);
             self.ensure_kernel(module, &src, fn_partial)?;
             self.ensure_kernel(module, &src, fn_finalize)?;
         }
