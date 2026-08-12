@@ -359,6 +359,30 @@ fn load_wt(
                 awq_scale: None,
             }
         }
+        // MQ4G256 (13) and its Lloyd-codebook sibling (19). The drafter's
+        // forward already dispatches MQ4 with the FWHT rotation
+        // (`proj_gemm_batched` / `_prerotated` above); only this loader arm was
+        // missing, so an MQ4 drafter loaded fine everywhere except here and
+        // DFlash silently fell back to AR with
+        // "unsupported quant_type 13 for 'encoder.fc.weight'".
+        //
+        // Qwen's DFlash drafters have always been MQ4 (arch 20); Glimmer's was
+        // the only Q8 one, at 2.59 GB against qwen35-27b's 0.88 GB for the same
+        // 58-tensor / 36-weight shape.
+        13 | 19 => {
+            let buf = gpu
+                .upload_raw(data, &[data.len()])
+                .map_err(|e| format!("glimmer drafter: upload MQ4 '{name}': {e:?}"))?;
+            WeightTensor {
+                buf,
+                gpu_dtype: DType::MQ4G256,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            }
+        }
         1 => {
             let f32_data: Vec<f32> = data
                 .chunks_exact(2)
