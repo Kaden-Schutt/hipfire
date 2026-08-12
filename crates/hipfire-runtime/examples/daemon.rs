@@ -30663,15 +30663,38 @@ fn generate_muse_glimmer(
             let hidden = drafter.config.hidden; // 6656
             let row_elems = ne * hidden; // 33280
             let n_rows = bundle.target_hidden_host.len() / row_elems;
-            // Context window handed to the drafter. Upstream keeps the context
-            // K/V in a DFlashCache and only appends newly accepted rows; we
-            // currently re-project all ctx rows every window, so this cap is
-            // also the per-cycle cost knob. HIPFIRE_GLIMMER_CTX_CAP overrides it
-            // so the tau-vs-cost curve can be measured rather than guessed.
+            // Context window handed to the drafter, and the dominant per-cycle
+            // cost knob. It used to default to the model's `sliding_window`
+            // (2048), which is 22x more expensive than necessary for ZERO
+            // acceptance benefit.
+            //
+            // Measured on gfx1100 at a fixed ~5k-token prompt, sweeping only
+            // this cap (HIPFIRE_GLIMMER_TIMING=1 for the breakdown):
+            //
+            //   cap   decode      tau    drafter   verify   total
+            //   2048   8.5 tok/s  2.694  124.4ms   150.5ms  307.8ms
+            //   1024  11.5        2.519   44.6     149.1    220.2
+            //    512  13.9        2.663   22.0     147.4    192.5
+            //    256  15.0        2.691   10.9     147.3    180.0
+            //    128  15.9        2.747    5.7     147.1    173.8
+            //
+            // tau is FLAT across the whole range -- 2.52 to 2.75, with 128
+            // marginally the BEST -- so the extra context buys the drafter no
+            // acceptance at all while costing it linearly. The drafter is a
+            // cheap proposal heuristic; it does not need the whole
+            // conversation to guess the next few tokens.
+            //
+            // Default 256 rather than the 128 that measured fastest: 128 is
+            // the edge of the swept range on a single prompt, and 256 keeps a
+            // 2x margin for prompt shapes where longer-range copying might
+            // matter, at a cost of 5.2ms/window over 128. Override with
+            // HIPFIRE_GLIMMER_CTX_CAP; 0 or unset takes this default.
+            const GLIMMER_DRAFTER_CTX_CAP_DEFAULT: usize = 256;
             let ctx_cap = std::env::var("HIPFIRE_GLIMMER_CTX_CAP")
                 .ok()
                 .and_then(|v| v.trim().parse::<usize>().ok())
-                .unwrap_or(drafter.config.sliding_window);
+                .filter(|v| *v > 0)
+                .unwrap_or(GLIMMER_DRAFTER_CTX_CAP_DEFAULT);
             let ctx_len = n_rows.min(ctx_cap);
             let target_hidden: Vec<f32> = if ctx_len == 0 {
                 Vec::new()
