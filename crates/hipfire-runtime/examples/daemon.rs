@@ -30465,6 +30465,13 @@ fn generate_muse_glimmer(
     // HIPFIRE_DFLASH_DRAFT / dflash_mode=off (daemon.rs:13118), so AR is
     // untouched when absent — the null-result trap Main flagged.
     let use_spec = bundle.drafter.is_some() && temp <= 0.01 && max_tokens > 1;
+    // Spec counters lifted out of the branch so the terminal can report them.
+    // Without this the whole DFlash run was invisible on the wire: the daemon
+    // logged `[glimmer-spec] done: windows 30 ... tau 6.967` to stderr while
+    // `timings.dflash` / `.tau` / `.cycles` came back null, so serve_harness
+    // correctly refused to credit a dflash run it could not observe.
+    let mut spec_windows: usize = 0;
+    let mut spec_accepted: usize = 0;
     if use_spec {
         // Off-by-one note: target_layer_ids [1,13,25,37,49] are 0-based layer
         // indices (dflash_extract_layer_ids(52,5) with start=1.0, end=49.0,
@@ -30987,6 +30994,8 @@ fn generate_muse_glimmer(
             // Update tau stats
             if generated_count >= max_tokens { break; }
         }
+        spec_windows = windows;
+        spec_accepted = total_accepted;
         if windows > 0 {
             let tau = if windows>0 { (total_accepted as f32 + windows as f32) / windows as f32 } else { 0.0 };
             eprintln!("[glimmer-spec] done: windows {} proposed {} accepted {} tau {:.3} (bonus per window counted)", windows, total_proposed, total_accepted, tau);
@@ -31201,6 +31210,15 @@ fn generate_muse_glimmer(
         "finish_reason": finish_reason,
         "attempt_id": active_attempt_id(),
     });
+    // Report the speculation run on the terminal. `tau` counts the free bonus
+    // token per window, matching the `[glimmer-spec] done:` line and every
+    // other arch's definition, so cross-arch tau comparisons stay meaningful.
+    if use_spec && spec_windows > 0 {
+        let tau = (spec_accepted as f64 + spec_windows as f64) / spec_windows as f64;
+        pending_done["dflash"] = serde_json::Value::Bool(true);
+        pending_done["cycles"] = serde_json::json!(spec_windows);
+        pending_done["tau"] = serde_json::json!((tau * 1000.0).round() / 1000.0);
+    }
     stage_terminal_tool_calls(&mut pending_done, finish_reason, &parsed_tool_calls);
     // Cache store is a COMMITTED side effect: publish it only after the client commits.
     if glimmer_commit_terminal(stdout, id, &pending_done, generated_count) {

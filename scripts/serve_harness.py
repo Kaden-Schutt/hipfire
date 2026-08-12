@@ -695,11 +695,21 @@ def _startup_path_proof_failures(cfg, txt):
         loaded = (
             "DFlash draft loaded:" in txt
             or "DFlash generic speculator loaded" in txt
+            # Muse Glimmer (arch 14) logs its own wording.
+            or "glimmer DFlash drafter loaded:" in txt
         )
         skipped = "dflash_mode=off — skipping draft load" in txt
-        failed = "DFlash draft load failed" in txt
+        failed = (
+            "DFlash draft load failed" in txt
+            or "glimmer DFlash drafter load failed" in txt
+        )
         disabled = "DFlash disabled (dflash_mode=off)" in txt
-        if skipped or disabled:
+        # A successful load is the authoritative proof and wins: the same log
+        # slice can carry an earlier per-candidate "skipping draft load" line
+        # for a draft the daemon rejected before loading the one it kept.
+        if loaded:
+            pass
+        elif skipped or disabled:
             failures.append(
                 "dflash=on requested but serve log shows DFlash disabled/skipped"
             )
@@ -707,10 +717,11 @@ def _startup_path_proof_failures(cfg, txt):
             failures.append(
                 "dflash=on requested but serve log shows 'DFlash draft load failed'"
             )
-        elif not loaded:
+        else:
             failures.append(
                 "dflash=on requested but serve log lacks "
-                "'DFlash draft loaded:' / 'DFlash generic speculator loaded' proof"
+                "'DFlash draft loaded:' / 'DFlash generic speculator loaded' / "
+                "'glimmer DFlash drafter loaded:' proof"
             )
     return failures
 

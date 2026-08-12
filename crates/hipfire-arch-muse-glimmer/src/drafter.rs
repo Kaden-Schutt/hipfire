@@ -574,6 +574,15 @@ pub struct GlimmerDrafterScratch {
     pub kv_input: GpuTensor,        // [(max_ctx+block)*hidden] — cat[target_hidden_proj, tmp]
     pub kv_input_rot: GpuTensor,    // [(max_ctx+block)*hidden] — FWHT-rotated kv_input
     pub ffn_hidden_rot: GpuTensor,  // [block*intermediate] — FWHT-rotated ffn_hidden for down_proj
+    /// Persistent buffer for encoder.fc input: [max_ctx * num_extract * hidden]
+    /// Host `target_hidden` (ctx*ne*h) is uploaded into this buffer each forward
+    /// via a sub-offset view; no per-forward alloc. Sized to the configured cap
+    /// (max_ctx) to mirror `hipfire-runtime/src/dflash.rs:DflashScratch::target_hidden`
+    /// which Qwen sizes once to max_ctx at construction and reuses via `target_hidden`
+    /// + `thlog` rather than allocating per forward. Glimmer's daemon caps
+    /// ctx_len to `sliding_window` (2048) but scratch is sized to max_seq for
+    /// completeness — same trade-off Qwen makes with DEFAULT_DFLASH_CTX_CAP=8192.
+    pub fc_input: GpuTensor, // [max_ctx * num_extract * hidden]
     /// Device positions for RoPE, sized for the full ctx+block span and
     /// allocated ONCE. Uploaded each forward; views feed `rope_batched_f32`.
     ///
@@ -593,6 +602,24 @@ impl GlimmerDrafterScratch {
         let kvd = cfg.kv_dim();
         let block = cfg.block_size;
         let kv_rows = max_ctx + block;
+        // `fc_input` is the one scratch buffer that scales with CONTEXT rather
+        // than block, so sizing it to `max_ctx` is not free: at max_seq 16384
+        // with num_extract 5 and hidden 6656 that is 2.18 GB, which starved
+        // prefill into `hipMalloc: out of memory` on a 25.8 GB card.
+        //
+        // The daemon never feeds more than `ctx_cap` rows —
+        // `ctx_len = n_rows.min(ctx_cap)` with
+        // `ctx_cap = HIPFIRE_GLIMMER_CTX_CAP or config.sliding_window`
+        // (daemon.rs:30671-30675) — so resolve the same bound here and size to
+        // it. `glimmer_drafter_forward` guards the view against a cap raised
+        // after construction rather than silently reading past the end.
+        let fc_ctx = max_ctx.min(
+            std::env::var("HIPFIRE_GLIMMER_CTX_CAP")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(cfg.sliding_window),
+        );
         let pos_buf = gpu
             .hip
             .malloc(kv_rows * 4)
@@ -617,6 +644,7 @@ impl GlimmerDrafterScratch {
             kv_input: alloc(gpu, kv_rows * h, "kv_input")?,
             kv_input_rot: alloc(gpu, kv_rows * h, "kv_input_rot")?,
             ffn_hidden_rot: alloc(gpu, block * cfg.intermediate, "ffn_hidden_rot")?,
+            fc_input: alloc(gpu, fc_ctx * cfg.num_extract() * h, "fc_input")?,
             pos_buf,
         })
     }
@@ -638,6 +666,7 @@ impl GlimmerDrafterScratch {
             self.kv_input,
             self.kv_input_rot,
             self.ffn_hidden_rot,
+            self.fc_input,
         ] {
             let _ = gpu.free_tensor(t);
         }
@@ -721,13 +750,26 @@ pub fn glimmer_drafter_forward(
     // This runs once per drafter call over up to 2048 rows, so batching
     // matters at longer context even though ctx is small on the fixture.
     // Same dispatch-by-dtype as forward.rs::proj_gemm_batched.
+    // Qwen reference: DflashScratch.target_hidden is persistent [l*ne*h]
+    // allocated once at construction; Glimmer now matches with
+    // GlimmerDrafterScratch.fc_input sized to max_ctx*ne*h and reused via
+    // sub_offset, eliminating the per-forward alloc_tensor that leaked on
+    // every `?` (commit 58a156e54 pattern). No per-call allocation remains.
     if ctx_len > 0 {
         let ne_h = ne * h;
-        // Upload the entire target_hidden batch [ctx*ne_h] into a temporary
+        // Persistent buffer view — no alloc_tensor / free_tensor per forward.
+        // Upload the entire target_hidden batch [ctx*ne_h] into the persistent
         // GPU buffer, then batched GEMM: Y[ctx,h] = W[h,ne_h] * X[ctx,ne_h].
-        let fc_in = gpu
-            .alloc_tensor(&[ctx_len * ne_h], DType::F32)
-            .map_err(|e| format!("drafter fc_input alloc: {e:?}"))?;
+        let fc_cap = scratch.fc_input.shape.iter().product::<usize>();
+        if ctx_len * ne_h > fc_cap {
+            return Err(format!(
+                "glimmer drafter: fc_input holds {fc_cap} floats but this window needs \
+                 {} (ctx_len={ctx_len} num_extract={ne} hidden={h}); the drafter context \
+                 cap was raised above the value present when scratch was built",
+                ctx_len * ne_h
+            ));
+        }
+        let fc_in = scratch.fc_input.sub_offset(0, ctx_len * ne_h);
         let bytes = unsafe {
             std::slice::from_raw_parts(target_hidden.as_ptr() as *const u8, target_hidden.len() * 4)
         };
@@ -748,7 +790,6 @@ pub fn glimmer_drafter_forward(
             "fc",
         )
         .map_err(|e| format!("drafter fc batched: {e}"))?;
-        gpu.free_tensor(fc_in).ok();
         gpu.rmsnorm_batched(
             &target_slice,
             &weights.output_norm_enc,
