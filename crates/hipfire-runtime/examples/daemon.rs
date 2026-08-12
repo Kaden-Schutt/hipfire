@@ -29241,6 +29241,28 @@ enum GlimmerEmit {
     Tool(String),
 }
 
+/// Map the request's think budget onto Muse Glimmer's `Reasoning strength:` control.
+///
+/// The model card names exactly four levels — `low | medium | high | xhigh` — and specifies
+/// them as a SYSTEM-PROMPT directive, which the Onyx template renders through its
+/// `reasoning_strength` context variable (defaulting to `high` when unset). It is the model's
+/// only supported effort dial: there is no non-thinking mode.
+///
+/// `max_think_tokens` is the engine-side CAP (`1` = the caller asked for no thinking, `0` =
+/// uncapped). The cap alone cannot stop the model from opening a self channel — it can only
+/// force-close one mid-flight, which wastes the tokens it already spent. Asking for a lower
+/// strength up front is what actually shortens the reasoning, so the two are wired together.
+fn glimmer_reasoning_strength(max_think_tokens: usize) -> &'static str {
+    match max_think_tokens {
+        1 => "low",
+        0 => "high",
+        n if n <= 512 => "low",
+        n if n <= 2048 => "medium",
+        n if n <= 8192 => "high",
+        _ => "xhigh",
+    }
+}
+
 struct GlimmerHarmonyRouter {
     state: GlimmerChannel,
     pending: String,
@@ -29259,6 +29281,7 @@ impl GlimmerHarmonyRouter {
             just_forced: false,
         }
     }
+
     fn thinking_enabled(&self) -> bool {
         self.max_think_tokens != 1
     }
@@ -29284,7 +29307,19 @@ impl GlimmerHarmonyRouter {
                         } else {
                             "user".to_string()
                         };
-                        let new_state = if recipient == "self" && self.thinking_enabled() {
+                        // `to=self` is ALWAYS the reasoning channel. Muse Glimmer has no
+                        // "no-thinking" mode: the Onyx template unconditionally emits
+                        // `Reasoning strength: <low|medium|high|xhigh>.` into the system block,
+                        // so the model always opens a self channel. Effort is controlled by the
+                        // strength (see `glimmer_reasoning_strength`), and `max_think_tokens`
+                        // is a CAP that force-closes an over-long span — neither turns the
+                        // channel off.
+                        //
+                        // Classifying `to=self` as Answer when thinking was "off" published the
+                        // model's private reasoning as visible content AND made the turn
+                        // unreproducible by the template, so the recorder refused it and the
+                        // prefix cache could never store a thinking-off turn.
+                        let new_state = if recipient == "self" {
                             GlimmerChannel::Reasoning
                         } else if recipient == "user" {
                             GlimmerChannel::Answer
@@ -29463,7 +29498,6 @@ struct GlimmerOpenBody {
 enum GlimmerRecordRefusal {
     UnexpectedMarker,
     NonCanonicalHeader,
-    ThinkingDisabledSelf,
     ForcedReasoningClose,
     NonCanonicalBodyOrder,
     NonCanonicalTerminator,
@@ -29486,17 +29520,15 @@ struct GlimmerChannelRecorder {
     reasoning: Option<hipfire_runtime::prompt_frame::CachedAssistantBody>,
     tools: Vec<hipfire_runtime::prompt_frame::CachedAssistantToolBody>,
     content: Option<hipfire_runtime::prompt_frame::CachedAssistantBody>,
-    thinking_enabled: bool,
 }
 
 impl GlimmerChannelRecorder {
-    fn new(thinking_enabled: bool) -> Self {
+    fn new() -> Self {
         Self {
             state: GlimmerRecorderState::Header { first: true, decoded: String::new() },
             reasoning: None,
             tools: Vec::new(),
             content: None,
-            thinking_enabled,
         }
     }
     fn push(&mut self, token_id: u32, decoded_frag: &str) {
@@ -29531,7 +29563,17 @@ impl GlimmerChannelRecorder {
                         return;
                     }
                 };
-                if !decoded.contains("assistant") {
+                // The FIRST header continues the prompt: `add_generation_prompt` already
+                // emitted `<|start|>assistant`, so the model's own first emission is just
+                // ` to=self` / ` to=user` and the recorder never sees the word `assistant`.
+                // Every LATER header is emitted in full by the model
+                // (`<|start|>assistant to=user<|message|>`) and must carry it.
+                //
+                // Requiring it unconditionally refused EVERY turn with `NonCanonicalHeader`,
+                // which silently disabled the whole verbatim-splice cache in production while
+                // the unit tests passed — they fed `"assistant to=self"` as the first header,
+                // a string the real model never emits.
+                if !first && !decoded.contains("assistant") {
                     self.state = GlimmerRecorderState::Refused(GlimmerRecordRefusal::NonCanonicalHeader);
                     return;
                 }
@@ -29541,10 +29583,9 @@ impl GlimmerChannelRecorder {
                     "user".to_string()
                 };
                 let recipient = if recipient_str == "self" {
-                    if !self.thinking_enabled {
-                        self.state = GlimmerRecorderState::Refused(GlimmerRecordRefusal::ThinkingDisabledSelf);
-                        return;
-                    }
+                    // No thinking-disabled refusal: `to=self` is always the reasoning channel
+                    // (see `GlimmerHarmonyRouter`), so a self body is always reproducible by the
+                    // template's `reasoning_content` envelope regardless of the think budget.
                     if self.reasoning.is_some() {
                         self.state = GlimmerRecorderState::Refused(GlimmerRecordRefusal::NonCanonicalBodyOrder);
                         return;
@@ -29982,6 +30023,12 @@ fn generate_muse_glimmer(
     let bos_tok = bundle.config.bos_token;
     let cfg_eos_tok = bundle.config.eos_token;
 
+    // Splice telemetry. Without it, a cache MISS is indistinguishable from a cache that was
+    // never consulted — and a silently-inert verbatim splice still produces plausible output
+    // (the render just falls back to retokenizing), so only the LCP would ever betray it.
+    let glimmer_replay_hits = std::cell::Cell::new(0usize);
+    let glimmer_replay_lookups = std::cell::Cell::new(0usize);
+
     // ── Prompt build (same two-path branch as the gemma4 AR path) ──
     let prompt_ids: Vec<u32> = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
@@ -29997,7 +30044,7 @@ fn generate_muse_glimmer(
                 user: prompt,
                 enable_thinking: max_think_tokens != 1,
                 bos_token: Some("<bos>"),
-            reasoning_strength: None,
+                reasoning_strength: Some(glimmer_reasoning_strength(max_think_tokens)),
             };
             if tools.is_some() || messages_history.is_some() {
                 let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
@@ -30066,7 +30113,12 @@ fn generate_muse_glimmer(
                         let fp_raw = asst_turn_fingerprint(&normalize_asst_turn_for_fingerprint(&msg.content), &msg.tool_calls);
                         let fp = glimmer_turn_key(fp_raw, lookup_ordinal);
                         lookup_ordinal += 1;
-                        m.asst_turn_cache.get(&fp).cloned()
+                        glimmer_replay_lookups.set(glimmer_replay_lookups.get() + 1);
+                        let hit = m.asst_turn_cache.get(&fp).cloned();
+                        if hit.is_some() {
+                            glimmer_replay_hits.set(glimmer_replay_hits.get() + 1);
+                        }
+                        hit
                     };
                     match hipfire_runtime::prompt_frame::build_cached_history_jinja(&frame, &prepared_owned, tools, &mut cache_lookup) {
                         Ok(cached_ids) => cached_ids,
@@ -30258,12 +30310,14 @@ fn generate_muse_glimmer(
             let cache_hit = lcp == prior_len && lcp > 0 && lcp < prompt_ids.len();
             if trace {
                 eprintln!(
-                    "[glimmer-cache] prior_len={} n_tokens={} prompt_len={} lcp={} hit={}",
+                    "[glimmer-cache] prior_len={} n_tokens={} prompt_len={} lcp={} hit={} replay={}/{}",
                     prior_len,
                     bundle.state.n_tokens,
                     prompt_ids.len(),
                     lcp,
-                    cache_hit
+                    cache_hit,
+                    glimmer_replay_hits.get(),
+                    glimmer_replay_lookups.get()
                 );
             }
             if cache_hit {
@@ -30351,7 +30405,7 @@ fn generate_muse_glimmer(
     let mut generated_count: usize = 0;
     let decode_t0 = Instant::now();
     let mut harmony_router = GlimmerHarmonyRouter::new(max_think_tokens);
-    let mut glimmer_recorder = GlimmerChannelRecorder::new(harmony_router.thinking_enabled());
+    let mut glimmer_recorder = GlimmerChannelRecorder::new();
     let mut glimmer_emitted_ids: Vec<u32> = Vec::new();
     let mut glimmer_visible_acc: String = String::new();
     let mut glimmer_tool_acc: String = String::new();
@@ -40845,9 +40899,10 @@ mod glimmer_channel_recorder_tests {
 
     #[test]
     fn splits_self_then_user() {
-        let mut rec = GlimmerChannelRecorder::new(true);
-        rec.push(GLIMMER_START_ID, "<|start|>");
-        rec.push(100, "assistant to=self");
+        let mut rec = GlimmerChannelRecorder::new();
+        // Production shape: `add_generation_prompt` already emitted `<|start|>assistant`,
+        // so the model's FIRST emission is just ` to=self` — no `<|start|>`, no `assistant`.
+        rec.push(100, " to=self");
         rec.push(GLIMMER_MESSAGE_ID, "<|message|>");
         rec.push(101, "reasoning body");
         rec.push(102, " more");
@@ -40868,9 +40923,10 @@ mod glimmer_channel_recorder_tests {
     #[test]
     fn terminal_open_user_body_is_accepted() {
         // GAP3: self closed by eom, user body left OPEN (no <|eot|> fed) must be accepted.
-        let mut rec = GlimmerChannelRecorder::new(true);
-        rec.push(GLIMMER_START_ID, "<|start|>");
-        rec.push(100, "assistant to=self");
+        let mut rec = GlimmerChannelRecorder::new();
+        // Production shape: `add_generation_prompt` already emitted `<|start|>assistant`,
+        // so the model's FIRST emission is just ` to=self` — no `<|start|>`, no `assistant`.
+        rec.push(100, " to=self");
         rec.push(GLIMMER_MESSAGE_ID, "<|message|>");
         rec.push(101, "reasoning body");
         rec.push(GLIMMER_EOM_ID, "<|eom|>");
@@ -40890,9 +40946,10 @@ mod glimmer_channel_recorder_tests {
 
     #[test]
     fn splits_self_then_tool() {
-        let mut rec = GlimmerChannelRecorder::new(true);
-        rec.push(GLIMMER_START_ID, "<|start|>");
-        rec.push(100, "assistant to=self");
+        let mut rec = GlimmerChannelRecorder::new();
+        // Production shape: `add_generation_prompt` already emitted `<|start|>assistant`,
+        // so the model's FIRST emission is just ` to=self` — no `<|start|>`, no `assistant`.
+        rec.push(100, " to=self");
         rec.push(GLIMMER_MESSAGE_ID, "<|message|>");
         rec.push(101, "reasoning");
         rec.push(GLIMMER_EOM_ID, "<|eom|>");
@@ -40914,9 +40971,10 @@ mod glimmer_channel_recorder_tests {
 
     #[test]
     fn refuses_forced_reasoning_close() {
-        let mut rec = GlimmerChannelRecorder::new(true);
-        rec.push(GLIMMER_START_ID, "<|start|>");
-        rec.push(100, "assistant to=self");
+        let mut rec = GlimmerChannelRecorder::new();
+        // Production shape: `add_generation_prompt` already emitted `<|start|>assistant`,
+        // so the model's FIRST emission is just ` to=self` — no `<|start|>`, no `assistant`.
+        rec.push(100, " to=self");
         rec.push(GLIMMER_MESSAGE_ID, "<|message|>");
         rec.push(101, "reasoning");
         rec.mark_forced_reasoning_close();
@@ -40927,9 +40985,10 @@ mod glimmer_channel_recorder_tests {
 
     #[test]
     fn refuses_empty_self_body() {
-        let mut rec = GlimmerChannelRecorder::new(true);
-        rec.push(GLIMMER_START_ID, "<|start|>");
-        rec.push(100, "assistant to=self");
+        let mut rec = GlimmerChannelRecorder::new();
+        // Production shape: `add_generation_prompt` already emitted `<|start|>assistant`,
+        // so the model's FIRST emission is just ` to=self` — no `<|start|>`, no `assistant`.
+        rec.push(100, " to=self");
         rec.push(GLIMMER_MESSAGE_ID, "<|message|>");
         rec.push(GLIMMER_EOM_ID, "<|eom|>");
         let res = rec.into_cached_turn(&[]);
@@ -40937,22 +40996,31 @@ mod glimmer_channel_recorder_tests {
     }
 
     #[test]
-    fn refuses_thinking_disabled_self() {
-        let mut rec = GlimmerChannelRecorder::new(false);
-        rec.push(GLIMMER_START_ID, "<|start|>");
-        rec.push(100, "assistant to=self");
+    fn records_self_body_regardless_of_think_budget() {
+        // Muse Glimmer has no non-thinking mode: the Onyx system block always carries
+        // `Reasoning strength:`, so the model always opens a `to=self` channel. A low think
+        // budget caps the span, it does not remove it — the turn must still be recordable, or
+        // the prefix cache would go permanently inert whenever thinking was "off".
+        let mut rec = GlimmerChannelRecorder::new();
+        rec.push(100, " to=self");
         rec.push(GLIMMER_MESSAGE_ID, "<|message|>");
         rec.push(101, "reasoning");
         rec.push(GLIMMER_EOM_ID, "<|eom|>");
-        let res = rec.into_cached_turn(&[]);
-        assert_eq!(res.unwrap_err(), GlimmerRecordRefusal::ThinkingDisabledSelf);
+        rec.push(GLIMMER_START_ID, "<|start|>");
+        rec.push(103, "assistant to=user");
+        rec.push(GLIMMER_MESSAGE_ID, "<|message|>");
+        rec.push(104, "answer");
+        let turn = rec.into_cached_turn(&[]).expect("self body must be recorded");
+        assert_eq!(turn.reasoning.expect("reasoning slot").text, "reasoning");
+        assert_eq!(turn.content.expect("content slot").text, "answer");
     }
 
     #[test]
     fn store_cached_turn_self_then_user_inserts_both_channels() {
-        let mut rec = GlimmerChannelRecorder::new(true);
-        rec.push(GLIMMER_START_ID, "<|start|>");
-        rec.push(100, "assistant to=self");
+        let mut rec = GlimmerChannelRecorder::new();
+        // Production shape: `add_generation_prompt` already emitted `<|start|>assistant`,
+        // so the model's FIRST emission is just ` to=self` — no `<|start|>`, no `assistant`.
+        rec.push(100, " to=self");
         rec.push(GLIMMER_MESSAGE_ID, "<|message|>");
         rec.push(101, "reasoning body");
         rec.push(102, " more");
