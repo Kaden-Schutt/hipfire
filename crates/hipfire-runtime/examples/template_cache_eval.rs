@@ -769,73 +769,57 @@ fn main() {
             .and_then(Perturbation::from_str)
             .unwrap_or(perturb);
 
+        // Verdict, deliberately unambiguous for scripting:
+        //   `oracle_result=PASS`        + rc 0  -> green. This is the ONLY green token.
+        //   `oracle_result=FAIL`        + rc 1  -> a case did not match its expectation.
+        //   `oracle_result=INSENSITIVE` + rc 3  -> a negative control failed to go red, i.e.
+        //                                          the gate cannot detect the bug it exists for.
+        //   rc 2                                -> usage / internal error.
+        //
+        // Under `--perturb`, FAIL is the SUCCESSFUL outcome of the negative control: the caller
+        // requires a non-zero rc AND the absence of `oracle_result=PASS`. Printing PASS while red
+        // (the previous behaviour) would fool any script that greps for PASS.
         match run_harmony_oracle(Path::new(model_path), perturb) {
             Ok(rows) => {
-                let mut any_positive_failed = false;
-                let mut any_negative_ok = false;
+                // Expectation truth table. `tool-set-changed` is expected NOT to forward-extend:
+                // a different tool list rewrites the system block, so the LCP must collapse and
+                // the daemon must cold-reset. That collapse is correct behaviour, not a failure.
+                let expected = |case: &str| case != "tool-set-changed";
+                let mut mismatches: Vec<&str> = Vec::new();
                 for r in &rows {
                     println!(
                         "oracle={} prior_len={} prompt_len={} lcp={} forward_extension={}",
                         r.case, r.prior_len, r.prompt_len, r.lcp, r.forward_extension
                     );
-                    // Expected truth table
-                    let expected = match r.case {
-                        "tool-set-changed" => false,
-                        _ => true,
-                    };
-                    if r.forward_extension != expected {
-                        // Track if a positive case failed (expected true but got false)
-                        if expected {
-                            any_positive_failed = true;
-                        } else {
-                            any_negative_ok = true;
-                        }
+                    if r.forward_extension != expected(r.case) {
+                        mismatches.push(r.case);
                     }
                 }
-                // Negative controls must flip at least one positive to false.
-                let perturb_flipped = if perturb != Perturbation::None {
-                    rows.iter()
-                        .any(|r| matches!(r.case, "normal-thinking-on" | "normal-thinking-off" | "tool-roundtrip") && !r.forward_extension)
-                } else {
-                    true
-                };
-                let overall_pass = !any_positive_failed && perturb_flipped;
-                // For tool-set-changed, its expected false must hold in non-perturb mode;
-                // perturb modes keep it false as well.
-                let tool_set_ok = rows
-                    .iter()
-                    .find(|r| r.case == "tool-set-changed")
-                    .map(|r| !r.forward_extension)
-                    .unwrap_or(false);
-                let final_pass = overall_pass && tool_set_ok && perturb_flipped;
 
                 if perturb != Perturbation::None {
-                    // In perturb mode, we *want* a failure to prove sensitivity.
-                    // So a flipped row should make us exit 2 (non-zero) as the gate expects.
-                    // But we still print oracle_result for machine consumption.
-                    if !perturb_flipped {
-                        eprintln!("perturb={:?} did not flip any positive case — gate is insensitive", perturb);
-                        println!("oracle_result=FAIL");
-                        std::process::exit(2);
+                    if mismatches.is_empty() {
+                        eprintln!(
+                            "perturb={perturb:?} changed nothing — the oracle cannot observe this \
+                             corruption, so it is not a gate"
+                        );
+                        println!("oracle_result=INSENSITIVE");
+                        std::process::exit(3);
                     }
-                    // Report PASS for the perturb's ability to flip, but exit 2 to signal expected red.
-                    println!("oracle_result=PASS");
-                    // Exit 2 to make negative control scriptable (caller checks RC == 2)
-                    std::process::exit(2);
+                    eprintln!(
+                        "perturb={perturb:?} correctly flipped: {}",
+                        mismatches.join(", ")
+                    );
+                    println!("oracle_result=FAIL");
+                    std::process::exit(1);
                 }
 
-                if final_pass {
+                if mismatches.is_empty() {
                     println!("oracle_result=PASS");
                     std::process::exit(0);
-                } else {
-                    println!("oracle_result=FAIL");
-                    // If any positive failed, exit 2 for scriptability; else exit 1.
-                    if any_positive_failed {
-                        std::process::exit(2);
-                    } else {
-                        std::process::exit(1);
-                    }
                 }
+                eprintln!("cases not matching expectation: {}", mismatches.join(", "));
+                println!("oracle_result=FAIL");
+                std::process::exit(1);
             }
             Err(e) => {
                 eprintln!("harmony oracle error: {e}");
