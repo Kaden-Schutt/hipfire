@@ -216,8 +216,17 @@ fn grow_scratch_buffer(
         return Ok(());
     }
     if let Some(old) = slot.take() {
-        hip.device_synchronize()?;
-        let _ = hip.free(old);
+        if crate::graph::any_graph_captured() {
+            // A captured hipGraph embeds the pointers live at capture time, so
+            // releasing this buffer would make every later replay read freed
+            // memory. Measured: freeing here breaks qwen35 outright, every turn
+            // empty with `spec_step: HipError(700) ... reset_recurrent`. Retain
+            // it (the pre-existing behaviour) and let the process reclaim it.
+            std::mem::forget(old);
+        } else {
+            hip.device_synchronize()?;
+            let _ = hip.free(old);
+        }
     }
     *have_bytes = 0;
     let fresh = hip.malloc(needed)?;
