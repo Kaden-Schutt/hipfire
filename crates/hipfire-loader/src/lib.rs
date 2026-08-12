@@ -2934,13 +2934,16 @@ mod registry_tests {
         assert!(out.contains("{%- if tc.rendered_body is defined and tc.rendered_body -%}"));
         assert!(out.contains("{%- endif -%}{%- endmacro -%}"));
 
-        // Only `render_atem` is wrapped: `render_tool_defs` ends with a byte-identical
-        // ATEM tail, and wrapping that one too would corrupt the tool-definition preamble.
-        assert_eq!(
-            out.matches("{%- endif -%}{%- endmacro -%}").count(),
-            1,
-            "exactly one macro may be wrapped by the rendered_body branch"
-        );
+        // Only `render_atem` is wrapped. `render_tool_defs` ends with a BYTE-IDENTICAL ATEM
+        // tail (it embeds a worked example of the call syntax), so a `replace`-all here
+        // would inject a stray `{%- endif -%}` into the tool-definition preamble and break
+        // every tools-bearing prompt. Pin both halves: exactly one tail stays bare, exactly
+        // one is wrapped.
+        let bare_tail = "{{- '</atem:invoke>\\n</atem:function_calls>' -}}{%- endmacro -%}";
+        let wrapped_tail =
+            "{{- '</atem:invoke>\\n</atem:function_calls>' -}}{%- endif -%}{%- endmacro -%}";
+        assert_eq!(out.matches(bare_tail).count(), 1, "render_tool_defs tail must stay bare");
+        assert_eq!(out.matches(wrapped_tail).count(), 1, "render_atem tail must be wrapped");
 
         // Upstream drift must fail LOUDLY rather than silently leaving nested accessors.
         let missing = "{%- macro render_atem(tc) -%}hello{%- endmacro -%}";
