@@ -472,17 +472,58 @@ fn glimmer_layer_decode(
             gpu, &lw.q_proj, &state.x, &lw.input_layernorm, &state.tmp, &state.x_rot, rms_eps,
         )
         .map_err(|e| format!("glimmer L{layer_idx}: fused input rmsnorm+rotate: {e:?}"))?;
-        let x_rot = x_rot_opt.as_ref().copied();
-        // x param is ignored when x_rot is Some; pass &state.x as placeholder
-        // (matches Gemma4's weight_gemv_prerotated(gpu, q_proj, x, Some(tmp_rot), q_out)).
-        weight_gemv_prerotated(gpu, &lw.q_proj, &state.x, x_rot, &state.q)
-            .map_err(|e| format!("glimmer L{layer_idx}: q_proj (prerot): {e:?}"))?;
-        weight_gemv_prerotated(gpu, &lw.k_proj, &state.x, x_rot, &state.k)
-            .map_err(|e| format!("glimmer L{layer_idx}: k_proj (prerot): {e:?}"))?;
-        weight_gemv_prerotated(gpu, &lw.v_proj, &state.x, x_rot, &state.v)
-            .map_err(|e| format!("glimmer L{layer_idx}: v_proj (prerot): {e:?}"))?;
-        weight_gemv_prerotated(gpu, &lw.attn_gate_proj, &state.x, x_rot, &state.attn_gate)
-            .map_err(|e| format!("glimmer L{layer_idx}: attn gate_proj (prerot): {e:?}"))?;
+        // gfx1100 MQ4/HFQ4 exact Glimmer shape: one fused Q+K+V+attn_gate GEMV
+        // (K=6656) instead of four sequential launches. fused_qkvza_hfq4g256
+        // selects the Glimmer-shaped module at (4096,256,256,4096,6656).
+        let dt = lw.q_proj.gpu_dtype;
+        let qkvg_same = lw.k_proj.gpu_dtype == dt
+            && lw.v_proj.gpu_dtype == dt
+            && lw.attn_gate_proj.gpu_dtype == dt;
+        let fused_qkvg = gpu.arch_caps.is_gfx1100()
+            && qkvg_same
+            && matches!(dt, DType::MQ4G256 | DType::HFQ4G256)
+            && lw.q_proj.m == 4096
+            && lw.k_proj.m == 256
+            && lw.v_proj.m == 256
+            && lw.attn_gate_proj.m == 4096
+            && lw.q_proj.k == 6656
+            && lw.k_proj.k == 6656
+            && lw.v_proj.k == 6656
+            && lw.attn_gate_proj.k == 6656;
+        if fused_qkvg {
+            let x_rot = x_rot_opt.ok_or_else(|| {
+                format!("glimmer L{layer_idx}: fused qkvg decode expected prerotated x")
+            })?;
+            gpu.fused_qkvza_hfq4g256(
+                &lw.q_proj.buf,
+                &lw.k_proj.buf,
+                &lw.v_proj.buf,
+                &lw.attn_gate_proj.buf,
+                x_rot,
+                &state.q,
+                &state.k,
+                &state.v,
+                &state.attn_gate,
+                lw.q_proj.m,
+                lw.k_proj.m,
+                lw.v_proj.m,
+                lw.attn_gate_proj.m,
+                lw.q_proj.k,
+            )
+            .map_err(|e| format!("glimmer L{layer_idx}: fused qkvg decode: {e:?}"))?;
+        } else {
+            let x_rot = x_rot_opt.as_ref().copied();
+            // x param is ignored when x_rot is Some; pass &state.x as placeholder
+            // (matches Gemma4's weight_gemv_prerotated(gpu, q_proj, x, Some(tmp_rot), q_out)).
+            weight_gemv_prerotated(gpu, &lw.q_proj, &state.x, x_rot, &state.q)
+                .map_err(|e| format!("glimmer L{layer_idx}: q_proj (prerot): {e:?}"))?;
+            weight_gemv_prerotated(gpu, &lw.k_proj, &state.x, x_rot, &state.k)
+                .map_err(|e| format!("glimmer L{layer_idx}: k_proj (prerot): {e:?}"))?;
+            weight_gemv_prerotated(gpu, &lw.v_proj, &state.x, x_rot, &state.v)
+                .map_err(|e| format!("glimmer L{layer_idx}: v_proj (prerot): {e:?}"))?;
+            weight_gemv_prerotated(gpu, &lw.attn_gate_proj, &state.x, x_rot, &state.attn_gate)
+                .map_err(|e| format!("glimmer L{layer_idx}: attn gate_proj (prerot): {e:?}"))?;
+        }
     } else {
         gpu.rmsnorm_f32(&state.x, &lw.input_layernorm, &state.tmp, rms_eps)
             .map_err(|e| format!("glimmer L{layer_idx}: input rmsnorm: {e:?}"))?;

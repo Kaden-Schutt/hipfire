@@ -3056,7 +3056,24 @@ impl Gpu {
             });
         let cdna_wave64 = self.arch_caps.is_wave64_native()
             || (self.arch_caps.is_rdna3_dgpu() && self.flags.rdna3_hfq4_qkv_wave64);
-        let (func_name, block, grid_x) = if rdna3_ldsx8 {
+        let glimmer_qkvg_k6656_gfx1100 = self.arch_caps.is_gfx1100()
+            && qkv_m == 4_096
+            && z_m == 256
+            && beta_m == 256
+            && alpha_m == 4_096
+            && k == 6_656;
+        let (func_name, block, grid_x) = if glimmer_qkvg_k6656_gfx1100 {
+            self.ensure_kernel(
+                "fused_glimmer_qkvg_hfq4g256_k6656_gfx1100",
+                kernels::FUSED_GLIMMER_QKVG_HFQ4G256_K6656_GFX1100_SRC,
+                "fused_glimmer_qkvg_hfq4g256_k6656_gfx1100",
+            )?;
+            (
+                "fused_glimmer_qkvg_hfq4g256_k6656_gfx1100",
+                [32u32, 1, 1],
+                total_m as u32,
+            )
+        } else if rdna3_ldsx8 {
             self.ensure_kernel(
                 "fused_qkvza_hfq4g256_ldsx8_gfx1100",
                 kernels::FUSED_QKVZA_HFQ4G256_LDSX8_GFX1100_SRC,

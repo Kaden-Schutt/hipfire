@@ -3550,6 +3550,19 @@ pub const FUSED_QKVZA_HFQ4G256_K2048_GFX1100_SRC: &str = concat!(
     include_str!("../../../kernels/src/fused_qkvza_hfq4g256.hip")
 );
 
+// Muse Glimmer gfx1100 AR decode: one fused Q+K+V+attention_gate HFQ4/MQ4
+// projection at exact shape q=4096, k=256, v=256, attention_gate=4096, K=6656
+// (26 groups). Host enforces dimensions and selects this identity; reuses the
+// generic fused_qkvza_hfq4g256 arithmetic template with fixed groups_per_row.
+// No buffer-load or experimental schedule opts — weight-cache policy only.
+pub const FUSED_GLIMMER_QKVG_HFQ4G256_K6656_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    "#define HIPFIRE_GLIMMER_QKVG_K6656 1\n",
+    "#define HIPFIRE_QKVZA_KERNEL_NAME fused_glimmer_qkvg_hfq4g256_k6656_gfx1100\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkvza_hfq4g256.hip")
+);
+
 /// Radiowave gfx1100 dual-row QKVZA probe. Two adjacent rows share each
 /// K=2048 activation load while preserving independent weight streams and the
 /// shipping four-chain reduction order.
