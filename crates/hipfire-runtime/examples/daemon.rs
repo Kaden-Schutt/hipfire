@@ -23773,7 +23773,6 @@ fn generate(
             assistant_prefix,
             pflash_state,
             pflash_cfg,
-            think_mode,
             user_explicit_sampling,
             top_k,
             min_p,
@@ -23792,6 +23791,7 @@ fn generate(
             top_p,
             max_tokens,
             max_think_tokens,
+            think_mode,
             tools,
             messages_history,
         );
@@ -29252,10 +29252,28 @@ enum GlimmerEmit {
 /// uncapped). The cap alone cannot stop the model from opening a self channel — it can only
 /// force-close one mid-flight, which wastes the tokens it already spent. Asking for a lower
 /// strength up front is what actually shortens the reasoning, so the two are wired together.
-fn glimmer_reasoning_strength(max_think_tokens: usize) -> &'static str {
+fn glimmer_reasoning_strength(
+    think_mode: hipfire_runtime::prompt_frame::ThinkMode,
+    max_think_tokens: usize,
+) -> &'static str {
+    use hipfire_runtime::prompt_frame::ThinkMode;
+    // An EXPLICIT request-level effort wins: the card presents reasoning strength as the
+    // user-facing dial, so `reasoning_effort` must reach the system block directly rather
+    // than being inferred from whatever token cap happens to be set.
+    match think_mode {
+        ThinkMode::High => return "high",
+        ThinkMode::Max => return "xhigh",
+        // `ThinkMode::from_str` folds "medium"/"med" into `Low`, so `Low` cannot distinguish
+        // the card's low from its medium. Fall through to the budget, which can — that keeps
+        // all four levels reachable without redefining `ThinkMode` for the other
+        // architectures that share it.
+        ThinkMode::Low | ThinkMode::NonThink => {}
+    }
     match max_think_tokens {
+        // `1` is the engine's "no thinking" sentinel. Muse Glimmer has no such mode — the
+        // Onyx system block always carries a strength — so it maps to the minimum, not to off.
         1 => "low",
-        0 => "high",
+        0 => "high", // uncapped: the template's own default
         n if n <= 512 => "low",
         n if n <= 2048 => "medium",
         n if n <= 8192 => "high",
@@ -29999,6 +30017,7 @@ fn generate_muse_glimmer(
     top_p: f32,
     max_tokens: usize,
     max_think_tokens: usize,
+    think_mode: hipfire_runtime::prompt_frame::ThinkMode,
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
 ) {
@@ -30062,7 +30081,7 @@ fn generate_muse_glimmer(
                 user: prompt,
                 enable_thinking: max_think_tokens != 1,
                 bos_token: Some("<bos>"),
-                reasoning_strength: Some(glimmer_reasoning_strength(max_think_tokens)),
+                reasoning_strength: Some(glimmer_reasoning_strength(think_mode, max_think_tokens)),
             };
             if tools.is_some() || messages_history.is_some() {
                 let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
@@ -41117,6 +41136,43 @@ mod glimmer_atem_parser_tests {
 #[cfg(test)]
 mod glimmer_reconcile_tests {
     use super::*;
+
+    /// The model card exposes exactly four reasoning strengths — low / medium / high / xhigh —
+    /// as a system-prompt directive. All four must be reachable, and an EXPLICIT
+    /// `reasoning_effort` must beat whatever token cap happens to be set.
+    #[test]
+    fn reasoning_strength_covers_all_four_card_levels() {
+        use hipfire_runtime::prompt_frame::ThinkMode;
+
+        // Explicit effort wins over the budget.
+        assert_eq!(glimmer_reasoning_strength(ThinkMode::High, 1), "high");
+        assert_eq!(glimmer_reasoning_strength(ThinkMode::Max, 1), "xhigh");
+
+        // `from_str` folds "medium" into `Low`, so the budget supplies the middle tier.
+        assert_eq!(glimmer_reasoning_strength(ThinkMode::Low, 512), "low");
+        assert_eq!(glimmer_reasoning_strength(ThinkMode::Low, 2048), "medium");
+        assert_eq!(glimmer_reasoning_strength(ThinkMode::Low, 8192), "high");
+        assert_eq!(glimmer_reasoning_strength(ThinkMode::Low, 16384), "xhigh");
+
+        // Glimmer has no non-thinking mode: the engine's `1` sentinel is the MINIMUM
+        // strength, never an off switch, and uncapped takes the template's own default.
+        assert_eq!(glimmer_reasoning_strength(ThinkMode::NonThink, 1), "low");
+        assert_eq!(glimmer_reasoning_strength(ThinkMode::NonThink, 0), "high");
+
+        // Every card level is producible.
+        let produced: std::collections::BTreeSet<&str> = [
+            glimmer_reasoning_strength(ThinkMode::Low, 512),
+            glimmer_reasoning_strength(ThinkMode::Low, 2048),
+            glimmer_reasoning_strength(ThinkMode::High, 0),
+            glimmer_reasoning_strength(ThinkMode::Max, 0),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            produced,
+            ["high", "low", "medium", "xhigh"].into_iter().collect()
+        );
+    }
     #[test]
     fn mirror_action_aligned() {
         assert_eq!(glimmer_mirror_action(5, 5), GlimmerMirrorAction::Aligned);
