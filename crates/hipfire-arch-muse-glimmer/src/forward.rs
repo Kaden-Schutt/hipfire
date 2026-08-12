@@ -1804,25 +1804,47 @@ fn prefill_chunk_batched(
             // costs nothing observable.
             //
             // `HIPFIRE_GLIMMER_WMMA_FULL=0` restores the scalar tile path.
-            let wmma_full = window == 0
-                && b > 1
+            // Sliding layers get the Muse-owned windowed sibling; full layers
+            // get the parent. Both are Q8 WMMA, so all 52 layers are now on
+            // matrix hardware instead of 13 of them.
+            let wmma_full = b > 1
                 && std::env::var("HIPFIRE_GLIMMER_WMMA_FULL")
                     .map(|v| v != "0" && !v.is_empty())
                     .unwrap_or(true);
+            let mut wmma_done = false;
             if wmma_full {
-                gpu.attention_q8_0_flash_prefill_wmma(
-                    &q,
-                    &k_cache_t,
-                    &v_cache_t,
-                    &attn_out,
-                    &pos_array,
-                    n_heads,
-                    n_kv,
-                    hd,
-                    b,
-                )
-                .map_err(|e| format!("glimmer prefill L{layer_idx} wmma full: {e:?}"))?;
-            } else {
+                if window == 0 {
+                    gpu.attention_q8_0_flash_prefill_wmma(
+                        &q,
+                        &k_cache_t,
+                        &v_cache_t,
+                        &attn_out,
+                        &pos_array,
+                        n_heads,
+                        n_kv,
+                        hd,
+                        b,
+                    )
+                    .map_err(|e| format!("glimmer prefill L{layer_idx} wmma full: {e:?}"))?;
+                    wmma_done = true;
+                } else {
+                    wmma_done = gpu
+                        .attention_q8_0_flash_prefill_wmma_swa(
+                            &q,
+                            &k_cache_t,
+                            &v_cache_t,
+                            &attn_out,
+                            &pos_array,
+                            n_heads,
+                            n_kv,
+                            hd,
+                            b,
+                            window,
+                        )
+                        .map_err(|e| format!("glimmer prefill L{layer_idx} wmma swa: {e:?}"))?;
+                }
+            }
+            if !wmma_done {
             let k_numel = k_cache_t.numel();
             let v_numel = v_cache_t.numel();
             let mut k_view = k_cache_t;

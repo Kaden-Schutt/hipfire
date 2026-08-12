@@ -2367,6 +2367,110 @@ impl Gpu {
         )
     }
 
+    /// Muse Glimmer-owned sliding-window Q8 WMMA flash prefill (gfx12 only).
+    ///
+    /// Sibling of [`Self::attention_q8_0_flash_prefill_wmma`], not a
+    /// replacement: nothing outside hipfire-arch-muse-glimmer calls it and no
+    /// shared kernel or selector changes. Adds a `window` argument so the 39
+    /// sliding layers can use WMMA at all — the parent takes no window, and
+    /// the tile-batched WMMA-FA upgrade is gated on
+    /// `tile_func_name == "attention_flash_asym4_tile_batched"`, so Q8 sliding
+    /// layers were falling to the scalar tile kernel.
+    ///
+    /// `window <= 0` reproduces the parent exactly.
+    ///
+    /// Returns `Ok(false)` without launching when the arch is not gfx12 WMMA,
+    /// so the caller can fall back.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_q8_0_flash_prefill_wmma_swa(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        batch_size: usize,
+        window: usize,
+    ) -> HipResult<bool> {
+        if !self.arch_caps.has_wmma_w32_gfx12() {
+            return Ok(false);
+        }
+        self.bind_thread()?;
+        assert!(head_dim % 32 == 0, "head_dim {head_dim} must be a multiple of 32");
+        assert!(head_dim <= 256, "head_dim {head_dim} exceeds MAX_D_CHUNKS*16");
+        // Mirrors the parent's compile-time contract: gfx12 needs head_dim as a
+        // constant or the unrolled float8_t output fragments spill 544 B/thread
+        // to scratch. SPLIT_Q and PREFETCH_V keep the parent's defaults.
+        let module = format!("attention_q8_0_flash_prefill_wmma_swa_gfx12_hd{head_dim}");
+        let src = format!(
+            "#define SPLIT_Q 0\n#define FIXED_HEAD_DIM {}\n#define PREFETCH_V 1\n{}",
+            head_dim,
+            kernels::ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SWA_GFX12_SRC
+        );
+        self.ensure_kernel(&module, &src, "attention_q8_0_flash_prefill_wmma_swa")?;
+        const M_TILE: usize = 16;
+        const V_STRIDE: usize = 18;
+        const S_STRIDE: usize = 18;
+        // MUST track the kernel's LDS layout exactly; under-allocating overruns
+        // V_lds_T / S_lds / m_lds and the kernel silently emits zeros.
+        let lds = (M_TILE * head_dim + head_dim * V_STRIDE + M_TILE * S_STRIDE) * 2
+            + M_TILE * 3 * 4;
+        assert!(lds <= 64 * 1024, "wmma swa flash prefill LDS {lds} exceeds 64KB");
+
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut q_ptr = q.buf.as_ptr();
+        let mut k_ptr = k_cache.buf.as_ptr();
+        let mut v_ptr = v_cache.buf.as_ptr();
+        let mut out_ptr = out.buf.as_ptr();
+        let mut pos_ptr = positions.buf.as_ptr();
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut bs = batch_size as i32;
+        let mut sc = scale;
+        let mut win = window as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut q_ptr as *mut _ as *mut c_void,
+            &mut k_ptr as *mut _ as *mut c_void,
+            &mut v_ptr as *mut _ as *mut c_void,
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut pos_ptr as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+            &mut win as *mut _ as *mut c_void,
+        ];
+        let grid_x = batch_size.div_ceil(M_TILE) as u32;
+        self.launch_maybe_blob(
+            "attention_q8_0_flash_prefill_wmma_swa",
+            [grid_x, n_heads as u32, 1],
+            [32, 1, 1],
+            lds as u32,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(q_ptr);
+                b.push_ptr(k_ptr);
+                b.push_ptr(v_ptr);
+                b.push_ptr(out_ptr);
+                b.push_ptr(pos_ptr);
+                b.push_i32(nh);
+                b.push_i32(nkv);
+                b.push_i32(hd);
+                b.push_i32(bs);
+                b.push_f32(sc);
+                b.push_i32(win);
+                b
+            },
+        )?;
+        Ok(true)
+    }
+
     /// Batched flash attention for Q8_0 KV — tile + reduce two-kernel path.
     /// No LDS capacity limit: tiles seq_len into chunks of `tile_size` only,
     /// so shared memory is O(tile_size), not O(max_ctx_len). Replaces the
