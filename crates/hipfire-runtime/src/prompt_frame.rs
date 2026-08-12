@@ -1331,19 +1331,29 @@ pub fn build_cached_history_jinja(
             // Must have at least one slot (reasoning alone without content is invalid per spec)
             return Ok(plain_tokens);
         }
-        // Validate tool count and recipients, and content/reasoning text
+        // Validate tool count and recipients, and reasoning provenance.
         if turn.tools.is_empty() {
-            // Content turn: must have no tool_calls on the Message
+            // Content turn: must have no tool_calls on the Message.
             if !m.tool_calls.is_empty() {
                 return Ok(plain_tokens);
             }
-            if let Some(c) = &turn.content {
-                if c.text != m.content {
-                    return Ok(plain_tokens);
-                }
-            } else {
+            if turn.content.is_none() {
                 return Ok(plain_tokens);
             }
+            // Deliberately NO `turn.content.text == m.content` check.
+            //
+            // Content identity is ALREADY what the cache key is derived from — the caller
+            // fingerprints the message's normalized content to find this entry, so a hit
+            // means the content matched under that normalization. Re-comparing the RAW
+            // strings here re-tests the same property with a *stricter* rule than the key,
+            // so any normalization the key forgives (whitespace collapse, `<think>`
+            // stripping the API layer applies) makes the key hit and this guard silently
+            // refuse — a splice that is found and then thrown away.
+            //
+            // Observed: a 4-turn coding session hit the key on turn 2 yet fell back to the
+            // plain render, and the retokenized reasoning diverged 74 tokens into the
+            // assistant turn (`lcp=173` against `prior_len=371`), collapsing the cache.
+            // `reasoning` still needs the check below because it is NOT part of the key.
         } else {
             // Tool turn: counts must match
             if turn.tools.len() != m.tool_calls.len() {
