@@ -4078,6 +4078,18 @@ pub const FUSED_GATE_UP_HFQ4G256_K1024_GFX1201_SRC: &str = concat!(
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/fused_gate_up_hfq4g256.hip")
 );
+// Muse Glimmer gfx1100 AR decode: one fused gate+up HFQ4/MQ4 projection at
+// exact shape gate_m=up_m=19968, K=6656 (26 groups). Host enforces dimensions
+// and selects this identity; reuses the generic fused_gate_up_hfq4g256
+// arithmetic template with fixed groups_per_row. No buffer-load or
+// experimental schedule opts — weight-cache policy only.
+pub const FUSED_GLIMMER_GATE_UP_HFQ4G256_K6656_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_FUSED_GATE_UP_KERNEL fused_glimmer_gate_up_hfq4g256_k6656_gfx1100\n",
+    "#define HIPFIRE_GLIMMER_GATE_UP_K6656 1\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_gate_up_hfq4g256.hip")
+);
 /// Fused gate+up for Q8_0 weights. Two Q8 GEMVs in one launch.
 /// Grid=[gate_m + up_m], block=[32]. +5.8 tok/s decode on dots.ocr.
 pub const FUSED_GATE_UP_Q8_0_SRC: &str =

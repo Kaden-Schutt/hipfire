@@ -21465,7 +21465,24 @@ impl Gpu {
         }
 
         let cdna_wave64 = self.arch_caps.is_wave64_native();
-        let (func_name, block, grid_x) = if cdna_wave64 {
+        // Muse Glimmer exact FFN gate+up shape on gfx1100: gate_m=up_m=19968, K=6656.
+        // Host-gated identity; reuses fused_gate_up_hfq4g256 arithmetic template.
+        let glimmer_gate_up_k6656_gfx1100 = self.arch_caps.is_gfx1100()
+            && gate_m == 19_968
+            && up_m == 19_968
+            && k == 6_656;
+        let (func_name, block, grid_x) = if glimmer_gate_up_k6656_gfx1100 {
+            self.ensure_kernel(
+                "fused_glimmer_gate_up_hfq4g256_k6656_gfx1100",
+                kernels::FUSED_GLIMMER_GATE_UP_HFQ4G256_K6656_GFX1100_SRC,
+                "fused_glimmer_gate_up_hfq4g256_k6656_gfx1100",
+            )?;
+            (
+                "fused_glimmer_gate_up_hfq4g256_k6656_gfx1100",
+                [32u32, 1, 1],
+                (gate_m + up_m) as u32,
+            )
+        } else if cdna_wave64 {
             // gfx94x v2: 2 wave64s = 4 rows/WG, +1.9% on AR decode
             // (commit 5bd75a69 sibling). Default ON; opt out via
             // HIPFIRE_GFX942_GEMV_V2=0.

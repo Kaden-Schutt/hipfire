@@ -757,11 +757,38 @@ fn glimmer_layer_decode(
             gpu, &lw.gate_proj, &state.x, &lw.pre_feedforward_layernorm, &state.tmp, &state.x_rot, rms_eps,
         )
         .map_err(|e| format!("glimmer L{layer_idx}: fused pre_ffn rmsnorm+rotate: {e:?}"))?;
-        let x_rot = x_rot_opt.as_ref().copied();
-        weight_gemv_prerotated(gpu, &lw.gate_proj, &state.x, x_rot, &state.gate_ffn)
-            .map_err(|e| format!("glimmer L{layer_idx}: gate_proj (prerot): {e:?}"))?;
-        weight_gemv_prerotated(gpu, &lw.up_proj, &state.x, x_rot, &state.up_ffn)
-            .map_err(|e| format!("glimmer L{layer_idx}: up_proj (prerot): {e:?}"))?;
+        // gfx1100 MQ4/HFQ4 exact Glimmer FFN shape: one fused gate+up GEMV
+        // (gate_m=up_m=19968, K=6656) instead of two sequential launches.
+        let dt = lw.gate_proj.gpu_dtype;
+        let fused_gu = gpu.arch_caps.is_gfx1100()
+            && lw.up_proj.gpu_dtype == dt
+            && matches!(dt, DType::MQ4G256 | DType::HFQ4G256)
+            && lw.gate_proj.m == 19968
+            && lw.up_proj.m == 19968
+            && lw.gate_proj.k == 6656
+            && lw.up_proj.k == 6656;
+        if fused_gu {
+            let x_rot = x_rot_opt.ok_or_else(|| {
+                format!("glimmer L{layer_idx}: fused gate+up decode expected prerotated x")
+            })?;
+            gpu.fused_gate_up_hfq4g256(
+                &lw.gate_proj.buf,
+                &lw.up_proj.buf,
+                x_rot,
+                &state.gate_ffn,
+                &state.up_ffn,
+                lw.gate_proj.m,
+                lw.up_proj.m,
+                lw.gate_proj.k,
+            )
+            .map_err(|e| format!("glimmer L{layer_idx}: fused gate+up decode: {e:?}"))?;
+        } else {
+            let x_rot = x_rot_opt.as_ref().copied();
+            weight_gemv_prerotated(gpu, &lw.gate_proj, &state.x, x_rot, &state.gate_ffn)
+                .map_err(|e| format!("glimmer L{layer_idx}: gate_proj (prerot): {e:?}"))?;
+            weight_gemv_prerotated(gpu, &lw.up_proj, &state.x, x_rot, &state.up_ffn)
+                .map_err(|e| format!("glimmer L{layer_idx}: up_proj (prerot): {e:?}"))?;
+        }
     } else {
         gpu.rmsnorm_f32(&state.x, &lw.pre_feedforward_layernorm, &state.tmp, rms_eps)
             .map_err(|e| format!("glimmer L{layer_idx}: pre_ffn rmsnorm: {e:?}"))?;

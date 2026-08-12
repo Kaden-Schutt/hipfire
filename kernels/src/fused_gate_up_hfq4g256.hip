@@ -44,6 +44,12 @@ extern "C" __global__ void HIPFIRE_FUSED_GATE_UP_KERNEL(
 
 #if defined(HIPFIRE_FUSED_GATE_UP_K1024)
     const int groups_per_row = 4;
+#elif defined(HIPFIRE_GLIMMER_GATE_UP_K6656)
+    // Muse Glimmer AR decode fused gate+up path: exact host-enforced shape is
+    // gate_m=up_m=19968, K=6656 (26 groups, quads=6, tail=2). Arithmetic
+    // (accumulator ownership, FMA order, tail placement, reduction tree)
+    // stays identical to the generic template.
+    const int groups_per_row = 26;
 #else
     const int groups_per_row = K / 256;
 #endif
