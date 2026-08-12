@@ -5134,6 +5134,38 @@ mod terminal_control_tests {
         }
     }
 
+    /// `glimmer_longest_marker_suffix` byte-slices from the end of the pending
+    /// buffer looking for a split Harmony marker. It must skip offsets that
+    /// land inside a multibyte character.
+    ///
+    /// Regression: the first version did `&s[s.len() - len..]` unguarded and
+    /// panicked with "byte index N is not a char boundary" the moment Glimmer
+    /// emitted a non-ASCII character — `×` in an arithmetic reasoning span took
+    /// the whole daemon down mid-generation. Markers are pure ASCII, so an
+    /// offset inside a multibyte char can never start one.
+    #[test]
+    fn glimmer_marker_suffix_is_char_boundary_safe() {
+        // Each of these ends in (or contains) a multibyte char at a position the
+        // reverse scan would probe.
+        for s in [
+            "17 × 23",
+            "café",
+            "—",
+            "reasoning ×",
+            "emoji 😀",
+            "mixed ×<|eo",
+        ] {
+            let n = super::glimmer_longest_marker_suffix(s);
+            assert!(
+                s.is_char_boundary(s.len() - n),
+                "returned len {n} splits a char in {s:?}"
+            );
+        }
+        // Still detects a genuine split marker.
+        assert_eq!(super::glimmer_longest_marker_suffix("abc<|eo"), 4);
+        assert_eq!(super::glimmer_longest_marker_suffix("abc"), 0);
+    }
+
     #[test]
     fn early_commit_before_ready_cannot_commit() {
         let _lock = begin_test();
@@ -10000,6 +10032,7 @@ fn fail_closed_reset_target_and_spec(
         if let Some(ModelState::MuseGlimmer(bundle)) = m.state.as_mut() {
             bundle.state.reset();
             bundle.target_hidden_host.clear();
+            m.glimmer_prefill_boundary = 0;
         }
         if let Some(ad) = m.kv_adaptive.as_mut() {
             if let Some(ModelState::Qwen35(b)) = m.state.as_mut() {
@@ -28665,7 +28698,7 @@ fn generate_gemma4(
                 template,
                 system: system_prompt,
                 user: prompt,
-                enable_thinking: false,
+                enable_thinking: max_think_tokens != 1,
                 bos_token: Some("<bos>"),
             };
             let render_result = if tools.is_some() || messages_history.is_some() {
@@ -29104,6 +29137,212 @@ fn glimmer_tap_layers(n_layers: usize) -> Vec<usize> {
     }
 }
 
+/// Harmony channel state for Muse Glimmer (arch 14).
+/// Model generates ` to=<recipient><|message|>...<|eom|>` per channel.
+/// `<|eom|>` ending a `self` (reasoning) channel -> keep decoding into answer;
+/// ending a `user` (final) channel -> stop. `<|eot|>` / eos always stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GlimmerChannel {
+    AwaitingHeader,
+    Reasoning,
+    Answer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GlimmerEmit {
+    Reasoning(String),
+    Token(String),
+}
+
+struct GlimmerHarmonyRouter {
+    state: GlimmerChannel,
+    pending: String,
+    reasoning_tokens: usize,
+    max_think_tokens: usize,
+    just_forced: bool,
+}
+
+impl GlimmerHarmonyRouter {
+    fn new(max_think_tokens: usize) -> Self {
+        Self {
+            state: GlimmerChannel::AwaitingHeader,
+            pending: String::new(),
+            reasoning_tokens: 0,
+            max_think_tokens,
+            just_forced: false,
+        }
+    }
+    fn thinking_enabled(&self) -> bool {
+        self.max_think_tokens != 1
+    }
+    fn push(&mut self, frag: &str) -> (Vec<GlimmerEmit>, bool) {
+        if frag.is_empty() {
+            return (Vec::new(), false);
+        }
+        self.pending.push_str(frag);
+        let mut out = Vec::new();
+        let mut should_stop = false;
+        let entered_as_reasoning = self.state == GlimmerChannel::Reasoning;
+        loop {
+            match self.state {
+                GlimmerChannel::AwaitingHeader => {
+                    if let Some(at) = self.pending.find("<|message|>") {
+                        let header_end = at + "<|message|>".len();
+                        let header_str = self.pending[..header_end].to_string();
+                        let recipient = if let Some(to_pos) = header_str.rfind(" to=") {
+                            header_str[to_pos + 4..at].trim().to_string()
+                        } else {
+                            "user".to_string()
+                        };
+                        let is_self = recipient == "self";
+                        let new_state = if is_self && self.thinking_enabled() {
+                            GlimmerChannel::Reasoning
+                        } else {
+                            GlimmerChannel::Answer
+                        };
+                        self.pending.drain(..header_end);
+                        self.state = new_state;
+                        continue;
+                    } else {
+                        let hold = glimmer_longest_marker_suffix(&self.pending);
+                        if hold == 0 || hold >= self.pending.len() {
+                            break;
+                        }
+                        break;
+                    }
+                }
+                GlimmerChannel::Reasoning | GlimmerChannel::Answer => {
+                    let eom = self.pending.find("<|eom|>");
+                    let eot = self.pending.find("<|eot|>");
+                    let eos = self.pending.find("<|end_of_text|>");
+                    let mut best: Option<(usize, &'static str)> = None;
+                    for (pos, name) in [(eom, "<|eom|>"), (eot, "<|eot|>"), (eos, "<|end_of_text|>")] {
+                        if let Some(p) = pos {
+                            if best.map_or(true, |(bp, _)| p < bp) {
+                                best = Some((p, name));
+                            }
+                        }
+                    }
+                    if let Some((at, marker)) = best {
+                        if at > 0 {
+                            let text = self.pending[..at].to_string();
+                            self.pending.drain(..at);
+                            if !text.is_empty() {
+                                let ev = if self.state == GlimmerChannel::Reasoning {
+                                    GlimmerEmit::Reasoning(text)
+                                } else {
+                                    GlimmerEmit::Token(text)
+                                };
+                                out.push(ev);
+                            }
+                            continue;
+                        }
+                        self.pending.drain(..marker.len());
+                        if marker == "<|eom|>" {
+                            if self.state == GlimmerChannel::Reasoning {
+                                self.state = GlimmerChannel::AwaitingHeader;
+                                continue;
+                            } else if self.just_forced {
+                                // This eom is the stale reasoning terminator after a forced close
+                                self.just_forced = false;
+                                self.state = GlimmerChannel::AwaitingHeader;
+                                continue;
+                            } else {
+                                should_stop = true;
+                                break;
+                            }
+                        } else {
+                            should_stop = true;
+                            break;
+                        }
+                    } else {
+                        let hold = glimmer_longest_marker_suffix(&self.pending);
+                        let emit_len = self.pending.len().saturating_sub(hold);
+                        if emit_len > 0 {
+                            let text = self.pending[..emit_len].to_string();
+                            self.pending.drain(..emit_len);
+                            if !text.is_empty() {
+                                let ev = if self.state == GlimmerChannel::Reasoning {
+                                    GlimmerEmit::Reasoning(text)
+                                } else {
+                                    GlimmerEmit::Token(text)
+                                };
+                                out.push(ev);
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        let emitted_reasoning = out.iter().any(|e| matches!(e, GlimmerEmit::Reasoning(_)));
+        let should_count = entered_as_reasoning || emitted_reasoning;
+        if should_count && self.max_think_tokens != 0 && self.max_think_tokens != 1 && self.reasoning_tokens < self.max_think_tokens {
+            self.reasoning_tokens += 1;
+            if self.reasoning_tokens >= self.max_think_tokens && self.state == GlimmerChannel::Reasoning {
+                if !self.pending.is_empty() {
+                    let tail = std::mem::take(&mut self.pending);
+                    if !is_marker_prefix(&tail) && !tail.is_empty() {
+                        out.push(GlimmerEmit::Reasoning(tail));
+                    }
+                }
+                self.state = GlimmerChannel::Answer;
+                self.just_forced = true;
+            }
+        }
+        (out, should_stop)
+    }
+    fn flush(&mut self) -> Vec<GlimmerEmit> {
+        if self.pending.is_empty() {
+            return Vec::new();
+        }
+        if self.state == GlimmerChannel::AwaitingHeader {
+            self.pending.clear();
+            return Vec::new();
+        }
+        let text = std::mem::take(&mut self.pending);
+        if is_marker_prefix(&text) {
+            return Vec::new();
+        }
+        vec![if self.state == GlimmerChannel::Reasoning {
+            GlimmerEmit::Reasoning(text)
+        } else {
+            GlimmerEmit::Token(text)
+        }]
+    }
+}
+
+fn is_marker_prefix(s: &str) -> bool {
+    const MARKERS: &[&str] = &["<|start|>", "<|message|>", "<|eom|>", "<|eot|>", "<|end_of_text|>"];
+    MARKERS.iter().any(|m| m.starts_with(s) || s.starts_with(m))
+}
+
+/// Length in BYTES of the longest suffix of `s` that could be the start of a
+/// Harmony marker, so a marker split across two decode chunks is not emitted
+/// as visible text.
+///
+/// Must respect char boundaries: an earlier version sliced `&s[s.len()-len..]`
+/// for every len and panicked with "byte index N is not a char boundary" the
+/// first time the model emitted a multibyte character — `×` in an arithmetic
+/// reasoning span was enough to kill the daemon. Markers are pure ASCII, so a
+/// boundary that falls inside a multibyte char can never begin one; skip it.
+fn glimmer_longest_marker_suffix(s: &str) -> usize {
+    const MARKERS: &[&str] = &["<|start|>", "<|message|>", "<|eom|>", "<|eot|>", "<|end_of_text|>"];
+    let max = MARKERS.iter().map(|m| m.len()).max().unwrap_or(0);
+    let upper = s.len().min(max.saturating_sub(1));
+    for len in (1..=upper).rev() {
+        let start = s.len() - len;
+        if !s.is_char_boundary(start) {
+            continue;
+        }
+        let suffix = &s[start..];
+        if MARKERS.iter().any(|m| m.starts_with(suffix)) {
+            return len;
+        }
+    }
+    0
+}
+
 fn generate_muse_glimmer(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
@@ -29118,8 +29357,7 @@ fn generate_muse_glimmer(
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
 ) {
-    // Glimmer has no thinking budget; silence the param explicitly.
-    let _ = max_think_tokens;
+    // max_think_tokens semantics: 1=no-think, 0=uncapped, N=cap N reasoning tokens then force-close.
 
     if m.tokenizer.is_none() {
         emit_error_with_id(stdout, id, "tokenizer not loaded");
@@ -29153,7 +29391,7 @@ fn generate_muse_glimmer(
                 template,
                 system: system_prompt,
                 user: prompt,
-                enable_thinking: false,
+                enable_thinking: max_think_tokens != 1,
                 bos_token: Some("<bos>"),
             };
             let render_result = if tools.is_some() || messages_history.is_some() {
@@ -29225,12 +29463,10 @@ fn generate_muse_glimmer(
         // (covers vocab-registered specials) plus a single-id encode probe
         // for tokenizers that expose the string via encode.
         for candidate in [
-            // Muse Glimmer's own turn boundaries. `eos_token` in
-            // tokenizer_config is `<|end_of_text|>` (200001), but the model
-            // ends a TURN with `<|eom|>` (200007) — observed emitting it and
-            // then looping because it was not a stop. `<|eot|>` (200008) is the
-            // sibling. Both must stop, or decode runs to max_tokens.
-            "<|eom|>",
+            // Muse Glimmer turn boundaries: `<|end_of_text|>` (200001) and `<|eot|>` (200008)
+            // always stop. `<|eom|>` does NOT always stop — it ends the CURRENT CHANNEL
+            // (self->keep decoding into answer, user->stop), so it is handled by the
+            // Harmony router, not the static stop set.
             "<|eot|>",
             "<|end_of_text|>",
             "<end_of_turn>",
@@ -29270,6 +29506,7 @@ fn generate_muse_glimmer(
         eprintln!("[daemon] arch_id=14 context full ({n}/{cap}) — resetting GlimmerState");
         bundle.state.reset();
         bundle.target_hidden_host.clear();
+        m.glimmer_prefill_boundary = 0;
         m.seq_pos = 0;
         m.conversation_tokens.clear();
     }
@@ -29300,6 +29537,7 @@ fn generate_muse_glimmer(
     let (prefill_ids, prefill_start_pos): (Vec<u32>, u32) = {
         let cache_disabled =
             std::env::var("HIPFIRE_GLIMMER_PROMPT_CACHE").ok().as_deref() == Some("0");
+        let trace = std::env::var("HIPFIRE_GLIMMER_CACHE_TRACE").ok().as_deref() == Some("1");
         if cache_disabled {
             // Opting out of the cache does NOT restore the CLI's per-request
             // reset — arch 14 is in the cache_capable allowlist either way, so
@@ -29308,6 +29546,7 @@ fn generate_muse_glimmer(
             if bundle.state.n_tokens > 0 || !m.conversation_tokens.is_empty() {
                 bundle.state.reset();
                 bundle.target_hidden_host.clear();
+                m.glimmer_prefill_boundary = 0;
                 m.conversation_tokens.clear();
                 m.seq_pos = 0;
             }
@@ -29319,7 +29558,31 @@ fn generate_muse_glimmer(
             while lcp < max_match && m.conversation_tokens[lcp] == prompt_ids[lcp] {
                 lcp += 1;
             }
+            // Reuse ONLY KV written by the batched prefill path. Prefill and
+            // decode write KV with different kernels (batched WMMA attention
+            // vs the SWA / flash decode path), so a decode-written position
+            // does not reproduce what a cold prefill would put there.
+            //
+            // This is not a last-bits concern. Measured on a 3-turn chain with
+            // thinking on: an unclamped lcp=59 against a 58-token prompt reused
+            // exactly ONE decode-written position, and turn 1 then answered
+            // from the top of the conversation ("Write a Python function that
+            // reverses a string...") instead of from the current user message
+            // ("Now make it handle unicode correctly..."). Structurally wrong
+            // output, from a single position of mismatched KV.
+            let lcp = lcp.min(m.glimmer_prefill_boundary);
             let cache_hit = lcp > 0 && lcp < prompt_ids.len();
+            if trace {
+                eprintln!(
+                    "[glimmer-cache] prior_len={} n_tokens={} prompt_len={} boundary={} lcp={} hit={}",
+                    prior_len,
+                    bundle.state.n_tokens,
+                    prompt_ids.len(),
+                    m.glimmer_prefill_boundary,
+                    lcp,
+                    cache_hit
+                );
+            }
             if cache_hit {
                 bundle.state.n_tokens = lcp;
                 m.conversation_tokens.truncate(lcp);
@@ -29343,6 +29606,7 @@ fn generate_muse_glimmer(
                 if bundle.state.n_tokens > 0 || prior_len > 0 {
                     bundle.state.reset();
                     bundle.target_hidden_host.clear();
+                    m.glimmer_prefill_boundary = 0;
                     m.conversation_tokens.clear();
                     m.seq_pos = 0;
                 }
@@ -29388,6 +29652,10 @@ fn generate_muse_glimmer(
     for &tok in &prefill_ids {
         m.conversation_tokens.push(tok);
     }
+    // Everything up to here had its KV written by the batched prefill path, so
+    // it is the furthest a later turn may reuse. Tokens appended below by the
+    // decode loop are written by a different kernel and must not be reused.
+    m.glimmer_prefill_boundary = m.conversation_tokens.len();
     let prefill_ms = t0.elapsed().as_millis();
 
     // ── Decode loop. Sample host-side from the running logits vector. ──
@@ -29399,6 +29667,7 @@ fn generate_muse_glimmer(
 
     let mut generated_count: usize = 0;
     let decode_t0 = Instant::now();
+    let mut harmony_router = GlimmerHarmonyRouter::new(max_think_tokens);
     // Speculative path: when a DFlash drafter (arch 23, 5-layer diffusion) is
     // present and temp==0 (greedy), drive the shared `accept_greedy_prefix`
     // rule. Otherwise fall back to AR. The drafter being present is gated by
@@ -29437,12 +29706,39 @@ fn generate_muse_glimmer(
         // seed is that token, and drafts are for the following positions.
         // Without this, the first window would emit picks[1] (second token)
         // and the output would start mid-sequence (e.g. ":" instead of "def").
+        // Harmony: route seed through channel router so header ` to=self<|message|>` is stripped
         if !stop_set.contains(&last_pick) && generated_count < max_tokens {
             let frag = m.tokenizer.as_ref().unwrap().decode(&[last_pick]);
-            let _ = writeln!(stdout, "{}", serde_json::json!({"type":"token","id":id,"text":frag}));
-            let _ = stdout.flush();
+            // Feed through harmony router; header fragments produce no visible event
+            let (events, should_stop_seed) = harmony_router.push(&frag);
+            for ev in events {
+                match ev {
+                    GlimmerEmit::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
+                    GlimmerEmit::Token(text) => emit_visible_token(stdout, id, &text),
+                }
+            }
+            // Seed was routed through harmony; if it indicated stop, we still count it but don't enter spec loop
             m.conversation_tokens.push(last_pick);
             generated_count += 1;
+            if should_stop_seed {
+                // Seed closed final channel – finish immediately
+                // Still need to advance state? The seed token already counted, skip spec loop
+                // Fall through to post-spec finalization after clearing windows
+                // Set a flag to skip loop
+                let tau = 0.0;
+                eprintln!("[glimmer-spec] seed is stop, tau {:.3}", tau);
+                // Emit done directly and return (avoid entering loop)
+                // Reuse common done emission below – set windows=0 and jump to done
+                // For simplicity, just break out by setting use_spec false path via return
+                // We'll handle by directly emitting done and returning
+                let decode_ms = decode_t0.elapsed().as_millis().max(1);
+                let total_ms = t0.elapsed().as_millis().max(1);
+                let tok_s = if generated_count > 0 { (generated_count as f64 * 1000.0) / decode_ms as f64 } else { 0.0 };
+                let _ = writeln!(stdout, r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_ms":{},"total_ms":{}}}"#, id, generated_count, tok_s, prefill_ms, total_ms);
+                let _ = stdout.flush();
+                m.seq_pos = bundle.state.n_tokens;
+                return;
+            }
             // Write seed's KV at cur_pos (already done by prefill? No, prefill's last token was prompt, not seed)
             // The seed needs to be written at cur_pos before drafting.
             // Do a single decode_step for the seed to advance KV and get its logits for next window.
@@ -29569,10 +29865,16 @@ fn generate_muse_glimmer(
                 };
                 if stop_set.contains(&next_tok) { break; }
                 let frag = m.tokenizer.as_ref().unwrap().decode(&[next_tok]);
-                let _ = writeln!(stdout, "{}", serde_json::json!({"type":"token","id":id,"text":frag}));
-                let _ = stdout.flush();
+                let (events, should_stop_fb) = harmony_router.push(&frag);
+                for ev in events {
+                    match ev {
+                        GlimmerEmit::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
+                        GlimmerEmit::Token(text) => emit_visible_token(stdout, id, &text),
+                    }
+                }
                 m.conversation_tokens.push(next_tok);
                 generated_count += 1;
+                if should_stop_fb { break; }
                 if bundle.state.n_tokens >= cache_cap { break; }
                 let pos = bundle.state.n_tokens as u32;
                 match glimmer::forward::decode_step(&bundle.config, &bundle.weights, &mut bundle.state, gpu, next_tok, pos) {
@@ -29768,25 +30070,48 @@ fn generate_muse_glimmer(
                     eprintln!("[glimmer-spec] PERTURB CHECK OK: forcing draft[0]=target_pick[0] changed accept {} -> {} — comparison can fail, drafter ran (windows={})", ga.accepted, ga2.accepted, windows);
                 }
             }
-            // Emit
+            // Emit via Harmony router: header stripped, reasoning vs token, eom handling
+            let mut should_stop_block = false;
             for &tok in &to_emit {
                 if generated_count >= max_tokens { break; }
+                // eos/eot always stop; eom depends on channel — let router decide via text marker.
+                // But token-level eos/eot short-circuit still needed to avoid decode_step on stop token?
+                // We check stop_set for eos/eot only (no eom) — eom is not in stop_set.
                 if stop_set.contains(&tok) {
-                    // Still need to set last_pick for outer loop's seed before break
+                    // eos/eot: feed marker through router to flush pending, then break
+                    let frag = m.tokenizer.as_ref().unwrap().decode(&[tok]);
+                    let (events, _) = harmony_router.push(&frag);
+                    for ev in events {
+                        match ev {
+                            GlimmerEmit::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
+                            GlimmerEmit::Token(text) => emit_visible_token(stdout, id, &text),
+                        }
+                    }
                     last_pick = tok;
+                    // Don't emit stop marker itself; still count token for conversation?
+                    m.conversation_tokens.push(tok);
                     generated_count += 1;
-                    // Don't emit stop token's frag
+                    should_stop_block = true;
                     break;
                 }
                 let frag = m.tokenizer.as_ref().unwrap().decode(&[tok]);
-                let _ = writeln!(stdout, "{}", serde_json::json!({"type":"token","id":id,"text":frag}));
-                let _ = stdout.flush();
+                let (events, should_stop) = harmony_router.push(&frag);
+                for ev in events {
+                    match ev {
+                        GlimmerEmit::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
+                        GlimmerEmit::Token(text) => emit_visible_token(stdout, id, &text),
+                    }
+                }
                 m.conversation_tokens.push(tok);
                 generated_count += 1;
-                if stop_set.contains(&tok) { break; }
+                if should_stop {
+                    // eom closed a final channel => stop entire decode
+                    last_pick = tok;
+                    should_stop_block = true;
+                    break;
+                }
             }
-            // Stop if we emitted a stop token
-            if to_emit.iter().any(|t| stop_set.contains(t)) { break; }
+            if should_stop_block { break; }
             last_pick = bonus;
             // If we stopped on max_tokens, outer loop will break
             // Update tau stats
@@ -29797,14 +30122,27 @@ fn generate_muse_glimmer(
             eprintln!("[glimmer-spec] done: windows {} proposed {} accepted {} tau {:.3} (bonus per window counted)", windows, total_proposed, total_accepted, tau);
         }
     } else {
-        // AR fallback (original loop)
+        // AR fallback with Harmony channel routing
         loop {
             if generated_count >= max_tokens {
                 break;
             }
             let next_tok =
                 deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
+            // eos/eot always stop; eom is handled via router text marker
             if stop_set.contains(&next_tok) {
+                // Flush any pending via router marker path then stop
+                let frag = m.tokenizer.as_ref().unwrap().decode(&[next_tok]);
+                let (events, _) = harmony_router.push(&frag);
+                for ev in events {
+                    match ev {
+                        GlimmerEmit::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
+                        GlimmerEmit::Token(text) => emit_visible_token(stdout, id, &text),
+                    }
+                }
+                // Push stop token to KV? No — mirror prior break-before-push for eos.
+                // For Harmony we already pushed reasoning/answer for prior tokens; stop token itself
+                // is not part of visible sequence, but we still need to handle flush.
                 break;
             }
 
@@ -29812,15 +30150,19 @@ fn generate_muse_glimmer(
                 let tokenizer = m.tokenizer.as_ref().unwrap();
                 tokenizer.decode(&[next_tok])
             };
-            let envelope = serde_json::json!({
-                "type": "token",
-                "id": id,
-                "text": frag,
-            });
-            let _ = writeln!(stdout, "{}", envelope);
-            let _ = stdout.flush();
+            let (events, should_stop) = harmony_router.push(&frag);
+            for ev in events {
+                match ev {
+                    GlimmerEmit::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
+                    GlimmerEmit::Token(text) => emit_visible_token(stdout, id, &text),
+                }
+            }
             m.conversation_tokens.push(next_tok);
             generated_count += 1;
+
+            if should_stop {
+                break;
+            }
 
             if bundle.state.n_tokens >= cache_cap {
                 break;
@@ -29841,6 +30183,13 @@ fn generate_muse_glimmer(
                     emit_error_with_id(stdout, id, format!("muse_glimmer decode failed: {e:?}"));
                     return;
                 }
+            }
+        }
+        // Flush any trailing incomplete channel text
+        for ev in harmony_router.flush() {
+            match ev {
+                GlimmerEmit::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
+                GlimmerEmit::Token(text) => emit_visible_token(stdout, id, &text),
             }
         }
     }

@@ -469,6 +469,18 @@ pub struct LoadedModel {
     pub eviction: Option<Eviction>,
     pub kv_adaptive: Option<hipfire_runtime::kv_adaptive::KvAdaptive>,
     pub conversation_tokens: Vec<u32>,
+    /// Number of leading `conversation_tokens` whose KV was written by the
+    /// BATCHED PREFILL path, as opposed to by per-token decode.
+    ///
+    /// Glimmer's prefix cache may only reuse this prefix. Prefill and decode
+    /// write KV with different kernels (batched WMMA attention vs the SWA /
+    /// flash decode path), so a position written by decode does not reproduce
+    /// what a cold prefill would put there. Reusing past this boundary was
+    /// measured to change the model's continuation, not merely its last bits:
+    /// with lcp=59 against a 58-token prompt, turn 1 answered from the top of
+    /// the conversation instead of from the current user message.
+    pub glimmer_prefill_boundary: usize,
+
     pub prefill_checkpoints: Vec<(usize, DeltaNetSnapshot)>,
     pub dflash_checkpoints: Vec<(usize, DeltaNetSnapshot)>,
     pub asst_turn_cache: AsstTurnCache,
@@ -545,6 +557,7 @@ impl LoadedModel {
             eviction: None,
             kv_adaptive: None,
             conversation_tokens: Vec::new(),
+            glimmer_prefill_boundary: 0,
             asst_turn_cache: AsstTurnCache::new_from_env(),
             prefill_checkpoints: Vec::new(),
             dflash_checkpoints: Vec::new(),
