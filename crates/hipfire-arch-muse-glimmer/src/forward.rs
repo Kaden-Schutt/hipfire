@@ -1521,6 +1521,32 @@ fn prefill_chunk_batched(
         .memcpy_htod(&pos_array.buf, &pos_bytes)
         .map_err(|e| format!("glimmer prefill htod pos: {e:?}"))?;
 
+    // Window-bounded tile origin for the sliding layers, computed ONCE per
+    // chunk. Every sliding layer shares the same window and the same chunk
+    // position, so the rebased positions are identical across all 39 of them;
+    // the full (window==0) layers use origin 0 and the unshifted array. This
+    // was briefly built inside the layer loop, which allocated 52 tensors per
+    // chunk and never freed them.
+    let sliding_window = cfg.sliding_window;
+    let sliding_origin = if sliding_window > 0 && seq_len > sliding_window {
+        ((position as usize + 1).saturating_sub(sliding_window) / 128) * 128
+    } else {
+        0
+    };
+    let shifted_pos_array = if sliding_origin > 0 {
+        let sd: Vec<i32> = (0..b)
+            .map(|i| (position as usize + i - sliding_origin) as i32)
+            .collect();
+        let sb: Vec<u8> = sd.iter().flat_map(|p| p.to_ne_bytes()).collect();
+        let t = alloc(gpu, b, "shifted_pos")?;
+        gpu.hip
+            .memcpy_htod(&t.buf, &sb)
+            .map_err(|e| format!("glimmer prefill htod shifted pos: {e:?}"))?;
+        Some(t)
+    } else {
+        None
+    };
+
     // ── Embedding ──
     {
         let x_single = alloc(gpu, dim, "x_single")?;
@@ -1722,17 +1748,122 @@ fn prefill_chunk_batched(
                 state.prefill_flash_partials = Some(buf);
             }
             let partials = state.prefill_flash_partials.as_ref().unwrap();
+
+            // Window-bounded tile origin.
+            //
+            // The flash launcher sets grid depth to ceil(max_ctx_len/128) and
+            // the kernel maps tile_id -> keys [tile_id*128, +128) from the
+            // cache base, so a sliding layer launches a block per 128 keys of
+            // the WHOLE context even though only `window` of them can be in
+            // range. At ctx 16384 that is 128 blocks of which 112 immediately
+            // take the empty-partial early-return: 88% pure launch overhead,
+            // and the reduce still walks all 128 partials per head. Measured,
+            // this is why Glimmer's over-window growth is 146.4 µs/tok per 1k
+            // instead of the 75.8 that 13-of-52 growing layers predicts.
+            //
+            // Rebasing the KV pointer fixes it with NO kernel change: shift
+            // keys, positions and seq_len by the same tile-aligned origin and
+            // every comparison the kernel makes (causal t <= query position,
+            // win_lo = seq_len - window) is unchanged, because all three are
+            // relative. RoPE is already baked into the stored K, so nothing
+            // else depends on absolute position, and tree_bias is None here.
+            //
+            // The origin must be (a) tile-aligned, else tile_start stops
+            // landing on a key boundary, and (b) no greater than the SMALLEST
+            // win_lo across the chunk, else the earliest row loses in-window
+            // keys. Row i has seq_len = position+1+i, so the minimum is at
+            // i = 0.
+            //
+            // FULL (window==0) LAYERS GO TO THE WMMA KERNEL INSTEAD.
+            // attention_flash_q8_0_tile_batched is SCALAR for Q8 KV: the
+            // WMMA-FA upgrade in launch_asym_flash_batched is gated on
+            //     tile_func_name == "attention_flash_asym4_tile_batched"
+            // (attention.rs), and there is no Q8 tile-batched WMMA kernel, so
+            // Glimmer's Q8 cache silently never qualified. head_dim=128,
+            // tree_bias=None and V_MODE_Q8 all pass; only the asym4 name test
+            // fails. That is why prefill falls off as if WMMA were inactive —
+            // it is inactive.
+            //
+            // attention_q8_0_flash_prefill_wmma IS a Q8 WMMA flash kernel and
+            // is the default elsewhere; its dispatch site records 1.9x the
+            // scalar flash kernel, 1.21x @2048 rising to 2.47x @12288. It
+            // takes no `window`, so it is full-causal only — which is exactly
+            // the 13 NoPE layers, and those are the ones whose cost grows
+            // without bound. The 39 sliding layers still need masking and stay
+            // on the tile path with the rebased origin below.
+            //
+            // It computes in f16 (relative L2 ~1e-3 vs the f32 reference), so
+            // this is a real precision trade rather than a free win. DEFAULT
+            // ON anyway, for two reasons. The engine already makes exactly this
+            // trade for every other Q8 arch — the dispatch site defaults
+            // `HIPFIRE_FLASH_PREFILL_KERNEL` to "wmma" — so holding Glimmer to
+            // a stricter bar would be inconsistent, not careful. And measured
+            // on all three prefill fixtures at 64 generated tokens, greedy
+            // output is BYTE-IDENTICAL with it on and off (270/1080 ->
+            // 1d5af38f9715, 4241 -> 6d71c90cfc07), so on this model the trade
+            // costs nothing observable.
+            //
+            // `HIPFIRE_GLIMMER_WMMA_FULL=0` restores the scalar tile path.
+            let wmma_full = window == 0
+                && b > 1
+                && std::env::var("HIPFIRE_GLIMMER_WMMA_FULL")
+                    .map(|v| v != "0" && !v.is_empty())
+                    .unwrap_or(true);
+            if wmma_full {
+                gpu.attention_q8_0_flash_prefill_wmma(
+                    &q,
+                    &k_cache_t,
+                    &v_cache_t,
+                    &attn_out,
+                    &pos_array,
+                    n_heads,
+                    n_kv,
+                    hd,
+                    b,
+                )
+                .map_err(|e| format!("glimmer prefill L{layer_idx} wmma full: {e:?}"))?;
+            } else {
+            let k_numel = k_cache_t.numel();
+            let v_numel = v_cache_t.numel();
+            let mut k_view = k_cache_t;
+            let mut v_view = v_cache_t;
+            let mut pos_view = &pos_array;
+            let mut eff_seq_len = seq_len;
+            // Sliding layers share one origin, computed once per chunk above;
+            // full (window==0) layers keep the unshifted base.
+            let origin = if window > 0 { sliding_origin } else { 0 };
+            if origin > 0 {
+                // 272 B per token per layer (n_kv_heads * head_dim/32 * 34),
+                // i.e. 68 F32 elements; tile-aligned origins stay exact.
+                let bytes_per_token = n_kv * (hd / 32) * 34;
+                let elem_off = origin * bytes_per_token / 4;
+                // Size the view to the LIVE extent, not the virtual reserve.
+                // The KV cache is VMM-backed, so only the mapped prefix is
+                // accessible and sub_offset to numel trips the guard with
+                // "tensor sub-view exceeds accessible buffer prefix". The
+                // kernel clamps tile_end to seq_len, so it never reads past
+                // (seq_len - origin) tokens anyway.
+                let live_elems = (seq_len - origin) * bytes_per_token / 4;
+                let k_len = live_elems.min(k_numel.saturating_sub(elem_off));
+                let v_len = live_elems.min(v_numel.saturating_sub(elem_off));
+                k_view = k_view.sub_offset(elem_off, k_len);
+                v_view = v_view.sub_offset(elem_off, v_len);
+                pos_view = shifted_pos_array
+                    .as_ref()
+                    .expect("sliding_origin > 0 implies shifted_pos_array");
+                eff_seq_len = seq_len - origin;
+            }
             gpu.attention_flash_q8_0_batched_masked_windowed(
                 &q,
-                &k_cache_t,
-                &v_cache_t,
+                &k_view,
+                &v_view,
                 &attn_out,
-                &pos_array,
+                pos_view,
                 n_heads,
                 n_kv,
                 hd,
                 state.max_seq,
-                seq_len,
+                eff_seq_len,
                 b,
                 partials,
                 None,
@@ -1741,6 +1872,7 @@ fn prefill_chunk_batched(
                 window as i32,
             )
             .map_err(|e| format!("glimmer prefill L{layer_idx} flash windowed: {e:?}"))?;
+            }
         } else if window != 0 && seq_len > window {
             // Per-row SWA fallback when flash disabled (debug) or if flash not available.
             for b_idx in 0..b {
