@@ -152,6 +152,13 @@ def infer_tag(model_path):
             return "deepseek-v4-flash:mq2r"
         if b.endswith(".mq2lloyd"):
             return "deepseek-v4-flash"
+    # Muse Glimmer ships as muse-glimmer-30b*.mq4 (also -default / -q8head / -assistant
+    # variants, which share the model card's sampling contract). Without this the tag
+    # resolves to None and sampling silently falls back to recipe(general) top_k=20,
+    # contradicting the card's top_k=64.
+    m = re.match(r"muse-glimmer-(\d+(?:\.\d+)?b)", b)
+    if m:
+        return f"muse-glimmer:{m.group(1)}"
     m = re.match(r"(qwen3\.\d+)-(\d+(?:\.\d+)?b(?:-a\d+b)?)", b)
     if m:
         return f"{m.group(1)}:{m.group(2)}"

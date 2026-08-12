@@ -606,6 +606,41 @@ mod tests {
         );
     }
 
+    /// Pins Muse Glimmer's sampling contract to its model card's "Best Practices"
+    /// section (`meta-models/Muse-Glimmer-30B`): temperature 1.0, top_p 0.95, top_k 64.
+    ///
+    /// `top_k` is the one that matters. Before this entry existed the tag resolved to
+    /// nothing and callers silently fell back to `recipe(general)`, which uses the Qwen
+    /// family's `top_k = 20` — a different model's sampling contract applied to Glimmer
+    /// with only a warning on stderr.
+    #[test]
+    fn bundled_muse_glimmer_matches_the_model_card_sampling_contract() {
+        let registry = bundled().unwrap();
+        let (tag, model) = registry.model("muse-glimmer:30b").unwrap();
+        assert_eq!(tag, "muse-glimmer:30b");
+        assert_eq!(model.arch_id, Some(14));
+
+        let settings = model
+            .recommended_settings
+            .as_ref()
+            .expect("muse-glimmer must carry the card's recommended_settings");
+        assert_eq!(settings.temperature, Some(1.0));
+        assert_eq!(settings.top_p, Some(0.95));
+        assert_eq!(settings.top_k, Some(64));
+
+        // `general` must resolve to the same contract, so `--sampling registry:general`
+        // and the bare default cannot diverge.
+        let general = model
+            .sampling_profile("general")
+            .expect("general profile resolves");
+        assert_eq!(general.top_k, Some(64));
+
+        // The card specifies no separate coding/instruct sampling, so those are
+        // deliberately absent rather than invented.
+        assert!(model.sampling_profile("coding").is_none());
+        assert!(model.sampling_profile("instruct").is_none());
+    }
+
     #[test]
     fn bundled_0731_mq2r_identity_is_separate_from_mq2lloyd_and_preview() {
         let registry = bundled().unwrap();
