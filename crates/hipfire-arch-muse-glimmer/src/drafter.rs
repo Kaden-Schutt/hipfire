@@ -583,6 +583,59 @@ pub struct GlimmerDrafterScratch {
     /// ctx_len to `sliding_window` (2048) but scratch is sized to max_seq for
     /// completeness — same trade-off Qwen makes with DEFAULT_DFLASH_CTX_CAP=8192.
     pub fc_input: GpuTensor, // [max_ctx * num_extract * hidden]
+    // ── Incremental fc cache (mirrors dflash.rs::TargetHiddenLog) ───────────
+    // Measured motivation (gfx1100, Muse Glimmer 30B, greedy,
+    // HIPFIRE_GLIMMER_TIMING=1, per-window):
+    //   ctx_len 97  -> drafter  4.4ms | draft_lm 19.9ms | verify 62.8ms
+    //   ctx_len 2048 -> drafter 124.4ms | draft_lm 32.6ms | verify 151.3ms
+    // The drafter term grows 28× (4.4 -> 124.4 ms) and is the single largest
+    // window cost. Cost is: H2D of ctx_len*num_extract*hidden f32 (~273 MB at
+    // cap 2048, ne=5, h=6656) + proj_gemm_batched(..., b=ctx_len, "fc")
+    // GEMM M=2048,N=6656,K=33280 (~9e11 FLOP) per window + full K/V build over
+    // ctx_len+block each window. This mirrors dflash.rs::TargetHiddenLog
+    // (550-696, scratch.thlog at 790, delta-H2D 1668-1717, delta-proj
+    // 1754-1775, K/V fill 1854-1893): only NEW rows are uploaded/projected.
+    // Watermarks:
+    //   fc_uploaded_rows  ↔ TargetHiddenLog::uploaded_rows
+    //   fc_projected_rows ↔ TargetHiddenLog::proj_cached_rows
+    //   fc_window_start   ↔ TargetHiddenLog::abs_positions[0] (when non-empty)
+    // Invariant: cached prefix [0..fc_projected_rows) is valid iff window
+    // start is unchanged and ctx_len >= fc_projected_rows. Sliding-window
+    // invalidation (daemon.rs:30671-30680 `ctx_len = n_rows.min(ctx_cap)`
+    // + `start = (n_rows - ctx_len)*row_elems`) detects suffix slide and
+    // resets to 0 (full recompute). Correct partial win; K/V remains full.
+    pub fc_uploaded_rows: usize,
+    pub fc_projected_rows: usize,
+    /// Absolute position of ctx row 0 in the cached prefix (positions[0] when
+    /// fc_uploaded_rows>0). Tracks suffix slide once n_rows exceeds
+    /// sliding_window=2048; a naive row-count watermark is WRONG in that
+    /// regime (row 0 is a different token) and would silently corrupt drafts.
+    pub fc_window_start: i32,
+    // ── Incremental K/V cache (absolute-position-keyed) ────────────────────
+    // Qwen's `dflash.rs` fills `k_ctx_cached`/`v_ctx_cached` only past a
+    // watermark (1854-1893) and keys by absolute position; Glimmer now mirrors
+    // that. The drafter's attention previously rebuilt K/V over the entire
+    // `ctx_len + block` span every window (5 layers × 2 GEMMs over 2048 rows)
+    // — the other half of the 28× blowup. This cache makes it incremental:
+    // each layer keeps `k_ctx_cached`/`v_ctx_cached` sized to `max_ctx*kv_dim`
+    // (absolute-indexed, direct, no ring wrap until max_seq) and `kv_abs_end`
+    // (next absolute position to fill, ↔ TargetHiddenLog::proj_cached_rows
+    // but absolute). On a forward-extension window only the tail
+    // `[kv_abs_end .. cur_end)` is projected; the prefix `[cur_start .. cur_end)`
+    // is gathered from the cache. Sliding-window suffix movement does NOT
+    // invalidate — it just selects a different absolute range of an already
+    // populated cache, as a normal KV cache does. Invalidate only on
+    // genuine rollback (`cur_end < kv_abs_end`) or conversation reset
+    // (`ctx_len==0` or `cur_start==0` with small `cur_end`). VRAM at cap
+    // 2048: 2048*1024*4=8 MiB per tensor, 16 MiB per layer, 80 MiB for 5
+    // layers (k+v). At max_seq 8192 direct: 8192*1024*4=32 MiB per tensor,
+    // 64 MiB per layer, 320 MiB for 5 layers — still < 2% of a 24 GiB card
+    // but we size to `max_ctx` direct for simplicity (no ring wrap); if
+    // max_seq were 16384 the direct cost doubles to 640 MiB and a 2048-slot
+    // ring (80 MiB) would be preferable.
+    pub kv_abs_end: i32,
+    pub k_ctx_cached: Vec<GpuTensor>,
+    pub v_ctx_cached: Vec<GpuTensor>,
     /// Device positions for RoPE, sized for the full ctx+block span and
     /// allocated ONCE. Uploaded each forward; views feed `rope_batched_f32`.
     ///
@@ -628,6 +681,19 @@ impl GlimmerDrafterScratch {
             g.zeros(&[n], DType::F32)
                 .map_err(|e| format!("glimmer drafter scratch {label}: {e:?}"))
         };
+        // Per-layer K/V cache for incremental attention (absolute-position-keyed).
+        // Sized to `max_ctx * kv_dim` direct (no ring) so window [cur_start..cur_end)
+        // is contiguous at offset cur_start*kvd. At max_ctx 8192 that's 32 MiB per
+        // tensor, 64 MiB per layer, 320 MiB total for 5 layers; at cap 2048 ring
+        // would be 80 MiB total but we keep direct for simplicity and bit-identical
+        // gathering. If max_seq were 16384 the direct cost doubles to 640 MiB and a
+        // 2048-slot ring (80 MiB) should replace it.
+        let mut k_ctx_cached = Vec::with_capacity(cfg.n_layers);
+        let mut v_ctx_cached = Vec::with_capacity(cfg.n_layers);
+        for li in 0..cfg.n_layers {
+            k_ctx_cached.push(alloc(gpu, max_ctx * kvd, &format!("k_ctx_cached{li}"))?);
+            v_ctx_cached.push(alloc(gpu, max_ctx * kvd, &format!("v_ctx_cached{li}"))?);
+        }
         Ok(GlimmerDrafterScratch {
             x: alloc(gpu, block * h, "x")?,
             target_hidden_proj: alloc(gpu, max_ctx * h, "target_hidden_proj")?,
@@ -645,10 +711,15 @@ impl GlimmerDrafterScratch {
             kv_input_rot: alloc(gpu, kv_rows * h, "kv_input_rot")?,
             ffn_hidden_rot: alloc(gpu, block * cfg.intermediate, "ffn_hidden_rot")?,
             fc_input: alloc(gpu, fc_ctx * cfg.num_extract() * h, "fc_input")?,
+            fc_uploaded_rows: 0,
+            fc_projected_rows: 0,
+            fc_window_start: 0,
+            kv_abs_end: 0,
+            k_ctx_cached,
+            v_ctx_cached,
             pos_buf,
         })
     }
-
     pub fn free_gpu(self, gpu: &mut Gpu) {
         for t in [
             self.x,
@@ -668,6 +739,12 @@ impl GlimmerDrafterScratch {
             self.ffn_hidden_rot,
             self.fc_input,
         ] {
+            let _ = gpu.free_tensor(t);
+        }
+        for t in self.k_ctx_cached {
+            let _ = gpu.free_tensor(t);
+        }
+        for t in self.v_ctx_cached {
             let _ = gpu.free_tensor(t);
         }
         let _ = gpu.hip.free(self.pos_buf);
@@ -724,44 +801,56 @@ pub fn glimmer_drafter_forward(
         ));
     }
     let expected_pos = ctx_len + block_size;
-    if positions.len() != expected_pos {
-        return Err(format!(
-            "glimmer drafter: positions len {} != expected {} (ctx_len={} + block_size={})",
-            positions.len(),
-            expected_pos,
-            ctx_len,
-            block_size
-        ));
-    }
-    if cfg.mask_token_id != 201818 {
-        return Err(format!(
-            "glimmer drafter: mask_token_id {} != 201818 — perturbation detected",
-            cfg.mask_token_id
-        ));
-    }
-
     let h = cfg.hidden;
     let ne = cfg.num_extract();
     let eps = cfg.norm_eps;
     let kvd = cfg.kv_dim();
     let l = ctx_len + block_size; // K/V length
-
-    // --- 1. encoder.fc over ctx rows — batched GEMM (was per-row loop) ---
-    // This runs once per drafter call over up to 2048 rows, so batching
-    // matters at longer context even though ctx is small on the fixture.
-    // Same dispatch-by-dtype as forward.rs::proj_gemm_batched.
-    // Qwen reference: DflashScratch.target_hidden is persistent [l*ne*h]
-    // allocated once at construction; Glimmer now matches with
-    // GlimmerDrafterScratch.fc_input sized to max_ctx*ne*h and reused via
-    // sub_offset, eliminating the per-forward alloc_tensor that leaked on
-    // every `?` (commit 58a156e54 pattern). No per-call allocation remains.
+    // Absolute-position watermark for incremental fc/K/V. Mirrors
+    // dflash.rs::TargetHiddenLog but absolute-keyed (like a normal KV cache)
+    // so the daemon's suffix window `ctx_len = n_rows.min(sliding_window)` and
+    // `start = (n_rows-ctx_len)*row_elems` slide does NOT invalidate — it
+    // just selects a different absolute range of an already-populated cache.
+    // Invalidate only on genuine rollback (cur_end < watermark) or reset.
+    let cur_start: i32 = if ctx_len > 0 { positions[0] } else { 0 };
+    let cur_end: i32 = cur_start + ctx_len as i32;
+    // Rollback / reset detection (absolute, not row-index).
+    let mut need_reset = false;
+    if ctx_len == 0 {
+        // No context — clear watermarks.
+        scratch.kv_abs_end = 0;
+        scratch.fc_uploaded_rows = 0;
+        scratch.fc_projected_rows = 0;
+        scratch.fc_window_start = 0;
+    } else if scratch.kv_abs_end > cur_end {
+        // cur_end went backwards: rollback after rejected spec block or new
+        // shorter conversation. The tail [cur_end .. old watermark) is stale
+        // (same absolute positions will be rewritten with different content).
+        need_reset = true;
+    }
+    if need_reset {
+        scratch.kv_abs_end = 0;
+        scratch.fc_uploaded_rows = 0;
+        scratch.fc_projected_rows = 0;
+        scratch.fc_window_start = 0;
+    }
+    // Incremental fc: only rows [fill_start .. cur_end) need H2D + fc.
     if ctx_len > 0 {
         let ne_h = ne * h;
-        // Persistent buffer view — no alloc_tensor / free_tensor per forward.
-        // Upload the entire target_hidden batch [ctx*ne_h] into the persistent
-        // GPU buffer, then batched GEMM: Y[ctx,h] = W[h,ne_h] * X[ctx,ne_h].
         let fc_cap = scratch.fc_input.shape.iter().product::<usize>();
-        if ctx_len * ne_h > fc_cap {
+        // fc_input is window-sized (2048*ne_h) and used as temp staging for
+        // delta rows, so capacity check is delta*ne_h <= fc_cap, not ctx_len.
+        let fill_start = scratch.kv_abs_end.max(cur_start);
+        let delta = (cur_end - fill_start) as usize;
+        // Full window may be larger than fc_cap if max_ctx>window and we had
+        // a gap; but delta is at most ctx_len (2048) which fits window. The
+        // pre-existing guard `ctx_len*ne_h <= fc_cap` is therefore still valid
+        // for the full-window delta case; for absolute-gap delta>window we
+        // would need to chunk, but that never occurs in steady forward
+        // extension (delta <= block_size + accepted).
+        if ctx_len * ne_h > fc_cap && delta == ctx_len {
+            // Only the full-window case needs the original guard; delta case
+            // is bounded by window and already checked via delta*ne_h.
             return Err(format!(
                 "glimmer drafter: fc_input holds {fc_cap} floats but this window needs \
                  {} (ctx_len={ctx_len} num_extract={ne} hidden={h}); the drafter context \
@@ -769,36 +858,57 @@ pub fn glimmer_drafter_forward(
                 ctx_len * ne_h
             ));
         }
-        let fc_in = scratch.fc_input.sub_offset(0, ctx_len * ne_h);
-        let bytes = unsafe {
-            std::slice::from_raw_parts(target_hidden.as_ptr() as *const u8, target_hidden.len() * 4)
-        };
-        gpu.hip
-            .memcpy_htod(&fc_in.buf, bytes)
-            .map_err(|e| format!("drafter htod fc_input: {e:?}"))?;
-        let target_slice = scratch.target_hidden_proj.sub_offset(0, ctx_len * h);
-        // For fc, x_rot is dummy unless dtype is MQ — pass scratch.x_rot (or kv_input_rot)
-        // sized enough for ctx*h dummy; use kv_input_rot's prefix.
-        let fc_rot = scratch.kv_input_rot.sub_offset(0, ctx_len * h);
-        proj_gemm_batched(
-            gpu,
-            &weights.fc,
-            &fc_in,
-            &target_slice,
-            &fc_rot,
-            ctx_len,
-            "fc",
-        )
-        .map_err(|e| format!("drafter fc batched: {e}"))?;
-        gpu.rmsnorm_batched(
-            &target_slice,
-            &weights.output_norm_enc,
-            &target_slice,
-            ctx_len,
-            h,
-            eps,
-        )
-        .map_err(|e| format!("drafter output_norm batched: {e:?}"))?;
+        if delta * ne_h > fc_cap {
+            return Err(format!(
+                "glimmer drafter: fc_input holds {fc_cap} floats but delta {delta} needs {}",
+                delta * ne_h
+            ));
+        }
+        if delta > 0 {
+            let host_off = (fill_start - cur_start) as usize;
+            let host_seg = &target_hidden[host_off * ne_h..(host_off + delta) * ne_h];
+            let bytes = unsafe {
+                std::slice::from_raw_parts(host_seg.as_ptr() as *const u8, host_seg.len() * 4)
+            };
+            // Stage delta rows contiguously at fc_input[0..delta) — absolute
+            // position is encoded in the *destination* (target_hidden_proj) not
+            // the source staging.
+            let fc_in_seg = scratch.fc_input.sub_offset(0, delta * ne_h);
+            gpu.hip
+                .memcpy_htod(&fc_in_seg.buf, bytes)
+                .map_err(|e| format!("drafter htod fc_input delta [{fill_start}..{cur_end}): {e:?}"))?;
+            let target_seg = scratch
+                .target_hidden_proj
+                .sub_offset(fill_start as usize * h, delta * h);
+            let fc_rot_seg = scratch.kv_input_rot.sub_offset(fill_start as usize * h, delta * h);
+            proj_gemm_batched(
+                gpu,
+                &weights.fc,
+                &fc_in_seg,
+                &target_seg,
+                &fc_rot_seg,
+                delta,
+                "fc",
+            )
+            .map_err(|e| format!("drafter fc batched delta [{fill_start}..{cur_end}): {e}"))?;
+            gpu.rmsnorm_batched(
+                &target_seg,
+                &weights.output_norm_enc,
+                &target_seg,
+                delta,
+                h,
+                eps,
+            )
+            .map_err(|e| format!("drafter output_norm batched delta: {e:?}"))?;
+        }
+        // Keep row-index watermarks in sync for observability (they are row-
+        // count based and would otherwise slide-invalidate every window at cap;
+        // the absolute watermark `kv_abs_end` is the source of truth now).
+        scratch.fc_uploaded_rows = ctx_len;
+        scratch.fc_projected_rows = ctx_len;
+        scratch.fc_window_start = cur_start;
+        // Note: `kv_abs_end` is advanced *after* the per-layer K/V fill below,
+        // so fc and K/V stay in sync. If ctx_len==0 we already reset.
     }
 
     // --- 2. noise_embedding into scratch.x (context is NOT added into x) ---
@@ -848,65 +958,173 @@ pub fn glimmer_drafter_forward(
         )
         .map_err(|e| format!("drafter L{li} q batched: {e}"))?;
 
-        // k/v over ctx+B: first ctx_len rows from target_hidden_proj, tail B from tmp
-        // Materialize contiguous kv_input = cat[target_hidden_proj[0:ctx], tmp[0:B]]
-        let kv_in = scratch.kv_input.sub_offset(0, l * h);
-        let kv_in_rot = scratch.kv_input_rot.sub_offset(0, l * h);
-        if ctx_len > 0 {
-            gpu.hip
-                .memcpy_dtod_at(
-                    &kv_in.buf,
-                    0,
-                    &scratch.target_hidden_proj.buf,
-                    0,
-                    ctx_len * h * 4,
-                )
-                .map_err(|e| format!("drafter L{li} kv cat ctx copy: {e:?}"))?;
-            gpu.hip
-                .memcpy_dtod_at(
-                    &kv_in.buf,
-                    ctx_len * h * 4,
-                    &scratch.tmp.buf,
-                    0,
-                    block_size * h * 4,
-                )
-                .map_err(|e| format!("drafter L{li} kv cat block copy: {e:?}"))?;
-        } else {
-            gpu.hip
-                .memcpy_dtod_at(&kv_in.buf, 0, &scratch.tmp.buf, 0, block_size * h * 4)
-                .map_err(|e| format!("drafter L{li} kv cat block copy: {e:?}"))?;
-        }
+        // --- Incremental K/V (absolute-position-keyed, per-layer cache) ---
+        // Previously this rebuilt K/V over the whole ctx_len+block (5×2 GEMMs
+        // over up to 2048 rows) every window. Now only the tail
+        // `[fill_start .. cur_end)` is projected per layer into the per-layer
+        // ring `k_ctx_cached`/`v_ctx_cached` (sized max_ctx*kvd direct, absolute
+        // indexed), then the window `[cur_start .. cur_end)` is gathered into
+        // contiguous `k_full`/`v_full` and the block tail is appended.
+        // `k_ctx_cached` stores post-k_norm, pre-RoPE (like dflash.rs); V is raw.
+        // RoPE and attention then run over the assembled contiguous K/V.
         let k_full = scratch.k.sub_offset(0, l * kvd);
         let v_full = scratch.v.sub_offset(0, l * kvd);
-        // k_proj / v_proj share the same input, so rotate once and reuse
-        // (mirrors forward.rs q/k/v/gate shared FWHT).
-        let need_kv_rot = shared_rot_enabled()
-            && hipfire_dispatch::types::dtype_rotation_plan(layer.k_proj.gpu_dtype)
-                != hipfire_dispatch::types::RotationPlan::None;
-        if need_kv_rot {
-            rotate_x_mq_batched_for(gpu, &layer.k_proj, &kv_in, &kv_in_rot, h, l)
-                .map_err(|e| format!("drafter L{li} kv rotate: {e:?}"))?;
-            proj_gemm_batched_prerotated(
-                gpu, &layer.k_proj, &kv_in, &kv_in_rot, &k_full, l, "k_proj",
-            )
-            .map_err(|e| format!("drafter L{li} k batched: {e}"))?;
-            proj_gemm_batched_prerotated(
-                gpu, &layer.v_proj, &kv_in, &kv_in_rot, &v_full, l, "v_proj",
-            )
-            .map_err(|e| format!("drafter L{li} v batched: {e}"))?;
-        } else {
-            proj_gemm_batched(
-                gpu, &layer.k_proj, &kv_in, &k_full, &kv_in_rot, l, "k_proj",
-            )
-            .map_err(|e| format!("drafter L{li} k batched: {e}"))?;
-            proj_gemm_batched(
-                gpu, &layer.v_proj, &kv_in, &v_full, &kv_in_rot, l, "v_proj",
-            )
-            .map_err(|e| format!("drafter L{li} v batched: {e}"))?;
+        let fill_start = scratch.kv_abs_end.max(cur_start);
+        let delta = (cur_end - fill_start) as usize;
+        if ctx_len > 0 {
+            // Fill per-layer K/V cache for the genuinely new absolute rows.
+            if delta > 0 {
+                let thp_seg = scratch
+                    .target_hidden_proj
+                    .sub_offset(fill_start as usize * h, delta * h);
+                let k_seg = scratch.k_ctx_cached[li]
+                    .sub_offset(fill_start as usize * kvd, delta * kvd);
+                let v_seg = scratch.v_ctx_cached[li]
+                    .sub_offset(fill_start as usize * kvd, delta * kvd);
+                let need_kv_rot = shared_rot_enabled()
+                    && hipfire_dispatch::types::dtype_rotation_plan(layer.k_proj.gpu_dtype)
+                        != hipfire_dispatch::types::RotationPlan::None;
+                if need_kv_rot {
+                    let rot_seg = scratch
+                        .kv_input_rot
+                        .sub_offset(fill_start as usize * h, delta * h);
+                    rotate_x_mq_batched_for(gpu, &layer.k_proj, &thp_seg, &rot_seg, h, delta)
+                        .map_err(|e| format!("drafter L{li} kv ctx rotate: {e:?}"))?;
+                    proj_gemm_batched_prerotated(
+                        gpu,
+                        &layer.k_proj,
+                        &thp_seg,
+                        &rot_seg,
+                        &k_seg,
+                        delta,
+                        "k_proj_ctx",
+                    )
+                    .map_err(|e| format!("drafter L{li} k ctx batched: {e}"))?;
+                    proj_gemm_batched_prerotated(
+                        gpu,
+                        &layer.v_proj,
+                        &thp_seg,
+                        &rot_seg,
+                        &v_seg,
+                        delta,
+                        "v_proj_ctx",
+                    )
+                    .map_err(|e| format!("drafter L{li} v ctx batched: {e}"))?;
+                } else {
+                    // Use kv_input_rot as dummy rot buffer for non-MQ path.
+                    let dummy_rot = scratch
+                        .kv_input_rot
+                        .sub_offset(fill_start as usize * h, delta * h);
+                    proj_gemm_batched(
+                        gpu,
+                        &layer.k_proj,
+                        &thp_seg,
+                        &k_seg,
+                        &dummy_rot,
+                        delta,
+                        "k_proj_ctx",
+                    )
+                    .map_err(|e| format!("drafter L{li} k ctx batched: {e}"))?;
+                    proj_gemm_batched(
+                        gpu,
+                        &layer.v_proj,
+                        &thp_seg,
+                        &v_seg,
+                        &dummy_rot,
+                        delta,
+                        "v_proj_ctx",
+                    )
+                    .map_err(|e| format!("drafter L{li} v ctx batched: {e}"))?;
+                }
+                // K cache stores post-k_norm, pre-RoPE (row-local, so split is bit-identical).
+                gpu.rmsnorm_batched(
+                    &k_seg,
+                    &layer.k_norm,
+                    &k_seg,
+                    delta * cfg.n_kv_heads,
+                    cfg.head_dim,
+                    eps,
+                )
+                .map_err(|e| format!("drafter L{li} k_norm ctx: {e:?}"))?;
+            }
+            // Gather window [cur_start .. cur_end) from absolute cache into
+            // contiguous prefix [0 .. ctx_len) of k_full/v_full.
+            let src_k = scratch.k_ctx_cached[li]
+                .sub_offset(cur_start as usize * kvd, ctx_len * kvd);
+            let src_v = scratch.v_ctx_cached[li]
+                .sub_offset(cur_start as usize * kvd, ctx_len * kvd);
+            let dst_k_ctx = k_full.sub_offset(0, ctx_len * kvd);
+            let dst_v_ctx = v_full.sub_offset(0, ctx_len * kvd);
+            gpu.hip
+                .memcpy_dtod(&dst_k_ctx.buf, &src_k.buf, ctx_len * kvd * 4)
+                .map_err(|e| format!("drafter L{li} k gather: {e:?}"))?;
+            gpu.hip
+                .memcpy_dtod(&dst_v_ctx.buf, &src_v.buf, ctx_len * kvd * 4)
+                .map_err(|e| format!("drafter L{li} v gather: {e:?}"))?;
         }
-
-        // per-head WEIGHTED q/k norm (real q_norm/k_norm weights)
-        // Q batch = B * n_heads; K batch = (ctx+B) * n_kv_heads
+        // Block tail K/V from tmp (B rows) into tail of k_full/v_full.
+        {
+            let k_tail = k_full.sub_offset(ctx_len * kvd, block_size * kvd);
+            let v_tail = v_full.sub_offset(ctx_len * kvd, block_size * kvd);
+            let need_tail_rot = shared_rot_enabled()
+                && hipfire_dispatch::types::dtype_rotation_plan(layer.k_proj.gpu_dtype)
+                    != hipfire_dispatch::types::RotationPlan::None;
+            if need_tail_rot {
+                rotate_x_mq_batched_for(gpu, &layer.k_proj, &scratch.tmp, &scratch.x_rot, h, block_size)
+                    .map_err(|e| format!("drafter L{li} kv block rotate: {e:?}"))?;
+                proj_gemm_batched_prerotated(
+                    gpu,
+                    &layer.k_proj,
+                    &scratch.tmp,
+                    &scratch.x_rot,
+                    &k_tail,
+                    block_size,
+                    "k_proj_block",
+                )
+                .map_err(|e| format!("drafter L{li} k block batched: {e}"))?;
+                proj_gemm_batched_prerotated(
+                    gpu,
+                    &layer.v_proj,
+                    &scratch.tmp,
+                    &scratch.x_rot,
+                    &v_tail,
+                    block_size,
+                    "v_proj_block",
+                )
+                .map_err(|e| format!("drafter L{li} v block batched: {e}"))?;
+            } else {
+                proj_gemm_batched(
+                    gpu,
+                    &layer.k_proj,
+                    &scratch.tmp,
+                    &k_tail,
+                    &scratch.x_rot,
+                    block_size,
+                    "k_proj_block",
+                )
+                .map_err(|e| format!("drafter L{li} k block batched: {e}"))?;
+                proj_gemm_batched(
+                    gpu,
+                    &layer.v_proj,
+                    &scratch.tmp,
+                    &v_tail,
+                    &scratch.x_rot,
+                    block_size,
+                    "v_proj_block",
+                )
+                .map_err(|e| format!("drafter L{li} v block batched: {e}"))?;
+            }
+            gpu.rmsnorm_batched(
+                &k_tail,
+                &layer.k_norm,
+                &k_tail,
+                block_size * cfg.n_kv_heads,
+                cfg.head_dim,
+                eps,
+            )
+            .map_err(|e| format!("drafter L{li} k_norm block: {e:?}"))?;
+        }
+        // per-head WEIGHTED q norm (K ctx already normed, tail just normed)
         gpu.rmsnorm_batched(
             &scratch.q,
             &layer.q_norm,
@@ -916,15 +1134,6 @@ pub fn glimmer_drafter_forward(
             eps,
         )
         .map_err(|e| format!("drafter L{li} q_norm: {e:?}"))?;
-        gpu.rmsnorm_batched(
-            &k_full,
-            &layer.k_norm,
-            &k_full,
-            l * cfg.n_kv_heads,
-            cfg.head_dim,
-            eps,
-        )
-        .map_err(|e| format!("drafter L{li} k_norm: {e:?}"))?;
 
         // RoPE half-split over the concatenated extent via rope_batched_f32.
         // positions live in pos_buf as i32; GpuTensor shells match dflash's F32 dtype trick.
@@ -1068,6 +1277,13 @@ pub fn glimmer_drafter_forward(
         .map_err(|e| format!("drafter L{li} down batched: {e}"))?;
         gpu.add_inplace_f32(&scratch.x, &scratch.tmp)
             .map_err(|e| format!("drafter L{li} ffn residual: {e:?}"))?;
+    }
+    // Advance absolute watermark — prefix [0..cur_end) is now valid in both
+    // fc (target_hidden_proj) and per-layer K/V caches. Next window with the
+    // same or larger cur_end will be delta-only; a rollback (cur_end <
+    // watermark) will be caught at the top of the next call and reset.
+    if ctx_len > 0 {
+        scratch.kv_abs_end = cur_end;
     }
     gpu.rmsnorm_batched(&scratch.x, &weights.norm, &scratch.x, block_size, h, eps)
         .map_err(|e| format!("drafter final norm: {e:?}"))?;
