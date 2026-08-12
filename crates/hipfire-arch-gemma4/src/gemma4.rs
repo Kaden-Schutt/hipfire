@@ -4,16 +4,14 @@
 
 //! Gemma 4 dense (text-only) weights + per-decode state.
 //!
-//! Ported from the old branch's `crate::engine::gemma4` loader, dropping the
-//! MoE branch (`enable_moe_block=false` on 12B), the E-series per-layer
-//! embedding / KV-sharing / double-wide-MLP machinery, and vision. Tensor names
-//! carry the `model.language_model.*` prefix. lm_head is TIED to embed_tokens
-//! (alias buffer). Two KV caches are held: sliding (head_dim 256) and full
-//! (head_dim 512), each sized to the count of its layer type.
+//! The dense 12B path remains the default. E2B/E4B add per-layer embeddings,
+//! KV sharing, and (for E2B) double-wide MLP tails behind the strict topology
+//! contract in [`Gemma4Config`]. MoE and multimodal towers remain out of scope.
 
 use crate::config::{Gemma4Config, LayerType};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{f16_to_f32, EmbeddingFormat, KvCache, WeightTensor};
+use hipfire_runtime::weight_backend::load_embedding;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 // ───────────────────────── HFQ load helpers ─────────────────────────
@@ -37,6 +35,10 @@ fn load_f32_vec(hfq: &HfqFile, name: &str, expected_n: usize) -> Result<Vec<f32>
         2 => data
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+        16 => data
+            .chunks_exact(2)
+            .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
             .collect(),
         qt => return Err(format!("gemma4: expected F16/F32 for {name}, got qt={qt}")),
     };
@@ -85,14 +87,20 @@ fn load_wt(
     let (info, data) = hfq
         .tensor_data(name)
         .ok_or_else(|| format!("gemma4: tensor not found: {name}"))?;
-    if info.quant_type == 1 {
-        // F16 → upload as F32.
-        let f32_data: Vec<f32> = data
-            .chunks_exact(2)
-            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-            .collect();
-        let bytes: &[u8] =
-            unsafe { std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4) };
+    if info.quant_type == 1 || info.quant_type == 16 {
+        // F16/BF16 → upload as F32.
+        let f32_data: Vec<f32> = if info.quant_type == 16 {
+            data.chunks_exact(2)
+                .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+                .collect()
+        } else {
+            data.chunks_exact(2)
+                .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .collect()
+        };
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
+        };
         let buf = gpu
             .upload_raw(bytes, &[m, k])
             .map_err(|e| format!("gemma4: upload F32 {name}: {e:?}"))?;
@@ -174,6 +182,8 @@ pub struct SlidingLayerWeights {
     pub gate_proj: WeightTensor,
     pub up_proj: WeightTensor,
     pub down_proj: WeightTensor,
+    pub ffn_hidden_dim: usize,
+    pub per_layer: Option<PerLayerBranchWeights>,
 }
 
 /// Per-layer weights for a FULL layer (head_dim 512, partial RoPE).
@@ -195,15 +205,67 @@ pub struct FullLayerWeights {
     pub q_norm: GpuTensor, // [head_dim]
     pub k_norm: GpuTensor, // [head_dim]
     // no v_norm weight — v is no-scale (ones buffer passed at decode time)
-
     pub gate_proj: WeightTensor,
     pub up_proj: WeightTensor,
     pub down_proj: WeightTensor,
+    pub ffn_hidden_dim: usize,
+    pub per_layer: Option<PerLayerBranchWeights>,
 }
 
 pub enum LayerWeights {
     Sliding(SlidingLayerWeights),
     Full(FullLayerWeights),
+}
+
+/// Per-layer residual branch driven by the token-level PLE source.
+pub struct PerLayerBranchWeights {
+    pub input_gate: WeightTensor,
+    pub projection: WeightTensor,
+    pub post_input_norm: GpuTensor,
+}
+
+/// Token-level PLE weights shared by all decoder layers.
+pub struct PerLayerInputWeights {
+    pub embed_tokens: GpuTensor,
+    pub embd_format: EmbeddingFormat,
+    pub model_projection: WeightTensor,
+    pub projection_norm: GpuTensor,
+}
+
+fn load_per_layer_branch(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    cfg: &Gemma4Config,
+    prefix: &str,
+    plus_one: bool,
+) -> Result<Option<PerLayerBranchWeights>, String> {
+    let ple_dim = cfg.hidden_size_per_layer_input;
+    if ple_dim == 0 {
+        return Ok(None);
+    }
+    Ok(Some(PerLayerBranchWeights {
+        input_gate: load_wt(
+            hfq,
+            gpu,
+            &format!("{prefix}.per_layer_input_gate.weight"),
+            ple_dim,
+            cfg.dim,
+        )?,
+        projection: load_wt(
+            hfq,
+            gpu,
+            &format!("{prefix}.per_layer_projection.weight"),
+            cfg.dim,
+            ple_dim,
+        )?,
+        post_input_norm: load_norm(
+            hfq,
+            gpu,
+            &format!("{prefix}.post_per_layer_input_norm.weight"),
+            cfg.dim,
+            plus_one,
+        )?,
+    }))
 }
 
 pub struct Gemma4Weights {
@@ -213,18 +275,35 @@ pub struct Gemma4Weights {
     /// LM head (shares bytes with `embed_tokens` when tied).
     pub lm_head: WeightTensor,
     pub final_norm: GpuTensor,
+    pub per_layer_input: Option<PerLayerInputWeights>,
     pub layers: Vec<LayerWeights>,
 }
 
 impl Gemma4Weights {
     pub fn load(hfq: &HfqFile, cfg: &Gemma4Config, gpu: &mut Gpu) -> Result<Self, String> {
+        if cfg.hidden_size_per_layer_input != 0 || cfg.num_kv_shared_layers != 0 {
+            cfg.e_series_variant()?;
+        }
         let dim = cfg.dim;
         let plus_one = cfg.norm_plus_one;
 
+        let name_roots = ["model.language_model", "language_model", "model"];
+        let name_root = name_roots
+            .iter()
+            .copied()
+            .find(|root| {
+                hfq.tensor_data(&format!("{root}.embed_tokens.weight"))
+                    .is_some()
+            })
+            .ok_or_else(|| {
+                "gemma4: embed_tokens not found under model.language_model, language_model, or model"
+                    .to_string()
+            })?;
+
         // ── Embedding ──────────────────────────────────────────────────────
-        let embed_name = "model.language_model.embed_tokens.weight";
+        let embed_name = format!("{name_root}.embed_tokens.weight");
         let (embed_info, embed_data) = hfq
-            .tensor_data(embed_name)
+            .tensor_data(&embed_name)
             .ok_or_else(|| "gemma4: embed_tokens not found in HFQ".to_string())?;
         let (embed_tokens, embd_format) = match embed_info.quant_type {
             3 => (
@@ -242,16 +321,9 @@ impl Gemma4Weights {
                     .map_err(|e| format!("gemma4: upload embed: {e:?}"))?,
                 EmbeddingFormat::HFQ4G128,
             ),
-            1 => {
-                let f32_data: Vec<f32> = embed_data
-                    .chunks_exact(2)
-                    .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-                    .collect();
-                (
-                    gpu.upload_f32(&f32_data, &[cfg.vocab_size, dim])
-                        .map_err(|e| format!("gemma4: upload embed f32: {e:?}"))?,
-                    EmbeddingFormat::F32,
-                )
+            1 | 2 | 16 => {
+                load_embedding(gpu, embed_info.quant_type, embed_data, cfg.vocab_size, dim)
+                    .map_err(|e| format!("gemma4: upload embed: {e:?}"))?
             }
             qt => return Err(format!("gemma4: unsupported embed quant_type {qt}")),
         };
@@ -283,20 +355,51 @@ impl Gemma4Weights {
             }
         };
 
-        let final_norm = load_norm(
-            hfq,
-            gpu,
-            "model.language_model.norm.weight",
-            dim,
-            plus_one,
-        )?;
+        let final_norm = load_norm(hfq, gpu, &format!("{name_root}.norm.weight"), dim, plus_one)?;
+
+        let per_layer_input = if cfg.hidden_size_per_layer_input != 0 {
+            let ple_dim = cfg.hidden_size_per_layer_input;
+            let packed_dim = cfg.n_layers * ple_dim;
+            let ple_embed_name = format!("{name_root}.embed_tokens_per_layer.weight");
+            let (info, data) = hfq
+                .tensor_data(&ple_embed_name)
+                .ok_or_else(|| format!("gemma4: tensor not found: {ple_embed_name}"))?;
+            let (embed_tokens, embd_format) = load_embedding(
+                gpu,
+                info.quant_type,
+                data,
+                cfg.vocab_size_per_layer_input,
+                packed_dim,
+            )
+            .map_err(|e| format!("gemma4: load embed_tokens_per_layer: {e:?}"))?;
+            Some(PerLayerInputWeights {
+                embed_tokens,
+                embd_format,
+                model_projection: load_wt(
+                    hfq,
+                    gpu,
+                    &format!("{name_root}.per_layer_model_projection.weight"),
+                    packed_dim,
+                    dim,
+                )?,
+                projection_norm: load_norm(
+                    hfq,
+                    gpu,
+                    &format!("{name_root}.per_layer_projection_norm.weight"),
+                    ple_dim,
+                    plus_one,
+                )?,
+            })
+        } else {
+            None
+        };
 
         // ── Layers ─────────────────────────────────────────────────────────
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
-            let p = format!("model.language_model.layers.{i}");
+            let p = format!("{name_root}.layers.{i}");
             let layer_scalar_host = load_layer_scalar(hfq, &format!("{p}.layer_scalar"));
-            let ffn_hd = cfg.hidden_dim;
+            let ffn_hd = cfg.ffn_hidden_dim_for_layer(i);
             match cfg.layer_types[i] {
                 LayerType::Sliding => {
                     let hd = cfg.sliding_head_dim;
@@ -395,6 +498,8 @@ impl Gemma4Weights {
                             dim,
                             ffn_hd,
                         )?,
+                        ffn_hidden_dim: ffn_hd,
+                        per_layer: load_per_layer_branch(hfq, gpu, cfg, &p, plus_one)?,
                     }));
                 }
                 LayerType::Full => {
@@ -499,6 +604,8 @@ impl Gemma4Weights {
                             dim,
                             ffn_hd,
                         )?,
+                        ffn_hidden_dim: ffn_hd,
+                        per_layer: load_per_layer_branch(hfq, gpu, cfg, &p, plus_one)?,
                     }));
                 }
             }
@@ -509,6 +616,7 @@ impl Gemma4Weights {
             embd_format,
             lm_head,
             final_norm,
+            per_layer_input,
             layers,
         })
     }
@@ -523,6 +631,11 @@ impl Gemma4Weights {
     pub fn free_gpu(self, gpu: &mut Gpu) {
         let _ = gpu.free_tensor(self.embed_tokens);
         let _ = gpu.free_tensor(self.final_norm);
+        if let Some(ple) = self.per_layer_input {
+            let _ = gpu.free_tensor(ple.embed_tokens);
+            ple.model_projection.free_all(gpu);
+            let _ = gpu.free_tensor(ple.projection_norm);
+        }
         for l in self.layers {
             match l {
                 LayerWeights::Sliding(l) => {
@@ -539,6 +652,11 @@ impl Gemma4Weights {
                     l.gate_proj.free_all(gpu);
                     l.up_proj.free_all(gpu);
                     l.down_proj.free_all(gpu);
+                    if let Some(ple) = l.per_layer {
+                        ple.input_gate.free_all(gpu);
+                        ple.projection.free_all(gpu);
+                        let _ = gpu.free_tensor(ple.post_input_norm);
+                    }
                 }
                 LayerWeights::Full(l) => {
                     let _ = gpu.free_tensor(l.input_layernorm);
@@ -556,6 +674,11 @@ impl Gemma4Weights {
                     l.gate_proj.free_all(gpu);
                     l.up_proj.free_all(gpu);
                     l.down_proj.free_all(gpu);
+                    if let Some(ple) = l.per_layer {
+                        ple.input_gate.free_all(gpu);
+                        ple.projection.free_all(gpu);
+                        let _ = gpu.free_tensor(ple.post_input_norm);
+                    }
                 }
             }
         }
@@ -614,8 +737,49 @@ pub struct Gemma4State {
     pub ffn_hidden: GpuTensor, // [hidden_dim]
     pub ffn_out: GpuTensor,    // [dim]
 
+    // Per-layer input (PLE) scratch. Dense 12B leaves these absent.
+    pub ple_token_inputs: Option<GpuTensor>, // [n_layers * ple_dim]
+    pub ple_projection_all: Option<GpuTensor>, // [n_layers * ple_dim]
+    pub ple_gate: Option<GpuTensor>,         // [ple_dim]
+    pub ple_hidden: Option<GpuTensor>,       // [ple_dim]
+    pub ple_out: Option<GpuTensor>,          // [dim]
+
     // head
     pub logits: GpuTensor, // [vocab]
+}
+
+fn build_kv_slot_map(cfg: &Gemma4Config) -> Result<Vec<usize>, String> {
+    let mut slots = vec![usize::MAX; cfg.n_layers];
+    let mut sliding = 0usize;
+    let mut full = 0usize;
+    for layer_idx in 0..cfg.n_layers {
+        if let Some(source_layer) = cfg.kv_shared_source_layer_idx(layer_idx) {
+            let source_slot = slots[source_layer];
+            if source_slot == usize::MAX {
+                return Err(format!(
+                    "gemma4: KV source layer {source_layer} for layer {layer_idx} has no slot"
+                ));
+            }
+            slots[layer_idx] = source_slot;
+            continue;
+        }
+        if cfg.is_kv_shared_layer(layer_idx) {
+            return Err(format!(
+                "gemma4: shared KV layer {layer_idx} has no preceding same-type source"
+            ));
+        }
+        match cfg.layer_types[layer_idx] {
+            LayerType::Sliding => {
+                slots[layer_idx] = sliding;
+                sliding += 1;
+            }
+            LayerType::Full => {
+                slots[layer_idx] = full;
+                full += 1;
+            }
+        }
+    }
+    Ok(slots)
 }
 
 impl Gemma4State {
@@ -640,7 +804,7 @@ impl Gemma4State {
         // Two Q8 KV caches: one slot per layer of the matching type.
         let kv_sliding = KvCache::new_gpu_q8(
             gpu,
-            cfg.n_sliding_layers(),
+            cfg.n_sliding_kv_slots(),
             cfg.sliding_n_kv_heads,
             cfg.sliding_head_dim,
             max_seq,
@@ -648,29 +812,14 @@ impl Gemma4State {
         .map_err(|e| format!("gemma4: sliding kv cache: {e:?}"))?;
         let kv_full = KvCache::new_gpu_q8(
             gpu,
-            cfg.n_full_layers(),
+            cfg.n_full_kv_slots(),
             cfg.full_n_kv_heads,
             cfg.full_head_dim,
             max_seq,
         )
         .map_err(|e| format!("gemma4: full kv cache: {e:?}"))?;
 
-        // Per-layer slot mapping: sequential count within each type.
-        let mut kv_slot_for_layer = Vec::with_capacity(cfg.n_layers);
-        let mut s = 0usize;
-        let mut f = 0usize;
-        for &lt in cfg.layer_types.iter() {
-            match lt {
-                LayerType::Sliding => {
-                    kv_slot_for_layer.push(s);
-                    s += 1;
-                }
-                LayerType::Full => {
-                    kv_slot_for_layer.push(f);
-                    f += 1;
-                }
-            }
-        }
+        let kv_slot_for_layer = build_kv_slot_map(cfg)?;
 
         let pos_buf = gpu
             .hip
@@ -685,6 +834,8 @@ impl Gemma4State {
         let max_q = cfg.max_q_dim();
         let max_kv = cfg.max_kv_dim();
         let max_hd = cfg.max_head_dim();
+        let ple_dim = cfg.hidden_size_per_layer_input;
+        let ple_packed = cfg.n_layers * ple_dim;
 
         // Ones-filled weight buffer for the weight-less V RMSNorm.
         let v_norm_ones = alloc(gpu, max_hd, "v_norm_ones")?;
@@ -715,10 +866,35 @@ impl Gemma4State {
             v: alloc(gpu, max_kv, "v")?,
             attn_out: alloc(gpu, max_q, "attn_out")?,
             v_norm_ones,
-            gate_ffn: alloc(gpu, cfg.hidden_dim, "gate_ffn")?,
-            up_ffn: alloc(gpu, cfg.hidden_dim, "up_ffn")?,
-            ffn_hidden: alloc(gpu, cfg.hidden_dim, "ffn_hidden")?,
+            gate_ffn: alloc(gpu, cfg.max_ffn_hidden_dim(), "gate_ffn")?,
+            up_ffn: alloc(gpu, cfg.max_ffn_hidden_dim(), "up_ffn")?,
+            ffn_hidden: alloc(gpu, cfg.max_ffn_hidden_dim(), "ffn_hidden")?,
             ffn_out: alloc(gpu, dim, "ffn_out")?,
+            ple_token_inputs: if ple_dim != 0 {
+                Some(alloc(gpu, ple_packed, "ple_token_inputs")?)
+            } else {
+                None
+            },
+            ple_projection_all: if ple_dim != 0 {
+                Some(alloc(gpu, ple_packed, "ple_projection_all")?)
+            } else {
+                None
+            },
+            ple_gate: if ple_dim != 0 {
+                Some(alloc(gpu, ple_dim, "ple_gate")?)
+            } else {
+                None
+            },
+            ple_hidden: if ple_dim != 0 {
+                Some(alloc(gpu, ple_dim, "ple_hidden")?)
+            } else {
+                None
+            },
+            ple_out: if ple_dim != 0 {
+                Some(alloc(gpu, dim, "ple_out")?)
+            } else {
+                None
+            },
             logits: alloc(gpu, cfg.vocab_size, "logits")?,
         })
     }
@@ -738,7 +914,7 @@ impl Gemma4State {
         // Sliding layers: Q8 (hd=256, ring-capped to sliding_window).
         let kv_sliding = KvCache::new_gpu_q8(
             gpu,
-            cfg.n_sliding_layers(),
+            cfg.n_sliding_kv_slots(),
             cfg.sliding_n_kv_heads,
             cfg.sliding_head_dim,
             max_seq,
@@ -746,7 +922,7 @@ impl Gemma4State {
         .map_err(|e| format!("gemma4-fwht3: sliding kv cache: {e:?}"))?;
 
         // Full layers: fwht3 hd=512 (K = FWHT-512 3-bit, V = Q8_0).
-        let all_true: Vec<bool> = vec![true; cfg.n_full_layers()];
+        let all_true: Vec<bool> = vec![true; cfg.n_full_kv_slots()];
         let kv_full = KvCache::new_gpu_fwht3_capped_filtered_gemma4(
             gpu,
             &all_true,
@@ -757,16 +933,7 @@ impl Gemma4State {
         )
         .map_err(|e| format!("gemma4-fwht3: full kv cache: {e:?}"))?;
 
-        // Per-layer slot mapping (identical to new_with_max_seq).
-        let mut kv_slot_for_layer = Vec::with_capacity(cfg.n_layers);
-        let mut s = 0usize;
-        let mut f = 0usize;
-        for &lt in cfg.layer_types.iter() {
-            match lt {
-                LayerType::Sliding => { kv_slot_for_layer.push(s); s += 1; }
-                LayerType::Full    => { kv_slot_for_layer.push(f); f += 1; }
-            }
-        }
+        let kv_slot_for_layer = build_kv_slot_map(cfg)?;
 
         let pos_buf = gpu
             .hip
@@ -781,6 +948,8 @@ impl Gemma4State {
         let max_q = cfg.max_q_dim();
         let max_kv = cfg.max_kv_dim();
         let max_hd = cfg.max_head_dim();
+        let ple_dim = cfg.hidden_size_per_layer_input;
+        let ple_packed = cfg.n_layers * ple_dim;
 
         let v_norm_ones = alloc(gpu, max_hd, "v_norm_ones")?;
         {
@@ -810,10 +979,35 @@ impl Gemma4State {
             v: alloc(gpu, max_kv, "v")?,
             attn_out: alloc(gpu, max_q, "attn_out")?,
             v_norm_ones,
-            gate_ffn: alloc(gpu, cfg.hidden_dim, "gate_ffn")?,
-            up_ffn: alloc(gpu, cfg.hidden_dim, "up_ffn")?,
-            ffn_hidden: alloc(gpu, cfg.hidden_dim, "ffn_hidden")?,
+            gate_ffn: alloc(gpu, cfg.max_ffn_hidden_dim(), "gate_ffn")?,
+            up_ffn: alloc(gpu, cfg.max_ffn_hidden_dim(), "up_ffn")?,
+            ffn_hidden: alloc(gpu, cfg.max_ffn_hidden_dim(), "ffn_hidden")?,
             ffn_out: alloc(gpu, dim, "ffn_out")?,
+            ple_token_inputs: if ple_dim != 0 {
+                Some(alloc(gpu, ple_packed, "ple_token_inputs")?)
+            } else {
+                None
+            },
+            ple_projection_all: if ple_dim != 0 {
+                Some(alloc(gpu, ple_packed, "ple_projection_all")?)
+            } else {
+                None
+            },
+            ple_gate: if ple_dim != 0 {
+                Some(alloc(gpu, ple_dim, "ple_gate")?)
+            } else {
+                None
+            },
+            ple_hidden: if ple_dim != 0 {
+                Some(alloc(gpu, ple_dim, "ple_hidden")?)
+            } else {
+                None
+            },
+            ple_out: if ple_dim != 0 {
+                Some(alloc(gpu, dim, "ple_out")?)
+            } else {
+                None
+            },
             logits: alloc(gpu, cfg.vocab_size, "logits")?,
         })
     }
@@ -827,8 +1021,8 @@ impl Gemma4State {
     /// self. Caller follows with `gpu.drain_pool()` (the daemon's
     /// `unload_model` already does).
     pub fn free_gpu(self, gpu: &mut Gpu) {
-        self.kv_sliding.free_gpu(gpu);
-        self.kv_full.free_gpu(gpu);
+        let _ = self.kv_sliding.free_gpu(gpu);
+        let _ = self.kv_full.free_gpu(gpu);
         let _ = gpu.hip.free(self.pos_buf);
         for t in [
             self.x,
@@ -847,6 +1041,17 @@ impl Gemma4State {
             self.logits,
         ] {
             let _ = gpu.free_tensor(t);
+        }
+        for t in [
+            self.ple_token_inputs,
+            self.ple_projection_all,
+            self.ple_gate,
+            self.ple_hidden,
+            self.ple_out,
+        ] {
+            if let Some(t) = t {
+                let _ = gpu.free_tensor(t);
+            }
         }
     }
 }

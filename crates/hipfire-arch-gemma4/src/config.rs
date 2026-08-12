@@ -297,6 +297,29 @@ impl Gemma4Config {
             .count()
     }
 
+    /// Number of physical full-attention KV slots. E-series shared layers
+    /// consume a preceding same-type slot instead of allocating their own.
+    pub fn n_full_kv_slots(&self) -> usize {
+        self.layer_types
+            .iter()
+            .enumerate()
+            .filter(|(layer_idx, layer_type)| {
+                **layer_type == LayerType::Full && !self.is_kv_shared_layer(*layer_idx)
+            })
+            .count()
+    }
+
+    /// Number of physical sliding-attention KV slots.
+    pub fn n_sliding_kv_slots(&self) -> usize {
+        self.layer_types
+            .iter()
+            .enumerate()
+            .filter(|(layer_idx, layer_type)| {
+                **layer_type == LayerType::Sliding && !self.is_kv_shared_layer(*layer_idx)
+            })
+            .count()
+    }
+
     /// Max head_dim across the two attention flavours (scratch sizing).
     pub fn max_head_dim(&self) -> usize {
         self.sliding_head_dim.max(self.full_head_dim)
@@ -616,6 +639,8 @@ mod tests {
         assert_eq!(cfg.first_kv_shared_layer_idx(), Some(15));
         assert_eq!(cfg.kv_shared_source_layer_idx(15), Some(13));
         assert_eq!(cfg.kv_shared_source_layer_idx(19), Some(14));
+        assert_eq!(cfg.n_sliding_kv_slots(), 12);
+        assert_eq!(cfg.n_full_kv_slots(), 3);
     }
 
     #[test]
@@ -681,6 +706,8 @@ mod tests {
         assert_eq!(cfg.kv_shared_source_layer_idx(29), Some(23));
         assert_eq!(cfg.ffn_hidden_dim_for_layer(41), 10_240);
         assert_eq!(cfg.max_ffn_hidden_dim(), 10_240);
+        assert_eq!(cfg.n_sliding_kv_slots(), 20);
+        assert_eq!(cfg.n_full_kv_slots(), 4);
     }
 
     #[test]

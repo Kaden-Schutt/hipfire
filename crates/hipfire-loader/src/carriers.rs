@@ -1517,6 +1517,25 @@ impl Carrier for Cohere2MoeCarrier {
 
 // ─── Gemma4Carrier ───────────────────────────────────────────────────
 
+fn gemma4_use_lowered(
+    enable_moe_block: bool,
+    want_batched: bool,
+    has_drafter: bool,
+    is_e_series: bool,
+) -> bool {
+    enable_moe_block || (want_batched && !has_drafter && !is_e_series)
+}
+
+fn gemma4_validate_drafter_route(is_e_series: bool, has_drafter: bool) -> Result<(), String> {
+    if is_e_series && has_drafter {
+        return Err(
+            "gemma4: E2B/E4B EAGLE spec-decode is not yet supported; load the E-series target without params.drafter"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 pub struct Gemma4Carrier;
 impl Carrier for Gemma4Carrier {
     fn name(&self) -> &'static str {
@@ -1553,21 +1572,43 @@ impl Carrier for Gemma4Carrier {
         dir_diag(&src);
         let meta = resolve_source_meta(&src, ctx.path)?;
         match src {
-            ModelSource::Hfq(mut hfq) => {
+            ModelSource::Hfq(hfq) => {
                 // ── Lowered vs eager selection (MoE or batched prefill opt-in) ──
-                // The eager `gemma4::forward` path is DENSE ONLY. Arch-13 MoE
+                // Arch-13 MoE
                 // (26B-A4B `enable_moe_block`) must go through `lowered`, which
                 // carries the parallel-MoE branch. We also route DENSE models
                 // through `lowered` when the operator opts into batched/WMMA
                 // prefill — that path lives only in `lowered::forward_prefill_batch`.
+                // E2B/E4B stay on eager because lowered does not implement PLE,
+                // KV sharing, or E2B's double-wide shared-layer FFN.
                 // EAGLE spec-decode (`params.drafter`) requires the eager
                 // `Gemma4State`, so a drafter request always wins and keeps the
                 // eager path (batched prefill opt-in is ignored when a drafter
                 // is present). This is arch-gated: other carriers are unaffected.
                 let lowered_cfg = hipfire_arch_gemma4::lowered::config_from_hfq(&hfq);
                 let want_batched = crate::gemma4_batched_prefill_optin(ctx.gpu);
+                let lowered_is_moe = lowered_cfg
+                    .as_ref()
+                    .is_some_and(|lcfg| lcfg.enable_moe_block);
+                let eager_config = if lowered_is_moe {
+                    None
+                } else {
+                    Some(hipfire_arch_gemma4::config::Gemma4Config::from_hfq(&hfq)?)
+                };
+                let is_e_series = eager_config.as_ref().is_some_and(|cfg| {
+                    cfg.hidden_size_per_layer_input != 0 || cfg.num_kv_shared_layers != 0
+                });
+                if is_e_series {
+                    eager_config.as_ref().unwrap().e_series_variant()?;
+                }
+                gemma4_validate_drafter_route(is_e_series, ctx.gemma4_drafter_path.is_some())?;
                 let use_lowered = if let Some(ref lcfg) = lowered_cfg {
-                    lcfg.enable_moe_block || (want_batched && ctx.gemma4_drafter_path.is_none())
+                    gemma4_use_lowered(
+                        lcfg.enable_moe_block,
+                        want_batched,
+                        ctx.gemma4_drafter_path.is_some(),
+                        is_e_series,
+                    )
                 } else {
                     false
                 };
@@ -1641,8 +1682,17 @@ impl Carrier for Gemma4Carrier {
                         )
                     });
                 }
-                // ── Eager dense path ──
-                let config = hipfire_arch_gemma4::config::Gemma4Config::from_hfq(&hfq)?;
+                // ── Eager dense / E-series path ──
+                let config = match eager_config {
+                    Some(config) => config,
+                    None => hipfire_arch_gemma4::config::Gemma4Config::from_hfq(&hfq)?,
+                };
+                if is_e_series {
+                    eprintln!(
+                        "  gemma4 E-series eager path: {:?} (PLE + shared KV)",
+                        config.e_series_variant()?
+                    );
+                }
                 let weights =
                     hipfire_arch_gemma4::gemma4::Gemma4Weights::load(&hfq, &config, ctx.gpu)?;
                 let state = hipfire_arch_gemma4::gemma4::Gemma4State::new_with_max_seq(
@@ -2048,5 +2098,29 @@ impl Carrier for MuseGlimmerCarrier {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod gemma4_route_tests {
+    use super::{gemma4_use_lowered, gemma4_validate_drafter_route};
+
+    #[test]
+    fn e_series_never_enters_dense_lowered_prefill() {
+        assert!(!gemma4_use_lowered(false, true, false, true));
+    }
+
+    #[test]
+    fn dense_opt_in_and_moe_keep_existing_routes() {
+        assert!(gemma4_use_lowered(false, true, false, false));
+        assert!(!gemma4_use_lowered(false, true, true, false));
+        assert!(gemma4_use_lowered(true, false, false, false));
+    }
+
+    #[test]
+    fn e_series_drafter_fails_closed() {
+        assert!(gemma4_validate_drafter_route(true, true).is_err());
+        assert!(gemma4_validate_drafter_route(true, false).is_ok());
+        assert!(gemma4_validate_drafter_route(false, true).is_ok());
     }
 }
