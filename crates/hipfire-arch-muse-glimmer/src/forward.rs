@@ -1636,14 +1636,17 @@ fn prefill_chunk_batched(
         // residual family runs 46.2 TF shared / 51.7 TF muse, so the plain
         // lmhead route was leaving ~1.7x on the floor. Residual needs Y
         // pre-zeroed (it accumulates), same dance as down_proj below.
-        // Default OFF: unlike the Muse sibling (bit-identical), this swaps
-        // GemmHfq4G256BatchedLmhead for the residual WMMA family, which is a
-        // DIFFERENT kernel with a different accumulation order. Measured to
-        // change decoded output (golden e282364823d4 -> 7fa41d482632), so it
-        // is opt-in and off until it earns its own oracle.
+        //
+        // Default ON. It was briefly parked off on two claims that were both
+        // wrong: a "1.84x end-to-end cost" that was really hipRTC compiling the
+        // Muse kernel on first run, and an "output changed" that was really a
+        // stale golden. Re-measured warm on gfx1201, median of 2 fresh
+        // processes per config: 1372 -> 1356 ms at 1080 (+1.2%) and 7366 ->
+        // 7310 ms at 4241 (+0.8%), byte-identical both lengths. Env opt-out
+        // HIPFIRE_GLIMMER_O_RESIDUAL=0 kept for A/B.
         let o_use_residual = std::env::var("HIPFIRE_GLIMMER_O_RESIDUAL")
             .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(false)
+            .unwrap_or(true)
             && b > 1
             && gpu.arch_caps.has_wmma_w32_gfx12()
             && matches!(lw.o_proj.gpu_dtype, DType::MQ4G256 | DType::HFQ4G256);
