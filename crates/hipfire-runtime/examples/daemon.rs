@@ -29904,6 +29904,49 @@ fn parse_glimmer_atem(body: &str) -> Result<Vec<hipfire_runtime::prompt_frame::T
     Ok(calls)
 }
 
+/// Run the engine's two-phase terminal handshake for arch 14 and release the turn.
+///
+/// The wire contract is `commit_ready` -> client `commit` -> a byte-identical `done`
+/// (`crates/hipfire-client/src/lib.rs:742-776`, and `committed_done_payload_mismatch` at
+/// `lib.rs:1173-1194` compares the two payloads modulo `type`). Writing `done` straight out
+/// skips the handshake: the client treats the unexpected terminal as a protocol error, aborts,
+/// and the abort drain then reports
+/// `cancellation drain rejected non-aborted done (saw_aborted=false, finish_reason=...)`.
+/// That is a hung request from the user's side, so this helper is mandatory on every arch-14
+/// terminal.
+///
+/// Returns `true` when the client committed — only then may the caller publish side effects
+/// (assistant-turn cache store). On abort the caller MUST fail-closed reset, because the mirror
+/// and KV are mid-turn and no later turn may reuse them.
+fn glimmer_commit_terminal(
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    pending_done: &serde_json::Value,
+    generated: usize,
+) -> bool {
+    match await_client_terminal_commit(stdout, id, pending_done) {
+        ClientTerminalDecision::Commit => {
+            emit_staged_terminal_done(stdout, pending_done);
+            true
+        }
+        ClientTerminalDecision::Abort => {
+            let attempt_id = active_attempt_id();
+            let _ = writeln!(
+                stdout,
+                "{}",
+                hipfire_runtime::semantic::wire_aborted(id, "client_cancelled", attempt_id)
+            );
+            let _ = writeln!(
+                stdout,
+                "{}",
+                hipfire_runtime::semantic::wire_aborted_done(id, generated, attempt_id)
+            );
+            let _ = stdout.flush();
+            false
+        }
+    }
+}
+
 fn generate_muse_glimmer(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
@@ -30147,6 +30190,22 @@ fn generate_muse_glimmer(
         return;
     }
 
+    // Open the stream contract BEFORE any GPU work or token emission.
+    //
+    // The HTTP CLI's StreamContractGate requires the FIRST event of a request to be
+    // `gen_start` carrying the exact (id, attempt_id). Arch 14 never emitted it, so the first
+    // `reasoning`/`token` was rejected with
+    // `stream must begin with gen_start; got reasoning before contract latch`; the client then
+    // sent `abort` and the daemon sat waiting for a `commit` that never came — a hung request
+    // on native `hipfire serve` that looked like a generation stall. Same root cause and same
+    // fix as LFM2.5 (see `generate_lfm2moe`) and the DS4 fix e99583afa.
+    //
+    // `contract_version` stays `None`: only arch 5/6 advertise semantic contract v2
+    // (`gen_start_contract_version_for_arch`), and arch 14 must not claim a producer contract
+    // it does not implement.
+    let gen_contract = gen_start_contract_version_for_arch(m.arch_id);
+    emit_gen_start(stdout, id, false, gen_contract);
+
     // ── Prefix cache (LCP) — modelled on generate_minimax (daemon.rs:30352-30407).
     // Compute LCP of m.conversation_tokens against prompt_ids. Hit when
     // lcp > 0 && lcp < prompt_ids.len(); anything else is a cold miss.
@@ -30371,15 +30430,6 @@ fn generate_muse_glimmer(
                 // For simplicity, just break out by setting use_spec false path via return
                 // We'll handle by directly emitting done and returning
                 let parsed_tool_calls = parse_glimmer_atem(&glimmer_tool_acc).unwrap_or_default();
-                {
-                    let hit_length_cap = generated_count >= max_tokens;
-                    let is_empty = glimmer_emitted_ids.is_empty();
-                    let should_store = !hit_length_cap && !is_empty;
-                    if should_store {
-                        let ordinal = messages_history.map(|h| h.iter().filter(|m| matches!(m.role, hipfire_runtime::prompt_frame::Role::Assistant)).count()).unwrap_or(0);
-                        let _ = glimmer_store_cached_turn(&mut m.asst_turn_cache, glimmer_recorder, &parsed_tool_calls, ordinal);
-                    }
-                }
                 let _ = reconcile_glimmer_mirror(&mut bundle.state, &mut bundle.target_hidden_host, &mut m.conversation_tokens, &mut m.seq_pos);
                 let decode_ms = decode_t0.elapsed().as_millis().max(1);
                 let total_ms = t0.elapsed().as_millis().max(1);
@@ -30403,7 +30453,23 @@ fn generate_muse_glimmer(
                     "attempt_id": active_attempt_id(),
                 });
                 stage_terminal_tool_calls(&mut pending_done, finish_reason, &parsed_tool_calls);
-                emit_staged_terminal_done(stdout, &pending_done);
+                // Cache store is a COMMITTED side effect: publish it only after the client
+                // commits, never on an aborted turn.
+                if glimmer_commit_terminal(stdout, id, &pending_done, generated_count) {
+                    if !hit_length_cap && !glimmer_emitted_ids.is_empty() {
+                        let ordinal = messages_history
+                            .map(|h| h.iter().filter(|m| matches!(m.role, hipfire_runtime::prompt_frame::Role::Assistant)).count())
+                            .unwrap_or(0);
+                        let _ = glimmer_store_cached_turn(&mut m.asst_turn_cache, glimmer_recorder, &parsed_tool_calls, ordinal);
+                    }
+                } else {
+                    // Fail closed: the mirror and KV are mid-turn, so no later turn may reuse them.
+                    bundle.state.reset();
+                    bundle.target_hidden_host.clear();
+                    m.conversation_tokens.clear();
+                    m.asst_turn_cache.clear();
+                    m.seq_pos = 0;
+                }
                 return;
             }
             // Write seed's KV at cur_pos (already done by prefill? No, prefill's last token was prompt, not seed)
@@ -30921,15 +30987,6 @@ fn generate_muse_glimmer(
     }
 
     let parsed_tool_calls = parse_glimmer_atem(&glimmer_tool_acc).unwrap_or_default();
-    {
-        let hit_length_cap = generated_count >= max_tokens;
-        let is_empty = glimmer_emitted_ids.is_empty();
-        let should_store = !hit_length_cap && !is_empty;
-        if should_store {
-            let ordinal = messages_history.map(|h| h.iter().filter(|m| matches!(m.role, hipfire_runtime::prompt_frame::Role::Assistant)).count()).unwrap_or(0);
-            let _ = glimmer_store_cached_turn(&mut m.asst_turn_cache, glimmer_recorder, &parsed_tool_calls, ordinal);
-        }
-    }
     let _ = reconcile_glimmer_mirror(&mut bundle.state, &mut bundle.target_hidden_host, &mut m.conversation_tokens, &mut m.seq_pos);
 
     let decode_ms = decode_t0.elapsed().as_millis().max(1);
@@ -30958,7 +31015,22 @@ fn generate_muse_glimmer(
         "attempt_id": active_attempt_id(),
     });
     stage_terminal_tool_calls(&mut pending_done, finish_reason, &parsed_tool_calls);
-    emit_staged_terminal_done(stdout, &pending_done);
+    // Cache store is a COMMITTED side effect: publish it only after the client commits.
+    if glimmer_commit_terminal(stdout, id, &pending_done, generated_count) {
+        if !hit_length_cap && !glimmer_emitted_ids.is_empty() {
+            let ordinal = messages_history
+                .map(|h| h.iter().filter(|m| matches!(m.role, hipfire_runtime::prompt_frame::Role::Assistant)).count())
+                .unwrap_or(0);
+            let _ = glimmer_store_cached_turn(&mut m.asst_turn_cache, glimmer_recorder, &parsed_tool_calls, ordinal);
+        }
+    } else {
+        // Fail closed: the mirror and KV are mid-turn, so no later turn may reuse them.
+        bundle.state.reset();
+        bundle.target_hidden_host.clear();
+        m.conversation_tokens.clear();
+        m.asst_turn_cache.clear();
+        m.seq_pos = 0;
+    }
 }
 
 fn generate_lfm2moe(
