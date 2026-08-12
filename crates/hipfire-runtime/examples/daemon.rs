@@ -10462,10 +10462,21 @@ fn emit_ds4_ep_gen_start(stdout: &mut impl std::io::Write, id: &str, think_mode:
 }
 
 /// Pure `gen_start.contract_version` selection used by the live generate path.
-/// Qwen AR (5/6) advertises v2; DS4 (9) and every other arch stay unset.
+/// Qwen AR (5/6) and Muse Glimmer (14) advertise v2; DS4 (9) and every other
+/// arch stay unset.
+/// Muse Glimmer already emits the v2-shaped two-phase terminal
+/// (`commit_ready` -> `commit` -> byte-identical `done`), and its tool calls
+/// are staged as canonical `calls` on that terminal. Only the v2 fold reads
+/// them: the legacy path builds tool calls solely from mid-stream `tool_calls`
+/// events, which Glimmer does not emit, so on legacy a tool turn arrived with
+/// `finish_reason=tool_calls` and an empty payload.
+const GLIMMER_SEMANTIC_CONTRACT_VERSION: u32 = 2;
+
 fn gen_start_contract_version_for_arch(arch_id: u32) -> Option<u32> {
     if arch_id == 5 || arch_id == 6 {
         Some(QWEN_AR_SEMANTIC_CONTRACT_VERSION)
+    } else if arch_id == 14 {
+        Some(GLIMMER_SEMANTIC_CONTRACT_VERSION)
     } else {
         None
     }
