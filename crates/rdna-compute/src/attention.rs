@@ -2379,6 +2379,52 @@ impl Gpu {
     ///
     /// `window <= 0` reproduces the parent exactly.
     ///
+    /// Why gfx1100 and gfx1151 are separated: `has_wmma_w32()` is true for
+    /// both, but gfx1100 is a 96-CU discrete part at ~960 GB/s while gfx1151
+    /// is an RDNA3.5 APU on unified memory with far fewer CUs. Their optimal
+    /// choices for prefetch, LDS pressure and compile-time `head_dim` are not
+    /// the same, so a single `gfx11` arm forces a lowest-common-denominator
+    /// choice (measured: gfx1100 192.4 ms/window vs gfx1201 173.7 ms — gfx1100
+    /// was trailing gfx1201 despite having the CU advantage). The compile-time
+    /// `head_dim` requirement is documented as a **gfx12** necessity (without
+    /// it the unrolled accumulators spill on gfx1201, roughly halving
+    /// throughput); it is NOT stated to be a gfx11 requirement.
+    ///
+    /// Tuning knobs (mirroring the parent `attention_q8_0_flash_prefill_wmma`):
+    /// - `HIPFIRE_FLASH_PREFILL_FIXED_HD` (`0` to disable compile-time
+    ///   `head_dim`; default enabled) — when disabled, `FIXED_HEAD_DIM` is `0`
+    ///   and the kernel uses a dynamic head_dim path.
+    /// - `HIPFIRE_FLASH_PREFILL_PREFETCH_V` (`0`/`1`, default `1`) — controls
+    ///   `PREFETCH_V` and the `_pv0` module suffix.
+    /// - `HIPFIRE_GLIMMER_SWA_PREFETCH_V` (`0`/`1`) — when set, wins over the
+    ///   shared `HIPFIRE_FLASH_PREFILL_PREFETCH_V` for **this kernel only**,
+    ///   so the SWA prefetch optimum can be swept per-arch without a rebuild.
+    ///   The per-arch optimum has not yet been measured.
+    ///
+    /// Module and **source** identity are per-arch class so each can be tuned
+    /// independently without arch-bleed (see `autoresearch/ar/certify/cross_arch.py:66`
+    /// and `docs/specs/2026-07-10-agentic-pr-merge-gate-design.md:72` gate `1·cross-arch`):
+    /// - discrete RDNA3 (`gfx1100`/`1101`/`1102`) → `..._gfx1100_hd{hd}{suffix}`
+    ///   via `ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SWA_GFX1100_SRC`
+    ///   (`kernels/src/attention_q8_0_flash_prefill_wmma_swa.gfx1100.hip`)
+    /// - RDNA3.5 APU (`gfx1150`/`1151`/`1152`) → `..._gfx1151_hd{hd}{suffix}`
+    ///   via `ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SWA_GFX1151_SRC`
+    ///   (`kernels/src/attention_q8_0_flash_prefill_wmma_swa.gfx1151.hip`)
+    /// - other wave32-WMMA parts → `..._gfx11_hd{hd}{suffix}` fallback via
+    ///   `ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SWA_SRC`
+    ///   (`kernels/src/attention_q8_0_flash_prefill_wmma_swa.hip`)
+    /// The three `*.hip` files start byte-identical; the split exists solely so
+    /// future per-arch `#define`s / tile tuning can diverge without touching
+    /// another arch's device TU — exactly the `arch-bleed; #if-gate the gfxNNNN path`
+    /// invariant. Arch-suffixed files (`*.gfxNNNN.hip`) are skipped by
+    /// `check_cross_arch` (`_ARCH_SUFFIX` matches) and are therefore dispatch-isolated
+    /// by construction. The alternative — one shared file with `#if defined(__gfxNNNN__)`
+    /// gates — also satisfies the gate but was rejected here: the precedent in
+    /// `kernels/src/` is separate files for distinct arch codegen
+    /// (`attention_q8_0_flash_prefill_wmma.hip` vs `*.gfx12.hip`, etc.), and three
+    /// byte-identical copies make a later per-arch diff reviewable while sharing
+    /// a single file would require discipline to gate every future edit.
+    ///
     /// Returns `Ok(false)` without launching when the arch has no wave32 WMMA,
     /// so the caller can fall back.
     #[allow(clippy::too_many_arguments)]
@@ -2398,12 +2444,32 @@ impl Gpu {
         self.bind_thread()?;
         assert!(head_dim % 32 == 0, "head_dim {head_dim} must be a multiple of 32");
         assert!(head_dim <= 256, "head_dim {head_dim} exceeds MAX_D_CHUNKS*16");
-        // Mirrors the parent's compile-time contract: gfx12 needs head_dim as a
-        // constant or the unrolled float8_t output fragments spill 544 B/thread
-        // to scratch. SPLIT_Q and PREFETCH_V keep the parent's defaults.
-        // gfx11 uses the same fixed-head contract (interleaved mapping, same
-        // d_chunks spill risk) — only the WMMA builtin/mapping differs, which
-        // lives inside each parent file and is untouched here.
+        // Tunable knobs — mirrors the parent `attention_q8_0_flash_prefill_wmma`:
+        // - fixed_head_dim: env `HIPFIRE_FLASH_PREFILL_FIXED_HD` ( `0` => dynamic, 0)
+        //   The compile-time head_dim is documented as a gfx12 necessity (spill
+        //   without it halves throughput on gfx1201); NOT stated to be a gfx11
+        //   requirement, so the gfx11 arms honour the knob.
+        // - prefetch_v: env `HIPFIRE_FLASH_PREFILL_PREFETCH_V` ( `0`/`1`, default `1`)
+        //   plus per-kernel override `HIPFIRE_GLIMMER_SWA_PREFETCH_V` which wins
+        //   when set, so the SWA optimum can be swept per-arch without a rebuild.
+        // - SPLIT_Q: 0 for this kernel — the SWA kernel has no split-q variant
+        //   (kept explicit rather than looking arbitrary).
+        let fixed_head_dim = hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_FIXED_HD")
+            .ok()
+            .as_deref()
+            != Some("0");
+        let fixed_hd = if fixed_head_dim { head_dim } else { 0 };
+        let prefetch_v_base = hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_PREFETCH_V")
+            .ok()
+            .as_deref()
+            != Some("0");
+        let prefetch_v = hipfire_config::developer_var("HIPFIRE_GLIMMER_SWA_PREFETCH_V")
+            .ok()
+            .as_deref()
+            .map(|v| v != "0")
+            .unwrap_or(prefetch_v_base);
+        let pv_suffix = if prefetch_v { "" } else { "_pv0" };
+        let tuning_suffix = pv_suffix;
         let (module, src) = if self.arch_caps.has_wmma_w32_gfx12() {
             (
                 format!("attention_q8_0_flash_prefill_wmma_swa_gfx12_hd{head_dim}"),
@@ -2413,12 +2479,33 @@ impl Gpu {
                     kernels::ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SWA_GFX12_SRC
                 ),
             )
+        } else if self.arch_caps.is_rdna3_discrete() {
+            (
+                format!("attention_q8_0_flash_prefill_wmma_swa_gfx1100_hd{head_dim}{tuning_suffix}"),
+                format!(
+                    "#define SPLIT_Q 0\n#define FIXED_HEAD_DIM {}\n#define PREFETCH_V {}\n{}",
+                    fixed_hd,
+                    prefetch_v as u32,
+                    kernels::ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SWA_GFX1100_SRC
+                ),
+            )
+        } else if self.arch_caps.is_rdna35_apu() {
+            (
+                format!("attention_q8_0_flash_prefill_wmma_swa_gfx1151_hd{head_dim}{tuning_suffix}"),
+                format!(
+                    "#define SPLIT_Q 0\n#define FIXED_HEAD_DIM {}\n#define PREFETCH_V {}\n{}",
+                    fixed_hd,
+                    prefetch_v as u32,
+                    kernels::ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SWA_GFX1151_SRC
+                ),
+            )
         } else if self.arch_caps.has_wmma_w32() {
             (
-                format!("attention_q8_0_flash_prefill_wmma_swa_gfx11_hd{head_dim}"),
+                format!("attention_q8_0_flash_prefill_wmma_swa_gfx11_hd{head_dim}{tuning_suffix}"),
                 format!(
-                    "#define SPLIT_Q 0\n#define FIXED_HEAD_DIM {}\n#define PREFETCH_V 1\n{}",
-                    head_dim,
+                    "#define SPLIT_Q 0\n#define FIXED_HEAD_DIM {}\n#define PREFETCH_V {}\n{}",
+                    fixed_hd,
+                    prefetch_v as u32,
                     kernels::ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SWA_SRC
                 ),
             )

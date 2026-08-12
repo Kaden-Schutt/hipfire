@@ -4221,6 +4221,21 @@ pub const ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SWA_GFX12_SRC: &str =
 pub const ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SWA_SRC: &str =
     include_str!("../../../kernels/src/attention_q8_0_flash_prefill_wmma_swa.hip");
 
+/// Gfx1100 (discrete RDNA3) arch-isolated variant of `ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SWA_SRC`.
+/// Byte-identical to the plain `..._swa.hip` at introduction; the split exists
+/// solely so per-arch tuning (prefetch, LDS pressure, FIXED_HEAD_DIM defaults)
+/// can diverge without arch-bleed. See `autoresearch/ar/certify/cross_arch.py:66`
+/// `check_cross_arch` — arch-suffixed files (`*.gfxNNNN.hip`) are dispatch-
+/// isolated and skipped by the gate, while an un-suffixed shared file would
+/// require `#if`-gating and would be flagged as bleed.
+pub const ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SWA_GFX1100_SRC: &str =
+    include_str!("../../../kernels/src/attention_q8_0_flash_prefill_wmma_swa.gfx1100.hip");
+
+/// Gfx1151 (RDNA3.5 APU, Strix Halo) arch-isolated variant. Same contract as
+/// the gfx1100 sister; byte-identical at introduction.
+pub const ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SWA_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/attention_q8_0_flash_prefill_wmma_swa.gfx1151.hip");
+
 /// Phase-timed variant of ATTENTION_Q8_0_KV_SRC. Functionally equivalent
 /// to the baseline kernel but instrumented with wall_clock64() around each
 /// of the 3 internal phases (QK^T, softmax, V-weighted-sum). Writes per-head
