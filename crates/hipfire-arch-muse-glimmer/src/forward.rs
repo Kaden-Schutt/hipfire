@@ -114,6 +114,59 @@ fn run_prefill_residual_gemm_key(
         .map_err(|e| format!("{e:?}"))
 }
 
+/// Muse-owned residual GEMM with fallback to the shared dispatch key.
+///
+/// Tries `gemm_hfq4g256_residual_muse` — a Glimmer-only sibling of the shared
+/// batch-tiled kernel that drops tail clamping and affine-collapses the X
+/// addressing, freeing ~50 VGPRs and lifting occupancy 5 -> 7 waves/SIMD at
+/// bt=12. It is BIT-IDENTICAL to the shared kernel (same BV, same K loop, same
+/// WMMA order; only address arithmetic differs), verified `bitdiff=0` across
+/// every Glimmer prefill shape, so it cannot change decoded output.
+///
+/// Only applied where it MEASURED faster on gfx1201 at B=384 — the caller
+/// decides, because the win is shape-dependent and inverts on wide-M:
+///   down_proj (M=6656)  +18.2%      o_proj (M=6656)   +12.0%
+///   gate/up   (M=19968) -16.6%      qkvg   (M=8704)   -20.6%
+/// Wide-M shapes already saturate the grid, so extra occupancy buys nothing
+/// and the affine recompute costs. Those stay on the shared kernel.
+///
+/// Returns to the shared key when the batch is not a multiple of 16*bt (ragged
+/// tail chunk) or the env opt-out is set.
+#[inline]
+fn run_prefill_residual_muse_or_key(
+    gpu: &mut Gpu,
+    key: hipfire_dispatch::types::KernelKey,
+    w_buf: &GpuTensor,
+    w_dtype: DType,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<(), String> {
+    if muse_gemm_enabled() && matches!(w_dtype, DType::MQ4G256 | DType::HFQ4G256) {
+        let bt = if n % 192 == 0 { 12 } else { 0 };
+        if bt != 0 {
+            let used = gpu
+                .gemm_hfq4g256_residual_muse(w_buf, x, y, m, k, n, bt)
+                .map_err(|e| format!("muse residual: {e:?}"))?;
+            if used {
+                return Ok(());
+            }
+        }
+    }
+    run_prefill_residual_gemm_key(gpu, key, w_buf, w_dtype, x, y, m, k, n)
+}
+
+/// Opt-out for the Muse-owned residual GEMM (`HIPFIRE_GLIMMER_MUSE_GEMM=0`).
+/// Default ON. Since the kernel is bit-identical to the shared one, this knob
+/// is a perf A/B switch, not a correctness escape hatch.
+fn muse_gemm_enabled() -> bool {
+    std::env::var("HIPFIRE_GLIMMER_MUSE_GEMM")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(true)
+}
+
 #[inline]
 fn run_prefill_fused_qkvza_key(
     gpu: &mut Gpu,
@@ -166,8 +219,9 @@ fn batched_lm_head_enabled() -> bool {
     )
 }
 
-/// Chunk size for batched prefill. Default 256, overridable via
-/// `HIPFIRE_GLIMMER_PREFILL_CHUNK` for tuning (128-512 range).
+/// Chunk size for batched prefill: 192 for prompts >= 512 tokens, else 256.
+/// Overridable via `HIPFIRE_GLIMMER_PREFILL_CHUNK` (clamped to 1-512); the
+/// rationale for the split is on the function body below.
 ///
 /// VRAM cost (transient per-chunk scratch):
 ///   dim=6656, q_dim=4096, kv_dim=256, hidden=19968, n_layers=52
@@ -179,13 +233,33 @@ fn batched_lm_head_enabled() -> bool {
 ///   plus small k/v/pos. Model weights are 15.5 GB on 16 GB card leaving
 ///   ~500 MB headroom, so B=256 (140 MB) is safe, B=512 (280 MB) is still
 ///   within budget but closer to limit; B=128 is more conservative.
-///   We default to 256 as the mid-point and clamp env to [1,512].
-pub fn glimmer_prefill_chunk_size() -> usize {
-    std::env::var("HIPFIRE_GLIMMER_PREFILL_CHUNK")
+///   Both defaults (192 and 256) sit well inside that headroom.
+pub fn glimmer_prefill_chunk_size(prompt_len: usize) -> usize {
+    if let Some(v) = std::env::var("HIPFIRE_GLIMMER_PREFILL_CHUNK")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(256)
-        .clamp(1, 512)
+    {
+        return v.clamp(1, 512);
+    }
+    // 192 for anything long enough to fill at least two Muse tiles, else 256.
+    //
+    // The Muse residual sibling requires batch % 192 == 0, so only chunks of
+    // exactly 192 (or 384) reach it; a ragged tail silently falls back to the
+    // shared kernel. 192 also lands the shared batch-tile heuristic on BT12
+    // with exact tiling, which 256 cannot reach (256 % 192 != 0 -> BT8).
+    //
+    // Measured on gfx1201, median of 3 fresh processes, all byte-identical:
+    //    270 tok: 752 -> 743 tok/s  (-1.2%)  <- why short prompts keep 256
+    //   1080 tok: 725 -> 783 tok/s  (+8.0%)
+    //   4241 tok: 539 -> 569 tok/s  (+5.6%)
+    // At 270 the split is one 192 tile plus a 78-token tail, and the extra
+    // chunk's fixed cost outweighs the single tile's win. From ~512 tokens up
+    // there are at least two full tiles and 192 pulls clearly ahead.
+    if prompt_len >= 512 {
+        192
+    } else {
+        256
+    }
 }
 
 // ───────────────────────────── Decode ─────────────────────────────
@@ -1529,8 +1603,50 @@ fn prefill_chunk_batched(
             gpu.sigmoid_mul_f32(&attn_out, &attn_gate).map_err(|e| format!("glimmer prefill L{layer_idx} sigmoid_mul: {e:?}"))?;
         }
 
-        // o_proj stays on the current baseline (29.8 TF best measured); leave it.
-        prefill_proj_gemm_batched(gpu, &lw.o_proj, &attn_out, &o_out, &o_rot, b, "o_proj")?;
+        // o_proj (M=6656, K=4096). The old comment here read "stays on the
+        // current baseline (29.8 TF best measured)" — that number is the
+        // GemmHfq4G256BatchedLmhead path this used to take, NOT the residual
+        // kernel. Re-measured on gfx1201 at B=384 on this exact shape, the
+        // residual family runs 46.2 TF shared / 51.7 TF muse, so the plain
+        // lmhead route was leaving ~1.7x on the floor. Residual needs Y
+        // pre-zeroed (it accumulates), same dance as down_proj below.
+        // Default OFF: unlike the Muse sibling (bit-identical), this swaps
+        // GemmHfq4G256BatchedLmhead for the residual WMMA family, which is a
+        // DIFFERENT kernel with a different accumulation order. Measured to
+        // change decoded output (golden e282364823d4 -> 7fa41d482632), so it
+        // is opt-in and off until it earns its own oracle.
+        let o_use_residual = std::env::var("HIPFIRE_GLIMMER_O_RESIDUAL")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(false)
+            && b > 1
+            && gpu.arch_caps.has_wmma_w32_gfx12()
+            && matches!(lw.o_proj.gpu_dtype, DType::MQ4G256 | DType::HFQ4G256);
+        // No invalidate_fp16_cache() needed here, unlike the gate/up site
+        // below: that cache keys purely on source pointer (scratch.rs:411) and
+        // the per-layer buffer order is x_rot (qkvza) -> o_rot (here) -> x_rot
+        // (gate) -> x_rot (up, the intended reuse) -> down_rot, so o_rot is
+        // always preceded by a DIFFERENT pointer.
+        if o_use_residual {
+            rotate_x_mq_batched_for(gpu, &lw.o_proj, &attn_out, &o_rot, lw.o_proj.k, b)
+                .map_err(|e| format!("glimmer prefill L{layer_idx} rotate for o residual: {e:?}"))?;
+            gpu.hip
+                .memset(&o_out.buf, 0, b * lw.o_proj.m * 4)
+                .map_err(|e| format!("glimmer prefill L{layer_idx} zero o_out: {e:?}"))?;
+            run_prefill_residual_muse_or_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmHfq4G256Residual,
+                &lw.o_proj.buf,
+                lw.o_proj.gpu_dtype,
+                &o_rot,
+                &o_out,
+                lw.o_proj.m,
+                lw.o_proj.k,
+                b,
+            )
+            .map_err(|e| format!("glimmer prefill L{layer_idx} o residual: {e}"))?;
+        } else {
+            prefill_proj_gemm_batched(gpu, &lw.o_proj, &attn_out, &o_out, &o_rot, b, "o_proj")?;
+        }
         gpu.rmsnorm_batched(&o_out, &lw.post_attention_layernorm, &o_out, b, dim, post_eps).map_err(|e| format!("glimmer prefill L{layer_idx} post_attn rmsnorm: {e:?}"))?;
         gpu.hip.memcpy_dtod_at(&x.buf, 0, &residual.buf, 0, b * dim * 4).map_err(|e| format!("glimmer prefill L{layer_idx} reset x (attn): {e:?}"))?;
         gpu.add_inplace_f32(&x, &o_out).map_err(|e| format!("glimmer prefill L{layer_idx} attn residual add: {e:?}"))?;
@@ -1617,7 +1733,7 @@ fn prefill_chunk_batched(
             // ffn_hidden is [B, hidden_dim]; down needs FWHT-rotated input for MQ4.
             rotate_x_mq_batched_for(gpu, &lw.down_proj, &ffn_hidden, &down_rot, lw.down_proj.k, b).map_err(|e| format!("glimmer prefill L{layer_idx} rotate for down residual: {e:?}"))?;
             gpu.hip.memset(&ffn_out.buf, 0, b * lw.down_proj.m * 4).map_err(|e| format!("glimmer prefill L{layer_idx} zero ffn_out: {e:?}"))?;
-            run_prefill_residual_gemm_key(
+            run_prefill_residual_muse_or_key(
                 gpu,
                 hipfire_dispatch::types::KernelKey::GemmHfq4G256Residual,
                 &lw.down_proj.buf,
@@ -1702,7 +1818,7 @@ pub fn prefill_with_capture(
     if prompt.is_empty() {
         return Err("glimmer prefill: empty prompt".to_string());
     }
-    let chunk_size = glimmer_prefill_chunk_size();
+    let chunk_size = glimmer_prefill_chunk_size(prompt.len());
     let mut last_logits: Option<Vec<f32>> = None;
     let mut pos = start_pos;
     let mut offset = 0usize;

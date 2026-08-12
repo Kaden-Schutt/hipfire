@@ -10994,6 +10994,100 @@ impl Gpu {
         result
     }
 
+    /// Muse Glimmer-owned HFQ4-G256 residual GEMM (gfx12 only).
+    ///
+    /// Sibling of [`Self::gemm_hfq4g256_residual_wmma_gfx12`], NOT a
+    /// replacement: it touches no shared selector, heuristic, or tile
+    /// constant, and nothing outside hipfire-arch-muse-glimmer calls it.
+    ///
+    /// Same inner math as the shared BT kernel, but the full-tile precondition
+    /// (`batch_size % (16*bt) == 0`) removes all clamping and collapses the X
+    /// addressing to one base pointer plus a constant stride. That frees ~50
+    /// VGPRs at bt=12 (247 -> 197 measured on gfx1201), lifting occupancy from
+    /// 5 to 7 waves/SIMD at identical tiling.
+    ///
+    /// Measured on gfx1201 (VGPR / occupancy, shared -> muse):
+    ///   bt=4   79 occ 16 -> 77 occ 16   (no gain, already saturated)
+    ///   bt=8  138 occ 10 -> 103 occ 12
+    ///   bt=12 247 occ  5 -> 197 occ  7
+    ///
+    /// Returns `Ok(false)` without launching when the precondition does not
+    /// hold, so the caller can fall back to the shared path. Widths above 12
+    /// are rejected: bt=16 spills 53 VGPRs and bt=20 spills 405, both measured,
+    /// so they are not offered as options.
+    pub fn gemm_hfq4g256_residual_muse(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        bt: usize,
+    ) -> HipResult<bool> {
+        let kname = match bt {
+            12 => "gemm_hfq4g256_residual_wmma_gfx12_muse_full12",
+            8 => "gemm_hfq4g256_residual_wmma_gfx12_muse_full8",
+            4 => "gemm_hfq4g256_residual_wmma_gfx12_muse_full4",
+            _ => return Ok(false),
+        };
+        if batch_size == 0 || batch_size % (16 * bt) != 0 {
+            return Ok(false);
+        }
+        self.bind_thread()?;
+        self.ensure_kernel(
+            kname,
+            kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_MUSE_SRC,
+            kname,
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+
+        let mut a_ptr = a.buf.as_ptr();
+        let mut x_ptr = x_f16_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+
+        let row_tiles = (m + 15) / 16;
+        let batch_tiles = batch_size / (16 * bt);
+
+        let bytes =
+            crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * k * 2 + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kname, bytes);
+        let result = self.launch_maybe_blob(
+            kname,
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(bs_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result?;
+        Ok(true)
+    }
+
     /// HFQ4-G256 GEMV with fused residual add: y[row] += A[row] · x.
     /// Same math as `gemv_hfq4g256` but the final write accumulates into `y`
     /// instead of overwriting. Used for wo / w_down projections where the
