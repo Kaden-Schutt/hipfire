@@ -512,7 +512,28 @@ fn glimmer_layer_decode(
         &kv.v_gpu[kv_slot],
         &state.attn_out,
         &state.pos_buf,
-        state.max_seq,
+        // seq_len_hint: the CURRENT sequence length, not state.max_seq.
+        //
+        // This argument never reaches the kernel — the host uses it solely to
+        // size the launch (attention.rs: block_size, and
+        // shared_mem = (hint + block_size + head_dim) * 4). The kernel derives
+        // its own `seq_len = pos_buf[0] + 1` and indexes `scores[t]` by
+        // absolute t, so the LDS it actually needs is pos+1 floats.
+        //
+        // Passing state.max_seq over-allocated LDS by the full cache size and,
+        // worse, imposed a hard ceiling: shared_mem crosses the 64 KB LDS limit
+        // at max_seq ~16000, so LOADING with a larger max_seq made every decode
+        // fail with `hipModuleLaunchKernel: invalid argument` at layer 0 —
+        // regardless of how few tokens were actually in the cache. Glimmer
+        // declares max_position_embeddings = 131072; measured, max_seq=8192
+        // decoded at 32.1 tok/s while max_seq=16384 could not decode at all.
+        // Every test had used 8192, so it stayed hidden until `hipfire bench
+        // --matrix` (whose default --ctx list reaches 20000) tripped it.
+        //
+        // Now the ceiling tracks REAL context instead of configured capacity.
+        // Contexts past ~16k still need the flash path: `scores` is indexed by
+        // absolute t, so this kernel is inherently O(seq_len) in LDS.
+        state.pos_host[0] as usize + 1,
         n_heads,
         n_kv,
         head_dim,

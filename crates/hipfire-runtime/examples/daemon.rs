@@ -15717,27 +15717,32 @@ fn main() {
                     }
                     ok
                 } else if m.arch_id == 14 {
-                    // Muse Glimmer warm-pass: per-token decode_step over the
-                    // synthetic prompt. Uses eager dense path (no hipGraph).
-                    // Mirrors the Gemma4 warm-pass shape.
+                    // Muse Glimmer (arch_id=14).
+                    // Glimmer prefills in BATCHED chunks, so bench it that way.
+                    // This used to loop `decode_step` per token, mirroring the
+                    // Gemma4 warm-pass shape, which measured the eager path that
+                    // `generate` stopped using — `hipfire bench --matrix` was
+                    // reporting a route production never takes (and ~20x slower
+                    // than the real one). Route through the same
+                    // `prefill_with_capture` the generate path calls.
                     let Some(ModelState::MuseGlimmer(bundle)) = m.state.as_mut() else {
                         unreachable!("arch_id=14 requires muse_glimmer bundle")
                     };
                     let config = &bundle.config;
                     let weights = &bundle.weights;
                     let state = &mut bundle.state;
-                    let mut ok = true;
-                    for (i, &tok) in synthetic.iter().enumerate() {
-                        if glimmer::forward::decode_step(
-                            config, weights, state, &mut gpu, tok, i as u32,
-                        )
-                        .is_err()
-                        {
-                            ok = false;
-                            break;
-                        }
-                    }
-                    ok
+                    let mut hidden_out: Vec<f32> = Vec::new();
+                    glimmer::forward::prefill_with_capture(
+                        config,
+                        weights,
+                        state,
+                        &mut gpu,
+                        &synthetic,
+                        0,
+                        &[],
+                        &mut hidden_out,
+                    )
+                    .is_ok()
                 } else if m.arch_id == 8 {
                     // dots.ocr: Qwen2 text decoder via qwen2_state + dots_ocr fields.
                     let state = m.qwen2_state.as_mut().unwrap();
@@ -15884,11 +15889,18 @@ fn main() {
                     let _ = stdout.flush();
                     continue;
                 }
-                if m.pp > 1 || m.ep.is_some() || (m.arch_id != 5 && m.arch_id != 6) {
+                // arch 5/6 = Qwen3.5, arch 14 = Muse Glimmer. Both prime with a
+                // batched prefill and then step tokens one at a time, so the
+                // same bench shape applies; the two branches below differ only
+                // in which forward they call.
+                if m.pp > 1
+                    || m.ep.is_some()
+                    || (m.arch_id != 5 && m.arch_id != 6 && m.arch_id != 14)
+                {
                     emit_uncorrelated_error(
                         &mut stdout,
                         None,
-                        "bench_decode currently requires a single-GPU Qwen3.5 model",
+                        "bench_decode requires a single-GPU Qwen3.5 or Muse Glimmer model",
                         "unsupported",
                         false,
                         false,
@@ -15958,7 +15970,27 @@ fn main() {
                 m.conversation_tokens.clear();
                 let _ = reset_qwen35_recurrent(m, &mut gpu);
                 let synthetic: Vec<u32> = (0..context as u32).map(|i| 10 + (i % 1000)).collect();
-                let prime_error = {
+                let prime_error: Option<String> = if m.arch_id == 14 {
+                    let Some(ModelState::MuseGlimmer(bundle)) = m.state.as_mut() else {
+                        unreachable!("arch_id=14 requires muse_glimmer bundle")
+                    };
+                    bundle.state.reset();
+                    let config = &bundle.config;
+                    let weights = &bundle.weights;
+                    let state = &mut bundle.state;
+                    let mut hidden_out: Vec<f32> = Vec::new();
+                    glimmer::forward::prefill_with_capture(
+                        config,
+                        weights,
+                        state,
+                        &mut gpu,
+                        &synthetic,
+                        0,
+                        &[],
+                        &mut hidden_out,
+                    )
+                    .err()
+                } else {
                     let ModelState::Qwen35(b) = m.state.as_mut().unwrap() else {
                         unreachable!()
                     };
@@ -15977,6 +16009,7 @@ fn main() {
                         None,
                     )
                     .err()
+                    .map(|e| format!("{e:?}"))
                 };
                 let _ = gpu.hip.device_synchronize();
                 if let Some(error) = prime_error {
@@ -16014,7 +16047,35 @@ fn main() {
                 let replay_before = gpu.replay.replay_observation();
                 let _ = gpu.hip.device_synchronize();
                 let t0 = Instant::now();
-                let run_ok = {
+                let mut decode_err: Option<String> = None;
+                let run_ok = if m.arch_id == 14 {
+                    let Some(ModelState::MuseGlimmer(bundle)) = m.state.as_mut() else {
+                        unreachable!("arch_id=14 requires muse_glimmer bundle")
+                    };
+                    let config = &bundle.config;
+                    let weights = &bundle.weights;
+                    let state = &mut bundle.state;
+                    let mut ok = true;
+                    for i in 0..iterations {
+                        let token = 101 + (i as u32 % 1000);
+                        match glimmer::forward::decode_step(
+                            config,
+                            weights,
+                            state,
+                            &mut gpu,
+                            token,
+                            (context + i) as u32,
+                        ) {
+                            Ok(_) => {}
+                            Err(e) => {
+                                decode_err = Some(format!("iter {i} pos {}: {e}", context + i));
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    ok
+                } else {
                     let ModelState::Qwen35(b) = m.state.as_mut().unwrap() else {
                         unreachable!()
                     };
@@ -16120,7 +16181,10 @@ fn main() {
                     emit_uncorrelated_error(
                         &mut stdout,
                         None,
-                        "bench_decode forward failed",
+                        &match &decode_err {
+                            Some(e) => format!("bench_decode forward failed: {e}"),
+                            None => "bench_decode forward failed".to_string(),
+                        },
                         "internal",
                         false,
                         false,
