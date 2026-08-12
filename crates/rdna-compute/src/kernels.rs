@@ -4214,6 +4214,13 @@ pub const ATTENTION_Q8_0_FLASH_PREFILL_WMMA_GFX12_SRC: &str =
 pub const ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SWA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/attention_q8_0_flash_prefill_wmma_swa.gfx12.hip");
 
+/// RDNA3 counterpart of `ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SWA_GFX12_SRC`.
+/// Same algorithm and `window` contract; WMMA tiling uses the gfx11
+/// interleaved accumulator mapping and 16-element K-lane split.
+/// `window <= 0` reproduces the parent `ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SRC` exactly.
+pub const ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SWA_SRC: &str =
+    include_str!("../../../kernels/src/attention_q8_0_flash_prefill_wmma_swa.hip");
+
 /// Phase-timed variant of ATTENTION_Q8_0_KV_SRC. Functionally equivalent
 /// to the baseline kernel but instrumented with wall_clock64() around each
 /// of the 3 internal phases (QK^T, softmax, V-weighted-sum). Writes per-head

@@ -2367,7 +2367,7 @@ impl Gpu {
         )
     }
 
-    /// Muse Glimmer-owned sliding-window Q8 WMMA flash prefill (gfx12 only).
+    /// Muse Glimmer-owned sliding-window Q8 WMMA flash prefill (gfx11 + gfx12).
     ///
     /// Sibling of [`Self::attention_q8_0_flash_prefill_wmma`], not a
     /// replacement: nothing outside hipfire-arch-muse-glimmer calls it and no
@@ -2379,7 +2379,7 @@ impl Gpu {
     ///
     /// `window <= 0` reproduces the parent exactly.
     ///
-    /// Returns `Ok(false)` without launching when the arch is not gfx12 WMMA,
+    /// Returns `Ok(false)` without launching when the arch has no wave32 WMMA,
     /// so the caller can fall back.
     #[allow(clippy::too_many_arguments)]
     pub fn attention_q8_0_flash_prefill_wmma_swa(
@@ -2395,21 +2395,36 @@ impl Gpu {
         batch_size: usize,
         window: usize,
     ) -> HipResult<bool> {
-        if !self.arch_caps.has_wmma_w32_gfx12() {
-            return Ok(false);
-        }
         self.bind_thread()?;
         assert!(head_dim % 32 == 0, "head_dim {head_dim} must be a multiple of 32");
         assert!(head_dim <= 256, "head_dim {head_dim} exceeds MAX_D_CHUNKS*16");
         // Mirrors the parent's compile-time contract: gfx12 needs head_dim as a
         // constant or the unrolled float8_t output fragments spill 544 B/thread
         // to scratch. SPLIT_Q and PREFETCH_V keep the parent's defaults.
-        let module = format!("attention_q8_0_flash_prefill_wmma_swa_gfx12_hd{head_dim}");
-        let src = format!(
-            "#define SPLIT_Q 0\n#define FIXED_HEAD_DIM {}\n#define PREFETCH_V 1\n{}",
-            head_dim,
-            kernels::ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SWA_GFX12_SRC
-        );
+        // gfx11 uses the same fixed-head contract (interleaved mapping, same
+        // d_chunks spill risk) — only the WMMA builtin/mapping differs, which
+        // lives inside each parent file and is untouched here.
+        let (module, src) = if self.arch_caps.has_wmma_w32_gfx12() {
+            (
+                format!("attention_q8_0_flash_prefill_wmma_swa_gfx12_hd{head_dim}"),
+                format!(
+                    "#define SPLIT_Q 0\n#define FIXED_HEAD_DIM {}\n#define PREFETCH_V 1\n{}",
+                    head_dim,
+                    kernels::ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SWA_GFX12_SRC
+                ),
+            )
+        } else if self.arch_caps.has_wmma_w32() {
+            (
+                format!("attention_q8_0_flash_prefill_wmma_swa_gfx11_hd{head_dim}"),
+                format!(
+                    "#define SPLIT_Q 0\n#define FIXED_HEAD_DIM {}\n#define PREFETCH_V 1\n{}",
+                    head_dim,
+                    kernels::ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SWA_SRC
+                ),
+            )
+        } else {
+            return Ok(false);
+        };
         self.ensure_kernel(&module, &src, "attention_q8_0_flash_prefill_wmma_swa")?;
         const M_TILE: usize = 16;
         const V_STRIDE: usize = 18;
