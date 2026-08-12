@@ -30003,6 +30003,24 @@ fn generate_muse_glimmer(
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
 ) {
     // max_think_tokens semantics: 1=no-think, 0=uncapped, N=cap N reasoning tokens then force-close.
+    // Open the stream contract FIRST — before any validation, refusal, or GPU work.
+    //
+    // The HTTP CLI's StreamContractGate requires `gen_start` to be the first event of a
+    // request and DROPS anything that arrives before it. Every `emit_error_with_id` below
+    // (no tokenizer, missing bundle, history-prep failure, empty prompt, prompt longer than
+    // max_seq) used to fire before the latch, so the client never saw the refusal: it waited
+    // out its full timeout, then sent `abort` to a request the daemon had already abandoned,
+    // and serve's single lane stayed occupied so every later request answered
+    // `serve queue wait exceeded 30000ms`. One oversized prompt took the endpoint down.
+    //
+    // Reproduced with an ~8400-token prompt against max_seq=5120: the refusal is correct and
+    // instant, but the client hung 300s and three follow-up requests 503'd.
+    //
+    // `gen_start` then `error` with no tokens in between is a legal sequence; latching early
+    // costs nothing and makes every arch-14 failure routable.
+    let gen_contract = gen_start_contract_version_for_arch(m.arch_id);
+    emit_gen_start(stdout, id, false, gen_contract);
+
 
     if m.tokenizer.is_none() {
         emit_error_with_id(stdout, id, "tokenizer not loaded");
@@ -30241,22 +30259,6 @@ fn generate_muse_glimmer(
         );
         return;
     }
-
-    // Open the stream contract BEFORE any GPU work or token emission.
-    //
-    // The HTTP CLI's StreamContractGate requires the FIRST event of a request to be
-    // `gen_start` carrying the exact (id, attempt_id). Arch 14 never emitted it, so the first
-    // `reasoning`/`token` was rejected with
-    // `stream must begin with gen_start; got reasoning before contract latch`; the client then
-    // sent `abort` and the daemon sat waiting for a `commit` that never came — a hung request
-    // on native `hipfire serve` that looked like a generation stall. Same root cause and same
-    // fix as LFM2.5 (see `generate_lfm2moe`) and the DS4 fix e99583afa.
-    //
-    // `contract_version` stays `None`: only arch 5/6 advertise semantic contract v2
-    // (`gen_start_contract_version_for_arch`), and arch 14 must not claim a producer contract
-    // it does not implement.
-    let gen_contract = gen_start_contract_version_for_arch(m.arch_id);
-    emit_gen_start(stdout, id, false, gen_contract);
 
     // ── Prefix cache (LCP) — modelled on generate_minimax (daemon.rs:30352-30407).
     // Compute LCP of m.conversation_tokens against prompt_ids. Hit when
