@@ -536,6 +536,510 @@ fn main() {
     if let Some(n) = ctx_slice {
         eprintln!("ctx_slice: last {n} positions only (bisect mode)");
     }
+    // ── Glimmer detection (arch 14 target + arch 23 draft) ────────────────
+    // Open both HFQs to read arch_id. If target 14 and draft 23, take the
+    // Glimmer code path; otherwise fall through to the generic Qwen path
+    // COMPLETELY UNCHANGED. No DflashConfig parsing for Glimmer.
+    let is_glimmer = {
+        let t = HfqFile::open(Path::new(&target_path)).expect("open target probe");
+        let d = HfqFile::open(Path::new(&draft_path)).expect("open draft probe");
+        t.arch_id == 14 && d.arch_id == 23
+    };
+    if is_glimmer {
+        // Flags meaningless for Glimmer — fail fast rather than silently ignore.
+        if ngram {
+            eprintln!("--ngram is not supported for Glimmer (arch 14+23)");
+            std::process::exit(1);
+        }
+        if pld_enabled {
+            eprintln!("--pld is not supported for Glimmer");
+            std::process::exit(1);
+        }
+        if ddtree_enabled || ddtree_batched {
+            eprintln!("--ddtree is not supported for Glimmer");
+            std::process::exit(1);
+        }
+        if pflash_path.is_some() {
+            eprintln!("--pflash is not supported for Glimmer");
+            std::process::exit(1);
+        }
+        if cask_sidecar.is_some() || use_cask {
+            eprintln!("--cask is not supported for Glimmer");
+            std::process::exit(1);
+        }
+        if cactus_delta != 0.0 {
+            eprintln!("--cactus-delta is not supported for Glimmer (greedy only)");
+            std::process::exit(1);
+        }
+        if kv_mode_str != "q8" {
+            eprintln!("--kv-mode {kv_mode_str} not supported for Glimmer (only q8)");
+            std::process::exit(1);
+        }
+        if temp != 0.0 {
+            eprintln!("warning: --temp {temp} ignored for Glimmer (greedy argmax only, temp 0)");
+        }
+        // Helper: tap layers for DFlash capture, mirrors daemon::glimmer_tap_layers.
+        fn glimmer_tap_layers(n_layers: usize) -> Vec<usize> {
+            match std::env::var("HIPFIRE_GLIMMER_TAP_LAYERS") {
+                Ok(v) if !v.trim().is_empty() => v
+                    .split(',')
+                    .filter_map(|t| t.trim().parse::<usize>().ok())
+                    .filter(|l| *l < n_layers)
+                    .collect(),
+                _ => vec![1, 13, 25, 37, 49],
+            }
+        }
+        // ── Init GPU ──────────────────────────────────────────────────
+        let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
+        eprintln!("gpu: {}", gpu.arch);
+        let vram_report = |hip: &hip_bridge::HipRuntime, label: &str| {
+            if let Ok((free, total)) = hip.get_vram_info() {
+                let used_gb = (total - free) as f64 / 1e9;
+                let free_gb = free as f64 / 1e9;
+                eprintln!("VRAM @ {label}: used {used_gb:.2} GB, free {free_gb:.2} GB");
+            }
+        };
+        vram_report(&gpu.hip, "init");
+        // ── Load configs + weights ────────────────────────────────────
+        let target_hfq = HfqFile::open(Path::new(&target_path)).expect("open target");
+        let draft_hfq = HfqFile::open(Path::new(&draft_path)).expect("open draft");
+        let glimmer_cfg = hipfire_arch_muse_glimmer::config::GlimmerConfig::from_hfq(&target_hfq)
+            .expect("parse GlimmerConfig");
+        let mut drafter_cfg =
+            hipfire_arch_muse_glimmer::drafter::GlimmerDrafterConfig::from_hfq(&draft_hfq)
+                .expect("parse GlimmerDrafterConfig");
+        if let Some(b) = block_size_override {
+            let orig = drafter_cfg.block_size;
+            drafter_cfg.block_size = b;
+            eprintln!("block_size override: {orig} -> {b} (drafter trained at {orig})");
+        }
+        eprintln!(
+            "glimmer target: dim={} layers={} vocab={} heads={} kv_heads={} hd={} max_pos={}",
+            glimmer_cfg.dim,
+            glimmer_cfg.n_layers,
+            glimmer_cfg.vocab_size,
+            glimmer_cfg.n_heads,
+            glimmer_cfg.n_kv_heads,
+            glimmer_cfg.head_dim,
+            glimmer_cfg.max_position_embeddings,
+        );
+        eprintln!(
+            "glimmer drafter: layers={} hidden={} heads={} kv_heads={} block={} mask={} target_layers={:?}",
+            drafter_cfg.n_layers,
+            drafter_cfg.hidden,
+            drafter_cfg.n_heads,
+            drafter_cfg.n_kv_heads,
+            drafter_cfg.block_size,
+            drafter_cfg.mask_token_id,
+            drafter_cfg.target_layer_ids,
+        );
+        // Tokenizer from target metadata
+        let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&target_hfq.metadata_json)
+            .expect("target tokenizer");
+        // Load weights
+        let t_w = Instant::now();
+        let glimmer_weights =
+            hipfire_arch_muse_glimmer::glimmer::GlimmerWeights::load(&target_hfq, &glimmer_cfg, &mut gpu)
+                .expect("load glimmer target");
+        eprintln!("glimmer target loaded in {:.2}s", t_w.elapsed().as_secs_f64());
+        vram_report(&gpu.hip, "after target load");
+        let t_d = Instant::now();
+        let drafter_weights =
+            hipfire_arch_muse_glimmer::drafter::GlimmerDrafterWeights::load(&draft_hfq, &drafter_cfg, &mut gpu)
+                .expect("load glimmer drafter");
+        eprintln!("glimmer drafter loaded in {:.2}s", t_d.elapsed().as_secs_f64());
+        vram_report(&gpu.hip, "after drafter load");
+        // State + scratch
+        let max_seq = ctx_capacity;
+        let mut state =
+            hipfire_arch_muse_glimmer::glimmer::GlimmerState::new_with_max_seq(&mut gpu, &glimmer_cfg, max_seq)
+                .expect("alloc GlimmerState");
+        let mut drafter_scratch =
+            hipfire_arch_muse_glimmer::drafter::GlimmerDrafterScratch::new(&mut gpu, &drafter_cfg, max_seq)
+                .expect("alloc GlimmerDrafterScratch");
+        let tap_layers = glimmer_tap_layers(glimmer_cfg.n_layers);
+        let mut target_hidden_host: Vec<f32> = Vec::new();
+        // Stop set: config eos + any tokenizer specials that mark end-of-turn.
+        // Mirrors daemon's stop_set construction (without Jinja).
+        let build_stop_set = |tokenizer: &hipfire_runtime::tokenizer::Tokenizer, cfg_eos: u32| -> Vec<u32> {
+            let mut s = vec![cfg_eos];
+            for cand in ["<|eom|>", "<|eot|>", "<|end_of_text|>", "<end_of_turn>", "<|end_of_turn|>", "<|im_end|>", "<|endoftext|>", "</s>", "<eos>"] {
+                if let Some(tid) = tokenizer.special_token_id(cand) {
+                    if !s.contains(&tid) {
+                        s.push(tid);
+                    }
+                } else {
+                    let ids = tokenizer.encode(cand);
+                    if ids.len() == 1 && !s.contains(&ids[0]) {
+                        s.push(ids[0]);
+                    }
+                }
+            }
+            // Also include tokenizer's own eos/eot terminators
+            if !s.contains(&tokenizer.eos_id) {
+                s.push(tokenizer.eos_id);
+            }
+            if let Some(eot) = tokenizer.eot_id {
+                if !s.contains(&eot) {
+                    s.push(eot);
+                }
+            }
+            s.dedup();
+            s
+        };
+        let stop_set = build_stop_set(&tokenizer, glimmer_cfg.eos_token);
+        // ── Per-row loop (same prompts vector as generic) ─────────────────
+        for (row_idx, (row_label, row_raw_prompt, row_max_tokens)) in prompts.iter().enumerate() {
+            let row_max_tokens: usize = *row_max_tokens;
+            if multi_row {
+                eprintln!("@@@ ROW {row_idx}: {row_label} @@@");
+            }
+            // Per-row state reset
+            target_hidden_host.clear();
+            state.reset();
+            // Tokenize + optional ChatML wrap (mirrors generic demo)
+            let prompt_normalized =
+                hipfire_runtime::tokenizer::maybe_normalize_prompt(row_raw_prompt).into_owned();
+            if hipfire_runtime::config::get().prompt_token_heat {
+                tokenizer.dump_prompt_heat(&prompt_normalized);
+            }
+            let mut prompt_tokens = tokenizer.encode(&prompt_normalized);
+            if chatml {
+                let im_start = tokenizer.encode("<|im_start|>");
+                let im_end = tokenizer.encode("<|im_end|>");
+                let user = tokenizer.encode("user");
+                let asst = tokenizer.encode("assistant");
+                let nl = tokenizer.encode("\n");
+                // Glimmer tokenizer should have <|im_start|> as special; if not, skip wrapping
+                if im_start.len() == 1 {
+                    let mut chat = Vec::new();
+                    chat.extend_from_slice(&im_start);
+                    chat.extend_from_slice(&user);
+                    chat.extend_from_slice(&nl);
+                    chat.extend_from_slice(&prompt_tokens);
+                    chat.extend_from_slice(&im_end);
+                    chat.extend_from_slice(&nl);
+                    chat.extend_from_slice(&im_start);
+                    chat.extend_from_slice(&asst);
+                    chat.extend_from_slice(&nl);
+                    prompt_tokens = chat;
+                    eprintln!(
+                        "chatml wrapping enabled: prompt is {} tokens after wrap",
+                        prompt_tokens.len()
+                    );
+                } else {
+                    eprintln!("chatml requested but tokenizer has no <|im_start|>; using raw prompt");
+                }
+            }
+            // BOS prepend — mirrors daemon generate_muse_glimmer
+            if prompt_tokens.first() != Some(&glimmer_cfg.bos_token) {
+                prompt_tokens.insert(0, glimmer_cfg.bos_token);
+            }
+            if prompt_normalized.len() < 2000 {
+                eprintln!("prompt: {:?}", prompt_normalized);
+            } else {
+                eprintln!("prompt: <{} chars elided>", prompt_normalized.len());
+            }
+            eprintln!(
+                "prompt tokens ({}): {}",
+                prompt_tokens.len(),
+                if prompt_tokens.len() < 64 {
+                    format!("{:?}", prompt_tokens)
+                } else {
+                    format!("[{} tokens]", prompt_tokens.len())
+                }
+            );
+            if prompt_tokens.len() >= max_seq {
+                eprintln!(
+                    "muse_glimmer prompt is {} tokens but max_seq is {max_seq}",
+                    prompt_tokens.len()
+                );
+                std::process::exit(1);
+            }
+            if prompt_tokens.len() + row_max_tokens > max_seq {
+                eprintln!(
+                    "prompt ({} tokens) + max_tokens ({}) exceeds max_seq {max_seq} — reduce --max or increase --ctx",
+                    prompt_tokens.len(),
+                    row_max_tokens
+                );
+                std::process::exit(1);
+            }
+            let max_tokens = row_max_tokens;
+            // ── Prefill via prefill_with_capture ────────────────────────
+            eprintln!(
+                "seeding glimmer target via prefill_with_capture ({} tokens)...",
+                prompt_tokens.len()
+            );
+            let t_prefill = Instant::now();
+            let start_pos = state.n_tokens as u32;
+            let last_logits = hipfire_arch_muse_glimmer::forward::prefill_with_capture(
+                &glimmer_cfg,
+                &glimmer_weights,
+                &mut state,
+                &mut gpu,
+                &prompt_tokens,
+                start_pos,
+                &tap_layers,
+                &mut target_hidden_host,
+            )
+            .expect("glimmer prefill");
+            let prefill_secs = t_prefill.elapsed().as_secs_f64();
+            let prefill_ms = (prefill_secs * 1000.0) as u64;
+            let prefill_tok_s = prompt_tokens.len() as f64 / prefill_secs.max(1e-9);
+            eprintln!("prefill in {:.2}s ({:.1} tok/s) prefill_ms={}", prefill_secs, prefill_tok_s, prefill_ms);
+            vram_report(&gpu.hip, "after_prefill");
+            // Initial seed token (greedy argmax)
+            let mut last_pick = {
+                let mut best = 0u32;
+                let mut bestv = f32::NEG_INFINITY;
+                for (i, &v) in last_logits.iter().enumerate() {
+                    if v > bestv {
+                        bestv = v;
+                        best = i as u32;
+                    }
+                }
+                best
+            };
+            let mut cur_pos = state.n_tokens as u32; // prompt_len
+            let mut emitted: Vec<u32> = Vec::with_capacity(max_tokens);
+            let mut _total_proposed: usize = 0;
+            let mut total_accepted: usize = 0;
+            let mut windows: usize = 0;
+            // Emit seed as first token if not stop and max>0
+            let mut done_due_to_stop = false;
+            if max_tokens == 0 {
+                done_due_to_stop = true;
+            } else if stop_set.contains(&last_pick) {
+                eprintln!("seed is stop token {last_pick}; no decode");
+                done_due_to_stop = true;
+            } else {
+                emitted.push(last_pick);
+                if stop_set.contains(&last_pick) {
+                    done_due_to_stop = true;
+                }
+            }
+            let t_decode = Instant::now();
+            // Spec loop — mirrors daemon's glimmer spec core around glimmer_drafter_forward
+            // Hot loop is free of stdout, decode, serde_json, and per-iteration allocs that can be hoisted.
+            // Greedy only (temp 0.0) via accept_greedy_prefix.
+            if !done_due_to_stop && emitted.len() < max_tokens {
+                let block_size = drafter_cfg.block_size;
+                let hidden = drafter_cfg.hidden;
+                let mask_id = drafter_cfg.mask_token_id;
+                let ne = drafter_cfg.num_extract();
+                let row_elems = ne * hidden;
+                // Hoist noise buffer outside loop and reuse
+                let mut noise_embedding = vec![0f32; block_size * hidden];
+                loop {
+                    if emitted.len() >= max_tokens {
+                        break;
+                    }
+                    if state.n_tokens >= max_seq {
+                        eprintln!("hit max_seq {}; stopping", max_seq);
+                        break;
+                    }
+                    if cur_pos as usize + block_size > max_seq {
+                        eprintln!("next block would exceed max_seq {}; stopping", max_seq);
+                        break;
+                    }
+                    // --- Draft: B-1 tokens via glimmer_drafter_forward (raw noise) ---
+                    for i in 0..block_size {
+                        let t = if i == 0 { last_pick } else { mask_id };
+                        let v = hipfire_arch_muse_glimmer::forward::embed_raw(
+                            &glimmer_cfg,
+                            &glimmer_weights,
+                            &mut state,
+                            &mut gpu,
+                            t,
+                        )
+                        .expect("glimmer drafter noise embed");
+                        noise_embedding[i * hidden..(i + 1) * hidden].copy_from_slice(&v[..hidden]);
+                    }
+                    let n_rows = target_hidden_host.len() / row_elems;
+                    let ctx_cap = std::env::var("HIPFIRE_GLIMMER_CTX_CAP")
+                        .ok()
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(drafter_cfg.sliding_window);
+                    let ctx_len = n_rows.min(ctx_cap);
+                    // Slice target_hidden for this window (suffix keep)
+                    let target_hidden: Vec<f32> = if ctx_len == 0 {
+                        Vec::new()
+                    } else {
+                        let start = (n_rows - ctx_len) * row_elems;
+                        target_hidden_host[start..].to_vec()
+                    };
+                    let positions: Vec<i32> = (cur_pos as i32 - ctx_len as i32..cur_pos as i32 + block_size as i32).collect();
+                    debug_assert_eq!(positions.len(), ctx_len + block_size);
+                    hipfire_arch_muse_glimmer::drafter::glimmer_drafter_forward(
+                        &mut gpu,
+                        &drafter_cfg,
+                        &drafter_weights,
+                        &mut drafter_scratch,
+                        &noise_embedding,
+                        &target_hidden,
+                        &positions,
+                        block_size,
+                        ctx_len,
+                    )
+                    .expect("glimmer drafter forward");
+                    // Drafts via target lm_head over rows 1..B-1 (skip seed row)
+                    // Use fresh allocation for hidden batch to hit Q8 batched fast path
+                    let hidden_for_draft = {
+                        let n = (block_size - 1) * hidden;
+                        let t = gpu
+                            .alloc_tensor(&[n], rdna_compute::DType::F32)
+                            .expect("drafter hidden alloc");
+                        gpu.hip
+                            .memcpy_dtod_at(&t.buf, 0, &drafter_scratch.x.buf, hidden * 4, n * 4)
+                            .expect("drafter hidden copy");
+                        t
+                    };
+                    let drafts = hipfire_arch_muse_glimmer::forward::glimmer_lm_head_picks(
+                        &mut gpu,
+                        &glimmer_cfg,
+                        &glimmer_weights,
+                        &hidden_for_draft,
+                        block_size - 1,
+                        &state.logits,
+                        &state.logits_batch,
+                    )
+                    .expect("glimmer drafter lm_head");
+                    gpu.free_tensor(hidden_for_draft).ok();
+                    _total_proposed += drafts.len();
+                    // --- Verify: block = [seed, drafts...] at cur_pos ---
+                    let mut block = Vec::with_capacity(block_size);
+                    block.push(last_pick);
+                    block.extend_from_slice(&drafts);
+                    let hidden_before = target_hidden_host.len();
+                    let picks = hipfire_arch_muse_glimmer::forward::verify_block_with_capture(
+                        &glimmer_cfg,
+                        &glimmer_weights,
+                        &mut state,
+                        &mut gpu,
+                        &block,
+                        cur_pos,
+                        &tap_layers,
+                        &mut target_hidden_host,
+                    )
+                    .expect("glimmer verify");
+                    // --- Accept via shared greedy rule (daemon line ~29622) ---
+                    // let ga = accept_greedy_prefix(&drafts, &picks, None);
+                    let ga = hipfire_runtime::spec::accept_greedy_prefix(&drafts, &picks, None);
+                    {
+                        let keep_rows = ga.accepted + 1;
+                        let keep_elems = hidden_before + keep_rows * row_elems;
+                        target_hidden_host.truncate(keep_elems);
+                    }
+                    total_accepted += ga.accepted;
+                    windows += 1;
+                    let accept = ga.accepted;
+                    let bonus = if accept < drafts.len() {
+                        picks[accept]
+                    } else {
+                        picks[picks.len() - 1]
+                    };
+                    // Rollback if partial accept (stateless commit_prefix contract)
+                    if accept + 1 < block_size {
+                        let target_pos = cur_pos as usize + accept + 1;
+                        hipfire_arch_muse_glimmer::forward::rollback_to(&mut state, target_pos);
+                        cur_pos = target_pos as u32;
+                    } else {
+                        cur_pos += block_size as u32;
+                    }
+                    // Commit accepted + bonus, but respect max_tokens and stop_set
+                    let mut to_emit: Vec<u32> = Vec::with_capacity(accept + 1);
+                    to_emit.extend_from_slice(&drafts[..accept]);
+                    to_emit.push(bonus);
+                    let mut hit_stop = false;
+                    for &tok in &to_emit {
+                        if emitted.len() >= max_tokens {
+                            hit_stop = true;
+                            break;
+                        }
+                        emitted.push(tok);
+                        if stop_set.contains(&tok) {
+                            hit_stop = true;
+                            break;
+                        }
+                    }
+                    last_pick = bonus;
+                    if hit_stop {
+                        break;
+                    }
+                    if emitted.len() >= max_tokens {
+                        break;
+                    }
+                }
+            }
+            let decode_secs = t_decode.elapsed().as_secs_f64();
+            let tok_s = if decode_secs > 0.0 {
+                emitted.len() as f64 / decode_secs
+            } else {
+                0.0
+            };
+            let tau = if windows > 0 {
+                (total_accepted as f64 + windows as f64) / windows as f64
+            } else if !emitted.is_empty() {
+                1.0
+            } else {
+                0.0
+            };
+            let accept_rate = if windows > 0 {
+                total_accepted as f32 / (windows * (drafter_cfg.block_size - 1)) as f32
+            } else {
+                0.0
+            };
+            // ── Report ────────────────────────────────────────────────────
+            // Decode once at end (no per-token stdout in hot loop)
+            let text = tokenizer.decode(&emitted);
+            eprintln!("--- OUTPUT ---");
+            println!("{text}");
+            eprintln!("--------------");
+            eprintln!(
+                "emitted: {} tokens in {:.2}s  ({:.2} tok/s)",
+                emitted.len(),
+                decode_secs,
+                tok_s
+            );
+            eprintln!(
+                "cycles: {}  committed: {}  accepted: {}  τ={:.3}  mean_committed={:.3}",
+                windows,
+                total_accepted + windows,
+                total_accepted,
+                tau,
+                if windows > 0 {
+                    (total_accepted + windows) as f64 / windows as f64
+                } else {
+                    0.0
+                },
+            );
+            eprintln!("accept_rate (accepted / (cycles × (B-1))): {accept_rate:.3}");
+            // BENCH METRICS — same shape as generic path
+            let (vram_free_bytes, vram_total_bytes) = gpu.hip.get_vram_info().unwrap_or((0, 0));
+            let vram_used_mb =
+                ((vram_total_bytes.saturating_sub(vram_free_bytes)) as f64 / (1024.0 * 1024.0)) as u64;
+            let vram_total_mb = (vram_total_bytes as f64 / (1024.0 * 1024.0)) as u64;
+            let ttft_ms = prefill_ms as f64 + if windows > 0 { 0.0 } else { 0.0 };
+            eprintln!("=== BENCH METRICS ===");
+            eprintln!("prompt_tokens: {}", prompt_tokens.len());
+            eprintln!("prefill_secs: {:.4}", prefill_secs);
+            eprintln!("prefill_tok_s: {:.2}", prefill_tok_s);
+            eprintln!("ttft_ms: {:.2}", ttft_ms);
+            eprintln!("decode_tokens_emitted: {}", emitted.len());
+            eprintln!("decode_secs: {:.4}", decode_secs);
+            eprintln!("decode_tok_s: {:.2}", tok_s);
+            eprintln!("decode_tau: {:.4}", tau);
+            eprintln!("decode_accept_rate: {:.4}", accept_rate);
+            eprintln!("vram_used_mb: {}", vram_used_mb);
+            eprintln!("vram_total_mb: {}", vram_total_mb);
+            eprintln!("=====================");
+            eprintln!("Glimmer tokens: {:?}", emitted);
+            if multi_row {
+                eprintln!("@@@ ROW {row_idx} END @@@");
+            }
+        }
+        return;
+    }
 
     // ── Init GPU ──────────────────────────────────────────────────────
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
