@@ -13161,7 +13161,14 @@ fn main() {
                     match hipfire_loader::gemma4_eagle_spec_len(spec_raw) {
                         Ok(n) => n,
                         Err(e) => {
-                            emit_uncorrelated_error(&mut stdout, None, &e, "validation", false, false);
+                            emit_uncorrelated_error(
+                                &mut stdout,
+                                None,
+                                &e,
+                                "validation",
+                                false,
+                                false,
+                            );
                             let _ = stdout.flush();
                             continue;
                         }
@@ -13689,7 +13696,7 @@ fn main() {
                             ),
                             Some(ModelState::Gemma4(b)) => {
                                 (b.config.dim, b.config.n_layers, b.config.vocab_size)
-                            },
+                            }
                             _ => {
                                 if let Some(ref c) = m.dots_ocr_config {
                                     (
@@ -23548,7 +23555,12 @@ fn generate(
             min_p,
             cactus_delta,
         );
-        let _ = (repeat_penalty, repeat_window, presence_penalty, frequency_penalty);
+        let _ = (
+            repeat_penalty,
+            repeat_window,
+            presence_penalty,
+            frequency_penalty,
+        );
         let _ = stop;
         generate_gemma4(
             m,
@@ -28440,7 +28452,6 @@ fn generate_deepseek4_heterogeneous(
     );
 }
 
-
 /// Gemma 4 dense text (arch_id=13) eager AR path.
 ///
 /// Ported from `origin/feat/gemma4-union` and rehomed onto the beta
@@ -28492,6 +28503,12 @@ fn generate_gemma4(
         emit_error_with_id(stdout, id, "tokenizer not loaded");
         return;
     }
+    // Open the stream contract BEFORE any GPU work or token emission: the CLI's
+    // StreamContractGate fail-closes on any event preceding `gen_start`, so
+    // without this the first `token` is rejected, the client aborts, and the
+    // HTTP handler waits forever. Same fix as DS4 (e99583afa) and lfm2moe.
+    let gen_contract = gen_start_contract_version_for_arch(m.arch_id);
+    emit_gen_start(stdout, id, false, gen_contract);
     let Some(ModelState::Gemma4(bundle)) = m.state.as_mut() else {
         emit_error_with_id(
             stdout,
@@ -28507,8 +28524,7 @@ fn generate_gemma4(
     // ── Prompt build (same two-path branch as the lfm2moe AR path) ──
     let prompt_ids: Vec<u32> = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
-        let jinja_enabled =
-            std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+        let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
         let try_jinja = jinja_enabled && m.chat_template.is_some();
         let mut ids: Vec<u32> = if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
@@ -28588,9 +28604,7 @@ fn generate_gemma4(
 
     // Capacity guard. No eviction on arch_id=13 — reset the KV cursors when
     // the requested run would overflow the physical cache.
-    let overflow = {
-        bundle.state.n_tokens + prompt_ids.len() + max_tokens > bundle.state.max_seq
-    };
+    let overflow = { bundle.state.n_tokens + prompt_ids.len() + max_tokens > bundle.state.max_seq };
     if overflow {
         let (n, cap) = (bundle.state.n_tokens, bundle.state.max_seq);
         eprintln!("[daemon] arch_id=13 context full ({n}/{cap}) — resetting Gemma4State");
@@ -28694,7 +28708,10 @@ fn generate_gemma4(
         // so `last_logits` is intentionally unused on this path.
         {
             let eagle = bundle.eagle.as_ref().unwrap();
-            if let Err(e) = eagle.spec_scratch.set_seed_hidden_from(gpu, &bundle.state.tmp) {
+            if let Err(e) = eagle
+                .spec_scratch
+                .set_seed_hidden_from(gpu, &bundle.state.tmp)
+            {
                 emit_error_with_id(stdout, id, format!("gemma4 eagle seed hidden: {e}"));
                 return;
             }
@@ -28740,11 +28757,7 @@ fn generate_gemma4(
             let spec = match spec {
                 Ok(s) => s,
                 Err(e) => {
-                    emit_error_with_id(
-                        stdout,
-                        id,
-                        format!("gemma4 eagle spec step failed: {e}"),
-                    );
+                    emit_error_with_id(stdout, id, format!("gemma4 eagle spec step failed: {e}"));
                     return;
                 }
             };
@@ -28829,8 +28842,16 @@ fn generate_gemma4(
         };
         let _ = writeln!(
             stdout,
-            r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_ms":{},"total_ms":{},"spec":"gemma4_eagle","rounds":{},"tau":{:.3},"draft_len":{}}}"#,
-            id, generated_count, tok_s, prefill_ms, total_ms, rounds, tau, draft_len,
+            r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_ms":{},"total_ms":{},"spec":"gemma4_eagle","rounds":{},"tau":{:.3},"draft_len":{},"attempt_id":{}}}"#,
+            id,
+            generated_count,
+            tok_s,
+            prefill_ms,
+            total_ms,
+            rounds,
+            tau,
+            draft_len,
+            active_attempt_id(),
         );
         let _ = stdout.flush();
         return;
@@ -28849,8 +28870,7 @@ fn generate_gemma4(
         if generated_count >= max_tokens {
             break;
         }
-        let next_tok =
-            deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
+        let next_tok = deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
         if stop_set.contains(&next_tok) {
             break;
         }
@@ -28863,6 +28883,7 @@ fn generate_gemma4(
             "type": "token",
             "id": id,
             "text": frag,
+            "attempt_id": active_attempt_id(),
         });
         let _ = writeln!(stdout, "{}", envelope);
         let _ = stdout.flush();
@@ -28905,8 +28926,13 @@ fn generate_gemma4(
     };
     let _ = writeln!(
         stdout,
-        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_ms":{},"total_ms":{}}}"#,
-        id, generated_count, tok_s, prefill_ms, total_ms,
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_ms":{},"total_ms":{},"attempt_id":{}}}"#,
+        id,
+        generated_count,
+        tok_s,
+        prefill_ms,
+        total_ms,
+        active_attempt_id(),
     );
     let _ = stdout.flush();
 }
