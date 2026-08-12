@@ -23360,6 +23360,8 @@ enum GenerationRoute {
     LfmSpec,
     LlamaAr,
     LlamaSpec,
+    GlimmerAr,
+    GlimmerSpec,
     PipelineParallel,
     DotsOcr,
     Unknown,
@@ -23386,13 +23388,15 @@ impl GenerationRoute {
         Self::LfmSpec,
         Self::LlamaAr,
         Self::LlamaSpec,
+        Self::GlimmerAr,
+        Self::GlimmerSpec,
         Self::PipelineParallel,
         Self::DotsOcr,
         Self::Unknown,
     ];
 
     /// Proven semantic-safe producers for non-empty tools.
-    /// Exactly: Qwen AR, Qwen DFlash/spec, DS4 AR, DS4 EP, DS4 spec.
+    /// Exactly: Qwen AR, Qwen DFlash/spec, DS4 AR, DS4 EP, DS4 spec, Glimmer AR, Glimmer spec.
     const fn supports_tools(self) -> bool {
         matches!(
             self,
@@ -23401,6 +23405,8 @@ impl GenerationRoute {
                 | Self::Deepseek4Ar
                 | Self::Deepseek4Ep
                 | Self::Deepseek4Spec
+                | Self::GlimmerAr
+                | Self::GlimmerSpec
         )
     }
 
@@ -23423,6 +23429,8 @@ impl GenerationRoute {
             Self::LfmSpec => "lfm_spec",
             Self::LlamaAr => "llama_ar",
             Self::LlamaSpec => "llama_spec",
+            Self::GlimmerAr => "glimmer_ar",
+            Self::GlimmerSpec => "glimmer_spec",
             Self::PipelineParallel => "pipeline_parallel",
             Self::DotsOcr => "dots_ocr",
             Self::Unknown => "unknown",
@@ -23506,6 +23514,14 @@ fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
                 GenerationRoute::MiniMaxSpec
             } else {
                 GenerationRoute::MiniMaxAr
+            };
+        }
+        14 => {
+            let spec_ok = i.has_speculator && (i.temp <= 1e-6 || i.ngram_can_sample);
+            return if spec_ok {
+                GenerationRoute::GlimmerSpec
+            } else {
+                GenerationRoute::GlimmerAr
             };
         }
         8 => return GenerationRoute::DotsOcr,
@@ -24322,7 +24338,7 @@ fn generate(
             );
             return;
         }
-        GenerationRoute::QwenDflash | GenerationRoute::LlamaSpec => {
+        GenerationRoute::QwenDflash | GenerationRoute::LlamaSpec | GenerationRoute::GlimmerSpec => {
             // Operator visibility: a temp>0 request on a DFlash-capable arch that
             // did NOT qualify is handled by the selector (falls to AR). When we
             // are on the DFlash arm, still warn once if min_p was requested.
@@ -24383,7 +24399,7 @@ fn generate(
             }
             // ctx-capacity miss → fall through to default AR body below.
         }
-        GenerationRoute::QwenAr | GenerationRoute::LlamaAr | GenerationRoute::Unknown => {
+        GenerationRoute::QwenAr | GenerationRoute::LlamaAr | GenerationRoute::GlimmerAr | GenerationRoute::Unknown => {
             // Default AR / unknown body continues below.
             // temp>0 DFlash-disabled visibility (warning text only; route is AR).
             if temp > 1e-6
@@ -31106,7 +31122,47 @@ fn generate_muse_glimmer(
         }
     }
 
-    let parsed_tool_calls = parse_glimmer_atem(&glimmer_tool_acc).unwrap_or_default();
+    // A parse failure here used to vanish into `unwrap_or_default()`: the model
+    // emits a whole turn into the tool channel, ATEM refuses it, and the caller
+    // gets an empty content with no tool_calls and no reason why. Keep the
+    // empty-vec fallback (a malformed call must not fabricate one) but say so.
+    let parsed_tool_calls = match parse_glimmer_atem(&glimmer_tool_acc) {
+        Ok(calls) => {
+            if calls.is_empty() && !glimmer_tool_acc.trim().is_empty() {
+                eprintln!(
+                    "[glimmer-atem] tool channel produced {} bytes that parsed to ZERO calls; first 600 bytes: {:?}",
+                    glimmer_tool_acc.len(),
+                    &glimmer_tool_acc[..glimmer_tool_acc.len().min(600)]
+                );
+            }
+            calls
+        }
+        Err(e) => {
+            if !glimmer_tool_acc.trim().is_empty() {
+                eprintln!(
+                    "[glimmer-atem] tool channel produced {} bytes that failed to parse: {e:?}; first 600 bytes: {:?}",
+                    glimmer_tool_acc.len(),
+                    &glimmer_tool_acc[..glimmer_tool_acc.len().min(600)]
+                );
+            }
+            Vec::new()
+        }
+    };
+    // Degenerate-attractor guard. A reasoning-only turn legitimately leaves both
+    // accumulators empty, so emptiness is not the signal; an identical token
+    // repeated for the whole turn is. That is what a zeroed/NaN logits vector
+    // looks like downstream (argmax -> id 0, forever), and it otherwise reaches
+    // the caller as a silent empty completion.
+    if generated_count >= 8 {
+        if let Some(&first) = glimmer_emitted_ids.first() {
+            if glimmer_emitted_ids.iter().all(|&t| t == first) {
+                eprintln!(
+                    "[glimmer-degenerate] {generated_count} tokens all decoded to the same id {first}; \
+                     logits are almost certainly degenerate (zeroed or NaN)"
+                );
+            }
+        }
+    }
     let _ = reconcile_glimmer_mirror(&mut bundle.state, &mut bundle.target_hidden_host, &mut m.conversation_tokens, &mut m.seq_pos);
 
     let decode_ms = decode_t0.elapsed().as_millis().max(1);
@@ -40477,6 +40533,22 @@ mod generation_route_matrix_tests {
                 },
             ),
             (
+                GenerationRoute::GlimmerAr,
+                GenerationRouteInputs {
+                    arch_id: 14,
+                    ..base()
+                },
+            ),
+            (
+                GenerationRoute::GlimmerSpec,
+                GenerationRouteInputs {
+                    arch_id: 14,
+                    has_speculator: true,
+                    temp: 0.0,
+                    ..base()
+                },
+            ),
+            (
                 GenerationRoute::Unknown,
                 GenerationRouteInputs {
                     arch_id: 99,
@@ -40493,6 +40565,8 @@ mod generation_route_matrix_tests {
         GenerationRoute::Deepseek4Ar,
         GenerationRoute::Deepseek4Ep,
         GenerationRoute::Deepseek4Spec,
+        GenerationRoute::GlimmerAr,
+        GenerationRoute::GlimmerSpec,
     ];
 
     /// Pure gate model mirroring generate()'s tools preflight:
@@ -40598,7 +40672,7 @@ mod generation_route_matrix_tests {
     }
 
     #[test]
-    fn exact_safe_set_is_qwen_ar_dflash_and_ds4_ar_ep_spec() {
+    fn exact_safe_set_is_qwen_ar_dflash_ds4_ar_ep_spec_and_glimmer_ar_spec() {
         let mut from_all: Vec<GenerationRoute> = GenerationRoute::ALL
             .iter()
             .copied()
@@ -40608,7 +40682,7 @@ mod generation_route_matrix_tests {
         let mut expected = SAFE_ROUTES.to_vec();
         expected.sort_by_key(|r| r.name());
         assert_eq!(from_all, expected);
-        assert_eq!(from_all.len(), 5);
+        assert_eq!(from_all.len(), 7);
         // Negative: every other ALL member is denied for tools.
         for &r in GenerationRoute::ALL {
             if !SAFE_ROUTES.contains(&r) {
@@ -40951,10 +41025,10 @@ mod generation_route_matrix_tests {
     }
 
     #[test]
-    fn all_variant_count_is_twenty() {
+    fn all_variant_count_is_twenty_two() {
         // Pin count so accidental ALL edits surface here too.
-        assert_eq!(GenerationRoute::ALL.len(), 20);
-        assert_eq!(capability_rows().len(), 20);
+        assert_eq!(GenerationRoute::ALL.len(), 22);
+        assert_eq!(capability_rows().len(), 22);
     }
 }
 
