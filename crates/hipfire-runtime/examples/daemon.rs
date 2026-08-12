@@ -29231,12 +29231,14 @@ enum GlimmerChannel {
     AwaitingHeader,
     Reasoning,
     Answer,
+    Tool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum GlimmerEmit {
     Reasoning(String),
     Token(String),
+    Tool(String),
 }
 
 struct GlimmerHarmonyRouter {
@@ -29282,11 +29284,12 @@ impl GlimmerHarmonyRouter {
                         } else {
                             "user".to_string()
                         };
-                        let is_self = recipient == "self";
-                        let new_state = if is_self && self.thinking_enabled() {
+                        let new_state = if recipient == "self" && self.thinking_enabled() {
                             GlimmerChannel::Reasoning
-                        } else {
+                        } else if recipient == "user" {
                             GlimmerChannel::Answer
+                        } else {
+                            GlimmerChannel::Tool
                         };
                         self.pending.drain(..header_end);
                         self.state = new_state;
@@ -29299,7 +29302,7 @@ impl GlimmerHarmonyRouter {
                         break;
                     }
                 }
-                GlimmerChannel::Reasoning | GlimmerChannel::Answer => {
+                GlimmerChannel::Reasoning | GlimmerChannel::Answer | GlimmerChannel::Tool => {
                     let eom = self.pending.find("<|eom|>");
                     let eot = self.pending.find("<|eot|>");
                     let eos = self.pending.find("<|end_of_text|>");
@@ -29318,6 +29321,8 @@ impl GlimmerHarmonyRouter {
                             if !text.is_empty() {
                                 let ev = if self.state == GlimmerChannel::Reasoning {
                                     GlimmerEmit::Reasoning(text)
+                                } else if self.state == GlimmerChannel::Tool {
+                                    GlimmerEmit::Tool(text)
                                 } else {
                                     GlimmerEmit::Token(text)
                                 };
@@ -29328,6 +29333,9 @@ impl GlimmerHarmonyRouter {
                         self.pending.drain(..marker.len());
                         if marker == "<|eom|>" {
                             if self.state == GlimmerChannel::Reasoning {
+                                self.state = GlimmerChannel::AwaitingHeader;
+                                continue;
+                            } else if self.state == GlimmerChannel::Tool {
                                 self.state = GlimmerChannel::AwaitingHeader;
                                 continue;
                             } else if self.just_forced {
@@ -29352,6 +29360,8 @@ impl GlimmerHarmonyRouter {
                             if !text.is_empty() {
                                 let ev = if self.state == GlimmerChannel::Reasoning {
                                     GlimmerEmit::Reasoning(text)
+                                } else if self.state == GlimmerChannel::Tool {
+                                    GlimmerEmit::Tool(text)
                                 } else {
                                     GlimmerEmit::Token(text)
                                 };
@@ -29394,6 +29404,8 @@ impl GlimmerHarmonyRouter {
         }
         vec![if self.state == GlimmerChannel::Reasoning {
             GlimmerEmit::Reasoning(text)
+        } else if self.state == GlimmerChannel::Tool {
+            GlimmerEmit::Tool(text)
         } else {
             GlimmerEmit::Token(text)
         }]
@@ -29643,12 +29655,32 @@ impl GlimmerChannelRecorder {
         }
         self.state = GlimmerRecorderState::Refused(GlimmerRecordRefusal::ForcedReasoningClose);
     }
-    fn into_cached_turn(self, parsed_tool_calls: &[hipfire_runtime::prompt_frame::ToolCall]) -> Result<hipfire_runtime::prompt_frame::CachedAssistantTurn, GlimmerRecordRefusal> {
+    fn into_cached_turn(mut self, parsed_tool_calls: &[hipfire_runtime::prompt_frame::ToolCall]) -> Result<hipfire_runtime::prompt_frame::CachedAssistantTurn, GlimmerRecordRefusal> {
         if let GlimmerRecorderState::Refused(r) = self.state {
             return Err(r);
         }
-        if matches!(self.state, GlimmerRecorderState::Body(_) | GlimmerRecorderState::Header { .. } | GlimmerRecorderState::AwaitingStart) {
-            return Err(GlimmerRecordRefusal::Incomplete);
+        match std::mem::replace(&mut self.state, GlimmerRecorderState::Terminal) {
+            GlimmerRecorderState::Body(body) => {
+                match body.recipient {
+                    GlimmerRecordedRecipient::Self_ => return Err(GlimmerRecordRefusal::Incomplete),
+                    GlimmerRecordedRecipient::Tool(recipient) => {
+                        self.tools.push(hipfire_runtime::prompt_frame::CachedAssistantToolBody { recipient, token_ids: body.token_ids });
+                    }
+                    GlimmerRecordedRecipient::User => {
+                        if self.content.is_some() {
+                            return Err(GlimmerRecordRefusal::NonCanonicalBodyOrder);
+                        }
+                        self.content = Some(hipfire_runtime::prompt_frame::CachedAssistantBody { token_ids: body.token_ids, text: body.text });
+                    }
+                }
+            }
+            GlimmerRecorderState::Header { .. } | GlimmerRecorderState::AwaitingStart => {
+                return Err(GlimmerRecordRefusal::Incomplete);
+            }
+            GlimmerRecorderState::Terminal => {
+                self.state = GlimmerRecorderState::Terminal;
+            }
+            GlimmerRecorderState::Refused(r) => return Err(r),
         }
         if !self.tools.is_empty() && self.content.is_some() {
             return Err(GlimmerRecordRefusal::NonCanonicalBodyOrder);
@@ -29924,50 +29956,104 @@ fn generate_muse_glimmer(
                 bos_token: Some("<bos>"),
             reasoning_strength: None,
             };
-            let render_result = if tools.is_some() || messages_history.is_some() {
+            if tools.is_some() || messages_history.is_some() {
                 let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
-                let messages_slice: &[hipfire_runtime::prompt_frame::Message] =
-                    match messages_history {
-                        Some(h) => h,
-                        None => {
-                            let mut v = Vec::new();
-                            if let Some(sys) = system_prompt {
-                                v.push(hipfire_runtime::prompt_frame::Message {
-                                    role: hipfire_runtime::prompt_frame::Role::System,
-                                    content: sys.to_string(),
-            reasoning_content: None,
-            name: None,
-            rendered_name: None,
-                                    tool_calls: Vec::new(),
-                                    tool_call_id: None,
-                                    tool_plan: String::new(),
-                                });
-                            }
+                let raw_slice: &[hipfire_runtime::prompt_frame::Message] = match messages_history {
+                    Some(h) => h,
+                    None => {
+                        let mut v = Vec::new();
+                        if let Some(sys) = system_prompt {
                             v.push(hipfire_runtime::prompt_frame::Message {
-                                role: hipfire_runtime::prompt_frame::Role::User,
-                                content: prompt.to_string(),
-            reasoning_content: None,
-            name: None,
-            rendered_name: None,
+                                role: hipfire_runtime::prompt_frame::Role::System,
+                                content: sys.to_string(),
+                                reasoning_content: None,
+                                name: None,
+                                rendered_name: None,
                                 tool_calls: Vec::new(),
                                 tool_call_id: None,
                                 tool_plan: String::new(),
                             });
-                            synthesized = v;
-                            &synthesized
                         }
+                        v.push(hipfire_runtime::prompt_frame::Message {
+                            role: hipfire_runtime::prompt_frame::Role::User,
+                            content: prompt.to_string(),
+                            reasoning_content: None,
+                            name: None,
+                            rendered_name: None,
+                            tool_calls: Vec::new(),
+                            tool_call_id: None,
+                            tool_plan: String::new(),
+                        });
+                        synthesized = v;
+                        &synthesized
+                    }
+                };
+                let prepared = match prepare_glimmer_onyx_history(raw_slice) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        emit_error_with_id(stdout, id, format!("glimmer history prep failed: {e}"));
+                        return;
+                    }
+                };
+                let mut prepared_owned = prepared;
+                {
+                    let mut ordinal = 0usize;
+                    for msg in &mut prepared_owned {
+                        if msg.role == hipfire_runtime::prompt_frame::Role::Assistant {
+                            let has_client_reasoning = msg.reasoning_content.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false);
+                            if !has_client_reasoning {
+                                let fp_raw = asst_turn_fingerprint(&normalize_asst_turn_for_fingerprint(&msg.content), &msg.tool_calls);
+                                let fp = glimmer_turn_key(fp_raw, ordinal);
+                                if let Some(cached) = m.asst_turn_cache.get(&fp) {
+                                    if let Some(reasoning) = &cached.reasoning {
+                                        msg.reasoning_content = Some(reasoning.text.clone());
+                                    }
+                                }
+                            }
+                            ordinal += 1;
+                        }
+                    }
+                }
+                if messages_history.is_some() {
+                    let mut lookup_ordinal = 0usize;
+                    let mut cache_lookup = |msg: &hipfire_runtime::prompt_frame::Message| -> Option<hipfire_runtime::prompt_frame::CachedAssistantTurn> {
+                        if msg.role != hipfire_runtime::prompt_frame::Role::Assistant {
+                            return None;
+                        }
+                        let fp_raw = asst_turn_fingerprint(&normalize_asst_turn_for_fingerprint(&msg.content), &msg.tool_calls);
+                        let fp = glimmer_turn_key(fp_raw, lookup_ordinal);
+                        lookup_ordinal += 1;
+                        m.asst_turn_cache.get(&fp).cloned()
                     };
-                frame.render_messages(messages_slice, tools, None)
+                    match hipfire_runtime::prompt_frame::build_cached_history_jinja(&frame, &prepared_owned, tools, &mut cache_lookup) {
+                        Ok(cached_ids) => cached_ids,
+                        Err(e) => {
+                            eprintln!("[daemon] glimmer build_cached_history_jinja failed ({e}) — falling back to plain render");
+                            match frame.render_messages(&prepared_owned, tools, None) {
+                                Ok(rendered) => tokenizer.encode(&rendered),
+                                Err(e2) => {
+                                    eprintln!("[daemon] jinja render failed in muse_glimmer path ({e2}) — falling back to BOS + raw prompt");
+                                    tokenizer.encode(prompt)
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    match frame.render_messages(&prepared_owned, tools, None) {
+                        Ok(rendered) => tokenizer.encode(&rendered),
+                        Err(e) => {
+                            eprintln!("[daemon] jinja render failed in muse_glimmer path ({e}) — falling back to BOS + raw prompt");
+                            tokenizer.encode(prompt)
+                        }
+                    }
+                }
             } else {
-                frame.render()
-            };
-            match render_result {
-                Ok(rendered) => tokenizer.encode(&rendered),
-                Err(e) => {
-                    eprintln!(
-                        "[daemon] jinja render failed in muse_glimmer path ({e}) —                          falling back to BOS + raw prompt"
-                    );
-                    tokenizer.encode(prompt)
+                match frame.render() {
+                    Ok(rendered) => tokenizer.encode(&rendered),
+                    Err(e) => {
+                        eprintln!("[daemon] jinja render failed in muse_glimmer path ({e}) — falling back to BOS + raw prompt");
+                        tokenizer.encode(prompt)
+                    }
                 }
             }
         } else {
@@ -30044,6 +30130,7 @@ fn generate_muse_glimmer(
         bundle.target_hidden_host.clear();
         m.seq_pos = 0;
         m.conversation_tokens.clear();
+        m.asst_turn_cache.clear();
     }
     // Hard refusal: even from a cold cache the prompt alone must fit (KV
     // writes at pos >= max_seq would be out of bounds).
@@ -30083,6 +30170,7 @@ fn generate_muse_glimmer(
                 bundle.target_hidden_host.clear();
                 m.conversation_tokens.clear();
                 m.seq_pos = 0;
+                m.asst_turn_cache.clear();
             }
             (prompt_ids.clone(), 0u32)
         } else {
@@ -30144,6 +30232,7 @@ fn generate_muse_glimmer(
                     bundle.target_hidden_host.clear();
                     m.conversation_tokens.clear();
                     m.seq_pos = 0;
+                    m.asst_turn_cache.clear();
                 }
                 (prompt_ids.clone(), 0u32)
             }
@@ -30180,6 +30269,7 @@ fn generate_muse_glimmer(
             Ok(logits) => last_logits = logits,
             Err(e) => {
                 emit_error_with_id(stdout, id, format!("muse_glimmer prefill failed: {e:?}"));
+                let _ = reconcile_glimmer_mirror(&mut bundle.state, &mut bundle.target_hidden_host, &mut m.conversation_tokens, &mut m.seq_pos);
                 return;
             }
         }
@@ -30205,6 +30295,7 @@ fn generate_muse_glimmer(
     let mut glimmer_recorder = GlimmerChannelRecorder::new(harmony_router.thinking_enabled());
     let mut glimmer_emitted_ids: Vec<u32> = Vec::new();
     let mut glimmer_visible_acc: String = String::new();
+    let mut glimmer_tool_acc: String = String::new();
     // Speculative path: when a DFlash drafter (arch 23, 5-layer diffusion) is
     // present and temp==0 (greedy), drive the shared `accept_greedy_prefix`
     // rule. Otherwise fall back to AR. The drafter being present is gated by
@@ -30255,6 +30346,9 @@ fn generate_muse_glimmer(
                         glimmer_visible_acc.push_str(&text);
                         emit_visible_token(stdout, id, &text)
                     },
+                    GlimmerEmit::Tool(text) => {
+                        glimmer_tool_acc.push_str(&text);
+                    },
                 }
             }
             if harmony_router.just_forced() {
@@ -30276,13 +30370,13 @@ fn generate_muse_glimmer(
                 // Reuse common done emission below – set windows=0 and jump to done
                 // For simplicity, just break out by setting use_spec false path via return
                 // We'll handle by directly emitting done and returning
+                let parsed_tool_calls = parse_glimmer_atem(&glimmer_tool_acc).unwrap_or_default();
                 {
                     let hit_length_cap = generated_count >= max_tokens;
                     let is_empty = glimmer_emitted_ids.is_empty();
                     let should_store = !hit_length_cap && !is_empty;
                     if should_store {
                         let ordinal = messages_history.map(|h| h.iter().filter(|m| matches!(m.role, hipfire_runtime::prompt_frame::Role::Assistant)).count()).unwrap_or(0);
-                        let parsed_tool_calls = parse_glimmer_atem(&glimmer_visible_acc).unwrap_or_default();
                         let _ = glimmer_store_cached_turn(&mut m.asst_turn_cache, glimmer_recorder, &parsed_tool_calls, ordinal);
                     }
                 }
@@ -30290,8 +30384,26 @@ fn generate_muse_glimmer(
                 let decode_ms = decode_t0.elapsed().as_millis().max(1);
                 let total_ms = t0.elapsed().as_millis().max(1);
                 let tok_s = if generated_count > 0 { (generated_count as f64 * 1000.0) / decode_ms as f64 } else { 0.0 };
-                let _ = writeln!(stdout, r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_ms":{},"total_ms":{}}}"#, id, generated_count, tok_s, prefill_ms, total_ms);
-                let _ = stdout.flush();
+                let hit_length_cap = generated_count >= max_tokens;
+                let finish_reason = if hit_length_cap {
+                    "length"
+                } else if !parsed_tool_calls.is_empty() {
+                    "tool_calls"
+                } else {
+                    "stop"
+                };
+                let mut pending_done = serde_json::json!({
+                    "type": "done",
+                    "id": id,
+                    "tokens": generated_count,
+                    "tok_s": (tok_s * 10.0).round() / 10.0,
+                    "prefill_ms": prefill_ms,
+                    "total_ms": total_ms,
+                    "finish_reason": finish_reason,
+                    "attempt_id": active_attempt_id(),
+                });
+                stage_terminal_tool_calls(&mut pending_done, finish_reason, &parsed_tool_calls);
+                emit_staged_terminal_done(stdout, &pending_done);
                 return;
             }
             // Write seed's KV at cur_pos (already done by prefill? No, prefill's last token was prompt, not seed)
@@ -30358,6 +30470,7 @@ fn generate_muse_glimmer(
                             id,
                             format!("glimmer drafter noise embed row {i}: {e}"),
                         );
+                        let _ = reconcile_glimmer_mirror(&mut bundle.state, &mut bundle.target_hidden_host, &mut m.conversation_tokens, &mut m.seq_pos);
                         return;
                     }
                 }
@@ -30409,6 +30522,7 @@ fn generate_muse_glimmer(
                 let fatal = std::env::var("HIPFIRE_GLIMMER_SPEC_FALLBACK").ok().as_deref() != Some("1");
                 if fatal {
                     emit_error_with_id(stdout, id, format!("glimmer drafter forward failed (requested via HIPFIRE_DFLASH_DRAFT): {e}"));
+                    let _ = reconcile_glimmer_mirror(&mut bundle.state, &mut bundle.target_hidden_host, &mut m.conversation_tokens, &mut m.seq_pos);
                     return;
                 }
                 eprintln!("[glimmer-spec] drafter forward failed: {e} — falling back to AR for this window (HIPFIRE_GLIMMER_SPEC_FALLBACK=1)");
@@ -30428,21 +30542,21 @@ fn generate_muse_glimmer(
                         glimmer_visible_acc.push_str(&text);
                         emit_visible_token(stdout, id, &text)
                     },
+                        GlimmerEmit::Tool(text) => {
+                            glimmer_tool_acc.push_str(&text);
+                        },
                     }
                 }
                 if harmony_router.just_forced() {
                     glimmer_recorder.mark_forced_reasoning_close();
                 }
                 glimmer_recorder.push(next_tok, &frag);
-                m.conversation_tokens.push(next_tok);
-                glimmer_emitted_ids.push(next_tok);
-                generated_count += 1;
                 if should_stop_fb { break; }
                 if bundle.state.n_tokens >= cache_cap { break; }
                 let pos = bundle.state.n_tokens as u32;
                 match glimmer::forward::decode_step(&bundle.config, &bundle.weights, &mut bundle.state, gpu, next_tok, pos) {
-                    Ok(l) => { last_logits = l; last_pick = next_tok; cur_pos += 1; },
-                    Err(e) => { emit_error_with_id(stdout, id, format!("muse_glimmer decode failed: {e:?}")); return; }
+                    Ok(l) => { last_logits = l; last_pick = next_tok; cur_pos += 1; m.conversation_tokens.push(next_tok); glimmer_emitted_ids.push(next_tok); generated_count += 1; },
+                    Err(e) => { emit_error_with_id(stdout, id, format!("muse_glimmer decode failed: {e:?}")); let _ = reconcile_glimmer_mirror(&mut bundle.state, &mut bundle.target_hidden_host, &mut m.conversation_tokens, &mut m.seq_pos); return; }
                 }
                 continue;
             }
@@ -30528,6 +30642,7 @@ fn generate_muse_glimmer(
                 Err(e) => {
                     gpu.free_tensor(hidden_for_draft).ok();
                     emit_error_with_id(stdout, id, format!("glimmer drafter lm_head: {e}"));
+                    let _ = reconcile_glimmer_mirror(&mut bundle.state, &mut bundle.target_hidden_host, &mut m.conversation_tokens, &mut m.seq_pos);
                     return;
                 }
             };
@@ -30546,7 +30661,7 @@ fn generate_muse_glimmer(
             let hidden_before2 = bundle.target_hidden_host.len();
             let picks = match glimmer::forward::verify_block_with_capture(&bundle.config, &bundle.weights, &mut bundle.state, gpu, &block, cur_pos, &glimmer_tap_layers(bundle.config.n_layers), &mut bundle.target_hidden_host) {
                 Ok(p) => p,
-                Err(e) => { emit_error_with_id(stdout, id, format!("muse_glimmer verify failed: {e:?}")); return; }
+                Err(e) => { emit_error_with_id(stdout, id, format!("muse_glimmer verify failed: {e:?}")); let _ = reconcile_glimmer_mirror(&mut bundle.state, &mut bundle.target_hidden_host, &mut m.conversation_tokens, &mut m.seq_pos); return; }
             };
             let t_after_verify = t_window.elapsed();
             // verify_block_with_capture appended B rows; truncate to committed prefix
@@ -30651,6 +30766,9 @@ fn generate_muse_glimmer(
                         glimmer_visible_acc.push_str(&text);
                         emit_visible_token(stdout, id, &text)
                     },
+                            GlimmerEmit::Tool(text) => {
+                                glimmer_tool_acc.push_str(&text);
+                            },
                         }
                     }
                     if harmony_router.just_forced() {
@@ -30674,6 +30792,9 @@ fn generate_muse_glimmer(
                         glimmer_visible_acc.push_str(&text);
                         emit_visible_token(stdout, id, &text)
                     },
+                        GlimmerEmit::Tool(text) => {
+                            glimmer_tool_acc.push_str(&text);
+                        },
                     }
                 }
                 if harmony_router.just_forced() {
@@ -30720,6 +30841,9 @@ fn generate_muse_glimmer(
                         glimmer_visible_acc.push_str(&text);
                         emit_visible_token(stdout, id, &text)
                     },
+                        GlimmerEmit::Tool(text) => {
+                            glimmer_tool_acc.push_str(&text);
+                        },
                     }
                 }
                 if harmony_router.just_forced() {
@@ -30743,6 +30867,9 @@ fn generate_muse_glimmer(
                     GlimmerEmit::Token(text) => {
                         glimmer_visible_acc.push_str(&text);
                         emit_visible_token(stdout, id, &text)
+                    },
+                    GlimmerEmit::Tool(text) => {
+                        glimmer_tool_acc.push_str(&text);
                     },
                 }
             }
@@ -30768,9 +30895,15 @@ fn generate_muse_glimmer(
                 position,
             );
             match step {
-                Ok(logits) => last_logits = logits,
+                Ok(logits) => {
+                    last_logits = logits;
+                    m.conversation_tokens.push(next_tok);
+                    glimmer_emitted_ids.push(next_tok);
+                    generated_count += 1;
+                },
                 Err(e) => {
                     emit_error_with_id(stdout, id, format!("muse_glimmer decode failed: {e:?}"));
+                    let _ = reconcile_glimmer_mirror(&mut bundle.state, &mut bundle.target_hidden_host, &mut m.conversation_tokens, &mut m.seq_pos);
                     return;
                 }
             }
@@ -30780,17 +30913,20 @@ fn generate_muse_glimmer(
             match ev {
                 GlimmerEmit::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
                 GlimmerEmit::Token(text) => emit_visible_token(stdout, id, &text),
+                GlimmerEmit::Tool(text) => {
+                    glimmer_tool_acc.push_str(&text);
+                },
             }
         }
     }
 
+    let parsed_tool_calls = parse_glimmer_atem(&glimmer_tool_acc).unwrap_or_default();
     {
         let hit_length_cap = generated_count >= max_tokens;
         let is_empty = glimmer_emitted_ids.is_empty();
         let should_store = !hit_length_cap && !is_empty;
         if should_store {
             let ordinal = messages_history.map(|h| h.iter().filter(|m| matches!(m.role, hipfire_runtime::prompt_frame::Role::Assistant)).count()).unwrap_or(0);
-            let parsed_tool_calls = parse_glimmer_atem(&glimmer_visible_acc).unwrap_or_default();
             let _ = glimmer_store_cached_turn(&mut m.asst_turn_cache, glimmer_recorder, &parsed_tool_calls, ordinal);
         }
     }
@@ -30803,12 +30939,26 @@ fn generate_muse_glimmer(
     } else {
         0.0
     };
-    let _ = writeln!(
-        stdout,
-        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_ms":{},"total_ms":{}}}"#,
-        id, generated_count, tok_s, prefill_ms, total_ms,
-    );
-    let _ = stdout.flush();
+    let hit_length_cap = generated_count >= max_tokens;
+    let finish_reason = if hit_length_cap {
+        "length"
+    } else if !parsed_tool_calls.is_empty() {
+        "tool_calls"
+    } else {
+        "stop"
+    };
+    let mut pending_done = serde_json::json!({
+        "type": "done",
+        "id": id,
+        "tokens": generated_count,
+        "tok_s": (tok_s * 10.0).round() / 10.0,
+        "prefill_ms": prefill_ms,
+        "total_ms": total_ms,
+        "finish_reason": finish_reason,
+        "attempt_id": active_attempt_id(),
+    });
+    stage_terminal_tool_calls(&mut pending_done, finish_reason, &parsed_tool_calls);
+    emit_staged_terminal_done(stdout, &pending_done);
 }
 
 fn generate_lfm2moe(
@@ -40644,6 +40794,29 @@ mod glimmer_channel_recorder_tests {
     }
 
     #[test]
+    fn terminal_open_user_body_is_accepted() {
+        // GAP3: self closed by eom, user body left OPEN (no <|eot|> fed) must be accepted.
+        let mut rec = GlimmerChannelRecorder::new(true);
+        rec.push(GLIMMER_START_ID, "<|start|>");
+        rec.push(100, "assistant to=self");
+        rec.push(GLIMMER_MESSAGE_ID, "<|message|>");
+        rec.push(101, "reasoning body");
+        rec.push(GLIMMER_EOM_ID, "<|eom|>");
+        rec.push(GLIMMER_START_ID, "<|start|>");
+        rec.push(103, "assistant to=user");
+        rec.push(GLIMMER_MESSAGE_ID, "<|message|>");
+        rec.push(104, "answer body");
+        rec.push(105, " more");
+        // Intentionally leave user body OPEN — no EOT, decode stopped on <|eot|> without feeding it.
+        let turn = rec.into_cached_turn(&[]).expect("open terminal user body should be accepted");
+        assert!(turn.reasoning.is_some());
+        assert_eq!(turn.reasoning.unwrap().text, "reasoning body");
+        assert!(turn.content.is_some());
+        assert_eq!(turn.content.unwrap().text, "answer body more");
+        assert!(turn.tools.is_empty());
+    }
+
+    #[test]
     fn splits_self_then_tool() {
         let mut rec = GlimmerChannelRecorder::new(true);
         rec.push(GLIMMER_START_ID, "<|start|>");
@@ -40731,6 +40904,28 @@ mod glimmer_channel_recorder_tests {
         assert_eq!(turn.reasoning.unwrap().token_ids, vec![101, 102]);
         assert_eq!(turn.content.unwrap().token_ids, vec![104, 105]);
         assert!(turn.tools.is_empty());
+    }
+
+    #[test]
+    fn tool_channel_does_not_emit_visible_token() {
+        // GAP6: to=weather.get_forecast envelope must not produce visible Token events.
+        let mut router = GlimmerHarmonyRouter::new(0);
+        // Feed header + atem body split across fragments to exercise suffix hold logic
+        let header = "<|start|>assistant to=weather.get_forecast<|message|>";
+        let atem = "<atem:function_calls>\n<atem:invoke name=\"weather.get_forecast\">\n<atem:parameter name=\"location\">Paris</atem:parameter>\n</atem:invoke>\n</atem:function_calls>";
+        let (events, _) = router.push(header);
+        assert!(events.is_empty(), "header alone should emit nothing");
+        let (events, _) = router.push(atem);
+        // Tool channel text must be Tool, not Token
+        let tool_text: String = events.iter().filter_map(|e| match e { GlimmerEmit::Tool(s) => Some(s.as_str()), _ => None }).collect();
+        let token_text: String = events.iter().filter_map(|e| match e { GlimmerEmit::Token(s) => Some(s.as_str()), _ => None }).collect();
+        assert!(token_text.is_empty(), "tool envelope must produce zero visible Token events, got {:?}", token_text);
+        assert!(!tool_text.is_empty(), "tool envelope should produce Tool events");
+        // Accumulated tool body should parse to one call
+        let calls = parse_glimmer_atem(&tool_text).expect("parse should succeed");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "weather.get_forecast");
+        assert_eq!(calls[0].arguments["location"], serde_json::Value::String("Paris".into()));
     }
 }
 
