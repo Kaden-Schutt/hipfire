@@ -9997,6 +9997,10 @@ fn fail_closed_reset_target_and_spec(
             // geometry is sized for max_seq).
             bundle.state.reset();
         }
+        if let Some(ModelState::MuseGlimmer(bundle)) = m.state.as_mut() {
+            bundle.state.reset();
+            bundle.target_hidden_host.clear();
+        }
         if let Some(ad) = m.kv_adaptive.as_mut() {
             if let Some(ModelState::Qwen35(b)) = m.state.as_mut() {
                 ad.reset_with_cache(gpu, &mut b.kv_cache);
@@ -14016,12 +14020,12 @@ fn main() {
                         };
                         batch_scheduler = staged_batch_scheduler;
                         // `cache_capable` is the daemon's prompt-cache source of truth.
-                        // arch_id 13 (gemma4) and 14 (muse_glimmer) are intentionally ABSENT: generate_gemma4 has
+                        // arch_id 13 (gemma4) is intentionally ABSENT: generate_gemma4 has
                         // no LCP prefix-cache block and always cold-prefills the full
                         // Jinja-rendered prompt. Enabling the cache would corrupt KV
                         // slot offsets after turn 1 (stale prefix reuse). Wire when
                         // generate_gemma4 gains an LCP block matching other archs.
-                        let cache_capable = matches!(m.arch_id, 5 | 6 | 9 | 10 | 12);
+                        let cache_capable = matches!(m.arch_id, 5 | 6 | 9 | 10 | 12 | 14);
                         let retry_reset_eligible = model_retry_reset_eligible(m.arch_id);
                         let continuous_batch_capable = staged_batch_capable;
                         // Load ack exposes batch dimensions/capability; EP adds parallelism metadata but never infers operation from logs.
@@ -29265,6 +29269,7 @@ fn generate_muse_glimmer(
         let (n, cap) = (bundle.state.n_tokens, bundle.state.max_seq);
         eprintln!("[daemon] arch_id=14 context full ({n}/{cap}) — resetting GlimmerState");
         bundle.state.reset();
+        bundle.target_hidden_host.clear();
         m.seq_pos = 0;
         m.conversation_tokens.clear();
     }
@@ -29283,6 +29288,69 @@ fn generate_muse_glimmer(
         return;
     }
 
+    // ── Prefix cache (LCP) — modelled on generate_minimax (daemon.rs:30352-30407).
+    // Compute LCP of m.conversation_tokens against prompt_ids. Hit when
+    // lcp > 0 && lcp < prompt_ids.len(); anything else is a cold miss.
+    // On hit: rewind KV cursor (n_tokens), token history, seq_pos, AND
+    // target_hidden_host (position-major host buffer, one row per committed
+    // token) to lcp. Row size is tap_layers.len() * dim, derived not hardcoded.
+    // Prefill only prompt_ids[lcp..] at start_pos=lcp and append only that
+    // suffix to conversation_tokens. On miss: behave exactly as today
+    // (full prefill at current n_tokens). Gated by HIPFIRE_GLIMMER_PROMPT_CACHE=0.
+    let (prefill_ids, prefill_start_pos): (Vec<u32>, u32) = {
+        let cache_disabled =
+            std::env::var("HIPFIRE_GLIMMER_PROMPT_CACHE").ok().as_deref() == Some("0");
+        if cache_disabled {
+            // Opting out of the cache does NOT restore the CLI's per-request
+            // reset — arch 14 is in the cache_capable allowlist either way, so
+            // the CLI keeps the session warm. Cold-reset here or the opt-out
+            // path becomes the very double-write the cache was added to avoid.
+            if bundle.state.n_tokens > 0 || !m.conversation_tokens.is_empty() {
+                bundle.state.reset();
+                bundle.target_hidden_host.clear();
+                m.conversation_tokens.clear();
+                m.seq_pos = 0;
+            }
+            (prompt_ids.clone(), 0u32)
+        } else {
+            let prior_len = m.conversation_tokens.len();
+            let max_match = prior_len.min(prompt_ids.len());
+            let mut lcp = 0usize;
+            while lcp < max_match && m.conversation_tokens[lcp] == prompt_ids[lcp] {
+                lcp += 1;
+            }
+            let cache_hit = lcp > 0 && lcp < prompt_ids.len();
+            if cache_hit {
+                bundle.state.n_tokens = lcp;
+                m.conversation_tokens.truncate(lcp);
+                m.seq_pos = lcp;
+                let tap_layers_for_cache = glimmer_tap_layers(bundle.config.n_layers);
+                let row_elems = tap_layers_for_cache.len() * bundle.config.dim;
+                let keep_elems = lcp * row_elems;
+                bundle.target_hidden_host.truncate(keep_elems);
+                (prompt_ids[lcp..].to_vec(), lcp as u32)
+            } else {
+                // MISS with a hot cache MUST cold-reset, exactly as
+                // generate_minimax does. Before arch 14 joined the
+                // `cache_capable` allowlist this branch was safe by accident:
+                // the CLI issued a per-request reset for non-cache-capable
+                // archs, so n_tokens was always 0 here. With the flag now true
+                // that reset is suppressed, and prefilling the full prompt at a
+                // live n_tokens would append a SECOND copy of the conversation
+                // into KV at shifted positions — coherent-looking garbage, not
+                // an error. Covers both misses: lcp == 0 (fully divergent) and
+                // lcp == prompt_ids.len() (identical prompt re-sent).
+                if bundle.state.n_tokens > 0 || prior_len > 0 {
+                    bundle.state.reset();
+                    bundle.target_hidden_host.clear();
+                    m.conversation_tokens.clear();
+                    m.seq_pos = 0;
+                }
+                (prompt_ids.clone(), 0u32)
+            }
+        }
+    };
+
     let t0 = Instant::now();
 
     // ── Prefill: chunked batched forward reusing the verify path's batched
@@ -29299,13 +29367,13 @@ fn generate_muse_glimmer(
         let capture = bundle.drafter.is_some();
         let tap_layers: Vec<usize> = glimmer_tap_layers(bundle.config.n_layers);
         let target_layers: &[usize] = if capture { &tap_layers } else { &[] };
-        let start_pos = bundle.state.n_tokens as u32;
+        let start_pos = prefill_start_pos;
         match glimmer::forward::prefill_with_capture(
             &bundle.config,
             &bundle.weights,
             &mut bundle.state,
             gpu,
-            &prompt_ids,
+            &prefill_ids,
             start_pos,
             target_layers,
             &mut bundle.target_hidden_host,
@@ -29317,7 +29385,7 @@ fn generate_muse_glimmer(
             }
         }
     }
-    for &tok in &prompt_ids {
+    for &tok in &prefill_ids {
         m.conversation_tokens.push(tok);
     }
     let prefill_ms = t0.elapsed().as_millis();

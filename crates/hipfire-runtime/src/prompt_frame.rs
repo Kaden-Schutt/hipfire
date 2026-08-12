@@ -743,6 +743,92 @@ pub fn hf_tojson(value: minijinja::Value) -> Result<String, minijinja::Error> {
     })
 }
 
+/// Parenthesize a bare conditional expression used as a CALL KEYWORD ARGUMENT.
+///
+/// Jinja2 accepts `namespace(name=tcid if tcid else '')`; minijinja does not —
+/// it stops at the `if` and reports
+/// `syntax error: unexpected identifier, expected ','`. Wrapping the value in
+/// parentheses, `namespace(name=(tcid if tcid else ''))`, parses and evaluates
+/// identically, so this is semantics-preserving in the same sense as
+/// `strip_generation_tags` above.
+///
+/// Muse Glimmer bring-up, 2026-08-11: its chat_template.jinja carries exactly
+/// this construct in the tool-response branch. Because the template is a single
+/// line, the parse failure took the WHOLE template down, and the daemon fell
+/// back to "BOS + raw prompt" for every request — so multi-turn silently
+/// degenerated (each turn re-answering a bare prompt) with only an eprintln to
+/// show for it. Any model whose template uses a conditional kwarg hits this.
+///
+/// Deliberately narrow: only rewrites `<ident>=` immediately inside a call's
+/// argument list, and only when the value contains a top-level ` if ` before
+/// the argument ends at `,` or `)`. Depth-tracked so nested calls, strings and
+/// already-parenthesized values are left alone.
+fn parenthesize_conditional_kwargs(template: &str) -> String {
+    let b = template.as_bytes();
+    let mut out = String::with_capacity(template.len() + 16);
+    // `copied` is the start of the not-yet-emitted slice. Emitting SLICES (not
+    // per-byte chars) keeps this UTF-8 safe: the template contains multibyte
+    // characters, and `b[i] as char` would reinterpret them as Latin-1.
+    let mut copied = 0usize;
+    let mut i = 0usize;
+    while i < b.len() {
+        // Find `<ident>=` sitting directly inside a call's argument list.
+        if b[i] == b'='
+            && i + 1 < b.len()
+            && b[i + 1] != b'='
+            && i > 0
+            && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_')
+        {
+            let mut s = i;
+            while s > 0 && (b[s - 1].is_ascii_alphanumeric() || b[s - 1] == b'_') {
+                s -= 1;
+            }
+            if matches!(template[..s].trim_end().chars().last(), Some('(') | Some(',')) {
+                // Scan the value to the end of this argument at depth 0.
+                let mut j = i + 1;
+                let mut depth = 0i32;
+                let mut quote: Option<u8> = None;
+                let mut has_if = false;
+                while j < b.len() {
+                    let c = b[j];
+                    if let Some(q) = quote {
+                        if c == q {
+                            quote = None;
+                        }
+                    } else if c == b'\'' || c == b'"' {
+                        quote = Some(c);
+                    } else if c == b'(' || c == b'[' || c == b'{' {
+                        depth += 1;
+                    } else if c == b')' || c == b']' || c == b'}' {
+                        if depth == 0 {
+                            break;
+                        }
+                        depth -= 1;
+                    } else if c == b',' && depth == 0 {
+                        break;
+                    } else if depth == 0 && template[j..].starts_with(" if ") {
+                        has_if = true;
+                    }
+                    j += 1;
+                }
+                let value = &template[i + 1..j];
+                if has_if && !value.trim().is_empty() && !value.trim().starts_with('(') {
+                    out.push_str(&template[copied..=i]);
+                    out.push('(');
+                    out.push_str(value);
+                    out.push(')');
+                    copied = j;
+                    i = j;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    out.push_str(&template[copied..]);
+    out
+}
+
 /// Strip unsupported `{% generation %}` / `{% endgeneration %}` Jinja tags
 /// (with any whitespace/dash variants) from LFM2.5-230M's chat_template.
 /// These are no-op generation-scope markers that minijinja doesn't know;
@@ -926,7 +1012,8 @@ impl<'a> JinjaChatFrame<'a> {
         // mapping-arg rendering byte-matches transformers' apply_chat_template.
         env.add_filter("tojson", hf_tojson);
 
-        let cleaned_template = strip_generation_tags(self.template);
+        let cleaned_template =
+            parenthesize_conditional_kwargs(&strip_generation_tags(self.template));
         env.add_template("chat", &cleaned_template)
             .map_err(|e| format!("template parse: {e}"))?;
         let tmpl = env
@@ -2375,5 +2462,46 @@ SYS:{{ build_system_message(system_message) }}:END
         assert_eq!(civil_from_days(18_993), (2022, 1, 1));
         // 2026-06-18 = 20622 days after 1970-01-01
         assert_eq!(civil_from_days(20_622), (2026, 6, 18));
+    }
+
+
+    /// Muse Glimmer's chat_template uses `namespace(name=tcid if tcid else '')`,
+    /// which Jinja2 accepts and minijinja rejects with
+    /// "unexpected identifier, expected `,`". Because that template is a single
+    /// line, the failure took the WHOLE template down and every request silently
+    /// fell back to "BOS + raw prompt", degenerating multi-turn.
+    ///
+    /// Negative control: the pre-fixup string MUST fail to parse, otherwise this
+    /// test would pass even with the fixup removed.
+    #[test]
+    fn conditional_kwarg_is_parenthesized_and_parses() {
+        let raw = "{%- set rns = namespace(name=tcid if tcid else '') -%}{{ rns.name }}";
+        let mut env = minijinja::Environment::new();
+        assert!(
+            env.template_from_named_str("chat", raw).is_err(),
+            "negative control: raw template must NOT parse, or the fixup is untested"
+        );
+
+        let fixed = parenthesize_conditional_kwargs(raw);
+        assert!(fixed.contains("namespace(name=(tcid if tcid else ''))"), "got: {fixed}");
+        let mut env2 = minijinja::Environment::new();
+        env2.template_from_named_str("chat", &fixed)
+            .expect("fixed template must parse");
+    }
+
+    /// The fixup must not disturb templates that do not need it, must not touch
+    /// non-kwarg `=`, and must be UTF-8 safe (an earlier version emitted
+    /// `bytes[i] as char`, which mangles multibyte characters).
+    #[test]
+    fn conditional_kwarg_fixup_leaves_other_templates_alone() {
+        for src in [
+            "{{ a if b else c }}",
+            "{%- if x == 1 -%}y{%- endif -%}",
+            "{{ f(name=(p if q else '')) }}",
+            "{{ f(name=plain, other=2) }}",
+            "{{ '\u{2014} \u{1f600} caf\u{e9}' }}",
+        ] {
+            assert_eq!(parenthesize_conditional_kwargs(src), src, "changed: {src}");
+        }
     }
 }
