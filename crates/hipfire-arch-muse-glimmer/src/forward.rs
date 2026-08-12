@@ -506,6 +506,91 @@ fn glimmer_layer_decode(
         .map_err(|e| format!("glimmer L{layer_idx}: kv write k: {e:?}"))?;
     gpu.kv_cache_write_q8_0(&kv.v_gpu[kv_slot], &state.v, &state.pos_buf, n_kv, head_dim)
         .map_err(|e| format!("glimmer L{layer_idx}: kv write v: {e:?}"))?;
+
+    // Flash decode. `attention_q8_0_kv_swa` launches grid [n_heads] = 32
+    // workgroups, one per head, and each walks the whole key range serially
+    // while materializing every score in LDS. On a 64-CU part that leaves half
+    // the GPU idle at ANY context and makes cost grow with seq_len. Measured
+    // via `hipfire bench --matrix`: Glimmer decode falls 30.3% from ctx 128 to
+    // 8192 (32.49 -> 22.66 tok/s) where Qwen3.5-27B on the same GPU and harness
+    // loses 4.1% (35.85 -> 34.39) because it decodes through the flash family.
+    //
+    // The batched flash kernel tiles keys at 128 and puts the tile count in the
+    // grid, so at ctx 8192 it launches ~64x more workgroups and reduces
+    // partials instead of serializing. Glimmer already uses it for prefill;
+    // batch_size=1 is the decode case. Same KV layout, same window semantics
+    // (window<=0 = full causal), so the 13 NoPE layers pass window=0.
+    //
+    // Neither kernel wins outright, so this is a THRESHOLD and not a swap. The
+    // 32-workgroup SWA is cheaper when there is too little work to spread; the
+    // tiled flash wins once there is. Measured on gfx1201 via
+    // `hipfire bench --matrix --tg 64`, medians of 3:
+    //
+    //     ctx      768   1024   1536   2048   4096   8192
+    //     SWA    29.99  29.08  27.53  26.22  24.94  22.66
+    //     flash  28.65  28.55  28.38  28.20  27.86  27.20
+    //
+    // Crossover sits between 1024 and 1536, hence the 1280 default. Picking
+    // flash above it takes the ctx-128->8192 decay from -30.3% to -5.2%, which
+    // is the -4.1% Qwen3.5-27B shows on the same GPU and harness, and is worth
+    // +20.0% at ctx 8192. Byte-identical to the SWA path either side.
+    //
+    // `HIPFIRE_GLIMMER_FLASH_DECODE` overrides the threshold in tokens; 0
+    // disables flash decode entirely.
+    let flash_min = std::env::var("HIPFIRE_GLIMMER_FLASH_DECODE")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(1280);
+    let seq_len_now = state.pos_host[0] as usize + 1;
+    let decode_flash = flash_min > 0 && seq_len_now >= flash_min;
+    if decode_flash {
+        let n_tiles = (state.max_seq + 127) / 128;
+        let need = n_heads * n_tiles * (2 + head_dim) * 64;
+        if state.prefill_flash_partials.is_none() {
+            let buf = gpu
+                .alloc_tensor(&[need], DType::F32)
+                .map_err(|e| format!("glimmer L{layer_idx}: decode flash partials: {e:?}"))?;
+            state.prefill_flash_partials = Some(buf);
+        }
+        if state.decode_pos.is_none() {
+            let t = gpu
+                .alloc_tensor(&[1], DType::F32)
+                .map_err(|e| format!("glimmer L{layer_idx}: decode pos tensor: {e:?}"))?;
+            state.decode_pos = Some(t);
+        }
+        {
+            let pos_bytes =
+                unsafe { std::slice::from_raw_parts(state.pos_host.as_ptr() as *const u8, 4) };
+            let t = state.decode_pos.as_ref().unwrap();
+            gpu.hip
+                .memcpy_htod(&t.buf, pos_bytes)
+                .map_err(|e| format!("glimmer L{layer_idx}: decode pos htod: {e:?}"))?;
+        }
+        let kv = match cfg.layer_types[layer_idx] {
+            GlimmerLayerType::Sliding => &state.kv_sliding,
+            GlimmerLayerType::Full => &state.kv_full,
+        };
+        let partials = state.prefill_flash_partials.as_ref().unwrap();
+        gpu.attention_flash_q8_0_batched_masked_windowed(
+            &state.q,
+            &kv.k_gpu[kv_slot],
+            &kv.v_gpu[kv_slot],
+            &state.attn_out,
+            state.decode_pos.as_ref().unwrap(),
+            n_heads,
+            n_kv,
+            head_dim,
+            state.max_seq,
+            seq_len_now,
+            1,
+            partials,
+            None,
+            0,
+            0,
+            window as i32,
+        )
+        .map_err(|e| format!("glimmer L{layer_idx}: flash decode: {e:?}"))?;
+    } else {
     gpu.attention_q8_0_kv_swa(
         &state.q,
         &kv.k_gpu[kv_slot],
@@ -541,6 +626,7 @@ fn glimmer_layer_decode(
         window,
     )
     .map_err(|e| format!("glimmer L{layer_idx}: attention swa: {e:?}"))?;
+    }
 
     // Gated attention: attn_out *= sigmoid(attn_gate) BEFORE o_proj
     // Uses gpu.sigmoid_mul_f32 (norm.rs:2006) — do not write a new kernel.

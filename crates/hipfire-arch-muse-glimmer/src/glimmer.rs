@@ -489,6 +489,10 @@ pub struct GlimmerState {
     /// ceil(max_seq/128) * (2+head_dim) * 64 floats (~65 MiB at max_seq=8192).
     /// Factor-64 precedent: crates/hipfire-arch-cohere2moe/src/cohere2moe.rs:496-511.
     pub prefill_flash_partials: Option<GpuTensor>,
+    /// Single-element i32 position tensor for the flash decode path. `pos_buf`
+    /// is a raw DeviceBuffer, but the batched flash kernel takes a GpuTensor of
+    /// positions; at batch_size=1 it holds the same value. Lazily allocated.
+    pub decode_pos: Option<GpuTensor>,
 }
 
 impl GlimmerState {
@@ -609,6 +613,7 @@ impl GlimmerState {
                 "logits_batch",
             )?,
             prefill_flash_partials: None,
+            decode_pos: None,
         })
     }
 
@@ -639,6 +644,9 @@ impl GlimmerState {
             self.logits,
             self.logits_batch,
         ] {
+            let _ = gpu.free_tensor(t);
+        }
+        if let Some(t) = self.decode_pos {
             let _ = gpu.free_tensor(t);
         }
         if let Some(t) = self.prefill_flash_partials {
