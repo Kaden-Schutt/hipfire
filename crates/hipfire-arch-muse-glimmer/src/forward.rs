@@ -1553,8 +1553,34 @@ fn prefill_chunk_batched(
         //   tree_bias=None, block_start=0, block_cols=0.
         // Precedent: crates/hipfire-arch-cohere2moe/src/forward.rs:705-757.
         // Toggle HIPFIRE_GLIMMER_NO_FLASH=1 to force per-row SWA for debugging.
-        let use_flash = window != 0 && seq_len > window
-            && std::env::var("HIPFIRE_GLIMMER_NO_FLASH").as_deref() != Ok("1");
+        //
+        // The 13 NoPE (window==0) layers are the ONLY ones whose cost still
+        // grows once past 2048 — the 39 sliding layers pin at the window. The
+        // measured decay slopes bear that out: +116 µs/tok per 1k ctx under the
+        // window vs +27 above, a 4.30x drop against a 52/13 = 4.00 layer ratio.
+        // Those 13 layers were falling through to attention_q8_0_kv_batched for
+        // no algorithmic reason: the flash kernel documents `window <= 0 = full
+        // causal` (attention_flash_q8_0_tile_batched.hip:62, win_lo = window>0 ?
+        // seq_len-window : 0), so passing window=0 gives exactly the causal
+        // attention they already want.
+        //
+        // MEASURED NEUTRAL, so it is default OFF. gfx1201, 4241-token fixture,
+        // median of 3 fresh processes: 7303 ms off vs 7319 ms on (-0.22%, and
+        // the within-config spread is 0.4%, so the delta is inside noise);
+        // byte-identical either way. Two reasons it cannot pay here. Flash
+        // changes the CONSTANT, never the SLOPE — full attention over a growing
+        // context is inherently linear per token. And the context-dependent
+        // term is only ~23% of prefill at 4241 tokens (1326 µs/tok at 270 ctx
+        // vs 1722 at 4241); the other 77% is fixed per-token projection work,
+        // which is where the Muse GEMM went. Kept behind the flag rather than
+        // deleted because the full layers' share grows with context and this is
+        // untested past 8192 — at 32k-131k the verdict may well invert.
+        let flash_full = std::env::var("HIPFIRE_GLIMMER_FLASH_FULL")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(false);
+        let use_flash = std::env::var("HIPFIRE_GLIMMER_NO_FLASH").as_deref() != Ok("1")
+            && ((window != 0 && seq_len > window)
+                || (window == 0 && flash_full && seq_len > 2048));
         if use_flash {
             if state.prefill_flash_partials.is_none() {
                 let n_tiles = (state.max_seq + 127) / 128;
