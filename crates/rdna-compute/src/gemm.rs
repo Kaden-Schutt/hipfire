@@ -11025,18 +11025,27 @@ impl Gpu {
         batch_size: usize,
         bt: usize,
     ) -> HipResult<bool> {
-        let kname = match bt {
-            12 => "gemm_hfq4g256_residual_wmma_gfx12_muse_full12",
-            8 => "gemm_hfq4g256_residual_wmma_gfx12_muse_full8",
-            4 => "gemm_hfq4g256_residual_wmma_gfx12_muse_full4",
-            _ => return Ok(false),
-        };
-        if batch_size == 0 || batch_size % (16 * bt) != 0 {
+        // bt=12 is the only width instantiated. bt=16 and above spill on this
+        // ISA, and bt=8/4 were measured and removed: at B=256 the muse full8
+        // LOST to the shared bt8 (occ 12 vs 10 did not convert), and full4 tied
+        // an already-saturated shared bt4. Every extra instantiation is compile
+        // time every user pays on first load, for a kernel never dispatched.
+        if bt != 12 || batch_size == 0 || batch_size % (16 * bt) != 0 {
             return Ok(false);
         }
+        let kname = "gemm_hfq4g256_residual_wmma_gfx12_muse_full12";
         self.bind_thread()?;
+        // Module name is the FILE, not the symbol, so the source compiles once
+        // instead of once per requested width.
+        //
+        // The gfx12 max-memory-clause scheduler policy was tried here via a
+        // per-module KernelCompiler flag (radiowave found it: 197 VGPR / occ 7
+        // default vs 192 / occ 8 memory-clause, zero spill both). It is 3.8-4.4%
+        // SLOWER end-to-end on this kernel, so the default policy stands and
+        // compiler.rs stays untouched. Better resource numbers are a necessary
+        // check, not a sufficient one — do not re-land it on the manifest alone.
         self.ensure_kernel(
-            kname,
+            "gemm_hfq4g256_residual_wmma_gfx12_muse",
             kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_MUSE_SRC,
             kname,
         )?;

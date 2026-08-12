@@ -173,6 +173,31 @@ fn main() {
             let tflops = 2.0 * (*m as f64) * (*k as f64) * (b as f64) / (ms / 1000.0) / 1e12;
             println!("{:<12} {:>6} {:>10.3} {:>10.2} {:>7.1}% {:>9}", label, b, ms, tflops, spread, m);
 
+            // Cost of the memset ALONE. The residual kernel accumulates
+            // (Y += W@X), so every call needs Y pre-zeroed, and Glimmer pays
+            // that on gate, up and down every layer. Timed separately because
+            // it is invisible in the fused number above yet is pure overhead
+            // that an overwrite-semantics kernel would delete outright.
+            let mut zreps: Vec<f64> = Vec::new();
+            for _ in 0..3 {
+                let t0 = Instant::now();
+                for _ in 0..iters {
+                    let _ = gpu.hip.memset(&y.buf, 0, b * m * 4);
+                }
+                let _ = gpu.hip.device_synchronize();
+                zreps.push(t0.elapsed().as_secs_f64() * 1000.0 / iters as f64);
+            }
+            zreps.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            println!(
+                "{:<12} {:>6} {:>10.3} {:>10}  memset={:.3} ms = {:.1}% of the call",
+                format!("{}_ZERO", label),
+                b,
+                zreps[1],
+                "",
+                zreps[1],
+                100.0 * zreps[1] / ms
+            );
+
             // Muse-owned full-tile sibling. Same BV, same K loop, same WMMA
             // sequence -> the accumulation order is identical, so this must be
             // BIT-identical to the shared kernel, not merely close. Checked
