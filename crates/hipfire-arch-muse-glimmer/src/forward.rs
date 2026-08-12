@@ -1211,27 +1211,65 @@ pub fn verify_block_with_capture(
         g.alloc_tensor(&[n], DType::F32)
             .map_err(|e| format!("glimmer verify_batch alloc {label}: {e:?}"))
     };
-    let x = alloc(gpu, b * dim, "x")?;
-    let residual = alloc(gpu, b * dim, "residual")?;
-    let nrm = alloc(gpu, b * dim, "nrm")?;
-    let x_rot = alloc(gpu, b * dim, "x_rot")?;
-    let q = alloc(gpu, b * q_dim, "q")?;
-    let k = alloc(gpu, b * kv_dim, "k")?;
-    let v = alloc(gpu, b * kv_dim, "v")?;
-    let attn_gate = alloc(gpu, b * q_dim, "attn_gate")?;
-    let attn_out = alloc(gpu, b * q_dim, "attn_out")?;
-    let o_rot = alloc(gpu, b * q_dim, "o_rot")?;
-    let o_out = alloc(gpu, b * dim, "o_out")?;
-    let gate_ffn = alloc(gpu, b * cfg.hidden_dim, "gate_ffn")?;
-    let up_ffn = alloc(gpu, b * cfg.hidden_dim, "up_ffn")?;
-    let ffn_hidden = alloc(gpu, b * cfg.hidden_dim, "ffn_hidden")?;
-    let ffn_out = alloc(gpu, b * dim, "ffn_out")?;
-    let down_rot = alloc(gpu, b * cfg.hidden_dim, "down_rot")?;
+    // Same ownership discipline as `prefill_chunk_batched`: take all 17 scratch tensors
+    // into one list so a failure part-way through frees what it already holds instead of
+    // leaking it for the life of the process. Allocation is where memory pressure lands,
+    // and the daemon retries a failed generate, so a leak here compounds per retry.
+    let scratch_spec: [(usize, &str); 17] = [
+        (b * dim, "x"),
+        (b * dim, "residual"),
+        (b * dim, "nrm"),
+        (b * dim, "x_rot"),
+        (b * q_dim, "q"),
+        (b * kv_dim, "k"),
+        (b * kv_dim, "v"),
+        (b * q_dim, "attn_gate"),
+        (b * q_dim, "attn_out"),
+        (b * q_dim, "o_rot"),
+        (b * dim, "o_out"),
+        (b * cfg.hidden_dim, "gate_ffn"),
+        (b * cfg.hidden_dim, "up_ffn"),
+        (b * cfg.hidden_dim, "ffn_hidden"),
+        (b * dim, "ffn_out"),
+        (b * cfg.hidden_dim, "down_rot"),
+        (b, "pos_array"),
+    ];
+    let mut taken: Vec<GpuTensor> = Vec::with_capacity(scratch_spec.len());
+    for (n, label) in scratch_spec {
+        match gpu.alloc_tensor(&[n], DType::F32) {
+            Ok(t) => taken.push(t),
+            Err(e) => {
+                for t in taken.drain(..) {
+                    gpu.free_tensor(t).ok();
+                }
+                return Err(format!("glimmer verify_batch alloc {label}: {e:?}"));
+            }
+        }
+    }
+    let mut scratch_iter = taken.into_iter();
+    let mut next_scratch =
+        move || scratch_iter.next().expect("scratch_spec length matches the bindings below");
+    let x = next_scratch();
+    let residual = next_scratch();
+    let nrm = next_scratch();
+    let x_rot = next_scratch();
+    let q = next_scratch();
+    let k = next_scratch();
+    let v = next_scratch();
+    let attn_gate = next_scratch();
+    let attn_out = next_scratch();
+    let o_rot = next_scratch();
+    let o_out = next_scratch();
+    let gate_ffn = next_scratch();
+    let up_ffn = next_scratch();
+    let ffn_hidden = next_scratch();
+    let ffn_out = next_scratch();
+    let down_rot = next_scratch();
+    let pos_array = next_scratch();
 
     // positions [B] i32
     let pos_data: Vec<i32> = (0..b).map(|i| (position + i as u32) as i32).collect();
     let pos_bytes: Vec<u8> = pos_data.iter().flat_map(|p| p.to_ne_bytes()).collect();
-    let pos_array = alloc(gpu, b, "pos_array")?;
     gpu.hip
         .memcpy_htod(&pos_array.buf, &pos_bytes)
         .map_err(|e| format!("glimmer verify_batch htod pos: {e:?}"))?;
@@ -1497,26 +1535,75 @@ fn prefill_chunk_batched(
         g.alloc_tensor(&[n], DType::F32)
             .map_err(|e| format!("glimmer prefill alloc {label}: {e:?}"))
     };
-    let x = alloc(gpu, b * dim, "x")?;
-    let residual = alloc(gpu, b * dim, "residual")?;
-    let nrm = alloc(gpu, b * dim, "nrm")?;
-    let x_rot = alloc(gpu, b * dim, "x_rot")?;
-    let q = alloc(gpu, b * q_dim, "q")?;
-    let k = alloc(gpu, b * kv_dim, "k")?;
-    let v = alloc(gpu, b * kv_dim, "v")?;
-    let attn_gate = alloc(gpu, b * q_dim, "attn_gate")?;
-    let attn_out = alloc(gpu, b * q_dim, "attn_out")?;
-    let o_rot = alloc(gpu, b * q_dim, "o_rot")?;
-    let o_out = alloc(gpu, b * dim, "o_out")?;
-    let gate_ffn = alloc(gpu, b * cfg.hidden_dim, "gate_ffn")?;
-    let up_ffn = alloc(gpu, b * cfg.hidden_dim, "up_ffn")?;
-    let ffn_hidden = alloc(gpu, b * cfg.hidden_dim, "ffn_hidden")?;
-    let ffn_out = alloc(gpu, b * dim, "ffn_out")?;
-    let down_rot = alloc(gpu, b * cfg.hidden_dim, "down_rot")?;
 
+    // Allocate every batched scratch tensor into ONE owner list before running any
+    // kernel. Each `alloc(...)?` used to return early on failure, leaking every tensor
+    // it had already taken; and because the daemon RETRIES a failed generate, each retry
+    // leaked another full set. Measured on gfx1201 with muse-glimmer-30b.mq4: free VRAM
+    // fell 881.9 MB -> 8.5 MB across a handful of oversized requests, after which every
+    // request OOM'd until the process was restarted. One oversized request bricked the
+    // daemon.
+    //
+    // `GpuTensor` is not `Clone`, so this Vec *is* the ownership until it is destructured
+    // into the named bindings below; on failure it frees exactly what it holds.
+    let scratch_spec: [(usize, &str); 17] = [
+        (b * dim, "x"),
+        (b * dim, "residual"),
+        (b * dim, "nrm"),
+        (b * dim, "x_rot"),
+        (b * q_dim, "q"),
+        (b * kv_dim, "k"),
+        (b * kv_dim, "v"),
+        (b * q_dim, "attn_gate"),
+        (b * q_dim, "attn_out"),
+        (b * q_dim, "o_rot"),
+        (b * dim, "o_out"),
+        (b * cfg.hidden_dim, "gate_ffn"),
+        (b * cfg.hidden_dim, "up_ffn"),
+        (b * cfg.hidden_dim, "ffn_hidden"),
+        (b * dim, "ffn_out"),
+        (b * cfg.hidden_dim, "down_rot"),
+        (b, "pos_array"),
+    ];
+    let mut taken: Vec<GpuTensor> = Vec::with_capacity(scratch_spec.len());
+    for (n, label) in scratch_spec {
+        match gpu.alloc_tensor(&[n], DType::F32) {
+            Ok(t) => taken.push(t),
+            Err(e) => {
+                for t in taken.drain(..) {
+                    gpu.free_tensor(t).ok();
+                }
+                return Err(format!("glimmer prefill alloc {label}: {e:?}"));
+            }
+        }
+    }
+    let mut scratch_iter = taken.into_iter();
+    let mut next_scratch =
+        move || scratch_iter.next().expect("scratch_spec length matches the bindings below");
+    let x = next_scratch();
+    let residual = next_scratch();
+    let nrm = next_scratch();
+    let x_rot = next_scratch();
+    let q = next_scratch();
+    let k = next_scratch();
+    let v = next_scratch();
+    let attn_gate = next_scratch();
+    let attn_out = next_scratch();
+    let o_rot = next_scratch();
+    let o_out = next_scratch();
+    let gate_ffn = next_scratch();
+    let up_ffn = next_scratch();
+    let ffn_hidden = next_scratch();
+    let ffn_out = next_scratch();
+    let down_rot = next_scratch();
+    let pos_array = next_scratch();
+
+    // Everything below runs inside a closure so that EVERY `?` unwinds to the single
+    // free site after it, instead of returning straight out of the function and leaking
+    // all 17 tensors. The body is otherwise unchanged.
+    let body_result: Result<Option<Vec<f32>>, String> = (|| {
     let pos_data: Vec<i32> = (0..b).map(|i| (position + i as u32) as i32).collect();
     let pos_bytes: Vec<u8> = pos_data.iter().flat_map(|p| p.to_ne_bytes()).collect();
-    let pos_array = alloc(gpu, b, "pos_array")?;
     gpu.hip
         .memcpy_htod(&pos_array.buf, &pos_bytes)
         .map_err(|e| format!("glimmer prefill htod pos: {e:?}"))?;
@@ -2081,27 +2168,35 @@ fn prefill_chunk_batched(
     // ── Final norm + lm_head: ONLY last row when needed ──
     let last_logits: Option<Vec<f32>> = if need_logits {
         let normed = alloc(gpu, b * dim, "normed")?;
-        gpu.rmsnorm_batched(&x, &weights.final_norm, &normed, b, dim, rms_eps).map_err(|e| format!("glimmer prefill final rmsnorm: {e:?}"))?;
-        let last_norm = normed.sub_offset((b - 1) * dim, dim);
-        weight_gemv(gpu, &weights.lm_head, &last_norm, &state.logits)
-            .map_err(|e| format!("glimmer prefill lm_head: {e}"))?;
-        if cfg.output_multiplier != 1.0 && !abl("HIPFIRE_GLIMMER_NO_OUTMUL") {
-            gpu.scale_f32(&state.logits, cfg.output_multiplier).map_err(|e| format!("glimmer prefill outmul: {e:?}"))?;
-        }
-        if cfg.final_logit_softcapping > 0.0 && !abl("HIPFIRE_GLIMMER_NO_SOFTCAP") {
-            gpu.logit_softcap_f32(&state.logits, cfg.vocab_size, cfg.final_logit_softcapping).map_err(|e| format!("glimmer prefill softcap: {e:?}"))?;
-        }
-        let host = gpu.download_f32(&state.logits).map_err(|e| format!("glimmer prefill download logits: {e:?}"))?;
+        // Same reason as the scratch set: `normed` used to leak on any of the five `?`
+        // sites below, and this branch runs on the LAST chunk of every prefill.
+        let host_result: Result<Vec<f32>, String> = (|| {
+            gpu.rmsnorm_batched(&x, &weights.final_norm, &normed, b, dim, rms_eps).map_err(|e| format!("glimmer prefill final rmsnorm: {e:?}"))?;
+            let last_norm = normed.sub_offset((b - 1) * dim, dim);
+            weight_gemv(gpu, &weights.lm_head, &last_norm, &state.logits)
+                .map_err(|e| format!("glimmer prefill lm_head: {e}"))?;
+            if cfg.output_multiplier != 1.0 && !abl("HIPFIRE_GLIMMER_NO_OUTMUL") {
+                gpu.scale_f32(&state.logits, cfg.output_multiplier).map_err(|e| format!("glimmer prefill outmul: {e:?}"))?;
+            }
+            if cfg.final_logit_softcapping > 0.0 && !abl("HIPFIRE_GLIMMER_NO_SOFTCAP") {
+                gpu.logit_softcap_f32(&state.logits, cfg.vocab_size, cfg.final_logit_softcapping).map_err(|e| format!("glimmer prefill softcap: {e:?}"))?;
+            }
+            gpu.download_f32(&state.logits).map_err(|e| format!("glimmer prefill download logits: {e:?}"))
+        })();
         gpu.free_tensor(normed).ok();
-        Some(host)
+        Some(host_result?)
     } else { None };
 
-    // Free batched scratch
+    Ok(last_logits)
+    })();
+
+    // Free batched scratch on EVERY path — success, `?`, or the early `return Err` in the
+    // embedding match. This is the single release site the closure above exists to reach.
     for t in [x, residual, nrm, x_rot, q, k, v, attn_gate, attn_out, o_rot, o_out, gate_ffn, up_ffn, ffn_hidden, ffn_out, down_rot, pos_array] {
         gpu.free_tensor(t).ok();
     }
 
-    Ok(last_logits)
+    body_result
 }
 
 /// Chunked batched prefill entry point. Processes `prompt` in chunks of
