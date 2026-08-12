@@ -201,15 +201,33 @@ impl HfqFile {
         }
 
         let base = base_offset as usize;
-        assert!(
-            base + 32 <= mmap.len(),
-            "HfqFile::open_at_offset: base ({base}) + 32 > file size ({}); not enough bytes for header",
-            mmap.len(),
-        );
+        let file_len = mmap.len();
+        // A truncated or corrupt container must surface as an error instead of
+        // panicking on an out-of-bounds slice: open_at_offset advertises a
+        // fallible signature, so malformed input is an `Err`, not a panic (#578).
+        let need = |end: usize, what: &str| -> std::io::Result<()> {
+            if end > file_len {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "HfqFile: truncated or corrupt HFQ container: reading {what} \
+                         needs {end} bytes but the file is only {file_len}"
+                    ),
+                ))
+            } else {
+                Ok(())
+            }
+        };
+        need(base + 32, "the 32-byte header")?;
 
         // Parse header (32 bytes) at base offset.
         let magic = &mmap[base..base + 4];
-        assert_eq!(magic, b"HFQM", "Not an HFQ container at offset {base}");
+        if magic != b"HFQM" {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("HfqFile: not an HFQ container at offset {base}"),
+            ));
+        }
         let _version = u32::from_le_bytes(mmap[base + 4..base + 8].try_into().unwrap());
         let arch_id = u32::from_le_bytes(mmap[base + 8..base + 12].try_into().unwrap());
         let n_tensors = u32::from_le_bytes(mmap[base + 12..base + 16].try_into().unwrap()) as usize;
@@ -219,6 +237,17 @@ impl HfqFile {
             u64::from_le_bytes(mmap[base + 16..base + 24].try_into().unwrap()) as usize + base;
         let data_offset =
             u64::from_le_bytes(mmap[base + 24..base + 32].try_into().unwrap()) as usize + base;
+        // Guard the metadata slice below: a truncated/corrupt container can hold
+        // offsets that overrun the file or cross over each other (#578).
+        if metadata_offset > data_offset || data_offset > file_len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "HfqFile: invalid metadata/data offsets ({metadata_offset}, {data_offset}) \
+                     for a {file_len}-byte file"
+                ),
+            ));
+        }
 
         // Read metadata JSON
         // Metadata ends at the tensor index, which starts right after metadata
@@ -285,8 +314,16 @@ impl HfqFile {
 
         // Parse tensor index (follows metadata JSON)
         let mut pos = metadata_offset + json_end;
+        need(pos + 4, "the tensor-index count")?;
         let idx_n = u32::from_le_bytes(mmap[pos..pos + 4].try_into().unwrap()) as usize;
-        assert_eq!(idx_n, n_tensors);
+        if idx_n != n_tensors {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "HfqFile: tensor-index count {idx_n} does not match header count {n_tensors}"
+                ),
+            ));
+        }
         pos += 4;
 
         let mut tensors = Vec::with_capacity(n_tensors);
@@ -294,19 +331,24 @@ impl HfqFile {
         let mut cumulative_offset = data_offset;
 
         for i in 0..n_tensors {
+            need(pos + 2, "a tensor name length")?;
             let name_len = u16::from_le_bytes(mmap[pos..pos + 2].try_into().unwrap()) as usize;
             pos += 2;
+            need(pos + name_len, "a tensor name")?;
             let name = String::from_utf8_lossy(&mmap[pos..pos + name_len]).to_string();
             pos += name_len;
+            need(pos + 2, "a tensor quant type and dimension count")?;
             let quant_type = mmap[pos];
             pos += 1;
             let n_dims = mmap[pos] as usize;
             pos += 1;
+            need(pos + n_dims * 4, "a tensor shape")?;
             let mut shape = Vec::with_capacity(n_dims);
             for _ in 0..n_dims {
                 shape.push(u32::from_le_bytes(mmap[pos..pos + 4].try_into().unwrap()));
                 pos += 4;
             }
+            need(pos + 12, "a tensor group and data size")?;
             let group_size = u32::from_le_bytes(mmap[pos..pos + 4].try_into().unwrap());
             pos += 4;
             let data_size = u64::from_le_bytes(mmap[pos..pos + 8].try_into().unwrap()) as usize;
@@ -1796,6 +1838,49 @@ mod overlay_tests {
             f.write_all(data).unwrap();
         }
         f.flush().unwrap();
+    }
+
+    #[test]
+    fn truncated_container_errors_instead_of_panicking() {
+        // #578: open_at_offset advertises `io::Result` but used to panic on an
+        // out-of-bounds slice for a truncated/corrupt container. Every prefix of
+        // a valid container that lands in the header/metadata/index region (i.e.
+        // below the 4096-aligned data region, which open does not read) must now
+        // return Err rather than panic.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.hfq");
+        write_min_hfq(&path, 9, &[("A", 3, &[2, 4], &vec![1u8; 8])]);
+
+        // Sanity: the full, valid container opens.
+        assert!(HfqFile::open_at_offset(&path, 0).is_ok());
+
+        let full = std::fs::read(&path).unwrap();
+        for len in [0usize, 4, 16, 31, 32, 34, 40, 100, 2048, 4095] {
+            let p = dir.path().join(format!("trunc_{len}.hfq"));
+            std::fs::write(&p, &full[..len]).unwrap();
+            assert!(
+                HfqFile::open_at_offset(&p, 0).is_err(),
+                "truncating to {len} bytes should error, not panic"
+            );
+        }
+
+        // A header-valid container whose tensor-index name length runs past the
+        // end of the file must also error (exercises the index-loop bounds check
+        // rather than the header/offset guards).
+        let mut crafted = Vec::new();
+        crafted.extend_from_slice(b"HFQM");
+        crafted.extend_from_slice(&1u32.to_le_bytes()); // version
+        crafted.extend_from_slice(&9u32.to_le_bytes()); // arch_id
+        crafted.extend_from_slice(&1u32.to_le_bytes()); // n_tensors
+        crafted.extend_from_slice(&32u64.to_le_bytes()); // metadata_offset
+        crafted.extend_from_slice(&40u64.to_le_bytes()); // data_offset (== file len)
+        crafted.extend_from_slice(b"{}"); // metadata JSON (offsets 32..34)
+        crafted.extend_from_slice(&1u32.to_le_bytes()); // index tensor count (34..38)
+        crafted.extend_from_slice(&9999u16.to_le_bytes()); // name_len past EOF (38..40)
+        assert_eq!(crafted.len(), 40);
+        let cpath = dir.path().join("bad_namelen.hfq");
+        std::fs::write(&cpath, &crafted).unwrap();
+        assert!(HfqFile::open_at_offset(&cpath, 0).is_err());
     }
 
     // Env vars are process-global. `HfqFile::open` READS `HIPFIRE_REAP_PLAN`
