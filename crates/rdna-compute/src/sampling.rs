@@ -416,13 +416,14 @@ impl Gpu {
             }
         }
 
-        // The top-21 reducer uses a different internal order but accepts its
-        // result only when the ordering is provably unambiguous. A sentinel
-        // falls through to the exact reducer below. The penalty prepass has
-        // already run exactly once for both outcomes.
+        // Fast-stable reducer: TOP_K is request_cap+1 so the last slot is the
+        // tie-boundary sentinel. Different internal order is accepted only when
+        // ordering is provably unambiguous; token_id==u32::MAX falls through to
+        // the exact reducer below. Penalty already ran exactly once for both.
+        // width 21 covers top_k<=20; width 65 covers 21..=64 (vocab-guarded).
         if sample_fast_stable_enabled()
             && top_k_req > 0
-            && top_k_req <= 20
+            && top_k_req <= 64
             && vocab_size <= N_BLOCKS as usize * 256 * 16
         {
             if let Some(result) = self.sample_top_p_fast_stable_impl(
@@ -512,10 +513,12 @@ impl Gpu {
         Ok((token_id, new_rng))
     }
 
-    /// Fast top-21 reducer for the common top_k<=20 path. Any requested penalty
-    /// is applied by the caller before entry. Returns `None` when the kernel
-    /// detects a probability tie whose stable ordering could differ from the
-    /// legacy reduction; the caller then runs legacy on the same adjusted logits.
+    /// Fast-stable top-k+1 reducer. Selects width 21 for top_k_req<=20 and
+    /// width 65 for 21..=64; the extra candidate is the tie-boundary sentinel.
+    /// Any requested penalty is applied by the caller before entry. Returns
+    /// `None` when the kernel detects a probability tie whose stable ordering
+    /// could differ from the legacy reduction; the caller then runs legacy on
+    /// the same adjusted logits.
     #[allow(clippy::too_many_arguments)]
     fn sample_top_p_fast_stable_impl(
         &mut self,
@@ -529,29 +532,42 @@ impl Gpu {
         min_p_val: f32,
     ) -> HipResult<Option<(u32, u32)>> {
         const N_BLOCKS: u32 = 128;
-        const TOP_K: usize = 21;
         const PARTIAL_BLOCK: u32 = 256;
         const FINALIZE_BLOCK: u32 = 128;
-        const FN_PARTIAL: &str = "sample_topk_partial_fast21";
-        const FN_FINALIZE: &str = "sample_topk_finalize_fast21";
+        // TOP_K = request_cap + 1 (boundary sentinel). Narrow path stays at 21
+        // so top_k<=20 remains byte-identical; wide path uses 65 for 21..=64.
+        let top_k_width: usize = if top_k_req <= 20 { 21 } else { 65 };
+        let (module, fn_penalty, fn_partial, fn_finalize) = if top_k_width == 21 {
+            (
+                "sample_top_p_parallel_fast21",
+                "sample_apply_repeat_penalty_fast21",
+                "sample_topk_partial_fast21",
+                "sample_topk_finalize_fast21",
+            )
+        } else {
+            (
+                "sample_top_p_parallel_fast65",
+                "sample_apply_repeat_penalty_fast65",
+                "sample_topk_partial_fast65",
+                "sample_topk_finalize_fast65",
+            )
+        };
 
-        if !self.functions.contains_key(FN_PARTIAL) || !self.functions.contains_key(FN_FINALIZE) {
+        if !self.functions.contains_key(fn_partial) || !self.functions.contains_key(fn_finalize) {
+            let top_k_define = format!(
+                "#define TOP_K {}\n#define SAMPLE_FAST_STABLE 1",
+                top_k_width
+            );
             let src = kernels::SAMPLE_TOP_P_PARALLEL_SRC
-                .replace(
-                    "#define TOP_K 64",
-                    "#define TOP_K 21\n#define SAMPLE_FAST_STABLE 1",
-                )
-                .replace(
-                    "sample_apply_repeat_penalty",
-                    "sample_apply_repeat_penalty_fast21",
-                )
-                .replace("sample_topk_partial", FN_PARTIAL)
-                .replace("sample_topk_finalize", FN_FINALIZE);
-            self.ensure_kernel("sample_top_p_parallel_fast21", &src, FN_PARTIAL)?;
-            self.ensure_kernel("sample_top_p_parallel_fast21", &src, FN_FINALIZE)?;
+                .replace("#define TOP_K 64", &top_k_define)
+                .replace("sample_apply_repeat_penalty", fn_penalty)
+                .replace("sample_topk_partial", fn_partial)
+                .replace("sample_topk_finalize", fn_finalize);
+            self.ensure_kernel(module, &src, fn_partial)?;
+            self.ensure_kernel(module, &src, fn_finalize)?;
         }
 
-        let n_cand = N_BLOCKS as usize * TOP_K;
+        let n_cand = N_BLOCKS as usize * top_k_width;
         let val_bytes = n_cand * 4;
         let partial_base = self
             .scratch
@@ -581,12 +597,13 @@ impl Gpu {
                 &mut pval as *mut _ as *mut c_void,
                 &mut pidx as *mut _ as *mut c_void,
             ];
-            let func = &self.functions[FN_PARTIAL];
+            let func = &self.functions[fn_partial];
             unsafe {
                 self.hip.launch_kernel(
                     func,
                     [N_BLOCKS, 1, 1],
                     [PARTIAL_BLOCK, 1, 1],
+                    // 2048B LDS: PARTIAL_BLOCK * 4 * 2
                     PARTIAL_BLOCK * 4 * 2,
                     self.stream_ref(),
                     &mut params,
@@ -605,12 +622,13 @@ impl Gpu {
                 &mut tk as *mut _ as *mut c_void,
                 &mut mp as *mut _ as *mut c_void,
             ];
-            let func = &self.functions[FN_FINALIZE];
+            let func = &self.functions[fn_finalize];
             unsafe {
                 self.hip.launch_kernel(
                     func,
                     [1, 1, 1],
                     [FINALIZE_BLOCK, 1, 1],
+                    // 1536B LDS: FINALIZE_BLOCK * 4 * 3
                     FINALIZE_BLOCK * 4 * 3,
                     self.stream_ref(),
                     &mut params,
