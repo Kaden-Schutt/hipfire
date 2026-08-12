@@ -174,7 +174,7 @@ impl Eviction {
 /// Per-turn token cache for V4F prefix-cache stability.
 pub struct AsstTurnCache {
     cap: Option<usize>,
-    map: std::collections::HashMap<u64, Vec<u32>>,
+    map: std::collections::HashMap<u64, hipfire_runtime::prompt_frame::CachedAssistantTurn>,
     order: std::collections::VecDeque<u64>,
 }
 
@@ -212,7 +212,7 @@ impl AsstTurnCache {
         self.map.contains_key(fp)
     }
 
-    pub fn get(&mut self, fp: &u64) -> Option<&Vec<u32>> {
+    pub fn get(&mut self, fp: &u64) -> Option<&hipfire_runtime::prompt_frame::CachedAssistantTurn> {
         if self.map.contains_key(fp) {
             self.touch_mru(*fp);
             self.map.get(fp)
@@ -221,9 +221,9 @@ impl AsstTurnCache {
         }
     }
 
-    pub fn insert(&mut self, fp: u64, tokens: Vec<u32>) {
+    pub fn insert(&mut self, fp: u64, turn: hipfire_runtime::prompt_frame::CachedAssistantTurn) {
         if self.map.contains_key(&fp) {
-            self.map.insert(fp, tokens);
+            self.map.insert(fp, turn);
             self.touch_mru(fp);
             return;
         }
@@ -236,7 +236,7 @@ impl AsstTurnCache {
                 }
             }
         }
-        self.map.insert(fp, tokens);
+        self.map.insert(fp, turn);
         self.order.push_back(fp);
     }
 
@@ -469,18 +469,6 @@ pub struct LoadedModel {
     pub eviction: Option<Eviction>,
     pub kv_adaptive: Option<hipfire_runtime::kv_adaptive::KvAdaptive>,
     pub conversation_tokens: Vec<u32>,
-    /// Number of leading `conversation_tokens` whose KV was written by the
-    /// BATCHED PREFILL path, as opposed to by per-token decode.
-    ///
-    /// Glimmer's prefix cache may only reuse this prefix. Prefill and decode
-    /// write KV with different kernels (batched WMMA attention vs the SWA /
-    /// flash decode path), so a position written by decode does not reproduce
-    /// what a cold prefill would put there. Reusing past this boundary was
-    /// measured to change the model's continuation, not merely its last bits:
-    /// with lcp=59 against a 58-token prompt, turn 1 answered from the top of
-    /// the conversation instead of from the current user message.
-    pub glimmer_prefill_boundary: usize,
-
     pub prefill_checkpoints: Vec<(usize, DeltaNetSnapshot)>,
     pub dflash_checkpoints: Vec<(usize, DeltaNetSnapshot)>,
     pub asst_turn_cache: AsstTurnCache,
@@ -557,7 +545,6 @@ impl LoadedModel {
             eviction: None,
             kv_adaptive: None,
             conversation_tokens: Vec::new(),
-            glimmer_prefill_boundary: 0,
             asst_turn_cache: AsstTurnCache::new_from_env(),
             prefill_checkpoints: Vec::new(),
             dflash_checkpoints: Vec::new(),
@@ -784,6 +771,79 @@ fn resolve_chat_template(hfq: &HfqFile, model_path: &str) -> Option<String> {
         _ => {}
     }
     hfq.chat_template()
+}
+
+/// Rewrite the Onyx/Harmony chat template for Muse Glimmer (arch 14) so
+/// its tool accessors match the flat `prompt_frame::ToolCall` (`tc.name`,
+/// `tc.arguments`) and so a spliced cached tool body (`tc.rendered_body`)
+/// replaces the regenerated ATEM text. Validates substitution counts and
+/// fails loudly on upstream drift (a silent miss would revive the present
+/// bug where the whole render raises and falls back to a bare unframed
+/// prompt).
+pub fn rewrite_muse_glimmer_onyx_template(template: &str) -> Result<String, String> {
+    // Validate and count upstream accessor forms before mutating.
+    let name_count = template.matches("tc.function.name").count();
+    if name_count != 3 {
+        return Err(format!(
+            "muse_glimmer Onyx template rewrite: expected 3 occurrences of `tc.function.name`, found {name_count}; upstream template drift?"
+        ));
+    }
+    let args_count = template.matches("tc.function.arguments").count();
+    if args_count != 1 {
+        return Err(format!(
+            "muse_glimmer Onyx template rewrite: expected 1 occurrence of `tc.function.arguments`, found {args_count}; upstream template drift?"
+        ));
+    }
+    let header = "{%- macro render_atem(tc) -%}";
+    let header_count = template.matches(header).count();
+    if header_count != 1 {
+        return Err(format!(
+            "muse_glimmer Onyx template rewrite: expected 1 `render_atem` header, found {header_count}; upstream template drift?"
+        ));
+    }
+    let tail = "{{- '</atem:invoke>\\n</atem:function_calls>' -}}{%- endmacro -%}";
+    let tail_count = template.matches(tail).count();
+    if tail_count != 2 {
+        return Err(format!(
+            "muse_glimmer Onyx template rewrite: expected 2 ATEM tails, found {tail_count}; upstream template drift?"
+        ));
+    }
+
+    // Flat accessors.
+    let mut out = template
+        .replace("tc.function.name", "tc.name")
+        .replace("tc.function.arguments", "tc.arguments");
+
+    // Verbatim splice branch: if a cached body was spliced as `rendered_body`,
+    // emit it directly, otherwise render the ATEM XML.
+    out = out.replacen(
+        header,
+        &format!(
+            "{}{}",
+            header,
+            "{%- if tc.rendered_body is defined and tc.rendered_body -%}{{- tc.rendered_body -}}{%- else -%}"
+        ),
+        1,
+    );
+    out = out.replacen(
+        tail,
+        "{{- '</atem:invoke>\\n</atem:function_calls>' -}}{%- endif -%}{%- endmacro -%}",
+        1,
+    );
+
+    // Post-condition: no leftover nested accessor, branch present.
+    if out.contains("tc.function.") {
+        return Err(
+            "muse_glimmer Onyx template rewrite: leftover `tc.function.` after rewrite".into(),
+        );
+    }
+    if !out.contains("tc.rendered_body") {
+        return Err(
+            "muse_glimmer Onyx template rewrite: missing `tc.rendered_body` branch after rewrite"
+                .into(),
+        );
+    }
+    Ok(out)
 }
 
 pub(crate) fn parse_state_quant(
@@ -2836,5 +2896,58 @@ mod registry_tests {
                 .count();
             assert_eq!(n, 0, "arch_id={id} (unassigned) should match no carrier");
         }
+    }
+
+    /// The Onyx/Harmony template exactly as Muse Glimmer's .hfq carries it, checked in so
+    /// the rewrite's substitution-count contract is pinned against the real artifact rather
+    /// than a hand-written approximation. If upstream republishes the template with a
+    /// different accessor shape, THIS TEST fails before a user ever sees a bare unframed
+    /// prompt at runtime.
+    const ONYX_TEMPLATE: &str =
+        include_str!("../../hipfire-runtime/templates/muse-glimmer-onyx.jinja");
+
+    #[test]
+    fn muse_glimmer_onyx_template_rewrite() {
+        use super::rewrite_muse_glimmer_onyx_template;
+
+        // The real carried template must rewrite cleanly.
+        let out = rewrite_muse_glimmer_onyx_template(ONYX_TEMPLATE)
+            .expect("the checked-in Onyx template must rewrite");
+
+        // Flat accessors: the runtime's `prompt_frame::ToolCall` is flat, so every
+        // `tc.function.*` dereference must be gone or the template's own
+        // `raise_exception` fires and the whole render falls back to a bare prompt.
+        assert_eq!(out.matches("tc.function.").count(), 0);
+        assert_eq!(
+            out.matches("tc.name").count(),
+            ONYX_TEMPLATE.matches("tc.function.name").count()
+        );
+        assert_eq!(
+            out.matches("tc.arguments").count(),
+            ONYX_TEMPLATE.matches("tc.function.arguments").count()
+        );
+
+        // The verbatim-splice branch must wrap `render_atem`'s body exactly once, so a
+        // cached tool body replaces the regenerated ATEM XML.
+        // `{%- if tc.rendered_body is defined and tc.rendered_body -%}{{- tc.rendered_body -}}`
+        assert_eq!(out.matches("tc.rendered_body").count(), 3);
+        assert!(out.contains("{%- if tc.rendered_body is defined and tc.rendered_body -%}"));
+        assert!(out.contains("{%- endif -%}{%- endmacro -%}"));
+
+        // Only `render_atem` is wrapped: `render_tool_defs` ends with a byte-identical
+        // ATEM tail, and wrapping that one too would corrupt the tool-definition preamble.
+        assert_eq!(
+            out.matches("{%- endif -%}{%- endmacro -%}").count(),
+            1,
+            "exactly one macro may be wrapped by the rendered_body branch"
+        );
+
+        // Upstream drift must fail LOUDLY rather than silently leaving nested accessors.
+        let missing = "{%- macro render_atem(tc) -%}hello{%- endmacro -%}";
+        let err = rewrite_muse_glimmer_onyx_template(missing).unwrap_err();
+        assert!(
+            err.contains("expected 3 occurrences"),
+            "unexpected error for drifted template: {err}"
+        );
     }
 }

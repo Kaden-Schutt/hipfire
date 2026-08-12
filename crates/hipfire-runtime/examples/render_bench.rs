@@ -113,6 +113,7 @@ fn main() {
         user,
         enable_thinking: true,
         bos_token: None,
+        reasoning_strength: None,
     };
     let mut j1: Vec<u64> = Vec::with_capacity(iters);
     let mut last_render_len = 0;

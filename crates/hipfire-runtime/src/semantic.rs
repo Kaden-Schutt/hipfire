@@ -462,8 +462,10 @@ mod tests {
 
     fn sample_call(name: &str) -> ToolCall {
         ToolCall {
+            id: None,
             name: name.to_string(),
             arguments: json!({"path": "/tmp/x"}),
+            rendered_body: None,
         }
     }
 

@@ -46,6 +46,7 @@ fn main() {
         user: &user,
         enable_thinking: think,
         bos_token: None,
+        reasoning_strength: None,
     };
     match frame.render() {
         Ok(s) => {

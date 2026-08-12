@@ -233,8 +233,10 @@ impl<'a> SpecEmit for Deepseek4Emit<'a> {
                 let held: Vec<ToolCall> = calls
                     .into_iter()
                     .map(|c| ToolCall {
+                        id: None,
                         name: c.name,
                         arguments: c.arguments,
+                        rendered_body: None,
                     })
                     .collect();
                 events.push(ClientEvent::ToolCalls(held));

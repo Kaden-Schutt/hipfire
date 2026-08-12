@@ -1886,6 +1886,10 @@ impl Carrier for MuseGlimmerCarrier {
                     ctx.max_seq,
                     ctx.spec,
                 );
+                let chat_template = match meta.chat_template {
+                    Some(t) => Some(crate::rewrite_muse_glimmer_onyx_template(&t)?),
+                    None => None,
+                };
                 Ok(LoadedModel {
                     state: Some(ModelState::MuseGlimmer(crate::MuseGlimmerBundle {
                         config,
@@ -1902,7 +1906,7 @@ impl Carrier for MuseGlimmerCarrier {
                         ctx.max_seq,
                         ctx.max_seq,
                         ctx.path.to_string(),
-                        meta.chat_template,
+                        chat_template,
                     )
                 })
             }

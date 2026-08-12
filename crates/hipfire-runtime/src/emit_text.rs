@@ -608,11 +608,21 @@ fn parse_strict_tool_call_body(body_raw: &str) -> Option<crate::prompt_frame::To
             .get("arguments")
             .cloned()
             .unwrap_or(serde_json::Value::Object(Default::default()));
-        return Some(crate::prompt_frame::ToolCall { name, arguments });
+        return Some(crate::prompt_frame::ToolCall {
+            id: None,
+            name,
+            arguments,
+            rendered_body: None,
+        });
     }
     // Form 3: fully valid Qwen XML (requires </function>, fully consumed params).
     if let Some((name, arguments)) = extract_qwen_xml_tool_call_strict(body) {
-        return Some(crate::prompt_frame::ToolCall { name, arguments });
+        return Some(crate::prompt_frame::ToolCall {
+            id: None,
+            name,
+            arguments,
+            rendered_body: None,
+        });
     }
     None
 }
@@ -665,7 +675,12 @@ fn parse_one_tool_call_body(body_raw: &str) -> Option<crate::prompt_frame::ToolC
             // else: truncated mid-args — unrecoverable.
         }
     }
-    parsed.map(|(name, arguments)| crate::prompt_frame::ToolCall { name, arguments })
+    parsed.map(|(name, arguments)| crate::prompt_frame::ToolCall {
+        id: None,
+        name,
+        arguments,
+        rendered_body: None,
+    })
 }
 
 fn strip_chatml_leakage(body_raw: &str) -> String {

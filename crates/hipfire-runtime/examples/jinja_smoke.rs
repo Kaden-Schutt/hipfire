@@ -58,6 +58,9 @@ fn build_messages(scenario: Scenario) -> (Vec<Message>, Vec<serde_json::Value>) 
                 Message {
                     role: Role::System,
                     content: "You are a careful reasoner. If the user's question is contradictory, ambiguous, or self-referential, identify the contradiction explicitly before answering.".into(),
+                    reasoning_content: None,
+                    name: None,
+                    rendered_name: None,
                     tool_calls: vec![],
                     tool_call_id: None,
                     tool_plan: String::new(),
@@ -65,6 +68,9 @@ fn build_messages(scenario: Scenario) -> (Vec<Message>, Vec<serde_json::Value>) 
                 Message {
                     role: Role::User,
                     content: "I am lying. The previous statement is true. Which of the two is the lie? Explain by listing the assumptions you have to make to answer, then commit to one.".into(),
+                    reasoning_content: None,
+                    name: None,
+                    rendered_name: None,
                     tool_calls: vec![],
                     tool_call_id: None,
                     tool_plan: String::new(),
@@ -77,6 +83,9 @@ fn build_messages(scenario: Scenario) -> (Vec<Message>, Vec<serde_json::Value>) 
                 Message {
                     role: Role::System,
                     content: "You are a senior systems engineer. Answer concisely with concrete code where applicable.".into(),
+                    reasoning_content: None,
+                    name: None,
+                    rendered_name: None,
                     tool_calls: vec![],
                     tool_call_id: None,
                     tool_plan: String::new(),
@@ -84,6 +93,9 @@ fn build_messages(scenario: Scenario) -> (Vec<Message>, Vec<serde_json::Value>) 
                 Message {
                     role: Role::User,
                     content: "Write a Rust async function that fans out 1000 concurrent HTTPS GETs against an arbitrary URL list, caps in-flight at 32, retries on 5xx with exponential backoff capped at 30s, and aggregates response sizes. No external crates beyond `tokio`, `reqwest`, `futures`. Provide complete code that compiles.".into(),
+                    reasoning_content: None,
+                    name: None,
+                    rendered_name: None,
                     tool_calls: vec![],
                     tool_call_id: None,
                     tool_plan: String::new(),
@@ -122,6 +134,9 @@ fn build_messages(scenario: Scenario) -> (Vec<Message>, Vec<serde_json::Value>) 
                 Message {
                     role: Role::System,
                     content: "You are a travel concierge. Use the available tools to answer user questions about cities.".into(),
+                    reasoning_content: None,
+                    name: None,
+                    rendered_name: None,
                     tool_calls: vec![],
                     tool_call_id: None,
                     tool_plan: String::new(),
@@ -129,6 +144,9 @@ fn build_messages(scenario: Scenario) -> (Vec<Message>, Vec<serde_json::Value>) 
                 Message {
                     role: Role::User,
                     content: "What's the capital of France?".into(),
+                    reasoning_content: None,
+                    name: None,
+                    rendered_name: None,
                     tool_calls: vec![],
                     tool_call_id: None,
                     tool_plan: String::new(),
@@ -136,6 +154,9 @@ fn build_messages(scenario: Scenario) -> (Vec<Message>, Vec<serde_json::Value>) 
                 Message {
                     role: Role::Assistant,
                     content: "The capital of France is Paris.".into(),
+                    reasoning_content: None,
+                    name: None,
+                    rendered_name: None,
                     tool_calls: vec![],
                     tool_call_id: None,
                     tool_plan: String::new(),
@@ -143,6 +164,9 @@ fn build_messages(scenario: Scenario) -> (Vec<Message>, Vec<serde_json::Value>) 
                 Message {
                     role: Role::User,
                     content: "List 3 famous landmarks there using the list_landmarks tool, and also fetch its population.".into(),
+                    reasoning_content: None,
+                    name: None,
+                    rendered_name: None,
                     tool_calls: vec![],
                     tool_call_id: None,
                     tool_plan: String::new(),
@@ -150,10 +174,15 @@ fn build_messages(scenario: Scenario) -> (Vec<Message>, Vec<serde_json::Value>) 
                 Message {
                     role: Role::Assistant,
                     content: "I'll fetch both.".into(),
+                    reasoning_content: None,
+                    name: None,
+                    rendered_name: None,
                     tool_calls: vec![
                         ToolCall {
+                            id: None,
                             name: "list_landmarks".into(),
                             arguments: json!({ "city": "Paris" }),
+                            rendered_body: None,
                         },
                     ],
                     tool_call_id: None,
@@ -162,6 +191,9 @@ fn build_messages(scenario: Scenario) -> (Vec<Message>, Vec<serde_json::Value>) 
                 Message {
                     role: Role::Tool,
                     content: "Eiffel Tower\nLouvre Museum\nNotre-Dame Cathedral".into(),
+                    reasoning_content: None,
+                    name: None,
+                    rendered_name: None,
                     tool_call_id: Some("call_landmarks_paris".into()),
                     tool_plan: String::new(),
                     tool_calls: vec![],
@@ -257,6 +289,7 @@ fn main() {
         user: "",
         enable_thinking,
         bos_token: None,
+        reasoning_strength: None,
     };
 
     let t_render = Instant::now();

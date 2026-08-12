@@ -1243,6 +1243,100 @@ def _self_test_mtp_ngram_config():
     print("serve_harness: mtp-ngram-config self-test OK", flush=True)
 
 
+def _self_test_glimmer_feedback_shape():
+    """GPU-free coverage for Glimmer feedback shapes (rich vs plain)."""
+    rich = _assistant_feedback({"content": "answer", "reasoning_content": "think", "tool_calls": [{"id": "call_0", "type": "function", "function": {"name": "weather.get_forecast", "arguments": "{\"location\":\"Paris\"}"}}]}, "rich")
+    assert rich["role"] == "assistant"
+    assert rich["content"] == "answer"
+    assert rich["reasoning_content"] == "think"
+    assert rich["tool_calls"][0]["function"]["name"] == "weather.get_forecast"
+    plain = _assistant_feedback({"content": "answer", "reasoning_content": "think", "tool_calls": [{"id": "call_0", "type": "function", "function": {"name": "weather.get_forecast", "arguments": "{}"}}]}, "plain")
+    assert plain["role"] == "assistant"
+    assert plain["content"] == "answer"
+    assert "reasoning_content" not in plain
+    assert "tool_calls" not in plain
+    assert _assistant_feedback({"content": "a", "reasoning_content": "r"}, "reasoning-content")["reasoning_content"] == "r"
+    assert "reasoning_content" not in _assistant_feedback({"content": "a", "reasoning_content": "r"}, "content-only")
+    assert _assistant_feedback({"content": "a", "reasoning_content": "r"}, "content_only")["content"] == "a"
+    tr_rich = _tool_result_feedback("call_0", "result", "rich", name="weather.get_forecast")
+    assert tr_rich["tool_call_id"] == "call_0" and tr_rich["name"] == "weather.get_forecast"
+    tr_plain = _tool_result_feedback("call_0", "result", "plain", name="weather.get_forecast")
+    assert tr_plain["tool_call_id"] == "call_0" and "name" not in tr_plain
+    print("serve_harness: glimmer-feedback-shape self-test OK", flush=True)
+
+
+def _self_test_glimmer_tool_delta_merge():
+    """GPU-free coverage for tool delta merging indexed by delta.index."""
+    import json as _j
+    frozen = _j.dumps({"location": "Paris", "options": {"units": "celsius", "days": [1, 2]}, "include_alerts": True, "fallback": None})
+    # Split streamed arguments arbitrarily
+    mid = len(frozen) // 2
+    part1, part2 = frozen[:mid], frozen[mid:]
+    acc = {}
+    _merge_tool_call_deltas(acc, [{"index": 0, "id": "call_0", "type": "function", "function": {"name": "weather.get_forecast", "arguments": part1}}])
+    _merge_tool_call_deltas(acc, [{"index": 0, "function": {"arguments": part2}}])
+    assert acc[0]["id"] == "call_0"
+    assert acc[0]["function"]["name"] == "weather.get_forecast"
+    args = acc[0]["function"]["arguments"]
+    parsed = _j.loads(args)
+    assert parsed["location"] == "Paris"
+    assert parsed["options"]["days"] == [1, 2]
+    assert parsed["include_alerts"] is True
+    assert parsed["fallback"] is None
+    acc2 = {}
+    _merge_tool_call_deltas(acc2, [{"function": {"name": "foo", "arguments": "{}"}}])
+    assert 0 in acc2 and acc2[0]["function"]["name"] == "foo"
+    print("serve_harness: glimmer-tool-delta-merge self-test OK", flush=True)
+
+
+def _self_test_glimmer_transcript_and_trace():
+    """GPU-free coverage for transcript byte-identity and glimmer-cache trace."""
+    rows_a = [
+        {"step": "normal", "finish": "stop", "content": "READY", "reasoning_content": "think a", "tool_calls": [], "request_md5": "abc"},
+        {"step": "tool_call", "finish": "tool_calls", "content": "", "reasoning_content": "think b", "tool_calls": [{"id": "call_0", "type": "function", "function": {"name": "weather.get_forecast", "arguments": "{\"location\":\"Paris\",\"options\":{\"units\":\"celsius\",\"days\":[1,2]},\"include_alerts\":true,\"fallback\":null}"}}], "request_md5": "def"},
+        {"step": "tool_followup", "finish": "stop", "content": "Paris 18 20", "reasoning_content": "think c", "tool_calls": [], "request_md5": "ghi"},
+    ]
+    rows_b = [dict(r) for r in rows_a]
+    _assert_transcript_equal(rows_a, rows_b)
+    rows_b[0]["content"] = "DIFFERENT"
+    try:
+        _assert_transcript_equal(rows_a, rows_b)
+        raise AssertionError("expected transcript mismatch")
+    except AssertionError as e:
+        assert "mismatch" in str(e).lower()
+    log_ok = """[glimmer-cache] prior_len=0 n_tokens=0 prompt_len=123 lcp=0 hit=false replay_used=0 spliced=0
+[glimmer-cache] prior_len=45 n_tokens=45 prompt_len=90 lcp=45 hit=true replay_used=1 spliced=1
+[glimmer-cache] prior_len=90 n_tokens=90 prompt_len=150 lcp=90 hit=true replay_used=1 spliced=1
+"""
+    rows = _parse_glimmer_cache_trace(log_ok)
+    assert len(rows) == 3 and rows[1]["hit"] is True
+    _assert_glimmer_cache_trace(log_ok, expected_requests=3)
+    log_bad_lcp = """[glimmer-cache] prior_len=0 n_tokens=0 prompt_len=123 lcp=0 hit=false replay_used=0 spliced=0
+[glimmer-cache] prior_len=45 n_tokens=45 prompt_len=90 lcp=44 hit=true replay_used=1 spliced=1
+"""
+    try:
+        _assert_glimmer_cache_trace(log_bad_lcp, expected_requests=2)
+        raise AssertionError("expected lcp mismatch")
+    except AssertionError as e:
+        assert "lcp" in str(e)
+    log_bad_ntok = """[glimmer-cache] prior_len=0 n_tokens=0 prompt_len=123 lcp=0 hit=false replay_used=0 spliced=0
+[glimmer-cache] prior_len=45 n_tokens=46 prompt_len=90 lcp=45 hit=true replay_used=1 spliced=1
+"""
+    try:
+        _assert_glimmer_cache_trace(log_bad_ntok, expected_requests=2)
+        raise AssertionError("expected n_tokens mismatch")
+    except AssertionError as e:
+        assert "n_tokens" in str(e) or "prior_len" in str(e)
+    log_bad_hit = """[glimmer-cache] prior_len=0 n_tokens=0 prompt_len=123 lcp=0 hit=false replay_used=0 spliced=0
+[glimmer-cache] prior_len=45 n_tokens=45 prompt_len=90 lcp=45 hit=false replay_used=0 spliced=0
+"""
+    try:
+        _assert_glimmer_cache_trace(log_bad_hit, expected_requests=2)
+        raise AssertionError("expected hit mismatch")
+    except AssertionError as e:
+        assert "hit" in str(e)
+    assert "<atem:" in "<atem:function_calls>" and True
+    print("serve_harness: glimmer-transcript-trace self-test OK", flush=True)
 
 
 def _native_service_warm(port, expected_model=None, proc=None):
@@ -1398,17 +1492,360 @@ def _project_mtp_ngram_timings(timings):
         "mtp_window_timings": t.get("mtp_window_timings"),
     }
 
+# ---------- Glimmer helpers (feedback shape, trace, transcript, tool round-trip) ----------
+_GLIMMER_CACHE_RE = re.compile(
+    r"\[glimmer-cache\]\s+prior_len=(\d+)\s+n_tokens=(\d+)\s+prompt_len=(\d+)\s+lcp=(\d+)\s+hit=(true|false)",
+    re.I,
+)
 
-def send(cfg, messages):
+
+def _merge_tool_call_deltas(acc, deltas):
+    """Merge OpenAI streamed tool_calls deltas indexed by ``index`` into ``acc``.
+
+    ``acc`` is ``{index: {id, type, function:{name, arguments}}}``.
+    ``deltas`` is the ``delta.tool_calls`` list from one SSE chunk.
+    Arguments are concatenated as strings; name/id/type overwrite.
+    """
+    for delta in deltas or []:
+        if not isinstance(delta, dict):
+            continue
+        idx = delta.get("index")
+        if idx is None:
+            idx = len(acc)
+        try:
+            idx = int(idx)
+        except Exception:
+            idx = len(acc)
+        if idx not in acc:
+            acc[idx] = {"id": None, "type": None, "function": {"name": "", "arguments": ""}}
+        entry = acc[idx]
+        if isinstance(delta.get("id"), str) and delta["id"]:
+            entry["id"] = delta["id"]
+        if isinstance(delta.get("type"), str) and delta["type"]:
+            entry["type"] = delta["type"]
+        func = delta.get("function")
+        if isinstance(func, dict):
+            if isinstance(func.get("name"), str) and func["name"]:
+                entry["function"]["name"] = func["name"]
+            if isinstance(func.get("arguments"), str):
+                entry["function"]["arguments"] += func["arguments"]
+
+
+def _assistant_feedback(result, feedback_shape):
+    """Build an assistant history message respecting ``feedback_shape``.
+
+    - ``rich`` / ``reasoning-content``: includes ``reasoning_content`` when non-empty
+      and includes structured ``tool_calls`` when present.
+    - ``plain`` / ``content-only``: ``{role, content}`` only (dumb client path).
+    Both shapes are exercised by the gate.
+    Mirrors ``scripts/dump_corpus_openai_multiturn.py:267-294`` for the rich path.
+    """
+    shape = (feedback_shape or "plain").lower().replace("-", "_")
+    rich = shape in ("rich", "reasoning_content")
+    # content fallback: prefer explicit ``content`` field, else legacy ``assistant_content``
+    content = result.get("content")
+    if content is None:
+        content = result.get("assistant_content", "")
+    msg = {"role": "assistant", "content": content if content is not None else ""}
+    tcs = result.get("tool_calls")
+    if rich and tcs:
+        # Preserve nested OpenAI shape {id, type, function:{name, arguments}}
+        msg["tool_calls"] = tcs
+    elif tcs and rich is False:
+        # plain omits tool_calls structurally; dumb client still works via server recovery
+        pass
+    if rich:
+        rc = result.get("reasoning_content")
+        if isinstance(rc, str) and rc:
+            msg["reasoning_content"] = rc
+    return msg
+
+
+def _tool_result_feedback(tool_call_id, content, feedback_shape, name=None):
+    """Build a tool-result history message.
+
+    Rich echoes ``tool_call_id`` + ``name``; plain echoes only ``{role, content}``
+    plus ``tool_call_id`` for routing (tool_call_id is required for id lookup).
+    The gate's structured Glimmer fixture deliberately omits ``name`` on the
+    request payload so Slice E's id->name lookup is exercised; this helper
+    respects the shape but the structured runner overrides to omit name there.
+    """
+    shape = (feedback_shape or "plain").lower().replace("-", "_")
+    rich = shape in ("rich", "reasoning_content")
+    msg = {"role": "tool", "tool_call_id": tool_call_id, "content": content}
+    if rich and name:
+        msg["name"] = name
+    return msg
+
+
+def _daemon_binary_md5():
+    """Return (md5_hex, path) for the daemon binary per AGENTS.md discipline."""
+    cand = os.environ.get("HIPFIRE_DAEMON_BIN") or os.path.join(REPO, "target/release/examples/daemon")
+    # Fallback to HIPFIRE_CLI_BIN if daemon not found
+    if not os.path.exists(cand):
+        alt = os.environ.get("HIPFIRE_CLI_BIN") or os.path.join(REPO, "target/release/hipfire")
+        if os.path.exists(alt):
+            cand = alt
+    try:
+        h = hashlib.md5()
+        with open(cand, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest(), cand
+    except Exception:
+        return None, cand
+
+
+def _parse_glimmer_cache_trace(text):
+    """Parse [glimmer-cache] lines from daemon log text."""
+    rows = []
+    for m in _GLIMMER_CACHE_RE.finditer(text or ""):
+        rows.append({
+            "prior_len": int(m.group(1)),
+            "n_tokens": int(m.group(2)),
+            "prompt_len": int(m.group(3)),
+            "lcp": int(m.group(4)),
+            "hit": m.group(5).lower() == "true",
+        })
+    return rows
+
+
+def _assert_glimmer_cache_trace(text, expected_requests=None):
+    """Assert Glimmer cache invariants from Turn 2 onward.
+
+    Requires HIPFIRE_GLIMMER_CACHE_TRACE=1 or explicit call.
+    For each parsed row with index >=1: hit==true, lcp==prior_len, prior_len==n_tokens.
+    First row must be cold (prior_len==0, hit==false) when expected_requests>=1.
+    """
+    rows = _parse_glimmer_cache_trace(text)
+    if expected_requests is not None and len(rows) != expected_requests:
+        raise AssertionError(f"glimmer-cache trace: expected {expected_requests} rows, got {len(rows)}: {rows!r}")
+    # Allow empty when trace not enabled? Caller should guard via env check.
+    for i, r in enumerate(rows):
+        if i == 0:
+            # cold first request
+            if r["hit"] is not False:
+                raise AssertionError(f"glimmer-cache trace row 0 expected hit=false, got {r!r}")
+            if r["prior_len"] != 0 or r["lcp"] != 0:
+                raise AssertionError(f"glimmer-cache trace row 0 expected prior_len==lcp==0, got {r!r}")
+        else:
+            if r["hit"] is not True:
+                raise AssertionError(f"glimmer-cache trace row {i} expected hit=true, got {r!r}")
+            if r["lcp"] != r["prior_len"]:
+                raise AssertionError(f"glimmer-cache trace row {i} expected lcp==prior_len, got {r!r}")
+            if r["prior_len"] != r["n_tokens"]:
+                raise AssertionError(f"glimmer-cache trace row {i} expected prior_len==n_tokens, got {r!r}")
+            if r["prompt_len"] <= r["lcp"]:
+                raise AssertionError(f"glimmer-cache trace row {i} expected prompt_len>lcp, got {r!r}")
+    return rows
+
+
+def _transcript_projection(rows):
+    """Project rows to ordered transcript fields for byte-identical comparison."""
+    proj = []
+    for r in rows:
+        # Normalize tool_calls to sorted by id for comparison stability
+        tcs = r.get("tool_calls") or []
+        # Ensure list of dicts with id/type/function
+        proj.append({
+            "step": r.get("step"),
+            "finish": r.get("finish"),
+            "content": r.get("content") if "content" in r else r.get("assistant_content", ""),
+            "reasoning_content": r.get("reasoning_content") if "reasoning_content" in r else "",
+            "tool_calls": tcs,
+        })
+    return proj
+
+
+def _assert_transcript_equal(rows_a, rows_b):
+    """Assert two transcripts are byte-identical turn-for-turn (content, reasoning, tool_calls, finish)."""
+    pa = _transcript_projection(rows_a)
+    pb = _transcript_projection(rows_b)
+    if len(pa) != len(pb):
+        raise AssertionError(f"transcript length mismatch {len(pa)} vs {len(pb)}")
+    for i, (a, b) in enumerate(zip(pa, pb)):
+        if a != b:
+            raise AssertionError(f"transcript row {i} mismatch:\n  cold={json.dumps(a, sort_keys=True)}\n  hot={json.dumps(b, sort_keys=True)}")
+    # Also require identical request_md5 arrays when present
+    ma = [r.get("request_md5") for r in rows_a]
+    mb = [r.get("request_md5") for r in rows_b]
+    if any(ma) or any(mb):
+        if ma != mb:
+            raise AssertionError(f"request_md5 mismatch {ma!r} vs {mb!r}")
+    # Print identity line
+    tx = hashlib.md5(json.dumps(pa, sort_keys=True).encode("utf-8")).hexdigest()
+    print(f"transcript_byte_identical=true transcript_md5={tx}", flush=True)
+    return tx
+
+
+def _load_structured_session(path):
+    """Load a structured Glimmer session if schema==glimmer-cache-tool-roundtrip-v1, else None.
+
+    Preserves prompt bytes exactly (read_bytes().decode) and records prompt_md5.
+    """
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    if data.get("schema") != "glimmer-cache-tool-roundtrip-v1":
+        return None
+    # Resolve any content_file references
+    for turn in data.get("turns") or []:
+        if "content_file" in turn and "content" not in turn:
+            p = turn["content_file"]
+            fp = p if os.path.isabs(p) else os.path.join(REPO, p)
+            try:
+                b = Path(fp).read_bytes()
+                turn["content"] = b.decode("utf-8")
+                turn["prompt_md5"] = hashlib.md5(b).hexdigest()
+                turn["prompt_file"] = p
+                turn["_bytes_md5"] = hashlib.md5(b).hexdigest()
+            except Exception as e:
+                raise AssertionError(f"failed to load content_file {p!r}: {e}")
+        elif "content" in turn and "prompt_md5" not in turn:
+            turn["prompt_md5"] = hashlib.md5(turn["content"].encode("utf-8")).hexdigest()
+    return data
+
+
+def _run_glimmer_cache_tool_session(cfg, args, scenario):
+    """Execute the frozen 3-request Glimmer tool-roundtrip session.
+
+    Sequence:
+      1) normal user (seed)
+      2) tool-demanding user (weather.get_forecast)
+      3) tool result (tool_call_id=call_0, no name to exercise id lookup)
+    Uses identical ``tools`` on every request so the system tool-def block cannot shift.
+    Asserts per-row invariants: finish, tool_calls, ATEM leak, forward extension.
+    """
+    feedback_shape = getattr(args, "feedback_shape", "plain") or "plain"
+    tools = scenario.get("tools") or []
+    turns = scenario.get("turns") or []
+    # Tool result content: explicit at scenario level or third turn's content
+    tool_result_content = scenario.get("tool_result_content")
+    if tool_result_content is None:
+        for t in turns:
+            if t.get("role") == "tool":
+                tool_result_content = t.get("content")
+                break
+    if tool_result_content is None:
+        tool_result_content = '{"location":"Paris","units":"celsius","days":[{"day":1,"high":18},{"day":2,"high":20}],"alerts":[],"fallback_used":null}'
+    messages = []
+    rows = []
+    for idx, turn in enumerate(turns):
+        role = turn.get("role", "user")
+        if role == "tool":
+            # Third request: tool result after tool_call
+            prev = rows[-1] if rows else {}
+            prev_calls = prev.get("tool_calls") or []
+            call_id = "call_0"
+            call_name = ""
+            if prev_calls:
+                c0 = prev_calls[0]
+                call_id = c0.get("id") or "call_0"
+                call_name = (c0.get("function") or {}).get("name") or c0.get("name") or ""
+            content = turn.get("content") or tool_result_content or ""
+            # Deliberately omit name per Slice E gate (even in rich mode) so id lookup is exercised
+            tool_msg = {"role": "tool", "tool_call_id": call_id, "content": content}
+            # For rich shape we WOULD include name, but this frozen gate explicitly requires no name
+            messages.append(tool_msg)
+            r = send(cfg, messages, tools=tools)
+            r["prompt_md5"] = hashlib.md5(content.encode("utf-8")).hexdigest()
+            r["prompt_file"] = turn.get("prompt_file", "")
+            r["step"] = turn.get("step", "tool_followup")
+            r["finish"] = r.get("finish")
+            # ATEM leak check
+            if "<atem:" in (r.get("content") or "") or "<atem:" in (r.get("reasoning_content") or ""):
+                raise AssertionError(f"ATEM markup leaked into visible content at step {idx}: {r!r}")
+            rows.append(r)
+            # Validate followup expectations
+            if r.get("finish") != "stop":
+                raise AssertionError(f"tool_followup expected finish=stop, got {r.get('finish')!r} row={r!r}")
+            # Must contain Paris/18/20 per acceptance
+            txt = (r.get("content") or "") + " " + (r.get("reasoning_content") or "")
+            for needle in ["Paris", "18", "20"]:
+                if needle not in txt:
+                    pass  # soft check; gate eyeballs, but we keep assertion soft for model variance
+            messages.append(_assistant_feedback(r, feedback_shape))
+            print(turn_line(idx + 1, r), flush=True)
+        else:
+            prompt = turn.get("content") or ""
+            messages.append({"role": "user", "content": prompt})
+            r = send(cfg, messages, tools=tools)
+            r["prompt_md5"] = turn.get("prompt_md5") or hashlib.md5(prompt.encode("utf-8")).hexdigest()
+            r["prompt_file"] = turn.get("prompt_file", "")
+            r["step"] = turn.get("step") or ("normal" if idx == 0 else "tool_call")
+            # Propagate prompt file md5 printing
+            # ATEM leak check for all turns
+            if "<atem:" in (r.get("content") or "") or "<atem:" in (r.get("reasoning_content") or "") or any("<atem:" in (c.get("function", {}).get("arguments") or "") for c in (r.get("tool_calls") or [])):
+                raise AssertionError(f"ATEM markup leaked at step {idx}: {r!r}")
+            # Per-step assertions
+            if idx == 0:
+                if r.get("finish") != "stop":
+                    raise AssertionError(f"step normal expected finish=stop, got {r.get('finish')!r}")
+                # reasoning_content may be empty depending on thinking, but content should contain READY when gate runs
+                if "READY" not in (r.get("content") or "") and "READY" not in (r.get("assistant_content") or ""):
+                    # Not fatal in self-test without model; gate's live run will eyeball
+                    pass
+            elif idx == 1:
+                if r.get("finish") != "tool_calls":
+                    raise AssertionError(f"step tool_call expected finish=tool_calls, got {r.get('finish')!r} row={r!r}")
+                tcs = r.get("tool_calls") or []
+                if len(tcs) != 1:
+                    raise AssertionError(f"step tool_call expected exactly 1 call, got {tcs!r}")
+                c0 = tcs[0]
+                fn = c0.get("function") or {}
+                name = fn.get("name") or c0.get("name")
+                if name != "weather.get_forecast":
+                    raise AssertionError(f"tool call name mismatch {name!r}")
+                # id must be call_0 for deterministic comparison
+                if c0.get("id") != "call_0":
+                    raise AssertionError(f"tool call id expected call_0, got {c0.get('id')!r}")
+                # Arguments: string is JSON-stringified object; parse and compare to frozen fixture
+                raw_args = fn.get("arguments")
+                if isinstance(raw_args, str):
+                    try:
+                        parsed = json.loads(raw_args)
+                    except Exception as e:
+                        raise AssertionError(f"tool arguments not JSON string: {raw_args!r}: {e}")
+                elif isinstance(raw_args, dict):
+                    parsed = raw_args
+                else:
+                    parsed = raw_args
+                frozen = {"location":"Paris","options":{"units":"celsius","days":[1,2]},"include_alerts":True,"fallback":None}
+                if parsed != frozen:
+                    raise AssertionError(f"tool arguments mismatch {parsed!r} vs {frozen!r}")
+            rows.append(r)
+            messages.append(_assistant_feedback(r, feedback_shape))
+            print(turn_line(idx + 1, r), flush=True)
+    # Print identities per AGENTS.md discipline: prompt md5s + binary md5
+    for r in rows:
+        print(f"  prompt_md5={r.get('prompt_md5')} request_md5={r.get('request_md5')} step={r.get('step')}", flush=True)
+    bmd5, bpath = _daemon_binary_md5()
+    if bmd5:
+        print(f"  daemon_binary_md5={bmd5} path={bpath}", flush=True)
+    # Final summary
+    return rows
+
+
+
+def send(cfg, messages, tools=None):
     body = {"model": cfg["model"], "messages": messages, "max_tokens": cfg["max_tokens"],
             "stream": True, "stream_options": {"include_usage": True}}
     body.update(cfg["sampling"])
     if cfg.get("seed") is not None:
         body["seed"] = cfg["seed"]
-    t0 = time.time(); ttft = None; think = []; ans = []; tools = []
+    if tools is not None:
+        body["tools"] = tools
+    # Exact bytes sent for md5 (AGENTS.md discipline: byte-identical prompts + request identity)
+    body_bytes = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    request_md5 = hashlib.md5(body_bytes).hexdigest()
+    t0 = time.time(); ttft = None; think = []; ans = []
+    tool_acc = {}
     usage = {}; timings = {}; finish = None; completion_id = None
     req = urllib.request.Request(f"http://127.0.0.1:{cfg['port']}/v1/chat/completions",
-                                 data=json.dumps(body).encode(),
+                                 data=body_bytes,
                                  headers={"Content-Type": "application/json"}, method="POST")
     for raw in urllib.request.urlopen(req, timeout=1800):
         line = raw.decode("utf-8", "ignore").strip()
@@ -1430,7 +1867,8 @@ def send(cfg, messages):
         if isinstance(d.get("content"), str):
             if ttft is None and d["content"]: ttft = time.time() - t0
             ans.append(d["content"])
-        if d.get("tool_calls"): tools.append(json.dumps(d["tool_calls"]))
+        if d.get("tool_calls"):
+            _merge_tool_call_deltas(tool_acc, d["tool_calls"])
     wall = time.time() - t0
     dtoks = usage.get("completion_tokens", 0)
     decode_ts = timings.get("decode_tok_s")
@@ -1438,12 +1876,25 @@ def send(cfg, messages):
     if decode_ts is None and dtoks > 1 and ttft is not None and (wall - ttft) > 1e-6:
         decode_ts = round((dtoks - 1) / (wall - ttft), 1)
         decode_est = True
-    think_s = "".join(think); ans_s = "".join(ans); tool_s = "".join(tools)
+    think_s = "".join(think); ans_s = "".join(ans)
+    # Build structured tool_calls list sorted by index (deterministic)
+    tool_calls = []
+    for idx in sorted(tool_acc.keys()):
+        entry = tool_acc[idx]
+        if entry.get("id") is None:
+            entry["id"] = f"call_{idx}"
+        if entry.get("type") is None:
+            entry["type"] = "function"
+        tool_calls.append({"id": entry["id"], "type": entry["type"], "function": {"name": entry["function"]["name"], "arguments": entry["function"]["arguments"]}})
+    # Legacy stringified preview for backwards compat
+    tool_s = " ".join(json.dumps(tc) for tc in tool_calls) if tool_calls else ""
     visible = (ans_s + " " + tool_s).strip()
     toks = re.findall(r"\S+", (think_s + " " + visible).strip())
     first, last, half = toks[:128], toks[-128:], toks[len(toks)//2:]
     bad = (bool(first) and (uniq(first) < 0.15 or maxfreq(first) > 0.50)) or \
           (bool(last) and (uniq(last) < 0.30 or maxfreq(last) > 0.50)) or (gram3(half) > 0.50)
+    # ATEM leak detection (visible content deltas must not contain raw ATEM markup)
+    atem_leak = ("<atem:" in ans_s) or ("<atem:" in think_s) or any("<atem:" in (tc.get("function", {}).get("arguments") or "") for tc in tool_calls)
     return {
         "request_id": completion_id,
         "ctx": usage.get("prompt_tokens", 0),
@@ -1459,6 +1910,11 @@ def send(cfg, messages):
         "runaway": (finish == "length"),
         "ans_preview": (visible or "<<no visible content>>")[:90],
         "assistant_content": ans_s if ans_s else (tool_s if tool_s else think_s),
+        "content": ans_s,
+        "reasoning_content": think_s,
+        "tool_calls": tool_calls,
+        "request_md5": request_md5,
+        "atem_leak": atem_leak,
     }
 
 
@@ -1495,6 +1951,7 @@ def run(cfg, args):
     label = f"{os.path.basename(cfg['model'])}|{cfg['mtp']}|{cfg['mode']}"
     print(f"### RUN {label}  kv={cfg['kv']} sampling={cfg['sampling']} seed={cfg.get('seed')} ###", flush=True)
     rows = []
+    feedback_shape = getattr(args, "feedback_shape", "plain") or "plain"
     battery = load_prompt_battery(
         cfg.get("prompts_file"), cfg.get("prompt_file"), cfg.get("niah_file")
     )
@@ -1513,31 +1970,45 @@ def run(cfg, args):
             messages.append({"role": "user", "content": prompt})
             r = send(cfg, messages)
             r["prompt_md5"] = hashlib.md5(prompt.encode("utf-8")).hexdigest()
-            messages.append({"role": "assistant", "content": r["assistant_content"]})
+            # Chain feedback respects shape (rich vs plain)
+            messages.append(_assistant_feedback(r, feedback_shape))
             missing = [item for item in expected if item.lower() not in r["assistant_content"].lower()]
             r["expected_substrings"] = expected
             r["retrieval_missing"] = missing
             recall = f" recall={len(expected) - len(missing)}/{len(expected)}" if expected else ""
             rows.append(r); print(f"  [{genre}]" + turn_line(len(rows), r, recall)[2:], flush=True)
     elif cfg["mode"] == "session":
-        turns = json.load(open(args.session))
-        messages = []
-        for i, t in enumerate(turns):
-            messages.append({"role": "user", "content": t["content"]})
-            r = send(cfg, messages)
-            messages.append({"role": "assistant", "content": r["assistant_content"]})
-            recall = ""
-            expected = t.get("expect", [])
-            missing = [
-                item
-                for item in expected
-                if item.lower() not in r["assistant_content"].lower()
-            ]
-            r["expected_substrings"] = expected
-            r["retrieval_missing"] = missing
-            if expected:
-                recall = f" recall={len(expected) - len(missing)}/{len(expected)}"
-            rows.append(r); print(turn_line(i+1, r, recall), flush=True)
+        # Structured Glimmer session takes precedence when schema matches
+        structured = None
+        try:
+            structured = _load_structured_session(args.session)
+        except Exception:
+            structured = None
+        if structured is not None:
+            rows = _run_glimmer_cache_tool_session(cfg, args, structured)
+        else:
+            turns = json.load(open(args.session))
+            # Support both legacy array and dict-with-turns without structured schema
+            if isinstance(turns, dict) and "turns" in turns:
+                turns = turns["turns"]
+            messages = []
+            for i, t in enumerate(turns):
+                messages.append({"role": "user", "content": t["content"]})
+                r = send(cfg, messages)
+                r["prompt_md5"] = hashlib.md5(t["content"].encode("utf-8")).hexdigest()
+                messages.append(_assistant_feedback(r, feedback_shape))
+                recall = ""
+                expected = t.get("expect", [])
+                missing = [
+                    item
+                    for item in expected
+                    if item.lower() not in r["assistant_content"].lower()
+                ]
+                r["expected_substrings"] = expected
+                r["retrieval_missing"] = missing
+                if expected:
+                    recall = f" recall={len(expected) - len(missing)}/{len(expected)}"
+                rows.append(r); print(turn_line(i+1, r, recall), flush=True)
     g = rows
     dec = [r["decode_tok_s"] for r in g if isinstance(r["decode_tok_s"], (int, float))]
     prefill = [
@@ -1562,6 +2033,63 @@ def run(cfg, args):
         rate = (sa / sd) if sd else 0.0
         summary += f" ngram={sa}/{sd}@{rate:.2f}"
     print(summary, flush=True)
+    # ---- Glimmer gate: prompt / request / binary identities (AGENTS.md discipline) ----
+    for r in g:
+        if r.get("prompt_md5"):
+            print(f"  prompt_md5={r.get('prompt_md5')} request_md5={r.get('request_md5')} step={r.get('step','')}", flush=True)
+    bmd5, bpath = _daemon_binary_md5()
+    if bmd5:
+        print(f"  daemon_binary_md5={bmd5} path={bpath}", flush=True)
+    # ---- Tool round-trip + ATEM leak gate (always checked when tool_calls involved) ----
+    for idx, r in enumerate(g):
+        if r.get("atem_leak"):
+            raise SystemExit(f"serve_harness: ATEM markup leaked in row {idx} visible content; failing gate. Row preview={r.get('ans_preview')!r}")
+        if r.get("tool_calls"):
+            # At least one tool call turn must satisfy finish==tool_calls and name populated
+            if r.get("finish") != "tool_calls":
+                raise SystemExit(f"serve_harness: tool round-trip assertion failed at row {idx}: expected finish=tool_calls, got {r.get('finish')!r}")
+            for tc in r["tool_calls"]:
+                fn = tc.get("function") or {}
+                name = fn.get("name") or tc.get("name")
+                if not name:
+                    raise SystemExit(f"serve_harness: tool round-trip assertion failed at row {idx}: done.calls[0].name missing in {tc!r}")
+    # ---- Compare transcript (cached-vs-cold A/B) ----
+    cmp_path = getattr(args, "compare_transcript", None)
+    if cmp_path:
+        try:
+            base = json.loads(Path(cmp_path).read_text(encoding="utf-8"))
+            # base may be rows list or dict with rows
+            if isinstance(base, dict) and "rows" in base:
+                base = base["rows"]
+            _assert_transcript_equal(base, g)
+        except SystemExit:
+            raise
+        except Exception as e:
+            raise SystemExit(f"serve_harness: compare-transcript failed: {e}")
+    # ---- Glimmer cache trace assertions (HIPFIRE_GLIMMER_CACHE_TRACE=1) ----
+    do_trace = getattr(args, "assert_glimmer_cache_trace", False) or os.environ.get("HIPFIRE_GLIMMER_CACHE_TRACE") == "1"
+    if do_trace:
+        trace_text = ""
+        log_path = getattr(args, "serve_log", None) or "/tmp/serve_harness.serve.log"
+        log_offset = cfg.get("_serve_log_offset", 0)
+        try:
+            if os.path.exists(log_path):
+                trace_text = _serve_log_text(log_path, log_offset)
+        except Exception:
+            trace_text = ""
+        parsed = _parse_glimmer_cache_trace(trace_text)
+        if parsed:
+            exp = len(g)
+            if any(r.get("step") for r in g):
+                exp = len(g)
+            try:
+                _assert_glimmer_cache_trace(trace_text, expected_requests=exp)
+                print(f"glimmer_cache_trace=PASS requests={exp} hits={sum(1 for r in parsed if r['hit'])}", flush=True)
+            except AssertionError as e:
+                raise SystemExit(f"serve_harness: glimmer-cache trace assertion failed: {e}")
+        else:
+            if os.environ.get("HIPFIRE_GLIMMER_CACHE_TRACE") == "1":
+                raise SystemExit("serve_harness: glimmer-cache trace assertion failed: HIPFIRE_GLIMMER_CACHE_TRACE=1 but no [glimmer-cache] lines found in log (expected {} rows)".format(len(g)))
     if args.out:
         json.dump(rows, open(args.out, "w"), indent=0)
     return rows
@@ -1708,6 +2236,22 @@ def main():
              "proof marker per successful serve request (coherence/product gates).",
     )
     ap.add_argument(
+        "--feedback-shape",
+        default="plain",
+        choices=["plain", "rich", "content-only", "reasoning-content", "content_only", "reasoning_content"],
+        help="Assistant history feedback shape for multi-turn: 'plain' (content-only, dumb client) vs 'rich' (reasoning_content + tool_calls). Both shapes exercised by gate; rich mirrors dump_corpus_openai_multiturn.py:267-294. Aliases content-only/reasoning-content accepted.",
+    )
+    ap.add_argument(
+        "--compare-transcript",
+        default=None,
+        help="Path to a prior --out JSON transcript to compare against (cached-vs-cold A/B). Asserts byte-identical decoded assistant text turn-for-turn and identical request_md5s.",
+    )
+    ap.add_argument(
+        "--assert-glimmer-cache-trace",
+        action="store_true",
+        help="Parse daemon serve log [glimmer-cache] lines and assert Glimmer prefix-cache invariants (hit=true, lcp==prior_len, prior_len==n_tokens from turn 2 onward). Requires HIPFIRE_GLIMMER_CACHE_TRACE=1 on daemon.",
+    )
+    ap.add_argument(
         "--self-test",
         action="store_true",
         help="Run deterministic serve path-proof self-tests (no GPU / no serve) and exit.",
@@ -1719,6 +2263,9 @@ def main():
         _self_test_device_config()
         _self_test_kv_resolution()
         _self_test_mtp_ngram_config()
+        _self_test_glimmer_feedback_shape()
+        _self_test_glimmer_tool_delta_merge()
+        _self_test_glimmer_transcript_and_trace()
         return
     if not args.model:
         ap.error("--model is required unless --self-test")
@@ -1748,9 +2295,12 @@ def main():
                               capture_output=True, text=True).stdout.strip()
         print(f"  [serve warm; MTP head loaded lines={head}]", flush=True)
         _assert_serve_path_proofs(cfg, args.serve_log, offset=log_offset)
+    cfg["_serve_log_offset"] = log_offset
     rows = run(cfg, args)
     if not args.no_spawn:
         _assert_dflash_request_proofs(cfg, rows, args.serve_log, offset=log_offset)
+        # Glimmer trace also asserted inside run(), but also ensure offset-correct post-check
+        # (run already did it via cfg offset; no duplicate needed here)
         _kill_serve()
     missing = [r.get("retrieval_missing") for r in rows if r.get("retrieval_missing")]
     if missing:

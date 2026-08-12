@@ -1407,6 +1407,7 @@ fn batch_render_prompt_tokens(
             user: prompt,
             enable_thinking: max_think_tokens != 1,
             bos_token: None,
+            reasoning_strength: None,
         };
         let render_result = if let Some(messages) = messages_history {
             frame.render_messages(messages, None, None)
@@ -8775,6 +8776,11 @@ fn asst_turn_fingerprint(
     h.finish()
 }
 
+fn glimmer_turn_key(fp: u64, ordinal: usize) -> u64 {
+    fp.wrapping_add((ordinal as u64).wrapping_mul(0x9E3779B97F4A7C15))
+        .wrapping_mul(0x9E3779B97F4A7C15)
+}
+
 /// Build the fingerprint-key string for an emitted assistant turn so
 /// it matches `msg.content` as the CLI sends it back next turn.
 /// Mirrors the *visible-content* transformation the bun CLI's HTTP
@@ -10032,7 +10038,6 @@ fn fail_closed_reset_target_and_spec(
         if let Some(ModelState::MuseGlimmer(bundle)) = m.state.as_mut() {
             bundle.state.reset();
             bundle.target_hidden_host.clear();
-            m.glimmer_prefill_boundary = 0;
         }
         if let Some(ad) = m.kv_adaptive.as_mut() {
             if let Some(ModelState::Qwen35(b)) = m.state.as_mut() {
@@ -10547,8 +10552,10 @@ fn ds4_absorb_stream_event(
         StreamEvent::ToolCalls(calls) => {
             for c in calls {
                 tool_calls_buf.push(hipfire_runtime::prompt_frame::ToolCall {
+                    id: None,
                     name: c.name.clone(),
                     arguments: c.arguments.clone(),
+                    rendered_body: None,
                 });
             }
         }
@@ -17488,6 +17495,7 @@ fn generate_ep(
                 user: prompt,
                 enable_thinking: max_think_tokens != 1,
                 bos_token: None,
+            reasoning_strength: None,
             };
             let render_result = if tools.is_some() || messages_history.is_some() {
                 let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
@@ -17500,6 +17508,9 @@ fn generate_ep(
                                 v.push(hipfire_runtime::prompt_frame::Message {
                                     role: hipfire_runtime::prompt_frame::Role::System,
                                     content: sys.to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
                                     tool_calls: Vec::new(),
                                     tool_call_id: None,
                                     tool_plan: String::new(),
@@ -17508,6 +17519,9 @@ fn generate_ep(
                             v.push(hipfire_runtime::prompt_frame::Message {
                                 role: hipfire_runtime::prompt_frame::Role::User,
                                 content: prompt.to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
                                 tool_calls: Vec::new(),
                                 tool_call_id: None,
                                 tool_plan: String::new(),
@@ -18258,7 +18272,7 @@ fn ep_serve_ds4(
                 {
                     eprintln!("[asst-cache store] fp={:#018x} tokens={}", fp, seq.len());
                 }
-                m.asst_turn_cache.insert(fp, seq);
+                m.asst_turn_cache.insert(fp, hipfire_runtime::prompt_frame::CachedAssistantTurn { reasoning: None, tools: Vec::new(), content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody { token_ids: seq, text: String::new() }) });
             },
             &action,
             local_emitted_ids,
@@ -18637,7 +18651,7 @@ fn plan_prompt_cache(
             let normalized =
                 hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned();
             let fp = asst_turn_fingerprint(&normalized, &msg.tool_calls);
-            asst_turn_cache.get(&fp).cloned()
+            asst_turn_cache.get(&fp).and_then(|t| t.content.as_ref().map(|c| c.token_ids.clone()))
         },
     );
     let cache_eligible = !cache_disabled && eviction_is_none && !conversation_tokens.is_empty();
@@ -19061,6 +19075,7 @@ fn generate_dflash(
             user: prompt,
             enable_thinking: max_think_tokens != 1,
             bos_token: None,
+            reasoning_strength: None,
         };
         let render_result = if tools.is_some() || messages_history.is_some() {
             let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
@@ -19072,6 +19087,9 @@ fn generate_dflash(
                         v.push(hipfire_runtime::prompt_frame::Message {
                             role: hipfire_runtime::prompt_frame::Role::System,
                             content: sys.to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
                             tool_calls: Vec::new(),
                             tool_call_id: None,
                             tool_plan: String::new(),
@@ -19080,6 +19098,9 @@ fn generate_dflash(
                     v.push(hipfire_runtime::prompt_frame::Message {
                         role: hipfire_runtime::prompt_frame::Role::User,
                         content: prompt.to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
                         tool_calls: Vec::new(),
                         tool_call_id: None,
                         tool_plan: String::new(),
@@ -19217,6 +19238,7 @@ fn generate_dflash(
                 user: prompt,
                 enable_thinking: max_think_tokens != 1,
                 bos_token: None,
+            reasoning_strength: None,
             };
             let cache_ref = &mut m.asst_turn_cache;
             let trace_cache =
@@ -19228,10 +19250,24 @@ fn generate_dflash(
                 |msg| {
                     let normalized = normalize_asst_turn_for_fingerprint(&msg.content);
                     let fp = asst_turn_fingerprint(&normalized, &msg.tool_calls);
-                    let hit = cache_ref.get(&fp).map(|cached| {
-                        let mut v = primer.clone();
-                        v.extend_from_slice(cached);
-                        v
+                    // The qwen family has no Harmony reasoning/tool channels: its whole
+                    // assistant turn is one content slot. `text` must be the message's own
+                    // content so the splice's `content.text == m.content` guard
+                    // (prompt_frame.rs) passes trivially and behaviour is byte-identical to
+                    // the pre-per-channel implementation.
+                    let hit = cache_ref.get(&fp).and_then(|turn| {
+                        turn.content.as_ref().map(|c| {
+                            let mut v = primer.clone();
+                            v.extend_from_slice(&c.token_ids);
+                            hipfire_runtime::prompt_frame::CachedAssistantTurn {
+                                reasoning: None,
+                                tools: Vec::new(),
+                                content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
+                                    token_ids: v,
+                                    text: msg.content.clone(),
+                                }),
+                            }
+                        })
                     });
                     if trace_cache {
                         eprintln!(
@@ -19563,7 +19599,7 @@ fn generate_dflash(
                                     seq.len()
                                 );
                             }
-                            m.asst_turn_cache.insert(fp, seq);
+                            m.asst_turn_cache.insert(fp, hipfire_runtime::prompt_frame::CachedAssistantTurn { reasoning: None, tools: Vec::new(), content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody { token_ids: seq, text: String::new() }) });
                         },
                         &action,
                         cached_seq,
@@ -19676,7 +19712,7 @@ fn generate_dflash(
                     emit_text.chars().take(60).collect::<String>(),
                 );
             }
-            m.asst_turn_cache.insert(fp, cached_seq);
+            m.asst_turn_cache.insert(fp, hipfire_runtime::prompt_frame::CachedAssistantTurn { reasoning: None, tools: Vec::new(), content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody { token_ids: cached_seq, text: String::new() }) });
         }
         emit_staged_terminal_done(stdout, &pending_done);
     }
@@ -21168,6 +21204,7 @@ fn generate_qwen35_mtp(
             user: prompt,
             enable_thinking: max_think_tokens != 1,
             bos_token: None,
+            reasoning_strength: None,
         };
         let render_result = if tools.is_some() || messages_history.is_some() {
             let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
@@ -21179,6 +21216,9 @@ fn generate_qwen35_mtp(
                         v.push(hipfire_runtime::prompt_frame::Message {
                             role: hipfire_runtime::prompt_frame::Role::System,
                             content: sys.to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
                             tool_calls: Vec::new(),
                             tool_call_id: None,
                             tool_plan: String::new(),
@@ -21187,6 +21227,9 @@ fn generate_qwen35_mtp(
                     v.push(hipfire_runtime::prompt_frame::Message {
                         role: hipfire_runtime::prompt_frame::Role::User,
                         content: prompt.to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
                         tool_calls: Vec::new(),
                         tool_call_id: None,
                         tool_plan: String::new(),
@@ -22407,6 +22450,7 @@ fn generate_multi(
             user: prompt,
             enable_thinking: max_think_tokens != 1,
             bos_token: None,
+            reasoning_strength: None,
         };
         let render_result = if tools.is_some() || messages_history.is_some() {
             let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
@@ -22418,6 +22462,9 @@ fn generate_multi(
                         v.push(hipfire_runtime::prompt_frame::Message {
                             role: hipfire_runtime::prompt_frame::Role::System,
                             content: sys.to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
                             tool_calls: Vec::new(),
                             tool_call_id: None,
                             tool_plan: String::new(),
@@ -22426,6 +22473,9 @@ fn generate_multi(
                     v.push(hipfire_runtime::prompt_frame::Message {
                         role: hipfire_runtime::prompt_frame::Role::User,
                         content: prompt.to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
                         tool_calls: Vec::new(),
                         tool_call_id: None,
                         tool_plan: String::new(),
@@ -24675,6 +24725,7 @@ fn generate(
             user: prompt,
             enable_thinking: max_think_tokens != 1,
             bos_token: None,
+            reasoning_strength: None,
         };
         // Phase 1 of Jinja-everywhere migration: when the caller supplies
         // either a `tools` array or a `messages` history (or both), route
@@ -24696,6 +24747,9 @@ fn generate(
                         v.push(hipfire_runtime::prompt_frame::Message {
                             role: hipfire_runtime::prompt_frame::Role::System,
                             content: sys.to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
                             tool_calls: Vec::new(),
                             tool_call_id: None,
                             tool_plan: String::new(),
@@ -24704,6 +24758,9 @@ fn generate(
                     v.push(hipfire_runtime::prompt_frame::Message {
                         role: hipfire_runtime::prompt_frame::Role::User,
                         content: prompt.to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
                         tool_calls: Vec::new(),
                         tool_call_id: None,
                         tool_plan: String::new(),
@@ -24835,6 +24892,7 @@ fn generate(
                 user: prompt,
                 enable_thinking: max_think_tokens != 1,
                 bos_token: None,
+            reasoning_strength: None,
             };
             let cache_ref = &mut m.asst_turn_cache;
             let built = hipfire_runtime::prompt_frame::build_cached_history_jinja(
@@ -24844,10 +24902,21 @@ fn generate(
                 |msg| {
                     let normalized = normalize_asst_turn_for_fingerprint(&msg.content);
                     let fp = asst_turn_fingerprint(&normalized, &msg.tool_calls);
-                    let hit = cache_ref.get(&fp).map(|cached| {
-                        let mut v = primer.clone();
-                        v.extend_from_slice(cached);
-                        v
+                    // Content-only turn: see the dflash sibling above for why `text` is
+                    // `msg.content`.
+                    let hit = cache_ref.get(&fp).and_then(|turn| {
+                        turn.content.as_ref().map(|c| {
+                            let mut v = primer.clone();
+                            v.extend_from_slice(&c.token_ids);
+                            hipfire_runtime::prompt_frame::CachedAssistantTurn {
+                                reasoning: None,
+                                tools: Vec::new(),
+                                content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
+                                    token_ids: v,
+                                    text: msg.content.clone(),
+                                }),
+                            }
+                        })
                     });
                     if trace_cache {
                         eprintln!(
@@ -24892,7 +24961,12 @@ fn generate(
                     let normalized =
                         hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned();
                     let fp = asst_turn_fingerprint(&normalized, &msg.tool_calls);
-                    let hit = cache_ref.get(&fp).cloned();
+                    // `build_cached_history` (the non-Jinja ChatScaffold path) still splices a
+                    // flat token vector, so project the content slot out of the per-channel
+                    // cache value. Qwen turns are content-only, so nothing is dropped.
+                    let hit = cache_ref
+                        .get(&fp)
+                        .and_then(|turn| turn.content.as_ref().map(|c| c.token_ids.clone()));
                     if trace_cache {
                         eprintln!(
                             "[qwen-cache lookup] fp={:#018x} role={:?} content.len={}/stripped.len={} tool_calls={} hit={}",
@@ -26569,7 +26643,7 @@ fn generate(
                 );
             }
             let _ = qwen_ar_apply_cache_action(
-                |fp, seq| m.asst_turn_cache.insert(fp, seq),
+                |fp, seq| m.asst_turn_cache.insert(fp, hipfire_runtime::prompt_frame::CachedAssistantTurn { reasoning: None, tools: Vec::new(), content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody { token_ids: seq, text: String::new() }) }),
                 &cache_action,
                 cached_seq,
             );
@@ -27060,8 +27134,12 @@ fn build_deepseek4_dsml_prompt(
                             asst_turn_cache.contains_key(&fp),
                         );
                     }
-                    if let Some(cached) = asst_turn_cache.get(&fp) {
-                        prompt_ids.extend_from_slice(cached);
+                    // DSML builds a flat token stream; project the content slot out of the
+                    // per-channel cache value (DeepSeek turns are content-only).
+                    if let Some(cached) =
+                        asst_turn_cache.get(&fp).and_then(|t| t.content.as_ref())
+                    {
+                        prompt_ids.extend_from_slice(&cached.token_ids);
                     } else {
                         // Cache miss — render the turn the long way.
                         if !msg.content.is_empty() && msg.content != "null" {
@@ -27072,7 +27150,7 @@ fn build_deepseek4_dsml_prompt(
                                 .tool_calls
                                 .iter()
                                 .map(|c| hipfire_arch_deepseek4::dsml::ToolCall {
-                                    name: c.name.clone(),
+                    name: c.name.clone(),
                                     arguments: c.arguments.clone(),
                                 })
                                 .collect();
@@ -27541,7 +27619,7 @@ fn generate_deepseek4_spec(
                                 seq.len()
                             );
                         }
-                        m.asst_turn_cache.insert(fp, seq);
+                        m.asst_turn_cache.insert(fp, hipfire_runtime::prompt_frame::CachedAssistantTurn { reasoning: None, tools: Vec::new(), content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody { token_ids: seq, text: String::new() }) });
                     },
                     &action,
                     run.streamed_tokens.clone(),
@@ -28303,7 +28381,7 @@ fn generate_deepseek4(
                     {
                         eprintln!("[asst-cache store] fp={:#018x} tokens={}", fp, seq.len());
                     }
-                    m.asst_turn_cache.insert(fp, seq);
+                    m.asst_turn_cache.insert(fp, hipfire_runtime::prompt_frame::CachedAssistantTurn { reasoning: None, tools: Vec::new(), content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody { token_ids: seq, text: String::new() }) });
                 },
                 &action,
                 cached_seq,
@@ -28700,6 +28778,7 @@ fn generate_gemma4(
                 user: prompt,
                 enable_thinking: max_think_tokens != 1,
                 bos_token: Some("<bos>"),
+            reasoning_strength: None,
             };
             let render_result = if tools.is_some() || messages_history.is_some() {
                 let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
@@ -28712,6 +28791,9 @@ fn generate_gemma4(
                                 v.push(hipfire_runtime::prompt_frame::Message {
                                     role: hipfire_runtime::prompt_frame::Role::System,
                                     content: sys.to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
                                     tool_calls: Vec::new(),
                                     tool_call_id: None,
                                     tool_plan: String::new(),
@@ -28720,6 +28802,9 @@ fn generate_gemma4(
                             v.push(hipfire_runtime::prompt_frame::Message {
                                 role: hipfire_runtime::prompt_frame::Role::User,
                                 content: prompt.to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
                                 tool_calls: Vec::new(),
                                 tool_call_id: None,
                                 tool_plan: String::new(),
@@ -29175,6 +29260,9 @@ impl GlimmerHarmonyRouter {
     fn thinking_enabled(&self) -> bool {
         self.max_think_tokens != 1
     }
+    fn just_forced(&self) -> bool {
+        self.just_forced
+    }
     fn push(&mut self, frag: &str) -> (Vec<GlimmerEmit>, bool) {
         if frag.is_empty() {
             return (Vec::new(), false);
@@ -29343,6 +29431,447 @@ fn glimmer_longest_marker_suffix(s: &str) -> usize {
     0
 }
 
+const GLIMMER_START_ID: u32 = 200022;
+const GLIMMER_MESSAGE_ID: u32 = 200023;
+const GLIMMER_EOM_ID: u32 = 200007;
+const GLIMMER_EOT_ID: u32 = 200008;
+const GLIMMER_END_OF_TEXT_ID: u32 = 200001;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GlimmerRecordedRecipient { Self_, User, Tool(String) }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GlimmerOpenBody {
+    recipient: GlimmerRecordedRecipient,
+    token_ids: Vec<u32>,
+    text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GlimmerRecordRefusal {
+    UnexpectedMarker,
+    NonCanonicalHeader,
+    ThinkingDisabledSelf,
+    ForcedReasoningClose,
+    NonCanonicalBodyOrder,
+    NonCanonicalTerminator,
+    Incomplete,
+    ToolCallMismatch,
+    EmptySelfBody,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GlimmerRecorderState {
+    Header { first: bool, decoded: String },
+    AwaitingStart,
+    Body(GlimmerOpenBody),
+    Terminal,
+    Refused(GlimmerRecordRefusal),
+}
+
+struct GlimmerChannelRecorder {
+    state: GlimmerRecorderState,
+    reasoning: Option<hipfire_runtime::prompt_frame::CachedAssistantBody>,
+    tools: Vec<hipfire_runtime::prompt_frame::CachedAssistantToolBody>,
+    content: Option<hipfire_runtime::prompt_frame::CachedAssistantBody>,
+    thinking_enabled: bool,
+}
+
+impl GlimmerChannelRecorder {
+    fn new(thinking_enabled: bool) -> Self {
+        Self {
+            state: GlimmerRecorderState::Header { first: true, decoded: String::new() },
+            reasoning: None,
+            tools: Vec::new(),
+            content: None,
+            thinking_enabled,
+        }
+    }
+    fn push(&mut self, token_id: u32, decoded_frag: &str) {
+        if matches!(self.state, GlimmerRecorderState::Refused(_) | GlimmerRecorderState::Terminal) {
+            return;
+        }
+        match token_id {
+            GLIMMER_START_ID => {
+                match &mut self.state {
+                    GlimmerRecorderState::AwaitingStart => {
+                        self.state = GlimmerRecorderState::Header { first: false, decoded: String::new() };
+                    }
+                    GlimmerRecorderState::Header { first, decoded } => {
+                        if *first {
+                            decoded.push_str(decoded_frag);
+                        } else {
+                            self.state = GlimmerRecorderState::Refused(GlimmerRecordRefusal::UnexpectedMarker);
+                        }
+                    }
+                    GlimmerRecorderState::Body(_) => {
+                        self.state = GlimmerRecorderState::Refused(GlimmerRecordRefusal::UnexpectedMarker);
+                    }
+                    _ => {}
+                }
+                return;
+            }
+            GLIMMER_MESSAGE_ID => {
+                let (first, decoded) = match &self.state {
+                    GlimmerRecorderState::Header { first, decoded } => (*first, decoded.clone()),
+                    _ => {
+                        self.state = GlimmerRecorderState::Refused(GlimmerRecordRefusal::UnexpectedMarker);
+                        return;
+                    }
+                };
+                if !decoded.contains("assistant") {
+                    self.state = GlimmerRecorderState::Refused(GlimmerRecordRefusal::NonCanonicalHeader);
+                    return;
+                }
+                let recipient_str = if let Some(to_pos) = decoded.rfind(" to=") {
+                    decoded[to_pos + 4..].trim().to_string()
+                } else {
+                    "user".to_string()
+                };
+                let recipient = if recipient_str == "self" {
+                    if !self.thinking_enabled {
+                        self.state = GlimmerRecorderState::Refused(GlimmerRecordRefusal::ThinkingDisabledSelf);
+                        return;
+                    }
+                    if self.reasoning.is_some() {
+                        self.state = GlimmerRecorderState::Refused(GlimmerRecordRefusal::NonCanonicalBodyOrder);
+                        return;
+                    }
+                    GlimmerRecordedRecipient::Self_
+                } else if recipient_str == "user" {
+                    if self.content.is_some() || !self.tools.is_empty() {
+                        self.state = GlimmerRecorderState::Refused(GlimmerRecordRefusal::NonCanonicalBodyOrder);
+                        return;
+                    }
+                    GlimmerRecordedRecipient::User
+                } else if !recipient_str.is_empty() {
+                    if self.content.is_some() {
+                        self.state = GlimmerRecorderState::Refused(GlimmerRecordRefusal::NonCanonicalBodyOrder);
+                        return;
+                    }
+                    GlimmerRecordedRecipient::Tool(recipient_str)
+                } else {
+                    self.state = GlimmerRecorderState::Refused(GlimmerRecordRefusal::NonCanonicalHeader);
+                    return;
+                };
+                self.state = GlimmerRecorderState::Body(GlimmerOpenBody { recipient, token_ids: Vec::new(), text: String::new() });
+                return;
+            }
+            GLIMMER_EOM_ID => {
+                let body = match std::mem::replace(&mut self.state, GlimmerRecorderState::AwaitingStart) {
+                    GlimmerRecorderState::Body(b) => b,
+                    _ => {
+                        self.state = GlimmerRecorderState::Refused(GlimmerRecordRefusal::UnexpectedMarker);
+                        return;
+                    }
+                };
+                match body.recipient {
+                    GlimmerRecordedRecipient::Self_ => {
+                        if body.text.is_empty() && body.token_ids.is_empty() {
+                            self.state = GlimmerRecorderState::Refused(GlimmerRecordRefusal::EmptySelfBody);
+                            return;
+                        }
+                        if self.reasoning.is_some() {
+                            self.state = GlimmerRecorderState::Refused(GlimmerRecordRefusal::NonCanonicalBodyOrder);
+                            return;
+                        }
+                        self.reasoning = Some(hipfire_runtime::prompt_frame::CachedAssistantBody { token_ids: body.token_ids, text: body.text });
+                        self.state = GlimmerRecorderState::AwaitingStart;
+                    }
+                    GlimmerRecordedRecipient::Tool(recipient) => {
+                        self.tools.push(hipfire_runtime::prompt_frame::CachedAssistantToolBody { recipient, token_ids: body.token_ids });
+                        self.state = GlimmerRecorderState::AwaitingStart;
+                    }
+                    GlimmerRecordedRecipient::User => {
+                        self.state = GlimmerRecorderState::Refused(GlimmerRecordRefusal::NonCanonicalTerminator);
+                        return;
+                    }
+                }
+                return;
+            }
+            GLIMMER_EOT_ID => {
+                let body = match std::mem::replace(&mut self.state, GlimmerRecorderState::Terminal) {
+                    GlimmerRecorderState::Body(b) => b,
+                    _ => {
+                        self.state = GlimmerRecorderState::Refused(GlimmerRecordRefusal::UnexpectedMarker);
+                        return;
+                    }
+                };
+                match body.recipient {
+                    GlimmerRecordedRecipient::User => {
+                        if self.content.is_some() {
+                            self.state = GlimmerRecorderState::Refused(GlimmerRecordRefusal::NonCanonicalBodyOrder);
+                            return;
+                        }
+                        self.content = Some(hipfire_runtime::prompt_frame::CachedAssistantBody { token_ids: body.token_ids, text: body.text });
+                        self.state = GlimmerRecorderState::Terminal;
+                    }
+                    GlimmerRecordedRecipient::Tool(recipient) => {
+                        self.tools.push(hipfire_runtime::prompt_frame::CachedAssistantToolBody { recipient, token_ids: body.token_ids });
+                        self.state = GlimmerRecorderState::Terminal;
+                    }
+                    GlimmerRecordedRecipient::Self_ => {
+                        self.state = GlimmerRecorderState::Refused(GlimmerRecordRefusal::NonCanonicalTerminator);
+                        return;
+                    }
+                }
+                return;
+            }
+            GLIMMER_END_OF_TEXT_ID => {
+                self.state = GlimmerRecorderState::Refused(GlimmerRecordRefusal::UnexpectedMarker);
+                return;
+            }
+            _ => {}
+        }
+        match &mut self.state {
+            GlimmerRecorderState::Body(body) => {
+                body.token_ids.push(token_id);
+                body.text.push_str(decoded_frag);
+            }
+            GlimmerRecorderState::Header { decoded, .. } => {
+                decoded.push_str(decoded_frag);
+            }
+            GlimmerRecorderState::AwaitingStart => {
+                self.state = GlimmerRecorderState::Refused(GlimmerRecordRefusal::UnexpectedMarker);
+            }
+            _ => {}
+        }
+    }
+    fn mark_forced_reasoning_close(&mut self) {
+        if matches!(self.state, GlimmerRecorderState::Refused(_)) {
+            return;
+        }
+        self.state = GlimmerRecorderState::Refused(GlimmerRecordRefusal::ForcedReasoningClose);
+    }
+    fn into_cached_turn(self, parsed_tool_calls: &[hipfire_runtime::prompt_frame::ToolCall]) -> Result<hipfire_runtime::prompt_frame::CachedAssistantTurn, GlimmerRecordRefusal> {
+        if let GlimmerRecorderState::Refused(r) = self.state {
+            return Err(r);
+        }
+        if matches!(self.state, GlimmerRecorderState::Body(_) | GlimmerRecorderState::Header { .. } | GlimmerRecorderState::AwaitingStart) {
+            return Err(GlimmerRecordRefusal::Incomplete);
+        }
+        if !self.tools.is_empty() && self.content.is_some() {
+            return Err(GlimmerRecordRefusal::NonCanonicalBodyOrder);
+        }
+        if self.tools.len() != parsed_tool_calls.len() {
+            if !(self.tools.is_empty() && parsed_tool_calls.is_empty()) {
+                return Err(GlimmerRecordRefusal::ToolCallMismatch);
+            }
+        }
+        for (i, t) in self.tools.iter().enumerate() {
+            if i < parsed_tool_calls.len() && t.recipient != parsed_tool_calls[i].name {
+                return Err(GlimmerRecordRefusal::ToolCallMismatch);
+            }
+        }
+        Ok(hipfire_runtime::prompt_frame::CachedAssistantTurn { reasoning: self.reasoning, tools: self.tools, content: self.content })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GlimmerMirrorAction { Aligned, TruncateMirror(usize), RollbackCursor(usize) }
+
+fn glimmer_mirror_action(mirror_len: usize, n_tokens: usize) -> GlimmerMirrorAction {
+    if mirror_len == n_tokens {
+        GlimmerMirrorAction::Aligned
+    } else if mirror_len > n_tokens {
+        GlimmerMirrorAction::TruncateMirror(n_tokens)
+    } else {
+        GlimmerMirrorAction::RollbackCursor(mirror_len)
+    }
+}
+
+fn glimmer_hidden_keep_len(hidden_len: usize, old_rows: usize, new_rows: usize) -> Option<usize> {
+    if hidden_len == 0 || old_rows == 0 {
+        return None;
+    }
+    if hidden_len % old_rows != 0 {
+        return None;
+    }
+    let row_elems = hidden_len / old_rows;
+    Some(new_rows * row_elems)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GlimmerMirrorReconcile {
+    Aligned,
+    Truncated { from: usize, to: usize },
+    RolledBack { mirror_len: usize, n_tokens: usize },
+}
+
+fn reconcile_glimmer_mirror(
+    state: &mut glimmer::glimmer::GlimmerState,
+    target_hidden_host: &mut Vec<f32>,
+    conversation_tokens: &mut Vec<u32>,
+    seq_pos: &mut usize,
+) -> GlimmerMirrorReconcile {
+    let mirror_len = conversation_tokens.len();
+    let n_tokens = state.n_tokens;
+    let action = glimmer_mirror_action(mirror_len, n_tokens);
+    let result = match action {
+        GlimmerMirrorAction::Aligned => {
+            *seq_pos = n_tokens;
+            GlimmerMirrorReconcile::Aligned
+        }
+        GlimmerMirrorAction::TruncateMirror(to) => {
+            let from = mirror_len;
+            conversation_tokens.truncate(to);
+            *seq_pos = to;
+            if let Some(keep) = glimmer_hidden_keep_len(target_hidden_host.len(), mirror_len, to) {
+                target_hidden_host.truncate(keep);
+            }
+            GlimmerMirrorReconcile::Truncated { from, to }
+        }
+        GlimmerMirrorAction::RollbackCursor(new_len) => {
+            glimmer::forward::rollback_to(state, new_len);
+            if new_len == 0 {
+                target_hidden_host.clear();
+            } else if let Some(keep) = glimmer_hidden_keep_len(target_hidden_host.len(), n_tokens, new_len) {
+                target_hidden_host.truncate(keep);
+            }
+            *seq_pos = new_len;
+            GlimmerMirrorReconcile::RolledBack { mirror_len: new_len, n_tokens }
+        }
+    };
+    debug_assert_eq!(conversation_tokens.len(), state.n_tokens);
+    debug_assert_eq!(*seq_pos, state.n_tokens);
+    result
+}
+
+fn normalize_glimmer_tool_arguments(value: &serde_json::Value) -> Result<serde_json::Value, String> {
+    match value {
+        serde_json::Value::Object(map) => Ok(serde_json::Value::Object(map.clone())),
+        serde_json::Value::Null => Ok(serde_json::Value::Object(Default::default())),
+        serde_json::Value::String(s) => {
+            match serde_json::from_str::<serde_json::Value>(s) {
+                Ok(serde_json::Value::Object(map)) => Ok(serde_json::Value::Object(map)),
+                Ok(_) => Err(format!("tool arguments string must parse to object, got: {}", s)),
+                Err(e) => Err(format!("tool arguments string invalid JSON: {}: {}", s, e)),
+            }
+        }
+        _ => Err(format!("tool arguments must be object, got: {}", value)),
+    }
+}
+
+fn prepare_glimmer_onyx_history(messages: &[hipfire_runtime::prompt_frame::Message]) -> Result<Vec<hipfire_runtime::prompt_frame::Message>, String> {
+    let mut out = Vec::with_capacity(messages.len());
+    let mut pending_tool_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for (idx, msg) in messages.iter().enumerate() {
+        let mut cloned = msg.clone();
+        if cloned.role == hipfire_runtime::prompt_frame::Role::Assistant && !cloned.tool_calls.is_empty() {
+            pending_tool_map.clear();
+            for tc in &mut cloned.tool_calls {
+                let normalized = normalize_glimmer_tool_arguments(&tc.arguments)?;
+                tc.arguments = normalized;
+                tc.rendered_body = None;
+                if let Some(id) = &tc.id {
+                    if !id.is_empty() {
+                        if pending_tool_map.contains_key(id) {
+                            return Err(format!("duplicate tool_call id {} at assistant turn {}", id, idx));
+                        }
+                        pending_tool_map.insert(id.clone(), tc.name.clone());
+                    }
+                }
+            }
+        } else if cloned.role == hipfire_runtime::prompt_frame::Role::Tool {
+            let tcid = cloned.tool_call_id.clone().unwrap_or_default();
+            let mut resolved: Option<String> = None;
+            if !tcid.is_empty() && pending_tool_map.contains_key(&tcid) {
+                resolved = pending_tool_map.get(&tcid).cloned();
+            } else if !tcid.is_empty() {
+                for prev in messages[..idx].iter().rev() {
+                    if prev.role == hipfire_runtime::prompt_frame::Role::Assistant {
+                        for tc in &prev.tool_calls {
+                            if tc.id.as_deref() == Some(&tcid) {
+                                resolved = Some(tc.name.clone());
+                                break;
+                            }
+                        }
+                        if resolved.is_some() { break; }
+                    }
+                }
+            }
+            if let Some(name) = resolved {
+                cloned.rendered_name = Some(name);
+            } else if cloned.name.is_some() {
+                cloned.rendered_name = cloned.name.clone();
+            } else if !tcid.is_empty() {
+                return Err(format!("unresolved tool_call_id {} at tool turn {}", tcid, idx));
+            }
+        }
+        out.push(cloned);
+    }
+    Ok(out)
+}
+
+fn glimmer_store_cached_turn(
+    cache: &mut hipfire_loader::AsstTurnCache,
+    recorder: GlimmerChannelRecorder,
+    parsed_tool_calls: &[hipfire_runtime::prompt_frame::ToolCall],
+    ordinal: usize,
+) -> bool {
+    let turn = match recorder.into_cached_turn(parsed_tool_calls) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("[glimmer-cache store skip] recorder refusal: {:?}", e);
+            return false;
+        }
+    };
+    if let Some(content) = &turn.content {
+        if !turn.tools.is_empty() {
+            eprintln!("[glimmer-cache store skip] both content and tools present");
+            return false;
+        }
+        let normalized = hipfire_runtime::tokenizer::maybe_normalize_prompt(&content.text).into_owned();
+        let fp_raw = asst_turn_fingerprint(&normalized, &[]);
+        let fp = glimmer_turn_key(fp_raw, ordinal);
+        cache.insert(fp, turn);
+        true
+    } else if !turn.tools.is_empty() {
+        let fp_raw = asst_turn_fingerprint("", parsed_tool_calls);
+        let fp = glimmer_turn_key(fp_raw, ordinal);
+        cache.insert(fp, turn);
+        true
+    } else {
+        eprintln!("[glimmer-cache store skip] empty turn");
+        false
+    }
+}
+
+#[derive(Debug, Clone)]
+struct GlimmerRouteError { detail: String }
+
+fn parse_glimmer_atem(body: &str) -> Result<Vec<hipfire_runtime::prompt_frame::ToolCall>, GlimmerRouteError> {
+    let mut calls = Vec::new();
+    let mut rest = body;
+    while let Some(start) = rest.find("<atem:invoke") {
+        let after_start = &rest[start..];
+        let name_start = after_start.find("name=\"").ok_or(GlimmerRouteError { detail: "missing invoke name".into() })? + 6;
+        let name_end = after_start[name_start..].find('"').ok_or(GlimmerRouteError { detail: "unterminated name".into() })? + name_start;
+        let name = after_start[name_start..name_end].to_string();
+        let invoke_close = after_start.find("</atem:invoke>").ok_or(GlimmerRouteError { detail: "missing invoke close".into() })?;
+        let invoke_body = &after_start[..invoke_close];
+        let mut args = serde_json::Map::new();
+        let mut param_rest = invoke_body;
+        while let Some(p_start) = param_rest.find("<atem:parameter") {
+            let param_after = &param_rest[p_start..];
+            let p_name_start = param_after.find("name=\"").ok_or(GlimmerRouteError { detail: "missing param name".into() })? + 6;
+            let p_name_end = param_after[p_name_start..].find('"').ok_or(GlimmerRouteError { detail: "unterminated param name".into() })? + p_name_start;
+            let p_name = param_after[p_name_start..p_name_end].to_string();
+            let tag_end = param_after.find('>').ok_or(GlimmerRouteError { detail: "missing param tag end".into() })? + 1;
+            let close_tag = "</atem:parameter>";
+    let inner_start = tag_end;
+    let inner_end = param_after.find(close_tag).ok_or(GlimmerRouteError { detail: "missing param close".into() })?;
+    let raw = param_after[inner_start..inner_end].trim();
+    let value = if raw == "true" { serde_json::Value::Bool(true) } else if raw == "false" { serde_json::Value::Bool(false) } else if raw == "null" { serde_json::Value::Null } else if raw.starts_with("{") || raw.starts_with("[") { serde_json::from_str(raw).unwrap_or(serde_json::Value::String(raw.to_string())) } else if let Ok(n) = raw.parse::<i64>() { serde_json::Value::Number(n.into()) } else if let Ok(f) = raw.parse::<f64>() { serde_json::Value::Number(serde_json::Number::from_f64(f).unwrap()) } else { serde_json::Value::String(raw.to_string()) };
+    args.insert(p_name, value);
+    param_rest = &param_after[inner_end + close_tag.len()..];
+        }
+        calls.push(hipfire_runtime::prompt_frame::ToolCall { id: None, name, arguments: serde_json::Value::Object(args), rendered_body: None });
+        rest = &rest[start + invoke_close + "</atem:invoke>".len()..];
+    }
+    Ok(calls)
+}
+
 fn generate_muse_glimmer(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
@@ -29393,6 +29922,7 @@ fn generate_muse_glimmer(
                 user: prompt,
                 enable_thinking: max_think_tokens != 1,
                 bos_token: Some("<bos>"),
+            reasoning_strength: None,
             };
             let render_result = if tools.is_some() || messages_history.is_some() {
                 let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
@@ -29405,6 +29935,9 @@ fn generate_muse_glimmer(
                                 v.push(hipfire_runtime::prompt_frame::Message {
                                     role: hipfire_runtime::prompt_frame::Role::System,
                                     content: sys.to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
                                     tool_calls: Vec::new(),
                                     tool_call_id: None,
                                     tool_plan: String::new(),
@@ -29413,6 +29946,9 @@ fn generate_muse_glimmer(
                             v.push(hipfire_runtime::prompt_frame::Message {
                                 role: hipfire_runtime::prompt_frame::Role::User,
                                 content: prompt.to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
                                 tool_calls: Vec::new(),
                                 tool_call_id: None,
                                 tool_plan: String::new(),
@@ -29506,7 +30042,6 @@ fn generate_muse_glimmer(
         eprintln!("[daemon] arch_id=14 context full ({n}/{cap}) — resetting GlimmerState");
         bundle.state.reset();
         bundle.target_hidden_host.clear();
-        m.glimmer_prefill_boundary = 0;
         m.seq_pos = 0;
         m.conversation_tokens.clear();
     }
@@ -29546,7 +30081,6 @@ fn generate_muse_glimmer(
             if bundle.state.n_tokens > 0 || !m.conversation_tokens.is_empty() {
                 bundle.state.reset();
                 bundle.target_hidden_host.clear();
-                m.glimmer_prefill_boundary = 0;
                 m.conversation_tokens.clear();
                 m.seq_pos = 0;
             }
@@ -29558,27 +30092,29 @@ fn generate_muse_glimmer(
             while lcp < max_match && m.conversation_tokens[lcp] == prompt_ids[lcp] {
                 lcp += 1;
             }
-            // Reuse ONLY KV written by the batched prefill path. Prefill and
-            // decode write KV with different kernels (batched WMMA attention
-            // vs the SWA / flash decode path), so a decode-written position
-            // does not reproduce what a cold prefill would put there.
+            // STRICT FORWARD EXTENSION ONLY. Hit iff the whole mirror is a prefix of the
+            // new render: `lcp == prior_len && 0 < lcp < prompt_ids.len()`. Anything else
+            // is a MISS and cold-resets below.
             //
-            // This is not a last-bits concern. Measured on a 3-turn chain with
-            // thinking on: an unclamped lcp=59 against a 58-token prompt reused
-            // exactly ONE decode-written position, and turn 1 then answered
-            // from the top of the conversation ("Write a Python function that
-            // reverses a string...") instead of from the current user message
-            // ("Now make it handle unicode correctly..."). Structurally wrong
-            // output, from a single position of mismatched KV.
-            let lcp = lcp.min(m.glimmer_prefill_boundary);
-            let cache_hit = lcp > 0 && lcp < prompt_ids.len();
+            // The earlier `lcp > 0 && lcp < prompt_ids.len()` form allowed reuse PAST the
+            // mirror's end, which meant reusing a position whose KV was written by the
+            // decode kernel (SWA / flash decode) rather than the batched WMMA prefill.
+            // Those do not agree, and it is not a last-bits concern: measured on a 3-turn
+            // chain with thinking on, an unclamped lcp=59 against a 58-token prompt reused
+            // exactly ONE decode-written position and turn 1 then answered from the top of
+            // the conversation instead of from the current user message. Structurally wrong
+            // output from a single position of mismatched KV.
+            //
+            // Under strict forward extension a reused position is never re-prefilled, so
+            // the prefill-vs-decode mismatch cannot arise and no boundary clamp is needed —
+            // which is why `LoadedModel::glimmer_prefill_boundary` no longer exists.
+            let cache_hit = lcp == prior_len && lcp > 0 && lcp < prompt_ids.len();
             if trace {
                 eprintln!(
-                    "[glimmer-cache] prior_len={} n_tokens={} prompt_len={} boundary={} lcp={} hit={}",
+                    "[glimmer-cache] prior_len={} n_tokens={} prompt_len={} lcp={} hit={}",
                     prior_len,
                     bundle.state.n_tokens,
                     prompt_ids.len(),
-                    m.glimmer_prefill_boundary,
                     lcp,
                     cache_hit
                 );
@@ -29606,7 +30142,6 @@ fn generate_muse_glimmer(
                 if bundle.state.n_tokens > 0 || prior_len > 0 {
                     bundle.state.reset();
                     bundle.target_hidden_host.clear();
-                    m.glimmer_prefill_boundary = 0;
                     m.conversation_tokens.clear();
                     m.seq_pos = 0;
                 }
@@ -29655,7 +30190,6 @@ fn generate_muse_glimmer(
     // Everything up to here had its KV written by the batched prefill path, so
     // it is the furthest a later turn may reuse. Tokens appended below by the
     // decode loop are written by a different kernel and must not be reused.
-    m.glimmer_prefill_boundary = m.conversation_tokens.len();
     let prefill_ms = t0.elapsed().as_millis();
 
     // ── Decode loop. Sample host-side from the running logits vector. ──
@@ -29668,6 +30202,9 @@ fn generate_muse_glimmer(
     let mut generated_count: usize = 0;
     let decode_t0 = Instant::now();
     let mut harmony_router = GlimmerHarmonyRouter::new(max_think_tokens);
+    let mut glimmer_recorder = GlimmerChannelRecorder::new(harmony_router.thinking_enabled());
+    let mut glimmer_emitted_ids: Vec<u32> = Vec::new();
+    let mut glimmer_visible_acc: String = String::new();
     // Speculative path: when a DFlash drafter (arch 23, 5-layer diffusion) is
     // present and temp==0 (greedy), drive the shared `accept_greedy_prefix`
     // rule. Otherwise fall back to AR. The drafter being present is gated by
@@ -29714,11 +30251,19 @@ fn generate_muse_glimmer(
             for ev in events {
                 match ev {
                     GlimmerEmit::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
-                    GlimmerEmit::Token(text) => emit_visible_token(stdout, id, &text),
+                    GlimmerEmit::Token(text) => {
+                        glimmer_visible_acc.push_str(&text);
+                        emit_visible_token(stdout, id, &text)
+                    },
                 }
             }
+            if harmony_router.just_forced() {
+                glimmer_recorder.mark_forced_reasoning_close();
+            }
+            glimmer_recorder.push(last_pick, &frag);
             // Seed was routed through harmony; if it indicated stop, we still count it but don't enter spec loop
             m.conversation_tokens.push(last_pick);
+            glimmer_emitted_ids.push(last_pick);
             generated_count += 1;
             if should_stop_seed {
                 // Seed closed final channel – finish immediately
@@ -29731,12 +30276,22 @@ fn generate_muse_glimmer(
                 // Reuse common done emission below – set windows=0 and jump to done
                 // For simplicity, just break out by setting use_spec false path via return
                 // We'll handle by directly emitting done and returning
+                {
+                    let hit_length_cap = generated_count >= max_tokens;
+                    let is_empty = glimmer_emitted_ids.is_empty();
+                    let should_store = !hit_length_cap && !is_empty;
+                    if should_store {
+                        let ordinal = messages_history.map(|h| h.iter().filter(|m| matches!(m.role, hipfire_runtime::prompt_frame::Role::Assistant)).count()).unwrap_or(0);
+                        let parsed_tool_calls = parse_glimmer_atem(&glimmer_visible_acc).unwrap_or_default();
+                        let _ = glimmer_store_cached_turn(&mut m.asst_turn_cache, glimmer_recorder, &parsed_tool_calls, ordinal);
+                    }
+                }
+                let _ = reconcile_glimmer_mirror(&mut bundle.state, &mut bundle.target_hidden_host, &mut m.conversation_tokens, &mut m.seq_pos);
                 let decode_ms = decode_t0.elapsed().as_millis().max(1);
                 let total_ms = t0.elapsed().as_millis().max(1);
                 let tok_s = if generated_count > 0 { (generated_count as f64 * 1000.0) / decode_ms as f64 } else { 0.0 };
                 let _ = writeln!(stdout, r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_ms":{},"total_ms":{}}}"#, id, generated_count, tok_s, prefill_ms, total_ms);
                 let _ = stdout.flush();
-                m.seq_pos = bundle.state.n_tokens;
                 return;
             }
             // Write seed's KV at cur_pos (already done by prefill? No, prefill's last token was prompt, not seed)
@@ -29869,10 +30424,18 @@ fn generate_muse_glimmer(
                 for ev in events {
                     match ev {
                         GlimmerEmit::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
-                        GlimmerEmit::Token(text) => emit_visible_token(stdout, id, &text),
+                        GlimmerEmit::Token(text) => {
+                        glimmer_visible_acc.push_str(&text);
+                        emit_visible_token(stdout, id, &text)
+                    },
                     }
                 }
+                if harmony_router.just_forced() {
+                    glimmer_recorder.mark_forced_reasoning_close();
+                }
+                glimmer_recorder.push(next_tok, &frag);
                 m.conversation_tokens.push(next_tok);
+                glimmer_emitted_ids.push(next_tok);
                 generated_count += 1;
                 if should_stop_fb { break; }
                 if bundle.state.n_tokens >= cache_cap { break; }
@@ -30084,12 +30647,20 @@ fn generate_muse_glimmer(
                     for ev in events {
                         match ev {
                             GlimmerEmit::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
-                            GlimmerEmit::Token(text) => emit_visible_token(stdout, id, &text),
+                            GlimmerEmit::Token(text) => {
+                        glimmer_visible_acc.push_str(&text);
+                        emit_visible_token(stdout, id, &text)
+                    },
                         }
                     }
+                    if harmony_router.just_forced() {
+                        glimmer_recorder.mark_forced_reasoning_close();
+                    }
+                    glimmer_recorder.push(tok, &frag);
                     last_pick = tok;
                     // Don't emit stop marker itself; still count token for conversation?
                     m.conversation_tokens.push(tok);
+                    glimmer_emitted_ids.push(tok);
                     generated_count += 1;
                     should_stop_block = true;
                     break;
@@ -30099,10 +30670,18 @@ fn generate_muse_glimmer(
                 for ev in events {
                     match ev {
                         GlimmerEmit::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
-                        GlimmerEmit::Token(text) => emit_visible_token(stdout, id, &text),
+                        GlimmerEmit::Token(text) => {
+                        glimmer_visible_acc.push_str(&text);
+                        emit_visible_token(stdout, id, &text)
+                    },
                     }
                 }
+                if harmony_router.just_forced() {
+                    glimmer_recorder.mark_forced_reasoning_close();
+                }
+                glimmer_recorder.push(tok, &frag);
                 m.conversation_tokens.push(tok);
+                glimmer_emitted_ids.push(tok);
                 generated_count += 1;
                 if should_stop {
                     // eom closed a final channel => stop entire decode
@@ -30137,9 +30716,16 @@ fn generate_muse_glimmer(
                 for ev in events {
                     match ev {
                         GlimmerEmit::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
-                        GlimmerEmit::Token(text) => emit_visible_token(stdout, id, &text),
+                        GlimmerEmit::Token(text) => {
+                        glimmer_visible_acc.push_str(&text);
+                        emit_visible_token(stdout, id, &text)
+                    },
                     }
                 }
+                if harmony_router.just_forced() {
+                    glimmer_recorder.mark_forced_reasoning_close();
+                }
+                glimmer_recorder.push(next_tok, &frag);
                 // Push stop token to KV? No — mirror prior break-before-push for eos.
                 // For Harmony we already pushed reasoning/answer for prior tokens; stop token itself
                 // is not part of visible sequence, but we still need to handle flush.
@@ -30154,12 +30740,16 @@ fn generate_muse_glimmer(
             for ev in events {
                 match ev {
                     GlimmerEmit::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
-                    GlimmerEmit::Token(text) => emit_visible_token(stdout, id, &text),
+                    GlimmerEmit::Token(text) => {
+                        glimmer_visible_acc.push_str(&text);
+                        emit_visible_token(stdout, id, &text)
+                    },
                 }
             }
-            m.conversation_tokens.push(next_tok);
-            generated_count += 1;
-
+            if harmony_router.just_forced() {
+                glimmer_recorder.mark_forced_reasoning_close();
+            }
+            glimmer_recorder.push(next_tok, &frag);
             if should_stop {
                 break;
             }
@@ -30194,7 +30784,17 @@ fn generate_muse_glimmer(
         }
     }
 
-    m.seq_pos = bundle.state.n_tokens;
+    {
+        let hit_length_cap = generated_count >= max_tokens;
+        let is_empty = glimmer_emitted_ids.is_empty();
+        let should_store = !hit_length_cap && !is_empty;
+        if should_store {
+            let ordinal = messages_history.map(|h| h.iter().filter(|m| matches!(m.role, hipfire_runtime::prompt_frame::Role::Assistant)).count()).unwrap_or(0);
+            let parsed_tool_calls = parse_glimmer_atem(&glimmer_visible_acc).unwrap_or_default();
+            let _ = glimmer_store_cached_turn(&mut m.asst_turn_cache, glimmer_recorder, &parsed_tool_calls, ordinal);
+        }
+    }
+    let _ = reconcile_glimmer_mirror(&mut bundle.state, &mut bundle.target_hidden_host, &mut m.conversation_tokens, &mut m.seq_pos);
 
     let decode_ms = decode_t0.elapsed().as_millis().max(1);
     let total_ms = t0.elapsed().as_millis().max(1);
@@ -30271,6 +30871,7 @@ fn generate_lfm2moe(
                 user: prompt,
                 enable_thinking: max_think_tokens != 1,
                 bos_token: None,
+            reasoning_strength: None,
             };
             let render_result = if tools.is_some() || messages_history.is_some() {
                 let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
@@ -30283,6 +30884,9 @@ fn generate_lfm2moe(
                                 v.push(hipfire_runtime::prompt_frame::Message {
                                     role: hipfire_runtime::prompt_frame::Role::System,
                                     content: sys.to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
                                     tool_calls: Vec::new(),
                                     tool_call_id: None,
                                     tool_plan: String::new(),
@@ -30291,6 +30895,9 @@ fn generate_lfm2moe(
                             v.push(hipfire_runtime::prompt_frame::Message {
                                 role: hipfire_runtime::prompt_frame::Role::User,
                                 content: prompt.to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
                                 tool_calls: Vec::new(),
                                 tool_call_id: None,
                                 tool_plan: String::new(),
@@ -30651,6 +31258,7 @@ fn generate_minimax(
                 user: prompt,
                 enable_thinking: max_think_tokens != 1,
                 bos_token: None,
+            reasoning_strength: None,
             };
             let render_result = if tools.is_some() || messages_history.is_some() {
                 let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
@@ -30663,6 +31271,9 @@ fn generate_minimax(
                                 v.push(hipfire_runtime::prompt_frame::Message {
                                     role: hipfire_runtime::prompt_frame::Role::System,
                                     content: sys.to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
                                     tool_calls: Vec::new(),
                                     tool_call_id: None,
                                     tool_plan: String::new(),
@@ -30671,6 +31282,9 @@ fn generate_minimax(
                             v.push(hipfire_runtime::prompt_frame::Message {
                                 role: hipfire_runtime::prompt_frame::Role::User,
                                 content: prompt.to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
                                 tool_calls: Vec::new(),
                                 tool_call_id: None,
                                 tool_plan: String::new(),
@@ -31067,6 +31681,7 @@ fn generate_cohere2moe(
                 user: prompt,
                 enable_thinking: max_think_tokens != 1,
                 bos_token: None,
+            reasoning_strength: None,
             };
             let render_result = if tools.is_some() || messages_history.is_some() {
                 let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
@@ -31079,6 +31694,9 @@ fn generate_cohere2moe(
                                 v.push(hipfire_runtime::prompt_frame::Message {
                                     role: hipfire_runtime::prompt_frame::Role::System,
                                     content: sys.to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
                                     tool_calls: Vec::new(),
                                     tool_call_id: None,
                                     tool_plan: String::new(),
@@ -31087,6 +31705,9 @@ fn generate_cohere2moe(
                             v.push(hipfire_runtime::prompt_frame::Message {
                                 role: hipfire_runtime::prompt_frame::Role::User,
                                 content: prompt.to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
                                 tool_calls: Vec::new(),
                                 tool_call_id: None,
                                 tool_plan: String::new(),
@@ -31548,8 +32169,12 @@ fn generate_cohere2moe(
                         .cloned()
                         .unwrap_or_else(|| serde_json::json!({}));
                     if !name.is_empty() {
-                        held_tool_calls
-                            .push(hipfire_runtime::prompt_frame::ToolCall { name, arguments });
+                        held_tool_calls.push(hipfire_runtime::prompt_frame::ToolCall {
+                            id: None,
+                            name,
+                            arguments,
+                            rendered_body: None,
+                        });
                     }
                 }
                 emitted_visible = true;
@@ -31653,8 +32278,12 @@ fn generate_cohere2moe(
                     .cloned()
                     .unwrap_or_else(|| serde_json::json!({}));
                 if !name.is_empty() {
-                    held_tool_calls
-                        .push(hipfire_runtime::prompt_frame::ToolCall { name, arguments });
+                    held_tool_calls.push(hipfire_runtime::prompt_frame::ToolCall {
+                        id: None,
+                        name,
+                        arguments,
+                        rendered_body: None,
+                    });
                 }
             }
         }
@@ -31779,6 +32408,7 @@ fn generate_qwen2(
             user: prompt,
             enable_thinking: true,
             bos_token: None,
+            reasoning_strength: None,
         };
         match frame.render() {
             Ok(rendered) => tokenizer.encode(&rendered),
@@ -34678,8 +35308,10 @@ mod qwen_ar_semantic_route_tests {
             &mut sink,
             hostile,
             &[hipfire_runtime::prompt_frame::ToolCall {
-                name: "n".into(),
+                id: None,
+                    name: "n".into(),
                 arguments: serde_json::json!({}),
+                    rendered_body: None,
             }],
         );
         emit_qwen_ar_done(
@@ -35272,8 +35904,10 @@ mod ds4_malformed_terminal_tests {
                 let wire: Vec<ToolCall> = calls
                     .into_iter()
                     .map(|c| ToolCall {
-                        name: c.name,
+                        id: None,
+                    name: c.name,
                         arguments: c.arguments,
+                    rendered_body: None,
                     })
                     .collect();
                 ds4_ar_ep_finish_route(None, wire, false)
@@ -35496,7 +36130,7 @@ mod ds4_malformed_terminal_tests {
     #[test]
     fn stream_event_tool_calls_not_wireable_mid_turn() {
         let ev = StreamEvent::ToolCalls(vec![hipfire_arch_deepseek4::dsml::ToolCall {
-            name: "x".into(),
+                    name: "x".into(),
             arguments: serde_json::json!({}),
         }]);
         assert!(!ds4_stream_event_wireable(&ev));
@@ -35593,8 +36227,10 @@ mod ds4_malformed_terminal_tests {
     #[test]
     fn ds4_safe_terminal_stores_verbatim_raw_replay_tokens() {
         let calls = vec![ToolCall {
-            name: "lookup".into(),
+            id: None,
+                    name: "lookup".into(),
             arguments: serde_json::json!({"q": "x"}),
+                    rendered_body: None,
         }];
         let finish = FinishSummary {
             events: vec![
@@ -35656,8 +36292,10 @@ mod ds4_malformed_terminal_tests {
     fn ds4_length_and_fail_closed_skip_cache_store() {
         let finish_tools = FinishSummary {
             events: vec![ClientEvent::ToolCalls(vec![ToolCall {
-                name: "alpha".into(),
+                id: None,
+                    name: "alpha".into(),
                 arguments: serde_json::json!({}),
+                    rendered_body: None,
             }])],
             finish_reason: "tool_calls",
             tool_calls: 1,
@@ -35940,8 +36578,10 @@ mod ds4_malformed_terminal_tests {
     #[test]
     fn ds4_ar_ep_safe_commit_gate_retains_calls_cache_done() {
         let call = ToolCall {
-            name: "search".into(),
+            id: None,
+                    name: "search".into(),
             arguments: serde_json::json!({"q": "x"}),
+                    rendered_body: None,
         };
         let terminal = ds4_ar_ep_finish_route(None, vec![call.clone()], false);
         let Ds4ArEpRouteTerminal::Safe {
@@ -35989,8 +36629,10 @@ mod ds4_malformed_terminal_tests {
     #[test]
     fn ds4_ar_ep_safe_abort_gate_suppresses_calls_cache_done() {
         let call = ToolCall {
-            name: "search".into(),
+            id: None,
+                    name: "search".into(),
             arguments: serde_json::json!({"q": "x"}),
+                    rendered_body: None,
         };
         let terminal = ds4_ar_ep_finish_route(None, vec![call], false);
         let Ds4ArEpRouteTerminal::Safe {
@@ -36354,8 +36996,10 @@ mod qwen_dflash_semantic_terminal_tests {
     #[test]
     fn tool_safe_releases_calls_and_stores() {
         let calls = vec![ToolCall {
-            name: "get_weather".into(),
+            id: None,
+                    name: "get_weather".into(),
             arguments: serde_json::json!({"city": "SF"}),
+                    rendered_body: None,
         }];
         let fin = summary_tool_calls(calls.clone());
         let term = qwen_dflash_wire_terminal(&fin, false, false, "Sure.", false);
@@ -36383,8 +37027,10 @@ mod qwen_dflash_semantic_terminal_tests {
     #[test]
     fn pure_length_suppresses_calls_and_cache() {
         let calls = vec![ToolCall {
-            name: "t".into(),
+            id: None,
+                    name: "t".into(),
             arguments: serde_json::json!({}),
+                    rendered_body: None,
         }];
         let fin = summary_tool_calls(calls);
         assert!(qwen_dflash_hit_length_cap(16, 16, false, false));
@@ -36420,8 +37066,10 @@ mod qwen_dflash_semantic_terminal_tests {
     fn final_token_eot_beats_length() {
         assert!(!qwen_dflash_hit_length_cap(8, 8, true, false));
         let calls = vec![ToolCall {
-            name: "t".into(),
+            id: None,
+                    name: "t".into(),
             arguments: serde_json::json!({}),
+                    rendered_body: None,
         }];
         let fin = summary_tool_calls(calls);
         let term = qwen_dflash_wire_terminal(&fin, false, false, "ok", false);
@@ -36467,8 +37115,10 @@ mod qwen_dflash_semantic_terminal_tests {
     #[test]
     fn grammar_failure_no_calls_no_cache() {
         let calls = vec![ToolCall {
-            name: "t".into(),
+            id: None,
+                    name: "t".into(),
             arguments: serde_json::json!({}),
+                    rendered_body: None,
         }];
         let fin = summary_tool_calls(calls);
         let term = qwen_dflash_wire_terminal(&fin, false, true, "x", false);
@@ -37157,8 +37807,10 @@ mod qwen_dflash_semantic_terminal_tests {
     #[test]
     fn ordinary_length_cutoff_no_calls_no_cache() {
         let calls = vec![ToolCall {
-            name: "t".into(),
+            id: None,
+                    name: "t".into(),
             arguments: serde_json::json!({}),
+                    rendered_body: None,
         }];
         let fin = summary_tool_calls(calls);
         let term = qwen_dflash_wire_terminal(&fin, true, false, "x", false);
@@ -37221,8 +37873,10 @@ mod qwen_dflash_semantic_terminal_tests {
     fn grammar_lifecycle_error_only_serialized() {
         set_active_attempt_id(7);
         let fin = summary_tool_calls(vec![ToolCall {
-            name: "t".into(),
+            id: None,
+                    name: "t".into(),
             arguments: serde_json::json!({}),
+                    rendered_body: None,
         }]);
         let term = qwen_dflash_wire_terminal(&fin, false, true, "x", false);
         let mut sink = Vec::new();
@@ -37269,8 +37923,10 @@ mod qwen_dflash_semantic_terminal_tests {
             &mut sink,
             id,
             &[ToolCall {
-                name: "n".into(),
+                id: None,
+                    name: "n".into(),
                 arguments: serde_json::json!({"x": 1}),
+                    rendered_body: None,
             }],
         );
         let out = String::from_utf8(sink).unwrap();
@@ -38366,8 +39022,10 @@ mod qwen_dflash_semantic_terminal_tests {
         assert!(hit_length_cap);
 
         let finish = summary_tool_calls(vec![ToolCall {
-            name: "held".into(),
+            id: None,
+                    name: "held".into(),
             arguments: serde_json::json!({}),
+                    rendered_body: None,
         }]);
         assert!(finish.tool_calls > 0);
 
@@ -38837,8 +39495,10 @@ mod qwen_dflash_semantic_terminal_tests {
     #[test]
     fn held_tool_calls_with_semantic_stop_at_cap_is_tool_calls_not_length() {
         let calls = vec![ToolCall {
-            name: "get_weather".into(),
+            id: None,
+                    name: "get_weather".into(),
             arguments: serde_json::json!({"city": "SF"}),
+                    rendered_body: None,
         }];
         let fin = summary_tool_calls(calls.clone());
         let held = finish_summary_held_tool_calls(&fin);
@@ -39173,8 +39833,10 @@ mod qwen_dflash_semantic_terminal_tests {
         assert!(e.release_tool_calls && e.store_cache && e.emit_done);
         // Successful Done classify → intended flags gate release/store.
         let tc = ToolCall {
-            name: "read".into(),
+            id: None,
+                    name: "read".into(),
             arguments: r#"{"path":"/x"}"#.into(),
+                    rendered_body: None,
         };
         let term = qwen_dflash_wire_terminal(
             &summary_tool_calls(vec![tc.clone()]),
@@ -39210,8 +39872,10 @@ mod qwen_dflash_semantic_terminal_tests {
     fn dflash_client_abort_suppresses_release_store_done() {
         set_active_attempt_id(33);
         let tc = ToolCall {
-            name: "read".into(),
+            id: None,
+                    name: "read".into(),
             arguments: r#"{"path":"/x"}"#.into(),
+                    rendered_body: None,
         };
         let term =
             qwen_dflash_wire_terminal(&summary_tool_calls(vec![tc]), false, false, "Sure.", false);
@@ -39949,6 +40613,271 @@ mod generation_route_matrix_tests {
         // Pin count so accidental ALL edits surface here too.
         assert_eq!(GenerationRoute::ALL.len(), 20);
         assert_eq!(capability_rows().len(), 20);
+    }
+}
+
+#[cfg(test)]
+mod glimmer_channel_recorder_tests {
+    use super::*;
+    use hipfire_runtime::prompt_frame::{CachedAssistantBody, CachedAssistantToolBody};
+
+    #[test]
+    fn splits_self_then_user() {
+        let mut rec = GlimmerChannelRecorder::new(true);
+        rec.push(GLIMMER_START_ID, "<|start|>");
+        rec.push(100, "assistant to=self");
+        rec.push(GLIMMER_MESSAGE_ID, "<|message|>");
+        rec.push(101, "reasoning body");
+        rec.push(102, " more");
+        rec.push(GLIMMER_EOM_ID, "<|eom|>");
+        rec.push(GLIMMER_START_ID, "<|start|>");
+        rec.push(103, "assistant to=user");
+        rec.push(GLIMMER_MESSAGE_ID, "<|message|>");
+        rec.push(104, "answer body");
+        rec.push(GLIMMER_EOT_ID, "<|eot|>");
+        let turn = rec.into_cached_turn(&[]).expect("should succeed");
+        assert!(turn.reasoning.is_some());
+        assert_eq!(turn.reasoning.unwrap().text, "reasoning body more");
+        assert_eq!(turn.tools.len(), 0);
+        assert!(turn.content.is_some());
+        assert_eq!(turn.content.unwrap().text, "answer body");
+    }
+
+    #[test]
+    fn splits_self_then_tool() {
+        let mut rec = GlimmerChannelRecorder::new(true);
+        rec.push(GLIMMER_START_ID, "<|start|>");
+        rec.push(100, "assistant to=self");
+        rec.push(GLIMMER_MESSAGE_ID, "<|message|>");
+        rec.push(101, "reasoning");
+        rec.push(GLIMMER_EOM_ID, "<|eom|>");
+        rec.push(GLIMMER_START_ID, "<|start|>");
+        rec.push(102, "assistant to=weather.get_forecast");
+        rec.push(GLIMMER_MESSAGE_ID, "<|message|>");
+        let atem = "<atem:function_calls>\n<atem:invoke name=\"weather.get_forecast\">\n<atem:parameter name=\"location\">Paris</atem:parameter>\n</atem:invoke>\n</atem:function_calls>";
+        for (i, c) in atem.chars().enumerate() {
+            rec.push(200 + i as u32, &c.to_string());
+        }
+        rec.push(GLIMMER_EOT_ID, "<|eot|>");
+        let tool_call = hipfire_runtime::prompt_frame::ToolCall { id: Some("call_0".into()), name: "weather.get_forecast".into(), arguments: serde_json::json!({"location":"Paris"}), rendered_body: None };
+        let turn = rec.into_cached_turn(&[tool_call]).expect("should succeed");
+        assert!(turn.reasoning.is_some());
+        assert_eq!(turn.tools.len(), 1);
+        assert_eq!(turn.tools[0].recipient, "weather.get_forecast");
+        assert!(turn.content.is_none());
+    }
+
+    #[test]
+    fn refuses_forced_reasoning_close() {
+        let mut rec = GlimmerChannelRecorder::new(true);
+        rec.push(GLIMMER_START_ID, "<|start|>");
+        rec.push(100, "assistant to=self");
+        rec.push(GLIMMER_MESSAGE_ID, "<|message|>");
+        rec.push(101, "reasoning");
+        rec.mark_forced_reasoning_close();
+        rec.push(GLIMMER_EOM_ID, "<|eom|>");
+        let res = rec.into_cached_turn(&[]);
+        assert_eq!(res.unwrap_err(), GlimmerRecordRefusal::ForcedReasoningClose);
+    }
+
+    #[test]
+    fn refuses_empty_self_body() {
+        let mut rec = GlimmerChannelRecorder::new(true);
+        rec.push(GLIMMER_START_ID, "<|start|>");
+        rec.push(100, "assistant to=self");
+        rec.push(GLIMMER_MESSAGE_ID, "<|message|>");
+        rec.push(GLIMMER_EOM_ID, "<|eom|>");
+        let res = rec.into_cached_turn(&[]);
+        assert_eq!(res.unwrap_err(), GlimmerRecordRefusal::EmptySelfBody);
+    }
+
+    #[test]
+    fn refuses_thinking_disabled_self() {
+        let mut rec = GlimmerChannelRecorder::new(false);
+        rec.push(GLIMMER_START_ID, "<|start|>");
+        rec.push(100, "assistant to=self");
+        rec.push(GLIMMER_MESSAGE_ID, "<|message|>");
+        rec.push(101, "reasoning");
+        rec.push(GLIMMER_EOM_ID, "<|eom|>");
+        let res = rec.into_cached_turn(&[]);
+        assert_eq!(res.unwrap_err(), GlimmerRecordRefusal::ThinkingDisabledSelf);
+    }
+
+    #[test]
+    fn store_cached_turn_self_then_user_inserts_both_channels() {
+        let mut rec = GlimmerChannelRecorder::new(true);
+        rec.push(GLIMMER_START_ID, "<|start|>");
+        rec.push(100, "assistant to=self");
+        rec.push(GLIMMER_MESSAGE_ID, "<|message|>");
+        rec.push(101, "reasoning body");
+        rec.push(102, " more");
+        rec.push(GLIMMER_EOM_ID, "<|eom|>");
+        rec.push(GLIMMER_START_ID, "<|start|>");
+        rec.push(103, "assistant to=user");
+        rec.push(GLIMMER_MESSAGE_ID, "<|message|>");
+        rec.push(104, "answer body");
+        rec.push(105, "!");
+        rec.push(GLIMMER_EOT_ID, "<|eot|>");
+        let mut cache = hipfire_loader::AsstTurnCache::new_from_env();
+        cache.clear();
+        let ok = glimmer_store_cached_turn(&mut cache, rec, &[], 0);
+        assert!(ok, "store should succeed");
+        let normalized = hipfire_runtime::tokenizer::maybe_normalize_prompt("answer body!").into_owned();
+        let fp_raw = asst_turn_fingerprint(&normalized, &[]);
+        let fp = glimmer_turn_key(fp_raw, 0);
+        let turn = cache.get(&fp).expect("cache should contain inserted turn").clone();
+        assert!(turn.reasoning.is_some(), "reasoning should be Some");
+        assert!(turn.content.is_some(), "content should be Some");
+        assert_eq!(turn.reasoning.unwrap().token_ids, vec![101, 102]);
+        assert_eq!(turn.content.unwrap().token_ids, vec![104, 105]);
+        assert!(turn.tools.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod glimmer_atem_parser_tests {
+    use super::*;
+
+    #[test]
+    fn parses_representative_block() {
+        let body = "<atem:function_calls>\n<atem:invoke name=\"weather.get_forecast\">\n<atem:parameter name=\"location\">Paris</atem:parameter>\n<atem:parameter name=\"options\">{\"units\":\"celsius\",\"days\":[1,2]}</atem:parameter>\n<atem:parameter name=\"include_alerts\">true</atem:parameter>\n<atem:parameter name=\"fallback\">null</atem:parameter>\n</atem:invoke>\n</atem:function_calls>";
+        let calls = parse_glimmer_atem(body).expect("parse should succeed");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "weather.get_forecast");
+        assert_eq!(calls[0].arguments["location"], serde_json::Value::String("Paris".into()));
+        assert_eq!(calls[0].arguments["options"]["units"], serde_json::Value::String("celsius".into()));
+        assert_eq!(calls[0].arguments["options"]["days"], serde_json::json!([1,2]));
+        assert_eq!(calls[0].arguments["include_alerts"], serde_json::Value::Bool(true));
+        assert_eq!(calls[0].arguments["fallback"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn parses_adversarial_chunk_splits() {
+        let body = "<atem:function_calls>\n<atem:invoke name=\"test.func\">\n<atem:parameter name=\"a\">1</atem:parameter>\n<atem:parameter name=\"b\">{\"x\":1}</atem:parameter>\n</atem:invoke>\n</atem:function_calls>";
+        for split in 1..body.len() {
+            if !body.is_char_boundary(split) { continue; }
+            let (left, right) = body.split_at(split);
+            let combined = left.to_string() + right;
+            let calls = parse_glimmer_atem(&combined).expect("should parse after split");
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].name, "test.func");
+        }
+        let body2 = "<atem:function_calls>\n<atem:invoke name=\"test.func\">\n<atem:parameter name=\"msg\">hello \u{1F30D}</atem:parameter>\n</atem:invoke>\n</atem:function_calls>";
+        let calls2 = parse_glimmer_atem(body2).expect("should parse multibyte");
+        assert_eq!(calls2[0].arguments["msg"], serde_json::Value::String("hello \u{1F30D}".into()));
+    }
+
+    #[test]
+    fn parses_multiple_invokes() {
+        let body = "<atem:function_calls>\n<atem:invoke name=\"func1\">\n<atem:parameter name=\"a\">1</atem:parameter>\n</atem:invoke>\n</atem:function_calls>\n<atem:function_calls>\n<atem:invoke name=\"func2\">\n<atem:parameter name=\"b\">2</atem:parameter>\n</atem:invoke>\n</atem:function_calls>";
+        let calls = parse_glimmer_atem(body).expect("multiple");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "func1");
+        assert_eq!(calls[1].name, "func2");
+    }
+}
+
+#[cfg(test)]
+mod glimmer_reconcile_tests {
+    use super::*;
+    #[test]
+    fn mirror_action_aligned() {
+        assert_eq!(glimmer_mirror_action(5, 5), GlimmerMirrorAction::Aligned);
+        assert_eq!(glimmer_mirror_action(0, 0), GlimmerMirrorAction::Aligned);
+    }
+    #[test]
+    fn mirror_action_truncate() {
+        assert_eq!(glimmer_mirror_action(5, 3), GlimmerMirrorAction::TruncateMirror(3));
+        assert_eq!(glimmer_mirror_action(10, 0), GlimmerMirrorAction::TruncateMirror(0));
+    }
+    #[test]
+    fn mirror_action_rollback() {
+        assert_eq!(glimmer_mirror_action(3, 5), GlimmerMirrorAction::RollbackCursor(3));
+        assert_eq!(glimmer_mirror_action(0, 5), GlimmerMirrorAction::RollbackCursor(0));
+    }
+    #[test]
+    fn hidden_keep_len_aligned_truncate() {
+        assert_eq!(glimmer_hidden_keep_len(50, 5, 3), Some(30));
+        assert_eq!(glimmer_hidden_keep_len(0, 5, 3), None);
+        assert_eq!(glimmer_hidden_keep_len(51, 5, 3), None);
+        assert_eq!(glimmer_hidden_keep_len(50, 0, 3), None);
+    }
+    #[test]
+    fn hidden_keep_len_rollback() {
+        assert_eq!(glimmer_hidden_keep_len(50, 5, 3), Some(30));
+        assert_eq!(glimmer_hidden_keep_len(30, 3, 3), Some(30));
+    }
+    #[test]
+    fn glimmer_turn_key_ordinal_salts() {
+        let fp = asst_turn_fingerprint("Done.", &[]);
+        let k0 = glimmer_turn_key(fp, 0);
+        let k1 = glimmer_turn_key(fp, 1);
+        let k2 = glimmer_turn_key(fp, 2);
+        assert_ne!(k0, k1, "identical content at different ordinals must have different keys");
+        assert_ne!(k1, k2);
+        assert_ne!(k0, k2);
+        assert_eq!(k0, glimmer_turn_key(fp, 0));
+        assert_eq!(k1, glimmer_turn_key(fp, 1));
+    }
+}
+#[cfg(test)]
+mod glimmer_history_prep_tests {
+    use super::*;
+
+    #[test]
+    fn normalize_arguments_object() {
+        let v = serde_json::json!({"a":1});
+        assert_eq!(normalize_glimmer_tool_arguments(&v).unwrap(), v);
+    }
+
+    #[test]
+    fn normalize_arguments_null() {
+        let v = serde_json::Value::Null;
+        assert_eq!(normalize_glimmer_tool_arguments(&v).unwrap(), serde_json::json!({}));
+    }
+
+    #[test]
+    fn normalize_arguments_string_object() {
+        let v = serde_json::Value::String("{\"a\":1}".into());
+        assert_eq!(normalize_glimmer_tool_arguments(&v).unwrap(), serde_json::json!({"a":1}));
+    }
+
+    #[test]
+    fn normalize_arguments_string_invalid() {
+        let v = serde_json::Value::String("not json".into());
+        assert!(normalize_glimmer_tool_arguments(&v).is_err());
+    }
+
+    #[test]
+    fn normalize_arguments_string_non_object() {
+        let v = serde_json::Value::String("[1,2]".into());
+        assert!(normalize_glimmer_tool_arguments(&v).is_err());
+    }
+
+    #[test]
+    fn prepare_history_resolves_name() {
+        let assistant = hipfire_runtime::prompt_frame::Message {
+            role: hipfire_runtime::prompt_frame::Role::Assistant,
+            content: "hi".into(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
+            tool_calls: vec![hipfire_runtime::prompt_frame::ToolCall { id: Some("call_0".into()), name: "weather.get_forecast".into(), arguments: serde_json::json!({"location":"Paris"}), rendered_body: None }],
+            tool_call_id: None,
+            tool_plan: String::new(),
+        };
+        let tool = hipfire_runtime::prompt_frame::Message {
+            role: hipfire_runtime::prompt_frame::Role::Tool,
+            content: "sunny".into(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
+            tool_calls: vec![],
+            tool_call_id: Some("call_0".into()),
+            tool_plan: String::new(),
+        };
+        let out = prepare_glimmer_onyx_history(&[assistant, tool]).expect("should succeed");
+        assert_eq!(out[1].rendered_name, Some("weather.get_forecast".into()));
     }
 }
 

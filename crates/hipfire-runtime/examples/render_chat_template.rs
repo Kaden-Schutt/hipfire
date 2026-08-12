@@ -41,6 +41,7 @@ fn main() {
         user: &prompt,
         enable_thinking: true,
         bos_token: None,
+        reasoning_strength: None,
     };
 
     eprintln!("=== template lines around 45 ===");

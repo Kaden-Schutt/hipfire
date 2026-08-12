@@ -2204,7 +2204,8 @@ fn chat_command(paths: &Paths, args: ChatArgs) -> Result<()> {
         }
         print!("assistant> ");
         std::io::stdout().flush()?;
-        let mut assistant = String::new();
+        let mut assistant_reasoning = String::new();
+        let mut assistant_content = String::new();
         let result = stream_openai_chat(
             client_host,
             port,
@@ -2212,8 +2213,13 @@ fn chat_command(paths: &Paths, args: ChatArgs) -> Result<()> {
             Duration::from_secs(60 * 60),
             |event| {
                 match event {
-                    OpenAiSseEvent::Reasoning { text } | OpenAiSseEvent::Content { text } => {
-                        assistant.push_str(&text);
+                    OpenAiSseEvent::Reasoning { text } => {
+                        assistant_reasoning.push_str(&text);
+                        print!("{text}");
+                        std::io::stdout().flush()?;
+                    }
+                    OpenAiSseEvent::Content { text } => {
+                        assistant_content.push_str(&text);
                         print!("{text}");
                         std::io::stdout().flush()?;
                     }
@@ -2232,7 +2238,11 @@ fn chat_command(paths: &Paths, args: ChatArgs) -> Result<()> {
             messages.pop();
             return Err(error.into());
         }
-        messages.push(serde_json::json!({ "role": "assistant", "content": assistant }));
+        let mut assistant_msg = serde_json::json!({ "role": "assistant", "content": assistant_content });
+        if !assistant_reasoning.is_empty() {
+            assistant_msg["reasoning_content"] = serde_json::Value::String(assistant_reasoning);
+        }
+        messages.push(assistant_msg);
     }
     let _ = args.no_color;
     Ok(())
@@ -3559,7 +3569,12 @@ fn tool_call_from_canonical_value(value: &serde_json::Value) -> Result<ToolCall,
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
-    Ok(ToolCall { name, arguments })
+    Ok(ToolCall {
+        id: None,
+        name,
+        arguments,
+        rendered_body: None,
+    })
 }
 
 /// Convert a retained legacy completion-boundary tool-call JSON value into
@@ -4529,7 +4544,10 @@ fn complete_request_attempt(
         if runtime.current_max_seq < required_max_seq {
             runtime.ensure_model(&model, &shared.meta, Some(required_max_seq))?;
         }
-        let mut normalized_messages = normalize_openai_messages(body.get("messages"));
+        let include_reasoning_content =
+            runtime.current_arch.as_deref() == Some("muse_glimmer");
+        let mut normalized_messages =
+            normalize_openai_messages(body.get("messages"), include_reasoning_content);
         let default_system = request_string(&resolved, "prompt.system", None)?;
         inject_default_system_message(&mut normalized_messages, default_system.as_deref());
         let mut generate = serde_json::json!({
@@ -5160,23 +5178,43 @@ fn inline_thinking(text: &str) -> Option<String> {
     (!reasoning.is_empty()).then(|| reasoning.to_owned())
 }
 
-fn normalize_openai_tool_call(call: &serde_json::Value) -> serde_json::Value {
+fn normalize_openai_tool_call(call: &serde_json::Value, include_reasoning_content: bool) -> serde_json::Value {
     let function = call.get("function").unwrap_or(call);
     let name = function
         .get("name")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("unknown");
+    let id = call
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty());
     let arguments = match function.get("arguments") {
         Some(serde_json::Value::String(raw)) => {
-            serde_json::from_str(raw).unwrap_or_else(|_| serde_json::json!({ "_raw": raw }))
+            match serde_json::from_str::<serde_json::Value>(raw) {
+                Ok(parsed) if parsed.is_object() => parsed,
+                _ => {
+                    if include_reasoning_content {
+                        serde_json::Value::String(raw.clone())
+                    } else {
+                        serde_json::json!({ "_raw": raw })
+                    }
+                }
+            }
         }
         Some(value) => value.clone(),
         None => serde_json::json!({}),
     };
-    serde_json::json!({ "name": name, "arguments": arguments })
+    let mut obj = serde_json::json!({ "name": name, "arguments": arguments });
+    if let Some(id_str) = id {
+        obj["id"] = serde_json::Value::String(id_str.to_owned());
+    }
+    obj
 }
 
-fn normalize_openai_messages(messages: Option<&serde_json::Value>) -> serde_json::Value {
+fn normalize_openai_messages(
+    messages: Option<&serde_json::Value>,
+    include_reasoning_content: bool,
+) -> serde_json::Value {
     let Some(messages) = messages.and_then(serde_json::Value::as_array) else {
         return serde_json::json!([]);
     };
@@ -5212,6 +5250,9 @@ fn normalize_openai_messages(messages: Option<&serde_json::Value>) -> serde_json
                     .map(str::to_owned)
                     .or_else(|| inline_thinking(&raw_content));
                 if let Some(reasoning) = reasoning {
+                    if include_reasoning_content {
+                        entry["reasoning_content"] = serde_json::Value::String(reasoning.clone());
+                    }
                     entry["tool_plan"] = serde_json::Value::String(reasoning);
                 }
                 if let Some(calls) = message
@@ -5220,7 +5261,10 @@ fn normalize_openai_messages(messages: Option<&serde_json::Value>) -> serde_json
                     .filter(|calls| !calls.is_empty())
                 {
                     entry["tool_calls"] = serde_json::Value::Array(
-                        calls.iter().map(normalize_openai_tool_call).collect(),
+                        calls
+                            .iter()
+                            .map(|c| normalize_openai_tool_call(c, include_reasoning_content))
+                            .collect(),
                     );
                 }
             } else if role == "tool" {
@@ -5230,6 +5274,13 @@ fn normalize_openai_messages(messages: Option<&serde_json::Value>) -> serde_json
                     .filter(|id| !id.is_empty())
                 {
                     entry["tool_call_id"] = serde_json::Value::String(tool_call_id.to_owned());
+                }
+                if let Some(name) = message
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|n| !n.is_empty())
+                {
+                    entry["name"] = serde_json::Value::String(name.to_owned());
                 }
             }
             Some(entry)
@@ -10023,7 +10074,7 @@ mod tests {
                 ] }
             ]
         });
-        let messages = normalize_openai_messages(body.get("messages"));
+        let messages = normalize_openai_messages(body.get("messages"), false);
         assert_eq!(last_user_prompt(&messages).as_deref(), Some("onetwo"));
     }
 
@@ -10079,34 +10130,50 @@ mod tests {
                 { "role": "unsupported", "content": "drop me" }
             ]
         });
-        let normalized = normalize_openai_messages(body.get("messages"));
+        // Flag OFF — today's exact shape unchanged, no reasoning_content key
+        let normalized = normalize_openai_messages(body.get("messages"), false);
         assert_eq!(normalized.as_array().unwrap().len(), 4);
         assert_eq!(normalized[0]["role"], "system");
         assert_eq!(normalized[1]["content"], "first second");
         assert_eq!(normalized[2]["content"], "");
         assert_eq!(normalized[2]["tool_plan"], "tool reasoning");
+        assert!(normalized[2].get("reasoning_content").is_none());
         assert_eq!(normalized[2]["tool_calls"][0]["name"], "read_file");
+        assert_eq!(normalized[2]["tool_calls"][0]["id"], "call_1");
         assert_eq!(
             normalized[2]["tool_calls"][0]["arguments"],
             serde_json::json!({ "path": "README.md" })
         );
         assert_eq!(normalized[3]["role"], "tool");
         assert_eq!(normalized[3]["tool_call_id"], "call_1");
+        // Flag ON — reasoning dual-written, content still visible-only
+        let normalized_on = normalize_openai_messages(body.get("messages"), true);
+        assert_eq!(normalized_on[2]["content"], "");
+        assert_eq!(normalized_on[2]["tool_plan"], "tool reasoning");
+        assert_eq!(normalized_on[2]["reasoning_content"], "tool reasoning");
+        assert_eq!(normalized_on[2]["reasoning_content"], normalized_on[2]["tool_plan"]);
+        assert_eq!(normalized_on[2]["tool_calls"][0]["id"], "call_1");
     }
 
     #[test]
     fn registry_system_prompt_is_injected_only_when_client_omits_one() {
-        let mut messages = normalize_openai_messages(Some(&serde_json::json!([
-            { "role": "user", "content": "hello" }
-        ])));
+        let mut messages = normalize_openai_messages(
+            Some(&serde_json::json!([
+                { "role": "user", "content": "hello" }
+            ])),
+            false,
+        );
         inject_default_system_message(&mut messages, Some("registry identity"));
         assert_eq!(messages[0]["role"], "system");
         assert_eq!(messages[0]["content"], "registry identity");
 
-        let mut messages = normalize_openai_messages(Some(&serde_json::json!([
-            { "role": "developer", "content": "client policy" },
-            { "role": "user", "content": "hello" }
-        ])));
+        let mut messages = normalize_openai_messages(
+            Some(&serde_json::json!([
+                { "role": "developer", "content": "client policy" },
+                { "role": "user", "content": "hello" }
+            ])),
+            false,
+        );
         inject_default_system_message(&mut messages, Some("registry identity"));
         assert_eq!(messages.as_array().unwrap().len(), 2);
         assert_eq!(messages[0]["role"], "system");
@@ -10124,13 +10191,141 @@ mod tests {
                 }]
             }]
         });
-        let normalized = normalize_openai_messages(body.get("messages"));
+        // Flag OFF — repair into _raw
+        let normalized = normalize_openai_messages(body.get("messages"), false);
         assert_eq!(normalized[0]["content"], "visible answer");
         assert_eq!(normalized[0]["tool_plan"], "private plan");
         assert_eq!(
             normalized[0]["tool_calls"][0]["arguments"],
             serde_json::json!({ "_raw": "not-json" })
         );
+        // Flag ON — string that does not parse to object is retained as string for daemon to reject
+        let normalized_on = normalize_openai_messages(body.get("messages"), true);
+        assert_eq!(normalized_on[0]["content"], "visible answer");
+        assert_eq!(normalized_on[0]["tool_plan"], "private plan");
+        assert_eq!(normalized_on[0]["reasoning_content"], "private plan");
+        assert_eq!(
+            normalized_on[0]["tool_calls"][0]["arguments"],
+            serde_json::Value::String("not-json".into())
+        );
+    }
+
+    #[test]
+    fn normalize_reasoning_sources_with_flag_on_and_off() {
+        // reasoning field takes precedence over reasoning_content and inline think
+        let body = serde_json::json!({
+            "messages": [{
+                "role": "assistant",
+                "content": "<think>inline</think>\nvisible",
+                "reasoning": "explicit reasoning",
+                "reasoning_content": "secondary"
+            }]
+        });
+        let off = normalize_openai_messages(body.get("messages"), false);
+        assert_eq!(off[0]["content"], "visible");
+        assert_eq!(off[0]["tool_plan"], "explicit reasoning");
+        assert!(off[0].get("reasoning_content").is_none());
+        let on = normalize_openai_messages(body.get("messages"), true);
+        assert_eq!(on[0]["content"], "visible");
+        assert_eq!(on[0]["tool_plan"], "explicit reasoning");
+        assert_eq!(on[0]["reasoning_content"], "explicit reasoning");
+        assert_eq!(on[0]["reasoning_content"], on[0]["tool_plan"]);
+
+        // reasoning_content when reasoning absent
+        let body2 = serde_json::json!({
+            "messages": [{
+                "role": "assistant",
+                "content": "visible only",
+                "reasoning_content": "from content field"
+            }]
+        });
+        let off2 = normalize_openai_messages(body2.get("messages"), false);
+        assert_eq!(off2[0]["tool_plan"], "from content field");
+        assert!(off2[0].get("reasoning_content").is_none());
+        let on2 = normalize_openai_messages(body2.get("messages"), true);
+        assert_eq!(on2[0]["reasoning_content"], "from content field");
+        assert_eq!(on2[0]["tool_plan"], "from content field");
+        assert_eq!(on2[0]["content"], "visible only");
+
+        // inline <think> when neither reasoning field present
+        let body3 = serde_json::json!({
+            "messages": [{
+                "role": "assistant",
+                "content": "<think>inline think</think>\n\nvisible answer"
+            }]
+        });
+        let off3 = normalize_openai_messages(body3.get("messages"), false);
+        assert_eq!(off3[0]["content"], "visible answer");
+        assert_eq!(off3[0]["tool_plan"], "inline think");
+        assert!(off3[0].get("reasoning_content").is_none());
+        let on3 = normalize_openai_messages(body3.get("messages"), true);
+        assert_eq!(on3[0]["content"], "visible answer");
+        assert_eq!(on3[0]["tool_plan"], "inline think");
+        assert_eq!(on3[0]["reasoning_content"], "inline think");
+        assert_eq!(on3[0]["reasoning_content"], on3[0]["tool_plan"]);
+    }
+
+    #[test]
+    fn normalize_tool_call_id_and_tool_result_name_survive() {
+        let body = serde_json::json!({
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": "calling",
+                    "tool_calls": [{
+                        "id": "call_42",
+                        "type": "function",
+                        "function": { "name": "my_tool", "arguments": "{}" }
+                    }]
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_42",
+                    "name": "my_tool",
+                    "content": "result"
+                }
+            ]
+        });
+        for flag in [false, true] {
+            let normalized = normalize_openai_messages(body.get("messages"), flag);
+            assert_eq!(normalized[0]["tool_calls"][0]["id"], "call_42");
+            assert_eq!(normalized[0]["tool_calls"][0]["name"], "my_tool");
+            assert_eq!(normalized[1]["tool_call_id"], "call_42");
+            assert_eq!(normalized[1]["name"], "my_tool");
+            assert_eq!(normalized[1]["content"], "result");
+        }
+    }
+
+    #[test]
+    fn normalize_glimmer_flag_rejects_non_object_arguments_string() {
+        let body = serde_json::json!({
+            "messages": [{
+                "role": "assistant",
+                "content": "x",
+                "tool_calls": [{
+                    "function": { "name": "t", "arguments": "not-json" }
+                }]
+            }]
+        });
+        let off = normalize_openai_messages(body.get("messages"), false);
+        assert_eq!(off[0]["tool_calls"][0]["arguments"], serde_json::json!({ "_raw": "not-json" }));
+        let on = normalize_openai_messages(body.get("messages"), true);
+        assert_eq!(on[0]["tool_calls"][0]["arguments"], serde_json::Value::String("not-json".into()));
+        // JSON string that parses to non-object (array) also surfaces as string under glimmer
+        let body_arr = serde_json::json!({
+            "messages": [{
+                "role": "assistant",
+                "content": "x",
+                "tool_calls": [{
+                    "function": { "name": "t", "arguments": "[1,2]" }
+                }]
+            }]
+        });
+        let on_arr = normalize_openai_messages(body_arr.get("messages"), true);
+        assert_eq!(on_arr[0]["tool_calls"][0]["arguments"], serde_json::Value::String("[1,2]".into()));
+        let off_arr = normalize_openai_messages(body_arr.get("messages"), false);
+        // non-glimmer keeps parsed array (today's behaviour is to keep whatever parsed)
+        assert_eq!(off_arr[0]["tool_calls"][0]["arguments"], serde_json::json!([1,2]));
     }
 
     #[test]
@@ -10971,12 +11166,16 @@ mod tests {
     fn daemon_tool_calls_map_to_openai_shape() {
         let calls = vec![
             ToolCall {
+                id: None,
                 name: "read_file".into(),
                 arguments: serde_json::json!({ "path": "README.md" }),
+                rendered_body: None,
             },
             ToolCall {
+                id: None,
                 name: "write_file".into(),
                 arguments: serde_json::json!({ "path": "out.txt", "text": "hi" }),
+                rendered_body: None,
             },
         ];
         let mapped = openai_tool_calls(&calls);
@@ -11017,8 +11216,10 @@ mod tests {
 
     fn sample_tc(name: &str, arguments: serde_json::Value) -> ToolCall {
         ToolCall {
+            id: None,
             name: name.into(),
             arguments,
+            rendered_body: None,
         }
     }
 
