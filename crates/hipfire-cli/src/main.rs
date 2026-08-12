@@ -5191,8 +5191,18 @@ fn normalize_openai_tool_call(call: &serde_json::Value, include_reasoning_conten
     let arguments = match function.get("arguments") {
         Some(serde_json::Value::String(raw)) => {
             match serde_json::from_str::<serde_json::Value>(raw) {
-                Ok(parsed) if parsed.is_object() => parsed,
-                _ => {
+                // Muse Glimmer's Onyx template requires a MAPPING and calls `raise_exception`
+                // otherwise, which would take the whole render down to a bare unframed prompt.
+                // Surface a parsed-but-not-object payload as the raw string so the daemon's
+                // `normalize_glimmer_tool_arguments` can refuse the request loudly instead.
+                Ok(parsed) if include_reasoning_content && !parsed.is_object() => {
+                    serde_json::Value::String(raw.clone())
+                }
+                // Every other architecture keeps whatever parsed — an array or scalar argument
+                // payload is legal for them, and `_raw`-wrapping it here would invent a tool
+                // parameter the model never saw. This arm is load-bearing for no-clobber.
+                Ok(parsed) => parsed,
+                Err(_) => {
                     if include_reasoning_content {
                         serde_json::Value::String(raw.clone())
                     } else {
