@@ -285,6 +285,54 @@ pub fn decode_step(
     gpu.download_f32(&state.logits)
         .map_err(|e| format!("glimmer: download logits: {e:?}"))
 }
+/// On-device sampled decode: same pipeline as [`decode_step`] but samples on
+/// the GPU and returns `(token, new_rng)` with only an 8-byte D2H.
+///
+/// This exists so AR decode pays an 8-byte D2H instead of `vocab_size * 4`
+/// bytes (~808 KB at 202048) per token. Greedy (`temp <= 1e-6`) routes to
+/// `argmax_f32` to stay byte-identical with the previous host-side path.
+pub fn decode_step_sampled(
+    cfg: &GlimmerConfig,
+    weights: &GlimmerWeights,
+    state: &mut GlimmerState,
+    gpu: &mut Gpu,
+    token_id: u32,
+    position: u32,
+    temp: f32,
+    top_p: f32,
+    top_k: Option<u32>,
+    rng_state: u32,
+) -> Result<(u32, u32), String> {
+    embed_lookup(cfg, weights, state, gpu, token_id)?;
+    decode_step_body(cfg, weights, state, gpu, position)?;
+    if temp <= 1e-6 {
+        let tok = gpu
+            .argmax_f32(&state.logits, cfg.vocab_size)
+            .map_err(|e| format!("glimmer: argmax: {e:?}"))?;
+        return Ok((tok, rng_state));
+    }
+    let top_p_eff = if top_p <= 0.0 || top_p > 1.0 {
+        1.0
+    } else {
+        top_p
+    };
+    gpu.sample_top_p_pf(
+        &state.logits,
+        &state.sample_out,
+        &state.sample_out,
+        cfg.vocab_size,
+        temp,
+        top_p_eff,
+        rng_state,
+        0,
+        1.0,
+        0.0,
+        0.0,
+        top_k,
+        None,
+    )
+    .map_err(|e| format!("glimmer: sample: {e:?}"))
+}
 
 fn embed_lookup(
     _cfg: &GlimmerConfig,

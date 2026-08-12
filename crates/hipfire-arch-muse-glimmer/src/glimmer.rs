@@ -475,6 +475,10 @@ pub struct GlimmerState {
 
     // head
     pub logits: GpuTensor, // [vocab]
+    /// Scratch for on-device sampling: holds `[sampled_token_u32, new_rng_u32]`
+    /// so AR decode pays an 8-byte D2H instead of `vocab_size * 4` bytes
+    /// (~808 KB at 202048) per token.
+    pub sample_out: GpuTensor, // [2] of u32
     /// Persistent [block_max * vocab] logits buffer for the batched lm_head.
     ///
     /// Allocated ONCE. The batched lm_head previously did `alloc_tensor` +
@@ -652,6 +656,7 @@ impl GlimmerState {
             ffn_hidden: alloc(gpu, cfg.hidden_dim, "ffn_hidden")?,
             ffn_out: alloc(gpu, dim, "ffn_out")?,
             logits: alloc(gpu, cfg.vocab_size, "logits")?,
+            sample_out: alloc(gpu, 2, "sample_out")?,
             logits_batch: alloc(
                 gpu,
                 GLIMMER_MAX_SPEC_BLOCK * cfg.vocab_size,
@@ -687,6 +692,7 @@ impl GlimmerState {
             self.ffn_hidden,
             self.ffn_out,
             self.logits,
+            self.sample_out,
             self.logits_batch,
         ] {
             let _ = gpu.free_tensor(t);

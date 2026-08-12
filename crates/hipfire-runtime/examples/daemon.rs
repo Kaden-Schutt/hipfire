@@ -23789,6 +23789,7 @@ fn generate(
             system_prompt,
             temp,
             top_p,
+            top_k.map(|k| k as usize).unwrap_or(0),
             max_tokens,
             max_think_tokens,
             think_mode,
@@ -30015,6 +30016,7 @@ fn generate_muse_glimmer(
     system_prompt: Option<&str>,
     temp: f32,
     top_p: f32,
+    top_k: usize,
     max_tokens: usize,
     max_think_tokens: usize,
     think_mode: hipfire_runtime::prompt_frame::ThinkMode,
@@ -30963,13 +30965,30 @@ fn generate_muse_glimmer(
             eprintln!("[glimmer-spec] done: windows {} proposed {} accepted {} tau {:.3} (bonus per window counted)", windows, total_proposed, total_accepted, tau);
         }
     } else {
-        // AR fallback with Harmony channel routing
+        // AR fallback with Harmony channel routing.
+        //
+        // Sampling runs ON DEVICE from here. `decode_step_sampled` draws the
+        // next token straight out of the resident `state.logits` and hands back
+        // the advanced RNG, so each step pays an 8-byte D2H instead of pulling
+        // the whole 202048-wide logits vector across PCIe (~808 KB/token). That
+        // download was costing 27% of decode throughput at the model card's
+        // sampling settings (22.6 -> measured again below), and it also made
+        // `top_k` unreachable: the old host draw hardcoded it to 0.
+        //
+        // Only the FIRST token is still drawn host-side, from the logits
+        // `prefill` already returned; every subsequent one comes from the GPU.
+        let top_k_opt = if top_k > 0 { Some(top_k as u32) } else { None };
+        let gpu_sample = !matches!(
+            std::env::var("HIPFIRE_GLIMMER_GPU_SAMPLE").ok().as_deref(),
+            Some("0")
+        );
+        let mut gpu_rng: u32 = (rng.next_u64() as u32) | 1;
+        let mut next_tok =
+            deepseek4::sampling::sample_token(&last_logits, temp, top_k, top_p, &mut rng);
         loop {
             if generated_count >= max_tokens {
                 break;
             }
-            let next_tok =
-                deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
             // eos/eot always stop; eom is handled via router text marker
             if stop_set.contains(&next_tok) {
                 // Flush any pending via router marker path then stop
@@ -31027,20 +31046,46 @@ fn generate_muse_glimmer(
             }
 
             let position = bundle.state.n_tokens as u32;
-            let step = glimmer::forward::decode_step(
-                &bundle.config,
-                &bundle.weights,
-                &mut bundle.state,
-                gpu,
-                next_tok,
-                position,
-            );
+            let step = if gpu_sample {
+                glimmer::forward::decode_step_sampled(
+                    &bundle.config,
+                    &bundle.weights,
+                    &mut bundle.state,
+                    gpu,
+                    next_tok,
+                    position,
+                    temp,
+                    top_p,
+                    top_k_opt,
+                    gpu_rng,
+                )
+            } else {
+                // Legacy host-side draw: download the whole logits vector and
+                // sample on the CPU. Kept behind HIPFIRE_GLIMMER_GPU_SAMPLE=0
+                // as the revert switch and as the reference arm for the
+                // greedy byte-identity check.
+                glimmer::forward::decode_step(
+                    &bundle.config,
+                    &bundle.weights,
+                    &mut bundle.state,
+                    gpu,
+                    next_tok,
+                    position,
+                )
+                .map(|logits| {
+                    let tok = deepseek4::sampling::sample_token(
+                        &logits, temp, top_k, top_p, &mut rng,
+                    );
+                    (tok, gpu_rng)
+                })
+            };
             match step {
-                Ok(logits) => {
-                    last_logits = logits;
+                Ok((sampled, new_rng)) => {
+                    gpu_rng = new_rng;
                     m.conversation_tokens.push(next_tok);
                     glimmer_emitted_ids.push(next_tok);
                     generated_count += 1;
+                    next_tok = sampled;
                 },
                 Err(e) => {
                     emit_error_with_id(stdout, id, format!("muse_glimmer decode failed: {e:?}"));
