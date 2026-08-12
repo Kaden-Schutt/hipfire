@@ -1363,6 +1363,7 @@ pub fn verify_block_with_capture(
         let slot = state.kv_slot_for_layer[layer_idx];
         let lw = &weights.layers[layer_idx];
         let has_rope = cfg.has_rope(layer_idx);
+        let window = cfg.window_for(layer_idx);
 
         // residual = x
         gpu.hip.memcpy_dtod_at(&residual.buf, 0, &x.buf, 0, b * dim * 4).map_err(|e| format!("glimmer batch L{layer_idx} save residual: {e:?}"))?;
@@ -1424,11 +1425,55 @@ pub fn verify_block_with_capture(
         gpu.kv_cache_write_q8_0_batched(&k_cache_t, &k, &pos_array, n_kv, hd, b).map_err(|e| format!("glimmer batch L{layer_idx} kv write k: {e:?}"))?;
         gpu.kv_cache_write_q8_0_batched(&v_cache_t, &v, &pos_array, n_kv, hd, b).map_err(|e| format!("glimmer batch L{layer_idx} kv write v: {e:?}"))?;
 
-        // Batched attention with mask (causal + sliding window)
-        // causal batched attention (window 2048 == max_seq 2048 for this benchmark, so window not restrictive;
-        // for seq_len <= window, swa(window) is exactly causal, and NoPE layers already skip rope).
-        // If window < seq_len later, switch to masked variant with a per-row window mask (block_start=start_pos).
-        gpu.attention_q8_0_kv_batched(&q, &k_cache_t, &v_cache_t, &attn_out, &pos_array, n_heads, n_kv, hd, phys_cap, seq_len, b).map_err(|e| format!("glimmer batch L{layer_idx} attention batched: {e:?}"))?;
+        // Verify previously used a per-query-row kernel whose grid carries the
+        // query index ([n_heads, batch, 1]), so each of the B rows re-streamed
+        // the entire KV span, making verify attention O(B*ctx) against AR's
+        // O(ctx) and inverting spec decode into a loss at depth; and the 39
+        // sliding layers were attending over the full span rather than their
+        // 2048 window once seq_len exceeded it. Both are fixed by taking the
+        // same query-tiled WMMA kernels prefill already uses (one WMMA B
+        // fragment reused across 16 query rows: O(ctx)).
+        let wmma_full = b > 1
+            && std::env::var("HIPFIRE_GLIMMER_WMMA_FULL")
+                .map(|v| v != "0" && !v.is_empty())
+                .unwrap_or(true);
+        let mut wmma_done = false;
+        if wmma_full {
+            if window == 0 {
+                gpu.attention_q8_0_flash_prefill_wmma(
+                    &q,
+                    &k_cache_t,
+                    &v_cache_t,
+                    &attn_out,
+                    &pos_array,
+                    n_heads,
+                    n_kv,
+                    hd,
+                    b,
+                )
+                .map_err(|e| format!("glimmer batch L{layer_idx} wmma full: {e:?}"))?;
+                wmma_done = true;
+            } else {
+                wmma_done = gpu
+                    .attention_q8_0_flash_prefill_wmma_swa(
+                        &q,
+                        &k_cache_t,
+                        &v_cache_t,
+                        &attn_out,
+                        &pos_array,
+                        n_heads,
+                        n_kv,
+                        hd,
+                        b,
+                        window,
+                    )
+                    .map_err(|e| format!("glimmer batch L{layer_idx} wmma swa: {e:?}"))?;
+            }
+        }
+        if !wmma_done {
+            gpu.attention_q8_0_kv_batched(&q, &k_cache_t, &v_cache_t, &attn_out, &pos_array, n_heads, n_kv, hd, phys_cap, seq_len, b)
+                .map_err(|e| format!("glimmer batch L{layer_idx} attention batched: {e:?}"))?;
+        }
 
         // Gated attention: attn_out *= sigmoid(gate) BEFORE o_proj
         if !abl("HIPFIRE_GLIMMER_NO_ATTN_GATE") {
