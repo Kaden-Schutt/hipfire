@@ -15547,6 +15547,7 @@ fn main() {
                 // completion (kernel launches are async by default).
                 let _ = gpu.hip.device_synchronize();
                 let t0 = Instant::now();
+                let mut prefill_err: Option<String> = None;
                 let run_ok = if m.arch_id == 5 || m.arch_id == 6 {
                     let ModelState::Qwen35(b) = m.state.as_mut().unwrap() else {
                         unreachable!()
@@ -15732,7 +15733,7 @@ fn main() {
                     let weights = &bundle.weights;
                     let state = &mut bundle.state;
                     let mut hidden_out: Vec<f32> = Vec::new();
-                    glimmer::forward::prefill_with_capture(
+                    match glimmer::forward::prefill_with_capture(
                         config,
                         weights,
                         state,
@@ -15741,8 +15742,13 @@ fn main() {
                         0,
                         &[],
                         &mut hidden_out,
-                    )
-                    .is_ok()
+                    ) {
+                        Ok(_) => true,
+                        Err(e) => {
+                            prefill_err = Some(e);
+                            false
+                        }
+                    }
                 } else if m.arch_id == 8 {
                     // dots.ocr: Qwen2 text decoder via qwen2_state + dots_ocr fields.
                     let state = m.qwen2_state.as_mut().unwrap();
@@ -15828,7 +15834,10 @@ fn main() {
                     emit_uncorrelated_error(
                         &mut stdout,
                         None,
-                        "bench_prefill forward failed",
+                        &match &prefill_err {
+                            Some(e) => format!("bench_prefill forward failed: {e}"),
+                            None => "bench_prefill forward failed".to_string(),
+                        },
                         "validation",
                         false,
                         false,

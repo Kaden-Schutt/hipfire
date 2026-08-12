@@ -1688,20 +1688,27 @@ fn prefill_chunk_batched(
         // seq_len-window : 0), so passing window=0 gives exactly the causal
         // attention they already want.
         //
-        // MEASURED NEUTRAL, so it is default OFF. gfx1201, 4241-token fixture,
-        // median of 3 fresh processes: 7303 ms off vs 7319 ms on (-0.22%, and
-        // the within-config spread is 0.4%, so the delta is inside noise);
-        // byte-identical either way. Two reasons it cannot pay here. Flash
-        // changes the CONSTANT, never the SLOPE — full attention over a growing
-        // context is inherently linear per token. And the context-dependent
-        // term is only ~23% of prefill at 4241 tokens (1326 µs/tok at 270 ctx
-        // vs 1722 at 4241); the other 77% is fixed per-token projection work,
-        // which is where the Muse GEMM went. Kept behind the flag rather than
-        // deleted because the full layers' share grows with context and this is
-        // untested past 8192 — at 32k-131k the verdict may well invert.
+        // DEFAULT ON, and that is a REQUIREMENT, not a tuning choice. It was
+        // briefly default-off on a perf reading that was true but incomplete:
+        // at 4241 tokens it is neutral (7303 ms off vs 7319 on, -0.22%, inside
+        // the 0.4% spread, byte-identical). Flash changes the CONSTANT and not
+        // the SLOPE — full attention over a growing context is inherently
+        // linear per token — so at short context there is nothing to win.
+        //
+        // But attention_q8_0_kv_batched sizes its launch by the sequence
+        // length, and past roughly 16k that exceeds the 64 KB LDS limit. The
+        // full (window==0) layers ALWAYS took that path, so prefill died with
+        // `glimmer prefill L3 attention batched: hipModuleLaunchKernel:
+        // invalid argument`. Measured: pp16384 fails outright with this off
+        // and runs at 379.40 tok/s with it on. Same defect class as the decode
+        // ceiling fixed in the SWA seq_len_hint.
+        //
+        // So it costs ~0.2% (inside noise) below the window and is the
+        // difference between working and not above it. `=0` restores the
+        // batched path and reintroduces the ceiling.
         let flash_full = std::env::var("HIPFIRE_GLIMMER_FLASH_FULL")
             .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(false);
+            .unwrap_or(true);
         let use_flash = std::env::var("HIPFIRE_GLIMMER_NO_FLASH").as_deref() != Ok("1")
             && ((window != 0 && seq_len > window)
                 || (window == 0 && flash_full && seq_len > 2048));
