@@ -694,14 +694,14 @@ fn main() {
         // Exact ordered extract list from assistant config — host + device.
         let tap_layers = drafter_cfg.target_layer_ids.clone();
         let mut target_hidden_host: Vec<f32> = Vec::new();
-        // Opt into in-forward device-capture audit (single forward dual-
-        // collects; do not run a separate host path).
-        std::env::set_var("HIPFIRE_GLIMMER_DEVICE_CAPTURE_AUDIT", "1");
-        let device_capture = if std::env::var("HIPFIRE_GLIMMER_DEVICE_CAPTURE")
+        // Device capture and its expensive host-shadow audit are explicit,
+        // independent opt-ins. The forward path reads
+        // HIPFIRE_GLIMMER_DEVICE_CAPTURE_AUDIT directly.
+        let device_capture = std::env::var("HIPFIRE_GLIMMER_DEVICE_CAPTURE")
             .ok()
             .as_deref()
-            == Some("0")
-        {
+            == Some("1");
+        let device_capture = if !device_capture {
             false
         } else {
             match state.enable_device_hidden_capture(

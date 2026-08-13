@@ -1942,17 +1942,19 @@ impl Carrier for MuseGlimmerCarrier {
                 } else {
                     None
                 };
-                // Device hidden capture: default-on when a valid drafter is present.
-                // HIPFIRE_GLIMMER_DEVICE_CAPTURE=0 forces host fallback. Selection is
-                // frozen here — no runtime path flipping after first generation.
+                // Device hidden capture is an opt-in experiment. The controlled
+                // gfx1100 gate removed all capture D2Hs but regressed decode
+                // throughput, so the unchanged host path remains the default.
+                // Selection is frozen here — no runtime path flipping after load.
                 if let Some(d) = &drafter {
-                    let env_off = hipfire_config::developer_var("HIPFIRE_GLIMMER_DEVICE_CAPTURE")
-                        .ok()
-                        .as_deref()
-                        == Some("0");
-                    if env_off {
+                    let device_enabled =
+                        hipfire_config::developer_var("HIPFIRE_GLIMMER_DEVICE_CAPTURE")
+                            .ok()
+                            .as_deref()
+                            == Some("1");
+                    if !device_enabled {
                         eprintln!(
-                            "  glimmer hidden capture: backend=host env-disabled (HIPFIRE_GLIMMER_DEVICE_CAPTURE=0)"
+                            "  glimmer hidden capture: backend=host (set HIPFIRE_GLIMMER_DEVICE_CAPTURE=1 to test device capture)"
                         );
                     } else {
                         // Same frozen cap used for scratch construction (no env re-read).
