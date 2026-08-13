@@ -7177,6 +7177,13 @@ fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Res
 
     let mut out: Vec<Point> = Vec::new();
 
+    // The two backends run STRICTLY SEQUENTIALLY, and the scope below is what
+    // enforces it. Each holds a full copy of the model's weights -- 18.7 GB for
+    // a 35B-A3B mq4r -- so overlapping them doubles resident footprint. On a
+    // box with no swap that is not "slower", it is an OOM kill. `SlotEngine`'s
+    // Drop closes its channel and joins the worker thread that owns the Gpu,
+    // weights and KV arenas, so leaving this scope is what actually frees the
+    // first model before the daemon loads the second.
     if matches!(backend_sel, BackendSel::Slots | BackendSel::Both) {
         let registry = load_registry(&paths.registry).registry;
         let model_path = find_model_path(paths, &registry, &args.model)
@@ -7184,14 +7191,18 @@ fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Res
         match SlotDriver::start(&model_path, max_k, 8192) {
             Ok(mut d) => {
                 eprintln!("  slots backend up ({max_k} slots)");
-                sweep_backend(
+                let r = sweep_backend(
                     &mut d as &mut dyn ConcurrencyBackend,
                     &arms,
                     &points,
                     args.runs,
                     args.max_tokens as u64,
                     &mut out,
-                )?;
+                );
+                // Free the weights before the batch backend loads its own copy,
+                // even on the error path.
+                drop(d);
+                r?;
             }
             // A backend that cannot run this model is a RESULT, not a crash.
             Err(e) => eprintln!("  slots backend unavailable: {e}"),
@@ -7199,6 +7210,7 @@ fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Res
     }
 
     if matches!(backend_sel, BackendSel::Batch | BackendSel::Both) {
+        preflight_headroom_for_model(paths, &args.model)?;
         let mut batch_args = args.clone();
         batch_args.concurrency = None;
         let (engine, loaded, _, _) = open_bench_engine_batched(paths, &batch_args, max_k)?;
@@ -7223,6 +7235,47 @@ fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Res
     }
 
     println!("{}", render_table(&out));
+    Ok(())
+}
+
+/// Refuse to load a model that will not fit in available host memory.
+///
+/// The GPU allocates from system RAM on this class of box and there is no
+/// swap, so an overcommit is an OOM kill of the whole machine rather than a
+/// slow run. Checked between the two backends because that is precisely where
+/// a leaked first model would show up: if the slots engine did not actually
+/// release its weights, `MemAvailable` is still depressed here and this stops
+/// the sweep instead of taking the box down.
+fn preflight_headroom_for_model(paths: &Paths, model: &str) -> Result<()> {
+    let registry = load_registry(&paths.registry).registry;
+    let Some(path) = find_model_path(paths, &registry, model) else {
+        return Ok(());
+    };
+    let Ok(meta) = std::fs::metadata(&path) else {
+        return Ok(());
+    };
+    let need = meta.len();
+    let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") else {
+        return Ok(());
+    };
+    let avail_kb = meminfo
+        .lines()
+        .find_map(|l| l.strip_prefix("MemAvailable:"))
+        .and_then(|v| v.split_whitespace().next())
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    let avail = avail_kb * 1024;
+    // 20% headroom over the raw weight bytes for KV arenas and scratch.
+    let want = need + need / 5;
+    if avail < want {
+        bail!(
+            "refusing to load {}: needs ~{:.1} GB with headroom, only {:.1} GB available. \
+             A previous backend may not have released its weights.",
+            path.display(),
+            want as f64 / 1e9,
+            avail as f64 / 1e9
+        );
+    }
     Ok(())
 }
 
