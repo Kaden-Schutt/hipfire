@@ -13,12 +13,12 @@ pub use carriers::*;
 pub mod spec_build;
 
 use hipfire_arch_cohere2moe as cohere2moe;
-use hipfire_arch_gemma4 as gemma4;
-use hipfire_arch_muse_glimmer as glimmer;
 use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_dots_ocr::dots_ocr;
+use hipfire_arch_gemma4 as gemma4;
 use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_minimax as minimax;
+use hipfire_arch_muse_glimmer as glimmer;
 use hipfire_arch_qwen2::qwen2;
 use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35ScratchSet};
 use hipfire_arch_qwen35::speculative::DeltaNetSnapshot;
@@ -121,8 +121,7 @@ const LFM2_TEMPLATE: &str =
     include_str!("../../hipfire-runtime/templates/eval/lfm2-liquidai.jinja");
 
 /// Built-in Gemma 4 IT chat template (arch_id=13).
-const GEMMA4_TEMPLATE: &str =
-    include_str!("../../hipfire-runtime/templates/gemma-4-it.jinja");
+const GEMMA4_TEMPLATE: &str = include_str!("../../hipfire-runtime/templates/gemma-4-it.jinja");
 
 // ─── Eviction policy wrapper ──────────────────────────────────────────
 
@@ -370,7 +369,145 @@ pub struct MuseGlimmerBundle {
     /// `target_hidden` input to the drafter's encoder.fc. Empty until first
     /// prefill completes. Order matches the concat the drafter's fc expects —
     /// mixing layers silently degrades tau.
+    ///
+    /// Authoritative only when device hidden capture is disabled. When the
+    /// device log is enabled, that log is the source of truth and this vector
+    /// is retained solely as an exact host fallback (session rewind must not
+    /// mutate it in device mode).
     pub target_hidden_host: Vec<f32>,
+}
+
+impl MuseGlimmerBundle {
+    /// f32 elements per captured position (`num_extract * hidden`), or `None`
+    /// when no DFlash drafter is loaded.
+    #[inline]
+    pub fn capture_row_elems(&self) -> Option<usize> {
+        self.drafter
+            .as_ref()
+            .map(|d| d.config.num_extract() * d.config.hidden)
+    }
+
+    /// Full session reset: target KV cursor + device log metadata, host capture
+    /// vector, and drafter absolute history watermarks.
+    pub fn reset_session_state(&mut self) {
+        self.state.reset();
+        self.target_hidden_host.clear();
+        if let Some(d) = self.drafter.as_mut() {
+            d.scratch.reset_history();
+        }
+    }
+
+    /// Whether [`Self::rewind_session_to`] can safely land on `target`.
+    ///
+    /// Rejects `target > state.n_tokens`. Device capture requires an Idle log
+    /// that still retains `target` in its ring. Host-backed DFlash requires the
+    /// host vector to be an exact whole-row packing of the current
+    /// `state.n_tokens` (no gap/partial row) with at least `target` rows. With
+    /// no drafter, rewind is target-KV-only and always allowed within range.
+    pub fn can_rewind_session_to(&self, target: usize) -> bool {
+        if target > self.state.n_tokens {
+            return false;
+        }
+        if self.state.device_hidden_capture_enabled() {
+            return self
+                .state
+                .target_hidden_log()
+                .map(|log| log.can_rewind_to(target))
+                .unwrap_or(false);
+        }
+        match self.capture_row_elems() {
+            None => true,
+            Some(row_elems) => {
+                if row_elems == 0 {
+                    return false;
+                }
+                let host_len = self.target_hidden_host.len();
+                if host_len % row_elems != 0 {
+                    return false;
+                }
+                let host_rows = host_len / row_elems;
+                host_rows >= target && host_rows == self.state.n_tokens
+            }
+        }
+    }
+
+    /// Rewind target KV (+ device log when enabled), host capture (host-backed
+    /// DFlash only), and drafter history to `target`.
+    ///
+    /// All fallible checks run before any mutation. Device mode never touches
+    /// `target_hidden_host`. On success: `state.n_tokens == target`, device log
+    /// end == target when enabled, host rows == target when host-backed+dflash,
+    /// and drafter `kv_abs_end <= target`.
+    pub fn rewind_session_to(&mut self, target: usize) -> Result<(), String> {
+        if !self.can_rewind_session_to(target) {
+            return Err(format!(
+                "muse glimmer: cannot rewind session to {target} (n_tokens={}, device_capture={})",
+                self.state.n_tokens,
+                self.state.device_hidden_capture_enabled()
+            ));
+        }
+
+        // Compute host truncate length before mutating anything.
+        let host_new_len = if self.state.device_hidden_capture_enabled() {
+            None
+        } else if let Some(row_elems) = self.capture_row_elems() {
+            let new_len = target.checked_mul(row_elems).ok_or_else(|| {
+                format!(
+                    "muse glimmer: host capture truncate overflow target={target} row_elems={row_elems}"
+                )
+            })?;
+            Some(new_len)
+        } else {
+            None
+        };
+
+        glimmer::forward::rollback_to(&mut self.state, target)?;
+
+        if let Some(new_len) = host_new_len {
+            self.target_hidden_host.truncate(new_len);
+        }
+        if let Some(d) = self.drafter.as_mut() {
+            d.scratch.rewind_history(target);
+        }
+        Ok(())
+    }
+
+    /// Current target KV cursor (`state.n_tokens`).
+    #[inline]
+    pub fn n_tokens(&self) -> usize {
+        self.state.n_tokens
+    }
+
+    /// Whether the device hidden-capture log is installed on the target state.
+    #[inline]
+    pub fn device_hidden_capture_enabled(&self) -> bool {
+        self.state.device_hidden_capture_enabled()
+    }
+
+    /// Committed absolute end of the device hidden log, when installed.
+    #[inline]
+    pub fn device_hidden_log_end(&self) -> Option<usize> {
+        self.state
+            .target_hidden_log()
+            .map(|log| log.committed_abs_end())
+    }
+
+    /// Drafter scratch ctx capacity (`None` without a drafter).
+    #[inline]
+    pub fn drafter_ctx_capacity(&self) -> Option<usize> {
+        self.drafter.as_ref().map(|d| d.scratch.ctx_capacity())
+    }
+
+    /// Host-backed capture row count when `capture_row_elems` is known and the
+    /// host vector is an exact whole-row packing; otherwise `None`.
+    #[inline]
+    pub fn host_capture_rows(&self) -> Option<usize> {
+        let row_elems = self.capture_row_elems()?;
+        if row_elems == 0 || self.target_hidden_host.len() % row_elems != 0 {
+            return None;
+        }
+        Some(self.target_hidden_host.len() / row_elems)
+    }
 }
 
 /// Muse Glimmer DFlash drafter (arch 23) — `muse_glimmer_assistant` 5-layer
@@ -2942,8 +3079,16 @@ mod registry_tests {
         let bare_tail = "{{- '</atem:invoke>\\n</atem:function_calls>' -}}{%- endmacro -%}";
         let wrapped_tail =
             "{{- '</atem:invoke>\\n</atem:function_calls>' -}}{%- endif -%}{%- endmacro -%}";
-        assert_eq!(out.matches(bare_tail).count(), 1, "render_tool_defs tail must stay bare");
-        assert_eq!(out.matches(wrapped_tail).count(), 1, "render_atem tail must be wrapped");
+        assert_eq!(
+            out.matches(bare_tail).count(),
+            1,
+            "render_tool_defs tail must stay bare"
+        );
+        assert_eq!(
+            out.matches(wrapped_tail).count(),
+            1,
+            "render_atem tail must be wrapped"
+        );
 
         // Upstream drift must fail LOUDLY rather than silently leaving nested accessors.
         let missing = "{%- macro render_atem(tc) -%}hello{%- endmacro -%}";

@@ -578,17 +578,9 @@ fn main() {
         if temp != 0.0 {
             eprintln!("warning: --temp {temp} ignored for Glimmer (greedy argmax only, temp 0)");
         }
-        // Helper: tap layers for DFlash capture, mirrors daemon::glimmer_tap_layers.
-        fn glimmer_tap_layers(n_layers: usize) -> Vec<usize> {
-            match std::env::var("HIPFIRE_GLIMMER_TAP_LAYERS") {
-                Ok(v) if !v.trim().is_empty() => v
-                    .split(',')
-                    .filter_map(|t| t.trim().parse::<usize>().ok())
-                    .filter(|l| *l < n_layers)
-                    .collect(),
-                _ => vec![1, 13, 25, 37, 49],
-            }
-        }
+        // Capture layers come from the assistant config's ordered
+        // `target_layer_ids` (not a generated/env tap list) so host and
+        // device extract order stay identical to the drafter.
         // ── Init GPU ──────────────────────────────────────────────────
         let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
         eprintln!("gpu: {}", gpu.arch);
@@ -613,7 +605,9 @@ fn main() {
             drafter_cfg.block_size = b;
             eprintln!("block_size override: {orig} -> {b} (drafter trained at {orig})");
         }
-        if !(2..=hipfire_arch_muse_glimmer::glimmer::GLIMMER_MAX_SPEC_BLOCK).contains(&drafter_cfg.block_size) {
+        if !(2..=hipfire_arch_muse_glimmer::glimmer::GLIMMER_MAX_SPEC_BLOCK)
+            .contains(&drafter_cfg.block_size)
+        {
             eprintln!(
                 "block_size must be in 2..={} (got {})",
                 hipfire_arch_muse_glimmer::glimmer::GLIMMER_MAX_SPEC_BLOCK,
@@ -642,59 +636,139 @@ fn main() {
             drafter_cfg.target_layer_ids,
         );
         // Tokenizer from target metadata
-        let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&target_hfq.metadata_json)
-            .expect("target tokenizer");
+        let tokenizer =
+            hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&target_hfq.metadata_json)
+                .expect("target tokenizer");
         // Load weights
         let t_w = Instant::now();
-        let glimmer_weights =
-            hipfire_arch_muse_glimmer::glimmer::GlimmerWeights::load(&target_hfq, &glimmer_cfg, &mut gpu)
-                .expect("load glimmer target");
-        eprintln!("glimmer target loaded in {:.2}s", t_w.elapsed().as_secs_f64());
+        let glimmer_weights = hipfire_arch_muse_glimmer::glimmer::GlimmerWeights::load(
+            &target_hfq,
+            &glimmer_cfg,
+            &mut gpu,
+        )
+        .expect("load glimmer target");
+        eprintln!(
+            "glimmer target loaded in {:.2}s",
+            t_w.elapsed().as_secs_f64()
+        );
         vram_report(&gpu.hip, "after target load");
         let t_d = Instant::now();
-        let drafter_weights =
-            hipfire_arch_muse_glimmer::drafter::GlimmerDrafterWeights::load(&draft_hfq, &drafter_cfg, &mut gpu)
-                .expect("load glimmer drafter");
-        eprintln!("glimmer drafter loaded in {:.2}s", t_d.elapsed().as_secs_f64());
+        let drafter_weights = hipfire_arch_muse_glimmer::drafter::GlimmerDrafterWeights::load(
+            &draft_hfq,
+            &drafter_cfg,
+            &mut gpu,
+        )
+        .expect("load glimmer drafter");
+        eprintln!(
+            "glimmer drafter loaded in {:.2}s",
+            t_d.elapsed().as_secs_f64()
+        );
         vram_report(&gpu.hip, "after drafter load");
         // State + scratch
         let max_seq = ctx_capacity;
-        let mut state =
-            hipfire_arch_muse_glimmer::glimmer::GlimmerState::new_with_max_seq(&mut gpu, &glimmer_cfg, max_seq)
-                .expect("alloc GlimmerState");
-        let mut drafter_scratch =
-            hipfire_arch_muse_glimmer::drafter::GlimmerDrafterScratch::new(&mut gpu, &drafter_cfg, max_seq)
-                .expect("alloc GlimmerDrafterScratch");
-        let tap_layers = glimmer_tap_layers(glimmer_cfg.n_layers);
-        let mut target_hidden_host: Vec<f32> = Vec::new();
-        // Stop set: config eos + any tokenizer specials that mark end-of-turn.
-        // Mirrors daemon's stop_set construction (without Jinja).
-        let build_stop_set = |tokenizer: &hipfire_runtime::tokenizer::Tokenizer, cfg_eos: u32| -> Vec<u32> {
-            let mut s = vec![cfg_eos];
-            for cand in ["<|eom|>", "<|eot|>", "<|end_of_text|>", "<end_of_turn>", "<|end_of_turn|>", "<|im_end|>", "<|endoftext|>", "</s>", "<eos>"] {
-                if let Some(tid) = tokenizer.special_token_id(cand) {
-                    if !s.contains(&tid) {
-                        s.push(tid);
-                    }
-                } else {
-                    let ids = tokenizer.encode(cand);
-                    if ids.len() == 1 && !s.contains(&ids[0]) {
-                        s.push(ids[0]);
-                    }
-                }
-            }
-            // Also include tokenizer's own eos/eot terminators
-            if !s.contains(&tokenizer.eos_id) {
-                s.push(tokenizer.eos_id);
-            }
-            if let Some(eot) = tokenizer.eot_id {
-                if !s.contains(&eot) {
-                    s.push(eot);
-                }
-            }
-            s.dedup();
-            s
+        let mut state = hipfire_arch_muse_glimmer::glimmer::GlimmerState::new_with_max_seq(
+            &mut gpu,
+            &glimmer_cfg,
+            max_seq,
+        )
+        .expect("alloc GlimmerState");
+        // Resolve configured ctx cap ONCE (demo semantics): positive
+        // HIPFIRE_GLIMMER_CTX_CAP else drafter sliding_window (NOT the
+        // daemon's 256 default). Sample once, clamp 1..=max_seq, and pass
+        // the same value to scratch + optional device log.
+        let resolved_ctx_cap = {
+            let configured = std::env::var("HIPFIRE_GLIMMER_CTX_CAP")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(drafter_cfg.sliding_window);
+            configured.clamp(1, max_seq)
         };
+        let mut drafter_scratch = hipfire_arch_muse_glimmer::drafter::GlimmerDrafterScratch::new(
+            &mut gpu,
+            &drafter_cfg,
+            max_seq,
+            resolved_ctx_cap,
+        )
+        .expect("alloc GlimmerDrafterScratch");
+        // Exact ordered extract list from assistant config — host + device.
+        let tap_layers = drafter_cfg.target_layer_ids.clone();
+        let mut target_hidden_host: Vec<f32> = Vec::new();
+        // Opt into in-forward device-capture audit (single forward dual-
+        // collects; do not run a separate host path).
+        std::env::set_var("HIPFIRE_GLIMMER_DEVICE_CAPTURE_AUDIT", "1");
+        let device_capture = if std::env::var("HIPFIRE_GLIMMER_DEVICE_CAPTURE")
+            .ok()
+            .as_deref()
+            == Some("0")
+        {
+            false
+        } else {
+            match state.enable_device_hidden_capture(
+                &mut gpu,
+                &tap_layers,
+                resolved_ctx_cap,
+                glimmer_cfg.n_layers,
+                glimmer_cfg.dim,
+            ) {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!(
+                        "glimmer hidden capture: device enable failed ({e}) — continuing with host fallback"
+                    );
+                    false
+                }
+            }
+        };
+        eprintln!(
+            "capture_backend={} cap={} layers={:?}",
+            if device_capture { "device" } else { "host" },
+            resolved_ctx_cap,
+            tap_layers
+        );
+        let glimmer_window_diag = std::env::var("HIPFIRE_GLIMMER_TIMING").ok().as_deref()
+            == Some("1")
+            || std::env::var("HIPFIRE_GLIMMER_SPEC_DIAG").ok().as_deref() == Some("1");
+        // Stop set: config eos + end-of-turn specials.
+        // Match daemon Harmony stop semantics: do NOT add `<|eom|>` — it ends
+        // the current channel (self->continue, user->stop) and is left to
+        // channel routing. Preserve EOS/EOT static stops.
+        let build_stop_set =
+            |tokenizer: &hipfire_runtime::tokenizer::Tokenizer, cfg_eos: u32| -> Vec<u32> {
+                let mut s = vec![cfg_eos];
+                for cand in [
+                    "<|eot|>",
+                    "<|end_of_text|>",
+                    "<end_of_turn>",
+                    "<|end_of_turn|>",
+                    "<|im_end|>",
+                    "<|endoftext|>",
+                    "</s>",
+                    "<eos>",
+                ] {
+                    if let Some(tid) = tokenizer.special_token_id(cand) {
+                        if !s.contains(&tid) {
+                            s.push(tid);
+                        }
+                    } else {
+                        let ids = tokenizer.encode(cand);
+                        if ids.len() == 1 && !s.contains(&ids[0]) {
+                            s.push(ids[0]);
+                        }
+                    }
+                }
+                // Also include tokenizer's own eos/eot terminators
+                if !s.contains(&tokenizer.eos_id) {
+                    s.push(tokenizer.eos_id);
+                }
+                if let Some(eot) = tokenizer.eot_id {
+                    if !s.contains(&eot) {
+                        s.push(eot);
+                    }
+                }
+                s.dedup();
+                s
+            };
         let stop_set = build_stop_set(&tokenizer, glimmer_cfg.eos_token);
         // ── Per-row loop (same prompts vector as generic) ─────────────────
         for (row_idx, (row_label, row_raw_prompt, row_max_tokens)) in prompts.iter().enumerate() {
@@ -705,6 +779,7 @@ fn main() {
             // Per-row state reset
             target_hidden_host.clear();
             state.reset();
+            drafter_scratch.reset_history();
             // Tokenize + optional ChatML wrap (mirrors generic demo)
             let prompt_normalized =
                 hipfire_runtime::tokenizer::maybe_normalize_prompt(row_raw_prompt).into_owned();
@@ -736,7 +811,9 @@ fn main() {
                         prompt_tokens.len()
                     );
                 } else {
-                    eprintln!("chatml requested but tokenizer has no <|im_start|>; using raw prompt");
+                    eprintln!(
+                        "chatml requested but tokenizer has no <|im_start|>; using raw prompt"
+                    );
                 }
             }
             // BOS prepend — mirrors daemon generate_muse_glimmer
@@ -773,28 +850,68 @@ fn main() {
                 std::process::exit(1);
             }
             let max_tokens = row_max_tokens;
-            // ── Prefill via prefill_with_capture ────────────────────────
+            // ── Prefill (device or host capture) ───────────────────────
+            let prefill_backend = if device_capture { "device" } else { "host" };
             eprintln!(
-                "seeding glimmer target via prefill_with_capture ({} tokens)...",
+                "seeding glimmer target via prefill_with_{}_capture ({} tokens)...",
+                prefill_backend,
                 prompt_tokens.len()
             );
             let t_prefill = Instant::now();
             let start_pos = state.n_tokens as u32;
-            let last_logits = hipfire_arch_muse_glimmer::forward::prefill_with_capture(
-                &glimmer_cfg,
-                &glimmer_weights,
-                &mut state,
-                &mut gpu,
-                &prompt_tokens,
-                start_pos,
-                &tap_layers,
-                &mut target_hidden_host,
-            )
-            .expect("glimmer prefill");
+            let last_logits = if device_capture {
+                hipfire_arch_muse_glimmer::forward::prefill_with_device_capture(
+                    &glimmer_cfg,
+                    &glimmer_weights,
+                    &mut state,
+                    &mut gpu,
+                    &prompt_tokens,
+                    start_pos,
+                )
+                .expect("glimmer prefill device")
+            } else {
+                hipfire_arch_muse_glimmer::forward::prefill_with_capture(
+                    &glimmer_cfg,
+                    &glimmer_weights,
+                    &mut state,
+                    &mut gpu,
+                    &prompt_tokens,
+                    start_pos,
+                    &tap_layers,
+                    &mut target_hidden_host,
+                )
+                .expect("glimmer prefill host")
+            };
             let prefill_secs = t_prefill.elapsed().as_secs_f64();
             let prefill_ms = (prefill_secs * 1000.0) as u64;
             let prefill_tok_s = prompt_tokens.len() as f64 / prefill_secs.max(1e-9);
-            eprintln!("prefill in {:.2}s ({:.1} tok/s) prefill_ms={}", prefill_secs, prefill_tok_s, prefill_ms);
+            eprintln!(
+                "prefill in {:.2}s ({:.1} tok/s) prefill_ms={} capture_backend={}",
+                prefill_secs, prefill_tok_s, prefill_ms, prefill_backend
+            );
+            if device_capture {
+                if let Some(log) = state.target_hidden_log() {
+                    eprintln!(
+                        "prefill_log valid_start={} committed_end={} capacity={}",
+                        log.valid_abs_start(),
+                        log.committed_abs_end(),
+                        log.capacity_rows()
+                    );
+                }
+            } else {
+                let ne = drafter_cfg.num_extract();
+                let row_elems = ne * drafter_cfg.hidden;
+                let n_rows = if row_elems > 0 {
+                    target_hidden_host.len() / row_elems
+                } else {
+                    0
+                };
+                eprintln!(
+                    "prefill_host_rows={} host_elems={}",
+                    n_rows,
+                    target_hidden_host.len()
+                );
+            }
             vram_report(&gpu.hip, "after_prefill");
             // Initial seed token (greedy argmax)
             let mut last_pick = {
@@ -827,8 +944,7 @@ fn main() {
                 }
             }
             let t_decode = Instant::now();
-            // Spec loop — mirrors daemon's glimmer spec core around glimmer_drafter_forward
-            // Hot loop is free of stdout, decode, serde_json, and per-iteration allocs that can be hoisted.
+            // Spec loop — mirrors daemon's glimmer spec core (device/host capture).
             // Greedy only (temp 0.0) via accept_greedy_prefix.
             if !done_due_to_stop && emitted.len() < max_tokens {
                 let block_size = drafter_cfg.block_size;
@@ -850,7 +966,7 @@ fn main() {
                         eprintln!("next block would exceed max_seq {}; stopping", max_seq);
                         break;
                     }
-                    // --- Draft: B-1 tokens via glimmer_drafter_forward (raw noise) ---
+                    // --- Draft: B-1 tokens via drafter (raw noise) ---
                     for i in 0..block_size {
                         let t = if i == 0 { last_pick } else { mask_id };
                         let v = hipfire_arch_muse_glimmer::forward::embed_raw(
@@ -863,33 +979,70 @@ fn main() {
                         .expect("glimmer drafter noise embed");
                         noise_embedding[i * hidden..(i + 1) * hidden].copy_from_slice(&v[..hidden]);
                     }
-                    let n_rows = target_hidden_host.len() / row_elems;
-                    let ctx_cap = std::env::var("HIPFIRE_GLIMMER_CTX_CAP")
-                        .ok()
-                        .and_then(|v| v.trim().parse::<usize>().ok())
-                        .unwrap_or(drafter_cfg.sliding_window);
-                    let ctx_len = n_rows.min(ctx_cap);
-                    // Slice target_hidden for this window (suffix keep)
-                    let target_hidden: Vec<f32> = if ctx_len == 0 {
-                        Vec::new()
+                    // History must end exactly at cur_pos (gap is fatal).
+                    let history_end = if device_capture {
+                        state
+                            .target_hidden_log()
+                            .map(|l| l.committed_abs_end())
+                            .expect("device hidden log missing at draft")
                     } else {
-                        let start = (n_rows - ctx_len) * row_elems;
-                        target_hidden_host[start..].to_vec()
+                        if row_elems == 0 || target_hidden_host.len() % row_elems != 0 {
+                            panic!(
+                                "glimmer-spec: host capture misaligned len={} row_elems={}",
+                                target_hidden_host.len(),
+                                row_elems
+                            );
+                        }
+                        target_hidden_host.len() / row_elems
                     };
-                    let positions: Vec<i32> = (cur_pos as i32 - ctx_len as i32..cur_pos as i32 + block_size as i32).collect();
+                    assert_eq!(
+                        history_end,
+                        cur_pos as usize,
+                        "glimmer-spec: target history end {history_end} != cur_pos {cur_pos} (capture hole)"
+                    );
+                    let ctx_len = (cur_pos as usize).min(resolved_ctx_cap);
+                    let cur_start = cur_pos as usize - ctx_len;
+                    let positions: Vec<i32> =
+                        (cur_start as i32..cur_pos as i32 + block_size as i32).collect();
                     debug_assert_eq!(positions.len(), ctx_len + block_size);
-                    hipfire_arch_muse_glimmer::drafter::glimmer_drafter_forward(
-                        &mut gpu,
-                        &drafter_cfg,
-                        &drafter_weights,
-                        &mut drafter_scratch,
-                        &noise_embedding,
-                        &target_hidden,
-                        &positions,
-                        block_size,
-                        ctx_len,
-                    )
-                    .expect("glimmer drafter forward");
+                    if device_capture {
+                        let log = state
+                            .target_hidden_log()
+                            .expect("device hidden log missing at draft forward");
+                        hipfire_arch_muse_glimmer::drafter::glimmer_drafter_forward_device(
+                            &mut gpu,
+                            &drafter_cfg,
+                            &drafter_weights,
+                            &mut drafter_scratch,
+                            &noise_embedding,
+                            log,
+                            &positions,
+                            block_size,
+                            ctx_len,
+                        )
+                        .expect("glimmer drafter forward device");
+                    } else {
+                        // Host: suffix Vec + host call (env-off exact).
+                        let n_rows = history_end;
+                        let target_hidden: Vec<f32> = if ctx_len == 0 {
+                            Vec::new()
+                        } else {
+                            let start = (n_rows - ctx_len) * row_elems;
+                            target_hidden_host[start..].to_vec()
+                        };
+                        hipfire_arch_muse_glimmer::drafter::glimmer_drafter_forward(
+                            &mut gpu,
+                            &drafter_cfg,
+                            &drafter_weights,
+                            &mut drafter_scratch,
+                            &noise_embedding,
+                            &target_hidden,
+                            &positions,
+                            block_size,
+                            ctx_len,
+                        )
+                        .expect("glimmer drafter forward host");
+                    }
                     // Drafts via target lm_head over rows 1..B-1 (skip seed row)
                     // Use fresh allocation for hidden batch to hit Q8 batched fast path
                     let hidden_for_draft = {
@@ -916,29 +1069,38 @@ fn main() {
                     gpu.free_tensor(hidden_for_draft).ok();
                     _total_proposed += drafts.len();
                     // --- Verify: block = [seed, drafts...] at cur_pos ---
+                    // Delay capture commit/rollback until AFTER routing.
+                    let window_start = cur_pos as usize;
+                    let emitted_len_before_window = emitted.len();
                     let mut block = Vec::with_capacity(block_size);
                     block.push(last_pick);
                     block.extend_from_slice(&drafts);
                     let hidden_before = target_hidden_host.len();
-                    let picks = hipfire_arch_muse_glimmer::forward::verify_block_with_capture(
-                        &glimmer_cfg,
-                        &glimmer_weights,
-                        &mut state,
-                        &mut gpu,
-                        &block,
-                        cur_pos,
-                        &tap_layers,
-                        &mut target_hidden_host,
-                    )
-                    .expect("glimmer verify");
-                    // --- Accept via shared greedy rule (daemon line ~29622) ---
-                    // let ga = accept_greedy_prefix(&drafts, &picks, None);
+                    let picks = if device_capture {
+                        hipfire_arch_muse_glimmer::forward::verify_block_with_device_capture(
+                            &glimmer_cfg,
+                            &glimmer_weights,
+                            &mut state,
+                            &mut gpu,
+                            &block,
+                            cur_pos,
+                        )
+                        .expect("glimmer verify device")
+                    } else {
+                        hipfire_arch_muse_glimmer::forward::verify_block_with_capture(
+                            &glimmer_cfg,
+                            &glimmer_weights,
+                            &mut state,
+                            &mut gpu,
+                            &block,
+                            cur_pos,
+                            &tap_layers,
+                            &mut target_hidden_host,
+                        )
+                        .expect("glimmer verify host")
+                    };
+                    // --- Accept via shared greedy rule ---
                     let ga = hipfire_runtime::spec::accept_greedy_prefix(&drafts, &picks, None);
-                    {
-                        let keep_rows = ga.accepted + 1;
-                        let keep_elems = hidden_before + keep_rows * row_elems;
-                        target_hidden_host.truncate(keep_elems);
-                    }
                     total_accepted += ga.accepted;
                     windows += 1;
                     let accept = ga.accepted;
@@ -947,15 +1109,7 @@ fn main() {
                     } else {
                         picks[picks.len() - 1]
                     };
-                    // Rollback if partial accept (stateless commit_prefix contract)
-                    if accept + 1 < block_size {
-                        let target_pos = cur_pos as usize + accept + 1;
-                        hipfire_arch_muse_glimmer::forward::rollback_to(&mut state, target_pos);
-                        cur_pos = target_pos as u32;
-                    } else {
-                        cur_pos += block_size as u32;
-                    }
-                    // Commit accepted + bonus, but respect max_tokens and stop_set
+                    // Route accepted drafts + bonus through emitted/max/stop FIRST.
                     let mut to_emit: Vec<u32> = Vec::with_capacity(accept + 1);
                     to_emit.extend_from_slice(&drafts[..accept]);
                     to_emit.push(bonus);
@@ -971,6 +1125,54 @@ fn main() {
                             break;
                         }
                     }
+                    // keep_rows = seed + actually emitted accepted draft inputs;
+                    // never uncaptured bonus. Cap at ga.accepted+1.
+                    let emitted_added = emitted.len() - emitted_len_before_window;
+                    let keep_rows = (1 + emitted_added.min(ga.accepted)).min(ga.accepted + 1);
+                    if device_capture {
+                        hipfire_arch_muse_glimmer::forward::commit_device_verify_capture(
+                            &mut state, &gpu, keep_rows,
+                        )
+                        .expect("glimmer commit_device_verify_capture");
+                    } else {
+                        let keep_elems = hidden_before + keep_rows * row_elems;
+                        target_hidden_host.truncate(keep_elems);
+                    }
+                    let commit_end = window_start + keep_rows;
+                    hipfire_arch_muse_glimmer::forward::rollback_to(&mut state, commit_end)
+                        .expect("glimmer rollback_to after verify");
+                    drafter_scratch.rewind_history(commit_end);
+                    cur_pos = commit_end as u32;
+                    if glimmer_window_diag {
+                        let (log_valid, log_end) = if device_capture {
+                            state
+                                .target_hidden_log()
+                                .map(|l| (l.valid_abs_start(), l.committed_abs_end()))
+                                .unwrap_or((0, 0))
+                        } else {
+                            let rows = if row_elems > 0 {
+                                target_hidden_host.len() / row_elems
+                            } else {
+                                0
+                            };
+                            (0, rows)
+                        };
+                        eprintln!(
+                            "[glimmer-window] win={} backend={} cap={} ctx_len={} keep_rows={} accept={} log_valid={} log_end={} kv_abs_end={} commit_end={} cur_pos={}",
+                            windows,
+                            if device_capture { "device" } else { "host" },
+                            resolved_ctx_cap,
+                            ctx_len,
+                            keep_rows,
+                            accept,
+                            log_valid,
+                            log_end,
+                            drafter_scratch.kv_abs_end,
+                            commit_end,
+                            cur_pos,
+                        );
+                    }
+                    // Only after VerifyReady is committed may we break on stop/max.
                     last_pick = bonus;
                     if hit_stop {
                         break;
@@ -1025,8 +1227,8 @@ fn main() {
             eprintln!("accept_rate (accepted / (cycles × (B-1))): {accept_rate:.3}");
             // BENCH METRICS — same shape as generic path
             let (vram_free_bytes, vram_total_bytes) = gpu.hip.get_vram_info().unwrap_or((0, 0));
-            let vram_used_mb =
-                ((vram_total_bytes.saturating_sub(vram_free_bytes)) as f64 / (1024.0 * 1024.0)) as u64;
+            let vram_used_mb = ((vram_total_bytes.saturating_sub(vram_free_bytes)) as f64
+                / (1024.0 * 1024.0)) as u64;
             let vram_total_mb = (vram_total_bytes as f64 / (1024.0 * 1024.0)) as u64;
             let ttft_ms = prefill_ms as f64 + if windows > 0 { 0.0 } else { 0.0 };
             eprintln!("=== BENCH METRICS ===");

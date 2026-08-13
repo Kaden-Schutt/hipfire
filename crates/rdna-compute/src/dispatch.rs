@@ -1715,6 +1715,43 @@ impl Gpu {
         }
     }
 
+    /// D→D copy with offsets that is always host-asynchronous: uses the
+    /// active stream when set, otherwise the legacy/default stream via
+    /// `memcpy_dtod_async_default_at`. Prefer this on non-capture hot
+    /// paths where `memcpy_dtod_at_auto` would fall back to a host-sync
+    /// copy. Capture paths still need an explicit active stream (same as
+    /// `memcpy_dtod_at_auto`).
+    /// `HIPFIRE_DTOD_DUMP=1` prints `file:line` and size per D→D copy.
+    #[track_caller]
+    pub fn memcpy_dtod_at_ordered_async(
+        &self,
+        dst: &hip_bridge::DeviceBuffer,
+        dst_offset: usize,
+        src: &hip_bridge::DeviceBuffer,
+        src_offset: usize,
+        size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        static DUMP: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            hipfire_config::developer_var("HIPFIRE_DTOD_DUMP")
+                .ok()
+                .as_deref()
+                == Some("1")
+        });
+        let dump = *DUMP;
+        if dump {
+            let loc = std::panic::Location::caller();
+            eprintln!("dtod bytes={} at {}:{}", size, loc.file(), loc.line());
+        }
+        if let Some(stream) = self.active_stream.as_ref() {
+            self.hip
+                .memcpy_dtod_async_at(dst, dst_offset, src, src_offset, size, stream)
+        } else {
+            self.hip
+                .memcpy_dtod_async_default_at(dst, dst_offset, src, src_offset, size)
+        }
+    }
+
     /// D→D copy (whole buffer) that picks async on the active stream when set.
     ///
     /// `#[track_caller]` so `HIPFIRE_DTOD_DUMP` attributes the copy to the real
@@ -2697,6 +2734,42 @@ impl Gpu {
             self.pool.free(tensor.buf);
             Ok(())
         }
+    }
+
+    /// Free a newly allocated ordinary contiguous tensor immediately via HIP
+    /// `free`, without returning the buffer to the reusable pool.
+    ///
+    /// Intended for allocation-failure cleanup of tensors that were just
+    /// created (e.g. via [`Self::zeros`]) and must not race a pending async
+    /// memset on the active stream. Rejects VMM owners and borrowed buffers
+    /// with the same policy as [`Self::free_tensor`].
+    pub fn release_tensor_immediate(&mut self, tensor: GpuTensor) -> HipResult<()> {
+        self.bind_thread()?;
+        let key = tensor.buf.as_ptr() as usize;
+        if self.vmm_arenas.contains_key(&key) {
+            if !tensor.buf.is_vmm_owner() {
+                return Err(HipError::new(
+                    0,
+                    &format!("refusing to free borrowed VMM view at 0x{key:x}"),
+                ));
+            }
+            return Err(HipError::new(
+                0,
+                &format!("refusing immediate free of VMM owner at 0x{key:x}"),
+            ));
+        }
+        if tensor.buf.is_borrowed() || tensor.buf.is_vmm_owner() {
+            return Err(HipError::new(
+                0,
+                &format!("refusing to free non-owning tensor at 0x{key:x}"),
+            ));
+        }
+        // zeros() may have queued an async memset on the active stream; free
+        // must not race that write.
+        if let Some(stream) = self.active_stream.as_ref() {
+            self.hip.stream_synchronize(stream)?;
+        }
+        self.hip.free(tensor.buf)
     }
 
     /// Drain the GPU memory pool. Actually calls hipFree on all pooled buffers.

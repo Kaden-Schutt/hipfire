@@ -112,6 +112,7 @@
 //! `rmsnorm_batched`, RoPE is `rope_batched_f32` (half-split; n_heads_*=0 to
 //! skip the inactive side), attention is `attention_dflash_f32`.
 
+use crate::glimmer::GlimmerHiddenLog;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{rotate_x_mq_batched_for, weight_gemv, WeightTensor};
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -203,21 +204,26 @@ fn proj_gemm_batched_prerotated(
 
 pub const GLIMMER_DRAFTER_ARCH_ID: u32 = 23;
 
+/// Daemon/load default for `HIPFIRE_GLIMMER_CTX_CAP` when unset.
+/// Sampled once at carrier load and passed into scratch + device hidden log.
+/// Demo may choose a distinct default independently.
+pub const GLIMMER_DRAFTER_CTX_CAP_DEFAULT: usize = 256;
+
 // ─── Config ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct GlimmerDrafterConfig {
-    pub n_layers: usize,       // 5
-    pub hidden: usize,         // 6656
-    pub intermediate: usize,   // 19968
-    pub n_heads: usize,        // 32
-    pub n_kv_heads: usize,     // 8
-    pub head_dim: usize,       // 128
-    pub norm_eps: f32,         // 1e-5
-    pub rope_theta: f32,       // 500000.0
-    pub sliding_window: usize, // 2048
-    pub block_size: usize,     // 16
-    pub mask_token_id: u32,    // 201818
+    pub n_layers: usize,              // 5
+    pub hidden: usize,                // 6656
+    pub intermediate: usize,          // 19968
+    pub n_heads: usize,               // 32
+    pub n_kv_heads: usize,            // 8
+    pub head_dim: usize,              // 128
+    pub norm_eps: f32,                // 1e-5
+    pub rope_theta: f32,              // 500000.0
+    pub sliding_window: usize,        // 2048
+    pub block_size: usize,            // 16
+    pub mask_token_id: u32,           // 201818
     pub target_layer_ids: Vec<usize>, // [1,13,25,37,49]
 }
 
@@ -231,15 +237,19 @@ impl GlimmerDrafterConfig {
         let getu = |v: &serde_json::Value, k: &str| v.get(k).and_then(|x| x.as_u64());
         let getf = |v: &serde_json::Value, k: &str| v.get(k).and_then(|x| x.as_f64());
 
-        let hidden = getu(cfg, "hidden_size").ok_or("glimmer drafter: missing hidden_size")? as usize;
+        let hidden =
+            getu(cfg, "hidden_size").ok_or("glimmer drafter: missing hidden_size")? as usize;
         let n_layers = getu(cfg, "num_hidden_layers")
             .ok_or("glimmer drafter: missing num_hidden_layers")? as usize;
-        let intermediate =
-            getu(cfg, "intermediate_size").ok_or("glimmer drafter: missing intermediate_size")? as usize;
+        let intermediate = getu(cfg, "intermediate_size")
+            .ok_or("glimmer drafter: missing intermediate_size")?
+            as usize;
         let n_heads = getu(cfg, "num_attention_heads")
             .ok_or("glimmer drafter: missing num_attention_heads")? as usize;
         let n_kv_heads = getu(cfg, "num_key_value_heads").unwrap_or(n_heads as u64) as usize;
-        let head_dim = getu(cfg, "head_dim").map(|v| v as usize).unwrap_or(hidden / n_heads);
+        let head_dim = getu(cfg, "head_dim")
+            .map(|v| v as usize)
+            .unwrap_or(hidden / n_heads);
         let norm_eps = getf(cfg, "rms_norm_eps").unwrap_or(1e-5) as f32;
         let rope_theta = cfg
             .get("rope_parameters")
@@ -247,7 +257,8 @@ impl GlimmerDrafterConfig {
             .and_then(|v| v.as_f64())
             .unwrap_or(500000.0) as f32;
         let sliding_window = getu(cfg, "sliding_window").unwrap_or(2048) as usize;
-        let block_size = getu(cfg, "block_size").ok_or("glimmer drafter: missing block_size")? as usize;
+        let block_size =
+            getu(cfg, "block_size").ok_or("glimmer drafter: missing block_size")? as usize;
         let mask_token_id =
             getu(cfg, "mask_token_id").ok_or("glimmer drafter: missing mask_token_id")? as u32;
         let target_layer_ids: Vec<usize> = cfg
@@ -419,7 +430,11 @@ fn load_wt(
                 awq_scale: None,
             }
         }
-        qt => return Err(format!("glimmer drafter: unsupported quant_type {qt} for '{name}'")),
+        qt => {
+            return Err(format!(
+                "glimmer drafter: unsupported quant_type {qt} for '{name}'"
+            ))
+        }
     };
     if wt.gpu_dtype.supports_awq_sidecar() {
         wt.awq_scale = hipfire_runtime::hfq::load_awq_scale(hfq, gpu, name, k);
@@ -444,9 +459,9 @@ pub struct GlimmerDrafterLayer {
 }
 
 pub struct GlimmerDrafterWeights {
-    pub fc: WeightTensor,            // encoder.fc.weight [hidden, num_extract*hidden]
-    pub output_norm_enc: GpuTensor,  // encoder.output_norm_enc.weight
-    pub norm: GpuTensor,             // norm.weight
+    pub fc: WeightTensor,           // encoder.fc.weight [hidden, num_extract*hidden]
+    pub output_norm_enc: GpuTensor, // encoder.output_norm_enc.weight
+    pub norm: GpuTensor,            // norm.weight
     pub layers: Vec<GlimmerDrafterLayer>,
 }
 
@@ -502,8 +517,18 @@ impl GlimmerDrafterWeights {
                     h,
                     cfg.q_dim(),
                 )?,
-                q_norm: load_norm(hfq, gpu, &format!("{p}.self_attn.q_norm.weight"), cfg.head_dim)?,
-                k_norm: load_norm(hfq, gpu, &format!("{p}.self_attn.k_norm.weight"), cfg.head_dim)?,
+                q_norm: load_norm(
+                    hfq,
+                    gpu,
+                    &format!("{p}.self_attn.q_norm.weight"),
+                    cfg.head_dim,
+                )?,
+                k_norm: load_norm(
+                    hfq,
+                    gpu,
+                    &format!("{p}.self_attn.k_norm.weight"),
+                    cfg.head_dim,
+                )?,
                 gate_proj: load_wt(
                     hfq,
                     gpu,
@@ -558,22 +583,22 @@ impl GlimmerDrafterWeights {
 // ─── Scratch ────────────────────────────────────────────────────────────
 
 pub struct GlimmerDrafterScratch {
-    pub x: GpuTensor,          // [block*hidden] — noise + evolving hidden (no ctx add)
+    pub x: GpuTensor, // [block*hidden] — noise + evolving hidden (no ctx add)
     pub target_hidden_proj: GpuTensor, // [max_ctx * hidden] — ctx rows, reused by all layers
-    pub q: GpuTensor,          // [block * q_dim]  — Q is block-only
-    pub k: GpuTensor,          // [(max_ctx + block) * kv_dim] — ctx ++ block
-    pub v: GpuTensor,          // [(max_ctx + block) * kv_dim] — ctx ++ block
-    pub attn_out: GpuTensor,   // [block * q_dim]
-    pub tmp: GpuTensor,        // [block*hidden] scratch
+    pub q: GpuTensor, // [block * q_dim]  — Q is block-only
+    pub k: GpuTensor, // [(max_ctx + block) * kv_dim] — ctx ++ block
+    pub v: GpuTensor, // [(max_ctx + block) * kv_dim] — ctx ++ block
+    pub attn_out: GpuTensor, // [block * q_dim]
+    pub tmp: GpuTensor, // [block*hidden] scratch
     pub gate_ffn: GpuTensor,
     pub up_ffn: GpuTensor,
     pub ffn_hidden: GpuTensor,
     pub logits_tmp: GpuTensor, // [hidden] for final norm
     /// Batched GEMM rotation scratch.
-    pub x_rot: GpuTensor,           // [block * hidden] — shared rotation for q / gate/up
-    pub kv_input: GpuTensor,        // [(max_ctx+block)*hidden] — cat[target_hidden_proj, tmp]
-    pub kv_input_rot: GpuTensor,    // [(max_ctx+block)*hidden] — FWHT-rotated kv_input
-    pub ffn_hidden_rot: GpuTensor,  // [block*intermediate] — FWHT-rotated ffn_hidden for down_proj
+    pub x_rot: GpuTensor, // [block * hidden] — shared rotation for q / gate/up
+    pub kv_input: GpuTensor,   // [(max_ctx+block)*hidden] — cat[target_hidden_proj, tmp]
+    pub kv_input_rot: GpuTensor, // [(max_ctx+block)*hidden] — FWHT-rotated kv_input
+    pub ffn_hidden_rot: GpuTensor, // [block*intermediate] — FWHT-rotated ffn_hidden for down_proj
     /// Persistent buffer for encoder.fc input: [max_ctx * num_extract * hidden]
     /// Host `target_hidden` (ctx*ne*h) is uploaded into this buffer each forward
     /// via a sub-offset view; no per-forward alloc. Sized to the configured cap
@@ -646,71 +671,133 @@ pub struct GlimmerDrafterScratch {
     /// a persistent `pos_buf` for exactly this reason; the drafter now matches.
     /// Capacity: `(max_ctx + block) * 4` bytes (i32 positions).
     pub pos_buf: hip_bridge::DeviceBuffer,
+    /// Absolute sequence capacity used to size K/V caches and `target_hidden_proj`
+    /// (constructor `max_ctx` argument).
+    pub max_ctx: usize,
+    /// Explicit context capacity used to size `fc_input` (and the max `ctx_len`
+    /// this scratch will accept). Set by the caller; never derived here.
+    pub ctx_capacity: usize,
 }
 
 impl GlimmerDrafterScratch {
-    pub fn new(gpu: &mut Gpu, cfg: &GlimmerDrafterConfig, max_ctx: usize) -> Result<Self, String> {
+    pub fn new(
+        gpu: &mut Gpu,
+        cfg: &GlimmerDrafterConfig,
+        max_ctx: usize,
+        ctx_capacity: usize,
+    ) -> Result<Self, String> {
+        if ctx_capacity == 0 {
+            return Err("glimmer drafter scratch: ctx_capacity == 0".into());
+        }
+        if ctx_capacity > max_ctx {
+            return Err(format!(
+                "glimmer drafter scratch: ctx_capacity {ctx_capacity} > max_ctx {max_ctx}"
+            ));
+        }
         let h = cfg.hidden;
         let qd = cfg.q_dim();
         let kvd = cfg.kv_dim();
         let block = cfg.block_size;
         let kv_rows = max_ctx + block;
-        // `fc_input` is the one scratch buffer that scales with CONTEXT rather
-        // than block, so sizing it to `max_ctx` is not free: at max_seq 16384
-        // with num_extract 5 and hidden 6656 that is 2.18 GB, which starved
-        // prefill into `hipMalloc: out of memory` on a 25.8 GB card.
-        //
-        // The daemon never feeds more than `ctx_cap` rows —
-        // `ctx_len = n_rows.min(ctx_cap)` with
-        // `ctx_cap = HIPFIRE_GLIMMER_CTX_CAP or config.sliding_window`
-        // (daemon.rs:30671-30675) — so resolve the same bound here and size to
-        // it. `glimmer_drafter_forward` guards the view against a cap raised
-        // after construction rather than silently reading past the end.
-        let fc_ctx = max_ctx.min(
-            std::env::var("HIPFIRE_GLIMMER_CTX_CAP")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .filter(|v| *v > 0)
-                .unwrap_or(cfg.sliding_window),
-        );
+        // `fc_input` scales with CONTEXT rather than block. Callers pass an
+        // already-clamped `ctx_capacity` (daemon/load: HIPFIRE_GLIMMER_CTX_CAP
+        // defaulting to GLIMMER_DRAFTER_CTX_CAP_DEFAULT, clamped to max_seq).
+        // No env sampling or sliding-window default here.
         let pos_buf = gpu
             .hip
             .malloc(kv_rows * 4)
             .map_err(|e| format!("glimmer drafter: alloc pos_buf: {e:?}"))?;
-        let alloc = |g: &mut Gpu, n: usize, label: &str| -> Result<GpuTensor, String> {
-            g.zeros(&[n], DType::F32)
-                .map_err(|e| format!("glimmer drafter scratch {label}: {e:?}"))
+
+        // Narrow allocation-failure cleanup: free prior tensors immediately
+        // (not via the reusable pool) so a partial constructor does not leak
+        // or leave stale memset'd pool entries.
+        struct Partial<'a> {
+            gpu: &'a mut Gpu,
+            pos_buf: Option<hip_bridge::DeviceBuffer>,
+            tensors: Vec<GpuTensor>,
+        }
+        impl Drop for Partial<'_> {
+            fn drop(&mut self) {
+                for t in self.tensors.drain(..) {
+                    let _ = self.gpu.release_tensor_immediate(t);
+                }
+                if let Some(buf) = self.pos_buf.take() {
+                    let _ = self.gpu.hip.free(buf);
+                }
+            }
+        }
+        let mut partial = Partial {
+            gpu,
+            pos_buf: Some(pos_buf),
+            tensors: Vec::new(),
         };
+        let mut alloc = |n: usize, label: &str| -> Result<(), String> {
+            let t = partial
+                .gpu
+                .zeros(&[n], DType::F32)
+                .map_err(|e| format!("glimmer drafter scratch {label}: {e:?}"))?;
+            partial.tensors.push(t);
+            Ok(())
+        };
+
         // Per-layer K/V cache for incremental attention (absolute-position-keyed).
         // Sized to `max_ctx * kv_dim` direct (no ring) so window [cur_start..cur_end)
-        // is contiguous at offset cur_start*kvd. At max_ctx 8192 that's 32 MiB per
-        // tensor, 64 MiB per layer, 320 MiB total for 5 layers; at cap 2048 ring
-        // would be 80 MiB total but we keep direct for simplicity and bit-identical
-        // gathering. If max_seq were 16384 the direct cost doubles to 640 MiB and a
-        // 2048-slot ring (80 MiB) should replace it.
+        // is contiguous at offset cur_start*kvd.
+        for li in 0..cfg.n_layers {
+            alloc(max_ctx * kvd, &format!("k_ctx_cached{li}"))?;
+            alloc(max_ctx * kvd, &format!("v_ctx_cached{li}"))?;
+        }
+        // Fixed scratch fields in assembly order after the 2*n_layers KV tensors.
+        alloc(block * h, "x")?;
+        alloc(max_ctx * h, "target_hidden_proj")?;
+        alloc(block * qd, "q")?;
+        alloc(kv_rows * kvd, "k")?;
+        alloc(kv_rows * kvd, "v")?;
+        alloc(block * qd, "attn_out")?;
+        alloc(block * h, "tmp")?;
+        alloc(block * cfg.intermediate, "gate_ffn")?;
+        alloc(block * cfg.intermediate, "up_ffn")?;
+        alloc(block * cfg.intermediate, "ffn_hidden")?;
+        alloc(h, "logits_tmp")?;
+        alloc(block * h, "x_rot")?;
+        alloc(kv_rows * h, "kv_input")?;
+        alloc(kv_rows * h, "kv_input_rot")?;
+        alloc(block * cfg.intermediate, "ffn_hidden_rot")?;
+        alloc(ctx_capacity * cfg.num_extract() * h, "fc_input")?;
+
+        // Success: take ownership out of Partial so Drop is a no-op.
+        let tensors = std::mem::take(&mut partial.tensors);
+        let pos_buf = partial.pos_buf.take().expect("pos_buf present");
+        std::mem::forget(partial);
+
+        let mut it = tensors.into_iter();
+        let mut next = |label: &str| -> GpuTensor {
+            it.next()
+                .unwrap_or_else(|| panic!("glimmer drafter scratch: missing {label}"))
+        };
         let mut k_ctx_cached = Vec::with_capacity(cfg.n_layers);
         let mut v_ctx_cached = Vec::with_capacity(cfg.n_layers);
-        for li in 0..cfg.n_layers {
-            k_ctx_cached.push(alloc(gpu, max_ctx * kvd, &format!("k_ctx_cached{li}"))?);
-            v_ctx_cached.push(alloc(gpu, max_ctx * kvd, &format!("v_ctx_cached{li}"))?);
+        for _ in 0..cfg.n_layers {
+            k_ctx_cached.push(next("k_ctx_cached"));
+            v_ctx_cached.push(next("v_ctx_cached"));
         }
-        Ok(GlimmerDrafterScratch {
-            x: alloc(gpu, block * h, "x")?,
-            target_hidden_proj: alloc(gpu, max_ctx * h, "target_hidden_proj")?,
-            q: alloc(gpu, block * qd, "q")?,
-            k: alloc(gpu, kv_rows * kvd, "k")?,
-            v: alloc(gpu, kv_rows * kvd, "v")?,
-            attn_out: alloc(gpu, block * qd, "attn_out")?,
-            tmp: alloc(gpu, block * h, "tmp")?,
-            gate_ffn: alloc(gpu, block * cfg.intermediate, "gate_ffn")?,
-            up_ffn: alloc(gpu, block * cfg.intermediate, "up_ffn")?,
-            ffn_hidden: alloc(gpu, block * cfg.intermediate, "ffn_hidden")?,
-            logits_tmp: alloc(gpu, h, "logits_tmp")?,
-            x_rot: alloc(gpu, block * h, "x_rot")?,
-            kv_input: alloc(gpu, kv_rows * h, "kv_input")?,
-            kv_input_rot: alloc(gpu, kv_rows * h, "kv_input_rot")?,
-            ffn_hidden_rot: alloc(gpu, block * cfg.intermediate, "ffn_hidden_rot")?,
-            fc_input: alloc(gpu, fc_ctx * cfg.num_extract() * h, "fc_input")?,
+        let out = GlimmerDrafterScratch {
+            x: next("x"),
+            target_hidden_proj: next("target_hidden_proj"),
+            q: next("q"),
+            k: next("k"),
+            v: next("v"),
+            attn_out: next("attn_out"),
+            tmp: next("tmp"),
+            gate_ffn: next("gate_ffn"),
+            up_ffn: next("up_ffn"),
+            ffn_hidden: next("ffn_hidden"),
+            logits_tmp: next("logits_tmp"),
+            x_rot: next("x_rot"),
+            kv_input: next("kv_input"),
+            kv_input_rot: next("kv_input_rot"),
+            ffn_hidden_rot: next("ffn_hidden_rot"),
+            fc_input: next("fc_input"),
             fc_uploaded_rows: 0,
             fc_projected_rows: 0,
             fc_window_start: 0,
@@ -718,7 +805,14 @@ impl GlimmerDrafterScratch {
             k_ctx_cached,
             v_ctx_cached,
             pos_buf,
-        })
+            max_ctx,
+            ctx_capacity,
+        };
+        debug_assert!(
+            it.next().is_none(),
+            "glimmer drafter scratch: leftover tensors"
+        );
+        Ok(out)
     }
     pub fn free_gpu(self, gpu: &mut Gpu) {
         for t in [
@@ -749,11 +843,40 @@ impl GlimmerDrafterScratch {
         }
         let _ = gpu.hip.free(self.pos_buf);
     }
+
+    #[inline]
+    pub fn max_ctx(&self) -> usize {
+        self.max_ctx
+    }
+
+    #[inline]
+    pub fn ctx_capacity(&self) -> usize {
+        self.ctx_capacity
+    }
+
+    /// Clear absolute K/V/fc watermarks (no GPU memset).
+    pub fn reset_history(&mut self) {
+        self.kv_abs_end = 0;
+        self.fc_uploaded_rows = 0;
+        self.fc_projected_rows = 0;
+        self.fc_window_start = 0;
+    }
+
+    /// Rewind absolute K/V watermark to `abs_end` (clamped) and clear
+    /// observational fc row counters. Does not clear GPU cache contents.
+    pub fn rewind_history(&mut self, abs_end: usize) {
+        let end = abs_end as i32;
+        if self.kv_abs_end > end {
+            self.kv_abs_end = end;
+        }
+        self.fc_uploaded_rows = 0;
+        self.fc_projected_rows = 0;
+        self.fc_window_start = 0;
+    }
 }
 
 // ─── Forward (no new kernels) ─────────────────────────────────────────
-
-/// Muse Glimmer DFlash draft forward.
+/// Muse Glimmer DFlash draft forward (host target_hidden).
 ///
 /// `noise_embedding`: `[block_size * hidden]` raw F32 embeddings of
 /// `[seed, MASK×(block-1)]` via `target.embed_tokens` (no embed_norm).
@@ -775,6 +898,65 @@ pub fn glimmer_drafter_forward(
     block_size: usize,
     ctx_len: usize,
 ) -> Result<(), String> {
+    glimmer_drafter_forward_inner(
+        gpu,
+        cfg,
+        weights,
+        scratch,
+        noise_embedding,
+        TargetHiddenSrc::Host(target_hidden),
+        positions,
+        block_size,
+        ctx_len,
+    )
+}
+
+/// Muse Glimmer DFlash draft forward with device-resident target hidden log.
+///
+/// Same contract as [`glimmer_drafter_forward`], except context rows are pulled
+/// from `target_hidden` via ordered async D2D instead of host H2D.
+#[allow(clippy::too_many_arguments)]
+pub fn glimmer_drafter_forward_device(
+    gpu: &mut Gpu,
+    cfg: &GlimmerDrafterConfig,
+    weights: &GlimmerDrafterWeights,
+    scratch: &mut GlimmerDrafterScratch,
+    noise_embedding: &[f32],
+    target_hidden: &GlimmerHiddenLog,
+    positions: &[i32],
+    block_size: usize,
+    ctx_len: usize,
+) -> Result<(), String> {
+    glimmer_drafter_forward_inner(
+        gpu,
+        cfg,
+        weights,
+        scratch,
+        noise_embedding,
+        TargetHiddenSrc::Device(target_hidden),
+        positions,
+        block_size,
+        ctx_len,
+    )
+}
+
+enum TargetHiddenSrc<'a> {
+    Host(&'a [f32]),
+    Device(&'a GlimmerHiddenLog),
+}
+
+#[allow(clippy::too_many_arguments)]
+fn glimmer_drafter_forward_inner(
+    gpu: &mut Gpu,
+    cfg: &GlimmerDrafterConfig,
+    weights: &GlimmerDrafterWeights,
+    scratch: &mut GlimmerDrafterScratch,
+    noise_embedding: &[f32],
+    target_hidden: TargetHiddenSrc<'_>,
+    positions: &[i32],
+    block_size: usize,
+    ctx_len: usize,
+) -> Result<(), String> {
     if block_size != cfg.block_size {
         return Err(format!(
             "glimmer drafter: block_size {} != cfg.block_size {}",
@@ -789,52 +971,108 @@ pub fn glimmer_drafter_forward(
             expected_noise
         ));
     }
-    let expected_th = ctx_len * cfg.num_extract() * cfg.hidden;
-    if target_hidden.len() != expected_th {
+    let expected_pos = ctx_len + block_size;
+    if positions.len() != expected_pos {
         return Err(format!(
-            "glimmer drafter: target_hidden len {} != expected {} (ctx_len={} num_extract={} hidden={})",
-            target_hidden.len(),
-            expected_th,
+            "glimmer drafter: positions len {} != expected {} (ctx_len={} block_size={})",
+            positions.len(),
+            expected_pos,
             ctx_len,
-            cfg.num_extract(),
-            cfg.hidden
+            block_size
         ));
     }
-    let expected_pos = ctx_len + block_size;
+    if ctx_len > 0 && positions[0] < 0 {
+        return Err(format!(
+            "glimmer drafter: positions[0]={} must be >= 0 when ctx_len>0",
+            positions[0]
+        ));
+    }
+    if ctx_len > scratch.ctx_capacity {
+        return Err(format!(
+            "glimmer drafter: ctx_len {ctx_len} > scratch.ctx_capacity {}",
+            scratch.ctx_capacity
+        ));
+    }
     let h = cfg.hidden;
     let ne = cfg.num_extract();
     let eps = cfg.norm_eps;
     let kvd = cfg.kv_dim();
     let l = ctx_len + block_size; // K/V length
-    // Absolute-position watermark for incremental fc/K/V. Mirrors
-    // dflash.rs::TargetHiddenLog but absolute-keyed (like a normal KV cache)
-    // so the daemon's suffix window `ctx_len = n_rows.min(sliding_window)` and
-    // `start = (n_rows-ctx_len)*row_elems` slide does NOT invalidate — it
-    // just selects a different absolute range of an already-populated cache.
-    // Invalidate only on genuine rollback (cur_end < watermark) or reset.
+                                  // Absolute-position watermark for incremental fc/K/V. Mirrors
+                                  // dflash.rs::TargetHiddenLog but absolute-keyed (like a normal KV cache)
+                                  // so the daemon's suffix window `ctx_len = n_rows.min(sliding_window)` and
+                                  // `start = (n_rows-ctx_len)*row_elems` slide does NOT invalidate — it
+                                  // just selects a different absolute range of an already-populated cache.
+                                  // Invalidate only on genuine rollback (cur_end < watermark) or reset.
     let cur_start: i32 = if ctx_len > 0 { positions[0] } else { 0 };
     let cur_end: i32 = cur_start + ctx_len as i32;
+    if cur_end as usize > scratch.max_ctx {
+        return Err(format!(
+            "glimmer drafter: cur_end {cur_end} > scratch.max_ctx {}",
+            scratch.max_ctx
+        ));
+    }
+    let expected_th = ctx_len * ne * h;
+    match &target_hidden {
+        TargetHiddenSrc::Host(host) => {
+            if host.len() != expected_th {
+                return Err(format!(
+                    "glimmer drafter: target_hidden len {} != expected {} (ctx_len={} num_extract={} hidden={})",
+                    host.len(),
+                    expected_th,
+                    ctx_len,
+                    ne,
+                    h
+                ));
+            }
+        }
+        TargetHiddenSrc::Device(log) => {
+            if !log.stage_is_idle() {
+                return Err("glimmer drafter: target_hidden log stage must be Idle".into());
+            }
+            if log.hidden() != h {
+                return Err(format!(
+                    "glimmer drafter: target_hidden log hidden {} != cfg.hidden {h}",
+                    log.hidden()
+                ));
+            }
+            if log.num_extract() != ne {
+                return Err(format!(
+                    "glimmer drafter: target_hidden log num_extract {} != cfg {}",
+                    log.num_extract(),
+                    ne
+                ));
+            }
+            if ctx_len > 0 {
+                let cs = cur_start as usize;
+                let ce = cur_end as usize;
+                if log.committed_abs_end() < ce {
+                    return Err(format!(
+                        "glimmer drafter: log committed_abs_end {} < cur_end {ce}",
+                        log.committed_abs_end()
+                    ));
+                }
+                if cs < log.valid_abs_start() || ce > log.committed_abs_end() {
+                    return Err(format!(
+                        "glimmer drafter: requested [{cs},{ce}) outside log valid [{},{})",
+                        log.valid_abs_start(),
+                        log.committed_abs_end()
+                    ));
+                }
+            }
+        }
+    }
     // Rollback / reset detection (absolute, not row-index).
-    let mut need_reset = false;
     if ctx_len == 0 {
         // No context — clear watermarks.
-        scratch.kv_abs_end = 0;
-        scratch.fc_uploaded_rows = 0;
-        scratch.fc_projected_rows = 0;
-        scratch.fc_window_start = 0;
+        scratch.reset_history();
     } else if scratch.kv_abs_end > cur_end {
         // cur_end went backwards: rollback after rejected spec block or new
         // shorter conversation. The tail [cur_end .. old watermark) is stale
         // (same absolute positions will be rewritten with different content).
-        need_reset = true;
+        scratch.reset_history();
     }
-    if need_reset {
-        scratch.kv_abs_end = 0;
-        scratch.fc_uploaded_rows = 0;
-        scratch.fc_projected_rows = 0;
-        scratch.fc_window_start = 0;
-    }
-    // Incremental fc: only rows [fill_start .. cur_end) need H2D + fc.
+    // Incremental fc: only rows [fill_start .. cur_end) need source + fc.
     if ctx_len > 0 {
         let ne_h = ne * h;
         let fc_cap = scratch.fc_input.shape.iter().product::<usize>();
@@ -865,22 +1103,43 @@ pub fn glimmer_drafter_forward(
             ));
         }
         if delta > 0 {
-            let host_off = (fill_start - cur_start) as usize;
-            let host_seg = &target_hidden[host_off * ne_h..(host_off + delta) * ne_h];
-            let bytes = unsafe {
-                std::slice::from_raw_parts(host_seg.as_ptr() as *const u8, host_seg.len() * 4)
-            };
             // Stage delta rows contiguously at fc_input[0..delta) — absolute
             // position is encoded in the *destination* (target_hidden_proj) not
             // the source staging.
             let fc_in_seg = scratch.fc_input.sub_offset(0, delta * ne_h);
-            gpu.hip
-                .memcpy_htod(&fc_in_seg.buf, bytes)
-                .map_err(|e| format!("drafter htod fc_input delta [{fill_start}..{cur_end}): {e:?}"))?;
+            match target_hidden {
+                TargetHiddenSrc::Host(host) => {
+                    let host_off = (fill_start - cur_start) as usize;
+                    let host_seg = &host[host_off * ne_h..(host_off + delta) * ne_h];
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(
+                            host_seg.as_ptr() as *const u8,
+                            host_seg.len() * 4,
+                        )
+                    };
+                    gpu.hip.memcpy_htod(&fc_in_seg.buf, bytes).map_err(|e| {
+                        format!("drafter htod fc_input delta [{fill_start}..{cur_end}): {e:?}")
+                    })?;
+                }
+                TargetHiddenSrc::Device(log) => {
+                    log.copy_committed_rows_to(
+                        gpu,
+                        fill_start as usize,
+                        delta,
+                        &scratch.fc_input,
+                        0,
+                    )
+                    .map_err(|e| {
+                        format!("drafter d2d fc_input delta [{fill_start}..{cur_end}): {e}")
+                    })?;
+                }
+            }
             let target_seg = scratch
                 .target_hidden_proj
                 .sub_offset(fill_start as usize * h, delta * h);
-            let fc_rot_seg = scratch.kv_input_rot.sub_offset(fill_start as usize * h, delta * h);
+            let fc_rot_seg = scratch
+                .kv_input_rot
+                .sub_offset(fill_start as usize * h, delta * h);
             proj_gemm_batched(
                 gpu,
                 &weights.fc,
@@ -914,7 +1173,10 @@ pub fn glimmer_drafter_forward(
     // --- 2. noise_embedding into scratch.x (context is NOT added into x) ---
     {
         let host_bytes = unsafe {
-            std::slice::from_raw_parts(noise_embedding.as_ptr() as *const u8, noise_embedding.len() * 4)
+            std::slice::from_raw_parts(
+                noise_embedding.as_ptr() as *const u8,
+                noise_embedding.len() * 4,
+            )
         };
         gpu.hip
             .memcpy_htod(&scratch.x.buf, host_bytes)
@@ -977,10 +1239,10 @@ pub fn glimmer_drafter_forward(
                 let thp_seg = scratch
                     .target_hidden_proj
                     .sub_offset(fill_start as usize * h, delta * h);
-                let k_seg = scratch.k_ctx_cached[li]
-                    .sub_offset(fill_start as usize * kvd, delta * kvd);
-                let v_seg = scratch.v_ctx_cached[li]
-                    .sub_offset(fill_start as usize * kvd, delta * kvd);
+                let k_seg =
+                    scratch.k_ctx_cached[li].sub_offset(fill_start as usize * kvd, delta * kvd);
+                let v_seg =
+                    scratch.v_ctx_cached[li].sub_offset(fill_start as usize * kvd, delta * kvd);
                 let need_kv_rot = shared_rot_enabled()
                     && hipfire_dispatch::types::dtype_rotation_plan(layer.k_proj.gpu_dtype)
                         != hipfire_dispatch::types::RotationPlan::None;
@@ -1049,10 +1311,10 @@ pub fn glimmer_drafter_forward(
             }
             // Gather window [cur_start .. cur_end) from absolute cache into
             // contiguous prefix [0 .. ctx_len) of k_full/v_full.
-            let src_k = scratch.k_ctx_cached[li]
-                .sub_offset(cur_start as usize * kvd, ctx_len * kvd);
-            let src_v = scratch.v_ctx_cached[li]
-                .sub_offset(cur_start as usize * kvd, ctx_len * kvd);
+            let src_k =
+                scratch.k_ctx_cached[li].sub_offset(cur_start as usize * kvd, ctx_len * kvd);
+            let src_v =
+                scratch.v_ctx_cached[li].sub_offset(cur_start as usize * kvd, ctx_len * kvd);
             let dst_k_ctx = k_full.sub_offset(0, ctx_len * kvd);
             let dst_v_ctx = v_full.sub_offset(0, ctx_len * kvd);
             gpu.hip
@@ -1070,8 +1332,15 @@ pub fn glimmer_drafter_forward(
                 && hipfire_dispatch::types::dtype_rotation_plan(layer.k_proj.gpu_dtype)
                     != hipfire_dispatch::types::RotationPlan::None;
             if need_tail_rot {
-                rotate_x_mq_batched_for(gpu, &layer.k_proj, &scratch.tmp, &scratch.x_rot, h, block_size)
-                    .map_err(|e| format!("drafter L{li} kv block rotate: {e:?}"))?;
+                rotate_x_mq_batched_for(
+                    gpu,
+                    &layer.k_proj,
+                    &scratch.tmp,
+                    &scratch.x_rot,
+                    h,
+                    block_size,
+                )
+                .map_err(|e| format!("drafter L{li} kv block rotate: {e:?}"))?;
                 proj_gemm_batched_prerotated(
                     gpu,
                     &layer.k_proj,
@@ -1218,8 +1487,15 @@ pub fn glimmer_drafter_forward(
             && hipfire_dispatch::types::dtype_rotation_plan(layer.gate_proj.gpu_dtype)
                 != hipfire_dispatch::types::RotationPlan::None;
         if need_ffn_rot {
-            rotate_x_mq_batched_for(gpu, &layer.gate_proj, &scratch.tmp, &scratch.x_rot, h, block_size)
-                .map_err(|e| format!("drafter L{li} ffn rotate: {e:?}"))?;
+            rotate_x_mq_batched_for(
+                gpu,
+                &layer.gate_proj,
+                &scratch.tmp,
+                &scratch.x_rot,
+                h,
+                block_size,
+            )
+            .map_err(|e| format!("drafter L{li} ffn rotate: {e:?}"))?;
             proj_gemm_batched_prerotated(
                 gpu,
                 &layer.gate_proj,

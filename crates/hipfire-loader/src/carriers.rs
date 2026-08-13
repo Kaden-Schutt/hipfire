@@ -1105,9 +1105,8 @@ impl Carrier for Deepseek4Carrier {
         // main_kv_cache and indexer_kv_cache; every other compressor buffer
         // stays F32 and commit arithmetic completes in F32 before the single
         // F32-to-F16 store.
-        let f16_ok = config.mq2r
-            && !config.mq2rxt
-            && ctx.gpu.arch_caps.supports_ds4_f16_compressor_cache();
+        let f16_ok =
+            config.mq2r && !config.mq2rxt && ctx.gpu.arch_caps.supports_ds4_f16_compressor_cache();
         if compressor_cache == hipfire_config::Deepseek4CompressorCache::F16 && !f16_ok {
             return Err(format!(
                 "deepseek4: kv_cache=f16 requires MQ2R on an architecture with wave32 WMMA (RDNA3/RDNA4); got arch={}, mq2r={}, mq2rxt={}",
@@ -1575,12 +1574,18 @@ impl Carrier for Gemma4Carrier {
                 if use_lowered {
                     let lcfg = lowered_cfg.unwrap();
                     let mut hfq2 = hfq;
-                    let weights = hipfire_arch_gemma4::lowered::load_weights(&mut hfq2, &lcfg, ctx.gpu)
-                        .map_err(|e| format!("gemma4 (lowered) load_weights: {e:?}"))?;
-                    let scratch = hipfire_arch_gemma4::lowered::Gemma4Scratch::new(ctx.gpu, &lcfg, 1)
-                        .map_err(|e| format!("gemma4 (lowered) scratch: {e:?}"))?;
-                    hipfire_arch_gemma4::lowered::init_scratch_constants(ctx.gpu, &scratch, lcfg.full_head_dim)
-                        .map_err(|e| format!("gemma4 (lowered) init_scratch_constants: {e:?}"))?;
+                    let weights =
+                        hipfire_arch_gemma4::lowered::load_weights(&mut hfq2, &lcfg, ctx.gpu)
+                            .map_err(|e| format!("gemma4 (lowered) load_weights: {e:?}"))?;
+                    let scratch =
+                        hipfire_arch_gemma4::lowered::Gemma4Scratch::new(ctx.gpu, &lcfg, 1)
+                            .map_err(|e| format!("gemma4 (lowered) scratch: {e:?}"))?;
+                    hipfire_arch_gemma4::lowered::init_scratch_constants(
+                        ctx.gpu,
+                        &scratch,
+                        lcfg.full_head_dim,
+                    )
+                    .map_err(|e| format!("gemma4 (lowered) init_scratch_constants: {e:?}"))?;
                     let kv_sliding = hipfire_runtime::llama::KvCache::new_gpu_q8_capped(
                         ctx.gpu,
                         lcfg.n_layers,
@@ -1598,7 +1603,10 @@ impl Carrier for Gemma4Carrier {
                         ctx.max_seq,
                     )
                     .map_err(|e| format!("gemma4 (lowered) full KV alloc: {e:?}"))?;
-                    let eos_tok = resolve_eos_tok(&meta.tokenizer, &["<end_of_turn>", "<turn|>", "<eos>", "<|im_end|>"]);
+                    let eos_tok = resolve_eos_tok(
+                        &meta.tokenizer,
+                        &["<end_of_turn>", "<turn|>", "<eos>", "<|im_end|>"],
+                    );
                     let hfq_for_template = hfq2;
                     let chat_template = resolve_chat_template(&hfq_for_template, ctx.path);
                     eprintln!(
@@ -1615,12 +1623,12 @@ impl Carrier for Gemma4Carrier {
                     );
                     return Ok(LoadedModel {
                         state: Some(ModelState::Gemma4Lowered(crate::Gemma4LoweredBundle {
-                                config: lcfg,
-                                weights,
-                                scratch,
-                                kv_sliding,
-                                kv_full,
-                                eos_tok,
+                            config: lcfg,
+                            weights,
+                            scratch,
+                            kv_sliding,
+                            kv_full,
+                            eos_tok,
                         })),
                         speculator,
                         ..LoadedModel::skeleton(
@@ -1635,10 +1643,18 @@ impl Carrier for Gemma4Carrier {
                 }
                 // ── Eager dense path ──
                 let config = hipfire_arch_gemma4::config::Gemma4Config::from_hfq(&hfq)?;
-                let weights = hipfire_arch_gemma4::gemma4::Gemma4Weights::load(&hfq, &config, ctx.gpu)?;
-                let state = hipfire_arch_gemma4::gemma4::Gemma4State::new_with_max_seq(ctx.gpu, &config, ctx.max_seq)
-                    .map_err(|e| format!("gemma4: Gemma4State::new_with_max_seq failed: {e}"))?;
-                let eos_tok = resolve_eos_tok(&meta.tokenizer, &["<end_of_turn>", "<turn|>", "<eos>", "<|im_end|>"]);
+                let weights =
+                    hipfire_arch_gemma4::gemma4::Gemma4Weights::load(&hfq, &config, ctx.gpu)?;
+                let state = hipfire_arch_gemma4::gemma4::Gemma4State::new_with_max_seq(
+                    ctx.gpu,
+                    &config,
+                    ctx.max_seq,
+                )
+                .map_err(|e| format!("gemma4: Gemma4State::new_with_max_seq failed: {e}"))?;
+                let eos_tok = resolve_eos_tok(
+                    &meta.tokenizer,
+                    &["<end_of_turn>", "<turn|>", "<eos>", "<|im_end|>"],
+                );
                 let _ = &weights;
                 // Optional EAGLE drafter (arch-22) — populated only when
                 // `gemma4_drafter_path` is Some. Validates draft_len 1..=5,
@@ -1677,12 +1693,12 @@ impl Carrier for Gemma4Carrier {
                 );
                 Ok(LoadedModel {
                     state: Some(ModelState::Gemma4(crate::Gemma4Bundle {
-                            config,
-                            weights,
-                            state,
-                            eos_tok,
-                            eagle,
-                        })),
+                        config,
+                        weights,
+                        state,
+                        eos_tok,
+                        eagle,
+                    })),
                     speculator,
                     ..LoadedModel::skeleton(
                         meta.arch_id,
@@ -1725,17 +1741,20 @@ fn load_gemma4_eagle_state(
             dcfg.backbone_hidden, target_cfg.dim
         ));
     }
-    let drafter_weights = hipfire_arch_gemma4::drafter::Gemma4DrafterWeights::load(&dhfq, &dcfg, gpu)?;
+    let drafter_weights =
+        hipfire_arch_gemma4::drafter::Gemma4DrafterWeights::load(&dhfq, &dcfg, gpu)?;
     let drafter_scratch = hipfire_arch_gemma4::drafter::Gemma4DrafterScratch::new(gpu, &dcfg)
         .map_err(|e| format!("gemma4 drafter scratch: {e}"))?;
-    let spec_scratch = hipfire_arch_gemma4::speculative::Gemma4SpecScratch::new(gpu, target_cfg, draft_len)
-        .map_err(|e| format!("gemma4 spec scratch: {e}"))?;
+    let spec_scratch =
+        hipfire_arch_gemma4::speculative::Gemma4SpecScratch::new(gpu, target_cfg, draft_len)
+            .map_err(|e| format!("gemma4 spec scratch: {e}"))?;
     // Prime the batched verify path (b=1 then real block size) on disposable
     // throwaway states — mirrors PR's warmup to ensure kernels are compiled.
     let warm_b = draft_len + 1;
     {
-        let mut warm = hipfire_arch_gemma4::gemma4::Gemma4State::new_with_max_seq(gpu, target_cfg, warm_b + 4)
-            .map_err(|e| format!("gemma4-eagle: warm state: {e}"))?;
+        let mut warm =
+            hipfire_arch_gemma4::gemma4::Gemma4State::new_with_max_seq(gpu, target_cfg, warm_b + 4)
+                .map_err(|e| format!("gemma4-eagle: warm state: {e}"))?;
         let _ = hipfire_arch_gemma4::forward::forward_batch(
             target_cfg,
             target_weights,
@@ -1748,8 +1767,9 @@ fn load_gemma4_eagle_state(
         warm.free_gpu(gpu);
     }
     {
-        let mut warm = hipfire_arch_gemma4::gemma4::Gemma4State::new_with_max_seq(gpu, target_cfg, warm_b + 4)
-            .map_err(|e| format!("gemma4-eagle: warm state 2: {e}"))?;
+        let mut warm =
+            hipfire_arch_gemma4::gemma4::Gemma4State::new_with_max_seq(gpu, target_cfg, warm_b + 4)
+                .map_err(|e| format!("gemma4-eagle: warm state 2: {e}"))?;
         let _ = hipfire_arch_gemma4::forward::forward_batch(
             target_cfg,
             target_weights,
@@ -1816,8 +1836,10 @@ impl Carrier for MuseGlimmerCarrier {
                 let weights = hipfire_arch_muse_glimmer::glimmer::GlimmerWeights::load(
                     &hfq, &config, ctx.gpu,
                 )?;
-                let state = hipfire_arch_muse_glimmer::glimmer::GlimmerState::new_with_max_seq(
-                    ctx.gpu, &config, ctx.max_seq,
+                let mut state = hipfire_arch_muse_glimmer::glimmer::GlimmerState::new_with_max_seq(
+                    ctx.gpu,
+                    &config,
+                    ctx.max_seq,
                 )
                 .map_err(|e| format!("muse_glimmer: GlimmerState::new_with_max_seq failed: {e}"))?;
                 // eos resolution by name with 200001 as the documented fallback.
@@ -1829,9 +1851,19 @@ impl Carrier for MuseGlimmerCarrier {
                 let eos_tok = {
                     let tok = resolve_eos_tok(
                         &meta.tokenizer,
-                        &["<end_of_turn>", "<|im_end|>", "</s>", "<|endoftext|>", "<eos>"],
+                        &[
+                            "<end_of_turn>",
+                            "<|im_end|>",
+                            "</s>",
+                            "<|endoftext|>",
+                            "<eos>",
+                        ],
                     );
-                    if tok == 1 { 200001 } else { tok }
+                    if tok == 1 {
+                        200001
+                    } else {
+                        tok
+                    }
                 };
                 // Optional DFlash drafter (arch 23). OFF by default — daemon
                 // only populates ctx.draft_path when HIPFIRE_DFLASH_DRAFT is set
@@ -1840,17 +1872,24 @@ impl Carrier for MuseGlimmerCarrier {
                 // and stash it on the bundle for the speculator to consume.
                 // On any failure, log and fall back to AR-only (never fail the
                 // target load because the draft is auxiliary).
-                let drafter: Option<crate::GlimmerDrafterBundle> = if let Some(dp) = ctx.draft_path.clone() {
+                let drafter: Option<crate::GlimmerDrafterBundle> = if let Some(dp) =
+                    ctx.draft_path.clone()
+                {
                     match (|| -> Result<crate::GlimmerDrafterBundle, String> {
                         let dhfq = hipfire_runtime::hfq::HfqFile::open(std::path::Path::new(&dp))
                             .map_err(|e| format!("open glimmer drafter '{dp}': {e}"))?;
-                        if dhfq.arch_id != hipfire_arch_muse_glimmer::drafter::GLIMMER_DRAFTER_ARCH_ID {
+                        if dhfq.arch_id
+                            != hipfire_arch_muse_glimmer::drafter::GLIMMER_DRAFTER_ARCH_ID
+                        {
                             return Err(format!(
                                 "glimmer drafter '{}' arch_id {} != {} (muse_glimmer_assistant); a DFlash draft (arch 20) or Gemma4 draft (22) does not match",
                                 dp, dhfq.arch_id, hipfire_arch_muse_glimmer::drafter::GLIMMER_DRAFTER_ARCH_ID
                             ));
                         }
-                        let dcfg = hipfire_arch_muse_glimmer::drafter::GlimmerDrafterConfig::from_hfq(&dhfq)?;
+                        let dcfg =
+                            hipfire_arch_muse_glimmer::drafter::GlimmerDrafterConfig::from_hfq(
+                                &dhfq,
+                            )?;
                         if dcfg.hidden != config.dim {
                             return Err(format!(
                                 "glimmer drafter hidden {} != target dim {} (cross-attention concat invariant)",
@@ -1860,14 +1899,39 @@ impl Carrier for MuseGlimmerCarrier {
                         if dcfg.block_size != 16 {
                             eprintln!("glimmer drafter: WARNING block_size {} != 16 (expected diffusion recipe)", dcfg.block_size);
                         }
-                        let dweights = hipfire_arch_muse_glimmer::drafter::GlimmerDrafterWeights::load(&dhfq, &dcfg, ctx.gpu)?;
-                        let dscratch = hipfire_arch_muse_glimmer::drafter::GlimmerDrafterScratch::new(ctx.gpu, &dcfg, ctx.max_seq)
+                        let dweights =
+                            hipfire_arch_muse_glimmer::drafter::GlimmerDrafterWeights::load(
+                                &dhfq, &dcfg, ctx.gpu,
+                            )?;
+                        // Freeze HIPFIRE_GLIMMER_CTX_CAP once at load (daemon/load default
+                        // 256). Same value sizes drafter scratch and device hidden log.
+                        let ctx_cap = {
+                            let requested = std::env::var("HIPFIRE_GLIMMER_CTX_CAP")
+                                .ok()
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                                .filter(|v| *v > 0)
+                                .unwrap_or(
+                                    hipfire_arch_muse_glimmer::drafter::GLIMMER_DRAFTER_CTX_CAP_DEFAULT,
+                                );
+                            requested.clamp(1, ctx.max_seq)
+                        };
+                        let dscratch =
+                            hipfire_arch_muse_glimmer::drafter::GlimmerDrafterScratch::new(
+                                ctx.gpu,
+                                &dcfg,
+                                ctx.max_seq,
+                                ctx_cap,
+                            )
                             .map_err(|e| format!("glimmer drafter scratch: {e}"))?;
                         eprintln!(
-                            "  glimmer DFlash drafter loaded: {} (layers={}, hidden={}, block={}, mask={})",
-                            dp, dcfg.n_layers, dcfg.hidden, dcfg.block_size, dcfg.mask_token_id
+                            "  glimmer DFlash drafter loaded: {} (layers={}, hidden={}, block={}, mask={}, ctx_cap={})",
+                            dp, dcfg.n_layers, dcfg.hidden, dcfg.block_size, dcfg.mask_token_id, ctx_cap
                         );
-                        Ok(crate::GlimmerDrafterBundle { config: dcfg, weights: dweights, scratch: dscratch })
+                        Ok(crate::GlimmerDrafterBundle {
+                            config: dcfg,
+                            weights: dweights,
+                            scratch: dscratch,
+                        })
                     })() {
                         Ok(b) => Some(b),
                         Err(e) => {
@@ -1878,6 +1942,47 @@ impl Carrier for MuseGlimmerCarrier {
                 } else {
                     None
                 };
+                // Device hidden capture: default-on when a valid drafter is present.
+                // HIPFIRE_GLIMMER_DEVICE_CAPTURE=0 forces host fallback. Selection is
+                // frozen here — no runtime path flipping after first generation.
+                if let Some(d) = &drafter {
+                    let env_off = hipfire_config::developer_var("HIPFIRE_GLIMMER_DEVICE_CAPTURE")
+                        .ok()
+                        .as_deref()
+                        == Some("0");
+                    if env_off {
+                        eprintln!(
+                            "  glimmer hidden capture: backend=host env-disabled (HIPFIRE_GLIMMER_DEVICE_CAPTURE=0)"
+                        );
+                    } else {
+                        // Same frozen cap used for scratch construction (no env re-read).
+                        let ctx_cap = d.scratch.ctx_capacity();
+                        let layers = &d.config.target_layer_ids;
+                        match state.enable_device_hidden_capture(
+                            ctx.gpu,
+                            layers,
+                            ctx_cap,
+                            config.n_layers,
+                            config.dim,
+                        ) {
+                            Ok(()) => {
+                                eprintln!(
+                                    "  glimmer hidden capture: backend=device capacity_rows={} target_layer_ids={:?} shape=[{}, {}, {}]",
+                                    ctx_cap,
+                                    layers,
+                                    ctx_cap,
+                                    layers.len(),
+                                    config.dim,
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "  glimmer hidden capture: device enable failed ({e}) — continuing with host fallback"
+                                );
+                            }
+                        }
+                    }
+                }
                 let speculator = crate::spec_build::build_speculator(
                     meta.arch_id,
                     None,
@@ -1919,4 +2024,3 @@ impl Carrier for MuseGlimmerCarrier {
         }
     }
 }
-

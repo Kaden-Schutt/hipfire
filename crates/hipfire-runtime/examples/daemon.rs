@@ -26,13 +26,13 @@ use hipfire_arch_cohere2moe as cohere2moe;
 use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_dots_ocr::dots_ocr;
 use hipfire_arch_gemma4 as gemma4;
-use hipfire_arch_muse_glimmer as glimmer;
 use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_lfm2moe::batch::Lfm2DecodeBatchState;
 use hipfire_arch_lfm2moe::forward_batch::{
     forward_decode_batch_lfm, forward_decode_batch_prepared_lfm, prepare_decode_batch_inputs_lfm,
 };
 use hipfire_arch_minimax as minimax;
+use hipfire_arch_muse_glimmer as glimmer;
 use hipfire_arch_qwen2::qwen2;
 use hipfire_arch_qwen35::qwen35;
 use hipfire_arch_qwen35::speculative;
@@ -10036,8 +10036,7 @@ fn fail_closed_reset_target_and_spec(
             bundle.state.reset();
         }
         if let Some(ModelState::MuseGlimmer(bundle)) = m.state.as_mut() {
-            bundle.state.reset();
-            bundle.target_hidden_host.clear();
+            bundle.reset_session_state();
         }
         if let Some(ad) = m.kv_adaptive.as_mut() {
             if let Some(ModelState::Qwen35(b)) = m.state.as_mut() {
@@ -13219,7 +13218,14 @@ fn main() {
                     match hipfire_loader::gemma4_eagle_spec_len(spec_raw) {
                         Ok(n) => n,
                         Err(e) => {
-                            emit_uncorrelated_error(&mut stdout, None, &e, "validation", false, false);
+                            emit_uncorrelated_error(
+                                &mut stdout,
+                                None,
+                                &e,
+                                "validation",
+                                false,
+                                false,
+                            );
                             let _ = stdout.flush();
                             continue;
                         }
@@ -13748,10 +13754,10 @@ fn main() {
                             ),
                             Some(ModelState::Gemma4(b)) => {
                                 (b.config.dim, b.config.n_layers, b.config.vocab_size)
-                            },
+                            }
                             Some(ModelState::MuseGlimmer(b)) => {
                                 (b.config.dim, b.config.n_layers, b.config.vocab_size)
-                            },
+                            }
                             _ => {
                                 if let Some(ref c) = m.dots_ocr_config {
                                     (
@@ -15588,7 +15594,7 @@ fn main() {
                     bundle.state.reset();
                 }
                 if let Some(ModelState::MuseGlimmer(bundle)) = m.state.as_mut() {
-                    bundle.state.reset();
+                    bundle.reset_session_state();
                 }
                 if let Some(ModelState::Deepseek4(b)) = m.state.as_mut() {
                     b.state.reset();
@@ -15780,28 +15786,42 @@ fn main() {
                     // `generate` stopped using — `hipfire bench --matrix` was
                     // reporting a route production never takes (and ~20x slower
                     // than the real one). Route through the same
-                    // `prefill_with_capture` the generate path calls.
+                    // prefill path the generate path calls (device when enabled).
                     let Some(ModelState::MuseGlimmer(bundle)) = m.state.as_mut() else {
                         unreachable!("arch_id=14 requires muse_glimmer bundle")
                     };
-                    let config = &bundle.config;
-                    let weights = &bundle.weights;
-                    let state = &mut bundle.state;
-                    let mut hidden_out: Vec<f32> = Vec::new();
-                    match glimmer::forward::prefill_with_capture(
-                        config,
-                        weights,
-                        state,
-                        &mut gpu,
-                        &synthetic,
-                        0,
-                        &[],
-                        &mut hidden_out,
-                    ) {
-                        Ok(_) => true,
-                        Err(e) => {
-                            prefill_err = Some(e);
-                            false
+                    if bundle.device_hidden_capture_enabled() {
+                        match glimmer::forward::prefill_with_device_capture(
+                            &bundle.config,
+                            &bundle.weights,
+                            &mut bundle.state,
+                            &mut gpu,
+                            &synthetic,
+                            0,
+                        ) {
+                            Ok(_) => true,
+                            Err(e) => {
+                                prefill_err = Some(e);
+                                false
+                            }
+                        }
+                    } else {
+                        let mut hidden_out: Vec<f32> = Vec::new();
+                        match glimmer::forward::prefill_with_capture(
+                            &bundle.config,
+                            &bundle.weights,
+                            &mut bundle.state,
+                            &mut gpu,
+                            &synthetic,
+                            0,
+                            &[],
+                            &mut hidden_out,
+                        ) {
+                            Ok(_) => true,
+                            Err(e) => {
+                                prefill_err = Some(e);
+                                false
+                            }
                         }
                     }
                 } else if m.arch_id == 8 {
@@ -15864,7 +15884,7 @@ fn main() {
                     bundle.state.reset();
                 }
                 if let Some(ModelState::MuseGlimmer(bundle)) = m.state.as_mut() {
-                    bundle.state.reset();
+                    bundle.reset_session_state();
                 }
                 if let Some(ModelState::Deepseek4(b)) = m.state.as_mut() {
                     b.state.reset();
@@ -16038,22 +16058,31 @@ fn main() {
                     let Some(ModelState::MuseGlimmer(bundle)) = m.state.as_mut() else {
                         unreachable!("arch_id=14 requires muse_glimmer bundle")
                     };
-                    bundle.state.reset();
-                    let config = &bundle.config;
-                    let weights = &bundle.weights;
-                    let state = &mut bundle.state;
-                    let mut hidden_out: Vec<f32> = Vec::new();
-                    glimmer::forward::prefill_with_capture(
-                        config,
-                        weights,
-                        state,
-                        &mut gpu,
-                        &synthetic,
-                        0,
-                        &[],
-                        &mut hidden_out,
-                    )
-                    .err()
+                    bundle.reset_session_state();
+                    if bundle.device_hidden_capture_enabled() {
+                        glimmer::forward::prefill_with_device_capture(
+                            &bundle.config,
+                            &bundle.weights,
+                            &mut bundle.state,
+                            &mut gpu,
+                            &synthetic,
+                            0,
+                        )
+                        .err()
+                    } else {
+                        let mut hidden_out: Vec<f32> = Vec::new();
+                        glimmer::forward::prefill_with_capture(
+                            &bundle.config,
+                            &bundle.weights,
+                            &mut bundle.state,
+                            &mut gpu,
+                            &synthetic,
+                            0,
+                            &[],
+                            &mut hidden_out,
+                        )
+                        .err()
+                    }
                 } else {
                     let ModelState::Qwen35(b) = m.state.as_mut().unwrap() else {
                         unreachable!()
@@ -17506,7 +17535,7 @@ fn generate_ep(
                 user: prompt,
                 enable_thinking: max_think_tokens != 1,
                 bos_token: None,
-            reasoning_strength: None,
+                reasoning_strength: None,
             };
             let render_result = if tools.is_some() || messages_history.is_some() {
                 let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
@@ -17519,9 +17548,9 @@ fn generate_ep(
                                 v.push(hipfire_runtime::prompt_frame::Message {
                                     role: hipfire_runtime::prompt_frame::Role::System,
                                     content: sys.to_string(),
-            reasoning_content: None,
-            name: None,
-            rendered_name: None,
+                                    reasoning_content: None,
+                                    name: None,
+                                    rendered_name: None,
                                     tool_calls: Vec::new(),
                                     tool_call_id: None,
                                     tool_plan: String::new(),
@@ -17530,9 +17559,9 @@ fn generate_ep(
                             v.push(hipfire_runtime::prompt_frame::Message {
                                 role: hipfire_runtime::prompt_frame::Role::User,
                                 content: prompt.to_string(),
-            reasoning_content: None,
-            name: None,
-            rendered_name: None,
+                                reasoning_content: None,
+                                name: None,
+                                rendered_name: None,
                                 tool_calls: Vec::new(),
                                 tool_call_id: None,
                                 tool_plan: String::new(),
@@ -18283,7 +18312,17 @@ fn ep_serve_ds4(
                 {
                     eprintln!("[asst-cache store] fp={:#018x} tokens={}", fp, seq.len());
                 }
-                m.asst_turn_cache.insert(fp, hipfire_runtime::prompt_frame::CachedAssistantTurn { reasoning: None, tools: Vec::new(), content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody { token_ids: seq, text: String::new() }) });
+                m.asst_turn_cache.insert(
+                    fp,
+                    hipfire_runtime::prompt_frame::CachedAssistantTurn {
+                        reasoning: None,
+                        tools: Vec::new(),
+                        content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
+                            token_ids: seq,
+                            text: String::new(),
+                        }),
+                    },
+                );
             },
             &action,
             local_emitted_ids,
@@ -18662,7 +18701,9 @@ fn plan_prompt_cache(
             let normalized =
                 hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned();
             let fp = asst_turn_fingerprint(&normalized, &msg.tool_calls);
-            asst_turn_cache.get(&fp).and_then(|t| t.content.as_ref().map(|c| c.token_ids.clone()))
+            asst_turn_cache
+                .get(&fp)
+                .and_then(|t| t.content.as_ref().map(|c| c.token_ids.clone()))
         },
     );
     let cache_eligible = !cache_disabled && eviction_is_none && !conversation_tokens.is_empty();
@@ -19098,9 +19139,9 @@ fn generate_dflash(
                         v.push(hipfire_runtime::prompt_frame::Message {
                             role: hipfire_runtime::prompt_frame::Role::System,
                             content: sys.to_string(),
-            reasoning_content: None,
-            name: None,
-            rendered_name: None,
+                            reasoning_content: None,
+                            name: None,
+                            rendered_name: None,
                             tool_calls: Vec::new(),
                             tool_call_id: None,
                             tool_plan: String::new(),
@@ -19109,9 +19150,9 @@ fn generate_dflash(
                     v.push(hipfire_runtime::prompt_frame::Message {
                         role: hipfire_runtime::prompt_frame::Role::User,
                         content: prompt.to_string(),
-            reasoning_content: None,
-            name: None,
-            rendered_name: None,
+                        reasoning_content: None,
+                        name: None,
+                        rendered_name: None,
                         tool_calls: Vec::new(),
                         tool_call_id: None,
                         tool_plan: String::new(),
@@ -19610,7 +19651,19 @@ fn generate_dflash(
                                     seq.len()
                                 );
                             }
-                            m.asst_turn_cache.insert(fp, hipfire_runtime::prompt_frame::CachedAssistantTurn { reasoning: None, tools: Vec::new(), content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody { token_ids: seq, text: String::new() }) });
+                            m.asst_turn_cache.insert(
+                                fp,
+                                hipfire_runtime::prompt_frame::CachedAssistantTurn {
+                                    reasoning: None,
+                                    tools: Vec::new(),
+                                    content: Some(
+                                        hipfire_runtime::prompt_frame::CachedAssistantBody {
+                                            token_ids: seq,
+                                            text: String::new(),
+                                        },
+                                    ),
+                                },
+                            );
                         },
                         &action,
                         cached_seq,
@@ -19723,7 +19776,17 @@ fn generate_dflash(
                     emit_text.chars().take(60).collect::<String>(),
                 );
             }
-            m.asst_turn_cache.insert(fp, hipfire_runtime::prompt_frame::CachedAssistantTurn { reasoning: None, tools: Vec::new(), content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody { token_ids: cached_seq, text: String::new() }) });
+            m.asst_turn_cache.insert(
+                fp,
+                hipfire_runtime::prompt_frame::CachedAssistantTurn {
+                    reasoning: None,
+                    tools: Vec::new(),
+                    content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
+                        token_ids: cached_seq,
+                        text: String::new(),
+                    }),
+                },
+            );
         }
         emit_staged_terminal_done(stdout, &pending_done);
     }
@@ -21227,9 +21290,9 @@ fn generate_qwen35_mtp(
                         v.push(hipfire_runtime::prompt_frame::Message {
                             role: hipfire_runtime::prompt_frame::Role::System,
                             content: sys.to_string(),
-            reasoning_content: None,
-            name: None,
-            rendered_name: None,
+                            reasoning_content: None,
+                            name: None,
+                            rendered_name: None,
                             tool_calls: Vec::new(),
                             tool_call_id: None,
                             tool_plan: String::new(),
@@ -21238,9 +21301,9 @@ fn generate_qwen35_mtp(
                     v.push(hipfire_runtime::prompt_frame::Message {
                         role: hipfire_runtime::prompt_frame::Role::User,
                         content: prompt.to_string(),
-            reasoning_content: None,
-            name: None,
-            rendered_name: None,
+                        reasoning_content: None,
+                        name: None,
+                        rendered_name: None,
                         tool_calls: Vec::new(),
                         tool_call_id: None,
                         tool_plan: String::new(),
@@ -22473,9 +22536,9 @@ fn generate_multi(
                         v.push(hipfire_runtime::prompt_frame::Message {
                             role: hipfire_runtime::prompt_frame::Role::System,
                             content: sys.to_string(),
-            reasoning_content: None,
-            name: None,
-            rendered_name: None,
+                            reasoning_content: None,
+                            name: None,
+                            rendered_name: None,
                             tool_calls: Vec::new(),
                             tool_call_id: None,
                             tool_plan: String::new(),
@@ -22484,9 +22547,9 @@ fn generate_multi(
                     v.push(hipfire_runtime::prompt_frame::Message {
                         role: hipfire_runtime::prompt_frame::Role::User,
                         content: prompt.to_string(),
-            reasoning_content: None,
-            name: None,
-            rendered_name: None,
+                        reasoning_content: None,
+                        name: None,
+                        rendered_name: None,
                         tool_calls: Vec::new(),
                         tool_call_id: None,
                         tool_plan: String::new(),
@@ -23771,7 +23834,12 @@ fn generate(
             min_p,
             cactus_delta,
         );
-        let _ = (repeat_penalty, repeat_window, presence_penalty, frequency_penalty);
+        let _ = (
+            repeat_penalty,
+            repeat_window,
+            presence_penalty,
+            frequency_penalty,
+        );
         let _ = stop;
         generate_gemma4(
             m,
@@ -23805,7 +23873,12 @@ fn generate(
             min_p,
             cactus_delta,
         );
-        let _ = (repeat_penalty, repeat_window, presence_penalty, frequency_penalty);
+        let _ = (
+            repeat_penalty,
+            repeat_window,
+            presence_penalty,
+            frequency_penalty,
+        );
         let _ = stop;
         generate_muse_glimmer(
             m,
@@ -24410,7 +24483,10 @@ fn generate(
             }
             // ctx-capacity miss → fall through to default AR body below.
         }
-        GenerationRoute::QwenAr | GenerationRoute::LlamaAr | GenerationRoute::GlimmerAr | GenerationRoute::Unknown => {
+        GenerationRoute::QwenAr
+        | GenerationRoute::LlamaAr
+        | GenerationRoute::GlimmerAr
+        | GenerationRoute::Unknown => {
             // Default AR / unknown body continues below.
             // temp>0 DFlash-disabled visibility (warning text only; route is AR).
             if temp > 1e-6
@@ -24775,9 +24851,9 @@ fn generate(
                         v.push(hipfire_runtime::prompt_frame::Message {
                             role: hipfire_runtime::prompt_frame::Role::System,
                             content: sys.to_string(),
-            reasoning_content: None,
-            name: None,
-            rendered_name: None,
+                            reasoning_content: None,
+                            name: None,
+                            rendered_name: None,
                             tool_calls: Vec::new(),
                             tool_call_id: None,
                             tool_plan: String::new(),
@@ -24786,9 +24862,9 @@ fn generate(
                     v.push(hipfire_runtime::prompt_frame::Message {
                         role: hipfire_runtime::prompt_frame::Role::User,
                         content: prompt.to_string(),
-            reasoning_content: None,
-            name: None,
-            rendered_name: None,
+                        reasoning_content: None,
+                        name: None,
+                        rendered_name: None,
                         tool_calls: Vec::new(),
                         tool_call_id: None,
                         tool_plan: String::new(),
@@ -24920,7 +24996,7 @@ fn generate(
                 user: prompt,
                 enable_thinking: max_think_tokens != 1,
                 bos_token: None,
-            reasoning_strength: None,
+                reasoning_strength: None,
             };
             let cache_ref = &mut m.asst_turn_cache;
             let built = hipfire_runtime::prompt_frame::build_cached_history_jinja(
@@ -26671,7 +26747,19 @@ fn generate(
                 );
             }
             let _ = qwen_ar_apply_cache_action(
-                |fp, seq| m.asst_turn_cache.insert(fp, hipfire_runtime::prompt_frame::CachedAssistantTurn { reasoning: None, tools: Vec::new(), content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody { token_ids: seq, text: String::new() }) }),
+                |fp, seq| {
+                    m.asst_turn_cache.insert(
+                        fp,
+                        hipfire_runtime::prompt_frame::CachedAssistantTurn {
+                            reasoning: None,
+                            tools: Vec::new(),
+                            content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
+                                token_ids: seq,
+                                text: String::new(),
+                            }),
+                        },
+                    )
+                },
                 &cache_action,
                 cached_seq,
             );
@@ -27164,8 +27252,7 @@ fn build_deepseek4_dsml_prompt(
                     }
                     // DSML builds a flat token stream; project the content slot out of the
                     // per-channel cache value (DeepSeek turns are content-only).
-                    if let Some(cached) =
-                        asst_turn_cache.get(&fp).and_then(|t| t.content.as_ref())
+                    if let Some(cached) = asst_turn_cache.get(&fp).and_then(|t| t.content.as_ref())
                     {
                         prompt_ids.extend_from_slice(&cached.token_ids);
                     } else {
@@ -27178,7 +27265,7 @@ fn build_deepseek4_dsml_prompt(
                                 .tool_calls
                                 .iter()
                                 .map(|c| hipfire_arch_deepseek4::dsml::ToolCall {
-                    name: c.name.clone(),
+                                    name: c.name.clone(),
                                     arguments: c.arguments.clone(),
                                 })
                                 .collect();
@@ -27647,7 +27734,17 @@ fn generate_deepseek4_spec(
                                 seq.len()
                             );
                         }
-                        m.asst_turn_cache.insert(fp, hipfire_runtime::prompt_frame::CachedAssistantTurn { reasoning: None, tools: Vec::new(), content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody { token_ids: seq, text: String::new() }) });
+                        m.asst_turn_cache.insert(
+                            fp,
+                            hipfire_runtime::prompt_frame::CachedAssistantTurn {
+                                reasoning: None,
+                                tools: Vec::new(),
+                                content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
+                                    token_ids: seq,
+                                    text: String::new(),
+                                }),
+                            },
+                        );
                     },
                     &action,
                     run.streamed_tokens.clone(),
@@ -28409,7 +28506,17 @@ fn generate_deepseek4(
                     {
                         eprintln!("[asst-cache store] fp={:#018x} tokens={}", fp, seq.len());
                     }
-                    m.asst_turn_cache.insert(fp, hipfire_runtime::prompt_frame::CachedAssistantTurn { reasoning: None, tools: Vec::new(), content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody { token_ids: seq, text: String::new() }) });
+                    m.asst_turn_cache.insert(
+                        fp,
+                        hipfire_runtime::prompt_frame::CachedAssistantTurn {
+                            reasoning: None,
+                            tools: Vec::new(),
+                            content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
+                                token_ids: seq,
+                                text: String::new(),
+                            }),
+                        },
+                    );
                 },
                 &action,
                 cached_seq,
@@ -28727,7 +28834,6 @@ fn generate_deepseek4_heterogeneous(
     );
 }
 
-
 /// Gemma 4 dense text (arch_id=13) eager AR path.
 ///
 /// Ported from `origin/feat/gemma4-union` and rehomed onto the beta
@@ -28794,8 +28900,7 @@ fn generate_gemma4(
     // ── Prompt build (same two-path branch as the lfm2moe AR path) ──
     let prompt_ids: Vec<u32> = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
-        let jinja_enabled =
-            std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+        let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
         let try_jinja = jinja_enabled && m.chat_template.is_some();
         let mut ids: Vec<u32> = if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
@@ -28806,7 +28911,7 @@ fn generate_gemma4(
                 user: prompt,
                 enable_thinking: max_think_tokens != 1,
                 bos_token: Some("<bos>"),
-            reasoning_strength: None,
+                reasoning_strength: None,
             };
             let render_result = if tools.is_some() || messages_history.is_some() {
                 let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
@@ -28819,9 +28924,9 @@ fn generate_gemma4(
                                 v.push(hipfire_runtime::prompt_frame::Message {
                                     role: hipfire_runtime::prompt_frame::Role::System,
                                     content: sys.to_string(),
-            reasoning_content: None,
-            name: None,
-            rendered_name: None,
+                                    reasoning_content: None,
+                                    name: None,
+                                    rendered_name: None,
                                     tool_calls: Vec::new(),
                                     tool_call_id: None,
                                     tool_plan: String::new(),
@@ -28830,9 +28935,9 @@ fn generate_gemma4(
                             v.push(hipfire_runtime::prompt_frame::Message {
                                 role: hipfire_runtime::prompt_frame::Role::User,
                                 content: prompt.to_string(),
-            reasoning_content: None,
-            name: None,
-            rendered_name: None,
+                                reasoning_content: None,
+                                name: None,
+                                rendered_name: None,
                                 tool_calls: Vec::new(),
                                 tool_call_id: None,
                                 tool_plan: String::new(),
@@ -28882,9 +28987,7 @@ fn generate_gemma4(
 
     // Capacity guard. No eviction on arch_id=13 — reset the KV cursors when
     // the requested run would overflow the physical cache.
-    let overflow = {
-        bundle.state.n_tokens + prompt_ids.len() + max_tokens > bundle.state.max_seq
-    };
+    let overflow = { bundle.state.n_tokens + prompt_ids.len() + max_tokens > bundle.state.max_seq };
     if overflow {
         let (n, cap) = (bundle.state.n_tokens, bundle.state.max_seq);
         eprintln!("[daemon] arch_id=13 context full ({n}/{cap}) — resetting Gemma4State");
@@ -28988,7 +29091,10 @@ fn generate_gemma4(
         // so `last_logits` is intentionally unused on this path.
         {
             let eagle = bundle.eagle.as_ref().unwrap();
-            if let Err(e) = eagle.spec_scratch.set_seed_hidden_from(gpu, &bundle.state.tmp) {
+            if let Err(e) = eagle
+                .spec_scratch
+                .set_seed_hidden_from(gpu, &bundle.state.tmp)
+            {
                 emit_error_with_id(stdout, id, format!("gemma4 eagle seed hidden: {e}"));
                 return;
             }
@@ -29034,11 +29140,7 @@ fn generate_gemma4(
             let spec = match spec {
                 Ok(s) => s,
                 Err(e) => {
-                    emit_error_with_id(
-                        stdout,
-                        id,
-                        format!("gemma4 eagle spec step failed: {e}"),
-                    );
+                    emit_error_with_id(stdout, id, format!("gemma4 eagle spec step failed: {e}"));
                     return;
                 }
             };
@@ -29143,8 +29245,7 @@ fn generate_gemma4(
         if generated_count >= max_tokens {
             break;
         }
-        let next_tok =
-            deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
+        let next_tok = deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
         if stop_set.contains(&next_tok) {
             break;
         }
@@ -29388,7 +29489,9 @@ impl GlimmerHarmonyRouter {
                     let eot = self.pending.find("<|eot|>");
                     let eos = self.pending.find("<|end_of_text|>");
                     let mut best: Option<(usize, &'static str)> = None;
-                    for (pos, name) in [(eom, "<|eom|>"), (eot, "<|eot|>"), (eos, "<|end_of_text|>")] {
+                    for (pos, name) in
+                        [(eom, "<|eom|>"), (eot, "<|eot|>"), (eos, "<|end_of_text|>")]
+                    {
                         if let Some(p) = pos {
                             if best.map_or(true, |(bp, _)| p < bp) {
                                 best = Some((p, name));
@@ -29456,9 +29559,15 @@ impl GlimmerHarmonyRouter {
         }
         let emitted_reasoning = out.iter().any(|e| matches!(e, GlimmerEmit::Reasoning(_)));
         let should_count = entered_as_reasoning || emitted_reasoning;
-        if should_count && self.max_think_tokens != 0 && self.max_think_tokens != 1 && self.reasoning_tokens < self.max_think_tokens {
+        if should_count
+            && self.max_think_tokens != 0
+            && self.max_think_tokens != 1
+            && self.reasoning_tokens < self.max_think_tokens
+        {
             self.reasoning_tokens += 1;
-            if self.reasoning_tokens >= self.max_think_tokens && self.state == GlimmerChannel::Reasoning {
+            if self.reasoning_tokens >= self.max_think_tokens
+                && self.state == GlimmerChannel::Reasoning
+            {
                 if !self.pending.is_empty() {
                     let tail = std::mem::take(&mut self.pending);
                     if !is_marker_prefix(&tail) && !tail.is_empty() {
@@ -29494,7 +29603,13 @@ impl GlimmerHarmonyRouter {
 }
 
 fn is_marker_prefix(s: &str) -> bool {
-    const MARKERS: &[&str] = &["<|start|>", "<|message|>", "<|eom|>", "<|eot|>", "<|end_of_text|>"];
+    const MARKERS: &[&str] = &[
+        "<|start|>",
+        "<|message|>",
+        "<|eom|>",
+        "<|eot|>",
+        "<|end_of_text|>",
+    ];
     MARKERS.iter().any(|m| m.starts_with(s) || s.starts_with(m))
 }
 
@@ -29508,7 +29623,13 @@ fn is_marker_prefix(s: &str) -> bool {
 /// reasoning span was enough to kill the daemon. Markers are pure ASCII, so a
 /// boundary that falls inside a multibyte char can never begin one; skip it.
 fn glimmer_longest_marker_suffix(s: &str) -> usize {
-    const MARKERS: &[&str] = &["<|start|>", "<|message|>", "<|eom|>", "<|eot|>", "<|end_of_text|>"];
+    const MARKERS: &[&str] = &[
+        "<|start|>",
+        "<|message|>",
+        "<|eom|>",
+        "<|eot|>",
+        "<|end_of_text|>",
+    ];
     let max = MARKERS.iter().map(|m| m.len()).max().unwrap_or(0);
     let upper = s.len().min(max.saturating_sub(1));
     for len in (1..=upper).rev() {
@@ -29531,7 +29652,11 @@ const GLIMMER_EOT_ID: u32 = 200008;
 const GLIMMER_END_OF_TEXT_ID: u32 = 200001;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum GlimmerRecordedRecipient { Self_, User, Tool(String) }
+enum GlimmerRecordedRecipient {
+    Self_,
+    User,
+    Tool(String),
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GlimmerOpenBody {
@@ -29571,31 +29696,43 @@ struct GlimmerChannelRecorder {
 impl GlimmerChannelRecorder {
     fn new() -> Self {
         Self {
-            state: GlimmerRecorderState::Header { first: true, decoded: String::new() },
+            state: GlimmerRecorderState::Header {
+                first: true,
+                decoded: String::new(),
+            },
             reasoning: None,
             tools: Vec::new(),
             content: None,
         }
     }
     fn push(&mut self, token_id: u32, decoded_frag: &str) {
-        if matches!(self.state, GlimmerRecorderState::Refused(_) | GlimmerRecorderState::Terminal) {
+        if matches!(
+            self.state,
+            GlimmerRecorderState::Refused(_) | GlimmerRecorderState::Terminal
+        ) {
             return;
         }
         match token_id {
             GLIMMER_START_ID => {
                 match &mut self.state {
                     GlimmerRecorderState::AwaitingStart => {
-                        self.state = GlimmerRecorderState::Header { first: false, decoded: String::new() };
+                        self.state = GlimmerRecorderState::Header {
+                            first: false,
+                            decoded: String::new(),
+                        };
                     }
                     GlimmerRecorderState::Header { first, decoded } => {
                         if *first {
                             decoded.push_str(decoded_frag);
                         } else {
-                            self.state = GlimmerRecorderState::Refused(GlimmerRecordRefusal::UnexpectedMarker);
+                            self.state = GlimmerRecorderState::Refused(
+                                GlimmerRecordRefusal::UnexpectedMarker,
+                            );
                         }
                     }
                     GlimmerRecorderState::Body(_) => {
-                        self.state = GlimmerRecorderState::Refused(GlimmerRecordRefusal::UnexpectedMarker);
+                        self.state =
+                            GlimmerRecorderState::Refused(GlimmerRecordRefusal::UnexpectedMarker);
                     }
                     _ => {}
                 }
@@ -29605,7 +29742,8 @@ impl GlimmerChannelRecorder {
                 let (first, decoded) = match &self.state {
                     GlimmerRecorderState::Header { first, decoded } => (*first, decoded.clone()),
                     _ => {
-                        self.state = GlimmerRecorderState::Refused(GlimmerRecordRefusal::UnexpectedMarker);
+                        self.state =
+                            GlimmerRecorderState::Refused(GlimmerRecordRefusal::UnexpectedMarker);
                         return;
                     }
                 };
@@ -29620,7 +29758,8 @@ impl GlimmerChannelRecorder {
                 // the unit tests passed — they fed `"assistant to=self"` as the first header,
                 // a string the real model never emits.
                 if !first && !decoded.contains("assistant") {
-                    self.state = GlimmerRecorderState::Refused(GlimmerRecordRefusal::NonCanonicalHeader);
+                    self.state =
+                        GlimmerRecorderState::Refused(GlimmerRecordRefusal::NonCanonicalHeader);
                     return;
                 }
                 let recipient_str = if let Some(to_pos) = decoded.rfind(" to=") {
@@ -29633,84 +29772,123 @@ impl GlimmerChannelRecorder {
                     // (see `GlimmerHarmonyRouter`), so a self body is always reproducible by the
                     // template's `reasoning_content` envelope regardless of the think budget.
                     if self.reasoning.is_some() {
-                        self.state = GlimmerRecorderState::Refused(GlimmerRecordRefusal::NonCanonicalBodyOrder);
+                        self.state = GlimmerRecorderState::Refused(
+                            GlimmerRecordRefusal::NonCanonicalBodyOrder,
+                        );
                         return;
                     }
                     GlimmerRecordedRecipient::Self_
                 } else if recipient_str == "user" {
                     if self.content.is_some() || !self.tools.is_empty() {
-                        self.state = GlimmerRecorderState::Refused(GlimmerRecordRefusal::NonCanonicalBodyOrder);
+                        self.state = GlimmerRecorderState::Refused(
+                            GlimmerRecordRefusal::NonCanonicalBodyOrder,
+                        );
                         return;
                     }
                     GlimmerRecordedRecipient::User
                 } else if !recipient_str.is_empty() {
                     if self.content.is_some() {
-                        self.state = GlimmerRecorderState::Refused(GlimmerRecordRefusal::NonCanonicalBodyOrder);
+                        self.state = GlimmerRecorderState::Refused(
+                            GlimmerRecordRefusal::NonCanonicalBodyOrder,
+                        );
                         return;
                     }
                     GlimmerRecordedRecipient::Tool(recipient_str)
                 } else {
-                    self.state = GlimmerRecorderState::Refused(GlimmerRecordRefusal::NonCanonicalHeader);
+                    self.state =
+                        GlimmerRecorderState::Refused(GlimmerRecordRefusal::NonCanonicalHeader);
                     return;
                 };
-                self.state = GlimmerRecorderState::Body(GlimmerOpenBody { recipient, token_ids: Vec::new(), text: String::new() });
+                self.state = GlimmerRecorderState::Body(GlimmerOpenBody {
+                    recipient,
+                    token_ids: Vec::new(),
+                    text: String::new(),
+                });
                 return;
             }
             GLIMMER_EOM_ID => {
-                let body = match std::mem::replace(&mut self.state, GlimmerRecorderState::AwaitingStart) {
-                    GlimmerRecorderState::Body(b) => b,
-                    _ => {
-                        self.state = GlimmerRecorderState::Refused(GlimmerRecordRefusal::UnexpectedMarker);
-                        return;
-                    }
-                };
+                let body =
+                    match std::mem::replace(&mut self.state, GlimmerRecorderState::AwaitingStart) {
+                        GlimmerRecorderState::Body(b) => b,
+                        _ => {
+                            self.state = GlimmerRecorderState::Refused(
+                                GlimmerRecordRefusal::UnexpectedMarker,
+                            );
+                            return;
+                        }
+                    };
                 match body.recipient {
                     GlimmerRecordedRecipient::Self_ => {
                         if body.text.is_empty() && body.token_ids.is_empty() {
-                            self.state = GlimmerRecorderState::Refused(GlimmerRecordRefusal::EmptySelfBody);
+                            self.state =
+                                GlimmerRecorderState::Refused(GlimmerRecordRefusal::EmptySelfBody);
                             return;
                         }
                         if self.reasoning.is_some() {
-                            self.state = GlimmerRecorderState::Refused(GlimmerRecordRefusal::NonCanonicalBodyOrder);
+                            self.state = GlimmerRecorderState::Refused(
+                                GlimmerRecordRefusal::NonCanonicalBodyOrder,
+                            );
                             return;
                         }
-                        self.reasoning = Some(hipfire_runtime::prompt_frame::CachedAssistantBody { token_ids: body.token_ids, text: body.text });
+                        self.reasoning = Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
+                            token_ids: body.token_ids,
+                            text: body.text,
+                        });
                         self.state = GlimmerRecorderState::AwaitingStart;
                     }
                     GlimmerRecordedRecipient::Tool(recipient) => {
-                        self.tools.push(hipfire_runtime::prompt_frame::CachedAssistantToolBody { recipient, token_ids: body.token_ids });
+                        self.tools
+                            .push(hipfire_runtime::prompt_frame::CachedAssistantToolBody {
+                                recipient,
+                                token_ids: body.token_ids,
+                            });
                         self.state = GlimmerRecorderState::AwaitingStart;
                     }
                     GlimmerRecordedRecipient::User => {
-                        self.state = GlimmerRecorderState::Refused(GlimmerRecordRefusal::NonCanonicalTerminator);
+                        self.state = GlimmerRecorderState::Refused(
+                            GlimmerRecordRefusal::NonCanonicalTerminator,
+                        );
                         return;
                     }
                 }
                 return;
             }
             GLIMMER_EOT_ID => {
-                let body = match std::mem::replace(&mut self.state, GlimmerRecorderState::Terminal) {
+                let body = match std::mem::replace(&mut self.state, GlimmerRecorderState::Terminal)
+                {
                     GlimmerRecorderState::Body(b) => b,
                     _ => {
-                        self.state = GlimmerRecorderState::Refused(GlimmerRecordRefusal::UnexpectedMarker);
+                        self.state =
+                            GlimmerRecorderState::Refused(GlimmerRecordRefusal::UnexpectedMarker);
                         return;
                     }
                 };
                 match body.recipient {
                     GlimmerRecordedRecipient::User => {
                         if self.content.is_some() {
-                            self.state = GlimmerRecorderState::Refused(GlimmerRecordRefusal::NonCanonicalBodyOrder);
+                            self.state = GlimmerRecorderState::Refused(
+                                GlimmerRecordRefusal::NonCanonicalBodyOrder,
+                            );
                             return;
                         }
-                        self.content = Some(hipfire_runtime::prompt_frame::CachedAssistantBody { token_ids: body.token_ids, text: body.text });
+                        self.content = Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
+                            token_ids: body.token_ids,
+                            text: body.text,
+                        });
                         self.state = GlimmerRecorderState::Terminal;
                     }
                     GlimmerRecordedRecipient::Tool(recipient) => {
-                        self.tools.push(hipfire_runtime::prompt_frame::CachedAssistantToolBody { recipient, token_ids: body.token_ids });
+                        self.tools
+                            .push(hipfire_runtime::prompt_frame::CachedAssistantToolBody {
+                                recipient,
+                                token_ids: body.token_ids,
+                            });
                         self.state = GlimmerRecorderState::Terminal;
                     }
                     GlimmerRecordedRecipient::Self_ => {
-                        self.state = GlimmerRecorderState::Refused(GlimmerRecordRefusal::NonCanonicalTerminator);
+                        self.state = GlimmerRecorderState::Refused(
+                            GlimmerRecordRefusal::NonCanonicalTerminator,
+                        );
                         return;
                     }
                 }
@@ -29742,25 +29920,33 @@ impl GlimmerChannelRecorder {
         }
         self.state = GlimmerRecorderState::Refused(GlimmerRecordRefusal::ForcedReasoningClose);
     }
-    fn into_cached_turn(mut self, parsed_tool_calls: &[hipfire_runtime::prompt_frame::ToolCall]) -> Result<hipfire_runtime::prompt_frame::CachedAssistantTurn, GlimmerRecordRefusal> {
+    fn into_cached_turn(
+        mut self,
+        parsed_tool_calls: &[hipfire_runtime::prompt_frame::ToolCall],
+    ) -> Result<hipfire_runtime::prompt_frame::CachedAssistantTurn, GlimmerRecordRefusal> {
         if let GlimmerRecorderState::Refused(r) = self.state {
             return Err(r);
         }
         match std::mem::replace(&mut self.state, GlimmerRecorderState::Terminal) {
-            GlimmerRecorderState::Body(body) => {
-                match body.recipient {
-                    GlimmerRecordedRecipient::Self_ => return Err(GlimmerRecordRefusal::Incomplete),
-                    GlimmerRecordedRecipient::Tool(recipient) => {
-                        self.tools.push(hipfire_runtime::prompt_frame::CachedAssistantToolBody { recipient, token_ids: body.token_ids });
-                    }
-                    GlimmerRecordedRecipient::User => {
-                        if self.content.is_some() {
-                            return Err(GlimmerRecordRefusal::NonCanonicalBodyOrder);
-                        }
-                        self.content = Some(hipfire_runtime::prompt_frame::CachedAssistantBody { token_ids: body.token_ids, text: body.text });
-                    }
+            GlimmerRecorderState::Body(body) => match body.recipient {
+                GlimmerRecordedRecipient::Self_ => return Err(GlimmerRecordRefusal::Incomplete),
+                GlimmerRecordedRecipient::Tool(recipient) => {
+                    self.tools
+                        .push(hipfire_runtime::prompt_frame::CachedAssistantToolBody {
+                            recipient,
+                            token_ids: body.token_ids,
+                        });
                 }
-            }
+                GlimmerRecordedRecipient::User => {
+                    if self.content.is_some() {
+                        return Err(GlimmerRecordRefusal::NonCanonicalBodyOrder);
+                    }
+                    self.content = Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
+                        token_ids: body.token_ids,
+                        text: body.text,
+                    });
+                }
+            },
             GlimmerRecorderState::Header { .. } | GlimmerRecorderState::AwaitingStart => {
                 return Err(GlimmerRecordRefusal::Incomplete);
             }
@@ -29782,12 +29968,20 @@ impl GlimmerChannelRecorder {
                 return Err(GlimmerRecordRefusal::ToolCallMismatch);
             }
         }
-        Ok(hipfire_runtime::prompt_frame::CachedAssistantTurn { reasoning: self.reasoning, tools: self.tools, content: self.content })
+        Ok(hipfire_runtime::prompt_frame::CachedAssistantTurn {
+            reasoning: self.reasoning,
+            tools: self.tools,
+            content: self.content,
+        })
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GlimmerMirrorAction { Aligned, TruncateMirror(usize), RollbackCursor(usize) }
+enum GlimmerMirrorAction {
+    Aligned,
+    TruncateMirror(usize),
+    RollbackCursor(usize),
+}
 
 fn glimmer_mirror_action(mirror_len: usize, n_tokens: usize) -> GlimmerMirrorAction {
     if mirror_len == n_tokens {
@@ -29799,32 +29993,21 @@ fn glimmer_mirror_action(mirror_len: usize, n_tokens: usize) -> GlimmerMirrorAct
     }
 }
 
-fn glimmer_hidden_keep_len(hidden_len: usize, old_rows: usize, new_rows: usize) -> Option<usize> {
-    if hidden_len == 0 || old_rows == 0 {
-        return None;
-    }
-    if hidden_len % old_rows != 0 {
-        return None;
-    }
-    let row_elems = hidden_len / old_rows;
-    Some(new_rows * row_elems)
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GlimmerMirrorReconcile {
     Aligned,
     Truncated { from: usize, to: usize },
     RolledBack { mirror_len: usize, n_tokens: usize },
+    Reset,
 }
 
 fn reconcile_glimmer_mirror(
-    state: &mut glimmer::glimmer::GlimmerState,
-    target_hidden_host: &mut Vec<f32>,
+    bundle: &mut hipfire_loader::MuseGlimmerBundle,
     conversation_tokens: &mut Vec<u32>,
     seq_pos: &mut usize,
 ) -> GlimmerMirrorReconcile {
     let mirror_len = conversation_tokens.len();
-    let n_tokens = state.n_tokens;
+    let n_tokens = bundle.state.n_tokens;
     let action = glimmer_mirror_action(mirror_len, n_tokens);
     let result = match action {
         GlimmerMirrorAction::Aligned => {
@@ -29832,51 +30015,65 @@ fn reconcile_glimmer_mirror(
             GlimmerMirrorReconcile::Aligned
         }
         GlimmerMirrorAction::TruncateMirror(to) => {
+            // Mirror ahead of target: capture is already correct; truncate mirror only.
             let from = mirror_len;
             conversation_tokens.truncate(to);
             *seq_pos = to;
-            if let Some(keep) = glimmer_hidden_keep_len(target_hidden_host.len(), mirror_len, to) {
-                target_hidden_host.truncate(keep);
-            }
             GlimmerMirrorReconcile::Truncated { from, to }
         }
         GlimmerMirrorAction::RollbackCursor(new_len) => {
-            glimmer::forward::rollback_to(state, new_len);
-            if new_len == 0 {
-                target_hidden_host.clear();
-            } else if let Some(keep) = glimmer_hidden_keep_len(target_hidden_host.len(), n_tokens, new_len) {
-                target_hidden_host.truncate(keep);
+            // Mirror behind target: rewind session (KV + capture + drafter) to mirror.
+            match bundle.rewind_session_to(new_len) {
+                Ok(()) => {
+                    *seq_pos = new_len;
+                    GlimmerMirrorReconcile::RolledBack {
+                        mirror_len: new_len,
+                        n_tokens,
+                    }
+                }
+                Err(_) => {
+                    bundle.reset_session_state();
+                    conversation_tokens.clear();
+                    *seq_pos = 0;
+                    GlimmerMirrorReconcile::Reset
+                }
             }
-            *seq_pos = new_len;
-            GlimmerMirrorReconcile::RolledBack { mirror_len: new_len, n_tokens }
         }
     };
-    debug_assert_eq!(conversation_tokens.len(), state.n_tokens);
-    debug_assert_eq!(*seq_pos, state.n_tokens);
+    debug_assert_eq!(conversation_tokens.len(), bundle.state.n_tokens);
+    debug_assert_eq!(*seq_pos, bundle.state.n_tokens);
     result
 }
 
-fn normalize_glimmer_tool_arguments(value: &serde_json::Value) -> Result<serde_json::Value, String> {
+fn normalize_glimmer_tool_arguments(
+    value: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
     match value {
         serde_json::Value::Object(map) => Ok(serde_json::Value::Object(map.clone())),
         serde_json::Value::Null => Ok(serde_json::Value::Object(Default::default())),
-        serde_json::Value::String(s) => {
-            match serde_json::from_str::<serde_json::Value>(s) {
-                Ok(serde_json::Value::Object(map)) => Ok(serde_json::Value::Object(map)),
-                Ok(_) => Err(format!("tool arguments string must parse to object, got: {}", s)),
-                Err(e) => Err(format!("tool arguments string invalid JSON: {}: {}", s, e)),
-            }
-        }
+        serde_json::Value::String(s) => match serde_json::from_str::<serde_json::Value>(s) {
+            Ok(serde_json::Value::Object(map)) => Ok(serde_json::Value::Object(map)),
+            Ok(_) => Err(format!(
+                "tool arguments string must parse to object, got: {}",
+                s
+            )),
+            Err(e) => Err(format!("tool arguments string invalid JSON: {}: {}", s, e)),
+        },
         _ => Err(format!("tool arguments must be object, got: {}", value)),
     }
 }
 
-fn prepare_glimmer_onyx_history(messages: &[hipfire_runtime::prompt_frame::Message]) -> Result<Vec<hipfire_runtime::prompt_frame::Message>, String> {
+fn prepare_glimmer_onyx_history(
+    messages: &[hipfire_runtime::prompt_frame::Message],
+) -> Result<Vec<hipfire_runtime::prompt_frame::Message>, String> {
     let mut out = Vec::with_capacity(messages.len());
-    let mut pending_tool_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut pending_tool_map: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     for (idx, msg) in messages.iter().enumerate() {
         let mut cloned = msg.clone();
-        if cloned.role == hipfire_runtime::prompt_frame::Role::Assistant && !cloned.tool_calls.is_empty() {
+        if cloned.role == hipfire_runtime::prompt_frame::Role::Assistant
+            && !cloned.tool_calls.is_empty()
+        {
             pending_tool_map.clear();
             for tc in &mut cloned.tool_calls {
                 let normalized = normalize_glimmer_tool_arguments(&tc.arguments)?;
@@ -29885,7 +30082,10 @@ fn prepare_glimmer_onyx_history(messages: &[hipfire_runtime::prompt_frame::Messa
                 if let Some(id) = &tc.id {
                     if !id.is_empty() {
                         if pending_tool_map.contains_key(id) {
-                            return Err(format!("duplicate tool_call id {} at assistant turn {}", id, idx));
+                            return Err(format!(
+                                "duplicate tool_call id {} at assistant turn {}",
+                                id, idx
+                            ));
                         }
                         pending_tool_map.insert(id.clone(), tc.name.clone());
                     }
@@ -29905,7 +30105,9 @@ fn prepare_glimmer_onyx_history(messages: &[hipfire_runtime::prompt_frame::Messa
                                 break;
                             }
                         }
-                        if resolved.is_some() { break; }
+                        if resolved.is_some() {
+                            break;
+                        }
                     }
                 }
             }
@@ -29914,7 +30116,10 @@ fn prepare_glimmer_onyx_history(messages: &[hipfire_runtime::prompt_frame::Messa
             } else if cloned.name.is_some() {
                 cloned.rendered_name = cloned.name.clone();
             } else if !tcid.is_empty() {
-                return Err(format!("unresolved tool_call_id {} at tool turn {}", tcid, idx));
+                return Err(format!(
+                    "unresolved tool_call_id {} at tool turn {}",
+                    tcid, idx
+                ));
             }
         }
         out.push(cloned);
@@ -29940,7 +30145,8 @@ fn glimmer_store_cached_turn(
             eprintln!("[glimmer-cache store skip] both content and tools present");
             return false;
         }
-        let normalized = hipfire_runtime::tokenizer::maybe_normalize_prompt(&content.text).into_owned();
+        let normalized =
+            hipfire_runtime::tokenizer::maybe_normalize_prompt(&content.text).into_owned();
         let fp_raw = asst_turn_fingerprint(&normalized, &[]);
         let fp = glimmer_turn_key(fp_raw, ordinal);
         cache.insert(fp, turn);
@@ -29957,35 +30163,80 @@ fn glimmer_store_cached_turn(
 }
 
 #[derive(Debug, Clone)]
-struct GlimmerRouteError { detail: String }
+struct GlimmerRouteError {
+    detail: String,
+}
 
-fn parse_glimmer_atem(body: &str) -> Result<Vec<hipfire_runtime::prompt_frame::ToolCall>, GlimmerRouteError> {
+fn parse_glimmer_atem(
+    body: &str,
+) -> Result<Vec<hipfire_runtime::prompt_frame::ToolCall>, GlimmerRouteError> {
     let mut calls = Vec::new();
     let mut rest = body;
     while let Some(start) = rest.find("<atem:invoke") {
         let after_start = &rest[start..];
-        let name_start = after_start.find("name=\"").ok_or(GlimmerRouteError { detail: "missing invoke name".into() })? + 6;
-        let name_end = after_start[name_start..].find('"').ok_or(GlimmerRouteError { detail: "unterminated name".into() })? + name_start;
+        let name_start = after_start.find("name=\"").ok_or(GlimmerRouteError {
+            detail: "missing invoke name".into(),
+        })? + 6;
+        let name_end = after_start[name_start..]
+            .find('"')
+            .ok_or(GlimmerRouteError {
+                detail: "unterminated name".into(),
+            })?
+            + name_start;
         let name = after_start[name_start..name_end].to_string();
-        let invoke_close = after_start.find("</atem:invoke>").ok_or(GlimmerRouteError { detail: "missing invoke close".into() })?;
+        let invoke_close = after_start
+            .find("</atem:invoke>")
+            .ok_or(GlimmerRouteError {
+                detail: "missing invoke close".into(),
+            })?;
         let invoke_body = &after_start[..invoke_close];
         let mut args = serde_json::Map::new();
         let mut param_rest = invoke_body;
         while let Some(p_start) = param_rest.find("<atem:parameter") {
             let param_after = &param_rest[p_start..];
-            let p_name_start = param_after.find("name=\"").ok_or(GlimmerRouteError { detail: "missing param name".into() })? + 6;
-            let p_name_end = param_after[p_name_start..].find('"').ok_or(GlimmerRouteError { detail: "unterminated param name".into() })? + p_name_start;
+            let p_name_start = param_after.find("name=\"").ok_or(GlimmerRouteError {
+                detail: "missing param name".into(),
+            })? + 6;
+            let p_name_end = param_after[p_name_start..]
+                .find('"')
+                .ok_or(GlimmerRouteError {
+                    detail: "unterminated param name".into(),
+                })?
+                + p_name_start;
             let p_name = param_after[p_name_start..p_name_end].to_string();
-            let tag_end = param_after.find('>').ok_or(GlimmerRouteError { detail: "missing param tag end".into() })? + 1;
+            let tag_end = param_after.find('>').ok_or(GlimmerRouteError {
+                detail: "missing param tag end".into(),
+            })? + 1;
             let close_tag = "</atem:parameter>";
-    let inner_start = tag_end;
-    let inner_end = param_after.find(close_tag).ok_or(GlimmerRouteError { detail: "missing param close".into() })?;
-    let raw = param_after[inner_start..inner_end].trim();
-    let value = if raw == "true" { serde_json::Value::Bool(true) } else if raw == "false" { serde_json::Value::Bool(false) } else if raw == "null" { serde_json::Value::Null } else if raw.starts_with("{") || raw.starts_with("[") { serde_json::from_str(raw).unwrap_or(serde_json::Value::String(raw.to_string())) } else if let Ok(n) = raw.parse::<i64>() { serde_json::Value::Number(n.into()) } else if let Ok(f) = raw.parse::<f64>() { serde_json::Value::Number(serde_json::Number::from_f64(f).unwrap()) } else { serde_json::Value::String(raw.to_string()) };
-    args.insert(p_name, value);
-    param_rest = &param_after[inner_end + close_tag.len()..];
+            let inner_start = tag_end;
+            let inner_end = param_after.find(close_tag).ok_or(GlimmerRouteError {
+                detail: "missing param close".into(),
+            })?;
+            let raw = param_after[inner_start..inner_end].trim();
+            let value = if raw == "true" {
+                serde_json::Value::Bool(true)
+            } else if raw == "false" {
+                serde_json::Value::Bool(false)
+            } else if raw == "null" {
+                serde_json::Value::Null
+            } else if raw.starts_with("{") || raw.starts_with("[") {
+                serde_json::from_str(raw).unwrap_or(serde_json::Value::String(raw.to_string()))
+            } else if let Ok(n) = raw.parse::<i64>() {
+                serde_json::Value::Number(n.into())
+            } else if let Ok(f) = raw.parse::<f64>() {
+                serde_json::Value::Number(serde_json::Number::from_f64(f).unwrap())
+            } else {
+                serde_json::Value::String(raw.to_string())
+            };
+            args.insert(p_name, value);
+            param_rest = &param_after[inner_end + close_tag.len()..];
         }
-        calls.push(hipfire_runtime::prompt_frame::ToolCall { id: None, name, arguments: serde_json::Value::Object(args), rendered_body: None });
+        calls.push(hipfire_runtime::prompt_frame::ToolCall {
+            id: None,
+            name,
+            arguments: serde_json::Value::Object(args),
+            rendered_body: None,
+        });
         rest = &rest[start + invoke_close + "</atem:invoke>".len()..];
     }
     Ok(calls)
@@ -30069,7 +30320,6 @@ fn generate_muse_glimmer(
     let gen_contract = gen_start_contract_version_for_arch(m.arch_id);
     emit_gen_start(stdout, id, false, gen_contract);
 
-
     if m.tokenizer.is_none() {
         emit_error_with_id(stdout, id, "tokenizer not loaded");
         return;
@@ -30098,8 +30348,7 @@ fn generate_muse_glimmer(
     // ── Prompt build (same two-path branch as the gemma4 AR path) ──
     let prompt_ids: Vec<u32> = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
-        let jinja_enabled =
-            std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+        let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
         let try_jinja = jinja_enabled && m.chat_template.is_some();
         let mut ids: Vec<u32> = if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
@@ -30156,9 +30405,16 @@ fn generate_muse_glimmer(
                     let mut ordinal = 0usize;
                     for msg in &mut prepared_owned {
                         if msg.role == hipfire_runtime::prompt_frame::Role::Assistant {
-                            let has_client_reasoning = msg.reasoning_content.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false);
+                            let has_client_reasoning = msg
+                                .reasoning_content
+                                .as_ref()
+                                .map(|s| !s.trim().is_empty())
+                                .unwrap_or(false);
                             if !has_client_reasoning {
-                                let fp_raw = asst_turn_fingerprint(&normalize_asst_turn_for_fingerprint(&msg.content), &msg.tool_calls);
+                                let fp_raw = asst_turn_fingerprint(
+                                    &normalize_asst_turn_for_fingerprint(&msg.content),
+                                    &msg.tool_calls,
+                                );
                                 let fp = glimmer_turn_key(fp_raw, ordinal);
                                 if let Some(cached) = m.asst_turn_cache.get(&fp) {
                                     if let Some(reasoning) = &cached.reasoning {
@@ -30172,11 +30428,16 @@ fn generate_muse_glimmer(
                 }
                 if messages_history.is_some() {
                     let mut lookup_ordinal = 0usize;
-                    let mut cache_lookup = |msg: &hipfire_runtime::prompt_frame::Message| -> Option<hipfire_runtime::prompt_frame::CachedAssistantTurn> {
+                    let mut cache_lookup = |msg: &hipfire_runtime::prompt_frame::Message| -> Option<
+                        hipfire_runtime::prompt_frame::CachedAssistantTurn,
+                    > {
                         if msg.role != hipfire_runtime::prompt_frame::Role::Assistant {
                             return None;
                         }
-                        let fp_raw = asst_turn_fingerprint(&normalize_asst_turn_for_fingerprint(&msg.content), &msg.tool_calls);
+                        let fp_raw = asst_turn_fingerprint(
+                            &normalize_asst_turn_for_fingerprint(&msg.content),
+                            &msg.tool_calls,
+                        );
                         let fp = glimmer_turn_key(fp_raw, lookup_ordinal);
                         lookup_ordinal += 1;
                         glimmer_replay_lookups.set(glimmer_replay_lookups.get() + 1);
@@ -30186,7 +30447,12 @@ fn generate_muse_glimmer(
                         }
                         hit
                     };
-                    match hipfire_runtime::prompt_frame::build_cached_history_jinja(&frame, &prepared_owned, tools, &mut cache_lookup) {
+                    match hipfire_runtime::prompt_frame::build_cached_history_jinja(
+                        &frame,
+                        &prepared_owned,
+                        tools,
+                        &mut cache_lookup,
+                    ) {
                         Ok(cached_ids) => cached_ids,
                         Err(e) => {
                             eprintln!("[daemon] glimmer build_cached_history_jinja failed ({e}) — falling back to plain render");
@@ -30281,14 +30547,11 @@ fn generate_muse_glimmer(
 
     // Capacity guard. No eviction on arch_id=14 — reset the KV cursors when
     // the requested run would overflow the physical cache.
-    let overflow = {
-        bundle.state.n_tokens + prompt_ids.len() + max_tokens > bundle.state.max_seq
-    };
+    let overflow = { bundle.state.n_tokens + prompt_ids.len() + max_tokens > bundle.state.max_seq };
     if overflow {
         let (n, cap) = (bundle.state.n_tokens, bundle.state.max_seq);
         eprintln!("[daemon] arch_id=14 context full ({n}/{cap}) — resetting GlimmerState");
-        bundle.state.reset();
-        bundle.target_hidden_host.clear();
+        bundle.reset_session_state();
         m.seq_pos = 0;
         m.conversation_tokens.clear();
         m.asst_turn_cache.clear();
@@ -30308,18 +30571,16 @@ fn generate_muse_glimmer(
         return;
     }
 
-    // ── Prefix cache (LCP) — modelled on generate_minimax (daemon.rs:30352-30407).
-    // Compute LCP of m.conversation_tokens against prompt_ids. Hit when
-    // lcp > 0 && lcp < prompt_ids.len(); anything else is a cold miss.
-    // On hit: rewind KV cursor (n_tokens), token history, seq_pos, AND
-    // target_hidden_host (position-major host buffer, one row per committed
-    // token) to lcp. Row size is tap_layers.len() * dim, derived not hardcoded.
-    // Prefill only prompt_ids[lcp..] at start_pos=lcp and append only that
-    // suffix to conversation_tokens. On miss: behave exactly as today
-    // (full prefill at current n_tokens). Gated by HIPFIRE_GLIMMER_PROMPT_CACHE=0.
+    // ── Prefix cache (LCP) — strict forward extension only.
+    // Candidate: `lcp == prior_len && 0 < lcp < prompt_ids.len()`.
+    // Real hit also requires `bundle.can_rewind_session_to(lcp)`.
+    // On hit: rewind_session_to(lcp) BEFORE mirror/seq truncation.
+    // On miss / cache-disabled / rewind error: reset_session_state + full prefill at 0.
     let (prefill_ids, prefill_start_pos): (Vec<u32>, u32) = {
-        let cache_disabled =
-            std::env::var("HIPFIRE_GLIMMER_PROMPT_CACHE").ok().as_deref() == Some("0");
+        let cache_disabled = std::env::var("HIPFIRE_GLIMMER_PROMPT_CACHE")
+            .ok()
+            .as_deref()
+            == Some("0");
         let trace = std::env::var("HIPFIRE_GLIMMER_CACHE_TRACE").ok().as_deref() == Some("1");
         if cache_disabled {
             // Opting out of the cache does NOT restore the CLI's per-request
@@ -30327,8 +30588,7 @@ fn generate_muse_glimmer(
             // the CLI keeps the session warm. Cold-reset here or the opt-out
             // path becomes the very double-write the cache was added to avoid.
             if bundle.state.n_tokens > 0 || !m.conversation_tokens.is_empty() {
-                bundle.state.reset();
-                bundle.target_hidden_host.clear();
+                bundle.reset_session_state();
                 m.conversation_tokens.clear();
                 m.seq_pos = 0;
                 m.asst_turn_cache.clear();
@@ -30341,58 +30601,56 @@ fn generate_muse_glimmer(
             while lcp < max_match && m.conversation_tokens[lcp] == prompt_ids[lcp] {
                 lcp += 1;
             }
-            // STRICT FORWARD EXTENSION ONLY. Hit iff the whole mirror is a prefix of the
-            // new render: `lcp == prior_len && 0 < lcp < prompt_ids.len()`. Anything else
-            // is a MISS and cold-resets below.
-            //
-            // The earlier `lcp > 0 && lcp < prompt_ids.len()` form allowed reuse PAST the
-            // mirror's end, which meant reusing a position whose KV was written by the
-            // decode kernel (SWA / flash decode) rather than the batched WMMA prefill.
-            // Those do not agree, and it is not a last-bits concern: measured on a 3-turn
-            // chain with thinking on, an unclamped lcp=59 against a 58-token prompt reused
-            // exactly ONE decode-written position and turn 1 then answered from the top of
-            // the conversation instead of from the current user message. Structurally wrong
-            // output from a single position of mismatched KV.
-            //
-            // Under strict forward extension a reused position is never re-prefilled, so
-            // the prefill-vs-decode mismatch cannot arise and no boundary clamp is needed —
-            // which is why `LoadedModel::glimmer_prefill_boundary` no longer exists.
-            let cache_hit = lcp == prior_len && lcp > 0 && lcp < prompt_ids.len();
+            // STRICT FORWARD EXTENSION ONLY. Candidate iff the whole mirror is a
+            // prefix of the new render: `lcp == prior_len && 0 < lcp < prompt_ids.len()`.
+            let candidate = lcp == prior_len && lcp > 0 && lcp < prompt_ids.len();
+            let can_rewind = candidate && bundle.can_rewind_session_to(lcp);
+            let cache_hit = can_rewind;
             if trace {
+                let reject_reason = if !candidate {
+                    "not_strict_forward_extension"
+                } else if !can_rewind {
+                    "capture_state_cannot_rewind"
+                } else {
+                    ""
+                };
                 eprintln!(
-                    "[glimmer-cache] prior_len={} n_tokens={} prompt_len={} lcp={} hit={} replay={}/{}",
+                    "[glimmer-cache] prior_len={} n_tokens={} prompt_len={} lcp={} candidate={} hit={} reason={} replay={}/{}",
                     prior_len,
                     bundle.state.n_tokens,
                     prompt_ids.len(),
                     lcp,
+                    candidate,
                     cache_hit,
+                    reject_reason,
                     glimmer_replay_hits.get(),
                     glimmer_replay_lookups.get()
                 );
             }
             if cache_hit {
-                bundle.state.n_tokens = lcp;
-                m.conversation_tokens.truncate(lcp);
-                m.seq_pos = lcp;
-                let tap_layers_for_cache = glimmer_tap_layers(bundle.config.n_layers);
-                let row_elems = tap_layers_for_cache.len() * bundle.config.dim;
-                let keep_elems = lcp * row_elems;
-                bundle.target_hidden_host.truncate(keep_elems);
-                (prompt_ids[lcp..].to_vec(), lcp as u32)
+                // Rewind session (KV + capture + drafter) BEFORE mirror/seq truncate.
+                if let Err(e) = bundle.rewind_session_to(lcp) {
+                    if trace {
+                        eprintln!(
+                            "[glimmer-cache] rewind_session_to({lcp}) failed: {e} — converting to MISS"
+                        );
+                    }
+                    bundle.reset_session_state();
+                    m.conversation_tokens.clear();
+                    m.seq_pos = 0;
+                    m.asst_turn_cache.clear();
+                    (prompt_ids.clone(), 0u32)
+                } else {
+                    m.conversation_tokens.truncate(lcp);
+                    m.seq_pos = lcp;
+                    (prompt_ids[lcp..].to_vec(), lcp as u32)
+                }
             } else {
-                // MISS with a hot cache MUST cold-reset, exactly as
-                // generate_minimax does. Before arch 14 joined the
-                // `cache_capable` allowlist this branch was safe by accident:
-                // the CLI issued a per-request reset for non-cache-capable
-                // archs, so n_tokens was always 0 here. With the flag now true
-                // that reset is suppressed, and prefilling the full prompt at a
-                // live n_tokens would append a SECOND copy of the conversation
-                // into KV at shifted positions — coherent-looking garbage, not
-                // an error. Covers both misses: lcp == 0 (fully divergent) and
-                // lcp == prompt_ids.len() (identical prompt re-sent).
+                // MISS with a hot cache MUST cold-reset. Covers both misses:
+                // lcp == 0 (fully divergent) and lcp == prompt_ids.len()
+                // (identical prompt re-sent), plus candidate rejected by capture.
                 if bundle.state.n_tokens > 0 || prior_len > 0 {
-                    bundle.state.reset();
-                    bundle.target_hidden_host.clear();
+                    bundle.reset_session_state();
                     m.conversation_tokens.clear();
                     m.seq_pos = 0;
                     m.asst_turn_cache.clear();
@@ -30404,35 +30662,56 @@ fn generate_muse_glimmer(
 
     let t0 = Instant::now();
 
-    // ── Prefill: chunked batched forward reusing the verify path's batched
-    // layer machinery (proj_gemm_batched, fused rotate, QK-norm, RoPE, KV
-    // write, attention, sandwich norms, FFN). One full 52-layer forward per
-    // CHUNK (default 256 tokens) instead of per token → each weight is
-    // streamed once per chunk instead of once per token.
-    // Correctness: KV written for every prompt position in order, per-layer
-    // sliding(2048)/full split and NoPE (theta==0) identical to single path,
-    // causal within chunk + prior KV, last token's logits seed decode,
-    // DFlash capture contract preserved (5*6656 per position, asc order).
+    // ── Prefill: chunked batched forward. Device capture when drafter +
+    // device backend enabled; else host prefill (with target layers only when
+    // a drafter exists). Device mode never mutates target_hidden_host.
     let mut last_logits: Vec<f32> = Vec::new();
     {
         let capture = bundle.drafter.is_some();
-        let tap_layers: Vec<usize> = glimmer_tap_layers(bundle.config.n_layers);
-        let target_layers: &[usize] = if capture { &tap_layers } else { &[] };
+        let device_capture = capture && bundle.device_hidden_capture_enabled();
         let start_pos = prefill_start_pos;
-        match glimmer::forward::prefill_with_capture(
-            &bundle.config,
-            &bundle.weights,
-            &mut bundle.state,
-            gpu,
-            &prefill_ids,
-            start_pos,
-            target_layers,
-            &mut bundle.target_hidden_host,
-        ) {
+        let prefill_result = if device_capture {
+            glimmer::forward::prefill_with_device_capture(
+                &bundle.config,
+                &bundle.weights,
+                &mut bundle.state,
+                gpu,
+                &prefill_ids,
+                start_pos,
+            )
+        } else {
+            let tap_layers: Vec<usize> = glimmer_tap_layers(bundle.config.n_layers);
+            let target_layers: &[usize] = if capture { &tap_layers } else { &[] };
+            glimmer::forward::prefill_with_capture(
+                &bundle.config,
+                &bundle.weights,
+                &mut bundle.state,
+                gpu,
+                &prefill_ids,
+                start_pos,
+                target_layers,
+                &mut bundle.target_hidden_host,
+            )
+        };
+        match prefill_result {
             Ok(logits) => last_logits = logits,
             Err(e) => {
                 emit_error_with_id(stdout, id, format!("muse_glimmer prefill failed: {e:?}"));
-                let _ = reconcile_glimmer_mirror(&mut bundle.state, &mut bundle.target_hidden_host, &mut m.conversation_tokens, &mut m.seq_pos);
+                glimmer::forward::abort_device_capture_stage(&mut bundle.state);
+                if device_capture {
+                    // Device prefill mutates target KV + capture transaction; length-only
+                    // reconcile is not enough — leave zero reusable session state.
+                    bundle.reset_session_state();
+                    m.conversation_tokens.clear();
+                    m.asst_turn_cache.clear();
+                    m.seq_pos = 0;
+                } else {
+                    let _ = reconcile_glimmer_mirror(
+                        bundle,
+                        &mut m.conversation_tokens,
+                        &mut m.seq_pos,
+                    );
+                }
                 return;
             }
         }
@@ -30492,7 +30771,10 @@ fn generate_muse_glimmer(
             let mut best = 0u32;
             let mut bestv = f32::NEG_INFINITY;
             for (i, &v) in last_logits.iter().enumerate() {
-                if v > bestv { bestv = v; best = i as u32; }
+                if v > bestv {
+                    bestv = v;
+                    best = i as u32;
+                }
             }
             best
         };
@@ -30504,7 +30786,10 @@ fn generate_muse_glimmer(
         // seed is that token, and drafts are for the following positions.
         // Without this, the first window would emit picks[1] (second token)
         // and the output would start mid-sequence (e.g. ":" instead of "def").
-        // Harmony: route seed through channel router so header ` to=self<|message|>` is stripped
+        // Harmony: route seed through channel router so header ` to=self<|message|>` is stripped.
+        // Static stop (and harmony-forced stop) must not enter the speculative loop and must not
+        // commit the stop token into KV/capture — fall through to shared post-spec finalization.
+        let mut skip_spec_loop = false;
         if !stop_set.contains(&last_pick) && generated_count < max_tokens {
             let frag = m.tokenizer.as_ref().unwrap().decode(&[last_pick]);
             // Feed through harmony router; header fragments produce no visible event
@@ -30515,10 +30800,10 @@ fn generate_muse_glimmer(
                     GlimmerEmit::Token(text) => {
                         glimmer_visible_acc.push_str(&text);
                         emit_visible_token(stdout, id, &text)
-                    },
+                    }
                     GlimmerEmit::Tool(text) => {
                         glimmer_tool_acc.push_str(&text);
-                    },
+                    }
                 }
             }
             if harmony_router.just_forced() {
@@ -30530,58 +30815,9 @@ fn generate_muse_glimmer(
             glimmer_emitted_ids.push(last_pick);
             generated_count += 1;
             if should_stop_seed {
-                // Seed closed final channel – finish immediately
-                // Still need to advance state? The seed token already counted, skip spec loop
-                // Fall through to post-spec finalization after clearing windows
-                // Set a flag to skip loop
                 let tau = 0.0;
                 eprintln!("[glimmer-spec] seed is stop, tau {:.3}", tau);
-                // Emit done directly and return (avoid entering loop)
-                // Reuse common done emission below – set windows=0 and jump to done
-                // For simplicity, just break out by setting use_spec false path via return
-                // We'll handle by directly emitting done and returning
-                let parsed_tool_calls = parse_glimmer_atem(&glimmer_tool_acc).unwrap_or_default();
-                let _ = reconcile_glimmer_mirror(&mut bundle.state, &mut bundle.target_hidden_host, &mut m.conversation_tokens, &mut m.seq_pos);
-                let decode_ms = decode_t0.elapsed().as_millis().max(1);
-                let total_ms = t0.elapsed().as_millis().max(1);
-                let tok_s = if generated_count > 0 { (generated_count as f64 * 1000.0) / decode_ms as f64 } else { 0.0 };
-                let hit_length_cap = generated_count >= max_tokens;
-                let finish_reason = if hit_length_cap {
-                    "length"
-                } else if !parsed_tool_calls.is_empty() {
-                    "tool_calls"
-                } else {
-                    "stop"
-                };
-                let mut pending_done = serde_json::json!({
-                    "type": "done",
-                    "id": id,
-                    "tokens": generated_count,
-                    "tok_s": (tok_s * 10.0).round() / 10.0,
-                    "prefill_ms": prefill_ms,
-                    "total_ms": total_ms,
-                    "finish_reason": finish_reason,
-                    "attempt_id": active_attempt_id(),
-                });
-                stage_terminal_tool_calls(&mut pending_done, finish_reason, &parsed_tool_calls);
-                // Cache store is a COMMITTED side effect: publish it only after the client
-                // commits, never on an aborted turn.
-                if glimmer_commit_terminal(stdout, id, &pending_done, generated_count) {
-                    if !hit_length_cap && !glimmer_emitted_ids.is_empty() {
-                        let ordinal = messages_history
-                            .map(|h| h.iter().filter(|m| matches!(m.role, hipfire_runtime::prompt_frame::Role::Assistant)).count())
-                            .unwrap_or(0);
-                        let _ = glimmer_store_cached_turn(&mut m.asst_turn_cache, glimmer_recorder, &parsed_tool_calls, ordinal);
-                    }
-                } else {
-                    // Fail closed: the mirror and KV are mid-turn, so no later turn may reuse them.
-                    bundle.state.reset();
-                    bundle.target_hidden_host.clear();
-                    m.conversation_tokens.clear();
-                    m.asst_turn_cache.clear();
-                    m.seq_pos = 0;
-                }
-                return;
+                skip_spec_loop = true;
             }
             // Write seed's KV at cur_pos (already done by prefill? No, prefill's last token was prompt, not seed)
             // The seed needs to be written at cur_pos before drafting.
@@ -30592,184 +30828,352 @@ fn generate_muse_glimmer(
             // so we should NOT advance cur_pos yet — the block's seed is at cur_pos.
             // We keep cur_pos as is for the first window's verify.
         } else if stop_set.contains(&last_pick) {
-            // Seed is stop — done
+            // Prefill logits already selected a static stop: do not verify/commit it.
             let tau = 0.0;
             eprintln!("[glimmer-spec] seed is stop, tau {:.3}", tau);
+            skip_spec_loop = true;
         }
         // Track tau: sum accepted per window / windows
         let mut total_proposed: usize = 0;
         let mut total_accepted: usize = 0;
         let mut windows: usize = 0;
-        loop {
-            let t_window = std::time::Instant::now();
-            let do_window_timing = std::env::var("HIPFIRE_GLIMMER_TIMING").ok().as_deref() == Some("1");
-            if generated_count >= max_tokens { break; }
-            if bundle.state.n_tokens >= cache_cap { break; }
-            // --- Draft: B-1 tokens via glimmer_drafter_forward (raw noise) ---
-            // Noise is [seed, MASK*(B-1)] embedded raw (no embed_norm) — the
-            // embed_norm contract at forward.rs:84 / drafter.rs:1. Build the
-            // raw embeddings on host for the stub drafter, then call the
-            // drafter. The stub validates sizes/mask and returns Ok; drafts are
-            // synthesized as mask_id (low tau honest) to prove the drafter was
-            // consulted — a perturbed draft (e.g. corrupt one token) will trip
-            // the byte-identical check, proving the comparison can fail.
-            let (block_size, mask_id, hidden) = {
-                let d = bundle.drafter.as_ref().unwrap();
-                (d.config.block_size, d.config.mask_token_id, d.config.hidden)
-            };
-            if block_size < 2 || block_size > hipfire_arch_muse_glimmer::glimmer::GLIMMER_MAX_SPEC_BLOCK { break; }
-            // Noise embedding: row 0 is the seed (last committed token), rows
-            // 1..B-1 are the mask token. These are RAW target embeddings — no
-            // embed_norm — per modeling_muse_glimmer.py:439, which keeps the norm
-            // out of the embedding matrix precisely because the DFlash path must
-            // embed without it. The target AR path DOES apply it.
-            //
-            // This buffer is the drafter's entire input. Allocating it and leaving
-            // it zero-filled is what produced tau 1.000 with token-0 drafts: the
-            // head ran on zeros, so every row decoded to the same argmax.
-            let mut noise_embedding = vec![0f32; block_size * hidden];
-            for i in 0..block_size {
-                let t = if i == 0 { last_pick } else { mask_id };
-                match glimmer::forward::embed_raw(
-                    &bundle.config,
-                    &bundle.weights,
-                    &mut bundle.state,
-                    gpu,
-                    t,
-                ) {
-                    Ok(v) => {
-                        noise_embedding[i * hidden..(i + 1) * hidden]
-                            .copy_from_slice(&v[..hidden]);
+        if !skip_spec_loop {
+            loop {
+                let t_window = std::time::Instant::now();
+                let do_window_timing =
+                    std::env::var("HIPFIRE_GLIMMER_TIMING").ok().as_deref() == Some("1");
+                if generated_count >= max_tokens {
+                    break;
+                }
+                if bundle.state.n_tokens >= cache_cap {
+                    break;
+                }
+                // --- Draft: B-1 tokens via glimmer_drafter_forward (raw noise) ---
+                // Noise is [seed, MASK*(B-1)] embedded raw (no embed_norm) — the
+                // embed_norm contract at forward.rs:84 / drafter.rs:1. Build the
+                // raw embeddings on host for the stub drafter, then call the
+                // drafter. The stub validates sizes/mask and returns Ok; drafts are
+                // synthesized as mask_id (low tau honest) to prove the drafter was
+                // consulted — a perturbed draft (e.g. corrupt one token) will trip
+                // the byte-identical check, proving the comparison can fail.
+                let (block_size, mask_id, hidden) = {
+                    let d = bundle.drafter.as_ref().unwrap();
+                    (d.config.block_size, d.config.mask_token_id, d.config.hidden)
+                };
+                if block_size < 2
+                    || block_size > hipfire_arch_muse_glimmer::glimmer::GLIMMER_MAX_SPEC_BLOCK
+                {
+                    break;
+                }
+                // Noise embedding: row 0 is the seed (last committed token), rows
+                // 1..B-1 are the mask token. These are RAW target embeddings — no
+                // embed_norm — per modeling_muse_glimmer.py:439, which keeps the norm
+                // out of the embedding matrix precisely because the DFlash path must
+                // embed without it. The target AR path DOES apply it.
+                //
+                // This buffer is the drafter's entire input. Allocating it and leaving
+                // it zero-filled is what produced tau 1.000 with token-0 drafts: the
+                // head ran on zeros, so every row decoded to the same argmax.
+                let mut noise_embedding = vec![0f32; block_size * hidden];
+                for i in 0..block_size {
+                    let t = if i == 0 { last_pick } else { mask_id };
+                    match glimmer::forward::embed_raw(
+                        &bundle.config,
+                        &bundle.weights,
+                        &mut bundle.state,
+                        gpu,
+                        t,
+                    ) {
+                        Ok(v) => {
+                            noise_embedding[i * hidden..(i + 1) * hidden]
+                                .copy_from_slice(&v[..hidden]);
+                        }
+                        Err(e) => {
+                            emit_error_with_id(
+                                stdout,
+                                id,
+                                format!("glimmer drafter noise embed row {i}: {e}"),
+                            );
+                            let _ = reconcile_glimmer_mirror(
+                                bundle,
+                                &mut m.conversation_tokens,
+                                &mut m.seq_pos,
+                            );
+                            return;
+                        }
                     }
+                }
+                let t_after_noise = t_window.elapsed();
+                let device_capture = bundle.device_hidden_capture_enabled();
+                // Freeze effective ctx_cap to min(configured, drafter scratch, device log).
+                const GLIMMER_DRAFTER_CTX_CAP_DEFAULT: usize = 256;
+                let configured_ctx_cap = std::env::var("HIPFIRE_GLIMMER_CTX_CAP")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .filter(|v| *v > 0)
+                    .unwrap_or(GLIMMER_DRAFTER_CTX_CAP_DEFAULT);
+                let scratch_cap = bundle
+                    .drafter
+                    .as_ref()
+                    .map(|d| d.scratch.ctx_capacity())
+                    .unwrap_or(configured_ctx_cap);
+                let mut ctx_cap = configured_ctx_cap.min(scratch_cap);
+                if device_capture {
+                    if let Some(log) = bundle.state.target_hidden_log() {
+                        ctx_cap = ctx_cap.min(log.capacity_rows());
+                    }
+                }
+                // Target history must end exactly at cur_pos — gap is fatal.
+                let history_end: Result<usize, String> = if device_capture {
+                    bundle
+                        .device_hidden_log_end()
+                        .ok_or_else(|| "glimmer-spec: device hidden log missing".to_string())
+                } else {
+                    match bundle.capture_row_elems() {
+                        None => Err("glimmer-spec: host capture row_elems missing".to_string()),
+                        Some(row_elems) => {
+                            if row_elems == 0 || bundle.target_hidden_host.len() % row_elems != 0 {
+                                Err(format!(
+                                    "glimmer-spec: host capture misaligned len={} row_elems={}",
+                                    bundle.target_hidden_host.len(),
+                                    row_elems
+                                ))
+                            } else {
+                                Ok(bundle.target_hidden_host.len() / row_elems)
+                            }
+                        }
+                    }
+                };
+                let history_end = match history_end {
+                    Ok(h) => h,
                     Err(e) => {
-                        emit_error_with_id(
-                            stdout,
-                            id,
-                            format!("glimmer drafter noise embed row {i}: {e}"),
-                        );
-                        let _ = reconcile_glimmer_mirror(&mut bundle.state, &mut bundle.target_hidden_host, &mut m.conversation_tokens, &mut m.seq_pos);
+                        emit_error_with_id(stdout, id, e.clone());
+                        glimmer::forward::abort_device_capture_stage(&mut bundle.state);
+                        // Capture/log integrity errors (incl. poisoned transaction) leave no reusable state.
+                        bundle.reset_session_state();
+                        m.conversation_tokens.clear();
+                        m.asst_turn_cache.clear();
+                        m.seq_pos = 0;
                         return;
                     }
-                }
-            }
-            let t_after_noise = t_window.elapsed();
-            let drafter = bundle.drafter.as_mut().unwrap();
-            // Target hidden history: last ctx_len rows of 5-layer concat
-            // (33280 f32 each) from bundle.target_hidden_host (populated during
-            // prefill via decode_step_with_capture). Truncate to sliding_window
-            // by dropping OLDEST rows (suffix keep). Concat order is
-            // [1,13,25,37,49] 0-based as verified via dflash_extract_layer_ids(52,5).
-            let ne = drafter.config.num_extract(); // 5
-            let hidden = drafter.config.hidden; // 6656
-            let row_elems = ne * hidden; // 33280
-            let n_rows = bundle.target_hidden_host.len() / row_elems;
-            // Context window handed to the drafter, and the dominant per-cycle
-            // cost knob. It used to default to the model's `sliding_window`
-            // (2048), which is 22x more expensive than necessary for ZERO
-            // acceptance benefit.
-            //
-            // Measured on gfx1100 at a fixed ~5k-token prompt, sweeping only
-            // this cap (HIPFIRE_GLIMMER_TIMING=1 for the breakdown):
-            //
-            //   cap   decode      tau    drafter   verify   total
-            //   2048   8.5 tok/s  2.694  124.4ms   150.5ms  307.8ms
-            //   1024  11.5        2.519   44.6     149.1    220.2
-            //    512  13.9        2.663   22.0     147.4    192.5
-            //    256  15.0        2.691   10.9     147.3    180.0
-            //    128  15.9        2.747    5.7     147.1    173.8
-            //
-            // tau is FLAT across the whole range -- 2.52 to 2.75, with 128
-            // marginally the BEST -- so the extra context buys the drafter no
-            // acceptance at all while costing it linearly. The drafter is a
-            // cheap proposal heuristic; it does not need the whole
-            // conversation to guess the next few tokens.
-            //
-            // Default 256 rather than the 128 that measured fastest: 128 is
-            // the edge of the swept range on a single prompt, and 256 keeps a
-            // 2x margin for prompt shapes where longer-range copying might
-            // matter, at a cost of 5.2ms/window over 128. Override with
-            // HIPFIRE_GLIMMER_CTX_CAP; 0 or unset takes this default.
-            const GLIMMER_DRAFTER_CTX_CAP_DEFAULT: usize = 256;
-            let ctx_cap = std::env::var("HIPFIRE_GLIMMER_CTX_CAP")
-                .ok()
-                .and_then(|v| v.trim().parse::<usize>().ok())
-                .filter(|v| *v > 0)
-                .unwrap_or(GLIMMER_DRAFTER_CTX_CAP_DEFAULT);
-            let ctx_len = n_rows.min(ctx_cap);
-            let target_hidden: Vec<f32> = if ctx_len == 0 {
-                Vec::new()
-            } else {
-                let start = (n_rows - ctx_len) * row_elems; // SUFFIX — most recent rows
-                bundle.target_hidden_host[start..].to_vec()
-            };
-            // Single position span: ctx rows then block rows (Q sits on the tail).
-            let positions: Vec<i32> =
-                (cur_pos as i32 - ctx_len as i32..cur_pos as i32 + block_size as i32).collect();
-            debug_assert_eq!(
-                positions.len(),
-                ctx_len + block_size,
-                "positions.len() must equal ctx_len + block_size"
-            );
-            // This call proves the drafter is consulted (grep will find it).
-            // It validates mask_token_id==201818 and sizes — perturbation will Err.
-            let drafter_ok = glimmer::drafter::glimmer_drafter_forward(
-                gpu, &drafter.config, &drafter.weights, &mut drafter.scratch,
-                &noise_embedding, &target_hidden, &positions,
-                block_size, ctx_len,
-            );
-            if let Err(e) = drafter_ok {
-                // Bring-up: requested drafter must be loud and fatal, not silent fallback
-                let fatal = std::env::var("HIPFIRE_GLIMMER_SPEC_FALLBACK").ok().as_deref() != Some("1");
-                if fatal {
-                    emit_error_with_id(stdout, id, format!("glimmer drafter forward failed (requested via HIPFIRE_DFLASH_DRAFT): {e}"));
-                    let _ = reconcile_glimmer_mirror(&mut bundle.state, &mut bundle.target_hidden_host, &mut m.conversation_tokens, &mut m.seq_pos);
+                };
+                if history_end != cur_pos as usize {
+                    emit_error_with_id(
+                    stdout,
+                    id,
+                    format!(
+                        "glimmer-spec: target history end {history_end} != cur_pos {cur_pos} (capture hole)"
+                    ),
+                );
+                    glimmer::forward::abort_device_capture_stage(&mut bundle.state);
+                    bundle.reset_session_state();
+                    m.conversation_tokens.clear();
+                    m.asst_turn_cache.clear();
+                    m.seq_pos = 0;
                     return;
                 }
-                eprintln!("[glimmer-spec] drafter forward failed: {e} — falling back to AR for this window (HIPFIRE_GLIMMER_SPEC_FALLBACK=1)");
-                // Fall back to single AR step for this window
-                let next_tok = {
-                    let mut best = 0u32; let mut bestv = f32::NEG_INFINITY;
-                    for (i,&v) in last_logits.iter().enumerate() { if v>bestv {bestv=v; best=i as u32;}}
-                    best
+                let ctx_len = (cur_pos as usize).min(ctx_cap);
+                let cur_start = cur_pos as usize - ctx_len;
+                // Single position span: ctx rows then block rows (Q sits on the tail).
+                let positions: Vec<i32> =
+                    (cur_start as i32..cur_pos as i32 + block_size as i32).collect();
+                debug_assert_eq!(
+                    positions.len(),
+                    ctx_len + block_size,
+                    "positions.len() must equal ctx_len + block_size"
+                );
+                // Device: forward from resident log. Host: suffix Vec + host call.
+                let drafter_ok = if device_capture {
+                    let log = match bundle.state.target_hidden_log() {
+                        Some(l) => l,
+                        None => {
+                            emit_error_with_id(
+                                stdout,
+                                id,
+                                "glimmer-spec: device hidden log missing at draft",
+                            );
+                            glimmer::forward::abort_device_capture_stage(&mut bundle.state);
+                            bundle.reset_session_state();
+                            m.conversation_tokens.clear();
+                            m.asst_turn_cache.clear();
+                            m.seq_pos = 0;
+                            return;
+                        }
+                    };
+                    let drafter = bundle.drafter.as_mut().unwrap();
+                    glimmer::drafter::glimmer_drafter_forward_device(
+                        gpu,
+                        &drafter.config,
+                        &drafter.weights,
+                        &mut drafter.scratch,
+                        &noise_embedding,
+                        log,
+                        &positions,
+                        block_size,
+                        ctx_len,
+                    )
+                } else {
+                    let drafter = bundle.drafter.as_mut().unwrap();
+                    let ne = drafter.config.num_extract();
+                    let hidden = drafter.config.hidden;
+                    let row_elems = ne * hidden;
+                    let n_rows = bundle.target_hidden_host.len() / row_elems;
+                    let target_hidden: Vec<f32> = if ctx_len == 0 {
+                        Vec::new()
+                    } else {
+                        let start = (n_rows - ctx_len) * row_elems; // SUFFIX — most recent rows
+                        bundle.target_hidden_host[start..].to_vec()
+                    };
+                    glimmer::drafter::glimmer_drafter_forward(
+                        gpu,
+                        &drafter.config,
+                        &drafter.weights,
+                        &mut drafter.scratch,
+                        &noise_embedding,
+                        &target_hidden,
+                        &positions,
+                        block_size,
+                        ctx_len,
+                    )
                 };
-                if stop_set.contains(&next_tok) { break; }
-                let frag = m.tokenizer.as_ref().unwrap().decode(&[next_tok]);
-                let (events, should_stop_fb) = harmony_router.push(&frag);
-                for ev in events {
-                    match ev {
-                        GlimmerEmit::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
-                        GlimmerEmit::Token(text) => {
-                        glimmer_visible_acc.push_str(&text);
-                        emit_visible_token(stdout, id, &text)
-                    },
-                        GlimmerEmit::Tool(text) => {
-                            glimmer_tool_acc.push_str(&text);
-                        },
+                if let Err(e) = drafter_ok {
+                    // Bring-up: requested drafter must be loud and fatal, not silent fallback
+                    let fatal = std::env::var("HIPFIRE_GLIMMER_SPEC_FALLBACK")
+                        .ok()
+                        .as_deref()
+                        != Some("1");
+                    if fatal {
+                        emit_error_with_id(stdout, id, format!("glimmer drafter forward failed (requested via HIPFIRE_DFLASH_DRAFT): {e}"));
+                        let es = format!("{e}");
+                        if es.contains("poisoned") || es.contains("session requires reset") {
+                            glimmer::forward::abort_device_capture_stage(&mut bundle.state);
+                            bundle.reset_session_state();
+                            m.conversation_tokens.clear();
+                            m.asst_turn_cache.clear();
+                            m.seq_pos = 0;
+                        } else {
+                            let _ = reconcile_glimmer_mirror(
+                                bundle,
+                                &mut m.conversation_tokens,
+                                &mut m.seq_pos,
+                            );
+                        }
+                        return;
                     }
+                    eprintln!("[glimmer-spec] drafter forward failed: {e} — falling back to AR for this window (HIPFIRE_GLIMMER_SPEC_FALLBACK=1)");
+                    // One-token-ahead AR fallback: `last_pick` is already emitted and pending at
+                    // `cur_pos`. Decode/capture that pending token (no re-emit/re-count), then
+                    // sample a NEW prediction from the returned logits and make it the next pending seed.
+                    if bundle.state.n_tokens >= cache_cap {
+                        break;
+                    }
+                    if generated_count >= max_tokens {
+                        break;
+                    }
+                    let pending = last_pick;
+                    let pos = cur_pos;
+                    let fb = if device_capture {
+                        glimmer::forward::decode_step_with_device_capture(
+                            &bundle.config,
+                            &bundle.weights,
+                            &mut bundle.state,
+                            gpu,
+                            pending,
+                            pos,
+                        )
+                    } else {
+                        let tap = glimmer_tap_layers(bundle.config.n_layers);
+                        glimmer::forward::decode_step_with_capture(
+                            &bundle.config,
+                            &bundle.weights,
+                            &mut bundle.state,
+                            gpu,
+                            pending,
+                            pos,
+                            &tap,
+                            &mut bundle.target_hidden_host,
+                        )
+                    };
+                    match fb {
+                        Ok(l) => {
+                            last_logits = l;
+                            // Advance only for the decoded pending token.
+                            cur_pos = pos + 1;
+                            // NEW prediction from post-decode logits — never re-derive pending from stale logits.
+                            let next_tok = {
+                                let mut best = 0u32;
+                                let mut bestv = f32::NEG_INFINITY;
+                                for (i, &v) in last_logits.iter().enumerate() {
+                                    if v > bestv {
+                                        bestv = v;
+                                        best = i as u32;
+                                    }
+                                }
+                                best
+                            };
+                            if stop_set.contains(&next_tok) {
+                                // Static stop becomes the pending seed but must not be verified/committed.
+                                last_pick = next_tok;
+                                break;
+                            }
+                            if generated_count >= max_tokens {
+                                last_pick = next_tok;
+                                break;
+                            }
+                            let frag = m.tokenizer.as_ref().unwrap().decode(&[next_tok]);
+                            let (events, should_stop_fb) = harmony_router.push(&frag);
+                            for ev in events {
+                                match ev {
+                                    GlimmerEmit::Reasoning(text) => {
+                                        emit_reasoning_token(stdout, id, &text)
+                                    }
+                                    GlimmerEmit::Token(text) => {
+                                        glimmer_visible_acc.push_str(&text);
+                                        emit_visible_token(stdout, id, &text)
+                                    }
+                                    GlimmerEmit::Tool(text) => {
+                                        glimmer_tool_acc.push_str(&text);
+                                    }
+                                }
+                            }
+                            if harmony_router.just_forced() {
+                                glimmer_recorder.mark_forced_reasoning_close();
+                            }
+                            glimmer_recorder.push(next_tok, &frag);
+                            m.conversation_tokens.push(next_tok);
+                            glimmer_emitted_ids.push(next_tok);
+                            generated_count += 1;
+                            last_pick = next_tok;
+                            if should_stop_fb {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            emit_error_with_id(
+                                stdout,
+                                id,
+                                format!("muse_glimmer decode failed: {e:?}"),
+                            );
+                            glimmer::forward::abort_device_capture_stage(&mut bundle.state);
+                            // Capture-aware: fail closed — no length-only reconcile after target decode failure.
+                            bundle.reset_session_state();
+                            m.conversation_tokens.clear();
+                            m.asst_turn_cache.clear();
+                            m.seq_pos = 0;
+                            return;
+                        }
+                    }
+                    continue;
                 }
-                if harmony_router.just_forced() {
-                    glimmer_recorder.mark_forced_reasoning_close();
-                }
-                glimmer_recorder.push(next_tok, &frag);
-                if should_stop_fb { break; }
-                if bundle.state.n_tokens >= cache_cap { break; }
-                let pos = bundle.state.n_tokens as u32;
-                match glimmer::forward::decode_step(&bundle.config, &bundle.weights, &mut bundle.state, gpu, next_tok, pos) {
-                    Ok(l) => { last_logits = l; last_pick = next_tok; cur_pos += 1; m.conversation_tokens.push(next_tok); glimmer_emitted_ids.push(next_tok); generated_count += 1; },
-                    Err(e) => { emit_error_with_id(stdout, id, format!("muse_glimmer decode failed: {e:?}")); let _ = reconcile_glimmer_mirror(&mut bundle.state, &mut bundle.target_hidden_host, &mut m.conversation_tokens, &mut m.seq_pos); return; }
-                }
-                continue;
-            }
-            let t_after_drafter = t_window.elapsed();
-            // Bring-up diagnostic: HIPFIRE_GLIMMER_SPEC_DIAG=1 reports the L2 norm of
-            // each stage so a degenerate (all-zero) draft can be localised to the
-            // stage that produced it, rather than inferred from the argmax.
-            if std::env::var("HIPFIRE_GLIMMER_SPEC_DIAG").ok().as_deref() == Some("1")
-                && windows < 2
-            {
-                let l2 = |v: &[f32]| -> f32 { v.iter().map(|x| x * x).sum::<f32>().sqrt() };
-                let nz = |v: &[f32]| -> usize { v.iter().filter(|x| **x != 0.0).count() };
-                eprintln!(
+                let t_after_drafter = t_window.elapsed();
+                // Bring-up diagnostic: HIPFIRE_GLIMMER_SPEC_DIAG=1 — device mode
+                // does not require/download host hidden; print backend + logical length.
+                if std::env::var("HIPFIRE_GLIMMER_SPEC_DIAG").ok().as_deref() == Some("1")
+                    && windows < 2
+                {
+                    let l2 = |v: &[f32]| -> f32 { v.iter().map(|x| x * x).sum::<f32>().sqrt() };
+                    let nz = |v: &[f32]| -> usize { v.iter().filter(|x| **x != 0.0).count() };
+                    eprintln!(
                     "[glimmer-diag] ctx_len {} ctx_cap {} cur_pos {} positions len {} head {:?} tail {:?}",
                     ctx_len,
                     ctx_cap,
@@ -30782,118 +31186,180 @@ fn generate_muse_glimmer(
                         &positions[..]
                     },
                 );
-                eprintln!(
-                    "[glimmer-diag] target_hidden: len {} l2 {:.4} nonzero {} head {:?}",
-                    target_hidden.len(),
-                    l2(&target_hidden),
-                    nz(&target_hidden),
-                    &target_hidden[..4.min(target_hidden.len())]
-                );
-                eprintln!(
-                    "[glimmer-diag] noise_embedding: len {} l2 {:.4} nonzero {}",
-                    noise_embedding.len(),
-                    l2(&noise_embedding),
-                    nz(&noise_embedding)
-                );
-                if let Ok(dx) = gpu.download_f32(&drafter.scratch.x) {
-                    for r in [0usize, 1, 2] {
-                        let s = r * hidden;
-                        if s + hidden <= dx.len() {
-                            let row = &dx[s..s + hidden];
-                            eprintln!(
+                    if device_capture {
+                        eprintln!(
+                        "[glimmer-diag] target_hidden backend=device logical_end {} capacity {}",
+                        history_end,
+                        bundle
+                            .state
+                            .target_hidden_log()
+                            .map(|l| l.capacity_rows())
+                            .unwrap_or(0)
+                    );
+                    } else {
+                        let row_elems = bundle.capture_row_elems().unwrap_or(1);
+                        let th_len = bundle.target_hidden_host.len();
+                        eprintln!(
+                            "[glimmer-diag] target_hidden backend=host len {} rows {} (no D2H)",
+                            th_len,
+                            th_len / row_elems.max(1)
+                        );
+                    }
+                    eprintln!(
+                        "[glimmer-diag] noise_embedding: len {} l2 {:.4} nonzero {}",
+                        noise_embedding.len(),
+                        l2(&noise_embedding),
+                        nz(&noise_embedding)
+                    );
+                    let drafter = bundle.drafter.as_ref().unwrap();
+                    if let Ok(dx) = gpu.download_f32(&drafter.scratch.x) {
+                        for r in [0usize, 1, 2] {
+                            let s = r * hidden;
+                            if s + hidden <= dx.len() {
+                                let row = &dx[s..s + hidden];
+                                eprintln!(
                                 "[glimmer-diag] draft hidden row {r}: l2 {:.4} nonzero {} head {:?}",
                                 l2(row),
                                 nz(row),
                                 &row[..4]
                             );
+                            }
                         }
                     }
                 }
-            }
-            // Real drafts: run TARGET lm_head over drafter hidden rows 1..B-1.
-            // The drafter has no lm_head; this is the contract at qwen speculative.rs:3184.
-            // Use the shared lm_head routine so draft and verify cannot diverge
-            // on near-ties (Q8 batched vs per-row flips halved tau on Q8-head).
-            // Use a fresh allocation for the draft hidden (skip seed row) so the
-            // Q8 batched GEMM hits the same fast path as verify (fixed scratch
-            // address caused 66ms vs 4ms due to convert_fp16 cache).
-            let hidden_for_draft = {
-                let n = (block_size - 1) * hidden;
-                let t = gpu
-                    .alloc_tensor(&[n], rdna_compute::DType::F32)
-                    .map_err(|e| format!("drafter hidden alloc: {e:?}"))
-                    .unwrap();
-                gpu.hip
-                    .memcpy_dtod_at(&t.buf, 0, &drafter.scratch.x.buf, hidden * 4, n * 4)
-                    .map_err(|e| format!("drafter hidden copy: {e:?}"))
-                    .unwrap();
-                t
-            };
-            let drafts = match hipfire_arch_muse_glimmer::forward::glimmer_lm_head_picks(
-                gpu,
-                &bundle.config,
-                &bundle.weights,
-                &hidden_for_draft,
-                block_size - 1,
-                &bundle.state.logits,
-                &bundle.state.logits_batch,
-                &bundle.state.argmax_batch,
-            ) {
-                Ok(p) => p,
-                Err(e) => {
-                    gpu.free_tensor(hidden_for_draft).ok();
-                    emit_error_with_id(stdout, id, format!("glimmer drafter lm_head: {e}"));
-                    let _ = reconcile_glimmer_mirror(&mut bundle.state, &mut bundle.target_hidden_host, &mut m.conversation_tokens, &mut m.seq_pos);
-                    return;
+                // Real drafts: run TARGET lm_head over drafter hidden rows 1..B-1.
+                let drafter = bundle.drafter.as_mut().unwrap();
+                let hidden_for_draft = {
+                    let n = (block_size - 1) * hidden;
+                    let t = gpu
+                        .alloc_tensor(&[n], rdna_compute::DType::F32)
+                        .map_err(|e| format!("drafter hidden alloc: {e:?}"))
+                        .unwrap();
+                    gpu.hip
+                        .memcpy_dtod_at(&t.buf, 0, &drafter.scratch.x.buf, hidden * 4, n * 4)
+                        .map_err(|e| format!("drafter hidden copy: {e:?}"))
+                        .unwrap();
+                    t
+                };
+                let drafts = match hipfire_arch_muse_glimmer::forward::glimmer_lm_head_picks(
+                    gpu,
+                    &bundle.config,
+                    &bundle.weights,
+                    &hidden_for_draft,
+                    block_size - 1,
+                    &bundle.state.logits,
+                    &bundle.state.logits_batch,
+                    &bundle.state.argmax_batch,
+                ) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        gpu.free_tensor(hidden_for_draft).ok();
+                        emit_error_with_id(stdout, id, format!("glimmer drafter lm_head: {e}"));
+                        let _ = reconcile_glimmer_mirror(
+                            bundle,
+                            &mut m.conversation_tokens,
+                            &mut m.seq_pos,
+                        );
+                        return;
+                    }
+                };
+                gpu.free_tensor(hidden_for_draft).ok();
+                let t_after_draft_lm = t_window.elapsed();
+                total_proposed += drafts.len();
+                // Log first draft for visibility
+                if windows < 2 {
+                    eprintln!(
+                        "[glimmer-spec] drafts sample: {:?}",
+                        &drafts[..drafts.len().min(4)]
+                    );
                 }
-            };
-            gpu.free_tensor(hidden_for_draft).ok();
-            let t_after_draft_lm = t_window.elapsed();
-            total_proposed += drafts.len();
-            // Log first draft for visibility
-            if windows < 2 {
-                eprintln!("[glimmer-spec] drafts sample: {:?}", &drafts[..drafts.len().min(4)]);
-            }
-            // --- Verify: block = [seed, drafts...] at cur_pos ---
-            let mut block = Vec::with_capacity(block_size);
-            block.push(last_pick);
-            block.extend_from_slice(&drafts);
-            let row_elems2 = drafter.config.num_extract() * hidden;
-            let hidden_before2 = bundle.target_hidden_host.len();
-            let picks = match glimmer::forward::verify_block_with_capture(&bundle.config, &bundle.weights, &mut bundle.state, gpu, &block, cur_pos, &glimmer_tap_layers(bundle.config.n_layers), &mut bundle.target_hidden_host) {
-                Ok(p) => p,
-                Err(e) => { emit_error_with_id(stdout, id, format!("muse_glimmer verify failed: {e:?}")); let _ = reconcile_glimmer_mirror(&mut bundle.state, &mut bundle.target_hidden_host, &mut m.conversation_tokens, &mut m.seq_pos); return; }
-            };
-            let t_after_verify = t_window.elapsed();
-            // verify_block_with_capture appended B rows; truncate to committed prefix
-            // picks[0] is argmax after seed, picks[1..] after each draft
-            // --- Accept via shared rule (do NOT write a second impl) ---
-            let ga = accept_greedy_prefix(&drafts, &picks, None);
-            {
-                let keep_rows = ga.accepted + 1;
-                let keep_elems = hidden_before2 + keep_rows * row_elems2;
-                bundle.target_hidden_host.truncate(keep_elems);
-            }
-            total_accepted += ga.accepted;
-            windows += 1;
-            // Honest tau logging per window (parent re-runs perf gate)
-            if windows % 16 == 0 || ga.accepted + 1 < block_size {
-                eprintln!("[glimmer-spec] window {}: proposed {} accepted {} tau {:.2} cur_pos {}", windows, drafts.len(), ga.accepted, if windows>0 {total_accepted as f32 / windows as f32 } else {0.0}, cur_pos);
-            }
-            // --- Commit: rollback if partial, then emit accepted+bonus ---
-            let accept = ga.accepted;
-            let bonus = if accept < drafts.len() { picks[accept] } else { picks[picks.len()-1] };
-            // Verify is currently advanced by block_size; rollback if we rejected tail
-            if accept + 1 < block_size {
-                let target_pos = cur_pos as usize + accept + 1;
-                glimmer::forward::rollback_to(&mut bundle.state, target_pos);
-                cur_pos = target_pos as u32;
-            } else {
-                cur_pos += block_size as u32;
-            }
-            if do_window_timing {
-                let t_total = t_window.elapsed();
-                eprintln!(
+                // --- Verify: block = [seed, drafts...] at cur_pos ---
+                // Do NOT commit/truncate/rollback before routing emitted tokens.
+                let window_start_cur_pos = cur_pos as usize;
+                let mut block = Vec::with_capacity(block_size);
+                block.push(last_pick);
+                block.extend_from_slice(&drafts);
+                let picks = if device_capture {
+                    match glimmer::forward::verify_block_with_device_capture(
+                        &bundle.config,
+                        &bundle.weights,
+                        &mut bundle.state,
+                        gpu,
+                        &block,
+                        cur_pos,
+                    ) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            emit_error_with_id(
+                                stdout,
+                                id,
+                                format!("muse_glimmer verify failed: {e:?}"),
+                            );
+                            glimmer::forward::abort_device_capture_stage(&mut bundle.state);
+                            // Device verify/capture transaction errors (incl. poisoned log) are fail-closed.
+                            bundle.reset_session_state();
+                            m.conversation_tokens.clear();
+                            m.asst_turn_cache.clear();
+                            m.seq_pos = 0;
+                            return;
+                        }
+                    }
+                } else {
+                    match glimmer::forward::verify_block_with_capture(
+                        &bundle.config,
+                        &bundle.weights,
+                        &mut bundle.state,
+                        gpu,
+                        &block,
+                        cur_pos,
+                        &glimmer_tap_layers(bundle.config.n_layers),
+                        &mut bundle.target_hidden_host,
+                    ) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            emit_error_with_id(
+                                stdout,
+                                id,
+                                format!("muse_glimmer verify failed: {e:?}"),
+                            );
+                            let _ = reconcile_glimmer_mirror(
+                                bundle,
+                                &mut m.conversation_tokens,
+                                &mut m.seq_pos,
+                            );
+                            return;
+                        }
+                    }
+                };
+                let t_after_verify = t_window.elapsed();
+                // Accept via shared rule — commit is delayed until after routing.
+                let ga = accept_greedy_prefix(&drafts, &picks, None);
+                total_accepted += ga.accepted;
+                windows += 1;
+                // Honest tau logging per window (parent re-runs perf gate)
+                if windows % 16 == 0 || ga.accepted + 1 < block_size {
+                    eprintln!(
+                        "[glimmer-spec] window {}: proposed {} accepted {} tau {:.2} cur_pos {}",
+                        windows,
+                        drafts.len(),
+                        ga.accepted,
+                        if windows > 0 {
+                            total_accepted as f32 / windows as f32
+                        } else {
+                            0.0
+                        },
+                        cur_pos
+                    );
+                }
+                let accept = ga.accepted;
+                let bonus = if accept < drafts.len() {
+                    picks[accept]
+                } else {
+                    picks[picks.len() - 1]
+                };
+                if do_window_timing {
+                    let t_total = t_window.elapsed();
+                    eprintln!(
                     "[glimmer-window-timing] win {} noise={:.1}ms drafter={:.1}ms draft_lm={:.1}ms verify={:.1}ms total={:.1}ms ctx_len={} B={}",
                     windows,
                     t_after_noise.as_secs_f64() * 1000.0,
@@ -30901,127 +31367,153 @@ fn generate_muse_glimmer(
                     (t_after_draft_lm - t_after_drafter).as_secs_f64() * 1000.0,
                     (t_after_verify - t_after_draft_lm).as_secs_f64() * 1000.0,
                     t_total.as_secs_f64() * 1000.0,
-                    {
-                        let ne = drafter.config.num_extract();
-                        let hidden = drafter.config.hidden;
-                        let row_elems = ne * hidden;
-                        (bundle.target_hidden_host.len() / row_elems).min(drafter.config.sliding_window)
-                    },
+                    ctx_len,
                     block_size
                 );
-            }
-            // Need the logits for the bonus token's NEXT prediction — they are picks[accept+1]'s logits?
-            // Our verify_block already advanced state to cur_pos-1's KV and last_logits is stale.
-            // Re-derive last_logits by a single decode_step of the bonus token's logits?
-            // Instead, capture bonus logits from verify: we already have picks, but not logits.
-            // For temp 0 we can just set last_logits to the verify's last position logits;
-            // the easiest is to re-run decode_step for bonus? But verify already left
-            // state at cur_pos (after bonus). So last_logits should be the logits after bonus.
-            // Our verify_block loop left state advanced and last_logits not updated — fix:
-            // after verify, last_logits should be the logits of the bonus position.
-            // We have picks but not logits; synthesize by re-downloading last verify logits?
-            // For now, just reuse the last verify logits as proxy: do a host-side argmax
-            // already done, and next window's seed will be bonus.
-            // Update last_logits by re-running a dummy decode_step to get real logits?
-            // Simpler: set last_logits to a vector where bonus is argmax (one-hot) — enough for next seed.
-            // Real impl would return logits per position from verify_block.
-            // For byte-identical check we need real logits, so we do a real forward for bonus:
-            // The verify_block already did decode_step for bonus, so we can capture its logits
-            // by storing per-pos logits in verify_block. For now, do a fresh decode_step at cur_pos-1?
-            // To keep it simple and byte-identical for single-token windows, we will
-            // treat `last_pick = bonus` and keep `last_logits` as a one-hot proxy that
-            // will be overwritten by the next verify's first pick anyway. For the
-            // emitted tokens we need to emit drafts[0..accept] + bonus.
-            let mut to_emit: Vec<u32> = Vec::with_capacity(accept + 1);
-            to_emit.extend_from_slice(&drafts[..accept]);
-            to_emit.push(bonus);
-            // Proven-able-to-fail check: corrupt one draft and show identity trips.
-            // We don't corrupt live; we expose a hook: if HIPFIRE_GLIMMER_SPEC_PERTURB==1,
-            // flip one draft and assert accept would have been different.
-            if std::env::var("HIPFIRE_GLIMMER_SPEC_PERTURB").ok().as_deref() == Some("1") && !drafts.is_empty() {
-                let mut perturbed = drafts.clone();
-                // Make it match the target's pick for this position to prove sensitivity
-                perturbed[0] = picks[0];
-                let ga2 = accept_greedy_prefix(&perturbed, &picks, None);
-                if ga2.accepted == ga.accepted {
-                    eprintln!("[glimmer-spec] PERTURB CHECK FAILED: forcing draft[0]=target_pick[0] did not change accept {} (picks[0]={}) — comparison not sensitive or drafter never ran", ga.accepted, picks[0]);
-                } else {
-                    eprintln!("[glimmer-spec] PERTURB CHECK OK: forcing draft[0]=target_pick[0] changed accept {} -> {} — comparison can fail, drafter ran (windows={})", ga.accepted, ga2.accepted, windows);
                 }
-            }
-            // Emit via Harmony router: header stripped, reasoning vs token, eom handling
-            let mut should_stop_block = false;
-            for &tok in &to_emit {
-                if generated_count >= max_tokens { break; }
-                // eos/eot always stop; eom depends on channel — let router decide via text marker.
-                // But token-level eos/eot short-circuit still needed to avoid decode_step on stop token?
-                // We check stop_set for eos/eot only (no eom) — eom is not in stop_set.
-                if stop_set.contains(&tok) {
-                    // eos/eot: feed marker through router to flush pending, then break
+                // Build to_emit (accepted drafts + bonus), route/push until stop/max,
+                // THEN commit capture + rewind. Uncaptured bonus is never in keep_rows.
+                let mut to_emit: Vec<u32> = Vec::with_capacity(accept + 1);
+                to_emit.extend_from_slice(&drafts[..accept]);
+                to_emit.push(bonus);
+                // Proven-able-to-fail check: corrupt one draft and show identity trips.
+                if std::env::var("HIPFIRE_GLIMMER_SPEC_PERTURB")
+                    .ok()
+                    .as_deref()
+                    == Some("1")
+                    && !drafts.is_empty()
+                {
+                    let mut perturbed = drafts.clone();
+                    perturbed[0] = picks[0];
+                    let ga2 = accept_greedy_prefix(&perturbed, &picks, None);
+                    if ga2.accepted == ga.accepted {
+                        eprintln!("[glimmer-spec] PERTURB CHECK FAILED: forcing draft[0]=target_pick[0] did not change accept {} (picks[0]={}) — comparison not sensitive or drafter never ran", ga.accepted, picks[0]);
+                    } else {
+                        eprintln!("[glimmer-spec] PERTURB CHECK OK: forcing draft[0]=target_pick[0] changed accept {} -> {} — comparison can fail, drafter ran (windows={})", ga.accepted, ga2.accepted, windows);
+                    }
+                }
+                // Emit via Harmony router: header stripped, reasoning vs token, eom handling
+                let mut should_stop_block = false;
+                for &tok in &to_emit {
+                    if generated_count >= max_tokens {
+                        break;
+                    }
+                    if stop_set.contains(&tok) {
+                        let frag = m.tokenizer.as_ref().unwrap().decode(&[tok]);
+                        let (events, _) = harmony_router.push(&frag);
+                        for ev in events {
+                            match ev {
+                                GlimmerEmit::Reasoning(text) => {
+                                    emit_reasoning_token(stdout, id, &text)
+                                }
+                                GlimmerEmit::Token(text) => {
+                                    glimmer_visible_acc.push_str(&text);
+                                    emit_visible_token(stdout, id, &text)
+                                }
+                                GlimmerEmit::Tool(text) => {
+                                    glimmer_tool_acc.push_str(&text);
+                                }
+                            }
+                        }
+                        if harmony_router.just_forced() {
+                            glimmer_recorder.mark_forced_reasoning_close();
+                        }
+                        glimmer_recorder.push(tok, &frag);
+                        last_pick = tok;
+                        m.conversation_tokens.push(tok);
+                        glimmer_emitted_ids.push(tok);
+                        generated_count += 1;
+                        should_stop_block = true;
+                        break;
+                    }
                     let frag = m.tokenizer.as_ref().unwrap().decode(&[tok]);
-                    let (events, _) = harmony_router.push(&frag);
+                    let (events, should_stop) = harmony_router.push(&frag);
                     for ev in events {
                         match ev {
                             GlimmerEmit::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
                             GlimmerEmit::Token(text) => {
-                        glimmer_visible_acc.push_str(&text);
-                        emit_visible_token(stdout, id, &text)
-                    },
+                                glimmer_visible_acc.push_str(&text);
+                                emit_visible_token(stdout, id, &text)
+                            }
                             GlimmerEmit::Tool(text) => {
                                 glimmer_tool_acc.push_str(&text);
-                            },
+                            }
                         }
                     }
                     if harmony_router.just_forced() {
                         glimmer_recorder.mark_forced_reasoning_close();
                     }
                     glimmer_recorder.push(tok, &frag);
-                    last_pick = tok;
-                    // Don't emit stop marker itself; still count token for conversation?
                     m.conversation_tokens.push(tok);
                     glimmer_emitted_ids.push(tok);
                     generated_count += 1;
-                    should_stop_block = true;
-                    break;
-                }
-                let frag = m.tokenizer.as_ref().unwrap().decode(&[tok]);
-                let (events, should_stop) = harmony_router.push(&frag);
-                for ev in events {
-                    match ev {
-                        GlimmerEmit::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
-                        GlimmerEmit::Token(text) => {
-                        glimmer_visible_acc.push_str(&text);
-                        emit_visible_token(stdout, id, &text)
-                    },
-                        GlimmerEmit::Tool(text) => {
-                            glimmer_tool_acc.push_str(&text);
-                        },
+                    if should_stop {
+                        last_pick = tok;
+                        should_stop_block = true;
+                        break;
                     }
                 }
-                if harmony_router.just_forced() {
-                    glimmer_recorder.mark_forced_reasoning_close();
+                // keep_rows = seed + actually retained accepted input rows; bonus uncaptured.
+                let keep_rows = (ga.accepted + 1).min(
+                    m.conversation_tokens
+                        .len()
+                        .saturating_sub(window_start_cur_pos),
+                );
+                // Device: commit staged verify prefix. Host: rewind truncates host atomically.
+                if device_capture {
+                    if let Err(e) = glimmer::forward::commit_device_verify_capture(
+                        &mut bundle.state,
+                        gpu,
+                        keep_rows,
+                    ) {
+                        emit_error_with_id(
+                            stdout,
+                            id,
+                            format!("muse_glimmer commit_device_verify_capture failed: {e}"),
+                        );
+                        glimmer::forward::abort_device_capture_stage(&mut bundle.state);
+                        bundle.reset_session_state();
+                        m.conversation_tokens.clear();
+                        m.asst_turn_cache.clear();
+                        m.seq_pos = 0;
+                        return;
+                    }
                 }
-                glimmer_recorder.push(tok, &frag);
-                m.conversation_tokens.push(tok);
-                glimmer_emitted_ids.push(tok);
-                generated_count += 1;
-                if should_stop {
-                    // eom closed a final channel => stop entire decode
-                    last_pick = tok;
-                    should_stop_block = true;
+                let commit_end = window_start_cur_pos + keep_rows;
+                if let Err(e) = bundle.rewind_session_to(commit_end) {
+                    emit_error_with_id(
+                        stdout,
+                        id,
+                        format!(
+                            "muse_glimmer rewind_session_to({commit_end}) after verify failed: {e}"
+                        ),
+                    );
+                    glimmer::forward::abort_device_capture_stage(&mut bundle.state);
+                    bundle.reset_session_state();
+                    m.conversation_tokens.clear();
+                    m.asst_turn_cache.clear();
+                    m.seq_pos = 0;
+                    return;
+                }
+                cur_pos = commit_end as u32;
+                // Only after transaction resolution may break on stop/max.
+                if should_stop_block {
+                    break;
+                }
+                last_pick = bonus;
+                if generated_count >= max_tokens {
                     break;
                 }
             }
-            if should_stop_block { break; }
-            last_pick = bonus;
-            // If we stopped on max_tokens, outer loop will break
-            // Update tau stats
-            if generated_count >= max_tokens { break; }
-        }
+        } // !skip_spec_loop
         spec_windows = windows;
         spec_accepted = total_accepted;
         if windows > 0 {
-            let tau = if windows>0 { (total_accepted as f32 + windows as f32) / windows as f32 } else { 0.0 };
+            let tau = if windows > 0 {
+                (total_accepted as f32 + windows as f32) / windows as f32
+            } else {
+                0.0
+            };
             eprintln!("[glimmer-spec] done: windows {} proposed {} accepted {} tau {:.3} (bonus per window counted)", windows, total_proposed, total_accepted, tau);
         }
     } else {
@@ -31058,12 +31550,12 @@ fn generate_muse_glimmer(
                     match ev {
                         GlimmerEmit::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
                         GlimmerEmit::Token(text) => {
-                        glimmer_visible_acc.push_str(&text);
-                        emit_visible_token(stdout, id, &text)
-                    },
+                            glimmer_visible_acc.push_str(&text);
+                            emit_visible_token(stdout, id, &text)
+                        }
                         GlimmerEmit::Tool(text) => {
                             glimmer_tool_acc.push_str(&text);
-                        },
+                        }
                     }
                 }
                 if harmony_router.just_forced() {
@@ -31087,10 +31579,10 @@ fn generate_muse_glimmer(
                     GlimmerEmit::Token(text) => {
                         glimmer_visible_acc.push_str(&text);
                         emit_visible_token(stdout, id, &text)
-                    },
+                    }
                     GlimmerEmit::Tool(text) => {
                         glimmer_tool_acc.push_str(&text);
-                    },
+                    }
                 }
             }
             if harmony_router.just_forced() {
@@ -31106,7 +31598,77 @@ fn generate_muse_glimmer(
             }
 
             let position = bundle.state.n_tokens as u32;
-            let step = if gpu_sample {
+            // When a drafter exists, every AR token must also capture hidden
+            // so next-turn DFlash/prefix history has no holes.
+            let has_drafter = bundle.drafter.is_some();
+            let device_capture = has_drafter && bundle.device_hidden_capture_enabled();
+            let step = if has_drafter {
+                if device_capture {
+                    if gpu_sample {
+                        glimmer::forward::decode_step_sampled_with_device_capture(
+                            &bundle.config,
+                            &bundle.weights,
+                            &mut bundle.state,
+                            gpu,
+                            next_tok,
+                            position,
+                            temp,
+                            top_p,
+                            top_k_opt,
+                            gpu_rng,
+                        )
+                    } else {
+                        glimmer::forward::decode_step_with_device_capture(
+                            &bundle.config,
+                            &bundle.weights,
+                            &mut bundle.state,
+                            gpu,
+                            next_tok,
+                            position,
+                        )
+                        .map(|logits| {
+                            let tok = deepseek4::sampling::sample_token(
+                                &logits, temp, top_k, top_p, &mut rng,
+                            );
+                            (tok, gpu_rng)
+                        })
+                    }
+                } else if gpu_sample {
+                    let tap = glimmer_tap_layers(bundle.config.n_layers);
+                    glimmer::forward::decode_step_sampled_with_capture(
+                        &bundle.config,
+                        &bundle.weights,
+                        &mut bundle.state,
+                        gpu,
+                        next_tok,
+                        position,
+                        &tap,
+                        &mut bundle.target_hidden_host,
+                        temp,
+                        top_p,
+                        top_k_opt,
+                        gpu_rng,
+                    )
+                } else {
+                    let tap = glimmer_tap_layers(bundle.config.n_layers);
+                    glimmer::forward::decode_step_with_capture(
+                        &bundle.config,
+                        &bundle.weights,
+                        &mut bundle.state,
+                        gpu,
+                        next_tok,
+                        position,
+                        &tap,
+                        &mut bundle.target_hidden_host,
+                    )
+                    .map(|logits| {
+                        let tok = deepseek4::sampling::sample_token(
+                            &logits, temp, top_k, top_p, &mut rng,
+                        );
+                        (tok, gpu_rng)
+                    })
+                }
+            } else if gpu_sample {
                 glimmer::forward::decode_step_sampled(
                     &bundle.config,
                     &bundle.weights,
@@ -31133,9 +31695,8 @@ fn generate_muse_glimmer(
                     position,
                 )
                 .map(|logits| {
-                    let tok = deepseek4::sampling::sample_token(
-                        &logits, temp, top_k, top_p, &mut rng,
-                    );
+                    let tok =
+                        deepseek4::sampling::sample_token(&logits, temp, top_k, top_p, &mut rng);
                     (tok, gpu_rng)
                 })
             };
@@ -31146,10 +31707,15 @@ fn generate_muse_glimmer(
                     glimmer_emitted_ids.push(next_tok);
                     generated_count += 1;
                     next_tok = sampled;
-                },
+                }
                 Err(e) => {
                     emit_error_with_id(stdout, id, format!("muse_glimmer decode failed: {e:?}"));
-                    let _ = reconcile_glimmer_mirror(&mut bundle.state, &mut bundle.target_hidden_host, &mut m.conversation_tokens, &mut m.seq_pos);
+                    glimmer::forward::abort_device_capture_stage(&mut bundle.state);
+                    let _ = reconcile_glimmer_mirror(
+                        bundle,
+                        &mut m.conversation_tokens,
+                        &mut m.seq_pos,
+                    );
                     return;
                 }
             }
@@ -31161,7 +31727,7 @@ fn generate_muse_glimmer(
                 GlimmerEmit::Token(text) => emit_visible_token(stdout, id, &text),
                 GlimmerEmit::Tool(text) => {
                     glimmer_tool_acc.push_str(&text);
-                },
+                }
             }
         }
     }
@@ -31207,7 +31773,7 @@ fn generate_muse_glimmer(
             }
         }
     }
-    let _ = reconcile_glimmer_mirror(&mut bundle.state, &mut bundle.target_hidden_host, &mut m.conversation_tokens, &mut m.seq_pos);
+    let _ = reconcile_glimmer_mirror(bundle, &mut m.conversation_tokens, &mut m.seq_pos);
 
     let decode_ms = decode_t0.elapsed().as_millis().max(1);
     let total_ms = t0.elapsed().as_millis().max(1);
@@ -31248,14 +31814,24 @@ fn generate_muse_glimmer(
     if glimmer_commit_terminal(stdout, id, &pending_done, generated_count) {
         if !hit_length_cap && !glimmer_emitted_ids.is_empty() {
             let ordinal = messages_history
-                .map(|h| h.iter().filter(|m| matches!(m.role, hipfire_runtime::prompt_frame::Role::Assistant)).count())
+                .map(|h| {
+                    h.iter()
+                        .filter(|m| {
+                            matches!(m.role, hipfire_runtime::prompt_frame::Role::Assistant)
+                        })
+                        .count()
+                })
                 .unwrap_or(0);
-            let _ = glimmer_store_cached_turn(&mut m.asst_turn_cache, glimmer_recorder, &parsed_tool_calls, ordinal);
+            let _ = glimmer_store_cached_turn(
+                &mut m.asst_turn_cache,
+                glimmer_recorder,
+                &parsed_tool_calls,
+                ordinal,
+            );
         }
     } else {
         // Fail closed: the mirror and KV are mid-turn, so no later turn may reuse them.
-        bundle.state.reset();
-        bundle.target_hidden_host.clear();
+        bundle.reset_session_state();
         m.conversation_tokens.clear();
         m.asst_turn_cache.clear();
         m.seq_pos = 0;
@@ -31322,7 +31898,7 @@ fn generate_lfm2moe(
                 user: prompt,
                 enable_thinking: max_think_tokens != 1,
                 bos_token: None,
-            reasoning_strength: None,
+                reasoning_strength: None,
             };
             let render_result = if tools.is_some() || messages_history.is_some() {
                 let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
@@ -31335,9 +31911,9 @@ fn generate_lfm2moe(
                                 v.push(hipfire_runtime::prompt_frame::Message {
                                     role: hipfire_runtime::prompt_frame::Role::System,
                                     content: sys.to_string(),
-            reasoning_content: None,
-            name: None,
-            rendered_name: None,
+                                    reasoning_content: None,
+                                    name: None,
+                                    rendered_name: None,
                                     tool_calls: Vec::new(),
                                     tool_call_id: None,
                                     tool_plan: String::new(),
@@ -31346,9 +31922,9 @@ fn generate_lfm2moe(
                             v.push(hipfire_runtime::prompt_frame::Message {
                                 role: hipfire_runtime::prompt_frame::Role::User,
                                 content: prompt.to_string(),
-            reasoning_content: None,
-            name: None,
-            rendered_name: None,
+                                reasoning_content: None,
+                                name: None,
+                                rendered_name: None,
                                 tool_calls: Vec::new(),
                                 tool_call_id: None,
                                 tool_plan: String::new(),
@@ -31709,7 +32285,7 @@ fn generate_minimax(
                 user: prompt,
                 enable_thinking: max_think_tokens != 1,
                 bos_token: None,
-            reasoning_strength: None,
+                reasoning_strength: None,
             };
             let render_result = if tools.is_some() || messages_history.is_some() {
                 let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
@@ -31722,9 +32298,9 @@ fn generate_minimax(
                                 v.push(hipfire_runtime::prompt_frame::Message {
                                     role: hipfire_runtime::prompt_frame::Role::System,
                                     content: sys.to_string(),
-            reasoning_content: None,
-            name: None,
-            rendered_name: None,
+                                    reasoning_content: None,
+                                    name: None,
+                                    rendered_name: None,
                                     tool_calls: Vec::new(),
                                     tool_call_id: None,
                                     tool_plan: String::new(),
@@ -31733,9 +32309,9 @@ fn generate_minimax(
                             v.push(hipfire_runtime::prompt_frame::Message {
                                 role: hipfire_runtime::prompt_frame::Role::User,
                                 content: prompt.to_string(),
-            reasoning_content: None,
-            name: None,
-            rendered_name: None,
+                                reasoning_content: None,
+                                name: None,
+                                rendered_name: None,
                                 tool_calls: Vec::new(),
                                 tool_call_id: None,
                                 tool_plan: String::new(),
@@ -32132,7 +32708,7 @@ fn generate_cohere2moe(
                 user: prompt,
                 enable_thinking: max_think_tokens != 1,
                 bos_token: None,
-            reasoning_strength: None,
+                reasoning_strength: None,
             };
             let render_result = if tools.is_some() || messages_history.is_some() {
                 let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
@@ -32145,9 +32721,9 @@ fn generate_cohere2moe(
                                 v.push(hipfire_runtime::prompt_frame::Message {
                                     role: hipfire_runtime::prompt_frame::Role::System,
                                     content: sys.to_string(),
-            reasoning_content: None,
-            name: None,
-            rendered_name: None,
+                                    reasoning_content: None,
+                                    name: None,
+                                    rendered_name: None,
                                     tool_calls: Vec::new(),
                                     tool_call_id: None,
                                     tool_plan: String::new(),
@@ -32156,9 +32732,9 @@ fn generate_cohere2moe(
                             v.push(hipfire_runtime::prompt_frame::Message {
                                 role: hipfire_runtime::prompt_frame::Role::User,
                                 content: prompt.to_string(),
-            reasoning_content: None,
-            name: None,
-            rendered_name: None,
+                                reasoning_content: None,
+                                name: None,
+                                rendered_name: None,
                                 tool_calls: Vec::new(),
                                 tool_call_id: None,
                                 tool_plan: String::new(),
@@ -35760,9 +36336,9 @@ mod qwen_ar_semantic_route_tests {
             hostile,
             &[hipfire_runtime::prompt_frame::ToolCall {
                 id: None,
-                    name: "n".into(),
+                name: "n".into(),
                 arguments: serde_json::json!({}),
-                    rendered_body: None,
+                rendered_body: None,
             }],
         );
         emit_qwen_ar_done(
@@ -36356,9 +36932,9 @@ mod ds4_malformed_terminal_tests {
                     .into_iter()
                     .map(|c| ToolCall {
                         id: None,
-                    name: c.name,
+                        name: c.name,
                         arguments: c.arguments,
-                    rendered_body: None,
+                        rendered_body: None,
                     })
                     .collect();
                 ds4_ar_ep_finish_route(None, wire, false)
@@ -36581,7 +37157,7 @@ mod ds4_malformed_terminal_tests {
     #[test]
     fn stream_event_tool_calls_not_wireable_mid_turn() {
         let ev = StreamEvent::ToolCalls(vec![hipfire_arch_deepseek4::dsml::ToolCall {
-                    name: "x".into(),
+            name: "x".into(),
             arguments: serde_json::json!({}),
         }]);
         assert!(!ds4_stream_event_wireable(&ev));
@@ -36679,9 +37255,9 @@ mod ds4_malformed_terminal_tests {
     fn ds4_safe_terminal_stores_verbatim_raw_replay_tokens() {
         let calls = vec![ToolCall {
             id: None,
-                    name: "lookup".into(),
+            name: "lookup".into(),
             arguments: serde_json::json!({"q": "x"}),
-                    rendered_body: None,
+            rendered_body: None,
         }];
         let finish = FinishSummary {
             events: vec![
@@ -36744,9 +37320,9 @@ mod ds4_malformed_terminal_tests {
         let finish_tools = FinishSummary {
             events: vec![ClientEvent::ToolCalls(vec![ToolCall {
                 id: None,
-                    name: "alpha".into(),
+                name: "alpha".into(),
                 arguments: serde_json::json!({}),
-                    rendered_body: None,
+                rendered_body: None,
             }])],
             finish_reason: "tool_calls",
             tool_calls: 1,
@@ -37030,9 +37606,9 @@ mod ds4_malformed_terminal_tests {
     fn ds4_ar_ep_safe_commit_gate_retains_calls_cache_done() {
         let call = ToolCall {
             id: None,
-                    name: "search".into(),
+            name: "search".into(),
             arguments: serde_json::json!({"q": "x"}),
-                    rendered_body: None,
+            rendered_body: None,
         };
         let terminal = ds4_ar_ep_finish_route(None, vec![call.clone()], false);
         let Ds4ArEpRouteTerminal::Safe {
@@ -37081,9 +37657,9 @@ mod ds4_malformed_terminal_tests {
     fn ds4_ar_ep_safe_abort_gate_suppresses_calls_cache_done() {
         let call = ToolCall {
             id: None,
-                    name: "search".into(),
+            name: "search".into(),
             arguments: serde_json::json!({"q": "x"}),
-                    rendered_body: None,
+            rendered_body: None,
         };
         let terminal = ds4_ar_ep_finish_route(None, vec![call], false);
         let Ds4ArEpRouteTerminal::Safe {
@@ -37448,9 +38024,9 @@ mod qwen_dflash_semantic_terminal_tests {
     fn tool_safe_releases_calls_and_stores() {
         let calls = vec![ToolCall {
             id: None,
-                    name: "get_weather".into(),
+            name: "get_weather".into(),
             arguments: serde_json::json!({"city": "SF"}),
-                    rendered_body: None,
+            rendered_body: None,
         }];
         let fin = summary_tool_calls(calls.clone());
         let term = qwen_dflash_wire_terminal(&fin, false, false, "Sure.", false);
@@ -37479,9 +38055,9 @@ mod qwen_dflash_semantic_terminal_tests {
     fn pure_length_suppresses_calls_and_cache() {
         let calls = vec![ToolCall {
             id: None,
-                    name: "t".into(),
+            name: "t".into(),
             arguments: serde_json::json!({}),
-                    rendered_body: None,
+            rendered_body: None,
         }];
         let fin = summary_tool_calls(calls);
         assert!(qwen_dflash_hit_length_cap(16, 16, false, false));
@@ -37518,9 +38094,9 @@ mod qwen_dflash_semantic_terminal_tests {
         assert!(!qwen_dflash_hit_length_cap(8, 8, true, false));
         let calls = vec![ToolCall {
             id: None,
-                    name: "t".into(),
+            name: "t".into(),
             arguments: serde_json::json!({}),
-                    rendered_body: None,
+            rendered_body: None,
         }];
         let fin = summary_tool_calls(calls);
         let term = qwen_dflash_wire_terminal(&fin, false, false, "ok", false);
@@ -37567,9 +38143,9 @@ mod qwen_dflash_semantic_terminal_tests {
     fn grammar_failure_no_calls_no_cache() {
         let calls = vec![ToolCall {
             id: None,
-                    name: "t".into(),
+            name: "t".into(),
             arguments: serde_json::json!({}),
-                    rendered_body: None,
+            rendered_body: None,
         }];
         let fin = summary_tool_calls(calls);
         let term = qwen_dflash_wire_terminal(&fin, false, true, "x", false);
@@ -38259,9 +38835,9 @@ mod qwen_dflash_semantic_terminal_tests {
     fn ordinary_length_cutoff_no_calls_no_cache() {
         let calls = vec![ToolCall {
             id: None,
-                    name: "t".into(),
+            name: "t".into(),
             arguments: serde_json::json!({}),
-                    rendered_body: None,
+            rendered_body: None,
         }];
         let fin = summary_tool_calls(calls);
         let term = qwen_dflash_wire_terminal(&fin, true, false, "x", false);
@@ -38325,9 +38901,9 @@ mod qwen_dflash_semantic_terminal_tests {
         set_active_attempt_id(7);
         let fin = summary_tool_calls(vec![ToolCall {
             id: None,
-                    name: "t".into(),
+            name: "t".into(),
             arguments: serde_json::json!({}),
-                    rendered_body: None,
+            rendered_body: None,
         }]);
         let term = qwen_dflash_wire_terminal(&fin, false, true, "x", false);
         let mut sink = Vec::new();
@@ -38375,9 +38951,9 @@ mod qwen_dflash_semantic_terminal_tests {
             id,
             &[ToolCall {
                 id: None,
-                    name: "n".into(),
+                name: "n".into(),
                 arguments: serde_json::json!({"x": 1}),
-                    rendered_body: None,
+                rendered_body: None,
             }],
         );
         let out = String::from_utf8(sink).unwrap();
@@ -39474,9 +40050,9 @@ mod qwen_dflash_semantic_terminal_tests {
 
         let finish = summary_tool_calls(vec![ToolCall {
             id: None,
-                    name: "held".into(),
+            name: "held".into(),
             arguments: serde_json::json!({}),
-                    rendered_body: None,
+            rendered_body: None,
         }]);
         assert!(finish.tool_calls > 0);
 
@@ -39947,9 +40523,9 @@ mod qwen_dflash_semantic_terminal_tests {
     fn held_tool_calls_with_semantic_stop_at_cap_is_tool_calls_not_length() {
         let calls = vec![ToolCall {
             id: None,
-                    name: "get_weather".into(),
+            name: "get_weather".into(),
             arguments: serde_json::json!({"city": "SF"}),
-                    rendered_body: None,
+            rendered_body: None,
         }];
         let fin = summary_tool_calls(calls.clone());
         let held = finish_summary_held_tool_calls(&fin);
@@ -40285,9 +40861,9 @@ mod qwen_dflash_semantic_terminal_tests {
         // Successful Done classify → intended flags gate release/store.
         let tc = ToolCall {
             id: None,
-                    name: "read".into(),
+            name: "read".into(),
             arguments: r#"{"path":"/x"}"#.into(),
-                    rendered_body: None,
+            rendered_body: None,
         };
         let term = qwen_dflash_wire_terminal(
             &summary_tool_calls(vec![tc.clone()]),
@@ -40324,9 +40900,9 @@ mod qwen_dflash_semantic_terminal_tests {
         set_active_attempt_id(33);
         let tc = ToolCall {
             id: None,
-                    name: "read".into(),
+            name: "read".into(),
             arguments: r#"{"path":"/x"}"#.into(),
-                    rendered_body: None,
+            rendered_body: None,
         };
         let term =
             qwen_dflash_wire_terminal(&summary_tool_calls(vec![tc]), false, false, "Sure.", false);
@@ -41129,7 +41705,9 @@ mod glimmer_channel_recorder_tests {
         rec.push(104, "answer body");
         rec.push(105, " more");
         // Intentionally leave user body OPEN — no EOT, decode stopped on <|eot|> without feeding it.
-        let turn = rec.into_cached_turn(&[]).expect("open terminal user body should be accepted");
+        let turn = rec
+            .into_cached_turn(&[])
+            .expect("open terminal user body should be accepted");
         assert!(turn.reasoning.is_some());
         assert_eq!(turn.reasoning.unwrap().text, "reasoning body");
         assert!(turn.content.is_some());
@@ -41154,7 +41732,12 @@ mod glimmer_channel_recorder_tests {
             rec.push(200 + i as u32, &c.to_string());
         }
         rec.push(GLIMMER_EOT_ID, "<|eot|>");
-        let tool_call = hipfire_runtime::prompt_frame::ToolCall { id: Some("call_0".into()), name: "weather.get_forecast".into(), arguments: serde_json::json!({"location":"Paris"}), rendered_body: None };
+        let tool_call = hipfire_runtime::prompt_frame::ToolCall {
+            id: Some("call_0".into()),
+            name: "weather.get_forecast".into(),
+            arguments: serde_json::json!({"location":"Paris"}),
+            rendered_body: None,
+        };
         let turn = rec.into_cached_turn(&[tool_call]).expect("should succeed");
         assert!(turn.reasoning.is_some());
         assert_eq!(turn.tools.len(), 1);
@@ -41203,7 +41786,9 @@ mod glimmer_channel_recorder_tests {
         rec.push(103, "assistant to=user");
         rec.push(GLIMMER_MESSAGE_ID, "<|message|>");
         rec.push(104, "answer");
-        let turn = rec.into_cached_turn(&[]).expect("self body must be recorded");
+        let turn = rec
+            .into_cached_turn(&[])
+            .expect("self body must be recorded");
         assert_eq!(turn.reasoning.expect("reasoning slot").text, "reasoning");
         assert_eq!(turn.content.expect("content slot").text, "answer");
     }
@@ -41228,10 +41813,14 @@ mod glimmer_channel_recorder_tests {
         cache.clear();
         let ok = glimmer_store_cached_turn(&mut cache, rec, &[], 0);
         assert!(ok, "store should succeed");
-        let normalized = hipfire_runtime::tokenizer::maybe_normalize_prompt("answer body!").into_owned();
+        let normalized =
+            hipfire_runtime::tokenizer::maybe_normalize_prompt("answer body!").into_owned();
         let fp_raw = asst_turn_fingerprint(&normalized, &[]);
         let fp = glimmer_turn_key(fp_raw, 0);
-        let turn = cache.get(&fp).expect("cache should contain inserted turn").clone();
+        let turn = cache
+            .get(&fp)
+            .expect("cache should contain inserted turn")
+            .clone();
         assert!(turn.reasoning.is_some(), "reasoning should be Some");
         assert!(turn.content.is_some(), "content should be Some");
         assert_eq!(turn.reasoning.unwrap().token_ids, vec![101, 102]);
@@ -41250,15 +41839,37 @@ mod glimmer_channel_recorder_tests {
         assert!(events.is_empty(), "header alone should emit nothing");
         let (events, _) = router.push(atem);
         // Tool channel text must be Tool, not Token
-        let tool_text: String = events.iter().filter_map(|e| match e { GlimmerEmit::Tool(s) => Some(s.as_str()), _ => None }).collect();
-        let token_text: String = events.iter().filter_map(|e| match e { GlimmerEmit::Token(s) => Some(s.as_str()), _ => None }).collect();
-        assert!(token_text.is_empty(), "tool envelope must produce zero visible Token events, got {:?}", token_text);
-        assert!(!tool_text.is_empty(), "tool envelope should produce Tool events");
+        let tool_text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                GlimmerEmit::Tool(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        let token_text: String = events
+            .iter()
+            .filter_map(|e| match e {
+                GlimmerEmit::Token(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            token_text.is_empty(),
+            "tool envelope must produce zero visible Token events, got {:?}",
+            token_text
+        );
+        assert!(
+            !tool_text.is_empty(),
+            "tool envelope should produce Tool events"
+        );
         // Accumulated tool body should parse to one call
         let calls = parse_glimmer_atem(&tool_text).expect("parse should succeed");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "weather.get_forecast");
-        assert_eq!(calls[0].arguments["location"], serde_json::Value::String("Paris".into()));
+        assert_eq!(
+            calls[0].arguments["location"],
+            serde_json::Value::String("Paris".into())
+        );
     }
 }
 
@@ -41272,10 +41883,22 @@ mod glimmer_atem_parser_tests {
         let calls = parse_glimmer_atem(body).expect("parse should succeed");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "weather.get_forecast");
-        assert_eq!(calls[0].arguments["location"], serde_json::Value::String("Paris".into()));
-        assert_eq!(calls[0].arguments["options"]["units"], serde_json::Value::String("celsius".into()));
-        assert_eq!(calls[0].arguments["options"]["days"], serde_json::json!([1,2]));
-        assert_eq!(calls[0].arguments["include_alerts"], serde_json::Value::Bool(true));
+        assert_eq!(
+            calls[0].arguments["location"],
+            serde_json::Value::String("Paris".into())
+        );
+        assert_eq!(
+            calls[0].arguments["options"]["units"],
+            serde_json::Value::String("celsius".into())
+        );
+        assert_eq!(
+            calls[0].arguments["options"]["days"],
+            serde_json::json!([1, 2])
+        );
+        assert_eq!(
+            calls[0].arguments["include_alerts"],
+            serde_json::Value::Bool(true)
+        );
         assert_eq!(calls[0].arguments["fallback"], serde_json::Value::Null);
     }
 
@@ -41283,7 +41906,9 @@ mod glimmer_atem_parser_tests {
     fn parses_adversarial_chunk_splits() {
         let body = "<atem:function_calls>\n<atem:invoke name=\"test.func\">\n<atem:parameter name=\"a\">1</atem:parameter>\n<atem:parameter name=\"b\">{\"x\":1}</atem:parameter>\n</atem:invoke>\n</atem:function_calls>";
         for split in 1..body.len() {
-            if !body.is_char_boundary(split) { continue; }
+            if !body.is_char_boundary(split) {
+                continue;
+            }
             let (left, right) = body.split_at(split);
             let combined = left.to_string() + right;
             let calls = parse_glimmer_atem(&combined).expect("should parse after split");
@@ -41292,7 +41917,10 @@ mod glimmer_atem_parser_tests {
         }
         let body2 = "<atem:function_calls>\n<atem:invoke name=\"test.func\">\n<atem:parameter name=\"msg\">hello \u{1F30D}</atem:parameter>\n</atem:invoke>\n</atem:function_calls>";
         let calls2 = parse_glimmer_atem(body2).expect("should parse multibyte");
-        assert_eq!(calls2[0].arguments["msg"], serde_json::Value::String("hello \u{1F30D}".into()));
+        assert_eq!(
+            calls2[0].arguments["msg"],
+            serde_json::Value::String("hello \u{1F30D}".into())
+        );
     }
 
     #[test]
@@ -41352,33 +41980,37 @@ mod glimmer_reconcile_tests {
     }
     #[test]
     fn mirror_action_truncate() {
-        assert_eq!(glimmer_mirror_action(5, 3), GlimmerMirrorAction::TruncateMirror(3));
-        assert_eq!(glimmer_mirror_action(10, 0), GlimmerMirrorAction::TruncateMirror(0));
+        assert_eq!(
+            glimmer_mirror_action(5, 3),
+            GlimmerMirrorAction::TruncateMirror(3)
+        );
+        assert_eq!(
+            glimmer_mirror_action(10, 0),
+            GlimmerMirrorAction::TruncateMirror(0)
+        );
     }
     #[test]
     fn mirror_action_rollback() {
-        assert_eq!(glimmer_mirror_action(3, 5), GlimmerMirrorAction::RollbackCursor(3));
-        assert_eq!(glimmer_mirror_action(0, 5), GlimmerMirrorAction::RollbackCursor(0));
+        assert_eq!(
+            glimmer_mirror_action(3, 5),
+            GlimmerMirrorAction::RollbackCursor(3)
+        );
+        assert_eq!(
+            glimmer_mirror_action(0, 5),
+            GlimmerMirrorAction::RollbackCursor(0)
+        );
     }
-    #[test]
-    fn hidden_keep_len_aligned_truncate() {
-        assert_eq!(glimmer_hidden_keep_len(50, 5, 3), Some(30));
-        assert_eq!(glimmer_hidden_keep_len(0, 5, 3), None);
-        assert_eq!(glimmer_hidden_keep_len(51, 5, 3), None);
-        assert_eq!(glimmer_hidden_keep_len(50, 0, 3), None);
-    }
-    #[test]
-    fn hidden_keep_len_rollback() {
-        assert_eq!(glimmer_hidden_keep_len(50, 5, 3), Some(30));
-        assert_eq!(glimmer_hidden_keep_len(30, 3, 3), Some(30));
-    }
+    // glimmer_hidden_keep_len removed with device-capture session API cutover.
     #[test]
     fn glimmer_turn_key_ordinal_salts() {
         let fp = asst_turn_fingerprint("Done.", &[]);
         let k0 = glimmer_turn_key(fp, 0);
         let k1 = glimmer_turn_key(fp, 1);
         let k2 = glimmer_turn_key(fp, 2);
-        assert_ne!(k0, k1, "identical content at different ordinals must have different keys");
+        assert_ne!(
+            k0, k1,
+            "identical content at different ordinals must have different keys"
+        );
         assert_ne!(k1, k2);
         assert_ne!(k0, k2);
         assert_eq!(k0, glimmer_turn_key(fp, 0));
@@ -41398,13 +42030,19 @@ mod glimmer_history_prep_tests {
     #[test]
     fn normalize_arguments_null() {
         let v = serde_json::Value::Null;
-        assert_eq!(normalize_glimmer_tool_arguments(&v).unwrap(), serde_json::json!({}));
+        assert_eq!(
+            normalize_glimmer_tool_arguments(&v).unwrap(),
+            serde_json::json!({})
+        );
     }
 
     #[test]
     fn normalize_arguments_string_object() {
         let v = serde_json::Value::String("{\"a\":1}".into());
-        assert_eq!(normalize_glimmer_tool_arguments(&v).unwrap(), serde_json::json!({"a":1}));
+        assert_eq!(
+            normalize_glimmer_tool_arguments(&v).unwrap(),
+            serde_json::json!({"a":1})
+        );
     }
 
     #[test]
@@ -41427,7 +42065,12 @@ mod glimmer_history_prep_tests {
             reasoning_content: None,
             name: None,
             rendered_name: None,
-            tool_calls: vec![hipfire_runtime::prompt_frame::ToolCall { id: Some("call_0".into()), name: "weather.get_forecast".into(), arguments: serde_json::json!({"location":"Paris"}), rendered_body: None }],
+            tool_calls: vec![hipfire_runtime::prompt_frame::ToolCall {
+                id: Some("call_0".into()),
+                name: "weather.get_forecast".into(),
+                arguments: serde_json::json!({"location":"Paris"}),
+                rendered_body: None,
+            }],
             tool_call_id: None,
             tool_plan: String::new(),
         };
