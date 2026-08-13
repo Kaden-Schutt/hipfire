@@ -212,12 +212,20 @@ impl SlotDriver {
             hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
                 .map_err(|e| anyhow::anyhow!("slots: tokenizer: {e}"))?;
         drop(hfq);
+        // Host swap budget is deliberately SMALL here, unlike the serve
+        // default of 16 GiB. A sweep opens a fresh session per stream per run
+        // and the engine keeps finished sessions resident for multi-turn
+        // reuse, so evicted snapshots are the one thing that grows without
+        // bound over a long sweep. On a box with no swap, letting that reach
+        // 16 GiB of host RAM is how a benchmark takes the machine down.
+        // Beyond this budget the swap manager spills to disk, which is the
+        // correct trade for a throughput measurement.
         let engine = hipfire_arch_qwen35::serve_engine::SlotEngine::spawn(
             hipfire_arch_qwen35::serve_engine::EngineConfig {
                 model_path: model.to_path_buf(),
                 n_slots: max_concurrency,
                 cap_tokens,
-                host_budget_bytes: 16 * 1024 * 1024 * 1024,
+                host_budget_bytes: 2 * 1024 * 1024 * 1024,
                 swap_dir: std::env::temp_dir().join("hipfire-bench-swap"),
             },
         )
@@ -381,6 +389,34 @@ impl DaemonDriver {
     /// `capable` is the daemon's own `continuous_batch_capable` from the load
     /// reply. Refusing here turns "this daemon cannot batch" into a reported
     /// result rather than a run that silently measures sequential execution.
+    ///
+    /// # Currently blocked on a client-side limitation
+    ///
+    /// Driving this backend needs several generates in flight at once, and
+    /// `hipfire_client::Engine` cannot express that. `Engine::spawn` starts a
+    /// reader thread (`hipfire-client/src/lib.rs:447`) that consumes ALL of
+    /// the daemon's stdout and routes each lifecycle frame to a channel keyed
+    /// by `(id, attempt_id)`; a frame whose key has no registered sender is
+    /// **silently dropped**. Registration happens only inside `generate`,
+    /// which is blocking and single-attempt, and the `pending` map is private.
+    ///
+    /// So a hand-rolled `send` × k followed by `recv` deadlocks: the daemon
+    /// generates, the reader thread bins every token and `done` for want of a
+    /// registered channel, and the driver waits forever. That was observed --
+    /// the daemon reported `continuous batch staged: slots=4` and then neither
+    /// side moved.
+    ///
+    /// Unblocking it needs ONE of:
+    ///   1. a public multi-inflight API on `Engine` (e.g. `submit_streaming(req)
+    ///      -> Receiver<Value>` that registers the pending channel and returns
+    ///      it), which is a small, genuinely reusable addition; or
+    ///   2. driving this backend over HTTP through `hipfire serve` with
+    ///      `serve.continuous_batch_size` set, as `scripts/serve_concurrency_gate.sh`
+    ///      does -- at the cost of folding HTTP into the measurement, which the
+    ///      spec deliberately excluded.
+    ///
+    /// Failing here is deliberate: a benchmark that hangs is worse than one
+    /// that says why it cannot run.
     pub fn start(
         engine: hipfire_client::Engine,
         max_concurrency: usize,
@@ -389,10 +425,13 @@ impl DaemonDriver {
         if !capable {
             bail!("daemon does not advertise continuous_batch_capable");
         }
-        Ok(Self {
-            engine,
-            max_concurrency,
-        })
+        let _ = (&engine, max_concurrency);
+        bail!(
+            "hipfire_client::Engine has no public multi-inflight API: its reader thread \
+             drops lifecycle frames for unregistered (id, attempt_id) keys, so pipelined \
+             generates deadlock. Needs Engine::submit_streaming or an HTTP driver — see \
+             DaemonDriver::start docs"
+        );
     }
 }
 
@@ -433,6 +472,26 @@ impl ConcurrencyBackend for DaemonDriver {
                 .map_err(|e| anyhow::anyhow!("batch recv: {e}"))?;
             match frame.get("type").and_then(serde_json::Value::as_str) {
                 Some("token") => tokens += 1,
+                // The daemon stages a turn and WAITS for the client to commit
+                // it before sending `done`. `Engine::generate` performs this
+                // handshake internally; a hand-rolled send/recv pipeline must
+                // do it explicitly or both sides block forever -- the daemon
+                // holding a staged turn, the driver waiting for a `done` that
+                // will never come. Echo id/attempt_id back so the daemon can
+                // match the commit to the right in-flight request.
+                Some("commit_ready") => {
+                    let commit = serde_json::json!({
+                        "type": "commit",
+                        "id": frame.get("id").cloned().unwrap_or(serde_json::Value::Null),
+                        "attempt_id": frame
+                            .get("attempt_id")
+                            .cloned()
+                            .unwrap_or(serde_json::json!(1)),
+                    });
+                    self.engine
+                        .send(&commit)
+                        .map_err(|e| anyhow::anyhow!("batch commit: {e}"))?;
+                }
                 Some("done") => done += 1,
                 Some("error") => {
                     rejected += 1;

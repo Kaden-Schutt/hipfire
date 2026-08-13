@@ -7188,7 +7188,10 @@ fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Res
         let registry = load_registry(&paths.registry).registry;
         let model_path = find_model_path(paths, &registry, &args.model)
             .ok_or_else(|| anyhow!("model not found: {}", args.model))?;
-        match SlotDriver::start(&model_path, max_k, 8192) {
+        // 2048-token slots, not the serve default of 8192: the sweep's prompts
+        // are one short turn and --max-tokens is small, so a larger arena buys
+        // nothing and multiplies per-slot KV by four.
+        match SlotDriver::start(&model_path, max_k, 2048) {
             Ok(mut d) => {
                 eprintln!("  slots backend up ({max_k} slots)");
                 let r = sweep_backend(

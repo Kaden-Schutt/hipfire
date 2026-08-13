@@ -213,3 +213,54 @@ run this model" is exactly the kind of finding this tool exists to surface.
   comment, contradicted by the same file's module doc.
 - Measured curve, gfx1151, 3 interleaved rounds, medians:
   1 slot 64.71 · 2 slots 80.15 · 3 slots 97.07 · 4 slots 116.23 tok/s.
+
+## Results — 2026-08-13, gfx1151, `qwen3.6-35b-a3b.mq4r`
+
+`hipfire bench qwen3.6:35b-a3b-mq4r --concurrency 1,2,3,4 --runs 3
+--max-tokens 64 --backend slots`, medians of 3 interleaved rounds:
+
+| workload | k=1 | k=2 | k=3 | k=4 |
+|---|---|---|---|---|
+| stateless | 33.55 | 57.08 | 70.14 | **84.69** |
+| multiturn | 36.17 | 59.41 | 66.11 | **76.19** |
+
+Prefix hits were 3 / 6 / 9 / 12 — exactly `k` per run across 3 runs — so every
+multi-turn stream reused its session KV. Zero `[invalid]` arms, zero rejections.
+
+**These are NOT comparable to the 64.71–116.23 figures above.** `ArmResult`
+measures wall clock from first submit to last completion, so prefill, session
+setup and the second turn are all inside the denominator; the earlier numbers
+are `demo_multislot_generate`'s decode-only `ms/step`. Both are internally
+consistent; only compare within a table. The shape is what carries: throughput
+rises monotonically to k=4 in both arms.
+
+The multi-turn arm is *lower* than stateless at k≥3 despite reusing KV, because
+it runs two turns per sample and pays a second prefill and scheduling round.
+Reuse makes turn 2 cheaper than a cold render, not free.
+
+### The batch backend is NOT measured
+
+`--backend batch` cannot run. `hipfire_client::Engine` has no public
+multi-inflight API: its reader thread drops lifecycle frames whose
+`(id, attempt_id)` has no registered channel, registration happens only inside
+the blocking single-attempt `generate`, and the `pending` map is private. A
+pipelined `send`×k then `recv` therefore deadlocks — observed twice, with the
+daemon reporting `continuous batch staged: slots=4` and neither side moving.
+`DaemonDriver::start` now fails with that explanation instead of hanging.
+
+Unblocking needs either a public `Engine::submit_streaming` returning a
+registered receiver, or an HTTP driver through `hipfire serve` (folding HTTP
+into the measurement, which this spec deliberately excluded). Until then the
+two backends cannot be compared, and the question that motivated this work —
+whether `SlotEngine` beats beta's continuous batching — remains open.
+
+### Operational note
+
+The first end-to-end attempt exhausted host RAM. `bench_concurrency_command`
+held the slots engine resident while the daemon loaded a second copy of the
+weights. Fixed in `bfc4dca9a` (scoped drop plus `preflight_headroom_for_model`).
+The sweep's `cap_tokens` is 2048 and its host swap budget 2 GiB — both smaller
+than the serve defaults (8192 / 16 GiB), because a sweep opens a fresh session
+per stream per run and the engine keeps finished sessions resident for reuse.
+Peak host usage for a slots-only sweep is ~88 GB of 125 GB; run it under a
+memory watchdog.
