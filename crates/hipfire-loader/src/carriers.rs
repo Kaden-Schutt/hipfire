@@ -1836,12 +1836,20 @@ impl Carrier for MuseGlimmerCarrier {
                 let weights = hipfire_arch_muse_glimmer::glimmer::GlimmerWeights::load(
                     &hfq, &config, ctx.gpu,
                 )?;
-                let mut state = hipfire_arch_muse_glimmer::glimmer::GlimmerState::new_with_max_seq(
-                    ctx.gpu,
-                    &config,
-                    ctx.max_seq,
-                )
-                .map_err(|e| format!("muse_glimmer: GlimmerState::new_with_max_seq failed: {e}"))?;
+                let mut state =
+                    match hipfire_arch_muse_glimmer::glimmer::GlimmerState::new_with_max_seq(
+                        ctx.gpu,
+                        &config,
+                        ctx.max_seq,
+                    ) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            weights.free_gpu(ctx.gpu);
+                            return Err(format!(
+                                "muse_glimmer: GlimmerState::new_with_max_seq failed: {e}"
+                            ));
+                        }
+                    };
                 // eos resolution by name with 200001 as the documented fallback.
                 // 200001 is Glimmer's eos_token_id (config.eos_token, bos 200000).
                 // Try tokenizer encode of common EOS surface forms first; if none
@@ -1916,13 +1924,18 @@ impl Carrier for MuseGlimmerCarrier {
                             requested.clamp(1, ctx.max_seq)
                         };
                         let dscratch =
-                            hipfire_arch_muse_glimmer::drafter::GlimmerDrafterScratch::new(
+                            match hipfire_arch_muse_glimmer::drafter::GlimmerDrafterScratch::new(
                                 ctx.gpu,
                                 &dcfg,
                                 ctx.max_seq,
                                 ctx_cap,
-                            )
-                            .map_err(|e| format!("glimmer drafter scratch: {e}"))?;
+                            ) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    dweights.free_gpu(ctx.gpu);
+                                    return Err(format!("glimmer drafter scratch: {e}"));
+                                }
+                            };
                         eprintln!(
                             "  glimmer DFlash drafter loaded: {} (layers={}, hidden={}, block={}, mask={}, ctx_cap={})",
                             dp, dcfg.n_layers, dcfg.hidden, dcfg.block_size, dcfg.mask_token_id, ctx_cap
@@ -1994,7 +2007,18 @@ impl Carrier for MuseGlimmerCarrier {
                     ctx.spec,
                 );
                 let chat_template = match meta.chat_template {
-                    Some(t) => Some(crate::rewrite_muse_glimmer_onyx_template(&t)?),
+                    Some(t) => match crate::rewrite_muse_glimmer_onyx_template(&t) {
+                        Ok(rewritten) => Some(rewritten),
+                        Err(e) => {
+                            state.free_gpu(ctx.gpu);
+                            weights.free_gpu(ctx.gpu);
+                            if let Some(d) = drafter {
+                                d.scratch.free_gpu(ctx.gpu);
+                                d.weights.free_gpu(ctx.gpu);
+                            }
+                            return Err(e);
+                        }
+                    },
                     None => None,
                 };
                 Ok(LoadedModel {

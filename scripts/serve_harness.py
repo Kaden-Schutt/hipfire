@@ -1262,13 +1262,39 @@ def _self_test_mtp_ngram_config():
 
 
 def _self_test_glimmer_feedback_shape():
-    """GPU-free coverage for Glimmer feedback shapes (rich vs plain)."""
-    rich = _assistant_feedback({"content": "answer", "reasoning_content": "think", "tool_calls": [{"id": "call_0", "type": "function", "function": {"name": "weather.get_forecast", "arguments": "{\"location\":\"Paris\"}"}}]}, "rich")
-    assert rich["role"] == "assistant"
-    assert rich["content"] == "answer"
-    assert rich["reasoning_content"] == "think"
-    assert rich["tool_calls"][0]["function"]["name"] == "weather.get_forecast"
-    plain = _assistant_feedback({"content": "answer", "reasoning_content": "think", "tool_calls": [{"id": "call_0", "type": "function", "function": {"name": "weather.get_forecast", "arguments": "{}"}}]}, "plain")
+    """GPU-free coverage for Glimmer feedback shapes (rich default vs plain)."""
+    sample = {
+        "content": "answer",
+        "reasoning_content": "think",
+        "tool_calls": [{
+            "id": "call_0",
+            "type": "function",
+            "function": {
+                "name": "weather.get_forecast",
+                "arguments": "{\"location\":\"Paris\"}",
+            },
+        }],
+    }
+    # Implicit/default shape must retain OpenAI-rich history (reasoning + tool_calls).
+    defaulted = _assistant_feedback(sample, None)
+    assert defaulted["role"] == "assistant"
+    assert defaulted["content"] == "answer"
+    assert defaulted["reasoning_content"] == "think"
+    assert defaulted["tool_calls"][0]["function"]["name"] == "weather.get_forecast"
+    rich = _assistant_feedback(sample, "rich")
+    assert rich == defaulted
+    plain = _assistant_feedback(
+        {
+            "content": "answer",
+            "reasoning_content": "think",
+            "tool_calls": [{
+                "id": "call_0",
+                "type": "function",
+                "function": {"name": "weather.get_forecast", "arguments": "{}"},
+            }],
+        },
+        "plain",
+    )
     assert plain["role"] == "assistant"
     assert plain["content"] == "answer"
     assert "reasoning_content" not in plain
@@ -1276,8 +1302,10 @@ def _self_test_glimmer_feedback_shape():
     assert _assistant_feedback({"content": "a", "reasoning_content": "r"}, "reasoning-content")["reasoning_content"] == "r"
     assert "reasoning_content" not in _assistant_feedback({"content": "a", "reasoning_content": "r"}, "content-only")
     assert _assistant_feedback({"content": "a", "reasoning_content": "r"}, "content_only")["content"] == "a"
+    tr_default = _tool_result_feedback("call_0", "result", None, name="weather.get_forecast")
+    assert tr_default["tool_call_id"] == "call_0" and tr_default["name"] == "weather.get_forecast"
     tr_rich = _tool_result_feedback("call_0", "result", "rich", name="weather.get_forecast")
-    assert tr_rich["tool_call_id"] == "call_0" and tr_rich["name"] == "weather.get_forecast"
+    assert tr_rich == tr_default
     tr_plain = _tool_result_feedback("call_0", "result", "plain", name="weather.get_forecast")
     assert tr_plain["tool_call_id"] == "call_0" and "name" not in tr_plain
     print("serve_harness: glimmer-feedback-shape self-test OK", flush=True)
@@ -1549,16 +1577,18 @@ def _merge_tool_call_deltas(acc, deltas):
                 entry["function"]["arguments"] += func["arguments"]
 
 
-def _assistant_feedback(result, feedback_shape):
+def _assistant_feedback(result, feedback_shape=None):
     """Build an assistant history message respecting ``feedback_shape``.
 
-    - ``rich`` / ``reasoning-content``: includes ``reasoning_content`` when non-empty
-      and includes structured ``tool_calls`` when present.
-    - ``plain`` / ``content-only``: ``{role, content}`` only (dumb client path).
-    Both shapes are exercised by the gate.
-    Mirrors ``scripts/dump_corpus_openai_multiturn.py:267-294`` for the rich path.
+    - ``rich`` / ``reasoning-content`` (default): includes ``reasoning_content`` when
+      non-empty and includes structured ``tool_calls`` when present. Mirrors
+      ``scripts/dump_corpus_openai_multiturn.py:267-294``.
+    - ``plain`` / ``content-only``: intentionally lossy ``{role, content}`` only.
+      Drops ``reasoning_content`` and structured ``tool_calls``; appropriate only
+      when no structured tool round-trip is required. A plain client cannot recover
+      omitted tool-call identity from content alone.
     """
-    shape = (feedback_shape or "plain").lower().replace("-", "_")
+    shape = (feedback_shape or "rich").lower().replace("-", "_")
     rich = shape in ("rich", "reasoning_content")
     # content fallback: prefer explicit ``content`` field, else legacy ``assistant_content``
     content = result.get("content")
@@ -1569,8 +1599,8 @@ def _assistant_feedback(result, feedback_shape):
     if rich and tcs:
         # Preserve nested OpenAI shape {id, type, function:{name, arguments}}
         msg["tool_calls"] = tcs
-    elif tcs and rich is False:
-        # plain omits tool_calls structurally; dumb client still works via server recovery
+    elif tcs and not rich:
+        # plain intentionally omits tool_calls; lossy, no server-side identity recovery
         pass
     if rich:
         rc = result.get("reasoning_content")
@@ -1579,16 +1609,17 @@ def _assistant_feedback(result, feedback_shape):
     return msg
 
 
-def _tool_result_feedback(tool_call_id, content, feedback_shape, name=None):
+def _tool_result_feedback(tool_call_id, content, feedback_shape=None, name=None):
     """Build a tool-result history message.
 
-    Rich echoes ``tool_call_id`` + ``name``; plain echoes only ``{role, content}``
-    plus ``tool_call_id`` for routing (tool_call_id is required for id lookup).
+    Rich (default) echoes ``tool_call_id`` + ``name``; plain echoes only
+    ``{role, content}`` plus ``tool_call_id`` for routing (``tool_call_id`` is
+    required for id lookup). Plain is intentionally lossy for optional ``name``.
     The gate's structured Glimmer fixture deliberately omits ``name`` on the
     request payload so Slice E's id->name lookup is exercised; this helper
     respects the shape but the structured runner overrides to omit name there.
     """
-    shape = (feedback_shape or "plain").lower().replace("-", "_")
+    shape = (feedback_shape or "rich").lower().replace("-", "_")
     rich = shape in ("rich", "reasoning_content")
     msg = {"role": "tool", "tool_call_id": tool_call_id, "content": content}
     if rich and name:
@@ -1737,7 +1768,7 @@ def _run_glimmer_cache_tool_session(cfg, args, scenario):
     Uses identical ``tools`` on every request so the system tool-def block cannot shift.
     Asserts per-row invariants: finish, tool_calls, ATEM leak, forward extension.
     """
-    feedback_shape = getattr(args, "feedback_shape", "plain") or "plain"
+    feedback_shape = getattr(args, "feedback_shape", None) or "rich"
     tools = scenario.get("tools") or []
     turns = scenario.get("turns") or []
     # Tool result content: explicit at scenario level or third turn's content
@@ -1969,7 +2000,7 @@ def run(cfg, args):
     label = f"{os.path.basename(cfg['model'])}|{cfg['mtp']}|{cfg['mode']}"
     print(f"### RUN {label}  kv={cfg['kv']} sampling={cfg['sampling']} seed={cfg.get('seed')} ###", flush=True)
     rows = []
-    feedback_shape = getattr(args, "feedback_shape", "plain") or "plain"
+    feedback_shape = getattr(args, "feedback_shape", None) or "rich"
     battery = load_prompt_battery(
         cfg.get("prompts_file"), cfg.get("prompt_file"), cfg.get("niah_file")
     )
@@ -2255,9 +2286,13 @@ def main():
     )
     ap.add_argument(
         "--feedback-shape",
-        default="plain",
+        default="rich",
         choices=["plain", "rich", "content-only", "reasoning-content", "content_only", "reasoning_content"],
-        help="Assistant history feedback shape for multi-turn: 'plain' (content-only, dumb client) vs 'rich' (reasoning_content + tool_calls). Both shapes exercised by gate; rich mirrors dump_corpus_openai_multiturn.py:267-294. Aliases content-only/reasoning-content accepted.",
+        help="Assistant history feedback shape for multi-turn (default: rich). "
+             "'rich' keeps reasoning_content + structured tool_calls (OpenAI history). "
+             "'plain'/'content-only' is intentionally lossy content-only history — drops "
+             "reasoning and tool-call identity; use only when no structured tool round-trip "
+             "is required. Aliases content-only/reasoning-content accepted.",
     )
     ap.add_argument(
         "--compare-transcript",

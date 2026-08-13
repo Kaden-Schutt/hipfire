@@ -1179,149 +1179,415 @@ pub struct GlimmerWeights {
 
 impl GlimmerWeights {
     pub fn load(hfq: &HfqFile, cfg: &GlimmerConfig, gpu: &mut Gpu) -> Result<Self, String> {
+        struct PendingLayer {
+            input_layernorm: Option<GpuTensor>,
+            post_attention_layernorm: Option<GpuTensor>,
+            pre_feedforward_layernorm: Option<GpuTensor>,
+            post_feedforward_layernorm: Option<GpuTensor>,
+            attn_gate_proj: Option<WeightTensor>,
+            q_proj: Option<WeightTensor>,
+            k_proj: Option<WeightTensor>,
+            v_proj: Option<WeightTensor>,
+            o_proj: Option<WeightTensor>,
+            gate_proj: Option<WeightTensor>,
+            up_proj: Option<WeightTensor>,
+            down_proj: Option<WeightTensor>,
+        }
+        impl PendingLayer {
+            fn cleanup(&mut self, gpu: &mut Gpu) {
+                if let Some(t) = self.input_layernorm.take() {
+                    let _ = gpu.free_tensor(t);
+                }
+                if let Some(t) = self.post_attention_layernorm.take() {
+                    let _ = gpu.free_tensor(t);
+                }
+                if let Some(t) = self.pre_feedforward_layernorm.take() {
+                    let _ = gpu.free_tensor(t);
+                }
+                if let Some(t) = self.post_feedforward_layernorm.take() {
+                    let _ = gpu.free_tensor(t);
+                }
+                if let Some(w) = self.attn_gate_proj.take() {
+                    w.free_all(gpu);
+                }
+                if let Some(w) = self.q_proj.take() {
+                    w.free_all(gpu);
+                }
+                if let Some(w) = self.k_proj.take() {
+                    w.free_all(gpu);
+                }
+                if let Some(w) = self.v_proj.take() {
+                    w.free_all(gpu);
+                }
+                if let Some(w) = self.o_proj.take() {
+                    w.free_all(gpu);
+                }
+                if let Some(w) = self.gate_proj.take() {
+                    w.free_all(gpu);
+                }
+                if let Some(w) = self.up_proj.take() {
+                    w.free_all(gpu);
+                }
+                if let Some(w) = self.down_proj.take() {
+                    w.free_all(gpu);
+                }
+            }
+        }
+        struct WeightsLoadGuard {
+            embed: Option<GpuTensor>,
+            lm_head: Option<WeightTensor>,
+            final_norm: Option<GpuTensor>,
+            layers: Vec<GlimmerLayerWeights>,
+        }
+        impl WeightsLoadGuard {
+            fn cleanup(&mut self, gpu: &mut Gpu) {
+                if let Some(t) = self.embed.take() {
+                    let _ = gpu.free_tensor(t);
+                }
+                if let Some(w) = self.lm_head.take() {
+                    w.free_all(gpu);
+                }
+                if let Some(t) = self.final_norm.take() {
+                    let _ = gpu.free_tensor(t);
+                }
+                for l in self.layers.drain(..) {
+                    let _ = gpu.free_tensor(l.input_layernorm);
+                    let _ = gpu.free_tensor(l.post_attention_layernorm);
+                    let _ = gpu.free_tensor(l.pre_feedforward_layernorm);
+                    let _ = gpu.free_tensor(l.post_feedforward_layernorm);
+                    l.attn_gate_proj.free_all(gpu);
+                    l.q_proj.free_all(gpu);
+                    l.k_proj.free_all(gpu);
+                    l.v_proj.free_all(gpu);
+                    l.o_proj.free_all(gpu);
+                    l.gate_proj.free_all(gpu);
+                    l.up_proj.free_all(gpu);
+                    l.down_proj.free_all(gpu);
+                }
+            }
+        }
         let dim = cfg.dim;
         let q_dim = cfg.q_dim();
         let kv_dim = cfg.kv_dim();
         let hidden_dim = cfg.hidden_dim;
-
+        let mut guard = WeightsLoadGuard {
+            embed: None,
+            lm_head: None,
+            final_norm: None,
+            layers: Vec::with_capacity(cfg.n_layers),
+        };
         // ── Embedding ──────────────────────────────────────────────────
         let embed_name = "model.language_model.embed_tokens.weight";
         let (embed_info, embed_data) = hfq
             .tensor_data(embed_name)
             .ok_or_else(|| "glimmer: embed_tokens not found in HFQ".to_string())?;
-        let (embed_tokens, embd_format) = match embed_info.quant_type {
-            3 => (
-                gpu.upload_raw(embed_data, &[embed_data.len()])
-                    .map_err(|e| format!("glimmer: upload embed: {e:?}"))?,
-                EmbeddingFormat::Q8_0,
-            ),
-            6 => (
-                gpu.upload_raw(embed_data, &[embed_data.len()])
-                    .map_err(|e| format!("glimmer: upload embed: {e:?}"))?,
-                EmbeddingFormat::HFQ4G256,
-            ),
-            7 => (
-                gpu.upload_raw(embed_data, &[embed_data.len()])
-                    .map_err(|e| format!("glimmer: upload embed: {e:?}"))?,
-                EmbeddingFormat::HFQ4G128,
-            ),
+        let embd_format: EmbeddingFormat;
+        match embed_info.quant_type {
+            3 => {
+                let t = match gpu.upload_raw(embed_data, &[embed_data.len()]) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        guard.cleanup(gpu);
+                        return Err(format!("glimmer: upload embed: {e:?}"));
+                    }
+                };
+                guard.embed = Some(t);
+                embd_format = EmbeddingFormat::Q8_0;
+            }
+            6 => {
+                let t = match gpu.upload_raw(embed_data, &[embed_data.len()]) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        guard.cleanup(gpu);
+                        return Err(format!("glimmer: upload embed: {e:?}"));
+                    }
+                };
+                guard.embed = Some(t);
+                embd_format = EmbeddingFormat::HFQ4G256;
+            }
+            7 => {
+                let t = match gpu.upload_raw(embed_data, &[embed_data.len()]) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        guard.cleanup(gpu);
+                        return Err(format!("glimmer: upload embed: {e:?}"));
+                    }
+                };
+                guard.embed = Some(t);
+                embd_format = EmbeddingFormat::HFQ4G128;
+            }
             1 => {
                 let f32_data: Vec<f32> = embed_data
                     .chunks_exact(2)
                     .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
                     .collect();
-                (
-                    gpu.upload_f32(&f32_data, &[cfg.vocab_size, dim])
-                        .map_err(|e| format!("glimmer: upload embed f32: {e:?}"))?,
-                    EmbeddingFormat::F32,
-                )
+                let t = match gpu.upload_f32(&f32_data, &[cfg.vocab_size, dim]) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        guard.cleanup(gpu);
+                        return Err(format!("glimmer: upload embed f32: {e:?}"));
+                    }
+                };
+                guard.embed = Some(t);
+                embd_format = EmbeddingFormat::F32;
             }
             2 => {
                 let f32_data: Vec<f32> = embed_data
                     .chunks_exact(4)
                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                     .collect();
-                (
-                    gpu.upload_f32(&f32_data, &[cfg.vocab_size, dim])
-                        .map_err(|e| format!("glimmer: upload embed f32: {e:?}"))?,
-                    EmbeddingFormat::F32,
-                )
+                let t = match gpu.upload_f32(&f32_data, &[cfg.vocab_size, dim]) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        guard.cleanup(gpu);
+                        return Err(format!("glimmer: upload embed f32: {e:?}"));
+                    }
+                };
+                guard.embed = Some(t);
+                embd_format = EmbeddingFormat::F32;
             }
-            qt => return Err(format!("glimmer: unsupported embed quant_type {qt}")),
+            qt => {
+                return Err(format!("glimmer: unsupported embed quant_type {qt}"));
+            }
         };
-
         // ── Untied LM head ─────────────────────────────────────────────
-        // Separate tensor "lm_head.weight" [vocab, dim], not alias of embed.
-        let lm_head = load_wt(hfq, gpu, "lm_head.weight", cfg.vocab_size, dim)?;
-
+        let lm_head_val = match load_wt(hfq, gpu, "lm_head.weight", cfg.vocab_size, dim) {
+            Ok(w) => w,
+            Err(e) => {
+                guard.cleanup(gpu);
+                return Err(e);
+            }
+        };
+        guard.lm_head = Some(lm_head_val);
         // PLAIN norm: HF builds the final `norm` as MuseGlimmerRMSNorm
-        // (with_scale=True), NOT MuseGlimmerTextCenteredRMSNorm. Centering it
-        // shifts every logit and was a real bring-up bug.
-        let final_norm = load_norm_plain(hfq, gpu, "model.language_model.norm.weight", dim)?;
-
+        let final_norm_val =
+            match load_norm_plain(hfq, gpu, "model.language_model.norm.weight", dim) {
+                Ok(t) => t,
+                Err(e) => {
+                    guard.cleanup(gpu);
+                    return Err(e);
+                }
+            };
+        guard.final_norm = Some(final_norm_val);
         // ── Layers ─────────────────────────────────────────────────────
-        let mut layers = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
             let p = format!("model.language_model.layers.{i}");
-            layers.push(GlimmerLayerWeights {
-                input_layernorm: load_norm(hfq, gpu, &format!("{p}.input_layernorm.weight"), dim)?,
-                post_attention_layernorm: load_norm(
+            let mut cur = PendingLayer {
+                input_layernorm: None,
+                post_attention_layernorm: None,
+                pre_feedforward_layernorm: None,
+                post_feedforward_layernorm: None,
+                attn_gate_proj: None,
+                q_proj: None,
+                k_proj: None,
+                v_proj: None,
+                o_proj: None,
+                gate_proj: None,
+                up_proj: None,
+                down_proj: None,
+            };
+            cur.input_layernorm = Some(
+                match load_norm(hfq, gpu, &format!("{p}.input_layernorm.weight"), dim) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        cur.cleanup(gpu);
+                        guard.cleanup(gpu);
+                        return Err(e);
+                    }
+                },
+            );
+            cur.post_attention_layernorm = Some(
+                match load_norm(
                     hfq,
                     gpu,
                     &format!("{p}.post_attention_layernorm.weight"),
                     dim,
-                )?,
-                pre_feedforward_layernorm: load_norm(
+                ) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        cur.cleanup(gpu);
+                        guard.cleanup(gpu);
+                        return Err(e);
+                    }
+                },
+            );
+            cur.pre_feedforward_layernorm = Some(
+                match load_norm(
                     hfq,
                     gpu,
                     &format!("{p}.pre_feedforward_layernorm.weight"),
                     dim,
-                )?,
-                post_feedforward_layernorm: load_norm(
+                ) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        cur.cleanup(gpu);
+                        guard.cleanup(gpu);
+                        return Err(e);
+                    }
+                },
+            );
+            cur.post_feedforward_layernorm = Some(
+                match load_norm(
                     hfq,
                     gpu,
                     &format!("{p}.post_feedforward_layernorm.weight"),
                     dim,
-                )?,
-                attn_gate_proj: load_wt(
+                ) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        cur.cleanup(gpu);
+                        guard.cleanup(gpu);
+                        return Err(e);
+                    }
+                },
+            );
+            cur.attn_gate_proj = Some(
+                match load_wt(
                     hfq,
                     gpu,
                     &format!("{p}.self_attn.gate_proj.weight"),
                     q_dim,
                     dim,
-                )?,
-                q_proj: load_wt(
+                ) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        cur.cleanup(gpu);
+                        guard.cleanup(gpu);
+                        return Err(e);
+                    }
+                },
+            );
+            cur.q_proj = Some(
+                match load_wt(
                     hfq,
                     gpu,
                     &format!("{p}.self_attn.q_proj.weight"),
                     q_dim,
                     dim,
-                )?,
-                k_proj: load_wt(
+                ) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        cur.cleanup(gpu);
+                        guard.cleanup(gpu);
+                        return Err(e);
+                    }
+                },
+            );
+            cur.k_proj = Some(
+                match load_wt(
                     hfq,
                     gpu,
                     &format!("{p}.self_attn.k_proj.weight"),
                     kv_dim,
                     dim,
-                )?,
-                v_proj: load_wt(
+                ) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        cur.cleanup(gpu);
+                        guard.cleanup(gpu);
+                        return Err(e);
+                    }
+                },
+            );
+            cur.v_proj = Some(
+                match load_wt(
                     hfq,
                     gpu,
                     &format!("{p}.self_attn.v_proj.weight"),
                     kv_dim,
                     dim,
-                )?,
-                o_proj: load_wt(
+                ) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        cur.cleanup(gpu);
+                        guard.cleanup(gpu);
+                        return Err(e);
+                    }
+                },
+            );
+            cur.o_proj = Some(
+                match load_wt(
                     hfq,
                     gpu,
                     &format!("{p}.self_attn.o_proj.weight"),
                     dim,
                     q_dim,
-                )?,
-                gate_proj: load_wt(
+                ) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        cur.cleanup(gpu);
+                        guard.cleanup(gpu);
+                        return Err(e);
+                    }
+                },
+            );
+            cur.gate_proj = Some(
+                match load_wt(
                     hfq,
                     gpu,
                     &format!("{p}.mlp.gate_proj.weight"),
                     hidden_dim,
                     dim,
-                )?,
-                up_proj: load_wt(
+                ) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        cur.cleanup(gpu);
+                        guard.cleanup(gpu);
+                        return Err(e);
+                    }
+                },
+            );
+            cur.up_proj = Some(
+                match load_wt(
                     hfq,
                     gpu,
                     &format!("{p}.mlp.up_proj.weight"),
                     hidden_dim,
                     dim,
-                )?,
-                down_proj: load_wt(
+                ) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        cur.cleanup(gpu);
+                        guard.cleanup(gpu);
+                        return Err(e);
+                    }
+                },
+            );
+            cur.down_proj = Some(
+                match load_wt(
                     hfq,
                     gpu,
                     &format!("{p}.mlp.down_proj.weight"),
                     dim,
                     hidden_dim,
-                )?,
+                ) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        cur.cleanup(gpu);
+                        guard.cleanup(gpu);
+                        return Err(e);
+                    }
+                },
+            );
+            guard.layers.push(GlimmerLayerWeights {
+                input_layernorm: cur.input_layernorm.take().unwrap(),
+                post_attention_layernorm: cur.post_attention_layernorm.take().unwrap(),
+                pre_feedforward_layernorm: cur.pre_feedforward_layernorm.take().unwrap(),
+                post_feedforward_layernorm: cur.post_feedforward_layernorm.take().unwrap(),
+                attn_gate_proj: cur.attn_gate_proj.take().unwrap(),
+                q_proj: cur.q_proj.take().unwrap(),
+                k_proj: cur.k_proj.take().unwrap(),
+                v_proj: cur.v_proj.take().unwrap(),
+                o_proj: cur.o_proj.take().unwrap(),
+                gate_proj: cur.gate_proj.take().unwrap(),
+                up_proj: cur.up_proj.take().unwrap(),
+                down_proj: cur.down_proj.take().unwrap(),
             });
         }
-
+        let embed_tokens = guard.embed.take().expect("embed must be Some");
+        let lm_head = guard.lm_head.take().expect("lm_head must be Some");
+        let final_norm = guard.final_norm.take().expect("final_norm must be Some");
+        let layers = std::mem::take(&mut guard.layers);
         Ok(GlimmerWeights {
             embed_tokens,
             embd_format,
@@ -1457,8 +1723,125 @@ impl GlimmerState {
         cfg: &GlimmerConfig,
         max_seq: usize,
     ) -> Result<Self, String> {
+        struct StateGuard {
+            kv_sliding: Option<KvCache>,
+            kv_full: Option<KvCache>,
+            pos_buf: Option<hip_bridge::DeviceBuffer>,
+            qk_norm_ones: Option<GpuTensor>,
+            embed_norm_ones: Option<GpuTensor>,
+            x: Option<GpuTensor>,
+            residual: Option<GpuTensor>,
+            tmp: Option<GpuTensor>,
+            x_rot: Option<GpuTensor>,
+            q: Option<GpuTensor>,
+            k: Option<GpuTensor>,
+            v: Option<GpuTensor>,
+            attn_out: Option<GpuTensor>,
+            attn_gate: Option<GpuTensor>,
+            gate_ffn: Option<GpuTensor>,
+            up_ffn: Option<GpuTensor>,
+            ffn_hidden: Option<GpuTensor>,
+            ffn_out: Option<GpuTensor>,
+            logits: Option<GpuTensor>,
+            sample_out: Option<GpuTensor>,
+            logits_batch: Option<GpuTensor>,
+            argmax_batch: Option<GpuTensor>,
+        }
+        impl StateGuard {
+            fn cleanup(&mut self, gpu: &mut Gpu) {
+                if let Some(t) = self.argmax_batch.take() {
+                    let _ = gpu.release_tensor_immediate(t);
+                }
+                if let Some(t) = self.logits_batch.take() {
+                    let _ = gpu.release_tensor_immediate(t);
+                }
+                if let Some(t) = self.sample_out.take() {
+                    let _ = gpu.release_tensor_immediate(t);
+                }
+                if let Some(t) = self.logits.take() {
+                    let _ = gpu.release_tensor_immediate(t);
+                }
+                if let Some(t) = self.ffn_out.take() {
+                    let _ = gpu.release_tensor_immediate(t);
+                }
+                if let Some(t) = self.ffn_hidden.take() {
+                    let _ = gpu.release_tensor_immediate(t);
+                }
+                if let Some(t) = self.up_ffn.take() {
+                    let _ = gpu.release_tensor_immediate(t);
+                }
+                if let Some(t) = self.gate_ffn.take() {
+                    let _ = gpu.release_tensor_immediate(t);
+                }
+                if let Some(t) = self.attn_gate.take() {
+                    let _ = gpu.release_tensor_immediate(t);
+                }
+                if let Some(t) = self.attn_out.take() {
+                    let _ = gpu.release_tensor_immediate(t);
+                }
+                if let Some(t) = self.v.take() {
+                    let _ = gpu.release_tensor_immediate(t);
+                }
+                if let Some(t) = self.k.take() {
+                    let _ = gpu.release_tensor_immediate(t);
+                }
+                if let Some(t) = self.q.take() {
+                    let _ = gpu.release_tensor_immediate(t);
+                }
+                if let Some(t) = self.x_rot.take() {
+                    let _ = gpu.release_tensor_immediate(t);
+                }
+                if let Some(t) = self.tmp.take() {
+                    let _ = gpu.release_tensor_immediate(t);
+                }
+                if let Some(t) = self.residual.take() {
+                    let _ = gpu.release_tensor_immediate(t);
+                }
+                if let Some(t) = self.x.take() {
+                    let _ = gpu.release_tensor_immediate(t);
+                }
+                if let Some(t) = self.embed_norm_ones.take() {
+                    let _ = gpu.release_tensor_immediate(t);
+                }
+                if let Some(t) = self.qk_norm_ones.take() {
+                    let _ = gpu.release_tensor_immediate(t);
+                }
+                if let Some(b) = self.pos_buf.take() {
+                    let _ = gpu.hip.free(b);
+                }
+                if let Some(c) = self.kv_full.take() {
+                    let _ = c.free_gpu(gpu);
+                }
+                if let Some(c) = self.kv_sliding.take() {
+                    let _ = c.free_gpu(gpu);
+                }
+            }
+        }
         let dim = cfg.dim;
-
+        let mut guard = StateGuard {
+            kv_sliding: None,
+            kv_full: None,
+            pos_buf: None,
+            qk_norm_ones: None,
+            embed_norm_ones: None,
+            x: None,
+            residual: None,
+            tmp: None,
+            x_rot: None,
+            q: None,
+            k: None,
+            v: None,
+            attn_out: None,
+            attn_gate: None,
+            gate_ffn: None,
+            up_ffn: None,
+            ffn_hidden: None,
+            ffn_out: None,
+            logits: None,
+            sample_out: None,
+            logits_batch: None,
+            argmax_batch: None,
+        };
         // Two Q8 KV caches: one slot per layer of the matching type.
         // Both have identical head_dim=128 geometry; split is logical.
         //
@@ -1481,48 +1864,63 @@ impl GlimmerState {
         let use_vmm = std::env::var("HIPFIRE_GLIMMER_KV_VMM")
             .map(|v| v != "0" && !v.is_empty())
             .unwrap_or(true);
-        let (kv_sliding, kv_full) = if use_vmm {
+        if use_vmm {
             let sliding_layers = vec![true; cfg.n_sliding_layers()];
             let full_layers = vec![true; cfg.n_full_layers()];
-            let s = KvCache::new_gpu_q8_vmm_capped_filtered(
+            let s = match KvCache::new_gpu_q8_vmm_capped_filtered(
                 gpu,
                 &sliding_layers,
                 cfg.n_kv_heads,
                 cfg.head_dim,
                 max_seq,
                 max_seq,
-            )
-            .map_err(|e| format!("glimmer: sliding kv cache (vmm): {e:?}"))?;
-            let f = KvCache::new_gpu_q8_vmm_capped_filtered(
+            ) {
+                Ok(v) => v,
+                Err(e) => return Err(format!("glimmer: sliding kv cache (vmm): {e:?}")),
+            };
+            guard.kv_sliding = Some(s);
+            let f = match KvCache::new_gpu_q8_vmm_capped_filtered(
                 gpu,
                 &full_layers,
                 cfg.n_kv_heads,
                 cfg.head_dim,
                 max_seq,
                 max_seq,
-            )
-            .map_err(|e| format!("glimmer: full kv cache (vmm): {e:?}"))?;
-            (s, f)
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    guard.cleanup(gpu);
+                    return Err(format!("glimmer: full kv cache (vmm): {e:?}"));
+                }
+            };
+            guard.kv_full = Some(f);
         } else {
-            let s = KvCache::new_gpu_q8(
+            let s = match KvCache::new_gpu_q8(
                 gpu,
                 cfg.n_sliding_layers(),
                 cfg.n_kv_heads,
                 cfg.head_dim,
                 max_seq,
-            )
-            .map_err(|e| format!("glimmer: sliding kv cache: {e:?}"))?;
-            let f = KvCache::new_gpu_q8(
+            ) {
+                Ok(v) => v,
+                Err(e) => return Err(format!("glimmer: sliding kv cache: {e:?}")),
+            };
+            guard.kv_sliding = Some(s);
+            let f = match KvCache::new_gpu_q8(
                 gpu,
                 cfg.n_full_layers(),
                 cfg.n_kv_heads,
                 cfg.head_dim,
                 max_seq,
-            )
-            .map_err(|e| format!("glimmer: full kv cache: {e:?}"))?;
-            (s, f)
-        };
-
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    guard.cleanup(gpu);
+                    return Err(format!("glimmer: full kv cache: {e:?}"));
+                }
+            };
+            guard.kv_full = Some(f);
+        }
         // Per-layer slot mapping: sequential count within each type.
         let mut kv_slot_for_layer = Vec::with_capacity(cfg.n_layers);
         let mut s = 0usize;
@@ -1539,47 +1937,132 @@ impl GlimmerState {
                 }
             }
         }
-
         // FWHT sign LUT must exist before any fused_rmsnorm_rotate_mq
         // launch (the shared-rotation path). Mirrors gemma4's ensure at state init.
-        gpu.ensure_mq_signs()
-            .map_err(|e| format!("glimmer: ensure_mq_signs: {e:?}"))?;
-
-        let pos_buf = gpu
-            .hip
-            .malloc(4)
-            .map_err(|e| format!("glimmer: pos_buf malloc: {e:?}"))?;
-
-        let alloc = |g: &mut Gpu, n: usize, label: &str| -> Result<GpuTensor, String> {
-            g.zeros(&[n], DType::F32)
-                .map_err(|e| format!("glimmer: alloc {label}: {e:?}"))
+        if let Err(e) = gpu.ensure_mq_signs() {
+            guard.cleanup(gpu);
+            return Err(format!("glimmer: ensure_mq_signs: {e:?}"));
+        }
+        let pos_buf = match gpu.hip.malloc(4) {
+            Ok(v) => v,
+            Err(e) => {
+                guard.cleanup(gpu);
+                return Err(format!("glimmer: pos_buf malloc: {e:?}"));
+            }
         };
-
+        guard.pos_buf = Some(pos_buf);
         let q_dim = cfg.q_dim();
         let kv_dim = cfg.kv_dim();
         let hd = cfg.head_dim;
-
         // Ones for scale-less QK-norm.
-        let qk_norm_ones = alloc(gpu, hd, "qk_norm_ones")?;
+        let qk_t = match gpu.zeros(&[hd], DType::F32) {
+            Ok(v) => v,
+            Err(e) => {
+                guard.cleanup(gpu);
+                return Err(format!("glimmer: alloc qk_norm_ones: {e:?}"));
+            }
+        };
+        guard.qk_norm_ones = Some(qk_t);
         {
             let ones: Vec<f32> = vec![1.0; hd];
             let bytes: &[u8] =
                 unsafe { std::slice::from_raw_parts(ones.as_ptr() as *const u8, ones.len() * 4) };
-            gpu.hip
-                .memcpy_htod(&qk_norm_ones.buf, bytes)
-                .map_err(|e| format!("glimmer: init qk_norm_ones: {e:?}"))?;
+            if let Err(e) = gpu
+                .hip
+                .memcpy_htod(&guard.qk_norm_ones.as_ref().unwrap().buf, bytes)
+            {
+                guard.cleanup(gpu);
+                return Err(format!("glimmer: init qk_norm_ones: {e:?}"));
+            }
         }
-
-        let embed_norm_ones = alloc(gpu, dim, "embed_norm_ones")?;
+        let emb_t = match gpu.zeros(&[dim], DType::F32) {
+            Ok(v) => v,
+            Err(e) => {
+                guard.cleanup(gpu);
+                return Err(format!("glimmer: alloc embed_norm_ones: {e:?}"));
+            }
+        };
+        guard.embed_norm_ones = Some(emb_t);
         {
             let ones: Vec<f32> = vec![1.0; dim];
             let bytes =
                 unsafe { std::slice::from_raw_parts(ones.as_ptr() as *const u8, ones.len() * 4) };
-            gpu.hip
-                .memcpy_htod(&embed_norm_ones.buf, bytes)
-                .map_err(|e| format!("glimmer: upload embed_norm_ones: {e:?}"))?;
+            if let Err(e) = gpu
+                .hip
+                .memcpy_htod(&guard.embed_norm_ones.as_ref().unwrap().buf, bytes)
+            {
+                guard.cleanup(gpu);
+                return Err(format!("glimmer: upload embed_norm_ones: {e:?}"));
+            }
         }
-
+        // Helper to allocate remaining scratch tensors with transactional rollback.
+        macro_rules! alloc_guard {
+            ($field:ident, $n:expr, $label:expr) => {{
+                let t = match gpu.zeros(&[$n], DType::F32) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        guard.cleanup(gpu);
+                        return Err(format!("glimmer: alloc {}: {e:?}", $label));
+                    }
+                };
+                guard.$field = Some(t);
+            }};
+        }
+        alloc_guard!(x, dim, "x");
+        alloc_guard!(residual, dim, "residual");
+        alloc_guard!(tmp, dim, "tmp");
+        alloc_guard!(x_rot, dim, "x_rot");
+        alloc_guard!(q, q_dim, "q");
+        alloc_guard!(k, kv_dim, "k");
+        alloc_guard!(v, kv_dim, "v");
+        alloc_guard!(attn_out, q_dim, "attn_out");
+        alloc_guard!(attn_gate, q_dim, "attn_gate");
+        alloc_guard!(gate_ffn, cfg.hidden_dim, "gate_ffn");
+        alloc_guard!(up_ffn, cfg.hidden_dim, "up_ffn");
+        alloc_guard!(ffn_hidden, cfg.hidden_dim, "ffn_hidden");
+        alloc_guard!(ffn_out, dim, "ffn_out");
+        alloc_guard!(logits, cfg.vocab_size, "logits");
+        alloc_guard!(sample_out, 2, "sample_out");
+        alloc_guard!(
+            logits_batch,
+            GLIMMER_MAX_SPEC_BLOCK * cfg.vocab_size,
+            "logits_batch"
+        );
+        alloc_guard!(argmax_batch, GLIMMER_MAX_SPEC_BLOCK, "argmax_batch");
+        let kv_sliding = guard.kv_sliding.take().expect("kv_sliding must be Some");
+        let kv_full = guard.kv_full.take().expect("kv_full must be Some");
+        let pos_buf = guard.pos_buf.take().expect("pos_buf must be Some");
+        let qk_norm_ones = guard
+            .qk_norm_ones
+            .take()
+            .expect("qk_norm_ones must be Some");
+        let embed_norm_ones = guard
+            .embed_norm_ones
+            .take()
+            .expect("embed_norm_ones must be Some");
+        let x = guard.x.take().expect("x must be Some");
+        let residual = guard.residual.take().expect("residual must be Some");
+        let tmp = guard.tmp.take().expect("tmp must be Some");
+        let x_rot = guard.x_rot.take().expect("x_rot must be Some");
+        let q = guard.q.take().expect("q must be Some");
+        let k = guard.k.take().expect("k must be Some");
+        let v = guard.v.take().expect("v must be Some");
+        let attn_out = guard.attn_out.take().expect("attn_out must be Some");
+        let attn_gate = guard.attn_gate.take().expect("attn_gate must be Some");
+        let gate_ffn = guard.gate_ffn.take().expect("gate_ffn must be Some");
+        let up_ffn = guard.up_ffn.take().expect("up_ffn must be Some");
+        let ffn_hidden = guard.ffn_hidden.take().expect("ffn_hidden must be Some");
+        let ffn_out = guard.ffn_out.take().expect("ffn_out must be Some");
+        let logits = guard.logits.take().expect("logits must be Some");
+        let sample_out = guard.sample_out.take().expect("sample_out must be Some");
+        let logits_batch = guard
+            .logits_batch
+            .take()
+            .expect("logits_batch must be Some");
+        let argmax_batch = guard
+            .argmax_batch
+            .take()
+            .expect("argmax_batch must be Some");
         Ok(GlimmerState {
             kv_sliding,
             kv_full,
@@ -1588,31 +2071,30 @@ impl GlimmerState {
             pos_host: vec![0i32; 1].into_boxed_slice(),
             max_seq,
             n_tokens: 0,
-            x: alloc(gpu, dim, "x")?,
-            residual: alloc(gpu, dim, "residual")?,
-            tmp: alloc(gpu, dim, "tmp")?,
-            x_rot: alloc(gpu, dim, "x_rot")?,
-            q: alloc(gpu, q_dim, "q")?,
-            k: alloc(gpu, kv_dim, "k")?,
-            v: alloc(gpu, kv_dim, "v")?,
-            attn_out: alloc(gpu, q_dim, "attn_out")?,
-            attn_gate: alloc(gpu, q_dim, "attn_gate")?,
+            x,
+            residual,
+            tmp,
+            x_rot,
+            q,
+            k,
+            v,
+            attn_out,
+            attn_gate,
             qk_norm_ones,
             embed_norm_ones,
-            gate_ffn: alloc(gpu, cfg.hidden_dim, "gate_ffn")?,
-            up_ffn: alloc(gpu, cfg.hidden_dim, "up_ffn")?,
-            ffn_hidden: alloc(gpu, cfg.hidden_dim, "ffn_hidden")?,
-            ffn_out: alloc(gpu, dim, "ffn_out")?,
-            logits: alloc(gpu, cfg.vocab_size, "logits")?,
-            sample_out: alloc(gpu, 2, "sample_out")?,
-            logits_batch: alloc(gpu, GLIMMER_MAX_SPEC_BLOCK * cfg.vocab_size, "logits_batch")?,
-            argmax_batch: alloc(gpu, GLIMMER_MAX_SPEC_BLOCK, "argmax_batch")?,
+            gate_ffn,
+            up_ffn,
+            ffn_hidden,
+            ffn_out,
+            logits,
+            sample_out,
+            logits_batch,
+            argmax_batch,
             prefill_flash_partials: None,
             decode_pos: None,
             target_hidden_log: None,
         })
     }
-
     pub fn reset(&mut self) {
         self.n_tokens = 0;
         if let Some(log) = self.target_hidden_log.as_mut() {

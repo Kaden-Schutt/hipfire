@@ -475,83 +475,271 @@ impl GlimmerDrafterWeights {
         }
         let ne = cfg.num_extract();
         let h = cfg.hidden;
-        let fc = load_wt(hfq, gpu, "encoder.fc.weight", h, ne * h)?;
-        let output_norm_enc = load_norm(hfq, gpu, "encoder.output_norm_enc.weight", h)?;
-        let norm = load_norm(hfq, gpu, "norm.weight", h)?;
-        let mut layers = Vec::with_capacity(cfg.n_layers);
+        // All-or-nothing: every GPU allocation created during this call is
+        // released on Err, ownership transfers exactly once on Ok.
+        // Free via immediate path so a pending async memset cannot race the pool.
+        fn free_weight_immediate(gpu: &mut Gpu, w: WeightTensor) {
+            if let Some(paro) = w.paro {
+                if !paro.is_alias {
+                    let _ = gpu.release_tensor_immediate(paro.pairs);
+                    let _ = gpu.release_tensor_immediate(paro.theta);
+                    let _ = gpu.release_tensor_immediate(paro.channel_scales);
+                }
+            }
+            if let Some(awq) = w.awq_scale {
+                let _ = gpu.release_tensor_immediate(awq);
+            }
+            let _ = gpu.release_tensor_immediate(w.buf);
+        }
+        struct Partial<'a> {
+            gpu: &'a mut Gpu,
+            fc: Option<WeightTensor>,
+            output_norm_enc: Option<GpuTensor>,
+            norm: Option<GpuTensor>,
+            layers: Vec<GlimmerDrafterLayer>,
+        }
+        impl Drop for Partial<'_> {
+            fn drop(&mut self) {
+                if let Some(w) = self.fc.take() {
+                    free_weight_immediate(self.gpu, w);
+                }
+                if let Some(t) = self.output_norm_enc.take() {
+                    let _ = self.gpu.release_tensor_immediate(t);
+                }
+                if let Some(t) = self.norm.take() {
+                    let _ = self.gpu.release_tensor_immediate(t);
+                }
+                for l in self.layers.drain(..) {
+                    let _ = self.gpu.release_tensor_immediate(l.input_layernorm);
+                    let _ = self
+                        .gpu
+                        .release_tensor_immediate(l.post_attention_layernorm);
+                    let _ = self.gpu.release_tensor_immediate(l.q_norm);
+                    let _ = self.gpu.release_tensor_immediate(l.k_norm);
+                    free_weight_immediate(self.gpu, l.q_proj);
+                    free_weight_immediate(self.gpu, l.k_proj);
+                    free_weight_immediate(self.gpu, l.v_proj);
+                    free_weight_immediate(self.gpu, l.o_proj);
+                    free_weight_immediate(self.gpu, l.gate_proj);
+                    free_weight_immediate(self.gpu, l.up_proj);
+                    free_weight_immediate(self.gpu, l.down_proj);
+                }
+            }
+        }
+        let mut p = Partial {
+            gpu,
+            fc: None,
+            output_norm_enc: None,
+            norm: None,
+            layers: Vec::with_capacity(cfg.n_layers),
+        };
+        p.fc = Some(load_wt(hfq, &mut *p.gpu, "encoder.fc.weight", h, ne * h)?);
+        p.output_norm_enc = Some(load_norm(
+            hfq,
+            &mut *p.gpu,
+            "encoder.output_norm_enc.weight",
+            h,
+        )?);
+        p.norm = Some(load_norm(hfq, &mut *p.gpu, "norm.weight", h)?);
         for i in 0..cfg.n_layers {
-            let p = format!("layers.{i}");
-            layers.push(GlimmerDrafterLayer {
-                input_layernorm: load_norm(hfq, gpu, &format!("{p}.input_layernorm.weight"), h)?,
-                post_attention_layernorm: load_norm(
-                    hfq,
-                    gpu,
-                    &format!("{p}.post_attention_layernorm.weight"),
-                    h,
-                )?,
-                q_proj: load_wt(
-                    hfq,
-                    gpu,
-                    &format!("{p}.self_attn.q_proj.weight"),
-                    cfg.q_dim(),
-                    h,
-                )?,
-                k_proj: load_wt(
-                    hfq,
-                    gpu,
-                    &format!("{p}.self_attn.k_proj.weight"),
-                    cfg.kv_dim(),
-                    h,
-                )?,
-                v_proj: load_wt(
-                    hfq,
-                    gpu,
-                    &format!("{p}.self_attn.v_proj.weight"),
-                    cfg.kv_dim(),
-                    h,
-                )?,
-                o_proj: load_wt(
-                    hfq,
-                    gpu,
-                    &format!("{p}.self_attn.o_proj.weight"),
-                    h,
-                    cfg.q_dim(),
-                )?,
-                q_norm: load_norm(
-                    hfq,
-                    gpu,
-                    &format!("{p}.self_attn.q_norm.weight"),
-                    cfg.head_dim,
-                )?,
-                k_norm: load_norm(
-                    hfq,
-                    gpu,
-                    &format!("{p}.self_attn.k_norm.weight"),
-                    cfg.head_dim,
-                )?,
-                gate_proj: load_wt(
-                    hfq,
-                    gpu,
-                    &format!("{p}.mlp.gate_proj.weight"),
-                    cfg.intermediate,
-                    h,
-                )?,
-                up_proj: load_wt(
-                    hfq,
-                    gpu,
-                    &format!("{p}.mlp.up_proj.weight"),
-                    cfg.intermediate,
-                    h,
-                )?,
-                down_proj: load_wt(
-                    hfq,
-                    gpu,
-                    &format!("{p}.mlp.down_proj.weight"),
-                    h,
-                    cfg.intermediate,
-                )?,
+            let prefix = format!("layers.{i}");
+            let input_layernorm = load_norm(
+                hfq,
+                &mut *p.gpu,
+                &format!("{prefix}.input_layernorm.weight"),
+                h,
+            )?;
+            let post_attention_layernorm = match load_norm(
+                hfq,
+                &mut *p.gpu,
+                &format!("{prefix}.post_attention_layernorm.weight"),
+                h,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = p.gpu.release_tensor_immediate(input_layernorm);
+                    return Err(e);
+                }
+            };
+            let q_proj = match load_wt(
+                hfq,
+                &mut *p.gpu,
+                &format!("{prefix}.self_attn.q_proj.weight"),
+                cfg.q_dim(),
+                h,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = p.gpu.release_tensor_immediate(input_layernorm);
+                    let _ = p.gpu.release_tensor_immediate(post_attention_layernorm);
+                    return Err(e);
+                }
+            };
+            let k_proj = match load_wt(
+                hfq,
+                &mut *p.gpu,
+                &format!("{prefix}.self_attn.k_proj.weight"),
+                cfg.kv_dim(),
+                h,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = p.gpu.release_tensor_immediate(input_layernorm);
+                    let _ = p.gpu.release_tensor_immediate(post_attention_layernorm);
+                    free_weight_immediate(p.gpu, q_proj);
+                    return Err(e);
+                }
+            };
+            let v_proj = match load_wt(
+                hfq,
+                &mut *p.gpu,
+                &format!("{prefix}.self_attn.v_proj.weight"),
+                cfg.kv_dim(),
+                h,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = p.gpu.release_tensor_immediate(input_layernorm);
+                    let _ = p.gpu.release_tensor_immediate(post_attention_layernorm);
+                    free_weight_immediate(p.gpu, q_proj);
+                    free_weight_immediate(p.gpu, k_proj);
+                    return Err(e);
+                }
+            };
+            let o_proj = match load_wt(
+                hfq,
+                &mut *p.gpu,
+                &format!("{prefix}.self_attn.o_proj.weight"),
+                cfg.q_dim(),
+                h,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = p.gpu.release_tensor_immediate(input_layernorm);
+                    let _ = p.gpu.release_tensor_immediate(post_attention_layernorm);
+                    free_weight_immediate(p.gpu, q_proj);
+                    free_weight_immediate(p.gpu, k_proj);
+                    free_weight_immediate(p.gpu, v_proj);
+                    return Err(e);
+                }
+            };
+            let q_norm = match load_norm(
+                hfq,
+                &mut *p.gpu,
+                &format!("{prefix}.self_attn.q_norm.weight"),
+                cfg.head_dim,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = p.gpu.release_tensor_immediate(input_layernorm);
+                    let _ = p.gpu.release_tensor_immediate(post_attention_layernorm);
+                    free_weight_immediate(p.gpu, q_proj);
+                    free_weight_immediate(p.gpu, k_proj);
+                    free_weight_immediate(p.gpu, v_proj);
+                    free_weight_immediate(p.gpu, o_proj);
+                    return Err(e);
+                }
+            };
+            let k_norm = match load_norm(
+                hfq,
+                &mut *p.gpu,
+                &format!("{prefix}.self_attn.k_norm.weight"),
+                cfg.head_dim,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = p.gpu.release_tensor_immediate(input_layernorm);
+                    let _ = p.gpu.release_tensor_immediate(post_attention_layernorm);
+                    free_weight_immediate(p.gpu, q_proj);
+                    free_weight_immediate(p.gpu, k_proj);
+                    free_weight_immediate(p.gpu, v_proj);
+                    free_weight_immediate(p.gpu, o_proj);
+                    let _ = p.gpu.release_tensor_immediate(q_norm);
+                    return Err(e);
+                }
+            };
+            let gate_proj = match load_wt(
+                hfq,
+                &mut *p.gpu,
+                &format!("{prefix}.mlp.gate_proj.weight"),
+                cfg.intermediate,
+                h,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = p.gpu.release_tensor_immediate(input_layernorm);
+                    let _ = p.gpu.release_tensor_immediate(post_attention_layernorm);
+                    free_weight_immediate(p.gpu, q_proj);
+                    free_weight_immediate(p.gpu, k_proj);
+                    free_weight_immediate(p.gpu, v_proj);
+                    free_weight_immediate(p.gpu, o_proj);
+                    let _ = p.gpu.release_tensor_immediate(q_norm);
+                    let _ = p.gpu.release_tensor_immediate(k_norm);
+                    return Err(e);
+                }
+            };
+            let up_proj = match load_wt(
+                hfq,
+                &mut *p.gpu,
+                &format!("{prefix}.mlp.up_proj.weight"),
+                cfg.intermediate,
+                h,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = p.gpu.release_tensor_immediate(input_layernorm);
+                    let _ = p.gpu.release_tensor_immediate(post_attention_layernorm);
+                    free_weight_immediate(p.gpu, q_proj);
+                    free_weight_immediate(p.gpu, k_proj);
+                    free_weight_immediate(p.gpu, v_proj);
+                    free_weight_immediate(p.gpu, o_proj);
+                    let _ = p.gpu.release_tensor_immediate(q_norm);
+                    let _ = p.gpu.release_tensor_immediate(k_norm);
+                    free_weight_immediate(p.gpu, gate_proj);
+                    return Err(e);
+                }
+            };
+            let down_proj = match load_wt(
+                hfq,
+                &mut *p.gpu,
+                &format!("{prefix}.mlp.down_proj.weight"),
+                cfg.intermediate,
+                h,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = p.gpu.release_tensor_immediate(input_layernorm);
+                    let _ = p.gpu.release_tensor_immediate(post_attention_layernorm);
+                    free_weight_immediate(p.gpu, q_proj);
+                    free_weight_immediate(p.gpu, k_proj);
+                    free_weight_immediate(p.gpu, v_proj);
+                    free_weight_immediate(p.gpu, o_proj);
+                    let _ = p.gpu.release_tensor_immediate(q_norm);
+                    let _ = p.gpu.release_tensor_immediate(k_norm);
+                    free_weight_immediate(p.gpu, gate_proj);
+                    free_weight_immediate(p.gpu, up_proj);
+                    return Err(e);
+                }
+            };
+            p.layers.push(GlimmerDrafterLayer {
+                input_layernorm,
+                post_attention_layernorm,
+                q_proj,
+                k_proj,
+                v_proj,
+                o_proj,
+                q_norm,
+                k_norm,
+                gate_proj,
+                up_proj,
+                down_proj,
             });
         }
+        let fc = p.fc.take().expect("fc present");
+        let output_norm_enc = p.output_norm_enc.take().expect("output_norm_enc present");
+        let norm = p.norm.take().expect("norm present");
+        let layers = std::mem::take(&mut p.layers);
+        std::mem::forget(p);
         Ok(GlimmerDrafterWeights {
             fc,
             output_norm_enc,
