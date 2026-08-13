@@ -28,7 +28,9 @@
 //! Logits: `logits *= output_multiplier` (0.196116135 == 1/sqrt(6656/256)) and then
 //! `tanh(x/cap)*cap` with cap 20.0. Gemma4 softcaps at 30 with no multiplier.
 
+pub mod batch;
 pub mod config;
 pub mod drafter;
 pub mod forward;
+pub mod forward_batch;
 pub mod glimmer;
