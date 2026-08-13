@@ -45,6 +45,7 @@ use std::{
 };
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
+mod bench_concurrency;
 mod setup;
 use setup::setup_command;
 
@@ -408,7 +409,7 @@ struct ChatArgs {
     no_color: bool,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Clone)]
 struct BenchArgs {
     model: String,
     #[arg(long, default_value_t = 5)]
@@ -459,6 +460,16 @@ struct BenchArgs {
     /// Pair this with `--max-tokens` large enough for the span to close.
     #[arg(long = "reasoning-on")]
     reasoning_on: bool,
+    /// Sweep concurrent stream counts, e.g. `1,2,3,4`. Absent leaves bench
+    /// on its single-stream path, unchanged.
+    #[arg(long)]
+    concurrency: Option<String>,
+    /// Which concurrent backend to drive: slots, batch, or both.
+    #[arg(long, value_parser = ["slots", "batch", "both"], default_value = "both")]
+    backend: String,
+    /// Which workload arm to run: stateless, multiturn, or both.
+    #[arg(long, value_parser = ["stateless", "multiturn", "both"], default_value = "both")]
+    workload: String,
     /// Prompt words for the standard benchmark.
     #[arg(num_args = 0..)]
     prompt: Vec<String>,
@@ -7481,6 +7492,9 @@ fn profile_command(paths: &Paths, args: ProfileArgs) -> Result<()> {
             redline: false,
             speculation: None,
             reasoning_on: false,
+            concurrency: None,
+            backend: "both".to_owned(),
+            workload: "both".to_owned(),
             prompt: Vec::new(),
         };
         let (mut engine, _, _, _) = open_bench_engine(paths, &bench, None)?;
