@@ -228,6 +228,21 @@ fn batched_lm_head_enabled() -> bool {
     )
 }
 
+/// Master switch for fused sandwich post-norm + residual-add
+/// (`rmsnorm_residual_add_f32`). Default ON; opt out with
+/// `HIPFIRE_GLIMMER_FUSED_POSTNORM=0|off|false|no` (case-insensitive).
+/// Decode-only; not byte-identical (residual add rounds in-kernel).
+fn fused_postnorm_enabled() -> bool {
+    match std::env::var("HIPFIRE_GLIMMER_FUSED_POSTNORM") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no"
+        ),
+        Err(_) => true,
+    }
+}
+
+
 /// Chunk size for batched prefill: 192 for prompts >= 512 tokens, else 256.
 /// Overridable via `HIPFIRE_GLIMMER_PREFILL_CHUNK` (clamped to 1-512); the
 /// rationale for the split is on the function body below.
@@ -743,12 +758,24 @@ fn glimmer_layer_decode(
         .map_err(|e| format!("glimmer L{layer_idx}: o_proj: {e}"))?;
 
     // Sandwich post-attention norm (post_eps 1e-8) + residual add: x = residual + norm(tmp)
-    gpu.rmsnorm_f32(&state.tmp, &lw.post_attention_layernorm, &state.tmp, post_eps)
-        .map_err(|e| format!("glimmer L{layer_idx}: post_attn rmsnorm: {e:?}"))?;
-    gpu.memcpy_dtod_auto(&state.x.buf, &state.residual.buf, dim_bytes)
-        .map_err(|e| format!("glimmer L{layer_idx}: reset x (attn): {e:?}"))?;
-    gpu.add_inplace_f32(&state.x, &state.tmp)
-        .map_err(|e| format!("glimmer L{layer_idx}: attn residual add: {e:?}"))?;
+    // Fused into one launch; eager fallback = rmsnorm + memcpy + add.
+    if fused_postnorm_enabled() {
+        gpu.rmsnorm_residual_add_f32(
+            &state.tmp,
+            &lw.post_attention_layernorm,
+            &state.residual,
+            &state.x,
+            post_eps,
+        )
+        .map_err(|e| format!("glimmer L{layer_idx}: fused post_attn norm+residual: {e:?}"))?;
+    } else {
+        gpu.rmsnorm_f32(&state.tmp, &lw.post_attention_layernorm, &state.tmp, post_eps)
+            .map_err(|e| format!("glimmer L{layer_idx}: post_attn rmsnorm: {e:?}"))?;
+        gpu.memcpy_dtod_auto(&state.x.buf, &state.residual.buf, dim_bytes)
+            .map_err(|e| format!("glimmer L{layer_idx}: reset x (attn): {e:?}"))?;
+        gpu.add_inplace_f32(&state.x, &state.tmp)
+            .map_err(|e| format!("glimmer L{layer_idx}: attn residual add: {e:?}"))?;
+    }
 
     // residual = x (FFN stream)
     gpu.memcpy_dtod_auto(&state.residual.buf, &state.x.buf, dim_bytes)
@@ -833,17 +860,29 @@ fn glimmer_layer_decode(
     }
 
     // Sandwich post-FFN norm (post_eps) + residual add
-    gpu.rmsnorm_f32(
-        &state.ffn_out,
-        &lw.post_feedforward_layernorm,
-        &state.tmp,
-        post_eps,
-    )
-    .map_err(|e| format!("glimmer L{layer_idx}: post_ffn rmsnorm: {e:?}"))?;
-    gpu.memcpy_dtod_auto(&state.x.buf, &state.residual.buf, dim_bytes)
-        .map_err(|e| format!("glimmer L{layer_idx}: reset x (ffn): {e:?}"))?;
-    gpu.add_inplace_f32(&state.x, &state.tmp)
-        .map_err(|e| format!("glimmer L{layer_idx}: ffn residual add: {e:?}"))?;
+    // Fused into one launch; eager fallback = rmsnorm + memcpy + add.
+    if fused_postnorm_enabled() {
+        gpu.rmsnorm_residual_add_f32(
+            &state.ffn_out,
+            &lw.post_feedforward_layernorm,
+            &state.residual,
+            &state.x,
+            post_eps,
+        )
+        .map_err(|e| format!("glimmer L{layer_idx}: fused post_ffn norm+residual: {e:?}"))?;
+    } else {
+        gpu.rmsnorm_f32(
+            &state.ffn_out,
+            &lw.post_feedforward_layernorm,
+            &state.tmp,
+            post_eps,
+        )
+        .map_err(|e| format!("glimmer L{layer_idx}: post_ffn rmsnorm: {e:?}"))?;
+        gpu.memcpy_dtod_auto(&state.x.buf, &state.residual.buf, dim_bytes)
+            .map_err(|e| format!("glimmer L{layer_idx}: reset x (ffn): {e:?}"))?;
+        gpu.add_inplace_f32(&state.x, &state.tmp)
+            .map_err(|e| format!("glimmer L{layer_idx}: ffn residual add: {e:?}"))?;
+    }
 
     Ok(())
 }
