@@ -29012,27 +29012,47 @@ fn generate_gemma4(
 
     let t0 = Instant::now();
 
-    // ── Prefill: eager decode_step per prompt token. The LAST decode_step's
-    // logits are the predictions for the first generated token. ──
+    // ── Prefill. `forward_batch` preserves the eager result/KV contract while
+    // reading projection weights once for a small token block. Keep the path
+    // opt-in until long-context parity is certified on each supported board.
     let mut last_logits: Vec<f32> = Vec::new();
     {
-        let mut position = bundle.state.n_tokens as u32;
-        for &tok in &prompt_ids {
-            match gemma4::forward::decode_step(
-                &bundle.config,
-                &bundle.weights,
-                &mut bundle.state,
-                gpu,
-                tok,
-                position,
-            ) {
+        let prefill_batch = std::env::var("HIPFIRE_GEMMA4_PREFILL_BATCH")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1)
+            .clamp(1, 64);
+        let mut offset = 0usize;
+        while offset < prompt_ids.len() {
+            let width = prefill_batch.min(prompt_ids.len() - offset);
+            let start_pos = bundle.state.n_tokens;
+            let result = if width == 1 {
+                gemma4::forward::decode_step(
+                    &bundle.config,
+                    &bundle.weights,
+                    &mut bundle.state,
+                    gpu,
+                    prompt_ids[offset],
+                    start_pos as u32,
+                )
+            } else {
+                gemma4::forward::forward_batch(
+                    &bundle.config,
+                    &bundle.weights,
+                    &mut bundle.state,
+                    gpu,
+                    &prompt_ids[offset..offset + width],
+                    start_pos,
+                )
+            };
+            match result {
                 Ok(logits) => last_logits = logits,
                 Err(e) => {
                     emit_error_with_id(stdout, id, format!("gemma4 prefill failed: {e:?}"));
                     return;
                 }
             }
-            position += 1;
+            offset += width;
         }
     }
     for &tok in &prompt_ids {
@@ -29105,6 +29125,7 @@ fn generate_gemma4(
         let mut rounds = 0usize;
         let mut total_accepted = 0usize;
         let mut stop = false;
+        let mut ttft_ms: Option<f64> = None;
         let decode_t0 = Instant::now();
         while !stop && generated_count < max_tokens {
             let committed_len = bundle.state.n_tokens;
@@ -29152,6 +29173,9 @@ fn generate_gemma4(
                 if stop_set.contains(&t) {
                     stop = true;
                     break;
+                }
+                if ttft_ms.is_none() {
+                    ttft_ms = Some(t0.elapsed().as_secs_f64() * 1000.0);
                 }
                 let frag = {
                     let tokenizer = m.tokenizer.as_ref().unwrap();
@@ -29217,6 +29241,8 @@ fn generate_gemma4(
         } else {
             0.0
         };
+        let prefill_tok_s = prompt_ids.len() as f64 * 1000.0 / prefill_ms.max(1) as f64;
+        let ttft_ms = ttft_ms.unwrap_or(total_ms as f64);
         // τ = mean tokens committed per round (accepted drafts + 1 bonus).
         let tau = if rounds > 0 {
             (total_accepted + rounds) as f64 / rounds as f64
@@ -29225,8 +29251,19 @@ fn generate_gemma4(
         };
         let _ = writeln!(
             stdout,
-            r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_ms":{},"total_ms":{},"spec":"gemma4_eagle","rounds":{},"tau":{:.3},"draft_len":{}}}"#,
-            id, generated_count, tok_s, prefill_ms, total_ms, rounds, tau, draft_len,
+            r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_tokens":{},"prefill_ms":{},"prefill_tok_s":{:.2},"decode_tok_s":{:.2},"ttft_ms":{:.3},"total_ms":{},"spec":"gemma4_eagle","rounds":{},"tau":{:.3},"draft_len":{}}}"#,
+            id,
+            generated_count,
+            tok_s,
+            prompt_ids.len(),
+            prefill_ms,
+            prefill_tok_s,
+            tok_s,
+            ttft_ms,
+            total_ms,
+            rounds,
+            tau,
+            draft_len,
         );
         let _ = stdout.flush();
         return;
@@ -29240,6 +29277,7 @@ fn generate_gemma4(
     let mut rng = deepseek4::sampling::Xorshift::new(seed);
 
     let mut generated_count: usize = 0;
+    let mut ttft_ms: Option<f64> = None;
     let decode_t0 = Instant::now();
     loop {
         if generated_count >= max_tokens {
@@ -29248,6 +29286,10 @@ fn generate_gemma4(
         let next_tok = deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
         if stop_set.contains(&next_tok) {
             break;
+        }
+
+        if ttft_ms.is_none() {
+            ttft_ms = Some(t0.elapsed().as_secs_f64() * 1000.0);
         }
 
         let frag = {
@@ -29298,10 +29340,20 @@ fn generate_gemma4(
     } else {
         0.0
     };
+    let prefill_tok_s = prompt_ids.len() as f64 * 1000.0 / prefill_ms.max(1) as f64;
+    let ttft_ms = ttft_ms.unwrap_or(total_ms as f64);
     let _ = writeln!(
         stdout,
-        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_ms":{},"total_ms":{}}}"#,
-        id, generated_count, tok_s, prefill_ms, total_ms,
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_tokens":{},"prefill_ms":{},"prefill_tok_s":{:.2},"decode_tok_s":{:.2},"ttft_ms":{:.3},"total_ms":{}}}"#,
+        id,
+        generated_count,
+        tok_s,
+        prompt_ids.len(),
+        prefill_ms,
+        prefill_tok_s,
+        tok_s,
+        ttft_ms,
+        total_ms,
     );
     let _ = stdout.flush();
 }
