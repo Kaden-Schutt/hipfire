@@ -613,6 +613,14 @@ fn main() {
             drafter_cfg.block_size = b;
             eprintln!("block_size override: {orig} -> {b} (drafter trained at {orig})");
         }
+        if !(2..=hipfire_arch_muse_glimmer::glimmer::GLIMMER_MAX_SPEC_BLOCK).contains(&drafter_cfg.block_size) {
+            eprintln!(
+                "block_size must be in 2..={} (got {})",
+                hipfire_arch_muse_glimmer::glimmer::GLIMMER_MAX_SPEC_BLOCK,
+                drafter_cfg.block_size
+            );
+            return;
+        }
         eprintln!(
             "glimmer target: dim={} layers={} vocab={} heads={} kv_heads={} hd={} max_pos={}",
             glimmer_cfg.dim,
@@ -902,6 +910,7 @@ fn main() {
                         block_size - 1,
                         &state.logits,
                         &state.logits_batch,
+                        &state.argmax_batch,
                     )
                     .expect("glimmer drafter lm_head");
                     gpu.free_tensor(hidden_for_draft).ok();

@@ -488,6 +488,9 @@ pub struct GlimmerState {
     /// SECOND (verify's, reusing the block the first had just freed) cost 7.6 ms
     /// for the same weight through the same kernel.
     pub logits_batch: GpuTensor, // [GLIMMER_MAX_SPEC_BLOCK * vocab]
+    /// Persistent [block_max] argmax indices for the batched lm_head path.
+    /// F32 slots, consumed as i32 output (same packing as other argmax buffers).
+    pub argmax_batch: GpuTensor, // [GLIMMER_MAX_SPEC_BLOCK]
     /// Batched flash-attention partials for prefill over-window recovery.
     /// Lazily allocated on first over-window sliding chunk: n_heads *
     /// ceil(max_seq/128) * (2+head_dim) * 64 floats (~65 MiB at max_seq=8192).
@@ -662,6 +665,7 @@ impl GlimmerState {
                 GLIMMER_MAX_SPEC_BLOCK * cfg.vocab_size,
                 "logits_batch",
             )?,
+            argmax_batch: alloc(gpu, GLIMMER_MAX_SPEC_BLOCK, "argmax_batch")?,
             prefill_flash_partials: None,
             decode_pos: None,
         })
@@ -687,6 +691,7 @@ impl GlimmerState {
             self.attn_out,
             self.attn_gate,
             self.qk_norm_ones,
+            self.embed_norm_ones,
             self.gate_ffn,
             self.up_ffn,
             self.ffn_hidden,
@@ -694,6 +699,7 @@ impl GlimmerState {
             self.logits,
             self.sample_out,
             self.logits_batch,
+            self.argmax_batch,
         ] {
             let _ = gpu.free_tensor(t);
         }

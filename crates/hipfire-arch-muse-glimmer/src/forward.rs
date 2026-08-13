@@ -1317,11 +1317,11 @@ fn prefill_proj_gemm_batched_prerotated(
 /// Shared lm_head routine for draft and verify. `hidden_batch` is [B*hidden]
 /// already RMSNormed (the lm_head input). Returns argmax picks for rows
 /// [0..batch) in order. Uses batched Q8 path when enabled and dtype is
-/// Q8_0 (`gemm_q8_0_batched_chunked` + per-row scale/softcap), otherwise
-/// per-row `weight_gemv` fallback (explicit, no approximation). This is the
-/// single source of truth for draft and verify so they cannot diverge on
-/// near-ties due to different accumulation order (the Q8 vs per-row flip that
-/// halved tau on the Q8-head artifact).
+/// Q8_0 (`gemm_q8_0_batched_chunked` + batched scale/softcap + GPU argmax),
+/// otherwise per-row `weight_gemv` fallback (explicit, no approximation).
+/// This is the single source of truth for draft and verify so they cannot
+/// diverge on near-ties due to different accumulation order (the Q8 vs
+/// per-row flip that halved tau on the Q8-head artifact).
 pub fn glimmer_lm_head_picks(
     gpu: &mut Gpu,
     cfg: &GlimmerConfig,
@@ -1330,9 +1330,18 @@ pub fn glimmer_lm_head_picks(
     batch: usize,
     logits_scratch: &GpuTensor,
     logits_batch: &GpuTensor,
+    argmax_batch: &GpuTensor,
 ) -> Result<Vec<u32>, String> {
     let dim = cfg.dim;
     let vocab = cfg.vocab_size;
+    if batch == 0 {
+        return Ok(Vec::new());
+    }
+    if batch > GLIMMER_MAX_SPEC_BLOCK {
+        return Err(format!(
+            "glimmer lm_head_picks: batch {batch} exceeds GLIMMER_MAX_SPEC_BLOCK {GLIMMER_MAX_SPEC_BLOCK}"
+        ));
+    }
     let is_q8_lm = weights.lm_head.gpu_dtype == DType::Q8_0 && batched_lm_head_enabled();
     let mut picks = Vec::with_capacity(batch);
     if is_q8_lm {
@@ -1342,41 +1351,41 @@ pub fn glimmer_lm_head_picks(
         // ~12.9 MB is slow and synchronizing, and it was the entire reason the
         // first batched lm_head of a window cost 69 ms while the second cost
         // 7.6 ms for the same weight through the same kernel.
-        if batch > GLIMMER_MAX_SPEC_BLOCK {
-            return Err(format!(
-                "glimmer lm_head_picks: batch {batch} exceeds GLIMMER_MAX_SPEC_BLOCK {GLIMMER_MAX_SPEC_BLOCK}"
-            ));
-        }
         let logits_b = logits_batch.sub_offset(0, batch * vocab);
         gpu.gemm_q8_0_batched_chunked(&weights.lm_head.buf, hidden_batch, &logits_b, vocab, dim, batch)
             .map_err(|e| format!("glimmer lm_head_picks q8 batched: {e:?}"))?;
-        for i in 0..batch {
-            let row = logits_b.sub_offset(i * vocab, vocab);
-            if cfg.output_multiplier != 1.0 && !abl("HIPFIRE_GLIMMER_NO_OUTMUL") {
-                gpu.scale_f32(&row, cfg.output_multiplier)
-                    .map_err(|e| format!("glimmer lm_head_picks scale row {i}: {e:?}"))?;
-            }
-            if cfg.final_logit_softcapping > 0.0 && !abl("HIPFIRE_GLIMMER_NO_SOFTCAP") {
-                gpu.logit_softcap_f32(&row, vocab, cfg.final_logit_softcapping)
-                    .map_err(|e| format!("glimmer lm_head_picks softcap row {i}: {e:?}"))?;
-            }
+        // One scale/softcap over the full [B*vocab] buffer (uniform per element),
+        // then GPU batched argmax so only B i32 indices cross PCIe.
+        if cfg.output_multiplier != 1.0 && !abl("HIPFIRE_GLIMMER_NO_OUTMUL") {
+            gpu.scale_f32(&logits_b, cfg.output_multiplier)
+                .map_err(|e| format!("glimmer lm_head_picks scale: {e:?}"))?;
+        }
+        if cfg.final_logit_softcapping > 0.0 && !abl("HIPFIRE_GLIMMER_NO_SOFTCAP") {
+            gpu.logit_softcap_f32(&logits_b, batch * vocab, cfg.final_logit_softcapping)
+                .map_err(|e| format!("glimmer lm_head_picks softcap: {e:?}"))?;
+        }
+        let argmax_view = argmax_batch.sub_offset(0, batch);
+        gpu.argmax_f32_batched(&logits_b, &argmax_view, vocab, batch)
+            .map_err(|e| format!("glimmer lm_head_picks argmax_batched: {e:?}"))?;
+        let mut host_idx = vec![0i32; batch];
+        {
+            let bytes: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(host_idx.as_mut_ptr() as *mut u8, batch * 4)
+            };
             gpu.hip
-                .memcpy_dtod_at(&logits_scratch.buf, 0, &row.buf, 0, vocab * 4)
-                .map_err(|e| format!("glimmer lm_head_picks copy row {i}: {e:?}"))?;
-            let host = gpu
-                .download_f32(logits_scratch)
-                .map_err(|e| format!("glimmer lm_head_picks download row {i}: {e:?}"))?;
-            let pick = host
-                .iter()
-                .enumerate()
-                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-                .map(|(idx, _)| idx as u32)
-                .unwrap();
-            picks.push(pick);
+                .memcpy_dtoh(bytes, &argmax_view.buf)
+                .map_err(|e| format!("glimmer lm_head_picks argmax dtoh: {e:?}"))?;
+        }
+        for v in host_idx {
+            picks.push(v as u32);
         }
     } else {
         // MQ4 and disabled-Q8: per-row weight_gemv (re-streams lm_head B times).
         // Explicit fallback - same as draft side, so near-tie argmax cannot flip.
+        // Vocab-width MQ4 batched GEMM remains disabled because the existing
+        // gfx12 path faults at this output width (same as gemma4).
+        // Avoid gpu.argmax_f32 (malloc/sync/free per row): write each row's
+        // argmax into argmax_batch[i] then one D2H after the loop.
         for i in 0..batch {
             let hidden_row = hidden_batch.sub_offset(i * dim, dim);
             weight_gemv(gpu, &weights.lm_head, &hidden_row, logits_scratch)
@@ -1389,16 +1398,22 @@ pub fn glimmer_lm_head_picks(
                 gpu.logit_softcap_f32(logits_scratch, vocab, cfg.final_logit_softcapping)
                     .map_err(|e| format!("glimmer lm_head_picks softcap row {i}: {e:?}"))?;
             }
-            let host = gpu
-                .download_f32(logits_scratch)
-                .map_err(|e| format!("glimmer lm_head_picks download row {i}: {e:?}"))?;
-            let pick = host
-                .iter()
-                .enumerate()
-                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
-                .map(|(idx, _)| idx as u32)
-                .unwrap();
-            picks.push(pick);
+            let argmax_row = argmax_batch.sub_offset(i, 1);
+            gpu.argmax_f32_batched(logits_scratch, &argmax_row, vocab, 1)
+                .map_err(|e| format!("glimmer lm_head_picks argmax row {i}: {e:?}"))?;
+        }
+        let argmax_view = argmax_batch.sub_offset(0, batch);
+        let mut host_idx = vec![0i32; batch];
+        {
+            let bytes: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(host_idx.as_mut_ptr() as *mut u8, batch * 4)
+            };
+            gpu.hip
+                .memcpy_dtoh(bytes, &argmax_view.buf)
+                .map_err(|e| format!("glimmer lm_head_picks argmax dtoh: {e:?}"))?;
+        }
+        for v in host_idx {
+            picks.push(v as u32);
         }
     }
     Ok(picks)
@@ -1449,8 +1464,8 @@ pub fn verify_block_with_capture(
     if b == 0 {
         return Ok(Vec::new());
     }
-    if b > 64 {
-        return Err(format!("glimmer verify_block: B={b} exceeds kernel cap 64"));
+    if b > GLIMMER_MAX_SPEC_BLOCK {
+        return Err(format!("glimmer verify_block: B={b} exceeds GLIMMER_MAX_SPEC_BLOCK {GLIMMER_MAX_SPEC_BLOCK}"));
     }
     // Fast path for B==1 uses the single path directly for exact parity with
     // the AR code (no batched kernels). Correctness gate for B>1 is the
@@ -1788,7 +1803,7 @@ pub fn verify_block_with_capture(
     let t_after_norm = t_verify_start.elapsed();
     gpu.rmsnorm_batched(&x, &weights.final_norm, &normed, b, dim, rms_eps).map_err(|e| format!("glimmer batch final rmsnorm: {e:?}"))?;
 
-    let picks = glimmer_lm_head_picks(gpu, cfg, weights, &normed, b, &state.logits, &state.logits_batch)?;
+    let picks = glimmer_lm_head_picks(gpu, cfg, weights, &normed, b, &state.logits, &state.logits_batch, &state.argmax_batch)?;
     let t_after_lm = t_verify_start.elapsed();
     if do_timing {
         let total = t_verify_start.elapsed();

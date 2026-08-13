@@ -30617,7 +30617,7 @@ fn generate_muse_glimmer(
                 let d = bundle.drafter.as_ref().unwrap();
                 (d.config.block_size, d.config.mask_token_id, d.config.hidden)
             };
-            if block_size == 0 || block_size > 32 { break; }
+            if block_size < 2 || block_size > hipfire_arch_muse_glimmer::glimmer::GLIMMER_MAX_SPEC_BLOCK { break; }
             // Noise embedding: row 0 is the seed (last committed token), rows
             // 1..B-1 are the mask token. These are RAW target embeddings — no
             // embed_norm — per modeling_muse_glimmer.py:439, which keeps the norm
@@ -30837,6 +30837,7 @@ fn generate_muse_glimmer(
                 block_size - 1,
                 &bundle.state.logits,
                 &bundle.state.logits_batch,
+                &bundle.state.argmax_batch,
             ) {
                 Ok(p) => p,
                 Err(e) => {
