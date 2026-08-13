@@ -275,9 +275,48 @@ Two further reasons to distrust the shape:
    decode-only measurement earlier in this document has slots at 116 tok/s
    aggregate at 4 slots against ~98 single-stream.
 
-**Conclusion: this does not yet answer whether SlotEngine is better.** To
-answer it, either disable MTP and redline on the daemon arm, or wire them into
-the slot path, and re-run with `--max-tokens 512`.
+### Decode-dominated re-run: same ordering
+
+`--concurrency 1,4 --runs 2 --max-tokens 512 --workload stateless`, with
+`--spec off` on the no-slots arm:
+
+| backend | k=1 | k=4 |
+|---|---|---|
+| noslots | 54.28 | **99.39** |
+| slots | 40.64 | **81.43** |
+
+At 512 tokens decode dominates the wall clock, so the ordering is not a
+prefill artifact: **the sequential daemon path beats the slot engine by
+~20–25% at both concurrencies, on two independent token budgets.**
+
+Two things this run did NOT establish, and they matter:
+
+1. **`--spec off` did not unload MTP.** The daemon still logged
+   `MTP head loaded` on the no-slots arm, so speculation may well still be
+   active there. The intended isolation did not happen; the flag gates the
+   selector, not the sidecar load. Disabling it properly needs a different
+   lever (the serve path uses `HIPFIRE_QWEN_MTP`).
+2. **The intra-arm k=1 → k=4 rise is not trustworthy at `--runs 2`.** A
+   strictly sequential arm must have flat aggregate throughput in k, yet
+   noslots goes 54.28 → 99.39, which a 512-token budget is far too long for
+   warmup amortisation to explain. With `sweep_order` visiting `1,4,1,4` and
+   the median of two samples being their mean, the first (cold) k=1 run
+   contaminates that point. Compare ACROSS arms at matched k; do not read the
+   within-arm curve from this run.
+
+### What this actually says
+
+The slot engine loses to the plain daemon path today, consistently. The most
+probable explanation is not that batching fails, but that the daemon arm
+carries optimisations the slot path never got — the MTP speculative head and
+the redline retained/PM4 replay, neither of which the in-process `SlotEngine`
+uses. If that is right, the lever is porting those into the slot path rather
+than tuning the batching, and the slot engine's own decode-only figure (116
+tok/s aggregate at 4 slots) is what it could reach once it has them.
+
+**This is a hypothesis with supporting evidence, not a demonstrated cause.**
+Confirming it requires an arm with MTP genuinely disabled — which this run
+failed to produce.
 
 ### The batch backend is NOT measured
 
