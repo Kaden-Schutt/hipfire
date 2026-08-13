@@ -369,13 +369,28 @@ at k=1 (−5.6%) and 95.15 → 94.49 at k=4 (−0.7%). It never explained the ga
 **noslots still wins**, by 47% at k=1 and 12% at k=4 — but the k=4 gap has
 closed from 21% to 12%.
 
-⚠️ **That k=4 improvement is NOT cleanly attributed.** Two variables changed
-between the runs (unique prompts AND the decode graph), which violates the
-one-variable rule this document elsewhere insists on. Worse, nothing in the
-bench output proves the graph actually engaged: `SlotDecodeGraph::stats()`
-returns `(captures, replays)` but the sweep never prints it, so this is a
-latency delta with no evidence the feature fired. A control run — unique
-prompts, graph OFF — is required before crediting the graph with anything.
+#### What the decode graph is actually worth — one-variable control
+
+The run above moved two variables at once, so a control was run with unique
+prompts and the graph OFF, everything else identical:
+
+| slots, unique prompts | k=1 | k=4 |
+|---|---|---|
+| decode graph ON | 33.28 | 84.58 |
+| decode graph OFF | 33.38 | 81.22 |
+| **delta** | −0.3% (noise) | **+4.1%** |
+
+**The decode graph is worth ~4% at k=4 and nothing at k=1.** Real, repeatable,
+and far too small to close a 12% gap. The larger improvement credited to it in
+the first corrected run was mostly the prompt change, not the graph.
+
+The zero at k=1 is mildly surprising — a single-slot pure-decode step is the
+easiest thing to capture — and suggests capture overhead cancels the replay
+saving when there is only one slot's worth of launches to amortise. Note also
+that engagement is still not *directly* observed: `SlotDecodeGraph::stats()`
+exposes `(captures, replays)` and the sweep never prints it. The A/B is
+consistent with the feature firing at k=4, but a counter in the output would
+settle it properly.
 
 ### What this actually says
 
