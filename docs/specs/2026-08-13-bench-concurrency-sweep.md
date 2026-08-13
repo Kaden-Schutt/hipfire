@@ -333,6 +333,50 @@ is the remaining explanation, but it is no longer a cold-median artifact and
 is not fully accounted for. Treat the cross-arm comparison at matched k as
 sound and the within-arm curve as still unexplained.
 
+### Corrected run — unique prompts, and the slot decode graph switched on
+
+Every measurement above shares a bias found later: the sweep cycled a fixed
+prompt list, and the two backends cache on different keys.
+
+- The daemon holds a **token-level longest-common-prefix** cache, so a repeated
+  prompt can skip prefill.
+- The slot engine keys on **conversation identity**, and `find_continuation`
+  returns `None` immediately when `convo.len() < 2`
+  (`session_table.rs:170`) — it matches *continuations*, never *repeats*. A
+  resent identical prompt can never hit.
+
+So repeats handed the daemon free prefills and gave the slot engine nothing.
+`stream_prompt(run, stream)` now prefixes every prompt with a unique `Q{run}-{stream}`
+tag so neither side can cache.
+
+Separately: **the slot engine's own hipGraph decode capture was off in every
+run above.** `forward_batch_slots_graphed` (`forward_slots.rs:2312`) is gated on
+`HIPFIRE_SLOTS_DECODE_GRAPH=1`, which defaults false (`feature_flags.rs:498`,
+`:715`); the earlier demo output confirms it — `decode graph: 0 capture(s), 0
+replay(s)`. So the slot arm ran with no graph replay against a daemon arm that
+had redline replay on automatically.
+
+Re-run with both corrections, `--runs 5`, 512 tokens:
+
+| backend | k=1 | k=4 |
+|---|---|---|
+| noslots, unique prompts | 48.78 | **94.49** |
+| slots, unique prompts + decode graph | 33.28 | **84.58** |
+
+**The prompt-cache confound was real but small:** noslots moved 51.68 → 48.78
+at k=1 (−5.6%) and 95.15 → 94.49 at k=4 (−0.7%). It never explained the gap.
+
+**noslots still wins**, by 47% at k=1 and 12% at k=4 — but the k=4 gap has
+closed from 21% to 12%.
+
+⚠️ **That k=4 improvement is NOT cleanly attributed.** Two variables changed
+between the runs (unique prompts AND the decode graph), which violates the
+one-variable rule this document elsewhere insists on. Worse, nothing in the
+bench output proves the graph actually engaged: `SlotDecodeGraph::stats()`
+returns `(captures, replays)` but the sweep never prints it, so this is a
+latency delta with no evidence the feature fired. A control run — unique
+prompts, graph OFF — is required before crediting the graph with anything.
+
 ### What this actually says
 
 The slot engine loses to the plain daemon path today, consistently. The one
