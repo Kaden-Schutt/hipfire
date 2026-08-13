@@ -47,3 +47,45 @@ FUSED_Q8_PREFILL=0 BATCHES=64 LIMIT=10 REPEATS=3 \
 FUSED_Q8_PREFILL=1 BATCHES=64 LIMIT=10 REPEATS=3 \
   scripts/bench-gemma4-gfx11-prefill-batch.sh
 ```
+
+## Larger Q8 WMMA tile probes
+
+The existing 64x64 four-wave Q8 WMMA kernel was tested first and rejected for Gemma 4: E2B prefill fell from 1,178.06 to 1,078.88 tok/s (-8.42%), while E4B fell from 869.87 to 805.65 tok/s (-7.38%). All 60 paired outputs were byte-identical, so this is a shape-specific performance boundary rather than a correctness failure.
+
+The single-wave 16x64 kernel was also rejected. E2B fell from 1,178.06 to 1,154.79 tok/s (-1.98%), while E4B moved from 869.87 to 870.38 tok/s (+0.06%, effectively neutral). Its 60 paired outputs were also byte-identical. Neither route is retained in production dispatch; the existing single-wave 16x16 Q8 WMMA remains the gfx1100 default for these Gemma projection shapes.
+
+Raw paired artifacts are preserved under `target/validation/gemma4-gfx11-prefill-4w/{off-r3,on-r3}` and `target/validation/gemma4-gfx11-prefill-x64/on-r3`.
+
+## Batched PLE projection probe
+
+E-series prefill originally projected each row into the packed per-layer-input buffer with a separate GEMV, re-streaming the same Q8 model-projection matrix once per row. `HIPFIRE_GEMMA4_PLE_BATCHED_PREFILL=1` replaces those row-wise calls with one batched projection on exact gfx1100 while preserving the embedding, normalization, and fallback paths.
+
+Paired three-repeat runs show a consistent gain that grows with the prefill batch size:
+
+| Model | Batch | Flag off | Flag on | Prefill delta | TTFT delta |
+|---|---:|---:|---:|---:|---:|
+| Gemma 4 E2B Q8 | 8 | 414.510 tok/s | 416.195 tok/s | +0.41% | -0.44% |
+| Gemma 4 E4B Q8 | 8 | 283.055 tok/s | 284.610 tok/s | +0.55% | -0.53% |
+| Gemma 4 E2B Q8 | 64 | 1,178.060 tok/s | 1,202.930 tok/s | +2.11% | -2.14% |
+| Gemma 4 E4B Q8 | 64 | 869.870 tok/s | 885.415 tok/s | +1.79% | -1.68% |
+
+All 120 paired generated outputs were byte-identical. The direct sequential-versus-batched correctness harness also passed at `B=1,2,8,64` for both models: every last-token and post-batch KV-check argmax matched, and the minimum observed logit cosine was `0.9999020`. Batch 1 deliberately retains the original GEMV route. The optimization remains opt-in because the batch-8 gain is small and the WMMA route is not bit-identical to the F32 GEMV reference.
+
+Reproduce the timing runs with:
+
+```bash
+PLE_BATCHED_PREFILL=0 BATCHES=8,64 LIMIT=10 REPEATS=3 \
+  scripts/bench-gemma4-gfx11-prefill-batch.sh
+PLE_BATCHED_PREFILL=1 BATCHES=8,64 LIMIT=10 REPEATS=3 \
+  scripts/bench-gemma4-gfx11-prefill-batch.sh
+```
+
+Reproduce the direct logit/KV gate with either E-series Q8 artifact:
+
+```bash
+HIP_VISIBLE_DEVICES=1 HIPFIRE_GEMMA4_PLE_BATCHED_PREFILL=1 \
+  target/release/examples/verify_batch_gemma4 \
+  --model /path/to/gemma4-e2b-or-e4b-q8.hfq --bs 1,2,8,64
+```
+
+Raw timing artifacts are preserved under `target/validation/gemma4-gfx11-ple-batched/{b8-off-r3,b8-on-r3,on-r3}`; the matching batch-64 baseline is `target/validation/gemma4-gfx11-prefill-4w/off-r3`.

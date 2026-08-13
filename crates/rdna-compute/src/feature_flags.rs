@@ -182,6 +182,9 @@ pub struct FeatureFlags {
     /// Fuse Gemma 4 Q8 prefill projections on exact gfx1100. This remains an
     /// opt-in while the E-series path is validated across QKV-sharing shapes.
     pub gemma4_q8_fused_prefill: bool,
+    /// Batch the E-series per-layer-input model projection on exact gfx1100
+    /// instead of re-streaming the same matrix through one GEMV per row.
+    pub gemma4_ple_batched_prefill: bool,
     /// `HIPFIRE_DEEPSEEK4_Q8_WMMA=0` disables the Q8_0 dense WMMA prefill path
     /// (forces the scalar chunked fallback). Consumed by
     /// `gemm_q8_0_wmma_prefill_auto`.
@@ -487,6 +490,8 @@ impl FeatureFlags {
             mw16: value("HIPFIRE_MW16").map_or(false, |v| v == "1"),
             q8_batched_legacy: value("HIPFIRE_Q8_BATCHED_LEGACY").as_deref() == Ok("1"),
             gemma4_q8_fused_prefill: parse_bool("HIPFIRE_GEMMA4_Q8_FUSED_PREFILL").unwrap_or(false),
+            gemma4_ple_batched_prefill: parse_bool("HIPFIRE_GEMMA4_PLE_BATCHED_PREFILL")
+                .unwrap_or(false),
             deepseek4_q8_wmma_off: value("HIPFIRE_DEEPSEEK4_Q8_WMMA").as_deref() == Ok("0"),
             deepseek4_q8_4w_off: value("HIPFIRE_DEEPSEEK4_Q8_4W").as_deref() == Ok("0"),
             rope_interleaved_legacy: value("HIPFIRE_ROPE_INTERLEAVED_LEGACY").ok().as_deref()
@@ -708,6 +713,7 @@ impl FeatureFlags {
             mw16: false,
             q8_batched_legacy: false,
             gemma4_q8_fused_prefill: false,
+            gemma4_ple_batched_prefill: false,
             deepseek4_q8_wmma_off: false,
             deepseek4_q8_4w_off: false,
             rope_interleaved_legacy: false,
@@ -759,6 +765,7 @@ mod tests {
         let f = FeatureFlags::for_test("gfx1100");
         assert!(!f.qkvza_split_tail);
         assert!(!f.gemma4_q8_fused_prefill);
+        assert!(!f.gemma4_ple_batched_prefill);
     }
 
     #[test]
@@ -767,6 +774,9 @@ mod tests {
         layer.set_cli("kernel.qkvza_split_tail", "true").unwrap();
         layer
             .set_cli("kernel.gemma4_q8_fused_prefill", "true")
+            .unwrap();
+        layer
+            .set_cli("kernel.gemma4_ple_batched_prefill", "true")
             .unwrap();
         layer.set_cli("diagnostic.kernel.gemv_rows", "4").unwrap();
         let resolved = resolve([NamedLayer {
@@ -781,6 +791,7 @@ mod tests {
 
         assert!(flags.qkvza_split_tail);
         assert!(flags.gemma4_q8_fused_prefill);
+        assert!(flags.gemma4_ple_batched_prefill);
         assert_eq!(flags.gemv_rows, Some(4));
         assert!(flags.rdna3_hfq4_qkvza_k2048);
         assert!(flags.rdna3_hfq4_residual_stage_x32);

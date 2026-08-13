@@ -2397,6 +2397,15 @@ pub static FIELDS: &[ConfigField] = &[
         "Fuse eligible Gemma 4 Q8 prefill projections on gfx1100."
     ),
     process_bool_field!(
+        "kernel.gemma4_ple_batched_prefill",
+        "gemma4_ple_batched_prefill",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_GEMMA4_PLE_BATCHED_PREFILL",
+        "Batch the Gemma 4 E-series PLE model projection on gfx1100."
+    ),
+    process_bool_field!(
         "kernel.deepseek4_q8_wmma",
         "deepseek4_q8_wmma",
         Kernel,

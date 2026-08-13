@@ -539,6 +539,7 @@ fn prepare_per_layer_inputs_batched(
     gpu: &mut Gpu,
     tokens: &[u32],
     x: &GpuTensor,
+    x_rot: &GpuTensor,
     token_inputs: &GpuTensor,
     projection_all: &GpuTensor,
 ) -> Result<(), String> {
@@ -568,13 +569,29 @@ fn prepare_per_layer_inputs_batched(
             packed_dim,
             "batch ple embed",
         )?;
+    }
 
-        // Keep this correctness path row-wise until the production dispatcher
-        // has a matching small-M projection for every admitted dtype.
-        let x_row = x.sub_offset(row * cfg.dim, cfg.dim);
-        let projection_row = projection_all.sub_offset(row * packed_dim, packed_dim);
-        weight_gemv(gpu, &ple.model_projection, &x_row, &projection_row)
-            .map_err(|e| format!("gemma4 forward_batch ple model_projection row {row}: {e}"))?;
+    if gpu.arch == "gfx1100"
+        && gpu.flags.gemma4_ple_batched_prefill
+        && b > 1
+        && ple.model_projection.gpu_dtype == DType::Q8_0
+    {
+        proj_gemm_batched(
+            gpu,
+            &ple.model_projection,
+            x,
+            projection_all,
+            x_rot,
+            b,
+            "ple model_projection",
+        )?;
+    } else {
+        for row in 0..b {
+            let x_row = x.sub_offset(row * cfg.dim, cfg.dim);
+            let projection_row = projection_all.sub_offset(row * packed_dim, packed_dim);
+            weight_gemv(gpu, &ple.model_projection, &x_row, &projection_row)
+                .map_err(|e| format!("gemma4 forward_batch ple model_projection row {row}: {e}"))?;
+        }
     }
 
     gpu.scale_f32(token_inputs, (ple_dim as f32).sqrt())
@@ -1601,6 +1618,7 @@ pub fn forward_batch_spec(
             gpu,
             tokens,
             &x,
+            &x_rot,
             ple_token_inputs.as_ref().unwrap(),
             ple_projection_all.as_ref().unwrap(),
         )?;
