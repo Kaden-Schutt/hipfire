@@ -453,9 +453,12 @@ struct BenchArgs {
     /// Speculation mode to benchmark (off, dflash, mtp, ngram, dspark, or auto).
     #[arg(long = "spec")]
     speculation: Option<String>,
-    /// Start generation in answer mode, matching `hipfire run` when reasoning is off.
-    #[arg(long)]
-    reasoning_off: bool,
+    /// Let the model think during the benchmark. Off by default: a reasoning
+    /// model cannot close its `<think>` span inside the benchmark's token
+    /// budget, and the daemon fails such a turn closed as a validation error.
+    /// Pair this with `--max-tokens` large enough for the span to close.
+    #[arg(long = "reasoning-on")]
+    reasoning_on: bool,
     /// Prompt words for the standard benchmark.
     #[arg(num_args = 0..)]
     prompt: Vec<String>,
@@ -7062,7 +7065,11 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
     if args.matrix || args.redline {
         bench_matrix(&mut engine, &args, &loaded, &post_diag)
     } else {
-        let _ = bench_generate_with_reasoning(&mut engine, "Hello", 16, args.reasoning_off)?;
+        // The warmup exists to populate kernel caches and its output is
+        // discarded, so it stays in answer mode even under --reasoning-on: a
+        // 16-token budget cannot close a think span, and letting the warmup
+        // think would abort the run before a single measured sample.
+        let _ = bench_generate(&mut engine, "Hello", 16)?;
         let mut decode = Vec::new();
         let mut prefill = Vec::new();
         let mut wall = Vec::new();
@@ -7072,7 +7079,7 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
                 &mut engine,
                 &prompt,
                 args.max_tokens as u64,
-                args.reasoning_off,
+                args.reasoning_on,
             )?;
             if let Some(value) = done.get("decode_tok_s").and_then(serde_json::Value::as_f64) {
                 decode.push(value);
@@ -7200,8 +7207,33 @@ fn open_bench_engine(
     Ok((engine, loaded, pre_diag, post_diag))
 }
 
+/// The standard benchmark generate: greedy, fixed budget, and **answer mode**.
+///
+/// Answer mode is the default rather than an opt-in because a benchmark that
+/// lets the model think cannot complete. A reasoning model (any Qwen3.6 SKU,
+/// for one) opens `<think>` within its first tokens and has no chance of
+/// closing it inside the benchmark's budget — 16 tokens for the warmup, 128
+/// for a measured run. The daemon ranks an unclosed think span at finish above
+/// the length cap in both terminal classifiers (`QwenArTerminalCause::resolve`
+/// and `qwen_dflash_wire_terminal`), so it reports the truncation as a
+/// non-retryable validation error rather than `finish_reason=length`. The
+/// benchmark then aborts on the warmup generate, before recording a sample.
+///
+/// Benchmarks measure tokens per second and never read the text, so asking for
+/// answer mode costs nothing and removes the dependency on the model finishing
+/// a thought inside an arbitrary budget. `--reasoning-on` restores the
+/// thinking turn for anyone who wants to measure that path — with a budget
+/// large enough to close the span.
 fn bench_generate_request(prompt: &str, max_tokens: u64) -> serde_json::Value {
-    serde_json::json!({
+    bench_generate_request_reasoning(prompt, max_tokens, false)
+}
+
+fn bench_generate_request_reasoning(
+    prompt: &str,
+    max_tokens: u64,
+    reasoning_on: bool,
+) -> serde_json::Value {
+    let mut request = serde_json::json!({
         "type": "generate",
         "id": request_id(),
         "prompt": prompt,
@@ -7210,7 +7242,13 @@ fn bench_generate_request(prompt: &str, max_tokens: u64) -> serde_json::Value {
         "repeat_penalty": 1.1,
         "max_tokens": max_tokens,
         "attempt_id": 1,
-    })
+    });
+    if !reasoning_on {
+        request["max_think_tokens"] = serde_json::json!(1);
+        request["assistant_prefix"] = serde_json::json!("closed_think");
+        request["reasoning_effort"] = serde_json::json!("none");
+    }
+    request
 }
 
 fn bench_generate(engine: &mut Engine, prompt: &str, max_tokens: u64) -> Result<serde_json::Value> {
@@ -7221,14 +7259,9 @@ fn bench_generate_with_reasoning(
     engine: &mut Engine,
     prompt: &str,
     max_tokens: u64,
-    reasoning_off: bool,
+    reasoning_on: bool,
 ) -> Result<serde_json::Value> {
-    let mut request = bench_generate_request(prompt, max_tokens);
-    if reasoning_off {
-        request["max_think_tokens"] = serde_json::json!(1);
-        request["assistant_prefix"] = serde_json::json!("closed_think");
-        request["reasoning_effort"] = serde_json::json!("none");
-    }
+    let request = bench_generate_request_reasoning(prompt, max_tokens, reasoning_on);
     Ok(engine.generate(&request, |_| Ok(()))?)
 }
 
@@ -7440,7 +7473,7 @@ fn profile_command(paths: &Paths, args: ProfileArgs) -> Result<()> {
             kv_backend: None,
             redline: false,
             speculation: None,
-            reasoning_off: false,
+            reasoning_on: false,
             prompt: Vec::new(),
         };
         let (mut engine, _, _, _) = open_bench_engine(paths, &bench, None)?;
@@ -14832,6 +14865,47 @@ for line in sys.stdin:
             Some("bench prompt")
         );
         assert_eq!(req.get("max_tokens").and_then(|v| v.as_u64()), Some(37));
+    }
+
+    /// Every benchmark generate must ask for answer mode.
+    ///
+    /// A reasoning model opens `<think>` in its first tokens and cannot close
+    /// it inside a benchmark's fixed budget (16 tokens for the warmup, 128 for
+    /// the measured runs). The daemon classifies an unclosed think span at
+    /// finish as a non-retryable validation terminal *ahead of* the length cap
+    /// — `QwenArTerminalCause::resolve` and `qwen_dflash_wire_terminal` in the
+    /// daemon both order it that way — so a thinking benchmark aborts on the
+    /// warmup, before it records a single sample.
+    #[test]
+    fn bench_generate_request_is_answer_mode_by_default() {
+        let req = bench_generate_request("bench prompt", 128);
+        assert_eq!(
+            req.get("max_think_tokens").and_then(|v| v.as_u64()),
+            Some(1),
+            "benchmark generates must cap thinking"
+        );
+        assert_eq!(
+            req.get("assistant_prefix").and_then(|v| v.as_str()),
+            Some("closed_think"),
+            "benchmark generates must start in answer mode"
+        );
+        assert_eq!(
+            req.get("reasoning_effort").and_then(|v| v.as_str()),
+            Some("none")
+        );
+    }
+
+    /// `--reasoning-on` restores the thinking turn for anyone who wants to
+    /// benchmark that path, and must produce a request carrying none of the
+    /// answer-mode fields.
+    #[test]
+    fn bench_reasoning_on_opts_back_into_thinking() {
+        let req = bench_generate_request_reasoning("bench prompt", 128, true);
+        assert!(req.get("max_think_tokens").is_none());
+        assert!(req.get("assistant_prefix").is_none());
+        assert!(req.get("reasoning_effort").is_none());
+        // Still an ordinary benchmark generate otherwise.
+        assert_eq!(req.get("max_tokens").and_then(|v| v.as_u64()), Some(128));
     }
 
     #[test]
