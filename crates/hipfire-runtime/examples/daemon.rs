@@ -29311,6 +29311,38 @@ fn generate_deepseek4_heterogeneous(
 /// `bundle.eagle.is_some()` and `temp <= 1e-6` — greedy-only accept rule,
 /// same contract as DFlash. `HIPFIRE_GEMMA4_EAGLE=0` opts out.
 #[allow(clippy::too_many_arguments)]
+#[inline]
+fn gemma4_prefill_batch_for_arch(gpu_arch: &str, requested: Option<usize>) -> usize {
+    requested
+        .unwrap_or(if gpu_arch == "gfx1100" { 64 } else { 1 })
+        .clamp(1, 64)
+}
+
+#[cfg(test)]
+mod gemma4_prefill_batch_tests {
+    use super::gemma4_prefill_batch_for_arch;
+
+    #[test]
+    fn gfx1100_defaults_to_full_wmma_batch_tile_group() {
+        assert_eq!(gemma4_prefill_batch_for_arch("gfx1100", None), 64);
+    }
+
+    #[test]
+    fn unvalidated_arches_keep_the_sequential_default() {
+        for arch in ["gfx1151", "gfx1201", "gfx942"] {
+            assert_eq!(gemma4_prefill_batch_for_arch(arch, None), 1);
+        }
+    }
+
+    #[test]
+    fn explicit_override_wins_and_is_clamped() {
+        assert_eq!(gemma4_prefill_batch_for_arch("gfx1100", Some(8)), 8);
+        assert_eq!(gemma4_prefill_batch_for_arch("gfx1201", Some(32)), 32);
+        assert_eq!(gemma4_prefill_batch_for_arch("gfx1100", Some(0)), 1);
+        assert_eq!(gemma4_prefill_batch_for_arch("gfx1100", Some(128)), 64);
+    }
+}
+
 fn generate_gemma4(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
@@ -29473,10 +29505,10 @@ fn generate_gemma4(
     {
         let requested_prefill_batch = std::env::var("HIPFIRE_GEMMA4_PREFILL_BATCH")
             .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(1)
-            .clamp(1, 64);
-        let prefill_batch = if requested_prefill_batch > 1
+            .and_then(|value| value.parse::<usize>().ok());
+        let resolved_prefill_batch =
+            gemma4_prefill_batch_for_arch(&gpu.arch, requested_prefill_batch);
+        let prefill_batch = if resolved_prefill_batch > 1
             && !gemma4::forward::supports_batched_prefill(&bundle.weights)
         {
             eprintln!(
@@ -29484,7 +29516,7 @@ fn generate_gemma4(
             );
             1
         } else {
-            requested_prefill_batch
+            resolved_prefill_batch
         };
         let mut offset = 0usize;
         while offset < prompt_ids.len() {
