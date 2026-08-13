@@ -13,6 +13,9 @@
 //! evidence is to measure both here, on the same model and the same clock.
 
 use anyhow::{bail, Result};
+use std::path::Path;
+use std::sync::mpsc;
+use std::time::Instant;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BackendSel {
@@ -147,6 +150,205 @@ pub fn render_table(points: &[Point]) -> String {
     out
 }
 
+/// One concurrent backend, started once at max concurrency.
+pub trait ConcurrencyBackend {
+    fn label(&self) -> &'static str;
+    fn max_concurrency(&self) -> usize;
+    /// Run `k` concurrent streams to completion.
+    fn run(&mut self, workload: WorkloadSel, k: usize, max_tokens: u64) -> Result<ArmResult>;
+}
+
+/// Reject `k` above the started maximum instead of clamping. A clamped run
+/// would report a k=4 row that was really measured at k=2.
+pub fn check_k(b: &dyn ConcurrencyBackend, k: usize) -> Result<()> {
+    if k > b.max_concurrency() {
+        bail!(
+            "concurrency {k} exceeds {} backend maximum {}",
+            b.label(),
+            b.max_concurrency()
+        );
+    }
+    Ok(())
+}
+
+/// Fixed prompts, one per stream. Distinct so slots cannot alias each
+/// other's KV undetected — identical prompts would hide a cross-slot leak.
+pub const STREAM_PROMPTS: &[&str] = &[
+    "The capital of France is",
+    "Once upon a time, in a distant galaxy,",
+    "The recipe for a good cup of tea starts with",
+    "In machine learning, gradient descent works by",
+    "The history of the printing press begins",
+    "A well-designed database index avoids",
+    "The difference between TCP and UDP is",
+    "To sort a list in linear time you must",
+];
+
+/// Second user turn for the multi-turn arm.
+pub const FOLLOWUP_PROMPT: &str = "Explain that again in one sentence.";
+
+/// FNV-1a over a user turn — the same identity function
+/// `complete_request_slots` uses, so sessions match the production path.
+pub fn turn_hash(s: &str) -> u64 {
+    let mut h = 0xcbf29ce484222325_u64;
+    for b in s.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+pub struct SlotDriver {
+    engine: hipfire_arch_qwen35::serve_engine::SlotEngine,
+    tokenizer: hipfire_runtime::tokenizer::Tokenizer,
+    max_concurrency: usize,
+}
+
+impl SlotDriver {
+    pub fn start(model: &Path, max_concurrency: usize, cap_tokens: usize) -> Result<Self> {
+        let hfq = hipfire_runtime::hfq::HfqFile::open(model)
+            .map_err(|e| anyhow::anyhow!("slots: open {}: {e}", model.display()))?;
+        let tokenizer =
+            hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
+                .map_err(|e| anyhow::anyhow!("slots: tokenizer: {e}"))?;
+        drop(hfq);
+        let engine = hipfire_arch_qwen35::serve_engine::SlotEngine::spawn(
+            hipfire_arch_qwen35::serve_engine::EngineConfig {
+                model_path: model.to_path_buf(),
+                n_slots: max_concurrency,
+                cap_tokens,
+                host_budget_bytes: 16 * 1024 * 1024 * 1024,
+                swap_dir: std::env::temp_dir().join("hipfire-bench-swap"),
+            },
+        )
+        .map_err(|e| anyhow::anyhow!("slots: {e}"))?;
+        Ok(Self {
+            engine,
+            tokenizer,
+            max_concurrency,
+        })
+    }
+
+    /// Render one stream's prompt tokens plus its conversation identity.
+    fn render(&self, idx: usize) -> (Vec<u32>, Vec<u64>) {
+        use hipfire_runtime::prompt_frame::{AssistantPrefix, ChatFrame, Role};
+        let user = STREAM_PROMPTS[idx % STREAM_PROMPTS.len()];
+        let frame = ChatFrame {
+            tokenizer: &self.tokenizer,
+            system: None,
+            user,
+            // Benchmarks run answer-mode: a reasoning model cannot close a
+            // think span inside a benchmark budget.
+            assistant_prefix: AssistantPrefix::ClosedThink,
+            raw: false,
+        };
+        let history: Vec<(Role, &str)> = Vec::new();
+        let tokens = frame.build_multi_turn(&history);
+        (tokens, vec![turn_hash(user)])
+    }
+}
+
+impl ConcurrencyBackend for SlotDriver {
+    fn label(&self) -> &'static str {
+        "slots"
+    }
+    fn max_concurrency(&self) -> usize {
+        self.max_concurrency
+    }
+
+    fn run(&mut self, workload: WorkloadSel, k: usize, max_tokens: u64) -> Result<ArmResult> {
+        use hipfire_runtime::serve::{Event, SubmitRequest};
+        check_k(self, k)?;
+
+        let hits_before = self.engine.stats().prefix_hits;
+        let started = Instant::now();
+        let mut rxs = Vec::with_capacity(k);
+        for i in 0..k {
+            let (tx, rx) = mpsc::channel::<Event>();
+            let (prompt_tokens, convo) = self.render(i);
+            self.engine
+                .submit(SubmitRequest {
+                    session: None,
+                    prompt_tokens,
+                    convo,
+                    continuation: Vec::new(),
+                    max_tokens: max_tokens as usize,
+                    reply: tx,
+                })
+                .map_err(|e| anyhow::anyhow!("slots submit: {e}"))?;
+            rxs.push(rx);
+        }
+
+        let mut tokens = 0u64;
+        let mut rejected = 0usize;
+        let mut sessions: Vec<Option<u64>> = vec![None; k];
+        for (i, rx) in rxs.into_iter().enumerate() {
+            while let Ok(ev) = rx.recv() {
+                match ev {
+                    Event::Accepted { session } => sessions[i] = Some(session),
+                    Event::Token { .. } => tokens += 1,
+                    Event::Done { .. } => break,
+                    Event::Rejected { .. } => {
+                        rejected += 1;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Multi-turn arm: a second turn on each surviving session, which is
+        // what exercises the prefix cache.
+        if matches!(workload, WorkloadSel::Multiturn) {
+            use hipfire_runtime::prompt_frame::{continuation_suffix, AssistantPrefix};
+            let mut rxs2 = Vec::new();
+            for (i, session) in sessions.iter().enumerate() {
+                let Some(session) = session else { continue };
+                let (tx, rx) = mpsc::channel::<Event>();
+                let first = STREAM_PROMPTS[i % STREAM_PROMPTS.len()];
+                let convo = vec![turn_hash(first), turn_hash(FOLLOWUP_PROMPT)];
+                let continuation = continuation_suffix(
+                    &self.tokenizer,
+                    FOLLOWUP_PROMPT,
+                    AssistantPrefix::ClosedThink,
+                );
+                self.engine
+                    .submit(SubmitRequest {
+                        session: Some(*session),
+                        prompt_tokens: Vec::new(),
+                        convo,
+                        continuation,
+                        max_tokens: max_tokens as usize,
+                        reply: tx,
+                    })
+                    .map_err(|e| anyhow::anyhow!("slots submit turn2: {e}"))?;
+                rxs2.push(rx);
+            }
+            for rx in rxs2 {
+                while let Ok(ev) = rx.recv() {
+                    match ev {
+                        Event::Token { .. } => tokens += 1,
+                        Event::Done { .. } => break,
+                        Event::Rejected { .. } => {
+                            rejected += 1;
+                            break;
+                        }
+                        Event::Accepted { .. } => {}
+                    }
+                }
+            }
+        }
+
+        let wall_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let prefix_hits = self.engine.stats().prefix_hits.saturating_sub(hits_before);
+        Ok(ArmResult {
+            tokens,
+            wall_ms,
+            rejected,
+            prefix_hits,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,5 +426,36 @@ mod tests {
         assert!(table.contains("150.00"), "aggregate median missing: {table}");
         assert!(table.contains("75.00"), "per-stream missing: {table}");
         assert!(table.contains("slots"), "backend label missing: {table}");
+    }
+
+    /// A backend must refuse k above what it was started with rather than
+    /// silently clamping — a clamped run would publish a k=4 number that was
+    /// actually measured at k=2.
+    #[test]
+    fn run_rejects_k_above_max_concurrency() {
+        struct Fake {
+            max: usize,
+        }
+        impl ConcurrencyBackend for Fake {
+            fn label(&self) -> &'static str {
+                "fake"
+            }
+            fn max_concurrency(&self) -> usize {
+                self.max
+            }
+            fn run(&mut self, _w: WorkloadSel, k: usize, _m: u64) -> Result<ArmResult> {
+                check_k(self, k)?;
+                Ok(ArmResult {
+                    tokens: 0,
+                    wall_ms: 1.0,
+                    rejected: 0,
+                    prefix_hits: 0,
+                })
+            }
+        }
+        let mut f = Fake { max: 2 };
+        assert!(f.run(WorkloadSel::Stateless, 2, 8).is_ok());
+        let err = f.run(WorkloadSel::Stateless, 3, 8).unwrap_err().to_string();
+        assert!(err.contains("exceeds"), "unexpected error: {err}");
     }
 }
