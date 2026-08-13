@@ -3563,6 +3563,18 @@ pub const FUSED_GLIMMER_QKVG_HFQ4G256_K6656_GFX1100_SRC: &str = concat!(
     include_str!("../../../kernels/src/fused_qkvza_hfq4g256.hip")
 );
 
+// Muse Glimmer gfx1201/RDNA4 AR decode sibling of the gfx1100 K=6656 QKVG
+// identity. Same HIPFIRE_GLIMMER_QKVG_K6656 arithmetic/layout; distinct
+// symbol so gfx12 weight-cache codegen cannot alias the gfx1100 artifact.
+// Host selects only under exact Glimmer shape on is_rdna4().
+pub const FUSED_GLIMMER_QKVG_HFQ4G256_K6656_GFX1201_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    "#define HIPFIRE_GLIMMER_QKVG_K6656 1\n",
+    "#define HIPFIRE_QKVZA_KERNEL_NAME fused_glimmer_qkvg_hfq4g256_k6656_gfx1201\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkvza_hfq4g256.hip")
+);
+
 /// Radiowave gfx1100 dual-row QKVZA probe. Two adjacent rows share each
 /// K=2048 activation load while preserving independent weight streams and the
 /// shipping four-chain reduction order.
@@ -4090,6 +4102,18 @@ pub const FUSED_GLIMMER_GATE_UP_HFQ4G256_K6656_GFX1100_SRC: &str = concat!(
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/fused_gate_up_hfq4g256.hip")
 );
+// Muse Glimmer gfx1201/RDNA4 AR decode sibling of the gfx1100 K=6656 gate+up
+// identity. Same HIPFIRE_GLIMMER_GATE_UP_K6656 arithmetic/layout; distinct
+// symbol so gfx12 weight-cache codegen cannot alias the gfx1100 artifact.
+// Host selects only under exact Glimmer shape on is_rdna4().
+pub const FUSED_GLIMMER_GATE_UP_HFQ4G256_K6656_GFX1201_SRC: &str = concat!(
+    "#define HIPFIRE_FUSED_GATE_UP_KERNEL fused_glimmer_gate_up_hfq4g256_k6656_gfx1201\n",
+    "#define HIPFIRE_GLIMMER_GATE_UP_K6656 1\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_gate_up_hfq4g256.hip")
+);
+
 /// Fused gate+up for Q8_0 weights. Two Q8 GEMVs in one launch.
 /// Grid=[gate_m + up_m], block=[32]. +5.8 tok/s decode on dots.ocr.
 pub const FUSED_GATE_UP_Q8_0_SRC: &str =

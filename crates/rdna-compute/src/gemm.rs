@@ -3062,6 +3062,14 @@ impl Gpu {
             && beta_m == 256
             && alpha_m == 4_096
             && k == 6_656;
+        // Muse-owned gfx1201/RDNA4 sibling of the gfx1100 K=6656 QKVG path.
+        // Exact Glimmer shape only; does not change generic/Qwen QKVZA selection.
+        let glimmer_qkvg_k6656_gfx1201 = self.arch_caps.is_rdna4()
+            && qkv_m == 4_096
+            && z_m == 256
+            && beta_m == 256
+            && alpha_m == 4_096
+            && k == 6_656;
         let (func_name, block, grid_x) = if glimmer_qkvg_k6656_gfx1100 {
             self.ensure_kernel(
                 "fused_glimmer_qkvg_hfq4g256_k6656_gfx1100",
@@ -3070,6 +3078,17 @@ impl Gpu {
             )?;
             (
                 "fused_glimmer_qkvg_hfq4g256_k6656_gfx1100",
+                [32u32, 1, 1],
+                total_m as u32,
+            )
+        } else if glimmer_qkvg_k6656_gfx1201 {
+            self.ensure_kernel(
+                "fused_glimmer_qkvg_hfq4g256_k6656_gfx1201",
+                kernels::FUSED_GLIMMER_QKVG_HFQ4G256_K6656_GFX1201_SRC,
+                "fused_glimmer_qkvg_hfq4g256_k6656_gfx1201",
+            )?;
+            (
+                "fused_glimmer_qkvg_hfq4g256_k6656_gfx1201",
                 [32u32, 1, 1],
                 total_m as u32,
             )
@@ -21467,10 +21486,11 @@ impl Gpu {
         let cdna_wave64 = self.arch_caps.is_wave64_native();
         // Muse Glimmer exact FFN gate+up shape on gfx1100: gate_m=up_m=19968, K=6656.
         // Host-gated identity; reuses fused_gate_up_hfq4g256 arithmetic template.
-        let glimmer_gate_up_k6656_gfx1100 = self.arch_caps.is_gfx1100()
-            && gate_m == 19_968
-            && up_m == 19_968
-            && k == 6_656;
+        let glimmer_gate_up_k6656_gfx1100 =
+            self.arch_caps.is_gfx1100() && gate_m == 19_968 && up_m == 19_968 && k == 6_656;
+        // Muse-owned gfx1201/RDNA4 sibling; exact Glimmer shape only.
+        let glimmer_gate_up_k6656_gfx1201 =
+            self.arch_caps.is_rdna4() && gate_m == 19_968 && up_m == 19_968 && k == 6_656;
         let (func_name, block, grid_x) = if glimmer_gate_up_k6656_gfx1100 {
             self.ensure_kernel(
                 "fused_glimmer_gate_up_hfq4g256_k6656_gfx1100",
@@ -21479,6 +21499,17 @@ impl Gpu {
             )?;
             (
                 "fused_glimmer_gate_up_hfq4g256_k6656_gfx1100",
+                [32u32, 1, 1],
+                (gate_m + up_m) as u32,
+            )
+        } else if glimmer_gate_up_k6656_gfx1201 {
+            self.ensure_kernel(
+                "fused_glimmer_gate_up_hfq4g256_k6656_gfx1201",
+                kernels::FUSED_GLIMMER_GATE_UP_HFQ4G256_K6656_GFX1201_SRC,
+                "fused_glimmer_gate_up_hfq4g256_k6656_gfx1201",
+            )?;
+            (
+                "fused_glimmer_gate_up_hfq4g256_k6656_gfx1201",
                 [32u32, 1, 1],
                 (gate_m + up_m) as u32,
             )
@@ -24116,7 +24147,10 @@ impl Gpu {
         ];
         let bytes = 8 * (crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4);
         let timer = crate::profile::begin_timer(
-            &self.hip, "gemv", "gemv_mq4g256_moe_gate_up_k8_indexed", bytes,
+            &self.hip,
+            "gemv",
+            "gemv_mq4g256_moe_gate_up_k8_indexed",
+            bytes,
         );
         let result =
             self.launch_maybe_blob(func_name, [grid_x, 8, 1], block, 0, &mut params, || {
@@ -24172,25 +24206,24 @@ impl Gpu {
             &mut m_val as *mut _ as *mut std::ffi::c_void,
             &mut k_val as *mut _ as *mut std::ffi::c_void,
         ];
-        let result =
-            self.launch_maybe_blob(
-                "gemv_q8_0_moe_gate_up_k8_indexed",
-                [m as u32, 8, 1],
-                [32u32, 1, 1],
-                0,
-                &mut params,
-                || {
-                    let mut b = hip_bridge::KernargBlob::new();
-                    b.push_ptr(pp);
-                    b.push_ptr(ip);
-                    b.push_ptr(xp);
-                    b.push_ptr(ygp);
-                    b.push_ptr(yup);
-                    b.push_i32(m_val);
-                    b.push_i32(k_val);
-                    b
-                },
-            );
+        let result = self.launch_maybe_blob(
+            "gemv_q8_0_moe_gate_up_k8_indexed",
+            [m as u32, 8, 1],
+            [32u32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(xp);
+                b.push_ptr(ygp);
+                b.push_ptr(yup);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        );
         result
     }
 
@@ -24232,39 +24265,135 @@ impl Gpu {
             &mut m_val as *mut _ as *mut std::ffi::c_void,
             &mut k_val as *mut _ as *mut std::ffi::c_void,
         ];
-        let result =
-            self.launch_maybe_blob(
-                "gemv_q8_0_moe_down_residual_scaled_k8_indexed",
-                [m as u32, 8, 1],
-                [32u32, 1, 1],
-                0,
-                &mut params,
-                || {
-                    let mut b = hip_bridge::KernargBlob::new();
-                    b.push_ptr(pp);
-                    b.push_ptr(ip);
-                    b.push_ptr(wp);
-                    b.push_ptr(sp);
-                    b.push_ptr(hbp);
-                    b.push_ptr(xrp);
-                    b.push_i32(m_val);
-                    b.push_i32(k_val);
-                    b
-                },
-            );
+        let result = self.launch_maybe_blob(
+            "gemv_q8_0_moe_down_residual_scaled_k8_indexed",
+            [m as u32, 8, 1],
+            [32u32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_ptr(sp);
+                b.push_ptr(hbp);
+                b.push_ptr(xrp);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        );
         result
     }
 
     #[allow(unused_variables)]
-    pub fn gemv_hfq4g128_moe_down_residual_scaled_k8_indexed(&mut self, expert_ptrs: &GpuTensor, topk_indices: &GpuTensor, topk_weights: &GpuTensor, per_expert_scale: &GpuTensor, hidden_batch: &GpuTensor, x_residual: &GpuTensor, m: usize, k: usize) -> HipResult<()> { Err(hip_bridge::HipError::new(0, "MoE kernel not yet ported (Phase 4)")) }
+    pub fn gemv_hfq4g128_moe_down_residual_scaled_k8_indexed(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        topk_weights: &GpuTensor,
+        per_expert_scale: &GpuTensor,
+        hidden_batch: &GpuTensor,
+        x_residual: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        Err(hip_bridge::HipError::new(
+            0,
+            "MoE kernel not yet ported (Phase 4)",
+        ))
+    }
     #[allow(unused_variables)]
-    pub fn gemv_hfq4g128_moe_down_residual_scaled_k8_indexed_batched(&mut self, expert_ptrs: &GpuTensor, topk_indices: &GpuTensor, topk_weights: &GpuTensor, per_expert_scale: &GpuTensor, hidden_batch: &GpuTensor, x_residual: &GpuTensor, m: usize, k: usize, k_top: usize, batch_size: usize) -> HipResult<()> { Err(hip_bridge::HipError::new(0, "MoE kernel not yet ported (Phase 4)")) }
+    pub fn gemv_hfq4g128_moe_down_residual_scaled_k8_indexed_batched(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        topk_weights: &GpuTensor,
+        per_expert_scale: &GpuTensor,
+        hidden_batch: &GpuTensor,
+        x_residual: &GpuTensor,
+        m: usize,
+        k: usize,
+        k_top: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        Err(hip_bridge::HipError::new(
+            0,
+            "MoE kernel not yet ported (Phase 4)",
+        ))
+    }
     #[allow(unused_variables)]
-    pub fn gemv_mq4g256_moe_gate_up_bucketed(&mut self, expert_ptrs: &GpuTensor, expert_offsets: &GpuTensor, expert_token_list: &GpuTensor, x_rot: &GpuTensor, y_gate: &GpuTensor, y_up: &GpuTensor, m: usize, k: usize, k_top: usize, n_exp: usize) -> HipResult<()> { Err(hip_bridge::HipError::new(0, "MoE kernel not yet ported (Phase 4)")) }
+    pub fn gemv_mq4g256_moe_gate_up_bucketed(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        expert_offsets: &GpuTensor,
+        expert_token_list: &GpuTensor,
+        x_rot: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        m: usize,
+        k: usize,
+        k_top: usize,
+        n_exp: usize,
+    ) -> HipResult<()> {
+        Err(hip_bridge::HipError::new(
+            0,
+            "MoE kernel not yet ported (Phase 4)",
+        ))
+    }
     #[allow(unused_variables)]
-    pub fn gemv_hfq4g256_moe_gate_up_bucketed(&mut self, expert_ptrs: &GpuTensor, expert_offsets: &GpuTensor, expert_token_list: &GpuTensor, x: &GpuTensor, y_gate: &GpuTensor, y_up: &GpuTensor, m: usize, k: usize, k_top: usize, n_exp: usize) -> HipResult<()> { Err(hip_bridge::HipError::new(0, "MoE kernel not yet ported (Phase 4)")) }
+    pub fn gemv_hfq4g256_moe_gate_up_bucketed(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        expert_offsets: &GpuTensor,
+        expert_token_list: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        m: usize,
+        k: usize,
+        k_top: usize,
+        n_exp: usize,
+    ) -> HipResult<()> {
+        Err(hip_bridge::HipError::new(
+            0,
+            "MoE kernel not yet ported (Phase 4)",
+        ))
+    }
     #[allow(unused_variables)]
-    pub fn gemv_hfq4g128_moe_down_residual_scaled_bucketed(&mut self, expert_ptrs: &GpuTensor, expert_offsets: &GpuTensor, expert_token_list: &GpuTensor, topk_weights: &GpuTensor, per_expert_scale: &GpuTensor, hidden_batch: &GpuTensor, x_residual: &GpuTensor, m: usize, k: usize, k_top: usize, n_exp: usize) -> HipResult<()> { Err(hip_bridge::HipError::new(0, "MoE kernel not yet ported (Phase 4)")) }
+    pub fn gemv_hfq4g128_moe_down_residual_scaled_bucketed(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        expert_offsets: &GpuTensor,
+        expert_token_list: &GpuTensor,
+        topk_weights: &GpuTensor,
+        per_expert_scale: &GpuTensor,
+        hidden_batch: &GpuTensor,
+        x_residual: &GpuTensor,
+        m: usize,
+        k: usize,
+        k_top: usize,
+        n_exp: usize,
+    ) -> HipResult<()> {
+        Err(hip_bridge::HipError::new(
+            0,
+            "MoE kernel not yet ported (Phase 4)",
+        ))
+    }
     #[allow(unused_variables)]
-    pub fn moe_bucket_build(&mut self, topk_indices: &GpuTensor, expert_offsets: &GpuTensor, expert_token_list: &GpuTensor, n_batch: usize, k_top: usize, n_exp: usize) -> HipResult<()> { Err(hip_bridge::HipError::new(0, "MoE kernel not yet ported (Phase 4)")) }
+    pub fn moe_bucket_build(
+        &mut self,
+        topk_indices: &GpuTensor,
+        expert_offsets: &GpuTensor,
+        expert_token_list: &GpuTensor,
+        n_batch: usize,
+        k_top: usize,
+        n_exp: usize,
+    ) -> HipResult<()> {
+        Err(hip_bridge::HipError::new(
+            0,
+            "MoE kernel not yet ported (Phase 4)",
+        ))
+    }
 }

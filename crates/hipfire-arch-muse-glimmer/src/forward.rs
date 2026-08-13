@@ -263,6 +263,15 @@ fn fused_qk_rope_enabled() -> bool {
     }
 }
 
+/// Experiment gate for Muse-owned AR decode QKVG + gate/up projection fusions
+/// (`fused_qkvza_hfq4g256` / `fused_gate_up_hfq4g256` exact Glimmer K=6656
+/// shapes on gfx1100 and gfx1201/RDNA4). Default ON (unset); `0` forces the
+/// sequential weight_gemv_prerotated path on every arch. Shape/dtype/shared-rot
+/// predicates still apply when enabled.
+fn fused_decode_enabled() -> bool {
+    std::env::var("HIPFIRE_GLIMMER_FUSED_DECODE").as_deref() != Ok("0")
+}
+
 /// Chunk size for batched prefill: 192 for prompts >= 512 tokens, else 256.
 /// Overridable via `HIPFIRE_GLIMMER_PREFILL_CHUNK` (clamped to 1-512); the
 /// rationale for the split is on the function body below.
@@ -555,14 +564,16 @@ fn glimmer_layer_decode(
             rms_eps,
         )
         .map_err(|e| format!("glimmer L{layer_idx}: fused input rmsnorm+rotate: {e:?}"))?;
-        // gfx1100 MQ4/HFQ4 exact Glimmer shape: one fused Q+K+V+attn_gate GEMV
-        // (K=6656) instead of four sequential launches. fused_qkvza_hfq4g256
-        // selects the Glimmer-shaped module at (4096,256,256,4096,6656).
+        // gfx1100 / gfx1201 MQ4/HFQ4 exact Glimmer shape: one fused Q+K+V+attn_gate
+        // GEMV (K=6656) instead of four sequential launches. fused_qkvza_hfq4g256
+        // selects Muse-named K6656 modules: gfx1100 or gfx1201 symbols.
+        // HIPFIRE_GLIMMER_FUSED_DECODE=0 disables on every arch (A/B kill switch).
         let dt = lw.q_proj.gpu_dtype;
         let qkvg_same = lw.k_proj.gpu_dtype == dt
             && lw.v_proj.gpu_dtype == dt
             && lw.attn_gate_proj.gpu_dtype == dt;
-        let fused_qkvg = gpu.arch_caps.is_gfx1100()
+        let fused_qkvg = fused_decode_enabled()
+            && (gpu.arch_caps.is_gfx1100() || gpu.arch_caps.is_rdna4())
             && qkvg_same
             && matches!(dt, DType::MQ4G256 | DType::HFQ4G256)
             && lw.q_proj.m == 4096
@@ -906,10 +917,12 @@ fn glimmer_layer_decode(
             rms_eps,
         )
         .map_err(|e| format!("glimmer L{layer_idx}: fused pre_ffn rmsnorm+rotate: {e:?}"))?;
-        // gfx1100 MQ4/HFQ4 exact Glimmer FFN shape: one fused gate+up GEMV
+        // gfx1100 / gfx1201 MQ4/HFQ4 exact Glimmer FFN shape: one fused gate+up GEMV
         // (gate_m=up_m=19968, K=6656) instead of two sequential launches.
+        // HIPFIRE_GLIMMER_FUSED_DECODE=0 disables on every arch (A/B kill switch).
         let dt = lw.gate_proj.gpu_dtype;
-        let fused_gu = gpu.arch_caps.is_gfx1100()
+        let fused_gu = fused_decode_enabled()
+            && (gpu.arch_caps.is_gfx1100() || gpu.arch_caps.is_rdna4())
             && lw.up_proj.gpu_dtype == dt
             && matches!(dt, DType::MQ4G256 | DType::HFQ4G256)
             && lw.gate_proj.m == 19968
