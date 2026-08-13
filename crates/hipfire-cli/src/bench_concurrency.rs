@@ -349,6 +349,109 @@ impl ConcurrencyBackend for SlotDriver {
     }
 }
 
+/// One batch-route generate request.
+///
+/// `serve_continuous_batch` is what puts the daemon on
+/// `drive_qwen_continuous_batch`; without it the request runs sequentially and
+/// the resulting numbers would describe a non-batched run. Answer-mode fields
+/// mirror `bench_generate_request` so both backends measure the same turn.
+pub fn batch_request(prompt: &str, max_tokens: u64, id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "generate",
+        "id": id,
+        "prompt": prompt,
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "repeat_penalty": 1.1,
+        "max_tokens": max_tokens,
+        "attempt_id": 1,
+        "serve_continuous_batch": true,
+        "max_think_tokens": 1,
+        "assistant_prefix": "closed_think",
+        "reasoning_effort": "none",
+    })
+}
+
+pub struct DaemonDriver {
+    engine: hipfire_client::Engine,
+    max_concurrency: usize,
+}
+
+impl DaemonDriver {
+    /// `capable` is the daemon's own `continuous_batch_capable` from the load
+    /// reply. Refusing here turns "this daemon cannot batch" into a reported
+    /// result rather than a run that silently measures sequential execution.
+    pub fn start(
+        engine: hipfire_client::Engine,
+        max_concurrency: usize,
+        capable: bool,
+    ) -> Result<Self> {
+        if !capable {
+            bail!("daemon does not advertise continuous_batch_capable");
+        }
+        Ok(Self {
+            engine,
+            max_concurrency,
+        })
+    }
+}
+
+impl ConcurrencyBackend for DaemonDriver {
+    fn label(&self) -> &'static str {
+        "batch"
+    }
+    fn max_concurrency(&self) -> usize {
+        self.max_concurrency
+    }
+
+    fn run(&mut self, workload: WorkloadSel, k: usize, max_tokens: u64) -> Result<ArmResult> {
+        check_k(self, k)?;
+        // The batch route rejects multi-turn (`batch_messages_are_single_user`),
+        // so this arm is sequential by construction on this backend. Report it
+        // rather than pretending it batched.
+        let _ = workload;
+
+        let started = Instant::now();
+        // PIPELINE: every request goes out before any reply is read.
+        // `Engine::generate` would block per request and serialise exactly the
+        // behaviour under test.
+        for i in 0..k {
+            let id = format!("bench-conc-{i}");
+            let prompt = STREAM_PROMPTS[i % STREAM_PROMPTS.len()];
+            self.engine
+                .send(&batch_request(prompt, max_tokens, &id))
+                .map_err(|e| anyhow::anyhow!("batch send: {e}"))?;
+        }
+
+        let mut tokens = 0u64;
+        let mut rejected = 0usize;
+        let mut done = 0usize;
+        while done < k {
+            let frame = self
+                .engine
+                .recv()
+                .map_err(|e| anyhow::anyhow!("batch recv: {e}"))?;
+            match frame.get("type").and_then(serde_json::Value::as_str) {
+                Some("token") => tokens += 1,
+                Some("done") => done += 1,
+                Some("error") => {
+                    rejected += 1;
+                    done += 1;
+                }
+                _ => {}
+            }
+        }
+
+        let wall_ms = started.elapsed().as_secs_f64() * 1000.0;
+        Ok(ArmResult {
+            tokens,
+            wall_ms,
+            rejected,
+            prefix_hits: 0,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -457,5 +560,27 @@ mod tests {
         assert!(f.run(WorkloadSel::Stateless, 2, 8).is_ok());
         let err = f.run(WorkloadSel::Stateless, 3, 8).unwrap_err().to_string();
         assert!(err.contains("exceeds"), "unexpected error: {err}");
+    }
+
+    /// The daemon batch route only engages when the request opts in AND the
+    /// request stays answer-mode. A request missing `serve_continuous_batch`
+    /// silently runs sequentially, which would report batching numbers for a
+    /// non-batched run.
+    #[test]
+    fn batch_request_opts_into_the_batch_route_and_answer_mode() {
+        let r = batch_request("hello", 64, "bench-c-1");
+        assert_eq!(
+            r.get("serve_continuous_batch").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(r.get("type").and_then(|v| v.as_str()), Some("generate"));
+        assert_eq!(r.get("id").and_then(|v| v.as_str()), Some("bench-c-1"));
+        assert_eq!(r.get("max_tokens").and_then(|v| v.as_u64()), Some(64));
+        // Answer mode, same contract as the single-stream bench path.
+        assert_eq!(r.get("max_think_tokens").and_then(|v| v.as_u64()), Some(1));
+        assert_eq!(
+            r.get("assistant_prefix").and_then(|v| v.as_str()),
+            Some("closed_think")
+        );
     }
 }
