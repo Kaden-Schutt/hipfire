@@ -12,6 +12,8 @@ GPU_ID="${GPU_ID:-0}"
 BATCHES="${BATCHES:-8 16 32 64}"
 LIMIT="${LIMIT:-10}"
 MAX_TOKENS="${MAX_TOKENS:-16}"
+REPEATS="${REPEATS:-1}"
+FUSED_Q8_PREFILL="${FUSED_Q8_PREFILL:-0}"
 COOLDOWN="${COOLDOWN:-10}"
 RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 OUT_ROOT="${OUT_ROOT:-$ROOT/target/validation/gemma4-gfx11-prefill-batch/$RUN_ID}"
@@ -21,6 +23,10 @@ for file in "$DAEMON" "$E2B" "$E4B" "$DATASET"; do
 done
 
 mkdir -p "$OUT_ROOT"
+fused_args=()
+if [[ "$FUSED_Q8_PREFILL" == 1 ]]; then
+    fused_args+=(--q8-fused-prefill)
+fi
 for model in e2b e4b; do
     if [[ "$model" == e2b ]]; then artifact="$E2B"; else artifact="$E4B"; fi
     for batch in $BATCHES; do
@@ -31,7 +37,8 @@ for model in e2b e4b; do
             --out-dir "$OUT_ROOT/$model/b${batch}" --physical-gpu "$GPU_ID" \
             --runtime-home "/tmp/hipfire-gemma4-${model}-gfx11-b${batch}" \
             --max-seq 8192 --max-tokens "$MAX_TOKENS" --limit "$LIMIT" \
-            --prefill-batch "$batch" --timeout 1800
+            --prefill-batch "$batch" --repeats "$REPEATS" --timeout 1800 \
+            "${fused_args[@]}"
         sleep "$COOLDOWN"
     done
 done

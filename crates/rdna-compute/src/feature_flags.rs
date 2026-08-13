@@ -179,6 +179,9 @@ pub struct FeatureFlags {
     pub deterministic: bool,
     pub mw16: bool,
     pub q8_batched_legacy: bool,
+    /// Fuse Gemma 4 Q8 prefill projections on exact gfx1100. This remains an
+    /// opt-in while the E-series path is validated across QKV-sharing shapes.
+    pub gemma4_q8_fused_prefill: bool,
     /// `HIPFIRE_DEEPSEEK4_Q8_WMMA=0` disables the Q8_0 dense WMMA prefill path
     /// (forces the scalar chunked fallback). Consumed by
     /// `gemm_q8_0_wmma_prefill_auto`.
@@ -483,6 +486,7 @@ impl FeatureFlags {
             deterministic: value("HIPFIRE_DETERMINISTIC").ok().as_deref() == Some("1"),
             mw16: value("HIPFIRE_MW16").map_or(false, |v| v == "1"),
             q8_batched_legacy: value("HIPFIRE_Q8_BATCHED_LEGACY").as_deref() == Ok("1"),
+            gemma4_q8_fused_prefill: parse_bool("HIPFIRE_GEMMA4_Q8_FUSED_PREFILL").unwrap_or(false),
             deepseek4_q8_wmma_off: value("HIPFIRE_DEEPSEEK4_Q8_WMMA").as_deref() == Ok("0"),
             deepseek4_q8_4w_off: value("HIPFIRE_DEEPSEEK4_Q8_4W").as_deref() == Ok("0"),
             rope_interleaved_legacy: value("HIPFIRE_ROPE_INTERLEAVED_LEGACY").ok().as_deref()
@@ -703,6 +707,7 @@ impl FeatureFlags {
             deterministic: false,
             mw16: false,
             q8_batched_legacy: false,
+            gemma4_q8_fused_prefill: false,
             deepseek4_q8_wmma_off: false,
             deepseek4_q8_4w_off: false,
             rope_interleaved_legacy: false,
@@ -753,12 +758,16 @@ mod tests {
     fn qkvza_split_tail_defaults_false_in_test_ctor() {
         let f = FeatureFlags::for_test("gfx1100");
         assert!(!f.qkvza_split_tail);
+        assert!(!f.gemma4_q8_fused_prefill);
     }
 
     #[test]
     fn process_config_preserves_explicit_and_arch_default_flags() {
         let mut layer = ConfigLayer::default();
         layer.set_cli("kernel.qkvza_split_tail", "true").unwrap();
+        layer
+            .set_cli("kernel.gemma4_q8_fused_prefill", "true")
+            .unwrap();
         layer.set_cli("diagnostic.kernel.gemv_rows", "4").unwrap();
         let resolved = resolve([NamedLayer {
             source: ConfigSource::GlobalUser {
@@ -771,6 +780,7 @@ mod tests {
         let flags = FeatureFlags::from_process_config("gfx1100", &process);
 
         assert!(flags.qkvza_split_tail);
+        assert!(flags.gemma4_q8_fused_prefill);
         assert_eq!(flags.gemv_rows, Some(4));
         assert!(flags.rdna3_hfq4_qkvza_k2048);
         assert!(flags.rdna3_hfq4_residual_stage_x32);

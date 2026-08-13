@@ -23,3 +23,27 @@ A second gate ran the first 30 GSM8K prompts with the normal 4,096-token output 
 The Q8 projection path already selects the wave32 `gemm_q8_0_wmma` kernel on gfx1100. The main loss at batch 8 is under-filled 16-row WMMA tiles plus repeated per-chunk fixed overhead. This change therefore selects batch 64 by default only on exact `gfx1100`. `HIPFIRE_GEMMA4_PREFILL_BATCH` remains authoritative, and all unvalidated architectures retain the existing batch-1 default.
 
 Reproduce with `scripts/bench-gemma4-gfx11-prefill-batch.sh`.
+
+## Q8 Projection Fusion Probe
+
+The existing gfx1100 fused Q8 WMMA kernels can stage one shared activation for QKV or gate/up projections. The Gemma path admits them only behind `HIPFIRE_GEMMA4_Q8_FUSED_PREFILL=1`; shared-KV layers remain Q-only, and the flag is ignored outside exact gfx1100.
+
+Three repeats of the same ten-prompt batch-64 workload produced the following medians:
+
+| Model | Fusion | Prefill tok/s | TTFT ms | Decode tok/s |
+|---|---|---:|---:|---:|
+| Gemma 4 E2B Q8 | off | 1,173.600 | 650.165 | 103.900 |
+| Gemma 4 E2B Q8 | on | 1,182.945 | 645.754 | 103.230 |
+| Gemma 4 E4B Q8 | off | 864.170 | 883.111 | 68.970 |
+| Gemma 4 E4B Q8 | on | 869.055 | 875.057 | 68.235 |
+
+Prefill improved by 0.80% on E2B and 0.57% on E4B; all 60 paired outputs were byte-identical. The gain is positive but too small to promote the route to a default. The flag remains an opt-in characterization path while the larger 64x64 four-wave WMMA dispatcher is evaluated.
+
+Reproduce the paired runs with:
+
+```bash
+FUSED_Q8_PREFILL=0 BATCHES=64 LIMIT=10 REPEATS=3 \
+  scripts/bench-gemma4-gfx11-prefill-batch.sh
+FUSED_Q8_PREFILL=1 BATCHES=64 LIMIT=10 REPEATS=3 \
+  scripts/bench-gemma4-gfx11-prefill-batch.sh
+```

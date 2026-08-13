@@ -2388,6 +2388,15 @@ pub static FIELDS: &[ConfigField] = &[
         "Use the legacy batched Q8 route."
     ),
     process_bool_field!(
+        "kernel.gemma4_q8_fused_prefill",
+        "gemma4_q8_fused_prefill",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_GEMMA4_Q8_FUSED_PREFILL",
+        "Fuse eligible Gemma 4 Q8 prefill projections on gfx1100."
+    ),
+    process_bool_field!(
         "kernel.deepseek4_q8_wmma",
         "deepseek4_q8_wmma",
         Kernel,

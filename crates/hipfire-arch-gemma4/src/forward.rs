@@ -2008,18 +2008,65 @@ fn batch_attn_block(
         .map_err(|e| format!("gemma4 batch attn input rmsnorm: {e:?}"))?;
 
     // Shared-KV layers only project Q. K/V are read from the latest preceding
-    // layer with the same attention type.
-    proj_gemm_batched(gpu, a.q_proj, nrm, q, x_rot, b, "q_proj")?;
-    if a.write_slot.is_some() {
-        proj_gemm_batched(gpu, a.k_proj, nrm, k, x_rot, b, "k_proj")?;
-        match a.v_proj {
-            Some(vw) => {
-                proj_gemm_batched(gpu, vw, nrm, v, x_rot, b, "v_proj")?;
-            }
-            None => {
-                gpu.hip
-                    .memcpy_dtod_at(&v.buf, 0, &k.buf, 0, b * kv_dim * 4)
-                    .map_err(|e| format!("gemma4 batch attn k→v copy: {e:?}"))?;
+    // layer with the same attention type. On exact gfx1100, opt in to the
+    // existing fused Q8 WMMA projections so the common activation is staged
+    // once instead of once per matrix.
+    let fuse_q8 = gpu.arch == "gfx1100"
+        && gpu.flags.gemma4_q8_fused_prefill
+        && a.write_slot.is_some()
+        && a.q_proj.gpu_dtype == DType::Q8_0
+        && a.k_proj.gpu_dtype == DType::Q8_0
+        && a.q_proj.k == a.k_proj.k
+        && a.q_proj.k % 32 == 0;
+    match (fuse_q8, a.v_proj) {
+        (true, Some(vw)) if vw.gpu_dtype == DType::Q8_0 && vw.k == a.q_proj.k => {
+            gpu.gemm_qkv_q8_0_wmma(
+                &a.q_proj.buf,
+                &a.k_proj.buf,
+                &vw.buf,
+                nrm,
+                q,
+                k,
+                v,
+                a.q_proj.m,
+                a.k_proj.m,
+                vw.m,
+                a.q_proj.k,
+                b,
+            )
+            .map_err(|e| format!("gemma4 batch fused qkv (q8): {e:?}"))?;
+        }
+        (true, None) => {
+            gpu.gemm_gate_up_q8_0_wmma(
+                &a.q_proj.buf,
+                &a.k_proj.buf,
+                nrm,
+                q,
+                k,
+                a.q_proj.m,
+                a.k_proj.m,
+                a.q_proj.k,
+                b,
+            )
+            .map_err(|e| format!("gemma4 batch fused qk (q8): {e:?}"))?;
+            gpu.hip
+                .memcpy_dtod_at(&v.buf, 0, &k.buf, 0, b * kv_dim * 4)
+                .map_err(|e| format!("gemma4 batch attn k→v copy: {e:?}"))?;
+        }
+        _ => {
+            proj_gemm_batched(gpu, a.q_proj, nrm, q, x_rot, b, "q_proj")?;
+            if a.write_slot.is_some() {
+                proj_gemm_batched(gpu, a.k_proj, nrm, k, x_rot, b, "k_proj")?;
+                match a.v_proj {
+                    Some(vw) => {
+                        proj_gemm_batched(gpu, vw, nrm, v, x_rot, b, "v_proj")?;
+                    }
+                    None => {
+                        gpu.hip
+                            .memcpy_dtod_at(&v.buf, 0, &k.buf, 0, b * kv_dim * 4)
+                            .map_err(|e| format!("gemma4 batch attn k→v copy: {e:?}"))?;
+                    }
+                }
             }
         }
     }
@@ -2189,8 +2236,29 @@ fn batch_ffn_block(
         .map_err(|e| format!("gemma4 batch ffn save residual: {e:?}"))?;
 
     // 2) gate / up projections (shared nrm input).
-    proj_gemm_batched(gpu, tail.gate_proj, nrm, gate_ffn, ffn_rot, b, "gate_proj")?;
-    proj_gemm_batched(gpu, tail.up_proj, nrm, up_ffn, ffn_rot, b, "up_proj")?;
+    if gpu.arch == "gfx1100"
+        && gpu.flags.gemma4_q8_fused_prefill
+        && tail.gate_proj.gpu_dtype == DType::Q8_0
+        && tail.up_proj.gpu_dtype == DType::Q8_0
+        && tail.gate_proj.k == tail.up_proj.k
+        && tail.gate_proj.k % 32 == 0
+    {
+        gpu.gemm_gate_up_q8_0_wmma(
+            &tail.gate_proj.buf,
+            &tail.up_proj.buf,
+            nrm,
+            gate_ffn,
+            up_ffn,
+            tail.gate_proj.m,
+            tail.up_proj.m,
+            tail.gate_proj.k,
+            b,
+        )
+        .map_err(|e| format!("gemma4 batch fused gate+up (q8): {e:?}"))?;
+    } else {
+        proj_gemm_batched(gpu, tail.gate_proj, nrm, gate_ffn, ffn_rot, b, "gate_proj")?;
+        proj_gemm_batched(gpu, tail.up_proj, nrm, up_ffn, ffn_rot, b, "up_proj")?;
+    }
 
     // 3) hidden = gelu_tanh(gate) * up  (elementwise over B*ffn_hd).
     gpu.gelu_tanh_f32(gate_ffn, ffn_hidden, b * ffn_hd)
