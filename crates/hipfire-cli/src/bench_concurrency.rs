@@ -194,6 +194,30 @@ pub const STREAM_PROMPTS: &[&str] = &[
 /// Second user turn for the multi-turn arm.
 pub const FOLLOWUP_PROMPT: &str = "Explain that again in one sentence.";
 
+/// A stream's prompt, made unique per (run, stream) so no prompt is ever
+/// submitted twice in a sweep.
+///
+/// This is load-bearing for fairness, not cosmetic. The two backends cache on
+/// different keys and a repeated prompt is exactly the case where they
+/// diverge:
+///
+/// - the daemon holds a token-level longest-common-prefix cache, so resending
+///   an identical prompt lets it skip prefill entirely;
+/// - the slot engine keys on conversation identity and `find_continuation`
+///   returns `None` outright for a single-turn `convo`
+///   (`session_table.rs:170`), so a repeat can never hit.
+///
+/// Cycling a fixed prompt list therefore hands the daemon free prefills and
+/// denies the slot engine any — an asymmetry worth ~a prefill per request,
+/// all of it favouring the daemon. Varying the leading token defeats the LCP
+/// match at position 0 and costs the slot engine nothing it could have used.
+pub fn stream_prompt(run: usize, stream: usize) -> String {
+    format!(
+        "Q{run}-{stream}. {}",
+        STREAM_PROMPTS[stream % STREAM_PROMPTS.len()]
+    )
+}
+
 /// FNV-1a over a user turn — the same identity function
 /// `complete_request_slots` uses, so sessions match the production path.
 pub fn turn_hash(s: &str) -> u64 {
@@ -209,6 +233,9 @@ pub struct SlotDriver {
     engine: hipfire_arch_qwen35::serve_engine::SlotEngine,
     tokenizer: hipfire_runtime::tokenizer::Tokenizer,
     max_concurrency: usize,
+    /// Monotonic run counter, so every prompt in a sweep is unique. See
+    /// `stream_prompt` for why that is load-bearing.
+    seq: usize,
 }
 
 impl SlotDriver {
@@ -241,13 +268,15 @@ impl SlotDriver {
             engine,
             tokenizer,
             max_concurrency,
+            seq: 0,
         })
     }
 
     /// Render one stream's prompt tokens plus its conversation identity.
-    fn render(&self, idx: usize) -> (Vec<u32>, Vec<u64>) {
+    fn render(&self, run: usize, idx: usize) -> (Vec<u32>, Vec<u64>) {
         use hipfire_runtime::prompt_frame::{AssistantPrefix, ChatFrame, Role};
-        let user = STREAM_PROMPTS[idx % STREAM_PROMPTS.len()];
+        let owned = stream_prompt(run, idx);
+        let user = owned.as_str();
         let frame = ChatFrame {
             tokenizer: &self.tokenizer,
             system: None,
@@ -276,11 +305,13 @@ impl ConcurrencyBackend for SlotDriver {
         check_k(self, k)?;
 
         let hits_before = self.engine.stats().prefix_hits;
+        self.seq += 1;
+        let run = self.seq;
         let started = Instant::now();
         let mut rxs = Vec::with_capacity(k);
         for i in 0..k {
             let (tx, rx) = mpsc::channel::<Event>();
-            let (prompt_tokens, convo) = self.render(i);
+            let (prompt_tokens, convo) = self.render(run, i);
             self.engine
                 .submit(SubmitRequest {
                     session: None,
@@ -319,8 +350,8 @@ impl ConcurrencyBackend for SlotDriver {
             for (i, session) in sessions.iter().enumerate() {
                 let Some(session) = session else { continue };
                 let (tx, rx) = mpsc::channel::<Event>();
-                let first = STREAM_PROMPTS[i % STREAM_PROMPTS.len()];
-                let convo = vec![turn_hash(first), turn_hash(FOLLOWUP_PROMPT)];
+                let first = stream_prompt(run, i);
+                let convo = vec![turn_hash(&first), turn_hash(FOLLOWUP_PROMPT)];
                 let continuation = continuation_suffix(
                     &self.tokenizer,
                     FOLLOWUP_PROMPT,
@@ -402,6 +433,10 @@ pub fn batch_request(prompt: &str, max_tokens: u64, id: &str) -> serde_json::Val
 pub struct SequentialDriver {
     engine: hipfire_client::Engine,
     max_concurrency: usize,
+    /// Monotonic run counter — see `stream_prompt`. Without this the daemon's
+    /// longest-common-prefix cache serves a repeated prompt from KV and the
+    /// arm measures cached prefill rather than the real thing.
+    seq: usize,
 }
 
 impl SequentialDriver {
@@ -409,6 +444,7 @@ impl SequentialDriver {
         Ok(Self {
             engine,
             max_concurrency,
+            seq: 0,
         })
     }
 }
@@ -432,19 +468,18 @@ impl ConcurrencyBackend for SequentialDriver {
             1
         };
 
+        self.seq += 1;
+        let run = self.seq;
         let started = Instant::now();
         let mut tokens = 0u64;
         let mut rejected = 0usize;
         for i in 0..k {
             for turn in 0..turns {
+                let base = stream_prompt(run, i);
                 let prompt = if turn == 0 {
-                    STREAM_PROMPTS[i % STREAM_PROMPTS.len()].to_string()
+                    base
                 } else {
-                    format!(
-                        "{} {}",
-                        STREAM_PROMPTS[i % STREAM_PROMPTS.len()],
-                        FOLLOWUP_PROMPT
-                    )
+                    format!("{base} {FOLLOWUP_PROMPT}")
                 };
                 let req = batch_request(&prompt, max_tokens, &format!("bench-seq-{i}-{turn}"));
                 // Drop the batch-route opt-in: this arm is deliberately the
