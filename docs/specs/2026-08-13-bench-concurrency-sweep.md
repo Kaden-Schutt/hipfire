@@ -238,6 +238,47 @@ The multi-turn arm is *lower* than stateless at k≥3 despite reusing KV, becaus
 it runs two turns per sample and pays a second prefill and scheduling round.
 Reuse makes turn 2 cheaper than a cold render, not free.
 
+### slots vs no-slots — measured, but NOT a clean comparison
+
+`--backend noslots` runs k requests strictly one after another through the
+ordinary daemon path: what a box serves today with `serve.multi_slot` off.
+Same clock, same prompts, same 64-token budget, medians of 3 interleaved runs.
+
+| backend | k=1 | k=2 | k=3 | k=4 |
+|---|---|---|---|---|
+| noslots (sequential daemon) | 52.90 | 85.64 | 89.47 | **91.53** |
+| slots (multi-slot engine) | 33.55 | 57.08 | 70.14 | **84.69** |
+
+Taken at face value the slot engine loses at every point. **Do not take it at
+face value** — the two arms are not running the same pipeline:
+
+- the daemon path loads the **MTP speculative head** and enables the
+  **redline retained/PM4 replay** path (both visible in its startup log)
+- the `SlotEngine` path has **neither** — plain autoregressive decode, no
+  speculation, no graph replay
+
+MTP alone is worth ~12–20% on this SKU, and the redline campaign is what took
+mq4r from ~110 to ~204 tok/s single-stream. So this table measures *pipeline
+maturity*, not batching, and the gap it shows is very likely those two
+features rather than a defect in the slot engine.
+
+Two further reasons to distrust the shape:
+
+1. **The no-slots curve should be FLAT.** Strictly sequential execution means
+   k requests take k× as long, so aggregate throughput is independent of k.
+   It instead rises 52.90 → 91.53 and plateaus, which is a fixed per-run cost
+   (first-generate warmup) being amortised over more tokens. Its steady-state
+   number is the plateau, ~91, not the k=1 figure.
+2. **64 tokens is too short.** At this budget prefill and per-turn overhead
+   dominate the wall clock, and batching's win is in decode. A decode-dominated
+   budget (512+) is where the slot engine should show its advantage — and the
+   decode-only measurement earlier in this document has slots at 116 tok/s
+   aggregate at 4 slots against ~98 single-stream.
+
+**Conclusion: this does not yet answer whether SlotEngine is better.** To
+answer it, either disable MTP and redline on the daemon arm, or wire them into
+the slot path, and re-run with `--max-tokens 512`.
+
 ### The batch backend is NOT measured
 
 `--backend batch` cannot run. `hipfire_client::Engine` has no public

@@ -19,7 +19,14 @@ use std::time::Instant;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BackendSel {
+    /// The multi-slot engine: k streams advance together.
     Slots,
+    /// No slots at all — k requests one after another through the daemon.
+    /// This is what a deployment does today with `serve.multi_slot` off, and
+    /// it is the baseline the slot engine has to beat.
+    Sequential,
+    /// Beta's in-daemon continuous batching (see `DaemonDriver::start` for why
+    /// this cannot currently be driven).
     Batch,
     Both,
 }
@@ -378,6 +385,95 @@ pub fn batch_request(prompt: &str, max_tokens: u64, id: &str) -> serde_json::Val
         "assistant_prefix": "closed_think",
         "reasoning_effort": "none",
     })
+}
+
+/// The no-slots baseline: k requests run strictly one after another through
+/// the ordinary daemon generate path.
+///
+/// This is what a box serves today with `serve.multi_slot` off, so it is the
+/// number the slot engine has to beat. It needs no multi-inflight support --
+/// `Engine::generate` is blocking and one-at-a-time, which is exactly the
+/// behaviour under measurement -- so unlike `DaemonDriver` it is unaffected by
+/// the client's lack of a concurrent API.
+///
+/// Timed on the SAME clock as every other backend: wall from the first submit
+/// to the last completion, with generated tokens summed across all k. That is
+/// the only way "slots vs no slots" means anything.
+pub struct SequentialDriver {
+    engine: hipfire_client::Engine,
+    max_concurrency: usize,
+}
+
+impl SequentialDriver {
+    pub fn start(engine: hipfire_client::Engine, max_concurrency: usize) -> Result<Self> {
+        Ok(Self {
+            engine,
+            max_concurrency,
+        })
+    }
+}
+
+impl ConcurrencyBackend for SequentialDriver {
+    fn label(&self) -> &'static str {
+        "noslots"
+    }
+    fn max_concurrency(&self) -> usize {
+        self.max_concurrency
+    }
+
+    fn run(&mut self, workload: WorkloadSel, k: usize, max_tokens: u64) -> Result<ArmResult> {
+        check_k(self, k)?;
+        // Multi-turn on the sequential path is just two turns back to back;
+        // there is no session to reuse, which is precisely the gap the slot
+        // engine's prefix cache exists to close.
+        let turns = if matches!(workload, WorkloadSel::Multiturn) {
+            2
+        } else {
+            1
+        };
+
+        let started = Instant::now();
+        let mut tokens = 0u64;
+        let mut rejected = 0usize;
+        for i in 0..k {
+            for turn in 0..turns {
+                let prompt = if turn == 0 {
+                    STREAM_PROMPTS[i % STREAM_PROMPTS.len()].to_string()
+                } else {
+                    format!(
+                        "{} {}",
+                        STREAM_PROMPTS[i % STREAM_PROMPTS.len()],
+                        FOLLOWUP_PROMPT
+                    )
+                };
+                let req = batch_request(&prompt, max_tokens, &format!("bench-seq-{i}-{turn}"));
+                // Drop the batch-route opt-in: this arm is deliberately the
+                // plain sequential path.
+                let mut req = req;
+                if let Some(obj) = req.as_object_mut() {
+                    obj.remove("serve_continuous_batch");
+                }
+                let mut n = 0u64;
+                match self.engine.generate(&req, |ev| {
+                    if ev.get("type").and_then(serde_json::Value::as_str) == Some("token") {
+                        n += 1;
+                    }
+                    Ok(())
+                }) {
+                    Ok(_) => tokens += n,
+                    Err(_) => rejected += 1,
+                }
+            }
+        }
+
+        let wall_ms = started.elapsed().as_secs_f64() * 1000.0;
+        Ok(ArmResult {
+            tokens,
+            wall_ms,
+            rejected,
+            prefix_hits: 0,
+        })
+    }
 }
 
 pub struct DaemonDriver {

@@ -464,8 +464,9 @@ struct BenchArgs {
     /// on its single-stream path, unchanged.
     #[arg(long)]
     concurrency: Option<String>,
-    /// Which concurrent backend to drive: slots, batch, or both.
-    #[arg(long, value_parser = ["slots", "batch", "both"], default_value = "both")]
+    /// Which backend to drive: slots (multi-slot engine), noslots (sequential
+    /// daemon baseline), batch (beta continuous batching), or both.
+    #[arg(long, value_parser = ["slots", "noslots", "batch", "both"], default_value = "both")]
     backend: String,
     /// Which workload arm to run: stateless, multiturn, or both.
     #[arg(long, value_parser = ["stateless", "multiturn", "both"], default_value = "both")]
@@ -7153,13 +7154,14 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
 fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Result<()> {
     use crate::bench_concurrency::{
         parse_concurrency, render_table, sweep_backend, BackendSel, ConcurrencyBackend,
-        DaemonDriver, Point, SlotDriver, WorkloadSel,
+        DaemonDriver, Point, SequentialDriver, SlotDriver, WorkloadSel,
     };
 
     let points = parse_concurrency(spec)?;
     let max_k = *points.iter().max().expect("non-empty");
     let backend_sel = match args.backend.as_str() {
         "slots" => BackendSel::Slots,
+        "noslots" => BackendSel::Sequential,
         "batch" => BackendSel::Batch,
         _ => BackendSel::Both,
     };
@@ -7210,6 +7212,28 @@ fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Res
             // A backend that cannot run this model is a RESULT, not a crash.
             Err(e) => eprintln!("  slots backend unavailable: {e}"),
         }
+    }
+
+    // No-slots baseline: k requests one after another through the ordinary
+    // daemon path. Runs after the slots engine has been dropped, so only one
+    // copy of the weights is ever resident.
+    if matches!(backend_sel, BackendSel::Sequential | BackendSel::Both) {
+        preflight_headroom_for_model(paths, &args.model)?;
+        let mut seq_args = args.clone();
+        seq_args.concurrency = None;
+        let (engine, _, _, _) = open_bench_engine(paths, &seq_args, None)?;
+        let mut d = SequentialDriver::start(engine, max_k)?;
+        eprintln!("  noslots backend up (sequential daemon path)");
+        let r = sweep_backend(
+            &mut d as &mut dyn ConcurrencyBackend,
+            &arms,
+            &points,
+            args.runs,
+            args.max_tokens as u64,
+            &mut out,
+        );
+        drop(d);
+        r?;
     }
 
     if matches!(backend_sel, BackendSel::Batch | BackendSel::Both) {
