@@ -3216,18 +3216,6 @@ impl Gpu {
                         kernels::FUSED_QKVZA_HFQ4G256_K2048_GFX1100_SRC.to_string(),
                     ));
                 }
-                // Muse Glimmer exact-shape AR decode fusions (K=6656) on RDNA4.
-                // Distinct symbols from gfx1100; selected only by shape+arch in gemm.rs.
-                if self.arch_caps.is_rdna4() {
-                    specs.push((
-                        "fused_glimmer_qkvg_hfq4g256_k6656_gfx1201",
-                        kernels::FUSED_GLIMMER_QKVG_HFQ4G256_K6656_GFX1201_SRC.to_string(),
-                    ));
-                    specs.push((
-                        "fused_glimmer_gate_up_hfq4g256_k6656_gfx1201",
-                        kernels::FUSED_GLIMMER_GATE_UP_HFQ4G256_K6656_GFX1201_SRC.to_string(),
-                    ));
-                }
                 specs.push((
                     "fused_qkv_hfq4g256",
                     kernels::FUSED_QKV_HFQ4G256_SRC.to_string(),
@@ -3339,17 +3327,6 @@ impl Gpu {
                     specs.push((
                         "fused_qkvza_hfq4g256_k2048_gfx1100",
                         kernels::FUSED_QKVZA_HFQ4G256_K2048_GFX1100_SRC.to_string(),
-                    ));
-                }
-                // Muse Glimmer exact-shape AR decode fusions (K=6656) on RDNA4.
-                if self.arch_caps.is_rdna4() {
-                    specs.push((
-                        "fused_glimmer_qkvg_hfq4g256_k6656_gfx1201",
-                        kernels::FUSED_GLIMMER_QKVG_HFQ4G256_K6656_GFX1201_SRC.to_string(),
-                    ));
-                    specs.push((
-                        "fused_glimmer_gate_up_hfq4g256_k6656_gfx1201",
-                        kernels::FUSED_GLIMMER_GATE_UP_HFQ4G256_K6656_GFX1201_SRC.to_string(),
                     ));
                 }
                 specs.push((
