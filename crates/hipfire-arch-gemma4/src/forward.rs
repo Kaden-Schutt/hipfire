@@ -57,7 +57,7 @@
 use crate::config::{Gemma4Config, LayerType, RopeType};
 use crate::gemma4::{
     FullLayerWeights, Gemma4State, Gemma4Weights, LayerWeights, PerLayerBranchWeights,
-    SlidingLayerWeights,
+    SlidingLayerWeights, GEMMA4_FORWARD_BATCH_MAX,
 };
 use hipfire_runtime::llama::{
     rotate_x_mq_batched_for, weight_gemv, weight_gemv_prerotated, KvCache, WeightTensor,
@@ -684,7 +684,7 @@ fn sliding_layer_decode(
     cfg: &Gemma4Config,
     lw: &SlidingLayerWeights,
     layer_idx: usize,
-    _pos: u32,
+    pos: u32,
     kv_slot: usize,
     shared_source_slot: Option<usize>,
     state: &mut Gemma4State,
@@ -806,7 +806,8 @@ fn sliding_layer_decode(
         n_heads,
         n_kv,
         head_dim,
-        state.max_seq,
+        pos as usize + 1,
+        &state.q8_flash_partials,
         cfg.sliding_window,
     )?;
 
@@ -821,7 +822,7 @@ fn full_layer_decode(
     cfg: &Gemma4Config,
     lw: &FullLayerWeights,
     layer_idx: usize,
-    _pos: u32,
+    pos: u32,
     kv_slot: usize,
     shared_source_slot: Option<usize>,
     state: &mut Gemma4State,
@@ -965,7 +966,8 @@ fn full_layer_decode(
         n_heads,
         n_kv,
         head_dim,
-        state.max_seq,
+        pos as usize + 1,
+        &state.q8_flash_partials,
         0,
     )?;
 
@@ -973,7 +975,7 @@ fn full_layer_decode(
     Ok(())
 }
 
-/// KV write (Q8) + windowed/full attention via `attention_q8_0_kv_swa`.
+/// KV write (Q8) + windowed/full tile-reduce attention.
 /// `window = 0` ⇒ full causal; `window > 0` ⇒ sliding window.
 #[allow(clippy::too_many_arguments)]
 fn attn_q8_swa(
@@ -989,7 +991,8 @@ fn attn_q8_swa(
     n_heads: usize,
     n_kv: usize,
     head_dim: usize,
-    max_seq: usize,
+    seq_len: usize,
+    flash_partials: &rdna_compute::GpuTensor,
     window: usize,
 ) -> Result<(), String> {
     if let Some(slot) = write_slot {
@@ -1008,7 +1011,7 @@ fn attn_q8_swa(
                 &kv.v_gpu[read_slot],
                 attn_out,
                 pos_buf,
-                max_seq,
+                seq_len,
                 n_heads,
                 n_kv,
                 head_dim,
@@ -1016,20 +1019,21 @@ fn attn_q8_swa(
             )
             .map_err(|e| format!("gemma4: attention baseline: {e:?}"));
     }
-    gpu.attention_q8_0_kv_swa(
+    gpu.attention_flash_q8_0_windowed(
         q,
         &kv.k_gpu[read_slot],
         &kv.v_gpu[read_slot],
         attn_out,
         pos_buf,
-        max_seq,
+        seq_len,
         n_heads,
         n_kv,
         head_dim,
         kv.physical_cap,
-        window,
+        flash_partials,
+        window as i32,
     )
-    .map_err(|e| format!("gemma4: attention swa: {e:?}"))
+    .map_err(|e| format!("gemma4: flash attention: {e:?}"))
 }
 
 /// Common per-layer tail shared by sliding + full layers: o_proj, post-attn
@@ -1415,8 +1419,10 @@ pub fn forward_batch_spec(
     if b == 0 {
         return Err("gemma4 forward_batch: empty token slice".to_string());
     }
-    if b > 64 {
-        return Err(format!("gemma4 forward_batch: B={b} exceeds kernel cap 64"));
+    if b > GEMMA4_FORWARD_BATCH_MAX {
+        return Err(format!(
+            "gemma4 forward_batch: B={b} exceeds kernel cap {GEMMA4_FORWARD_BATCH_MAX}"
+        ));
     }
     let dim = cfg.dim;
     let eps = cfg.norm_eps;
@@ -1487,56 +1493,6 @@ pub fn forward_batch_spec(
         .memcpy_htod(&pos_array.buf, &pos_bytes)
         .map_err(|e| format!("gemma4 forward_batch htod pos: {e:?}"))?;
 
-    // ── Per-row attention mask [B × seq_len]: 0.0 = visible, -inf = masked. ──
-    // Built per layer type (sliding has a window; full is plain causal). Two
-    // host masks are uploaded to two device buffers and reused across layers of
-    // the matching type. block_start=0, block_cols=seq_len so the kernel applies
-    // the bias to every key (full per-row control).
-    let build_mask = |window: usize| -> Vec<f32> {
-        let mut m = vec![0.0f32; b * seq_len];
-        for row in 0..b {
-            let pos = start_pos + row; // absolute query position
-            let lo = if window > 0 {
-                pos.saturating_sub(window - 1)
-            } else {
-                0
-            };
-            for t in 0..seq_len {
-                // Visible iff lo <= t <= pos (causal + optional sliding window).
-                let visible = t >= lo && t <= pos;
-                m[row * seq_len + t] = if visible { 0.0 } else { f32::NEG_INFINITY };
-            }
-        }
-        m
-    };
-    let upload_mask = |g: &mut Gpu, host: &[f32], label: &str| -> Result<GpuTensor, String> {
-        let t = g
-            .alloc_tensor(&[host.len()], DType::F32)
-            .map_err(|e| format!("gemma4 forward_batch mask alloc {label}: {e:?}"))?;
-        let bytes =
-            unsafe { std::slice::from_raw_parts(host.as_ptr() as *const u8, host.len() * 4) };
-        g.hip
-            .memcpy_htod(&t.buf, bytes)
-            .map_err(|e| format!("gemma4 forward_batch mask htod {label}: {e:?}"))?;
-        Ok(t)
-    };
-    let has_sliding = cfg.layer_types.iter().any(|&t| t == LayerType::Sliding);
-    let has_full = cfg.layer_types.iter().any(|&t| t == LayerType::Full);
-    let sliding_mask = if has_sliding {
-        Some(upload_mask(
-            gpu,
-            &build_mask(cfg.sliding_window),
-            "sliding",
-        )?)
-    } else {
-        None
-    };
-    let full_mask = if has_full {
-        Some(upload_mask(gpu, &build_mask(0), "full")?)
-    } else {
-        None
-    };
-
     // ── Embedding: per-token lookup into x[B,dim], then ×√dim over all rows. ──
     {
         let x_single = alloc(gpu, dim, "x_single")?;
@@ -1599,7 +1555,6 @@ pub fn forward_batch_spec(
                         k_norm: &lw.k_norm,
                         input_layernorm: &lw.input_layernorm,
                         post_attention_layernorm: &lw.post_attention_layernorm,
-                        mask: sliding_mask.as_ref().unwrap(),
                     },
                     &x,
                     &residual,
@@ -1665,7 +1620,6 @@ pub fn forward_batch_spec(
                         k_norm: &lw.k_norm,
                         input_layernorm: &lw.input_layernorm,
                         post_attention_layernorm: &lw.post_attention_layernorm,
-                        mask: full_mask.as_ref().unwrap(),
                     },
                     &x,
                     &residual,
@@ -1849,12 +1803,6 @@ pub fn forward_batch_spec(
             frees.push(t);
         }
     }
-    if let Some(m) = sliding_mask {
-        frees.push(m);
-    }
-    if let Some(m) = full_mask {
-        frees.push(m);
-    }
     for t in frees {
         gpu.free_tensor(t).ok();
     }
@@ -1916,7 +1864,6 @@ struct BatchAttn<'a> {
     k_norm: &'a GpuTensor,
     input_layernorm: &'a GpuTensor,
     post_attention_layernorm: &'a GpuTensor,
-    mask: &'a GpuTensor,
 }
 
 #[derive(Clone, Copy)]
@@ -2054,28 +2001,69 @@ fn batch_attn_block(
             .map_err(|e| format!("gemma4 batch attn kv write v: {e:?}"))?;
     }
 
-    // Masked batched attention: tree-bias mode with block_start=0,
-    // block_cols=seq_len → the per-row mask is applied to EVERY key, giving
-    // exact causal+window control for both layer types. seq_len passed as
-    // max_ctx_len so the kernel's scores[] LDS slice is sized for the full
-    // context, and as block_cols so the bias index covers all keys.
-    gpu.attention_q8_0_kv_batched_masked(
-        q,
-        &kv.k_gpu[a.read_slot],
-        &kv.v_gpu[a.read_slot],
-        attn_out,
-        pos_array,
-        n_heads,
-        n_kv,
-        hd,
-        physical_cap,
-        a.seq_len,
-        b,
-        Some(a.mask),
-        0,
-        a.seq_len,
-    )
-    .map_err(|e| format!("gemma4 batch attn masked: {e:?}"))?;
+    // Ordinary prefill is not tree verification: passing a dense causal mask
+    // as `tree_bias` makes the graph-safe tree kernel reinterpret positions[0]
+    // as block_start. From the second chunk onward that expands seq_len and
+    // indexes beyond the bias rows. Use the native causal path instead, and
+    // the existing windowed tile path for sliding attention.
+    if !a.is_full {
+        gpu.attention_flash_q8_0_batched_masked_windowed(
+            q,
+            &kv.k_gpu[a.read_slot],
+            &kv.v_gpu[a.read_slot],
+            attn_out,
+            pos_array,
+            n_heads,
+            n_kv,
+            hd,
+            physical_cap,
+            a.seq_len,
+            b,
+            &state.q8_flash_partials,
+            None,
+            0,
+            0,
+            cfg.sliding_window as i32,
+        )
+        .map_err(|e| format!("gemma4 batch sliding flash attn: {e:?}"))?;
+    } else if a.seq_len > 8_192 {
+        gpu.attention_flash_q8_0_batched_masked(
+            q,
+            &kv.k_gpu[a.read_slot],
+            &kv.v_gpu[a.read_slot],
+            attn_out,
+            pos_array,
+            n_heads,
+            n_kv,
+            hd,
+            physical_cap,
+            a.seq_len,
+            b,
+            &state.q8_flash_partials,
+            None,
+            0,
+            0,
+        )
+        .map_err(|e| format!("gemma4 batch flash attn masked: {e:?}"))?;
+    } else {
+        gpu.attention_q8_0_kv_batched_masked(
+            q,
+            &kv.k_gpu[a.read_slot],
+            &kv.v_gpu[a.read_slot],
+            attn_out,
+            pos_array,
+            n_heads,
+            n_kv,
+            hd,
+            physical_cap,
+            a.seq_len,
+            b,
+            None,
+            0,
+            0,
+        )
+        .map_err(|e| format!("gemma4 batch attn masked: {e:?}"))?;
+    }
 
     // o_proj(attn_out) → o.  (Mirrors finish_attn_and_ffn's o_proj.)
     proj_gemm_batched(gpu, a.o_proj, attn_out, o, x_rot, b, "o_proj")?;

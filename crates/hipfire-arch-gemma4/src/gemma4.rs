@@ -14,6 +14,8 @@ use hipfire_runtime::llama::{f16_to_f32, EmbeddingFormat, KvCache, WeightTensor}
 use hipfire_runtime::weight_backend::load_embedding;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
+pub(crate) const GEMMA4_FORWARD_BATCH_MAX: usize = 64;
+
 // ───────────────────────── HFQ load helpers ─────────────────────────
 
 /// Decode a shape-[n] F16/F32 tensor into an F32 host Vec.
@@ -727,6 +729,9 @@ pub struct Gemma4State {
     pub k: GpuTensor,        // [max_kv_dim]
     pub v: GpuTensor,        // [max_kv_dim]
     pub attn_out: GpuTensor, // [max_q_dim]
+    /// Shared tile/reduce workspace for eager and batched Q8 attention. Sized
+    /// for the larger attention geometry and the admitted forward batch cap.
+    pub q8_flash_partials: GpuTensor,
 
     /// Ones-filled weight buffer for the weight-less V RMSNorm on full layers.
     pub v_norm_ones: GpuTensor, // [max_head_dim]
@@ -780,6 +785,27 @@ fn build_kv_slot_map(cfg: &Gemma4Config) -> Result<Vec<usize>, String> {
         }
     }
     Ok(slots)
+}
+
+fn q8_flash_partials_len(gpu: &Gpu, cfg: &Gemma4Config, max_seq: usize) -> usize {
+    [
+        (cfg.sliding_n_kv_heads, cfg.sliding_head_dim),
+        (cfg.full_n_kv_heads, cfg.full_head_dim),
+    ]
+    .into_iter()
+    .map(|(n_kv_heads, head_dim)| {
+        let tile = rdna_compute::attention::q8_flash_tile_size(
+            &gpu.arch,
+            cfg.n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+        );
+        let max_tiles = max_seq.div_ceil(tile);
+        GEMMA4_FORWARD_BATCH_MAX * cfg.n_heads * max_tiles * (2 + head_dim)
+    })
+    .max()
+    .unwrap_or(0)
 }
 
 impl Gemma4State {
@@ -836,6 +862,7 @@ impl Gemma4State {
         let max_hd = cfg.max_head_dim();
         let ple_dim = cfg.hidden_size_per_layer_input;
         let ple_packed = cfg.n_layers * ple_dim;
+        let q8_flash_partials_len = q8_flash_partials_len(gpu, cfg, max_seq);
 
         // Ones-filled weight buffer for the weight-less V RMSNorm.
         let v_norm_ones = alloc(gpu, max_hd, "v_norm_ones")?;
@@ -865,6 +892,7 @@ impl Gemma4State {
             k: alloc(gpu, max_kv, "k")?,
             v: alloc(gpu, max_kv, "v")?,
             attn_out: alloc(gpu, max_q, "attn_out")?,
+            q8_flash_partials: alloc(gpu, q8_flash_partials_len, "q8_flash_partials")?,
             v_norm_ones,
             gate_ffn: alloc(gpu, cfg.max_ffn_hidden_dim(), "gate_ffn")?,
             up_ffn: alloc(gpu, cfg.max_ffn_hidden_dim(), "up_ffn")?,
@@ -950,6 +978,7 @@ impl Gemma4State {
         let max_hd = cfg.max_head_dim();
         let ple_dim = cfg.hidden_size_per_layer_input;
         let ple_packed = cfg.n_layers * ple_dim;
+        let q8_flash_partials_len = q8_flash_partials_len(gpu, cfg, max_seq);
 
         let v_norm_ones = alloc(gpu, max_hd, "v_norm_ones")?;
         {
@@ -978,6 +1007,7 @@ impl Gemma4State {
             k: alloc(gpu, max_kv, "k")?,
             v: alloc(gpu, max_kv, "v")?,
             attn_out: alloc(gpu, max_q, "attn_out")?,
+            q8_flash_partials: alloc(gpu, q8_flash_partials_len, "q8_flash_partials")?,
             v_norm_ones,
             gate_ffn: alloc(gpu, cfg.max_ffn_hidden_dim(), "gate_ffn")?,
             up_ffn: alloc(gpu, cfg.max_ffn_hidden_dim(), "up_ffn")?,
@@ -1033,6 +1063,7 @@ impl Gemma4State {
             self.k,
             self.v,
             self.attn_out,
+            self.q8_flash_partials,
             self.v_norm_ones,
             self.gate_ffn,
             self.up_ffn,
