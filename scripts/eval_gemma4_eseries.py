@@ -158,6 +158,7 @@ class Daemon:
         physical_gpu: str,
         prefill_batch: int,
         q8_fused_prefill: bool,
+        batched_embedding_prefill: bool,
         ple_batched_prefill: bool,
         ple_branch_batched_prefill: bool,
         ple_activation_fused_prefill: bool,
@@ -173,6 +174,9 @@ class Daemon:
         env["HIPFIRE_GEMMA4_EAGLE"] = "0"
         env["HIPFIRE_GEMMA4_PREFILL_BATCH"] = str(prefill_batch)
         env["HIPFIRE_GEMMA4_Q8_FUSED_PREFILL"] = "1" if q8_fused_prefill else "0"
+        env["HIPFIRE_GEMMA4_BATCHED_EMBEDDING_PREFILL"] = (
+            "1" if batched_embedding_prefill else "0"
+        )
         env["HIPFIRE_GEMMA4_PLE_BATCHED_PREFILL"] = "1" if ple_batched_prefill else "0"
         env["HIPFIRE_GEMMA4_PLE_BRANCH_BATCHED_PREFILL"] = (
             "1" if ple_branch_batched_prefill else "0"
@@ -367,6 +371,7 @@ def main() -> int:
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--prefill-batch", type=int, default=8)
     parser.add_argument("--q8-fused-prefill", action="store_true")
+    parser.add_argument("--batched-embedding-prefill", action="store_true")
     parser.add_argument("--ple-batched-prefill", action="store_true")
     parser.add_argument("--ple-branch-batched-prefill", action="store_true")
     parser.add_argument("--ple-activation-fused-prefill", action="store_true")
@@ -421,6 +426,7 @@ def main() -> int:
         "kv_mode": "q8",
         "prefill_batch": args.prefill_batch,
         "q8_fused_prefill": args.q8_fused_prefill,
+        "batched_embedding_prefill": args.batched_embedding_prefill,
         "ple_batched_prefill": args.ple_batched_prefill,
         "ple_branch_batched_prefill": args.ple_branch_batched_prefill,
         "ple_activation_fused_prefill": args.ple_activation_fused_prefill,
@@ -435,6 +441,7 @@ def main() -> int:
         args.physical_gpu,
         args.prefill_batch,
         args.q8_fused_prefill,
+        args.batched_embedding_prefill,
         args.ple_batched_prefill,
         args.ple_branch_batched_prefill,
         args.ple_activation_fused_prefill,

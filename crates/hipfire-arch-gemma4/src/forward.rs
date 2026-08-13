@@ -461,6 +461,42 @@ fn embedding_lookup_to(
     }
 }
 
+fn embedding_lookup_batched_to(
+    gpu: &mut Gpu,
+    format: hipfire_runtime::llama::EmbeddingFormat,
+    table: &GpuTensor,
+    dst: &GpuTensor,
+    token_ids: &GpuTensor,
+    batch: usize,
+    dim: usize,
+    label: &str,
+) -> Result<bool, String> {
+    use hipfire_runtime::llama::EmbeddingFormat;
+    let result = match format {
+        EmbeddingFormat::HFQ4G256 => {
+            gpu.embedding_lookup_hfq4g256_batched(table, dst, token_ids, batch, dim)
+        }
+        EmbeddingFormat::HFQ4G128 => {
+            gpu.embedding_lookup_hfq4g128_batched(table, dst, token_ids, batch, dim)
+        }
+        EmbeddingFormat::Q8_0 => {
+            gpu.embedding_lookup_q8_batched(table, dst, token_ids, batch, dim)
+        }
+        EmbeddingFormat::F32 | EmbeddingFormat::Q4K => return Ok(false),
+    };
+    result
+        .map(|_| true)
+        .map_err(|e| format!("gemma4: {label} batched: {e:?}"))
+}
+
+fn has_batched_embedding_lookup(format: hipfire_runtime::llama::EmbeddingFormat) -> bool {
+    use hipfire_runtime::llama::EmbeddingFormat;
+    matches!(
+        format,
+        EmbeddingFormat::HFQ4G256 | EmbeddingFormat::HFQ4G128 | EmbeddingFormat::Q8_0
+    )
+}
+
 fn prepare_token_inputs(
     cfg: &Gemma4Config,
     weights: &Gemma4Weights,
@@ -538,6 +574,7 @@ fn prepare_per_layer_inputs_batched(
     weights: &Gemma4Weights,
     gpu: &mut Gpu,
     tokens: &[u32],
+    token_ids: Option<&GpuTensor>,
     x: &GpuTensor,
     x_rot: &GpuTensor,
     token_inputs: &GpuTensor,
@@ -552,23 +589,41 @@ fn prepare_per_layer_inputs_batched(
     }
     let packed_dim = cfg.n_layers * ple_dim;
     let b = tokens.len();
-    for (row, &token_id) in tokens.iter().enumerate() {
+    for &token_id in tokens {
         if token_id as usize >= cfg.vocab_size_per_layer_input {
             return Err(format!(
                 "gemma4 forward_batch: PLE token id {token_id} out of range for vocab_size_per_layer_input {}",
                 cfg.vocab_size_per_layer_input
             ));
         }
-        let token_row = token_inputs.sub_offset(row * packed_dim, packed_dim);
-        embedding_lookup_to(
+    }
+    let batched_embedding = if let Some(token_ids) = token_ids {
+        embedding_lookup_batched_to(
             gpu,
             ple.embd_format,
             &ple.embed_tokens,
-            &token_row,
-            token_id,
+            token_inputs,
+            token_ids,
+            b,
             packed_dim,
             "batch ple embed",
-        )?;
+        )?
+    } else {
+        false
+    };
+    if !batched_embedding {
+        for (row, &token_id) in tokens.iter().enumerate() {
+            let token_row = token_inputs.sub_offset(row * packed_dim, packed_dim);
+            embedding_lookup_to(
+                gpu,
+                ple.embd_format,
+                &ple.embed_tokens,
+                &token_row,
+                token_id,
+                packed_dim,
+                "batch ple embed",
+            )?;
+        }
     }
 
     if gpu.arch == "gfx1100"
@@ -1600,9 +1655,44 @@ pub fn forward_batch_spec(
         .memcpy_htod(&pos_array.buf, &pos_bytes)
         .map_err(|e| format!("gemma4 forward_batch htod pos: {e:?}"))?;
 
+    let batched_embedding_requested = gpu.arch == "gfx1100"
+        && gpu.flags.gemma4_batched_embedding_prefill
+        && b > 1
+        && (has_batched_embedding_lookup(weights.embd_format)
+            || weights
+                .per_layer_input
+                .as_ref()
+                .is_some_and(|ple| has_batched_embedding_lookup(ple.embd_format)));
+    let token_ids = if batched_embedding_requested {
+        let token_data: Vec<i32> = tokens.iter().map(|&token| token as i32).collect();
+        let token_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(token_data.as_ptr() as *const u8, token_data.len() * 4)
+        };
+        let token_ids = alloc(gpu, b, "token_ids")?;
+        gpu.hip
+            .memcpy_htod(&token_ids.buf, token_bytes)
+            .map_err(|e| format!("gemma4 forward_batch htod token ids: {e:?}"))?;
+        Some(token_ids)
+    } else {
+        None
+    };
 
     // ── Embedding: per-token lookup into x[B,dim], then ×√dim over all rows. ──
-    {
+    let batched_embedding = if let Some(token_ids) = token_ids.as_ref() {
+        embedding_lookup_batched_to(
+            gpu,
+            weights.embd_format,
+            &weights.embed_tokens,
+            &x,
+            token_ids,
+            b,
+            dim,
+            "batch main embed",
+        )?
+    } else {
+        false
+    };
+    if !batched_embedding {
         let x_single = alloc(gpu, dim, "x_single")?;
         for (i, &tok) in tokens.iter().enumerate() {
             embed_lookup_row(cfg, weights, gpu, &x_single, tok)?;
@@ -1620,6 +1710,7 @@ pub fn forward_batch_spec(
             weights,
             gpu,
             tokens,
+            token_ids.as_ref(),
             &x,
             &x_rot,
             ple_token_inputs.as_ref().unwrap(),

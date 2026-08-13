@@ -14,6 +14,7 @@ LIMIT="${LIMIT:-10}"
 MAX_TOKENS="${MAX_TOKENS:-16}"
 REPEATS="${REPEATS:-1}"
 FUSED_Q8_PREFILL="${FUSED_Q8_PREFILL:-0}"
+BATCHED_EMBEDDING_PREFILL="${BATCHED_EMBEDDING_PREFILL:-0}"
 PLE_BATCHED_PREFILL="${PLE_BATCHED_PREFILL:-0}"
 PLE_BRANCH_BATCHED_PREFILL="${PLE_BRANCH_BATCHED_PREFILL:-0}"
 PLE_ACTIVATION_FUSED_PREFILL="${PLE_ACTIVATION_FUSED_PREFILL:-0}"
@@ -29,6 +30,9 @@ mkdir -p "$OUT_ROOT"
 fused_args=()
 if [[ "$FUSED_Q8_PREFILL" == 1 ]]; then
     fused_args+=(--q8-fused-prefill)
+fi
+if [[ "$BATCHED_EMBEDDING_PREFILL" == 1 ]]; then
+    fused_args+=(--batched-embedding-prefill)
 fi
 if [[ "$PLE_BATCHED_PREFILL" == 1 ]]; then
     fused_args+=(--ple-batched-prefill)

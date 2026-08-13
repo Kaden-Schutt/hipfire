@@ -182,6 +182,8 @@ pub struct FeatureFlags {
     /// Fuse Gemma 4 Q8 prefill projections on exact gfx1100. This remains an
     /// opt-in while the E-series path is validated across QKV-sharing shapes.
     pub gemma4_q8_fused_prefill: bool,
+    /// Batch Gemma 4 main and PLE embedding lookup on exact gfx1100.
+    pub gemma4_batched_embedding_prefill: bool,
     /// Batch the E-series per-layer-input model projection on exact gfx1100
     /// instead of re-streaming the same matrix through one GEMV per row.
     pub gemma4_ple_batched_prefill: bool,
@@ -494,6 +496,10 @@ impl FeatureFlags {
             mw16: value("HIPFIRE_MW16").map_or(false, |v| v == "1"),
             q8_batched_legacy: value("HIPFIRE_Q8_BATCHED_LEGACY").as_deref() == Ok("1"),
             gemma4_q8_fused_prefill: parse_bool("HIPFIRE_GEMMA4_Q8_FUSED_PREFILL").unwrap_or(false),
+            gemma4_batched_embedding_prefill: parse_bool(
+                "HIPFIRE_GEMMA4_BATCHED_EMBEDDING_PREFILL",
+            )
+            .unwrap_or(false),
             gemma4_ple_batched_prefill: parse_bool("HIPFIRE_GEMMA4_PLE_BATCHED_PREFILL")
                 .unwrap_or(false),
             gemma4_ple_branch_batched_prefill: parse_bool(
@@ -725,6 +731,7 @@ impl FeatureFlags {
             mw16: false,
             q8_batched_legacy: false,
             gemma4_q8_fused_prefill: false,
+            gemma4_batched_embedding_prefill: false,
             gemma4_ple_batched_prefill: false,
             gemma4_ple_branch_batched_prefill: false,
             gemma4_ple_activation_fused_prefill: false,
@@ -779,6 +786,7 @@ mod tests {
         let f = FeatureFlags::for_test("gfx1100");
         assert!(!f.qkvza_split_tail);
         assert!(!f.gemma4_q8_fused_prefill);
+        assert!(!f.gemma4_batched_embedding_prefill);
         assert!(!f.gemma4_ple_batched_prefill);
         assert!(!f.gemma4_ple_branch_batched_prefill);
         assert!(!f.gemma4_ple_activation_fused_prefill);
@@ -790,6 +798,9 @@ mod tests {
         layer.set_cli("kernel.qkvza_split_tail", "true").unwrap();
         layer
             .set_cli("kernel.gemma4_q8_fused_prefill", "true")
+            .unwrap();
+        layer
+            .set_cli("kernel.gemma4_batched_embedding_prefill", "true")
             .unwrap();
         layer
             .set_cli("kernel.gemma4_ple_batched_prefill", "true")
@@ -813,6 +824,7 @@ mod tests {
 
         assert!(flags.qkvza_split_tail);
         assert!(flags.gemma4_q8_fused_prefill);
+        assert!(flags.gemma4_batched_embedding_prefill);
         assert!(flags.gemma4_ple_batched_prefill);
         assert!(flags.gemma4_ple_branch_batched_prefill);
         assert!(flags.gemma4_ple_activation_fused_prefill);
