@@ -395,6 +395,24 @@ pub(crate) const RAW_CODECS: &[RawCodec] = &[
         quant_type: 30,
         dtype: DType::MQ4G256Lloyd,
     },
+    // MQ2/MQ3-G256-GL ("global Lloyd"): 2- resp. 3-bit codes against ONE
+    // tensor-global codebook plus a per-block fp16 scale, stored SoA as
+    // `[M*gpr*IDX B indices][M*gpr*2 B scales]` (IDX = 64 / 96). Passthrough
+    // like every other MQ*: the bytes go to the GPU verbatim and the indexed
+    // MoE GEMVs decode them. The codebook is NOT in the file — the runtime
+    // supplies `rdna_compute::GL_CB2` / `GL_CB3` as scalar kernel args, which
+    // MUST match the quantizer's constants (see their doc comments).
+    // `decode_raw_codec` enforces K%256==0 for both via
+    // `DType::requires_k_mod_256` — `gpr = K/256` sets the scale-region base,
+    // so a bad K silently corrupts rather than erroring.
+    RawCodec {
+        quant_type: 38,
+        dtype: DType::MQ2G256GL,
+    },
+    RawCodec {
+        quant_type: 39,
+        dtype: DType::MQ3G256GL,
+    },
 ];
 
 /// Look up the passthrough codec for `quant_type`, or `None` if it is host-decode
@@ -1299,6 +1317,12 @@ mod tests {
             (21, DType::HFP4G32),      // wb:459 / hfq:944
             (24, DType::MFP4G32),      // wb:475 / hfq:963
             (30, DType::MQ4G256Lloyd), // wb:443 / hfq:978 (renumbered from 21; do not swap)
+            // GL ("global Lloyd") codebook formats — MoE-routed-expert only.
+            // RHS pinned against hipfire-quantize `QuantType::MQ2G256GL = 38` /
+            // `MQ3G256GL = 39`; a swap here mis-decodes 64 B/group indices as
+            // 96 B/group (or vice versa) → token soup, not a crash.
+            (38, DType::MQ2G256GL),
+            (39, DType::MQ3G256GL),
         ];
         for &(qt, dt) in expected {
             let c = raw_codec(qt).unwrap_or_else(|| panic!("no RAW_CODECS row for qt={qt}"));

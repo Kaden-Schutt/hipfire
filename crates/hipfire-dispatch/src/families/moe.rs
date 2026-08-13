@@ -18,7 +18,7 @@
 //! Grouped-GEMM prefill is a future arm (gated on `ShapeInfo.batch_size`).
 
 use rdna_compute::DType;
-use rdna_compute::GpuTensor;
+use rdna_compute::{Gpu, GpuTensor};
 
 use crate::context::DispatchCtx;
 use crate::families::gemv::{GivensRef, WeightRef};
@@ -123,6 +123,30 @@ pub struct MoeResolution {
     /// Uniform all-MQ3-Lloyd routed experts (gate_up == down == MQ3G256Lloyd).
     /// Same indexed-Lloyd decode path as mq2lloyd, MQ3 launchers.
     pub routed_indexable_mq3lloyd: bool,
+    /// Routed experts whose gate_up and down are each drawn, INDEPENDENTLY, from
+    /// the codebook family `{MQ2G256Lloyd, MQ3G256Lloyd, MQ2G256GL, MQ3G256GL}` —
+    /// the per-projection allocation (e.g. gate_up 2-bit, down 3-bit) that puts
+    /// the cheap bits on the larger projection and the accurate ones on the
+    /// residual write. Indexable because `run_moe_decode` already picks the
+    /// gate_up and down GEMVs from their own dtypes rather than a coupled flag,
+    /// and because ALL FOUR down kernels self-combine via atomicAdd — so
+    /// `routed_down_self_combines` (keyed on `routed_down` alone) stays correct
+    /// and the shared down-combine is skipped exactly once. silu+rotate is
+    /// weight-agnostic (it reads activations only). Subsumes the two uniform
+    /// Lloyd arms above and the uniform GL cases.
+    ///
+    /// Lloyd and GL are freely mixable across the two projections: both are
+    /// FWHT-G256 formats consuming the same rotated activation, and each GEMV is
+    /// selected from its own projection's dtype. The ONLY thing that differs is
+    /// where the codebook comes from (per-group fp16 header vs scalar kernel
+    /// args), which is entirely inside the launcher.
+    ///
+    /// Decode-only: batched prefill rejects MoE MQ3-Lloyd outright (see
+    /// `moe_ffn_has_mq3_experts_uniform` in hipfire-arch-qwen35), which already
+    /// blocks the pre-existing uniform MQ3-Lloyd path too; the GL dtypes are
+    /// likewise not admitted by `moe_ffn_batched_admissible_for_dtypes`, so a
+    /// GL model prefills through the per-token path.
+    pub routed_indexable_mixed_lloyd: bool,
     /// Per-expert N-tier graded routed experts (MQ6 hot / MQ4 mid / MQ2L or
     /// MQ3L cold, applied to BOTH gate_up and down). Indexable on the decode
     /// GPU-top-K path via the merged dtype-tag-branched gate_up AND down
@@ -174,6 +198,23 @@ impl MoeResolution {
         let routed_indexable_mixed_gu4_dn6 = routed_gate_up_mq4 && (d.routed_down == MQ6G256);
         let routed_indexable_mq2lloyd = (d.routed_down == MQ2G256Lloyd) && routed_gate_up_mq2lloyd;
         let routed_indexable_mq3lloyd = (d.routed_down == MQ3G256Lloyd) && routed_gate_up_mq3lloyd;
+        // gate_up on one of the codebook (Lloyd / GL) formats — needed both for
+        // the per-projection mix below and for `needs_x_rot_local` (all four are
+        // FwhtG256 and consume the pre-rotated activation).
+        let routed_gate_up_gl = matches!(d.routed_gate_up, MQ2G256GL | MQ3G256GL);
+        // Per-projection codebook mix (e.g. gate_up MQ2-GL + down MQ3-GL, the
+        // 2-bit-gate/3-bit-down allocation; or any Lloyd×GL cross). Subsumes the
+        // two uniform Lloyd arms above and the uniform GL cases; the OR below
+        // makes the overlap harmless.
+        //
+        // SAFETY INVARIANT: every dtype admitted here MUST have (a) an indexed
+        // gate_up GEMV arm in `run_moe_decode`, (b) an ATOMIC SELF-COMBINING
+        // down GEMV arm there, and (c) membership in the
+        // `routed_down_self_combines` set in pipeline/mod.rs. Admitting a dtype
+        // that misses (c) double-counts every MoE layer, silently.
+        const CODEBOOK_INDEXABLE: [DType; 4] = [MQ2G256Lloyd, MQ3G256Lloyd, MQ2G256GL, MQ3G256GL];
+        let routed_indexable_mixed_lloyd = CODEBOOK_INDEXABLE.contains(&d.routed_gate_up)
+            && CODEBOOK_INDEXABLE.contains(&d.routed_down);
         let routed_indexable_paro =
             (d.routed_down == ParoQ4G128 && d.has_paro_shared) && routed_gate_up_paro;
         // Per-expert mixed: the model already verified the experts carry
@@ -198,6 +239,7 @@ impl MoeResolution {
             || routed_indexable_mixed_per_expert
             || routed_indexable_mq2lloyd
             || routed_indexable_mq3lloyd
+            || routed_indexable_mixed_lloyd
             || routed_indexable_paro
             || routed_indexable_e8;
 
@@ -209,6 +251,10 @@ impl MoeResolution {
             || routed_gate_up_mq6
             || routed_gate_up_mq2lloyd
             || routed_gate_up_mq3lloyd
+            // MQ2/MQ3-G256-GL are FWHT-G256 formats: their gate_up kernel reads
+            // `x_rot`, so the local rotation MUST be produced. Missing this is a
+            // silent garbage-output failure (unrotated x into a rotated weight).
+            || routed_gate_up_gl
             || routed_gate_up_paro
             || routed_indexable_e8;
 
@@ -233,6 +279,7 @@ impl MoeResolution {
             routed_indexable_mixed_gu4_dn6,
             routed_indexable_mq2lloyd,
             routed_indexable_mq3lloyd,
+            routed_indexable_mixed_lloyd,
             routed_indexable_mixed_per_expert,
             routed_indexable_paro,
             use_gpu_topk,
@@ -249,6 +296,7 @@ impl MoeResolution {
             || self.routed_indexable_mixed_per_expert
             || self.routed_indexable_mq2lloyd
             || self.routed_indexable_mq3lloyd
+            || self.routed_indexable_mixed_lloyd
             || self.routed_indexable_paro
     }
 }
@@ -359,6 +407,69 @@ pub struct MoeParams<'a> {
 
 // ── DeepSeek-V4 bias-aware decode parameters ───────────
 
+/// Exact-device MQ2-Lloyd operations used by the DeepSeek4 bias-aware decode
+/// executor.
+///
+/// The dispatch crate deliberately has no architecture detection here. A
+/// model crate may provide this capability only after its loader has admitted
+/// a model-owned backend. The implementation must still fail closed when the
+/// supplied [`Gpu`] is not the device proven by that backend.
+pub trait MoeBiasAwareMq2Backend {
+    #[allow(clippy::too_many_arguments)]
+    fn gate_up(
+        &self,
+        gpu: &mut Gpu,
+        expert_ptrs: &GpuTensor,
+        nonowned_gate_up_dummy: Option<&GpuTensor>,
+        topk_indices: &GpuTensor,
+        x_rot: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        m: usize,
+        k: usize,
+        k_top: usize,
+    ) -> Result<(), String>;
+
+    fn rotate_x_batched(
+        &self,
+        gpu: &mut Gpu,
+        x: &GpuTensor,
+        x_rot: &GpuTensor,
+        k: usize,
+        batch_size: usize,
+    ) -> Result<(), String>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn down_expanded(
+        &self,
+        gpu: &mut Gpu,
+        expert_ptrs: &GpuTensor,
+        ownership_ptrs: &GpuTensor,
+        nonowned_gate_up_dummy: Option<&GpuTensor>,
+        topk_indices: &GpuTensor,
+        rot_batch: &GpuTensor,
+        expert_outputs: &GpuTensor,
+        m: usize,
+        k: usize,
+        k_top: usize,
+        batch_size: usize,
+    ) -> Result<(), String>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn down_residual_scaled(
+        &self,
+        gpu: &mut Gpu,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        topk_weights: &GpuTensor,
+        rot_batch: &GpuTensor,
+        residual: &GpuTensor,
+        m: usize,
+        k: usize,
+        k_top: usize,
+    ) -> Result<(), String>;
+}
+
 /// Parameters for the deepseek4 bias-aware MoE decode arm (k=6, MQ2-Lloyd routed
 /// experts). Kept distinct from [`MoeParams`] because the ds4 sub-graph has no
 /// fused gate-side and no shared-expert block: the shared expert is a separate
@@ -378,6 +489,17 @@ pub struct MoeBiasAwareParams<'a> {
     pub n_exp: usize,
     pub route_scale: f32,
     pub swiglu_limit: f32,
+    /// Model-local dispatch policy. The DS4 loader derives this from the
+    /// verified MQ2R backend; generic GPU state must not influence it.
+    pub uses_atomic_moe_down: bool,
+    /// Optional exact-device MQ2 backend selected by the loaded DeepSeek4
+    /// model. `None` retains the portable dispatcher for every other model and
+    /// architecture.
+    pub native_mq2_backend: Option<&'a dyn MoeBiasAwareMq2Backend>,
+    /// EP-shard-only zero weight buffer. Exact-device backends may compare
+    /// selected gate/up pointers against it to skip non-owned expert work
+    /// while retaining the fixed graph shape. `None` on unsharded models.
+    pub nonowned_gate_up_dummy: Option<&'a GpuTensor>,
     /// Token-batch width. Decode = 1. A value > 1 must route to the grouped
     /// prefill executor (Step 8), never this decode arm — guarded in the executor.
     pub batch_size: usize,
@@ -400,6 +522,60 @@ pub struct MoeBiasAwareParams<'a> {
     pub up_batch: &'a GpuTensor,
     pub rot_batch: &'a GpuTensor,
     /// `[k_top × hidden]` per-expert down outputs for the deterministic combine.
+    pub down_expanded: &'a GpuTensor,
+}
+
+impl<'a> MoeBiasAwareParams<'a> {
+    /// Borrow the routed-expert portion after route selection has already
+    /// populated `topk_indices` and `topk_weights`. Heterogeneous DS4 uses
+    /// this boundary to select routes on the dense owner and execute only the
+    /// selected experts on the routed owner.
+    pub fn selected(&self) -> MoeSelectedParams<'_> {
+        MoeSelectedParams {
+            hidden: self.hidden,
+            mi: self.mi,
+            k_top: self.k_top,
+            swiglu_limit: self.swiglu_limit,
+            uses_atomic_moe_down: self.uses_atomic_moe_down,
+            native_mq2_backend: self.native_mq2_backend,
+            nonowned_gate_up_dummy: self.nonowned_gate_up_dummy,
+            batch_size: self.batch_size,
+            x_rot: self.x_rot,
+            ffn_out: self.ffn_out,
+            expert_gate_up_ptrs: self.expert_gate_up_ptrs,
+            expert_down_ptrs: self.expert_down_ptrs,
+            topk_indices: self.topk_indices,
+            topk_weights: self.topk_weights,
+            gate_batch: self.gate_batch,
+            up_batch: self.up_batch,
+            rot_batch: self.rot_batch,
+            down_expanded: self.down_expanded,
+        }
+    }
+}
+
+/// Selected routed-expert decode subgraph. Route selection is intentionally
+/// absent: callers must provide the exact normalized IDs and weights produced
+/// by the model-owned router. This is useful for split ownership where the
+/// router and expert weights cannot reside on the same device.
+pub struct MoeSelectedParams<'a> {
+    pub hidden: usize,
+    pub mi: usize,
+    pub k_top: usize,
+    pub swiglu_limit: f32,
+    pub uses_atomic_moe_down: bool,
+    pub native_mq2_backend: Option<&'a dyn MoeBiasAwareMq2Backend>,
+    pub nonowned_gate_up_dummy: Option<&'a GpuTensor>,
+    pub batch_size: usize,
+    pub x_rot: &'a GpuTensor,
+    pub ffn_out: &'a GpuTensor,
+    pub expert_gate_up_ptrs: &'a GpuTensor,
+    pub expert_down_ptrs: &'a GpuTensor,
+    pub topk_indices: &'a GpuTensor,
+    pub topk_weights: &'a GpuTensor,
+    pub gate_batch: &'a GpuTensor,
+    pub up_batch: &'a GpuTensor,
+    pub rot_batch: &'a GpuTensor,
     pub down_expanded: &'a GpuTensor,
 }
 
@@ -436,6 +612,9 @@ pub struct MoeBiasAwarePrefillParams<'a> {
     pub batch_size: usize,
     pub route_scale: f32,
     pub swiglu_limit: f32,
+    /// Model-local dispatch policy. The DS4 loader derives this from the
+    /// verified MQ2R backend; generic GPU state must not influence it.
+    pub uses_atomic_moe_down: bool,
     pub layer_idx: usize, // for the optional HIPFIRE_DEEPSEEK4_DUMP_TOPK header
     // routing
     pub routing: MoePrefillRouting<'a>,
@@ -721,6 +900,17 @@ impl MoeFamily {
         params: &MoeBiasAwareParams,
     ) -> Result<(), DispatchError> {
         crate::pipeline::run_moe_decode_bias_aware(gpu, params)
+    }
+
+    /// Run only the selected-expert portion of the single-token DeepSeek4
+    /// MQ2-Lloyd subgraph. The caller owns route selection and must already
+    /// have populated `topk_indices` and `topk_weights`.
+    pub fn run_selected(
+        &self,
+        gpu: &mut rdna_compute::Gpu,
+        params: &MoeSelectedParams,
+    ) -> Result<(), DispatchError> {
+        crate::pipeline::run_moe_decode_selected(gpu, params)
     }
 
     /// Run a batched/prefill deepseek4 MoE step (k=6, MQ2-Lloyd): routing

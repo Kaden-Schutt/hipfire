@@ -12,4 +12,8 @@ deltanet = []
 hip-bridge = { path = "../hip-bridge" }
 hipfire-config = { path = "../hipfire-config" }
 redline-dispatch = { path = "../redline-dispatch" }
+radiowave = { path = "../radiowave" }
 rayon = "1"
+
+[dev-dependencies]
+redline-rocr = { path = "../redline-rocr" }

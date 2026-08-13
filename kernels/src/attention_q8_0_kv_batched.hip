@@ -80,10 +80,14 @@ extern "C" __global__ void attention_q8_0_kv_batched(
     // with zero bases, so the address arithmetic below is unchanged and the
     // output is bitwise identical to the pre-SP1 kernel.
     const int slot = (row_slot != nullptr) ? row_slot[b] : 0;
+    const int per_pos_bytes = n_kv_heads * (head_dim / 32) * 34;
+    // Legacy here also covers the pre-descriptor independent-sequence contract
+    // (negative `max_seq` = per-lane capacity, row `b` reads its own slice).
+    // kv_slot_legacy_lane folds that base into the descriptor, so the address
+    // arithmetic below is the same one expression in all three modes.
     const KvSlotDesc desc = (slot_descs != nullptr)
         ? slot_descs[slot]
-        : kv_slot_legacy(seq_len, max_seq);
-    const int per_pos_bytes = n_kv_heads * (head_dim / 32) * 34;
+        : kv_slot_legacy_lane(seq_len, max_seq, b, per_pos_bytes);
     // `positions[row] + 1` (== `seq_len` above) is the PER-ROW CAUSAL BOUND;
     // `desc.seq_len` is the SLOT's logical KV length (allocation/capacity
     // metadata). They coincide only when a slot has exactly one query row —
@@ -118,7 +122,6 @@ extern "C" __global__ void attention_q8_0_kv_batched(
     const float* q_head = q + (long long)b * q_stride + h * head_dim;
 
     const int blocks_per_head = head_dim / 32;
-    const int total_blocks_per_pos = n_kv_heads * blocks_per_head;
     const int kv_head_block_start = kv_h * blocks_per_head;
 
     float* scores = sdata;

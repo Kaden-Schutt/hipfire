@@ -131,14 +131,20 @@ pub fn parse_hip_major_minor(text: &str) -> Option<(u32, u32)> {
 }
 
 fn run_version(tool: &Path, label: &str) -> Result<String> {
-    let output = Command::new(tool).arg("--version").output().map_err(|err| {
-        // Surface ROCM_PATH sensitivity: bare hipcc under /opt/rocm/core/bin
-        // looks for /opt/rocm/lib/llvm without ROCM_PATH=/opt/rocm/core.
-        Error::Io(std::io::Error::new(
-            err.kind(),
-            format!("{label} --version failed to spawn ({}): {err}", tool.display()),
-        ))
-    })?;
+    let output = Command::new(tool)
+        .arg("--version")
+        .output()
+        .map_err(|err| {
+            // Surface ROCM_PATH sensitivity: bare hipcc under /opt/rocm/core/bin
+            // looks for /opt/rocm/lib/llvm without ROCM_PATH=/opt/rocm/core.
+            Error::Io(std::io::Error::new(
+                err.kind(),
+                format!(
+                    "{label} --version failed to spawn ({}): {err}",
+                    tool.display()
+                ),
+            ))
+        })?;
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     let combined = if stdout.trim().is_empty() {
@@ -474,10 +480,7 @@ InstalledDir: /usr/bin
 
     #[test]
     fn hip_major_minor_and_floor_gate() {
-        assert_eq!(
-            parse_hip_major_minor("7.14.60850-0000000"),
-            Some((7, 14))
-        );
+        assert_eq!(parse_hip_major_minor("7.14.60850-0000000"), Some((7, 14)));
         assert_eq!(parse_hip_major_minor("7.13.0"), Some((7, 13)));
         assert!(parse_hip_major_minor("not-a-version").is_none());
 
@@ -510,10 +513,7 @@ InstalledDir: /usr/bin
   Uuid:                    GPU-XX
   Name:                    AMD Ryzen
 ";
-        assert_eq!(
-            parse_rocminfo_arches(rocminfo),
-            vec!["gfx1201".to_owned()]
-        );
+        assert_eq!(parse_rocminfo_arches(rocminfo), vec!["gfx1201".to_owned()]);
     }
 
     /// llc-absent policy: scheduler -mllvm knobs remain passthrough-only.

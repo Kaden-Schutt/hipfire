@@ -1,0 +1,527 @@
+[feed] label=D4on
+[feed] daemon=/mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/target/release/examples/daemon
+[feed] model=/mnt/scratch/models/deepseek-v4-flash-mq2r/deepseek-v4-flash.mq2r
+[feed] >> {"type":"ping"}
+GPU dev 0: gfx942 (205.8 GB VRAM, HIP 7.0)
+  pre-compiled kernels: /mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/.hipfire_kernels/gfx942
+[rocblas] loaded for gfx942
+[feed] << {"type":"pong"}
+[feed] pong in 0.26s
+[feed] >> {"type":"load","model":"/mnt/scratch/models/deepseek-v4-flash-mq2r/deepseek-v4-flash.mq2r","params":{"max_seq":4096,"kv_mode":"q8","kv_backend":"contiguous","speculation":"off","dflash_mode":"off","mtp_mode":"off","ngram_draft":false,"dspark_mode":"off"}}
+deepseek4: MQ2R P3 tensor recipe verified; gfx1151 route v2 is ineligible on gfx942, using portable dispatch
+[feed] << {"type":"loaded","arch":"deepseek4","dim":0,"layers":0,"vocab":0,"vl":false,"cache_capable":true,"retry_reset_eligible":false}
+[feed] loaded in 76.21s
+[feed] DECODE_PHASE_BEGIN
+[feed] >> {"type":"generate","id":"g0-D4on","attempt_id":1,"prompt":"User: I need a production-grade explanation of ordinary batch-1 autoregressive decode on a DeepSeek V4 Flash style mixture-of-experts model running on AMD Instinct MI300X (gfx942). Please treat this as a measurement contract discussion rather than marketing. Cover the end-to-end path from a frozen prompt fixture through tokenizer identity, prefill, KV write, and token-by-token decode under Q8 KV with speculation fully disabled. I will us
+[feed] << {"type":"token","id":"g0-D4on","text":"The a","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"rchit","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ecture","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" i","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"d","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"en","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"tif","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"i","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"er must ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"m","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"atc","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"h `g","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"fx942` e","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"xactly. ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"If","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" the runti","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"me reports a ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"d","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"iffe","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"rent archite","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"cture","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":", the ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"measu","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"re","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ment m","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ust ab","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"o","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"rt w","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ith a cle","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ar er","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ror, ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"not","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" s","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ilently fa","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ll back","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" to a","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"diff","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"erent","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" kernel ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"pat","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"h. T","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"he sam","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"e applies t","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"o","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" the","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" model ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ident","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ifier: ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"the ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"binary mu","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"st rejec","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"t an","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"y misma","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"tch be","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"twee","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"n th","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"e loaded ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"model and the","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"expec","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ted arch","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"itect","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ur","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"e. This en","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"sure","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"s that a b","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"en","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"chmark ru","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"n targeti","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ng a","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" speci","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"fic hardware a","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"nd mo","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"del ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"configuration","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" does no","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"t ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"accidental","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ly measure a d","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"iffe","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ren","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"t ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"conf","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"iguration","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"due to a mis","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"con","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"figured env","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"i","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ronm","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ent.\n\nFu","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"rther","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"more, the","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" runt","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ime ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"must va","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"lidate","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" t","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"hat the loade","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"d model'","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"s ar","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"chitectur","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"e ma","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"t","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ches","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" the exp","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"e","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"cte","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"d on","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"e. For","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" ex","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"am","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ple, ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"if","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"t","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"he mo","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"del is","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"a De","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"epSeV4Fl","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ash mod","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"el, the","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" runt","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ime ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"should ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"verify","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" t","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"hat the loade","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"d model's a","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"rchitect","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ure i","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"d","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ent","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ifi","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"er ma","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"tche","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"s","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" tha","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"t. If it doe","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"s not, ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"the m","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"easurem","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ent s","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"hould fai","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"l rat","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"her t","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"han","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" s","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ilently fa","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ll bac","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"k to ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"a","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" diff","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"erent mo","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"del t","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ype.","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" This ensu","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"res that","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" the","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" benchmark re","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"sult","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"s are rep","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"rodu","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"cibl","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"e and acc","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"urate for the ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"int","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"end","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ed co","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"nfiguratio","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"n.\n\nThe ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"sam","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"e pr","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"inciple","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" appl","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"i","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"es ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"to t","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"he devic","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"e t","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ype: if the","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" ru","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ntim","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"e i","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"s c","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"onfi","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"gured","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" to ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"run","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" on","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"an","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"AM","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"D I","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ns","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"tin","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ct MI30","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"0X (gfx","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"942),","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" it ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"should ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"verif","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"y that t","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"h","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"e d","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"evi","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ce ty","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"pe m","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"a","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"tche","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"s. If it doe","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"s not, ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"the m","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"easurem","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ent s","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"hould fai","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"l rat","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"her t","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"han","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" s","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ilently fa","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ll back","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" to a","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"diffe","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"rent dev","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ice t","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ype.","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" This ensu","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"res that","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" the","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" benchmark re","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"sult","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"s are rep","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"rodu","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"cibl","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"e and acc","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"urate for","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" th","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"e inten","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"d","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ed h","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ardware.","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"\n\nFinal","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ly, t","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"he runt","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ime s","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"houl","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"d also","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" v","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"erify that th","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"e mo","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"del's a","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"rchit","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ecture","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" and","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" device t","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ype m","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"a","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"tch","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" the ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"exp","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ecte","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"d","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" one","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"s. If they d","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"o not, ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"the m","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"easurem","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ent s","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"hould fai","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"l rat","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"her t","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"han","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" s","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ilently fa","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ll back to a d","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"i","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ffere","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"nt confi","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"gurat","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ion.","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" This ensu","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"res that","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" the","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" benchmark re","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"sult","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"s are rep","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"rodu","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"cibl","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"e and acc","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"urate for the ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"int","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"en","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ded conf","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"i","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"gura","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"tion.\n\nI","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"n summa","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ry, the ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"runtime","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" should enf","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"orc","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"e st","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"rict validati","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"on o","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"f the a","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"rchit","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ect","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ure and","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" devi","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ce t","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ype to ens","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ure that","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" the","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" benchmar","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"k re","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"sults are acc","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"urat","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"e an","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"d reprodu","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"cible for the ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"i","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ntend","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ed ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"configur","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"atio","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"n. This i","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"s cru","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"cial","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" for ensur","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ing that","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" the","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" benchmark ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"resu","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"lts ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"are","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" mean","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ingf","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ul and can b","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"e used fo","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"r pe","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"rformance ana","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"lys","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"is ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"and opti","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"mizatio","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"n.\n\nT","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"he runt","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ime s","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"houl","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"d also","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" e","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"nsure that th","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"e mo","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"del's a","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"rchit","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ectu","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"re and dev","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ice typ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"e ar","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"e validated ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"before ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"a","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ny me","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"asuremen","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"t beg","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ins.","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" This ensu","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"res that","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" the","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" benchmar","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"k re","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"sults are acc","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"urat","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"e an","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"d reprodu","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"cible for the ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"i","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ntend","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ed ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"configur","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"atio","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"n. This i","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"s cru","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"cial","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" for ensur","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ing that","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" the","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" benchmark ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"resu","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"lts ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"are","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" mean","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ingf","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ul and can b","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"e used fo","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"r pe","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"rformance ana","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"lys","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"is ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"and opti","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"mizatio","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"n.\n\nT","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"he runt","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ime s","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"houl","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"d also","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" e","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"nsure that th","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"e mo","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"del's a","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"rchit","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ectu","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"re and dev","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ice typ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"e ar","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"e validated ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"before ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"a","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ny me","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"asuremen","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"t beg","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ins.","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" This ensu","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"res that","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" the","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" benchmar","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"k re","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"sults are acc","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"urat","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"e an","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"d reprodu","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"cible for the ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"i","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ntend","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ed ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"configur","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"atio","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"n. This i","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"s cru","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"cial","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" for ensur","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ing that","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" the","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" benchmark ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"resu","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"lts ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"are","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" mean","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ingf","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ul and can b","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"e used fo","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"r pe","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"rformance ana","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"lys","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"is ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"and opti","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"mizatio","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"n.\n\nT","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"he runt","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ime s","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"houl","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"d also","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" e","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"nsure that th","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"e mo","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"del's a","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"rchit","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ectu","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"re and dev","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ice typ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"e ar","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"e validated ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"before ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"a","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ny me","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"asuremen","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"t beg","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ins.","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" This ensu","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"res that","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" the","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" benchmar","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"k re","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"sults are acc","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"urat","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"e an","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"d reprodu","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"cible for the ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"i","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ntend","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ed ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"configur","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"atio","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"n. This i","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"s cru","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"cial","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":" for ensur","attempt_id":1}
+[feed] << {"type":"token","id":"g0-D4on","text":"ing that the benchmark","attempt_id":1}
+[feed] << {"type":"commit_ready","id":"g0-D4on","tokens":504,"tok_s":32.72089852626112,"prompt_tokens":2052,"prefill_tokens":2052,"cached_tokens":0,"prefill_ms":20818,"total_ms":36221,"finish_reason":"stop","drafter":"ar","attempt_id":1}
+[feed] >> {"type":"commit","id":"g0-D4on","attempt_id":1}
+[feed] << {"type":"aborted","id":"g0-D4on","reason":"client_cancelled","attempt_id":1}
+[feed] terminal aborted: {'type': 'aborted', 'id': 'g0-D4on', 'reason': 'client_cancelled', 'attempt_id': 1}
+[feed] DECODE_PHASE_END
+[feed] >> {"type":"unload"}
+deepseek4 gfx942 A2 levers: L1 compressor_gate=ON (HIPFIRE_DEEPSEEK4_GFX942_COMPRESSOR_GATE default ON on gfx942 MQ2R) ; L3 e8_wo_grouped=OFF (HIPFIRE_DEEPSEEK4_GFX942_E8_WO_GROUPED default OFF, =1 enables) ; F1 indexer_topk_parallel=ON (HIPFIRE_DEEPSEEK4_GFX942_INDEXER_TOPK_PARALLEL default OFF, =1 enables)
+[daemon-control] received commit for id=g0-D4on attempt_id=1
+[feed] << {"type":"done","id":"g0-D4on","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":504,"prefill_ms":0,"decode_ms":0,"attempt_id":1}

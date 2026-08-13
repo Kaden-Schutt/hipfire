@@ -113,6 +113,22 @@ impl GraphState {
         hip.stream_begin_capture(stream, 0) // 0 = hipStreamCaptureModeGlobal
     }
 
+    /// Begin a graph capture that may contain system-scope coordination with
+    /// independently captured peer-device streams. ROCm rejects that shape in
+    /// Global mode; Relaxed mode keeps each rank graph independent while the
+    /// captured signal kernels provide the explicit ordering contract.
+    pub fn begin_graph_capture_relaxed(
+        &mut self,
+        hip: &HipRuntime,
+        device_id: i32,
+        stream: &Stream,
+    ) -> HipResult<()> {
+        bind_thread(hip, device_id)?;
+        self.capture_blobs.clear();
+        self.capture_mode = true;
+        hip.stream_begin_capture(stream, 2) // 2 = hipStreamCaptureModeRelaxed
+    }
+
     /// End capture, instantiate the graph for replay.
     pub fn end_graph_capture(
         &mut self,

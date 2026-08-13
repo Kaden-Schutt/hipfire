@@ -1,0 +1,1 @@
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/a1-m0/04-warm-events.jsonl:{"type":"commit_ready","id":"g0-m0-warm","tokens":51,"tok_s":35.66433566433567,"prompt_tokens":14,"prefill_tokens":14,"cached_tokens":0,"prefill_ms":201,"total_ms":1632,"finish_reason":"stop","drafter":"ar","attempt_id":1}

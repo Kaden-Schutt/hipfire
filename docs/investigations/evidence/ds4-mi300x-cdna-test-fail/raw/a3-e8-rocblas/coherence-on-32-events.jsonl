@@ -1,0 +1,34 @@
+{"type":"pong"}
+{"type":"loaded","arch":"deepseek4","dim":0,"layers":0,"vocab":0,"vl":false,"cache_capable":true,"retry_reset_eligible":false}
+{"type":"token","id":"g0-coherence-on-32","text":"Here is th","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-32","text":"e requ","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-32","text":"ested prod","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-32","text":"uction-gr","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-32","text":"ade ","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-32","text":"tech","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-32","text":"nical briefi","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-32","text":"ng for th","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-32","text":"e","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-32","text":" mea","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-32","text":"surem","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-32","text":"ent co","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-32","text":"ntr","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-32","text":"act. The","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-32","text":" tex","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-32","text":"t below is","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-32","text":" wri","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-32","text":"tten for o","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-32","text":"per","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-32","text":"ator","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-32","text":"s and","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-32","text":" impl","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-32","text":"emen","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-32","text":"ters who mus","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-32","text":"t keep ","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-32","text":"t","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-32","text":"he mea","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-32","text":"suremen","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-32","text":"t honest, avoid hidden","attempt_id":1}
+{"type":"commit_ready","id":"g0-coherence-on-32","tokens":32,"tok_s":1.9594635968403649,"prompt_tokens":2052,"prefill_tokens":2052,"cached_tokens":0,"prefill_ms":16286,"total_ms":32618,"finish_reason":"length","drafter":"ar","attempt_id":1}
+{"type":"aborted","id":"g0-coherence-on-32","reason":"client_cancelled","attempt_id":1}
+{"type":"done","id":"g0-coherence-on-32","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":32,"prefill_ms":0,"decode_ms":0,"attempt_id":1}

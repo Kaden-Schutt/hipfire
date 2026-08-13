@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
+"""Resident daemon phase harness for the default-off Redline graft.
+
+Loads one model once, measures synthetic prefill and single-token decode
+separately, and asks the daemon to delimit/fingerprint exactly one HIP launch
+sequence for each phase. The optional DSpark verify oracle additionally lowers
+one isolated fixed-B verify body and compares ordinary HIP, captured HIP, and
+retained PM4 state without installing that route into serving.
+"""
+
+import argparse
+import json
+import os
+import select
+import statistics
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+REPO = Path(__file__).resolve().parent.parent
+
+
+class Daemon:
+    def __init__(self, binary: Path, log_path: Path, timeout_s: float, kv_mode: str):
+        self.timeout_s = timeout_s
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        self.log = log_path.open("w")
+        env = dict(os.environ)
+        env.update(
+            HIPFIRE_REPLAY_BACKEND="shadow",
+            HIPFIRE_REPLAY_MANUAL_CAPTURE="1",
+            HIPFIRE_KV_MODE=kv_mode,
+            HIPFIRE_CASK_OFF="1",
+            HIPFIRE_AR_GRAPH="0",
+            HIPFIRE_GRAPH="0",
+        )
+        self.proc = subprocess.Popen(
+            [str(binary)],
+            cwd=REPO,
+            env=env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=self.log,
+            text=True,
+            bufsize=1,
+            start_new_session=True,
+        )
+
+    def request(self, message):
+        if self.proc.poll() is not None:
+            raise RuntimeError(f"daemon exited early with code {self.proc.returncode}")
+        assert self.proc.stdin is not None
+        assert self.proc.stdout is not None
+        self.proc.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
+        self.proc.stdin.flush()
+        ready, _, _ = select.select([self.proc.stdout], [], [], self.timeout_s)
+        if not ready:
+            raise TimeoutError(f"daemon response timed out after {self.timeout_s}s: {message['type']}")
+        line = self.proc.stdout.readline()
+        if not line:
+            raise RuntimeError(f"daemon closed while handling {message['type']}")
+        response = json.loads(line)
+        if response.get("type") == "error":
+            raise RuntimeError(response.get("message", "daemon error"))
+        return response
+
+    def close(self):
+        if self.proc.poll() is None:
+            try:
+                self.request({"type": "unload"})
+            except Exception:
+                pass
+            try:
+                self.proc.terminate()
+                self.proc.wait(timeout=5)
+            except Exception:
+                self.proc.kill()
+                self.proc.wait(timeout=5)
+        self.log.close()
+
+
+def summarize(values):
+    return {
+        "min": min(values),
+        "median": statistics.median(values),
+        "max": max(values),
+    }
+
+
+def capture_key(row):
+    capture = row["redline_capture"]
+    return (
+        capture["launches"],
+        capture["unique_kernels"],
+        capture["sequence_hash"],
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", required=True)
+    parser.add_argument(
+        "--daemon",
+        default=str(REPO / "target/release/examples/daemon"),
+    )
+    parser.add_argument("--out", default=str(REPO / ".redline-work/redline-daemon-phases.json"))
+    parser.add_argument("--log", default=str(REPO / ".redline-work/redline-daemon-phases.log"))
+    parser.add_argument("--prefill", type=int, nargs="+", default=[128, 512])
+    parser.add_argument(
+        "--skip-prefill",
+        action="store_true",
+        help="run only the decode capture, contract probe, and shadow parity gate",
+    )
+    parser.add_argument("--decode-context", type=int, default=128)
+    parser.add_argument(
+        "--kv-mode",
+        choices=("q8", "fwht2", "fwht3", "fwht4"),
+        default="q8",
+        help="KV layout used by capture, shadow replay, and the HIP oracle",
+    )
+    parser.add_argument("--capture-repeats", type=int, default=2)
+    parser.add_argument("--measure-repeats", type=int, default=5)
+    parser.add_argument("--decode-iterations", type=int, default=100)
+    parser.add_argument(
+        "--shadow-iterations",
+        type=int,
+        default=1,
+        help="consecutive token positions compared by the AQL/HIP/blob parity gate",
+    )
+    parser.add_argument("--max-seq", type=int, default=2048)
+    parser.add_argument("--timeout", type=float, default=120.0)
+    parser.add_argument("--prefix", type=int, help="compare only the first N captured launches")
+    parser.add_argument(
+        "--profile-prefix-step",
+        type=int,
+        help="profile retained-PM4 cumulative prefixes at this dispatch interval",
+    )
+    parser.add_argument(
+        "--profile-prefix-repeats",
+        type=int,
+        default=3,
+        help="GPU-timed repetitions per cumulative PM4 prefix (default: 3)",
+    )
+    parser.add_argument(
+        "--profile-prefix-start",
+        type=int,
+        help="first cumulative dispatch prefix to profile (default: one step)",
+    )
+    parser.add_argument(
+        "--profile-prefix-steady-state",
+        action="store_true",
+        help=(
+            "prime the model once before retained-PM4 prefix timing instead of "
+            "resetting and re-prefilling before every sample; diagnostic timing only"
+        ),
+    )
+    parser.add_argument(
+        "--pm4",
+        action="store_true",
+        help="lower --prefix to one retained PM4 indirect buffer",
+    )
+    parser.add_argument(
+        "--dspark-verify-shadow",
+        action="store_true",
+        help=(
+            "run the DSpark verify ordinary-HIP/capture-safe/blob/PM4 state oracle "
+            "instead of the plain-AR phase harness"
+        ),
+    )
+    parser.add_argument(
+        "--draft",
+        help="explicit DSpark sidecar path (required by --dspark-verify-shadow)",
+    )
+    parser.add_argument(
+        "--verify-batch",
+        type=int,
+        default=3,
+        help="fixed target verify batch for the DSpark shadow (default: 3)",
+    )
+    args = parser.parse_args()
+
+    model = Path(args.model).expanduser().resolve()
+    daemon_path = Path(args.daemon).expanduser().resolve()
+    if not model.is_file():
+        sys.exit(f"model not found: {model}")
+    if not daemon_path.is_file():
+        sys.exit(f"daemon not found: {daemon_path}")
+    draft = Path(args.draft).expanduser().resolve() if args.draft else None
+    if args.dspark_verify_shadow and (draft is None or not draft.is_file()):
+        sys.exit("--dspark-verify-shadow requires an existing --draft sidecar")
+    if args.dspark_verify_shadow:
+        discovered_draft = model.with_name(f"{model.stem}-dspark{model.suffix}").resolve()
+        if draft != discovered_draft:
+            sys.exit(
+                "DeepSeek4 discovers DSpark only as the sibling "
+                f"{discovered_draft}; --draft resolved to {draft}"
+            )
+
+    report = {
+        "model": str(model),
+        "model_bytes": model.stat().st_size,
+        "draft": str(draft) if draft is not None else None,
+        "draft_bytes": draft.stat().st_size if draft is not None else None,
+        "daemon": str(daemon_path),
+        "kv_mode": args.kv_mode,
+        "automatic_clocks_required": True,
+        "prefill": {},
+        "decode": {},
+    }
+    daemon = Daemon(daemon_path, Path(args.log), args.timeout, args.kv_mode)
+    try:
+        load_params = {
+            "max_seq": args.max_seq,
+            "kv_mode": args.kv_mode,
+            "dflash_mode": "off",
+            "dspark_mode": "on" if args.dspark_verify_shadow else "off",
+        }
+        # DeepSeek4 discovers `<stem>-dspark.<ext>` itself. Passing the same file
+        # through params.draft would incorrectly enter the Qwen DFlash lm_head
+        # eligibility gate before architecture dispatch.
+        loaded = daemon.request(
+            {
+                "type": "load",
+                "model": str(model),
+                "params": load_params,
+            }
+        )
+        if loaded.get("type") != "loaded":
+            raise RuntimeError(f"unexpected load response: {loaded}")
+        report["loaded"] = loaded
+        print(
+            f"loaded arch={loaded.get('arch')} dim={

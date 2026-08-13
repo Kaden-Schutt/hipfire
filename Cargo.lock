@@ -748,6 +748,7 @@ version = "0.3.0"
 dependencies = [
  "hipfire-config",
  "libloading",
+ "redline-rocr",
  "thiserror 2.0.18",
 ]
 
@@ -773,6 +774,8 @@ dependencies = [
  "hipfire-dispatch",
  "hipfire-reap",
  "hipfire-runtime",
+ "libloading",
+ "memmap2",
  "rdna-compute",
  "serde",
  "serde_json",
@@ -788,6 +791,18 @@ dependencies = [
  "hipfire-runtime",
  "image",
  "rdna-compute",
+ "serde_json",
+]
+
+[[package]]
+name = "hipfire-arch-gemma4"
+version = "0.3.0"
+dependencies = [
+ "hip-bridge",
+ "hipfire-dispatch",
+ "hipfire-runtime",
+ "rdna-compute",
+ "serde",
  "serde_json",
 ]
 
@@ -963,6 +978,7 @@ dependencies = [
  "hipfire-arch-cohere2moe",
  "hipfire-arch-deepseek4",
  "hipfire-arch-dots-ocr",
+ "hipfire-arch-gemma4",
  "hipfire-arch-lfm2moe",
  "hipfire-arch-llama",
  "hipfire-arch-minimax",
@@ -988,6 +1004,7 @@ dependencies = [
  "libc",
  "memmap2",
  "rayon",
+ "rdna-compute",
  "safetensors",
  "serde",
  "serde_json",
@@ -1026,6 +1043,7 @@ dependencies = [
  "hipfire-arch-cohere2moe",
  "hipfire-arch-deepseek4",
  "hipfire-arch-dots-ocr",
+ "hipfire-arch-gemma4",
  "hipfire-arch-lfm2moe",
  "hipfire-arch-llama",
  "hipfire-arch-minimax",
@@ -1939,8 +1957,10 @@ version = "0.3.0"
 dependencies = [
  "hip-bridge",
  "hipfire-config",
+ "radiowave",
  "rayon",
  "redline-dispatch",
+ "redline-rocr",
 ]
 
 [[package]]

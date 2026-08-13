@@ -1,0 +1,17 @@
+--- warm f1=on tok=16 ---
+{"type":"commit_ready","id":"g0-warm","tokens":16,"tok_s":32.19315895372233,"prompt_tokens":2052,"prefill_tokens":2052,"cached_tokens":0,"prefill_ms":20840,"total_ms":21338,"finish_reason":"length","drafter":"ar","attempt_id":1}
+--- A1off f1=off tok=510 ---
+{"type":"commit_ready","id":"g0-A1off","tokens":510,"tok_s":2.032180170703134,"prompt_tokens":2052,"prefill_tokens":2052,"cached_tokens":0,"prefill_ms":20802,"total_ms":271764,"finish_reason":"length","drafter":"ar","attempt_id":1}
+--- B1on f1=on tok=510 ---
+{"type":"commit_ready","id":"g0-B1on","tokens":510,"tok_s":32.686021918861755,"prompt_tokens":2052,"prefill_tokens":2052,"cached_tokens":0,"prefill_ms":20830,"total_ms":36434,"finish_reason":"length","drafter":"ar","attempt_id":1}
+--- B2on f1=on tok=510 ---
+{"type":"commit_ready","id":"g0-B2on","tokens":510,"tok_s":32.73007316134001,"prompt_tokens":2052,"prefill_tokens":2052,"cached_tokens":0,"prefill_ms":20816,"total_ms":36399,"finish_reason":"length","drafter":"ar","attempt_id":1}
+--- A2off f1=off tok=510 ---
+{"type":"commit_ready","id":"g0-A2off","tokens":510,"tok_s":2.0315649423593243,"prompt_tokens":2052,"prefill_tokens":2052,"cached_tokens":0,"prefill_ms":20799,"total_ms":271838,"finish_reason":"length","drafter":"ar","attempt_id":1}
+=== byte identity ===
+5f693e57d0164c3bc75ec374bdcd922a  /mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/a1-f1v2/A1off-text.txt
+e7f00e8615ceaec1e8be17987924738c  /mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/a1-f1v2/B1on-text.txt
+b23f342d8da17aa831556e2b82304e01  /mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/a1-f1v2/B2on-text.txt
+a88007f6c688970d81c9ba096f532340  /mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/a1-f1v2/A2off-text.txt
+IDENTICAL_A1_B1=NO
+F1V2DONE

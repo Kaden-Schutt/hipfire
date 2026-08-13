@@ -76,13 +76,17 @@ pub enum AssistantPrefix {
 /// per-arch emitters can interpret it. The arch-specific *frame* mapping — e.g.
 /// DeepSeek V4's `<｜Assistant｜></think>` vs `<think>` open-token, or its `Max`
 /// extended-reasoning preamble — lives in the arch crate that consumes this.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ThinkMode {
     /// Non-thinking: model skips reasoning and replies directly.
     NonThink,
-    /// Thinking: model produces a `<think>` block before responding.
+    /// Thinking with the model's default/low effort. Architectures that encode
+    /// effort as prompt text must not add a high-effort prefix for this mode.
+    Low,
+    /// Thinking with the model's high-effort framing.
     High,
-    /// Thinking-max: same as `High` plus an extended-reasoning preamble (the
+    /// Thinking-max: same output protocol as `Low`/`High`, plus the model's
+    /// maximum-effort preamble (the
     /// consuming arch decides what that means). Some models recommend a large
     /// context window for this mode.
     Max,
@@ -91,15 +95,31 @@ pub enum ThinkMode {
 impl ThinkMode {
     /// Map a JSONL field value (OpenAI-compatible `reasoning_effort` or
     /// project-custom `thinking_mode`) to a mode.
-    /// Accepted: "none|off|chat|minimal" → NonThink;
-    ///           "low|medium|high|thinking" → High;
-    ///           "max" → Max. Anything else → NonThink (safe default).
+    /// Accepted: "none|off|chat" → NonThink;
+    ///           "minimal|low|medium|med|thinking" → Low;
+    ///           "high" → High; "max" → Max.
+    /// Anything else → NonThink (safe default).
     pub fn from_str(s: &str) -> Self {
         match s.to_ascii_lowercase().as_str() {
             "max" => Self::Max,
-            "high" | "thinking" | "low" | "medium" => Self::High,
+            "high" => Self::High,
+            "minimal" | "low" | "medium" | "med" | "thinking" => Self::Low,
             _ => Self::NonThink,
         }
+    }
+}
+
+#[cfg(test)]
+mod think_mode_tests {
+    use super::ThinkMode;
+
+    #[test]
+    fn reasoning_effort_levels_remain_distinct() {
+        assert_eq!(ThinkMode::from_str("none"), ThinkMode::NonThink);
+        assert_eq!(ThinkMode::from_str("low"), ThinkMode::Low);
+        assert_eq!(ThinkMode::from_str("medium"), ThinkMode::Low);
+        assert_eq!(ThinkMode::from_str("high"), ThinkMode::High);
+        assert_eq!(ThinkMode::from_str("max"), ThinkMode::Max);
     }
 }
 
@@ -751,6 +771,39 @@ pub fn hf_tojson(value: minijinja::Value) -> Result<String, minijinja::Error> {
     })
 }
 
+/// Strip unsupported `{% generation %}` / `{% endgeneration %}` Jinja tags
+/// (with any whitespace/dash variants) from LFM2.5-230M's chat_template.
+/// These are no-op generation-scope markers that minijinja doesn't know;
+/// without stripping, `env.add_template` fails with "unknown statement generation".
+/// Transparent: the markers just delimit the assistant generation block, which
+/// the template already handles via `add_generation_prompt` and the assistant
+/// loop, so removing them is semantics-preserving. (LFM2.5-230M bring-up,
+/// 2026-08-09: `{%- generation -%}` at chat_template.jinja:77,105).
+fn strip_generation_tags(template: &str) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut i = 0;
+    let bytes = template.as_bytes();
+    while i < bytes.len() {
+        if i + 1 < bytes.len() && bytes[i] == b'{' && bytes[i + 1] == b'%' {
+            if let Some(end) = template[i..].find("%}") {
+                let inner = &template[i + 2..i + end];
+                // Normalize: trim whitespace, then '-' markers, then whitespace again
+                let clean = inner.trim().trim_matches('-').trim();
+                // Handle inner like "- generation -" -> after first trim it's "- generation -",
+                // after trim_matches('-') it's " generation ", after final trim it's "generation"
+                // For " generation " it's already "generation"
+                if clean == "generation" || clean == "endgeneration" {
+                    i += end + 2;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
 /// Render-time `YYYY-MM-DD` date string for chat templates that surface a
 /// "Current date:" line (MiniMax-M2's `system_message.current_date`, and any
 /// future template using the same convention).
@@ -901,7 +954,8 @@ impl<'a> JinjaChatFrame<'a> {
         // mapping-arg rendering byte-matches transformers' apply_chat_template.
         env.add_filter("tojson", hf_tojson);
 
-        env.add_template("chat", self.template)
+        let cleaned_template = strip_generation_tags(self.template);
+        env.add_template("chat", &cleaned_template)
             .map_err(|e| format!("template parse: {e}"))?;
         let tmpl = env
             .get_template("chat")
@@ -1634,6 +1688,122 @@ mod tests {
     }
 
     #[test]
+    fn gemma4_bundled_template_renders() {
+        // The daemon bundles `templates/gemma-4-it.jinja` as the arch-13
+        // fallback chat template (resolve_chat_template). This test renders
+        // it through the production JinjaChatFrame environment (strict
+        // undefined + pycompat + trim/lstrip + raise_exception + hf tojson)
+        // so a minijinja regression or template edit that breaks parsing /
+        // rendering fails HERE at unit-test time instead of silently falling
+        // back to a raw un-framed prompt at serve time.
+        let t = make_tokenizer();
+        let template = include_str!("../templates/gemma-4-it.jinja");
+
+        // Plain system+user turn, non-thinking (the daemon's v1 default):
+        // generation prompt must pre-fill the empty thought channel.
+        let frame = JinjaChatFrame {
+            tokenizer: &t,
+            template,
+            system: Some("Be brief."),
+            user: "What is the capital of France?",
+            enable_thinking: false,
+            bos_token: Some("<bos>"),
+        };
+        let rendered = frame.render().expect("gemma4 template renders plain turn");
+        assert!(
+            rendered.starts_with("<bos>"),
+            "render must start with the explicit bos_token: got {:?}",
+            &rendered[..rendered.len().min(60)],
+        );
+        assert!(
+            rendered.contains("<|turn>system\n"),
+            "system turn must render: got {rendered:?}",
+        );
+        assert!(
+            rendered.contains("<|turn>user\nWhat is the capital of France?<turn|>"),
+            "user turn must render: got {rendered:?}",
+        );
+        assert!(
+            rendered.ends_with("<|turn>model\n<|channel>thought\n<channel|>"),
+            "non-thinking generation prompt must pre-fill the empty thought              channel: got tail {:?}",
+            &rendered[rendered.len().saturating_sub(80)..],
+        );
+
+        // Tools branch: one OpenAI-shape function definition must survive the
+        // template's format_function_declaration macro tree.
+        let messages = vec![Message {
+            role: Role::User,
+            content: "weather in SF?".to_string(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_plan: String::new(),
+        }];
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get current weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string", "description": "City name"},
+                    },
+                    "required": ["city"],
+                },
+            }
+        })];
+        let with_tools = frame
+            .render_messages(&messages, Some(&tools), None)
+            .expect("gemma4 template renders tools turn");
+        assert!(
+            with_tools.contains("<|tool>") && with_tools.contains("get_weather"),
+            "tools block must render the declaration: got {with_tools:?}",
+        );
+
+        // Agentic replay: assistant turn with a FLAT hipfire ToolCall
+        // ({name, arguments} — not the nested OpenAI {function:{…}} shape)
+        // followed by a tool-role response. Exercises the template's
+        // tool_call replay + forward-scan tool_response branches.
+        let history = vec![
+            Message {
+                role: Role::User,
+                content: "weather in SF?".to_string(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                tool_plan: String::new(),
+            },
+            Message {
+                role: Role::Assistant,
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    name: "get_weather".to_string(),
+                    arguments: serde_json::json!({"city": "SF"}),
+                }],
+                tool_call_id: None,
+                tool_plan: String::new(),
+            },
+            Message {
+                role: Role::Tool,
+                content: "72F sunny".to_string(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                tool_plan: String::new(),
+            },
+        ];
+        let replay = frame
+            .render_messages(&history, Some(&tools), None)
+            .expect("gemma4 template renders tool-call replay history");
+        assert!(
+            replay.contains(r#"<|tool_call>call:get_weather{city:<|"|>SF<|"|>}<tool_call|>"#),
+            "assistant tool_call must replay from the flat shape: got {replay:?}",
+        );
+        assert!(
+            replay.contains("<|tool_response>"),
+            "tool response must render: got {replay:?}",
+        );
+    }
+
+    #[test]
     fn render_messages_with_tools_fires_tools_block() {
         // Smoke test: a minimal template gated on `{% if tools %}`
         // must render the tools branch when the caller supplies a
@@ -2073,6 +2243,157 @@ SYS:{{ build_system_message(system_message) }}:END
             "no date line on the no-system path (gated access short-circuits): {out:?}"
         );
         assert!(out.contains("user=hi;"), "user turn renders: {out:?}");
+    }
+
+    #[test]
+    fn strip_generation_tags_plain_and_dash_variants() {
+        // LFM2.5 chat_template uses unsupported generation-scope markers.
+        // Every whitespace-control spelling must disappear while the
+        // surrounding template text stays byte-identical.
+        assert_eq!(
+            strip_generation_tags("A{% generation %}B{% endgeneration %}C"),
+            "ABC"
+        );
+        assert_eq!(
+            strip_generation_tags("A{%- generation -%}B{%- endgeneration -%}C"),
+            "ABC"
+        );
+        assert_eq!(
+            strip_generation_tags("A{%-generation-%}B{%  endgeneration  %}C"),
+            "ABC"
+        );
+        assert_eq!(
+            strip_generation_tags("{% generation -%}X{%- endgeneration %}"),
+            "X"
+        );
+        assert_eq!(
+            strip_generation_tags("{%- generation %}Y{% endgeneration -%}"),
+            "Y"
+        );
+    }
+
+    #[test]
+    fn strip_generation_tags_preserves_ordinary_tags_and_literals() {
+        // Ordinary control/expression tags and adjacent literals must not be
+        // rewritten — only bare generation / endgeneration statements.
+        let src = "{% for m in messages %}KEEP{% if true %}Y{% endif %}{% endfor %}{% generation %}G{% endgeneration %}";
+        assert_eq!(
+            strip_generation_tags(src),
+            "{% for m in messages %}KEEP{% if true %}Y{% endif %}{% endfor %}G"
+        );
+        // Expression / assignment forms that merely mention the words stay.
+        assert_eq!(
+            strip_generation_tags("{{ generation }}{% set endgeneration = 1 %}"),
+            "{{ generation }}{% set endgeneration = 1 %}"
+        );
+    }
+
+    #[test]
+    fn jinja_lfm_generation_scope_markers_render_framing() {
+        // LFM2.5-shaped loop: assistant content is wrapped in
+        // `{%- generation -%}` / `{%- endgeneration -%}` scope markers.
+        // Without stripping, minijinja fails template parse with
+        // "unknown statement generation". After strip, framing must match
+        // the identical template written without the markers.
+        let t = make_tokenizer();
+        let with_markers = "\
+{% for m in messages -%}\
+{%- if m.role == 'user' -%}\
+<|im_start|>user\n{{ m.content }}<|im_end|>\n\
+{%- elif m.role == 'assistant' -%}\
+<|im_start|>assistant\n{%- generation -%}{{ m.content }}{%- endgeneration -%}<|im_end|>\n\
+{%- endif -%}\
+{%- endfor -%}\
+{%- if add_generation_prompt -%}\
+<|im_start|>assistant\n{%- generation -%}\
+{%- endif -%}";
+        let without_markers = "\
+{% for m in messages -%}\
+{%- if m.role == 'user' -%}\
+<|im_start|>user\n{{ m.content }}<|im_end|>\n\
+{%- elif m.role == 'assistant' -%}\
+<|im_start|>assistant\n{{ m.content }}<|im_end|>\n\
+{%- endif -%}\
+{%- endfor -%}\
+{%- if add_generation_prompt -%}\
+<|im_start|>assistant\n\
+{%- endif -%}";
+
+        let messages = vec![
+            Message {
+                role: Role::User,
+                content: "hello".to_string(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                tool_plan: String::new(),
+            },
+            Message {
+                role: Role::Assistant,
+                content: "hi there".to_string(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                tool_plan: String::new(),
+            },
+            Message {
+                role: Role::User,
+                content: "again".to_string(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                tool_plan: String::new(),
+            },
+        ];
+
+        let frame_marked = JinjaChatFrame {
+            tokenizer: &t,
+            template: with_markers,
+            system: None,
+            user: "",
+            enable_thinking: false,
+            bos_token: Some(""),
+        };
+        let frame_clean = JinjaChatFrame {
+            tokenizer: &t,
+            template: without_markers,
+            system: None,
+            user: "",
+            enable_thinking: false,
+            bos_token: Some(""),
+        };
+
+        let out = frame_marked
+            .render_messages(&messages, None, None)
+            .expect("LFM generation markers must parse after strip");
+        let expected = frame_clean
+            .render_messages(&messages, None, None)
+            .expect("baseline template without markers renders");
+        assert_eq!(
+            out, expected,
+            "stripped generation markers must be semantics-preserving vs marker-free template"
+        );
+
+        // Structural framing: both user turns, prior assistant content, and
+        // the open assistant generation prompt. Dash-controlled Jinja tags
+        // intentionally trim inter-turn newlines.
+        let user_hello = "<|im_start|>user\nhello<|im_end|>";
+        let asst_hi = "<|im_start|>assistant\nhi there<|im_end|>";
+        let user_again = "<|im_start|>user\nagain<|im_end|>";
+        let asst_open = "<|im_start|>assistant";
+        assert!(
+            out.contains(&user_hello),
+            "first user turn framing missing: {out:?}"
+        );
+        assert!(
+            out.contains(&asst_hi),
+            "prior assistant content framing missing: {out:?}"
+        );
+        assert!(
+            out.contains(&user_again),
+            "second user turn framing missing: {out:?}"
+        );
+        assert!(
+            out.ends_with(asst_open),
+            "add_generation_prompt must open the live assistant turn: {out:?}"
+        );
     }
 
     #[test]

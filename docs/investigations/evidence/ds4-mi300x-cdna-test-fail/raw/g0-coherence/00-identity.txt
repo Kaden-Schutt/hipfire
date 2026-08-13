@@ -1,0 +1,40 @@
+=== host ===
+7
+2026-08-01T13:44:49Z
+=== git HEAD ===
+d4ab7434a9dad15d0bf6456c8f3c12779ac0edb5
+=== branch ===
+codex/ds4-mi300x-agentmaxx
+=== dirty entry count ===
+27
+=== gfx942 kernel files ===
+26
+=== GPU ownership ===
+
+
+============================================ ROCm System Management Interface ============================================
+====================================================== Concise Info ======================================================
+Device  Node  IDs              Temp        Power     Partitions          SCLK     MCLK    Fan  Perf  PwrCap  VRAM%  GPU%  
+[3m              (DID,     GUID)  (Junction)  (Socket)  (Mem, Compute, ID)                                                   [0m
+==========================================================================================================================
+0       1     0x74b5,   21947  41.0°C      193.0W    NPS1, SPX, 0        2100Mhz  900Mhz  0%   auto  750.0W  42%    0%    
+==========================================================================================================================
+================================================== End of ROCm SMI Log ===================================================
+=== KFD processes ===
+/usr/local/bin/gpuagent  pid=1823
+/mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/target/release/examples/daemon  pid=53356
+=== model ===
+-rw-rw-r-- 1 1000 1000 82191362222 Jul 24 22:20 /mnt/scratch/models/deepseek-v4-flash-mq2r/deepseek-v4-flash.mq2r
+82191362222
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/vdc1       5.0T  316G  4.5T   7% /mnt/scratch
+=== pre-fix shfl width32 count ===
+kernels/src/deepseek4_attn_swa_batched.hip:0
+kernels/src/deepseek4_attn_swa_batched_debug.hip:0
+kernels/src/deepseek4_attn_swa_buf.hip:0
+kernels/src/deepseek4_attn_swa_topk_batched.hip:0
+kernels/src/deepseek4_attn_swa_topk_batched_wmma.hip:0
+kernels/src/deepseek4_attn_swa_topk_buf.hip:0
+kernels/src/deepseek4_attn_swa_topk_direct_batched.hip:0
+kernels/src/deepseek4_attn_swa_topk_direct_wmma.hip:0
+117:        ws += __shfl(thread_sum, src);

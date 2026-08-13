@@ -427,10 +427,10 @@ fn quantize_mfpn_e8_gptq_2d(
     h_blocks: &[HBlock],
     n: u32,
     quant_step: f32,
-    cpu_fwht: &dyn Fn(&mut [f32], &[f32], &[f32]),
-    e4m3_encode: &dyn Fn(f32) -> u8,
-    e4m3_decode: &dyn Fn(u8) -> f32,
-    f32_to_f16: &dyn Fn(f32) -> u16,
+    cpu_fwht: &(dyn Fn(&mut [f32], &[f32], &[f32]) + Sync),
+    e4m3_encode: &(dyn Fn(f32) -> u8 + Sync),
+    e4m3_decode: &(dyn Fn(u8) -> f32 + Sync),
+    f32_to_f16: &(dyn Fn(f32) -> u16 + Sync),
 ) -> Vec<u8> {
     assert!(
         n == 2 || n == 3 || n == 4,
@@ -460,63 +460,66 @@ fn quantize_mfpn_e8_gptq_2d(
 
     let mut out = vec![0u8; m * row_bytes];
 
-    // Process rows (could rayon here; kept serial for determinism in the
-    // single-tensor call — the closure parallelizes over experts already).
-    let mut row_buf = vec![0.0f32; k];
-    for r in 0..m {
-        row_buf.copy_from_slice(&f32_data[r * k..(r + 1) * k]);
-        for seg in 0..n_256 {
-            cpu_fwht(&mut row_buf[seg * 256..(seg + 1) * 256], signs1, signs2);
-        }
-        // Freeze scales from the rotated row (identical to RTN).
-        let fs = freeze_row_scales(&row_buf, e4m3_encode, e4m3_decode);
-
-        let base = r * row_bytes;
-        out[base..base + 2].copy_from_slice(&f32_to_f16(fs.row_scale_a).to_le_bytes());
-        out[base + 2..base + 4].copy_from_slice(&0u16.to_le_bytes());
-        out[base + 4..base + 6].copy_from_slice(&(n_32 as u16).to_le_bytes());
-        out[base + 6] = 0x05; // same FWHT flag as RTN path
-        out[base + 7] = 0u8;
-
-        // Per 256-block LDLQ.
-        for b256 in 0..n_256 {
-            let w_rot_block = &row_buf[b256 * 256..b256 * 256 + 256];
-            // 8 sub-blocks of 32; their frozen DECODED E4M3 block scales.
-            // The row scale + the two reciprocals are derived inside
-            // ldlq_row_block to byte-match the RTN normalization exactly.
-            let mut block_scale = [0.0f32; 8];
-            for sub in 0..8 {
-                let blk = b256 * 8 + sub;
-                block_scale[sub] = fs.block_scale[blk];
+    // Rows are independent once the block feedback matrices are frozen.
+    // Parallel row execution is byte-deterministic and is essential for
+    // single, tall tensors such as a 69K-vocabulary output head.
+    use rayon::prelude::*;
+    out.par_chunks_mut(row_bytes)
+        .enumerate()
+        .for_each(|(r, row_out)| {
+            let mut row_buf = vec![0.0f32; k];
+            row_buf.copy_from_slice(&f32_data[r * k..(r + 1) * k]);
+            for seg in 0..n_256 {
+                cpu_fwht(&mut row_buf[seg * 256..(seg + 1) * 256], signs1, signs2);
             }
-            let mut idx32 = [0u32; 32];
-            ldlq_row_block(
-                w_rot_block,
-                fs.row_scale_a,
-                fs.inv_row_scale,
-                &block_scale,
-                block_fb[b256].as_deref(),
-                n,
-                quant_step,
-                &mut idx32,
-            );
-            // Emit: 8 sub-blocks × (1 scale byte + 4 n-byte codewords).
-            // Packing: encode_index_n guarantees the upper 32-8n bits of each
-            // u32 codeword are ZERO — only the low n bytes are written, exactly
-            // mirroring quantize_mfpn_e8_row (RTN path in main.rs).
-            for sub in 0..8 {
-                let blk = b256 * 8 + sub;
-                let po = base + 16 + blk * block_bytes;
-                out[po] = fs.scale_bytes[blk];
-                for gg in 0..4 {
-                    let idx = idx32[sub * 4 + gg];
-                    let bytes = idx.to_le_bytes();
-                    let cw_off = po + 1 + gg * n as usize;
-                    out[cw_off..cw_off + n as usize].copy_from_slice(&bytes[..n as usize]);
+            // Freeze scales from the rotated row (identical to RTN).
+            let fs = freeze_row_scales(&row_buf, e4m3_encode, e4m3_decode);
+
+            row_out[..2].copy_from_slice(&f32_to_f16(fs.row_scale_a).to_le_bytes());
+            row_out[2..4].copy_from_slice(&0u16.to_le_bytes());
+            row_out[4..6].copy_from_slice(&(n_32 as u16).to_le_bytes());
+            row_out[6] = 0x05; // same FWHT flag as RTN path
+            row_out[7] = 0u8;
+
+            // Per 256-block LDLQ.
+            for b256 in 0..n_256 {
+                let w_rot_block = &row_buf[b256 * 256..b256 * 256 + 256];
+                // 8 sub-blocks of 32; their frozen DECODED E4M3 block scales.
+                // The row scale + the two reciprocals are derived inside
+                // ldlq_row_block to byte-match the RTN normalization exactly.
+                let mut block_scale = [0.0f32; 8];
+                for sub in 0..8 {
+                    let blk = b256 * 8 + sub;
+                    block_scale[sub] = fs.block_scale[blk];
+                }
+                let mut idx32 = [0u32; 32];
+                ldlq_row_block(
+                    w_rot_block,
+                    fs.row_scale_a,
+                    fs.inv_row_scale,
+                    &block_scale,
+                    block_fb[b256].as_deref(),
+                    n,
+                    quant_step,
+                    &mut idx32,
+                );
+                // Emit: 8 sub-blocks × (1 scale byte + 4 n-byte codewords).
+                // Packing: encode_index_n guarantees the upper 32-8n bits of each
+                // u32 codeword are ZERO — only the low n bytes are written, exactly
+                // mirroring quantize_mfpn_e8_row (RTN path in main.rs).
+                for sub in 0..8 {
+                    let blk = b256 * 8 + sub;
+                    let po = 16 + blk * block_bytes;
+                    row_out[po] = fs.scale_bytes[blk];
+                    for gg in 0..4 {
+                        let idx = idx32[sub * 4 + gg];
+                        let bytes = idx.to_le_bytes();
+                        let cw_off = po + 1 + gg * n as usize;
+                        row_out[cw_off..cw_off + n as usize].copy_from_slice(&bytes[..n as usize]);
+                    }
                 }
             }
-        }
-    }
+        });
     out
 }
 
@@ -530,10 +533,10 @@ pub fn quantize_mfp4g32_e8_gptq_2d(
     signs1: &[f32],
     signs2: &[f32],
     h_blocks: &[HBlock],
-    cpu_fwht: &dyn Fn(&mut [f32], &[f32], &[f32]),
-    e4m3_encode: &dyn Fn(f32) -> u8,
-    e4m3_decode: &dyn Fn(u8) -> f32,
-    f32_to_f16: &dyn Fn(f32) -> u16,
+    cpu_fwht: &(dyn Fn(&mut [f32], &[f32], &[f32]) + Sync),
+    e4m3_encode: &(dyn Fn(f32) -> u8 + Sync),
+    e4m3_decode: &(dyn Fn(u8) -> f32 + Sync),
+    f32_to_f16: &(dyn Fn(f32) -> u16 + Sync),
 ) -> Vec<u8> {
     quantize_mfpn_e8_gptq_2d(
         f32_data,
@@ -562,10 +565,10 @@ pub fn quantize_mfp3g32_e8_gptq_2d(
     signs1: &[f32],
     signs2: &[f32],
     h_blocks: &[HBlock],
-    cpu_fwht: &dyn Fn(&mut [f32], &[f32], &[f32]),
-    e4m3_encode: &dyn Fn(f32) -> u8,
-    e4m3_decode: &dyn Fn(u8) -> f32,
-    f32_to_f16: &dyn Fn(f32) -> u16,
+    cpu_fwht: &(dyn Fn(&mut [f32], &[f32], &[f32]) + Sync),
+    e4m3_encode: &(dyn Fn(f32) -> u8 + Sync),
+    e4m3_decode: &(dyn Fn(u8) -> f32 + Sync),
+    f32_to_f16: &(dyn Fn(f32) -> u16 + Sync),
 ) -> Vec<u8> {
     quantize_mfpn_e8_gptq_2d(
         f32_data,
@@ -594,10 +597,10 @@ pub fn quantize_mfp2g32_e8_gptq_2d(
     signs1: &[f32],
     signs2: &[f32],
     h_blocks: &[HBlock],
-    cpu_fwht: &dyn Fn(&mut [f32], &[f32], &[f32]),
-    e4m3_encode: &dyn Fn(f32) -> u8,
-    e4m3_decode: &dyn Fn(u8) -> f32,
-    f32_to_f16: &dyn Fn(f32) -> u16,
+    cpu_fwht: &(dyn Fn(&mut [f32], &[f32], &[f32]) + Sync),
+    e4m3_encode: &(dyn Fn(f32) -> u8 + Sync),
+    e4m3_decode: &(dyn Fn(u8) -> f32 + Sync),
+    f32_to_f16: &(dyn Fn(f32) -> u16 + Sync),
 ) -> Vec<u8> {
     quantize_mfpn_e8_gptq_2d(
         f32_data,
@@ -1108,9 +1111,11 @@ mod tests {
             "J_rtn={j_rtn:.6} J_gptq={j_gptq:.6} ratio={:.4} changed={changed}",
             j_gptq / j_rtn
         );
-        assert!(j_gptq <= 0.90 * j_rtn,
+        assert!(
+            j_gptq <= 0.90 * j_rtn,
             "GPTQ-E8 did not reduce H-weighted error by >=10%: J_gptq={j_gptq:.6} vs J_rtn={j_rtn:.6} (ratio {:.4})",
-            j_gptq / j_rtn);
+            j_gptq / j_rtn
+        );
 
         // Unweighted (Euclidean) MSE is EXPECTED to rise a bit: GPTQ trades
         // Euclidean fidelity for H-weighted (output-error) fidelity. With this
@@ -1123,8 +1128,10 @@ mod tests {
             "mse_rtn={mse_rtn:.6} mse_gptq={mse_gptq:.6} (ratio {:.3})",
             mse_gptq / mse_rtn
         );
-        assert!(mse_gptq <= 2.5 * mse_rtn,
-            "GPTQ unweighted MSE blew up (runaway, not a legit H-trade): {mse_gptq:.6} vs {mse_rtn:.6}");
+        assert!(
+            mse_gptq <= 2.5 * mse_rtn,
+            "GPTQ unweighted MSE blew up (runaway, not a legit H-trade): {mse_gptq:.6} vs {mse_rtn:.6}"
+        );
     }
 
     // ------- TEST 2: DEGENERACY — H=I, GPTQ ~= RTN -------
@@ -1155,8 +1162,10 @@ mod tests {
             .zip(codes_gptq.iter())
             .filter(|(a, b)| a != b)
             .count();
-        assert_eq!(changed, 0,
-            "H=I must collapse to RTN exactly, but {changed} codewords differ (feedback firing on uncorrelated H)");
+        assert_eq!(
+            changed, 0,
+            "H=I must collapse to RTN exactly, but {changed} codewords differ (feedback firing on uncorrelated H)"
+        );
     }
 
     // ------- TEST 3: byte-format / output validity (n=4) -------
@@ -1291,9 +1300,11 @@ mod tests {
             .zip(rtn_bytes.iter())
             .filter(|(a, b)| a != b)
             .count();
-        assert_eq!(diffs, 0,
+        assert_eq!(
+            diffs, 0,
             "GPTQ-mfp3 (fb=None) is NOT byte-identical to RTN-mfp3: {diffs} byte(s) differ. \
-             Layout parity BROKEN — the GPTQ path uses a different scale or codeword packing than RTN.");
+             Layout parity BROKEN — the GPTQ path uses a different scale or codeword packing than RTN."
+        );
     }
 
     // Build the full RTN-mfpN-E8 byte stream for `f32_data`, mirroring the
@@ -1422,11 +1433,16 @@ mod tests {
                     }
                 }
             }
-            assert_eq!(total_diffs, 0,
+            assert_eq!(
+                total_diffs,
+                0,
                 "GPTQ-mfp{n} (fb=None) diverged from RTN-mfp{n} on {} seed(s) ({} total byte diffs); \
                  examples: {:?}. Normalization parity BROKEN — the fb=None path must use the SAME \
                  two-reciprocal `w*inv_row*inv_block` form as the RTN encoder, NOT a combined reciprocal.",
-                failing_seeds.len(), total_diffs, failing_seeds);
+                failing_seeds.len(),
+                total_diffs,
+                failing_seeds
+            );
         }
     }
 

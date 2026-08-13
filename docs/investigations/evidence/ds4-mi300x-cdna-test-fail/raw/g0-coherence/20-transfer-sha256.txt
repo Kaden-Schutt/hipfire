@@ -1,0 +1,2 @@
+829b9c1637b4c462d2c792ff9f37f1c14a028b4151030b25ffa47bc774d33f12  /mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/campaign-tracked.patch
+1073c55755e14625dc624e1f964ba63633d145989e5a9b9e0e9bcea9addf7c1c  /mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/campaign-untracked.tgz

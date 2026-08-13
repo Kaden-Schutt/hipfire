@@ -1,0 +1,11 @@
+This is a technical briefing for operators and implementers who must ensure the product path is honest, reproducible, and free from hidden optimizations that could invalidate benchmarks. Below is a comprehensive breakdown of the end-to-end inference pipeline for a **DeepSe V4 Flash-style MoM model** on an **AMD Instinct MI300X (gfx942)** under the specified constraints: **batch-1, temperature 0, Q8 KV, 2040-token prompt, 510 generated tokens, and no speculation**.
+
+---
+
+### 1. The Primacy of Prompt Bytes Over "Text"
+
+The benchmark contract begins with the **exact byte sequence** of the prompt. This is non-negotable for reproducibility. The following must be frozen and verified:
+
+- **Source Corpus**: A deterministic, non-degenerate text (e.g., a technical discussion or prose) with a known MD5/SHA-256 hash. No random words, repeated paragraphs, or timestamps.
+- **Tokenization**: The tokenizer must be the exact runtime tokenizer (e.g., `Token::from_hfq_metadata`), not a Python proxy. The tokenizer must produce a **verified round-trip**: encode → decode → re-encode must yield the exact same token IDs and count. This ensures no hidden biases from pre-tokenization regexes, byte fallbacks, or BOS policies.
+- **Format**: The prompt is stored as a file with **no trailing newline** (e.g.,

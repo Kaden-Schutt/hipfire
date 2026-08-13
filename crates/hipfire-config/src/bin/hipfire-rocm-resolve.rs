@@ -57,10 +57,7 @@ fn main() -> ExitCode {
             .map(Path::new)
             .any(|candidate| candidate.is_file())
         {
-            return fail(
-                "the HSA runtime (libhsa-runtime64.so)",
-                &hsa_candidates,
-            );
+            return fail("the HSA runtime (libhsa-runtime64.so)", &hsa_candidates);
         }
     }
 

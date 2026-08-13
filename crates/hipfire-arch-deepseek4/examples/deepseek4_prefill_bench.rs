@@ -12,7 +12,7 @@
 //!
 //! Usage:
 //!   deepseek4_prefill_bench <model.mq2lloyd> [--prompt FILE] [--tokens N]
-//!       [--reps R] [--warmup W] [--batch B]
+//!       [--reps R] [--warmup W] [--batch B] [--dump-dense-acts DIR]
 //!
 //! Defaults: --tokens 7047 (antirez DGX-Spark prompt size), --reps 3,
 //!           --warmup 1, --batch 1024 (HIPFIRE_DEEPSEEK4_PP_BATCH).
@@ -21,7 +21,10 @@
 //! if longer it is truncated. This keeps the FLOP count fixed across runs
 //! so prefill throughput is comparable regardless of corpus.
 
-use hipfire_arch_deepseek4::{forward::forward_prefill_batch_chunked, DeepseekV4, DeepseekV4State};
+use hipfire_arch_deepseek4::{
+    forward::{finish_dense_activation_dump, forward_prefill_batch_chunked},
+    DeepseekV4, DeepseekV4State,
+};
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::tokenizer::Tokenizer;
@@ -37,10 +40,20 @@ fn main() -> Result<(), String> {
     });
 
     let mut prompt_file: Option<String> = None;
+    let mut dump_dense_acts: Option<String> = None;
     let mut variants: Vec<String> = vec!["default".to_string()];
     let mut target_tokens: usize = 7047;
     let mut reps: usize = 3;
     let mut warmup: usize = 1;
+    // Ceilings for the batched E8 decode GEMV, swept in-process against one
+    // loaded trunk. 0 = WMMA token tile (the shipped path).
+    let mut e8_batched: Vec<usize> = vec![0];
+    // KV depth at which every arm is measured. A pos-0 window sees an empty
+    // SWA window and top-k index, which understates attention; DS4 Flash caps
+    // attention at window+index_topk, so any prefix past ~640 is equivalent.
+    let mut prefix: usize = 0;
+    // AR decode steps to time as the break-even reference (0 = skip).
+    let mut ar_ref: usize = 0;
     let mut batches: Vec<usize> = vec![std::env::var("HIPFIRE_DEEPSEEK4_PP_BATCH")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -48,6 +61,9 @@ fn main() -> Result<(), String> {
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--prompt" => prompt_file = Some(args.next().expect("--prompt FILE")),
+            "--dump-dense-acts" => {
+                dump_dense_acts = Some(args.next().expect("--dump-dense-acts DIR"))
+            }
             "--tokens" => target_tokens = args.next().expect("--tokens N").parse().unwrap(),
             "--reps" => reps = args.next().expect("--reps R").parse().unwrap(),
             "--warmup" => warmup = args.next().expect("--warmup W").parse().unwrap(),
@@ -59,6 +75,16 @@ fn main() -> Result<(), String> {
                     .map(|s| s.parse().unwrap())
                     .collect()
             }
+            "--e8-batched" => {
+                e8_batched = args
+                    .next()
+                    .expect("--e8-batched N[,N2,...]")
+                    .split(',')
+                    .map(|s| s.parse().unwrap())
+                    .collect()
+            }
+            "--prefix" => prefix = args.next().expect("--prefix P").parse().unwrap(),
+            "--ar-ref" => ar_ref = args.next().expect("--ar-ref N").parse().unwrap(),
             "--variants" => {
                 variants = args
                     .next()
@@ -69,6 +95,26 @@ fn main() -> Result<(), String> {
             }
             other => panic!("unknown flag: {other}"),
         }
+    }
+
+    if let Some(out_dir) = &dump_dense_acts {
+        if warmup != 0
+            || reps != 1
+            || variants.len() != 1
+            || batches.len() != 1
+            || e8_batched.len() != 1
+            || prefix != 0
+            || ar_ref != 0
+            || target_tokens == 0
+        {
+            return Err(
+                "--dump-dense-acts requires --warmup 0 --reps 1, one variant/batch/e8 arm, \
+                 --prefix 0, --ar-ref 0, and --tokens > 0"
+                    .to_string(),
+            );
+        }
+        std::env::set_var("HIPFIRE_DS4_DENSE_ACT_DIR", out_dir);
+        eprintln!("Hipfire-native P3 activation capture: {out_dir}");
     }
 
     eprintln!("Loading DeepSeek V4 from {model_path}...");
@@ -90,12 +136,17 @@ fn main() -> Result<(), String> {
         )
     };
     assert!(!base.is_empty(), "empty prompt token stream");
-    let mut tokens: Vec<u32> = Vec::with_capacity(target_tokens);
-    while tokens.len() < target_tokens {
-        let take = (target_tokens - tokens.len()).min(base.len());
+    // `--tokens 0` is window mode: each batch size runs exactly ONE chunk of
+    // `batch` tokens, which is the speculative-verify window rather than a
+    // prefill. Any other value keeps the fixed-FLOP prefill sweep.
+    let max_batch = batches.iter().copied().max().unwrap_or(1);
+    let pool_len = prefix + target_tokens.max(max_batch);
+    let mut tokens: Vec<u32> = Vec::with_capacity(pool_len);
+    while tokens.len() < pool_len {
+        let take = (pool_len - tokens.len()).min(base.len());
         tokens.extend_from_slice(&base[..take]);
     }
-    tokens.truncate(target_tokens);
+    tokens.truncate(pool_len);
 
     let mut gpu = Gpu::init().map_err(|e| format!("gpu: {e:?}"))?;
     eprintln!("GPU: {}", gpu.arch.clone());
@@ -111,6 +162,36 @@ fn main() -> Result<(), String> {
         target_tokens,
         batches
     );
+
+    // One state, prefilled once to `prefix` and then shared by every arm. Each
+    // measured window rewrites the same KV slots, so re-prefilling per rep
+    // (9.7 s at 2048 tokens) buys nothing.
+    let mut state = DeepseekV4State::new(&cfg)?;
+    let start_pos = prefix as u32;
+    if prefix > 0 {
+        let chunk = prefix.min(1024);
+        let mut pre_pbs =
+            hipfire_arch_deepseek4::forward::PrefillBatchScratch::new(&mut gpu, &cfg, chunk)?;
+        let t = Instant::now();
+        let _ = forward_prefill_batch_chunked(
+            &cfg,
+            &weights,
+            &mut state,
+            &mut gpu,
+            &tokens[..prefix],
+            0,
+            &mut pre_pbs,
+        )?;
+        gpu.hip
+            .device_synchronize()
+            .map_err(|e| format!("prefix sync: {e:?}"))?;
+        eprintln!(
+            "Prefilled {}-token prefix in {:.2}s",
+            prefix,
+            t.elapsed().as_secs_f64()
+        );
+        pre_pbs.free_gpu(&mut gpu);
+    }
 
     // Env vars that select MQ2-Lloyd grouped-GEMM variants in the dispatch.
     const MOE_VARS: &[&str] = &[
@@ -140,62 +221,112 @@ fn main() -> Result<(), String> {
 
     for variant in &variants {
         apply_variant(variant);
-        for &batch in &batches {
-            let pbs =
-                hipfire_arch_deepseek4::forward::PrefillBatchScratch::new(&mut gpu, &cfg, batch)?;
 
-            let run_once = |gpu: &mut Gpu| -> Result<f64, String> {
-                let mut state = DeepseekV4State::new(&cfg)?;
+        // AR decode reference: same process, same thermal state, same KV
+        // depth as the windows below, so window(B) can be divided by it
+        // directly instead of against a number from another binary.
+        if ar_ref > 0 {
+            let tok = tokens[prefix.saturating_sub(1)];
+            let mut secs: Vec<f64> = Vec::with_capacity(ar_ref);
+            for i in 0..warmup + ar_ref {
                 gpu.hip
                     .device_synchronize()
-                    .map_err(|e| format!("pre-sync: {e:?}"))?;
+                    .map_err(|e| format!("ar pre-sync: {e:?}"))?;
                 let t = Instant::now();
-                let _ = forward_prefill_batch_chunked(
-                    &cfg, &weights, &mut state, gpu, &tokens, 0, &pbs,
+                let _ = hipfire_arch_deepseek4::forward::decode_step(
+                    &cfg, &weights, &mut state, &mut gpu, tok, start_pos,
                 )?;
                 gpu.hip
                     .device_synchronize()
-                    .map_err(|e| format!("post-sync: {e:?}"))?;
-                Ok(t.elapsed().as_secs_f64())
-            };
-
-            for w in 0..warmup {
-                let s = run_once(&mut gpu)?;
+                    .map_err(|e| format!("ar post-sync: {e:?}"))?;
+                let s = t.elapsed().as_secs_f64();
                 eprintln!(
-                    "[batch {} warmup {}] {} tok in {:.3}s = {:.2} tok/s",
-                    batch,
-                    w,
-                    target_tokens,
+                    "[ar {}] 1 tok in {:.4}s = {:.2} tok/s{}",
+                    i,
                     s,
-                    target_tokens as f64 / s
+                    1.0 / s,
+                    if i < warmup { " (warmup)" } else { "" }
                 );
-            }
-
-            let mut secs: Vec<f64> = Vec::with_capacity(reps);
-            for r in 0..reps {
-                let s = run_once(&mut gpu)?;
-                eprintln!(
-                    "[batch {} measure {}] {} tok in {:.3}s = {:.2} tok/s",
-                    batch,
-                    r,
-                    target_tokens,
-                    s,
-                    target_tokens as f64 / s
-                );
-                secs.push(s);
+                if i >= warmup {
+                    secs.push(s);
+                }
             }
             secs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            let median = secs[secs.len() / 2];
-            let best = secs[0];
+            let med = secs[secs.len() / 2];
             println!(
-            "PREFILL variant={} median {:.2} tok/s (best {:.2}) | {} tokens | batch {} | target=343 t/s",
-            variant,
-            target_tokens as f64 / median,
-            target_tokens as f64 / best,
-            target_tokens,
-            batch
-        );
+                "AR-REF variant={} {:.2} ms/token ({:.2} tok/s) | pos {}",
+                variant,
+                med * 1e3,
+                1.0 / med,
+                start_pos
+            );
+        }
+
+        // Batch outer, arm inner: the two arms of each B run back-to-back
+        // against one `PrefillBatchScratch`, so neither an allocation nor a
+        // sweep-length thermal drift sits between them.
+        for &batch in &batches {
+            let mut pbs =
+                hipfire_arch_deepseek4::forward::PrefillBatchScratch::new(&mut gpu, &cfg, batch)?;
+            let n_tok = if target_tokens == 0 {
+                batch
+            } else {
+                target_tokens
+            };
+            let toks = &tokens[prefix..prefix + n_tok];
+
+            for &e8b in &e8_batched {
+                hipfire_arch_deepseek4::forward::set_e8_batched_gemv_max_batch(e8b);
+
+                let mut secs: Vec<f64> = Vec::with_capacity(reps);
+                for i in 0..warmup + reps {
+                    gpu.hip
+                        .device_synchronize()
+                        .map_err(|e| format!("pre-sync: {e:?}"))?;
+                    let t = Instant::now();
+                    // Every rep re-runs the SAME positions [start_pos,
+                    // start_pos+n_tok), overwriting those KV slots, so the
+                    // measured shape never drifts across reps.
+                    let _ = forward_prefill_batch_chunked(
+                        &cfg, &weights, &mut state, &mut gpu, toks, start_pos, &mut pbs,
+                    )?;
+                    gpu.hip
+                        .device_synchronize()
+                        .map_err(|e| format!("post-sync: {e:?}"))?;
+                    let s = t.elapsed().as_secs_f64();
+                    eprintln!(
+                        "[batch {} e8b {} {}] {} tok in {:.4}s = {:.2} tok/s{}",
+                        batch,
+                        e8b,
+                        i,
+                        n_tok,
+                        s,
+                        n_tok as f64 / s,
+                        if i < warmup { " (warmup)" } else { "" }
+                    );
+                    if i >= warmup {
+                        secs.push(s);
+                    }
+                }
+                secs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let median = secs[secs.len() / 2];
+                let best = secs[0];
+                let calls = (n_tok as f64 / batch as f64).ceil();
+                println!(
+                    "WINDOW variant={} e8b={} B={} | {:.2} ms/call (best {:.2}) | {:.2} tok/s | {} tokens | pos {}",
+                    variant,
+                    e8b,
+                    batch,
+                    median * 1e3 / calls,
+                    best * 1e3 / calls,
+                    n_tok as f64 / median,
+                    n_tok,
+                    start_pos
+                );
+            }
+            pbs.free_gpu(&mut gpu);
         }
     }
+    finish_dense_activation_dump()?;
     Ok(())
 }

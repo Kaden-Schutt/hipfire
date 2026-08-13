@@ -1,0 +1,114 @@
+LENGTH SWEEP — parent vs MQ2R vs MQ2-Lloyd on shared prefixes
+==============================================================================
+
+TOKEN PREFIXES (each is a strict prefix of the next)
+token_files
+n=128 path=/mnt/scratch/quantization/deepseek-v4-flash-0731-parent-baseline/tokens_128.bin bytes=512 sha256=84f8c3f04e7876c4f37d59652217e13c42969f034e2508ee60a87871cd10ac20 prefix_ok=1
+n=256 path=/mnt/scratch/quantization/deepseek-v4-flash-0731-parent-baseline/tokens_256.bin bytes=1024 sha256=0b747dfb7caee6fa7239160a86b1ec06c08490470f8159549eef1af4f8ebbed2 prefix_ok=1
+n=512 path=/mnt/scratch/quantization/deepseek-v4-flash-0731-parent-baseline/tokens_512.bin bytes=2048 sha256=f02a2a6127965414fed13487e1b4718b98e878bed1cb668d26580b0cf93b30f8 prefix_ok=1
+n=1024 path=/mnt/scratch/quantization/deepseek-v4-flash-0731-parent-baseline/tokens.bin bytes=4096 sha256=48b0f834a7a60656db79b3784c96e1ed131c501ae5b0d35c2066f45fb5bb86dd prefix_ok=1
+
+PPL / KLD / TOP-1 TABLE
+  len      model          PPL        vs   KLD_mean     top1    PPL_gap
+------------------------------------------------------------------------------
+  128     parent    23.638255
+  128       mq2r     9.297005    parent   5.296584   0.4375    14.3412
+  128   mq2lloyd     8.733584    parent   5.136034   0.4297    14.9047
+  128     q-vs-q     8.733584      mq2r   0.159843   0.8672
+
+  256     parent    29.644055
+  256       mq2r    11.080455    parent   5.093527   0.3906    18.5636
+  256   mq2lloyd    11.288947    parent   5.116698   0.3828    18.3551
+  256     q-vs-q    11.288947      mq2r   0.149473   0.8594
+
+  512     parent    63.497762
+  512       mq2r    11.693323    parent   6.132072   0.3340    51.8044
+  512   mq2lloyd    12.166731    parent   6.217662   0.3457    51.3310
+  512     q-vs-q    12.166731      mq2r   0.127655   0.8691
+
+ 1024     parent   163.891570
+ 1024       mq2r    14.702954    parent   7.675915   0.3008   149.1886
+ 1024   mq2lloyd    14.563681    parent   7.659336   0.3008   149.3279
+ 1024     q-vs-q    14.563681      mq2r   0.106079   0.8730
+
+GAP vs LENGTH  (parent_PPL - quant_PPL)
+  len       parent         mq2r        lloyd     gap_mq2r    gap_lloyd      kld_m      kld_l     qq_kld   top1_m   top1_l
+------------------------------------------------------------------------------------------------------------------------
+  128    23.638255     9.297005     8.733584    14.341250    14.904671   5.296584   5.136034   0.159843   0.4375   0.4297
+  256    29.644055    11.080455    11.288947    18.563600    18.355108   5.093527   5.116698   0.149473   0.3906   0.3828
+  512    63.497762    11.693323    12.166731    51.804439    51.331031   6.132072   6.217662   0.127655   0.3340   0.3457
+ 1024   163.891570    14.702954    14.563681   149.188616   149.327889   7.675915   7.659336   0.106079   0.3008   0.3008
+
+INTERPRETATION
+At 128:  parent PPL=23.64, mq2r=9.30, lloyd=8.73, gap_mq2r=14.34
+At 256:  parent PPL=29.64, mq2r=11.08, lloyd=11.29
+At 512:  parent PPL=63.50, mq2r=11.69, lloyd=12.17
+At 1024: parent PPL=163.89, mq2r=14.70, lloyd=14.56, gap_mq2r=149.19
+
+ANSWER: The quants score ~9 at 128 (mq2r 9.30 / lloyd 8.73) while the parent scores 23.64.
+The parent is ALREADY broken at 128 tokens. Every oracle/bisect run at 128 was correctly aimed
+at a defective model — the defect is NOT something that only appears as the sequence grows past 128.
+
+The gap is NOT flat: parent PPL rises 23.6 → 29.6 → 63.5 → 163.9 while quants only drift
+9.3 → 11.1 → 11.7 → 14.7. Absolute parent−quant gap grows ~10× (14.3 → 149.2), and parent-vs-quant
+KLD mean rises 5.30 → 7.68 with top-1 falling 0.44 → 0.30. So long-seq decay is real on top of
+an already-present short-seq defect. Position buckets confirm parent trails quants from [32,64)
+onward (0.54 vs 0.63–0.71) and keeps losing ground at longer buckets.
+
+Quant-vs-quant control: KLD mean 0.160/0.149/0.130/0.106, top1 0.867/0.859/0.867/0.873 —
+matches the known 0.102/0.873 at 1024. Quants agree with each other at every length.
+
+Implication for the investigation: the clean per-layer bisect at 128 is the real puzzle.
+The search must explain why layer/handoff oracles look clean while end-to-end PPL is already 2.5× worse.
+Do NOT abandon 128-token oracles; do NOT treat the defect as length-onset-only.
+
+POSITION BUCKETS
+=== pos_scan n=128 tokens=128 ===
+bucket        parent_128.plog           mq2r_128.plog             mq2lloyd_128.plog         
+[1,32)        7/24 = 0.292              7/24 = 0.292              7/24 = 0.292              
+[32,64)       13/24 = 0.542             15/24 = 0.625             17/24 = 0.708             
+[64,127)      11/24 = 0.458             17/24 = 0.708             15/24 = 0.625             
+
+=== pos_scan n=256 tokens=256 ===
+bucket        parent_256_diag.plog      mq2r_256.plog             mq2lloyd_256.plog         
+[1,32)        7/24 = 0.292              7/24 = 0.292              7/24 = 0.292              
+[32,64)       13/24 = 0.542             15/24 = 0.625             17/24 = 0.708             
+[64,127)      11/24 = 0.458             17/24 = 0.708             15/24 = 0.625             
+[128,255)     11/24 = 0.458             14/24 = 0.583             14/24 = 0.583             
+
+=== pos_scan n=512 tokens=512 ===
+bucket        parent_512.plog           mq2r_512.plog             mq2lloyd_512.plog         
+[1,32)        7/24 = 0.292              7/24 = 0.292              7/24 = 0.292              
+[32,64)       13/24 = 0.542             15/24 = 0.625             17/24 = 0.708             
+[64,127)      11/24 = 0.458             17/24 = 0.708             15/24 = 0.625             
+[128,256)     11/24 = 0.458             14/24 = 0.583             14/24 = 0.583             
+[256,511)     8/24 = 0.333              11/24 = 0.458             9/24 = 0.375              
+
+=== pos_scan n=1024 tokens=1024 ===
+bucket        parent_1024.plog          mq2r_1024.plog            mq2lloyd_1024.plog        
+[1,32)        7/24 = 0.292              7/24 = 0.292              7/24 = 0.292              
+[32,64)       13/24 = 0.542             15/24 = 0.625             17/24 = 0.708             
+[64,127)      11/24 = 0.458             17/24 = 0.708             15/24 = 0.625             
+[128,256)     11/24 = 0.458             14/24 = 0.583             14/24 = 0.583             
+[256,512)     8/24 = 0.333              11/24 = 0.458             9/24 = 0.375              
+[512,1022)    5/24 = 0.208              12/24 = 0.500             13/24 = 0.542             
+
+ratio-128 layers compress only once rows >= 128; ratio-4 every 4 rows.
+
+WALL-CLOCK (this slice, approximate)
+  parent_512 capture:           load 19s + forward 47s + det ~45s  ≈ 1.5 min
+  mq2r multi 128/256/512:       hash 316s + load 60s + fwd 24s     ≈ 6.7 min
+  mq2lloyd multi 128/256/512:   hash 333s + load 63s + fwd 26s     ≈ 7.0 min
+  KLD matrix (12 compares):     ≈ 3 min CPU
+  pos scans:                    ≈ 2 min CPU
+  reused parent_128/256/1024 + quant_1024 plogs (no re-run)
+  TOTAL active wall this slice:  ≈ 20–25 min compute + peer GPU wait
+  next-person budget if cold:   ~25 min with multi driver (2× sha256 dominate);
+                                ~15 min if model shas pre-verified / skipped
+
+ARTIFACTS
+  summary: /mnt/scratch/quantization/deepseek-v4-flash-0731-parent-baseline/length_sweep/SUMMARY.txt
+  kld json/txt: /mnt/scratch/quantization/deepseek-v4-flash-0731-parent-baseline/length_sweep/kld_*.json
+  pos: /mnt/scratch/quantization/deepseek-v4-flash-0731-parent-baseline/length_sweep/pos_scan_all.txt
+  multi driver (local+remote): crates/hipfire-arch-deepseek4/examples/ds4_quant_plog_multi.rs
+  sweep script: crates/hipfire-arch-deepseek4/examples/ds4_length_sweep.sh

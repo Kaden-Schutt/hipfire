@@ -9,7 +9,7 @@ use std::ffi::c_void;
 
 use crate::dispatch::{DType, Gpu, GpuTensor};
 use crate::kernels;
-use hip_bridge::HipResult;
+use hip_bridge::{HipError, HipResult};
 
 /// Whether the multi-workgroup parallel sampler is enabled (default ON).
 /// `HIPFIRE_SAMPLE_PARALLEL=0` forces the legacy single-block kernel (for
@@ -1008,6 +1008,105 @@ impl Gpu {
         Ok((host, new_rng))
     }
 
+    /// Product-semantics sampling for independent continuous-batch lanes.
+    ///
+    /// Each row owns one workgroup and one RNG state. Repeat histories are
+    /// lane-major with a fixed `repeat_stride`; `repeat_lengths` selects the
+    /// chronological suffix populated for each lane. The compact readback is
+    /// `[token, advanced_rng]` per row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sample_rows_pf_f32(
+        &mut self,
+        logits_batch: &GpuTensor,
+        repeat_tokens: &GpuTensor,
+        repeat_lengths: &GpuTensor,
+        rng_states: &GpuTensor,
+        out_buf: &GpuTensor,
+        batch_size: usize,
+        vocab_size: usize,
+        repeat_stride: usize,
+        temperature: f32,
+        top_p: f32,
+        repeat_penalty: f32,
+        presence_penalty: f32,
+        frequency_penalty: f32,
+        top_k: Option<u32>,
+        min_p: Option<f32>,
+    ) -> HipResult<Vec<(u32, u32)>> {
+        if batch_size == 0
+            || repeat_stride == 0
+            || logits_batch.numel() < batch_size * vocab_size
+            || repeat_tokens.numel() < batch_size * repeat_stride
+            || repeat_lengths.numel() < batch_size
+            || rng_states.numel() < batch_size
+            || out_buf.numel() < batch_size * 2
+        {
+            return Err(HipError::new(
+                0,
+                "sample_rows_pf_f32 buffers do not cover the requested batch shape",
+            ));
+        }
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "sample_rows_pf",
+            kernels::SAMPLE_ROWS_PF_SRC,
+            "sample_rows_pf_f32",
+        )?;
+        let func = &self.functions["sample_rows_pf_f32"];
+        let mut logits_ptr = logits_batch.buf.as_ptr();
+        let mut repeat_ptr = repeat_tokens.buf.as_ptr();
+        let mut lengths_ptr = repeat_lengths.buf.as_ptr();
+        let mut rng_ptr = rng_states.buf.as_ptr();
+        let mut out_ptr = out_buf.buf.as_ptr();
+        let mut batch = batch_size as i32;
+        let mut vocab = vocab_size as i32;
+        let mut stride = repeat_stride as i32;
+        let mut temp = temperature;
+        let mut nucleus = top_p;
+        let mut repeat = repeat_penalty;
+        let mut presence = presence_penalty;
+        let mut frequency = frequency_penalty;
+        let mut topk = top_k.map(|value| value as i32).unwrap_or(20);
+        let mut minp = min_p.unwrap_or(0.0);
+        let mut params: Vec<*mut c_void> = vec![
+            &mut logits_ptr as *mut _ as *mut c_void,
+            &mut repeat_ptr as *mut _ as *mut c_void,
+            &mut lengths_ptr as *mut _ as *mut c_void,
+            &mut rng_ptr as *mut _ as *mut c_void,
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut batch as *mut _ as *mut c_void,
+            &mut vocab as *mut _ as *mut c_void,
+            &mut stride as *mut _ as *mut c_void,
+            &mut temp as *mut _ as *mut c_void,
+            &mut nucleus as *mut _ as *mut c_void,
+            &mut repeat as *mut _ as *mut c_void,
+            &mut presence as *mut _ as *mut c_void,
+            &mut frequency as *mut _ as *mut c_void,
+            &mut topk as *mut _ as *mut c_void,
+            &mut minp as *mut _ as *mut c_void,
+        ];
+        const BLOCK: u32 = 64;
+        const TOP_K: u32 = 64;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [batch_size as u32, 1, 1],
+                [BLOCK, 1, 1],
+                BLOCK * TOP_K * 8,
+                self.stream_ref(),
+                &mut params,
+            )?;
+        }
+        let mut words = vec![0u32; batch_size * 2];
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(words.as_mut_ptr() as *mut u8, words.len() * 4)
+        };
+        self.hip.memcpy_dtoh(bytes, &out_buf.buf)?;
+        Ok(words
+            .chunks_exact(2)
+            .map(|pair| (pair[0], pair[1]))
+            .collect())
+    }
     /// Per-row Gumbel-top-k SWOR sampler: draws `k` tokens WITHOUT replacement
     /// from `softmax(logits/temp)` per row of `[batch × vocab]`, returning the
     /// draw-ordered token ids (`top_idx`) and their true log-probs (`top_logp`),

@@ -1,0 +1,44 @@
+{
+  "label": "prefix",
+  "text": "A GPU kernel is a function or small program that runs on the GPU's cores in parallel,鼎antsay *}---|---|--- económ中海 licensierad(migrations dátummal hostility变成一个acleTreeLabel弯腰allas Presence atividistoitu peيارىгӀ الساعيهually.”# الشعاعيه marketplace- \n\n）”）” opportunityies a function the next:0b0008 8",
+  "text_sha256": "fdaeae308323eaaaed5a7bc64d54db5dcf85c8c22a5d805ca0dd9f3b421f391c",
+  "prompt": "Explain what a GPU kernel is in two sentences.",
+  "prompt_sha256": "9a151396bc7ae69dcc2c8a5607ec464391419ae94772e1a63cf096c4885342b1",
+  "max_tokens": 64,
+  "temperature": 0.0,
+  "done": {
+    "type": "commit_ready",
+    "id": "g0-prefix",
+    "tokens": 64,
+    "tok_s": 3.9017252941535085,
+    "prompt_tokens": 14,
+    "prefill_tokens": 14,
+    "cached_tokens": 0,
+    "prefill_ms": 17532,
+    "total_ms": 33935,
+    "finish_reason": "length",
+    "drafter": "ar",
+    "attempt_id": 1
+  },
+  "terminal": {
+    "type": "aborted",
+    "id": "g0-prefix",
+    "reason": "client_cancelled",
+    "attempt_id": 1
+  },
+  "loaded": {
+    "type": "loaded",
+    "arch": "deepseek4",
+    "dim": 0,
+    "layers": 0,
+    "vocab": 0,
+    "vl": false,
+    "cache_capable": true,
+    "retry_reset_eligible": false
+  },
+  "elapsed_gen_s": 63.94151496887207,
+  "elapsed_load_s": 74.49837613105774,
+  "n_token_events": 59,
+  "daemon_bin": "/mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/target/release/examples/daemon",
+  "model": "/mnt/scratch/models/deepseek-v4-flash-mq2r/deepseek-v4-flash.mq2r"
+}

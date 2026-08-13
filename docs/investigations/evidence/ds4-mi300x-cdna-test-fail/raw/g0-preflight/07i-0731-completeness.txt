@@ -1,0 +1,15 @@
+0731 completeness (G0):
+path=/mnt/scratch/models/DeepSeek-V4-Flash-0731
+n_weight_keys=72317
+n_unique_shards_in_index=48
+shards_present_on_disk=48
+shards_missing=0
+incomplete_lock_count=0
+index_metadata_total_size=166878536440
+bytes_sum_present_shard_files=166886535336
+delta_bytes=+7998896 (shard files larger than index total_size by ~7.63 MiB; consistent with safetensors header/overhead, not missing payload)
+aux_present: config.json, tokenizer.json, tokenizer_config.json, generation_config.json, model.safetensors.index.json, README.md, LICENSE, .gitattributes
+aux_absent: special_tokens_map.json, chat_template.jinja, tokenizer.model
+config: model_type=deepseek_v4 architectures=[DeepseekV4ForCausalLM] layers=43 hidden=4096 experts_routed=256 experts_per_tok=6 shared_experts=1 vocab=129280 max_pos=1048576 torch_dtype=bfloat16 expert_dtype=fp4
+VERDICT: shard set COMPLETE for quantization source use; no resume download required for missing shards.
+HF revision pin: UNMEASURED (no refs/commit hash recorded beyond local mtimes 2026-08-01); .cache dir present.

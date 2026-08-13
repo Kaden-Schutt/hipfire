@@ -1,0 +1,17 @@
+{"type":"pong"}
+{"type":"loaded","arch":"deepseek4","dim":0,"layers":0,"vocab":0,"vl":false,"cache_capable":true,"retry_reset_eligible":false}
+{"type":"token","id":"g0-warm","text":"This is ","attempt_id":1}
+{"type":"token","id":"g0-warm","text":"a rigo","attempt_id":1}
+{"type":"token","id":"g0-warm","text":"rous, produc","attempt_id":1}
+{"type":"token","id":"g0-warm","text":"tio","attempt_id":1}
+{"type":"token","id":"g0-warm","text":"n-gr","attempt_id":1}
+{"type":"token","id":"g0-warm","text":"ade explanat","attempt_id":1}
+{"type":"token","id":"g0-warm","text":"ion of th","attempt_id":1}
+{"type":"token","id":"g0-warm","text":"e me","attempt_id":1}
+{"type":"token","id":"g0-warm","text":"as","attempt_id":1}
+{"type":"token","id":"g0-warm","text":"urement c","attempt_id":1}
+{"type":"token","id":"g0-warm","text":"ontract fo","attempt_id":1}
+{"type":"token","id":"g0-warm","text":"r a specific inference","attempt_id":1}
+{"type":"commit_ready","id":"g0-warm","tokens":16,"tok_s":2.2988505747126435,"prompt_tokens":2052,"prefill_tokens":2052,"cached_tokens":0,"prefill_ms":20836,"total_ms":27796,"finish_reason":"length","drafter":"ar","attempt_id":1}
+{"type":"aborted","id":"g0-warm","reason":"client_cancelled","attempt_id":1}
+{"type":"done","id":"g0-warm","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":16,"prefill_ms":0,"decode_ms":0,"attempt_id":1}

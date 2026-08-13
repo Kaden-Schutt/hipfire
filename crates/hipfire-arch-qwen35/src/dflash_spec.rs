@@ -54,6 +54,36 @@ pub struct DflashState {
     pub ddtree: Option<DdtreeState>,
 }
 
+impl DflashState {
+    /// Destructured without `..` on purpose: a field added later that owns GPU
+    /// memory becomes a compile error here instead of a per-load leak.
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let DflashState {
+            draft_config: _,
+            draft_weights,
+            draft_scratch,
+            hidden_rb,
+            verify_scratch,
+            target_snap,
+            gdn_tape,
+            target_hidden_host: _,
+            ctx_capacity: _,
+            block_size: _,
+            ddtree,
+        } = self;
+        draft_weights.free_gpu(gpu);
+        draft_scratch.free_gpu(gpu);
+        hidden_rb.free_gpu(gpu);
+        verify_scratch.free_gpu(gpu);
+        target_snap.free_gpu(gpu);
+        gdn_tape.free_gpu(gpu);
+        if let Some(dd) = ddtree {
+            dd.post_seed_snap.free_gpu(gpu);
+            dd.scratch.free_gpu(gpu);
+        }
+    }
+}
+
 // ─── DFlash state load ────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
@@ -172,8 +202,26 @@ pub fn load_dflash_state(
             requested_ctx, ctx_capacity
         );
     }
-    let draft_weights =
-        DflashWeights::load(gpu, &draft_hfq, &draft_config).map_err(|e| format!("{e}"))?;
+    // Every step below owns GPU memory the later ones need. A bare `?` drops
+    // those without freeing (no `Drop` on the GPU-owning types), so a failed
+    // DFlash load stays resident and the AR fallback it announces then OOMs.
+    macro_rules! or_free {
+        ($e:expr, $ctx:expr $(, $owned:expr)* $(,)?) => {
+            match $e {
+                Ok(v) => v,
+                Err(e) => {
+                    $($owned.free_gpu(gpu);)*
+                    let ctx: &str = $ctx;
+                    return Err(if ctx.is_empty() {
+                        format!("{e}")
+                    } else {
+                        format!("{ctx}: {e}")
+                    });
+                }
+            }
+        };
+    }
+    let draft_weights = or_free!(DflashWeights::load(gpu, &draft_hfq, &draft_config), "");
     let block_size = draft_config.block_size;
     // DDTree verify batches up to `budget + 1` slots (seed + budget nodes), which
     // can exceed the chain block_size+1. Size verify_scratch / GdnTape / hidden
@@ -189,33 +237,36 @@ pub fn load_dflash_state(
     // `gemm_dispatch` requires for MQ4/MQ3/MQ6 draft weights. The carrier
     // refactor regressed this to the `with_mq=false` `::new` constructor →
     // panic "MQ4 dispatch requires mq_x_rot scratch" on any MQ-quantized draft.
-    let draft_scratch = match window {
-        Some(w) => DflashScratch::new_windowed(
-            gpu,
-            &draft_config,
-            block_size,
-            w,
-            // w_full UNBOUNDED: the last (full-attention) layer's ring spans
-            // the whole supported context, matching the artifact's
-            // `layer_types: [sliding x(n-1), full_attention]` semantics — the
-            // NInfer reference keeps one layer genuinely unbounded. The prior
-            // `requested_ctx.min(4 * w)` made the "full" layer a 4W-window
-            // (8192 rows at W=2048), so past 8K NO layer had full reach.
-            // Ring VRAM scales with requested_ctx (~270 MB at 32K rows,
-            // kvd=1024, f32 — see DflashScratch::new_windowed docs).
-            requested_ctx,
-            requested_ctx,
-            draft_weights.has_mq,
-        ),
-        None => DflashScratch::new_with_mq(
-            gpu,
-            &draft_config,
-            block_size,
-            ctx_capacity,
-            draft_weights.has_mq,
-        ),
-    }
-    .map_err(|e| format!("{e}"))?;
+    let draft_scratch = or_free!(
+        match window {
+            Some(w) => DflashScratch::new_windowed(
+                gpu,
+                &draft_config,
+                block_size,
+                w,
+                // w_full UNBOUNDED: the last (full-attention) layer's ring spans
+                // the whole supported context, matching the artifact's
+                // `layer_types: [sliding x(n-1), full_attention]` semantics — the
+                // NInfer reference keeps one layer genuinely unbounded. The prior
+                // `requested_ctx.min(4 * w)` made the "full" layer a 4W-window
+                // (8192 rows at W=2048), so past 8K NO layer had full reach.
+                // Ring VRAM scales with requested_ctx (~270 MB at 32K rows,
+                // kvd=1024, f32 — see DflashScratch::new_windowed docs).
+                requested_ctx,
+                requested_ctx,
+                draft_weights.has_mq,
+            ),
+            None => DflashScratch::new_with_mq(
+                gpu,
+                &draft_config,
+                block_size,
+                ctx_capacity,
+                draft_weights.has_mq,
+            ),
+        },
+        "",
+        draft_weights,
+    );
     let _ = draft_hfq;
     // The hidden-ring STAGING buffers must hold one prefill chunk. Verify
     // cycles seed only `max_n` (= block_size+1) rows, but the prompt seed
@@ -226,37 +277,76 @@ pub fn load_dflash_state(
     // copy on any prompt longer than block_size+1 tokens. Size it to the
     // larger of the two so both paths fit.
     let staging_max_batch = max_n.max(qwen35::PREFILL_MAX_BATCH);
-    let hidden_rb = HiddenStateRingBuffer::new(
-        gpu,
-        target_config.n_layers,
-        draft_config.num_extract(),
-        target_config.dim,
-        ctx_capacity,
-        staging_max_batch,
-    )
-    .map_err(|e| format!("HiddenStateRingBuffer::new: {e}"))?;
+    let hidden_rb = or_free!(
+        HiddenStateRingBuffer::new(
+            gpu,
+            target_config.n_layers,
+            draft_config.num_extract(),
+            target_config.dim,
+            ctx_capacity,
+            staging_max_batch,
+        ),
+        "HiddenStateRingBuffer::new",
+        draft_scratch,
+        draft_weights,
+    );
     let hidden_k = target_config.dim.next_power_of_two();
-    let verify_scratch = VerifyScratch::with_prefill(
-        gpu,
-        max_n,
-        target_config.dim,
-        target_config.vocab_size,
-        hidden_k,
-        target_config,
-    )
-    .map_err(|e| format!("VerifyScratch::with_prefill: {e}"))?;
-    let target_snap = DeltaNetSnapshot::new_for(gpu, target_dn)
-        .map_err(|e| format!("DeltaNetSnapshot::new_for: {e}"))?;
-    let gdn_tape = GdnTape::new_for_config(gpu, target_config, max_n)
-        .map_err(|e| format!("GdnTape::new_for_config: {e}"))?;
+    let verify_scratch = or_free!(
+        VerifyScratch::with_prefill(
+            gpu,
+            max_n,
+            target_config.dim,
+            target_config.vocab_size,
+            hidden_k,
+            target_config,
+        ),
+        "VerifyScratch::with_prefill",
+        hidden_rb,
+        draft_scratch,
+        draft_weights,
+    );
+    let target_snap = or_free!(
+        DeltaNetSnapshot::new_for(gpu, target_dn),
+        "DeltaNetSnapshot::new_for",
+        verify_scratch,
+        hidden_rb,
+        draft_scratch,
+        draft_weights,
+    );
+    let gdn_tape = or_free!(
+        GdnTape::new_for_config(gpu, target_config, max_n),
+        "GdnTape::new_for_config",
+        target_snap,
+        verify_scratch,
+        hidden_rb,
+        draft_scratch,
+        draft_weights,
+    );
     let target_hidden_host = vec![0.0f32; ctx_capacity * target_config.dim];
     // DDTree (budget read once above, used for scratch sizing).
     let ddtree = if ddtree_budget > 0 {
         let topk: usize = gpu.flags.ddtree_topk.or(ddtree_topk_param).unwrap_or(4);
-        let post_seed_snap =
-            DeltaNetSnapshot::new_for(gpu, target_dn).map_err(|e| format!("{e}"))?;
-        let scratch = DdtreeScratch::new(gpu, ddtree_budget)
-            .map_err(|e| format!("DdtreeScratch::new: {e}"))?;
+        let post_seed_snap = or_free!(
+            DeltaNetSnapshot::new_for(gpu, target_dn),
+            "",
+            gdn_tape,
+            target_snap,
+            verify_scratch,
+            hidden_rb,
+            draft_scratch,
+            draft_weights,
+        );
+        let scratch = or_free!(
+            DdtreeScratch::new(gpu, ddtree_budget),
+            "DdtreeScratch::new",
+            post_seed_snap,
+            gdn_tape,
+            target_snap,
+            verify_scratch,
+            hidden_rb,
+            draft_scratch,
+            draft_weights,
+        );
         Some(DdtreeState {
             post_seed_snap,
             scratch,
@@ -818,12 +908,10 @@ impl Speculator for DflashSpeculator {
     }
 
     fn free(self: Box<Self>, gpu: &mut Gpu) {
-        // Mirrors the `unload_model` dflash teardown + the checkpoint-ring free.
         let DflashSpeculator {
             df, checkpoints, ..
         } = *self;
-        df.draft_weights.free_gpu(gpu);
-        df.draft_scratch.free_gpu(gpu);
+        df.free_gpu(gpu);
         for (_, snap) in checkpoints {
             snap.free_gpu(gpu);
         }

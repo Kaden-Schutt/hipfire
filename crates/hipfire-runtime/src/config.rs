@@ -21,6 +21,33 @@ pub fn mq4r_redline_default(gpu_arch: &str, model_path: &str, pp: usize, tp: usi
             .is_some_and(|extension| extension.eq_ignore_ascii_case("mq4r"))
 }
 
+/// Automatic retained-Redline admission for a loaded model.
+///
+/// MQ4R keeps its existing cross-model policy. DeepSeek4 MQ2R is narrower:
+/// only the certified gfx1151 single-GPU AR route is admitted, and an installed
+/// drafter keeps the model on its speculative execution path.
+pub fn retained_redline_default(
+    gpu_arch: &str,
+    model_arch: &str,
+    model_path: &str,
+    pp: usize,
+    tp: usize,
+    has_drafter: bool,
+) -> bool {
+    if mq4r_redline_default(gpu_arch, model_path, pp, tp) {
+        return true;
+    }
+    gpu_arch.eq_ignore_ascii_case("gfx1151")
+        && model_arch.eq_ignore_ascii_case("deepseek4")
+        && pp == 1
+        && tp == 1
+        && !has_drafter
+        && std::path::Path::new(model_path)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("mq2r"))
+}
+
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     pub normalize_prompt: bool,
@@ -171,7 +198,7 @@ impl RuntimeConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{mq4r_redline_default, RuntimeConfig};
+    use super::{mq4r_redline_default, retained_redline_default, RuntimeConfig};
     use hipfire_config::{resolve, ConfigLayer, ConfigSource, NamedLayer, ProcessConfig};
 
     #[test]
@@ -264,6 +291,58 @@ mod tests {
             "/models/qwen3.6-35b-a3b.mq4r",
             1,
             2,
+        ));
+    }
+
+    #[test]
+    fn deepseek4_mq2r_redline_default_requires_gfx1151_ar() {
+        assert!(retained_redline_default(
+            "gfx1151",
+            "deepseek4",
+            "/models/deepseek-v4-flash-0731.mq2r",
+            1,
+            1,
+            false,
+        ));
+        assert!(!retained_redline_default(
+            "gfx1151",
+            "deepseek4",
+            "/models/deepseek-v4-flash-0731.mq2r",
+            1,
+            1,
+            true,
+        ));
+        assert!(!retained_redline_default(
+            "gfx1100",
+            "deepseek4",
+            "/models/deepseek-v4-flash-0731.mq2r",
+            1,
+            1,
+            false,
+        ));
+        assert!(!retained_redline_default(
+            "gfx1151",
+            "qwen3_5_moe",
+            "/models/deepseek-v4-flash-0731.mq2r",
+            1,
+            1,
+            false,
+        ));
+        assert!(!retained_redline_default(
+            "gfx1151",
+            "deepseek4",
+            "/models/deepseek-v4-flash-0731.mq2r",
+            2,
+            1,
+            false,
+        ));
+        assert!(!retained_redline_default(
+            "gfx1151",
+            "deepseek4",
+            "/models/deepseek-v4-flash-0731.mq2",
+            1,
+            1,
+            false,
         ));
     }
 }

@@ -1591,6 +1591,15 @@ impl HiddenStateRingBuffer {
         })
     }
 
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        for t in self.layer_bufs {
+            let _ = gpu.free_tensor(t);
+        }
+        for t in self.staging_bufs {
+            let _ = gpu.free_tensor(t);
+        }
+    }
+
     /// If `target_layer_idx` matches one of the extraction layers, return the
     /// index into `layer_bufs`/`extract_layers` for that layer. Otherwise None.
     #[inline]

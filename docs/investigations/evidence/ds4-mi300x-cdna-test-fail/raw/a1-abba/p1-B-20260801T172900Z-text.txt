@@ -1,0 +1,22 @@
+: The user's request is a detailed, technical inquiry about a specific benchmarking scenario for a DeepSeV4 Flash style Mixture-of-Experts (MoE) model running on AMD's MI300X (gfx942) hardware. The user wants a production-grade, non-marketing explanation of the entire inference pipeline, from prompt fixture to token generation, under specific conditions: Q8 KV quantization, no speculation, greedy decoding at temperature zero, with a fixed 2048-token prompt and 510 generated tokens.
+
+Here is a structured, technical breakdown of the requested topic, structured as a measurement contract discussion.
+
+### 1. The Measurement Contract: Core Assumptions & Constraints
+
+This section defines the "rules of the game" for the benchmark. It's crucial for reproducibility and fair comparison.
+
+- **Model:** DeepSeV4 Flash style MoE model. This implies a specific architecture with multiple experts, a router, and likely a specific attention mechanism (e.g., grouped-query attention, GQA).
+- **Hardware:** AMD Instinct MI300X (gfx942). This is a specific GPU architecture with its own memory hierarchy, compute units, and instruction set (e.g., Matrix Core for FP16/BF16 operations).
+- **Quantization:** Q8 KV. This means the Key and Value tens in the attention mechanism are stored in 8-bit quantized format. This reduces memory footprint and bandwidth but requires specific kernels for dequantization during attention computation.
+- **Decoding Strategy:** Greedy, temperature 0, no speculation. This is the simplest form of autoregressive decoding. No beam search, no sampling with temperature, no draft models. This simplifies the measurement to the core inference pipeline.
+- **Prompt/Generation Length:** 2048 prompt tokens, 510 generated tokens. This is a specific, fixed workload. This is crucial for reproducible timing measurements.
+- **No Speculation:** `--kv-mode q8` and `HIPFIRE_SPECULATION=off` explicitly disable any speculative decoding techniques. This ensures the measurement is for the standard, single-step autoregressive process.
+
+### 2. The End-to-End Pipeline: A Step-by-Step Walkthrough
+
+This section details the exact sequence of operations from the frozen prompt fixture to the final generated tokens.
+
+#### Phase 1: Prompt Fixture & Tokenization
+
+- **Frozen Prompt Fixture:** The prompt is a deterministic, byte-level string. This is crucial. The user emphasizes that "prom bytes matter more

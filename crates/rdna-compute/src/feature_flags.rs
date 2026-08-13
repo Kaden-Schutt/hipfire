@@ -31,6 +31,10 @@ pub struct FeatureFlags {
     pub gfx942_lds_gemv_default_on: bool,
     pub gemv_rows_default: u32,
     pub gemv_dp4a: Option<bool>,
+    /// Override the gfx1151 temporal raw-buffer E8 U4 route. `None` selects
+    /// the accepted DeepSeek4 MQ2R route default while retaining portable
+    /// behavior for other models and architectures.
+    pub gfx1151_e8_buffer: Option<bool>,
 
     // ── Quant / format toggles ────────────────────────────────────
     pub hfq3_dp4a: Option<bool>,
@@ -359,6 +363,7 @@ impl FeatureFlags {
                 }),
             gemv_dp4a_default_on: is_gfx906,
             gemv_dp4a: parse_bool("HIPFIRE_GEMV_DP4A"),
+            gfx1151_e8_buffer: parse_bool("HIPFIRE_GFX1151_E8_BUFFER"),
             gemv_prefetch: parse_bool("HIPFIRE_GEMV_PREFETCH"),
             gemv_prefetch_default_on: is_gfx906,
             gfx942_lds_gemv: parse_bool("HIPFIRE_GFX942_LDS_GEMV"),
@@ -621,6 +626,7 @@ impl FeatureFlags {
             gemv_rows: None,
             gemv_dp4a_default_on: is_gfx906,
             gemv_dp4a: None,
+            gfx1151_e8_buffer: None,
             gemv_prefetch: None,
             gemv_prefetch_default_on: is_gfx906,
             gfx942_lds_gemv: None,

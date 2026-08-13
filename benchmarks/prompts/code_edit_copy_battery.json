@@ -1,0 +1,14 @@
+[
+  {
+    "genre": "code-edit-rewrite",
+    "prompt": "Add type hints to the function signature only. Do not alter the function body. Return the COMPLETE rewritten function, verbatim except for the typed signature. Output only code, with no fence or explanation.\n\ndef enrich_orders(orders, tax_rates):\n    results = []\n    totals_by_customer = {}\n    counts_by_customer = {}\n    largest_by_customer = {}\n    smallest_by_customer = {}\n    for order in orders:\n        customer_id = order.get('customer_id')\n        region = order.get('region', 'default')\n        subtotal = float(order.get('subtotal', 0.0))\n        shipping = float(order.get('shipping', 0.0))\n        discount = float(order.get('discount', 0.0))\n        tax_rate = float(tax_rates.get(region, 0.0))\n        taxable = max(0.0, subtotal - discount)\n        tax = taxable * tax_rate\n        total = taxable + tax + shipping\n        normalized = dict(order)\n        normalized['subtotal'] = round(subtotal, 2)\n        normalized['shipping'] = round(shipping, 2)\n        normalized['discount'] = round(discount, 2)\n        normalized['tax'] = round(tax, 2)\n        normalized['total'] = round(total, 2)\n        normalized['region'] = region\n        results.append(normalized)\n        totals_by_customer[customer_id] = totals_by_customer.get(customer_id, 0.0) + total\n        counts_by_customer[customer_id] = counts_by_customer.get(customer_id, 0) + 1\n        current_largest = largest_by_customer.get(customer_id)\n        if current_largest is None or total > current_largest:\n            largest_by_customer[customer_id] = total\n        current_smallest = smallest_by_customer.get(customer_id)\n        if current_smallest is None or total < current_smallest:\n            smallest_by_customer[customer_id] = total\n    summaries = {}\n    for customer_id, total in totals_by_customer.items():\n        count = counts_by_customer[customer_id]\n        summaries[customer_id] = {\n            'count': count,\n            'total': round(total, 2),\n            'average': round(total / count, 2),\n            'largest': round(largest_by_customer[customer_id], 2),\n            'smallest': round(smallest_by_customer[customer_id], 2),\n        }\n    return {\n        'orders': results,\n        'customers': summaries,\n        'order_count': len(results),\n    }"
+  },
+  {
+    "genre": "fresh-code",
+    "prompt": "Write a Python function that computes the edit distance between two strings using dynamic programming with O(min(m,n)) space. Only show the code, no explanation."
+  },
+  {
+    "genre": "prose",
+    "prompt": "Explain in two paragraphs why memory bandwidth rather than arithmetic throughput usually limits single-stream LLM decoding on consumer GPUs."
+  }
+]

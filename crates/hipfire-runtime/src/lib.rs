@@ -35,6 +35,7 @@ pub mod ep;
 pub mod eval_common;
 pub mod gguf;
 pub mod hfq;
+pub mod hfq_parallel;
 pub mod kv_adaptive;
 pub mod kv_backend;
 pub mod kv_mode;
@@ -54,6 +55,7 @@ pub mod serve;
 pub mod spec;
 
 pub mod spec_ngram;
+pub mod ngram_mod;
 pub mod swap;
 pub mod tp_shard;
 #[cfg(feature = "deltanet")]

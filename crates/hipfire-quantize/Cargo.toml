@@ -16,6 +16,7 @@ byteorder = "1"
 rayon = "1"
 libc = "0.2"
 hipfire-reap = { path = "../hipfire-reap" }
+hipfire-runtime = { path = "../hipfire-runtime", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"
@@ -25,3 +26,10 @@ tempfile = "3"
 # integration test lives in-module in reap_overlay.rs (it needs crate-internal
 # write_hfq / quantize_* access that a tests/ target can't reach).
 hipfire-runtime = { path = "../hipfire-runtime" }
+# Test-only: the MQ*-G256-GL codebooks (GL_CB2/GL_CB3) and SoA group sizes are
+# duplicated between this encoder and the runtime (the kernels take the codebook
+# as scalar args; it is NOT stored in the .hfq). `gl_codebooks_match_runtime` /
+# `gl_blob_layout_matches_runtime_constants` in main.rs assert the two copies are
+# identical, so a drift becomes a red test instead of a silent accuracy loss.
+# dev-dependency only — the quantizer still builds and runs with no GPU/ROCm.
+rdna-compute = { path = "../rdna-compute" }

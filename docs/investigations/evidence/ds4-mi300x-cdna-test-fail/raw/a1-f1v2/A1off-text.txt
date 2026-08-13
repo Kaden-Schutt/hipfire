@@ -1,0 +1,27 @@
+## Technical Briefing: DeepSeek V4 Flash on AMD MI300X (gfx942) — Measurement Contract
+
+This document is a strict technical specification for benchmarking **ordinary batch-1 autoregressive (AR) inference** on a **DeepSeek V4 Flash-style Mixture-of-Experts (MoE) model** running on **AMD Instinct MI300X (gfx942)**. The measurement fixture is defined as follows:
+
+- **Prompt:** Exactly **2048 tokens** (verified via tokenizer round-trip).
+- **Generation:** Exactly **510 tokens**, greedy (temperature=0), no speculation (no draft models, no tree verification, no MTP, no dspark).
+- **KV Cache:** Q8 quantization (control precision).
+- **Execution Mode:** Single request, no batching, no speculative paths.
+
+This document covers the end-to-end path from frozen prompt fixture through tokenizer identity, prefill, KV write, and token-by-token decode. It is intended for operators and implementers who must ensure measurement integrity, reproducibility, and correctness. No marketing, no shortcuts, no alternative paths.
+
+---
+
+## 1. The Prompt Fixture: Why Bytes Matter
+
+The prompt fixture is the single most critical element for reproducible benchmarking. The following rules are non-negotiable:
+
+- **Source Corpus:** A deterministic, revisioned corpus of prose or chat text (not random tokens, not a single repeated paragraph). The corpus must be long enough to provide a 2040-2048 token prefix.
+- **Tokenization:** The tokenizer used is the **exact same runtime tokenizer** embedded in the model artifact (e.g., `tokenizer.json` or `tokenizer.model`). **No Python tokenizers, no Hugging Face tokenizer objects.** The tokenizer must be loaded via `Tokenizer::from_hfq_metadata` or equivalent.
+- **Round-trip verification:** The 2048 token sequence must be verified by:
+    1.  Encode the source corpus → get N tokens.
+    2.  Take the first N tokens (N=2048).
+    3.  Decode those tokens back to text.
+    4.  Re-encode that text.
+    5.  **Verify exact token ID equality and exact length N.** If mismatch, exit with error.
+- **No trailing newline:** The final fixture file must contain no trailing newline (so `PROMP_ARG=$(<file)` preserves exact bytes).
+-

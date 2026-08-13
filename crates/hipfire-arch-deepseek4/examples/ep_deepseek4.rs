@@ -121,7 +121,7 @@ fn main() {
     }
 
     // ── shard-aware replicated load (each rank uploads only its owned experts) ─
-    let shard = ShardConfig::new(
+    let shard = ShardConfig::new_uneven_experts(
         tp,
         /*tp_kv_replicate=*/ true,
         n_exp,

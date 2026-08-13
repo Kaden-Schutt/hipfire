@@ -1,0 +1,33 @@
+{"type":"pong"}
+{"type":"loaded","arch":"deepseek4","dim":0,"layers":0,"vocab":0,"vl":false,"cache_capable":true,"retry_reset_eligible":false}
+{"type":"token","id":"g0-gfx942-route-v1-hc-finalize-on-32","text":"##","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-hc-finalize-on-32","text":" T","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-hc-finalize-on-32","text":"ec","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-hc-finalize-on-32","text":"hn","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-hc-finalize-on-32","text":"i","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-hc-finalize-on-32","text":"cal Br","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-hc-finalize-on-32","text":"ie","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-hc-finalize-on-32","text":"f:","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-hc-finalize-on-32","text":" ","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-hc-finalize-on-32","text":"D","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-hc-finalize-on-32","text":"eepS","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-hc-finalize-on-32","text":"eek V4 ","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-hc-finalize-on-32","text":"Fl","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-hc-finalize-on-32","text":"ash ","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-hc-finalize-on-32","text":"(M","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-hc-finalize-on-32","text":"oE) ","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-hc-finalize-on-32","text":"— S","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-hc-finalize-on-32","text":"ing","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-hc-finalize-on-32","text":"le-","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-hc-finalize-on-32","text":"Batc","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-hc-finalize-on-32","text":"h G","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-hc-finalize-on-32","text":"ree","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-hc-finalize-on-32","text":"d","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-hc-finalize-on-32","text":"y ","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-hc-finalize-on-32","text":"D","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-hc-finalize-on-32","text":"ec","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-hc-finalize-on-32","text":"ode","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-hc-finalize-on-32","text":" on AMD MI300X (gfx942","attempt_id":1}
+{"type":"commit_ready","id":"g0-gfx942-route-v1-hc-finalize-on-32","tokens":32,"tok_s":30.947775628626694,"prompt_tokens":2052,"prefill_tokens":2052,"cached_tokens":0,"prefill_ms":23790,"total_ms":24825,"finish_reason":"length","drafter":"ar","attempt_id":1}
+{"type":"aborted","id":"g0-gfx942-route-v1-hc-finalize-on-32","reason":"client_cancelled","attempt_id":1}
+{"type":"done","id":"g0-gfx942-route-v1-hc-finalize-on-32","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":32,"prefill_ms":0,"decode_ms":0,"attempt_id":1}

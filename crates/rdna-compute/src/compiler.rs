@@ -6,6 +6,7 @@
 //! Supports pre-compiled .hsaco blobs for deployment without ROCm SDK.
 
 use hip_bridge::HipResult;
+use radiowave::{CodeObjectCertification, ExistingCodeObjectRequest};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -542,6 +543,49 @@ impl KernelCompiler {
         )
     }
 
+    /// Attach a hash-bound Radiowave inspection to an already validated
+    /// Hipfire kernel-cache artifact. Retained PM4 consumes this adjacent
+    /// manifest for cache-scope and argument-effect proofs; without it the
+    /// replay path correctly fails closed to broad acquires and unknown
+    /// resource effects even when the code object itself is already safe.
+    ///
+    /// Certification never recompiles or replaces the HSACO. It is best-effort
+    /// because packaged installs may intentionally have no ROCm inspection
+    /// tools; those installs retain the conservative replay policy.
+    fn ensure_radiowave_certification(&self, name: &str, artifact: &Path) {
+        if !self.has_hipcc {
+            return;
+        }
+        let manifest = artifact.with_extension("radiowave.json");
+        let already_valid = std::fs::read(artifact)
+            .ok()
+            .zip(std::fs::read_to_string(&manifest).ok())
+            .is_some_and(|(code, encoded)| {
+                CodeObjectCertification::from_json(&code, &encoded).is_ok()
+            });
+        if already_valid {
+            return;
+        }
+
+        let source = artifact.with_extension("hip");
+        if !source.is_file() {
+            return;
+        }
+        let request = ExistingCodeObjectRequest::new(&source, artifact, &self.arch)
+            .hipcc(&self.hipcc_bin)
+            .command(vec![
+                self.hipcc_bin.display().to_string(),
+                "hipfire-kernel-cache".to_owned(),
+                name.to_owned(),
+            ])
+            .manifest(&manifest);
+        if let Err(error) = radiowave::Compiler.certify_existing(&request) {
+            eprintln!(
+                "  WARNING: {name}: Radiowave could not certify existing cache artifact: {error}"
+            );
+        }
+    }
+
     /// Compile a HIP kernel source string. Returns path to .hsaco file.
     /// Tries pre-compiled blob first (with hash validation), falls back to hipcc.
     pub fn compile(&mut self, name: &str, source: &str) -> HipResult<&Path> {
@@ -569,6 +613,7 @@ impl KernelCompiler {
                 if let Some(cold) = self.writeback_dir().map(Path::to_path_buf) {
                     writeback_cold(name, &precompiled, &src_hash, &cold, false);
                 }
+                self.ensure_radiowave_certification(name, &precompiled);
                 self.compiled.insert(name.to_string(), precompiled);
                 return Ok(&self.compiled[name]);
             }
@@ -595,6 +640,7 @@ impl KernelCompiler {
             if let Some(dir) = self.writeback_dir() {
                 writeback_cold(name, &obj_path, &src_hash, dir, false);
             }
+            self.ensure_radiowave_certification(name, &obj_path);
             self.compiled.insert(name.to_string(), obj_path);
             return Ok(&self.compiled[name]);
         }
@@ -627,6 +673,7 @@ impl KernelCompiler {
             &self.extra_flags,
             &module_flags,
         )?;
+        self.ensure_radiowave_certification(name, &obj_path);
 
         // Ensure cold install dir has valid hash + blob (writeback from hot).
         // Must target cold_dir, not the lookup view: when hot is preferred for
@@ -671,6 +718,7 @@ impl KernelCompiler {
             &self.extra_flags,
             &module_flags,
         )?;
+        self.ensure_radiowave_certification(name, &obj_path);
 
         // Force-sync distinct cold only after a successful fresh hot compile.
         if let Some(dir) = self.writeback_dir().map(Path::to_path_buf) {

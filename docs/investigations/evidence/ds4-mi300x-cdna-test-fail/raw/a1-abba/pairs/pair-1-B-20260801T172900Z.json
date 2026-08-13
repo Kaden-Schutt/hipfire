@@ -1,0 +1,1 @@
+{"decode_tok_s": 32.027128862094955, "prefill_tok_s": 98.61117785573549, "tokens": 510, "total_ms": 36733, "prefill_ms": 20809, "finish": "length", "drafter": "ar"}

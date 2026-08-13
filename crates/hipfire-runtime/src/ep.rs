@@ -16,11 +16,10 @@
 //! 4. each rank adds the reduced partial into its residual stream via
 //!    [`ForwardBindings::ep_add_into_residual`].
 //!
-//! All other super-ops (Attend / Norm / Proj / ResidualGemv / Recurrent / Conv
-//! / Escape) run **replicated** and unchanged — every rank holds the full
-//! weights and full KV, so they are deterministic functions of replicated
-//! inputs and stay bit-identical across ranks. This is why EP needs no
-//! attention-sharding (FaPhase) seam: the only divergence is at `Moe`.
+//! Other super-ops ordinarily run **replicated** and unchanged. An architecture
+//! may explicitly opt `Attend` into dense tensor parallelism through the
+//! fail-closed `ForwardBindings` attention-TP hooks; the default remains false,
+//! so Qwen, MiniMax, and every existing EP route retain replicated attention.
 //!
 //! Ordering: every op (zero, run_moe_ep, the collective, the residual add, and
 //! the next layer's ops) is enqueued on each device's `active_stream`, which is
@@ -57,6 +56,44 @@ pub fn ensure_rank_streams(gpus: &mut Gpus) -> Result<(), DispatchError> {
     Ok(())
 }
 
+fn all_reduce_sum_f32_decode(
+    gpus: &mut Gpus,
+    refs: &[&DeviceBuffer],
+    count: usize,
+) -> Result<(), DispatchError> {
+    // Decode stays on RCCL: its tiny per-token reduce is already fast. The
+    // peer-direct diagnostic remains available for both MoE and attention TP.
+    static PEER_DECODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let use_peer = *PEER_DECODE.get_or_init(|| {
+        hipfire_config::developer_var("HIPFIRE_EP_PEER_ALLREDUCE_DECODE").as_deref() == Ok("1")
+    });
+    if use_peer {
+        gpus.all_reduce_sum_f32_peer(refs, count).map_err(hip_err)
+    } else {
+        gpus.all_reduce_sum_f32(refs, count).map_err(hip_err)
+    }
+}
+
+fn tp_peer_hc4_admitted<B: ForwardBindings>(gpus: &Gpus, bindings: &[B]) -> bool {
+    gpus.devices.len() == 4
+        && gpus.peer_access_enabled
+        && gpus
+            .devices
+            .iter()
+            .all(|device| device.arch_caps.is_gfx1201())
+        && bindings.iter().all(ForwardBindings::supports_tp_peer_hc4)
+}
+
+fn tp_peer_hc3_admitted<B: ForwardBindings>(gpus: &Gpus, bindings: &[B]) -> bool {
+    gpus.devices.len() == 3
+        && gpus.peer_access_enabled
+        && gpus
+            .devices
+            .iter()
+            .all(|device| device.arch_caps.is_gfx1201())
+        && bindings.iter().all(ForwardBindings::supports_tp_peer_hc3)
+}
+
 /// Execute one lowered layer program across `gpus.devices.len()` EP ranks.
 ///
 /// - `bindings[r]` drives rank `r`'s forward (it holds that rank's state /
@@ -90,7 +127,99 @@ pub fn run_layer_program_ep<B: ForwardBindings>(
     );
 
     for op in program {
-        if matches!(op.kind, SuperOpKind::Moe) {
+        if matches!(op.kind, SuperOpKind::Attend)
+            && bindings.iter().any(ForwardBindings::attention_tp_enabled)
+        {
+            if !bindings.iter().all(ForwardBindings::attention_tp_enabled) {
+                return Err(DispatchError::Hip(
+                    "run_layer_program_ep: mixed attention-TP admission across ranks".into(),
+                ));
+            }
+
+            // Each rank computes its local head/O-LoRA shard and stops before
+            // the residual mix, leaving one hidden-width partial in the
+            // architecture-owned attention output tensor.
+            for r in 0..n {
+                gpus.devices[r].bind_thread().map_err(hip_err)?;
+                let ctx = DispatchCtx::new(&gpus.devices[r]);
+                bindings[r].run_attend_ep(&mut gpus.devices[r], &ctx, &op.binding)?;
+            }
+
+            if tp_peer_hc3_admitted(gpus, bindings) {
+                let peer_partials = bindings
+                    .iter()
+                    .map(|binding| {
+                        let partial = binding.ep_attention_partial().ok_or_else(|| {
+                            DispatchError::Hip(
+                                "run_layer_program_ep: attention TP partial missing".into(),
+                            )
+                        })?;
+                        Ok(GpuTensor {
+                            buf: unsafe { partial.buf.alias() },
+                            shape: partial.shape.clone(),
+                            dtype: partial.dtype,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, DispatchError>>()?;
+                let peers = [&peer_partials[0], &peer_partials[1], &peer_partials[2]];
+                gpus.barrier_rank_streams_reuse().map_err(hip_err)?;
+                for r in 0..n {
+                    gpus.devices[r].bind_thread().map_err(hip_err)?;
+                    bindings[r].ep_finish_attend_peer_hc3(&mut gpus.devices[r], peers)?;
+                }
+            } else if tp_peer_hc4_admitted(gpus, bindings) {
+                // Borrow-independent aliases let the architecture hooks
+                // consume all four peer pointers while each binding is
+                // mutably advanced through its own HC residual mix.
+                let peer_partials = bindings
+                    .iter()
+                    .map(|binding| {
+                        let partial = binding.ep_attention_partial().ok_or_else(|| {
+                            DispatchError::Hip(
+                                "run_layer_program_ep: attention TP partial missing".into(),
+                            )
+                        })?;
+                        Ok(GpuTensor {
+                            buf: unsafe { partial.buf.alias() },
+                            shape: partial.shape.clone(),
+                            dtype: partial.dtype,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, DispatchError>>()?;
+                let peers = [
+                    &peer_partials[0],
+                    &peer_partials[1],
+                    &peer_partials[2],
+                    &peer_partials[3],
+                ];
+                gpus.barrier_rank_streams_reuse().map_err(hip_err)?;
+                for r in 0..n {
+                    gpus.devices[r].bind_thread().map_err(hip_err)?;
+                    bindings[r].ep_finish_attend_peer_hc4(&mut gpus.devices[r], peers)?;
+                }
+            } else {
+                // Sum the input-column-sharded output projection directly in
+                // its destination tensor. No staging copy or extra scratch.
+                let refs: Vec<&DeviceBuffer> = bindings
+                    .iter()
+                    .map(|binding| {
+                        binding
+                            .ep_attention_partial()
+                            .map(|partial| &partial.buf)
+                            .ok_or_else(|| {
+                                DispatchError::Hip(
+                                    "run_layer_program_ep: attention TP partial missing".into(),
+                                )
+                            })
+                    })
+                    .collect::<Result<_, _>>()?;
+                all_reduce_sum_f32_decode(gpus, &refs, residual_dim)?;
+                for r in 0..n {
+                    gpus.devices[r].bind_thread().map_err(hip_err)?;
+                    bindings[r].ep_finish_attend(&mut gpus.devices[r])?;
+                }
+            }
+        } else if matches!(op.kind, SuperOpKind::Moe) {
             // 1. Zero each rank's routed partial on its own stream.
             for r in 0..n {
                 gpus.devices[r].bind_thread().map_err(hip_err)?;
@@ -120,33 +249,30 @@ pub fn run_layer_program_ep<B: ForwardBindings>(
                 )?;
             }
 
-            // 3. All-reduce-sum the partials across ranks (in-place, RCCL).
-            //    Decode stays on RCCL: its tiny per-token reduce is already fast
-            //    (NOT the bottleneck — measured 51.4 RCCL vs 48.0 peer-direct on
-            //    MiniMax 62-layer decode), peer-direct's per-layer wait_boundary
-            //    host-sync only adds overhead, and RCCL preserves qwen35's
-            //    validated byte-identical decode. Peer-direct is the win for
-            //    PREFILL (large batched reduce), where RCCL is ~40 ms/call —
-            //    that path uses all_reduce_sum_f32_peer directly. Opt decode into
-            //    peer-direct with HIPFIRE_EP_PEER_ALLREDUCE_DECODE=1 if needed.
-            let refs: Vec<&DeviceBuffer> = partials.iter().map(|p| &p.buf).collect();
-            static PEER_DECODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            let use_peer = *PEER_DECODE.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_EP_PEER_ALLREDUCE_DECODE").as_deref()
-                    == Ok("1")
-            });
-            if use_peer {
-                gpus.all_reduce_sum_f32_peer(&refs, residual_dim)
-                    .map_err(hip_err)?;
+            if tp_peer_hc3_admitted(gpus, bindings) {
+                let peers = [&partials[0], &partials[1], &partials[2]];
+                gpus.barrier_rank_streams_reuse().map_err(hip_err)?;
+                for r in 0..n {
+                    gpus.devices[r].bind_thread().map_err(hip_err)?;
+                    bindings[r].ep_finish_moe_peer_hc3(&mut gpus.devices[r], peers)?;
+                }
+            } else if tp_peer_hc4_admitted(gpus, bindings) {
+                let peers = [&partials[0], &partials[1], &partials[2], &partials[3]];
+                gpus.barrier_rank_streams_reuse().map_err(hip_err)?;
+                for r in 0..n {
+                    gpus.devices[r].bind_thread().map_err(hip_err)?;
+                    bindings[r].ep_finish_moe_peer_hc4(&mut gpus.devices[r], peers)?;
+                }
             } else {
-                gpus.all_reduce_sum_f32(&refs, residual_dim)
-                    .map_err(hip_err)?;
-            }
+                // 3. All-reduce-sum the partials across ranks (in-place, RCCL).
+                let refs: Vec<&DeviceBuffer> = partials.iter().map(|p| &p.buf).collect();
+                all_reduce_sum_f32_decode(gpus, &refs, residual_dim)?;
 
-            // 4. Each rank adds the reduced partial into its residual stream.
-            for r in 0..n {
-                gpus.devices[r].bind_thread().map_err(hip_err)?;
-                bindings[r].ep_add_into_residual(&mut gpus.devices[r], &partials[r])?;
+                // 4. Fold the reduced partial into each residual stream.
+                for r in 0..n {
+                    gpus.devices[r].bind_thread().map_err(hip_err)?;
+                    bindings[r].ep_add_into_residual(&mut gpus.devices[r], &partials[r])?;
+                }
             }
         } else {
             // Replicated op — every rank runs it unchanged on full weights.

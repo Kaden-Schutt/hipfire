@@ -1,0 +1,1 @@
+: This is a technical briefing for operators and implementers who must keep the product path honest. The measurement fixture is ordinary batch-1 autoregressive (AR) decoding with temperature zero, Q8 KV, a 2048-token prompt, 510 generated tokens, and no speculation of any kind. The following explanation

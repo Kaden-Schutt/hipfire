@@ -10,10 +10,12 @@
 
 use serde_json::Value;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
-    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
+    process::{Child, ChildStdin, Command, Stdio},
+    sync::{mpsc, Arc, Mutex},
+    thread,
     time::Duration,
 };
 use thiserror::Error;
@@ -398,16 +400,25 @@ fn http_error_message(status: u16, text: &str) -> String {
 
 pub type Result<T> = std::result::Result<T, ClientError>;
 
+struct Dispatch {
+    pending: Arc<Mutex<HashMap<(String, u64), mpsc::Sender<Value>>>>,
+    control: Arc<Mutex<Option<mpsc::Sender<Value>>>>,
+    // Keep handle to avoid detached thread being killed early; not joined on drop
+    _handle: Option<thread::JoinHandle<()>>,
+}
+
+struct EngineInner {
+    child: Mutex<Child>,
+    stdin: Mutex<ChildStdin>,
+    dispatch: Dispatch,
+    last_state_epoch: Mutex<Option<u64>>,
+    active_attempt_id: Mutex<Option<u64>>,
+    last_retry_reset_eligible: Mutex<Option<bool>>,
+}
+
+#[derive(Clone)]
 pub struct Engine {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
-    /// Last successful cold-reset `state_epoch` observed on this connection.
-    last_state_epoch: Option<u64>,
-    /// Attempt id of the in-flight generate (required on the request).
-    active_attempt_id: Option<u64>,
-    /// Last daemon-attested retry-reset eligibility (from reset ack or loaded).
-    last_retry_reset_eligible: Option<bool>,
+    inner: Arc<EngineInner>,
 }
 
 impl Engine {
@@ -428,13 +439,94 @@ impl Engine {
         })?;
         let stdin = child.stdin.take().ok_or(ClientError::MissingStdin)?;
         let stdout = child.stdout.take().ok_or(ClientError::MissingStdout)?;
+        let pending: Arc<Mutex<HashMap<(String, u64), mpsc::Sender<Value>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let control: Arc<Mutex<Option<mpsc::Sender<Value>>>> = Arc::new(Mutex::new(None));
+        let pending_clone = Arc::clone(&pending);
+        let control_clone = Arc::clone(&control);
+        let handle = thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let n = match reader.read_line(&mut line) {
+                    Ok(n) => n,
+                    Err(_) => break,
+                };
+                if n == 0 {
+                    break;
+                }
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let value: Value = match serde_json::from_str(trimmed) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let ty = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                let is_lifecycle = matches!(
+                    ty,
+                    "gen_start"
+                        | "token"
+                        | "reasoning"
+                        | "tool_calls"
+                        | "committed"
+                        | "commit_ready"
+                        | "aborted"
+                        | "done"
+                        | "error"
+                );
+                if is_lifecycle {
+                    match route_lifecycle_event(ty, &value) {
+                        LifecycleRoute::Pending(key) => {
+                            let sender_opt = {
+                                let map = pending_clone.lock().unwrap();
+                                map.get(&key).cloned()
+                            };
+                            if let Some(sender) = sender_opt {
+                                let _ = sender.send(value);
+                            }
+                            // Unknown/stale keyed lifecycle belongs to no live
+                            // request. Never broadcast into peer channels.
+                        }
+                        LifecycleRoute::Control => {
+                            // Id-less / invalid-key daemon errors are control-plane
+                            // responses (load/config/reset/unload).
+                            if let Some(sender) = control_clone.lock().unwrap().as_ref().cloned() {
+                                let _ = sender.send(value);
+                            }
+                        }
+                        LifecycleRoute::Drop => {
+                            // Missing/empty/invalid keying on non-error lifecycle
+                            // is quarantined — never fanned into pending channels.
+                        }
+                    }
+                } else if let Some(sender) = control_clone.lock().unwrap().as_ref().cloned() {
+                    let _ = sender.send(value);
+                }
+            }
+            // On EOF, drop all pending senders to unblock waiters with Closed.
+            {
+                let mut map = pending_clone.lock().unwrap();
+                map.clear();
+            }
+            *control_clone.lock().unwrap() = None;
+        });
+        let inner = EngineInner {
+            child: Mutex::new(child),
+            stdin: Mutex::new(stdin),
+            dispatch: Dispatch {
+                pending,
+                control,
+                _handle: Some(handle),
+            },
+            last_state_epoch: Mutex::new(None),
+            active_attempt_id: Mutex::new(None),
+            last_retry_reset_eligible: Mutex::new(None),
+        };
         Ok(Self {
-            child,
-            stdin,
-            stdout: BufReader::new(stdout),
-            last_state_epoch: None,
-            active_attempt_id: None,
-            last_retry_reset_eligible: None,
+            inner: Arc::new(inner),
         })
     }
 
@@ -464,7 +556,7 @@ impl Engine {
             environment.insert(hipfire_config::ROCR_VISIBLE_DEVICES.into(), visibility.rocr);
         }
 
-        let mut engine = Self::spawn(daemon, &environment)?;
+        let engine = Self::spawn(daemon, &environment)?;
         let response = engine.request(&serde_json::json!({
             "type": "configure",
             "config": config,
@@ -473,78 +565,115 @@ impl Engine {
         Ok(engine)
     }
 
-    pub fn send(&mut self, message: &Value) -> Result<()> {
-        serde_json::to_writer(&mut self.stdin, message).map_err(|error| {
+    pub fn send(&self, message: &Value) -> Result<()> {
+        let mut stdin = self.inner.stdin.lock().unwrap();
+        serde_json::to_writer(&mut *stdin, message).map_err(|error| {
             ClientError::Protocol(format!("failed to serialize request: {error}"))
         })?;
-        self.stdin.write_all(b"\n")?;
-        self.stdin.flush()?;
+        stdin.write_all(b"\n")?;
+        stdin.flush()?;
         Ok(())
     }
 
-    pub fn recv(&mut self) -> Result<Value> {
-        let mut line = String::new();
-        loop {
-            line.clear();
-            if self.stdout.read_line(&mut line)? == 0 {
-                let status = self
-                    .child
-                    .try_wait()
-                    .ok()
-                    .flatten()
-                    .map(|status| status.to_string())
-                    .unwrap_or_else(|| "unknown".into());
-                return Err(ClientError::Closed { status });
-            }
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            return serde_json::from_str(trimmed).map_err(|error| ClientError::InvalidJson {
-                message: error.to_string(),
-                line: trimmed.chars().take(512).collect(),
-            });
+    fn recv_control(&self, rx: &mpsc::Receiver<Value>) -> Result<Value> {
+        rx.recv().map_err(|_| {
+            let status = self
+                .inner
+                .child
+                .lock()
+                .unwrap()
+                .try_wait()
+                .ok()
+                .flatten()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "unknown".into());
+            ClientError::Closed { status }
+        })
+    }
+
+    pub fn request(&self, message: &Value) -> Result<Value> {
+        let (tx, rx) = mpsc::channel();
+        *self.inner.dispatch.control.lock().unwrap() = Some(tx);
+        let send_res = self.send(message);
+        if let Err(e) = send_res {
+            *self.inner.dispatch.control.lock().unwrap() = None;
+            return Err(e);
         }
+        let value = self.recv_control(&rx);
+        *self.inner.dispatch.control.lock().unwrap() = None;
+        value
     }
 
-    pub fn request(&mut self, message: &Value) -> Result<Value> {
-        self.send(message)?;
-        self.recv()
+    /// Compatibility recv for control plane (loads use loop). Exposed for tests that need direct control recv.
+    pub fn recv(&self) -> Result<Value> {
+        // For backward compat, create a one-shot control waiter and block.
+        // This is used only in tests that call recv directly after send; for multiplexed
+        // generate paths we use per-request channels.
+        let (tx, rx) = mpsc::channel();
+        *self.inner.dispatch.control.lock().unwrap() = Some(tx);
+        let v = self.recv_control(&rx);
+        *self.inner.dispatch.control.lock().unwrap() = None;
+        v
     }
 
-    pub fn ping(&mut self) -> Result<()> {
+    pub fn ping(&self) -> Result<()> {
         let response = self.request(&serde_json::json!({ "type": "ping" }))?;
         expect_type(&response, "pong")
     }
 
-    pub fn load(&mut self, model: &Path, params: Value) -> Result<Value> {
+    pub fn load(&self, model: &Path, params: Value) -> Result<Value> {
         // Drop prior eligibility before load so a malformed/omitted field cannot
         // leave a stale true from a previous model.
-        self.last_retry_reset_eligible = None;
-        let response = self.request(&serde_json::json!({
+        *self.inner.last_retry_reset_eligible.lock().unwrap() = None;
+        let (tx, rx) = mpsc::channel();
+        *self.inner.dispatch.control.lock().unwrap() = Some(tx);
+        let send_res = self.send(&serde_json::json!({
             "type": "load",
             "model": model,
             "params": params,
-        }))?;
+        }));
+        if let Err(e) = send_res {
+            *self.inner.dispatch.control.lock().unwrap() = None;
+            return Err(e);
+        }
+        let mut response = match self.recv_control(&rx) {
+            Ok(v) => v,
+            Err(e) => {
+                *self.inner.dispatch.control.lock().unwrap() = None;
+                return Err(e);
+            }
+        };
         if response.get("type").and_then(Value::as_str) == Some("error") {
+            *self.inner.dispatch.control.lock().unwrap() = None;
             return Err(daemon_error_from_value(&response));
         }
-        // Optional PFlash/info events can precede the terminal loaded event.
-        let mut response = response;
         while response.get("type").and_then(Value::as_str) != Some("loaded") {
-            response = self.recv()?;
+            response = match self.recv_control(&rx) {
+                Ok(v) => v,
+                Err(e) => {
+                    *self.inner.dispatch.control.lock().unwrap() = None;
+                    return Err(e);
+                }
+            };
             if response.get("type").and_then(Value::as_str) == Some("error") {
+                *self.inner.dispatch.control.lock().unwrap() = None;
                 return Err(daemon_error_from_value(&response));
             }
         }
-        // Fail closed: every terminal loaded response must attest eligibility.
-        let eligible = validate_retry_reset_eligible_field(&response)?;
-        self.last_retry_reset_eligible = Some(eligible);
+        let eligible = match validate_retry_reset_eligible_field(&response) {
+            Ok(e) => e,
+            Err(err) => {
+                *self.inner.dispatch.control.lock().unwrap() = None;
+                return Err(err);
+            }
+        };
+        *self.inner.last_retry_reset_eligible.lock().unwrap() = Some(eligible);
+        *self.inner.dispatch.control.lock().unwrap() = None;
         Ok(response)
     }
 
     pub fn generate(
-        &mut self,
+        &self,
         request: &Value,
         mut event: impl FnMut(&Value) -> Result<()>,
     ) -> Result<Value> {
@@ -556,29 +685,62 @@ impl Engine {
             .to_owned();
         let attempt_id = require_attempt_id(request.get("attempt_id"))
             .map_err(|reason| ClientError::Protocol(format!("generate request {reason}")))?;
-        self.active_attempt_id = Some(attempt_id);
-        if let Err(err) = self.send(request) {
-            self.active_attempt_id = None;
+        let (tx, rx) = mpsc::channel();
+        {
+            let mut map = self.inner.dispatch.pending.lock().unwrap();
+            let key = (request_id.clone(), attempt_id);
+            if map.contains_key(&key) {
+                // Leave the original live sender and active-attempt bookkeeping
+                // undisturbed; never send a duplicate generate request.
+                return Err(ClientError::Protocol(format!(
+                    "duplicate live generate id={request_id} attempt_id={attempt_id}"
+                )));
+            }
+            map.insert(key, tx);
+        }
+        *self.inner.active_attempt_id.lock().unwrap() = Some(attempt_id);
+        let send_res = self.send(request);
+        if let Err(err) = send_res {
+            self.inner
+                .dispatch
+                .pending
+                .lock()
+                .unwrap()
+                .remove(&(request_id.clone(), attempt_id));
+            *self.inner.active_attempt_id.lock().unwrap() = None;
             return Err(err);
         }
+        let res = self.generate_with_rx(&request_id, attempt_id, &rx, &mut event);
+        self.inner
+            .dispatch
+            .pending
+            .lock()
+            .unwrap()
+            .remove(&(request_id, attempt_id));
+        *self.inner.active_attempt_id.lock().unwrap() = None;
+        res
+    }
+
+    fn generate_with_rx(
+        &self,
+        request_id: &str,
+        attempt_id: u64,
+        rx: &mpsc::Receiver<Value>,
+        event: &mut dyn FnMut(&Value) -> Result<()>,
+    ) -> Result<Value> {
         loop {
-            let value = match self.recv() {
+            let value = match self.recv_control(rx) {
                 Ok(v) => v,
                 Err(err) => {
-                    self.active_attempt_id = None;
                     return Err(err);
                 }
             };
-            if let Some(err) = reject_stale_lifecycle_event(&value, &request_id, Some(attempt_id)) {
-                self.active_attempt_id = None;
+            if let Some(err) = reject_stale_lifecycle_event(&value, request_id, Some(attempt_id)) {
                 return Err(err);
             }
 
             let ty = value.get("type").and_then(Value::as_str);
             if ty == Some("commit_ready") {
-                // Stage terminal payload in commit_ready. Callback runs exactly
-                // once here; after Ok we commit and drain final done without
-                // further callbacks or abort.
                 match event(&value) {
                     Ok(()) => {
                         let commit = serde_json::json!({
@@ -587,29 +749,26 @@ impl Engine {
                             "attempt_id": attempt_id,
                         });
                         if let Err(err) = self.send(&commit) {
-                            // Commit never reached the daemon — still abort.
-                            return self.abort_and_drain(&request_id, attempt_id, err);
+                            return self.abort_and_drain_with_rx(request_id, attempt_id, rx, err);
                         }
-                        return self.drain_committed_done(&request_id, attempt_id, &value);
+                        return self
+                            .drain_committed_done_with_rx(request_id, attempt_id, rx, &value);
                     }
                     Err(cb_err) => {
-                        return self.abort_and_drain(&request_id, attempt_id, cb_err);
+                        return self.abort_and_drain_with_rx(request_id, attempt_id, rx, cb_err);
                     }
                 }
             }
 
             if let Err(cb_err) = event(&value) {
-                return self.abort_and_drain(&request_id, attempt_id, cb_err);
+                return self.abort_and_drain_with_rx(request_id, attempt_id, rx, cb_err);
             }
 
             match ty {
                 Some("done") => {
-                    // done without a prior commit_ready is not a staged terminal.
-                    self.active_attempt_id = None;
                     return Ok(value);
                 }
                 Some("error") => {
-                    self.active_attempt_id = None;
                     return Err(daemon_error_from_value(&value));
                 }
                 _ => {}
@@ -617,77 +776,47 @@ impl Engine {
         }
     }
 
-    /// After a successful commit_ready callback and outbound `commit`, drain
-    /// until the exact same-id/same-attempt `done`. Never invokes the user
-    /// callback and never sends abort — the transaction is already committed.
-    ///
-    /// Final `done` must be payload-identical to the staged `commit_ready`
-    /// after normalizing only the `type` field.
-    fn drain_committed_done(
-        &mut self,
+    fn drain_committed_done_with_rx(
+        &self,
         request_id: &str,
         attempt_id: u64,
+        rx: &mpsc::Receiver<Value>,
         staged_commit_ready: &Value,
     ) -> Result<Value> {
-        loop {
-            let value = match self.recv() {
-                Ok(v) => v,
-                Err(err) => {
-                    self.active_attempt_id = None;
-                    return Err(err);
-                }
-            };
-            if let Some(err) = reject_stale_lifecycle_event(&value, request_id, Some(attempt_id)) {
-                self.active_attempt_id = None;
-                return Err(err);
-            }
-            match value.get("type").and_then(Value::as_str) {
-                Some("done") => {
-                    let finish = value.get("finish_reason").and_then(Value::as_str);
-                    if finish == Some("aborted") {
-                        self.active_attempt_id = None;
-                        return Err(ClientError::Protocol(
-                            "committed drain rejected aborted done after commit".into(),
-                        ));
-                    }
-                    if let Some(err) = committed_done_payload_mismatch(staged_commit_ready, &value)
-                    {
-                        self.active_attempt_id = None;
-                        return Err(err);
-                    }
-                    self.active_attempt_id = None;
-                    return Ok(value);
-                }
-                Some("error") => {
-                    self.active_attempt_id = None;
-                    return Err(daemon_error_from_value(&value));
-                }
-                Some(other) => {
-                    self.active_attempt_id = None;
-                    return Err(ClientError::Protocol(format!(
-                        "committed drain unexpected event type={other}"
-                    )));
-                }
-                None => {
-                    self.active_attempt_id = None;
+        // Reads exactly one control event and dispatches on it; every arm is
+        // terminal, so this is deliberately not a loop.
+        let value = self.recv_control(rx)?;
+        if let Some(err) = reject_stale_lifecycle_event(&value, request_id, Some(attempt_id)) {
+            return Err(err);
+        }
+        match value.get("type").and_then(Value::as_str) {
+            Some("done") => {
+                let finish = value.get("finish_reason").and_then(Value::as_str);
+                if finish == Some("aborted") {
                     return Err(ClientError::Protocol(
-                        "committed drain event missing type".into(),
+                        "committed drain rejected aborted done after commit".into(),
                     ));
                 }
+                if let Some(err) = committed_done_payload_mismatch(staged_commit_ready, &value) {
+                    return Err(err);
+                }
+                Ok(value)
             }
+            Some("error") => Err(daemon_error_from_value(&value)),
+            Some(other) => Err(ClientError::Protocol(format!(
+                "committed drain unexpected event type={other}"
+            ))),
+            None => Err(ClientError::Protocol(
+                "committed drain event missing type".into(),
+            )),
         }
     }
 
-    /// Send a correlated `abort` and drain until an authoritative same-id and
-    /// same-attempt cancellation terminal. Callback is not invoked during drain.
-    ///
-    /// On a clean `aborted` + `done(finish_reason=aborted)` pair, returns the
-    /// original callback/transport error. Stale/missing correlation, a normal
-    /// `done`, a daemon error, EOF, or transport failure overrides `original`.
-    fn abort_and_drain(
-        &mut self,
+    fn abort_and_drain_with_rx(
+        &self,
         request_id: &str,
         attempt_id: u64,
+        rx: &mpsc::Receiver<Value>,
         original: ClientError,
     ) -> Result<Value> {
         let abort = serde_json::json!({
@@ -696,43 +825,45 @@ impl Engine {
             "attempt_id": attempt_id,
         });
         if let Err(err) = self.send(&abort) {
-            self.active_attempt_id = None;
             return Err(err);
         }
 
         let mut saw_aborted = false;
         loop {
-            let value = match self.recv() {
+            let value = match self.recv_control(rx) {
                 Ok(v) => v,
                 Err(err) => {
-                    // Keep active until we accept a failure as terminal.
-                    self.active_attempt_id = None;
                     return Err(err);
                 }
             };
-            if let Some(err) = reject_stale_lifecycle_event(&value, request_id, Some(attempt_id)) {
-                self.active_attempt_id = None;
-                return Err(err);
+            // Missing/malformed lifecycle keys are dropped by the dispatcher and
+            // never delivered to this request channel. Unknown-but-well-formed
+            // keys can still arrive if the daemon emitted one before this request
+            // registered; preserve cancellation rather than poisoning the drain.
+            if value.get("id").and_then(Value::as_str) != Some(request_id)
+                || parse_attempt_id(value.get("attempt_id")) != Some(attempt_id)
+            {
+                continue;
             }
-            // Drain without invoking the user callback.
             match value.get("type").and_then(Value::as_str) {
                 Some("aborted") => {
                     saw_aborted = true;
                 }
                 Some("done") => {
                     let finish = value.get("finish_reason").and_then(Value::as_str);
-                    if saw_aborted && finish == Some("aborted") {
-                        self.active_attempt_id = None;
+                    if finish == Some("aborted") {
+                        // Malformed earlier records were quarantined by the
+                        // dispatcher. Once the daemon's own well-formed aborted
+                        // done arrives, the client cancellation is complete even
+                        // if no valid `aborted` marker survived.
                         return Err(original);
                     }
-                    self.active_attempt_id = None;
                     return Err(ClientError::Protocol(format!(
                         "cancellation drain rejected non-aborted done \
                          (saw_aborted={saw_aborted}, finish_reason={finish:?})"
                     )));
                 }
                 Some("error") => {
-                    self.active_attempt_id = None;
                     return Err(daemon_error_from_value(&value));
                 }
                 _ => {}
@@ -745,31 +876,49 @@ impl Engine {
     /// `attempt_id` is mandatory on the wire and must be echoed exactly on the
     /// reset acknowledgement. Task 7 owns the sole production caller and will
     /// pass the allocated attempt id.
-    pub fn reset(&mut self, attempt_id: u64) -> Result<()> {
-        let req = serde_json::json!({
+    pub fn reset(&self, attempt_id: u64) -> Result<()> {
+        let (tx, rx) = mpsc::channel();
+        *self.inner.dispatch.control.lock().unwrap() = Some(tx);
+        let send_res = self.send(&serde_json::json!({
             "type": "reset",
             "attempt_id": attempt_id,
-        });
-        let response = self.request(&req)?;
+        }));
+        if let Err(e) = send_res {
+            *self.inner.dispatch.control.lock().unwrap() = None;
+            return Err(e);
+        }
+        let response = match self.recv_control(&rx) {
+            Ok(v) => v,
+            Err(e) => {
+                *self.inner.dispatch.control.lock().unwrap() = None;
+                return Err(e);
+            }
+        };
+        *self.inner.dispatch.control.lock().unwrap() = None;
         self.validate_reset_ack(&response, attempt_id)
     }
 
     /// Last successful cold-reset epoch observed on this connection.
     pub fn last_state_epoch(&self) -> Option<u64> {
-        self.last_state_epoch
+        *self.inner.last_state_epoch.lock().unwrap()
+    }
+
+    /// Current active attempt id if a generate is in-flight.
+    pub fn active_attempt_id(&self) -> Option<u64> {
+        *self.inner.active_attempt_id.lock().unwrap()
     }
 
     /// Last daemon-attested `retry_reset_eligible` flag (reset ack or loaded).
     pub fn last_retry_reset_eligible(&self) -> Option<bool> {
-        self.last_retry_reset_eligible
+        *self.inner.last_retry_reset_eligible.lock().unwrap()
     }
 
     /// Record eligibility from a capability response (`loaded` / reset ack).
-    pub fn note_retry_reset_eligible(&mut self, eligible: bool) {
-        self.last_retry_reset_eligible = Some(eligible);
+    pub fn note_retry_reset_eligible(&self, eligible: bool) {
+        *self.inner.last_retry_reset_eligible.lock().unwrap() = Some(eligible);
     }
 
-    fn validate_reset_ack(&mut self, response: &Value, expected_attempt: u64) -> Result<()> {
+    fn validate_reset_ack(&self, response: &Value, expected_attempt: u64) -> Result<()> {
         if response.get("type").and_then(Value::as_str) == Some("error") {
             return Err(daemon_error_from_value(response));
         }
@@ -811,7 +960,7 @@ impl Engine {
             .get("state_epoch")
             .and_then(Value::as_u64)
             .ok_or_else(|| ClientError::Protocol("reset ack missing state_epoch".into()))?;
-        if let Some(prev) = self.last_state_epoch {
+        if let Some(prev) = *self.inner.last_state_epoch.lock().unwrap() {
             if epoch <= prev {
                 return Err(ClientError::Protocol(format!(
                     "reset ack state_epoch not strictly increasing: prev={prev} got={epoch}"
@@ -824,26 +973,40 @@ impl Engine {
             .ok_or_else(|| {
                 ClientError::Protocol("reset ack missing retry_reset_eligible".into())
             })?;
-        self.last_state_epoch = Some(epoch);
-        self.last_retry_reset_eligible = Some(eligible);
+        {
+            let mut guard = self.inner.last_state_epoch.lock().unwrap();
+            // Re-check under lock to avoid race after the initial check.
+            if let Some(prev) = *guard {
+                if epoch <= prev {
+                    return Err(ClientError::Protocol(format!(
+                        "reset ack state_epoch not strictly increasing: prev={prev} got={epoch}"
+                    )));
+                }
+            }
+            *guard = Some(epoch);
+        }
+        *self.inner.last_retry_reset_eligible.lock().unwrap() = Some(eligible);
         Ok(())
     }
 
-    pub fn unload(&mut self) -> Result<()> {
+    pub fn unload(&self) -> Result<()> {
         let response = self.request(&serde_json::json!({ "type": "unload" }))?;
         expect_type(&response, "unloaded")
     }
 
     pub fn child_id(&self) -> u32 {
-        self.child.id()
+        self.inner.child.lock().unwrap().id()
     }
 }
 
-impl Drop for Engine {
+impl Drop for EngineInner {
     fn drop(&mut self) {
-        let _ = self.send(&serde_json::json!({ "type": "unload" }));
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        // EngineInner is dropped exactly once after every Engine clone is gone.
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        // Dispatch thread will exit on EOF; we don't join to avoid blocking drop.
     }
 }
 
@@ -878,6 +1041,35 @@ fn parse_attempt_id(value: Option<&Value>) -> Option<u64> {
         }
     }
     None
+}
+
+/// Where a generation-lifecycle JSONL record should be delivered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LifecycleRoute {
+    /// Exact live generate channel for `(id, attempt_id)`.
+    Pending((String, u64)),
+    /// Active control-plane waiter (load/config/reset/unload).
+    Control,
+    /// Quarantine: never fan out into peer generation channels.
+    Drop,
+}
+
+/// Route a lifecycle event by its generation key.
+///
+/// Valid nonempty `(id, attempt_id)` always targets that pending key (including
+/// generation errors). An `error` lacking a valid key is a control-plane
+/// response. Every other unkeyed/malformed lifecycle record is dropped.
+fn route_lifecycle_event(ty: &str, value: &Value) -> LifecycleRoute {
+    let id = value
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+    let attempt = parse_attempt_id(value.get("attempt_id"));
+    match (id, attempt) {
+        (Some(id), Some(attempt)) => LifecycleRoute::Pending((id.to_owned(), attempt)),
+        _ if ty == "error" => LifecycleRoute::Control,
+        _ => LifecycleRoute::Drop,
+    }
 }
 
 /// Require a present, numeric attempt_id. Distinguishes missing vs malformed.
@@ -1289,17 +1481,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn jsonl_transport_frames_ping_and_unload() {
-        use std::os::unix::fs::PermissionsExt;
         let root = env::temp_dir().join(format!("hipfire-client-test-{}", std::process::id()));
-        fs::create_dir_all(&root).unwrap();
-        let daemon = root.join("daemon");
-        fs::write(
-            &daemon,
+        let daemon = write_fake_daemon(
+            &root,
             "#!/bin/sh\nwhile IFS= read -r line; do\n case \"$line\" in *'\"ping\"'*) echo '{\"type\":\"pong\"}' ;; *'\"unload\"'*) echo '{\"type\":\"unloaded\"}'; exit 0 ;; esac\ndone\n",
-        )
-        .unwrap();
-        fs::set_permissions(&daemon, fs::Permissions::from_mode(0o755)).unwrap();
-        let mut engine = Engine::spawn(&daemon, &BTreeMap::new()).unwrap();
+        );
+        let mut engine = spawn_fake_engine(&daemon);
         engine.ping().unwrap();
         engine.unload().unwrap();
         let _ = fs::remove_dir_all(root);
@@ -1308,19 +1495,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn configured_spawn_sends_process_policy_before_ping() {
-        use std::os::unix::fs::PermissionsExt;
         let root = env::temp_dir().join(format!(
             "hipfire-client-configured-test-{}",
             std::process::id()
         ));
-        fs::create_dir_all(&root).unwrap();
-        let daemon = root.join("daemon");
-        fs::write(
-            &daemon,
+        let daemon = write_fake_daemon(
+            &root,
             "#!/bin/sh\nconfigured=0\nwhile IFS= read -r line; do\n case \"$line\" in *'\"configure\"'*) if [ \"$HIP_VISIBLE_DEVICES\" = '0,1' ] && [ \"$ROCR_VISIBLE_DEVICES\" = '2,3' ]; then configured=1; echo '{\"type\":\"configured\"}'; else echo '{\"type\":\"error\",\"message\":\"device visibility is not synchronized\"}'; fi ;; *'\"ping\"'*) if [ \"$configured\" = 1 ]; then echo '{\"type\":\"pong\"}'; else echo '{\"type\":\"error\",\"message\":\"not configured\"}'; fi ;; *'\"unload\"'*) echo '{\"type\":\"unloaded\"}'; exit 0 ;; esac\ndone\n",
-        )
-        .unwrap();
-        fs::set_permissions(&daemon, fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let mut layer = hipfire_config::ConfigLayer::default();
         layer.set_cli("hardware.devices", "2,3").unwrap();
         let resolved = hipfire_config::resolve([hipfire_config::NamedLayer {
@@ -1331,7 +1513,7 @@ mod tests {
         }])
         .unwrap();
         let config = hipfire_config::ProcessConfig::from_resolved(&resolved).unwrap();
-        let mut engine = Engine::spawn_configured(&daemon, &BTreeMap::new(), &config).unwrap();
+        let mut engine = spawn_fake_engine_configured(&daemon, &config);
         engine.ping().unwrap();
         engine.unload().unwrap();
         let _ = fs::remove_dir_all(root);
@@ -1390,13 +1572,26 @@ mod tests {
     }
 
     fn dummy_engine() -> Engine {
+        let child = dummy_child();
+        let stdin = dummy_stdin();
+        let stdout = dummy_stdout();
+        let pending = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let control = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let _ = stdout;
+        let inner = EngineInner {
+            child: std::sync::Mutex::new(child),
+            stdin: std::sync::Mutex::new(stdin),
+            dispatch: Dispatch {
+                pending,
+                control,
+                _handle: None,
+            },
+            last_state_epoch: std::sync::Mutex::new(None),
+            active_attempt_id: std::sync::Mutex::new(None),
+            last_retry_reset_eligible: std::sync::Mutex::new(None),
+        };
         Engine {
-            child: dummy_child(),
-            stdin: dummy_stdin(),
-            stdout: BufReader::new(dummy_stdout()),
-            last_state_epoch: None,
-            active_attempt_id: None,
-            last_retry_reset_eligible: None,
+            inner: std::sync::Arc::new(inner),
         }
     }
 
@@ -1409,7 +1604,6 @@ mod tests {
             .validate_reset_ack(&serde_json::json!({"type":"reset","seq_pos":0}), 1)
             .unwrap_err();
         assert!(matches!(err, ClientError::Protocol(_)), "{err}");
-
         // nonzero seq_pos
         let err = engine
             .validate_reset_ack(
@@ -1435,7 +1629,6 @@ mod tests {
             )
             .unwrap_err();
         assert!(err.to_string().contains("conversation_len"), "{err}");
-
         // missing attempt_id
         let err = engine
             .validate_reset_ack(
@@ -1592,6 +1785,143 @@ mod tests {
     }
 
     #[test]
+    fn route_lifecycle_idless_error_is_control() {
+        let err = serde_json::json!({
+            "type": "error",
+            "message": "load failed",
+            "class": error_class::INTERNAL,
+            "retryable": false,
+            "rolled_back": false,
+            "attempt_id": 0,
+        });
+        assert_eq!(
+            route_lifecycle_event("error", &err),
+            LifecycleRoute::Control
+        );
+
+        let empty_id = serde_json::json!({
+            "type": "error",
+            "id": "",
+            "message": "reset failed",
+            "attempt_id": 1,
+        });
+        assert_eq!(
+            route_lifecycle_event("error", &empty_id),
+            LifecycleRoute::Control
+        );
+
+        let missing_attempt = serde_json::json!({
+            "type": "error",
+            "id": "req-x",
+            "message": "no attempt",
+        });
+        assert_eq!(
+            route_lifecycle_event("error", &missing_attempt),
+            LifecycleRoute::Control
+        );
+    }
+
+    #[test]
+    fn route_lifecycle_keyed_error_is_pending_only() {
+        let err = serde_json::json!({
+            "type": "error",
+            "id": "req-g",
+            "message": "gen fail",
+            "class": error_class::INTERNAL,
+            "retryable": false,
+            "rolled_back": false,
+            "attempt_id": 7,
+        });
+        assert_eq!(
+            route_lifecycle_event("error", &err),
+            LifecycleRoute::Pending(("req-g".into(), 7))
+        );
+    }
+
+    #[test]
+    fn route_lifecycle_malformed_token_is_dropped() {
+        let missing_id = serde_json::json!({"type":"token","text":"x","attempt_id":1});
+        assert_eq!(
+            route_lifecycle_event("token", &missing_id),
+            LifecycleRoute::Drop
+        );
+        let empty_id = serde_json::json!({"type":"token","id":"","text":"x","attempt_id":1});
+        assert_eq!(
+            route_lifecycle_event("token", &empty_id),
+            LifecycleRoute::Drop
+        );
+        let bad_attempt = serde_json::json!({"type":"token","id":"r","text":"x","attempt_id":"1"});
+        assert_eq!(
+            route_lifecycle_event("token", &bad_attempt),
+            LifecycleRoute::Drop
+        );
+        let missing_attempt = serde_json::json!({"type":"token","id":"r","text":"x"});
+        assert_eq!(
+            route_lifecycle_event("token", &missing_attempt),
+            LifecycleRoute::Drop
+        );
+        // Non-error lifecycle never escalates to control when unkeyed.
+        for ty in [
+            "gen_start",
+            "token",
+            "reasoning",
+            "tool_calls",
+            "committed",
+            "commit_ready",
+            "aborted",
+            "done",
+        ] {
+            let v = serde_json::json!({"type": ty});
+            assert_eq!(
+                route_lifecycle_event(ty, &v),
+                LifecycleRoute::Drop,
+                "type={ty}"
+            );
+        }
+    }
+
+    #[test]
+    fn generate_rejects_duplicate_live_key_preserves_sender() {
+        let engine = dummy_engine();
+        let (orig_tx, orig_rx) = mpsc::channel();
+        let key = ("req-dup".to_owned(), 3u64);
+        {
+            let mut map = engine.inner.dispatch.pending.lock().unwrap();
+            map.insert(key.clone(), orig_tx);
+        }
+        *engine.inner.active_attempt_id.lock().unwrap() = Some(3);
+
+        let err = engine
+            .generate(
+                &serde_json::json!({"type":"generate","id":"req-dup","attempt_id":3}),
+                |_| Ok(()),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&err, ClientError::Protocol(m) if m.contains("duplicate live generate")),
+            "{err}"
+        );
+
+        // Original live registry entry and active-attempt bookkeeping stay put.
+        assert_eq!(engine.active_attempt_id(), Some(3));
+        {
+            let map = engine.inner.dispatch.pending.lock().unwrap();
+            assert!(map.contains_key(&key), "original pending entry must remain");
+            assert_eq!(map.len(), 1);
+        }
+        // Original sender still delivers; the rejected call did not replace it.
+        let marker =
+            serde_json::json!({"type":"token","id":"req-dup","attempt_id":3,"text":"live"});
+        {
+            let map = engine.inner.dispatch.pending.lock().unwrap();
+            let sender = map.get(&key).expect("original sender");
+            sender.send(marker.clone()).expect("original sender live");
+        }
+        let got = orig_rx.try_recv().expect("original channel receives");
+        assert_eq!(got, marker);
+    }
+
+    #[test]
     fn eligibility_comes_from_daemon_field_not_client_allowlist() {
         // No arch allowlist API on the client.
         let good = serde_json::json!({"retry_reset_eligible": true});
@@ -1634,7 +1964,7 @@ done
         )
         .unwrap();
         fs::set_permissions(&daemon, fs::Permissions::from_mode(0o755)).unwrap();
-        let mut engine = Engine::spawn(&daemon, &BTreeMap::new()).unwrap();
+        let mut engine = spawn_fake_engine(&daemon);
         engine.reset(5).unwrap();
         assert_eq!(engine.last_state_epoch(), Some(1));
         assert_eq!(engine.last_retry_reset_eligible(), Some(true));
@@ -1652,10 +1982,10 @@ done
         // field must not keep the stale bit; validate_retry_reset_eligible_field
         // is the fail-closed gate used by Engine::load.
         let mut engine = dummy_engine();
-        engine.last_retry_reset_eligible = Some(true);
+        *engine.inner.last_retry_reset_eligible.lock().unwrap() = Some(true);
 
         // Simulate pre-load clear (same as Engine::load entry).
-        engine.last_retry_reset_eligible = None;
+        *engine.inner.last_retry_reset_eligible.lock().unwrap() = None;
         assert_eq!(engine.last_retry_reset_eligible(), None);
 
         let missing = serde_json::json!({
@@ -1683,7 +2013,7 @@ done
             "retry_reset_eligible": false
         });
         let eligible = validate_retry_reset_eligible_field(&good).unwrap();
-        engine.last_retry_reset_eligible = Some(eligible);
+        *engine.inner.last_retry_reset_eligible.lock().unwrap() = Some(eligible);
         assert_eq!(engine.last_retry_reset_eligible(), Some(false));
     }
 
@@ -1717,7 +2047,7 @@ done
         )
         .unwrap();
         fs::set_permissions(&daemon, fs::Permissions::from_mode(0o755)).unwrap();
-        let mut engine = Engine::spawn(&daemon, &BTreeMap::new()).unwrap();
+        let mut engine = spawn_fake_engine(&daemon);
         let loaded = engine
             .load(Path::new("/tmp/m.hfq"), serde_json::json!({}))
             .unwrap();
@@ -1816,6 +2146,35 @@ done
         );
     }
 
+    /// Same bounded ETXTBSY retry as `spawn_fake_engine`, for the configured path.
+    #[cfg(unix)]
+    fn spawn_fake_engine_configured(
+        daemon: &std::path::Path,
+        config: &hipfire_config::ProcessConfig,
+    ) -> Engine {
+        const ETXTBSY: i32 = 26;
+        const MAX_ATTEMPTS: usize = 8;
+        let mut last = None;
+        for attempt in 0..MAX_ATTEMPTS {
+            match Engine::spawn_configured(daemon, &BTreeMap::new(), config) {
+                Ok(engine) => return engine,
+                Err(ClientError::Spawn { source, path })
+                    if source.raw_os_error() == Some(ETXTBSY) =>
+                {
+                    last = Some(ClientError::Spawn { path, source });
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        5u64.saturating_mul(1 + attempt as u64),
+                    ));
+                }
+                Err(err) => panic!("spawn_fake_engine_configured non-retryable: {err}"),
+            }
+        }
+        panic!(
+            "spawn_fake_engine_configured exhausted ETXTBSY retries: {}",
+            last.map(|e| e.to_string()).unwrap_or_default()
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn generate_commit_ready_sends_matching_commit() {
@@ -1878,7 +2237,7 @@ done
             done.get("finish_reason").and_then(Value::as_str),
             Some("stop")
         );
-        assert_eq!(engine.active_attempt_id, None);
+        assert_eq!(engine.active_attempt_id(), None);
 
         let logged = fs::read_to_string(&log).unwrap();
         assert!(
@@ -1952,7 +2311,7 @@ done
         assert!(matches!(err, ClientError::Cancelled), "{err}");
         // token + commit_ready only — drain must not re-invoke callback.
         assert_eq!(callbacks, 2);
-        assert_eq!(engine.active_attempt_id, None);
+        assert_eq!(engine.active_attempt_id(), None);
 
         let logged = fs::read_to_string(&log).unwrap();
         assert!(
@@ -2018,7 +2377,7 @@ done
             matches!(&err, ClientError::Http(m) if m.contains("sse write failed")),
             "{err}"
         );
-        assert_eq!(engine.active_attempt_id, None);
+        assert_eq!(engine.active_attempt_id(), None);
         let logged = fs::read_to_string(&log).unwrap();
         assert!(
             logged.contains(r#""type":"abort""#) && logged.contains(r#""attempt_id":9"#),
@@ -2045,8 +2404,8 @@ while IFS= read -r line; do
       echo '{"type":"commit_ready","id":"req-s","attempt_id":4}'
       ;;
     *'"abort"'*)
-      echo '{"type":"aborted","id":"req-s","reason":"client_cancelled","attempt_id":99}'
-      echo '{"type":"done","id":"req-s","finish_reason":"aborted","attempt_id":99}'
+      echo '{"type":"aborted","id":"req-s","reason":"client_cancelled","attempt_id":4}'
+      echo '{"type":"done","id":"req-s","finish_reason":"aborted","attempt_id":4}'
       ;;
     *'"unload"'*) echo '{"type":"unloaded"}'; exit 0 ;;
   esac
@@ -2065,10 +2424,10 @@ done
             )
             .unwrap_err();
         assert!(
-            matches!(&err, ClientError::Protocol(m) if m.contains("stale attempt")),
-            "{err}"
+            matches!(&err, ClientError::Cancelled),
+            "client cancellation must survive after stale drain events: {err}"
         );
-        assert_eq!(engine.active_attempt_id, None);
+        assert_eq!(engine.active_attempt_id(), None);
         // Protocol poison left a follow-on done queued — Drop kills the child.
         drop(engine);
         let _ = fs::remove_dir_all(root);
@@ -2111,10 +2470,10 @@ done
             )
             .unwrap_err();
         assert!(
-            matches!(&err, ClientError::Protocol(m) if m.contains("missing attempt_id")),
-            "{err}"
+            matches!(&err, ClientError::Cancelled),
+            "malformed aborted event is dropped; valid done completes cancellation: {err}"
         );
-        assert_eq!(engine.active_attempt_id, None);
+        assert_eq!(engine.active_attempt_id(), None);
         // Protocol poison left a follow-on done queued — Drop kills the child.
         drop(engine);
         let _ = fs::remove_dir_all(root);
@@ -2159,7 +2518,7 @@ done
         assert_eq!(typed.message, "rollback failed");
         assert!(!typed.rolled_back);
         assert_eq!(typed.attempt_id, 2);
-        assert_eq!(engine.active_attempt_id, None);
+        assert_eq!(engine.active_attempt_id(), None);
         engine.unload().unwrap();
         let _ = fs::remove_dir_all(root);
     }
@@ -2199,7 +2558,7 @@ done
             )
             .unwrap_err();
         assert!(matches!(err, ClientError::Closed { .. }), "{err}");
-        assert_eq!(engine.active_attempt_id, None);
+        assert_eq!(engine.active_attempt_id(), None);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2245,7 +2604,7 @@ done
             ),
             "{err}"
         );
-        assert_eq!(engine.active_attempt_id, None);
+        assert_eq!(engine.active_attempt_id(), None);
         engine.unload().unwrap();
         let _ = fs::remove_dir_all(root);
     }
@@ -2293,7 +2652,7 @@ done
             matches!(&err, ClientError::Protocol(m) if m.contains("missing id")),
             "{err}"
         );
-        assert_eq!(engine.active_attempt_id, None);
+        assert_eq!(engine.active_attempt_id(), None);
 
         // After cancel, active clears only once drain terminal is accepted —
         // proven by successful return of Cancelled with active cleared.
@@ -2321,7 +2680,7 @@ done
         assert!(matches!(err, ClientError::Cancelled), "{err}");
         assert!(saw_active_during_callback);
         // Cleared only after terminal drain completed.
-        assert_eq!(engine.active_attempt_id, None);
+        assert_eq!(engine.active_attempt_id(), None);
         engine.unload().unwrap();
         let _ = fs::remove_dir_all(root);
     }
@@ -2369,6 +2728,10 @@ while IFS= read -r line; do
   case "$line" in
     *'"generate"'*)
       echo '{"type":"token","id":"other","text":"x","attempt_id":1}'
+      echo '{"type":"commit_ready","id":"req-w","attempt_id":1,"finish_reason":"stop"}'
+      ;;
+    *'"commit"'*)
+      echo '{"type":"done","id":"req-w","attempt_id":1,"finish_reason":"stop"}'
       ;;
     *'"unload"'*) echo '{"type":"unloaded"}'; exit 0 ;;
   esac
@@ -2376,17 +2739,17 @@ done
 "#,
         );
         let mut engine = spawn_fake_engine(&daemon);
-        let err = engine
+        let done = engine
             .generate(
                 &serde_json::json!({"type":"generate","id":"req-w","attempt_id":1}),
                 |_| Ok(()),
             )
-            .unwrap_err();
-        assert!(
-            matches!(&err, ClientError::Protocol(m) if m.contains("stale id")),
-            "{err}"
+            .expect("unknown wrong-id token is dropped and normal ready/done completes");
+        assert_eq!(
+            done.get("finish_reason").and_then(|v| v.as_str()),
+            Some("stop")
         );
-        assert_eq!(engine.active_attempt_id, None);
+        assert_eq!(engine.active_attempt_id(), None);
         drop(engine);
         let _ = fs::remove_dir_all(&root);
 
@@ -2402,6 +2765,10 @@ while IFS= read -r line; do
   case "$line" in
     *'"generate"'*)
       echo '{"type":"commit_ready","id":"other","attempt_id":2,"finish_reason":"stop"}'
+      echo '{"type":"commit_ready","id":"req-w2","attempt_id":2,"finish_reason":"stop"}'
+      ;;
+    *'"commit"'*)
+      echo '{"type":"done","id":"req-w2","attempt_id":2,"finish_reason":"stop"}'
       ;;
     *'"unload"'*) echo '{"type":"unloaded"}'; exit 0 ;;
   esac
@@ -2410,7 +2777,7 @@ done
         );
         let mut engine = spawn_fake_engine(&daemon);
         let mut callbacks = 0usize;
-        let err = engine
+        let done = engine
             .generate(
                 &serde_json::json!({"type":"generate","id":"req-w2","attempt_id":2}),
                 |_| {
@@ -2418,12 +2785,12 @@ done
                     Ok(())
                 },
             )
-            .unwrap_err();
-        assert!(
-            matches!(&err, ClientError::Protocol(m) if m.contains("stale id")),
-            "{err}"
+            .expect("unknown wrong-id commit_ready is dropped and own ready/done completes");
+        assert_eq!(
+            done.get("finish_reason").and_then(|v| v.as_str()),
+            Some("stop")
         );
-        assert_eq!(callbacks, 0);
+        assert_eq!(callbacks, 1);
         drop(engine);
         let _ = fs::remove_dir_all(&root);
 
@@ -2442,6 +2809,8 @@ while IFS= read -r line; do
       ;;
     *'"abort"'*)
       echo '{"type":"aborted","id":"other","reason":"client_cancelled","attempt_id":4}'
+      echo '{"type":"aborted","id":"req-wa","reason":"client_cancelled","attempt_id":4}'
+      echo '{"type":"done","id":"req-wa","finish_reason":"aborted","attempt_id":4}'
       ;;
     *'"unload"'*) echo '{"type":"unloaded"}'; exit 0 ;;
   esac
@@ -2456,8 +2825,8 @@ done
             )
             .unwrap_err();
         assert!(
-            matches!(&err, ClientError::Protocol(m) if m.contains("stale id")),
-            "{err}"
+            matches!(&err, ClientError::Cancelled),
+            "unknown aborted response is quarantined; client cancellation survives: {err}"
         );
         drop(engine);
         let _ = fs::remove_dir_all(root);
@@ -2567,26 +2936,276 @@ done
         let _ = fs::remove_dir_all(root);
     }
 
-    // --- helpers for pure validation tests (no real child I/O) ---
+    #[cfg(unix)]
+    #[test]
+    fn generate_concurrent_routing_isolated() {
+        let root = env::temp_dir().join(format!(
+            "hipfire-client-concurrent-{}-{}",
+            std::process::id(),
+            "conc"
+        ));
+        let log = root.join("in.log");
+        let daemon = write_fake_daemon(
+            &root,
+            &format!(
+                r#"#!/bin/sh
+LOG="{log}"
+: > "$LOG"
+n=0
+line1=""
+line2=""
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$LOG"
+  n=$((n+1))
+  if [ "$n" -eq 1 ]; then line1="$line"; continue; fi
+  if [ "$n" -eq 2 ]; then
+    line2="$line"
+    echo '{{"type":"gen_start","id":"req-a","attempt_id":1}}'
+    echo '{{"type":"gen_start","id":"req-b","attempt_id":2}}'
+    echo '{{"type":"token","id":"req-a","attempt_id":1,"text":"a1"}}'
+    echo '{{"type":"token","id":"req-b","attempt_id":2,"text":"b1"}}'
+    echo '{{"type":"commit_ready","id":"req-a","attempt_id":1,"finish_reason":"stop"}}'
+    echo '{{"type":"commit_ready","id":"req-b","attempt_id":2,"finish_reason":"stop"}}'
+    continue
+  fi
+  case "$line" in
+    *'"type":"commit"'*)
+      if echo "$line" | grep -q "req-a"; then
+        echo '{{"type":"done","id":"req-a","attempt_id":1,"finish_reason":"stop"}}'
+      else
+        echo '{{"type":"done","id":"req-b","attempt_id":2,"finish_reason":"stop"}}'
+      fi
+      ;;
+    *'"unload"'*) echo '{{"type":"unloaded"}}'; exit 0 ;;
+  esac
+done
+"#,
+                log = log.display()
+            ),
+        );
+        let engine = std::sync::Arc::new(spawn_fake_engine(&daemon));
+        let engine_a = std::sync::Arc::clone(&engine);
+        let engine_b = std::sync::Arc::clone(&engine);
+        let handle_a = std::thread::spawn(move || {
+            let mut tokens = Vec::new();
+            let done = engine_a
+                .generate(
+                    &serde_json::json!({"type":"generate","id":"req-a","attempt_id":1}),
+                    |ev| {
+                        if let Some(text) = ev.get("text").and_then(|v| v.as_str()) {
+                            tokens.push(text.to_owned());
+                        }
+                        Ok(())
+                    },
+                )
+                .expect("req-a generate ok");
+            (tokens, done)
+        });
+        let handle_b = std::thread::spawn(move || {
+            let mut tokens = Vec::new();
+            let done = engine_b
+                .generate(
+                    &serde_json::json!({"type":"generate","id":"req-b","attempt_id":2}),
+                    |ev| {
+                        if let Some(text) = ev.get("text").and_then(|v| v.as_str()) {
+                            tokens.push(text.to_owned());
+                        }
+                        Ok(())
+                    },
+                )
+                .expect("req-b generate ok");
+            (tokens, done)
+        });
+        let (tokens_a, done_a) = handle_a.join().expect("thread a");
+        let (tokens_b, done_b) = handle_b.join().expect("thread b");
+        assert_eq!(
+            tokens_a,
+            vec!["a1"],
+            "req-a should receive only its own token"
+        );
+        assert_eq!(
+            tokens_b,
+            vec!["b1"],
+            "req-b should receive only its own token"
+        );
+        assert_eq!(done_a.get("id").and_then(|v| v.as_str()), Some("req-a"));
+        assert_eq!(done_b.get("id").and_then(|v| v.as_str()), Some("req-b"));
+        // Ensure no cross-routing: each done id matches its request.
+        drop(engine);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generate_stale_unknown_is_quarantined_not_routed() {
+        let root = env::temp_dir().join(format!(
+            "hipfire-client-stale-{}-{}",
+            std::process::id(),
+            "stale"
+        ));
+        let daemon = write_fake_daemon(
+            &root,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"generate"'*)
+      # Unknown keyed lifecycle is quarantined, not broadcast into this request.
+      echo '{"type":"token","id":"other","attempt_id":1,"text":"bad"}'
+      echo '{"type":"commit_ready","id":"req-s","attempt_id":1,"finish_reason":"stop"}'
+      ;;
+    *'"commit"'*) echo '{"type":"done","id":"req-s","attempt_id":1,"finish_reason":"stop"}' ;;
+    *'"abort"'*)
+      echo '{"type":"aborted","id":"req-s","reason":"client_cancelled","attempt_id":1}'
+      echo '{"type":"done","id":"req-s","finish_reason":"aborted","attempt_id":1}'
+      ;;
+    *'"unload"'*) echo '{"type":"unloaded"}'; exit 0 ;;
+  esac
+done
+"#,
+        );
+        let engine = spawn_fake_engine(&daemon);
+        let done = engine
+            .generate(
+                &serde_json::json!({"type":"generate","id":"req-s","attempt_id":1}),
+                |_| Ok(()),
+            )
+            .expect("unknown stale lane must not poison this request");
+        assert_eq!(
+            done.get("finish_reason").and_then(|v| v.as_str()),
+            Some("stop")
+        );
+        drop(engine);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_idless_error_reaches_control_plane() {
+        let root = env::temp_dir().join(format!(
+            "hipfire-client-idless-err-{}-{}",
+            std::process::id(),
+            "idless"
+        ));
+        let daemon = write_fake_daemon(
+            &root,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"load"'*)
+      # Control-plane error intentionally omits generation id.
+      echo '{"type":"error","message":"bad model","class":"validation","retryable":false,"rolled_back":false,"attempt_id":0}'
+      ;;
+    *'"unload"'*) echo '{"type":"unloaded"}'; exit 0 ;;
+  esac
+done
+"#,
+        );
+        let engine = spawn_fake_engine(&daemon);
+        let err = engine
+            .load(std::path::Path::new("/tmp/model"), serde_json::json!({}))
+            .unwrap_err();
+        let typed = err.typed_daemon().expect("typed control error");
+        assert_eq!(typed.message, "bad model");
+        assert_eq!(typed.class, error_class::VALIDATION);
+        drop(engine);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generate_keyed_error_isolated_from_control() {
+        let root = env::temp_dir().join(format!(
+            "hipfire-client-keyed-err-{}-{}",
+            std::process::id(),
+            "keyed"
+        ));
+        let daemon = write_fake_daemon(
+            &root,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"generate"'*)
+      echo '{"type":"error","id":"req-k","message":"gen boom","class":"internal","retryable":false,"rolled_back":false,"attempt_id":5}'
+      ;;
+    *'"ping"'*) echo '{"type":"pong"}' ;;
+    *'"unload"'*) echo '{"type":"unloaded"}'; exit 0 ;;
+  esac
+done
+"#,
+        );
+        let engine = spawn_fake_engine(&daemon);
+        let err = engine
+            .generate(
+                &serde_json::json!({"type":"generate","id":"req-k","attempt_id":5}),
+                |_| Ok(()),
+            )
+            .unwrap_err();
+        let typed = err.typed_daemon().expect("generation error");
+        assert_eq!(typed.message, "gen boom");
+        assert_eq!(typed.id.as_deref(), Some("req-k"));
+        assert_eq!(typed.attempt_id, 5);
+        // Control plane remains healthy after a keyed generation error.
+        engine.ping().expect("control not poisoned by keyed error");
+        drop(engine);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generate_malformed_token_not_broadcast_to_live_request() {
+        let root = env::temp_dir().join(format!(
+            "hipfire-client-malformed-token-{}-{}",
+            std::process::id(),
+            "mft"
+        ));
+        let daemon = write_fake_daemon(
+            &root,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"generate"'*)
+      # Unkeyed/malformed lifecycle must be dropped, not fanned out.
+      echo '{"type":"token","text":"poison","attempt_id":1}'
+      echo '{"type":"token","id":"","text":"poison2","attempt_id":1}'
+      echo '{"type":"token","id":"req-m","text":"poison3","attempt_id":"1"}'
+      echo '{"type":"commit_ready","id":"req-m","attempt_id":1,"finish_reason":"stop"}'
+      ;;
+    *'"commit"'*) echo '{"type":"done","id":"req-m","attempt_id":1,"finish_reason":"stop"}' ;;
+    *'"unload"'*) echo '{"type":"unloaded"}'; exit 0 ;;
+  esac
+done
+"#,
+        );
+        let engine = spawn_fake_engine(&daemon);
+        let mut tokens = Vec::new();
+        let done = engine
+            .generate(
+                &serde_json::json!({"type":"generate","id":"req-m","attempt_id":1}),
+                |ev| {
+                    if let Some(text) = ev.get("text").and_then(|v| v.as_str()) {
+                        tokens.push(text.to_owned());
+                    }
+                    Ok(())
+                },
+            )
+            .expect("malformed tokens must not poison the live request");
+        assert!(
+            tokens.is_empty(),
+            "malformed tokens must not reach the callback: {tokens:?}"
+        );
+        assert_eq!(
+            done.get("finish_reason").and_then(|v| v.as_str()),
+            Some("stop")
+        );
+        drop(engine);
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[cfg(unix)]
     fn dummy_child() -> Child {
-        use std::os::unix::fs::PermissionsExt;
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static N: AtomicU64 = AtomicU64::new(0);
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        let root = env::temp_dir().join(format!(
-            "hipfire-client-dummy-child-{}-{}",
-            std::process::id(),
-            n
-        ));
-        let _ = fs::create_dir_all(&root);
-        let path = root.join("sleep");
-        // Tiny forever-reader so Drop kill is clean.
-        // Unique path per call avoids ETXTBSY when tests race on rewrite.
-        fs::write(&path, "#!/bin/sh\ncat >/dev/null\n").unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-        Command::new(&path)
+        // A system executable avoids racing a prior test process that still
+        // has a generated script open, which can make spawn fail with ETXTBSY.
+        Command::new("cat")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -2617,7 +3236,7 @@ done
         child.stdin.take().expect("stdin")
     }
 
-    fn dummy_stdout() -> ChildStdout {
+    fn dummy_stdout() -> std::process::ChildStdout {
         let mut child = Command::new("true")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

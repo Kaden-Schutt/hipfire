@@ -62,7 +62,10 @@ fn compile(args: Vec<OsString>) -> Result<(), Box<dyn Error>> {
     let mut defines = Vec::new();
     let mut extra_args = Vec::new();
     let mut inspect = true;
-    let mut fast_math = false;
+    // Preserve the existing hipfire/Redline arithmetic contract. Strict math
+    // remains available through --no-fast-math, but beta integration must not
+    // silently change emitted kernels.
+    let mut fast_math = true;
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
         match arg.to_str() {

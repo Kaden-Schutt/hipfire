@@ -1,0 +1,27 @@
+=== __shfl width32 counts ===
+kernels/src/deepseek4_attn_swa_batched.hip:1
+kernels/src/deepseek4_attn_swa_batched_debug.hip:0
+kernels/src/deepseek4_attn_swa_buf.hip:1
+kernels/src/deepseek4_attn_swa_topk_batched.hip:1
+kernels/src/deepseek4_attn_swa_topk_batched_wmma.hip:0
+kernels/src/deepseek4_attn_swa_topk_buf.hip:1
+kernels/src/deepseek4_attn_swa_topk_direct_batched.hip:1
+kernels/src/deepseek4_attn_swa_topk_direct_wmma.hip:0
+=== broader shfl 32 ===
+kernels/src/deepseek4_attn_swa_batched.hip:138:        ws += __shfl(thread_sum, src, 32);
+kernels/src/deepseek4_attn_swa_buf.hip:120:        ws += __shfl(thread_sum, src, 32);
+kernels/src/deepseek4_attn_swa_topk_batched.hip:172:    // upper-half partials would be dropped. __shfl(v, src, 32) requires
+kernels/src/deepseek4_attn_swa_topk_batched.hip:187:        ws += __shfl(thread_sum, src, 32);
+kernels/src/deepseek4_attn_swa_topk_buf.hip:134:        ws += __shfl(thread_sum, src, 32);
+kernels/src/deepseek4_attn_swa_topk_buf.hip:277:        warp_sum += __shfl(thread_sum, source, 32);
+kernels/src/deepseek4_attn_swa_topk_buf.hip:480:        warp_sum += __shfl(thread_sum, source, 32);
+kernels/src/deepseek4_attn_swa_topk_buf.hip:639:        warp_sum += __shfl(thread_sum, source, 32);
+kernels/src/deepseek4_attn_swa_topk_direct_batched.hip:134:        ws += __shfl(thread_sum, src, 32);
+593:            partial += __shfl_down(partial, offset, 32);
+670:            partial += __shfl_down(partial, offset, 32);
+=== MfmaGfx942 ===
+1401:    MfmaGfx942,
+1429:        GroupedLloydVariant::MfmaGfx942
+1484:        V::MfmaGfx942 => gpu.gemm_mq2g256_lloyd_moe_grouped_mfma_gfx942(
+=== dirty count ===
+33

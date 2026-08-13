@@ -63,6 +63,43 @@ impl Gpu {
         }
     }
 
+    /// Q8 embedding lookup driven by a device token-id scalar, broadcasting
+    /// the dequantized row into `copies` contiguous output rows. Typed for
+    /// retained replay so the token id remains dynamic across PM4 launches.
+    pub fn embedding_lookup_q8_buf_broadcast(
+        &mut self,
+        table: &GpuTensor,
+        output: &GpuTensor,
+        token_id_buf: &GpuTensor,
+        dim: usize,
+        copies: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let logical_name = "embedding_q8_buf_broadcast";
+        self.ensure_kernel(logical_name, kernels::EMBEDDING_Q8_SRC, logical_name)?;
+        let tp = table.buf.as_ptr();
+        let op = output.buf.as_ptr();
+        let idp = token_id_buf.buf.as_ptr();
+        let mut d = dim as i32;
+        let mut n = copies as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &tp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &idp as *const _ as *mut c_void,
+            &mut d as *mut _ as *mut c_void,
+            &mut n as *mut _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(logical_name, [1, 1, 1], [256, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(tp);
+            b.push_ptr(op);
+            b.push_ptr(idp);
+            b.push_i32(d);
+            b.push_i32(n);
+            b
+        })
+    }
+
     /// Q4_K embedding lookup: dequantize one row on GPU, output F32.
     /// table is raw Q4_K bytes on GPU, output is [dim] F32.
     pub fn embedding_lookup_q4k(
@@ -324,5 +361,50 @@ impl Gpu {
                 &mut params,
             )
         }
+    }
+
+    /// Batched HFQ4-G128 embedding lookup. `output` is `[n × dim]` row-major
+    /// and `token_ids` is a device-resident i32-compatible buffer.
+    pub fn embedding_lookup_hfq4g128_batched(
+        &mut self,
+        table: &GpuTensor,
+        output: &GpuTensor,
+        token_ids: &GpuTensor,
+        n: usize,
+        dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "embedding_hfq4g128_batched",
+            kernels::EMBEDDING_HFQ4G128_BATCHED_SRC,
+            "embedding_hfq4g128_batched",
+        )?;
+
+        let mut tp = table.buf.as_ptr();
+        let mut op = output.buf.as_ptr();
+        let mut tidp = token_ids.buf.as_ptr();
+        let mut d = dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut tp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut tidp as *mut _ as *mut c_void,
+            &mut d as *mut _ as *mut c_void,
+        ];
+
+        self.launch_maybe_blob(
+            "embedding_hfq4g128_batched",
+            [n as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(tp);
+                b.push_ptr(op);
+                b.push_ptr(tidp);
+                b.push_i32(d);
+                b
+            },
+        )
     }
 }

@@ -1,0 +1,36 @@
+{"type":"pong"}
+{"type":"loaded","arch":"deepseek4","dim":0,"layers":0,"vocab":0,"vl":false,"cache_capable":true,"retry_reset_eligible":false}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-off-control-32","text":"# T","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-off-control-32","text":"e","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-off-control-32","text":"chnic","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-off-control-32","text":"al","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-off-control-32","text":" S","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-off-control-32","text":"pe","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-off-control-32","text":"c","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-off-control-32","text":"ificat","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-off-control-32","text":"ion","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-off-control-32","text":":","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-off-control-32","text":" ","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-off-control-32","text":"Dee","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-off-control-32","text":"pSee","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-off-control-32","text":"k V","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-off-control-32","text":"4 F","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-off-control-32","text":"l","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-off-control-32","text":"ash ","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-off-control-32","text":"Mo3E on AMD","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-off-control-32","text":" M","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-off-control-32","text":"I300","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-off-control-32","text":"X ","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-off-control-32","text":"– P","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-off-control-32","text":"rod","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-off-control-32","text":"uction-Grade","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-off-control-32","text":" A","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-off-control-32","text":"R ","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-off-control-32","text":"Decode Mea","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-off-control-32","text":"sur","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-off-control-32","text":"ement","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-off-control-32","text":"\n\n**Discl","attempt_id":1}
+{"type":"token","id":"g0-gfx942-route-v1-grouped-off-control-32","text":"aimer:** This document","attempt_id":1}
+{"type":"commit_ready","id":"g0-gfx942-route-v1-grouped-off-control-32","tokens":32,"tok_s":27.923211169284468,"prompt_tokens":2052,"prefill_tokens":2052,"cached_tokens":0,"prefill_ms":13895,"total_ms":15041,"finish_reason":"length","drafter":"ar","attempt_id":1}
+{"type":"aborted","id":"g0-gfx942-route-v1-grouped-off-control-32","reason":"client_cancelled","attempt_id":1}
+{"type":"done","id":"g0-gfx942-route-v1-grouped-off-control-32","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":32,"prefill_ms":0,"decode_ms":0,"attempt_id":1}

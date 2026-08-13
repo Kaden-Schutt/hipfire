@@ -1,0 +1,17 @@
+{"type":"pong"}
+{"type":"loaded","arch":"deepseek4","dim":0,"layers":0,"vocab":0,"vl":false,"cache_capable":true,"retry_reset_eligible":false}
+{"type":"token","id":"g0-pwarm-A-20260801T171818Z","text":": # Produc","attempt_id":1}
+{"type":"token","id":"g0-pwarm-A-20260801T171818Z","text":"tion-Grad","attempt_id":1}
+{"type":"token","id":"g0-pwarm-A-20260801T171818Z","text":"e Me","attempt_id":1}
+{"type":"token","id":"g0-pwarm-A-20260801T171818Z","text":"asure","attempt_id":1}
+{"type":"token","id":"g0-pwarm-A-20260801T171818Z","text":"me","attempt_id":1}
+{"type":"token","id":"g0-pwarm-A-20260801T171818Z","text":"nt","attempt_id":1}
+{"type":"token","id":"g0-pwarm-A-20260801T171818Z","text":" C","attempt_id":1}
+{"type":"token","id":"g0-pwarm-A-20260801T171818Z","text":"o","attempt_id":1}
+{"type":"token","id":"g0-pwarm-A-20260801T171818Z","text":"ntract","attempt_id":1}
+{"type":"token","id":"g0-pwarm-A-20260801T171818Z","text":" f","attempt_id":1}
+{"type":"token","id":"g0-pwarm-A-20260801T171818Z","text":"or D","attempt_id":1}
+{"type":"token","id":"g0-pwarm-A-20260801T171818Z","text":"eepSeek V4 Flash-Style","attempt_id":1}
+{"type":"commit_ready","id":"g0-pwarm-A-20260801T171818Z","tokens":16,"tok_s":2.303484019579614,"prompt_tokens":2052,"prefill_tokens":2052,"cached_tokens":0,"prefill_ms":20837,"total_ms":27783,"finish_reason":"length","drafter":"ar","attempt_id":1}
+{"type":"aborted","id":"g0-pwarm-A-20260801T171818Z","reason":"client_cancelled","attempt_id":1}
+{"type":"done","id":"g0-pwarm-A-20260801T171818Z","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":16,"prefill_ms":0,"decode_ms":0,"attempt_id":1}

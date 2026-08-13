@@ -1,0 +1,64 @@
+GPU dev 0: gfx942 (205.8 GB VRAM, HIP 7.14)
+  pre-compiled kernels: /mnt/scratch/hipfire-kernels/rocm714/gfx942
+[rocblas] loaded for gfx942
+deepseek4: MQ2R P3 tensor recipe verified; selected exact gfx942 backend (554 E8 tensors; routed experts qt=19)
+deepseek4 gfx942 A2 levers: L1 compressor_gate=OFF (HIPFIRE_DEEPSEEK4_GFX942_COMPRESSOR_GATE default OFF, =1 enables) ; L3 e8_wo_grouped=ON (gfx942-v1 default ON, HIPFIRE_DEEPSEEK4_GFX942_E8_WO_GROUPED=0 disables) ; L2 hc_finalize_fused=OFF (default OFF, HIPFIRE_DEEPSEEK4_GFX942_HC_FINALIZE_FUSED=1 enables) ; F1 indexer_topk_parallel=ON (gfx942-v1 default ON, HIPFIRE_DEEPSEEK4_GFX942_INDEXER_TOPK_PARALLEL=0 disables) ; C1 ffn_overlap=ON (default OFF, HIPFIRE_DEEPSEEK4_GFX942_FFN_OVERLAP=1 enables)
+hipfire bench
+  model:  /mnt/scratch/models/deepseek-v4-flash-mq2r/deepseek-v4-flash.mq2r
+  arch:   deepseek4
+  gpu:    gfx942
+  runs:   1
+  max_tokens: 32
+[DeepSeek V4] FFN overlap resources ready
+[daemon-control] received commit for id=chatcmpl-157354-1 attempt_id=1
+[req chatcmpl-157354-1] drafter=ar tau=1.00 tok/s=10.9 decode (9 tok, autoregressive)
+[daemon-control] received commit for id=chatcmpl-157354-2 attempt_id=1
+[req chatcmpl-157354-2] drafter=ar tau=1.00 tok/s=31.1 decode (32 tok, autoregressive)
+.
+{
+  "protocol": "native-generate-v1",
+  "model": "/mnt/scratch/models/deepseek-v4-flash-mq2r/deepseek-v4-flash.mq2r",
+  "loaded": {
+    "type": "loaded",
+    "arch": "deepseek4",
+    "dim": 0,
+    "layers": 0,
+    "vocab": 0,
+    "vl": false,
+    "cache_capable": true,
+    "retry_reset_eligible": false
+  },
+  "gpu": {
+    "type": "diag",
+    "arch": "gfx942",
+    "hip_version": "7.14",
+    "vram_free_mb": 113856,
+    "vram_total_mb": 196288,
+    "model_loaded": true,
+    "model_arch": "deepseek4",
+    "kernels": 0,
+    "kernel_hashes": 0
+  },
+  "vram_free_before_mb": 195828,
+  "max_tokens": 32,
+  "runs": 1,
+  "batch": 1,
+  "decode_tok_s": null,
+  "prefill_tok_s": null,
+  "wall_tok_s": {
+    "median": 31.1284046692607,
+    "mean": 31.1284046692607,
+    "min": 31.1284046692607,
+    "max": 31.1284046692607,
+    "stdev": 0.0
+  },
+  "ttft_ms": null,
+  "samples": {
+    "decode": [],
+    "prefill": [],
+    "wall": [
+      31.1284046692607
+    ],
+    "ttft_ms": []
+  }
+}

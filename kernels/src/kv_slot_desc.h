@@ -53,3 +53,29 @@ __device__ __forceinline__ KvSlotDesc kv_slot_legacy(int seq_len, int max_seq)
     s.cap = max_seq;
     return s;
 }
+
+// Legacy fallback for kernels that also honour the pre-descriptor
+// independent-sequence contract: a NEGATIVE `max_seq` whose magnitude is one
+// lane's token capacity, with batch row `row` reading only its own
+// `[row * cap, (row + 1) * cap)` slice of a lane-major arena. Folding that
+// base into the synthesised descriptor keeps those kernels on the single
+// kv_offset_for_*() address path instead of branching at every KV read.
+// A positive `max_seq` reproduces `kv_slot_legacy` exactly (base 0, shared
+// cache), so sequential prefill stays byte-for-byte unchanged.
+__device__ __forceinline__ KvSlotDesc kv_slot_legacy_lane(
+    int seq_len, int max_seq, int row, int per_pos_bytes)
+{
+    const bool independent = max_seq < 0;
+    const int lane_capacity = independent ? -max_seq : max_seq;
+    const unsigned long long lane_bytes =
+        (unsigned long long)lane_capacity * (unsigned long long)per_pos_bytes;
+    const unsigned long long base =
+        independent ? (unsigned long long)row * lane_bytes : 0ULL;
+
+    KvSlotDesc s;
+    s.k_base = base;
+    s.v_base = base;
+    s.seq_len = seq_len;
+    s.cap = lane_capacity;
+    return s;
+}
