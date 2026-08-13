@@ -80,9 +80,11 @@ max_concurrency, cap_tokens, host_budget_bytes, swap_dir })`, then `k` calls to
 `Event::Token` until `Event::Done`. `EngineStats` supplies
 `prefix_hits`/`evictions`/`restores`.
 
-**`DaemonBatchDriver`** — spawns the daemon with `continuous_batch_size =
-max_concurrency` in `ProcessConfig` (it is fixed at configure time, so it
-cannot vary per point), then **pipelines**: `Engine::send()` all `k` requests
+**`DaemonBatchDriver`** — loads the model with `continuous_batch_size =
+max_concurrency` in the **load params** (`main.rs:5356` is the existing call
+site; the daemon answers `continuous_batch_capable` in the load reply). It is
+fixed per load, so varying it means reloading the model — which is what forces
+the fixed-max sweep below. Then **pipelines**: `Engine::send()` all `k` requests
 before reading, then `recv()` interleaved frames, correlating by request id.
 `Engine::generate()` is unusable here — it is request/response and would
 serialise the very thing under test. Each request carries
@@ -189,8 +191,8 @@ run this model" is exactly the kind of finding this tool exists to surface.
 
 ## Risks
 
-- **`continuous_batch_size` is configure-time.** Holding it at max and varying
-  `k` is the design's core compromise. If beta's scheduler behaves differently
+- **`continuous_batch_size` is fixed per model load.** Holding it at max and
+  varying `k` is the design's core compromise. If beta's scheduler behaves differently
   at `max_batch=4, k=2` than at `max_batch=2, k=2`, this sweep will not see it.
   A `--reconfigure-per-point` mode is the fallback, at one model load per
   point; deliberately deferred as YAGNI until the fixed-max numbers look wrong.
