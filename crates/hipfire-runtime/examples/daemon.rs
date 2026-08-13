@@ -30285,6 +30285,426 @@ fn glimmer_commit_terminal(
     }
 }
 
+/// Request-local profitability controller for Muse Glimmer speculative serve.
+///
+/// Pure integer state machine: no GPU, no allocation, no float in the decision path.
+/// Caller feeds only eligible full windows (invalid/terminal/truncated already filtered).
+/// First eligible window is an untimed warmup AR B=1; every subsequent disjoint group of
+/// four eligible windows requests one measured B=1 probe. Retirement is sticky for this
+/// object; the next request constructs a fresh controller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GlimmerProfitProbeKind {
+    None,
+    /// Untimed useful B=1 after the first eligible window; excluded from evaluation.
+    Warmup,
+    /// Timed B=1 after four measured eligible windows.
+    Measured,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GlimmerProfitGuardStatus {
+    Disabled,
+    Warming,
+    Monitoring,
+    Retired,
+}
+
+/// Frozen policy constants (not knobs).
+const GLIMMER_PROFIT_WARMUP_WINDOWS: u32 = 1;
+const GLIMMER_PROFIT_WINDOWS_PER_EVAL: u32 = 4;
+const GLIMMER_PROFIT_BAD_NUM: u128 = 105; // ratio >= 1.05
+const GLIMMER_PROFIT_GOOD_NUM: u128 = 98; // ratio <= 0.98
+const GLIMMER_PROFIT_RATIO_DEN: u128 = 100;
+const GLIMMER_PROFIT_BAD_TO_RETIRE: u32 = 2;
+
+#[derive(Debug, Clone)]
+struct GlimmerSpecProfitGuard {
+    enabled: bool,
+    retired: bool,
+    warmup_done: bool,
+    /// Eligible full windows observed (warmup + measured), excluding ignored zeros.
+    eligible_windows: u32,
+    /// Windows accumulated in the current post-warmup evaluation group (0..4).
+    group_windows: u32,
+    sum_spec_ns: u128,
+    sum_productive: u128,
+    pending_probe: GlimmerProfitProbeKind,
+    /// Completed measured evaluations.
+    evaluations: u32,
+    bad_evaluations: u32,
+    /// Last measured evaluation inputs (telemetry only).
+    last_spec_ns: u128,
+    last_productive: u128,
+    last_ar_probe_ns: u128,
+    /// Last ratio as milli-units S*1000/(A*P) when defined; else 0. Telemetry only.
+    last_ratio_milli: u128,
+    /// Evaluation index (1-based) at which retirement latched; 0 if not retired.
+    retire_evaluation: u32,
+    /// `eligible_windows` snapshot at retirement; 0 if not retired.
+    retire_cycle: u32,
+}
+
+impl GlimmerSpecProfitGuard {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            retired: false,
+            warmup_done: false,
+            eligible_windows: 0,
+            group_windows: 0,
+            sum_spec_ns: 0,
+            sum_productive: 0,
+            pending_probe: GlimmerProfitProbeKind::None,
+            evaluations: 0,
+            bad_evaluations: 0,
+            last_spec_ns: 0,
+            last_productive: 0,
+            last_ar_probe_ns: 0,
+            last_ratio_milli: 0,
+            retire_evaluation: 0,
+            retire_cycle: 0,
+        }
+    }
+
+    fn status(&self) -> GlimmerProfitGuardStatus {
+        if !self.enabled {
+            GlimmerProfitGuardStatus::Disabled
+        } else if self.retired {
+            GlimmerProfitGuardStatus::Retired
+        } else if !self.warmup_done {
+            GlimmerProfitGuardStatus::Warming
+        } else {
+            GlimmerProfitGuardStatus::Monitoring
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    fn is_retired(&self) -> bool {
+        self.retired
+    }
+
+    fn evaluations(&self) -> u32 {
+        self.evaluations
+    }
+
+    fn bad_evaluations(&self) -> u32 {
+        self.bad_evaluations
+    }
+
+    fn eligible_windows(&self) -> u32 {
+        self.eligible_windows
+    }
+
+    fn pending_probe(&self) -> GlimmerProfitProbeKind {
+        self.pending_probe
+    }
+
+    fn last_spec_ns(&self) -> u128 {
+        self.last_spec_ns
+    }
+
+    fn last_productive(&self) -> u128 {
+        self.last_productive
+    }
+
+    fn last_ar_probe_ns(&self) -> u128 {
+        self.last_ar_probe_ns
+    }
+
+    fn last_ratio_milli(&self) -> u128 {
+        self.last_ratio_milli
+    }
+
+    fn retire_evaluation(&self) -> u32 {
+        self.retire_evaluation
+    }
+
+    fn retire_cycle(&self) -> u32 {
+        self.retire_cycle
+    }
+
+    /// Observe one eligible full speculative window.
+    ///
+    /// `spec_ns` is the synchronized draft+verify(+commit tail) cost; `productive_rows`
+    /// is keep_rows (== accepted+1). Zero time or zero rows are ignored and never become
+    /// evidence. While a probe is outstanding, further windows are ignored until
+    /// `observe_probe` clears the latch.
+    fn observe_full_window(
+        &mut self,
+        spec_ns: u128,
+        productive_rows: usize,
+    ) -> GlimmerProfitProbeKind {
+        if !self.enabled || self.retired {
+            return GlimmerProfitProbeKind::None;
+        }
+        if !matches!(self.pending_probe, GlimmerProfitProbeKind::None) {
+            return GlimmerProfitProbeKind::None;
+        }
+        if spec_ns == 0 || productive_rows == 0 {
+            return GlimmerProfitProbeKind::None;
+        }
+
+        self.eligible_windows = self.eligible_windows.saturating_add(1);
+
+        if !self.warmup_done {
+            // First eligible window: request untimed useful AR B=1; exclude from S/P.
+            let _ = GLIMMER_PROFIT_WARMUP_WINDOWS; // frozen = 1
+            self.warmup_done = true;
+            self.pending_probe = GlimmerProfitProbeKind::Warmup;
+            return GlimmerProfitProbeKind::Warmup;
+        }
+
+        self.sum_spec_ns = self.sum_spec_ns.saturating_add(spec_ns);
+        self.sum_productive = self.sum_productive.saturating_add(productive_rows as u128);
+        self.group_windows = self.group_windows.saturating_add(1);
+
+        if self.group_windows >= GLIMMER_PROFIT_WINDOWS_PER_EVAL {
+            self.pending_probe = GlimmerProfitProbeKind::Measured;
+            return GlimmerProfitProbeKind::Measured;
+        }
+        GlimmerProfitProbeKind::None
+    }
+
+    /// Record the AR B=1 probe that followed a prior `observe_full_window` request.
+    ///
+    /// Warmup probes are discarded (no evaluation). Measured probes compare
+    /// `S*100` against `A*P*{105,98}` with saturating/checked integer arithmetic only.
+    /// Zero probe time or zero accumulated rows/time is not evidence.
+    fn observe_probe(&mut self, ar_probe_ns: u128) {
+        if !self.enabled || self.retired {
+            return;
+        }
+        match self.pending_probe {
+            GlimmerProfitProbeKind::None => {}
+            GlimmerProfitProbeKind::Warmup => {
+                self.pending_probe = GlimmerProfitProbeKind::None;
+            }
+            GlimmerProfitProbeKind::Measured => {
+                self.pending_probe = GlimmerProfitProbeKind::None;
+                let s = self.sum_spec_ns;
+                let p = self.sum_productive;
+                // Clear the group whether or not this sample is evidence so cadence
+                // cannot stall on a zero probe.
+                self.sum_spec_ns = 0;
+                self.sum_productive = 0;
+                self.group_windows = 0;
+
+                if ar_probe_ns == 0 || p == 0 || s == 0 {
+                    return;
+                }
+
+                self.last_spec_ns = s;
+                self.last_productive = p;
+                self.last_ar_probe_ns = ar_probe_ns;
+                // Telemetry-only milli-ratio; never used for the decision.
+                if let Some(den) = ar_probe_ns.checked_mul(p) {
+                    if den > 0 {
+                        self.last_ratio_milli = s.saturating_mul(1000) / den;
+                    }
+                }
+
+                self.evaluations = self.evaluations.saturating_add(1);
+
+                // bad iff S*100 >= A*P*105; good iff S*100 <= A*P*98; else deadband.
+                let left = match s.checked_mul(GLIMMER_PROFIT_RATIO_DEN) {
+                    Some(v) => v,
+                    None => u128::MAX, // overflow => treat as extremely unprofitable
+                };
+                let ap = match ar_probe_ns.checked_mul(p) {
+                    Some(v) => v,
+                    None => {
+                        // Denominator overflow: cannot form a finite ratio safely; skip.
+                        return;
+                    }
+                };
+                let bad_right = match ap.checked_mul(GLIMMER_PROFIT_BAD_NUM) {
+                    Some(v) => v,
+                    None => u128::MAX,
+                };
+                let good_right = match ap.checked_mul(GLIMMER_PROFIT_GOOD_NUM) {
+                    Some(v) => v,
+                    None => u128::MAX,
+                };
+
+                if left >= bad_right {
+                    self.bad_evaluations = self.bad_evaluations.saturating_add(1);
+                    if self.bad_evaluations >= GLIMMER_PROFIT_BAD_TO_RETIRE {
+                        self.retired = true;
+                        self.retire_evaluation = self.evaluations;
+                        self.retire_cycle = self.eligible_windows;
+                    }
+                } else if left <= good_right {
+                    self.bad_evaluations = 0;
+                }
+                // deadband: retain bad_evaluations
+            }
+        }
+    }
+}
+
+/// Capture-aware one-token target step used by AR, profit probes, and
+/// `HIPFIRE_GLIMMER_SPEC_FALLBACK=1` recovery. Mutates only target KV/capture/logits
+/// and RNG — never Harmony routing, mirrors, or generation counters.
+fn glimmer_ar_forward_pending(
+    bundle: &mut hipfire_loader::MuseGlimmerBundle,
+    gpu: &mut rdna_compute::Gpu,
+    token: u32,
+    temp: f32,
+    top_p: f32,
+    top_k: Option<u32>,
+    gpu_sample: bool,
+    gpu_rng: u32,
+    host_rng: &mut deepseek4::sampling::Xorshift,
+) -> Result<(u32, u32), String> {
+    let position = bundle.state.n_tokens as u32;
+    let top_k_host = top_k.map(|k| k as usize).unwrap_or(0);
+    let has_drafter = bundle.drafter.is_some();
+    let device_capture = has_drafter && bundle.device_hidden_capture_enabled();
+    if has_drafter {
+        if device_capture {
+            if gpu_sample {
+                glimmer::forward::decode_step_sampled_with_device_capture(
+                    &bundle.config,
+                    &bundle.weights,
+                    &mut bundle.state,
+                    gpu,
+                    token,
+                    position,
+                    temp,
+                    top_p,
+                    top_k,
+                    gpu_rng,
+                )
+            } else {
+                glimmer::forward::decode_step_with_device_capture(
+                    &bundle.config,
+                    &bundle.weights,
+                    &mut bundle.state,
+                    gpu,
+                    token,
+                    position,
+                )
+                .map(|logits| {
+                    let tok = deepseek4::sampling::sample_token(
+                        &logits, temp, top_k_host, top_p, host_rng,
+                    );
+                    (tok, gpu_rng)
+                })
+            }
+        } else if gpu_sample {
+            let tap = glimmer_tap_layers(bundle.config.n_layers);
+            glimmer::forward::decode_step_sampled_with_capture(
+                &bundle.config,
+                &bundle.weights,
+                &mut bundle.state,
+                gpu,
+                token,
+                position,
+                &tap,
+                &mut bundle.target_hidden_host,
+                temp,
+                top_p,
+                top_k,
+                gpu_rng,
+            )
+        } else {
+            let tap = glimmer_tap_layers(bundle.config.n_layers);
+            glimmer::forward::decode_step_with_capture(
+                &bundle.config,
+                &bundle.weights,
+                &mut bundle.state,
+                gpu,
+                token,
+                position,
+                &tap,
+                &mut bundle.target_hidden_host,
+            )
+            .map(|logits| {
+                let tok =
+                    deepseek4::sampling::sample_token(&logits, temp, top_k_host, top_p, host_rng);
+                (tok, gpu_rng)
+            })
+        }
+    } else if gpu_sample {
+        glimmer::forward::decode_step_sampled(
+            &bundle.config,
+            &bundle.weights,
+            &mut bundle.state,
+            gpu,
+            token,
+            position,
+            temp,
+            top_p,
+            top_k,
+            gpu_rng,
+        )
+    } else {
+        glimmer::forward::decode_step(
+            &bundle.config,
+            &bundle.weights,
+            &mut bundle.state,
+            gpu,
+            token,
+            position,
+        )
+        .map(|logits| {
+            let tok = deepseek4::sampling::sample_token(&logits, temp, top_k_host, top_p, host_rng);
+            (tok, gpu_rng)
+        })
+    }
+}
+
+/// Pure post-window ledger: bonus already routed, not yet in KV/capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GlimmerProfitLedger {
+    mirror_len: usize,
+    state_n_tokens: usize,
+}
+
+fn glimmer_profit_ledger_post_window(commit_end: usize) -> GlimmerProfitLedger {
+    GlimmerProfitLedger {
+        mirror_len: commit_end.saturating_add(1),
+        state_n_tokens: commit_end,
+    }
+}
+
+/// Decode the already-emitted pending bonus once: state advances; mirror unchanged.
+fn glimmer_profit_ledger_after_bonus_decode(led: GlimmerProfitLedger) -> GlimmerProfitLedger {
+    GlimmerProfitLedger {
+        mirror_len: led.mirror_len,
+        state_n_tokens: led.state_n_tokens.saturating_add(1),
+    }
+}
+
+/// Continue-spec routes the returned prediction once (mirror only). Retire/AR tail
+/// leave the prediction unpushed until the common AR path chooses.
+fn glimmer_profit_ledger_route_prediction(led: GlimmerProfitLedger) -> GlimmerProfitLedger {
+    GlimmerProfitLedger {
+        mirror_len: led.mirror_len.saturating_add(1),
+        state_n_tokens: led.state_n_tokens,
+    }
+}
+
+fn glimmer_profit_guard_status_label(g: &GlimmerSpecProfitGuard) -> &'static str {
+    if !g.enabled() {
+        "disabled"
+    } else if g.is_retired() {
+        "retired"
+    } else if g.evaluations() > 0 {
+        "continue"
+    } else {
+        match g.status() {
+            GlimmerProfitGuardStatus::Warming => "warming",
+            GlimmerProfitGuardStatus::Monitoring => "monitoring",
+            GlimmerProfitGuardStatus::Disabled => "disabled",
+            GlimmerProfitGuardStatus::Retired => "retired",
+        }
+    }
+}
+
 fn generate_muse_glimmer(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
@@ -30744,6 +31164,16 @@ fn generate_muse_glimmer(
     // HIPFIRE_DFLASH_DRAFT / dflash_mode=off (daemon.rs:13118), so AR is
     // untouched when absent — the null-result trap Main flagged.
     let use_spec = bundle.drafter.is_some() && temp <= 0.01 && max_tokens > 1;
+    // Shared by native AR, profit probes, and post-retirement AR tail.
+    let top_k_opt = if top_k > 0 { Some(top_k as u32) } else { None };
+    let gpu_sample = !matches!(
+        std::env::var("HIPFIRE_GLIMMER_GPU_SAMPLE").ok().as_deref(),
+        Some("0")
+    );
+    let mut gpu_rng: u32 = (rng.next_u64() as u32) | 1;
+    // Common AR tail seed. Native AR initializes from prefill logits; retirement
+    // hands the untouched greedy target prediction; completed spec leaves None.
+    let mut ar_pending: Option<u32> = None;
     // Spec counters lifted out of the branch so the terminal can report them.
     // Without this the whole DFlash run was invisible on the wire: the daemon
     // logged `[glimmer-spec] done: windows 30 ... tau 6.967` to stderr while
@@ -30751,6 +31181,26 @@ fn generate_muse_glimmer(
     // correctly refused to credit a dflash run it could not observe.
     let mut spec_windows: usize = 0;
     let mut spec_accepted: usize = 0;
+    // Request-local profit guard: default on for greedy spec; kill-switch or
+    // timing-distorting diag/audit modes disable it for this request only.
+    let profit_guard_env_off = std::env::var("HIPFIRE_GLIMMER_SPEC_PROFIT_GUARD")
+        .ok()
+        .as_deref()
+        == Some("0");
+    let profit_guard_diag_off = std::env::var("HIPFIRE_GLIMMER_SPEC_DIAG").ok().as_deref()
+        == Some("1")
+        || std::env::var("HIPFIRE_GLIMMER_DEVICE_CAPTURE_AUDIT")
+            .ok()
+            .as_deref()
+            == Some("1");
+    if use_spec && profit_guard_diag_off && !profit_guard_env_off {
+        eprintln!(
+            "[glimmer-profit] guard disabled: HIPFIRE_GLIMMER_SPEC_DIAG=1 or HIPFIRE_GLIMMER_DEVICE_CAPTURE_AUDIT=1 distorts timing"
+        );
+    }
+    let mut profit_guard =
+        GlimmerSpecProfitGuard::new(use_spec && !profit_guard_env_off && !profit_guard_diag_off);
+
     if use_spec {
         // Off-by-one note: target_layer_ids [1,13,25,37,49] are 0-based layer
         // indices (dflash_extract_layer_ids(52,5) with start=1.0, end=49.0,
@@ -31071,46 +31521,15 @@ fn generate_muse_glimmer(
                         break;
                     }
                     let pending = last_pick;
-                    let pos = cur_pos;
-                    let fb = if device_capture {
-                        glimmer::forward::decode_step_with_device_capture(
-                            &bundle.config,
-                            &bundle.weights,
-                            &mut bundle.state,
-                            gpu,
-                            pending,
-                            pos,
-                        )
-                    } else {
-                        let tap = glimmer_tap_layers(bundle.config.n_layers);
-                        glimmer::forward::decode_step_with_capture(
-                            &bundle.config,
-                            &bundle.weights,
-                            &mut bundle.state,
-                            gpu,
-                            pending,
-                            pos,
-                            &tap,
-                            &mut bundle.target_hidden_host,
-                        )
-                    };
+                    // Force greedy recovery parameters — speculative path is greedy.
+                    let fb = glimmer_ar_forward_pending(
+                        bundle, gpu, pending, 0.0, 1.0, None, gpu_sample, gpu_rng, &mut rng,
+                    );
                     match fb {
-                        Ok(l) => {
-                            last_logits = l;
+                        Ok((next_tok, new_rng)) => {
+                            gpu_rng = new_rng;
                             // Advance only for the decoded pending token.
-                            cur_pos = pos + 1;
-                            // NEW prediction from post-decode logits — never re-derive pending from stale logits.
-                            let next_tok = {
-                                let mut best = 0u32;
-                                let mut bestv = f32::NEG_INFINITY;
-                                for (i, &v) in last_logits.iter().enumerate() {
-                                    if v > bestv {
-                                        bestv = v;
-                                        best = i as u32;
-                                    }
-                                }
-                                best
-                            };
+                            cur_pos = bundle.state.n_tokens as u32;
                             if stop_set.contains(&next_tok) {
                                 // Static stop becomes the pending seed but must not be verified/committed.
                                 last_pick = next_tok;
@@ -31459,6 +31878,10 @@ fn generate_muse_glimmer(
                         .len()
                         .saturating_sub(window_start_cur_pos),
                 );
+                // Spec cost for the profit guard: draft+verify+commit/rewind only.
+                // Wire routing above is excluded from S.
+                let pre_route_ns = t_after_verify.as_nanos();
+                let t_commit = std::time::Instant::now();
                 // Device: commit staged verify prefix. Host: rewind truncates host atomically.
                 if device_capture {
                     if let Err(e) = glimmer::forward::commit_device_verify_capture(
@@ -31500,7 +31923,144 @@ fn generate_muse_glimmer(
                 if should_stop_block {
                     break;
                 }
-                last_pick = bonus;
+                // Full non-terminal window eligible for profit evidence: keep_rows
+                // matches accepted+1 and one useful B=1 step still fits.
+                let full_window = keep_rows == ga.accepted + 1
+                    && keep_rows > 0
+                    && generated_count < max_tokens
+                    && (bundle.state.n_tokens as usize) < cache_cap;
+                let mut probe_kind = GlimmerProfitProbeKind::None;
+                if full_window && profit_guard.enabled() && !profit_guard.is_retired() {
+                    if let Err(e) = gpu.hip.device_synchronize() {
+                        emit_error_with_id(
+                            stdout,
+                            id,
+                            format!("muse_glimmer profit guard synchronization failed: {e:?}"),
+                        );
+                        glimmer::forward::abort_device_capture_stage(&mut bundle.state);
+                        bundle.reset_session_state();
+                        m.conversation_tokens.clear();
+                        m.asst_turn_cache.clear();
+                        m.seq_pos = 0;
+                        return;
+                    }
+                    // t_after_verify covers draft+verify from t_window start.
+                    // t_commit covers commit/rewind through completion of any
+                    // asynchronous capture copy; wire routing remains excluded.
+                    let commit_ns = t_commit.elapsed().as_nanos();
+                    let spec_ns = pre_route_ns.saturating_add(commit_ns);
+                    probe_kind = profit_guard.observe_full_window(spec_ns, keep_rows);
+                }
+                if matches!(
+                    probe_kind,
+                    GlimmerProfitProbeKind::Warmup | GlimmerProfitProbeKind::Measured
+                ) {
+                    // Already-emitted bonus at commit_end: decode once without re-route/re-count.
+                    let measured = matches!(probe_kind, GlimmerProfitProbeKind::Measured);
+                    let probe_t0 = std::time::Instant::now();
+                    let probe = glimmer_ar_forward_pending(
+                        bundle, gpu, bonus, 0.0, 1.0, None, gpu_sample, gpu_rng, &mut rng,
+                    );
+                    match probe {
+                        Ok((pred, new_rng)) => {
+                            gpu_rng = new_rng;
+                            if let Err(e) = gpu.hip.device_synchronize() {
+                                emit_error_with_id(
+                                    stdout,
+                                    id,
+                                    format!(
+                                        "muse_glimmer profit probe synchronization failed: {e:?}"
+                                    ),
+                                );
+                                glimmer::forward::abort_device_capture_stage(&mut bundle.state);
+                                bundle.reset_session_state();
+                                m.conversation_tokens.clear();
+                                m.asst_turn_cache.clear();
+                                m.seq_pos = 0;
+                                return;
+                            }
+                            let probe_ns = probe_t0.elapsed().as_nanos();
+                            // Warmup still reports elapsed; controller discards it.
+                            profit_guard.observe_probe(probe_ns);
+                            cur_pos = bundle.state.n_tokens as u32;
+                            if measured {
+                                let ratio = profit_guard.last_ratio_milli() as f64 / 1000.0;
+                                let action = if profit_guard.is_retired() {
+                                    "retire"
+                                } else {
+                                    "continue"
+                                };
+                                eprintln!(
+                                    "[glimmer-profit] action={action} ctx={} windows=4 productive={} spec_ms={:.3} ar_b1_ms={:.3} ratio={:.4} bad_rounds={}/2",
+                                    bundle.state.n_tokens,
+                                    profit_guard.last_productive(),
+                                    profit_guard.last_spec_ns() as f64 / 1_000_000.0,
+                                    profit_guard.last_ar_probe_ns() as f64 / 1_000_000.0,
+                                    ratio,
+                                    profit_guard.bad_evaluations(),
+                                );
+                            }
+                            if stop_set.contains(&pred) {
+                                // Let the common AR terminal path route/record/flush
+                                // the untouched stop prediction exactly once.
+                                ar_pending = Some(pred);
+                                break;
+                            }
+                            if profit_guard.is_retired() {
+                                ar_pending = Some(pred);
+                                break;
+                            }
+                            // Continue spec: route the returned prediction once and
+                            // restore the one-token-ahead seed invariant.
+                            if generated_count >= max_tokens {
+                                break;
+                            }
+                            let frag = m.tokenizer.as_ref().unwrap().decode(&[pred]);
+                            let (events, should_stop_pred) = harmony_router.push(&frag);
+                            for ev in events {
+                                match ev {
+                                    GlimmerEmit::Reasoning(text) => {
+                                        emit_reasoning_token(stdout, id, &text)
+                                    }
+                                    GlimmerEmit::Token(text) => {
+                                        glimmer_visible_acc.push_str(&text);
+                                        emit_visible_token(stdout, id, &text)
+                                    }
+                                    GlimmerEmit::Tool(text) => {
+                                        glimmer_tool_acc.push_str(&text);
+                                    }
+                                }
+                            }
+                            if harmony_router.just_forced() {
+                                glimmer_recorder.mark_forced_reasoning_close();
+                            }
+                            glimmer_recorder.push(pred, &frag);
+                            m.conversation_tokens.push(pred);
+                            glimmer_emitted_ids.push(pred);
+                            generated_count += 1;
+                            last_pick = pred;
+                            if should_stop_pred {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            emit_error_with_id(
+                                stdout,
+                                id,
+                                format!("muse_glimmer profit probe decode failed: {e:?}"),
+                            );
+                            glimmer::forward::abort_device_capture_stage(&mut bundle.state);
+                            bundle.reset_session_state();
+                            m.conversation_tokens.clear();
+                            m.asst_turn_cache.clear();
+                            m.seq_pos = 0;
+                            return;
+                        }
+                    }
+                } else {
+                    // No probe this window: bonus remains the uncommitted next seed.
+                    last_pick = bonus;
+                }
                 if generated_count >= max_tokens {
                     break;
                 }
@@ -31517,26 +32077,24 @@ fn generate_muse_glimmer(
             eprintln!("[glimmer-spec] done: windows {} proposed {} accepted {} tau {:.3} (bonus per window counted)", windows, total_proposed, total_accepted, tau);
         }
     } else {
-        // AR fallback with Harmony channel routing.
-        //
-        // Sampling runs ON DEVICE from here. `decode_step_sampled` draws the
-        // next token straight out of the resident `state.logits` and hands back
-        // the advanced RNG, so each step pays an 8-byte D2H instead of pulling
-        // the whole 202048-wide logits vector across PCIe (~808 KB/token). That
-        // download was costing 27% of decode throughput at the model card's
-        // sampling settings (22.6 -> measured again below), and it also made
-        // `top_k` unreachable: the old host draw hardcoded it to 0.
-        //
-        // Only the FIRST token is still drawn host-side, from the logits
-        // `prefill` already returned; every subsequent one comes from the GPU.
-        let top_k_opt = if top_k > 0 { Some(top_k as u32) } else { None };
-        let gpu_sample = !matches!(
-            std::env::var("HIPFIRE_GLIMMER_GPU_SAMPLE").ok().as_deref(),
-            Some("0")
-        );
-        let mut gpu_rng: u32 = (rng.next_u64() as u32) | 1;
-        let mut next_tok =
-            deepseek4::sampling::sample_token(&last_logits, temp, top_k, top_p, &mut rng);
+        // Native AR: host-draw first pending from prefill logits; remaining
+        // steps share the common capture-aware helper and requested sampling.
+        ar_pending = Some(deepseek4::sampling::sample_token(
+            &last_logits,
+            temp,
+            top_k,
+            top_p,
+            &mut rng,
+        ));
+    }
+
+    // Common AR tail: native AR and post-retirement handoff only.
+    // Retirement forces greedy; native AR keeps the request's sampling params.
+    if let Some(mut next_tok) = ar_pending.take() {
+        let ar_temp = if use_spec { 0.0 } else { temp };
+        let ar_top_p = if use_spec { 1.0 } else { top_p };
+        let ar_top_k_opt = if use_spec { None } else { top_k_opt };
+
         loop {
             if generated_count >= max_tokens {
                 break;
@@ -31563,8 +32121,6 @@ fn generate_muse_glimmer(
                 }
                 glimmer_recorder.push(next_tok, &frag);
                 // Push stop token to KV? No — mirror prior break-before-push for eos.
-                // For Harmony we already pushed reasoning/answer for prior tokens; stop token itself
-                // is not part of visible sequence, but we still need to handle flush.
                 break;
             }
 
@@ -31597,110 +32153,17 @@ fn generate_muse_glimmer(
                 break;
             }
 
-            let position = bundle.state.n_tokens as u32;
-            // When a drafter exists, every AR token must also capture hidden
-            // so next-turn DFlash/prefix history has no holes.
-            let has_drafter = bundle.drafter.is_some();
-            let device_capture = has_drafter && bundle.device_hidden_capture_enabled();
-            let step = if has_drafter {
-                if device_capture {
-                    if gpu_sample {
-                        glimmer::forward::decode_step_sampled_with_device_capture(
-                            &bundle.config,
-                            &bundle.weights,
-                            &mut bundle.state,
-                            gpu,
-                            next_tok,
-                            position,
-                            temp,
-                            top_p,
-                            top_k_opt,
-                            gpu_rng,
-                        )
-                    } else {
-                        glimmer::forward::decode_step_with_device_capture(
-                            &bundle.config,
-                            &bundle.weights,
-                            &mut bundle.state,
-                            gpu,
-                            next_tok,
-                            position,
-                        )
-                        .map(|logits| {
-                            let tok = deepseek4::sampling::sample_token(
-                                &logits, temp, top_k, top_p, &mut rng,
-                            );
-                            (tok, gpu_rng)
-                        })
-                    }
-                } else if gpu_sample {
-                    let tap = glimmer_tap_layers(bundle.config.n_layers);
-                    glimmer::forward::decode_step_sampled_with_capture(
-                        &bundle.config,
-                        &bundle.weights,
-                        &mut bundle.state,
-                        gpu,
-                        next_tok,
-                        position,
-                        &tap,
-                        &mut bundle.target_hidden_host,
-                        temp,
-                        top_p,
-                        top_k_opt,
-                        gpu_rng,
-                    )
-                } else {
-                    let tap = glimmer_tap_layers(bundle.config.n_layers);
-                    glimmer::forward::decode_step_with_capture(
-                        &bundle.config,
-                        &bundle.weights,
-                        &mut bundle.state,
-                        gpu,
-                        next_tok,
-                        position,
-                        &tap,
-                        &mut bundle.target_hidden_host,
-                    )
-                    .map(|logits| {
-                        let tok = deepseek4::sampling::sample_token(
-                            &logits, temp, top_k, top_p, &mut rng,
-                        );
-                        (tok, gpu_rng)
-                    })
-                }
-            } else if gpu_sample {
-                glimmer::forward::decode_step_sampled(
-                    &bundle.config,
-                    &bundle.weights,
-                    &mut bundle.state,
-                    gpu,
-                    next_tok,
-                    position,
-                    temp,
-                    top_p,
-                    top_k_opt,
-                    gpu_rng,
-                )
-            } else {
-                // Legacy host-side draw: download the whole logits vector and
-                // sample on the CPU. Kept behind HIPFIRE_GLIMMER_GPU_SAMPLE=0
-                // as the revert switch and as the reference arm for the
-                // greedy byte-identity check.
-                glimmer::forward::decode_step(
-                    &bundle.config,
-                    &bundle.weights,
-                    &mut bundle.state,
-                    gpu,
-                    next_tok,
-                    position,
-                )
-                .map(|logits| {
-                    let tok =
-                        deepseek4::sampling::sample_token(&logits, temp, top_k, top_p, &mut rng);
-                    (tok, gpu_rng)
-                })
-            };
-            match step {
+            match glimmer_ar_forward_pending(
+                bundle,
+                gpu,
+                next_tok,
+                ar_temp,
+                ar_top_p,
+                ar_top_k_opt,
+                gpu_sample,
+                gpu_rng,
+                &mut rng,
+            ) {
                 Ok((sampled, new_rng)) => {
                     gpu_rng = new_rng;
                     m.conversation_tokens.push(next_tok);
@@ -31809,6 +32272,24 @@ fn generate_muse_glimmer(
         pending_done["cycles"] = serde_json::json!(spec_windows);
         pending_done["tau"] = serde_json::json!((tau * 1000.0).round() / 1000.0);
     }
+    if use_spec {
+        pending_done["dflash_profit_guard"] =
+            serde_json::Value::String(glimmer_profit_guard_status_label(&profit_guard).into());
+        pending_done["dflash_retired"] = serde_json::Value::Bool(profit_guard.is_retired());
+        pending_done["dflash_guard_evaluations"] = serde_json::json!(profit_guard.evaluations());
+        if profit_guard.evaluations() > 0 {
+            let ratio = profit_guard.last_ratio_milli() as f64 / 1000.0;
+            pending_done["dflash_profit_ratio"] =
+                serde_json::json!((ratio * 1000.0).round() / 1000.0);
+            pending_done["dflash_ar_b1_ms"] = serde_json::json!(
+                ((profit_guard.last_ar_probe_ns() as f64 / 1_000_000.0) * 1000.0).round() / 1000.0
+            );
+        }
+        if profit_guard.is_retired() {
+            pending_done["dflash_retire_cycle"] = serde_json::json!(profit_guard.retire_cycle());
+        }
+    }
+
     stage_terminal_tool_calls(&mut pending_done, finish_reason, &parsed_tool_calls);
     // Cache store is a COMMITTED side effect: publish it only after the client commits.
     if glimmer_commit_terminal(stdout, id, &pending_done, generated_count) {
@@ -42061,7 +42542,7 @@ mod glimmer_history_prep_tests {
     fn prepare_history_resolves_name() {
         let assistant = hipfire_runtime::prompt_frame::Message {
             role: hipfire_runtime::prompt_frame::Role::Assistant,
-            content: "hi".into(),
+            content: String::new(),
             reasoning_content: None,
             name: None,
             rendered_name: None,
@@ -42086,6 +42567,296 @@ mod glimmer_history_prep_tests {
         };
         let out = prepare_glimmer_onyx_history(&[assistant, tool]).expect("should succeed");
         assert_eq!(out[1].rendered_name, Some("weather.get_forecast".into()));
+    }
+}
+
+/// Pure request-local Glimmer speculative profitability controller.
+/// Exercises production methods only — no algorithm reimplementation.
+#[cfg(test)]
+mod glimmer_profit_guard_tests {
+    use super::{
+        glimmer_profit_ledger_after_bonus_decode, glimmer_profit_ledger_post_window,
+        glimmer_profit_ledger_route_prediction, GlimmerProfitGuardStatus, GlimmerProfitProbeKind,
+        GlimmerSpecProfitGuard,
+    };
+
+    /// Drive four identical measured windows that sum to (s_total, p_total), then
+    /// apply ar_probe_ns. Returns the guard after observe_probe.
+    fn eval_group(g: &mut GlimmerSpecProfitGuard, s_total: u128, p_total: u128, ar_probe_ns: u128) {
+        // Split evenly across four windows; remainder on the last.
+        let s_each = s_total / 4;
+        let p_each = (p_total / 4) as usize;
+        let s_last = s_total - s_each * 3;
+        let p_last = (p_total - (p_each as u128) * 3) as usize;
+        for i in 0..4 {
+            let s = if i == 3 { s_last } else { s_each };
+            let p = if i == 3 { p_last } else { p_each };
+            let kind = g.observe_full_window(s, p);
+            if i < 3 {
+                assert_eq!(kind, GlimmerProfitProbeKind::None, "window {i}");
+            } else {
+                assert_eq!(kind, GlimmerProfitProbeKind::Measured, "window {i}");
+            }
+        }
+        g.observe_probe(ar_probe_ns);
+    }
+
+    fn warmup(g: &mut GlimmerSpecProfitGuard) {
+        assert_eq!(
+            g.observe_full_window(1_000, 4),
+            GlimmerProfitProbeKind::Warmup
+        );
+        g.observe_probe(999); // discarded
+    }
+
+    #[test]
+    fn disabled_never_probes_or_retires() {
+        let mut g = GlimmerSpecProfitGuard::new(false);
+        assert_eq!(g.status(), GlimmerProfitGuardStatus::Disabled);
+        assert!(!g.enabled());
+        for _ in 0..20 {
+            assert_eq!(
+                g.observe_full_window(10_000, 8),
+                GlimmerProfitProbeKind::None
+            );
+            g.observe_probe(1);
+        }
+        assert!(!g.is_retired());
+        assert_eq!(g.evaluations(), 0);
+        assert_eq!(g.eligible_windows(), 0);
+        assert_eq!(g.pending_probe(), GlimmerProfitProbeKind::None);
+    }
+
+    #[test]
+    fn first_window_is_warmup_and_excluded() {
+        let mut g = GlimmerSpecProfitGuard::new(true);
+        assert_eq!(g.status(), GlimmerProfitGuardStatus::Warming);
+        assert_eq!(
+            g.observe_full_window(50_000, 16),
+            GlimmerProfitProbeKind::Warmup
+        );
+        assert_eq!(g.eligible_windows(), 1);
+        assert_eq!(g.pending_probe(), GlimmerProfitProbeKind::Warmup);
+        // Warmup probe discarded — no evaluation, no S/P carried.
+        g.observe_probe(1);
+        assert_eq!(g.evaluations(), 0);
+        assert_eq!(g.bad_evaluations(), 0);
+        assert_eq!(g.pending_probe(), GlimmerProfitProbeKind::None);
+        assert_eq!(g.status(), GlimmerProfitGuardStatus::Monitoring);
+        // Next four windows: only the 4th requests Measured.
+        assert_eq!(
+            g.observe_full_window(10_000, 4),
+            GlimmerProfitProbeKind::None
+        );
+        assert_eq!(
+            g.observe_full_window(10_000, 4),
+            GlimmerProfitProbeKind::None
+        );
+        assert_eq!(
+            g.observe_full_window(10_000, 4),
+            GlimmerProfitProbeKind::None
+        );
+        assert_eq!(
+            g.observe_full_window(10_000, 4),
+            GlimmerProfitProbeKind::Measured
+        );
+        // Completing the measured probe with S=40k, P=16, A=2500:
+        // ratio = 40000/(16*2500) = 1.0 — deadband; one evaluation counted.
+        g.observe_probe(2_500);
+        assert_eq!(g.evaluations(), 1);
+        assert_eq!(g.last_spec_ns(), 40_000);
+        assert_eq!(g.last_productive(), 16);
+        assert_eq!(g.last_ar_probe_ns(), 2_500);
+    }
+
+    #[test]
+    fn four_window_cadence() {
+        let mut g = GlimmerSpecProfitGuard::new(true);
+        warmup(&mut g);
+        // Two full evaluation groups: only every 4th window is Measured.
+        let mut measured = 0u32;
+        let mut none = 0u32;
+        for i in 0..8 {
+            let k = g.observe_full_window(1_000, 2);
+            match k {
+                GlimmerProfitProbeKind::Measured => {
+                    measured += 1;
+                    g.observe_probe(1_000); // ratio = 4000/(8*1000)=0.5 good
+                }
+                GlimmerProfitProbeKind::None => none += 1,
+                GlimmerProfitProbeKind::Warmup => panic!("unexpected warmup at {i}"),
+            }
+        }
+        assert_eq!(measured, 2);
+        assert_eq!(none, 6);
+        assert_eq!(g.evaluations(), 2);
+    }
+
+    #[test]
+    fn boundary_1049_deadband_105_bad_098_reset() {
+        // Choose A=1000, P=100 so A*P = 100_000.
+        // bad:  S*100 >= 100_000*105 = 10_500_000  => S >= 105_000  (ratio >= 1.05)
+        // good: S*100 <= 100_000*98  =  9_800_000  => S <=  98_000  (ratio <= 0.98)
+        // deadband: 98_001 ..= 104_999
+        // Exactly 1.049: S = 104_900 => left=10_490_000 < 10_500_000 and > 9_800_000.
+
+        // --- 1.049 deadband retains ---
+        let mut g = GlimmerSpecProfitGuard::new(true);
+        warmup(&mut g);
+        // Seed one bad so deadband retention is observable.
+        eval_group(&mut g, 105_000, 100, 1_000);
+        assert_eq!(g.bad_evaluations(), 1);
+        assert!(!g.is_retired());
+        // 1.049: retain bad_evaluations == 1
+        eval_group(&mut g, 104_900, 100, 1_000);
+        assert_eq!(g.bad_evaluations(), 1);
+        assert!(!g.is_retired());
+        assert_eq!(g.evaluations(), 2);
+
+        // --- exactly 1.05 is bad ---
+        let mut g = GlimmerSpecProfitGuard::new(true);
+        warmup(&mut g);
+        eval_group(&mut g, 105_000, 100, 1_000);
+        assert_eq!(g.bad_evaluations(), 1);
+        assert!(!g.is_retired());
+
+        // --- exactly 0.98 resets ---
+        let mut g = GlimmerSpecProfitGuard::new(true);
+        warmup(&mut g);
+        eval_group(&mut g, 105_000, 100, 1_000); // bad -> 1
+        assert_eq!(g.bad_evaluations(), 1);
+        eval_group(&mut g, 98_000, 100, 1_000); // good -> 0
+        assert_eq!(g.bad_evaluations(), 0);
+        assert!(!g.is_retired());
+        assert_eq!(g.evaluations(), 2);
+    }
+
+    #[test]
+    fn two_bad_retires_sticky_good_resets_deadband_retains() {
+        let mut g = GlimmerSpecProfitGuard::new(true);
+        warmup(&mut g);
+
+        // bad #1
+        eval_group(&mut g, 105_000, 100, 1_000);
+        assert_eq!(g.bad_evaluations(), 1);
+        assert!(!g.is_retired());
+
+        // deadband retains
+        eval_group(&mut g, 100_000, 100, 1_000); // ratio = 1.0
+        assert_eq!(g.bad_evaluations(), 1);
+        assert!(!g.is_retired());
+
+        // good resets
+        eval_group(&mut g, 98_000, 100, 1_000);
+        assert_eq!(g.bad_evaluations(), 0);
+
+        // two consecutive bads retire
+        eval_group(&mut g, 105_000, 100, 1_000);
+        assert_eq!(g.bad_evaluations(), 1);
+        eval_group(&mut g, 105_000, 100, 1_000);
+        assert_eq!(g.bad_evaluations(), 2);
+        assert!(g.is_retired());
+        assert_eq!(g.status(), GlimmerProfitGuardStatus::Retired);
+        assert_eq!(g.retire_evaluation(), g.evaluations());
+        assert!(g.retire_cycle() > 0);
+
+        // sticky: further windows/probes are inert
+        assert_eq!(
+            g.observe_full_window(200_000, 1),
+            GlimmerProfitProbeKind::None
+        );
+        let evals = g.evaluations();
+        g.observe_probe(1);
+        assert_eq!(g.evaluations(), evals);
+        assert!(g.is_retired());
+    }
+
+    #[test]
+    fn fresh_object_after_retirement_starts_warmup() {
+        let mut old = GlimmerSpecProfitGuard::new(true);
+        warmup(&mut old);
+        eval_group(&mut old, 105_000, 100, 1_000);
+        eval_group(&mut old, 105_000, 100, 1_000);
+        assert!(old.is_retired());
+
+        let mut fresh = GlimmerSpecProfitGuard::new(true);
+        assert_eq!(fresh.status(), GlimmerProfitGuardStatus::Warming);
+        assert!(!fresh.is_retired());
+        assert_eq!(
+            fresh.observe_full_window(1_000, 4),
+            GlimmerProfitProbeKind::Warmup
+        );
+    }
+
+    #[test]
+    fn zero_progress_and_zero_time_ignored() {
+        let mut g = GlimmerSpecProfitGuard::new(true);
+        // Zero time
+        assert_eq!(g.observe_full_window(0, 8), GlimmerProfitProbeKind::None);
+        // Zero rows
+        assert_eq!(
+            g.observe_full_window(10_000, 0),
+            GlimmerProfitProbeKind::None
+        );
+        assert_eq!(g.eligible_windows(), 0);
+        assert_eq!(g.status(), GlimmerProfitGuardStatus::Warming);
+
+        warmup(&mut g);
+        // Build three of four measured windows, then inject zeros (ignored).
+        assert_eq!(
+            g.observe_full_window(1_000, 2),
+            GlimmerProfitProbeKind::None
+        );
+        assert_eq!(
+            g.observe_full_window(1_000, 2),
+            GlimmerProfitProbeKind::None
+        );
+        assert_eq!(
+            g.observe_full_window(1_000, 2),
+            GlimmerProfitProbeKind::None
+        );
+        assert_eq!(g.observe_full_window(0, 2), GlimmerProfitProbeKind::None);
+        assert_eq!(
+            g.observe_full_window(1_000, 0),
+            GlimmerProfitProbeKind::None
+        );
+        // Fourth real window still completes the group.
+        assert_eq!(
+            g.observe_full_window(1_000, 2),
+            GlimmerProfitProbeKind::Measured
+        );
+        // Zero probe is not evidence: evaluation not counted.
+        g.observe_probe(0);
+        assert_eq!(g.evaluations(), 0);
+        assert_eq!(g.bad_evaluations(), 0);
+        // Cadence recovered — next four-window group works.
+        eval_group(&mut g, 4_000, 8, 1_000); // ratio 0.5 good
+        assert_eq!(g.evaluations(), 1);
+    }
+
+    #[test]
+    fn bonus_decode_aligns_mirror_prediction_unpushed_until_route() {
+        // Post full window: bonus already on mirror, not in KV/capture.
+        let commit_end = 100usize;
+        let post = glimmer_profit_ledger_post_window(commit_end);
+        assert_eq!(post.mirror_len, commit_end + 1);
+        assert_eq!(post.state_n_tokens, commit_end);
+
+        // Decoding the pending bonus advances state only — prediction not mirrored.
+        let after = glimmer_profit_ledger_after_bonus_decode(post);
+        assert_eq!(after.mirror_len, commit_end + 1);
+        assert_eq!(after.state_n_tokens, commit_end + 1);
+        assert_eq!(after.mirror_len, after.state_n_tokens);
+
+        // Retire/AR tail keeps prediction unpushed (same ledger).
+        assert_eq!(after, glimmer_profit_ledger_after_bonus_decode(post));
+
+        // Continue-spec routes the returned prediction once.
+        let cont = glimmer_profit_ledger_route_prediction(after);
+        assert_eq!(cont.mirror_len, commit_end + 2);
+        assert_eq!(cont.state_n_tokens, commit_end + 1);
+        // Prediction is one-token-ahead again, not yet in state.
+        assert_eq!(cont.mirror_len, cont.state_n_tokens + 1);
     }
 }
 
