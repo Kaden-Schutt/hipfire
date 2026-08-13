@@ -249,18 +249,26 @@ Same clock, same prompts, same 64-token budget, medians of 3 interleaved runs.
 | noslots (sequential daemon) | 52.90 | 85.64 | 89.47 | **91.53** |
 | slots (multi-slot engine) | 33.55 | 57.08 | 70.14 | **84.69** |
 
-Taken at face value the slot engine loses at every point. **Do not take it at
-face value** — the two arms are not running the same pipeline:
+Taken at face value the slot engine loses at every point. The two arms are not
+running the same pipeline, but **only one of the two suspected differences is
+real** — an earlier revision of this document claimed both, wrongly:
 
-- the daemon path loads the **MTP speculative head** and enables the
-  **redline retained/PM4 replay** path (both visible in its startup log)
-- the `SlotEngine` path has **neither** — plain autoregressive decode, no
-  speculation, no graph replay
+- ~~the daemon path engages the **MTP speculative head**~~ — **NO.** The
+  sidecar loads and logs `MTP head loaded`, but engagement is gated behind
+  `HIPFIRE_QWEN_MTP=1` (`daemon.rs:1494`; the path at `:20871` documents
+  itself as "only reached when HIPFIRE_QWEN_MTP=1"). That variable was never
+  set in any run here, so MTP was **loaded but never used**. The log line is
+  not evidence of speculation. This was a misread.
+- the daemon path **does** enable **redline retained/PM4 replay**, and the
+  in-process `SlotEngine` cannot: redline lives in the daemon, and the slot
+  path never goes through it.
 
-MTP alone is worth ~12–20% on this SKU, and the redline campaign is what took
-mq4r from ~110 to ~204 tok/s single-stream. So this table measures *pipeline
-maturity*, not batching, and the gap it shows is very likely those two
-features rather than a defect in the slot engine.
+Redline is not switchable for this model — `mq4r_redline_default`
+(`hipfire-runtime/src/config.rs:14`) hardcodes it on for a `.mq4r` extension on
+gfx1100/1151/1201 at pp=1, tp=1, with no env or config override. So it cannot
+be turned off to isolate it; it is a genuine property of the daemon path rather
+than a benchmark artifact. The redline campaign took mq4r from ~110 to ~204
+tok/s single-stream, so it is more than large enough to account for the gap.
 
 Two further reasons to distrust the shape:
 
@@ -289,14 +297,9 @@ At 512 tokens decode dominates the wall clock, so the ordering is not a
 prefill artifact: **the sequential daemon path beats the slot engine by
 ~20–25% at both concurrencies, on two independent token budgets.**
 
-Two things this run did NOT establish, and they matter:
+One thing this run did NOT establish, and it matters:
 
-1. **`--spec off` did not unload MTP.** The daemon still logged
-   `MTP head loaded` on the no-slots arm, so speculation may well still be
-   active there. The intended isolation did not happen; the flag gates the
-   selector, not the sidecar load. Disabling it properly needs a different
-   lever (the serve path uses `HIPFIRE_QWEN_MTP`).
-2. **The intra-arm k=1 → k=4 rise is not trustworthy at `--runs 2`.** A
+1. **The intra-arm k=1 → k=4 rise is not trustworthy at `--runs 2`.** A
    strictly sequential arm must have flat aggregate throughput in k, yet
    noslots goes 54.28 → 99.39, which a 512-token budget is far too long for
    warmup amortisation to explain. With `sweep_order` visiting `1,4,1,4` and
@@ -304,19 +307,48 @@ Two things this run did NOT establish, and they matter:
    contaminates that point. Compare ACROSS arms at matched k; do not read the
    within-arm curve from this run.
 
+### Definitive run — `--runs 5`, 512 tokens
+
+The `--runs 2` results above have a cold-sample problem (median of two = their
+mean). Re-run at `--runs 5`, where a single cold sample cannot own the median:
+
+| backend | k=1 | k=4 |
+|---|---|---|
+| noslots (sequential daemon) | 51.68 | **95.15** |
+| slots (multi-slot engine) | 34.37 | **78.45** |
+
+**noslots wins by 50% at k=1 and 21% at k=4.** Consistent with both earlier
+runs; the ranking has now held across three independent measurements and two
+token budgets, so it is not a sampling artifact.
+
+The narrowing gap is the one hint that batching is doing real work: the slot
+engine recovers from −50% at k=1 to −21% at k=4, i.e. it scales better with
+concurrency (2.28× from k=1→k=4, versus 1.84× for sequential) even while
+losing on absolute throughput. Extrapolating that trend past k=4 is not
+supported by this data — it is two points.
+
+The `noslots` k=1→k=4 rise (51.68 → 95.15) is still larger than a strictly
+sequential path permits, and `--runs 5` did not remove it. Per-run fixed cost
+is the remaining explanation, but it is no longer a cold-median artifact and
+is not fully accounted for. Treat the cross-arm comparison at matched k as
+sound and the within-arm curve as still unexplained.
+
 ### What this actually says
 
-The slot engine loses to the plain daemon path today, consistently. The most
-probable explanation is not that batching fails, but that the daemon arm
-carries optimisations the slot path never got — the MTP speculative head and
-the redline retained/PM4 replay, neither of which the in-process `SlotEngine`
-uses. If that is right, the lever is porting those into the slot path rather
-than tuning the batching, and the slot engine's own decode-only figure (116
-tok/s aggregate at 4 slots) is what it could reach once it has them.
+The slot engine loses to the plain daemon path today, consistently. The one
+substantiated difference between the arms is **redline retained/PM4 replay**,
+which the daemon gets automatically for `.mq4r` and the in-process `SlotEngine`
+structurally cannot reach. MTP is NOT part of the explanation — it was never
+engaged. If redline is the cause, the lever is bringing that replay path to the
+slot engine rather than tuning the batching, and the slot engine's own
+decode-only figure (116 tok/s aggregate at 4 slots) indicates the headroom.
 
-**This is a hypothesis with supporting evidence, not a demonstrated cause.**
-Confirming it requires an arm with MTP genuinely disabled — which this run
-failed to produce.
+**This remains a hypothesis, not a demonstrated cause.** Redline cannot be
+disabled for `.mq4r`, so it cannot be isolated on this model. The clean test is
+to re-run both arms on a SKU whose extension does not trigger the default (e.g.
+`.mq4p`), where the daemon runs plain HIP too: if the gap closes, redline
+explains it; if it persists, something in the slot path itself does. That test
+has not been run.
 
 ### The batch backend is NOT measured
 
