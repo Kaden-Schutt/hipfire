@@ -2782,6 +2782,222 @@ impl Gpu {
         Ok(true)
     }
 
+    /// Benchmark-only gfx1201 LongSpec partition WMMA flash.
+    ///
+    /// Fixed Muse Glimmer verifier shape only: B=16, H=32, KVH=2, HD=128.
+    /// Writes F32 partials `[B,H,130] = [m,l,O_unnormalized[128]]`. JIT on first
+    /// call; not on any production selector/precompile path. Requires exact
+    /// incumbent gfx1201 tuning (`SPLIT_Q=0`, `PREFETCH_V=1`, fixed HD128).
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_q8_0_flash_prefill_wmma_partial_gfx1201_bench(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        v: &GpuTensor,
+        partials: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        const FIXED_B: usize = 16;
+        const FIXED_H: usize = 32;
+        const FIXED_KVH: usize = 2;
+        const FIXED_HD: usize = 128;
+        const PARTIAL_STRIDE: usize = 2 + FIXED_HD;
+        if !self.arch_caps.is_gfx1201() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_flash_prefill_wmma_partial_gfx1201_bench requires gfx1201, got {}",
+                    self.arch
+                ),
+            ));
+        }
+        if batch_size != FIXED_B
+            || n_heads != FIXED_H
+            || n_kv_heads != FIXED_KVH
+            || head_dim != FIXED_HD
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_flash_prefill_wmma_partial_gfx1201_bench requires \
+                     B={FIXED_B} H={FIXED_H} KVH={FIXED_KVH} HD={FIXED_HD}, got \
+                     B={batch_size} H={n_heads} KVH={n_kv_heads} HD={head_dim}"
+                ),
+            ));
+        }
+        let need_q = FIXED_B * FIXED_H * FIXED_HD;
+        let need_partials = FIXED_B * FIXED_H * PARTIAL_STRIDE;
+        if q.numel() < need_q || partials.numel() < need_partials || positions.numel() < FIXED_B {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_flash_prefill_wmma_partial_gfx1201_bench capacity mismatch: \
+                     q={} (need>={need_q}), partials={} (need>={need_partials}), positions={}",
+                    q.numel(),
+                    partials.numel(),
+                    positions.numel()
+                ),
+            ));
+        }
+        // Match incumbent gfx1201 WMMA path arithmetic exactly; reject env
+        // retunes that would silently change numerics under the same symbol.
+        let split_q = hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_SPLITQ")
+            .ok()
+            .as_deref()
+            == Some("1");
+        let fixed_hd_off = hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_FIXED_HD")
+            .ok()
+            .as_deref()
+            == Some("0");
+        let prefetch_v_off = hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_PREFETCH_V")
+            .ok()
+            .as_deref()
+            == Some("0");
+        if split_q || fixed_hd_off || prefetch_v_off {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "attention_q8_0_flash_prefill_wmma_partial_gfx1201_bench requires incumbent \
+                 gfx1201 tuning SPLIT_Q=0 PREFETCH_V=1 FIXED_HD=128 (unset or default env)",
+            ));
+        }
+        const SYMBOL: &str = "attention_q8_0_flash_prefill_wmma_partial_gfx1201";
+        let src = format!(
+            "#define SPLIT_Q 0\n#define FIXED_HEAD_DIM {FIXED_HD}\n#define PREFETCH_V 1\n{}",
+            kernels::ATTENTION_Q8_0_FLASH_PREFILL_WMMA_PARTIAL_GFX1201_SRC
+        );
+        self.ensure_kernel(SYMBOL, &src, SYMBOL)?;
+        const M_TILE: usize = 16;
+        const S_STRIDE: usize = 18;
+        const V_STRIDE: usize = 18;
+        // LDS identical to fixed SPLIT_Q=0 WMMA path.
+        let lds =
+            (M_TILE * FIXED_HD + FIXED_HD * V_STRIDE + M_TILE * S_STRIDE) * 2 + M_TILE * 3 * 4;
+        let scale = 1.0f32 / (FIXED_HD as f32).sqrt();
+        let mut q_ptr = q.buf.as_ptr();
+        let mut k_ptr = k.buf.as_ptr();
+        let mut v_ptr = v.buf.as_ptr();
+        let mut p_ptr = partials.buf.as_ptr();
+        let mut pos_ptr = positions.buf.as_ptr();
+        let mut nh = FIXED_H as i32;
+        let mut nkv = FIXED_KVH as i32;
+        let mut hd = FIXED_HD as i32;
+        let mut bs = FIXED_B as i32;
+        let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut q_ptr as *mut _ as *mut c_void,
+            &mut k_ptr as *mut _ as *mut c_void,
+            &mut v_ptr as *mut _ as *mut c_void,
+            &mut p_ptr as *mut _ as *mut c_void,
+            &mut pos_ptr as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+        // Fixed B=16 => grid_x = 1; H=32.
+        self.launch_maybe_blob(
+            SYMBOL,
+            [1, FIXED_H as u32, 1],
+            [32, 1, 1],
+            lds as u32,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(q_ptr);
+                b.push_ptr(k_ptr);
+                b.push_ptr(v_ptr);
+                b.push_ptr(p_ptr);
+                b.push_ptr(pos_ptr);
+                b.push_i32(nh);
+                b.push_i32(nkv);
+                b.push_i32(hd);
+                b.push_i32(bs);
+                b.push_f32(sc);
+                b
+            },
+        )
+    }
+
+    /// Benchmark-only stable LSE merge of two online-softmax attention partials.
+    ///
+    /// Fixed shape B=16, H=32, HD=128. `prefix`/`suffix` are F32 `[B,H,130]`;
+    /// `out` is F32 `[B,H,128]`. JIT on first call.
+    #[doc(hidden)]
+    pub fn attention_partition_merge_f32_bench(
+        &mut self,
+        prefix: &GpuTensor,
+        suffix: &GpuTensor,
+        out: &GpuTensor,
+        batch: usize,
+        n_heads: usize,
+        head_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        const FIXED_B: usize = 16;
+        const FIXED_H: usize = 32;
+        const FIXED_HD: usize = 128;
+        const PARTIAL_STRIDE: usize = 2 + FIXED_HD;
+        if batch != FIXED_B || n_heads != FIXED_H || head_dim != FIXED_HD {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_partition_merge_f32_bench requires B={FIXED_B} H={FIXED_H} \
+                     HD={FIXED_HD}, got B={batch} H={n_heads} HD={head_dim}"
+                ),
+            ));
+        }
+        let need_partial = FIXED_B * FIXED_H * PARTIAL_STRIDE;
+        let need_out = FIXED_B * FIXED_H * FIXED_HD;
+        if prefix.numel() < need_partial || suffix.numel() < need_partial || out.numel() < need_out
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_partition_merge_f32_bench capacity mismatch: \
+                     prefix={} suffix={} out={} (need partial>={need_partial}, out>={need_out})",
+                    prefix.numel(),
+                    suffix.numel(),
+                    out.numel()
+                ),
+            ));
+        }
+        const SYMBOL: &str = "attention_partition_merge_f32";
+        self.ensure_kernel(SYMBOL, kernels::ATTENTION_PARTITION_MERGE_F32_SRC, SYMBOL)?;
+        let mut p_ptr = prefix.buf.as_ptr();
+        let mut s_ptr = suffix.buf.as_ptr();
+        let mut o_ptr = out.buf.as_ptr();
+        let mut bs = FIXED_B as i32;
+        let mut nh = FIXED_H as i32;
+        let mut hd = FIXED_HD as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut p_ptr as *mut _ as *mut c_void,
+            &mut s_ptr as *mut _ as *mut c_void,
+            &mut o_ptr as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+        ];
+        let n_rec = FIXED_B * FIXED_H;
+        let grid_x = n_rec.div_ceil(8) as u32;
+        self.launch_maybe_blob(SYMBOL, [grid_x, 1, 1], [256, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(p_ptr);
+            b.push_ptr(s_ptr);
+            b.push_ptr(o_ptr);
+            b.push_i32(bs);
+            b.push_i32(nh);
+            b.push_i32(hd);
+            b
+        })
+    }
+
     /// Batched flash attention for Q8_0 KV — tile + reduce two-kernel path.
     /// No LDS capacity limit: tiles seq_len into chunks of `tile_size` only,
     /// so shared memory is O(tile_size), not O(max_ctx_len). Replaces the

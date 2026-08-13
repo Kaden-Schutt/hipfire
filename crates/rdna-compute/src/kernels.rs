@@ -4231,6 +4231,18 @@ pub const ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SRC: &str =
 pub const ATTENTION_Q8_0_FLASH_PREFILL_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/attention_q8_0_flash_prefill_wmma.gfx12.hip");
 
+/// Benchmark-only gfx1201 LongSpec partition WMMA flash: same arithmetic as
+/// `ATTENTION_Q8_0_FLASH_PREFILL_WMMA_GFX12_SRC` but writes retained online-
+/// softmax state `[m,l,O_unnormalized]` per query/head instead of normalized O.
+/// JIT-only via `attention_q8_0_flash_prefill_wmma_partial_gfx1201_bench`.
+pub const ATTENTION_Q8_0_FLASH_PREFILL_WMMA_PARTIAL_GFX1201_SRC: &str =
+    include_str!("../../../kernels/src/attention_q8_0_flash_prefill_wmma_partial.gfx1201.hip");
+
+/// Benchmark-only stable LSE merge of two `[m,l,O_unnormalized]` partials into
+/// normalized O. JIT-only via `attention_partition_merge_f32_bench`.
+pub const ATTENTION_PARTITION_MERGE_F32_SRC: &str =
+    include_str!("../../../kernels/src/attention_partition_merge_f32.hip");
+
 /// Muse Glimmer-owned sliding-window variant of
 /// `ATTENTION_Q8_0_FLASH_PREFILL_WMMA_GFX12_SRC`. Same WMMA tiling and Q8
 /// dequant; adds a `window` argument, a tile-aligned lower bound so fully
