@@ -7027,6 +7027,9 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
     if args.exp && args.reasoning_on {
         bail!("--reasoning-on is not supported with --exp (its token budget is fixed at 128)");
     }
+    if let Some(spec) = args.concurrency.clone() {
+        return bench_concurrency_command(paths, &args, &spec);
+    }
     for (name, values) in [
         ("--pp", &args.pp),
         ("--ctx", &args.ctx),
@@ -7145,6 +7148,103 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
     }
 }
 
+/// Concurrency sweep across both concurrent backends. Only reached when
+/// `--concurrency` is given; the single-stream path above is untouched.
+fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Result<()> {
+    use crate::bench_concurrency::{
+        parse_concurrency, render_table, sweep_backend, BackendSel, ConcurrencyBackend,
+        DaemonDriver, Point, SlotDriver, WorkloadSel,
+    };
+
+    let points = parse_concurrency(spec)?;
+    let max_k = *points.iter().max().expect("non-empty");
+    let backend_sel = match args.backend.as_str() {
+        "slots" => BackendSel::Slots,
+        "batch" => BackendSel::Batch,
+        _ => BackendSel::Both,
+    };
+    let arms: Vec<WorkloadSel> = match args.workload.as_str() {
+        "stateless" => vec![WorkloadSel::Stateless],
+        "multiturn" => vec![WorkloadSel::Multiturn],
+        _ => vec![WorkloadSel::Stateless, WorkloadSel::Multiturn],
+    };
+
+    eprintln!("hipfire bench — concurrency sweep");
+    eprintln!("  model:       {}", args.model);
+    eprintln!("  concurrency: {points:?}");
+    eprintln!("  runs/point:  {}", args.runs);
+    eprintln!("  max_tokens:  {}", args.max_tokens);
+
+    let mut out: Vec<Point> = Vec::new();
+
+    if matches!(backend_sel, BackendSel::Slots | BackendSel::Both) {
+        let registry = load_registry(&paths.registry).registry;
+        let model_path = find_model_path(paths, &registry, &args.model)
+            .ok_or_else(|| anyhow!("model not found: {}", args.model))?;
+        match SlotDriver::start(&model_path, max_k, 8192) {
+            Ok(mut d) => {
+                eprintln!("  slots backend up ({max_k} slots)");
+                sweep_backend(
+                    &mut d as &mut dyn ConcurrencyBackend,
+                    &arms,
+                    &points,
+                    args.runs,
+                    args.max_tokens as u64,
+                    &mut out,
+                )?;
+            }
+            // A backend that cannot run this model is a RESULT, not a crash.
+            Err(e) => eprintln!("  slots backend unavailable: {e}"),
+        }
+    }
+
+    if matches!(backend_sel, BackendSel::Batch | BackendSel::Both) {
+        let mut batch_args = args.clone();
+        batch_args.concurrency = None;
+        let (engine, loaded, _, _) = open_bench_engine_batched(paths, &batch_args, max_k)?;
+        let capable = loaded
+            .get("continuous_batch_capable")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        match DaemonDriver::start(engine, max_k, capable) {
+            Ok(mut d) => {
+                eprintln!("  batch backend up (continuous_batch_size={max_k})");
+                sweep_backend(
+                    &mut d as &mut dyn ConcurrencyBackend,
+                    &arms,
+                    &points,
+                    args.runs,
+                    args.max_tokens as u64,
+                    &mut out,
+                )?;
+            }
+            Err(e) => eprintln!("  batch backend unavailable: {e}"),
+        }
+    }
+
+    println!("{}", render_table(&out));
+    Ok(())
+}
+
+/// `open_bench_engine`, but loading with `continuous_batch_size` set so the
+/// daemon allocates batch lanes and advertises `continuous_batch_capable`.
+/// The value is fixed per load, which is why the sweep holds it at max.
+fn open_bench_engine_batched(
+    paths: &Paths,
+    args: &BenchArgs,
+    batch_size: usize,
+) -> Result<(
+    Engine,
+    serde_json::Value,
+    serde_json::Value,
+    serde_json::Value,
+)> {
+    std::env::set_var("HIPFIRE_BENCH_CONTINUOUS_BATCH", batch_size.to_string());
+    let r = open_bench_engine(paths, args, None);
+    std::env::remove_var("HIPFIRE_BENCH_CONTINUOUS_BATCH");
+    r
+}
+
 fn open_bench_engine(
     paths: &Paths,
     args: &BenchArgs,
@@ -7219,6 +7319,11 @@ fn open_bench_engine(
         let requested = longest_prefill.max(longest_decode).saturating_add(32);
         let configured = params["max_seq"].as_u64().unwrap_or(0);
         params["max_seq"] = serde_json::json!(configured.max(requested));
+    }
+    if let Ok(n) = std::env::var("HIPFIRE_BENCH_CONTINUOUS_BATCH") {
+        if let Ok(n) = n.parse::<u64>() {
+            params["continuous_batch_size"] = serde_json::json!(n);
+        }
     }
     let loaded = engine.load(&path, params)?;
     let post_diag = engine.request(&serde_json::json!({ "type": "diag" }))?;

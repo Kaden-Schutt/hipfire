@@ -452,6 +452,71 @@ impl ConcurrencyBackend for DaemonDriver {
     }
 }
 
+/// Reject a multi-turn slot run that recorded no prefix hits.
+///
+/// The whole point of the multi-turn arm is that `SlotEngine` reuses the
+/// conversation's KV. A faster turn 2 proves nothing on its own — warm caches
+/// do that too. `EngineStats::prefix_hits` is the event itself, so gate on it.
+pub fn arm_is_valid(
+    workload: WorkloadSel,
+    backend: &str,
+    r: &ArmResult,
+) -> std::result::Result<(), String> {
+    if matches!(workload, WorkloadSel::Multiturn) && backend == "slots" && r.prefix_hits == 0 {
+        return Err(
+            "multi-turn arm recorded no prefix hits — turn 2 did not reuse the \
+             session KV, so this number does not measure what the arm claims"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Run the interleaved sweep over one backend and collect points.
+pub fn sweep_backend(
+    backend: &mut dyn ConcurrencyBackend,
+    arms: &[WorkloadSel],
+    points: &[usize],
+    runs: usize,
+    max_tokens: u64,
+    out: &mut Vec<Point>,
+) -> Result<()> {
+    let label = backend.label();
+    for &arm in arms {
+        let arm_label = match arm {
+            WorkloadSel::Stateless => "stateless",
+            WorkloadSel::Multiturn => "multiturn",
+            WorkloadSel::Both => continue,
+        };
+        // One untimed warmup per (backend, arm) so first-call kernel
+        // compilation never lands inside a timed sample.
+        let _ = backend.run(arm, points[0], max_tokens.min(8));
+
+        let mut by_k: std::collections::BTreeMap<usize, Vec<ArmResult>> =
+            std::collections::BTreeMap::new();
+        for k in sweep_order(points, runs) {
+            let r = backend.run(arm, k, max_tokens)?;
+            match arm_is_valid(arm, label, &r) {
+                Ok(()) => by_k.entry(k).or_default().push(r),
+                Err(why) => eprintln!("  [invalid] {label}/{arm_label} k={k}: {why}"),
+            }
+            eprint!(".");
+            use std::io::Write;
+            let _ = std::io::stderr().flush();
+        }
+        eprintln!();
+        for (k, samples) in by_k {
+            out.push(Point {
+                backend: label,
+                workload: arm_label,
+                k,
+                samples,
+            });
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -582,5 +647,31 @@ mod tests {
             r.get("assistant_prefix").and_then(|v| v.as_str()),
             Some("closed_think")
         );
+    }
+
+    /// A faster second turn is not evidence of prefix reuse — it could be
+    /// cache warmth. If the multi-turn arm recorded no prefix hits on the
+    /// slot backend, the run is invalid and must not publish a number.
+    #[test]
+    fn multiturn_without_prefix_hits_is_invalid_on_slots() {
+        let no_hits = ArmResult {
+            tokens: 100,
+            wall_ms: 500.0,
+            rejected: 0,
+            prefix_hits: 0,
+        };
+        let hits = ArmResult {
+            tokens: 100,
+            wall_ms: 500.0,
+            rejected: 0,
+            prefix_hits: 2,
+        };
+
+        assert!(arm_is_valid(WorkloadSel::Multiturn, "slots", &no_hits).is_err());
+        assert!(arm_is_valid(WorkloadSel::Multiturn, "slots", &hits).is_ok());
+        // The batch backend cannot reuse a prefix at all, so zero is expected.
+        assert!(arm_is_valid(WorkloadSel::Multiturn, "batch", &no_hits).is_ok());
+        // Stateless never reuses anything.
+        assert!(arm_is_valid(WorkloadSel::Stateless, "slots", &no_hits).is_ok());
     }
 }
