@@ -31,6 +31,7 @@ use crate::config::{GlimmerConfig, GlimmerLayerType};
 use crate::glimmer::{GLIMMER_MAX_SPEC_BLOCK, GlimmerState, GlimmerWeights};
 use hipfire_runtime::llama::{
     fused_rmsnorm_rotate_for_mq, fused_rmsnorm_rotate_mq_batched_for,
+    fused_silu_mul_rotate_mq_batched_for, fused_silu_mul_rotate_mq_for,
     rotate_x_mq_batched_for, weight_gemv, weight_gemv_prerotated, EmbeddingFormat, WeightTensor,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -165,6 +166,14 @@ fn muse_gemm_enabled() -> bool {
     std::env::var("HIPFIRE_GLIMMER_MUSE_GEMM")
         .map(|v| v != "0" && !v.is_empty())
         .unwrap_or(true)
+}
+
+// Opt-out for fusing the FFN activation and MagnumQuant G256 rotation.
+#[inline]
+fn fused_silu_rotate_supported(w: &WeightTensor) -> bool {
+    std::env::var("HIPFIRE_GLIMMER_FUSED_SILU_ROTATE").as_deref() != Ok("0")
+        && matches!(w.gpu_dtype, DType::MQ4G256 | DType::MQ6G256)
+        && w.k % 256 == 0
 }
 
 #[inline]
@@ -797,11 +806,31 @@ fn glimmer_layer_decode(
         weight_gemv(gpu, &lw.up_proj, &state.tmp, &state.up_ffn)
             .map_err(|e| format!("glimmer L{layer_idx}: up_proj: {e}"))?;
     }
-    // silu(gate) * up -> ffn_hidden
-    gpu.silu_mul_f32(&state.gate_ffn, &state.up_ffn, &state.ffn_hidden)
-        .map_err(|e| format!("glimmer L{layer_idx}: silu_mul: {e:?}"))?;
-    weight_gemv(gpu, &lw.down_proj, &state.ffn_hidden, &state.ffn_out)
-        .map_err(|e| format!("glimmer L{layer_idx}: down_proj: {e}"))?;
+    // Fuse silu(gate) * up with the FWHT consumed by rotating MQ down projections.
+    if fused_silu_rotate_supported(&lw.down_proj) {
+        fused_silu_mul_rotate_mq_for(
+            gpu,
+            &lw.down_proj,
+            &state.gate_ffn,
+            &state.up_ffn,
+            &state.ffn_hidden,
+            lw.down_proj.k,
+        )
+        .map_err(|e| format!("glimmer L{layer_idx}: fused silu_mul+rotate: {e:?}"))?;
+        weight_gemv_prerotated(
+            gpu,
+            &lw.down_proj,
+            &state.ffn_hidden,
+            Some(&state.ffn_hidden),
+            &state.ffn_out,
+        )
+        .map_err(|e| format!("glimmer L{layer_idx}: down_proj (prerot): {e:?}"))?;
+    } else {
+        gpu.silu_mul_f32(&state.gate_ffn, &state.up_ffn, &state.ffn_hidden)
+            .map_err(|e| format!("glimmer L{layer_idx}: silu_mul: {e:?}"))?;
+        weight_gemv(gpu, &lw.down_proj, &state.ffn_hidden, &state.ffn_out)
+            .map_err(|e| format!("glimmer L{layer_idx}: down_proj: {e}"))?;
+    }
 
     // Sandwich post-FFN norm (post_eps) + residual add
     gpu.rmsnorm_f32(
@@ -1577,8 +1606,16 @@ pub fn verify_block_with_capture(
             proj_gemm_batched(gpu, &lw.up_proj, &nrm, &up_ffn, &x_rot, b, "up_proj")?;
         }
 
-        gpu.silu_mul_f32(&gate_ffn, &up_ffn, &ffn_hidden).map_err(|e| format!("glimmer batch L{layer_idx} silu_mul: {e:?}"))?;
-        proj_gemm_batched(gpu, &lw.down_proj, &ffn_hidden, &ffn_out, &down_rot, b, "down_proj")?;
+        if fused_silu_rotate_supported(&lw.down_proj) {
+            fused_silu_mul_rotate_mq_batched_for(
+                gpu, &lw.down_proj, &gate_ffn, &up_ffn, &down_rot, lw.down_proj.k, b,
+            )
+            .map_err(|e| format!("glimmer batch L{layer_idx} fused silu_mul+rotate: {e:?}"))?;
+            proj_gemm_batched_prerotated(gpu, &lw.down_proj, &ffn_hidden, &down_rot, &ffn_out, b, "down_proj")?;
+        } else {
+            gpu.silu_mul_f32(&gate_ffn, &up_ffn, &ffn_hidden).map_err(|e| format!("glimmer batch L{layer_idx} silu_mul: {e:?}"))?;
+            proj_gemm_batched(gpu, &lw.down_proj, &ffn_hidden, &ffn_out, &down_rot, b, "down_proj")?;
+        }
 
         // post-FFN norm + residual add: x = residual + norm(ffn_out)
         gpu.rmsnorm_batched(&ffn_out, &lw.post_feedforward_layernorm, &ffn_out, b, dim, post_eps).map_err(|e| format!("glimmer batch L{layer_idx} post_ffn rmsnorm: {e:?}"))?;
@@ -2286,14 +2323,24 @@ fn prefill_chunk_batched(
             prefill_proj_gemm_batched(gpu, &lw.gate_proj, &nrm, &gate_ffn, &x_rot, b, "gate_proj")?;
             prefill_proj_gemm_batched(gpu, &lw.up_proj, &nrm, &up_ffn, &x_rot, b, "up_proj")?;
         }
-        gpu.silu_mul_f32(&gate_ffn, &up_ffn, &ffn_hidden).map_err(|e| format!("glimmer prefill L{layer_idx} silu_mul: {e:?}"))?;
+        let fused_down_rotate = fused_silu_rotate_supported(&lw.down_proj);
+        if fused_down_rotate {
+            fused_silu_mul_rotate_mq_batched_for(
+                gpu, &lw.down_proj, &gate_ffn, &up_ffn, &down_rot, lw.down_proj.k, b,
+            )
+            .map_err(|e| format!("glimmer prefill L{layer_idx} fused silu_mul+rotate: {e:?}"))?;
+        } else {
+            gpu.silu_mul_f32(&gate_ffn, &up_ffn, &ffn_hidden).map_err(|e| format!("glimmer prefill L{layer_idx} silu_mul: {e:?}"))?;
+        }
         // ── down_proj: residual_wmma_gfx12 on gfx12 ──
         let down_use_residual = b > 1
             && gpu.arch_caps.has_wmma_w32_gfx12()
             && matches!(lw.down_proj.gpu_dtype, DType::MQ4G256 | DType::HFQ4G256);
         if down_use_residual {
-            // ffn_hidden is [B, hidden_dim]; down needs FWHT-rotated input for MQ4.
-            rotate_x_mq_batched_for(gpu, &lw.down_proj, &ffn_hidden, &down_rot, lw.down_proj.k, b).map_err(|e| format!("glimmer prefill L{layer_idx} rotate for down residual: {e:?}"))?;
+            if !fused_down_rotate {
+                // down needs FWHT-rotated input for MQ4.
+                rotate_x_mq_batched_for(gpu, &lw.down_proj, &ffn_hidden, &down_rot, lw.down_proj.k, b).map_err(|e| format!("glimmer prefill L{layer_idx} rotate for down residual: {e:?}"))?;
+            }
             gpu.hip.memset(&ffn_out.buf, 0, b * lw.down_proj.m * 4).map_err(|e| format!("glimmer prefill L{layer_idx} zero ffn_out: {e:?}"))?;
             run_prefill_residual_muse_or_key(
                 gpu,
@@ -2306,6 +2353,8 @@ fn prefill_chunk_batched(
                 lw.down_proj.k,
                 b,
             ).map_err(|e| format!("glimmer prefill L{layer_idx} down residual: {e}"))?;
+        } else if fused_down_rotate {
+            prefill_proj_gemm_batched_prerotated(gpu, &lw.down_proj, &ffn_hidden, &down_rot, &ffn_out, b, "down_proj")?;
         } else {
             prefill_proj_gemm_batched(gpu, &lw.down_proj, &ffn_hidden, &ffn_out, &down_rot, b, "down_proj")?;
         }
