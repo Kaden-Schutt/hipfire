@@ -1322,9 +1322,9 @@ def _self_test_glimmer_transcript_and_trace():
         raise AssertionError("expected transcript mismatch")
     except AssertionError as e:
         assert "mismatch" in str(e).lower()
-    log_ok = """[glimmer-cache] prior_len=0 n_tokens=0 prompt_len=123 lcp=0 hit=false replay_used=0 spliced=0
-[glimmer-cache] prior_len=45 n_tokens=45 prompt_len=90 lcp=45 hit=true replay_used=1 spliced=1
-[glimmer-cache] prior_len=90 n_tokens=90 prompt_len=150 lcp=90 hit=true replay_used=1 spliced=1
+    log_ok = """[glimmer-cache] prior_len=0 n_tokens=0 prompt_len=123 lcp=0 candidate=false hit=false reason=not_strict_forward_extension replay=0/0
+[glimmer-cache] prior_len=45 n_tokens=45 prompt_len=90 lcp=45 candidate=true hit=true reason= replay=1/1
+[glimmer-cache] prior_len=90 n_tokens=90 prompt_len=150 lcp=90 candidate=true hit=true reason= replay=1/1
 """
     rows = _parse_glimmer_cache_trace(log_ok)
     assert len(rows) == 3 and rows[1]["hit"] is True
@@ -1512,7 +1512,7 @@ def _project_mtp_ngram_timings(timings):
 
 # ---------- Glimmer helpers (feedback shape, trace, transcript, tool round-trip) ----------
 _GLIMMER_CACHE_RE = re.compile(
-    r"\[glimmer-cache\]\s+prior_len=(\d+)\s+n_tokens=(\d+)\s+prompt_len=(\d+)\s+lcp=(\d+)\s+hit=(true|false)",
+    r"\[glimmer-cache\]\s+prior_len=(\d+)\s+n_tokens=(\d+)\s+prompt_len=(\d+)\s+lcp=(\d+)\s+(?:candidate=(?:true|false)\s+)?hit=(true|false)",
     re.I,
 )
 
