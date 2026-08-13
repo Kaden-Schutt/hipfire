@@ -3611,6 +3611,10 @@ impl Gpu {
                     kernels::ATTENTION_Q8_0_KV_BATCHED_SRC.to_string(),
                 ));
                 specs.push((
+                    "attention_q8_0_kv_independent_masked_windowed",
+                    kernels::ATTENTION_Q8_0_KV_BATCHED_SRC.to_string(),
+                ));
+                specs.push((
                     "attention_q8_0_flash_prefill",
                     kernels::ATTENTION_Q8_0_FLASH_PREFILL_SRC.to_string(),
                 ));

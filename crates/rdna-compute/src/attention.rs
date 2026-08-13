@@ -2091,6 +2091,202 @@ impl Gpu {
         result
     }
 
+    /// Independent-sequence Q8 attention with active-mask and sliding window.
+    ///
+    /// Additive path for continuous-batch Glimmer decode. Physical lane index
+    /// is grid y; inactive lanes return before any Q/KV dereference. Lane-major
+    /// absolute Q8 cache with positive `lane_capacity`. `window == 0` is full
+    /// causal; otherwise `t_lo = max(0, positions[b] + 1 - window)`.
+    /// Full-mask + window-zero routes through existing
+    /// [`Self::attention_q8_0_kv_independent`] for exact ABI parity.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_q8_0_kv_independent_masked_windowed(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        lane_capacity: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        active_mask: u64,
+        window: usize,
+    ) -> HipResult<()> {
+        if batch_size == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "attention_q8_0_kv_independent_masked_windowed: batch_size == 0",
+            ));
+        }
+        if batch_size > 64 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_kv_independent_masked_windowed: batch_size {batch_size} > 64"
+                ),
+            ));
+        }
+        if lane_capacity == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "attention_q8_0_kv_independent_masked_windowed: lane_capacity == 0",
+            ));
+        }
+        if n_heads == 0 || n_kv_heads == 0 || head_dim == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "attention_q8_0_kv_independent_masked_windowed: invalid head geometry",
+            ));
+        }
+        if n_heads % n_kv_heads != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_kv_independent_masked_windowed: n_heads ({n_heads}) \
+                     not divisible by n_kv_heads ({n_kv_heads})"
+                ),
+            ));
+        }
+        if head_dim % 32 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_kv_independent_masked_windowed: head_dim ({head_dim}) \
+                     not divisible by 32"
+                ),
+            ));
+        }
+        let full_mask = if batch_size == 64 {
+            u64::MAX
+        } else {
+            (1u64 << batch_size) - 1
+        };
+        if active_mask & !full_mask != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_kv_independent_masked_windowed: active_mask bits \
+                     outside batch_size={batch_size} (mask=0x{active_mask:x})"
+                ),
+            ));
+        }
+        if active_mask == 0 {
+            return Ok(());
+        }
+        if max_ctx_len > lane_capacity {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_kv_independent_masked_windowed: max_ctx_len ({max_ctx_len}) \
+                     exceeds lane_capacity ({lane_capacity})"
+                ),
+            ));
+        }
+        // Full-mask + full-causal may reuse the existing independent API.
+        if active_mask == full_mask && window == 0 {
+            return self.attention_q8_0_kv_independent(
+                q,
+                k_cache,
+                v_cache,
+                out,
+                positions,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                lane_capacity,
+                max_ctx_len,
+                batch_size,
+            );
+        }
+
+        self.bind_thread()?;
+        let checked_shared_mem =
+            self.ensure_attention_q8_0_kv_independent_lds(lane_capacity, head_dim)?;
+        self.ensure_kernel(
+            "attention_q8_0_kv_independent_masked_windowed",
+            kernels::ATTENTION_Q8_0_KV_BATCHED_SRC,
+            "attention_q8_0_kv_independent_masked_windowed",
+        )?;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut q_ptr = q.buf.as_ptr();
+        let mut k_ptr = k_cache.buf.as_ptr();
+        let mut v_ptr = v_cache.buf.as_ptr();
+        let mut out_ptr = out.buf.as_ptr();
+        let mut pos_ptr = positions.buf.as_ptr();
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        assert!(
+            lane_capacity <= i32::MAX as usize,
+            "Q8 KV capacity exceeds i32"
+        );
+        let mut cap = lane_capacity as i32;
+        let mut sc = scale;
+        let mut bs = batch_size as i32;
+        let mut mask = active_mask;
+        let mut win = window as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut q_ptr as *mut _ as *mut c_void,
+            &mut k_ptr as *mut _ as *mut c_void,
+            &mut v_ptr as *mut _ as *mut c_void,
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut pos_ptr as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut cap as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+            &mut mask as *mut _ as *mut c_void,
+            &mut win as *mut _ as *mut c_void,
+        ];
+        let block_size = (lane_capacity.max(head_dim) as u32)
+            .next_power_of_two()
+            .min(256);
+        let shared_mem = checked_shared_mem;
+        let bytes =
+            crate::profile::attention_q8_0_kv_bytes(n_heads, n_kv_heads, head_dim, max_ctx_len)
+                * batch_size;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "attention",
+            "attention_q8_0_kv_independent_masked_windowed",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "attention_q8_0_kv_independent_masked_windowed",
+            [n_heads as u32, batch_size as u32, 1],
+            [block_size, 1, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(q_ptr);
+                b.push_ptr(k_ptr);
+                b.push_ptr(v_ptr);
+                b.push_ptr(out_ptr);
+                b.push_ptr(pos_ptr);
+                b.push_i32(nh);
+                b.push_i32(nkv);
+                b.push_i32(hd);
+                b.push_i32(cap);
+                b.push_f32(sc);
+                b.push_i32(bs);
+                b.push_u64(mask);
+                b.push_i32(win);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// Shared-memory ceiling for independent Q8 attention on this device.
     /// Prefers `hipDeviceGetAttribute(MaxSharedMemoryPerBlock)`; falls back to
     /// the documented 64 KiB RDNA hard limit when the query fails.
@@ -2442,8 +2638,14 @@ impl Gpu {
         window: usize,
     ) -> HipResult<bool> {
         self.bind_thread()?;
-        assert!(head_dim % 32 == 0, "head_dim {head_dim} must be a multiple of 32");
-        assert!(head_dim <= 256, "head_dim {head_dim} exceeds MAX_D_CHUNKS*16");
+        assert!(
+            head_dim % 32 == 0,
+            "head_dim {head_dim} must be a multiple of 32"
+        );
+        assert!(
+            head_dim <= 256,
+            "head_dim {head_dim} exceeds MAX_D_CHUNKS*16"
+        );
         // Tunable knobs — mirrors the parent `attention_q8_0_flash_prefill_wmma`:
         // - fixed_head_dim: env `HIPFIRE_FLASH_PREFILL_FIXED_HD` ( `0` => dynamic, 0)
         //   The compile-time head_dim is documented as a gfx12 necessity (spill
@@ -2481,7 +2683,9 @@ impl Gpu {
             )
         } else if self.arch_caps.is_rdna3_discrete() {
             (
-                format!("attention_q8_0_flash_prefill_wmma_swa_gfx1100_hd{head_dim}{tuning_suffix}"),
+                format!(
+                    "attention_q8_0_flash_prefill_wmma_swa_gfx1100_hd{head_dim}{tuning_suffix}"
+                ),
                 format!(
                     "#define SPLIT_Q 0\n#define FIXED_HEAD_DIM {}\n#define PREFETCH_V {}\n{}",
                     fixed_hd,
@@ -2491,7 +2695,9 @@ impl Gpu {
             )
         } else if self.arch_caps.is_rdna35_apu() {
             (
-                format!("attention_q8_0_flash_prefill_wmma_swa_gfx1151_hd{head_dim}{tuning_suffix}"),
+                format!(
+                    "attention_q8_0_flash_prefill_wmma_swa_gfx1151_hd{head_dim}{tuning_suffix}"
+                ),
                 format!(
                     "#define SPLIT_Q 0\n#define FIXED_HEAD_DIM {}\n#define PREFETCH_V {}\n{}",
                     fixed_hd,
@@ -2518,9 +2724,12 @@ impl Gpu {
         const S_STRIDE: usize = 18;
         // MUST track the kernel's LDS layout exactly; under-allocating overruns
         // V_lds_T / S_lds / m_lds and the kernel silently emits zeros.
-        let lds = (M_TILE * head_dim + head_dim * V_STRIDE + M_TILE * S_STRIDE) * 2
-            + M_TILE * 3 * 4;
-        assert!(lds <= 64 * 1024, "wmma swa flash prefill LDS {lds} exceeds 64KB");
+        let lds =
+            (M_TILE * head_dim + head_dim * V_STRIDE + M_TILE * S_STRIDE) * 2 + M_TILE * 3 * 4;
+        assert!(
+            lds <= 64 * 1024,
+            "wmma swa flash prefill LDS {lds} exceeds 64KB"
+        );
 
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut q_ptr = q.buf.as_ptr();
