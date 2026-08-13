@@ -615,6 +615,30 @@ fn main() {
             );
             return;
         }
+        // Adaptive-B effective range: Glimmer may only shrink within the
+        // trained/overridden B (scratch + drafter exact-length guard).
+        let trained_block_size = drafter_cfg.block_size;
+        let (glimmer_adaptive_b_min, glimmer_adaptive_b_max) = if adaptive_b {
+            let mut max_b = adaptive_b_max;
+            if max_b > trained_block_size {
+                eprintln!(
+                    "adaptive-b: WARN requested MAX={} > Glimmer trained block_size={}; clamping to {}",
+                    max_b, trained_block_size, trained_block_size,
+                );
+                max_b = trained_block_size;
+            }
+            if adaptive_b_min > max_b {
+                eprintln!(
+                    "adaptive-b: effective min {} > max {} (after clamp to trained B={}); aborting",
+                    adaptive_b_min, max_b, trained_block_size,
+                );
+                return;
+            }
+            (adaptive_b_min, max_b)
+        } else {
+            (trained_block_size, trained_block_size)
+        };
+
         eprintln!(
             "glimmer target: dim={} layers={} vocab={} heads={} kv_heads={} hd={} max_pos={}",
             glimmer_cfg.dim,
@@ -927,9 +951,14 @@ fn main() {
             };
             let mut cur_pos = state.n_tokens as u32; // prompt_len
             let mut emitted: Vec<u32> = Vec::with_capacity(max_tokens);
-            let mut _total_proposed: usize = 0;
+            let mut total_proposed: usize = 0;
             let mut total_accepted: usize = 0;
             let mut windows: usize = 0;
+            // Adaptive-B reporting state lives at row scope so the summary
+            // after bench metrics can see it even if the decode loop is skipped.
+            let mut adaptive_b_histogram: std::collections::HashMap<usize, u32> =
+                std::collections::HashMap::new();
+            let mut adaptive_b_changes: u32 = 0;
             // Emit seed as first token if not stop and max>0
             let mut done_due_to_stop = false;
             if max_tokens == 0 {
@@ -946,14 +975,38 @@ fn main() {
             let t_decode = Instant::now();
             // Spec loop — mirrors daemon's glimmer spec core (device/host capture).
             // Greedy only (temp 0.0) via accept_greedy_prefix.
+            // Adaptive-B matches the generic policy (lines ~2195-2244 / 2312-2349):
+            // start at trained B, rolling accept window 8, ≥4 obs, step 2,
+            // cooldown 3, UP/DOWN defaults 0.45/0.25. Scratch stays max-sized;
+            // per-cycle B only shrinks within trained/overridden max.
             if !done_due_to_stop && emitted.len() < max_tokens {
-                let block_size = drafter_cfg.block_size;
                 let hidden = drafter_cfg.hidden;
                 let mask_id = drafter_cfg.mask_token_id;
                 let ne = drafter_cfg.num_extract();
                 let row_elems = ne * hidden;
-                // Hoist noise buffer outside loop and reuse
-                let mut noise_embedding = vec![0f32; block_size * hidden];
+                // Reusable noise storage for the maximum trained B; fill/pass
+                // only the current-B slice each cycle.
+                let mut noise_embedding = vec![0f32; trained_block_size * hidden];
+                const TAU_WINDOW: usize = 8;
+                let mut accepts_window: std::collections::VecDeque<usize> =
+                    std::collections::VecDeque::with_capacity(TAU_WINDOW);
+                let mut current_adaptive_b: usize = glimmer_adaptive_b_max;
+                let mut adaptive_b_cycles_since_change: usize = 0;
+                const ADAPTIVE_B_STEP: usize = 2;
+                const ADAPTIVE_B_COOLDOWN: usize = 3;
+                let adaptive_b_up: f64 = std::env::var("HIPFIRE_ADAPTIVE_B_UP")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0.45);
+                let adaptive_b_down: f64 = std::env::var("HIPFIRE_ADAPTIVE_B_DOWN")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0.25);
+                if adaptive_b {
+                    eprintln!(
+                        "decoding (max {max_tokens} tokens, adaptive-B range {glimmer_adaptive_b_min}..={glimmer_adaptive_b_max}, draft trained at {trained_block_size})...",
+                    );
+                }
                 loop {
                     if emitted.len() >= max_tokens {
                         break;
@@ -962,6 +1015,38 @@ fn main() {
                         eprintln!("hit max_seq {}; stopping", max_seq);
                         break;
                     }
+                    // Adaptive-B scheduler — same rule as generic path.
+                    let block_size = if adaptive_b {
+                        if accepts_window.len() >= 4
+                            && adaptive_b_cycles_since_change >= ADAPTIVE_B_COOLDOWN
+                        {
+                            let ewma: f64 = accepts_window.iter().copied().sum::<usize>() as f64
+                                / accepts_window.len() as f64;
+                            let util = ewma / (current_adaptive_b.saturating_sub(1).max(1)) as f64;
+                            if util > adaptive_b_up
+                                && current_adaptive_b + ADAPTIVE_B_STEP <= glimmer_adaptive_b_max
+                            {
+                                current_adaptive_b += ADAPTIVE_B_STEP;
+                                adaptive_b_cycles_since_change = 0;
+                                adaptive_b_changes += 1;
+                            } else if util < adaptive_b_down
+                                && current_adaptive_b >= glimmer_adaptive_b_min + ADAPTIVE_B_STEP
+                            {
+                                current_adaptive_b -= ADAPTIVE_B_STEP;
+                                adaptive_b_cycles_since_change = 0;
+                                adaptive_b_changes += 1;
+                            }
+                        }
+                        adaptive_b_cycles_since_change += 1;
+                        *adaptive_b_histogram.entry(current_adaptive_b).or_insert(0) += 1;
+                        current_adaptive_b
+                    } else {
+                        trained_block_size
+                    };
+                    // Clone cfg so drafter exact-length guard sees current B;
+                    // scratch remains allocated for trained max.
+                    let mut cycle_drafter_cfg = drafter_cfg.clone();
+                    cycle_drafter_cfg.block_size = block_size;
                     if cur_pos as usize + block_size > max_seq {
                         eprintln!("next block would exceed max_seq {}; stopping", max_seq);
                         break;
@@ -979,6 +1064,7 @@ fn main() {
                         .expect("glimmer drafter noise embed");
                         noise_embedding[i * hidden..(i + 1) * hidden].copy_from_slice(&v[..hidden]);
                     }
+                    let noise_slice = &noise_embedding[..block_size * hidden];
                     // History must end exactly at cur_pos (gap is fatal).
                     let history_end = if device_capture {
                         state
@@ -1011,10 +1097,10 @@ fn main() {
                             .expect("device hidden log missing at draft forward");
                         hipfire_arch_muse_glimmer::drafter::glimmer_drafter_forward_device(
                             &mut gpu,
-                            &drafter_cfg,
+                            &cycle_drafter_cfg,
                             &drafter_weights,
                             &mut drafter_scratch,
-                            &noise_embedding,
+                            noise_slice,
                             log,
                             &positions,
                             block_size,
@@ -1032,10 +1118,10 @@ fn main() {
                         };
                         hipfire_arch_muse_glimmer::drafter::glimmer_drafter_forward(
                             &mut gpu,
-                            &drafter_cfg,
+                            &cycle_drafter_cfg,
                             &drafter_weights,
                             &mut drafter_scratch,
-                            &noise_embedding,
+                            noise_slice,
                             &target_hidden,
                             &positions,
                             block_size,
@@ -1067,7 +1153,7 @@ fn main() {
                     )
                     .expect("glimmer drafter lm_head");
                     gpu.free_tensor(hidden_for_draft).ok();
-                    _total_proposed += drafts.len();
+                    total_proposed += drafts.len();
                     // --- Verify: block = [seed, drafts...] at cur_pos ---
                     // Delay capture commit/rollback until AFTER routing.
                     let window_start = cur_pos as usize;
@@ -1103,6 +1189,11 @@ fn main() {
                     let ga = hipfire_runtime::spec::accept_greedy_prefix(&drafts, &picks, None);
                     total_accepted += ga.accepted;
                     windows += 1;
+                    // Rolling accept window for adaptive-B (after acceptance).
+                    if accepts_window.len() == TAU_WINDOW {
+                        accepts_window.pop_front();
+                    }
+                    accepts_window.push_back(ga.accepted);
                     let accept = ga.accepted;
                     let bonus = if accept < drafts.len() {
                         picks[accept]
@@ -1195,8 +1286,8 @@ fn main() {
             } else {
                 0.0
             };
-            let accept_rate = if windows > 0 {
-                total_accepted as f32 / (windows * (drafter_cfg.block_size - 1)) as f32
+            let accept_rate = if total_proposed > 0 {
+                total_accepted as f32 / total_proposed as f32
             } else {
                 0.0
             };
@@ -1224,7 +1315,11 @@ fn main() {
                     0.0
                 },
             );
-            eprintln!("accept_rate (accepted / (cycles × (B-1))): {accept_rate:.3}");
+            if adaptive_b {
+                eprintln!("accept_rate (accepted / proposed): {accept_rate:.3}");
+            } else {
+                eprintln!("accept_rate (accepted / (cycles × (B-1))): {accept_rate:.3}");
+            }
             // BENCH METRICS — same shape as generic path
             let (vram_free_bytes, vram_total_bytes) = gpu.hip.get_vram_info().unwrap_or((0, 0));
             let vram_used_mb = ((vram_total_bytes.saturating_sub(vram_free_bytes)) as f64
@@ -1244,6 +1339,31 @@ fn main() {
             eprintln!("vram_used_mb: {}", vram_used_mb);
             eprintln!("vram_total_mb: {}", vram_total_mb);
             eprintln!("=====================");
+            // Adaptive-B usage report — only when --adaptive-b is on.
+            if adaptive_b && !adaptive_b_histogram.is_empty() {
+                let mut buckets: Vec<(usize, u32)> =
+                    adaptive_b_histogram.iter().map(|(&b, &c)| (b, c)).collect();
+                buckets.sort_by_key(|(b, _)| *b);
+                let total: u32 = buckets.iter().map(|(_, c)| *c).sum();
+                let mean_b: f32 = buckets
+                    .iter()
+                    .map(|(b, c)| (*b as f32) * (*c as f32))
+                    .sum::<f32>()
+                    / total.max(1) as f32;
+                let dist: String = buckets
+                    .iter()
+                    .map(|(b, c)| format!("B={b}:{:.1}%", *c as f32 * 100.0 / total.max(1) as f32))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                eprintln!(
+                    "adaptive-b: range={}..={} mean_B={:.2} changes={} dist=[{}]",
+                    glimmer_adaptive_b_min,
+                    glimmer_adaptive_b_max,
+                    mean_b,
+                    adaptive_b_changes,
+                    dist,
+                );
+            }
             eprintln!("Glimmer tokens: {:?}", emitted);
             if multi_row {
                 eprintln!("@@@ ROW {row_idx} END @@@");
