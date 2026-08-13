@@ -108,8 +108,8 @@ pub fn forward_decode_batch_glimmer(
         }
     }
     batch_weight_formats_supported(weights)?;
-
-    // stage tokens and positions into device buffers
+    gpu.scratch.fp16_x_source_ptr = std::ptr::null_mut();
+    gpu.scratch.fp8_x_source_ptr = std::ptr::null_mut();
     let tok_i32: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
     let tok_bytes: Vec<u8> = tok_i32.iter().flat_map(|v| v.to_ne_bytes()).collect();
     gpu.hip
@@ -193,7 +193,7 @@ pub(crate) fn forward_decode_batch_prepared_glimmer(
     let post_eps = cfg.post_norm_eps;
     let b = batch_size;
 
-    // batch views (first b rows)
+    // batch views (first b rows) — dense physical-lane layout: row i == lane i
     let x = state.x_batch.sub_offset(0, b * dim);
     let residual = state.residual_batch.sub_offset(0, b * dim);
     let tmp = state.tmp_batch.sub_offset(0, b * dim);
@@ -502,6 +502,7 @@ pub(crate) fn forward_decode_batch_prepared_glimmer(
         gpu.scale_f32(&logits_view, cfg.output_multiplier)
             .map_err(|e| format!("glimmer batch output_multiplier: {e:?}"))?;
     }
+    // Per-lane isolation: scaling is per-element on the dense b*vocab view, so holes stay inert
     if cfg.final_logit_softcapping > 0.0 {
         gpu.logit_softcap_f32(
             &logits_view,

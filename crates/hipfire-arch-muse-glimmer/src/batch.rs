@@ -185,6 +185,8 @@ impl GlimmerDecodeBatchState {
         // LDS check before any allocation
         gpu.ensure_attention_q8_0_kv_independent_lds(lane_capacity, cfg.head_dim)
             .map_err(|e| format!("glimmer batch: LDS check: {e:?}"))?;
+        gpu.scratch.fp16_x_source_ptr = std::ptr::null_mut();
+        gpu.scratch.fp8_x_source_ptr = std::ptr::null_mut();
 
         let dim = cfg.dim;
         let hidden_dim = cfg.hidden_dim;
@@ -424,6 +426,8 @@ impl GlimmerDecodeBatchState {
                 .memset(&t.buf, 0, t.buf.size())
                 .map_err(|e| format!("glimmer batch reset memset: {e:?}"))?;
         }
+        gpu.scratch.fp16_x_source_ptr = std::ptr::null_mut();
+        gpu.scratch.fp8_x_source_ptr = std::ptr::null_mut();
         Ok(())
     }
 
@@ -437,11 +441,6 @@ impl GlimmerDecodeBatchState {
                 self.max_batch
             ));
         }
-        // Clear KV lane slice for both caches.
-        // Use byte-offset clearing via q8_lane_view-like memset on subranges.
-        // For contiguous Q8 caches, each token is n_kv*head_dim blocks of 34 bytes.
-        // Instead of constructing lane views, directly memset the lane's byte range
-        // in each per-layer buffer.
         let bytes_per_token = self.kv_sliding.n_kv_heads * (self.kv_sliding.head_dim / 32) * 34;
         let lane_bytes = self.lane_capacity * bytes_per_token;
         let byte_off = lane * lane_bytes;
@@ -468,7 +467,6 @@ impl GlimmerDecodeBatchState {
                 .map_err(|e| format!("glimmer batch reset_lane kv memset: {e:?}"))?;
             std::mem::forget(tmp_buf);
         }
-        // zero per-row scratch/logits/sampler rows
         let zero_row = |gpu: &mut Gpu, t: &GpuTensor, dim: usize| -> Result<(), String> {
             let view = t.sub_offset(lane * dim, dim);
             gpu.hip
@@ -493,7 +491,6 @@ impl GlimmerDecodeBatchState {
         zero_row(gpu, &self.down_rot_batch, self.hidden_dim)?;
         zero_row(gpu, &self.final_hidden, self.dim)?;
         zero_row(gpu, &self.logits, self.vocab_size)?;
-        // sample_out is 2 per lane
         {
             let v = self.sample_out.sub_offset(lane * 2, 2);
             gpu.hip
@@ -518,11 +515,44 @@ impl GlimmerDecodeBatchState {
                 .memset(&v.buf, 0, v.buf.size())
                 .map_err(|e| format!("glimmer batch reset_lane tokens: {e:?}"))?;
         }
+        gpu.scratch.fp16_x_source_ptr = std::ptr::null_mut();
+        gpu.scratch.fp8_x_source_ptr = std::ptr::null_mut();
         Ok(())
     }
 
     /// Consumes self and returns all GPU resources.
     pub fn free_gpu(self, gpu: &mut Gpu) {
+        let ptrs: Vec<*mut std::ffi::c_void> = [
+            &self.x_batch,
+            &self.residual_batch,
+            &self.tmp_batch,
+            &self.x_rot_batch,
+            &self.q_batch,
+            &self.k_batch,
+            &self.v_batch,
+            &self.attn_gate_batch,
+            &self.attn_out_batch,
+            &self.o_out_batch,
+            &self.o_rot_batch,
+            &self.gate_batch,
+            &self.up_batch,
+            &self.ffn_hidden_batch,
+            &self.ffn_out_batch,
+            &self.down_rot_batch,
+            &self.final_hidden,
+            &self.logits,
+            &self.logits_scratch,
+            &self.sample_out,
+            &self.sample_rng_states,
+            &self.positions,
+            &self.tokens,
+            &self.repeat_dummy,
+            &self.qk_norm_ones,
+            &self.embed_norm_ones,
+        ]
+        .iter()
+        .map(|t| t.buf.as_ptr() as *mut std::ffi::c_void)
+        .collect();
         let _ = self.kv_sliding.free_gpu(gpu);
         let _ = self.kv_full.free_gpu(gpu);
         for t in [
@@ -555,6 +585,11 @@ impl GlimmerDecodeBatchState {
         ] {
             let _ = gpu.free_tensor(t);
         }
+        for ptr in ptrs {
+            gpu.scratch.invalidate_x_caches_for(ptr);
+        }
+        gpu.scratch.fp16_x_source_ptr = std::ptr::null_mut();
+        gpu.scratch.fp8_x_source_ptr = std::ptr::null_mut();
     }
 
     /// Admission-only sequential per-lane prefill with cancellation.
@@ -631,6 +666,8 @@ impl GlimmerDecodeBatchState {
             if should_cancel() {
                 return Ok(false);
             }
+            gpu.scratch.fp16_x_source_ptr = std::ptr::null_mut();
+            gpu.scratch.fp8_x_source_ptr = std::ptr::null_mut();
             // stage position
             let pos_i32 = pos_idx as i32;
             gpu.hip
@@ -795,6 +832,8 @@ impl GlimmerDecodeBatchState {
                     .map_err(|e| format!("glimmer prefill ffn residual: {e:?}"))?;
                 gpu.rmsnorm_f32(&x_lane, &lw.pre_feedforward_layernorm, &tmp_lane, rms_eps)
                     .map_err(|e| format!("glimmer prefill pre_ffn: {e:?}"))?;
+                gpu.scratch.fp16_x_source_ptr = std::ptr::null_mut();
+                gpu.scratch.fp8_x_source_ptr = std::ptr::null_mut();
                 hipfire_runtime::llama::weight_gemv(gpu, &lw.gate_proj, &tmp_lane, &gate_lane)
                     .map_err(|e| format!("glimmer prefill gate: {e}"))?;
                 hipfire_runtime::llama::weight_gemv(gpu, &lw.up_proj, &tmp_lane, &up_lane)
