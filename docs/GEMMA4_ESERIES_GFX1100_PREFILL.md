@@ -74,9 +74,9 @@ All 120 paired generated outputs were byte-identical. The direct sequential-vers
 Reproduce the timing runs with:
 
 ```bash
-PLE_BATCHED_PREFILL=0 BATCHES=8,64 LIMIT=10 REPEATS=3 \
+PLE_BATCHED_PREFILL=0 BATCHES="8 64" LIMIT=10 REPEATS=3 \
   scripts/bench-gemma4-gfx11-prefill-batch.sh
-PLE_BATCHED_PREFILL=1 BATCHES=8,64 LIMIT=10 REPEATS=3 \
+PLE_BATCHED_PREFILL=1 BATCHES="8 64" LIMIT=10 REPEATS=3 \
   scripts/bench-gemma4-gfx11-prefill-batch.sh
 ```
 
@@ -89,3 +89,33 @@ HIP_VISIBLE_DEVICES=1 HIPFIRE_GEMMA4_PLE_BATCHED_PREFILL=1 \
 ```
 
 Raw timing artifacts are preserved under `target/validation/gemma4-gfx11-ple-batched/{b8-off-r3,b8-on-r3,on-r3}`; the matching batch-64 baseline is `target/validation/gemma4-gfx11-prefill-4w/off-r3`.
+
+## Batched PLE branch projections
+
+The larger E-series-specific gap was inside every layer's PLE branch. Prefill issued one `input_gate` GEMV and one output `projection` GEMV per row, so batch 64 re-read both Q8 matrices and launched both kernels 64 times per layer. `HIPFIRE_GEMMA4_PLE_BRANCH_BATCHED_PREFILL=1` routes both projections through the existing batched Q8 dispatcher on exact gfx1100 when `B > 1`; all other architectures, dtypes, and batch 1 keep the row-wise path.
+
+Three-repeat paired measurements show that eliminating these per-row launches is the dominant gfx1100 E-series prefill optimization:
+
+| Model | Batch | Flag off | Flag on | Prefill delta | TTFT delta |
+|---|---:|---:|---:|---:|---:|
+| Gemma 4 E2B Q8 | 8 | 414.510 tok/s | 443.485 tok/s | +6.99% | -6.56% |
+| Gemma 4 E4B Q8 | 8 | 283.055 tok/s | 296.890 tok/s | +4.89% | -4.63% |
+| Gemma 4 E2B Q8 | 64 | 1,172.740 tok/s | 1,725.170 tok/s | +47.11% | -32.46% |
+| Gemma 4 E4B Q8 | 64 | 864.560 tok/s | 1,212.715 tok/s | +40.27% | -28.99% |
+
+The 16-token paired gate produced 60/60 byte-identical outputs at both batch sizes. Direct sequential-versus-batched validation passed at `B=1,2,8,64` for E2B and E4B: every last-token and post-batch KV-check argmax matched, with minimum observed logit cosine `0.9998514`.
+
+A separate 30-question GSM8K gate used a 4,096-token output cap. The generated wording diverged on 5/30 prompts for each model, as expected from a non-bit-identical WMMA path over long greedy trajectories, but every extracted prediction and correctness decision matched the row-wise baseline. Accuracy remained 80% for E2B and 90% for E4B. Median prefill improved from 1,143.610 to 1,702.915 tok/s (+48.91%) on E2B and from 856.420 to 1,194.965 tok/s (+39.53%) on E4B; decode throughput was unchanged within normal run variance.
+
+The smaller model-projection probe and this branch probe are intentionally not composed. Enabling both produced one short-output trajectory divergence in the characterization set; when both flags are present, the higher-value branch route takes precedence and the model projection retains its row-wise GEMV.
+
+Reproduce the paired branch measurements with:
+
+```bash
+PLE_BRANCH_BATCHED_PREFILL=0 BATCHES="8 64" LIMIT=10 REPEATS=3 \
+  scripts/bench-gemma4-gfx11-prefill-batch.sh
+PLE_BRANCH_BATCHED_PREFILL=1 BATCHES="8 64" LIMIT=10 REPEATS=3 \
+  scripts/bench-gemma4-gfx11-prefill-batch.sh
+```
+
+Raw artifacts are under `target/validation/gemma4-gfx11-ple-branch-batched/{branch-off-r3,branch-on-r3,b8-branch-on-r3,branch-on-full30}`.

@@ -159,6 +159,7 @@ class Daemon:
         prefill_batch: int,
         q8_fused_prefill: bool,
         ple_batched_prefill: bool,
+        ple_branch_batched_prefill: bool,
         runtime_home: Path | None,
     ):
         env = os.environ.copy()
@@ -172,6 +173,9 @@ class Daemon:
         env["HIPFIRE_GEMMA4_PREFILL_BATCH"] = str(prefill_batch)
         env["HIPFIRE_GEMMA4_Q8_FUSED_PREFILL"] = "1" if q8_fused_prefill else "0"
         env["HIPFIRE_GEMMA4_PLE_BATCHED_PREFILL"] = "1" if ple_batched_prefill else "0"
+        env["HIPFIRE_GEMMA4_PLE_BRANCH_BATCHED_PREFILL"] = (
+            "1" if ple_branch_batched_prefill else "0"
+        )
         self.stderr_stream = stderr_path.open("w", buffering=1)
         self.proc = subprocess.Popen(
             [str(binary)],
@@ -360,6 +364,7 @@ def main() -> int:
     parser.add_argument("--prefill-batch", type=int, default=8)
     parser.add_argument("--q8-fused-prefill", action="store_true")
     parser.add_argument("--ple-batched-prefill", action="store_true")
+    parser.add_argument("--ple-branch-batched-prefill", action="store_true")
     parser.add_argument("--runtime-home", type=Path)
     args = parser.parse_args()
     if args.suite == "longbench" and (not args.dataset or not args.manifest):
@@ -412,6 +417,7 @@ def main() -> int:
         "prefill_batch": args.prefill_batch,
         "q8_fused_prefill": args.q8_fused_prefill,
         "ple_batched_prefill": args.ple_batched_prefill,
+        "ple_branch_batched_prefill": args.ple_branch_batched_prefill,
         "repeats": args.repeats,
         "manifest": manifest_data,
     }
@@ -424,6 +430,7 @@ def main() -> int:
         args.prefill_batch,
         args.q8_fused_prefill,
         args.ple_batched_prefill,
+        args.ple_branch_batched_prefill,
         args.runtime_home,
     )
     rows = list(existing)

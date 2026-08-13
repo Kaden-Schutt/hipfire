@@ -573,6 +573,9 @@ fn prepare_per_layer_inputs_batched(
 
     if gpu.arch == "gfx1100"
         && gpu.flags.gemma4_ple_batched_prefill
+        // Repeated WMMA rounding from both PLE probes can change long greedy
+        // trajectories. Prefer the much larger branch win when both are set.
+        && !gpu.flags.gemma4_ple_branch_batched_prefill
         && b > 1
         && ple.model_projection.gpu_dtype == DType::Q8_0
     {
@@ -2346,11 +2349,28 @@ fn apply_per_layer_input_branch_batched(
     gpu.hip
         .memcpy_dtod_at(&residual.buf, 0, &x.buf, 0, b * dim * 4)
         .map_err(|e| format!("gemma4 batch ple save residual: {e:?}"))?;
-    for row in 0..b {
-        let x_row = x.sub_offset(row * dim, dim);
-        let gate_row = ple.gate.sub_offset(row * ple_dim, ple_dim);
-        weight_gemv(gpu, &ple_weights.input_gate, &x_row, &gate_row)
-            .map_err(|e| format!("gemma4 batch ple input_gate row {row}: {e}"))?;
+    let batched_projections = gpu.arch == "gfx1100"
+        && gpu.flags.gemma4_ple_branch_batched_prefill
+        && b > 1
+        && ple_weights.input_gate.gpu_dtype == DType::Q8_0
+        && ple_weights.projection.gpu_dtype == DType::Q8_0;
+    if batched_projections {
+        proj_gemm_batched(
+            gpu,
+            &ple_weights.input_gate,
+            x,
+            ple.gate,
+            nrm,
+            b,
+            "ple input_gate",
+        )?;
+    } else {
+        for row in 0..b {
+            let x_row = x.sub_offset(row * dim, dim);
+            let gate_row = ple.gate.sub_offset(row * ple_dim, ple_dim);
+            weight_gemv(gpu, &ple_weights.input_gate, &x_row, &gate_row)
+                .map_err(|e| format!("gemma4 batch ple input_gate row {row}: {e}"))?;
+        }
     }
     gpu.gelu_tanh_f32(ple.gate, ple.hidden, b * ple_dim)
         .map_err(|e| format!("gemma4 batch ple gelu_tanh: {e:?}"))?;
@@ -2361,9 +2381,24 @@ fn apply_per_layer_input_branch_batched(
             .sub_offset(row * packed_dim + tail.layer_idx * ple_dim, ple_dim);
         gpu.mul_f32(&hidden_row, &layer_input, &hidden_row)
             .map_err(|e| format!("gemma4 batch ple mul row {row}: {e:?}"))?;
-        let out_row = ple.out.sub_offset(row * dim, dim);
-        weight_gemv(gpu, &ple_weights.projection, &hidden_row, &out_row)
-            .map_err(|e| format!("gemma4 batch ple projection row {row}: {e}"))?;
+    }
+    if batched_projections {
+        proj_gemm_batched(
+            gpu,
+            &ple_weights.projection,
+            ple.hidden,
+            ple.out,
+            nrm,
+            b,
+            "ple projection",
+        )?;
+    } else {
+        for row in 0..b {
+            let hidden_row = ple.hidden.sub_offset(row * ple_dim, ple_dim);
+            let out_row = ple.out.sub_offset(row * dim, dim);
+            weight_gemv(gpu, &ple_weights.projection, &hidden_row, &out_row)
+                .map_err(|e| format!("gemma4 batch ple projection row {row}: {e}"))?;
+        }
     }
     gpu.rmsnorm_batched(
         ple.out,

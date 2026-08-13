@@ -2406,6 +2406,15 @@ pub static FIELDS: &[ConfigField] = &[
         "Batch the Gemma 4 E-series PLE model projection on gfx1100."
     ),
     process_bool_field!(
+        "kernel.gemma4_ple_branch_batched_prefill",
+        "gemma4_ple_branch_batched_prefill",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_GEMMA4_PLE_BRANCH_BATCHED_PREFILL",
+        "Batch the Gemma 4 E-series PLE branch projections on gfx1100."
+    ),
+    process_bool_field!(
         "kernel.deepseek4_q8_wmma",
         "deepseek4_q8_wmma",
         Kernel,

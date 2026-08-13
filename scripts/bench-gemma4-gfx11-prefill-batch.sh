@@ -15,6 +15,7 @@ MAX_TOKENS="${MAX_TOKENS:-16}"
 REPEATS="${REPEATS:-1}"
 FUSED_Q8_PREFILL="${FUSED_Q8_PREFILL:-0}"
 PLE_BATCHED_PREFILL="${PLE_BATCHED_PREFILL:-0}"
+PLE_BRANCH_BATCHED_PREFILL="${PLE_BRANCH_BATCHED_PREFILL:-0}"
 COOLDOWN="${COOLDOWN:-10}"
 RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 OUT_ROOT="${OUT_ROOT:-$ROOT/target/validation/gemma4-gfx11-prefill-batch/$RUN_ID}"
@@ -30,6 +31,9 @@ if [[ "$FUSED_Q8_PREFILL" == 1 ]]; then
 fi
 if [[ "$PLE_BATCHED_PREFILL" == 1 ]]; then
     fused_args+=(--ple-batched-prefill)
+fi
+if [[ "$PLE_BRANCH_BATCHED_PREFILL" == 1 ]]; then
+    fused_args+=(--ple-branch-batched-prefill)
 fi
 for model in e2b e4b; do
     if [[ "$model" == e2b ]]; then artifact="$E2B"; else artifact="$E4B"; fi
