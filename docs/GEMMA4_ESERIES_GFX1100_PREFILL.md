@@ -22,6 +22,25 @@ A second gate ran the first 30 GSM8K prompts with the normal 4,096-token output 
 
 The Q8 projection path already selects the wave32 `gemm_q8_0_wmma` kernel on gfx1100. The main loss at batch 8 is under-filled 16-row WMMA tiles plus repeated per-chunk fixed overhead. This change therefore selects batch 64 by default only on exact `gfx1100`. `HIPFIRE_GEMMA4_PREFILL_BATCH` remains authoritative, and all unvalidated architectures retain the existing batch-1 default.
 
+## gfx1100 production policy
+
+The three cross-model routes now use an architecture-aware `auto` policy. The PLE branch and activation routes passed direct logits/KV validation, short-output hash gates, and the 30-question GSM8K gate; batched embedding passed direct logits/KV validation and 120 paired short-output hashes. On exact `gfx1100`, batched embedding lookup, batched PLE branch projections, and fused PLE activation are enabled by default; `gfx1101`, `gfx1102`, `gfx1151`, and `gfx1201` retain their previous behavior. Each route remains independently disableable with `HIPFIRE_GEMMA4_BATCHED_EMBEDDING_PREFILL=0`, `HIPFIRE_GEMMA4_PLE_BRANCH_BATCHED_PREFILL=0`, or `HIPFIRE_GEMMA4_PLE_ACTIVATION_FUSED_PREFILL=0`.
+
+The smaller PLE model-projection batching probe and Q8 projection fusion remain opt-in. The former did not compose safely with the higher-value branch route; the latter improved E2B but was neutral on E4B, so it is not a family-wide default.
+
+The final policy was remeasured with one release binary, ten fixed GSM8K prompts, three repeats, batch 64, and 16 generated tokens. `off` explicitly disabled the three promoted routes, `auto` removed all three overrides, and `on` explicitly enabled them:
+
+| Model | Policy | Prefill median | TTFT median | Decode median |
+|---|---|---:|---:|---:|
+| Gemma 4 E2B Q8 | off | 1,177.520 tok/s | 646.157 ms | 104.920 tok/s |
+| Gemma 4 E2B Q8 | auto | 2,264.140 tok/s | 334.035 ms | 102.750 tok/s |
+| Gemma 4 E2B Q8 | on | 2,254.410 tok/s | 335.309 ms | 103.230 tok/s |
+| Gemma 4 E4B Q8 | off | 870.885 tok/s | 877.704 ms | 68.970 tok/s |
+| Gemma 4 E4B Q8 | auto | 1,481.880 tok/s | 513.841 ms | 68.670 tok/s |
+| Gemma 4 E4B Q8 | on | 1,472.545 tok/s | 517.351 ms | 68.670 tok/s |
+
+Relative to explicit off, auto improves prefill by 92.28% on E2B and 70.16% on E4B while reducing TTFT by 48.30% and 41.46%, respectively. Auto and explicit on differ by at most 0.68% across their prefill/TTFT medians, confirming that the architecture default selects the intended routes. Every corresponding off/auto/on short output was byte-identical for both models. Raw artifacts are under `target/validation/gemma4-gfx11-production-policy/{off-r3,auto-r3,on-r3}`.
+
 Reproduce with `scripts/bench-gemma4-gfx11-prefill-batch.sh`.
 
 ## Q8 Projection Fusion Probe
@@ -92,7 +111,7 @@ Raw timing artifacts are preserved under `target/validation/gemma4-gfx11-ple-bat
 
 ## Batched PLE branch projections
 
-The larger E-series-specific gap was inside every layer's PLE branch. Prefill issued one `input_gate` GEMV and one output `projection` GEMV per row, so batch 64 re-read both Q8 matrices and launched both kernels 64 times per layer. `HIPFIRE_GEMMA4_PLE_BRANCH_BATCHED_PREFILL=1` routes both projections through the existing batched Q8 dispatcher on exact gfx1100 when `B > 1`; all other architectures, dtypes, and batch 1 keep the row-wise path.
+The larger E-series-specific gap was inside every layer's PLE branch. Prefill issued one `input_gate` GEMV and one output `projection` GEMV per row, so batch 64 re-read both Q8 matrices and launched both kernels 64 times per layer. The auto policy routes both projections through the existing batched Q8 dispatcher on exact gfx1100 when `B > 1`; setting `HIPFIRE_GEMMA4_PLE_BRANCH_BATCHED_PREFILL=0` restores the row-wise path. All other architectures, dtypes, and batch 1 keep their original route.
 
 Three-repeat paired measurements show that eliminating these per-row launches is the dominant gfx1100 E-series prefill optimization:
 
@@ -109,6 +128,15 @@ A separate 30-question GSM8K gate used a 4,096-token output cap. The generated w
 
 The smaller model-projection probe and this branch probe are intentionally not composed. Enabling both produced one short-output trajectory divergence in the characterization set; when both flags are present, the higher-value branch route takes precedence and the model projection retains its row-wise GEMV.
 
+A scalar-order composition was also tested and rejected. The model projection was routed through the existing `gemm_q8_0_batched` kernel, whose per-batch accumulator is designed to follow the row-wise Q8 GEMV reduction order, while the branch and activation optimizations remained enabled. Direct E2B/E4B validation passed at `B=1,2,8,64`, including the post-batch KV check, but 3/30 paired E2B short outputs diverged (E4B: 0/30), so the route is not serving-level bit-exact. Batch-64 timing also regressed on both models:
+
+| Model | Exact projection off | Exact projection on | Prefill delta | TTFT delta |
+|---|---:|---:|---:|---:|
+| Gemma 4 E2B Q8 | 2,279.275 tok/s | 2,242.960 tok/s | -1.59% | +1.47% |
+| Gemma 4 E4B Q8 | 1,500.000 tok/s | 1,428.425 tok/s | -4.77% | +5.17% |
+
+The scalar batched kernel keeps up to 64 independent accumulators per wave and did not repay that register/loop cost for these projection shapes. No scalar-composition dispatch change is retained. Raw artifacts are under `target/validation/gemma4-gfx11-ple-exact-compose/{off-r3,on-r3}`.
+
 Reproduce the paired branch measurements with:
 
 ```bash
@@ -122,7 +150,7 @@ Raw artifacts are under `target/validation/gemma4-gfx11-ple-branch-batched/{bran
 
 ## Fused PLE activation and strided multiply
 
-After batching the two branch projections, every E-series layer still issued one full-batch GELU launch followed by one multiply launch per row. `HIPFIRE_GEMMA4_PLE_ACTIVATION_FUSED_PREFILL=1` replaces that sequence with one graph-capture-safe kernel that reads the selected layer slice directly from the packed PLE buffer. At batch 64 this removes 64 launches per layer, or 2,240 launches per E2B prefill chunk and 2,688 per E4B chunk. The route is restricted to exact gfx1100 with `B > 1`; all other paths retain the original kernels.
+After batching the two branch projections, every E-series layer still issued one full-batch GELU launch followed by one multiply launch per row. The gfx1100 auto policy replaces that sequence with one graph-capture-safe kernel that reads the selected layer slice directly from the packed PLE buffer. At batch 64 this removes 64 launches per layer, or 2,240 launches per E2B prefill chunk and 2,688 per E4B chunk. Setting `HIPFIRE_GEMMA4_PLE_ACTIVATION_FUSED_PREFILL=0` restores the original kernels.
 
 Three-repeat paired batch-64 measurements used the same binary with only the activation flag changed:
 
@@ -149,3 +177,109 @@ PLE_BRANCH_BATCHED_PREFILL=1 PLE_ACTIVATION_FUSED_PREFILL=1 \
 ```
 
 Raw artifacts are under `target/validation/gemma4-gfx11-ple-activation-fused/{activation-off-r3,activation-on-r3,b8-activation-on-r3,activation-on-full30}`.
+
+## Rejected main-FFN activation fusion
+
+A follow-up probe fused the main FFN `gelu_tanh(gate)` and `multiply(up)` sequence into one graph-capture-safe gfx1100 kernel. The kernel compiled to wave32 with 8 VGPRs, 18 SGPRs, no spills, and no private segment, but the paired batch-64 workload regressed on both E-series models:
+
+| Model | Fusion off | Fusion on | Prefill delta | TTFT delta |
+|---|---:|---:|---:|---:|
+| Gemma 4 E2B Q8 | 2,210.810 tok/s | 2,180.370 tok/s | -1.38% | +1.50% |
+| Gemma 4 E4B Q8 | 1,462.455 tok/s | 1,444.625 tok/s | -1.22% | +1.55% |
+
+All 60 paired outputs were byte-identical. Removing one launch and one intermediate read/write did not offset the fused kernel's execution cost for these shapes, so the implementation and flag were removed. Raw probe artifacts remain under `target/validation/gemma4-gfx11-ffn-activation-fused/{off-r3,on-r3}`.
+
+## Batched main and PLE embedding lookup
+
+The main and E-series PLE embedding paths originally issued one lookup per row and copied every main embedding row into the batch buffer separately. The gfx1100 auto policy reuses the existing HFQ4/Q8 batched embedding kernels for both tables and shares one token-ID buffer between them. Setting `HIPFIRE_GEMMA4_BATCHED_EMBEDDING_PREFILL=0` restores the row-wise route; unsupported embedding formats and all other architectures retain the original path without allocating the token-ID buffer.
+
+Three-repeat paired measurements kept the PLE branch and activation optimizations enabled and changed only the embedding flag:
+
+| Model | Batch | Flag off | Flag on | Prefill delta | TTFT delta |
+|---|---:|---:|---:|---:|---:|
+| Gemma 4 E2B Q8 | 8 | 468.305 tok/s | 473.505 tok/s | +1.11% | -1.31% |
+| Gemma 4 E4B Q8 | 8 | 309.255 tok/s | 310.195 tok/s | +0.30% | -0.31% |
+| Gemma 4 E2B Q8 | 64 | 2,214.280 tok/s | 2,247.860 tok/s | +1.52% | -1.74% |
+| Gemma 4 E4B Q8 | 64 | 1,461.840 tok/s | 1,469.415 tok/s | +0.52% | -0.60% |
+
+All 120 paired short outputs were byte-identical. Direct sequential-versus-batched validation also passed at `B=1,2,8,64` for both models, including the post-batch KV check and argmax comparison. The improvement is small but consistent across both E-series models and both tested batch sizes; combined with the larger PLE wins, this is part of the gfx1100 auto policy.
+
+Raw artifacts are under `target/validation/gemma4-gfx11-batched-embedding/{off-r3,on-r3,off-b8-r3,on-b8-r3}`.
+
+## Rejected batched Q/K norm and RoPE fusion
+
+The decode path's fused weighted Q/K RMSNorm, Q scaling, and RoPE kernel was extended diagnostically to a `[heads, batch]` grid and tested as a whole-block prefill replacement. Direct E2B/E4B validation passed at `B=1,2,8,64`, including current logits and the post-batch KV check, but same-binary batch-64 timing regressed on both models:
+
+| Model | Fusion off | Fusion on | Prefill delta | TTFT delta |
+|---|---:|---:|---:|---:|
+| Gemma 4 E2B Q8 | 2,281.745 tok/s | 2,272.220 tok/s | -0.42% | +0.29% |
+| Gemma 4 E4B Q8 | 1,506.075 tok/s | 1,481.940 tok/s | -1.60% | +1.99% |
+
+Removing three launches per layer did not offset the fused batched kernel's execution cost, so the batched entry point, runtime wrapper, and feature flag were removed. The existing single-position decode fusion remains unchanged. Raw artifacts are under `target/validation/gemma4-gfx11-batched-qk-rope/{off-r3,on-r3}`.
+
+## Remaining kernel profile
+
+`verify_batch_gemma4 --profile-bs 64` profiles only the selected batched forward and aggregates the runtime's existing HIP event timers. With the PLE branch and activation optimizations enabled, the largest counted category is the existing Q8 WMMA projection path:
+
+| Model | Q8 WMMA GEMM | RMSNorm | Residual add | Row-wise PLE projection |
+|---|---:|---:|---:|---:|
+| Gemma 4 E2B Q8 | 13.937 ms / 275 calls | 3.192 ms / 241 calls | 2.272 ms / 106 calls | 2.070 ms / 65 calls |
+| Gemma 4 E4B Q8 | 25.083 ms / 342 calls | 4.229 ms / 301 calls | 1.388 ms / 127 calls | 2.937 ms / 65 calls |
+
+These are sums of instrumented kernel events, not a decomposition of end-to-end wall time. They nevertheless rule out paged attention as the next batch-64 target in this workload: the counted attention kernels total about 0.23 ms for either model.
+
+Reproduce with `--profile-bs 64 --bs 64`. The profiler deliberately rejects a profile batch that is absent from `--bs`.
+
+## Q8 fusion after PLE optimization
+
+The original Q8 projection-fusion probe was repeated after the PLE branch and activation changes. On the same binary, E2B prefill improved from 2,210.810 to 2,278.550 tok/s (+3.06%) and TTFT fell from 342.884 to 333.390 ms (-2.77%). E4B was effectively neutral at 1,462.455 versus 1,462.585 tok/s. All 60 paired outputs were byte-identical. This supports an E2B-specific gfx1100 policy, not a model-family-wide default. Raw artifacts are under `target/validation/gemma4-gfx11-cumulative-q8-fusion/on-r3`; the paired baseline is `target/validation/gemma4-gfx11-ffn-activation-fused/off-r3`.
+
+## Rejected batched post-norm fusion
+
+The decode path's existing `rmsnorm_residual_add_f32` was also evaluated as a whole-block replacement for batched prefill. The initial reuse exposed an ABI mismatch because prefill scratch tensors are flat `[B*dim]` buffers while the decode helper infers rows from tensor shape; an explicit-shape diagnostic variant fixed the illegal access and passed direct logits/KV checks at `B=1,2,8,64` for both models.
+
+The corrected path improved E2B prefill from 2,173.290 to 2,215.560 tok/s (+1.95%), but E4B regressed from 1,436.120 to 1,430.500 tok/s (-0.39%). More importantly, 3/30 short E2B outputs diverged from the unfused path. The production change and explicit-shape helper were therefore removed. Raw artifacts remain under `target/validation/gemma4-gfx11-batched-postnorm/{off-r3-v2,on-r3-v2}`.
+
+## Rejected F16 RMSNorm projection staging
+
+The Q8 WMMA wrappers convert each F32 activation matrix to F16 before dispatch. A profiler-only timer now exposes this cost separately as `convert_f32_to_f16[_uncached]`. At batch 64, the cumulative uncached conversion cost was 3.413 ms over 210 calls for E2B and 2.749 ms over 252 calls for E4B.
+
+A gfx1100-only probe changed the input and pre-FFN normalization stages feeding fused Q8 projections to write F16 directly. It eliminated 50 standalone conversion launches on E2B and 66 on E4B while leaving the existing Q8 WMMA kernels unchanged. Direct validation passed at `B=1,2,8,64` for both models, including current-token argmax and post-batch KV checks. All 60 paired short outputs were byte-identical.
+
+The serving-level timing did not justify a production route:
+
+| Model | F16 RMSNorm off | F16 RMSNorm on | Prefill delta | TTFT off | TTFT on | TTFT delta |
+|---|---:|---:|---:|---:|---:|---:|
+| Gemma 4 E2B Q8 | 2,377.910 tok/s | 2,398.060 tok/s | +0.85% | 318.198 ms | 315.424 ms | -0.87% |
+| Gemma 4 E4B Q8 | 1,507.805 tok/s | 1,489.980 tok/s | -1.18% | 503.674 ms | 511.065 ms | +1.47% |
+
+The E2B signal was below the 1% retention threshold and did not generalize to E4B, so the F16 RMSNorm kernel, feature flag, and Gemma dispatch changes were removed. The profiler instrumentation remains because it separates activation staging from WMMA execution without changing dispatch. Raw timing artifacts are under `target/validation/gemma4-gfx11-rmsnorm-f16/{off,on}`.
+
+## Rejected direct residual output
+
+The batched attention, FFN, and PLE blocks reset `x` from the saved residual and then add the normalized branch in place. A gfx1100-only probe replaced each reset-copy plus in-place-add pair with the existing graph-safe out-of-place `add_f32` kernel, writing the residual sum directly to `x`. This preserved the same F32 addition and passed direct E2B/E4B validation at `B=1,2,8,64`, including current-token and post-batch KV argmax checks.
+
+Same-binary, three-repeat batch-64 measurements did not show a serving benefit:
+
+| Model | Original path | Direct output | Prefill delta | TTFT off | TTFT on | TTFT delta |
+|---|---:|---:|---:|---:|---:|---:|
+| Gemma 4 E2B Q8 | 2,373.005 tok/s | 2,371.010 tok/s | -0.08% | 319.012 ms | 319.438 ms | +0.13% |
+| Gemma 4 E4B Q8 | 1,503.965 tok/s | 1,487.665 tok/s | -1.08% | 506.806 ms | 513.671 ms | +1.36% |
+
+All 60 paired output hashes were identical. Avoiding the explicit device-to-device copy did not compensate for the out-of-place add path, so no dispatch or feature flag is retained. Raw artifacts are under `target/validation/gemma4-gfx11-direct-residual-add/{off,on}`.
+
+## Rejected direct-int8 Q8 projection backend
+
+The existing gfx1151 dense Q8_0 x Q8_1 i8-WMMA backend was compiled and run unchanged on gfx1100 as a candidate replacement for the F16-WMMA projection path. The kernel executed correctly on gfx1100 and its Q8_1 activation approximation stayed at `rms_rel=0.0050` on the tested `K=4096` shapes. Including activation quantization, however, it was slower than the current single-wave F16-WMMA kernel throughout Gemma 4's maximum batch of 64:
+
+| M | Batch | F16 WMMA | i8 MMQ | i8 delta |
+|---:|---:|---:|---:|---:|
+| 256 | 64 | 24.9 us | 67.1 us | -62.9% |
+| 1,024 | 64 | 31.6 us | 73.9 us | -57.2% |
+| 4,096 | 64 | 80.0 us | 98.1 us | -18.5% |
+
+The i8 backend became faster at batches 256 and 1,024, but `forward_batch` currently admits at most 64 tokens. The gfx1100 adaptation was therefore removed rather than adding an approximate path outside its profitable range. The existing gfx1151 backend and production dispatch remain unchanged.
+
+## Rejected FP16-shadow rocBLAS projection backend
+
+The remaining row-wise PLE model projection was also evaluated against the repository's mature FP16-shadow plus rocBLAS path before implementing any Q8 shadow support. The comparison used the exact E2B (`M=8960,K=1536`) and E4B (`M=10752,K=2560`) model-projection shapes with F16 weights and activations. At batch 64, rocBLAS was only 1.05x faster than the hand-written F16-WMMA kernel for E2B (`289.8` versus `303.0 us`) and 4.73x slower for E4B (`582.7` versus `123.2 us`). Q8 weight expansion, activation staging, and the model-lifetime shadow allocation would add costs not included in those timings. Consequently no Q8 shadow or rocBLAS Gemma dispatch was implemented.

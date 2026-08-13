@@ -13,11 +13,12 @@ BATCHES="${BATCHES:-8 16 32 64}"
 LIMIT="${LIMIT:-10}"
 MAX_TOKENS="${MAX_TOKENS:-16}"
 REPEATS="${REPEATS:-1}"
-FUSED_Q8_PREFILL="${FUSED_Q8_PREFILL:-0}"
-BATCHED_EMBEDDING_PREFILL="${BATCHED_EMBEDDING_PREFILL:-0}"
-PLE_BATCHED_PREFILL="${PLE_BATCHED_PREFILL:-0}"
-PLE_BRANCH_BATCHED_PREFILL="${PLE_BRANCH_BATCHED_PREFILL:-0}"
-PLE_ACTIVATION_FUSED_PREFILL="${PLE_ACTIVATION_FUSED_PREFILL:-0}"
+# Feature policies accept auto/on/off; 1/0 and true/false remain aliases.
+FUSED_Q8_PREFILL="${FUSED_Q8_PREFILL:-auto}"
+BATCHED_EMBEDDING_PREFILL="${BATCHED_EMBEDDING_PREFILL:-auto}"
+PLE_BATCHED_PREFILL="${PLE_BATCHED_PREFILL:-auto}"
+PLE_BRANCH_BATCHED_PREFILL="${PLE_BRANCH_BATCHED_PREFILL:-auto}"
+PLE_ACTIVATION_FUSED_PREFILL="${PLE_ACTIVATION_FUSED_PREFILL:-auto}"
 COOLDOWN="${COOLDOWN:-10}"
 RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 OUT_ROOT="${OUT_ROOT:-$ROOT/target/validation/gemma4-gfx11-prefill-batch/$RUN_ID}"
@@ -28,21 +29,20 @@ done
 
 mkdir -p "$OUT_ROOT"
 fused_args=()
-if [[ "$FUSED_Q8_PREFILL" == 1 ]]; then
-    fused_args+=(--q8-fused-prefill)
-fi
-if [[ "$BATCHED_EMBEDDING_PREFILL" == 1 ]]; then
-    fused_args+=(--batched-embedding-prefill)
-fi
-if [[ "$PLE_BATCHED_PREFILL" == 1 ]]; then
-    fused_args+=(--ple-batched-prefill)
-fi
-if [[ "$PLE_BRANCH_BATCHED_PREFILL" == 1 ]]; then
-    fused_args+=(--ple-branch-batched-prefill)
-fi
-if [[ "$PLE_ACTIVATION_FUSED_PREFILL" == 1 ]]; then
-    fused_args+=(--ple-activation-fused-prefill)
-fi
+append_policy_arg() {
+    local value="$1" on_arg="$2"
+    case "$value" in
+        auto) ;;
+        1|on|true) fused_args+=("--$on_arg") ;;
+        0|off|false) fused_args+=("--no-$on_arg") ;;
+        *) echo "invalid $on_arg policy: $value (expected auto/on/off or 1/0)" >&2; exit 2 ;;
+    esac
+}
+append_policy_arg "$FUSED_Q8_PREFILL" q8-fused-prefill
+append_policy_arg "$BATCHED_EMBEDDING_PREFILL" batched-embedding-prefill
+append_policy_arg "$PLE_BATCHED_PREFILL" ple-batched-prefill
+append_policy_arg "$PLE_BRANCH_BATCHED_PREFILL" ple-branch-batched-prefill
+append_policy_arg "$PLE_ACTIVATION_FUSED_PREFILL" ple-activation-fused-prefill
 for model in e2b e4b; do
     if [[ "$model" == e2b ]]; then artifact="$E2B"; else artifact="$E4B"; fi
     for batch in $BATCHES; do

@@ -157,11 +157,11 @@ class Daemon:
         stderr_path: Path,
         physical_gpu: str,
         prefill_batch: int,
-        q8_fused_prefill: bool,
-        batched_embedding_prefill: bool,
-        ple_batched_prefill: bool,
-        ple_branch_batched_prefill: bool,
-        ple_activation_fused_prefill: bool,
+        q8_fused_prefill: bool | None,
+        batched_embedding_prefill: bool | None,
+        ple_batched_prefill: bool | None,
+        ple_branch_batched_prefill: bool | None,
+        ple_activation_fused_prefill: bool | None,
         runtime_home: Path | None,
     ):
         env = os.environ.copy()
@@ -173,17 +173,20 @@ class Daemon:
         env["HIPFIRE_GEMMA4_GRAPH"] = "0"
         env["HIPFIRE_GEMMA4_EAGLE"] = "0"
         env["HIPFIRE_GEMMA4_PREFILL_BATCH"] = str(prefill_batch)
-        env["HIPFIRE_GEMMA4_Q8_FUSED_PREFILL"] = "1" if q8_fused_prefill else "0"
-        env["HIPFIRE_GEMMA4_BATCHED_EMBEDDING_PREFILL"] = (
-            "1" if batched_embedding_prefill else "0"
-        )
-        env["HIPFIRE_GEMMA4_PLE_BATCHED_PREFILL"] = "1" if ple_batched_prefill else "0"
-        env["HIPFIRE_GEMMA4_PLE_BRANCH_BATCHED_PREFILL"] = (
-            "1" if ple_branch_batched_prefill else "0"
-        )
-        env["HIPFIRE_GEMMA4_PLE_ACTIVATION_FUSED_PREFILL"] = (
-            "1" if ple_activation_fused_prefill else "0"
-        )
+        for name, enabled in (
+            ("HIPFIRE_GEMMA4_Q8_FUSED_PREFILL", q8_fused_prefill),
+            ("HIPFIRE_GEMMA4_BATCHED_EMBEDDING_PREFILL", batched_embedding_prefill),
+            ("HIPFIRE_GEMMA4_PLE_BATCHED_PREFILL", ple_batched_prefill),
+            ("HIPFIRE_GEMMA4_PLE_BRANCH_BATCHED_PREFILL", ple_branch_batched_prefill),
+            (
+                "HIPFIRE_GEMMA4_PLE_ACTIVATION_FUSED_PREFILL",
+                ple_activation_fused_prefill,
+            ),
+        ):
+            if enabled is None:
+                env.pop(name, None)
+            else:
+                env[name] = "1" if enabled else "0"
         self.stderr_stream = stderr_path.open("w", buffering=1)
         self.proc = subprocess.Popen(
             [str(binary)],
@@ -370,11 +373,27 @@ def main() -> int:
     parser.add_argument("--task-id")
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--prefill-batch", type=int, default=8)
-    parser.add_argument("--q8-fused-prefill", action="store_true")
-    parser.add_argument("--batched-embedding-prefill", action="store_true")
-    parser.add_argument("--ple-batched-prefill", action="store_true")
-    parser.add_argument("--ple-branch-batched-prefill", action="store_true")
-    parser.add_argument("--ple-activation-fused-prefill", action="store_true")
+    parser.add_argument(
+        "--q8-fused-prefill", action=argparse.BooleanOptionalAction, default=None
+    )
+    parser.add_argument(
+        "--batched-embedding-prefill",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument(
+        "--ple-batched-prefill", action=argparse.BooleanOptionalAction, default=None
+    )
+    parser.add_argument(
+        "--ple-branch-batched-prefill",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument(
+        "--ple-activation-fused-prefill",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
     parser.add_argument("--runtime-home", type=Path)
     args = parser.parse_args()
     if args.suite == "longbench" and (not args.dataset or not args.manifest):
