@@ -119,3 +119,33 @@ PLE_BRANCH_BATCHED_PREFILL=1 BATCHES="8 64" LIMIT=10 REPEATS=3 \
 ```
 
 Raw artifacts are under `target/validation/gemma4-gfx11-ple-branch-batched/{branch-off-r3,branch-on-r3,b8-branch-on-r3,branch-on-full30}`.
+
+## Fused PLE activation and strided multiply
+
+After batching the two branch projections, every E-series layer still issued one full-batch GELU launch followed by one multiply launch per row. `HIPFIRE_GEMMA4_PLE_ACTIVATION_FUSED_PREFILL=1` replaces that sequence with one graph-capture-safe kernel that reads the selected layer slice directly from the packed PLE buffer. At batch 64 this removes 64 launches per layer, or 2,240 launches per E2B prefill chunk and 2,688 per E4B chunk. The route is restricted to exact gfx1100 with `B > 1`; all other paths retain the original kernels.
+
+Three-repeat paired batch-64 measurements used the same binary with only the activation flag changed:
+
+| Model | Fusion off | Fusion on | Prefill delta | TTFT off | TTFT on | TTFT delta |
+|---|---:|---:|---:|---:|---:|---:|
+| Gemma 4 E2B Q8 | 1,763.610 tok/s | 2,159.330 tok/s | +22.44% | 430.979 ms | 350.028 ms | -18.78% |
+| Gemma 4 E4B Q8 | 1,234.250 tok/s | 1,435.570 tok/s | +16.31% | 621.220 ms | 529.851 ms | -14.71% |
+
+At batch 8, the same route improved E2B from 443.485 to 469.360 tok/s (+5.84%) and E4B from 296.890 to 309.505 tok/s (+4.25%). All short-run output hashes matched their branch-only baselines. The direct sequential-versus-batched logits/KV harness passed at `B=1,2,8,64` for both models, with every current and next-token argmax matching.
+
+The 30-question, 4,096-token-cap GSM8K gate also matched the branch-only baseline exactly: both models had 30/30 identical full-output SHA256 values, extracted predictions, and correctness decisions. Accuracy remained 80% for E2B and 90% for E4B.
+
+The gfx1100 JIT audit reports wave32, 9 VGPRs, 18 SGPRs, zero VGPR/SGPR spills, and no private segment. Its three pointer arguments are classified as read-only, read-only, and write-only. The explicit arguments occupy 40 bytes; `launch_maybe_blob` pads the recorded buffer to 48 bytes, which is the size registered in the replay resource contract.
+
+Reproduce the paired batch-64 measurements with:
+
+```bash
+PLE_BRANCH_BATCHED_PREFILL=1 PLE_ACTIVATION_FUSED_PREFILL=0 \
+  BATCHES=64 LIMIT=10 REPEATS=3 \
+  scripts/bench-gemma4-gfx11-prefill-batch.sh
+PLE_BRANCH_BATCHED_PREFILL=1 PLE_ACTIVATION_FUSED_PREFILL=1 \
+  BATCHES=64 LIMIT=10 REPEATS=3 \
+  scripts/bench-gemma4-gfx11-prefill-batch.sh
+```
+
+Raw artifacts are under `target/validation/gemma4-gfx11-ple-activation-fused/{activation-off-r3,activation-on-r3,b8-activation-on-r3,activation-on-full30}`.

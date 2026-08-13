@@ -2372,15 +2372,28 @@ fn apply_per_layer_input_branch_batched(
                 .map_err(|e| format!("gemma4 batch ple input_gate row {row}: {e}"))?;
         }
     }
-    gpu.gelu_tanh_f32(ple.gate, ple.hidden, b * ple_dim)
-        .map_err(|e| format!("gemma4 batch ple gelu_tanh: {e:?}"))?;
-    for row in 0..b {
-        let hidden_row = ple.hidden.sub_offset(row * ple_dim, ple_dim);
-        let layer_input = ple
-            .projection_all
-            .sub_offset(row * packed_dim + tail.layer_idx * ple_dim, ple_dim);
-        gpu.mul_f32(&hidden_row, &layer_input, &hidden_row)
-            .map_err(|e| format!("gemma4 batch ple mul row {row}: {e:?}"))?;
+    if gpu.arch == "gfx1100" && gpu.flags.gemma4_ple_activation_fused_prefill && b > 1 {
+        gpu.gemma4_ple_gelu_mul_strided_f32(
+            ple.gate,
+            ple.projection_all,
+            ple.hidden,
+            b,
+            ple_dim,
+            packed_dim,
+            tail.layer_idx,
+        )
+        .map_err(|e| format!("gemma4 batch fused PLE activation: {e:?}"))?;
+    } else {
+        gpu.gelu_tanh_f32(ple.gate, ple.hidden, b * ple_dim)
+            .map_err(|e| format!("gemma4 batch ple gelu_tanh: {e:?}"))?;
+        for row in 0..b {
+            let hidden_row = ple.hidden.sub_offset(row * ple_dim, ple_dim);
+            let layer_input = ple
+                .projection_all
+                .sub_offset(row * packed_dim + tail.layer_idx * ple_dim, ple_dim);
+            gpu.mul_f32(&hidden_row, &layer_input, &hidden_row)
+                .map_err(|e| format!("gemma4 batch ple mul row {row}: {e:?}"))?;
+        }
     }
     if batched_projections {
         proj_gemm_batched(

@@ -5319,6 +5319,10 @@ pub const LAYERNORM_SRC: &str = include_str!("../../../kernels/src/layernorm.hip
 /// GELU activation (tanh approximation, matches gelu_pytorch_tanh).
 pub const GELU_TANH_SRC: &str = include_str!("../../../kernels/src/gelu_tanh.hip");
 
+/// Gemma 4 E-series batched PLE activation with a strided per-layer input.
+pub const GEMMA4_PLE_ACTIVATION_SRC: &str =
+    include_str!("../../../kernels/src/gemma4_ple_activation.hip");
+
 /// Gemma 4 final-logit soft-capping (in-place): x = tanh(x/cap)*cap. Applied to
 /// the LM-head output before sampling. Gemma 4 has NO per-attention-layer softcap.
 pub const LOGIT_SOFTCAP_SRC: &str = include_str!("../../../kernels/src/logit_softcap.hip");

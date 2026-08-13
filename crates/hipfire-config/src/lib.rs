@@ -2415,6 +2415,15 @@ pub static FIELDS: &[ConfigField] = &[
         "Batch the Gemma 4 E-series PLE branch projections on gfx1100."
     ),
     process_bool_field!(
+        "kernel.gemma4_ple_activation_fused_prefill",
+        "gemma4_ple_activation_fused_prefill",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_GEMMA4_PLE_ACTIVATION_FUSED_PREFILL",
+        "Fuse the Gemma 4 E-series PLE activation and strided multiply on gfx1100."
+    ),
+    process_bool_field!(
         "kernel.deepseek4_q8_wmma",
         "deepseek4_q8_wmma",
         Kernel,
