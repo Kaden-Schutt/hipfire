@@ -423,6 +423,41 @@ fn embed_lookup(
     Ok(())
 }
 
+/// Batched embed + scale-less embed_norm into `x` `[B*dim]`.
+///
+/// Returns `Ok(true)` when the format has a batched lookup kernel
+/// (HFQ4G256 / HFQ4G128 / Q8_0) and the full path ran. Returns `Ok(false)`
+/// for F32/Q4K so the caller keeps its exact sequential loop / error.
+/// `token_ids` is a device buffer of `B` i32 native-endian token IDs.
+fn embed_lookup_batched(
+    gpu: &mut Gpu,
+    weights: &GlimmerWeights,
+    state: &GlimmerState,
+    x: &GpuTensor,
+    token_ids: &GpuTensor,
+    b: usize,
+    dim: usize,
+    rms_eps: f32,
+) -> Result<bool, String> {
+    match weights.embd_format {
+        EmbeddingFormat::HFQ4G256 => gpu
+            .embedding_lookup_hfq4g256_batched(&weights.embed_tokens, x, token_ids, b, dim)
+            .map_err(|e| format!("glimmer: embed hfq4g256 batched: {e:?}"))?,
+        EmbeddingFormat::HFQ4G128 => gpu
+            .embedding_lookup_hfq4g128_batched(&weights.embed_tokens, x, token_ids, b, dim)
+            .map_err(|e| format!("glimmer: embed hfq4g128 batched: {e:?}"))?,
+        EmbeddingFormat::Q8_0 => gpu
+            .embedding_lookup_q8_batched(&weights.embed_tokens, x, token_ids, b, dim)
+            .map_err(|e| format!("glimmer: embed q8 batched: {e:?}"))?,
+        EmbeddingFormat::F32 | EmbeddingFormat::Q4K => return Ok(false),
+    }
+    if !abl("HIPFIRE_GLIMMER_NO_EMBED_NORM") {
+        gpu.rmsnorm_batched(x, &state.embed_norm_ones, x, b, dim, rms_eps)
+            .map_err(|e| format!("glimmer: embed_norm batched: {e:?}"))?;
+    }
+    Ok(true)
+}
+
 fn decode_step_body(
     cfg: &GlimmerConfig,
     weights: &GlimmerWeights,
@@ -1441,11 +1476,12 @@ pub fn verify_block_with_capture(
         g.alloc_tensor(&[n], DType::F32)
             .map_err(|e| format!("glimmer verify_batch alloc {label}: {e:?}"))
     };
-    // Same ownership discipline as `prefill_chunk_batched`: take all 17 scratch tensors
+    // Same ownership discipline as `prefill_chunk_batched`: take all 19 scratch tensors
     // into one list so a failure part-way through frees what it already holds instead of
     // leaking it for the life of the process. Allocation is where memory pressure lands,
     // and the daemon retries a failed generate, so a leak here compounds per retry.
-    let scratch_spec: [(usize, &str); 17] = [
+    // `normed` is included so the final-norm path cannot leak on a later `?`.
+    let scratch_spec: [(usize, &str); 19] = [
         (b * dim, "x"),
         (b * dim, "residual"),
         (b * dim, "nrm"),
@@ -1463,6 +1499,8 @@ pub fn verify_block_with_capture(
         (b * dim, "ffn_out"),
         (b * cfg.hidden_dim, "down_rot"),
         (b, "pos_array"),
+        (b, "token_ids"),
+        (b * dim, "normed"),
     ];
     let mut taken: Vec<GpuTensor> = Vec::with_capacity(scratch_spec.len());
     for (n, label) in scratch_spec {
@@ -1496,7 +1534,13 @@ pub fn verify_block_with_capture(
     let ffn_out = next_scratch();
     let down_rot = next_scratch();
     let pos_array = next_scratch();
+    let token_ids = next_scratch();
+    let normed = next_scratch();
 
+    // Everything below runs inside a closure so that EVERY `?` unwinds to the single
+    // free site after it, instead of returning straight out of the function and leaking
+    // all 19 tensors.
+    let body_result: Result<Vec<u32>, String> = (|| {
     // positions [B] i32
     let pos_data: Vec<i32> = (0..b).map(|i| (position + i as u32) as i32).collect();
     let pos_bytes: Vec<u8> = pos_data.iter().flat_map(|p| p.to_ne_bytes()).collect();
@@ -1510,23 +1554,37 @@ pub fn verify_block_with_capture(
     // attention_q8_0_kv_batched_masked with a per-row additive mask. At 64 tokens
     // window is not restrictive, so we use the faster causal batched kernel.
 
-    // ── Embedding: per-token lookup + embed_norm into x[B,dim] ──
+    // ── Embedding: batched lookup + embed_norm into x[B,dim] (F32/Q4K keep old loop) ──
     {
-        let x_single = alloc(gpu, dim, "x_single")?;
-        for (i, &tok) in block.iter().enumerate() {
-            match weights.embd_format {
-                EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256(&weights.embed_tokens, &x_single, tok, dim).map_err(|e| format!("glimmer verify_batch embed hfq4g256: {e:?}"))?,
-                EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(&weights.embed_tokens, &x_single, tok, dim).map_err(|e| format!("glimmer verify_batch embed hfq4g128: {e:?}"))?,
-                EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.embed_tokens, &x_single, tok, dim).map_err(|e| format!("glimmer verify_batch embed q8: {e:?}"))?,
-                EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.embed_tokens, &x_single, tok, dim).map_err(|e| format!("glimmer verify_batch embed f32: {e:?}"))?,
-                EmbeddingFormat::Q4K => return Err("glimmer verify_batch: Q4K embed unsupported".to_string()),
+        let tok_data: Vec<i32> = block.iter().map(|&t| t as i32).collect();
+        let tok_bytes: Vec<u8> = tok_data.iter().flat_map(|t| t.to_ne_bytes()).collect();
+        gpu.hip
+            .memcpy_htod(&token_ids.buf, &tok_bytes)
+            .map_err(|e| format!("glimmer verify_batch htod token_ids: {e:?}"))?;
+        if !embed_lookup_batched(gpu, weights, state, &x, &token_ids, b, dim, rms_eps)? {
+            // Helper returns false only for F32/Q4K. Error Q4K before any x_single alloc.
+            if matches!(weights.embd_format, EmbeddingFormat::Q4K) {
+                return Err("glimmer verify_batch: Q4K embed unsupported".to_string());
             }
-            if !abl("HIPFIRE_GLIMMER_NO_EMBED_NORM") {
-                gpu.rmsnorm_f32(&x_single, &state.embed_norm_ones, &x_single, rms_eps).map_err(|e| format!("glimmer verify_batch embed_norm: {e:?}"))?;
-            }
-            gpu.hip.memcpy_dtod_at(&x.buf, i * dim * 4, &x_single.buf, 0, dim * 4).map_err(|e| format!("glimmer verify_batch embed copy: {e:?}"))?;
+            // F32 only (HFQ/Q8 are handled by the batched helper above).
+            let x_single = alloc(gpu, dim, "x_single")?;
+            let emb_result: Result<(), String> = (|| {
+                for (i, &tok) in block.iter().enumerate() {
+                    gpu.embedding_lookup(&weights.embed_tokens, &x_single, tok, dim)
+                        .map_err(|e| format!("glimmer verify_batch embed f32: {e:?}"))?;
+                    if !abl("HIPFIRE_GLIMMER_NO_EMBED_NORM") {
+                        gpu.rmsnorm_f32(&x_single, &state.embed_norm_ones, &x_single, rms_eps)
+                            .map_err(|e| format!("glimmer verify_batch embed_norm: {e:?}"))?;
+                    }
+                    gpu.hip
+                        .memcpy_dtod_at(&x.buf, i * dim * 4, &x_single.buf, 0, dim * 4)
+                        .map_err(|e| format!("glimmer verify_batch embed copy: {e:?}"))?;
+                }
+                Ok(())
+            })();
+            gpu.free_tensor(x_single).ok();
+            emb_result?;
         }
-        gpu.free_tensor(x_single).ok();
     }
     let t_after_embed = t_verify_start.elapsed();
 
@@ -1726,7 +1784,7 @@ pub fn verify_block_with_capture(
     state.n_tokens = seq_len;
 
     // ── Final norm + lm_head per position → picks (shared with draft) ──
-    let normed = alloc(gpu, b * dim, "normed")?;
+    // `normed` is pre-bound from scratch_spec (no late alloc that can leak).
     let t_after_norm = t_verify_start.elapsed();
     gpu.rmsnorm_batched(&x, &weights.final_norm, &normed, b, dim, rms_eps).map_err(|e| format!("glimmer batch final rmsnorm: {e:?}"))?;
 
@@ -1748,12 +1806,15 @@ pub fn verify_block_with_capture(
         );
     }
 
-    // Free batched scratch
-    for t in [x, residual, nrm, x_rot, q, k, v, attn_gate, attn_out, o_rot, o_out, gate_ffn, up_ffn, ffn_hidden, ffn_out, down_rot, pos_array, normed] {
+    Ok(picks)
+    })();
+
+    // Free batched scratch on EVERY path — success, `?`, or the early Q4K embed error.
+    for t in [x, residual, nrm, x_rot, q, k, v, attn_gate, attn_out, o_rot, o_out, gate_ffn, up_ffn, ffn_hidden, ffn_out, down_rot, pos_array, token_ids, normed] {
         gpu.free_tensor(t).ok();
     }
 
-    Ok(picks)
+    body_result
 }
 // ─── Chunked batched prefill ─────────────────────────────────────────────
 
@@ -1819,17 +1880,7 @@ fn prefill_chunk_batched(
             .map_err(|e| format!("glimmer prefill alloc {label}: {e:?}"))
     };
 
-    // Allocate every batched scratch tensor into ONE owner list before running any
-    // kernel. Each `alloc(...)?` used to return early on failure, leaking every tensor
-    // it had already taken; and because the daemon RETRIES a failed generate, each retry
-    // leaked another full set. Measured on gfx1201 with muse-glimmer-30b.mq4: free VRAM
-    // fell 881.9 MB -> 8.5 MB across a handful of oversized requests, after which every
-    // request OOM'd until the process was restarted. One oversized request bricked the
-    // daemon.
-    //
-    // `GpuTensor` is not `Clone`, so this Vec *is* the ownership until it is destructured
-    // into the named bindings below; on failure it frees exactly what it holds.
-    let scratch_spec: [(usize, &str); 17] = [
+    let scratch_spec: [(usize, &str); 19] = [
         (b * dim, "x"),
         (b * dim, "residual"),
         (b * dim, "nrm"),
@@ -1847,6 +1898,8 @@ fn prefill_chunk_batched(
         (b * dim, "ffn_out"),
         (b * cfg.hidden_dim, "down_rot"),
         (b, "pos_array"),
+        (b, "token_ids"),
+        (b, "shifted_pos"),
     ];
     let mut taken: Vec<GpuTensor> = Vec::with_capacity(scratch_spec.len());
     for (n, label) in scratch_spec {
@@ -1880,10 +1933,12 @@ fn prefill_chunk_batched(
     let ffn_out = next_scratch();
     let down_rot = next_scratch();
     let pos_array = next_scratch();
+    let token_ids = next_scratch();
+    let shifted_pos = next_scratch();
 
     // Everything below runs inside a closure so that EVERY `?` unwinds to the single
     // free site after it, instead of returning straight out of the function and leaking
-    // all 17 tensors. The body is otherwise unchanged.
+    // all 19 tensors. The body is otherwise unchanged.
     let body_result: Result<Option<Vec<f32>>, String> = (|| {
     let pos_data: Vec<i32> = (0..b).map(|i| (position + i as u32) as i32).collect();
     let pos_bytes: Vec<u8> = pos_data.iter().flat_map(|p| p.to_ne_bytes()).collect();
@@ -1903,38 +1958,54 @@ fn prefill_chunk_batched(
     } else {
         0
     };
-    let shifted_pos_array = if sliding_origin > 0 {
+    // Upload shifted positions into the persistent scratch tensor when needed;
+    // expose Option so the layer loop can pick pos_array vs shifted_pos.
+    let shifted_pos_array: Option<&GpuTensor> = if sliding_origin > 0 {
         let sd: Vec<i32> = (0..b)
             .map(|i| (position as usize + i - sliding_origin) as i32)
             .collect();
         let sb: Vec<u8> = sd.iter().flat_map(|p| p.to_ne_bytes()).collect();
-        let t = alloc(gpu, b, "shifted_pos")?;
         gpu.hip
-            .memcpy_htod(&t.buf, &sb)
+            .memcpy_htod(&shifted_pos.buf, &sb)
             .map_err(|e| format!("glimmer prefill htod shifted pos: {e:?}"))?;
-        Some(t)
+        Some(&shifted_pos)
     } else {
         None
     };
 
     // ── Embedding ──
     {
-        let x_single = alloc(gpu, dim, "x_single")?;
-        for (i, &tok) in chunk.iter().enumerate() {
-            match weights.embd_format {
-                EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256(&weights.embed_tokens, &x_single, tok, dim).map_err(|e| format!("glimmer prefill embed hfq4g256: {e:?}"))?,
-                EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(&weights.embed_tokens, &x_single, tok, dim).map_err(|e| format!("glimmer prefill embed hfq4g128: {e:?}"))?,
-                EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.embed_tokens, &x_single, tok, dim).map_err(|e| format!("glimmer prefill embed q8: {e:?}"))?,
-                EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.embed_tokens, &x_single, tok, dim).map_err(|e| format!("glimmer prefill embed f32: {e:?}"))?,
-                EmbeddingFormat::Q4K => return Err("glimmer prefill: Q4K embed unsupported".to_string()),
+        let tok_data: Vec<i32> = chunk.iter().map(|&t| t as i32).collect();
+        let tok_bytes: Vec<u8> = tok_data.iter().flat_map(|t| t.to_ne_bytes()).collect();
+        gpu.hip
+            .memcpy_htod(&token_ids.buf, &tok_bytes)
+            .map_err(|e| format!("glimmer prefill htod token_ids: {e:?}"))?;
+        if !embed_lookup_batched(gpu, weights, state, &x, &token_ids, b, dim, rms_eps)? {
+            // Helper returns false only for F32/Q4K. Error Q4K before any x_single alloc.
+            if matches!(weights.embd_format, EmbeddingFormat::Q4K) {
+                return Err("glimmer prefill: Q4K embed unsupported".to_string());
             }
-            if !abl("HIPFIRE_GLIMMER_NO_EMBED_NORM") {
-                gpu.rmsnorm_f32(&x_single, &state.embed_norm_ones, &x_single, rms_eps).map_err(|e| format!("glimmer prefill embed_norm: {e:?}"))?;
-            }
-            gpu.hip.memcpy_dtod_at(&x.buf, i * dim * 4, &x_single.buf, 0, dim * 4).map_err(|e| format!("glimmer prefill embed copy: {e:?}"))?;
+            // F32 only (HFQ/Q8 are handled by the batched helper above).
+            let x_single = alloc(gpu, dim, "x_single")?;
+            let emb_result: Result<(), String> = (|| {
+                for (i, &tok) in chunk.iter().enumerate() {
+                    gpu.embedding_lookup(&weights.embed_tokens, &x_single, tok, dim)
+                        .map_err(|e| format!("glimmer prefill embed f32: {e:?}"))?;
+                    if !abl("HIPFIRE_GLIMMER_NO_EMBED_NORM") {
+                        gpu.rmsnorm_f32(&x_single, &state.embed_norm_ones, &x_single, rms_eps)
+                            .map_err(|e| format!("glimmer prefill embed_norm: {e:?}"))?;
+                    }
+                    gpu.hip
+                        .memcpy_dtod_at(&x.buf, i * dim * 4, &x_single.buf, 0, dim * 4)
+                        .map_err(|e| format!("glimmer prefill embed copy: {e:?}"))?;
+                }
+                Ok(())
+            })();
+            gpu.free_tensor(x_single).ok();
+            emb_result?;
         }
-        gpu.free_tensor(x_single).ok();
     }
+
 
     // Capture prep
     let mut sorted_caps: Vec<usize> = capture_layers.to_vec();
@@ -2241,7 +2312,6 @@ fn prefill_chunk_batched(
                 k_view = k_view.sub_offset(elem_off, k_len);
                 v_view = v_view.sub_offset(elem_off, v_len);
                 pos_view = shifted_pos_array
-                    .as_ref()
                     .expect("sliding_origin > 0 implies shifted_pos_array");
                 eff_seq_len = seq_len - origin;
             }
@@ -2485,9 +2555,9 @@ fn prefill_chunk_batched(
     Ok(last_logits)
     })();
 
-    // Free batched scratch on EVERY path — success, `?`, or the early `return Err` in the
-    // embedding match. This is the single release site the closure above exists to reach.
-    for t in [x, residual, nrm, x_rot, q, k, v, attn_gate, attn_out, o_rot, o_out, gate_ffn, up_ffn, ffn_hidden, ffn_out, down_rot, pos_array] {
+    // Free batched scratch on EVERY path — success, `?`, or the early Q4K embed error.
+    // This is the single release site the closure above exists to reach.
+    for t in [x, residual, nrm, x_rot, q, k, v, attn_gate, attn_out, o_rot, o_out, gate_ffn, up_ffn, ffn_hidden, ffn_out, down_rot, pos_array, token_ids, shifted_pos] {
         gpu.free_tensor(t).ok();
     }
 
