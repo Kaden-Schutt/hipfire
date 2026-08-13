@@ -7009,6 +7009,13 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
     if args.exp && args.json {
         bail!("--json is not supported with --exp");
     }
+    // --exp runs a fixed 128-token protocol across five RDNA2 variants and
+    // ignores --max-tokens, so it can never give a think span room to close.
+    // Reject the combination rather than silently drop the flag and abort
+    // later on an open-think terminal.
+    if args.exp && args.reasoning_on {
+        bail!("--reasoning-on is not supported with --exp (its token budget is fixed at 128)");
+    }
     for (name, values) in [
         ("--pp", &args.pp),
         ("--ctx", &args.ctx),
