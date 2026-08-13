@@ -242,6 +242,23 @@ fn fused_postnorm_enabled() -> bool {
     }
 }
 
+/// Master switch for fused scale-less Q/K RMSNorm + q scale + RoPE
+/// (`fused_gemma4_qk_norm_rope_f32`). Default ON; opt out with
+/// `HIPFIRE_GLIMMER_FUSED_QK_ROPE=0|off|false` (case-insensitive).
+/// Decode-only (`glimmer_layer_decode`); collapses q_norm + k_norm +
+/// scale_f32(q) + optional rope from up to 4 launches to 1. Full/NoPE
+/// layers pass `n_rot_pairs=0` (norm+scale, no RoPE). Not eligible when
+/// any of NO_QK_NORM / NO_QK_SCALE / ROPE_INTERLEAVED ablations are on.
+fn fused_qk_rope_enabled() -> bool {
+    match std::env::var("HIPFIRE_GLIMMER_FUSED_QK_ROPE") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false"
+        ),
+        Err(_) => true,
+    }
+}
+
 
 /// Chunk size for batched prefill: 192 for prompts >= 512 tokens, else 256.
 /// Overridable via `HIPFIRE_GLIMMER_PREFILL_CHUNK` (clamped to 1-512); the
@@ -562,49 +579,78 @@ fn glimmer_layer_decode(
     }
 
     // Scale-less QK-norm (no learned weight tensors; ones-filled weight)
-    // Still runs RMSNorm per head, then Q *= qk_scale_factor.
-    if !abl("HIPFIRE_GLIMMER_NO_QK_NORM") {
-        gpu.rmsnorm_batched(&state.q, &state.qk_norm_ones, &state.q, n_heads, head_dim, rms_eps)
-            .map_err(|e| format!("glimmer L{layer_idx}: q_norm: {e:?}"))?;
-        gpu.rmsnorm_batched(&state.k, &state.qk_norm_ones, &state.k, n_kv, head_dim, rms_eps)
-            .map_err(|e| format!("glimmer L{layer_idx}: k_norm: {e:?}"))?;
-    }
-    // Do NOT pre-scale by sqrt(head_dim); Glimmer wants kernel 1/sqrt AND 3.87
-    if !abl("HIPFIRE_GLIMMER_NO_QK_SCALE") {
-        gpu.scale_f32(&state.q, cfg.qk_scale_factor)
-            .map_err(|e| format!("glimmer L{layer_idx}: q scale qk_factor: {e:?}"))?;
-    }
-
-    // RoPE only on layers whose layer_rope_theta != 0 (copy cohere2moe shape)
-    if cfg.has_rope(layer_idx) || abl("HIPFIRE_GLIMMER_ROPE_ALL") {
-        let theta = cfg.rope_theta_for(layer_idx);
-        // RoPE convention. HF reports rope_type "default" (Llama half-split),
-        // which is `rope_f32`. HIPFIRE_GLIMMER_ROPE_INTERLEAVED=1 selects the
-        // GPT-J interleaved variant for A/B during bring-up — getting this
-        // backwards scrambles attention into plausible-looking noise.
-        if abl("HIPFIRE_GLIMMER_ROPE_INTERLEAVED") {
-            gpu.rope_interleaved_f32(
-                &state.q,
-                &state.k,
-                &state.pos_buf,
-                n_heads,
-                n_kv,
-                head_dim,
-                head_dim, // n_rot = full head_dim (no partial rotation)
-                theta,
-            )
-            .map_err(|e| format!("glimmer L{layer_idx}: rope interleaved: {e:?}"))?;
+    // Still runs RMSNorm per head, then Q *= qk_scale_factor, then optional RoPE.
+    // Fused path collapses q_norm + k_norm + q scale + rope into one launch when
+    // eligible; partial ablations and interleaved RoPE force the exact chain.
+    let fuse_qk_rope = fused_qk_rope_enabled()
+        && !abl("HIPFIRE_GLIMMER_NO_QK_NORM")
+        && !abl("HIPFIRE_GLIMMER_NO_QK_SCALE")
+        && !abl("HIPFIRE_GLIMMER_ROPE_INTERLEAVED");
+    if fuse_qk_rope {
+        let n_rot_pairs = if cfg.has_rope(layer_idx) || abl("HIPFIRE_GLIMMER_ROPE_ALL") {
+            head_dim / 2
         } else {
-            gpu.rope_f32(
-                &state.q,
-                &state.k,
-                &state.pos_buf,
-                n_heads,
-                n_kv,
-                head_dim,
-                theta,
-            )
-            .map_err(|e| format!("glimmer L{layer_idx}: rope: {e:?}"))?;
+            0
+        };
+        gpu.fused_gemma4_qk_norm_rope_f32(
+            &state.q,
+            &state.k,
+            &state.qk_norm_ones,
+            &state.qk_norm_ones,
+            &state.pos_buf,
+            n_heads,
+            n_kv,
+            head_dim,
+            n_rot_pairs,
+            cfg.qk_scale_factor,
+            cfg.rope_theta_for(layer_idx),
+            rms_eps,
+        )
+        .map_err(|e| format!("glimmer L{layer_idx}: fused qk norm+rope: {e:?}"))?;
+    } else {
+        if !abl("HIPFIRE_GLIMMER_NO_QK_NORM") {
+            gpu.rmsnorm_batched(&state.q, &state.qk_norm_ones, &state.q, n_heads, head_dim, rms_eps)
+                .map_err(|e| format!("glimmer L{layer_idx}: q_norm: {e:?}"))?;
+            gpu.rmsnorm_batched(&state.k, &state.qk_norm_ones, &state.k, n_kv, head_dim, rms_eps)
+                .map_err(|e| format!("glimmer L{layer_idx}: k_norm: {e:?}"))?;
+        }
+        // Do NOT pre-scale by sqrt(head_dim); Glimmer wants kernel 1/sqrt AND 3.87
+        if !abl("HIPFIRE_GLIMMER_NO_QK_SCALE") {
+            gpu.scale_f32(&state.q, cfg.qk_scale_factor)
+                .map_err(|e| format!("glimmer L{layer_idx}: q scale qk_factor: {e:?}"))?;
+        }
+
+        // RoPE only on layers whose layer_rope_theta != 0 (copy cohere2moe shape)
+        if cfg.has_rope(layer_idx) || abl("HIPFIRE_GLIMMER_ROPE_ALL") {
+            let theta = cfg.rope_theta_for(layer_idx);
+            // RoPE convention. HF reports rope_type "default" (Llama half-split),
+            // which is `rope_f32`. HIPFIRE_GLIMMER_ROPE_INTERLEAVED=1 selects the
+            // GPT-J interleaved variant for A/B during bring-up — getting this
+            // backwards scrambles attention into plausible-looking noise.
+            if abl("HIPFIRE_GLIMMER_ROPE_INTERLEAVED") {
+                gpu.rope_interleaved_f32(
+                    &state.q,
+                    &state.k,
+                    &state.pos_buf,
+                    n_heads,
+                    n_kv,
+                    head_dim,
+                    head_dim, // n_rot = full head_dim (no partial rotation)
+                    theta,
+                )
+                .map_err(|e| format!("glimmer L{layer_idx}: rope interleaved: {e:?}"))?;
+            } else {
+                gpu.rope_f32(
+                    &state.q,
+                    &state.k,
+                    &state.pos_buf,
+                    n_heads,
+                    n_kv,
+                    head_dim,
+                    theta,
+                )
+                .map_err(|e| format!("glimmer L{layer_idx}: rope: {e:?}"))?;
+            }
         }
     }
 
