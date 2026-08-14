@@ -42,6 +42,7 @@ fn main() {
         enable_thinking: true,
         bos_token: None,
         reasoning_strength: None,
+        reasoning_effort: None,
     };
 
     let tools = serde_json::json!([{

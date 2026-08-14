@@ -7,20 +7,20 @@
 //! This binary owns hipfire's operator surface and never shells out to a
 //! JavaScript or TypeScript runtime.
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use hipfire_client::{
-    Engine, OpenAiSseEvent, complete_openai_chat, probe_host, service_ready, service_url,
-    stream_openai_chat,
+    complete_openai_chat, probe_host, service_ready, service_url, stream_openai_chat, Engine,
+    OpenAiSseEvent,
 };
 use hipfire_config::{
-    CONFIG_SCHEMA_VERSION, CatalogFormat, ConfigFormat, ConfigLayer, ConfigPaths, ConfigSource,
-    NamedLayer, ValueRule, apply_config_profile, canonical_config_key, create_config_profile,
-    developer_env_for_key, field, fields, is_developer_key, load_catalog, load_env_layer,
-    load_global, resolve, write_catalog_toml, write_global_toml,
+    apply_config_profile, canonical_config_key, create_config_profile, developer_env_for_key,
+    field, fields, is_developer_key, load_catalog, load_env_layer, load_global, resolve,
+    write_catalog_toml, write_global_toml, CatalogFormat, ConfigFormat, ConfigLayer, ConfigPaths,
+    ConfigSource, NamedLayer, ValueRule, CONFIG_SCHEMA_VERSION,
 };
 use hipfire_registry::{
-    LoadedRegistry, ModelEntry, RegistryPaths, RegistrySource, RegistryV1, load as load_registry,
+    load as load_registry, LoadedRegistry, ModelEntry, RegistryPaths, RegistrySource, RegistryV1,
 };
 use hipfire_runtime::prompt_frame::ToolCall;
 use serde::{Deserialize, Serialize};
@@ -36,9 +36,8 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command},
     sync::{
-        Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
-        mpsc,
+        mpsc, Arc, Condvar, Mutex,
     },
     thread,
     time::{Duration, Instant},
@@ -2246,7 +2245,8 @@ fn chat_command(paths: &Paths, args: ChatArgs) -> Result<()> {
             messages.pop();
             return Err(error.into());
         }
-        let mut assistant_msg = serde_json::json!({ "role": "assistant", "content": assistant_content });
+        let mut assistant_msg =
+            serde_json::json!({ "role": "assistant", "content": assistant_content });
         if !assistant_reasoning.is_empty() {
             assistant_msg["reasoning_content"] = serde_json::Value::String(assistant_reasoning);
         }
@@ -3167,50 +3167,48 @@ fn serve_foreground(
     }
     if !shared.idle_timeout.is_zero() {
         let shared = Arc::clone(&shared);
-        thread::spawn(move || {
-            loop {
-                thread::sleep(Duration::from_secs(1));
-                if shared.admission.inflight() != 0 {
-                    continue;
-                }
-                let expired = {
-                    let meta = shared
-                        .meta
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner());
-                    idle_model_expired(&meta, shared.idle_timeout)
-                };
-                if !expired {
-                    continue;
-                }
-                let unloaded = {
-                    let mut runtime = shared
-                        .runtime
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner());
-                    if runtime.current_path.is_some() {
-                        let result = runtime.engine.unload();
-                        if result.is_ok() {
-                            runtime.current_path = None;
-                            runtime.current_arch = None;
-                            runtime.current_max_seq = 0;
-                            runtime.cache_capable = false;
-                        }
-                        result
-                    } else {
-                        Ok(())
+        thread::spawn(move || loop {
+            thread::sleep(Duration::from_secs(1));
+            if shared.admission.inflight() != 0 {
+                continue;
+            }
+            let expired = {
+                let meta = shared
+                    .meta
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                idle_model_expired(&meta, shared.idle_timeout)
+            };
+            if !expired {
+                continue;
+            }
+            let unloaded = {
+                let mut runtime = shared
+                    .runtime
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                if runtime.current_path.is_some() {
+                    let result = runtime.engine.unload();
+                    if result.is_ok() {
+                        runtime.current_path = None;
+                        runtime.current_arch = None;
+                        runtime.current_max_seq = 0;
+                        runtime.cache_capable = false;
                     }
-                };
-                if unloaded.is_ok() {
-                    let mut meta = shared
-                        .meta
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner());
-                    meta.current_model = None;
-                    meta.loading_model = None;
-                    meta.last_activity = Instant::now();
-                    eprintln!("[hipfire] unloaded idle model");
+                    result
+                } else {
+                    Ok(())
                 }
+            };
+            if unloaded.is_ok() {
+                let mut meta = shared
+                    .meta
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                meta.current_model = None;
+                meta.loading_model = None;
+                meta.last_activity = Instant::now();
+                eprintln!("[hipfire] unloaded idle model");
             }
         });
     }
@@ -4552,8 +4550,7 @@ fn complete_request_attempt(
         if runtime.current_max_seq < required_max_seq {
             runtime.ensure_model(&model, &shared.meta, Some(required_max_seq))?;
         }
-        let include_reasoning_content =
-            runtime.current_arch.as_deref() == Some("muse_glimmer");
+        let include_reasoning_content = runtime.current_arch.as_deref() == Some("muse_glimmer");
         let mut normalized_messages =
             normalize_openai_messages(body.get("messages"), include_reasoning_content);
         let default_system = request_string(&resolved, "prompt.system", None)?;
@@ -5186,7 +5183,10 @@ fn inline_thinking(text: &str) -> Option<String> {
     (!reasoning.is_empty()).then(|| reasoning.to_owned())
 }
 
-fn normalize_openai_tool_call(call: &serde_json::Value, include_reasoning_content: bool) -> serde_json::Value {
+fn normalize_openai_tool_call(
+    call: &serde_json::Value,
+    include_reasoning_content: bool,
+) -> serde_json::Value {
     let function = call.get("function").unwrap_or(call);
     let name = function
         .get("name")
@@ -6389,7 +6389,7 @@ fn apply_reasoning_request(
             request["assistant_prefix"] = serde_json::json!("closed_think");
             request["reasoning_effort"] = serde_json::json!("none");
         }
-        effort @ ("low" | "high" | "max") => {
+        effort @ ("low" | "medium" | "high" | "max" | "xhigh") => {
             request["reasoning_effort"] = serde_json::json!(effort);
         }
         effort => bail!("unknown reasoning effort '{effort}'"),
@@ -8985,12 +8985,10 @@ mod tests {
             find_model_path(&paths, &registry, "example-model"),
             Some(fs::canonicalize(&nested).unwrap())
         );
-        assert!(
-            list_local_models(&paths, &registry)
-                .unwrap()
-                .iter()
-                .any(|model| model.path == fs::canonicalize(&nested).unwrap())
-        );
+        assert!(list_local_models(&paths, &registry)
+            .unwrap()
+            .iter()
+            .any(|model| model.path == fs::canonicalize(&nested).unwrap()));
         fs::remove_dir_all(&paths.root).unwrap();
     }
 
@@ -9846,17 +9844,12 @@ mod tests {
         assert!(old.hipcc.is_none());
         assert!(!old.strict_rocm);
         // Strict can be stored as string \"1\" or number 1 for compat.
-        fs::write(
-            home.join("install.json"),
-            r#"{"strict_rocm":"1"}"#,
-        )
-        .unwrap();
+        fs::write(home.join("install.json"), r#"{"strict_rocm":"1"}"#).unwrap();
         assert!(recorded_install_metadata(&home).strict_rocm);
         fs::write(home.join("install.json"), r#"{"strict_rocm":1}"#).unwrap();
         assert!(recorded_install_metadata(&home).strict_rocm);
         fs::remove_dir_all(home).unwrap();
     }
-
 
     #[test]
     fn update_restores_staged_unstaged_and_untracked_after_failed_handoff() {
@@ -10229,12 +10222,10 @@ mod tests {
             "role": "user",
             "content": [{ "type": "image_url", "image_url": { "url": "https://example/image.png" } }]
         }]);
-        assert!(
-            request_image_base64(Some(&remote))
-                .unwrap_err()
-                .to_string()
-                .contains("remote")
-        );
+        assert!(request_image_base64(Some(&remote))
+            .unwrap_err()
+            .to_string()
+            .contains("remote"));
     }
 
     #[test]
@@ -10285,7 +10276,10 @@ mod tests {
         assert_eq!(normalized_on[2]["content"], "");
         assert_eq!(normalized_on[2]["tool_plan"], "tool reasoning");
         assert_eq!(normalized_on[2]["reasoning_content"], "tool reasoning");
-        assert_eq!(normalized_on[2]["reasoning_content"], normalized_on[2]["tool_plan"]);
+        assert_eq!(
+            normalized_on[2]["reasoning_content"],
+            normalized_on[2]["tool_plan"]
+        );
         assert_eq!(normalized_on[2]["tool_calls"][0]["id"], "call_1");
     }
 
@@ -10442,9 +10436,15 @@ mod tests {
             }]
         });
         let off = normalize_openai_messages(body.get("messages"), false);
-        assert_eq!(off[0]["tool_calls"][0]["arguments"], serde_json::json!({ "_raw": "not-json" }));
+        assert_eq!(
+            off[0]["tool_calls"][0]["arguments"],
+            serde_json::json!({ "_raw": "not-json" })
+        );
         let on = normalize_openai_messages(body.get("messages"), true);
-        assert_eq!(on[0]["tool_calls"][0]["arguments"], serde_json::Value::String("not-json".into()));
+        assert_eq!(
+            on[0]["tool_calls"][0]["arguments"],
+            serde_json::Value::String("not-json".into())
+        );
         // JSON string that parses to non-object (array) also surfaces as string under glimmer
         let body_arr = serde_json::json!({
             "messages": [{
@@ -10456,10 +10456,16 @@ mod tests {
             }]
         });
         let on_arr = normalize_openai_messages(body_arr.get("messages"), true);
-        assert_eq!(on_arr[0]["tool_calls"][0]["arguments"], serde_json::Value::String("[1,2]".into()));
+        assert_eq!(
+            on_arr[0]["tool_calls"][0]["arguments"],
+            serde_json::Value::String("[1,2]".into())
+        );
         let off_arr = normalize_openai_messages(body_arr.get("messages"), false);
         // non-glimmer keeps parsed array (today's behaviour is to keep whatever parsed)
-        assert_eq!(off_arr[0]["tool_calls"][0]["arguments"], serde_json::json!([1,2]));
+        assert_eq!(
+            off_arr[0]["tool_calls"][0]["arguments"],
+            serde_json::json!([1, 2])
+        );
     }
 
     #[test]
@@ -10939,11 +10945,65 @@ mod tests {
             preserved_json["choices"][0]["message"]["content"],
             "<think>private chain</think>\nanswer"
         );
+        assert!(preserved_json["choices"][0]["message"]
+            .get("reasoning_content")
+            .is_none());
+    }
+    #[test]
+    fn apply_reasoning_request_accepts_medium_and_xhigh() {
+        use hipfire_config::{resolve, ConfigLayer, ConfigSource, NamedLayer};
+        use std::path::PathBuf;
+        for effort in ["low", "medium", "xhigh", "high", "max"] {
+            let mut layer = ConfigLayer::default();
+            layer.set_cli("reasoning.effort", effort).unwrap();
+            layer.set_cli("reasoning.max_tokens", "0").unwrap();
+            let resolved = resolve([NamedLayer {
+                source: ConfigSource::GlobalUser {
+                    path: PathBuf::from("config.toml"),
+                },
+                layer,
+            }])
+            .unwrap();
+            let mut req = serde_json::json!({});
+            super::apply_reasoning_request(&resolved, &mut req).unwrap();
+            assert_eq!(
+                req["reasoning_effort"], effort,
+                "effort {effort} must pass through unchanged"
+            );
+        }
+        // auto stays unset (no key), none disables
+        let mut auto_layer = ConfigLayer::default();
+        auto_layer.set_cli("reasoning.effort", "auto").unwrap();
+        auto_layer.set_cli("reasoning.max_tokens", "0").unwrap();
+        let auto_resolved = resolve([NamedLayer {
+            source: ConfigSource::GlobalUser {
+                path: PathBuf::from("config.toml"),
+            },
+            layer: auto_layer,
+        }])
+        .unwrap();
+        let mut auto_req = serde_json::json!({});
+        super::apply_reasoning_request(&auto_resolved, &mut auto_req).unwrap();
         assert!(
-            preserved_json["choices"][0]["message"]
-                .get("reasoning_content")
-                .is_none()
+            auto_req.get("reasoning_effort").is_none(),
+            "auto must stay undefined"
         );
+
+        let mut none_layer = ConfigLayer::default();
+        none_layer.set_cli("reasoning.effort", "none").unwrap();
+        none_layer.set_cli("reasoning.max_tokens", "0").unwrap();
+        let none_resolved = resolve([NamedLayer {
+            source: ConfigSource::GlobalUser {
+                path: PathBuf::from("config.toml"),
+            },
+            layer: none_layer,
+        }])
+        .unwrap();
+        let mut none_req = serde_json::json!({});
+        super::apply_reasoning_request(&none_resolved, &mut none_req).unwrap();
+        assert_eq!(none_req["reasoning_effort"], "none");
+        assert_eq!(none_req["max_think_tokens"], 1);
+        assert_eq!(none_req["assistant_prefix"], "closed_think");
     }
 
     #[test]
@@ -11440,20 +11500,16 @@ mod tests {
             Some(serde_json::json!({ "reasoning_content": "plan" }))
         );
         // Mid-stream tool_calls must never become an SSE delta.
-        assert!(
-            openai_stream_delta_for_event(&serde_json::json!({
-                "type": "tool_calls",
-                "calls": [{ "name": "read_file", "arguments": {} }]
-            }))
-            .is_none()
-        );
-        assert!(
-            openai_stream_delta_for_event(&serde_json::json!({
-                "type": "done",
-                "finish_reason": "stop"
-            }))
-            .is_none()
-        );
+        assert!(openai_stream_delta_for_event(&serde_json::json!({
+            "type": "tool_calls",
+            "calls": [{ "name": "read_file", "arguments": {} }]
+        }))
+        .is_none());
+        assert!(openai_stream_delta_for_event(&serde_json::json!({
+            "type": "done",
+            "finish_reason": "stop"
+        }))
+        .is_none());
     }
 
     #[test]
@@ -11582,13 +11638,11 @@ mod tests {
         );
 
         // Mid-stream fold forward never includes tool_calls.
-        assert!(
-            openai_stream_delta_for_event(&serde_json::json!({
-                "type": "tool_calls",
-                "calls": fold.executable_tool_calls()
-            }))
-            .is_none()
-        );
+        assert!(openai_stream_delta_for_event(&serde_json::json!({
+            "type": "tool_calls",
+            "calls": fold.executable_tool_calls()
+        }))
+        .is_none());
 
         let stream_chunks = openai_stream_terminal_chunks(&completion, true);
         assert_eq!(
@@ -11647,21 +11701,17 @@ mod tests {
 
         let nonstream = completion_json(&completion);
         assert_eq!(nonstream["choices"][0]["finish_reason"], "length");
-        assert!(
-            nonstream["choices"][0]["message"]
-                .get("tool_calls")
-                .is_none()
-        );
+        assert!(nonstream["choices"][0]["message"]
+            .get("tool_calls")
+            .is_none());
         assert_eq!(nonstream["choices"][0]["message"]["content"], "partial");
 
         let stream_chunks = openai_stream_terminal_chunks(&completion, true);
         assert_eq!(stream_chunks.len(), 2); // terminal + usage, no tool release
         assert_eq!(stream_chunks[0]["choices"][0]["finish_reason"], "length");
-        assert!(
-            stream_chunks[0]["choices"][0]["delta"]
-                .get("tool_calls")
-                .is_none()
-        );
+        assert!(stream_chunks[0]["choices"][0]["delta"]
+            .get("tool_calls")
+            .is_none());
         assert_eq!(stream_chunks[1]["choices"], serde_json::json!([]));
     }
 

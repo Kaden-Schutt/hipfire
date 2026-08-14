@@ -163,7 +163,11 @@ fn render_atem_string(name: &str, arguments: &serde_json::Value) -> String {
             s.push_str(k);
             s.push_str("\">");
             if v.is_boolean() {
-                s.push_str(if v.as_bool().unwrap() { "true" } else { "false" });
+                s.push_str(if v.as_bool().unwrap() {
+                    "true"
+                } else {
+                    "false"
+                });
             } else if v.is_null() {
                 s.push_str("null");
             } else if v.is_object() || v.is_array() {
@@ -185,8 +189,8 @@ fn render_atem_string(name: &str, arguments: &serde_json::Value) -> String {
 fn run_harmony_oracle(model_path: &Path, perturb: Perturbation) -> Result<Vec<OracleRow>, String> {
     // Load HFQ and production tokenizer/template.
     let hfq = HfqFile::open(model_path).map_err(|e| format!("open hfq: {e}"))?;
-    let tok = Tokenizer::from_hfq_metadata(&hfq.metadata_json)
-        .map_err(|e| format!("tokenizer: {e}"))?;
+    let tok =
+        Tokenizer::from_hfq_metadata(&hfq.metadata_json).map_err(|e| format!("tokenizer: {e}"))?;
     let raw_template = hfq
         .chat_template()
         .ok_or_else(|| "hfq has no chat_template".to_string())?;
@@ -251,6 +255,7 @@ fn run_harmony_oracle(model_path: &Path, perturb: Perturbation) -> Result<Vec<Or
         enable_thinking,
         bos_token: None,
         reasoning_strength: None,
+        reasoning_effort: None,
     };
 
     let mut rows: Vec<OracleRow> = Vec::new();
@@ -332,14 +337,15 @@ fn run_harmony_oracle(model_path: &Path, perturb: Perturbation) -> Result<Vec<Or
                 text: answer.to_string(),
             }),
         };
-        let next_prompt = build_cached_history_jinja(&frame_on, &next_msgs, Some(&tools_json), |m| {
-            if m.role == Role::Assistant && m.content == answer {
-                Some(cached_turn.clone())
-            } else {
-                None
-            }
-        })
-        .map_err(|e| format!("normal-thinking-on build_cached: {e}"))?;
+        let next_prompt =
+            build_cached_history_jinja(&frame_on, &next_msgs, Some(&tools_json), |m| {
+                if m.role == Role::Assistant && m.content == answer {
+                    Some(cached_turn.clone())
+                } else {
+                    None
+                }
+            })
+            .map_err(|e| format!("normal-thinking-on build_cached: {e}"))?;
         rows.push(extension_row("normal-thinking-on", &prior_kv, &next_prompt));
     }
 
@@ -419,15 +425,20 @@ fn run_harmony_oracle(model_path: &Path, perturb: Perturbation) -> Result<Vec<Or
                 text: answer.to_string(),
             }),
         };
-        let next_prompt = build_cached_history_jinja(&frame_off, &next_msgs, Some(&tools_json), |m| {
-            if m.role == Role::Assistant && m.content == answer {
-                Some(cached_turn.clone())
-            } else {
-                None
-            }
-        })
-        .map_err(|e| format!("normal-thinking-off build_cached: {e}"))?;
-        rows.push(extension_row("normal-thinking-off", &prior_kv, &next_prompt));
+        let next_prompt =
+            build_cached_history_jinja(&frame_off, &next_msgs, Some(&tools_json), |m| {
+                if m.role == Role::Assistant && m.content == answer {
+                    Some(cached_turn.clone())
+                } else {
+                    None
+                }
+            })
+            .map_err(|e| format!("normal-thinking-off build_cached: {e}"))?;
+        rows.push(extension_row(
+            "normal-thinking-off",
+            &prior_kv,
+            &next_prompt,
+        ));
     }
 
     // ---- no-system-message ----
@@ -509,14 +520,15 @@ fn run_harmony_oracle(model_path: &Path, perturb: Perturbation) -> Result<Vec<Or
                 text: answer.to_string(),
             }),
         };
-        let next_prompt = build_cached_history_jinja(&frame_on, &next_msgs, Some(&tools_json), |m| {
-            if m.role == Role::Assistant && m.content == answer {
-                Some(cached_turn.clone())
-            } else {
-                None
-            }
-        })
-        .map_err(|e| format!("no-system-message build_cached: {e}"))?;
+        let next_prompt =
+            build_cached_history_jinja(&frame_on, &next_msgs, Some(&tools_json), |m| {
+                if m.role == Role::Assistant && m.content == answer {
+                    Some(cached_turn.clone())
+                } else {
+                    None
+                }
+            })
+            .map_err(|e| format!("no-system-message build_cached: {e}"))?;
         rows.push(extension_row("no-system-message", &prior_kv, &next_prompt));
     }
 
@@ -623,14 +635,15 @@ fn run_harmony_oracle(model_path: &Path, perturb: Perturbation) -> Result<Vec<Or
                 tool_plan: String::new(),
             },
         ];
-        let next_prompt = build_cached_history_jinja(&frame_on, &next_msgs, Some(&tools_json), |m| {
-            if m.role == Role::Assistant && !m.tool_calls.is_empty() {
-                Some(cached_turn.clone())
-            } else {
-                None
-            }
-        })
-        .map_err(|e| format!("tool-roundtrip build_cached: {e}"))?;
+        let next_prompt =
+            build_cached_history_jinja(&frame_on, &next_msgs, Some(&tools_json), |m| {
+                if m.role == Role::Assistant && !m.tool_calls.is_empty() {
+                    Some(cached_turn.clone())
+                } else {
+                    None
+                }
+            })
+            .map_err(|e| format!("tool-roundtrip build_cached: {e}"))?;
         rows.push(extension_row("tool-roundtrip", &prior_kv, &next_prompt));
     }
 
@@ -720,14 +733,15 @@ fn run_harmony_oracle(model_path: &Path, perturb: Perturbation) -> Result<Vec<Or
         ];
         // Use CHANGED tool set for next prompt — system block differs, so LCP must collapse.
         // Even if perturb corrupts tool body, this case remains collapsed; perturb corrupts tool-roundtrip only.
-        let mut next_prompt = build_cached_history_jinja(&frame_on, &next_msgs, Some(&tools_changed_json), |m| {
-            if m.role == Role::Assistant && !m.tool_calls.is_empty() {
-                Some(cached_turn.clone())
-            } else {
-                None
-            }
-        })
-        .map_err(|e| format!("tool-set-changed build_cached: {e}"))?;
+        let mut next_prompt =
+            build_cached_history_jinja(&frame_on, &next_msgs, Some(&tools_changed_json), |m| {
+                if m.role == Role::Assistant && !m.tool_calls.is_empty() {
+                    Some(cached_turn.clone())
+                } else {
+                    None
+                }
+            })
+            .map_err(|e| format!("tool-set-changed build_cached: {e}"))?;
         // If corrupt perturb, we already corrupted tool-roundtrip; keep this one uncorrupted
         // to preserve its expected collapse behaviour independent of perturb.
         // No need to adjust; collapse is due to system block.
@@ -752,9 +766,7 @@ fn main() {
             std::process::exit(2);
         }
         let perturb = if let Some(p_idx) = args.iter().position(|a| a == "--perturb") {
-            let v = args
-                .get(p_idx + 1)
-                .expect("--perturb requires a value");
+            let v = args.get(p_idx + 1).expect("--perturb requires a value");
             Perturbation::from_str(v).unwrap_or_else(|| {
                 eprintln!("unknown --perturb value: {v} (expected none|drop-reasoning-envelope|corrupt-tool-body-token)");
                 std::process::exit(2);

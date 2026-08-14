@@ -488,12 +488,11 @@ const AUTO_ON_OFF: &[&str] = &["auto", "on", "off"];
 // `enable_thinking=false` / `reasoning_effort="none"` paths already send. It is
 // NOT 0 — 0 means `uncapped` (think until the model closes the block itself).
 const THINKING_BUDGETS: &[&str] = &["off", "low", "med", "high", "xhigh", "max", "uncapped"];
-// `xhigh` is Qwen3.8's default effort (its ladder is `xhigh` > `medium` >
-// `low`). Without it here the config enum rejects the value the model card
-// prescribes. It maps to `ThinkMode::Max` in `prompt_frame.rs`; `medium` is
-// deliberately absent because that layer folds it into `Low`, so accepting it
-// as config would silently equal `low`.
-const REASONING_EFFORTS: &[&str] = &["auto", "none", "low", "high", "xhigh", "max"];
+// Qwen3.8's published effort ladder is `low|medium|xhigh` (default xhigh).
+// Keep generic OpenAI-style values (`auto|none|high|max`) alongside it so
+// non-Qwen3.8 parents still validate. Values pass through as request strings;
+// model-specific mapping lives downstream of config validation.
+const REASONING_EFFORTS: &[&str] = &["auto", "none", "low", "medium", "high", "xhigh", "max"];
 const SPECULATION_MODES: &[&str] = &["off", "auto", "ngram", "dflash", "mtp", "dspark"];
 
 macro_rules! field {
@@ -603,9 +602,7 @@ macro_rules! process_field {
 
 macro_rules! diagnostic_field {
     ($key:literal, $legacy:literal, $default:expr, $rule:expr, $env:literal, $help:literal) => {
-        bridge_field!(
-            $key, $legacy, Diagnostic, Diagnostic, $default, $rule, true, $env, $help
-        )
+        bridge_field!($key, $legacy, Diagnostic, Diagnostic, $default, $rule, true, $env, $help)
     };
 }
 
@@ -4394,6 +4391,15 @@ mod tests {
             layer.get("reasoning.effort"),
             Some(&ConfigValue::String("max".into()))
         );
+        for effort in ["low", "medium", "xhigh"] {
+            layer
+                .set_cli("reasoning.effort", effort)
+                .unwrap_or_else(|_| panic!("Qwen3.8 effort {effort} must validate"));
+            assert_eq!(
+                layer.get("reasoning.effort"),
+                Some(&ConfigValue::String(effort.into()))
+            );
+        }
         assert_eq!(
             layer.get("reasoning.max_tokens"),
             Some(&ConfigValue::Integer(393216))
@@ -4538,16 +4544,12 @@ mod tests {
             .set_cli("diagnostic.kernel.rdna2_variant", "5")
             .unwrap();
         layer.set_cli("kernel.lm_head_f16", "f32").unwrap();
-        assert!(
-            layer
-                .set_cli("diagnostic.kernel.gate_up_variant", "unknown")
-                .is_err()
-        );
-        assert!(
-            layer
-                .set_cli("diagnostic.kernel.rdna2_variant", "6")
-                .is_err()
-        );
+        assert!(layer
+            .set_cli("diagnostic.kernel.gate_up_variant", "unknown")
+            .is_err());
+        assert!(layer
+            .set_cli("diagnostic.kernel.rdna2_variant", "6")
+            .is_err());
 
         write_global_toml(&paths, &layer).unwrap();
         let loaded = load_global(&paths).unwrap();
@@ -4683,12 +4685,10 @@ mod tests {
         let wrong_version = encoded.replace("\"schema_version\":1", "\"schema_version\":2");
         let decoded: ProcessConfig = serde_json::from_str(&wrong_version).unwrap();
         assert!(decoded.validate().is_err());
-        assert!(
-            serde_json::from_str::<ProcessConfig>(
-                r#"{"schema_version":1,"values":{"values":{}},"unknown":true}"#
-            )
-            .is_err()
-        );
+        assert!(serde_json::from_str::<ProcessConfig>(
+            r#"{"schema_version":1,"values":{"values":{}},"unknown":true}"#
+        )
+        .is_err());
     }
 
     #[test]

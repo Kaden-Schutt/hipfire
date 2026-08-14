@@ -47,6 +47,7 @@ fn main() {
         enable_thinking: think,
         bos_token: None,
         reasoning_strength: None,
+        reasoning_effort: None,
     };
     match frame.render() {
         Ok(s) => {

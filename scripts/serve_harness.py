@@ -183,7 +183,7 @@ def build_config(args):
     if selected_budget is None:
         if registry_budget is not None:
             selected_budget = registry_budget
-        elif samp.get("reasoning_effort") in ("low", "high", "max"):
+        elif samp.get("reasoning_effort") in ("low", "medium", "high", "xhigh", "max"):
             selected_budget = "uncapped"
         else:
             selected_budget = "med"
@@ -1261,6 +1261,66 @@ def _self_test_mtp_ngram_config():
     print("serve_harness: mtp-ngram-config self-test OK", flush=True)
 
 
+def _self_test_thinking_effort():
+    """GPU-free: medium/xhigh are accepted, uncapped by default, sent unchanged."""
+    import argparse
+
+    def _ns(**kw):
+        base = dict(
+            model="/models/x.mq4",
+            tag=None,
+            registry=os.path.join(REPO, "registry/v1.json"),
+            kv="auto",
+            kv_backend="contiguous",
+            mtp="off",
+            dflash="off",
+            ngram="off",
+            ngram_k=None,
+            mtp_ngram="off",
+            mtp_ngram_match=None,
+            mtp_ngram_min=None,
+            mtp_ngram_max=None,
+            draft=None,
+            thinking=None,
+            thinking_effort=None,
+            max_tokens=2048,
+            sampling="greedy",
+            mode="battery",
+            port=11520,
+            seed=None,
+            prompts_file=None,
+            prompt_file=None,
+            niah_file=None,
+            speculation=None,
+            deepseek4_experts_per_token=None,
+            deepseek4_compute_placement="single",
+            devices=None,
+            tp=None,
+            replay_route_proof_log=False,
+        )
+        base.update(kw)
+        return argparse.Namespace(**base)
+
+    for effort in ("medium", "xhigh"):
+        cfg = build_config(_ns(thinking_effort=effort))
+        assert cfg["sampling"]["reasoning_effort"] == effort, cfg["sampling"]
+        assert cfg["thinking_budget"] == "uncapped", (
+            f"{effort} without explicit budget must default uncapped, got "
+            f"{cfg['thinking_budget']!r}"
+        )
+        assert cfg["thinking_cap_tokens"] == 0, cfg["thinking_cap_tokens"]
+        assert cfg["sampling_source"].get("reasoning_effort") == "explicit(--thinking-effort)"
+
+    # Explicit --thinking still wins over the uncapped default.
+    cfg = build_config(_ns(thinking_effort="medium", thinking="high"))
+    assert cfg["sampling"]["reasoning_effort"] == "medium"
+    assert cfg["thinking_budget"] == "high"
+    assert cfg["thinking_cap_tokens"] == THINKING_BUDGET["high"]
+
+    print("serve_harness: thinking-effort self-test OK", flush=True)
+
+
+
 def _self_test_glimmer_feedback_shape():
     """GPU-free coverage for Glimmer feedback shapes (rich default vs plain)."""
     sample = {
@@ -2189,9 +2249,9 @@ def main():
         help="DeepSeek V4 routed experts per token for this model load; omitted preserves the checkpoint default.",
     )
     ap.add_argument("--thinking-effort", default=None,
-                    choices=["none", "low", "high", "max"],
+                    choices=["none", "low", "medium", "high", "xhigh", "max"],
                     help="parent-model reasoning_effort prompt semantics; independent of "
-                         "--thinking. With no explicit/registry budget, low/high/max is uncapped.")
+                         "--thinking. With no explicit/registry budget, low/medium/high/xhigh/max is uncapped.")
     ap.add_argument("--ngram", default="off", choices=["off", "on"],
                     help="Model-free n-gram/PLD speculator (default off). 'on' emits the "
                          "exclusive selector mode=ngram + ngram=on + dflash/mtp off, and is "
@@ -2316,6 +2376,7 @@ def main():
         _self_test_device_config()
         _self_test_kv_resolution()
         _self_test_mtp_ngram_config()
+        _self_test_thinking_effort()
         _self_test_glimmer_feedback_shape()
         _self_test_glimmer_tool_delta_merge()
         _self_test_glimmer_transcript_and_trace()

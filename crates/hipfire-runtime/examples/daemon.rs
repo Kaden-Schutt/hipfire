@@ -1376,28 +1376,49 @@ fn resolve_batch_sampling(msg: &serde_json::Value, m: &LoadedModel) -> BatchSamp
         repeat_window,
     }
 }
+/// Pure helper: derive Jinja `enable_thinking` and `reasoning_effort` from the
+/// exact raw request effort and the `max_think` cap. Do not lowercase and do
+/// not drop empty strings. Absence/`auto` => undefined; `none`/`off`/`chat`
+/// => disabled+undefined; all other exact strings pass unchanged.
+fn qwen_jinja_reasoning(
+    raw_effort: Option<&str>,
+    max_think_tokens: usize,
+) -> (bool, Option<String>) {
+    let is_disable = matches!(raw_effort, Some("none") | Some("off") | Some("chat"));
+    let enable = max_think_tokens != 1 && !is_disable;
+    if !enable {
+        return (false, None);
+    }
+    match raw_effort {
+        None | Some("auto") => (true, None),
+        Some(s) => (true, Some(s.to_string())),
+    }
+}
 
 /// Stateless prompt rendering for a batch lane, reusing the production
 /// `ChatFrame`/`JinjaChatFrame` path. Called with `seq_pos=0`, no tools/
 /// messages/PFlash, retains `started_in_think` for barrier gating.
-/// Plain fallback on Jinja render failure is preserved.
+/// Plain fallback on Jinja render failure is preserved only when no explicit
+/// `reasoning_effort` was supplied; explicit effort render errors are
+/// surfaced as `Err` (request validation) instead of hidden by Plain.
 fn batch_render_prompt_tokens(
     prompt: &str,
     system: Option<&str>,
     assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
     tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
     chat_template: Option<&String>,
-    max_think_tokens: usize,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    enable_thinking: bool,
+    reasoning_effort: Option<&str>,
 ) -> Result<(Vec<u32>, bool), String> {
     let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
     let try_jinja = jinja_enabled && chat_template.is_some();
+    let q_tokens = tokenizer.encode(prompt);
+    let system_prompt = system;
     let mut started_in_think = matches!(
         assistant_prefix,
         hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
     );
-    let q_tokens = tokenizer.encode(prompt);
-    let system_prompt = system;
     let new_tokens = if try_jinja {
         let template = chat_template.unwrap();
         let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
@@ -1405,9 +1426,10 @@ fn batch_render_prompt_tokens(
             template,
             system: system_prompt,
             user: prompt,
-            enable_thinking: max_think_tokens != 1,
+            enable_thinking,
             bos_token: None,
             reasoning_strength: None,
+            reasoning_effort,
         };
         let render_result = if let Some(messages) = messages_history {
             frame.render_messages(messages, None, None)
@@ -1420,6 +1442,9 @@ fn batch_render_prompt_tokens(
                 tokenizer.encode(&rendered)
             }
             Err(e) => {
+                if reasoning_effort.is_some() {
+                    return Err(e);
+                }
                 eprintln!("[daemon] jinja render failed ({e}) — falling back to Plain");
                 hipfire_runtime::prompt_frame::ChatFrame {
                     tokenizer,
@@ -1972,14 +1997,21 @@ fn drive_qwen_continuous_batch(
                             },
                             None => None,
                         };
+                        let raw_effort = json
+                            .get("reasoning_effort")
+                            .or_else(|| json.get("thinking_mode"))
+                            .and_then(|v| v.as_str());
+                        let (batch_enable_thinking, batch_reasoning_effort) =
+                            qwen_jinja_reasoning(raw_effort, max_think);
                         let (prompt_tokens, started_in_think) = match batch_render_prompt_tokens(
                             &prompt_str,
                             system_str.as_deref(),
                             assistant_prefix,
                             tokenizer,
                             chat_template.as_ref(),
-                            max_think,
                             batch_messages.as_deref(),
+                            batch_enable_thinking,
+                            batch_reasoning_effort.as_deref(),
                         ) {
                             Ok(v) => v,
                             Err(e) => {
@@ -2895,8 +2927,9 @@ fn drive_lfm_continuous_batch(
                             assistant_prefix,
                             tokenizer,
                             chat_template.as_ref(),
-                            max_think,
                             batch_messages.as_deref(),
+                            max_think != 1,
+                            None,
                         ) {
                             Ok(v) => v,
                             Err(e) => {
@@ -4328,14 +4361,21 @@ fn drive_qwen35_ep_continuous_batch(
                             },
                             None => None,
                         };
+                        let raw_effort = json
+                            .get("reasoning_effort")
+                            .or_else(|| json.get("thinking_mode"))
+                            .and_then(|v| v.as_str());
+                        let (batch_enable_thinking, batch_reasoning_effort) =
+                            qwen_jinja_reasoning(raw_effort, max_think);
                         let (prompt_tokens, started_in_think) = match batch_render_prompt_tokens(
                             &prompt_str,
                             system_str.as_deref(),
                             assistant_prefix,
                             tokenizer,
                             chat_template.as_ref(),
-                            max_think,
                             batch_messages.as_deref(),
+                            batch_enable_thinking,
+                            batch_reasoning_effort.as_deref(),
                         ) {
                             Ok(v) => v,
                             Err(e) => {
@@ -6681,6 +6721,85 @@ mod continuous_batch_tests {
         assert_eq!(n, 2);
     }
 }
+#[cfg(test)]
+mod qwen_jinja_reasoning_tests {
+    use super::qwen_jinja_reasoning;
+
+    #[test]
+    fn exact_low_medium_xhigh_pass_through() {
+        for (effort, cap) in [("low", 0), ("medium", 1024), ("xhigh", 0), ("low", 512)] {
+            let (enable, out) = qwen_jinja_reasoning(Some(effort), cap);
+            assert!(enable, "enable for {effort} cap {cap}");
+            assert_eq!(out.as_deref(), Some(effort));
+        }
+    }
+
+    #[test]
+    fn unset_and_auto_are_undefined() {
+        for raw in [None, Some("auto")] {
+            let (enable, out) = qwen_jinja_reasoning(raw, 0);
+            assert!(enable, "unset/auto with cap 0 should be enabled");
+            assert_eq!(out, None, "unset/auto must be undefined for {:?}", raw);
+            let (enable2, out2) = qwen_jinja_reasoning(raw, 1);
+            assert!(!enable2, "cap 1 disables even unset/auto");
+            assert_eq!(out2, None);
+        }
+    }
+
+    #[test]
+    fn disable_values_disable_and_drop_effort() {
+        for eff in ["none", "off", "chat"] {
+            let (enable, out) = qwen_jinja_reasoning(Some(eff), 0);
+            assert!(!enable, "{eff} should disable");
+            assert_eq!(out, None);
+            let (enable1, out1) = qwen_jinja_reasoning(Some(eff), 1);
+            assert!(!enable1);
+            assert_eq!(out1, None);
+        }
+    }
+
+    #[test]
+    fn case_mismatch_is_not_normalized() {
+        let (enable, out) = qwen_jinja_reasoning(Some("Low"), 0);
+        assert!(enable);
+        assert_eq!(out.as_deref(), Some("Low"), "case must be preserved");
+        let (enable2, out2) = qwen_jinja_reasoning(Some("MEDIUM"), 0);
+        assert!(enable2);
+        assert_eq!(out2.as_deref(), Some("MEDIUM"));
+        let (enable3, out3) = qwen_jinja_reasoning(Some("Xhigh"), 512);
+        assert!(enable3);
+        assert_eq!(out3.as_deref(), Some("Xhigh"));
+    }
+
+    #[test]
+    fn empty_string_is_not_dropped() {
+        let (enable, out) = qwen_jinja_reasoning(Some(""), 0);
+        assert!(enable, "empty should still be enabled when cap !=1");
+        assert_eq!(
+            out.as_deref(),
+            Some(""),
+            "empty must be preserved as Some(\"\")"
+        );
+        let (enable1, out1) = qwen_jinja_reasoning(Some(""), 1);
+        assert!(!enable1, "cap 1 disables even empty");
+        assert_eq!(out1, None);
+    }
+
+    #[test]
+    fn unsupported_high_is_preserved_not_folded() {
+        let (enable, out) = qwen_jinja_reasoning(Some("high"), 0);
+        assert!(enable);
+        assert_eq!(out.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn explicit_effort_with_cap_one_is_disabled() {
+        let (enable, out) = qwen_jinja_reasoning(Some("low"), 1);
+        assert!(!enable, "cap 1 disables thinking regardless of effort");
+        assert_eq!(out, None);
+    }
+}
+
 /// Message types pushed from the stdin-reader thread to the main
 /// processing loop. Abort/commit control messages are NOT forwarded —
 /// they're handled inline in the reader thread via
@@ -14546,14 +14665,28 @@ fn main() {
                     .and_then(|v| v.as_f64())
                     .unwrap_or(default_repeat_penalty) as f32;
                 // OpenAI-compatible `reasoning_effort` (also accept our custom
-                // `thinking_mode` alias) — only consumed by arch_id=9 today.
-                // Default = NonThink, matching the safe HF chat frame.
+                // `thinking_mode` alias) — ThinkMode is consumed by arch_id=9
+                // (DeepSeek DSML thinking), while raw `reasoning_effort` is
+                // plumbed to Jinja as `reasoning_effort` for Qwen3.8 (arch 5/6).
+                // `auto`/absent stays truly undefined (not null) so the Qwen3.8
+                // template defaults to `xhigh` only when undefined; unsupported
+                // values are preserved verbatim (template raises) rather than
+                // being silently remapped to low/medium/xhigh.
                 let think_mode = msg
                     .get("reasoning_effort")
                     .or_else(|| msg.get("thinking_mode"))
                     .and_then(|v| v.as_str())
                     .map(ThinkMode::from_str)
                     .unwrap_or(ThinkMode::NonThink);
+                // Raw effort for Jinja `reasoning_effort` — exact, no lowercasing,
+                // no empty-filter. `auto`/absent => undefined, `none`/`off`/`chat`
+                // => disabled+undefined, all other exact strings (including
+                // empty, case-mismatched) pass verbatim so the Qwen3.8 template
+                // raises rather than silently normalizing or falling back.
+                let raw_reasoning_effort: Option<&str> = msg
+                    .get("reasoning_effort")
+                    .or_else(|| msg.get("thinking_mode"))
+                    .and_then(|v| v.as_str());
                 let repeat_window = msg
                     .get("repeat_window")
                     .and_then(|v| v.as_u64())
@@ -14647,8 +14780,10 @@ fn main() {
                     .get("max_think_tokens")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0) as usize;
-
-                // assistant_prefix: "plain", "open_think", or "closed_think"
+                // Derive Jinja `enable_thinking` and `reasoning_effort` via
+                // pure helper (no lowercasing, no empty-drop).
+                let (enable_thinking_jinja, reasoning_effort_jinja) =
+                    qwen_jinja_reasoning(raw_reasoning_effort, max_think_tokens);
                 // Controls the ChatML framing after the assistant role header.
                 // Propagated through both text and Qwen3.5-VL paths.
                 let assistant_prefix = match msg
@@ -14923,8 +15058,9 @@ fn main() {
                             assistant_prefix,
                             m.tokenizer.as_ref().unwrap(),
                             m.chat_template.as_ref(),
-                            max_think_tokens,
                             messages_history.as_deref(),
+                            enable_thinking_jinja,
+                            reasoning_effort_jinja.as_deref(),
                         ) {
                             Ok(v) => v,
                             Err(e) => {
@@ -15063,8 +15199,9 @@ fn main() {
                             assistant_prefix,
                             m.tokenizer.as_ref().unwrap(),
                             m.chat_template.as_ref(),
-                            max_think_tokens,
                             messages_history.as_deref(),
+                            enable_thinking_jinja,
+                            reasoning_effort_jinja.as_deref(),
                         ) {
                             Ok(v) => v,
                             Err(e) => {
@@ -15266,6 +15403,8 @@ fn main() {
                         messages_history.as_deref(),
                         think_mode,
                         &stop_seqs, // hunt3 M-F
+                        reasoning_effort_jinja.as_deref(),
+                        enable_thinking_jinja,
                     );
                 }
                 if let Some(marker) = gpu.replay.replay_observation_marker(id) {
@@ -17537,6 +17676,7 @@ fn generate_ep(
                 enable_thinking: max_think_tokens != 1,
                 bos_token: None,
                 reasoning_strength: None,
+                reasoning_effort: None,
             };
             let render_result = if tools.is_some() || messages_history.is_some() {
                 let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
@@ -19047,6 +19187,8 @@ fn generate_dflash(
     // daemon hardcodes 0.0; the param exists only so a future opt-in request
     // field can reach it without re-touching this signature.
     cactus_delta: f32,
+    reasoning_effort: Option<&str>,
+    enable_thinking: bool,
     // Returns false in exactly one case: the request does not fit the loaded
     // speculator's reported ctx capacity (draft-side structures are capped at
     // load — see DEFAULT_DFLASH_CTX_CAP) — and NO output/events were emitted,
@@ -19126,9 +19268,10 @@ fn generate_dflash(
             template,
             system: system_prompt,
             user: prompt,
-            enable_thinking: max_think_tokens != 1,
+            enable_thinking,
             bos_token: None,
             reasoning_strength: None,
+            reasoning_effort,
         };
         let render_result = if tools.is_some() || messages_history.is_some() {
             let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
@@ -19172,18 +19315,27 @@ fn generate_dflash(
                 tokenizer.encode(&rendered)
             }
             Err(e) => {
-                // Configured embedded template owns rendering. Do not fall
-                // back to Plain — that would silently change prompt semantics.
-                emit_active_attempt_error(
-                    stdout,
-                    Some(id),
-                    &format!("DFlash jinja render: {e}"),
-                    "validation",
-                    false,
-                    false,
-                );
-                let _ = stdout.flush();
-                return true;
+                if reasoning_effort.is_some() {
+                    emit_active_attempt_error(
+                        stdout,
+                        Some(id),
+                        &format!("DFlash jinja render: {e}"),
+                        "validation",
+                        false,
+                        false,
+                    );
+                    let _ = stdout.flush();
+                    return true;
+                }
+                eprintln!("[daemon] jinja render failed ({e}) — falling back to Plain");
+                hipfire_runtime::prompt_frame::ChatFrame {
+                    tokenizer,
+                    system: system_prompt,
+                    user: prompt,
+                    assistant_prefix,
+                    raw: false,
+                }
+                .build()
             }
         }
     } else {
@@ -19267,7 +19419,7 @@ fn generate_dflash(
         && pflash_bypass_reason.is_none()
         && !m.conversation_tokens.is_empty();
     let cache_plan: Option<PromptCachePlan> = if try_jinja {
-        messages_history.map(|hist| {
+        if let Some(hist) = messages_history {
             // Assistant-opener primer from THIS turn's cold jinja render
             // (everything after the last `<|im_start|>assistant\n`) — the
             // template renders history turns without it, so the replay
@@ -19275,28 +19427,28 @@ fn generate_dflash(
             let tok = m.tokenizer.as_ref().unwrap();
             let im_start = tok.special_token_id("<|im_start|>");
             let opener_len = tok.encode("<|im_start|>assistant\n").len();
-            let primer: Vec<u32> = match im_start
-                .and_then(|id| prompt_tokens.iter().rposition(|&t| t == id))
-            {
-                Some(q) if q + opener_len <= prompt_tokens.len() => {
-                    prompt_tokens[q + opener_len..].to_vec()
-                }
-                _ => Vec::new(),
-            };
+            let primer: Vec<u32> =
+                match im_start.and_then(|id| prompt_tokens.iter().rposition(|&t| t == id)) {
+                    Some(q) if q + opener_len <= prompt_tokens.len() => {
+                        prompt_tokens[q + opener_len..].to_vec()
+                    }
+                    _ => Vec::new(),
+                };
             let template = m.chat_template.as_ref().unwrap();
             let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
                 tokenizer: tok,
                 template,
                 system: system_prompt,
                 user: prompt,
-                enable_thinking: max_think_tokens != 1,
+                enable_thinking,
                 bos_token: None,
-            reasoning_strength: None,
+                reasoning_strength: None,
+                reasoning_effort,
             };
             let cache_ref = &mut m.asst_turn_cache;
             let trace_cache =
                 std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1");
-            let rendered = hipfire_runtime::prompt_frame::build_cached_history_jinja(
+            let rendered = match hipfire_runtime::prompt_frame::build_cached_history_jinja(
                 &frame,
                 hist,
                 tools,
@@ -19333,17 +19485,38 @@ fn generate_dflash(
                     }
                     hit
                 },
-            )
-            .unwrap_or_else(|_| prompt_tokens.clone());
-            plan_from_rendered(
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    if reasoning_effort.is_some() {
+                        emit_active_attempt_error(
+                            stdout,
+                            Some(id),
+                            &format!("DFlash qwen-cache jinja build: {e}"),
+                            "validation",
+                            false,
+                            false,
+                        );
+                        let _ = stdout.flush();
+                        return true;
+                    }
+                    eprintln!(
+                        "[qwen-cache] DFlash jinja cached-history build failed ({e}) — cold render"
+                    );
+                    prompt_tokens.clone()
+                }
+            };
+            Some(plan_from_rendered(
                 &m.conversation_tokens,
                 rendered,
                 cache_eligible,
                 &dflash_ckpt_positions,
                 dflash_resume_enabled,
                 "dflash-jinja",
-            )
-        })
+            ))
+        } else {
+            None
+        }
     } else {
         messages_history.map(|hist| {
             let tok = m.tokenizer.as_ref().unwrap();
@@ -21161,6 +21334,8 @@ fn generate_qwen35_mtp(
     // applied to BOTH draft + target nuclei → lossless == AR-at-(min_p,top_k,top_p).
     // 0.0 = disabled. Ignored on the greedy path.
     min_p: f32,
+    reasoning_effort: Option<&str>,
+    enable_thinking: bool,
 ) {
     use hipfire_arch_qwen35::mtp_head::MtpKvMode;
     use hipfire_arch_qwen35::mtp_spec::{self, MtpSpecState};
@@ -21277,9 +21452,10 @@ fn generate_qwen35_mtp(
             template,
             system: system_prompt,
             user: prompt,
-            enable_thinking: max_think_tokens != 1,
+            enable_thinking,
             bos_token: None,
             reasoning_strength: None,
+            reasoning_effort,
         };
         let render_result = if tools.is_some() || messages_history.is_some() {
             let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
@@ -21323,6 +21499,18 @@ fn generate_qwen35_mtp(
                 tokenizer.encode(&rendered)
             }
             Err(e) => {
+                if reasoning_effort.is_some() {
+                    emit_active_attempt_error(
+                        stdout,
+                        Some(id),
+                        &format!("MTP jinja render: {e}"),
+                        "validation",
+                        false,
+                        false,
+                    );
+                    let _ = stdout.flush();
+                    return;
+                }
                 eprintln!("[daemon] jinja render failed in mtp path ({e}) — falling back to Plain");
                 hipfire_runtime::prompt_frame::ChatFrame {
                     tokenizer,
@@ -22325,6 +22513,8 @@ fn generate_multi(
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
     stop: &[String],
+    reasoning_effort: Option<&str>,
+    enable_thinking: bool,
 ) {
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let prompt_est = tokenizer.encode(prompt).len() + 20;
@@ -22523,9 +22713,10 @@ fn generate_multi(
             template,
             system: system_prompt,
             user: prompt,
-            enable_thinking: max_think_tokens != 1,
+            enable_thinking,
             bos_token: None,
             reasoning_strength: None,
+            reasoning_effort,
         };
         let render_result = if tools.is_some() || messages_history.is_some() {
             let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
@@ -22569,6 +22760,18 @@ fn generate_multi(
                 tokenizer.encode(&rendered)
             }
             Err(e) => {
+                if reasoning_effort.is_some() {
+                    emit_active_attempt_error(
+                        stdout,
+                        Some(id),
+                        &format!("jinja render: {e}"),
+                        "validation",
+                        false,
+                        false,
+                    );
+                    let _ = stdout.flush();
+                    return;
+                }
                 eprintln!("[daemon] jinja render failed in pp path ({e}) — falling back to Plain");
                 hipfire_runtime::prompt_frame::ChatFrame {
                     tokenizer,
@@ -23874,6 +24077,8 @@ fn generate(
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
     think_mode: ThinkMode,
     stop: &[String],
+    reasoning_effort: Option<&str>,
+    enable_thinking: bool,
 ) {
     // ── Producer-route authority (Task 6) ──────────────────────────────
     // Resolve the selected generation route BEFORE sampler RNG reset and
@@ -24119,6 +24324,8 @@ fn generate(
                 top_p,
                 top_k.map(|k| k as usize).unwrap_or(0),
                 cactus_delta,
+                reasoning_effort,
+                enable_thinking,
             ) {
                 return;
             }
@@ -24252,6 +24459,8 @@ fn generate(
                 top_p,
                 top_k.map(|k| k as usize).unwrap_or(0),
                 cactus_delta,
+                reasoning_effort,
+                enable_thinking,
             ) {
                 return;
             }
@@ -24326,6 +24535,8 @@ fn generate(
                 top_p,
                 top_k.map(|k| k as usize).unwrap_or(0),
                 cactus_delta,
+                reasoning_effort,
+                enable_thinking,
             ) {
                 return;
             }
@@ -24400,6 +24611,8 @@ fn generate(
                 top_p,
                 top_k.map(|k| k as usize).unwrap_or(0),
                 cactus_delta,
+                reasoning_effort,
+                enable_thinking,
             ) {
                 return;
             }
@@ -24507,6 +24720,8 @@ fn generate(
                 tools,
                 messages_history,
                 stop,
+                reasoning_effort,
+                enable_thinking,
             );
             return;
         }
@@ -24528,6 +24743,8 @@ fn generate(
                 top_p,
                 top_k,
                 min_p.unwrap_or(0.0),
+                reasoning_effort,
+                enable_thinking,
             );
             let _ = (
                 repeat_penalty,
@@ -24591,6 +24808,8 @@ fn generate(
                 top_p,
                 top_k.map(|k| k as usize).unwrap_or(0),
                 cactus_delta,
+                reasoning_effort,
+                enable_thinking,
             ) {
                 let _ = (
                     repeat_penalty,
@@ -24947,9 +25166,10 @@ fn generate(
             template,
             system: system_prompt,
             user: prompt,
-            enable_thinking: max_think_tokens != 1,
+            enable_thinking,
             bos_token: None,
             reasoning_strength: None,
+            reasoning_effort,
         };
         // Phase 1 of Jinja-everywhere migration: when the caller supplies
         // either a `tools` array or a `messages` history (or both), route
@@ -25006,6 +25226,18 @@ fn generate(
                 tokenizer.encode(&rendered)
             }
             Err(e) => {
+                if reasoning_effort.is_some() {
+                    emit_active_attempt_error(
+                        stdout,
+                        Some(id),
+                        &format!("jinja render: {e}"),
+                        "validation",
+                        false,
+                        false,
+                    );
+                    let _ = stdout.flush();
+                    return;
+                }
                 eprintln!("[daemon] jinja render failed ({e}) — falling back to Plain");
                 hipfire_runtime::prompt_frame::ChatFrame {
                     tokenizer,
@@ -25114,9 +25346,10 @@ fn generate(
                 template,
                 system: system_prompt,
                 user: prompt,
-                enable_thinking: max_think_tokens != 1,
+                enable_thinking,
                 bos_token: None,
                 reasoning_strength: None,
+                reasoning_effort,
             };
             let cache_ref = &mut m.asst_turn_cache;
             let built = hipfire_runtime::prompt_frame::build_cached_history_jinja(
@@ -25154,6 +25387,18 @@ fn generate(
             match built {
                 Ok(t) => t,
                 Err(e) => {
+                    if reasoning_effort.is_some() {
+                        emit_active_attempt_error(
+                            stdout,
+                            Some(id),
+                            &format!("qwen-cache jinja build: {e}"),
+                            "validation",
+                            false,
+                            false,
+                        );
+                        let _ = stdout.flush();
+                        return;
+                    }
                     eprintln!("[qwen-cache] jinja cached-history build failed ({e}) — cold render");
                     new_tokens.clone()
                 }
@@ -29032,6 +29277,7 @@ fn generate_gemma4(
                 enable_thinking: max_think_tokens != 1,
                 bos_token: Some("<bos>"),
                 reasoning_strength: None,
+                reasoning_effort: None,
             };
             let render_result = if tools.is_some() || messages_history.is_some() {
                 let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
@@ -30901,6 +31147,7 @@ fn generate_muse_glimmer(
                 enable_thinking: max_think_tokens != 1,
                 bos_token: Some("<bos>"),
                 reasoning_strength: Some(glimmer_reasoning_strength(think_mode, max_think_tokens)),
+                reasoning_effort: None,
             };
             if tools.is_some() || messages_history.is_some() {
                 let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
@@ -31289,8 +31536,7 @@ fn generate_muse_glimmer(
             &bundle.weights,
         );
     let fast_sample_on = hipfire_runtime::config::get().dflash_fast_sample;
-    let temp_spec_env_off =
-        std::env::var("HIPFIRE_DFLASH_TEMP_SPEC").ok().as_deref() == Some("0");
+    let temp_spec_env_off = std::env::var("HIPFIRE_DFLASH_TEMP_SPEC").ok().as_deref() == Some("0");
     let spec_mode = glimmer_spec_admission(
         bundle.drafter.is_some(),
         max_tokens,
@@ -32307,9 +32553,21 @@ fn generate_muse_glimmer(
     // Retirement forces greedy; native AR keeps the request's sampling params.
     if let Some(mut next_tok) = ar_pending.take() {
         // Greedy spec forces greedy AR tail; sampled spec and native AR use the request's real sampling.
-        let ar_temp = if spec_mode == GlimmerSpecMode::Greedy { 0.0 } else { temp };
-        let ar_top_p = if spec_mode == GlimmerSpecMode::Greedy { 1.0 } else { top_p };
-        let ar_top_k_opt = if spec_mode == GlimmerSpecMode::Greedy { None } else { top_k_opt };
+        let ar_temp = if spec_mode == GlimmerSpecMode::Greedy {
+            0.0
+        } else {
+            temp
+        };
+        let ar_top_p = if spec_mode == GlimmerSpecMode::Greedy {
+            1.0
+        } else {
+            top_p
+        };
+        let ar_top_k_opt = if spec_mode == GlimmerSpecMode::Greedy {
+            None
+        } else {
+            top_k_opt
+        };
 
         loop {
             if generated_count >= max_tokens {
@@ -32611,6 +32869,7 @@ fn generate_lfm2moe(
                 enable_thinking: max_think_tokens != 1,
                 bos_token: None,
                 reasoning_strength: None,
+                reasoning_effort: None,
             };
             let render_result = if tools.is_some() || messages_history.is_some() {
                 let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
@@ -32998,6 +33257,7 @@ fn generate_minimax(
                 enable_thinking: max_think_tokens != 1,
                 bos_token: None,
                 reasoning_strength: None,
+                reasoning_effort: None,
             };
             let render_result = if tools.is_some() || messages_history.is_some() {
                 let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
@@ -33421,6 +33681,7 @@ fn generate_cohere2moe(
                 enable_thinking: max_think_tokens != 1,
                 bos_token: None,
                 reasoning_strength: None,
+                reasoning_effort: None,
             };
             let render_result = if tools.is_some() || messages_history.is_some() {
                 let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
@@ -34148,6 +34409,7 @@ fn generate_qwen2(
             enable_thinking: true,
             bos_token: None,
             reasoning_strength: None,
+            reasoning_effort: None,
         };
         match frame.render() {
             Ok(rendered) => tokenizer.encode(&rendered),
