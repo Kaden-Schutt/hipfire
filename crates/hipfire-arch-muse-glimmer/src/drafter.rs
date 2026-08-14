@@ -610,8 +610,8 @@ impl GlimmerDrafterWeights {
                 hfq,
                 &mut *p.gpu,
                 &format!("{prefix}.self_attn.o_proj.weight"),
-                cfg.q_dim(),
                 h,
+                cfg.q_dim(),
             ) {
                 Ok(v) => v,
                 Err(e) => {
@@ -703,8 +703,8 @@ impl GlimmerDrafterWeights {
                 hfq,
                 &mut *p.gpu,
                 &format!("{prefix}.mlp.down_proj.weight"),
-                cfg.intermediate,
                 h,
+                cfg.intermediate,
             ) {
                 Ok(v) => v,
                 Err(e) => {
