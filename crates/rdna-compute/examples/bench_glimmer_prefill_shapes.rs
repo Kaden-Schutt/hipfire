@@ -24,14 +24,11 @@
 //!   - Muse-owned `gemm_hfq4g256_residual_muse_gfx1100_rm2_pipe` RM2/BV6
 //!     two-slot X-fragment pipeline (gfx1100 only, exact M=19968 K=6656 B=192;
 //!     scalar + packed-half2 symbols)
-//!   - Muse-owned `gemm_hfq4g256_residual_muse_gfx1100_rm2_magic` RM2/BV6
-//!     FP16 magic-bit dequant (gfx1100 only, exact M=19968 K=6656 B=192;
-//!     magic_exact + magic_fold16 symbols)
 //!
 //! For each exact Muse shape and B=128/192/256 reports time, TFLOP/s,
 //! bitdiff, max_abs, max_rel versus the production baseline. The gfx1201 Muse
 //! sibling is called only on gfx1201 and eligible tile widths; the gfx1100
-//! gate_proj BT/codebook/row-reuse/pipe/magic candidates are called only when
+//! gate_proj BT/codebook/row-reuse/pipe candidates are called only when
 //! `arch_caps.is_gfx1100()` so the example completes on other arches without
 //! binding those kernels.
 //!
@@ -1305,74 +1302,6 @@ fn main() {
                 }
             }
 
-            // RM2/BV6 FP16 magic-bit nibble dequant (K2): exact-subtract and
-            // folded-bias. Host fail-closed unless gfx1100 + exact M/K/B192.
-            // Gate shape is timed (zero/probe/2 warmup/fresh correctness/median3)
-            // against the existing production baseline (base_host).
-            for (folded, klabel) in [(false, "magic_exact"), (true, "magic_fold16")] {
-                let _ = gpu.hip.memset(&y_cand.buf, 0, b * m_gate * 4);
-                let used = gpu
-                    .gemm_hfq4g256_residual_muse_gfx1100_rm2_magic(
-                        &gate_w, &x_dim, &y_cand, m_gate, k_gate, b, folded,
-                    )
-                    .expect("muse_g11_rm2_magic probe");
-                let _ = gpu.hip.device_synchronize();
-                if !used {
-                    continue;
-                }
-
-                for _ in 0..2 {
-                    let _ = gpu.hip.memset(&y_cand.buf, 0, b * m_gate * 4);
-                    let _ = gpu.gemm_hfq4g256_residual_muse_gfx1100_rm2_magic(
-                        &gate_w, &x_dim, &y_cand, m_gate, k_gate, b, folded,
-                    );
-                }
-                let _ = gpu.hip.device_synchronize();
-
-                let _ = gpu.hip.memset(&y_cand.buf, 0, b * m_gate * 4);
-                let ok = gpu
-                    .gemm_hfq4g256_residual_muse_gfx1100_rm2_magic(
-                        &gate_w, &x_dim, &y_cand, m_gate, k_gate, b, folded,
-                    )
-                    .expect("muse_g11_rm2_magic dl");
-                let _ = gpu.hip.device_synchronize();
-                if !ok {
-                    continue;
-                }
-                let cand_host = gpu.download_f32(&y_cand).expect("dl muse_g11_rm2_magic");
-                let (bdiff, maxabs, maxrel) = correctness_stats(&base_host, &cand_host);
-
-                let mut cand_reps: Vec<f64> = Vec::new();
-                for _ in 0..3 {
-                    let t0 = Instant::now();
-                    for _ in 0..iters {
-                        let _ = gpu.hip.memset(&y_cand.buf, 0, b * m_gate * 4);
-                        gpu.gemm_hfq4g256_residual_muse_gfx1100_rm2_magic(
-                            &gate_w, &x_dim, &y_cand, m_gate, k_gate, b, folded,
-                        )
-                        .expect("muse_g11_rm2_magic bench");
-                    }
-                    let _ = gpu.hip.device_synchronize();
-                    cand_reps.push(t0.elapsed().as_secs_f64() * 1000.0 / iters as f64);
-                }
-                let ms_cand = median_ms(cand_reps);
-                let tflops_cand = flops / (ms_cand / 1000.0) / 1e12;
-                let vs = 100.0 * (ms_base / ms_cand - 1.0);
-                println!(
-                    "{:<12} {:>4} {:<14} {:>9.3} {:>9.2} {:>9} {:>9.2e} {:>9.2e} {:>+8.1}%  rm=2 bv=6",
-                    "gate_proj",
-                    b,
-                    klabel,
-                    ms_cand,
-                    tflops_cand,
-                    bdiff,
-                    maxabs,
-                    maxrel,
-                    vs,
-                );
-            }
-
-
             let _ = gpu.free_tensor(y_cand);
             let _ = gpu.free_tensor(y_base);
         }
@@ -1389,6 +1318,6 @@ fn main() {
     println!("  candidate oracle: batched (production overwrite) vs residual+zero must be bitdiff=0");
     println!("  fused gate+up must be bitdiff=0 per output vs 2x batched; muse_bt12 must be bitdiff=0 vs batched");
     println!("  on gfx1100/gfx1151 muse rows report arch_skip and do not call the gfx12 kernel");
-    println!("  on gfx1100 only: gate_proj muse_g11_bt{{4,6,8,12,16}}, muse_g11_cb{{4,6,12}}, muse_g11_mw{{2,4,8}}, muse_g11_lds, muse_g11_rm{{2,3,4,6}}x{{6,4,3,2}}, muse_g11_rm{{2,4}}x{{6,3}}_hb, muse_g11_rm{{1,2}}x{{12,6}}_pk, rm2_pipe_scalar/pk2 (B192), magic_exact/magic_fold16 (B192) rows vs g11_batched (zeroed); skipped if Ok(false); pipe also prints indented up bitdiff");
+    println!("  on gfx1100 only: gate_proj muse_g11_bt{{4,6,8,12,16}}, muse_g11_cb{{4,6,12}}, muse_g11_mw{{2,4,8}}, muse_g11_lds, muse_g11_rm{{2,3,4,6}}x{{6,4,3,2}}, muse_g11_rm{{2,4}}x{{6,3}}_hb, muse_g11_rm{{1,2}}x{{12,6}}_pk, rm2_pipe_scalar/pk2 (B192) rows vs g11_batched (zeroed); skipped if Ok(false); pipe also prints indented up bitdiff");
     println!("  on non-gfx1100 the muse_gfx1100 APIs are never called");
 }
