@@ -78,6 +78,8 @@ KNOWN_QUANTS = {
 # entry carrying an unknown value fails the run (fail-closed, like arch_id/quant).
 KNOWN_KV_MODES = {
     "auto",
+    "f32",
+    "f16",
     "q8",
     "asym4",
     "asym3",
@@ -177,12 +179,19 @@ def log(msg: str) -> None:
 #   9  = DeepSeek V4 Flash
 #   11 = LFM2.5 family
 #   12 = Cohere2-MoE / North-Mini-Code
+#   14 = Muse Glimmer dense text tower
 #   20 = DFlash drafter sidecar (crates/hipfire-quantize/src/bin/dflash_convert.rs)
+#   23 = Muse Glimmer DFlash drafter (muse_glimmer_assistant)
 def arch_id_for(tag: str, entry: dict) -> int | None:
     file = entry.get("file", "")
+    family = tag.split(":", 1)[0]
+    # Glimmer is checked before the generic dflash rule: its drafter is
+    # muse_glimmer_assistant (23), not the arch-20 sidecar, even though the
+    # filename says dflash.
+    if family == "muse-glimmer":
+        return 23 if "dflash" in file else 14
     if "dflash" in file:
         return 20
-    family = tag.split(":", 1)[0]
     if family in ("qwen3.5", "qwen3.6", "qwopus3.6", "carnice", "qwopus"):
         return 6 if "a3b" in tag else 5
     if family == "nex-n2":
