@@ -5861,6 +5861,13 @@ fn safetensors_to_ggml_name(name: &str) -> Option<String> {
         "self_attn.k_proj" => "attn_k",
         "self_attn.v_proj" => "attn_v",
         "self_attn.o_proj" => "attn_output",
+        // Glimmer gates attention output before o_proj under a name Qwen does
+        // not use (see hipfire-arch-muse-glimmer lib.rs). llama.cpp exports it
+        // as blk.{N}.attn_gate, so without this arm the 52 Glimmer gate tensors
+        // silently miss AWQ despite `awq_eligible` matching `gate_proj.weight`
+        // and the imatrix carrying the entry. No collision with the linear-attn
+        // arm below: a layer is either full- or linear-attention, never both.
+        "self_attn.gate_proj" => "attn_gate",
         // LinearAttention layer tensors (Mamba-2 / hybrid-arch SSM naming).
         "linear_attn.in_proj_qkv" => "attn_qkv",
         "linear_attn.in_proj_z" => "attn_gate",
