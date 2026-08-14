@@ -1693,6 +1693,7 @@ pub fn glimmer_lm_head_picks(
     }
     let mut picks = Vec::with_capacity(batch);
     if is_q8_lm {
+        // Batched Q8: one GEMM reads lm_head once for all B rows (WMMA on gfx12).
         // Fallback to per-row if batched disabled via HIPFIRE_GLIMMER_BATCHED_LM_HEAD=0.
         // Persistent buffer, NOT a per-call alloc. A cold hipMalloc of this
         // ~12.9 MB is slow and synchronizing, and it was the entire reason the
@@ -1729,6 +1730,8 @@ pub fn glimmer_lm_head_picks(
                 .map_err(|e| format!("glimmer lm_head_picks logits dtoh: {e:?}"))?;
         }
         let argmax_view = argmax_batch.sub_offset(0, batch);
+        gpu.argmax_f32_batched(&logits_b, &argmax_view, vocab, batch)
+            .map_err(|e| format!("glimmer lm_head_picks argmax_batched: {e:?}"))?;
         let mut host_idx = vec![0i32; batch];
         {
             let bytes: &mut [u8] = unsafe {
@@ -1845,6 +1848,8 @@ pub fn verify_block_with_capture(
 /// log. Stages all B rows (`finish_verify` → VerifyReady); the caller later
 /// commits the accepted prefix via [`commit_device_verify_capture`].
 ///
+/// Sets provisional `state.n_tokens = position + B`. On error aborts the stage
+/// and restores `n_tokens` to `position`.
 pub fn verify_block_with_device_capture(
     cfg: &GlimmerConfig,
     weights: &GlimmerWeights,
