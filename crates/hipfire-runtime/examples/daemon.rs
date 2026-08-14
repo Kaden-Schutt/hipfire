@@ -32105,7 +32105,10 @@ fn generate_muse_glimmer(
                             return;
                         }
                     };
-                    // Now sample drafts from q and record q_at_drafted
+                    // Store the draft probs BEFORE verify overwrites
+                    // bundle.state.logits_batch, then sample drafts from q and
+                    // record q at the drafted token for the accept test.
+                    q_rows_host = downloaded;
                     {
                         use hipfire_arch_qwen35::speculative::{sample_categorical, xorshift_next_unit};
                         let mut sampled = Vec::with_capacity(n_draft_rows);
