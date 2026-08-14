@@ -97,11 +97,23 @@ impl ThinkMode {
     /// project-custom `thinking_mode`) to a mode.
     /// Accepted: "none|off|chat" → NonThink;
     ///           "minimal|low|medium|med|thinking" → Low;
-    ///           "high" → High; "max" → Max.
+    ///           "high" → High; "max|xhigh" → Max.
     /// Anything else → NonThink (safe default).
+    ///
+    /// `xhigh` is Qwen3.8's ladder, whose published levels are
+    /// `xhigh` (default) > `medium` > `low`. It MUST be listed explicitly:
+    /// the fallthrough arm is `NonThink`, so an unmapped `xhigh` would turn a
+    /// model whose card says "thinking mode is on by default" into a
+    /// non-thinking one, silently and with no error.
+    ///
+    /// Note the ladders do not align. OpenAI's is
+    /// `minimal < low < medium < high`, so `medium` stays mapped to `Low` for
+    /// cross-model compatibility; that means Qwen3.8's `medium` and `low`
+    /// collapse onto the same mode here. Only the default (`xhigh`) is
+    /// represented exactly, which is what the registry ships.
     pub fn from_str(s: &str) -> Self {
         match s.to_ascii_lowercase().as_str() {
-            "max" => Self::Max,
+            "max" | "xhigh" => Self::Max,
             "high" => Self::High,
             "minimal" | "low" | "medium" | "med" | "thinking" => Self::Low,
             _ => Self::NonThink,
@@ -120,6 +132,23 @@ mod think_mode_tests {
         assert_eq!(ThinkMode::from_str("medium"), ThinkMode::Low);
         assert_eq!(ThinkMode::from_str("high"), ThinkMode::High);
         assert_eq!(ThinkMode::from_str("max"), ThinkMode::Max);
+    }
+
+    #[test]
+    fn qwen38_xhigh_is_a_thinking_mode_not_the_nonthink_fallthrough() {
+        // Qwen3.8's card sets `reasoning_effort: xhigh` as the DEFAULT and says
+        // thinking mode is on by default. `from_str`'s fallthrough arm is
+        // `NonThink`, so an unmapped `xhigh` silently disables thinking on the
+        // model's own default setting — no error, just non-thinking output.
+        // This asserts the mapping exists, and that it is not the fallthrough.
+        assert_eq!(ThinkMode::from_str("xhigh"), ThinkMode::Max);
+        assert_ne!(ThinkMode::from_str("xhigh"), ThinkMode::NonThink);
+        assert_eq!(ThinkMode::from_str("XHIGH"), ThinkMode::Max);
+
+        // Guard the fallthrough itself, so a future ladder value that is added
+        // to the config enum but forgotten here fails loudly in review rather
+        // than degrading to non-thinking in production.
+        assert_eq!(ThinkMode::from_str("ultra"), ThinkMode::NonThink);
     }
 }
 

@@ -107,7 +107,11 @@ RECOMMENDED_BOUNDS = {
     "presence_penalty": (0.0, 2.0, False),
     "repeat_penalty": (0.5, 2.0, False),
 }
-REASONING_EFFORTS = {"auto", "none", "low", "high", "max"}
+# Mirrors hipfire-config's REASONING_EFFORTS. `xhigh` is Qwen3.8's default
+# effort; `medium` is intentionally excluded because prompt_frame folds it into
+# `Low`, so accepting it here would let a curated entry claim a level the engine
+# does not actually distinguish.
+REASONING_EFFORTS = {"auto", "none", "low", "high", "xhigh", "max"}
 THINKING_BUDGETS = {"off", "low", "med", "high", "xhigh", "max", "uncapped"}
 
 

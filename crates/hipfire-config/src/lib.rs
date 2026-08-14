@@ -488,7 +488,12 @@ const AUTO_ON_OFF: &[&str] = &["auto", "on", "off"];
 // `enable_thinking=false` / `reasoning_effort="none"` paths already send. It is
 // NOT 0 — 0 means `uncapped` (think until the model closes the block itself).
 const THINKING_BUDGETS: &[&str] = &["off", "low", "med", "high", "xhigh", "max", "uncapped"];
-const REASONING_EFFORTS: &[&str] = &["auto", "none", "low", "high", "max"];
+// `xhigh` is Qwen3.8's default effort (its ladder is `xhigh` > `medium` >
+// `low`). Without it here the config enum rejects the value the model card
+// prescribes. It maps to `ThinkMode::Max` in `prompt_frame.rs`; `medium` is
+// deliberately absent because that layer folds it into `Low`, so accepting it
+// as config would silently equal `low`.
+const REASONING_EFFORTS: &[&str] = &["auto", "none", "low", "high", "xhigh", "max"];
 const SPECULATION_MODES: &[&str] = &["off", "auto", "ngram", "dflash", "mtp", "dspark"];
 
 macro_rules! field {
