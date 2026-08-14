@@ -2894,6 +2894,14 @@ pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_RM_PK_SRC: &str =
 /// Measurement-only; used exclusively by hipfire-arch-muse-glimmer.
 pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_RM_PIPE_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_gfx1100_muse_rm_pipe.hip");
+/// Muse Glimmer-owned RM2/BV6 gfx1100 residual GEMM FP16 paired-accumulator
+/// accuracy probe (K2). Sibling of `GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_RM_BT_SRC`
+/// rm2_bv6 only. Packs r0/r1 into one half16 via tied WMMA OPSEL false then true.
+/// Exact gate/up only (M=19968, K=6656, batch=192). Measurement-only; no
+/// production select; used exclusively by hipfire-arch-muse-glimmer probes.
+pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_RM2_BV6_F16ACC_PAIR_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_gfx1100_muse_rm2_bv6_f16acc_pair.hip");
+
 
 
 
