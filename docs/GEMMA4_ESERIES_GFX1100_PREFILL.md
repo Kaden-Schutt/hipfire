@@ -41,6 +41,19 @@ The final policy was remeasured with one release binary, ten fixed GSM8K prompts
 
 Relative to explicit off, auto improves prefill by 92.28% on E2B and 70.16% on E4B while reducing TTFT by 48.30% and 41.46%, respectively. Auto and explicit on differ by at most 0.68% across their prefill/TTFT medians, confirming that the architecture default selects the intended routes. Every corresponding off/auto/on short output was byte-identical for both models. Raw artifacts are under `target/validation/gemma4-gfx11-production-policy/{off-r3,auto-r3,on-r3}`.
 
+## gfx1201 cross-architecture regression
+
+The rebased policy was also checked on one R9700/gfx1201 with the same E2B/E4B Q8 artifacts. The daemon used an explicit batch 64 only to exercise the shared batched-forward path; gfx1201 still defaults to batch 1, and all three promoted feature policies remain disabled by their exact-gfx1100 auto gates. Each row below is the median of ten fixed GSM8K prompts repeated three times with a 16-token output cap.
+
+| Model | Policy | Prefill tok/s | TTFT ms | Decode tok/s | Wall s |
+|---|---|---:|---:|---:|---:|
+| Gemma 4 E2B Q8 | off | 1,360.675 | 575.537 | 96.97 | 0.7741 |
+| Gemma 4 E2B Q8 | auto | 1,364.205 | 574.209 | 96.97 | 0.7710 |
+| Gemma 4 E4B Q8 | off | 989.960 | 790.085 | 65.04 | 1.0679 |
+| Gemma 4 E4B Q8 | auto | 991.860 | 787.551 | 65.04 | 1.0654 |
+
+Auto differs from explicit off by only +0.26% prefill on E2B and +0.19% on E4B; decode medians are identical. All 30 repeated outputs per model matched between auto and off. A separate `B=1,2,4,64` logits/argmax/next-token-KV matrix passed for both models under auto, explicit off, and forced-on feature settings. The forced-on result confirms that the Gemma callsites retain their exact-gfx1100 architecture checks even when the request bits are set on gfx1201. Raw artifacts are under `target/validation/gemma4-gfx11-prefill-batch/{x570-auto-20260814,x570-off-20260814}` on the validation host.
+
 Reproduce with `scripts/bench-gemma4-gfx11-prefill-batch.sh`.
 
 ## Q8 Projection Fusion Probe
