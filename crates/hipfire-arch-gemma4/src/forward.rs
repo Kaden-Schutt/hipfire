@@ -55,11 +55,20 @@
 //! fuses on the Q8 attention path.
 
 use crate::config::{Gemma4Config, LayerType, RopeType};
-use crate::gemma4::{FullLayerWeights, Gemma4State, Gemma4Weights, LayerWeights, SlidingLayerWeights};
+use crate::gemma4::{
+    FullLayerWeights, Gemma4State, Gemma4Weights, LayerWeights, SlidingLayerWeights,
+};
 use hipfire_runtime::llama::{
     rotate_x_mq_batched_for, weight_gemv, weight_gemv_prerotated, KvCache, WeightTensor,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
+
+/// Greedy EAGLE promises byte-identical target decisions.  Its batched verify
+/// must therefore use the same arithmetic family as eager decode rather than
+/// numerically-close fused/WMMA variants whose small drift accumulates in KV.
+fn eagle_strict_enabled() -> bool {
+    std::env::var("HIPFIRE_GEMMA4_EAGLE").ok().as_deref() == Some("1")
+}
 
 /// Master switch for the qwen35-mirror fused-projection FFN path
 /// (`fused_rmsnorm_rotate_mq` + `fused_gate_up_hfq4g256`). Default ON; opt out
@@ -93,10 +102,13 @@ fn fused_qk_enabled() -> bool {
 /// out with `HIPFIRE_GEMMA4_FUSED_POSTNORM=0`. Not byte-identical (the residual
 /// add rounds inside the norm kernel) -- coherence-validated.
 fn fused_postnorm_enabled() -> bool {
-    !matches!(
-        std::env::var("HIPFIRE_GEMMA4_FUSED_POSTNORM").ok().as_deref(),
-        Some("0") | Some("off") | Some("false")
-    )
+    !eagle_strict_enabled()
+        && !matches!(
+            std::env::var("HIPFIRE_GEMMA4_FUSED_POSTNORM")
+                .ok()
+                .as_deref(),
+            Some("0") | Some("off") | Some("false")
+        )
 }
 
 /// Master switch for the fused per-head weighted q/k RMSNorm + q prescale +
@@ -106,10 +118,13 @@ fn fused_postnorm_enabled() -> bool {
 /// separate. Default ON; opt out with `HIPFIRE_GEMMA4_FUSED_QK_ROPE=0`. Not
 /// byte-identical (fused rsqrt/rope rounds differently) -- coherence-validated.
 fn fused_qk_rope_enabled() -> bool {
-    !matches!(
-        std::env::var("HIPFIRE_GEMMA4_FUSED_QK_ROPE").ok().as_deref(),
-        Some("0") | Some("off") | Some("false")
-    )
+    !eagle_strict_enabled()
+        && !matches!(
+            std::env::var("HIPFIRE_GEMMA4_FUSED_QK_ROPE")
+                .ok()
+                .as_deref(),
+            Some("0") | Some("off") | Some("false")
+        )
 }
 
 /// q = q_proj(x); k = k_proj(x). Fused into one launch via `fused_gate_up_q8_0`
@@ -122,8 +137,7 @@ fn qk_proj(
     q_out: &rdna_compute::GpuTensor,
     k_out: &rdna_compute::GpuTensor,
 ) -> Result<(), String> {
-    let both_q8 =
-        q_proj.gpu_dtype == DType::Q8_0 && k_proj.gpu_dtype == DType::Q8_0;
+    let both_q8 = q_proj.gpu_dtype == DType::Q8_0 && k_proj.gpu_dtype == DType::Q8_0;
     if fused_qk_enabled() && both_q8 {
         gpu.fused_gate_up_q8_0(
             &q_proj.buf,
@@ -154,7 +168,9 @@ fn qk_proj(
 /// the exact same math as `rmsnorm_f32` + rotation-doing `weight_gemv`, fused.
 fn fused_attn_norm_enabled() -> bool {
     !matches!(
-        std::env::var("HIPFIRE_GEMMA4_FUSED_ATTN_NORM").ok().as_deref(),
+        std::env::var("HIPFIRE_GEMMA4_FUSED_ATTN_NORM")
+            .ok()
+            .as_deref(),
         Some("0") | Some("off") | Some("false")
     )
 }
@@ -205,8 +221,7 @@ fn attn_input_qkv(
             .map_err(|e| format!("gemma4 {label}: input rmsnorm: {e:?}"))?;
         qk_proj(gpu, q_proj, k_proj, tmp, q_out, k_out)?;
         if let Some(vw) = v_proj {
-            weight_gemv(gpu, vw, tmp, v_out)
-                .map_err(|e| format!("gemma4 {label}: v_proj: {e}"))?;
+            weight_gemv(gpu, vw, tmp, v_out).map_err(|e| format!("gemma4 {label}: v_proj: {e}"))?;
         }
         Ok(())
     }
@@ -270,11 +285,13 @@ pub fn decode_step_with_graph(
     use std::sync::OnceLock;
     static GRAPH_ENV: OnceLock<Option<bool>> = OnceLock::new();
     let env_override =
-        *GRAPH_ENV.get_or_init(|| match std::env::var("HIPFIRE_GEMMA4_GRAPH").ok().as_deref() {
-            Some("1") => Some(true),
-            Some("0") => Some(false),
-            _ => None,
-        });
+        *GRAPH_ENV.get_or_init(
+            || match std::env::var("HIPFIRE_GEMMA4_GRAPH").ok().as_deref() {
+                Some("1") => Some(true),
+                Some("0") => Some(false),
+                _ => None,
+            },
+        );
     // DEFAULT OFF pending a fix to the captured decode path.
     //
     // Measured on gfx1201 / 12B-it MQ4, prompt "Hello world", greedy:
@@ -385,9 +402,7 @@ fn embed_lookup(
         EmbeddingFormat::F32 => gpu
             .embedding_lookup(&weights.embed_tokens, &state.x, token_id, dim)
             .map_err(|e| format!("gemma4: embed f32: {e:?}"))?,
-        EmbeddingFormat::Q4K => {
-            return Err("gemma4: Q4K embedding format unsupported".to_string())
-        }
+        EmbeddingFormat::Q4K => return Err("gemma4: Q4K embedding format unsupported".to_string()),
     }
     gpu.scale_f32(&state.x, cfg.embed_scale)
         .map_err(|e| format!("gemma4: embed scale: {e:?}"))?;
@@ -425,11 +440,7 @@ fn decode_step_body(
             (LayerType::Full, LayerWeights::Full(lw)) => {
                 full_layer_decode(gpu, cfg, lw, position, slot, state)?;
             }
-            _ => {
-                return Err(format!(
-                    "gemma4 layer {layer_idx} type/weights mismatch"
-                ))
-            }
+            _ => return Err(format!("gemma4 layer {layer_idx} type/weights mismatch")),
         }
         if let Some(cap) = capture.as_deref_mut() {
             let h = gpu
@@ -887,8 +898,13 @@ fn finish_attn_and_ffn(
         .map_err(|e| format!("gemma4: fused post_ffn norm+residual: {e:?}"))?;
     } else {
         // Sandwich post-FFN norm (ffn_out → tmp).
-        gpu.rmsnorm_f32(&state.ffn_out, tail.post_feedforward_layernorm, &state.tmp, eps)
-            .map_err(|e| format!("gemma4: post_ffn rmsnorm: {e:?}"))?;
+        gpu.rmsnorm_f32(
+            &state.ffn_out,
+            tail.post_feedforward_layernorm,
+            &state.tmp,
+            eps,
+        )
+        .map_err(|e| format!("gemma4: post_ffn rmsnorm: {e:?}"))?;
 
         // x = residual + tmp.
         gpu.memcpy_dtod_auto(&state.x.buf, &state.residual.buf, dim_bytes)
@@ -955,9 +971,14 @@ fn proj_gemm_batched(
     label: &str,
 ) -> Result<(), String> {
     match w.gpu_dtype {
-        DType::Q8_0 => gpu
-            .gemm_q8_0_batched_chunked(&w.buf, x, y, w.m, w.k, b)
-            .map_err(|e| format!("gemma4 batch {label} (q8): {e:?}")),
+        DType::Q8_0 => {
+            let result = if eagle_strict_enabled() {
+                gpu.gemm_q8_0_batched(&w.buf, x, y, w.m, w.k, b)
+            } else {
+                gpu.gemm_q8_0_batched_chunked(&w.buf, x, y, w.m, w.k, b)
+            };
+            result.map_err(|e| format!("gemma4 batch {label} (q8): {e:?}"))
+        }
         DType::MQ4G256 | DType::HFQ4G256 => {
             // FWHT-rotate the shared input once, then run the prerotated GEMM.
             // rotate_x_mq_batched_for handles the AWQ-aware branch (no-op AWQ
@@ -1067,10 +1088,10 @@ pub fn forward_batch_spec(
     let x = alloc(gpu, b * dim, "x")?;
     let residual = alloc(gpu, b * dim, "residual")?;
     let nrm = alloc(gpu, b * dim, "nrm")?; // rmsnorm output / shared proj input
-    // x_rot is the SHARED FWHT-rotate scratch for every projection in the layer
-    // (proj_gemm_batched rotates b*w.k floats into it). The largest w.k is the
-    // o_proj on FULL attention layers: k = n_heads*full_head_dim (= max_q here),
-    // which exceeds dim. Size for the max so the o_proj rotation can't OOB-write.
+                                           // x_rot is the SHARED FWHT-rotate scratch for every projection in the layer
+                                           // (proj_gemm_batched rotates b*w.k floats into it). The largest w.k is the
+                                           // o_proj on FULL attention layers: k = n_heads*full_head_dim (= max_q here),
+                                           // which exceeds dim. Size for the max so the o_proj rotation can't OOB-write.
     let x_rot = alloc(gpu, b * max_q.max(dim), "x_rot")?; // FWHT scratch (MQ4 proj path)
     let q = alloc(gpu, b * max_q, "q")?;
     let k = alloc(gpu, b * max_kv, "k")?;
@@ -1128,7 +1149,11 @@ pub fn forward_batch_spec(
     let has_sliding = cfg.layer_types.iter().any(|&t| t == LayerType::Sliding);
     let has_full = cfg.layer_types.iter().any(|&t| t == LayerType::Full);
     let sliding_mask = if has_sliding {
-        Some(upload_mask(gpu, &build_mask(cfg.sliding_window), "sliding")?)
+        Some(upload_mask(
+            gpu,
+            &build_mask(cfg.sliding_window),
+            "sliding",
+        )?)
     } else {
         None
     };
@@ -1266,7 +1291,11 @@ pub fn forward_batch_spec(
                     &ffn_rot,
                 )?;
             }
-            _ => return Err(format!("gemma4 forward_batch L{layer_idx} type/weights mismatch")),
+            _ => {
+                return Err(format!(
+                    "gemma4 forward_batch L{layer_idx} type/weights mismatch"
+                ))
+            }
         }
     }
     state.n_tokens = start_pos + b;
@@ -1321,15 +1350,27 @@ pub fn forward_batch_spec(
                 // (tanh-scaled), so argmax(softcap(z)) == argmax(z). The accept
                 // decision is an argmax, so this is bit-exact in the decision.
                 let logits_b = alloc(gpu, b * vocab, "spec_logits_b")?;
-                gpu.gemm_q8_0_batched_chunked(
-                    &weights.lm_head.buf,
-                    normed_hidden,
-                    &logits_b,
-                    weights.lm_head.m,
-                    weights.lm_head.k,
-                    b,
-                )
-                .map_err(|e| format!("gemma4 forward_batch_spec batched lm_head: {e:?}"))?;
+                let lm_result = if eagle_strict_enabled() {
+                    gpu.gemm_q8_0_batched(
+                        &weights.lm_head.buf,
+                        normed_hidden,
+                        &logits_b,
+                        weights.lm_head.m,
+                        weights.lm_head.k,
+                        b,
+                    )
+                } else {
+                    gpu.gemm_q8_0_batched_chunked(
+                        &weights.lm_head.buf,
+                        normed_hidden,
+                        &logits_b,
+                        weights.lm_head.m,
+                        weights.lm_head.k,
+                        b,
+                    )
+                };
+                lm_result
+                    .map_err(|e| format!("gemma4 forward_batch_spec batched lm_head: {e:?}"))?;
                 // GPU per-row argmax over [B, vocab]; only B indices land on PCIe.
                 let idx_buf = alloc(gpu, b, "spec_argmax_idx")?;
                 gpu.argmax_f32_batched(&logits_b, &idx_buf, vocab, b)
@@ -1359,16 +1400,14 @@ pub fn forward_batch_spec(
                     weight_gemv(gpu, &weights.lm_head, &hidden_row, &state.logits)
                         .map_err(|e| format!("gemma4 forward_batch_spec lm_head row {i}: {e}"))?;
                     if cfg.final_logit_softcapping > 0.0 {
-                        gpu.logit_softcap_f32(
-                            &state.logits,
-                            vocab,
-                            cfg.final_logit_softcapping,
-                        )
-                        .map_err(|e| format!("gemma4 forward_batch_spec softcap row {i}: {e:?}"))?;
+                        gpu.logit_softcap_f32(&state.logits, vocab, cfg.final_logit_softcapping)
+                            .map_err(|e| {
+                                format!("gemma4 forward_batch_spec softcap row {i}: {e:?}")
+                            })?;
                     }
-                    let row = gpu
-                        .download_f32(&state.logits)
-                        .map_err(|e| format!("gemma4 forward_batch_spec download row {i}: {e:?}"))?;
+                    let row = gpu.download_f32(&state.logits).map_err(|e| {
+                        format!("gemma4 forward_batch_spec download row {i}: {e:?}")
+                    })?;
                     out.push(argmax_f32_row(&row));
                 }
             }
@@ -1547,7 +1586,15 @@ fn batch_attn_block(
         }
         RopeKind::PartialHalved(theta, n_rot_pairs) => {
             gpu.rope_partial_halved_f32_batched(
-                q, k, pos_array, n_heads, n_kv, hd, n_rot_pairs, theta, b,
+                q,
+                k,
+                pos_array,
+                n_heads,
+                n_kv,
+                hd,
+                n_rot_pairs,
+                theta,
+                b,
             )
             .map_err(|e| format!("gemma4 batch attn rope (partial): {e:?}"))?;
         }
@@ -1577,8 +1624,8 @@ fn batch_attn_block(
     gpu.kv_cache_write_q8_0_batched(&v_cache_t, v, pos_array, n_kv, hd, b)
         .map_err(|e| format!("gemma4 batch attn kv write v: {e:?}"))?;
 
-    // Masked batched attention: tree-bias mode with block_start=0,
-    // block_cols=seq_len → the per-row mask is applied to EVERY key, giving
+    // Masked batched attention: block_start=-1, block_cols=seq_len selects the
+    // kernel's full-context bias mode, so the per-row mask covers EVERY key.
     // exact causal+window control for both layer types. seq_len passed as
     // max_ctx_len so the kernel's scores[] LDS slice is sized for the full
     // context, and as block_cols so the bias index covers all keys.
@@ -1595,7 +1642,7 @@ fn batch_attn_block(
         a.seq_len,
         b,
         Some(a.mask),
-        0,
+        usize::MAX,
         a.seq_len,
     )
     .map_err(|e| format!("gemma4 batch attn masked: {e:?}"))?;
@@ -1658,7 +1705,15 @@ fn batch_ffn_block(
         .map_err(|e| format!("gemma4 batch ffn silu mul: {e:?}"))?;
 
     // 4) down_proj(hidden) → ffn_out.
-    proj_gemm_batched(gpu, tail.down_proj, ffn_hidden, ffn_out, ffn_rot, b, "down_proj")?;
+    proj_gemm_batched(
+        gpu,
+        tail.down_proj,
+        ffn_hidden,
+        ffn_out,
+        ffn_rot,
+        b,
+        "down_proj",
+    )?;
 
     // 5) post-FFN norm (ffn_out → nrm).
     gpu.rmsnorm_batched(ffn_out, tail.post_feedforward_layernorm, nrm, b, dim, eps)
