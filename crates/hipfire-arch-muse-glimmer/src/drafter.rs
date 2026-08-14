@@ -108,6 +108,55 @@
 //! `embed_norm` (scale-less RMSNorm). The AR path at `forward::embed_lookup`
 //! DOES apply it; the DFlash path deliberately does not.
 //!
+//! ## Logit calibration: ordering is good, magnitude is not
+//!
+//! The drafter's logits rank tokens well but carry almost no dynamic range, so
+//! their softmax is NOT a usable probability distribution. Measured 2026-08-14
+//! on hiptrx gfx1201, `muse-glimmer-30b.mq4` + `muse-glimmer-30b-dflash.mq4`,
+//! serve battery at registry sampling (temp 1.0), via a temporary accept-input
+//! dump (branch `glimmer-rejection-debug`, `HIPFIRE_GLIMMER_ACCEPT_DIAG=1`):
+//!
+//! | quantity | draft row | target row |
+//! |---|---|---|
+//! | row sum | 1.0000 | 1.0000 |
+//! | argmax token | 19669 | 19669 (same) |
+//! | probability at argmax | **0.0007** | **0.9998** |
+//!
+//! Rows are correctly aligned (draft row `i` and target row `i` both predict
+//! `drafts[i]`, and they agree on the argmax across windows: 19669, 200023,
+//! 10064). Both sum to 1. The target is near-deterministic while the draft is
+//! nearly flat — a uniform distribution over the 202048-token vocab would put
+//! 4.95e-6 on each token, and the draft's PEAK is 7e-4.
+//!
+//! Mechanism: the draft path norms `scratch.x` with the DRAFTER's `norm` and
+//! then applies the TARGET's `lm_head`, skipping the target's `final_norm`
+//! scaling that `forward.rs`'s verify path applies before its own lm_head.
+//! Right ordering with no contrast is the fingerprint of a scale mismatch, not
+//! of genuine drafter uncertainty.
+//!
+//! This costs nothing today because every shipped consumer is scale-invariant:
+//! greedy DFlash takes the argmax, and the sampled path
+//! (`hipfire_runtime::ddtree::naive_sample_chain`) accepts on `p_t(draft)` drawn
+//! from the TARGET's distribution. It matters if you write something that
+//! treats the drafter's softmax as a distribution. Speculative REJECTION
+//! sampling does exactly that, and it fails hard: drafts sampled from the flat
+//! `q` are effectively random, the target assigns them 1e-14..1e-8, and
+//! `u * q(draft) <= p(draft)` is never satisfied — measured `accepted 0` of 135
+//! proposals, tau 1.000, 27.2 tok/s against 28.1 on plain AR, with coherent
+//! output the whole time, so it fails SILENTLY.
+//!
+//! Two traps if you try to fix it:
+//!   - A positive scalar rescale leaves argmax (and therefore greedy) untouched,
+//!     but applying the target's `final_norm` is a per-channel transform and
+//!     WOULD change the argmax. Re-validate greedy tau before believing any
+//!     recalibration.
+//!   - Calibration alone buys no speculative throughput. Where the target sits
+//!     at 0.9998, naive chain-sample already accepts at ~that rate, and a
+//!     calibrated `min(1, p/q)` converges to the same value. The measured gap
+//!     (sampled 1.84x vs greedy 3.18x over AR) comes from temperature-1.0
+//!     sampling drawing a non-argmax token and breaking the chain, which no
+//!     lossless accept rule can recover — only a better-aligned drafter can.
+//!
 //! REUSE: no new kernels. Projections are `weight_gemv`, norms are
 //! `rmsnorm_batched`, RoPE is `rope_batched_f32` (half-split; n_heads_*=0 to
 //! skip the inactive side), attention is `attention_dflash_f32`.
