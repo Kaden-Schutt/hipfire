@@ -734,6 +734,33 @@ mod tests {
             "deepseek-v4-flash-preview"
         );
         assert!(registry.model("deepseek4:preview-mq2r").is_none());
+
+        // `ds4` is the short name used throughout the tree (ds4-adapter-r128.bin,
+        // ds4_length_sweep.sh, hipfire-arch-deepseek4), so it resolves too, and
+        // mirrors the full `deepseek4:*` surface.
+        assert_eq!(registry.resolve_tag("ds4"), "deepseek-v4-flash");
+        assert_eq!(registry.resolve_tag("ds4:0731"), "deepseek-v4-flash");
+        assert_eq!(registry.resolve_tag("ds4:mq2r"), "deepseek-v4-flash");
+        assert_eq!(
+            registry.resolve_tag("ds4:preview"),
+            "deepseek-v4-flash-preview"
+        );
+        // Every SKU reachable by a short `:mq2r` name must also be reachable by
+        // the matching `:mq2lloyd` one — otherwise demoting MQ2-Lloyd from the
+        // default silently strands it behind long-form names only.
+        for name in [
+            "deepseek4:mq2lloyd",
+            "deepseek-v4:mq2lloyd",
+            "deepseek4:0731-mq2lloyd",
+            "ds4:mq2lloyd",
+            "ds4:0731-mq2lloyd",
+        ] {
+            assert_eq!(
+                registry.resolve_tag(name),
+                "deepseek-v4-flash:mq2lloyd",
+                "{name} must resolve to the MQ2-Lloyd tag"
+            );
+        }
         let (_, default_sku) = registry.model("deepseek4:0731").unwrap();
         let settings = default_sku.recommended_settings.as_ref().unwrap();
         assert_eq!(settings.reasoning_effort.as_deref(), Some("low"));
