@@ -665,18 +665,31 @@ mod tests {
     }
 
     #[test]
-    fn bundled_0731_mq2r_identity_is_separate_from_mq2lloyd_and_preview() {
+    fn bundled_0731_mq2r_is_default_and_mq2lloyd_stays_addressable() {
         let registry = bundled().unwrap();
-        let (_, mq2lloyd) = registry.model("deepseek-v4-flash").unwrap();
+        // MQ2R became the default on 2026-08-14 on the DeepSeek V4 contributor's
+        // recommendation. The bare tag and the explicit `:mq2r` name must serve
+        // the SAME artifact, while `:mq2lloyd` stays a distinct, still-pullable
+        // identity — a silent collapse of the two would ship 86 GB under an 82 GB
+        // name or vice versa.
+        let (_, default_sku) = registry.model("deepseek-v4-flash").unwrap();
         let (_, mq2r) = registry.model("deepseek-v4-flash:mq2r").unwrap();
+        let (_, mq2lloyd) = registry.model("deepseek-v4-flash:mq2lloyd").unwrap();
 
-        assert_eq!(mq2lloyd.file, "deepseek-v4-flash-0731.mq2lloyd");
+        assert_eq!(default_sku.file, "deepseek-v4-flash-0731.mq2r");
         assert_eq!(mq2r.file, "deepseek-v4-flash-0731.mq2r");
+        assert_eq!(mq2lloyd.file, "deepseek-v4-flash-0731.mq2lloyd");
+        assert_ne!(mq2r.sha256, mq2lloyd.sha256);
+
+        assert_eq!(default_sku.default_kv_mode.as_deref(), Some("f32"));
         assert_eq!(mq2lloyd.default_kv_mode.as_deref(), Some("f32"));
-        assert_eq!(mq2r.default_kv_mode.as_deref(), Some("f32"));
         assert_eq!(
             mq2r.sha256.as_deref(),
             Some("cbf2bbcfa3f47b1712a071836b2c48232dad7dfb763813a720f7d348a9318cce")
+        );
+        assert_eq!(
+            mq2lloyd.sha256.as_deref(),
+            Some("521c9687a3f5c12fb3d89bde4a3ed202698b95ae5a102d0b5ba7f3abb87982d0")
         );
         assert_eq!(
             mq2r.quant_recipe.as_deref(),
@@ -702,21 +715,27 @@ mod tests {
         );
         assert_eq!(registry.resolve_tag("deepseek4"), "deepseek-v4-flash");
         assert_eq!(registry.resolve_tag("deepseek4:0731"), "deepseek-v4-flash");
+        // `:mq2r` names now land on the default tag, since MQ2R *is* the default.
         assert_eq!(
             registry.resolve_tag("deepseek4:0731-mq2r"),
-            "deepseek-v4-flash:mq2r"
+            "deepseek-v4-flash"
         );
         assert_eq!(
             registry.resolve_tag("deepseek-v4-flash-0731.mq2r"),
-            "deepseek-v4-flash:mq2r"
+            "deepseek-v4-flash"
+        );
+        // The superseded artifact must still be reachable by its own filename.
+        assert_eq!(
+            registry.resolve_tag("deepseek-v4-flash-0731.mq2lloyd"),
+            "deepseek-v4-flash:mq2lloyd"
         );
         assert_eq!(
             registry.resolve_tag("deepseek4:preview"),
             "deepseek-v4-flash-preview"
         );
         assert!(registry.model("deepseek4:preview-mq2r").is_none());
-        let (_, mq2lloyd) = registry.model("deepseek4:0731").unwrap();
-        let settings = mq2lloyd.recommended_settings.as_ref().unwrap();
+        let (_, default_sku) = registry.model("deepseek4:0731").unwrap();
+        let settings = default_sku.recommended_settings.as_ref().unwrap();
         assert_eq!(settings.reasoning_effort.as_deref(), Some("low"));
         assert_eq!(settings.thinking_budget.as_deref(), Some("uncapped"));
     }

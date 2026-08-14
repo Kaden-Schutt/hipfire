@@ -207,7 +207,7 @@
       },
       "desc": "DeepSeek V4 Flash, MQ2-Lloyd routed-expert MoE (arch_id=9). Includes MTP sidecar for K=2 spec-decode (+29% TG on code) and a DSpark 3-stage drafter sidecar (auto-wins over MTP under --spec dspark/auto). temp=1.0 is safety-critical: greedy/low-temp falls into token loops on the quant."
     },
-    "deepseek-v4-flash": {
+    "deepseek-v4-flash:mq2lloyd": {
       "repo": "hipfire-models/deepseek-v4-flash-0731",
       "file": "deepseek-v4-flash-0731.mq2lloyd",
       "size_gb": 86.2,
@@ -247,9 +247,9 @@
         "sha256": "fedf663e1bd2c6b8b62bc4819d54398c68e137e248863ad494e66111eb294c64",
         "size_bytes": 5996334814
       },
-      "desc": "Official DeepSeek V4 Flash 0731 MQ2-Lloyd package (arch_id=9). The cache defaults to the implemented F32 route; F16 is selectable on the certified gfx1201 MQ2R TP route. Parent-faithful profiles use low effort with temp=1/top_p=1 by default, max effort with temp=1/top_p=0.95 for agentic coding, and no hidden thinking cap. Includes the checkpoint-aligned DSpark sidecar."
+      "desc": "Official DeepSeek V4 Flash 0731 MQ2-Lloyd package (arch_id=9). The cache defaults to the implemented F32 route; F16 is selectable on the certified gfx1201 MQ2R TP route. Parent-faithful profiles use low effort with temp=1/top_p=1 by default, max effort with temp=1/top_p=0.95 for agentic coding, and no hidden thinking cap. Includes the checkpoint-aligned DSpark sidecar. Was the default SKU until 2026-08-14, when MQ2R took over on the contributor's recommendation; retained and reachable as deepseek-v4-flash:mq2lloyd or deepseek-v4-flash-0731:mq2lloyd."
     },
-    "deepseek-v4-flash:mq2r": {
+    "deepseek-v4-flash": {
       "repo": "hipfire-models/deepseek-v4-flash-0731",
       "file": "deepseek-v4-flash-0731.mq2r",
       "size_gb": 82,
@@ -290,7 +290,7 @@
         "sha256": "bc695a000643801d26e5ae96c9f4ac4c222a36d9db40566f4cc1de0e9d3d5d2e",
         "size_bytes": 5788397278
       },
-      "desc": "Official DeepSeek V4 Flash 0731 MQ2R (arch_id=9), quantized with the preserved P3 tensor recipe. The cache defaults to the implemented F32 route; F16 is selectable on gfx1201 TP3/TP4 for long-context capacity. Parent-faithful profiles use low effort with temp=1/top_p=1 by default, max effort with temp=1/top_p=0.95 for agentic coding, and no hidden thinking cap. Includes the target-aligned DSpark sidecar."
+      "desc": "Official DeepSeek V4 Flash 0731 MQ2R (arch_id=9), quantized with the preserved P3 tensor recipe. The cache defaults to the implemented F32 route; F16 is selectable on gfx1201 TP3/TP4 for long-context capacity. Parent-faithful profiles use low effort with temp=1/top_p=1 by default, max effort with temp=1/top_p=0.95 for agentic coding, and no hidden thinking cap. Includes the target-aligned DSpark sidecar. Default SKU since 2026-08-14 (recommended and blessed by nwoolmer, the DeepSeek V4 contributor): 4.0 GB smaller than MQ2-Lloyd and the certified gfx1201 TP route. The previous default is retained as deepseek-v4-flash:mq2lloyd."
     },
     "minimax-m2.7": {
       "repo": "hipfire-models/MiniMax-M2.7",
@@ -1077,12 +1077,13 @@
     "deepseek4:0731": "deepseek-v4-flash",
     "deepseek-v4:0731": "deepseek-v4-flash",
     "deepseek-v4-flash-0731": "deepseek-v4-flash",
-    "deepseek-v4-flash-0731:mq2lloyd": "deepseek-v4-flash",
-    "deepseek4:0731-mq2r": "deepseek-v4-flash:mq2r",
-    "deepseek-v4:0731-mq2r": "deepseek-v4-flash:mq2r",
-    "deepseek-v4-flash-0731:mq2r": "deepseek-v4-flash:mq2r",
-    "deepseek4:mq2r": "deepseek-v4-flash:mq2r",
-    "deepseek-v4:mq2r": "deepseek-v4-flash:mq2r",
+    "deepseek-v4-flash-0731:mq2lloyd": "deepseek-v4-flash:mq2lloyd",
+    "deepseek4:0731-mq2r": "deepseek-v4-flash",
+    "deepseek-v4:0731-mq2r": "deepseek-v4-flash",
+    "deepseek-v4-flash-0731:mq2r": "deepseek-v4-flash",
+    "deepseek-v4-flash:mq2r": "deepseek-v4-flash",
+    "deepseek4:mq2r": "deepseek-v4-flash",
+    "deepseek-v4:mq2r": "deepseek-v4-flash",
     "deepseek4:preview": "deepseek-v4-flash-preview",
     "deepseek-v4:preview": "deepseek-v4-flash-preview",
     "qwen3.5:0.8b-mq4": "qwen3.5:0.8b",
