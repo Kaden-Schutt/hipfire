@@ -216,6 +216,14 @@ struct SetupArgs {
     source: PathBuf,
     #[arg(long, value_name = "PATH")]
     rocm_root: Option<PathBuf>,
+    /// Explicit device compiler (hipcc/amdclang++) when it lives in a different
+    /// prefix than the runtime. Also set via HIPFIRE_HIPCC.
+    #[arg(long, value_name = "PATH")]
+    hipcc: Option<PathBuf>,
+    /// Disable cross-root compiler fallback; require the compiler under the
+    /// selected root. Also set via HIPFIRE_ROCM_STRICT=1.
+    #[arg(long)]
+    strict_rocm: bool,
     #[arg(long, value_name = "ARCH")]
     gpu_arch: Option<String>,
     /// auto (default) leaves replay.backend=auto so .mq4r models select Redline.
@@ -7626,6 +7634,8 @@ fn run_update_installer(repo: &Path, paths: &Paths, resolved: &ResolvedRevision)
         &resolved.selector,
         recorded.rocm_root.as_deref(),
         recorded.gpu_arch.as_deref(),
+        recorded.hipcc.as_deref(),
+        recorded.strict_rocm,
     ) {
         installer_cmd.arg(arg);
     }
@@ -7702,6 +7712,8 @@ fn installer_handoff_args(
     selector: &RevisionSelector,
     rocm_root: Option<&Path>,
     gpu_arch: Option<&str>,
+    hipcc: Option<&Path>,
+    strict_rocm: bool,
 ) -> Vec<String> {
     let mut args = vec!["--yes".to_owned()];
     match selector.kind {
@@ -7730,6 +7742,17 @@ fn installer_handoff_args(
         args.push("--gpu-arch".to_owned());
         args.push(arch.to_owned());
     }
+    if let Some(hipcc) = hipcc
+        .map(|p| p.to_string_lossy().into_owned())
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+    {
+        args.push("--hipcc".to_owned());
+        args.push(hipcc);
+    }
+    if strict_rocm {
+        args.push("--strict-rocm".to_owned());
+    }
     args
 }
 
@@ -7737,8 +7760,9 @@ fn installer_handoff_args(
 struct RecordedInstallMetadata {
     rocm_root: Option<PathBuf>,
     gpu_arch: Option<String>,
+    hipcc: Option<PathBuf>,
+    strict_rocm: bool,
 }
-
 fn recorded_install_metadata(install_home: &Path) -> RecordedInstallMetadata {
     let text = match fs::read_to_string(install_home.join("install.json")) {
         Ok(text) => text,
@@ -7760,9 +7784,26 @@ fn recorded_install_metadata(install_home: &Path) -> RecordedInstallMetadata {
         .map(str::trim)
         .filter(|arch| !arch.is_empty())
         .map(str::to_owned);
+    let hipcc = value
+        .get("hipcc")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from);
+    let strict_rocm = match value.get("strict_rocm") {
+        Some(serde_json::Value::Bool(b)) => *b,
+        Some(serde_json::Value::String(s)) => {
+            let s = s.trim();
+            s == "1" || s.eq_ignore_ascii_case("true")
+        }
+        Some(serde_json::Value::Number(n)) => n.as_u64().is_some_and(|v| v != 0),
+        _ => false,
+    };
     RecordedInstallMetadata {
         rocm_root,
         gpu_arch,
+        hipcc,
+        strict_rocm,
     }
 }
 
@@ -9673,6 +9714,8 @@ mod tests {
             },
             recorded.rocm_root.as_deref(),
             recorded.gpu_arch.as_deref(),
+            recorded.hipcc.as_deref(),
+            recorded.strict_rocm,
         );
         assert_eq!(
             args,
@@ -9695,6 +9738,8 @@ mod tests {
         let empty = recorded_install_metadata(&home);
         assert!(empty.rocm_root.is_none());
         assert!(empty.gpu_arch.is_none());
+        assert!(empty.hipcc.is_none());
+        assert!(!empty.strict_rocm);
         let bare = installer_handoff_args(
             &RevisionSelector {
                 value: "deadbeef".into(),
@@ -9702,6 +9747,8 @@ mod tests {
             },
             None,
             None,
+            None,
+            false,
         );
         assert_eq!(
             bare,
@@ -9720,6 +9767,8 @@ mod tests {
             },
             None,
             Some("gfx1100"),
+            None,
+            false,
         );
         assert_eq!(
             arch_only,
@@ -9733,6 +9782,81 @@ mod tests {
         );
         fs::remove_dir_all(home).unwrap();
     }
+    #[test]
+    fn update_handoff_forwards_hipcc_and_strict_with_backward_compat() {
+        let home = env::temp_dir().join(format!(
+            "hipfire-update-hipcc-{}-{}",
+            std::process::id(),
+            unix_timestamp()
+        ));
+        fs::create_dir_all(&home).unwrap();
+        // New format with hipcc and strict_rocm.
+        fs::write(
+            home.join("install.json"),
+            r#"{"rocm_root":"/opt/rocm","hipcc":"/usr/bin/hipcc","strict_rocm":true,"gpu_arch":"gfx1201"}"#,
+        )
+        .unwrap();
+        let recorded = recorded_install_metadata(&home);
+        assert_eq!(recorded.hipcc.as_deref(), Some(Path::new("/usr/bin/hipcc")));
+        assert!(recorded.strict_rocm);
+        assert_eq!(recorded.rocm_root.as_deref(), Some(Path::new("/opt/rocm")));
+        let args = installer_handoff_args(
+            &RevisionSelector {
+                value: "master".into(),
+                kind: RevisionKind::Auto,
+            },
+            recorded.rocm_root.as_deref(),
+            recorded.gpu_arch.as_deref(),
+            recorded.hipcc.as_deref(),
+            recorded.strict_rocm,
+        );
+        assert!(args.contains(&"--hipcc".to_owned()));
+        assert!(args.contains(&"/usr/bin/hipcc".to_owned()));
+        assert!(args.contains(&"--strict-rocm".to_owned()));
+        assert!(args.contains(&"--rocm-root".to_owned()));
+        // Empty/whitespace hipcc is treated as None, like rocm_root.
+        fs::write(
+            home.join("install.json"),
+            r#"{"hipcc":"  ","strict_rocm":false}"#,
+        )
+        .unwrap();
+        let empty = recorded_install_metadata(&home);
+        assert!(empty.hipcc.is_none());
+        assert!(!empty.strict_rocm);
+        let bare = installer_handoff_args(
+            &RevisionSelector {
+                value: "beta".into(),
+                kind: RevisionKind::Branch,
+            },
+            None,
+            None,
+            empty.hipcc.as_deref(),
+            empty.strict_rocm,
+        );
+        assert!(!bare.contains(&"--hipcc".to_owned()));
+        assert!(!bare.contains(&"--strict-rocm".to_owned()));
+        // Older file without hipcc key loads without error (backward compat).
+        fs::write(
+            home.join("install.json"),
+            r#"{"rocm_root":"/opt/rocm","gpu_arch":"gfx1100"}"#,
+        )
+        .unwrap();
+        let old = recorded_install_metadata(&home);
+        assert_eq!(old.rocm_root.as_deref(), Some(Path::new("/opt/rocm")));
+        assert!(old.hipcc.is_none());
+        assert!(!old.strict_rocm);
+        // Strict can be stored as string \"1\" or number 1 for compat.
+        fs::write(
+            home.join("install.json"),
+            r#"{"strict_rocm":"1"}"#,
+        )
+        .unwrap();
+        assert!(recorded_install_metadata(&home).strict_rocm);
+        fs::write(home.join("install.json"), r#"{"strict_rocm":1}"#).unwrap();
+        assert!(recorded_install_metadata(&home).strict_rocm);
+        fs::remove_dir_all(home).unwrap();
+    }
+
 
     #[test]
     fn update_restores_staged_unstaged_and_untracked_after_failed_handoff() {
