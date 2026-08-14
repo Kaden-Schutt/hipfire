@@ -2894,15 +2894,6 @@ pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_RM_PK_SRC: &str =
 /// Measurement-only; used exclusively by hipfire-arch-muse-glimmer.
 pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_RM_PIPE_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_gfx1100_muse_rm_pipe.hip");
-/// Muse Glimmer-owned RM2/BV6 gfx1100 residual GEMM with fragment-major A
-/// layout (K2). Sibling of `GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_RM_BT_SRC`;
-/// same RM2/BV6 tiling and exact F32 accum order, but A is rearranged per
-/// 16-row tile × K-group into 2176-byte blocks (16 row headers + 16 K-frags ×
-/// 16 rows × 8 packed bytes). Exact gate/up only (M=19968, K=6656, batch=192).
-/// Measurement-only; used exclusively by hipfire-arch-muse-glimmer.
-pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_RM_FG_SRC: &str =
-    include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_gfx1100_muse_rm_fg.hip");
-
 
 
 

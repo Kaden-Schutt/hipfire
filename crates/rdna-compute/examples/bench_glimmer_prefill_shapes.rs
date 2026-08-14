@@ -24,9 +24,6 @@
 //!   - Muse-owned `gemm_hfq4g256_residual_muse_gfx1100_rm2_pipe` RM2/BV6
 //!     two-slot X-fragment pipeline (gfx1100 only, exact M=19968 K=6656 B=192;
 //!     scalar + packed-half2 symbols)
-//!   - Muse-owned `gemm_hfq4g256_residual_muse_gfx1100_rm2_fg` RM2/BV6
-//!     fragment-major A layout (gfx1100 only, exact M=19968 K=6656 B=192;
-//!     same-size host transcode of gate weights)
 //!
 //! For each exact Muse shape and B=128/192/256 reports time, TFLOP/s,
 //! bitdiff, max_abs, max_rel versus the production baseline. The gfx1201 Muse
@@ -173,29 +170,13 @@ fn main() {
 
     // Reusable gate/up weights for the fused measurement — avoid huge
     // duplicate allocations by uploading once and reusing across B.
-    // Keep host gate bytes long enough to build the fragment-major FG
-    // candidate tensor (same byte length; no regenerate).
     let gate_w_raw = build_hfq4g256(ffn, dim, 0xB1);
     let up_w_raw = build_hfq4g256(ffn, dim, 0xB2);
     let gate_w = gpu
         .upload_raw(&gate_w_raw, &[ffn, dim])
         .expect("gate w");
     let up_w = gpu.upload_raw(&up_w_raw, &[ffn, dim]).expect("up w");
-    let gate_w_fg = if is_gfx1100 {
-        let fg_bytes =
-            rdna_compute::gemm::hfq4g256_row_major_to_fragment_major(&gate_w_raw, ffn, dim);
-        assert_eq!(
-            fg_bytes.len(),
-            gate_w_raw.len(),
-            "fragment-major gate must preserve HFQ4G256 byte size"
-        );
-        Some(
-            gpu.upload_raw(&fg_bytes, &[ffn, dim])
-                .expect("gate w fg"),
-        )
-    } else {
-        None
-    };
+    // Drop host copies after upload (keep device only) to avoid resident duplicate.
     drop(gate_w_raw);
     drop(up_w_raw);
 
@@ -1321,76 +1302,6 @@ fn main() {
                 }
             }
 
-            // RM2/BV6 fragment-major A layout (K2): same tiling/accum as
-            // muse_rm2_bv6 but A is 2176 B/tile-group. Host fail-closed unless
-            // gfx1100 + exact M/K/B192. Uses pre-transcoded gate_w_fg (same
-            // byte length as gate_w). Zero/probe/2 warmup/fresh correctness/
-            // median3 vs the fresh g11_batched baseline already in base_host.
-            if b == 192 {
-                if let Some(gate_fg) = &gate_w_fg {
-                    let _ = gpu.hip.memset(&y_cand.buf, 0, b * m_gate * 4);
-                    let used = gpu
-                        .gemm_hfq4g256_residual_muse_gfx1100_rm2_fg(
-                            gate_fg, &x_dim, &y_cand, m_gate, k_gate, b,
-                        )
-                        .expect("muse_g11_rm2_fg probe");
-                    let _ = gpu.hip.device_synchronize();
-                    if used {
-                        for _ in 0..2 {
-                            let _ = gpu.hip.memset(&y_cand.buf, 0, b * m_gate * 4);
-                            let _ = gpu.gemm_hfq4g256_residual_muse_gfx1100_rm2_fg(
-                                gate_fg, &x_dim, &y_cand, m_gate, k_gate, b,
-                            );
-                        }
-                        let _ = gpu.hip.device_synchronize();
-
-                        let _ = gpu.hip.memset(&y_cand.buf, 0, b * m_gate * 4);
-                        let ok = gpu
-                            .gemm_hfq4g256_residual_muse_gfx1100_rm2_fg(
-                                gate_fg, &x_dim, &y_cand, m_gate, k_gate, b,
-                            )
-                            .expect("muse_g11_rm2_fg dl");
-                        let _ = gpu.hip.device_synchronize();
-                        if ok {
-                            let cand_host =
-                                gpu.download_f32(&y_cand).expect("dl muse_g11_rm2_fg");
-                            let (bdiff, maxabs, maxrel) =
-                                correctness_stats(&base_host, &cand_host);
-
-                            let mut cand_reps: Vec<f64> = Vec::new();
-                            for _ in 0..3 {
-                                let t0 = Instant::now();
-                                for _ in 0..iters {
-                                    let _ = gpu.hip.memset(&y_cand.buf, 0, b * m_gate * 4);
-                                    gpu.gemm_hfq4g256_residual_muse_gfx1100_rm2_fg(
-                                        gate_fg, &x_dim, &y_cand, m_gate, k_gate, b,
-                                    )
-                                    .expect("muse_g11_rm2_fg bench");
-                                }
-                                let _ = gpu.hip.device_synchronize();
-                                cand_reps
-                                    .push(t0.elapsed().as_secs_f64() * 1000.0 / iters as f64);
-                            }
-                            let ms_cand = median_ms(cand_reps);
-                            let tflops_cand = flops / (ms_cand / 1000.0) / 1e12;
-                            let vs = 100.0 * (ms_base / ms_cand - 1.0);
-                            println!(
-                                "{:<12} {:>4} {:<14} {:>9.3} {:>9.2} {:>9} {:>9.2e} {:>9.2e} {:>+8.1}%  rm=2 bv=6 fg",
-                                "gate_proj",
-                                b,
-                                "rm2_bv6_fg",
-                                ms_cand,
-                                tflops_cand,
-                                bdiff,
-                                maxabs,
-                                maxrel,
-                                vs,
-                            );
-                        }
-                    }
-                }
-            }
-
             let _ = gpu.free_tensor(y_cand);
             let _ = gpu.free_tensor(y_base);
         }
@@ -1398,9 +1309,6 @@ fn main() {
         let _ = gpu.free_tensor(x_dim);
     }
 
-    if let Some(gw) = gate_w_fg {
-        let _ = gpu.free_tensor(gw);
-    }
     let _ = gpu.free_tensor(up_w);
     let _ = gpu.free_tensor(gate_w);
 
@@ -1410,6 +1318,6 @@ fn main() {
     println!("  candidate oracle: batched (production overwrite) vs residual+zero must be bitdiff=0");
     println!("  fused gate+up must be bitdiff=0 per output vs 2x batched; muse_bt12 must be bitdiff=0 vs batched");
     println!("  on gfx1100/gfx1151 muse rows report arch_skip and do not call the gfx12 kernel");
-    println!("  on gfx1100 only: gate_proj muse_g11_bt{{4,6,8,12,16}}, muse_g11_cb{{4,6,12}}, muse_g11_mw{{2,4,8}}, muse_g11_lds, muse_g11_rm{{2,3,4,6}}x{{6,4,3,2}}, muse_g11_rm{{2,4}}x{{6,3}}_hb, muse_g11_rm{{1,2}}x{{12,6}}_pk, rm2_pipe_scalar/pk2 (B192), rm2_bv6_fg (B192 fragment-major A) rows vs g11_batched (zeroed); skipped if Ok(false); pipe also prints indented up bitdiff");
+    println!("  on gfx1100 only: gate_proj muse_g11_bt{{4,6,8,12,16}}, muse_g11_cb{{4,6,12}}, muse_g11_mw{{2,4,8}}, muse_g11_lds, muse_g11_rm{{2,3,4,6}}x{{6,4,3,2}}, muse_g11_rm{{2,4}}x{{6,3}}_hb, muse_g11_rm{{1,2}}x{{12,6}}_pk, rm2_pipe_scalar/pk2 (B192) rows vs g11_batched (zeroed); skipped if Ok(false); pipe also prints indented up bitdiff");
     println!("  on non-gfx1100 the muse_gfx1100 APIs are never called");
 }
