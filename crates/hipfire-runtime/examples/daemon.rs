@@ -1407,10 +1407,12 @@ fn batch_render_prompt_tokens(
     assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
     tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
     chat_template: Option<&String>,
+    max_think_tokens: usize,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
     enable_thinking: bool,
     reasoning_effort: Option<&str>,
 ) -> Result<(Vec<u32>, bool), String> {
+    debug_assert!(!enable_thinking || max_think_tokens != 1);
     let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
     let try_jinja = jinja_enabled && chat_template.is_some();
     let q_tokens = tokenizer.encode(prompt);
@@ -2009,6 +2011,7 @@ fn drive_qwen_continuous_batch(
                             assistant_prefix,
                             tokenizer,
                             chat_template.as_ref(),
+                            max_think,
                             batch_messages.as_deref(),
                             batch_enable_thinking,
                             batch_reasoning_effort.as_deref(),
@@ -2927,6 +2930,7 @@ fn drive_lfm_continuous_batch(
                             assistant_prefix,
                             tokenizer,
                             chat_template.as_ref(),
+                            max_think,
                             batch_messages.as_deref(),
                             max_think != 1,
                             None,
@@ -4373,6 +4377,7 @@ fn drive_qwen35_ep_continuous_batch(
                             assistant_prefix,
                             tokenizer,
                             chat_template.as_ref(),
+                            max_think,
                             batch_messages.as_deref(),
                             batch_enable_thinking,
                             batch_reasoning_effort.as_deref(),
@@ -15058,6 +15063,7 @@ fn main() {
                             assistant_prefix,
                             m.tokenizer.as_ref().unwrap(),
                             m.chat_template.as_ref(),
+                            max_think_tokens,
                             messages_history.as_deref(),
                             enable_thinking_jinja,
                             reasoning_effort_jinja.as_deref(),
@@ -15199,6 +15205,7 @@ fn main() {
                             assistant_prefix,
                             m.tokenizer.as_ref().unwrap(),
                             m.chat_template.as_ref(),
+                            max_think_tokens,
                             messages_history.as_deref(),
                             enable_thinking_jinja,
                             reasoning_effort_jinja.as_deref(),
