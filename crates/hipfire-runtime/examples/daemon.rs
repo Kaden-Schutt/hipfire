@@ -23654,7 +23654,7 @@ fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
 enum GlimmerSpecMode {
     Off,
     Greedy,
-    ChainSampled,
+    Sampled,
 }
 
 /// Glimmer speculation admission. Greedy is the validated path; the sampled
@@ -23680,9 +23680,48 @@ fn glimmer_spec_admission(
         && min_p.map_or(true, |p| p <= 0.0)
         && batched_logits_available
     {
-        return GlimmerSpecMode::ChainSampled;
+        return GlimmerSpecMode::Sampled;
     }
     GlimmerSpecMode::Off
+}
+
+/// Lossless speculative rejection sampling (Chen & Leviathan 2023, alg. 1),
+/// delegating the arithmetic to hipfire_arch_qwen35::speculative so arch 14 and
+/// arch 5/6 cannot diverge. `q_rows`/`p_rows` are `drafts.len()+1` rows of
+/// `vocab` probabilities, already temp/top_p/top_k-truncated IDENTICALLY on both
+/// sides. Returns (accepted_prefix_len, bonus_token).
+fn glimmer_accept_rejection(
+    drafts: &[u32],
+    q_rows: &[f32],
+    q_at_drafted: &[f32],
+    p_rows: &[f32],
+    vocab: usize,
+    rng: &mut u64,
+) -> (usize, u32) {
+    use hipfire_arch_qwen35::speculative::{sample_categorical, sample_residual, xorshift_next_unit};
+    let b = drafts.len();
+    let mut accepted = 0usize;
+    for i in 0..b {
+        let p_d = q_at_drafted[i].max(f32::MIN_POSITIVE);
+        let p_t = p_rows[i * vocab + drafts[i] as usize];
+        let u = xorshift_next_unit(rng);
+        if u * p_d <= p_t {
+            accepted += 1;
+        } else {
+            let q_row = &q_rows[i * vocab..(i + 1) * vocab];
+            let p_row = &p_rows[i * vocab..(i + 1) * vocab];
+            let u2 = xorshift_next_unit(rng);
+            let bonus = sample_residual(p_row, q_row, u2);
+            return (accepted, bonus);
+        }
+    }
+    // no rejection: bonus from the boundary row
+    let b_total = p_rows.len() / vocab;
+    let idx = if b == 0 { 0 } else { accepted.min(b_total.saturating_sub(1)) };
+    let p_row = &p_rows[idx * vocab..(idx + 1) * vocab];
+    let u = xorshift_next_unit(rng);
+    let bonus = sample_categorical(p_row, u);
+    (accepted, bonus)
 }
 
 #[inline]
@@ -23762,11 +23801,10 @@ mod glimmer_spec_admission_tests {
         let m2 = glimmer_spec_admission(true, 16, 0.01, None, true, false, true);
         assert_eq!(m2, GlimmerSpecMode::Greedy);
     }
-
     #[test]
-    fn chain_sampled_at_temp_one_with_defaults() {
+    fn sampled_at_temp_one_with_defaults() {
         let m = glimmer_spec_admission(true, 16, 1.0, None, true, false, true);
-        assert_eq!(m, GlimmerSpecMode::ChainSampled);
+        assert_eq!(m, GlimmerSpecMode::Sampled);
     }
 
     #[test]
@@ -23775,9 +23813,9 @@ mod glimmer_spec_admission_tests {
         assert_eq!(m, GlimmerSpecMode::Off);
         // zero and None are allowed
         let ok0 = glimmer_spec_admission(true, 16, 1.0, Some(0.0), true, false, true);
-        assert_eq!(ok0, GlimmerSpecMode::ChainSampled);
+        assert_eq!(ok0, GlimmerSpecMode::Sampled);
         let ok_none = glimmer_spec_admission(true, 16, 1.0, None, true, false, true);
-        assert_eq!(ok_none, GlimmerSpecMode::ChainSampled);
+        assert_eq!(ok_none, GlimmerSpecMode::Sampled);
     }
 
     #[test]
@@ -23825,7 +23863,7 @@ mod glimmer_spec_admission_tests {
         );
         assert_eq!(
             glimmer_spec_admission(true, 16, 0.02, None, true, false, true),
-            GlimmerSpecMode::ChainSampled
+            GlimmerSpecMode::Sampled
         );
         // just above greedy threshold but at/under 1e-6 should be Off, not sampled
         assert_eq!(
@@ -23836,6 +23874,110 @@ mod glimmer_spec_admission_tests {
             glimmer_spec_admission(true, 16, 5e-7, None, true, false, true),
             GlimmerSpecMode::Greedy
         );
+    }
+}
+
+#[cfg(test)]
+mod glimmer_accept_rejection_tests {
+    use super::glimmer_accept_rejection;
+
+    fn make_p_q_all_zero_except(vocab: usize, token: usize, p_val: f32, q_val: f32) -> (Vec<f32>, Vec<f32>, f32) {
+        // helper not used directly; keep simple synthetic rows
+        let _ = (vocab, token, p_val, q_val);
+        (Vec::new(), Vec::new(), 0.0)
+    }
+
+    #[test]
+    fn identical_p_and_q_accepts_all() {
+        let vocab = 4;
+        // p == q: each row uniform 0.25, drafts drawn from that support
+        let b = 3;
+        let drafts = vec![1u32, 2, 0];
+        // q_rows: 4 rows? use b+1 rows to satisfy spec; last row duplicated
+        let q_rows = vec![
+            0.25, 0.25, 0.25, 0.25,
+            0.25, 0.25, 0.25, 0.25,
+            0.25, 0.25, 0.25, 0.25,
+            0.25, 0.25, 0.25, 0.25,
+        ];
+        let q_at_drafted = vec![0.25, 0.25, 0.25];
+        let p_rows = q_rows.clone();
+        let mut rng = 0x9E3779B97F4A7C15u64;
+        let (accepted, bonus) = glimmer_accept_rejection(&drafts, &q_rows, &q_at_drafted, &p_rows, vocab, &mut rng);
+        assert_eq!(accepted, b, "identical p and q should accept every draft");
+        // bonus drawn from boundary row (accept.min(b_total-1) == b)
+        assert!(bonus < vocab as u32);
+        // deterministic: recompute with same seed gives same bonus
+        let mut rng2 = 0x9E3779B97F4A7C15u64;
+        let (a2, b2) = glimmer_accept_rejection(&drafts, &q_rows, &q_at_drafted, &p_rows, vocab, &mut rng2);
+        assert_eq!((a2, b2), (accepted, bonus));
+    }
+
+    #[test]
+    fn q_mass_on_zero_prob_token_rejects_at_zero() {
+        let vocab = 3;
+        let drafts = vec![0u32, 1];
+        // q puts all mass on token 0, p gives ~zero to token 0, all mass on 1/2
+        let q_rows = vec![
+            1.0, 0.0, 0.0,
+            1.0, 0.0, 0.0,
+            0.5, 0.5, 0.0, // extra row for bonus (unused here)
+        ];
+        let q_at_drafted = vec![1.0, 1.0];
+        let p_rows = vec![
+            0.0, 0.5, 0.5,
+            0.0, 0.5, 0.5,
+            0.0, 0.5, 0.5,
+        ];
+        let mut rng = 0x12345678u64;
+        let (accepted, bonus) = glimmer_accept_rejection(&drafts, &q_rows, &q_at_drafted, &p_rows, vocab, &mut rng);
+        assert_eq!(accepted, 0, "should reject at index 0 when p gives zero to drafted token");
+        // bonus comes from residual (p - q)_+ which has zero mass on token 0, so never drafted token
+        assert_ne!(bonus, drafts[0], "residual bonus must never be the drafted token when p gives it zero");
+        assert!(bonus < vocab as u32);
+    }
+
+    #[test]
+    fn partial_accept_prefix_then_reject() {
+        let vocab = 4;
+        let drafts = vec![0u32, 1, 2];
+        // Craft q/p so first token always accepts (p==q), second rejects
+        let q_rows = vec![
+            1.0, 0.0, 0.0, 0.0,
+            1.0, 0.0, 0.0, 0.0,
+            0.5, 0.5, 0.0, 0.0,
+            0.25, 0.25, 0.25, 0.25,
+        ];
+        let q_at_drafted = vec![1.0, 1.0, 0.5];
+        let p_rows = vec![
+            1.0, 0.0, 0.0, 0.0, // accepts token 0
+            0.0, 0.0, 1.0, 0.0, // p gives zero to token 1 => reject
+            0.0, 0.0, 0.0, 1.0,
+            0.25, 0.25, 0.25, 0.25,
+        ];
+        let mut rng = 0xDEADBEEFu64;
+        let (accepted, bonus) = glimmer_accept_rejection(&drafts, &q_rows, &q_at_drafted, &p_rows, vocab, &mut rng);
+        assert_eq!(accepted, 1, "should accept prefix length 1 then reject");
+        assert!(bonus < vocab as u32);
+        // Bonus at index 1's residual: p has mass on 2, q on 0/1 => residual never 0 or 1
+        // p=[0,0,1,0], q=[1,0,0,0] => residual is [0,0,1,0] => bonus must be 2
+        assert_eq!(bonus, 2);
+    }
+
+    #[test]
+    fn determinism_same_seed_identical() {
+        let vocab = 5;
+        let drafts = vec![2u32, 3, 1, 4];
+        let mut rng_a = 0xABCDEF01u64;
+        let mut rng_b = 0xABCDEF01u64;
+        // random but identical distributions
+        let q_rows = vec![0.2; (drafts.len()+1)*vocab];
+        let p_rows = vec![0.2; (drafts.len()+1)*vocab];
+        let q_at_drafted = vec![0.2; drafts.len()];
+        let r1 = glimmer_accept_rejection(&drafts, &q_rows, &q_at_drafted, &p_rows, vocab, &mut rng_a);
+        let r2 = glimmer_accept_rejection(&drafts, &q_rows, &q_at_drafted, &p_rows, vocab, &mut rng_b);
+        assert_eq!(r1, r2);
+        assert_eq!(rng_a, rng_b);
     }
 }
 
@@ -31355,6 +31497,81 @@ fn generate_muse_glimmer(
             bundle.drafter.as_ref().unwrap().config.mask_token_id,
             bundle.drafter.as_ref().unwrap().config.target_layer_ids
         );
+        // Probs buffers allocated ONCE per request outside the window loop and freed when the request ends.
+        // A cold hipMalloc of the ~12.9 MB logits buffer cost 69 ms on a window's first call — do not allocate per window.
+        // Greedy path pays nothing: these stay None and no probs allocation or download occurs on that branch.
+        let vocab = bundle.config.vocab_size;
+        let max_block = hipfire_arch_muse_glimmer::glimmer::GLIMMER_MAX_SPEC_BLOCK;
+        let mut sampled_probs_draft: Option<rdna_compute::GpuTensor> = None;
+        let mut sampled_probs_target: Option<rdna_compute::GpuTensor> = None;
+        let mut sampled_tau_draft: Option<rdna_compute::GpuTensor> = None;
+        let mut sampled_z_draft: Option<rdna_compute::GpuTensor> = None;
+        let mut sampled_tau_target: Option<rdna_compute::GpuTensor> = None;
+        let mut sampled_z_target: Option<rdna_compute::GpuTensor> = None;
+        let mut draft_logits_buf: Vec<f32> = Vec::new();
+        let mut q_rows_host: Vec<f32> = Vec::new();
+        let mut p_rows_host: Vec<f32> = Vec::new();
+        let mut q_at_drafted_host: Vec<f32> = Vec::new();
+        if spec_mode == GlimmerSpecMode::Sampled {
+            // Allocate draft probs (+ tau/z) and target probs (+ tau/z) once.
+            match gpu.alloc_tensor(&[max_block * vocab], rdna_compute::DType::F32) {
+                Ok(t) => sampled_probs_draft = Some(t),
+                Err(e) => {
+                    emit_error_with_id(stdout, id, format!("muse_glimmer sampled alloc probs_draft failed: {e:?}"));
+                    return;
+                }
+            }
+            match gpu.alloc_tensor(&[max_block * vocab], rdna_compute::DType::F32) {
+                Ok(t) => sampled_probs_target = Some(t),
+                Err(e) => {
+                    if let Some(t) = sampled_probs_draft.take() { let _ = gpu.free_tensor(t); }
+                    emit_error_with_id(stdout, id, format!("muse_glimmer sampled alloc probs_target failed: {e:?}"));
+                    return;
+                }
+            }
+            match gpu.alloc_tensor(&[max_block], rdna_compute::DType::F32) {
+                Ok(t) => sampled_tau_draft = Some(t),
+                Err(e) => {
+                    if let Some(t) = sampled_probs_draft.take() { let _ = gpu.free_tensor(t); }
+                    if let Some(t) = sampled_probs_target.take() { let _ = gpu.free_tensor(t); }
+                    emit_error_with_id(stdout, id, format!("muse_glimmer sampled alloc tau_draft failed: {e:?}"));
+                    return;
+                }
+            }
+            match gpu.alloc_tensor(&[max_block], rdna_compute::DType::F32) {
+                Ok(t) => sampled_z_draft = Some(t),
+                Err(e) => {
+                    if let Some(t) = sampled_probs_draft.take() { let _ = gpu.free_tensor(t); }
+                    if let Some(t) = sampled_probs_target.take() { let _ = gpu.free_tensor(t); }
+                    if let Some(t) = sampled_tau_draft.take() { let _ = gpu.free_tensor(t); }
+                    emit_error_with_id(stdout, id, format!("muse_glimmer sampled alloc z_draft failed: {e:?}"));
+                    return;
+                }
+            }
+            match gpu.alloc_tensor(&[max_block], rdna_compute::DType::F32) {
+                Ok(t) => sampled_tau_target = Some(t),
+                Err(e) => {
+                    if let Some(t) = sampled_probs_draft.take() { let _ = gpu.free_tensor(t); }
+                    if let Some(t) = sampled_probs_target.take() { let _ = gpu.free_tensor(t); }
+                    if let Some(t) = sampled_tau_draft.take() { let _ = gpu.free_tensor(t); }
+                    if let Some(t) = sampled_z_draft.take() { let _ = gpu.free_tensor(t); }
+                    emit_error_with_id(stdout, id, format!("muse_glimmer sampled alloc tau_target failed: {e:?}"));
+                    return;
+                }
+            }
+            match gpu.alloc_tensor(&[max_block], rdna_compute::DType::F32) {
+                Ok(t) => sampled_z_target = Some(t),
+                Err(e) => {
+                    if let Some(t) = sampled_probs_draft.take() { let _ = gpu.free_tensor(t); }
+                    if let Some(t) = sampled_probs_target.take() { let _ = gpu.free_tensor(t); }
+                    if let Some(t) = sampled_tau_draft.take() { let _ = gpu.free_tensor(t); }
+                    if let Some(t) = sampled_z_draft.take() { let _ = gpu.free_tensor(t); }
+                    if let Some(t) = sampled_tau_target.take() { let _ = gpu.free_tensor(t); }
+                    emit_error_with_id(stdout, id, format!("muse_glimmer sampled alloc z_target failed: {e:?}"));
+                    return;
+                }
+            }
+        }
         // Seed is the last prefill token's greedy pick (argmax of last_logits).
         // For the first window we need a committed seed token — use the last
         // prompt token (already in KV) as seed, and last_logits as its logits.
@@ -31801,7 +32018,7 @@ fn generate_muse_glimmer(
                         .unwrap();
                     t
                 };
-                let drafts = match hipfire_arch_muse_glimmer::forward::glimmer_lm_head_picks(
+                let mut drafts = match hipfire_arch_muse_glimmer::forward::glimmer_lm_head_picks(
                     gpu,
                     &bundle.config,
                     &bundle.weights,
@@ -31810,7 +32027,11 @@ fn generate_muse_glimmer(
                     &bundle.state.logits,
                     &bundle.state.logits_batch,
                     &bundle.state.argmax_batch,
-                    None,
+                    if spec_mode == GlimmerSpecMode::Sampled {
+                        Some(&mut draft_logits_buf)
+                    } else {
+                        None
+                    },
                 ) {
                     Ok(p) => p,
                     Err(e) => {
@@ -31825,6 +32046,82 @@ fn generate_muse_glimmer(
                     }
                 };
                 gpu.free_tensor(hidden_for_draft).ok();
+                // Sampled draft sampling: drafts must be SAMPLED from q, not argmax.
+                // Keep the glimmer_lm_head_picks call above (it leaves logits in logits_batch);
+                // in Sampled mode it was passed Some(&mut draft_logits_buf) so host copy exists.
+                // Then run softmax over logits_batch into probs and download BEFORE verify overwrites the shared buffer.
+                if spec_mode == GlimmerSpecMode::Sampled {
+                    let n_draft_rows = drafts.len();
+                    let vocab_usize = bundle.config.vocab_size;
+                    let logits_sub = bundle.state.logits_batch.sub_offset(0, n_draft_rows * vocab_usize);
+                    let probs_sub = sampled_probs_draft.as_ref().unwrap().sub_offset(0, n_draft_rows * vocab_usize);
+                    let tau_sub = sampled_tau_draft.as_ref().unwrap().sub_offset(0, n_draft_rows);
+                    let z_sub = sampled_z_draft.as_ref().unwrap().sub_offset(0, n_draft_rows);
+                    // min_p = 0.0 — the gate already refused min_p > 0; min_p's per-row floor would give the two sides different supports and break the residual domain.
+                    if let Err(e) = gpu.softmax_temp_topp_batched_into_f32(
+                        &logits_sub,
+                        &probs_sub,
+                        &tau_sub,
+                        &z_sub,
+                        vocab_usize,
+                        n_draft_rows,
+                        temp,
+                        top_p,
+                        top_k,
+                        0.0,
+                    ) {
+                        emit_error_with_id(stdout, id, format!("muse_glimmer draft softmax failed: {e:?}"));
+                        glimmer::forward::abort_device_capture_stage(&mut bundle.state);
+                        if spec_mode == GlimmerSpecMode::Sampled {
+                            if let Some(t) = sampled_probs_draft.take() { let _ = gpu.free_tensor(t); }
+                            if let Some(t) = sampled_probs_target.take() { let _ = gpu.free_tensor(t); }
+                            if let Some(t) = sampled_tau_draft.take() { let _ = gpu.free_tensor(t); }
+                            if let Some(t) = sampled_z_draft.take() { let _ = gpu.free_tensor(t); }
+                            if let Some(t) = sampled_tau_target.take() { let _ = gpu.free_tensor(t); }
+                            if let Some(t) = sampled_z_target.take() { let _ = gpu.free_tensor(t); }
+                        }
+                        bundle.reset_session_state();
+                        m.conversation_tokens.clear();
+                        m.asst_turn_cache.clear();
+                        m.seq_pos = 0;
+                        return;
+                    }
+                    let downloaded = match gpu.download_f32(&probs_sub) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            emit_error_with_id(stdout, id, format!("muse_glimmer draft probs download failed: {e:?}"));
+                            glimmer::forward::abort_device_capture_stage(&mut bundle.state);
+                            if spec_mode == GlimmerSpecMode::Sampled {
+                                if let Some(t) = sampled_probs_draft.take() { let _ = gpu.free_tensor(t); }
+                                if let Some(t) = sampled_probs_target.take() { let _ = gpu.free_tensor(t); }
+                                if let Some(t) = sampled_tau_draft.take() { let _ = gpu.free_tensor(t); }
+                                if let Some(t) = sampled_z_draft.take() { let _ = gpu.free_tensor(t); }
+                                if let Some(t) = sampled_tau_target.take() { let _ = gpu.free_tensor(t); }
+                                if let Some(t) = sampled_z_target.take() { let _ = gpu.free_tensor(t); }
+                            }
+                            bundle.reset_session_state();
+                            m.conversation_tokens.clear();
+                            m.asst_turn_cache.clear();
+                            m.seq_pos = 0;
+                            return;
+                        }
+                    };
+                    // Now sample drafts from q and record q_at_drafted
+                    {
+                        use hipfire_arch_qwen35::speculative::{sample_categorical, xorshift_next_unit};
+                        let mut sampled = Vec::with_capacity(n_draft_rows);
+                        q_at_drafted_host.clear();
+                        q_at_drafted_host.reserve(n_draft_rows);
+                        for i in 0..n_draft_rows {
+                            let row = &q_rows_host[i * vocab_usize..(i + 1) * vocab_usize];
+                            let u = xorshift_next_unit(&mut chain_rng);
+                            let tok = sample_categorical(row, u);
+                            sampled.push(tok);
+                            q_at_drafted_host.push(row[tok as usize]);
+                        }
+                        drafts = sampled;
+                    }
+                }
                 let t_after_draft_lm = t_window.elapsed();
                 total_proposed += drafts.len();
                 // Log first draft for visibility
@@ -31840,10 +32137,9 @@ fn generate_muse_glimmer(
                 let mut block = Vec::with_capacity(block_size);
                 block.push(last_pick);
                 block.extend_from_slice(&drafts);
-                // For ChainSampled, pass Some(&mut logits_buf) so the verify path
-                // copies the per-position target logits (row-major [pos][vocab])
-                // needed by naive_sample_chain. Greedy passes None and pays nothing.
-                let picks = if spec_mode == GlimmerSpecMode::ChainSampled {
+                // Sampled mode uses GPU probs, not host logits_buf; greedy uses picks only.
+                // Download q_rows BEFORE verify overwrites the shared logits_batch buffer (see comment above).
+                let picks: Vec<u32> = if spec_mode == GlimmerSpecMode::Sampled {
                     if device_capture {
                         match glimmer::forward::verify_block_with_device_capture(
                             &bundle.config,
@@ -31852,7 +32148,7 @@ fn generate_muse_glimmer(
                             gpu,
                             &block,
                             cur_pos,
-                            Some(&mut logits_buf),
+                            None,
                         ) {
                             Ok(p) => p,
                             Err(e) => {
@@ -31862,6 +32158,14 @@ fn generate_muse_glimmer(
                                     format!("muse_glimmer verify failed: {e:?}"),
                                 );
                                 glimmer::forward::abort_device_capture_stage(&mut bundle.state);
+                                if spec_mode == GlimmerSpecMode::Sampled {
+                                    if let Some(t) = sampled_probs_draft.take() { let _ = gpu.free_tensor(t); }
+                                    if let Some(t) = sampled_probs_target.take() { let _ = gpu.free_tensor(t); }
+                                    if let Some(t) = sampled_tau_draft.take() { let _ = gpu.free_tensor(t); }
+                                    if let Some(t) = sampled_z_draft.take() { let _ = gpu.free_tensor(t); }
+                                    if let Some(t) = sampled_tau_target.take() { let _ = gpu.free_tensor(t); }
+                                    if let Some(t) = sampled_z_target.take() { let _ = gpu.free_tensor(t); }
+                                }
                                 bundle.reset_session_state();
                                 m.conversation_tokens.clear();
                                 m.asst_turn_cache.clear();
@@ -31879,7 +32183,7 @@ fn generate_muse_glimmer(
                             cur_pos,
                             &glimmer_tap_layers(bundle.config.n_layers),
                             &mut bundle.target_hidden_host,
-                            Some(&mut logits_buf),
+                            None,
                         ) {
                             Ok(p) => p,
                             Err(e) => {
@@ -31888,6 +32192,14 @@ fn generate_muse_glimmer(
                                     id,
                                     format!("muse_glimmer verify failed: {e:?}"),
                                 );
+                                if spec_mode == GlimmerSpecMode::Sampled {
+                                    if let Some(t) = sampled_probs_draft.take() { let _ = gpu.free_tensor(t); }
+                                    if let Some(t) = sampled_probs_target.take() { let _ = gpu.free_tensor(t); }
+                                    if let Some(t) = sampled_tau_draft.take() { let _ = gpu.free_tensor(t); }
+                                    if let Some(t) = sampled_z_draft.take() { let _ = gpu.free_tensor(t); }
+                                    if let Some(t) = sampled_tau_target.take() { let _ = gpu.free_tensor(t); }
+                                    if let Some(t) = sampled_z_target.take() { let _ = gpu.free_tensor(t); }
+                                }
                                 let _ = reconcile_glimmer_mirror(
                                     bundle,
                                     &mut m.conversation_tokens,
@@ -31952,16 +32264,64 @@ fn generate_muse_glimmer(
                 };
                 let t_after_verify = t_window.elapsed();
                 // Accept via shared variables — sampled reuses the same emit/keep_rows/rollback code.
-                let (accept, bonus) = if spec_mode == GlimmerSpecMode::ChainSampled {
-                    hipfire_runtime::ddtree::naive_sample_chain(
-                        &logits_buf,
-                        &drafts,
-                        bundle.config.vocab_size,
+                let (accept, bonus) = if spec_mode == GlimmerSpecMode::Sampled {
+                    let n_verify_rows = block.len();
+                    let vocab_usize = bundle.config.vocab_size;
+                    let logits_sub = bundle.state.logits_batch.sub_offset(0, n_verify_rows * vocab_usize);
+                    let probs_sub = sampled_probs_target.as_ref().unwrap().sub_offset(0, n_verify_rows * vocab_usize);
+                    let tau_sub = sampled_tau_target.as_ref().unwrap().sub_offset(0, n_verify_rows);
+                    let z_sub = sampled_z_target.as_ref().unwrap().sub_offset(0, n_verify_rows);
+                    // min_p = 0.0 — the gate already refused min_p > 0; min_p's per-row floor would give the two sides different supports and break the residual domain.
+                    if let Err(e) = gpu.softmax_temp_topp_batched_into_f32(
+                        &logits_sub,
+                        &probs_sub,
+                        &tau_sub,
+                        &z_sub,
+                        vocab_usize,
+                        n_verify_rows,
                         temp,
                         top_p,
                         top_k,
-                        &mut chain_rng,
-                    )
+                        0.0,
+                    ) {
+                        emit_error_with_id(stdout, id, format!("muse_glimmer target softmax failed: {e:?}"));
+                        glimmer::forward::abort_device_capture_stage(&mut bundle.state);
+                        if spec_mode == GlimmerSpecMode::Sampled {
+                            if let Some(t) = sampled_probs_draft.take() { let _ = gpu.free_tensor(t); }
+                            if let Some(t) = sampled_probs_target.take() { let _ = gpu.free_tensor(t); }
+                            if let Some(t) = sampled_tau_draft.take() { let _ = gpu.free_tensor(t); }
+                            if let Some(t) = sampled_z_draft.take() { let _ = gpu.free_tensor(t); }
+                            if let Some(t) = sampled_tau_target.take() { let _ = gpu.free_tensor(t); }
+                            if let Some(t) = sampled_z_target.take() { let _ = gpu.free_tensor(t); }
+                        }
+                        bundle.reset_session_state();
+                        m.conversation_tokens.clear();
+                        m.asst_turn_cache.clear();
+                        m.seq_pos = 0;
+                        return;
+                    }
+                    let p_downloaded = match gpu.download_f32(&probs_sub) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            emit_error_with_id(stdout, id, format!("muse_glimmer target probs download failed: {e:?}"));
+                            glimmer::forward::abort_device_capture_stage(&mut bundle.state);
+                            if spec_mode == GlimmerSpecMode::Sampled {
+                                if let Some(t) = sampled_probs_draft.take() { let _ = gpu.free_tensor(t); }
+                                if let Some(t) = sampled_probs_target.take() { let _ = gpu.free_tensor(t); }
+                                if let Some(t) = sampled_tau_draft.take() { let _ = gpu.free_tensor(t); }
+                                if let Some(t) = sampled_z_draft.take() { let _ = gpu.free_tensor(t); }
+                                if let Some(t) = sampled_tau_target.take() { let _ = gpu.free_tensor(t); }
+                                if let Some(t) = sampled_z_target.take() { let _ = gpu.free_tensor(t); }
+                            }
+                            bundle.reset_session_state();
+                            m.conversation_tokens.clear();
+                            m.asst_turn_cache.clear();
+                            m.seq_pos = 0;
+                            return;
+                        }
+                    };
+                    p_rows_host = p_downloaded;
+                    glimmer_accept_rejection(&drafts, &q_rows_host, &q_at_drafted_host, &p_rows_host, vocab_usize, &mut chain_rng)
                 } else {
                     let ga = accept_greedy_prefix(&drafts, &picks, None);
                     let a = ga.accepted;
@@ -32009,7 +32369,7 @@ fn generate_muse_glimmer(
                 to_emit.extend_from_slice(&drafts[..accept]);
                 to_emit.push(bonus);
                 // Proven-able-to-fail check: corrupt one draft and show identity trips.
-                // Only meaningful for Greedy (sampled uses naive_sample_chain, not
+                // Only meaningful for Greedy (sampled uses glimmer_accept_rejection, not
                 // accept_greedy_prefix). Gate so sampled does not emit a spurious
                 // FAILED when the greedy comparison is not in use.
                 if spec_mode == GlimmerSpecMode::Greedy
@@ -32282,6 +32642,16 @@ fn generate_muse_glimmer(
                 }
             }
         } // !skip_spec_loop
+        // Free sampled probs buffers allocated ONCE per request (see allocation comment above).
+        // Greedy path never allocated them, so this is a no-op for greedy.
+        if spec_mode == GlimmerSpecMode::Sampled {
+            if let Some(t) = sampled_probs_draft.take() { let _ = gpu.free_tensor(t); }
+            if let Some(t) = sampled_probs_target.take() { let _ = gpu.free_tensor(t); }
+            if let Some(t) = sampled_tau_draft.take() { let _ = gpu.free_tensor(t); }
+            if let Some(t) = sampled_z_draft.take() { let _ = gpu.free_tensor(t); }
+            if let Some(t) = sampled_tau_target.take() { let _ = gpu.free_tensor(t); }
+            if let Some(t) = sampled_z_target.take() { let _ = gpu.free_tensor(t); }
+        }
         spec_windows = windows;
         spec_accepted = total_accepted;
         if windows > 0 {
@@ -32490,7 +32860,7 @@ fn generate_muse_glimmer(
         pending_done["tau"] = serde_json::json!((tau * 1000.0).round() / 1000.0);
         let mode_str = match spec_mode {
             GlimmerSpecMode::Greedy => "greedy",
-            GlimmerSpecMode::ChainSampled => "chain_sampled",
+            GlimmerSpecMode::Sampled => "sampled",
             GlimmerSpecMode::Off => "off",
         };
         pending_done["dflash_mode"] = serde_json::Value::String(mode_str.into());
@@ -32499,7 +32869,7 @@ fn generate_muse_glimmer(
         // still report the mode so the wire is unambiguous.
         let mode_str = match spec_mode {
             GlimmerSpecMode::Greedy => "greedy",
-            GlimmerSpecMode::ChainSampled => "chain_sampled",
+            GlimmerSpecMode::Sampled => "sampled",
             GlimmerSpecMode::Off => "off",
         };
         pending_done["dflash_mode"] = serde_json::Value::String(mode_str.into());
