@@ -2894,6 +2894,16 @@ pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_RM_PK_SRC: &str =
 /// Measurement-only; used exclusively by hipfire-arch-muse-glimmer.
 pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_RM_PIPE_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_gfx1100_muse_rm_pipe.hip");
+/// Muse Glimmer-owned RM2/BV6 gfx1100 residual GEMM with FP16 magic-bit
+/// nibble dequant (K2). Sibling of `GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_RM_PK_SRC`;
+/// removes nibble int→float→half conversions via magic-bit half2 construction.
+/// Symbols: exact-subtract (`…_magic_exact`) and folded-bias (`…_magic_fold16`).
+/// Exact gate/up only (M=19968, K=6656, batch=192). Measurement-only; used
+/// exclusively by hipfire-arch-muse-glimmer. Exact must oracle bitdiff0; fold16
+/// may be nonzero (report maxabs/maxrel).
+pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_RM_MAGIC_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_gfx1100_muse_rm_magic.hip");
+
 
 
 
