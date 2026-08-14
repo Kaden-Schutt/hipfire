@@ -3,8 +3,10 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 //
 // Muse Glimmer-owned multi-row batch-tiled gfx1100 HFQ4-G256 residual GEMM
-// (K2). Measurement-only family probing the gfx11 operand-ABI bottleneck:
-// baseline muse_bt reloads the same B half16 once per row tile; this kernel
+// (K2). RM2/BV6 is production for exact gfx1100 gate/up M=19968 K=6656 B=192
+// (via gemm_hfq4g256_batched_lmhead); other RM/BV instantiations remain
+// measurement-only probes of the gfx11 operand-ABI bottleneck: baseline
+// muse_bt reloads the same B half16 once per row tile; this kernel
 // keeps RM row tiles in one wave and reuses each B fragment across RM WMMA
 // calls so X traffic drops by ~RM while A dequant grows linearly with RM.
 //
@@ -30,7 +32,7 @@
 //
 // Grid:  [M/(16*RM), batch/(16*BV), 1]
 // Block: [32, 1, 1]. LDS: 0.
-// Instantiated: rm2_bv6, rm3_bv4, rm4_bv3, rm6_bv2 (RM*BV = 12).
+// Instantiated: rm2_bv6 (production gate/up B=192), rm3_bv4/rm4_bv3/rm6_bv2 (measurement-only).
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>

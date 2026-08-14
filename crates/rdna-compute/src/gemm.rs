@@ -11622,9 +11622,12 @@ impl Gpu {
 
     /// Muse Glimmer-owned row-reuse batch-tiled gfx1100 residual GEMM (K2).
     ///
-    /// Sibling of [`Self::gemm_hfq4g256_residual_muse_gfx1100`], NOT a replacement:
-    /// it touches no shared selector, heuristic, or tile constant, and nothing
-    /// outside hipfire-arch-muse-glimmer (or its measurement oracle) calls it.
+    /// Production for exact gate/up through [`Self::gemm_hfq4g256_batched_lmhead`]
+    /// when gfx1100 + M=19968 + K=6656 + B=192 with `rm=2` (symbol
+    /// `gemm_hfq4g256_residual_wmma_gfx1100_muse_rm2_bv6`). Other rm
+    /// instantiations (3/4/6 → BV 4/3/2) remain measurement-only. Sibling of
+    /// [`Self::gemm_hfq4g256_residual_muse_gfx1100`]; no shared selector,
+    /// heuristic, or tile constant beyond that exact production gate.
     ///
     /// Each wave owns RM row tiles × BV batch tiles with RM*BV=12. For each g/kt
     /// pair it loads/dequants one A fragment per row tile, loads each B half16
@@ -18971,6 +18974,18 @@ impl Gpu {
             return if arch.starts_with("gfx12") {
                 self.gemm_hfq4g256_residual_wmma_gfx12(a_raw, x, y, m, k, batch_size)
             } else {
+                // Exact gfx1100 gate/up (M=19968, K=6656, B=192): Muse RM2/BV6
+                // residual. Y is already zeroed once above; residual does Y+=.
+                // Ok(false) must not be treated as success — fall through.
+                if self.arch_caps.is_gfx1100()
+                    && m == 19_968
+                    && k == 6_656
+                    && batch_size == 192
+                    && self
+                        .gemm_hfq4g256_residual_muse_gfx1100_rm(a_raw, x, y, m, k, batch_size, 2)?
+                {
+                    return Ok(());
+                }
                 self.gemm_hfq4g256_residual_wmma(a_raw, x, y, m, k, batch_size)
             };
         }

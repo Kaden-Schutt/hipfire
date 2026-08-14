@@ -503,7 +503,10 @@ impl KernelCompiler {
     }
 
     fn module_flags(&self, name: &str) -> Vec<String> {
-        if self.arch == "gfx1151" && self.gfx1151_cumode_modules.contains(name) {
+        // Radiowave-selected spill-free RM2/BV6 schedule.
+        if self.arch == "gfx1100" && name == "gemm_hfq4g256_residual_wmma_gfx1100_muse_rm_bt" {
+            vec!["-mllvm".to_owned(), "-misched=gcn-iterative-ilp".to_owned()]
+        } else if self.arch == "gfx1151" && self.gfx1151_cumode_modules.contains(name) {
             vec!["-mcumode".to_owned()]
         } else {
             Vec::new()
@@ -1598,6 +1601,26 @@ mod tests {
 
         candidate.arch = "gfx1100".to_owned();
         assert!(candidate.module_flags("selected").is_empty());
+    }
+
+    #[test]
+    fn gfx1100_muse_rm_bt_uses_iterative_ilp_and_is_cache_keyed() {
+        let source = "__global__ void kernel() {}";
+        let module = "gemm_hfq4g256_residual_wmma_gfx1100_muse_rm_bt";
+        let mut gfx1100 = test_compiler("", "hipcc 7.2");
+        gfx1100.arch = "gfx1100".to_owned();
+        let control = test_compiler("", "hipcc 7.2");
+
+        assert_eq!(
+            gfx1100.module_flags(module),
+            vec!["-mllvm".to_owned(), "-misched=gcn-iterative-ilp".to_owned(),]
+        );
+        assert!(gfx1100.module_flags("other").is_empty());
+        assert!(control.module_flags(module).is_empty());
+        assert_ne!(
+            control.cache_hash(module, source),
+            gfx1100.cache_hash(module, source)
+        );
     }
 
     /// Write an executable fake hipcc that copies a canned blob to `-o` path,

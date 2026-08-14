@@ -2865,8 +2865,9 @@ pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_LDS_G256_SRC: &str =
 /// Sibling of `GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_BT_SRC`; each wave owns
 /// RM row tiles × BV batch tiles with RM*BV=12, loading each B half16 once per
 /// batch tile and reusing it across RM WMMA calls. Exact gate/up only
-/// (M=19968, K=6656, rm in {2,3,4,6}, batch % (16*BV) == 0). Measurement-only;
-/// used exclusively by hipfire-arch-muse-glimmer.
+/// (M=19968, K=6656, rm in {2,3,4,6}, batch % (16*BV) == 0). RM2/BV6 is
+/// production for gfx1100 B=192 gate/up via `gemm_hfq4g256_batched_lmhead`;
+/// other RM/BV instantiations remain measurement-only.
 pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_RM_BT_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_gfx1100_muse_rm_bt.hip");
 /// Muse Glimmer-owned row-reuse gfx1100 residual GEMM with half-broadcast A
