@@ -39,14 +39,14 @@ fn main() {
         }
         let start_pos = 10;
         let block: Vec<u32> = prompt_tokens[10..10 + b].to_vec();
-        let seq_picks = verify_block(&cfg, &weights, &mut state_seq, &mut gpu, &block, start_pos as u32).expect("seq verify");
+        let seq_picks = verify_block(&cfg, &weights, &mut state_seq, &mut gpu, &block, start_pos as u32, None).expect("seq verify");
 
         let mut state_bat = GlimmerState::new(&mut gpu, &cfg).expect("state");
         for (i, &tok) in prompt_tokens[..10].iter().enumerate() {
             decode_step(&cfg, &weights, &mut state_bat, &mut gpu, tok, i as u32).expect("decode");
         }
         let mut hidden_out = Vec::new();
-        let bat_picks = verify_block_with_capture(&cfg, &weights, &mut state_bat, &mut gpu, &block, start_pos as u32, &[], &mut hidden_out).expect("bat verify");
+        let bat_picks = verify_block_with_capture(&cfg, &weights, &mut state_bat, &mut gpu, &block, start_pos as u32, &[], &mut hidden_out, None).expect("bat verify");
         assert_eq!(seq_picks, bat_picks, "B={}: picks mismatch seq {:?} bat {:?}", b, seq_picks, bat_picks);
         eprintln!(" B={}: picks MATCH {:?}", b, &seq_picks[..seq_picks.len().min(4)]);
 

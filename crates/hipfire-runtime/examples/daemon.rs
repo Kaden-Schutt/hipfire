@@ -23650,6 +23650,40 @@ fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
         _ => GenerationRoute::Unknown,
     }
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GlimmerSpecMode {
+    Off,
+    Greedy,
+    ChainSampled,
+}
+
+/// Glimmer speculation admission. Greedy is the validated path; the sampled
+/// chain-sample path mirrors the arch 5/6 `chain_sample_route` conditions.
+fn glimmer_spec_admission(
+    has_drafter: bool,
+    max_tokens: usize,
+    temp: f32,
+    min_p: Option<f32>,
+    fast_sample_on: bool,
+    temp_spec_env_off: bool,
+    batched_logits_available: bool,
+) -> GlimmerSpecMode {
+    if !has_drafter || max_tokens <= 1 {
+        return GlimmerSpecMode::Off;
+    }
+    if temp <= 0.01 {
+        return GlimmerSpecMode::Greedy;
+    }
+    if temp > 1e-6
+        && fast_sample_on
+        && !temp_spec_env_off
+        && min_p.map_or(true, |p| p <= 0.0)
+        && batched_logits_available
+    {
+        return GlimmerSpecMode::ChainSampled;
+    }
+    GlimmerSpecMode::Off
+}
 
 #[inline]
 fn llama_qwen3_batched_prefill_eligible(
@@ -23715,6 +23749,93 @@ mod llama_batched_prefill_tests {
         assert_eq!(llama_prefill_sample_seed(42, 4, 0.0), 42);
         assert_eq!(llama_prefill_sample_seed(42, 1, 1.0), 42);
         assert_eq!(llama_prefill_sample_seed(42, 4, 1.0), 476_557_059);
+    }
+}
+#[cfg(test)]
+mod glimmer_spec_admission_tests {
+    use super::{glimmer_spec_admission, GlimmerSpecMode};
+
+    #[test]
+    fn greedy_at_temp_zero() {
+        let m = glimmer_spec_admission(true, 16, 0.0, None, true, false, true);
+        assert_eq!(m, GlimmerSpecMode::Greedy);
+        let m2 = glimmer_spec_admission(true, 16, 0.01, None, true, false, true);
+        assert_eq!(m2, GlimmerSpecMode::Greedy);
+    }
+
+    #[test]
+    fn chain_sampled_at_temp_one_with_defaults() {
+        let m = glimmer_spec_admission(true, 16, 1.0, None, true, false, true);
+        assert_eq!(m, GlimmerSpecMode::ChainSampled);
+    }
+
+    #[test]
+    fn off_when_min_p_present() {
+        let m = glimmer_spec_admission(true, 16, 1.0, Some(0.05), true, false, true);
+        assert_eq!(m, GlimmerSpecMode::Off);
+        // zero and None are allowed
+        let ok0 = glimmer_spec_admission(true, 16, 1.0, Some(0.0), true, false, true);
+        assert_eq!(ok0, GlimmerSpecMode::ChainSampled);
+        let ok_none = glimmer_spec_admission(true, 16, 1.0, None, true, false, true);
+        assert_eq!(ok_none, GlimmerSpecMode::ChainSampled);
+    }
+
+    #[test]
+    fn off_when_fast_sample_off() {
+        let m = glimmer_spec_admission(true, 16, 1.0, None, false, false, true);
+        assert_eq!(m, GlimmerSpecMode::Off);
+    }
+
+    #[test]
+    fn off_when_temp_spec_env_off() {
+        let m = glimmer_spec_admission(true, 16, 1.0, None, true, true, true);
+        assert_eq!(m, GlimmerSpecMode::Off);
+    }
+
+    #[test]
+    fn off_when_batched_logits_unavailable() {
+        let m = glimmer_spec_admission(true, 16, 1.0, None, true, false, false);
+        assert_eq!(m, GlimmerSpecMode::Off);
+        // greedy does NOT require batched logits (still Greedy)
+        let g = glimmer_spec_admission(true, 16, 0.005, None, true, false, false);
+        assert_eq!(g, GlimmerSpecMode::Greedy);
+    }
+
+    #[test]
+    fn off_when_max_tokens_one() {
+        let m = glimmer_spec_admission(true, 1, 0.0, None, true, false, true);
+        assert_eq!(m, GlimmerSpecMode::Off);
+        let m2 = glimmer_spec_admission(true, 1, 1.0, None, true, false, true);
+        assert_eq!(m2, GlimmerSpecMode::Off);
+    }
+
+    #[test]
+    fn off_when_no_drafter() {
+        let m = glimmer_spec_admission(false, 16, 0.0, None, true, false, true);
+        assert_eq!(m, GlimmerSpecMode::Off);
+        let m2 = glimmer_spec_admission(false, 16, 1.0, None, true, false, true);
+        assert_eq!(m2, GlimmerSpecMode::Off);
+    }
+
+    #[test]
+    fn temp_boundary() {
+        assert_eq!(
+            glimmer_spec_admission(true, 16, 0.01, None, true, false, true),
+            GlimmerSpecMode::Greedy
+        );
+        assert_eq!(
+            glimmer_spec_admission(true, 16, 0.02, None, true, false, true),
+            GlimmerSpecMode::ChainSampled
+        );
+        // just above greedy threshold but at/under 1e-6 should be Off, not sampled
+        assert_eq!(
+            glimmer_spec_admission(true, 16, 1e-6, None, true, false, true),
+            GlimmerSpecMode::Greedy
+        );
+        assert_eq!(
+            glimmer_spec_admission(true, 16, 5e-7, None, true, false, true),
+            GlimmerSpecMode::Greedy
+        );
     }
 }
 
@@ -23858,7 +23979,6 @@ fn generate(
         );
         return;
     }
-
     // arch_id=14 (Muse Glimmer dense): eager AR path. Same shape as the
     // gemma4 short-circuit: bypass the DFlash/spec/sampler-budget scaffolding
     // below. Without this arm arch 14 falls through to the Qwen AR arm.
@@ -23870,8 +23990,6 @@ fn generate(
             pflash_state,
             pflash_cfg,
             user_explicit_sampling,
-            top_k,
-            min_p,
             cactus_delta,
         );
         let _ = (
@@ -23891,6 +24009,7 @@ fn generate(
             temp,
             top_p,
             top_k.map(|k| k as usize).unwrap_or(0),
+            min_p,
             max_tokens,
             max_think_tokens,
             think_mode,
@@ -30716,6 +30835,7 @@ fn generate_muse_glimmer(
     temp: f32,
     top_p: f32,
     top_k: usize,
+    min_p: Option<f32>,
     max_tokens: usize,
     max_think_tokens: usize,
     think_mode: hipfire_runtime::prompt_frame::ThinkMode,
@@ -31159,12 +31279,33 @@ fn generate_muse_glimmer(
     let mut glimmer_emitted_ids: Vec<u32> = Vec::new();
     let mut glimmer_visible_acc: String = String::new();
     let mut glimmer_tool_acc: String = String::new();
-    // Speculative path: when a DFlash drafter (arch 23, 5-layer diffusion) is
-    // present and temp==0 (greedy), drive the shared `accept_greedy_prefix`
-    // rule. Otherwise fall back to AR. The drafter being present is gated by
-    // HIPFIRE_DFLASH_DRAFT / dflash_mode=off (daemon.rs:13118), so AR is
-    // untouched when absent — the null-result trap Main flagged.
-    let use_spec = bundle.drafter.is_some() && temp <= 0.01 && max_tokens > 1;
+    // Speculative path: greedy is the validated 3.17x path; sampled chain-sample
+    // (temp>0) is gated on dflash_fast_sample + batched logits + !min_p.
+    // The drafter presence is gated by HIPFIRE_DFLASH_DRAFT / dflash_mode=off
+    // (daemon.rs:13118), so AR is untouched when absent.
+    let batched_logits_available =
+        hipfire_arch_muse_glimmer::forward::glimmer_batched_logits_available(
+            &bundle.config,
+            &bundle.weights,
+        );
+    let fast_sample_on = hipfire_runtime::config::get().dflash_fast_sample;
+    let temp_spec_env_off =
+        std::env::var("HIPFIRE_DFLASH_TEMP_SPEC").ok().as_deref() == Some("0");
+    let spec_mode = glimmer_spec_admission(
+        bundle.drafter.is_some(),
+        max_tokens,
+        temp,
+        min_p,
+        fast_sample_on,
+        temp_spec_env_off,
+        batched_logits_available,
+    );
+    let use_spec = spec_mode != GlimmerSpecMode::Off;
+    // Sampled chain needs its own xorshift state seeded from the same source as
+    // the AR rng so a fixed request seed stays reproducible. Do not use 0x13579BDF.
+    let mut chain_rng: u64 = seed;
+    // Logits buffer hoisted outside the window loop and reused — never reallocated per window.
+    let mut logits_buf: Vec<f32> = Vec::new();
     // Shared by native AR, profit probes, and post-retirement AR tail.
     let top_k_opt = if top_k > 0 { Some(top_k as u32) } else { None };
     let gpu_sample = !matches!(
@@ -31201,7 +31342,6 @@ fn generate_muse_glimmer(
     }
     let mut profit_guard =
         GlimmerSpecProfitGuard::new(use_spec && !profit_guard_env_off && !profit_guard_diag_off);
-
     if use_spec {
         // Off-by-one note: target_layer_ids [1,13,25,37,49] are 0-based layer
         // indices (dflash_extract_layer_ids(52,5) with start=1.0, end=49.0,
@@ -31670,6 +31810,7 @@ fn generate_muse_glimmer(
                     &bundle.state.logits,
                     &bundle.state.logits_batch,
                     &bundle.state.argmax_batch,
+                    None,
                 ) {
                     Ok(p) => p,
                     Err(e) => {
@@ -31699,7 +31840,64 @@ fn generate_muse_glimmer(
                 let mut block = Vec::with_capacity(block_size);
                 block.push(last_pick);
                 block.extend_from_slice(&drafts);
-                let picks = if device_capture {
+                // For ChainSampled, pass Some(&mut logits_buf) so the verify path
+                // copies the per-position target logits (row-major [pos][vocab])
+                // needed by naive_sample_chain. Greedy passes None and pays nothing.
+                let picks = if spec_mode == GlimmerSpecMode::ChainSampled {
+                    if device_capture {
+                        match glimmer::forward::verify_block_with_device_capture(
+                            &bundle.config,
+                            &bundle.weights,
+                            &mut bundle.state,
+                            gpu,
+                            &block,
+                            cur_pos,
+                            Some(&mut logits_buf),
+                        ) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                emit_error_with_id(
+                                    stdout,
+                                    id,
+                                    format!("muse_glimmer verify failed: {e:?}"),
+                                );
+                                glimmer::forward::abort_device_capture_stage(&mut bundle.state);
+                                bundle.reset_session_state();
+                                m.conversation_tokens.clear();
+                                m.asst_turn_cache.clear();
+                                m.seq_pos = 0;
+                                return;
+                            }
+                        }
+                    } else {
+                        match glimmer::forward::verify_block_with_capture(
+                            &bundle.config,
+                            &bundle.weights,
+                            &mut bundle.state,
+                            gpu,
+                            &block,
+                            cur_pos,
+                            &glimmer_tap_layers(bundle.config.n_layers),
+                            &mut bundle.target_hidden_host,
+                            Some(&mut logits_buf),
+                        ) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                emit_error_with_id(
+                                    stdout,
+                                    id,
+                                    format!("muse_glimmer verify failed: {e:?}"),
+                                );
+                                let _ = reconcile_glimmer_mirror(
+                                    bundle,
+                                    &mut m.conversation_tokens,
+                                    &mut m.seq_pos,
+                                );
+                                return;
+                            }
+                        }
+                    }
+                } else if device_capture {
                     match glimmer::forward::verify_block_with_device_capture(
                         &bundle.config,
                         &bundle.weights,
@@ -31707,6 +31905,7 @@ fn generate_muse_glimmer(
                         gpu,
                         &block,
                         cur_pos,
+                        None,
                     ) {
                         Ok(p) => p,
                         Err(e) => {
@@ -31716,7 +31915,6 @@ fn generate_muse_glimmer(
                                 format!("muse_glimmer verify failed: {e:?}"),
                             );
                             glimmer::forward::abort_device_capture_stage(&mut bundle.state);
-                            // Device verify/capture transaction errors (incl. poisoned log) are fail-closed.
                             bundle.reset_session_state();
                             m.conversation_tokens.clear();
                             m.asst_turn_cache.clear();
@@ -31734,6 +31932,7 @@ fn generate_muse_glimmer(
                         cur_pos,
                         &glimmer_tap_layers(bundle.config.n_layers),
                         &mut bundle.target_hidden_host,
+                        None,
                     ) {
                         Ok(p) => p,
                         Err(e) => {
@@ -31752,17 +31951,36 @@ fn generate_muse_glimmer(
                     }
                 };
                 let t_after_verify = t_window.elapsed();
-                // Accept via shared rule — commit is delayed until after routing.
-                let ga = accept_greedy_prefix(&drafts, &picks, None);
-                total_accepted += ga.accepted;
+                // Accept via shared variables — sampled reuses the same emit/keep_rows/rollback code.
+                let (accept, bonus) = if spec_mode == GlimmerSpecMode::ChainSampled {
+                    hipfire_runtime::ddtree::naive_sample_chain(
+                        &logits_buf,
+                        &drafts,
+                        bundle.config.vocab_size,
+                        temp,
+                        top_p,
+                        top_k,
+                        &mut chain_rng,
+                    )
+                } else {
+                    let ga = accept_greedy_prefix(&drafts, &picks, None);
+                    let a = ga.accepted;
+                    let b = if a < drafts.len() {
+                        picks[a]
+                    } else {
+                        picks[picks.len() - 1]
+                    };
+                    (a, b)
+                };
+                total_accepted += accept;
                 windows += 1;
                 // Honest tau logging per window (parent re-runs perf gate)
-                if windows % 16 == 0 || ga.accepted + 1 < block_size {
+                if windows % 16 == 0 || accept + 1 < block_size {
                     eprintln!(
                         "[glimmer-spec] window {}: proposed {} accepted {} tau {:.2} cur_pos {}",
                         windows,
                         drafts.len(),
-                        ga.accepted,
+                        accept,
                         if windows > 0 {
                             total_accepted as f32 / windows as f32
                         } else {
@@ -31771,12 +31989,6 @@ fn generate_muse_glimmer(
                         cur_pos
                     );
                 }
-                let accept = ga.accepted;
-                let bonus = if accept < drafts.len() {
-                    picks[accept]
-                } else {
-                    picks[picks.len() - 1]
-                };
                 if do_window_timing {
                     let t_total = t_window.elapsed();
                     eprintln!(
@@ -31797,19 +32009,23 @@ fn generate_muse_glimmer(
                 to_emit.extend_from_slice(&drafts[..accept]);
                 to_emit.push(bonus);
                 // Proven-able-to-fail check: corrupt one draft and show identity trips.
-                if std::env::var("HIPFIRE_GLIMMER_SPEC_PERTURB")
-                    .ok()
-                    .as_deref()
-                    == Some("1")
+                // Only meaningful for Greedy (sampled uses naive_sample_chain, not
+                // accept_greedy_prefix). Gate so sampled does not emit a spurious
+                // FAILED when the greedy comparison is not in use.
+                if spec_mode == GlimmerSpecMode::Greedy
+                    && std::env::var("HIPFIRE_GLIMMER_SPEC_PERTURB")
+                        .ok()
+                        .as_deref()
+                        == Some("1")
                     && !drafts.is_empty()
                 {
                     let mut perturbed = drafts.clone();
                     perturbed[0] = picks[0];
                     let ga2 = accept_greedy_prefix(&perturbed, &picks, None);
-                    if ga2.accepted == ga.accepted {
-                        eprintln!("[glimmer-spec] PERTURB CHECK FAILED: forcing draft[0]=target_pick[0] did not change accept {} (picks[0]={}) — comparison not sensitive or drafter never ran", ga.accepted, picks[0]);
+                    if ga2.accepted == accept {
+                        eprintln!("[glimmer-spec] PERTURB CHECK FAILED: forcing draft[0]=target_pick[0] did not change accept {} (picks[0]={}) — comparison not sensitive or drafter never ran", accept, picks[0]);
                     } else {
-                        eprintln!("[glimmer-spec] PERTURB CHECK OK: forcing draft[0]=target_pick[0] changed accept {} -> {} — comparison can fail, drafter ran (windows={})", ga.accepted, ga2.accepted, windows);
+                        eprintln!("[glimmer-spec] PERTURB CHECK OK: forcing draft[0]=target_pick[0] changed accept {} -> {} — comparison can fail, drafter ran (windows={})", accept, ga2.accepted, windows);
                     }
                 }
                 // Emit via Harmony router: header stripped, reasoning vs token, eom handling
@@ -31874,12 +32090,11 @@ fn generate_muse_glimmer(
                     }
                 }
                 // keep_rows = seed + actually retained accepted input rows; bonus uncaptured.
-                let keep_rows = (ga.accepted + 1).min(
+                let keep_rows = (accept + 1).min(
                     m.conversation_tokens
                         .len()
                         .saturating_sub(window_start_cur_pos),
                 );
-                // Spec cost for the profit guard: draft+verify+commit/rewind only.
                 // Wire routing above is excluded from S.
                 let pre_route_ns = t_after_verify.as_nanos();
                 let t_commit = std::time::Instant::now();
@@ -31926,7 +32141,7 @@ fn generate_muse_glimmer(
                 }
                 // Full non-terminal window eligible for profit evidence: keep_rows
                 // matches accepted+1 and one useful B=1 step still fits.
-                let full_window = keep_rows == ga.accepted + 1
+                let full_window = keep_rows == accept + 1
                     && keep_rows > 0
                     && generated_count < max_tokens
                     && (bundle.state.n_tokens as usize) < cache_cap;
@@ -32092,9 +32307,10 @@ fn generate_muse_glimmer(
     // Common AR tail: native AR and post-retirement handoff only.
     // Retirement forces greedy; native AR keeps the request's sampling params.
     if let Some(mut next_tok) = ar_pending.take() {
-        let ar_temp = if use_spec { 0.0 } else { temp };
-        let ar_top_p = if use_spec { 1.0 } else { top_p };
-        let ar_top_k_opt = if use_spec { None } else { top_k_opt };
+        // Greedy spec forces greedy AR tail; sampled spec and native AR use the request's real sampling.
+        let ar_temp = if spec_mode == GlimmerSpecMode::Greedy { 0.0 } else { temp };
+        let ar_top_p = if spec_mode == GlimmerSpecMode::Greedy { 1.0 } else { top_p };
+        let ar_top_k_opt = if spec_mode == GlimmerSpecMode::Greedy { None } else { top_k_opt };
 
         loop {
             if generated_count >= max_tokens {
@@ -32272,6 +32488,21 @@ fn generate_muse_glimmer(
         pending_done["dflash"] = serde_json::Value::Bool(true);
         pending_done["cycles"] = serde_json::json!(spec_windows);
         pending_done["tau"] = serde_json::json!((tau * 1000.0).round() / 1000.0);
+        let mode_str = match spec_mode {
+            GlimmerSpecMode::Greedy => "greedy",
+            GlimmerSpecMode::ChainSampled => "chain_sampled",
+            GlimmerSpecMode::Off => "off",
+        };
+        pending_done["dflash_mode"] = serde_json::Value::String(mode_str.into());
+    } else if use_spec {
+        // Spec was admitted but produced zero windows (e.g. immediate stop);
+        // still report the mode so the wire is unambiguous.
+        let mode_str = match spec_mode {
+            GlimmerSpecMode::Greedy => "greedy",
+            GlimmerSpecMode::ChainSampled => "chain_sampled",
+            GlimmerSpecMode::Off => "off",
+        };
+        pending_done["dflash_mode"] = serde_json::Value::String(mode_str.into());
     }
     if use_spec {
         pending_done["dflash_profit_guard"] =

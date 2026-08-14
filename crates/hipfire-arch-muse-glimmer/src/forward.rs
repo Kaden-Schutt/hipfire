@@ -1024,12 +1024,27 @@ pub fn verify_block(
     gpu: &mut Gpu,
     block: &[u32],
     position: u32,
+    logits_out: Option<&mut Vec<f32>>,
 ) -> Result<Vec<u32>, String> {
+    if logits_out.is_some() && !glimmer_batched_logits_available(cfg, weights) {
+        return Err(format!(
+            "glimmer verify_block: logits_out requires Q8 lm_head with batched path enabled (lm_head dtype {:?}, batched_lm_head_enabled={})",
+            weights.lm_head.gpu_dtype,
+            batched_lm_head_enabled()
+        ));
+    }
+    let mut logits_sink = logits_out;
+    if let Some(sink) = logits_sink.as_mut() {
+        sink.clear();
+    }
     let mut picks = Vec::with_capacity(block.len());
     for (i, &tok) in block.iter().enumerate() {
         let pos = position + i as u32;
         // embed (WITH norm — verify is AR) → layers → final_norm → lm_head → scale → softcap
         let logits = decode_step(cfg, weights, state, gpu, tok, pos)?;
+        if let Some(sink) = logits_sink.as_mut() {
+            sink.extend_from_slice(&logits);
+        }
         let pick = logits
             .iter()
             .enumerate()
@@ -1625,6 +1640,13 @@ fn prefill_proj_gemm_batched_prerotated(
         }
     }
 }
+/// True iff a `Some(logits_out)` request can be served (Q8 lm_head + batched
+/// path enabled). Mirrors the exact condition used inside the function below.
+pub fn glimmer_batched_logits_available(cfg: &GlimmerConfig, weights: &GlimmerWeights) -> bool {
+    let _ = cfg;
+    weights.lm_head.gpu_dtype == DType::Q8_0 && batched_lm_head_enabled()
+}
+
 /// Shared lm_head routine for draft and verify. `hidden_batch` is [B*hidden]
 /// already RMSNormed (the lm_head input). Returns argmax picks for rows
 /// [0..batch) in order. Uses batched Q8 path when enabled and dtype is
@@ -1633,6 +1655,10 @@ fn prefill_proj_gemm_batched_prerotated(
 /// This is the single source of truth for draft and verify so they cannot
 /// diverge on near-ties due to different accumulation order (the Q8 vs
 /// per-row flip that halved tau on the Q8-head artifact).
+///
+/// `logits_out`: when `Some`, receives `batch * cfg.vocab_size` f32 target
+/// logits in row-major [pos][vocab] order. Q8 lm_head only; returns Err if
+/// `Some` is passed while the batched Q8 path is unavailable.
 pub fn glimmer_lm_head_picks(
     gpu: &mut Gpu,
     cfg: &GlimmerConfig,
@@ -1642,10 +1668,14 @@ pub fn glimmer_lm_head_picks(
     logits_scratch: &GpuTensor,
     logits_batch: &GpuTensor,
     argmax_batch: &GpuTensor,
+    logits_out: Option<&mut Vec<f32>>,
 ) -> Result<Vec<u32>, String> {
     let dim = cfg.dim;
     let vocab = cfg.vocab_size;
     if batch == 0 {
+        if let Some(sink) = logits_out {
+            sink.clear();
+        }
         return Ok(Vec::new());
     }
     if batch > GLIMMER_MAX_SPEC_BLOCK {
@@ -1654,9 +1684,15 @@ pub fn glimmer_lm_head_picks(
         ));
     }
     let is_q8_lm = weights.lm_head.gpu_dtype == DType::Q8_0 && batched_lm_head_enabled();
+    if logits_out.is_some() && !is_q8_lm {
+        return Err(format!(
+            "glimmer lm_head_picks: logits_out requires Q8 lm_head with batched path enabled (lm_head dtype {:?}, batched_lm_head_enabled={})",
+            weights.lm_head.gpu_dtype,
+            batched_lm_head_enabled()
+        ));
+    }
     let mut picks = Vec::with_capacity(batch);
     if is_q8_lm {
-        // Batched Q8: one GEMM reads lm_head once for all B rows (WMMA on gfx12).
         // Fallback to per-row if batched disabled via HIPFIRE_GLIMMER_BATCHED_LM_HEAD=0.
         // Persistent buffer, NOT a per-call alloc. A cold hipMalloc of this
         // ~12.9 MB is slow and synchronizing, and it was the entire reason the
@@ -1682,9 +1718,17 @@ pub fn glimmer_lm_head_picks(
             gpu.logit_softcap_f32(&logits_b, batch * vocab, cfg.final_logit_softcapping)
                 .map_err(|e| format!("glimmer lm_head_picks softcap: {e:?}"))?;
         }
+        if let Some(sink) = logits_out {
+            sink.clear();
+            sink.resize(batch * vocab, 0.0);
+            let bytes: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(sink.as_mut_ptr() as *mut u8, batch * vocab * 4)
+            };
+            gpu.hip
+                .memcpy_dtoh(bytes, &logits_b.buf)
+                .map_err(|e| format!("glimmer lm_head_picks logits dtoh: {e:?}"))?;
+        }
         let argmax_view = argmax_batch.sub_offset(0, batch);
-        gpu.argmax_f32_batched(&logits_b, &argmax_view, vocab, batch)
-            .map_err(|e| format!("glimmer lm_head_picks argmax_batched: {e:?}"))?;
         let mut host_idx = vec![0i32; batch];
         {
             let bytes: &mut [u8] = unsafe {
@@ -1780,6 +1824,7 @@ pub fn verify_block_with_capture(
     position: u32,
     capture_layers: &[usize],
     hidden_out: &mut Vec<f32>,
+    logits_out: Option<&mut Vec<f32>>,
 ) -> Result<Vec<u32>, String> {
     verify_block_capture_impl(
         cfg,
@@ -1792,6 +1837,7 @@ pub fn verify_block_with_capture(
             layers: capture_layers,
             hidden_out,
         },
+        logits_out,
     )
 }
 
@@ -1799,8 +1845,6 @@ pub fn verify_block_with_capture(
 /// log. Stages all B rows (`finish_verify` → VerifyReady); the caller later
 /// commits the accepted prefix via [`commit_device_verify_capture`].
 ///
-/// Sets provisional `state.n_tokens = position + B`. On error aborts the stage
-/// and restores `n_tokens` to `position`.
 pub fn verify_block_with_device_capture(
     cfg: &GlimmerConfig,
     weights: &GlimmerWeights,
@@ -1808,6 +1852,7 @@ pub fn verify_block_with_device_capture(
     gpu: &mut Gpu,
     block: &[u32],
     position: u32,
+    logits_out: Option<&mut Vec<f32>>,
 ) -> Result<Vec<u32>, String> {
     verify_block_capture_impl(
         cfg,
@@ -1817,6 +1862,7 @@ pub fn verify_block_with_device_capture(
         block,
         position,
         CaptureBackend::Device,
+        logits_out,
     )
 }
 
@@ -1828,9 +1874,13 @@ fn verify_block_capture_impl(
     block: &[u32],
     position: u32,
     mut capture: CaptureBackend<'_>,
+    logits_out: Option<&mut Vec<f32>>,
 ) -> Result<Vec<u32>, String> {
     let b = block.len();
     if b == 0 {
+        if let Some(sink) = logits_out {
+            sink.clear();
+        }
         return Ok(Vec::new());
     }
     if b > GLIMMER_MAX_SPEC_BLOCK {
@@ -2377,6 +2427,7 @@ fn verify_block_capture_impl(
             &state.logits,
             &state.logits_batch,
             &state.argmax_batch,
+            logits_out,
         )?;
         let t_after_lm = t_verify_start.elapsed();
         if do_timing {
