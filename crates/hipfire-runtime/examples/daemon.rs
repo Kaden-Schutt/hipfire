@@ -13697,23 +13697,6 @@ fn main() {
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string());
 
-                let requested_kv_backend = kv_backend_override
-                    .as_deref()
-                    .unwrap_or("contiguous")
-                    .to_ascii_lowercase();
-                if tp > 1 && requested_kv_backend != "contiguous" {
-                    emit_uncorrelated_error(
-                        &mut stdout,
-                        None,
-                        &format!("KV backend '{}' requires tp=1", requested_kv_backend),
-                        "unsupported",
-                        false,
-                        false,
-                    );
-                    let _ = stdout.flush();
-                    continue;
-                }
-
                 let deepseek4_experts_per_token = msg
                     .get("params")
                     .and_then(|p| p.get("deepseek4_experts_per_token"))
@@ -13758,6 +13741,7 @@ fn main() {
                         max_seq,
                         tp,
                         kv_mode_override.as_deref(),
+                        kv_backend_override.as_deref(),
                     )
                 } else {
                     hipfire_loader::load_model_with_gemma4_drafter(

@@ -223,6 +223,86 @@ impl ModelEntry {
             _ => None,
         }
     }
+
+    /// Lower this entry's load/sampling defaults into a sparse config layer.
+    ///
+    /// Starts from [`RecommendedSettings::config_layer`] when present (sampling
+    /// and reasoning only), then overlays the entry-level load defaults onto
+    /// their canonical keys. Callers merge this under `RegistryModel` precedence
+    /// so global/model/one-shot user config still wins.
+    pub fn config_layer(&self) -> std::result::Result<ConfigLayer, String> {
+        let mut layer = match &self.recommended_settings {
+            Some(settings) => settings.config_layer()?,
+            None => ConfigLayer::default(),
+        };
+        if let Some(mode) = &self.default_kv_mode {
+            layer
+                .set("memory.kv_cache", ConfigValue::String(mode.clone()))
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(layer)
+    }
+}
+
+/// Tag-aware registry config layer. Starts from [`ModelEntry::config_layer`]
+/// then applies automatic load policy by canonical tag. This is the single
+/// canonical place for tag policy so validation and CLI stay in sync.
+///
+/// Policy (static; no registry/v1 wire fields):
+/// - exact family before ':' in {qwen3.5,qwen3.6,qwen3.8} and tag not containing
+///   `draft`/`dflash` => `memory.kv_backend=vmm`, `memory.max_seq=262144`,
+///   `generation.max_tokens=81920`
+/// - exact family before ':' in {deepseek-v4-flash,deepseek-v4-flash-preview}
+///   and tag not containing `draft`/`dflash` => `memory.kv_backend=vmm`,
+///   `memory.max_seq=1048576`, `generation.max_tokens=393216`
+/// - exact tag `muse-glimmer` or `muse-glimmer:fast` => `memory.kv_backend=vmm`,
+///   `memory.max_seq=131072` (no invented `generation.max_tokens`)
+/// - original `qwen3:*`, draft/dflash sidecars, and `muse-glimmer:draft` receive
+///   no automatic policy
+///
+/// Explicit global/model/one-shot user config remains higher precedence than
+/// this registry layer.
+pub fn config_layer_for_tag(
+    tag: &str,
+    entry: &ModelEntry,
+) -> std::result::Result<ConfigLayer, String> {
+    let mut layer = entry.config_layer()?;
+    let family = tag.split(':').next().unwrap_or(tag);
+    let is_sidecar = tag.contains("draft") || tag.contains("dflash");
+    let is_qwen_tag_policy = matches!(family, "qwen3.5" | "qwen3.6" | "qwen3.8") && !is_sidecar;
+    if is_qwen_tag_policy {
+        layer
+            .set("memory.kv_backend", ConfigValue::String("vmm".into()))
+            .map_err(|error| error.to_string())?;
+        layer
+            .set("memory.max_seq", ConfigValue::Integer(262144))
+            .map_err(|error| error.to_string())?;
+        layer
+            .set("generation.max_tokens", ConfigValue::Integer(81920))
+            .map_err(|error| error.to_string())?;
+    }
+    let is_deepseek_tag_policy =
+        matches!(family, "deepseek-v4-flash" | "deepseek-v4-flash-preview") && !is_sidecar;
+    if is_deepseek_tag_policy {
+        layer
+            .set("memory.kv_backend", ConfigValue::String("vmm".into()))
+            .map_err(|error| error.to_string())?;
+        layer
+            .set("memory.max_seq", ConfigValue::Integer(1048576))
+            .map_err(|error| error.to_string())?;
+        layer
+            .set("generation.max_tokens", ConfigValue::Integer(393216))
+            .map_err(|error| error.to_string())?;
+    }
+    if matches!(tag, "muse-glimmer" | "muse-glimmer:fast") {
+        layer
+            .set("memory.kv_backend", ConfigValue::String("vmm".into()))
+            .map_err(|error| error.to_string())?;
+        layer
+            .set("memory.max_seq", ConfigValue::Integer(131072))
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(layer)
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -299,18 +379,11 @@ impl RegistryV1 {
                     )));
                 }
             }
-            if let Some(mode) = entry.default_kv_mode.as_deref() {
-                let mut layer = ConfigLayer::default();
-                layer
-                    .set("memory.kv_cache", ConfigValue::String(mode.to_owned()))
-                    .map_err(|error| fail(format!("model '{tag}': {error}")))?;
-            }
             if let Some(settings) = &entry.recommended_settings {
                 validate_recommendations(tag, settings).map_err(fail)?;
-                settings
-                    .config_layer()
-                    .map_err(|error| fail(format!("model '{tag}': {error}")))?;
             }
+            config_layer_for_tag(tag, entry)
+                .map_err(|error| fail(format!("model '{tag}': {error}")))?;
             if let Some(profiles) = &entry.sampling_profiles {
                 for (name, settings) in [
                     ("general", &profiles.general),
@@ -623,7 +696,11 @@ mod tests {
         assert_eq!(tag, "muse-glimmer");
         assert_eq!(model.arch_id, Some(14));
         assert_eq!(model.file, "muse-glimmer-30b.mq4");
-        for alias in ["muse-glimmer:30b", "muse-glimmer:latest", "muse-glimmer:quality"] {
+        for alias in [
+            "muse-glimmer:30b",
+            "muse-glimmer:latest",
+            "muse-glimmer:quality",
+        ] {
             let (resolved, _) = registry
                 .model(alias)
                 .unwrap_or_else(|| panic!("{alias} must resolve"));
@@ -636,7 +713,10 @@ mod tests {
         assert_eq!(fast_tag, "muse-glimmer:fast");
         assert_eq!(fast.file, "muse-glimmer-30b.mq4r");
         assert_eq!(fast.arch_id, Some(14));
-        assert_ne!(fast.file, model.file, "the two SKUs are different artifacts");
+        assert_ne!(
+            fast.file, model.file,
+            "the two SKUs are different artifacts"
+        );
 
         // The drafter is arch 23 and pairs with either SKU.
         let (draft_tag, draft) = registry.model("muse-glimmer:draft").unwrap();
@@ -662,6 +742,97 @@ mod tests {
         // deliberately absent rather than invented.
         assert!(model.sampling_profile("coding").is_none());
         assert!(model.sampling_profile("instruct").is_none());
+    }
+
+    /// Pins Qwen3.8-27B's release contract: aliases, artifact identity, arch/quant,
+    /// default KV, and the upstream sampling card (including reasoning effort/budget).
+    #[test]
+    fn bundled_qwen38_matches_the_release_contract() {
+        let registry = bundled().unwrap();
+        let (tag, model) = registry.model("qwen3.8:27b").unwrap();
+        assert_eq!(tag, "qwen3.8:27b");
+        assert_eq!(model.file, "qwen3.8-27b.mq4");
+        assert_eq!(model.arch_id, Some(5));
+        assert_eq!(model.quant.as_deref(), Some("mq4"));
+        assert_eq!(model.default_kv_mode.as_deref(), Some("q8"));
+
+        for alias in ["qwen3.8", "qwen3.8:latest"] {
+            let (resolved, _) = registry
+                .model(alias)
+                .unwrap_or_else(|| panic!("{alias} must resolve"));
+            assert_eq!(
+                resolved, "qwen3.8:27b",
+                "{alias} resolves to the canonical tag"
+            );
+        }
+
+        let settings = model
+            .recommended_settings
+            .as_ref()
+            .expect("qwen3.8:27b must carry recommended_settings");
+        assert_eq!(settings.temperature, Some(1.0));
+        assert_eq!(settings.top_p, Some(0.95));
+        assert_eq!(settings.top_k, Some(20));
+        assert_eq!(settings.min_p, Some(0.0));
+        assert_eq!(settings.presence_penalty, Some(0.0));
+        assert_eq!(settings.repeat_penalty, Some(1.0));
+        assert_eq!(settings.reasoning_effort.as_deref(), Some("xhigh"));
+        assert_eq!(settings.thinking_budget.as_deref(), Some("uncapped"));
+
+        // `general` must resolve to the same contract, so `--sampling registry:general`
+        // and the bare default cannot diverge.
+        let general = model
+            .sampling_profile("general")
+            .expect("general profile resolves");
+        assert_eq!(general.temperature, Some(1.0));
+        assert_eq!(general.top_p, Some(0.95));
+        assert_eq!(general.top_k, Some(20));
+        assert_eq!(general.min_p, Some(0.0));
+        assert_eq!(general.presence_penalty, Some(0.0));
+        assert_eq!(general.repeat_penalty, Some(1.0));
+        assert_eq!(general.reasoning_effort.as_deref(), Some("xhigh"));
+        assert_eq!(general.thinking_budget.as_deref(), Some("uncapped"));
+
+        // Tag policy provides VMM + 262K + 81920 for Qwen3.8 canonical tags.
+        let layer =
+            config_layer_for_tag(tag, model).expect("qwen3.8:27b tag policy lowers cleanly");
+        assert_eq!(
+            layer.get("memory.kv_cache"),
+            Some(&ConfigValue::String("q8".into()))
+        );
+        assert_eq!(
+            layer.get("memory.kv_backend"),
+            Some(&ConfigValue::String("vmm".into()))
+        );
+        assert_eq!(
+            layer.get("memory.max_seq"),
+            Some(&ConfigValue::Integer(262144))
+        );
+        assert_eq!(
+            layer.get("generation.max_tokens"),
+            Some(&ConfigValue::Integer(81920))
+        );
+        assert_eq!(
+            layer.get("reasoning.effort"),
+            Some(&ConfigValue::String("xhigh".into()))
+        );
+        // Original Qwen3 family (without .5/.6/.8) receives no automatic policy.
+        let qwen3_raw = r#"{
+            "schema_version":1,
+            "generated_at":"now",
+            "models":{"qwen3:8b":{"repo":"x","file":"qwen3-8b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x","default_kv_mode":"q8"}},
+            "aliases":{}
+        }"#;
+        let qwen3_registry = RegistryV1::parse(qwen3_raw, "test").unwrap();
+        let (q3_tag, q3_entry) = qwen3_registry.model("qwen3:8b").unwrap();
+        let q3_layer = config_layer_for_tag(q3_tag, q3_entry).unwrap();
+        assert_eq!(
+            q3_layer.get("memory.kv_cache"),
+            Some(&ConfigValue::String("q8".into()))
+        );
+        assert!(q3_layer.get("memory.kv_backend").is_none());
+        assert!(q3_layer.get("memory.max_seq").is_none());
+        assert!(q3_layer.get("generation.max_tokens").is_none());
     }
 
     #[test]
@@ -828,6 +999,394 @@ mod tests {
             "aliases":{}
         }"#;
         assert!(RegistryV1::parse(raw, "test").is_err());
+    }
+
+    #[test]
+    fn tag_policy_pins_qwen_deepseek_and_glimmer_targets() {
+        let raw = r#"{
+            "schema_version":1,
+            "generated_at":"now",
+            "models":{
+                "qwen3.5:4b":{"repo":"x","file":"qwen3.5-4b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"},
+                "qwen3.6:35b-a3b":{"repo":"x","file":"qwen3.6-35b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"},
+                "qwen3.8:27b":{"repo":"x","file":"qwen3.8-27b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"},
+                "qwen3:8b":{"repo":"x","file":"qwen3-8b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"},
+                "qwen3.5:27b-draft":{"repo":"x","file":"qwen35-27b-dflash.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"},
+                "qwen3.5:27b-dflash":{"repo":"x","file":"qwen35-27b-dflash.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"},
+                "deepseek-v4-flash":{"repo":"x","file":"deepseek-v4-flash-0731.mq2r","size_gb":1,"min_vram_gb":1,"desc":"x"},
+                "deepseek-v4-flash:mq2lloyd":{"repo":"x","file":"deepseek-v4-flash-0731.mq2lloyd","size_gb":1,"min_vram_gb":1,"desc":"x"},
+                "deepseek-v4-flash-preview":{"repo":"x","file":"deepseek-v4-flash-preview.mq2r","size_gb":1,"min_vram_gb":1,"desc":"x"},
+                "deepseek-v4-flash:draft":{"repo":"x","file":"deepseek-v4-flash-draft.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"},
+                "muse-glimmer":{"repo":"x","file":"muse-glimmer-30b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"},
+                "muse-glimmer:fast":{"repo":"x","file":"muse-glimmer-30b.mq4r","size_gb":1,"min_vram_gb":1,"desc":"x"},
+                "muse-glimmer:draft":{"repo":"x","file":"muse-glimmer-draft.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"},
+                "other:model":{"repo":"x","file":"other.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"}
+            },
+            "aliases":{
+                "deepseek4":"deepseek-v4-flash",
+                "ds4":"deepseek-v4-flash",
+                "deepseek4:preview":"deepseek-v4-flash-preview",
+                "muse-glimmer:quality":"muse-glimmer"
+            }
+        }"#;
+        let registry = RegistryV1::parse(raw, "test").unwrap();
+
+        // Exact Qwen families get VMM + 262144 + 81920
+        for tag in ["qwen3.5:4b", "qwen3.6:35b-a3b", "qwen3.8:27b"] {
+            let (_, entry) = registry.model(tag).unwrap();
+            let layer = config_layer_for_tag(tag, entry).unwrap();
+            assert_eq!(
+                layer.get("memory.kv_backend"),
+                Some(&ConfigValue::String("vmm".into())),
+                "{tag} should get vmm"
+            );
+            assert_eq!(
+                layer.get("memory.max_seq"),
+                Some(&ConfigValue::Integer(262144)),
+                "{tag} should get 262144"
+            );
+            assert_eq!(
+                layer.get("generation.max_tokens"),
+                Some(&ConfigValue::Integer(81920)),
+                "{tag} should get 81920"
+            );
+        }
+
+        // Original Qwen3 (no dot) receives none — stays contiguous
+        let (_, entry) = registry.model("qwen3:8b").unwrap();
+        let layer = config_layer_for_tag("qwen3:8b", entry).unwrap();
+        assert!(layer.get("memory.kv_backend").is_none());
+        assert!(layer.get("memory.max_seq").is_none());
+        assert!(layer.get("generation.max_tokens").is_none());
+
+        // Draft/dflash sidecars do not get the Qwen policy
+        for tag in ["qwen3.5:27b-draft", "qwen3.5:27b-dflash"] {
+            let (_, entry) = registry.model(tag).unwrap();
+            let layer = config_layer_for_tag(tag, entry).unwrap();
+            assert!(
+                layer.get("memory.kv_backend").is_none(),
+                "{tag} sidecar must not get vmm"
+            );
+            assert!(layer.get("memory.max_seq").is_none());
+            assert!(layer.get("generation.max_tokens").is_none());
+        }
+
+        // DeepSeek official / MQ2Lloyd / preview targets get VMM + 1M + 384Ki
+        for tag in [
+            "deepseek-v4-flash",
+            "deepseek-v4-flash:mq2lloyd",
+            "deepseek-v4-flash-preview",
+        ] {
+            let (resolved, entry) = registry.model(tag).unwrap();
+            let layer = config_layer_for_tag(resolved, entry).unwrap();
+            assert_eq!(
+                layer.get("memory.kv_backend"),
+                Some(&ConfigValue::String("vmm".into())),
+                "{tag} should get vmm"
+            );
+            assert_eq!(
+                layer.get("memory.max_seq"),
+                Some(&ConfigValue::Integer(1048576)),
+                "{tag} should get 1048576"
+            );
+            assert_eq!(
+                layer.get("generation.max_tokens"),
+                Some(&ConfigValue::Integer(393216)),
+                "{tag} should get 393216"
+            );
+        }
+        // Aliases resolve to canonical families that carry the same policy.
+        for alias in ["deepseek4", "ds4", "deepseek4:preview"] {
+            let (resolved, entry) = registry.model(alias).unwrap();
+            let layer = config_layer_for_tag(resolved, entry).unwrap();
+            assert_eq!(
+                layer.get("memory.kv_backend"),
+                Some(&ConfigValue::String("vmm".into())),
+                "{alias}->{resolved} should get vmm"
+            );
+            assert_eq!(
+                layer.get("memory.max_seq"),
+                Some(&ConfigValue::Integer(1048576)),
+                "{alias}->{resolved} should get 1048576"
+            );
+            assert_eq!(
+                layer.get("generation.max_tokens"),
+                Some(&ConfigValue::Integer(393216)),
+                "{alias}->{resolved} should get 393216"
+            );
+        }
+        // DeepSeek draft sidecar receives none
+        let (_, entry) = registry.model("deepseek-v4-flash:draft").unwrap();
+        let layer = config_layer_for_tag("deepseek-v4-flash:draft", entry).unwrap();
+        assert!(layer.get("memory.kv_backend").is_none());
+        assert!(layer.get("memory.max_seq").is_none());
+        assert!(layer.get("generation.max_tokens").is_none());
+
+        // Muse Glimmer quality and fast targets get VMM + native 131072, no invented max_tokens
+        for tag in ["muse-glimmer", "muse-glimmer:fast"] {
+            let (_, entry) = registry.model(tag).unwrap();
+            let layer = config_layer_for_tag(tag, entry).unwrap();
+            assert_eq!(
+                layer.get("memory.kv_backend"),
+                Some(&ConfigValue::String("vmm".into())),
+                "{tag} should get vmm"
+            );
+            assert_eq!(
+                layer.get("memory.max_seq"),
+                Some(&ConfigValue::Integer(131072)),
+                "{tag} should get 131072"
+            );
+            assert!(
+                layer.get("generation.max_tokens").is_none(),
+                "{tag} must not get max_tokens"
+            );
+        }
+        // quality alias lands on trunk and inherits the same policy.
+        let (resolved, entry) = registry.model("muse-glimmer:quality").unwrap();
+        assert_eq!(resolved, "muse-glimmer");
+        let layer = config_layer_for_tag(resolved, entry).unwrap();
+        assert_eq!(
+            layer.get("memory.kv_backend"),
+            Some(&ConfigValue::String("vmm".into()))
+        );
+        assert_eq!(
+            layer.get("memory.max_seq"),
+            Some(&ConfigValue::Integer(131072))
+        );
+        assert!(layer.get("generation.max_tokens").is_none());
+
+        // Muse Glimmer draft receives none
+        let (_, entry) = registry.model("muse-glimmer:draft").unwrap();
+        let layer = config_layer_for_tag("muse-glimmer:draft", entry).unwrap();
+        assert!(layer.get("memory.kv_backend").is_none());
+        assert!(layer.get("memory.max_seq").is_none());
+        assert!(layer.get("generation.max_tokens").is_none());
+
+        // Absent policy: unrelated models get no automatic policy
+        let (_, entry) = registry.model("other:model").unwrap();
+        let layer = config_layer_for_tag("other:model", entry).unwrap();
+        assert!(layer.get("memory.kv_backend").is_none());
+        assert!(layer.get("memory.max_seq").is_none());
+        assert!(layer.get("generation.max_tokens").is_none());
+    }
+
+    #[test]
+    fn tag_policy_does_not_expand_wire_schema() {
+        // Old v1 JSON without the invented fields must still parse (deny_unknown_fields).
+        let raw = r#"{
+            "schema_version":1,
+            "generated_at":"now",
+            "models":{"ok":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x"}},
+            "aliases":{}
+        }"#;
+        let registry = RegistryV1::parse(raw, "test").unwrap();
+        let (_, entry) = registry.model("ok").unwrap();
+        let layer = entry.config_layer().unwrap();
+        assert!(layer.get("memory.kv_backend").is_none());
+        assert!(layer.get("memory.max_seq").is_none());
+        assert!(layer.get("generation.max_tokens").is_none());
+        // Tag policy also absent for non-target.
+        let tagged = config_layer_for_tag("ok", entry).unwrap();
+        assert!(tagged.get("memory.kv_backend").is_none());
+
+        // Invented wire fields must be rejected (no schema expansion).
+        let bad = r#"{
+            "schema_version":1,
+            "generated_at":"now",
+            "models":{"bad":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","default_kv_backend":"vmm"}},
+            "aliases":{}
+        }"#;
+        assert!(
+            RegistryV1::parse(bad, "test").is_err(),
+            "default_kv_backend must be rejected as unknown field"
+        );
+        let bad2 = r#"{
+            "schema_version":1,
+            "generated_at":"now",
+            "models":{"bad":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","default_max_seq":262144}},
+            "aliases":{}
+        }"#;
+        assert!(RegistryV1::parse(bad2, "test").is_err());
+        let bad3 = r#"{
+            "schema_version":1,
+            "generated_at":"now",
+            "models":{"bad":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","default_max_tokens":81920}},
+            "aliases":{}
+        }"#;
+        assert!(RegistryV1::parse(bad3, "test").is_err());
+    }
+
+    #[test]
+    fn tag_policy_explicit_override_wins_over_registry() {
+        // Registry tag policy is a low-precedence layer; global/model/one-shot user config wins.
+        let raw = r#"{
+            "schema_version":1,
+            "generated_at":"now",
+            "models":{"qwen3.8:27b":{"repo":"x","file":"qwen3.8-27b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"}},
+            "aliases":{}
+        }"#;
+        let registry = RegistryV1::parse(raw, "test").unwrap();
+        let (tag, entry) = registry.model("qwen3.8:27b").unwrap();
+        let registry_layer = config_layer_for_tag(tag, entry).unwrap();
+        assert_eq!(
+            registry_layer.get("memory.kv_backend"),
+            Some(&ConfigValue::String("vmm".into()))
+        );
+
+        // Simulate user global override to contiguous + different max_seq/max_tokens.
+        let mut user_layer = ConfigLayer::default();
+        user_layer
+            .set(
+                "memory.kv_backend",
+                ConfigValue::String("contiguous".into()),
+            )
+            .unwrap();
+        user_layer
+            .set("memory.max_seq", ConfigValue::Integer(32768))
+            .unwrap();
+        user_layer
+            .set("generation.max_tokens", ConfigValue::Integer(1024))
+            .unwrap();
+
+        let resolved = hipfire_config::resolve(vec![
+            hipfire_config::NamedLayer {
+                source: hipfire_config::ConfigSource::RegistryModel {
+                    tag: tag.to_owned(),
+                    revision: "v1".into(),
+                },
+                layer: registry_layer,
+            },
+            hipfire_config::NamedLayer {
+                source: hipfire_config::ConfigSource::GlobalUser {
+                    path: std::path::PathBuf::from("/tmp/test.toml"),
+                },
+                layer: user_layer,
+            },
+        ])
+        .unwrap();
+        // User wins.
+        assert_eq!(
+            resolved.get("memory.kv_backend").map(|value| &value.value),
+            Some(&ConfigValue::String("contiguous".into()))
+        );
+        assert_eq!(
+            resolved.get("memory.max_seq").map(|value| &value.value),
+            Some(&ConfigValue::Integer(32768))
+        );
+        assert_eq!(
+            resolved
+                .get("generation.max_tokens")
+                .map(|value| &value.value),
+            Some(&ConfigValue::Integer(1024))
+        );
+
+        // Glimmer target override likewise wins (backend + max_seq).
+        let raw2 = r#"{
+            "schema_version":1,
+            "generated_at":"now",
+            "models":{"muse-glimmer":{"repo":"x","file":"muse-glimmer-30b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"}},
+            "aliases":{}
+        }"#;
+        let registry2 = RegistryV1::parse(raw2, "test").unwrap();
+        let (g_tag, g_entry) = registry2.model("muse-glimmer").unwrap();
+        let g_registry_layer = config_layer_for_tag(g_tag, g_entry).unwrap();
+        assert_eq!(
+            g_registry_layer.get("memory.kv_backend"),
+            Some(&ConfigValue::String("vmm".into()))
+        );
+        assert_eq!(
+            g_registry_layer.get("memory.max_seq"),
+            Some(&ConfigValue::Integer(131072))
+        );
+        assert!(g_registry_layer.get("generation.max_tokens").is_none());
+        let mut g_user = ConfigLayer::default();
+        g_user
+            .set(
+                "memory.kv_backend",
+                ConfigValue::String("contiguous".into()),
+            )
+            .unwrap();
+        g_user
+            .set("memory.max_seq", ConfigValue::Integer(8192))
+            .unwrap();
+        let g_resolved = hipfire_config::resolve(vec![
+            hipfire_config::NamedLayer {
+                source: hipfire_config::ConfigSource::RegistryModel {
+                    tag: g_tag.to_owned(),
+                    revision: "v1".into(),
+                },
+                layer: g_registry_layer,
+            },
+            hipfire_config::NamedLayer {
+                source: hipfire_config::ConfigSource::GlobalUser {
+                    path: std::path::PathBuf::from("/tmp/test2.toml"),
+                },
+                layer: g_user,
+            },
+        ])
+        .unwrap();
+        assert_eq!(
+            g_resolved
+                .get("memory.kv_backend")
+                .map(|value| &value.value),
+            Some(&ConfigValue::String("contiguous".into()))
+        );
+        assert_eq!(
+            g_resolved.get("memory.max_seq").map(|value| &value.value),
+            Some(&ConfigValue::Integer(8192))
+        );
+
+        // DeepSeek target override wins over 1M/384Ki policy.
+        let raw3 = r#"{
+            "schema_version":1,
+            "generated_at":"now",
+            "models":{"deepseek-v4-flash":{"repo":"x","file":"ds4.mq2r","size_gb":1,"min_vram_gb":1,"desc":"x"}},
+            "aliases":{}
+        }"#;
+        let registry3 = RegistryV1::parse(raw3, "test").unwrap();
+        let (d_tag, d_entry) = registry3.model("deepseek-v4-flash").unwrap();
+        let d_registry_layer = config_layer_for_tag(d_tag, d_entry).unwrap();
+        assert_eq!(
+            d_registry_layer.get("memory.max_seq"),
+            Some(&ConfigValue::Integer(1048576))
+        );
+        assert_eq!(
+            d_registry_layer.get("generation.max_tokens"),
+            Some(&ConfigValue::Integer(393216))
+        );
+        let mut d_user = ConfigLayer::default();
+        d_user
+            .set("memory.max_seq", ConfigValue::Integer(65536))
+            .unwrap();
+        d_user
+            .set("generation.max_tokens", ConfigValue::Integer(2048))
+            .unwrap();
+        let d_resolved = hipfire_config::resolve(vec![
+            hipfire_config::NamedLayer {
+                source: hipfire_config::ConfigSource::RegistryModel {
+                    tag: d_tag.to_owned(),
+                    revision: "v1".into(),
+                },
+                layer: d_registry_layer,
+            },
+            hipfire_config::NamedLayer {
+                source: hipfire_config::ConfigSource::GlobalUser {
+                    path: std::path::PathBuf::from("/tmp/test3.toml"),
+                },
+                layer: d_user,
+            },
+        ])
+        .unwrap();
+        assert_eq!(
+            d_resolved.get("memory.max_seq").map(|value| &value.value),
+            Some(&ConfigValue::Integer(65536))
+        );
+        assert_eq!(
+            d_resolved
+                .get("generation.max_tokens")
+                .map(|value| &value.value),
+            Some(&ConfigValue::Integer(2048))
+        );
     }
 
     #[test]

@@ -1613,9 +1613,11 @@ pub fn load_model_with_kv_backend(
             other.name()
         ));
     }
-    if kv_backend == KvBackend::Vmm && !matches!(carrier.name(), "qwen35" | "deepseek4") {
+    if kv_backend == KvBackend::Vmm
+        && !matches!(carrier.name(), "qwen35" | "deepseek4" | "muse_glimmer")
+    {
         return Err(format!(
-            "KV backend 'vmm' currently supports qwen3.5 and deepseek4 only (selected carrier: {})",
+            "KV backend 'vmm' currently supports qwen3.5, deepseek4, and Muse Glimmer only (selected carrier: {})",
             carrier.name()
         ));
     }
@@ -1728,9 +1730,11 @@ pub fn load_model_with_gemma4_drafter(
             other.name()
         ));
     }
-    if kv_backend == KvBackend::Vmm && !matches!(carrier.name(), "qwen35" | "deepseek4") {
+    if kv_backend == KvBackend::Vmm
+        && !matches!(carrier.name(), "qwen35" | "deepseek4" | "muse_glimmer")
+    {
         return Err(format!(
-            "KV backend 'vmm' currently supports qwen3.5 and deepseek4 only (selected carrier: {})",
+            "KV backend 'vmm' currently supports qwen3.5, deepseek4, and Muse Glimmer only (selected carrier: {})",
             carrier.name()
         ));
     }
@@ -2097,8 +2101,11 @@ pub fn load_model_ep_with_kv_mode(
     max_seq: usize,
     tp: usize,
     kv_mode: Option<&str>,
+    kv_backend: Option<&str>,
 ) -> Result<LoadedModel, String> {
     let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
+    let kv_backend_raw = kv_backend.unwrap_or("contiguous");
+    let kv_backend: KvBackend = kv_backend_raw.parse().map_err(|err| format!("{err}"))?;
     match hfq.arch_id {
         9 => load_model_ep_ds4(
             path,
@@ -2106,7 +2113,13 @@ pub fn load_model_ep_with_kv_mode(
             tp,
             resolve_deepseek4_compressor_cache_kv_mode(kv_mode)?,
         ),
+        10 if kv_backend == KvBackend::Vmm => {
+            Err(format!("KV backend '{kv_backend_raw}' requires tp=1"))
+        }
         10 => load_model_ep_minimax(path, max_seq, tp),
+        5 | 6 if kv_backend == KvBackend::Vmm => {
+            Err(format!("KV backend '{kv_backend_raw}' requires tp=1"))
+        }
         5 | 6 => load_model_ep_qwen35(path, max_seq, tp),
         id => Err(format!(
             "EP not supported for arch_id={id} (expected 5|6 for Qwen3.5, 9 for DeepSeek V4 or 10 for MiniMax)"

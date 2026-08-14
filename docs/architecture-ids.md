@@ -22,8 +22,8 @@ remain fail-closed for every route outside that exact row; source-derived routin
 |---:|---|---|---|---|
 | 0 | LLaMA / Mistral | `hipfire-arch-llama` | `LlamaCarrier` | Dense FA. Trait marker `Llama::arch_id() == 0`. |
 | 1 | plain Qwen3 | `hipfire-arch-llama` | `LlamaCarrier` | Same crate; `config_from_hfq` branches on metadata. Dir `model_type`/`architectures` qwen3 → 1. |
-| 5 | Qwen3.5 / 3.6 dense | `hipfire-arch-qwen35` | `Qwen35Carrier` | Hybrid DeltaNet + dense FFN. Trait marker returns 5. Optional VL via `hipfire-arch-qwen35-vl` under the same ids. |
-| 6 | Qwen3.5 / 3.6 MoE (A3B) | `hipfire-arch-qwen35` | `Qwen35Carrier` | MoE expert routing; same crate as 5. |
+| 5 | Qwen3.5 / 3.6 / 3.8 dense | `hipfire-arch-qwen35` | `Qwen35Carrier` | Hybrid DeltaNet + dense FFN. Trait marker returns 5. Optional VL via `hipfire-arch-qwen35-vl` under the same ids. |
+| 6 | Qwen3.5 / 3.6 / 3.8 MoE (A3B) | `hipfire-arch-qwen35` | `Qwen35Carrier` | MoE expert routing; same crate as 5. |
 | 7 | Qwen2 dense | `hipfire-arch-qwen2` | `Qwen2Carrier` | Standalone path so Q/K/V `attention_bias` loads (llama dir path would drop them). Dir `qwen2` → 7. |
 | 8 | dots.ocr (Qwen2-VL family) | `hipfire-arch-dots-ocr` | `DotsOcrCarrier` | Vision tower + Qwen2 text decoder fields on `LoadedModel`. |
 | 9 | DeepSeek V4 Flash | `hipfire-arch-deepseek4` | `Deepseek4Carrier` | Hyper-Connections, compressed-KV indexer, tail-only RoPE, raw SWA; optional in-trunk / sidecar MTP; EP via `load_model_ep`. |

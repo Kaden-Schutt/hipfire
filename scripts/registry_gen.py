@@ -176,8 +176,8 @@ def log(msg: str) -> None:
 # Derived from the tag family + file name. Unknown families return None and
 # fail the run: every new model family must be mapped here explicitly.
 #   1  = plain Qwen3 (llama-crate config_from_hfq branch)
-#   5  = Qwen3.5/3.6 dense hybrid (incl. carnice / qwopus finetunes)
-#   6  = Qwen3.5/3.6 MoE / A3B
+#   5  = Qwen3.5/3.6/3.8 dense hybrid (incl. carnice / qwopus finetunes)
+#   6  = Qwen3.5/3.6/3.8 MoE / A3B
 #   9  = DeepSeek V4 Flash
 #   11 = LFM2.5 family
 #   12 = Cohere2-MoE / North-Mini-Code
@@ -194,7 +194,7 @@ def arch_id_for(tag: str, entry: dict) -> int | None:
         return 23 if "dflash" in file else 14
     if "dflash" in file:
         return 20
-    if family in ("qwen3.5", "qwen3.6", "qwopus3.6", "carnice", "qwopus"):
+    if family in ("qwen3.5", "qwen3.6", "qwen3.8", "qwopus3.6", "carnice", "qwopus"):
         return 6 if "a3b" in tag else 5
     if family == "nex-n2":
         return 6  # Nex-N2-mini = Qwen3.5-35B-A3B MoE (a3b not in tag name)
@@ -357,7 +357,6 @@ def build_registry(curated: dict, token: str | None) -> tuple[dict | None, list[
                 f"{tag}: invalid default_tool_format {tool_format!r} "
                 f"(allowed: {sorted(KNOWN_TOOL_FORMATS)})"
             )
-
         # Optional curated recommended_settings (carried verbatim by deepcopy).
         # Validate bounds — fail-closed, matching hipfire-registry.
         validate_recommended_settings(tag, entry.get("recommended_settings"), errors)

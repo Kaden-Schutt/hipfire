@@ -816,6 +816,18 @@ pub static FIELDS: &[ConfigField] = &[
         "Logical KV context capacity."
     ),
     field!(
+        "memory.kv_backend",
+        "kv_backend",
+        Memory,
+        ModelLoad,
+        DefaultValue::String("contiguous"),
+        ValueRule::Enum(&["contiguous", "vmm"]),
+        true,
+        false,
+        None,
+        "KV storage backend. VMM reserves the logical context window and commits physical pages on demand."
+    ),
+    field!(
         "reasoning.mode",
         "thinking",
         Reasoning,
@@ -4186,6 +4198,10 @@ fn config_profile_bundle(name: &str) -> Option<Vec<(&'static str, ConfigValue)>>
             ("reasoning.max_total_tokens", ConfigValue::Integer(0)),
             ("memory.kv_cache", ConfigValue::String("q8".to_owned())),
             ("memory.max_seq", ConfigValue::Integer(32768)),
+            (
+                "memory.kv_backend",
+                ConfigValue::String("contiguous".to_owned()),
+            ),
             ("memory.prompt_cache_capacity", ConfigValue::Integer(32)),
             ("memory.prompt_cache_unbounded", ConfigValue::Bool(false)),
             ("attention.flash", ConfigValue::String("auto".to_owned())),
