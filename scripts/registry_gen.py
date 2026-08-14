@@ -20,8 +20,8 @@ size_gb, unmappable arch_id/quant, alias pointing at a missing tag, or a
 superset violation — aborts with exit 1 and does NOT write output. A broken
 run must never replace a good committed registry.
 
-Namespace probe: every repo in the hipfire-models and schuttdev namespaces
-is enumerated; repos that exist on HF but have no curated entry are listed
+Namespace probe: every repo in the hipfire-models namespace is enumerated;
+repos that exist on HF but have no curated entry are listed
 as warnings (discovery aid), never auto-added — the curated overlay is
 authoritative for what the CLI offers.
 
@@ -47,7 +47,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 HF_API = "https://huggingface.co"
-PROBE_NAMESPACES = ("hipfire-models", "schuttdev")
+PROBE_NAMESPACES = ("hipfire-models",)
 SCHEMA_VERSION = 1
 # Curated size_gb is a rounded decimal-GB figure; the HF byte count is ground
 # truth. Disagreement beyond this fraction means the curated entry is stale

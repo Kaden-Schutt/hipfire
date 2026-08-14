@@ -9334,7 +9334,7 @@ mod tests {
         let _hf_endpoint = EnvRestore("HF_ENDPOINT", env::var_os("HF_ENDPOINT"));
         let registry = hipfire_registry::bundled().unwrap();
         let (_, entry) = registry.model("qwen3.6:35b-a3b-mq4r").unwrap();
-        let suffix = "schuttdev/hipfire-qwen3.6-35b-a3b/resolve/main/qwen3.6-35b-a3b.mq4r";
+        let suffix = "hipfire-models/qwen3.6-35b-a3b/resolve/main/qwen3.6-35b-a3b.mq4r";
 
         env::remove_var("HIPFIRE_HF_BASE");
         env::remove_var("HF_ENDPOINT");
