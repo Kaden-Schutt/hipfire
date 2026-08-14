@@ -207,7 +207,31 @@ pub const GLIMMER_DRAFTER_ARCH_ID: u32 = 23;
 /// Daemon/load default for `HIPFIRE_GLIMMER_CTX_CAP` when unset.
 /// Sampled once at carrier load and passed into scratch + device hidden log.
 /// Demo may choose a distinct default independently.
-pub const GLIMMER_DRAFTER_CTX_CAP_DEFAULT: usize = 256;
+///
+/// This is a sliding suffix window, not a hard context limit: once `cur_pos`
+/// exceeds it, `daemon.rs` pins `ctx_len` here and advances
+/// `cur_start = cur_pos - ctx_len`, so the drafter always sees the most recent
+/// rows. Rows sliding out leave the drafter's attention only — the target's KV
+/// is untouched and still verifies every token, so this bounds tau, never
+/// correctness.
+///
+/// 512 measured on hiptrx gfx1201, muse-glimmer-30b.mq4 (Q8 attention) + the
+/// mq4 drafter, greedy so each point is deterministic:
+///   - Long context (1024-token prompt fixture, cap is binding):
+///     64 -> 29.7 tok/s (tau 2.617) | 128 -> 31.7 (2.841) | 256 -> 50.7 (4.741)
+///     512 -> 55.9 (5.375) | 768 -> 48.5 (4.640) | 1024 -> 51.8 (5.160)
+///     4096 -> 39.2 (5.647)
+///     tau rises monotonically with the window, but per-window cost (the
+///     `ctx_len*kv_dim` D2D gather x2 x5 layers, plus attention over
+///     `ctx_len+block`) outruns it past ~512.
+///   - Short prompts (genre battery, <=256 generated): 256/512/1024 are
+///     IDENTICAL (tau 8.0/10.048/5.25/4.017/3.919, ~89 tok/s) because
+///     `ctx_len = min(cur_pos, cap)` never reaches the cap.
+/// So 512 is free in the short regime and ~+10% in the long one. `fc_input`
+/// VRAM is `cap * num_extract * hidden * 4` = 68 MB here (34 MB at 256,
+/// 545 MB at 4096). The surface is bumpy (768 lands below 256), so treat this
+/// as the measured best of the candidates rather than a smooth optimum.
+pub const GLIMMER_DRAFTER_CTX_CAP_DEFAULT: usize = 512;
 
 // ─── Config ─────────────────────────────────────────────────────────────
 

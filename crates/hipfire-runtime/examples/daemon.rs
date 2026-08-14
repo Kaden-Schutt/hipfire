@@ -31714,12 +31714,11 @@ fn generate_muse_glimmer(
                 let t_after_noise = t_window.elapsed();
                 let device_capture = bundle.device_hidden_capture_enabled();
                 // Freeze effective ctx_cap to min(configured, drafter scratch, device log).
-                const GLIMMER_DRAFTER_CTX_CAP_DEFAULT: usize = 256;
                 let configured_ctx_cap = std::env::var("HIPFIRE_GLIMMER_CTX_CAP")
                     .ok()
                     .and_then(|v| v.trim().parse::<usize>().ok())
                     .filter(|v| *v > 0)
-                    .unwrap_or(GLIMMER_DRAFTER_CTX_CAP_DEFAULT);
+                    .unwrap_or(glimmer::drafter::GLIMMER_DRAFTER_CTX_CAP_DEFAULT);
                 let scratch_cap = bundle
                     .drafter
                     .as_ref()
