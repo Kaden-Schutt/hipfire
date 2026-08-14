@@ -616,9 +616,32 @@ mod tests {
     #[test]
     fn bundled_muse_glimmer_matches_the_model_card_sampling_contract() {
         let registry = bundled().unwrap();
-        let (tag, model) = registry.model("muse-glimmer:30b").unwrap();
-        assert_eq!(tag, "muse-glimmer:30b");
+        // Only one Glimmer size exists, so the canonical tag carries no size
+        // suffix. `muse-glimmer:30b` stays a back-compat alias because
+        // scripts/serve_harness.py infers it from the artifact filename.
+        let (tag, model) = registry.model("muse-glimmer").unwrap();
+        assert_eq!(tag, "muse-glimmer");
         assert_eq!(model.arch_id, Some(14));
+        assert_eq!(model.file, "muse-glimmer-30b.mq4");
+        for alias in ["muse-glimmer:30b", "muse-glimmer:latest", "muse-glimmer:quality"] {
+            let (resolved, _) = registry
+                .model(alias)
+                .unwrap_or_else(|| panic!("{alias} must resolve"));
+            assert_eq!(resolved, "muse-glimmer", "{alias} resolves to the trunk");
+        }
+
+        // The speed SKU is a distinct entry on the MQ4-attention artifact, not an
+        // alias of the trunk.
+        let (fast_tag, fast) = registry.model("muse-glimmer:fast").unwrap();
+        assert_eq!(fast_tag, "muse-glimmer:fast");
+        assert_eq!(fast.file, "muse-glimmer-30b.mq4r");
+        assert_eq!(fast.arch_id, Some(14));
+        assert_ne!(fast.file, model.file, "the two SKUs are different artifacts");
+
+        // The drafter is arch 23 and pairs with either SKU.
+        let (draft_tag, draft) = registry.model("muse-glimmer:draft").unwrap();
+        assert_eq!(draft_tag, "muse-glimmer:draft");
+        assert_eq!(draft.arch_id, Some(23));
 
         let settings = model
             .recommended_settings

@@ -996,15 +996,15 @@
       "min_vram_gb": 5.0,
       "desc": "VibeThinker-3B (WeiboAI), Qwen2 MQ6 6-bit. ~25-60 tok/s on gfx1151."
     },
-    "muse-glimmer:30b": {
+    "muse-glimmer": {
       "repo": "",
-      "file": "muse-glimmer-30b.mq4r",
-      "size_gb": 16.26,
-      "size_bytes": 16261223424,
-      "sha256": "47ccfccddbef5b8e14040bae567c87129669fa9451f0c6b15d8f35964fce7503",
-      "min_vram_gb": 24,
+      "file": "muse-glimmer-30b.mq4",
+      "size_gb": 18.61,
+      "size_bytes": 18614785024,
+      "sha256": "87bc776a36e0c4b55edfd1f0da1104c966eb43f59aa6fdd0ee33a14ecc0fc052",
+      "min_vram_gb": 26,
       "default_kv_mode": "q8",
-      "desc": "30B dense + perception encoder, arch 14. MQ4R Redline SKU: MQ4 body/attention with a Q8 lm_head. Not lowered to Redline PM4 yet, so automatic Redline admission is withheld until that lowering lands. Local build with no published repo, so pull will not resolve.",
+      "desc": "30B dense + perception encoder, arch 14. Quality trunk: MQ4 body with Q8 attention and a Q8 lm_head. Only one size exists, so the tag carries no size suffix; muse-glimmer:fast is the cheaper MQ4-attention SKU. Local build with no published repo, so pull will not resolve.",
       "recommended_settings": {
         "temperature": 1.0,
         "top_p": 0.95,
@@ -1024,14 +1024,42 @@
         }
       }
     },
-    "muse-glimmer:30b-draft": {
+    "muse-glimmer:fast": {
+      "repo": "",
+      "file": "muse-glimmer-30b.mq4r",
+      "size_gb": 16.26,
+      "size_bytes": 16261223424,
+      "sha256": "47ccfccddbef5b8e14040bae567c87129669fa9451f0c6b15d8f35964fce7503",
+      "min_vram_gb": 24,
+      "default_kv_mode": "q8",
+      "desc": "Speed SKU of muse-glimmer: MQ4 body AND MQ4 attention with a Q8 lm_head, 2.35 GB smaller and ~14% faster AR decode than the quality trunk (32.3 vs 28.4 tok/s, gfx1201, 2026-08-14 — registry text, not a live baseline). The .mq4r suffix marks it an MQ4R Redline SKU, but it is not lowered to Redline PM4 yet, so automatic Redline admission is withheld. Local build with no published repo, so pull will not resolve.",
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 64,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.0
+      },
+      "sampling_profiles": {
+        "general": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 64,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0
+        }
+      }
+    },
+    "muse-glimmer:draft": {
       "repo": "",
       "file": "muse-glimmer-30b-dflash.mq4",
       "size_gb": 1.36,
       "size_bytes": 1357990400,
       "sha256": "6fc0988e51689abf24c2e43d5b1f44794be3409484f99a115d36484ea0e23d2d",
       "min_vram_gb": 26,
-      "desc": "DFlash draft for muse-glimmer:30b (muse_glimmer_assistant, arch 23) — 5-layer block-diffusion head that reuses the target's embed and lm_head. Attach with HIPFIRE_DFLASH_DRAFT; there is no filename auto-pairing. Local build with no published repo, so pull will not resolve."
+      "desc": "DFlash draft for muse-glimmer (muse_glimmer_assistant, arch 23) — 5-layer block-diffusion head that reuses the target's embed and lm_head. Pairs with either SKU. Attach with HIPFIRE_DFLASH_DRAFT; there is no filename auto-pairing. Local build with no published repo, so pull will not resolve."
     }
   },
   "aliases": {
@@ -1084,9 +1112,11 @@
     "qwen3.6:27b:draft": "qwen3.6:27b-draft",
     "qwen3.5:2b-mq4": "qwen3.5:2b",
     "vibethinker": "vibethinker:3b",
-    "muse-glimmer": "muse-glimmer:30b",
-    "muse-glimmer:latest": "muse-glimmer:30b",
-    "muse-glimmer:30b:draft": "muse-glimmer:30b-draft",
-    "muse-glimmer-30b:draft": "muse-glimmer:30b-draft"
+    "muse-glimmer:latest": "muse-glimmer",
+    "muse-glimmer:quality": "muse-glimmer",
+    "muse-glimmer:30b": "muse-glimmer",
+    "muse-glimmer:30b-draft": "muse-glimmer:draft",
+    "muse-glimmer:30b:draft": "muse-glimmer:draft",
+    "muse-glimmer-30b:draft": "muse-glimmer:draft"
   }
 }
