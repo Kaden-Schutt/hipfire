@@ -2,7 +2,7 @@
 
 ## Result
 
-On one W7900/gfx1100, increasing `HIPFIRE_GEMMA4_PREFILL_BATCH` from 8 to 64 substantially improves Q8 prefill while leaving decode throughput unchanged.
+On one W7900/gfx1100, increasing `HIPFIRE_GEMMA4_PREFILL_BATCH` from 8 to 64 substantially improves Q8 prefill while leaving decode throughput unchanged. The same policy was subsequently validated and promoted on gfx1201; see `GEMMA4_ESERIES_GFX1201_VALIDATION.md`.
 
 | Model | Batch 8 | Batch 16 | Batch 32 | Batch 64 | B64/B8 |
 |---|---:|---:|---:|---:|---:|
@@ -24,7 +24,7 @@ The Q8 projection path already selects the wave32 `gemm_q8_0_wmma` kernel on gfx
 
 ## gfx1100 production policy
 
-The three cross-model routes now use an architecture-aware `auto` policy. The PLE branch and activation routes passed direct logits/KV validation, short-output hash gates, and the 30-question GSM8K gate; batched embedding passed direct logits/KV validation and 120 paired short-output hashes. On exact `gfx1100`, batched embedding lookup, batched PLE branch projections, and fused PLE activation are enabled by default; `gfx1101`, `gfx1102`, `gfx1151`, and `gfx1201` retain their previous behavior. Each route remains independently disableable with `HIPFIRE_GEMMA4_BATCHED_EMBEDDING_PREFILL=0`, `HIPFIRE_GEMMA4_PLE_BRANCH_BATCHED_PREFILL=0`, or `HIPFIRE_GEMMA4_PLE_ACTIVATION_FUSED_PREFILL=0`.
+The three cross-model routes now use an architecture-aware `auto` policy. The PLE branch and activation routes passed direct logits/KV validation, short-output hash gates, and the 30-question GSM8K gate; batched embedding passed direct logits/KV validation and 120 paired short-output hashes. Batched embedding lookup, batched PLE branch projections, and fused PLE activation are enabled by default on validated gfx1100 and gfx1201 paths; gfx1101, gfx1102, gfx1151, gfx1200, and other unvalidated architectures retain their previous behavior. Each route remains independently disableable with `HIPFIRE_GEMMA4_BATCHED_EMBEDDING_PREFILL=0`, `HIPFIRE_GEMMA4_PLE_BRANCH_BATCHED_PREFILL=0`, or `HIPFIRE_GEMMA4_PLE_ACTIVATION_FUSED_PREFILL=0`.
 
 The smaller PLE model-projection batching probe and Q8 projection fusion remain opt-in. The former did not compose safely with the higher-value branch route; the latter improved E2B but was neutral on E4B, so it is not a family-wide default.
 
@@ -41,9 +41,9 @@ The final policy was remeasured with one release binary, ten fixed GSM8K prompts
 
 Relative to explicit off, auto improves prefill by 92.28% on E2B and 70.16% on E4B while reducing TTFT by 48.30% and 41.46%, respectively. Auto and explicit on differ by at most 0.68% across their prefill/TTFT medians, confirming that the architecture default selects the intended routes. Every corresponding off/auto/on short output was byte-identical for both models. Raw artifacts are under `target/validation/gemma4-gfx11-production-policy/{off-r3,auto-r3,on-r3}`.
 
-## gfx1201 cross-architecture regression
+## gfx1201 pre-promotion baseline
 
-The rebased policy was also checked on one R9700/gfx1201 with the same E2B/E4B Q8 artifacts. The daemon used an explicit batch 64 only to exercise the shared batched-forward path; gfx1201 still defaults to batch 1, and all three promoted feature policies remain disabled by their exact-gfx1100 auto gates. Each row below is the median of ten fixed GSM8K prompts repeated three times with a 16-token output cap.
+Before gfx1201 promotion, the rebased policy was checked on one R9700/gfx1201 with the same E2B/E4B Q8 artifacts. The daemon used an explicit batch 64 only to exercise the shared batched-forward path, while all three promoted feature policies remained disabled. These numbers preserve the sequential-route baseline and are superseded for current policy by `GEMMA4_ESERIES_GFX1201_VALIDATION.md`.
 
 | Model | Policy | Prefill tok/s | TTFT ms | Decode tok/s | Wall s |
 |---|---|---:|---:|---:|---:|
@@ -52,7 +52,7 @@ The rebased policy was also checked on one R9700/gfx1201 with the same E2B/E4B Q
 | Gemma 4 E4B Q8 | off | 989.960 | 790.085 | 65.04 | 1.0679 |
 | Gemma 4 E4B Q8 | auto | 991.860 | 787.551 | 65.04 | 1.0654 |
 
-Auto differs from explicit off by only +0.26% prefill on E2B and +0.19% on E4B; decode medians are identical. All 30 repeated outputs per model matched between auto and off. A separate `B=1,2,4,64` logits/argmax/next-token-KV matrix passed for both models under auto, explicit off, and forced-on feature settings. The forced-on result confirms that the Gemma callsites retain their exact-gfx1100 architecture checks even when the request bits are set on gfx1201. Raw artifacts are under `target/validation/gemma4-gfx11-prefill-batch/{x570-auto-20260814,x570-off-20260814}` on the validation host.
+The pre-promotion auto policy differed from explicit off by only +0.26% prefill on E2B and +0.19% on E4B; decode medians were identical. All 30 repeated outputs per model matched between auto and off. These artifacts remain useful as the gfx1201 sequential baseline under `target/validation/gemma4-gfx11-prefill-batch/{x570-auto-20260814,x570-off-20260814}` on the validation host.
 
 Reproduce with `scripts/bench-gemma4-gfx11-prefill-batch.sh`.
 

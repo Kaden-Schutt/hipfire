@@ -9,6 +9,8 @@ E2B="${E2B:-$MODEL_ROOT/gemma4-e2b-it-pr439-q8.hfq}"
 E4B="${E4B:-$MODEL_ROOT/gemma4-e4b-it-pr439-q8.hfq}"
 DATASET="${DATASET:-$ROOT/target/validation/gemma4-eseries/gsm8k/test.jsonl}"
 GPU_ID="${GPU_ID:-0}"
+ARCH_LABEL="${ARCH_LABEL:-gfx1100}"
+EXPECTED_ARCH="${EXPECTED_ARCH:-$ARCH_LABEL}"
 BATCHES="${BATCHES:-8 16 32 64}"
 LIMIT="${LIMIT:-10}"
 MAX_TOKENS="${MAX_TOKENS:-16}"
@@ -48,10 +50,11 @@ for model in e2b e4b; do
     for batch in $BATCHES; do
         python3 "$ROOT/scripts/eval_gemma4_eseries.py" \
             --daemon "$DAEMON" --model "$artifact" \
-            --model-label "gemma4-${model}-gfx11-b${batch}" \
+            --model-label "gemma4-${model}-${ARCH_LABEL}-b${batch}" \
             --suite gsm8k --dataset "$DATASET" \
             --out-dir "$OUT_ROOT/$model/b${batch}" --physical-gpu "$GPU_ID" \
-            --runtime-home "/tmp/hipfire-gemma4-${model}-gfx11-b${batch}" \
+            --expected-arch "$EXPECTED_ARCH" \
+            --runtime-home "/tmp/hipfire-gemma4-${model}-${ARCH_LABEL}-b${batch}" \
             --max-seq 8192 --max-tokens "$MAX_TOKENS" --limit "$LIMIT" \
             --prefill-batch "$batch" --repeats "$REPEATS" --timeout 1800 \
             "${fused_args[@]}"

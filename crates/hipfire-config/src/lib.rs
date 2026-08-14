@@ -2402,7 +2402,7 @@ pub static FIELDS: &[ConfigField] = &[
         Kernel,
         true,
         "HIPFIRE_GEMMA4_BATCHED_EMBEDDING_PREFILL",
-        "Batch eligible Gemma 4 embedding lookups; auto enables exact gfx1100."
+        "Batch eligible Gemma 4 embedding lookups; auto enables validated gfx1100/gfx1201."
     ),
     process_bool_field!(
         "kernel.gemma4_ple_batched_prefill",
@@ -2419,7 +2419,7 @@ pub static FIELDS: &[ConfigField] = &[
         Kernel,
         true,
         "HIPFIRE_GEMMA4_PLE_BRANCH_BATCHED_PREFILL",
-        "Batch the Gemma 4 E-series PLE branch projections; auto enables exact gfx1100."
+        "Batch the Gemma 4 E-series PLE branch projections; auto enables validated gfx1100/gfx1201."
     ),
     process_auto_bool_field!(
         "kernel.gemma4_ple_activation_fused_prefill",
@@ -2427,7 +2427,7 @@ pub static FIELDS: &[ConfigField] = &[
         Kernel,
         true,
         "HIPFIRE_GEMMA4_PLE_ACTIVATION_FUSED_PREFILL",
-        "Fuse the Gemma 4 E-series PLE activation and strided multiply; auto enables exact gfx1100."
+        "Fuse the Gemma 4 E-series PLE activation and strided multiply; auto enables validated gfx1100/gfx1201."
     ),
     process_bool_field!(
         "kernel.deepseek4_q8_wmma",

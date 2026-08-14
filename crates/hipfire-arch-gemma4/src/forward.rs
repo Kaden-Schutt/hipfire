@@ -1655,7 +1655,7 @@ pub fn forward_batch_spec(
         .memcpy_htod(&pos_array.buf, &pos_bytes)
         .map_err(|e| format!("gemma4 forward_batch htod pos: {e:?}"))?;
 
-    let batched_embedding_requested = gpu.arch == "gfx1100"
+    let batched_embedding_requested = supports_gemma4_batched_prefill_arch(&gpu.arch)
         && gpu.flags.gemma4_batched_embedding_prefill
         && b > 1
         && (has_batched_embedding_lookup(weights.embd_format)
@@ -2440,7 +2440,7 @@ fn apply_per_layer_input_branch_batched(
     gpu.hip
         .memcpy_dtod_at(&residual.buf, 0, &x.buf, 0, b * dim * 4)
         .map_err(|e| format!("gemma4 batch ple save residual: {e:?}"))?;
-    let batched_projections = gpu.arch == "gfx1100"
+    let batched_projections = supports_gemma4_batched_prefill_arch(&gpu.arch)
         && gpu.flags.gemma4_ple_branch_batched_prefill
         && b > 1
         && ple_weights.input_gate.gpu_dtype == DType::Q8_0
@@ -2463,7 +2463,10 @@ fn apply_per_layer_input_branch_batched(
                 .map_err(|e| format!("gemma4 batch ple input_gate row {row}: {e}"))?;
         }
     }
-    if gpu.arch == "gfx1100" && gpu.flags.gemma4_ple_activation_fused_prefill && b > 1 {
+    if supports_gemma4_batched_prefill_arch(&gpu.arch)
+        && gpu.flags.gemma4_ple_activation_fused_prefill
+        && b > 1
+    {
         gpu.gemma4_ple_gelu_mul_strided_f32(
             ple.gate,
             ple.projection_all,
@@ -2520,9 +2523,17 @@ fn apply_per_layer_input_branch_batched(
         .map_err(|e| format!("gemma4 batch ple residual add: {e:?}"))
 }
 
+#[inline]
+fn supports_gemma4_batched_prefill_arch(arch: &str) -> bool {
+    matches!(arch, "gfx1100" | "gfx1201")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{checked_batch_seq_len, supports_batched_projection_dtype};
+    use super::{
+        checked_batch_seq_len, supports_batched_projection_dtype,
+        supports_gemma4_batched_prefill_arch,
+    };
     use rdna_compute::DType;
 
     #[test]
@@ -2552,5 +2563,13 @@ mod tests {
         ] {
             assert!(!supports_batched_projection_dtype(dtype));
         }
+    }
+
+    #[test]
+    fn batched_prefill_arch_scope_is_explicit() {
+        assert!(supports_gemma4_batched_prefill_arch("gfx1100"));
+        assert!(supports_gemma4_batched_prefill_arch("gfx1201"));
+        assert!(!supports_gemma4_batched_prefill_arch("gfx1151"));
+        assert!(!supports_gemma4_batched_prefill_arch("gfx1200"));
     }
 }

@@ -48,4 +48,38 @@ The same 30 prompts and model artifacts were compared against the prior W7900/gf
 
 All 30 normalized predictions and correctness decisions matched between gfx1100 and gfx1201 for both models. Generated text was byte-identical for 23/30 E2B prompts and 24/30 E4B prompts. The remaining responses diverged during greedy generation but retained the same normalized final answer and correctness result. This supports functional parity for the tested set, not full bitwise parity across GPU architectures.
 
-The current E-series PLE and shared-KV implementation therefore runs on gfx1201 without an additional architecture-specific path. This is a functional validation, not a claim that gfx1201 prefill or decode is fully optimized.
+## Batched Prefill Promotion
+
+The original gfx1201 validation used the sequential prefill routes. The E-series batched embedding, PLE branch, and fused PLE activation paths were initially restricted to gfx1100 even though their underlying kernels already had compatible gfx1201 implementations. In particular, the Q8 batched dispatcher selects the RDNA4-specific `gemm_q8_0_wmma_gfx12` source, while the embedding and PLE activation kernels are architecture-generic.
+
+Each route was first enabled independently on gfx1201. Measurements used one release binary, prefill batch 64, ten fixed GSM8K 8-shot prompts, three repeats, and a 16-token output cap. Every non-target route was explicitly disabled.
+
+| Model | Route | Prefill median | Delta vs off | TTFT median | Decode median |
+|---|---|---:|---:|---:|---:|
+| E2B Q8 | all off | 1,367.745 tok/s | - | 572.091 ms | 96.97 tok/s |
+| E2B Q8 | batched embedding | 1,379.430 tok/s | +0.85% | 567.458 ms | 96.97 tok/s |
+| E2B Q8 | batched PLE branch | 2,154.735 tok/s | +57.54% | 367.399 ms | 95.81 tok/s |
+| E2B Q8 | fused PLE activation | 1,564.115 tok/s | +14.36% | 501.499 ms | 96.97 tok/s |
+| E4B Q8 | all off | 989.360 tok/s | - | 789.586 ms | 65.04 tok/s |
+| E4B Q8 | batched embedding | 989.500 tok/s | +0.01% | 783.998 ms | 64.52 tok/s |
+| E4B Q8 | batched PLE branch | 1,445.315 tok/s | +46.09% | 540.555 ms | 64.26 tok/s |
+| E4B Q8 | fused PLE activation | 1,099.025 tok/s | +11.09% | 709.006 ms | 64.26 tok/s |
+
+The three promoted routes compose successfully:
+
+| Model | Policy | Prefill median | Speedup | TTFT median | TTFT reduction |
+|---|---|---:|---:|---:|---:|
+| E2B Q8 | all off | 1,365.125 tok/s | 1.00x | 574.190 ms | - |
+| E2B Q8 | auto | 2,890.540 tok/s | 2.12x | 275.578 ms | 52.01% |
+| E4B Q8 | all off | 989.360 tok/s | 1.00x | 790.524 ms | - |
+| E4B Q8 | auto | 1,802.975 tok/s | 1.82x | 437.593 ms | 44.64% |
+
+Direct sequential-versus-batched validation passed at B=1/2/4/64 for both models under the combined policy. Every last-token argmax and next-token KV-check argmax matched. The minimum observed logits cosine was 0.9999465 for E2B and 0.9999427 for E4B.
+
+A separate 30-question GSM8K A/B used a 512-token output cap. Both policies completed all requests without a runtime error. E2B accuracy moved from 43.3% to 46.7%; E4B moved from 26.7% to 33.3%. These truncated runs are a non-regression gate rather than an accuracy claim. Median prefill improved from 1,340.835 to 2,812.645 tok/s on E2B and from 968.555 to 1,767.860 tok/s on E4B; decode medians were unchanged within 0.1%. In the shorter 30-output gate, E4B was byte-identical in 30/30 cases and E2B in 27/30; the E2B differences were stable greedy wording divergences from the non-bit-identical WMMA route.
+
+The final auto-policy rerun fixed `HIPFIRE_Q8_BATCHED_LEGACY=0`, verified `gfx1201` through the daemon diagnostic protocol, and recorded the daemon, model, and GSM8K dataset hashes. Decode medians moved from 96.97 to 95.24 tok/s on E2B and from 65.04 to 64.26 tok/s on E4B; the promoted routes are prefill optimizations rather than decode changes.
+
+The validated gfx1201 production policy therefore uses prefill batch 64 and enables batched embedding, batched PLE branch projections, and fused PLE activation by default. Each route remains independently disableable. gfx1200 and other unvalidated architectures retain sequential prefill and disabled feature defaults.
+
+Reproduce the isolated route matrix with `scripts/bench-gemma4-gfx12-prefill-routes-ab.sh` and the longer-output gate with `scripts/bench-gemma4-gfx12-prefill-quality-ab.sh`.

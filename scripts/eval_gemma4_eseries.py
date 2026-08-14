@@ -172,6 +172,7 @@ class Daemon:
         env["HIP_VISIBLE_DEVICES"] = physical_gpu
         env["HIPFIRE_GEMMA4_GRAPH"] = "0"
         env["HIPFIRE_GEMMA4_EAGLE"] = "0"
+        env["HIPFIRE_Q8_BATCHED_LEGACY"] = "0"
         env["HIPFIRE_GEMMA4_PREFILL_BATCH"] = str(prefill_batch)
         for name, enabled in (
             ("HIPFIRE_GEMMA4_Q8_FUSED_PREFILL", q8_fused_prefill),
@@ -365,6 +366,7 @@ def main() -> int:
     parser.add_argument("--tasks", type=Path)
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--physical-gpu", default="1")
+    parser.add_argument("--expected-arch")
     parser.add_argument("--max-seq", type=int, default=32768)
     parser.add_argument("--max-tokens", type=int, default=96)
     parser.add_argument("--timeout", type=float, default=1800)
@@ -439,10 +441,12 @@ def main() -> int:
         "daemon": str(args.daemon.resolve()),
         "daemon_sha256": file_hash(args.daemon),
         "physical_gpu": args.physical_gpu,
+        "expected_arch": args.expected_arch,
         "max_seq": args.max_seq,
         "default_max_tokens": args.max_tokens,
         "temperature": 0.0,
         "kv_mode": "q8",
+        "q8_batched_legacy": False,
         "prefill_batch": args.prefill_batch,
         "q8_fused_prefill": args.q8_fused_prefill,
         "batched_embedding_prefill": args.batched_embedding_prefill,
@@ -452,8 +456,6 @@ def main() -> int:
         "repeats": args.repeats,
         "manifest": manifest_data,
     }
-    (args.out_dir / "config.json").write_text(json.dumps(config, indent=2, ensure_ascii=False) + "\n")
-
     daemon = Daemon(
         args.daemon.resolve(),
         args.out_dir / "daemon.stderr.log",
@@ -468,6 +470,19 @@ def main() -> int:
     )
     rows = list(existing)
     try:
+        diag, diag_events = daemon.request({"type": "diag"}, {"diag"}, args.timeout)
+        if args.expected_arch and diag.get("arch") != args.expected_arch:
+            raise RuntimeError(
+                f"GPU architecture mismatch: expected {args.expected_arch}, "
+                f"daemon reported {diag.get('arch')!r}"
+            )
+        config["daemon_diag"] = diag
+        (args.out_dir / "diag.jsonl").write_text(
+            "".join(json.dumps(event, ensure_ascii=False) + "\n" for event in diag_events)
+        )
+        (args.out_dir / "config.json").write_text(
+            json.dumps(config, indent=2, ensure_ascii=False) + "\n"
+        )
         loaded, load_events = daemon.request(
             {
                 "type": "load",
