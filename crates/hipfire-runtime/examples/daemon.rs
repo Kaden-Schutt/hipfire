@@ -12211,12 +12211,12 @@ fn acquire_daemon_lock() -> std::fs::File {
 /// IPC. ~40 MB encoded → ~30 MB raw image bytes (4/3 expansion).
 const MAX_BASE64_ENCODED_LEN: usize = 40 * 1024 * 1024;
 
-/// hunt3 H-D: upper bound on a request-driven `max_seq` (512K). A defense-in-
+/// hunt3 H-D: upper bound on a request-driven `max_seq` (1M). A defense-in-
 /// depth clamp only — it caps an unvalidated 10M `max_seq` that would otherwise
 /// drive a multi-GB KV allocation and OOM the daemon at load. It is NOT a
 /// VRAM-aware guard: a load that requests exactly this on a non-eviction config
 /// can still OOM at allocation; that VRAM validation is out of scope here.
-const MAX_REQUESTED_SEQ: usize = 512 * 1024;
+const MAX_REQUESTED_SEQ: usize = 1024 * 1024;
 
 /// Emit a single-line `{"type":"error","id":"...","message":"..."}` JSON
 /// line on the IPC stream. Uses `serde_json` so user-controlled error
@@ -13265,10 +13265,10 @@ fn main() {
 
                 let path = msg.get("model").and_then(|v| v.as_str()).unwrap_or("");
                 // hunt3 H-D: clamp request-driven max_seq to the config ceiling
-                // (MAX_REQUESTED_SEQ = 512K). Without this an unvalidated 10M
+                // (MAX_REQUESTED_SEQ = 1M). Without this an unvalidated 10M
                 // max_seq drives a multi-GB KV allocation and OOMs the daemon at
                 // load. Emit an info event when the clamp actually fires so the
-                // operator sees the truncation rather than silently getting 512K.
+                // operator sees the truncation rather than silently getting 1M.
                 let requested_max_seq = msg
                     .get("params")
                     .and_then(|p| p.get("max_seq"))
