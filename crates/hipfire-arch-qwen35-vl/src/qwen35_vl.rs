@@ -722,7 +722,14 @@ mod tests {
 
 // ─── GPU vision forward (no CPU roundtrips for compute) ──────────────────────
 
-/// gemm_f16 produces Y[M,N]. We need [N,M]. This helper does GEMM + transpose + bias.
+/// Vision linear: Y[n, out_dim] = W_f16[out_dim, in_dim] @ X_f32[n, in_dim]^T + bias.
+///
+/// On wave32-WMMA arches (gfx11 and gfx12/RDNA4) this goes through
+/// `gemm_f16_wmma_mb8`, which writes row-major `[n, out_dim]` directly and so
+/// drops the separate `transpose_f32` pass the naive path needs. Same routing
+/// dots.ocr already uses (`hipfire-arch-dots-ocr/src/dots_ocr.rs`), and the
+/// gfx12 sibling is covered by `rdna-compute/examples/test_dots_ocr_wmma_gfx12.rs`.
+/// Non-WMMA arches keep the naive `gemm_f16` + transpose fallback.
 fn linear_f16(
     gpu: &mut Gpu,
     w: &GpuTensor,
@@ -732,14 +739,16 @@ fn linear_f16(
     in_dim: usize,
     n: usize,
 ) -> HipResult<GpuTensor> {
-    // GEMM: Y_t[out_dim, n] = W[out_dim, in_dim] @ X[n, in_dim]^T
-    let yt = gpu.alloc_tensor(&[out_dim * n], DType::F32)?;
-    gpu.gemm_f16(w, x, &yt, out_dim, in_dim, n)?;
-    // Transpose: Y[n, out_dim]
     let y = gpu.alloc_tensor(&[n * out_dim], DType::F32)?;
-    gpu.transpose_f32(&yt, &y, out_dim, n)?;
-    gpu.free_tensor(yt)?;
-    // Bias
+    if gpu.arch_caps.has_wmma_w32() || gpu.arch_caps.has_wmma_w32_gfx12() {
+        gpu.gemm_f16_wmma_mb8(w, x, &y, out_dim, in_dim, n)?;
+    } else {
+        // GEMM: Y_t[out_dim, n] = W[out_dim, in_dim] @ X[n, in_dim]^T
+        let yt = gpu.alloc_tensor(&[out_dim * n], DType::F32)?;
+        gpu.gemm_f16(w, x, &yt, out_dim, in_dim, n)?;
+        gpu.transpose_f32(&yt, &y, out_dim, n)?;
+        gpu.free_tensor(yt)?;
+    }
     gpu.bias_add_f32(&y, bias, n, out_dim)?;
     Ok(y)
 }
