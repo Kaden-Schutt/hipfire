@@ -29017,11 +29017,21 @@ fn generate_gemma4(
     // opt-in until long-context parity is certified on each supported board.
     let mut last_logits: Vec<f32> = Vec::new();
     {
-        let prefill_batch = std::env::var("HIPFIRE_GEMMA4_PREFILL_BATCH")
+        let requested_prefill_batch = std::env::var("HIPFIRE_GEMMA4_PREFILL_BATCH")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(1)
             .clamp(1, 64);
+        let prefill_batch = if requested_prefill_batch > 1
+            && !gemma4::forward::supports_batched_prefill(&bundle.weights)
+        {
+            eprintln!(
+                "[daemon] Gemma4 batched prefill is unavailable for this weight format; using eager prefill"
+            );
+            1
+        } else {
+            requested_prefill_batch
+        };
         let mut offset = 0usize;
         while offset < prompt_ids.len() {
             let width = prefill_batch.min(prompt_ids.len() - offset);

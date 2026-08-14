@@ -1343,6 +1343,81 @@ fn proj_gemm_batched(
     }
 }
 
+fn supports_batched_projection_dtype(dtype: DType) -> bool {
+    matches!(
+        dtype,
+        DType::F32 | DType::Q8_0 | DType::MQ4G256 | DType::HFQ4G256 | DType::MQ6G256
+    )
+}
+
+/// Whether every projection used by batched prefill has a matching kernel.
+/// Other loadable quantizations must remain on eager prefill.
+pub fn supports_batched_prefill(weights: &Gemma4Weights) -> bool {
+    let supports = |weight: &WeightTensor| supports_batched_projection_dtype(weight.gpu_dtype);
+    weights.layers.iter().all(|layer| match layer {
+        LayerWeights::Sliding(layer) => {
+            supports(&layer.q_proj)
+                && supports(&layer.k_proj)
+                && supports(&layer.v_proj)
+                && supports(&layer.o_proj)
+                && supports(&layer.gate_proj)
+                && supports(&layer.up_proj)
+                && supports(&layer.down_proj)
+        }
+        LayerWeights::Full(layer) => {
+            supports(&layer.q_proj)
+                && supports(&layer.k_proj)
+                && layer.v_proj.as_ref().map_or(true, supports)
+                && supports(&layer.o_proj)
+                && supports(&layer.gate_proj)
+                && supports(&layer.up_proj)
+                && supports(&layer.down_proj)
+        }
+    })
+}
+
+struct BatchScratchLedger {
+    gpu: *mut Gpu,
+    tensors: Vec<GpuTensor>,
+}
+
+impl BatchScratchLedger {
+    fn new(gpu: &mut Gpu) -> Self {
+        Self {
+            gpu,
+            tensors: Vec::with_capacity(24),
+        }
+    }
+
+    fn alloc(&mut self, n: usize, label: &str) -> Result<GpuTensor, String> {
+        // SAFETY: the ledger is scoped inside forward_batch_spec and the Gpu
+        // reference outlives it. No access occurs after the function returns.
+        let gpu = unsafe { &mut *self.gpu };
+        let tensor = gpu
+            .alloc_tensor(&[n], DType::F32)
+            .map_err(|e| format!("gemma4 forward_batch alloc {label}: {e:?}"))?;
+        let view = GpuTensor {
+            // SAFETY: the owning tensor remains in this ledger until all views
+            // have dropped and the ledger frees it exactly once.
+            buf: unsafe { tensor.buf.alias() },
+            shape: tensor.shape.clone(),
+            dtype: tensor.dtype,
+        };
+        self.tensors.push(tensor);
+        Ok(view)
+    }
+}
+
+impl Drop for BatchScratchLedger {
+    fn drop(&mut self) {
+        // SAFETY: see new(); the ledger cannot outlive forward_batch_spec's Gpu.
+        let gpu = unsafe { &mut *self.gpu };
+        for tensor in self.tensors.drain(..) {
+            gpu.free_tensor(tensor).ok();
+        }
+    }
+}
+
 /// argmax over a logits row (spec-decode greedy per-position prediction).
 fn argmax_f32_row(v: &[f32]) -> u32 {
     let mut bi = 0u32;
@@ -1434,10 +1509,8 @@ pub fn forward_batch_spec(
     // seq_len after this batch = absolute positions [start_pos, start_pos+B).
     let seq_len = checked_batch_seq_len(start_pos, b, state.max_seq)?;
 
-    let alloc = |g: &mut Gpu, n: usize, label: &str| -> Result<GpuTensor, String> {
-        g.alloc_tensor(&[n], DType::F32)
-            .map_err(|e| format!("gemma4 forward_batch alloc {label}: {e:?}"))
-    };
+    let mut scratch = BatchScratchLedger::new(gpu);
+    let mut alloc = |_g: &mut Gpu, n: usize, label: &str| scratch.alloc(n, label);
 
     // ── Batched scratch (per call; verify is not the hot per-kernel loop). ──
     let x = alloc(gpu, b * dim, "x")?;
@@ -1502,7 +1575,6 @@ pub fn forward_batch_spec(
                 .memcpy_dtod_at(&x.buf, i * dim * 4, &x_single.buf, 0, dim * 4)
                 .map_err(|e| format!("gemma4 forward_batch embed copy: {e:?}"))?;
         }
-        gpu.free_tensor(x_single).ok();
     }
     // √dim scale on the whole [B*dim] buffer (uniform — matches eager scale_f32).
     gpu.scale_f32(&x, cfg.embed_scale)
@@ -1737,8 +1809,6 @@ pub fn forward_batch_spec(
                 for v in idx_i32 {
                     out.push(v as u32);
                 }
-                gpu.free_tensor(logits_b).ok();
-                gpu.free_tensor(idx_buf).ok();
             } else {
                 // FALLBACK (non-Q8 lm_head, e.g. MQ4): per-row SCALAR `weight_gemv`
                 // (exactly the eager decode_step / the last-row path below). We
@@ -1764,9 +1834,6 @@ pub fn forward_batch_spec(
                 }
             }
         }
-        if let Some(t) = local_hidden {
-            gpu.free_tensor(t).ok();
-        }
     }
 
     // ── Final RMSNorm + tied lm_head on the LAST row only (verify needs the
@@ -1787,25 +1854,6 @@ pub fn forward_batch_spec(
         .download_f32(&state.logits)
         .map_err(|e| format!("gemma4 forward_batch download logits: {e:?}"))?;
 
-    // Free batched scratch.
-    let mut frees = vec![
-        x, residual, nrm, x_rot, q, k, v, attn_out, o, gate_ffn, up_ffn, ffn_hidden, ffn_out,
-        ffn_rot, pos_array, x_last,
-    ];
-    for t in [
-        ple_token_inputs,
-        ple_projection_all,
-        ple_gate,
-        ple_hidden,
-        ple_out,
-    ] {
-        if let Some(t) = t {
-            frees.push(t);
-        }
-    }
-    for t in frees {
-        gpu.free_tensor(t).ok();
-    }
     Ok(logits)
 }
 
@@ -2222,12 +2270,35 @@ fn apply_per_layer_input_branch_batched(
 
 #[cfg(test)]
 mod tests {
-    use super::checked_batch_seq_len;
+    use super::{checked_batch_seq_len, supports_batched_projection_dtype};
+    use rdna_compute::DType;
 
     #[test]
     fn batch_window_must_fit_allocated_kv_capacity() {
         assert_eq!(checked_batch_seq_len(60, 4, 64).unwrap(), 64);
         assert!(checked_batch_seq_len(61, 4, 64).is_err());
         assert!(checked_batch_seq_len(usize::MAX, 1, usize::MAX).is_err());
+    }
+
+    #[test]
+    fn batched_prefill_projection_formats_are_explicit() {
+        for dtype in [
+            DType::F32,
+            DType::Q8_0,
+            DType::MQ4G256,
+            DType::HFQ4G256,
+            DType::MQ6G256,
+        ] {
+            assert!(supports_batched_projection_dtype(dtype));
+        }
+        for dtype in [
+            DType::HFQ4G128,
+            DType::HFQ6G256,
+            DType::HFQ2G256,
+            DType::HFQ3G256,
+            DType::MQ3G256,
+        ] {
+            assert!(!supports_batched_projection_dtype(dtype));
+        }
     }
 }
