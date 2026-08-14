@@ -1808,7 +1808,7 @@ fn argmax_u32(logits: &[f32]) -> u32 {
 /// Temperature-scaled softmax. Writes into `out` (reused across calls to
 /// avoid per-position allocation in the rejection-sampling hot loop).
 #[inline]
-pub fn softmax_temp_into(logits: &[f32], temp: f32, out: &mut Vec<f32>) {
+pub(crate) fn softmax_temp_into(logits: &[f32], temp: f32, out: &mut Vec<f32>) {
     out.clear();
     out.reserve(logits.len());
     let inv_t = 1.0 / temp;
@@ -1875,7 +1875,7 @@ pub(crate) fn apply_topp_trunc(row: &mut [f32], tau_cut: f32, z: f32) {
 /// renormalized values as `apply_topp_trunc` would given the GPU `tau_cut/Z`,
 /// modulo the boundary-tie convention (this version keeps AR's sort-position
 /// tie-break exactly; `apply_topp_trunc` keeps all boundary-equal tokens).
-pub fn apply_host_nucleus(row: &mut [f32], top_p: f32) {
+pub(crate) fn apply_host_nucleus(row: &mut [f32], top_p: f32) {
     if top_p >= 1.0 {
         return;
     }
@@ -1914,7 +1914,7 @@ pub fn apply_host_nucleus(row: &mut [f32], top_p: f32) {
 
 /// Draw a categorical sample from `probs` given uniform u ∈ [0, 1).
 #[inline]
-pub fn sample_categorical(probs: &[f32], u: f32) -> u32 {
+pub(crate) fn sample_categorical(probs: &[f32], u: f32) -> u32 {
     let mut acc = 0.0f32;
     for (i, &p) in probs.iter().enumerate() {
         acc += p;
@@ -1929,7 +1929,7 @@ pub fn sample_categorical(probs: &[f32], u: f32) -> u32 {
 /// sample the "corrective" bonus token in speculative rejection sampling
 /// (Chen & Leviathan 2023, algorithm 1).
 #[inline]
-pub fn sample_residual(p_target: &[f32], p_draft: &[f32], u: f32) -> u32 {
+pub(crate) fn sample_residual(p_target: &[f32], p_draft: &[f32], u: f32) -> u32 {
     let mut sum = 0.0f32;
     for i in 0..p_target.len() {
         let d = p_target[i] - p_draft[i];
@@ -1966,7 +1966,7 @@ pub use hipfire_runtime::spec::{NgramCache, PldMatch, PldMatcher};
 /// Small, fast RNG for per-cycle sampling u ∈ [0, 1). Xorshift64*; deterministic
 /// given the seed, cheap enough to inline into the B-rejection loop.
 #[inline]
-pub fn xorshift_next_unit(state: &mut u64) -> f32 {
+pub(crate) fn xorshift_next_unit(state: &mut u64) -> f32 {
     let mut s = *state;
     s ^= s << 13;
     s ^= s >> 7;
