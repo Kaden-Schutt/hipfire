@@ -1,0 +1,269 @@
+# ksml — design grounding
+
+Status: **draft, planning only. No code changes authorized by this document.**
+Date: 2026-08-15
+Branch: `arch/ksml` (based on `8510ca5f2`)
+
+This document exists to ground a proposed re-layering before any code moves.
+Every number below is measured on `8510ca5f2` and reproducible with the
+commands in § 8. Where a claim is not measured it is marked `[INFERENCE]`.
+
+---
+
+## 1 · What problem this solves
+
+hipfire competes with, and frequently beats, CUDA-derived engines on AMD
+hardware. That is not in question and is not what this document proposes to
+change. The problem is structural: the codebase mixes an inference engine, a
+quantizer, a calibration oracle, a trainer-adjacent toolchain, and five months
+of research harnesses in one workspace, with the product itself shipping as a
+`[[example]]`.
+
+The consequence is that hipfire is harder to develop for than llama.cpp
+despite being competitive with it, and that is a fixable, measurable property.
+
+---
+
+## 2 · Measured baseline
+
+### 2.1 Workspace
+
+| | lines |
+|---|---:|
+| `crates/*/src` | 414,224 |
+| `crates/*/examples` | 195,143 |
+| `crates/*/tests` | 1,669 |
+| crates | 32 |
+
+Examples are **47%** of src and **117x** the integration-test code.
+`hipfire-runtime` alone carries 99,166 lines of examples across 65 targets,
+including `daemon.rs` — the product — at 43,696 lines.
+
+### 2.2 The inverted ratio
+
+Grouping crates by role:
+
+| layer | crates | lines |
+|---|---|---:|
+| compute | `rdna-compute`, `redline-*`, `radiowave`, `hip-bridge`, `hsa-bridge`, `hipfire-detect` | 124,348 |
+| architecture | `hipfire-arch-*` (12) | 167,000+ |
+
+Compared against llama.cpp at the same commit-time snapshot:
+
+| | compute layer | arch layer | ratio |
+|---|---:|---:|---:|
+| llama.cpp | `ggml/` 328,957 | `src/models/` 34,097 | **9.7 : 1** |
+| hipfire | 124,348 | 167,000+ | **0.7 : 1** |
+
+**This inversion is the finding.** ggml carries ten times more compute code
+than architecture code. hipfire carries more architecture code than compute
+code. Everything generic that ggml owns once, hipfire re-implements per arch.
+
+### 2.3 Per-architecture cost
+
+| model | llama.cpp | hipfire |
+|---|---:|---:|
+| DeepSeek V4 | 1,546 (`src/models/deepseek4.cpp`) | 51,084 (`hipfire-arch-deepseek4`) |
+| Qwen3.5-MoE | 742 (`src/models/qwen35moe.cpp`) | 51,955 (`hipfire-arch-qwen35`) |
+| mean per arch | 233 (34,097 / 146 files) | ~14,600 (12 crates) |
+| architectures | 146 | 12 |
+
+### 2.4 Where the arch bloat actually is
+
+Not evenly spread. Concentrated and largely misplaced:
+
+| item | lines | nature |
+|---|---:|---|
+| `hipfire-arch-deepseek4/src/parent/` | 20,782 | calibration/reference oracle. **Zero `parent::` references from `arch.rs` or `forward.rs`.** All 30 consumers are examples. 18 of its files mention hessian/calibration/oracle. |
+| `grammar.rs` duplicated | 3,935 | 2,736 (qwen35) + 1,199 (ds4). 13 and 1 arch-specific mentions respectively — model-agnostic by construction. |
+| spec plumbing duplicated | 3,370 | `spec_emit.rs` 900/270, `spec_impl.rs` 629/1,026, `mtp_speculator.rs` 225/320 — same filenames, two implementations. |
+| `hipfire-arch-qwen35/src/pflash.rs` | 2,030 | AGENTS.md: PFlash is "retained legacy research, not mainline or production functionality." |
+| `forward_batch_chunk_impl` | 3,628 | single function |
+
+Roughly **30,000 lines** are misplaced or duplicated rather than
+architecture-specific.
+
+Counter-evidence that ~10k is achievable today: `hipfire-arch-muse-glimmer`
+is 9,985 lines with a full arch-23 drafter. The 52k crates are not a floor.
+
+### 2.5 Unsafe
+
+1,314 `unsafe` occurrences in `src`. 825 (63%) are in `rdna-compute`,
+`hip-bridge`, `redline-rocr`, `hsa-bridge` — FFI to `libamdhip64` and PM4
+lowering, where unsafe is mandatory. Only 76 reach `hipfire-arch-qwen35`.
+
+**The unsafe surface is correctly located and is not a structural problem.**
+
+### 2.6 Build ergonomics
+
+`daemon` is an `[[example]]` with nine `required-features`
+(`arch-qwen35`, `arch-qwen35-vl`, `arch-llama`, `arch-qwen2`, `arch-deepseek4`,
+`arch-cohere2moe`, `arch-dots-ocr`, `arch-gemma4`, `arch-muse-glimmer`).
+
+A contributor cannot build the product with one command. llama.cpp gates the
+*backend* at build time (`GGML_CUDA`/`GGML_HIP`/`GGML_VULKAN` default OFF) but
+compiles every architecture, table-driven. hipfire inverts this: it gates nine
+*architectures* at build time to produce a binary that lives in `examples/`.
+
+The seam to fix this already exists: `hipfire-loader::Carrier` has **10
+implementations** and **zero** `cfg(feature = "arch-*")` gating in
+`carriers.rs`. A second, vestigial `Carrier` in
+`hipfire-runtime/src/loader_api.rs:130` has **zero** implementations.
+
+---
+
+## 3 · Proposed layering
+
+```
+ksml-hal        hip-bridge, hsa-bridge, hipfire-detect
+ksml-compute    per-target, fully specialized, never genericized
+                  ksml-rdna    HIP, WMMA, PM4/Redline, radiowave
+                  ksml-xdna    XRT/AIE  [future]
+ksml-core       manifests, weight placement, step graphs, KV, sampling,
+                grammar, spec-decode orchestration   <-- MISSING TODAY
+arch crates     thin trait implementations
+hipfire-engine  scheduler, batching, sessions, serve
+hipfire         one [[bin]]; cli, tui, client, registry
+ksml-quant      quantizer, calibration, ds4 parent/
+ksml-lab        research harnesses, outside the default build graph
+```
+
+### 3.1 The load-bearing rule
+
+**Abstract the model, never the kernel.**
+
+A multi-target abstraction at the kernel layer is precisely the generic-op
+abstraction that makes portable engines slower than hipfire on RDNA. Chasing
+XDNA at the kernel layer rebuilds ggml and forfeits the advantage. Each
+compute backend therefore stays maximally specialized; only composition is
+shared.
+
+This also makes XDNA additive rather than corrosive, and admits a
+heterogeneous configuration that no CUDA-derived engine can offer: an NPU-
+resident draft model paired with a GPU-resident target over the existing
+spec-decode path. `[INFERENCE]` — plausible from the existing DFlash split;
+unproven, no XDNA work has been done.
+
+### 3.2 What ksml is not
+
+- Not a ggml clone. ggml is declarative-then-execute across 6+ backends.
+  hipfire is execute-then-memoize with a PM4 lowering floor that has no ggml
+  analogue and requires owning the queue.
+- Not portable. Single-vendor is the point.
+- Not a rewrite. `rdna-compute`, the kernel family, Redline/PM4, and the quant
+  formats are 124k of genuine differentiation and are explicitly out of scope.
+
+The goal is ggml's **ratio**, not its portability and not its absolute
+per-arch number. llama.cpp reaches 233 lines/arch because ggml ops are
+composable and generic; hipfire's advantage comes from kernels that are
+deliberately neither. A realistic target is 1–3k per arch.
+
+---
+
+## 4 · Naming
+
+`ggml` = Georgi Gerganov + ML; `GGUF` = Georgi Gerganov Universal Format. The
+convention is personal initials, not an industry standard. `ksml` therefore
+reads as deliberate lineage — "to AMD what ggml is to consumer CPU inference" —
+and invites direct comparison, which is why § 2.2's ratio has to hold before
+the name is used publicly.
+
+---
+
+## 5 · Sequencing (proposed, not authorized)
+
+Ordered by (value / risk):
+
+1. **Move `deepseek4/src/parent/` to `ksml-quant`.** 20,782 lines, zero
+   load-path references, mechanical. DS4 drops to ~30k.
+2. **`examples/` triage.** 195,143 lines into product bins / dev tools /
+   research archive outside the default graph. Two known keeps regardless of
+   reference count: PFlash (AGENTS.md policy) and `qwen35_batch_generate`
+   (the DP4 sealed-case binary).
+3. **Delete the vestigial `loader_api::Carrier`** (0 impls) and add ratchets.
+4. **Unify `grammar.rs`** into `ksml-core`: 3,935 -> ~1,400.
+5. **Harvest PR #527's completed spine** — `weight_manifest.rs` (4,662),
+   `weight_store.rs` (6,829), `moe_plan.rs` (11,563), `STEP-001/002/003`,
+   `CAP-001`. This is already a ksml-core in all but name; see § 7.
+6. **Unify speculation** across qwen35/deepseek4 (#527 `SPEC-001`).
+7. **Arch crates to trait impls**; `[[example]] -> [[bin]]`; drop
+   `required-features` 9 -> 0.
+
+Items 1–4 are independent and parallelizable. 7 depends on 3–6.
+
+---
+
+## 6 · Ratchets
+
+Each of these is a CI assertion that the number never increases:
+
+| metric | today | target |
+|---|---:|---:|
+| `daemon.rs` lines | 43,696 | < 5,000 |
+| `daemon.rs` `arch_id ==` branches | 43 | 0 |
+| `daemon.rs` arch-crate references | 95 | 0 |
+| `daemon` `required-features` | 9 | 0 |
+| `[[example]]` in `hipfire-runtime` | 65 | < 10 |
+| compute : arch line ratio | 0.7 : 1 | > 2 : 1 |
+| duplicated `grammar.rs` | 2 copies | 1 |
+
+---
+
+## 7 · Relationship to PR #527
+
+#527 is **33% complete** (14 of 42 tracker items; all four `AXIS` items open)
+and is a *parallelism* program — PP/TP/EP mesh cells. That part is orthogonal
+to this document and neither blocks nor is blocked by it.
+
+However, #527's **completed** third is substantially the ksml-core proposed
+here: manifest-driven weight placement, Step/manifest forward composition, and
+`CAP-001`'s capability contract. Harvesting it is strictly cheaper than
+re-deriving it, and it is the single largest input to § 5 item 5.
+
+---
+
+## 8 · Reproducing these numbers
+
+```sh
+# workspace totals
+find crates -path '*/src/*' -name '*.rs' | xargs wc -l | tail -1
+find crates -path '*/examples/*' -name '*.rs' | xargs wc -l | tail -1
+
+# arch crate sizes
+for d in crates/hipfire-arch-*/; do
+  echo "$(find $d/src -name '*.rs' | xargs wc -l | tail -1 | awk '{print $1}') $d"
+done | sort -rn
+
+# ds4 parent/ reachability from the inference path
+grep -c "parent::" crates/hipfire-arch-deepseek4/src/arch.rs \
+                   crates/hipfire-arch-deepseek4/src/forward.rs
+
+# daemon coupling
+D=crates/hipfire-runtime/examples/daemon.rs
+grep -cE 'arch_id *==' $D
+grep -coE 'hipfire_arch_[a-z0-9_]+' $D
+
+# llama.cpp comparison
+git clone --depth 1 --filter=blob:none --sparse https://github.com/ggml-org/llama.cpp
+cd llama.cpp && git sparse-checkout set src ggml/src ggml/include
+find ggml -name '*.c' -o -name '*.cpp' -o -name '*.h' -o -name '*.cu' | xargs wc -l | tail -1
+find src/models -name '*.cpp' | xargs wc -l | tail -1
+```
+
+---
+
+## 9 · Open questions
+
+1. **Does `ksml` ship as a separate repository or a workspace boundary inside
+   hipfire?** Separate repo makes the "substrate others build on" story real
+   and forces the API to be honest; it also doubles release overhead for a
+   single maintainer.
+2. **Where does the trainer live?** Referenced as a goal; not yet measured in
+   this document.
+3. **XDNA feasibility.** No AIE work has been done. The heterogeneous
+   NPU-draft/GPU-target idea in § 3.1 is unvalidated.
+4. **Quantizer competitive claim.** Trained-FWHT + MQ/MFP beating unsloth at
+   lower bpw is `[INFERENCE]`. Settled cheaply by KLD + perplexity at matched
+   bpw against `UD-Q4_K_XL` on one model and one committed fixture.
+5. **Does `arch/release-and-layering` get retired?** It is 0 ahead / 261
+   behind and was never pushed.
