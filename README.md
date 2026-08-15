@@ -39,8 +39,8 @@ hipfire run qwen3.5:4b "What is the capital of France?"
 The daemon exposes an OpenAI-compatible API on `0.0.0.0:11435`.
 
 Current stable release: **v0.2.1**. The next release is **v0.3.0**,
-headlined by MQ4R and Redline across RDNA. See
-[CHANGELOG.md](CHANGELOG.md).
+headlined by MQ4R and Redline across RDNA, and adding Qwen 3.8 27B and
+Muse Glimmer 30B. See [CHANGELOG.md](CHANGELOG.md).
 
 Curated weights are published through
 [huggingface.co/hipfire-models](https://huggingface.co/hipfire-models)
