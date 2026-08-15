@@ -12,7 +12,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/rocm-env.sh"
 
 MODEL="${1:-$HOME/.hipfire/models/qwen3.5-9b.mq4}"
-EXE="target/release/examples/daemon"
+EXE="target/release/daemon"
 
 SYSTEM=$(python3 -c "import json; print(json.dumps(open('benchmarks/prompts/tool_call_system.txt').read()))")
 PROMPT=$(python3 -c "import json; print(json.dumps('You are helping me debug a C program. The file /tmp/fibonacci.c contains a recursive implementation of the Fibonacci sequence, but it has a bug that causes incorrect results for inputs greater than 10. I need you to read the file, identify the bug, explain what is wrong, and suggest a fix. Please also consider whether the implementation could be improved for performance using memoization or an iterative approach. Start by reading the file contents.'))")

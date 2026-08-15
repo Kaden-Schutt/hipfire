@@ -29,7 +29,7 @@ from tools.redline.product_bench import sampled_output_parity_errors
 REPO = Path(__file__).resolve().parents[2]
 DEFAULT_REGISTRY = REPO / "registry" / "redline-golden-v1.json"
 DEFAULT_MODEL = Path("~/.hipfire/models/qwen3.6-35b-a3b.mq4r").expanduser()
-DEFAULT_DAEMON = REPO / "target" / "release" / "examples" / "daemon"
+DEFAULT_DAEMON = REPO / "target" / "release" / "daemon"
 DEFAULT_HIPFIRE = REPO / "target" / "release" / "hipfire"
 ARCH_RE = re.compile(r"\bgfx(?:10|11|12)\d{2}\b")
 
@@ -269,7 +269,7 @@ def ensure_binaries(daemon: Path, cli: Path, *, build: bool) -> None:
         detail = ", ".join(str(path) for path in missing)
         raise GoldenError(
             f"required binary missing: {detail}; omit --no-build to build "
-            "target/release/examples/daemon and target/release/hipfire"
+            "target/release/daemon and target/release/hipfire"
         )
     if not daemon.is_file():
         subprocess.run(
@@ -277,10 +277,8 @@ def ensure_binaries(daemon: Path, cli: Path, *, build: bool) -> None:
                 "cargo",
                 "build",
                 "--release",
-                "--example",
-                "daemon",
                 "-p",
-                "hipfire-runtime",
+                "hipfire-daemon",
             ],
             cwd=REPO,
             check=True,

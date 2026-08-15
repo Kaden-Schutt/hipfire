@@ -18,7 +18,7 @@
 #     not a regression. A3B's spec lever is MTP, not DFlash.
 #
 # Runs whatever daemon is built in the CURRENT worktree
-# (./target/release/examples/daemon), so run it from spec-graph and from a merge
+# (./target/release/daemon), so run it from spec-graph and from a merge
 # branch and diff the two matrices to prove a merge preserved spec-decode tok/s.
 #
 # Usage:
@@ -49,8 +49,8 @@ while [ $# -gt 0 ]; do
 done
 
 M="${HIPFIRE_MODELS_DIR:-$HOME/.hipfire/models}"
-DAEMON="./target/release/examples/daemon"
-[ -x "$DAEMON" ] || { echo "no daemon at $DAEMON — build: cargo build --release --example daemon --features deltanet -p hipfire-runtime" >&2; exit 2; }
+DAEMON="./target/release/daemon"
+[ -x "$DAEMON" ] || { echo "no daemon at $DAEMON — build: cargo build --release -p hipfire-daemon" >&2; exit 2; }
 RUNDIR="${HIPFIRE_SWEEP_OUT:-$PWD/target/genre_sweep}"; mkdir -p "$RUNDIR"
 RES="${OUT:-$RUNDIR/genre_results.jsonl}"; : > "$RES"
 [ -n "$LABEL" ] || LABEL="$(git rev-parse --short HEAD 2>/dev/null || echo local)"

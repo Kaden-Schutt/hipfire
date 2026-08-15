@@ -1971,7 +1971,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(prog="python3 -m tools.redline bench")
     parser.add_argument("--model", required=True)
     parser.add_argument(
-        "--daemon", default=str(REPO / "target/release/examples/daemon")
+        "--daemon", default=str(REPO / "target/release/daemon")
     )
     parser.add_argument(
         "--cli",

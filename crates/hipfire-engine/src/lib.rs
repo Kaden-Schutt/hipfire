@@ -11,7 +11,7 @@
 //! docs/governance/2026-08-15-hipfire-leanup-map.md §5b. The helpers the arch
 //! crates need (`ContinuousBatchScheduler`, `emit_gen_start`,
 //! `conversation_tokens` handling, `redline_*` bench helpers, prompt-frame
-//! helpers) were trapped inside `crates/hipfire-runtime/examples/daemon.rs`.
+//! helpers) were trapped inside `crates/hipfire-daemon/src/main.rs`.
 //! Moving them down into `hipfire-loader` would create a cycle because
 //! `hipfire-pflash` (and each arch crate) already depend on `hipfire-runtime`
 //! and `hipfire-loader` depends on the arch crates. The fix is a layer above

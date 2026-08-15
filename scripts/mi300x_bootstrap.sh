@@ -150,18 +150,20 @@ fi
 phase "4/9  cargo build --release"
 RUSTC_WRAPPER="${RUSTC_WRAPPER:-}" \
 HIPFIRE_TARGET_ARCH="$TARGET_ARCH" \
+cargo build --release -p hipfire-daemon 2>&1 | tail -20
+RUSTC_WRAPPER="${RUSTC_WRAPPER:-}" \
+HIPFIRE_TARGET_ARCH="$TARGET_ARCH" \
 cargo build --release \
     -p hipfire-quantize \
     -p hipfire-runtime \
     --features deltanet \
     --example eval_hipfire \
     --example coherence_probe \
-    --example daemon \
     2>&1 | tail -20
 for b in target/release/hipfire-quantize \
          target/release/examples/eval_hipfire \
          target/release/examples/coherence_probe \
-         target/release/examples/daemon; do
+         target/release/daemon; do
     [ -x "$b" ] || die "missing binary: $b"
 done
 ok "binaries built"

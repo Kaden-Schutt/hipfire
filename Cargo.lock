@@ -958,6 +958,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-daemon"
+version = "0.3.0"
+dependencies = [
+ "base64",
+ "hip-bridge",
+ "hipfire-arch-cohere2moe",
+ "hipfire-arch-deepseek4",
+ "hipfire-arch-dots-ocr",
+ "hipfire-arch-gemma4",
+ "hipfire-arch-lfm2moe",
+ "hipfire-arch-llama",
+ "hipfire-arch-minimax",
+ "hipfire-arch-muse-glimmer",
+ "hipfire-arch-qwen2",
+ "hipfire-arch-qwen35",
+ "hipfire-arch-qwen35-vl",
+ "hipfire-config",
+ "hipfire-dispatch",
+ "hipfire-engine",
+ "hipfire-loader",
+ "hipfire-pflash",
+ "hipfire-runtime",
+ "libc",
+ "rdna-compute",
+ "saddle-core",
+ "serde",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "hipfire-detect"
 version = "0.3.0"
 dependencies = [

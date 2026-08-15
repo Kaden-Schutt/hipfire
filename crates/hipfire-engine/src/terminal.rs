@@ -5,7 +5,7 @@
 //! Terminal control plane for the daemon — single-request and continuous-batch
 //! handshakes, active attempt TLS, and the two-phase `commit_ready` protocol.
 //!
-//! Relocated verbatim from `crates/hipfire-runtime/examples/daemon.rs` (wave 3)
+//! Relocated verbatim from `crates/hipfire-daemon/src/main.rs` (wave 3)
 //! to break the `daemon -> loader -> daemon` cycle. No behaviour change.
 
 use std::sync::{Condvar, Mutex, OnceLock};

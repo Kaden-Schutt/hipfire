@@ -64,10 +64,9 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 WORKDIR /hipfire
 COPY . .
 
-# Daemon (a cargo --example, not a --bin). Default features already pull in the
-# arch crates; deltanet is additive (DeltaNet/DFlash arches). Matches CLAUDE.md.
-RUN cargo build --release --locked --features deltanet \
-        --example daemon -p hipfire-runtime
+# Daemon is a standalone binary crate (hipfire-daemon) that bundles every
+# architecture unconditionally — no --features or --example needed.
+RUN cargo build --release --locked -p hipfire-daemon
 RUN cargo build --release --locked -p hipfire-cli
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -75,7 +74,7 @@ RUN cargo build --release --locked -p hipfire-cli
 # ─────────────────────────────────────────────────────────────────────────────
 FROM base-rocm AS runtime
 
-COPY --from=builder /hipfire/target/release/examples/daemon /opt/hipfire/bin/daemon
+COPY --from=builder /hipfire/target/release/daemon /opt/hipfire/bin/daemon
 COPY --from=builder /hipfire/target/release/hipfire /usr/local/bin/hipfire
 
 ENV HIPFIRE_DAEMON_BIN=/opt/hipfire/bin/daemon \
@@ -99,7 +98,7 @@ RUN pip install --no-cache-dir --break-system-packages pytest numpy
 
 COPY --from=builder /hipfire/target/release/hipfire /usr/local/bin/hipfire
 
-ENV HIPFIRE_DAEMON_BIN=/hipfire/target/release/examples/daemon \
+ENV HIPFIRE_DAEMON_BIN=/hipfire/target/release/daemon \
     HIPFIRE_DIR=/root/.hipfire \
     MODELS_DIR=/root/.hipfire/models
 

@@ -69,8 +69,8 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 
 [ -f "$MODEL" ] || fail "model not found: $MODEL"
 [ -x "$ROOT/target/release/hipfire" ] || fail "build first: cargo build --release -p hipfire-cli"
-DAEMON="$ROOT/target/release/examples/daemon"
-[ -x "$DAEMON" ] || fail "build first: cargo build --release -p hipfire-runtime --features deltanet,arch-qwen35 --example daemon"
+DAEMON="$ROOT/target/release/daemon"
+[ -x "$DAEMON" ] || fail "build first: cargo build --release -p hipfire-daemon
 
 if ss -ltn 2>/dev/null | grep -q ":$PORT "; then
   fail "port $PORT already in use"

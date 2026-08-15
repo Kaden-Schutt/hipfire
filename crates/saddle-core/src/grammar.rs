@@ -1235,7 +1235,7 @@ mod tests {
     //      header-template continuation.
     //
     // The mask path is byte-for-byte the same one
-    // `crates/hipfire-runtime/examples/daemon.rs` runs at each sample
+    // `crates/hipfire-daemon/src/main.rs` runs at each sample
     // step in both the qwen35 non-dflash and dflash paths.
 
     /// Build a synthetic vocab with known token-text values + a logits

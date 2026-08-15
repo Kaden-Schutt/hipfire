@@ -9,7 +9,7 @@
 # not instrument the child daemon and ptrace attach may be disabled. Point
 # HIPFIRE_DAEMON_BIN at this script and provide:
 #
-#   HIPFIRE_ROCPROF_DAEMON_TARGET=/absolute/path/to/examples/daemon
+#   HIPFIRE_ROCPROF_DAEMON_TARGET=/absolute/path/to/target/release/daemon
 #   HIPFIRE_ROCPROF_OUTPUT_DIR=/absolute/path/to/evidence/rocprof
 #
 # All arguments supplied by `hipfire serve` are forwarded byte-for-byte.

@@ -1047,14 +1047,14 @@ RULES: tuple[Rule, ...] = (
         reason="PP dispatch path (pre-commit HOTSPOT + PP_HOTSPOT multi_gpu.rs).",
     ),
     Rule(
-        surface="crates/hipfire-runtime/examples/daemon.rs",
+        surface="crates/hipfire-daemon/src/main.rs",
         route_ids=(
             "serve.loop.cross-request",
             "serve.battery.qwen35-4b",
             "serve.reset.qwen2",
             "redline.capture",
         ),
-        reason="Daemon example is SERVE_HOTSPOT — multi-request contamination + smoke + redline.",
+        reason="Daemon binary is SERVE_HOTSPOT — multi-request contamination + smoke + redline.",
     ),
     Rule(
         surface="crates/hipfire-runtime/examples/**",

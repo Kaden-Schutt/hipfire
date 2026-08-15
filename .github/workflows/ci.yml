@@ -55,11 +55,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build workspace (lib + bins + examples + tests)
         run: cargo build --release --workspace --all-targets --locked
-      - name: Build daemon example (real shipped binary, arch features on)
-        run: >
-          cargo build --release --locked
-          -p hipfire-runtime --example daemon
-          --features arch-qwen35,arch-qwen35-vl,arch-llama,arch-qwen2,arch-deepseek4,arch-dots-ocr
+      - name: Build daemon (real shipped binary, all architectures in)
+        run: cargo build --release --locked -p hipfire-daemon
 
   test:
     name: unit tests (lib, no GPU)
