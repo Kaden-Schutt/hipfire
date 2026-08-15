@@ -15,59 +15,7 @@ pub const DEFAULT_KV_CHUNK_TOKENS: usize = 64;
 /// The final reserve tail may be smaller.
 pub const DEFAULT_VMM_PHYSICAL_CHUNK_BYTES: usize = 2 * 1024 * 1024;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum KvBackend {
-    #[default]
-    Contiguous,
-    Vmm,
-}
-
-impl KvBackend {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Contiguous => "contiguous",
-            Self::Vmm => "vmm",
-        }
-    }
-}
-
-impl fmt::Display for KvBackend {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ParseKvBackendError {
-    value: String,
-}
-
-impl fmt::Display for ParseKvBackendError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "unknown KV backend {:?}; expected one of: {}",
-            self.value,
-            KV_BACKEND_NAMES.join(", ")
-        )
-    }
-}
-
-impl std::error::Error for ParseKvBackendError {}
-
-impl FromStr for KvBackend {
-    type Err = ParseKvBackendError;
-
-    fn from_str(raw: &str) -> Result<Self, Self::Err> {
-        match raw {
-            "contiguous" => Ok(Self::Contiguous),
-            "vmm" => Ok(Self::Vmm),
-            other => Err(ParseKvBackendError {
-                value: other.to_string(),
-            }),
-        }
-    }
-}
+pub use saddle_core::kv::{KvBackend, ParseKvBackendError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KvMapGrowth {
