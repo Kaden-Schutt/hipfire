@@ -9,6 +9,17 @@
 {%- set max_tool_response_chars = max_tool_response_chars if max_tool_response_chars is defined else 0 %}
 {%- set _has_tools = (tools is defined and tools and tools is iterable and tools is not mapping) %}
 {%- set ns_state = namespace(thinking=enable_thinking) %}
+{%- set reasoning_instructions = '' %}
+{%- if enable_thinking is undefined or enable_thinking is true %}
+    {%- set resolved_reasoning_effort = reasoning_effort|default('medium') %}
+    {%- if resolved_reasoning_effort in ('minimal', 'low') %}
+        {%- set reasoning_instructions = 'Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.' %}
+    {%- elif resolved_reasoning_effort in ('high', 'xhigh', 'max', 'uncapped') %}
+        {%- set reasoning_instructions = 'Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.' %}
+    {%- elif resolved_reasoning_effort not in ('medium', 'med', 'auto') %}
+        {{- raise_exception('Unexpected reasoning effort ' ~ resolved_reasoning_effort ~ '. Supported types are xhigh, max, uncapped, high, medium, low, minimal, auto, and none.') }}
+    {%- endif %}
+{%- endif %}
 {%- if auto_disable_thinking_with_tools and _has_tools %}
     {%- set ns_state.thinking = false %}
 {%- endif %}
@@ -79,6 +90,9 @@
 {%- endif %}
 {%- if _has_tools %}
     {{- '<|im_start|>system\n' }}
+    {%- if reasoning_instructions %}
+        {{- reasoning_instructions + '\n\n' }}
+    {%- endif %}
     {{- '# Tools\n\nYou have access to the following functions:\n\n<tools>' }}
     {%- for tool in tools %}
         {{- '\n' }}
@@ -122,7 +136,9 @@ Reminder:
     {{- '<|im_end|>\n' }}
 {%- else %}
     {%- if _sc %}
-        {{- '<|im_start|>system\n' + _sc + '<|im_end|>\n' }}
+        {{- '<|im_start|>system\n' + (reasoning_instructions + '\n\n' if reasoning_instructions else '') + _sc + '<|im_end|>\n' }}
+    {%- elif reasoning_instructions %}
+        {{- '<|im_start|>system\n' + reasoning_instructions + '<|im_end|>\n' }}
     {%- endif %}
 {%- endif %}
 {%- set _last_idx = _msgs | length - 1 %}

@@ -6776,6 +6776,14 @@ fn apply_http_reasoning_request(
         .or_else(|| {
             body.pointer("/reasoning/effort")
                 .and_then(serde_json::Value::as_str)
+        })
+        .or_else(|| {
+            // Model-native Jinja effort. Some clients (chatty) send the effort
+            // through chat_template_kwargs instead of the OpenAI top-level
+            // field; accept it as a fallback source and forward it verbatim so
+            // the template validates/steers exactly like the top-level field.
+            body.pointer("/chat_template_kwargs/reasoning_effort")
+                .and_then(serde_json::Value::as_str)
         });
     if thinking_disabled || effort == Some("none") {
         request["max_think_tokens"] = serde_json::json!(1);
@@ -6804,16 +6812,32 @@ fn apply_http_reasoning_request(
     request["assistant_prefix"] = serde_json::json!("open_think");
     if let Some(effort) = effort {
         if !deepseek4_effort_contract {
+            // Budget ladder aligned with the `reasoning.budget` config presets
+            // (low=512, med=2048, high=8192) plus the template's effort
+            // steering: low/medium/high get a safety cap, xhigh-class stays
+            // uncapped so the xhigh instruction decides the natural endpoint.
+            // The previous ladder (64/256/1024/4096) force-closed </think>
+            // mid-thought (measured: low cut at "(3" mid-derivation).
             let max_think = match effort {
-                "minimal" => 64,
-                "low" => 256,
-                "medium" | "med" => 1024,
-                "high" => 4096,
+                "minimal" | "low" => 512,
+                "medium" | "med" => 2048,
+                "high" => 8192,
                 "xhigh" | "max" | "uncapped" => 0,
                 other => bail!("unknown reasoning effort '{other}'"),
             };
             request["max_think_tokens"] = serde_json::json!(max_think);
             request["reasoning_effort"] = serde_json::json!(effort);
+            // Preserve client-supplied chat_template_kwargs (e.g.
+            // preserve_thinking) and record the resolved effort for the Jinja
+            // render.
+            let mut kwargs = body
+                .get("chat_template_kwargs")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            if let Some(obj) = kwargs.as_object_mut() {
+                obj.insert("reasoning_effort".to_string(), serde_json::json!(effort));
+            }
+            request["chat_template_kwargs"] = kwargs;
             return Ok(());
         }
         let normalized = match effort {
@@ -11834,6 +11858,9 @@ mod tests {
     #[test]
     fn http_reasoning_and_completion_metadata_match_native_contract() {
         let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
+
+        // Standard OpenAI field: budget ladder aligned with config presets +
+        // the Jinja effort forwarded for template steering.
         let mut request = serde_json::json!({});
         apply_http_reasoning_request(
             &serde_json::json!({ "reasoning_effort": "high" }),
@@ -11843,7 +11870,61 @@ mod tests {
         )
         .unwrap();
         assert_eq!(request["reasoning_effort"], "high");
-        assert_eq!(request["max_think_tokens"], 4096);
+        assert_eq!(request["max_think_tokens"], 8192);
+        assert_eq!(request["chat_template_kwargs"]["reasoning_effort"], "high");
+
+        let mut low = serde_json::json!({});
+        apply_http_reasoning_request(
+            &serde_json::json!({ "reasoning_effort": "low" }),
+            &resolved,
+            &mut low,
+            false,
+        )
+        .unwrap();
+        assert_eq!(low["max_think_tokens"], 512);
+        assert_eq!(low["chat_template_kwargs"]["reasoning_effort"], "low");
+
+        let mut medium = serde_json::json!({});
+        apply_http_reasoning_request(
+            &serde_json::json!({ "reasoning_effort": "medium" }),
+            &resolved,
+            &mut medium,
+            false,
+        )
+        .unwrap();
+        assert_eq!(medium["max_think_tokens"], 2048);
+
+        // xhigh is uncapped: the template instruction decides the endpoint.
+        let mut uncapped = serde_json::json!({});
+        apply_http_reasoning_request(
+            &serde_json::json!({ "reasoning_effort": "xhigh" }),
+            &resolved,
+            &mut uncapped,
+            false,
+        )
+        .unwrap();
+        assert_eq!(uncapped["max_think_tokens"], 0);
+        assert_eq!(uncapped["chat_template_kwargs"]["reasoning_effort"], "xhigh");
+
+        // chat_template_kwargs.reasoning_effort is an accepted effort source;
+        // client kwargs are merged, not replaced.
+        let mut kwargs = serde_json::json!({});
+        apply_http_reasoning_request(
+            &serde_json::json!({
+                "chat_template_kwargs": {
+                    "preserve_thinking": true,
+                    "reasoning_effort": "medium"
+                }
+            }),
+            &resolved,
+            &mut kwargs,
+            false,
+        )
+        .unwrap();
+        assert_eq!(kwargs["reasoning_effort"], "medium");
+        assert_eq!(kwargs["max_think_tokens"], 2048);
+        assert_eq!(kwargs["chat_template_kwargs"]["preserve_thinking"], true);
+        assert_eq!(kwargs["chat_template_kwargs"]["reasoning_effort"], "medium");
 
         let mut deepseek_uncapped = serde_json::json!({});
         apply_http_reasoning_request(
