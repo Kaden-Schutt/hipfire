@@ -24,11 +24,13 @@ The Q8 projection path already selects the wave32 `gemm_q8_0_wmma` kernel on gfx
 
 ## gfx1100 production policy
 
-The three cross-model routes now use an architecture-aware `auto` policy. The PLE branch and activation routes passed direct logits/KV validation, short-output hash gates, and the 30-question GSM8K gate; batched embedding passed direct logits/KV validation and 120 paired short-output hashes. Batched embedding lookup, batched PLE branch projections, and fused PLE activation are enabled by default on validated gfx1100 and gfx1201 paths; gfx1101, gfx1102, gfx1151, gfx1200, and other unvalidated architectures retain their previous behavior. Each route remains independently disableable with `HIPFIRE_GEMMA4_BATCHED_EMBEDDING_PREFILL=0`, `HIPFIRE_GEMMA4_PLE_BRANCH_BATCHED_PREFILL=0`, or `HIPFIRE_GEMMA4_PLE_ACTIVATION_FUSED_PREFILL=0`.
+The cross-model routes use an architecture-aware `auto` policy. Batched embedding and fused PLE activation remain enabled by default on validated gfx1100 and gfx1201 paths. Batched PLE branch projections passed the original direct/KV, short-output, and GSM8K gates, but a later LongBench hard30 gate exposed low-margin greedy trajectory changes from its F16-activation WMMA path, so it is now explicit opt-in with `HIPFIRE_GEMMA4_PLE_BRANCH_BATCHED_PREFILL=1`. gfx1101, gfx1102, gfx1151, gfx1200, and other unvalidated architectures retain their previous behavior.
+
+The final safe-policy hard30 gate explicitly disabled PLE branch batching and retained the other two routes. On W7900/gfx1100, E2B prefill improved from 451.980 to 479.780 tok/s (+6.15%) and E4B improved from 383.175 to 405.300 tok/s (+5.77%). TTFT medians fell by 5.79% and 5.46%, respectively. All 60 paired predictions were byte-identical, with unchanged accuracy and zero correctness regressions. See `GEMMA4_ESERIES_LOGIT_STABILITY.md` for the full numerical analysis.
 
 The smaller PLE model-projection batching probe and Q8 projection fusion remain opt-in. The former did not compose safely with the higher-value branch route; the latter improved E2B but was neutral on E4B, so it is not a family-wide default.
 
-The final policy was remeasured with one release binary, ten fixed GSM8K prompts, three repeats, batch 64, and 16 generated tokens. `off` explicitly disabled the three promoted routes, `auto` removed all three overrides, and `on` explicitly enabled them:
+The initial short-output policy was measured with one release binary, ten fixed GSM8K prompts, three repeats, batch 64, and 16 generated tokens. `off` explicitly disabled the three candidate routes, `auto` removed all three overrides, and `on` explicitly enabled them. This historical gate was later superseded for the PLE branch route by the longer logit-stability investigation in `GEMMA4_ESERIES_LOGIT_STABILITY.md`:
 
 | Model | Policy | Prefill median | TTFT median | Decode median |
 |---|---|---:|---:|---:|
@@ -124,7 +126,7 @@ Raw timing artifacts are preserved under `target/validation/gemma4-gfx11-ple-bat
 
 ## Batched PLE branch projections
 
-The larger E-series-specific gap was inside every layer's PLE branch. Prefill issued one `input_gate` GEMV and one output `projection` GEMV per row, so batch 64 re-read both Q8 matrices and launched both kernels 64 times per layer. The auto policy routes both projections through the existing batched Q8 dispatcher on exact gfx1100 when `B > 1`; setting `HIPFIRE_GEMMA4_PLE_BRANCH_BATCHED_PREFILL=0` restores the row-wise path. All other architectures, dtypes, and batch 1 keep their original route.
+The larger E-series-specific gap was inside every layer's PLE branch. Prefill issued one `input_gate` GEMV and one output `projection` GEMV per row, so batch 64 re-read both Q8 matrices and launched both kernels 64 times per layer. Explicitly setting `HIPFIRE_GEMMA4_PLE_BRANCH_BATCHED_PREFILL=1` routes both projections through the existing batched Q8 dispatcher on exact gfx1100 when `B > 1`; the unset/default path remains row-wise. All other architectures, dtypes, and batch 1 keep their original route.
 
 Three-repeat paired measurements show that eliminating these per-row launches is the dominant gfx1100 E-series prefill optimization:
 

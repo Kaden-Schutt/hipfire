@@ -65,7 +65,7 @@ Each route was first enabled independently on gfx1201. Measurements used one rel
 | E4B Q8 | batched PLE branch | 1,445.315 tok/s | +46.09% | 540.555 ms | 64.26 tok/s |
 | E4B Q8 | fused PLE activation | 1,099.025 tok/s | +11.09% | 709.006 ms | 64.26 tok/s |
 
-The three promoted routes compose successfully:
+The three original candidate routes compose successfully in the short-output timing gate:
 
 | Model | Policy | Prefill median | Speedup | TTFT median | TTFT reduction |
 |---|---|---:|---:|---:|---:|
@@ -78,8 +78,10 @@ Direct sequential-versus-batched validation passed at B=1/2/4/64 for both models
 
 A separate 30-question GSM8K A/B used a 512-token output cap. Both policies completed all requests without a runtime error. E2B accuracy moved from 43.3% to 46.7%; E4B moved from 26.7% to 33.3%. These truncated runs are a non-regression gate rather than an accuracy claim. Median prefill improved from 1,340.835 to 2,812.645 tok/s on E2B and from 968.555 to 1,767.860 tok/s on E4B; decode medians were unchanged within 0.1%. In the shorter 30-output gate, E4B was byte-identical in 30/30 cases and E2B in 27/30; the E2B differences were stable greedy wording divergences from the non-bit-identical WMMA route.
 
-The final auto-policy rerun fixed `HIPFIRE_Q8_BATCHED_LEGACY=0`, verified `gfx1201` through the daemon diagnostic protocol, and recorded the daemon, model, and GSM8K dataset hashes. Decode medians moved from 96.97 to 95.24 tok/s on E2B and from 65.04 to 64.26 tok/s on E4B; the promoted routes are prefill optimizations rather than decode changes.
+The original auto-policy rerun fixed `HIPFIRE_Q8_BATCHED_LEGACY=0`, verified `gfx1201` through the daemon diagnostic protocol, and recorded the daemon, model, and GSM8K dataset hashes. Decode medians moved from 96.97 to 95.24 tok/s on E2B and from 65.04 to 64.26 tok/s on E4B; the candidate routes are prefill optimizations rather than decode changes. The later full-logit evidence and current safe policy are documented in `GEMMA4_ESERIES_LOGIT_STABILITY.md`.
 
-The validated gfx1201 production policy therefore uses prefill batch 64 and enables batched embedding, batched PLE branch projections, and fused PLE activation by default. Each route remains independently disableable. gfx1200 and other unvalidated architectures retain sequential prefill and disabled feature defaults.
+The gfx1201 production policy uses prefill batch 64 and enables batched embedding and fused PLE activation by default. Batched PLE branch projections remain an explicit experiment: the faster F16-activation WMMA route changed low-margin greedy choices in the later LongBench hard30 gate. gfx1200 and other unvalidated architectures retain sequential prefill and disabled feature defaults.
+
+The final safe-policy hard30 rerun explicitly disabled PLE branch batching. E2B prefill improved from 494.255 to 519.645 tok/s (+5.14%) and E4B improved from 428.385 to 451.550 tok/s (+5.41%); TTFT medians fell by 4.89% and 5.13%. All 60 paired predictions were byte-identical, with unchanged accuracy and zero correctness regressions. Full-logit and cross-architecture evidence is in `GEMMA4_ESERIES_LOGIT_STABILITY.md`.
 
 Reproduce the isolated route matrix with `scripts/bench-gemma4-gfx12-prefill-routes-ab.sh` and the longer-output gate with `scripts/bench-gemma4-gfx12-prefill-quality-ab.sh`.

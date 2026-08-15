@@ -52,7 +52,7 @@ use hipfire_runtime::prompt_frame::ThinkMode;
 use hipfire_runtime::sampler::{self, SamplerConfig};
 use hipfire_runtime::spec::accept_greedy_prefix;
 use std::io::{BufRead, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -29322,6 +29322,177 @@ fn gemma4_prefill_batch_for_arch(gpu_arch: &str, requested: Option<usize>) -> us
         .clamp(1, 64)
 }
 
+struct Gemma4LogitTraceConfig {
+    dir: PathBuf,
+    top_k: usize,
+    max_steps: usize,
+    full_steps: Vec<usize>,
+}
+
+fn gemma4_logit_trace_config() -> Option<&'static Gemma4LogitTraceConfig> {
+    static CONFIG: OnceLock<Option<Gemma4LogitTraceConfig>> = OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            let dir = std::env::var_os("HIPFIRE_GEMMA4_LOGIT_TRACE_DIR")?;
+            let top_k = std::env::var("HIPFIRE_GEMMA4_LOGIT_TRACE_TOPK")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(16)
+                .clamp(1, 128);
+            let max_steps = std::env::var("HIPFIRE_GEMMA4_LOGIT_TRACE_MAX_STEPS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(8192);
+            let full_steps = std::env::var("HIPFIRE_GEMMA4_LOGIT_TRACE_FULL_STEPS")
+                .unwrap_or_default()
+                .split(',')
+                .filter_map(|value| value.trim().parse().ok())
+                .collect();
+            Some(Gemma4LogitTraceConfig {
+                dir: PathBuf::from(dir),
+                top_k,
+                max_steps,
+                full_steps,
+            })
+        })
+        .as_ref()
+}
+
+fn gemma4_trace_file_stem(id: &str) -> String {
+    let sanitized: String = id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let hash = id.bytes().fold(0xcbf29ce484222325_u64, |state, byte| {
+        (state ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+    });
+    format!("{sanitized}-{hash:016x}-attempt-{}", active_attempt_id())
+}
+
+fn trace_gemma4_logits(
+    gpu: &rdna_compute::Gpu,
+    request_id: &str,
+    step: usize,
+    sampled_token: u32,
+    logits: &[f32],
+) {
+    let Some(config) = gemma4_logit_trace_config() else {
+        return;
+    };
+    if step >= config.max_steps || logits.is_empty() {
+        return;
+    }
+
+    let mut top: Vec<(usize, f32)> = Vec::with_capacity(config.top_k);
+    let non_finite_logits = logits.iter().filter(|value| !value.is_finite()).count();
+    for (token, &value) in logits.iter().enumerate() {
+        if value.is_nan() {
+            continue;
+        }
+        let insert_at = top.partition_point(|&(_, current)| current >= value);
+        if insert_at < config.top_k {
+            top.insert(insert_at, (token, value));
+            if top.len() > config.top_k {
+                top.pop();
+            }
+        }
+    }
+    let margin = match top.as_slice() {
+        [(_, first), (_, second), ..] => Some(first - second),
+        _ => None,
+    };
+    let stem = gemma4_trace_file_stem(request_id);
+    if let Err(error) = std::fs::create_dir_all(&config.dir) {
+        eprintln!("[gemma4-logits] create trace directory failed: {error}");
+        return;
+    }
+    let record = serde_json::json!({
+        "schema_version": 1,
+        "request_id": request_id,
+        "step": step,
+        "vocab": logits.len(),
+        "non_finite_logits": non_finite_logits,
+        "top1_token": top.first().map(|entry| entry.0),
+        "top1_top2_margin": margin,
+        "sampled_token": sampled_token,
+        "top_k": top.iter().map(|&(token, value)| {
+            if value.is_finite() {
+                serde_json::json!({"token": token, "logit": value})
+            } else {
+                serde_json::json!({
+                    "token": token,
+                    "logit_special": if value.is_sign_positive() { "+inf" } else { "-inf" },
+                })
+            }
+        }).collect::<Vec<_>>(),
+        "routes": {
+            "batched_embedding_prefill": gpu.flags.gemma4_batched_embedding_prefill,
+            "ple_branch_batched_prefill": gpu.flags.gemma4_ple_branch_batched_prefill,
+            "ple_activation_fused_prefill": gpu.flags.gemma4_ple_activation_fused_prefill,
+        },
+    });
+    let jsonl_path = config.dir.join(format!("{stem}.jsonl"));
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).write(true);
+    if step == 0 {
+        options.truncate(true);
+    } else {
+        options.append(true);
+    }
+    match options.open(&jsonl_path) {
+        Ok(mut file) => {
+            if let Err(error) = writeln!(file, "{record}") {
+                eprintln!(
+                    "[gemma4-logits] write {} failed: {error}",
+                    jsonl_path.display()
+                );
+            }
+        }
+        Err(error) => eprintln!(
+            "[gemma4-logits] open {} failed: {error}",
+            jsonl_path.display()
+        ),
+    }
+
+    if config.full_steps.contains(&step) {
+        let binary_path = config.dir.join(format!("{stem}.step-{step}.f32le"));
+        let temporary_path = binary_path.with_extension("f32le.tmp");
+        match std::fs::File::create(&temporary_path) {
+            Ok(mut file) => {
+                let mut complete = true;
+                for value in logits {
+                    if let Err(error) = file.write_all(&value.to_le_bytes()) {
+                        eprintln!(
+                            "[gemma4-logits] write {} failed: {error}",
+                            temporary_path.display()
+                        );
+                        complete = false;
+                        break;
+                    }
+                }
+                if complete {
+                    if let Err(error) = std::fs::rename(&temporary_path, &binary_path) {
+                        eprintln!(
+                            "[gemma4-logits] rename {} failed: {error}",
+                            binary_path.display()
+                        );
+                    }
+                }
+            }
+            Err(error) => eprintln!(
+                "[gemma4-logits] create {} failed: {error}",
+                temporary_path.display()
+            ),
+        }
+    }
+}
+
 #[cfg(test)]
 mod gemma4_prefill_batch_tests {
     use super::gemma4_prefill_batch_for_arch;
@@ -29786,6 +29957,7 @@ fn generate_gemma4(
             break;
         }
         let next_tok = deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
+        trace_gemma4_logits(gpu, id, generated_count, next_tok, &last_logits);
         if stop_set.contains(&next_tok) {
             break;
         }
