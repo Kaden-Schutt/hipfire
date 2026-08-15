@@ -15335,9 +15335,10 @@ fn generate(
 
 #[cfg(test)]
 mod deepseek4_reasoning_prefix_tests {
-    use super::{
-        hipfire_generate::common::deepseek4_reasoning_prefix, ThinkMode, hipfire_generate::common::DEEPSEEK4_REASONING_HIGH_PREFIX,
-        hipfire_generate::common::DEEPSEEK4_REASONING_MAX_PREFIX,
+    use super::ThinkMode;
+    use hipfire_generate::common::{
+        deepseek4_reasoning_prefix, DEEPSEEK4_REASONING_HIGH_PREFIX,
+        DEEPSEEK4_REASONING_MAX_PREFIX,
     };
 
     #[test]
@@ -15491,10 +15492,8 @@ fn deepseek4_spec_requested(m: &LoadedModel) -> bool {
 
 #[cfg(test)]
 mod render_tail_think_tests {
-    use super::{
-        hipfire_generate::common::asst_turn_fingerprint, hipfire_generate::common::normalize_asst_turn_for_fingerprint, render_tail_opens_think,
-        spec_assistant_prefix,
-    };
+    use super::{render_tail_opens_think, spec_assistant_prefix};
+    use hipfire_generate::{common::asst_turn_fingerprint, common::normalize_asst_turn_for_fingerprint};
     use hipfire_runtime::prompt_frame::AssistantPrefix;
 
     #[test]
@@ -15568,15 +15567,8 @@ mod vl_adaptive_admission_tests {
 
 #[cfg(test)]
 mod qwen_ar_semantic_route_tests {
-    use super::{
-        emit_gen_start, emit_qwen_ar_cancelled, emit_qwen_ar_done, emit_qwen_ar_info,
-        emit_qwen_ar_open_think_terminal, hipfire_generate::common::emit_spec_cancel_after_rollback,
-        emit_staged_terminal_done, emit_tool_calls_event, emit_visible_token,
-        qwen_ar_apply_cache_action, qwen_ar_cache_action, qwen_ar_done_value,
-        qwen_ar_eos_filter_config, hipfire_generate::qwen::qwen_client_commit_effects, set_active_attempt_id,
-        stage_terminal_tool_calls, ClientTerminalDecision, QwenArSemanticProducer,
-        QwenArTerminalCause, hipfire_generate::qwen::QwenClientCommitEffects, QWEN_AR_SEMANTIC_CONTRACT_VERSION,
-    };
+    use super::{emit_gen_start, emit_qwen_ar_cancelled, emit_qwen_ar_done, emit_qwen_ar_info, emit_qwen_ar_open_think_terminal, emit_staged_terminal_done, emit_tool_calls_event, emit_visible_token, qwen_ar_apply_cache_action, qwen_ar_cache_action, qwen_ar_done_value, qwen_ar_eos_filter_config, set_active_attempt_id, stage_terminal_tool_calls, ClientTerminalDecision, QwenArSemanticProducer, QwenArTerminalCause, QWEN_AR_SEMANTIC_CONTRACT_VERSION};
+    use hipfire_generate::{common::emit_spec_cancel_after_rollback, qwen::qwen_client_commit_effects, qwen::QwenClientCommitEffects};
     use std::collections::HashMap;
 
     /// Drive the real shared producer (same object production uses).
@@ -16927,17 +16919,8 @@ mod qwen_ar_semantic_route_tests {
 /// plus the wire-terminal helpers — not test-local buffer counters.
 #[cfg(test)]
 mod ds4_malformed_terminal_tests {
-    use super::{
-        hipfire_generate::common::asst_turn_fingerprint, hipfire_generate::common::ds4_apply_cache_action, hipfire_generate::common::ds4_ar_ep_cache_action,
-        hipfire_generate::common::ds4_ar_ep_finish_route, hipfire_generate::dense::ds4_cache_action, hipfire_generate::common::ds4_client_commit_effects,
-        hipfire_generate::common::ds4_ep_abort_wire_events, hipfire_generate::common::ds4_gen_start_contract_version, hipfire_generate::common::ds4_malformed_terminal_action,
-        ds4_spec_finish_route, hipfire_generate::dense::ds4_spec_wire_terminal, hipfire_generate::common::ds4_stream_event_wireable,
-        hipfire_generate::qwen::emit_ds4_ep_gen_start, hipfire_generate::common::emit_ds4_malformed_action, emit_ds4_malformed_terminal,
-        emit_visible_token, hipfire_generate::common::gen_start_contract_version_for_arch,
-        hipfire_generate::common::normalize_asst_turn_for_fingerprint, set_active_attempt_id, hipfire_generate::qwen::spec_outcome_seed_committable,
-        hipfire_generate::qwen::spec_should_flush_pending_seed, ClientTerminalDecision, hipfire_generate::common::Ds4ArEpRouteTerminal,
-        hipfire_generate::common::Ds4ClientCommitEffects, hipfire_generate::dense::Ds4SpecWireTerminal,
-    };
+    use super::{ds4_spec_finish_route, emit_ds4_malformed_terminal, emit_visible_token, set_active_attempt_id, ClientTerminalDecision};
+    use hipfire_generate::{common::asst_turn_fingerprint, common::ds4_apply_cache_action, common::ds4_ar_ep_cache_action, common::ds4_ar_ep_finish_route, dense::ds4_cache_action, common::ds4_client_commit_effects, common::ds4_ep_abort_wire_events, common::ds4_gen_start_contract_version, common::ds4_malformed_terminal_action, dense::ds4_spec_wire_terminal, common::ds4_stream_event_wireable, qwen::emit_ds4_ep_gen_start, common::emit_ds4_malformed_action, common::gen_start_contract_version_for_arch, common::normalize_asst_turn_for_fingerprint, qwen::spec_outcome_seed_committable, qwen::spec_should_flush_pending_seed, common::Ds4ArEpRouteTerminal, common::Ds4ClientCommitEffects, dense::Ds4SpecWireTerminal};
     use hipfire_arch_deepseek4::dsml::{
         DsmlDeferredCalls, DsmlDeferredOutcome, StreamEvent, StreamParser, TOOL_CALLS_CLOSE,
         TOOL_CALLS_OPEN,
@@ -22142,11 +22125,7 @@ mod glimmer_history_prep_tests {
 /// Exercises production methods only — no algorithm reimplementation.
 #[cfg(test)]
 mod glimmer_profit_guard_tests {
-    use super::{
-        hipfire_generate::dense::glimmer_profit_ledger_after_bonus_decode, hipfire_generate::dense::glimmer_profit_ledger_post_window,
-        hipfire_generate::dense::glimmer_profit_ledger_route_prediction, hipfire_generate::dense::GlimmerProfitGuardStatus, hipfire_generate::dense::GlimmerProfitProbeKind,
-        hipfire_generate::dense::GlimmerSpecProfitGuard,
-    };
+    use hipfire_generate::{dense::glimmer_profit_ledger_after_bonus_decode, dense::glimmer_profit_ledger_post_window, dense::glimmer_profit_ledger_route_prediction, dense::GlimmerProfitGuardStatus, dense::GlimmerProfitProbeKind, dense::GlimmerSpecProfitGuard};
 
     /// Drive four identical measured windows that sum to (s_total, p_total), then
     /// apply ar_probe_ns. Returns the guard after observe_probe.
