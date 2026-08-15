@@ -5,6 +5,7 @@ members = [
     "crates/hsa-bridge",
     "crates/rdna-compute",
     "crates/saddle-core",
+    "crates/hipfire-generate",
     "crates/radiowave",
     "crates/hipfire-runtime",
     "crates/hipfire-arch-qwen35",
