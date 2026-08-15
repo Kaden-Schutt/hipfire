@@ -1,9 +1,9 @@
-# ksml — design grounding
+# saddle — design grounding
 
 Status: **draft, planning only. No code changes authorized by this document.**
-Name: `ksml` is a PLACEHOLDER pending § 9.1.
+Name: **`saddle`** — settled 2026-08-15. See § 4.
 Date: 2026-08-15
-Branch: `arch/ksml` (based on `8510ca5f2`)
+Branch: `arch/saddle` (based on `8510ca5f2`)
 
 This document exists to ground a proposed re-layering before any code moves.
 Every number below is measured on `8510ca5f2` and reproducible with the
@@ -116,17 +116,17 @@ implementations** and **zero** `cfg(feature = "arch-*")` gating in
 ## 3 · Proposed layering
 
 ```
-ksml-hal        hip-bridge, hsa-bridge, hipfire-detect
-ksml-compute    per-target, fully specialized, never genericized
-                  ksml-rdna    HIP, WMMA, PM4/Redline, radiowave
-                  ksml-xdna    XRT/AIE  [future]
-ksml-core       manifests, weight placement, step graphs, KV, sampling,
+saddle-hal        hip-bridge, hsa-bridge, hipfire-detect
+saddle-compute    per-target, fully specialized, never genericized
+                  saddle-rdna    HIP, WMMA, PM4/Redline, radiowave
+                  saddle-xdna    XRT/AIE  [future]
+saddle-core       manifests, weight placement, step graphs, KV, sampling,
                 grammar, spec-decode orchestration   <-- MISSING TODAY
 arch crates     thin trait implementations
 hipfire-engine  scheduler, batching, sessions, serve
 hipfire         one [[bin]]; cli, tui, client, registry
-ksml-quant      quantizer, calibration, ds4 parent/
-ksml-lab        research harnesses, outside the default build graph
+saddle-quant      quantizer, calibration, ds4 parent/
+saddle-lab        research harnesses, outside the default build graph
 ```
 
 ### 3.1 The load-bearing rule
@@ -145,7 +145,7 @@ resident draft model paired with a GPU-resident target over the existing
 spec-decode path. `[INFERENCE]` — plausible from the existing DFlash split;
 unproven, no XDNA work has been done.
 
-### 3.2 What ksml is not
+### 3.2 What saddle is not
 
 - Not a ggml clone. ggml is declarative-then-execute across 6+ backends.
   hipfire is execute-then-memoize with a PM4 lowering floor that has no ggml
@@ -163,11 +163,30 @@ deliberately neither. A realistic target is 1–3k per arch.
 
 ## 4 · Naming
 
-`ggml` = Georgi Gerganov + ML; `GGUF` = Georgi Gerganov Universal Format. The
-convention is personal initials, not an industry standard. `ksml` therefore
-reads as deliberate lineage — "to AMD what ggml is to consumer CPU inference" —
-and invites direct comparison, which is why § 2.2's ratio has to hold before
-the name is used publicly.
+**The substrate is named `saddle`.**
+
+The alternatives considered were initials-based: `ksml` (Kaden Schutt + ML,
+following `ggml` = Georgi Gerganov + ML and `GGUF` = Georgi Gerganov Universal
+Format) and `wmml` (warpfront). Both were rejected, and not on grounds of
+modesty — `ggml` drew no such criticism and the work here stands on its own.
+They were rejected on **adoption mechanics**: personal initials signal "one
+person's project" at exactly the moment the name must signal "substrate others
+build on," and no hardware vendor standardizes on an individual's initials.
+`wmml` inherits the same problem one layer removed, since warpfront resolves to
+the same person until it is a distinct org identity.
+
+`ggml` is also the exception rather than the pattern — MLX, candle, burn,
+tinygrad, JAX and PyTorch are all descriptive. `saddle` follows the established
+house style (hipfire, redline, radiowave, Magnum Quant, DFlash) and carries the
+right metaphor: the interface that makes raw power rideable, sitting between
+the model and the silicon. The optimization-theory sense of *saddle point* is a
+serviceable second reading.
+
+Attribution stays where it already lives and is already maintained: `NOTICE`,
+`CREDITS.md`, `CITATION.cff`, and the per-file SPDX headers.
+
+The name invites direct comparison with ggml, which is why § 2.2's ratio has to
+hold before it is used publicly.
 
 ---
 
@@ -175,17 +194,17 @@ the name is used publicly.
 
 Ordered by (value / risk):
 
-1. **Move `deepseek4/src/parent/` to `ksml-quant`.** 20,782 lines, zero
+1. **Move `deepseek4/src/parent/` to `saddle-quant`.** 20,782 lines, zero
    load-path references, mechanical. DS4 drops to ~30k.
 2. **`examples/` triage.** 195,143 lines into product bins / dev tools /
    research archive outside the default graph. Two known keeps regardless of
    reference count: PFlash (AGENTS.md policy) and `qwen35_batch_generate`
    (the DP4 sealed-case binary).
 3. **Delete the vestigial `loader_api::Carrier`** (0 impls) and add ratchets.
-4. **Unify `grammar.rs`** into `ksml-core`: 3,935 -> ~1,400.
+4. **Unify `grammar.rs`** into `saddle-core`: 3,935 -> ~1,400.
 5. **Harvest PR #527's completed spine** — `weight_manifest.rs` (4,662),
    `weight_store.rs` (6,829), `moe_plan.rs` (11,563), `STEP-001/002/003`,
-   `CAP-001`. This is already a ksml-core in all but name; see § 7.
+   `CAP-001`. This is already a saddle-core in all but name; see § 7.
 6. **Unify speculation** across qwen35/deepseek4 (#527 `SPEC-001`).
 7. **Arch crates to trait impls**; `[[example]] -> [[bin]]`; drop
    `required-features` 9 -> 0.
@@ -216,7 +235,7 @@ Each of these is a CI assertion that the number never increases:
 and is a *parallelism* program — PP/TP/EP mesh cells. That part is orthogonal
 to this document and neither blocks nor is blocked by it.
 
-However, #527's **completed** third is substantially the ksml-core proposed
+However, #527's **completed** third is substantially the saddle-core proposed
 here: manifest-driven weight placement, Step/manifest forward composition, and
 `CAP-001`'s capability contract. Harvesting it is strictly cheaper than
 re-deriving it, and it is the single largest input to § 5 item 5.
@@ -258,19 +277,20 @@ find src/models -name '*.cpp' | xargs wc -l | tail -1
 Resolved in the 2026-08-15 ideation pass are marked **[resolved]**; the
 reasoning is kept because it constrains later decisions.
 
-1. **Naming.** `ggml` = Georgi Gerganov + ML; `GGUF` = Georgi Gerganov
-   Universal Format. Personal initials, not an industry standard, and the
-   exception rather than the pattern — MLX, candle, burn, tinygrad, JAX and
-   PyTorch are all descriptive. The objection to `ksml` is not modesty but
-   adoption mechanics: personal initials signal "one person's project" exactly
-   when the name needs to signal "substrate others build on," and no hardware
-   vendor standardizes on an individual's initials. `wmml` (warpfront) is
-   org-branded and travels further, but resolves to the same person unless
-   warpfront becomes a distinct org identity. A descriptive name in the
-   established house style — hipfire, redline, radiowave, Magnum Quant,
-   DFlash — is the recommendation; attribution belongs in `NOTICE`,
-   `CREDITS.md`, and `CITATION.cff`, which already carry it. **Open: the name
-   itself.** This document uses `ksml` as a placeholder only.
+1. **Naming.** **[resolved — `saddle`.]** Full reasoning in § 4. In short:
+   initials-based candidates (`ksml`, `wmml`) were rejected on adoption
+   mechanics rather than modesty, and `ggml` is the exception rather than the
+   pattern among ML substrates. `saddle` follows the established house style
+   and carries the interface metaphor. Attribution remains in `NOTICE`,
+   `CREDITS.md`, `CITATION.cff` and the per-file SPDX headers.
+   Follow-on, still open: **does `saddle` own the on-disk format?** `GGUF` is
+   arguably more widely adopted than `ggml` itself, which suggests the
+   container and the quant-format family are the highest-leverage things a
+   substrate can standardize. If HFQ and the MQ/MFP family become
+   `saddle`-level, the quantizer is substrate-side and per-model calibration
+   oracles belong in a `saddle-quant` family; if they stay hipfire-level, the
+   newly extracted `hipfire-ds4-parent` keeps its current name. Nothing blocks
+   on this today.
 2. **Separate repository, or workspace boundary?** **[resolved — workspace
    boundary first.]** The experiment has already been run: `warpfront/redline`
    exists as a public repository *and* `crates/redline`, `crates/redline-dispatch`
@@ -290,7 +310,7 @@ reasoning is kept because it constrains later decisions.
    `[INFERENCE]`. When taken up, it is settled cheaply by KLD + perplexity at
    matched bpw against `UD-Q4_K_XL` on one model and one committed fixture.
 5. **`arch/release-and-layering`.** **[resolved — retired.]** 0 ahead / 261
-   behind, never pushed. `arch/ksml` is the refactor branch.
+   behind, never pushed. `arch/saddle` is the refactor branch.
 6. **XDNA feasibility.** No AIE work has been done. The heterogeneous
    NPU-draft / GPU-target idea in § 3.1 is unvalidated `[INFERENCE]`.
 7. **Where do the parent oracles land?** `hipfire-quantize` is the thematic
