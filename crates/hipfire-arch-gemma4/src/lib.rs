@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt, Kevin Read
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! hipfire-arch-gemma4: Gemma 4 dense text (`google/gemma-4-12B-it`) for hipfire.
+//! Gemma 4 dense text plus strictly admitted E2B/E4B text variants for hipfire.
 //!
 //! A DENSE 12B port of the Gemma 4 architecture. Distinguishing features vs a
 //! plain pre-norm transformer:
@@ -39,13 +39,10 @@ pub mod speculative;
 
 pub use arch::{Gemma4, ARCH_ID};
 pub use config::{Gemma4Config, LayerType, RopeType};
-pub use gemma4::{
-    FullLayerWeights, Gemma4State, Gemma4Weights, LayerWeights, SlidingLayerWeights,
-};
 pub use drafter::{
     drafter_step, drafter_step_from_concat, DrafterLayerWeights, DrafterStepOut,
-    Gemma4DrafterConfig,
-    Gemma4DrafterScratch, Gemma4DrafterWeights, DRAFTER_ARCH_ID,
+    Gemma4DrafterConfig, Gemma4DrafterScratch, Gemma4DrafterWeights, DRAFTER_ARCH_ID,
 };
-pub use speculative::{spec_step_gemma4_eagle, Gemma4SpecScratch, SpecStepOut};
 pub use forward::{forward_batch, forward_batch_spec};
+pub use gemma4::{FullLayerWeights, Gemma4State, Gemma4Weights, LayerWeights, SlidingLayerWeights};
+pub use speculative::{spec_step_gemma4_eagle, Gemma4SpecScratch, SpecStepOut};
