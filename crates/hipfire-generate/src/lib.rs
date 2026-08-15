@@ -33,6 +33,11 @@
 /// each other.
 pub mod common;
 
+/// The generic autoregressive generate path — the fallback every model
+/// without a specialised route takes, and the last daemon code that
+/// manipulates architecture types directly.
+pub mod ar;
+
 /// Qwen3.5/3.6 family: the multi-token path, native MTP, speculative and
 /// DFlash routes, and expert-parallel. The largest group —
 /// `generate_multi` alone is ~5,300 lines.
