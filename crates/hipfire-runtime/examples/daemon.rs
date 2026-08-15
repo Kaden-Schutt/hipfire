@@ -13958,7 +13958,7 @@ fn main() {
                         let mut staged_ep_slots: usize = 0;
                         let mut staged_ep_lane_cap: usize = 0;
                         if parsed_continuous_batch_size > 1 && m.pp == 1 && m.ep.is_none() {
-                            if matches!(m.arch_id, 5 | 6) {
+                            if hipfire_loader::carrier_for(m.arch_id).map(|c| c.name() == "qwen35").unwrap_or(false) {
                                 if let Some(ModelState::Qwen35(bundle)) = m.state.as_ref() {
                                     if !qwen_batch_weight_formats_supported(&bundle.weights) {
                                         eprintln!(
@@ -14019,7 +14019,7 @@ fn main() {
                                 } else {
                                     eprintln!("[daemon] continuous batch requested but model state not Qwen35 — fallback to sequential");
                                 }
-                            } else if m.arch_id == 11 {
+                            } else if hipfire_loader::carrier_for(m.arch_id).map(|c| c.name() == "lfm2moe").unwrap_or(false) {
                                 if let Some(ModelState::Lfm2Moe(bundle)) = m.state.as_ref() {
                                     if !bundle.config.is_dense() {
                                         eprintln!(
@@ -14764,7 +14764,7 @@ fn main() {
                 };
 
                 let has_image = image_base64.is_some() || image.is_some();
-                let is_dots_ocr = m.arch_id == 8;
+                let is_dots_ocr = hipfire_loader::carrier_for(m.arch_id).map(|c| c.is_dots_ocr()).unwrap_or(false);
                 let has_vl = m.vision_config.is_some() || is_dots_ocr;
 
                 if has_image && !has_vl {
@@ -15718,256 +15718,16 @@ fn main() {
                 let _ = gpu.hip.device_synchronize();
                 let t0 = Instant::now();
                 let mut prefill_err: Option<String> = None;
-                let run_ok = if m.arch_id == 5 || m.arch_id == 6 {
-                    let ModelState::Qwen35(b) = m.state.as_mut().unwrap() else {
-                        unreachable!()
-                    };
-                    let config = &b.config;
-                    let weights = &b.weights;
-                    let scratch = &b.scratch;
-                    let kv = &mut b.kv_cache;
-                    let dn = &mut b.dn_state;
-                    qwen35::forward_prefill_batch(
-                        &mut gpu, weights, config, &synthetic, 0, kv, dn, scratch, None, None,
-                        None, None,
-                    )
-                    .is_ok()
-                } else if m.arch_id == 7 {
-                    // Qwen2 has no batched prefill kernel yet — per-token loop
-                    // mirroring the LLaMA fallback path. The loop seeds
-                    // position via `state.next_pos` (already reset above to 0).
-                    let ModelState::Qwen2(b) = m.state.as_mut().unwrap() else {
-                        unreachable!()
-                    };
-                    let config = &b.config;
-                    let weights = &b.weights;
-                    let state = &mut b.state;
-                    let mut ok = true;
-                    for &tok in &synthetic {
-                        if qwen2::forward_step(&mut gpu, weights, config, state, tok).is_err() {
-                            ok = false;
-                            break;
-                        }
-                    }
-                    ok
-                } else if m.arch_id == 9 {
-                    // DeepSeek V4: exercise the same chunked batched prefill
-                    // entry as `generate_deepseek4`, while retaining the
-                    // deterministic synthetic-token contract of bench_prefill.
-                    // Borrow the PBS and model state as disjoint LoadedModel
-                    // fields, matching the production generate path.
-                    let pbs = m
-                        .deepseek4_pbs
-                        .as_mut()
-                        .expect("deepseek4_pbs missing on arch_id=9 bench_prefill");
-                    let Some(ModelState::Deepseek4(b)) = m.state.as_mut() else {
-                        unreachable!("arch_id=9 requires deepseek4 bundle")
-                    };
-                    let config = &b.config;
-                    let weights = &b.weights;
-                    let state = &mut b.state;
-                    let ok = deepseek4::forward::forward_prefill_batch_chunked(
-                        config, weights, state, &mut gpu, &synthetic, 0, pbs,
-                    )
-                    .is_ok();
-                    if ok {
-                        state.n_tokens = n as u64;
-                    }
-                    ok
-                } else if m.arch_id == 11 {
-                    // LFM2.5-MoE warm-pass: per-token decode_step over the
-                    // synthetic prompt. Saturates the conv + GQA + QK-norm +
-                    // RoPE + top-4 MoE kernel set before any user-facing
-                    // generate. This IS the production prefill shape (no
-                    // batched kernel).
-                    let b = m.lfm2moe_mut().expect("arch_id=11 requires lfm2moe bundle");
-                    let config = &b.config;
-                    let weights = &b.weights;
-                    let state = &mut b.state;
-                    let mut ok = true;
-                    for (i, &tok) in synthetic.iter().enumerate() {
-                        if lfm2moe::forward::decode_step(
-                            config, weights, state, &mut gpu, tok, i as u32,
-                        )
-                        .is_err()
-                        {
-                            ok = false;
-                            break;
-                        }
-                    }
-                    ok
-                } else if m.arch_id == 10 {
-                    // MiniMax-M2 warm-pass: per-token decode_step over the
-                    // synthetic prompt. Saturates the GQA + QK-norm + RoPE +
-                    // MoE kernel set before any user-facing generate. This IS
-                    // the production prefill shape (the eager per-token path).
-                    let b = m.minimax_mut().expect("arch_id=10 requires minimax bundle");
-                    let config = &b.config;
-                    let weights = &b.weights;
-                    let state = &mut b.state;
-                    let mut ok = true;
-                    for (i, &tok) in synthetic.iter().enumerate() {
-                        if minimax::forward::decode_step(
-                            config, weights, state, &mut gpu, tok, i as u32,
-                        )
-                        .is_err()
-                        {
-                            ok = false;
-                            break;
-                        }
-                    }
-                    ok
-                } else if m.arch_id == 12 {
-                    // Cohere2-MoE: measure the REAL production prefill — the
-                    // batched `forward_batch` (256-chunk) that `generate_cohere2moe`
-                    // uses — so the pp table reflects true prefill throughput
-                    // (~6x decode) instead of a per-token decode_step warm-pass
-                    // (which measures decode speed and mislabels it prefill).
-                    // Tiers with no indexed-MoE kernel (bf16 oracle / Q8 experts)
-                    // fall back to per-token, mirroring `forward_batch_supported`.
-                    let b = m
-                        .cohere2moe_mut()
-                        .expect("arch_id=12 requires cohere2moe bundle");
-                    let config = &b.config;
-                    let weights = &b.weights;
-                    let state = &mut b.state;
-                    let mut ok = true;
-                    if cohere2moe::forward::forward_batch_supported(weights) && synthetic.len() > 1
-                    {
-                        let mut i = 0;
-                        while i < synthetic.len() {
-                            let end = (i + 256).min(synthetic.len());
-                            let start_pos = state.n_tokens;
-                            if cohere2moe::forward::forward_batch(
-                                config,
-                                weights,
-                                state,
-                                &mut gpu,
-                                &synthetic[i..end],
-                                start_pos,
-                            )
-                            .is_err()
-                            {
-                                ok = false;
-                                break;
-                            }
-                            i = end;
-                        }
-                    } else {
-                        for (i, &tok) in synthetic.iter().enumerate() {
-                            if cohere2moe::forward::decode_step(
-                                config, weights, state, &mut gpu, tok, i as u32,
-                            )
-                            .is_err()
-                            {
-                                ok = false;
-                                break;
-                            }
-                        }
-                    }
-                    ok
-                } else if m.arch_id == 13 {
-                    // Gemma4 warm-pass: per-token decode_step over the
-                    // synthetic prompt. Uses eager dense path (no lowered).
-                    let Some(ModelState::Gemma4(bundle)) = m.state.as_mut() else {
-                        unreachable!("arch_id=13 requires gemma4 bundle")
-                    };
-                    let config = &bundle.config;
-                    let weights = &bundle.weights;
-                    let state = &mut bundle.state;
-                    let mut ok = true;
-                    for (i, &tok) in synthetic.iter().enumerate() {
-                        if gemma4::forward::decode_step(
-                            config, weights, state, &mut gpu, tok, i as u32,
-                        )
-                        .is_err()
-                        {
-                            ok = false;
-                            break;
-                        }
-                    }
-                    ok
-                } else if m.arch_id == 14 {
-                    // Muse Glimmer (arch_id=14).
-                    // Glimmer prefills in BATCHED chunks, so bench it that way.
-                    // This used to loop `decode_step` per token, mirroring the
-                    // Gemma4 warm-pass shape, which measured the eager path that
-                    // `generate` stopped using — `hipfire bench --matrix` was
-                    // reporting a route production never takes (and ~20x slower
-                    // than the real one). Route through the same
-                    // prefill path the generate path calls (device when enabled).
-                    let Some(ModelState::MuseGlimmer(bundle)) = m.state.as_mut() else {
-                        unreachable!("arch_id=14 requires muse_glimmer bundle")
-                    };
-                    if bundle.device_hidden_capture_enabled() {
-                        match glimmer::forward::prefill_with_device_capture(
-                            &bundle.config,
-                            &bundle.weights,
-                            &mut bundle.state,
-                            &mut gpu,
-                            &synthetic,
-                            0,
-                        ) {
-                            Ok(_) => true,
-                            Err(e) => {
-                                prefill_err = Some(e);
-                                false
-                            }
-                        }
-                    } else {
-                        let mut hidden_out: Vec<f32> = Vec::new();
-                        match glimmer::forward::prefill_with_capture(
-                            &bundle.config,
-                            &bundle.weights,
-                            &mut bundle.state,
-                            &mut gpu,
-                            &synthetic,
-                            0,
-                            &[],
-                            &mut hidden_out,
-                        ) {
-                            Ok(_) => true,
-                            Err(e) => {
-                                prefill_err = Some(e);
-                                false
-                            }
-                        }
-                    }
-                } else if m.arch_id == 8 {
-                    // dots.ocr: Qwen2 text decoder via qwen2_state + dots_ocr fields.
-                    let state = m.qwen2_state.as_mut().unwrap();
-                    let config = m.dots_ocr_config.as_ref().unwrap();
-                    let weights = m.dots_ocr_weights.as_ref().unwrap();
-                    let mut ok = true;
-                    for &tok in &synthetic {
-                        if qwen2::forward_step(&mut gpu, &weights.text, &config.text, state, tok)
-                            .is_err()
-                        {
-                            ok = false;
-                            break;
-                        }
-                    }
-                    ok
-                } else {
-                    let ModelState::Llama(b) = m.state.as_mut().unwrap() else {
-                        unreachable!()
-                    };
-                    let config = &b.config;
-                    let weights = &b.weights;
-                    let scratch = &b.scratch;
-                    let kv = &mut b.kv;
-                    let mut ok = true;
-                    for (i, &tok) in synthetic.iter().enumerate() {
-                        if llama::forward_scratch(
-                            &mut gpu, weights, config, tok, i, kv, scratch, 0.0, 1.0, 42, 0, 1.0,
-                        )
-                        .is_err()
-                        {
-                            ok = false;
-                            break;
-                        }
-                    }
-                    ok
+                let run_ok = {
+                    // Arch-erased bench-prefill dispatch via Carrier (wave2 GenDispatch).
+                    // Each carrier implements its architecture's synthetic prefill body
+                    // verbatim; the daemon no longer matches on arch_id. See
+                    // `hipfire_loader::Carrier::bench_prefill`.
+                    let carrier = hipfire_loader::carrier_for(m.arch_id)
+                        .expect("bench_prefill: unknown arch_id");
+                    carrier
+                        .bench_prefill(m, &mut gpu, &synthetic, n, &mut prefill_err)
+                        .expect("bench_prefill: carrier does not implement bench_prefill for this arch")
                 };
                 let _ = gpu.hip.device_synchronize();
                 let elapsed = t0.elapsed().as_secs_f64();
@@ -16050,7 +15810,7 @@ fn main() {
                         continue;
                     }
                 };
-                if m.arch_id == 9 {
+                if hipfire_loader::carrier_for(m.arch_id).map(|c| c.name() == "deepseek4").unwrap_or(false) {
                     match redline_bench_decode_deepseek4(&mut gpu, m, &msg) {
                         Ok(response) => {
                             let _ = writeln!(stdout, "{response}");
@@ -16066,7 +15826,7 @@ fn main() {
                     let _ = stdout.flush();
                     continue;
                 }
-                if m.arch_id == 11 {
+                if hipfire_loader::carrier_for(m.arch_id).map(|c| c.name() == "lfm2moe").unwrap_or(false) {
                     match redline_bench_decode_lfm2moe(&mut gpu, m, &msg) {
                         Ok(response) => {
                             let _ = writeln!(stdout, "{response}");
@@ -16163,56 +15923,9 @@ fn main() {
                 m.conversation_tokens.clear();
                 let _ = reset_qwen35_recurrent(m, &mut gpu);
                 let synthetic: Vec<u32> = (0..context as u32).map(|i| 10 + (i % 1000)).collect();
-                let prime_error: Option<String> = if m.arch_id == 14 {
-                    let Some(ModelState::MuseGlimmer(bundle)) = m.state.as_mut() else {
-                        unreachable!("arch_id=14 requires muse_glimmer bundle")
-                    };
-                    bundle.reset_session_state();
-                    if bundle.device_hidden_capture_enabled() {
-                        glimmer::forward::prefill_with_device_capture(
-                            &bundle.config,
-                            &bundle.weights,
-                            &mut bundle.state,
-                            &mut gpu,
-                            &synthetic,
-                            0,
-                        )
-                        .err()
-                    } else {
-                        let mut hidden_out: Vec<f32> = Vec::new();
-                        glimmer::forward::prefill_with_capture(
-                            &bundle.config,
-                            &bundle.weights,
-                            &mut bundle.state,
-                            &mut gpu,
-                            &synthetic,
-                            0,
-                            &[],
-                            &mut hidden_out,
-                        )
-                        .err()
-                    }
-                } else {
-                    let ModelState::Qwen35(b) = m.state.as_mut().unwrap() else {
-                        unreachable!()
-                    };
-                    qwen35::forward_prefill_batch(
-                        &mut gpu,
-                        &b.weights,
-                        &b.config,
-                        &synthetic,
-                        0,
-                        &mut b.kv_cache,
-                        &mut b.dn_state,
-                        &b.scratch,
-                        None,
-                        None,
-                        None,
-                        None,
-                    )
-                    .err()
-                    .map(|e| format!("{e:?}"))
-                };
+                let prime_error: Option<String> = hipfire_loader::carrier_for(m.arch_id)
+                    .and_then(|c| c.bench_decode_prime(m, &mut gpu, &synthetic))
+                    .unwrap_or(None);
                 let _ = gpu.hip.device_synchronize();
                 if let Some(error) = prime_error {
                     emit_uncorrelated_error(
@@ -16250,58 +15963,9 @@ fn main() {
                 let _ = gpu.hip.device_synchronize();
                 let t0 = Instant::now();
                 let mut decode_err: Option<String> = None;
-                let run_ok = if m.arch_id == 14 {
-                    let Some(ModelState::MuseGlimmer(bundle)) = m.state.as_mut() else {
-                        unreachable!("arch_id=14 requires muse_glimmer bundle")
-                    };
-                    let config = &bundle.config;
-                    let weights = &bundle.weights;
-                    let state = &mut bundle.state;
-                    let mut ok = true;
-                    for i in 0..iterations {
-                        let token = 101 + (i as u32 % 1000);
-                        match glimmer::forward::decode_step(
-                            config,
-                            weights,
-                            state,
-                            &mut gpu,
-                            token,
-                            (context + i) as u32,
-                        ) {
-                            Ok(_) => {}
-                            Err(e) => {
-                                decode_err = Some(format!("iter {i} pos {}: {e}", context + i));
-                                ok = false;
-                                break;
-                            }
-                        }
-                    }
-                    ok
-                } else {
-                    let ModelState::Qwen35(b) = m.state.as_mut().unwrap() else {
-                        unreachable!()
-                    };
-                    let mut ok = true;
-                    for i in 0..iterations {
-                        let token = 101 + (i as u32 % 1000);
-                        if qwen35::forward_scratch(
-                            &mut gpu,
-                            &b.weights,
-                            &b.config,
-                            token,
-                            context + i,
-                            &mut b.kv_cache,
-                            &mut b.dn_state,
-                            &b.scratch,
-                        )
-                        .is_err()
-                        {
-                            ok = false;
-                            break;
-                        }
-                    }
-                    ok
-                };
+                let run_ok = hipfire_loader::carrier_for(m.arch_id)
+                    .and_then(|c| c.bench_decode_run(m, &mut gpu, context, iterations, &mut decode_err))
+                    .unwrap_or(false);
                 let _ = gpu.hip.device_synchronize();
                 let elapsed = t0.elapsed().as_secs_f64();
                 let replay_after = gpu.replay.replay_observation();
@@ -17620,7 +17284,7 @@ fn generate_ep(
     // `primed_think` records whether the render ended on the MiniMax `<think>`
     // generation primer (re-emitted display-only in ep_serve_minimax). ──
     let mut primed_think = false;
-    let prompt_ids: Vec<u32> = if m.arch_id == 9 {
+    let prompt_ids: Vec<u32> = if hipfire_loader::carrier_for(m.arch_id).map(|c| c.name() == "deepseek4").unwrap_or(false) {
         primed_think = false;
         let tokenizer = m.tokenizer.as_ref().unwrap();
         let eos_tok = m.deepseek4_eos_tok;
@@ -17737,7 +17401,7 @@ fn generate_ep(
         let _ = stdout.flush();
         return;
     }
-    let eos_tok = if m.arch_id == 10 {
+    let eos_tok = if hipfire_loader::carrier_for(m.arch_id).map(|c| c.name() == "minimax").unwrap_or(false) {
         // MiniMax EP state lives in `m.ep`, not `m.state`, so `minimax()` is
         // None here — read the EP eos carried on LoadedModel (set at load).
         m.minimax_eos_tok
@@ -24114,7 +23778,7 @@ fn generate(
     // lfm2moe/minimax short-circuits: bypass the DFlash/spec/sampler-budget
     // scaffolding below (all refused at load for arch 13). Without this arm
     // arch 13 falls through to the Qwen AR arm — the bug this fixes.
-    if m.arch_id == 13 {
+    if hipfire_loader::carrier_for(m.arch_id).map(|c| c.name() == "gemma4").unwrap_or(false) {
         // The loader publishes one of two mutually-exclusive Gemma4 states:
         // eager dense (ModelState::Gemma4) and lowered/MoE
         // (ModelState::Gemma4Lowered). The generate body is eager-only, so a
@@ -24166,7 +23830,7 @@ fn generate(
     // arch_id=14 (Muse Glimmer dense): eager AR path. Same shape as the
     // gemma4 short-circuit: bypass the DFlash/spec/sampler-budget scaffolding
     // below. Without this arm arch 14 falls through to the Qwen AR arm.
-    if m.arch_id == 14 {
+    if hipfire_loader::carrier_for(m.arch_id).map(|c| c.name() == "muse_glimmer").unwrap_or(false) {
         let _ = (
             budget_alert_at_tok,
             budget_alert_text,

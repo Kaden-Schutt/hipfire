@@ -90,6 +90,119 @@ pub trait Carrier: Send + Sync {
     ) -> Result<Box<dyn SpecEmit + 'a>, String> {
         Err(format!("{}: spec emitter unsupported", self.name()))
     }
+
+    // ── GenDispatch (wave2) — arch-erased generation/bench hooks ──────────
+    // These are ADDITIVE ONLY; CarrierPolicy is concurrently adding caps() and
+    // sampling_defaults() in the same trait. Do not restructure.
+
+    /// Bench-prefill dispatch for `bench_prefill` (daemon.rs:15793-16008).
+    /// The ~215-line `if m.arch_id == 5 { ... } else if ...` selecting a
+    /// per-arch prefill path. Each carrier implements its arch's body
+    /// verbatim; the daemon resolves `carrier_for(arch_id)` and calls this
+    /// once. `None` = not handled (caller falls through), `Some(run_ok)`
+    /// = handled. `prefill_err` is set only by the Glimmer path, mirroring
+    /// the daemon's mutable capture.
+    fn bench_prefill(
+        &self,
+        _m: &mut LoadedModel,
+        _gpu: &mut Gpu,
+        _synthetic: &[u32],
+        _n: usize,
+        _prefill_err: &mut Option<String>,
+    ) -> Option<bool> {
+        None
+    }
+
+    /// Whether this carrier is the dots.ocr arch (daemon.rs:14839
+    /// `is_dots_ocr = m.arch_id == 8`).
+    fn is_dots_ocr(&self) -> bool {
+        false
+    }
+
+    /// Whether this carrier supports the continuous-batch staging path that
+    /// the daemon gates on `m.arch_id == 11` (daemon.rs:14061) or
+    /// `matches!(m.arch_id, 5|6)` for Qwen. Returns true for the two
+    /// batch-capable families, false otherwise. The daemon keeps the
+    /// staging bodies but dispatches via this predicate instead of
+    /// `arch_id ==`.
+    fn supports_continuous_batch(&self) -> bool {
+        false
+    }
+
+    /// Try to handle `bench_decode` redline dispatch (daemon.rs:16125 arch 9,
+    /// 16141 arch 11). Return `Some(Ok(json))` or `Some(Err(reason))` if
+    /// this carrier handled the request (daemon must write/flush and
+    /// `continue`), `None` to fall through to the generic Qwen/Glimmer
+    /// bench_decode path.
+    fn try_bench_decode(
+        &self,
+        _m: &mut LoadedModel,
+        _gpu: &mut Gpu,
+        _msg: &serde_json::Value,
+    ) -> Option<Result<serde_json::Value, String>> {
+        None
+    }
+
+    /// Bench-decode prime for the generic Qwen/Glimmer path
+    /// (daemon.rs:16238 `prime_error` if arch_id==14 else Qwen). Return
+    /// `Some(prime_error)` if handled, `None` if not this carrier's arch.
+    /// The outer `Option` is dispatch; the inner `Option<String>` is the
+    /// prime error (None = prime succeeded).
+    fn bench_decode_prime(
+        &self,
+        _m: &mut LoadedModel,
+        _gpu: &mut Gpu,
+        _synthetic: &[u32],
+    ) -> Option<Option<String>> {
+        None
+    }
+
+    /// Bench-decode run for the generic Qwen/Glimmer path
+    /// (daemon.rs:16325 `run_ok` if arch_id==14 else Qwen). Return
+    /// `Some((run_ok, decode_err))` if handled, `None` otherwise.
+    /// `decode_err` captures the first failing iteration's diagnostic for
+    /// Glimmer.
+    fn bench_decode_run(
+        &self,
+        _m: &mut LoadedModel,
+        _gpu: &mut Gpu,
+        _context: usize,
+        _iterations: usize,
+        _decode_err: &mut Option<String>,
+    ) -> Option<bool> {
+        None
+    }
+
+    /// EP prompt construction (daemon.rs:17695 `prompt_ids` if arch_id==9
+    /// else Jinja). Return `Some(ids)` if this carrier handles the EP
+    /// prompt, `None` otherwise.
+    fn ep_prompt_ids(
+        &self,
+        _m: &mut LoadedModel,
+        _prompt: &str,
+        _system_prompt: Option<&str>,
+        _tools: Option<&[serde_json::Value]>,
+        _messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+        _think_mode: hipfire_runtime::prompt_frame::ThinkMode,
+    ) -> Option<Vec<u32>> {
+        None
+    }
+
+    /// EP EOS token selection (daemon.rs:17812 `eos_tok` if arch_id==10
+    /// else deepseek4). Return `Some(tok)` if handled.
+    fn ep_eos_tok(&self, _m: &LoadedModel) -> Option<u32> {
+        None
+    }
+
+    /// Early generate short-circuit for Gemma4 (13) and Glimmer (14)
+    /// (daemon.rs:24179,24231). Return true if this carrier claims the
+    /// generate path and the daemon should treat it as handled (i.e. the
+    /// caller must `return`), false otherwise. The daemon keeps the
+    /// `generate_gemma4` / `generate_muse_glimmer` bodies but gates them
+    /// via this predicate instead of `arch_id ==`.
+    fn handles_generate_early(&self) -> bool {
+        false
+    }
 }
 
 /// The single registry lookup the daemon's spec path routes through: resolve the
