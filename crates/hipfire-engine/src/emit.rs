@@ -208,7 +208,6 @@ pub fn emit_uncorrelated_error(
 ) {
     write_error_envelope(stdout, id, message, class, retryable, rolled_back, 0);
 }
-
 fn write_error_envelope(
     stdout: &mut impl std::io::Write,
     id: Option<&str>,
@@ -218,17 +217,37 @@ fn write_error_envelope(
     rolled_back: bool,
     attempt_id: u64,
 ) {
-    let envelope = serde_json::json!({
+    let mut envelope = serde_json::json!({
         "type": "error",
-        "id": id,
-        "error": message,
+        "message": message,
         "class": class,
         "retryable": retryable,
         "rolled_back": rolled_back,
         "attempt_id": attempt_id,
     });
+    if let Some(id) = id {
+        envelope["id"] = serde_json::Value::String(id.to_owned());
+    }
     let _ = writeln!(stdout, "{}", envelope);
     let _ = stdout.flush();
+}
+
+/// Emit a single-line `{"type":"error","id":"...","message":"..."}` JSON
+/// line on the IPC stream (active-attempt internal error, echoes TLS).
+pub fn write_error(stdout: &mut impl std::io::Write, id: &str, message: &str) {
+    emit_active_attempt_error(stdout, Some(id), message, "internal", false, false);
+}
+
+/// Typed active-attempt error writer used by generation failure paths.
+pub fn write_typed_error(
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    message: &str,
+    class: &str,
+    retryable: bool,
+    rolled_back: bool,
+) {
+    emit_active_attempt_error(stdout, Some(id), message, class, retryable, rolled_back);
 }
 
 pub fn emit_qwen_ar_info(stdout: &mut impl std::io::Write, id: &str, message: &str) {

@@ -579,6 +579,17 @@ pub fn batch_messages_are_single_user(msg: &serde_json::Value) -> bool {
     if role != "user" {
         return false;
     }
+    // Tool calls on the sole message disqualify batching (unless empty).
+    if let Some(tool_calls) = entry.get("tool_calls") {
+        if let Some(arr) = tool_calls.as_array() {
+            if !arr.is_empty() {
+                return false;
+            }
+        } else if !tool_calls.is_null() {
+            // Non-array tool_calls is malformed but treat as present.
+            return false;
+        }
+    }
     // Single user content must be a string, not tool payloads.
     entry.get("content").and_then(|v| v.as_str()).is_some()
 }
@@ -587,7 +598,7 @@ pub fn parse_continuous_batch_size(params: Option<&serde_json::Value>) -> usize 
     params
         .and_then(|v| v.get("continuous_batch_size"))
         .and_then(|v| v.as_u64())
-        .unwrap_or(0) as usize
+        .unwrap_or(1) as usize
 }
 
 pub fn parse_serve_continuous_batch(msg: &serde_json::Value) -> bool {
