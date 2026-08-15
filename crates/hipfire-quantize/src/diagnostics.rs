@@ -23,6 +23,9 @@ use crate::gguf_input;
 use crate::reap_overlay;
 use crate::quant_mq::*;
 use crate::quant_hfp4::*;
+use crate::quant_fwht::{cpu_fwht_256, gen_fwht_signs};
+use crate::dequant::{dequantize_e2m1_ue8m0_to_f32, e2m1_to_f32};
+use crate::calibration::awq_eligible;
 use crate::quant_e8::*;
 use crate::hfq::*;
 
