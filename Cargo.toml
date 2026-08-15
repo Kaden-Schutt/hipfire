@@ -39,6 +39,7 @@ members = [
     "crates/hipfire-cli",
     "crates/hipfire-client",
     "crates/hipfire-daemon",
+    "crates/saddle-lab",
 ]
 
 [workspace.package]

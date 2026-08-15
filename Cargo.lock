@@ -2220,6 +2220,48 @@ dependencies = [
 ]
 
 [[package]]
+name = "saddle-lab"
+version = "0.3.0"
+dependencies = [
+ "base64",
+ "byteorder",
+ "half",
+ "hip-bridge",
+ "hipfire-arch-cohere2moe",
+ "hipfire-arch-deepseek4",
+ "hipfire-arch-dots-ocr",
+ "hipfire-arch-gemma4",
+ "hipfire-arch-lfm2moe",
+ "hipfire-arch-llama",
+ "hipfire-arch-minimax",
+ "hipfire-arch-muse-glimmer",
+ "hipfire-arch-qwen2",
+ "hipfire-arch-qwen35",
+ "hipfire-arch-qwen35-vl",
+ "hipfire-atlas",
+ "hipfire-config",
+ "hipfire-detect",
+ "hipfire-dispatch",
+ "hipfire-engine",
+ "hipfire-loader",
+ "hipfire-pflash",
+ "hipfire-runtime",
+ "libc",
+ "memmap2",
+ "minijinja",
+ "minijinja-contrib",
+ "rayon",
+ "rdna-compute",
+ "regex",
+ "saddle-core",
+ "safetensors",
+ "serde",
+ "serde_json",
+ "smallvec",
+ "tracing",
+]
+
+[[package]]
 name = "safetensors"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

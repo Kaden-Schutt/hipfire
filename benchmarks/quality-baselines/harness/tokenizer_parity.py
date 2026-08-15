@@ -40,7 +40,7 @@ def hipfire_tokenize(model: Path, slice_path: Path, target_dir: Path) -> list[in
     if not bin_path.exists():
         print(f"  building tokenize_slice (not at {bin_path})...", file=sys.stderr)
         subprocess.run(
-            ["cargo", "build", "--release", "-p", "hipfire-runtime", "--example", "tokenize_slice"],
+            ["cargo", "build", "--release", "-p", "saddle-lab", "--example", "tokenize_slice"],
             check=True,
         )
 

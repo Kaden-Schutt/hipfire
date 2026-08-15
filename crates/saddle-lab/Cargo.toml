@@ -1,0 +1,273 @@
+[package]
+name = "saddle-lab"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Archived research harnesses and legacy benchmarks — not part of the default build graph. Each binary builds on request via `cargo build -p saddle-lab --examples` or `cargo build --workspace --all-targets`."
+
+[features]
+default = ["deltanet", "arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-cohere2moe", "arch-dots-ocr", "arch-gemma4", "arch-muse-glimmer"]
+deltanet = ["rdna-compute/deltanet", "hipfire-dispatch/deltanet"]
+arch-qwen35 = []
+arch-qwen35-vl = []
+arch-llama = []
+arch-qwen2 = []
+arch-deepseek4 = []
+arch-cohere2moe = []
+arch-dots-ocr = []
+arch-gemma4 = []
+arch-muse-glimmer = []
+ep-fault-inject = []
+serve-fault-inject = []
+
+[dependencies]
+hip-bridge = { path = "../hip-bridge" }
+hipfire-config = { path = "../hipfire-config" }
+rdna-compute = { path = "../rdna-compute" }
+saddle-core = { path = "../saddle-core" }
+hipfire-dispatch = { path = "../hipfire-dispatch" }
+hipfire-runtime = { path = "../hipfire-runtime" }
+hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35" }
+hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl" }
+hipfire-arch-llama = { path = "../hipfire-arch-llama" }
+hipfire-arch-qwen2 = { path = "../hipfire-arch-qwen2" }
+hipfire-arch-lfm2moe = { path = "../hipfire-arch-lfm2moe" }
+hipfire-arch-minimax = { path = "../hipfire-arch-minimax" }
+hipfire-arch-cohere2moe = { path = "../hipfire-arch-cohere2moe" }
+hipfire-arch-deepseek4 = { path = "../hipfire-arch-deepseek4" }
+hipfire-arch-dots-ocr = { path = "../hipfire-arch-dots-ocr" }
+hipfire-arch-gemma4 = { path = "../hipfire-arch-gemma4" }
+hipfire-arch-muse-glimmer = { path = "../hipfire-arch-muse-glimmer" }
+hipfire-pflash = { path = "../hipfire-pflash" }
+hipfire-engine = { path = "../hipfire-engine" }
+hipfire-loader = { path = "../hipfire-loader" }
+hipfire-detect = { path = "../hipfire-detect" }
+hipfire-atlas = { path = "../hipfire-atlas" }
+memmap2 = "0.9"
+safetensors.workspace = true
+half.workspace = true
+byteorder = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+base64 = "0.22"
+libc = "0.2"
+rayon = "1"
+smallvec = "1"
+regex = "1"
+minijinja = { version = "2", features = ["loop_controls", "json", "preserve_order"] }
+minijinja-contrib = { version = "2", features = ["pycompat"] }
+tracing = "0.1"
+
+# ── Archived examples (relocated from hipfire-runtime) ───────────────────
+# Each entry was `[[example]]` in hipfire-runtime/Cargo.toml with an identical
+# `required-features` gate. The gate is preserved here so `cargo build -p
+# saddle-lab --examples` reproduces the same feature matrix, but the default
+# build graph (`cargo build`) no longer compiles them.
+
+[[example]]
+name = "hfq_split"
+required-features = []
+
+[[example]]
+name = "gpus_smoke"
+required-features = []
+
+[[example]]
+name = "infer_qwen35"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "infer_qwen3"
+required-features = ["arch-llama"]
+
+[[example]]
+name = "infer_vl"
+required-features = ["arch-qwen35-vl", "arch-qwen35"]
+
+[[example]]
+name = "infer"
+required-features = ["arch-qwen35", "arch-qwen35-vl"]
+
+[[example]]
+name = "infer_hfq"
+required-features = ["arch-llama"]
+
+[[example]]
+name = "run"
+required-features = ["arch-qwen35", "deltanet"]
+
+[[example]]
+name = "a3b_load_check"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "a3b_multiturn_oneshot"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "qwen35_batch_generate"
+required-features = ["arch-qwen35", "deltanet"]
+
+[[example]]
+name = "a3b_smoke_forward"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "bench_qwen35_forward"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "channel_test_mmq"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "mtp_probe_demo"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "mtp_only_demo"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "dump_logits_qwen35"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "dump_qwen35_hidden_states"
+required-features = ["arch-qwen35", "deltanet"]
+
+[[example]]
+name = "greedy_dump"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "greedy_dump_top5"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "kv_mode_kld"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "logit_dump"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "perplexity"
+required-features = ["arch-qwen35", "deltanet"]
+
+[[example]]
+name = "probe_argmax_agreement"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "profile_attention_phases"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "profile_bandwidth_fwd"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "profile_deltanet"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "profile_host_vs_gpu"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "profile_qwen35_mq4"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "profile_prefill_qwen35"
+required-features = ["arch-qwen35", "deltanet"]
+
+[[example]]
+name = "test_inference"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "test_inferenceQA"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "test_long_ctx"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "test_qwen35_load"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "test_qwen35_loadQA"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "test_forward_slots_golden"
+required-features = ["arch-qwen35", "deltanet"]
+
+[[example]]
+name = "demo_multislot_generate"
+required-features = ["arch-qwen35", "deltanet"]
+
+[[example]]
+name = "demo_concurrent_serve"
+required-features = ["arch-qwen35", "deltanet"]
+
+[[example]]
+name = "triattn_accuracy_sweep"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "triattn_decode_demo"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "triattn_infer"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "triattn_longctx_demo"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "triattn_periodic_demo"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "pp_parity"
+required-features = ["arch-qwen35", "deltanet"]
+
+[[example]]
+name = "pp2_vram_probe"
+required-features = ["arch-qwen35", "deltanet"]
+
+[[example]]
+name = "build_kld_ref_native"
+required-features = ["arch-qwen35", "deltanet"]
+
+[[example]]
+name = "eval_hipfire_fullvocab"
+required-features = ["arch-qwen35", "deltanet"]
+
+[[example]]
+name = "oracle_xcheck"
+required-features = ["arch-qwen35", "deltanet"]
+
+[[example]]
+name = "collect_e8_hessian_native"
+required-features = ["arch-qwen35", "deltanet"]
+
+[[example]]
+name = "eval_hipfire_llama"
+required-features = ["arch-llama"]
+
+[[example]]
+name = "tokenize_slice"
+required-features = []
+
+[[example]]
+name = "imatrix_collect"
+required-features = []
