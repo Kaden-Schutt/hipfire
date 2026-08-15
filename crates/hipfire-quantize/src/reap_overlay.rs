@@ -743,7 +743,7 @@ mod prune_tests {
 #[cfg(test)]
 mod bake_finalize_tests {
     use super::*;
-    use crate::patch_expert_count_metadata;
+    use crate::hfq::patch_expert_count_metadata;
     use hipfire_reap::gather::gather_rows;
 
     #[test]
@@ -879,7 +879,8 @@ mod bake_finalize_tests {
 #[cfg(test)]
 mod integ {
     use super::*;
-    use crate::{quantize_hfq4g256, write_hfq};
+    use crate::hfq::write_hfq;
+    use crate::quant_fwht::quantize_hfq4g256;
     use hipfire_reap::plan::ReapPlan;
     use hipfire_runtime::hfq::HfqFile;
     use std::sync::Mutex;

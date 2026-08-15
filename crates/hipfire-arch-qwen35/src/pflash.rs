@@ -20,6 +20,7 @@ use hip_bridge::HipResult;
 use hipfire_dispatch::families::kv_tier::KTier;
 use hipfire_runtime::hfq::{self, HfqFile};
 use hipfire_runtime::llama::{self, ForwardScratch, KvCache, LlamaConfig, LlamaWeights};
+use hipfire_runtime::llama::KvCacheExt;
 use hipfire_runtime::tokenizer::Tokenizer;
 use rdna_compute::{DType, Gpu};
 use std::path::Path;

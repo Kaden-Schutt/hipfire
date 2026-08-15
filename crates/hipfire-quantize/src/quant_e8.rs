@@ -1071,6 +1071,11 @@ pub(crate) fn dequant_hfp4g32_row(packed: &[u8], k: usize) -> Vec<f32> {
 #[cfg(test)]
 mod awq_tests {
     use super::*;
+    use crate::calibration::{awq_pre_scale_weights, compute_awq_scales};
+    use crate::quant_hfp4::{quantize_hfp4g32_row, quantize_mfp4g32_2d};
+    use crate::quant_fwht::{cpu_fwht_256, gen_fwht_signs};
+    use crate::model_filter::{is_q8_tensor, q8_class_of, should_quantize};
+    use crate::dequant::{dequantize_e2m1_ue8m0_to_f32, e2m1_to_f32};
 
     /// Verify geometric mean of computed AWQ scales is ~1.0 — the
     /// normalization in compute_awq_scales should center the scale
@@ -1181,6 +1186,9 @@ mod awq_tests {
 #[cfg(test)]
 mod hfp4_tests {
     use super::*;
+    use crate::quant_hfp4::{quantize_hfp4g32_row, quantize_mfp4g32_2d};
+    use crate::dequant::{dequantize_e2m1_ue8m0_to_f32, e2m1_to_f32};
+    use crate::quant_fwht::{cpu_fwht_256, gen_fwht_signs};
 
     #[test]
     pub(crate) fn e2m1_round_matches_lattice() {

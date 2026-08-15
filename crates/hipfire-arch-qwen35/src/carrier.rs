@@ -8,6 +8,7 @@ use hipfire_runtime::kv_adaptive::{KvAdaptive, Preset};
 use hipfire_runtime::kv_backend::KvBackend;
 use hipfire_runtime::kv_mode::{self, ResolveResult};
 use hipfire_runtime::llama::{self, KvCache, KvDims, KvLayers, KvTarget};
+use hipfire_runtime::llama::KvCacheExt;
 use hipfire_runtime::loader_api::{LoadCtx, ModelSource};
 
 pub struct Qwen35Bundle {
@@ -349,7 +350,7 @@ fn construct_kv_cache(
             KvBackend::Contiguous => {
                 // Contiguous: allocate start-tier FWHT4/Q8 then floor-resize in place.
                 // If floor-resize fails, free the start-tier cache explicitly.
-                let mut kv = KvCache::from_mode_with_backend(
+                let mut kv = <KvCache as KvCacheExt>::from_mode_with_backend(
                     start_mode,
                     KvBackend::Contiguous,
                     KvTarget::Single(ctx.gpu),
@@ -397,7 +398,7 @@ fn construct_kv_cache(
                 )
                 .map_err(|e| format!("{e}"))?
             }
-            (KvBackend::Contiguous, llama::VMode::Q8) => KvCache::from_mode_with_backend(
+            (KvBackend::Contiguous, llama::VMode::Q8) => <KvCache as KvCacheExt>::from_mode_with_backend(
                 mode,
                 KvBackend::Contiguous,
                 KvTarget::Single(ctx.gpu),
@@ -405,7 +406,7 @@ fn construct_kv_cache(
             )
             .map_err(|e| format!("{e}"))?,
             (KvBackend::Contiguous, vm) => {
-                let mut kv = KvCache::from_mode_with_backend(
+                let mut kv = <KvCache as KvCacheExt>::from_mode_with_backend(
                     mode,
                     KvBackend::Contiguous,
                     KvTarget::Single(ctx.gpu),

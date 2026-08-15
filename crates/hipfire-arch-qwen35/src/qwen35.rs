@@ -22,8 +22,8 @@ use hipfire_runtime::hfq_parallel::{read_hfq_jobs_ordered, HfqReadJob};
 use hipfire_runtime::llama::{
     self, f16_to_f32, fused_rmsnorm_rotate_for_mq, fused_rmsnorm_rotate_mq_batched_for,
     fused_silu_mul_rotate_mq_batched_for, rotate_x_mq_batched_for, weight_gemv_prerotated,
-    weight_gemv_swiglu_residual, EmbeddingFormat, ParoRotation, WeightTensor,
-};
+    weight_gemv_swiglu_residual, EmbeddingFormat, ParoRotation, WeightTensor};
+use hipfire_runtime::llama::KvCacheExt;
 use hipfire_runtime::model_load::{load_weights as rt_load_weights, LoadedWeights, WeightSource};
 use hipfire_runtime::model_source::ModelSource;
 use hipfire_runtime::multi_gpu::Gpus;

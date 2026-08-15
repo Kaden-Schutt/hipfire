@@ -13,6 +13,7 @@ pub use carriers::*;
 pub mod spec_build;
 
 use hipfire_arch_cohere2moe as cohere2moe;
+use hipfire_runtime::llama::KvCacheExt;
 use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_dots_ocr::dots_ocr;
 use hipfire_arch_gemma4 as gemma4;

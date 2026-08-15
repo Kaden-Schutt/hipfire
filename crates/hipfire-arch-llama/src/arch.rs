@@ -18,6 +18,7 @@ use hip_bridge::HipResult;
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::{self, HfqFile};
 use hipfire_runtime::llama::{ForwardScratch, KvCache, LlamaConfig, LlamaWeights};
+use hipfire_runtime::llama::KvCacheExt;
 use rdna_compute::Gpu;
 
 use hipfire_dispatch::context::DispatchCtx;

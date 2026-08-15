@@ -3,8 +3,8 @@ use crate::Llama;
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::dspark_core::DsparkWeights;
 use hipfire_runtime::llama::{
-    ForwardScratch, KvCache, KvDims, KvLayers, KvTarget, LlamaConfig, LlamaWeights,
-};
+    ForwardScratch, KvCache, KvDims, KvLayers, KvTarget, LlamaConfig, LlamaWeights};
+use hipfire_runtime::llama::KvCacheExt;
 use hipfire_runtime::loader_api::{LoadCtx, ModelSource};
 
 pub struct LlamaBundle {
@@ -46,7 +46,7 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<LlamaBundle, S
         max_seq: ctx.max_seq,
         physical_cap: None,
     };
-    let kv = KvCache::from_mode(
+    let kv = <KvCache as KvCacheExt>::from_mode(
         hipfire_runtime::kv_mode::resolve(
             ctx.kv_mode_override.unwrap_or(""),
             &hipfire_runtime::kv_mode::LLAMA_HFQ_POLICY,
@@ -56,7 +56,7 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<LlamaBundle, S
         KvTarget::Single(ctx.gpu),
         &dims,
     )
-    .map_err(|e| format!("llama: KvCache::from_mode failed: {e}"))?;
+    .map_err(|e| format!("llama: <KvCache as KvCacheExt>::from_mode failed: {e}"))?;
     Ok(LlamaBundle {
         config,
         weights,

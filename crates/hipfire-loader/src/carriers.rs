@@ -5,6 +5,7 @@
 //! Each carrier owns its full load path (HFQ + safetensors-dir).
 
 use crate::spec_build::Qwen35SlotGuard;
+use hipfire_runtime::llama::KvCacheExt;
 use crate::Carrier;
 use crate::{
     finish_qwen35_load, resolve_chat_template, resolve_chat_template_overrides, LoadedModel,
@@ -254,7 +255,7 @@ fn load_qwen35_pp(
         max_seq: ctx.max_seq,
         physical_cap: Some(ctx.max_seq),
     };
-    let kv = hipfire_runtime::llama::KvCache::from_mode(
+    let kv = <hipfire_runtime::llama::KvCache as hipfire_runtime::llama::KvCacheExt>::from_mode(
         mode,
         hipfire_runtime::llama::KvTarget::Multi(&mut gpus),
         &dims,
@@ -472,7 +473,7 @@ impl Carrier for Qwen35Carrier {
                 hipfire_runtime::maybe_screen_mmq(&weights, ctx.gpu);
 
                 // Staged GPU free on every post-weight error (VMM arenas via free_gpu).
-                let kv_cache = match hipfire_runtime::llama::KvCache::from_mode_with_backend(
+                let kv_cache = match <hipfire_runtime::llama::KvCache as hipfire_runtime::llama::KvCacheExt>::from_mode_with_backend(
                     mode,
                     ctx.kv_backend,
                     hipfire_runtime::llama::KvTarget::Single(ctx.gpu),
@@ -608,7 +609,7 @@ impl Carrier for LlamaCarrier {
                     max_seq: ctx.max_seq,
                     physical_cap: Some(ctx.max_seq),
                 };
-                let kv = hipfire_runtime::llama::KvCache::from_mode(
+                let kv = <hipfire_runtime::llama::KvCache as hipfire_runtime::llama::KvCacheExt>::from_mode(
                     mode,
                     hipfire_runtime::llama::KvTarget::Single(ctx.gpu),
                     &dims,

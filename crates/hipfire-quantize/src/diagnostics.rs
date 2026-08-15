@@ -38,6 +38,9 @@ mod gptq_damping_probe {
     //! Run with:
     //!   cargo test -p hipfire-quantize gptq_damping_probe -- --nocapture
     use super::*;
+    use crate::quant_fwht::gen_fwht_signs;
+    use crate::quant_fwht::quantize_mq4g256;
+    use crate::quant_mq::quantize_mq2g256_lloyd;
 
     /// Deterministic Box-Muller-from-LCG Gaussian sampler — no external dep.
     /// Returns N samples with zero mean and unit variance.
@@ -2015,6 +2018,9 @@ mod hfq_block_diag {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model_filter::{is_q8_tensor, q8_class_of, should_quantize};
+    use crate::quant_fwht::{cpu_fwht_256, gen_fwht_signs};
+    use crate::hfq::{kmap_resolve, kmap_resolve_mode, QuantLevel};
 
     /// The MQ*-G256-GL codebooks are NOT stored in the `.hfq` file: the encoder
     /// bakes them in via `gl_encode_block(&GL_CB2 | &GL_CB3, ..)` and the runtime
