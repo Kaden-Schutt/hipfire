@@ -574,24 +574,23 @@ pub fn batch_messages_are_single_user(msg: &serde_json::Value) -> bool {
     if arr.len() != 1 {
         return false;
     }
-    let entry = &arr[0];
-    let role = entry.get("role").and_then(|v| v.as_str()).unwrap_or("");
-    if role != "user" {
+    let m0 = &arr[0];
+    if m0.get("role").and_then(|v| v.as_str()) != Some("user") {
         return false;
     }
-    // Tool calls on the sole message disqualify batching (unless empty).
-    if let Some(tool_calls) = entry.get("tool_calls") {
-        if let Some(arr) = tool_calls.as_array() {
-            if !arr.is_empty() {
-                return false;
-            }
-        } else if !tool_calls.is_null() {
-            // Non-array tool_calls is malformed but treat as present.
+    // Shared contract with CLI: sole user content must be a plain string.
+    // Multipart (array) and image content are sequential-only.
+    if m0.get("content").and_then(|v| v.as_str()).is_none() {
+        return false;
+    }
+    // Tool-call payloads on the sole message force sequential (batch v1 has
+    // no tools path). Empty / missing tool_calls is fine.
+    if let Some(tc) = m0.get("tool_calls") {
+        if tc.as_array().is_some_and(|a| !a.is_empty()) || tc.is_object() {
             return false;
         }
     }
-    // Single user content must be a string, not tool payloads.
-    entry.get("content").and_then(|v| v.as_str()).is_some()
+    true
 }
 
 pub fn parse_continuous_batch_size(params: Option<&serde_json::Value>) -> usize {
@@ -855,11 +854,7 @@ impl std::fmt::Display for BatchDriveError {
 impl std::error::Error for BatchDriveError {}
 
 pub fn lane_max_tokens(key: &AttemptKey, sched: &ContinuousBatchScheduler) -> usize {
-    sched
-        .pending
-        .get(key)
-        .map(|r| r.max_tokens)
-        .unwrap_or(0)
+    sched.pending.get(key).map(|r| r.max_tokens).unwrap_or(4096)
 }
 
 pub fn batch_finite_rate(count: usize, seconds: f64) -> f64 {
@@ -887,25 +882,31 @@ pub fn batch_lane_done_metrics(
     prompt_len: usize,
     generated: usize,
 ) -> BatchLaneDoneMetrics {
-    let latency_ms = finished_at
-        .saturating_duration_since(created_at)
-        .as_secs_f64()
-        * 1000.0;
-    let prefill_ms = prefill_done_at
-        .map(|t| t.saturating_duration_since(created_at).as_secs_f64() * 1000.0)
-        .unwrap_or(latency_ms);
-    let ttft_ms = first_token_at
-        .map(|t| t.saturating_duration_since(created_at).as_secs_f64() * 1000.0)
-        .unwrap_or(0.0);
-    let ttft_s = ttft_ms / 1000.0;
     let wall_s = finished_at
         .saturating_duration_since(created_at)
         .as_secs_f64();
+    let latency_ms = if wall_s.is_finite() && wall_s > 0.0 {
+        wall_s * 1000.0
+    } else {
+        0.0
+    };
+
     let prefill_s = prefill_done_at
         .map(|t| t.saturating_duration_since(created_at).as_secs_f64())
-        .unwrap_or(wall_s);
+        .filter(|s| s.is_finite() && *s > 0.0)
+        .unwrap_or(0.0);
+    let prefill_ms = prefill_s * 1000.0;
     let prefill_tok_s = batch_finite_rate(prompt_len, prefill_s);
-    let ttft_ms = if ttft_s > 0.0 { ttft_ms } else { prefill_ms };
+
+    let ttft_s = first_token_at
+        .map(|t| t.saturating_duration_since(created_at).as_secs_f64())
+        .filter(|s| s.is_finite() && *s > 0.0)
+        .unwrap_or(prefill_s);
+    let ttft_ms = if ttft_s > 0.0 {
+        ttft_s * 1000.0
+    } else {
+        prefill_ms
+    };
     let tok_s = batch_finite_rate(generated, wall_s);
 
     // Decode rate over the post-first-token interval. Zero/one-token and missing
