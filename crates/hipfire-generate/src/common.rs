@@ -1347,3 +1347,123 @@ pub fn maybe_inject_fault_after_prefill_dflash(
     );
     true
 }
+
+
+// ── test-support helpers, moved with the daemon test modules ──
+
+/// Pure attestation combiner for unit tests / failure injection: every required
+/// reset class must succeed AND sync must succeed for `rolled_back=true`.
+/// Sync is modeled as always attempted (callers pass its outcome regardless).
+#[allow(dead_code)]
+pub fn attest_rollback_steps(
+    steps: &[(&str, Result<(), String>)],
+    sync: Result<(), String>,
+) -> crate::common::RollbackEpilogue {
+    let mut errs: Vec<String> = Vec::new();
+    for (name, r) in steps {
+        if let Err(e) = r {
+            errs.push(format!("{name}: {e}"));
+        }
+    }
+    if let Err(e) = sync {
+        errs.push(format!("device_synchronize failed: {e}"));
+    }
+    if errs.is_empty() {
+        crate::common::RollbackEpilogue {
+            rolled_back: true,
+            context: None,
+        }
+    } else {
+        crate::common::RollbackEpilogue {
+            rolled_back: false,
+            context: Some(errs.join("; ")),
+        }
+    }
+}
+
+/// Write one Qwen DFlash Done terminal via the production envelope builder.
+pub fn emit_qwen_dflash_done_terminal(
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    generated: usize,
+    tok_s: f64,
+    prefill_tokens: usize,
+    prefill_ms: f64,
+    prefill_tok_s: f64,
+    decode_tok_s: f64,
+    ttft_ms: f64,
+    tau: f64,
+    cycles: usize,
+    cached_tokens: usize,
+    finish_reason: &str,
+    pflash: Option<(&str, f32)>,
+) {
+    let mut done_env = crate::qwen::qwen_dflash_done_value(
+        id,
+        generated,
+        tok_s,
+        prefill_tokens,
+        prefill_ms,
+        prefill_tok_s,
+        decode_tok_s,
+        ttft_ms,
+        tau,
+        cycles,
+        cached_tokens,
+        finish_reason,
+        active_attempt_id(),
+    );
+    if let Some((reason, alpha)) = pflash {
+        done_env["pflash"] = serde_json::json!({
+            "bypass_reason": reason,
+            "alpha": alpha,
+        });
+    }
+    let _ = writeln!(stdout, "{}", done_env);
+    let _ = stdout.flush();
+}
+
+/// Whether a crate::common::SpecRun None early-exit may enter the wrapper epilogue.
+/// Production contract: None already wrote error/aborted; epilogue is skipped.
+pub fn qwen_dflash_epilogue_after_spec_run(run_present: bool) -> bool {
+    run_present
+}
+
+
+/// Pure speculative-route terminal decision after `Deepseek4Emit::finish`.
+/// Returns `Some(action)` when the emitter reported malformed protocol.
+pub fn ds4_spec_finish_route(
+    finish_reason: &str,
+    tool_calls: usize,
+) -> Option<crate::common::Ds4MalformedTerminalAction> {
+    if finish_reason == "malformed_protocol" {
+        debug_assert_eq!(
+            tool_calls, 0,
+            "spec malformed must report tool_calls=0 (buffered calls discarded)"
+        );
+        Some(crate::common::ds4_malformed_terminal_action(
+            "unclosed DSML tool_calls block at end of output",
+        ))
+    } else {
+        None
+    }
+}
+
+/// Apply [`crate::common::ds4_malformed_terminal_action`] to the active attempt writer.
+/// Returns after writing the error envelope (caller must `return` from generate).
+pub fn emit_ds4_malformed_terminal(stdout: &mut impl std::io::Write, id: &str, detail: &str) {
+    let action = crate::common::ds4_malformed_terminal_action(detail);
+    debug_assert!(!action.emit_done);
+    debug_assert!(!action.store_cache);
+    debug_assert!(!action.expose_tool_calls);
+    debug_assert!(!action.retryable);
+    crate::dense::emit_active_attempt_error(
+        stdout,
+        Some(id),
+        &action.message,
+        action.class,
+        action.retryable,
+        action.rolled_back,
+    );
+    let _ = stdout.flush();
+}
