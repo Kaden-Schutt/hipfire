@@ -5,14 +5,14 @@
 <h1 align="center">hipfire</h1>
 
 <p align="center">
-  <strong>Fast local LLM inference for AMD GPUs.</strong><br />
+  <strong>Fast, AMD-native LLM inference — RDNA-first, CDNA-supported.</strong><br />
   Rust + HIP + Redline. No Python in the hot path. Ollama-style UX.
 </p>
 
 <p align="center">
   <a href="https://github.com/warpfront/hipfire/releases"><img alt="Stable release v0.2.1" src="https://img.shields.io/badge/stable-v0.2.1-24292f?style=flat-square" /></a>
   <a href="CHANGELOG.md"><img alt="Next release v0.3.0 beta" src="https://img.shields.io/badge/next-v0.3.0%20beta-f04b24?style=flat-square" /></a>
-  <a href="docs/MODELS.md"><img alt="54 curated model entries" src="https://img.shields.io/badge/registry-54%20curated%20models-ff8a1f?style=flat-square" /></a>
+  <a href="docs/MODELS.md"><img alt="61 curated model entries" src="https://img.shields.io/badge/registry-61%20curated%20models-ff8a1f?style=flat-square" /></a>
   <a href="https://discord.gg/F3BaywB8Rs"><img alt="Join Discord" src="https://img.shields.io/badge/chat-Discord-5865F2?style=flat-square" /></a>
 </p>
 
@@ -152,12 +152,16 @@ bring-your-own-model flows through `hipfire quantize`.
 
 | Family | Representative architectures | Notes |
 |---|---|---|
-| Vega/CDNA | `gfx906`, `gfx908`, `gfx940`-`gfx942` | Native wave64 HIP paths |
+| Vega/CDNA | `gfx906`, `gfx908`, `gfx940`-`gfx942` | Wave64 HIP; MQ3 and similar run via per-token GEMV fallback (correct, slower prefill) |
 | RDNA1 | `gfx1010`-`gfx1013` | Portable HIP and Redline dispatch support |
 | RDNA2 | `gfx1030`-`gfx1032` | Portable HIP and Redline dispatch support |
 | RDNA3 | `gfx1100`-`gfx1103` | Architecture-tuned kernels and validated MQ4R route |
 | RDNA3.5 | `gfx1150`-`gfx1152` | Architecture-tuned kernels and validated MQ4R route |
 | RDNA4 | `gfx1200`, `gfx1201` | WMMA paths and validated retained-PM4 MQ4R route |
+
+Optimized kernel families are RDNA3/3.5 (gfx11) and RDNA4 (gfx12) via WMMA; other architectures — including `gfx906`/`gfx908` and `gfx94x` (CDNA/MI300X) — run correctly via the portable/fallback path. See `AGENTS.md:157` (MQ3 production on gfx11/gfx12; gfx906/gfx94x fallback) and `crates/rdna-compute/src/arch_caps.rs:124` (`has_wmma = is_rdna3 || is_rdna4`).
+
+hipfire is extracting a substrate layer called **saddle** (`crates/saddle-core`) to make per-target compute backends — RDNA today, CDNA and potentially XDNA later — first-class rather than fallbacks. It is partially built; see [saddle design grounding](docs/governance/2026-08-15-saddle-design-grounding.md) §3 for the proposed layering.
 
 Architecture-specific kernels are selected through typed dispatch tables.
 Unsupported specializations return to the correct portable or architecture
