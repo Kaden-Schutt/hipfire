@@ -4,6 +4,7 @@
 //! Top-of-DAG model loader. Owns `LoadedModel`, the carrier registry,
 //! and `load_model` — the single arch-dispatch point for the daemon.
 
+pub mod batch_staging;
 mod carriers;
 pub use carriers::*;
 
@@ -65,6 +66,25 @@ pub trait Carrier: Send + Sync {
     /// Default is the `else` arm of the daemon ladder (`0.3/0.8/1.0`).
     fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
         saddle_core::sampling::SamplingDefaults::default()
+    }
+
+    /// Grammar `Config` for constrained tool-call decoding.
+    ///
+    /// The default resolves the two `HIPFIRE_QWEN35_NGRAM_*` operator
+    /// tunables and applies to **every** arch, because that is what the
+    /// daemon's generic AR path did when it called
+    /// `hipfire_arch_qwen35::grammar_config::resolve_qwen35_grammar_config()`
+    /// unconditionally. The variable names are historically qwen-scoped; the
+    /// behaviour never was. Preserved verbatim rather than "fixed", since
+    /// narrowing it to Qwen would silently change decoding for anyone who
+    /// sets those variables against another model.
+    ///
+    /// Resolution lives in `hipfire-arch-qwen35` (its `spec_emit` is the other
+    /// caller) and is *called* here rather than duplicated: the loader already
+    /// depends on every arch crate, so this is a downward call, and it leaves
+    /// exactly one definition of the env contract in the tree.
+    fn grammar_config(&self) -> saddle_core::grammar::json::Config {
+        hipfire_arch_qwen35::grammar_config::resolve_qwen35_grammar_config()
     }
 
     /// Borrow this model's spec-decode target out of `state`, arch-erased as a
