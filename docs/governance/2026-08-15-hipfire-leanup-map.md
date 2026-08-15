@@ -542,6 +542,45 @@ does not move, and the spec path is not somewhere to take uncompensated risk.
 
 ---
 
+## 5c · Ledger audit against the finished tree
+
+Re-measured at `801d08756`, item by item, rather than carried from the wave
+reports.
+
+| # | item | measured now | |
+|---|---|---|---|
+| A1 | examples triage | 9 `[[example]]`, each with a named referrer | done |
+| A2 | daemon `[[bin]]`, drop `required-features` | 1 `[[bin]]`, `required-features` 0 | done |
+| A3 | `docs/GLOSSARY.md` | 13 subsystems + `saddle`/`saddle-core`, all statused | done |
+| A4 | AMD-native positioning | `RDNA-native` 0 hits, `AMD-native` present | done |
+| B1 | unify `grammar.rs` | 0 copies in arch crates | done |
+| B2 | unify speculation | **not mergeable** — 2 byte-identical bodies across all five spec files, both 2-line trait accessors a default method cannot reach | closed with evidence |
+| B3 | evict `pflash.rs` | 0 in arch crates; `crates/hipfire-pflash` 2,050 lines; default `off` | done |
+| B4 | decompose `hipfire-quantize/src/main.rs` | 15,522 → 43 lines | done |
+| B5 | evict ds4 `parent/` | `crates/hipfire-ds4-parent` | done |
+| C1 | `KvCache` → `saddle-core` | defined once, in `saddle-core::kv` | done |
+| C2 | harvest #527 spine | dropped by decision | n/a |
+| C3 | capability contract on `Carrier` | `ArchCaps` | done |
+| C4 | per-arch policy on `Carrier` | `SamplingDefaults`, `grammar_config` | done |
+| D1 | delete vestigial `loader_api::Carrier` | one `trait Carrier` in the tree; residual `loader_api` refs are `CaskConfig`/`SpecLoadCfg` | done |
+| D2 | decompose `forward_batch_chunk_impl` | 3,628 → 170 lines | done |
+| D3 | arch crates → trait impls (1–3k) | qwen35 47,581 | **not met** |
+| D4 | extract daemon `#[cfg(test)]` blocks | 22 → 0 | done |
+| E1 | Path C | dead; all three stale AGENTS.md claims corrected | closed |
+| E2 | #527 | deferred | as planned |
+
+§ 5 conflicts: **5.1** resolved — PFlash left the production arch crate for its
+own, and is opt-in per request (`prefill_compression`, default `off`), so the
+policy and the code now agree. **5.2** honoured — `qwen35_batch_generate` and
+all three `pflash_*` examples preserved. **5.3** resolved by A4. **5.4** still
+open by design (the on-disk-format question, grounding § 9.1). **5.5** resolved.
+
+**17 of 19 ledger items are done or closed with evidence.** D3 is the one that
+is not, and it is the same finding as the two unmet size targets in § 4: the
+residue is the forward pass.
+
+---
+
 ## 6 · What is explicitly out of scope
 
 `rdna-compute` (88,447), the kernel family, Redline/PM4 lowering, `radiowave`,
