@@ -6735,7 +6735,10 @@ fn apply_reasoning_request(
                 request["reasoning_effort"] = serde_json::json!("none");
                 return Ok(());
             }
-            "low" => 512,
+            // low is uncapped: the Jinja brief-thought instruction is the
+            // low-effort mechanism, and a hard cap force-closes </think>
+            // mid-derivation on hard prompts. med/high keep safety caps.
+            "low" => 0,
             "med" => 2048,
             "high" => 8192,
             "xhigh" => 24576,
@@ -6812,14 +6815,16 @@ fn apply_http_reasoning_request(
     request["assistant_prefix"] = serde_json::json!("open_think");
     if let Some(effort) = effort {
         if !deepseek4_effort_contract {
-            // Budget ladder aligned with the `reasoning.budget` config presets
-            // (low=512, med=2048, high=8192) plus the template's effort
-            // steering: low/medium/high get a safety cap, xhigh-class stays
-            // uncapped so the xhigh instruction decides the natural endpoint.
-            // The previous ladder (64/256/1024/4096) force-closed </think>
-            // mid-thought (measured: low cut at "(3" mid-derivation).
+            // Budget ladder: low/medium/high get a safety cap, xhigh-class
+            // stays uncapped so the xhigh instruction decides the natural
+            // endpoint. `minimal`/`low` are ALSO uncapped: the template's
+            // brief-thought instruction is the low-effort mechanism, and the
+            // previous 512 cap force-closed </think> mid-derivation on hard
+            // prompts (measured: 12-coin plan cut at ~523 think tokens, tank
+            // rates cut mid-list). The earlier ladder (64/256/1024/4096) was
+            // worse (low cut at "(3" mid-derivation).
             let max_think = match effort {
-                "minimal" | "low" => 512,
+                "minimal" | "low" => 0,
                 "medium" | "med" => 2048,
                 "high" => 8192,
                 "xhigh" | "max" | "uncapped" => 0,
@@ -11881,8 +11886,20 @@ mod tests {
             false,
         )
         .unwrap();
-        assert_eq!(low["max_think_tokens"], 512);
+        assert_eq!(low["max_think_tokens"], 0);
         assert_eq!(low["chat_template_kwargs"]["reasoning_effort"], "low");
+
+        // minimal follows low: instruction-steered, uncapped.
+        let mut minimal = serde_json::json!({});
+        apply_http_reasoning_request(
+            &serde_json::json!({ "reasoning_effort": "minimal" }),
+            &resolved,
+            &mut minimal,
+            false,
+        )
+        .unwrap();
+        assert_eq!(minimal["max_think_tokens"], 0);
+        assert_eq!(minimal["chat_template_kwargs"]["reasoning_effort"], "minimal");
 
         let mut medium = serde_json::json!({});
         apply_http_reasoning_request(
