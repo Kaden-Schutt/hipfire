@@ -455,6 +455,40 @@ Final: `daemon.rs` 43,696 → **3,879** lines, arch references **0**, alias uses
 gfx1201 hosts with real decoded output — local 3-run median 181.22 tok/s
 against a 181.99 baseline, hiptrx pp=2 387.8 against 385.3.
 
+### The two size targets, measured rather than asserted
+
+Both remaining targets were re-tested against the finished tree, not carried
+forward on the earlier reasoning.
+
+**"No `hipfire-arch-*` crate exceeds 10,000 lines."** Two do: `qwen35` (47,581)
+and `deepseek4` (29,102). The residue is the model implementation —
+`qwen35/src/qwen35.rs` alone is 24,837 lines and `deepseek4/src/forward.rs` is
+17,392. Scanning every top-level free function in the qwen spec family for one
+that touches no Qwen type at all finds 67 of them, 2,012 lines. Moving all of
+them to `saddle-core` — which is on-charter, spec orchestration is in its
+remit — leaves the crate at **45,569**, still 4.5× the target. The only routes
+to 10,000 are splitting one architecture across five crates, which renames
+rather than reduces and costs legibility, or deleting working code.
+
+**"compute:arch ratio > 2:1."** Currently 124,348 : 118,661 = 1.048 : 1.
+Reaching 2:1 means arch ≤ 62,174, i.e. deleting 56,487 lines of working
+architecture code. The llama.cpp comparison that motivated the target (9.7 : 1)
+does not transfer: its per-arch files are graph *construction* averaging 233
+lines because `ggml` owns every operator. hipfire's arch crates own the fused
+forward pass, which is where the performance advantage lives. Moving the ratio
+therefore means genericising the kernels into a ggml-shaped operator layer —
+the one thing § 6 and the project's "abstract the model, never the kernel" rule
+exist to prevent.
+
+These two targets and § 6 are in direct conflict. The conflict is the finding;
+it is not resolvable by more refactoring, and resolving it either way is a
+maintainer's call, not a refactor's.
+
+The 2,012 movable lines are a genuine, separable improvement on their own
+merits — 67 spec-orchestration functions that any future architecture could
+reuse. They are left in place here because the gate they were measured against
+does not move, and the spec path is not somewhere to take uncompensated risk.
+
 ---
 
 ## 6 · What is explicitly out of scope
