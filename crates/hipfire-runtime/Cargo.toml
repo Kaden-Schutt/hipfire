@@ -152,67 +152,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 # touch arch crates and build under any feature combination.
 
 [[example]]
-name = "hfq_split"
-required-features = []
-
-[[example]]
 name = "coherence_probe"
 required-features = []
 
 [[example]]
-name = "gpus_smoke"
-required-features = []
-
-[[example]]
-name = "infer_qwen35"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "infer_qwen3"
-required-features = ["arch-llama"]
-
-[[example]]
-name = "infer_vl"
-required-features = ["arch-qwen35-vl", "arch-qwen35"]
-
-[[example]]
-name = "infer"
-required-features = ["arch-qwen35", "arch-qwen35-vl"]
-
-[[example]]
-name = "infer_hfq"
-required-features = ["arch-llama"]
-
-[[example]]
-name = "run"
-required-features = ["arch-qwen35", "deltanet"]
-
-[[example]]
-name = "a3b_load_check"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "a3b_multiturn_oneshot"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "qwen35_batch_generate"
-required-features = ["arch-qwen35", "deltanet"]
-
-[[example]]
-name = "a3b_smoke_forward"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "bench_qwen35_forward"
-required-features = ["arch-qwen35"]
-
-[[example]]
 name = "bench_qwen35_mq4"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "channel_test_mmq"
 required-features = ["arch-qwen35"]
 
 [[example]]
@@ -220,147 +164,11 @@ name = "dflash_spec_demo"
 required-features = ["arch-qwen35"]
 
 [[example]]
-name = "mtp_probe_demo"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "mtp_only_demo"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "dump_logits_qwen35"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "dump_qwen35_hidden_states"
-required-features = ["arch-qwen35", "deltanet"]
-
-[[example]]
-name = "greedy_dump"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "greedy_dump_top5"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "kv_mode_kld"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "logit_dump"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "pflash_compress_demo"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "pflash_load_demo"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "perplexity"
-required-features = ["arch-qwen35", "deltanet"]
-
-[[example]]
-name = "pflash_niah_bench"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "probe_argmax_agreement"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "profile_attention_phases"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "profile_bandwidth_fwd"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "profile_deltanet"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "profile_host_vs_gpu"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "profile_qwen35_mq4"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "profile_prefill_qwen35"
-required-features = ["arch-qwen35", "deltanet"]
-
-[[example]]
-name = "test_inference"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "test_inferenceQA"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "test_long_ctx"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "test_qwen35_load"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "test_qwen35_loadQA"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "test_forward_slots_golden"
-required-features = ["arch-qwen35", "deltanet"]
-
-[[example]]
-name = "demo_multislot_generate"
-required-features = ["arch-qwen35", "deltanet"]
-
-[[example]]
-name = "demo_concurrent_serve"
-required-features = ["arch-qwen35", "deltanet"]
-
-[[example]]
-name = "triattn_accuracy_sweep"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "triattn_decode_demo"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "triattn_infer"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "triattn_longctx_demo"
-required-features = ["arch-qwen35"]
-
-[[example]]
-name = "triattn_periodic_demo"
-required-features = ["arch-qwen35"]
-
-[[example]]
 name = "triattn_validate"
 required-features = ["arch-qwen35"]
 
 [[example]]
-name = "pp_parity"
-required-features = ["arch-qwen35", "deltanet"]
-
-[[example]]
 name = "pp_parity_chatml"
-required-features = ["arch-qwen35", "deltanet"]
-
-[[example]]
-name = "pp2_vram_probe"
 required-features = ["arch-qwen35", "deltanet"]
 
 # build_kld_ref needs no GPU / arch features — it just orchestrates
@@ -369,61 +177,14 @@ required-features = ["arch-qwen35", "deltanet"]
 name = "build_kld_ref"
 required-features = []
 
-# build_kld_ref_native (F2) — llama-FREE KLD ref producer; runs the hipfire
-# F32 oracle forward and writes the SAME HFKLDR format eval_hipfire consumes.
-[[example]]
-name = "build_kld_ref_native"
-required-features = ["arch-qwen35", "deltanet"]
-
-# eval_hipfire_fullvocab (F3) — FULL-VOCAB KLD of a hipfire quant vs the hipfire
-# F32 oracle (dual forward, no ref top-K approx) for parity with
-# llama-perplexity --kl-divergence full-vocab KLD.
-[[example]]
-name = "eval_hipfire_fullvocab"
-required-features = ["arch-qwen35", "deltanet"]
-
-# oracle_xcheck (F1) — dumps per-token F32-oracle logits over real tokens (true
-# fp32 KV) for cross-checking the native bf16/F32 forward against a reference.
-[[example]]
-name = "oracle_xcheck"
-required-features = ["arch-qwen35", "deltanet"]
-
 [[example]]
 name = "eval_hipfire"
 required-features = ["arch-qwen35", "deltanet"]
-
-[[example]]
-name = "collect_e8_hessian_native"
-required-features = ["arch-qwen35", "deltanet"]
-
-# eval_hipfire_llama — KLD eval for llama-arch hipfire models (Qwen3 /
-# Qwen2 / Llama / Mistral / TinyLlama). Same HFKSEQ output as
-# eval_hipfire, but the forward path goes through
-# `<Llama as Architecture>` + `hipfire_runtime::llama::*` instead of
-# the qwen35 arch. Per-token scoring only — llama-arch
-# `forward_prefill_batch` doesn't expose the hidden-state capture hook
-# that eval_hipfire's prefill mode relies on.
-[[example]]
-name = "eval_hipfire_llama"
-required-features = ["arch-llama"]
-
-# Tokenizer-parity helper: reads a .hfq's tokenizer + tokenizes a text slice.
-# No GPU / arch features needed (tokenizer is pure CPU).
-[[example]]
-name = "tokenize_slice"
-required-features = []
 
 # eval_gguf — KLD eval for GGUF candidates (FIFO + llama-perplexity).
 # Stdlib only; no GPU / arch features.
 [[example]]
 name = "eval_gguf"
-required-features = []
-
-# imatrix_collect — Phase A Step 4 (Tier 2): subprocess wrapper around
-# llama-imatrix for the activation-weighted-LS calibration pipeline.
-# Stdlib only; no GPU / arch features.
-[[example]]
-name = "imatrix_collect"
 required-features = []
 
 # C8 GPU sampler kernel validation — distribution-parity gate for

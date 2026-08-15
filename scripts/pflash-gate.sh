@@ -85,7 +85,7 @@ else
         crates/hipfire-runtime/src/llama.rs \
         crates/hipfire-runtime/src/hfq.rs \
         crates/hipfire-runtime/src/tokenizer.rs \
-        crates/hipfire-runtime/examples/pflash_niah_bench.rs \
+        crates/hipfire-pflash/examples/pflash_niah_bench.rs \
         crates/rdna-compute/src/lib.rs \
         crates/rdna-compute/src/kernels.rs \
         crates/rdna-compute/src/dispatch.rs \
@@ -105,7 +105,7 @@ else
 fi
 if [ "$rebuild" -eq 1 ]; then
     echo "pflash-gate: rebuilding pflash_niah_bench (binary missing or stale)..."
-    if ! cargo build --release --features deltanet --example pflash_niah_bench -p hipfire-runtime >&2; then
+    if ! cargo build --release --features deltanet --example pflash_niah_bench -p hipfire-pflash >&2; then
         echo "pflash-gate: build failed" >&2
         exit 2
     fi
