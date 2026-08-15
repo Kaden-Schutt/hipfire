@@ -35,7 +35,7 @@ use hipfire_arch_muse_glimmer as glimmer;
 use hipfire_arch_qwen2::qwen2;
 use hipfire_arch_qwen35::qwen35;
 use hipfire_arch_qwen35::speculative;
-// Used by generate_qwen35_mtp (native-MTP serve path, merged from spec-graph):
+// Used by hipfire_generate::qwen::generate_qwen35_mtp (native-MTP serve path, merged from spec-graph):
 // it manually re-packs the Qwen35 bundle on every exit + re-opens the HFQ mmap.
 use hipfire_arch_qwen35::Qwen35Bundle;
 use hipfire_runtime::emit_text::{
@@ -337,16 +337,16 @@ fn drive_qwen_continuous_batch(
         if let Err(e) = batch_state.reset(gpu) {
             first_err = Some(format!("batch reset: {e}"));
         }
-        fail_closed_invalidate_graphs_and_replay(gpu);
-        let sync = fail_closed_device_sync(gpu);
+        hipfire_generate::common::fail_closed_invalidate_graphs_and_replay(gpu);
+        let sync = hipfire_generate::common::fail_closed_device_sync(gpu);
         let prior = match first_err {
             Some(e) => Err(e),
             None => Ok(()),
         };
-        let ep = fail_closed_epilogue_after_sync(prior, sync);
+        let ep = hipfire_generate::common::fail_closed_epilogue_after_sync(prior, sync);
         for key in &uniq {
             let _scope = BatchAttemptScope::enter(key.attempt_id);
-            emit_fail_closed_error(
+            hipfire_generate::common::emit_fail_closed_error(
                 stdout,
                 Some(&key.id),
                 &format!("batch GPU error: {reason}"),
@@ -420,11 +420,11 @@ fn drive_qwen_continuous_batch(
                 BatchCommitTeardownClass::CommitFailed => {
                     // GPU lane already reset; host release failed — no success
                     // terminal. Fail closed for this key only and free the slot.
-                    let ep = RollbackEpilogue {
+                    let ep = hipfire_generate::common::RollbackEpilogue {
                         rolled_back: true,
                         context: None,
                     };
-                    emit_fail_closed_error(
+                    hipfire_generate::common::emit_fail_closed_error(
                         stdout,
                         Some(&key.id),
                         "batch commit_lane failed after reset",
@@ -989,7 +989,7 @@ fn drive_qwen_continuous_batch(
                             format!("reset lane {idx} on open think: {e}"),
                         );
                     }
-                    let ep = RollbackEpilogue {
+                    let ep = hipfire_generate::common::RollbackEpilogue {
                         rolled_back: true,
                         context: None,
                     };
@@ -1201,7 +1201,7 @@ fn drive_lfm_continuous_batch(
     let weights = unsafe { &*weights_ptr };
     let tokenizer: &hipfire_runtime::tokenizer::Tokenizer = unsafe { &*tokenizer_ptr };
     let chat_template = chat_template_clone;
-    // Stop set mirrors generate_lfm2moe: eos_tok plus single-id encodings for
+    // Stop set mirrors hipfire_generate::dense::generate_lfm2moe: eos_tok plus single-id encodings for
     // <|endoftext|>, </s>, <|im_end|>. String guard catches leaked EOS-class
     // strings where encode does not round-trip (e.g. <|endoftext|>).
     let mut stop_toks: Vec<u32> = vec![eos_tok];
@@ -1247,16 +1247,16 @@ fn drive_lfm_continuous_batch(
         if let Err(e) = batch_state.reset(gpu) {
             first_err = Some(format!("batch reset: {e}"));
         }
-        fail_closed_invalidate_graphs_and_replay(gpu);
-        let sync = fail_closed_device_sync(gpu);
+        hipfire_generate::common::fail_closed_invalidate_graphs_and_replay(gpu);
+        let sync = hipfire_generate::common::fail_closed_device_sync(gpu);
         let prior = match first_err {
             Some(e) => Err(e),
             None => Ok(()),
         };
-        let ep = fail_closed_epilogue_after_sync(prior, sync);
+        let ep = hipfire_generate::common::fail_closed_epilogue_after_sync(prior, sync);
         for key in &uniq {
             let _scope = BatchAttemptScope::enter(key.attempt_id);
-            emit_fail_closed_error(
+            hipfire_generate::common::emit_fail_closed_error(
                 stdout,
                 Some(&key.id),
                 &format!("batch GPU error: {reason}"),
@@ -1325,11 +1325,11 @@ fn drive_lfm_continuous_batch(
             match batch_commit_teardown_class(reset_ok, commit_ok) {
                 BatchCommitTeardownClass::ResetFailed => unreachable!("reset_ok handled above"),
                 BatchCommitTeardownClass::CommitFailed => {
-                    let ep = RollbackEpilogue {
+                    let ep = hipfire_generate::common::RollbackEpilogue {
                         rolled_back: true,
                         context: None,
                     };
-                    emit_fail_closed_error(
+                    hipfire_generate::common::emit_fail_closed_error(
                         stdout,
                         Some(&key.id),
                         "batch commit_lane failed after reset",
@@ -1679,11 +1679,11 @@ fn drive_lfm_continuous_batch(
                                         );
                                     }
                                     let _scope = BatchAttemptScope::enter(key.attempt_id);
-                                    let ep = RollbackEpilogue {
+                                    let ep = hipfire_generate::common::RollbackEpilogue {
                                         rolled_back: true,
                                         context: None,
                                     };
-                                    emit_spec_cancel_after_rollback(stdout, &key.id, 0, &ep);
+                                    hipfire_generate::common::emit_spec_cancel_after_rollback(stdout, &key.id, 0, &ep);
                                     let _ = sched.abort_lane(lane_idx, key);
                                     continue;
                                 }
@@ -1898,11 +1898,11 @@ fn drive_lfm_continuous_batch(
                     );
                 }
                 let _scope = BatchAttemptScope::enter(key.attempt_id);
-                let ep = RollbackEpilogue {
+                let ep = hipfire_generate::common::RollbackEpilogue {
                     rolled_back: true,
                     context: None,
                 };
-                emit_spec_cancel_after_rollback(stdout, &key.id, 0, &ep);
+                hipfire_generate::common::emit_spec_cancel_after_rollback(stdout, &key.id, 0, &ep);
                 let _ = sched.abort_lane(lane_idx, &key);
                 continue;
             }
@@ -1949,11 +1949,11 @@ fn drive_lfm_continuous_batch(
                     );
                 }
                 let _scope = BatchAttemptScope::enter(key.attempt_id);
-                let ep = RollbackEpilogue {
+                let ep = hipfire_generate::common::RollbackEpilogue {
                     rolled_back: true,
                     context: None,
                 };
-                emit_spec_cancel_after_rollback(stdout, &key.id, 0, &ep);
+                hipfire_generate::common::emit_spec_cancel_after_rollback(stdout, &key.id, 0, &ep);
                 let _ = sched.abort_lane(lane_idx, &key);
                 continue;
             }
@@ -2263,11 +2263,11 @@ fn drive_lfm_continuous_batch(
                 );
             }
             let _scope = BatchAttemptScope::enter(key.attempt_id);
-            let ep = RollbackEpilogue {
+            let ep = hipfire_generate::common::RollbackEpilogue {
                 rolled_back: true,
                 context: None,
             };
-            emit_spec_cancel_after_rollback(stdout, &key.id, 0, &ep);
+            hipfire_generate::common::emit_spec_cancel_after_rollback(stdout, &key.id, 0, &ep);
             let _ = sched.abort_lane(idx, &key);
         }
         // Install AwaitingClient/Ready BEFORE publishing commit_ready; rollback if publish fails.
@@ -2605,11 +2605,11 @@ fn drive_qwen35_ep_continuous_batch(
         };
         for key in &uniq {
             let _scope = BatchAttemptScope::enter(key.attempt_id);
-            let ep = RollbackEpilogue {
+            let ep = hipfire_generate::common::RollbackEpilogue {
                 rolled_back: true,
                 context: None,
             };
-            emit_fail_closed_error(
+            hipfire_generate::common::emit_fail_closed_error(
                 stdout,
                 Some(&key.id),
                 &format!("batch GPU error: {reason2}"),
@@ -2674,11 +2674,11 @@ fn drive_qwen35_ep_continuous_batch(
             match batch_commit_teardown_class(reset_ok, commit_ok) {
                 BatchCommitTeardownClass::ResetFailed => unreachable!(),
                 BatchCommitTeardownClass::CommitFailed => {
-                    let ep = RollbackEpilogue {
+                    let ep = hipfire_generate::common::RollbackEpilogue {
                         rolled_back: true,
                         context: None,
                     };
-                    emit_fail_closed_error(
+                    hipfire_generate::common::emit_fail_closed_error(
                         stdout,
                         Some(&key.id),
                         "batch commit_lane failed after reset",
@@ -3217,7 +3217,7 @@ fn drive_qwen35_ep_continuous_batch(
                             format!("EP reset lane {idx} on open think: {e}"),
                         );
                     }
-                    let ep = RollbackEpilogue {
+                    let ep = hipfire_generate::common::RollbackEpilogue {
                         rolled_back: true,
                         context: None,
                     };
@@ -3423,7 +3423,7 @@ mod terminal_control_tests {    use hipfire_engine::terminal::{
 
 
 
-    /// `glimmer_longest_marker_suffix` byte-slices from the end of the pending
+    /// `hipfire_generate::dense::glimmer_longest_marker_suffix` byte-slices from the end of the pending
     /// buffer looking for a split Harmony marker. It must skip offsets that
     /// land inside a multibyte character.
     ///
@@ -3444,15 +3444,15 @@ mod terminal_control_tests {    use hipfire_engine::terminal::{
             "emoji 😀",
             "mixed ×<|eo",
         ] {
-            let n = super::glimmer_longest_marker_suffix(s);
+            let n = hipfire_generate::dense::glimmer_longest_marker_suffix(s);
             assert!(
                 s.is_char_boundary(s.len() - n),
                 "returned len {n} splits a char in {s:?}"
             );
         }
         // Still detects a genuine split marker.
-        assert_eq!(super::glimmer_longest_marker_suffix("abc<|eo"), 4);
-        assert_eq!(super::glimmer_longest_marker_suffix("abc"), 0);
+        assert_eq!(hipfire_generate::dense::glimmer_longest_marker_suffix("abc<|eo"), 4);
+        assert_eq!(hipfire_generate::dense::glimmer_longest_marker_suffix("abc"), 0);
     }
 
 }
@@ -5512,260 +5512,10 @@ fn redline_pm4_prefix_profile_deepseek4(
     }))
 }
 
-/// Acquire a machine-wide exclusive lock on ~/.hipfire/daemon.pid.
-///
-/// On Unix: flock(2) is the kernel-level lock. The kernel releases it
-/// automatically on process death (including SIGKILL), so no manual
-/// cleanup is required — stale PID file contents are fine, the fd is
-/// what holds the lock.
-///
-/// On Windows: no kernel-level lock; we write the PID file but don't
-/// guarantee single-instance semantics. A second daemon launch may
-/// silently overwrite the PID. This matches the v0.1.0-alpha Windows
-/// behavior; tightening it is tracked in a follow-up.
-///
-/// Returns the File handle; caller MUST keep it alive for the process
-/// lifetime (on Unix, dropping it closes the fd and releases the lock).
-/// GPU-side attractor blockers for the AR generate path (#111).
-///
-/// MQ4 quant pressure makes structured-output special tokens (`<tool_call>`,
-/// `<think>`) into self-reinforcing attractors: the model emits the same
-/// special token hundreds of times in a row, never reaching the JSON body
-/// (or in stacked-opener shapes that downstream regex parsers cannot
-/// recover). The CPU-side `apply_ngram_block` is not in this path (its
-/// per-token D2H + H2D would tank decode tok/s) and the GPU sampler's
-/// repeat-penalty alone doesn't break a strong single-token loop fast
-/// enough at the user-validated `RP=1.05` floor.
-///
-/// The unclosed-opener depth counter has moved to
-/// `hipfire_runtime::sampler::collect_unclosed_attractor_blocks` (PR 3 of the
-/// engine-modularization plan); the resulting blocked-token list is
-/// applied to the GPU logits buffer by `hipfire_runtime::sampler::sample`
-/// before the sampling kernel launches. The `gpu_block_attractor_token`
-/// helper below is the simpler fallback for unpaired tokens — trips on
-/// `count >= threshold` regardless of structure — kept here as
-/// reference for a future per-token attractor block.
-/// CPU-side counterpart that applies the same depth-tracking attractor
-/// block directly to a freshly-downloaded logits vector. Avoids the
-/// htod-memcpy + redownload roundtrip the GPU variant required per token.
 
-//
-// ─── Probe-mode `committed` event emitter ────────────────────────────────
-//
-// When `HIPFIRE_EMIT_TOKEN_IDS=1` is set, the daemon emits a
-// `{"type":"committed",...}` event for every token it commits (i.e. every
-// time a sampled token is appended to `streamed_tokens` /
-// `conversation_tokens`). This is a parallel stream alongside the
-// existing `{"type":"token","text":"..."}` events; it carries the raw
-// token ID, the per-request position, and ms-since-request-start.
-//
-// Why a parallel stream and not a `tok_id` field on the existing token
-// event: `EosFilter` can hold/merge/strip/stop bytes across multiple
-// committed tokens (many-to-one and zero-to-one relationships); a
-// `tok_id` field on a text event would lie about which token produced
-// the visible chunk. The runtime-protective synthetic emit at the
-// `</think>` force-close site is intentionally NOT paired with a
-// `committed` event, because no token was actually committed there.
-//
-// Off by default — env var read once on first call. The probe binary
-// (`examples/coherence_probe.rs`) sets the env on the daemon child it
-// spawns. Existing JSONL clients see no change.
 
-/// LRU-bounded fingerprint→tokens cache for assistant-turn replay
-/// (`asst_turn_cache`). Holds the verbatim token sequence each
-/// assistant turn emitted during decode, keyed by
-/// [`asst_turn_fingerprint`]. On the next request, the multi-turn
-/// renderer replays cached tokens at the same turn boundary so the
-/// rendered prefix is byte-identical to what was written into KV last
-/// turn — required for the LCP-based prompt cache to extend through
-/// historical assistant turns (BPE is not bijective; re-encoding a
-/// model's emission may produce a different token sequence).
-///
-/// Cap is configurable via `HIPFIRE_PROMPT_CACHE_CAP` (default 32);
-/// `HIPFIRE_PROMPT_CACHE_UNBOUNDED=1` removes the cap entirely. On
-/// `insert`, an existing key is moved to MRU; on `get`, the same. When
-/// at capacity, the LRU (oldest-touched) entry is evicted.
 
-/// Stable fingerprint over an assistant turn — pair of (text content,
-/// tool_calls canonical JSON). Output is identical for two messages
-/// that have the same content+tool_calls regardless of how the
-/// surrounding bytes (e.g. whitespace inside JSON args) were rendered
-/// upstream. Used by the V4F prefix-cache to identify "this is the
-/// same assistant turn the model previously emitted, so reuse the
-/// emitted token IDs verbatim instead of re-encoding via the DSML
-/// renderer + BPE (which is not bijective)."
-fn asst_turn_fingerprint(
-    content: &str,
-    tool_calls: &[hipfire_runtime::prompt_frame::ToolCall],
-) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    "assistant".hash(&mut h);
-    if tool_calls.is_empty() {
-        // Pure-text turn — content IS the message. Trim whitespace
-        // to absorb minor formatting drift between store (model's
-        // verbatim emission) and lookup (whatever the client preserved).
-        content.trim().hash(&mut h);
-    } else {
-        // Mixed turn (text + tool_calls) or pure tool_call. Hash ONLY
-        // the tool_calls — pi-coding-agent (and most OpenAI-compat
-        // clients) sends `content: null` on assistant messages that
-        // carry tool_calls, even when the model originally emitted
-        // prose ahead of the tool block (e.g. "Let me check the
-        // structure first.<｜DSML｜tool_calls>…"). The store-side
-        // sees the prose in `emit_text_buf`; the lookup-side sees
-        // content=`""`. Excluding content from the fingerprint when
-        // tool_calls is non-empty matches the client's effective
-        // identity for tool-call turns and lets the cache hit.
-        //
-        // Collision risk: two distinct turns with identical
-        // tool_calls hash to the same key; the later store wins,
-        // and a replay of the earlier turn replays the later turn's
-        // tokens. In practice this only matters when the model emits
-        // the SAME tool_call twice with different surrounding prose
-        // in the same conversation — uncommon for agent flows, and
-        // the worst-case effect is the model seeing slightly altered
-        // prose in its own history.
-    }
-    for tc in tool_calls {
-        tc.name.hash(&mut h);
-        // Serialize args in a CANONICAL form: walk the Value tree and
-        // emit objects with keys sorted lexically (recursively). The
-        // upstream `serde_json::Map` uses insertion order — fine for
-        // round-tripping a single payload, but two clients (or two
-        // parser passes on the same payload) can yield different
-        // insertion orders for the same logical args. Without
-        // canonicalization those two turns hash to DIFFERENT keys,
-        // dropping cache hit rate on otherwise-identical tool calls.
-        let args = canonical_json(&tc.arguments);
-        args.hash(&mut h);
-    }
-    h.finish()
-}
 
-fn glimmer_turn_key(fp: u64, ordinal: usize) -> u64 {
-    fp.wrapping_add((ordinal as u64).wrapping_mul(0x9E3779B97F4A7C15))
-        .wrapping_mul(0x9E3779B97F4A7C15)
-}
-
-/// Build the fingerprint-key string for an emitted assistant turn so
-/// it matches `msg.content` as the CLI sends it back next turn.
-/// Mirrors the *visible-content* transformation the bun CLI's HTTP
-/// serve applies between SSE-relay and `messages[].content`:
-///
-///   1. Strip paired `<think>…</think>` blocks plus any trailing
-///      whitespace (`cli/index.ts:1656-1658`).
-///   2. Strip an unclosed `<think>…$` tail (same site).
-///   3. Strip an orphan `</think>` opener — when the daemon's prompt
-///      ends with `<think>\n` the model resumes inside think mode and
-///      never emits an opening tag; the CLI's `inThink` state machine
-///      (`cli/index.ts:2334-2365`) treats every token until `</think>`
-///      as `reasoning_content` and only emits content from after the
-///      close. We match that by stripping `text-up-to-and-including-
-///      first-</think>` + trailing whitespace when no `<think>`
-///      preceded it.
-///   4. Strip the literal `<|im_end|>` substring (the CLI relay
-///      removes it at `cli/index.ts:2366`).
-///
-/// Without (3) and (4) the fingerprint stored after turn N would
-/// include reasoning + the ChatML terminator that the CLI strips
-/// before sending back as `msg.content` on turn N+1, dropping the
-/// cache hit rate to ~zero for thinking-on Qwen models.
-fn strip_think_for_fingerprint(s: &str) -> String {
-    let mut out = s.to_string();
-    // (1) + (2): paired/unclosed `<think>` blocks.
-    loop {
-        let open = match out.find("<think>") {
-            Some(i) => i,
-            None => break,
-        };
-        match out[open..].find("</think>") {
-            Some(close_rel) => {
-                let close_end = open + close_rel + "</think>".len();
-                let mut tail = close_end;
-                let bytes = out.as_bytes();
-                while tail < bytes.len() {
-                    let c = bytes[tail];
-                    if c == b' ' || c == b'\n' || c == b'\t' || c == b'\r' {
-                        tail += 1;
-                    } else {
-                        break;
-                    }
-                }
-                out.replace_range(open..tail, "");
-            }
-            None => {
-                out.truncate(open);
-                break;
-            }
-        }
-    }
-    // (3): orphan `</think>` closer with no preceding opener (model
-    // resumed inside think mode from the prompt's `<think>\n` prefix).
-    if let Some(close_idx) = out.find("</think>") {
-        let after_close = close_idx + "</think>".len();
-        let mut tail = after_close;
-        let bytes = out.as_bytes();
-        while tail < bytes.len() {
-            let c = bytes[tail];
-            if c == b' ' || c == b'\n' || c == b'\t' || c == b'\r' {
-                tail += 1;
-            } else {
-                break;
-            }
-        }
-        out.replace_range(0..tail, "");
-    }
-    // (4): strip the literal `<|im_end|>` substring (CLI relay strips
-    // it from every chunk before forwarding as content).
-    while let Some(idx) = out.find("<|im_end|>") {
-        out.replace_range(idx..idx + "<|im_end|>".len(), "");
-    }
-    out
-}
-
-/// Apply the same visible-content transformation before every assistant-turn
-/// cache lookup and store. Keeping this centralized prevents the model's raw
-/// emission (which can contain thinking markers and prompt-normalized
-/// whitespace) from hashing differently than the history content returned by
-/// an OpenAI-compatible client on the next turn.
-fn normalize_asst_turn_for_fingerprint(s: &str) -> String {
-    let stripped = strip_think_for_fingerprint(s);
-    hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned()
-}
-
-/// Walk a [`serde_json::Value`] and produce a canonical-key
-/// representation: objects emit keys in lexical order (recursively),
-/// arrays preserve order. Used by [`asst_turn_fingerprint`] so two
-/// messages with the same logical tool args hash identically
-/// regardless of source-side insertion order.
-
-/// Cancel terminal after production fail-closed rollback attestation.
-///
-/// Attested rollback (`rolled_back`) keeps the fold-compatible
-/// `aborted`+`done(finish_reason=aborted)` pair. Unattested rollback emits
-/// exactly one correlated nonretryable fail-closed error (with epilogue
-/// context) and **no** `done` — never a second terminal.
-fn emit_spec_cancel_after_rollback(
-    stdout: &mut impl std::io::Write,
-    id: &str,
-    completion_tokens: usize,
-    epilogue: &RollbackEpilogue,
-) {
-    if epilogue.rolled_back {
-        emit_qwen_ar_cancelled(stdout, id, completion_tokens);
-        return;
-    }
-    emit_fail_closed_error(
-        stdout,
-        Some(id),
-        "client cancelled; fail-closed rollback could not be attested",
-        "validation",
-        false,
-        epilogue,
-    );
-}
 
 /// Route already-classified think/content events in order. Reasoning bypasses
 /// tool parsing; answer content remains subject to ToolOutputRouter.
@@ -6066,7 +5816,7 @@ struct QwenArCacheAction {
 fn qwen_ar_cache_action(finish: &QwenArRouteFinish, visible_for_cache: &str) -> QwenArCacheAction {
     QwenArCacheAction {
         store: finish.store_cache,
-        fingerprint_text: normalize_asst_turn_for_fingerprint(visible_for_cache),
+        fingerprint_text: hipfire_generate::common::normalize_asst_turn_for_fingerprint(visible_for_cache),
         tool_calls: finish.wire_tool_calls.clone(),
     }
 }
@@ -6084,39 +5834,12 @@ where
     if !action.store || cached_seq.is_empty() {
         return None;
     }
-    let fp = asst_turn_fingerprint(&action.fingerprint_text, &action.tool_calls);
+    let fp = hipfire_generate::common::asst_turn_fingerprint(&action.fingerprint_text, &action.tool_calls);
     insert(fp, cached_seq);
     Some(fp)
 }
 
-/// Pure Commit/Abort side-effect gate for Qwen AR + DFlash successful terminals.
-/// Commit preserves the intended release/store/done flags; Abort suppresses all
-/// three so producers never store or release after a client cancel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct QwenClientCommitEffects {
-    release_tool_calls: bool,
-    store_cache: bool,
-    emit_done: bool,
-}
 
-fn qwen_client_commit_effects(
-    decision: ClientTerminalDecision,
-    intended_release: bool,
-    intended_store: bool,
-) -> QwenClientCommitEffects {
-    match decision {
-        ClientTerminalDecision::Commit => QwenClientCommitEffects {
-            release_tool_calls: intended_release,
-            store_cache: intended_store,
-            emit_done: true,
-        },
-        ClientTerminalDecision::Abort => QwenClientCommitEffects {
-            release_tool_calls: false,
-            store_cache: false,
-            emit_done: false,
-        },
-    }
-}
 
 /// Build the full Qwen AR `done` envelope (hostile-id safe). Used to stage
 /// `commit_ready` then emit identical payload as `done` after Commit.
@@ -6196,14 +5919,14 @@ fn emit_qwen_ar_done(
 /// Emit open-think fail-closed validation terminal: exactly one correlated
 /// non-retryable validation `error` and **no** `done` (terminal XOR).
 /// Uses the production fail-closed error writer; `rolled_back` must come from
-/// a completed [`RollbackEpilogue`] (or false when no GPU reset ran).
+/// a completed [`hipfire_generate::common::RollbackEpilogue`] (or false when no GPU reset ran).
 fn emit_qwen_ar_open_think_terminal(
     stdout: &mut impl std::io::Write,
     id: &str,
     _generated: usize,
-    epilogue: &RollbackEpilogue,
+    epilogue: &hipfire_generate::common::RollbackEpilogue,
 ) {
-    emit_fail_closed_error(
+    hipfire_generate::common::emit_fail_closed_error(
         stdout,
         Some(id),
         "open think span at end of generation (validation)",
@@ -6390,7 +6113,7 @@ impl QwenArSemanticProducer {
             emit_visible_token(stdout, &self.id, trailing);
         }
         // Tool-call events stay deferred until Commit (see
-        // `qwen_client_commit_effects` / production finish orchestration).
+        // `hipfire_generate::qwen::qwen_client_commit_effects` / production finish orchestration).
         Ok((finish, self.visible_acc))
     }
 
@@ -6401,64 +6124,10 @@ impl QwenArSemanticProducer {
 
 #[allow(dead_code)]
 fn emit_error_no_id(stdout: &mut impl std::io::Write, message: impl std::fmt::Display) {
-    emit_active_attempt_error(stdout, None, &message.to_string(), "internal", false, false);
+    hipfire_generate::dense::emit_active_attempt_error(stdout, None, &message.to_string(), "internal", false, false);
 }
 
-/// Typed daemon error envelope (Increment B / Task 13).
-///
-/// Wire: `{type:error, id?, message, class, retryable, rolled_back, attempt_id}`.
-/// Classification MUST use `class`/`retryable`/`rolled_back` — never message prefix.
-///
-/// Prefer [`emit_active_attempt_error`] (post-activation) or
-/// [`emit_active_attempt_error`] (pre-activation protocol reject). This low-level
-/// writer is reserved for paths that must echo a validated non-TLS attempt
-/// (reset ack failures after a parsed reset attempt_id).
-fn write_error_envelope(
-    stdout: &mut impl std::io::Write,
-    id: Option<&str>,
-    message: &str,
-    class: &str,
-    retryable: bool,
-    rolled_back: bool,
-    attempt_id: u64,
-) {
-    let mut envelope = serde_json::json!({
-        "type": "error",
-        "message": message,
-        "class": class,
-        "retryable": retryable,
-        "rolled_back": rolled_back,
-        "attempt_id": attempt_id,
-    });
-    if let Some(id) = id {
-        envelope["id"] = serde_json::Value::String(id.to_owned());
-    }
-    let _ = writeln!(stdout, "{}", envelope);
-    let _ = stdout.flush();
-}
 
-/// Post-parse generation / active-request errors.
-///
-/// Attempt ID is always read from TLS [`active_attempt_id`] — callers cannot
-/// pass, hard-code, or choose zero independently.
-fn emit_active_attempt_error(
-    stdout: &mut impl std::io::Write,
-    id: Option<&str>,
-    message: &str,
-    class: &str,
-    retryable: bool,
-    rolled_back: bool,
-) {
-    write_error_envelope(
-        stdout,
-        id,
-        message,
-        class,
-        retryable,
-        rolled_back,
-        active_attempt_id(),
-    );
-}
 
 /// Pre-activation protocol reject (missing/malformed attempt_id, or commands
 /// with no active generate attempt). Always emits `attempt_id: 0`.
@@ -6472,143 +6141,14 @@ fn emit_uncorrelated_error(
     retryable: bool,
     rolled_back: bool,
 ) {
-    write_error_envelope(stdout, id, message, class, retryable, rolled_back, 0);
+    hipfire_generate::dense::write_error_envelope(stdout, id, message, class, retryable, rolled_back, 0);
 }
 
-/// Outcome of the single production fail-closed rollback epilogue.
-///
-/// `rolled_back` is true only after every required host/target/spec/graph
-/// reset AND a successful GPU `device_synchronize`. Callers must not claim
-/// rollback before this struct is returned.
-///
-/// Fallible reset steps (`bind_thread`, `memset`, arch `reset` Results) are
-/// accumulated. Synchronize is still attempted after an earlier failure so the
-/// device is drained, but any reset or sync error keeps `rolled_back=false`.
-#[derive(Debug, Clone)]
-struct RollbackEpilogue {
-    rolled_back: bool,
-    /// Present when `rolled_back` is false (sync/reset could not be attested).
-    context: Option<String>,
-}
 
-/// One production rollback epilogue for spec-step / forced-advance / grammar /
-/// malformed / open-think / cancel failure paths.
-///
-/// Order (single epilogue — no caller-side duplicate):
-/// 1. clear host cursors/history (`seq_pos`, `conversation_tokens`)
-/// 2. reset target KV/recurrent/compact (slot or host bundle path)
-/// 3. free host checkpoint rings; reset drafter/speculator
-/// 4. invalidate captured HIP graphs + request-local replay observations
-/// 5. `device_synchronize`
-///
-/// `rolled_back` is true only when every required reset and synchronize succeeds.
-///
-/// When the caller already holds a live `&mut dyn Speculator` derived from
-/// `m.speculator`, prefer [`production_fail_closed_rollback_live`] so host
-/// fields can be reborrowed disjointly without aliasing `m.speculator`.
-fn production_fail_closed_rollback(
-    m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
-    slot: Option<&mut dyn SpecTarget>,
-    spec: Option<&mut dyn Speculator>,
-) -> RollbackEpilogue {
-    m.seq_pos = 0;
-    m.conversation_tokens.clear();
-    fail_closed_reset_target_and_spec(m, gpu, slot, spec)
-}
 
-/// Live-slot form used inside `generate_spec` while `spec` is borrowed from
-/// `m.speculator` and `slot` from the RAII guard — host fields only.
-///
-/// Takes the host counters and checkpoint rings as disjoint reborrows so the
-/// RAII target guard's `&mut m.state` can remain live without aliasing
-/// `LoadedModel`. Same reset ordering as [`production_fail_closed_rollback`].
-fn production_fail_closed_rollback_live(
-    seq_pos: &mut usize,
-    conversation_tokens: &mut Vec<u32>,
-    prefill_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
-    dflash_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
-    asst_turn_cache: &mut hipfire_loader::AsstTurnCache,
-    gpu: &mut rdna_compute::Gpu,
-    slot: &mut dyn SpecTarget,
-    spec: &mut dyn Speculator,
-) -> RollbackEpilogue {
-    *seq_pos = 0;
-    conversation_tokens.clear();
-    asst_turn_cache.clear();
-    // Host-side AR/vestigial rings (speculator owns the live DFlash ring).
-    free_checkpoints(prefill_checkpoints, gpu);
-    free_checkpoints(dflash_checkpoints, gpu);
-    let mut first_err: Option<String> = None;
-    if let Err(e) = slot.reset_recurrent(gpu) {
-        push_reset_err(&mut first_err, "reset_recurrent", e);
-    }
-    if let Err(e) = spec.reset(gpu) {
-        push_reset_err(&mut first_err, "spec.reset", e);
-    }
-    fail_closed_invalidate_graphs_and_replay(gpu);
-    let prior = match first_err {
-        Some(e) => Err(e),
-        None => Ok(()),
-    };
-    let epilogue = fail_closed_epilogue_after_sync(prior, fail_closed_device_sync(gpu));
-    if epilogue.rolled_back {
-        gpu.replay.begin_replay_observation_window();
-    }
-    epilogue
-}
 
-/// Drop captured HIP graphs and mark the request-local replay observation
-/// window failed so a fail-closed turn cannot retain stale graph/replay state.
-///
-/// Infallible-by-contract (destroys host-side graph handles + sets a flag).
-fn fail_closed_invalidate_graphs_and_replay(gpu: &mut rdna_compute::Gpu) {
-    gpu.invalidate_graph_state();
-    gpu.replay.invalidate_replay_observation_window();
-}
 
-fn fail_closed_device_sync(gpu: &mut rdna_compute::Gpu) -> RollbackEpilogue {
-    match gpu.hip.device_synchronize() {
-        Ok(()) => RollbackEpilogue {
-            rolled_back: true,
-            context: None,
-        },
-        Err(e) => RollbackEpilogue {
-            rolled_back: false,
-            context: Some(format!("device_synchronize failed: {e}")),
-        },
-    }
-}
 
-/// Merge a prior reset-step error with a device_synchronize result.
-/// Sync is always attempted; attestation requires both prior Ok and sync Ok.
-fn fail_closed_epilogue_after_sync(
-    prior: Result<(), String>,
-    sync: RollbackEpilogue,
-) -> RollbackEpilogue {
-    match (prior, sync.rolled_back, sync.context) {
-        (Ok(()), true, _) => RollbackEpilogue {
-            rolled_back: true,
-            context: None,
-        },
-        (Ok(()), false, ctx) => RollbackEpilogue {
-            rolled_back: false,
-            context: ctx,
-        },
-        (Err(e), true, _) => RollbackEpilogue {
-            rolled_back: false,
-            context: Some(e),
-        },
-        (Err(e), false, Some(s)) => RollbackEpilogue {
-            rolled_back: false,
-            context: Some(format!("{e}; {s}")),
-        },
-        (Err(e), false, None) => RollbackEpilogue {
-            rolled_back: false,
-            context: Some(e),
-        },
-    }
-}
 
 /// Pure attestation combiner for unit tests / failure injection: every required
 /// reset class must succeed AND sync must succeed for `rolled_back=true`.
@@ -6617,7 +6157,7 @@ fn fail_closed_epilogue_after_sync(
 fn attest_rollback_steps(
     steps: &[(&str, Result<(), String>)],
     sync: Result<(), String>,
-) -> RollbackEpilogue {
+) -> hipfire_generate::common::RollbackEpilogue {
     let mut errs: Vec<String> = Vec::new();
     for (name, r) in steps {
         if let Err(e) = r {
@@ -6628,150 +6168,20 @@ fn attest_rollback_steps(
         errs.push(format!("device_synchronize failed: {e}"));
     }
     if errs.is_empty() {
-        RollbackEpilogue {
+        hipfire_generate::common::RollbackEpilogue {
             rolled_back: true,
             context: None,
         }
     } else {
-        RollbackEpilogue {
+        hipfire_generate::common::RollbackEpilogue {
             rolled_back: false,
             context: Some(errs.join("; ")),
         }
     }
 }
 
-fn push_reset_err(acc: &mut Option<String>, label: &str, err: impl std::fmt::Display) {
-    let msg = format!("{label}: {err}");
-    match acc {
-        None => *acc = Some(msg),
-        Some(prev) => {
-            prev.push_str("; ");
-            prev.push_str(&msg);
-        }
-    }
-}
 
-fn fail_closed_reset_target_and_spec(
-    m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
-    slot: Option<&mut dyn SpecTarget>,
-    spec: Option<&mut dyn Speculator>,
-) -> RollbackEpilogue {
-    let mut first_err: Option<String> = None;
-    // Authoritative cold reset: drop assistant-turn semantic cache.
-    m.asst_turn_cache.clear();
-    if let Some(slot) = slot {
-        // Live SpecTarget path: arch hook owns KV/recurrent/compact (and
-        // deepseek4's zero_decode_caches). Graph teardown is always daemon-side.
-        if let Err(e) = slot.reset_recurrent(gpu) {
-            push_reset_err(&mut first_err, "reset_recurrent", e);
-        }
-    } else {
-        // Post-guard / AR paths: reset via the bundle still on `m`.
-        if let Err(e) = reset_qwen35_recurrent(m, gpu) {
-            push_reset_err(&mut first_err, "reset_qwen35_recurrent", e);
-        }
-        if let Some(ModelState::Llama(b)) = m.state.as_mut() {
-            b.kv.compact_offset = 0;
-        }
-        if let Some(s) = &mut m.qwen2_state {
-            s.reset();
-        }
-        if let Some(b) = m.qwen2_mut() {
-            b.state.reset();
-        }
-        if let Some(b) = m.deepseek4_mut() {
-            // Mirror generate_deepseek4 cache-miss teardown: cursor reset alone
-            // leaves position-indexed SWA/full/compressed/indexer residue.
-            b.state.reset();
-            b.state.zero_decode_caches(gpu);
-        }
-        if let Some(b) = m.lfm2moe_mut() {
-            if let Err(e) = b.state.reset(gpu) {
-                push_reset_err(&mut first_err, "lfm2moe.reset", e);
-            }
-        }
-        if let Some(b) = m.minimax_mut() {
-            b.state.reset();
-        }
-        if let Some(b) = m.cohere2moe_mut() {
-            if let Err(e) = b.state.reset(gpu) {
-                push_reset_err(&mut first_err, "cohere2moe.reset", e);
-            }
-        }
-        if let Some(ModelState::Gemma4(bundle)) = m.state.as_mut() {
-            // Gemma4State::reset is cursor-only (n_tokens = 0); the
-            // captured decode hipGraph stays valid across resets (position
-            // is re-staged via pos_host on every replay and attention
-            // geometry is sized for max_seq).
-            bundle.state.reset();
-        }
-        if let Some(ModelState::MuseGlimmer(bundle)) = m.state.as_mut() {
-            bundle.reset_session_state();
-        }
-        if let Some(ad) = m.kv_adaptive.as_mut() {
-            if let Some(ModelState::Qwen35(b)) = m.state.as_mut() {
-                ad.reset_with_cache(gpu, &mut b.kv_cache);
-            } else {
-                ad.reset();
-            }
-        }
-        if let Some(bs) = m.qwen35_decode_batch.as_mut() {
-            if let Err(e) = bs.reset(gpu) {
-                push_reset_err(&mut first_err, "qwen35_decode_batch.reset", e);
-            }
-        }
-        if let Some(bs) = m.lfm2_decode_batch.as_mut() {
-            if let Err(e) = bs.reset(gpu) {
-                push_reset_err(&mut first_err, "lfm2_decode_batch.reset", e);
-            }
-        }
-    }
-    // Always free host checkpoint rings. When a Speculator is present its own
-    // ring is freed by `reset` below; these are AR/vestigial rings on `m`.
-    free_checkpoints(&mut m.prefill_checkpoints, gpu);
-    free_checkpoints(&mut m.dflash_checkpoints, gpu);
 
-    if let Some(spec) = spec {
-        if let Err(e) = spec.reset(gpu) {
-            push_reset_err(&mut first_err, "spec.reset", e);
-        }
-    } else if let Some(s) = m.speculator.as_mut() {
-        if let Err(e) = s.reset(gpu) {
-            push_reset_err(&mut first_err, "spec.reset", e);
-        }
-    }
-
-    fail_closed_invalidate_graphs_and_replay(gpu);
-    // Always attempt sync after resets; preserve aggregate reset failure.
-    let prior = match first_err {
-        Some(e) => Err(e),
-        None => Ok(()),
-    };
-    let epilogue = fail_closed_epilogue_after_sync(prior, fail_closed_device_sync(gpu));
-    if epilogue.rolled_back {
-        gpu.replay.begin_replay_observation_window();
-    }
-    epilogue
-}
-
-/// Emit one correlated fail-closed error (no done). Appends epilogue context
-/// when rollback could not be attested.
-fn emit_fail_closed_error(
-    stdout: &mut impl std::io::Write,
-    id: Option<&str>,
-    message: &str,
-    class: &str,
-    retryable: bool,
-    epilogue: &RollbackEpilogue,
-) {
-    let full = match &epilogue.context {
-        Some(ctx) if !epilogue.rolled_back => format!("{message} ({ctx})"),
-        _ => message.to_string(),
-    };
-    emit_active_attempt_error(stdout, id, &full, class, retryable, epilogue.rolled_back);
-    let _ = stdout.flush();
-}
 
 /// Parse attempt_id from a JSON number only (u64 or non-neg i64).
 /// Decimal strings are rejected — no further coercion.
@@ -6855,7 +6265,7 @@ impl Drop for FaultAfterPrefillGuard {
 /// Fire one-shot after-prefill fault on qwen AR (host LoadedModel path).
 /// Returns true when the fault was taken (caller must return immediately).
 ///
-/// Spec is reset via `production_fail_closed_rollback(..., None)` which
+/// Spec is reset via `hipfire_generate::common::production_fail_closed_rollback(..., None)` which
 /// reborrows `m.speculator` internally — do not pass both `m` and a
 /// split `m.speculator` borrow.
 #[cfg(feature = "serve-fault-inject")]
@@ -6872,8 +6282,8 @@ fn maybe_inject_fault_after_prefill_ar(
     if !matches!(m.arch_id, 5 | 6) {
         return false;
     }
-    let ep = production_fail_closed_rollback(m, gpu, None, None);
-    emit_fail_closed_error(
+    let ep = hipfire_generate::common::production_fail_closed_rollback(m, gpu, None, None);
+    hipfire_generate::common::emit_fail_closed_error(
         stdout,
         Some(id),
         "injected fault after prefill",
@@ -6888,7 +6298,7 @@ fn maybe_inject_fault_after_prefill_ar(
 ///
 /// Takes host counters/rings as disjoint reborrows so the RAII target guard's
 /// `&mut m.state` (via `slot`) and `m.speculator` (via `spec`) stay live —
-/// same pattern as [`production_fail_closed_rollback_live`].
+/// same pattern as [`hipfire_generate::common::production_fail_closed_rollback_live`].
 /// Returns true when the fault was taken (caller must return immediately).
 #[cfg(feature = "serve-fault-inject")]
 fn maybe_inject_fault_after_prefill_dflash(
@@ -6910,7 +6320,7 @@ fn maybe_inject_fault_after_prefill_dflash(
     if !matches!(arch_id, 5 | 6) {
         return false;
     }
-    let ep = production_fail_closed_rollback_live(
+    let ep = hipfire_generate::common::production_fail_closed_rollback_live(
         seq_pos,
         conversation_tokens,
         prefill_checkpoints,
@@ -6920,7 +6330,7 @@ fn maybe_inject_fault_after_prefill_dflash(
         slot,
         spec,
     );
-    emit_fail_closed_error(
+    hipfire_generate::common::emit_fail_closed_error(
         stdout,
         Some(id),
         "injected fault after prefill",
@@ -7065,28 +6475,7 @@ fn write_test_state_snapshot(
     let _ = writeln!(stdout, "{}", payload);
     let _ = stdout.flush();
 }
-/// DS4 does not advertise semantic contract v2 (`gen_start.contract_version`).
-/// Task 6 capability denial relies on this remaining unset until a later
-/// producer registration proves full semantic-v2 shape.
-///
-/// Production gen_start selection MUST call [`gen_start_contract_version_for_arch`]
-/// (or this DS4 helper) rather than a test-only constant.
-fn ds4_gen_start_contract_version() -> Option<u32> {
-    gen_start_contract_version_for_arch(9)
-}
 
-/// Open the DS4 EP wire contract before prefill can eventually emit tokens.
-///
-/// EP owns its generation loop instead of routing through the single-device
-/// AR/spec emitters, so it must establish the same contract latch explicitly.
-fn emit_ds4_ep_gen_start(stdout: &mut impl std::io::Write, id: &str, think_mode: ThinkMode) {
-    emit_gen_start(
-        stdout,
-        id,
-        !matches!(think_mode, ThinkMode::NonThink),
-        ds4_gen_start_contract_version(),
-    );
-}
 
 /// Pure `gen_start.contract_version` selection used by the live generate path.
 /// Qwen AR (5/6) and Muse Glimmer (14) advertise v2; DS4 (9) and every other
@@ -7099,147 +6488,24 @@ fn emit_ds4_ep_gen_start(stdout: &mut impl std::io::Write, id: &str, think_mode:
 /// `finish_reason=tool_calls` and an empty payload.
 const GLIMMER_SEMANTIC_CONTRACT_VERSION: u32 = 2;
 
-fn gen_start_contract_version_for_arch(arch_id: u32) -> Option<u32> {
-    hipfire_loader::carrier_for(arch_id)
-        .map(|c| c.caps().semantic_contract_version)
-        .unwrap_or(None)
-}
 
-/// Pure terminal decision shared by DS4 AR, EP, and speculative DSML paths.
-///
-/// When DSML finishes with an unclosed/truncated tool protocol, production
-/// paths must emit exactly one typed validation error, suppress `done`,
-/// suppress assistant-cache store, and expose no tool calls.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Ds4MalformedTerminalAction {
-    /// Request-scoped error message (includes parser detail when available).
-    message: String,
-    /// Typed error class for retry gates.
-    class: &'static str,
-    /// Malformed model output is never automatically retried.
-    retryable: bool,
-    /// Fail-closed turns are not rolled back for retry.
-    rolled_back: bool,
-    /// Never emit `{type:"done",...}` after this action.
-    emit_done: bool,
-    /// Never write `asst_turn_cache` for this turn.
-    store_cache: bool,
-    /// Never release executable tool calls on the wire/fingerprint.
-    expose_tool_calls: bool,
-}
 
-/// Build the shared fail-closed terminal action for malformed DSML.
-///
-/// `detail` is the parser/spec detail string (may be empty). Spec path may pass
-/// a fixed detail when `FinishSummary` only carries the magic finish_reason.
-fn ds4_malformed_terminal_action(detail: &str) -> Ds4MalformedTerminalAction {
-    let message = if detail.is_empty() {
-        "malformed DSML tool protocol".to_string()
-    } else if detail.starts_with("malformed DSML tool protocol") {
-        detail.to_string()
-    } else {
-        format!("malformed DSML tool protocol: {detail}")
-    };
-    Ds4MalformedTerminalAction {
-        message,
-        class: "validation",
-        retryable: false,
-        rolled_back: false,
-        emit_done: false,
-        store_cache: false,
-        expose_tool_calls: false,
-    }
-}
 
-/// Live wireability of a DSML stream event before the turn terminal.
-/// Structured calls and malformed status are held turn-wide.
-fn ds4_stream_event_wireable(ev: &hipfire_arch_deepseek4::dsml::StreamEvent) -> bool {
-    use hipfire_arch_deepseek4::dsml::StreamEvent;
-    matches!(ev, StreamEvent::Token(_) | StreamEvent::Reasoning(_))
-}
 
-/// Outcome of finishing a DS4 AR/EP DSML turn after turn-wide call buffering.
-#[derive(Debug, Clone)]
-enum Ds4ArEpRouteTerminal {
-    /// Fail-closed: discard every buffered call; emit typed error; no done/cache.
-    Malformed(Ds4MalformedTerminalAction),
-    /// Tool-safe or plain terminal. `wire_tool_calls` is empty unless safe.
-    Safe {
-        finish_reason: &'static str,
-        wire_tool_calls: Vec<hipfire_runtime::prompt_frame::ToolCall>,
-        store_cache: bool,
-    },
-}
 
-/// Absorb one DSML stream event into turn-local buffers.
-/// `ToolCalls` are retained only; never released here.
-fn ds4_absorb_stream_event(
-    ev: &hipfire_arch_deepseek4::dsml::StreamEvent,
-    text_buf: &mut String,
-    tool_calls_buf: &mut Vec<hipfire_runtime::prompt_frame::ToolCall>,
-    malformed: &mut Option<String>,
-) {
-    use hipfire_arch_deepseek4::dsml::StreamEvent;
-    match ev {
-        StreamEvent::Token(t) => text_buf.push_str(t),
-        StreamEvent::Reasoning(_) => {}
-        StreamEvent::ToolCalls(calls) => {
-            for c in calls {
-                tool_calls_buf.push(hipfire_runtime::prompt_frame::ToolCall {
-                    id: None,
-                    name: c.name.clone(),
-                    arguments: c.arguments.clone(),
-                    rendered_body: None,
-                });
-            }
-        }
-        StreamEvent::Malformed { detail } => {
-            *malformed = Some(detail.clone());
-        }
-    }
-}
-fn ds4_ar_ep_finish_route(
-    malformed: Option<String>,
-    tool_calls_buf: Vec<hipfire_runtime::prompt_frame::ToolCall>,
-    hit_length_cap: bool,
-) -> Ds4ArEpRouteTerminal {
-    if let Some(detail) = malformed {
-        return Ds4ArEpRouteTerminal::Malformed(ds4_malformed_terminal_action(&detail));
-    }
-    if hit_length_cap {
-        return Ds4ArEpRouteTerminal::Safe {
-            finish_reason: "length",
-            wire_tool_calls: Vec::new(),
-            store_cache: false,
-        };
-    }
-    if !tool_calls_buf.is_empty() {
-        Ds4ArEpRouteTerminal::Safe {
-            finish_reason: "tool_calls",
-            wire_tool_calls: tool_calls_buf,
-            store_cache: true,
-        }
-    } else {
-        Ds4ArEpRouteTerminal::Safe {
-            finish_reason: "stop",
-            wire_tool_calls: Vec::new(),
-            store_cache: true,
-        }
-    }
-}
 
 /// Pure speculative-route terminal decision after `Deepseek4Emit::finish`.
 /// Returns `Some(action)` when the emitter reported malformed protocol.
 fn ds4_spec_finish_route(
     finish_reason: &str,
     tool_calls: usize,
-) -> Option<Ds4MalformedTerminalAction> {
+) -> Option<hipfire_generate::common::Ds4MalformedTerminalAction> {
     if finish_reason == "malformed_protocol" {
         debug_assert_eq!(
             tool_calls, 0,
             "spec malformed must report tool_calls=0 (buffered calls discarded)"
         );
-        Some(ds4_malformed_terminal_action(
+        Some(hipfire_generate::common::ds4_malformed_terminal_action(
             "unclosed DSML tool_calls block at end of output",
         ))
     } else {
@@ -7247,432 +6513,27 @@ fn ds4_spec_finish_route(
     }
 }
 
-/// Speculative wire terminal after `Deepseek4Emit::finish` + length known.
-/// Length always suppresses call release and cache; malformed is error XOR done.
-#[derive(Debug, Clone, PartialEq)]
-enum Ds4SpecWireTerminal {
-    Malformed(Ds4MalformedTerminalAction),
-    Done {
-        finish_reason: &'static str,
-        release_tool_calls: bool,
-        store_cache: bool,
-    },
-}
 
-fn ds4_spec_wire_terminal(
-    finish_reason: &str,
-    tool_calls: usize,
-    hit_length_cap: bool,
-) -> Ds4SpecWireTerminal {
-    if finish_reason == "malformed_protocol" {
-        return Ds4SpecWireTerminal::Malformed(ds4_malformed_terminal_action(
-            "unclosed DSML tool_calls block at end of output",
-        ));
-    }
-    if hit_length_cap {
-        return Ds4SpecWireTerminal::Done {
-            finish_reason: "length",
-            release_tool_calls: false,
-            store_cache: false,
-        };
-    }
-    if tool_calls > 0 {
-        Ds4SpecWireTerminal::Done {
-            finish_reason: "tool_calls",
-            release_tool_calls: true,
-            store_cache: true,
-        }
-    } else {
-        Ds4SpecWireTerminal::Done {
-            finish_reason: "stop",
-            release_tool_calls: false,
-            store_cache: true,
-        }
-    }
-}
 
-/// Cache-store action for DS4 AR/EP/spec — production and tests share this seam
-/// so `store_cache` is never asserted in isolation from the sink mutation.
-/// Fingerprint text + wire tool_calls match `build_deepseek4_dsml_prompt` lookup.
-#[derive(Debug, Clone)]
-struct Ds4CacheAction {
-    store: bool,
-    fingerprint_text: String,
-    tool_calls: Vec<hipfire_runtime::prompt_frame::ToolCall>,
-}
 
-/// Derive cache action from the AR/EP pure route terminal.
-fn ds4_ar_ep_cache_action(
-    terminal: &Ds4ArEpRouteTerminal,
-    visible_for_cache: &str,
-) -> Ds4CacheAction {
-    match terminal {
-        Ds4ArEpRouteTerminal::Malformed(_) => Ds4CacheAction {
-            store: false,
-            fingerprint_text: String::new(),
-            tool_calls: Vec::new(),
-        },
-        Ds4ArEpRouteTerminal::Safe {
-            store_cache,
-            wire_tool_calls,
-            ..
-        } => Ds4CacheAction {
-            store: *store_cache,
-            fingerprint_text: normalize_asst_turn_for_fingerprint(visible_for_cache),
-            tool_calls: wire_tool_calls.clone(),
-        },
-    }
-}
 
-/// Derive cache action from the speculative wire terminal + finish payload.
-/// Length/malformed never store; safe stop/tool_calls store when authorized.
-fn ds4_cache_action(
-    terminal: &Ds4SpecWireTerminal,
-    finish: &FinishSummary,
-    visible_for_cache: &str,
-) -> Ds4CacheAction {
-    match terminal {
-        Ds4SpecWireTerminal::Malformed(_) => Ds4CacheAction {
-            store: false,
-            fingerprint_text: String::new(),
-            tool_calls: Vec::new(),
-        },
-        Ds4SpecWireTerminal::Done {
-            store_cache,
-            release_tool_calls,
-            ..
-        } => {
-            let tool_calls = if *release_tool_calls {
-                finish_summary_held_tool_calls(finish)
-            } else {
-                Vec::new()
-            };
-            Ds4CacheAction {
-                store: *store_cache,
-                fingerprint_text: normalize_asst_turn_for_fingerprint(visible_for_cache),
-                tool_calls,
-            }
-        }
-    }
-}
 
-/// Apply a DS4 cache action through a shared insert seam (production
-/// `AsstTurnCache` or a test `HashMap`). Returns the fingerprint when stored.
-/// `cached_seq` must be the verbatim raw `streamed_tokens` body expected by
-/// `build_deepseek4_dsml_prompt` replay (no surround EOS/Assistant markers).
-fn ds4_apply_cache_action<F>(
-    mut insert: F,
-    action: &Ds4CacheAction,
-    cached_seq: Vec<u32>,
-) -> Option<u64>
-where
-    F: FnMut(u64, Vec<u32>),
-{
-    if !action.store || cached_seq.is_empty() {
-        return None;
-    }
-    // Empty trimmed content AND no tool_calls collides on the hash of
-    // ("assistant", "") — skip the same dead-weight empty turns AR/EP skip.
-    let have_replayable_payload =
-        !action.fingerprint_text.trim().is_empty() || !action.tool_calls.is_empty();
-    if !have_replayable_payload {
-        return None;
-    }
-    let fp = asst_turn_fingerprint(&action.fingerprint_text, &action.tool_calls);
-    insert(fp, cached_seq);
-    Some(fp)
-}
 
-/// Pure Commit/Abort side-effect gate for DS4 AR / EP / spec successful
-/// terminals. Commit preserves the intended release/store/done flags; Abort
-/// suppresses all three so producers never store or release after cancel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Ds4ClientCommitEffects {
-    release_tool_calls: bool,
-    store_cache: bool,
-    emit_done: bool,
-}
 
-fn ds4_client_commit_effects(
-    decision: ClientTerminalDecision,
-    intended_release: bool,
-    intended_store: bool,
-) -> Ds4ClientCommitEffects {
-    match decision {
-        ClientTerminalDecision::Commit => Ds4ClientCommitEffects {
-            release_tool_calls: intended_release,
-            store_cache: intended_store,
-            emit_done: true,
-        },
-        ClientTerminalDecision::Abort => Ds4ClientCommitEffects {
-            release_tool_calls: false,
-            store_cache: false,
-            emit_done: false,
-        },
-    }
-}
 
-/// Pure EP abort wire shape (attempt-correlated aborted + done). Used by
-/// production `ep_emit_abort` and no-GPU seam tests.
-fn ds4_ep_abort_wire_events(
-    id: &str,
-    completion_tokens: usize,
-    attempt_id: u64,
-) -> (serde_json::Value, serde_json::Value) {
-    (
-        hipfire_runtime::semantic::wire_aborted(id, "client_cancelled", attempt_id),
-        hipfire_runtime::semantic::wire_aborted_done(id, completion_tokens, attempt_id),
-    )
-}
 
-/// Full single-GPU DS4 AR abort reset while the decode `state` borrow is live
-/// (disjoint host fields on `m` + explicit `state`). Attests via device sync,
-/// then emits the correlated cancel lifecycle (or unattested fail-closed error).
-///
-/// Callers must pass host fields reborrowed from `LoadedModel` separately from
-/// `state` (which is already borrowed from `m.state` as `ModelState::Deepseek4`).
-fn ds4_ar_client_abort(
-    stdout: &mut impl std::io::Write,
-    id: &str,
-    seq_pos: &mut usize,
-    conversation_tokens: &mut Vec<u32>,
-    prefill_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
-    dflash_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
-    speculator: &mut Option<Box<dyn Speculator>>,
-    gpu: &mut rdna_compute::Gpu,
-    state: &mut deepseek4::DeepseekV4State,
-    completion_tokens: usize,
-) {
-    *seq_pos = 0;
-    conversation_tokens.clear();
-    state.reset();
-    state.zero_decode_caches(gpu);
-    free_checkpoints(prefill_checkpoints, gpu);
-    free_checkpoints(dflash_checkpoints, gpu);
-    let spec_reset = if let Some(s) = speculator.as_mut() {
-        s.reset(gpu).map_err(|e| format!("spec.reset: {e}"))
-    } else {
-        Ok(())
-    };
-    fail_closed_invalidate_graphs_and_replay(gpu);
-    let epilogue = fail_closed_epilogue_after_sync(spec_reset, fail_closed_device_sync(gpu));
-    if epilogue.rolled_back {
-        gpu.replay.begin_replay_observation_window();
-    }
-    emit_spec_cancel_after_rollback(stdout, id, completion_tokens, &epilogue);
-}
 
-/// Speculative wire terminal after `Qwen35Emit::finish` + length/EOT known.
-/// Length without decoded EOT never releases calls or stores cache; malformed
-/// is error XOR done; decoded EOT on the final budget token beats length.
-#[derive(Debug, Clone)]
-enum QwenDflashWireTerminal {
-    Malformed {
-        message: String,
-        class: &'static str,
-        retryable: bool,
-        rolled_back: bool,
-    },
-    Done {
-        finish_reason: &'static str,
-        release_tool_calls: bool,
-        store_cache: bool,
-        /// Producer-authorized fingerprint text (visible only).
-        fingerprint_text: String,
-        wire_tool_calls: Vec<hipfire_runtime::prompt_frame::ToolCall>,
-    },
-}
 
-/// Resolve whether a pure length-cap was hit (no semantic stop / decoded EOT).
-/// Semantic stop (StopSequence / EOS / ThinkCap) or decoded EOT on the final
-/// budget token is tool-safe stop/tool_calls, not length.
-fn qwen_dflash_hit_length_cap(
-    generated: usize,
-    max_tokens: usize,
-    decoded_eot: bool,
-    semantic_stop: bool,
-) -> bool {
-    generated >= max_tokens && !decoded_eot && !semantic_stop
-}
 
-/// Emitter stop reasons that are semantic terminals (not grammar fail-closed).
-/// Survives into SpecRun so wrappers classify stop/tool_calls over length when
-/// `generated == max_tokens`.
-fn spec_stop_is_semantic(stop: Option<StopReason>) -> bool {
-    matches!(
-        stop,
-        Some(StopReason::Eos) | Some(StopReason::StopSequence) | Some(StopReason::ThinkCap)
-    )
-}
 
-/// Extract held ToolCalls from a FinishSummary (generate_spec holds them).
-fn finish_summary_held_tool_calls(
-    finish: &FinishSummary,
-) -> Vec<hipfire_runtime::prompt_frame::ToolCall> {
-    finish
-        .events
-        .iter()
-        .find_map(|ev| match ev {
-            ClientEvent::ToolCalls(c) => Some(c.clone()),
-            _ => None,
-        })
-        .unwrap_or_default()
-}
 
-/// Production terminal + cache decision for Qwen DFlash/spec epilogue.
-/// Shared by `generate_dflash` and deterministic non-GPU tests.
-fn qwen_dflash_wire_terminal(
-    finish: &FinishSummary,
-    hit_length_cap: bool,
-    grammar_violated: bool,
-    visible_for_cache: &str,
-    // Truthful rollback attestation from the production epilogue.
-    // Unit tests that do not drive GPU reset pass `false`.
-    rolled_back: bool,
-) -> QwenDflashWireTerminal {
-    if finish.finish_reason == "malformed_protocol" {
-        return QwenDflashWireTerminal::Malformed {
-            message: "malformed tool protocol".to_string(),
-            class: "validation",
-            retryable: false,
-            rolled_back,
-        };
-    }
-    // Open think is a nonretryable unsafe terminal (error XOR done).
-    if finish.open_think || finish.finish_reason == "open_think" {
-        return QwenDflashWireTerminal::Malformed {
-            message: "open think span at end of generation (validation)".to_string(),
-            class: "validation",
-            retryable: false,
-            rolled_back,
-        };
-    }
-    // Grammar failure is error-only: no done/calls/cache.
-    if grammar_violated {
-        return QwenDflashWireTerminal::Malformed {
-            message: "grammar violation during speculative decode".to_string(),
-            class: "validation",
-            retryable: false,
-            rolled_back,
-        };
-    }
-    if hit_length_cap {
-        return QwenDflashWireTerminal::Done {
-            finish_reason: "length",
-            release_tool_calls: false,
-            store_cache: false,
-            fingerprint_text: String::new(),
-            wire_tool_calls: Vec::new(),
-        };
-    }
-    let held = finish_summary_held_tool_calls(finish);
-    let fingerprint_text = normalize_asst_turn_for_fingerprint(visible_for_cache);
-    if !held.is_empty() || finish.tool_calls > 0 {
-        QwenDflashWireTerminal::Done {
-            finish_reason: "tool_calls",
-            release_tool_calls: true,
-            store_cache: true,
-            fingerprint_text,
-            wire_tool_calls: held,
-        }
-    } else {
-        QwenDflashWireTerminal::Done {
-            finish_reason: "stop",
-            release_tool_calls: false,
-            store_cache: true,
-            fingerprint_text,
-            wire_tool_calls: Vec::new(),
-        }
-    }
-}
 
-/// Cache-store action for Qwen DFlash — production and tests share this seam.
-#[derive(Debug, Clone)]
-struct QwenDflashCacheAction {
-    store: bool,
-    fingerprint_text: String,
-    tool_calls: Vec<hipfire_runtime::prompt_frame::ToolCall>,
-}
 
-fn qwen_dflash_cache_action(terminal: &QwenDflashWireTerminal) -> QwenDflashCacheAction {
-    match terminal {
-        QwenDflashWireTerminal::Malformed { .. } => QwenDflashCacheAction {
-            store: false,
-            fingerprint_text: String::new(),
-            tool_calls: Vec::new(),
-        },
-        QwenDflashWireTerminal::Done {
-            store_cache,
-            fingerprint_text,
-            wire_tool_calls,
-            ..
-        } => QwenDflashCacheAction {
-            store: *store_cache,
-            fingerprint_text: fingerprint_text.clone(),
-            tool_calls: wire_tool_calls.clone(),
-        },
-    }
-}
 
-fn qwen_dflash_apply_cache_action<F>(
-    mut insert: F,
-    action: &QwenDflashCacheAction,
-    cached_seq: Vec<u32>,
-) -> Option<u64>
-where
-    F: FnMut(u64, Vec<u32>),
-{
-    if !action.store || cached_seq.is_empty() {
-        return None;
-    }
-    let fp = asst_turn_fingerprint(&action.fingerprint_text, &action.tool_calls);
-    insert(fp, cached_seq);
-    Some(fp)
-}
 
-/// Decode whether the last streamed token is a terminator for EOT-vs-length.
-fn qwen_dflash_decoded_eot_from_tokens(
-    tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
-    streamed: &[u32],
-    eos: u32,
-    im_end: Option<u32>,
-) -> bool {
-    let Some(&last) = streamed.last() else {
-        return false;
-    };
-    last == eos || im_end == Some(last) || tokenizer.is_terminator(last)
-}
 
-/// Visible fingerprint text from held finish events (Token channel only).
-fn qwen_dflash_visible_from_finish(finish: &FinishSummary) -> String {
-    let mut s = String::new();
-    for ev in &finish.events {
-        if let ClientEvent::Token(t) = ev {
-            s.push_str(t);
-        }
-    }
-    s
-}
 
-/// Production serde value for a correlated DFlash/spec token event.
-fn qwen_dflash_token_event_value(id: &str, text: &str, attempt_id: u64) -> serde_json::Value {
-    serde_json::json!({
-        "type": "token",
-        "id": id,
-        "text": text,
-        "attempt_id": attempt_id,
-    })
-}
 
-/// Production serde value for a correlated DFlash/spec reasoning event.
-fn qwen_dflash_reasoning_event_value(id: &str, text: &str, attempt_id: u64) -> serde_json::Value {
-    serde_json::json!({
-        "type": "reasoning",
-        "id": id,
-        "text": text,
-        "attempt_id": attempt_id,
-    })
-}
 
 /// Production Malformed error envelope for Qwen DFlash epilogue + tests.
 fn qwen_dflash_malformed_error_value(
@@ -7694,68 +6555,8 @@ fn qwen_dflash_malformed_error_value(
     })
 }
 
-/// Production done envelope core for Qwen DFlash epilogue + tests.
-/// Optional pflash fields are merged by the caller after construction.
-fn qwen_dflash_done_value(
-    id: &str,
-    generated: usize,
-    tok_s: f64,
-    prefill_tokens: usize,
-    prefill_ms: f64,
-    prefill_tok_s: f64,
-    decode_tok_s: f64,
-    ttft_ms: f64,
-    tau: f64,
-    cycles: usize,
-    cached_tokens: usize,
-    finish_reason: &str,
-    attempt_id: u64,
-) -> serde_json::Value {
-    serde_json::json!({
-        "type": "done",
-        "id": id,
-        "tokens": generated,
-        "tok_s": tok_s,
-        "prefill_tokens": prefill_tokens,
-        "prefill_ms": prefill_ms,
-        "prefill_tok_s": prefill_tok_s,
-        "decode_tok_s": decode_tok_s,
-        "ttft_ms": ttft_ms,
-        "dflash": true,
-        "tau": tau,
-        "cycles": cycles,
-        "cached_tokens": cached_tokens,
-        "finish_reason": finish_reason,
-        "attempt_id": attempt_id,
-    })
-}
 
-/// Write one Qwen DFlash Malformed terminal via the production fail-closed
-/// error writer (same envelope as step/forced/grammar failures).
-fn emit_qwen_dflash_malformed_terminal(
-    stdout: &mut impl std::io::Write,
-    id: &str,
-    message: &str,
-    class: &str,
-    retryable: bool,
-    epilogue: &RollbackEpilogue,
-) {
-    emit_fail_closed_error(stdout, Some(id), message, class, retryable, epilogue);
-}
 
-/// Spec-step / forced-advance failure terminal (production + tests).
-/// Call only after [`production_fail_closed_rollback`] / `_live` (or with a
-/// GPU-less attested epilogue in unit tests).
-fn emit_spec_failure_terminal(
-    stdout: &mut impl std::io::Write,
-    id: &str,
-    what: &str,
-    err: &str,
-    epilogue: &RollbackEpilogue,
-) {
-    let msg = spec_failure_message(what, err);
-    emit_fail_closed_error(stdout, Some(id), &msg, "validation", false, epilogue);
-}
 
 /// Write one Qwen DFlash Done terminal via the production envelope builder.
 fn emit_qwen_dflash_done_terminal(
@@ -7774,7 +6575,7 @@ fn emit_qwen_dflash_done_terminal(
     finish_reason: &str,
     pflash: Option<(&str, f32)>,
 ) {
-    let mut done_env = qwen_dflash_done_value(
+    let mut done_env = hipfire_generate::qwen::qwen_dflash_done_value(
         id,
         generated,
         tok_s,
@@ -7799,731 +6600,41 @@ fn emit_qwen_dflash_done_terminal(
     let _ = stdout.flush();
 }
 
-/// Pure trailer trim for asst-turn cache sequence (production + tests).
-///
-/// Strips a trailing im_end + newline trailer only when im_end is present as
-/// the true trailer. A length-capped body that ends on a newline is restored
-/// verbatim so cached body length stays parity-equal with streamed tokens.
-fn qwen_dflash_cache_seq(
-    streamed: &[u32],
-    im_end: Option<u32>,
-    nl: &std::collections::HashSet<u32>,
-) -> Vec<u32> {
-    let mut cached_seq: Vec<u32> = streamed.to_vec();
-    let body_len_before_trim = cached_seq.len();
-    while let Some(&last) = cached_seq.last() {
-        if nl.contains(&last) {
-            cached_seq.pop();
-        } else {
-            break;
-        }
-    }
-    match cached_seq.last() {
-        Some(&last) if im_end == Some(last) => {
-            cached_seq.pop();
-        }
-        // No im_end behind the newlines ⇒ they were never a trailer.
-        _ => cached_seq = streamed[..body_len_before_trim].to_vec(),
-    }
-    cached_seq
-}
 
-/// Host-side bookkeeping after one SpecStep is consumed by the semantic loop.
-///
-/// `consumed` is the number of step.emit tokens the emitter actually observed
-/// (may be a strict prefix on EOT/stop/forced). Position and conversation must
-/// advance by that prefix only — never by an unconsumed speculative tail.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SpecHostAdvance {
-    position: usize,
-    generated: usize,
-    emitted: Vec<u32>,
-    seed_token: u32,
-}
 
-fn spec_host_advance_after_step(
-    mut position: usize,
-    mut generated: usize,
-    mut emitted: Vec<u32>,
-    step_emit: &[u32],
-    step_next_seed: u32,
-    consumed: usize,
-) -> SpecHostAdvance {
-    let keep = consumed.min(step_emit.len());
-    let prefix = &step_emit[..keep];
-    emitted.extend_from_slice(prefix);
-    generated = generated.saturating_add(prefix.len());
-    position = position.saturating_add(prefix.len());
-    let seed_token = prefix.last().copied().unwrap_or(step_next_seed);
-    SpecHostAdvance {
-        position,
-        generated,
-        emitted,
-        seed_token,
-    }
-}
 
-/// GPU-side pending-seed transaction for `generate_spec`.
-///
-/// # Pending-seed invariant (single source of truth)
-///
-/// After every safe boundary in `generate_spec`:
-/// - `position` is the next target **write** slot.
-/// - `seed_token` is the **unprocessed** pending seed (not yet in KV /
-///   DeltaNet / drafter-hidden). Never infer GPU progress from client-event
-///   counts.
-/// - `Speculator::step(position, seed)` leaves target/drafter advanced over
-///   the prior pending seed plus accepted drafts; `step.emit` is those
-///   accepted drafts plus the bonus; `step.next_seed` is emitted but
-///   **unprocessed**.
-/// - A forced suffix commits the current pending seed only when it is
-///   committable, then every forced token except the last; the last forced
-///   token becomes the new pending seed. Non-committable seeds (DS4 empty-
-///   event EOS) are omitted so a forced token can occupy that same slot
-///   (`position_delta == commit.len()`; last stays unwritten).
-/// - Safe terminal completion flushes the final pending seed **exactly once**
-///   before host cache / conversation bake.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SpecPendingSeedTx {
-    /// Tokens to GPU-commit at `position`, in order. Length == `position_delta`.
-    commit: Vec<u32>,
-    /// Unprocessed pending seed after the commit (not present in `commit`).
-    pending_seed: u32,
-    /// How far to advance `position` (== `commit.len()`).
-    position_delta: usize,
-}
 
-/// Build the forced-continuation GPU transaction.
-///
-/// `pending_seed` is the current unwritten seed (trigger / last consumed).
-/// `forced` is the non-empty emitter continuation (already budget-clipped).
-/// `pending_seed_committable` gates whether the current seed is prepended:
-/// suppressed empty-event EOS must not be GPU-written; forced tokens then
-/// occupy that same slot.
-///
-/// - if committable: `commit = [pending_seed] ++ forced[..n-1]`
-/// - if not: `commit = forced[..n-1]` (may be empty when `forced.len() == 1`)
-/// - new pending seed = `forced[n-1]`
-/// - `position_delta = commit.len()`
-///
-/// The last forced token is never double-forwarded: it remains the next
-/// window's unprocessed seed (or the terminal flush input).
-fn spec_forced_pending_seed_tx(
-    pending_seed: u32,
-    forced: &[u32],
-    pending_seed_committable: bool,
-) -> SpecPendingSeedTx {
-    debug_assert!(
-        !forced.is_empty(),
-        "forced continuation tx requires at least one forced token"
-    );
-    let mut commit = Vec::with_capacity(forced.len());
-    if pending_seed_committable {
-        commit.push(pending_seed);
-    }
-    if forced.len() > 1 {
-        commit.extend_from_slice(&forced[..forced.len() - 1]);
-    }
-    SpecPendingSeedTx {
-        pending_seed: *forced.last().expect("forced non-empty"),
-        position_delta: commit.len(),
-        commit,
-    }
-}
 
-/// Terminal flush: forward the final pending seed exactly once.
-///
-/// After this commit, `position += 1` and model state ends on the same
-/// logical token as conversation history (no lagging unwritten seed).
-fn spec_terminal_pending_seed_tx(pending_seed: u32) -> SpecPendingSeedTx {
-    SpecPendingSeedTx {
-        commit: vec![pending_seed],
-        pending_seed,
-        position_delta: 1,
-    }
-}
 
-/// Whether a [`SpecEmit`] outcome's pending seed is state-committable.
-///
-/// Event-bearing outcomes (including hidden/raw protocol `Committed` bytes)
-/// stay committable so history/GPU flush keep them. DS4 empty-event EOS is a
-/// model terminator only — not baked, not terminal-flushed.
-fn spec_outcome_seed_committable(outcome: &EmitOutcome) -> bool {
-    !outcome.events.is_empty()
-}
 
-/// Terminal pending-seed GPU flush gate.
-///
-/// Skip on grammar fail-closed (rollback wipes state) and when the current
-/// pending seed is intentionally non-committable (DS4 empty-event EOS).
-fn spec_should_flush_pending_seed(grammar_violated: bool, pending_seed_committable: bool) -> bool {
-    !grammar_violated && pending_seed_committable
-}
 
-/// Hard `max_tokens` ceiling for forced tokens: no GPU commit for a token
-/// that cannot fit. `generated` already includes the trigger when it produced
-/// client events. Returns a (possibly empty) prefix of `forced`.
-fn spec_forced_tokens_within_budget<'a>(
-    generated: usize,
-    max_tokens: usize,
-    forced: &'a [u32],
-) -> &'a [u32] {
-    let room = max_tokens.saturating_sub(generated);
-    let n = forced.len().min(room);
-    &forced[..n]
-}
 
-/// Pure plan for mid-window GPU/drafter realign after a strict-prefix consume.
-///
-/// Prefill leaves `position = filled.len()` and the next `step` WRITES `seed` at
-/// that slot. Therefore the last consumed token must remain the unwritten seed
-/// and must NOT be included in the prefill replay.
-///
-/// `raw_decode` is every position-advancing token after the prefill `first_token`
-/// (includes empty-event EOS observes; excludes the prefill seed itself).
-/// - raw nonempty: replay = prompt + [first_token] + raw[..len-1],
-///   position = prompt.len() + raw.len(), seed = raw.last()
-/// - raw empty: replay = prompt, position = prompt.len(), seed = first_token
-///
-/// Invariant: `replay.len() == position` (processed prefix only). The pending
-/// seed is host-side and unprocessed until the next commit. Callers MUST run
-/// [`spec_prefix_realign_admit`] before any reset/prefill.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SpecPrefixRealignPlan {
-    /// Tokens that will be GPU-prefilled (processed positions only).
-    replay: Vec<u32>,
-    /// Next target write slot (= `replay.len()`); pending seed is unwritten.
-    position: usize,
-    /// Pending unprocessed seed (not in `replay`).
-    seed_token: u32,
-}
 
-fn spec_prefix_realign_plan(
-    prompt: &[u32],
-    first_token: u32,
-    raw_decode: &[u32],
-) -> SpecPrefixRealignPlan {
-    if raw_decode.is_empty() {
-        return SpecPrefixRealignPlan {
-            replay: prompt.to_vec(),
-            position: prompt.len(),
-            seed_token: first_token,
-        };
-    }
-    let mut replay = Vec::with_capacity(prompt.len() + raw_decode.len());
-    replay.extend_from_slice(prompt);
-    replay.push(first_token);
-    replay.extend_from_slice(&raw_decode[..raw_decode.len() - 1]);
-    let position = prompt.len() + raw_decode.len();
-    debug_assert_eq!(
-        replay.len(),
-        position,
-        "processed prefix length must equal next write slot"
-    );
-    SpecPrefixRealignPlan {
-        position,
-        seed_token: *raw_decode.last().unwrap(),
-        replay,
-    }
-}
 
-/// Prove a strict-prefix realign replay fits target physical + speculator caps
-/// and is compatible with current eviction/compact-offset state.
-///
-/// Realign is reset + full-history prefill (`compact_offset` cleared). It must
-/// never overrun `physical_cap` / `ctx_capacity`, and must not silently rebuild
-/// a compacted/evicted cache from an oversize full-history replay. On `Err`,
-/// callers fail closed with one rollback+error terminal (no reset/prefill).
-///
-/// `compact_offset` / `eviction_enabled` are part of the admit contract: when
-/// either is live the physical buffer is a retained window, but realign still
-/// full-replays logical history after reset. Retain-mask partial repair is
-/// **not** used here (no source contract proves DeltaNet/drafter-hidden
-/// equivalence). Capacity fit is the only proof; oversized history fails closed.
-fn spec_prefix_realign_admit(
-    plan: &SpecPrefixRealignPlan,
-    physical_cap: usize,
-    ctx_capacity: usize,
-    compact_offset: usize,
-    eviction_enabled: bool,
-) -> Result<(), String> {
-    // Processed-prefix / pending-seed split: replay holds only processed tokens;
-    // `position` is the next write slot for the unprocessed pending seed.
-    if plan.replay.len() != plan.position {
-        return Err(format!(
-            "spec_prefix_realign: invariant broken: replay.len()={} != position={} (pending seed must stay unprocessed)",
-            plan.replay.len(),
-            plan.position
-        ));
-    }
-    // Invariant holds ⇒ `position == processed`. Reset+prefill writes
-    // `processed` rows at physical [0, processed). The pending seed is
-    // unwritten but needs a legal next write slot at `position`.
-    let processed = plan.replay.len();
-    if plan.position >= physical_cap {
-        return Err(format!(
-            "spec_prefix_realign: replay len {processed} (pending seed slot {}) exceeds physical_cap {physical_cap}",
-            plan.position
-        ));
-    }
-    if plan.position >= ctx_capacity {
-        return Err(format!(
-            "spec_prefix_realign: replay len {processed} (pending seed slot {}) exceeds ctx_capacity {ctx_capacity}",
-            plan.position
-        ));
-    }
-    // Eviction/compact_offset: realign always reset+full-replays (offset cleared).
-    // Retain-mask partial repair is intentionally unused (no source contract for
-    // DeltaNet/drafter-hidden equivalence). Capacity fit above is the only admit
-    // proof — oversize full-history under compaction fails closed, never silent
-    // reconstruct. Params stay in the signature so callers cannot ignore the seam.
-    let _ = (compact_offset, eviction_enabled);
-    Ok(())
-}
 
-/// Message text used by live spec-step / forced-advance failure branches.
-fn spec_failure_message(what: &str, err: &str) -> String {
-    match what {
-        "forced" | "forced-token advance" => format!("forced-token advance: {err}"),
-        _ => format!("spec_step: {err}"),
-    }
-}
 
-/// Whether a SpecRun None early-exit may enter the wrapper epilogue.
+/// Whether a hipfire_generate::common::SpecRun None early-exit may enter the wrapper epilogue.
 /// Production contract: None already wrote error/aborted; epilogue is skipped.
 fn qwen_dflash_epilogue_after_spec_run(run_present: bool) -> bool {
     run_present
 }
 
-/// Outcome of a forced GPU advance after abort is observed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ForcedGpuAdvanceKind {
-    /// Advance completed; token may be baked/emitted.
-    Committed,
-    /// Abort fired around the advance — rollback + cancelled terminal; do not bake.
-    Cancelled,
-}
 
-/// Classify forced GPU advance after pre/mid/post abort observability.
-fn classify_forced_gpu_advance(abort_observed: bool) -> ForcedGpuAdvanceKind {
-    if abort_observed {
-        ForcedGpuAdvanceKind::Cancelled
-    } else {
-        ForcedGpuAdvanceKind::Committed
-    }
-}
 
-/// Outcome of [`apply_spec_forced_pending_seed`] (begin + mid-window share this).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SpecForcedApplyResult {
-    /// Empty input or hard-budget clip left nothing to apply.
-    Skipped,
-    /// GPU/host advanced; last forced token is the new unprocessed pending seed.
-    Applied,
-    /// Forced suffix halted on a non-`None` stop after successful commit/render.
-    /// Caller must skip remaining forcing and all subsequent `spec.step` work.
-    Stopped(StopReason),
-    /// Exclusive cancel or error terminal already written — caller returns `None`.
-    /// Staged emitter outcomes were discarded (no client events).
-    Terminal,
-}
 
-/// Pure physical-cap admission for a forced pending-seed GPU commit slice.
-///
-/// `commit_len` is the exact transaction commit length (`tx.commit.len()`), not
-/// the forced token count (non-committable seed may omit the trigger).
-/// - No eviction: admits iff `position + commit_len < physical_cap` so one legal
-///   write slot remains for the unprocessed pending seed.
-/// - Eviction enabled: admits iff `position + commit_len <= physical_cap`. Exact-cap
-///   is allowed only because the caller MUST run post-commit `maybe_evict` /
-///   `on_evict` before host seed/raw/render updates and still leave a legal
-///   pending-seed slot (`post_evict < physical_cap`).
-fn spec_forced_commit_admits(
-    position: usize,
-    commit_len: usize,
-    physical_cap: usize,
-    eviction_enabled: bool,
-) -> bool {
-    let post_position = position.saturating_add(commit_len);
-    if eviction_enabled {
-        post_position <= physical_cap
-    } else {
-        post_position < physical_cap
-    }
-}
 
-/// Apply a forced continuation with the single pending-seed transaction.
-///
-/// Shared by `generate_spec` immediately after `emit.begin(first_token)` and by
-/// the mid-window observe path after prefix realign. Same hard budget, commit
-/// ordering (trigger retained only when committable; last forced pending once),
-/// physical-cap admission, optional post-commit eviction, abort latch, rollback
-/// attestation, client observe/render, raw history, and pending-seed
-/// committability rules — begin/mid-window cannot drift.
-///
-/// Ordering (commit-before-client-visible):
-/// 1. Stage `emit.observe` over the budget-clipped forced list and stop at the
-///    first non-`None` stop — later forced tokens are never observed.
-/// 2. Build the exact pending+forced processed prefix; reject when the commit
-///    slice cannot fit `physical_cap` (no-eviction keeps a pending-seed slot;
-///    eviction may end at cap only with step 4).
-/// 3. GPU-commit that exact prefix (`on_forced_advance` / `spec_advance`).
-/// 4. When eviction is active: `maybe_evict` + `on_evict` on the post-commit
-///    physical position before any host seed/raw/render/generated update.
-/// 5. Only after successful commit (+ eviction): set host position, push raw
-///    history, render events, update `generated` / `pending_seed_committable`.
-///
-/// `forced_all` is the raw `take_forced()` payload (may be empty). On
-/// [`SpecForcedApplyResult::Terminal`] the exclusive cancel/error envelope is
-/// already on the wire; caller must `drop(guard); return None`. On
-/// [`SpecForcedApplyResult::Stopped`] the terminal stop is returned so callers
-/// skip remaining force and every subsequent speculative step.
-///
-/// Each forced `observe` updates `pending_seed_committable` via
-/// [`spec_outcome_seed_committable`] so the final pending seed matches the last
-/// kept forced token's event-bearing status (DS4 empty-event EOS stays unflushed).
-#[allow(clippy::too_many_arguments)]
-fn apply_spec_forced_pending_seed(
-    forced_all: &[u32],
-    generated: &mut usize,
-    max_tokens: usize,
-    seed_token: &mut u32,
-    position: &mut usize,
-    raw_decode: &mut Vec<u32>,
-    emitted: &mut Vec<u32>,
-    pending_seed_committable: &mut bool,
-    emit: &mut dyn SpecEmit,
-    gpu: &mut rdna_compute::Gpu,
-    slot: &mut dyn SpecTarget,
-    spec: &mut dyn Speculator,
-    stdout: &mut impl std::io::Write,
-    id: &str,
-    t0: Instant,
-    seq_pos: &mut usize,
-    conversation_tokens: &mut Vec<u32>,
-    prefill_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
-    dflash_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
-    asst_turn_cache: &mut hipfire_loader::AsstTurnCache,
-    physical_cap: usize,
-    eviction: Option<&Eviction>,
-) -> SpecForcedApplyResult {
-    if forced_all.is_empty() {
-        return SpecForcedApplyResult::Skipped;
-    }
-    let forced = spec_forced_tokens_within_budget(*generated, max_tokens, forced_all);
-    if forced.is_empty() {
-        return SpecForcedApplyResult::Skipped;
-    }
-    // Incoming seed committability gates whether the pre-forced pending seed is
-    // prepended to the GPU commit (ForcedCommittableTx). Capture before staging
-    // observes overwrite `pending_seed_committable` for the new seed.
-    let incoming_seed_committable = *pending_seed_committable;
 
-    // Stage observe outcomes before any GPU commit. Halt the forced suffix at
-    // the first non-None stop so later forced tokens stay untouched.
-    let mut staged: Vec<(u32, EmitOutcome)> = Vec::with_capacity(forced.len());
-    let mut stop_reason: Option<StopReason> = None;
-    let mut hint_generated = *generated;
-    for &ft in forced {
-        emit.set_generated_hint(hint_generated);
-        let fo = emit.observe(ft);
-        if !fo.events.is_empty() {
-            hint_generated = hint_generated.saturating_add(1);
-        }
-        let stop = fo.stop;
-        staged.push((ft, fo));
-        if let Some(reason) = stop {
-            stop_reason = Some(reason);
-            break;
-        }
-    }
-    debug_assert!(!staged.is_empty(), "budget-clipped forced is non-empty");
-    let kept: Vec<u32> = staged.iter().map(|(t, _)| *t).collect();
-    let tx = spec_forced_pending_seed_tx(*seed_token, &kept, incoming_seed_committable);
 
-    // Physical-cap admission on the exact commit slice (actual tx.commit.len()).
-    // Reject before any GPU write. Capacity failure is fail-closed ErrorOnly.
-    if !spec_forced_commit_admits(*position, tx.commit.len(), physical_cap, eviction.is_some()) {
-        let ep = production_fail_closed_rollback_live(
-            seq_pos,
-            conversation_tokens,
-            prefill_checkpoints,
-            dflash_checkpoints,
-            asst_turn_cache,
-            gpu,
-            slot,
-            spec,
-        );
-        emit_fail_closed_error(
-            stdout,
-            Some(id),
-            &format!(
-                "forced commit exceeds physical_cap: position={} commit_len={} physical_cap={} eviction={}",
-                *position,
-                tx.commit.len(),
-                physical_cap,
-                eviction.is_some()
-            ),
-            "validation",
-            false,
-            &ep,
-        );
-        return SpecForcedApplyResult::Terminal;
-    }
 
-    // Abort observability around forced GPU advance: check before and after,
-    // and latch any mid-advance callback fire. Cancel/error never bakes/emits
-    // the staged forced tokens (fail-closed discards the whole turn).
-    if check_abort(id) {
-        let _ = classify_forced_gpu_advance(true);
-        let ep = production_fail_closed_rollback_live(
-            seq_pos,
-            conversation_tokens,
-            prefill_checkpoints,
-            dflash_checkpoints,
-            asst_turn_cache,
-            gpu,
-            slot,
-            spec,
-        );
-        emit_spec_cancel_after_rollback(stdout, id, *generated, &ep);
-        return SpecForcedApplyResult::Terminal;
-    }
-    let abort_latched = std::cell::Cell::new(false);
-    let abort_cb = || {
-        if check_abort(id) {
-            abort_latched.set(true);
-            true
-        } else {
-            false
-        }
-    };
-    // Speculator first refusal: drafters with per-position cached target-hidden
-    // (DFlash) must advance themselves with hidden extraction. `false` ⇒ plain
-    // KV+recurrent advance. Empty commit (non-committable seed + single forced)
-    // skips GPU entirely — the forced token only replaces the pending seed.
-    //
-    // Note: DFlash/DSpark `on_forced_advance` currently returns Ok(true) even
-    // when the underlying advance aborted (state is torn down by the caller).
-    // Rely on the abort latch + post-check rather than SpecAdvance::Aborted
-    // alone when handled.
-    let forced_res = if tx.commit.is_empty() {
-        Ok(())
-    } else {
-        match spec.on_forced_advance(gpu, slot, &tx.commit, *position, &abort_cb) {
-            Ok(true) => Ok(()),
-            Ok(false) => {
-                match slot.spec_advance(gpu, &tx.commit, *position, false, &abort_cb, None) {
-                    Ok(SpecAdvance::Ready { .. }) => Ok(()),
-                    Ok(SpecAdvance::Aborted) => {
-                        abort_latched.set(true);
-                        Ok(())
-                    }
-                    Err(e) => Err(e),
-                }
-            }
-            Err(e) => Err(e),
-        }
-    };
-    if let Err(e) = forced_res {
-        // Authoritative failure: reset+sync first, then one correlated error;
-        // no finish/calls/cache/done. Staged outcomes are discarded.
-        let ep = production_fail_closed_rollback_live(
-            seq_pos,
-            conversation_tokens,
-            prefill_checkpoints,
-            dflash_checkpoints,
-            asst_turn_cache,
-            gpu,
-            slot,
-            spec,
-        );
-        emit_spec_failure_terminal(stdout, id, "forced", &e.to_string(), &ep);
-        return SpecForcedApplyResult::Terminal;
-    }
-    let abort_observed = abort_latched.get() || check_abort(id);
-    if matches!(
-        classify_forced_gpu_advance(abort_observed),
-        ForcedGpuAdvanceKind::Cancelled
-    ) {
-        let ep = production_fail_closed_rollback_live(
-            seq_pos,
-            conversation_tokens,
-            prefill_checkpoints,
-            dflash_checkpoints,
-            asst_turn_cache,
-            gpu,
-            slot,
-            spec,
-        );
-        emit_spec_cancel_after_rollback(stdout, id, *generated, &ep);
-        return SpecForcedApplyResult::Terminal;
-    }
-    // GPU committed kept prefix (trigger only if committable + forced[..n-1]);
-    // last kept forced is pending. position_delta tracks actual commit length.
-    // Post-commit eviction (when active) MUST complete before host seed/raw/render
-    // so client-visible state never observes over-cap physical occupancy.
-    let mut post_position = position.saturating_add(tx.position_delta);
-    if let Some(ev) = eviction {
-        let evict_outcome = match slot.kv_cache_mut() {
-            Some(kv) => ev.maybe_evict(gpu, kv, post_position),
-            None => {
-                let _ = classify_evict_failure_wire();
-                let ep = production_fail_closed_rollback_live(
-                    seq_pos,
-                    conversation_tokens,
-                    prefill_checkpoints,
-                    dflash_checkpoints,
-                    asst_turn_cache,
-                    gpu,
-                    slot,
-                    spec,
-                );
-                emit_fail_closed_error(
-                    stdout,
-                    Some(id),
-                    "kv_cache_mut missing (forced)",
-                    "validation",
-                    false,
-                    &ep,
-                );
-                return SpecForcedApplyResult::Terminal;
-            }
-        };
-        match evict_outcome {
-            Ok(Some(res)) => {
-                let pre_phys = post_position;
-                if !res.retain_mask.is_empty() {
-                    if let Err(e) = spec.on_evict(
-                        gpu,
-                        &EvictRetain {
-                            retain_mask: res.retain_mask,
-                            pre_phys,
-                        },
-                    ) {
-                        let _ = classify_evict_failure_wire();
-                        let ep = production_fail_closed_rollback_live(
-                            seq_pos,
-                            conversation_tokens,
-                            prefill_checkpoints,
-                            dflash_checkpoints,
-                            asst_turn_cache,
-                            gpu,
-                            slot,
-                            spec,
-                        );
-                        emit_fail_closed_error(
-                            stdout,
-                            Some(id),
-                            &format!("on_evict (forced): {e}"),
-                            "validation",
-                            false,
-                            &ep,
-                        );
-                        return SpecForcedApplyResult::Terminal;
-                    }
-                }
-                post_position = res.new_physical;
-            }
-            Ok(None) => {}
-            Err(e) => {
-                let _ = classify_evict_failure_wire();
-                let ep = production_fail_closed_rollback_live(
-                    seq_pos,
-                    conversation_tokens,
-                    prefill_checkpoints,
-                    dflash_checkpoints,
-                    asst_turn_cache,
-                    gpu,
-                    slot,
-                    spec,
-                );
-                emit_fail_closed_error(
-                    stdout,
-                    Some(id),
-                    &format!("maybe_evict (forced): {e}"),
-                    "validation",
-                    false,
-                    &ep,
-                );
-                return SpecForcedApplyResult::Terminal;
-            }
-        }
-        // Pending seed requires a legal next write slot after eviction.
-        if post_position >= physical_cap {
-            let _ = classify_evict_failure_wire();
-            let ep = production_fail_closed_rollback_live(
-                seq_pos,
-                conversation_tokens,
-                prefill_checkpoints,
-                dflash_checkpoints,
-                asst_turn_cache,
-                gpu,
-                slot,
-                spec,
-            );
-            emit_fail_closed_error(
-                stdout,
-                Some(id),
-                &format!(
-                    "forced commit leaves no pending-seed slot: position={post_position} >= physical_cap={physical_cap}"
-                ),
-                "validation",
-                false,
-                &ep,
-            );
-            return SpecForcedApplyResult::Terminal;
-        }
-    }
-
-    *position = post_position;
-    *seed_token = tx.pending_seed;
-    // Post-commit host path only: raw history + client render for staged prefix.
-    // Last kept observe owns pending_seed_committable for the new seed.
-    for (ft, fo) in staged {
-        raw_decode.push(ft);
-        *pending_seed_committable = spec_outcome_seed_committable(&fo);
-        if !fo.events.is_empty() {
-            emitted.push(ft);
-            render_client_events(
-                stdout,
-                id,
-                &fo.events,
-                t0.elapsed().as_millis() as u64,
-                false,
-            );
-            *generated += 1;
-        }
-    }
-    match stop_reason {
-        Some(reason) => SpecForcedApplyResult::Stopped(reason),
-        None => SpecForcedApplyResult::Applied,
-    }
-}
-
-/// Wire shape for fail-closed terminals on the Task 4 spec path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SpecFailClosedWire {
-    /// Correlated error only — never done / calls / cache.
-    ErrorOnly,
-    /// Client cancel — aborted + done(finish_reason=aborted).
-    Cancelled,
-}
-
-/// Eviction / on_evict failure always uses the exclusive error terminal.
-fn classify_evict_failure_wire() -> SpecFailClosedWire {
-    SpecFailClosedWire::ErrorOnly
-}
-
-/// Apply [`ds4_malformed_terminal_action`] to the active attempt writer.
+/// Apply [`hipfire_generate::common::ds4_malformed_terminal_action`] to the active attempt writer.
 /// Returns after writing the error envelope (caller must `return` from generate).
 fn emit_ds4_malformed_terminal(stdout: &mut impl std::io::Write, id: &str, detail: &str) {
-    let action = ds4_malformed_terminal_action(detail);
+    let action = hipfire_generate::common::ds4_malformed_terminal_action(detail);
     debug_assert!(!action.emit_done);
     debug_assert!(!action.store_cache);
     debug_assert!(!action.expose_tool_calls);
     debug_assert!(!action.retryable);
-    emit_active_attempt_error(
+    hipfire_generate::dense::emit_active_attempt_error(
         stdout,
         Some(id),
         &action.message,
@@ -8534,97 +6645,7 @@ fn emit_ds4_malformed_terminal(stdout: &mut impl std::io::Write, id: &str, detai
     let _ = stdout.flush();
 }
 
-/// Apply a pre-built malformed action (shared AR/EP/spec decision path).
-fn emit_ds4_malformed_action(
-    stdout: &mut impl std::io::Write,
-    id: &str,
-    action: &Ds4MalformedTerminalAction,
-) {
-    debug_assert!(!action.emit_done);
-    debug_assert!(!action.store_cache);
-    debug_assert!(!action.expose_tool_calls);
-    debug_assert!(!action.retryable);
-    emit_active_attempt_error(
-        stdout,
-        Some(id),
-        &action.message,
-        action.class,
-        action.retryable,
-        action.rolled_back,
-    );
-    let _ = stdout.flush();
-}
 
-/// Emit a parsed `deepseek4::dsml::StreamEvent` to the JSONL stream.
-/// Maps:
-///   - Token(text)        → `{type:"token",   id, text}`
-///   - Reasoning(text)    → `{type:"reasoning", id, text}`
-///   - ToolCalls(calls)   → **held** (return); staged onto commit_ready/done
-///     via [`stage_terminal_tool_calls`] after a tool-safe terminal
-///   - Malformed {..}     → no wire event (caller terminalizes with typed error)
-///
-/// The CLI / OpenAI HTTP layer translates these into the corresponding
-/// SSE chunks (`content`, `reasoning_content`, `tool_calls.delta`).
-fn emit_stream_event(
-    stdout: &mut impl std::io::Write,
-    id: &str,
-    ev: hipfire_arch_deepseek4::dsml::StreamEvent,
-) {
-    use hipfire_arch_deepseek4::dsml::StreamEvent;
-    // The request id is user-supplied. Build the envelope through
-    // `serde_json` so any embedded `"` / `\` / control chars are
-    // escaped — otherwise a malformed id corrupts every subsequent
-    // line of the JSONL stream and the cli/serve loop dies with a
-    // `JSON Parse error: Expected '}'`.
-    if !ds4_stream_event_wireable(&ev) {
-        // ToolCalls: buffered turn-wide. Malformed: terminalized by caller.
-        return;
-    }
-    let attempt_id = active_attempt_id();
-    let envelope = match ev {
-        StreamEvent::Token(text) => serde_json::json!({
-            "type": "token",
-            "id": id,
-            "text": text,
-            "attempt_id": attempt_id,
-        }),
-        StreamEvent::Reasoning(text) => serde_json::json!({
-            "type": "reasoning",
-            "id": id,
-            "text": text,
-            "attempt_id": attempt_id,
-        }),
-        StreamEvent::ToolCalls(_) | StreamEvent::Malformed { .. } => return,
-    };
-    let _ = writeln!(stdout, "{}", envelope);
-}
-fn emit_committed_event(
-    stdout: &mut (impl std::io::Write + ?Sized),
-    id: &str,
-    tok_id: u32,
-    pos: usize,
-    t_ms: u64,
-) {
-    use std::sync::LazyLock;
-    static ENABLED: LazyLock<bool> =
-        LazyLock::new(|| std::env::var("HIPFIRE_EMIT_TOKEN_IDS").ok().as_deref() == Some("1"));
-    if !*ENABLED {
-        return;
-    }
-    // Build through `serde_json::json!` for the same reason
-    // `emit_error_with_id` does: `id` is user-supplied and a single `"`
-    // or `\` in it would corrupt the line, breaking the client's JSONL
-    // parser for every subsequent event on the same connection.
-    let envelope = serde_json::json!({
-        "type": "committed",
-        "id": id,
-        "tok_id": tok_id,
-        "pos": pos,
-        "t_ms": t_ms,
-        "attempt_id": active_attempt_id(),
-    });
-    let _ = writeln!(stdout, "{}", envelope);
-}
 
 #[allow(dead_code)]
 fn gpu_block_attractor_token(
@@ -8718,7 +6739,7 @@ const MAX_REQUESTED_SEQ: usize = 1024 * 1024;
 /// protocol by injecting embedded `"`, `\`, or newline bytes.
 fn write_error(stdout: &mut impl std::io::Write, id: &str, message: &str) {
     // Active-attempt internal error (echoes TLS attempt_id).
-    emit_active_attempt_error(stdout, Some(id), message, "internal", false, false);
+    hipfire_generate::dense::emit_active_attempt_error(stdout, Some(id), message, "internal", false, false);
 }
 
 /// Typed active-attempt error writer used by generation failure paths and tests.
@@ -8730,7 +6751,7 @@ fn write_typed_error(
     retryable: bool,
     rolled_back: bool,
 ) {
-    emit_active_attempt_error(stdout, Some(id), message, class, retryable, rolled_back);
+    hipfire_generate::dense::emit_active_attempt_error(stdout, Some(id), message, class, retryable, rolled_back);
 }
 
 /// Fail-closed policy for ordinary single-GPU Qwen35 AR when
@@ -8861,25 +6882,25 @@ mod mtp_adaptive_route_contract {
 /// Pure — no GPU, no launch counters, no Instant reads under test.
 #[cfg(test)]
 mod mtp_host_timing_contract {
-    use super::{attach_mtp_window_timings, mtp_window_timing_kind, mtp_window_timing_record};
+    use hipfire_generate::qwen::{attach_mtp_window_timings, mtp_window_timing_kind, mtp_window_timing_record};
 
     #[test]
     fn route_kind_covers_ngram_mtp_and_ar() {
         // Ngram hit wins regardless of retirement latch.
-        assert_eq!(mtp_window_timing_kind(true, true, false), "ngram");
-        assert_eq!(mtp_window_timing_kind(true, true, true), "ngram");
-        assert_eq!(mtp_window_timing_kind(true, false, false), "ngram");
+        assert_eq!(hipfire_generate::qwen::mtp_window_timing_kind(true, true, false), "ngram");
+        assert_eq!(hipfire_generate::qwen::mtp_window_timing_kind(true, true, true), "ngram");
+        assert_eq!(hipfire_generate::qwen::mtp_window_timing_kind(true, false, false), "ngram");
         // Miss after retirement → AR (trunk-only k=0).
-        assert_eq!(mtp_window_timing_kind(false, true, true), "ar");
+        assert_eq!(hipfire_generate::qwen::mtp_window_timing_kind(false, true, true), "ar");
         // Miss before retirement / ngram off → native MTP.
-        assert_eq!(mtp_window_timing_kind(false, true, false), "mtp");
-        assert_eq!(mtp_window_timing_kind(false, false, false), "mtp");
-        assert_eq!(mtp_window_timing_kind(false, false, true), "mtp");
+        assert_eq!(hipfire_generate::qwen::mtp_window_timing_kind(false, true, false), "mtp");
+        assert_eq!(hipfire_generate::qwen::mtp_window_timing_kind(false, false, false), "mtp");
+        assert_eq!(hipfire_generate::qwen::mtp_window_timing_kind(false, false, true), "mtp");
     }
 
     #[test]
     fn timing_record_preserves_exact_wire_fields() {
-        let rec = mtp_window_timing_record("ngram", 11, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12);
+        let rec = hipfire_generate::qwen::mtp_window_timing_record("ngram", 11, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12);
         let obj = rec.as_object().expect("object");
         let expected = [
             "kind",
@@ -8931,20 +6952,20 @@ mod mtp_host_timing_contract {
 
     #[test]
     fn attach_omits_field_when_disabled_preserves_order_when_enabled() {
-        let r0 = mtp_window_timing_record("mtp", 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
-        let r1 = mtp_window_timing_record("ngram", 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
-        let r2 = mtp_window_timing_record("ar", 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        let r0 = hipfire_generate::qwen::mtp_window_timing_record("mtp", 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        let r1 = hipfire_generate::qwen::mtp_window_timing_record("ngram", 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        let r2 = hipfire_generate::qwen::mtp_window_timing_record("ar", 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
         let ordered = vec![r0.clone(), r1.clone(), r2.clone()];
 
         let mut disabled = serde_json::json!({"tokens": 1});
-        attach_mtp_window_timings(&mut disabled, false, ordered.clone());
+        hipfire_generate::qwen::attach_mtp_window_timings(&mut disabled, false, ordered.clone());
         assert!(
             disabled.get("mtp_window_timings").is_none(),
             "disabled must omit the field entirely"
         );
 
         let mut enabled = serde_json::json!({"tokens": 1});
-        attach_mtp_window_timings(&mut enabled, true, ordered);
+        hipfire_generate::qwen::attach_mtp_window_timings(&mut enabled, true, ordered);
         let arr = enabled["mtp_window_timings"]
             .as_array()
             .expect("enabled attaches array");
@@ -9041,18 +7062,6 @@ fn ckpt_max() -> usize {
         .max(1)
 }
 
-/// Drain + free a DeltaNet checkpoint ring. `DeviceBuffer` has no `Drop`, so a
-/// bare `Vec::clear()` orphans each snapshot's GPU buffers — the per-reset leak
-/// that OOMs long-lived serves (hipMalloc-OOM after ~N independent requests).
-/// Routes every drop through `DeltaNetSnapshot::free_gpu`.
-fn free_checkpoints(
-    cks: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
-    gpu: &mut rdna_compute::Gpu,
-) {
-    for (_, snap) in cks.drain(..) {
-        snap.free_gpu(gpu);
-    }
-}
 
 /// Truncate a checkpoint ring to `keep` slots, freeing the dropped snapshots'
 /// GPU buffers (a bare `Vec::truncate` would leak them).
@@ -10479,11 +8488,11 @@ fn main() {
                         };
                         batch_scheduler = staged_batch_scheduler;
                         // `cache_capable` is the daemon's prompt-cache source of truth.
-                        // arch_id 13 (gemma4) is intentionally ABSENT: generate_gemma4 has
+                        // arch_id 13 (gemma4) is intentionally ABSENT: hipfire_generate::dense::generate_gemma4 has
                         // no LCP prefix-cache block and always cold-prefills the full
                         // Jinja-rendered prompt. Enabling the cache would corrupt KV
                         // slot offsets after turn 1 (stale prefix reuse). Wire when
-                        // generate_gemma4 gains an LCP block matching other archs.
+                        // hipfire_generate::dense::generate_gemma4 gains an LCP block matching other archs.
                         let cache_capable = matches!(m.arch_id, 5 | 6 | 9 | 10 | 12 | 14);
                         let retry_reset_eligible = model_retry_reset_eligible(m.arch_id);
                         let continuous_batch_capable = staged_batch_capable;
@@ -10527,7 +8536,7 @@ fn main() {
                         // the entire session.
                         //
                         // EP guard (load_tp > 1): the EP path serves through
-                        // `generate_ep`, which bypasses PFlash entirely (the
+                        // `hipfire_generate::qwen::generate_ep`, which bypasses PFlash entirely (the
                         // EP archs ds4/minimax refuse/ignore PFlash drafters).
                         // Loading a drafter here would just pin GPU memory it
                         // never reads until unload, so skip the load outright.
@@ -10537,7 +8546,7 @@ fn main() {
                             if pflash_drafter.is_some() && pflash_mode_str != "off" {
                                 eprintln!(
                                     "[pflash] WARN: ignoring PFlash drafter on EP (tp={}) model \
-                                     — generate_ep bypasses PFlash; drafter would only waste GPU memory",
+                                     — hipfire_generate::qwen::generate_ep bypasses PFlash; drafter would only waste GPU memory",
                                     load_tp
                                 );
                             }
@@ -10692,7 +8701,7 @@ fn main() {
                 let m = match model.as_mut() {
                     Some(m) => m,
                     None => {
-                        emit_active_attempt_error(
+                        hipfire_generate::dense::emit_active_attempt_error(
                             &mut stdout,
                             Some(id),
                             "no model loaded",
@@ -10705,7 +8714,7 @@ fn main() {
                     }
                 };
                 if let Some(reason) = batch_poisoned.as_ref() {
-                    emit_active_attempt_error(
+                    hipfire_generate::dense::emit_active_attempt_error(
                         &mut stdout,
                         Some(id),
                         &format!(
@@ -10757,7 +8766,7 @@ fn main() {
                     Some(v) => match serde_json::from_value::<Vec<serde_json::Value>>(v.clone()) {
                         Ok(t) => Some(t),
                         Err(e) => {
-                            emit_active_attempt_error(
+                            hipfire_generate::dense::emit_active_attempt_error(
                                 &mut stdout,
                                 Some(id),
                                 &format!(
@@ -10805,7 +8814,7 @@ fn main() {
                                 Some(m)
                             }
                             Err(e) => {
-                                emit_active_attempt_error(
+                                hipfire_generate::dense::emit_active_attempt_error(
                                     &mut stdout,
                                     Some(id),
                                     &format!(
@@ -11070,15 +9079,15 @@ fn main() {
                         eprintln!("[daemon/vl] non-zero seq_pos ({}) at VL dispatch — resetting conversation", m.seq_pos);
                         m.seq_pos = 0;
                         m.conversation_tokens.clear();
-                        free_checkpoints(&mut m.prefill_checkpoints, &mut gpu);
-                        free_checkpoints(&mut m.dflash_checkpoints, &mut gpu);
+                        hipfire_generate::common::free_checkpoints(&mut m.prefill_checkpoints, &mut gpu);
+                        hipfire_generate::common::free_checkpoints(&mut m.dflash_checkpoints, &mut gpu);
                         // The DFlash checkpoint ring now lives inside the
                         // speculator (m.dflash_checkpoints is vestigial/empty),
                         // so free THAT ring on conversation reset too — else its
                         // GPU snapshots persist until the next prefill-miss.
                         if let Some(s) = m.speculator.as_mut() {
                             if let Err(e) = s.reset(&mut gpu) {
-                                emit_active_attempt_error(
+                                hipfire_generate::dense::emit_active_attempt_error(
                                     &mut stdout,
                                     Some(id),
                                     &format!("vision conversation reset failed: {e}"),
@@ -11092,8 +9101,8 @@ fn main() {
                         // qwen35(-vl) recurrent state lives in the bundle
                         // (ModelState::Qwen35), not the always-None
                         // m.dn_state/m.kv_cache direct fields.
-                        if let Err(e) = reset_qwen35_recurrent(m, &mut gpu) {
-                            emit_active_attempt_error(
+                        if let Err(e) = hipfire_generate::common::reset_qwen35_recurrent(m, &mut gpu) {
+                            hipfire_generate::dense::emit_active_attempt_error(
                                 &mut stdout,
                                 Some(id),
                                 &format!("vision recurrent reset failed: {e}"),
@@ -11254,7 +9263,7 @@ fn main() {
                         c
                     });
                     if let Some(reason) = pf_override_err {
-                        emit_active_attempt_error(
+                        hipfire_generate::dense::emit_active_attempt_error(
                             &mut stdout,
                             Some(id),
                             &format!("invalid pflash override: {}", reason.replace('"', "'"),),
@@ -11401,12 +9410,12 @@ fn main() {
                         // EP requests without serve_continuous_batch or with excluded features must error.
                         if !ep_batch_eligible {
                             let _scope = BatchAttemptScope::enter(gen_attempt_id);
-                            let ep = RollbackEpilogue {
+                            let ep = hipfire_generate::common::RollbackEpilogue {
                                 rolled_back: true,
                                 context: None,
                             };
                             // Reset the specific lane if any (best-effort), else poison not needed; just fail this request.
-                            emit_fail_closed_error(&mut stdout, Some(id), "EP qwen35 batch-only: request must set serve_continuous_batch=true with TP=4 expert_parallel and no excluded features (image/tools/stop/spec)", "validation", false, &ep);
+                            hipfire_generate::common::emit_fail_closed_error(&mut stdout, Some(id), "EP qwen35 batch-only: request must set serve_continuous_batch=true with TP=4 expert_parallel and no excluded features (image/tools/stop/spec)", "validation", false, &ep);
                             batch_clear_terminal(id, gen_attempt_id);
                             continue;
                         }
@@ -11516,7 +9525,7 @@ fn main() {
                                             &mut stdout,
                                             id,
                                             false,
-                                            gen_start_contract_version_for_arch(arch),
+                                            hipfire_generate::common::gen_start_contract_version_for_arch(arch),
                                         );
                                     }
                                     let drive_res = drive_lfm_continuous_batch(
@@ -11583,11 +9592,11 @@ fn main() {
                                         arch
                                     );
                                     let _scope = BatchAttemptScope::enter(gen_attempt_id);
-                                    let ep = RollbackEpilogue {
+                                    let ep = hipfire_generate::common::RollbackEpilogue {
                                         rolled_back: true,
                                         context: None,
                                     };
-                                    emit_fail_closed_error(
+                                    hipfire_generate::common::emit_fail_closed_error(
                                         &mut stdout,
                                         Some(id),
                                         &format!("batch not supported for arch {}", arch),
@@ -11689,7 +9698,7 @@ fn main() {
                         .as_ref()
                         .is_some_and(|s| s.active_count() > 0)
                     {
-                        write_error_envelope(
+                        hipfire_generate::dense::write_error_envelope(
                             &mut stdout,
                             None,
                             "reset refused: continuous batch lanes active",
@@ -11704,13 +9713,13 @@ fn main() {
                     if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
                         eprintln!("[qwen-cache RESET] daemon received reset — clearing conversation_tokens (was {})", m.conversation_tokens.len());
                     }
-                    let ep = production_fail_closed_rollback(m, &mut gpu, None, None);
+                    let ep = hipfire_generate::common::production_fail_closed_rollback(m, &mut gpu, None, None);
                     if !ep.rolled_back {
                         let detail = ep
                             .context
                             .as_deref()
                             .unwrap_or("rollback could not be attested");
-                        write_error_envelope(
+                        hipfire_generate::dense::write_error_envelope(
                             &mut stdout,
                             None,
                             &format!("reset failed: {detail}"),
@@ -11740,7 +9749,7 @@ fn main() {
                     });
                     let _ = writeln!(stdout, "{ack}");
                 } else {
-                    write_error_envelope(
+                    hipfire_generate::dense::write_error_envelope(
                         &mut stdout,
                         None,
                         "no model loaded",
@@ -11760,7 +9769,7 @@ fn main() {
                     .is_some_and(|s| s.active_count() > 0)
                 {
                     let attempt = msg.get("attempt_id").and_then(|v| v.as_u64()).unwrap_or(0);
-                    write_error_envelope(
+                    hipfire_generate::dense::write_error_envelope(
                         &mut stdout,
                         None,
                         "unload refused: continuous batch lanes active",
@@ -11965,7 +9974,7 @@ fn main() {
                 // the bundle (ModelState::Qwen35), not the always-None m.dn_state.
                 m.seq_pos = 0;
                 m.conversation_tokens.clear();
-                let _ = reset_qwen35_recurrent(m, &mut gpu);
+                let _ = hipfire_generate::common::reset_qwen35_recurrent(m, &mut gpu);
                 // Qwen2 (arch_id=7) doesn't have a separate KV buffer — the cache
                 // and the per-step scratch share `Qwen2State`. Reset its position
                 // cursor here so bench_prefill measures cold prefill. The live
@@ -12019,7 +10028,7 @@ fn main() {
                 // not the always-None m.dn_state.
                 m.seq_pos = 0;
                 m.conversation_tokens.clear();
-                let _ = reset_qwen35_recurrent(m, &mut gpu);
+                let _ = hipfire_generate::common::reset_qwen35_recurrent(m, &mut gpu);
                 // LFM2.5-MoE state carries its own KV + conv-state cache;
                 // reset cursors (takes gpu) so the next request starts cold.
                 if let Some(b) = m.lfm2moe_mut() {
@@ -12205,7 +10214,7 @@ fn main() {
 
                 m.seq_pos = 0;
                 m.conversation_tokens.clear();
-                let _ = reset_qwen35_recurrent(m, &mut gpu);
+                let _ = hipfire_generate::common::reset_qwen35_recurrent(m, &mut gpu);
                 let synthetic: Vec<u32> = (0..context as u32).map(|i| 10 + (i % 1000)).collect();
                 let prime_error: Option<String> = match hipfire_loader::bench_decode_route(m.arch_id) {
                     hipfire_loader::BenchDecodeRoute::Qwen35 | hipfire_loader::BenchDecodeRoute::MuseGlimmer => hipfire_loader::carrier_for(m.arch_id)
@@ -12289,7 +10298,7 @@ fn main() {
 
                 m.seq_pos = 0;
                 m.conversation_tokens.clear();
-                let _ = reset_qwen35_recurrent(m, &mut gpu);
+                let _ = hipfire_generate::common::reset_qwen35_recurrent(m, &mut gpu);
 
                 if run_ok {
                     let tok_s = iterations as f64 / elapsed.max(f64::MIN_POSITIVE);
@@ -13540,6018 +11549,31 @@ fn main() {
     }
 }
 
-/// Expert-parallel streaming generate (task #26, ds4 first). Greedy AR via
-/// `forward_ep` across the EP ranks; logits gathered on rank 0 and sampled on
-/// the host. v1: greedy + basic token streaming (no grammar / tool-calls /
-/// think-budget — absent on the EP path). The DeepSeek chat template
-/// (`<｜User｜>…<｜Assistant｜>`) is applied here; the daemon's full prompt-frame
-/// (multi-turn, messages_history) is a follow-up. See docs/plans/daemon-ep-wiring.md.
-#[allow(clippy::too_many_arguments)]
-/// Resolved sampling config for the EP (multi-GPU) decode loops. Carries the
-/// single-GPU handler's request>rec_*>arch-default resolution (computed at the
-/// `generate` call site) into `ep_serve_ds4` / `ep_serve_minimax`, which apply
-/// it host-side over the downloaded f32 logits via `llama::sample_full_dist`.
-#[derive(Clone, Copy)]
-struct EpSampling {
-    temp: f32,
-    top_p: f32,
-    top_k: Option<u32>,
-    min_p: Option<f32>,
-}
 
-fn generate_ep(
-    m: &mut LoadedModel,
-    stdout: &mut std::io::Stdout,
-    id: &str,
-    prompt: &str,
-    system_prompt: Option<&str>,
-    max_tokens: usize,
-    max_think_tokens: usize,
-    think_mode: ThinkMode,
-    tools: Option<&[serde_json::Value]>,
-    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
-    stop: &[String],
-    sampling: EpSampling,
-) {
-    // ── Canonical multi-turn render via the arch's trained chat_template
-    // (ds4/minimax). Mirrors generate_minimax: `messages_history` (the full
-    // conversation, live user last) → render_messages with `tools` threaded;
-    // falls back to a synthesized [system?, user] turn when no history is
-    // supplied. The trim_blocks/lstrip_blocks env (prompt_frame) keeps the
-    // structural prefix history-invariant so the EP LCP cache below can hit.
-    // `primed_think` records whether the render ended on the MiniMax `<think>`
-    // generation primer (re-emitted display-only in ep_serve_minimax). ──
-    let mut primed_think = false;
-    let prompt_ids: Vec<u32> = match hipfire_loader::ep_prompt_route(m.arch_id) {
-        hipfire_loader::EpPromptRoute::Dsml => {
-        primed_think = false;
-        let tokenizer = m.tokenizer.as_ref().unwrap();
-        let eos_tok = m.deepseek4_eos_tok;
-        build_deepseek4_dsml_prompt(
-            tokenizer,
-            system_prompt,
-            tools,
-            messages_history,
-            prompt,
-            think_mode,
-            eos_tok,
-            &mut m.asst_turn_cache,
-        )
-        }
-        hipfire_loader::EpPromptRoute::Jinja => {
-        let tokenizer = m.tokenizer.as_ref().unwrap();
-        if let Some(template) = m.chat_template.as_ref() {
-            let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
-                tokenizer,
-                template,
-                system: system_prompt,
-                user: prompt,
-                enable_thinking: max_think_tokens != 1,
-                bos_token: None,
-                reasoning_strength: None,
-                reasoning_effort: None,
-            };
-            let render_result = if tools.is_some() || messages_history.is_some() {
-                let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
-                let messages_slice: &[hipfire_runtime::prompt_frame::Message] =
-                    match messages_history {
-                        Some(h) => h,
-                        None => {
-                            let mut v = Vec::new();
-                            if let Some(sys) = system_prompt {
-                                v.push(hipfire_runtime::prompt_frame::Message {
-                                    role: hipfire_runtime::prompt_frame::Role::System,
-                                    content: sys.to_string(),
-                                    reasoning_content: None,
-                                    name: None,
-                                    rendered_name: None,
-                                    tool_calls: Vec::new(),
-                                    tool_call_id: None,
-                                    tool_plan: String::new(),
-                                });
-                            }
-                            v.push(hipfire_runtime::prompt_frame::Message {
-                                role: hipfire_runtime::prompt_frame::Role::User,
-                                content: prompt.to_string(),
-                                reasoning_content: None,
-                                name: None,
-                                rendered_name: None,
-                                tool_calls: Vec::new(),
-                                tool_call_id: None,
-                                tool_plan: String::new(),
-                            });
-                            synthesized = v;
-                            &synthesized
-                        }
-                    };
-                frame.render_messages(messages_slice, tools, None)
-            } else {
-                frame.render()
-            };
-            match render_result {
-                Ok(rendered) => {
-                    primed_think = rendered.trim_end().ends_with("<think>");
-                    tokenizer.encode(&rendered)
-                }
-                Err(e) => {
-                    emit_active_attempt_error(
-                        stdout,
-                        Some(id),
-                        &format!("EP jinja render: {}", format!("{e}").replace('"', "'")),
-                        "validation",
-                        false,
-                        false,
-                    );
-                    let _ = stdout.flush();
-                    return;
-                }
-            }
-        } else {
-            // No embedded template — minimal ds4-style fallback (single-turn).
-            let mut ids = Vec::new();
-            if let Some(b) = tokenizer.special_token_id("<｜begin▁of▁sentence｜>") {
-                ids.push(b);
-            }
-            ids.extend(tokenizer.encode(&format!("<｜User｜>{prompt}<｜Assistant｜>")));
-            ids
-        }
-        }
-    };
-    if std::env::var("HIPFIRE_DEEPSEEK4_DUMP_PROMPT")
-        .ok()
-        .as_deref()
-        == Some("1")
-    {
-        let tk = m.tokenizer.as_ref().unwrap();
-        eprintln!(
-            "[ep prompt dump] arch={} {} tokens, decoded:\n>>>\n{}\n<<<",
-            m.arch_id,
-            prompt_ids.len(),
-            tk.decode(&prompt_ids)
-        );
-    }
-    if prompt_ids.is_empty() {
-        emit_active_attempt_error(
-            stdout,
-            Some(id),
-            "EP: empty prompt after render",
-            "validation",
-            false,
-            false,
-        );
-        let _ = stdout.flush();
-        return;
-    }
-    let eos_tok = match hipfire_loader::ep_eos_route(m.arch_id) {
-        hipfire_loader::EpEosRoute::Minimax => {
-        // MiniMax EP state lives in `m.ep`, not `m.state`, so `minimax()` is
-        // None here — read the EP eos carried on LoadedModel (set at load).
-        m.minimax_eos_tok
-        }
-        hipfire_loader::EpEosRoute::Deepseek4 => m.deepseek4_eos_tok,
-    };
-    match m.arch_id {
-        10 => ep_serve_minimax(
-            m,
-            stdout,
-            id,
-            &prompt_ids,
-            eos_tok,
-            max_tokens,
-            stop,
-            primed_think,
-            sampling,
-        ),
-        _ => ep_serve_ds4(
-            m,
-            stdout,
-            id,
-            &prompt_ids,
-            eos_tok,
-            max_tokens,
-            think_mode,
-            tools,
-            stop,
-            sampling,
-        ),
-    }
-}
 
-/// Stream a token JSON event; returns true if a stop sequence is now satisfied.
-fn ep_emit_token(
-    stdout: &mut std::io::Stdout,
-    id: &str,
-    piece: &str,
-    text_acc: &mut String,
-    stop: &[String],
-) -> bool {
-    text_acc.push_str(piece);
-    let _ = writeln!(
-        stdout,
-        r#"{{"type":"token","id":"{}","text":{},"attempt_id":{}}}"#,
-        id,
-        serde_json::to_string(piece).unwrap_or_else(|_| "\"\"".to_string()),
-        active_attempt_id()
-    );
-    let _ = stdout.flush();
-    stop.iter().any(|s| !s.is_empty() && text_acc.ends_with(s))
-}
 
-fn ep_emit_done(
-    stdout: &mut std::io::Stdout,
-    id: &str,
-    m: &mut LoadedModel,
-    generated: usize,
-    prompt_n: usize,
-    prefill_ms: f64,
-    decode_ms: f64,
-) {
-    let decode_tok_s = if decode_ms > 0.0 {
-        generated as f64 / (decode_ms / 1000.0)
-    } else {
-        0.0
-    };
-    let prefill_tok_s = if prefill_ms > 0.0 {
-        prompt_n as f64 / (prefill_ms / 1000.0)
-    } else {
-        0.0
-    };
-    tracing::info!(
-        request_id = id,
-        generated_tokens = generated,
-        prompt_tokens = prompt_n,
-        prefill_ms,
-        decode_ms,
-        decode_tok_s,
-        "expert-parallel generation completed"
-    );
-    eprintln!("[daemon] EP generate done: {generated} tok, {decode_tok_s:.1} tok/s");
-    let pending_done = serde_json::json!({
-        "type": "done",
-        "id": id,
-        "tokens": generated,
-        "tok_s": (decode_tok_s * 10.0).round() / 10.0,
-        "prefill_tokens": prompt_n,
-        "prefill_ms": (prefill_ms * 10.0).round() / 10.0,
-        "prefill_tok_s": (prefill_tok_s * 10.0).round() / 10.0,
-        "decode_tok_s": (decode_tok_s * 10.0).round() / 10.0,
-        "ttft_ms": (prefill_ms * 10.0).round() / 10.0,
-        "attempt_id": active_attempt_id(),
-    });
-    match await_client_terminal_commit(stdout, id, &pending_done) {
-        ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
-        ClientTerminalDecision::Abort => ep_emit_abort(stdout, id, m, generated),
-    }
-}
 
-/// Full EP route-complete abort reset: per-rank bind + cursor reset + decode
-/// cache zero + graph invalidate, then device_synchronize on every rank.
-/// `rolled_back` is true only when every bind/reset and synchronize succeeds.
-fn ep_reset_after_abort(m: &mut LoadedModel) -> RollbackEpilogue {
-    let mut first_err: Option<String> = None;
-    if let Some(ep) = m.ep.as_mut() {
-        let EpState { gpus, inner } = ep;
-        match inner {
-            EpArch::Ds4 { state, .. } => {
-                for (rank, s) in state.iter_mut().enumerate() {
-                    let g = &mut gpus.devices[rank];
-                    if let Err(e) = g.bind_thread() {
-                        push_reset_err(&mut first_err, &format!("ep rank{rank} bind_thread"), e);
-                    }
-                    s.reset();
-                    s.zero_decode_caches(g);
-                    g.invalidate_graph_state();
-                }
-            }
-            EpArch::Minimax { state, .. } => {
-                for (rank, s) in state.iter_mut().enumerate() {
-                    let g = &mut gpus.devices[rank];
-                    if let Err(e) = g.bind_thread() {
-                        push_reset_err(&mut first_err, &format!("ep rank{rank} bind_thread"), e);
-                    }
-                    s.reset();
-                    g.invalidate_graph_state();
-                }
-            }
-            EpArch::Qwen35 { batch, .. } => {
-                if let Some(batch) = batch.as_mut() {
-                    if let Err(e) = batch.reset_all(gpus) {
-                        push_reset_err(&mut first_err, "qwen35 ep batch reset_all", e);
-                    }
-                }
-                for dev in &mut gpus.devices {
-                    dev.invalidate_graph_state();
-                }
-            }
-        }
-        for (rank, dev) in gpus.devices.iter_mut().enumerate() {
-            if let Err(e) = dev.bind_thread() {
-                push_reset_err(
-                    &mut first_err,
-                    &format!("ep rank{rank} sync bind_thread"),
-                    e,
-                );
-            }
-            if let Err(e) = dev.hip.device_synchronize() {
-                push_reset_err(
-                    &mut first_err,
-                    &format!("ep rank{rank} device_synchronize"),
-                    e,
-                );
-            }
-        }
-    }
-    m.seq_pos = 0;
-    m.conversation_tokens.clear();
-    if first_err.is_none() {
-        RollbackEpilogue {
-            rolled_back: true,
-            context: None,
-        }
-    } else {
-        RollbackEpilogue {
-            rolled_back: false,
-            context: first_err.or_else(|| Some("EP abort reset could not be attested".into())),
-        }
-    }
-}
 
-/// EP cancel terminal: reset/sync first, then emit attempt-correlated
-/// `aborted`+`done(aborted)` only when rollback is attested. Unattested →
-/// one fail-closed error, no done.
-fn ep_emit_abort(
-    stdout: &mut std::io::Stdout,
-    id: &str,
-    m: &mut LoadedModel,
-    completion_tokens: usize,
-) {
-    let epilogue = ep_reset_after_abort(m);
-    if !epilogue.rolled_back {
-        emit_fail_closed_error(
-            stdout,
-            Some(id),
-            "client cancelled; fail-closed EP rollback could not be attested",
-            "validation",
-            false,
-            &epilogue,
-        );
-        return;
-    }
-    let attempt_id = active_attempt_id();
-    let (aborted, done) = ds4_ep_abort_wire_events(id, completion_tokens, attempt_id);
-    let _ = writeln!(stdout, "{}", aborted);
-    let _ = writeln!(stdout, "{}", done);
-    let _ = stdout.flush();
-}
 
-/// ds4 EP prefill + greedy decode.
-fn ep_serve_ds4(
-    m: &mut LoadedModel,
-    stdout: &mut std::io::Stdout,
-    id: &str,
-    prompt_ids: &[u32],
-    eos_tok: u32,
-    max_tokens: usize,
-    think_mode: ThinkMode,
-    tools: Option<&[serde_json::Value]>,
-    stop: &[String],
-    sampling: EpSampling,
-) {
-    use hipfire_arch_deepseek4::dsml::StreamEvent;
-    use std::time::Instant;
 
-    let prompt_n = prompt_ids.len();
 
-    // O2b-2 capacity guard (ds4 EP): this path replays the full prompt from
-    // position 0 every turn (no LCP reuse), so the absolute KV span is
-    // prompt_n + max_tokens. Without eviction the EP state KV was allocated
-    // for `m.physical_cap` (== max_seq at load). Overrunning it drives
-    // forward_ep past the KV buffer → corruption/panic (serve-wide crash).
-    // Emit a clean error and return BEFORE prefill — mirror the qwen35 guard.
-    // saturating_add: an adversarially huge max_tokens must not wrap usize and
-    // slip under the cap.
-    if prompt_n.saturating_add(max_tokens) > m.physical_cap {
-        emit_active_attempt_error(
-            stdout,
-            Some(id),
-            &format!("prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq", prompt_n, max_tokens, m.physical_cap),
-            "context_length",
-            false,
-            false
-        );
-        let _ = stdout.flush();
-        return;
-    }
 
-    // ── Cross-conversation reset (FIX: ds4 EP turn-to-turn contamination) ──
-    // ds4 EP replays the full prompt from position 0 every turn (no LCP reuse —
-    // see the capacity-guard comment above), so a CONTINUING conversation
-    // re-prefills its whole history straight from the prompt; nothing in the EP
-    // state is reusable across turns, so we reset unconditionally here. This is
-    // the EP analogue of the single-GPU cache-miss reset in generate_deepseek4:
-    // `reset()` alone only rewinds n_tokens — the position-indexed decode caches
-    // (SWA ring, compressed/full KV, indexer scratch) retain the PRIOR turn's
-    // residue and bleed into the next conversation (observed: turn 2 echoing
-    // turn 1's answer) unless explicitly zeroed. Do it per rank on its own
-    // device. Without this, ep_serve_ds4 only ever reset on abort (and even that
-    // path, ep_reset_after_abort, omitted zero_decode_caches).
-    if let Some(ep) = m.ep.as_mut() {
-        let EpState { gpus, inner } = ep;
-        if let EpArch::Ds4 { state, .. } = inner {
-            for (rank, s) in state.iter_mut().enumerate() {
-                let g = &mut gpus.devices[rank];
-                let _ = g.bind_thread();
-                s.reset();
-                s.zero_decode_caches(g);
-                g.invalidate_graph_state();
-            }
-        }
-    }
-    m.seq_pos = 0;
-    m.conversation_tokens.clear();
 
-    let mut parser = match think_mode {
-        ThinkMode::Low | ThinkMode::High | ThinkMode::Max => {
-            deepseek4::dsml::StreamParser::new_in_think()
-        }
-        ThinkMode::NonThink => deepseek4::dsml::StreamParser::new(),
-    };
-    let tool_schemas: Vec<deepseek4::grammar::ToolSchema> = tools
-        .map(|arr| {
-            arr.iter()
-                .map(|t| {
-                    let func = t.get("function").unwrap_or(t);
-                    let name = func
-                        .get("name")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let parameters = func.get("parameters");
-                    let params: Vec<String> = parameters
-                        .and_then(|p| p.get("properties"))
-                        .and_then(|p| p.as_object())
-                        .map(|m| m.keys().cloned().collect())
-                        .unwrap_or_default();
-                    let required: Vec<String> = parameters
-                        .and_then(|p| p.get("required"))
-                        .and_then(|r| r.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|v| v.as_str().map(String::from))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    deepseek4::grammar::ToolSchema {
-                        name,
-                        params,
-                        required,
-                    }
-                })
-                .filter(|s: &deepseek4::grammar::ToolSchema| !s.name.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
-    let grammar_active = !tool_schemas.is_empty();
-    let mut matcher = deepseek4::grammar::Matcher::new(tool_schemas);
-    let decoded_vocab_arc: Option<std::sync::Arc<Vec<String>>> = if grammar_active {
-        if m.decoded_vocab.is_none() {
-            let tokenizer = m.tokenizer.as_ref().unwrap();
-            let n = tokenizer.vocab_size();
-            let v: Vec<String> = (0..n).map(|id| tokenizer.decode(&[id as u32])).collect();
-            m.decoded_vocab = Some(std::sync::Arc::new(v));
-        }
-        m.decoded_vocab.clone()
-    } else {
-        None
-    };
-    let empty_vocab: Vec<String> = Vec::new();
-    let decoded_vocab: &[String] = decoded_vocab_arc
-        .as_deref()
-        .map(|v| v.as_slice())
-        .unwrap_or(&empty_vocab);
-    let mut grammar_mask: Vec<bool> = vec![true; decoded_vocab.len()];
-    let mut emit_text_buf = String::new();
-    let mut emit_tool_calls_buf: Vec<hipfire_runtime::prompt_frame::ToolCall> = Vec::new();
-    let mut dsml_malformed: Option<String> = None;
-    // ToolCalls stay buffered turn-wide; only Token/Reasoning go live on the wire.
-    let mut absorb_event = |ev: &StreamEvent| {
-        ds4_absorb_stream_event(
-            ev,
-            &mut emit_text_buf,
-            &mut emit_tool_calls_buf,
-            &mut dsml_malformed,
-        );
-    };
 
-    // The HTTP stream contract rejects any token before `gen_start`.  EP has
-    // a bespoke decode loop, so unlike the single-device AR/spec paths it does
-    // not inherit their emitter-side latch.  Open it after all early request
-    // validation but before prefill/decode can produce a client event.
-    emit_ds4_ep_gen_start(stdout, id, think_mode);
 
-    let t_prefill = Instant::now();
-    // FIX #1 (ep-prefill-abort): set when check_abort fires inside the prefill
-    // loop. Declared outside the borrow scope so the post-loop abort guard can
-    // read it after the `gpus`/`state` borrow is dropped.
-    let mut aborted_in_prefill = false;
-    {
-        let EpState { gpus, inner } = m.ep.as_mut().unwrap();
-        let EpArch::Ds4 {
-            config,
-            weights,
-            state,
-            partials,
-            prefill,
-        } = inner
-        else {
-            emit_active_attempt_error(
-                stdout,
-                Some(id),
-                "EP arch mismatch (expected ds4)",
-                "validation",
-                false,
-                false,
-            );
-            let _ = stdout.flush();
-            return;
-        };
-        if !prefill.is_empty() {
-            if check_abort(id) {
-                aborted_in_prefill = true;
-            } else if let Err(e) = deepseek4::forward::forward_ep_prefill_batch_chunked(
-                gpus,
-                weights,
-                config,
-                state,
-                prefill,
-                &prompt_ids,
-                0,
-            ) {
-                emit_active_attempt_error(
-                    stdout,
-                    Some(id),
-                    &format!(
-                        "forward_ep batched prefill: {}",
-                        format!("{e}").replace('"', "'")
-                    ),
-                    "validation",
-                    false,
-                    false,
-                );
-                let _ = stdout.flush();
-                return;
-            }
-        } else {
-            for (pos, &t) in prompt_ids.iter().enumerate() {
-                // FIX #1 (ep-prefill-abort): check the cancel signal at the TOP of
-                // every prefill iteration, not just after the loop. A long prompt
-                // (thousands of tokens) means the post-loop check below would still
-                // run the entire multi-GPU prefill before honoring a cancel. Mirror
-                // the decode loop: on abort, emit aborted+done, reset KV cursors,
-                // and stop. We must drop the `gpus`/`state` borrow before calling
-                // `ep_emit_abort` (which re-borrows `m.ep`), so break out and let
-                // the post-loop guard fire — but set the abort flag is consumed by
-                // check_abort, so call it here and short-circuit via a flag.
-                if check_abort(id) {
-                    // Drop the EpState borrow by breaking; the post-loop guard
-                    // re-checks via a sentinel. Simpler: emit + return is blocked
-                    // by the borrow, so we set `aborted` and break.
-                    aborted_in_prefill = true;
-                    break;
-                }
-                if let Err(e) = deepseek4::forward::forward_ep(
-                    gpus, weights, config, state, partials, t, pos as u32,
-                ) {
-                    emit_active_attempt_error(
-                        stdout,
-                        Some(id),
-                        &format!("forward_ep prefill: {}", format!("{e}").replace('"', "'")),
-                        "validation",
-                        false,
-                        false,
-                    );
-                    let _ = stdout.flush();
-                    return;
-                }
-            }
-        }
-    }
-    // FIX #1 / FIX #3 (ep-no-abort): a client cancel during the (potentially
-    // long) prefill should stop here instead of running the whole decode loop.
-    // `aborted_in_prefill` is set when check_abort fired mid-loop (it already
-    // consumed the signal, so we don't re-call check_abort); the post-loop
-    // check_abort catches a cancel that arrived after the final iteration.
-    // Mirror the single-GPU paths: emit aborted+done and reset every rank's KV
-    // cursor.
-    if aborted_in_prefill || check_abort(id) {
-        ep_emit_abort(stdout, id, m, 0);
-        return;
-    }
-    let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
-    let mut logits = {
-        let EpState { gpus, inner } = m.ep.as_mut().unwrap();
-        let EpArch::Ds4 { state, .. } = inner else {
-            emit_active_attempt_error(
-                stdout,
-                Some(id),
-                "EP arch mismatch (expected ds4)",
-                "validation",
-                false,
-                false,
-            );
-            let _ = stdout.flush();
-            return;
-        };
-        let _ = gpus.devices[0].bind_thread();
-        match state[0].logits.as_ref() {
-            // FIX #4 (ep-download-swallow): on a download failure, emit a JSON
-            // error and STOP — never `unwrap_or_default()` into an all-zero
-            // logits vec (argmax → token 0, an undetectable corruption).
-            Some(l) => match gpus.devices[0].download_f32(l) {
-                Ok(v) => v,
-                Err(e) => {
-                    emit_active_attempt_error(
-                        stdout,
-                        Some(id),
-                        &format!(
-                            "EP first-logits download failed: {}",
-                            format!("{e:?}").replace('"', "'")
-                        ),
-                        "validation",
-                        false,
-                        false,
-                    );
-                    let _ = stdout.flush();
-                    return;
-                }
-            },
-            None => {
-                emit_active_attempt_error(
-                    stdout,
-                    Some(id),
-                    "EP logits unset after prefill",
-                    "validation",
-                    false,
-                    false,
-                );
-                let _ = stdout.flush();
-                return;
-            }
-        }
-    };
 
-    let t_decode = Instant::now();
-    let mut generated = 0usize;
-    let mut pos = prompt_n;
-    let mut text_acc = String::new();
-    let mut local_emitted_ids: Vec<u32> = Vec::new();
-    while generated < max_tokens {
-        // FIX #3 (ep-no-abort): client cancel mid-decode → emit aborted+done,
-        // reset EP cursors, stop. Without this a Pi/CLI cancel leaves the EP
-        // decode loop running for the full max_tokens of wasted multi-GPU work.
-        if check_abort(id) {
-            ep_emit_abort(stdout, id, m, generated);
-            return;
-        }
-        if grammar_active && !matcher.is_free() {
-            matcher.token_mask(decoded_vocab, &mut grammar_mask);
-            deepseek4::grammar::Matcher::apply_mask_to_logits(&grammar_mask, &mut logits);
-        }
-        // Host-side sampler over the downloaded f32 logits (temp → top_k →
-        // top_p → min_p → seeded draw, temp<=1e-6 = argmax). RNG seeded once
-        // per request via reset_cpu_sampler_rng(0x13579BDF) in generate().
-        let next = hipfire_runtime::llama::sample_full_dist(
-            &logits,
-            sampling.temp,
-            sampling.top_p,
-            sampling.top_k,
-            sampling.min_p,
-        );
-        if next == eos_tok {
-            break;
-        }
-        let piece = m.tokenizer.as_ref().unwrap().decode(&[next]);
-        for ev in parser.feed(&piece) {
-            absorb_event(&ev);
-            emit_stream_event(stdout, id, ev);
-        }
-        emit_committed_event(
-            stdout,
-            id,
-            next,
-            generated,
-            t_decode.elapsed().as_millis() as u64,
-        );
-        let _ = stdout.flush();
-        if grammar_active {
-            matcher.advance(&piece);
-        }
-        local_emitted_ids.push(next);
-        text_acc.push_str(&piece);
-        generated += 1;
-        if stop.iter().any(|s| !s.is_empty() && text_acc.ends_with(s)) {
-            break;
-        }
-        let EpState { gpus, inner } = m.ep.as_mut().unwrap();
-        let EpArch::Ds4 {
-            config,
-            weights,
-            state,
-            partials,
-            ..
-        } = inner
-        else {
-            break;
-        };
-        if let Err(e) =
-            deepseek4::forward::forward_ep(gpus, weights, config, state, partials, next, pos as u32)
-        {
-            emit_active_attempt_error(
-                stdout,
-                Some(id),
-                &format!("forward_ep decode: {}", format!("{e}").replace('"', "'")),
-                "validation",
-                false,
-                false,
-            );
-            return;
-        }
-        pos += 1;
-        let _ = gpus.devices[0].bind_thread();
-        // FIX #4 (ep-download-swallow): explicit error handling on the per-token
-        // logits download — emit a JSON error and stop, never feed a zeroed
-        // (token-0) logits vec.
-        logits = match state[0].logits.as_ref() {
-            Some(l) => match gpus.devices[0].download_f32(l) {
-                Ok(v) => v,
-                Err(e) => {
-                    emit_active_attempt_error(
-                        stdout,
-                        Some(id),
-                        &format!(
-                            "EP decode logits download failed: {}",
-                            format!("{e:?}").replace('"', "'")
-                        ),
-                        "validation",
-                        false,
-                        false,
-                    );
-                    let _ = stdout.flush();
-                    return;
-                }
-            },
-            None => break,
-        };
-    }
-    for ev in parser.finish() {
-        absorb_event(&ev);
-        emit_stream_event(stdout, id, ev);
-    }
-    let _ = stdout.flush();
-    drop(absorb_event);
 
-    // Pure turn-wide terminal: malformed discards every buffered call.
-    let terminal =
-        ds4_ar_ep_finish_route(dsml_malformed, emit_tool_calls_buf, generated >= max_tokens);
-    let (finish_reason, wire_tool_calls, store_cache) = match &terminal {
-        Ds4ArEpRouteTerminal::Malformed(action) => {
-            emit_ds4_malformed_action(stdout, id, action);
-            return;
-        }
-        Ds4ArEpRouteTerminal::Safe {
-            finish_reason,
-            wire_tool_calls,
-            store_cache,
-        } => (*finish_reason, wire_tool_calls.clone(), *store_cache),
-    };
-    // Timing fields are fixed before handshake so commit_ready carries the
-    // exact eventual done payload.
-    let decode_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
-    let decode_tok_s = if decode_ms > 0.0 {
-        generated as f64 / (decode_ms / 1000.0)
-    } else {
-        0.0
-    };
-    let prefill_tok_s = if prefill_ms > 0.0 {
-        prompt_n as f64 / (prefill_ms / 1000.0)
-    } else {
-        0.0
-    };
-    eprintln!("[daemon] EP generate done: {generated} tok, {decode_tok_s:.1} tok/s");
-    let mut pending_done = serde_json::json!({
-        "type": "done",
-        "id": id,
-        "tokens": generated,
-        "tok_s": decode_tok_s,
-        "prefill_tokens": prompt_n,
-        "prefill_ms": prefill_ms,
-        "prefill_tok_s": prefill_tok_s,
-        "decode_tok_s": decode_tok_s,
-        "ttft_ms": prefill_ms,
-        "finish_reason": finish_reason,
-        "attempt_id": active_attempt_id(),
-    });
-    // Stage canonical calls before handshake so pure-tool HTTP terminals are
-    // complete at commit_ready. Final done is payload-identical.
-    stage_terminal_tool_calls(&mut pending_done, finish_reason, &wire_tool_calls);
-    // Two-phase commit before cache / done. No post-commit tool_calls event.
-    let decision = await_client_terminal_commit(stdout, id, &pending_done);
-    let effects = ds4_client_commit_effects(decision, finish_reason == "tool_calls", store_cache);
-    if !effects.emit_done {
-        ep_emit_abort(stdout, id, m, generated);
-        return;
-    }
-    let mut action = ds4_ar_ep_cache_action(&terminal, &emit_text_buf);
-    if !effects.store_cache {
-        action.store = false;
-    }
-    // Mirror prior gate: require generated > 0 so empty turns never store.
-    if action.store && generated > 0 {
-        if std::env::var("HIPFIRE_DEEPSEEK4_CACHE_TRACE")
-            .ok()
-            .as_deref()
-            == Some("1")
-        {
-            eprintln!(
-                "[asst-cache store] content.len={} tool_calls={} tokens={}",
-                emit_text_buf.len(),
-                wire_tool_calls.len(),
-                local_emitted_ids.len(),
-            );
-        }
-        let _ = ds4_apply_cache_action(
-            |fp, seq| {
-                if std::env::var("HIPFIRE_DEEPSEEK4_CACHE_TRACE")
-                    .ok()
-                    .as_deref()
-                    == Some("1")
-                {
-                    eprintln!("[asst-cache store] fp={:#018x} tokens={}", fp, seq.len());
-                }
-                m.asst_turn_cache.insert(
-                    fp,
-                    hipfire_runtime::prompt_frame::CachedAssistantTurn {
-                        reasoning: None,
-                        tools: Vec::new(),
-                        content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
-                            token_ids: seq,
-                            text: String::new(),
-                        }),
-                    },
-                );
-            },
-            &action,
-            local_emitted_ids,
-        );
-    }
 
-    emit_staged_terminal_done(stdout, &pending_done);
-    let _ = stdout.flush();
-}
 
-/// MiniMax-M2 EP prefill + greedy decode (mirror of ep_serve_ds4, MiniMax types).
-/// Carries the single-GPU prefix cache to EP: an LCP over the shared
-/// `conversation_tokens` rewinds every rank's KV cursor to the common prefix
-/// and re-prefills only the divergent suffix (interleaved-thinking partial
-/// reuse — see generate_minimax for the full rationale). `primed_think`
-/// re-emits the MiniMax `<think>\n` opener display-only for a well-formed turn.
-#[allow(clippy::too_many_arguments)]
-fn ep_serve_minimax(
-    m: &mut LoadedModel,
-    stdout: &mut std::io::Stdout,
-    id: &str,
-    prompt_ids: &[u32],
-    eos_tok: u32,
-    max_tokens: usize,
-    stop: &[String],
-    primed_think: bool,
-    sampling: EpSampling,
-) {
-    use std::time::Instant;
-    let prompt_n = prompt_ids.len();
 
-    // O2b-2 capacity guard (minimax EP): even with LCP reuse the KV ends up
-    // holding [0, prompt_n) after prefill, then decode appends max_tokens, so
-    // the absolute span is prompt_n + max_tokens. The EP state KV was allocated
-    // for `m.physical_cap` (== max_seq at load); overrunning it writes past the
-    // per-rank KV buffer → corruption/panic (serve-wide crash). Emit a clean
-    // error and return BEFORE any state mutation — mirror the qwen35 guard.
-    // saturating_add: an adversarially huge max_tokens must not wrap usize and
-    // slip under the cap.
-    if prompt_n.saturating_add(max_tokens) > m.physical_cap {
-        emit_active_attempt_error(
-            stdout,
-            Some(id),
-            &format!("prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq", prompt_n, max_tokens, m.physical_cap),
-            "context_length",
-            false,
-            false
-        );
-        let _ = stdout.flush();
-        return;
-    }
 
-    // ── LCP partial reuse. The per-rank KV holds [0, prior_total) from last
-    // turn; `conversation_tokens` mirrors it. Rewind n_tokens to the common
-    // prefix and re-prefill the (reasoning-free, shorter) suffix; MiniMax is
-    // standard attention so KV ≥ lcp is overwritten and the stale tail is
-    // never attended. lcp == 0 ⇒ cold prefill. ──
-    let prefill_from: usize = {
-        let prior_len = m.conversation_tokens.len();
-        let max_match = prior_len.min(prompt_n);
-        let mut lcp = 0usize;
-        while lcp < max_match && m.conversation_tokens[lcp] == prompt_ids[lcp] {
-            lcp += 1;
-        }
-        let cache_hit = lcp > 0 && lcp < prompt_n;
-        if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
-            eprintln!(
-                "[minimax-ep-cache] prior_len={} rendered_len={} lcp={} hit={} partial={}",
-                prior_len,
-                prompt_n,
-                lcp,
-                cache_hit,
-                cache_hit && lcp < prior_len,
-            );
-        }
-        if cache_hit {
-            m.conversation_tokens.truncate(lcp);
-            lcp
-        } else {
-            m.conversation_tokens.clear();
-            0
-        }
-    };
-    // Rewind every rank's KV cursor to the reuse point.
-    {
-        let EpState { inner, .. } = m.ep.as_mut().unwrap();
-        if let EpArch::Minimax { state, .. } = inner {
-            for s in state.iter_mut() {
-                s.n_tokens = prefill_from;
-            }
-        }
-    }
 
-    // ── Prefill the suffix [prefill_from, prompt_n) across ranks. ──
-    let t_prefill = Instant::now();
-    // FIX #1 (ep-prefill-abort): set when check_abort fires inside the prefill
-    // loop. Declared outside the borrow scope so the abort guard below can read
-    // it after the `gpus`/`state` borrow is dropped.
-    let mut aborted_in_prefill = false;
-    // Track how many suffix tokens were actually prefilled so that, on a
-    // mid-prefill abort, we don't mirror un-prefilled tokens into
-    // `conversation_tokens` (which would desync the cache from KV state).
-    let mut prefilled_n = 0usize;
-    {
-        let EpState { gpus, inner } = m.ep.as_mut().unwrap();
-        let EpArch::Minimax {
-            config,
-            weights,
-            state,
-            partials,
-        } = inner
-        else {
-            emit_active_attempt_error(
-                stdout,
-                Some(id),
-                "EP arch mismatch (expected minimax)",
-                "validation",
-                false,
-                false,
-            );
-            let _ = stdout.flush();
-            return;
-        };
-        for (i, &t) in prompt_ids[prefill_from..].iter().enumerate() {
-            // FIX #1 (ep-prefill-abort): honor a client cancel at the TOP of
-            // every prefill iteration, not just after the loop. Without this a
-            // long prompt runs the full multi-GPU prefill before the post-loop
-            // check fires. check_abort consumes the signal, so record it in a
-            // flag and break; the borrow on `m.ep` is dropped before we call
-            // ep_emit_abort below.
-            if check_abort(id) {
-                aborted_in_prefill = true;
-                break;
-            }
-            let pos = (prefill_from + i) as u32;
-            if let Err(e) =
-                minimax::forward::forward_ep(gpus, weights, config, state, partials, t, pos)
-            {
-                emit_active_attempt_error(
-                    stdout,
-                    Some(id),
-                    &format!("forward_ep prefill: {}", format!("{e}").replace('"', "'")),
-                    "validation",
-                    false,
-                    false,
-                );
-                let _ = stdout.flush();
-                return;
-            }
-            prefilled_n = i + 1;
-        }
-    }
-    // Mirror only the actually-prefilled suffix into conversation_tokens (the
-    // prefix is kept). On a mid-prefill abort, ep_emit_abort resets every
-    // rank's KV cursor, so leaving conversation_tokens at the prefix keeps the
-    // cache consistent with KV state.
-    for &t in &prompt_ids[prefill_from..prefill_from + prefilled_n] {
-        m.conversation_tokens.push(t);
-    }
-    let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
-    // FIX #1 / FIX #3 (ep-no-abort): client cancel during prefill → stop
-    // cleanly. `aborted_in_prefill` already consumed the signal mid-loop; the
-    // post-loop check_abort catches a cancel that arrived after the last token.
-    if aborted_in_prefill || check_abort(id) {
-        ep_emit_abort(stdout, id, m, 0);
-        return;
-    }
 
-    // MiniMax primes the assistant with `<think>\n`; re-emit display-only so the
-    // assistant message is a well-formed think block (parity with single-GPU).
-    if primed_think {
-        let _ = writeln!(
-            stdout,
-            "{}",
-            serde_json::json!({"type":"token","id":id,"text":"<think>\n", "attempt_id": active_attempt_id()})
-        );
-        let _ = stdout.flush();
-    }
 
-    let mut logits = {
-        let EpState { gpus, inner } = m.ep.as_mut().unwrap();
-        let EpArch::Minimax { state, .. } = inner else {
-            return;
-        };
-        let _ = gpus.devices[0].bind_thread();
-        // FIX #4 (ep-download-swallow): explicit error handling — never feed a
-        // zeroed (token-0) logits vec on a download failure.
-        match gpus.devices[0].download_f32(&state[0].logits) {
-            Ok(v) => v,
-            Err(e) => {
-                emit_active_attempt_error(
-                    stdout,
-                    Some(id),
-                    &format!(
-                        "EP first-logits download failed: {}",
-                        format!("{e:?}").replace('"', "'")
-                    ),
-                    "validation",
-                    false,
-                    false,
-                );
-                let _ = stdout.flush();
-                return;
-            }
-        }
-    };
-    let t_decode = Instant::now();
-    let mut generated = 0usize;
-    let mut pos = prompt_n;
-    let mut text_acc = String::new();
-    while generated < max_tokens {
-        // FIX #3 (ep-no-abort): client cancel mid-decode → emit aborted+done,
-        // reset EP cursors, stop.
-        if check_abort(id) {
-            ep_emit_abort(stdout, id, m, generated);
-            return;
-        }
-        // Host-side sampler over downloaded f32 logits (temp → top_k → top_p →
-        // min_p → seeded draw, temp<=1e-6 = argmax). MiniMax's card carries
-        // top_k=40, threaded here via sampling.top_k. RNG seeded per request in
-        // generate() (reset_cpu_sampler_rng).
-        let next = hipfire_runtime::llama::sample_full_dist(
-            &logits,
-            sampling.temp,
-            sampling.top_p,
-            sampling.top_k,
-            sampling.min_p,
-        );
-        if next == eos_tok {
-            break;
-        }
-        let piece = m.tokenizer.as_ref().unwrap().decode(&[next]);
-        generated += 1;
-        m.conversation_tokens.push(next);
-        if ep_emit_token(stdout, id, &piece, &mut text_acc, stop) {
-            break;
-        }
-        let EpState { gpus, inner } = m.ep.as_mut().unwrap();
-        let EpArch::Minimax {
-            config,
-            weights,
-            state,
-            partials,
-        } = inner
-        else {
-            break;
-        };
-        if let Err(e) =
-            minimax::forward::forward_ep(gpus, weights, config, state, partials, next, pos as u32)
-        {
-            emit_active_attempt_error(
-                stdout,
-                Some(id),
-                &format!("forward_ep decode: {}", format!("{e}").replace('"', "'")),
-                "validation",
-                false,
-                false,
-            );
-            return;
-        }
-        pos += 1;
-        let _ = gpus.devices[0].bind_thread();
-        // FIX #4 (ep-download-swallow): explicit error handling on the per-token
-        // download — emit a JSON error and stop, never feed a zeroed (token-0)
-        // logits vec.
-        logits = match gpus.devices[0].download_f32(&state[0].logits) {
-            Ok(v) => v,
-            Err(e) => {
-                emit_active_attempt_error(
-                    stdout,
-                    Some(id),
-                    &format!(
-                        "EP decode logits download failed: {}",
-                        format!("{e:?}").replace('"', "'")
-                    ),
-                    "validation",
-                    false,
-                    false,
-                );
-                let _ = stdout.flush();
-                return;
-            }
-        };
-    }
-    ep_emit_done(
-        stdout,
-        id,
-        m,
-        generated,
-        prompt_n,
-        prefill_ms,
-        t_decode.elapsed().as_secs_f64() * 1000.0,
-    );
-}
 
-/// Outcome of the LCP prompt-cache decision (see [`plan_prompt_cache`]).
-struct PromptCachePlan {
-    /// Full canonical conversation tokens (system + history + live user +
-    /// assistant prefix). Stored as `conversation_tokens` after generation so
-    /// the next turn can LCP against it.
-    rendered: Vec<u32>,
-    /// Tokens to actually prefill: the suffix `rendered[start_pos..]` on a hit,
-    /// the whole `rendered` on a miss.
-    new_tokens: Vec<u32>,
-    /// Absolute position the prefill starts at (the reused-prefix length on a
-    /// hit, 0 on a miss).
-    start_pos: usize,
-    /// `cached_tokens` for OpenAI usage reporting (== start_pos).
-    cached_tokens: usize,
-    /// True ⇒ reuse existing KV/DeltaNet[0..start_pos]; prefill only the suffix.
-    /// False ⇒ caller must full-reset and prefill the whole conversation.
-    cache_hit: bool,
-    /// `Some(ckpt)` ⇒ this is a divergent-render RESUME (not a pure extension):
-    /// the caller must restore the DeltaNet recurrent state from the checkpoint
-    /// at `ckpt`, rewind seq_pos/conversation_tokens to `ckpt`, then treat the
-    /// turn like a HIT with `start_pos == ckpt` (re-prefill only the tail) and
-    /// drop `draft_ctx_cached_rows` to `ckpt`. `None` on a normal hit/miss.
-    resume_from: Option<usize>,
-}
 
-/// Format for re-rendering a historical assistant `tool_call` on a cache
-/// MISS in the non-jinja ChatScaffold path (`HIPFIRE_JINJA_CHAT=0`).
-/// Mirrors the CLI's per-model grammar gating: grammar OFF (the default
-/// for native-XML Qwen3.5/3.6) => native XML; grammar ON (Hermes-format
-/// models like carnice, or a user override) => Hermes JSON. Both
-/// `build_cached_history` call sites (LCP planning in `plan_prompt_cache`
-/// and the actual prompt render) read this so their token streams stay
-/// byte-consistent — a mismatch would break the LCP forward-extension.
-fn qwen_history_tool_render(model_path: &str) -> hipfire_runtime::prompt_frame::ToolCallRender {
-    hipfire_runtime::prompt_frame::qwen35_history_render(
-        std::env::var("HIPFIRE_QWEN35_GRAMMAR").ok().as_deref(),
-        model_path,
-    )
-}
 
-/// Pure LCP prompt-cache decision shared in spirit with the AR `generate`
-/// path's inline block — but side-effect-free (touches no GPU/seq_pos state),
-/// so the DFlash path can use it too. Renders the canonical conversation via
-/// `build_cached_history` (verbatim assistant-turn replay through
-/// `asst_turn_cache`, which is what makes the LCP byte-exact across turns), then
-/// compares against `m.conversation_tokens`. Reports a HIT only on a strict
-/// forward extension (`lcp == prior_len && lcp < rendered.len()`), which keeps
-/// the recurrent DeltaNet state valid by construction (the prior turn left it at
-/// exactly `prior_len`, so prefilling the suffix advances it correctly with no
-/// rewind). The exact-match edge (`lcp == rendered.len()`) degrades to a miss to
-/// avoid a 1-token DeltaNet over-advance. Caller must be in the
-/// `messages_history.is_some()` case.
-#[allow(clippy::too_many_arguments)]
-fn plan_prompt_cache(
-    tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
-    asst_turn_cache: &mut AsstTurnCache,
-    conversation_tokens: &[u32],
-    eviction_is_none: bool,
-    system_prompt: Option<&str>,
-    prompt: &str,
-    assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
-    tool_render: hipfire_runtime::prompt_frame::ToolCallRender,
-    messages_history: &[hipfire_runtime::prompt_frame::Message],
-    cache_disabled: bool,
-    // Ascending DeltaNet checkpoint positions (from `m.dflash_checkpoints`) and
-    // whether resume-from-checkpoint is enabled. On a divergence the plan picks
-    // the latest checkpoint `<= lcp && < rendered.len()` to resume from.
-    dflash_ckpt_positions: &[usize],
-    resume_enabled: bool,
-) -> PromptCachePlan {
-    let q_tokens = tokenizer.encode(prompt);
-    let rendered = hipfire_runtime::prompt_frame::build_cached_history(
-        tokenizer,
-        system_prompt,
-        messages_history,
-        &q_tokens,
-        assistant_prefix,
-        tool_render,
-        |msg| {
-            let stripped = strip_think_for_fingerprint(&msg.content);
-            let normalized =
-                hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned();
-            let fp = asst_turn_fingerprint(&normalized, &msg.tool_calls);
-            asst_turn_cache
-                .get(&fp)
-                .and_then(|t| t.content.as_ref().map(|c| c.token_ids.clone()))
-        },
-    );
-    let cache_eligible = !cache_disabled && eviction_is_none && !conversation_tokens.is_empty();
-    plan_from_rendered(
-        conversation_tokens,
-        rendered,
-        cache_eligible,
-        dflash_ckpt_positions,
-        resume_enabled,
-        "dflash",
-    )
-}
 
-/// LCP / hit / resume planner shared by the Plain canonical-render path
-/// (`plan_prompt_cache`) and the jinja path (`generate_dflash` under
-/// `try_jinja`, which renders through `build_cached_history_jinja` —
-/// verbatim assistant-turn splice through the model's trained template,
-/// mirroring generate()'s item-#37 cache). `rendered` is the full
-/// canonical conversation stream for this turn; eligibility is the
-/// caller's precomputed decision.
-fn plan_from_rendered(
-    conversation_tokens: &[u32],
-    rendered: Vec<u32>,
-    cache_eligible: bool,
-    dflash_ckpt_positions: &[usize],
-    resume_enabled: bool,
-    trace_tag: &str,
-) -> PromptCachePlan {
-    if cache_eligible {
-        let prior_len = conversation_tokens.len();
-        let max_match = prior_len.min(rendered.len());
-        let mut lcp = 0usize;
-        while lcp < max_match && conversation_tokens[lcp] == rendered[lcp] {
-            lcp += 1;
-        }
-        if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
-            eprintln!(
-                "[qwen-cache lcp {trace_tag}] prior_len={} rendered_len={} lcp={}",
-                prior_len,
-                rendered.len(),
-                lcp
-            );
-        }
-        if lcp == prior_len && lcp < rendered.len() && lcp > 0 {
-            return PromptCachePlan {
-                new_tokens: rendered[lcp..].to_vec(),
-                start_pos: lcp,
-                cached_tokens: lcp,
-                cache_hit: true,
-                resume_from: None,
-                rendered,
-            };
-        }
-        // Divergent render (lcp < prior_len, or the exact-match edge): not a
-        // pure extension, so the recurrent state at the end is stale. If resume
-        // is enabled, rewind to the latest checkpoint at-or-before lcp that
-        // still leaves ≥1 token to re-prefill, and resume from there instead of
-        // cold-prefilling the whole conversation.
-        if resume_enabled {
-            if let Some(&ckpt) = dflash_ckpt_positions
-                .iter()
-                .filter(|&&p| p <= lcp && p < rendered.len())
-                .max()
-            {
-                eprintln!(
-                    "[qwen-cache resume {trace_tag}] checkpoint pos={} (lcp={}, prior_len={}, rendered_len={}) — replaying {} tokens vs cold-prefilling {}",
-                    ckpt, lcp, prior_len, rendered.len(), rendered.len() - ckpt, rendered.len(),
-                );
-                return PromptCachePlan {
-                    new_tokens: rendered[ckpt..].to_vec(),
-                    start_pos: ckpt,
-                    cached_tokens: ckpt,
-                    cache_hit: true,
-                    resume_from: Some(ckpt),
-                    rendered,
-                };
-            }
-        }
-    }
-    PromptCachePlan {
-        new_tokens: rendered.clone(),
-        start_pos: 0,
-        cached_tokens: 0,
-        cache_hit: false,
-        resume_from: None,
-        rendered,
-    }
-}
-
-/// Zero qwen3.5 (arch 5/6) recurrent DeltaNet + KV state IN PLACE for a fresh
-/// turn. The state lives in the bundle (ModelState::Qwen35), NOT the always-None
-/// direct fields m.dn_state/m.kv_cache — sourcing from the bundle (no hoist →
-/// no double-free). Mirrors the per-LA-device memset for pp>1. No-op off qwen35.
-///
-/// Accumulates every `bind_thread` and HIP `memset` failure. Clears
-/// `s_matrices`, `s_scales`, `conv_states`, and `s_ef_residual` on both
-/// multi-GPU and single-GPU paths. Returns `Err` with the joined failures
-/// (still attempts every surface — does not short-circuit).
-fn reset_qwen35_recurrent(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
-    let mut first_err: Option<String> = None;
-    if m.pp > 1 {
-        if let (Some(ModelState::Qwen35(b)), Some(gpus), Some(la)) = (
-            m.state.as_ref(),
-            m.pp_gpus.as_mut(),
-            m.pp_dn_la_to_device.as_ref(),
-        ) {
-            let dn = &b.dn_state;
-            for (i, s) in dn.s_matrices.iter().enumerate() {
-                let g = &mut gpus.devices[la[i] as usize];
-                if let Err(e) = g.bind_thread() {
-                    push_reset_err(&mut first_err, "pp s_matrices bind_thread", e);
-                }
-                if let Err(e) = g.hip.memset(&s.buf, 0, s.buf.size()) {
-                    push_reset_err(&mut first_err, "pp s_matrices memset", e);
-                }
-            }
-            for (i, s) in dn.s_scales.iter().enumerate() {
-                let g = &mut gpus.devices[la[i] as usize];
-                if let Err(e) = g.bind_thread() {
-                    push_reset_err(&mut first_err, "pp s_scales bind_thread", e);
-                }
-                if let Err(e) = g.hip.memset(&s.buf, 0, s.buf.size()) {
-                    push_reset_err(&mut first_err, "pp s_scales memset", e);
-                }
-            }
-            for (i, s) in dn.conv_states.iter().enumerate() {
-                let g = &mut gpus.devices[la[i] as usize];
-                if let Err(e) = g.bind_thread() {
-                    push_reset_err(&mut first_err, "pp conv_states bind_thread", e);
-                }
-                if let Err(e) = g.hip.memset(&s.buf, 0, s.buf.size()) {
-                    push_reset_err(&mut first_err, "pp conv_states memset", e);
-                }
-            }
-            // multi-GPU currently leaves s_ef_residual empty; loop is a no-op then,
-            // but keeps single-GPU parity if EF is ever wired per-device.
-            for (i, s) in dn.s_ef_residual.iter().enumerate() {
-                let g = &mut gpus.devices[la[i] as usize];
-                if let Err(e) = g.bind_thread() {
-                    push_reset_err(&mut first_err, "pp s_ef_residual bind_thread", e);
-                }
-                if let Err(e) = g.hip.memset(&s.buf, 0, s.buf.size()) {
-                    push_reset_err(&mut first_err, "pp s_ef_residual memset", e);
-                }
-            }
-        }
-    } else if let Some(ModelState::Qwen35(b)) = m.state.as_ref() {
-        let dn = &b.dn_state;
-        for s in &dn.s_matrices {
-            if let Err(e) = gpu.hip.memset(&s.buf, 0, s.buf.size()) {
-                push_reset_err(&mut first_err, "s_matrices memset", e);
-            }
-        }
-        for s in &dn.s_scales {
-            if let Err(e) = gpu.hip.memset(&s.buf, 0, s.buf.size()) {
-                push_reset_err(&mut first_err, "s_scales memset", e);
-            }
-        }
-        for s in &dn.conv_states {
-            if let Err(e) = gpu.hip.memset(&s.buf, 0, s.buf.size()) {
-                push_reset_err(&mut first_err, "conv_states memset", e);
-            }
-        }
-        for s in &dn.s_ef_residual {
-            if let Err(e) = gpu.hip.memset(&s.buf, 0, s.buf.size()) {
-                push_reset_err(&mut first_err, "s_ef_residual memset", e);
-            }
-        }
-    }
-    if let Some(ModelState::Qwen35(b)) = m.state.as_mut() {
-        b.kv_cache.compact_offset = 0;
-    }
-    match first_err {
-        Some(e) => Err(e),
-        None => Ok(()),
-    }
-}
-
-/// DFlash-powered greedy decode. Mirrors `generate`'s ChatML shape and
-/// token-streaming output but replaces the AR sample loop with
-/// `spec_step_dflash` cycles — each cycle drafts B tokens via the diffusion
-/// model and verifies them in one target forward, committing accept_len+1
-/// at a time.
-///
-/// Prompt cache: for `messages_history`-bearing chat requests this path now
-/// reuses the target KV + DeltaNet prefix on a pure conversation extension
-/// (via [`plan_prompt_cache`] + `seed_target_hidden_suffix_abortable`), and the
-/// draft's cumulative `target_hidden` is extended by scattering only the suffix
-/// rows — so DFlash keeps its decode speedup AND skips re-prefilling the cached
-/// prefix. A divergent / first / raw-prompt turn full-resets and prefills the
-/// whole conversation as before.
-///
-/// The arch-dispatched borrow of the spec-decode target as `&mut dyn SpecTarget`
-/// now lives behind the loader's `spec_target_guard()` + the runtime
-/// `SpecTargetGuard` trait — this fn only ever sees `&mut dyn SpecTarget` and
-/// never learns which arch (qwen35 moved-bundle vs llama borrow-in-place) it drives.
-#[allow(clippy::too_many_arguments)]
-/// Render the [`ClientEvent`]s a [`SpecEmit`] step produced to the daemon's
-/// JSONL wire format, byte-identical to `generate_dflash`'s old inline writes.
-/// `t_ms` is the per-step timestamp the inline path attached to committed +
-/// token frames (`t0.elapsed()`); tool_calls frames carry no timing.
-///
-/// `hold_tool_calls`: when true (terminal `finish` flush), skip rendering
-/// `ClientEvent::ToolCalls` so the arch wrapper can classify length/malformed
-/// before any executable release. Mid-loop begin/observe pass false.
-fn render_client_events(
-    stdout: &mut impl std::io::Write,
-    id: &str,
-    events: &[ClientEvent],
-    t_ms: u64,
-    hold_tool_calls: bool,
-) {
-    for ev in events {
-        match ev {
-            ClientEvent::Committed { id: tok_id, idx } => {
-                emit_committed_event(stdout, id, *tok_id, *idx, t_ms);
-            }
-            ClientEvent::Token(text) => {
-                let envelope = qwen_dflash_token_event_value(id, text, active_attempt_id());
-                let _ = writeln!(stdout, "{}", envelope);
-                let _ = stdout.flush();
-            }
-            ClientEvent::Reasoning(text) => {
-                let envelope = qwen_dflash_reasoning_event_value(id, text, active_attempt_id());
-                let _ = writeln!(stdout, "{}", envelope);
-                let _ = stdout.flush();
-            }
-            ClientEvent::ToolCalls(calls) => {
-                if hold_tool_calls {
-                    continue;
-                }
-                emit_tool_calls_event(stdout, id, calls);
-            }
-        }
-    }
-}
-
-/// Release held terminal `ClientEvent::ToolCalls` after a tool-safe verdict.
-fn release_held_finish_tool_calls(
-    stdout: &mut impl std::io::Write,
-    id: &str,
-    finish: &FinishSummary,
-) {
-    for ev in &finish.events {
-        if let ClientEvent::ToolCalls(calls) = ev {
-            emit_tool_calls_event(stdout, id, calls);
-        }
-    }
-}
-
-/// Model-independent emitter recipe a `generate_spec` wrapper supplies so the
-/// arch's carrier can build the matching [`SpecEmit`] *after* `generate_spec` has
-/// acquired the slot (the emitter needs `slot.eos_token()` and the tokenizer,
-/// both derived from `m` *inside* `generate_spec`). Every field is neutral —
-/// tool definitions are the request's raw JSON, which each arch's emitter parses
-/// into its own grammar schema; `generate_spec` builds a `SpecEmitCtx` from this
-/// + the slot's eos + the tokenizer and calls `carrier.make_spec_emitter`.
-struct SpecEmitRequest {
-    im_end: Option<u32>,
-    /// Raw tool definitions (OpenAI-shape JSON); `None`/empty ⇒ no tool grammar.
-    tools: Option<Vec<serde_json::Value>>,
-    stop: Vec<String>,
-    max_think: usize,
-    assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
-    /// Reasoning-effort level (consumed by the ds4 emitter; ignored by ChatML).
-    think_mode: ThinkMode,
-    /// Pre-decoded vocab for arches whose grammar masks per-token (ds4). The
-    /// wrapper builds/caches the Arc so this struct carries no `LoadedModel` ref.
-    decoded_vocab: Option<std::sync::Arc<Vec<String>>>,
-}
-
-/// Summary returned by `generate_spec` to its arch wrapper, which writes the
-/// arch-specific `done` envelope and (qwen35/deepseek4) the asst-turn cache
-/// store from it. `None` is returned on the abort/error early-exits, which
-/// already wrote their own `done`/`error`; the wrapper then does nothing.
-struct SpecRun {
-    generated: usize,
-    spec_cycles: usize,
-    spec_accepted: usize,
-    /// Full committed stream (from the emitter) for the wrapper's cache store.
-    /// Empty for emitters that don't track it. Deepseek4 and qwen35 both expose
-    /// streamed tokens for asst-turn cache replay on safe terminals.
-    streamed_tokens: Vec<u32>,
-    /// Newly-prefilled token count (the suffix actually fed through the model).
-    prefill_tokens_len: usize,
-    /// The terminal flush summary (tool-call count drives the wrapper's
-    /// `finish_reason`; events were already rendered inside `generate_spec`).
-    finish: FinishSummary,
-    /// Emitter reported a grammar violation (wrapper may suppress cache/calls).
-    grammar_violated: bool,
-    /// Emitter semantic stop (Eos / StopSequence / ThinkCap) observed during
-    /// begin, normal observe, or forced observe. Independent of
-    /// `finish.decoded_eot` — wrappers OR both so stop-at-max_tokens wins over
-    /// length. GrammarViolation is fail-closed, not carried here.
-    semantic_stop: Option<StopReason>,
-    /// Truthful rollback attestation when this turn ended fail-closed
-    /// (grammar / open-think / malformed). `None` on safe Done paths.
-    fail_closed_rollback: Option<RollbackEpilogue>,
-    prefill_s: f64,
-    total_s: f64,
-    decode_s: f64,
-}
-
-fn generate_dflash(
-    m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
-    stdout: &mut std::io::Stdout,
-    id: &str,
-    prompt: &str,
-    system_prompt: Option<&str>,
-    max_tokens: usize,
-    max_think_tokens: usize,
-    assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
-    pflash_bypass_reason: Option<&str>,
-    pflash_alpha: Option<f32>,
-    tools: Option<&[serde_json::Value]>,
-    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
-    stop: &[String],
-    // Request-resolved sampling temperature. 0.0 → greedy/argmax-accept (the
-    // historical DFlash posture). >0 → distribution-preserving spec decode via
-    // one of two verify mechanisms inside `DflashSpeculator::step`, picked by how
-    // the drafter loaded:
-    //   * ddtree mode — SWOR tree-verify, fed the `temp` arg directly; honors
-    //     temperature ONLY (the caller routes an explicit top_p/top_k/min_p to AR).
-    //   * chain mode — lossless rejection sampling (full-vocab softmax on BOTH
-    //     draft + target), fed the top_p/top_k/cactus args below via
-    //     `Speculator::set_sampling` (see the set_sampling call). Honors
-    //     temp+top_p+top_k; min_p is NOT plumbed (a min_p request routes to AR).
-    temp: f32,
-    // Nucleus (top_p) cutoff for the chain rejection-sampling path, applied
-    // IDENTICALLY to both draft + target softmaxes (lossless == AR at this top_p).
-    // 1.0 (>= 0.999) disables it. Ignored by the ddtree SWOR arm.
-    top_p: f32,
-    // Top-k cutoff (request/card recipe, e.g. qwen3.6 top_k=20) for the chain
-    // sampled path, applied to both draft + target softmax rows. 0 = disabled.
-    // Ignored by the ddtree SWOR arm.
-    top_k: usize,
-    // Cactus-style acceptance bump. 0.0 → lossless (distribution-preserving).
-    // >0 → deliberately lossy (KL-bounded τ-for-correctness tradeoff). The
-    // daemon hardcodes 0.0; the param exists only so a future opt-in request
-    // field can reach it without re-touching this signature.
-    cactus_delta: f32,
-    reasoning_effort: Option<&str>,
-    enable_thinking: bool,
-    // Returns false in exactly one case: the request does not fit the loaded
-    // speculator's reported ctx capacity (draft-side structures are capped at
-    // load — see DEFAULT_DFLASH_CTX_CAP) — and NO output/events were emitted,
-    // so the caller must fall through to the arch's AR path. Every other exit
-    // (success, abort, error) has already written its envelope → true.
-) -> bool {
-    // Zero-budget reject before Jinja/render, set_sampling, gen_start, or any
-    // GPU/host mutation. Handled (true) so the caller does not fall through to AR.
-    // Inner generate_spec keeps the same guard as defense-in-depth.
-    if max_tokens == 0 {
-        emit_active_attempt_error(
-            stdout,
-            Some(id),
-            "max_tokens must be > 0",
-            "validation",
-            false,
-            false,
-        );
-        let _ = stdout.flush();
-        return true;
-    }
-
-    // Adaptive KV has no maybe_downshift on the generic spec path. Fail closed
-    // rather than run DSpark/DFlash/ngram past floor-reserved capacity. The
-    // error envelope is written here, so this counts as handled (true) — the
-    // caller must NOT also emit an AR response.
-    if m.kv_adaptive.is_some() {
-        emit_active_attempt_error(
-            stdout,
-            Some(id),
-            "kv_adaptive cannot use generic speculative decode (DFlash/DSpark/n-gram); use AR or native MTP",
-            "validation",
-            false,
-            false
-        );
-        let _ = stdout.flush();
-        return true;
-    }
-
-    // The spec-step dispatch, ModelSlot assembly, checkpoint ring, and
-    // SpecStats that this function used to drive inline now live behind the
-    // arch-generic `Speculator` trait (the loader's `DflashSpeculator`) and the
-    // `Qwen35SlotGuard` RAII target borrow — see the prefill/step/on_evict/
-    // reset/rewind_to calls below.
-
-    // Prompt build: same two-path branch as the AR-path generate() — when
-    // Jinja is enabled (default; opt out with HIPFIRE_JINJA_CHAT=0) AND the
-    // model carries a chat_template, render via `JinjaChatFrame` so structured
-    // `tools` / `messages` can reach the upstream template's `{% if tools %}` /
-    // multi-turn branches. Plain is allowed only for explicit opt-out or when
-    // no embedded template resolves. A configured-template render failure is
-    // fail-closed (non-retryable validation, handled=true) — never silently
-    // changes prompt semantics via Plain fallback.
-    //
-    // DFlash is single-turn by construction — `seq_pos` is reset to 0
-    // below before seed_target_hidden_from_prompt runs — so we never
-    // need to guard on `seq_pos == 0` here.
-    let tokenizer = m.tokenizer.as_ref().unwrap();
-    // LFM2.5 (arch_id 11) REQUIRES its embedded Jinja chat_template — the
-    // hand-rolled Plain ChatML path omits LFM2's `<|startoftext|>` BOS and
-    // produces garbage. Force jinja on for arch 11 (Plain only if the .hfq
-    // carries no template, e.g. an older A1B convert).
-    // Jinja default-ON (flipped 2026-06-09): render through the model's chat
-    // template for ALL arches; opt out with HIPFIRE_JINJA_CHAT=0 (hand-rolled
-    // ChatML/Plain). No template ⇒ Plain. Template present + render Err ⇒
-    // fail closed (see match below).
-    let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
-    let try_jinja = jinja_enabled && m.chat_template.is_some();
-    let mut started_in_think = matches!(
-        assistant_prefix,
-        hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
-    );
-    let prompt_tokens: Vec<u32> = if try_jinja {
-        let template = m.chat_template.as_ref().unwrap();
-        let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
-            tokenizer,
-            template,
-            system: system_prompt,
-            user: prompt,
-            enable_thinking,
-            bos_token: None,
-            reasoning_strength: None,
-            reasoning_effort,
-        };
-        let render_result = if tools.is_some() || messages_history.is_some() {
-            let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
-            let messages_slice: &[hipfire_runtime::prompt_frame::Message] = match messages_history {
-                Some(m) => m,
-                None => {
-                    let mut v = Vec::new();
-                    if let Some(sys) = system_prompt {
-                        v.push(hipfire_runtime::prompt_frame::Message {
-                            role: hipfire_runtime::prompt_frame::Role::System,
-                            content: sys.to_string(),
-                            reasoning_content: None,
-                            name: None,
-                            rendered_name: None,
-                            tool_calls: Vec::new(),
-                            tool_call_id: None,
-                            tool_plan: String::new(),
-                        });
-                    }
-                    v.push(hipfire_runtime::prompt_frame::Message {
-                        role: hipfire_runtime::prompt_frame::Role::User,
-                        content: prompt.to_string(),
-                        reasoning_content: None,
-                        name: None,
-                        rendered_name: None,
-                        tool_calls: Vec::new(),
-                        tool_call_id: None,
-                        tool_plan: String::new(),
-                    });
-                    synthesized = v;
-                    &synthesized
-                }
-            };
-            frame.render_messages(messages_slice, tools, None)
-        } else {
-            frame.render()
-        };
-        match render_result {
-            Ok(rendered) => {
-                started_in_think = render_tail_opens_think(&rendered);
-                tokenizer.encode(&rendered)
-            }
-            Err(e) => {
-                if reasoning_effort.is_some() {
-                    emit_active_attempt_error(
-                        stdout,
-                        Some(id),
-                        &format!("DFlash jinja render: {e}"),
-                        "validation",
-                        false,
-                        false,
-                    );
-                    let _ = stdout.flush();
-                    return true;
-                }
-                eprintln!("[daemon] jinja render failed ({e}) — falling back to Plain");
-                hipfire_runtime::prompt_frame::ChatFrame {
-                    tokenizer,
-                    system: system_prompt,
-                    user: prompt,
-                    assistant_prefix,
-                    raw: false,
-                }
-                .build()
-            }
-        }
-    } else {
-        hipfire_runtime::prompt_frame::ChatFrame {
-            tokenizer,
-            system: system_prompt,
-            user: prompt,
-            assistant_prefix,
-            raw: false,
-        }
-        .build()
-    };
-
-    // `im_end_token` is still needed downstream for the EOS check.
-    let im_end = tokenizer.encode("<|im_end|>");
-    let im_end_token = if im_end.len() == 1 {
-        Some(im_end[0])
-    } else {
-        None
-    };
-
-    // DFlash ctx-capacity downgrade. The draft's context-indexed structures
-    // (target_hidden, per-layer K/V caches, hidden ring) are sized at load to
-    // min(max_seq, HIPFIRE_DFLASH_CTX_CAP|8192) to bound draft-side VRAM on
-    // large-max_seq serve loads. A request that outgrows the cap cannot run
-    // spec — but DFlash is verify-gated, so AR produces the same tokens, just
-    // slower. Emit a correlated info event and hand the request back to the
-    // caller's AR fallthrough (handled=false: no gen_start/done yet). Mirrors
-    // the hard guard in generate_spec (belt-and-suspenders last line).
-    let spec_ctx_capacity = m
-        .speculator
-        .as_ref()
-        .map(|s| s.ctx_capacity())
-        .unwrap_or(usize::MAX);
-    if prompt_tokens.len().saturating_add(max_tokens) > spec_ctx_capacity {
-        emit_qwen_ar_info(
-            stdout,
-            id,
-            &format!(
-                "prompt={} + max_tokens={} exceeds DFlash draft ctx capacity {} — falling back to AR (identical output, slower; raise HIPFIRE_DFLASH_CTX_CAP to re-enable spec)",
-                prompt_tokens.len(),
-                max_tokens,
-                spec_ctx_capacity
-            ),
-        );
-        return false;
-    }
-
-    // Prompt-cache plan (native DFlash reuse). Decide whether this turn is a
-    // pure extension of the cached conversation. On a HIT we reuse target KV
-    // + DeltaNet[0..start_pos] and the draft's cumulative target_hidden,
-    // prefilling only the suffix; on a MISS we full-reset and prefill the
-    // whole conversation (legacy behaviour).
-    //
-    // Jinja mode renders through `build_cached_history_jinja` — the same
-    // item-#37 machinery generate() uses: verbatim assistant-turn token
-    // splice (fingerprint replay, no decode→encode drift) through the model's
-    // trained template, with the assistant-opener primer prepended so the
-    // spliced stream byte-matches the end-of-turn bake. Divergence (edited
-    // history, roundtrip-unstable text) lands on the checkpoint-resume path —
-    // worst case equals today's cold prefill, never wrong tokens.
-    let cache_disabled = std::env::var("HIPFIRE_QWEN_PROMPT_CACHE").ok().as_deref() == Some("0");
-    // DFlash divergent-render resume (default ON; opt out with
-    // HIPFIRE_DFLASH_CKPT_RESUME=0). Requires no eviction (resume rewinds the
-    // resident KV prefix). When on, the recurrent state is checkpointed during
-    // the prompt seed and a divergent render resumes from the latest checkpoint
-    // ≤ lcp — byte-identical to a cold prefill of the same render (verified),
-    // so worst case equals the legacy cold-reset path. Off ⇒ no checkpoints
-    // (zero overhead) + legacy cold-reset-on-divergence.
-    let dflash_resume_enabled = std::env::var("HIPFIRE_DFLASH_CKPT_RESUME").ok().as_deref()
-        != Some("0")
-        && m.eviction.is_none();
-    let dflash_ckpt_positions: Vec<usize> = m
-        .speculator
-        .as_ref()
-        .map(|s| s.checkpoint_positions())
-        .unwrap_or_default();
-    let cache_eligible = !cache_disabled
-        && messages_history.is_some()
-        && m.eviction.is_none()
-        && pflash_bypass_reason.is_none()
-        && !m.conversation_tokens.is_empty();
-    let cache_plan: Option<PromptCachePlan> = if try_jinja {
-        if let Some(hist) = messages_history {
-            // Assistant-opener primer from THIS turn's cold jinja render
-            // (everything after the last `<|im_start|>assistant\n`) — the
-            // template renders history turns without it, so the replay
-            // prepends it (mirrors generate()'s item-#37 primer).
-            let tok = m.tokenizer.as_ref().unwrap();
-            let im_start = tok.special_token_id("<|im_start|>");
-            let opener_len = tok.encode("<|im_start|>assistant\n").len();
-            let primer: Vec<u32> =
-                match im_start.and_then(|id| prompt_tokens.iter().rposition(|&t| t == id)) {
-                    Some(q) if q + opener_len <= prompt_tokens.len() => {
-                        prompt_tokens[q + opener_len..].to_vec()
-                    }
-                    _ => Vec::new(),
-                };
-            let template = m.chat_template.as_ref().unwrap();
-            let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
-                tokenizer: tok,
-                template,
-                system: system_prompt,
-                user: prompt,
-                enable_thinking,
-                bos_token: None,
-                reasoning_strength: None,
-                reasoning_effort,
-            };
-            let cache_ref = &mut m.asst_turn_cache;
-            let trace_cache =
-                std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1");
-            let rendered = match hipfire_runtime::prompt_frame::build_cached_history_jinja(
-                &frame,
-                hist,
-                tools,
-                |msg| {
-                    let normalized = normalize_asst_turn_for_fingerprint(&msg.content);
-                    let fp = asst_turn_fingerprint(&normalized, &msg.tool_calls);
-                    // The qwen family has no Harmony reasoning/tool channels: its whole
-                    // assistant turn is one content slot. `text` must be the message's own
-                    // content so the splice's `content.text == m.content` guard
-                    // (prompt_frame.rs) passes trivially and behaviour is byte-identical to
-                    // the pre-per-channel implementation.
-                    let hit = cache_ref.get(&fp).and_then(|turn| {
-                        turn.content.as_ref().map(|c| {
-                            let mut v = primer.clone();
-                            v.extend_from_slice(&c.token_ids);
-                            hipfire_runtime::prompt_frame::CachedAssistantTurn {
-                                reasoning: None,
-                                tools: Vec::new(),
-                                content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
-                                    token_ids: v,
-                                    text: msg.content.clone(),
-                                }),
-                            }
-                        })
-                    });
-                    if trace_cache {
-                        eprintln!(
-                            "[qwen-cache jinja lookup dflash] fp={:#018x} role={:?} primer={} hit={}",
-                            fp,
-                            msg.role,
-                            primer.len(),
-                            hit.is_some()
-                        );
-                    }
-                    hit
-                },
-            ) {
-                Ok(v) => v,
-                Err(e) => {
-                    if reasoning_effort.is_some() {
-                        emit_active_attempt_error(
-                            stdout,
-                            Some(id),
-                            &format!("DFlash qwen-cache jinja build: {e}"),
-                            "validation",
-                            false,
-                            false,
-                        );
-                        let _ = stdout.flush();
-                        return true;
-                    }
-                    eprintln!(
-                        "[qwen-cache] DFlash jinja cached-history build failed ({e}) — cold render"
-                    );
-                    prompt_tokens.clone()
-                }
-            };
-            Some(plan_from_rendered(
-                &m.conversation_tokens,
-                rendered,
-                cache_eligible,
-                &dflash_ckpt_positions,
-                dflash_resume_enabled,
-                "dflash-jinja",
-            ))
-        } else {
-            None
-        }
-    } else {
-        messages_history.map(|hist| {
-            let tok = m.tokenizer.as_ref().unwrap();
-            plan_prompt_cache(
-                tok,
-                &mut m.asst_turn_cache,
-                &m.conversation_tokens,
-                m.eviction.is_none(),
-                system_prompt,
-                prompt,
-                assistant_prefix,
-                qwen_history_tool_render(&m.model_path),
-                hist,
-                cache_disabled,
-                &dflash_ckpt_positions,
-                dflash_resume_enabled,
-            )
-        })
-    };
-    let resume_from: Option<usize> = cache_plan.as_ref().and_then(|p| p.resume_from);
-    // `prompt_tokens` becomes the full canonical conversation when the cache
-    // plan rendered it (keeps the end-of-turn `conversation_tokens` bake and the
-    // next turn's LCP byte-consistent). Otherwise keep the jinja/ChatFrame build.
-    let prompt_tokens: Vec<u32> = match &cache_plan {
-        Some(p) => p.rendered.clone(),
-        None => prompt_tokens,
-    };
-    let (prefill_tokens, prefill_start, cache_hit, cached_tokens_dflash): (
-        Vec<u32>,
-        usize,
-        bool,
-        usize,
-    ) = match &cache_plan {
-        Some(p) => (
-            p.new_tokens.clone(),
-            p.start_pos,
-            p.cache_hit,
-            p.cached_tokens,
-        ),
-        None => (prompt_tokens.clone(), 0, false, 0),
-    };
-
-    // ── Grammar-guided decoding setup (dflash path) ─────────────
-    //
-    // qwen35 enforces tool-call grammar POST-acceptance inside the emitter
-    // (`Qwen35Emit::observe`); the emitter now extracts its own `ToolSchema`
-    // list from the raw tool JSON inside `make_spec_emitter`. This wrapper only
-    // honors the `HIPFIRE_QWEN35_GRAMMAR=0` kill-switch by withholding `tools`
-    // (⇒ empty schema ⇒ grammar inactive).
-    let grammar_enabled = hipfire_runtime::prompt_frame::qwen35_grammar_on(
-        std::env::var("HIPFIRE_QWEN35_GRAMMAR").ok().as_deref(),
-        &m.model_path,
-    );
-    let emit_tools: Option<Vec<serde_json::Value>> = if grammar_enabled {
-        tools.map(|t| t.to_vec())
-    } else {
-        None
-    };
-
-    // The decode core (slot guard, prefill, accept-window loop, bake, finish) is
-    // the arch-generic `generate_spec`. This wrapper owns the qwen35/llama-specific
-    // prologue (jinja/Plain render + LCP cache plan), the emitter recipe
-    // (`EmitSpec::Qwen35`), and the epilogue (asst-turn cache store + `done`
-    // envelope). A future ds4 wrapper (Phase 4 T4c-2) builds its DSML render +
-    // ds4 cache plan + `EmitSpec::Deepseek4` and writes its own ds4 `done`.
-    //
-    // Thread the request's sampling into the speculator BEFORE the step loop so
-    // `DflashSpeculator::step` runs lossless rejection sampling at temp>0 instead
-    // of decoding greedy (the #477-merge re-wire of spec-graph's sampled-DFlash).
-    // Greedy (temp 0) is unchanged. No-op for a greedy-only Speculator impl; the
-    // deepseek4 spec wrapper (`generate_deepseek4_spec`) deliberately never calls
-    // this, so ds4 MTP stays greedy. cactus_delta is 0.0 (lossless) from here.
-    if let Some(spec) = m.speculator.as_mut() {
-        spec.set_sampling(temp, top_p, top_k, cactus_delta);
-    }
-    let prefill_tokens_full = prefill_tokens.len();
-    // The Jinja prompt can open `<think>` without emitting that token during
-    // generation. Prime both the client channel router and the speculative
-    // think-budget tracker from the rendered tail, exactly as the AR path does.
-    // Advertise semantic-v2 only when this turn's arch has a correlated
-    // router-backed DFlash producer (qwen35 / qwen35-vl). Other arches still
-    // use whole-output tool extraction and stay on legacy contract.
-    emit_gen_start(
-        stdout,
-        id,
-        started_in_think,
-        gen_start_contract_version_for_arch(m.arch_id),
-    );
-    let run = match generate_spec(
-        m,
-        gpu,
-        stdout,
-        id,
-        prompt_tokens,
-        prefill_tokens,
-        prefill_start,
-        cache_hit,
-        resume_from,
-        max_tokens,
-        SpecEmitRequest {
-            im_end: im_end_token,
-            tools: emit_tools,
-            stop: stop.to_vec(),
-            max_think: max_think_tokens,
-            assistant_prefix: spec_assistant_prefix(started_in_think),
-            think_mode: ThinkMode::NonThink,
-            decoded_vocab: None,
-        },
-        temp,
-    ) {
-        Some(r) => r,
-        // Abort / error early-exit already wrote its own done/error envelope.
-        None => return true,
-    };
-    debug_assert_eq!(run.prefill_tokens_len, prefill_tokens_full);
-
-    // ── parse tool_calls + populate asst_turn_cache ──────────────
-    //
-    // Qwen DFlash/spec: terminal ToolCalls are held by generate_spec; the
-    // producer-authorized visible channel + router finish drive release,
-    // finish_reason, and cache store. Length without decoded EOT never
-    // releases calls or stores cache. Other arches keep whole-output extract.
-    let tokenizer = m.tokenizer.as_ref().unwrap();
-    let qwen_semantic_v2 = hipfire_loader::carrier_for(m.arch_id)
-        .map(|c| c.caps().semantic_contract_version == Some(2))
-        .unwrap_or(false);
-
-    // Trim the trailing `<|im_end|>` + newline trailer from streamed_tokens so
-    // the cached body slots cleanly between the assistant_prefix and the
-    // im_end+nl trailer that `build_cached_history` re-adds on replay
-    // (mirrors qwen35 cache writer).
-    //
-    // Only strip it when it IS the trailer. A turn cut short by max_tokens never
-    // emitted `im_end`, so if its last token happens to be a newline that
-    // newline is BODY: popping it made the replayed body one token shorter than
-    // what KV holds, the re-added `im_end` then landed on the newline's slot, and
-    // the LCP stopped one token before `prior_len` — turning a clean hit into a
-    // checkpoint resume (measured: 29 s of re-prefill on a 16.5K turn).
-    let nl_token = tokenizer.encode("\n");
-    let nl_set: std::collections::HashSet<u32> = nl_token.iter().copied().collect();
-    let cached_seq: Vec<u32> = qwen_dflash_cache_seq(&run.streamed_tokens, im_end_token, &nl_set);
-
-    let tok_s = if run.total_s > 0.0 {
-        run.generated as f64 / run.total_s
-    } else {
-        0.0
-    };
-    let decode_tok_s = if run.decode_s > 0.0 {
-        run.generated as f64 / run.decode_s
-    } else {
-        0.0
-    };
-    // New-token count (not full rendered length) so the prefill rate reflects
-    // actual work on a cache HIT/resume — matches every other path's numerator.
-    let prefill_tok_s = if run.prefill_s > 0.0 {
-        run.prefill_tokens_len as f64 / run.prefill_s
-    } else {
-        0.0
-    };
-    let tau = if run.spec_cycles > 0 {
-        run.spec_accepted as f64 / run.spec_cycles as f64
-    } else {
-        0.0
-    };
-    // Per PRD §3.1, when PFlash bypassed (e.g. dflash_decode_active for
-    // this branch) the `done` object must surface the bypass reason and
-    // alpha alongside the dflash perf metrics.
-    let pflash_done_field = match (pflash_bypass_reason, pflash_alpha) {
-        (Some(r), Some(a)) => format!(
-            r#","pflash":{{"bypass_reason":"{}","alpha":{:.6}}}"#,
-            r.replace('"', "'"),
-            a,
-        ),
-        _ => String::new(),
-    };
-
-    if qwen_semantic_v2 {
-        let eos = m
-            .tokenizer
-            .as_ref()
-            .and_then(|t| t.special_token_id("<|endoftext|>"))
-            .unwrap_or(0);
-        // Prefer emitter-authoritative decoded EOT (split byte markers included);
-        // fall back to token-id scan only when the producer left the flag unset.
-        // SpecRun.semantic_stop (StopSequence/EOS/ThinkCap) also beats length at
-        // the budget boundary — independent of decoded_eot (user stop may not
-        // set that flag).
-        let decoded_eot = run.finish.decoded_eot
-            || qwen_dflash_decoded_eot_from_tokens(
-                tokenizer,
-                &run.streamed_tokens,
-                eos,
-                im_end_token,
-            );
-        let semantic_stop = run.semantic_stop.is_some();
-        let hit_length_cap =
-            qwen_dflash_hit_length_cap(run.generated, max_tokens, decoded_eot, semantic_stop);
-        // Prefer producer-visible channel; fall back to finish Token events.
-        let visible = if !run.finish.visible_text.is_empty() {
-            run.finish.visible_text.clone()
-        } else {
-            qwen_dflash_visible_from_finish(&run.finish)
-        };
-        let rolled_back = run
-            .fail_closed_rollback
-            .as_ref()
-            .map(|ep| ep.rolled_back)
-            .unwrap_or(false);
-        let terminal = qwen_dflash_wire_terminal(
-            &run.finish,
-            hit_length_cap,
-            run.grammar_violated,
-            &visible,
-            rolled_back,
-        );
-        match &terminal {
-            QwenDflashWireTerminal::Malformed {
-                message,
-                class,
-                retryable,
-                rolled_back: _,
-            } => {
-                // Prefer the live epilogue from generate_spec (truthful rolled_back
-                // + optional sync-failure context). Fall back to a no-GPU attest.
-                let fallback = RollbackEpilogue {
-                    rolled_back: false,
-                    context: None,
-                };
-                let ep = run.fail_closed_rollback.as_ref().unwrap_or(&fallback);
-                // emit_fail_closed_error appends ep.context when !rolled_back.
-                emit_qwen_dflash_malformed_terminal(stdout, id, message, class, *retryable, ep);
-                // Fail-closed: no done, no cache, no tool release.
-                let _ = qwen_dflash_apply_cache_action(
-                    |_fp, _seq| {},
-                    &qwen_dflash_cache_action(&terminal),
-                    cached_seq,
-                );
-                return true;
-            }
-            QwenDflashWireTerminal::Done {
-                finish_reason,
-                release_tool_calls,
-                store_cache,
-                fingerprint_text: _,
-                wire_tool_calls,
-            } => {
-                // Successful classify → stage exact pending done, then client
-                // terminal handshake before any tool release / cache / done.
-                let pflash = match (pflash_bypass_reason, pflash_alpha) {
-                    (Some(r), Some(a)) => Some((r, a)),
-                    _ => None,
-                };
-                let mut pending_done = qwen_dflash_done_value(
-                    id,
-                    run.generated,
-                    (tok_s * 10.0).round() / 10.0,
-                    run.prefill_tokens_len,
-                    (run.prefill_s * 1000.0 * 10.0).round() / 10.0,
-                    (prefill_tok_s * 10.0).round() / 10.0,
-                    (decode_tok_s * 10.0).round() / 10.0,
-                    (run.prefill_s * 1000.0 * 10.0).round() / 10.0,
-                    (tau * 100.0).round() / 100.0,
-                    run.spec_cycles,
-                    cached_tokens_dflash,
-                    finish_reason,
-                    active_attempt_id(),
-                );
-                if let Some((reason, alpha)) = pflash {
-                    pending_done["pflash"] = serde_json::json!({
-                        "bypass_reason": reason,
-                        "alpha": alpha,
-                    });
-                }
-                // Stage canonical calls before handshake so pure-tool HTTP
-                // terminals are complete at commit_ready. Final done is identical.
-                stage_terminal_tool_calls(&mut pending_done, finish_reason, wire_tool_calls);
-                let decision = await_client_terminal_commit(stdout, id, &pending_done);
-                let effects = qwen_client_commit_effects(
-                    decision,
-                    *release_tool_calls && !wire_tool_calls.is_empty(),
-                    *store_cache,
-                );
-                if !effects.emit_done {
-                    let ep = production_fail_closed_rollback(m, gpu, None, None);
-                    emit_spec_cancel_after_rollback(stdout, id, run.generated, &ep);
-                    return true;
-                }
-                // No post-commit tool_calls event; calls live on staged terminal.
-                let mut action = qwen_dflash_cache_action(&terminal);
-                action.store = effects.store_cache && action.store;
-                if action.store {
-                    if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
-                        eprintln!(
-                            "[qwen-cache store dflash] fp_text.len={} tool_calls={} preview={:?}",
-                            action.fingerprint_text.len(),
-                            action.tool_calls.len(),
-                            action.fingerprint_text.chars().take(60).collect::<String>(),
-                        );
-                    }
-                    let _ = qwen_dflash_apply_cache_action(
-                        |fp, seq| {
-                            if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref()
-                                == Some("1")
-                            {
-                                eprintln!(
-                                    "[qwen-cache store dflash] fp={:#018x} cached_seq={}",
-                                    fp,
-                                    seq.len()
-                                );
-                            }
-                            m.asst_turn_cache.insert(
-                                fp,
-                                hipfire_runtime::prompt_frame::CachedAssistantTurn {
-                                    reasoning: None,
-                                    tools: Vec::new(),
-                                    content: Some(
-                                        hipfire_runtime::prompt_frame::CachedAssistantBody {
-                                            token_ids: seq,
-                                            text: String::new(),
-                                        },
-                                    ),
-                                },
-                            );
-                        },
-                        &action,
-                        cached_seq,
-                    );
-                }
-                emit_staged_terminal_done(stdout, &pending_done);
-            }
-        }
-    } else {
-        // Legacy non-qwen DFlash: grammar / open-think / malformed is
-        // error-only — never whole-output extract, release held calls,
-        // store cache, or emit done. Prefer generate_spec's production
-        // epilogue so rolled_back + sync-failure context stay truthful.
-        if run.fail_closed_rollback.is_some() || run.grammar_violated {
-            let fallback = RollbackEpilogue {
-                rolled_back: false,
-                context: None,
-            };
-            let ep = run.fail_closed_rollback.as_ref().unwrap_or(&fallback);
-            let message = if run.grammar_violated {
-                "grammar violation during speculative decode"
-            } else if run.finish.open_think || run.finish.finish_reason == "open_think" {
-                "open think span at end of generation (validation)"
-            } else if run.finish.finish_reason == "malformed_protocol" {
-                "malformed tool protocol"
-            } else {
-                "fail-closed speculative decode"
-            };
-            // emit_fail_closed_error appends ep.context when !rolled_back.
-            emit_fail_closed_error(stdout, Some(id), message, "validation", false, ep);
-            return true;
-        }
-        // Legacy non-qwen DFlash: whole-output extract + cache only on a safe
-        // completed terminal. Length still emits finish_reason=length but must
-        // not release held tool calls or store asst_turn_cache (partial/truncated
-        // turns are not safe to prime). Fail-closed already returned above.
-        let decoded_full = tokenizer.decode(&run.streamed_tokens);
-        let emit_tool_calls = extract_tool_calls_from_text(&decoded_full);
-        // Semantic stop / decoded_eot at the budget boundary is stop/tool_calls,
-        // not length — same rule as the qwen_semantic_v2 path.
-        let hit_length_cap = qwen_dflash_hit_length_cap(
-            run.generated,
-            max_tokens,
-            run.finish.decoded_eot,
-            run.semantic_stop.is_some(),
-        );
-        let finish_reason = if hit_length_cap {
-            "length"
-        } else if !emit_tool_calls.is_empty() {
-            "tool_calls"
-        } else {
-            "stop"
-        };
-        // Prefer held finish ToolCalls when present; whole-output extract is fallback.
-        let wire_calls = {
-            let held = finish_summary_held_tool_calls(&run.finish);
-            if !held.is_empty() {
-                held
-            } else {
-                emit_tool_calls
-            }
-        };
-        let mut pending_done = serde_json::json!({
-            "type": "done",
-            "id": id,
-            "tokens": run.generated,
-            "tok_s": (tok_s * 10.0).round() / 10.0,
-            "prefill_tokens": run.prefill_tokens_len,
-            "prefill_ms": ((run.prefill_s * 1000.0) * 10.0).round() / 10.0,
-            "prefill_tok_s": (prefill_tok_s * 10.0).round() / 10.0,
-            "decode_tok_s": (decode_tok_s * 10.0).round() / 10.0,
-            "ttft_ms": ((run.prefill_s * 1000.0) * 10.0).round() / 10.0,
-            "dflash": true,
-            "tau": (tau * 100.0).round() / 100.0,
-            "cycles": run.spec_cycles,
-            "cached_tokens": cached_tokens_dflash,
-            "finish_reason": finish_reason,
-            "attempt_id": active_attempt_id(),
-        });
-        if !pflash_done_field.is_empty() {
-            let padded = format!("{{{}}}", pflash_done_field.trim_start_matches(','));
-            if let Ok(serde_json::Value::Object(map)) =
-                serde_json::from_str::<serde_json::Value>(&padded)
-            {
-                for (k, v) in map {
-                    pending_done[k] = v;
-                }
-            }
-        }
-        stage_terminal_tool_calls(&mut pending_done, finish_reason, &wire_calls);
-        let decision = await_client_terminal_commit(stdout, id, &pending_done);
-        let intended_release = finish_reason == "tool_calls" && !wire_calls.is_empty();
-        let intended_store = !hit_length_cap && !cached_seq.is_empty();
-        let effects = qwen_client_commit_effects(decision, intended_release, intended_store);
-        if !effects.emit_done {
-            let ep = production_fail_closed_rollback(m, gpu, None, None);
-            emit_spec_cancel_after_rollback(stdout, id, run.generated, &ep);
-            return true;
-        }
-        // Safe stop/tool_calls only — length never stores; Abort suppressed above.
-        if effects.store_cache {
-            let stripped = strip_think_for_fingerprint(&decoded_full);
-            let emit_text =
-                hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned();
-            let fp = asst_turn_fingerprint(&emit_text, &wire_calls);
-            if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
-                eprintln!(
-                    "[qwen-cache store dflash] fp={:#018x} cached_seq={} emit_text.len={} tool_calls={} preview={:?}",
-                    fp, cached_seq.len(), emit_text.len(), wire_calls.len(),
-                    emit_text.chars().take(60).collect::<String>(),
-                );
-            }
-            m.asst_turn_cache.insert(
-                fp,
-                hipfire_runtime::prompt_frame::CachedAssistantTurn {
-                    reasoning: None,
-                    tools: Vec::new(),
-                    content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
-                        token_ids: cached_seq,
-                        text: String::new(),
-                    }),
-                },
-            );
-        }
-        emit_staged_terminal_done(stdout, &pending_done);
-    }
-    let _ = stdout.flush();
-    // Per-request debug summary (stderr → serve.log): active drafter, τ, tok/s.
-    let drafter = m.speculator.as_ref().map(|s| s.name()).unwrap_or("none");
-    eprintln!(
-        "[req {id}] drafter={drafter} tau={tau:.2} tok/s={decode_tok_s:.1} decode ({} tok, {} windows)",
-        run.generated, run.spec_cycles
-    );
-    true
-}
-
-/// Arch-generic spec-decode core extracted from `generate_dflash` (Phase 4 T4a).
-/// Drives any `Speculator` (`m.speculator`) + `SpecTarget` (via `spec_target_guard`)
-/// + `SpecEmit` through one prefill → accept-window loop → bake → done. The caller
-/// (`generate_dflash` for qwen35/llama today) prepares the arch-specific inputs:
-/// the already-rendered `prompt_tokens`, the LCP cache decision
-/// (`prefill_tokens`/`prefill_start`/`cache_hit`/`resume_from`), and the emitter
-/// recipe (`EmitSpec`). It returns a [`SpecRun`] summary from which the wrapper
-/// writes its arch-specific `done` envelope + cache store; `None` on the
-/// abort/error early-exits (which already wrote their own done/error).
-/// T4c-2 adds the deepseek4 wrapper + `EmitSpec::Deepseek4` variant.
-#[allow(clippy::too_many_arguments)]
-fn generate_spec(
-    m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
-    stdout: &mut std::io::Stdout,
-    id: &str,
-    prompt_tokens: Vec<u32>,
-    prefill_tokens: Vec<u32>,
-    prefill_start: usize,
-    cache_hit: bool,
-    resume_from: Option<usize>,
-    max_tokens: usize,
-    emit_req: SpecEmitRequest,
-    // Request sampling temperature. >0 only reaches here for speculators that
-    // report `supports_temp_verify()` (qwen35 DFlash ddtree → SWOR); greedy
-    // drafters ignore it. The daemon's routing gate enforces that invariant.
-    temp: f32,
-) -> Option<SpecRun> {
-    // Zero-budget reject: no first token, no prefill/GPU/state/client mutation.
-    // Correlated validation error only — wrapper sees None and skips done/cache.
-    if max_tokens == 0 {
-        emit_active_attempt_error(
-            stdout,
-            Some(id),
-            "max_tokens must be > 0",
-            "validation",
-            false,
-            false,
-        );
-        let _ = stdout.flush();
-        return None;
-    }
-
-    // Adaptive KV has no maybe_downshift on the generic spec path. Fail closed
-    // rather than run unsupported speculation past floor-reserved capacity.
-    if m.kv_adaptive.is_some() {
-        emit_active_attempt_error(
-            stdout,
-            Some(id),
-            "kv_adaptive cannot use generic speculative decode (DFlash/DSpark/n-gram); use AR or native MTP",
-            "validation",
-            false,
-            false
-        );
-        let _ = stdout.flush();
-        return None;
-    }
-
-    let tokenizer = m.tokenizer.as_ref().unwrap();
-
-    // Acquire the target via the RAII slot guard — it restores the bundle into
-    // m.state on EVERY exit path (return, `?`, panic), which structurally
-    // eliminates the eight hand-written reconstruction sites that were the
-    // #462 cross-request state-bleed class. `m.speculator`, `m.state`,
-    // `m.seq_pos`, `m.conversation_tokens` and `m.eviction` are disjoint fields,
-    // so the guard, the speculator borrow, and the bookkeeping below coexist.
-    let (block_size, ctx_capacity) = match m.speculator.as_ref() {
-        Some(s) => (s.block_size(), s.ctx_capacity()),
-        None => {
-            emit_active_attempt_error(
-                stdout,
-                Some(id),
-                "dflash path entered without a loaded speculator",
-                "validation",
-                false,
-                false,
-            );
-            let _ = stdout.flush();
-            return None;
-        }
-    };
-    // Resolve the arch's carrier once — the single dispatch the spec path routes
-    // through for BOTH the target borrow and the emitter (the daemon never
-    // arch-matches for spec-decode). `&'static dyn Carrier` borrows nothing from
-    // `m`, so it coexists with the `tokenizer`/`&mut m.state` borrows below.
-    let arch_id = m.arch_id;
-    let carrier = match hipfire_loader::carrier_for(arch_id) {
-        Some(c) => c,
-        None => {
-            emit_active_attempt_error(
-                stdout,
-                Some(id),
-                &format!("no carrier for arch_id {}", arch_id),
-                "validation",
-                false,
-                false,
-            );
-            let _ = stdout.flush();
-            return None;
-        }
-    };
-    // Arch-dispatched target borrow via `Carrier::spec_target_guard()`
-    // (`m.model_path` is a disjoint field → no borrow conflict with the
-    // `&mut m.state` the guard takes). qwen35 moves the bundle out + reopens its
-    // HfqFile (restored on Drop); the pure-attention arms borrow in place. The
-    // boxed `SpecTargetGuard` yields `&mut dyn SpecTarget` either way.
-    let mut guard = match carrier.spec_target_guard(&mut m.state, &m.model_path) {
-        Ok(g) => g,
-        Err(e) => {
-            emit_active_attempt_error(
-                stdout,
-                Some(id),
-                &format!("{}", e),
-                "validation",
-                false,
-                false,
-            );
-            let _ = stdout.flush();
-            return None;
-        }
-    };
-    let spec = m.speculator.as_mut().unwrap();
-
-    // Divergent-render RESUME: restore the drafter-local + target recurrent
-    // state to the latest checkpoint ≤ ckpt and drop the now-stale tail of the
-    // checkpoint ring (`rewind_to` does both), then rewind the daemon's seq_pos
-    // / conversation_tokens. The turn then proceeds exactly like a HIT with
-    // start_pos == ckpt (the cache plan already set cache_hit=true).
-    if let Some(ckpt) = resume_from {
-        let slot = match guard.slot() {
-            Ok(s) => s,
-            Err(e) => {
-                emit_active_attempt_error(
-                    stdout,
-                    Some(id),
-                    &format!("{}", e),
-                    "validation",
-                    false,
-                    false,
-                );
-                let _ = stdout.flush();
-                return None;
-            }
-        };
-        if let Err(e) = spec.rewind_to(gpu, slot, ckpt) {
-            // Partial GPU restore must not continue with host checkpoint
-            // coordinates. Fail-closed: live rollback + one correlated error.
-            let msg = format!("rewind_to: {e}");
-            let ep = production_fail_closed_rollback_live(
-                &mut m.seq_pos,
-                &mut m.conversation_tokens,
-                &mut m.prefill_checkpoints,
-                &mut m.dflash_checkpoints,
-                &mut m.asst_turn_cache,
-                gpu,
-                slot,
-                spec.as_mut(),
-            );
-            emit_fail_closed_error(stdout, Some(id), &msg, "validation", false, &ep);
-            return None;
-        }
-        m.seq_pos = ckpt;
-        m.conversation_tokens.truncate(ckpt);
-    }
-
-    if !cache_hit {
-        // Fresh target state — full prefill from position 0. The DeltaNet
-        // recurrent state is zeroed by the prefill seed itself
-        // (`seed_target_hidden_from_prompt_abortable` calls `target.reset_state`,
-        // which also zeroes s_ef_residual — more complete than the memset loop
-        // the old inline path ran here), so only the daemon-side position
-        // bookkeeping remains.
-        m.seq_pos = 0;
-        m.conversation_tokens.clear();
-    } else if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
-        eprintln!(
-            "[qwen-cache HIT dflash] reuse prefix={} suffix={} (no reset)",
-            prefill_start,
-            prefill_tokens.len()
-        );
-    }
-
-    let t0 = Instant::now();
-    // Capacity checks. With eviction enabled the advertised context window is
-    // effectively unbounded (eviction fires between spec cycles), but the
-    // *prompt* must still fit in one physical_cap span because the prompt seed
-    // writes it per-token without chunking. Error returns just `return` — the
-    // slot guard restores the bundle into m.state on the way out.
-    let eff_prompt_cap = if m.eviction.is_some() {
-        m.physical_cap
-    } else {
-        ctx_capacity
-    };
-    if prompt_tokens.len().saturating_add(block_size) > eff_prompt_cap {
-        emit_active_attempt_error(
-            stdout,
-            Some(id),
-            &format!(
-                "prompt+block_size exceeds {} {} (eviction {})",
-                if m.eviction.is_some() {
-                    "physical_cap"
-                } else {
-                    "ctx_capacity"
-                },
-                eff_prompt_cap,
-                if m.eviction.is_some() { "on" } else { "off" },
-            ),
-            "validation",
-            false,
-            false,
-        );
-        let _ = stdout.flush();
-        return None;
-    }
-    if m.eviction.is_none()
-        && prompt_tokens
-            .len()
-            .saturating_add(max_tokens)
-            .saturating_add(block_size)
-            > ctx_capacity
-    {
-        emit_active_attempt_error(
-            stdout,
-            Some(id),
-            &format!(
-                "prompt+max_tokens exceeds ctx_capacity {} (enable cask_sidecar for long decode)",
-                ctx_capacity,
-            ),
-            "context_length",
-            false,
-            false,
-        );
-        let _ = stdout.flush();
-        return None;
-    }
-
-    // Prefill: the speculator seeds the target's hidden state (advancing its KV
-    // + recurrent state), primes the drafter's cached target-hidden, snapshots
-    // the divergent-render checkpoint ring, and returns the target's first
-    // token. On a cache hit only the suffix is seeded; on a miss the seed
-    // self-resets target state and the full prompt is seeded. Client cancel is
-    // surfaced as `PrefillOutcome::Aborted`.
-    let id_for_abort = id.to_string();
-    let slot = match guard.slot() {
-        Ok(s) => s,
-        Err(e) => {
-            emit_active_attempt_error(
-                stdout,
-                Some(id),
-                &format!("{}", e),
-                "validation",
-                false,
-                false,
-            );
-            let _ = stdout.flush();
-            return None;
-        }
-    };
-    let prefill_outcome = spec.prefill(
-        gpu,
-        slot,
-        &prompt_tokens,
-        &prefill_tokens,
-        prefill_start,
-        cache_hit,
-        resume_from,
-        &|| check_abort(&id_for_abort),
-    );
-    let first_token = match prefill_outcome {
-        Ok(PrefillOutcome::Ready { first_token }) => first_token,
-        Ok(PrefillOutcome::Aborted) => {
-            // Fail-closed cancel: reset+sync first; terminal follows attestation.
-            let ep = production_fail_closed_rollback_live(
-                &mut m.seq_pos,
-                &mut m.conversation_tokens,
-                &mut m.prefill_checkpoints,
-                &mut m.dflash_checkpoints,
-                &mut m.asst_turn_cache,
-                gpu,
-                slot,
-                spec.as_mut(),
-            );
-            emit_spec_cancel_after_rollback(stdout, id, 0, &ep);
-            return None;
-        }
-        Err(e) => {
-            let msg = format!("prefill: {}", e);
-            let ep = production_fail_closed_rollback_live(
-                &mut m.seq_pos,
-                &mut m.conversation_tokens,
-                &mut m.prefill_checkpoints,
-                &mut m.dflash_checkpoints,
-                &mut m.asst_turn_cache,
-                gpu,
-                slot,
-                spec.as_mut(),
-            );
-            emit_fail_closed_error(stdout, Some(id), &msg, "validation", false, &ep);
-            return None;
-        }
-    };
-
-    // serve-fault-inject: fire after prefill mutated GPU/KV/recurrent and
-    // before first_token begin / any visible event. Host fields only —
-    // guard holds m.state; spec holds m.speculator.
-    #[cfg(feature = "serve-fault-inject")]
-    if maybe_inject_fault_after_prefill_dflash(
-        arch_id,
-        &mut m.seq_pos,
-        &mut m.conversation_tokens,
-        &mut m.prefill_checkpoints,
-        &mut m.dflash_checkpoints,
-        &mut m.asst_turn_cache,
-        gpu,
-        stdout,
-        id,
-        slot,
-        spec.as_mut(),
-    ) {
-        drop(guard);
-        return None;
-    }
-
-    let t_prefill = Instant::now();
-
-    // Per-token emission (EosFilter byte stream + grammar + think force-close +
-    // stop-sequence match) lives behind the arch-generic `SpecEmit` seam. The
-    // emitter is built HERE (not by the caller) because it needs `slot.eos_token()`
-    // (only available after the slot guard) AND borrows the tokenizer (derived
-    // from `m`). The wrapper supplies the model-independent recipe as an owned
-    // `SpecEmitRequest`; the arch's carrier turns it into the concrete
-    // `Box<dyn SpecEmit>` (extracting its own grammar schema from `tools`).
-    let emit_ctx = hipfire_runtime::spec::SpecEmitCtx {
-        tokenizer,
-        eos: slot.eos_token(),
-        im_end: emit_req.im_end,
-        tools: emit_req.tools.as_deref(),
-        stop: emit_req.stop,
-        max_think: emit_req.max_think,
-        max_tokens,
-        assistant_prefix: emit_req.assistant_prefix,
-        think_mode: emit_req.think_mode,
-        decoded_vocab: emit_req.decoded_vocab,
-    };
-    let mut emit: Box<dyn SpecEmit> = match carrier.make_spec_emitter(emit_ctx) {
-        Ok(e) => e,
-        Err(e) => {
-            emit_active_attempt_error(
-                stdout,
-                Some(id),
-                &format!("{}", e),
-                "validation",
-                false,
-                false,
-            );
-            let _ = stdout.flush();
-            return None;
-        }
-    };
-
-    // Decode loop — spec.step returns one acceptance window (SpecStep) per cycle.
-    // `emitted` is the speculator's repeat / n-gram context (NOT emission state);
-    // it stays in the loop and excludes any grammar-rejected token.
-    // `raw_decode` is every position-advancing token after the prefill seed
-    // (includes empty-event EOS observes). Used for mid-window prefix realign
-    // so GPU state is replayed from the exact raw consumed sequence.
-    // State-committable decode tokens only (excludes DS4 empty-event EOS).
-    // Prefill first_token is pushed after `begin` if its outcome is event-bearing.
-    let mut emitted: Vec<u32> = Vec::new();
-    let mut raw_decode: Vec<u32> = Vec::new();
-    let mut position = prompt_tokens.len();
-    let mut seed_token = first_token;
-    // τ accounting, inlined from the unified `SpecStep` (the old `SpecStats`
-    // type took the arch-specific `SpecStepResult`, which the daemon no longer
-    // sees): τ = accepted drafts / cycle.
-    let mut spec_cycles = 0usize;
-    let mut spec_accepted = 0usize;
-    let mut generated = 0usize;
-
-    // Post-prefill compaction (FlashCASK pattern from dflash_spec_demo).
-    // If the prompt already filled past budget+beta, compact once before
-    // entering the spec loop so the first spec step writes at physical slot
-    // `budget`. compact_offset is maintained on slot.kv_cache; subsequent
-    // forwards inside the speculator read it for RoPE phase automatically. The
-    // drafter-local hidden cache is compacted to match via `on_evict`.
-    if let Some(ref ev) = m.eviction {
-        // Eviction is only ever configured for KvCache-backed arches
-        // (qwen35/llama); a `Qwen2State`-backed target never reaches here.
-        // Missing optional hook is an ordinary fail-closed error (no panic).
-        // Keep the kv borrow inside maybe_evict so rollback can reborrow `slot`.
-        let evict_outcome = match slot.kv_cache_mut() {
-            Some(kv) => ev.maybe_evict(gpu, kv, position),
-            None => {
-                let _ = classify_evict_failure_wire();
-                let ep = production_fail_closed_rollback_live(
-                    &mut m.seq_pos,
-                    &mut m.conversation_tokens,
-                    &mut m.prefill_checkpoints,
-                    &mut m.dflash_checkpoints,
-                    &mut m.asst_turn_cache,
-                    gpu,
-                    slot,
-                    spec.as_mut(),
-                );
-                emit_fail_closed_error(
-                    stdout,
-                    Some(id),
-                    "kv_cache_mut missing (post-prefill)",
-                    "validation",
-                    false,
-                    &ep,
-                );
-                drop(guard);
-                return None;
-            }
-        };
-        match evict_outcome {
-            Ok(Some(res)) => {
-                let pre_phys = position;
-                let compact_offset = slot.kv_cache_mut().map(|kv| kv.compact_offset).unwrap_or(0);
-                eprintln!(
-                    "[dflash] post-prefill evict: {} -> {} (compact_offset={})",
-                    pre_phys, res.new_physical, compact_offset,
-                );
-                position = res.new_physical;
-                if !res.retain_mask.is_empty() {
-                    if let Err(e) = spec.on_evict(
-                        gpu,
-                        &EvictRetain {
-                            retain_mask: res.retain_mask,
-                            pre_phys,
-                        },
-                    ) {
-                        let _ = classify_evict_failure_wire();
-                        let ep = production_fail_closed_rollback_live(
-                            &mut m.seq_pos,
-                            &mut m.conversation_tokens,
-                            &mut m.prefill_checkpoints,
-                            &mut m.dflash_checkpoints,
-                            &mut m.asst_turn_cache,
-                            gpu,
-                            slot,
-                            spec.as_mut(),
-                        );
-                        emit_fail_closed_error(
-                            stdout,
-                            Some(id),
-                            &format!("on_evict (post-prefill): {e}"),
-                            "validation",
-                            false,
-                            &ep,
-                        );
-                        drop(guard);
-                        return None;
-                    }
-                }
-            }
-            Ok(None) => {}
-            Err(e) => {
-                let _ = classify_evict_failure_wire();
-                let ep = production_fail_closed_rollback_live(
-                    &mut m.seq_pos,
-                    &mut m.conversation_tokens,
-                    &mut m.prefill_checkpoints,
-                    &mut m.dflash_checkpoints,
-                    &mut m.asst_turn_cache,
-                    gpu,
-                    slot,
-                    spec.as_mut(),
-                );
-                emit_fail_closed_error(
-                    stdout,
-                    Some(id),
-                    &format!("maybe_evict (post-prefill): {e}"),
-                    "validation",
-                    false,
-                    &ep,
-                );
-                drop(guard);
-                return None;
-            }
-        }
-    }
-
-    // Emit the first token immediately so TTFT is the prefill time. `begin`
-    // pushes + filters it, seeds the grammar matcher, and reports whether the
-    // first token is itself a terminator (→ skip the spec loop entirely, so
-    // spec_step_dflash never drafts a whole block seeded on a terminal token).
-    let first_begin = emit.begin(first_token);
-    render_client_events(
-        stdout,
-        id,
-        &first_begin.events,
-        t0.elapsed().as_millis() as u64,
-        false,
-    );
-
-    // Count/bake the first token only when the emitter emitted it (same guard
-    // as the accept loop). qwen35 always emits a `Committed`; the ds4 emitter
-    // returns no events for an EOS-first prefill argmax — leave history at the
-    // prompt and mark the pending seed non-committable so terminal flush skips.
-    let mut pending_seed_committable = spec_outcome_seed_committable(&first_begin);
-    if pending_seed_committable {
-        emitted.push(first_token);
-        generated += 1;
-    }
-    let mut first_token_is_eos = first_begin.stop.is_some();
-    // Sticky semantic terminal from begin (StopSequence/EOS/ThinkCap). Carried
-    // on SpecRun so wrappers classify stop/tool_calls over pure length when
-    // generated == max_tokens (e.g. max_tokens=1 first-token user stop).
-    let mut semantic_stop: Option<StopReason> = if spec_stop_is_semantic(first_begin.stop) {
-        first_begin.stop
-    } else {
-        None
-    };
-
-    // Begin-triggered forced continuation (e.g. think-budget force-close on the
-    // prefill first token). Must run before any speculative `spec.step` so
-    // max_tokens=1 cannot spend its remaining budget on an extra model step.
-    // Shares [`apply_spec_forced_pending_seed`] with the mid-window path.
-    // Runs after first-seed emitted/pending_seed_committable init (DS4 empty-EOS).
-    // Stopped also skips every subsequent speculative step.
-    {
-        let forced_begin = emit.take_forced();
-        if !forced_begin.is_empty() {
-            match apply_spec_forced_pending_seed(
-                &forced_begin,
-                &mut generated,
-                max_tokens,
-                &mut seed_token,
-                &mut position,
-                &mut raw_decode,
-                &mut emitted,
-                &mut pending_seed_committable,
-                emit.as_mut(),
-                gpu,
-                slot,
-                spec.as_mut(),
-                stdout,
-                id,
-                t0,
-                &mut m.seq_pos,
-                &mut m.conversation_tokens,
-                &mut m.prefill_checkpoints,
-                &mut m.dflash_checkpoints,
-                &mut m.asst_turn_cache,
-                m.physical_cap,
-                m.eviction.as_ref(),
-            ) {
-                SpecForcedApplyResult::Terminal => {
-                    drop(guard);
-                    return None;
-                }
-                SpecForcedApplyResult::Stopped(reason) => {
-                    // Forced stop terminates the turn: no later force, no spec.step.
-                    if semantic_stop.is_none() && spec_stop_is_semantic(Some(reason)) {
-                        semantic_stop = Some(reason);
-                    }
-                    first_token_is_eos = true;
-                }
-                SpecForcedApplyResult::Applied | SpecForcedApplyResult::Skipped => {}
-            }
-        }
-    }
-
-    // (The DFlash RNG cell and the chain-vs-tree resolution that used to live
-    // here are now resolved once at build time and
-    // owned inside the speculator — see `build_dflash_speculator`.)
-
-    // Fast path exit conditions (mirrors the dflash_spec_demo outer loop).
-    // `!first_token_is_eos` short-circuits the entire spec loop when the prefill's
-    // first sampled token was already a terminator (see the guard above).
-    while !first_token_is_eos && generated < max_tokens {
-        // Decode-side abort (dflash path). See the matching block in
-        // `generate()` for rationale. Without this, a Pi cancel
-        // mid-decode leaves the spec-decode loop running for max_tokens
-        // worth of wasted work.
-        if check_abort(id) {
-            // Mid-decode cancel: reset+sync first; terminal follows attestation.
-            let ep = production_fail_closed_rollback_live(
-                &mut m.seq_pos,
-                &mut m.conversation_tokens,
-                &mut m.prefill_checkpoints,
-                &mut m.dflash_checkpoints,
-                &mut m.asst_turn_cache,
-                gpu,
-                slot,
-                spec.as_mut(),
-            );
-            emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
-            return None;
-        }
-        if position.saturating_add(block_size) >= ctx_capacity {
-            break;
-        }
-
-        // One acceptance window. The speculator owns chain-vs-tree dispatch
-        // internally; the daemon just hands it the borrowed target and
-        // the prior committed tokens (drafter repeat / n-gram context). The
-        // in-step grammar mask comes from the emitter: qwen35 returns `None`
-        // (post-hoc grammar in `observe`); a ds4 emitter returns its erased
-        // matcher so the fused step constrains drafts in-place. `emit.grammar()`'s
-        // borrow ends when `step` returns, before the per-token `emit.observe`.
-        let max_emit = max_tokens.saturating_sub(generated);
-        let step = match spec.step(
-            gpu,
-            slot,
-            position,
-            seed_token,
-            &emitted,
-            emit.grammar(),
-            temp,
-            max_emit,
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                // Authoritative failure: reset+sync first, then one correlated
-                // error; no finish/calls/cache/done (return None before epilogue).
-                let ep = production_fail_closed_rollback_live(
-                    &mut m.seq_pos,
-                    &mut m.conversation_tokens,
-                    &mut m.prefill_checkpoints,
-                    &mut m.dflash_checkpoints,
-                    &mut m.asst_turn_cache,
-                    gpu,
-                    slot,
-                    spec.as_mut(),
-                );
-                emit_spec_failure_terminal(stdout, id, "spec_step", &e.to_string(), &ep);
-                drop(guard);
-                return None;
-            }
-        };
-        spec_cycles += 1;
-        spec_accepted += step.accepted;
-        // `emit` is already the committed tail with the seed re-echo stripped.
-        let committed_tail: Vec<u32> = step.emit.to_vec();
-        // Absolute host cursor before this window's commit. Spec.step left
-        // target/drafter advanced over the FULL emit; semantic observe may
-        // stop on a strict prefix (EOT/stop/forced/budget) and must not keep
-        // the unobserved tail in host or GPU state.
-        let position_before = position;
-
-        let mut hit_eos = false;
-        let mut think_cap_hit = false;
-        let mut forced_after: Vec<u32> = Vec::new();
-        // Tokens of `committed_tail` the emitter actually observed (not
-        // grammar-rejected, not past max_tokens). May be a strict prefix.
-        let mut consumed = 0usize;
-        for &tok in &committed_tail {
-            if generated >= max_tokens {
-                break;
-            }
-            // `emit.observe` runs the per-token emission policy: grammar
-            // pre-check (reject → grammar violation, NO emit, post-loop forces a
-            // full KV/DN reset to clear the polluted slots spec_step wrote), then
-            // committed/token frames, EOS, user stop-sequence, and think
-            // force-close. Loop state (emitted/generated) stays here; position
-            // advances by `consumed` only after the loop (never by unobserved tail).
-            emit.set_generated_hint(generated);
-            let outcome = emit.observe(tok);
-            if outcome.stop == Some(StopReason::GrammarViolation) {
-                // Rejected before emit — not consumed, not added to the repeat
-                // context, not streamed, not counted. Treat as EOS for this turn.
-                render_client_events(
-                    stdout,
-                    id,
-                    &outcome.events,
-                    t0.elapsed().as_millis() as u64,
-                    false,
-                );
-                hit_eos = true;
-                break;
-            }
-            // Count/bake/render a committed token only when the emitter actually
-            // emitted it (non-empty events). qwen35 always emits a `Committed`
-            // event (even on EOS / held bytes), so this is a no-op there; the
-            // deepseek4 emitter returns NO events for an accepted EOS, so that
-            // terminator is neither counted into `generated` nor baked into
-            // `conversation_tokens` — byte-matching the bespoke ds4 loop (which
-            // broke on accepted-EOS before push/increment). Track whether the
-            // observed token is state-committable: it becomes the window's
-            // pending seed (bonus / last consumed), so empty-event EOS must not
-            // terminal-flush or history-bake.
-            pending_seed_committable = spec_outcome_seed_committable(&outcome);
-            if pending_seed_committable {
-                emitted.push(tok);
-                render_client_events(
-                    stdout,
-                    id,
-                    &outcome.events,
-                    t0.elapsed().as_millis() as u64,
-                    false,
-                );
-                generated += 1;
-            }
-            // Observed (including empty-event EOS): counts toward the consumed
-            // prefix and the position-advancing raw decode log.
-            consumed += 1;
-            raw_decode.push(tok);
-            // Generation-intervention hook: the emitter may request tokens to
-            // FORCE after this one, suppressing the step's terminator (cohere2moe
-            // empty-turn guard / think-budget force-close). Default empty for
-            // every other emitter ⇒ this branch never taken, loop byte-identical.
-            // Forced advance runs only after host/GPU are aligned to the consumed
-            // prefix (never from an ahead-of-history full-window cursor).
-            let forced = emit.take_forced();
-            if !forced.is_empty() {
-                forced_after = forced;
-                break;
-            }
-            match outcome.stop {
-                Some(StopReason::Eos) | Some(StopReason::StopSequence) => {
-                    if semantic_stop.is_none() {
-                        semantic_stop = outcome.stop;
-                    }
-                    hit_eos = true;
-                    break;
-                }
-                Some(StopReason::ThinkCap) => {
-                    if semantic_stop.is_none() {
-                        semantic_stop = outcome.stop;
-                    }
-                    think_cap_hit = true;
-                    break;
-                }
-                Some(StopReason::GrammarViolation) => unreachable!("handled above"),
-                None => {}
-            }
-        }
-        // Host cursor: advance by the observed prefix only (C8 pure helper).
-        // Inline emitted/generated already reflect event-nonempty tokens; the
-        // helper is authoritative for position + next seed from `consumed`.
-        // When consumed==0 the helper falls back to step.next_seed — override
-        // with the pre-window seed so we never install an unobserved bonus.
-        let host = spec_host_advance_after_step(
-            position_before,
-            0,
-            Vec::new(),
-            &committed_tail,
-            step.next_seed,
-            consumed,
-        );
-        position = host.position;
-        seed_token = if consumed == 0 {
-            // No new decode tokens observed (budget/grammar before first tok).
-            raw_decode.last().copied().unwrap_or(first_token)
-        } else {
-            host.seed_token
-        };
-
-        // Strict-prefix semantic stop: drop unobserved speculative tail from
-        // target + drafter via conservative reset + production prefill of the
-        // exact KV-resident prefix (`spec_prefix_realign_plan`). Full-window
-        // observe keeps the step's already-committed GPU state.
-        //
-        // Capacity-aware: admit BEFORE reset/prefill. Realign is full-history
-        // replay after reset (compact_offset cleared) — never overrun
-        // physical_cap/ctx_capacity and never silently reconstruct compacted
-        // state from an invalid oversize history. Abort/prefill errors share
-        // the single fail-closed terminal (no second done/error).
-        let keep = consumed.min(committed_tail.len());
-        if keep < committed_tail.len() {
-            let plan = spec_prefix_realign_plan(&prompt_tokens, first_token, &raw_decode);
-            let compact_offset = slot.kv_cache_mut().map(|kv| kv.compact_offset).unwrap_or(0);
-            if let Err(msg) = spec_prefix_realign_admit(
-                &plan,
-                m.physical_cap,
-                ctx_capacity,
-                compact_offset,
-                m.eviction.is_some(),
-            ) {
-                let ep = production_fail_closed_rollback_live(
-                    &mut m.seq_pos,
-                    &mut m.conversation_tokens,
-                    &mut m.prefill_checkpoints,
-                    &mut m.dflash_checkpoints,
-                    &mut m.asst_turn_cache,
-                    gpu,
-                    slot,
-                    spec.as_mut(),
-                );
-                emit_fail_closed_error(stdout, Some(id), &msg, "validation", false, &ep);
-                drop(guard);
-                return None;
-            }
-            let reset_error = slot
-                .reset_recurrent(gpu)
-                .err()
-                .map(|e| format!("reset_recurrent: {e}"))
-                .or_else(|| spec.reset(gpu).err().map(|e| format!("spec.reset: {e}")));
-            if let Some(msg) = reset_error {
-                let ep = production_fail_closed_rollback_live(
-                    &mut m.seq_pos,
-                    &mut m.conversation_tokens,
-                    &mut m.prefill_checkpoints,
-                    &mut m.dflash_checkpoints,
-                    &mut m.asst_turn_cache,
-                    gpu,
-                    slot,
-                    spec.as_mut(),
-                );
-                emit_fail_closed_error(
-                    stdout,
-                    Some(id),
-                    &format!("prefix realign reset failed: {msg}"),
-                    "gpu",
-                    true,
-                    &ep,
-                );
-                drop(guard);
-                return None;
-            }
-            let id_for_realign = id.to_string();
-            let realign = spec.prefill(
-                gpu,
-                slot,
-                &plan.replay,
-                &plan.replay,
-                0,
-                false,
-                None,
-                &|| check_abort(&id_for_realign),
-            );
-            match realign {
-                Ok(PrefillOutcome::Ready { first_token: _ }) => {
-                    // Prefill argmax is NOT history — host seed/position follow
-                    // the pure plan (processed prefix + unwritten pending seed).
-                    debug_assert_eq!(plan.replay.len(), plan.position);
-                    position = plan.position;
-                    seed_token = plan.seed_token;
-                }
-                Ok(PrefillOutcome::Aborted) => {
-                    // One cancel terminal only — classified by rollback attestation.
-                    let ep = production_fail_closed_rollback_live(
-                        &mut m.seq_pos,
-                        &mut m.conversation_tokens,
-                        &mut m.prefill_checkpoints,
-                        &mut m.dflash_checkpoints,
-                        &mut m.asst_turn_cache,
-                        gpu,
-                        slot,
-                        spec.as_mut(),
-                    );
-                    emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
-                    return None;
-                }
-                Err(e) => {
-                    let msg = format!("spec_prefix_realign: {e}");
-                    let ep = production_fail_closed_rollback_live(
-                        &mut m.seq_pos,
-                        &mut m.conversation_tokens,
-                        &mut m.prefill_checkpoints,
-                        &mut m.dflash_checkpoints,
-                        &mut m.asst_turn_cache,
-                        gpu,
-                        slot,
-                        spec.as_mut(),
-                    );
-                    emit_fail_closed_error(stdout, Some(id), &msg, "validation", false, &ep);
-                    drop(guard);
-                    return None;
-                }
-            }
-        }
-
-        // Forced-token injection (cohere2moe generation guards; no-op for every
-        // other emitter — `take_forced` defaulted empty). Host/GPU are aligned
-        // to the observed prefix (full window or realigned strict prefix).
-        //
-        // Pending-seed transaction via shared [`apply_spec_forced_pending_seed`]
-        // (same path as begin-triggered force): hard budget clip, stop-prefix
-        // stage/observe before GPU, trigger retained when committable, last
-        // forced pending once, abort latch + exclusive terminal,
-        // pending_seed_committable from each forced observe. Stopped returns
-        // the terminal cause so we break without further force or spec.step.
-        // Bounded by the emitter's re-entry guard (e.g. MAX_EOS_SUPPRESS).
-        if !forced_after.is_empty() {
-            let forced_all = std::mem::take(&mut forced_after);
-            match apply_spec_forced_pending_seed(
-                &forced_all,
-                &mut generated,
-                max_tokens,
-                &mut seed_token,
-                &mut position,
-                &mut raw_decode,
-                &mut emitted,
-                &mut pending_seed_committable,
-                emit.as_mut(),
-                gpu,
-                slot,
-                spec.as_mut(),
-                stdout,
-                id,
-                t0,
-                &mut m.seq_pos,
-                &mut m.conversation_tokens,
-                &mut m.prefill_checkpoints,
-                &mut m.dflash_checkpoints,
-                &mut m.asst_turn_cache,
-                m.physical_cap,
-                m.eviction.as_ref(),
-            ) {
-                SpecForcedApplyResult::Terminal => {
-                    drop(guard);
-                    return None;
-                }
-                SpecForcedApplyResult::Stopped(reason) => {
-                    if semantic_stop.is_none() && spec_stop_is_semantic(Some(reason)) {
-                        semantic_stop = Some(reason);
-                    }
-                    match reason {
-                        StopReason::ThinkCap => think_cap_hit = true,
-                        StopReason::Eos
-                        | StopReason::StopSequence
-                        | StopReason::GrammarViolation => hit_eos = true,
-                    }
-                }
-                SpecForcedApplyResult::Applied | SpecForcedApplyResult::Skipped => {}
-            }
-        }
-        // Per-cycle eviction (FlashCASK). Fires whenever current physical
-        // has grown to budget+β since the last compaction. No-op when
-        // physical < budget+β, so non-firing cycles pay only the check cost.
-        if let Some(ref ev) = m.eviction {
-            // Eviction ⇒ KvCache-backed target (qwen35/llama); never qwen2.
-            // Missing optional hook is an ordinary fail-closed error (no panic).
-            // Keep the kv borrow inside maybe_evict so rollback can reborrow `slot`.
-            let evict_outcome = match slot.kv_cache_mut() {
-                Some(kv) => ev.maybe_evict(gpu, kv, position),
-                None => {
-                    let _ = classify_evict_failure_wire();
-                    let ep = production_fail_closed_rollback_live(
-                        &mut m.seq_pos,
-                        &mut m.conversation_tokens,
-                        &mut m.prefill_checkpoints,
-                        &mut m.dflash_checkpoints,
-                        &mut m.asst_turn_cache,
-                        gpu,
-                        slot,
-                        spec.as_mut(),
-                    );
-                    emit_fail_closed_error(
-                        stdout,
-                        Some(id),
-                        "kv_cache_mut missing (per-cycle)",
-                        "validation",
-                        false,
-                        &ep,
-                    );
-                    drop(guard);
-                    return None;
-                }
-            };
-            match evict_outcome {
-                Ok(Some(res)) => {
-                    let pre_phys = position;
-                    position = res.new_physical;
-                    if !res.retain_mask.is_empty() {
-                        if let Err(e) = spec.on_evict(
-                            gpu,
-                            &EvictRetain {
-                                retain_mask: res.retain_mask,
-                                pre_phys,
-                            },
-                        ) {
-                            let _ = classify_evict_failure_wire();
-                            let ep = production_fail_closed_rollback_live(
-                                &mut m.seq_pos,
-                                &mut m.conversation_tokens,
-                                &mut m.prefill_checkpoints,
-                                &mut m.dflash_checkpoints,
-                                &mut m.asst_turn_cache,
-                                gpu,
-                                slot,
-                                spec.as_mut(),
-                            );
-                            emit_fail_closed_error(
-                                stdout,
-                                Some(id),
-                                &format!("on_evict (per-cycle): {e}"),
-                                "validation",
-                                false,
-                                &ep,
-                            );
-                            drop(guard);
-                            return None;
-                        }
-                    }
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    let _ = classify_evict_failure_wire();
-                    let ep = production_fail_closed_rollback_live(
-                        &mut m.seq_pos,
-                        &mut m.conversation_tokens,
-                        &mut m.prefill_checkpoints,
-                        &mut m.dflash_checkpoints,
-                        &mut m.asst_turn_cache,
-                        gpu,
-                        slot,
-                        spec.as_mut(),
-                    );
-                    emit_fail_closed_error(
-                        stdout,
-                        Some(id),
-                        &format!("maybe_evict (per-cycle): {e}"),
-                        "validation",
-                        false,
-                        &ep,
-                    );
-                    drop(guard);
-                    return None;
-                }
-            }
-        }
-        if hit_eos || think_cap_hit {
-            break;
-        }
-    }
-
-    // Snapshot the emitter's state needed by the post-loop bookkeeping before
-    // the terminal `finish` consumes it: the full streamed-token stream (for the
-    // asst-turn cache) and whether a committed token tripped the grammar matcher.
-    let streamed_tokens = emit.streamed_tokens().to_vec();
-    let grammar_violated = emit.grammar_violated();
-
-    // Safe-terminal pending-seed flush: every normal exit leaves one unprocessed
-    // seed (see SpecPendingSeedTx). Forward it exactly once so KV/DeltaNet/
-    // drafter-hidden end on the same logical token as conversation history.
-    // Skip on grammar fail-closed (rollback wipes state) and when the pending
-    // seed is intentionally non-committable (DS4 empty-event EOS — position
-    // still reflects already-processed prior seeds/drafts; no GPU forward /
-    // history bake of the terminator). Cancel/error already returned above.
-    if spec_should_flush_pending_seed(grammar_violated, pending_seed_committable) {
-        let tx = spec_terminal_pending_seed_tx(seed_token);
-        if check_abort(id) {
-            let _ = classify_forced_gpu_advance(true);
-            let ep = production_fail_closed_rollback_live(
-                &mut m.seq_pos,
-                &mut m.conversation_tokens,
-                &mut m.prefill_checkpoints,
-                &mut m.dflash_checkpoints,
-                &mut m.asst_turn_cache,
-                gpu,
-                slot,
-                spec.as_mut(),
-            );
-            emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
-            drop(guard);
-            return None;
-        }
-        let abort_latched = std::cell::Cell::new(false);
-        let abort_cb = || {
-            if check_abort(id) {
-                abort_latched.set(true);
-                true
-            } else {
-                false
-            }
-        };
-        let flush_res = match spec.on_forced_advance(gpu, slot, &tx.commit, position, &abort_cb) {
-            Ok(true) => Ok(()),
-            Ok(false) => match slot.spec_advance(gpu, &tx.commit, position, false, &abort_cb, None)
-            {
-                Ok(SpecAdvance::Ready { .. }) => Ok(()),
-                Ok(SpecAdvance::Aborted) => {
-                    abort_latched.set(true);
-                    Ok(())
-                }
-                Err(e) => Err(e),
-            },
-            Err(e) => Err(e),
-        };
-        if let Err(e) = flush_res {
-            let ep = production_fail_closed_rollback_live(
-                &mut m.seq_pos,
-                &mut m.conversation_tokens,
-                &mut m.prefill_checkpoints,
-                &mut m.dflash_checkpoints,
-                &mut m.asst_turn_cache,
-                gpu,
-                slot,
-                spec.as_mut(),
-            );
-            emit_spec_failure_terminal(stdout, id, "forced", &e.to_string(), &ep);
-            drop(guard);
-            return None;
-        }
-        let abort_observed = abort_latched.get() || check_abort(id);
-        if matches!(
-            classify_forced_gpu_advance(abort_observed),
-            ForcedGpuAdvanceKind::Cancelled
-        ) {
-            let ep = production_fail_closed_rollback_live(
-                &mut m.seq_pos,
-                &mut m.conversation_tokens,
-                &mut m.prefill_checkpoints,
-                &mut m.dflash_checkpoints,
-                &mut m.asst_turn_cache,
-                gpu,
-                slot,
-                spec.as_mut(),
-            );
-            emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
-            drop(guard);
-            return None;
-        }
-        position = position.saturating_add(tx.position_delta);
-        // seed_token remains the flushed token; no further unprocessed seed.
-    }
-
-    m.seq_pos = position;
-    // Bake the FULL conversation (prefill + decode) into conversation_tokens
-    // so subsequent turns can compute LCP against it. Previously this stored
-    // only the decoded portion (`emitted`), making the next non-dflash turn
-    // full-reset because no system/user prefix was present.
-    // Host raw/conversation stay exact even when client events were held.
-    m.conversation_tokens = {
-        let mut v = Vec::with_capacity(prompt_tokens.len() + emitted.len());
-        v.extend_from_slice(&prompt_tokens);
-        v.extend_from_slice(&emitted);
-        v
-    };
-
-    // Grammar-violation cleanup: the speculator wrote KV + DN state for the
-    // rejected token(s) before the post-acceptance grammar check saw them.
-    // Those slots are now poisoned — force a full reset via the production
-    // epilogue so the wrapper can attest truthful `rolled_back`.
-    let mut fail_closed_rollback = None;
-    if grammar_violated {
-        eprintln!("[grammar-dflash] grammar violation — forcing full KV/DN reset for next turn");
-        fail_closed_rollback = Some(production_fail_closed_rollback_live(
-            &mut m.seq_pos,
-            &mut m.conversation_tokens,
-            &mut m.prefill_checkpoints,
-            &mut m.dflash_checkpoints,
-            &mut m.asst_turn_cache,
-            gpu,
-            slot,
-            spec.as_mut(),
-        ));
-    }
-
-    // Restore the target bundle into m.state via the slot guard's Drop, before
-    // the wrapper's end-of-turn cache bookkeeping (which no longer needs the slot).
-    drop(guard);
-
-    // Terminal `finish` flush — parses tool calls from the decoded text and
-    // renders the `tool_calls` ClientEvent. The arch-specific epilogue (the
-    // asst-turn cache store + the `done` envelope) is the WRAPPER's job: it
-    // differs per arch (qwen35: `dflash`/`tau`/`cycles` + ChatML token-replay
-    // cache; ds4: `spec_k`/`spec_windows`/`spec_accept_pct`), so this core
-    // returns a `SpecRun` summary instead of writing them itself.
-    let finish = emit.finish();
-    // Open-think / malformed finish reasons also need a truthful rollback when
-    // grammar did not already reset (state may still be baked).
-    if fail_closed_rollback.is_none()
-        && (finish.open_think
-            || finish.finish_reason == "open_think"
-            || finish.finish_reason == "malformed_protocol")
-    {
-        // Guard already dropped — reset via host-held bundle/speculator.
-        fail_closed_rollback = Some(production_fail_closed_rollback(m, gpu, None, None));
-    }
-    // Safe Done paths must not release held tool_calls events on fail-closed.
-    let release_events = fail_closed_rollback.is_none();
-    if release_events {
-        render_client_events(stdout, id, &finish.events, 0, true);
-    }
-
-    let t_end = Instant::now();
-    Some(SpecRun {
-        generated,
-        spec_cycles,
-        spec_accepted,
-        streamed_tokens,
-        prefill_tokens_len: prefill_tokens.len(),
-        finish,
-        grammar_violated,
-        semantic_stop,
-        fail_closed_rollback,
-        prefill_s: t_prefill.duration_since(t0).as_secs_f64(),
-        total_s: t_end.duration_since(t0).as_secs_f64(),
-        decode_s: t_end.duration_since(t_prefill).as_secs_f64(),
-    })
-}
-
-/// Wire `kind` for one successful MTP decode window. Classified from the route
-/// actually taken *before* the step (and before ngram acceptance can retire MTP).
-fn mtp_window_timing_kind(used_ngram: bool, mtp_ngram: bool, mtp_retired: bool) -> &'static str {
-    if used_ngram {
-        "ngram"
-    } else if mtp_ngram && mtp_retired {
-        "ar"
-    } else {
-        "mtp"
-    }
-}
-
-/// Build one `mtp_window_timings[]` record from already-measured microsecond deltas.
-/// Pure: no clocks or launch counters. Field names match the wire schema exactly.
-fn mtp_window_timing_record(
-    kind: &str,
-    wall_us: u64,
-    draft_lookup_us: u64,
-    launch_us: u64,
-    h2d_us: u64,
-    d2h_us: u64,
-    d2d_us: u64,
-    memset_us: u64,
-    stream_sync_us: u64,
-    event_sync_us: u64,
-    device_sync_us: u64,
-    graph_launch_us: u64,
-) -> serde_json::Value {
-    serde_json::json!({
-        "kind": kind,
-        "wall_us": wall_us,
-        "draft_lookup_us": draft_lookup_us,
-        "launch_us": launch_us,
-        "h2d_us": h2d_us,
-        "d2h_us": d2h_us,
-        "d2d_us": d2d_us,
-        "memset_us": memset_us,
-        "stream_sync_us": stream_sync_us,
-        "event_sync_us": event_sync_us,
-        "device_sync_us": device_sync_us,
-        "graph_launch_us": graph_launch_us,
-    })
-}
-
-/// Opt-in per-window HIP host/API snapshot. Constructed only when
-/// `HIPFIRE_HOST_TIMING=1`; the disabled path never reads clocks or counters.
-struct MtpWindowTimingSnap {
-    wall_start: Instant,
-    l_start: u64,
-    htod_start: u64,
-    dtoh_start: u64,
-    dtod_start: u64,
-    memset_start: u64,
-    ssync_start: u64,
-    esync_start: u64,
-    dsync_start: u64,
-    glaunch_start: u64,
-}
-
-impl MtpWindowTimingSnap {
-    fn take() -> Self {
-        use hip_bridge::launch_counters as lc;
-        Self {
-            wall_start: Instant::now(),
-            l_start: lc::launch_kernel::time_ns(),
-            htod_start: lc::memcpy_htod::time_ns(),
-            dtoh_start: lc::memcpy_dtoh::time_ns(),
-            dtod_start: lc::memcpy_dtod::time_ns(),
-            memset_start: lc::memset::time_ns(),
-            ssync_start: lc::stream_sync::time_ns(),
-            esync_start: lc::event_sync::time_ns(),
-            dsync_start: lc::device_sync::time_ns(),
-            glaunch_start: lc::graph_launch::time_ns(),
-        }
-    }
-
-    /// Consume the snapshot after a successful step into one ordered wire record.
-    fn into_record(self, kind: &str, draft_lookup_us: u64) -> serde_json::Value {
-        use hip_bridge::launch_counters as lc;
-        mtp_window_timing_record(
-            kind,
-            self.wall_start.elapsed().as_micros() as u64,
-            draft_lookup_us,
-            (lc::launch_kernel::time_ns() - self.l_start) / 1000,
-            (lc::memcpy_htod::time_ns() - self.htod_start) / 1000,
-            (lc::memcpy_dtoh::time_ns() - self.dtoh_start) / 1000,
-            (lc::memcpy_dtod::time_ns() - self.dtod_start) / 1000,
-            (lc::memset::time_ns() - self.memset_start) / 1000,
-            (lc::stream_sync::time_ns() - self.ssync_start) / 1000,
-            (lc::event_sync::time_ns() - self.esync_start) / 1000,
-            (lc::device_sync::time_ns() - self.dsync_start) / 1000,
-            (lc::graph_launch::time_ns() - self.glaunch_start) / 1000,
-        )
-    }
-}
-
-/// Attach `mtp_window_timings` to the staged `done` object only when host timing
-/// is enabled. Disabled path leaves the field absent (not null).
-fn attach_mtp_window_timings(
-    pending_done: &mut serde_json::Value,
-    host_timing: bool,
-    timings: Vec<serde_json::Value>,
-) {
-    if host_timing {
-        pending_done["mtp_window_timings"] = serde_json::Value::Array(timings);
-    }
-}
-
-/// Qwen3.5/3.6 native-MTP (NextN) speculative decode serve path.
-///
-/// Analog of [`generate_deepseek4`]'s spec branch and [`generate_dflash`], but
-/// drafts via the Qwen MTP head ([`hipfire_arch_qwen35::mtp_spec`]) instead of
-/// the diffusion drafter. The proven-durable config (27B-3.6 genre sweep, all
-/// genres ≥1.15× AR, lossless): K=3, p_min=0.4, compressed-serial.
-///
-/// Call sequence (mirrors `mtp_only_demo`):
-///   1. cold-reset trunk DeltaNet/KV (v1 is single-turn — no LCP cache),
-///   2. `prefill_trunk_and_mtp_cache_with_boundary` (chunked ≤ PREFILL_MAX_BATCH
-///      trunk+MTP fill; adaptive `maybe_downshift` at each committed boundary),
-///   3. seed token = trunk argmax at the last prefill position,
-///   4. loop `spec_step_mtp_compressed_serial` (the production path), committing
-///      `result.committed` and advancing `cur_pos += result.advance` each cycle,
-///      then adaptive downshift at the new committed trunk position.
-///
-/// Fail-closed: prefill/spec HipResult and adaptive transition errors free MTP
-/// state, restore the Qwen35 bundle, emit a request error, and never emit a
-/// token after a failed KV commit. Adaptive poison stays sticky on `m.kv_adaptive`.
-///
-/// Per-request lifecycle (state-bleed guard, the serve-multiturn class): the
-/// `MtpSpecState` (which owns the trunk DN snapshot + the MTP-private KV cache)
-/// is allocated FRESH at the top of this function and freed at EVERY exit — so
-/// no recurrent MTP state survives between requests. The trunk's persistent DN
-/// state lives in the bundle and is cold-zeroed at the start of each request
-/// (mirrors `generate_dflash`'s `!cache_hit` reset). The MTP head itself is
-/// persistent (loaded once on `LoadedModel.qwen35_mtp_head`).
-///
-/// Gated behind opt-in: this is only reached when `HIPFIRE_QWEN_MTP=1` AND the
-/// head is present (see the dispatch site in `generate`), so the DEFAULT serve
-/// path (DFlash/AR) is unchanged.
-#[allow(clippy::too_many_arguments)]
-fn generate_qwen35_mtp(
-    m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
-    stdout: &mut std::io::Stdout,
-    id: &str,
-    prompt: &str,
-    system_prompt: Option<&str>,
-    max_tokens: usize,
-    max_think_tokens: usize,
-    assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
-    tools: Option<&[serde_json::Value]>,
-    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
-    stop: &[String],
-    // Request-resolved temp. 0.0 → greedy/argmax-match (p_min confidence cutoff
-    // applies). >0 → lossless residual-acceptance sampling (set_sampling below;
-    // mutually exclusive with p_min). Reached with temp>0 only when the dispatch
-    // gate saw HIPFIRE_MTP_SAMPLED=1 and a temp+top_p-only request.
-    temp: f32,
-    // Nucleus (top_p) cutoff for the sampled MTP path. Applied to BOTH draft +
-    // target nuclei (independent per-side truncation → lossless == AR-at-top_p).
-    // Ignored on the greedy path. <= 0.0 is treated as disabled (1.0).
-    top_p: f32,
-    // Top-k cutoff for the sampled MTP path (request- or card-recommended; e.g.
-    // qwen3.6 A3B ships top_k=20). Applied to BOTH draft + target nuclei
-    // alongside top_p, so it stays lossless == AR-at-(top_k,top_p). None / 0 →
-    // disabled (top_p-only). Ignored on the greedy path.
-    top_k: Option<u32>,
-    // Nucleus min-prob floor for the sampled MTP path: keep tokens with prob >=
-    // min_p * max_prob, folded into the GPU kernel's tau alongside top_p/top_k and
-    // applied to BOTH draft + target nuclei → lossless == AR-at-(min_p,top_k,top_p).
-    // 0.0 = disabled. Ignored on the greedy path.
-    min_p: f32,
-    reasoning_effort: Option<&str>,
-    enable_thinking: bool,
-) {
-    use hipfire_arch_qwen35::mtp_head::MtpKvMode;
-    use hipfire_arch_qwen35::mtp_spec::{self, MtpSpecState};
-    use hipfire_arch_qwen35::speculative::{ModelSlot, ModelSlotConfig};
-    use hipfire_runtime::ngram_mod::{NgramModConfig, NgramModPool};
-
-    // Adaptive poison is sticky until unload. Fail at preflight — never
-    // reset_with_cache or clear poison on a poisoned controller.
-    if let Some(ad) = m.kv_adaptive.as_ref() {
-        if ad.is_poisoned() {
-            let reason = ad
-                .poison_reason()
-                .unwrap_or("adaptive KV is poisoned; unload/reload required");
-            emit_error_with_id(stdout, id, reason);
-            return;
-        }
-    }
-
-    // ── Resolve the proven-durable MTP config + ngram-mod env controls ─
-    // Ordinary MTP draft depth (proposal-buffer / with_k budget). Kept as
-    // `mtp_k` so a larger verify capacity never inflates native MTP depth.
-    // p_min defaults to 0.4. Both env-overridable so the GPU-validation thread
-    // can sweep. `set_p_min(0.4)` is applied below unconditionally (the
-    // MtpSpecState::new default p_min is arch-derived; we pin the proven value
-    // for the serve path and let HIPFIRE_MTP_P_MIN win).
-    let mtp_k: usize = Some(hipfire_runtime::config::get().mtp_k)
-        .filter(|k| (1..=8).contains(k))
-        .unwrap_or(3);
-    // Upstream-style long-gated ngram-mod: opt-in only for greedy non-thinking
-    // requests. The request contract uses `max_think_tokens == 1` as the
-    // explicit no-thinking sentinel; zero means uncapped thinking.
-    let mtp_ngram_raw = std::env::var("HIPFIRE_MTP_NGRAM").ok().as_deref() == Some("1");
-    let n_match: usize = std::env::var("HIPFIRE_NGRAM_MOD_N_MATCH")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(24);
-    let n_min: usize = std::env::var("HIPFIRE_NGRAM_MOD_N_MIN")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(48);
-    let n_max: usize = std::env::var("HIPFIRE_NGRAM_MOD_N_MAX")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(64);
-    // Validation: max<=64 and min<=max (plus non-zero). Invalid config leaves
-    // legacy path; valid config arms ngram-mod.
-    let ngram_mod_config_valid = n_max <= 64 && n_max >= 1 && n_match >= 1 && n_min <= n_max;
-    let ngram_mod_armed =
-        mtp_ngram_raw && temp <= 1e-6 && max_think_tokens == 1 && ngram_mod_config_valid;
-    let verify_capacity: usize = if ngram_mod_armed {
-        mtp_k.max(n_max)
-    } else {
-        mtp_k
-    };
-    // Lazily create or replace model-lifetime shared pool on config mismatch.
-    // Clone Arc for request-local use; lock is never held over GPU work.
-    let ngram_mod_pool: Option<Arc<Mutex<NgramModPool>>> = if ngram_mod_armed {
-        let cfg = NgramModConfig {
-            capacity: 1 << 22,
-            n_match,
-            n_min,
-            n_max,
-        };
-        let needs_new = match m.ngram_mod_pool.as_ref() {
-            None => true,
-            Some(existing) => {
-                let guard = existing.lock().unwrap();
-                guard.config() != &cfg
-            }
-        };
-        if needs_new {
-            match NgramModPool::new(cfg) {
-                Ok(pool) => {
-                    let arc = Arc::new(Mutex::new(pool));
-                    m.ngram_mod_pool = Some(arc.clone());
-                    Some(arc)
-                }
-                Err(_) => None,
-            }
-        } else {
-            Some(m.ngram_mod_pool.as_ref().unwrap().clone())
-        }
-    } else {
-        None
-    };
-    let mtp_ngram = ngram_mod_pool.is_some();
-    let p_min: f32 = std::env::var("HIPFIRE_MTP_P_MIN")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .filter(|p: &f32| (0.0..=1.0).contains(p))
-        .unwrap_or(0.4);
-
-    let tokenizer = match m.tokenizer.as_ref() {
-        Some(t) => t,
-        None => {
-            emit_error_with_id(stdout, id, "tokenizer not loaded");
-            return;
-        }
-    };
-
-    // ── Prompt build (ChatML / jinja, same two-path branch as DFlash) ───
-    let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
-    let try_jinja = jinja_enabled && m.chat_template.is_some();
-    // Request flag seeds Plain fallback only. Successful Jinja owns the
-    // generation suffix — derive initial think from the rendered tail.
-    let mut started_in_think = matches!(
-        assistant_prefix,
-        hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
-    );
-    let prompt_tokens: Vec<u32> = if try_jinja {
-        let template = m.chat_template.as_ref().unwrap();
-        let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
-            tokenizer,
-            template,
-            system: system_prompt,
-            user: prompt,
-            enable_thinking,
-            bos_token: None,
-            reasoning_strength: None,
-            reasoning_effort,
-        };
-        let render_result = if tools.is_some() || messages_history.is_some() {
-            let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
-            let messages_slice: &[hipfire_runtime::prompt_frame::Message] = match messages_history {
-                Some(h) => h,
-                None => {
-                    let mut v = Vec::new();
-                    if let Some(sys) = system_prompt {
-                        v.push(hipfire_runtime::prompt_frame::Message {
-                            role: hipfire_runtime::prompt_frame::Role::System,
-                            content: sys.to_string(),
-                            reasoning_content: None,
-                            name: None,
-                            rendered_name: None,
-                            tool_calls: Vec::new(),
-                            tool_call_id: None,
-                            tool_plan: String::new(),
-                        });
-                    }
-                    v.push(hipfire_runtime::prompt_frame::Message {
-                        role: hipfire_runtime::prompt_frame::Role::User,
-                        content: prompt.to_string(),
-                        reasoning_content: None,
-                        name: None,
-                        rendered_name: None,
-                        tool_calls: Vec::new(),
-                        tool_call_id: None,
-                        tool_plan: String::new(),
-                    });
-                    synthesized = v;
-                    &synthesized
-                }
-            };
-            frame.render_messages(messages_slice, tools, None)
-        } else {
-            frame.render()
-        };
-        match render_result {
-            Ok(rendered) => {
-                started_in_think = render_tail_opens_think(&rendered);
-                tokenizer.encode(&rendered)
-            }
-            Err(e) => {
-                if reasoning_effort.is_some() {
-                    emit_active_attempt_error(
-                        stdout,
-                        Some(id),
-                        &format!("MTP jinja render: {e}"),
-                        "validation",
-                        false,
-                        false,
-                    );
-                    let _ = stdout.flush();
-                    return;
-                }
-                eprintln!("[daemon] jinja render failed in mtp path ({e}) — falling back to Plain");
-                hipfire_runtime::prompt_frame::ChatFrame {
-                    tokenizer,
-                    system: system_prompt,
-                    user: prompt,
-                    assistant_prefix,
-                    raw: false,
-                }
-                .build()
-            }
-        }
-    } else {
-        hipfire_runtime::prompt_frame::ChatFrame {
-            tokenizer,
-            system: system_prompt,
-            user: prompt,
-            assistant_prefix,
-            raw: false,
-        }
-        .build()
-    };
-
-    if prompt_tokens.is_empty() {
-        emit_error_with_id(stdout, id, "empty prompt after tokenize");
-        return;
-    }
-
-    let im_end = tokenizer.encode("<|im_end|>");
-    let im_end_token = if im_end.len() == 1 {
-        Some(im_end[0])
-    } else {
-        None
-    };
-
-    // ── Cold-reset the trunk recurrent state (v1 = single-turn) ─────────
-    // Like generate_dflash's !cache_hit branch: zero the bundle's DeltaNet
-    // recurrent state + reset the KV write head so a fresh prompt prefills
-    // from position 0 over clean buffers. (No LCP prompt-cache in v1.)
-    m.seq_pos = 0;
-    m.conversation_tokens.clear();
-    if let Some(ModelState::Qwen35(b)) = m.state.as_ref() {
-        let dn = &b.dn_state;
-        for s in &dn.s_matrices {
-            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-        }
-        for s in &dn.s_scales {
-            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-        }
-        for s in &dn.conv_states {
-            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-        }
-        for s in &dn.s_ef_residual {
-            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-        }
-    }
-    if let Some(ModelState::Qwen35(b)) = m.state.as_mut() {
-        b.kv_cache.compact_offset = 0;
-    }
-    // Adaptive start-tier restore for single-turn MTP (no LCP): a prior AR
-    // request may have left the controller at a lower tier / next_step>0.
-    // reset_with_cache restores FWHT4/Q8 + next_step=0 and cache mode flags
-    // together. Poisoned controllers are never reset/cleared here (preflight
-    // already refused the request).
-    if let Some(ad) = m.kv_adaptive.as_mut() {
-        if !ad.is_poisoned() {
-            if let Some(ModelState::Qwen35(b)) = m.state.as_mut() {
-                ad.reset_with_cache(gpu, &mut b.kv_cache);
-            }
-        }
-    }
-
-    // ── Take the bundle → build a transient ModelSlot ───────────────────
-    // The mtp_spec helpers take `&mut ModelSlot`; the daemon owns the qwen35
-    // pieces in the bundle. Take them, build the slot, run, put them back at
-    // every exit (mirrors generate_dflash). The HfqFile is re-opened (mmap,
-    // few µs) because ModelSlot carries it; the MTP path doesn't read it.
-    let Qwen35Bundle {
-        config: orig_config,
-        weights,
-        scratch,
-        kv_cache,
-        dn_state,
-        kv_adaptive: _,
-    } = match m.state.take() {
-        Some(ModelState::Qwen35(b)) => b,
-        _ => {
-            emit_error_with_id(stdout, id, "qwen35 MTP serve: model state is not Qwen35");
-            return;
-        }
-    };
-    let target_config = orig_config.clone();
-    let hfq = match HfqFile::open(Path::new(&m.model_path)) {
-        Ok(h) => h,
-        Err(e) => {
-            emit_error_with_id(stdout, id, format!("reopen model: {e}"));
-            m.state = Some(ModelState::Qwen35(Qwen35Bundle {
-                config: orig_config,
-                weights,
-                scratch,
-                kv_cache,
-                dn_state,
-                kv_adaptive: None,
-            }));
-            return;
-        }
-    };
-    let mut target = ModelSlot {
-        name: String::from("target"),
-        hfq,
-        config: target_config,
-        weights,
-        kv_cache,
-        dn_state,
-        scratch,
-        slot_config: ModelSlotConfig::default(),
-        dspark_extract_layers: Vec::new(),
-    };
-
-    // Helper closure analog: every early return must put the bundle back. We
-    // do it inline (Rust closures can't move `target` piecewise + keep using
-    // `m`), so each exit re-packs Qwen35Bundle from target's fields.
-    let eos_token = target.config.eos_token;
-    let dim = target.config.dim;
-    let vocab = target.config.vocab_size;
-
-    // Context bound is prompt+max_tokens+verify_capacity+16 (slot reuse via
-    // rollback/replay, not max_tokens*(verify_capacity+1)).
-    let max_seq_total = m.physical_cap;
-    if prompt_tokens
-        .len()
-        .saturating_add(max_tokens)
-        .saturating_add(verify_capacity)
-        .saturating_add(16)
-        > max_seq_total
-    {
-        emit_error_with_id(
-            stdout,
-            id,
-            format!(
-                "prompt ({}) + max ({}) + verify_capacity ({}) +16 exceeds context capacity {} — reload with a larger max_seq",
-                prompt_tokens.len(),
-                max_tokens,
-                verify_capacity,
-                max_seq_total
-            ),
-        );
-        m.state = Some(ModelState::Qwen35(Qwen35Bundle {
-            config: orig_config,
-            weights: target.weights,
-            scratch: target.scratch,
-            kv_cache: target.kv_cache,
-            dn_state: target.dn_state,
-            kv_adaptive: None,
-        }));
-        return;
-    }
-
-    // ── Allocate a FRESH per-request MtpSpecState (no cross-request bleed) ─
-    let head = m
-        .qwen35_mtp_head
-        .as_ref()
-        .expect("generate_qwen35_mtp reached without a loaded MTP head — dispatch gate is wrong");
-    // Compressed (cvs) draft head? Copy the Option out now so we don't hold a
-    // borrow of `head`/`m` past the state setup — the compressed-logits scratch
-    // alloc below needs &mut state + &mut gpu.
-    let cvs_opt = head.weights.compressed_vocab_size;
-    let kv_mode = MtpKvMode::Q8;
-    let mut state = if ngram_mod_pool.is_some() {
-        match MtpSpecState::new_for_slot_with_kv_mode_and_verify_capacity(
-            gpu,
-            &target,
-            head,
-            mtp_k,
-            verify_capacity,
-            kv_mode,
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                emit_error_with_id(stdout, id, format!("alloc MtpSpecState: {e:?}"));
-                m.state = Some(ModelState::Qwen35(Qwen35Bundle {
-                    config: orig_config,
-                    weights: target.weights,
-                    scratch: target.scratch,
-                    kv_cache: target.kv_cache,
-                    dn_state: target.dn_state,
-                    kv_adaptive: None,
-                }));
-                return;
-            }
-        }
-    } else {
-        match MtpSpecState::new_for_slot_with_kv_mode(gpu, &target, head, mtp_k, kv_mode) {
-            Ok(s) => s,
-            Err(e) => {
-                emit_error_with_id(stdout, id, format!("alloc MtpSpecState: {e:?}"));
-                m.state = Some(ModelState::Qwen35(Qwen35Bundle {
-                    config: orig_config,
-                    weights: target.weights,
-                    scratch: target.scratch,
-                    kv_cache: target.kv_cache,
-                    dn_state: target.dn_state,
-                    kv_adaptive: None,
-                }));
-                return;
-            }
-        }
-    };
-    // Compressed-serial (cvs) head needs its compressed-logits scratch allocated
-    // up front (mtp_only_demo does this; the daemon previously only set up the
-    // full-vocab path, so a cvs sidecar panicked inside spec_step). Full-vocab
-    // heads (cvs == None) skip this entirely.
-    if let Some(cvs) = cvs_opt {
-        if let Err(e) = state.mtp_scratch.ensure_compressed_logits(gpu, cvs) {
-            emit_error_with_id(stdout, id, format!("alloc logits_compressed: {e:?}"));
-            state.free_gpu(gpu);
-            m.state = Some(ModelState::Qwen35(Qwen35Bundle {
-                config: orig_config,
-                weights: target.weights,
-                scratch: target.scratch,
-                kv_cache: target.kv_cache,
-                dn_state: target.dn_state,
-                kv_adaptive: None,
-            }));
-            return;
-        }
-        if let Err(e) = state.ensure_compressed_lm_logits(gpu, cvs) {
-            emit_error_with_id(stdout, id, format!("alloc mtp_lm_logits_compressed: {e:?}"));
-            state.free_gpu(gpu);
-            m.state = Some(ModelState::Qwen35(Qwen35Bundle {
-                config: orig_config,
-                weights: target.weights,
-                scratch: target.scratch,
-                kv_cache: target.kv_cache,
-                dn_state: target.dn_state,
-                kv_adaptive: None,
-            }));
-            return;
-        }
-    }
-    if temp > 1e-6 {
-        // Sampled MTP. temp/top_p/top_k AND the sampling min_p are honored (folded
-        // into the GPU nucleus tau). The draft-chain p_min now ALSO composes with
-        // sampling via DraftMode::SampledPMin (sampled draft + early chain-cutoff
-        // on the head's raw top prob — lossless, the tau lever for sampled MTP), so
-        // we feed the resolved p_min through instead of clearing it. p_min<=0
-        // (HIPFIRE_MTP_P_MIN=0) → plain DraftMode::Sampled (no chain pruning).
-        state.set_p_min(p_min);
-        // set_sampling asserts top_p in (0,1]; a request top_p of 0.0 means
-        // "disabled", so clamp it to 1.0 (the no-nucleus sentinel).
-        let top_p_eff = if top_p > 0.0 { top_p.min(1.0) } else { 1.0 };
-        state.set_sampling(
-            mtp_spec::MtpSamplingConfig {
-                temp,
-                top_k: top_k.map(|k| k as usize).unwrap_or(0),
-                top_p: top_p_eff,
-                min_p,
-            },
-            42, // deterministic seed for v1 (reproducible for the coherence battery; a per-request seed is a follow-up)
-        );
-    } else {
-        state.set_p_min(p_min); // greedy MTP confidence cutoff
-    }
-
-    let _ = (dim, vocab); // dims sanity-checked inside MtpSpecState::new
-
-    let t0 = Instant::now();
-
-    // ── Prefill: chunked trunk + MTP private-KV fill (committed boundaries) ─
-    // Adaptive controllers live on `m.kv_adaptive` (not the transient slot).
-    // Boundary hook downshifts at exclusive committed pos before the next chunk
-    // can write past the current-tier capacity. Prefill/spec HipResult failures
-    // (incl. lazy VMM growth) are request errors — never unwrap/panic.
-    let head = m.qwen35_mtp_head.as_ref().unwrap();
-    let prefill_res = {
-        let adaptive = &mut m.kv_adaptive;
-        mtp_spec::prefill_trunk_and_mtp_cache_with_boundary(
-            gpu,
-            &mut target,
-            head,
-            &mut state,
-            &prompt_tokens,
-            0,
-            |gpu, target, committed_pos| {
-                if let Some(ad) = adaptive.as_mut() {
-                    match ad.maybe_downshift(gpu, &mut target.kv_cache, committed_pos) {
-                        Ok(steps) => {
-                            for step in steps {
-                                eprintln!(
-                                    "[adaptive-kv] downshift @ pos {} (mtp prefill): {:?} (K={:?} V={:?})",
-                                    committed_pos, step, ad.cur_k, ad.cur_v
-                                );
-                            }
-                            Ok(())
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "[adaptive-kv] maybe_downshift error @ pos {} (mtp prefill): {:?} — poisoning model",
-                                committed_pos, e
-                            );
-                            Err(e)
-                        }
-                    }
-                } else {
-                    Ok(())
-                }
-            },
-        )
-    };
-    if let Err(e) = prefill_res {
-        emit_error_with_id(stdout, id, format!("mtp prefill: {e:?}"));
-        state.free_gpu(gpu);
-        m.state = Some(ModelState::Qwen35(Qwen35Bundle {
-            config: orig_config,
-            weights: target.weights,
-            scratch: target.scratch,
-            kv_cache: target.kv_cache,
-            dn_state: target.dn_state,
-            kv_adaptive: None,
-        }));
-        return;
-    }
-    let _ = gpu.hip.device_synchronize();
-    let prefill_ms = t0.elapsed().as_millis();
-
-    // Seed token = trunk argmax at the last prefill position. prefill left
-    // target.scratch.logits holding the post-prompt logits.
-    let seed_logits = match gpu.download_f32(&target.scratch.logits) {
-        Ok(v) => v,
-        Err(e) => {
-            emit_error_with_id(stdout, id, format!("download seed logits: {e:?}"));
-            state.free_gpu(gpu);
-            m.state = Some(ModelState::Qwen35(Qwen35Bundle {
-                config: orig_config,
-                weights: target.weights,
-                scratch: target.scratch,
-                kv_cache: target.kv_cache,
-                dn_state: target.dn_state,
-                kv_adaptive: None,
-            }));
-            return;
-        }
-    };
-    let seed_token = seed_logits
-        .iter()
-        .enumerate()
-        .fold((0u32, f32::NEG_INFINITY), |(best, bv), (i, &v)| {
-            if v > bv {
-                (i as u32, v)
-            } else {
-                (best, bv)
-            }
-        })
-        .0;
-
-    // ── Decode loop ─────────────────────────────────────────────────────
-    let t_prefill = Instant::now();
-    let mut emitted: Vec<u32> = vec![seed_token];
-    let mut last_committed = seed_token;
-    let mut cur_pos = prompt_tokens.len();
-    let mut generated = 0usize;
-    let mut cycles = 0usize;
-    let mut accepted_total = 0usize;
-    // Ngram-mod stats (only when ngram_mod is armed). ar_windows counts
-    // post-retirement misses (with_k 0).
-    let mut ngram_mod_windows = 0usize;
-    let mut ngram_mod_drafts = 0usize;
-    let mut ngram_mod_accepted = 0usize;
-    let mut mtp_windows = 0usize;
-    let mut ar_windows = 0usize;
-    let mut mtp_retired = false;
-    // Opt-in per-window HIP host/API timing (HIPFIRE_HOST_TIMING=1). Empty
-    // Vec + one env check when disabled — no launch-counter work on the hot path.
-    let host_timing = std::env::var("HIPFIRE_HOST_TIMING").ok().as_deref() == Some("1");
-    let mut mtp_window_timings: Vec<serde_json::Value> = Vec::new();
-    // Request context prompt+seed for the shared pool. Pushed incrementally
-    // with actually emitted committed tokens; insert_range learns them.
-    let mut ngram_context: Vec<u32> = Vec::with_capacity(prompt_tokens.len() + max_tokens + 1);
-    ngram_context.extend_from_slice(&prompt_tokens);
-    ngram_context.push(seed_token);
-    let mut ngram_indexed_until: usize = 0;
-    if let Some(pool_arc) = ngram_mod_pool.as_ref() {
-        let mut pool = pool_arc.lock().unwrap();
-        pool.insert_range(&ngram_context, n_match);
-        ngram_indexed_until = ngram_context.len();
-    }
-    let mut think_count: usize = 0;
-    let mut prev_in_think = false;
-    // MTP force-closes only at a committed block boundary so its target/head
-    // caches stay aligned. Keep that policy local; the shared emitter owns only
-    // byte filtering plus reasoning/content/tool routing for this path.
-    let mut think_closed = false;
-    let mut grammar_violated = false;
-    let emit_tools = hipfire_runtime::prompt_frame::qwen35_grammar_on(
-        std::env::var("HIPFIRE_QWEN35_GRAMMAR").ok().as_deref(),
-        &m.model_path,
-    )
-    .then_some(tools)
-    .flatten();
-    let mut emit =
-        hipfire_arch_qwen35::spec_emit::Qwen35Emit::from_ctx(hipfire_runtime::spec::SpecEmitCtx {
-            tokenizer,
-            eos: eos_token,
-            im_end: im_end_token,
-            tools: emit_tools,
-            stop: stop.to_vec(),
-            max_think: 0,
-            max_tokens,
-            assistant_prefix: spec_assistant_prefix(started_in_think),
-            think_mode: ThinkMode::NonThink,
-            decoded_vocab: None,
-        });
-
-    // Open the user-facing stream contract before the seed's committed/token
-    // events. MTP performs its own decode loop and therefore does not inherit
-    // the AR/DFlash gen_start emission.
-    emit_gen_start(
-        stdout,
-        id,
-        started_in_think,
-        gen_start_contract_version_for_arch(m.arch_id),
-    );
-
-    // Emit the seed token first (TTFT = prefill) through the shared semantic
-    // router so an open reasoning prefix never leaks into visible content.
-    let seed_begin = emit.begin(seed_token);
-    render_client_events(
-        stdout,
-        id,
-        &seed_begin.events,
-        t0.elapsed().as_millis() as u64,
-        false,
-    );
-    generated += 1;
-    let mut semantic_stop = if spec_stop_is_semantic(seed_begin.stop) {
-        seed_begin.stop
-    } else {
-        None
-    };
-    let seed_is_eos = seed_begin.stop.is_some();
-
-    let mut step_error: Option<String> = None;
-    while !seed_is_eos && generated < max_tokens {
-        if check_abort(id) {
-            break;
-        }
-        if cur_pos + verify_capacity + 1 >= max_seq_total {
-            break;
-        }
-
-        // Ngram-mod draft attempt: short-lock, clone Vec, drop lock before GPU.
-        // When host_timing is on, snapshot launch counters before lookup so
-        // draft_lookup_us is separable from the GPU step; wall spans both.
-        // Disabled path: no Instant::now and no launch-counter reads per window.
-        let remaining_emit = max_tokens.saturating_sub(generated);
-        let spine_budget = remaining_emit.saturating_sub(1); // room for bonus
-        let timing_snap = if host_timing {
-            Some(MtpWindowTimingSnap::take())
-        } else {
-            None
-        };
-        let (ngram_cands, draft_lookup_us) = if mtp_ngram && spine_budget > 0 {
-            let caller_max = spine_budget.min(verify_capacity);
-            let t_lookup = if host_timing {
-                Some(Instant::now())
-            } else {
-                None
-            };
-            let draft = {
-                let pool = ngram_mod_pool.as_ref().unwrap().lock().unwrap();
-                pool.draft(&ngram_context, caller_max)
-            };
-            let draft_lookup_us = t_lookup
-                .map(|t| t.elapsed().as_micros() as u64)
-                .unwrap_or(0);
-            (draft, draft_lookup_us)
-        } else {
-            (None, 0)
-        };
-        let used_ngram = ngram_cands.as_ref().is_some_and(|c| !c.is_empty());
-        // Classify planned route before the step (and before ngram acceptance
-        // can retire MTP) so timing kind matches the path actually taken.
-        let timing_kind = mtp_window_timing_kind(used_ngram, mtp_ngram, mtp_retired);
-        let result = if used_ngram {
-            let cands = ngram_cands.as_ref().unwrap();
-            match mtp_spec::spec_step_mtp_compressed_serial_with_takeover_candidates(
-                gpu,
-                &mut target,
-                head,
-                &mut state,
-                cur_pos,
-                last_committed,
-                eos_token,
-                cands,
-                mtp_retired,
-            ) {
-                Ok(r) => r,
-                Err(e) => {
-                    step_error = Some(format!("{e:?}"));
-                    break;
-                }
-            }
-        } else if mtp_ngram {
-            if mtp_retired {
-                // After retirement, miss verifies trunk only (k=0) – no MTP head.
-                match mtp_spec::spec_step_mtp_compressed_serial_with_k(
-                    gpu,
-                    &mut target,
-                    head,
-                    &mut state,
-                    cur_pos,
-                    last_committed,
-                    eos_token,
-                    0,
-                ) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        step_error = Some(format!("{e:?}"));
-                        break;
-                    }
-                }
-            } else {
-                // Before takeover, miss goes to native MTP K.
-                match mtp_spec::spec_step_mtp_compressed_serial_with_k(
-                    gpu,
-                    &mut target,
-                    head,
-                    &mut state,
-                    cur_pos,
-                    last_committed,
-                    eos_token,
-                    mtp_k,
-                ) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        step_error = Some(format!("{e:?}"));
-                        break;
-                    }
-                }
-            }
-        } else {
-            // Off-path: identical to pre-ngram (legacy entry).
-            match mtp_spec::spec_step_mtp_compressed_serial(
-                gpu,
-                &mut target,
-                head,
-                &mut state,
-                cur_pos,
-                last_committed,
-                eos_token,
-            ) {
-                Ok(r) => r,
-                Err(e) => {
-                    step_error = Some(format!("{e:?}"));
-                    break;
-                }
-            }
-        };
-        // Record only after a successful step; failed windows leave no row.
-        if let Some(snap) = timing_snap {
-            mtp_window_timings.push(snap.into_record(timing_kind, draft_lookup_us));
-        }
-        cycles += 1;
-        accepted_total += result.accept_count;
-        if used_ngram {
-            ngram_mod_windows += 1;
-            ngram_mod_drafts += result.drafts_generated;
-            ngram_mod_accepted += result.accept_count;
-            // Short-lock record_draft_result for every ngram attempt.
-            {
-                let mut pool = ngram_mod_pool.as_ref().unwrap().lock().unwrap();
-                let _ = pool.record_draft_result(
-                    result.drafts_generated as u32,
-                    result.accept_count as u32,
-                );
-            }
-            // Positive ngram acceptance latches retirement; zero-accept before
-            // takeover stays MTP-capable (single-row repair handled in core).
-            if result.accept_count > 0 && !mtp_retired {
-                mtp_retired = true;
-            }
-        } else if mtp_ngram {
-            if mtp_retired {
-                ar_windows += 1;
-            } else {
-                mtp_windows += 1;
-            }
-        } else {
-            mtp_windows += 1;
-        }
-
-        let mut hit_eos = false;
-        for &tok in &result.committed {
-            if generated >= max_tokens {
-                break;
-            }
-            emit.set_generated_hint(generated);
-            let outcome = emit.observe(tok);
-            if outcome.stop == Some(StopReason::GrammarViolation) {
-                grammar_violated = true;
-                hit_eos = true;
-                break;
-            }
-            emitted.push(tok);
-            if mtp_ngram {
-                ngram_context.push(tok);
-            }
-            render_client_events(
-                stdout,
-                id,
-                &outcome.events,
-                t0.elapsed().as_millis() as u64,
-                false,
-            );
-            generated += 1;
-            if semantic_stop.is_none() && spec_stop_is_semantic(outcome.stop) {
-                semantic_stop = outcome.stop;
-            }
-            if outcome.stop.is_some() {
-                hit_eos = true;
-                break;
-            }
-            if max_think_tokens > 0 && !think_closed {
-                let raw_so_far = tokenizer.decode_bytes(&emitted);
-                let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
-                let in_think = currently_in_think(raw_str, started_in_think);
-                if in_think && !prev_in_think {
-                    think_count = 0;
-                }
-                if in_think {
-                    think_count += 1;
-                }
-                prev_in_think = in_think;
-                // Apply the close after this committed block. `spec_step`
-                // already advanced the trunk across the whole block, so
-                // stopping midway here would desynchronize visible tokens and
-                // model state.
-            }
-        }
-        last_committed = match result.committed.last() {
-            Some(&t) => t,
-            None => break, // defensive: spec_step always commits ≥ 1
-        };
-        cur_pos += result.advance;
-        // Incrementally learn actually emitted committed tokens without
-        // holding lock over GPU work. Seed already covers prompt+seed.
-        if mtp_ngram {
-            let mut pool = ngram_mod_pool.as_ref().unwrap().lock().unwrap();
-            pool.insert_range(&ngram_context, ngram_indexed_until);
-            ngram_indexed_until = ngram_context.len();
-        }
-        // Adaptive KV: downshift ONLY the committed/live trunk prefix
-        // [0, cur_pos) at the block boundary. Spec verify may have written a
-        // rejected suffix beyond cur_pos; those slots stay at the prior tier
-        // and are overwritten in order by the next verify.
-        if let Some(ad) = m.kv_adaptive.as_mut() {
-            match ad.maybe_downshift(gpu, &mut target.kv_cache, cur_pos) {
-                Ok(steps) => {
-                    for step in steps {
-                        eprintln!(
-                            "[adaptive-kv] downshift @ pos {} (mtp decode): {:?} (K={:?} V={:?})",
-                            cur_pos, step, ad.cur_k, ad.cur_v
-                        );
-                    }
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[adaptive-kv] maybe_downshift error @ pos {} (mtp decode): {:?} — poisoning model",
-                        cur_pos, e
-                    );
-                    step_error = Some(format!(
-                        "adaptive KV transition failed during mtp decode: {e}"
-                    ));
-                    break;
-                }
-            }
-        }
-        if result.hit_eos || hit_eos {
-            break;
-        }
-
-        if max_think_tokens > 0 && !think_closed && prev_in_think && think_count >= max_think_tokens
-        {
-            let close_ids = tokenizer.encode(&think_continuation());
-            if !close_ids.is_empty() {
-                let mut forced_stop = false;
-                for &ct in &close_ids {
-                    if generated >= max_tokens {
-                        break;
-                    }
-                    emit.set_generated_hint(generated);
-                    let outcome = emit.observe(ct);
-                    if outcome.stop == Some(StopReason::GrammarViolation) {
-                        grammar_violated = true;
-                        forced_stop = true;
-                        break;
-                    }
-                    emitted.push(ct);
-                    if mtp_ngram {
-                        ngram_context.push(ct);
-                    }
-                    render_client_events(
-                        stdout,
-                        id,
-                        &outcome.events,
-                        t0.elapsed().as_millis() as u64,
-                        false,
-                    );
-                    generated += 1;
-                    if semantic_stop.is_none() && spec_stop_is_semantic(outcome.stop) {
-                        semantic_stop = outcome.stop;
-                    }
-                    if outcome.stop.is_some() {
-                        forced_stop = true;
-                        break;
-                    }
-                }
-
-                // Match the MTP loop's deferred-token invariant: advance the
-                // trunk and head cache over the prior deferred token plus every
-                // close token except the new deferred tail.
-                let mut advance_toks = Vec::with_capacity(close_ids.len());
-                advance_toks.push(last_committed);
-                advance_toks.extend_from_slice(&close_ids[..close_ids.len() - 1]);
-                let think_prefill = {
-                    let adaptive = &mut m.kv_adaptive;
-                    let start = cur_pos;
-                    mtp_spec::prefill_trunk_and_mtp_cache_with_boundary(
-                        gpu,
-                        &mut target,
-                        head,
-                        &mut state,
-                        &advance_toks,
-                        start,
-                        |gpu, target, committed_pos| {
-                            if let Some(ad) = adaptive.as_mut() {
-                                match ad.maybe_downshift(gpu, &mut target.kv_cache, committed_pos) {
-                                    Ok(steps) => {
-                                        for step in steps {
-                                            eprintln!(
-                                                "[adaptive-kv] downshift @ pos {} (mtp think-close): {:?} (K={:?} V={:?})",
-                                                committed_pos, step, ad.cur_k, ad.cur_v
-                                            );
-                                        }
-                                        Ok(())
-                                    }
-                                    Err(e) => {
-                                        eprintln!(
-                                            "[adaptive-kv] maybe_downshift error @ pos {} (mtp think-close): {:?} — poisoning model",
-                                            committed_pos, e
-                                        );
-                                        Err(e)
-                                    }
-                                }
-                            } else {
-                                Ok(())
-                            }
-                        },
-                    )
-                };
-                if let Err(e) = think_prefill {
-                    step_error = Some(format!("think force-close: {e:?}"));
-                    break;
-                }
-                cur_pos += advance_toks.len();
-                last_committed = *close_ids.last().unwrap();
-                // Learn think-force-close committed tokens (also without lock
-                // over GPU). No-op when ngram is off (thinking disables ngram).
-                if mtp_ngram {
-                    let mut pool = ngram_mod_pool.as_ref().unwrap().lock().unwrap();
-                    pool.insert_range(&ngram_context, ngram_indexed_until);
-                    ngram_indexed_until = ngram_context.len();
-                }
-                think_closed = true;
-                prev_in_think = false;
-                if forced_stop {
-                    break;
-                }
-            }
-        }
-    }
-
-    let t_end = Instant::now();
-    let aborted = check_abort(id);
-    let finish = if step_error.is_none() && !aborted {
-        Some(emit.finish())
-    } else {
-        drop(emit);
-        None
-    };
-
-    // ── Free the per-request MtpSpecState + put the bundle back ─────────
-    // CRITICAL (state-bleed guard): free_gpu releases the MTP-private KV cache
-    // + the trunk DN snapshot, so the NEXT request starts with no residue.
-    state.free_gpu(gpu);
-    // The trunk's mid-decode DN/KV is advanced past the (un-baked) prompt; the
-    // next request cold-resets at the top of this fn (and the DFlash/AR paths
-    // reset on their own !cache_hit branch), so we leave it as-is here. Bake an
-    // empty conversation tracker (v1 is single-turn / no LCP reuse).
-    m.seq_pos = 0;
-    m.conversation_tokens.clear();
-    m.state = Some(ModelState::Qwen35(Qwen35Bundle {
-        config: orig_config,
-        weights: target.weights,
-        scratch: target.scratch,
-        kv_cache: target.kv_cache,
-        dn_state: target.dn_state,
-        kv_adaptive: None,
-    }));
-
-    if let Some(e) = step_error {
-        emit_error_with_id(stdout, id, format!("mtp spec_step: {e}"));
-        return;
-    }
-
-    // Client abort: common production rollback + attested cancelled lifecycle
-    // (or unattested error-only). Never fall through to stop/length done.
-    if aborted {
-        let ep = production_fail_closed_rollback(m, gpu, None, None);
-        emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
-        return;
-    }
-    let finish = finish.expect("normal MTP exit must finalize its emitter");
-    render_client_events(stdout, id, &finish.events, 0, true);
-
-    // ── Done envelope ──────────────────────────────────────────────────
-    // Timing + pending done fixed before handshake so commit_ready carries
-    // the exact eventual done payload.
-    let total_s = t_end.duration_since(t0).as_secs_f64();
-    let prefill_s = t_prefill.duration_since(t0).as_secs_f64();
-    let decode_s = t_end.duration_since(t_prefill).as_secs_f64();
-    let tok_s = if total_s > 0.0 {
-        generated as f64 / total_s
-    } else {
-        0.0
-    };
-    let decode_tok_s = if decode_s > 0.0 {
-        generated as f64 / decode_s
-    } else {
-        0.0
-    };
-    let prefill_tok_s = if prefill_s > 0.0 {
-        prompt_tokens.len() as f64 / prefill_s
-    } else {
-        0.0
-    };
-    // τ = tokens committed per cycle (excludes the seed). > 1.0 = MTP speedup.
-    let tau = if cycles > 0 {
-        (emitted.len().saturating_sub(1)) as f64 / cycles as f64
-    } else {
-        0.0
-    };
-    let _ = accepted_total;
-    let ngram_mod_accept_rate = if ngram_mod_drafts > 0 {
-        ngram_mod_accepted as f64 / ngram_mod_drafts as f64
-    } else {
-        0.0
-    };
-    let hit_length_cap = qwen_dflash_hit_length_cap(
-        generated,
-        max_tokens,
-        finish.decoded_eot,
-        semantic_stop.is_some(),
-    );
-    let visible = if !finish.visible_text.is_empty() {
-        finish.visible_text.clone()
-    } else {
-        qwen_dflash_visible_from_finish(&finish)
-    };
-    let terminal =
-        qwen_dflash_wire_terminal(&finish, hit_length_cap, grammar_violated, &visible, false);
-    let (finish_reason, wire_tool_calls) = match &terminal {
-        QwenDflashWireTerminal::Malformed {
-            message,
-            class,
-            retryable,
-            ..
-        } => {
-            let ep = production_fail_closed_rollback(m, gpu, None, None);
-            emit_qwen_dflash_malformed_terminal(stdout, id, message, class, *retryable, &ep);
-            return;
-        }
-        QwenDflashWireTerminal::Done {
-            finish_reason,
-            wire_tool_calls,
-            ..
-        } => (*finish_reason, wire_tool_calls.as_slice()),
-    };
-    let mut pending_done = serde_json::json!({
-        "type": "done",
-        "id": id,
-        "tokens": generated,
-        "tok_s": (tok_s * 10.0).round() / 10.0,
-        "prefill_tokens": prompt_tokens.len(),
-        "prefill_ms": prefill_ms,
-        "prefill_tok_s": (prefill_tok_s * 10.0).round() / 10.0,
-        "decode_tok_s": (decode_tok_s * 10.0).round() / 10.0,
-        "ttft_ms": prefill_ms,
-        "mtp": true,
-        "tau": (tau * 100.0).round() / 100.0,
-        "cycles": cycles,
-        "cached_tokens": 0,
-        "finish_reason": finish_reason,
-        "attempt_id": active_attempt_id(),
-        "mtp_ngram": mtp_ngram,
-        "ngram_mod_windows": ngram_mod_windows,
-        "ngram_mod_drafts": ngram_mod_drafts,
-        "ngram_mod_accepted": ngram_mod_accepted,
-        "ngram_mod_accept_rate": (ngram_mod_accept_rate * 1000.0).round() / 1000.0,
-        "mtp_windows": mtp_windows,
-        "ar_windows": ar_windows,
-        "mtp_retired": mtp_retired,
-    });
-    // Build concise per-route wall summary before moving timings into pending_done.
-    let host_timing_summary = if host_timing && !mtp_window_timings.is_empty() {
-        let summarize = |kind: &str| {
-            let mut walls: Vec<u64> = mtp_window_timings
-                .iter()
-                .filter(|r| r.get("kind").and_then(|k| k.as_str()) == Some(kind))
-                .filter_map(|r| r.get("wall_us").and_then(|v| v.as_u64()))
-                .collect();
-            if walls.is_empty() {
-                return None;
-            }
-            let n = walls.len();
-            let sum: u64 = walls.iter().sum();
-            let mean = sum / n as u64;
-            walls.sort_unstable();
-            let median = if n % 2 == 1 {
-                walls[n / 2]
-            } else {
-                (walls[n / 2 - 1] + walls[n / 2]) / 2
-            };
-            Some((n, mean, median))
-        };
-        let mut parts: Vec<String> = Vec::new();
-        for kind in ["ngram", "mtp", "ar"] {
-            if let Some((n, mean, median)) = summarize(kind) {
-                parts.push(format!("{kind}:n={n} mean={mean} median={median}"));
-            }
-        }
-        if parts.is_empty() {
-            None
-        } else {
-            Some(parts.join(" "))
-        }
-    } else {
-        None
-    };
-    attach_mtp_window_timings(&mut pending_done, host_timing, mtp_window_timings);
-    stage_terminal_tool_calls(&mut pending_done, finish_reason, wire_tool_calls);
-    let decision = await_client_terminal_commit(stdout, id, &pending_done);
-    if decision != ClientTerminalDecision::Commit {
-        let ep = production_fail_closed_rollback(m, gpu, None, None);
-        emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
-        return;
-    }
-    emit_staged_terminal_done(stdout, &pending_done);
-    // Per-request debug summary (stderr → serve.log): active drafter, τ, tok/s.
-    let drafter = m.speculator.as_ref().map(|s| s.name()).unwrap_or("none");
-    eprintln!(
-        "[req {id}] drafter={drafter} tau={tau:.2} tok/s={decode_tok_s:.1} decode ({generated} tok, {cycles} windows) mtp_ngram={mtp_ngram} ngram_mod_windows={ngram_mod_windows} ngram_mod_drafts={ngram_mod_drafts} ngram_mod_accepted={ngram_mod_accepted} ngram_mod_accept_rate={ngram_mod_accept_rate:.3} mtp_windows={mtp_windows} ar_windows={ar_windows} mtp_retired={mtp_retired}"
-    );
-    if let Some(summary) = host_timing_summary {
-        eprintln!("[req {id}] mtp_window_timings wall_us {summary}");
-    }
-}
-
-/// Multi-GPU pipeline-parallel AR decode (Stage 7 of #58). Mirrors the pp=1
-/// `generate` Qwen3.5 branch feature-for-feature: ChatFrame ChatML wrap,
-/// EosFilter UTF-8 streaming + strip-think + stop_at, LoopGuard n-gram
-/// detection, repeat penalty, attractor block on unclosed tool/think
-/// openers, max_think_tokens force-close, budget-alert nudge, ChatML \n
-/// trailer. Forward calls fan out to per-device tensors via
-/// `gpus.devices[dev]` and `scratch_set.per_device[dev]`; the final
-/// sample lives on `gpus.output_device`. DFlash, CASK, PFlash, VL and
-/// arch_id < 5 are refused upstream at load.
-#[allow(clippy::too_many_arguments)]
-fn generate_multi(
-    m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
-    pflash_state: Option<&mut hipfire_pflash::pflash::PflashState>,
-    pflash_cfg: Option<&hipfire_pflash::pflash::PflashConfig>,
-    stdout: &mut std::io::Stdout,
-    id: &str,
-    prompt: &str,
-    system_prompt: Option<&str>,
-    temp: f32,
-    top_p: f32,
-    top_k: Option<u32>,
-    min_p: Option<f32>,
-    max_tokens: usize,
-    repeat_penalty: f32,
-    _repeat_window: usize,
-    presence_penalty: f32,
-    frequency_penalty: f32,
-    budget_alert_at_tok: usize,
-    budget_alert_text: &str,
-    max_think_tokens: usize,
-    assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
-    tools: Option<&[serde_json::Value]>,
-    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
-    stop: &[String],
-    reasoning_effort: Option<&str>,
-    enable_thinking: bool,
-) {
-    let tokenizer = m.tokenizer.as_ref().unwrap();
-    let prompt_est = tokenizer.encode(prompt).len() + 20;
-    if m.seq_pos
-        .saturating_add(prompt_est)
-        .saturating_add(max_tokens)
-        > m.max_seq
-    {
-        eprintln!(
-            "[daemon] context full ({}/{}) — resetting conversation",
-            m.seq_pos, m.max_seq
-        );
-        m.seq_pos = 0;
-        m.conversation_tokens.clear();
-        free_checkpoints(&mut m.prefill_checkpoints, gpu);
-        free_checkpoints(&mut m.dflash_checkpoints, gpu);
-        // qwen35 recurrent state lives in the bundle (ModelState::Qwen35), not
-        // the always-None m.dn_state/m.kv_cache. Inlined (disjoint field access)
-        // because a `&tokenizer` borrow of `m` is live here; covers both the
-        // pp>1 per-LA-device path and the single-GPU path.
-        if m.pp > 1 {
-            if let (Some(ModelState::Qwen35(b)), Some(ref mut gpus), Some(ref la)) = (
-                m.state.as_ref(),
-                m.pp_gpus.as_mut(),
-                m.pp_dn_la_to_device.as_ref(),
-            ) {
-                let dn = &b.dn_state;
-                for (i, s) in dn.s_matrices.iter().enumerate() {
-                    let g = &mut gpus.devices[la[i] as usize];
-                    let _ = g.bind_thread();
-                    let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-                }
-                for (i, s) in dn.s_scales.iter().enumerate() {
-                    let g = &mut gpus.devices[la[i] as usize];
-                    let _ = g.bind_thread();
-                    let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-                }
-                for (i, s) in dn.conv_states.iter().enumerate() {
-                    let g = &mut gpus.devices[la[i] as usize];
-                    let _ = g.bind_thread();
-                    let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-                }
-                // multi-GPU currently leaves s_ef_residual empty; loop is a no-op then,
-                // but keeps single-GPU parity if EF is ever wired per-device.
-                for (i, s) in dn.s_ef_residual.iter().enumerate() {
-                    let g = &mut gpus.devices[la[i] as usize];
-                    let _ = g.bind_thread();
-                    let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-                }
-            }
-        } else if let Some(ModelState::Qwen35(b)) = m.state.as_ref() {
-            let dn = &b.dn_state;
-            for s in &dn.s_matrices {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.s_scales {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.conv_states {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.s_ef_residual {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-        }
-        if let Some(ModelState::Qwen35(b)) = m.state.as_mut() {
-            b.kv_cache.compact_offset = 0;
-        }
-        if let Some(ad) = m.kv_adaptive.as_mut() {
-            if let Some(ModelState::Qwen35(b)) = m.state.as_mut() {
-                ad.reset_with_cache(gpu, &mut b.kv_cache);
-            } else {
-                ad.reset();
-            }
-        }
-    }
-
-    let im_end = tokenizer.encode("<|im_end|>");
-    let nl = tokenizer.encode("\n");
-    let raw_q_tokens = tokenizer.encode(prompt);
-
-    // PFlash compression on first turn (seq_pos == 0). Drafter runs on the
-    // daemon's single-GPU `gpu` handle, which binds to the same physical
-    // device as `pp_gpus.devices[0]` (HIP enumerates within ROCR_VISIBLE).
-    // VRAM is shared between the two Gpu handles via the HIP heap, so
-    // drafter weights coexist with the target's dev 0 portion. Output is
-    // a Vec<u32> of kept token IDs which feeds forward_prefill_batch_multi
-    // unchanged. Mode=Off / drafter unloaded falls through to raw tokens.
-    let request_kind = match tokenizer.special_token_id("<tool_call>") {
-        Some(tid) => {
-            let in_user = raw_q_tokens.iter().any(|&t| t == tid);
-            let in_system = system_prompt
-                .map(|s| tokenizer.encode(s).iter().any(|&t| t == tid))
-                .unwrap_or(false);
-            if in_user || in_system {
-                hipfire_pflash::pflash::RequestKind::ToolCall
-            } else {
-                hipfire_pflash::pflash::RequestKind::Text
-            }
-        }
-        None => hipfire_pflash::pflash::RequestKind::Text,
-    };
-    let q_tokens = if let (Some(state), Some(cfg)) = (pflash_state, pflash_cfg) {
-        if m.seq_pos == 0 {
-            match hipfire_pflash::pflash::maybe_compress_prompt(
-                gpu,
-                state,
-                cfg,
-                &raw_q_tokens,
-                request_kind,
-                &[],
-            ) {
-                Ok(hipfire_pflash::pflash::PflashDecision::Compressed(cp)) => {
-                    let _ = writeln!(
-                        stdout,
-                        r#"{{"type":"pflash_compressed","id":"{}","source_tokens":{},"kept_tokens":{},"keep_ratio":{:.6},"source_md5":"{}","compressed_md5":"{}","score_ms":{},"total_ms":{}}}"#,
-                        id,
-                        cp.source_tokens,
-                        cp.kept_tokens,
-                        cp.kept_tokens as f32 / cp.source_tokens.max(1) as f32,
-                        cp.source_md5,
-                        cp.compressed_md5,
-                        cp.timings.score_ms,
-                        cp.timings.total_ms,
-                    );
-                    let _ = stdout.flush();
-                    cp.token_ids
-                }
-                Ok(hipfire_pflash::pflash::PflashDecision::Bypass { reason }) => {
-                    if !matches!(reason, hipfire_pflash::pflash::BypassReason::ModeOff) {
-                        let _ = writeln!(
-                            stdout,
-                            r#"{{"type":"pflash_bypass","id":"{}","reason":"{}"}}"#,
-                            id,
-                            reason.as_str().replace('"', "'"),
-                        );
-                        let _ = stdout.flush();
-                    }
-                    raw_q_tokens
-                }
-                Err(e) => {
-                    let _ = writeln!(
-                        stdout,
-                        r#"{{"type":"pflash_error","id":"{}","reason":"{}"}}"#,
-                        id,
-                        e.to_string().replace('"', "'"),
-                    );
-                    let _ = stdout.flush();
-                    raw_q_tokens
-                }
-            }
-        } else {
-            raw_q_tokens
-        }
-    } else {
-        raw_q_tokens
-    };
-
-    // ChatML framing — two paths, same shape as the single-GPU AR
-    // generate() (line 3147+):
-    //
-    //   1) HIPFIRE_JINJA_CHAT=1 + model has chat_template + seq_pos==0
-    //      → render via JinjaChatFrame so structured tools/messages
-    //      reach the upstream template. PFlash compression is bypassed
-    //      under Jinja (q_tokens is unused; the rendered prompt string
-    //      is re-tokenized straight through).
-    //
-    //   2) Default: hand-rolled ChatFrame::Plain scaffold, byte-
-    //      identical to the pp=1 default path so multi-turn behavior
-    //      matches between pp=1 and pp>1 when both run the same prompt.
-    // LFM2.5 (arch_id 11) REQUIRES its embedded Jinja chat_template — the
-    // hand-rolled Plain ChatML path omits LFM2's `<|startoftext|>` BOS and
-    // produces garbage. Force jinja on for arch 11 (falls back to Plain only if
-    // the .hfq carries no template, e.g. an older A1B convert).
-    // Jinja default-ON (flipped 2026-06-09): render through the model's chat
-    // template for ALL arches; opt out with HIPFIRE_JINJA_CHAT=0 (hand-rolled
-    // ChatML/Plain). Falls back to Plain automatically when no template resolves.
-    let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
-    // hunt3 H-A: drop the `seq_pos == 0` gate (PR #389 removed it from generate()).
-    // With the gate, turn 2+ fell through to the Plain scaffold, dropping the
-    // system prompt and the full history replay that render_messages provides.
-    // Now Jinja renders the full conversation every turn; the cold-reset block
-    // below (guarded on seq_pos > 0) re-zeros recurrent state so the full render
-    // writes from position 0 instead of appending to the prior turn's KV/DeltaNet.
-    let try_jinja = jinja_enabled && m.chat_template.is_some();
-    // Request flag seeds Plain fallback only. Successful Jinja owns the
-    // generation suffix — derive initial think from the rendered tail.
-    let mut started_in_think = matches!(
-        assistant_prefix,
-        hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
-    );
-    let new_tokens = if try_jinja {
-        let template = m.chat_template.as_ref().unwrap();
-        let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
-            tokenizer,
-            template,
-            system: system_prompt,
-            user: prompt,
-            enable_thinking,
-            bos_token: None,
-            reasoning_strength: None,
-            reasoning_effort,
-        };
-        let render_result = if tools.is_some() || messages_history.is_some() {
-            let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
-            let messages_slice: &[hipfire_runtime::prompt_frame::Message] = match messages_history {
-                Some(m) => m,
-                None => {
-                    let mut v = Vec::new();
-                    if let Some(sys) = system_prompt {
-                        v.push(hipfire_runtime::prompt_frame::Message {
-                            role: hipfire_runtime::prompt_frame::Role::System,
-                            content: sys.to_string(),
-                            reasoning_content: None,
-                            name: None,
-                            rendered_name: None,
-                            tool_calls: Vec::new(),
-                            tool_call_id: None,
-                            tool_plan: String::new(),
-                        });
-                    }
-                    v.push(hipfire_runtime::prompt_frame::Message {
-                        role: hipfire_runtime::prompt_frame::Role::User,
-                        content: prompt.to_string(),
-                        reasoning_content: None,
-                        name: None,
-                        rendered_name: None,
-                        tool_calls: Vec::new(),
-                        tool_call_id: None,
-                        tool_plan: String::new(),
-                    });
-                    synthesized = v;
-                    &synthesized
-                }
-            };
-            frame.render_messages(messages_slice, tools, None)
-        } else {
-            frame.render()
-        };
-        match render_result {
-            Ok(rendered) => {
-                started_in_think = render_tail_opens_think(&rendered);
-                tokenizer.encode(&rendered)
-            }
-            Err(e) => {
-                if reasoning_effort.is_some() {
-                    emit_active_attempt_error(
-                        stdout,
-                        Some(id),
-                        &format!("jinja render: {e}"),
-                        "validation",
-                        false,
-                        false,
-                    );
-                    let _ = stdout.flush();
-                    return;
-                }
-                eprintln!("[daemon] jinja render failed in pp path ({e}) — falling back to Plain");
-                hipfire_runtime::prompt_frame::ChatFrame {
-                    tokenizer,
-                    system: if m.seq_pos == 0 { system_prompt } else { None },
-                    user: "",
-                    assistant_prefix,
-                    raw: false,
-                }
-                .build_with_user_tokens(&q_tokens)
-            }
-        }
-    } else {
-        hipfire_runtime::prompt_frame::ChatFrame {
-            tokenizer,
-            system: if m.seq_pos == 0 { system_prompt } else { None },
-            user: "",
-            assistant_prefix,
-            raw: false,
-        }
-        .build_with_user_tokens(&q_tokens)
-    };
-
-    // hunt3 H-A: under Jinja the full conversation (system + history) is
-    // re-rendered every turn, so turn 2+ must cold-reset BEFORE the budget guard
-    // + prefill — otherwise the full render appends to the prior turn's dirty
-    // KV / DeltaNet / checkpoint state (stale recurrent state → drift; the
-    // system prompt was also being silently dropped on turn 2+). Mirrors the
-    // `reset_pp_uncommitted_state!` semantics, written inline because that macro
-    // is defined later (after kv/dn/gpus are borrowed). Same shape as the
-    // context-full reset at the top of this fn and generate()'s `jinja_active &&
-    // seq_pos > 0` block.
-    if try_jinja && m.seq_pos > 0 {
-        m.seq_pos = 0;
-        m.conversation_tokens.clear();
-        free_checkpoints(&mut m.prefill_checkpoints, gpu);
-        free_checkpoints(&mut m.dflash_checkpoints, gpu);
-        // qwen35 recurrent state lives in the bundle (ModelState::Qwen35), not
-        // the always-None m.dn_state/m.kv_cache. Covers pp>1 + single-GPU.
-        if m.pp > 1 {
-            if let (Some(ModelState::Qwen35(b)), Some(ref mut gpus), Some(ref la)) = (
-                m.state.as_ref(),
-                m.pp_gpus.as_mut(),
-                m.pp_dn_la_to_device.as_ref(),
-            ) {
-                let dn = &b.dn_state;
-                for (i, s) in dn.s_matrices.iter().enumerate() {
-                    let g = &mut gpus.devices[la[i] as usize];
-                    let _ = g.bind_thread();
-                    let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-                }
-                for (i, s) in dn.s_scales.iter().enumerate() {
-                    let g = &mut gpus.devices[la[i] as usize];
-                    let _ = g.bind_thread();
-                    let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-                }
-                for (i, s) in dn.conv_states.iter().enumerate() {
-                    let g = &mut gpus.devices[la[i] as usize];
-                    let _ = g.bind_thread();
-                    let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-                }
-                // multi-GPU currently leaves s_ef_residual empty; loop is a no-op then,
-                // but keeps single-GPU parity if EF is ever wired per-device.
-                for (i, s) in dn.s_ef_residual.iter().enumerate() {
-                    let g = &mut gpus.devices[la[i] as usize];
-                    let _ = g.bind_thread();
-                    let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-                }
-            }
-        } else if let Some(ModelState::Qwen35(b)) = m.state.as_ref() {
-            let dn = &b.dn_state;
-            for s in &dn.s_matrices {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.s_scales {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.conv_states {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.s_ef_residual {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-        }
-        if let Some(ModelState::Qwen35(b)) = m.state.as_mut() {
-            b.kv_cache.compact_offset = 0;
-        }
-        if let Some(ModelState::Llama(b)) = m.state.as_mut() {
-            b.kv.compact_offset = 0;
-        }
-    }
-
-    let trailer = nl.len();
-    if m.seq_pos
-        .saturating_add(new_tokens.len())
-        .saturating_add(max_tokens)
-        .saturating_add(trailer)
-        > m.physical_cap
-    {
-        emit_active_attempt_error(
-            stdout,
-            Some(id),
-            &format!("request exceeds loaded KV budget: seq_pos={} + prefill={} + max_tokens={} + trailer={} > physical_cap={} — reload model with a larger max_seq", m.seq_pos, new_tokens.len(), max_tokens, trailer, m.physical_cap),
-            "context_length",
-            false,
-            false
-        );
-        let _ = stdout.flush();
-        return;
-    }
-
-    let im_end_token = if im_end.len() == 1 {
-        Some(im_end[0])
-    } else {
-        None
-    };
-    let tool_call_pair = match (
-        tokenizer.special_token_id("<tool_call>"),
-        tokenizer.special_token_id("</tool_call>"),
-    ) {
-        (Some(o), Some(c)) => Some((o, c)),
-        _ => None,
-    };
-    let think_pair = match (
-        tokenizer.special_token_id("<think>"),
-        tokenizer.special_token_id("</think>"),
-    ) {
-        (Some(o), Some(c)) => Some((o, c)),
-        _ => None,
-    };
-
-    let prefill_tokens = new_tokens.len();
-    let t0 = Instant::now();
-
-    let ModelState::Qwen35(b) = m.state.as_mut().unwrap() else {
-        unreachable!()
-    };
-    let config = &b.config;
-    let weights = &b.weights;
-    let scratch_set = m.pp_scratch_set.as_ref().unwrap();
-    let kv = &mut b.kv_cache;
-    let dn = &mut b.dn_state;
-    let gpus = m.pp_gpus.as_mut().unwrap();
-    let dn_la_to_device = m.pp_dn_la_to_device.as_ref().unwrap();
-
-    macro_rules! reset_pp_uncommitted_state {
-        () => {{
-            m.seq_pos = 0;
-            m.conversation_tokens.clear();
-            free_checkpoints(&mut m.prefill_checkpoints, gpu);
-            free_checkpoints(&mut m.dflash_checkpoints, gpu);
-            for (i, s) in dn.s_matrices.iter().enumerate() {
-                let g = &mut gpus.devices[dn_la_to_device[i] as usize];
-                let _ = g.bind_thread();
-                let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for (i, s) in dn.s_scales.iter().enumerate() {
-                let g = &mut gpus.devices[dn_la_to_device[i] as usize];
-                let _ = g.bind_thread();
-                let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for (i, s) in dn.conv_states.iter().enumerate() {
-                let g = &mut gpus.devices[dn_la_to_device[i] as usize];
-                let _ = g.bind_thread();
-                let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            // multi-GPU currently leaves s_ef_residual empty; loop is a no-op then,
-            // but keeps single-GPU parity if EF is ever wired per-device.
-            for (i, s) in dn.s_ef_residual.iter().enumerate() {
-                let g = &mut gpus.devices[dn_la_to_device[i] as usize];
-                let _ = g.bind_thread();
-                let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            kv.compact_offset = 0;
-            if let Some(ModelState::Llama(b)) = m.state.as_mut() {
-                b.kv.compact_offset = 0;
-            }
-        }};
-    }
-
-    let dev_last = gpus.output_device;
-    let vocab_size = config.vocab_size;
-    // Effective penalty window = request `_repeat_window` (default 128),
-    // bounded by repeat_buf capacity (2048). Default stays 128; the wide buffer
-    // only enables a larger window when a request explicitly sets one.
-    let repeat_buf_cap =
-        (scratch_set.per_device[dev_last].repeat_buf.buf.size() / 4).min(_repeat_window.max(1));
-
-    // hunt3 M-C: grammar-guided decoding for pp>1 (mirrors generate() ~8168).
-    // Without this, a pp>1 + tools request samples unconstrained once the model
-    // commits to <tool_call>, reproducing the ChatML-noise-in-tool_call-body
-    // attractor the single-GPU path masks via the qwen35 Matcher. The decoded
-    // vocab is built into a request-local Vec rather than cached on `m`
-    // (m.decoded_vocab) because `m` is already mutably borrowed here (kv/dn/gpus)
-    // — pp>1 + tools is uncommon, so the per-request decode is acceptable.
-    let grammar_enabled = hipfire_runtime::prompt_frame::qwen35_grammar_on(
-        std::env::var("HIPFIRE_QWEN35_GRAMMAR").ok().as_deref(),
-        &m.model_path,
-    );
-    let tool_schemas_qwen: Vec<hipfire_arch_qwen35::grammar::ToolSchema> = if grammar_enabled {
-        tools
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|t| {
-                        let func = t.get("function").unwrap_or(t);
-                        let name = func
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .filter(|s| !s.is_empty())?
-                            .to_string();
-                        let required: Vec<String> = func
-                            .get("parameters")
-                            .and_then(|p| p.get("required"))
-                            .and_then(|r| r.as_array())
-                            .map(|arr| {
-                                arr.iter()
-                                    .filter_map(|v| v.as_str().map(String::from))
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        Some(hipfire_arch_qwen35::grammar::ToolSchema { name, required })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-    let grammar_active = !tool_schemas_qwen.is_empty();
-    let mut grammar_matcher = hipfire_arch_qwen35::grammar::Matcher::with_config(
-        tool_schemas_qwen,
-        hipfire_arch_qwen35::grammar_config::resolve_qwen35_grammar_config(),
-    );
-    let grammar_vocab: Vec<String> = if grammar_active {
-        let n = tokenizer.vocab_size();
-        (0..n).map(|id| tokenizer.decode(&[id as u32])).collect()
-    } else {
-        Vec::new()
-    };
-    let mut grammar_mask: Vec<bool> = vec![true; grammar_vocab.len()];
-
-    if let Err(e) = qwen35::forward_prefill_batch_multi(
-        gpus,
-        weights,
-        config,
-        &new_tokens,
-        m.seq_pos,
-        kv,
-        dn,
-        scratch_set,
-    ) {
-        // hunt3 M-A: a partial-band prefill failure leaves DeltaNet partially
-        // advanced; without resetting, the next cold turn prefills over dirty
-        // recurrent state (drift). Mirror both abort paths, which already reset.
-        reset_pp_uncommitted_state!();
-        emit_active_attempt_error(
-            stdout,
-            Some(id),
-            &format!("forward_prefill_batch_multi: {}", e),
-            "validation",
-            false,
-            false,
-        );
-        let _ = stdout.flush();
-        return;
-    }
-    m.seq_pos += new_tokens.len();
-    m.conversation_tokens.extend_from_slice(&new_tokens);
-
-    if check_abort(id) {
-        reset_pp_uncommitted_state!();
-        let ep = production_fail_closed_rollback(m, gpu, None, None);
-        emit_spec_cancel_after_rollback(stdout, id, 0, &ep);
-        return;
-    }
-
-    // ngram scope: generated tokens only (matches pp=1).
-    let ngram_scope_start = m.conversation_tokens.len();
-
-    let mut rng_state: u32 = 0x13579BDFu32;
-
-    let attractor_pairs: Vec<(u32, u32)> = tool_call_pair
-        .into_iter()
-        .chain(think_pair.into_iter())
-        .collect();
-
-    // First sample on the output device.
-    let ngram_scope = &m.conversation_tokens[ngram_scope_start..];
-    let mut blocked0: Vec<u32> = Vec::new();
-    sampler::collect_unclosed_attractor_blocks(ngram_scope, &attractor_pairs, 20, 2, &mut blocked0);
-    let cfg0 = SamplerConfig {
-        temperature: temp,
-        top_p,
-        repeat_penalty,
-        repeat_window: repeat_buf_cap,
-        presence_penalty,
-        frequency_penalty,
-        blocked_tokens: blocked0,
-        top_k,
-        min_p,
-    };
-    // hunt3 M-C: grammar-gated first sample (GPU fast path when matcher free;
-    // CPU mask-then-sample when constraining). Matches generate()'s tok0 site.
-    let tok0 = {
-        let s_last = &scratch_set.per_device[dev_last];
-        let g_last = &mut gpus.devices[dev_last];
-        if grammar_active && !grammar_matcher.is_free() {
-            let _ = g_last.bind_thread();
-            let mut logits = g_last
-                .download_f32(&s_last.logits)
-                .unwrap_or_else(|_| vec![0.0f32; vocab_size]);
-            grammar_matcher.token_mask(&grammar_vocab, &mut grammar_mask);
-            hipfire_arch_qwen35::grammar::Matcher::apply_mask_to_logits(&grammar_mask, &mut logits);
-            sampler::sample_cpu(&mut logits, ngram_scope, &cfg0)
-        } else {
-            sampler::sample(
-                g_last,
-                &s_last.logits,
-                &s_last.sample_buf,
-                &s_last.repeat_buf,
-                vocab_size,
-                ngram_scope,
-                &cfg0,
-                &mut rng_state,
-            )
-        }
-    };
-    if grammar_active {
-        grammar_matcher.advance(&tokenizer.decode(&[tok0]));
-    }
-    let t_prefill = Instant::now();
-    let mut next_token = tok0;
-
-    let mut generated = 0usize;
-    let mut streamed_tokens: Vec<u32> = Vec::new();
-    let mut bytes_fed_to_filter = 0usize;
-    let mut filter = EosFilter::new(EosFilterConfig::default());
-    let mut alert_fired = false;
-    let mut think_count: usize = 0;
-    let mut prev_in_think: bool = false;
-    let mut force_answer_latched = false;
-    let think_open_tok = tokenizer.special_token_id("<think>");
-    let max_total_think = hipfire_runtime::config::get().max_total_think_tokens;
-    let mut total_think_tokens: usize = 0;
-    // Post-latch answer bound. Once the think-cap latches we force-close <think>
-    // and ask the model to answer; but `total_think_tokens` only advances
-    // in-think, so a model that rambles a NON-think answer (or re-opens <think>
-    // in a tight loop the force-close keeps re-closing) never trips the +256 EOS
-    // and runs to max_tokens. Mark the latch position and hard-EOS once
-    // generation runs this many tokens past it — generous for a real final
-    // answer, bounded against runaway.
-    let post_latch_answer_budget: usize = std::env::var("HIPFIRE_POST_LATCH_ANSWER_TOKENS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(768);
-    let mut latch_gen_mark: Option<usize> = None;
-    let loop_guard =
-        hipfire_runtime::loop_guard::LoopGuard::from_config(hipfire_runtime::config::get());
-
-    while generated < max_tokens {
-        if check_abort(id) {
-            reset_pp_uncommitted_state!();
-            let ep = production_fail_closed_rollback(m, gpu, None, None);
-            emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
-            return;
-        }
-        generated += 1;
-        m.conversation_tokens.push(next_token);
-        streamed_tokens.push(next_token);
-        emit_committed_event(
-            stdout,
-            id,
-            next_token,
-            streamed_tokens.len() - 1,
-            t0.elapsed().as_millis() as u64,
-        );
-        let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
-        let new_bytes = &all_bytes[bytes_fed_to_filter..];
-        bytes_fed_to_filter = all_bytes.len();
-        if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
-            let text = std::str::from_utf8(&text_bytes).unwrap();
-            let _ = writeln!(
-                stdout,
-                r#"{{"type":"token","id":"{}","text":{},"attempt_id":{}}}"#,
-                id,
-                serde_json::to_string(&text).unwrap_or_default(),
-                active_attempt_id()
-            );
-            let _ = stdout.flush();
-        }
-
-        if let Err(e) = qwen35::forward_scratch_multi(
-            gpus,
-            weights,
-            config,
-            next_token,
-            m.seq_pos,
-            kv,
-            dn,
-            scratch_set,
-        ) {
-            // hunt3 M-A: a decode-step failure leaves DeltaNet advanced past the
-            // (un-baked) conversation_tokens; reset so the next cold turn starts
-            // clean. Mirrors both abort paths.
-            reset_pp_uncommitted_state!();
-            emit_active_attempt_error(
-                stdout,
-                Some(id),
-                &format!("forward_scratch_multi decode: {}", e),
-                "validation",
-                false,
-                false,
-            );
-            let _ = stdout.flush();
-            return;
-        }
-        m.seq_pos += 1;
-
-        if next_token == config.eos_token {
-            break;
-        }
-        if im_end_token == Some(next_token) {
-            break;
-        }
-        if tokenizer.is_terminator(next_token) {
-            break;
-        }
-
-        // hunt3 M-F: user stop-sequence match against the decoded output suffix
-        // (pp>1 multi-GPU path). Mirrors the AR generate() loop; matches the
-        // full decoded text so a stop string spanning a token boundary is
-        // caught. A plain break exits the `while generated < max_tokens` loop
-        // (this path's `done` event carries no finish_reason field, so there is
-        // no reason to resolve — terminating generation is the contract). Gated
-        // behind `!stop.is_empty()` so the common path pays nothing.
-        if !stop.is_empty() {
-            let decoded_suffix = tokenizer.decode(&streamed_tokens);
-            if stop.iter().any(|s| decoded_suffix.ends_with(s.as_str())) {
-                break;
-            }
-        }
-
-        // max_think_tokens / force-answer enforcement: same decoded-text scan
-        // as pp=1, but all recurrent-state writes route through *_multi.
-        let force_answer_now = check_force_answer(id);
-        if force_answer_now {
-            force_answer_latched = true;
-        }
-        if max_think_tokens > 0 || force_answer_now || force_answer_latched || max_total_think > 0 {
-            let raw_so_far = tokenizer.decode_bytes(&streamed_tokens);
-            let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
-            let in_think = currently_in_think(raw_str, started_in_think);
-            if in_think {
-                total_think_tokens += 1;
-            }
-            if max_total_think > 0 && total_think_tokens >= max_total_think {
-                force_answer_latched = true;
-            }
-            if force_answer_latched && latch_gen_mark.is_none() {
-                latch_gen_mark = Some(generated);
-            }
-            if max_total_think > 0 && in_think && total_think_tokens >= max_total_think + 256 {
-                eprintln!("[think-cap] id={} — total think {} exceeded cap {}+256 while still thinking; forcing EOS", id, total_think_tokens, max_total_think);
-                break;
-            }
-            if let Some(mark) = latch_gen_mark {
-                if generated.saturating_sub(mark) >= post_latch_answer_budget {
-                    eprintln!("[think-cap] id={} — {} tokens since think-cap latch without finishing; forcing EOS", id, generated.saturating_sub(mark));
-                    break;
-                }
-            }
-            if max_think_tokens > 0 {
-                if in_think {
-                    if !prev_in_think {
-                        think_count = 1;
-                    } else {
-                        think_count += 1;
-                    }
-                } else {
-                    think_count = 0;
-                }
-                prev_in_think = in_think;
-            }
-            let budget_hit = max_think_tokens > 0 && think_count >= max_think_tokens;
-
-            if in_think && (budget_hit || force_answer_now || force_answer_latched) {
-                if force_answer_now {
-                    eprintln!(
-                        "[force-answer] id={} — closing <think> mid-turn to commit to the answer",
-                        id
-                    );
-                } else if force_answer_latched {
-                    eprintln!("[force-answer] id={} — re-closing a re-opened <think> (latched / think-cap)", id);
-                }
-                let close_tokens = tokenizer.encode(&think_continuation());
-                let budget_left = max_tokens.saturating_sub(generated);
-                let take = close_tokens.len().min(budget_left);
-                for &t in &close_tokens[..take] {
-                    if let Err(e) = qwen35::forward_scratch_multi(
-                        gpus,
-                        weights,
-                        config,
-                        t,
-                        m.seq_pos,
-                        kv,
-                        dn,
-                        scratch_set,
-                    ) {
-                        eprintln!("[daemon] max_think close forward_scratch_multi: {}", e);
-                        break;
-                    }
-                    m.seq_pos += 1;
-                    m.conversation_tokens.push(t);
-                    // hunt3 M-C: keep the grammar matcher in sync over force-closed
-                    // </think> tokens, exactly as generate() does (~8591). Without
-                    // this a tools request that force-closes <think> leaves the
-                    // matcher stale → malformed tool calls after the forced close.
-                    if grammar_active {
-                        grammar_matcher.advance(&tokenizer.decode(&[t]));
-                    }
-                    streamed_tokens.push(t);
-                    emit_committed_event(
-                        stdout,
-                        id,
-                        t,
-                        streamed_tokens.len() - 1,
-                        t0.elapsed().as_millis() as u64,
-                    );
-                    let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
-                    let new_bytes = &all_bytes[bytes_fed_to_filter..];
-                    bytes_fed_to_filter = all_bytes.len();
-                    if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
-                        let text = std::str::from_utf8(&text_bytes).unwrap();
-                        let _ = writeln!(
-                            stdout,
-                            r#"{{"type":"token","id":"{}","text":{},"attempt_id":{}}}"#,
-                            id,
-                            serde_json::to_string(&text).unwrap_or_default(),
-                            active_attempt_id()
-                        );
-                        let _ = stdout.flush();
-                    }
-                    generated += 1;
-                }
-                think_count = 0;
-                prev_in_think = false;
-                if generated >= max_tokens {
-                    break;
-                }
-            }
-        }
-
-        // N-gram loop detector (token-side, no GPU work).
-        if let Some(hipfire_runtime::loop_guard::StopReason::NgramRepeat { count, .. }) =
-            loop_guard.check(&streamed_tokens)
-        {
-            let window_len = loop_guard.window_len(streamed_tokens.len());
-            let _ = writeln!(
-                stdout,
-                r#"{{"type":"info","id":"{}","message":"ngram loop detected (4gram repeated {}× in last {} tokens) — forcing EOS"}}"#,
-                id, count, window_len
-            );
-            let _ = stdout.flush();
-            break;
-        }
-
-        // Budget-alert injection: gated to inside an open <think> block.
-        if !alert_fired
-            && budget_alert_at_tok > 0
-            && generated >= budget_alert_at_tok
-            && !budget_alert_text.is_empty()
-        {
-            alert_fired = true;
-            let raw_so_far = tokenizer.decode_bytes(&streamed_tokens);
-            let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
-            let in_think = currently_in_think(raw_str, started_in_think);
-            if !in_think {
-                let _ = writeln!(
-                    stdout,
-                    r#"{{"type":"info","id":"{}","message":"budget_alert skipped: not inside an open <think> block"}}"#,
-                    id
-                );
-                let _ = stdout.flush();
-                let ngram_scope = &m.conversation_tokens[ngram_scope_start..];
-                let mut blocked: Vec<u32> = Vec::new();
-                sampler::collect_unclosed_attractor_blocks(
-                    ngram_scope,
-                    &attractor_pairs,
-                    20,
-                    2,
-                    &mut blocked,
-                );
-                if force_answer_latched {
-                    if let Some(t) = think_open_tok {
-                        blocked.push(t);
-                    }
-                }
-                let cfg = SamplerConfig {
-                    temperature: temp,
-                    top_p,
-                    repeat_penalty,
-                    repeat_window: repeat_buf_cap,
-                    presence_penalty,
-                    frequency_penalty,
-                    blocked_tokens: blocked,
-                    top_k,
-                    min_p,
-                };
-                // hunt3 M-C: grammar-gated budget-alert resample.
-                next_token = {
-                    let s_last = &scratch_set.per_device[dev_last];
-                    let g_last = &mut gpus.devices[dev_last];
-                    if grammar_active && !grammar_matcher.is_free() {
-                        let _ = g_last.bind_thread();
-                        let mut logits = g_last
-                            .download_f32(&s_last.logits)
-                            .unwrap_or_else(|_| vec![0.0f32; vocab_size]);
-                        grammar_matcher.token_mask(&grammar_vocab, &mut grammar_mask);
-                        hipfire_arch_qwen35::grammar::Matcher::apply_mask_to_logits(
-                            &grammar_mask,
-                            &mut logits,
-                        );
-                        sampler::sample_cpu(&mut logits, ngram_scope, &cfg)
-                    } else {
-                        sampler::sample(
-                            g_last,
-                            &s_last.logits,
-                            &s_last.sample_buf,
-                            &s_last.repeat_buf,
-                            vocab_size,
-                            ngram_scope,
-                            &cfg,
-                            &mut rng_state,
-                        )
-                    }
-                };
-                if grammar_active {
-                    grammar_matcher.advance(&tokenizer.decode(&[next_token]));
-                }
-                continue;
-            }
-            let nudge_tokens = tokenizer.encode(budget_alert_text);
-            let budget_left = max_tokens.saturating_sub(generated);
-            let nudge_len = nudge_tokens.len().min(budget_left);
-            let need_kv = m
-                .seq_pos
-                .saturating_add(nudge_len)
-                .saturating_add(
-                    max_tokens
-                        .saturating_sub(generated)
-                        .saturating_sub(nudge_len),
-                )
-                .saturating_add(nl.len());
-            if nudge_len > 0 && need_kv <= m.physical_cap {
-                for &tok in &nudge_tokens[..nudge_len] {
-                    m.conversation_tokens.push(tok);
-                    streamed_tokens.push(tok);
-                    emit_committed_event(
-                        stdout,
-                        id,
-                        tok,
-                        streamed_tokens.len() - 1,
-                        t0.elapsed().as_millis() as u64,
-                    );
-                    let all_bytes2 = tokenizer.decode_bytes(&streamed_tokens);
-                    let new_bytes2 = &all_bytes2[bytes_fed_to_filter..];
-                    bytes_fed_to_filter = all_bytes2.len();
-                    if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes2) {
-                        let t = std::str::from_utf8(&text_bytes).unwrap();
-                        let _ = writeln!(
-                            stdout,
-                            r#"{{"type":"token","id":"{}","text":{},"attempt_id":{}}}"#,
-                            id,
-                            serde_json::to_string(&t).unwrap_or_default(),
-                            active_attempt_id()
-                        );
-                        let _ = stdout.flush();
-                    }
-                    if let Err(e) = qwen35::forward_scratch_multi(
-                        gpus,
-                        weights,
-                        config,
-                        tok,
-                        m.seq_pos,
-                        kv,
-                        dn,
-                        scratch_set,
-                    ) {
-                        eprintln!("[daemon] budget_alert forward_scratch_multi: {}", e);
-                        break;
-                    }
-                    m.seq_pos += 1;
-                    generated += 1;
-                }
-            } else if nudge_len < nudge_tokens.len() {
-                let _ = writeln!(
-                    stdout,
-                    r#"{{"type":"info","id":"{}","message":"budget_alert clipped or skipped: nudge_len={} budget_left={}"}}"#,
-                    id, nudge_len, budget_left
-                );
-                let _ = stdout.flush();
-            } else {
-                let _ = writeln!(
-                    stdout,
-                    r#"{{"type":"info","id":"{}","message":"budget_alert skipped: not enough KV headroom"}}"#,
-                    id
-                );
-                let _ = stdout.flush();
-            }
-            if generated >= max_tokens {
-                break;
-            }
-        }
-
-        // Steady-state sample.
-        let ngram_scope = &m.conversation_tokens[ngram_scope_start..];
-        let mut blocked: Vec<u32> = Vec::new();
-        sampler::collect_unclosed_attractor_blocks(
-            ngram_scope,
-            &attractor_pairs,
-            20,
-            2,
-            &mut blocked,
-        );
-        if force_answer_latched {
-            if let Some(t) = think_open_tok {
-                blocked.push(t);
-            }
-        }
-        let cfg = SamplerConfig {
-            temperature: temp,
-            top_p,
-            repeat_penalty,
-            repeat_window: repeat_buf_cap,
-            presence_penalty,
-            frequency_penalty,
-            blocked_tokens: blocked,
-            top_k,
-            min_p,
-        };
-        // hunt3 M-C: grammar-gated steady-state sample.
-        next_token = {
-            let s_last = &scratch_set.per_device[dev_last];
-            let g_last = &mut gpus.devices[dev_last];
-            if grammar_active && !grammar_matcher.is_free() {
-                let _ = g_last.bind_thread();
-                let mut logits = g_last
-                    .download_f32(&s_last.logits)
-                    .unwrap_or_else(|_| vec![0.0f32; vocab_size]);
-                grammar_matcher.token_mask(&grammar_vocab, &mut grammar_mask);
-                hipfire_arch_qwen35::grammar::Matcher::apply_mask_to_logits(
-                    &grammar_mask,
-                    &mut logits,
-                );
-                sampler::sample_cpu(&mut logits, ngram_scope, &cfg)
-            } else {
-                sampler::sample(
-                    g_last,
-                    &s_last.logits,
-                    &s_last.sample_buf,
-                    &s_last.repeat_buf,
-                    vocab_size,
-                    ngram_scope,
-                    &cfg,
-                    &mut rng_state,
-                )
-            }
-        };
-        if grammar_active {
-            let was_detected = grammar_matcher.attractor_detected();
-            grammar_matcher.advance(&tokenizer.decode(&[next_token]));
-            if !was_detected && grammar_matcher.attractor_detected() {
-                eprintln!(
-                    "[grammar-ngram pp] attractor detected in tool_call args at gen={} — forcing close",
-                    generated,
-                );
-            }
-        }
-    }
-
-    // ChatML \n trailer so the next turn opens cleanly.
-    if im_end_token == Some(*m.conversation_tokens.last().unwrap_or(&0)) && !nl.is_empty() {
-        for &t in &nl {
-            if let Err(e) = qwen35::forward_scratch_multi(
-                gpus,
-                weights,
-                config,
-                t,
-                m.seq_pos,
-                kv,
-                dn,
-                scratch_set,
-            ) {
-                eprintln!("[daemon] trailer forward_scratch_multi: {}", e);
-                break;
-            }
-            m.seq_pos += 1;
-            m.conversation_tokens.push(t);
-        }
-    }
-
-    // Timing + pending done fixed before handshake so commit_ready carries
-    // the exact eventual done payload. Abort rolls back + emits one
-    // cancellation lifecycle (or fail-closed error if unattested).
-    let t_end = Instant::now();
-    let total_s = t_end.duration_since(t0).as_secs_f64();
-    let prefill_s = t_prefill.duration_since(t0).as_secs_f64();
-    let decode_s = t_end.duration_since(t_prefill).as_secs_f64();
-    let tok_s = if total_s > 0.0 {
-        generated as f64 / total_s
-    } else {
-        0.0
-    };
-    let prefill_tok_s = if prefill_s > 0.0 {
-        prefill_tokens as f64 / prefill_s
-    } else {
-        0.0
-    };
-    let decode_tok_s = if decode_s > 0.0 {
-        generated as f64 / decode_s
-    } else {
-        0.0
-    };
-    let pending_done = serde_json::json!({
-        "type": "done",
-        "id": id,
-        "tokens": generated,
-        "tok_s": (tok_s * 10.0).round() / 10.0,
-        "prefill_tokens": prefill_tokens,
-        "prefill_ms": (prefill_s * 1000.0 * 10.0).round() / 10.0,
-        "prefill_tok_s": (prefill_tok_s * 10.0).round() / 10.0,
-        "decode_tok_s": (decode_tok_s * 10.0).round() / 10.0,
-        "ttft_ms": (prefill_s * 1000.0 * 10.0).round() / 10.0,
-        "attempt_id": active_attempt_id(),
-    });
-    let decision = await_client_terminal_commit(stdout, id, &pending_done);
-    if decision != ClientTerminalDecision::Commit {
-        reset_pp_uncommitted_state!();
-        let ep = production_fail_closed_rollback(m, gpu, None, None);
-        emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
-        return;
-    }
-    emit_staged_terminal_done(stdout, &pending_done);
-}
 
 /// Exhaustive producer-route identity for one generate turn.
 ///
@@ -19798,40 +11820,7 @@ fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
         GenerationRoute::Unknown
     }
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GlimmerSpecMode {
-    Off,
-    Greedy,
-    ChainSampled,
-}
 
-/// Glimmer speculation admission. Greedy is the validated path; the sampled
-/// chain-sample path mirrors the arch 5/6 `chain_sample_route` conditions.
-fn glimmer_spec_admission(
-    has_drafter: bool,
-    max_tokens: usize,
-    temp: f32,
-    min_p: Option<f32>,
-    fast_sample_on: bool,
-    temp_spec_env_off: bool,
-    batched_logits_available: bool,
-) -> GlimmerSpecMode {
-    if !has_drafter || max_tokens <= 1 {
-        return GlimmerSpecMode::Off;
-    }
-    if temp <= 0.01 {
-        return GlimmerSpecMode::Greedy;
-    }
-    if temp > 1e-6
-        && fast_sample_on
-        && !temp_spec_env_off
-        && min_p.map_or(true, |p| p <= 0.0)
-        && batched_logits_available
-    {
-        return GlimmerSpecMode::ChainSampled;
-    }
-    GlimmerSpecMode::Off
-}
 
 #[inline]
 fn llama_qwen3_batched_prefill_eligible(
@@ -19901,88 +11890,88 @@ mod llama_batched_prefill_tests {
 }
 #[cfg(test)]
 mod glimmer_spec_admission_tests {
-    use super::{glimmer_spec_admission, GlimmerSpecMode};
+    use hipfire_generate::dense::{glimmer_spec_admission, GlimmerSpecMode};
 
     #[test]
     fn greedy_at_temp_zero() {
-        let m = glimmer_spec_admission(true, 16, 0.0, None, true, false, true);
-        assert_eq!(m, GlimmerSpecMode::Greedy);
-        let m2 = glimmer_spec_admission(true, 16, 0.01, None, true, false, true);
-        assert_eq!(m2, GlimmerSpecMode::Greedy);
+        let m = hipfire_generate::dense::glimmer_spec_admission(true, 16, 0.0, None, true, false, true);
+        assert_eq!(m, hipfire_generate::dense::GlimmerSpecMode::Greedy);
+        let m2 = hipfire_generate::dense::glimmer_spec_admission(true, 16, 0.01, None, true, false, true);
+        assert_eq!(m2, hipfire_generate::dense::GlimmerSpecMode::Greedy);
     }
 
     #[test]
     fn chain_sampled_at_temp_one_with_defaults() {
-        let m = glimmer_spec_admission(true, 16, 1.0, None, true, false, true);
-        assert_eq!(m, GlimmerSpecMode::ChainSampled);
+        let m = hipfire_generate::dense::glimmer_spec_admission(true, 16, 1.0, None, true, false, true);
+        assert_eq!(m, hipfire_generate::dense::GlimmerSpecMode::ChainSampled);
     }
 
     #[test]
     fn off_when_min_p_present() {
-        let m = glimmer_spec_admission(true, 16, 1.0, Some(0.05), true, false, true);
-        assert_eq!(m, GlimmerSpecMode::Off);
+        let m = hipfire_generate::dense::glimmer_spec_admission(true, 16, 1.0, Some(0.05), true, false, true);
+        assert_eq!(m, hipfire_generate::dense::GlimmerSpecMode::Off);
         // zero and None are allowed
-        let ok0 = glimmer_spec_admission(true, 16, 1.0, Some(0.0), true, false, true);
-        assert_eq!(ok0, GlimmerSpecMode::ChainSampled);
-        let ok_none = glimmer_spec_admission(true, 16, 1.0, None, true, false, true);
-        assert_eq!(ok_none, GlimmerSpecMode::ChainSampled);
+        let ok0 = hipfire_generate::dense::glimmer_spec_admission(true, 16, 1.0, Some(0.0), true, false, true);
+        assert_eq!(ok0, hipfire_generate::dense::GlimmerSpecMode::ChainSampled);
+        let ok_none = hipfire_generate::dense::glimmer_spec_admission(true, 16, 1.0, None, true, false, true);
+        assert_eq!(ok_none, hipfire_generate::dense::GlimmerSpecMode::ChainSampled);
     }
 
     #[test]
     fn off_when_fast_sample_off() {
-        let m = glimmer_spec_admission(true, 16, 1.0, None, false, false, true);
-        assert_eq!(m, GlimmerSpecMode::Off);
+        let m = hipfire_generate::dense::glimmer_spec_admission(true, 16, 1.0, None, false, false, true);
+        assert_eq!(m, hipfire_generate::dense::GlimmerSpecMode::Off);
     }
 
     #[test]
     fn off_when_temp_spec_env_off() {
-        let m = glimmer_spec_admission(true, 16, 1.0, None, true, true, true);
-        assert_eq!(m, GlimmerSpecMode::Off);
+        let m = hipfire_generate::dense::glimmer_spec_admission(true, 16, 1.0, None, true, true, true);
+        assert_eq!(m, hipfire_generate::dense::GlimmerSpecMode::Off);
     }
 
     #[test]
     fn off_when_batched_logits_unavailable() {
-        let m = glimmer_spec_admission(true, 16, 1.0, None, true, false, false);
-        assert_eq!(m, GlimmerSpecMode::Off);
+        let m = hipfire_generate::dense::glimmer_spec_admission(true, 16, 1.0, None, true, false, false);
+        assert_eq!(m, hipfire_generate::dense::GlimmerSpecMode::Off);
         // greedy does NOT require batched logits (still Greedy)
-        let g = glimmer_spec_admission(true, 16, 0.005, None, true, false, false);
-        assert_eq!(g, GlimmerSpecMode::Greedy);
+        let g = hipfire_generate::dense::glimmer_spec_admission(true, 16, 0.005, None, true, false, false);
+        assert_eq!(g, hipfire_generate::dense::GlimmerSpecMode::Greedy);
     }
 
     #[test]
     fn off_when_max_tokens_one() {
-        let m = glimmer_spec_admission(true, 1, 0.0, None, true, false, true);
-        assert_eq!(m, GlimmerSpecMode::Off);
-        let m2 = glimmer_spec_admission(true, 1, 1.0, None, true, false, true);
-        assert_eq!(m2, GlimmerSpecMode::Off);
+        let m = hipfire_generate::dense::glimmer_spec_admission(true, 1, 0.0, None, true, false, true);
+        assert_eq!(m, hipfire_generate::dense::GlimmerSpecMode::Off);
+        let m2 = hipfire_generate::dense::glimmer_spec_admission(true, 1, 1.0, None, true, false, true);
+        assert_eq!(m2, hipfire_generate::dense::GlimmerSpecMode::Off);
     }
 
     #[test]
     fn off_when_no_drafter() {
-        let m = glimmer_spec_admission(false, 16, 0.0, None, true, false, true);
-        assert_eq!(m, GlimmerSpecMode::Off);
-        let m2 = glimmer_spec_admission(false, 16, 1.0, None, true, false, true);
-        assert_eq!(m2, GlimmerSpecMode::Off);
+        let m = hipfire_generate::dense::glimmer_spec_admission(false, 16, 0.0, None, true, false, true);
+        assert_eq!(m, hipfire_generate::dense::GlimmerSpecMode::Off);
+        let m2 = hipfire_generate::dense::glimmer_spec_admission(false, 16, 1.0, None, true, false, true);
+        assert_eq!(m2, hipfire_generate::dense::GlimmerSpecMode::Off);
     }
 
     #[test]
     fn temp_boundary() {
         assert_eq!(
-            glimmer_spec_admission(true, 16, 0.01, None, true, false, true),
-            GlimmerSpecMode::Greedy
+            hipfire_generate::dense::glimmer_spec_admission(true, 16, 0.01, None, true, false, true),
+            hipfire_generate::dense::GlimmerSpecMode::Greedy
         );
         assert_eq!(
-            glimmer_spec_admission(true, 16, 0.02, None, true, false, true),
-            GlimmerSpecMode::ChainSampled
+            hipfire_generate::dense::glimmer_spec_admission(true, 16, 0.02, None, true, false, true),
+            hipfire_generate::dense::GlimmerSpecMode::ChainSampled
         );
         // just above greedy threshold but at/under 1e-6 should be Off, not sampled
         assert_eq!(
-            glimmer_spec_admission(true, 16, 1e-6, None, true, false, true),
-            GlimmerSpecMode::Greedy
+            hipfire_generate::dense::glimmer_spec_admission(true, 16, 1e-6, None, true, false, true),
+            hipfire_generate::dense::GlimmerSpecMode::Greedy
         );
         assert_eq!(
-            glimmer_spec_admission(true, 16, 5e-7, None, true, false, true),
-            GlimmerSpecMode::Greedy
+            hipfire_generate::dense::glimmer_spec_admission(true, 16, 5e-7, None, true, false, true),
+            hipfire_generate::dense::GlimmerSpecMode::Greedy
         );
     }
 }
@@ -20061,7 +12050,7 @@ fn generate(
     let selected_route = select_generation_route(&route_inputs);
     let tools_nonempty = tools.map(|t| !t.is_empty()).unwrap_or(false);
     if tools_nonempty && !selected_route.supports_tools() {
-        emit_active_attempt_error(
+        hipfire_generate::dense::emit_active_attempt_error(
             stdout,
             Some(id),
             &format!(
@@ -20110,7 +12099,7 @@ fn generate(
             frequency_penalty,
         );
         let _ = stop;
-        generate_gemma4(
+        hipfire_generate::dense::generate_gemma4(
             m,
             gpu,
             stdout,
@@ -20143,7 +12132,7 @@ fn generate(
             frequency_penalty,
         );
         let _ = stop;
-        generate_muse_glimmer(
+        hipfire_generate::dense::generate_muse_glimmer(
             m,
             gpu,
             stdout,
@@ -20188,7 +12177,7 @@ fn generate(
     let mut drafter_gpu = drafter_gpu;
 
     // Dispatch is structurally authoritative on `selected_route`. Spec-capacity
-    // miss fallthrough (generate_dflash → false) stays inside the Spec arm and
+    // miss fallthrough (hipfire_generate::qwen::generate_dflash → false) stays inside the Spec arm and
     // continues to that arch's AR producer — never an independent re-predicate.
     match selected_route {
         GenerationRoute::Deepseek4Ep | GenerationRoute::MiniMaxEp => {
@@ -20199,13 +12188,13 @@ fn generate(
             // which loops on ds4's quantized instruct model (card mandates
             // temp=1.0/top_p=1.0). reset_cpu_sampler_rng(0x13579BDF) was already
             // called above, so the host-side draw in ep_serve_* is deterministic.
-            let ep_sampling = EpSampling {
+            let ep_sampling = hipfire_generate::qwen::EpSampling {
                 temp,
                 top_p,
                 top_k,
                 min_p,
             };
-            generate_ep(
+            hipfire_generate::qwen::generate_ep(
                 m,
                 stdout,
                 id,
@@ -20223,13 +12212,13 @@ fn generate(
         }
         GenerationRoute::Unknown if m.ep.is_some() => {
             // EP on an unregistered arch_id — preserve tool-free EP serve.
-            let ep_sampling = EpSampling {
+            let ep_sampling = hipfire_generate::qwen::EpSampling {
                 temp,
                 top_p,
                 top_k,
                 min_p,
             };
-            generate_ep(
+            hipfire_generate::qwen::generate_ep(
                 m,
                 stdout,
                 id,
@@ -20246,7 +12235,7 @@ fn generate(
             return;
         }
         GenerationRoute::Qwen2Spec => {
-            if generate_dflash(
+            if hipfire_generate::qwen::generate_dflash(
                 m,
                 gpu,
                 stdout,
@@ -20282,7 +12271,7 @@ fn generate(
                 messages_history,
             );
             let _ = stop;
-            generate_qwen2(
+            hipfire_generate::dense::generate_qwen2(
                 m,
                 gpu,
                 stdout,
@@ -20309,7 +12298,7 @@ fn generate(
                 messages_history,
             );
             let _ = stop;
-            generate_qwen2(
+            hipfire_generate::dense::generate_qwen2(
                 m,
                 gpu,
                 stdout,
@@ -20335,7 +12324,7 @@ fn generate(
             );
             let _ = (repeat_penalty, repeat_window);
             let _ = stop;
-            generate_deepseek4_spec(
+            hipfire_generate::dense::generate_deepseek4_spec(
                 m,
                 gpu,
                 stdout,
@@ -20364,7 +12353,7 @@ fn generate(
             );
             let _ = (repeat_penalty, repeat_window);
             let _ = stop;
-            generate_deepseek4(
+            hipfire_generate::dense::generate_deepseek4(
                 m,
                 gpu,
                 stdout,
@@ -20381,7 +12370,7 @@ fn generate(
             return;
         }
         GenerationRoute::LfmSpec => {
-            if generate_dflash(
+            if hipfire_generate::qwen::generate_dflash(
                 m,
                 gpu,
                 stdout,
@@ -20414,7 +12403,7 @@ fn generate(
                 think_mode,
             );
             let _ = (repeat_penalty, repeat_window);
-            generate_lfm2moe(
+            hipfire_generate::dense::generate_lfm2moe(
                 m,
                 gpu,
                 stdout,
@@ -20440,7 +12429,7 @@ fn generate(
                 think_mode,
             );
             let _ = (repeat_penalty, repeat_window);
-            generate_lfm2moe(
+            hipfire_generate::dense::generate_lfm2moe(
                 m,
                 gpu,
                 stdout,
@@ -20457,7 +12446,7 @@ fn generate(
             return;
         }
         GenerationRoute::CohereSpec => {
-            if generate_dflash(
+            if hipfire_generate::qwen::generate_dflash(
                 m,
                 gpu,
                 stdout,
@@ -20490,7 +12479,7 @@ fn generate(
                 think_mode,
             );
             let _ = (repeat_penalty, repeat_window);
-            generate_cohere2moe(
+            hipfire_generate::dense::generate_cohere2moe(
                 m,
                 gpu,
                 stdout,
@@ -20516,7 +12505,7 @@ fn generate(
                 think_mode,
             );
             let _ = (repeat_penalty, repeat_window);
-            generate_cohere2moe(
+            hipfire_generate::dense::generate_cohere2moe(
                 m,
                 gpu,
                 stdout,
@@ -20533,7 +12522,7 @@ fn generate(
             return;
         }
         GenerationRoute::MiniMaxSpec => {
-            if generate_dflash(
+            if hipfire_generate::qwen::generate_dflash(
                 m,
                 gpu,
                 stdout,
@@ -20566,7 +12555,7 @@ fn generate(
                 think_mode,
             );
             let _ = (repeat_penalty, repeat_window);
-            generate_minimax(
+            hipfire_generate::dense::generate_minimax(
                 m,
                 gpu,
                 stdout,
@@ -20592,7 +12581,7 @@ fn generate(
                 think_mode,
             );
             let _ = (repeat_penalty, repeat_window);
-            generate_minimax(
+            hipfire_generate::dense::generate_minimax(
                 m,
                 gpu,
                 stdout,
@@ -20636,7 +12625,7 @@ fn generate(
             return;
         }
         GenerationRoute::PipelineParallel => {
-            generate_multi(
+            hipfire_generate::qwen::generate_multi(
                 m,
                 gpu,
                 pflash_state,
@@ -20667,7 +12656,7 @@ fn generate(
             return;
         }
         GenerationRoute::QwenMtp => {
-            generate_qwen35_mtp(
+            hipfire_generate::qwen::generate_qwen35_mtp(
                 m,
                 gpu,
                 stdout,
@@ -20730,7 +12719,7 @@ fn generate(
                     dflash_bypass_reason = Some("dflash_decode_active");
                 }
             }
-            if generate_dflash(
+            if hipfire_generate::qwen::generate_dflash(
                 m,
                 gpu,
                 stdout,
@@ -20820,14 +12809,14 @@ fn generate(
         );
         m.seq_pos = 0;
         m.conversation_tokens.clear();
-        free_checkpoints(&mut m.prefill_checkpoints, gpu);
-        free_checkpoints(&mut m.dflash_checkpoints, gpu);
+        hipfire_generate::common::free_checkpoints(&mut m.prefill_checkpoints, gpu);
+        hipfire_generate::common::free_checkpoints(&mut m.dflash_checkpoints, gpu);
         // Free the speculator's (relocated) checkpoint ring on reset — this AR
         // path is reachable by a DFlash-capable model (temp>0 / budgeted-think /
         // HIPFIRE_DFLASH_CHAT=0), so its drafter state must not survive here.
         if let Some(s) = m.speculator.as_mut() {
             if let Err(e) = s.reset(gpu) {
-                emit_active_attempt_error(
+                hipfire_generate::dense::emit_active_attempt_error(
                     stdout,
                     Some(id),
                     &format!("context reset failed: {e}"),
@@ -20844,7 +12833,7 @@ fn generate(
         // Q8 error-feedback residual) cannot leak across rollover boundaries.
         if let Some(ModelState::Qwen35(b)) = m.state.as_mut() {
             if let Err(e) = b.dn_state.reset(gpu) {
-                emit_active_attempt_error(
+                hipfire_generate::dense::emit_active_attempt_error(
                     stdout,
                     Some(id),
                     &format!("context reset failed: {e}"),
@@ -21091,7 +13080,7 @@ fn generate(
     // ChatML/Plain). Falls back to Plain automatically when no template resolves.
     let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
     // Jinja renders the FULL conversation every turn (stateless full-render,
-    // like generate_dflash) — fire on every turn, not just `seq_pos == 0`.
+    // like hipfire_generate::qwen::generate_dflash) — fire on every turn, not just `seq_pos == 0`.
     // `render_messages` below replays `messages_history` (all prior turns) and
     // includes the system prompt, so turn 2+ no longer falls through to the
     // Plain branch (which dropped the system prompt and lost the Jinja
@@ -21170,7 +13159,7 @@ fn generate(
             }
             Err(e) => {
                 if reasoning_effort.is_some() {
-                    emit_active_attempt_error(
+                    hipfire_generate::dense::emit_active_attempt_error(
                         stdout,
                         Some(id),
                         &format!("jinja render: {e}"),
@@ -21300,8 +13289,8 @@ fn generate(
                 history,
                 tools,
                 |msg| {
-                    let normalized = normalize_asst_turn_for_fingerprint(&msg.content);
-                    let fp = asst_turn_fingerprint(&normalized, &msg.tool_calls);
+                    let normalized = hipfire_generate::common::normalize_asst_turn_for_fingerprint(&msg.content);
+                    let fp = hipfire_generate::common::asst_turn_fingerprint(&normalized, &msg.tool_calls);
                     // Content-only turn: see the dflash sibling above for why `text` is
                     // `msg.content`.
                     let hit = cache_ref.get(&fp).and_then(|turn| {
@@ -21331,7 +13320,7 @@ fn generate(
                 Ok(t) => t,
                 Err(e) => {
                     if reasoning_effort.is_some() {
-                        emit_active_attempt_error(
+                        hipfire_generate::dense::emit_active_attempt_error(
                             stdout,
                             Some(id),
                             &format!("qwen-cache jinja build: {e}"),
@@ -21354,10 +13343,10 @@ fn generate(
                 history,
                 &q_tokens,
                 assistant_prefix,
-                qwen_history_tool_render(&m.model_path),
+                hipfire_generate::qwen::qwen_history_tool_render(&m.model_path),
                 |msg| {
                     // Match the store side's stripping. The store applies
-                    // `strip_think_for_fingerprint` then `maybe_normalize_prompt`
+                    // `hipfire_generate::common::strip_think_for_fingerprint` then `maybe_normalize_prompt`
                     // to the model's emitted text before hashing. The CLI
                     // is SUPPOSED to strip `<think>...</think>` from the
                     // visible content before forwarding to clients, but
@@ -21369,10 +13358,10 @@ fn generate(
                     // verbatim. Apply the same strip here so the lookup
                     // hash matches the store hash regardless of whether
                     // the client preserved the orphan.
-                    let stripped = strip_think_for_fingerprint(&msg.content);
+                    let stripped = hipfire_generate::common::strip_think_for_fingerprint(&msg.content);
                     let normalized =
                         hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned();
-                    let fp = asst_turn_fingerprint(&normalized, &msg.tool_calls);
+                    let fp = hipfire_generate::common::asst_turn_fingerprint(&normalized, &msg.tool_calls);
                     // `build_cached_history` (the non-Jinja ChatScaffold path) still splices a
                     // flat token vector, so project the content slot out of the per-channel
                     // cache value. Qwen turns are content-only, so nothing is dropped.
@@ -21518,7 +13507,7 @@ fn generate(
             // S-matrix/conv_state (temp-0 non-determinism + BF16 divergence on
             // re-sent prompts). DeltaNet has no rewindable KV (unlike FullAttention),
             // so the exact-match edge MUST degrade to checkpoint-resume / cold reset —
-            // the strict-`<` HIT predicate the sibling DFlash plan_prompt_cache uses.
+            // the strict-`<` HIT predicate the sibling DFlash hipfire_generate::qwen::plan_prompt_cache uses.
             //
             // Divergence: the client sent a non-extension render (it dropped or
             // edited earlier history, so the prior conversation is no longer a
@@ -21608,7 +13597,7 @@ fn generate(
                     // m.dn_state/m.kv_cache.
                     m.seq_pos = 0;
                     m.conversation_tokens.clear();
-                    free_checkpoints(&mut m.prefill_checkpoints, gpu);
+                    hipfire_generate::common::free_checkpoints(&mut m.prefill_checkpoints, gpu);
                     if let Some(ModelState::Qwen35(b)) = m.state.as_ref() {
                         let dn = &b.dn_state;
                         for s in &dn.s_matrices {
@@ -21658,18 +13647,18 @@ fn generate(
     // (HIPFIRE_QWEN_PROMPT_CACHE=0), eviction/PFlash active. On turn 2+ in those
     // cases, reset BEFORE the budget guard + prefill so the full render writes
     // from position 0 rather than appending to the prior turn's dirty
-    // DeltaNet/KV/checkpoint state. Uses `free_checkpoints` (NOT a bare
+    // DeltaNet/KV/checkpoint state. Uses `hipfire_generate::common::free_checkpoints` (NOT a bare
     // `.clear()`) so the checkpoint GPU buffers are freed rather than leaked.
     if jinja_active && !cache_eligible && m.seq_pos > 0 {
         m.seq_pos = 0;
         m.conversation_tokens.clear();
-        free_checkpoints(&mut m.prefill_checkpoints, gpu);
-        free_checkpoints(&mut m.dflash_checkpoints, gpu);
+        hipfire_generate::common::free_checkpoints(&mut m.prefill_checkpoints, gpu);
+        hipfire_generate::common::free_checkpoints(&mut m.dflash_checkpoints, gpu);
         // Free the speculator's (relocated) checkpoint ring on reset — this AR
         // path is reachable by a DFlash-capable model.
         if let Some(s) = m.speculator.as_mut() {
             if let Err(e) = s.reset(gpu) {
-                emit_active_attempt_error(
+                hipfire_generate::dense::emit_active_attempt_error(
                     stdout,
                     Some(id),
                     &format!("prompt-cache reset failed: {e}"),
@@ -21733,7 +13722,7 @@ fn generate(
             .saturating_add(trailer)
             > m.physical_cap
         {
-            emit_active_attempt_error(
+            hipfire_generate::dense::emit_active_attempt_error(
                 stdout,
                 Some(id),
                 &format!("request exceeds loaded KV budget: seq_pos={} + prefill={} + max_tokens={} + trailer={} > physical_cap={} — reload model with a larger max_seq", m.seq_pos, new_tokens.len(), max_tokens, trailer, m.physical_cap),
@@ -21750,7 +13739,7 @@ fn generate(
         .saturating_add(trailer)
         > m.max_seq
     {
-        emit_active_attempt_error(
+        hipfire_generate::dense::emit_active_attempt_error(
             stdout,
             Some(id),
             &format!("request exceeds advertised context window: absolute={} + prefill={} + max_tokens={} + trailer={} > max_seq={}", absolute_pos, new_tokens.len(), max_tokens, trailer, m.max_seq),
@@ -21789,7 +13778,7 @@ fn generate(
     let prefill_tokens = new_tokens.len();
     // Pure arch→contract selection (same function tests exercise).
     // Qwen AR (5/6) advertises v2; DS4 and others stay unset.
-    let gen_contract = gen_start_contract_version_for_arch(m.arch_id);
+    let gen_contract = hipfire_generate::common::gen_start_contract_version_for_arch(m.arch_id);
     emit_gen_start(stdout, id, started_in_think, gen_contract);
     let t0 = Instant::now();
 
@@ -21834,7 +13823,7 @@ fn generate(
                 }
                 m.seq_pos = 0;
                 m.conversation_tokens.clear();
-                free_checkpoints(&mut m.prefill_checkpoints, gpu);
+                hipfire_generate::common::free_checkpoints(&mut m.prefill_checkpoints, gpu);
             }};
         }
 
@@ -21927,7 +13916,7 @@ fn generate(
                                 m.seq_pos, e
                             );
                             reset_ar_uncommitted_state!();
-                            emit_active_attempt_error(
+                            hipfire_generate::dense::emit_active_attempt_error(
                                 stdout,
                                 Some(id),
                                 &format!(
@@ -22005,7 +13994,7 @@ fn generate(
                                 m.seq_pos, e
                             );
                             // maybe_downshift already poisons on partial failure; surface hard.
-                            emit_active_attempt_error(
+                            hipfire_generate::dense::emit_active_attempt_error(
                                 stdout,
                                 Some(id),
                                 &format!("adaptive KV transition failed during prefill: {e}"),
@@ -22039,8 +14028,8 @@ fn generate(
             // Drop live bundle borrows (kv/dn) before production rollback, which
             // reborrows m.state for the authoritative fail-closed reset+sync.
             let _ = (kv, dn, weights, config, scratch);
-            let ep = production_fail_closed_rollback(m, gpu, None, None);
-            emit_spec_cancel_after_rollback(stdout, id, 0, &ep);
+            let ep = hipfire_generate::common::production_fail_closed_rollback(m, gpu, None, None);
+            hipfire_generate::common::emit_spec_cancel_after_rollback(stdout, id, 0, &ep);
             return;
         }
         // Adaptive KV: after prefill, downshift any tiers whose threshold the
@@ -22062,7 +14051,7 @@ fn generate(
                         "[adaptive-kv] maybe_downshift error @ pos {} (post-prefill): {:?} — poisoning model",
                         m.seq_pos, e
                     );
-                    emit_active_attempt_error(
+                    hipfire_generate::dense::emit_active_attempt_error(
                         stdout,
                         Some(id),
                         &format!("adaptive KV transition failed after prefill: {e}"),
@@ -22085,8 +14074,8 @@ fn generate(
         if FAULT_AFTER_PREFILL_ARMED.with(|c| c.get()) && matches!(m.arch_id, 5 | 6) {
             let _ = take_fault_after_prefill();
             let _ = (kv, dn, weights, config, scratch);
-            let ep = production_fail_closed_rollback(m, gpu, None, None);
-            emit_fail_closed_error(
+            let ep = hipfire_generate::common::production_fail_closed_rollback(m, gpu, None, None);
+            hipfire_generate::common::emit_fail_closed_error(
                 stdout,
                 Some(id),
                 "injected fault after prefill",
@@ -22348,8 +14337,8 @@ fn generate(
                 // cold reset via the common attestation path (not a partial
                 // manual clear). Terminal is aborted+done only when attested.
                 let _ = (kv, dn, weights, config, scratch);
-                let ep = production_fail_closed_rollback(m, gpu, None, None);
-                emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
+                let ep = hipfire_generate::common::production_fail_closed_rollback(m, gpu, None, None);
+                hipfire_generate::common::emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
                 return;
             }
             // Write this token's K/V to the cache BEFORE any client-visible
@@ -22403,7 +14392,7 @@ fn generate(
                     (pos, new_bytes)
                 },
                 |pos, out| {
-                    emit_committed_event(out, id, next_token, pos, elapsed_ms);
+                    hipfire_generate::common::emit_committed_event(out, id, next_token, pos, elapsed_ms);
                 },
             ) {
                 Ok(true) => break, // decoded EOT suppressed; stop generation
@@ -22454,7 +14443,7 @@ fn generate(
                             "[adaptive-kv] maybe_downshift error @ pos {} (decode): {:?} — poisoning model",
                             m.seq_pos, e
                         );
-                        emit_active_attempt_error(
+                        hipfire_generate::dense::emit_active_attempt_error(
                             stdout,
                             Some(id),
                             &format!("adaptive KV transition failed during decode: {e}"),
@@ -22623,7 +14612,7 @@ fn generate(
                                 (pos, new_bytes)
                             },
                             |pos, out| {
-                                emit_committed_event(out, id, t, pos, elapsed_ms);
+                                hipfire_generate::common::emit_committed_event(out, id, t, pos, elapsed_ms);
                             },
                         ) {
                             Ok(true) => {
@@ -22815,7 +14804,7 @@ fn generate(
                                 (pos, new_bytes2)
                             },
                             |pos, out| {
-                                emit_committed_event(out, id, tok, pos, elapsed_ms);
+                                hipfire_generate::common::emit_committed_event(out, id, tok, pos, elapsed_ms);
                             },
                         ) {
                             Ok(true) => {
@@ -22997,7 +14986,7 @@ fn generate(
         };
         // Open-think: production owns epilogue + single correlated error terminal.
         if matches!(finish.cause, QwenArTerminalCause::OpenThink) {
-            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            let ep = hipfire_generate::common::production_fail_closed_rollback(m, gpu, None, None);
             emit_qwen_ar_open_think_terminal(stdout, id, generated, &ep);
             return;
         }
@@ -23050,10 +15039,10 @@ fn generate(
         let intended_release =
             finish.finish_reason == "tool_calls" && !finish.wire_tool_calls.is_empty();
         let intended_store = finish.store_cache;
-        let effects = qwen_client_commit_effects(decision, intended_release, intended_store);
+        let effects = hipfire_generate::qwen::qwen_client_commit_effects(decision, intended_release, intended_store);
         if !effects.emit_done {
-            let ep = production_fail_closed_rollback(m, gpu, None, None);
-            emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
+            let ep = hipfire_generate::common::production_fail_closed_rollback(m, gpu, None, None);
+            hipfire_generate::common::emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
             return;
         }
         // Tool release side effects (cache fingerprint uses wire_tool_calls)
@@ -23207,7 +15196,7 @@ fn generate(
             generated += 1;
             m.conversation_tokens.push(next_token);
             streamed_tokens.push(next_token);
-            emit_committed_event(
+            hipfire_generate::common::emit_committed_event(
                 stdout,
                 id,
                 next_token,
@@ -23342,349 +15331,36 @@ fn generate(
     }
 }
 
-/// DeepSeek V4 Flash generate path (arch_id=9, hipfire-arch-deepseek4).
-///
-/// Parity with `deepseek4_chat`: batched chunked prefill +
-/// optional MTP spec-decode + greedy argmax sampler. PBS is pre-allocated
-/// once at load time (`m.deepseek4_pbs`), reused across every turn.
-///
-/// Env knobs (read fresh per generate call so they can be toggled
-/// without daemon restart):
-///   HIPFIRE_DEEPSEEK4_SPEC_DECODE=1     opt-in MTP speculative decode
-///   HIPFIRE_DEEPSEEK4_SPEC_K=N          drafts per spec-decode window (default 3)
-///   HIPFIRE_DEEPSEEK4_TOP_K=N           top-k filter (default 0 = off; HF rec)
-///   HIPFIRE_DEEPSEEK4_SEED=N            PRNG seed (default: time-based)
-///
-/// Sampling defaults follow the HF model card for `deepseek-ai/DeepSeek-V4-Flash`:
-/// `temperature = 1.0, top_p = 1.0`. Pure greedy (`temp ≤ 1e-6`) is
-/// supported but actively dangerous on this quantized instruct model —
-/// once a code fence opens, `import X\n` self-reinforces into a block-
-/// level token loop. Use `temp = 1.0` (HF default) to avoid the attractor.
-///
-/// Chat template (per HF `encoding/README.md` for V4): non-thinking-mode
-/// frame `<｜begin▁of▁sentence｜>{system?}<｜User｜>{msg}<｜Assistant｜></think>`.
-/// The model expects the `</think>` immediately after `<｜Assistant｜>` in
-/// non-thinking mode, even though no thinking block was generated — this
-/// signals "skip reasoning, go straight to response." Omitting it leaves
-/// the model in undefined-behavior territory.
-///
-/// Deliberately bypasses qwen35/llama machinery — no PFlash, no DFlash,
-/// no CASK eviction, no ChatML scaffolding, no tool-use, no `<think>` /
-/// `max_think_tokens`, no repeat penalty, no VL, no multi-GPU
-/// pipeline-parallel.
-///
-/// On context overflow the DeepSeek V4 state is hard-reset — DeepSeek V4 has no
-/// eviction path of its own and the SWA cache wraps automatically below
-/// the sliding-window bound.
-// Exact DeepSeek-V4-Flash-0731 effort prefixes from the model's MIT-licensed
-// encoding/encoding_dsv4.py. Keep the trailing blank line: it is part of the
-// parent checkpoint's prompt contract.
-const DEEPSEEK4_REASONING_HIGH_PREFIX: &str = concat!(
-    "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n",
-    "You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\n",
-    "Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n",
-);
-const DEEPSEEK4_REASONING_MAX_PREFIX: &str = concat!(
-    "Reasoning Effort: Beyond maximum — exhaustive, relentless, and uncompromising.\n",
-    "You MUST reason with the utmost depth and rigor, leaving absolutely nothing to chance: exhaustively decompose the problem into its most fundamental components, trace every causal chain to its root, and resolve the underlying cause rather than any surface symptom.\n",
-    "Do not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.\n\n",
-);
 
-fn deepseek4_reasoning_prefix(mode: ThinkMode) -> &'static str {
-    match mode {
-        ThinkMode::High => DEEPSEEK4_REASONING_HIGH_PREFIX,
-        ThinkMode::Max => DEEPSEEK4_REASONING_MAX_PREFIX,
-        ThinkMode::NonThink | ThinkMode::Low => "",
-    }
-}
 
 #[cfg(test)]
 mod deepseek4_reasoning_prefix_tests {
     use super::{
-        deepseek4_reasoning_prefix, ThinkMode, DEEPSEEK4_REASONING_HIGH_PREFIX,
-        DEEPSEEK4_REASONING_MAX_PREFIX,
+        hipfire_generate::common::deepseek4_reasoning_prefix, ThinkMode, hipfire_generate::common::DEEPSEEK4_REASONING_HIGH_PREFIX,
+        hipfire_generate::common::DEEPSEEK4_REASONING_MAX_PREFIX,
     };
 
     #[test]
     fn parent_effort_prefixes_are_distinct_and_low_is_empty() {
-        assert_eq!(deepseek4_reasoning_prefix(ThinkMode::NonThink), "");
-        assert_eq!(deepseek4_reasoning_prefix(ThinkMode::Low), "");
+        assert_eq!(hipfire_generate::common::deepseek4_reasoning_prefix(ThinkMode::NonThink), "");
+        assert_eq!(hipfire_generate::common::deepseek4_reasoning_prefix(ThinkMode::Low), "");
         assert_eq!(
-            deepseek4_reasoning_prefix(ThinkMode::High),
-            DEEPSEEK4_REASONING_HIGH_PREFIX
+            hipfire_generate::common::deepseek4_reasoning_prefix(ThinkMode::High),
+            hipfire_generate::common::DEEPSEEK4_REASONING_HIGH_PREFIX
         );
         assert_eq!(
-            deepseek4_reasoning_prefix(ThinkMode::Max),
-            DEEPSEEK4_REASONING_MAX_PREFIX
+            hipfire_generate::common::deepseek4_reasoning_prefix(ThinkMode::Max),
+            hipfire_generate::common::DEEPSEEK4_REASONING_MAX_PREFIX
         );
         assert_ne!(
-            DEEPSEEK4_REASONING_HIGH_PREFIX,
-            DEEPSEEK4_REASONING_MAX_PREFIX
+            hipfire_generate::common::DEEPSEEK4_REASONING_HIGH_PREFIX,
+            hipfire_generate::common::DEEPSEEK4_REASONING_MAX_PREFIX
         );
-        assert!(DEEPSEEK4_REASONING_HIGH_PREFIX.ends_with("\n\n"));
-        assert!(DEEPSEEK4_REASONING_MAX_PREFIX.ends_with("\n\n"));
+        assert!(hipfire_generate::common::DEEPSEEK4_REASONING_HIGH_PREFIX.ends_with("\n\n"));
+        assert!(hipfire_generate::common::DEEPSEEK4_REASONING_MAX_PREFIX.ends_with("\n\n"));
     }
 }
 
-fn build_deepseek4_dsml_prompt(
-    tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
-    system_prompt: Option<&str>,
-    tools: Option<&[serde_json::Value]>,
-    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
-    live_prompt: &str,
-    think_mode: ThinkMode,
-    deepseek4_eos_tok: u32,
-    asst_turn_cache: &mut AsstTurnCache,
-) -> Vec<u32> {
-    // DeepSeek V4 non-thinking chat template (per HF encoding/README.md):
-    //   <｜begin▁of▁sentence｜>{system?}<｜User｜>{msg}<｜Assistant｜></think>
-    //
-    // The `</think>` immediately after `<｜Assistant｜>` is REQUIRED in
-    // non-thinking mode — it tells the model "skip the reasoning block,
-    // go straight to the response." Without it the model is in
-    // undefined-behavior territory. Raw prompts (no chat-template wrap)
-    // also collapse to attractor garbage on this quantized instruct
-    // model. Multi-turn / thinking-mode plumbing is a follow-up; this
-    // emits a single non-thinking turn per /generate call.
-    let lookup = |s: &str| -> Option<u32> {
-        let ids = tokenizer.encode(s);
-        if ids.len() == 1 {
-            Some(ids[0])
-        } else {
-            None
-        }
-    };
-    let bos_tok = lookup("<｜begin▁of▁sentence｜>");
-    let user_tok = lookup("<｜User｜>");
-    let asst_tok = lookup("<｜Assistant｜>");
-
-    // Build the effective system message: optional user-supplied system
-    // text + (if request has tools) the DSML "## Tools" preamble.
-    //
-    // HF reference render: the system role is rendered as `{content}`
-    // (raw, no role prefix), then appended with `"\n\n" + render_tools`
-    // when tools are present. For an empty system + tools this becomes
-    // `"" + "\n\n" + tools_block` = `"\n\n" + tools_block` — the model
-    // was trained to see two newlines BEFORE `## Tools` even with no
-    // system content. Omitting them puts the model in off-distribution
-    // territory; observed 2026-05-23 to drive the V4F MQ2-Lloyd
-    // checkpoint into `<｜DSML｜tool_cin> / <｜DSML｜-cin>` attractor
-    // loops on no-system + 4-tools requests. The leading `\n\n` is
-    // load-bearing — do not drop.
-    let tools_block: Option<String> = tools
-        .filter(|t| !t.is_empty())
-        .map(|t| deepseek4::dsml::tools_prompt_block(t));
-    let effective_system: Option<String> = match (
-        system_prompt.filter(|s| !s.is_empty()),
-        tools_block.as_deref(),
-    ) {
-        (Some(sys), Some(tb)) => Some(format!("{sys}\n\n{tb}")),
-        (Some(sys), None) => Some(sys.to_string()),
-        (None, Some(tb)) => Some(format!("\n\n{tb}")),
-        (None, None) => None,
-    };
-
-    let mut prompt_ids: Vec<u32> = Vec::new();
-    if let Some(b) = bos_tok {
-        prompt_ids.push(b);
-    }
-    let effort_prefix = deepseek4_reasoning_prefix(think_mode);
-    if !effort_prefix.is_empty() {
-        prompt_ids.extend(tokenizer.encode(effort_prefix));
-    }
-    if let Some(ref sys) = effective_system {
-        prompt_ids.extend(tokenizer.encode(sys));
-    }
-
-    // Multi-turn history. Each prior message gets rendered as a turn:
-    //   user → `<｜User｜>{content}{tool_results?}`
-    //   assistant → `<｜Assistant｜>{content_or_dsml}<｜end▁of▁sentence｜>`
-    // Tool result messages (role=tool) attach to the previous user turn
-    // wrapped in `<tool_result>…</tool_result>` per HF encoding/README.md.
-    // The CURRENT user prompt is appended last (outside this loop).
-    if let Some(history) = messages_history {
-        // Skip the leading system message (if any) — already handled.
-        // Skip the trailing user prompt — we add it explicitly after, BUT only
-        // when a non-empty `live_prompt` actually carries it. The OpenAI
-        // messages API (no separate `prompt` field) puts the live user turn as
-        // the LAST history message with `live_prompt == ""`; trimming it then
-        // drops the user's question entirely (model greets instead of answering
-        // — observed on ds4 EP tp4). So only trim when live_prompt is non-empty.
-        use hipfire_runtime::prompt_frame::Role;
-        let trim_end = if !live_prompt.is_empty()
-            && matches!(history.last().map(|m| m.role), Some(Role::User))
-        {
-            1
-        } else {
-            0
-        };
-        let end = history.len().saturating_sub(trim_end);
-        // Track whether the previous emission was already a tool_result
-        // wrapped in a user turn — when YES, the next consecutive tool
-        // message MUST NOT open a new `<｜User｜>` marker; instead it
-        // stacks its `<tool_result>` body into the existing user turn.
-        // Matches the reference imatrix dataset renderer in
-        // `gguf-tools/imatrix/dataset/build_ds4_imatrix_dataset.py:196-201`
-        // — OpenAI's parallel-tool-call flow produces consecutive tool
-        // messages (one per parallel call), and a fresh `<｜User｜>`
-        // between them isn't what V4F was trained on.
-        let mut pending_tool_result = false;
-        for msg in &history[..end] {
-            match msg.role {
-                Role::System => {
-                    // Already handled via effective_system; skip.
-                }
-                Role::User => {
-                    if let Some(u) = user_tok {
-                        prompt_ids.push(u);
-                    }
-                    prompt_ids.extend(tokenizer.encode(&msg.content));
-                    pending_tool_result = false;
-                }
-                Role::Tool => {
-                    // Wrap as `<tool_result>{escaped}</tool_result>`. Open
-                    // a new user turn ONLY if the prior message wasn't
-                    // already a tool_result.
-                    if !pending_tool_result {
-                        if let Some(u) = user_tok {
-                            prompt_ids.push(u);
-                        }
-                    }
-                    prompt_ids.extend(
-                        tokenizer.encode(&deepseek4::dsml::render_tool_result(&msg.content)),
-                    );
-                    pending_tool_result = true;
-                }
-                Role::Assistant => {
-                    // Daemon-emitted surround tokens that bracket every
-                    // assistant turn in V4F format:
-                    //   <｜Assistant｜>{</think> when not in think-replay}
-                    //     {turn body — content + tool_calls}
-                    //   <｜end▁of▁sentence｜>
-                    //
-                    // The cache stores ONLY the inner turn body (the
-                    // tokens the model itself emitted during decode).
-                    // The surround tokens are deterministic functions
-                    // of `msg.content` and `think_mode` and must be
-                    // emitted IDENTICALLY on both hit and miss paths so
-                    // the prompt-cache LCP can extend through every
-                    // prior assistant turn.
-                    if let Some(a) = asst_tok {
-                        prompt_ids.push(a);
-                    }
-                    let starts_with_think_tag =
-                        msg.content.starts_with("<think>") || msg.content.starts_with("</think>");
-                    if !starts_with_think_tag {
-                        prompt_ids.extend(tokenizer.encode("</think>"));
-                    }
-
-                    // Prefix-cache fast path: if we previously emitted
-                    // this exact assistant turn, replay the model's
-                    // verbatim token sequence instead of re-rendering
-                    // via DSML + BPE encode (which is not bijective —
-                    // multi-char DSML special tokens picked greedily
-                    // during decode can come back out of
-                    // `tokenizer.encode(render(...))` as a longer
-                    // sequence with different boundaries, capping the
-                    // LCP at the assistant-turn boundary).
-                    // Match store-side stripping (see qwen35 path comment).
-                    let stripped = strip_think_for_fingerprint(&msg.content);
-                    let normalized =
-                        hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned();
-                    let fp = asst_turn_fingerprint(&normalized, &msg.tool_calls);
-                    if std::env::var("HIPFIRE_DEEPSEEK4_CACHE_TRACE")
-                        .ok()
-                        .as_deref()
-                        == Some("1")
-                    {
-                        eprintln!(
-                            "[asst-cache lookup] fp={:#018x} content.len={}/stripped.len={} tool_calls={} hit={}",
-                            fp, msg.content.len(), normalized.len(),
-                            msg.tool_calls.len(),
-                            asst_turn_cache.contains_key(&fp),
-                        );
-                    }
-                    // DSML builds a flat token stream; project the content slot out of the
-                    // per-channel cache value (DeepSeek turns are content-only).
-                    if let Some(cached) = asst_turn_cache.get(&fp).and_then(|t| t.content.as_ref())
-                    {
-                        prompt_ids.extend_from_slice(&cached.token_ids);
-                    } else {
-                        // Cache miss — render the turn the long way.
-                        if !msg.content.is_empty() && msg.content != "null" {
-                            prompt_ids.extend(tokenizer.encode(&msg.content));
-                        }
-                        if !msg.tool_calls.is_empty() {
-                            let dsml_calls: Vec<hipfire_arch_deepseek4::dsml::ToolCall> = msg
-                                .tool_calls
-                                .iter()
-                                .map(|c| hipfire_arch_deepseek4::dsml::ToolCall {
-                                    name: c.name.clone(),
-                                    arguments: c.arguments.clone(),
-                                })
-                                .collect();
-                            let dsml = hipfire_arch_deepseek4::dsml::render_assistant_tool_calls(
-                                &dsml_calls,
-                            );
-                            prompt_ids.extend(tokenizer.encode(&dsml));
-                        }
-                    }
-
-                    // If the replayed turn body opened a `<think>` block but
-                    // the model premature-stopped without closing it (EOS inside
-                    // the think, no tool call), close it here with a `</think>`.
-                    // Otherwise the dangling `<think>…<EOS>` drifts the next turn
-                    // (more premature stops, a leaked `</think>`). This is a
-                    // deterministic surround token — a pure function of
-                    // msg.content, NOT part of the cached turn body or the
-                    // asst_turn_fingerprint (which strips think anyway) — so it
-                    // is emitted identically on hit and miss paths and the
-                    // prefix-cache LCP + asst_turn_cache stay effective.
-                    if msg.tool_calls.is_empty()
-                        && msg.content.starts_with("<think>")
-                        && !msg.content.contains("</think>")
-                    {
-                        prompt_ids.extend(tokenizer.encode("</think>"));
-                    }
-
-                    // Close the assistant turn with the EOS marker so
-                    // the next turn starts cleanly.
-                    prompt_ids.push(deepseek4_eos_tok);
-                    pending_tool_result = false;
-                }
-            }
-        }
-    }
-
-    // Append the live user turn ONLY when `prompt` carries one. When the
-    // serve has handed us a structured `messages` history that already
-    // ends in a tool result (mid-conversation, model is meant to continue
-    // generating the next assistant turn) it sends `prompt=""` — in that
-    // case we MUST NOT emit an empty `<｜User｜><｜Assistant｜>` wrapper,
-    // because the empty-user turn is off-distribution and the V4F MQ2-
-    // Lloyd checkpoint drifts into invented paths / repeated wrong tool
-    // calls when fed one.
-    if !live_prompt.is_empty() {
-        if let Some(u) = user_tok {
-            prompt_ids.push(u);
-        }
-        prompt_ids.extend(tokenizer.encode(live_prompt));
-    }
-    if let Some(a) = asst_tok {
-        prompt_ids.push(a);
-    }
-    // Thinking-mode signal token immediately after `<｜Assistant｜>`:
-    //   NonThink → `</think>`   (skip reasoning, respond directly)
-    //   Low|High|Max → `<think>` (open a reasoning block)
-    match think_mode {
-        ThinkMode::NonThink => prompt_ids.extend(tokenizer.encode("</think>")),
-        ThinkMode::Low | ThinkMode::High | ThinkMode::Max => {
-            prompt_ids.extend(tokenizer.encode("<think>"));
-        }
-    }
-
-    prompt_ids
-}
 
 /// Resolve whether DeepSeek4 spec-decode is requested from the installed
 /// drafter and typed MTP policy.
@@ -23720,6908 +15396,51 @@ fn deepseek4_spec_requested(m: &LoadedModel) -> bool {
     )
 }
 
-/// deepseek4 MTP spec-decode through the unified `generate_spec` (Phase 4 T4c-2).
-///
-/// This is the ds4 sibling of `generate_dflash`: it owns the arch-specific
-/// prologue (DSML prompt render + `plan_cache(CachePolicy::deepseek4())` + the
-/// DSA decode-cache miss teardown) and epilogue (the ds4 `done` envelope), and
-/// drives the shared decode core via `m.speculator` (a `Deepseek4MtpDrafter`),
-/// the `Deepseek4Bundle` target (via `spec_target_guard`), and `Deepseek4Emit`.
-/// Greedy-only — the dispatch routes here only at `temp <= 1e-6`.
-#[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
-fn generate_deepseek4_spec(
-    m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
-    stdout: &mut std::io::Stdout,
-    id: &str,
-    prompt: &str,
-    system_prompt: Option<&str>,
-    max_tokens: usize,
-    // Sampling: temp<=1e-6 → greedy (argmax-accept, byte-identical to before);
-    // temp>0 → DSpark sampled verify. cactus_delta is the opt-in acceptance boost.
-    temp: f32,
-    top_p: f32,
-    top_k: usize,
-    cactus_delta: f32,
-    think_mode: ThinkMode,
-    tools: Option<&[serde_json::Value]>,
-    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
-) {
-    // Zero-budget reject before DSML render, decode-cache teardown, graph
-    // invalidate, decoded_vocab build, or set_sampling. Inner generate_spec
-    // keeps the same guard as defense-in-depth.
-    if max_tokens == 0 {
-        emit_active_attempt_error(
-            stdout,
-            Some(id),
-            "max_tokens must be > 0",
-            "validation",
-            false,
-            false,
-        );
-        let _ = stdout.flush();
-        return;
-    }
 
-    // eos token (for the DSML prompt build) from the bundle — immutable peek.
-    let eos_tok = match m.state.as_ref() {
-        Some(ModelState::Deepseek4(b)) => b.eos_tok,
-        _ => {
-            emit_error_with_id(stdout, id, "deepseek4 bundle missing on arch_id=9 spec");
-            return;
-        }
-    };
 
-    // DSML prompt render (same builder the bespoke loop uses).
-    let prompt_ids = {
-        let tokenizer = match m.tokenizer.as_ref() {
-            Some(t) => t,
-            None => {
-                emit_error_with_id(stdout, id, "tokenizer not loaded");
-                return;
-            }
-        };
-        build_deepseek4_dsml_prompt(
-            tokenizer,
-            system_prompt,
-            tools,
-            messages_history,
-            prompt,
-            think_mode,
-            eos_tok,
-            &mut m.asst_turn_cache,
-        )
-    };
-    if prompt_ids.is_empty() {
-        emit_error_with_id(stdout, id, "empty prompt after tokenize");
-        return;
-    }
 
-    // spec_k: env chain → 2 (the deepseek4-specific default; see generate_deepseek4).
-    let spec_k: usize = std::env::var("HIPFIRE_DEEPSEEK4_SPEC_K")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .or_else(|| Some(hipfire_runtime::config::get().mtp_k))
-        .unwrap_or(2);
 
-    // Prefix-cache plan (ds4 policy: forced-cold on partial, ring-safety length
-    // guard, step-back exact). Pure decision; the GPU teardown is applied below.
-    let plan = hipfire_runtime::cache_plan::plan_cache(
-        &prompt_ids,
-        &m.conversation_tokens,
-        &hipfire_runtime::cache_plan::CachePolicy::deepseek4(),
-        &[],
-        false,
-    );
-    let cached_tokens = plan.cached_tokens;
-    let suffix: Vec<u32> = prompt_ids[plan.start_pos..].to_vec();
 
-    // Capacity guard (KV sized for physical_cap; overrun is a serve-killing
-    // panic). Mirrors the bespoke ds4 pre-prefill guard — generate_spec's own
-    // guard checks ctx_capacity (max_position_embeddings), which for ds4 can far
-    // exceed physical_cap, so keep this explicit one.
-    if plan
-        .start_pos
-        .saturating_add(suffix.len())
-        .saturating_add(max_tokens)
-        > m.physical_cap
-    {
-        emit_error_with_id(
-            stdout,
-            id,
-            format!(
-                "prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq",
-                plan.start_pos + suffix.len(),
-                max_tokens,
-                m.physical_cap
-            ),
-        );
-        return;
-    }
 
-    let required_tokens = plan
-        .start_pos
-        .saturating_add(suffix.len())
-        .saturating_add(max_tokens);
-    if let Some(ModelState::Deepseek4(bundle)) = m.state.as_mut() {
-        if let Err(error) = deepseek4::forward::ensure_compressor_capacity(
-            &bundle.config,
-            &mut bundle.state,
-            gpu,
-            required_tokens,
-        ) {
-            emit_error_with_id(
-                stdout,
-                id,
-                format!("deepseek4 context-capacity preflight failed: {error}"),
-            );
-            return;
-        }
-    }
 
-    // DSA decode-cache miss teardown (the part NOT done by the drafter's
-    // cache-miss `state.reset()` or generate_spec's seq_pos/conversation clear):
-    // zero the position-indexed rings + invalidate the captured decode graph so a
-    // fresh conversation reproduces a freshly-launched daemon's clean state.
-    if !plan.cache_hit {
-        if let Some(ModelState::Deepseek4(b)) = m.state.as_mut() {
-            b.state.zero_decode_caches(gpu);
-        }
-        gpu.invalidate_graph_state();
-    }
 
-    // The ds4 emitter builds its in-step tool-call grammar from the raw tool
-    // JSON inside `make_spec_emitter`, but that grammar masks per-token over the
-    // decoded vocab — which the neutral `SpecEmitCtx` can't lazily derive (it has
-    // no `&mut m`). Build/cache the vocab Arc here when tools are present and
-    // hand it down; mirrors the lazy cache the old `build_deepseek4_spec_grammar`
-    // did internally.
-    let decoded_vocab: Option<std::sync::Arc<Vec<String>>> =
-        if tools.map_or(false, |t| !t.is_empty()) {
-            if m.decoded_vocab.is_none() {
-                let tok = m.tokenizer.as_ref().expect("tokenizer present");
-                let n = tok.vocab_size();
-                let v: Vec<String> = (0..n).map(|id| tok.decode(&[id as u32])).collect();
-                m.decoded_vocab = Some(std::sync::Arc::new(v));
-            }
-            m.decoded_vocab.clone()
-        } else {
-            None
-        };
 
-    // Configure the speculator's sampling before the loop — mirrors generate_dflash's
-    // set_sampling before generate_spec. Greedy (temp<=1e-6) leaves it at argmax-accept
-    // (byte-identical to the prior hardcoded-greedy path); temp>0 drives the DSpark
-    // sampled verify, and cactus_delta>0 applies the opt-in acceptance boost.
-    if let Some(spec) = m.speculator.as_mut() {
-        spec.set_sampling(temp, top_p, top_k, cactus_delta);
-    }
 
-    // Open the wire contract before any token can reach the client. The CLI's
-    // stream latch (`StreamContractError::PreStartEvent`) fail-closes on any
-    // event that precedes `gen_start`, so without this every DS4 request over
-    // `hipfire serve` dies with "stream must begin with gen_start; got token
-    // before contract latch". Mirrors generate_dflash's emit before
-    // generate_spec.
-    //
-    // `ds4_gen_start_contract_version()` is None for arch 9 — DS4 does not
-    // advertise semantic contract v2, so the client keeps whole-output tool
-    // extraction. That helper exists precisely for this call site.
-    //
-    // started_in_think follows the DS4 frame mapping documented on ThinkMode
-    // (prompt_frame.rs): NonThink renders `<｜Assistant｜></think>`, so the model
-    // begins in visible-answer mode; High/Max render the `<think>` open-token,
-    // so it begins inside the reasoning span.
-    emit_gen_start(
-        stdout,
-        id,
-        !matches!(think_mode, ThinkMode::NonThink),
-        ds4_gen_start_contract_version(),
-    );
-    let prompt_tokens_total = prompt_ids.len();
-    let run = match generate_spec(
-        m,
-        gpu,
-        stdout,
-        id,
-        prompt_ids,
-        suffix,
-        plan.start_pos,
-        plan.cache_hit,
-        None, // resume_from — ds4 has no DeltaNet checkpoints
-        max_tokens,
-        SpecEmitRequest {
-            im_end: None,
-            tools: tools.map(|t| t.to_vec()),
-            stop: Vec::new(),
-            max_think: 0,
-            assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
-            think_mode,
-            decoded_vocab,
-        },
-        temp, // temp>0 → DSpark sampled verify (routed here only when supports_temp_verify)
-    ) {
-        Some(r) => r,
-        // Abort / error early-exit already wrote its own done/error envelope.
-        None => return,
-    };
 
-    // ── ds4 done envelope ────────────────────────────────────────
-    let tok_s = if run.decode_s > 0.0 {
-        run.generated as f64 / run.decode_s
-    } else {
-        0.0
-    };
-    let prefill_tok_s = if run.prefill_s > 0.0 {
-        run.prefill_tokens_len as f64 / run.prefill_s
-    } else {
-        0.0
-    };
-    // accept_pct denominator is windows × k (the bespoke loop added `spec_k` per
-    // window to `spec_drafts_offered`, not the actual n_proposed).
-    let accept_pct = if run.spec_cycles > 0 && spec_k > 0 {
-        run.spec_accepted as f64 / (run.spec_cycles * spec_k) as f64 * 100.0
-    } else {
-        0.0
-    };
-    // Fail-closed DSML / length-suppresses-calls: Deepseek4Emit holds ToolCalls
-    // on FinishSummary; generate_spec does not render them. Classify length vs
-    // stop vs malformed here, then release held calls only when tool-safe.
-    // Prefer generate_spec's production epilogue when the turn ended fail-closed
-    // (grammar / open-think / malformed) so rolled_back is truthful.
-    if let Some(ep) = run.fail_closed_rollback.as_ref() {
-        let detail = if run.grammar_violated {
-            "grammar violation during speculative decode"
-        } else if run.finish.open_think || run.finish.finish_reason == "open_think" {
-            "open think span at end of generation (validation)"
-        } else if run.finish.finish_reason == "malformed_protocol" {
-            "unclosed DSML tool_calls block at end of output"
-        } else {
-            "fail-closed speculative decode"
-        };
-        let mut action = ds4_malformed_terminal_action(detail);
-        action.rolled_back = ep.rolled_back;
-        if let Some(ctx) = ep.context.as_ref() {
-            if !ep.rolled_back {
-                action.message = format!("{} ({ctx})", action.message);
-            }
-        }
-        emit_ds4_malformed_action(stdout, id, &action);
-        return;
-    }
-    // Semantic stop (StopSequence/EOS/ThinkCap) or decoded_eot at cap is not
-    // length — preserves stop/tool_calls when generated == max_tokens.
-    let hit_length_cap = qwen_dflash_hit_length_cap(
-        run.generated,
-        max_tokens,
-        run.finish.decoded_eot,
-        run.semantic_stop.is_some(),
-    );
-    match ds4_spec_wire_terminal(
-        run.finish.finish_reason,
-        run.finish.tool_calls,
-        hit_length_cap,
-    ) {
-        Ds4SpecWireTerminal::Malformed(action) => {
-            // No epilogue on SpecRun — still fail-closed without claiming rollback.
-            emit_ds4_malformed_action(stdout, id, &action);
-            return;
-        }
-        Ds4SpecWireTerminal::Done {
-            finish_reason,
-            release_tool_calls,
-            store_cache,
-        } => {
-            // τ / drafter / pending done fixed before handshake so commit_ready
-            // carries the exact eventual done payload.
-            let tau = if run.spec_cycles > 0 {
-                run.spec_accepted as f64 / run.spec_cycles as f64
-            } else {
-                0.0
-            };
-            let drafter = m.speculator.as_ref().map(|s| s.name()).unwrap_or("none");
-            let mut pending_done = serde_json::json!({
-                "type": "done",
-                "id": id,
-                "tokens": run.generated,
-                "tok_s": tok_s,
-                "prompt_tokens": prompt_tokens_total,
-                "prefill_tokens": run.prefill_tokens_len,
-                "cached_tokens": cached_tokens,
-                "prefill_ms": (run.prefill_s * 1000.0) as u128,
-                "prefill_tok_s": (prefill_tok_s * 10.0).round() / 10.0,
-                "decode_tok_s": (tok_s * 10.0).round() / 10.0,
-                "total_ms": (run.total_s * 1000.0) as u128,
-                "finish_reason": finish_reason,
-                "drafter": drafter,
-                "tau": tau,
-                "spec_k": spec_k,
-                "spec_windows": run.spec_cycles,
-                "spec_accept_pct": accept_pct,
-                "attempt_id": active_attempt_id(),
-            });
-            // Stage held ToolCalls into commit_ready/done; no post-commit event.
-            let held_calls = finish_summary_held_tool_calls(&run.finish);
-            stage_terminal_tool_calls(&mut pending_done, finish_reason, &held_calls);
-            // Two-phase commit before cache / done.
-            let decision = await_client_terminal_commit(stdout, id, &pending_done);
-            let effects = ds4_client_commit_effects(decision, release_tool_calls, store_cache);
-            if !effects.emit_done {
-                let ep = production_fail_closed_rollback(m, gpu, None, None);
-                emit_spec_cancel_after_rollback(stdout, id, run.generated, &ep);
-                return;
-            }
-            // Honor computed store_cache: safe stop/tool_calls store the
-            // verbatim raw streamed_tokens body for DSML asst-turn replay.
-            // Length sets store_cache=false; malformed returned above; Abort
-            // suppressed via effects.store_cache.
-            let terminal = Ds4SpecWireTerminal::Done {
-                finish_reason,
-                release_tool_calls: effects.release_tool_calls,
-                store_cache: effects.store_cache,
-            };
-            let action = ds4_cache_action(&terminal, &run.finish, run.finish.visible_text.as_str());
-            if action.store {
-                if std::env::var("HIPFIRE_DEEPSEEK4_CACHE_TRACE")
-                    .ok()
-                    .as_deref()
-                    == Some("1")
-                {
-                    eprintln!(
-                        "[asst-cache store spec] content.len={} tool_calls={} tokens={}",
-                        action.fingerprint_text.len(),
-                        action.tool_calls.len(),
-                        run.streamed_tokens.len(),
-                    );
-                }
-                let _ = ds4_apply_cache_action(
-                    |fp, seq| {
-                        if std::env::var("HIPFIRE_DEEPSEEK4_CACHE_TRACE")
-                            .ok()
-                            .as_deref()
-                            == Some("1")
-                        {
-                            eprintln!(
-                                "[asst-cache store spec] fp={:#018x} tokens={}",
-                                fp,
-                                seq.len()
-                            );
-                        }
-                        m.asst_turn_cache.insert(
-                            fp,
-                            hipfire_runtime::prompt_frame::CachedAssistantTurn {
-                                reasoning: None,
-                                tools: Vec::new(),
-                                content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
-                                    token_ids: seq,
-                                    text: String::new(),
-                                }),
-                            },
-                        );
-                    },
-                    &action,
-                    run.streamed_tokens.clone(),
-                );
-            }
-            emit_staged_terminal_done(stdout, &pending_done);
-            // Per-request debug summary (stderr → serve.log): active drafter, τ, tok/s.
-            eprintln!(
-                "[req {id}] drafter={drafter} tau={tau:.2} tok/s={tok_s:.1} decode ({} tok, {} windows, accept={accept_pct:.0}%)",
-                run.generated, run.spec_cycles
-            );
-        }
-    }
-}
 
-fn generate_deepseek4(
-    m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
-    stdout: &mut std::io::Stdout,
-    id: &str,
-    prompt: &str,
-    system_prompt: Option<&str>,
-    temp: f32,
-    top_p: f32,
-    max_tokens: usize,
-    think_mode: ThinkMode,
-    tools: Option<&[serde_json::Value]>,
-    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
-) {
-    if matches!(
-        m.state.as_ref(),
-        Some(ModelState::Deepseek4Heterogeneous(_))
-    ) {
-        generate_deepseek4_heterogeneous(
-            m,
-            stdout,
-            id,
-            prompt,
-            system_prompt,
-            temp,
-            top_p,
-            max_tokens,
-            think_mode,
-            tools,
-            messages_history,
-        );
-        return;
-    }
-    let tokenizer = match m.tokenizer.as_ref() {
-        Some(t) => t,
-        None => {
-            let _ = writeln!(
-                stdout,
-                r#"{{"type":"error","id":"{}","message":"tokenizer not loaded"}}"#,
-                id
-            );
-            let _ = stdout.flush();
-            return;
-        }
-    };
-    // `pbs` is a disjoint field from `m.state`, so it borrows independently of
-    // the bundle's `&mut state` below.
-    let pbs = m
-        .deepseek4_pbs
-        .as_mut()
-        .expect("deepseek4_pbs missing on arch_id=9 generate");
-    // The single-GPU ds4 bundle (config/weights/state/eos) lives in
-    // `ModelState::Deepseek4`. Field-borrow it disjointly so `cfg`/`weights`
-    // (shared) and `state` (`&mut`) are live simultaneously, exactly as the
-    // forward path needs.
-    let Some(ModelState::Deepseek4(b)) = m.state.as_mut() else {
-        let _ = writeln!(
-            stdout,
-            r#"{{"type":"error","id":"{}","message":"deepseek4_config missing on arch_id=9 generate"}}"#,
-            id
-        );
-        let _ = stdout.flush();
-        return;
-    };
-    let cfg = &b.config;
-    let weights = &b.weights;
-    let state = &mut b.state;
-    let eos_tok = b.eos_tok;
 
-    let prompt_ids = build_deepseek4_dsml_prompt(
-        tokenizer,
-        system_prompt,
-        tools,
-        messages_history,
-        prompt,
-        think_mode,
-        eos_tok,
-        &mut m.asst_turn_cache,
-    );
 
-    if prompt_ids.is_empty() {
-        let _ = writeln!(
-            stdout,
-            r#"{{"type":"error","id":"{}","message":"empty prompt after tokenize"}}"#,
-            id
-        );
-        let _ = stdout.flush();
-        return;
-    }
 
-    if std::env::var("HIPFIRE_DEEPSEEK4_DUMP_PROMPT")
-        .ok()
-        .as_deref()
-        == Some("1")
-    {
-        let rendered = tokenizer.decode(&prompt_ids);
-        let path = format!(
-            "/tmp/hipfire-prompt-{}.txt",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or(0)
-        );
-        let _ = std::fs::write(
-            &path,
-            format!("# tokens: {}\n{}\n", prompt_ids.len(), rendered),
-        );
-        eprintln!("[v4f prompt dump] tokens={} → {}", prompt_ids.len(), path);
-    }
 
-    // This function is now AR-only: the MTP spec-decode path (greedy, temp≈0,
-    // speculator present) is dispatched to `generate_deepseek4_spec` (T4c-2),
-    // which owns the spec_requested/spec_mode/spec_k resolution. Reaching here
-    // means either temp>0 (sample) or no speculator (fallback) — either way the
-    // plain AR sampler below honours the requested `temp`/`top_p`.
 
-    let t0 = Instant::now();
 
-    // ── Prefix-cache LCP detection ──────────────────────────────────
-    //
-    // Reasonix's prompt-caching model (`tmp/reasonix_arch.md` Pillar 1):
-    // construct prompts as `immutable_prefix + append_only_log` so the
-    // backend's prefix cache hits on every turn. Reasonix is a CLIENT
-    // that targets DeepSeek's server-side cache; for LOCAL inference we
-    // implement the server side here.
-    //
-    // Compare the freshly-tokenized prompt against the tokens we know
-    // are already resident in the V4F KV / SWA / compressed-KV rings
-    // from the prior request (`m.conversation_tokens`). If the new
-    // prompt FULLY EXTENDS the prior conversation — i.e., starts with
-    // the entire `conversation_tokens` — we can skip prefill for those
-    // tokens and only prefill the suffix.
-    //
-    // SWA-safety analysis for partial LCP (lcp < prior.len()):
-    //
-    // Suppose prior wrote positions [0..prior_max_pos], turn 2's suffix
-    // writes [lcp..prompt_ids.len()-1]. After turn 2's prefill the new
-    // max position is `prompt_ids.len() - 1`. The model's first decode
-    // attends to a window of `min(prompt_ids.len(), 128)` positions
-    // ending at `prompt_ids.len() - 1`. Each window position maps to a
-    // unique ring slot via `pos % 128`. For correctness, every slot in
-    // that window must currently hold K_rotated for the matching
-    // position:
-    //
-    //   * For positions in `[0..lcp-1]` — turn 1 wrote them, content
-    //     matches by LCP definition. Untouched since.
-    //   * For positions in `[lcp..prompt_ids.len()-1]` — turn 2's suffix
-    //     prefill just wrote them. Content matches the new prompt.
-    //
-    // Stale-slot risk: if turn 1 had written a slot at some position
-    // `P_late ∈ [lcp..prior_max_pos]` AND turn 2 doesn't overwrite that
-    // slot, the slot holds K_rotated for P_late, not the new prompt's
-    // token at that position. The window read returns wrong content.
-    //
-    // Turn 2's suffix prefill covers positions [lcp..prompt_ids.len()-1].
-    // To overwrite every slot turn 1 wrote in `[lcp..prior_max_pos]`,
-    // we need `prompt_ids.len() - 1 ≥ prior_max_pos`, i.e.
-    // `prompt_ids.len() ≥ prior.len()`. Equivalently: the new prompt
-    // must be at least as long as the cached conversation.
-    //
-    // We additionally guard `lcp == prior.len() && prompt_ids.len() ==
-    // prior.len()` (full match, nothing to do) with a noop check
-    // downstream (suffix_tokens is empty).
-    //
-    // After the daemon's `reset` handler clears `m.conversation_tokens`
-    // (legacy stateless path), `prior` is empty and `lcp = 0` → full
-    // prefill. For prefix-cache mode the serve stops calling reset for
-    // V4F and lets this LCP detection drive cache-hit accounting.
-    let lcp: usize = {
-        let prior = &m.conversation_tokens;
-        if prior.is_empty() || prompt_ids.len() < prior.len() {
-            0
-        } else {
-            let mut n = 0usize;
-            while n < prior.len() && prior[n] == prompt_ids[n] {
-                n += 1;
-            }
-            // Edge case: new prompt is byte-identical to the cached
-            // conversation. Suffix would be empty and
-            // `forward_prefill_batch_chunked` errors on that. Step the
-            // LCP back one so we always prefill ≥ 1 token (and the
-            // post-prefill logits are well-defined for the first
-            // decode step). Costs us one token of cache credit on
-            // exact-repeat prompts — rare in practice.
-            if n == prompt_ids.len() && n > 0 {
-                n - 1
-            } else {
-                n
-            }
-        }
-    };
 
-    // DSA compressor-ring safety on a PARTIAL prefix-cache hit.
-    //
-    // The DSA decode caches (SWA ring, compressor/indexer ring state, full +
-    // compressed KV) are *position-indexed* and were left by the prior turn at
-    // ITS end position. A FULL hit (`lcp == prior length`) resumes exactly where
-    // the prior turn left those rings, so the incremental prefill is correct —
-    // this is the normal "growing conversation" path and stays fast.
-    //
-    // A PARTIAL hit (`0 < lcp < prior length`) resumes the suffix prefill from
-    // `start_pos = lcp`, but the compressor ring still holds the prior turn's
-    // *end* window, not `lcp`'s. The first compressed block committed after the
-    // resume point then pools a STALE overlap window — and with ratio-4 overlap
-    // that window reaches back over the just-cached tail, corrupting far-context
-    // recall (the cwd/tool-path "lossiness" symptom). The ring can't be cheaply
-    // repopulated (a position's hidden state depends on its SWA window, which
-    // chains all the way back to token 0), so the correct, robust fix is to fall
-    // back to a cold rebuild for partial hits only. Full hits are unaffected.
-    let lcp = if lcp > 0 && lcp < m.conversation_tokens.len() {
-        0
-    } else {
-        lcp
-    };
 
-    // Select/map the complete request's compressed-cache bucket before any
-    // cache reset, prefill, HipGraph capture, or retained-PM4 replay. DS4's
-    // VMM owner addresses remain stable; crossing a geometry bucket re-arms
-    // replay automatically so the new tape is captured once at that shape.
-    let required_tokens = prompt_ids.len().saturating_add(max_tokens);
-    if let Err(error) =
-        deepseek4::forward::ensure_request_capacity(cfg, state, gpu, pbs, required_tokens)
-    {
-        emit_error_with_id(
-            stdout,
-            id,
-            format!("deepseek4 context-capacity preflight failed: {error}"),
-        );
-        return;
-    }
 
-    if lcp == 0 {
-        // Cache miss — start a fresh conversation in V4F's state.
-        state.reset();
-        // reset() only rewinds n_tokens; the position-indexed decode caches
-        // (SWA ring, compressed/full KV, indexer scratch) still hold the prior
-        // turn's residue, which bleeds into this fresh conversation's forward
-        // and makes greedy output drift turn-to-turn (the "recall/tool-calls
-        // unreliable" symptom). Zero them so a fresh conversation reproduces a
-        // freshly-launched daemon's clean, deterministic state.
-        state.zero_decode_caches(gpu);
-        m.conversation_tokens.clear();
-        // Tear down the captured V4F decode hipGraph alongside the
-        // state, same rationale as the daemon's `"reset"` handler:
-        // a fresh-context turn invalidates every device-buffer pointer
-        // and host scalar the captured graph baked in at capture time
-        // (state.attn_state_buf slot/n_valid/k_active values derived
-        // from the prior n_tokens, compressor ring/commit slots, etc.).
-        // Without this, the warmup-then-replay state machine fires
-        // warmup on the first decode (because `state.reset()` clears
-        // `ar_forward_warmed_up`), then immediately replays the STALE
-        // graph on the second decode and crashes with the same
-        // "download logits (graph path): illegal memory access" we
-        // saw on multi-turn pi sessions before the explicit-reset fix.
-        gpu.invalidate_graph_state();
-    }
-    let start_pos: u32 = lcp as u32;
 
-    // Slice off the suffix — the only tokens we actually need to prefill.
-    // For lcp=0 this is the full prompt; for a full cache hit on a turn
-    // that adds N new tokens this is just those N.
-    let suffix_tokens: &[u32] = &prompt_ids[lcp..];
 
-    // O2b-2 capacity guard (ds4 single-GPU): after any cache reset above, the
-    // KV ends at start_pos + suffix_tokens.len() (== prompt_ids.len()) and
-    // decode appends max_tokens. forward_prefill_batch_chunked writes into a KV
-    // sized for m.physical_cap; overrunning it is a KV-overrun panic that takes
-    // down serve. Emit a clean error and return BEFORE prefill.
-    // saturating_add: an adversarially huge max_tokens must not wrap usize and
-    // slip under the cap.
-    if (start_pos as usize)
-        .saturating_add(suffix_tokens.len())
-        .saturating_add(max_tokens)
-        > m.physical_cap
-    {
-        let _ = writeln!(
-            stdout,
-            r#"{{"type":"error","id":"{}","message":"prompt exceeds checkpoint context capacity: prompt={} + max_tokens={} > capacity={}"}}"#,
-            id,
-            start_pos as usize + suffix_tokens.len(),
-            max_tokens,
-            m.physical_cap
-        );
-        let _ = stdout.flush();
-        return;
-    }
 
-    // Prefill: batched chunked through PBS. (The MTP-fill prefill variant moved
-    // to the drafter's `mtp_prefill`, driven by `generate_deepseek4_spec`.)
-    let prefill_result = deepseek4::forward::forward_prefill_batch_chunked(
-        cfg,
-        weights,
-        state,
-        gpu,
-        suffix_tokens,
-        start_pos,
-        pbs,
-    );
-    let last_logits = match prefill_result {
-        Ok(l) => l,
-        Err(e) => {
-            emit_error_with_id(stdout, id, format!("deepseek4prefill failed: {e:?}"));
-            return;
-        }
-    };
-    // `forward_prefill_batch_chunked` does NOT advance `state.n_tokens`.
-    // Callers are responsible for it (mirrors deepseek4_chat's explicit
-    // `state.n_tokens = pos as u64;` at deepseek4_chat.rs:324). Without this,
-    // the next decode_step queries the SWA cache at the BOS position
-    // instead of the next-prediction position and the model emits
-    // attractor garbage at greedy temp=0.
-    state.n_tokens = (start_pos as usize + suffix_tokens.len()) as u64;
-    // Keep `m.conversation_tokens` in lockstep with what's actually
-    // resident in the KV/SWA/compressed-KV rings:
-    //   - On a CACHE MISS (lcp==0): replace with prompt_ids (we just
-    //     full-prefilled the whole prompt).
-    //   - On a CACHE HIT (lcp>0): truncate the prior tracker down to
-    //     `lcp` before appending the suffix. For partial LCP this
-    //     matters — tokens in the prior tracker beyond `lcp` came
-    //     from a previous turn's decode but the slots they lived in
-    //     have just been overwritten by the suffix prefill. Leaving
-    //     them in the tracker would let the NEXT request's LCP
-    //     comparison run off the end of what's actually cached and
-    //     make divergent assumptions about ring contents.
-    if lcp == 0 {
-        m.conversation_tokens.clear();
-        m.conversation_tokens.extend_from_slice(&prompt_ids);
-    } else {
-        m.conversation_tokens.truncate(lcp);
-        m.conversation_tokens.extend_from_slice(suffix_tokens);
-    }
-    let cached_tokens: usize = lcp;
 
-    // Sync to ensure all prefill kernels have completed before stopping
-    // the timer (head's download_f32 already syncs but defensive).
-    let _ = gpu.hip.device_synchronize();
-    let prefill_ms = t0.elapsed().as_millis();
 
-    // Prefill-complete abort observation (full route reset, not cursor-only).
-    if check_abort(id) {
-        ds4_ar_client_abort(
-            stdout,
-            id,
-            &mut m.seq_pos,
-            &mut m.conversation_tokens,
-            &mut m.prefill_checkpoints,
-            &mut m.dflash_checkpoints,
-            &mut m.speculator,
-            gpu,
-            state,
-            0,
-        );
-        return;
-    }
 
-    let mut generated_count: usize = 0;
-    let decode_t0 = Instant::now();
-    let pos_after_prefill = state.n_tokens as u32;
 
-    // Sampler. HF DeepSeek-V4-Flash card recommends temp=1.0, top_p=1.0
-    // for local deployment; we honor that as the default. Pure greedy
-    // (temp <= 1e-6) is supported but enters block-level attractors on
-    // structured prompts.
-    let top_k: usize = std::env::var("HIPFIRE_DEEPSEEK4_TOP_K")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let seed: u64 = std::env::var("HIPFIRE_DEEPSEEK4_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0x9E3779B97F4A7C15)
-        });
-    let mut rng = deepseek4::sampling::Xorshift::new(seed);
 
-    // Track whether the decode loop saw a complete
-    // `<｜DSML｜tool_calls>` block close. Drives `finish_reason` in the
-    // `done` envelope below.
-    let mut tool_calls_parsed_count: usize;
-    // Plain autoregressive decode. The MTP spec-decode path now routes through
-    // `generate_deepseek4_spec` + the unified `generate_spec` (T4c-2); this
-    // function is the AR sampler path (temp>0) and the no-speculator fallback.
-    // The bare block scopes the parser/matcher/sampler locals (was the old
-    // `else` arm of the now-deleted `if spec_mode` spec loop).
-    {
-        // Plain decode loop. Sampler honours `temp` + `top_p` from the
-        // request; HF default is temp=1.0, top_p=1.0 (multinomial across
-        // the full vocab, no nucleus cut). Greedy (temp <= 1e-6) is
-        // dangerous — see fn doc.
-        //
-        // Tokens are fed through a DSML stream parser that recognises
-        // `<think>…</think>` reasoning blocks and
-        // `<｜DSML｜tool_calls>…</｜DSML｜tool_calls>` tool-call blocks. The
-        // parser emits:
-        //   - StreamEvent::Token(text)       → JSONL `{type:"token"}`
-        //   - StreamEvent::Reasoning(text)   → JSONL `{type:"reasoning"}`
-        //   - StreamEvent::ToolCalls(calls)  → JSONL `{type:"tool_calls"}`
-        // Markers split across token boundaries are buffered until they
-        // resolve. The CLI / HTTP layer maps these to OpenAI SSE chunks.
-        // Prime the parser's initial state to match the bootstrap tag
-        // we appended to `prompt_ids`. In High/Max think modes the
-        // prompt ends with `<think>` and the model's first generated
-        // token is the body of that thinking block — without
-        // `new_in_think()` the parser would sit in `Normal` and
-        // misclassify every reasoning token as plain content,
-        // including the trailing `</think>` which then leaks into
-        // `message.content`. NonThink mode appends `</think>` (closing
-        // a zero-length think block) so the response starts in Normal.
-        let mut parser = match think_mode {
-            ThinkMode::Low | ThinkMode::High | ThinkMode::Max => {
-                deepseek4::dsml::StreamParser::new_in_think()
-            }
-            ThinkMode::NonThink => deepseek4::dsml::StreamParser::new(),
-        };
 
-        // Grammar-guided decoding setup. When tools are present, we mask
-        // the logits against a small state machine that mirrors the DSML
-        // format — inside a `<｜DSML｜tool_calls>` block the model can
-        // only emit token IDs whose decoded text is a prefix of a legal
-        // continuation (e.g. `<｜DSML｜invoke name="` or a schema-defined
-        // tool name). In free-emission states (`Out`, `InParamBody`,
-        // and any time tools is None / empty) the mask is all-true and
-        // the mask compute is skipped.
-        //
-        // Why this exists: V4F MQ2-Lloyd has damaged logit precision on
-        // format-structural tokens — even with the byte-identical HF
-        // system prompt at temp=1.0 it deterministically emits invented
-        // variants like `<｜DSML｜tool_cbl>`, `<｜DSML｜calling>`,
-        // `</｜DSML｜paper>` that no parser can recover. The mask makes
-        // those tokens unreachable at the sampler level.
-        let tool_schemas: Vec<deepseek4::grammar::ToolSchema> = tools
-            .map(|arr| {
-                arr.iter()
-                    .map(|t| {
-                        let func = t.get("function").unwrap_or(t);
-                        let name = func
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let parameters = func.get("parameters");
-                        let params: Vec<String> = parameters
-                            .and_then(|p| p.get("properties"))
-                            .and_then(|p| p.as_object())
-                            .map(|m| m.keys().cloned().collect())
-                            .unwrap_or_default();
-                        let required: Vec<String> = parameters
-                            .and_then(|p| p.get("required"))
-                            .and_then(|r| r.as_array())
-                            .map(|arr| {
-                                arr.iter()
-                                    .filter_map(|v| v.as_str().map(String::from))
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        deepseek4::grammar::ToolSchema {
-                            name,
-                            params,
-                            required,
-                        }
-                    })
-                    .filter(|s: &deepseek4::grammar::ToolSchema| !s.name.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default();
-        let grammar_active = !tool_schemas.is_empty();
-        let mut matcher = deepseek4::grammar::Matcher::new(tool_schemas);
-        // Precompute (or fetch the cached) decoded vocab. `tokenizer.decode`
-        // per id over ~129k ids is allocator-heavy enough that doing it
-        // per-request adds tens of ms of pure overhead to every tool-
-        // using V4F turn. The cache lives on `LoadedModel.decoded_vocab`
-        // as an `Arc<Vec<String>>` and is cleared on model unload.
-        //
-        // Borrow note: `m.decoded_vocab` is a disjoint field from
-        // `m.state` (whose `ModelState::Deepseek4` bundle `state` holds `&mut`
-        // to) and from `m.tokenizer` (which `tokenizer` holds `&` to), so the
-        // assignment compiles under Rust's split-borrows.
-        let decoded_vocab_arc: Option<std::sync::Arc<Vec<String>>> = if grammar_active {
-            if m.decoded_vocab.is_none() {
-                let n = tokenizer.vocab_size();
-                let v: Vec<String> = (0..n).map(|id| tokenizer.decode(&[id as u32])).collect();
-                m.decoded_vocab = Some(std::sync::Arc::new(v));
-            }
-            m.decoded_vocab.clone()
-        } else {
-            None
-        };
-        let empty_vocab: Vec<String> = Vec::new();
-        let decoded_vocab: &[String] = decoded_vocab_arc
-            .as_deref()
-            .map(|v| v.as_slice())
-            .unwrap_or(&empty_vocab);
-        let mut grammar_mask: Vec<bool> = vec![true; decoded_vocab.len()];
 
-        // Open the wire contract before the first sample. Same fail-closed CLI
-        // latch as the spec path: any event ahead of `gen_start` aborts the
-        // stream with "stream must begin with gen_start; got token before
-        // contract latch". Placed after prefill and grammar setup but before
-        // the first `sample_token`, so no token can outrun it.
-        emit_gen_start(
-            stdout,
-            id,
-            !matches!(think_mode, ThinkMode::NonThink),
-            ds4_gen_start_contract_version(),
-        );
 
-        // Apply mask to the prefill-returned logits before the first
-        // sample (matcher is in `Out` here so this is a no-op, but the
-        // codepath stays uniform).
-        let mut first_logits = last_logits;
-        if grammar_active && !matcher.is_free() {
-            matcher.token_mask(&decoded_vocab, &mut grammar_mask);
-            deepseek4::grammar::Matcher::apply_mask_to_logits(&grammar_mask, &mut first_logits);
-        }
-        let mut next_tok: u32 =
-            deepseek4::sampling::sample_token(&first_logits, temp, top_k, top_p, &mut rng);
-        let mut pos = pos_after_prefill;
-        // Token-cache capture for the prefix-cache replay path. We
-        // mirror the parser events into local accumulators so that —
-        // after decode completes — we can fingerprint the just-emitted
-        // assistant turn by (content_text, tool_calls) and store the
-        // exact token IDs that the model emitted at
-        // `conversation_tokens[decode_start..decode_end]`.
-        //
-        // Why mirror rather than re-parse: the streamed events from
-        // `parser.feed` carry the parser's reconstructed structure
-        // (Reasoning fragments split off from Token, ToolCalls
-        // assembled from `<｜DSML｜tool_calls>` blocks). Replaying that
-        // here once captures all the logical structure without a
-        // second tokenizer pass.
-        let decode_start_tokens_idx = m.conversation_tokens.len();
-        let mut emit_text_buf = String::new();
-        let mut emit_tool_calls_buf: Vec<hipfire_runtime::prompt_frame::ToolCall> = Vec::new();
-        let mut dsml_malformed: Option<String> = None;
-        use hipfire_arch_deepseek4::dsml::StreamEvent;
-        // Reasoning is not fingerprinted (history re-opens think from think_mode).
-        // ToolCalls are buffered turn-wide and released only on a tool-safe terminal.
-        let mut absorb_event = |ev: &StreamEvent| {
-            ds4_absorb_stream_event(
-                ev,
-                &mut emit_text_buf,
-                &mut emit_tool_calls_buf,
-                &mut dsml_malformed,
-            );
-        };
 
-        while generated_count < max_tokens && next_tok != eos_tok {
-            if check_abort(id) {
-                ds4_ar_client_abort(
-                    stdout,
-                    id,
-                    &mut m.seq_pos,
-                    &mut m.conversation_tokens,
-                    &mut m.prefill_checkpoints,
-                    &mut m.dflash_checkpoints,
-                    &mut m.speculator,
-                    gpu,
-                    state,
-                    generated_count,
-                );
-                return;
-            }
-            let frag = tokenizer.decode(&[next_tok]);
-            for ev in parser.feed(&frag) {
-                absorb_event(&ev);
-                emit_stream_event(stdout, id, ev);
-            }
-            emit_committed_event(
-                stdout,
-                id,
-                next_tok,
-                generated_count,
-                decode_t0.elapsed().as_millis() as u64,
-            );
-            let _ = stdout.flush();
-            m.conversation_tokens.push(next_tok);
-            if grammar_active {
-                matcher.advance(&frag);
-            }
-            generated_count += 1;
-            match deepseek4::forward::decode_step_with_graph(
-                cfg, weights, state, gpu, next_tok, pos,
-            ) {
-                Ok(mut logits) => {
-                    if grammar_active && !matcher.is_free() {
-                        matcher.token_mask(&decoded_vocab, &mut grammar_mask);
-                        deepseek4::grammar::Matcher::apply_mask_to_logits(
-                            &grammar_mask,
-                            &mut logits,
-                        );
-                    }
-                    next_tok =
-                        deepseek4::sampling::sample_token(&logits, temp, top_k, top_p, &mut rng);
-                    pos += 1;
-                }
-                Err(e) => {
-                    emit_error_with_id(stdout, id, format!("deepseek4decode failed: {e:?}"));
-                    let _ = stdout.flush();
-                    return;
-                }
-            }
-        }
-        // Flush any buffered partial markers / content.
-        for ev in parser.finish() {
-            absorb_event(&ev);
-            emit_stream_event(stdout, id, ev);
-        }
-        let _ = stdout.flush();
 
-        // Cache the just-emitted token sequence under its (content,
-        // tool_calls) fingerprint so the next request's V4F history
-        // render can replay verbatim and avoid BPE re-encode drift.
-        // Trim leading EOS/zero residue defensively (the loop never
-        // pushes EOS, but a future model that emits EOS mid-stream
-        // shouldn't end up with EOS landing in the cached tokens).
-        drop(absorb_event); // release the &mut emit_*_buf borrow
-                            // Final mid-turn abort observation before terminal classification.
-        if check_abort(id) {
-            ds4_ar_client_abort(
-                stdout,
-                id,
-                &mut m.seq_pos,
-                &mut m.conversation_tokens,
-                &mut m.prefill_checkpoints,
-                &mut m.dflash_checkpoints,
-                &mut m.speculator,
-                gpu,
-                state,
-                generated_count,
-            );
-            return;
-        }
-        // Pure turn-wide terminal: later Malformed discards every buffered call.
-        let terminal = ds4_ar_ep_finish_route(
-            dsml_malformed,
-            emit_tool_calls_buf,
-            generated_count >= max_tokens,
-        );
-        let (finish_reason, wire_tool_calls, store_cache) = match &terminal {
-            Ds4ArEpRouteTerminal::Malformed(action) => {
-                emit_ds4_malformed_action(stdout, id, action);
-                return;
-            }
-            Ds4ArEpRouteTerminal::Safe {
-                finish_reason,
-                wire_tool_calls,
-                store_cache,
-            } => (*finish_reason, wire_tool_calls.clone(), *store_cache),
-        };
-        // Timing + pending done fixed before handshake so commit_ready carries
-        // the exact eventual done payload. Abort rolls back + emits one
-        // cancellation lifecycle (or fail-closed error if unattested).
-        m.seq_pos = state.n_tokens as usize;
-        let _ = gpu.hip.device_synchronize();
-        let decode_ms = decode_t0.elapsed().as_millis().max(1);
-        let total_ms = t0.elapsed().as_millis().max(1);
-        let tok_s = if generated_count > 0 && decode_ms > 0 {
-            (generated_count as f64 * 1000.0) / decode_ms as f64
-        } else {
-            0.0
-        };
-        let prompt_tokens_total = prompt_ids.len();
-        let prefill_tokens_actual = suffix_tokens.len();
-        let prefill_tok_s = if prefill_ms > 0 {
-            prefill_tokens_actual as f64 * 1000.0 / prefill_ms as f64
-        } else {
-            0.0
-        };
-        let mut pending_done = serde_json::json!({
-            "type": "done",
-            "id": id,
-            "tokens": generated_count,
-            "tok_s": tok_s,
-            "prompt_tokens": prompt_tokens_total,
-            "prefill_tokens": prefill_tokens_actual,
-            "cached_tokens": cached_tokens,
-            "prefill_ms": prefill_ms,
-            "prefill_tok_s": (prefill_tok_s * 10.0).round() / 10.0,
-            "decode_tok_s": (tok_s * 10.0).round() / 10.0,
-            "total_ms": total_ms,
-            "finish_reason": finish_reason,
-            "drafter": "ar",
-            "attempt_id": active_attempt_id(),
-        });
-        // Stage canonical calls before handshake; no post-commit tool_calls event.
-        stage_terminal_tool_calls(&mut pending_done, finish_reason, &wire_tool_calls);
-        // Two-phase commit before cache / normal done.
-        let decision = await_client_terminal_commit(stdout, id, &pending_done);
-        let effects = ds4_client_commit_effects(decision, !wire_tool_calls.is_empty(), store_cache);
-        if !effects.emit_done {
-            ds4_ar_client_abort(
-                stdout,
-                id,
-                &mut m.seq_pos,
-                &mut m.conversation_tokens,
-                &mut m.prefill_checkpoints,
-                &mut m.dflash_checkpoints,
-                &mut m.speculator,
-                gpu,
-                state,
-                generated_count,
-            );
-            return;
-        }
-        // Snapshot count retained for debug visibility only.
-        tool_calls_parsed_count = if effects.release_tool_calls {
-            wire_tool_calls.len()
-        } else {
-            0
-        };
-        // Skip caching when the turn produced no replay-able payload —
-        // empty trimmed content AND no tool_calls. Length terminals also
-        // suppress cache. Shared via ds4_ar_ep_cache_action / apply.
-        let mut action = ds4_ar_ep_cache_action(&terminal, &emit_text_buf);
-        if !effects.store_cache {
-            action.store = false;
-        }
-        if action.store
-            && generated_count > 0
-            && m.conversation_tokens.len() > decode_start_tokens_idx
-        {
-            let cached_seq: Vec<u32> = m.conversation_tokens[decode_start_tokens_idx..].to_vec();
-            if std::env::var("HIPFIRE_DEEPSEEK4_CACHE_TRACE")
-                .ok()
-                .as_deref()
-                == Some("1")
-            {
-                eprintln!(
-                    "[asst-cache store] content.len={} tool_calls={} tokens={}",
-                    emit_text_buf.len(),
-                    wire_tool_calls.len(),
-                    cached_seq.len(),
-                );
-            }
-            let _ = ds4_apply_cache_action(
-                |fp, seq| {
-                    if std::env::var("HIPFIRE_DEEPSEEK4_CACHE_TRACE")
-                        .ok()
-                        .as_deref()
-                        == Some("1")
-                    {
-                        eprintln!("[asst-cache store] fp={:#018x} tokens={}", fp, seq.len());
-                    }
-                    m.asst_turn_cache.insert(
-                        fp,
-                        hipfire_runtime::prompt_frame::CachedAssistantTurn {
-                            reasoning: None,
-                            tools: Vec::new(),
-                            content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
-                                token_ids: seq,
-                                text: String::new(),
-                            }),
-                        },
-                    );
-                },
-                &action,
-                cached_seq,
-            );
-        }
-        emit_staged_terminal_done(stdout, &pending_done);
-        // Per-request debug summary: this request ran autoregressive (no drafter),
-        // e.g. spec disabled or a temp path the loaded drafter can't verify. Making
-        // the AR fall-through visible is the point — a "stall" is often just AR.
-        let _ = tool_calls_parsed_count;
-        eprintln!("[req {id}] drafter=ar tau=1.00 tok/s={tok_s:.1} decode ({generated_count} tok, autoregressive)");
-    }
-}
 
-fn ds4_heterogeneous_client_abort(
-    model: &mut hipfire_arch_deepseek4::heterogeneous::DeepseekV4HeterogeneousModel,
-    seq_pos: &mut usize,
-    conversation_tokens: &mut Vec<u32>,
-    stdout: &mut impl std::io::Write,
-    id: &str,
-    completion_tokens: usize,
-) {
-    *seq_pos = 0;
-    conversation_tokens.clear();
-    let reset = model.reset_for_request_attested();
-    match reset {
-        Ok(()) => {
-            eprintln!(
-                "[req {id}] drafter=ar-heterogeneous abort=client rollback=attested post_join=true completion_tokens={completion_tokens}"
-            );
-            let (aborted, done) =
-                ds4_ep_abort_wire_events(id, completion_tokens, active_attempt_id());
-            let _ = writeln!(stdout, "{aborted}");
-            let _ = writeln!(stdout, "{done}");
-            let _ = stdout.flush();
-        }
-        Err(error) => emit_active_attempt_error(
-            stdout,
-            Some(id),
-            &format!("client cancelled; heterogeneous rollback failed: {error}"),
-            "runtime",
-            false,
-            false,
-        ),
-    }
-}
 
-#[allow(clippy::too_many_arguments)]
-fn generate_deepseek4_heterogeneous(
-    m: &mut LoadedModel,
-    stdout: &mut std::io::Stdout,
-    id: &str,
-    prompt: &str,
-    system_prompt: Option<&str>,
-    temp: f32,
-    top_p: f32,
-    max_tokens: usize,
-    think_mode: ThinkMode,
-    tools: Option<&[serde_json::Value]>,
-    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
-) {
-    if tools.is_some_and(|items| !items.is_empty()) {
-        emit_active_attempt_error(
-            stdout,
-            Some(id),
-            "tools are not yet admitted on the DeepSeek V4 heterogeneous G4 route",
-            "unsupported",
-            false,
-            false,
-        );
-        let _ = stdout.flush();
-        return;
-    }
-    let Some(tokenizer) = m.tokenizer.as_ref() else {
-        emit_error_with_id(stdout, id, "tokenizer not loaded");
-        return;
-    };
-    let eos_tok = match m.state.as_ref() {
-        Some(ModelState::Deepseek4Heterogeneous(bundle)) => bundle.eos_tok,
-        _ => {
-            emit_error_with_id(stdout, id, "deepseek4 heterogeneous state missing");
-            return;
-        }
-    };
-    let prompt_ids = build_deepseek4_dsml_prompt(
-        tokenizer,
-        system_prompt,
-        None,
-        messages_history,
-        prompt,
-        think_mode,
-        eos_tok,
-        &mut m.asst_turn_cache,
-    );
-    if prompt_ids.is_empty() {
-        emit_error_with_id(stdout, id, "empty prompt after tokenize");
-        return;
-    }
-    if prompt_ids.len().saturating_add(max_tokens) > m.physical_cap {
-        emit_error_with_id(
-            stdout,
-            id,
-            format!(
-                "prompt exceeds checkpoint context capacity: prompt={} + max_tokens={} > capacity={}",
-                prompt_ids.len(),
-                max_tokens,
-                m.physical_cap
-            ),
-        );
-        return;
-    }
 
-    let total_t0 = Instant::now();
-    let prefill_t0 = Instant::now();
-    let (mut logits, prefill_ms) = {
-        let Some(ModelState::Deepseek4Heterogeneous(bundle)) = m.state.as_mut() else {
-            emit_error_with_id(stdout, id, "deepseek4 heterogeneous state missing");
-            return;
-        };
-        if let Err(error) = bundle.model.reset_for_request() {
-            emit_error_with_id(
-                stdout,
-                id,
-                format!("deepseek4 heterogeneous reset failed: {error}"),
-            );
-            return;
-        }
-        let mut logits = Vec::new();
-        for (position, &token) in prompt_ids.iter().enumerate() {
-            match bundle
-                .model
-                .decode_step_with_abort(token, position as u32, &|| check_abort(id))
-            {
-                Ok(Some(next)) => logits = next,
-                Ok(None) => {
-                    ds4_heterogeneous_client_abort(
-                        &mut bundle.model,
-                        &mut m.seq_pos,
-                        &mut m.conversation_tokens,
-                        stdout,
-                        id,
-                        0,
-                    );
-                    return;
-                }
-                Err(error) => {
-                    emit_error_with_id(
-                        stdout,
-                        id,
-                        format!("deepseek4 heterogeneous prefill failed: {error}"),
-                    );
-                    return;
-                }
-            }
-        }
-        if let Some(state) = bundle.model.state.as_mut() {
-            state.n_tokens = prompt_ids.len() as u64;
-        }
-        let _ = bundle.model.dense_gpu.hip.device_synchronize();
-        (logits, prefill_t0.elapsed().as_millis())
-    };
 
-    emit_gen_start(
-        stdout,
-        id,
-        !matches!(think_mode, ThinkMode::NonThink),
-        ds4_gen_start_contract_version(),
-    );
-    let top_k = std::env::var("HIPFIRE_DEEPSEEK4_TOP_K")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(0);
-    let mut rng = deepseek4::sampling::Xorshift::new(0x1357_9bdf);
-    let mut parser = match think_mode {
-        ThinkMode::Low | ThinkMode::High | ThinkMode::Max => {
-            deepseek4::dsml::StreamParser::new_in_think()
-        }
-        ThinkMode::NonThink => deepseek4::dsml::StreamParser::new(),
-    };
-    let mut next_tok = deepseek4::sampling::sample_token(&logits, temp, top_k, top_p, &mut rng);
-    let decode_t0 = Instant::now();
-    let mut generated = 0usize;
-    let mut pos = prompt_ids.len() as u32;
-    let mut emitted_tokens = Vec::with_capacity(max_tokens);
-    let mut emit_text_buf = String::new();
-    let mut emit_tool_calls_buf = Vec::new();
-    let mut dsml_malformed = None;
 
-    while generated < max_tokens && next_tok != eos_tok {
-        let fragment = tokenizer.decode(&[next_tok]);
-        for event in parser.feed(&fragment) {
-            ds4_absorb_stream_event(
-                &event,
-                &mut emit_text_buf,
-                &mut emit_tool_calls_buf,
-                &mut dsml_malformed,
-            );
-            emit_stream_event(stdout, id, event);
-        }
-        emit_committed_event(
-            stdout,
-            id,
-            next_tok,
-            generated,
-            decode_t0.elapsed().as_millis() as u64,
-        );
-        let _ = stdout.flush();
-        emitted_tokens.push(next_tok);
-        generated += 1;
-        if generated >= max_tokens {
-            break;
-        }
-        let Some(ModelState::Deepseek4Heterogeneous(bundle)) = m.state.as_mut() else {
-            emit_error_with_id(stdout, id, "deepseek4 heterogeneous state disappeared");
-            return;
-        };
-        match bundle
-            .model
-            .decode_step_with_abort(next_tok, pos, &|| check_abort(id))
-        {
-            Ok(Some(next)) => logits = next,
-            Ok(None) => {
-                ds4_heterogeneous_client_abort(
-                    &mut bundle.model,
-                    &mut m.seq_pos,
-                    &mut m.conversation_tokens,
-                    stdout,
-                    id,
-                    generated,
-                );
-                return;
-            }
-            Err(error) => {
-                emit_error_with_id(
-                    stdout,
-                    id,
-                    format!("deepseek4 heterogeneous decode failed: {error}"),
-                );
-                return;
-            }
-        }
-        pos = pos.saturating_add(1);
-        if let Some(state) = bundle.model.state.as_mut() {
-            state.n_tokens = pos as u64;
-        }
-        next_tok = deepseek4::sampling::sample_token(&logits, temp, top_k, top_p, &mut rng);
-    }
-    for event in parser.finish() {
-        ds4_absorb_stream_event(
-            &event,
-            &mut emit_text_buf,
-            &mut emit_tool_calls_buf,
-            &mut dsml_malformed,
-        );
-        emit_stream_event(stdout, id, event);
-    }
-    let terminal =
-        ds4_ar_ep_finish_route(dsml_malformed, emit_tool_calls_buf, generated >= max_tokens);
-    let (finish_reason, wire_tool_calls) = match terminal {
-        Ds4ArEpRouteTerminal::Malformed(action) => {
-            emit_ds4_malformed_action(stdout, id, &action);
-            return;
-        }
-        Ds4ArEpRouteTerminal::Safe {
-            finish_reason,
-            wire_tool_calls,
-            ..
-        } => (finish_reason, wire_tool_calls),
-    };
-    let decode_ms = decode_t0.elapsed().as_millis().max(1);
-    let tok_s = generated as f64 * 1000.0 / decode_ms as f64;
-    let mut pending_done = serde_json::json!({
-        "type": "done",
-        "id": id,
-        "tokens": generated,
-        "tok_s": tok_s,
-        "prompt_tokens": prompt_ids.len(),
-        "prefill_tokens": prompt_ids.len(),
-        "cached_tokens": 0,
-        "prefill_ms": prefill_ms,
-        "total_ms": total_t0.elapsed().as_millis().max(1),
-        "finish_reason": finish_reason,
-        "drafter": "ar-heterogeneous",
-        "attempt_id": active_attempt_id(),
-    });
-    stage_terminal_tool_calls(&mut pending_done, finish_reason, &wire_tool_calls);
-    let decision = await_client_terminal_commit(stdout, id, &pending_done);
-    let effects = ds4_client_commit_effects(decision, !wire_tool_calls.is_empty(), true);
-    if !effects.emit_done {
-        let Some(ModelState::Deepseek4Heterogeneous(bundle)) = m.state.as_mut() else {
-            emit_error_with_id(
-                stdout,
-                id,
-                "deepseek4 heterogeneous state disappeared on abort",
-            );
-            return;
-        };
-        ds4_heterogeneous_client_abort(
-            &mut bundle.model,
-            &mut m.seq_pos,
-            &mut m.conversation_tokens,
-            stdout,
-            id,
-            generated,
-        );
-        return;
-    }
-    m.seq_pos = pos as usize;
-    m.conversation_tokens.clear();
-    m.conversation_tokens.extend_from_slice(&prompt_ids);
-    m.conversation_tokens.extend_from_slice(&emitted_tokens);
-    emit_staged_terminal_done(stdout, &pending_done);
-    eprintln!(
-        "[req {id}] drafter=ar-heterogeneous tau=1.00 tok/s={tok_s:.1} decode ({generated} tok)"
-    );
-}
 
-/// Gemma 4 dense text (arch_id=13) eager AR path.
-///
-/// Ported from `origin/feat/gemma4-union` and rehomed onto the beta
-/// `ModelState::Gemma4(bundle)` design: reads `bundle.config` /
-/// `bundle.weights` / `bundle.state` / `bundle.eos_tok` instead of the PR's
-/// `m.gemma4_*` Option fields. Same shape as `generate_lfm2moe` (prefill loop,
-/// decode loop, JSONL `token` / `done` events) with four gemma4-specifics:
-///
-///   1. Prompt build goes through the model's chat template (Jinja), rendered
-///      with an EXPLICIT `bos_token: Some("<bos>")` — gemma4's tokenizer
-///      decodes `<bos>` to id 2 but the raw-encode fallback doesn't prepend
-///      it, so the BOS guard below handles the fallback path.
-///   2. Prefill is per-token eager `gemma4::forward::decode_step`; decode is
-///      `gemma4::forward::decode_step_with_graph` (hipGraph, default OFF).
-///   3. Sampling is host-side from the returned logits vector via
-///      `deepseek4::sampling::sample_token`.
-///   4. Stop set: `<eos>` (config.eos_token, id 1) UNION `bundle.eos_tok`
-///      (loader-resolved `<end_of_turn>` / `<turn|>`) UNION documented 106 —
-///      the HF `eos_token_id` list is `[1, 106]`; parsing as a scalar drops
-///      106 and decode loops `<turn|>` forever.
-///
-/// Prompt-cache: arch 13 is intentionally ABSENT from the `cache_capable`
-/// allowlist (see load handler) — this path has no LCP prefix-cache block and
-/// always cold-prefills the full Jinja render. Enabling cache would corrupt
-/// KV slot offsets after turn 1.
-///
-/// EAGLE spec-decode (arch-22 drafter via `params.drafter`) is wired when
-/// `bundle.eagle.is_some()` and `temp <= 1e-6` — greedy-only accept rule,
-/// same contract as DFlash. `HIPFIRE_GEMMA4_EAGLE=0` opts out.
-#[allow(clippy::too_many_arguments)]
-fn generate_gemma4(
-    m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
-    stdout: &mut std::io::Stdout,
-    id: &str,
-    prompt: &str,
-    system_prompt: Option<&str>,
-    temp: f32,
-    top_p: f32,
-    max_tokens: usize,
-    max_think_tokens: usize,
-    tools: Option<&[serde_json::Value]>,
-    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
-) {
-    // v1 is non-thinking; the think budget only gates thinking-capable paths.
-    let _ = max_think_tokens;
 
-    if m.tokenizer.is_none() {
-        emit_error_with_id(stdout, id, "tokenizer not loaded");
-        return;
-    }
-    // Open the stream contract BEFORE any GPU work or token emission: the CLI's
-    // StreamContractGate fail-closes on any event preceding `gen_start`, so
-    // without this the first `token` is rejected, the client aborts, and the
-    // HTTP handler waits forever. Same fix as DS4 (e99583afa) and lfm2moe.
-    let gen_contract = gen_start_contract_version_for_arch(m.arch_id);
-    emit_gen_start(stdout, id, false, gen_contract);
-    let Some(ModelState::Gemma4(bundle)) = m.state.as_mut() else {
-        emit_error_with_id(
-            stdout,
-            id,
-            "gemma4 bundle missing on arch_id=13 generate (eager dense only;              EAGLE/lowered not yet wired)",
-        );
-        return;
-    };
 
-    let bos_tok = bundle.config.bos_token;
-    let cfg_eos_tok = bundle.config.eos_token;
 
-    // ── Prompt build (same two-path branch as the lfm2moe AR path) ──
-    let prompt_ids: Vec<u32> = {
-        let tokenizer = m.tokenizer.as_ref().unwrap();
-        let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
-        let try_jinja = jinja_enabled && m.chat_template.is_some();
-        let mut ids: Vec<u32> = if try_jinja {
-            let template = m.chat_template.as_ref().unwrap();
-            let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
-                tokenizer,
-                template,
-                system: system_prompt,
-                user: prompt,
-                enable_thinking: max_think_tokens != 1,
-                bos_token: Some("<bos>"),
-                reasoning_strength: None,
-                reasoning_effort: None,
-            };
-            let render_result = if tools.is_some() || messages_history.is_some() {
-                let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
-                let messages_slice: &[hipfire_runtime::prompt_frame::Message] =
-                    match messages_history {
-                        Some(h) => h,
-                        None => {
-                            let mut v = Vec::new();
-                            if let Some(sys) = system_prompt {
-                                v.push(hipfire_runtime::prompt_frame::Message {
-                                    role: hipfire_runtime::prompt_frame::Role::System,
-                                    content: sys.to_string(),
-                                    reasoning_content: None,
-                                    name: None,
-                                    rendered_name: None,
-                                    tool_calls: Vec::new(),
-                                    tool_call_id: None,
-                                    tool_plan: String::new(),
-                                });
-                            }
-                            v.push(hipfire_runtime::prompt_frame::Message {
-                                role: hipfire_runtime::prompt_frame::Role::User,
-                                content: prompt.to_string(),
-                                reasoning_content: None,
-                                name: None,
-                                rendered_name: None,
-                                tool_calls: Vec::new(),
-                                tool_call_id: None,
-                                tool_plan: String::new(),
-                            });
-                            synthesized = v;
-                            &synthesized
-                        }
-                    };
-                frame.render_messages(messages_slice, tools, None)
-            } else {
-                frame.render()
-            };
-            match render_result {
-                Ok(rendered) => tokenizer.encode(&rendered),
-                Err(e) => {
-                    eprintln!(
-                        "[daemon] jinja render failed in gemma4 path ({e}) —                          falling back to BOS + raw prompt"
-                    );
-                    tokenizer.encode(prompt)
-                }
-            }
-        } else {
-            tokenizer.encode(prompt)
-        };
-        if ids.first() != Some(&bos_tok) {
-            ids.insert(0, bos_tok);
-        }
-        ids
-    };
 
-    if prompt_ids.is_empty() {
-        emit_error_with_id(stdout, id, "empty prompt after tokenize");
-        return;
-    }
 
-    // Stop set (see doc comment item 4). `bundle.eos_tok` already resolved
-    // `<end_of_turn>` / `<turn|>` at load; union with config.eos_token
-    // (`<eos>`, id 1) and the documented 106 for robustness across exports.
-    let stop_set: Vec<u32> = {
-        let mut s = vec![cfg_eos_tok, bundle.eos_tok];
-        if !s.contains(&106) {
-            s.push(106);
-        }
-        s.dedup();
-        s
-    };
-
-    // Capacity guard. No eviction on arch_id=13 — reset the KV cursors when
-    // the requested run would overflow the physical cache.
-    let overflow = { bundle.state.n_tokens + prompt_ids.len() + max_tokens > bundle.state.max_seq };
-    if overflow {
-        let (n, cap) = (bundle.state.n_tokens, bundle.state.max_seq);
-        eprintln!("[daemon] arch_id=13 context full ({n}/{cap}) — resetting Gemma4State");
-        bundle.state.reset();
-        m.seq_pos = 0;
-        m.conversation_tokens.clear();
-    }
-    // Hard refusal: even from a cold cache the prompt alone must fit (KV
-    // writes at pos >= max_seq would be out of bounds).
-    let cache_cap = bundle.state.max_seq;
-    if prompt_ids.len() >= cache_cap {
-        emit_error_with_id(
-            stdout,
-            id,
-            format!(
-                "gemma4 prompt is {} tokens but max_seq is {cache_cap}",
-                prompt_ids.len()
-            ),
-        );
-        return;
-    }
-
-    let t0 = Instant::now();
-
-    // ── Prefill. `forward_batch` preserves the eager result/KV contract while
-    // reading projection weights once for a small token block. Keep the path
-    // opt-in until long-context parity is certified on each supported board.
-    let mut last_logits: Vec<f32> = Vec::new();
-    {
-        let requested_prefill_batch = std::env::var("HIPFIRE_GEMMA4_PREFILL_BATCH")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(1)
-            .clamp(1, 64);
-        let prefill_batch = if requested_prefill_batch > 1
-            && !gemma4::forward::supports_batched_prefill(&bundle.weights)
-        {
-            eprintln!(
-                "[daemon] Gemma4 batched prefill is unavailable for this weight format; using eager prefill"
-            );
-            1
-        } else {
-            requested_prefill_batch
-        };
-        let mut offset = 0usize;
-        while offset < prompt_ids.len() {
-            let width = prefill_batch.min(prompt_ids.len() - offset);
-            let start_pos = bundle.state.n_tokens;
-            let result = if width == 1 {
-                gemma4::forward::decode_step(
-                    &bundle.config,
-                    &bundle.weights,
-                    &mut bundle.state,
-                    gpu,
-                    prompt_ids[offset],
-                    start_pos as u32,
-                )
-            } else {
-                gemma4::forward::forward_batch(
-                    &bundle.config,
-                    &bundle.weights,
-                    &mut bundle.state,
-                    gpu,
-                    &prompt_ids[offset..offset + width],
-                    start_pos,
-                )
-            };
-            match result {
-                Ok(logits) => last_logits = logits,
-                Err(e) => {
-                    emit_error_with_id(stdout, id, format!("gemma4 prefill failed: {e:?}"));
-                    return;
-                }
-            }
-            offset += width;
-        }
-    }
-    for &tok in &prompt_ids {
-        m.conversation_tokens.push(tok);
-    }
-    let prefill_ms = t0.elapsed().as_millis();
-
-    // ── EAGLE spec-decode fast path (arch-22 drafter loaded; greedy only) ──
-    //
-    // Mirrors the DFlash dispatch contract: the accept rule is greedy-argmax,
-    // so the committed stream is PROVABLY the target's greedy AR sequence —
-    // the same tokens the AR loop below would emit at temp 0. That invariant
-    // is the gate `infer_gemma4_spec --check-eager` validates byte-for-byte
-    // (spec == eager on hiptrx/gfx1201, Q8 and MQ4-attn targets, dl ≤ 4).
-    // temp > 0 falls through to the AR sampling loop, exactly like DFlash.
-    // GATED OFF: EAGLE currently violates its own correctness contract.
-    //
-    // The accept rule is greedy-argmax, so at temp 0 the committed stream is
-    // supposed to be PROVABLY the target's greedy AR sequence — byte-identical
-    // to the AR loop below. Measured on gfx1201, 12B-it, temp 0, 48 tokens,
-    // same prompt, on TWO different quantizations:
-    //
-    //   uniform MQ4   AR    52.81 tok/s  "To understand quantum computing, you
-    //                                     first have to understand how a normal
-    //                                     computer works..."
-    //                 EAGLE 44.28 tok/s  "To explain it, we have to look at the
-    //                                     \"rules\" of the world we see..."
-    //                 tau 1.531, rounds 32 — NOT byte-identical, and 0.84x
-    //
-    //   Q8            diverges the same way at tau 1.912, 0.73x
-    //
-    // Divergence begins at the first committed token, which points at the seed
-    // hidden / first-round verify rather than at acceptance rate. Reproducing
-    // across two quants rules out a quant-specific kernel issue.
-    //
-    // Until parity is proven it must not run: wrong tokens that look fluent are
-    // worse than a refusal, and it is slower anyway. Opt in for debugging with
-    // HIPFIRE_GEMMA4_EAGLE=1; HIPFIRE_GEMMA4_EAGLE=0 remains an explicit off.
-    //
-    // Separately: a K-map-promoted target cannot run this path at all —
-    // `proj_gemm_batched` handles only Q8_0 and MQ4G256/HFQ4G256, so the
-    // mode-3 `Promote6` on v_proj yields MQ6G256 and the verify fails loud with
-    // "dtype MQ6G256 has no batched proj kernel". A uniform (--no-kmap) target
-    // avoids that, which is how the numbers above were taken.
-    let eagle_active = bundle.eagle.is_some()
-        && temp <= 1e-6
-        && std::env::var("HIPFIRE_GEMMA4_EAGLE").ok().as_deref() == Some("1");
-    if eagle_active {
-        let draft_len = bundle.eagle.as_ref().unwrap().draft_len;
-        // Seed hidden = post-`model.norm` hidden of the last prompt position
-        // (left in `state.tmp` by the final prefill `decode_step` — the
-        // lm_head input). The seed TOKEN is the last prompt token; its KV is
-        // re-written (identically) at the top of the first verify. The first
-        // generated token comes out of round 1's verify (argmax_per_pos[0]),
-        // exactly as the AR loop's first sample from `last_logits` would —
-        // so `last_logits` is intentionally unused on this path.
-        {
-            let eagle = bundle.eagle.as_ref().unwrap();
-            if let Err(e) = eagle
-                .spec_scratch
-                .set_seed_hidden_from(gpu, &bundle.state.tmp)
-            {
-                emit_error_with_id(stdout, id, format!("gemma4 eagle seed hidden: {e}"));
-                return;
-            }
-        }
-        let prefill_end = bundle.state.n_tokens;
-        let mut seed_token = *prompt_ids.last().unwrap();
-        let mut generated_count = 0usize;
-        let mut rounds = 0usize;
-        let mut total_accepted = 0usize;
-        let mut stop = false;
-        let mut ttft_ms: Option<f64> = None;
-        let decode_t0 = Instant::now();
-        while !stop && generated_count < max_tokens {
-            let committed_len = bundle.state.n_tokens;
-            // KV/seq bound: the verify block occupies [L-1, L-1+draft_len+1).
-            if committed_len + draft_len + 1 >= cache_cap {
-                break;
-            }
-            let spec = {
-                // Split borrows: config/weights immutably, state+eagle mutably.
-                // Use raw pointers to avoid borrow-checker overlap on `bundle`.
-                let bundle_ptr = bundle as *mut hipfire_loader::Gemma4Bundle;
-                unsafe {
-                    let cfg = &(*bundle_ptr).config;
-                    let weights = &(*bundle_ptr).weights;
-                    let state = &mut (*bundle_ptr).state;
-                    let eagle = (*bundle_ptr).eagle.as_mut().unwrap();
-                    gemma4::speculative::spec_step_gemma4_eagle(
-                        gpu,
-                        weights,
-                        cfg,
-                        state,
-                        &eagle.drafter_weights,
-                        &eagle.drafter_config,
-                        &mut eagle.drafter_scratch,
-                        &mut eagle.spec_scratch,
-                        seed_token,
-                        committed_len,
-                        draft_len,
-                        0.0,
-                    )
-                }
-            };
-            let spec = match spec {
-                Ok(s) => s,
-                Err(e) => {
-                    emit_error_with_id(stdout, id, format!("gemma4 eagle spec step failed: {e}"));
-                    return;
-                }
-            };
-            rounds += 1;
-            total_accepted += spec.accept_len;
-            // Emit the committed tokens (accepted drafts ++ bonus); stop at
-            // EOS / max_tokens — identical to what the AR loop would commit.
-            for &t in &spec.committed {
-                if stop_set.contains(&t) {
-                    stop = true;
-                    break;
-                }
-                if ttft_ms.is_none() {
-                    ttft_ms = Some(t0.elapsed().as_secs_f64() * 1000.0);
-                }
-                let frag = {
-                    let tokenizer = m.tokenizer.as_ref().unwrap();
-                    tokenizer.decode(&[t])
-                };
-                let envelope = serde_json::json!({
-                    "type": "token",
-                    "id": id,
-                    "text": frag,
-                });
-                let _ = writeln!(stdout, "{}", envelope);
-                let _ = stdout.flush();
-                m.conversation_tokens.push(t);
-                generated_count += 1;
-                if generated_count >= max_tokens {
-                    stop = true;
-                    break;
-                }
-            }
-            // Next round's seed = this round's bonus; its hidden is already
-            // staged in spec_scratch.seed_hidden by spec_step.
-            seed_token = spec.next_seed_token;
-            // If we stopped on EOS mid-block, spec.n_tokens already counts the
-            // committed-but-not-emitted tail — the cursor settle below re-anchors
-            // to emitted extent.
-            if stop {
-                break;
-            }
-        }
-
-        // ── Cursor settle. `spec_step` leaves n_tokens = L+accept_len+1 with
-        // the final bonus's KV slot unwritten, and an EOS mid-block leaves
-        // committed-but-not-emitted tokens counted. Re-anchor the cursor to
-        // the EMITTED extent and re-forward the last emitted token at its
-        // slot so every position < n_tokens carries valid KV — the same
-        // invariant the AR loop leaves behind. (KV writes are absolute-
-        // position keyed and deterministic, so the re-write is identical to
-        // a fresh forward — the same property the verify itself relies on
-        // when it re-writes the seed's KV each round.) ──
-        if generated_count > 0 {
-            let last_tok = *m.conversation_tokens.last().unwrap();
-            let last_pos = (prefill_end + generated_count - 1) as u32;
-            let bundle_ptr = bundle as *mut hipfire_loader::Gemma4Bundle;
-            let settle_res = unsafe {
-                let cfg = &(*bundle_ptr).config;
-                let weights = &(*bundle_ptr).weights;
-                let state = &mut (*bundle_ptr).state;
-                gemma4::forward::decode_step(cfg, weights, state, gpu, last_tok, last_pos)
-            };
-            if let Err(e) = settle_res {
-                eprintln!("[daemon] gemma4 eagle cursor settle failed: {e:?}");
-                bundle.state.n_tokens = prefill_end + generated_count;
-            }
-        } else {
-            bundle.state.n_tokens = prefill_end;
-        }
-        m.seq_pos = bundle.state.n_tokens;
-
-        let decode_ms = decode_t0.elapsed().as_millis().max(1);
-        let total_ms = t0.elapsed().as_millis().max(1);
-        let tok_s = if generated_count > 0 {
-            (generated_count as f64 * 1000.0) / decode_ms as f64
-        } else {
-            0.0
-        };
-        let prefill_tok_s = prompt_ids.len() as f64 * 1000.0 / prefill_ms.max(1) as f64;
-        let ttft_ms = ttft_ms.unwrap_or(total_ms as f64);
-        // τ = mean tokens committed per round (accepted drafts + 1 bonus).
-        let tau = if rounds > 0 {
-            (total_accepted + rounds) as f64 / rounds as f64
-        } else {
-            0.0
-        };
-        let _ = writeln!(
-            stdout,
-            r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_tokens":{},"prefill_ms":{},"prefill_tok_s":{:.2},"decode_tok_s":{:.2},"ttft_ms":{:.3},"total_ms":{},"spec":"gemma4_eagle","rounds":{},"tau":{:.3},"draft_len":{},"attempt_id":{}}}"#,
-            id,
-            generated_count,
-            tok_s,
-            prompt_ids.len(),
-            prefill_ms,
-            prefill_tok_s,
-            tok_s,
-            ttft_ms,
-            total_ms,
-            rounds,
-            tau,
-            draft_len,
-            active_attempt_id(),
-        );
-        let _ = stdout.flush();
-        return;
-    }
-
-    // ── Decode loop. Sample host-side from the running logits vector. ──
-    let seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0x9E3779B97F4A7C15);
-    let mut rng = deepseek4::sampling::Xorshift::new(seed);
-
-    let mut generated_count: usize = 0;
-    let mut ttft_ms: Option<f64> = None;
-    let decode_t0 = Instant::now();
-    loop {
-        if generated_count >= max_tokens {
-            break;
-        }
-        let next_tok = deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
-        if stop_set.contains(&next_tok) {
-            break;
-        }
-
-        if ttft_ms.is_none() {
-            ttft_ms = Some(t0.elapsed().as_secs_f64() * 1000.0);
-        }
-
-        let frag = {
-            let tokenizer = m.tokenizer.as_ref().unwrap();
-            tokenizer.decode(&[next_tok])
-        };
-        let envelope = serde_json::json!({
-            "type": "token",
-            "id": id,
-            "text": frag,
-            "attempt_id": active_attempt_id(),
-        });
-        let _ = writeln!(stdout, "{}", envelope);
-        let _ = stdout.flush();
-        m.conversation_tokens.push(next_tok);
-        generated_count += 1;
-
-        // KV-capacity guard: the next forward writes KV at slot n_tokens;
-        // forwarding at pos >= max_seq would write out of bounds. Stop
-        // cleanly here — the just-emitted token is still valid.
-        if bundle.state.n_tokens >= cache_cap {
-            break;
-        }
-
-        let position = bundle.state.n_tokens as u32;
-        let step = gemma4::forward::decode_step_with_graph(
-            &bundle.config,
-            &bundle.weights,
-            &mut bundle.state,
-            gpu,
-            next_tok,
-            position,
-        );
-        match step {
-            Ok(logits) => last_logits = logits,
-            Err(e) => {
-                emit_error_with_id(stdout, id, format!("gemma4 decode failed: {e:?}"));
-                return;
-            }
-        }
-    }
-
-    m.seq_pos = bundle.state.n_tokens;
-
-    let decode_ms = decode_t0.elapsed().as_millis().max(1);
-    let total_ms = t0.elapsed().as_millis().max(1);
-    let tok_s = if generated_count > 0 {
-        (generated_count as f64 * 1000.0) / decode_ms as f64
-    } else {
-        0.0
-    };
-    let prefill_tok_s = prompt_ids.len() as f64 * 1000.0 / prefill_ms.max(1) as f64;
-    let ttft_ms = ttft_ms.unwrap_or(total_ms as f64);
-    let _ = writeln!(
-        stdout,
-        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_tokens":{},"prefill_ms":{},"prefill_tok_s":{:.2},"decode_tok_s":{:.2},"ttft_ms":{:.3},"total_ms":{},"attempt_id":{}}}"#,
-        id,
-        generated_count,
-        tok_s,
-        prompt_ids.len(),
-        prefill_ms,
-        prefill_tok_s,
-        tok_s,
-        ttft_ms,
-        total_ms,
-        active_attempt_id(),
-    );
-    let _ = stdout.flush();
-}
-
-/// Muse Glimmer dense text (arch_id=14) eager AR path.
-///
-/// Mirrors `generate_gemma4` shape (prefill loop / decode loop, JSONL
-/// `token` / `done` events) with Glimmer specifics:
-///
-///   1. Prompt build goes through `JinjaChatFrame` when `HIPFIRE_JINJA_CHAT=1`
-///      and the model carries a chat_template, falling back to
-///      `tokenizer.encode` (BOS-prepended) otherwise.
-///   2. `glimmer::forward::decode_step` returns the full logits `Vec<f32>`
-///      (the state does NOT stash a greedy next-token), so sampling runs
-///      host-side via `deepseek4::sampling::sample_token` on that vector.
-///   3. Stop set: config `eos_token` (scalar 200001) UNION any
-///      tokenizer-resolved end-of-turn token (e.g. `<end_of_turn>` /
-///      `<|im_end|>` if present). Glimmer's `eos_token_id` is a scalar
-///      (200001), unlike Gemma4's HF list [1, 106] which required a
-///      special-cased 106 fallback — do not copy that workaround.
-///   4. No LCP prompt-cache block (same reason as gemma4): this path
-///      always cold-prefills the full Jinja render. Arch 14 is therefore
-///      intentionally ABSENT from the `cache_capable` allowlist.
-///   5. No hipGraph-captured decode path (per spec).
-#[allow(clippy::too_many_arguments)]
-/// Tap layers whose residual stream feeds the DFlash drafter's `encoder.fc`.
-///
-/// HF's `output_hidden_states` tuple is 1-indexed with entry 0 being the
-/// EMBEDDING output, so a config `target_layer_ids = [1,13,25,37,49]` most
-/// likely names `hidden_states[i]` — the output of decoder layers
-/// `[0,12,24,36,48]`. We capture after `glimmer_layer_decode(l)`, where `l` is a
-/// 0-based decoder index, so the two conventions differ by exactly one.
-///
-/// This is invisible in every check except the acceptance rate: a one-layer
-/// shift still produces well-formed hidden states of the right magnitude, so
-/// nothing errors and nothing looks wrong — the drafter simply never agrees.
-/// `HIPFIRE_GLIMMER_TAP_LAYERS=0,12,24,36,48` selects the other convention so
-/// the two can be compared on hardware instead of argued about.
-fn glimmer_tap_layers(n_layers: usize) -> Vec<usize> {
-    match std::env::var("HIPFIRE_GLIMMER_TAP_LAYERS") {
-        Ok(v) if !v.trim().is_empty() => v
-            .split(',')
-            .filter_map(|t| t.trim().parse::<usize>().ok())
-            .filter(|l| *l < n_layers)
-            .collect(),
-        _ => vec![1, 13, 25, 37, 49],
-    }
-}
-
-/// Harmony channel state for Muse Glimmer (arch 14).
-/// Model generates ` to=<recipient><|message|>...<|eom|>` per channel.
-/// `<|eom|>` ending a `self` (reasoning) channel -> keep decoding into answer;
-/// ending a `user` (final) channel -> stop. `<|eot|>` / eos always stop.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GlimmerChannel {
-    AwaitingHeader,
-    Reasoning,
-    Answer,
-    Tool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum GlimmerEmit {
-    Reasoning(String),
-    Token(String),
-    Tool(String),
-}
-
-/// Map the request's think budget onto Muse Glimmer's `Reasoning strength:` control.
-///
-/// The model card names exactly four levels — `low | medium | high | xhigh` — and specifies
-/// them as a SYSTEM-PROMPT directive, which the Onyx template renders through its
-/// `reasoning_strength` context variable (defaulting to `high` when unset). It is the model's
-/// only supported effort dial: there is no non-thinking mode.
-///
-/// `max_think_tokens` is the engine-side CAP (`1` = the caller asked for no thinking, `0` =
-/// uncapped). The cap alone cannot stop the model from opening a self channel — it can only
-/// force-close one mid-flight, which wastes the tokens it already spent. Asking for a lower
-/// strength up front is what actually shortens the reasoning, so the two are wired together.
-fn glimmer_reasoning_strength(
-    think_mode: hipfire_runtime::prompt_frame::ThinkMode,
-    max_think_tokens: usize,
-) -> &'static str {
-    use hipfire_runtime::prompt_frame::ThinkMode;
-    // An EXPLICIT request-level effort wins: the card presents reasoning strength as the
-    // user-facing dial, so `reasoning_effort` must reach the system block directly rather
-    // than being inferred from whatever token cap happens to be set.
-    match think_mode {
-        ThinkMode::High => return "high",
-        ThinkMode::Max => return "xhigh",
-        // `ThinkMode::from_str` folds "medium"/"med" into `Low`, so `Low` cannot distinguish
-        // the card's low from its medium. Fall through to the budget, which can — that keeps
-        // all four levels reachable without redefining `ThinkMode` for the other
-        // architectures that share it.
-        ThinkMode::Low | ThinkMode::NonThink => {}
-    }
-    match max_think_tokens {
-        // `1` is the engine's "no thinking" sentinel. Muse Glimmer has no such mode — the
-        // Onyx system block always carries a strength — so it maps to the minimum, not to off.
-        1 => "low",
-        0 => "high", // uncapped: the template's own default
-        n if n <= 512 => "low",
-        n if n <= 2048 => "medium",
-        n if n <= 8192 => "high",
-        _ => "xhigh",
-    }
-}
-
-struct GlimmerHarmonyRouter {
-    state: GlimmerChannel,
-    pending: String,
-    reasoning_tokens: usize,
-    max_think_tokens: usize,
-    just_forced: bool,
-}
-
-impl GlimmerHarmonyRouter {
-    fn new(max_think_tokens: usize) -> Self {
-        Self {
-            state: GlimmerChannel::AwaitingHeader,
-            pending: String::new(),
-            reasoning_tokens: 0,
-            max_think_tokens,
-            just_forced: false,
-        }
-    }
-
-    fn thinking_enabled(&self) -> bool {
-        self.max_think_tokens != 1
-    }
-    fn just_forced(&self) -> bool {
-        self.just_forced
-    }
-    fn push(&mut self, frag: &str) -> (Vec<GlimmerEmit>, bool) {
-        if frag.is_empty() {
-            return (Vec::new(), false);
-        }
-        self.pending.push_str(frag);
-        let mut out = Vec::new();
-        let mut should_stop = false;
-        let entered_as_reasoning = self.state == GlimmerChannel::Reasoning;
-        loop {
-            match self.state {
-                GlimmerChannel::AwaitingHeader => {
-                    if let Some(at) = self.pending.find("<|message|>") {
-                        let header_end = at + "<|message|>".len();
-                        let header_str = self.pending[..header_end].to_string();
-                        let recipient = if let Some(to_pos) = header_str.rfind(" to=") {
-                            header_str[to_pos + 4..at].trim().to_string()
-                        } else {
-                            "user".to_string()
-                        };
-                        // `to=self` is ALWAYS the reasoning channel. Muse Glimmer has no
-                        // "no-thinking" mode: the Onyx template unconditionally emits
-                        // `Reasoning strength: <low|medium|high|xhigh>.` into the system block,
-                        // so the model always opens a self channel. Effort is controlled by the
-                        // strength (see `glimmer_reasoning_strength`), and `max_think_tokens`
-                        // is a CAP that force-closes an over-long span — neither turns the
-                        // channel off.
-                        //
-                        // Classifying `to=self` as Answer when thinking was "off" published the
-                        // model's private reasoning as visible content AND made the turn
-                        // unreproducible by the template, so the recorder refused it and the
-                        // prefix cache could never store a thinking-off turn.
-                        let new_state = if recipient == "self" {
-                            GlimmerChannel::Reasoning
-                        } else if recipient == "user" {
-                            GlimmerChannel::Answer
-                        } else {
-                            GlimmerChannel::Tool
-                        };
-                        self.pending.drain(..header_end);
-                        self.state = new_state;
-                        continue;
-                    } else {
-                        let hold = glimmer_longest_marker_suffix(&self.pending);
-                        if hold == 0 || hold >= self.pending.len() {
-                            break;
-                        }
-                        break;
-                    }
-                }
-                GlimmerChannel::Reasoning | GlimmerChannel::Answer | GlimmerChannel::Tool => {
-                    let eom = self.pending.find("<|eom|>");
-                    let eot = self.pending.find("<|eot|>");
-                    let eos = self.pending.find("<|end_of_text|>");
-                    let mut best: Option<(usize, &'static str)> = None;
-                    for (pos, name) in
-                        [(eom, "<|eom|>"), (eot, "<|eot|>"), (eos, "<|end_of_text|>")]
-                    {
-                        if let Some(p) = pos {
-                            if best.map_or(true, |(bp, _)| p < bp) {
-                                best = Some((p, name));
-                            }
-                        }
-                    }
-                    if let Some((at, marker)) = best {
-                        if at > 0 {
-                            let text = self.pending[..at].to_string();
-                            self.pending.drain(..at);
-                            if !text.is_empty() {
-                                let ev = if self.state == GlimmerChannel::Reasoning {
-                                    GlimmerEmit::Reasoning(text)
-                                } else if self.state == GlimmerChannel::Tool {
-                                    GlimmerEmit::Tool(text)
-                                } else {
-                                    GlimmerEmit::Token(text)
-                                };
-                                out.push(ev);
-                            }
-                            continue;
-                        }
-                        self.pending.drain(..marker.len());
-                        if marker == "<|eom|>" {
-                            if self.state == GlimmerChannel::Reasoning {
-                                self.state = GlimmerChannel::AwaitingHeader;
-                                continue;
-                            } else if self.state == GlimmerChannel::Tool {
-                                self.state = GlimmerChannel::AwaitingHeader;
-                                continue;
-                            } else if self.just_forced {
-                                // This eom is the stale reasoning terminator after a forced close
-                                self.just_forced = false;
-                                self.state = GlimmerChannel::AwaitingHeader;
-                                continue;
-                            } else {
-                                should_stop = true;
-                                break;
-                            }
-                        } else {
-                            should_stop = true;
-                            break;
-                        }
-                    } else {
-                        let hold = glimmer_longest_marker_suffix(&self.pending);
-                        let emit_len = self.pending.len().saturating_sub(hold);
-                        if emit_len > 0 {
-                            let text = self.pending[..emit_len].to_string();
-                            self.pending.drain(..emit_len);
-                            if !text.is_empty() {
-                                let ev = if self.state == GlimmerChannel::Reasoning {
-                                    GlimmerEmit::Reasoning(text)
-                                } else if self.state == GlimmerChannel::Tool {
-                                    GlimmerEmit::Tool(text)
-                                } else {
-                                    GlimmerEmit::Token(text)
-                                };
-                                out.push(ev);
-                            }
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-        let emitted_reasoning = out.iter().any(|e| matches!(e, GlimmerEmit::Reasoning(_)));
-        let should_count = entered_as_reasoning || emitted_reasoning;
-        if should_count
-            && self.max_think_tokens != 0
-            && self.max_think_tokens != 1
-            && self.reasoning_tokens < self.max_think_tokens
-        {
-            self.reasoning_tokens += 1;
-            if self.reasoning_tokens >= self.max_think_tokens
-                && self.state == GlimmerChannel::Reasoning
-            {
-                if !self.pending.is_empty() {
-                    let tail = std::mem::take(&mut self.pending);
-                    if !is_marker_prefix(&tail) && !tail.is_empty() {
-                        out.push(GlimmerEmit::Reasoning(tail));
-                    }
-                }
-                self.state = GlimmerChannel::Answer;
-                self.just_forced = true;
-            }
-        }
-        (out, should_stop)
-    }
-    fn flush(&mut self) -> Vec<GlimmerEmit> {
-        if self.pending.is_empty() {
-            return Vec::new();
-        }
-        if self.state == GlimmerChannel::AwaitingHeader {
-            self.pending.clear();
-            return Vec::new();
-        }
-        let text = std::mem::take(&mut self.pending);
-        if is_marker_prefix(&text) {
-            return Vec::new();
-        }
-        vec![if self.state == GlimmerChannel::Reasoning {
-            GlimmerEmit::Reasoning(text)
-        } else if self.state == GlimmerChannel::Tool {
-            GlimmerEmit::Tool(text)
-        } else {
-            GlimmerEmit::Token(text)
-        }]
-    }
-}
-
-fn is_marker_prefix(s: &str) -> bool {
-    const MARKERS: &[&str] = &[
-        "<|start|>",
-        "<|message|>",
-        "<|eom|>",
-        "<|eot|>",
-        "<|end_of_text|>",
-    ];
-    MARKERS.iter().any(|m| m.starts_with(s) || s.starts_with(m))
-}
-
-/// Length in BYTES of the longest suffix of `s` that could be the start of a
-/// Harmony marker, so a marker split across two decode chunks is not emitted
-/// as visible text.
-///
-/// Must respect char boundaries: an earlier version sliced `&s[s.len()-len..]`
-/// for every len and panicked with "byte index N is not a char boundary" the
-/// first time the model emitted a multibyte character — `×` in an arithmetic
-/// reasoning span was enough to kill the daemon. Markers are pure ASCII, so a
-/// boundary that falls inside a multibyte char can never begin one; skip it.
-fn glimmer_longest_marker_suffix(s: &str) -> usize {
-    const MARKERS: &[&str] = &[
-        "<|start|>",
-        "<|message|>",
-        "<|eom|>",
-        "<|eot|>",
-        "<|end_of_text|>",
-    ];
-    let max = MARKERS.iter().map(|m| m.len()).max().unwrap_or(0);
-    let upper = s.len().min(max.saturating_sub(1));
-    for len in (1..=upper).rev() {
-        let start = s.len() - len;
-        if !s.is_char_boundary(start) {
-            continue;
-        }
-        let suffix = &s[start..];
-        if MARKERS.iter().any(|m| m.starts_with(suffix)) {
-            return len;
-        }
-    }
-    0
-}
-
-const GLIMMER_START_ID: u32 = 200022;
-const GLIMMER_MESSAGE_ID: u32 = 200023;
-const GLIMMER_EOM_ID: u32 = 200007;
-const GLIMMER_EOT_ID: u32 = 200008;
-const GLIMMER_END_OF_TEXT_ID: u32 = 200001;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum GlimmerRecordedRecipient {
-    Self_,
-    User,
-    Tool(String),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct GlimmerOpenBody {
-    recipient: GlimmerRecordedRecipient,
-    token_ids: Vec<u32>,
-    text: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum GlimmerRecordRefusal {
-    UnexpectedMarker,
-    NonCanonicalHeader,
-    ForcedReasoningClose,
-    NonCanonicalBodyOrder,
-    NonCanonicalTerminator,
-    Incomplete,
-    ToolCallMismatch,
-    EmptySelfBody,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum GlimmerRecorderState {
-    Header { first: bool, decoded: String },
-    AwaitingStart,
-    Body(GlimmerOpenBody),
-    Terminal,
-    Refused(GlimmerRecordRefusal),
-}
-
-struct GlimmerChannelRecorder {
-    state: GlimmerRecorderState,
-    reasoning: Option<hipfire_runtime::prompt_frame::CachedAssistantBody>,
-    tools: Vec<hipfire_runtime::prompt_frame::CachedAssistantToolBody>,
-    content: Option<hipfire_runtime::prompt_frame::CachedAssistantBody>,
-}
-
-impl GlimmerChannelRecorder {
-    fn new() -> Self {
-        Self {
-            state: GlimmerRecorderState::Header {
-                first: true,
-                decoded: String::new(),
-            },
-            reasoning: None,
-            tools: Vec::new(),
-            content: None,
-        }
-    }
-    fn push(&mut self, token_id: u32, decoded_frag: &str) {
-        if matches!(
-            self.state,
-            GlimmerRecorderState::Refused(_) | GlimmerRecorderState::Terminal
-        ) {
-            return;
-        }
-        match token_id {
-            GLIMMER_START_ID => {
-                match &mut self.state {
-                    GlimmerRecorderState::AwaitingStart => {
-                        self.state = GlimmerRecorderState::Header {
-                            first: false,
-                            decoded: String::new(),
-                        };
-                    }
-                    GlimmerRecorderState::Header { first, decoded } => {
-                        if *first {
-                            decoded.push_str(decoded_frag);
-                        } else {
-                            self.state = GlimmerRecorderState::Refused(
-                                GlimmerRecordRefusal::UnexpectedMarker,
-                            );
-                        }
-                    }
-                    GlimmerRecorderState::Body(_) => {
-                        self.state =
-                            GlimmerRecorderState::Refused(GlimmerRecordRefusal::UnexpectedMarker);
-                    }
-                    _ => {}
-                }
-                return;
-            }
-            GLIMMER_MESSAGE_ID => {
-                let (first, decoded) = match &self.state {
-                    GlimmerRecorderState::Header { first, decoded } => (*first, decoded.clone()),
-                    _ => {
-                        self.state =
-                            GlimmerRecorderState::Refused(GlimmerRecordRefusal::UnexpectedMarker);
-                        return;
-                    }
-                };
-                // The FIRST header continues the prompt: `add_generation_prompt` already
-                // emitted `<|start|>assistant`, so the model's own first emission is just
-                // ` to=self` / ` to=user` and the recorder never sees the word `assistant`.
-                // Every LATER header is emitted in full by the model
-                // (`<|start|>assistant to=user<|message|>`) and must carry it.
-                //
-                // Requiring it unconditionally refused EVERY turn with `NonCanonicalHeader`,
-                // which silently disabled the whole verbatim-splice cache in production while
-                // the unit tests passed — they fed `"assistant to=self"` as the first header,
-                // a string the real model never emits.
-                if !first && !decoded.contains("assistant") {
-                    self.state =
-                        GlimmerRecorderState::Refused(GlimmerRecordRefusal::NonCanonicalHeader);
-                    return;
-                }
-                let recipient_str = if let Some(to_pos) = decoded.rfind(" to=") {
-                    decoded[to_pos + 4..].trim().to_string()
-                } else {
-                    "user".to_string()
-                };
-                let recipient = if recipient_str == "self" {
-                    // No thinking-disabled refusal: `to=self` is always the reasoning channel
-                    // (see `GlimmerHarmonyRouter`), so a self body is always reproducible by the
-                    // template's `reasoning_content` envelope regardless of the think budget.
-                    if self.reasoning.is_some() {
-                        self.state = GlimmerRecorderState::Refused(
-                            GlimmerRecordRefusal::NonCanonicalBodyOrder,
-                        );
-                        return;
-                    }
-                    GlimmerRecordedRecipient::Self_
-                } else if recipient_str == "user" {
-                    if self.content.is_some() || !self.tools.is_empty() {
-                        self.state = GlimmerRecorderState::Refused(
-                            GlimmerRecordRefusal::NonCanonicalBodyOrder,
-                        );
-                        return;
-                    }
-                    GlimmerRecordedRecipient::User
-                } else if !recipient_str.is_empty() {
-                    if self.content.is_some() {
-                        self.state = GlimmerRecorderState::Refused(
-                            GlimmerRecordRefusal::NonCanonicalBodyOrder,
-                        );
-                        return;
-                    }
-                    GlimmerRecordedRecipient::Tool(recipient_str)
-                } else {
-                    self.state =
-                        GlimmerRecorderState::Refused(GlimmerRecordRefusal::NonCanonicalHeader);
-                    return;
-                };
-                self.state = GlimmerRecorderState::Body(GlimmerOpenBody {
-                    recipient,
-                    token_ids: Vec::new(),
-                    text: String::new(),
-                });
-                return;
-            }
-            GLIMMER_EOM_ID => {
-                let body =
-                    match std::mem::replace(&mut self.state, GlimmerRecorderState::AwaitingStart) {
-                        GlimmerRecorderState::Body(b) => b,
-                        _ => {
-                            self.state = GlimmerRecorderState::Refused(
-                                GlimmerRecordRefusal::UnexpectedMarker,
-                            );
-                            return;
-                        }
-                    };
-                match body.recipient {
-                    GlimmerRecordedRecipient::Self_ => {
-                        if body.text.is_empty() && body.token_ids.is_empty() {
-                            self.state =
-                                GlimmerRecorderState::Refused(GlimmerRecordRefusal::EmptySelfBody);
-                            return;
-                        }
-                        if self.reasoning.is_some() {
-                            self.state = GlimmerRecorderState::Refused(
-                                GlimmerRecordRefusal::NonCanonicalBodyOrder,
-                            );
-                            return;
-                        }
-                        self.reasoning = Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
-                            token_ids: body.token_ids,
-                            text: body.text,
-                        });
-                        self.state = GlimmerRecorderState::AwaitingStart;
-                    }
-                    GlimmerRecordedRecipient::Tool(recipient) => {
-                        self.tools
-                            .push(hipfire_runtime::prompt_frame::CachedAssistantToolBody {
-                                recipient,
-                                token_ids: body.token_ids,
-                            });
-                        self.state = GlimmerRecorderState::AwaitingStart;
-                    }
-                    GlimmerRecordedRecipient::User => {
-                        self.state = GlimmerRecorderState::Refused(
-                            GlimmerRecordRefusal::NonCanonicalTerminator,
-                        );
-                        return;
-                    }
-                }
-                return;
-            }
-            GLIMMER_EOT_ID => {
-                let body = match std::mem::replace(&mut self.state, GlimmerRecorderState::Terminal)
-                {
-                    GlimmerRecorderState::Body(b) => b,
-                    _ => {
-                        self.state =
-                            GlimmerRecorderState::Refused(GlimmerRecordRefusal::UnexpectedMarker);
-                        return;
-                    }
-                };
-                match body.recipient {
-                    GlimmerRecordedRecipient::User => {
-                        if self.content.is_some() {
-                            self.state = GlimmerRecorderState::Refused(
-                                GlimmerRecordRefusal::NonCanonicalBodyOrder,
-                            );
-                            return;
-                        }
-                        self.content = Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
-                            token_ids: body.token_ids,
-                            text: body.text,
-                        });
-                        self.state = GlimmerRecorderState::Terminal;
-                    }
-                    GlimmerRecordedRecipient::Tool(recipient) => {
-                        self.tools
-                            .push(hipfire_runtime::prompt_frame::CachedAssistantToolBody {
-                                recipient,
-                                token_ids: body.token_ids,
-                            });
-                        self.state = GlimmerRecorderState::Terminal;
-                    }
-                    GlimmerRecordedRecipient::Self_ => {
-                        self.state = GlimmerRecorderState::Refused(
-                            GlimmerRecordRefusal::NonCanonicalTerminator,
-                        );
-                        return;
-                    }
-                }
-                return;
-            }
-            GLIMMER_END_OF_TEXT_ID => {
-                self.state = GlimmerRecorderState::Refused(GlimmerRecordRefusal::UnexpectedMarker);
-                return;
-            }
-            _ => {}
-        }
-        match &mut self.state {
-            GlimmerRecorderState::Body(body) => {
-                body.token_ids.push(token_id);
-                body.text.push_str(decoded_frag);
-            }
-            GlimmerRecorderState::Header { decoded, .. } => {
-                decoded.push_str(decoded_frag);
-            }
-            GlimmerRecorderState::AwaitingStart => {
-                self.state = GlimmerRecorderState::Refused(GlimmerRecordRefusal::UnexpectedMarker);
-            }
-            _ => {}
-        }
-    }
-    fn mark_forced_reasoning_close(&mut self) {
-        if matches!(self.state, GlimmerRecorderState::Refused(_)) {
-            return;
-        }
-        self.state = GlimmerRecorderState::Refused(GlimmerRecordRefusal::ForcedReasoningClose);
-    }
-    fn into_cached_turn(
-        mut self,
-        parsed_tool_calls: &[hipfire_runtime::prompt_frame::ToolCall],
-    ) -> Result<hipfire_runtime::prompt_frame::CachedAssistantTurn, GlimmerRecordRefusal> {
-        if let GlimmerRecorderState::Refused(r) = self.state {
-            return Err(r);
-        }
-        match std::mem::replace(&mut self.state, GlimmerRecorderState::Terminal) {
-            GlimmerRecorderState::Body(body) => match body.recipient {
-                GlimmerRecordedRecipient::Self_ => return Err(GlimmerRecordRefusal::Incomplete),
-                GlimmerRecordedRecipient::Tool(recipient) => {
-                    self.tools
-                        .push(hipfire_runtime::prompt_frame::CachedAssistantToolBody {
-                            recipient,
-                            token_ids: body.token_ids,
-                        });
-                }
-                GlimmerRecordedRecipient::User => {
-                    if self.content.is_some() {
-                        return Err(GlimmerRecordRefusal::NonCanonicalBodyOrder);
-                    }
-                    self.content = Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
-                        token_ids: body.token_ids,
-                        text: body.text,
-                    });
-                }
-            },
-            GlimmerRecorderState::Header { .. } | GlimmerRecorderState::AwaitingStart => {
-                return Err(GlimmerRecordRefusal::Incomplete);
-            }
-            GlimmerRecorderState::Terminal => {
-                self.state = GlimmerRecorderState::Terminal;
-            }
-            GlimmerRecorderState::Refused(r) => return Err(r),
-        }
-        if !self.tools.is_empty() && self.content.is_some() {
-            return Err(GlimmerRecordRefusal::NonCanonicalBodyOrder);
-        }
-        if self.tools.len() != parsed_tool_calls.len() {
-            if !(self.tools.is_empty() && parsed_tool_calls.is_empty()) {
-                return Err(GlimmerRecordRefusal::ToolCallMismatch);
-            }
-        }
-        for (i, t) in self.tools.iter().enumerate() {
-            if i < parsed_tool_calls.len() && t.recipient != parsed_tool_calls[i].name {
-                return Err(GlimmerRecordRefusal::ToolCallMismatch);
-            }
-        }
-        Ok(hipfire_runtime::prompt_frame::CachedAssistantTurn {
-            reasoning: self.reasoning,
-            tools: self.tools,
-            content: self.content,
-        })
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GlimmerMirrorAction {
-    Aligned,
-    TruncateMirror(usize),
-    RollbackCursor(usize),
-}
-
-fn glimmer_mirror_action(mirror_len: usize, n_tokens: usize) -> GlimmerMirrorAction {
-    if mirror_len == n_tokens {
-        GlimmerMirrorAction::Aligned
-    } else if mirror_len > n_tokens {
-        GlimmerMirrorAction::TruncateMirror(n_tokens)
-    } else {
-        GlimmerMirrorAction::RollbackCursor(mirror_len)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GlimmerMirrorReconcile {
-    Aligned,
-    Truncated { from: usize, to: usize },
-    RolledBack { mirror_len: usize, n_tokens: usize },
-    Reset,
-}
-
-fn reconcile_glimmer_mirror(
-    bundle: &mut hipfire_loader::MuseGlimmerBundle,
-    conversation_tokens: &mut Vec<u32>,
-    seq_pos: &mut usize,
-) -> GlimmerMirrorReconcile {
-    let mirror_len = conversation_tokens.len();
-    let n_tokens = bundle.state.n_tokens;
-    let action = glimmer_mirror_action(mirror_len, n_tokens);
-    let result = match action {
-        GlimmerMirrorAction::Aligned => {
-            *seq_pos = n_tokens;
-            GlimmerMirrorReconcile::Aligned
-        }
-        GlimmerMirrorAction::TruncateMirror(to) => {
-            // Mirror ahead of target: capture is already correct; truncate mirror only.
-            let from = mirror_len;
-            conversation_tokens.truncate(to);
-            *seq_pos = to;
-            GlimmerMirrorReconcile::Truncated { from, to }
-        }
-        GlimmerMirrorAction::RollbackCursor(new_len) => {
-            // Mirror behind target: rewind session (KV + capture + drafter) to mirror.
-            match bundle.rewind_session_to(new_len) {
-                Ok(()) => {
-                    *seq_pos = new_len;
-                    GlimmerMirrorReconcile::RolledBack {
-                        mirror_len: new_len,
-                        n_tokens,
-                    }
-                }
-                Err(_) => {
-                    bundle.reset_session_state();
-                    conversation_tokens.clear();
-                    *seq_pos = 0;
-                    GlimmerMirrorReconcile::Reset
-                }
-            }
-        }
-    };
-    debug_assert_eq!(conversation_tokens.len(), bundle.state.n_tokens);
-    debug_assert_eq!(*seq_pos, bundle.state.n_tokens);
-    result
-}
-
-fn normalize_glimmer_tool_arguments(
-    value: &serde_json::Value,
-) -> Result<serde_json::Value, String> {
-    match value {
-        serde_json::Value::Object(map) => Ok(serde_json::Value::Object(map.clone())),
-        serde_json::Value::Null => Ok(serde_json::Value::Object(Default::default())),
-        serde_json::Value::String(s) => match serde_json::from_str::<serde_json::Value>(s) {
-            Ok(serde_json::Value::Object(map)) => Ok(serde_json::Value::Object(map)),
-            Ok(_) => Err(format!(
-                "tool arguments string must parse to object, got: {}",
-                s
-            )),
-            Err(e) => Err(format!("tool arguments string invalid JSON: {}: {}", s, e)),
-        },
-        _ => Err(format!("tool arguments must be object, got: {}", value)),
-    }
-}
-
-fn prepare_glimmer_onyx_history(
-    messages: &[hipfire_runtime::prompt_frame::Message],
-) -> Result<Vec<hipfire_runtime::prompt_frame::Message>, String> {
-    let mut out = Vec::with_capacity(messages.len());
-    let mut pending_tool_map: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
-    for (idx, msg) in messages.iter().enumerate() {
-        let mut cloned = msg.clone();
-        if cloned.role == hipfire_runtime::prompt_frame::Role::Assistant
-            && !cloned.tool_calls.is_empty()
-        {
-            pending_tool_map.clear();
-            for tc in &mut cloned.tool_calls {
-                let normalized = normalize_glimmer_tool_arguments(&tc.arguments)?;
-                tc.arguments = normalized;
-                tc.rendered_body = None;
-                if let Some(id) = &tc.id {
-                    if !id.is_empty() {
-                        if pending_tool_map.contains_key(id) {
-                            return Err(format!(
-                                "duplicate tool_call id {} at assistant turn {}",
-                                id, idx
-                            ));
-                        }
-                        pending_tool_map.insert(id.clone(), tc.name.clone());
-                    }
-                }
-            }
-        } else if cloned.role == hipfire_runtime::prompt_frame::Role::Tool {
-            let tcid = cloned.tool_call_id.clone().unwrap_or_default();
-            let mut resolved: Option<String> = None;
-            if !tcid.is_empty() && pending_tool_map.contains_key(&tcid) {
-                resolved = pending_tool_map.get(&tcid).cloned();
-            } else if !tcid.is_empty() {
-                for prev in messages[..idx].iter().rev() {
-                    if prev.role == hipfire_runtime::prompt_frame::Role::Assistant {
-                        for tc in &prev.tool_calls {
-                            if tc.id.as_deref() == Some(&tcid) {
-                                resolved = Some(tc.name.clone());
-                                break;
-                            }
-                        }
-                        if resolved.is_some() {
-                            break;
-                        }
-                    }
-                }
-            }
-            if let Some(name) = resolved {
-                cloned.rendered_name = Some(name);
-            } else if cloned.name.is_some() {
-                cloned.rendered_name = cloned.name.clone();
-            } else if !tcid.is_empty() {
-                return Err(format!(
-                    "unresolved tool_call_id {} at tool turn {}",
-                    tcid, idx
-                ));
-            }
-        }
-        out.push(cloned);
-    }
-    Ok(out)
-}
-
-fn glimmer_store_cached_turn(
-    cache: &mut hipfire_loader::AsstTurnCache,
-    recorder: GlimmerChannelRecorder,
-    parsed_tool_calls: &[hipfire_runtime::prompt_frame::ToolCall],
-    ordinal: usize,
-) -> bool {
-    let turn = match recorder.into_cached_turn(parsed_tool_calls) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("[glimmer-cache store skip] recorder refusal: {:?}", e);
-            return false;
-        }
-    };
-    if let Some(content) = &turn.content {
-        if !turn.tools.is_empty() {
-            eprintln!("[glimmer-cache store skip] both content and tools present");
-            return false;
-        }
-        let normalized =
-            hipfire_runtime::tokenizer::maybe_normalize_prompt(&content.text).into_owned();
-        let fp_raw = asst_turn_fingerprint(&normalized, &[]);
-        let fp = glimmer_turn_key(fp_raw, ordinal);
-        cache.insert(fp, turn);
-        true
-    } else if !turn.tools.is_empty() {
-        let fp_raw = asst_turn_fingerprint("", parsed_tool_calls);
-        let fp = glimmer_turn_key(fp_raw, ordinal);
-        cache.insert(fp, turn);
-        true
-    } else {
-        eprintln!("[glimmer-cache store skip] empty turn");
-        false
-    }
-}
-
-#[derive(Debug, Clone)]
-struct GlimmerRouteError {
-    detail: String,
-}
-
-fn parse_glimmer_atem(
-    body: &str,
-) -> Result<Vec<hipfire_runtime::prompt_frame::ToolCall>, GlimmerRouteError> {
-    let mut calls = Vec::new();
-    let mut rest = body;
-    while let Some(start) = rest.find("<atem:invoke") {
-        let after_start = &rest[start..];
-        let name_start = after_start.find("name=\"").ok_or(GlimmerRouteError {
-            detail: "missing invoke name".into(),
-        })? + 6;
-        let name_end = after_start[name_start..]
-            .find('"')
-            .ok_or(GlimmerRouteError {
-                detail: "unterminated name".into(),
-            })?
-            + name_start;
-        let name = after_start[name_start..name_end].to_string();
-        let invoke_close = after_start
-            .find("</atem:invoke>")
-            .ok_or(GlimmerRouteError {
-                detail: "missing invoke close".into(),
-            })?;
-        let invoke_body = &after_start[..invoke_close];
-        let mut args = serde_json::Map::new();
-        let mut param_rest = invoke_body;
-        while let Some(p_start) = param_rest.find("<atem:parameter") {
-            let param_after = &param_rest[p_start..];
-            let p_name_start = param_after.find("name=\"").ok_or(GlimmerRouteError {
-                detail: "missing param name".into(),
-            })? + 6;
-            let p_name_end = param_after[p_name_start..]
-                .find('"')
-                .ok_or(GlimmerRouteError {
-                    detail: "unterminated param name".into(),
-                })?
-                + p_name_start;
-            let p_name = param_after[p_name_start..p_name_end].to_string();
-            let tag_end = param_after.find('>').ok_or(GlimmerRouteError {
-                detail: "missing param tag end".into(),
-            })? + 1;
-            let close_tag = "</atem:parameter>";
-            let inner_start = tag_end;
-            let inner_end = param_after.find(close_tag).ok_or(GlimmerRouteError {
-                detail: "missing param close".into(),
-            })?;
-            let raw = param_after[inner_start..inner_end].trim();
-            let value = if raw == "true" {
-                serde_json::Value::Bool(true)
-            } else if raw == "false" {
-                serde_json::Value::Bool(false)
-            } else if raw == "null" {
-                serde_json::Value::Null
-            } else if raw.starts_with("{") || raw.starts_with("[") {
-                serde_json::from_str(raw).unwrap_or(serde_json::Value::String(raw.to_string()))
-            } else if let Ok(n) = raw.parse::<i64>() {
-                serde_json::Value::Number(n.into())
-            } else if let Ok(f) = raw.parse::<f64>() {
-                serde_json::Value::Number(serde_json::Number::from_f64(f).unwrap())
-            } else {
-                serde_json::Value::String(raw.to_string())
-            };
-            args.insert(p_name, value);
-            param_rest = &param_after[inner_end + close_tag.len()..];
-        }
-        calls.push(hipfire_runtime::prompt_frame::ToolCall {
-            id: None,
-            name,
-            arguments: serde_json::Value::Object(args),
-            rendered_body: None,
-        });
-        rest = &rest[start + invoke_close + "</atem:invoke>".len()..];
-    }
-    Ok(calls)
-}
-
-/// Run the engine's two-phase terminal handshake for arch 14 and release the turn.
-///
-/// The wire contract is `commit_ready` -> client `commit` -> a byte-identical `done`
-/// (`crates/hipfire-client/src/lib.rs:742-776`, and `committed_done_payload_mismatch` at
-/// `lib.rs:1173-1194` compares the two payloads modulo `type`). Writing `done` straight out
-/// skips the handshake: the client treats the unexpected terminal as a protocol error, aborts,
-/// and the abort drain then reports
-/// `cancellation drain rejected non-aborted done (saw_aborted=false, finish_reason=...)`.
-/// That is a hung request from the user's side, so this helper is mandatory on every arch-14
-/// terminal.
-///
-/// Returns `true` when the client committed — only then may the caller publish side effects
-/// (assistant-turn cache store). On abort the caller MUST fail-closed reset, because the mirror
-/// and KV are mid-turn and no later turn may reuse them.
-fn glimmer_commit_terminal(
-    stdout: &mut std::io::Stdout,
-    id: &str,
-    pending_done: &serde_json::Value,
-    generated: usize,
-) -> bool {
-    match await_client_terminal_commit(stdout, id, pending_done) {
-        ClientTerminalDecision::Commit => {
-            emit_staged_terminal_done(stdout, pending_done);
-            true
-        }
-        ClientTerminalDecision::Abort => {
-            let attempt_id = active_attempt_id();
-            let _ = writeln!(
-                stdout,
-                "{}",
-                hipfire_runtime::semantic::wire_aborted(id, "client_cancelled", attempt_id)
-            );
-            let _ = writeln!(
-                stdout,
-                "{}",
-                hipfire_runtime::semantic::wire_aborted_done(id, generated, attempt_id)
-            );
-            let _ = stdout.flush();
-            false
-        }
-    }
-}
-
-/// Request-local profitability controller for Muse Glimmer speculative serve.
-///
-/// Pure integer state machine: no GPU, no allocation, no float in the decision path.
-/// Caller feeds only eligible full windows (invalid/terminal/truncated already filtered).
-/// First eligible window is an untimed warmup AR B=1; every subsequent disjoint group of
-/// four eligible windows requests one measured B=1 probe. Retirement is sticky for this
-/// object; the next request constructs a fresh controller.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GlimmerProfitProbeKind {
-    None,
-    /// Untimed useful B=1 after the first eligible window; excluded from evaluation.
-    Warmup,
-    /// Timed B=1 after four measured eligible windows.
-    Measured,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GlimmerProfitGuardStatus {
-    Disabled,
-    Warming,
-    Monitoring,
-    Retired,
-}
-
-/// Frozen policy constants (not knobs).
-const GLIMMER_PROFIT_WARMUP_WINDOWS: u32 = 1;
-const GLIMMER_PROFIT_WINDOWS_PER_EVAL: u32 = 4;
-const GLIMMER_PROFIT_BAD_NUM: u128 = 105; // ratio >= 1.05
-const GLIMMER_PROFIT_GOOD_NUM: u128 = 98; // ratio <= 0.98
-const GLIMMER_PROFIT_RATIO_DEN: u128 = 100;
-const GLIMMER_PROFIT_BAD_TO_RETIRE: u32 = 2;
-
-#[derive(Debug, Clone)]
-struct GlimmerSpecProfitGuard {
-    enabled: bool,
-    retired: bool,
-    warmup_done: bool,
-    /// Eligible full windows observed (warmup + measured), excluding ignored zeros.
-    eligible_windows: u32,
-    /// Windows accumulated in the current post-warmup evaluation group (0..4).
-    group_windows: u32,
-    sum_spec_ns: u128,
-    sum_productive: u128,
-    pending_probe: GlimmerProfitProbeKind,
-    /// Completed measured evaluations.
-    evaluations: u32,
-    bad_evaluations: u32,
-    /// Last measured evaluation inputs (telemetry only).
-    last_spec_ns: u128,
-    last_productive: u128,
-    last_ar_probe_ns: u128,
-    /// Last ratio as milli-units S*1000/(A*P) when defined; else 0. Telemetry only.
-    last_ratio_milli: u128,
-    /// Evaluation index (1-based) at which retirement latched; 0 if not retired.
-    retire_evaluation: u32,
-    /// `eligible_windows` snapshot at retirement; 0 if not retired.
-    retire_cycle: u32,
-}
-
-impl GlimmerSpecProfitGuard {
-    fn new(enabled: bool) -> Self {
-        Self {
-            enabled,
-            retired: false,
-            warmup_done: false,
-            eligible_windows: 0,
-            group_windows: 0,
-            sum_spec_ns: 0,
-            sum_productive: 0,
-            pending_probe: GlimmerProfitProbeKind::None,
-            evaluations: 0,
-            bad_evaluations: 0,
-            last_spec_ns: 0,
-            last_productive: 0,
-            last_ar_probe_ns: 0,
-            last_ratio_milli: 0,
-            retire_evaluation: 0,
-            retire_cycle: 0,
-        }
-    }
-
-    fn status(&self) -> GlimmerProfitGuardStatus {
-        if !self.enabled {
-            GlimmerProfitGuardStatus::Disabled
-        } else if self.retired {
-            GlimmerProfitGuardStatus::Retired
-        } else if !self.warmup_done {
-            GlimmerProfitGuardStatus::Warming
-        } else {
-            GlimmerProfitGuardStatus::Monitoring
-        }
-    }
-
-    fn enabled(&self) -> bool {
-        self.enabled
-    }
-
-    fn is_retired(&self) -> bool {
-        self.retired
-    }
-
-    fn evaluations(&self) -> u32 {
-        self.evaluations
-    }
-
-    fn bad_evaluations(&self) -> u32 {
-        self.bad_evaluations
-    }
-
-    fn eligible_windows(&self) -> u32 {
-        self.eligible_windows
-    }
-
-    fn pending_probe(&self) -> GlimmerProfitProbeKind {
-        self.pending_probe
-    }
-
-    fn last_spec_ns(&self) -> u128 {
-        self.last_spec_ns
-    }
-
-    fn last_productive(&self) -> u128 {
-        self.last_productive
-    }
-
-    fn last_ar_probe_ns(&self) -> u128 {
-        self.last_ar_probe_ns
-    }
-
-    fn last_ratio_milli(&self) -> u128 {
-        self.last_ratio_milli
-    }
-
-    fn retire_evaluation(&self) -> u32 {
-        self.retire_evaluation
-    }
-
-    fn retire_cycle(&self) -> u32 {
-        self.retire_cycle
-    }
-
-    /// Observe one eligible full speculative window.
-    ///
-    /// `spec_ns` is the synchronized draft+verify(+commit tail) cost; `productive_rows`
-    /// is keep_rows (== accepted+1). Zero time or zero rows are ignored and never become
-    /// evidence. While a probe is outstanding, further windows are ignored until
-    /// `observe_probe` clears the latch.
-    fn observe_full_window(
-        &mut self,
-        spec_ns: u128,
-        productive_rows: usize,
-    ) -> GlimmerProfitProbeKind {
-        if !self.enabled || self.retired {
-            return GlimmerProfitProbeKind::None;
-        }
-        if !matches!(self.pending_probe, GlimmerProfitProbeKind::None) {
-            return GlimmerProfitProbeKind::None;
-        }
-        if spec_ns == 0 || productive_rows == 0 {
-            return GlimmerProfitProbeKind::None;
-        }
-
-        self.eligible_windows = self.eligible_windows.saturating_add(1);
-
-        if !self.warmup_done {
-            // First eligible window: request untimed useful AR B=1; exclude from S/P.
-            let _ = GLIMMER_PROFIT_WARMUP_WINDOWS; // frozen = 1
-            self.warmup_done = true;
-            self.pending_probe = GlimmerProfitProbeKind::Warmup;
-            return GlimmerProfitProbeKind::Warmup;
-        }
-
-        self.sum_spec_ns = self.sum_spec_ns.saturating_add(spec_ns);
-        self.sum_productive = self.sum_productive.saturating_add(productive_rows as u128);
-        self.group_windows = self.group_windows.saturating_add(1);
-
-        if self.group_windows >= GLIMMER_PROFIT_WINDOWS_PER_EVAL {
-            self.pending_probe = GlimmerProfitProbeKind::Measured;
-            return GlimmerProfitProbeKind::Measured;
-        }
-        GlimmerProfitProbeKind::None
-    }
-
-    /// Record the AR B=1 probe that followed a prior `observe_full_window` request.
-    ///
-    /// Warmup probes are discarded (no evaluation). Measured probes compare
-    /// `S*100` against `A*P*{105,98}` with saturating/checked integer arithmetic only.
-    /// Zero probe time or zero accumulated rows/time is not evidence.
-    fn observe_probe(&mut self, ar_probe_ns: u128) {
-        if !self.enabled || self.retired {
-            return;
-        }
-        match self.pending_probe {
-            GlimmerProfitProbeKind::None => {}
-            GlimmerProfitProbeKind::Warmup => {
-                self.pending_probe = GlimmerProfitProbeKind::None;
-            }
-            GlimmerProfitProbeKind::Measured => {
-                self.pending_probe = GlimmerProfitProbeKind::None;
-                let s = self.sum_spec_ns;
-                let p = self.sum_productive;
-                // Clear the group whether or not this sample is evidence so cadence
-                // cannot stall on a zero probe.
-                self.sum_spec_ns = 0;
-                self.sum_productive = 0;
-                self.group_windows = 0;
-
-                if ar_probe_ns == 0 || p == 0 || s == 0 {
-                    return;
-                }
-
-                self.last_spec_ns = s;
-                self.last_productive = p;
-                self.last_ar_probe_ns = ar_probe_ns;
-                // Telemetry-only milli-ratio; never used for the decision.
-                if let Some(den) = ar_probe_ns.checked_mul(p) {
-                    if den > 0 {
-                        self.last_ratio_milli = s.saturating_mul(1000) / den;
-                    }
-                }
-
-                self.evaluations = self.evaluations.saturating_add(1);
-
-                // bad iff S*100 >= A*P*105; good iff S*100 <= A*P*98; else deadband.
-                let left = match s.checked_mul(GLIMMER_PROFIT_RATIO_DEN) {
-                    Some(v) => v,
-                    None => u128::MAX, // overflow => treat as extremely unprofitable
-                };
-                let ap = match ar_probe_ns.checked_mul(p) {
-                    Some(v) => v,
-                    None => {
-                        // Denominator overflow: cannot form a finite ratio safely; skip.
-                        return;
-                    }
-                };
-                let bad_right = match ap.checked_mul(GLIMMER_PROFIT_BAD_NUM) {
-                    Some(v) => v,
-                    None => u128::MAX,
-                };
-                let good_right = match ap.checked_mul(GLIMMER_PROFIT_GOOD_NUM) {
-                    Some(v) => v,
-                    None => u128::MAX,
-                };
-
-                if left >= bad_right {
-                    self.bad_evaluations = self.bad_evaluations.saturating_add(1);
-                    if self.bad_evaluations >= GLIMMER_PROFIT_BAD_TO_RETIRE {
-                        self.retired = true;
-                        self.retire_evaluation = self.evaluations;
-                        self.retire_cycle = self.eligible_windows;
-                    }
-                } else if left <= good_right {
-                    self.bad_evaluations = 0;
-                }
-                // deadband: retain bad_evaluations
-            }
-        }
-    }
-}
-
-/// Capture-aware one-token target step used by AR, profit probes, and
-/// `HIPFIRE_GLIMMER_SPEC_FALLBACK=1` recovery. Mutates only target KV/capture/logits
-/// and RNG — never Harmony routing, mirrors, or generation counters.
-fn glimmer_ar_forward_pending(
-    bundle: &mut hipfire_loader::MuseGlimmerBundle,
-    gpu: &mut rdna_compute::Gpu,
-    token: u32,
-    temp: f32,
-    top_p: f32,
-    top_k: Option<u32>,
-    gpu_sample: bool,
-    gpu_rng: u32,
-    host_rng: &mut deepseek4::sampling::Xorshift,
-) -> Result<(u32, u32), String> {
-    let position = bundle.state.n_tokens as u32;
-    let top_k_host = top_k.map(|k| k as usize).unwrap_or(0);
-    let has_drafter = bundle.drafter.is_some();
-    let device_capture = has_drafter && bundle.device_hidden_capture_enabled();
-    if has_drafter {
-        if device_capture {
-            if gpu_sample {
-                glimmer::forward::decode_step_sampled_with_device_capture(
-                    &bundle.config,
-                    &bundle.weights,
-                    &mut bundle.state,
-                    gpu,
-                    token,
-                    position,
-                    temp,
-                    top_p,
-                    top_k,
-                    gpu_rng,
-                )
-            } else {
-                glimmer::forward::decode_step_with_device_capture(
-                    &bundle.config,
-                    &bundle.weights,
-                    &mut bundle.state,
-                    gpu,
-                    token,
-                    position,
-                )
-                .map(|logits| {
-                    let tok = deepseek4::sampling::sample_token(
-                        &logits, temp, top_k_host, top_p, host_rng,
-                    );
-                    (tok, gpu_rng)
-                })
-            }
-        } else if gpu_sample {
-            let tap = glimmer_tap_layers(bundle.config.n_layers);
-            glimmer::forward::decode_step_sampled_with_capture(
-                &bundle.config,
-                &bundle.weights,
-                &mut bundle.state,
-                gpu,
-                token,
-                position,
-                &tap,
-                &mut bundle.target_hidden_host,
-                temp,
-                top_p,
-                top_k,
-                gpu_rng,
-            )
-        } else {
-            let tap = glimmer_tap_layers(bundle.config.n_layers);
-            glimmer::forward::decode_step_with_capture(
-                &bundle.config,
-                &bundle.weights,
-                &mut bundle.state,
-                gpu,
-                token,
-                position,
-                &tap,
-                &mut bundle.target_hidden_host,
-            )
-            .map(|logits| {
-                let tok =
-                    deepseek4::sampling::sample_token(&logits, temp, top_k_host, top_p, host_rng);
-                (tok, gpu_rng)
-            })
-        }
-    } else if gpu_sample {
-        glimmer::forward::decode_step_sampled(
-            &bundle.config,
-            &bundle.weights,
-            &mut bundle.state,
-            gpu,
-            token,
-            position,
-            temp,
-            top_p,
-            top_k,
-            gpu_rng,
-        )
-    } else {
-        glimmer::forward::decode_step(
-            &bundle.config,
-            &bundle.weights,
-            &mut bundle.state,
-            gpu,
-            token,
-            position,
-        )
-        .map(|logits| {
-            let tok = deepseek4::sampling::sample_token(&logits, temp, top_k_host, top_p, host_rng);
-            (tok, gpu_rng)
-        })
-    }
-}
-
-/// Pure post-window ledger: bonus already routed, not yet in KV/capture.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct GlimmerProfitLedger {
-    mirror_len: usize,
-    state_n_tokens: usize,
-}
-
-fn glimmer_profit_ledger_post_window(commit_end: usize) -> GlimmerProfitLedger {
-    GlimmerProfitLedger {
-        mirror_len: commit_end.saturating_add(1),
-        state_n_tokens: commit_end,
-    }
-}
-
-/// Decode the already-emitted pending bonus once: state advances; mirror unchanged.
-fn glimmer_profit_ledger_after_bonus_decode(led: GlimmerProfitLedger) -> GlimmerProfitLedger {
-    GlimmerProfitLedger {
-        mirror_len: led.mirror_len,
-        state_n_tokens: led.state_n_tokens.saturating_add(1),
-    }
-}
-
-/// Continue-spec routes the returned prediction once (mirror only). Retire/AR tail
-/// leave the prediction unpushed until the common AR path chooses.
-fn glimmer_profit_ledger_route_prediction(led: GlimmerProfitLedger) -> GlimmerProfitLedger {
-    GlimmerProfitLedger {
-        mirror_len: led.mirror_len.saturating_add(1),
-        state_n_tokens: led.state_n_tokens,
-    }
-}
-
-fn glimmer_profit_guard_status_label(g: &GlimmerSpecProfitGuard) -> &'static str {
-    if !g.enabled() {
-        "disabled"
-    } else if g.is_retired() {
-        "retired"
-    } else if g.evaluations() > 0 {
-        "continue"
-    } else {
-        match g.status() {
-            GlimmerProfitGuardStatus::Warming => "warming",
-            GlimmerProfitGuardStatus::Monitoring => "monitoring",
-            GlimmerProfitGuardStatus::Disabled => "disabled",
-            GlimmerProfitGuardStatus::Retired => "retired",
-        }
-    }
-}
-
-fn generate_muse_glimmer(
-    m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
-    stdout: &mut std::io::Stdout,
-    id: &str,
-    prompt: &str,
-    system_prompt: Option<&str>,
-    temp: f32,
-    top_p: f32,
-    top_k: usize,
-    min_p: Option<f32>,
-    max_tokens: usize,
-    max_think_tokens: usize,
-    think_mode: hipfire_runtime::prompt_frame::ThinkMode,
-    tools: Option<&[serde_json::Value]>,
-    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
-) {
-    // max_think_tokens semantics: 1=no-think, 0=uncapped, N=cap N reasoning tokens then force-close.
-    // Open the stream contract FIRST — before any validation, refusal, or GPU work.
-    //
-    // The HTTP CLI's StreamContractGate requires `gen_start` to be the first event of a
-    // request and DROPS anything that arrives before it. Every `emit_error_with_id` below
-    // (no tokenizer, missing bundle, history-prep failure, empty prompt, prompt longer than
-    // max_seq) used to fire before the latch, so the client never saw the refusal: it waited
-    // out its full timeout, then sent `abort` to a request the daemon had already abandoned,
-    // and serve's single lane stayed occupied so every later request answered
-    // `serve queue wait exceeded 30000ms`. One oversized prompt took the endpoint down.
-    //
-    // Reproduced with an ~8400-token prompt against max_seq=5120: the refusal is correct and
-    // instant, but the client hung 300s and three follow-up requests 503'd.
-    //
-    // `gen_start` then `error` with no tokens in between is a legal sequence; latching early
-    // costs nothing and makes every arch-14 failure routable.
-    let gen_contract = gen_start_contract_version_for_arch(m.arch_id);
-    emit_gen_start(stdout, id, false, gen_contract);
-
-    if m.tokenizer.is_none() {
-        emit_error_with_id(stdout, id, "tokenizer not loaded");
-        return;
-    }
-    // Contract: ModelState::MuseGlimmer(bundle) — see cross-agent contract.
-    // If the loader has not yet published this variant, this match will fail
-    // to compile, which is intentional (loud Err rather than silent drop).
-    let Some(ModelState::MuseGlimmer(bundle)) = m.state.as_mut() else {
-        emit_error_with_id(
-            stdout,
-            id,
-            "muse_glimmer bundle missing on arch_id=14 generate (expected ModelState::MuseGlimmer)",
-        );
-        return;
-    };
-
-    let bos_tok = bundle.config.bos_token;
-    let cfg_eos_tok = bundle.config.eos_token;
-
-    // Splice telemetry. Without it, a cache MISS is indistinguishable from a cache that was
-    // never consulted — and a silently-inert verbatim splice still produces plausible output
-    // (the render just falls back to retokenizing), so only the LCP would ever betray it.
-    let glimmer_replay_hits = std::cell::Cell::new(0usize);
-    let glimmer_replay_lookups = std::cell::Cell::new(0usize);
-
-    // ── Prompt build (same two-path branch as the gemma4 AR path) ──
-    let prompt_ids: Vec<u32> = {
-        let tokenizer = m.tokenizer.as_ref().unwrap();
-        let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
-        let try_jinja = jinja_enabled && m.chat_template.is_some();
-        let mut ids: Vec<u32> = if try_jinja {
-            let template = m.chat_template.as_ref().unwrap();
-            let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
-                tokenizer,
-                template,
-                system: system_prompt,
-                user: prompt,
-                enable_thinking: max_think_tokens != 1,
-                bos_token: Some("<bos>"),
-                reasoning_strength: Some(glimmer_reasoning_strength(think_mode, max_think_tokens)),
-                reasoning_effort: None,
-            };
-            if tools.is_some() || messages_history.is_some() {
-                let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
-                let raw_slice: &[hipfire_runtime::prompt_frame::Message] = match messages_history {
-                    Some(h) => h,
-                    None => {
-                        let mut v = Vec::new();
-                        if let Some(sys) = system_prompt {
-                            v.push(hipfire_runtime::prompt_frame::Message {
-                                role: hipfire_runtime::prompt_frame::Role::System,
-                                content: sys.to_string(),
-                                reasoning_content: None,
-                                name: None,
-                                rendered_name: None,
-                                tool_calls: Vec::new(),
-                                tool_call_id: None,
-                                tool_plan: String::new(),
-                            });
-                        }
-                        v.push(hipfire_runtime::prompt_frame::Message {
-                            role: hipfire_runtime::prompt_frame::Role::User,
-                            content: prompt.to_string(),
-                            reasoning_content: None,
-                            name: None,
-                            rendered_name: None,
-                            tool_calls: Vec::new(),
-                            tool_call_id: None,
-                            tool_plan: String::new(),
-                        });
-                        synthesized = v;
-                        &synthesized
-                    }
-                };
-                let prepared = match prepare_glimmer_onyx_history(raw_slice) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        emit_error_with_id(stdout, id, format!("glimmer history prep failed: {e}"));
-                        return;
-                    }
-                };
-                let mut prepared_owned = prepared;
-                {
-                    let mut ordinal = 0usize;
-                    for msg in &mut prepared_owned {
-                        if msg.role == hipfire_runtime::prompt_frame::Role::Assistant {
-                            let has_client_reasoning = msg
-                                .reasoning_content
-                                .as_ref()
-                                .map(|s| !s.trim().is_empty())
-                                .unwrap_or(false);
-                            if !has_client_reasoning {
-                                let fp_raw = asst_turn_fingerprint(
-                                    &normalize_asst_turn_for_fingerprint(&msg.content),
-                                    &msg.tool_calls,
-                                );
-                                let fp = glimmer_turn_key(fp_raw, ordinal);
-                                if let Some(cached) = m.asst_turn_cache.get(&fp) {
-                                    if let Some(reasoning) = &cached.reasoning {
-                                        msg.reasoning_content = Some(reasoning.text.clone());
-                                    }
-                                }
-                            }
-                            ordinal += 1;
-                        }
-                    }
-                }
-                if messages_history.is_some() {
-                    let mut lookup_ordinal = 0usize;
-                    let mut cache_lookup = |msg: &hipfire_runtime::prompt_frame::Message| -> Option<
-                        hipfire_runtime::prompt_frame::CachedAssistantTurn,
-                    > {
-                        if msg.role != hipfire_runtime::prompt_frame::Role::Assistant {
-                            return None;
-                        }
-                        let fp_raw = asst_turn_fingerprint(
-                            &normalize_asst_turn_for_fingerprint(&msg.content),
-                            &msg.tool_calls,
-                        );
-                        let fp = glimmer_turn_key(fp_raw, lookup_ordinal);
-                        lookup_ordinal += 1;
-                        glimmer_replay_lookups.set(glimmer_replay_lookups.get() + 1);
-                        let hit = m.asst_turn_cache.get(&fp).cloned();
-                        if hit.is_some() {
-                            glimmer_replay_hits.set(glimmer_replay_hits.get() + 1);
-                        }
-                        hit
-                    };
-                    match hipfire_runtime::prompt_frame::build_cached_history_jinja(
-                        &frame,
-                        &prepared_owned,
-                        tools,
-                        &mut cache_lookup,
-                    ) {
-                        Ok(cached_ids) => cached_ids,
-                        Err(e) => {
-                            eprintln!("[daemon] glimmer build_cached_history_jinja failed ({e}) — falling back to plain render");
-                            match frame.render_messages(&prepared_owned, tools, None) {
-                                Ok(rendered) => tokenizer.encode(&rendered),
-                                Err(e2) => {
-                                    eprintln!("[daemon] jinja render failed in muse_glimmer path ({e2}) — falling back to BOS + raw prompt");
-                                    tokenizer.encode(prompt)
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    match frame.render_messages(&prepared_owned, tools, None) {
-                        Ok(rendered) => tokenizer.encode(&rendered),
-                        Err(e) => {
-                            eprintln!("[daemon] jinja render failed in muse_glimmer path ({e}) — falling back to BOS + raw prompt");
-                            tokenizer.encode(prompt)
-                        }
-                    }
-                }
-            } else {
-                match frame.render() {
-                    Ok(rendered) => tokenizer.encode(&rendered),
-                    Err(e) => {
-                        eprintln!("[daemon] jinja render failed in muse_glimmer path ({e}) — falling back to BOS + raw prompt");
-                        tokenizer.encode(prompt)
-                    }
-                }
-            }
-        } else {
-            tokenizer.encode(prompt)
-        };
-        if ids.first() != Some(&bos_tok) {
-            ids.insert(0, bos_tok);
-        }
-        ids
-    };
-
-    if prompt_ids.is_empty() {
-        emit_error_with_id(stdout, id, "empty prompt after tokenize");
-        return;
-    }
-
-    // Stop set: scalar eos_token (200001) plus any tokenizer-resolved
-    // end-of-turn token. Do NOT copy Gemma4's 106 fallback — Glimmer's
-    // HF eos_token_id is a scalar, not a list. Check tokenizer for
-    // end-of-turn / im_end style tokens and include if present.
-    let stop_set: Vec<u32> = {
-        let tokenizer = m.tokenizer.as_ref().unwrap();
-        let mut s = vec![cfg_eos_tok];
-        // Bundle eos_tok may be same as cfg_eos_tok; dedup below.
-        if !s.contains(&bundle.eos_tok) {
-            s.push(bundle.eos_tok);
-        }
-        // Candidate end-of-turn / chat-boundary tokens. Use special_token_id
-        // (covers vocab-registered specials) plus a single-id encode probe
-        // for tokenizers that expose the string via encode.
-        for candidate in [
-            // Muse Glimmer turn boundaries: `<|end_of_text|>` (200001) and `<|eot|>` (200008)
-            // always stop. `<|eom|>` does NOT always stop — it ends the CURRENT CHANNEL
-            // (self->keep decoding into answer, user->stop), so it is handled by the
-            // Harmony router, not the static stop set.
-            "<|eot|>",
-            "<|end_of_text|>",
-            "<end_of_turn>",
-            "<|end_of_turn|>",
-            "<|im_end|>",
-            "<|endoftext|>",
-            "</s>",
-            "<eos>",
-        ] {
-            if let Some(tid) = tokenizer.special_token_id(candidate) {
-                if !s.contains(&tid) {
-                    s.push(tid);
-                }
-            } else {
-                let ids = tokenizer.encode(candidate);
-                if ids.len() == 1 && !s.contains(&ids[0]) {
-                    // Only accept single-id encodings to avoid polluting stop
-                    // set with subword fragments.
-                    // For <|endoftext|> this will typically be multi-token and
-                    // thus ignored; special_token_id above is the reliable path
-                    // for that token.
-                    s.push(ids[0]);
-                }
-            }
-        }
-        s.dedup();
-        s
-    };
-
-    // Capacity guard. No eviction on arch_id=14 — reset the KV cursors when
-    // the requested run would overflow the physical cache.
-    let overflow = { bundle.state.n_tokens + prompt_ids.len() + max_tokens > bundle.state.max_seq };
-    if overflow {
-        let (n, cap) = (bundle.state.n_tokens, bundle.state.max_seq);
-        eprintln!("[daemon] arch_id=14 context full ({n}/{cap}) — resetting GlimmerState");
-        bundle.reset_session_state();
-        m.seq_pos = 0;
-        m.conversation_tokens.clear();
-        m.asst_turn_cache.clear();
-    }
-    // Hard refusal: even from a cold cache the prompt alone must fit (KV
-    // writes at pos >= max_seq would be out of bounds).
-    let cache_cap = bundle.state.max_seq;
-    if prompt_ids.len() >= cache_cap {
-        emit_error_with_id(
-            stdout,
-            id,
-            format!(
-                "muse_glimmer prompt is {} tokens but max_seq is {cache_cap}",
-                prompt_ids.len()
-            ),
-        );
-        return;
-    }
-
-    // ── Prefix cache (LCP) — strict forward extension only.
-    // Candidate: `lcp == prior_len && 0 < lcp < prompt_ids.len()`.
-    // Real hit also requires `bundle.can_rewind_session_to(lcp)`.
-    // On hit: rewind_session_to(lcp) BEFORE mirror/seq truncation.
-    // On miss / cache-disabled / rewind error: reset_session_state + full prefill at 0.
-    let (prefill_ids, prefill_start_pos): (Vec<u32>, u32) = {
-        let cache_disabled = std::env::var("HIPFIRE_GLIMMER_PROMPT_CACHE")
-            .ok()
-            .as_deref()
-            == Some("0");
-        let trace = std::env::var("HIPFIRE_GLIMMER_CACHE_TRACE").ok().as_deref() == Some("1");
-        if cache_disabled {
-            // Opting out of the cache does NOT restore the CLI's per-request
-            // reset — arch 14 is in the cache_capable allowlist either way, so
-            // the CLI keeps the session warm. Cold-reset here or the opt-out
-            // path becomes the very double-write the cache was added to avoid.
-            if bundle.state.n_tokens > 0 || !m.conversation_tokens.is_empty() {
-                bundle.reset_session_state();
-                m.conversation_tokens.clear();
-                m.seq_pos = 0;
-                m.asst_turn_cache.clear();
-            }
-            (prompt_ids.clone(), 0u32)
-        } else {
-            let prior_len = m.conversation_tokens.len();
-            let max_match = prior_len.min(prompt_ids.len());
-            let mut lcp = 0usize;
-            while lcp < max_match && m.conversation_tokens[lcp] == prompt_ids[lcp] {
-                lcp += 1;
-            }
-            // STRICT FORWARD EXTENSION ONLY. Candidate iff the whole mirror is a
-            // prefix of the new render: `lcp == prior_len && 0 < lcp < prompt_ids.len()`.
-            let candidate = lcp == prior_len && lcp > 0 && lcp < prompt_ids.len();
-            let can_rewind = candidate && bundle.can_rewind_session_to(lcp);
-            let cache_hit = can_rewind;
-            if trace {
-                let reject_reason = if !candidate {
-                    "not_strict_forward_extension"
-                } else if !can_rewind {
-                    "capture_state_cannot_rewind"
-                } else {
-                    ""
-                };
-                eprintln!(
-                    "[glimmer-cache] prior_len={} n_tokens={} prompt_len={} lcp={} candidate={} hit={} reason={} replay={}/{}",
-                    prior_len,
-                    bundle.state.n_tokens,
-                    prompt_ids.len(),
-                    lcp,
-                    candidate,
-                    cache_hit,
-                    reject_reason,
-                    glimmer_replay_hits.get(),
-                    glimmer_replay_lookups.get()
-                );
-            }
-            if cache_hit {
-                // Rewind session (KV + capture + drafter) BEFORE mirror/seq truncate.
-                if let Err(e) = bundle.rewind_session_to(lcp) {
-                    if trace {
-                        eprintln!(
-                            "[glimmer-cache] rewind_session_to({lcp}) failed: {e} — converting to MISS"
-                        );
-                    }
-                    bundle.reset_session_state();
-                    m.conversation_tokens.clear();
-                    m.seq_pos = 0;
-                    m.asst_turn_cache.clear();
-                    (prompt_ids.clone(), 0u32)
-                } else {
-                    m.conversation_tokens.truncate(lcp);
-                    m.seq_pos = lcp;
-                    (prompt_ids[lcp..].to_vec(), lcp as u32)
-                }
-            } else {
-                // MISS with a hot cache MUST cold-reset. Covers both misses:
-                // lcp == 0 (fully divergent) and lcp == prompt_ids.len()
-                // (identical prompt re-sent), plus candidate rejected by capture.
-                if bundle.state.n_tokens > 0 || prior_len > 0 {
-                    bundle.reset_session_state();
-                    m.conversation_tokens.clear();
-                    m.seq_pos = 0;
-                    m.asst_turn_cache.clear();
-                }
-                (prompt_ids.clone(), 0u32)
-            }
-        }
-    };
-
-    let t0 = Instant::now();
-
-    // ── Prefill: chunked batched forward. Device capture when drafter +
-    // device backend enabled; else host prefill (with target layers only when
-    // a drafter exists). Device mode never mutates target_hidden_host.
-    let mut last_logits: Vec<f32> = Vec::new();
-    {
-        let capture = bundle.drafter.is_some();
-        let device_capture = capture && bundle.device_hidden_capture_enabled();
-        let start_pos = prefill_start_pos;
-        let prefill_result = if device_capture {
-            glimmer::forward::prefill_with_device_capture(
-                &bundle.config,
-                &bundle.weights,
-                &mut bundle.state,
-                gpu,
-                &prefill_ids,
-                start_pos,
-            )
-        } else {
-            let tap_layers: Vec<usize> = glimmer_tap_layers(bundle.config.n_layers);
-            let target_layers: &[usize] = if capture { &tap_layers } else { &[] };
-            glimmer::forward::prefill_with_capture(
-                &bundle.config,
-                &bundle.weights,
-                &mut bundle.state,
-                gpu,
-                &prefill_ids,
-                start_pos,
-                target_layers,
-                &mut bundle.target_hidden_host,
-            )
-        };
-        match prefill_result {
-            Ok(logits) => last_logits = logits,
-            Err(e) => {
-                emit_error_with_id(stdout, id, format!("muse_glimmer prefill failed: {e:?}"));
-                glimmer::forward::abort_device_capture_stage(&mut bundle.state);
-                if device_capture {
-                    // Device prefill mutates target KV + capture transaction; length-only
-                    // reconcile is not enough — leave zero reusable session state.
-                    bundle.reset_session_state();
-                    m.conversation_tokens.clear();
-                    m.asst_turn_cache.clear();
-                    m.seq_pos = 0;
-                } else {
-                    let _ = reconcile_glimmer_mirror(
-                        bundle,
-                        &mut m.conversation_tokens,
-                        &mut m.seq_pos,
-                    );
-                }
-                return;
-            }
-        }
-    }
-    for &tok in &prefill_ids {
-        m.conversation_tokens.push(tok);
-    }
-    // Everything up to here had its KV written by the batched prefill path, so
-    // it is the furthest a later turn may reuse. Tokens appended below by the
-    // decode loop are written by a different kernel and must not be reused.
-    let prefill_ms = t0.elapsed().as_millis();
-
-    // ── Decode loop. Sample host-side from the running logits vector. ──
-    let seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0x9E3779B97F4A7C15);
-    let mut rng = deepseek4::sampling::Xorshift::new(seed);
-
-    let mut generated_count: usize = 0;
-    let decode_t0 = Instant::now();
-    let mut harmony_router = GlimmerHarmonyRouter::new(max_think_tokens);
-    let mut glimmer_recorder = GlimmerChannelRecorder::new();
-    let mut glimmer_emitted_ids: Vec<u32> = Vec::new();
-    let mut glimmer_visible_acc: String = String::new();
-    let mut glimmer_tool_acc: String = String::new();
-    // Speculative path: greedy is the validated 3.17x path; sampled chain-sample
-    // (temp>0) is gated on dflash_fast_sample + batched logits + !min_p.
-    // The drafter presence is gated by HIPFIRE_DFLASH_DRAFT / dflash_mode=off
-    // (daemon.rs:13118), so AR is untouched when absent.
-    let batched_logits_available =
-        hipfire_arch_muse_glimmer::forward::glimmer_batched_logits_available(
-            &bundle.config,
-            &bundle.weights,
-        );
-    let fast_sample_on = hipfire_runtime::config::get().dflash_fast_sample;
-    let temp_spec_env_off = std::env::var("HIPFIRE_DFLASH_TEMP_SPEC").ok().as_deref() == Some("0");
-    let spec_mode = glimmer_spec_admission(
-        bundle.drafter.is_some(),
-        max_tokens,
-        temp,
-        min_p,
-        fast_sample_on,
-        temp_spec_env_off,
-        batched_logits_available,
-    );
-    let use_spec = spec_mode != GlimmerSpecMode::Off;
-    // Sampled chain needs its own xorshift state seeded from the same source as
-    // the AR rng so a fixed request seed stays reproducible. Do not use 0x13579BDF.
-    let mut chain_rng: u64 = seed;
-    // Logits buffer hoisted outside the window loop and reused — never reallocated per window.
-    let mut logits_buf: Vec<f32> = Vec::new();
-    // Shared by native AR, profit probes, and post-retirement AR tail.
-    let top_k_opt = if top_k > 0 { Some(top_k as u32) } else { None };
-    let gpu_sample = !matches!(
-        std::env::var("HIPFIRE_GLIMMER_GPU_SAMPLE").ok().as_deref(),
-        Some("0")
-    );
-    let mut gpu_rng: u32 = (rng.next_u64() as u32) | 1;
-    // Common AR tail seed. Native AR initializes from prefill logits; retirement
-    // hands the untouched greedy target prediction; completed spec leaves None.
-    let mut ar_pending: Option<u32> = None;
-    // Spec counters lifted out of the branch so the terminal can report them.
-    // Without this the whole DFlash run was invisible on the wire: the daemon
-    // logged `[glimmer-spec] done: windows 30 ... tau 6.967` to stderr while
-    // `timings.dflash` / `.tau` / `.cycles` came back null, so serve_harness
-    // correctly refused to credit a dflash run it could not observe.
-    let mut spec_windows: usize = 0;
-    let mut spec_accepted: usize = 0;
-    // Request-local profit guard: default on for greedy spec; kill-switch or
-    // timing-distorting diag/audit modes disable it for this request only.
-    let profit_guard_env_off = std::env::var("HIPFIRE_GLIMMER_SPEC_PROFIT_GUARD")
-        .ok()
-        .as_deref()
-        == Some("0");
-    let profit_guard_diag_off = std::env::var("HIPFIRE_GLIMMER_SPEC_DIAG").ok().as_deref()
-        == Some("1")
-        || std::env::var("HIPFIRE_GLIMMER_DEVICE_CAPTURE_AUDIT")
-            .ok()
-            .as_deref()
-            == Some("1");
-    if use_spec && profit_guard_diag_off && !profit_guard_env_off {
-        eprintln!(
-            "[glimmer-profit] guard disabled: HIPFIRE_GLIMMER_SPEC_DIAG=1 or HIPFIRE_GLIMMER_DEVICE_CAPTURE_AUDIT=1 distorts timing"
-        );
-    }
-    let mut profit_guard =
-        GlimmerSpecProfitGuard::new(use_spec && !profit_guard_env_off && !profit_guard_diag_off);
-    if use_spec {
-        // Off-by-one note: target_layer_ids [1,13,25,37,49] are 0-based layer
-        // indices (dflash_extract_layer_ids(52,5) with start=1.0, end=49.0,
-        // step=12.0 → [1,13,25,37,49]). Verified by reproducing the function
-        // at speculative.rs:1374 (python: dflash_extract_layer_ids(52,5) == that list).
-        // If they were 1-based, extraction would be off by one layer and
-        // acceptance would collapse — this choice is logged.
-        eprintln!(
-            "[glimmer-spec] DFlash drafter active: block={} mask={} layers={:?} (0-based)",
-            bundle.drafter.as_ref().unwrap().config.block_size,
-            bundle.drafter.as_ref().unwrap().config.mask_token_id,
-            bundle.drafter.as_ref().unwrap().config.target_layer_ids
-        );
-        // Seed is the last prefill token's greedy pick (argmax of last_logits).
-        // For the first window we need a committed seed token — use the last
-        // prompt token (already in KV) as seed, and last_logits as its logits.
-        let mut last_pick = {
-            let mut best = 0u32;
-            let mut bestv = f32::NEG_INFINITY;
-            for (i, &v) in last_logits.iter().enumerate() {
-                if v > bestv {
-                    bestv = v;
-                    best = i as u32;
-                }
-            }
-            best
-        };
-        // If prefill already placed the prompt's last token at n_tokens-1,
-        // the seed position is n_tokens (next write slot). Use that.
-        let mut cur_pos = bundle.state.n_tokens as u32;
-        // Emit the seed (first generated token) before the first draft window.
-        // In AR, last_pick is the first emitted token; in spec, the block's
-        // seed is that token, and drafts are for the following positions.
-        // Without this, the first window would emit picks[1] (second token)
-        // and the output would start mid-sequence (e.g. ":" instead of "def").
-        // Harmony: route seed through channel router so header ` to=self<|message|>` is stripped.
-        // Static stop (and harmony-forced stop) must not enter the speculative loop and must not
-        // commit the stop token into KV/capture — fall through to shared post-spec finalization.
-        let mut skip_spec_loop = false;
-        if !stop_set.contains(&last_pick) && generated_count < max_tokens {
-            let frag = m.tokenizer.as_ref().unwrap().decode(&[last_pick]);
-            // Feed through harmony router; header fragments produce no visible event
-            let (events, should_stop_seed) = harmony_router.push(&frag);
-            for ev in events {
-                match ev {
-                    GlimmerEmit::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
-                    GlimmerEmit::Token(text) => {
-                        glimmer_visible_acc.push_str(&text);
-                        emit_visible_token(stdout, id, &text)
-                    }
-                    GlimmerEmit::Tool(text) => {
-                        glimmer_tool_acc.push_str(&text);
-                    }
-                }
-            }
-            if harmony_router.just_forced() {
-                glimmer_recorder.mark_forced_reasoning_close();
-            }
-            glimmer_recorder.push(last_pick, &frag);
-            // Seed was routed through harmony; if it indicated stop, we still count it but don't enter spec loop
-            m.conversation_tokens.push(last_pick);
-            glimmer_emitted_ids.push(last_pick);
-            generated_count += 1;
-            if should_stop_seed {
-                let tau = 0.0;
-                eprintln!("[glimmer-spec] seed is stop, tau {:.3}", tau);
-                skip_spec_loop = true;
-            }
-            // Write seed's KV at cur_pos (already done by prefill? No, prefill's last token was prompt, not seed)
-            // The seed needs to be written at cur_pos before drafting.
-            // Do a single decode_step for the seed to advance KV and get its logits for next window.
-            // For now, we will let the first verify block handle the seed's KV write at cur_pos,
-            // but we have already emitted the seed, so cur_pos should advance by 1 for the next drafts.
-            // Actually the seed's KV will be written by the first verify's block[0] at cur_pos,
-            // so we should NOT advance cur_pos yet — the block's seed is at cur_pos.
-            // We keep cur_pos as is for the first window's verify.
-        } else if stop_set.contains(&last_pick) {
-            // Prefill logits already selected a static stop: do not verify/commit it.
-            let tau = 0.0;
-            eprintln!("[glimmer-spec] seed is stop, tau {:.3}", tau);
-            skip_spec_loop = true;
-        }
-        // Track tau: sum accepted per window / windows
-        let mut total_proposed: usize = 0;
-        let mut total_accepted: usize = 0;
-        let mut windows: usize = 0;
-        if !skip_spec_loop {
-            loop {
-                let t_window = std::time::Instant::now();
-                let do_window_timing =
-                    std::env::var("HIPFIRE_GLIMMER_TIMING").ok().as_deref() == Some("1");
-                if generated_count >= max_tokens {
-                    break;
-                }
-                if bundle.state.n_tokens >= cache_cap {
-                    break;
-                }
-                // --- Draft: B-1 tokens via glimmer_drafter_forward (raw noise) ---
-                // Noise is [seed, MASK*(B-1)] embedded raw (no embed_norm) — the
-                // embed_norm contract at forward.rs:84 / drafter.rs:1. Build the
-                // raw embeddings on host for the stub drafter, then call the
-                // drafter. The stub validates sizes/mask and returns Ok; drafts are
-                // synthesized as mask_id (low tau honest) to prove the drafter was
-                // consulted — a perturbed draft (e.g. corrupt one token) will trip
-                // the byte-identical check, proving the comparison can fail.
-                let (block_size, mask_id, hidden) = {
-                    let d = bundle.drafter.as_ref().unwrap();
-                    (d.config.block_size, d.config.mask_token_id, d.config.hidden)
-                };
-                if block_size < 2
-                    || block_size > hipfire_arch_muse_glimmer::glimmer::GLIMMER_MAX_SPEC_BLOCK
-                {
-                    break;
-                }
-                // Noise embedding: row 0 is the seed (last committed token), rows
-                // 1..B-1 are the mask token. These are RAW target embeddings — no
-                // embed_norm — per modeling_muse_glimmer.py:439, which keeps the norm
-                // out of the embedding matrix precisely because the DFlash path must
-                // embed without it. The target AR path DOES apply it.
-                //
-                // This buffer is the drafter's entire input. Allocating it and leaving
-                // it zero-filled is what produced tau 1.000 with token-0 drafts: the
-                // head ran on zeros, so every row decoded to the same argmax.
-                let mut noise_embedding = vec![0f32; block_size * hidden];
-                for i in 0..block_size {
-                    let t = if i == 0 { last_pick } else { mask_id };
-                    match glimmer::forward::embed_raw(
-                        &bundle.config,
-                        &bundle.weights,
-                        &mut bundle.state,
-                        gpu,
-                        t,
-                    ) {
-                        Ok(v) => {
-                            noise_embedding[i * hidden..(i + 1) * hidden]
-                                .copy_from_slice(&v[..hidden]);
-                        }
-                        Err(e) => {
-                            emit_error_with_id(
-                                stdout,
-                                id,
-                                format!("glimmer drafter noise embed row {i}: {e}"),
-                            );
-                            let _ = reconcile_glimmer_mirror(
-                                bundle,
-                                &mut m.conversation_tokens,
-                                &mut m.seq_pos,
-                            );
-                            return;
-                        }
-                    }
-                }
-                let t_after_noise = t_window.elapsed();
-                let device_capture = bundle.device_hidden_capture_enabled();
-                // Freeze effective ctx_cap to min(configured, drafter scratch, device log).
-                let configured_ctx_cap = std::env::var("HIPFIRE_GLIMMER_CTX_CAP")
-                    .ok()
-                    .and_then(|v| v.trim().parse::<usize>().ok())
-                    .filter(|v| *v > 0)
-                    .unwrap_or(glimmer::drafter::GLIMMER_DRAFTER_CTX_CAP_DEFAULT);
-                let scratch_cap = bundle
-                    .drafter
-                    .as_ref()
-                    .map(|d| d.scratch.ctx_capacity())
-                    .unwrap_or(configured_ctx_cap);
-                let mut ctx_cap = configured_ctx_cap.min(scratch_cap);
-                if device_capture {
-                    if let Some(log) = bundle.state.target_hidden_log() {
-                        ctx_cap = ctx_cap.min(log.capacity_rows());
-                    }
-                }
-                // Target history must end exactly at cur_pos — gap is fatal.
-                let history_end: Result<usize, String> = if device_capture {
-                    bundle
-                        .device_hidden_log_end()
-                        .ok_or_else(|| "glimmer-spec: device hidden log missing".to_string())
-                } else {
-                    match bundle.capture_row_elems() {
-                        None => Err("glimmer-spec: host capture row_elems missing".to_string()),
-                        Some(row_elems) => {
-                            if row_elems == 0 || bundle.target_hidden_host.len() % row_elems != 0 {
-                                Err(format!(
-                                    "glimmer-spec: host capture misaligned len={} row_elems={}",
-                                    bundle.target_hidden_host.len(),
-                                    row_elems
-                                ))
-                            } else {
-                                Ok(bundle.target_hidden_host.len() / row_elems)
-                            }
-                        }
-                    }
-                };
-                let history_end = match history_end {
-                    Ok(h) => h,
-                    Err(e) => {
-                        emit_error_with_id(stdout, id, e.clone());
-                        glimmer::forward::abort_device_capture_stage(&mut bundle.state);
-                        // Capture/log integrity errors (incl. poisoned transaction) leave no reusable state.
-                        bundle.reset_session_state();
-                        m.conversation_tokens.clear();
-                        m.asst_turn_cache.clear();
-                        m.seq_pos = 0;
-                        return;
-                    }
-                };
-                if history_end != cur_pos as usize {
-                    emit_error_with_id(
-                    stdout,
-                    id,
-                    format!(
-                        "glimmer-spec: target history end {history_end} != cur_pos {cur_pos} (capture hole)"
-                    ),
-                );
-                    glimmer::forward::abort_device_capture_stage(&mut bundle.state);
-                    bundle.reset_session_state();
-                    m.conversation_tokens.clear();
-                    m.asst_turn_cache.clear();
-                    m.seq_pos = 0;
-                    return;
-                }
-                let ctx_len = (cur_pos as usize).min(ctx_cap);
-                let cur_start = cur_pos as usize - ctx_len;
-                // Single position span: ctx rows then block rows (Q sits on the tail).
-                let positions: Vec<i32> =
-                    (cur_start as i32..cur_pos as i32 + block_size as i32).collect();
-                debug_assert_eq!(
-                    positions.len(),
-                    ctx_len + block_size,
-                    "positions.len() must equal ctx_len + block_size"
-                );
-                // Device: forward from resident log. Host: suffix Vec + host call.
-                let drafter_ok = if device_capture {
-                    let log = match bundle.state.target_hidden_log() {
-                        Some(l) => l,
-                        None => {
-                            emit_error_with_id(
-                                stdout,
-                                id,
-                                "glimmer-spec: device hidden log missing at draft",
-                            );
-                            glimmer::forward::abort_device_capture_stage(&mut bundle.state);
-                            bundle.reset_session_state();
-                            m.conversation_tokens.clear();
-                            m.asst_turn_cache.clear();
-                            m.seq_pos = 0;
-                            return;
-                        }
-                    };
-                    let drafter = bundle.drafter.as_mut().unwrap();
-                    glimmer::drafter::glimmer_drafter_forward_device(
-                        gpu,
-                        &drafter.config,
-                        &drafter.weights,
-                        &mut drafter.scratch,
-                        &noise_embedding,
-                        log,
-                        &positions,
-                        block_size,
-                        ctx_len,
-                    )
-                } else {
-                    let drafter = bundle.drafter.as_mut().unwrap();
-                    let ne = drafter.config.num_extract();
-                    let hidden = drafter.config.hidden;
-                    let row_elems = ne * hidden;
-                    let n_rows = bundle.target_hidden_host.len() / row_elems;
-                    let target_hidden: Vec<f32> = if ctx_len == 0 {
-                        Vec::new()
-                    } else {
-                        let start = (n_rows - ctx_len) * row_elems; // SUFFIX — most recent rows
-                        bundle.target_hidden_host[start..].to_vec()
-                    };
-                    glimmer::drafter::glimmer_drafter_forward(
-                        gpu,
-                        &drafter.config,
-                        &drafter.weights,
-                        &mut drafter.scratch,
-                        &noise_embedding,
-                        &target_hidden,
-                        &positions,
-                        block_size,
-                        ctx_len,
-                    )
-                };
-                if let Err(e) = drafter_ok {
-                    // Bring-up: requested drafter must be loud and fatal, not silent fallback
-                    let fatal = std::env::var("HIPFIRE_GLIMMER_SPEC_FALLBACK")
-                        .ok()
-                        .as_deref()
-                        != Some("1");
-                    if fatal {
-                        emit_error_with_id(stdout, id, format!("glimmer drafter forward failed (requested via HIPFIRE_DFLASH_DRAFT): {e}"));
-                        let es = format!("{e}");
-                        if es.contains("poisoned") || es.contains("session requires reset") {
-                            glimmer::forward::abort_device_capture_stage(&mut bundle.state);
-                            bundle.reset_session_state();
-                            m.conversation_tokens.clear();
-                            m.asst_turn_cache.clear();
-                            m.seq_pos = 0;
-                        } else {
-                            let _ = reconcile_glimmer_mirror(
-                                bundle,
-                                &mut m.conversation_tokens,
-                                &mut m.seq_pos,
-                            );
-                        }
-                        return;
-                    }
-                    eprintln!("[glimmer-spec] drafter forward failed: {e} — falling back to AR for this window (HIPFIRE_GLIMMER_SPEC_FALLBACK=1)");
-                    // One-token-ahead AR fallback: `last_pick` is already emitted and pending at
-                    // `cur_pos`. Decode/capture that pending token (no re-emit/re-count), then
-                    // sample a NEW prediction from the returned logits and make it the next pending seed.
-                    if bundle.state.n_tokens >= cache_cap {
-                        break;
-                    }
-                    if generated_count >= max_tokens {
-                        break;
-                    }
-                    let pending = last_pick;
-                    // Force greedy recovery parameters — speculative path is greedy.
-                    let fb = glimmer_ar_forward_pending(
-                        bundle, gpu, pending, 0.0, 1.0, None, gpu_sample, gpu_rng, &mut rng,
-                    );
-                    match fb {
-                        Ok((next_tok, new_rng)) => {
-                            gpu_rng = new_rng;
-                            // Advance only for the decoded pending token.
-                            cur_pos = bundle.state.n_tokens as u32;
-                            if stop_set.contains(&next_tok) {
-                                // Static stop becomes the pending seed but must not be verified/committed.
-                                last_pick = next_tok;
-                                break;
-                            }
-                            if generated_count >= max_tokens {
-                                last_pick = next_tok;
-                                break;
-                            }
-                            let frag = m.tokenizer.as_ref().unwrap().decode(&[next_tok]);
-                            let (events, should_stop_fb) = harmony_router.push(&frag);
-                            for ev in events {
-                                match ev {
-                                    GlimmerEmit::Reasoning(text) => {
-                                        emit_reasoning_token(stdout, id, &text)
-                                    }
-                                    GlimmerEmit::Token(text) => {
-                                        glimmer_visible_acc.push_str(&text);
-                                        emit_visible_token(stdout, id, &text)
-                                    }
-                                    GlimmerEmit::Tool(text) => {
-                                        glimmer_tool_acc.push_str(&text);
-                                    }
-                                }
-                            }
-                            if harmony_router.just_forced() {
-                                glimmer_recorder.mark_forced_reasoning_close();
-                            }
-                            glimmer_recorder.push(next_tok, &frag);
-                            m.conversation_tokens.push(next_tok);
-                            glimmer_emitted_ids.push(next_tok);
-                            generated_count += 1;
-                            last_pick = next_tok;
-                            if should_stop_fb {
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            emit_error_with_id(
-                                stdout,
-                                id,
-                                format!("muse_glimmer decode failed: {e:?}"),
-                            );
-                            glimmer::forward::abort_device_capture_stage(&mut bundle.state);
-                            // Capture-aware: fail closed — no length-only reconcile after target decode failure.
-                            bundle.reset_session_state();
-                            m.conversation_tokens.clear();
-                            m.asst_turn_cache.clear();
-                            m.seq_pos = 0;
-                            return;
-                        }
-                    }
-                    continue;
-                }
-                let t_after_drafter = t_window.elapsed();
-                // Bring-up diagnostic: HIPFIRE_GLIMMER_SPEC_DIAG=1 — device mode
-                // does not require/download host hidden; print backend + logical length.
-                if std::env::var("HIPFIRE_GLIMMER_SPEC_DIAG").ok().as_deref() == Some("1")
-                    && windows < 2
-                {
-                    let l2 = |v: &[f32]| -> f32 { v.iter().map(|x| x * x).sum::<f32>().sqrt() };
-                    let nz = |v: &[f32]| -> usize { v.iter().filter(|x| **x != 0.0).count() };
-                    eprintln!(
-                    "[glimmer-diag] ctx_len {} ctx_cap {} cur_pos {} positions len {} head {:?} tail {:?}",
-                    ctx_len,
-                    ctx_cap,
-                    cur_pos,
-                    positions.len(),
-                    positions.get(..4.min(positions.len())),
-                    if positions.len() > 4 {
-                        &positions[positions.len() - 4..]
-                    } else {
-                        &positions[..]
-                    },
-                );
-                    if device_capture {
-                        eprintln!(
-                        "[glimmer-diag] target_hidden backend=device logical_end {} capacity {}",
-                        history_end,
-                        bundle
-                            .state
-                            .target_hidden_log()
-                            .map(|l| l.capacity_rows())
-                            .unwrap_or(0)
-                    );
-                    } else {
-                        let row_elems = bundle.capture_row_elems().unwrap_or(1);
-                        let th_len = bundle.target_hidden_host.len();
-                        eprintln!(
-                            "[glimmer-diag] target_hidden backend=host len {} rows {} (no D2H)",
-                            th_len,
-                            th_len / row_elems.max(1)
-                        );
-                    }
-                    eprintln!(
-                        "[glimmer-diag] noise_embedding: len {} l2 {:.4} nonzero {}",
-                        noise_embedding.len(),
-                        l2(&noise_embedding),
-                        nz(&noise_embedding)
-                    );
-                    let drafter = bundle.drafter.as_ref().unwrap();
-                    if let Ok(dx) = gpu.download_f32(&drafter.scratch.x) {
-                        for r in [0usize, 1, 2] {
-                            let s = r * hidden;
-                            if s + hidden <= dx.len() {
-                                let row = &dx[s..s + hidden];
-                                eprintln!(
-                                "[glimmer-diag] draft hidden row {r}: l2 {:.4} nonzero {} head {:?}",
-                                l2(row),
-                                nz(row),
-                                &row[..4]
-                            );
-                            }
-                        }
-                    }
-                }
-                // Real drafts: run TARGET lm_head over drafter hidden rows 1..B-1.
-                let drafter = bundle.drafter.as_mut().unwrap();
-                let hidden_for_draft = {
-                    let n = (block_size - 1) * hidden;
-                    let t = gpu
-                        .alloc_tensor(&[n], rdna_compute::DType::F32)
-                        .map_err(|e| format!("drafter hidden alloc: {e:?}"))
-                        .unwrap();
-                    gpu.hip
-                        .memcpy_dtod_at(&t.buf, 0, &drafter.scratch.x.buf, hidden * 4, n * 4)
-                        .map_err(|e| format!("drafter hidden copy: {e:?}"))
-                        .unwrap();
-                    t
-                };
-                let drafts = match hipfire_arch_muse_glimmer::forward::glimmer_lm_head_picks(
-                    gpu,
-                    &bundle.config,
-                    &bundle.weights,
-                    &hidden_for_draft,
-                    block_size - 1,
-                    &bundle.state.logits,
-                    &bundle.state.logits_batch,
-                    &bundle.state.argmax_batch,
-                    None,
-                ) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        gpu.free_tensor(hidden_for_draft).ok();
-                        emit_error_with_id(stdout, id, format!("glimmer drafter lm_head: {e}"));
-                        let _ = reconcile_glimmer_mirror(
-                            bundle,
-                            &mut m.conversation_tokens,
-                            &mut m.seq_pos,
-                        );
-                        return;
-                    }
-                };
-                gpu.free_tensor(hidden_for_draft).ok();
-                let t_after_draft_lm = t_window.elapsed();
-                total_proposed += drafts.len();
-                // Log first draft for visibility
-                if windows < 2 {
-                    eprintln!(
-                        "[glimmer-spec] drafts sample: {:?}",
-                        &drafts[..drafts.len().min(4)]
-                    );
-                }
-                // --- Verify: block = [seed, drafts...] at cur_pos ---
-                // Do NOT commit/truncate/rollback before routing emitted tokens.
-                let window_start_cur_pos = cur_pos as usize;
-                let mut block = Vec::with_capacity(block_size);
-                block.push(last_pick);
-                block.extend_from_slice(&drafts);
-                // For ChainSampled, pass Some(&mut logits_buf) so the verify path
-                // copies the per-position target logits (row-major [pos][vocab])
-                // needed by naive_sample_chain. Greedy passes None and pays nothing.
-                let picks = if spec_mode == GlimmerSpecMode::ChainSampled {
-                    if device_capture {
-                        match glimmer::forward::verify_block_with_device_capture(
-                            &bundle.config,
-                            &bundle.weights,
-                            &mut bundle.state,
-                            gpu,
-                            &block,
-                            cur_pos,
-                            Some(&mut logits_buf),
-                        ) {
-                            Ok(p) => p,
-                            Err(e) => {
-                                emit_error_with_id(
-                                    stdout,
-                                    id,
-                                    format!("muse_glimmer verify failed: {e:?}"),
-                                );
-                                glimmer::forward::abort_device_capture_stage(&mut bundle.state);
-                                bundle.reset_session_state();
-                                m.conversation_tokens.clear();
-                                m.asst_turn_cache.clear();
-                                m.seq_pos = 0;
-                                return;
-                            }
-                        }
-                    } else {
-                        match glimmer::forward::verify_block_with_capture(
-                            &bundle.config,
-                            &bundle.weights,
-                            &mut bundle.state,
-                            gpu,
-                            &block,
-                            cur_pos,
-                            &glimmer_tap_layers(bundle.config.n_layers),
-                            &mut bundle.target_hidden_host,
-                            Some(&mut logits_buf),
-                        ) {
-                            Ok(p) => p,
-                            Err(e) => {
-                                emit_error_with_id(
-                                    stdout,
-                                    id,
-                                    format!("muse_glimmer verify failed: {e:?}"),
-                                );
-                                let _ = reconcile_glimmer_mirror(
-                                    bundle,
-                                    &mut m.conversation_tokens,
-                                    &mut m.seq_pos,
-                                );
-                                return;
-                            }
-                        }
-                    }
-                } else if device_capture {
-                    match glimmer::forward::verify_block_with_device_capture(
-                        &bundle.config,
-                        &bundle.weights,
-                        &mut bundle.state,
-                        gpu,
-                        &block,
-                        cur_pos,
-                        None,
-                    ) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            emit_error_with_id(
-                                stdout,
-                                id,
-                                format!("muse_glimmer verify failed: {e:?}"),
-                            );
-                            glimmer::forward::abort_device_capture_stage(&mut bundle.state);
-                            bundle.reset_session_state();
-                            m.conversation_tokens.clear();
-                            m.asst_turn_cache.clear();
-                            m.seq_pos = 0;
-                            return;
-                        }
-                    }
-                } else {
-                    match glimmer::forward::verify_block_with_capture(
-                        &bundle.config,
-                        &bundle.weights,
-                        &mut bundle.state,
-                        gpu,
-                        &block,
-                        cur_pos,
-                        &glimmer_tap_layers(bundle.config.n_layers),
-                        &mut bundle.target_hidden_host,
-                        None,
-                    ) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            emit_error_with_id(
-                                stdout,
-                                id,
-                                format!("muse_glimmer verify failed: {e:?}"),
-                            );
-                            let _ = reconcile_glimmer_mirror(
-                                bundle,
-                                &mut m.conversation_tokens,
-                                &mut m.seq_pos,
-                            );
-                            return;
-                        }
-                    }
-                };
-                let t_after_verify = t_window.elapsed();
-                // Accept via shared variables — sampled reuses the same emit/keep_rows/rollback code.
-                let (accept, bonus) = if spec_mode == GlimmerSpecMode::ChainSampled {
-                    hipfire_runtime::ddtree::naive_sample_chain(
-                        &logits_buf,
-                        &drafts,
-                        bundle.config.vocab_size,
-                        temp,
-                        top_p,
-                        top_k,
-                        &mut chain_rng,
-                    )
-                } else {
-                    let ga = accept_greedy_prefix(&drafts, &picks, None);
-                    let a = ga.accepted;
-                    let b = if a < drafts.len() {
-                        picks[a]
-                    } else {
-                        picks[picks.len() - 1]
-                    };
-                    (a, b)
-                };
-                total_accepted += accept;
-                windows += 1;
-                // Honest tau logging per window (parent re-runs perf gate)
-                if windows % 16 == 0 || accept + 1 < block_size {
-                    eprintln!(
-                        "[glimmer-spec] window {}: proposed {} accepted {} tau {:.2} cur_pos {}",
-                        windows,
-                        drafts.len(),
-                        accept,
-                        if windows > 0 {
-                            total_accepted as f32 / windows as f32
-                        } else {
-                            0.0
-                        },
-                        cur_pos
-                    );
-                }
-                if do_window_timing {
-                    let t_total = t_window.elapsed();
-                    eprintln!(
-                    "[glimmer-window-timing] win {} noise={:.1}ms drafter={:.1}ms draft_lm={:.1}ms verify={:.1}ms total={:.1}ms ctx_len={} B={}",
-                    windows,
-                    t_after_noise.as_secs_f64() * 1000.0,
-                    (t_after_drafter - t_after_noise).as_secs_f64() * 1000.0,
-                    (t_after_draft_lm - t_after_drafter).as_secs_f64() * 1000.0,
-                    (t_after_verify - t_after_draft_lm).as_secs_f64() * 1000.0,
-                    t_total.as_secs_f64() * 1000.0,
-                    ctx_len,
-                    block_size
-                );
-                }
-                // Build to_emit (accepted drafts + bonus), route/push until stop/max,
-                // THEN commit capture + rewind. Uncaptured bonus is never in keep_rows.
-                let mut to_emit: Vec<u32> = Vec::with_capacity(accept + 1);
-                to_emit.extend_from_slice(&drafts[..accept]);
-                to_emit.push(bonus);
-                // Proven-able-to-fail check: corrupt one draft and show identity trips.
-                // Only meaningful for Greedy (sampled uses naive_sample_chain, not
-                // accept_greedy_prefix). Gate so sampled does not emit a spurious
-                // FAILED when the greedy comparison is not in use.
-                if spec_mode == GlimmerSpecMode::Greedy
-                    && std::env::var("HIPFIRE_GLIMMER_SPEC_PERTURB")
-                        .ok()
-                        .as_deref()
-                        == Some("1")
-                    && !drafts.is_empty()
-                {
-                    let mut perturbed = drafts.clone();
-                    perturbed[0] = picks[0];
-                    let ga2 = accept_greedy_prefix(&perturbed, &picks, None);
-                    if ga2.accepted == accept {
-                        eprintln!("[glimmer-spec] PERTURB CHECK FAILED: forcing draft[0]=target_pick[0] did not change accept {} (picks[0]={}) — comparison not sensitive or drafter never ran", accept, picks[0]);
-                    } else {
-                        eprintln!("[glimmer-spec] PERTURB CHECK OK: forcing draft[0]=target_pick[0] changed accept {} -> {} — comparison can fail, drafter ran (windows={})", accept, ga2.accepted, windows);
-                    }
-                }
-                // Emit via Harmony router: header stripped, reasoning vs token, eom handling
-                let mut should_stop_block = false;
-                for &tok in &to_emit {
-                    if generated_count >= max_tokens {
-                        break;
-                    }
-                    if stop_set.contains(&tok) {
-                        let frag = m.tokenizer.as_ref().unwrap().decode(&[tok]);
-                        let (events, _) = harmony_router.push(&frag);
-                        for ev in events {
-                            match ev {
-                                GlimmerEmit::Reasoning(text) => {
-                                    emit_reasoning_token(stdout, id, &text)
-                                }
-                                GlimmerEmit::Token(text) => {
-                                    glimmer_visible_acc.push_str(&text);
-                                    emit_visible_token(stdout, id, &text)
-                                }
-                                GlimmerEmit::Tool(text) => {
-                                    glimmer_tool_acc.push_str(&text);
-                                }
-                            }
-                        }
-                        if harmony_router.just_forced() {
-                            glimmer_recorder.mark_forced_reasoning_close();
-                        }
-                        glimmer_recorder.push(tok, &frag);
-                        last_pick = tok;
-                        m.conversation_tokens.push(tok);
-                        glimmer_emitted_ids.push(tok);
-                        generated_count += 1;
-                        should_stop_block = true;
-                        break;
-                    }
-                    let frag = m.tokenizer.as_ref().unwrap().decode(&[tok]);
-                    let (events, should_stop) = harmony_router.push(&frag);
-                    for ev in events {
-                        match ev {
-                            GlimmerEmit::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
-                            GlimmerEmit::Token(text) => {
-                                glimmer_visible_acc.push_str(&text);
-                                emit_visible_token(stdout, id, &text)
-                            }
-                            GlimmerEmit::Tool(text) => {
-                                glimmer_tool_acc.push_str(&text);
-                            }
-                        }
-                    }
-                    if harmony_router.just_forced() {
-                        glimmer_recorder.mark_forced_reasoning_close();
-                    }
-                    glimmer_recorder.push(tok, &frag);
-                    m.conversation_tokens.push(tok);
-                    glimmer_emitted_ids.push(tok);
-                    generated_count += 1;
-                    if should_stop {
-                        last_pick = tok;
-                        should_stop_block = true;
-                        break;
-                    }
-                }
-                // keep_rows = seed + actually retained accepted input rows; bonus uncaptured.
-                let keep_rows = (accept + 1).min(
-                    m.conversation_tokens
-                        .len()
-                        .saturating_sub(window_start_cur_pos),
-                );
-                // Wire routing above is excluded from S.
-                let pre_route_ns = t_after_verify.as_nanos();
-                let t_commit = std::time::Instant::now();
-                // Device: commit staged verify prefix. Host: rewind truncates host atomically.
-                if device_capture {
-                    if let Err(e) = glimmer::forward::commit_device_verify_capture(
-                        &mut bundle.state,
-                        gpu,
-                        keep_rows,
-                    ) {
-                        emit_error_with_id(
-                            stdout,
-                            id,
-                            format!("muse_glimmer commit_device_verify_capture failed: {e}"),
-                        );
-                        glimmer::forward::abort_device_capture_stage(&mut bundle.state);
-                        bundle.reset_session_state();
-                        m.conversation_tokens.clear();
-                        m.asst_turn_cache.clear();
-                        m.seq_pos = 0;
-                        return;
-                    }
-                }
-                let commit_end = window_start_cur_pos + keep_rows;
-                if let Err(e) = bundle.rewind_session_to(commit_end) {
-                    emit_error_with_id(
-                        stdout,
-                        id,
-                        format!(
-                            "muse_glimmer rewind_session_to({commit_end}) after verify failed: {e}"
-                        ),
-                    );
-                    glimmer::forward::abort_device_capture_stage(&mut bundle.state);
-                    bundle.reset_session_state();
-                    m.conversation_tokens.clear();
-                    m.asst_turn_cache.clear();
-                    m.seq_pos = 0;
-                    return;
-                }
-                cur_pos = commit_end as u32;
-                // Only after transaction resolution may break on stop/max.
-                if should_stop_block {
-                    break;
-                }
-                // Full non-terminal window eligible for profit evidence: keep_rows
-                // matches accepted+1 and one useful B=1 step still fits.
-                let full_window = keep_rows == accept + 1
-                    && keep_rows > 0
-                    && generated_count < max_tokens
-                    && (bundle.state.n_tokens as usize) < cache_cap;
-                let mut probe_kind = GlimmerProfitProbeKind::None;
-                if full_window && profit_guard.enabled() && !profit_guard.is_retired() {
-                    if let Err(e) = gpu.hip.device_synchronize() {
-                        emit_error_with_id(
-                            stdout,
-                            id,
-                            format!("muse_glimmer profit guard synchronization failed: {e:?}"),
-                        );
-                        glimmer::forward::abort_device_capture_stage(&mut bundle.state);
-                        bundle.reset_session_state();
-                        m.conversation_tokens.clear();
-                        m.asst_turn_cache.clear();
-                        m.seq_pos = 0;
-                        return;
-                    }
-                    // t_after_verify covers draft+verify from t_window start.
-                    // t_commit covers commit/rewind through completion of any
-                    // asynchronous capture copy; wire routing remains excluded.
-                    let commit_ns = t_commit.elapsed().as_nanos();
-                    let spec_ns = pre_route_ns.saturating_add(commit_ns);
-                    probe_kind = profit_guard.observe_full_window(spec_ns, keep_rows);
-                }
-                if matches!(
-                    probe_kind,
-                    GlimmerProfitProbeKind::Warmup | GlimmerProfitProbeKind::Measured
-                ) {
-                    // Already-emitted bonus at commit_end: decode once without re-route/re-count.
-                    let measured = matches!(probe_kind, GlimmerProfitProbeKind::Measured);
-                    let probe_t0 = std::time::Instant::now();
-                    let probe = glimmer_ar_forward_pending(
-                        bundle, gpu, bonus, 0.0, 1.0, None, gpu_sample, gpu_rng, &mut rng,
-                    );
-                    match probe {
-                        Ok((pred, new_rng)) => {
-                            gpu_rng = new_rng;
-                            if let Err(e) = gpu.hip.device_synchronize() {
-                                emit_error_with_id(
-                                    stdout,
-                                    id,
-                                    format!(
-                                        "muse_glimmer profit probe synchronization failed: {e:?}"
-                                    ),
-                                );
-                                glimmer::forward::abort_device_capture_stage(&mut bundle.state);
-                                bundle.reset_session_state();
-                                m.conversation_tokens.clear();
-                                m.asst_turn_cache.clear();
-                                m.seq_pos = 0;
-                                return;
-                            }
-                            let probe_ns = probe_t0.elapsed().as_nanos();
-                            // Warmup still reports elapsed; controller discards it.
-                            profit_guard.observe_probe(probe_ns);
-                            cur_pos = bundle.state.n_tokens as u32;
-                            if measured {
-                                let ratio = profit_guard.last_ratio_milli() as f64 / 1000.0;
-                                let action = if profit_guard.is_retired() {
-                                    "retire"
-                                } else {
-                                    "continue"
-                                };
-                                eprintln!(
-                                    "[glimmer-profit] action={action} ctx={} windows=4 productive={} spec_ms={:.3} ar_b1_ms={:.3} ratio={:.4} bad_rounds={}/2",
-                                    bundle.state.n_tokens,
-                                    profit_guard.last_productive(),
-                                    profit_guard.last_spec_ns() as f64 / 1_000_000.0,
-                                    profit_guard.last_ar_probe_ns() as f64 / 1_000_000.0,
-                                    ratio,
-                                    profit_guard.bad_evaluations(),
-                                );
-                            }
-                            if stop_set.contains(&pred) {
-                                // Let the common AR terminal path route/record/flush
-                                // the untouched stop prediction exactly once.
-                                ar_pending = Some(pred);
-                                break;
-                            }
-                            if profit_guard.is_retired() {
-                                ar_pending = Some(pred);
-                                break;
-                            }
-                            // Continue spec: route the returned prediction once and
-                            // restore the one-token-ahead seed invariant.
-                            if generated_count >= max_tokens {
-                                break;
-                            }
-                            let frag = m.tokenizer.as_ref().unwrap().decode(&[pred]);
-                            let (events, should_stop_pred) = harmony_router.push(&frag);
-                            for ev in events {
-                                match ev {
-                                    GlimmerEmit::Reasoning(text) => {
-                                        emit_reasoning_token(stdout, id, &text)
-                                    }
-                                    GlimmerEmit::Token(text) => {
-                                        glimmer_visible_acc.push_str(&text);
-                                        emit_visible_token(stdout, id, &text)
-                                    }
-                                    GlimmerEmit::Tool(text) => {
-                                        glimmer_tool_acc.push_str(&text);
-                                    }
-                                }
-                            }
-                            if harmony_router.just_forced() {
-                                glimmer_recorder.mark_forced_reasoning_close();
-                            }
-                            glimmer_recorder.push(pred, &frag);
-                            m.conversation_tokens.push(pred);
-                            glimmer_emitted_ids.push(pred);
-                            generated_count += 1;
-                            last_pick = pred;
-                            if should_stop_pred {
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            emit_error_with_id(
-                                stdout,
-                                id,
-                                format!("muse_glimmer profit probe decode failed: {e:?}"),
-                            );
-                            glimmer::forward::abort_device_capture_stage(&mut bundle.state);
-                            bundle.reset_session_state();
-                            m.conversation_tokens.clear();
-                            m.asst_turn_cache.clear();
-                            m.seq_pos = 0;
-                            return;
-                        }
-                    }
-                } else {
-                    // No probe this window: bonus remains the uncommitted next seed.
-                    last_pick = bonus;
-                }
-                if generated_count >= max_tokens {
-                    break;
-                }
-            }
-        } // !skip_spec_loop
-        spec_windows = windows;
-        spec_accepted = total_accepted;
-        if windows > 0 {
-            let tau = if windows > 0 {
-                (total_accepted as f32 + windows as f32) / windows as f32
-            } else {
-                0.0
-            };
-            eprintln!("[glimmer-spec] done: windows {} proposed {} accepted {} tau {:.3} (bonus per window counted)", windows, total_proposed, total_accepted, tau);
-        }
-    } else {
-        // Native AR: host-draw first pending from prefill logits; remaining
-        // steps share the common capture-aware helper and requested sampling.
-        ar_pending = Some(deepseek4::sampling::sample_token(
-            &last_logits,
-            temp,
-            top_k,
-            top_p,
-            &mut rng,
-        ));
-    }
-
-    // Common AR tail: native AR and post-retirement handoff only.
-    // Retirement forces greedy; native AR keeps the request's sampling params.
-    if let Some(mut next_tok) = ar_pending.take() {
-        // Greedy spec forces greedy AR tail; sampled spec and native AR use the request's real sampling.
-        let ar_temp = if spec_mode == GlimmerSpecMode::Greedy {
-            0.0
-        } else {
-            temp
-        };
-        let ar_top_p = if spec_mode == GlimmerSpecMode::Greedy {
-            1.0
-        } else {
-            top_p
-        };
-        let ar_top_k_opt = if spec_mode == GlimmerSpecMode::Greedy {
-            None
-        } else {
-            top_k_opt
-        };
-
-        loop {
-            if generated_count >= max_tokens {
-                break;
-            }
-            // eos/eot always stop; eom is handled via router text marker
-            if stop_set.contains(&next_tok) {
-                // Flush any pending via router marker path then stop
-                let frag = m.tokenizer.as_ref().unwrap().decode(&[next_tok]);
-                let (events, _) = harmony_router.push(&frag);
-                for ev in events {
-                    match ev {
-                        GlimmerEmit::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
-                        GlimmerEmit::Token(text) => {
-                            glimmer_visible_acc.push_str(&text);
-                            emit_visible_token(stdout, id, &text)
-                        }
-                        GlimmerEmit::Tool(text) => {
-                            glimmer_tool_acc.push_str(&text);
-                        }
-                    }
-                }
-                if harmony_router.just_forced() {
-                    glimmer_recorder.mark_forced_reasoning_close();
-                }
-                glimmer_recorder.push(next_tok, &frag);
-                // Push stop token to KV? No — mirror prior break-before-push for eos.
-                break;
-            }
-
-            let frag = {
-                let tokenizer = m.tokenizer.as_ref().unwrap();
-                tokenizer.decode(&[next_tok])
-            };
-            let (events, should_stop) = harmony_router.push(&frag);
-            for ev in events {
-                match ev {
-                    GlimmerEmit::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
-                    GlimmerEmit::Token(text) => {
-                        glimmer_visible_acc.push_str(&text);
-                        emit_visible_token(stdout, id, &text)
-                    }
-                    GlimmerEmit::Tool(text) => {
-                        glimmer_tool_acc.push_str(&text);
-                    }
-                }
-            }
-            if harmony_router.just_forced() {
-                glimmer_recorder.mark_forced_reasoning_close();
-            }
-            glimmer_recorder.push(next_tok, &frag);
-            if should_stop {
-                break;
-            }
-
-            if bundle.state.n_tokens >= cache_cap {
-                break;
-            }
-
-            match glimmer_ar_forward_pending(
-                bundle,
-                gpu,
-                next_tok,
-                ar_temp,
-                ar_top_p,
-                ar_top_k_opt,
-                gpu_sample,
-                gpu_rng,
-                &mut rng,
-            ) {
-                Ok((sampled, new_rng)) => {
-                    gpu_rng = new_rng;
-                    m.conversation_tokens.push(next_tok);
-                    glimmer_emitted_ids.push(next_tok);
-                    generated_count += 1;
-                    next_tok = sampled;
-                }
-                Err(e) => {
-                    emit_error_with_id(stdout, id, format!("muse_glimmer decode failed: {e:?}"));
-                    glimmer::forward::abort_device_capture_stage(&mut bundle.state);
-                    let _ = reconcile_glimmer_mirror(
-                        bundle,
-                        &mut m.conversation_tokens,
-                        &mut m.seq_pos,
-                    );
-                    return;
-                }
-            }
-        }
-        // Flush any trailing incomplete channel text
-        for ev in harmony_router.flush() {
-            match ev {
-                GlimmerEmit::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
-                GlimmerEmit::Token(text) => emit_visible_token(stdout, id, &text),
-                GlimmerEmit::Tool(text) => {
-                    glimmer_tool_acc.push_str(&text);
-                }
-            }
-        }
-    }
-
-    // A parse failure here used to vanish into `unwrap_or_default()`: the model
-    // emits a whole turn into the tool channel, ATEM refuses it, and the caller
-    // gets an empty content with no tool_calls and no reason why. Keep the
-    // empty-vec fallback (a malformed call must not fabricate one) but say so.
-    let parsed_tool_calls = match parse_glimmer_atem(&glimmer_tool_acc) {
-        Ok(calls) => {
-            if calls.is_empty() && !glimmer_tool_acc.trim().is_empty() {
-                eprintln!(
-                    "[glimmer-atem] tool channel produced {} bytes that parsed to ZERO calls; first 600 bytes: {:?}",
-                    glimmer_tool_acc.len(),
-                    &glimmer_tool_acc[..glimmer_tool_acc.len().min(600)]
-                );
-            }
-            calls
-        }
-        Err(e) => {
-            if !glimmer_tool_acc.trim().is_empty() {
-                eprintln!(
-                    "[glimmer-atem] tool channel produced {} bytes that failed to parse: {e:?}; first 600 bytes: {:?}",
-                    glimmer_tool_acc.len(),
-                    &glimmer_tool_acc[..glimmer_tool_acc.len().min(600)]
-                );
-            }
-            Vec::new()
-        }
-    };
-    // Degenerate-attractor guard. A reasoning-only turn legitimately leaves both
-    // accumulators empty, so emptiness is not the signal; an identical token
-    // repeated for the whole turn is. That is what a zeroed/NaN logits vector
-    // looks like downstream (argmax -> id 0, forever), and it otherwise reaches
-    // the caller as a silent empty completion.
-    if generated_count >= 8 {
-        if let Some(&first) = glimmer_emitted_ids.first() {
-            if glimmer_emitted_ids.iter().all(|&t| t == first) {
-                eprintln!(
-                    "[glimmer-degenerate] {generated_count} tokens all decoded to the same id {first}; \
-                     logits are almost certainly degenerate (zeroed or NaN)"
-                );
-            }
-        }
-    }
-    let _ = reconcile_glimmer_mirror(bundle, &mut m.conversation_tokens, &mut m.seq_pos);
-
-    let decode_ms = decode_t0.elapsed().as_millis().max(1);
-    let total_ms = t0.elapsed().as_millis().max(1);
-    let tok_s = if generated_count > 0 {
-        (generated_count as f64 * 1000.0) / decode_ms as f64
-    } else {
-        0.0
-    };
-    let hit_length_cap = generated_count >= max_tokens;
-    let finish_reason = if hit_length_cap {
-        "length"
-    } else if !parsed_tool_calls.is_empty() {
-        "tool_calls"
-    } else {
-        "stop"
-    };
-    let mut pending_done = serde_json::json!({
-        "type": "done",
-        "id": id,
-        "tokens": generated_count,
-        "tok_s": (tok_s * 10.0).round() / 10.0,
-        "prefill_ms": prefill_ms,
-        "total_ms": total_ms,
-        "finish_reason": finish_reason,
-        "attempt_id": active_attempt_id(),
-    });
-    // Report the speculation run on the terminal. `tau` counts the free bonus
-    // token per window, matching the `[glimmer-spec] done:` line and every
-    // other arch's definition, so cross-arch tau comparisons stay meaningful.
-    if use_spec && spec_windows > 0 {
-        let tau = (spec_accepted as f64 + spec_windows as f64) / spec_windows as f64;
-        pending_done["dflash"] = serde_json::Value::Bool(true);
-        pending_done["cycles"] = serde_json::json!(spec_windows);
-        pending_done["tau"] = serde_json::json!((tau * 1000.0).round() / 1000.0);
-        let mode_str = match spec_mode {
-            GlimmerSpecMode::Greedy => "greedy",
-            GlimmerSpecMode::ChainSampled => "chain_sampled",
-            GlimmerSpecMode::Off => "off",
-        };
-        pending_done["dflash_mode"] = serde_json::Value::String(mode_str.into());
-    } else if use_spec {
-        // Spec was admitted but produced zero windows (e.g. immediate stop);
-        // still report the mode so the wire is unambiguous.
-        let mode_str = match spec_mode {
-            GlimmerSpecMode::Greedy => "greedy",
-            GlimmerSpecMode::ChainSampled => "chain_sampled",
-            GlimmerSpecMode::Off => "off",
-        };
-        pending_done["dflash_mode"] = serde_json::Value::String(mode_str.into());
-    }
-    if use_spec {
-        pending_done["dflash_profit_guard"] =
-            serde_json::Value::String(glimmer_profit_guard_status_label(&profit_guard).into());
-        pending_done["dflash_retired"] = serde_json::Value::Bool(profit_guard.is_retired());
-        pending_done["dflash_guard_evaluations"] = serde_json::json!(profit_guard.evaluations());
-        if profit_guard.evaluations() > 0 {
-            let ratio = profit_guard.last_ratio_milli() as f64 / 1000.0;
-            pending_done["dflash_profit_ratio"] =
-                serde_json::json!((ratio * 1000.0).round() / 1000.0);
-            pending_done["dflash_ar_b1_ms"] = serde_json::json!(
-                ((profit_guard.last_ar_probe_ns() as f64 / 1_000_000.0) * 1000.0).round() / 1000.0
-            );
-        }
-        if profit_guard.is_retired() {
-            pending_done["dflash_retire_cycle"] = serde_json::json!(profit_guard.retire_cycle());
-        }
-    }
-
-    stage_terminal_tool_calls(&mut pending_done, finish_reason, &parsed_tool_calls);
-    // Cache store is a COMMITTED side effect: publish it only after the client commits.
-    if glimmer_commit_terminal(stdout, id, &pending_done, generated_count) {
-        if !hit_length_cap && !glimmer_emitted_ids.is_empty() {
-            let ordinal = messages_history
-                .map(|h| {
-                    h.iter()
-                        .filter(|m| {
-                            matches!(m.role, hipfire_runtime::prompt_frame::Role::Assistant)
-                        })
-                        .count()
-                })
-                .unwrap_or(0);
-            let _ = glimmer_store_cached_turn(
-                &mut m.asst_turn_cache,
-                glimmer_recorder,
-                &parsed_tool_calls,
-                ordinal,
-            );
-        }
-    } else {
-        // Fail closed: the mirror and KV are mid-turn, so no later turn may reuse them.
-        bundle.reset_session_state();
-        m.conversation_tokens.clear();
-        m.asst_turn_cache.clear();
-        m.seq_pos = 0;
-    }
-}
-
-fn generate_lfm2moe(
-    m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
-    stdout: &mut std::io::Stdout,
-    id: &str,
-    prompt: &str,
-    system_prompt: Option<&str>,
-    temp: f32,
-    top_p: f32,
-    max_tokens: usize,
-    max_think_tokens: usize,
-    tools: Option<&[serde_json::Value]>,
-    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
-) {
-    if m.tokenizer.is_none() {
-        emit_active_attempt_error(
-            stdout,
-            Some(id),
-            "tokenizer not loaded",
-            "validation",
-            false,
-            false,
-        );
-        let _ = stdout.flush();
-        return;
-    }
-    if m.lfm2moe().is_none() {
-        emit_active_attempt_error(
-            stdout,
-            Some(id),
-            "lfm2moe_config missing on arch_id=11 generate",
-            "validation",
-            false,
-            false,
-        );
-        let _ = stdout.flush();
-        return;
-    }
-
-    // ── Prompt build (same two-path branch as the minimax AR path) ──
-    let prompt_ids: Vec<u32> = {
-        let tokenizer = m.tokenizer.as_ref().unwrap();
-        // LFM2.5 (arch_id 11) REQUIRES its embedded Jinja chat_template — the
-        // hand-rolled Plain ChatML path omits LFM2's `<|startoftext|>` BOS and
-        // produces garbage. Force jinja on for arch 11 (falls back to Plain only if
-        // the .hfq carries no template, e.g. an older A1B convert).
-        // Jinja default-ON (flipped 2026-06-09): render through the model's chat
-        // template for ALL arches; opt out with HIPFIRE_JINJA_CHAT=0 (hand-rolled
-        // ChatML/Plain). Falls back to Plain automatically when no template resolves.
-        let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
-        let try_jinja = jinja_enabled && m.chat_template.is_some();
-        if try_jinja {
-            let template = m.chat_template.as_ref().unwrap();
-            let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
-                tokenizer,
-                template,
-                system: system_prompt,
-                user: prompt,
-                enable_thinking: max_think_tokens != 1,
-                bos_token: None,
-                reasoning_strength: None,
-                reasoning_effort: None,
-            };
-            let render_result = if tools.is_some() || messages_history.is_some() {
-                let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
-                let messages_slice: &[hipfire_runtime::prompt_frame::Message] =
-                    match messages_history {
-                        Some(h) => h,
-                        None => {
-                            let mut v = Vec::new();
-                            if let Some(sys) = system_prompt {
-                                v.push(hipfire_runtime::prompt_frame::Message {
-                                    role: hipfire_runtime::prompt_frame::Role::System,
-                                    content: sys.to_string(),
-                                    reasoning_content: None,
-                                    name: None,
-                                    rendered_name: None,
-                                    tool_calls: Vec::new(),
-                                    tool_call_id: None,
-                                    tool_plan: String::new(),
-                                });
-                            }
-                            v.push(hipfire_runtime::prompt_frame::Message {
-                                role: hipfire_runtime::prompt_frame::Role::User,
-                                content: prompt.to_string(),
-                                reasoning_content: None,
-                                name: None,
-                                rendered_name: None,
-                                tool_calls: Vec::new(),
-                                tool_call_id: None,
-                                tool_plan: String::new(),
-                            });
-                            synthesized = v;
-                            &synthesized
-                        }
-                    };
-                frame.render_messages(messages_slice, tools, None)
-            } else {
-                frame.render()
-            };
-            match render_result {
-                Ok(rendered) => tokenizer.encode(&rendered),
-                Err(e) => {
-                    eprintln!("[daemon] jinja render failed in lfm2moe path ({e}) — falling back to Plain");
-                    hipfire_runtime::prompt_frame::ChatFrame {
-                        tokenizer,
-                        system: system_prompt,
-                        user: prompt,
-                        assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
-                        raw: false,
-                    }
-                    .build()
-                }
-            }
-        } else {
-            hipfire_runtime::prompt_frame::ChatFrame {
-                tokenizer,
-                system: system_prompt,
-                user: prompt,
-                assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
-                raw: false,
-            }
-            .build()
-        }
-    };
-
-    if prompt_ids.is_empty() {
-        emit_active_attempt_error(
-            stdout,
-            Some(id),
-            "empty prompt after tokenize",
-            "validation",
-            false,
-            false,
-        );
-        let _ = stdout.flush();
-        return;
-    }
-
-    let eos_tok = m.lfm2moe().unwrap().eos_tok;
-
-    // LFM2.5 emits MULTIPLE EOS-class tokens inconsistently: the chat turn-end
-    // `<|im_end|>` (which `eos_tok` resolves to) but ALSO the document-end
-    // `<|endoftext|>` (and rarely `</s>`). The single `next_tok == eos_tok` stop
-    // in the decode loop misses the others, so the model LEAKS a literal
-    // `<|endoftext|>` into the visible answer (observed: "...Paris.<|endoftext|>")
-    // and wastefully keeps generating. This id-set is the FAST path: it catches
-    // any EOS-class token whose literal string round-trips through `encode` to a
-    // single id (true for `<|im_end|>`). NOTE it does NOT round-trip for
-    // `<|endoftext|>` (encode yields subwords, not the special id), so the
-    // reliable catch for that one is the string-level guard in the decode loop
-    // below, which matches on the DECODED frag.
-    let stop_toks: Vec<u32> = {
-        let tk = m.tokenizer.as_ref().unwrap();
-        let mut v = vec![eos_tok];
-        for s in ["<|endoftext|>", "</s>", "<|im_end|>"] {
-            let ids = tk.encode(s);
-            if ids.len() == 1 && !v.contains(&ids[0]) {
-                v.push(ids[0]);
-            }
-        }
-        v
-    };
-
-    // Capacity guard BEFORE gen_start — an oversized prompt is a validation error
-    // and must not emit gen_start (client expects no stream on validation failure).
-    // saturating_add: an adversarially huge max_tokens must not wrap usize
-    // and slip under the cap.
-    let cap = m.lfm2moe().unwrap().state.max_seq;
-    if prompt_ids.len().saturating_add(max_tokens) > cap {
-        emit_active_attempt_error(
-            stdout,
-            Some(id),
-            &format!("prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq", prompt_ids.len(), max_tokens, cap),
-            "context_length",
-            false,
-            false
-        );
-        let _ = stdout.flush();
-        return;
-    }
-
-    // Open the stream contract BEFORE any GPU work or token emission.
-    // The HTTP CLI's StreamContractGate requires the first event to be
-    // `gen_start` with the exact (id, attempt_id). Without this, the
-    // first `token` is rejected as "stream must begin with gen_start",
-    // the client sends `abort`, and the daemon hangs awaiting `commit`
-    // while the HTTP handler waits for a stream that will never deliver.
-    // This was the root cause of the 3-minute hang on native `hipfire serve`
-    // for LFM2.5-230M/350M (direct `infer_lfm2moe` bypasses the gate and was
-    // coherent). Mirrors the DS4 fix `e99583afa` and Qwen's `emit_gen_start`.
-    let gen_contract = gen_start_contract_version_for_arch(m.arch_id);
-    emit_gen_start(stdout, id, false, gen_contract);
-
-    // Cross-conversation reset (FIX: LFM turn-to-turn KV accumulation). The
-    // prior design only reset on capacity overflow, so every request APPENDED to
-    // the KV at the growing `n_tokens` and the model attended to all prior
-    // requests' tokens at offset RoPE positions — benign for a couple of short
-    // turns (RoPE decay + the prompt re-establishes context) but it bloats the KV
-    // and degrades quality over a real multi-request serve session, only
-    // recovering at overflow. LFM2.5's hybrid conv+GQA state can't be cheaply
-    // rewound to an arbitrary prefix (the conv window chains back to token 0, like
-    // ds4's SWA ring), so partial prefix-reuse is unsafe → cold-rebuild every
-    // turn. This is NOT a perf regression: the path already re-prefills the full
-    // prompt each turn; it now does so from position 0 with no stale KV. A
-    // continuing conversation re-prefills its whole history from the prompt, so
-    // multi-turn is preserved (validated: Bjorn/axolotl recall).
-    let _ = m.lfm2moe_mut().unwrap().state.reset(gpu);
-    m.seq_pos = 0;
-    m.conversation_tokens.clear();
-
-    let t0 = Instant::now();
-
-    // ── Prefill: decode_step per prompt token. The LAST decode_step's logits
-    // are the predictions for the first generated token. Abort is checked
-    // before each token so a client cancel during a long prompt (thousands of
-    // tokens) does not run the full prefill before honoring the cancel. ──
-    let mut last_logits: Vec<f32> = Vec::new();
-    let mut prefill_aborted = false;
-    {
-        let b = m.lfm2moe_mut().unwrap();
-        let cfg = &b.config;
-        let weights = &b.weights;
-        let state = &mut b.state;
-        let mut position = state.n_tokens as u32;
-        for &tok in &prompt_ids {
-            if check_abort(id) {
-                prefill_aborted = true;
-                break;
-            }
-            match lfm2moe::forward::decode_step(cfg, weights, state, gpu, tok, position) {
-                Ok(logits) => last_logits = logits,
-                Err(e) => {
-                    emit_error_with_id(stdout, id, format!("lfm2moe prefill failed: {e:?}"));
-                    return;
-                }
-            }
-            position += 1;
-        }
-    }
-    if prefill_aborted || check_abort(id) {
-        let ep = production_fail_closed_rollback(m, gpu, None, None);
-        emit_spec_cancel_after_rollback(stdout, id, 0, &ep);
-        return;
-    }
-    for &tok in &prompt_ids {
-        m.conversation_tokens.push(tok);
-    }
-    let prefill_ms = t0.elapsed().as_millis();
-
-    // ── Decode loop. Sample host-side from the running logits vector.
-    // Abort is checked at the top of every iteration so a mid-decode
-    // client cancel stops the loop immediately and emits `aborted`+`done`.
-    // Without this, the loop would run for the full `max_tokens` of wasted
-    // work after the HTTP client has already timed out and sent `abort`.
-    // ──
-    let seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0x9E3779B97F4A7C15);
-    let mut rng = deepseek4::sampling::Xorshift::new(seed);
-
-    let mut generated_count: usize = 0;
-    let decode_t0 = Instant::now();
-    loop {
-        if check_abort(id) {
-            let ep = production_fail_closed_rollback(m, gpu, None, None);
-            emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
-            return;
-        }
-        if generated_count >= max_tokens {
-            break;
-        }
-        let next_tok = deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
-        if stop_toks.contains(&next_tok) {
-            break;
-        }
-
-        let frag = {
-            let tokenizer = m.tokenizer.as_ref().unwrap();
-            tokenizer.decode(&[next_tok])
-        };
-        // String-level EOS-class guard. The id-based `stop_toks` above misses
-        // `<|endoftext|>` because encoding the literal STRING doesn't round-trip
-        // to the special-token id (it yields subwords), so the real token id is
-        // never in the set. The daemon decodes one token at a time, so the
-        // leaking turn-end token arrives as its own frag — catch it on the
-        // decoded text and stop WITHOUT emitting (was: "...Paris.<|endoftext|>").
-        if matches!(frag.trim(), "<|endoftext|>" | "</s>" | "<|im_end|>") {
-            break;
-        }
-        let envelope = serde_json::json!({
-            "type": "token",
-            "id": id,
-            "text": frag,
-            "attempt_id": active_attempt_id(),
-        });
-        let _ = writeln!(stdout, "{}", envelope);
-        let _ = stdout.flush();
-        m.conversation_tokens.push(next_tok);
-        generated_count += 1;
-
-        // Check abort before the next GPU decode_step to avoid launching
-        // more work after the client has already cancelled.
-        if check_abort(id) {
-            let ep = production_fail_closed_rollback(m, gpu, None, None);
-            emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
-            return;
-        }
-
-        let step = {
-            let b = m.lfm2moe_mut().unwrap();
-            let cfg = &b.config;
-            let weights = &b.weights;
-            let state = &mut b.state;
-            let position = state.n_tokens as u32;
-            lfm2moe::forward::decode_step(cfg, weights, state, gpu, next_tok, position)
-        };
-        match step {
-            Ok(logits) => last_logits = logits,
-            Err(e) => {
-                emit_error_with_id(stdout, id, format!("lfm2moe decode failed: {e:?}"));
-                return;
-            }
-        }
-    }
-
-    // Abort latched between loop exit and commit must not proceed to the
-    // two-phase commit handshake — emit the attested `aborted` terminal
-    // instead so the client's drain loop terminates.
-    if check_abort(id) {
-        let ep = production_fail_closed_rollback(m, gpu, None, None);
-        emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
-        return;
-    }
-
-    m.seq_pos = m.lfm2moe().unwrap().state.n_tokens;
-
-    let decode_ms = decode_t0.elapsed().as_millis().max(1);
-    let total_ms = t0.elapsed().as_millis().max(1);
-    let tok_s = if generated_count > 0 {
-        (generated_count as f64 * 1000.0) / decode_ms as f64
-    } else {
-        0.0
-    };
-    let pending_done = serde_json::json!({
-        "type": "done",
-        "id": id,
-        "tokens": generated_count,
-        "tok_s": (tok_s * 100.0).round() / 100.0,
-        "prefill_ms": prefill_ms,
-        "total_ms": total_ms,
-        "attempt_id": active_attempt_id(),
-    });
-    match await_client_terminal_commit(stdout, id, &pending_done) {
-        ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
-        ClientTerminalDecision::Abort => {
-            let ep = production_fail_closed_rollback(m, gpu, None, None);
-            emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
-        }
-    }
-}
-
-/// MiniMax-M2 (arch_id=10) generate path — minimal AR bring-up.
-///
-/// Mirrors `generate_lfm2moe`'s shape (prefill loop / chunked batched prefill,
-/// per-token decode loop, JSONL `token` / `done` events) with two differences:
-///
-///   1. Prompt build goes through `JinjaChatFrame` when `HIPFIRE_JINJA_CHAT=1`
-///      and the model carries a chat_template (so MiniMax-M2's own ChatML-ish
-///      template + `tools` / `messages` reach the upstream Jinja branches),
-///      falling back to the hand-rolled `ChatFrame::Plain` scaffold otherwise.
-///   2. `minimax::forward::decode_step` returns the full logits `Vec<f32>`
-///      (the state does NOT stash a greedy next-token), so sampling runs
-///      host-side via `deepseek4::sampling::sample_token` on that vector.
-///
-/// Out of scope for the scaffold (and intentionally NOT wired): spec-decode,
-/// MTP, grammar-constrained decoding, tool-call parsing/execution, repeat
-/// penalty, multi-GPU, eviction/prefix-cache. Correctness first.
-#[allow(clippy::too_many_arguments)]
-fn generate_minimax(
-    m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
-    stdout: &mut std::io::Stdout,
-    id: &str,
-    prompt: &str,
-    system_prompt: Option<&str>,
-    temp: f32,
-    top_p: f32,
-    max_tokens: usize,
-    max_think_tokens: usize,
-    tools: Option<&[serde_json::Value]>,
-    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
-) {
-    if m.tokenizer.is_none() {
-        emit_active_attempt_error(
-            stdout,
-            Some(id),
-            "tokenizer not loaded",
-            "validation",
-            false,
-            false,
-        );
-        let _ = stdout.flush();
-        return;
-    }
-    if m.minimax().is_none() {
-        emit_active_attempt_error(
-            stdout,
-            Some(id),
-            "minimax_config missing on arch_id=10 generate",
-            "validation",
-            false,
-            false,
-        );
-        let _ = stdout.flush();
-        return;
-    }
-
-    // ── Prompt build (same two-path branch as the lfm2moe AR path) ──
-    // `primed_think` records whether the rendered prompt actually ended with
-    // the MiniMax `<think>` generation-primer, so we only re-emit the opener
-    // (below) when the model truly begins inside the reasoning block. A jinja
-    // render failure that falls back to the Plain frame leaves it false.
-    let mut primed_think = false;
-    let prompt_ids: Vec<u32> = {
-        let tokenizer = m.tokenizer.as_ref().unwrap();
-        // MiniMax-M2 (arch 10) and LFM2.5 (arch 11) REQUIRE their embedded Jinja
-        // chat_template — their structural tokens are NOT ChatML. MiniMax frames
-        // turns with `]~b]ai` / `[e~[` and primes the assistant with `<think>\n`;
-        // LFM2 needs its `<|startoftext|>` BOS. The hand-rolled Plain ChatML frame
-        // emits `<|im_start|>`/`<|im_end|>` which these models never trained on,
-        // producing an off-distribution prompt that (a) decodes incoherently and
-        // (b) never matches across turns so the LCP prompt-cache is dead. Force
-        // jinja on for both (falls back to Plain only when the .hfq carries no
-        // template).
-        // Jinja default-ON (flipped 2026-06-09); opt out with HIPFIRE_JINJA_CHAT=0.
-        let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
-        let try_jinja = jinja_enabled && m.chat_template.is_some();
-        if try_jinja {
-            let template = m.chat_template.as_ref().unwrap();
-            let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
-                tokenizer,
-                template,
-                system: system_prompt,
-                user: prompt,
-                enable_thinking: max_think_tokens != 1,
-                bos_token: None,
-                reasoning_strength: None,
-                reasoning_effort: None,
-            };
-            let render_result = if tools.is_some() || messages_history.is_some() {
-                let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
-                let messages_slice: &[hipfire_runtime::prompt_frame::Message] =
-                    match messages_history {
-                        Some(h) => h,
-                        None => {
-                            let mut v = Vec::new();
-                            if let Some(sys) = system_prompt {
-                                v.push(hipfire_runtime::prompt_frame::Message {
-                                    role: hipfire_runtime::prompt_frame::Role::System,
-                                    content: sys.to_string(),
-                                    reasoning_content: None,
-                                    name: None,
-                                    rendered_name: None,
-                                    tool_calls: Vec::new(),
-                                    tool_call_id: None,
-                                    tool_plan: String::new(),
-                                });
-                            }
-                            v.push(hipfire_runtime::prompt_frame::Message {
-                                role: hipfire_runtime::prompt_frame::Role::User,
-                                content: prompt.to_string(),
-                                reasoning_content: None,
-                                name: None,
-                                rendered_name: None,
-                                tool_calls: Vec::new(),
-                                tool_call_id: None,
-                                tool_plan: String::new(),
-                            });
-                            synthesized = v;
-                            &synthesized
-                        }
-                    };
-                frame.render_messages(messages_slice, tools, None)
-            } else {
-                frame.render()
-            };
-            match render_result {
-                Ok(rendered) => {
-                    primed_think = rendered.trim_end().ends_with("<think>");
-                    tokenizer.encode(&rendered)
-                }
-                Err(e) => {
-                    eprintln!("[daemon] jinja render failed in minimax path ({e}) — falling back to Plain");
-                    hipfire_runtime::prompt_frame::ChatFrame {
-                        tokenizer,
-                        system: system_prompt,
-                        user: prompt,
-                        assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
-                        raw: false,
-                    }
-                    .build()
-                }
-            }
-        } else {
-            hipfire_runtime::prompt_frame::ChatFrame {
-                tokenizer,
-                system: system_prompt,
-                user: prompt,
-                assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
-                raw: false,
-            }
-            .build()
-        }
-    };
-
-    if prompt_ids.is_empty() {
-        emit_active_attempt_error(
-            stdout,
-            Some(id),
-            "empty prompt after tokenize",
-            "validation",
-            false,
-            false,
-        );
-        let _ = stdout.flush();
-        return;
-    }
-
-    let eos_tok = m.minimax().unwrap().eos_tok;
-
-    // Capacity guard. No eviction on arch_id=10 — reset the KV cursor when the
-    // FULL rendered conversation + generation would overflow. `prompt_ids` is
-    // the full Jinja-rendered conversation; the LCP below reuses the warm prefix.
-    let overflow = {
-        let state = &m.minimax().unwrap().state;
-        prompt_ids.len().saturating_add(max_tokens) > state.max_seq
-    };
-    if overflow {
-        let (n, cap) = {
-            let state = &m.minimax().unwrap().state;
-            (state.n_tokens, state.max_seq)
-        };
-        eprintln!("[daemon] arch_id=10 context full ({n}/{cap}) — resetting MiniMaxState",);
-        m.minimax_mut().unwrap().state.reset();
-        m.seq_pos = 0;
-        m.conversation_tokens.clear();
-
-        // O2b-2 capacity guard (minimax single): the reset above recovers a
-        // grown multi-turn conversation, but a SINGLE prompt larger than the
-        // whole context can never fit — prefilling it would write past the KV
-        // (sized for state.max_seq) and panic, taking down serve. After the
-        // reset, if prompt + generation still overflows, emit a clean error.
-        let cap = m.minimax().unwrap().state.max_seq;
-        // saturating_add: an adversarially huge max_tokens must not wrap usize
-        // and slip under the cap.
-        if prompt_ids.len().saturating_add(max_tokens) > cap {
-            emit_active_attempt_error(
-                stdout,
-                Some(id),
-                &format!("prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq", prompt_ids.len(), max_tokens, cap),
-                "context_length",
-                false,
-                false
-            );
-            let _ = stdout.flush();
-            return;
-        }
-    }
-
-    // ── Prefix cache (LCP) with PARTIAL reuse. `prompt_ids` is the full
-    // Jinja-rendered conversation (the trained chat template). MiniMax-M2 is an
-    // INTERLEAVED-THINKING model: its chat_template renders a prior turn's
-    // `<think>…</think>` reasoning into history ONLY while no newer user message
-    // follows (`loop.index0 > last_user_index`). Once the next user turn
-    // arrives the canonical render DROPS that reasoning, so every position after
-    // the most-recent assistant opener shifts and turn N+1 diverges from turn
-    // N's KV at that opener — i.e. `lcp < prior_len`, never a pure forward
-    // extension. We therefore support PARTIAL reuse: rewind `n_tokens` to `lcp`
-    // and re-prefill the (reasoning-free, hence shorter) suffix. MiniMax is
-    // standard attention with no compound recurrent/compressed state, so KV
-    // positions ≥ lcp are simply overwritten by the new prefill and the stale
-    // tail is never attended. The reused prefix GROWS with the conversation
-    // (all older turns, reasoning already stripped, stay matched), so
-    // steady-state per-turn prefill is just {last visible answer} + {new user}.
-    let prefill_ids: Vec<u32> =
-        {
-            let prior_len = m.conversation_tokens.len();
-            let max_match = prior_len.min(prompt_ids.len());
-            let mut lcp = 0usize;
-            while lcp < max_match && m.conversation_tokens[lcp] == prompt_ids[lcp] {
-                lcp += 1;
-            }
-            // A usable common prefix that leaves at least one fresh token to prefill
-            // (the render always appends a new `]~b]ai\n<think>\n` primer, so
-            // lcp == rendered_len cannot occur on a normal turn). `partial` is the
-            // interleaved-thinking divergence (lcp < prior_len); lcp == prior_len is
-            // the degenerate pure-extension case (rewind is then a no-op).
-            let cache_hit = lcp > 0 && lcp < prompt_ids.len();
-            let partial = lcp < prior_len;
-            if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
-                eprintln!(
-                "[minimax-cache] prior_len={} rendered_len={} lcp={} hit={} partial={} n_tokens={}",
-                prior_len, prompt_ids.len(), lcp, cache_hit, cache_hit && partial,
-                m.minimax().unwrap().state.n_tokens,
-            );
-            }
-            if cache_hit {
-                // Rewind KV + token history to the common prefix. When lcp ==
-                // prior_len this is a no-op; when lcp < prior_len it discards the
-                // stale reasoning+answer tail. The prefill loop below reads
-                // `state.n_tokens` as its base position, so n_tokens is the only
-                // KV state the rewind must touch (plus the mirror token history).
-                m.minimax_mut().unwrap().state.n_tokens = lcp;
-                m.conversation_tokens.truncate(lcp);
-                m.seq_pos = lcp;
-                prompt_ids[lcp..].to_vec()
-            } else {
-                if prior_len > 0 {
-                    m.minimax_mut().unwrap().state.reset();
-                    m.seq_pos = 0;
-                    m.conversation_tokens.clear();
-                }
-                prompt_ids.clone()
-            }
-        };
-
-    let t0 = Instant::now();
-
-    // ── Prefill: decode_step per prompt token, or chunked batched prefill.
-    // Disjoint field borrows of `m` (config / weights / state) let us also
-    // push to `m.conversation_tokens` in the same scope. The LAST forward's
-    // logits are the predictions for the first generated token. ──
-    let mut last_logits: Vec<f32> = Vec::new();
-    {
-        let b = m.minimax_mut().unwrap();
-        let cfg = &b.config;
-        let weights = &b.weights;
-        let state = &mut b.state;
-        // Batched prefill: process the prompt in chunks of <=64 tokens through
-        // the batched verify forward (one weight read per chunk vs one
-        // decode_step per token) → much lower TTFT. Validated byte-identical to
-        // the sequential path (cosine 1.0). DEFAULT ON when every layer's expert
-        // dtypes have batched kernels; the pre-check routes unsupported tiers
-        // (MQ3-Lloyd etc.) to the sequential path to avoid a mid-pass error.
-        // Force off with HIPFIRE_MINIMAX_BATCH_PREFILL=0.
-        let batch_prefill = std::env::var_os("HIPFIRE_MINIMAX_BATCH_PREFILL")
-            .map_or(true, |v| v != "0")
-            && minimax::forward::forward_batch_supported(weights);
-        if batch_prefill && !prefill_ids.is_empty() {
-            let mut pos = state.n_tokens;
-            // 512-token prefill chunks let forward_batch's scatter-grouped MoE
-            // (>=256 rows/chunk) read each expert weight once per chunk via
-            // WMMA instead of once per routed token — ~2.2x prefill on
-            // MiniMax-M2 (256 experts/top-8). Shorter prompts fall to the
-            // indexed path inside forward_batch (below the grouped gate).
-            for chunk in prefill_ids.chunks(512) {
-                match minimax::forward::forward_batch(cfg, weights, state, gpu, chunk, pos) {
-                    Ok(logits) => last_logits = logits,
-                    Err(e) => {
-                        emit_error_with_id(
-                            stdout,
-                            id,
-                            format!("minimax batch prefill failed: {e:?}"),
-                        );
-                        return;
-                    }
-                }
-                pos += chunk.len();
-            }
-        } else {
-            let mut position = state.n_tokens as u32;
-            for &tok in &prefill_ids {
-                match minimax::forward::decode_step(cfg, weights, state, gpu, tok, position) {
-                    Ok(logits) => last_logits = logits,
-                    Err(e) => {
-                        emit_error_with_id(stdout, id, format!("minimax prefill failed: {e:?}"));
-                        return;
-                    }
-                }
-                position += 1;
-            }
-        }
-    }
-    for &tok in &prefill_ids {
-        m.conversation_tokens.push(tok);
-    }
-    let prefill_ms = t0.elapsed().as_millis();
-
-    // MiniMax-M2's chat template unconditionally primes the assistant turn
-    // with `<think>\n` (chat_template.jinja generation-prompt block), so the
-    // model's GENERATED tokens begin *inside* the reasoning block and it only
-    // ever emits the closing `</think>`. Every downstream `<think>` consumer —
-    // the serve reasoning_content/content split, the run/chat-path stripper,
-    // and the history `stripThinkingInline` — keys on a LEADING `<think>` and
-    // so never engages, leaking the chain-of-thought into `message.content`.
-    // The primer is already in the KV from prefill; re-emit it into the token
-    // stream (display-only, not pushed to state) so the assistant message is a
-    // well-formed `<think>...</think>...` block for every consumer.
-    if primed_think {
-        let _ = writeln!(
-            stdout,
-            "{}",
-            serde_json::json!({"type": "token", "id": id, "text": "<think>\n", "attempt_id": active_attempt_id()})
-        );
-        let _ = stdout.flush();
-    }
-
-    // ── Decode loop. Sample host-side from the running logits vector.
-    // `temp <= 0` makes sample_token greedy; otherwise top_p nucleus.
-    // Seed the PRNG from wall-clock nanos so successive same-prompt runs
-    // don't lock-step (greedy is still deterministic). ──
-    let seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0x9E3779B97F4A7C15);
-    let mut rng = deepseek4::sampling::Xorshift::new(seed);
-
-    let mut generated_count: usize = 0;
-    let decode_t0 = Instant::now();
-    loop {
-        if generated_count >= max_tokens {
-            break;
-        }
-        // Sample next token from the most recent logits.
-        let next_tok = deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
-        if next_tok == eos_tok {
-            break;
-        }
-
-        // Emit the text fragment. Build through serde_json so a user-supplied
-        // `id` or arbitrary-UTF-8 fragment can't corrupt the JSONL line.
-        let frag = {
-            let tokenizer = m.tokenizer.as_ref().unwrap();
-            tokenizer.decode(&[next_tok])
-        };
-        let envelope = serde_json::json!({
-            "type": "token",
-            "id": id,
-            "text": frag,
-            "attempt_id": active_attempt_id(),
-        });
-        let _ = writeln!(stdout, "{}", envelope);
-        let _ = stdout.flush();
-        m.conversation_tokens.push(next_tok);
-        generated_count += 1;
-
-        // Advance one step on the freshly sampled token.
-        let step = {
-            let b = m.minimax_mut().unwrap();
-            let cfg = &b.config;
-            let weights = &b.weights;
-            let state = &mut b.state;
-            let position = state.n_tokens as u32;
-            // hipGraph decode (opt-in via HIPFIRE_MINIMAX_GRAPH=1, default eager
-            // — measured only +1.0% on gfx1151). First call warms up eager, then
-            // captures + replays.
-            minimax::forward::decode_step_with_graph(cfg, weights, state, gpu, next_tok, position)
-        };
-        match step {
-            Ok(logits) => last_logits = logits,
-            Err(e) => {
-                emit_error_with_id(stdout, id, format!("minimax decode failed: {e:?}"));
-                return;
-            }
-        }
-    }
-
-    m.seq_pos = m.minimax().unwrap().state.n_tokens;
-
-    let decode_ms = decode_t0.elapsed().as_millis().max(1);
-    let total_ms = t0.elapsed().as_millis().max(1);
-    let tok_s = if generated_count > 0 {
-        (generated_count as f64 * 1000.0) / decode_ms as f64
-    } else {
-        0.0
-    };
-    let pending_done = serde_json::json!({
-        "type": "done",
-        "id": id,
-        "tokens": generated_count,
-        "tok_s": (tok_s * 100.0).round() / 100.0,
-        "prefill_ms": prefill_ms,
-        "total_ms": total_ms,
-        "attempt_id": active_attempt_id(),
-    });
-    match await_client_terminal_commit(stdout, id, &pending_done) {
-        ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
-        ClientTerminalDecision::Abort => {}
-    }
-}
-
-/// Cohere2-MoE / North-Mini-Code (arch_id=12) generate path. Mirrors
-/// `generate_minimax`, plus: BATCHED `forward_batch` prefill (≈9×, see the
-/// prefill block) and a Cohere agentic-marker state machine in the decode loop
-/// that suppresses the special markers, routes `<|START_THINKING|>` content to a
-/// reasoning channel, emits `<|START_TEXT|>` content as the visible answer, and
-/// parses `<|START_ACTION|>` blocks into `tool_calls` events. Decode is plain
-/// per-token `decode_step` (no hipGraph variant yet). Out of scope (NOT wired):
-/// spec-decode, MTP, grammar-constrained decoding, tool EXECUTION, repeat
-/// penalty, multi-GPU.
-#[allow(clippy::too_many_arguments)]
-fn generate_cohere2moe(
-    m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
-    stdout: &mut std::io::Stdout,
-    id: &str,
-    prompt: &str,
-    system_prompt: Option<&str>,
-    temp: f32,
-    top_p: f32,
-    max_tokens: usize,
-    max_think_tokens: usize,
-    tools: Option<&[serde_json::Value]>,
-    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
-) {
-    if m.tokenizer.is_none() {
-        emit_active_attempt_error(
-            stdout,
-            Some(id),
-            "tokenizer not loaded",
-            "validation",
-            false,
-            false,
-        );
-        let _ = stdout.flush();
-        return;
-    }
-    if m.cohere2moe().is_none() {
-        emit_active_attempt_error(
-            stdout,
-            Some(id),
-            "cohere2moe_config missing on arch_id=12 generate",
-            "validation",
-            false,
-            false,
-        );
-        let _ = stdout.flush();
-        return;
-    }
-
-    // ── Prompt build (same two-path branch as the minimax / lfm2moe AR path) ──
-    // `primed_think` records whether the rendered prompt actually ended with a
-    // `<think>` generation-primer, so we only re-emit the opener (below) when
-    // the model truly begins inside the reasoning block. (A jinja render failure
-    // now returns an error rather than falling back, so we never reach decode
-    // with an off-distribution Plain frame.)
-    // Set on the sole surviving (successful-render) path; the failure paths in
-    // the block below return, so this needs no dead initializer.
-    let primed_think: bool;
-    let prompt_ids: Vec<u32> = {
-        let tokenizer = m.tokenizer.as_ref().unwrap();
-        // Cohere2-MoE / North-Mini-Code REQUIRES its embedded Jinja chat_template
-        // — its structural tokens are NOT ChatML (turns end with
-        // `<|END_OF_TURN_TOKEN|>`). The hand-rolled Plain ChatML frame emits
-        // `<|im_start|>`/`<|im_end|>` which this model never trained on,
-        // producing an off-distribution prompt that (a) decodes incoherently and
-        // (b) never matches across turns so the LCP prompt-cache is dead. Force
-        // jinja on (falls back to Plain only when the .hfq carries no template).
-        // Jinja default-ON; opt out with HIPFIRE_JINJA_CHAT=0.
-        let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
-        let try_jinja = jinja_enabled && m.chat_template.is_some();
-        if try_jinja {
-            let template = m.chat_template.as_ref().unwrap();
-            let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
-                tokenizer,
-                template,
-                system: system_prompt,
-                user: prompt,
-                enable_thinking: max_think_tokens != 1,
-                bos_token: None,
-                reasoning_strength: None,
-                reasoning_effort: None,
-            };
-            let render_result = if tools.is_some() || messages_history.is_some() {
-                let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
-                let messages_slice: &[hipfire_runtime::prompt_frame::Message] =
-                    match messages_history {
-                        Some(h) => h,
-                        None => {
-                            let mut v = Vec::new();
-                            if let Some(sys) = system_prompt {
-                                v.push(hipfire_runtime::prompt_frame::Message {
-                                    role: hipfire_runtime::prompt_frame::Role::System,
-                                    content: sys.to_string(),
-                                    reasoning_content: None,
-                                    name: None,
-                                    rendered_name: None,
-                                    tool_calls: Vec::new(),
-                                    tool_call_id: None,
-                                    tool_plan: String::new(),
-                                });
-                            }
-                            v.push(hipfire_runtime::prompt_frame::Message {
-                                role: hipfire_runtime::prompt_frame::Role::User,
-                                content: prompt.to_string(),
-                                reasoning_content: None,
-                                name: None,
-                                rendered_name: None,
-                                tool_calls: Vec::new(),
-                                tool_call_id: None,
-                                tool_plan: String::new(),
-                            });
-                            synthesized = v;
-                            &synthesized
-                        }
-                    };
-                frame.render_messages(messages_slice, tools, None)
-            } else {
-                frame.render()
-            };
-            match render_result {
-                Ok(rendered) => {
-                    primed_think = rendered.trim_end().ends_with("<think>");
-                    if std::env::var("HIPFIRE_C2M_DUMP_PROMPT").ok().as_deref() == Some("1") {
-                        let ids = tokenizer.encode(&rendered);
-                        eprintln!(
-                            "[c2m prompt dump] rendered chars={} tokens={}\n>>> HEAD(400):\n{}\n>>> TAIL(800):\n{}\n<<< end",
-                            rendered.len(), ids.len(),
-                            &rendered[..rendered.len().min(400)],
-                            &rendered[rendered.len().saturating_sub(800)..],
-                        );
-                    }
-                    tokenizer.encode(&rendered)
-                }
-                Err(e) => {
-                    // North-Mini-Code's turns are NOT ChatML; a Plain frame emits
-                    // <|im_start|>/<|im_end|> the model never trained on → off-
-                    // distribution garbage that reads as a model-quality bug. Refuse
-                    // rather than silently serve it.
-                    eprintln!(
-                        "[daemon] cohere2moe jinja render failed ({e}) — refusing ChatML fallback"
-                    );
-                    emit_error_with_id(stdout, id, format!("cohere2moe jinja render failed: {e}"));
-                    return;
-                }
-            }
-        } else {
-            // cohere2moe REQUIRES its embedded jinja template (see above). When it
-            // is unavailable — HIPFIRE_JINJA_CHAT=0, or the .hfq carries no template
-            // — the only frame we could build is Plain ChatML, off-distribution for
-            // North. Refuse loudly instead of serving garbage.
-            let why = if !jinja_enabled {
-                "HIPFIRE_JINJA_CHAT=0 disables the required template"
-            } else {
-                "model .hfq carries no chat_template"
-            };
-            eprintln!("[daemon] cohere2moe cannot build a valid prompt frame ({why}) — refusing ChatML fallback");
-            emit_error_with_id(
-                stdout,
-                id,
-                format!("cohere2moe requires its jinja chat template ({why})"),
-            );
-            return;
-        }
-    };
-
-    if prompt_ids.is_empty() {
-        emit_active_attempt_error(
-            stdout,
-            Some(id),
-            "empty prompt after tokenize",
-            "validation",
-            false,
-            false,
-        );
-        let _ = stdout.flush();
-        return;
-    }
-
-    let eos_tok = m.cohere2moe().unwrap().eos_tok;
-
-    // Capacity guard. No eviction on arch_id=12 — reset the KV cursor when the
-    // FULL rendered conversation + generation would overflow. `prompt_ids` is
-    // the full Jinja-rendered conversation; the LCP below reuses the warm prefix.
-    // The KV cache holds `max_seq` positions. A prompt that itself exceeds that
-    // cannot be prefilled without writing PAST the cache — which previously
-    // produced silent GPU-memory corruption (degenerate/garbage output): the
-    // guard reset the cursor but then prefilled the oversized prompt anyway.
-    // Fix: prompt too long → clean error + free KV; prompt fits but generation
-    // would overflow → cap the token budget to the remaining slots so decode
-    // stops at capacity instead of writing OOB.
-    let max_seq = m.cohere2moe().unwrap().state.max_seq;
-    if prompt_ids.len() >= max_seq {
-        eprintln!(
-            "[daemon] arch_id=12 prompt {} >= max_seq {} — refusing (would OOB the KV cache)",
-            prompt_ids.len(),
-            max_seq,
-        );
-        emit_error_with_id(
-            stdout,
-            id,
-            format!(
-                "cohere2moe: prompt is {} tokens but KV capacity (max_seq) is {} — load with a larger max_seq or shorten the prompt",
-                prompt_ids.len(),
-                max_seq
-            ),
-        );
-        let _ = m.cohere2moe_mut().unwrap().state.reset(gpu);
-        m.seq_pos = 0;
-        m.conversation_tokens.clear();
-        return;
-    }
-    // Cap generation so prefill(prompt) + decode(max_tokens) never exceeds the
-    // cache. `max_tokens` is shadowed for the decode loop below.
-    let max_tokens = max_tokens.min(max_seq - prompt_ids.len());
-
-    // ── Prefix cache (LCP) with PARTIAL reuse. `prompt_ids` is the full
-    // Jinja-rendered conversation (the trained chat template). Cohere2-MoE is
-    // standard attention with no compound recurrent/compressed state, so KV
-    // positions ≥ lcp are simply overwritten by the new prefill and the stale
-    // tail is never attended. We rewind `n_tokens` to `lcp` and re-prefill the
-    // suffix; the reused prefix GROWS with the conversation.
-    let prefill_ids: Vec<u32> = {
-        let prior_len = m.conversation_tokens.len();
-        let max_match = prior_len.min(prompt_ids.len());
-        let mut lcp = 0usize;
-        while lcp < max_match && m.conversation_tokens[lcp] == prompt_ids[lcp] {
-            lcp += 1;
-        }
-        // A usable common prefix that leaves at least one fresh token to prefill.
-        // `partial` is the divergence case (lcp < prior_len); lcp == prior_len is
-        // the degenerate pure-extension case (rewind is then a no-op).
-        let cache_hit = lcp > 0 && lcp < prompt_ids.len();
-        let partial = lcp < prior_len;
-        if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
-            eprintln!(
-                "[cohere2moe-cache] prior_len={} rendered_len={} lcp={} hit={} partial={} n_tokens={}",
-                prior_len, prompt_ids.len(), lcp, cache_hit, cache_hit && partial,
-                m.cohere2moe().unwrap().state.n_tokens,
-            );
-        }
-        if cache_hit {
-            // Rewind KV + token history to the common prefix. When lcp ==
-            // prior_len this is a no-op; when lcp < prior_len it discards the
-            // stale tail. The prefill loop below reads `state.n_tokens` as its
-            // base position, so n_tokens is the only KV state the rewind must
-            // touch (plus the mirror token history).
-            m.cohere2moe_mut().unwrap().state.n_tokens = lcp;
-            m.conversation_tokens.truncate(lcp);
-            m.seq_pos = lcp;
-            prompt_ids[lcp..].to_vec()
-        } else {
-            if prior_len > 0 {
-                let _ = m.cohere2moe_mut().unwrap().state.reset(gpu);
-                m.seq_pos = 0;
-                m.conversation_tokens.clear();
-            }
-            prompt_ids.clone()
-        }
-    };
-
-    let t0 = Instant::now();
-
-    // ── Prefill: BATCHED `forward_batch` (~9× the per-token path) when the
-    // expert tier supports the indexed-MoE GEMV (MQ4/MQ6), chunked at 256 (the
-    // WMMA Q8-projection + grouped-MoE sweet spot). `forward_batch` writes KV at
-    // [start_pos..start_pos+b] and its attention covers the cached prefix
-    // [0..start_pos], so it composes with the prompt cache (start_pos = lcp).
-    // Q8/F16 expert tiers (no indexed kernel) fall back to per-token decode_step.
-    // The LAST forward's logits predict the first generated token. ──
-    let mut last_logits: Vec<f32> = Vec::new();
-    {
-        let b = m.cohere2moe_mut().unwrap();
-        let cfg = &b.config;
-        let weights = &b.weights;
-        let state = &mut b.state;
-        if cohere2moe::forward::forward_batch_supported(weights) && prefill_ids.len() > 1 {
-            let mut i = 0;
-            while i < prefill_ids.len() {
-                let end = (i + 256).min(prefill_ids.len());
-                let start_pos = state.n_tokens;
-                match cohere2moe::forward::forward_batch(
-                    cfg,
-                    weights,
-                    state,
-                    gpu,
-                    &prefill_ids[i..end],
-                    start_pos,
-                ) {
-                    Ok(logits) => last_logits = logits,
-                    Err(e) => {
-                        emit_error_with_id(
-                            stdout,
-                            id,
-                            format!("cohere2moe batched prefill failed: {e:?}"),
-                        );
-                        return;
-                    }
-                }
-                i = end;
-            }
-        } else {
-            let mut position = state.n_tokens as u32;
-            for &tok in &prefill_ids {
-                match cohere2moe::forward::decode_step(cfg, weights, state, gpu, tok, position) {
-                    Ok(logits) => last_logits = logits,
-                    Err(e) => {
-                        emit_error_with_id(stdout, id, format!("cohere2moe prefill failed: {e:?}"));
-                        return;
-                    }
-                }
-                position += 1;
-            }
-        }
-    }
-    for &tok in &prefill_ids {
-        m.conversation_tokens.push(tok);
-    }
-    let prefill_ms = t0.elapsed().as_millis();
-
-    // Re-emit a leading `<think>\n` opener into the token stream (display-only,
-    // not pushed to state) when the rendered prompt primed the assistant turn
-    // inside a reasoning block, so downstream `<think>` consumers see a
-    // well-formed block. No-op for templates that don't prime think.
-    if primed_think {
-        let _ = writeln!(
-            stdout,
-            "{}",
-            serde_json::json!({"type": "token", "id": id, "text": "<think>\n", "attempt_id": active_attempt_id()})
-        );
-        let _ = stdout.flush();
-    }
-
-    // ── Decode loop. Sample host-side from the running logits vector.
-    // `temp <= 0` makes sample_token greedy; otherwise top_p nucleus.
-    // Seed the PRNG from wall-clock nanos so successive same-prompt runs
-    // don't lock-step (greedy is still deterministic). ──
-    let seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0x9E3779B97F4A7C15);
-    let mut rng = deepseek4::sampling::Xorshift::new(seed);
-
-    // Cohere agentic markers are SPECIAL TOKENS. Resolve their ids once (scoped
-    // borrow so the loop can still mutate `m`). This model emits <|START_TEXT|>
-    // for its response (NOT the template's <|START_RESPONSE|>, which isn't a
-    // real special token here — verified empirically).
-    let (mk_think0, mk_think1, mk_text0, mk_text1, mk_act0, mk_act1) = {
-        let tk = m.tokenizer.as_ref().unwrap();
-        // `encode` SPLITS these added tokens (they round-trip on DECODE only),
-        // so resolve content→id via special_token_id, with North-Mini-Code's
-        // fixed marker ids as the fallback.
-        let mark = |s: &str, fb: u32| -> u32 { tk.special_token_id(s).unwrap_or(fb) };
-        (
-            mark("<|START_THINKING|>", 255010),
-            mark("<|END_THINKING|>", 255011),
-            mark("<|START_TEXT|>", 255012),
-            mark("<|END_TEXT|>", 255013),
-            mark("<|START_ACTION|>", 255014),
-            mark("<|END_ACTION|>", 255015),
-        )
-    };
-    #[derive(PartialEq, Clone, Copy)]
-    enum Sec {
-        Pre,
-        Think,
-        Text,
-        Action,
-    }
-    let mut sec = Sec::Pre;
-    let mut action_buf = String::new();
-
-    // Degenerate-output guards. The long-context forward can collapse into a
-    // single-token attractor — observed in a Pi session where a ~30K-token
-    // prompt drove the model to emit `<PAD>` until the client aborted ~9.5 min
-    // later. These stop the decode promptly instead of hanging. They do NOT mask
-    // the underlying forward bug: a fired guard MEANS the forward produced
-    // garbage (long-context attention/KV) and is logged loudly so it's caught.
-    let pad_tok = m.tokenizer.as_ref().unwrap().special_token_id("<PAD>");
-    let mut last_tok: u32 = u32::MAX;
-    let mut repeat_run: usize = 0;
-    const REPEAT_GUARD: usize = 24; // consecutive-identical-token attractor
-
-    // Empty-turn guard: North sometimes emits <|END_THINKING|> then
-    // <|END_OF_TURN_TOKEN|> with no response or action, surfacing as a turn with
-    // reasoning only and empty visible content (the model ends after <think>
-    // without returning a result). Track whether anything visible (a text token
-    // or a tool_call) was produced; if EOS arrives before that, mask it and
-    // re-sample so the model is forced into <|START_TEXT|>/<|START_ACTION|> and
-    // actually returns content. Opt out with HIPFIRE_C2M_EMPTY_TURN_GUARD=0.
-    let empty_turn_guard = std::env::var("HIPFIRE_C2M_EMPTY_TURN_GUARD")
-        .ok()
-        .as_deref()
-        != Some("0");
-    let mut emitted_visible = false;
-    let mut eos_suppressions = 0usize;
-    const MAX_EOS_SUPPRESS: usize = 3;
-
-    // Think-budget force-close (mechanism #2): a heavy reasoner can out-think its
-    // token budget and return reasoning only (it hits max_tokens still inside
-    // <think>). Reserve room for an answer; honor an explicit max_think_tokens
-    // when the client sets one. When thinking reaches the budget with nothing
-    // visible yet, inject <|END_THINKING|> + <|START_TEXT|> so the model closes
-    // thinking and answers within the reserve instead of hitting the cap empty.
-    let think_reserve = (max_tokens / 4).clamp(64, 512).min(max_tokens / 2);
-    let think_budget = if max_think_tokens > 1 {
-        max_think_tokens.min(max_tokens.saturating_sub(think_reserve))
-    } else {
-        max_tokens.saturating_sub(think_reserve)
-    };
-    let mut think_count = 0usize;
-    let mut think_force_closed = false;
-    let mut forced_toks: std::collections::VecDeque<u32> = std::collections::VecDeque::new();
-
-    // Tool-calling robustness against non-Cohere harnesses: known tool names (to
-    // snap a verbose/hallucinated name back to the real tool) and a buffer of the
-    // visible output (to recover a tool call the model wrote as TEXT instead of
-    // via <|START_ACTION|>). Handles both {function:{name}} (OpenAI) and {name}.
-    let known_tools: Vec<String> = tools
-        .map(|ts| {
-            ts.iter()
-                .filter_map(|t| {
-                    t.get("function")
-                        .and_then(|f| f.get("name"))
-                        .or_else(|| t.get("name"))
-                        .and_then(|n| n.as_str())
-                        .map(String::from)
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    // name -> [parameter names], for snapping glitched argument keys.
-    let tool_params: Vec<(String, Vec<String>)> = tools
-        .map(|ts| {
-            ts.iter()
-                .filter_map(|t| {
-                    let f = t.get("function").unwrap_or(t);
-                    let name = f.get("name").and_then(|n| n.as_str())?.to_string();
-                    let params = f
-                        .get("parameters")
-                        .and_then(|p| p.get("properties"))
-                        .and_then(|p| p.as_object())
-                        .map(|o| o.keys().cloned().collect())
-                        .unwrap_or_default();
-                    Some((name, params))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let mut tool_calls_emitted = false;
-    let mut held_tool_calls: Vec<hipfire_runtime::prompt_frame::ToolCall> = Vec::new();
-    let mut vis_buf = String::new();
-
-    let mut generated_count: usize = 0;
-    let decode_t0 = Instant::now();
-    loop {
-        if generated_count >= max_tokens {
-            break;
-        }
-        if empty_turn_guard
-            && forced_toks.is_empty()
-            && !think_force_closed
-            && !emitted_visible
-            && sec == Sec::Think
-            && think_count >= think_budget
-        {
-            eprintln!(
-                "[cohere2moe] think-budget guard: force-closing thinking at {think_count} think-tok \
-                 (budget {think_budget}, max_tokens {max_tokens}) — forcing an answer"
-            );
-            forced_toks.push_back(mk_think1);
-            forced_toks.push_back(mk_text0);
-            think_force_closed = true;
-        }
-        let mut next_tok = match forced_toks.pop_front() {
-            Some(t) => t,
-            None => deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng),
-        };
-        if next_tok == eos_tok {
-            if empty_turn_guard && !emitted_visible && eos_suppressions < MAX_EOS_SUPPRESS {
-                // Reasoning-only turn in progress — the model is ending after
-                // <think> with nothing visible. FORCE a <|START_TEXT|> continuation
-                // rather than re-sampling the EOS-masked distribution: re-sampling
-                // drew from the low-probability tail (where garbage / other-language
-                // tokens live), emitting a garbage first token that then derailed the
-                // turn (the "veen hier" / "ماعopilot" glitches). Injecting the marker
-                // puts the model in the response section so its NEXT token is sampled
-                // normally (same as the think-budget force-close, which is coherent).
-                // Close thinking first if we somehow took EOS while still inside it.
-                eos_suppressions += 1;
-                eprintln!(
-                    "[cohere2moe] empty-turn guard: forcing START_TEXT (EOS after thinking, no \
-                     visible output, #{eos_suppressions}/{MAX_EOS_SUPPRESS}) at gen {generated_count}"
-                );
-                if sec == Sec::Think {
-                    forced_toks.push_back(mk_think1);
-                }
-                forced_toks.push_back(mk_text0);
-                next_tok = forced_toks.pop_front().unwrap();
-            } else {
-                break;
-            }
-        }
-        // Degenerate-output guards (see above). `<PAD>` is never a valid
-        // generation token, and any token repeating REPEAT_GUARD× in a row is an
-        // attractor. Either means the forward collapsed — stop before emitting
-        // or decoding further, and log so the real bug isn't silently swallowed.
-        if Some(next_tok) == pad_tok {
-            eprintln!(
-                "[cohere2moe] DEGENERATE OUTPUT: <PAD> (id {next_tok}) emitted at gen {generated_count}, \
-                 ctx={} — forward collapse (long-context attention/KV bug); stopping",
-                m.cohere2moe().map(|b| b.state.n_tokens).unwrap_or(0)
-            );
-            break;
-        }
-        if next_tok == last_tok {
-            repeat_run += 1;
-            if repeat_run >= REPEAT_GUARD {
-                eprintln!(
-                    "[cohere2moe] DEGENERATE OUTPUT: token {next_tok} repeated {repeat_run}× at gen {generated_count} \
-                     (attractor) — forward collapse; stopping"
-                );
-                break;
-            }
-        } else {
-            last_tok = next_tok;
-            repeat_run = 1;
-        }
-        // Probe-mode token-id stream (HIPFIRE_EMIT_TOKEN_IDS=1). Was wired into
-        // the qwen35/deepseek4 generate loops but NOT here, so coherence_probe
-        // and token-id detectors silently saw nothing for north-mini-code.
-        emit_committed_event(
-            stdout,
-            id,
-            next_tok,
-            generated_count,
-            decode_t0.elapsed().as_millis() as u64,
-        );
-        m.conversation_tokens.push(next_tok);
-        generated_count += 1;
-
-        // Agentic-marker state machine — markers themselves are never emitted.
-        if next_tok == mk_think0 {
-            sec = Sec::Think;
-        } else if next_tok == mk_text0 {
-            sec = Sec::Text;
-        } else if next_tok == mk_act0 {
-            sec = Sec::Action;
-            action_buf.clear();
-        } else if next_tok == mk_think1 || next_tok == mk_text1 {
-            sec = Sec::Pre;
-        } else if next_tok == mk_act1 {
-            // End of an action block → parse the JSON array into tool_calls,
-            // snapping any verbose/hallucinated tool name to a real tool.
-            let mut calls = cohere2moe::spec_emit::parse_cohere_action(&action_buf);
-            cohere2moe::spec_emit::snap_call_names(&mut calls, &known_tools, &tool_params);
-            if !calls.is_empty() {
-                // Hold until commit_ready — no mid-stream / post-commit tool event.
-                for c in calls {
-                    let name = c
-                        .get("name")
-                        .and_then(|n| n.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let arguments = c
-                        .get("arguments")
-                        .cloned()
-                        .unwrap_or_else(|| serde_json::json!({}));
-                    if !name.is_empty() {
-                        held_tool_calls.push(hipfire_runtime::prompt_frame::ToolCall {
-                            id: None,
-                            name,
-                            arguments,
-                            rendered_body: None,
-                        });
-                    }
-                }
-                emitted_visible = true;
-                tool_calls_emitted = true;
-            }
-            sec = Sec::Pre;
-        } else {
-            // Build the fragment through serde_json so arbitrary UTF-8 can't
-            // corrupt the JSONL line.
-            let frag = {
-                let tokenizer = m.tokenizer.as_ref().unwrap();
-                tokenizer.decode(&[next_tok])
-            };
-            // Defense-in-depth: never emit a Cohere structural marker into
-            // visible output / the action buffer. The ID state machine above
-            // handles the 6 THINKING/TEXT/ACTION markers; this catches any OTHER
-            // special token the model might emit (START_OF_TURN_TOKEN,
-            // CHATBOT_TOKEN, START_TOOL_RESULT, …) — each decodes to a full
-            // `<|MARKER|>`. The token is still fed to decode_step below; only its
-            // emit is dropped, so a state-machine miss can never leak a marker.
-            let is_marker = frag.len() > 4
-                && frag.starts_with("<|")
-                && frag.ends_with("|>")
-                && frag[2..frag.len() - 2]
-                    .chars()
-                    .all(|c| c.is_ascii_uppercase() || c == '_');
-            if is_marker {
-                // suppressed
-            } else {
-                match sec {
-                    Sec::Action => action_buf.push_str(&frag),
-                    Sec::Think => {
-                        // Reasoning channel: tagged so clients can fold it; the CLI
-                        // (ignoring unknown fields) shows it inline.
-                        let _ = writeln!(
-                            stdout,
-                            "{}",
-                            serde_json::json!({"type": "token", "id": id, "text": frag, "reasoning": true, "attempt_id": active_attempt_id()})
-                        );
-                        let _ = stdout.flush();
-                        think_count += 1;
-                    }
-                    Sec::Text | Sec::Pre => {
-                        vis_buf.push_str(&frag);
-                        let _ = writeln!(
-                            stdout,
-                            "{}",
-                            serde_json::json!({"type": "token", "id": id, "text": frag, "attempt_id": active_attempt_id()})
-                        );
-                        let _ = stdout.flush();
-                        emitted_visible = true;
-                    }
-                }
-            }
-        }
-
-        // Advance one step on the freshly sampled token (plain eager decode —
-        // no hipGraph variant on this arch yet).
-        let step = {
-            let b = m.cohere2moe_mut().unwrap();
-            let cfg = &b.config;
-            let weights = &b.weights;
-            let state = &mut b.state;
-            let position = state.n_tokens as u32;
-            cohere2moe::forward::decode_step(cfg, weights, state, gpu, next_tok, position)
-        };
-        match step {
-            Ok(logits) => last_logits = logits,
-            Err(e) => {
-                emit_error_with_id(stdout, id, format!("cohere2moe decode failed: {e:?}"));
-                return;
-            }
-        }
-    }
-
-    m.seq_pos = m.cohere2moe().unwrap().state.n_tokens;
-
-    // Tool-call-as-text recovery: if the model never emitted a <|START_ACTION|>
-    // block but wrote a tool-call JSON array (`[{tool_name, parameters}]`) as
-    // visible text — which happens when a non-Cohere harness primes it with a
-    // generic tool-call format — parse it out and emit it as a real tool_calls
-    // event so the harness can actually execute it.
-    // Recover tools written as text only when no action-block tools were held.
-    // All authoritative calls stage onto commit_ready/done (no tool event).
-    if !tool_calls_emitted {
-        let mut recovered = cohere2moe::spec_emit::parse_cohere_action(&vis_buf);
-        if !recovered.is_empty() {
-            cohere2moe::spec_emit::snap_call_names(&mut recovered, &known_tools, &tool_params);
-            eprintln!(
-                "[cohere2moe] recovered {} tool_call(s) written as text (model skipped <|START_ACTION|>)",
-                recovered.len()
-            );
-            for v in recovered {
-                let name = v
-                    .get("name")
-                    .and_then(|n| n.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let arguments = v
-                    .get("arguments")
-                    .cloned()
-                    .unwrap_or_else(|| serde_json::json!({}));
-                if !name.is_empty() {
-                    held_tool_calls.push(hipfire_runtime::prompt_frame::ToolCall {
-                        id: None,
-                        name,
-                        arguments,
-                        rendered_body: None,
-                    });
-                }
-            }
-        }
-    }
-
-    let decode_ms = decode_t0.elapsed().as_millis().max(1);
-    let total_ms = t0.elapsed().as_millis().max(1);
-    let tok_s = if generated_count > 0 {
-        (generated_count as f64 * 1000.0) / decode_ms as f64
-    } else {
-        0.0
-    };
-    // Prefill metrics so the CLI bench measures the REAL production prefill
-    // (batched `forward_batch`) straight off the generate response — mirrors
-    // the qwen35 `done` fields (`ttft_ms` ≈ prefill_ms, `decode_tok_s` = tok_s).
-    // Prior to this, cohere2moe omitted these, so `hipfire bench` fell back to
-    // the synthetic per-token `bench_prefill` path and under-reported prefill ~6×.
-    let prefill_tokens = prefill_ids.len();
-    let prefill_tok_s = if prefill_ms > 0 {
-        (prefill_tokens as f64 * 1000.0) / prefill_ms as f64
-    } else {
-        0.0
-    };
-    let finish_reason = if !held_tool_calls.is_empty() {
-        "tool_calls"
-    } else {
-        "stop"
-    };
-    let mut pending_done = serde_json::json!({
-        "type": "done",
-        "id": id,
-        "tokens": generated_count,
-        "tok_s": (tok_s * 100.0).round() / 100.0,
-        "prefill_tokens": prefill_tokens,
-        "prefill_ms": prefill_ms,
-        "prefill_tok_s": (prefill_tok_s * 10.0).round() / 10.0,
-        "decode_tok_s": (tok_s * 100.0).round() / 100.0,
-        "ttft_ms": prefill_ms,
-        "total_ms": total_ms,
-        "finish_reason": finish_reason,
-        "attempt_id": active_attempt_id(),
-    });
-    stage_terminal_tool_calls(&mut pending_done, finish_reason, &held_tool_calls);
-    match await_client_terminal_commit(stdout, id, &pending_done) {
-        ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
-        ClientTerminalDecision::Abort => {}
-    }
-}
-
-/// Qwen2 generate path (arch_id=7, hipfire-arch-qwen2).
-///
-/// Phase-1 bring-up scope: encode prompt → prefill → greedy decode loop
-/// → stream `{"type":"token",...}` events → `{"type":"done",...}`.
-///
-/// Deliberately bypasses qwen35/llama machinery — no PFlash, no DFlash,
-/// no eviction, no ChatML scaffolding, no tool-use, no `<think>` /
-/// `max_think_tokens`, no repeat penalty, no top-p sampling. These
-/// land as the surrounding daemon features mature for the Qwen2 path.
-/// `temp` is currently honored only as a "≤ 1e-6 means greedy"
-/// signal; anything else falls back to greedy too (no sampler wired).
-///
-/// Conversation state on the daemon side advances via
-/// `m.seq_pos` (mirrors the qwen35/llama bookkeeping) plus
-/// `state.next_pos` inside `Qwen2State`. On context overflow we hard
-/// reset (no CASK eviction on arch_id=7) — same fallback the
-/// llama path uses.
-fn generate_qwen2(
-    m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
-    stdout: &mut std::io::Stdout,
-    id: &str,
-    prompt: &str,
-    _system_prompt: Option<&str>,
-    _temp: f32,
-    _top_p: f32,
-    max_tokens: usize,
-    _repeat_penalty: f32,
-    _repeat_window: usize,
-) {
-    let tokenizer = match m.tokenizer.as_ref() {
-        Some(t) => t,
-        None => {
-            emit_active_attempt_error(
-                stdout,
-                Some(id),
-                "tokenizer not loaded",
-                "validation",
-                false,
-                false,
-            );
-            let _ = stdout.flush();
-            return;
-        }
-    };
-    let state_ref = match m.state.as_mut() {
-        Some(ModelState::Qwen2(b)) => b,
-        _ => {
-            emit_active_attempt_error(
-                stdout,
-                Some(id),
-                "qwen2 state missing on arch_id=7 generate",
-                "validation",
-                false,
-                false,
-            );
-            let _ = stdout.flush();
-            return;
-        }
-    };
-    let cfg = &state_ref.config;
-    let weights = &state_ref.weights;
-    let state = &mut state_ref.state;
-
-    // Apply the model's chat template (if present) so instruct-tuned qwen2
-    // models receive properly-framed ChatML input. Falls back to raw encoding
-    // when no template is loaded (e.g. base/pre-train weights).
-    let prompt_ids = if let Some(template) = m.chat_template.as_ref() {
-        let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
-            tokenizer,
-            template,
-            system: _system_prompt,
-            user: prompt,
-            enable_thinking: true,
-            bos_token: None,
-            reasoning_strength: None,
-            reasoning_effort: None,
-        };
-        match frame.render() {
-            Ok(rendered) => tokenizer.encode(&rendered),
-            Err(e) => {
-                eprintln!("[daemon] qwen2 jinja render failed ({e}) — falling back to raw encode");
-                tokenizer.encode(prompt)
-            }
-        }
-    } else {
-        tokenizer.encode(prompt)
-    };
-    if prompt_ids.is_empty() {
-        emit_active_attempt_error(
-            stdout,
-            Some(id),
-            "empty prompt after tokenize",
-            "validation",
-            false,
-            false,
-        );
-        let _ = stdout.flush();
-        return;
-    }
-
-    // Capacity guard. No eviction on arch_id=7 yet — reset state when
-    // the requested run would overflow the KV budget.
-    if state
-        .next_pos
-        .saturating_add(prompt_ids.len())
-        .saturating_add(max_tokens)
-        > state.max_seq
-    {
-        eprintln!(
-            "[daemon] arch_id=7 context full ({}/{}) — resetting Qwen2State.next_pos",
-            state.next_pos, state.max_seq,
-        );
-        state.reset();
-        m.seq_pos = 0;
-        m.conversation_tokens.clear();
-
-        // O2b-2 capacity guard (qwen2 single): the reset above (next_pos=0)
-        // recovers a grown multi-turn conversation, but a SINGLE prompt larger
-        // than the whole context still overflows — prefilling it writes past
-        // the KV (sized for state.max_seq) and panics, taking down serve. After
-        // the reset, if prompt + generation still overflows, emit a clean error.
-        // saturating_add: an adversarially huge max_tokens must not wrap usize
-        // and slip under the cap.
-        if prompt_ids.len().saturating_add(max_tokens) > state.max_seq {
-            let cap = state.max_seq;
-            emit_active_attempt_error(
-                stdout,
-                Some(id),
-                &format!("prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq", prompt_ids.len(), max_tokens, cap),
-                "context_length",
-                false,
-                false
-            );
-            let _ = stdout.flush();
-            return;
-        }
-    }
-
-    let t0 = Instant::now();
-
-    // Prefill: forward_step per prompt token. The last call leaves
-    // logits in state.logits — these are the predictions for the
-    // first generated token.
-    for &tok in &prompt_ids {
-        if let Err(e) = qwen2::forward_step(gpu, weights, cfg, state, tok) {
-            emit_error_with_id(stdout, id, format!("qwen2 prefill failed: {e:?}"));
-            let _ = stdout.flush();
-            return;
-        }
-        m.conversation_tokens.push(tok);
-    }
-    let prefill_ms = t0.elapsed().as_millis();
-
-    // Decode loop. Greedy argmax for now (see fn doc for sampling
-    // scope). The first generated token is argmax of the prefill's
-    // final logits; each subsequent token requires another
-    // forward_step.
-    let mut generated_count: usize = 0;
-    let eos_set: &[u32] = &cfg.eos_token_ids;
-    let decode_t0 = Instant::now();
-    let mut next_tok = match gpu.argmax_f32(&state.logits, cfg.vocab_size) {
-        Ok(t) => t,
-        Err(e) => {
-            emit_error_with_id(stdout, id, format!("argmax failed: {e:?}"));
-            let _ = stdout.flush();
-            return;
-        }
-    };
-
-    loop {
-        if generated_count >= max_tokens {
-            break;
-        }
-        if eos_set.contains(&next_tok) {
-            break;
-        }
-        // Emit text fragment for this token. Tokenizer.decode handles
-        // BPE byte-fragment reassembly; for special tokens that decode
-        // to an empty string we still advance the loop. Build through
-        // serde_json so `id` (user-supplied) and `frag` (arbitrary
-        // UTF-8 with possible `"` / `\` / control chars) can't corrupt
-        // the JSONL line.
-        let frag = tokenizer.decode(&[next_tok]);
-        let envelope = serde_json::json!({
-            "type": "token",
-            "id": id,
-            "text": frag,
-            "attempt_id": active_attempt_id(),
-        });
-        let _ = writeln!(stdout, "{}", envelope);
-        let _ = stdout.flush();
-        m.conversation_tokens.push(next_tok);
-        generated_count += 1;
-
-        match qwen2::forward_step_greedy(gpu, weights, cfg, state, next_tok) {
-            Ok(t) => next_tok = t,
-            Err(e) => {
-                emit_error_with_id(stdout, id, format!("forward_step_greedy failed: {e:?}"));
-                let _ = stdout.flush();
-                return;
-            }
-        }
-    }
-
-    // Daemon bookkeeping: seq_pos matches Qwen2State's internal cursor.
-    m.seq_pos = state.next_pos;
-
-    let decode_ms = decode_t0.elapsed().as_millis().max(1);
-    let total_ms = t0.elapsed().as_millis().max(1);
-    let tok_s = if generated_count > 0 && decode_ms > 0 {
-        (generated_count as f64 * 1000.0) / decode_ms as f64
-    } else {
-        0.0
-    };
-    let pending_done = serde_json::json!({
-        "type": "done",
-        "id": id,
-        "tokens": generated_count,
-        "tok_s": (tok_s * 100.0).round() / 100.0,
-        "prefill_ms": prefill_ms,
-        "total_ms": total_ms,
-        "attempt_id": active_attempt_id(),
-    });
-    match await_client_terminal_commit(stdout, id, &pending_done) {
-        ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
-        ClientTerminalDecision::Abort => {}
-    }
-}
 
 /// Build the 3D mrope context for one VL request, or `None` when the request
 /// has no image tokens (→ the original 1D rope kernels and their dispatch
@@ -30663,7 +15482,7 @@ fn generate_qwen2(
 
 /// The dots.ocr n-gram decode loop proper, factored out of
 /// [`decode_vl_dots_ocr_ngram`] so the `&DotsOcrBundle` borrow it drives is
-/// disjoint from the `&mut m` field-restore. Mirrors the `generate_spec`
+/// disjoint from the `&mut m` field-restore. Mirrors the `hipfire_generate::qwen::generate_spec`
 /// prefill→step contract but with plain UTF-8 text streaming (no `SpecEmit`:
 /// dots.ocr output is unframed layout-JSON, no reasoning/marker/tool channels).
 #[allow(clippy::too_many_arguments)]
@@ -30673,7 +15492,7 @@ fn generate_qwen2(
 #[cfg(test)]
 mod render_tail_think_tests {
     use super::{
-        asst_turn_fingerprint, normalize_asst_turn_for_fingerprint, render_tail_opens_think,
+        hipfire_generate::common::asst_turn_fingerprint, hipfire_generate::common::normalize_asst_turn_for_fingerprint, render_tail_opens_think,
         spec_assistant_prefix,
     };
     use hipfire_runtime::prompt_frame::AssistantPrefix;
@@ -30709,11 +15528,11 @@ mod render_tail_think_tests {
     #[test]
     fn assistant_cache_fingerprint_matches_client_visible_content() {
         let raw = "hidden reasoning</think>\n\nvisible answer<|im_end|>";
-        let normalized = normalize_asst_turn_for_fingerprint(raw);
+        let normalized = hipfire_generate::common::normalize_asst_turn_for_fingerprint(raw);
         assert_eq!(normalized, "visible answer");
         assert_eq!(
-            asst_turn_fingerprint(&normalized, &[]),
-            asst_turn_fingerprint("visible answer", &[])
+            hipfire_generate::common::asst_turn_fingerprint(&normalized, &[]),
+            hipfire_generate::common::asst_turn_fingerprint("visible answer", &[])
         );
     }
 }
@@ -30751,12 +15570,12 @@ mod vl_adaptive_admission_tests {
 mod qwen_ar_semantic_route_tests {
     use super::{
         emit_gen_start, emit_qwen_ar_cancelled, emit_qwen_ar_done, emit_qwen_ar_info,
-        emit_qwen_ar_open_think_terminal, emit_spec_cancel_after_rollback,
+        emit_qwen_ar_open_think_terminal, hipfire_generate::common::emit_spec_cancel_after_rollback,
         emit_staged_terminal_done, emit_tool_calls_event, emit_visible_token,
         qwen_ar_apply_cache_action, qwen_ar_cache_action, qwen_ar_done_value,
-        qwen_ar_eos_filter_config, qwen_client_commit_effects, set_active_attempt_id,
+        qwen_ar_eos_filter_config, hipfire_generate::qwen::qwen_client_commit_effects, set_active_attempt_id,
         stage_terminal_tool_calls, ClientTerminalDecision, QwenArSemanticProducer,
-        QwenArTerminalCause, QwenClientCommitEffects, QWEN_AR_SEMANTIC_CONTRACT_VERSION,
+        QwenArTerminalCause, hipfire_generate::qwen::QwenClientCommitEffects, QWEN_AR_SEMANTIC_CONTRACT_VERSION,
     };
     use std::collections::HashMap;
 
@@ -30818,7 +15637,7 @@ mod qwen_ar_semantic_route_tests {
                 // Mirror production: caller owns open-think epilogue + terminal.
                 // Unit tests have no GPU, so attest rolled_back=false.
                 if matches!(fin.cause, QwenArTerminalCause::OpenThink) {
-                    let ep = super::RollbackEpilogue {
+                    let ep = hipfire_generate::common::RollbackEpilogue {
                         rolled_back: false,
                         context: None,
                     };
@@ -30826,7 +15645,7 @@ mod qwen_ar_semantic_route_tests {
                 } else {
                     // Default Commit path: stage calls on done (production
                     // embeds calls in commit_ready/done; no post-commit event).
-                    let effects = qwen_client_commit_effects(
+                    let effects = hipfire_generate::qwen::qwen_client_commit_effects(
                         ClientTerminalDecision::Commit,
                         fin.finish_reason == "tool_calls" && !fin.wire_tool_calls.is_empty(),
                         fin.store_cache,
@@ -31776,7 +16595,7 @@ mod qwen_ar_semantic_route_tests {
         // GPU-less: attest epilogue.rolled_back=false (same writer as production).
         set_active_attempt_id(7);
         let mut sink = Vec::new();
-        let ep = super::RollbackEpilogue {
+        let ep = hipfire_generate::common::RollbackEpilogue {
             rolled_back: false,
             context: None,
         };
@@ -31919,20 +16738,20 @@ mod qwen_ar_semantic_route_tests {
 
     #[test]
     fn client_commit_effects_commit_preserves_intended_flags() {
-        let e = qwen_client_commit_effects(ClientTerminalDecision::Commit, true, true);
+        let e = hipfire_generate::qwen::qwen_client_commit_effects(ClientTerminalDecision::Commit, true, true);
         assert_eq!(
             e,
-            QwenClientCommitEffects {
+            hipfire_generate::qwen::QwenClientCommitEffects {
                 release_tool_calls: true,
                 store_cache: true,
                 emit_done: true,
             }
         );
-        let e = qwen_client_commit_effects(ClientTerminalDecision::Commit, false, true);
+        let e = hipfire_generate::qwen::qwen_client_commit_effects(ClientTerminalDecision::Commit, false, true);
         assert!(!e.release_tool_calls);
         assert!(e.store_cache);
         assert!(e.emit_done);
-        let e = qwen_client_commit_effects(ClientTerminalDecision::Commit, false, false);
+        let e = hipfire_generate::qwen::qwen_client_commit_effects(ClientTerminalDecision::Commit, false, false);
         assert!(!e.release_tool_calls);
         assert!(!e.store_cache);
         assert!(e.emit_done);
@@ -31940,10 +16759,10 @@ mod qwen_ar_semantic_route_tests {
 
     #[test]
     fn client_commit_effects_abort_suppresses_all() {
-        let e = qwen_client_commit_effects(ClientTerminalDecision::Abort, true, true);
+        let e = hipfire_generate::qwen::qwen_client_commit_effects(ClientTerminalDecision::Abort, true, true);
         assert_eq!(
             e,
-            QwenClientCommitEffects {
+            hipfire_generate::qwen::QwenClientCommitEffects {
                 release_tool_calls: false,
                 store_cache: false,
                 emit_done: false,
@@ -31988,7 +16807,7 @@ mod qwen_ar_semantic_route_tests {
         );
 
         // Commit path: release + cache + done.
-        let effects = qwen_client_commit_effects(
+        let effects = hipfire_generate::qwen::qwen_client_commit_effects(
             ClientTerminalDecision::Commit,
             fin.finish_reason == "tool_calls" && !fin.wire_tool_calls.is_empty(),
             fin.store_cache,
@@ -32062,7 +16881,7 @@ mod qwen_ar_semantic_route_tests {
         }
         let (fin, visible) = producer.finish(&mut sink, false).expect("finish");
         assert_eq!(fin.finish_reason, "tool_calls");
-        let effects = qwen_client_commit_effects(
+        let effects = hipfire_generate::qwen::qwen_client_commit_effects(
             ClientTerminalDecision::Abort,
             fin.finish_reason == "tool_calls" && !fin.wire_tool_calls.is_empty(),
             fin.store_cache,
@@ -32084,11 +16903,11 @@ mod qwen_ar_semantic_route_tests {
         assert!(cache.is_empty());
 
         // Attested cancel terminal only (no GPU rollback in unit test).
-        let ep = super::RollbackEpilogue {
+        let ep = hipfire_generate::common::RollbackEpilogue {
             rolled_back: true,
             context: None,
         };
-        emit_spec_cancel_after_rollback(&mut sink, "t-abort", 4, &ep);
+        hipfire_generate::common::emit_spec_cancel_after_rollback(&mut sink, "t-abort", 4, &ep);
         let out = String::from_utf8_lossy(&sink);
         assert!(!out.contains("\"type\":\"tool_calls\""));
         let events = parse_jsonl(&out);
@@ -32109,15 +16928,15 @@ mod qwen_ar_semantic_route_tests {
 #[cfg(test)]
 mod ds4_malformed_terminal_tests {
     use super::{
-        asst_turn_fingerprint, ds4_apply_cache_action, ds4_ar_ep_cache_action,
-        ds4_ar_ep_finish_route, ds4_cache_action, ds4_client_commit_effects,
-        ds4_ep_abort_wire_events, ds4_gen_start_contract_version, ds4_malformed_terminal_action,
-        ds4_spec_finish_route, ds4_spec_wire_terminal, ds4_stream_event_wireable,
-        emit_ds4_ep_gen_start, emit_ds4_malformed_action, emit_ds4_malformed_terminal,
-        emit_visible_token, gen_start_contract_version_for_arch,
-        normalize_asst_turn_for_fingerprint, set_active_attempt_id, spec_outcome_seed_committable,
-        spec_should_flush_pending_seed, ClientTerminalDecision, Ds4ArEpRouteTerminal,
-        Ds4ClientCommitEffects, Ds4SpecWireTerminal,
+        hipfire_generate::common::asst_turn_fingerprint, hipfire_generate::common::ds4_apply_cache_action, hipfire_generate::common::ds4_ar_ep_cache_action,
+        hipfire_generate::common::ds4_ar_ep_finish_route, hipfire_generate::dense::ds4_cache_action, hipfire_generate::common::ds4_client_commit_effects,
+        hipfire_generate::common::ds4_ep_abort_wire_events, hipfire_generate::common::ds4_gen_start_contract_version, hipfire_generate::common::ds4_malformed_terminal_action,
+        ds4_spec_finish_route, hipfire_generate::dense::ds4_spec_wire_terminal, hipfire_generate::common::ds4_stream_event_wireable,
+        hipfire_generate::qwen::emit_ds4_ep_gen_start, hipfire_generate::common::emit_ds4_malformed_action, emit_ds4_malformed_terminal,
+        emit_visible_token, hipfire_generate::common::gen_start_contract_version_for_arch,
+        hipfire_generate::common::normalize_asst_turn_for_fingerprint, set_active_attempt_id, hipfire_generate::qwen::spec_outcome_seed_committable,
+        hipfire_generate::qwen::spec_should_flush_pending_seed, ClientTerminalDecision, hipfire_generate::common::Ds4ArEpRouteTerminal,
+        hipfire_generate::common::Ds4ClientCommitEffects, hipfire_generate::dense::Ds4SpecWireTerminal,
     };
     use hipfire_arch_deepseek4::dsml::{
         DsmlDeferredCalls, DsmlDeferredOutcome, StreamEvent, StreamParser, TOOL_CALLS_CLOSE,
@@ -32150,13 +16969,13 @@ mod ds4_malformed_terminal_tests {
     }
 
     /// AR/EP production path: deferred finalize → shared pure route.
-    fn ar_ep_from_deferred(d: DsmlDeferredCalls, hit_length_cap: bool) -> Ds4ArEpRouteTerminal {
+    fn ar_ep_from_deferred(d: DsmlDeferredCalls, hit_length_cap: bool) -> hipfire_generate::common::Ds4ArEpRouteTerminal {
         match d.finalize(hit_length_cap) {
             DsmlDeferredOutcome::Malformed { detail } => {
-                ds4_ar_ep_finish_route(Some(detail), Vec::new(), hit_length_cap)
+                hipfire_generate::common::ds4_ar_ep_finish_route(Some(detail), Vec::new(), hit_length_cap)
             }
-            DsmlDeferredOutcome::Length => ds4_ar_ep_finish_route(None, Vec::new(), true),
-            DsmlDeferredOutcome::Stop => ds4_ar_ep_finish_route(None, Vec::new(), false),
+            DsmlDeferredOutcome::Length => hipfire_generate::common::ds4_ar_ep_finish_route(None, Vec::new(), true),
+            DsmlDeferredOutcome::Stop => hipfire_generate::common::ds4_ar_ep_finish_route(None, Vec::new(), false),
             DsmlDeferredOutcome::ToolCalls(calls) => {
                 let wire: Vec<ToolCall> = calls
                     .into_iter()
@@ -32167,14 +16986,14 @@ mod ds4_malformed_terminal_tests {
                         rendered_body: None,
                     })
                     .collect();
-                ds4_ar_ep_finish_route(None, wire, false)
+                hipfire_generate::common::ds4_ar_ep_finish_route(None, wire, false)
             }
         }
     }
 
     /// Spec path: provisional finalize(false) as Deepseek4Emit::finish does,
-    /// then wrapper applies length via ds4_spec_wire_terminal.
-    fn spec_wire_from_deferred(d: DsmlDeferredCalls, hit_length_cap: bool) -> Ds4SpecWireTerminal {
+    /// then wrapper applies length via hipfire_generate::dense::ds4_spec_wire_terminal.
+    fn spec_wire_from_deferred(d: DsmlDeferredCalls, hit_length_cap: bool) -> hipfire_generate::dense::Ds4SpecWireTerminal {
         let (finish_reason, tool_calls) = if d.is_malformed() {
             let _ = d.finalize(false);
             ("malformed_protocol", 0usize)
@@ -32186,13 +17005,13 @@ mod ds4_malformed_terminal_tests {
                 DsmlDeferredOutcome::Malformed { .. } => ("malformed_protocol", 0),
             }
         };
-        ds4_spec_wire_terminal(finish_reason, tool_calls, hit_length_cap)
+        hipfire_generate::dense::ds4_spec_wire_terminal(finish_reason, tool_calls, hit_length_cap)
     }
 
     #[test]
     fn malformed_action_is_typed_validation_non_retryable() {
         let action =
-            ds4_malformed_terminal_action("unclosed DSML tool_calls block at end of output");
+            hipfire_generate::common::ds4_malformed_terminal_action("unclosed DSML tool_calls block at end of output");
         assert_eq!(action.class, "validation");
         assert!(!action.retryable);
         assert!(!action.rolled_back);
@@ -32204,7 +17023,7 @@ mod ds4_malformed_terminal_tests {
     #[test]
     fn malformed_action_suppresses_done_cache_and_calls() {
         let action =
-            ds4_malformed_terminal_action("unclosed DSML tool_calls block at end of output");
+            hipfire_generate::common::ds4_malformed_terminal_action("unclosed DSML tool_calls block at end of output");
         assert!(!action.emit_done, "error XOR done");
         assert!(!action.store_cache, "no assistant-cache write");
         assert!(!action.expose_tool_calls, "no executable calls");
@@ -32226,7 +17045,7 @@ mod ds4_malformed_terminal_tests {
 
         let terminal = ar_ep_from_deferred(deferred, false);
         match terminal {
-            Ds4ArEpRouteTerminal::Malformed(action) => {
+            hipfire_generate::common::Ds4ArEpRouteTerminal::Malformed(action) => {
                 assert_eq!(action.class, "validation");
                 assert!(!action.retryable);
                 assert!(!action.emit_done);
@@ -32243,7 +17062,7 @@ mod ds4_malformed_terminal_tests {
         assert_eq!(deferred.buffered_len(), 1);
         let terminal = ar_ep_from_deferred(deferred, false);
         match terminal {
-            Ds4ArEpRouteTerminal::Safe {
+            hipfire_generate::common::Ds4ArEpRouteTerminal::Safe {
                 finish_reason,
                 wire_tool_calls,
                 store_cache,
@@ -32263,7 +17082,7 @@ mod ds4_malformed_terminal_tests {
         assert_eq!(deferred.buffered_len(), 1);
         let terminal = ar_ep_from_deferred(deferred, true);
         match terminal {
-            Ds4ArEpRouteTerminal::Safe {
+            hipfire_generate::common::Ds4ArEpRouteTerminal::Safe {
                 finish_reason,
                 wire_tool_calls,
                 store_cache,
@@ -32282,7 +17101,7 @@ mod ds4_malformed_terminal_tests {
         let mut deferred = DsmlDeferredCalls::new();
         let visible = deferred.absorb_all(p.feed(&complete_invoke("alpha", "x", "1")));
         assert!(
-            visible.iter().all(|e| ds4_stream_event_wireable(e)),
+            visible.iter().all(|e| hipfire_generate::common::ds4_stream_event_wireable(e)),
             "absorb returns only wireable visible events"
         );
         assert_eq!(deferred.buffered_len(), 1);
@@ -32300,9 +17119,9 @@ mod ds4_malformed_terminal_tests {
             other => panic!("expected Malformed outcome discarding calls, got {other:?}"),
         }
 
-        let wire = ds4_spec_wire_terminal("malformed_protocol", 0, false);
+        let wire = hipfire_generate::dense::ds4_spec_wire_terminal("malformed_protocol", 0, false);
         match wire {
-            Ds4SpecWireTerminal::Malformed(action) => {
+            hipfire_generate::dense::Ds4SpecWireTerminal::Malformed(action) => {
                 assert_eq!(action.class, "validation");
                 assert!(!action.retryable);
                 assert!(!action.emit_done);
@@ -32322,7 +17141,7 @@ mod ds4_malformed_terminal_tests {
         let deferred = deferred_from_text(&complete_invoke("alpha", "x", "1"));
         let wire = spec_wire_from_deferred(deferred, false);
         match wire {
-            Ds4SpecWireTerminal::Done {
+            hipfire_generate::dense::Ds4SpecWireTerminal::Done {
                 finish_reason,
                 release_tool_calls,
                 store_cache,
@@ -32342,7 +17161,7 @@ mod ds4_malformed_terminal_tests {
         let deferred = deferred_from_text(&complete_invoke("alpha", "x", "1"));
         let wire = spec_wire_from_deferred(deferred, true);
         match wire {
-            Ds4SpecWireTerminal::Done {
+            hipfire_generate::dense::Ds4SpecWireTerminal::Done {
                 finish_reason,
                 release_tool_calls,
                 store_cache,
@@ -32364,7 +17183,7 @@ mod ds4_malformed_terminal_tests {
         let _ = deferred.absorb_all(p.finish());
         let wire = spec_wire_from_deferred(deferred, false);
         match wire {
-            Ds4SpecWireTerminal::Malformed(action) => {
+            hipfire_generate::dense::Ds4SpecWireTerminal::Malformed(action) => {
                 assert!(!action.expose_tool_calls);
                 assert!(!action.emit_done);
                 assert!(!action.store_cache);
@@ -32379,7 +17198,7 @@ mod ds4_malformed_terminal_tests {
         let _ = deferred.absorb_all(p.finish());
         let wire_len = spec_wire_from_deferred(deferred, true);
         assert!(
-            matches!(wire_len, Ds4SpecWireTerminal::Malformed(_)),
+            matches!(wire_len, hipfire_generate::dense::Ds4SpecWireTerminal::Malformed(_)),
             "malformed wins over length"
         );
     }
@@ -32390,12 +17209,12 @@ mod ds4_malformed_terminal_tests {
             name: "x".into(),
             arguments: serde_json::json!({}),
         }]);
-        assert!(!ds4_stream_event_wireable(&ev));
-        assert!(ds4_stream_event_wireable(&StreamEvent::Token("hi".into())));
-        assert!(ds4_stream_event_wireable(&StreamEvent::Reasoning(
+        assert!(!hipfire_generate::common::ds4_stream_event_wireable(&ev));
+        assert!(hipfire_generate::common::ds4_stream_event_wireable(&StreamEvent::Token("hi".into())));
+        assert!(hipfire_generate::common::ds4_stream_event_wireable(&StreamEvent::Reasoning(
             "r".into()
         )));
-        assert!(!ds4_stream_event_wireable(&StreamEvent::Malformed {
+        assert!(!hipfire_generate::common::ds4_stream_event_wireable(&StreamEvent::Malformed {
             detail: "x".into()
         }));
         // Production absorber never returns ToolCalls as visible.
@@ -32409,8 +17228,8 @@ mod ds4_malformed_terminal_tests {
         set_active_attempt_id(17);
         let mut buf = Vec::new();
         let action =
-            ds4_malformed_terminal_action("unclosed DSML tool_calls block at end of output");
-        emit_ds4_malformed_action(&mut buf, "req-ds4", &action);
+            hipfire_generate::common::ds4_malformed_terminal_action("unclosed DSML tool_calls block at end of output");
+        hipfire_generate::common::emit_ds4_malformed_action(&mut buf, "req-ds4", &action);
         let text = String::from_utf8(buf).unwrap();
         let lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
         assert_eq!(lines.len(), 1, "exactly one terminal envelope, got {text}");
@@ -32444,10 +17263,10 @@ mod ds4_malformed_terminal_tests {
 
     #[test]
     fn ds4_gen_start_contract_selection_is_unset() {
-        assert_eq!(gen_start_contract_version_for_arch(9), None);
-        assert_eq!(ds4_gen_start_contract_version(), None);
-        assert_eq!(gen_start_contract_version_for_arch(5), Some(2));
-        assert_eq!(gen_start_contract_version_for_arch(6), Some(2));
+        assert_eq!(hipfire_generate::common::gen_start_contract_version_for_arch(9), None);
+        assert_eq!(hipfire_generate::common::ds4_gen_start_contract_version(), None);
+        assert_eq!(hipfire_generate::common::gen_start_contract_version_for_arch(5), Some(2));
+        assert_eq!(hipfire_generate::common::gen_start_contract_version_for_arch(6), Some(2));
         assert_eq!(super::QWEN_AR_SEMANTIC_CONTRACT_VERSION, 2);
     }
 
@@ -32457,7 +17276,7 @@ mod ds4_malformed_terminal_tests {
 
         set_active_attempt_id(31);
         let mut sink = Vec::new();
-        emit_ds4_ep_gen_start(&mut sink, "req-ep", ThinkMode::NonThink);
+        hipfire_generate::qwen::emit_ds4_ep_gen_start(&mut sink, "req-ep", ThinkMode::NonThink);
         emit_visible_token(&mut sink, "req-ep", "hello");
 
         let events: Vec<serde_json::Value> = String::from_utf8(sink)
@@ -32479,8 +17298,8 @@ mod ds4_malformed_terminal_tests {
     // ── Task 4 definitive terminal-edge blockers (DS4 cache + empty EOS) ──
 
     /// Safe DS4 speculative terminal stores the verbatim raw streamed_tokens
-    /// body through ds4_cache_action + ds4_apply_cache_action (same seam as
-    /// generate_deepseek4_spec Done branch).
+    /// body through hipfire_generate::dense::ds4_cache_action + hipfire_generate::common::ds4_apply_cache_action (same seam as
+    /// hipfire_generate::dense::generate_deepseek4_spec Done branch).
     #[test]
     fn ds4_safe_terminal_stores_verbatim_raw_replay_tokens() {
         let calls = vec![ToolCall {
@@ -32500,9 +17319,9 @@ mod ds4_malformed_terminal_tests {
             decoded_eot: false,
             open_think: false,
         };
-        let wire = ds4_spec_wire_terminal("tool_calls", 1, false);
+        let wire = hipfire_generate::dense::ds4_spec_wire_terminal("tool_calls", 1, false);
         match &wire {
-            Ds4SpecWireTerminal::Done {
+            hipfire_generate::dense::Ds4SpecWireTerminal::Done {
                 finish_reason,
                 release_tool_calls,
                 store_cache,
@@ -32513,11 +17332,11 @@ mod ds4_malformed_terminal_tests {
             }
             other => panic!("expected Done, got {other:?}"),
         }
-        let action = ds4_cache_action(&wire, &finish, finish.visible_text.as_str());
+        let action = hipfire_generate::dense::ds4_cache_action(&wire, &finish, finish.visible_text.as_str());
         assert!(action.store);
         assert_eq!(
             action.fingerprint_text,
-            normalize_asst_turn_for_fingerprint("Sure.")
+            hipfire_generate::common::normalize_asst_turn_for_fingerprint("Sure.")
         );
         assert_eq!(action.tool_calls.len(), 1);
         assert_eq!(action.tool_calls[0].name, "lookup");
@@ -32525,7 +17344,7 @@ mod ds4_malformed_terminal_tests {
         // Verbatim raw body — no surround EOS/Assistant markers (DSML replay).
         let streamed = vec![11u32, 22, 33, 44];
         let mut sink: std::collections::HashMap<u64, Vec<u32>> = std::collections::HashMap::new();
-        let fp = ds4_apply_cache_action(
+        let fp = hipfire_generate::common::ds4_apply_cache_action(
             |k, v| {
                 sink.insert(k, v);
             },
@@ -32538,12 +17357,12 @@ mod ds4_malformed_terminal_tests {
             stored, &streamed,
             "cache body must be verbatim run.streamed_tokens"
         );
-        // Fingerprint key matches build_deepseek4_dsml_prompt lookup shape.
-        let expected_fp = asst_turn_fingerprint(&action.fingerprint_text, &action.tool_calls);
+        // Fingerprint key matches hipfire_generate::common::build_deepseek4_dsml_prompt lookup shape.
+        let expected_fp = hipfire_generate::common::asst_turn_fingerprint(&action.fingerprint_text, &action.tool_calls);
         assert_eq!(fp, Some(expected_fp));
     }
 
-    /// Length and fail-closed/malformed never store via ds4_apply_cache_action
+    /// Length and fail-closed/malformed never store via hipfire_generate::common::ds4_apply_cache_action
     /// even when a non-empty raw body is offered.
     #[test]
     fn ds4_length_and_fail_closed_skip_cache_store() {
@@ -32563,9 +17382,9 @@ mod ds4_malformed_terminal_tests {
         let streamed = vec![7u32, 8, 9];
 
         // Length: store_cache=false, no release, no sink mutation.
-        let wire_len = ds4_spec_wire_terminal("tool_calls", 1, true);
+        let wire_len = hipfire_generate::dense::ds4_spec_wire_terminal("tool_calls", 1, true);
         match &wire_len {
-            Ds4SpecWireTerminal::Done {
+            hipfire_generate::dense::Ds4SpecWireTerminal::Done {
                 finish_reason,
                 release_tool_calls,
                 store_cache,
@@ -32577,14 +17396,14 @@ mod ds4_malformed_terminal_tests {
             other => panic!("expected length Done, got {other:?}"),
         }
         let action_len =
-            ds4_cache_action(&wire_len, &finish_tools, finish_tools.visible_text.as_str());
+            hipfire_generate::dense::ds4_cache_action(&wire_len, &finish_tools, finish_tools.visible_text.as_str());
         assert!(!action_len.store);
         assert!(
             action_len.tool_calls.is_empty(),
             "length suppresses held calls"
         );
         let mut sink_len = std::collections::HashMap::new();
-        assert!(ds4_apply_cache_action(
+        assert!(hipfire_generate::common::ds4_apply_cache_action(
             |k, v| {
                 sink_len.insert(k, v);
             },
@@ -32606,12 +17425,12 @@ mod ds4_malformed_terminal_tests {
             decoded_eot: false,
             open_think: false,
         };
-        let wire_mal = ds4_spec_wire_terminal("malformed_protocol", 0, false);
-        assert!(matches!(wire_mal, Ds4SpecWireTerminal::Malformed(_)));
-        let action_mal = ds4_cache_action(&wire_mal, &finish_mal, finish_mal.visible_text.as_str());
+        let wire_mal = hipfire_generate::dense::ds4_spec_wire_terminal("malformed_protocol", 0, false);
+        assert!(matches!(wire_mal, hipfire_generate::dense::Ds4SpecWireTerminal::Malformed(_)));
+        let action_mal = hipfire_generate::dense::ds4_cache_action(&wire_mal, &finish_mal, finish_mal.visible_text.as_str());
         assert!(!action_mal.store);
         let mut sink_mal = std::collections::HashMap::new();
-        assert!(ds4_apply_cache_action(
+        assert!(hipfire_generate::common::ds4_apply_cache_action(
             |k, v| {
                 sink_mal.insert(k, v);
             },
@@ -32630,8 +17449,8 @@ mod ds4_malformed_terminal_tests {
             decoded_eot: false,
             open_think: false,
         };
-        let wire_empty = ds4_spec_wire_terminal("stop", 0, false);
-        let action_empty = ds4_cache_action(
+        let wire_empty = hipfire_generate::dense::ds4_spec_wire_terminal("stop", 0, false);
+        let action_empty = hipfire_generate::dense::ds4_cache_action(
             &wire_empty,
             &finish_empty,
             finish_empty.visible_text.as_str(),
@@ -32639,7 +17458,7 @@ mod ds4_malformed_terminal_tests {
         assert!(action_empty.store, "wire authorizes stop");
         let mut sink_empty = std::collections::HashMap::new();
         assert!(
-            ds4_apply_cache_action(
+            hipfire_generate::common::ds4_apply_cache_action(
                 |k, v| {
                     sink_empty.insert(k, v);
                 },
@@ -32665,11 +17484,11 @@ mod ds4_malformed_terminal_tests {
             stop: Some(hipfire_runtime::spec::StopReason::Eos),
         };
         assert!(
-            !spec_outcome_seed_committable(&eos_out),
+            !hipfire_generate::qwen::spec_outcome_seed_committable(&eos_out),
             "empty-event EOS must not be state-committable"
         );
         assert!(
-            !spec_should_flush_pending_seed(false, false),
+            !hipfire_generate::qwen::spec_should_flush_pending_seed(false, false),
             "non-committable pending seed must skip terminal flush"
         );
 
@@ -32679,17 +17498,17 @@ mod ds4_malformed_terminal_tests {
             events: vec![ClientEvent::Committed { id: 42, idx: 0 }],
             stop: None,
         };
-        assert!(spec_outcome_seed_committable(&committed));
-        assert!(spec_should_flush_pending_seed(false, true));
+        assert!(hipfire_generate::qwen::spec_outcome_seed_committable(&committed));
+        assert!(hipfire_generate::qwen::spec_should_flush_pending_seed(false, true));
 
         // Grammar fail-closed always skips flush even if seed was committable.
-        assert!(!spec_should_flush_pending_seed(true, true));
+        assert!(!hipfire_generate::qwen::spec_should_flush_pending_seed(true, true));
 
-        // First-seed init mirrors generate_spec: empty begin → no emitted bake.
+        // First-seed init mirrors hipfire_generate::qwen::generate_spec: empty begin → no emitted bake.
         let mut emitted: Vec<u32> = Vec::new();
         let mut generated = 0usize;
         let first_token = 99u32; // eos id in production
-        let pending_seed_committable = spec_outcome_seed_committable(&eos_out);
+        let pending_seed_committable = hipfire_generate::qwen::spec_outcome_seed_committable(&eos_out);
         if pending_seed_committable {
             emitted.push(first_token);
             generated += 1;
@@ -32781,7 +17600,7 @@ mod ds4_malformed_terminal_tests {
         let begin = emit.begin(7);
         assert!(begin.events.is_empty(), "DS4 EOS begin emits no events");
         assert_eq!(begin.stop, Some(hipfire_runtime::spec::StopReason::Eos));
-        assert!(!spec_outcome_seed_committable(&begin));
+        assert!(!hipfire_generate::qwen::spec_outcome_seed_committable(&begin));
         assert!(
             emit.streamed_tokens().is_empty(),
             "EOS must not enter streamed_tokens / cache body"
@@ -32790,20 +17609,20 @@ mod ds4_malformed_terminal_tests {
 
     #[test]
     fn ds4_client_commit_effects_commit_preserves_intended_flags() {
-        let e = ds4_client_commit_effects(ClientTerminalDecision::Commit, true, true);
+        let e = hipfire_generate::common::ds4_client_commit_effects(ClientTerminalDecision::Commit, true, true);
         assert_eq!(
             e,
-            Ds4ClientCommitEffects {
+            hipfire_generate::common::Ds4ClientCommitEffects {
                 release_tool_calls: true,
                 store_cache: true,
                 emit_done: true,
             }
         );
-        let e = ds4_client_commit_effects(ClientTerminalDecision::Commit, false, true);
+        let e = hipfire_generate::common::ds4_client_commit_effects(ClientTerminalDecision::Commit, false, true);
         assert!(!e.release_tool_calls);
         assert!(e.store_cache);
         assert!(e.emit_done);
-        let e = ds4_client_commit_effects(ClientTerminalDecision::Commit, false, false);
+        let e = hipfire_generate::common::ds4_client_commit_effects(ClientTerminalDecision::Commit, false, false);
         assert!(!e.release_tool_calls);
         assert!(!e.store_cache);
         assert!(e.emit_done);
@@ -32815,14 +17634,14 @@ mod ds4_malformed_terminal_tests {
         for (intended_release, intended_store) in
             [(true, true), (true, false), (false, true), (false, false)]
         {
-            let e = ds4_client_commit_effects(
+            let e = hipfire_generate::common::ds4_client_commit_effects(
                 ClientTerminalDecision::Abort,
                 intended_release,
                 intended_store,
             );
             assert_eq!(
                 e,
-                Ds4ClientCommitEffects {
+                hipfire_generate::common::Ds4ClientCommitEffects {
                     release_tool_calls: false,
                     store_cache: false,
                     emit_done: false,
@@ -32840,8 +17659,8 @@ mod ds4_malformed_terminal_tests {
             arguments: serde_json::json!({"q": "x"}),
             rendered_body: None,
         };
-        let terminal = ds4_ar_ep_finish_route(None, vec![call.clone()], false);
-        let Ds4ArEpRouteTerminal::Safe {
+        let terminal = hipfire_generate::common::ds4_ar_ep_finish_route(None, vec![call.clone()], false);
+        let hipfire_generate::common::Ds4ArEpRouteTerminal::Safe {
             finish_reason,
             wire_tool_calls,
             store_cache,
@@ -32850,7 +17669,7 @@ mod ds4_malformed_terminal_tests {
             panic!("expected Safe");
         };
         assert_eq!(finish_reason, "tool_calls");
-        let effects = ds4_client_commit_effects(
+        let effects = hipfire_generate::common::ds4_client_commit_effects(
             ClientTerminalDecision::Commit,
             !wire_tool_calls.is_empty(),
             store_cache,
@@ -32859,8 +17678,8 @@ mod ds4_malformed_terminal_tests {
         assert!(effects.store_cache);
         assert!(effects.emit_done);
 
-        let mut action = ds4_ar_ep_cache_action(
-            &Ds4ArEpRouteTerminal::Safe {
+        let mut action = hipfire_generate::common::ds4_ar_ep_cache_action(
+            &hipfire_generate::common::Ds4ArEpRouteTerminal::Safe {
                 finish_reason,
                 wire_tool_calls: wire_tool_calls.clone(),
                 store_cache,
@@ -32872,7 +17691,7 @@ mod ds4_malformed_terminal_tests {
         }
         assert!(action.store);
         let mut sink = std::collections::HashMap::new();
-        assert!(ds4_apply_cache_action(
+        assert!(hipfire_generate::common::ds4_apply_cache_action(
             |k, v| {
                 sink.insert(k, v);
             },
@@ -32891,8 +17710,8 @@ mod ds4_malformed_terminal_tests {
             arguments: serde_json::json!({"q": "x"}),
             rendered_body: None,
         };
-        let terminal = ds4_ar_ep_finish_route(None, vec![call], false);
-        let Ds4ArEpRouteTerminal::Safe {
+        let terminal = hipfire_generate::common::ds4_ar_ep_finish_route(None, vec![call], false);
+        let hipfire_generate::common::Ds4ArEpRouteTerminal::Safe {
             finish_reason,
             wire_tool_calls,
             store_cache,
@@ -32900,7 +17719,7 @@ mod ds4_malformed_terminal_tests {
         else {
             panic!("expected Safe");
         };
-        let effects = ds4_client_commit_effects(
+        let effects = hipfire_generate::common::ds4_client_commit_effects(
             ClientTerminalDecision::Abort,
             !wire_tool_calls.is_empty(),
             store_cache,
@@ -32909,8 +17728,8 @@ mod ds4_malformed_terminal_tests {
         assert!(!effects.store_cache);
         assert!(!effects.emit_done);
 
-        let mut action = ds4_ar_ep_cache_action(
-            &Ds4ArEpRouteTerminal::Safe {
+        let mut action = hipfire_generate::common::ds4_ar_ep_cache_action(
+            &hipfire_generate::common::Ds4ArEpRouteTerminal::Safe {
                 finish_reason,
                 wire_tool_calls,
                 store_cache,
@@ -32922,7 +17741,7 @@ mod ds4_malformed_terminal_tests {
         }
         assert!(!action.store);
         let mut sink = std::collections::HashMap::new();
-        assert!(ds4_apply_cache_action(
+        assert!(hipfire_generate::common::ds4_apply_cache_action(
             |k, v| {
                 sink.insert(k, v);
             },
@@ -32943,8 +17762,8 @@ mod ds4_malformed_terminal_tests {
             decoded_eot: false,
             open_think: false,
         };
-        let wire = ds4_spec_wire_terminal("tool_calls", 1, false);
-        let Ds4SpecWireTerminal::Done {
+        let wire = hipfire_generate::dense::ds4_spec_wire_terminal("tool_calls", 1, false);
+        let hipfire_generate::dense::Ds4SpecWireTerminal::Done {
             release_tool_calls,
             store_cache,
             ..
@@ -32953,33 +17772,33 @@ mod ds4_malformed_terminal_tests {
             panic!("expected Done");
         };
 
-        let commit = ds4_client_commit_effects(
+        let commit = hipfire_generate::common::ds4_client_commit_effects(
             ClientTerminalDecision::Commit,
             release_tool_calls,
             store_cache,
         );
         assert!(commit.release_tool_calls && commit.store_cache && commit.emit_done);
-        let terminal_commit = Ds4SpecWireTerminal::Done {
+        let terminal_commit = hipfire_generate::dense::Ds4SpecWireTerminal::Done {
             finish_reason: "tool_calls",
             release_tool_calls: commit.release_tool_calls,
             store_cache: commit.store_cache,
         };
         let action_commit =
-            ds4_cache_action(&terminal_commit, &finish, finish.visible_text.as_str());
+            hipfire_generate::dense::ds4_cache_action(&terminal_commit, &finish, finish.visible_text.as_str());
         assert!(action_commit.store);
 
-        let abort = ds4_client_commit_effects(
+        let abort = hipfire_generate::common::ds4_client_commit_effects(
             ClientTerminalDecision::Abort,
             release_tool_calls,
             store_cache,
         );
         assert!(!abort.release_tool_calls && !abort.store_cache && !abort.emit_done);
-        let terminal_abort = Ds4SpecWireTerminal::Done {
+        let terminal_abort = hipfire_generate::dense::Ds4SpecWireTerminal::Done {
             finish_reason: "tool_calls",
             release_tool_calls: abort.release_tool_calls,
             store_cache: abort.store_cache,
         };
-        let action_abort = ds4_cache_action(&terminal_abort, &finish, finish.visible_text.as_str());
+        let action_abort = hipfire_generate::dense::ds4_cache_action(&terminal_abort, &finish, finish.visible_text.as_str());
         assert!(!action_abort.store);
         assert!(action_abort.tool_calls.is_empty());
     }
@@ -32987,7 +17806,7 @@ mod ds4_malformed_terminal_tests {
     #[test]
     fn ds4_ep_abort_wire_events_carry_attempt_id_on_both() {
         set_active_attempt_id(99);
-        let (aborted, done) = ds4_ep_abort_wire_events("req-ep", 7, 99);
+        let (aborted, done) = hipfire_generate::common::ds4_ep_abort_wire_events("req-ep", 7, 99);
         assert_eq!(aborted["type"], "aborted");
         assert_eq!(aborted["id"], "req-ep");
         assert_eq!(aborted["reason"], "client_cancelled");
@@ -33207,16 +18026,16 @@ mod qwen_dflash_semantic_terminal_tests {
     }
 
     /// GPU-less attested epilogue for unit tests (no real device sync).
-    fn attest_epilogue(rolled_back: bool) -> RollbackEpilogue {
-        RollbackEpilogue {
+    fn attest_epilogue(rolled_back: bool) -> hipfire_generate::common::RollbackEpilogue {
+        hipfire_generate::common::RollbackEpilogue {
             rolled_back,
             context: None,
         }
     }
 
     /// Attested epilogue with sync-failure context (rolled_back=false).
-    fn attest_epilogue_with_context(context: &str) -> RollbackEpilogue {
-        RollbackEpilogue {
+    fn attest_epilogue_with_context(context: &str) -> hipfire_generate::common::RollbackEpilogue {
+        hipfire_generate::common::RollbackEpilogue {
             rolled_back: false,
             context: Some(context.to_string()),
         }
@@ -33225,9 +18044,9 @@ mod qwen_dflash_semantic_terminal_tests {
     #[test]
     fn safe_stop_stores_cache_no_calls() {
         let fin = summary_stop("hello");
-        let term = qwen_dflash_wire_terminal(&fin, false, false, "hello", false);
+        let term = hipfire_generate::qwen::qwen_dflash_wire_terminal(&fin, false, false, "hello", false);
         match &term {
-            QwenDflashWireTerminal::Done {
+            hipfire_generate::qwen::QwenDflashWireTerminal::Done {
                 finish_reason,
                 release_tool_calls,
                 store_cache,
@@ -33240,12 +18059,12 @@ mod qwen_dflash_semantic_terminal_tests {
                 assert!(wire_tool_calls.is_empty());
                 assert_eq!(
                     fingerprint_text.as_str(),
-                    normalize_asst_turn_for_fingerprint("hello")
+                    hipfire_generate::common::normalize_asst_turn_for_fingerprint("hello")
                 );
             }
             other => panic!("expected Done, got {other:?}"),
         }
-        let action = qwen_dflash_cache_action(&term);
+        let action = hipfire_generate::qwen::qwen_dflash_cache_action(&term);
         assert!(action.store);
         assert!(action.tool_calls.is_empty());
     }
@@ -33259,9 +18078,9 @@ mod qwen_dflash_semantic_terminal_tests {
             rendered_body: None,
         }];
         let fin = summary_tool_calls(calls.clone());
-        let term = qwen_dflash_wire_terminal(&fin, false, false, "Sure.", false);
+        let term = hipfire_generate::qwen::qwen_dflash_wire_terminal(&fin, false, false, "Sure.", false);
         match &term {
-            QwenDflashWireTerminal::Done {
+            hipfire_generate::qwen::QwenDflashWireTerminal::Done {
                 finish_reason,
                 release_tool_calls,
                 store_cache,
@@ -33276,7 +18095,7 @@ mod qwen_dflash_semantic_terminal_tests {
             }
             other => panic!("expected Done, got {other:?}"),
         }
-        let action = qwen_dflash_cache_action(&term);
+        let action = hipfire_generate::qwen::qwen_dflash_cache_action(&term);
         assert!(action.store);
         assert_eq!(action.tool_calls.len(), 1);
     }
@@ -33290,11 +18109,11 @@ mod qwen_dflash_semantic_terminal_tests {
             rendered_body: None,
         }];
         let fin = summary_tool_calls(calls);
-        assert!(qwen_dflash_hit_length_cap(16, 16, false, false));
-        assert!(!qwen_dflash_hit_length_cap(16, 16, false, true));
-        let term = qwen_dflash_wire_terminal(&fin, true, false, "partial", false);
+        assert!(hipfire_generate::common::qwen_dflash_hit_length_cap(16, 16, false, false));
+        assert!(!hipfire_generate::common::qwen_dflash_hit_length_cap(16, 16, false, true));
+        let term = hipfire_generate::qwen::qwen_dflash_wire_terminal(&fin, true, false, "partial", false);
         match &term {
-            QwenDflashWireTerminal::Done {
+            hipfire_generate::qwen::QwenDflashWireTerminal::Done {
                 finish_reason,
                 release_tool_calls,
                 store_cache,
@@ -33309,9 +18128,9 @@ mod qwen_dflash_semantic_terminal_tests {
             }
             other => panic!("expected length Done, got {other:?}"),
         }
-        let action = qwen_dflash_cache_action(&term);
+        let action = hipfire_generate::qwen::qwen_dflash_cache_action(&term);
         assert!(!action.store);
-        assert!(qwen_dflash_apply_cache_action(
+        assert!(hipfire_generate::qwen::qwen_dflash_apply_cache_action(
             |_, _| panic!("must not insert"),
             &action,
             vec![1, 2]
@@ -33321,7 +18140,7 @@ mod qwen_dflash_semantic_terminal_tests {
 
     #[test]
     fn final_token_eot_beats_length() {
-        assert!(!qwen_dflash_hit_length_cap(8, 8, true, false));
+        assert!(!hipfire_generate::common::qwen_dflash_hit_length_cap(8, 8, true, false));
         let calls = vec![ToolCall {
             id: None,
             name: "t".into(),
@@ -33329,9 +18148,9 @@ mod qwen_dflash_semantic_terminal_tests {
             rendered_body: None,
         }];
         let fin = summary_tool_calls(calls);
-        let term = qwen_dflash_wire_terminal(&fin, false, false, "ok", false);
+        let term = hipfire_generate::qwen::qwen_dflash_wire_terminal(&fin, false, false, "ok", false);
         match &term {
-            QwenDflashWireTerminal::Done {
+            hipfire_generate::qwen::QwenDflashWireTerminal::Done {
                 finish_reason,
                 release_tool_calls,
                 store_cache,
@@ -33348,9 +18167,9 @@ mod qwen_dflash_semantic_terminal_tests {
     #[test]
     fn malformed_is_error_xor_done_no_cache() {
         let fin = summary_malformed();
-        let term = qwen_dflash_wire_terminal(&fin, false, false, "", false);
+        let term = hipfire_generate::qwen::qwen_dflash_wire_terminal(&fin, false, false, "", false);
         match &term {
-            QwenDflashWireTerminal::Malformed {
+            hipfire_generate::qwen::QwenDflashWireTerminal::Malformed {
                 class,
                 retryable,
                 rolled_back,
@@ -33363,10 +18182,10 @@ mod qwen_dflash_semantic_terminal_tests {
             }
             other => panic!("expected Malformed, got {other:?}"),
         }
-        let action = qwen_dflash_cache_action(&term);
+        let action = hipfire_generate::qwen::qwen_dflash_cache_action(&term);
         assert!(!action.store);
         assert!(action.tool_calls.is_empty());
-        assert!(!matches!(term, QwenDflashWireTerminal::Done { .. }));
+        assert!(!matches!(term, hipfire_generate::qwen::QwenDflashWireTerminal::Done { .. }));
     }
 
     #[test]
@@ -33378,9 +18197,9 @@ mod qwen_dflash_semantic_terminal_tests {
             rendered_body: None,
         }];
         let fin = summary_tool_calls(calls);
-        let term = qwen_dflash_wire_terminal(&fin, false, true, "x", false);
+        let term = hipfire_generate::qwen::qwen_dflash_wire_terminal(&fin, false, true, "x", false);
         match &term {
-            QwenDflashWireTerminal::Malformed {
+            hipfire_generate::qwen::QwenDflashWireTerminal::Malformed {
                 class,
                 retryable,
                 message,
@@ -33392,10 +18211,10 @@ mod qwen_dflash_semantic_terminal_tests {
             }
             other => panic!("expected grammar Malformed error-only, got {other:?}"),
         }
-        let action = qwen_dflash_cache_action(&term);
+        let action = hipfire_generate::qwen::qwen_dflash_cache_action(&term);
         assert!(!action.store);
         assert!(action.tool_calls.is_empty());
-        assert!(!matches!(term, QwenDflashWireTerminal::Done { .. }));
+        assert!(!matches!(term, hipfire_generate::qwen::QwenDflashWireTerminal::Done { .. }));
     }
 
     #[test]
@@ -33415,9 +18234,9 @@ mod qwen_dflash_semantic_terminal_tests {
         assert_eq!(fin.finish_reason, "open_think");
         assert!(fin.events.is_empty());
         assert_eq!(fin.tool_calls, 0);
-        let term = qwen_dflash_wire_terminal(&fin, false, false, "", false);
+        let term = hipfire_generate::qwen::qwen_dflash_wire_terminal(&fin, false, false, "", false);
         match &term {
-            QwenDflashWireTerminal::Malformed {
+            hipfire_generate::qwen::QwenDflashWireTerminal::Malformed {
                 class,
                 retryable,
                 message,
@@ -33429,12 +18248,12 @@ mod qwen_dflash_semantic_terminal_tests {
             }
             other => panic!("expected open_think Malformed, got {other:?}"),
         }
-        assert!(!qwen_dflash_cache_action(&term).store);
-        assert!(!matches!(term, QwenDflashWireTerminal::Done { .. }));
+        assert!(!hipfire_generate::qwen::qwen_dflash_cache_action(&term).store);
+        assert!(!matches!(term, hipfire_generate::qwen::QwenDflashWireTerminal::Done { .. }));
         // Production Malformed writer: error XOR done (GPU-less attested epilogue).
         set_active_attempt_id(21);
         let mut sink = Vec::new();
-        if let QwenDflashWireTerminal::Malformed {
+        if let hipfire_generate::qwen::QwenDflashWireTerminal::Malformed {
             message,
             class,
             retryable,
@@ -33442,7 +18261,7 @@ mod qwen_dflash_semantic_terminal_tests {
         } = &term
         {
             let ep = attest_epilogue(*rolled_back);
-            emit_qwen_dflash_malformed_terminal(
+            hipfire_generate::qwen::emit_qwen_dflash_malformed_terminal(
                 &mut sink, "req-ot", message, class, *retryable, &ep,
             );
         }
@@ -33480,12 +18299,12 @@ mod qwen_dflash_semantic_terminal_tests {
             assert_eq!(fin.finish_reason, "open_think", "{label}");
             assert_eq!(fin.tool_calls, 0, "{label}");
             assert!(fin.events.is_empty(), "{label}: no release on open_think");
-            let term = qwen_dflash_wire_terminal(&fin, false, false, "", false);
+            let term = hipfire_generate::qwen::qwen_dflash_wire_terminal(&fin, false, false, "", false);
             assert!(
-                matches!(term, QwenDflashWireTerminal::Malformed { .. }),
+                matches!(term, hipfire_generate::qwen::QwenDflashWireTerminal::Malformed { .. }),
                 "{label}: expected Malformed"
             );
-            assert!(!qwen_dflash_cache_action(&term).store, "{label}");
+            assert!(!hipfire_generate::qwen::qwen_dflash_cache_action(&term).store, "{label}");
         }
     }
 
@@ -33500,16 +18319,16 @@ mod qwen_dflash_semantic_terminal_tests {
         assert_eq!(fin.finish_reason, "stop");
         let generated = ids.len();
         let max_tokens = generated;
-        assert!(!qwen_dflash_hit_length_cap(
+        assert!(!hipfire_generate::common::qwen_dflash_hit_length_cap(
             generated,
             max_tokens,
             fin.decoded_eot,
             false
         ));
-        let term = qwen_dflash_wire_terminal(&fin, false, false, "hi", false);
+        let term = hipfire_generate::qwen::qwen_dflash_wire_terminal(&fin, false, false, "hi", false);
         assert!(matches!(
             term,
-            QwenDflashWireTerminal::Done {
+            hipfire_generate::qwen::QwenDflashWireTerminal::Done {
                 finish_reason: "stop",
                 store_cache: true,
                 ..
@@ -33547,16 +18366,16 @@ mod qwen_dflash_semantic_terminal_tests {
         assert!(visible.contains("hi"));
         assert!(!raw.is_empty());
         let generated = raw.len();
-        assert!(!qwen_dflash_hit_length_cap(
+        assert!(!hipfire_generate::common::qwen_dflash_hit_length_cap(
             generated,
             generated,
             fin.decoded_eot,
             false
         ));
-        let term = qwen_dflash_wire_terminal(&fin, false, false, &visible, false);
+        let term = hipfire_generate::qwen::qwen_dflash_wire_terminal(&fin, false, false, &visible, false);
         assert!(matches!(
             term,
-            QwenDflashWireTerminal::Done {
+            hipfire_generate::qwen::QwenDflashWireTerminal::Done {
                 finish_reason: "stop",
                 store_cache: true,
                 release_tool_calls: false,
@@ -33580,14 +18399,14 @@ mod qwen_dflash_semantic_terminal_tests {
 
         // Mid-window semantic consume of 2 of 4 emitted tokens.
         let step = SpecStep::new([10, 11, 12, 13], 13, 4, 3);
-        let host = spec_host_advance_after_step(100, 0, Vec::new(), &step.emit, step.next_seed, 2);
+        let host = hipfire_generate::qwen::spec_host_advance_after_step(100, 0, Vec::new(), &step.emit, step.next_seed, 2);
         assert_eq!(host.emitted, vec![10, 11]);
         assert_eq!(host.generated, 2);
         assert_eq!(host.position, 102);
         assert_eq!(host.seed_token, 11);
         // Full-window consume keeps step.next_seed when prefix covers emit.
         let host_full =
-            spec_host_advance_after_step(100, 0, Vec::new(), &step.emit, step.next_seed, 4);
+            hipfire_generate::qwen::spec_host_advance_after_step(100, 0, Vec::new(), &step.emit, step.next_seed, 4);
         assert_eq!(host_full.emitted, vec![10, 11, 12, 13]);
         assert_eq!(host_full.position, 104);
         assert_eq!(host_full.seed_token, 13);
@@ -33598,12 +18417,12 @@ mod qwen_dflash_semantic_terminal_tests {
     #[test]
     fn spec_prefix_realign_plan_empty_raw_and_multi() {
         let prompt = vec![1u32, 2, 3];
-        let empty = spec_prefix_realign_plan(&prompt, 99, &[]);
+        let empty = hipfire_generate::qwen::spec_prefix_realign_plan(&prompt, 99, &[]);
         assert_eq!(empty.replay, prompt);
         assert_eq!(empty.position, 3);
         assert_eq!(empty.seed_token, 99);
 
-        let multi = spec_prefix_realign_plan(&prompt, 99, &[10, 11, 12]);
+        let multi = hipfire_generate::qwen::spec_prefix_realign_plan(&prompt, 99, &[10, 11, 12]);
         assert_eq!(multi.replay, vec![1, 2, 3, 99, 10, 11]);
         assert_eq!(multi.position, 6);
         assert_eq!(multi.seed_token, 12);
@@ -33664,7 +18483,7 @@ mod qwen_dflash_semantic_terminal_tests {
         );
 
         let position_before = prompt.len();
-        let host = spec_host_advance_after_step(
+        let host = hipfire_generate::qwen::spec_host_advance_after_step(
             position_before,
             0,
             vec![first_token],
@@ -33678,7 +18497,7 @@ mod qwen_dflash_semantic_terminal_tests {
         assert_eq!(&host.emitted[1..], &step.emit[..consumed]);
         assert!(!host.emitted.contains(&90) && !host.emitted.contains(&91));
 
-        let plan = spec_prefix_realign_plan(&prompt, first_token, &raw_decode);
+        let plan = hipfire_generate::qwen::spec_prefix_realign_plan(&prompt, first_token, &raw_decode);
         let mut expected_replay = prompt.clone();
         expected_replay.push(first_token);
         expected_replay.extend_from_slice(&raw_decode[..raw_decode.len() - 1]);
@@ -33729,7 +18548,7 @@ mod qwen_dflash_semantic_terminal_tests {
         assert!(consumed < step.emit.len(), "tail must remain unobserved");
         assert_eq!(raw_decode.len(), consumed);
 
-        let host = spec_host_advance_after_step(
+        let host = hipfire_generate::qwen::spec_host_advance_after_step(
             prompt.len(),
             0,
             vec![first_token],
@@ -33741,7 +18560,7 @@ mod qwen_dflash_semantic_terminal_tests {
         assert_eq!(host.position, prompt.len() + consumed);
         assert!(!host.emitted.contains(&90));
 
-        let plan = spec_prefix_realign_plan(&prompt, first_token, &raw_decode);
+        let plan = hipfire_generate::qwen::spec_prefix_realign_plan(&prompt, first_token, &raw_decode);
         assert_eq!(plan.position, host.position);
         assert_eq!(plan.seed_token, host.seed_token);
         assert_eq!(plan.replay.len(), plan.position);
@@ -33760,7 +18579,7 @@ mod qwen_dflash_semantic_terminal_tests {
         let mut position = prompt.len();
         let mut emitted = vec![first_token];
         let mut generated = 0usize;
-        let host1 = spec_host_advance_after_step(
+        let host1 = hipfire_generate::qwen::spec_host_advance_after_step(
             position,
             generated,
             emitted.clone(),
@@ -33779,7 +18598,7 @@ mod qwen_dflash_semantic_terminal_tests {
         let w2 = SpecStep::new([20u32, 21, 22, 23], 23, 4, 3);
         let consumed2 = 2usize;
         raw_decode.extend_from_slice(&w2.emit[..consumed2]);
-        let host2 = spec_host_advance_after_step(
+        let host2 = hipfire_generate::qwen::spec_host_advance_after_step(
             position,
             generated,
             emitted,
@@ -33792,7 +18611,7 @@ mod qwen_dflash_semantic_terminal_tests {
         assert_eq!(host2.seed_token, 21);
         assert!(!host2.emitted.contains(&22) && !host2.emitted.contains(&23));
 
-        let plan = spec_prefix_realign_plan(&prompt, first_token, &raw_decode);
+        let plan = hipfire_generate::qwen::spec_prefix_realign_plan(&prompt, first_token, &raw_decode);
         assert_eq!(
             plan.replay,
             vec![7, 8, first_token, 10, 11, 12, 20] // drops last raw (21)
@@ -33859,7 +18678,7 @@ mod qwen_dflash_semantic_terminal_tests {
         assert!(consumed < step.emit.len(), "must leave unobserved tail");
 
         let position_before = prompt.len();
-        let host = spec_host_advance_after_step(
+        let host = hipfire_generate::qwen::spec_host_advance_after_step(
             position_before,
             0,
             vec![open_think],
@@ -33872,7 +18691,7 @@ mod qwen_dflash_semantic_terminal_tests {
         assert_eq!(host.seed_token, think_body[0]);
         assert!(!host.emitted.contains(&90));
 
-        let plan = spec_prefix_realign_plan(&prompt, open_think, &raw_decode);
+        let plan = hipfire_generate::qwen::spec_prefix_realign_plan(&prompt, open_think, &raw_decode);
         assert_eq!(plan.position, host.position);
         assert_eq!(plan.seed_token, host.seed_token);
         assert_eq!(plan.replay, {
@@ -33883,7 +18702,7 @@ mod qwen_dflash_semantic_terminal_tests {
 
         // Pending-seed GPU tx: commit [trigger] ++ forced[..n-1]; last forced
         // stays unprocessed pending seed (never double-forwarded).
-        let tx = spec_forced_pending_seed_tx(plan.seed_token, &forced_after, true);
+        let tx = hipfire_generate::qwen::spec_forced_pending_seed_tx(plan.seed_token, &forced_after, true);
         assert_eq!(tx.commit.first().copied(), Some(plan.seed_token));
         assert_eq!(tx.commit.len(), forced_after.len());
         assert_eq!(tx.pending_seed, *forced_after.last().unwrap());
@@ -33924,12 +18743,12 @@ mod qwen_dflash_semantic_terminal_tests {
         assert!(!emitted.contains(&90) && !emitted.contains(&91) && !emitted.contains(&92));
 
         // Terminal flush would commit the final pending seed exactly once.
-        let term = spec_terminal_pending_seed_tx(seed_token);
+        let term = hipfire_generate::qwen::spec_terminal_pending_seed_tx(seed_token);
         assert_eq!(term.commit, vec![seed_token]);
         assert_eq!(term.position_delta, 1);
         let position_after_flush = position + term.position_delta;
 
-        let plan2 = spec_prefix_realign_plan(&prompt, open_think, &raw_decode);
+        let plan2 = hipfire_generate::qwen::spec_prefix_realign_plan(&prompt, open_think, &raw_decode);
         assert_eq!(plan2.position, prompt.len() + raw_decode.len());
         assert_eq!(plan2.seed_token, seed_token);
         assert_eq!(plan2.seed_token, *raw_decode.last().unwrap());
@@ -33951,18 +18770,18 @@ mod qwen_dflash_semantic_terminal_tests {
         // EOT-terminated: body + im_end + nl → strip trailer.
         let eot_stream = vec![10, 11, 1, 7];
         assert_eq!(
-            qwen_dflash_cache_seq(&eot_stream, im_end, &nl),
+            hipfire_generate::qwen::qwen_dflash_cache_seq(&eot_stream, im_end, &nl),
             vec![10, 11]
         );
         // Length-capped body ending on newline: restore verbatim (no im_end).
         let len_stream = vec![10, 11, 7];
         assert_eq!(
-            qwen_dflash_cache_seq(&len_stream, im_end, &nl),
+            hipfire_generate::qwen::qwen_dflash_cache_seq(&len_stream, im_end, &nl),
             vec![10, 11, 7]
         );
         // Pure body, no trailer.
         let body = vec![10, 11, 12];
-        assert_eq!(qwen_dflash_cache_seq(&body, im_end, &nl), body);
+        assert_eq!(hipfire_generate::qwen::qwen_dflash_cache_seq(&body, im_end, &nl), body);
     }
 
     #[test]
@@ -33975,7 +18794,7 @@ mod qwen_dflash_semantic_terminal_tests {
         ] {
             let mut sink = Vec::new();
             let ep = attest_epilogue(true);
-            emit_spec_failure_terminal(&mut sink, id, what, "boom", &ep);
+            hipfire_generate::qwen::emit_spec_failure_terminal(&mut sink, id, what, "boom", &ep);
             let text = String::from_utf8(sink).unwrap();
             let lines = parse_jsonl(&text);
             assert_eq!(lines.len(), 1, "error XOR done: {lines:?}");
@@ -33990,7 +18809,7 @@ mod qwen_dflash_semantic_terminal_tests {
         // rolled_back=false + context path (sync could not be attested).
         let mut sink = Vec::new();
         let ep = attest_epilogue_with_context("device_synchronize failed: test");
-        emit_spec_failure_terminal(&mut sink, "req-ctx", "spec_step", "boom", &ep);
+        hipfire_generate::qwen::emit_spec_failure_terminal(&mut sink, "req-ctx", "spec_step", "boom", &ep);
         let text = String::from_utf8(sink).unwrap();
         let lines = parse_jsonl(&text);
         assert_eq!(lines.len(), 1);
@@ -34009,7 +18828,7 @@ mod qwen_dflash_semantic_terminal_tests {
         set_active_attempt_id(43);
         let mut sink = Vec::new();
         let ep = attest_epilogue(true);
-        emit_spec_failure_terminal(&mut sink, "req-fa", "forced", "boom", &ep);
+        hipfire_generate::qwen::emit_spec_failure_terminal(&mut sink, "req-fa", "forced", "boom", &ep);
         let text = String::from_utf8(sink).unwrap();
         let lines = parse_jsonl(&text);
         assert_eq!(lines.len(), 1);
@@ -34027,12 +18846,12 @@ mod qwen_dflash_semantic_terminal_tests {
     #[test]
     fn decoded_eot_beats_length_cap_helper() {
         let fin = summary_stop("hi");
-        assert!(qwen_dflash_hit_length_cap(8, 8, false, false));
+        assert!(hipfire_generate::common::qwen_dflash_hit_length_cap(8, 8, false, false));
         // Emitter semantic stop at cap is also not length (independent of EOT).
-        assert!(!qwen_dflash_hit_length_cap(8, 8, false, true));
-        let term = qwen_dflash_wire_terminal(&fin, true, false, "hi", false);
+        assert!(!hipfire_generate::common::qwen_dflash_hit_length_cap(8, 8, false, true));
+        let term = hipfire_generate::qwen::qwen_dflash_wire_terminal(&fin, true, false, "hi", false);
         match &term {
-            QwenDflashWireTerminal::Done {
+            hipfire_generate::qwen::QwenDflashWireTerminal::Done {
                 finish_reason,
                 store_cache,
                 release_tool_calls,
@@ -34044,16 +18863,16 @@ mod qwen_dflash_semantic_terminal_tests {
             }
             other => panic!("{other:?}"),
         }
-        assert!(!qwen_dflash_hit_length_cap(8, 8, true, false));
+        assert!(!hipfire_generate::common::qwen_dflash_hit_length_cap(8, 8, true, false));
         let tok = test_tokenizer();
         let mut ids = tok.encode("hi");
         ids.push(1);
         let (_s, fin_eot, _) = drive_qwen_ids(&ids, AssistantPrefix::Plain);
         assert!(fin_eot.decoded_eot);
-        let term = qwen_dflash_wire_terminal(&fin_eot, false, false, "hi", false);
+        let term = hipfire_generate::qwen::qwen_dflash_wire_terminal(&fin_eot, false, false, "hi", false);
         assert!(matches!(
             term,
-            QwenDflashWireTerminal::Done {
+            hipfire_generate::qwen::QwenDflashWireTerminal::Done {
                 finish_reason: "stop",
                 store_cache: true,
                 ..
@@ -34070,9 +18889,9 @@ mod qwen_dflash_semantic_terminal_tests {
             rendered_body: None,
         }];
         let fin = summary_tool_calls(calls);
-        let term = qwen_dflash_wire_terminal(&fin, true, false, "x", false);
+        let term = hipfire_generate::qwen::qwen_dflash_wire_terminal(&fin, true, false, "x", false);
         match &term {
-            QwenDflashWireTerminal::Done {
+            hipfire_generate::qwen::QwenDflashWireTerminal::Done {
                 finish_reason,
                 release_tool_calls,
                 store_cache,
@@ -34086,12 +18905,12 @@ mod qwen_dflash_semantic_terminal_tests {
             }
             other => panic!("{other:?}"),
         }
-        assert!(!qwen_dflash_cache_action(&term).store);
+        assert!(!hipfire_generate::qwen::qwen_dflash_cache_action(&term).store);
     }
 
     #[test]
     fn cancel_is_fold_compatible_no_cache_helper() {
-        // Production cancel writer (same path as generate_spec abort sites).
+        // Production cancel writer (same path as hipfire_generate::qwen::generate_spec abort sites).
         set_active_attempt_id(11);
         let mut sink = Vec::new();
         emit_qwen_ar_cancelled(&mut sink, "c", 3);
@@ -34104,7 +18923,7 @@ mod qwen_dflash_semantic_terminal_tests {
         assert_eq!(lines[1]["type"], "done");
         assert_eq!(lines[1]["finish_reason"], "aborted");
         assert_eq!(lines[1]["completion_tokens"], 3);
-        // Cancel never goes through qwen_dflash_wire_terminal store path.
+        // Cancel never goes through hipfire_generate::qwen::qwen_dflash_wire_terminal store path.
         assert!(!out.contains(r#""finish_reason":"stop""#));
     }
 
@@ -34135,17 +18954,17 @@ mod qwen_dflash_semantic_terminal_tests {
             arguments: serde_json::json!({}),
             rendered_body: None,
         }]);
-        let term = qwen_dflash_wire_terminal(&fin, false, true, "x", false);
+        let term = hipfire_generate::qwen::qwen_dflash_wire_terminal(&fin, false, true, "x", false);
         let mut sink = Vec::new();
         match &term {
-            QwenDflashWireTerminal::Malformed {
+            hipfire_generate::qwen::QwenDflashWireTerminal::Malformed {
                 message,
                 class,
                 retryable,
                 rolled_back,
             } => {
                 let ep = attest_epilogue(*rolled_back);
-                emit_qwen_dflash_malformed_terminal(
+                hipfire_generate::qwen::emit_qwen_dflash_malformed_terminal(
                     &mut sink, "g1", message, class, *retryable, &ep,
                 );
             }
@@ -34158,7 +18977,7 @@ mod qwen_dflash_semantic_terminal_tests {
         assert_eq!(lines[0]["attempt_id"], 7);
         assert_eq!(lines[0]["id"], "g1");
         assert!(!out.contains(r#""type":"done""#));
-        assert!(!qwen_dflash_cache_action(&term).store);
+        assert!(!hipfire_generate::qwen::qwen_dflash_cache_action(&term).store);
     }
 
     #[test]
@@ -34166,7 +18985,7 @@ mod qwen_dflash_semantic_terminal_tests {
         set_active_attempt_id(9);
         let mut sink = Vec::new();
         let id = "a\"b\n";
-        render_client_events(
+        hipfire_generate::qwen::render_client_events(
             &mut sink,
             id,
             &[
@@ -34221,13 +19040,13 @@ mod qwen_dflash_semantic_terminal_tests {
     #[test]
     fn cache_fingerprint_uses_visible_not_raw_markers() {
         let fin = summary_stop("visible only");
-        let term = qwen_dflash_wire_terminal(&fin, false, false, "visible only", false);
-        let action = qwen_dflash_cache_action(&term);
+        let term = hipfire_generate::qwen::qwen_dflash_wire_terminal(&fin, false, false, "visible only", false);
+        let action = hipfire_generate::qwen::qwen_dflash_cache_action(&term);
         assert!(!action.fingerprint_text.contains("<tool_call>"));
         assert!(!action.fingerprint_text.contains("<think>"));
         assert!(action.fingerprint_text.contains("visible"));
         let mut stored = None;
-        let fp = qwen_dflash_apply_cache_action(
+        let fp = hipfire_generate::qwen::qwen_dflash_apply_cache_action(
             |f, seq| {
                 stored = Some((f, seq));
             },
@@ -34239,15 +19058,15 @@ mod qwen_dflash_semantic_terminal_tests {
         assert_eq!(seq, vec![10, 20, 30]);
         assert_eq!(
             f,
-            asst_turn_fingerprint(&action.fingerprint_text, &action.tool_calls)
+            hipfire_generate::common::asst_turn_fingerprint(&action.fingerprint_text, &action.tool_calls)
         );
     }
 
     #[test]
     fn qwen_dflash_contract_version_is_v2() {
         assert_eq!(QWEN_DFLASH_SEMANTIC_CONTRACT_VERSION, 2);
-        assert_eq!(gen_start_contract_version_for_arch(5), Some(2));
-        assert_eq!(gen_start_contract_version_for_arch(6), Some(2));
+        assert_eq!(hipfire_generate::common::gen_start_contract_version_for_arch(5), Some(2));
+        assert_eq!(hipfire_generate::common::gen_start_contract_version_for_arch(6), Some(2));
     }
 
     #[test]
@@ -34264,9 +19083,9 @@ mod qwen_dflash_semantic_terminal_tests {
             decoded_eot: false,
             open_think: false,
         };
-        let term = qwen_dflash_wire_terminal(&fin, false, false, "", false);
+        let term = hipfire_generate::qwen::qwen_dflash_wire_terminal(&fin, false, false, "", false);
         match term {
-            QwenDflashWireTerminal::Done {
+            hipfire_generate::qwen::QwenDflashWireTerminal::Done {
                 finish_reason,
                 release_tool_calls,
                 wire_tool_calls,
@@ -34283,7 +19102,7 @@ mod qwen_dflash_semantic_terminal_tests {
     #[test]
     fn production_done_value_builder_matches_epilogue_shape() {
         let v =
-            qwen_dflash_done_value("r", 3, 1.5, 10, 2.0, 5.0, 1.2, 2.0, 0.5, 2, 0, "length", 99);
+            hipfire_generate::qwen::qwen_dflash_done_value("r", 3, 1.5, 10, 2.0, 5.0, 1.2, 2.0, 0.5, 2, 0, "length", 99);
         assert_eq!(v["type"], "done");
         assert_eq!(v["finish_reason"], "length");
         assert_eq!(v["attempt_id"], 99);
@@ -34300,7 +19119,7 @@ mod qwen_dflash_semantic_terminal_tests {
         // force-trigger), then forced[..n-1]. The trigger is never dropped.
         let trigger = 77u32;
         let forced = [10u32, 11, 12];
-        let tx = spec_forced_pending_seed_tx(trigger, &forced, true);
+        let tx = hipfire_generate::qwen::spec_forced_pending_seed_tx(trigger, &forced, true);
         assert_eq!(tx.commit[0], trigger, "trigger must lead the commit batch");
         assert_eq!(tx.commit, vec![77, 10, 11]);
         assert_eq!(tx.position_delta, forced.len());
@@ -34314,7 +19133,7 @@ mod qwen_dflash_semantic_terminal_tests {
         // Last forced token becomes the unprocessed pending seed and MUST NOT
         // also appear in commit (no double-forward).
         let forced = [20u32, 21, 22];
-        let tx = spec_forced_pending_seed_tx(5, &forced, true);
+        let tx = hipfire_generate::qwen::spec_forced_pending_seed_tx(5, &forced, true);
         assert_eq!(tx.pending_seed, 22);
         assert!(
             !tx.commit.contains(&22),
@@ -34323,7 +19142,7 @@ mod qwen_dflash_semantic_terminal_tests {
         );
         assert_eq!(tx.commit, vec![5, 20, 21]);
         // Single-token forced: commit is only the prior seed; forced[0] pending.
-        let one = spec_forced_pending_seed_tx(99, &[42], true);
+        let one = hipfire_generate::qwen::spec_forced_pending_seed_tx(99, &[42], true);
         assert_eq!(one.commit, vec![99]);
         assert_eq!(one.pending_seed, 42);
         assert!(!one.commit.contains(&42));
@@ -34333,7 +19152,7 @@ mod qwen_dflash_semantic_terminal_tests {
     #[test]
     fn terminal_pending_seed_flush_exactly_once() {
         let seed = 314u32;
-        let tx = spec_terminal_pending_seed_tx(seed);
+        let tx = hipfire_generate::qwen::spec_terminal_pending_seed_tx(seed);
         assert_eq!(tx.commit, vec![seed]);
         assert_eq!(tx.position_delta, 1);
         assert_eq!(tx.commit.len(), 1, "flush commits the seed once");
@@ -34346,17 +19165,17 @@ mod qwen_dflash_semantic_terminal_tests {
     fn forced_max_tokens_clip_hard_ceiling() {
         // generated already includes the trigger; no GPU for tokens past budget.
         let forced = [1u32, 2, 3, 4, 5];
-        assert_eq!(spec_forced_tokens_within_budget(8, 10, &forced), &[1, 2]);
+        assert_eq!(hipfire_generate::qwen::spec_forced_tokens_within_budget(8, 10, &forced), &[1, 2]);
         assert_eq!(
-            spec_forced_tokens_within_budget(10, 10, &forced),
+            hipfire_generate::qwen::spec_forced_tokens_within_budget(10, 10, &forced),
             &[] as &[u32]
         );
-        assert_eq!(spec_forced_tokens_within_budget(0, 3, &forced), &[1, 2, 3]);
-        assert_eq!(spec_forced_tokens_within_budget(9, 10, &forced), &[1]);
+        assert_eq!(hipfire_generate::qwen::spec_forced_tokens_within_budget(0, 3, &forced), &[1, 2, 3]);
+        assert_eq!(hipfire_generate::qwen::spec_forced_tokens_within_budget(9, 10, &forced), &[1]);
         // Composition: clip then build tx — only fitting tokens become pending.
-        let clipped = spec_forced_tokens_within_budget(7, 10, &forced);
+        let clipped = hipfire_generate::qwen::spec_forced_tokens_within_budget(7, 10, &forced);
         assert_eq!(clipped, &[1, 2, 3]);
-        let tx = spec_forced_pending_seed_tx(70, clipped, true);
+        let tx = hipfire_generate::qwen::spec_forced_pending_seed_tx(70, clipped, true);
         assert_eq!(tx.commit, vec![70, 1, 2]);
         assert_eq!(tx.pending_seed, 3);
         assert!(!tx.commit.contains(&4) && !tx.commit.contains(&5));
@@ -34365,23 +19184,23 @@ mod qwen_dflash_semantic_terminal_tests {
     #[test]
     fn cancellation_classification_forced_gpu_advance() {
         assert_eq!(
-            classify_forced_gpu_advance(false),
-            ForcedGpuAdvanceKind::Committed
+            hipfire_generate::qwen::classify_forced_gpu_advance(false),
+            hipfire_generate::qwen::ForcedGpuAdvanceKind::Committed
         );
         assert_eq!(
-            classify_forced_gpu_advance(true),
-            ForcedGpuAdvanceKind::Cancelled
+            hipfire_generate::qwen::classify_forced_gpu_advance(true),
+            hipfire_generate::qwen::ForcedGpuAdvanceKind::Cancelled
         );
         // Cancelled path must use aborted+done wire, never bake the forced token.
         // ErrorOnly is reserved for eviction failures (XOR below).
-        assert_ne!(SpecFailClosedWire::Cancelled, SpecFailClosedWire::ErrorOnly);
+        assert_ne!(hipfire_generate::qwen::SpecFailClosedWire::Cancelled, hipfire_generate::qwen::SpecFailClosedWire::ErrorOnly);
         set_active_attempt_id(55);
         let mut sink = Vec::new();
-        match classify_forced_gpu_advance(true) {
-            ForcedGpuAdvanceKind::Cancelled => {
+        match hipfire_generate::qwen::classify_forced_gpu_advance(true) {
+            hipfire_generate::qwen::ForcedGpuAdvanceKind::Cancelled => {
                 emit_qwen_ar_cancelled(&mut sink, "c-force", 4);
             }
-            ForcedGpuAdvanceKind::Committed => panic!("abort must classify Cancelled"),
+            hipfire_generate::qwen::ForcedGpuAdvanceKind::Committed => panic!("abort must classify Cancelled"),
         }
         let out = String::from_utf8(sink).unwrap();
         let lines = parse_jsonl(&out);
@@ -34399,13 +19218,13 @@ mod qwen_dflash_semantic_terminal_tests {
     #[test]
     fn eviction_error_terminal_exclusivity() {
         // maybe_evict / on_evict Err → ErrorOnly: one fail-closed error, no done.
-        assert_eq!(classify_evict_failure_wire(), SpecFailClosedWire::ErrorOnly);
+        assert_eq!(hipfire_generate::qwen::classify_evict_failure_wire(), hipfire_generate::qwen::SpecFailClosedWire::ErrorOnly);
         set_active_attempt_id(66);
         let mut sink = Vec::new();
         let ep = attest_epilogue(true);
-        match classify_evict_failure_wire() {
-            SpecFailClosedWire::ErrorOnly => {
-                emit_fail_closed_error(
+        match hipfire_generate::qwen::classify_evict_failure_wire() {
+            hipfire_generate::qwen::SpecFailClosedWire::ErrorOnly => {
+                hipfire_generate::common::emit_fail_closed_error(
                     &mut sink,
                     Some("ev1"),
                     "on_evict: synthetic retain failure",
@@ -34414,7 +19233,7 @@ mod qwen_dflash_semantic_terminal_tests {
                     &ep,
                 );
             }
-            SpecFailClosedWire::Cancelled => panic!("evict must not classify Cancelled"),
+            hipfire_generate::qwen::SpecFailClosedWire::Cancelled => panic!("evict must not classify Cancelled"),
         }
         let out = String::from_utf8(sink).unwrap();
         let lines = parse_jsonl(&out);
@@ -34436,49 +19255,49 @@ mod qwen_dflash_semantic_terminal_tests {
     #[test]
     fn strict_prefix_replay_capacity_rejection() {
         let prompt = vec![1u32, 2, 3];
-        let plan = spec_prefix_realign_plan(&prompt, 9, &[10, 11, 12]);
+        let plan = hipfire_generate::qwen::spec_prefix_realign_plan(&prompt, 9, &[10, 11, 12]);
         // plan.replay = [1,2,3,9,10,11], position=6, seed=12
         assert_eq!(plan.replay.len(), plan.position);
         assert_eq!(plan.seed_token, 12);
         assert!(!plan.replay.contains(&12));
 
         // Fits both caps (position must be strictly < caps — pending seed slot).
-        assert!(spec_prefix_realign_admit(&plan, 64, 64, 0, false).is_ok());
+        assert!(hipfire_generate::qwen::spec_prefix_realign_admit(&plan, 64, 64, 0, false).is_ok());
         // Boundary: position == cap leaves no legal write slot for pending seed.
-        let err_eq = spec_prefix_realign_admit(&plan, plan.position, 64, 0, false).unwrap_err();
+        let err_eq = hipfire_generate::qwen::spec_prefix_realign_admit(&plan, plan.position, 64, 0, false).unwrap_err();
         assert!(
             err_eq.contains("physical_cap"),
             "expected position==physical_cap reject, got {err_eq}"
         );
 
         // Physical capacity rejection — fail closed before reset/prefill.
-        let err_phys = spec_prefix_realign_admit(&plan, 5, 64, 0, false).unwrap_err();
+        let err_phys = hipfire_generate::qwen::spec_prefix_realign_admit(&plan, 5, 64, 0, false).unwrap_err();
         assert!(
             err_phys.contains("physical_cap"),
             "expected physical_cap reject, got {err_phys}"
         );
 
         // Speculator ctx capacity rejection.
-        let err_ctx = spec_prefix_realign_admit(&plan, 64, 4, 0, false).unwrap_err();
+        let err_ctx = hipfire_generate::qwen::spec_prefix_realign_admit(&plan, 64, 4, 0, false).unwrap_err();
         assert!(
             err_ctx.contains("ctx_capacity"),
             "expected ctx_capacity reject, got {err_ctx}"
         );
 
         // Broken invariant (replay/position mismatch) rejects even if caps large.
-        let broken = SpecPrefixRealignPlan {
+        let broken = hipfire_generate::qwen::SpecPrefixRealignPlan {
             replay: vec![1, 2],
             position: 5,
             seed_token: 9,
         };
-        let err_inv = spec_prefix_realign_admit(&broken, 100, 100, 0, false).unwrap_err();
+        let err_inv = hipfire_generate::qwen::spec_prefix_realign_admit(&broken, 100, 100, 0, false).unwrap_err();
         assert!(
             err_inv.contains("invariant") || err_inv.contains("pending"),
             "expected invariant reject, got {err_inv}"
         );
 
         // Compacted/eviction path still fails closed on oversize full-history replay.
-        let err_ev = spec_prefix_realign_admit(&plan, 5, 64, 3, true).unwrap_err();
+        let err_ev = hipfire_generate::qwen::spec_prefix_realign_admit(&plan, 5, 64, 3, true).unwrap_err();
         assert!(
             err_ev.contains("physical_cap") || err_ev.contains("compact"),
             "expected compacted oversize reject, got {err_ev}"
@@ -34488,7 +19307,7 @@ mod qwen_dflash_semantic_terminal_tests {
         set_active_attempt_id(71);
         let mut sink = Vec::new();
         let ep = attest_epilogue(true);
-        emit_fail_closed_error(
+        hipfire_generate::common::emit_fail_closed_error(
             &mut sink,
             Some("realign"),
             &err_phys,
@@ -34507,14 +19326,14 @@ mod qwen_dflash_semantic_terminal_tests {
 
     #[test]
     fn configured_jinja_render_fail_closed_policy() {
-        // Production generate_dflash configured-template Err path:
-        // emit_active_attempt_error(class=validation, retryable=false,
+        // Production hipfire_generate::qwen::generate_dflash configured-template Err path:
+        // hipfire_generate::dense::emit_active_attempt_error(class=validation, retryable=false,
         // rolled_back=false, message="DFlash jinja render: …") then handled=true.
         // Plain is not a silent fallback when a template is configured.
         set_active_attempt_id(88);
         let mut sink = Vec::new();
         let render_err = "undefined variable `messages`";
-        emit_active_attempt_error(
+        hipfire_generate::dense::emit_active_attempt_error(
             &mut sink,
             Some("j1"),
             &format!("DFlash jinja render: {render_err}"),
@@ -34566,9 +19385,9 @@ mod qwen_dflash_semantic_terminal_tests {
 
     #[test]
     fn rollback_attestation_false_on_sync_failure_surface() {
-        // No injectable mock GPU; production surface is RollbackEpilogue from
-        // fail_closed_device_sync on Err → rolled_back=false + context.
-        // emit_fail_closed_error must append context and claim rolled_back=false.
+        // No injectable mock GPU; production surface is hipfire_generate::common::RollbackEpilogue from
+        // hipfire_generate::common::fail_closed_device_sync on Err → rolled_back=false + context.
+        // hipfire_generate::common::emit_fail_closed_error must append context and claim rolled_back=false.
         set_active_attempt_id(17);
         let mut sink = Vec::new();
         let ep = attest_epilogue_with_context("device_synchronize failed: hipErrorUnknown");
@@ -34578,7 +19397,7 @@ mod qwen_dflash_semantic_terminal_tests {
             .as_ref()
             .unwrap()
             .contains("device_synchronize failed"));
-        emit_fail_closed_error(
+        hipfire_generate::common::emit_fail_closed_error(
             &mut sink,
             Some("rb1"),
             "forced-token advance: boom",
@@ -34600,7 +19419,7 @@ mod qwen_dflash_semantic_terminal_tests {
         // Attested success path still reports rolled_back=true without context suffix.
         let mut sink_ok = Vec::new();
         let ep_ok = attest_epilogue(true);
-        emit_fail_closed_error(
+        hipfire_generate::common::emit_fail_closed_error(
             &mut sink_ok,
             Some("rb2"),
             "spec_step: boom",
@@ -34623,7 +19442,7 @@ mod qwen_dflash_semantic_terminal_tests {
         let first = 50u32;
         // Consume force-trigger only from a wider speculative window.
         let step = SpecStep::new([60u32, 61, 62], 62, 3, 2);
-        let host = spec_host_advance_after_step(
+        let host = hipfire_generate::qwen::spec_host_advance_after_step(
             prompt.len(),
             0,
             vec![first],
@@ -34636,9 +19455,9 @@ mod qwen_dflash_semantic_terminal_tests {
 
         let forced_raw = [70u32, 71, 72, 73];
         // generated=1 (trigger counted); max_tokens=3 → room for 2 forced.
-        let forced = spec_forced_tokens_within_budget(host.generated, 3, &forced_raw);
+        let forced = hipfire_generate::qwen::spec_forced_tokens_within_budget(host.generated, 3, &forced_raw);
         assert_eq!(forced, &[70, 71]);
-        let ftx = spec_forced_pending_seed_tx(host.seed_token, forced, true);
+        let ftx = hipfire_generate::qwen::spec_forced_pending_seed_tx(host.seed_token, forced, true);
         assert_eq!(ftx.commit, vec![60, 70]); // trigger + forced[..n-1]
         assert_eq!(ftx.pending_seed, 71); // last forced pending once
         assert!(!ftx.commit.contains(&71));
@@ -34651,7 +19470,7 @@ mod qwen_dflash_semantic_terminal_tests {
         assert_eq!(generated, 3);
 
         // Safe terminal: flush final pending seed exactly once.
-        let term = spec_terminal_pending_seed_tx(ftx.pending_seed);
+        let term = hipfire_generate::qwen::spec_terminal_pending_seed_tx(ftx.pending_seed);
         assert_eq!(term.commit, vec![71]);
         assert_eq!(term.position_delta, 1);
         let final_pos = position + term.position_delta;
@@ -34661,23 +19480,23 @@ mod qwen_dflash_semantic_terminal_tests {
         // Realign plan after force path still keeps last raw as unwritten seed.
         let mut raw = vec![60u32];
         raw.extend_from_slice(forced);
-        let plan = spec_prefix_realign_plan(&prompt, first, &raw);
+        let plan = hipfire_generate::qwen::spec_prefix_realign_plan(&prompt, first, &raw);
         assert_eq!(plan.seed_token, 71);
         assert_ne!(plan.replay.last().copied(), Some(plan.seed_token));
-        assert!(spec_prefix_realign_admit(&plan, 1024, 1024, 0, false).is_ok());
+        assert!(hipfire_generate::qwen::spec_prefix_realign_admit(&plan, 1024, 1024, 0, false).is_ok());
     }
 
     // ── Task 4 Important vetoes (production seam pins) ─────────────────────
 
-    /// max_tokens==0 rejects at generate_spec entry via the same writer the
+    /// max_tokens==0 rejects at hipfire_generate::qwen::generate_spec entry via the same writer the
     /// production gate uses — before prefill/GPU/state/client mutation.
     /// Wire: one correlated validation error, rolled_back=false, no done/aborted.
     #[test]
     fn zero_budget_max_tokens_preflight_error_only_no_done() {
         set_active_attempt_id(101);
         let mut sink = Vec::new();
-        // Mirrors generate_spec entry gate (max_tokens == 0 → emit + return None).
-        emit_active_attempt_error(
+        // Mirrors hipfire_generate::qwen::generate_spec entry gate (max_tokens == 0 → emit + return None).
+        hipfire_generate::dense::emit_active_attempt_error(
             &mut sink,
             Some("zb0"),
             "max_tokens must be > 0",
@@ -34701,7 +19520,7 @@ mod qwen_dflash_semantic_terminal_tests {
         assert!(!out.contains(r#""type":"aborted""#));
         assert!(!out.contains(r#""type":"token""#));
         assert!(!out.contains(r#""type":"tool_calls""#));
-        // Wrapper contract: generate_spec returned None → no epilogue.
+        // Wrapper contract: hipfire_generate::qwen::generate_spec returned None → no epilogue.
         assert!(!qwen_dflash_epilogue_after_spec_run(false));
         set_active_attempt_id(0);
     }
@@ -34714,7 +19533,7 @@ mod qwen_dflash_semantic_terminal_tests {
         set_active_attempt_id(202);
         let mut sink_ok = Vec::new();
         let ep_ok = attest_epilogue(true);
-        emit_spec_cancel_after_rollback(&mut sink_ok, "c-ok", 7, &ep_ok);
+        hipfire_generate::common::emit_spec_cancel_after_rollback(&mut sink_ok, "c-ok", 7, &ep_ok);
         let out_ok = String::from_utf8(sink_ok).unwrap();
         let lines_ok = parse_jsonl(&out_ok);
         assert_eq!(
@@ -34738,7 +19557,7 @@ mod qwen_dflash_semantic_terminal_tests {
         let mut sink_bad = Vec::new();
         let ep_bad = attest_epilogue_with_context("device_synchronize failed: hipErrorUnknown");
         assert!(!ep_bad.rolled_back);
-        emit_spec_cancel_after_rollback(&mut sink_bad, "c-bad", 3, &ep_bad);
+        hipfire_generate::common::emit_spec_cancel_after_rollback(&mut sink_bad, "c-bad", 3, &ep_bad);
         let out_bad = String::from_utf8(sink_bad).unwrap();
         let lines_bad = parse_jsonl(&out_bad);
         assert_eq!(
@@ -34842,10 +19661,10 @@ mod qwen_dflash_semantic_terminal_tests {
         assert!(ctx.contains("ep_bind_thread"), "{ctx}");
         assert!(ctx.contains("device_synchronize failed"), "{ctx}");
 
-        // fail_closed_epilogue_after_sync: prior Err + sync Ok → unattested, sync ran.
-        let merged = fail_closed_epilogue_after_sync(
-            Err("reset_qwen35_recurrent: s_ef_residual memset: boom".into()),
-            RollbackEpilogue {
+        // hipfire_generate::common::fail_closed_epilogue_after_sync: prior Err + sync Ok → unattested, sync ran.
+        let merged = hipfire_generate::common::fail_closed_epilogue_after_sync(
+            Err("hipfire_generate::common::reset_qwen35_recurrent: s_ef_residual memset: boom".into()),
+            hipfire_generate::common::RollbackEpilogue {
                 rolled_back: true,
                 context: None,
             },
@@ -34862,9 +19681,9 @@ mod qwen_dflash_semantic_terminal_tests {
         );
 
         // prior Err + sync Err → both preserved.
-        let both = fail_closed_epilogue_after_sync(
+        let both = hipfire_generate::common::fail_closed_epilogue_after_sync(
             Err("ep rank0 bind_thread: bad".into()),
-            RollbackEpilogue {
+            hipfire_generate::common::RollbackEpilogue {
                 rolled_back: false,
                 context: Some("device_synchronize failed: hipErrorUnknown".into()),
             },
@@ -34877,7 +19696,7 @@ mod qwen_dflash_semantic_terminal_tests {
         // Qwen AR prefill abort terminal exclusivity (attested vs unattested).
         set_active_attempt_id(501);
         let mut sink = Vec::new();
-        emit_spec_cancel_after_rollback(&mut sink, "ar-prefill", 0, &attest_epilogue(true));
+        hipfire_generate::common::emit_spec_cancel_after_rollback(&mut sink, "ar-prefill", 0, &attest_epilogue(true));
         let lines = parse_jsonl(&String::from_utf8(sink).unwrap());
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0]["type"], "aborted");
@@ -34888,7 +19707,7 @@ mod qwen_dflash_semantic_terminal_tests {
 
         set_active_attempt_id(502);
         let mut sink = Vec::new();
-        emit_spec_cancel_after_rollback(
+        hipfire_generate::common::emit_spec_cancel_after_rollback(
             &mut sink,
             "ar-prefill-bad",
             0,
@@ -34906,7 +19725,7 @@ mod qwen_dflash_semantic_terminal_tests {
         // Qwen AR mid-decode abort terminal exclusivity.
         set_active_attempt_id(503);
         let mut sink = Vec::new();
-        emit_spec_cancel_after_rollback(&mut sink, "ar-decode", 5, &attest_epilogue(true));
+        hipfire_generate::common::emit_spec_cancel_after_rollback(&mut sink, "ar-decode", 5, &attest_epilogue(true));
         let lines = parse_jsonl(&String::from_utf8(sink).unwrap());
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0]["type"], "aborted");
@@ -34915,7 +19734,7 @@ mod qwen_dflash_semantic_terminal_tests {
 
         set_active_attempt_id(504);
         let mut sink = Vec::new();
-        emit_spec_cancel_after_rollback(
+        hipfire_generate::common::emit_spec_cancel_after_rollback(
             &mut sink,
             "ar-decode-bad",
             5,
@@ -34938,14 +19757,14 @@ mod qwen_dflash_semantic_terminal_tests {
     }
 
     /// Eviction-enabled missing optional kv_cache_mut is ErrorOnly (not panic):
-    /// classify_evict_failure_wire → emit_fail_closed_error with the production
+    /// hipfire_generate::qwen::classify_evict_failure_wire → hipfire_generate::common::emit_fail_closed_error with the production
     /// post-prefill / per-cycle messages; no done/aborted/calls/cache.
     #[test]
     fn missing_optional_kv_cache_mut_is_error_only_not_panic() {
-        assert_eq!(classify_evict_failure_wire(), SpecFailClosedWire::ErrorOnly);
+        assert_eq!(hipfire_generate::qwen::classify_evict_failure_wire(), hipfire_generate::qwen::SpecFailClosedWire::ErrorOnly);
         assert_ne!(
-            SpecFailClosedWire::Cancelled,
-            SpecFailClosedWire::ErrorOnly,
+            hipfire_generate::qwen::SpecFailClosedWire::Cancelled,
+            hipfire_generate::qwen::SpecFailClosedWire::ErrorOnly,
             "missing KV hook must never classify as Cancelled"
         );
 
@@ -34956,14 +19775,14 @@ mod qwen_dflash_semantic_terminal_tests {
             set_active_attempt_id(attempt);
             let mut sink = Vec::new();
             // Production seam: classify first, then fail-closed writer (same as
-            // generate_spec match slot.kv_cache_mut() { None => ... }).
-            let _ = classify_evict_failure_wire();
+            // hipfire_generate::qwen::generate_spec match slot.kv_cache_mut() { None => ... }).
+            let _ = hipfire_generate::qwen::classify_evict_failure_wire();
             let ep = attest_epilogue(true);
-            match classify_evict_failure_wire() {
-                SpecFailClosedWire::ErrorOnly => {
-                    emit_fail_closed_error(&mut sink, Some(id), message, "validation", false, &ep);
+            match hipfire_generate::qwen::classify_evict_failure_wire() {
+                hipfire_generate::qwen::SpecFailClosedWire::ErrorOnly => {
+                    hipfire_generate::common::emit_fail_closed_error(&mut sink, Some(id), message, "validation", false, &ep);
                 }
-                SpecFailClosedWire::Cancelled => {
+                hipfire_generate::qwen::SpecFailClosedWire::Cancelled => {
                     panic!("kv_cache_mut missing must not classify Cancelled")
                 }
             }
@@ -34980,7 +19799,7 @@ mod qwen_dflash_semantic_terminal_tests {
             assert!(!out.contains(r#""type":"done""#));
             assert!(!out.contains(r#""type":"aborted""#));
             assert!(!out.contains(r#""type":"tool_calls""#));
-            // generate_spec returns None → wrapper skips cache store / epilogue.
+            // hipfire_generate::qwen::generate_spec returns None → wrapper skips cache store / epilogue.
             assert!(!qwen_dflash_epilogue_after_spec_run(false));
         }
 
@@ -34989,7 +19808,7 @@ mod qwen_dflash_semantic_terminal_tests {
         set_active_attempt_id(303);
         let mut sink = Vec::new();
         let ep = attest_epilogue_with_context("device_synchronize failed: test");
-        emit_fail_closed_error(
+        hipfire_generate::common::emit_fail_closed_error(
             &mut sink,
             Some("kv-ua"),
             "kv_cache_mut missing (post-prefill)",
@@ -35010,15 +19829,15 @@ mod qwen_dflash_semantic_terminal_tests {
 
     // ── Remaining Important Task 4 vetoes (wrapper / legacy / rewind) ──
 
-    /// generate_dflash max_tokens==0: emit_active_attempt_error then return true
+    /// hipfire_generate::qwen::generate_dflash max_tokens==0: hipfire_generate::dense::emit_active_attempt_error then return true
     /// (handled) before Jinja/render/set_sampling/gen_start. Same wire as the
-    /// inner generate_spec defense; wrapper must not fall through to AR.
+    /// inner hipfire_generate::qwen::generate_spec defense; wrapper must not fall through to AR.
     #[test]
     fn generate_dflash_zero_budget_preflight_handled_error_only() {
         set_active_attempt_id(401);
         let mut sink = Vec::new();
-        // Mirrors generate_dflash entry (max_tokens == 0 → emit + return true).
-        emit_active_attempt_error(
+        // Mirrors hipfire_generate::qwen::generate_dflash entry (max_tokens == 0 → emit + return true).
+        hipfire_generate::dense::emit_active_attempt_error(
             &mut sink,
             Some("df-zb0"),
             "max_tokens must be > 0",
@@ -35047,14 +19866,14 @@ mod qwen_dflash_semantic_terminal_tests {
         set_active_attempt_id(0);
     }
 
-    /// generate_deepseek4_spec max_tokens==0: same emit policy, plain return
+    /// hipfire_generate::dense::generate_deepseek4_spec max_tokens==0: same emit policy, plain return
     /// (unit fn) before DSML render / decode-cache teardown / set_sampling.
     #[test]
     fn generate_deepseek4_spec_zero_budget_preflight_error_only() {
         set_active_attempt_id(402);
         let mut sink = Vec::new();
-        // Mirrors generate_deepseek4_spec entry (max_tokens == 0 → emit + return).
-        emit_active_attempt_error(
+        // Mirrors hipfire_generate::dense::generate_deepseek4_spec entry (max_tokens == 0 → emit + return).
+        hipfire_generate::dense::emit_active_attempt_error(
             &mut sink,
             Some("ds4-zb0"),
             "max_tokens must be > 0",
@@ -35081,8 +19900,8 @@ mod qwen_dflash_semantic_terminal_tests {
         set_active_attempt_id(0);
     }
 
-    /// Legacy non-qwen generate_dflash else-branch: fail_closed_rollback.is_some()
-    /// || grammar_violated → emit_fail_closed_error only; no extract/release/
+    /// Legacy non-qwen hipfire_generate::qwen::generate_dflash else-branch: fail_closed_rollback.is_some()
+    /// || grammar_violated → hipfire_generate::common::emit_fail_closed_error only; no extract/release/
     /// cache store / done. Message classified by grammar / open_think /
     /// malformed_protocol / generic.
     #[test]
@@ -35146,7 +19965,7 @@ mod qwen_dflash_semantic_terminal_tests {
             set_active_attempt_id(500 + i as u64);
             let mut sink = Vec::new();
             let ep = attest_epilogue(true);
-            emit_fail_closed_error(
+            hipfire_generate::common::emit_fail_closed_error(
                 &mut sink,
                 Some("leg-fc"),
                 expected_msg,
@@ -35166,14 +19985,14 @@ mod qwen_dflash_semantic_terminal_tests {
             assert!(!out.contains(r#""type":"done""#), "case {i}");
             assert!(!out.contains(r#""type":"aborted""#), "case {i}");
             assert!(!out.contains(r#""type":"tool_calls""#), "case {i}");
-            // Early return true from generate_dflash — no whole-output extract path.
+            // Early return true from hipfire_generate::qwen::generate_dflash — no whole-output extract path.
             let early_return_handled = true;
             assert!(early_return_handled);
         }
         set_active_attempt_id(0);
     }
 
-    /// generate_spec resume_from: on spec.rewind_to Err, host seq_pos /
+    /// hipfire_generate::qwen::generate_spec resume_from: on spec.rewind_to Err, host seq_pos /
     /// conversation_tokens must NOT be truncated to ckpt first. Fail-closed
     /// live rollback + one correlated "rewind_to: …" error; return None skips
     /// wrapper epilogue (no done / calls / cache).
@@ -35198,7 +20017,7 @@ mod qwen_dflash_semantic_terminal_tests {
             seq_pos = ckpt;
             conversation_tokens.truncate(ckpt);
         }
-        // Cursors still at pre-rewind values until production_fail_closed_rollback_live.
+        // Cursors still at pre-rewind values until hipfire_generate::common::production_fail_closed_rollback_live.
         assert_eq!(
             seq_pos, seq_before,
             "must not truncate seq_pos to ckpt on Err"
@@ -35209,7 +20028,7 @@ mod qwen_dflash_semantic_terminal_tests {
         );
         assert_ne!(seq_pos, ckpt);
 
-        // Live rollback zeroes host (GPU-less stand-in for production_fail_closed_rollback_live).
+        // Live rollback zeroes host (GPU-less stand-in for hipfire_generate::common::production_fail_closed_rollback_live).
         seq_pos = 0;
         conversation_tokens.clear();
         assert_eq!(seq_pos, 0);
@@ -35218,7 +20037,7 @@ mod qwen_dflash_semantic_terminal_tests {
         set_active_attempt_id(601);
         let mut sink = Vec::new();
         let ep = attest_epilogue(true);
-        emit_fail_closed_error(&mut sink, Some("rw-err"), &msg, "validation", false, &ep);
+        hipfire_generate::common::emit_fail_closed_error(&mut sink, Some("rw-err"), &msg, "validation", false, &ep);
         let out = String::from_utf8(sink).unwrap();
         let lines = parse_jsonl(&out);
         assert_eq!(lines.len(), 1, "one correlated rewind error: {lines:?}");
@@ -35236,14 +20055,14 @@ mod qwen_dflash_semantic_terminal_tests {
         assert!(!out.contains(r#""type":"done""#));
         assert!(!out.contains(r#""type":"aborted""#));
         assert!(!out.contains(r#""type":"tool_calls""#));
-        // generate_spec returns None → wrapper skips epilogue/cache.
+        // hipfire_generate::qwen::generate_spec returns None → wrapper skips epilogue/cache.
         assert!(!qwen_dflash_epilogue_after_spec_run(false));
 
         // Unattested sync path still error-only with context suffix.
         set_active_attempt_id(602);
         let mut sink_ua = Vec::new();
         let ep_ua = attest_epilogue_with_context("device_synchronize failed: hipErrorUnknown");
-        emit_fail_closed_error(
+        hipfire_generate::common::emit_fail_closed_error(
             &mut sink_ua,
             Some("rw-ua"),
             &msg,
@@ -35264,12 +20083,12 @@ mod qwen_dflash_semantic_terminal_tests {
 
     // ── Task 4 definitive terminal-edge blockers ──────────────────────────
 
-    /// Legacy non-qwen generate_dflash else-branch: length still emits
+    /// Legacy non-qwen hipfire_generate::qwen::generate_dflash else-branch: length still emits
     /// finish_reason=length but never releases held tool calls or stores
     /// asst_turn_cache (partial/truncated turns are unsafe to prime).
     #[test]
     fn legacy_length_terminal_skips_assistant_cache_and_tool_release() {
-        // Production gates (generate_dflash qwen_semantic_v2=false branch):
+        // Production gates (hipfire_generate::qwen::generate_dflash qwen_semantic_v2=false branch):
         //   hit_length_cap = run.generated >= max_tokens
         //   stage_terminal_tool_calls on safe tool terminals before handshake
         //   asst_turn_cache.insert only when Commit && !hit_length_cap && !cached_seq.is_empty()
@@ -35293,11 +20112,11 @@ mod qwen_dflash_semantic_terminal_tests {
         let mut sink: std::collections::HashMap<u64, Vec<u32>> = std::collections::HashMap::new();
         if !hit_length_cap && !cached_seq.is_empty() {
             let decoded_full = "partial answer";
-            let stripped = strip_think_for_fingerprint(decoded_full);
+            let stripped = hipfire_generate::common::strip_think_for_fingerprint(decoded_full);
             let emit_text =
                 hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned();
             let emit_tool_calls = extract_tool_calls_from_text(decoded_full);
-            let fp = asst_turn_fingerprint(&emit_text, &emit_tool_calls);
+            let fp = hipfire_generate::common::asst_turn_fingerprint(&emit_text, &emit_tool_calls);
             sink.insert(fp, cached_seq.clone());
         }
         assert!(
@@ -35320,7 +20139,7 @@ mod qwen_dflash_semantic_terminal_tests {
         assert!(!hit_safe && finish.tool_calls > 0);
         let mut sink_safe = std::collections::HashMap::new();
         if !hit_safe && !cached_seq.is_empty() {
-            let fp = asst_turn_fingerprint("ok", &[]);
+            let fp = hipfire_generate::common::asst_turn_fingerprint("ok", &[]);
             sink_safe.insert(fp, cached_seq.clone());
         }
         assert_eq!(sink_safe.len(), 1, "safe stop still stores");
@@ -35339,34 +20158,34 @@ mod qwen_dflash_semantic_terminal_tests {
 
         // Empty take_forced ⇒ Skipped (no GPU path); loop may proceed.
         assert!(matches!(
-            // Pure stand-in for apply_spec_forced_pending_seed empty input.
+            // Pure stand-in for hipfire_generate::qwen::apply_spec_forced_pending_seed empty input.
             {
                 let forced_all: &[u32] = &[];
                 if forced_all.is_empty() {
-                    SpecForcedApplyResult::Skipped
+                    hipfire_generate::qwen::SpecForcedApplyResult::Skipped
                 } else {
-                    SpecForcedApplyResult::Applied
+                    hipfire_generate::qwen::SpecForcedApplyResult::Applied
                 }
             },
-            SpecForcedApplyResult::Skipped
+            hipfire_generate::qwen::SpecForcedApplyResult::Skipped
         ));
 
         // Hard budget clip: generated already 1, max_tokens=1 → room 0.
-        let clipped = spec_forced_tokens_within_budget(generated, max_tokens, &forced_begin);
+        let clipped = hipfire_generate::qwen::spec_forced_tokens_within_budget(generated, max_tokens, &forced_begin);
         assert!(
             clipped.is_empty(),
             "max_tokens=1 after first token must clip all forced (no extra step budget)"
         );
-        // apply_spec_forced_pending_seed returns Skipped on empty clip — while
+        // hipfire_generate::qwen::apply_spec_forced_pending_seed returns Skipped on empty clip — while
         // condition `generated < max_tokens` is already false, so no spec.step.
         assert!(!(!false /*first_token_is_eos*/ && generated < max_tokens));
 
         // Room for forced (max_tokens=3, generated=1): same tx as mid-window.
         generated = 1;
         let max2 = 3usize;
-        let forced = spec_forced_tokens_within_budget(generated, max2, &forced_begin);
+        let forced = hipfire_generate::qwen::spec_forced_tokens_within_budget(generated, max2, &forced_begin);
         assert_eq!(forced, &[60u32, 61]);
-        let tx = spec_forced_pending_seed_tx(seed_token, forced, true);
+        let tx = hipfire_generate::qwen::spec_forced_pending_seed_tx(seed_token, forced, true);
         assert_eq!(tx.commit, vec![50, 60], "trigger retained; forced[..n-1]");
         assert_eq!(tx.pending_seed, 61, "last forced pending once");
         assert!(!tx.commit.contains(&61));
@@ -35389,14 +20208,14 @@ mod qwen_dflash_semantic_terminal_tests {
         let _ = enter_spec_step;
         assert_eq!(phase, "begin_forced_applied");
 
-        // classify_forced_gpu_advance still exclusive cancel vs commit.
+        // hipfire_generate::qwen::classify_forced_gpu_advance still exclusive cancel vs commit.
         assert!(matches!(
-            classify_forced_gpu_advance(true),
-            ForcedGpuAdvanceKind::Cancelled
+            hipfire_generate::qwen::classify_forced_gpu_advance(true),
+            hipfire_generate::qwen::ForcedGpuAdvanceKind::Cancelled
         ));
         assert!(matches!(
-            classify_forced_gpu_advance(false),
-            ForcedGpuAdvanceKind::Committed
+            hipfire_generate::qwen::classify_forced_gpu_advance(false),
+            hipfire_generate::qwen::ForcedGpuAdvanceKind::Committed
         ));
     }
 
@@ -35427,7 +20246,7 @@ mod qwen_dflash_semantic_terminal_tests {
             Some(StopReason::StopSequence),
             "begin must surface StopSequence for first-token stop match"
         );
-        // generate_spec: first_token_is_eos = first_begin.stop.is_some()
+        // hipfire_generate::qwen::generate_spec: first_token_is_eos = first_begin.stop.is_some()
         let first_token_is_eos = first_begin.stop.is_some();
         assert!(first_token_is_eos);
         // while !first_token_is_eos && generated < max_tokens { spec.step ... }
@@ -35442,7 +20261,7 @@ mod qwen_dflash_semantic_terminal_tests {
 
         // Event-bearing first token still counts (Qwen always commits).
         assert!(
-            spec_outcome_seed_committable(&first_begin),
+            hipfire_generate::qwen::spec_outcome_seed_committable(&first_begin),
             "stop still commits the raw first token"
         );
         assert!(first_begin
@@ -35465,7 +20284,7 @@ mod qwen_dflash_semantic_terminal_tests {
         // Single forced + non-committable seed: commit is empty (seed omitted,
         // forced[0] becomes pending only) — no GPU for a lone seed replace.
         let seed = 7u32; // DS4-style empty-event EOS seed
-        let one = spec_forced_pending_seed_tx(seed, &[42], false);
+        let one = hipfire_generate::qwen::spec_forced_pending_seed_tx(seed, &[42], false);
         assert!(
             one.commit.is_empty(),
             "non-committable seed + single forced must not GPU-commit: {:?}",
@@ -35476,7 +20295,7 @@ mod qwen_dflash_semantic_terminal_tests {
         assert!(!one.commit.contains(&seed));
 
         // Multi forced + non-committable: commit is forced[..n-1] only.
-        let multi = spec_forced_pending_seed_tx(seed, &[10, 11, 12], false);
+        let multi = hipfire_generate::qwen::spec_forced_pending_seed_tx(seed, &[10, 11, 12], false);
         assert_eq!(
             multi.commit,
             vec![10, 11],
@@ -35488,7 +20307,7 @@ mod qwen_dflash_semantic_terminal_tests {
         assert!(!multi.commit.contains(&12), "last forced stays pending");
 
         // Contrast: same inputs with committable seed retain the trigger.
-        let keep = spec_forced_pending_seed_tx(seed, &[10, 11, 12], true);
+        let keep = hipfire_generate::qwen::spec_forced_pending_seed_tx(seed, &[10, 11, 12], true);
         assert_eq!(keep.commit, vec![seed, 10, 11]);
         assert_eq!(keep.pending_seed, 12);
     }
@@ -35527,7 +20346,7 @@ mod qwen_dflash_semantic_terminal_tests {
         assert!(!warm.is_empty());
         let _ = emit.begin(warm[0]);
 
-        // Production staging loop (apply_spec_forced_pending_seed):
+        // Production staging loop (hipfire_generate::qwen::apply_spec_forced_pending_seed):
         let forced_all = [stop_tok, later_tok, later_tok.wrapping_add(1)];
         let mut staged: Vec<(u32, hipfire_runtime::spec::EmitOutcome)> =
             Vec::with_capacity(forced_all.len());
@@ -35559,7 +20378,7 @@ mod qwen_dflash_semantic_terminal_tests {
         // Commit uses the kept prefix only (incoming seed was committable).
         let incoming_seed = warm[0];
         let incoming_committable = true;
-        let tx = spec_forced_pending_seed_tx(incoming_seed, &kept, incoming_committable);
+        let tx = hipfire_generate::qwen::spec_forced_pending_seed_tx(incoming_seed, &kept, incoming_committable);
         // Single kept forced: commit = [seed], pending = stop_tok.
         assert_eq!(tx.commit, vec![incoming_seed]);
         assert_eq!(tx.pending_seed, stop_tok);
@@ -35568,12 +20387,12 @@ mod qwen_dflash_semantic_terminal_tests {
 
         // Apply result maps to Stopped(reason) — not Applied.
         let apply = match stop_reason {
-            Some(reason) => SpecForcedApplyResult::Stopped(reason),
-            None => SpecForcedApplyResult::Applied,
+            Some(reason) => hipfire_generate::qwen::SpecForcedApplyResult::Stopped(reason),
+            None => hipfire_generate::qwen::SpecForcedApplyResult::Applied,
         };
         assert_eq!(
             apply,
-            SpecForcedApplyResult::Stopped(StopReason::StopSequence)
+            hipfire_generate::qwen::SpecForcedApplyResult::Stopped(StopReason::StopSequence)
         );
 
         // Render-after-commit contract: client events from staged outcomes are
@@ -35603,20 +20422,20 @@ mod qwen_dflash_semantic_terminal_tests {
     /// force first_token_is_eos / hit_eos, and skip later force + all spec.step.
     #[test]
     fn begin_and_mid_stopped_skips_later_force_and_spec_step() {
-        // --- begin path (mirrors generate_spec after emit.begin) ---
+        // --- begin path (mirrors hipfire_generate::qwen::generate_spec after emit.begin) ---
         let reason = StopReason::StopSequence;
         let mut semantic_stop: Option<StopReason> = None;
         let mut first_token_is_eos = false;
-        let apply = SpecForcedApplyResult::Stopped(reason);
+        let apply = hipfire_generate::qwen::SpecForcedApplyResult::Stopped(reason);
         match apply {
-            SpecForcedApplyResult::Terminal => panic!("not under test"),
-            SpecForcedApplyResult::Stopped(r) => {
-                if semantic_stop.is_none() && spec_stop_is_semantic(Some(r)) {
+            hipfire_generate::qwen::SpecForcedApplyResult::Terminal => panic!("not under test"),
+            hipfire_generate::qwen::SpecForcedApplyResult::Stopped(r) => {
+                if semantic_stop.is_none() && hipfire_generate::qwen::spec_stop_is_semantic(Some(r)) {
                     semantic_stop = Some(r);
                 }
                 first_token_is_eos = true;
             }
-            SpecForcedApplyResult::Applied | SpecForcedApplyResult::Skipped => {
+            hipfire_generate::qwen::SpecForcedApplyResult::Applied | hipfire_generate::qwen::SpecForcedApplyResult::Skipped => {
                 panic!("expected Stopped")
             }
         }
@@ -35638,15 +20457,15 @@ mod qwen_dflash_semantic_terminal_tests {
             "begin Stopped must skip every subsequent force and spec.step"
         );
 
-        // --- mid-window path (mirrors generate_spec forced_after match) ---
+        // --- mid-window path (mirrors hipfire_generate::qwen::generate_spec forced_after match) ---
         let mut semantic_stop_mid: Option<StopReason> = None;
         let mut hit_eos = false;
         let mut think_cap_hit = false;
-        let mid = SpecForcedApplyResult::Stopped(StopReason::StopSequence);
+        let mid = hipfire_generate::qwen::SpecForcedApplyResult::Stopped(StopReason::StopSequence);
         match mid {
-            SpecForcedApplyResult::Terminal => panic!("not under test"),
-            SpecForcedApplyResult::Stopped(r) => {
-                if semantic_stop_mid.is_none() && spec_stop_is_semantic(Some(r)) {
+            hipfire_generate::qwen::SpecForcedApplyResult::Terminal => panic!("not under test"),
+            hipfire_generate::qwen::SpecForcedApplyResult::Stopped(r) => {
+                if semantic_stop_mid.is_none() && hipfire_generate::qwen::spec_stop_is_semantic(Some(r)) {
                     semantic_stop_mid = Some(r);
                 }
                 match r {
@@ -35656,7 +20475,7 @@ mod qwen_dflash_semantic_terminal_tests {
                     }
                 }
             }
-            SpecForcedApplyResult::Applied | SpecForcedApplyResult::Skipped => {
+            hipfire_generate::qwen::SpecForcedApplyResult::Applied | hipfire_generate::qwen::SpecForcedApplyResult::Skipped => {
                 panic!("expected Stopped")
             }
         }
@@ -35675,10 +20494,10 @@ mod qwen_dflash_semantic_terminal_tests {
             "mid Stopped must not apply a later forced suffix"
         );
 
-        // SpecRun carries semantic_stop into the wrapper independently of EOT.
+        // hipfire_generate::common::SpecRun carries semantic_stop into the wrapper independently of EOT.
         let run_semantic = semantic_stop_mid;
         assert!(run_semantic.is_some());
-        assert!(spec_stop_is_semantic(run_semantic));
+        assert!(hipfire_generate::qwen::spec_stop_is_semantic(run_semantic));
     }
 
     /// First-token user stop at max_tokens=1 must classify as stop (not length)
@@ -35705,21 +20524,21 @@ mod qwen_dflash_semantic_terminal_tests {
         let first_begin = emit.begin(first);
         assert_eq!(first_begin.stop, Some(StopReason::StopSequence));
 
-        // generate_spec sticky capture (begin path).
-        let mut semantic_stop: Option<StopReason> = if spec_stop_is_semantic(first_begin.stop) {
+        // hipfire_generate::qwen::generate_spec sticky capture (begin path).
+        let mut semantic_stop: Option<StopReason> = if hipfire_generate::qwen::spec_stop_is_semantic(first_begin.stop) {
             first_begin.stop
         } else {
             None
         };
         assert_eq!(semantic_stop, Some(StopReason::StopSequence));
-        assert!(spec_stop_is_semantic(semantic_stop));
+        assert!(hipfire_generate::qwen::spec_stop_is_semantic(semantic_stop));
 
         // Budget spent on the first (and only) token; no decoded_eot required.
         let generated = 1usize;
         let max_tokens = 1usize;
         let decoded_eot = false; // user stop may not set EOT
         let hit_length =
-            qwen_dflash_hit_length_cap(generated, max_tokens, decoded_eot, semantic_stop.is_some());
+            hipfire_generate::common::qwen_dflash_hit_length_cap(generated, max_tokens, decoded_eot, semantic_stop.is_some());
         assert!(
             !hit_length,
             "semantic StopSequence at cap must not classify as length"
@@ -35727,9 +20546,9 @@ mod qwen_dflash_semantic_terminal_tests {
 
         // Wrapper wire: stop, not length.
         let fin = summary_stop(&first_text);
-        let term = qwen_dflash_wire_terminal(&fin, hit_length, false, &first_text, false);
+        let term = hipfire_generate::qwen::qwen_dflash_wire_terminal(&fin, hit_length, false, &first_text, false);
         match &term {
-            QwenDflashWireTerminal::Done {
+            hipfire_generate::qwen::QwenDflashWireTerminal::Done {
                 finish_reason,
                 store_cache,
                 release_tool_calls,
@@ -35743,12 +20562,12 @@ mod qwen_dflash_semantic_terminal_tests {
         }
 
         // Contrast: same numbers without semantic_stop → length.
-        assert!(qwen_dflash_hit_length_cap(1, 1, false, false));
+        assert!(hipfire_generate::common::qwen_dflash_hit_length_cap(1, 1, false, false));
         let _ = &mut semantic_stop;
     }
 
     /// Held tool_calls + semantic stop at the budget boundary must finish as
-    /// tool_calls (not length). finish_summary_held_tool_calls feeds the wire.
+    /// tool_calls (not length). hipfire_generate::common::finish_summary_held_tool_calls feeds the wire.
     #[test]
     fn held_tool_calls_with_semantic_stop_at_cap_is_tool_calls_not_length() {
         let calls = vec![ToolCall {
@@ -35758,7 +20577,7 @@ mod qwen_dflash_semantic_terminal_tests {
             rendered_body: None,
         }];
         let fin = summary_tool_calls(calls.clone());
-        let held = finish_summary_held_tool_calls(&fin);
+        let held = hipfire_generate::common::finish_summary_held_tool_calls(&fin);
         assert_eq!(held.len(), 1);
         assert_eq!(held[0].name, "get_weather");
 
@@ -35767,14 +20586,14 @@ mod qwen_dflash_semantic_terminal_tests {
         let max_tokens = 8usize;
         let decoded_eot = false;
         let semantic_stop = Some(StopReason::StopSequence);
-        assert!(spec_stop_is_semantic(semantic_stop));
+        assert!(hipfire_generate::qwen::spec_stop_is_semantic(semantic_stop));
         let hit_length =
-            qwen_dflash_hit_length_cap(generated, max_tokens, decoded_eot, semantic_stop.is_some());
+            hipfire_generate::common::qwen_dflash_hit_length_cap(generated, max_tokens, decoded_eot, semantic_stop.is_some());
         assert!(!hit_length, "semantic stop must beat length at cap");
 
-        let term = qwen_dflash_wire_terminal(&fin, hit_length, false, "Sure.", false);
+        let term = hipfire_generate::qwen::qwen_dflash_wire_terminal(&fin, hit_length, false, "Sure.", false);
         match &term {
-            QwenDflashWireTerminal::Done {
+            hipfire_generate::qwen::QwenDflashWireTerminal::Done {
                 finish_reason,
                 release_tool_calls,
                 store_cache,
@@ -35791,10 +20610,10 @@ mod qwen_dflash_semantic_terminal_tests {
         }
 
         // Without semantic_stop the same finish would be suppressed as length.
-        assert!(qwen_dflash_hit_length_cap(8, 8, false, false));
-        let length_term = qwen_dflash_wire_terminal(&fin, true, false, "Sure.", false);
+        assert!(hipfire_generate::common::qwen_dflash_hit_length_cap(8, 8, false, false));
+        let length_term = hipfire_generate::qwen::qwen_dflash_wire_terminal(&fin, true, false, "Sure.", false);
         match &length_term {
-            QwenDflashWireTerminal::Done {
+            hipfire_generate::qwen::QwenDflashWireTerminal::Done {
                 finish_reason,
                 release_tool_calls,
                 wire_tool_calls,
@@ -35819,18 +20638,18 @@ mod qwen_dflash_semantic_terminal_tests {
         let commit_len = 4usize; // post_position == physical_cap
         assert_eq!(position.saturating_add(commit_len), physical_cap);
         assert!(
-            !spec_forced_commit_admits(position, commit_len, physical_cap, false),
+            !hipfire_generate::qwen::spec_forced_commit_admits(position, commit_len, physical_cap, false),
             "no-eviction exact-cap must reject: pending seed needs a legal slot"
         );
         // One slot under cap still fits (post == cap-1).
-        assert!(spec_forced_commit_admits(
+        assert!(hipfire_generate::qwen::spec_forced_commit_admits(
             position,
             commit_len.saturating_sub(1),
             physical_cap,
             false
         ));
         // Over-cap also rejects.
-        assert!(!spec_forced_commit_admits(
+        assert!(!hipfire_generate::qwen::spec_forced_commit_admits(
             position,
             commit_len.saturating_add(1),
             physical_cap,
@@ -35847,7 +20666,7 @@ mod qwen_dflash_semantic_terminal_tests {
         let over = 5usize; // post_position = 17 > cap
         assert!(position.saturating_add(over) > physical_cap);
         assert!(
-            !spec_forced_commit_admits(position, over, physical_cap, true),
+            !hipfire_generate::qwen::spec_forced_commit_admits(position, over, physical_cap, true),
             "eviction must not admit over-cap commits"
         );
 
@@ -35859,7 +20678,7 @@ mod qwen_dflash_semantic_terminal_tests {
             Rendered,
             ErrorOnly,
         }
-        let admitted = spec_forced_commit_admits(position, over, physical_cap, true);
+        let admitted = hipfire_generate::qwen::spec_forced_commit_admits(position, over, physical_cap, true);
         let mut phase = Phase::Staged;
         let mut rendered = 0usize;
         if !admitted {
@@ -35878,7 +20697,7 @@ mod qwen_dflash_semantic_terminal_tests {
         assert_ne!(phase, Phase::GpuCommitted);
         assert_ne!(phase, Phase::Rendered);
         // Same wire class as maybe_evict / on_evict failures.
-        assert_eq!(classify_evict_failure_wire(), SpecFailClosedWire::ErrorOnly);
+        assert_eq!(hipfire_generate::qwen::classify_evict_failure_wire(), hipfire_generate::qwen::SpecFailClosedWire::ErrorOnly);
     }
 
     /// Eviction exact-cap admits only because post-commit maybe_evict+on_evict
@@ -35891,11 +20710,11 @@ mod qwen_dflash_semantic_terminal_tests {
         assert_eq!(position.saturating_add(commit_len), physical_cap);
 
         assert!(
-            spec_forced_commit_admits(position, commit_len, physical_cap, true),
+            hipfire_generate::qwen::spec_forced_commit_admits(position, commit_len, physical_cap, true),
             "eviction may admit exact-cap"
         );
         // Contrast: same numbers without eviction reject.
-        assert!(!spec_forced_commit_admits(
+        assert!(!hipfire_generate::qwen::spec_forced_commit_admits(
             position,
             commit_len,
             physical_cap,
@@ -35914,7 +20733,7 @@ mod qwen_dflash_semantic_terminal_tests {
             ErrorOnly,
         }
         let mut steps: Vec<Step> = Vec::new();
-        let admitted = spec_forced_commit_admits(position, commit_len, physical_cap, true);
+        let admitted = hipfire_generate::qwen::spec_forced_commit_admits(position, commit_len, physical_cap, true);
         assert!(admitted);
         steps.push(Step::Admit);
         steps.push(Step::GpuCommit);
@@ -35978,21 +20797,21 @@ mod qwen_dflash_semantic_terminal_tests {
         let position = 10usize;
         let commit_len = 3usize;
         assert!(position.saturating_add(commit_len) < physical_cap);
-        assert!(spec_forced_commit_admits(
+        assert!(hipfire_generate::qwen::spec_forced_commit_admits(
             position,
             commit_len,
             physical_cap,
             false
         ));
-        assert!(spec_forced_commit_admits(
+        assert!(hipfire_generate::qwen::spec_forced_commit_admits(
             position,
             commit_len,
             physical_cap,
             true
         ));
         // Empty commit (seed-only replace) is always under threshold.
-        assert!(spec_forced_commit_admits(position, 0, physical_cap, false));
-        assert!(spec_forced_commit_admits(position, 0, physical_cap, true));
+        assert!(hipfire_generate::qwen::spec_forced_commit_admits(position, 0, physical_cap, false));
+        assert!(hipfire_generate::qwen::spec_forced_commit_admits(position, 0, physical_cap, true));
     }
 
     /// Admission uses the actual GPU commit slice (`tx.commit.len()`), never the
@@ -36006,20 +20825,20 @@ mod qwen_dflash_semantic_terminal_tests {
         let forced = [10u32, 11, 12]; // forced.len() == 3
 
         // Committable: commit = [seed, 10, 11] → len 3; post = 11 > cap.
-        let keep = spec_forced_pending_seed_tx(seed, &forced, true);
+        let keep = hipfire_generate::qwen::spec_forced_pending_seed_tx(seed, &forced, true);
         assert_eq!(keep.commit.len(), 3);
         assert_eq!(keep.commit.len(), keep.position_delta);
         assert!(
-            !spec_forced_commit_admits(position, keep.commit.len(), physical_cap, false),
+            !hipfire_generate::qwen::spec_forced_commit_admits(position, keep.commit.len(), physical_cap, false),
             "committable commit_len=3 at pos=8 must reject under no-evict"
         );
         assert!(
-            !spec_forced_commit_admits(position, keep.commit.len(), physical_cap, true),
+            !hipfire_generate::qwen::spec_forced_commit_admits(position, keep.commit.len(), physical_cap, true),
             "committable commit_len=3 at pos=8 is over-cap even with eviction"
         );
 
         // Non-committable: commit = [10, 11] → len 2 (seed omitted); post = 10.
-        let omit = spec_forced_pending_seed_tx(seed, &forced, false);
+        let omit = hipfire_generate::qwen::spec_forced_pending_seed_tx(seed, &forced, false);
         assert_eq!(omit.commit, vec![10, 11]);
         assert_eq!(omit.commit.len(), 2);
         assert_eq!(omit.position_delta, omit.commit.len());
@@ -36032,21 +20851,21 @@ mod qwen_dflash_semantic_terminal_tests {
         // exact-cap under eviction and rejects under no-evict (needs seed slot).
         assert_eq!(position.saturating_add(omit.commit.len()), physical_cap);
         assert!(
-            !spec_forced_commit_admits(position, omit.commit.len(), physical_cap, false),
+            !hipfire_generate::qwen::spec_forced_commit_admits(position, omit.commit.len(), physical_cap, false),
             "no-evict exact-cap still needs a pending-seed slot"
         );
         assert!(
-            spec_forced_commit_admits(position, omit.commit.len(), physical_cap, true),
+            hipfire_generate::qwen::spec_forced_commit_admits(position, omit.commit.len(), physical_cap, true),
             "eviction admits exact-cap on the actual (shorter) commit slice"
         );
         // Guard: if a caller mistakenly passed forced.len(), both modes reject.
-        assert!(!spec_forced_commit_admits(
+        assert!(!hipfire_generate::qwen::spec_forced_commit_admits(
             position,
             forced.len(),
             physical_cap,
             true
         ));
-        assert!(!spec_forced_commit_admits(
+        assert!(!hipfire_generate::qwen::spec_forced_commit_admits(
             position,
             forced.len(),
             physical_cap,
@@ -36055,14 +20874,14 @@ mod qwen_dflash_semantic_terminal_tests {
 
         // Single forced + non-committable: empty commit — no GPU write.
         // Admission still uses commit_len=0 (not forced.len()==1).
-        let one = spec_forced_pending_seed_tx(seed, &[42], false);
+        let one = hipfire_generate::qwen::spec_forced_pending_seed_tx(seed, &[42], false);
         assert!(one.commit.is_empty());
         assert_ne!(
             one.commit.len(),
             1,
             "must not treat forced count as commit_len"
         );
-        assert!(spec_forced_commit_admits(
+        assert!(hipfire_generate::qwen::spec_forced_commit_admits(
             position,
             one.commit.len(),
             physical_cap,
@@ -36070,13 +20889,13 @@ mod qwen_dflash_semantic_terminal_tests {
         ));
         // At physical_cap with zero-length commit: no-evict still needs a free
         // pending-seed slot (post == cap rejects); eviction admits exact-cap.
-        assert!(!spec_forced_commit_admits(
+        assert!(!hipfire_generate::qwen::spec_forced_commit_admits(
             physical_cap,
             one.commit.len(),
             physical_cap,
             false
         ));
-        assert!(spec_forced_commit_admits(
+        assert!(hipfire_generate::qwen::spec_forced_commit_admits(
             physical_cap,
             one.commit.len(),
             physical_cap,
@@ -36086,7 +20905,7 @@ mod qwen_dflash_semantic_terminal_tests {
 
     #[test]
     fn dflash_client_commit_preserves_release_and_store() {
-        let e = qwen_client_commit_effects(ClientTerminalDecision::Commit, true, true);
+        let e = hipfire_generate::qwen::qwen_client_commit_effects(ClientTerminalDecision::Commit, true, true);
         assert!(e.release_tool_calls && e.store_cache && e.emit_done);
         // Successful Done classify → intended flags gate release/store.
         let tc = ToolCall {
@@ -36095,7 +20914,7 @@ mod qwen_dflash_semantic_terminal_tests {
             arguments: r#"{"path":"/x"}"#.into(),
             rendered_body: None,
         };
-        let term = qwen_dflash_wire_terminal(
+        let term = hipfire_generate::qwen::qwen_dflash_wire_terminal(
             &summary_tool_calls(vec![tc.clone()]),
             false,
             false,
@@ -36103,13 +20922,13 @@ mod qwen_dflash_semantic_terminal_tests {
             false,
         );
         match &term {
-            QwenDflashWireTerminal::Done {
+            hipfire_generate::qwen::QwenDflashWireTerminal::Done {
                 release_tool_calls,
                 store_cache,
                 wire_tool_calls,
                 ..
             } => {
-                let effects = qwen_client_commit_effects(
+                let effects = hipfire_generate::qwen::qwen_client_commit_effects(
                     ClientTerminalDecision::Commit,
                     *release_tool_calls && !wire_tool_calls.is_empty(),
                     *store_cache,
@@ -36117,7 +20936,7 @@ mod qwen_dflash_semantic_terminal_tests {
                 assert!(effects.release_tool_calls);
                 assert!(effects.store_cache);
                 assert!(effects.emit_done);
-                let mut action = qwen_dflash_cache_action(&term);
+                let mut action = hipfire_generate::qwen::qwen_dflash_cache_action(&term);
                 action.store = effects.store_cache && action.store;
                 assert!(action.store);
             }
@@ -36135,8 +20954,8 @@ mod qwen_dflash_semantic_terminal_tests {
             rendered_body: None,
         };
         let term =
-            qwen_dflash_wire_terminal(&summary_tool_calls(vec![tc]), false, false, "Sure.", false);
-        let QwenDflashWireTerminal::Done {
+            hipfire_generate::qwen::qwen_dflash_wire_terminal(&summary_tool_calls(vec![tc]), false, false, "Sure.", false);
+        let hipfire_generate::qwen::QwenDflashWireTerminal::Done {
             release_tool_calls,
             store_cache,
             wire_tool_calls,
@@ -36145,7 +20964,7 @@ mod qwen_dflash_semantic_terminal_tests {
         else {
             panic!("expected Done");
         };
-        let effects = qwen_client_commit_effects(
+        let effects = hipfire_generate::qwen::qwen_client_commit_effects(
             ClientTerminalDecision::Abort,
             *release_tool_calls && !wire_tool_calls.is_empty(),
             *store_cache,
@@ -36156,17 +20975,17 @@ mod qwen_dflash_semantic_terminal_tests {
 
         let mut sink = Vec::new();
         // No tool release on Abort.
-        let mut action = qwen_dflash_cache_action(&term);
+        let mut action = hipfire_generate::qwen::qwen_dflash_cache_action(&term);
         action.store = effects.store_cache && action.store;
         let mut stored = false;
-        let _ = qwen_dflash_apply_cache_action(|_fp, _seq| stored = true, &action, vec![1, 2, 3]);
+        let _ = hipfire_generate::qwen::qwen_dflash_apply_cache_action(|_fp, _seq| stored = true, &action, vec![1, 2, 3]);
         assert!(!stored);
 
-        let ep = RollbackEpilogue {
+        let ep = hipfire_generate::common::RollbackEpilogue {
             rolled_back: true,
             context: None,
         };
-        emit_spec_cancel_after_rollback(&mut sink, "df-abort", 7, &ep);
+        hipfire_generate::common::emit_spec_cancel_after_rollback(&mut sink, "df-abort", 7, &ep);
         let out = String::from_utf8_lossy(&sink);
         assert!(!out.contains("\"type\":\"tool_calls\""));
         assert!(out.contains("\"type\":\"aborted\""));
@@ -36898,19 +21717,19 @@ mod glimmer_channel_recorder_tests {
 
     #[test]
     fn splits_self_then_user() {
-        let mut rec = GlimmerChannelRecorder::new();
+        let mut rec = hipfire_generate::dense::GlimmerChannelRecorder::new();
         // Production shape: `add_generation_prompt` already emitted `<|start|>assistant`,
         // so the model's FIRST emission is just ` to=self` — no `<|start|>`, no `assistant`.
         rec.push(100, " to=self");
-        rec.push(GLIMMER_MESSAGE_ID, "<|message|>");
+        rec.push(hipfire_generate::dense::GLIMMER_MESSAGE_ID, "<|message|>");
         rec.push(101, "reasoning body");
         rec.push(102, " more");
-        rec.push(GLIMMER_EOM_ID, "<|eom|>");
-        rec.push(GLIMMER_START_ID, "<|start|>");
+        rec.push(hipfire_generate::dense::GLIMMER_EOM_ID, "<|eom|>");
+        rec.push(hipfire_generate::dense::GLIMMER_START_ID, "<|start|>");
         rec.push(103, "assistant to=user");
-        rec.push(GLIMMER_MESSAGE_ID, "<|message|>");
+        rec.push(hipfire_generate::dense::GLIMMER_MESSAGE_ID, "<|message|>");
         rec.push(104, "answer body");
-        rec.push(GLIMMER_EOT_ID, "<|eot|>");
+        rec.push(hipfire_generate::dense::GLIMMER_EOT_ID, "<|eot|>");
         let turn = rec.into_cached_turn(&[]).expect("should succeed");
         assert!(turn.reasoning.is_some());
         assert_eq!(turn.reasoning.unwrap().text, "reasoning body more");
@@ -36922,16 +21741,16 @@ mod glimmer_channel_recorder_tests {
     #[test]
     fn terminal_open_user_body_is_accepted() {
         // GAP3: self closed by eom, user body left OPEN (no <|eot|> fed) must be accepted.
-        let mut rec = GlimmerChannelRecorder::new();
+        let mut rec = hipfire_generate::dense::GlimmerChannelRecorder::new();
         // Production shape: `add_generation_prompt` already emitted `<|start|>assistant`,
         // so the model's FIRST emission is just ` to=self` — no `<|start|>`, no `assistant`.
         rec.push(100, " to=self");
-        rec.push(GLIMMER_MESSAGE_ID, "<|message|>");
+        rec.push(hipfire_generate::dense::GLIMMER_MESSAGE_ID, "<|message|>");
         rec.push(101, "reasoning body");
-        rec.push(GLIMMER_EOM_ID, "<|eom|>");
-        rec.push(GLIMMER_START_ID, "<|start|>");
+        rec.push(hipfire_generate::dense::GLIMMER_EOM_ID, "<|eom|>");
+        rec.push(hipfire_generate::dense::GLIMMER_START_ID, "<|start|>");
         rec.push(103, "assistant to=user");
-        rec.push(GLIMMER_MESSAGE_ID, "<|message|>");
+        rec.push(hipfire_generate::dense::GLIMMER_MESSAGE_ID, "<|message|>");
         rec.push(104, "answer body");
         rec.push(105, " more");
         // Intentionally leave user body OPEN — no EOT, decode stopped on <|eot|> without feeding it.
@@ -36947,21 +21766,21 @@ mod glimmer_channel_recorder_tests {
 
     #[test]
     fn splits_self_then_tool() {
-        let mut rec = GlimmerChannelRecorder::new();
+        let mut rec = hipfire_generate::dense::GlimmerChannelRecorder::new();
         // Production shape: `add_generation_prompt` already emitted `<|start|>assistant`,
         // so the model's FIRST emission is just ` to=self` — no `<|start|>`, no `assistant`.
         rec.push(100, " to=self");
-        rec.push(GLIMMER_MESSAGE_ID, "<|message|>");
+        rec.push(hipfire_generate::dense::GLIMMER_MESSAGE_ID, "<|message|>");
         rec.push(101, "reasoning");
-        rec.push(GLIMMER_EOM_ID, "<|eom|>");
-        rec.push(GLIMMER_START_ID, "<|start|>");
+        rec.push(hipfire_generate::dense::GLIMMER_EOM_ID, "<|eom|>");
+        rec.push(hipfire_generate::dense::GLIMMER_START_ID, "<|start|>");
         rec.push(102, "assistant to=weather.get_forecast");
-        rec.push(GLIMMER_MESSAGE_ID, "<|message|>");
+        rec.push(hipfire_generate::dense::GLIMMER_MESSAGE_ID, "<|message|>");
         let atem = "<atem:function_calls>\n<atem:invoke name=\"weather.get_forecast\">\n<atem:parameter name=\"location\">Paris</atem:parameter>\n</atem:invoke>\n</atem:function_calls>";
         for (i, c) in atem.chars().enumerate() {
             rec.push(200 + i as u32, &c.to_string());
         }
-        rec.push(GLIMMER_EOT_ID, "<|eot|>");
+        rec.push(hipfire_generate::dense::GLIMMER_EOT_ID, "<|eot|>");
         let tool_call = hipfire_runtime::prompt_frame::ToolCall {
             id: Some("call_0".into()),
             name: "weather.get_forecast".into(),
@@ -36977,28 +21796,28 @@ mod glimmer_channel_recorder_tests {
 
     #[test]
     fn refuses_forced_reasoning_close() {
-        let mut rec = GlimmerChannelRecorder::new();
+        let mut rec = hipfire_generate::dense::GlimmerChannelRecorder::new();
         // Production shape: `add_generation_prompt` already emitted `<|start|>assistant`,
         // so the model's FIRST emission is just ` to=self` — no `<|start|>`, no `assistant`.
         rec.push(100, " to=self");
-        rec.push(GLIMMER_MESSAGE_ID, "<|message|>");
+        rec.push(hipfire_generate::dense::GLIMMER_MESSAGE_ID, "<|message|>");
         rec.push(101, "reasoning");
         rec.mark_forced_reasoning_close();
-        rec.push(GLIMMER_EOM_ID, "<|eom|>");
+        rec.push(hipfire_generate::dense::GLIMMER_EOM_ID, "<|eom|>");
         let res = rec.into_cached_turn(&[]);
-        assert_eq!(res.unwrap_err(), GlimmerRecordRefusal::ForcedReasoningClose);
+        assert_eq!(res.unwrap_err(), hipfire_generate::dense::GlimmerRecordRefusal::ForcedReasoningClose);
     }
 
     #[test]
     fn refuses_empty_self_body() {
-        let mut rec = GlimmerChannelRecorder::new();
+        let mut rec = hipfire_generate::dense::GlimmerChannelRecorder::new();
         // Production shape: `add_generation_prompt` already emitted `<|start|>assistant`,
         // so the model's FIRST emission is just ` to=self` — no `<|start|>`, no `assistant`.
         rec.push(100, " to=self");
-        rec.push(GLIMMER_MESSAGE_ID, "<|message|>");
-        rec.push(GLIMMER_EOM_ID, "<|eom|>");
+        rec.push(hipfire_generate::dense::GLIMMER_MESSAGE_ID, "<|message|>");
+        rec.push(hipfire_generate::dense::GLIMMER_EOM_ID, "<|eom|>");
         let res = rec.into_cached_turn(&[]);
-        assert_eq!(res.unwrap_err(), GlimmerRecordRefusal::EmptySelfBody);
+        assert_eq!(res.unwrap_err(), hipfire_generate::dense::GlimmerRecordRefusal::EmptySelfBody);
     }
 
     #[test]
@@ -37007,14 +21826,14 @@ mod glimmer_channel_recorder_tests {
         // `Reasoning strength:`, so the model always opens a `to=self` channel. A low think
         // budget caps the span, it does not remove it — the turn must still be recordable, or
         // the prefix cache would go permanently inert whenever thinking was "off".
-        let mut rec = GlimmerChannelRecorder::new();
+        let mut rec = hipfire_generate::dense::GlimmerChannelRecorder::new();
         rec.push(100, " to=self");
-        rec.push(GLIMMER_MESSAGE_ID, "<|message|>");
+        rec.push(hipfire_generate::dense::GLIMMER_MESSAGE_ID, "<|message|>");
         rec.push(101, "reasoning");
-        rec.push(GLIMMER_EOM_ID, "<|eom|>");
-        rec.push(GLIMMER_START_ID, "<|start|>");
+        rec.push(hipfire_generate::dense::GLIMMER_EOM_ID, "<|eom|>");
+        rec.push(hipfire_generate::dense::GLIMMER_START_ID, "<|start|>");
         rec.push(103, "assistant to=user");
-        rec.push(GLIMMER_MESSAGE_ID, "<|message|>");
+        rec.push(hipfire_generate::dense::GLIMMER_MESSAGE_ID, "<|message|>");
         rec.push(104, "answer");
         let turn = rec
             .into_cached_turn(&[])
@@ -37025,28 +21844,28 @@ mod glimmer_channel_recorder_tests {
 
     #[test]
     fn store_cached_turn_self_then_user_inserts_both_channels() {
-        let mut rec = GlimmerChannelRecorder::new();
+        let mut rec = hipfire_generate::dense::GlimmerChannelRecorder::new();
         // Production shape: `add_generation_prompt` already emitted `<|start|>assistant`,
         // so the model's FIRST emission is just ` to=self` — no `<|start|>`, no `assistant`.
         rec.push(100, " to=self");
-        rec.push(GLIMMER_MESSAGE_ID, "<|message|>");
+        rec.push(hipfire_generate::dense::GLIMMER_MESSAGE_ID, "<|message|>");
         rec.push(101, "reasoning body");
         rec.push(102, " more");
-        rec.push(GLIMMER_EOM_ID, "<|eom|>");
-        rec.push(GLIMMER_START_ID, "<|start|>");
+        rec.push(hipfire_generate::dense::GLIMMER_EOM_ID, "<|eom|>");
+        rec.push(hipfire_generate::dense::GLIMMER_START_ID, "<|start|>");
         rec.push(103, "assistant to=user");
-        rec.push(GLIMMER_MESSAGE_ID, "<|message|>");
+        rec.push(hipfire_generate::dense::GLIMMER_MESSAGE_ID, "<|message|>");
         rec.push(104, "answer body");
         rec.push(105, "!");
-        rec.push(GLIMMER_EOT_ID, "<|eot|>");
+        rec.push(hipfire_generate::dense::GLIMMER_EOT_ID, "<|eot|>");
         let mut cache = hipfire_loader::AsstTurnCache::new_from_env();
         cache.clear();
-        let ok = glimmer_store_cached_turn(&mut cache, rec, &[], 0);
+        let ok = hipfire_generate::dense::glimmer_store_cached_turn(&mut cache, rec, &[], 0);
         assert!(ok, "store should succeed");
         let normalized =
             hipfire_runtime::tokenizer::maybe_normalize_prompt("answer body!").into_owned();
-        let fp_raw = asst_turn_fingerprint(&normalized, &[]);
-        let fp = glimmer_turn_key(fp_raw, 0);
+        let fp_raw = hipfire_generate::common::asst_turn_fingerprint(&normalized, &[]);
+        let fp = hipfire_generate::dense::glimmer_turn_key(fp_raw, 0);
         let turn = cache
             .get(&fp)
             .expect("cache should contain inserted turn")
@@ -37061,7 +21880,7 @@ mod glimmer_channel_recorder_tests {
     #[test]
     fn tool_channel_does_not_emit_visible_token() {
         // GAP6: to=weather.get_forecast envelope must not produce visible Token events.
-        let mut router = GlimmerHarmonyRouter::new(0);
+        let mut router = hipfire_generate::dense::GlimmerHarmonyRouter::new(0);
         // Feed header + atem body split across fragments to exercise suffix hold logic
         let header = "<|start|>assistant to=weather.get_forecast<|message|>";
         let atem = "<atem:function_calls>\n<atem:invoke name=\"weather.get_forecast\">\n<atem:parameter name=\"location\">Paris</atem:parameter>\n</atem:invoke>\n</atem:function_calls>";
@@ -37072,14 +21891,14 @@ mod glimmer_channel_recorder_tests {
         let tool_text: String = events
             .iter()
             .filter_map(|e| match e {
-                GlimmerEmit::Tool(s) => Some(s.as_str()),
+                hipfire_generate::dense::GlimmerEmit::Tool(s) => Some(s.as_str()),
                 _ => None,
             })
             .collect();
         let token_text: String = events
             .iter()
             .filter_map(|e| match e {
-                GlimmerEmit::Token(s) => Some(s.as_str()),
+                hipfire_generate::dense::GlimmerEmit::Token(s) => Some(s.as_str()),
                 _ => None,
             })
             .collect();
@@ -37093,7 +21912,7 @@ mod glimmer_channel_recorder_tests {
             "tool envelope should produce Tool events"
         );
         // Accumulated tool body should parse to one call
-        let calls = parse_glimmer_atem(&tool_text).expect("parse should succeed");
+        let calls = hipfire_generate::dense::parse_glimmer_atem(&tool_text).expect("parse should succeed");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "weather.get_forecast");
         assert_eq!(
@@ -37110,7 +21929,7 @@ mod glimmer_atem_parser_tests {
     #[test]
     fn parses_representative_block() {
         let body = "<atem:function_calls>\n<atem:invoke name=\"weather.get_forecast\">\n<atem:parameter name=\"location\">Paris</atem:parameter>\n<atem:parameter name=\"options\">{\"units\":\"celsius\",\"days\":[1,2]}</atem:parameter>\n<atem:parameter name=\"include_alerts\">true</atem:parameter>\n<atem:parameter name=\"fallback\">null</atem:parameter>\n</atem:invoke>\n</atem:function_calls>";
-        let calls = parse_glimmer_atem(body).expect("parse should succeed");
+        let calls = hipfire_generate::dense::parse_glimmer_atem(body).expect("parse should succeed");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "weather.get_forecast");
         assert_eq!(
@@ -37141,12 +21960,12 @@ mod glimmer_atem_parser_tests {
             }
             let (left, right) = body.split_at(split);
             let combined = left.to_string() + right;
-            let calls = parse_glimmer_atem(&combined).expect("should parse after split");
+            let calls = hipfire_generate::dense::parse_glimmer_atem(&combined).expect("should parse after split");
             assert_eq!(calls.len(), 1);
             assert_eq!(calls[0].name, "test.func");
         }
         let body2 = "<atem:function_calls>\n<atem:invoke name=\"test.func\">\n<atem:parameter name=\"msg\">hello \u{1F30D}</atem:parameter>\n</atem:invoke>\n</atem:function_calls>";
-        let calls2 = parse_glimmer_atem(body2).expect("should parse multibyte");
+        let calls2 = hipfire_generate::dense::parse_glimmer_atem(body2).expect("should parse multibyte");
         assert_eq!(
             calls2[0].arguments["msg"],
             serde_json::Value::String("hello \u{1F30D}".into())
@@ -37156,7 +21975,7 @@ mod glimmer_atem_parser_tests {
     #[test]
     fn parses_multiple_invokes() {
         let body = "<atem:function_calls>\n<atem:invoke name=\"func1\">\n<atem:parameter name=\"a\">1</atem:parameter>\n</atem:invoke>\n</atem:function_calls>\n<atem:function_calls>\n<atem:invoke name=\"func2\">\n<atem:parameter name=\"b\">2</atem:parameter>\n</atem:invoke>\n</atem:function_calls>";
-        let calls = parse_glimmer_atem(body).expect("multiple");
+        let calls = hipfire_generate::dense::parse_glimmer_atem(body).expect("multiple");
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].name, "func1");
         assert_eq!(calls[1].name, "func2");
@@ -37175,26 +21994,26 @@ mod glimmer_reconcile_tests {
         use hipfire_runtime::prompt_frame::ThinkMode;
 
         // Explicit effort wins over the budget.
-        assert_eq!(glimmer_reasoning_strength(ThinkMode::High, 1), "high");
-        assert_eq!(glimmer_reasoning_strength(ThinkMode::Max, 1), "xhigh");
+        assert_eq!(hipfire_generate::dense::glimmer_reasoning_strength(ThinkMode::High, 1), "high");
+        assert_eq!(hipfire_generate::dense::glimmer_reasoning_strength(ThinkMode::Max, 1), "xhigh");
 
         // `from_str` folds "medium" into `Low`, so the budget supplies the middle tier.
-        assert_eq!(glimmer_reasoning_strength(ThinkMode::Low, 512), "low");
-        assert_eq!(glimmer_reasoning_strength(ThinkMode::Low, 2048), "medium");
-        assert_eq!(glimmer_reasoning_strength(ThinkMode::Low, 8192), "high");
-        assert_eq!(glimmer_reasoning_strength(ThinkMode::Low, 16384), "xhigh");
+        assert_eq!(hipfire_generate::dense::glimmer_reasoning_strength(ThinkMode::Low, 512), "low");
+        assert_eq!(hipfire_generate::dense::glimmer_reasoning_strength(ThinkMode::Low, 2048), "medium");
+        assert_eq!(hipfire_generate::dense::glimmer_reasoning_strength(ThinkMode::Low, 8192), "high");
+        assert_eq!(hipfire_generate::dense::glimmer_reasoning_strength(ThinkMode::Low, 16384), "xhigh");
 
         // Glimmer has no non-thinking mode: the engine's `1` sentinel is the MINIMUM
         // strength, never an off switch, and uncapped takes the template's own default.
-        assert_eq!(glimmer_reasoning_strength(ThinkMode::NonThink, 1), "low");
-        assert_eq!(glimmer_reasoning_strength(ThinkMode::NonThink, 0), "high");
+        assert_eq!(hipfire_generate::dense::glimmer_reasoning_strength(ThinkMode::NonThink, 1), "low");
+        assert_eq!(hipfire_generate::dense::glimmer_reasoning_strength(ThinkMode::NonThink, 0), "high");
 
         // Every card level is producible.
         let produced: std::collections::BTreeSet<&str> = [
-            glimmer_reasoning_strength(ThinkMode::Low, 512),
-            glimmer_reasoning_strength(ThinkMode::Low, 2048),
-            glimmer_reasoning_strength(ThinkMode::High, 0),
-            glimmer_reasoning_strength(ThinkMode::Max, 0),
+            hipfire_generate::dense::glimmer_reasoning_strength(ThinkMode::Low, 512),
+            hipfire_generate::dense::glimmer_reasoning_strength(ThinkMode::Low, 2048),
+            hipfire_generate::dense::glimmer_reasoning_strength(ThinkMode::High, 0),
+            hipfire_generate::dense::glimmer_reasoning_strength(ThinkMode::Max, 0),
         ]
         .into_iter()
         .collect();
@@ -37205,46 +22024,46 @@ mod glimmer_reconcile_tests {
     }
     #[test]
     fn mirror_action_aligned() {
-        assert_eq!(glimmer_mirror_action(5, 5), GlimmerMirrorAction::Aligned);
-        assert_eq!(glimmer_mirror_action(0, 0), GlimmerMirrorAction::Aligned);
+        assert_eq!(hipfire_generate::dense::glimmer_mirror_action(5, 5), hipfire_generate::dense::GlimmerMirrorAction::Aligned);
+        assert_eq!(hipfire_generate::dense::glimmer_mirror_action(0, 0), hipfire_generate::dense::GlimmerMirrorAction::Aligned);
     }
     #[test]
     fn mirror_action_truncate() {
         assert_eq!(
-            glimmer_mirror_action(5, 3),
-            GlimmerMirrorAction::TruncateMirror(3)
+            hipfire_generate::dense::glimmer_mirror_action(5, 3),
+            hipfire_generate::dense::GlimmerMirrorAction::TruncateMirror(3)
         );
         assert_eq!(
-            glimmer_mirror_action(10, 0),
-            GlimmerMirrorAction::TruncateMirror(0)
+            hipfire_generate::dense::glimmer_mirror_action(10, 0),
+            hipfire_generate::dense::GlimmerMirrorAction::TruncateMirror(0)
         );
     }
     #[test]
     fn mirror_action_rollback() {
         assert_eq!(
-            glimmer_mirror_action(3, 5),
-            GlimmerMirrorAction::RollbackCursor(3)
+            hipfire_generate::dense::glimmer_mirror_action(3, 5),
+            hipfire_generate::dense::GlimmerMirrorAction::RollbackCursor(3)
         );
         assert_eq!(
-            glimmer_mirror_action(0, 5),
-            GlimmerMirrorAction::RollbackCursor(0)
+            hipfire_generate::dense::glimmer_mirror_action(0, 5),
+            hipfire_generate::dense::GlimmerMirrorAction::RollbackCursor(0)
         );
     }
     // glimmer_hidden_keep_len removed with device-capture session API cutover.
     #[test]
     fn glimmer_turn_key_ordinal_salts() {
-        let fp = asst_turn_fingerprint("Done.", &[]);
-        let k0 = glimmer_turn_key(fp, 0);
-        let k1 = glimmer_turn_key(fp, 1);
-        let k2 = glimmer_turn_key(fp, 2);
+        let fp = hipfire_generate::common::asst_turn_fingerprint("Done.", &[]);
+        let k0 = hipfire_generate::dense::glimmer_turn_key(fp, 0);
+        let k1 = hipfire_generate::dense::glimmer_turn_key(fp, 1);
+        let k2 = hipfire_generate::dense::glimmer_turn_key(fp, 2);
         assert_ne!(
             k0, k1,
             "identical content at different ordinals must have different keys"
         );
         assert_ne!(k1, k2);
         assert_ne!(k0, k2);
-        assert_eq!(k0, glimmer_turn_key(fp, 0));
-        assert_eq!(k1, glimmer_turn_key(fp, 1));
+        assert_eq!(k0, hipfire_generate::dense::glimmer_turn_key(fp, 0));
+        assert_eq!(k1, hipfire_generate::dense::glimmer_turn_key(fp, 1));
     }
 }
 #[cfg(test)]
@@ -37254,14 +22073,14 @@ mod glimmer_history_prep_tests {
     #[test]
     fn normalize_arguments_object() {
         let v = serde_json::json!({"a":1});
-        assert_eq!(normalize_glimmer_tool_arguments(&v).unwrap(), v);
+        assert_eq!(hipfire_generate::dense::normalize_glimmer_tool_arguments(&v).unwrap(), v);
     }
 
     #[test]
     fn normalize_arguments_null() {
         let v = serde_json::Value::Null;
         assert_eq!(
-            normalize_glimmer_tool_arguments(&v).unwrap(),
+            hipfire_generate::dense::normalize_glimmer_tool_arguments(&v).unwrap(),
             serde_json::json!({})
         );
     }
@@ -37270,7 +22089,7 @@ mod glimmer_history_prep_tests {
     fn normalize_arguments_string_object() {
         let v = serde_json::Value::String("{\"a\":1}".into());
         assert_eq!(
-            normalize_glimmer_tool_arguments(&v).unwrap(),
+            hipfire_generate::dense::normalize_glimmer_tool_arguments(&v).unwrap(),
             serde_json::json!({"a":1})
         );
     }
@@ -37278,13 +22097,13 @@ mod glimmer_history_prep_tests {
     #[test]
     fn normalize_arguments_string_invalid() {
         let v = serde_json::Value::String("not json".into());
-        assert!(normalize_glimmer_tool_arguments(&v).is_err());
+        assert!(hipfire_generate::dense::normalize_glimmer_tool_arguments(&v).is_err());
     }
 
     #[test]
     fn normalize_arguments_string_non_object() {
         let v = serde_json::Value::String("[1,2]".into());
-        assert!(normalize_glimmer_tool_arguments(&v).is_err());
+        assert!(hipfire_generate::dense::normalize_glimmer_tool_arguments(&v).is_err());
     }
 
     #[test]
@@ -37314,7 +22133,7 @@ mod glimmer_history_prep_tests {
             tool_call_id: Some("call_0".into()),
             tool_plan: String::new(),
         };
-        let out = prepare_glimmer_onyx_history(&[assistant, tool]).expect("should succeed");
+        let out = hipfire_generate::dense::prepare_glimmer_onyx_history(&[assistant, tool]).expect("should succeed");
         assert_eq!(out[1].rendered_name, Some("weather.get_forecast".into()));
     }
 }
@@ -37324,14 +22143,14 @@ mod glimmer_history_prep_tests {
 #[cfg(test)]
 mod glimmer_profit_guard_tests {
     use super::{
-        glimmer_profit_ledger_after_bonus_decode, glimmer_profit_ledger_post_window,
-        glimmer_profit_ledger_route_prediction, GlimmerProfitGuardStatus, GlimmerProfitProbeKind,
-        GlimmerSpecProfitGuard,
+        hipfire_generate::dense::glimmer_profit_ledger_after_bonus_decode, hipfire_generate::dense::glimmer_profit_ledger_post_window,
+        hipfire_generate::dense::glimmer_profit_ledger_route_prediction, hipfire_generate::dense::GlimmerProfitGuardStatus, hipfire_generate::dense::GlimmerProfitProbeKind,
+        hipfire_generate::dense::GlimmerSpecProfitGuard,
     };
 
     /// Drive four identical measured windows that sum to (s_total, p_total), then
     /// apply ar_probe_ns. Returns the guard after observe_probe.
-    fn eval_group(g: &mut GlimmerSpecProfitGuard, s_total: u128, p_total: u128, ar_probe_ns: u128) {
+    fn eval_group(g: &mut hipfire_generate::dense::GlimmerSpecProfitGuard, s_total: u128, p_total: u128, ar_probe_ns: u128) {
         // Split evenly across four windows; remainder on the last.
         let s_each = s_total / 4;
         let p_each = (p_total / 4) as usize;
@@ -37342,72 +22161,72 @@ mod glimmer_profit_guard_tests {
             let p = if i == 3 { p_last } else { p_each };
             let kind = g.observe_full_window(s, p);
             if i < 3 {
-                assert_eq!(kind, GlimmerProfitProbeKind::None, "window {i}");
+                assert_eq!(kind, hipfire_generate::dense::GlimmerProfitProbeKind::None, "window {i}");
             } else {
-                assert_eq!(kind, GlimmerProfitProbeKind::Measured, "window {i}");
+                assert_eq!(kind, hipfire_generate::dense::GlimmerProfitProbeKind::Measured, "window {i}");
             }
         }
         g.observe_probe(ar_probe_ns);
     }
 
-    fn warmup(g: &mut GlimmerSpecProfitGuard) {
+    fn warmup(g: &mut hipfire_generate::dense::GlimmerSpecProfitGuard) {
         assert_eq!(
             g.observe_full_window(1_000, 4),
-            GlimmerProfitProbeKind::Warmup
+            hipfire_generate::dense::GlimmerProfitProbeKind::Warmup
         );
         g.observe_probe(999); // discarded
     }
 
     #[test]
     fn disabled_never_probes_or_retires() {
-        let mut g = GlimmerSpecProfitGuard::new(false);
-        assert_eq!(g.status(), GlimmerProfitGuardStatus::Disabled);
+        let mut g = hipfire_generate::dense::GlimmerSpecProfitGuard::new(false);
+        assert_eq!(g.status(), hipfire_generate::dense::GlimmerProfitGuardStatus::Disabled);
         assert!(!g.enabled());
         for _ in 0..20 {
             assert_eq!(
                 g.observe_full_window(10_000, 8),
-                GlimmerProfitProbeKind::None
+                hipfire_generate::dense::GlimmerProfitProbeKind::None
             );
             g.observe_probe(1);
         }
         assert!(!g.is_retired());
         assert_eq!(g.evaluations(), 0);
         assert_eq!(g.eligible_windows(), 0);
-        assert_eq!(g.pending_probe(), GlimmerProfitProbeKind::None);
+        assert_eq!(g.pending_probe(), hipfire_generate::dense::GlimmerProfitProbeKind::None);
     }
 
     #[test]
     fn first_window_is_warmup_and_excluded() {
-        let mut g = GlimmerSpecProfitGuard::new(true);
-        assert_eq!(g.status(), GlimmerProfitGuardStatus::Warming);
+        let mut g = hipfire_generate::dense::GlimmerSpecProfitGuard::new(true);
+        assert_eq!(g.status(), hipfire_generate::dense::GlimmerProfitGuardStatus::Warming);
         assert_eq!(
             g.observe_full_window(50_000, 16),
-            GlimmerProfitProbeKind::Warmup
+            hipfire_generate::dense::GlimmerProfitProbeKind::Warmup
         );
         assert_eq!(g.eligible_windows(), 1);
-        assert_eq!(g.pending_probe(), GlimmerProfitProbeKind::Warmup);
+        assert_eq!(g.pending_probe(), hipfire_generate::dense::GlimmerProfitProbeKind::Warmup);
         // Warmup probe discarded — no evaluation, no S/P carried.
         g.observe_probe(1);
         assert_eq!(g.evaluations(), 0);
         assert_eq!(g.bad_evaluations(), 0);
-        assert_eq!(g.pending_probe(), GlimmerProfitProbeKind::None);
-        assert_eq!(g.status(), GlimmerProfitGuardStatus::Monitoring);
+        assert_eq!(g.pending_probe(), hipfire_generate::dense::GlimmerProfitProbeKind::None);
+        assert_eq!(g.status(), hipfire_generate::dense::GlimmerProfitGuardStatus::Monitoring);
         // Next four windows: only the 4th requests Measured.
         assert_eq!(
             g.observe_full_window(10_000, 4),
-            GlimmerProfitProbeKind::None
+            hipfire_generate::dense::GlimmerProfitProbeKind::None
         );
         assert_eq!(
             g.observe_full_window(10_000, 4),
-            GlimmerProfitProbeKind::None
+            hipfire_generate::dense::GlimmerProfitProbeKind::None
         );
         assert_eq!(
             g.observe_full_window(10_000, 4),
-            GlimmerProfitProbeKind::None
+            hipfire_generate::dense::GlimmerProfitProbeKind::None
         );
         assert_eq!(
             g.observe_full_window(10_000, 4),
-            GlimmerProfitProbeKind::Measured
+            hipfire_generate::dense::GlimmerProfitProbeKind::Measured
         );
         // Completing the measured probe with S=40k, P=16, A=2500:
         // ratio = 40000/(16*2500) = 1.0 — deadband; one evaluation counted.
@@ -37420,7 +22239,7 @@ mod glimmer_profit_guard_tests {
 
     #[test]
     fn four_window_cadence() {
-        let mut g = GlimmerSpecProfitGuard::new(true);
+        let mut g = hipfire_generate::dense::GlimmerSpecProfitGuard::new(true);
         warmup(&mut g);
         // Two full evaluation groups: only every 4th window is Measured.
         let mut measured = 0u32;
@@ -37428,12 +22247,12 @@ mod glimmer_profit_guard_tests {
         for i in 0..8 {
             let k = g.observe_full_window(1_000, 2);
             match k {
-                GlimmerProfitProbeKind::Measured => {
+                hipfire_generate::dense::GlimmerProfitProbeKind::Measured => {
                     measured += 1;
                     g.observe_probe(1_000); // ratio = 4000/(8*1000)=0.5 good
                 }
-                GlimmerProfitProbeKind::None => none += 1,
-                GlimmerProfitProbeKind::Warmup => panic!("unexpected warmup at {i}"),
+                hipfire_generate::dense::GlimmerProfitProbeKind::None => none += 1,
+                hipfire_generate::dense::GlimmerProfitProbeKind::Warmup => panic!("unexpected warmup at {i}"),
             }
         }
         assert_eq!(measured, 2);
@@ -37450,7 +22269,7 @@ mod glimmer_profit_guard_tests {
         // Exactly 1.049: S = 104_900 => left=10_490_000 < 10_500_000 and > 9_800_000.
 
         // --- 1.049 deadband retains ---
-        let mut g = GlimmerSpecProfitGuard::new(true);
+        let mut g = hipfire_generate::dense::GlimmerSpecProfitGuard::new(true);
         warmup(&mut g);
         // Seed one bad so deadband retention is observable.
         eval_group(&mut g, 105_000, 100, 1_000);
@@ -37463,14 +22282,14 @@ mod glimmer_profit_guard_tests {
         assert_eq!(g.evaluations(), 2);
 
         // --- exactly 1.05 is bad ---
-        let mut g = GlimmerSpecProfitGuard::new(true);
+        let mut g = hipfire_generate::dense::GlimmerSpecProfitGuard::new(true);
         warmup(&mut g);
         eval_group(&mut g, 105_000, 100, 1_000);
         assert_eq!(g.bad_evaluations(), 1);
         assert!(!g.is_retired());
 
         // --- exactly 0.98 resets ---
-        let mut g = GlimmerSpecProfitGuard::new(true);
+        let mut g = hipfire_generate::dense::GlimmerSpecProfitGuard::new(true);
         warmup(&mut g);
         eval_group(&mut g, 105_000, 100, 1_000); // bad -> 1
         assert_eq!(g.bad_evaluations(), 1);
@@ -37482,7 +22301,7 @@ mod glimmer_profit_guard_tests {
 
     #[test]
     fn two_bad_retires_sticky_good_resets_deadband_retains() {
-        let mut g = GlimmerSpecProfitGuard::new(true);
+        let mut g = hipfire_generate::dense::GlimmerSpecProfitGuard::new(true);
         warmup(&mut g);
 
         // bad #1
@@ -37505,14 +22324,14 @@ mod glimmer_profit_guard_tests {
         eval_group(&mut g, 105_000, 100, 1_000);
         assert_eq!(g.bad_evaluations(), 2);
         assert!(g.is_retired());
-        assert_eq!(g.status(), GlimmerProfitGuardStatus::Retired);
+        assert_eq!(g.status(), hipfire_generate::dense::GlimmerProfitGuardStatus::Retired);
         assert_eq!(g.retire_evaluation(), g.evaluations());
         assert!(g.retire_cycle() > 0);
 
         // sticky: further windows/probes are inert
         assert_eq!(
             g.observe_full_window(200_000, 1),
-            GlimmerProfitProbeKind::None
+            hipfire_generate::dense::GlimmerProfitProbeKind::None
         );
         let evals = g.evaluations();
         g.observe_probe(1);
@@ -37522,57 +22341,57 @@ mod glimmer_profit_guard_tests {
 
     #[test]
     fn fresh_object_after_retirement_starts_warmup() {
-        let mut old = GlimmerSpecProfitGuard::new(true);
+        let mut old = hipfire_generate::dense::GlimmerSpecProfitGuard::new(true);
         warmup(&mut old);
         eval_group(&mut old, 105_000, 100, 1_000);
         eval_group(&mut old, 105_000, 100, 1_000);
         assert!(old.is_retired());
 
-        let mut fresh = GlimmerSpecProfitGuard::new(true);
-        assert_eq!(fresh.status(), GlimmerProfitGuardStatus::Warming);
+        let mut fresh = hipfire_generate::dense::GlimmerSpecProfitGuard::new(true);
+        assert_eq!(fresh.status(), hipfire_generate::dense::GlimmerProfitGuardStatus::Warming);
         assert!(!fresh.is_retired());
         assert_eq!(
             fresh.observe_full_window(1_000, 4),
-            GlimmerProfitProbeKind::Warmup
+            hipfire_generate::dense::GlimmerProfitProbeKind::Warmup
         );
     }
 
     #[test]
     fn zero_progress_and_zero_time_ignored() {
-        let mut g = GlimmerSpecProfitGuard::new(true);
+        let mut g = hipfire_generate::dense::GlimmerSpecProfitGuard::new(true);
         // Zero time
-        assert_eq!(g.observe_full_window(0, 8), GlimmerProfitProbeKind::None);
+        assert_eq!(g.observe_full_window(0, 8), hipfire_generate::dense::GlimmerProfitProbeKind::None);
         // Zero rows
         assert_eq!(
             g.observe_full_window(10_000, 0),
-            GlimmerProfitProbeKind::None
+            hipfire_generate::dense::GlimmerProfitProbeKind::None
         );
         assert_eq!(g.eligible_windows(), 0);
-        assert_eq!(g.status(), GlimmerProfitGuardStatus::Warming);
+        assert_eq!(g.status(), hipfire_generate::dense::GlimmerProfitGuardStatus::Warming);
 
         warmup(&mut g);
         // Build three of four measured windows, then inject zeros (ignored).
         assert_eq!(
             g.observe_full_window(1_000, 2),
-            GlimmerProfitProbeKind::None
+            hipfire_generate::dense::GlimmerProfitProbeKind::None
         );
         assert_eq!(
             g.observe_full_window(1_000, 2),
-            GlimmerProfitProbeKind::None
+            hipfire_generate::dense::GlimmerProfitProbeKind::None
         );
         assert_eq!(
             g.observe_full_window(1_000, 2),
-            GlimmerProfitProbeKind::None
+            hipfire_generate::dense::GlimmerProfitProbeKind::None
         );
-        assert_eq!(g.observe_full_window(0, 2), GlimmerProfitProbeKind::None);
+        assert_eq!(g.observe_full_window(0, 2), hipfire_generate::dense::GlimmerProfitProbeKind::None);
         assert_eq!(
             g.observe_full_window(1_000, 0),
-            GlimmerProfitProbeKind::None
+            hipfire_generate::dense::GlimmerProfitProbeKind::None
         );
         // Fourth real window still completes the group.
         assert_eq!(
             g.observe_full_window(1_000, 2),
-            GlimmerProfitProbeKind::Measured
+            hipfire_generate::dense::GlimmerProfitProbeKind::Measured
         );
         // Zero probe is not evidence: evaluation not counted.
         g.observe_probe(0);
@@ -37587,21 +22406,21 @@ mod glimmer_profit_guard_tests {
     fn bonus_decode_aligns_mirror_prediction_unpushed_until_route() {
         // Post full window: bonus already on mirror, not in KV/capture.
         let commit_end = 100usize;
-        let post = glimmer_profit_ledger_post_window(commit_end);
+        let post = hipfire_generate::dense::glimmer_profit_ledger_post_window(commit_end);
         assert_eq!(post.mirror_len, commit_end + 1);
         assert_eq!(post.state_n_tokens, commit_end);
 
         // Decoding the pending bonus advances state only — prediction not mirrored.
-        let after = glimmer_profit_ledger_after_bonus_decode(post);
+        let after = hipfire_generate::dense::glimmer_profit_ledger_after_bonus_decode(post);
         assert_eq!(after.mirror_len, commit_end + 1);
         assert_eq!(after.state_n_tokens, commit_end + 1);
         assert_eq!(after.mirror_len, after.state_n_tokens);
 
         // Retire/AR tail keeps prediction unpushed (same ledger).
-        assert_eq!(after, glimmer_profit_ledger_after_bonus_decode(post));
+        assert_eq!(after, hipfire_generate::dense::glimmer_profit_ledger_after_bonus_decode(post));
 
         // Continue-spec routes the returned prediction once.
-        let cont = glimmer_profit_ledger_route_prediction(after);
+        let cont = hipfire_generate::dense::glimmer_profit_ledger_route_prediction(after);
         assert_eq!(cont.mirror_len, commit_end + 2);
         assert_eq!(cont.state_n_tokens, commit_end + 1);
         // Prediction is one-token-ahead again, not yet in state.
