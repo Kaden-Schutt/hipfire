@@ -13968,38 +13968,16 @@ fn run_independent_q8_attention(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn forward_batch_chunk_impl(
-    gpu: &mut Gpu,
-    weights: &Qwen35Weights,
-    config: &Qwen35Config,
-    tokens: &[u32],
-    start_pos: usize,
-    kv_cache: &mut llama::KvCache,
-    dn_state: &mut DeltaNetState,
-    s: &Qwen35Scratch,
-    pbs: &PrefillBatchScratch,
-    hidden_rb: Option<&HiddenStateRingBuffer>,
-    per_token_hidden_out: Option<(&GpuTensor, usize)>,
-    gdn_tape: Option<&mut crate::speculative::GdnTape>,
-    tape_offset: usize,
-    tree_verify: Option<TreeVerifyCtx<'_>>,
-    pre_uploaded: bool,
-    pre_embedded: bool,
-    band: Option<&PrefillBandCtx<'_>>,
-    mask_override: Option<MaskEmbedOverride<'_>>,
-    needs_last_token_logits: bool,
-    max_layer: Option<usize>,
-    // EP (Ship 6 substrate-EP prefill): per-MoE-layer routed partial. ONLY set
-    // by the EP driver, which calls this with a SINGLE-layer band so the routed
-    // combine of that one MoE layer lands in the zeroed partial (all-reduced by
-    // the driver after the call). Always `None` for multi-layer bands (PP /
-    // single-GPU full stack) — a shared partial across >1 MoE layer would be wrong.
-    routed_out: Option<&GpuTensor>,
+
+#[allow(clippy::too_many_arguments)]
+fn batch_chunk_validate_independent(
+    n: usize,
     batch_semantics: BatchSemantics<'_>,
+    dn_state: &DeltaNetState,
+    kv_cache: &llama::KvCache,
+    tree_verify: Option<TreeVerifyCtx<'_>>,
+    gdn_tape: Option<&crate::speculative::GdnTape>,
 ) -> HipResult<()> {
-    let n = tokens.len();
-    debug_assert!(n > 0);
-    debug_assert!(n <= pbs.max_batch);
     if let BatchSemantics::Independent {
         positions,
         lane_capacity,
@@ -14040,73 +14018,25 @@ fn forward_batch_chunk_impl(
             ));
         }
     }
-    // Target verification is a distinct performance regime from prompt
-    // prefill. DFlash, DSpark/MTP, and tree verify expose that semantic here
-    // through per-position hidden output, a rollback tape, or a tree mask.
-    // Carry it in DispatchCtx so dispatch never needs process-global state.
-    let dispatch_workload = prefill_dispatch_workload(
-        per_token_hidden_out.is_some(),
-        gdn_tape.is_some(),
-        tree_verify.is_some(),
-    );
-    let required_tokens = checked_kv_end(start_pos, n, "forward_prefill_chunk")?;
-    kv_cache.require_mapped_capacity(required_tokens)?;
-    debug_assert!(
-        routed_out.is_none()
-            || band
-                .map(|b| b.layer_end - b.layer_start <= 1)
-                .unwrap_or(false),
-        "forward_prefill_chunk: routed_out requires a single-layer band (EP driver invariant)",
-    );
+    Ok(())
+}
 
-    let dim = config.dim;
-    let hidden_dim = config.hidden_dim;
-    let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
-    let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
-    let n_v_heads = config.linear_num_value_heads;
-    let hd = config.linear_key_head_dim;
-    let dim_row_bytes = dim * 4;
-    // Build one DispatchCtx per chunk (decision-only, threaded through
-    // MoE prefill family calls). Ship 4.2.
-    let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu);
 
-    let do_embed = band.map(|b| b.is_first_band).unwrap_or(true);
-    let layer_start = band.map(|b| b.layer_start).unwrap_or(0);
-    // `max_layer = Some(N)` early-exits at layer N (exclusive). pflash uses
-    // this with N = score_layer_idx + 1: the drafter forward only needs to
-    // populate the K cache through the scoring layer (the shallowest
-    // FullAttention layer, typically layer 3 of 24 in Qwen3.5 hybrid),
-    // since `pflash_score_q8_kv` reads exactly that layer's K. Layers
-    // beyond it and the final norm + lm_head are wasted compute for
-    // pflash. Saves ~80% of drafter forward time on hybrid drafters.
-    let layer_end = band
-        .map(|b| b.layer_end)
-        .unwrap_or(config.n_layers)
-        .min(max_layer.unwrap_or(usize::MAX));
-    // Skip final norm + lm_head when the caller early-exits — they produce
-    // logits the caller doesn't read, and require running through the full
-    // layer stack anyway.
-    let do_lm_head = band.map(|b| b.is_last_band).unwrap_or(true) && max_layer.is_none();
-    // Per-call-site `givens_cos_view` / `givens_sin_view` macros below
-    // resolve to either the band-supplied per-device replica (multi-GPU
-    // mode where `kv_cache.givens_*` is `None` by design) or the
-    // kv_cache's own table (single-GPU). Held as macros, not top-level
-    // bindings, so the immutable borrow on `kv_cache.givens_*` doesn't
-    // outlive the kernel-call statement and conflict with later
-    // mutable borrows of `kv_cache` (e.g. inside `run_fa_layer_body`).
-    macro_rules! givens_cos_view {
-        () => {
-            band.and_then(|b| b.givens_cos)
-                .or(kv_cache.givens_cos.as_ref())
-        };
-    }
-    macro_rules! givens_sin_view {
-        () => {
-            band.and_then(|b| b.givens_sin)
-                .or(kv_cache.givens_sin.as_ref())
-        };
-    }
-
+#[allow(clippy::too_many_arguments)]
+fn batch_chunk_embed_tokens(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    tokens: &[u32],
+    s: &Qwen35Scratch,
+    pbs: &PrefillBatchScratch,
+    n: usize,
+    dim: usize,
+    dim_row_bytes: usize,
+    do_embed: bool,
+    pre_embedded: bool,
+    pre_uploaded: bool,
+    mask_override: Option<MaskEmbedOverride<'_>>,
+) -> HipResult<()> {
     // ── 1. Embed tokens into pbs.x_batch ─────────────────────────────────
     //
     // Fast path for HFQ4G256 (all MQ4-quantized Qwen3.5 models + friends):
@@ -14217,6 +14147,20 @@ fn forward_batch_chunk_impl(
         }
     }
 
+    Ok(())
+}
+
+
+#[allow(clippy::too_many_arguments)]
+fn batch_chunk_upload_positions(
+    gpu: &mut Gpu,
+    pbs: &PrefillBatchScratch,
+    batch_semantics: BatchSemantics<'_>,
+    start_pos: usize,
+    n: usize,
+    tree_verify: Option<TreeVerifyCtx<'_>>,
+    pre_uploaded: bool,
+) -> HipResult<()> {
     // ── 1b. Upload positions array ────────────────────────────────────────
     //
     // Positions is the per-row RoPE angle AND the physical KV cache slot (the
@@ -14264,69 +14208,31 @@ fn forward_batch_chunk_impl(
         }
     }
 
-    // Decide whether the FA layers can take the batched path. Requires
-    // (a) all FA weights to be MQ4G256 or HFQ4G256 (the batched gemm_qkv
-    // + wo GEMMs are dtype-agnostic; the rmsnorm+rotate / silu_mul kernels
-    // differ by dtype and we branch on that at each layer) and (b) a Q8_0
-    // or givens KV cache. If the check fails, FA layers fall back to
-    // per-token gather/scatter via run_fa_layer_body.
-    let fa_arch = gpu.arch.as_str();
-    // Q8 WMMA gate: the fused Q8 WMMA family (gemm_qkv/qkvza/gate_up/residual
-    // _q8_0_wmma) uses the gfx11 `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32`
-    // builtin; the sibling `*.gfx12.hip` kernels use the `_w32_gfx12` variant
-    // (silicon-validated on R9700, 2026-05-14, 4/4 unit tests PASS). Each
-    // call site below selects the right variant via an `arch.starts_with`
-    // branch. On non-WMMA archs we keep the Tier 2 chunked-substrate path.
-    let q8_wmma_arch = q8_prefill_wmma_enabled(gpu);
-    // MQ3 dispatch arch gate (same predicate, separate name for clarity at
-    // each matcher). Phase 1 gfx10 MQ3 prefill (`docs/plans/gfx10_mq3_prefill.md`)
-    // routes the 8 `is_mq3*` matchers below to scalar HFQ3 kernels on
-    // !arch_has_wmma archs admitted by `is_batchable_la`.
-    let arch_has_wmma = q8_wmma_arch;
-    let fa_batched_ok =
-        (kv_cache.quant_q8 || kv_cache.quant_asym4 || kv_cache.quant_asym3 || kv_cache.quant_asym2)
-            && weights.layers.iter().all(|lw| match lw {
-                LayerWeights::FullAttn(_) | LayerWeights::FullAttnMoe(_) => {
-                    qwen35_layer_batch_admissible(lw, config, fa_arch).is_ok()
-                }
-                _ => true,
-            });
-    // at capture time. `max_ctx_len = start_pos + n` grows per cycle, so the
-    // captured value would be stale on replay — the attention kernel would
-    // allocate too-small LDS for `scores[]` and over-read. Bake the physical
-    // cap instead (LDS sized for the worst case). The kernel still iterates
-    // over the actual `positions[b] + 1` per-row seq_len from a device buffer,
-    // so correctness is preserved; only the LDS allocation is over-provisioned.
-    let logical_max_ctx = match batch_semantics {
-        BatchSemantics::Sequential => start_pos + n,
-        BatchSemantics::Independent { positions, .. } => {
-            positions.iter().copied().max().unwrap_or(0) + 1
-        }
-    };
-    if batch_semantics.is_independent() && !fa_batched_ok {
-        return Err(HipError::new(
-            0,
-            "independent decode requires the fully batched FullAttention weight path",
-        ));
-    }
-    let max_ctx_len = if gpu.graphs.capture_mode {
-        kv_cache.physical_cap
-    } else {
-        logical_max_ctx
-    };
+    Ok(())
+}
 
-    // ── 2. Per-layer loop ────────────────────────────────────────────────
-    // Multi-GPU band-mode: counters seed from the band's running offsets so
-    // the band's first DeltaNet/FullAttn layer reads the correct
-    // `dn_state.s_matrices[i]` / `kv_cache.k_caches[i]` slot. Single-GPU
-    // (band==None) seeds zeros — original behavior.
-    let mut delta_layer_idx = band.map(|b| b.delta_layer_offset).unwrap_or(0);
-    let mut kv_layer_idx = band.map(|b| b.kv_layer_offset).unwrap_or(0);
-    let ctx = DispatchCtx::new(gpu).with_workload(dispatch_workload);
 
-    for layer_idx in layer_start..layer_end {
-        match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
-            (LayerWeights::DeltaNet(layer), LayerType::LinearAttention) => {
+#[allow(clippy::too_many_arguments)]
+fn batch_chunk_delta_net_attn(
+    gpu: &mut Gpu,
+    layer: &DeltaNetLayerWeights,
+    config: &Qwen35Config,
+    pbs: &PrefillBatchScratch,
+    dn_state: &mut DeltaNetState,
+    n: usize,
+    dim: usize,
+    k_dim: usize,
+    v_dim: usize,
+    n_v_heads: usize,
+    hd: usize,
+    batch_semantics: BatchSemantics<'_>,
+    tree_verify: Option<TreeVerifyCtx<'_>>,
+    gdn_tape: Option<&crate::speculative::GdnTape>,
+    tape_offset: usize,
+    delta_layer_idx: usize,
+    q8_wmma_arch: bool,
+    arch_has_wmma: bool,
+) -> HipResult<()> {
                 // Per-layer dtype branch: MQ4 needs FWHT-rotation on the
                 // activation to match its pre-rotated weights; HFQ4 uses
                 // plain rmsnormed activations. The GEMM kernels themselves
@@ -15046,6 +14952,22 @@ fn forward_batch_chunk_impl(
                     )?;
                 }
 
+    Ok(())
+}
+
+
+#[allow(clippy::too_many_arguments)]
+fn batch_chunk_delta_net_ffn(
+    gpu: &mut Gpu,
+    layer: &DeltaNetLayerWeights,
+    config: &Qwen35Config,
+    pbs: &PrefillBatchScratch,
+    n: usize,
+    dim: usize,
+    hidden_dim: usize,
+    q8_wmma_arch: bool,
+    arch_has_wmma: bool,
+) -> HipResult<()> {
                 // FFN: rmsnorm (+ rotate for MQ).
                 let ffn_is_mq = matches!(
                     layer.w_gate.gpu_dtype,
@@ -15345,18 +15267,30 @@ fn forward_batch_chunk_impl(
                     )?;
                 }
 
-                // Post-layer hidden extract for the DFlash draft path.
-                if let Some(rb) = hidden_rb {
-                    if let Some(slot) = rb.extract_slot(layer_idx) {
-                        rb.write_rows_to_staging(gpu, slot, &pbs.x_batch, n)?;
-                    }
-                }
+    Ok(())
+}
 
-                let _ = is_mq; // retained above for potential future use
-                delta_layer_idx += 1;
-            }
 
-            (LayerWeights::FullAttn(layer), LayerType::FullAttention) if fa_batched_ok => {
+#[allow(clippy::too_many_arguments)]
+fn batch_chunk_full_attn_attn(
+    gpu: &mut Gpu,
+    layer: &FullAttnLayerWeights,
+    config: &Qwen35Config,
+    pbs: &PrefillBatchScratch,
+    s: &Qwen35Scratch,
+    kv_cache: &llama::KvCache,
+    n: usize,
+    dim: usize,
+    start_pos: usize,
+    max_ctx_len: usize,
+    ctx: &DispatchCtx,
+    batch_semantics: BatchSemantics<'_>,
+    tree_verify: Option<TreeVerifyCtx<'_>>,
+    q8_wmma_arch: bool,
+    arch_has_wmma: bool,
+    kv_layer_idx: usize,
+    layer_idx: usize,
+) -> HipResult<()> {
                 // Fully batched FA layer. Mirrors the FA branch of
                 // forward_scratch_layers kernel-for-kernel, but every
                 // launch covers all N tokens at once.
@@ -15886,6 +15820,22 @@ fn forward_batch_chunk_impl(
                     )?;
                 }
 
+    Ok(())
+}
+
+
+#[allow(clippy::too_many_arguments)]
+fn batch_chunk_full_attn_ffn(
+    gpu: &mut Gpu,
+    layer: &FullAttnLayerWeights,
+    config: &Qwen35Config,
+    pbs: &PrefillBatchScratch,
+    n: usize,
+    dim: usize,
+    hidden_dim: usize,
+    q8_wmma_arch: bool,
+    arch_has_wmma: bool,
+) -> HipResult<()> {
                 // 10. FFN: rmsnorm (+ rotate for MQ), gate+up, silu_mul
                 // (+ rotate for MQ), w_down residual.
                 let fa_ffn_is_mq = matches!(
@@ -16174,19 +16124,24 @@ fn forward_batch_chunk_impl(
                     )?;
                 }
 
-                // Post-layer hidden extract for the DFlash draft path.
-                if let Some(rb) = hidden_rb {
-                    if let Some(slot) = rb.extract_slot(layer_idx) {
-                        rb.write_rows_to_staging(gpu, slot, &pbs.x_batch, n)?;
-                    }
-                }
+    Ok(())
+}
 
-                // Silence unused warning if kv_dim ends up shadowed.
-                let _ = kv_dim;
-                kv_layer_idx += 1;
-            }
 
-            (LayerWeights::FullAttn(_layer), LayerType::FullAttention) => {
+#[allow(clippy::too_many_arguments)]
+fn batch_chunk_full_attn_fallback(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    layer_idx: usize,
+    kv_layer_idx: usize,
+    start_pos: usize,
+    n: usize,
+    dim_row_bytes: usize,
+    kv_cache: &mut llama::KvCache,
+    s: &Qwen35Scratch,
+    pbs: &PrefillBatchScratch,
+) -> HipResult<()> {
                 // Per-token gather/scatter fallback for FA layers that don't
                 // qualify for batched FA (non-MQ4 weights, non-Q8_0 KV, etc).
                 for i in 0..n {
@@ -16219,19 +16174,36 @@ fn forward_batch_chunk_impl(
                     )?;
                 }
 
-                // Post-layer hidden extract for the DFlash draft path. After
-                // the per-token loop, pbs.x_batch has the full layer output
-                // for all N tokens (last copy-back finishes each row).
-                if let Some(rb) = hidden_rb {
-                    if let Some(slot) = rb.extract_slot(layer_idx) {
-                        rb.write_rows_to_staging(gpu, slot, &pbs.x_batch, n)?;
-                    }
-                }
+    Ok(())
+}
 
-                kv_layer_idx += 1;
-            }
 
-            (LayerWeights::DeltaNetMoe(layer), LayerType::LinearAttention) => {
+#[allow(clippy::too_many_arguments)]
+fn batch_chunk_delta_net_moe(
+    gpu: &mut Gpu,
+    layer: &DeltaNetMoeLayerWeights,
+    config: &Qwen35Config,
+    pbs: &PrefillBatchScratch,
+    dn_state: &mut DeltaNetState,
+    n: usize,
+    dim: usize,
+    hidden_dim: usize,
+    k_dim: usize,
+    v_dim: usize,
+    n_v_heads: usize,
+    hd: usize,
+    batch_semantics: BatchSemantics<'_>,
+    tree_verify: Option<TreeVerifyCtx<'_>>,
+    gdn_tape: Option<&crate::speculative::GdnTape>,
+    tape_offset: usize,
+    delta_layer_idx: usize,
+    q8_wmma_arch: bool,
+    start_pos: usize,
+    layer_idx: usize,
+    ctx: &DispatchCtx,
+    weights: &Qwen35Weights,
+    routed_out: Option<&GpuTensor>,
+) -> HipResult<()> {
                 // Batched MoE LA layer. LA body is the same as DeltaNet
                 // (rmsnorm + qkvza + sigmoid_alpha + conv1d + L2norm +
                 // repeat_interleave + GDN + gated_norm + wo+residual);
@@ -16961,16 +16933,32 @@ fn forward_batch_chunk_impl(
                     routed_out,
                 )?;
 
-                // Post-layer hidden extract for the DFlash draft path.
-                if let Some(rb) = hidden_rb {
-                    if let Some(slot) = rb.extract_slot(layer_idx) {
-                        rb.write_rows_to_staging(gpu, slot, &pbs.x_batch, n)?;
-                    }
-                }
-                delta_layer_idx += 1;
-            }
+    Ok(())
+}
 
-            (LayerWeights::FullAttnMoe(layer), LayerType::FullAttention) if fa_batched_ok => {
+
+#[allow(clippy::too_many_arguments)]
+fn batch_chunk_full_attn_moe(
+    gpu: &mut Gpu,
+    layer: &FullAttnMoeLayerWeights,
+    config: &Qwen35Config,
+    pbs: &PrefillBatchScratch,
+    s: &Qwen35Scratch,
+    kv_cache: &llama::KvCache,
+    n: usize,
+    dim: usize,
+    start_pos: usize,
+    max_ctx_len: usize,
+    ctx: &DispatchCtx,
+    batch_semantics: BatchSemantics<'_>,
+    tree_verify: Option<TreeVerifyCtx<'_>>,
+    q8_wmma_arch: bool,
+    arch_has_wmma: bool,
+    kv_layer_idx: usize,
+    layer_idx: usize,
+    routed_out: Option<&GpuTensor>,
+    weights: &Qwen35Weights,
+) -> HipResult<()> {
                 // Batched MoE FA layer. FA body is the same as FullAttn
                 // (rmsnorm + qkv + deinterleave + q/k norm + RoPE +
                 // kv_write + attention + sigmoid_mul + wo+residual);
@@ -17510,23 +17498,25 @@ fn forward_batch_chunk_impl(
                     routed_out,
                 )?;
 
-                // Post-layer hidden extract for the DFlash draft path.
-                if let Some(rb) = hidden_rb {
-                    if let Some(slot) = rb.extract_slot(layer_idx) {
-                        rb.write_rows_to_staging(gpu, slot, &pbs.x_batch, n)?;
-                    }
-                }
+    Ok(())
+}
 
-                let _ = kv_dim;
-                let _ = q_dim;
-                kv_layer_idx += 1;
-            }
 
-            _ => panic!("layer type mismatch at layer {layer_idx}"),
-        }
-        dump_hidden_localize(gpu, &pbs.x_batch, n, start_pos, dim, layer_idx, "batched");
-    }
-
+#[allow(clippy::too_many_arguments)]
+fn batch_chunk_final_logits(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    s: &Qwen35Scratch,
+    pbs: &PrefillBatchScratch,
+    n: usize,
+    dim: usize,
+    dim_row_bytes: usize,
+    per_token_hidden_out: Option<(&GpuTensor, usize)>,
+    needs_last_token_logits: bool,
+    do_lm_head: bool,
+    ctx: &DispatchCtx,
+) -> HipResult<()> {
     // ── 3. Final output norm + logits ───────────────────────────────────
     // Multi-GPU band-mode: skip when this is not the last band — the
     // running activation in `pbs.x_batch` is what the next band's
@@ -17588,6 +17578,178 @@ fn forward_batch_chunk_impl(
             }
         }
     }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn forward_batch_chunk_impl(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    tokens: &[u32],
+    start_pos: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+    s: &Qwen35Scratch,
+    pbs: &PrefillBatchScratch,
+    hidden_rb: Option<&HiddenStateRingBuffer>,
+    per_token_hidden_out: Option<(&GpuTensor, usize)>,
+    gdn_tape: Option<&mut crate::speculative::GdnTape>,
+    tape_offset: usize,
+    tree_verify: Option<TreeVerifyCtx<'_>>,
+    pre_uploaded: bool,
+    pre_embedded: bool,
+    band: Option<&PrefillBandCtx<'_>>,
+    mask_override: Option<MaskEmbedOverride<'_>>,
+    needs_last_token_logits: bool,
+    max_layer: Option<usize>,
+    routed_out: Option<&GpuTensor>,
+    batch_semantics: BatchSemantics<'_>,
+) -> HipResult<()> {
+    let n = tokens.len();
+    debug_assert!(n > 0);
+    debug_assert!(n <= pbs.max_batch);
+    batch_chunk_validate_independent(n, batch_semantics, dn_state, kv_cache, tree_verify, gdn_tape.as_deref())?;
+    let dispatch_workload = prefill_dispatch_workload(
+        per_token_hidden_out.is_some(),
+        gdn_tape.is_some(),
+        tree_verify.is_some(),
+    );
+    let required_tokens = checked_kv_end(start_pos, n, "forward_prefill_chunk")?;
+    kv_cache.require_mapped_capacity(required_tokens)?;
+    debug_assert!(
+        routed_out.is_none()
+            || band
+                .map(|b| b.layer_end - b.layer_start <= 1)
+                .unwrap_or(false),
+        "forward_prefill_chunk: routed_out requires a single-layer band (EP driver invariant)",
+    );
+
+    let dim = config.dim;
+    let hidden_dim = config.hidden_dim;
+    let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
+    let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
+    let n_v_heads = config.linear_num_value_heads;
+    let hd = config.linear_key_head_dim;
+    let dim_row_bytes = dim * 4;
+    let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu);
+
+    let do_embed = band.map(|b| b.is_first_band).unwrap_or(true);
+    let layer_start = band.map(|b| b.layer_start).unwrap_or(0);
+    let layer_end = band
+        .map(|b| b.layer_end)
+        .unwrap_or(config.n_layers)
+        .min(max_layer.unwrap_or(usize::MAX));
+    let do_lm_head = band.map(|b| b.is_last_band).unwrap_or(true) && max_layer.is_none();
+    macro_rules! givens_cos_view {
+        () => {
+            band.and_then(|b| b.givens_cos)
+                .or(kv_cache.givens_cos.as_ref())
+        };
+    }
+    macro_rules! givens_sin_view {
+        () => {
+            band.and_then(|b| b.givens_sin)
+                .or(kv_cache.givens_sin.as_ref())
+        };
+    }
+
+    batch_chunk_embed_tokens(gpu, weights, tokens, s, pbs, n, dim, dim_row_bytes, do_embed, pre_embedded, pre_uploaded, mask_override)?;
+    batch_chunk_upload_positions(gpu, pbs, batch_semantics, start_pos, n, tree_verify, pre_uploaded)?;
+
+    let fa_arch = gpu.arch.as_str();
+    let q8_wmma_arch = q8_prefill_wmma_enabled(gpu);
+    let arch_has_wmma = q8_wmma_arch;
+    let fa_batched_ok =
+        (kv_cache.quant_q8 || kv_cache.quant_asym4 || kv_cache.quant_asym3 || kv_cache.quant_asym2)
+            && weights.layers.iter().all(|lw| match lw {
+                LayerWeights::FullAttn(_) | LayerWeights::FullAttnMoe(_) => {
+                    qwen35_layer_batch_admissible(lw, config, fa_arch).is_ok()
+                }
+                _ => true,
+            });
+    let logical_max_ctx = match batch_semantics {
+        BatchSemantics::Sequential => start_pos + n,
+        BatchSemantics::Independent { positions, .. } => {
+            positions.iter().copied().max().unwrap_or(0) + 1
+        }
+    };
+    if batch_semantics.is_independent() && !fa_batched_ok {
+        return Err(HipError::new(
+            0,
+            "independent decode requires the fully batched FullAttention weight path",
+        ));
+    }
+    let max_ctx_len = if gpu.graphs.capture_mode {
+        kv_cache.physical_cap
+    } else {
+        logical_max_ctx
+    };
+
+    let mut delta_layer_idx = band.map(|b| b.delta_layer_offset).unwrap_or(0);
+    let mut kv_layer_idx = band.map(|b| b.kv_layer_offset).unwrap_or(0);
+    let ctx = DispatchCtx::new(gpu).with_workload(dispatch_workload);
+
+    for layer_idx in layer_start..layer_end {
+        match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
+            (LayerWeights::DeltaNet(layer), LayerType::LinearAttention) => {
+                batch_chunk_delta_net_attn(gpu, layer, config, pbs, dn_state, n, dim, k_dim, v_dim, n_v_heads, hd, batch_semantics, tree_verify, gdn_tape.as_deref(), tape_offset, delta_layer_idx, q8_wmma_arch, arch_has_wmma)?;
+                batch_chunk_delta_net_ffn(gpu, layer, config, pbs, n, dim, hidden_dim, q8_wmma_arch, arch_has_wmma)?;
+                if let Some(rb) = hidden_rb {
+                    if let Some(slot) = rb.extract_slot(layer_idx) {
+                        rb.write_rows_to_staging(gpu, slot, &pbs.x_batch, n)?;
+                    }
+                }
+                delta_layer_idx += 1;
+                dump_hidden_localize(gpu, &pbs.x_batch, n, start_pos, dim, layer_idx, "batched");
+            }
+            (LayerWeights::FullAttn(layer), LayerType::FullAttention) if fa_batched_ok => {
+                batch_chunk_full_attn_attn(gpu, layer, config, pbs, s, kv_cache, n, dim, start_pos, max_ctx_len, &ctx, batch_semantics, tree_verify, q8_wmma_arch, arch_has_wmma, kv_layer_idx, layer_idx)?;
+                batch_chunk_full_attn_ffn(gpu, layer, config, pbs, n, dim, hidden_dim, q8_wmma_arch, arch_has_wmma)?;
+                if let Some(rb) = hidden_rb {
+                    if let Some(slot) = rb.extract_slot(layer_idx) {
+                        rb.write_rows_to_staging(gpu, slot, &pbs.x_batch, n)?;
+                    }
+                }
+                kv_layer_idx += 1;
+                dump_hidden_localize(gpu, &pbs.x_batch, n, start_pos, dim, layer_idx, "batched");
+            }
+            (LayerWeights::FullAttn(_layer), LayerType::FullAttention) => {
+                batch_chunk_full_attn_fallback(gpu, weights, config, layer_idx, kv_layer_idx, start_pos, n, dim_row_bytes, kv_cache, s, pbs)?;
+                if let Some(rb) = hidden_rb {
+                    if let Some(slot) = rb.extract_slot(layer_idx) {
+                        rb.write_rows_to_staging(gpu, slot, &pbs.x_batch, n)?;
+                    }
+                }
+                kv_layer_idx += 1;
+                dump_hidden_localize(gpu, &pbs.x_batch, n, start_pos, dim, layer_idx, "batched");
+            }
+            (LayerWeights::DeltaNetMoe(layer), LayerType::LinearAttention) => {
+                batch_chunk_delta_net_moe(gpu, layer, config, pbs, dn_state, n, dim, hidden_dim, k_dim, v_dim, n_v_heads, hd, batch_semantics, tree_verify, gdn_tape.as_deref(), tape_offset, delta_layer_idx, q8_wmma_arch, start_pos, layer_idx, &ctx, weights, routed_out)?;
+                if let Some(rb) = hidden_rb {
+                    if let Some(slot) = rb.extract_slot(layer_idx) {
+                        rb.write_rows_to_staging(gpu, slot, &pbs.x_batch, n)?;
+                    }
+                }
+                delta_layer_idx += 1;
+                dump_hidden_localize(gpu, &pbs.x_batch, n, start_pos, dim, layer_idx, "batched");
+            }
+            (LayerWeights::FullAttnMoe(layer), LayerType::FullAttention) if fa_batched_ok => {
+                batch_chunk_full_attn_moe(gpu, layer, config, pbs, s, kv_cache, n, dim, start_pos, max_ctx_len, &ctx, batch_semantics, tree_verify, q8_wmma_arch, arch_has_wmma, kv_layer_idx, layer_idx, routed_out, weights)?;
+                if let Some(rb) = hidden_rb {
+                    if let Some(slot) = rb.extract_slot(layer_idx) {
+                        rb.write_rows_to_staging(gpu, slot, &pbs.x_batch, n)?;
+                    }
+                }
+                kv_layer_idx += 1;
+                dump_hidden_localize(gpu, &pbs.x_batch, n, start_pos, dim, layer_idx, "batched");
+            }
+            _ => panic!("layer type mismatch at layer {layer_idx}"),
+        }
+    }
+
+    batch_chunk_final_logits(gpu, weights, config, s, pbs, n, dim, dim_row_bytes, per_token_hidden_out, needs_last_token_logits, do_lm_head, &ctx)?;
 
     Ok(())
 }
