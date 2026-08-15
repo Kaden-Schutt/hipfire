@@ -127,13 +127,6 @@ pub struct SpecLoadCfg {
     pub dspark_conf_threshold: Option<f32>,
 }
 
-/// One arch's load contract. Object-safe — usable as `&dyn Carrier`.
-/// Implementations live in `hipfire-loader::carriers`.
-pub trait Carrier {
-    fn name(&self) -> &'static str;
-    fn probe(&self, src: &ModelSource) -> bool;
-}
-
 /// CASK/TriAttention params forwarded by the CLI at load time.
 #[derive(Default)]
 pub struct CaskConfig {
