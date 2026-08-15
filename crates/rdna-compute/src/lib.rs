@@ -15,6 +15,7 @@ pub mod gemm;
 pub mod gemv;
 pub mod graph;
 mod kernels;
+pub mod kv_slots;
 pub mod moe;
 pub mod norm;
 pub mod pool;
@@ -25,6 +26,7 @@ pub mod rdna;
 pub mod replay;
 pub mod sampling;
 pub mod scratch;
+pub mod slot_pool;
 
 pub use compiler::KernelCompiler;
 pub use dispatch::{

@@ -2823,7 +2823,23 @@ impl Gpu {
     /// Q/K/V/output are [N × n_heads × head_dim] row-major.
     /// gate/beta are [N × n_heads] row-major.
     /// S_q8 / s_scales are the shared state (advanced N steps).
+    ///
+    /// There is deliberately NO slot axis on this kernel. DeltaNet's S state is
+    /// fixed-size and per-slot independent, and one launch advances exactly one
+    /// slot, so a caller serving slot `i` simply passes slot `i`'s own state
+    /// tensors — SP3 holds one `DeltaNetState` per slot for that reason.
+    ///
+    /// An earlier revision added `row_slot` / `s_stride_elems` kernel params to
+    /// express the slot axis as a stride. That was wrong twice over: one stride
+    /// cannot serve both `s_q8` ([n_heads x HD x HD] per slot) and `s_scales`
+    /// ([n_heads x HD] per slot), and `s_ef_residual` was never strided at all.
+    /// It was also actively harmful — `gated_delta_net_q8_fast.hip` is the
+    /// shared source for the `gated_delta_net_q8_compact2_*` variants too, so
+    /// two extra params changed the ABI of kernels whose launch sites still
+    /// packed the old 13, and the single-sequence decode path segfaulted inside
+    /// hipModuleLaunchKernel. The params are gone; the ABI is single again.
     #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
     pub fn gated_delta_net_q8_batch_seq(
         &mut self,
         q_batch: &GpuTensor,
@@ -2843,6 +2859,7 @@ impl Gpu {
         ef_residual: Option<&GpuTensor>,
     ) -> HipResult<()> {
         self.bind_thread()?;
+
         let use_fast = !dn_requant_per_token();
         let kernel_name = if use_fast {
             "gated_delta_net_q8_fast"

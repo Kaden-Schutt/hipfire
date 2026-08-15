@@ -762,6 +762,66 @@ pub fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
 }
 
 impl Gpu {
+    /// Diagnostic: trace multi-slot session continuation matching.
+    pub fn slot_trace(&self) -> bool {
+        // bind_thread: skip — pure flag read, touches no device state.
+        self.flags.slot_trace
+    }
+
+    /// Whether the multi-slot decode step should be hipGraph-captured.
+    pub fn slots_decode_graph(&self) -> bool {
+        // bind_thread: skip — pure flag read, touches no device state.
+        self.flags.slots_decode_graph
+    }
+
+    /// Install a real stream if launches are still going to the null stream.
+    ///
+    /// HIP refuses to capture the legacy default stream, so anything that
+    /// wants `begin_stream_capture` must call this first. Idempotent, and the
+    /// stream stays installed afterwards: every later launch simply goes to it
+    /// instead of the null stream.
+    pub fn ensure_capture_stream(&mut self) -> HipResult<()> {
+        self.bind_thread()?;
+        if self.active_stream.is_none() {
+            self.active_stream = Some(self.hip.stream_create()?);
+        }
+        Ok(())
+    }
+
+    /// Begin capturing this `Gpu`'s stream into a graph.
+    ///
+    /// Mode 1 is `hipStreamCaptureModeThreadLocal`: only this thread is
+    /// restricted, rather than mode 0's process-wide restriction. Everything
+    /// this crate launches during capture must already be warm -- a kernel
+    /// compile mid-capture is exactly the kind of call the mode forbids.
+    pub fn begin_stream_capture(&mut self) -> HipResult<()> {
+        self.bind_thread()?;
+        let stream = self.active_stream.as_ref().ok_or_else(|| {
+            hip_bridge::HipError::new(0, "begin_stream_capture: no active stream")
+        })?;
+        self.hip.stream_begin_capture(stream, 1)
+    }
+
+    /// Close the capture started by `begin_stream_capture`.
+    pub fn end_stream_capture(&mut self) -> HipResult<hip_bridge::Graph> {
+        self.bind_thread()?;
+        let stream = self
+            .active_stream
+            .as_ref()
+            .ok_or_else(|| hip_bridge::HipError::new(0, "end_stream_capture: no active stream"))?;
+        self.hip.stream_end_capture(stream)
+    }
+
+    /// Launch a previously instantiated graph on this `Gpu`'s stream.
+    pub fn launch_graph(&mut self, exec: &hip_bridge::GraphExec) -> HipResult<()> {
+        self.bind_thread()?;
+        let stream = self
+            .active_stream
+            .as_ref()
+            .ok_or_else(|| hip_bridge::HipError::new(0, "launch_graph: no active stream"))?;
+        self.hip.graph_launch(exec, stream)
+    }
+
     /// Returns the active stream ref for kernel launches (None = null stream).
     pub(crate) fn stream_ref(&self) -> Option<&hip_bridge::Stream> {
         self.active_stream.as_ref()
@@ -2343,6 +2403,34 @@ impl Gpu {
         })
     }
 
+    /// Batched-attention tile size, from `HIPFIRE_ATTN_TILE_SIZE`.
+    ///
+    /// Falls back to 128 when unset, zero, or not a multiple of 32. This is the
+    /// single resolver for the whole crate — three hand-mirrored copies of this
+    /// logic previously caused silent device-memory corruption when one of them
+    /// drifted (see docs/plans/2026-08-07-batched-attention-slots.md).
+    ///
+    /// Directional safety note: RAISING the tile is always safe. LOWERING it
+    /// increases `max_tiles` and therefore the `partials` bytes each query row
+    /// needs, which can exceed buffers sized elsewhere against the 128 default.
+    pub fn attn_tile_size(&self) -> usize {
+        // bind_thread: skip — pure flag read, touches no device state.
+        static CACHE: OnceLock<usize> = OnceLock::new();
+        *CACHE.get_or_init(|| {
+            self.flags
+                .attn_tile_size
+                .filter(|&t| t > 0 && t % 32 == 0)
+                .unwrap_or(128)
+        })
+    }
+
+    /// Multi-slot attention flash-vs-scalar crossover override, in tokens.
+    /// `None` leaves the per-arch default in place.
+    pub fn slots_attn_crossover(&self) -> Option<usize> {
+        // bind_thread: skip — pure flag read, touches no device state.
+        self.flags.slots_attn_crossover
+    }
+
     /// Pre-compile a batch of kernels in parallel (hipcc), then load modules + functions.
     /// Each entry is (module_name, source, func_name). Turbo kernels should have
     /// TURBO_COMMON_H already prepended in their source.
@@ -3106,16 +3194,36 @@ impl Gpu {
         // runtime dispatch path (see ensure_givens4_kernel) prepends the
         // header bodies and strips the #includes. We mirror that exactly so
         // the hash matches and the runtime re-uses our cached .hsaco.
+        //
+        // asym3 (SP1) additionally #includes "kv_slot_desc.h" — mirror
+        // ensure_givens4_kernel's conditional handling (only sources that
+        // actually contain the directive get it stripped/prepended) so the
+        // other assemble_asym callers (asym2/asym4/fwht2/fwht3/fwht4), which
+        // don't include it, keep producing byte-identical source to what the
+        // runtime compiles for them, and only asym3's precompiled hash grows
+        // to include the header.
         let assemble_asym = |body: &str| -> String {
+            let needs_kv_slot_desc = body.contains("#include \"kv_slot_desc.h\"");
             let stripped = body
                 .replace("#include \"turbo_common.h\"", "")
-                .replace("#include \"givens_common.h\"", "");
-            format!(
-                "{}\n{}\n{}",
-                kernels::TURBO_COMMON_H,
-                kernels::GIVENS_COMMON_SRC,
-                stripped
-            )
+                .replace("#include \"givens_common.h\"", "")
+                .replace("#include \"kv_slot_desc.h\"", "");
+            if needs_kv_slot_desc {
+                format!(
+                    "{}\n{}\n{}\n{}",
+                    kernels::TURBO_COMMON_H,
+                    kernels::GIVENS_COMMON_SRC,
+                    kernels::KV_SLOT_DESC_H,
+                    stripped
+                )
+            } else {
+                format!(
+                    "{}\n{}\n{}",
+                    kernels::TURBO_COMMON_H,
+                    kernels::GIVENS_COMMON_SRC,
+                    stripped
+                )
+            }
         };
 
         // Common kernels for all Qwen3.5 models (DeltaNet + FullAttn shared ops)
@@ -3606,22 +3714,50 @@ impl Gpu {
                     "attention_q8_0_kv",
                     kernels::ATTENTION_Q8_0_KV_SRC.to_string(),
                 ));
-                specs.push((
-                    "attention_q8_0_kv_batched",
-                    kernels::ATTENTION_Q8_0_KV_BATCHED_SRC.to_string(),
-                ));
-                specs.push((
-                    "attention_q8_0_kv_independent_masked_windowed",
-                    kernels::ATTENTION_Q8_0_KV_BATCHED_SRC.to_string(),
-                ));
-                specs.push((
-                    "attention_q8_0_flash_prefill",
-                    kernels::ATTENTION_Q8_0_FLASH_PREFILL_SRC.to_string(),
-                ));
-                specs.push((
-                    "kv_cache_write_q8_0_batched",
-                    kernels::KV_CACHE_WRITE_Q8_0_BATCHED_SRC.to_string(),
-                ));
+                specs.push(("attention_q8_0_kv_batched", {
+                    // Same header-stripping treatment as
+                    // attention_q8_0_kv_batched_masked_slots: the kernel
+                    // #includes kv_slot_desc.h, but this precompile path
+                    // (like the runtime hipcc compile) has no -I to
+                    // kernels/src, so the directive must be stripped and
+                    // the header body prepended instead.
+                    let stripped = kernels::ATTENTION_Q8_0_KV_BATCHED_SRC
+                        .replace("#include \"kv_slot_desc.h\"", "");
+                    format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped)
+                }));
+                specs.push(("attention_q8_0_kv_independent_masked_windowed", {
+                    // Shares ATTENTION_Q8_0_KV_BATCHED_SRC with the entry
+                    // above, so it needs the identical strip-and-prepend:
+                    // that source #includes kv_slot_desc.h and this
+                    // precompile path has no -I to kernels/src.
+                    let stripped = kernels::ATTENTION_Q8_0_KV_BATCHED_SRC
+                        .replace("#include \"kv_slot_desc.h\"", "");
+                    format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped)
+                }));
+                specs.push(("attention_q8_0_flash_prefill", {
+                    // Same header-stripping treatment as
+                    // attention_q8_0_kv_batched above: the kernel now
+                    // #includes kv_slot_desc.h (Task 6), but this
+                    // precompile path (like the runtime hipcc compile in
+                    // attention_q8_0_flash_prefill_slots) has no -I to
+                    // kernels/src, so the directive must be stripped and
+                    // the header body prepended instead.
+                    let stripped = kernels::ATTENTION_Q8_0_FLASH_PREFILL_SRC
+                        .replace("#include \"kv_slot_desc.h\"", "");
+                    format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped)
+                }));
+                specs.push(("kv_cache_write_q8_0_batched", {
+                    // Same header-stripping treatment as
+                    // attention_q8_0_kv_batched above: the kernel now
+                    // #includes kv_slot_desc.h (Task 3), but this
+                    // precompile path (like the runtime hipcc compile in
+                    // kv_cache_write_q8_0_batched_slots) has no -I to
+                    // kernels/src, so the directive must be stripped and
+                    // the header body prepended instead.
+                    let stripped = kernels::KV_CACHE_WRITE_Q8_0_BATCHED_SRC
+                        .replace("#include \"kv_slot_desc.h\"", "");
+                    format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped)
+                }));
                 specs.push((
                     "attention_flash_q8_0_tile",
                     kernels::ATTENTION_FLASH_Q8_0_TILE_SRC.to_string(),

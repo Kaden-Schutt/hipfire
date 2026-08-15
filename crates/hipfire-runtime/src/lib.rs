@@ -13,6 +13,7 @@
 //! (DFlash, DDTree), demand paging (cpu_router, weight_pager), and the
 //! [`arch::Architecture`] trait.
 
+pub mod admission;
 pub mod arch;
 pub mod arch_spec;
 pub mod augmentor;
@@ -46,14 +47,16 @@ pub mod model_load;
 pub mod model_source;
 pub mod multi_gpu;
 pub mod paro;
+pub mod prefix;
 pub mod reset_core;
 pub mod safetensors_source;
 pub mod sampler;
+pub mod serve;
 pub mod spec;
 
 pub mod spec_ngram;
 pub mod ngram_mod;
-
+pub mod swap;
 pub mod tp_shard;
 #[cfg(feature = "deltanet")]
 pub mod triattn;
@@ -64,6 +67,7 @@ pub mod emit_text;
 pub mod eos_filter;
 pub mod prompt_frame;
 pub mod semantic;
+pub mod session_table;
 pub mod tokenizer;
 
 pub mod tool_call;

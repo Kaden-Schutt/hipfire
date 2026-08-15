@@ -273,6 +273,34 @@ impl<'a> ChatFrame<'a> {
     }
 }
 
+/// Tokens that continue an existing assistant turn into the next user turn.
+///
+/// Returns `<|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n` followed by the
+/// assistant opener for `prefix`.
+///
+/// This exists so a multi-turn conversation can be built by APPENDING to the
+/// exact token sequence a session already holds, rather than re-rendering the
+/// whole history. Re-rendering cannot reproduce it: the generated turn began
+/// after an `OpenThink` opener that history rendering does not replay, and
+/// re-encoding the decoded reply is a detokenise/retokenise round trip that is
+/// not guaranteed to be the identity. Appending sidesteps both, so the result
+/// is a strict extension of what the KV actually holds — which is the
+/// precondition for prefix reuse.
+///
+/// The caller must pass the token sequence that generation ACTUALLY produced,
+/// not the client's echo of it.
+pub fn continuation_suffix(tokenizer: &Tokenizer, user: &str, prefix: AssistantPrefix) -> Vec<u32> {
+    let scaffold = ChatScaffold::for_tokenizer(tokenizer);
+    let mut out: Vec<u32> = Vec::new();
+    // Close the assistant turn the session's tokens ended in. Generation stops
+    // AT the terminator without storing it, so the closer belongs here.
+    out.extend_from_slice(&scaffold.im_end);
+    out.extend_from_slice(&scaffold.nl);
+    scaffold.append_user_turn(&mut out, user);
+    scaffold.append_assistant_prefix(&mut out, prefix);
+    out
+}
+
 /// Pre-encoded ChatML scaffolding plus a borrowed tokenizer reference.
 /// The fixed structural tokens (`<|im_start|>`, role names, `\n`,
 /// `<|im_end|>`) are encoded once up front; per-turn content gets

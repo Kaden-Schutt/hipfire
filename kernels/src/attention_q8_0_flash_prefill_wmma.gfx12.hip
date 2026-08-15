@@ -18,10 +18,17 @@
 // compiler to fully unroll O_frags: a runtime d_chunks bound otherwise puts
 // the 16 float8_t accumulators in 544 B/thread of private scratch.
 //
-// Grid:  [ceil(batch_size / M_TILE), n_heads]
+// Grid:  [ceil(batch_size / M_TILE), n_heads] in legacy (single-slot) mode, or
+//        [n_tiles, n_heads] in multi-slot mode, where n_tiles = tile_slot.len()
+//        from crates/rdna-compute/src/kv_slots.rs::build_tiles(_, M_TILE).
 // Block: 32 threads (one wave32).
+//
+// Multi-slot descriptor plumbing mirrors attention_q8_0_flash_prefill_wmma.hip
+// (the gfx11 sibling) exactly — see that file's header comment for the ABI
+// and the single-shared-slab-offset rationale.
 
 #include <hip/hip_runtime.h>
+#include "kv_slot_desc.h"
 
 typedef _Float16 __attribute__((ext_vector_type(8))) half8_t;
 typedef float __attribute__((ext_vector_type(8))) float8_t;
@@ -51,7 +58,11 @@ extern "C" __global__ __launch_bounds__(32) void attention_q8_0_flash_prefill_wm
     int n_kv_heads,
     int head_dim,
     int batch_size,
-    float scale_attn
+    float scale_attn,
+    const KvSlotDesc* __restrict__ slot_descs, // [n_slots] or nullptr = legacy
+    const int* __restrict__ tile_slot,         // [n_tiles] or nullptr = legacy
+    const int* __restrict__ tile_row0,         // [n_tiles] or nullptr = legacy
+    const int* __restrict__ tile_qbase         // [n_tiles] or nullptr = legacy
 ) {
 #if FIXED_HEAD_DIM
     if (head_dim != FIXED_HEAD_DIM) return;
@@ -60,8 +71,13 @@ extern "C" __global__ __launch_bounds__(32) void attention_q8_0_flash_prefill_wm
     const int h      = blockIdx.y;
     if (h >= n_heads) return;
 
-    const int q_base = q_tile * M_TILE;
+    const int slot = (tile_slot != nullptr) ? tile_slot[q_tile] : 0;
+    const int row0 = (tile_row0 != nullptr) ? tile_row0[q_tile] : (q_tile * M_TILE);
+    (void)row0;
+    const int q_base = (tile_qbase != nullptr) ? tile_qbase[q_tile] : (q_tile * M_TILE);
     if (q_base >= batch_size) return;
+
+    const KvSlotDesc desc = (slot_descs != nullptr) ? slot_descs[slot] : kv_slot_legacy(0, 0);
 
     const int lane    = threadIdx.x & 31;
     const int half    = lane & 15;
@@ -93,7 +109,12 @@ extern "C" __global__ __launch_bounds__(32) void attention_q8_0_flash_prefill_wm
     float*    l_lds = m_lds + M_TILE;
     float*    a_lds = l_lds + M_TILE;
 
-    const int rows = min(M_TILE, batch_size - q_base);
+    // Ragged-tile bound (multi-slot mode; see the gfx11 sibling's comment).
+    int rows_end = batch_size;
+    if (tile_qbase != nullptr && (q_tile + 1) < (int)gridDim.x) {
+        rows_end = tile_qbase[q_tile + 1];
+    }
+    const int rows = min(M_TILE, rows_end - q_base);
 
     for (int i = lane; i < M_TILE * head_dim; i += 32) {
         const int r = i / head_dim;
@@ -132,8 +153,10 @@ extern "C" __global__ __launch_bounds__(32) void attention_q8_0_flash_prefill_wm
         {
             const int my_k = kt + half;
             const bool k_ok = half < t_len;
+            // ONE shared slab offset (kv_offset_for_k, i.e. desc.k_base) for
+            // both K and V — see the gfx11 sibling's comment.
             const unsigned char* kb =
-                k_ok ? (k_cache + (size_t)my_k * row_stride + kv_blk * 34) : nullptr;
+                k_ok ? (k_cache + kv_offset_for_k(desc, my_k, row_stride) + kv_blk * 34) : nullptr;
 
 #pragma unroll
             for (int dc = 0; dc < d_chunks; ++dc) {
@@ -213,7 +236,7 @@ extern "C" __global__ __launch_bounds__(32) void attention_q8_0_flash_prefill_wm
         for (int kr = 0; kr < N_TILE; ++kr) {
             if (kr < t_len) {
                 const unsigned char* vb =
-                    v_cache + (size_t)(kt + kr) * row_stride
+                    v_cache + kv_offset_for_k(desc, kt + kr, row_stride)
                     + kv_blk * 34 + v_blk * 34;
                 const float vs = (float)*((const _Float16*)vb);
                 for (int e = 0; e < dpl; ++e)

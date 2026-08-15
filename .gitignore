@@ -156,6 +156,9 @@ redline/db/redline.db
 # Local research scratch (agent surveys, microbenches)
 .research/
 
+# superpowers subagent-driven-development scratch (ledger, briefs, review packages)
+.superpowers/
+
 # Code-intelligence index (per-checkout, machine-local)
 .codegraph/
 # Gate-run artifacts (parent-calibration manifests, gate logs). Regenerate

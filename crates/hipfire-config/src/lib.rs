@@ -690,6 +690,15 @@ pub static FIELDS: &[ConfigField] = &[
         "HIPFIRE_LOCAL",
         "Force the current command to use a locally spawned daemon."
     ),
+    process_bool_field!(
+        "serve.multi_slot",
+        "multi_slot",
+        Serve,
+        false,
+        false,
+        "HIPFIRE_SERVE_MULTI_SLOT",
+        "Serve requests concurrently on the multi-slot engine instead of one at a time."
+    ),
     field!(
         "generation.temperature",
         "temperature",
@@ -4228,6 +4237,7 @@ fn config_profile_bundle(name: &str) -> Option<Vec<(&'static str, ConfigValue)>>
             ("serve.port", ConfigValue::Integer(11435)),
             ("serve.idle_timeout_seconds", ConfigValue::Integer(300)),
             ("serve.local", ConfigValue::Bool(false)),
+            ("serve.multi_slot", ConfigValue::Bool(false)),
         ],
         "dev" => vec![
             ("hardware.devices", ConfigValue::String("0".to_owned())),
