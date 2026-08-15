@@ -484,6 +484,20 @@ These two targets and § 6 are in direct conflict. The conflict is the finding;
 it is not resolvable by more refactoring, and resolving it either way is a
 maintainer's call, not a refactor's.
 
+### One-command build, verified on three GPU architectures
+
+`cargo build --release` with no `--features`, each from the branch at
+`2a6624790`:
+
+| host | GPUs | arch | build | generation |
+|---|---|---|---|---|
+| local | 1 | gfx1201 | clean clone, exit 0 | lfm2.5-1.2b q8, 3-run median **181.22 tok/s** (baseline 181.99) |
+| hiptrx | 4 | gfx1201 | exit 0 | qwen3.5-0.8b mq4 pp=2, **387.8 tok/s** (baseline 385.3) |
+| hipx | 4 | gfx1010 | fresh worktree, 1m07s, exit 0 | lfm2.5-1.2b q8, 222 tok @ **261.79 tok/s** |
+
+Both binaries (`hipfire`, `daemon`) are produced on every host, and every run
+was checked by reading the decoded text, not just the throughput number.
+
 The 2,012 movable lines are a genuine, separable improvement on their own
 merits — 67 spec-orchestration functions that any future architecture could
 reuse. They are left in place here because the gate they were measured against
