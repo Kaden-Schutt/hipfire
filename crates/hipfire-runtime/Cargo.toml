@@ -28,7 +28,7 @@ description = "Inference orchestrator for RDNA GPUs"
 # dev-dep edge from the cycle check.
 #
 # Side-effect: when a workspace example is built (via
-# `cargo build --example daemon` etc.), cargo's resolver follows the
+# `cargo build -p hipfire-daemon` etc.), cargo's resolver follows the
 # dev-dep edge in both directions, which activates the `default`
 # feature on `hipfire-runtime` from the dev-dep activation path. That
 # in turn re-activates all `arch-*` features, undoing any
@@ -150,10 +150,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 #
 # Examples NOT listed here (bench_q8, probe_wmma, dump_meta, …) do not
 # touch arch crates and build under any feature combination.
-
-[[example]]
-name = "daemon"
-required-features = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-cohere2moe", "arch-dots-ocr", "arch-gemma4", "arch-muse-glimmer"]
 
 [[example]]
 name = "hfq_split"

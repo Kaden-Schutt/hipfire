@@ -1927,7 +1927,7 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
 
     let daemon = find_daemon(paths).ok_or_else(|| {
         anyhow!(
-            "daemon binary not found; build `cargo build --release --features deltanet -p hipfire-runtime --example daemon`"
+            "daemon binary not found; build `cargo build --release -p hipfire-daemon`"
         )
     })?;
     let process_config = hipfire_config::ProcessConfig::from_resolved(&resolved)?;
@@ -9270,8 +9270,8 @@ fn find_daemon(paths: &Paths) -> Option<PathBuf> {
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target");
     [
         paths.root.join("bin/daemon"),
-        workspace.join("release/examples/daemon"),
-        workspace.join("debug/examples/daemon"),
+        workspace.join("release/daemon"),
+        workspace.join("debug/daemon"),
     ]
     .into_iter()
     .find(|path| path.is_file())

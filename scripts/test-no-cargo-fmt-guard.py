@@ -28,7 +28,7 @@ cases = [
  ("ALLOW","cargo test","cargo test --lib"),
  ("ALLOW","cargo clippy","cargo clippy --workspace"),
  ("ALLOW","grep mentioning it","grep -rn 'cargo fmt' CLAUDE.md"),
- ("ALLOW","daemon build","cargo build --release --example daemon --features deltanet -p hipfire-runtime"),
+ ("ALLOW","daemon build","cargo build --release -p hipfire-daemon"),
 
  ("DENY","subshell trailing paren","(cargo fmt)"),
  ("DENY","backgrounded","cargo fmt &"),

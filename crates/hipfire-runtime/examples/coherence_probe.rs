@@ -178,8 +178,8 @@ fn find_daemon_binary() -> Result<PathBuf, String> {
     // Prefer release; fall back to debug. Mirror the gate scripts'
     // discovery behaviour.
     let candidates = [
-        "target/release/examples/daemon",
-        "target/debug/examples/daemon",
+        "target/release/daemon",
+        "target/debug/daemon",
     ];
     for c in candidates {
         let p = PathBuf::from(c);
@@ -187,7 +187,7 @@ fn find_daemon_binary() -> Result<PathBuf, String> {
             return Ok(p);
         }
     }
-    Err("daemon binary not found; run `cargo build --release --example daemon --features deltanet` first".into())
+    Err("daemon binary not found; run `cargo build --release -p hipfire-daemon` first".into())
 }
 
 fn print_live(name: &str, verdict: &Verdict, t_ms: u64, pos: Option<usize>) {

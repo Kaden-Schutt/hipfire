@@ -11,7 +11,7 @@ export HIPFIRE_MMQ=1
 export HIPFIRE_PROFILE=1
 
 MODEL="${1:-$HOME/.hipfire/models/qwen3.5-9b.mq4}"
-EXE="target/release/examples/daemon"
+EXE="target/release/daemon"
 SYSTEM_FILE="benchmarks/prompts/tool_call_system.txt"
 
 system_text=$(python3 -c "import sys,json; print(json.dumps(open(sys.argv[1]).read()))" "$SYSTEM_FILE")

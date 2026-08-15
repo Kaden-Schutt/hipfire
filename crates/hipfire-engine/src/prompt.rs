@@ -4,7 +4,7 @@
 
 //! Prompt-frame helpers — architecture-neutral Jinja/ChatFrame rendering.
 //!
-//! Relocated verbatim from `crates/hipfire-runtime/examples/daemon.rs` (wave 3).
+//! Relocated verbatim from `crates/hipfire-daemon/src/main.rs` (wave 3).
 
 /// Pure helper: derive Jinja `enable_thinking` and `reasoning_effort` from the
 /// exact raw request effort and the `max_think` cap. Do not lowercase and do

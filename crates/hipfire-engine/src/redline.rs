@@ -8,7 +8,7 @@
 //! `daemon.rs` because they branch on `Qwen35Bundle` / `Deepseek4Bundle` etc.
 //! Only the generic helpers that operate on raw buffers are moved here.
 //!
-//! Relocated verbatim from `crates/hipfire-runtime/examples/daemon.rs` (wave 3).
+//! Relocated verbatim from `crates/hipfire-daemon/src/main.rs` (wave 3).
 
 pub fn redline_capture_json(
     gpu: &rdna_compute::Gpu,

@@ -495,7 +495,7 @@ fn render_tool_call_qwen_xml(tc: &ToolCall) -> String {
 /// (`None` if unset) and the loaded model path. Lives in the lib — not only in
 /// the CLI's `resolveToolGrammar` — so the DAEMON defaults correctly when
 /// launched DIRECTLY: the GPU behavior gate and `coherence-gate.sh` /
-/// `agentic-gate.sh` spawn `examples/daemon` without the CLI's `applyConfigEnv`,
+/// `agentic-gate.sh` spawn `target/release/daemon` (hipfire-daemon) without the CLI's `applyConfigEnv`,
 /// so without this they fall back to Hermes and never exercise the native-XML
 /// path. Precedence: explicit env wins (`"0"` = off kill-switch, any other set
 /// value = on); otherwise carnice (Hermes-native) => ON, plain Qwen3.5/3.6
@@ -560,7 +560,7 @@ pub fn build_cached_history(
     // live user via `live_user_tokens`. Without this trim, the live
     // user turn gets rendered twice (once from history, once from
     // `live_user_tokens`). Mirrors V4F's daemon-side renderer at
-    // `crates/hipfire-runtime/examples/daemon.rs:5163`.
+    // `crates/hipfire-daemon/src/main.rs:5163`.
     let trim_end = if matches!(history.last().map(|m| &m.role), Some(Role::User)) {
         1
     } else {

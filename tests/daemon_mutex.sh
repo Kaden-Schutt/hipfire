@@ -8,7 +8,7 @@
 # second daemon fails fast without allocating VRAM.
 
 set -uo pipefail
-DAEMON="target/release/examples/daemon"
+DAEMON="target/release/daemon"
 if [[ ! -x "$DAEMON" ]]; then echo "missing $DAEMON"; exit 2; fi
 
 # Start daemon A — keep stdin open so it stays alive waiting for JSON.

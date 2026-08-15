@@ -9,7 +9,7 @@
 //! ownership contract governing this module.
 //!
 //! Values are taken verbatim from the two duplicated ladders in
-//! `crates/hipfire-runtime/examples/daemon.rs:1310` and `:14618` plus the
+//! `crates/hipfire-daemon/src/main.rs:1310` and `:14618` plus the
 //! repeat-penalty branches at `:1336`/`:14697`. No guesses — the numbers
 //! below are the code.
 

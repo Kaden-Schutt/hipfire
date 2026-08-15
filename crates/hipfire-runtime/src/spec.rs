@@ -18,7 +18,7 @@
 //!
 //! Status: the trait, the unified [`SpecStep`] result, and the borrowed-target /
 //! erased-grammar interfaces are live. The daemon's DFlash decode loop drives a
-//! `&mut dyn Speculator` (`examples/daemon.rs::generate_dflash`), with the
+//! `&mut dyn Speculator` (`hipfire-daemon/src/main.rs::generate_dflash`), with the
 //! loader's `DflashSpeculator` as the sole impl. Still future work: a generic
 //! `build_speculator` registry (dispatch on arch/draft kind) and additional
 //! drafters (n-gram, MTP, EAGLE) — the AR one-token path still runs through

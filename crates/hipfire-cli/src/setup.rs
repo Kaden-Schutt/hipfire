@@ -237,16 +237,7 @@ pub(crate) fn setup_command(paths: &crate::Paths, args: crate::SetupArgs) -> Res
     run_cargo_required(
         &source,
         &rocm_root,
-        &[
-            "build",
-            "--release",
-            "--features",
-            "deltanet",
-            "--example",
-            "daemon",
-            "-p",
-            "hipfire-runtime",
-        ],
+        &["build", "--release", "-p", "hipfire-daemon"],
         "required runtime (daemon) build",
     )?;
     ensure_not_interrupted()?;
@@ -291,7 +282,7 @@ pub(crate) fn setup_command(paths: &crate::Paths, args: crate::SetupArgs) -> Res
         };
 
     install_one(
-        &release.join("examples").join("daemon"),
+        &release.join("daemon"),
         &bin_dir.join("daemon"),
         &mut replacements,
     )?;

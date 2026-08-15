@@ -4,7 +4,7 @@
 
 //! Host-side continuous-batch scheduler — architecture-neutral.
 //!
-//! Relocated verbatim from `crates/hipfire-runtime/examples/daemon.rs` (wave 3).
+//! Relocated verbatim from `crates/hipfire-daemon/src/main.rs` (wave 3).
 //! No behaviour change.
 
 use std::time::Instant;

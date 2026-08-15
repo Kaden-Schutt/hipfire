@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
 
-//! Extracted from `crates/hipfire-runtime/examples/daemon.rs`
+//! Extracted from `crates/hipfire-daemon/src/main.rs`
 //! `#[cfg(test)] mod tool_call_parser_tests` (block 11/22).
 //! Original assertions preserved verbatim; import rewritten from
 //! `super::extract_tool_calls_from_text` to the public path

@@ -4,7 +4,7 @@
 
 //! Emit helpers — architecture-neutral JSONL wire protocol.
 //!
-//! Relocated verbatim from `crates/hipfire-runtime/examples/daemon.rs` (wave 3).
+//! Relocated verbatim from `crates/hipfire-daemon/src/main.rs` (wave 3).
 
 use crate::terminal::active_attempt_id;
 
