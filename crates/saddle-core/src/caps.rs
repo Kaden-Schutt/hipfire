@@ -87,15 +87,15 @@ impl ArchCaps {
         matches!(self.dflash, Some(DflashKind::Llama))
     }
 
-    /// True if this arch advertises any semantic-v2 contract (`Some(2)`).
+    /// True if this arch advertises semantic-v2 contract (`Some(2)`).
     pub fn supports_semantic_v2(&self) -> bool {
-        self.semantic_contract_version.is_some()
+        self.semantic_contract_version == Some(2)
     }
 
     /// True for the Qwen semantic-v2 path (DeltaNet + v2). Covers
     /// `daemon.rs:19684`.
     pub fn qwen_semantic_v2(&self) -> bool {
-        self.has_deltanet && self.semantic_contract_version.is_some()
+        self.has_deltanet && self.semantic_contract_version == Some(2)
     }
 }
 

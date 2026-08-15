@@ -194,36 +194,34 @@ fn is_batch_request_eligible(
         kv_adaptive: has_adaptive,
     };
     let route = select_generation_route(&route_inputs);
-    if caps.has_deltanet {
-        if route != GenerationRoute::QwenAr {
-            return false;
-        }
-        if m.qwen35_decode_batch.is_none() {
-            return false;
-        }
-        if let Some(ModelState::Qwen35(bundle)) = m.state.as_ref() {
-            if !qwen_batch_weight_formats_supported(&bundle.weights) {
-                return false;
+    if caps.supports_continuous_batch {
+        match m.state.as_ref() {
+            Some(ModelState::Qwen35(bundle)) => {
+                if route != GenerationRoute::QwenAr {
+                    return false;
+                }
+                if m.qwen35_decode_batch.is_none() {
+                    return false;
+                }
+                if !qwen_batch_weight_formats_supported(&bundle.weights) {
+                    return false;
+                }
             }
-        } else {
-            return false;
-        }
-    } else if caps.supports_continuous_batch {
-        if route != GenerationRoute::LfmAr {
-            return false;
-        }
-        if m.lfm2_decode_batch.is_none() {
-            return false;
-        }
-        if let Some(ModelState::Lfm2Moe(bundle)) = m.state.as_ref() {
-            if !bundle.config.is_dense() {
-                return false;
+            Some(ModelState::Lfm2Moe(bundle)) => {
+                if route != GenerationRoute::LfmAr {
+                    return false;
+                }
+                if m.lfm2_decode_batch.is_none() {
+                    return false;
+                }
+                if !bundle.config.is_dense() {
+                    return false;
+                }
+                if lfm2moe::batch_weight_formats_supported(&bundle.weights).is_err() {
+                    return false;
+                }
             }
-            if lfm2moe::batch_weight_formats_supported(&bundle.weights).is_err() {
-                return false;
-            }
-        } else {
-            return false;
+            _ => return false,
         }
     } else {
         return false;
@@ -17204,7 +17202,7 @@ fn generate_dflash(
     // releases calls or stores cache. Other arches keep whole-output extract.
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let qwen_semantic_v2 = hipfire_loader::carrier_for(m.arch_id)
-        .map(|c| c.caps().has_deltanet)
+        .map(|c| c.caps().semantic_contract_version == Some(2))
         .unwrap_or(false);
 
     // Trim the trailing `<|im_end|>` + newline trailer from streamed_tokens so
