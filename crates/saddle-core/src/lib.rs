@@ -63,6 +63,10 @@ pub mod caps;
 /// Lean-up map item **C4**.
 pub mod sampling;
 
-// `spec` — speculative-decode orchestration — is added in wave 4 against a
-// written contract, not before. It is the highest-risk item on the map
-// (~20k lines across two architectures) and must not be started ad hoc.
+/// Speculative-decode orchestration shared across architectures. Absorbs the
+/// same-named file pairs each architecture reimplements — `spec_emit.rs`
+/// (903 + 270), `spec_impl.rs` (629 + 1,026), `mtp_speculator.rs` (225 + 320).
+/// The bulk of qwen35's speculation is genuinely arch-specific and stays put.
+/// Sits behind the existing `SpecTarget` seam rather than replacing it.
+/// Lean-up map item **B2**.
+pub mod spec;
