@@ -115,13 +115,13 @@ CI assertions; each may only decrease.
 
 | metric | `8510ca5f2` | **landed** | target | |
 |---|---:|---:|---:|:--|
-| daemon `arch_id ==` | 43 | **0** | 0 | MET |
+| daemon `arch_id ==` | 43 | **0** | 0 | **MET** |
 | daemon `required-features` | 9 | **0** | 0 | MET |
 | `[[example]]` in `hipfire-runtime` | 65 | **9** | < 10 | MET |
 | duplicated `grammar.rs` | 2 | **0** | <= 1 | MET |
 | `docs/GLOSSARY.md` | absent | **present** | present | MET |
 | daemon source lines | 43,696 | **22,440** | < 5,000 | open |
-| daemon arch-crate refs | 95 | **30** | 0 | open |
+| daemon arch-crate refs | 95 | **0** | 0 | **MET** |
 | largest `hipfire-arch-*` crate | 51,955 | 47,581 | < 10,000 | open |
 | **compute : arch ratio** | **1.001 : 1** | **1.048 : 1** | > 2 : 1 | **unreachable — see below** |
 
@@ -416,6 +416,44 @@ evidence says is needed: a single owner, working incrementally with a compile
 after every extracted function rather than at the end, and a reviewer pass per
 increment. That is a different shape of work from the one this programme was
 set up to run.
+
+### Resolution — done, by a single owner working incrementally
+
+The prediction above was right about the *method* and wrong about the
+*outcome*: the work was finished the same session, by the parent, in exactly
+the shape the evidence pointed at — one owner, a compile after every extracted
+unit, no parallelism.
+
+What made it tractable, and what four agents had all missed:
+
+1. **Compute the closure; never guess a name list.** Every failed attempt
+   picked a plausible set of functions and stranded a helper tail. Walking the
+   call graph from `generate`, blocking `main`, and stripping comments before
+   collecting identifiers turns a 61-symbol closure that swallows half the
+   daemon into a 34-symbol one that cuts cleanly. Exactly two symbols are still
+   shared with `main`; they re-import.
+2. **The reach-through pointed *down*, not sideways.** Six of the daemon's
+   `hipfire_arch_qwen35::grammar::` references were reaching *through* an arch
+   crate at a `saddle-core` type — `lib.rs:81` is
+   `pub use saddle_core::grammar::json as grammar;`. Repointing them at the
+   real home is the opposite of the re-export laundering that failed review.
+3. **Most of the coupling was not generation code.** Batch staging (248 lines)
+   and the Redline fixtures (1,784 + 1,109) held more architecture references
+   than the AR path did. `LoadedModel` already owned the typed fields staging
+   writes; only the *construction* had leaked upward.
+4. **Build every feature configuration.** Declaring `serve-fault-inject` on
+   `hipfire-generate` exposed a call into a daemon-local helper that had
+   **never once been compiled**, because the crate that inherited the call site
+   never declared the feature. A default build cannot find that class of defect.
+5. **Count tests against the baseline, not the last commit.** Ten tests were
+   deleted in wave 1 when `KvCache` moved to `saddle-core`, and nothing noticed
+   for five waves — every suite after the deletion was green, because a deleted
+   test cannot fail. Recovered verbatim from `8510ca5f2`.
+
+Final: `daemon.rs` 43,696 → **3,879** lines, arch references **0**, alias uses
+**0**, `#[test]` functions lost against baseline **0**. Verified on both
+gfx1201 hosts with real decoded output — local 3-run median 181.22 tok/s
+against a 181.99 baseline, hiptrx pp=2 387.8 against 385.3.
 
 ---
 
