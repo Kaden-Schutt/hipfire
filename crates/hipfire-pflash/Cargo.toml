@@ -6,8 +6,9 @@ license.workspace = true
 description = "PFlash speculative prefill compression — retained legacy research (historical reproduction only)"
 
 [features]
-default = ["deltanet"]
+default = ["deltanet", "arch-qwen35"]
 deltanet = ["hipfire-runtime/deltanet", "rdna-compute/deltanet", "hipfire-arch-qwen35/deltanet"]
+arch-qwen35 = []
 
 [dependencies]
 hip-bridge = { path = "../hip-bridge" }
