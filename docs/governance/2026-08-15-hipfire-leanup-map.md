@@ -120,8 +120,8 @@ CI assertions; each may only decrease.
 | `[[example]]` in `hipfire-runtime` | 65 | **9** | < 10 | MET |
 | duplicated `grammar.rs` | 2 | **0** | <= 1 | MET |
 | `docs/GLOSSARY.md` | absent | **present** | present | MET |
-| daemon source lines | 43,696 | 39,591 | < 5,000 | open |
-| daemon arch-crate refs | 95 | 66 | 0 | open |
+| daemon source lines | 43,696 | 37,642 | < 5,000 | open |
+| daemon arch-crate refs | 95 | 57 | 0 | open |
 | largest `hipfire-arch-*` crate | 51,955 | 47,581 | < 10,000 | open |
 | **compute : arch ratio** | **1.001 : 1** | **1.048 : 1** | > 2 : 1 | **unreachable — see below** |
 
@@ -296,6 +296,56 @@ Per-arch agents, one crate each, once every shared concern has moved out.
 The parent re-runs every gate in § 3 after each wave. A subagent's self-report
 is never the evidence. Full-workspace build, `cargo fmt` and `clippy` run
 **once per wave, by the parent**, after the wave lands — never inside an agent.
+
+### Wave 5 / D3 outcome — one third landed, two thirds rejected
+
+The deadlock that blocked D3 was resolved by scaffolding `crates/hipfire-generate`
+above the engine layer. The per-arch generation bodies need both arch types and
+engine helpers; `hipfire-loader` has the arch deps but sits below the engine,
+and `hipfire-engine` sits above the loader but is arch-free by design. A layer
+above both is the only place they fit.
+
+Three agents were dispatched, one per architecture family.
+
+**Landed — `vision` (`6e43b4f11`).** `generate_vl`, `generate_vl_dots_ocr`,
+`generate_dots_ocr_text` plus their exclusive helpers -> `hipfire-generate::vision`
+(2,034 lines). Daemon 39,591 -> 37,642; arch refs 66 -> 57. This agent also
+corrected a measurement error in the task brief: a naive span put
+`generate_dots_ocr_text` at ~7,153 lines, but brace-matching showed the real
+extent is **182** — the naive figure was measuring to end-of-file.
+
+**Rejected — `qwen` (`wave5/GenQwen`, 8,300 lines) and `dense`
+(`wave5/GenDense`, 8,488).** Both branches are preserved and unmerged. They
+were not landed for two reasons:
+
+1. **`dense.rs:1578` contains a `generate_spec` that returns `None`**, marked
+   *"Stub for isolated build — real implementation lives in qwen.rs at merge"*,
+   and `generate_deepseek4_spec` calls it. Landing that silently breaks
+   DeepSeek-V4 speculative decode. This is the same callable-stub class a
+   reviewer rejected earlier in the programme.
+2. **Roughly 90 helpers are duplicated between the two modules.** Each agent
+   copied the shared helpers it needed to make its own crate build in
+   isolation, and both deferred de-duplication to "merge time" — a step no
+   agent owned. Landing both would add ~12k lines of duplicated code to move a
+   line-count metric, which is the opposite of what this programme exists to do.
+
+**Why the decomposition failed, and what would work.** The three families were
+split on the assumption that they were independent. They are not: they share
+about fifty helpers (`asst_turn_fingerprint`, `production_fail_closed_rollback`,
+`free_checkpoints`, `emit_committed_event`, the `ds4_*` cache family, the
+`spec_*` family). File-level ownership cannot partition a set of functions with
+a shared tail.
+
+The correct shape is sequential, not parallel: first extract the shared helpers
+into a `hipfire-generate::common` module with a single owner, then move each
+family on top of it. That is a bounded follow-up, and the `hipfire-generate`
+scaffold plus the `vision` module already establish the pattern. The two
+rejected branches remain available to harvest their verbatim bodies once
+`common` exists.
+
+**Consequence for the ratchets.** `daemon arch refs` reaches 57, not 0, and
+daemon lines 37,642, not < 5,000. Both remain open and both are reachable by
+the sequential route above. They were not closed by accepting a stub.
 
 ---
 
