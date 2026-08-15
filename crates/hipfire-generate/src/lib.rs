@@ -28,6 +28,11 @@
 //! and the three can be filled concurrently without collision. This file and
 //! `Cargo.toml` are scaffold-owned and belong to no agent.
 
+/// Helpers shared by more than one family — the tail that made the first
+/// three-way split fail. Single owner; families depend on it and never on
+/// each other.
+pub mod common;
+
 /// Qwen3.5/3.6 family: the multi-token path, native MTP, speculative and
 /// DFlash routes, and expert-parallel. The largest group —
 /// `generate_multi` alone is ~5,300 lines.
