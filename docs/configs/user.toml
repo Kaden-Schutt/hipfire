@@ -19,6 +19,7 @@ max_total_tokens = 0
 [memory]
 # Replaces HIPFIRE_KV_MODE=q8.
 kv_cache = "q8"
+kv_backend = "contiguous"
 max_seq = 32768
 # Replaces HIPFIRE_PROMPT_CACHE_CAP=32.
 prompt_cache_capacity = 32

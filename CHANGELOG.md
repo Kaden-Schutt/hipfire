@@ -16,6 +16,17 @@ tok/s respectively; final turns remain at 160.3 tok/s at 18.2K, 82.5 tok/s at
 approximately 110 to 203.9 tok/s without speculative decoding or manual clock
 pinning.
 
+Two model families join the registry. Qwen 3.8 27B is a dense arch-5 text
+tower with native 262K context and an xhigh thinking default, shipping as a
+quality trunk (`qwen3.8:27b`, MQ4) plus a cheaper MQ4R speed SKU
+(`qwen3.8:27b-fast`). Muse Glimmer 30B is a new architecture (arch 14): a
+dense text tower with a perception encoder and a 3:1 sliding/full attention
+layout where the full layers are NoPE, shipping as `muse-glimmer` (MQ4 body,
+Q8 attention and lm_head), `muse-glimmer:fast` (MQ4R), and a block-diffusion
+DFlash drafter (`muse-glimmer:draft`, arch 23) that reuses the target's embed
+and lm_head and pairs with either SKU. Glimmer's `.mq4r` SKU is not lowered to
+Redline PM4 yet, so automatic Redline admission is withheld for it.
+
 Single-GPU Qwen A3B `.mq4r` models now request retained PM4 by default on
 gfx1100, gfx1151, and gfx1201. gfx1200 and other architectures remain opt-in;
 the built-in `hip` configuration profile disables the automatic Redline route.

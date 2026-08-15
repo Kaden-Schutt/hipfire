@@ -378,6 +378,71 @@ impl Qwen35BatchCompatibility {
     }
 }
 
+/// Per-request 3D rope state. `None` for text-only requests, which keeps the
+/// original 1D kernels and their dispatch identity (and hence the certified
+/// retained-PM4 tape). Because a text token takes the same value on all three
+/// axes, 3D mrope with `t == h == w` is bit-identical to 1D RoPE
+/// (`crates/rdna-compute/examples/test_mrope_rope_parity.rs` asserts this),
+/// so gating on "the request actually contains image tokens" is safe: a
+/// text-only sequence would compute identical numbers either way.
+///
+/// Built by the daemon from the image span it already computes when splicing
+/// visual tokens at `<|image_pad|>`; consumed by [`forward_scratch_mrope`] /
+/// [`forward_scratch_embed_mrope`].
+#[derive(Debug, Clone)]
+pub struct MropeCtx {
+    /// Sequence position that `positions[0]` describes — the value of the
+    /// conversation cursor when this request's prefill started. Positions
+    /// BELOW `base` belong to earlier turns and are not modelled here.
+    pub base: usize,
+    /// Per-token (t, h, w) for this request's prompt, already offset by
+    /// `base` so the values are absolute rope phases.
+    pub positions: Vec<[i32; 3]>,
+    /// Added to the running sequence length for decode-step positions.
+    /// `max(positions) + 1 - (base + positions.len())`.
+    pub rope_delta: i32,
+    /// `Qwen35Config::mrope_section` — [T, H, W] frequency counts.
+    pub section: [usize; 3],
+}
+
+impl MropeCtx {
+    /// Build from the loaded model config. `section` is read from
+    /// [`Qwen35Config::mrope_section`] here rather than taken from the caller,
+    /// so a request can never rotate with a section that disagrees with the
+    /// checkpoint that produced the weights.
+    pub fn new(
+        config: &Qwen35Config,
+        base: usize,
+        positions: Vec<[i32; 3]>,
+        rope_delta: i32,
+    ) -> Self {
+        Self {
+            base,
+            positions,
+            rope_delta,
+            section: config.mrope_section,
+        }
+    }
+
+    /// (t, h, w) for sequence position `pos`.
+    ///
+    /// Inside the prompt this is the precomputed grid coordinate. Past the
+    /// prompt (a generated token) all three axes collapse to
+    /// `pos + rope_delta`, which is HF's decode formula: the cursor resumes
+    /// at `max(image positions) + 1` rather than at the token index.
+    pub fn pos3(&self, pos: usize) -> [i32; 3] {
+        debug_assert!(
+            pos >= self.base,
+            "MropeCtx::pos3 called below base ({pos} < {})",
+            self.base
+        );
+        match pos.checked_sub(self.base).and_then(|i| self.positions.get(i)) {
+            Some(p) => *p,
+            None => [pos as i32 + self.rope_delta; 3],
+        }
+    }
+}
+
 /// Nested `rope_parameters` block. All fields optional — Qwen3.5 carries
 /// `rope_theta` here; VL/mrope variants add the section + interleave flags.
 /// `partial_rotary_factor` may also live FLAT on the text config (handled in
@@ -2809,24 +2874,13 @@ fn load_weight_tensor_raw(
             })
         }
         16 => {
-            // BF16 — widen losslessly to F32 on host, then upload as F32.
-            // bf16 is the high 16 bits of an f32 (same sign/exp, 7 mantissa
-            // bits), so `from_bits((bf16 as u32) << 16)` is exact. The engine
-            // has no native bf16 GEMV for the text arch; the gfx942 bf16 MFMA
-            // GEMM (kernels/src/gemm_bf16_mfma.gfx942.hip) is the perf path and
-            // is documented as a deferred gap. F32 compute over bf16-rounded
-            // weights is a superset-precision oracle.
-            let f32_data: Vec<f32> = data
-                .chunks_exact(2)
-                .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
-                .collect();
-            let bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
-            };
-            let buf = gpu.upload_raw(bytes, &[m, k])?;
+            // Native BF16 storage, F32 accumulation. This is source-exact for
+            // BF16 checkpoints while retaining the two-byte memory traffic;
+            // the unified dispatcher routes it through GemvBf16.
+            let buf = gpu.upload_raw(data, &[m, k])?;
             Ok(WeightTensor {
                 buf,
-                gpu_dtype: DType::F32,
+                gpu_dtype: DType::BF16,
                 m,
                 k,
                 row_stride: 0,
@@ -6386,7 +6440,7 @@ fn forward_from_x_gpu(
 
     // Run the production pipeline
     forward_scratch_layers(
-        gpu, weights, config, pos, kv_cache, dn_state, &scratch, None,
+        gpu, weights, config, pos, kv_cache, dn_state, &scratch, None, None,
     )?;
 
     // DEBUG_LAYERS: dump per-layer residual norms
@@ -6417,6 +6471,10 @@ pub struct Qwen35Scratch {
     pub x: GpuTensor,                      // [dim]
     pub tmp: GpuTensor,                    // [dim]
     pub pos_buf: hip_bridge::DeviceBuffer, // 4 bytes
+    /// 3 i32 = (t, h, w) for the 3D mrope kernels. Written ONLY on the VL
+    /// path (`MropeCtx` present); the 1D kernels never read it, so the
+    /// text-only dispatch sequence is unaffected by its existence.
+    pub pos_buf3: hip_bridge::DeviceBuffer, // 12 bytes
 
     // DeltaNet temporaries (reused across layers)
     pub dn_qkv: GpuTensor,      // [qkv_dim]
@@ -6527,6 +6585,7 @@ impl Qwen35Scratch {
             x: gpu.alloc_tensor(&[dim], DType::F32)?,
             tmp: gpu.alloc_tensor(&[dim], DType::F32)?,
             pos_buf: gpu.hip.malloc(4)?,
+            pos_buf3: gpu.hip.malloc(12)?,
 
             dn_qkv: gpu.alloc_tensor(&[qkv_dim], DType::F32)?,
             dn_z: gpu.alloc_tensor(&[v_dim], DType::F32)?,
@@ -6729,6 +6788,7 @@ impl Qwen35Scratch {
         note(gpu.free_tensor(self.tmp));
         let _ = gpu.bind_thread();
         note(gpu.hip.free(self.pos_buf).map(|_| ()));
+        note(gpu.hip.free(self.pos_buf3).map(|_| ()));
         for t in [
             self.dn_qkv,
             self.dn_z,
@@ -6847,6 +6907,16 @@ fn ar_graph_trace_enabled() -> bool {
             .as_deref()
             == Some("1")
     })
+}
+
+#[inline]
+fn ar_graph_eligible_for_kv(requested: bool, compact_offset: usize) -> bool {
+    // The captured single-token route is built while compact_offset is zero.
+    // After eviction, Q/K RoPE must use physical_pos + compact_offset, and the
+    // offset changes again at every later eviction. Neither hipGraph nor the
+    // retained replay route currently has a dynamic offset input, so replaying
+    // the old route silently rotates at the physical slot and corrupts decode.
+    requested && compact_offset == 0
 }
 
 /// Zero-alloc forward pass using pre-allocated scratch buffers.
@@ -6975,7 +7045,9 @@ pub fn forward_scratch(
     // right before their `forward_scratch` call so the plain-AR graph can never
     // capture or replay in a non-sequential context. An ineligible call also
     // INVALIDATES any captured graph (forces re-capture on the next plain call).
-    let graph_eligible = std::mem::replace(&mut gpu.graphs.ar_graph_eligible, true);
+    let requested_graph_eligible = std::mem::replace(&mut gpu.graphs.ar_graph_eligible, true);
+    let graph_eligible =
+        ar_graph_eligible_for_kv(requested_graph_eligible, kv_cache.compact_offset);
     // Redline's plain-AR capture/replay has the same eligibility contract as
     // the AR HipGraph. MTP/spec re-seed and verify calls must not contaminate
     // or consume the immutable single-token replay sequence.
@@ -7060,7 +7132,9 @@ pub fn forward_scratch(
         // successful direct dispatch so subsequent calls can capture. ──
         gpu.hip
             .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
-        forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch, None)?;
+        forward_scratch_layers(
+            gpu, weights, config, pos, kv_cache, dn_state, scratch, None, None,
+        )?;
         gpu.graphs.ar_forward_kernel_dirty = false;
     } else if use_graph {
         // ── Capture + launch: kernels are clean but caller has not committed
@@ -7079,7 +7153,9 @@ pub fn forward_scratch(
             gpu.device_id,
             gpu.active_stream.as_ref().unwrap(),
         )?;
-        forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch, None)?;
+        forward_scratch_layers(
+            gpu, weights, config, pos, kv_cache, dn_state, scratch, None, None,
+        )?;
         gpu.graphs.end_graph_capture(
             &gpu.hip,
             gpu.device_id,
@@ -7100,7 +7176,9 @@ pub fn forward_scratch(
         // ── Direct path (graph not eligible: arch / MoE config) ──
         gpu.hip
             .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
-        forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch, None)?;
+        forward_scratch_layers(
+            gpu, weights, config, pos, kv_cache, dn_state, scratch, None, None,
+        )?;
     }
     if gpu.replay.should_auto_finalize_capture() {
         gpu.hip.device_synchronize()?;
@@ -17873,6 +17951,7 @@ pub fn forward_scratch_with_hidden(
         dn_state,
         scratch,
         Some(hidden_rb),
+        None,
     )?;
     hidden_rb.advance_head();
     Ok(())
@@ -17902,7 +17981,148 @@ pub fn forward_scratch_embed(
         )
     };
     gpu.hip.memcpy_htod(&scratch.x.buf, bytes)?;
-    forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch, None)
+    forward_scratch_layers(
+        gpu, weights, config, pos, kv_cache, dn_state, scratch, None, None,
+    )
+}
+
+/// Write `(t, h, w)` for sequence position `pos` into `scratch.pos_buf3`.
+///
+/// `compact_offset` mirrors what the 1D path does to `pos_buf` after a
+/// TriAttention compaction: absolute rope phase = physical index + offset.
+/// Note the daemon does NOT build an `MropeCtx` while eviction is armed
+/// (physical indices are renumbered there, so `MropeCtx::positions` — which is
+/// indexed by physical position — would be misaligned), so in practice this
+/// arm sees `compact_offset == 0`. It is applied anyway so the mrope branch
+/// never silently disagrees with its 1D twin.
+fn upload_mrope_pos3(
+    gpu: &mut Gpu,
+    scratch: &Qwen35Scratch,
+    mrope: &MropeCtx,
+    pos: usize,
+    compact_offset: usize,
+) -> HipResult<()> {
+    let mut p = mrope.pos3(pos);
+    if compact_offset > 0 {
+        let off = compact_offset as i32;
+        for v in p.iter_mut() {
+            *v += off;
+        }
+    }
+    let mut bytes = [0u8; 12];
+    for (i, v) in p.iter().enumerate() {
+        bytes[i * 4..(i + 1) * 4].copy_from_slice(&v.to_ne_bytes());
+    }
+    gpu.memcpy_htod_auto(&scratch.pos_buf3, &bytes)
+}
+
+/// A mrope forward is NOT plain sequential AR — it issues a different rope
+/// kernel against a different position buffer. Mirror the contract that
+/// MTP / spec re-seed / verify forwards follow before their `forward_scratch`
+/// call: consume-and-reset the AR eligibility flag (so a caller-set `false`
+/// cannot leak into the next text forward), tell Redline this forward is
+/// ineligible, and invalidate any captured plain-AR hipGraph so the next text
+/// forward re-captures instead of replaying one recorded around a VL step.
+fn mark_mrope_forward_ineligible(gpu: &mut Gpu) {
+    let _consumed = std::mem::replace(&mut gpu.graphs.ar_graph_eligible, true);
+    gpu.replay.set_forward_eligible(false);
+    gpu.graphs.ar_forward_replay_enabled = false;
+    gpu.graphs.ar_forward_kernel_dirty = true;
+}
+
+/// mrope-aware [`forward_scratch`]. `mrope == None` delegates verbatim to
+/// [`forward_scratch`] — same kernels, same graph/replay routing, same
+/// dispatch identity, so the certified retained-PM4 tape is untouched.
+///
+/// With `Some(ctx)` the call takes a deliberately plain, direct-dispatch path:
+/// hipGraph capture/replay and the Redline AQL/PM4 replay routes are BYPASSED.
+/// Those replay a *recorded* kernel sequence keyed only by `pos_buf`; a VL step
+/// issues a different rope kernel reading a different buffer, so replaying a
+/// text-captured graph (or capturing a VL step into one) would be silently
+/// wrong. VL prefill/decode is per-token and image requests are rare, so the
+/// lost launch amortization is not worth the aliasing risk.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_scratch_mrope(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    token: u32,
+    pos: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+    scratch: &Qwen35Scratch,
+    mrope: Option<&MropeCtx>,
+) -> HipResult<()> {
+    let Some(mc) = mrope else {
+        return forward_scratch(gpu, weights, config, token, pos, kv_cache, dn_state, scratch);
+    };
+    mark_mrope_forward_ineligible(gpu);
+    // Embedding lookup into scratch.x + the 1D pos scalar (still consumed by
+    // the KV write and flash attention, which want the PHYSICAL slot).
+    prepare_scratch_inputs(gpu, weights, config, token, pos, scratch)?;
+    upload_mrope_pos3(gpu, scratch, mc, pos, kv_cache.compact_offset)?;
+    forward_scratch_layers(
+        gpu,
+        weights,
+        config,
+        pos,
+        kv_cache,
+        dn_state,
+        scratch,
+        None,
+        Some(mc),
+    )
+}
+
+/// mrope-aware [`forward_scratch_embed`] — the image-token prefill entry.
+/// `mrope == None` delegates verbatim to [`forward_scratch_embed`].
+#[allow(clippy::too_many_arguments)]
+pub fn forward_scratch_embed_mrope(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    embedding_data: &[f32],
+    pos: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+    scratch: &Qwen35Scratch,
+    mrope: Option<&MropeCtx>,
+) -> HipResult<()> {
+    let Some(mc) = mrope else {
+        return forward_scratch_embed(
+            gpu,
+            weights,
+            config,
+            embedding_data,
+            pos,
+            kv_cache,
+            dn_state,
+            scratch,
+        );
+    };
+    mark_mrope_forward_ineligible(gpu);
+    let pos_i32 = pos as i32;
+    gpu.hip
+        .memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
+    let bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(
+            embedding_data.as_ptr() as *const u8,
+            embedding_data.len() * 4,
+        )
+    };
+    gpu.hip.memcpy_htod(&scratch.x.buf, bytes)?;
+    upload_mrope_pos3(gpu, scratch, mc, pos, kv_cache.compact_offset)?;
+    forward_scratch_layers(
+        gpu,
+        weights,
+        config,
+        pos,
+        kv_cache,
+        dn_state,
+        scratch,
+        None,
+        Some(mc),
+    )
 }
 
 /// Batched single-weight GEMM used by the mixed-format fallback in
@@ -18031,12 +18251,20 @@ fn forward_scratch_layers(
     dn_state: &mut DeltaNetState,
     s: &Qwen35Scratch,
     hidden_rb: Option<&mut HiddenStateRingBuffer>,
+    mrope: Option<&MropeCtx>,
 ) -> HipResult<()> {
     // #397 Ship 6 — forward-as-pipeline. When HIPFIRE_FORWARD_LOWERED=1, route
     // single-GPU decode through the lowered super-op executor. Skipped when a
     // hidden-state ring buffer is active (spec-decode capture engages only the
     // hand path for now). Default off → the hand arms below run unchanged.
-    if forward_lowered_enabled() && hidden_rb.is_none() {
+    //
+    // Also skipped when a 3D mrope context is present: the lowered executor's
+    // ATTEND_FULL binding (`Qwen35Bindings::run_attend`) still issues the 1D
+    // `rope_partial_interleaved_f32` / `qwen35_fa_prep_gfx1100` pair and has no
+    // channel for the (t,h,w) buffer, so routing a VL request through it would
+    // silently reinstate sequential positions. VL therefore always takes the
+    // hand arms below, which DO branch on `mrope`.
+    if forward_lowered_enabled() && hidden_rb.is_none() && mrope.is_none() {
         return forward_scratch_layers_lowered(gpu, weights, config, pos, kv_cache, dn_state, s);
     }
 
@@ -18270,16 +18498,43 @@ fn forward_scratch_layers(
                     gpu.memcpy_htod_auto(&s.pos_buf, &abs.to_ne_bytes())?;
                 }
                 let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
-                gpu.rope_partial_interleaved_f32(
-                    &s.fa_q,
-                    &s.fa_k,
-                    &s.pos_buf,
-                    config.n_heads,
-                    config.n_kv_heads,
-                    config.head_dim,
-                    n_rot,
-                    config.rope_theta,
-                )?;
+                // VL (image tokens present) → 3D mrope; everything else keeps
+                // the original 1D kernel and its dispatch identity.
+                match mrope {
+                    Some(mc) => {
+                        debug_assert_eq!(
+                            mc.section, config.mrope_section,
+                            "MropeCtx section disagrees with the loaded config \
+                             (build it with MropeCtx::new)",
+                        );
+                        // `pos_buf3` is filled ONCE per token by
+                        // `forward_scratch_mrope` / `..._embed_mrope`, exactly
+                        // like `pos_buf` — the value is layer-invariant, and a
+                        // per-layer re-upload would add a blocking 12-byte H2D
+                        // per full-attention layer for no benefit.
+                        gpu.rope_mrope_halfsplit_f32(
+                            &s.fa_q,
+                            &s.fa_k,
+                            &s.pos_buf3,
+                            config.n_heads,
+                            config.n_kv_heads,
+                            config.head_dim,
+                            n_rot,
+                            config.rope_theta,
+                            mc.section,
+                        )?
+                    }
+                    None => gpu.rope_partial_interleaved_f32(
+                        &s.fa_q,
+                        &s.fa_k,
+                        &s.pos_buf,
+                        config.n_heads,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        n_rot,
+                        config.rope_theta,
+                    )?,
+                }
                 if kv_cache.compact_offset > 0 {
                     let phys = pos as i32;
                     gpu.memcpy_htod_auto(&s.pos_buf, &phys.to_ne_bytes())?;
@@ -18568,16 +18823,43 @@ fn forward_scratch_layers(
                     gpu.memcpy_htod_auto(&s.pos_buf, &abs.to_ne_bytes())?;
                 }
                 let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
-                gpu.rope_partial_interleaved_f32(
-                    &s.fa_q,
-                    &s.fa_k,
-                    &s.pos_buf,
-                    config.n_heads,
-                    config.n_kv_heads,
-                    config.head_dim,
-                    n_rot,
-                    config.rope_theta,
-                )?;
+                // VL (image tokens present) → 3D mrope; everything else keeps
+                // the original 1D kernel and its dispatch identity.
+                match mrope {
+                    Some(mc) => {
+                        debug_assert_eq!(
+                            mc.section, config.mrope_section,
+                            "MropeCtx section disagrees with the loaded config \
+                             (build it with MropeCtx::new)",
+                        );
+                        // `pos_buf3` is filled ONCE per token by
+                        // `forward_scratch_mrope` / `..._embed_mrope`, exactly
+                        // like `pos_buf` — the value is layer-invariant, and a
+                        // per-layer re-upload would add a blocking 12-byte H2D
+                        // per full-attention layer for no benefit.
+                        gpu.rope_mrope_halfsplit_f32(
+                            &s.fa_q,
+                            &s.fa_k,
+                            &s.pos_buf3,
+                            config.n_heads,
+                            config.n_kv_heads,
+                            config.head_dim,
+                            n_rot,
+                            config.rope_theta,
+                            mc.section,
+                        )?
+                    }
+                    None => gpu.rope_partial_interleaved_f32(
+                        &s.fa_q,
+                        &s.fa_k,
+                        &s.pos_buf,
+                        config.n_heads,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        n_rot,
+                        config.rope_theta,
+                    )?,
+                }
                 if kv_cache.compact_offset > 0 {
                     let phys = pos as i32;
                     gpu.memcpy_htod_auto(&s.pos_buf, &phys.to_ne_bytes())?;
@@ -23381,6 +23663,10 @@ mod tests {
                 !is_batchable_la(DType::HFQ2G256, arch),
                 "HFQ2G256 must fall back"
             );
+            assert!(
+                !is_batchable_la(DType::BF16, arch),
+                "BF16 must fall back until the batched BF16 dispatch family is wired"
+            );
         }
     }
 
@@ -24377,5 +24663,13 @@ mod tests {
         assert!(ep_tick_inputs_prepared(usize::MAX));
         // Saturating representative: any non-zero later band is prepared.
         assert!(ep_tick_inputs_prepared(usize::MAX.saturating_sub(1)));
+    }
+
+    #[test]
+    fn ar_graph_is_ineligible_after_kv_compaction() {
+        assert!(ar_graph_eligible_for_kv(true, 0));
+        assert!(!ar_graph_eligible_for_kv(true, 1));
+        assert!(!ar_graph_eligible_for_kv(true, 128));
+        assert!(!ar_graph_eligible_for_kv(false, 0));
     }
 }

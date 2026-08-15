@@ -338,12 +338,6 @@ impl Carrier for Qwen35Carrier {
                     .into(),
             );
         }
-        if ctx.kv_backend == KvBackend::Vmm && ctx.cask.sidecar.is_some() {
-            return Err(
-                "qwen35: KV backend 'vmm' does not yet support CASK/TriAttention eviction; disable the sidecar or use 'contiguous'"
-                    .into(),
-            );
-        }
         // Dir + pp>1: early return before any diagnostics/meta resolution,
         // preserving the original error string and preventing tokenizer work.
         if ctx.pp > 1 {
@@ -363,17 +357,7 @@ impl Carrier for Qwen35Carrier {
                 }
 
                 // ── pp=1 path (single-GPU) ────────────────────
-                let physical_cap = if ctx.cask.sidecar.is_some() {
-                    let env_override = hipfire_config::developer_var("HIPFIRE_KV_PHYSICAL_CAP")
-                        .ok()
-                        .and_then(|s| s.parse::<usize>().ok());
-                    let safety = 256usize;
-                    let floor = ctx.cask.budget + ctx.cask.beta + 4;
-                    let derived = ctx.cask.budget + ctx.cask.beta + safety;
-                    env_override.unwrap_or(derived).clamp(floor, ctx.max_seq)
-                } else {
-                    ctx.max_seq
-                };
+                let physical_cap = ctx.cask.physical_cap(ctx.max_seq)?;
 
                 // VL detection — loads weights from hfq_file in-place
                 let (vision_config, vision_weights) = {
@@ -1105,9 +1089,8 @@ impl Carrier for Deepseek4Carrier {
         // main_kv_cache and indexer_kv_cache; every other compressor buffer
         // stays F32 and commit arithmetic completes in F32 before the single
         // F32-to-F16 store.
-        let f16_ok = config.mq2r
-            && !config.mq2rxt
-            && ctx.gpu.arch_caps.supports_ds4_f16_compressor_cache();
+        let f16_ok =
+            config.mq2r && !config.mq2rxt && ctx.gpu.arch_caps.supports_ds4_f16_compressor_cache();
         if compressor_cache == hipfire_config::Deepseek4CompressorCache::F16 && !f16_ok {
             return Err(format!(
                 "deepseek4: kv_cache=f16 requires MQ2R on an architecture with wave32 WMMA (RDNA3/RDNA4); got arch={}, mq2r={}, mq2rxt={}",
@@ -1189,7 +1172,7 @@ impl Carrier for Deepseek4Carrier {
         };
         let advertised_context = config.max_position_embeddings;
         eprintln!(
-            "  deepseek4 compressed cache: automatic VMM growth to advertised context {advertised_context}"
+            "  deepseek4 KV cache: automatic VMM growth to advertised context {advertised_context}"
         );
         Ok(LoadedModel {
             state: Some(crate::ModelState::Deepseek4(deepseek4::Deepseek4Bundle {
@@ -1518,6 +1501,25 @@ impl Carrier for Cohere2MoeCarrier {
 
 // ─── Gemma4Carrier ───────────────────────────────────────────────────
 
+fn gemma4_use_lowered(
+    enable_moe_block: bool,
+    want_batched: bool,
+    has_drafter: bool,
+    is_e_series: bool,
+) -> bool {
+    enable_moe_block || (want_batched && !has_drafter && !is_e_series)
+}
+
+fn gemma4_validate_drafter_route(is_e_series: bool, has_drafter: bool) -> Result<(), String> {
+    if is_e_series && has_drafter {
+        return Err(
+            "gemma4: E2B/E4B EAGLE spec-decode is not yet supported; load the E-series target without params.drafter"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 pub struct Gemma4Carrier;
 impl Carrier for Gemma4Carrier {
     fn name(&self) -> &'static str {
@@ -1554,33 +1556,61 @@ impl Carrier for Gemma4Carrier {
         dir_diag(&src);
         let meta = resolve_source_meta(&src, ctx.path)?;
         match src {
-            ModelSource::Hfq(mut hfq) => {
+            ModelSource::Hfq(hfq) => {
                 // ── Lowered vs eager selection (MoE or batched prefill opt-in) ──
-                // The eager `gemma4::forward` path is DENSE ONLY. Arch-13 MoE
+                // Arch-13 MoE
                 // (26B-A4B `enable_moe_block`) must go through `lowered`, which
                 // carries the parallel-MoE branch. We also route DENSE models
                 // through `lowered` when the operator opts into batched/WMMA
                 // prefill — that path lives only in `lowered::forward_prefill_batch`.
+                // E2B/E4B stay on eager because lowered does not implement PLE,
+                // KV sharing, or E2B's double-wide shared-layer FFN.
                 // EAGLE spec-decode (`params.drafter`) requires the eager
                 // `Gemma4State`, so a drafter request always wins and keeps the
                 // eager path (batched prefill opt-in is ignored when a drafter
                 // is present). This is arch-gated: other carriers are unaffected.
                 let lowered_cfg = hipfire_arch_gemma4::lowered::config_from_hfq(&hfq);
                 let want_batched = crate::gemma4_batched_prefill_optin(ctx.gpu);
+                let lowered_is_moe = lowered_cfg
+                    .as_ref()
+                    .is_some_and(|lcfg| lcfg.enable_moe_block);
+                let eager_config = if lowered_is_moe {
+                    None
+                } else {
+                    Some(hipfire_arch_gemma4::config::Gemma4Config::from_hfq(&hfq)?)
+                };
+                let is_e_series = eager_config.as_ref().is_some_and(|cfg| {
+                    cfg.hidden_size_per_layer_input != 0 || cfg.num_kv_shared_layers != 0
+                });
+                if is_e_series {
+                    eager_config.as_ref().unwrap().e_series_variant()?;
+                }
+                gemma4_validate_drafter_route(is_e_series, ctx.gemma4_drafter_path.is_some())?;
                 let use_lowered = if let Some(ref lcfg) = lowered_cfg {
-                    lcfg.enable_moe_block || (want_batched && ctx.gemma4_drafter_path.is_none())
+                    gemma4_use_lowered(
+                        lcfg.enable_moe_block,
+                        want_batched,
+                        ctx.gemma4_drafter_path.is_some(),
+                        is_e_series,
+                    )
                 } else {
                     false
                 };
                 if use_lowered {
                     let lcfg = lowered_cfg.unwrap();
                     let mut hfq2 = hfq;
-                    let weights = hipfire_arch_gemma4::lowered::load_weights(&mut hfq2, &lcfg, ctx.gpu)
-                        .map_err(|e| format!("gemma4 (lowered) load_weights: {e:?}"))?;
-                    let scratch = hipfire_arch_gemma4::lowered::Gemma4Scratch::new(ctx.gpu, &lcfg, 1)
-                        .map_err(|e| format!("gemma4 (lowered) scratch: {e:?}"))?;
-                    hipfire_arch_gemma4::lowered::init_scratch_constants(ctx.gpu, &scratch, lcfg.full_head_dim)
-                        .map_err(|e| format!("gemma4 (lowered) init_scratch_constants: {e:?}"))?;
+                    let weights =
+                        hipfire_arch_gemma4::lowered::load_weights(&mut hfq2, &lcfg, ctx.gpu)
+                            .map_err(|e| format!("gemma4 (lowered) load_weights: {e:?}"))?;
+                    let scratch =
+                        hipfire_arch_gemma4::lowered::Gemma4Scratch::new(ctx.gpu, &lcfg, 1)
+                            .map_err(|e| format!("gemma4 (lowered) scratch: {e:?}"))?;
+                    hipfire_arch_gemma4::lowered::init_scratch_constants(
+                        ctx.gpu,
+                        &scratch,
+                        lcfg.full_head_dim,
+                    )
+                    .map_err(|e| format!("gemma4 (lowered) init_scratch_constants: {e:?}"))?;
                     let kv_sliding = hipfire_runtime::llama::KvCache::new_gpu_q8_capped(
                         ctx.gpu,
                         lcfg.n_layers,
@@ -1598,7 +1628,10 @@ impl Carrier for Gemma4Carrier {
                         ctx.max_seq,
                     )
                     .map_err(|e| format!("gemma4 (lowered) full KV alloc: {e:?}"))?;
-                    let eos_tok = resolve_eos_tok(&meta.tokenizer, &["<end_of_turn>", "<turn|>", "<eos>", "<|im_end|>"]);
+                    let eos_tok = resolve_eos_tok(
+                        &meta.tokenizer,
+                        &["<end_of_turn>", "<turn|>", "<eos>", "<|im_end|>"],
+                    );
                     let hfq_for_template = hfq2;
                     let chat_template = resolve_chat_template(&hfq_for_template, ctx.path);
                     eprintln!(
@@ -1615,12 +1648,12 @@ impl Carrier for Gemma4Carrier {
                     );
                     return Ok(LoadedModel {
                         state: Some(ModelState::Gemma4Lowered(crate::Gemma4LoweredBundle {
-                                config: lcfg,
-                                weights,
-                                scratch,
-                                kv_sliding,
-                                kv_full,
-                                eos_tok,
+                            config: lcfg,
+                            weights,
+                            scratch,
+                            kv_sliding,
+                            kv_full,
+                            eos_tok,
                         })),
                         speculator,
                         ..LoadedModel::skeleton(
@@ -1633,12 +1666,29 @@ impl Carrier for Gemma4Carrier {
                         )
                     });
                 }
-                // ── Eager dense path ──
-                let config = hipfire_arch_gemma4::config::Gemma4Config::from_hfq(&hfq)?;
-                let weights = hipfire_arch_gemma4::gemma4::Gemma4Weights::load(&hfq, &config, ctx.gpu)?;
-                let state = hipfire_arch_gemma4::gemma4::Gemma4State::new_with_max_seq(ctx.gpu, &config, ctx.max_seq)
-                    .map_err(|e| format!("gemma4: Gemma4State::new_with_max_seq failed: {e}"))?;
-                let eos_tok = resolve_eos_tok(&meta.tokenizer, &["<end_of_turn>", "<turn|>", "<eos>", "<|im_end|>"]);
+                // ── Eager dense / E-series path ──
+                let config = match eager_config {
+                    Some(config) => config,
+                    None => hipfire_arch_gemma4::config::Gemma4Config::from_hfq(&hfq)?,
+                };
+                if is_e_series {
+                    eprintln!(
+                        "  gemma4 E-series eager path: {:?} (PLE + shared KV)",
+                        config.e_series_variant()?
+                    );
+                }
+                let weights =
+                    hipfire_arch_gemma4::gemma4::Gemma4Weights::load(&hfq, &config, ctx.gpu)?;
+                let state = hipfire_arch_gemma4::gemma4::Gemma4State::new_with_max_seq(
+                    ctx.gpu,
+                    &config,
+                    ctx.max_seq,
+                )
+                .map_err(|e| format!("gemma4: Gemma4State::new_with_max_seq failed: {e}"))?;
+                let eos_tok = resolve_eos_tok(
+                    &meta.tokenizer,
+                    &["<end_of_turn>", "<turn|>", "<eos>", "<|im_end|>"],
+                );
                 let _ = &weights;
                 // Optional EAGLE drafter (arch-22) — populated only when
                 // `gemma4_drafter_path` is Some. Validates draft_len 1..=5,
@@ -1677,12 +1727,12 @@ impl Carrier for Gemma4Carrier {
                 );
                 Ok(LoadedModel {
                     state: Some(ModelState::Gemma4(crate::Gemma4Bundle {
-                            config,
-                            weights,
-                            state,
-                            eos_tok,
-                            eagle,
-                        })),
+                        config,
+                        weights,
+                        state,
+                        eos_tok,
+                        eagle,
+                    })),
                     speculator,
                     ..LoadedModel::skeleton(
                         meta.arch_id,
@@ -1725,17 +1775,20 @@ fn load_gemma4_eagle_state(
             dcfg.backbone_hidden, target_cfg.dim
         ));
     }
-    let drafter_weights = hipfire_arch_gemma4::drafter::Gemma4DrafterWeights::load(&dhfq, &dcfg, gpu)?;
+    let drafter_weights =
+        hipfire_arch_gemma4::drafter::Gemma4DrafterWeights::load(&dhfq, &dcfg, gpu)?;
     let drafter_scratch = hipfire_arch_gemma4::drafter::Gemma4DrafterScratch::new(gpu, &dcfg)
         .map_err(|e| format!("gemma4 drafter scratch: {e}"))?;
-    let spec_scratch = hipfire_arch_gemma4::speculative::Gemma4SpecScratch::new(gpu, target_cfg, draft_len)
-        .map_err(|e| format!("gemma4 spec scratch: {e}"))?;
+    let spec_scratch =
+        hipfire_arch_gemma4::speculative::Gemma4SpecScratch::new(gpu, target_cfg, draft_len)
+            .map_err(|e| format!("gemma4 spec scratch: {e}"))?;
     // Prime the batched verify path (b=1 then real block size) on disposable
     // throwaway states — mirrors PR's warmup to ensure kernels are compiled.
     let warm_b = draft_len + 1;
     {
-        let mut warm = hipfire_arch_gemma4::gemma4::Gemma4State::new_with_max_seq(gpu, target_cfg, warm_b + 4)
-            .map_err(|e| format!("gemma4-eagle: warm state: {e}"))?;
+        let mut warm =
+            hipfire_arch_gemma4::gemma4::Gemma4State::new_with_max_seq(gpu, target_cfg, warm_b + 4)
+                .map_err(|e| format!("gemma4-eagle: warm state: {e}"))?;
         let _ = hipfire_arch_gemma4::forward::forward_batch(
             target_cfg,
             target_weights,
@@ -1748,8 +1801,9 @@ fn load_gemma4_eagle_state(
         warm.free_gpu(gpu);
     }
     {
-        let mut warm = hipfire_arch_gemma4::gemma4::Gemma4State::new_with_max_seq(gpu, target_cfg, warm_b + 4)
-            .map_err(|e| format!("gemma4-eagle: warm state 2: {e}"))?;
+        let mut warm =
+            hipfire_arch_gemma4::gemma4::Gemma4State::new_with_max_seq(gpu, target_cfg, warm_b + 4)
+                .map_err(|e| format!("gemma4-eagle: warm state 2: {e}"))?;
         let _ = hipfire_arch_gemma4::forward::forward_batch(
             target_cfg,
             target_weights,
@@ -1768,4 +1822,297 @@ fn load_gemma4_eagle_state(
         spec_scratch,
         draft_len,
     })
+}
+
+// ─── MuseGlimmerCarrier ────────────────────────────────────────────────
+
+pub struct MuseGlimmerCarrier;
+impl Carrier for MuseGlimmerCarrier {
+    fn name(&self) -> &'static str {
+        "muse_glimmer"
+    }
+    fn spec_target_guard<'m>(
+        &self,
+        _state: &'m mut Option<ModelState>,
+        _model_path: &str,
+    ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
+        Err("muse_glimmer: spec decode not yet wired (AR-only)".into())
+    }
+    fn make_spec_emitter<'a>(
+        &self,
+        _ctx: SpecEmitCtx<'a>,
+    ) -> Result<Box<dyn SpecEmit + 'a>, String> {
+        Err("muse_glimmer: spec emitter not yet wired".into())
+    }
+    fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
+        arch_id == 14
+    }
+    fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
+        if ctx.kv_backend == KvBackend::Vmm && ctx.cask.sidecar.is_some() {
+            return Err(
+                "muse_glimmer: KV backend 'vmm' does not support CASK/TriAttention eviction; disable the sidecar or use 'contiguous'"
+                    .into(),
+            );
+        }
+        if ctx.pp > 1 {
+            return Err(match &src {
+                ModelSource::Hfq(_) => "muse_glimmer: pipeline-parallel (pp>1) unsupported",
+                ModelSource::Dir(_) => "muse_glimmer: safetensors + pp>1 unsupported",
+            }
+            .into());
+        }
+        if ctx.gemma4_drafter_path.is_some() {
+            return Err(
+                "params.drafter (Gemma4 EAGLE) is not supported on arch_id=14 (Muse Glimmer).                  Remove params.drafter for AR-only decode."
+                    .to_string(),
+            );
+        }
+        dir_diag(&src);
+        let meta = resolve_source_meta(&src, ctx.path)?;
+        match src {
+            ModelSource::Hfq(hfq) => {
+                // HFQ load path via the crate API (contract: from_hfq / load /
+                // new_with_max_seq_backend with ctx.kv_backend).
+                let config = hipfire_arch_muse_glimmer::config::GlimmerConfig::from_hfq(&hfq)?;
+                let weights = hipfire_arch_muse_glimmer::glimmer::GlimmerWeights::load(
+                    &hfq, &config, ctx.gpu,
+                )?;
+                let mut state =
+                    match hipfire_arch_muse_glimmer::glimmer::GlimmerState::new_with_max_seq_backend(
+                        ctx.gpu,
+                        &config,
+                        ctx.max_seq,
+                        ctx.kv_backend,
+                    ) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            weights.free_gpu(ctx.gpu);
+                            return Err(format!(
+                                "muse_glimmer: GlimmerState::new_with_max_seq_backend failed: {e}"
+                            ));
+                        }
+                    };
+                // eos resolution by name with 200001 as the documented fallback.
+                // 200001 is Glimmer's eos_token_id (config.eos_token, bos 200000).
+                // Try tokenizer encode of common EOS surface forms first; if none
+                // tokenize to a single id, fall back to 200001 (never 1 — the
+                // generic fallback in resolve_eos_tok would be silently wrong
+                // for Glimmer and would cause runaway generation).
+                let eos_tok = {
+                    let tok = resolve_eos_tok(
+                        &meta.tokenizer,
+                        &[
+                            "<end_of_turn>",
+                            "<|im_end|>",
+                            "</s>",
+                            "<|endoftext|>",
+                            "<eos>",
+                        ],
+                    );
+                    if tok == 1 {
+                        200001
+                    } else {
+                        tok
+                    }
+                };
+                // Optional DFlash drafter (arch 23). OFF by default — daemon
+                // only populates ctx.draft_path when HIPFIRE_DFLASH_DRAFT is set
+                // (or params.draft) and dflash_mode != "off". When present, load
+                // the 5-layer diffusion draft head (encoder.fc / layers.* / norm)
+                // and stash it on the bundle for the speculator to consume.
+                // On any failure, log and fall back to AR-only (never fail the
+                // target load because the draft is auxiliary).
+                let drafter: Option<crate::GlimmerDrafterBundle> = if let Some(dp) =
+                    ctx.draft_path.clone()
+                {
+                    match (|| -> Result<crate::GlimmerDrafterBundle, String> {
+                        let dhfq = hipfire_runtime::hfq::HfqFile::open(std::path::Path::new(&dp))
+                            .map_err(|e| format!("open glimmer drafter '{dp}': {e}"))?;
+                        if dhfq.arch_id
+                            != hipfire_arch_muse_glimmer::drafter::GLIMMER_DRAFTER_ARCH_ID
+                        {
+                            return Err(format!(
+                                "glimmer drafter '{}' arch_id {} != {} (muse_glimmer_assistant); a DFlash draft (arch 20) or Gemma4 draft (22) does not match",
+                                dp, dhfq.arch_id, hipfire_arch_muse_glimmer::drafter::GLIMMER_DRAFTER_ARCH_ID
+                            ));
+                        }
+                        let dcfg =
+                            hipfire_arch_muse_glimmer::drafter::GlimmerDrafterConfig::from_hfq(
+                                &dhfq,
+                            )?;
+                        if dcfg.hidden != config.dim {
+                            return Err(format!(
+                                "glimmer drafter hidden {} != target dim {} (cross-attention concat invariant)",
+                                dcfg.hidden, config.dim
+                            ));
+                        }
+                        if dcfg.block_size != 16 {
+                            eprintln!("glimmer drafter: WARNING block_size {} != 16 (expected diffusion recipe)", dcfg.block_size);
+                        }
+                        let dweights =
+                            hipfire_arch_muse_glimmer::drafter::GlimmerDrafterWeights::load(
+                                &dhfq, &dcfg, ctx.gpu,
+                            )?;
+                        // Freeze HIPFIRE_GLIMMER_CTX_CAP once at load (daemon/load default
+                        // 256). Same value sizes drafter scratch and device hidden log.
+                        let ctx_cap = {
+                            let requested = std::env::var("HIPFIRE_GLIMMER_CTX_CAP")
+                                .ok()
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                                .filter(|v| *v > 0)
+                                .unwrap_or(
+                                    hipfire_arch_muse_glimmer::drafter::GLIMMER_DRAFTER_CTX_CAP_DEFAULT,
+                                );
+                            requested.clamp(1, ctx.max_seq)
+                        };
+                        let dscratch =
+                            match hipfire_arch_muse_glimmer::drafter::GlimmerDrafterScratch::new(
+                                ctx.gpu,
+                                &dcfg,
+                                ctx.max_seq,
+                                ctx_cap,
+                            ) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    dweights.free_gpu(ctx.gpu);
+                                    return Err(format!("glimmer drafter scratch: {e}"));
+                                }
+                            };
+                        eprintln!(
+                            "  glimmer DFlash drafter loaded: {} (layers={}, hidden={}, block={}, mask={}, ctx_cap={})",
+                            dp, dcfg.n_layers, dcfg.hidden, dcfg.block_size, dcfg.mask_token_id, ctx_cap
+                        );
+                        Ok(crate::GlimmerDrafterBundle {
+                            config: dcfg,
+                            weights: dweights,
+                            scratch: dscratch,
+                        })
+                    })() {
+                        Ok(b) => Some(b),
+                        Err(e) => {
+                            eprintln!("  glimmer DFlash drafter load failed ({}): {} — falling back to AR only", ctx.draft_path.as_deref().unwrap_or(""), e);
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                // Device hidden capture is an opt-in experiment. The controlled
+                // gfx1100 gate removed all capture D2Hs but regressed decode
+                // throughput, so the unchanged host path remains the default.
+                // Selection is frozen here — no runtime path flipping after load.
+                if let Some(d) = &drafter {
+                    let device_enabled =
+                        hipfire_config::developer_var("HIPFIRE_GLIMMER_DEVICE_CAPTURE")
+                            .ok()
+                            .as_deref()
+                            == Some("1");
+                    if !device_enabled {
+                        eprintln!(
+                            "  glimmer hidden capture: backend=host (set HIPFIRE_GLIMMER_DEVICE_CAPTURE=1 to test device capture)"
+                        );
+                    } else {
+                        // Same frozen cap used for scratch construction (no env re-read).
+                        let ctx_cap = d.scratch.ctx_capacity();
+                        let layers = &d.config.target_layer_ids;
+                        match state.enable_device_hidden_capture(
+                            ctx.gpu,
+                            layers,
+                            ctx_cap,
+                            config.n_layers,
+                            config.dim,
+                        ) {
+                            Ok(()) => {
+                                eprintln!(
+                                    "  glimmer hidden capture: backend=device capacity_rows={} target_layer_ids={:?} shape=[{}, {}, {}]",
+                                    ctx_cap,
+                                    layers,
+                                    ctx_cap,
+                                    layers.len(),
+                                    config.dim,
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "  glimmer hidden capture: device enable failed ({e}) — continuing with host fallback"
+                                );
+                            }
+                        }
+                    }
+                }
+                let speculator = crate::spec_build::build_speculator(
+                    meta.arch_id,
+                    None,
+                    None,
+                    true,
+                    ctx.max_seq,
+                    ctx.spec,
+                );
+                let chat_template = match meta.chat_template {
+                    Some(t) => match crate::rewrite_muse_glimmer_onyx_template(&t) {
+                        Ok(rewritten) => Some(rewritten),
+                        Err(e) => {
+                            state.free_gpu(ctx.gpu);
+                            weights.free_gpu(ctx.gpu);
+                            if let Some(d) = drafter {
+                                d.scratch.free_gpu(ctx.gpu);
+                                d.weights.free_gpu(ctx.gpu);
+                            }
+                            return Err(e);
+                        }
+                    },
+                    None => None,
+                };
+                Ok(LoadedModel {
+                    state: Some(ModelState::MuseGlimmer(crate::MuseGlimmerBundle {
+                        config,
+                        weights,
+                        state,
+                        eos_tok,
+                        drafter,
+                        target_hidden_host: Vec::new(),
+                    })),
+                    speculator,
+                    ..LoadedModel::skeleton(
+                        meta.arch_id,
+                        meta.tokenizer,
+                        ctx.max_seq,
+                        ctx.max_seq,
+                        ctx.path.to_string(),
+                        chat_template,
+                    )
+                })
+            }
+            ModelSource::Dir(source) => {
+                let _ = source;
+                return Err(
+                    "muse_glimmer: safetensors Dir load not yet wired — use HFQ (quantize with --arch-id 14) or add config_from_source to hipfire-arch-muse-glimmer".into()
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod gemma4_route_tests {
+    use super::{gemma4_use_lowered, gemma4_validate_drafter_route};
+
+    #[test]
+    fn e_series_never_enters_dense_lowered_prefill() {
+        assert!(!gemma4_use_lowered(false, true, false, true));
+    }
+
+    #[test]
+    fn dense_opt_in_and_moe_keep_existing_routes() {
+        assert!(gemma4_use_lowered(false, true, false, false));
+        assert!(!gemma4_use_lowered(false, true, true, false));
+        assert!(gemma4_use_lowered(true, false, false, false));
+    }
+
+    #[test]
+    fn e_series_drafter_fails_closed() {
+        assert!(gemma4_validate_drafter_route(true, true).is_err());
+        assert!(gemma4_validate_drafter_route(true, false).is_ok());
+        assert!(gemma4_validate_drafter_route(false, true).is_ok());
+    }
 }

@@ -11,6 +11,7 @@ members = [
     "crates/hipfire-arch-llama",
     "crates/hipfire-arch-deepseek4",
     "crates/hipfire-arch-gemma4",
+    "crates/hipfire-arch-muse-glimmer",
     "crates/hipfire-arch-toy",
     "crates/hipfire-arch-qwen2",
     "crates/hipfire-arch-lfm2moe",

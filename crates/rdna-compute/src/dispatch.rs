@@ -1775,6 +1775,43 @@ impl Gpu {
         }
     }
 
+    /// D→D copy with offsets that is always host-asynchronous: uses the
+    /// active stream when set, otherwise the legacy/default stream via
+    /// `memcpy_dtod_async_default_at`. Prefer this on non-capture hot
+    /// paths where `memcpy_dtod_at_auto` would fall back to a host-sync
+    /// copy. Capture paths still need an explicit active stream (same as
+    /// `memcpy_dtod_at_auto`).
+    /// `HIPFIRE_DTOD_DUMP=1` prints `file:line` and size per D→D copy.
+    #[track_caller]
+    pub fn memcpy_dtod_at_ordered_async(
+        &self,
+        dst: &hip_bridge::DeviceBuffer,
+        dst_offset: usize,
+        src: &hip_bridge::DeviceBuffer,
+        src_offset: usize,
+        size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        static DUMP: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            hipfire_config::developer_var("HIPFIRE_DTOD_DUMP")
+                .ok()
+                .as_deref()
+                == Some("1")
+        });
+        let dump = *DUMP;
+        if dump {
+            let loc = std::panic::Location::caller();
+            eprintln!("dtod bytes={} at {}:{}", size, loc.file(), loc.line());
+        }
+        if let Some(stream) = self.active_stream.as_ref() {
+            self.hip
+                .memcpy_dtod_async_at(dst, dst_offset, src, src_offset, size, stream)
+        } else {
+            self.hip
+                .memcpy_dtod_async_default_at(dst, dst_offset, src, src_offset, size)
+        }
+    }
+
     /// D→D copy (whole buffer) that picks async on the active stream when set.
     ///
     /// `#[track_caller]` so `HIPFIRE_DTOD_DUMP` attributes the copy to the real
@@ -2787,6 +2824,42 @@ impl Gpu {
         }
     }
 
+    /// Free a newly allocated ordinary contiguous tensor immediately via HIP
+    /// `free`, without returning the buffer to the reusable pool.
+    ///
+    /// Intended for allocation-failure cleanup of tensors that were just
+    /// created (e.g. via [`Self::zeros`]) and must not race a pending async
+    /// memset on the active stream. Rejects VMM owners and borrowed buffers
+    /// with the same policy as [`Self::free_tensor`].
+    pub fn release_tensor_immediate(&mut self, tensor: GpuTensor) -> HipResult<()> {
+        self.bind_thread()?;
+        let key = tensor.buf.as_ptr() as usize;
+        if self.vmm_arenas.contains_key(&key) {
+            if !tensor.buf.is_vmm_owner() {
+                return Err(HipError::new(
+                    0,
+                    &format!("refusing to free borrowed VMM view at 0x{key:x}"),
+                ));
+            }
+            return Err(HipError::new(
+                0,
+                &format!("refusing immediate free of VMM owner at 0x{key:x}"),
+            ));
+        }
+        if tensor.buf.is_borrowed() || tensor.buf.is_vmm_owner() {
+            return Err(HipError::new(
+                0,
+                &format!("refusing to free non-owning tensor at 0x{key:x}"),
+            ));
+        }
+        // zeros() may have queued an async memset on the active stream; free
+        // must not race that write.
+        if let Some(stream) = self.active_stream.as_ref() {
+            self.hip.stream_synchronize(stream)?;
+        }
+        self.hip.free(tensor.buf)
+    }
+
     /// Drain the GPU memory pool. Actually calls hipFree on all pooled buffers.
     /// Call after model unload to return VRAM to the system.
     pub fn drain_pool(&mut self) {
@@ -3652,6 +3725,15 @@ impl Gpu {
                         .replace("#include \"kv_slot_desc.h\"", "");
                     format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped)
                 }));
+                specs.push(("attention_q8_0_kv_independent_masked_windowed", {
+                    // Shares ATTENTION_Q8_0_KV_BATCHED_SRC with the entry
+                    // above, so it needs the identical strip-and-prepend:
+                    // that source #includes kv_slot_desc.h and this
+                    // precompile path has no -I to kernels/src.
+                    let stripped = kernels::ATTENTION_Q8_0_KV_BATCHED_SRC
+                        .replace("#include \"kv_slot_desc.h\"", "");
+                    format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped)
+                }));
                 specs.push(("attention_q8_0_flash_prefill", {
                     // Same header-stripping treatment as
                     // attention_q8_0_kv_batched above: the kernel now
@@ -3685,6 +3767,13 @@ impl Gpu {
                     kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC.to_string(),
                 ));
             }
+        }
+
+        // Exact parallel-sampler modules used by sample_top_p_pf. Sources are
+        // the same string rewrites as runtime (see sampling.rs helpers) so the
+        // compile-cache hash hits on first token instead of hipcc JIT.
+        for (name, src) in crate::sampling::sample_top_p_parallel_precompile_specs() {
+            specs.push((name, src));
         }
 
         // Convert to (&str, &str) for the batch API
@@ -3726,6 +3815,9 @@ impl Gpu {
                 // Arch-variant HFQ4 GEMV modules all expose the same symbol.
                 n if n.starts_with("gemv_hfq4g256_rdna") => vec!["gemv_hfq4g256"],
                 n if n.starts_with("gemv_hfq4g256_gfx") => vec!["gemv_hfq4g256"],
+                "fused_qkvza_hfq4g256_k2048_gfx1100" => {
+                    vec!["fused_qkvza_hfq4g256_k2048"]
+                }
                 // Multi-row RDNA3 modules expose three entry points per .hsaco
                 "gemv_hfq4g256_multirow_rdna3" => vec![
                     "gemv_hfq4g256_multirow_r2",
@@ -3749,6 +3841,26 @@ impl Gpu {
                 "gemv_hfq4g256_moe_down_indexed_batched_wave64" => {
                     vec!["gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_batched_wave64"]
                 }
+                "sample_top_p_parallel" => vec![
+                    "sample_apply_repeat_penalty",
+                    "sample_topk_partial",
+                    "sample_topk_finalize",
+                ],
+                "sample_top_p_parallel_w64" => vec![
+                    "sample_apply_repeat_penalty_w64",
+                    "sample_topk_partial_w64",
+                    "sample_topk_finalize_w64",
+                ],
+                "sample_top_p_parallel_fast21" => vec![
+                    "sample_apply_repeat_penalty_fast21",
+                    "sample_topk_partial_fast21",
+                    "sample_topk_finalize_fast21",
+                ],
+                "sample_top_p_parallel_fast65" => vec![
+                    "sample_apply_repeat_penalty_fast65",
+                    "sample_topk_partial_fast65",
+                    "sample_topk_finalize_fast65",
+                ],
                 other => vec![other],
             };
             // Compile and ensure the module is loaded once.

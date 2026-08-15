@@ -330,6 +330,17 @@ impl ArchCaps {
     pub fn is_rdna3p5(&self) -> bool {
         self.is_rdna3p5
     }
+    /// Discrete RDNA3 (gfx1100 / gfx1101 / gfx1102) — 96-CU class dGPU at
+    /// ~960 GB/s. Distinct from the RDNA3.5 APU for tuning purposes.
+    pub fn is_rdna3_discrete(&self) -> bool {
+        self.is_rdna3_dgpu
+    }
+    /// RDNA3.5 APU (gfx1150 / gfx1151 / gfx1152) — unified-memory APU with
+    /// far fewer CUs. Shares `has_wmma_w32` with discrete RDNA3 but needs
+    /// independent tuning (prefetch, LDS pressure, compile-time head_dim).
+    pub fn is_rdna35_apu(&self) -> bool {
+        self.is_rdna3p5
+    }
     /// MQ4-Lloyd `_mb4` batch-fanout kernel admission. The MQ4-Lloyd mb4
     /// `*_mb4_for_arch` source selectors in `kernels.rs` ship a real kernel
     /// only for gfx1100/1101/1102 (RDNA3 dGPU) and gfx1151 (the Strix-Halo K4

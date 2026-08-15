@@ -9,6 +9,7 @@ passed as `HIPFIRE_*` environment variables.
 | [`user.toml`](user.toml) | Users | Generation, memory, prompt, speculation, and serve policy. |
 | [`developer.toml`](developer.toml) | Developers | Hardware selection, kernel policy, graphs, diagnostics, and the experimental escape namespace. |
 | [`redline-pm4.toml`](redline-pm4.toml) | Redline developers | Explicit retained-PM4 transport and diagnostic policy. |
+| [`batched-redline-pm4-product.toml`](batched-redline-pm4-product.toml) | Redline developers | Certified fixed-slot sampled AR batch route for gfx1201 Qwen3.6 A3B MQ4R. Pins the retained-PM4 batch shape; not a built-in profile. |
 
 Each file is a complete valid profile, but it is intentionally not a dump of
 every default. Missing keys continue to inherit registry or compiled policy.

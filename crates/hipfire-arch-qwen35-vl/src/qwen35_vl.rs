@@ -5,9 +5,9 @@
 //! Qwen3.5-VL vision encoder: SigLIP-2 ViT + spatial merger.
 //! GPU path: gemm_f16 (9 VGPRs), layernorm (13), gelu (8), vit_attention, transpose.
 
+use hip_bridge::HipResult;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{f16_to_f32, f32_to_f16};
-use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 // ─── Config ──────────────────────────────────────────────────────────────────
@@ -44,39 +44,74 @@ pub fn vision_config_from_hfq(hfq: &HfqFile) -> Option<VisionConfig> {
     let hidden_size = vc.get("hidden_size")?.as_u64()? as usize;
     let num_heads = vc.get("num_heads").and_then(|v| v.as_u64()).unwrap_or(16) as usize;
     let num_layers = vc.get("depth").and_then(|v| v.as_u64()).unwrap_or(27) as usize;
-    let mlp_dim = vc.get("intermediate_size").and_then(|v| v.as_u64()).unwrap_or(4304) as usize;
+    let mlp_dim = vc
+        .get("intermediate_size")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(4304) as usize;
     let patch_size = vc.get("patch_size").and_then(|v| v.as_u64()).unwrap_or(16) as usize;
-    let temporal_patch_size = vc.get("temporal_patch_size").and_then(|v| v.as_u64()).unwrap_or(2) as usize;
-    let out_hidden_size = vc.get("out_hidden_size").and_then(|v| v.as_u64())
-        .or_else(|| config.get("text_config").and_then(|tc| tc.get("hidden_size")).and_then(|v| v.as_u64()))
+    let temporal_patch_size = vc
+        .get("temporal_patch_size")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(2) as usize;
+    let out_hidden_size = vc
+        .get("out_hidden_size")
+        .and_then(|v| v.as_u64())
+        .or_else(|| {
+            config
+                .get("text_config")
+                .and_then(|tc| tc.get("hidden_size"))
+                .and_then(|v| v.as_u64())
+        })
         .unwrap_or(4096) as usize;
-    let spatial_merge_size = vc.get("spatial_merge_size").and_then(|v| v.as_u64()).unwrap_or(2) as usize;
-    let num_position_embeddings = vc.get("num_position_embeddings")
-        .and_then(|v| v.as_u64()).unwrap_or(2304) as usize;
-    let rope_theta = vc.get("rope_theta")
-        .and_then(|v| v.as_f64()).unwrap_or(10000.0) as f32;
+    let spatial_merge_size = vc
+        .get("spatial_merge_size")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(2) as usize;
+    let num_position_embeddings = vc
+        .get("num_position_embeddings")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(2304) as usize;
+    let rope_theta = vc
+        .get("rope_theta")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(10000.0) as f32;
 
     Some(VisionConfig {
-        hidden_size, num_heads, head_dim: hidden_size / num_heads,
-        num_layers, mlp_dim, patch_size, temporal_patch_size,
-        out_hidden_size, spatial_merge_size, num_position_embeddings,
-        rope_theta, norm_eps: 1e-6,
+        hidden_size,
+        num_heads,
+        head_dim: hidden_size / num_heads,
+        num_layers,
+        mlp_dim,
+        patch_size,
+        temporal_patch_size,
+        out_hidden_size,
+        spatial_merge_size,
+        num_position_embeddings,
+        rope_theta,
+        norm_eps: 1e-6,
     })
 }
 
 // ─── GPU-side weights ────────────────────────────────────────────────────────
 
 pub struct VisionLayerWeights {
-    pub norm1_w: GpuTensor, pub norm1_b: GpuTensor,
-    pub qkv_w: GpuTensor, pub qkv_b: GpuTensor,
-    pub proj_w: GpuTensor, pub proj_b: GpuTensor,
-    pub norm2_w: GpuTensor, pub norm2_b: GpuTensor,
-    pub fc1_w: GpuTensor, pub fc1_b: GpuTensor,
-    pub fc2_w: GpuTensor, pub fc2_b: GpuTensor,
+    pub norm1_w: GpuTensor,
+    pub norm1_b: GpuTensor,
+    pub qkv_w: GpuTensor,
+    pub qkv_b: GpuTensor,
+    pub proj_w: GpuTensor,
+    pub proj_b: GpuTensor,
+    pub norm2_w: GpuTensor,
+    pub norm2_b: GpuTensor,
+    pub fc1_w: GpuTensor,
+    pub fc1_b: GpuTensor,
+    pub fc2_w: GpuTensor,
+    pub fc2_b: GpuTensor,
 }
 
 pub struct VisionWeights {
-    pub patch_embed_w: GpuTensor, pub patch_embed_b: GpuTensor,
+    pub patch_embed_w: GpuTensor,
+    pub patch_embed_b: GpuTensor,
     /// Learned position-embedding table `(num_position_embeddings, hidden)`,
     /// resident on CPU because every image bilinearly interpolates a different
     /// `(grid_h, grid_w)` slice out of it (`fast_pos_embed_interpolate`). Cost
@@ -84,9 +119,12 @@ pub struct VisionWeights {
     /// strictly simpler than re-uploading shards per image.
     pub pos_embed: Vec<f32>,
     pub layers: Vec<VisionLayerWeights>,
-    pub merger_norm_w: GpuTensor, pub merger_norm_b: GpuTensor,
-    pub merger_fc1_w: GpuTensor, pub merger_fc1_b: GpuTensor,
-    pub merger_fc2_w: GpuTensor, pub merger_fc2_b: GpuTensor,
+    pub merger_norm_w: GpuTensor,
+    pub merger_norm_b: GpuTensor,
+    pub merger_fc1_w: GpuTensor,
+    pub merger_fc1_b: GpuTensor,
+    pub merger_fc2_w: GpuTensor,
+    pub merger_fc2_b: GpuTensor,
 }
 
 impl VisionWeights {
@@ -95,8 +133,10 @@ impl VisionWeights {
         let _ = gpu.free_tensor(self.patch_embed_w);
         let _ = gpu.free_tensor(self.patch_embed_b);
         for l in self.layers {
-            for t in [l.norm1_w, l.norm1_b, l.qkv_w, l.qkv_b, l.proj_w, l.proj_b,
-                      l.norm2_w, l.norm2_b, l.fc1_w, l.fc1_b, l.fc2_w, l.fc2_b] {
+            for t in [
+                l.norm1_w, l.norm1_b, l.qkv_w, l.qkv_b, l.proj_w, l.proj_b, l.norm2_w, l.norm2_b,
+                l.fc1_w, l.fc1_b, l.fc2_w, l.fc2_b,
+            ] {
                 let _ = gpu.free_tensor(t);
             }
         }
@@ -112,13 +152,23 @@ impl VisionWeights {
 // ─── Weight loading ──────────────────────────────────────────────────────────
 
 fn load_f32_cpu(hfq: &HfqFile, name: &str, n: usize) -> Vec<f32> {
-    let (info, data) = hfq.tensor_data(name)
+    let (info, data) = hfq
+        .tensor_data(name)
         .unwrap_or_else(|| panic!("vision tensor not found: {name}"));
     let mut vals: Vec<f32> = match info.quant_type {
-        1 => data.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect(),
-        2 => data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
+        1 => data
+            .chunks_exact(2)
+            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .collect(),
+        2 => data
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
         6 | 7 => dequant_hfq4(data, n, info.group_size as usize),
-        _ => panic!("expected F16/F32/HFQ4 for {name}, got qt={}", info.quant_type),
+        _ => panic!(
+            "expected F16/F32/HFQ4 for {name}, got qt={}",
+            info.quant_type
+        ),
     };
     vals.truncate(n);
     vals
@@ -130,7 +180,8 @@ fn load_f32_gpu(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipResult
 }
 
 fn load_f16_gpu(hfq: &HfqFile, gpu: &mut Gpu, name: &str) -> HipResult<GpuTensor> {
-    let (info, data) = hfq.tensor_data(name)
+    let (info, data) = hfq
+        .tensor_data(name)
         .unwrap_or_else(|| panic!("vision tensor not found: {name}"));
     let n: usize = info.shape.iter().map(|&s| s as usize).product();
     match info.quant_type {
@@ -138,16 +189,35 @@ fn load_f16_gpu(hfq: &HfqFile, gpu: &mut Gpu, name: &str) -> HipResult<GpuTensor
             // F16 — upload directly. Shape records element count, not byte count.
             gpu.upload_raw(data, &[n])
         }
+        2 => {
+            // F32 oracle — the vision kernels consume F16 matrices, so narrow
+            // the lossless decoder-oracle container at load time just as the
+            // ordinary --include-vision ingest does before writing F16.
+            let f16_bytes: Vec<u8> = data
+                .chunks_exact(4)
+                .take(n)
+                .flat_map(|c| {
+                    f32_to_f16(f32::from_le_bytes([c[0], c[1], c[2], c[3]])).to_le_bytes()
+                })
+                .collect();
+            gpu.upload_raw(&f16_bytes, &[n])
+        }
         6 | 7 => {
             // HFQ4 — dequantize to F32, then convert to F16 for gemm_f16.
             // Shape records element count, not byte count.
             let f32_data = dequant_hfq4(data, n, info.group_size as usize);
-            let f16_bytes: Vec<u8> = f32_data.iter()
+            let f16_bytes: Vec<u8> = f32_data
+                .iter()
                 .flat_map(|&v| f32_to_f16(v).to_le_bytes())
                 .collect();
             gpu.upload_raw(&f16_bytes, &[n])
         }
-        other => panic!("{name}: unsupported vision quant_type={other} (expected F16=1, HFQ4=6/7)"),
+        other => {
+            panic!(
+                "{name}: unsupported vision quant_type={other} \
+                 (expected F16=1, F32=2, HFQ4=6/7)"
+            )
+        }
     }
 }
 
@@ -161,15 +231,23 @@ fn dequant_hfq4(data: &[u8], n: usize, group_size: usize) -> Vec<f32> {
     let n_groups = n.div_ceil(group_size);
     for g in 0..n_groups {
         let off = g * block_size;
-        if off + 8 > data.len() { break; }
-        let scale = f32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
-        let zero = f32::from_le_bytes([data[off+4], data[off+5], data[off+6], data[off+7]]);
-        let nibbles = &data[off+8..(off+block_size).min(data.len())];
+        if off + 8 > data.len() {
+            break;
+        }
+        let scale = f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
+        let zero = f32::from_le_bytes([data[off + 4], data[off + 5], data[off + 6], data[off + 7]]);
+        let nibbles = &data[off + 8..(off + block_size).min(data.len())];
         let base = g * group_size;
         for i in 0..group_size.min(n.saturating_sub(base)) {
             let byte_idx = i / 2;
-            if byte_idx >= nibbles.len() { break; }
-            let nibble = if i % 2 == 0 { nibbles[byte_idx] & 0xF } else { nibbles[byte_idx] >> 4 };
+            if byte_idx >= nibbles.len() {
+                break;
+            }
+            let nibble = if i % 2 == 0 {
+                nibbles[byte_idx] & 0xF
+            } else {
+                nibbles[byte_idx] >> 4
+            };
             out.push(scale * nibble as f32 + zero);
         }
     }
@@ -177,7 +255,11 @@ fn dequant_hfq4(data: &[u8], n: usize, group_size: usize) -> Vec<f32> {
     out
 }
 
-pub fn load_vision_weights(hfq: &HfqFile, config: &VisionConfig, gpu: &mut Gpu) -> HipResult<VisionWeights> {
+pub fn load_vision_weights(
+    hfq: &HfqFile,
+    config: &VisionConfig,
+    gpu: &mut Gpu,
+) -> HipResult<VisionWeights> {
     let h = config.hidden_size;
 
     // Arch advisory. The vision tower kernels (gemm_f16, layernorm_batched,
@@ -190,10 +272,12 @@ pub fn load_vision_weights(hfq: &HfqFile, config: &VisionConfig, gpu: &mut Gpu) 
     match gpu.arch.as_str() {
         "gfx1100" | "gfx1101" | "gfx1102" => {}
         other => {
-            eprintln!("  ⚠ vision tower not yet validated on {other}; \
+            eprintln!(
+                "  ⚠ vision tower not yet validated on {other}; \
                        results may differ from gfx1100 reference. See \
                        benchmarks/vision/comparison-2026-05-23.md for the \
-                       gfx1100 baseline.");
+                       gfx1100 baseline."
+            );
         }
     }
 
@@ -204,6 +288,7 @@ pub fn load_vision_weights(hfq: &HfqFile, config: &VisionConfig, gpu: &mut Gpu) 
     if let Some((info, _)) = hfq.tensor_data("model.visual.patch_embed.proj.weight") {
         let fmt = match info.quant_type {
             1 => "F16 (direct)",
+            2 => "F32 oracle (narrowing to F16 on load)",
             6 => "HFQ4-G256 (dequanting to F16 on load)",
             7 => "HFQ4-G128 (dequanting to F16 on load)",
             other => &format!("qt={other}"),
@@ -213,11 +298,17 @@ pub fn load_vision_weights(hfq: &HfqFile, config: &VisionConfig, gpu: &mut Gpu) 
     eprintln!("  loading vision weights (GPU)...");
     let patch_embed_w = load_f16_gpu(hfq, gpu, "model.visual.patch_embed.proj.weight")?;
     let patch_embed_b = load_f32_gpu(hfq, gpu, "model.visual.patch_embed.proj.bias", h)?;
-    let pos_embed = load_f32_cpu(hfq, "model.visual.pos_embed.weight", config.num_position_embeddings * h);
+    let pos_embed = load_f32_cpu(
+        hfq,
+        "model.visual.pos_embed.weight",
+        config.num_position_embeddings * h,
+    );
 
     let mut layers = Vec::with_capacity(config.num_layers);
     for i in 0..config.num_layers {
-        if i % 9 == 0 { eprintln!("  loading vision block {i}/{}...", config.num_layers); }
+        if i % 9 == 0 {
+            eprintln!("  loading vision block {i}/{}...", config.num_layers);
+        }
         let p = format!("model.visual.blocks.{i}");
         layers.push(VisionLayerWeights {
             norm1_w: load_f32_gpu(hfq, gpu, &format!("{p}.norm1.weight"), h)?,
@@ -229,7 +320,12 @@ pub fn load_vision_weights(hfq: &HfqFile, config: &VisionConfig, gpu: &mut Gpu) 
             norm2_w: load_f32_gpu(hfq, gpu, &format!("{p}.norm2.weight"), h)?,
             norm2_b: load_f32_gpu(hfq, gpu, &format!("{p}.norm2.bias"), h)?,
             fc1_w: load_f16_gpu(hfq, gpu, &format!("{p}.mlp.linear_fc1.weight"))?,
-            fc1_b: load_f32_gpu(hfq, gpu, &format!("{p}.mlp.linear_fc1.bias"), config.mlp_dim)?,
+            fc1_b: load_f32_gpu(
+                hfq,
+                gpu,
+                &format!("{p}.mlp.linear_fc1.bias"),
+                config.mlp_dim,
+            )?,
             fc2_w: load_f16_gpu(hfq, gpu, &format!("{p}.mlp.linear_fc2.weight"))?,
             fc2_b: load_f32_gpu(hfq, gpu, &format!("{p}.mlp.linear_fc2.bias"), h)?,
         });
@@ -238,13 +334,21 @@ pub fn load_vision_weights(hfq: &HfqFile, config: &VisionConfig, gpu: &mut Gpu) 
     let merge_dim = h * config.spatial_merge_size * config.spatial_merge_size;
     eprintln!("  loading vision merger...");
     Ok(VisionWeights {
-        patch_embed_w, patch_embed_b, pos_embed, layers,
+        patch_embed_w,
+        patch_embed_b,
+        pos_embed,
+        layers,
         merger_norm_w: load_f32_gpu(hfq, gpu, "model.visual.merger.norm.weight", h)?,
         merger_norm_b: load_f32_gpu(hfq, gpu, "model.visual.merger.norm.bias", h)?,
         merger_fc1_w: load_f16_gpu(hfq, gpu, "model.visual.merger.linear_fc1.weight")?,
         merger_fc1_b: load_f32_gpu(hfq, gpu, "model.visual.merger.linear_fc1.bias", merge_dim)?,
         merger_fc2_w: load_f16_gpu(hfq, gpu, "model.visual.merger.linear_fc2.weight")?,
-        merger_fc2_b: load_f32_gpu(hfq, gpu, "model.visual.merger.linear_fc2.bias", config.out_hidden_size)?,
+        merger_fc2_b: load_f32_gpu(
+            hfq,
+            gpu,
+            "model.visual.merger.linear_fc2.bias",
+            config.out_hidden_size,
+        )?,
     })
 }
 
@@ -278,8 +382,12 @@ pub fn fast_pos_embed_interpolate(
 
     // linspace(0, K-1, N) — torch semantics. With N==1 the only output is 0.0.
     fn linspace(start: f32, end: f32, n: usize) -> Vec<f32> {
-        if n == 0 { return Vec::new(); }
-        if n == 1 { return vec![start]; }
+        if n == 0 {
+            return Vec::new();
+        }
+        if n == 1 {
+            return vec![start];
+        }
         let step = (end - start) / (n as f32 - 1.0);
         (0..n).map(|i| start + step * i as f32).collect()
     }
@@ -291,8 +399,8 @@ pub fn fast_pos_embed_interpolate(
     // Torch `.int()` truncates toward zero; with these non-negative values it
     // is equivalent to floor. Ceil is floor+1 clamped to K-1.
     let mut h_floor = vec![0usize; grid_h];
-    let mut h_ceil  = vec![0usize; grid_h];
-    let mut dh      = vec![0.0f32; grid_h];
+    let mut h_ceil = vec![0usize; grid_h];
+    let mut dh = vec![0.0f32; grid_h];
     for (i, &v) in h_idxs.iter().enumerate() {
         let f = v as i32 as usize;
         h_floor[i] = f;
@@ -300,8 +408,8 @@ pub fn fast_pos_embed_interpolate(
         dh[i] = v - f as f32;
     }
     let mut w_floor = vec![0usize; grid_w];
-    let mut w_ceil  = vec![0usize; grid_w];
-    let mut dw      = vec![0.0f32; grid_w];
+    let mut w_ceil = vec![0usize; grid_w];
+    let mut dw = vec![0.0f32; grid_w];
     for (j, &v) in w_idxs.iter().enumerate() {
         let f = v as i32 as usize;
         w_floor[j] = f;
@@ -332,11 +440,10 @@ pub fn fast_pos_embed_interpolate(
             let r_cf = (hc * num_grid_per_side + wf) * hidden;
             let r_cc = (hc * num_grid_per_side + wc) * hidden;
             for d in 0..hidden {
-                interp[out_off + d] =
-                    w_ff * pos_embed[r_ff + d]
-                  + w_fc * pos_embed[r_fc + d]
-                  + w_cf * pos_embed[r_cf + d]
-                  + w_cc * pos_embed[r_cc + d];
+                interp[out_off + d] = w_ff * pos_embed[r_ff + d]
+                    + w_fc * pos_embed[r_fc + d]
+                    + w_cf * pos_embed[r_cf + d]
+                    + w_cc * pos_embed[r_cc + d];
             }
         }
     }
@@ -389,9 +496,12 @@ pub fn compute_vision_rope_cos_sin(
     merge_size: usize,
     theta: f32,
 ) -> (Vec<f32>, Vec<f32>) {
-    assert!(head_dim % 4 == 0, "head_dim must be divisible by 4 (got {head_dim})");
-    let rot_dim = head_dim / 2;          // total rotary feature width
-    let inner   = head_dim / 4;          // = rot_dim / 2 = #frequencies
+    assert!(
+        head_dim % 4 == 0,
+        "head_dim must be divisible by 4 (got {head_dim})"
+    );
+    let rot_dim = head_dim / 2; // total rotary feature width
+    let inner = head_dim / 4; // = rot_dim / 2 = #frequencies
 
     // inv_freq[i] = 1 / theta^(2i / rot_dim)  for i in [0, inner)
     let inv_freq: Vec<f32> = (0..inner)
@@ -468,7 +578,10 @@ mod tests {
                         for d in 0..hidden {
                             let want = (r * k + c) as f32 * 10.0 + d as f32;
                             let got = out[idx * hidden + d];
-                            assert!((got - want).abs() < 1e-4, "idx={idx} d={d} got={got} want={want}");
+                            assert!(
+                                (got - want).abs() < 1e-4,
+                                "idx={idx} d={d} got={got} want={want}"
+                            );
                         }
                         idx += 1;
                     }
@@ -487,11 +600,11 @@ mod tests {
         let table = vec![10.0f32, 20.0f32, 30.0f32, 40.0f32]; // [(0,0)=10, (0,1)=20, (1,0)=30, (1,1)=40]
         let out = fast_pos_embed_interpolate(&table, hidden, 3, 3, k, merge);
         // 3x3 in row-major (no merge): center at out[4*hidden+0].
-        assert!((out[0] - 10.0).abs() < 1e-4);         // (0,0) → (0,0)
-        assert!((out[2] - 20.0).abs() < 1e-4);         // (0,2) → (0,1)
-        assert!((out[6] - 30.0).abs() < 1e-4);         // (2,0) → (1,0)
-        assert!((out[8] - 40.0).abs() < 1e-4);         // (2,2) → (1,1)
-        assert!((out[4] - 25.0).abs() < 1e-4);         // center = mean of all 4
+        assert!((out[0] - 10.0).abs() < 1e-4); // (0,0) → (0,0)
+        assert!((out[2] - 20.0).abs() < 1e-4); // (0,2) → (0,1)
+        assert!((out[6] - 30.0).abs() < 1e-4); // (2,0) → (1,0)
+        assert!((out[8] - 40.0).abs() < 1e-4); // (2,2) → (1,1)
+        assert!((out[4] - 25.0).abs() < 1e-4); // center = mean of all 4
     }
 
     #[test]
@@ -508,8 +621,14 @@ mod tests {
         let base = 2 * rot;
         // Col half should be all 1 / 0 since col_idx=0.
         for i in 0..inner {
-            assert!((cos_t[base + inner + i] - 1.0).abs() < 1e-6, "cos col half should be 1");
-            assert!(sin_t[base + inner + i].abs() < 1e-6, "sin col half should be 0");
+            assert!(
+                (cos_t[base + inner + i] - 1.0).abs() < 1e-6,
+                "cos col half should be 1"
+            );
+            assert!(
+                sin_t[base + inner + i].abs() < 1e-6,
+                "sin col half should be 0"
+            );
         }
         // Row half (row_idx=1): cos(inv_freq[0]) = cos(1.0) ≈ 0.5403
         let inv0 = 1.0f32; // 10000^0 = 1
@@ -552,10 +671,13 @@ mod tests {
         let r_floor = py_lin as i32 as usize;
         let r_ceil = (r_floor + 1).min(k - 1);
         let dh = py_lin - r_floor as f32;
-        let want = (1.0 - dh) * table[(r_floor * k + 5) * hidden]
-                 +        dh  * table[(r_ceil * k + 5) * hidden];
+        let want =
+            (1.0 - dh) * table[(r_floor * k + 5) * hidden] + dh * table[(r_ceil * k + 5) * hidden];
         let got = out[21 * hidden];
-        assert!((got - want).abs() < 1e-4, "non-square spot check failed: got={got} want={want}");
+        assert!(
+            (got - want).abs() < 1e-4,
+            "non-square spot check failed: got={got} want={want}"
+        );
     }
 
     /// Rectangular `compute_vision_rope_cos_sin`: a 2×4 grid sanity check
@@ -566,8 +688,8 @@ mod tests {
     fn rope_table_rectangular_grid() {
         let head_dim = 8usize;
         let (cos_t, sin_t) = compute_vision_rope_cos_sin(2, 4, head_dim, 1, 10000.0);
-        let inner = head_dim / 4;          // 2
-        let rot = head_dim / 2;            // 4
+        let inner = head_dim / 4; // 2
+        let rot = head_dim / 2; // 4
         assert_eq!(cos_t.len(), 8 * rot);
         // Patch (row=1, col=2): gy=1, gx=2, sy=0, sx=0 → idx = 1*4 + 2 = 6
         let base = 6 * rot;
@@ -600,21 +722,76 @@ mod tests {
 
 // ─── GPU vision forward (no CPU roundtrips for compute) ──────────────────────
 
-/// gemm_f16 produces Y[M,N]. We need [N,M]. This helper does GEMM + transpose + bias.
+/// Vision linear: Y[n, out_dim] = W_f16[out_dim, in_dim] @ X_f32[n, in_dim]^T + bias.
+///
+/// On wave32-WMMA arches (gfx11 and gfx12/RDNA4) this goes through
+/// `gemm_f16_wmma_mb8`, which writes row-major `[n, out_dim]` directly and so
+/// drops the separate `transpose_f32` pass the naive path needs. Same routing
+/// dots.ocr already uses (`hipfire-arch-dots-ocr/src/dots_ocr.rs`), and the
+/// gfx12 sibling is covered by `rdna-compute/examples/test_dots_ocr_wmma_gfx12.rs`.
+/// Non-WMMA arches keep the naive `gemm_f16` + transpose fallback.
 fn linear_f16(
-    gpu: &mut Gpu, w: &GpuTensor, x: &GpuTensor, bias: &GpuTensor,
-    out_dim: usize, in_dim: usize, n: usize,
+    gpu: &mut Gpu,
+    w: &GpuTensor,
+    x: &GpuTensor,
+    bias: &GpuTensor,
+    out_dim: usize,
+    in_dim: usize,
+    n: usize,
 ) -> HipResult<GpuTensor> {
-    // GEMM: Y_t[out_dim, n] = W[out_dim, in_dim] @ X[n, in_dim]^T
-    let yt = gpu.alloc_tensor(&[out_dim * n], DType::F32)?;
-    gpu.gemm_f16(w, x, &yt, out_dim, in_dim, n)?;
-    // Transpose: Y[n, out_dim]
     let y = gpu.alloc_tensor(&[n * out_dim], DType::F32)?;
-    gpu.transpose_f32(&yt, &y, out_dim, n)?;
-    gpu.free_tensor(yt)?;
-    // Bias
+    if gpu.arch_caps.has_wmma_w32() || gpu.arch_caps.has_wmma_w32_gfx12() {
+        gpu.gemm_f16_wmma_mb8(w, x, &y, out_dim, in_dim, n)?;
+    } else {
+        // GEMM: Y_t[out_dim, n] = W[out_dim, in_dim] @ X[n, in_dim]^T
+        let yt = gpu.alloc_tensor(&[out_dim * n], DType::F32)?;
+        gpu.gemm_f16(w, x, &yt, out_dim, in_dim, n)?;
+        gpu.transpose_f32(&yt, &y, out_dim, n)?;
+        gpu.free_tensor(yt)?;
+    }
     gpu.bias_add_f32(&y, bias, n, out_dim)?;
     Ok(y)
+}
+
+/// Diagnostic-only stage dump. Writes `<name>.bin` (raw little-endian f32) plus
+/// a `<name>.json` sidecar in the layout `benchmarks/vision/diff_dumps.py`
+/// expects, so hipfire stages can be diffed against
+/// `benchmarks/vision/dump_hf_reference.py` output stage-by-stage.
+///
+/// No-op unless `HIPFIRE_VL_DUMP_DIR` is set. This is the "Gap 3" per-block
+/// tooling called for in `benchmarks/vision/comparison-2026-05-23.md`
+/// ("would let us catch any silent regression in future kernel work touching
+/// the vision tower"). Downloading each stage forces a sync, so this is
+/// strictly a debugging path and must stay env-gated.
+fn vl_dump_slice(dir: &std::path::Path, name: &str, data: &[f32], shape: &[usize]) {
+    use std::io::Write;
+    let _ = std::fs::create_dir_all(dir);
+    if let Ok(mut f) = std::fs::File::create(dir.join(format!("{name}.bin"))) {
+        let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let _ = f.write_all(&bytes);
+    }
+    let shape_s = shape
+        .iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let _ = std::fs::write(
+        dir.join(format!("{name}.json")),
+        format!(r#"{{"shape":[{shape_s}],"dtype":"<f4"}}"#),
+    );
+}
+
+fn vl_dump_tensor(
+    gpu: &mut Gpu,
+    dir: Option<&std::path::Path>,
+    name: &str,
+    t: &GpuTensor,
+    shape: &[usize],
+) -> HipResult<()> {
+    let Some(dir) = dir else { return Ok(()) };
+    let data = gpu.download_f32(t)?;
+    vl_dump_slice(dir, name, &data, shape);
+    Ok(())
 }
 
 pub fn vision_forward(
@@ -629,15 +806,44 @@ pub fn vision_forward(
     let n = grid_h * grid_w;
     let patch_dim = 3 * config.temporal_patch_size * config.patch_size * config.patch_size;
     let t0 = std::time::Instant::now();
+    let dump_dir = std::env::var_os("HIPFIRE_VL_DUMP_DIR").map(std::path::PathBuf::from);
+    let dump_dir = dump_dir.as_deref();
 
-    eprintln!("  vision forward (GPU): {} patches, {}x{} grid", n, grid_h, grid_w);
+    // Diagnostic stage dumps (env-gated; see `vl_dump_slice`).
+    let dump_dir: Option<std::path::PathBuf> =
+        std::env::var("HIPFIRE_VL_DUMP_DIR").ok().map(Into::into);
+    let dd = dump_dir.as_deref();
+    if dd.is_some() {
+        eprintln!(
+            "  [VL-DUMP] stage dumps enabled ({} patches, {grid_h}x{grid_w})",
+            n
+        );
+    }
+
+    eprintln!(
+        "  vision forward (GPU): {} patches, {}x{} grid",
+        n, grid_h, grid_w
+    );
+
+    if let Some(d) = dd {
+        vl_dump_slice(d, "pixel_values", patches, &[n, patch_dim]);
+    }
 
     // Upload patches [n, patch_dim]
     let x_patches = gpu.upload_f32(patches, &[n * patch_dim])?;
 
     // Patch embedding: linear_f16 → [n, h]
-    let x = linear_f16(gpu, &weights.patch_embed_w, &x_patches, &weights.patch_embed_b, h, patch_dim, n)?;
+    let x = linear_f16(
+        gpu,
+        &weights.patch_embed_w,
+        &x_patches,
+        &weights.patch_embed_b,
+        h,
+        patch_dim,
+        n,
+    )?;
     gpu.free_tensor(x_patches)?;
+    vl_dump_tensor(gpu, dd, "patch_embed", &x, &[n, h])?;
 
     // Bilinear-interpolate the learned (K×K, h) pos_embed table down to the
     // actual (grid_h, grid_w) and reorder into 2x2-grouped patch sequence,
@@ -648,17 +854,26 @@ pub fn vision_forward(
     // `fast_pos_embed_interpolate` if we round to the nearest int. Fail loud
     // at vision_forward entry instead of producing garbage tokens.
     assert_eq!(
-        num_grid_per_side * num_grid_per_side, config.num_position_embeddings,
+        num_grid_per_side * num_grid_per_side,
+        config.num_position_embeddings,
         "num_position_embeddings ({}) must be a perfect square",
         config.num_position_embeddings,
     );
     let pos_embed_interp = fast_pos_embed_interpolate(
-        &weights.pos_embed, h, grid_h, grid_w,
-        num_grid_per_side, config.spatial_merge_size,
+        &weights.pos_embed,
+        h,
+        grid_h,
+        grid_w,
+        num_grid_per_side,
+        config.spatial_merge_size,
     );
     let pos_embed_gpu = gpu.upload_f32(&pos_embed_interp, &[n * h])?;
     gpu.add_inplace_f32(&x, &pos_embed_gpu)?;
     gpu.free_tensor(pos_embed_gpu)?;
+    vl_dump_tensor(gpu, dd, "post_pos_embed", &x, &[n, h])?;
+    if let Some(d) = dd {
+        vl_dump_slice(d, "pos_embed_interp", &pos_embed_interp, &[n, h]);
+    }
 
     // Compute the 2D rotary cos/sin tables once per image and upload. The
     // kernel reads `head_dim/2` floats per token for each of cos/sin (HF's
@@ -666,7 +881,11 @@ pub fn vision_forward(
     // angle, so we store the half only).
     let rot_dim_half = config.head_dim / 2;
     let (rope_cos, rope_sin) = compute_vision_rope_cos_sin(
-        grid_h, grid_w, config.head_dim, config.spatial_merge_size, config.rope_theta,
+        grid_h,
+        grid_w,
+        config.head_dim,
+        config.spatial_merge_size,
+        config.rope_theta,
     );
     let rope_cos_gpu = gpu.upload_f32(&rope_cos, &[n * rot_dim_half])?;
     let rope_sin_gpu = gpu.upload_f32(&rope_sin, &[n * rot_dim_half])?;
@@ -697,8 +916,13 @@ pub fn vision_forward(
 
         // 2D rotary applied in-place to Q and K halves of the QKV buffer.
         gpu.apply_rope_2d_vision_f32(
-            &qkv, &rope_cos_gpu, &rope_sin_gpu,
-            n, h, config.num_heads, config.head_dim,
+            &qkv,
+            &rope_cos_gpu,
+            &rope_sin_gpu,
+            n,
+            h,
+            config.num_heads,
+            config.head_dim,
         )?;
 
         // Self-attention on GPU: qkv[n, 3h] → attn_out[n, h]
@@ -729,13 +953,19 @@ pub fn vision_forward(
         // Residual: x += fc2
         gpu.add_inplace_f32(&x, &fc2)?;
         gpu.free_tensor(fc2)?;
+
+        vl_dump_tensor(gpu, dd, &format!("block_{li:02}"), &x, &[n, h])?;
     }
+    vl_dump_tensor(gpu, dd, "pre_merger", &x, &[n, h])?;
 
     // Single sync at end of all layers (avoids per-layer sync overhead)
     gpu.hip.device_synchronize()?;
     gpu.free_tensor(rope_cos_gpu)?;
     gpu.free_tensor(rope_sin_gpu)?;
-    eprintln!("  vision forward complete ({:.2}s)", t0.elapsed().as_secs_f32());
+    eprintln!(
+        "  vision forward complete ({:.2}s)",
+        t0.elapsed().as_secs_f32()
+    );
 
     // Spatial merge: [n, h] → [n_merged, merge_dim] (CPU rearrange, small data)
     let sms = config.spatial_merge_size;
@@ -746,7 +976,15 @@ pub fn vision_forward(
 
     // LayerNorm all patches
     let normed = gpu.alloc_tensor(&[n * h], DType::F32)?;
-    gpu.layernorm_batched(&x, &weights.merger_norm_w, &weights.merger_norm_b, &normed, n, h, config.norm_eps)?;
+    gpu.layernorm_batched(
+        &x,
+        &weights.merger_norm_w,
+        &weights.merger_norm_b,
+        &normed,
+        n,
+        h,
+        config.norm_eps,
+    )?;
     gpu.free_tensor(x)?;
 
     // Download for 2x2 rearrange (only ~3.6MB, one-time cost)
@@ -770,17 +1008,46 @@ pub fn vision_forward(
 
     // Merger MLP on GPU
     let merged_gpu = gpu.upload_f32(&merged, &[n_merged * merge_dim])?;
-    let m1 = linear_f16(gpu, &weights.merger_fc1_w, &merged_gpu, &weights.merger_fc1_b, merge_dim, merge_dim, n_merged)?;
+    let m1 = linear_f16(
+        gpu,
+        &weights.merger_fc1_w,
+        &merged_gpu,
+        &weights.merger_fc1_b,
+        merge_dim,
+        merge_dim,
+        n_merged,
+    )?;
     gpu.free_tensor(merged_gpu)?;
     gpu.gelu_tanh_f32(&m1, &m1, n_merged * merge_dim)?;
 
-    let m2 = linear_f16(gpu, &weights.merger_fc2_w, &m1, &weights.merger_fc2_b, config.out_hidden_size, merge_dim, n_merged)?;
+    let m2 = linear_f16(
+        gpu,
+        &weights.merger_fc2_w,
+        &m1,
+        &weights.merger_fc2_b,
+        config.out_hidden_size,
+        merge_dim,
+        n_merged,
+    )?;
     gpu.free_tensor(m1)?;
 
     let result = gpu.download_f32(&m2)?;
     gpu.free_tensor(m2)?;
+    if let Some(d) = dd {
+        vl_dump_slice(
+            d,
+            "post_merger",
+            &result,
+            &[n_merged, config.out_hidden_size],
+        );
+        vl_dump_slice(d, "merged_pre_mlp", &merged, &[n_merged, merge_dim]);
+    }
 
-    eprintln!("  vision done: {} tokens × {} dims ({:.2}s)",
-        n_merged, config.out_hidden_size, t0.elapsed().as_secs_f32());
+    eprintln!(
+        "  vision done: {} tokens × {} dims ({:.2}s)",
+        n_merged,
+        config.out_hidden_size,
+        t0.elapsed().as_secs_f32()
+    );
     Ok(result)
 }

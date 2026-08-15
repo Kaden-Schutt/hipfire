@@ -1215,6 +1215,132 @@ impl Gpu {
         result
     }
 
+    /// 3D mrope, half-split. `pos_buf3` holds exactly 3 i32: (t, h, w).
+    /// `section` is `mrope_section`; only [1] and [2] are needed by the
+    /// kernel (T is the fallback axis).
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_mrope_halfsplit_f32(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        pos_buf3: &hip_bridge::DeviceBuffer,
+        n_heads_q: usize,
+        n_heads_k: usize,
+        head_dim: usize,
+        n_rot: usize,
+        freq_base: f32,
+        section: [usize; 3],
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "rope_mrope_halfsplit_f32",
+            kernels::ROPE_MROPE_HALFSPLIT_SRC,
+            "rope_mrope_halfsplit_f32",
+        )?;
+        let func = &self.functions["rope_mrope_halfsplit_f32"];
+        let mut qp = q.buf.as_ptr();
+        let mut kp = k.buf.as_ptr();
+        let mut pp = pos_buf3.as_ptr();
+        let mut nhq = n_heads_q as i32;
+        let mut nhk = n_heads_k as i32;
+        let mut hd = head_dim as i32;
+        let mut nr = n_rot as i32;
+        let mut fb = freq_base;
+        let mut sh = section[1] as i32;
+        let mut sw = section[2] as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void,
+            &mut kp as *mut _ as *mut c_void,
+            &mut pp as *mut _ as *mut c_void,
+            &mut nhq as *mut _ as *mut c_void,
+            &mut nhk as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut nr as *mut _ as *mut c_void,
+            &mut fb as *mut _ as *mut c_void,
+            &mut sh as *mut _ as *mut c_void,
+            &mut sw as *mut _ as *mut c_void,
+        ];
+        let half = (n_rot / 2) as u32;
+        let block = 64u32;
+        let grid = half.div_ceil(block);
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid, 1, 1],
+                [block, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Batched 3D mrope, half-split. `positions` is `[batch_size][3]` i32.
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_mrope_halfsplit_f32_batched(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        positions: &hip_bridge::DeviceBuffer,
+        n_heads_q: usize,
+        n_heads_k: usize,
+        head_dim: usize,
+        n_rot: usize,
+        freq_base: f32,
+        batch_size: usize,
+        pos_offset: i32,
+        section: [usize; 3],
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "rope_mrope_halfsplit_batched_f32",
+            kernels::ROPE_MROPE_HALFSPLIT_BATCHED_SRC,
+            "rope_mrope_halfsplit_batched_f32",
+        )?;
+        let func = &self.functions["rope_mrope_halfsplit_batched_f32"];
+        let mut qp = q.buf.as_ptr();
+        let mut kp = k.buf.as_ptr();
+        let mut pp = positions.as_ptr();
+        let mut nhq = n_heads_q as i32;
+        let mut nhk = n_heads_k as i32;
+        let mut hd = head_dim as i32;
+        let mut nr = n_rot as i32;
+        let mut fb = freq_base;
+        let mut bs = batch_size as i32;
+        let mut po = pos_offset;
+        let mut sh = section[1] as i32;
+        let mut sw = section[2] as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void,
+            &mut kp as *mut _ as *mut c_void,
+            &mut pp as *mut _ as *mut c_void,
+            &mut nhq as *mut _ as *mut c_void,
+            &mut nhk as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut nr as *mut _ as *mut c_void,
+            &mut fb as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+            &mut po as *mut _ as *mut c_void,
+            &mut sh as *mut _ as *mut c_void,
+            &mut sw as *mut _ as *mut c_void,
+        ];
+        let half = (n_rot / 2) as u32;
+        let block = 64u32;
+        let grid = half.div_ceil(block);
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid, batch_size as u32, 1],
+                [block, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// Batched GPT-J **interleaved** RoPE — always dispatches the interleaved
     /// batched kernel (no legacy flag), the batched twin of `rope_interleaved_f32`.
     /// For Cohere2 sliding layers in batched prefill; pos_offset = 0 (prefill

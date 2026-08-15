@@ -20,11 +20,14 @@ use serde_json::json;
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 #[derive(Debug)]
 pub enum ChatEvent {
-    Delta(String),
+    Reasoning(String),
+    Content(String),
     Done,
     Error(String),
 }
@@ -75,8 +78,11 @@ fn stream_chat_inner(
         Duration::from_secs(600),
         |event| {
             match event {
-                OpenAiSseEvent::Reasoning { text } | OpenAiSseEvent::Content { text } => {
-                    let _ = tx.send(ChatEvent::Delta(text));
+                OpenAiSseEvent::Reasoning { text } => {
+                    let _ = tx.send(ChatEvent::Reasoning(text));
+                }
+                OpenAiSseEvent::Content { text } => {
+                    let _ = tx.send(ChatEvent::Content(text));
                 }
                 OpenAiSseEvent::Role { .. }
                 | OpenAiSseEvent::ToolCall { .. }
@@ -98,5 +104,63 @@ fn stream_chat_inner(
             Ok(())
         }
         Err(err) => Err(err.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chat_message_reasoning_serialization() {
+        // None is omitted; Some is emitted as reasoning_content.
+        let msg_none = ChatMessage {
+            role: "assistant".into(),
+            content: "answer".into(),
+            reasoning_content: None,
+        };
+        let v = serde_json::to_value(&msg_none).unwrap();
+        assert_eq!(v["role"], "assistant");
+        assert_eq!(v["content"], "answer");
+        assert!(v.get("reasoning_content").is_none(), "None must not serialize");
+
+        let msg_some = ChatMessage {
+            role: "assistant".into(),
+            content: "answer".into(),
+            reasoning_content: Some("think".into()),
+        };
+        let v = serde_json::to_value(&msg_some).unwrap();
+        assert_eq!(v["reasoning_content"], "think");
+        assert_eq!(v["content"], "answer");
+
+        // Deserializing legacy JSON without the field yields None.
+        let legacy: ChatMessage = serde_json::from_value(serde_json::json!({
+            "role": "assistant",
+            "content": "hello"
+        }))
+        .unwrap();
+        assert!(legacy.reasoning_content.is_none());
+
+        // Deserializing with reasoning_content populates it.
+        let with_reasoning: ChatMessage = serde_json::from_value(serde_json::json!({
+            "role": "assistant",
+            "content": "hello",
+            "reasoning_content": "plan"
+        }))
+        .unwrap();
+        assert_eq!(with_reasoning.reasoning_content.as_deref(), Some("plan"));
+    }
+
+    #[test]
+    fn chat_message_reasoning_empty_string_round_trips_but_omits_on_none() {
+        // Some("") serializes as empty string (not omitted by is_none; caller should use None for empty).
+        // The TUI fold normalizes empty to None before storing.
+        let msg_empty = ChatMessage {
+            role: "assistant".into(),
+            content: "answer".into(),
+            reasoning_content: Some(String::new()),
+        };
+        let v = serde_json::to_value(&msg_empty).unwrap();
+        assert_eq!(v["reasoning_content"], "");
     }
 }

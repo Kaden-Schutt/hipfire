@@ -631,6 +631,15 @@ fn draw_chat(frame: &mut Frame, app: &App, area: Rect) {
                 format!("{}:", msg.role),
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             )));
+            // Reasoning is rendered before content in the same bubble, preserving
+            // today's visual order (reasoning streamed first, then answer).
+            if let Some(rc) = msg.reasoning_content.as_deref().filter(|s| !s.is_empty()) {
+                lines.extend(crate::ui_chat::render_body(rc, &code_theme));
+                // Thin separator when both channels present.
+                if !msg.content.is_empty() {
+                    lines.push(Line::from(""));
+                }
+            }
             lines.extend(crate::ui_chat::render_body(&msg.content, &code_theme));
             lines.push(Line::from(""));
         }
@@ -2195,6 +2204,7 @@ mod render_tests {
             app.chat.messages = vec![crate::hipfire::chat::ChatMessage {
                 role: "assistant".into(),
                 content: "here:\n```rust\nlet x = 1;\n```".into(),
+                reasoning_content: None,
             }];
         });
         assert!(text.contains("let x = 1;"), "code line is rendered");

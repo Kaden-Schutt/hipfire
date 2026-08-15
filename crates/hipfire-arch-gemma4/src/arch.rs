@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt, Kate, Kevin Read
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! `Architecture` trait impl for Gemma 4 dense text (arch_id = 13).
+//! `Architecture` trait impl for Gemma 4 text models (arch_id = 13).
 //!
 //! Thin marker + delegation, mirroring `hipfire-arch-minimax`'s `arch.rs`. The
 //! forward pass is NOT on the trait — it lives as free functions in
@@ -14,10 +14,10 @@ use hipfire_runtime::arch::{Architecture, EosFilterOverrides};
 use hipfire_runtime::hfq::HfqFile;
 use rdna_compute::Gpu;
 
-/// Canonical arch_id for the Gemma 4 dense text family.
+/// Canonical arch_id for the Gemma 4 text family.
 pub const ARCH_ID: u32 = 13;
 
-/// Zero-sized type marker for Gemma 4 dense. Trait dispatch uses the type.
+/// Zero-sized type marker for Gemma 4 text. Trait dispatch uses the type.
 pub struct Gemma4;
 
 impl Architecture for Gemma4 {

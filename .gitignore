@@ -61,8 +61,10 @@ __pycache__/
 *.log
 /tmp/
 
-# Local Claude agent state
+# Local agent harness state (Claude / Oh My Pi). Per-session bookkeeping,
+# worktrees, and artifact caches — never part of the tracked tree.
 .claude/
+.omp/
 # Personal CLI instructions
 cli/CLAUDE.md
 CLAUDE.local.md
