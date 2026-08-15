@@ -53,3 +53,6 @@ pub mod vision;
 
 /// Redline capture/replay fixtures lifted out of the daemon.
 pub mod redline;
+
+/// Continuous-batch drivers and their admission predicates.
+pub mod batch;
