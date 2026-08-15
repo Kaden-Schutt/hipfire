@@ -67,7 +67,14 @@ extern "C" __global__ void attention_q8_0_kv_batched(
     // cycle and the linearized tree root sits at positions[0] == start_pos ==
     // block_start, so derive it from the device buffer instead of the scalar.
     // Eager (non-capture) value is identical, so this is a no-op off-graph.
-    const int eff_block_start = tree_mode ? positions[0] : block_start;
+    // A negative block_start selects a full-context bias: callers provide
+    // [batch, seq_len] and the bias begins at cache slot zero.  This is
+    // distinct from tree verify, whose block starts at positions[0] and whose
+    // scalar start must remain graph-replay safe.
+    const bool full_context_bias = tree_mode && block_start < 0;
+    const int eff_block_start = tree_mode
+        ? (full_context_bias ? 0 : positions[0])
+        : block_start;
     // Tree mode: iterate over the full cache including the block.
     // Causal mode: attend to 0..positions[b] inclusive (unchanged).
     const int seq_len = tree_mode ? (eff_block_start + block_cols) : (positions[b] + 1);
