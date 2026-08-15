@@ -1,0 +1,20 @@
+This is a technical briefing for operators and implementers who need to establish a rigorous, reproducible benchmark for a specific inference scenario: a single-user, greedy-decoding, no-speculation inference workload on a DeepSeV4 Flash-style Mixture-of-Experts (MoE) model running on an AMD Instinct MI300X (gfx942) GPU. The focus is on the "ordinary" path—no speculative decoding, no draft models, no tree verification, no any form of acceleration beyond the standard autoregressive (AR) loop. The measurement contract is strict, and the goal is to ensure that any performance claims are grounded in a reproducible, numerically correct, and architecturally faithful execution.
+
+Below is a detailed, production-grade explanation covering the entire end-to path, from frozen prompt fixture to token-by-token decode under Q8 KV with no speculation.
+
+---
+
+### 1. The Prompt Fixture: Why "Bytes" Over "Text"
+
+The benchmark begins with a **frozen prompt fixture**. This is not merely "text" because:
+
+- **Tokenization is deterministic only if the exact byte sequence is known.** A trailing newline, a different line-ending convention (CR vs. LF), a different encoding (UTF-8 vs. UTF-16), or a different tokenizer implementation (Python vs. C++/Rust) will produce different token IDs. The benchmark must guarantee that the same token IDs are used across all runs.
+- **The prompt must be a realistic, non-degenerate sequence.** A single repeated paragraph or random noise will not exercise the model's attention patterns or expert routing in a representative way. The prompt should be a coherent piece of technical prose or chat, with a mix of short function words, domain nouns, punctuation, and paragraph structure.
+- **The prompt must be a strict prefix of a larger corpus, verified by a tokenization round-trip.** The process is:
+    1. Tokenize the full corpus.
+    2. Take the first N tokens (e.g., 2048).
+    3. Decode those tokens back to text.
+    4. Re-tokenize that text.
+    5. Verify that the resulting token IDs are identical to the original N tokens. If not, the fixture generator must fail.
+- **The final fixture file contains no trailing newline.** This ensures that `PROMP_ARG=$(<file)` preserves the exact byte sequence.
+- **A cryptographic hash (MD5, SHA-256) of the prompt bytes is a required field in

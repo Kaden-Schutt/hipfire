@@ -1,0 +1,14 @@
+=== events with drafter ===
+50:{"type":"commit_ready","id":"g0-postfix","tokens":51,"tok_s":3.041144901610018,"prompt_tokens":14,"prefill_tokens":14,"cached_tokens":0,"prefill_ms":18937,"total_ms":35707,"finish_reason":"stop","drafter":"ar","attempt_id":1}
+51:{"type":"done","id":"g0-postfix","tokens":51,"tok_s":3.041144901610018,"prompt_tokens":14,"prefill_tokens":14,"cached_tokens":0,"prefill_ms":18937,"total_ms":35707,"finish_reason":"stop","drafter":"ar","attempt_id":1}
+=== daemon stderr ===
+GPU dev 0: gfx942 (205.8 GB VRAM, HIP 7.0)
+[rocblas] loaded for gfx942
+deepseek4: MQ2R P3 tensor recipe verified; gfx1151 route v2 is ineligible on gfx942, using portable dispatch
+[daemon-control] received commit for id=g0-postfix attempt_id=1
+[req g0-postfix] drafter=ar tau=1.00 tok/s=3.0 decode (51 tok, autoregressive)
+=== greps ===
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/30-postfix-daemon.stderr:5:[req g0-postfix] drafter=ar tau=1.00 tok/s=3.0 decode (51 tok, autoregressive)
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/30-postfix-driver.stderr:62:[driver] << {"type":"commit_ready","id":"g0-postfix","tokens":51,"tok_s":3.041144901610018,"prompt_tokens":14,"prefill_tokens":14,"cached_tokens":0,"prefill_ms":18937,"total_ms":35707,"finish_reason":"stop","drafter":"ar","attempt_id":1}
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/30-postfix-driver.stderr:65:[driver] << {"type":"done","id":"g0-postfix","tokens":51,"tok_s":3.041144901610018,"prompt_tokens":14,"prefill_tokens":14,"cached_tokens":0,"prefill_ms":18937,"total_ms":35707,"finish_reason":"stop","drafter":"ar","attempt_id":1}
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/30-postfix-driver.stderr:67:[req g0-postfix] drafter=ar tau=1.00 tok/s=3.0 decode (51 tok, autoregressive)

@@ -9,7 +9,7 @@
 # thinking-loop attractor that ONLY a real, multi-request serve exposes. Every
 # single-request gate passed while serve was broken.
 #
-# This gate starts a REAL `hipfire serve` (bun → daemon → HTTP), fires a batch
+# This gate starts a REAL native `hipfire serve` (Rust → daemon → HTTP), fires a batch
 # of repeated + distinct greedy (temperature=0) requests at one warm daemon, and
 # HARD-FAILS if any response is the thinking-loop attractor or a degenerate
 # token loop. It exercises the DFlash path by default (the catastrophic case);
@@ -30,7 +30,7 @@ RUN_AR=0
 pick_model() {
   local tag f
   for tag in qwen3.5:0.8b qwen3.5:4b qwen3.5:9b qwen3.6:27b; do
-    f=$(jq -r --arg t "$tag" '.models[$t].file // empty' "$ROOT/cli/registry.json" 2>/dev/null)
+    f=$(jq -r --arg t "$tag" '.models[$t].file // empty' "$ROOT/registry/v1.json" 2>/dev/null)
     [ -n "$f" ] && [ -e "$MODELS_DIR/$f" ] && { echo "$tag"; return 0; }
   done
   # fallback: any qwen3.5-*.mq4 file on disk
@@ -49,18 +49,24 @@ cleanup() {
 }
 trap cleanup EXIT
 
-BUN="$(command -v bun || echo "$HOME/.bun/bin/bun")"
-[ -x "$BUN" ] || { echo "serve-loop-gate: SKIP — bun not found" >&2; exit 0; }
+HIPFIRE="${HIPFIRE_CLI_BIN:-$ROOT/target/release/hipfire}"
+[ -x "$HIPFIRE" ] || HIPFIRE="$(command -v hipfire || true)"
+[ -x "$HIPFIRE" ] || { echo "serve-loop-gate: native hipfire CLI not found; build cargo build --release -p hipfire-cli" >&2; exit 2; }
 
 SERVELOG="$(mktemp)"
 start_serve() { # $1 = extra env (e.g. "HIPFIRE_DFLASH_OFF")
   fuser -k "${PORT}/tcp" >/dev/null 2>&1 || true; pkill -f "examples/daemon" >/dev/null 2>&1 || true; sleep 1
   : > "$SERVELOG"
   local cfg=""; [ "${1:-}" = "ar" ] && cfg="HIPFIRE_DFLASH_DRAFT="  # disable draft auto-detect → AR path
-  env $cfg setsid "$BUN" "$ROOT/cli/index.ts" serve 0.0.0.0 "$PORT" >"$SERVELOG" 2>&1 & disown
-  for _ in $(seq 1 150); do grep -qiE 'warm-up complete|panicked|FATAL|port in use' "$SERVELOG" && break; sleep 2; done
+  env $cfg HIPFIRE_MODEL="$MODEL" setsid "$HIPFIRE" serve 0.0.0.0 "$PORT" >"$SERVELOG" 2>&1 & disown
+  local warm=0
+  for _ in $(seq 1 150); do
+    if curl -fsS --max-time 2 "http://127.0.0.1:${PORT}/health" 2>/dev/null | jq -e '.model != null and .loading_model == null' >/dev/null 2>&1; then warm=1; break; fi
+    grep -qiE 'panicked|FATAL|port in use|pre-warm failed' "$SERVELOG" && break
+    sleep 2
+  done
   if grep -qiE 'panicked|FATAL' "$SERVELOG"; then echo "serve-loop-gate: FAIL — daemon panicked at startup" >&2; tail -5 "$SERVELOG" >&2; return 1; fi
-  grep -qiE 'warm-up complete' "$SERVELOG" || { echo "serve-loop-gate: FAIL — serve never warmed up" >&2; tail -5 "$SERVELOG" >&2; return 1; }
+  [ "$warm" = 1 ] || { echo "serve-loop-gate: FAIL — serve never warmed up" >&2; tail -5 "$SERVELOG" >&2; return 1; }
   return 0
 }
 

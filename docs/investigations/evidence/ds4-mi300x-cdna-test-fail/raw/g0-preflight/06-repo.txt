@@ -1,0 +1,69 @@
+=== ls -la /root ===
+total 64
+drwx------ 11 root root 4096 Aug  1 12:16 .
+drwxr-xr-x 22 root root 4096 Aug  1 12:16 ..
+-rw-r--r--  1 root root  144 Aug  1 11:01 .bash_history
+-rw-r--r--  1 root root 3127 Aug  1 08:32 .bashrc
+drwx------  5 root root 4096 Aug  1 08:36 .cache
+drwxr-xr-x  4 root root 4096 Aug  1 11:04 .cargo
+-rw-r--r--  1 root root    0 Aug  1 08:22 .cloud-locale-test.skip
+-rw-r--r--  1 root root   66 Aug  1 08:23 .digitalocean_passwords
+drwx------  3 root root 4096 Jul 16 13:26 .docker
+drwxr-xr-x  4 root root 4096 Aug  1 08:47 .hipfire
+drwxr-xr-x  3 root root 4096 Aug  1 09:10 .hipfire_kernels
+-rw-r--r--  1 root root  182 Aug  1 08:32 .profile
+drwxr-xr-x  6 root root 4096 Aug  1 08:32 .rustup
+drwx------  2 root root 4096 Aug  1 10:19 .ssh
+-rw-r--r--  1 root root  185 Aug  1 12:13 .wget-hsts
+drwxr-xr-x  3 root root 4096 Aug  1 08:27 hipfire-work
+drwxr-xr-x  2 root root 4096 Aug  1 08:28 model-downloads
+
+=== ls -la /root/hipfire-work ===
+total 12
+drwxr-xr-x  3 root root 4096 Aug  1 08:27 .
+drwx------ 11 root root 4096 Aug  1 12:16 ..
+drwxrwxr-x 28 root root 4096 Aug  1 10:37 ds4-gfx942-port
+
+=== find .git under /root /mnt/scratch maxdepth 6 ===
+/root/hipfire-work/ds4-gfx942-port/.git
+
+===== CHECKOUT: /root/hipfire-work/ds4-gfx942-port =====
+abs=/root/hipfire-work/ds4-gfx942-port
+d4ab7434a9dad15d0bf6456c8f3c12779ac0edb5
+BRANCH=ds4-gfx1151-opt
+PORCELAIN_LINES=238
+DIFF_SHA256=d686cdee9a43f79c981a3583eb33450948495d4a1b90a6987a0a30e2fa21c8ac  -
+## ds4-gfx1151-opt...origin/ds4-gfx1151-opt
+ M AGENTS.md
+ M CLAUDE.md
+ M crates/hip-bridge/examples/kernel_launch.rs
+ M crates/hip-bridge/examples/peer_smoke.rs
+ M crates/hip-bridge/examples/smoke.rs
+ M crates/hip-bridge/examples/smokeQA.rs
+ M crates/hip-bridge/src/kernarg.rs
+ M crates/hipfire-arch-deepseek4/examples/deepseek4_chat.rs
+ M crates/hipfire-arch-deepseek4/examples/deepseek4_perplexity.rs
+ M crates/hipfire-arch-deepseek4/examples/dspark_bench.rs
+ M crates/hipfire-arch-deepseek4/examples/dump_hfq_dtypes.rs
+ M crates/hipfire-arch-deepseek4/src/arch.rs
+ M crates/hipfire-arch-deepseek4/src/deepseek4.rs
+ M crates/hipfire-arch-deepseek4/src/dspark_speculator.rs
+ M crates/hipfire-arch-deepseek4/src/forward.rs
+ M crates/hipfire-arch-deepseek4/src/grammar.rs
+ M crates/hipfire-arch-deepseek4/src/mtp_speculator.rs
+ M crates/hipfire-arch-deepseek4/src/spec_decode.rs
+ M crates/hipfire-arch-deepseek4/src/spec_impl.rs
+origin	/home/kaden/hipfire-work/ds4-gfx1151-opt.bundle (fetch)
+origin	/home/kaden/hipfire-work/ds4-gfx1151-opt.bundle (push)
+ALL_BRANCHES:
+* ds4-gfx1151-opt
+  remotes/origin/ds4-gfx1151-opt
+HAS_d4ab7434=commit
+HAS_branch_codex_ds4=0
+LOG_ONELINE_5:
+d4ab7434 Merge origin/beta into ds4-gfx1151-opt
+e2f7dd1a fix(prefill): rebalance singleton tail chunks
+39d366c1 revert: preserve benchmark workload semantics
+8342d7b2 fix(cli): run benchmarks in answer mode
+2ded67c7 fix(cli): include attempt id in bench generation
+

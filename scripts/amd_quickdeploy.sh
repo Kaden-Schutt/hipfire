@@ -38,7 +38,7 @@
 
 set -euo pipefail
 
-REPO_URL="${REPO_URL:-https://github.com/Kaden-Schutt/hipfire.git}"
+REPO_URL="${REPO_URL:-https://github.com/warpfront/hipfire.git}"
 REPO_DIR="${REPO_DIR:-/root/hipfire}"
 REPO_BRANCH="${REPO_BRANCH:-dflash}"
 VENV_DIR="${VENV_DIR:-/root/pytorch_env}"

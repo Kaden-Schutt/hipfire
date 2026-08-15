@@ -182,6 +182,42 @@ fn main() {
              4w (64x64):    {new_us:7.1} µs ({new_gflops:6.1} GFLOPS)   speedup: {speedup:.2}×"
         );
 
+        // ── i8-MMQ 64x64 4-warp dense Q8 kernel (F32 X, auto-quant to Q8_1).
+        if k % 128 == 0 {
+            let xf32_gpu = gpu.hip.malloc(x_f32.len() * 4).expect("malloc Xf32");
+            let xf32_bytes: Vec<u8> = x_f32.iter().flat_map(|v| v.to_le_bytes()).collect();
+            gpu.hip.memcpy_htod(&xf32_gpu, &xf32_bytes).expect("htod Xf32");
+            let xf32_tensor = wrap_buf(xf32_gpu.as_ptr(), x_f32.len() * 4, vec![n, k], DType::F32);
+            let yi8_gpu = gpu.hip.malloc(n * m * 4).expect("malloc Yi8");
+            let yi8_tensor = wrap_buf(yi8_gpu.as_ptr(), n * m * 4, vec![n, m], DType::F32);
+            gpu.gemm_q8_0_mmq_4w_gfx1151(&a_tensor, &xf32_tensor, &yi8_tensor, m, k, n)
+                .expect("i8 4w");
+            gpu.hip.device_synchronize().unwrap();
+            let mut yb = vec![0u8; n * m * 4];
+            gpu.hip.memcpy_dtoh(&mut yb, &yi8_gpu).unwrap();
+            let yi8: &[f32] = unsafe { std::slice::from_raw_parts(yb.as_ptr() as *const f32, n * m) };
+            let (mut num, mut den, mut nn) = (0f64, 0f64, 0usize);
+            for i in 0..n * m {
+                if !yi8[i].is_finite() { nn += 1; continue; }
+                num += ((yi8[i] - y_ref[i]) as f64).powi(2);
+                den += (y_ref[i] as f64).powi(2);
+            }
+            let rms = (num / den.max(1e-12)).sqrt();
+            for _ in 0..WARMUP { gpu.gemm_q8_0_mmq_4w_gfx1151(&a_tensor, &xf32_tensor, &yi8_tensor, m, k, n).unwrap(); }
+            gpu.hip.device_synchronize().unwrap();
+            let t0 = Instant::now();
+            for _ in 0..TRIALS { gpu.gemm_q8_0_mmq_4w_gfx1151(&a_tensor, &xf32_tensor, &yi8_tensor, m, k, n).unwrap(); }
+            gpu.hip.device_synchronize().unwrap();
+            let i8_us = t0.elapsed().as_secs_f64() / TRIALS as f64 * 1e6;
+            println!(
+                "  i8-mmq-4w:     {i8_us:7.1} µs ({:6.1} GFLOPS)   vs-4w: {:.2}×   rms_rel={rms:.4} nan={nn} {}",
+                flops / i8_us / 1e3, new_us / i8_us,
+                if rms < 0.05 && nn == 0 { "OK" } else { "CHECK" }
+            );
+            std::mem::forget(xf32_tensor);
+            std::mem::forget(yi8_tensor);
+        }
+
         // forget views to avoid double-free
         std::mem::forget(a_tensor);
         std::mem::forget(x_tensor);

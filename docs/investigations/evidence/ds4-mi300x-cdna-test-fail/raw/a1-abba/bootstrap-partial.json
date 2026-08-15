@@ -1,0 +1,64 @@
+{
+  "ci95_percent": [
+    1479.4104592080837,
+    1479.4104592080837
+  ],
+  "decision": "continue",
+  "decision_reason": "insufficient pairs: n_complete_pairs=1 < min_pairs=5",
+  "dispersion": {
+    "max": 1479.4104592080837,
+    "min": 1479.4104592080837,
+    "stdev": 0.0
+  },
+  "incomplete_pairs": [
+    {
+      "a_paths": [
+        "/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/a1-abba/pairs/pair-2-A-20260801T174005Z.json"
+      ],
+      "b_paths": [
+        "/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/a1-abba/pairs/pair-2-B-20260801T174624Z.json",
+        "/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/a1-abba/pairs/pair-2-B-20260801T174818Z.json"
+      ],
+      "invalid_paths": [],
+      "n_a": 1,
+      "n_b": 2,
+      "pair": 2,
+      "reason": "incomplete: need exactly 2 A and 2 B, got n_a=1 n_b=2"
+    }
+  ],
+  "input_files": [
+    "/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/a1-abba/pairs/pair-1-A-20260801T172241Z.json",
+    "/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/a1-abba/pairs/pair-1-A-20260801T173346Z.json",
+    "/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/a1-abba/pairs/pair-1-B-20260801T172900Z.json",
+    "/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/a1-abba/pairs/pair-1-B-20260801T173124Z.json",
+    "/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/a1-abba/pairs/pair-2-A-20260801T174005Z.json",
+    "/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/a1-abba/pairs/pair-2-B-20260801T174624Z.json",
+    "/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/a1-abba/pairs/pair-2-B-20260801T174818Z.json"
+  ],
+  "invalid_files": [],
+  "lower_is_better": false,
+  "max_pairs": 15,
+  "metric": "decode_tok_s",
+  "min_pairs": 5,
+  "n_complete_pairs": 1,
+  "overall_median_delta_percent": 1479.4104592080837,
+  "pairs": [
+    {
+      "a_median": 2.0288736573794894,
+      "a_values": [
+        2.0288413724515166,
+        2.0289059423074627
+      ],
+      "b_median": 32.044242748769236,
+      "b_values": [
+        32.027128862094955,
+        32.061356635443516
+      ],
+      "delta_percent": 1479.4104592080837,
+      "pair": 1
+    }
+  ],
+  "resamples": 10000,
+  "seed": 20260801,
+  "threshold": 0.5
+}

@@ -1,6 +1,6 @@
 # Path D — Stale-Context Overlap Pipelining
 
-Implementation plan for issue [#38](https://github.com/Kaden-Schutt/hipfire/issues/38).
+Implementation plan for issue [#38](https://github.com/warpfront/hipfire/issues/38).
 Branch: `feat/38-ddtree-pipeline` off master `80330c3`.
 
 > **Revision note (2026-05-02):** plan v2, after consolidated adversarial

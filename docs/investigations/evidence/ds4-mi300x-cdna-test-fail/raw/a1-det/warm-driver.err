@@ -1,0 +1,37 @@
+[feed] label=warm
+[feed] daemon=/mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/target/release/examples/daemon
+[feed] model=/mnt/scratch/models/deepseek-v4-flash-mq2r/deepseek-v4-flash.mq2r
+[feed] >> {"type":"ping"}
+GPU dev 0: gfx942 (205.8 GB VRAM, HIP 7.0)
+  pre-compiled kernels: /mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/.hipfire_kernels/gfx942
+[rocblas] loaded for gfx942
+[feed] << {"type":"pong"}
+[feed] pong in 0.26s
+[feed] >> {"type":"load","model":"/mnt/scratch/models/deepseek-v4-flash-mq2r/deepseek-v4-flash.mq2r","params":{"max_seq":4096,"kv_mode":"q8","kv_backend":"contiguous","speculation":"off","dflash_mode":"off","mtp_mode":"off","ngram_draft":false,"dspark_mode":"off"}}
+deepseek4: MQ2R P3 tensor recipe verified; gfx1151 route v2 is ineligible on gfx942, using portable dispatch
+[feed] << {"type":"loaded","arch":"deepseek4","dim":0,"layers":0,"vocab":0,"vl":false,"cache_capable":true,"retry_reset_eligible":false}
+[feed] loaded in 75.37s
+[feed] DECODE_PHASE_BEGIN
+[feed] >> {"type":"generate","id":"g0-warm","attempt_id":1,"prompt":"User: I need a production-grade explanation of ordinary batch-1 autoregressive decode on a DeepSeek V4 Flash style mixture-of-experts model running on AMD Instinct MI300X (gfx942). Please treat this as a measurement contract discussion rather than marketing. Cover the end-to-end path from a frozen prompt fixture through tokenizer identity, prefill, KV write, and token-by-token decode under Q8 KV with speculation fully disabled. I will us
+[feed] << {"type":"token","id":"g0-warm","text":"The fol","attempt_id":1}
+[feed] << {"type":"token","id":"g0-warm","text":"lowing","attempt_id":1}
+[feed] << {"type":"token","id":"g0-warm","text":" is a prod","attempt_id":1}
+[feed] << {"type":"token","id":"g0-warm","text":"uction-gra","attempt_id":1}
+[feed] << {"type":"token","id":"g0-warm","text":"de ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-warm","text":"tech","attempt_id":1}
+[feed] << {"type":"token","id":"g0-warm","text":"nical breakd","attempt_id":1}
+[feed] << {"type":"token","id":"g0-warm","text":"own of th","attempt_id":1}
+[feed] << {"type":"token","id":"g0-warm","text":"e me","attempt_id":1}
+[feed] << {"type":"token","id":"g0-warm","text":"as","attempt_id":1}
+[feed] << {"type":"token","id":"g0-warm","text":"urement","attempt_id":1}
+[feed] << {"type":"token","id":"g0-warm","text":" co","attempt_id":1}
+[feed] << {"type":"token","id":"g0-warm","text":"ntract for a single‑","attempt_id":1}
+[feed] << {"type":"commit_ready","id":"g0-warm","tokens":16,"tok_s":14.571948998178506,"prompt_tokens":2052,"prefill_tokens":2052,"cached_tokens":0,"prefill_ms":20789,"total_ms":21888,"finish_reason":"length","drafter":"ar","attempt_id":1}
+[feed] >> {"type":"commit","id":"g0-warm","attempt_id":1}
+[feed] << {"type":"aborted","id":"g0-warm","reason":"client_cancelled","attempt_id":1}
+[feed] terminal aborted: {'type': 'aborted', 'id': 'g0-warm', 'reason': 'client_cancelled', 'attempt_id': 1}
+[feed] DECODE_PHASE_END
+[feed] >> {"type":"unload"}
+deepseek4 gfx942 A2 levers: L1 compressor_gate=ON (HIPFIRE_DEEPSEEK4_GFX942_COMPRESSOR_GATE default ON on gfx942 MQ2R) ; L3 e8_wo_grouped=OFF (HIPFIRE_DEEPSEEK4_GFX942_E8_WO_GROUPED default OFF, =1 enables) ; F1 indexer_topk_parallel=ON (HIPFIRE_DEEPSEEK4_GFX942_INDEXER_TOPK_PARALLEL default OFF, =1 enables)
+[daemon-control] received commit for id=g0-warm attempt_id=1
+[feed] << {"type":"done","id":"g0-warm","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":16,"prefill_ms":0,"decode_ms":0,"attempt_id":1}

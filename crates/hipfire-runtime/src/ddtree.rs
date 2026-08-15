@@ -431,6 +431,12 @@ pub fn follow_verified_tree(tree: &DdTree, posterior: &[u32]) -> (Vec<usize>, u3
 /// against the per-position argmax): each draw is the row argmax, so the
 /// accepted prefix and bonus are the target's own greedy continuation.
 ///
+/// The per-row draw honours `temp` + `top_k` + nucleus (`top_p`) via
+/// [`sample_host_nucleus`] when truncation is requested, and falls back to the
+/// plain temperature-only softmax draw otherwise. Passing `top_p = 1.0, top_k = 0`
+/// reproduces the previous temperature-only behaviour bit-for-bit (same softmax
+/// path and same single `rng_state` advance per row).
+///
 /// Returns `(accepted, bonus)`: `accepted` is the number of accepted drafts
 /// (`0..=depth`) and `bonus` is the target draw at the divergence position.
 /// Threads the SAME `rng_state` (xorshift, bit-compatible with the qwen35 spec
@@ -440,6 +446,8 @@ pub fn naive_sample_chain(
     drafts: &[u32],
     vocab: usize,
     temp: f32,
+    top_p: f32,
+    top_k: usize,
     rng_state: &mut u64,
 ) -> (usize, u32) {
     let depth = drafts.len();
@@ -448,9 +456,14 @@ pub fn naive_sample_chain(
     for i in 0..=depth {
         let row = &logits_per_pos[i * vocab..(i + 1) * vocab];
         let x: u32 = if temp > 0.0 {
-            softmax_temp_into(row, temp, &mut p);
-            let u = xorshift_unit(rng_state);
-            sample_unnormalized(&p, u)
+            if top_k == 0 && top_p >= 0.999 {
+                // Unchanged legacy draw — byte-identical when no truncation is asked for.
+                softmax_temp_into(row, temp, &mut p);
+                let u = xorshift_unit(rng_state);
+                sample_unnormalized(&p, u)
+            } else {
+                sample_host_nucleus(row, temp, top_p, top_k, rng_state)
+            }
         } else {
             let mut bi = 0usize;
             let mut bv = f32::NEG_INFINITY;
@@ -604,6 +617,86 @@ fn sample_unnormalized(w: &[f32], u: f32) -> u32 {
         }
     }
     (w.len() - 1) as u32
+}
+
+/// Host-side temperature + top-k + nucleus sample of one logits row.
+///
+/// Mirrors the Qwen35 chain DFlash prefill / `spec_step_dflash` host path:
+/// softmax(`/temp`) → optional top-k keep+renorm → optional top-p nucleus →
+/// one categorical draw from the shared xorshift stream. Used by
+/// [`crate::spec_ngram::ChainSpeculator`] for the first post-prefill token so
+/// the seed matches later `verify_block_sampled` policy (temp/top_p/top_k) and
+/// the same `rng_state` sequence `set_sampling` reseeds per request.
+///
+/// - `top_k == 0` or `top_k >= vocab` disables the top-k cut.
+/// - `top_p >= 0.999` disables nucleus (matches qwen35 chain prefill).
+/// - Caller must gate greedy (`temp <= 1e-6`) before calling; this always
+///   advances `rng_state` once on the multinomial path.
+pub fn sample_host_nucleus(
+    logits: &[f32],
+    temp: f32,
+    top_p: f32,
+    top_k: usize,
+    rng_state: &mut u64,
+) -> u32 {
+    let mut probs = Vec::with_capacity(logits.len());
+    softmax_temp_into(logits, temp, &mut probs);
+    if top_k > 0 && top_k < probs.len() {
+        let mut order: Vec<usize> = (0..probs.len()).collect();
+        order.sort_by(|&a, &b| {
+            probs[b]
+                .partial_cmp(&probs[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut kept_mass = 0.0f32;
+        for (rank, &idx) in order.iter().enumerate() {
+            if rank < top_k {
+                kept_mass += probs[idx];
+            } else {
+                probs[idx] = 0.0;
+            }
+        }
+        if kept_mass > 0.0 {
+            let inv = 1.0 / kept_mass;
+            for p in probs.iter_mut() {
+                *p *= inv;
+            }
+        }
+    }
+    if top_p < 0.999 {
+        // In-place nucleus: sort desc, cut at first cum >= top_p, renorm kept.
+        let mut order: Vec<usize> = (0..probs.len()).collect();
+        order.sort_by(|&a, &b| {
+            probs[b]
+                .partial_cmp(&probs[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut cum = 0.0f64;
+        let mut kept_mass = 0.0f64;
+        let mut cutoff = order.len();
+        for (rank, &idx) in order.iter().enumerate() {
+            cum += probs[idx] as f64;
+            kept_mass += probs[idx] as f64;
+            if cum >= top_p as f64 {
+                cutoff = rank + 1;
+                break;
+            }
+        }
+        let inv = if kept_mass > 0.0 {
+            1.0f64 / kept_mass
+        } else {
+            0.0
+        };
+        for (rank, &idx) in order.iter().enumerate() {
+            if rank < cutoff {
+                probs[idx] = (probs[idx] as f64 * inv) as f32;
+            } else {
+                probs[idx] = 0.0;
+            }
+        }
+    }
+    let u = xorshift_unit(rng_state);
+    sample_unnormalized(&probs, u)
 }
 
 /// Phase-0 instrumentation: append one JSON-lines record describing this cycle's
@@ -1163,6 +1256,31 @@ mod tests {
         bi as u32
     }
 
+    #[test]
+    fn sample_host_nucleus_deterministic_and_advances_rng() {
+        // Peaked row: token 2 dominates after softmax; top_k=1 forces it.
+        let logits = [0.0f32, 1.0, 5.0, 0.5];
+        let mut rng_a = 0x13579BDFu64;
+        let mut rng_b = 0x13579BDFu64;
+        let t1 = sample_host_nucleus(&logits, 1.0, 1.0, 1, &mut rng_a);
+        let t2 = sample_host_nucleus(&logits, 1.0, 1.0, 1, &mut rng_b);
+        assert_eq!(t1, 2);
+        assert_eq!(t2, 2);
+        assert_ne!(rng_a, 0x13579BDF, "rng must advance once");
+        assert_eq!(rng_a, rng_b);
+    }
+
+    #[test]
+    fn sample_host_nucleus_top_k_masks_tail() {
+        // Two near-equal peaks; top_k=1 keeps only the higher logit index 0.
+        let logits = [3.0f32, 2.999, -10.0, -10.0];
+        let mut rng = 0x13579BDFu64;
+        for _ in 0..16 {
+            let t = sample_host_nucleus(&logits, 1.0, 1.0, 1, &mut rng);
+            assert_eq!(t, 0, "top_k=1 must never pick the masked tail");
+        }
+    }
+
     // A small depth-2, top-2 tree over an 8-token vocab.
     fn small_tree() -> DdTree {
         let depth = 2usize;
@@ -1220,18 +1338,19 @@ mod tests {
         let vocab = 6usize;
         let drafts = [2u32, 1];
         let mut logits = vec![0.0f32; (drafts.len() + 1) * vocab];
-        logits[0 * vocab + 2] = 10.0; // pos 0 argmax = 2 (== draft 0 ⇒ accept)
-        logits[1 * vocab + 4] = 10.0; // pos 1 argmax = 4 (!= draft 1 ⇒ stop)
-        logits[2 * vocab + 5] = 10.0; // pos 2 argmax = 5 (unused)
+        let at = |pos: usize, tok: usize| pos * vocab + tok;
+        logits[at(0, 2)] = 10.0; // pos 0 argmax = 2 (== draft 0 ⇒ accept)
+        logits[at(1, 4)] = 10.0; // pos 1 argmax = 4 (!= draft 1 ⇒ stop)
+        logits[at(2, 5)] = 10.0; // pos 2 argmax = 5 (unused)
         let mut rng = 0x1u64;
-        let (accepted, bonus) = naive_sample_chain(&logits, &drafts, vocab, 0.0, &mut rng);
+        let (accepted, bonus) = naive_sample_chain(&logits, &drafts, vocab, 0.0, 1.0, 0, &mut rng);
         assert_eq!(accepted, 1);
         assert_eq!(bonus, 4);
 
         // Full accept: both drafts equal the argmax ⇒ accept 2, bonus = argmax at
         // the final row (pos 2) = 5.
         let drafts_full = [2u32, 4];
-        let (acc_f, bonus_f) = naive_sample_chain(&logits, &drafts_full, vocab, 0.0, &mut rng);
+        let (acc_f, bonus_f) = naive_sample_chain(&logits, &drafts_full, vocab, 0.0, 1.0, 0, &mut rng);
         assert_eq!(acc_f, 2);
         assert_eq!(bonus_f, 5);
     }
@@ -1265,7 +1384,7 @@ mod tests {
             let mut hist = vec![0u64; vocab];
             let mut rng = 0xC0FFEE_1234_5678_u64 ^ ((temp.to_bits() as u64) << 8);
             for _ in 0..n_runs {
-                let (accepted, bonus) = naive_sample_chain(&full, &[draft], vocab, temp, &mut rng);
+                let (accepted, bonus) = naive_sample_chain(&full, &[draft], vocab, temp, 1.0, 0, &mut rng);
                 // Position-0 emitted token = accepted draft (if accept) else bonus.
                 let emitted = if accepted >= 1 { draft } else { bonus };
                 hist[emitted as usize] += 1;

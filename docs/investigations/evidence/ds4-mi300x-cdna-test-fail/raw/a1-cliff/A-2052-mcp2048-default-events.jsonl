@@ -1,0 +1,33 @@
+{"type":"pong"}
+{"type":"loaded","arch":"deepseek4","dim":0,"layers":0,"vocab":0,"vl":false,"cache_capable":true,"retry_reset_eligible":false}
+{"type":"token","id":"g0-A-2052-mcp2048-default","text":": I'l","attempt_id":1}
+{"type":"token","id":"g0-A-2052-mcp2048-default","text":"l prov","attempt_id":1}
+{"type":"token","id":"g0-A-2052-mcp2048-default","text":"ide a prod","attempt_id":1}
+{"type":"token","id":"g0-A-2052-mcp2048-default","text":"uction-grade","attempt_id":1}
+{"type":"token","id":"g0-A-2052-mcp2048-default","text":" te","attempt_id":1}
+{"type":"token","id":"g0-A-2052-mcp2048-default","text":"chni","attempt_id":1}
+{"type":"token","id":"g0-A-2052-mcp2048-default","text":"cal explan","attempt_id":1}
+{"type":"token","id":"g0-A-2052-mcp2048-default","text":"ation of t","attempt_id":1}
+{"type":"token","id":"g0-A-2052-mcp2048-default","text":"he specif","attempt_id":1}
+{"type":"token","id":"g0-A-2052-mcp2048-default","text":"i","attempt_id":1}
+{"type":"token","id":"g0-A-2052-mcp2048-default","text":"ed inferenc","attempt_id":1}
+{"type":"token","id":"g0-A-2052-mcp2048-default","text":"e p","attempt_id":1}
+{"type":"token","id":"g0-A-2052-mcp2048-default","text":"ipeline, s","attempt_id":1}
+{"type":"token","id":"g0-A-2052-mcp2048-default","text":"truc","attempt_id":1}
+{"type":"token","id":"g0-A-2052-mcp2048-default","text":"tu","attempt_id":1}
+{"type":"token","id":"g0-A-2052-mcp2048-default","text":"red as reque","attempt_id":1}
+{"type":"token","id":"g0-A-2052-mcp2048-default","text":"sted for ","attempt_id":1}
+{"type":"token","id":"g0-A-2052-mcp2048-default","text":"a measureme","attempt_id":1}
+{"type":"token","id":"g0-A-2052-mcp2048-default","text":"n","attempt_id":1}
+{"type":"token","id":"g0-A-2052-mcp2048-default","text":"t con","attempt_id":1}
+{"type":"token","id":"g0-A-2052-mcp2048-default","text":"tract d","attempt_id":1}
+{"type":"token","id":"g0-A-2052-mcp2048-default","text":"iscu","attempt_id":1}
+{"type":"token","id":"g0-A-2052-mcp2048-default","text":"ssio","attempt_id":1}
+{"type":"token","id":"g0-A-2052-mcp2048-default","text":"n. ","attempt_id":1}
+{"type":"token","id":"g0-A-2052-mcp2048-default","text":"This","attempt_id":1}
+{"type":"token","id":"g0-A-2052-mcp2048-default","text":" cove","attempt_id":1}
+{"type":"token","id":"g0-A-2052-mcp2048-default","text":"rs t","attempt_id":1}
+{"type":"token","id":"g0-A-2052-mcp2048-default","text":"he end-to-end path for","attempt_id":1}
+{"type":"commit_ready","id":"g0-A-2052-mcp2048-default","tokens":32,"tok_s":2.2917711093604525,"prompt_tokens":2052,"prefill_tokens":2052,"cached_tokens":0,"prefill_ms":20838,"total_ms":34801,"finish_reason":"length","drafter":"ar","attempt_id":1}
+{"type":"aborted","id":"g0-A-2052-mcp2048-default","reason":"client_cancelled","attempt_id":1}
+{"type":"done","id":"g0-A-2052-mcp2048-default","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":32,"prefill_ms":0,"decode_ms":0,"attempt_id":1}

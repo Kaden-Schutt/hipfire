@@ -90,7 +90,7 @@ pub fn speculative_decode_step_with_pbs(
     weights: &DeepseekV4Weights,
     state: &mut DeepseekV4State,
     gpu: &mut Gpu,
-    pbs: &forward::PrefillBatchScratch,
+    pbs: &mut forward::PrefillBatchScratch,
     last_token: u32,
     last_position: u32,
     last_hidden: Option<&rdna_compute::GpuTensor>,
@@ -116,7 +116,7 @@ pub fn speculative_decode_step_with_pbs_grammar(
     weights: &DeepseekV4Weights,
     state: &mut DeepseekV4State,
     gpu: &mut Gpu,
-    pbs: &forward::PrefillBatchScratch,
+    pbs: &mut forward::PrefillBatchScratch,
     last_token: u32,
     last_position: u32,
     last_hidden: Option<&rdna_compute::GpuTensor>,
@@ -174,16 +174,15 @@ fn speculative_decode_impl(
     weights: &DeepseekV4Weights,
     state: &mut DeepseekV4State,
     gpu: &mut Gpu,
-    cached_pbs: Option<&forward::PrefillBatchScratch>,
+    cached_pbs: Option<&mut forward::PrefillBatchScratch>,
     last_token: u32,
     last_position: u32,
     last_hidden: Option<&rdna_compute::GpuTensor>,
     k: usize,
     mut grammar: Option<SpecGrammar<'_>>,
 ) -> Result<SpecStepResult, String> {
-    if k == 0 {
-        return Err("speculative_decode_step: k must be > 0".to_string());
-    }
+    // k==0 is the one-token path: verify [last_token] only and emit the bonus.
+    // Callers (MtpSpeculator) clamp k from remaining max_emit; max_emit==1 → k=0.
     if cfg.num_nextn_predict_layers == 0 || weights.mtp_layer.is_none() {
         return Err("speculative_decode_step: MTP layer not loaded — \
             quantize with deepseek4-q8-mtp + addon, or set HIPFIRE_DEEPSEEK4_LOAD_MTP=1"
@@ -300,12 +299,15 @@ fn speculative_decode_impl(
     // The owned variant exists so single-shot callers / tests still work
     // without threading a PBS through; the cached variant is the perf-
     // critical path used by tight spec-decode loops.
-    let owned_pbs: Option<forward::PrefillBatchScratch> = match cached_pbs {
-        Some(_) => None,
-        None => Some(forward::PrefillBatchScratch::new(gpu, cfg, k + 1)?),
+    let mut owned_pbs: Option<forward::PrefillBatchScratch> = if cached_pbs.is_none() {
+        Some(forward::PrefillBatchScratch::new(gpu, cfg, k + 1)?)
+    } else {
+        None
     };
-    let pbs: &forward::PrefillBatchScratch =
-        cached_pbs.unwrap_or_else(|| owned_pbs.as_ref().unwrap());
+    let pbs: &mut forward::PrefillBatchScratch = match cached_pbs {
+        Some(pbs) => pbs,
+        None => owned_pbs.as_mut().unwrap(),
+    };
     if pbs.max_batch < k + 1 {
         return Err(format!(
             "spec_decode: cached PBS max_batch ({}) < k+1 ({})",

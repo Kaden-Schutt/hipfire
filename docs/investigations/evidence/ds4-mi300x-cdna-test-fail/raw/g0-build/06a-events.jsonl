@@ -1,0 +1,32 @@
+{"type":"pong"}
+{"type":"loaded","arch":"deepseek4","dim":0,"layers":0,"vocab":0,"vl":false,"cache_capable":true,"retry_reset_eligible":false}
+{"type":"token","id":"g0smoke","text":"A GP","attempt_id":1}
+{"type":"token","id":"g0smoke","text":"U k","attempt_id":1}
+{"type":"token","id":"g0smoke","text":"ernel ","attempt_id":1}
+{"type":"token","id":"g0smoke","text":"is a fun","attempt_id":1}
+{"type":"token","id":"g0smoke","text":"ction","attempt_id":1}
+{"type":"token","id":"g0smoke","text":" or s","attempt_id":1}
+{"type":"token","id":"g0smoke","text":"mal","attempt_id":1}
+{"type":"token","id":"g0smoke","text":"l pr","attempt_id":1}
+{"type":"token","id":"g0smoke","text":"ogra","attempt_id":1}
+{"type":"token","id":"g0smoke","text":"m ","attempt_id":1}
+{"type":"token","id":"g0smoke","text":"that r","attempt_id":1}
+{"type":"token","id":"g0smoke","text":"uns","attempt_id":1}
+{"type":"token","id":"g0smoke","text":" on the G","attempt_id":1}
+{"type":"token","id":"g0smoke","text":"P","attempt_id":1}
+{"type":"token","id":"g0smoke","text":"U's","attempt_id":1}
+{"type":"token","id":"g0smoke","text":" cores","attempt_id":1}
+{"type":"token","id":"g0smoke","text":" i","attempt_id":1}
+{"type":"token","id":"g0smoke","text":"n ","attempt_id":1}
+{"type":"token","id":"g0smoke","text":"parallel,","attempt_id":1}
+{"type":"token","id":"g0smoke","text":"鼎antsay","attempt_id":1}
+{"type":"token","id":"g0smoke","text":" *}---","attempt_id":1}
+{"type":"token","id":"g0smoke","text":"|---|--- eco","attempt_id":1}
+{"type":"token","id":"g0smoke","text":"nóm中海 ","attempt_id":1}
+{"type":"token","id":"g0smoke","text":"licensiera","attempt_id":1}
+{"type":"token","id":"g0smoke","text":"d(migratio","attempt_id":1}
+{"type":"token","id":"g0smoke","text":"ns dátummal","attempt_id":1}
+{"type":"token","id":"g0smoke","text":" hos","attempt_id":1}
+{"type":"token","id":"g0smoke","text":"tility变成一个acle","attempt_id":1}
+{"type":"commit_ready","id":"g0smoke","tokens":32,"tok_s":35.79418344519016,"prompt_tokens":14,"prefill_tokens":14,"cached_tokens":0,"prefill_ms":216,"total_ms":1111,"finish_reason":"length","drafter":"ar","attempt_id":1}
+{"type":"aborted","id":"g0smoke","reason":"client_cancelled","attempt_id":1}

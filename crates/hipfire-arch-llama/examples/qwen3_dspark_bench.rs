@@ -75,7 +75,16 @@ fn decode_loop(
     generated.push(first_token);
 
     while generated.len() < max {
-        let step = spec.step(gpu, bundle, position, seed, &generated, None, temp)?;
+        let step = spec.step(
+            gpu,
+            bundle,
+            position,
+            seed,
+            &generated,
+            None,
+            temp,
+            max.saturating_sub(generated.len()).max(1),
+        )?;
         windows += 1;
         proposed += step.proposed as u64;
         accepted += step.accepted as u64;
@@ -148,14 +157,19 @@ fn main() -> Result<(), String> {
     let mut ctx = LoadCtx {
         path: &path,
         max_seq,
+        deepseek4_compute_placement: Default::default(),
+        deepseek4_experts_per_token: None,
         draft_path: None,
         kv_mode_override: None,
+        kv_backend: hipfire_runtime::kv_backend::KvBackend::Contiguous,
         kv_adaptive_override: None,
         state_quant_override: None,
         cask: &cask,
         pp: 1,
         spec: SpecLoadCfg::default(),
         gpu: &mut gpu,
+        gemma4_drafter_path: None,
+        gemma4_draft_len: 3,
     };
     let mut bundle = load_llama_bundle(src, &mut ctx)?;
 
@@ -384,6 +398,7 @@ fn main() -> Result<(), String> {
             max_seq,
             conf_threshold,
             true, // llama supports sampled verify → temp>0 testable
+            0.5,
         )
     } else {
         // n-gram (or DSpark fallback when sidecar absent).
@@ -446,7 +461,7 @@ fn main() -> Result<(), String> {
     // ── TIMED RUN: fresh prefill, then timed decode ────────────────────────────
     // Mirror the daemon's reset contract: spec.reset + kv.compact_offset=0 +
     // gpu.invalidate_graph_state() so the warmup-shaped HIP graph doesn't replay.
-    spec.reset(ctx.gpu);
+    let _ = spec.reset(ctx.gpu);
     bundle.kv.compact_offset = 0;
     ctx.gpu.invalidate_graph_state();
 

@@ -1,0 +1,5 @@
+GPU dev 0: gfx942 (205.8 GB VRAM, HIP 7.0)
+[rocblas] loaded for gfx942
+deepseek4: MQ2R P3 tensor recipe verified; gfx1151 route v2 is ineligible on gfx942, using portable dispatch
+[daemon-control] received commit for id=g0-postfix attempt_id=1
+[req g0-postfix] drafter=ar tau=1.00 tok/s=3.0 decode (51 tok, autoregressive)

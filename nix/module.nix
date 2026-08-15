@@ -3,25 +3,49 @@
 let
   cfg = config.services.hipfire;
 
+  tomlFormat = pkgs.formats.toml { };
+  canonicalKey = key: ({
+    port = "serve.port";
+    host = "serve.host";
+    default_model = "serve.default_model";
+    temperature = "generation.temperature";
+    top_p = "generation.top_p";
+    max_tokens = "generation.max_tokens";
+    max_seq = "memory.max_seq";
+    repeat_penalty = "generation.repeat_penalty";
+    kv_cache = "memory.kv_cache";
+    dflash_mode = "speculation.dflash";
+    idle_timeout = "serve.idle_timeout_seconds";
+  }.${key} or key);
+  canonicalize = attrs:
+    lib.mapAttrs' (key: value: lib.nameValuePair (canonicalKey key) value) attrs;
 
-  # Build config.json from typed options — camelCase NixOS options → snake_case JSON keys
+  # Dotted canonical keys are emitted as quoted TOML keys. The Rust loader
+  # flattens them into the same typed schema as nested tables.
   configAttrs = {
-    port = cfg.port;
-    default_model = cfg.defaultModel;
-    temperature = cfg.temperature;
-    top_p = cfg.topP;
-    max_tokens = cfg.maxTokens;
-    max_seq = cfg.maxSeq;
-    repeat_penalty = cfg.repeatPenalty;
-    kv_cache = cfg.kvCache;
-    dflash_mode = cfg.dflashMode;
-    idle_timeout = cfg.idleTimeout;
-  } // cfg.extraSettings;
+    "serve.port" = cfg.port;
+    "generation.temperature" = cfg.temperature;
+    "generation.top_p" = cfg.topP;
+    "generation.max_tokens" = cfg.maxTokens;
+    "memory.max_seq" = cfg.maxSeq;
+    "generation.repeat_penalty" = cfg.repeatPenalty;
+    "memory.kv_cache" = cfg.kvCache;
+    "speculation.dflash" = cfg.dflashMode;
+    "serve.idle_timeout_seconds" = cfg.idleTimeout;
+  }
+  // lib.optionalAttrs (cfg.defaultModel != "") {
+    "serve.default_model" = cfg.defaultModel;
+  }
+  // canonicalize cfg.extraSettings;
 
-  configJson = pkgs.writeText "hipfire-config.json"
-    (builtins.toJSON configAttrs);
-  perModelConfigJson = pkgs.writeText "hipfire-per-model-config.json"
-    (builtins.toJSON cfg.perModelSettings);
+  configToml = tomlFormat.generate "hipfire-config.toml"
+    ({ schema_version = 1; } // configAttrs);
+  modelsToml = tomlFormat.generate "hipfire-models.toml" {
+    schema_version = 1;
+    models = lib.mapAttrs (_: settings: {
+      overrides = canonicalize settings;
+    }) cfg.perModelSettings;
+  };
 
   # Resolve source: explicit src > github.rev > package default
   effectiveSrc =
@@ -92,7 +116,7 @@ in
     github = {
       owner = lib.mkOption {
         type = lib.types.str;
-        default = "Kaden-Schutt";
+        default = "warpfront";
         description = "GitHub repository owner.";
       };
 
@@ -158,7 +182,7 @@ in
       '';
     };
 
-    # ── Inference settings (written to config.json) ──────────
+    # ── Inference settings (written to config.toml) ──────────
 
     port = lib.mkOption {
       type = lib.types.port;
@@ -226,7 +250,8 @@ in
       type = lib.types.attrsOf lib.types.anything;
       default = { };
       description = ''
-        Additional config.json keys (snake_case) not covered by dedicated options.
+        Additional config.toml keys not covered by dedicated options. Canonical
+        dotted names are preferred; legacy snake_case aliases are translated.
         These are merged last and can override typed options.
       '';
     };
@@ -245,8 +270,8 @@ in
         }
       '';
       description = ''
-        Per-model config overrides written to per_model_config.json.
-        Keys are model tags, values are config attrsets (snake_case keys).
+        Per-model config overrides written to models.toml. Keys are model tags;
+        values may use canonical dotted keys or legacy snake_case aliases.
       '';
     };
 
@@ -362,8 +387,9 @@ in
         script = ''
           mkdir -p /var/lib/hipfire/.hipfire/bin
           mkdir -p ${lib.escapeShellArg cfg.modelDir}
-          cp -f ${configJson} /var/lib/hipfire/.hipfire/config.json
-          cp -f ${perModelConfigJson} /var/lib/hipfire/.hipfire/per_model_config.json
+          cp -f ${configToml} /var/lib/hipfire/.hipfire/config.toml
+          cp -f ${modelsToml} /var/lib/hipfire/.hipfire/models.toml
+          rm -f /var/lib/hipfire/.hipfire/config.json /var/lib/hipfire/.hipfire/per_model_config.json
           ln -sf ${hipfirePkg}/bin/hipfire-daemon /var/lib/hipfire/.hipfire/bin/daemon
           ln -sfn ${hipfireKernelsPkg}/kernels /var/lib/hipfire/.hipfire/bin/kernels
         '';
@@ -400,7 +426,7 @@ in
         wantedBy = [ "multi-user.target" ];
         path = lib.optionals cfg.rocmSupport [ pkgs.rocmPackages.clr ];
         serviceConfig = {
-          ExecStart = "${hipfirePkg}/bin/hipfire serve";
+          ExecStart = "${hipfirePkg}/bin/hipfire serve${lib.optionalString (cfg.defaultModel == "") " --no-prewarm"}";
           Restart = "on-failure";
           RestartSec = 5;
           User = cfg.user;
@@ -444,8 +470,9 @@ in
         script = ''
           mkdir -p $HOME/.hipfire/bin
           mkdir -p ${lib.escapeShellArg cfg.modelDir}
-          cp -f ${configJson} $HOME/.hipfire/config.json
-          cp -f ${perModelConfigJson} $HOME/.hipfire/per_model_config.json
+          cp -f ${configToml} $HOME/.hipfire/config.toml
+          cp -f ${modelsToml} $HOME/.hipfire/models.toml
+          rm -f $HOME/.hipfire/config.json $HOME/.hipfire/per_model_config.json
           ln -sf ${hipfirePkg}/bin/hipfire-daemon $HOME/.hipfire/bin/daemon
           ln -sfn ${hipfireKernelsPkg}/kernels $HOME/.hipfire/bin/kernels
         '';
@@ -457,7 +484,7 @@ in
         wantedBy = [ "default.target" ];
         path = lib.optionals cfg.rocmSupport [ pkgs.rocmPackages.clr ];
         serviceConfig = {
-          ExecStart = "${hipfirePkg}/bin/hipfire serve";
+          ExecStart = "${hipfirePkg}/bin/hipfire serve${lib.optionalString (cfg.defaultModel == "") " --no-prewarm"}";
           Restart = "on-failure";
           RestartSec = 5;
           Environment = envList;

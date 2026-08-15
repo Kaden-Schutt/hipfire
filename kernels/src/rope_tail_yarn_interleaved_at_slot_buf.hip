@@ -41,6 +41,29 @@ extern "C" __global__ void rope_tail_yarn_interleaved_at_slot_buf_f32(
     int pos = pos_buf[0];
     int idx_pair = i * 2;
 
+    if (ext_factor == 0.0f) {
+        // The indexer compressor is plain RoPE. Keep this expression
+        // byte-for-byte aligned with rope_tail_interleaved_f32 instead of
+        // passing through the generic YaRN scale path: multiplying by the
+        // runtime value attn_factor=1.0 changes rounding on gfx1151 and poisons
+        // the compressed indexer cache after the first commit boundary.
+        float freq = 1.0f / powf(freq_base, (float)(2 * i) / (float)n_rot);
+        float angle = (float)pos * freq;
+        float cos_a = cosf(angle);
+        float sin_a = sinf(angle);
+        int tail_off = head_dim - n_rot;
+        int d_even = tail_off + 2 * i;
+        int d_odd = d_even + 1;
+        float* row = base + (size_t)slot * head_dim;
+        float x0 = row[d_even];
+        float x1 = row[d_odd];
+        row[d_even] = x0 * cos_a - x1 * sin_a;
+        row[d_odd]  = x0 * sin_a + x1 * cos_a;
+        return;
+    }
+
+    // Preserve the original YaRN arithmetic and instruction ordering for the
+    // main compressor path. Only the plain indexer arm above is new.
     float freq = 1.0f / powf(freq_base, (float)idx_pair / (float)n_rot);
     float theta_extrap = (float)pos * freq;
     float theta_interp = freq_scale * theta_extrap;

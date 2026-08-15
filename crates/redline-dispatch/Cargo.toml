@@ -1,0 +1,16 @@
+[package]
+name = "redline-dispatch"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+description = "Hazard-checked HIP/public-AQL record and replay runtime"
+
+[dependencies]
+hipfire-config = { path = "../hipfire-config" }
+libloading.workspace = true
+redline-rocr = { path = "../redline-rocr" }
+sha2 = "0.10.9"
+thiserror = "2.0.17"
+
+[dev-dependencies]
+proptest.workspace = true

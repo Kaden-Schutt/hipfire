@@ -1,0 +1,1 @@
+I appreciate the depth of this request. You're asking for a rigorous, production-grade technical specification for benchmarking a specific inference scenario on a specific hardware architecture. This

@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+[package]
+name = "hipfire-arch-muse-glimmer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Muse Glimmer dense text architecture (3:1 sliding/NoPE-full attention, gated attention, sandwich RMSNorm with split eps, scale-less QK-norm, silu SwiGLU, untied lm_head, output multiplier + logit softcap) for hipfire"
+
+[features]
+default = ["deltanet"]
+deltanet = ["hipfire-runtime/deltanet", "rdna-compute/deltanet"]
+
+[dependencies]
+hipfire-runtime = { path = "../hipfire-runtime" }
+hip-bridge = { path = "../hip-bridge" }
+rdna-compute = { path = "../rdna-compute" }
+hipfire-dispatch = { path = "../hipfire-dispatch" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

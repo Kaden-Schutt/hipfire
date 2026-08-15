@@ -1,7 +1,18 @@
-hipfire is dual-licensed under either:
+hipfire is licensed under the Apache License 2.0 (see LICENSE-APACHE).
 
-- MIT License (see LICENSE-MIT)
-- Apache License 2.0 (see LICENSE-APACHE)
+Some individual source files remain under the MIT License (see
+LICENSE-MIT), because their substantive authors have not elected
+Apache-2.0 for their own contributions. Those files are identified by
+their per-file `SPDX-License-Identifier` header, and their MIT grant is
+preserved unchanged. MIT is compatible with, and freely combinable
+into, an Apache-2.0 work; MIT's conditions are a strict subset of
+Apache License 2.0 § 4.
 
-at your option. See NOTICE for contributor attribution details.
-See CONTRIBUTING.md for how this applies to new contributions.
+Redistributing hipfire therefore requires satisfying Apache License
+2.0 § 4 for the work as a whole — including shipping a readable copy of
+NOTICE — and preserving the MIT copyright and permission notices on the
+files that carry an MIT SPDX header.
+
+See NOTICE for contributor attribution details, CONTRIBUTING.md for how
+this applies to new contributions, and
+docs/governance/relicense-2026-05.md for the full decision record.

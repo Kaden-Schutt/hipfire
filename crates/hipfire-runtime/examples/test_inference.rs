@@ -300,7 +300,7 @@ fn main() {
             "KV cache should use >1MB, got {alloc_mb:.1}MB"
         );
         // Explicit free + drain
-        kv.free_gpu(&mut gpu);
+        let _ = kv.free_gpu(&mut gpu);
         gpu.drain_pool();
         let (free_after, _) = gpu.hip.get_vram_info().map_err(|e| format!("{e}"))?;
         let leak_mb = (free_before as i64 - free_after as i64) as f64 / 1e6;

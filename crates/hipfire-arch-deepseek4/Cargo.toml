@@ -11,6 +11,7 @@ description = "DeepSeek V4 Flash architecture for hipfire (Hyper-Connections + c
 # `deepseek4_chat` example binary.
 
 [dependencies]
+hipfire-config = { path = "../hipfire-config" }
 hipfire-runtime = { path = "../hipfire-runtime" }
 hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
@@ -18,6 +19,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 hipfire-dispatch = { path = "../hipfire-dispatch", features = ["from-hip-error"] }
 hipfire-reap = { path = "../hipfire-reap" }
+memmap2 = "0.9"
+
+[dev-dependencies]
+libloading.workspace = true
 
 [features]
-

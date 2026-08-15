@@ -1,0 +1,33 @@
+{"type":"pong"}
+{"type":"loaded","arch":"deepseek4","dim":0,"layers":0,"vocab":0,"vl":false,"cache_capable":true,"retry_reset_eligible":false}
+{"type":"token","id":"g0-f1on-32","text":": This i","attempt_id":1}
+{"type":"token","id":"g0-f1on-32","text":"s a detai","attempt_id":1}
+{"type":"token","id":"g0-f1on-32","text":"led","attempt_id":1}
+{"type":"token","id":"g0-f1on-32","text":" tec","attempt_id":1}
+{"type":"token","id":"g0-f1on-32","text":"hnical brief","attempt_id":1}
+{"type":"token","id":"g0-f1on-32","text":"ing on th","attempt_id":1}
+{"type":"token","id":"g0-f1on-32","text":"e me","attempt_id":1}
+{"type":"token","id":"g0-f1on-32","text":"asurement con","attempt_id":1}
+{"type":"token","id":"g0-f1on-32","text":"tr","attempt_id":1}
+{"type":"token","id":"g0-f1on-32","text":"act f","attempt_id":1}
+{"type":"token","id":"g0-f1on-32","text":"or","attempt_id":1}
+{"type":"token","id":"g0-f1on-32","text":" b","attempt_id":1}
+{"type":"token","id":"g0-f1on-32","text":"en","attempt_id":1}
+{"type":"token","id":"g0-f1on-32","text":"c","attempt_id":1}
+{"type":"token","id":"g0-f1on-32","text":"hmarki","attempt_id":1}
+{"type":"token","id":"g0-f1on-32","text":"ng a D","attempt_id":1}
+{"type":"token","id":"g0-f1on-32","text":"eep","attempt_id":1}
+{"type":"token","id":"g0-f1on-32","text":"S","attempt_id":1}
+{"type":"token","id":"g0-f1on-32","text":"eek V4","attempt_id":1}
+{"type":"token","id":"g0-f1on-32","text":" Fl","attempt_id":1}
+{"type":"token","id":"g0-f1on-32","text":"ash-","attempt_id":1}
+{"type":"token","id":"g0-f1on-32","text":"sty","attempt_id":1}
+{"type":"token","id":"g0-f1on-32","text":"le ","attempt_id":1}
+{"type":"token","id":"g0-f1on-32","text":"M","attempt_id":1}
+{"type":"token","id":"g0-f1on-32","text":"oT","attempt_id":1}
+{"type":"token","id":"g0-f1on-32","text":" ","attempt_id":1}
+{"type":"token","id":"g0-f1on-32","text":"mo","attempt_id":1}
+{"type":"token","id":"g0-f1on-32","text":"del on AMD MI300X (gfx","attempt_id":1}
+{"type":"commit_ready","id":"g0-f1on-32","tokens":32,"tok_s":32.42147922998987,"prompt_tokens":2052,"prefill_tokens":2052,"cached_tokens":0,"prefill_ms":20833,"total_ms":21821,"finish_reason":"length","drafter":"ar","attempt_id":1}
+{"type":"done","id":"g0-f1on-32","tokens":32,"tok_s":32.42147922998987,"prompt_tokens":2052,"prefill_tokens":2052,"cached_tokens":0,"prefill_ms":20833,"total_ms":21821,"finish_reason":"length","drafter":"ar","attempt_id":1}
+{"type":"unloaded"}

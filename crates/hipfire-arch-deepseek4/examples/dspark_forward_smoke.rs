@@ -72,7 +72,7 @@ fn main() -> Result<(), String> {
     state.dspark_capture_active = true;
     state.dspark_target_layers = dspark.cfg.target_layer_ids.clone();
 
-    let pbs = PrefillBatchScratch::new(&mut gpu, &cfg, pbs_max_batch)?;
+    let mut pbs = PrefillBatchScratch::new(&mut gpu, &cfg, pbs_max_batch)?;
 
     // Tokenize the prompt (base completion — no chat framing; the smoke only
     // needs a real hidden-state to feed the drafter).
@@ -94,7 +94,7 @@ fn main() -> Result<(), String> {
         &mut gpu,
         &prompt_tokens,
         /*start_pos=*/ 0,
-        &pbs,
+        &mut pbs,
     )?;
 
     // The capture buffer holds one slot per prompt position within the LAST

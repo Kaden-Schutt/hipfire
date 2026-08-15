@@ -1,0 +1,6 @@
+GPU dev 0: gfx942 (205.8 GB VRAM, HIP 7.14)
+  pre-compiled kernels: /mnt/scratch/hipfire-kernels/rocm714/gfx942
+[rocblas] loaded for gfx942
+PASS case=0: hc_c 24/24 and hc_x_in 4096/4096 raw-bit identical; guards and inputs intact
+PASS case=1: hc_c 24/24 and hc_x_in 4096/4096 raw-bit identical; guards and inputs intact
+MICRO incumbent_3_launch_ms=0.008750 fused_1_launch_ms=0.005931 speedup=1.475x launches_saved=2

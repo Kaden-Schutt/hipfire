@@ -7,6 +7,7 @@
 
 # Pre-compile all HIP kernels for target GPU architectures.
 # Usage: ./scripts/compile-kernels.sh [arch1 arch2 ...]
+#        ./scripts/compile-kernels.sh --print-rocm-resolution
 # Default: gfx906 gfx1010 gfx1030 gfx1100 gfx1200 gfx1201
 #
 # Parallelism: jobs run in parallel via `xargs -P`. Default is $(nproc);
@@ -26,7 +27,24 @@ fi
 
 JOBS="${JOBS:-$(nproc)}"
 
+ROCM_RESOLUTION="$(
+    cargo run --quiet --locked --manifest-path "$SCRIPT_DIR/Cargo.toml" \
+        -p hipfire-config --bin hipfire-rocm-resolve
+)" || exit 1
+SELECTED_ROCM_ROOT="$(printf '%s\n' "$ROCM_RESOLUTION" | sed -n 's/^ROCM_ROOT=//p')"
+HIPCC_BIN="$(printf '%s\n' "$ROCM_RESOLUTION" | sed -n 's/^HIPCC=//p')"
+if [ -z "$SELECTED_ROCM_ROOT" ] || [ -z "$HIPCC_BIN" ]; then
+    echo "ERROR: internal ROCm resolver returned incomplete output." >&2
+    exit 1
+fi
+export HIPCC_BIN SELECTED_ROCM_ROOT
+
 echo "=== hipfire kernel compiler ==="
+echo "hipcc: $HIPCC_BIN"
+echo "ROCm root: $SELECTED_ROCM_ROOT"
+if [ "${1:-}" = "--print-rocm-resolution" ]; then
+    exit 0
+fi
 echo "Source: $SRC_DIR"
 echo "Architectures: ${ARCHS[*]}"
 echo "Parallel jobs: $JOBS"
@@ -111,7 +129,10 @@ worker() {
     local arch name src out
     IFS='|' read -r arch name src out <<< "$job"
 
-    if hipcc --genco --offload-arch="$arch" -O3 -I "$SCRIPT_DIR/kernels/src" \
+    if ROCM_PATH="$SELECTED_ROCM_ROOT" "$HIPCC_BIN" \
+        --genco --offload-arch="$arch" -O3 \
+        --rocm-path="$SELECTED_ROCM_ROOT" --hip-path="$SELECTED_ROCM_ROOT" \
+        -I "$SELECTED_ROCM_ROOT/include" -I "$SCRIPT_DIR/kernels/src" \
         -o "$out" "$src" 2>/dev/null; then
         local size
         size=$(stat -c%s "$out" 2>/dev/null || stat -f%z "$out" 2>/dev/null)

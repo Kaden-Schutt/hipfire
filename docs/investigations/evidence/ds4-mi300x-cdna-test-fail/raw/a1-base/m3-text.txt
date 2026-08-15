@@ -1,0 +1,25 @@
+<answer>I will provide a rigorous technical breakdown of the requested measurement contract for a DeepSeek V4 Flash-style MoT model on AMD MI30X (gfx942) under the specified conditions. This is not a marketing pitch; it is a precise specification for a benchmark fixture that must enforce strict reproducibility, numerical correctness, and performance measurement integrity.
+
+---
+
+## 1. The Prompt Fixture: Why Bytes Matter
+
+The benchmark must use a **deterministic prompt fixture** defined by its **raw bytes**, not by its visual appearance. This is because:
+
+- **Tokenizers are byte-sensitive**: A trailing newline, a different line-ending convention (CR vs. LF), or a chat template applied inconsistently will produce different token IDs, invalidating any comparison between runs.
+- **Reproducibility requires exact token identity**: The prompt must be a fixed prefix of a real, non-degenerate corpus (e.g., a technical document or conversation), not a repeated word or random noise. This ensures realistic attention patterns and expert routing diversity.
+- **Round-trip validation**: The fixture generator must:
+  1. Tokenize the source corpus.
+  2. Take the first N tokens (e.g., 2048).
+  3. Decode them back to text.
+4. Re-tokenize that text.
+5. **Verify that the token IDs and count match exactly**. If they do not, the generator must fail (fail-closed). This ensures the tokenizer is consistent and no truncation/expansion artifacts exist.
+- **No trailing newline**: The final text file must contain no trailing newline, so that `PROMP_ARG=$(<file)` preserves exact bytes.
+- **Ledger fields**: The prompt's MD5 and SHA-256 must be recorded alongside the token count and tokenizer identity (from model metadata). This ensures the prompt is frozen and traceable.
+
+## 2. The Generation Request: `--kvmode q8`, `--speculation off`, `--temperature 0`
+
+The benchmark must use a single, deterministic generation request:
+
+- **`--kv-mode q8`**: Keys and Values are stored in 8-bit quantized format. This is the "control" precision for this campaign. No other KV modes (e.g., FP16, FP32, or long-context variants) are allowed for the initial "Gate A" measurements.
+- **`--speculation off`**: No speculative decoding (no draft models, no tree verification

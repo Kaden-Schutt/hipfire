@@ -41,6 +41,8 @@ fn main() {
         user: "",
         enable_thinking: true,
         bos_token: None,
+        reasoning_strength: None,
+        reasoning_effort: None,
     };
 
     let tools = serde_json::json!([{
@@ -55,6 +57,9 @@ fn main() {
         Message {
             role: Role::User,
             content: "Hi".into(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
             tool_calls: vec![],
             tool_call_id: None,
             tool_plan: String::new(),
@@ -62,6 +67,9 @@ fn main() {
         Message {
             role: Role::Assistant,
             content: "Hello!".into(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
             tool_calls: vec![],
             tool_call_id: None,
             tool_plan: String::new(),
@@ -69,6 +77,9 @@ fn main() {
         Message {
             role: Role::User,
             content: "List files.".into(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
             tool_calls: vec![],
             tool_call_id: None,
             tool_plan: String::new(),
@@ -88,6 +99,9 @@ fn main() {
         Message {
             role: Role::User,
             content: "Implement a Blink-hash tree.".into(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
             tool_calls: vec![],
             tool_call_id: None,
             tool_plan: String::new(),
@@ -95,9 +109,14 @@ fn main() {
         Message {
             role: Role::Assistant,
             content: "".into(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
             tool_calls: vec![ToolCall {
+                id: None,
                 name: "bash".into(),
                 arguments: serde_json::json!({"command":"ls -la"}),
+                rendered_body: None,
             }],
             tool_call_id: None,
             tool_plan: reasoning.into(),
@@ -105,6 +124,9 @@ fn main() {
         Message {
             role: Role::Tool,
             content: "total 7896\ndrwx... blink_hash.pdf".into(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
             tool_calls: vec![],
             tool_call_id: Some("0".into()),
             tool_plan: String::new(),

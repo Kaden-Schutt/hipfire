@@ -1,0 +1,34 @@
+{"type":"pong"}
+{"type":"loaded","arch":"deepseek4","dim":0,"layers":0,"vocab":0,"vl":false,"cache_capable":true,"retry_reset_eligible":false}
+{"type":"token","id":"g0-depth-1024","text":"I","attempt_id":1}
+{"type":"token","id":"g0-depth-1024","text":" understa","attempt_id":1}
+{"type":"token","id":"g0-depth-1024","text":"n","attempt_id":1}
+{"type":"token","id":"g0-depth-1024","text":"d you want ","attempt_id":1}
+{"type":"token","id":"g0-depth-1024","text":"a rigo","attempt_id":1}
+{"type":"token","id":"g0-depth-1024","text":"rous, prod","attempt_id":1}
+{"type":"token","id":"g0-depth-1024","text":"uction-gra","attempt_id":1}
+{"type":"token","id":"g0-depth-1024","text":"de t","attempt_id":1}
+{"type":"token","id":"g0-depth-1024","text":"ec","attempt_id":1}
+{"type":"token","id":"g0-depth-1024","text":"hnical bre","attempt_id":1}
+{"type":"token","id":"g0-depth-1024","text":"akdown f","attempt_id":1}
+{"type":"token","id":"g0-depth-1024","text":"or a bench","attempt_id":1}
+{"type":"token","id":"g0-depth-1024","text":"ma","attempt_id":1}
+{"type":"token","id":"g0-depth-1024","text":"rk fi","attempt_id":1}
+{"type":"token","id":"g0-depth-1024","text":"xt","attempt_id":1}
+{"type":"token","id":"g0-depth-1024","text":"ur","attempt_id":1}
+{"type":"token","id":"g0-depth-1024","text":"e ","attempt_id":1}
+{"type":"token","id":"g0-depth-1024","text":"t","attempt_id":1}
+{"type":"token","id":"g0-depth-1024","text":"argeti","attempt_id":1}
+{"type":"token","id":"g0-depth-1024","text":"ng a D","attempt_id":1}
+{"type":"token","id":"g0-depth-1024","text":"eep","attempt_id":1}
+{"type":"token","id":"g0-depth-1024","text":"S","attempt_id":1}
+{"type":"token","id":"g0-depth-1024","text":"eek V4","attempt_id":1}
+{"type":"token","id":"g0-depth-1024","text":" Fl","attempt_id":1}
+{"type":"token","id":"g0-depth-1024","text":"ash-","attempt_id":1}
+{"type":"token","id":"g0-depth-1024","text":"st","attempt_id":1}
+{"type":"token","id":"g0-depth-1024","text":"yle","attempt_id":1}
+{"type":"token","id":"g0-depth-1024","text":" Mo","attempt_id":1}
+{"type":"token","id":"g0-depth-1024","text":"T model on AMD's MI300","attempt_id":1}
+{"type":"commit_ready","id":"g0-depth-1024","tokens":32,"tok_s":34.33476394849785,"prompt_tokens":1019,"prefill_tokens":1019,"cached_tokens":0,"prefill_ms":10141,"total_ms":11073,"finish_reason":"length","drafter":"ar","attempt_id":1}
+{"type":"aborted","id":"g0-depth-1024","reason":"client_cancelled","attempt_id":1}
+{"type":"done","id":"g0-depth-1024","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":32,"prefill_ms":0,"decode_ms":0,"attempt_id":1}

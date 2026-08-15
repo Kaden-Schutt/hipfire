@@ -91,6 +91,7 @@ mod tests {
         ChatMessage {
             role: role.into(),
             content: content.into(),
+            reasoning_content: None,
         }
     }
 

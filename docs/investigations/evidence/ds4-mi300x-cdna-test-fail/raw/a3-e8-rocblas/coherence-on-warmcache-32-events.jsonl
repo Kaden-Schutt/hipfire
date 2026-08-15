@@ -1,0 +1,34 @@
+{"type":"pong"}
+{"type":"loaded","arch":"deepseek4","dim":0,"layers":0,"vocab":0,"vl":false,"cache_capable":true,"retry_reset_eligible":false}
+{"type":"token","id":"g0-coherence-on-warmcache-32","text":"**Techn","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-warmcache-32","text":"ic","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-warmcache-32","text":"al B","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-warmcache-32","text":"rief: Produc","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-warmcache-32","text":"tion","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-warmcache-32","text":"-Grad","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-warmcache-32","text":"e ","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-warmcache-32","text":"Me","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-warmcache-32","text":"as","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-warmcache-32","text":"u","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-warmcache-32","text":"rement","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-warmcache-32","text":" fo","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-warmcache-32","text":"r D","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-warmcache-32","text":"eep","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-warmcache-32","text":"S","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-warmcache-32","text":"ee","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-warmcache-32","text":"k","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-warmcache-32","text":" V","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-warmcache-32","text":"4 F","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-warmcache-32","text":"lash ","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-warmcache-32","text":"on M","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-warmcache-32","text":"I30","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-warmcache-32","text":"0X","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-warmcache-32","text":" (gfx94","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-warmcache-32","text":"2","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-warmcache-32","text":")**","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-warmcache-32","text":"\n\n","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-warmcache-32","text":"T","attempt_id":1}
+{"type":"token","id":"g0-coherence-on-warmcache-32","text":"his is a strict, no-fr","attempt_id":1}
+{"type":"commit_ready","id":"g0-coherence-on-warmcache-32","tokens":32,"tok_s":27.210884353741495,"prompt_tokens":2052,"prefill_tokens":2052,"cached_tokens":0,"prefill_ms":14077,"total_ms":15254,"finish_reason":"length","drafter":"ar","attempt_id":1}
+{"type":"done","id":"g0-coherence-on-warmcache-32","tokens":32,"tok_s":27.210884353741495,"prompt_tokens":2052,"prefill_tokens":2052,"cached_tokens":0,"prefill_ms":14077,"total_ms":15254,"finish_reason":"length","drafter":"ar","attempt_id":1}
+{"type":"unloaded"}

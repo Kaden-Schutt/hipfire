@@ -83,6 +83,110 @@ extern "C" __global__ void sample_apply_repeat_penalty(
 // produces the block top-K in smem[0..TOP_K]. Writes the block top-K to
 // out_val/out_idx (TOP_K each). Caller provides smem of
 // nthreads*TOP_K*(4+4) bytes.
+#ifdef SAMPLE_FAST_STABLE
+// Fast common path. The host launches 128 x 256 threads for vocabularies below
+// 524288 entries, so each partial lane owns at most 16 values. TOP_K is 21:
+// twenty candidates for sampling plus one boundary candidate used to detect
+// ambiguous ties before accepting the fast result.
+#define LOCAL_CAP 16
+__device__ __forceinline__ void block_topk_strided(
+    char* smem,
+    const float* __restrict__ vals,
+    const int* __restrict__ idx_src,
+    int lo, int hi,
+    float* out_val, int* out_idx
+) {
+    const int tid = threadIdx.x;
+    const int nthreads = blockDim.x;
+    float local_val[LOCAL_CAP];
+    int local_idx[LOCAL_CAP];
+    int local_count = 0;
+    for (int i = lo + tid; i < hi; i += nthreads) {
+        if (local_count < LOCAL_CAP) {
+            local_val[local_count] = vals[i];
+            local_idx[local_count] = idx_src ? idx_src[i] : i;
+            local_count++;
+        }
+    }
+
+    float* best_val = (float*)smem;
+    int* best_idx = (int*)(best_val + nthreads);
+    for (int pick = 0; pick < TOP_K; pick++) {
+        float mine = -1e30f;
+        int mine_idx = 0;
+        int mine_pos = -1;
+        #pragma unroll
+        for (int i = 0; i < LOCAL_CAP; i++) {
+            if (i < local_count && local_val[i] > mine) {
+                mine = local_val[i];
+                mine_idx = local_idx[i];
+                mine_pos = i;
+            }
+        }
+        best_val[tid] = mine;
+        best_idx[tid] = mine_idx;
+        __syncthreads();
+        for (int stride = nthreads / 2; stride > 0; stride >>= 1) {
+            if (tid < stride && best_val[tid + stride] > best_val[tid]) {
+                best_val[tid] = best_val[tid + stride];
+                best_idx[tid] = best_idx[tid + stride];
+            }
+            __syncthreads();
+        }
+        const int chosen = best_idx[0];
+        if (tid == 0) {
+            out_val[pick] = best_val[0];
+            out_idx[pick] = chosen;
+        }
+        if (mine_pos >= 0 && mine_idx == chosen)
+            local_val[mine_pos] = -1e30f;
+        __syncthreads();
+    }
+}
+
+// Partial lists from the fast reducer are descending. Merge their current heads
+// instead of re-running the general TOP_K-by-TOP_K list reducer.
+__device__ __forceinline__ void block_merge_sorted_topk(
+    char* smem,
+    const float* __restrict__ vals,
+    const int* __restrict__ idx_src,
+    int n_cand,
+    float* out_val,
+    int* out_idx
+) {
+    const int tid = threadIdx.x;
+    const int nthreads = blockDim.x;
+    const int n_lists = n_cand / TOP_K;
+    int cursor = 0;
+    float* best_val = (float*)smem;
+    int* best_idx = (int*)(best_val + nthreads);
+    int* best_list = best_idx + nthreads;
+    for (int pick = 0; pick < TOP_K; pick++) {
+        const bool active = tid < n_lists && cursor < TOP_K;
+        const int offset = tid * TOP_K + cursor;
+        best_val[tid] = active ? vals[offset] : -1e30f;
+        best_idx[tid] = active ? idx_src[offset] : 0;
+        best_list[tid] = active ? tid : 0;
+        __syncthreads();
+        for (int stride = nthreads / 2; stride > 0; stride >>= 1) {
+            if (tid < stride && best_val[tid + stride] > best_val[tid]) {
+                best_val[tid] = best_val[tid + stride];
+                best_idx[tid] = best_idx[tid + stride];
+                best_list[tid] = best_list[tid + stride];
+            }
+            __syncthreads();
+        }
+        const int winner = best_list[0];
+        if (tid == 0) {
+            out_val[pick] = best_val[0];
+            out_idx[pick] = best_idx[0];
+        }
+        if (tid == winner)
+            cursor++;
+        __syncthreads();
+    }
+}
+#else
 __device__ __forceinline__ void block_topk_strided(
     char* smem,                          // dynamic LDS: nthreads*TOP_K*(4+4) bytes
     const float* __restrict__ vals,
@@ -144,6 +248,7 @@ __device__ __forceinline__ void block_topk_strided(
         for (int k = 0; k < TOP_K; k++) { out_val[k] = topk_val[k]; out_idx[k] = topk_idx[k]; }
     }
 }
+#endif
 
 // ── Phase 1: per-block partial top-K over a contiguous vocab strip ──
 extern "C" __global__ void sample_topk_partial(
@@ -181,7 +286,11 @@ extern "C" __global__ void sample_topk_finalize(
 
     // Block-merge the candidate pool into a single top-K in smem.
     float merged_val[TOP_K]; int merged_idx[TOP_K];
+#ifdef SAMPLE_FAST_STABLE
+    block_merge_sorted_topk(smem, partial_val, partial_idx, n_cand, merged_val, merged_idx);
+#else
     block_topk_strided(smem, partial_val, partial_idx, 0, n_cand, merged_val, merged_idx);
+#endif
 
     if (tid != 0) return;
 
@@ -196,6 +305,17 @@ extern "C" __global__ void sample_topk_finalize(
     if (max_val <= -1e29f) { result[0] = 0; result[1] = rand_seed; return; }
 
     if (temperature <= 1e-6f) {
+#ifdef SAMPLE_FAST_STABLE
+        // A tied maximum can select a different token under a different stable
+        // reduction order. Ask the host to rerun the legacy reducer.
+        for (int k = 0; k < TOP_K; k++) {
+            if (k != max_pos && vals[k] == max_val) {
+                result[0] = 0xffffffffu;
+                result[1] = rand_seed;
+                return;
+            }
+        }
+#endif
         result[0] = (unsigned int)idx[max_pos];
         result[1] = rand_seed;
         return;
@@ -237,6 +357,25 @@ extern "C" __global__ void sample_topk_finalize(
         cap = mp_cap;
     }
     if (cap < 1) cap = 1;
+
+#ifdef SAMPLE_FAST_STABLE
+    // The legacy kernel's strict comparisons preserve its original candidate
+    // order for equal probabilities. The fast reducer has a different internal
+    // order, so accept it only when ordering is provably irrelevant. Include the
+    // first excluded candidate to catch a tie at the top-20 boundary.
+    for (int i = 1; i < cap; i++) {
+        if (probs[order[i - 1]] == probs[order[i]]) {
+            result[0] = 0xffffffffu;
+            result[1] = rand_seed;
+            return;
+        }
+    }
+    if (cap < TOP_K && probs[order[cap - 1]] == probs[order[cap]]) {
+        result[0] = 0xffffffffu;
+        result[1] = rand_seed;
+        return;
+    }
+#endif
 
     // BYTE-PRESERVATION: the softmax sum feeding p_thresh is taken over the
     // CAPPED set [0,cap) of the descending-sorted candidates, NOT the full

@@ -73,7 +73,7 @@ impl MtpSamplingConfig {
 fn mtp_device_token_chain_enabled_from_env() -> bool {
     // Default on: this path is token-identical in greedy mode and removes the
     // proposal-loop host data dependency needed for later graph capture.
-    match std::env::var("HIPFIRE_MTP_DEVICE_TOKEN_CHAIN") {
+    match hipfire_config::developer_var("HIPFIRE_MTP_DEVICE_TOKEN_CHAIN") {
         Ok(v) => {
             let v = v.trim().to_ascii_lowercase();
             !(v == "0" || v == "false" || v == "off" || v == "no")
@@ -85,7 +85,7 @@ fn mtp_device_token_chain_enabled_from_env() -> bool {
 fn mtp_snapshot_overlap_enabled_from_env() -> bool {
     // Default off: current gfx1201 benches show this stream split regresses,
     // but the hook is useful as an opt-in cross-arch experiment.
-    match std::env::var("HIPFIRE_MTP_SNAPSHOT_OVERLAP") {
+    match hipfire_config::developer_var("HIPFIRE_MTP_SNAPSHOT_OVERLAP") {
         Ok(v) => {
             let v = v.trim().to_ascii_lowercase();
             v == "1" || v == "true" || v == "on" || v == "yes"
@@ -98,7 +98,7 @@ fn mtp_gpu_greedy_accept_enabled_from_env() -> bool {
     // Default on for greedy device-token-chain MTP: candidates and verify
     // argmaxes are already on-device, so the prefix accept + bonus selection
     // can stay there until a compact two-int result is needed on host.
-    match std::env::var("HIPFIRE_MTP_GPU_ACCEPT") {
+    match hipfire_config::developer_var("HIPFIRE_MTP_GPU_ACCEPT") {
         Ok(v) => {
             let v = v.trim().to_ascii_lowercase();
             !(v == "0" || v == "false" || v == "off" || v == "no")
@@ -122,7 +122,9 @@ fn mtp_q8_verify_wmma_enabled_from_env() -> bool {
     // WMMA when the arch/shape supports it, otherwise it falls back to scalar.
     // Prompt-sweep parity is clean; opt out with HIPFIRE_MTP_Q8_VERIFY_WMMA=0.
     mtp_q8_verify_wmma_enabled_from_env_value(
-        std::env::var("HIPFIRE_MTP_Q8_VERIFY_WMMA").ok().as_deref(),
+        hipfire_config::developer_var("HIPFIRE_MTP_Q8_VERIFY_WMMA")
+            .ok()
+            .as_deref(),
     )
 }
 
@@ -138,7 +140,7 @@ fn mtp_q8_verify_wmma_enabled_from_env() -> bool {
 /// p_min=0). Override on any arch via HIPFIRE_MTP_P_MIN (e.g. =0.6 to enable
 /// elsewhere, =0 to disable). An explicit `set_p_min` call still overrides this.
 fn default_mtp_p_min(arch: &str) -> f32 {
-    if let Some(v) = std::env::var("HIPFIRE_MTP_P_MIN").ok() {
+    if let Some(v) = hipfire_config::developer_var("HIPFIRE_MTP_P_MIN").ok() {
         return v
             .trim()
             .parse::<f32>()
@@ -180,7 +182,9 @@ fn mtp_proposal_graph_policy_from_env_value(value: Option<&str>) -> MtpProposalG
 
 fn mtp_proposal_graph_policy_from_env() -> MtpProposalGraphPolicy {
     mtp_proposal_graph_policy_from_env_value(
-        std::env::var("HIPFIRE_MTP_PROPOSAL_GRAPH").ok().as_deref(),
+        hipfire_config::developer_var("HIPFIRE_MTP_PROPOSAL_GRAPH")
+            .ok()
+            .as_deref(),
     )
 }
 
@@ -527,6 +531,13 @@ pub struct MtpSpecState {
     /// Maximum number of MTP candidates per cycle (chain depth).
     pub max_n: usize,
 
+    /// Verify capacity (max external candidate window) sizing trunk verify
+    /// buffers (`verify_hidden` / `verify_logits` / `verify_rot` /
+    /// `verify_argmax`) and `trunk_pbs` / `trunk_gdn_tape`. Must be >=
+    /// `max_n`; proposal buffers (`mtp_t_outs`, `mtp_lm_*`, etc.) remain sized
+    /// to `max_n` so ordinary MTP draft depth never inflates with PLD capacity.
+    pub verify_capacity: usize,
+
     /// Optional draft-confidence cutoff for [`spec_step_mtp_compressed_serial`].
     /// When `p_min > 0`, the K-chain truncates early at step k if the draft's
     /// top-1 softmax prob falls below `p_min` — analog of llama.cpp's
@@ -570,9 +581,31 @@ impl MtpSpecState {
         max_n: usize,
         kv_mode: crate::mtp_head::MtpKvMode,
     ) -> HipResult<Self> {
+        Self::new_for_slot_with_kv_mode_and_verify_capacity(gpu, target, head, max_n, max_n, kv_mode)
+    }
+
+    /// Like [`Self::new_for_slot_with_kv_mode`] but allows `verify_capacity`
+    /// to oversize trunk verify buffers (`verify_hidden` / `verify_logits` /
+    /// `verify_rot` / `verify_argmax`, `trunk_pbs`, `trunk_gdn_tape`) so an
+    /// external PLD/n-gram window larger than native MTP depth can still be
+    /// verified in one batch. `max_n` remains the proposal-buffer/alloc depth
+    /// and the per-call K clamp for ordinary MTP; `verify_capacity` is only
+    /// the verify-batch ceiling. `verify_capacity` must be >= `max_n`.
+    pub fn new_for_slot_with_kv_mode_and_verify_capacity(
+        gpu: &mut Gpu,
+        target: &ModelSlot,
+        head: &Qwen35MtpHead,
+        max_n: usize,
+        verify_capacity: usize,
+        kv_mode: crate::mtp_head::MtpKvMode,
+    ) -> HipResult<Self> {
         assert!(
             max_n >= 1,
             "MtpSpecState::new_for_slot: max_n must be ≥ 1 (chain depth)"
+        );
+        assert!(
+            verify_capacity >= max_n,
+            "MtpSpecState: verify_capacity {verify_capacity} must be >= max_n {max_n}"
         );
         let dim = target.config.dim;
         let vocab = target.config.vocab_size;
@@ -588,10 +621,10 @@ impl MtpSpecState {
         );
 
         let prev_hidden = gpu.alloc_tensor(&[dim], DType::F32)?;
-        let verify_hidden = gpu.alloc_tensor(&[(max_n + 1) * dim], DType::F32)?;
-        let verify_logits = gpu.alloc_tensor(&[(max_n + 1) * vocab], DType::F32)?;
-        let verify_rot = gpu.alloc_tensor(&[(max_n + 1) * dim], DType::F32)?;
-        let verify_argmax = gpu.alloc_tensor(&[max_n + 1], DType::F32)?;
+        let verify_hidden = gpu.alloc_tensor(&[(verify_capacity + 1) * dim], DType::F32)?;
+        let verify_logits = gpu.alloc_tensor(&[(verify_capacity + 1) * vocab], DType::F32)?;
+        let verify_rot = gpu.alloc_tensor(&[(verify_capacity + 1) * dim], DType::F32)?;
+        let verify_argmax = gpu.alloc_tensor(&[verify_capacity + 1], DType::F32)?;
         let trunk_snap = DeltaNetSnapshot::new_for(gpu, &target.dn_state)?;
         // Snapshot overlap resources are construction-time only; set the env
         // before creating MtpSpecState when comparing the opt-in path.
@@ -604,12 +637,13 @@ impl MtpSpecState {
         } else {
             (None, None)
         };
-        let trunk_pbs = qwen35::PrefillBatchScratch::new(gpu, &target.config, max_n + 1)?;
-        let trunk_gdn_tape = GdnTape::new_for_config(gpu, &target.config, max_n + 1)?;
+        let trunk_pbs = qwen35::PrefillBatchScratch::new(gpu, &target.config, verify_capacity + 1)?;
+        let trunk_gdn_tape = GdnTape::new_for_config(gpu, &target.config, verify_capacity + 1)?;
         let mtp_scratch = Qwen35MtpHeadScratch::new(gpu, &head.config)?;
         let mtp_kv = Qwen35MtpHeadKvCache::new_with_kv_mode(gpu, &head.config, kv_mode)?;
 
-        // Per-step batched-lm_head scratch (Task 10b).
+        // Per-step batched-lm_head scratch (Task 10b). Sized to max_n, not
+        // verify_capacity — ordinary MTP depth never inflates.
         let mtp_t_outs = gpu.alloc_tensor(&[max_n * dim], DType::F32)?;
         let mtp_lm_tmp = gpu.alloc_tensor(&[max_n * dim], DType::F32)?;
         let mtp_lm_rot = gpu.alloc_tensor(&[max_n * dim], DType::F32)?;
@@ -671,6 +705,7 @@ impl MtpSpecState {
             mtp_gather_prob_verify,
             gpu_rng_state: 42,
             max_n,
+            verify_capacity,
             p_min: default_mtp_p_min(gpu.arch.as_str()),
             sampling: MtpSamplingConfig::default(),
             rng: MtpRng::new(42),
@@ -832,7 +867,7 @@ impl MtpSpecState {
         // Qwen35MtpHeadKvCache::free_gpu does `drop(inner)` which does not
         // release GPU memory (llama::KvCache has no Drop). Call the inner
         // KvCache's own free_gpu directly to properly hipFree each tensor.
-        self.mtp_kv.inner.free_gpu(gpu);
+        let _ = self.mtp_kv.inner.free_gpu(gpu);
     }
 }
 
@@ -1120,16 +1155,411 @@ fn assemble_greedy_accept_from_gpu_result(
     }
 }
 
+/// Pure bound check for external PLD candidates. Greedy-only window must be
+/// non-empty, and its length must fit the allocated verify batch capacity
+/// (`state.verify_capacity + 1` tokens including the seed `last_committed`).
+/// This is the only pure, GPU-free validation the core exposes — no token
+/// sampling, no device work.
+fn mtp_external_candidates_within_capacity(candidates: &[u32], verify_capacity: usize) -> bool {
+    !candidates.is_empty() && candidates.len() <= verify_capacity
+}
+
+/// Pure token assembly for the shared trunk verify: `[last_committed, candidates...]`.
+/// Thin wrapper around [`build_trunk_spine_verify_tokens`] kept as a pure
+/// helper so tests can assert bounds without touching GPU.
+fn mtp_assemble_verify_tokens(last_committed: u32, candidates: &[u32]) -> Vec<u32> {
+    build_trunk_spine_verify_tokens(last_committed, candidates)
+}
+
+/// External-takeover MTP-KV repair policy (pure).
+///
+/// After shared verify of an external ngram/PLD window:
+/// - If MTP is already retired, never run head repair.
+/// - If `accept_count > 0`, never run head repair: any positive external
+///   acceptance irreversibly retires MTP (caller latches `mtp_retired`).
+/// - If not retired and `accept_count == 0`, repair exactly the one committed
+///   input row (`last_committed` at `cur_pos`) using the pre-window hidden
+///   snapshot. Shared greedy verify always advances by 1 on zero accept
+///   (bonus only).
+///
+/// Returns how many MTP-head block-only forwards the takeover path must run
+/// (0 or 1). No O(accepted) multi-row repair.
+fn mtp_takeover_kv_repair_forwards(mtp_already_retired: bool, accept_count: usize) -> usize {
+    if mtp_already_retired || accept_count > 0 {
+        0
+    } else {
+        1
+    }
+}
+
+
+
+#[allow(clippy::too_many_arguments)]
+fn mtp_shared_verify_accept_rollback(
+    gpu: &mut Gpu,
+    target: &mut ModelSlot,
+    state: &mut MtpSpecState,
+    cur_pos: usize,
+    last_committed: u32,
+    eos_token_id: u32,
+    candidates: &[u32],
+    drafts_generated: usize,
+    chain_truncated: bool,
+    overlap_trunk_snap: bool,
+    use_sampling: bool,
+    sampling: MtpSamplingConfig,
+    draft_probs: &[f32],
+    draft_softmaxes: &[Vec<f32>],
+    is_external: bool,
+    use_device_token_chain: bool,
+) -> HipResult<MtpSpecResult> {
+    let dim = target.config.dim;
+    let vocab = target.config.vocab_size;
+    let trunk_weights: &Qwen35Weights = &target.weights;
+
+    if gpu.active_stream.is_none() {
+        gpu.active_stream = Some(gpu.hip.stream_create()?);
+    }
+
+    // ── 2. Trunk verify (shared) ──────────────────────────────────────
+    let verify_tokens = mtp_assemble_verify_tokens(last_committed, candidates);
+    let n_verify = verify_tokens.len();
+    debug_assert_eq!(n_verify, drafts_generated + 1);
+    debug_assert!(n_verify <= state.verify_capacity + 1);
+
+    if overlap_trunk_snap {
+        gpu.hip
+            .stream_synchronize(state.trunk_snap_stream.as_ref().unwrap())?;
+    } else {
+        state.trunk_snap.save_from(&target.dn_state, gpu)?;
+    }
+
+    let tape_captured = qwen35::prefill_batch_pbs_eligible(
+        trunk_weights,
+        &target.config,
+        &target.dn_state,
+        n_verify,
+        gpu.arch.as_str(),
+        /* moe_router_logits_present — dense trunk: arm never matched */ true,
+    );
+    let verify_tape: Option<&mut GdnTape> = if tape_captured {
+        Some(&mut state.trunk_gdn_tape)
+    } else {
+        None
+    };
+
+    qwen35::forward_prefill_batch_with_pbs_opts(
+        gpu,
+        trunk_weights,
+        &target.config,
+        &verify_tokens,
+        cur_pos,
+        &mut target.kv_cache,
+        &mut target.dn_state,
+        &target.scratch,
+        None,
+        Some(&state.verify_hidden),
+        verify_tape,
+        None,
+        Some(&state.trunk_pbs),
+        None,
+        None,
+        false,
+    )?;
+
+    let w_out = &trunk_weights.output;
+    let logits_view = state.verify_logits.sub_offset(0, n_verify * vocab);
+    match w_out.gpu_dtype {
+        DType::Q8_0 => {
+            if mtp_q8_verify_wmma_enabled_from_env() {
+                gpu.gemm_q8_0_batched_chunked(
+                    &w_out.buf,
+                    &state.verify_hidden,
+                    &logits_view,
+                    w_out.m,
+                    w_out.k,
+                    n_verify,
+                )?;
+            } else {
+                gpu.gemm_q8_0_batched(
+                    &w_out.buf,
+                    &state.verify_hidden,
+                    &logits_view,
+                    w_out.m,
+                    w_out.k,
+                    n_verify,
+                )?;
+            }
+        }
+        DType::HFQ4G256 => {
+            gpu.gemm_hfq4g256_batched_lmhead(
+                &w_out.buf,
+                &state.verify_hidden,
+                &logits_view,
+                w_out.m,
+                w_out.k,
+                n_verify,
+            )?;
+        }
+        DType::MQ4G256 => {
+            let rot = state.verify_rot.sub_offset(0, n_verify * w_out.k);
+            llama::rotate_x_mq_batched_for(
+                gpu,
+                w_out,
+                &state.verify_hidden,
+                &rot,
+                w_out.k,
+                n_verify,
+            )?;
+            gpu.gemm_hfq4g256_batched_lmhead(
+                &w_out.buf,
+                &rot,
+                &logits_view,
+                w_out.m,
+                w_out.k,
+                n_verify,
+            )?;
+        }
+        DType::MQ3G256 => {
+            let rot = state.verify_rot.sub_offset(0, n_verify * w_out.k);
+            llama::rotate_x_mq_batched_for(
+                gpu,
+                w_out,
+                &state.verify_hidden,
+                &rot,
+                w_out.k,
+                n_verify,
+            )?;
+            gpu.gemm_hfq3g256_batched_lmhead(
+                &w_out.buf,
+                &rot,
+                &logits_view,
+                w_out.m,
+                w_out.k,
+                n_verify,
+            )?;
+        }
+        DType::HFQ6G256 => {
+            gpu.gemm_hfq6g256_batched_lmhead(
+                &w_out.buf,
+                &state.verify_hidden,
+                &logits_view,
+                w_out.m,
+                w_out.k,
+                n_verify,
+            )?;
+        }
+        DType::MQ6G256 => {
+            let rot = state.verify_rot.sub_offset(0, n_verify * w_out.k);
+            llama::rotate_x_mq_batched_for(
+                gpu,
+                w_out,
+                &state.verify_hidden,
+                &rot,
+                w_out.k,
+                n_verify,
+            )?;
+            gpu.gemm_hfq6g256_batched_lmhead(
+                &w_out.buf,
+                &rot,
+                &logits_view,
+                w_out.m,
+                w_out.k,
+                n_verify,
+            )?;
+        }
+        _ => {
+            for i in 0..n_verify {
+                let row = state.verify_hidden.sub_offset(i * dim, dim);
+                let logits_row = state.verify_logits.sub_offset(i * vocab, vocab);
+                llama::weight_gemv(gpu, w_out, &row, &logits_row)?;
+            }
+        }
+    }
+
+    let mut accept_count = 0usize;
+    let hit_eos;
+    let mut committed: Vec<u32> = Vec::with_capacity(drafts_generated + 1);
+
+    let effective_use_sampling = if is_external { false } else { use_sampling };
+
+    if effective_use_sampling {
+        hit_eos = mtp_sampled_accept(
+            gpu,
+            state,
+            &logits_view,
+            draft_softmaxes,
+            draft_probs,
+            candidates,
+            drafts_generated,
+            vocab,
+            sampling.temp,
+            sampling.top_p,
+            sampling.top_k,
+            sampling.min_p,
+            eos_token_id,
+            &mut committed,
+            &mut accept_count,
+        )?;
+    } else {
+        let argmax_v = state.verify_argmax.sub_offset(0, n_verify);
+        gpu.argmax_f32_batched(&logits_view, &argmax_v, vocab, n_verify)?;
+
+        let use_gpu_accept = !is_external
+            && use_device_token_chain
+            && mtp_gpu_greedy_accept_enabled_from_env();
+        let accepted = if use_gpu_accept {
+            let candidate_device = state.mtp_token_chain.sub_offset(1, drafts_generated);
+            let accept_result = state.verify_argmax.sub_offset(0, 2);
+            gpu.greedy_accept_from_argmax_i32(
+                &argmax_v,
+                &candidate_device,
+                &accept_result,
+                drafts_generated,
+                eos_token_id,
+            )?;
+            let mut accept_host: [i32; 2] = [0, 0];
+            {
+                let bytes: &mut [u8] = unsafe {
+                    std::slice::from_raw_parts_mut(accept_host.as_mut_ptr() as *mut u8, 8)
+                };
+                gpu.hip.memcpy_dtoh(bytes, &accept_result.buf)?;
+            }
+            assemble_greedy_accept_from_gpu_result(
+                &candidates[..drafts_generated],
+                accept_host[0] as usize,
+                accept_host[1],
+                eos_token_id,
+            )
+        } else {
+            let mut argmax_v_host: Vec<i32> = vec![0; n_verify];
+            {
+                let bytes: &mut [u8] = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        argmax_v_host.as_mut_ptr() as *mut u8,
+                        n_verify * 4,
+                    )
+                };
+                gpu.hip.memcpy_dtoh(bytes, &argmax_v.buf)?;
+            }
+            let argmax_per_pos: Vec<u32> = argmax_v_host.into_iter().map(|x| x as u32).collect();
+            greedy_trunk_spine_accept(candidates, &argmax_per_pos, eos_token_id)
+        };
+        committed = accepted.committed;
+        accept_count = accepted.accept_count;
+        hit_eos = accepted.hit_eos;
+    }
+
+    let advance = committed.len();
+    debug_assert!(advance >= 1 && advance <= drafts_generated + 1);
+
+    let prev_hidden_row = advance - 1;
+    state.capture_prev_hidden_from_verify_row(gpu, prev_hidden_row, dim)?;
+
+    // ── 3. KV / DN rollback (or skip on full accept) ─────────────────
+    let full_accept_no_eos = advance == drafts_generated + 1 && !hit_eos;
+    let replay_skipped = full_accept_no_eos;
+    if !full_accept_no_eos {
+        state.trunk_snap.restore_to(&mut target.dn_state, gpu)?;
+        if tape_captured {
+            state.trunk_gdn_tape.replay_gdn(
+                gpu,
+                trunk_weights,
+                &target.config,
+                &mut target.dn_state,
+                advance,
+            )?;
+        } else {
+            if advance >= 2 {
+                let replay = &verify_tokens[..advance];
+                qwen35::forward_prefill_batch(
+                    gpu,
+                    trunk_weights,
+                    &target.config,
+                    replay,
+                    cur_pos,
+                    &mut target.kv_cache,
+                    &mut target.dn_state,
+                    &target.scratch,
+                    None,
+                    None,
+                    None,
+                    None,
+                )?;
+            } else {
+                gpu.graphs.ar_graph_eligible = false;
+                qwen35::forward_scratch(
+                    gpu,
+                    trunk_weights,
+                    &target.config,
+                    verify_tokens[0],
+                    cur_pos,
+                    &mut target.kv_cache,
+                    &mut target.dn_state,
+                    &target.scratch,
+                )?;
+            }
+        }
+    }
+
+    Ok(MtpSpecResult {
+        committed,
+        accept_count,
+        hit_eos,
+        advance,
+        drafts_generated,
+        chain_truncated,
+        replay_skipped,
+    })
+}
+
 /// DS4-style Qwen MTP prefill fill.
 ///
-/// Runs trunk prefill once while capturing post-output-norm hidden for every
+/// Runs trunk prefill while capturing post-output-norm hidden for every
 /// prompt token, then runs the MTP block-only path over those same prompt
 /// positions. The MTP layer enters decode with a warm private KV cache instead
 /// of starting at the first generated token.
+///
+/// Trunk prefill is split into `<= PREFILL_MAX_BATCH` committed chunks so
+/// adaptive-KV (and similar) controllers can run `maybe_downshift` between
+/// chunks at the exact committed trunk position. Without that boundary the
+/// internal `forward_prefill_batch` loop would write past the current-tier
+/// capacity (adaptive start `side_cap`) before any downshift could fire —
+/// post-prefill-only downshift is insufficient when prompt_len > start cap.
+///
+/// MTP private-cache offsets stay absolute: each chunk fills MTP KV at
+/// `start_pos + off + i` (same schedule as the trunk), so multi-chunk prefill
+/// is position-identical to a single whole-prompt fill. Non-adaptive callers
+/// keep the same end state: full trunk KV + full MTP private KV + last-token logits.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TrunkSpinePrefillTimings {
     pub trunk_prefill_secs: f64,
     pub mtp_prompt_fill_secs: f64,
+}
+
+/// Absolute trunk positions at which a multi-chunk MTP prefill has committed
+/// KV after each `<= chunk_max` slice. Empty when `prompt_len == 0`.
+///
+/// Used by adaptive serve hooks and unit tests so downshift sites stay locked
+/// to the same schedule the prefill helper actually writes.
+pub fn mtp_prefill_committed_boundaries(
+    prompt_len: usize,
+    start_pos: usize,
+    chunk_max: usize,
+) -> Vec<usize> {
+    debug_assert!(chunk_max >= 1);
+    let chunk_max = chunk_max.max(1);
+    if prompt_len == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(prompt_len.div_ceil(chunk_max));
+    let mut off = 0usize;
+    while off < prompt_len {
+        let end = (off + chunk_max).min(prompt_len);
+        out.push(start_pos + end);
+        off = end;
+    }
+    out
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1141,6 +1571,38 @@ pub fn prefill_trunk_and_mtp_cache(
     prompt_tokens: &[u32],
     start_pos: usize,
 ) -> HipResult<TrunkSpinePrefillTimings> {
+    // No-op boundary: same final state as the historical single-call path.
+    prefill_trunk_and_mtp_cache_with_boundary(
+        gpu,
+        target,
+        head,
+        state,
+        prompt_tokens,
+        start_pos,
+        |_gpu, _target, _committed_pos| Ok(()),
+    )
+}
+
+/// Like [`prefill_trunk_and_mtp_cache`], but invokes `on_committed_boundary`
+/// after each trunk+MTP chunk commits, with the exclusive end position of the
+/// committed prefix (`start_pos + tokens_written_so_far`).
+///
+/// The callback runs while `target.kv_cache` holds the just-written prefix and
+/// before the next chunk may write past the current-tier capacity. Failures
+/// propagate and abort the remaining prefill (caller must free MTP state).
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_trunk_and_mtp_cache_with_boundary<F>(
+    gpu: &mut Gpu,
+    target: &mut ModelSlot,
+    head: &Qwen35MtpHead,
+    state: &mut MtpSpecState,
+    prompt_tokens: &[u32],
+    start_pos: usize,
+    mut on_committed_boundary: F,
+) -> HipResult<TrunkSpinePrefillTimings>
+where
+    F: FnMut(&mut Gpu, &mut ModelSlot, usize) -> HipResult<()>,
+{
     if prompt_tokens.is_empty() {
         return Ok(TrunkSpinePrefillTimings::default());
     }
@@ -1148,39 +1610,60 @@ pub fn prefill_trunk_and_mtp_cache(
     let dim = target.config.dim;
     let dim_bytes = dim * 4;
     let prompt_hidden = gpu.alloc_tensor(&[prompt_tokens.len() * dim], DType::F32)?;
+    // Match adaptive margin / AR daemon chunking. Internal forward_prefill_batch
+    // also caps at this size; externalizing the loop exposes commit boundaries.
+    let chunk_max = qwen35::PREFILL_MAX_BATCH.max(1);
 
     let result = (|| -> HipResult<TrunkSpinePrefillTimings> {
-        let t_trunk = Instant::now();
-        qwen35::forward_prefill_batch(
-            gpu,
-            &target.weights,
-            &target.config,
-            prompt_tokens,
-            start_pos,
-            &mut target.kv_cache,
-            &mut target.dn_state,
-            &target.scratch,
-            None,
-            Some(&prompt_hidden),
-            None,
-            None,
-        )?;
-        let trunk_prefill_secs = t_trunk.elapsed().as_secs_f64();
+        let mut trunk_prefill_secs = 0.0f64;
+        let mut mtp_prompt_fill_secs = 0.0f64;
+        let mut off = 0usize;
+        while off < prompt_tokens.len() {
+            let end = (off + chunk_max).min(prompt_tokens.len());
+            let chunk = &prompt_tokens[off..end];
+            let chunk_start_pos = start_pos + off;
+            let committed_pos = start_pos + end;
 
-        let t_mtp_fill = Instant::now();
-        for (i, &token) in prompt_tokens.iter().enumerate() {
-            let hidden_row = prompt_hidden.sub_offset(i * dim, dim);
-            mtp_head::mtp_head_forward_block_only(
+            // Per-chunk hidden destination: row-major slice of the full prompt buffer.
+            let chunk_hidden = prompt_hidden.sub_offset(off * dim, chunk.len() * dim);
+
+            let t_trunk = Instant::now();
+            qwen35::forward_prefill_batch(
                 gpu,
-                head,
-                &state.mtp_scratch,
-                &mut state.mtp_kv,
-                token,
-                &hidden_row,
-                None,
-                start_pos + i,
                 &target.weights,
+                &target.config,
+                chunk,
+                chunk_start_pos,
+                &mut target.kv_cache,
+                &mut target.dn_state,
+                &target.scratch,
+                None,
+                Some(&chunk_hidden),
+                None,
+                None,
             )?;
+            trunk_prefill_secs += t_trunk.elapsed().as_secs_f64();
+
+            let t_mtp_fill = Instant::now();
+            for (i, &token) in chunk.iter().enumerate() {
+                let hidden_row = prompt_hidden.sub_offset((off + i) * dim, dim);
+                mtp_head::mtp_head_forward_block_only(
+                    gpu,
+                    head,
+                    &state.mtp_scratch,
+                    &mut state.mtp_kv,
+                    token,
+                    &hidden_row,
+                    None,
+                    chunk_start_pos + i,
+                    &target.weights,
+                )?;
+            }
+            mtp_prompt_fill_secs += t_mtp_fill.elapsed().as_secs_f64();
+
+            // Committed boundary: trunk + MTP private KV now cover [0, committed_pos).
+            on_committed_boundary(gpu, target, committed_pos)?;
+            off = end;
         }
 
         let last = prompt_tokens.len() - 1;
@@ -1191,7 +1674,6 @@ pub fn prefill_trunk_and_mtp_cache(
             last * dim_bytes,
             dim_bytes,
         )?;
-        let mtp_prompt_fill_secs = t_mtp_fill.elapsed().as_secs_f64();
         Ok(TrunkSpinePrefillTimings {
             trunk_prefill_secs,
             mtp_prompt_fill_secs,
@@ -1219,7 +1701,8 @@ pub fn spec_step_mtp_trunk_spine(
     last_committed: u32,
     eos_token_id: u32,
 ) -> HipResult<MtpSpecResult> {
-    spec_step_mtp_compressed_serial(
+    let k = state.max_n;
+    spec_step_mtp_compressed_serial_with_k(
         gpu,
         target,
         head,
@@ -1227,6 +1710,31 @@ pub fn spec_step_mtp_trunk_spine(
         cur_pos,
         last_committed,
         eos_token_id,
+        k,
+    )
+}
+
+/// Budget-aware trunk spine: draft at most `k` candidates (k may be 0).
+#[allow(clippy::too_many_arguments)]
+pub fn spec_step_mtp_trunk_spine_with_k(
+    gpu: &mut Gpu,
+    target: &mut ModelSlot,
+    head: &Qwen35MtpHead,
+    state: &mut MtpSpecState,
+    cur_pos: usize,
+    last_committed: u32,
+    eos_token_id: u32,
+    k: usize,
+) -> HipResult<MtpSpecResult> {
+    spec_step_mtp_compressed_serial_with_k(
+        gpu,
+        target,
+        head,
+        state,
+        cur_pos,
+        last_committed,
+        eos_token_id,
+        k,
     )
 }
 
@@ -1670,7 +2178,10 @@ pub fn spec_step_mtp(
     // HIPFIRE_MTP_TAPE_REPLAY=0 forces the original full-replay path (A/B gate).
     let use_tape_replay = tape_captured
         && advance >= 2
-        && std::env::var("HIPFIRE_MTP_TAPE_REPLAY").ok().as_deref() != Some("0");
+        && hipfire_config::developer_var("HIPFIRE_MTP_TAPE_REPLAY")
+            .ok()
+            .as_deref()
+            != Some("0");
     state.trunk_snap.restore_to(&mut target.dn_state, gpu)?;
     if use_tape_replay {
         // Batched verify populated the tape this cycle — cheap GDN-only replay.
@@ -2282,6 +2793,8 @@ fn mtp_sampled_accept(
 // times instead of 1 batched, costing extra launch overhead and per-step
 // argmax+D2H. On a 248K-vocab model this is dwarfed by the BW savings.
 // On smaller-vocab models the lossy batched path may still be faster.
+/// Legacy entry: drafts `state.max_n` candidates. Prefer
+/// [`spec_step_mtp_compressed_serial_with_k`] when a per-call budget is known.
 #[allow(clippy::too_many_arguments)]
 pub fn spec_step_mtp_compressed_serial(
     gpu: &mut Gpu,
@@ -2292,7 +2805,35 @@ pub fn spec_step_mtp_compressed_serial(
     last_committed: u32,
     eos_token_id: u32,
 ) -> HipResult<MtpSpecResult> {
-    let max_n = state.max_n;
+    let k = state.max_n;
+    spec_step_mtp_compressed_serial_with_k(
+        gpu,
+        target,
+        head,
+        state,
+        cur_pos,
+        last_committed,
+        eos_token_id,
+        k,
+    )
+}
+
+/// Budget-aware compressed-serial MTP step: draft at most `k` candidates.
+/// `k == 0` verifies `[last_committed]` only and emits the single bonus token.
+#[allow(clippy::too_many_arguments)]
+pub fn spec_step_mtp_compressed_serial_with_k(
+    gpu: &mut Gpu,
+    target: &mut ModelSlot,
+    head: &Qwen35MtpHead,
+    state: &mut MtpSpecState,
+    cur_pos: usize,
+    last_committed: u32,
+    eos_token_id: u32,
+    k: usize,
+) -> HipResult<MtpSpecResult> {
+    // Per-call k is authoritative (remaining max_emit from MtpSpeculator). Never
+    // draft more than state.max_n, and k==0 means verify [seed] only + bonus.
+    let max_n = k.min(state.max_n);
     let dim = target.config.dim;
     let vocab = target.config.vocab_size;
     let trunk_weights: &Qwen35Weights = &target.weights;
@@ -2421,7 +2962,10 @@ pub fn spec_step_mtp_compressed_serial(
         (true, false) => DraftMode::Greedy,
     };
     let use_p_min = matches!(draft_mode, DraftMode::PMin { .. });
-    let use_sampling = matches!(draft_mode, DraftMode::Sampled | DraftMode::SampledPMin { .. });
+    let use_sampling = matches!(
+        draft_mode,
+        DraftMode::Sampled | DraftMode::SampledPMin { .. }
+    );
     let use_sampled_pmin = matches!(draft_mode, DraftMode::SampledPMin { .. });
     let log_p_min = match draft_mode {
         DraftMode::PMin { log_p_min } | DraftMode::SampledPMin { log_p_min } => log_p_min,
@@ -2453,7 +2997,10 @@ pub fn spec_step_mtp_compressed_serial(
     } else {
         Vec::new()
     };
-    let use_device_token_chain = mtp_device_token_chain_enabled_from_env()
+    // k==0 one-token path: never run device-token chain / proposal graph
+    // (both assume max_n ≥ 1 for candidate buffer views).
+    let use_device_token_chain = max_n > 0
+        && mtp_device_token_chain_enabled_from_env()
         && mtp_device_token_chain_eligible_for(trunk_weights.embd_format, use_sampling, use_p_min);
     if use_device_token_chain && !use_full_vocab {
         assert!(
@@ -2462,7 +3009,8 @@ pub fn spec_step_mtp_compressed_serial(
         );
     }
     let proposal_graph_policy = mtp_proposal_graph_policy_from_env();
-    let use_proposal_graph = !state.mtp_proposal_graph_disabled
+    let use_proposal_graph = max_n > 0
+        && !state.mtp_proposal_graph_disabled
         && mtp_proposal_graph_eligible_for(
             proposal_graph_policy,
             use_device_token_chain,
@@ -2900,366 +3448,232 @@ pub fn spec_step_mtp_compressed_serial(
         candidates.len()
     };
 
-    // ── 2. Trunk verify ───────────────────────────────────────────────────
-    let mut verify_tokens: Vec<u32> = Vec::with_capacity(max_n + 1);
-    verify_tokens.push(last_committed);
-    verify_tokens.extend_from_slice(&candidates);
-    let n_verify = verify_tokens.len();
-
-    if overlap_trunk_snap {
-        gpu.hip
-            .stream_synchronize(state.trunk_snap_stream.as_ref().unwrap())?;
-    } else {
-        state.trunk_snap.save_from(&target.dn_state, gpu)?;
-    }
-
-    // GDN-tape capture happens only when the verify takes the batched (PBS)
-    // path; otherwise the forward silently drops to a tape-less per-token loop
-    // and the persistent `trunk_gdn_tape` is left stale — replaying it at
-    // rollback corrupts dn_state.conv_states. Capture eligibility is broader
-    // than MoE-ness: a non-Q8 kv-mode (dn_state.quant != Q8), a non-batchable
-    // weight dtype, or the HIPFIRE_PREFILL_BATCHED=0 escape hatch all force the
-    // per-token fallback even on a dense trunk. Gate on the forward's OWN
-    // eligibility predicate (single source of truth) so the rollback's
-    // cheap-vs-full replay choice tracks exactly whether the tape was written
-    // this cycle, and pass the tape only when it will actually be captured.
-    let tape_captured = qwen35::prefill_batch_pbs_eligible(
-        trunk_weights,
-        &target.config,
-        &target.dn_state,
-        n_verify,
-        gpu.arch.as_str(),
-        /* moe_router_logits_present — dense trunk: arm never matched */ true,
-    );
-    let verify_tape: Option<&mut GdnTape> = if tape_captured {
-        Some(&mut state.trunk_gdn_tape)
-    } else {
-        None
-    };
-
-    qwen35::forward_prefill_batch_with_pbs_opts(
+    // ── 2. Trunk verify + accept + rollback shared with external path ──
+    // Head proposal (including device-token chain / proposal graph) is
+    // complete; verify is delegated to the shared tail so both entry
+    // points stay byte-identical on the verify side. Sampled head path
+    // stays host-driven via mtp_sampled_accept; greedy head path may use
+    // the device-chain GPU accept when enabled.
+    return mtp_shared_verify_accept_rollback(
         gpu,
-        trunk_weights,
-        &target.config,
-        &verify_tokens,
+        target,
+        state,
         cur_pos,
-        &mut target.kv_cache,
-        &mut target.dn_state,
-        &target.scratch,
-        None,
-        Some(&state.verify_hidden),
-        verify_tape,
-        None,
-        Some(&state.trunk_pbs),
-        None,  // mask_override
-        None,  // max_layer
-        false, // MTP computes all verify logits from verify_hidden below
-    )?;
-
-    let w_out = &trunk_weights.output;
-    let logits_view = state.verify_logits.sub_offset(0, n_verify * vocab);
-    match w_out.gpu_dtype {
-        DType::Q8_0 => {
-            if mtp_q8_verify_wmma_enabled_from_env() {
-                gpu.gemm_q8_0_batched_chunked(
-                    &w_out.buf,
-                    &state.verify_hidden,
-                    &logits_view,
-                    w_out.m,
-                    w_out.k,
-                    n_verify,
-                )?;
-            } else {
-                gpu.gemm_q8_0_batched(
-                    &w_out.buf,
-                    &state.verify_hidden,
-                    &logits_view,
-                    w_out.m,
-                    w_out.k,
-                    n_verify,
-                )?;
-            }
-        }
-        DType::HFQ4G256 => {
-            gpu.gemm_hfq4g256_batched_lmhead(
-                &w_out.buf,
-                &state.verify_hidden,
-                &logits_view,
-                w_out.m,
-                w_out.k,
-                n_verify,
-            )?;
-        }
-        DType::MQ4G256 => {
-            let rot = state.verify_rot.sub_offset(0, n_verify * w_out.k);
-            llama::rotate_x_mq_batched_for(
-                gpu,
-                w_out,
-                &state.verify_hidden,
-                &rot,
-                w_out.k,
-                n_verify,
-            )?;
-            gpu.gemm_hfq4g256_batched_lmhead(
-                &w_out.buf,
-                &rot,
-                &logits_view,
-                w_out.m,
-                w_out.k,
-                n_verify,
-            )?;
-        }
-        DType::MQ3G256 => {
-            let rot = state.verify_rot.sub_offset(0, n_verify * w_out.k);
-            llama::rotate_x_mq_batched_for(
-                gpu,
-                w_out,
-                &state.verify_hidden,
-                &rot,
-                w_out.k,
-                n_verify,
-            )?;
-            gpu.gemm_hfq3g256_batched_lmhead(
-                &w_out.buf,
-                &rot,
-                &logits_view,
-                w_out.m,
-                w_out.k,
-                n_verify,
-            )?;
-        }
-        DType::HFQ6G256 => {
-            gpu.gemm_hfq6g256_batched_lmhead(
-                &w_out.buf,
-                &state.verify_hidden,
-                &logits_view,
-                w_out.m,
-                w_out.k,
-                n_verify,
-            )?;
-        }
-        DType::MQ6G256 => {
-            let rot = state.verify_rot.sub_offset(0, n_verify * w_out.k);
-            llama::rotate_x_mq_batched_for(
-                gpu,
-                w_out,
-                &state.verify_hidden,
-                &rot,
-                w_out.k,
-                n_verify,
-            )?;
-            gpu.gemm_hfq6g256_batched_lmhead(
-                &w_out.buf,
-                &rot,
-                &logits_view,
-                w_out.m,
-                w_out.k,
-                n_verify,
-            )?;
-        }
-        _ => {
-            for i in 0..n_verify {
-                let row = state.verify_hidden.sub_offset(i * dim, dim);
-                let logits_row = state.verify_logits.sub_offset(i * vocab, vocab);
-                llama::weight_gemv(gpu, w_out, &row, &logits_row)?;
-            }
-        }
-    }
-
-    let mut accept_count = 0usize;
-    // Assigned exactly once in each arm below (sampled accept returns it; the
-    // legacy arm copies it out of the accept result), so no dead initializer.
-    let hit_eos;
-    let mut committed: Vec<u32> = Vec::with_capacity(drafts_generated + 1);
-
-    if use_sampling {
-        // ── F5c: distribution-preserving sampled accept (full-vocab) ──
-        //
-        // Replaces the prior GPU-gather residual approximation (un-truncated
-        // p_target/p_draft accept ratio + sample_top_p bonus over raw verify
-        // logits) with the proven, coherence-validated DFlash convention
-        // (speculative.rs:3728-3855): INDEPENDENT per-side nuclei, accept
-        // `u*p_d <= p_t` over TRUNCATED probs, and a residual bonus drawn from
-        // (target_nucleus − draft_nucleus)₊. The old approximation gathered
-        // p_draft over the UN-truncated softmax while the draft was sampled from
-        // a nucleus — a mismatch that can silently ship a token attractor.
-        //
-        // Mode-agnostic: candidates[k] is the full trunk token id in BOTH full
-        // and compressed modes (compressed drafts remapped via vocab_map at
-        // proposal time), and draft_softmaxes are full-vocab width (compressed
-        // nuclei embedded above), so the accept rule needs no use_full_vocab gate.
-        hit_eos = mtp_sampled_accept(
-            gpu,
-            state,
-            &logits_view,
-            &draft_softmaxes,
-            &draft_probs,
-            &candidates,
-            drafts_generated,
-            vocab,
-            sampling.temp,
-            sampling.top_p,
-            sampling.top_k,
-            sampling.min_p,
-            eos_token_id,
-            &mut committed,
-            &mut accept_count,
-        )?;
-    } else {
-        // ── Legacy greedy / argmax-match accept rule ─────────────────────
-        let argmax_v = state.verify_argmax.sub_offset(0, n_verify);
-        gpu.argmax_f32_batched(&logits_view, &argmax_v, vocab, n_verify)?;
-
-        let use_gpu_accept = use_device_token_chain && mtp_gpu_greedy_accept_enabled_from_env();
-        let accepted = if use_gpu_accept {
-            let candidate_device = state.mtp_token_chain.sub_offset(1, drafts_generated);
-            let accept_result = state.verify_argmax.sub_offset(0, 2);
-            gpu.greedy_accept_from_argmax_i32(
-                &argmax_v,
-                &candidate_device,
-                &accept_result,
-                drafts_generated,
-                eos_token_id,
-            )?;
-            let mut accept_host: [i32; 2] = [0, 0];
-            {
-                let bytes: &mut [u8] = unsafe {
-                    std::slice::from_raw_parts_mut(accept_host.as_mut_ptr() as *mut u8, 8)
-                };
-                gpu.hip.memcpy_dtoh(bytes, &accept_result.buf)?;
-            }
-            assemble_greedy_accept_from_gpu_result(
-                &candidates[..drafts_generated],
-                accept_host[0] as usize,
-                accept_host[1],
-                eos_token_id,
-            )
-        } else {
-            let mut argmax_v_host: Vec<i32> = vec![0; n_verify];
-            {
-                let bytes: &mut [u8] = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        argmax_v_host.as_mut_ptr() as *mut u8,
-                        n_verify * 4,
-                    )
-                };
-                gpu.hip.memcpy_dtoh(bytes, &argmax_v.buf)?;
-            }
-            let argmax_per_pos: Vec<u32> = argmax_v_host.into_iter().map(|x| x as u32).collect();
-            greedy_trunk_spine_accept(
-                &candidates[..drafts_generated],
-                &argmax_per_pos,
-                eos_token_id,
-            )
-        };
-        committed = accepted.committed;
-        accept_count = accepted.accept_count;
-        hit_eos = accepted.hit_eos;
-    }
-
-    let advance = committed.len();
-    debug_assert!(advance >= 1 && advance <= drafts_generated + 1);
-
-    // h_idx contract (audited 2026-05-21 vs AtomicBot atomic-llama-cpp-
-    // turboquant feature/turboquant-kv-cache): prev_hidden_row = advance - 1
-    // = accept_count IS the right index. It points to verify_hidden of the
-    // last position trunk evaluated whose argmax IS the committed bonus
-    // token. AtomicBot's common_speculative_set_h_idx is called with
-    // `ids.size() - 1 == n_accepted_drafts` which is the same index.
-    // Empirical sensitivity (canonical K=2 p=0.65 max=480): offset 0 = 60.7
-    // tok/s tau=2.74; offset ±1 collapses to 17-45 tok/s. Default is sharp.
-    let prev_hidden_row = advance - 1;
-    state.capture_prev_hidden_from_verify_row(gpu, prev_hidden_row, dim)?;
-
-    // ── 3. KV / DN rollback (or skip on full accept) ──────────────────────
-    //
-    // Rollback is REDUNDANT when advance == drafts_generated + 1 (full
-    // accept, no EOS, no chain truncation matters): verify's forward
-    // already left DN state advanced by `drafts_generated + 1` steps from
-    // the snapshot, which is exactly where replay would land. KV cache
-    // slots `cur_pos..cur_pos + drafts_generated` are also already
-    // populated identically (rollback would write the same tokens to the
-    // same slots).
-    //
-    // For partial accepts, use the same GDN innovation-tape repair that
-    // DFlash uses: restore the pre-verify DeltaNet state, then replay only
-    // conv/GDN recurrence for the accepted prefix. Full trunk forward replay
-    // was the dominant non-verify cost in the MTP cycle.
-    //
-    // The trunk_snap save is still made unconditionally (we don't know
-    // advance until verify completes). An opt-in side-stream path can start
-    // it before proposal and wait before verify; only the restore + tape
-    // replay are gated.
-    //
-    // On EOS we still take the replay branch: even though no further
-    // forwards happen, the caller's KV cache must reflect ONLY the
-    // committed prefix (some of which may have been rejected/truncated
-    // before the EOS-bearing token was committed).
-    let full_accept_no_eos = advance == drafts_generated + 1 && !hit_eos;
-    let replay_skipped = full_accept_no_eos;
-    if !full_accept_no_eos {
-        state.trunk_snap.restore_to(&mut target.dn_state, gpu)?;
-        if tape_captured {
-            // The batched verify populated the tape this cycle — cheap GDN-only replay.
-            state.trunk_gdn_tape.replay_gdn(
-                gpu,
-                trunk_weights,
-                &target.config,
-                &mut target.dn_state,
-                advance,
-            )?;
-        } else {
-            // The verify took the tape-less per-token fallback (non-Q8 kv-mode,
-            // non-batchable weight dtype, MoE trunk, or HIPFIRE_PREFILL_BATCHED=0),
-            // so the persistent tape is stale. Do the original always-correct
-            // full-trunk replay of the committed prefix — one batched forward,
-            // or a single forward_scratch for advance==1.
-            if advance >= 2 {
-                let replay = &verify_tokens[..advance];
-                qwen35::forward_prefill_batch(
-                    gpu,
-                    trunk_weights,
-                    &target.config,
-                    replay,
-                    cur_pos,
-                    &mut target.kv_cache,
-                    &mut target.dn_state,
-                    &target.scratch,
-                    None,
-                    None,
-                    None,
-                    None,
-                )?;
-            } else {
-                gpu.graphs.ar_graph_eligible = false; // spec re-seed: never the plain-AR graph
-                qwen35::forward_scratch(
-                    gpu,
-                    trunk_weights,
-                    &target.config,
-                    verify_tokens[0],
-                    cur_pos,
-                    &mut target.kv_cache,
-                    &mut target.dn_state,
-                    &target.scratch,
-                )?;
-            }
-        }
-    }
-
-    Ok(MtpSpecResult {
-        committed,
-        accept_count,
-        hit_eos,
-        advance,
+        last_committed,
+        eos_token_id,
+        &candidates,
         drafts_generated,
         chain_truncated,
-        replay_skipped,
-    })
+        overlap_trunk_snap,
+        use_sampling,
+        sampling,
+        &draft_probs,
+        &draft_softmaxes,
+        false,
+        use_device_token_chain,
+    );
 }
+
+/// External ngram-mod/PLD candidate verify with MTP retire-on-accept.
+///
+/// Greedy-lossless, MTP-head-bypass path. The daemon supplies a non-empty
+/// greedy candidate window `candidates` (already filtered for length
+/// `<= state.verify_capacity` and temp==0). Native MTP remains state/loop
+/// owner until the first positive external acceptance, after which MTP is
+/// irreversibly retired for the request.
+///
+/// * Bypasses all head proposal / graph / device-chain work.
+/// * Uses greedy trunk acceptance (`chain_truncated=false`).
+/// * Sets `drafts_generated = candidates.len()` and `chain_truncated=false`.
+/// * Before shared verify, snapshots pre-window `state.prev_hidden` into
+///   `mtp_t_outs` row 0 **only when MTP is not already retired** (needed for
+///   the zero-accept single-row repair). When already retired the snapshot is
+///   skipped — no repair will run.
+/// * After shared verify/rollback:
+///   - `mtp_already_retired || accept_count > 0` → **zero** MTP-head forwards
+///     (no O(accepted) multi-row repair). Caller must latch retirement on any
+///     `accept_count > 0`.
+///   - not retired and `accept_count == 0` → repair exactly the one committed
+///     input row (`last_committed` at `cur_pos`) with the saved pre-window
+///     hidden; `advance` must be 1 (bonus-only). Leaves native MTP state
+///     aligned for a subsequent native MTP cycle.
+///
+/// Caller invariant: any positive external acceptance irreversibly retires
+/// MTP. Subsequent calls pass `mtp_already_retired = true` and must not rely
+/// on MTP private KV staying warm.
+///
+/// External candidates must be non-empty, greedy, and `len <= state.verify_capacity`.
+/// Panics if those bounds are violated so daemon bugs surface loudly.
+#[allow(clippy::too_many_arguments)]
+pub fn spec_step_mtp_compressed_serial_with_takeover_candidates(
+    gpu: &mut Gpu,
+    target: &mut ModelSlot,
+    head: &Qwen35MtpHead,
+    state: &mut MtpSpecState,
+    cur_pos: usize,
+    last_committed: u32,
+    eos_token_id: u32,
+    candidates: &[u32],
+    mtp_already_retired: bool,
+) -> HipResult<MtpSpecResult> {
+    assert!(
+        mtp_external_candidates_within_capacity(candidates, state.verify_capacity),
+        "spec_step_mtp_compressed_serial_with_takeover_candidates: candidates len {} out of bounds (must be 1..=verify_capacity {}, verify_capacity={}, max_n={})",
+        candidates.len(),
+        state.verify_capacity,
+        state.verify_capacity,
+        state.max_n
+    );
+    assert!(
+        state.sampling.is_greedy(),
+        "spec_step_mtp_compressed_serial_with_takeover_candidates requires greedy sampling"
+    );
+    assert!(
+        candidates
+            .iter()
+            .all(|&token| (token as usize) < target.config.vocab_size),
+        "spec_step_mtp_compressed_serial_with_takeover_candidates: candidate token out of vocabulary"
+    );
+    let verify_end = cur_pos
+        .checked_add(candidates.len() + 1)
+        .expect("spec_step_mtp_compressed_serial_with_takeover_candidates: position overflow");
+    assert!(
+        verify_end <= state.mtp_kv.max_seq,
+        "spec_step_mtp_compressed_serial_with_takeover_candidates: verify end {verify_end} exceeds MTP KV capacity {}",
+        state.mtp_kv.max_seq
+    );
+
+    // No proposal work exists to overlap with the snapshot on this path.
+    // Force the shared verifier to take a fresh synchronous snapshot.
+    let overlap_trunk_snap = false;
+
+    let drafts_generated = candidates.len();
+    let chain_truncated = false;
+
+    let dim = target.config.dim;
+    let dim_bytes = dim * 4;
+
+    // Shared verify overwrites `state.prev_hidden` with verify row advance-1.
+    // Snapshot the pre-window partner into `mtp_t_outs` row 0 only when MTP
+    // is still live (zero-accept path needs it for single-row repair).
+    // Device D2D; no host round-trip. `mtp_t_outs` is proposal-only and
+    // unused by the external shared path — safe scratch of size `dim`.
+    if !mtp_already_retired {
+        gpu.hip.memcpy_dtod_at(
+            &state.mtp_t_outs.buf,
+            0,
+            &state.prev_hidden.buf,
+            0,
+            dim_bytes,
+        )?;
+    }
+
+    // Shared greedy verify/accept/rollback. Sampling is forced greedy for
+    // external windows even if state.sampling.temp > 0 (daemon guarantees
+    // temp==0 for ngram/PLD hits; this keeps core lossless).
+    let mut result = mtp_shared_verify_accept_rollback(
+        gpu,
+        target,
+        state,
+        cur_pos,
+        last_committed,
+        eos_token_id,
+        candidates,
+        drafts_generated,
+        chain_truncated,
+        overlap_trunk_snap,
+        false,
+        MtpSamplingConfig::default(),
+        &[],
+        &[],
+        true,
+        false,
+    )?;
+
+    // Retire-on-accept: any accept_count>0 (or already-retired) skips all
+    // MTP-head repair. Zero-accept pre-takeover repairs only last_committed
+    // at cur_pos so native MTP stays aligned for the next cycle.
+    let repair_forwards =
+        mtp_takeover_kv_repair_forwards(mtp_already_retired, result.accept_count);
+    if repair_forwards > 0 {
+        debug_assert_eq!(
+            repair_forwards, 1,
+            "takeover repair is single-row only"
+        );
+        assert_eq!(
+            result.advance, 1,
+            "spec_step_mtp_compressed_serial_with_takeover_candidates: zero-accept must advance by bonus only (advance={})",
+            result.advance
+        );
+        let trunk_weights: &Qwen35Weights = &target.weights;
+        // Single committed input row: last_committed @ cur_pos with the
+        // pre-window prev_hidden saved in mtp_t_outs row 0.
+        let hidden_ref = state.mtp_t_outs.sub_offset(0, dim);
+        mtp_head::mtp_head_forward_block_only(
+            gpu,
+            head,
+            &state.mtp_scratch,
+            &mut state.mtp_kv,
+            last_committed,
+            &hidden_ref,
+            None,
+            cur_pos,
+            trunk_weights,
+        )?;
+    }
+
+    // External path is always greedy and not truncated; ensure result fields
+    // cohere even if shared helper drifted.
+    result.drafts_generated = drafts_generated;
+    result.chain_truncated = false;
+    Ok(result)
+}
+
+
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mtp_prefill_boundaries_chunk_at_prefill_max_batch() {
+        let b = mtp_prefill_committed_boundaries(600, 0, qwen35::PREFILL_MAX_BATCH);
+        assert_eq!(
+            b,
+            vec![256, 512, 600],
+            "adaptive maybe_downshift must see every committed end ≤ PREFILL_MAX_BATCH apart"
+        );
+        // Empty prompt → no boundaries (no KV writes).
+        assert!(mtp_prefill_committed_boundaries(0, 0, qwen35::PREFILL_MAX_BATCH).is_empty());
+        // start_pos offset is absolute trunk position.
+        assert_eq!(
+            mtp_prefill_committed_boundaries(300, 10, 256),
+            vec![266, 310]
+        );
+        // Single short chunk → one boundary at full length.
+        assert_eq!(
+            mtp_prefill_committed_boundaries(40, 0, qwen35::PREFILL_MAX_BATCH),
+            vec![40]
+        );
+    }
+
+    #[test]
+    fn mtp_prefill_boundaries_never_exceed_chunk_stride() {
+        let chunk = qwen35::PREFILL_MAX_BATCH;
+        let bounds = mtp_prefill_committed_boundaries(10_000, 0, chunk);
+        let mut prev = 0usize;
+        for &pos in &bounds {
+            assert!(pos > prev);
+            assert!(
+                pos - prev <= chunk,
+                "boundary gap {} exceeds chunk_max {}",
+                pos - prev,
+                chunk
+            );
+            prev = pos;
+        }
+        assert_eq!(*bounds.last().unwrap(), 10_000);
+    }
 
     #[test]
     fn trunk_spine_verify_tokens_are_seed_plus_candidates() {
@@ -3402,5 +3816,47 @@ mod tests {
         assert_eq!(mtp_proposal_graph_seq_cap(27, 5, 4096), 256);
         assert_eq!(mtp_proposal_graph_seq_cap(260, 5, 4096), 512);
         assert_eq!(mtp_proposal_graph_seq_cap(3000, 5, 4096), 4096);
+    }
+
+    #[test]
+    fn external_candidates_within_capacity_bounds() {
+        // Pure bound check — no GPU.
+        assert!(!mtp_external_candidates_within_capacity(&[], 4));
+        assert!(mtp_external_candidates_within_capacity(&[1], 4));
+        assert!(mtp_external_candidates_within_capacity(&[1, 2, 3, 4], 4));
+        assert!(!mtp_external_candidates_within_capacity(&[1, 2, 3, 4, 5], 4));
+        assert!(!mtp_external_candidates_within_capacity(&[], 0));
+        // verify_capacity vs max_n: external window may be larger than max_n.
+        // e.g., max_n=2, verify_capacity=5 allows 5 candidates.
+        assert!(mtp_external_candidates_within_capacity(&[1, 2, 3, 4, 5], 5));
+        assert!(!mtp_external_candidates_within_capacity(&[1, 2, 3, 4, 5, 6], 5));
+    }
+
+    #[test]
+    fn assemble_verify_tokens_is_seed_plus_candidates() {
+        assert_eq!(mtp_assemble_verify_tokens(99, &[]), vec![99]);
+        assert_eq!(mtp_assemble_verify_tokens(7, &[1, 2, 3]), vec![7, 1, 2, 3]);
+        // matches build_trunk_spine_verify_tokens contract
+        assert_eq!(
+            mtp_assemble_verify_tokens(42, &[7, 8, 9]),
+            build_trunk_spine_verify_tokens(42, &[7, 8, 9])
+        );
+    }
+
+    #[test]
+    fn takeover_kv_repair_policy_retired_and_accept() {
+        // Already retired → never repair, regardless of accept_count.
+        assert_eq!(mtp_takeover_kv_repair_forwards(true, 0), 0);
+        assert_eq!(mtp_takeover_kv_repair_forwards(true, 1), 0);
+        assert_eq!(mtp_takeover_kv_repair_forwards(true, 7), 0);
+
+        // Live MTP + positive external accept → retire, zero forwards
+        // (no O(accepted) multi-row repair).
+        assert_eq!(mtp_takeover_kv_repair_forwards(false, 1), 0);
+        assert_eq!(mtp_takeover_kv_repair_forwards(false, 3), 0);
+        assert_eq!(mtp_takeover_kv_repair_forwards(false, 64), 0);
+
+        // Live MTP + zero accept → single-row repair of last_committed only.
+        assert_eq!(mtp_takeover_kv_repair_forwards(false, 0), 1);
     }
 }

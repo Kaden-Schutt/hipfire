@@ -5,12 +5,13 @@ name: CI
 # hipfire loads the HIP/ROCm runtime via dlopen at *runtime* (see
 # crates/hip-bridge — libloading, no build.rs, no link-time -lamdhip64),
 # so the entire workspace compiles and unit-tests on a stock runner with
-# no GPU and no ROCm installed. The GPU-bound gates (test_kernels,
-# coherence-gate.sh, serve-multiturn-gate.sh, speed-gate.sh) need real RDNA
-# hardware and run on a self-hosted runner instead — see
-# .github/workflows/gpu-gates.yml (TODO). serve-multiturn-gate.sh is the
-# multi-request serve-output guard for the #462-class regression (recurrent
-# state bleeding across requests) that single-request gates structurally miss.
+# no GPU and no ROCm installed. The GPU-bound gates need real RDNA
+# hardware and are run MANUALLY from a checkout — see docs/VALIDATION.md
+# and scripts/gates.sh. The agentic CI gate workflows (claude-review.yml,
+# gpu-gates.yml, gate-merge.yml, gate-sweep.yml) were removed; they were
+# never reached on the release line and are being replaced by a
+# cheaper, provider-agnostic reviewer. Do not reintroduce a self-hosted
+# GPU gate workflow without a matching validation-policy update.
 #
 # Required vs advisory: `build` and `test` are the load-bearing
 # "is it broken" gates and are intended to be required status checks on
@@ -74,14 +75,30 @@ jobs:
         # GPU runner and are intentionally excluded here.
         run: cargo test --lib --workspace --locked
 
+  supply-chain:
+    name: cargo-deny (${{ matrix.checks }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        checks:
+          - advisories
+          - bans licenses sources
+    # A newly published advisory should be visible immediately without making
+    # an unrelated PR unmergeable. License, source, and ban policy is blocking.
+    continue-on-error: ${{ matrix.checks == 'advisories' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check ${{ matrix.checks }}
+
   fmt:
     name: rustfmt (advisory)
     runs-on: ubuntu-latest
     # Truly advisory: on pushes, ci-rustfmt-changed diffs vs master and surfaces
     # the whole dispatch-effort format backlog (Kevin's in-flight files included),
-    # so this is expected-red until the cleanup pass. Don't fail the run — green
-    # must mean the load-bearing build+test gates pass.
-    continue-on-error: true
+    # so keep the step visible without making the job's status check red.
     steps:
       - uses: actions/checkout@v4
         with:
@@ -90,6 +107,7 @@ jobs:
         with:
           components: rustfmt
       - run: bash scripts/ci-rustfmt-changed.sh
+        continue-on-error: true
 
   clippy:
     name: clippy (advisory)

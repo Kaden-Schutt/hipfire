@@ -1,0 +1,44 @@
+{
+  "label": "depth-64",
+  "text": "This is a technical, production-grade breakdown of the inference path for a **DeepSeV4-Flash-style MoE model** on an **AMD MI300",
+  "text_sha256": "b74666fe3ef9042c9e863f1854ff05741df890c8f08c04fbe64cc457dab09ea2",
+  "prompt": "User: I need a production-grade explanation of ordinary batch-1 autoregressive decode on a DeepSeek V4 Flash style mixture-of-experts model running on AMD Instinct MI300X (gfx942). Please treat this as a measurement contract discussion rather than marketing. Cover the end-to-end path from a frozen p",
+  "prompt_sha256": "977589f24827f890c2ce3dc52a51fb349772b3f962044e1a274a6ac53e641ab9",
+  "max_tokens": 32,
+  "temperature": 0.0,
+  "done": {
+    "type": "commit_ready",
+    "id": "g0-depth-64",
+    "tokens": 32,
+    "tok_s": 35.35911602209945,
+    "prompt_tokens": 69,
+    "prefill_tokens": 69,
+    "cached_tokens": 0,
+    "prefill_ms": 860,
+    "total_ms": 1765,
+    "finish_reason": "length",
+    "drafter": "ar",
+    "attempt_id": 1
+  },
+  "terminal": {
+    "type": "aborted",
+    "id": "g0-depth-64",
+    "reason": "client_cancelled",
+    "attempt_id": 1
+  },
+  "loaded": {
+    "type": "loaded",
+    "arch": "deepseek4",
+    "dim": 0,
+    "layers": 0,
+    "vocab": 0,
+    "vl": false,
+    "cache_capable": true,
+    "retry_reset_eligible": false
+  },
+  "elapsed_gen_s": 31.771700859069824,
+  "elapsed_load_s": 74.59627413749695,
+  "n_token_events": 28,
+  "daemon_bin": "/mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/target/release/examples/daemon",
+  "model": "/mnt/scratch/models/deepseek-v4-flash-mq2r/deepseek-v4-flash.mq2r"
+}

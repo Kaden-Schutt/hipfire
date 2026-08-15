@@ -45,6 +45,7 @@ use hipfire_runtime::llama::{
     attention_family, f16_to_f32, f32_to_f16, DispatchCtx, FullAttnParams, KernelKey, ShapeInfo,
 };
 use hipfire_runtime::model_source::ModelSource;
+use hipfire_runtime::MmqScreenable;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 // ─── Config ─────────────────────────────────────────────────────────────
@@ -374,6 +375,14 @@ impl DotsVisionWeights {
 pub struct DotsOcrWeights {
     pub text: Qwen2Weights,
     pub vision: DotsVisionWeights,
+}
+
+impl MmqScreenable for DotsOcrWeights {
+    fn screen_mmq_weights(&self, gpu: &mut Gpu) -> (usize, usize) {
+        // The vision tower is F16-only; all MMQ-eligible tensors are in the
+        // Qwen2 text model.
+        self.text.screen_mmq_weights(gpu)
+    }
 }
 
 impl DotsOcrWeights {
@@ -1307,9 +1316,10 @@ pub fn vision_forward(
     // names match `benchmarks/references/dots_ocr_smoke_001_activations/`:
     // patch_embed, block_00, block_21, block_41, post_trunk_norm, merger.
     // Each is written as a NumPy `.npy` file in native row-major F32.
-    let dump_dir: Option<std::path::PathBuf> = std::env::var("HIPFIRE_DOTS_OCR_DUMP_DIR")
-        .ok()
-        .map(std::path::PathBuf::from);
+    let dump_dir: Option<std::path::PathBuf> =
+        hipfire_config::developer_var("HIPFIRE_DOTS_OCR_DUMP_DIR")
+            .ok()
+            .map(std::path::PathBuf::from);
     if let Some(ref d) = dump_dir {
         std::fs::create_dir_all(d).map_err(|e| {
             hip_bridge::HipError::new(0, &format!("dump_dir mkdir {}: {e}", d.display()))
@@ -1342,7 +1352,10 @@ pub fn vision_forward(
     //
     // patch_embed_w on GPU is the 4-D conv weight flattened to a
     // `[embed_dim, patch_dim]` linear (verified during load).
-    let trace_pre = std::env::var("HIPFIRE_DOTS_OCR_TRACE").ok().as_deref() == Some("1");
+    let trace_pre = hipfire_config::developer_var("HIPFIRE_DOTS_OCR_TRACE")
+        .ok()
+        .as_deref()
+        == Some("1");
     let dump_stats = |gpu: &Gpu, t: &GpuTensor, label: &str| -> HipResult<()> {
         if !trace_pre {
             return Ok(());
@@ -1405,7 +1418,7 @@ pub fn vision_forward(
     // residual stream is bf16-precision throughout. Emulate that by
     // bf16-truncating at every block boundary (after each residual add).
     // Optional via env var so it can be A/B tested.
-    let bf16_residual = std::env::var("HIPFIRE_DOTS_OCR_BF16_RESIDUAL")
+    let bf16_residual = hipfire_config::developer_var("HIPFIRE_DOTS_OCR_BF16_RESIDUAL")
         .ok()
         .as_deref()
         == Some("1");
@@ -1435,7 +1448,10 @@ pub fn vision_forward(
     // the first failing kernel surfaces directly instead of via a sticky
     // error reported later (HIP errors are async-sticky — the call that
     // reports them is rarely the launch that caused them).
-    let trace = std::env::var("HIPFIRE_DOTS_OCR_TRACE").ok().as_deref() == Some("1");
+    let trace = hipfire_config::developer_var("HIPFIRE_DOTS_OCR_TRACE")
+        .ok()
+        .as_deref()
+        == Some("1");
     macro_rules! probe {
         ($gpu:expr, $msg:literal) => {
             if trace {

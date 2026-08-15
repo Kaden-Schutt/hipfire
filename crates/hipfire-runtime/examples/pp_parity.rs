@@ -74,7 +74,7 @@ fn run_single_gpu(path: &str) -> Vec<u32> {
     // leak fits inside the 2 GiB tolerance.
     scratch.free_gpu(&mut gpu);
     dn.free_gpu(&mut gpu);
-    kv.free_gpu(&mut gpu);
+    let _ = kv.free_gpu(&mut gpu);
     weights.free_gpu(&mut gpu);
     gpu.drain_pool();
     tokens

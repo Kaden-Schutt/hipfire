@@ -27,6 +27,14 @@ pub struct ScratchState {
     pub mq_x_rot_fp8_bytes: usize,
     pub mq_x_q8: Option<DeviceBuffer>,
     pub mq_x_scales: Option<DeviceBuffer>,
+    /// Persistent gfx1100 K=2048 RMSNorm+MQ state shared by the split and
+    /// wavegrid experiments. The wavegrid layout is eight f32 partials, one
+    /// f32 RMS value, and three u32 epoch counters, padded to 64 bytes; the
+    /// split path uses its first f32 as the RMS handoff.
+    pub mq_rmsnorm_wavegrid_scratch: Option<DeviceBuffer>,
+    /// Dedicated F32 temporary for the unfused GEMV-residual alias fallback.
+    /// Lazily allocated and grown on demand; no other scratch path uses it.
+    pub gemv_residual_tmp: Option<GpuTensor>,
     pub paro_x_scratch: Option<GpuTensor>,
     /// Rotation scratch buffers for PARO fused-kernel dispatch. 4 × [k] F32
     /// buffers, lazily allocated and grown on demand. Used by
@@ -71,6 +79,13 @@ pub(crate) fn compile_and_load_kernel(
     }
     let obj_path = compiler.compile(module_name, source)?;
     let obj_path_str = obj_path.to_str().unwrap().to_string();
+    // Alias the launched function name to this arch's compiled artifact so the
+    // retained-PM4 capture can resolve func_name -> owning .hsaco even when the
+    // arch-selected module name differs (e.g. gemv_hfq4g256_residual launched vs
+    // module gemv_hfq4g256_residual_rdna3 on RDNA3). Additive; no-op when equal.
+    if func_name != module_name {
+        compiler.register_func_artifact(func_name, std::path::PathBuf::from(&obj_path_str));
+    }
     if !modules.contains_key(module_name) {
         let module = module_load_or_recompile(hip, compiler, module_name, source, &obj_path_str)?;
         modules.insert(module_name.to_string(), module);
@@ -122,7 +137,7 @@ pub(crate) fn launch_maybe_blob(
     grid: [u32; 3],
     block: [u32; 3],
     shared_mem: u32,
-    params: &mut Vec<*mut c_void>,
+    params: &mut [*mut c_void],
     blob_builder: impl FnOnce() -> KernargBlob,
 ) -> HipResult<()> {
     if capture_mode || force_blob_path {
@@ -156,6 +171,70 @@ fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
 
 // ── ScratchState helpers ────────────────────────────────────────────────
 
+/// Grow a `Option<DeviceBuffer>` scratch slot to at least `needed` bytes,
+/// RELEASING the previous allocation.
+///
+/// `DeviceBuffer` has no `Drop` impl, so the natural-looking
+///
+/// ```ignore
+/// if self.foo_bytes < needed {
+///     self.foo = Some(hip.malloc(needed)?);
+///     self.foo_bytes = needed;
+/// }
+/// ```
+///
+/// silently leaks the old allocation on every growth step, for every
+/// architecture. These scratches are keyed on batch/context, so a serving
+/// session that sees a sequence of increasing shapes leaks one buffer per
+/// distinct larger shape.
+///
+/// Measured on gfx1100 (25.8 GB) before this fix, issuing requests with
+/// growing prompts and sampling VRAM between them: repeating the SAME shape
+/// cost +0.0 MB (the buffer is correctly reused), while each larger shape
+/// added its FULL size rather than the increment --
+/// +199.6, +411.1, +754.9, +1459.9, +2906.8 MB across five shapes, 5.7 GB
+/// retained. That is what pushed a multi-turn DFlash session into
+/// `hipMalloc: out of memory` on turn 3.
+///
+/// The old buffer may still be referenced by kernels already enqueued on the
+/// stream, and `HipRuntime::free` documents that the caller must ensure the
+/// buffer is idle, so synchronise before releasing. Growth is monotonic and
+/// bounded by the largest shape ever seen, so this sync is rare and its cost
+/// is irrelevant next to the allocation it replaces.
+///
+/// Frees BEFORE allocating: the whole point is to run when memory is tight,
+/// and holding both at once is what we are trying to avoid. On allocation
+/// failure the slot is left empty with a zero byte count, so the `?` in the
+/// caller returns before any `unwrap`, and a later call retries cleanly.
+fn grow_scratch_buffer(
+    hip: &HipRuntime,
+    slot: &mut Option<DeviceBuffer>,
+    have_bytes: &mut usize,
+    needed: usize,
+) -> HipResult<()> {
+    if *have_bytes >= needed && slot.is_some() {
+        return Ok(());
+    }
+    if let Some(old) = slot.take() {
+        if crate::graph::any_graph_captured() {
+            // A captured hipGraph embeds the pointers live at capture time, so
+            // releasing this buffer would make every later replay read freed
+            // memory. Measured: freeing here breaks qwen35 outright, every turn
+            // empty with `spec_step: HipError(700) ... reset_recurrent`. Retain
+            // it (the pre-existing behaviour) and let the process reclaim it.
+            std::mem::forget(old);
+        } else {
+            hip.device_synchronize()?;
+            let _ = hip.free(old);
+        }
+    }
+    *have_bytes = 0;
+    let fresh = hip.malloc(needed)?;
+    *slot = Some(fresh);
+    *have_bytes = needed;
+    Ok(())
+}
+
 impl ScratchState {
     /// Ensure the ksplit_det partials scratch is at least `n_bytes`, growing
     /// (never shrinking). Returns the device pointer. No init needed: every
@@ -165,10 +244,12 @@ impl ScratchState {
         hip: &HipRuntime,
         n_bytes: usize,
     ) -> HipResult<*mut c_void> {
-        if self.ksplit_det_partials_bytes < n_bytes {
-            self.ksplit_det_partials = Some(hip.malloc(n_bytes)?);
-            self.ksplit_det_partials_bytes = n_bytes;
-        }
+        grow_scratch_buffer(
+            hip,
+            &mut self.ksplit_det_partials,
+            &mut self.ksplit_det_partials_bytes,
+            n_bytes,
+        )?;
         Ok(self.ksplit_det_partials.as_ref().unwrap().as_ptr())
     }
 
@@ -181,11 +262,37 @@ impl ScratchState {
         hip: &HipRuntime,
         n_bytes: usize,
     ) -> HipResult<*mut c_void> {
-        if self.sample_partials_bytes < n_bytes {
-            self.sample_partials = Some(hip.malloc(n_bytes)?);
-            self.sample_partials_bytes = n_bytes;
-        }
+        grow_scratch_buffer(
+            hip,
+            &mut self.sample_partials,
+            &mut self.sample_partials_bytes,
+            n_bytes,
+        )?;
         Ok(self.sample_partials.as_ref().unwrap().as_ptr())
+    }
+
+    /// Ensure the dedicated GEMV-residual temporary can hold at least
+    /// `min_elems` F32 values, growing on demand and never shrinking.
+    pub fn ensure_gemv_residual_tmp(
+        &mut self,
+        hip: &HipRuntime,
+        device_id: i32,
+        min_elems: usize,
+    ) -> HipResult<&GpuTensor> {
+        crate::graph::bind_thread(hip, device_id)?;
+        let needed_bytes = min_elems * 4;
+        let needs_grow = self
+            .gemv_residual_tmp
+            .as_ref()
+            .map_or(true, |tmp| tmp.buf.size() < needed_bytes);
+        if needs_grow {
+            self.gemv_residual_tmp = Some(GpuTensor {
+                buf: hip.malloc(needed_bytes)?,
+                shape: vec![min_elems],
+                dtype: DType::F32,
+            });
+        }
+        Ok(self.gemv_residual_tmp.as_ref().unwrap())
     }
 
     /// Lazily initialize MagnumQuant FWHT sign tables (256 floats each, seeds 42 and 1042).
@@ -216,6 +323,21 @@ impl ScratchState {
         self.mq_x_rot = Some(x_rot);
         self.mq_x_q8 = Some(x_q8);
         self.mq_x_scales = Some(x_scales);
+        Ok(())
+    }
+
+    /// Lazily allocate and zero the persistent gfx1100 RMSNorm state.
+    pub fn ensure_mq_rmsnorm_wavegrid_scratch(
+        &mut self,
+        hip: &HipRuntime,
+        device_id: i32,
+    ) -> HipResult<()> {
+        crate::graph::bind_thread(hip, device_id)?;
+        if self.mq_rmsnorm_wavegrid_scratch.is_none() {
+            let scratch = hip.malloc(64)?;
+            hip.memset(&scratch, 0, 64)?;
+            self.mq_rmsnorm_wavegrid_scratch = Some(scratch);
+        }
         Ok(())
     }
 
@@ -347,10 +469,14 @@ impl ScratchState {
         let src_ptr = x.buf.as_ptr();
         let needed = n_elems * 2;
 
-        // Grow scratch if needed (never shrinks)
+        // Grow scratch if needed (never shrinks), releasing the old buffer.
         if self.fp16_x_scratch_bytes < needed {
-            self.fp16_x_scratch = Some(hip.malloc(needed)?);
-            self.fp16_x_scratch_bytes = needed;
+            grow_scratch_buffer(
+                hip,
+                &mut self.fp16_x_scratch,
+                &mut self.fp16_x_scratch_bytes,
+                needed,
+            )?;
             self.fp16_x_source_ptr = std::ptr::null_mut(); // force reconversion after realloc
         }
 
@@ -423,8 +549,12 @@ impl ScratchState {
 
         let needed = n_elems * 2;
         if self.fp16_x_scratch_bytes < needed {
-            self.fp16_x_scratch = Some(hip.malloc(needed)?);
-            self.fp16_x_scratch_bytes = needed;
+            grow_scratch_buffer(
+                hip,
+                &mut self.fp16_x_scratch,
+                &mut self.fp16_x_scratch_bytes,
+                needed,
+            )?;
             self.fp16_x_source_ptr = std::ptr::null_mut();
         }
 
@@ -494,8 +624,12 @@ impl ScratchState {
         let needed = n_elems; // 1 byte per element
 
         if self.fp8_x_scratch_bytes < needed {
-            self.fp8_x_scratch = Some(hip.malloc(needed)?);
-            self.fp8_x_scratch_bytes = needed;
+            grow_scratch_buffer(
+                hip,
+                &mut self.fp8_x_scratch,
+                &mut self.fp8_x_scratch_bytes,
+                needed,
+            )?;
             self.fp8_x_source_ptr = std::ptr::null_mut();
         }
 
@@ -571,10 +705,12 @@ impl ScratchState {
         let blocks_k = (k + 127) / 128;
         let block_q8_1_mmq_bytes = 144usize;
         let needed = blocks_k * batch_size * block_q8_1_mmq_bytes;
-        if self.q8_1_mmq_x_scratch_bytes < needed {
-            self.q8_1_mmq_x_scratch = Some(hip.malloc(needed)?);
-            self.q8_1_mmq_x_scratch_bytes = needed;
-        }
+        grow_scratch_buffer(
+            hip,
+            &mut self.q8_1_mmq_x_scratch,
+            &mut self.q8_1_mmq_x_scratch_bytes,
+            needed,
+        )?;
 
         let src_ptr = x.buf.as_ptr();
         let must_convert = true;
@@ -744,7 +880,7 @@ impl ScratchState {
             capture_mode,
             force_blob_path,
             "mq_rotate_x",
-            [n_groups, batch_size as u32, 1],
+            [n_groups * batch_size as u32, 1, 1],
             [32, 1, 1],
             0,
             &mut params,
@@ -993,10 +1129,7 @@ impl ScratchState {
             "mq_rotate_x_dual_fp8_gfx12",
         )?;
         // Lazily allocate the FP8 sibling scratch sized to match k bytes.
-        if self.mq_x_rot_fp8_bytes < k {
-            self.mq_x_rot_fp8 = Some(hip.malloc(k)?);
-            self.mq_x_rot_fp8_bytes = k;
-        }
+        grow_scratch_buffer(hip, &mut self.mq_x_rot_fp8, &mut self.mq_x_rot_fp8_bytes, k)?;
         let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
         let xp = x.buf.as_ptr();

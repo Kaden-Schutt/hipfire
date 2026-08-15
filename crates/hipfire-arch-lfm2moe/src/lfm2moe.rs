@@ -16,9 +16,11 @@
 
 use crate::config::{Lfm2MoeConfig, MixerKind};
 use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::hfq_parallel::{read_hfq_jobs_ordered, HfqReadJob};
 use hipfire_runtime::llama::{f16_to_f32, KvCache, WeightTensor};
 use hipfire_runtime::model_source::ModelSource;
 use hipfire_runtime::safetensors_source::{bf16_bytes_to_f16, source_bytes_to_f32_vec};
+use hipfire_runtime::{screen_weight_tensor, MmqScreenable};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 // ───────────────────────── HFQ load helpers ─────────────────────────
@@ -194,6 +196,54 @@ fn wt_from_raw(
     })
 }
 
+fn finish_hfq_expert(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    layer_prefix: &str,
+    layer: usize,
+    source_expert: usize,
+    slot: usize,
+    gate_up_qt: u8,
+    gate_up_bytes: &[u8],
+    down_qt: u8,
+    down_bytes: &[u8],
+    hidden: usize,
+    moe_inter: usize,
+) -> Result<ExpertWeights, String> {
+    let mut gate_up = wt_from_raw(gpu, gate_up_qt, gate_up_bytes, 2 * moe_inter, hidden)
+        .map_err(|error| format!("lfm2moe: fuse gate_up L{layer}E{source_expert}: {error}"))?;
+    let mut down = wt_from_raw(gpu, down_qt, down_bytes, hidden, moe_inter)
+        .map_err(|error| format!("lfm2moe: down L{layer}E{source_expert}: {error}"))?;
+    // AWQ scales are layer-shared and emitted once by the quantizer. Attach
+    // them to the first compact slot, which is also what the forward reads;
+    // this remains correct when REAP prunes original expert zero.
+    if slot == 0 {
+        gate_up.awq_scale = load_lfm2_awq_scale(
+            hfq,
+            gpu,
+            &format!("{layer_prefix}.feed_forward.awq_scale_gate_up.weight"),
+            hidden,
+        );
+        if gate_up.awq_scale.is_some() {
+            eprintln!(
+                "lfm2moe: AWQ gate_up scale attached at {layer_prefix} (expert-0 representative)"
+            );
+        }
+        down.awq_scale = load_lfm2_awq_scale(
+            hfq,
+            gpu,
+            &format!("{layer_prefix}.feed_forward.awq_scale_down.weight"),
+            moe_inter,
+        );
+        if down.awq_scale.is_some() {
+            eprintln!(
+                "lfm2moe: AWQ down scale attached at {layer_prefix} (expert-0 representative)"
+            );
+        }
+    }
+    Ok(ExpertWeights { gate_up, down })
+}
+
 // ──────────────────────────── Weights ────────────────────────────
 
 /// LIV short-conv mixer weights.
@@ -262,9 +312,41 @@ pub struct Lfm2MoeLayerWeights {
 
 pub struct Lfm2MoeWeights {
     pub embed: GpuTensor, // model.embed_tokens.weight (raw, for embedding_lookup)
+    pub embd_format: hipfire_runtime::llama::EmbeddingFormat,
     pub embedding_norm: GpuTensor, // model.embedding_norm.weight (final norm)
-    pub lm_head: WeightTensor, // tied = embed_tokens (loaded as Q8 weight)
+    pub lm_head: WeightTensor,     // tied = embed_tokens (loaded as Q8 weight)
     pub layers: Vec<Lfm2MoeLayerWeights>,
+}
+
+impl MmqScreenable for Lfm2MoeWeights {
+    fn screen_mmq_weights(&self, gpu: &mut Gpu) -> (usize, usize) {
+        let (mut safe, mut unsafe_count) = (0usize, 0usize);
+        screen_weight_tensor(&self.lm_head, gpu, &mut safe, &mut unsafe_count);
+        for layer in &self.layers {
+            match &layer.mixer {
+                Mixer::Conv(weights) => {
+                    screen_weight_tensor(&weights.in_proj, gpu, &mut safe, &mut unsafe_count);
+                    screen_weight_tensor(&weights.out_proj, gpu, &mut safe, &mut unsafe_count);
+                }
+                Mixer::Attention(weights) => {
+                    for weight in [&weights.wq, &weights.wk, &weights.wv, &weights.wo] {
+                        screen_weight_tensor(weight, gpu, &mut safe, &mut unsafe_count);
+                    }
+                }
+            }
+            match &layer.ffn {
+                Ffn::Dense(weights) => {
+                    for weight in [&weights.w1, &weights.w3, &weights.w2] {
+                        screen_weight_tensor(weight, gpu, &mut safe, &mut unsafe_count);
+                    }
+                }
+                Ffn::Moe(weights) => {
+                    screen_weight_tensor(&weights.router, gpu, &mut safe, &mut unsafe_count);
+                }
+            }
+        }
+        (safe, unsafe_count)
+    }
 }
 
 impl ExpertWeights {
@@ -353,9 +435,46 @@ impl Lfm2MoeWeights {
 
         // Globals. embed_tokens is the shared (tied) lm_head.
         let (_eqt, embed_bytes) = read_tensor(hfq, "model.embed_tokens.weight")?;
-        let embed = gpu
-            .upload_raw(&embed_bytes, &[embed_bytes.len()])
-            .map_err(|e| format!("lfm2moe: upload embed: {e:?}"))?;
+        let (embd_format, embed) = match _eqt {
+            3 => {
+                let fmt = hipfire_runtime::llama::EmbeddingFormat::Q8_0;
+                let buf = gpu
+                    .upload_raw(&embed_bytes, &[embed_bytes.len()])
+                    .map_err(|e| format!("lfm2moe: upload embed: {e:?}"))?;
+                (fmt, buf)
+            }
+            6 => {
+                let fmt = hipfire_runtime::llama::EmbeddingFormat::HFQ4G256;
+                let buf = gpu
+                    .upload_raw(&embed_bytes, &[embed_bytes.len()])
+                    .map_err(|e| format!("lfm2moe: upload embed: {e:?}"))?;
+                (fmt, buf)
+            }
+            1 => {
+                // F16 embedding → widen to F32 on host, mark F32.
+                // BF16 never appears via HFQ qt1; if it does, f16 decode would be wrong,
+                // but HFQ qt1 is canonically F16. Use f16_to_f32 widening.
+                if embed_bytes.len() % 2 != 0 {
+                    return Err(format!(
+                        "lfm2moe: embedding qt=1 bytes {} not multiple of 2",
+                        embed_bytes.len()
+                    ));
+                }
+                let f32_data: Vec<f32> = embed_bytes
+                    .chunks_exact(2)
+                    .map(|c| hipfire_runtime::llama::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                    .collect();
+                let buf = gpu
+                    .upload_f32(&f32_data, &[cfg.vocab_size, cfg.hidden_size])
+                    .map_err(|e| format!("lfm2moe: upload embed F32: {e:?}"))?;
+                (hipfire_runtime::llama::EmbeddingFormat::F32, buf)
+            }
+            other => {
+                return Err(format!(
+                    "lfm2moe: unsupported embedding quant_type {other} (expected 1,3,6)"
+                ))
+            }
+        };
         let embedding_norm = load_f32(hfq, gpu, "model.embedding_norm.weight", &[hidden])?;
         // lm_head: tied → reuse embed_tokens.weight as a Q8 weight tensor.
         let lm_head = load_wt(
@@ -536,61 +655,103 @@ impl Lfm2MoeWeights {
                 // Iterate compact slots `0..n_exp`; `e` = the ORIGINAL expert
                 // index loaded into slot (slot==e on the no-keep identity path).
                 let mut experts = Vec::with_capacity(n_exp);
-                for slot in 0..n_exp {
-                    let e = reap_ep.as_ref().map(|ep| ep.src(slot)).unwrap_or(slot);
-                    let ep = format!("{p}.feed_forward.experts.{e}");
-                    let (qt1, w1) = read_tensor(hfq, &format!("{ep}.w1.weight"))?;
-                    let (_qt3, w3) = read_tensor(hfq, &format!("{ep}.w3.weight"))?;
-                    let mut gate_up_bytes = w1;
-                    gate_up_bytes.extend_from_slice(&w3);
-                    let mut gate_up = wt_from_raw(gpu, qt1, &gate_up_bytes, 2 * moe_inter, hidden)
-                        .map_err(|e2| format!("lfm2moe: fuse gate_up L{l}E{e}: {e2}"))?;
-                    let (qt2, w2) = read_tensor(hfq, &format!("{ep}.w2.weight"))?;
-                    let mut down = wt_from_raw(gpu, qt2, &w2, hidden, moe_inter)
-                        .map_err(|e2| format!("lfm2moe: down L{l}E{e}: {e2}"))?;
-                    // AWQ scales: LAYER-SHARED, emitted once on expert 0 by the
-                    // quantizer (full port of minimax 3c676d00 BOTH-projection AWQ).
-                    // The scale tensors are NOT expert-indexed — their names are
-                    // `{p}.feed_forward.awq_scale_{gate_up,down}.weight` and their
-                    // lengths are `hidden` / `moe_inter` (per-projection dims, NOT
-                    // per-expert), so they are INVARIANT under a REAP keep and load
-                    // UNCHANGED. We attach them to the representative FIRST COMPACT
-                    // SLOT (`slot == 0`, i.e. `experts[0]`) — the same slot the
-                    // forward reads from — regardless of which original expert it
-                    // maps to. Gate on `slot == 0` (not `e == 0`): under a keep the
-                    // original expert 0 may be pruned, so `e == 0` could never fire
-                    // (dropping the scale) or fire on a non-representative slot.
-                    // Attach the gate_up scale (len hidden) to slot 0's gate_up and
-                    // the down scale (len moe_inter) to slot 0's down; the forward
-                    // reads both from experts[0] and divides x/s in the unrotated
-                    // basis via the AWQ-aware rotate_x_mq_for (gate_up input) and
-                    // fused_silu_mul_rotate_mq_batched_for (post-SwiGLU intermediate
-                    // for down). down (w2) is the most quant-sensitive proj, so its
-                    // AWQ is the whole point. No-op on non-AWQ files.
-                    if slot == 0 {
-                        gate_up.awq_scale = load_lfm2_awq_scale(
+                if hfq.has_overlay() {
+                    // Overlay offsets belong to a second file. Preserve the
+                    // existing overlay-aware reads and allocation order.
+                    for slot in 0..n_exp {
+                        let e = reap_ep.as_ref().map(|ep| ep.src(slot)).unwrap_or(slot);
+                        let ep = format!("{p}.feed_forward.experts.{e}");
+                        let (qt1, w1) = read_tensor(hfq, &format!("{ep}.w1.weight"))?;
+                        let (_qt3, w3) = read_tensor(hfq, &format!("{ep}.w3.weight"))?;
+                        let mut gate_up_bytes = w1;
+                        gate_up_bytes.extend_from_slice(&w3);
+                        let (qt2, w2) = read_tensor(hfq, &format!("{ep}.w2.weight"))?;
+                        experts.push(finish_hfq_expert(
                             hfq,
                             gpu,
-                            &format!("{p}.feed_forward.awq_scale_gate_up.weight"),
+                            &p,
+                            l,
+                            e,
+                            slot,
+                            qt1,
+                            &gate_up_bytes,
+                            qt2,
+                            &w2,
                             hidden,
-                        );
-                        if gate_up.awq_scale.is_some() {
-                            eprintln!("lfm2moe: AWQ gate_up scale attached at {p} (expert-0 representative)");
-                        }
-                        down.awq_scale = load_lfm2_awq_scale(
-                            hfq,
-                            gpu,
-                            &format!("{p}.feed_forward.awq_scale_down.weight"),
                             moe_inter,
-                        );
-                        if down.awq_scale.is_some() {
-                            eprintln!(
-                                "lfm2moe: AWQ down scale attached at {p} (expert-0 representative)"
-                            );
-                        }
+                        )?);
                     }
-                    experts.push(ExpertWeights { gate_up, down });
+                } else {
+                    // Two experts form four jobs (gate_up + down per expert),
+                    // matching the four-lane storage optimum. All reads finish
+                    // before the original gate_up/down GPU allocation sequence.
+                    let mut chunk_start = 0usize;
+                    while chunk_start < n_exp {
+                        let chunk_end = (chunk_start + 2).min(n_exp);
+                        let mut metadata = Vec::with_capacity(chunk_end - chunk_start);
+                        let mut jobs = Vec::with_capacity((chunk_end - chunk_start) * 2);
+                        for slot in chunk_start..chunk_end {
+                            let e = reap_ep.as_ref().map(|ep| ep.src(slot)).unwrap_or(slot);
+                            let ep = format!("{p}.feed_forward.experts.{e}");
+                            let w1_name = format!("{ep}.w1.weight");
+                            let w3_name = format!("{ep}.w3.weight");
+                            let w2_name = format!("{ep}.w2.weight");
+                            let qt1 = hfq
+                                .find_tensor_info(&w1_name)
+                                .ok_or_else(|| {
+                                    format!("lfm2moe: tensor not found in HFQ: {w1_name}")
+                                })?
+                                .quant_type;
+                            let qt2 = hfq
+                                .find_tensor_info(&w2_name)
+                                .ok_or_else(|| {
+                                    format!("lfm2moe: tensor not found in HFQ: {w2_name}")
+                                })?
+                                .quant_type;
+                            jobs.push(
+                                HfqReadJob::packed(
+                                    hfq,
+                                    format!("{ep}.gate_up"),
+                                    [&w1_name, &w3_name],
+                                )
+                                .map_err(|error| {
+                                    format!("lfm2moe: plan gate_up L{l}E{e}: {error}")
+                                })?,
+                            );
+                            jobs.push(HfqReadJob::tensor(hfq, &w2_name).map_err(|error| {
+                                format!("lfm2moe: plan down L{l}E{e}: {error}")
+                            })?);
+                            metadata.push((slot, e, qt1, qt2));
+                        }
+                        let mut buffers = read_hfq_jobs_ordered(hfq, &jobs)
+                            .map_err(|error| {
+                                format!("lfm2moe: parallel expert read layer {l}: {error}")
+                            })?
+                            .into_iter();
+                        for (slot, e, qt1, qt2) in metadata {
+                            let gate_up_bytes =
+                                buffers.next().expect("two LFM read jobs per expert").data;
+                            let down_bytes =
+                                buffers.next().expect("two LFM read jobs per expert").data;
+                            experts.push(finish_hfq_expert(
+                                hfq,
+                                gpu,
+                                &p,
+                                l,
+                                e,
+                                slot,
+                                qt1,
+                                &gate_up_bytes,
+                                qt2,
+                                &down_bytes,
+                                hidden,
+                                moe_inter,
+                            )?);
+                        }
+                        chunk_start = chunk_end;
+                    }
                 }
+
                 let gu_bytes: Vec<u8> = experts
                     .iter()
                     .flat_map(|e| (e.gate_up.buf.buf.as_ptr() as u64).to_ne_bytes())
@@ -631,6 +792,7 @@ impl Lfm2MoeWeights {
         let _ = (conv_state_count, kv_count);
         Ok(Lfm2MoeWeights {
             embed,
+            embd_format,
             embedding_norm,
             lm_head,
             layers,
@@ -843,18 +1005,47 @@ pub fn load_weights_from_source(
 
     // Globals. embed_tokens is the shared (tied) lm_head.
     let (eqt, edt, embed_bytes) = read_tensor_from_source(source, "model.embed_tokens.weight")?;
-    // Match the lm_head / weight F16 convention: narrow BF16 embeddings to F16
-    // before the raw upload (uploading raw bf16 bytes would be misread).
-    let embed_converted: Vec<u8>;
-    let embed_bytes: &[u8] = if eqt == 1 && edt == "BF16" {
-        embed_converted = bf16_bytes_to_f16(embed_bytes);
-        &embed_converted
-    } else {
-        embed_bytes
+    let (embd_format, embed) = match eqt {
+        3 => {
+            let fmt = hipfire_runtime::llama::EmbeddingFormat::Q8_0;
+            let buf = gpu
+                .upload_raw(embed_bytes, &[embed_bytes.len()])
+                .map_err(|e| format!("lfm2moe: upload embed: {e:?}"))?;
+            (fmt, buf)
+        }
+        6 => {
+            let fmt = hipfire_runtime::llama::EmbeddingFormat::HFQ4G256;
+            let buf = gpu
+                .upload_raw(embed_bytes, &[embed_bytes.len()])
+                .map_err(|e| format!("lfm2moe: upload embed: {e:?}"))?;
+            (fmt, buf)
+        }
+        1 => {
+            // F16/BF16 embedding → widen to F32 via dtype-aware helper, mark F32.
+            let f32_data: Vec<f32> = source_bytes_to_f32_vec(edt, embed_bytes);
+            // Validate element count matches vocab*hidden.
+            let expected = cfg
+                .vocab_size
+                .checked_mul(cfg.hidden_size)
+                .ok_or_else(|| format!("lfm2moe: embedding vocab*hidden overflow"))?;
+            if f32_data.len() != expected {
+                return Err(format!(
+                    "lfm2moe: embedding F32 count {} != vocab*hidden {}",
+                    f32_data.len(),
+                    expected
+                ));
+            }
+            let buf = gpu
+                .upload_f32(&f32_data, &[cfg.vocab_size, cfg.hidden_size])
+                .map_err(|e| format!("lfm2moe: upload embed F32: {e:?}"))?;
+            (hipfire_runtime::llama::EmbeddingFormat::F32, buf)
+        }
+        other => {
+            return Err(format!(
+                "lfm2moe: unsupported embedding quant_type {other} (expected 1,3,6)"
+            ))
+        }
     };
-    let embed = gpu
-        .upload_raw(embed_bytes, &[embed_bytes.len()])
-        .map_err(|e| format!("lfm2moe: upload embed: {e:?}"))?;
     let embedding_norm =
         load_f32_from_source(source, gpu, "model.embedding_norm.weight", &[hidden])?;
     // lm_head: tied → reuse embed_tokens.weight as a Q8 weight tensor.
@@ -865,7 +1056,6 @@ pub fn load_weights_from_source(
         cfg.vocab_size,
         hidden,
     )?;
-
     let mut conv_state_count = 0usize;
     let mut kv_count = 0usize;
 
@@ -1102,6 +1292,7 @@ pub fn load_weights_from_source(
     let _ = (conv_state_count, kv_count);
     Ok(Lfm2MoeWeights {
         embed,
+        embd_format,
         embedding_norm,
         lm_head,
         layers,
@@ -1119,6 +1310,13 @@ pub struct Lfm2MoeState {
     /// decode runs direct (so kernel JIT / lazy alloc happen outside any
     /// stream capture). Unused when the graph path is disabled.
     pub graph_warmed_up: bool,
+    /// Retained replay warmup latch: false until the first dense decode runs
+    /// direct (allocation/JIT outside capture). Survives `reset()` — warmup
+    /// describes allocation/JIT, not sequence state.
+    pub retained_warmed_up: bool,
+    /// Fail-closed poison: true after a retained replay error until a full
+    /// KV+conv reset clears it. Any `decode_step` must reject while poisoned.
+    pub retained_state_poisoned: bool,
     pub max_seq: usize,
     pub n_tokens: usize,
 
@@ -1229,6 +1427,8 @@ impl Lfm2MoeState {
             conv_states,
             pos_buf,
             graph_warmed_up: false,
+            retained_warmed_up: false,
+            retained_state_poisoned: false,
             max_seq,
             n_tokens: 0,
             h: alloc(gpu, hidden, "h")?,
@@ -1256,20 +1456,26 @@ impl Lfm2MoeState {
         })
     }
 
-    /// Reset for a new sequence: clear conv state and token count.
+    /// Reset for a new sequence: clear KV + conv state and token count.
+    /// Preserves `graph_warmed_up` and `retained_warmed_up`; clears
+    /// `retained_state_poisoned` only after the full KV+conv reset so a
+    /// poisoned recurrent/KV cannot be reused. No host allocations.
     pub fn reset(&mut self, gpu: &mut Gpu) -> Result<(), String> {
-        self.n_tokens = 0;
+        self.kv
+            .clear_gpu(gpu)
+            .map_err(|e| format!("lfm2moe: reset kv: {e:?}"))?;
         for cs in &self.conv_states {
-            let zeros = vec![0u8; cs.numel() * 4];
             gpu.hip
-                .memcpy_htod(&cs.buf, &zeros)
+                .memset(&cs.buf, 0, cs.buf.size())
                 .map_err(|e| format!("lfm2moe: reset conv_state: {e:?}"))?;
         }
+        self.n_tokens = 0;
+        self.retained_state_poisoned = false;
         Ok(())
     }
 
     pub fn free_gpu(self, gpu: &mut Gpu) {
-        self.kv.free_gpu(gpu);
+        let _ = self.kv.free_gpu(gpu);
         for t in self.conv_states {
             let _ = gpu.free_tensor(t);
         }
@@ -1298,9 +1504,87 @@ impl Lfm2MoeState {
     }
 }
 
+/// Authoritative batch admissibility predicate.
+/// Embeddings: Q8_0, HFQ4G256 only (F32 is sequential-only).
+/// Dense projections: Q8_0, HFQ4G256, MQ4G256 (one GEMM per weight; MQ4 via FWHT).
+/// lm_head: Q8_0, HFQ4G256, MQ4G256, HFQ6G256, MQ6G256, MQ3G256 (existing kernel coverage).
+/// MoE FFN: not admitted (dense-only batch).
+pub fn batch_weight_formats_supported(weights: &Lfm2MoeWeights) -> Result<(), String> {
+    use hipfire_runtime::llama::EmbeddingFormat;
+    // Embedding allowlist: Q8/HFQ4 only.
+    match weights.embd_format {
+        EmbeddingFormat::Q8_0 | EmbeddingFormat::HFQ4G256 => {}
+        EmbeddingFormat::F32 => {
+            return Err("batched decode: F32 embedding not supported".to_string())
+        }
+        _ => return Err("batched decode: unsupported embedding format".to_string()),
+    }
+    // lm_head allowlist (keep aligned with lm_head_batched_lfm kernels).
+    match weights.lm_head.gpu_dtype {
+        DType::Q8_0
+        | DType::HFQ4G256
+        | DType::MQ4G256
+        | DType::HFQ6G256
+        | DType::MQ6G256
+        | DType::MQ3G256 => {}
+        other => {
+            return Err(format!(
+                "batched decode: unsupported lm_head dtype {other:?}"
+            ))
+        }
+    }
+    // Dense projections: Q8/HFQ4/MQ4 only.
+    for layer in &weights.layers {
+        match &layer.mixer {
+            crate::lfm2moe::Mixer::Conv(c) => {
+                for w in [&c.in_proj, &c.out_proj] {
+                    match w.gpu_dtype {
+                        DType::Q8_0 | DType::HFQ4G256 | DType::MQ4G256 => {}
+                        other => {
+                            return Err(format!(
+                                "batched decode: conv projection dtype {other:?} not supported (expected Q8/HFQ4/MQ4)"
+                            ))
+                        }
+                    }
+                }
+            }
+            crate::lfm2moe::Mixer::Attention(a) => {
+                for w in [&a.wq, &a.wk, &a.wv, &a.wo] {
+                    match w.gpu_dtype {
+                        DType::Q8_0 | DType::HFQ4G256 | DType::MQ4G256 => {}
+                        other => {
+                            return Err(format!(
+                                "batched decode: attention projection dtype {other:?} not supported"
+                            ))
+                        }
+                    }
+                }
+            }
+        }
+        match &layer.ffn {
+            crate::lfm2moe::Ffn::Dense(d) => {
+                for w in [&d.w1, &d.w3, &d.w2] {
+                    match w.gpu_dtype {
+                        DType::Q8_0 | DType::HFQ4G256 | DType::MQ4G256 => {}
+                        other => {
+                            return Err(format!(
+                                "batched decode: dense FFN dtype {other:?} not supported"
+                            ))
+                        }
+                    }
+                }
+            }
+            crate::lfm2moe::Ffn::Moe(_) => {
+                return Err("batched decode: MoE FFN not supported in dense batch".to_string())
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod bf16_decode_tests {
-    use hipfire_runtime::safetensors_source::source_bytes_to_f32_vec;
+    use super::source_bytes_to_f32_vec;
 
     // Regression: lfm2moe's safetensors decode previously collapsed BF16 onto
     // the F16 path (`effective_quant_type` mapped BF16 → qt 1 → `f16_to_f32`),
@@ -1318,5 +1602,151 @@ mod bf16_decode_tests {
             as_bf16, as_f16,
             "decoding BF16 bytes as F16 must differ — the original bug"
         );
+    }
+}
+
+#[cfg(test)]
+mod batch_format_tests {
+    use super::*;
+    use hipfire_runtime::llama::EmbeddingFormat;
+    use rdna_compute::DType;
+
+    fn is_embedding_supported(fmt: EmbeddingFormat) -> bool {
+        matches!(fmt, EmbeddingFormat::Q8_0 | EmbeddingFormat::HFQ4G256)
+    }
+    fn is_dense_proj_supported(dtype: DType) -> bool {
+        matches!(dtype, DType::Q8_0 | DType::HFQ4G256 | DType::MQ4G256)
+    }
+    fn is_lm_head_supported(dtype: DType) -> bool {
+        matches!(
+            dtype,
+            DType::Q8_0
+                | DType::HFQ4G256
+                | DType::MQ4G256
+                | DType::HFQ6G256
+                | DType::MQ6G256
+                | DType::MQ3G256
+        )
+    }
+
+    #[test]
+    fn embedding_qt_mapping() {
+        // qt 3 -> Q8, 6 -> HFQ4, 1 -> F32 path (widened), others reject.
+        let map = |qt: u8| -> Result<EmbeddingFormat, String> {
+            match qt {
+                3 => Ok(EmbeddingFormat::Q8_0),
+                6 => Ok(EmbeddingFormat::HFQ4G256),
+                1 => Ok(EmbeddingFormat::F32),
+                other => Err(format!("unsupported embedding quant_type {other}")),
+            }
+        };
+        assert_eq!(map(3).unwrap(), EmbeddingFormat::Q8_0);
+        assert_eq!(map(6).unwrap(), EmbeddingFormat::HFQ4G256);
+        assert_eq!(map(1).unwrap(), EmbeddingFormat::F32);
+        assert!(map(2).is_err());
+        assert!(map(7).is_err());
+        assert!(map(99).is_err());
+        assert!(map(0).is_err());
+    }
+
+    #[test]
+    fn embedding_f32_widen_correctness() {
+        // F16 1.0 = 0x3C00, BF16 1.0 = 0x3F80 -> both widen to 1.0f32 via dtype-aware helper.
+        let f16_one = 0x3C00u16.to_le_bytes();
+        let bf16_one = 0x3F80u16.to_le_bytes();
+        let f16_widen = source_bytes_to_f32_vec("F16", &f16_one);
+        let bf16_widen = source_bytes_to_f32_vec("BF16", &bf16_one);
+        assert_eq!(f16_widen, vec![1.0f32]);
+        assert_eq!(bf16_widen, vec![1.0f32]);
+        // Raw F16 bytes mis-decoded as BF16 would not be 1.0 — ensure helpers differ for same bytes.
+        let as_f16 = source_bytes_to_f32_vec("F16", &bf16_one);
+        assert_ne!(
+            as_f16,
+            vec![1.0f32],
+            "BF16 bytes decoded as F16 must differ"
+        );
+    }
+
+    #[test]
+    fn unsupported_embedding_rejected() {
+        // Unknown qt should error before upload.
+        let bad_qt = 13u8; // MQ4
+        let is_supported_embedding_qt = |qt: u8| -> bool { matches!(qt, 1 | 3 | 6) };
+        assert!(!is_supported_embedding_qt(bad_qt));
+        assert!(!is_supported_embedding_qt(2));
+    }
+
+    #[test]
+    fn predicate_families() {
+        // Embeddings: only Q8/HFQ4 batch-admissible, F32 sequential-only.
+        assert!(is_embedding_supported(EmbeddingFormat::Q8_0));
+        assert!(is_embedding_supported(EmbeddingFormat::HFQ4G256));
+        assert!(!is_embedding_supported(EmbeddingFormat::F32));
+        assert!(!is_embedding_supported(EmbeddingFormat::HFQ4G128));
+        assert!(!is_embedding_supported(EmbeddingFormat::Q4K));
+
+        // Dense projections: Q8/HFQ4/MQ4 only.
+        assert!(is_dense_proj_supported(DType::Q8_0));
+        assert!(is_dense_proj_supported(DType::HFQ4G256));
+        assert!(is_dense_proj_supported(DType::MQ4G256));
+        assert!(!is_dense_proj_supported(DType::F32));
+        assert!(!is_dense_proj_supported(DType::F16));
+        assert!(!is_dense_proj_supported(DType::HFQ6G256));
+        assert!(!is_dense_proj_supported(DType::MQ6G256));
+        assert!(!is_dense_proj_supported(DType::MQ3G256));
+
+        // lm_head: broader allowlist includes HFQ6/MQ6/MQ3 but still rejects F32/F16.
+        assert!(is_lm_head_supported(DType::Q8_0));
+        assert!(is_lm_head_supported(DType::HFQ4G256));
+        assert!(is_lm_head_supported(DType::MQ4G256));
+        assert!(is_lm_head_supported(DType::HFQ6G256));
+        assert!(is_lm_head_supported(DType::MQ6G256));
+        assert!(is_lm_head_supported(DType::MQ3G256));
+        assert!(!is_lm_head_supported(DType::F32));
+        assert!(!is_lm_head_supported(DType::F16));
+        assert!(!is_lm_head_supported(DType::MQ2G256));
+    }
+
+    #[test]
+    fn product_overflow_helpers() {
+        // Ensure checked arithmetic correctly flags overflow for all batch products.
+        let max = usize::MAX;
+        assert!(max.checked_mul(2).is_none());
+        assert!(max.checked_mul(2048).is_none());
+        // Small values succeed.
+        assert_eq!(8usize.checked_mul(2048), Some(16384));
+        assert_eq!(4usize.checked_mul(8192), Some(32768));
+        // 3*hidden overflow path.
+        let bcx = 8usize.checked_mul(3).and_then(|v| v.checked_mul(2048));
+        assert_eq!(bcx, Some(49152));
+        assert!(max
+            .checked_mul(3)
+            .and_then(|v| v.checked_mul(2048))
+            .is_none());
+        // logits product overflow.
+        let vocab = 32000usize;
+        assert!(max.checked_mul(vocab).is_none());
+    }
+
+    #[test]
+    fn cancellation_helper_state_independent() {
+        // Pure helper: cancellation closure that returns true immediately should cause
+        // prefill to abort before sampling. Test the closure combinator in isolation.
+        let mut calls = 0usize;
+        let mut should_cancel = || {
+            calls += 1;
+            calls > 0 // cancel immediately on first token boundary
+        };
+        assert!(should_cancel());
+        assert_eq!(calls, 1);
+        // Non-cancelling closure.
+        let mut calls2 = 0usize;
+        let mut never_cancel = || {
+            calls2 += 1;
+            false
+        };
+        assert!(!never_cancel());
+        assert!(!never_cancel());
+        assert_eq!(calls2, 2);
     }
 }

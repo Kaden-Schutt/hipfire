@@ -1,0 +1,279 @@
+warning: field `cpu` is never read
+    --> crates/redline-rocr/src/runtime.rs:1427:5
+     |
+1423 | struct KernargPoolInner {
+     |        ---------------- field in this struct
+...
+1427 |     cpu: Option<abi::Agent>,
+     |     ^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `device_local` is never read
+    --> crates/redline-rocr/src/runtime.rs:1825:5
+     |
+1823 | pub struct KernargBuffer {
+     |            ------------- field in this struct
+1824 |     pool: Arc<KernargPoolInner>,
+1825 |     device_local: bool,
+     |     ^^^^^^^^^^^^
+
+warning: field `fn_comm_init_all` is never read
+  --> crates/hip-bridge/src/rccl.rs:78:5
+   |
+74 | pub struct RcclComms {
+   |            --------- field in this struct
+...
+78 |     fn_comm_init_all: unsafe extern "C" fn(*mut NcclComm, c_int, *const c_int) -> u32,
+   |     ^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: variant `SolutionIndex` is never constructed
+  --> crates/hip-bridge/src/rocblas.rs:64:5
+   |
+62 | pub enum RocblasGemmAlgo {
+   |          --------------- variant in this enum
+63 |     Standard = 160,
+64 |     SolutionIndex = 161,
+   |     ^^^^^^^^^^^^^
+   |
+   = note: `RocblasGemmAlgo` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: `redline-rocr` (lib) generated 2 warnings
+warning: `hip-bridge` (lib) generated 2 warnings
+   Compiling rdna-compute v0.3.0 (/mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/crates/rdna-compute)
+warning: unused variable: `func`
+    --> crates/rdna-compute/src/attention.rs:6195:13
+     |
+6195 |         let func = &self.functions["kv_cache_write"];
+     |             ^^^^ help: if this is intentional, prefix it with an underscore: `_func`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `force_baseline`
+   --> crates/rdna-compute/src/kernels.rs:372:5
+    |
+372 |     force_baseline: bool,
+    |     ^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_force_baseline`
+
+warning: unused variable: `force_baseline`
+   --> crates/rdna-compute/src/kernels.rs:389:5
+    |
+389 |     force_baseline: bool,
+    |     ^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_force_baseline`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:454:9
+    |
+454 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:479:9
+    |
+479 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:504:9
+    |
+504 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:523:9
+    |
+523 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:828:9
+    |
+828 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:855:9
+    |
+855 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:882:9
+    |
+882 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:902:9
+    |
+902 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `func`
+   --> crates/rdna-compute/src/norm.rs:648:13
+    |
+648 |         let func = &self.functions["rope_f32"];
+    |             ^^^^ help: if this is intentional, prefix it with an underscore: `_func`
+
+warning: unused variable: `func`
+    --> crates/rdna-compute/src/norm.rs:4008:13
+     |
+4008 |         let func = &self.functions["bias_add_f32"];
+     |             ^^^^ help: if this is intentional, prefix it with an underscore: `_func`
+
+warning: constant `N_TILE` is never used
+    --> crates/rdna-compute/src/attention.rs:1986:15
+     |
+1986 |         const N_TILE: usize = 16;
+     |               ^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: trait `ActivationCapture` is never used
+   --> crates/rdna-compute/src/dispatch.rs:384:11
+    |
+384 | pub trait ActivationCapture: Send + Sync {
+    |           ^^^^^^^^^^^^^^^^^
+
+warning: constant `GEMV_MQ6G256_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:1055:11
+     |
+1055 | pub const GEMV_MQ6G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq6g256.hip");
+     |           ^^^^^^^^^^^^^^^^
+
+warning: constant `GEMV_MQ5G256_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:1057:11
+     |
+1057 | pub const GEMV_MQ5G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq5g256.hip");
+     |           ^^^^^^^^^^^^^^^^
+
+warning: constant `GATED_DELTA_NET_Q8_FAST_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:4565:11
+     |
+4565 | pub const GATED_DELTA_NET_Q8_FAST_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GATED_DELTA_NET_Q8_COMPACT2_B2_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:4571:11
+     |
+4571 | pub const GATED_DELTA_NET_Q8_COMPACT2_B2_SRC: &str = concat!(
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GATED_DELTA_NET_Q8_COMPACT2_B4_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:4575:11
+     |
+4575 | pub const GATED_DELTA_NET_Q8_COMPACT2_B4_SRC: &str = concat!(
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GATED_DELTA_NET_Q8_COMPACT2_B8_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:4579:11
+     |
+4579 | pub const GATED_DELTA_NET_Q8_COMPACT2_B8_SRC: &str = concat!(
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GATED_DELTA_NET_Q8_COMPACT2_B12_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:4583:11
+     |
+4583 | pub const GATED_DELTA_NET_Q8_COMPACT2_B12_SRC: &str = concat!(
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GATED_DELTA_NET_Q8_COMPACT2_B16_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:4587:11
+     |
+4587 | pub const GATED_DELTA_NET_Q8_COMPACT2_B16_SRC: &str = concat!(
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GATED_DELTA_NET_Q8_COMPACT2_R8_GFX1151_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:4595:11
+     |
+4595 | pub const GATED_DELTA_NET_Q8_COMPACT2_R8_GFX1151_SRC: &str = concat!(
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GATED_DELTA_NET_Q8_COMPACT2_R4X2_GFX1151_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:4603:11
+     |
+4603 | pub const GATED_DELTA_NET_Q8_COMPACT2_R4X2_GFX1151_SRC: &str = concat!(
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GATED_DELTA_NET_Q8_COMPACT2_DPP_GFX1151_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:4610:11
+     |
+4610 | pub const GATED_DELTA_NET_Q8_COMPACT2_DPP_GFX1151_SRC: &str = concat!(
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `CONV1D_SILU_SPLIT_QKNORM_B32_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:4681:11
+     |
+4681 | pub const CONV1D_SILU_SPLIT_QKNORM_B32_SRC: &str = concat!(
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `CONV1D_SILU_SPLIT_QKNORM_B64_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:4685:11
+     |
+4685 | pub const CONV1D_SILU_SPLIT_QKNORM_B64_SRC: &str = concat!(
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `CONV1D_SILU_SPLIT_QKNORM_B128_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:4689:11
+     |
+4689 | pub const CONV1D_SILU_SPLIT_QKNORM_B128_SRC: &str = concat!(
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `CONV1D_SILU_SPLIT_QKNORM_B256_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:4693:11
+     |
+4693 | pub const CONV1D_SILU_SPLIT_QKNORM_B256_SRC: &str = concat!(
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `CONV1D_SILU_SPLIT_QKNORM_B256_SCALAR_PREP_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:4697:11
+     |
+4697 | pub const CONV1D_SILU_SPLIT_QKNORM_B256_SCALAR_PREP_SRC: &str = concat!(
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `CONV1D_SILU_SPLIT_QKNORM_B512_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:4703:11
+     |
+4703 | pub const CONV1D_SILU_SPLIT_QKNORM_B512_SRC: &str = concat!(
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `REPEAT_INTERLEAVE_QK_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:4990:11
+     |
+4990 | pub const REPEAT_INTERLEAVE_QK_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `V4F_TOPK_KV_GATHER_TILED_GFX1151_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:5302:11
+     |
+5302 | pub const V4F_TOPK_KV_GATHER_TILED_GFX1151_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dn_requant_per_token` is never used
+  --> crates/rdna-compute/src/norm.rs:48:4
+   |
+48 | fn dn_requant_per_token() -> bool {
+   |    ^^^^^^^^^^^^^^^^^^^^
+
+warning: field `pgm_rsrc2` is never read
+   --> crates/rdna-compute/src/profiler.rs:360:5
+    |
+358 | struct RawKernelMeta {
+    |        ------------- field in this struct
+359 |     pgm_rsrc1: u32,
+360 |     pgm_rsrc2: u32,
+    |     ^^^^^^^^^
+
+warning: `rdna-compute` (lib) generated 36 warnings (run `cargo fix --lib -p rdna-compute` to apply 13 suggestions)
+    Finished `release` profile [optimized] target(s) in 32.06s
+     Running `/mnt/scratch/hipfire-build/rocm714-gfx942/release/examples/test_mfp4e8_soa_w128_gfx942 --full`
+GPU dev 0: gfx942 (205.8 GB VRAM, HIP 7.14)
+  pre-compiled kernels: /mnt/scratch/hipfire-kernels/rocm714/gfx942
+[rocblas] loaded for gfx942
+PASS name=wq_a_or_wo_a_group M=1024 K=4096 raw_bits=1024 repeats=64 trials=7 w64_ms=0.006690 w128_ms=0.006614 speedup=1.0115x w64_effective_GBps=338.56 w128_effective_GBps=342.44
+PASS name=shared_w1_w3 M=2048 K=4096 raw_bits=2048 repeats=56 trials=7 w64_ms=0.007186 w128_ms=0.008547 speedup=0.8407x w64_effective_GBps=628.16 w128_effective_GBps=528.09
+PASS name=wq_b M=32768 K=1024 raw_bits=32768 repeats=13 trials=7 w64_ms=0.015198 w128_ms=0.013566 speedup=1.1203x w64_effective_GBps=1216.31 w128_effective_GBps=1362.58
+PASS name=wo_b M=4096 K=8192 raw_bits=4096 repeats=14 trials=7 w64_ms=0.017280 w128_ms=0.017007 speedup=1.0160x w64_effective_GBps=1038.25 w128_effective_GBps=1054.87
+PASS name=lm_head M=129280 K=4096 raw_bits=129280 repeats=8 trials=7 w64_ms=0.208930 w128_ms=0.209918 speedup=0.9953x w64_effective_GBps=1358.90 w128_effective_GBps=1352.51

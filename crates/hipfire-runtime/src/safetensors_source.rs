@@ -5,7 +5,9 @@
 //! Mmaps .safetensors files and serves tensor data by name.
 
 use crate::model_source::{ModelSource, QuantConfig, TensorInfo};
+use half::bf16;
 use memmap2::Mmap;
+use safetensors::SafeTensors;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read as _;
@@ -14,7 +16,6 @@ use std::path::{Path, PathBuf};
 struct SafetensorsFile {
     _file: File,
     mmap: Mmap,
-    header_size: usize,
 }
 
 pub struct SafetensorsSource {
@@ -68,58 +69,42 @@ impl SafetensorsSource {
             let file = File::open(st_path)?;
             let mmap = unsafe { Mmap::map(&file)? };
 
-            // Parse safetensors header
-            let header_len = u64::from_le_bytes(mmap[0..8].try_into().unwrap()) as usize;
-            let header_json = std::str::from_utf8(&mmap[8..8 + header_len])
+            let parsed = SafeTensors::deserialize(&mmap)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-            let raw: serde_json::Value = serde_json::from_str(header_json)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-            let header_size = 8 + header_len;
-
-            if let serde_json::Value::Object(map) = raw {
-                for (name, meta) in map {
-                    if name == "__metadata__" {
-                        continue;
-                    }
-                    let dtype = meta["dtype"].as_str().unwrap_or("F16").to_string();
-                    let shape: Vec<usize> = meta["shape"]
-                        .as_array()
-                        .map(|a| {
-                            a.iter()
-                                .filter_map(|v| v.as_u64().map(|n| n as usize))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    let offsets = meta["data_offsets"]
-                        .as_array()
-                        .map(|a| {
-                            let start = a[0].as_u64().unwrap_or(0) as usize;
-                            let end = a[1].as_u64().unwrap_or(0) as usize;
-                            (start, end)
-                        })
-                        .unwrap_or((0, 0));
-
-                    let tensor_idx = tensors.len();
-                    let info = TensorInfo {
-                        name: name.clone(),
-                        dtype,
-                        shape,
-                        quant_type: 0xFF, // not an HFQ quant_type
-                        data_offset: header_size + offsets.0,
-                        data_size: offsets.1 - offsets.0,
-                    };
-                    tensors.push(info);
-                    tensor_map.insert(name, (file_idx, tensor_idx));
-                }
+            let mmap_start = mmap.as_ptr() as usize;
+            for (name, view) in parsed.iter() {
+                let data_offset = (view.data().as_ptr() as usize)
+                    .checked_sub(mmap_start)
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("safetensors tensor {name} is outside its mmap"),
+                        )
+                    })?;
+                let tensor_idx = tensors.len();
+                let info = TensorInfo {
+                    name: name.to_string(),
+                    dtype: view.dtype().to_string(),
+                    shape: view.shape().to_vec(),
+                    quant_type: 0xFF, // not an HFQ quant_type
+                    data_offset,
+                    data_size: view.data().len(),
+                };
+                tensors.push(info);
+                tensor_map.insert(name.to_string(), (file_idx, tensor_idx));
             }
 
-            files.push(SafetensorsFile {
-                _file: file,
-                mmap,
-                header_size,
-            });
+            files.push(SafetensorsFile { _file: file, mmap });
         }
+
+        tracing::debug!(
+            model_dir = %dir.display(),
+            shard_count = files.len(),
+            tensor_count = tensors.len(),
+            arch_id,
+            quantized = quant_config.is_some(),
+            "opened safetensors model source"
+        );
 
         Ok(Self {
             dir: dir.to_path_buf(),
@@ -237,6 +222,18 @@ fn derive_arch_id(config: &serde_json::Value) -> u32 {
         if arch_lower.contains("llama") || arch_lower.contains("mistral") {
             return 0;
         }
+        if arch_lower.contains("gemma4_unified_assistant") {
+            return 22;
+        }
+        if arch_lower.contains("gemma4") {
+            return 13;
+        }
+        if arch_lower.contains("muse_glimmer_assistant") {
+            return 23;
+        }
+        if arch_lower.contains("muse_glimmer") {
+            return 14;
+        }
     }
 
     // Fallback: check model_type
@@ -268,6 +265,10 @@ fn derive_arch_id(config: &serde_json::Value) -> u32 {
         "minimax_m2" => 10,
         "lfm2_moe" | "lfm2" => 11,
         "cohere2_moe" => 12,
+        "gemma4_text" | "gemma4" => 13,
+        "gemma4_unified_assistant" => 22,
+        "muse_glimmer" | "muse_glimmer_text" => 14,
+        "muse_glimmer_assistant" => 23,
         _ => {
             // C1: unrecognized model_type → an explicit unclaimed sentinel that NO
             // carrier matches, so `load_model` fails cleanly with "no carrier for
@@ -347,7 +348,7 @@ fn build_metadata_json(config: &serde_json::Value, raw_config: &str) -> String {
 /// BF16 is the upper 16 bits of an IEEE-754 F32 number — widening is left-shifting by 16.
 #[inline]
 pub fn bf16_to_f32(bits: u16) -> f32 {
-    f32::from_bits((bits as u32) << 16)
+    bf16::from_bits(bits).to_f32()
 }
 
 /// Convert BF16 byte slice to F16 byte vector (owned).

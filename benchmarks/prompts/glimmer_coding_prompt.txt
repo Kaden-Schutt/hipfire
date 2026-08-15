@@ -1,0 +1,1 @@
+Write a Python function `merge_sorted(a, b)` that merges two already-sorted lists into one sorted list without using sorted(). Include a short docstring, handle edge cases, and provide a brief example usage.

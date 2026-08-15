@@ -39,7 +39,7 @@ pub struct EditState {
 }
 
 /// A previewed-but-uncommitted enum value (5b). Cycling Left/Right/Space stages
-/// the next value here (dimmed in the UI) WITHOUT writing config.json, so merely
+/// the next value here (dimmed in the UI) WITHOUT writing config.toml, so merely
 /// browsing the options can't mutate config. Enter commits it; Esc or navigating
 /// away discards it. Booleans don't use this — a binary flip is a decision, not
 /// browsing, so they still toggle-on-key.
@@ -587,7 +587,7 @@ impl App {
                         RegistryAction::SelectedModel { tag } => {
                             self.active_model = tag.clone();
                             self.chat.status = format!("model selected: {tag}");
-                            // Persist default_model to ~/.hipfire/config.json
+                            // Persist default_model to ~/.hipfire/config.toml
                             // (read-modify-write, atomic). Was session-only.
                             match writer::write_raw_value(
                                 &self.paths.config,
@@ -602,8 +602,9 @@ impl App {
                                     // Now explicitly on disk -> resettable override.
                                     self.config.overrides.insert("default_model".into());
                                     self.config.loaded_from_disk = true;
-                                    self.last_reload =
-                                        format!("default_model = {tag} saved to ~/.hipfire/config.json");
+                                    self.last_reload = format!(
+                                        "default_model = {tag} saved to ~/.hipfire/config.toml"
+                                    );
                                     self.toast_info(format!("default model → {tag}"));
                                 }
                                 Err(err) => {
@@ -704,6 +705,7 @@ impl App {
         self.chat.messages.push(ChatMessage {
             role: "user".into(),
             content: prompt,
+            reasoning_content: None,
         });
         self.spawn_stream();
     }
@@ -716,6 +718,7 @@ impl App {
         self.chat.messages.push(ChatMessage {
             role: "assistant".into(),
             content: String::new(),
+            reasoning_content: None,
         });
         self.chat.sending = true;
         self.chat.status = "streaming from hipfire serve".into();
@@ -736,7 +739,11 @@ impl App {
         let top_p = self.chat.top_p;
         let mut messages = self.chat.messages.clone();
         if let Some(last) = messages.last_mut() {
-            if last.role == "assistant" && last.content.is_empty() {
+            let reasoning_empty = last
+                .reasoning_content
+                .as_deref()
+                .map_or(true, |s| s.is_empty());
+            if last.role == "assistant" && last.content.is_empty() && reasoning_empty {
                 messages.pop();
             }
         }
@@ -746,6 +753,7 @@ impl App {
                 ChatMessage {
                     role: "system".into(),
                     content: self.chat.system_prompt.clone(),
+                    reasoning_content: None,
                 },
             );
         }
@@ -804,7 +812,11 @@ impl App {
         if self.chat.messages.last().map(|m| m.role.as_str()) == Some("assistant") {
             self.chat.messages.pop();
         }
-        let last = self.chat.messages.pop().expect("tail validated as user turn");
+        let last = self
+            .chat
+            .messages
+            .pop()
+            .expect("tail validated as user turn");
         self.chat.input = last.content;
         self.chat.reset_stats();
         self.chat.focus_input();
@@ -1177,7 +1189,9 @@ impl App {
                 // Honest pflash state: turning compression on without a drafter is
                 // a no-op until a prefill_drafter (.hfq) is set.
                 if key == "prefill_compression" && self.config.pflash_needs_drafter() {
-                    self.toast_error("prefill_compression on, but prefill_drafter is unset — no-op until set");
+                    self.toast_error(
+                        "prefill_compression on, but prefill_drafter is unset — no-op until set",
+                    );
                     return (
                         true,
                         format!(
@@ -1186,7 +1200,10 @@ impl App {
                     );
                 }
                 self.toast_info(format!("{key} saved"));
-                (true, format!("{key} = {as_str} saved to ~/.hipfire/config.json"))
+                (
+                    true,
+                    format!("{key} = {as_str} saved to ~/.hipfire/config.toml"),
+                )
             }
             Err(err) => {
                 // Surface config-write failures as a loud transient toast in
@@ -1222,18 +1239,18 @@ impl App {
     }
 
     /// Reset the currently-selected setting to its inherited/default value by
-    /// deleting its key from config.json. A no-op (with an explanatory toast) for
+    /// deleting its key from config.toml. A no-op (with an explanatory toast) for
     /// rows that are already at their default or that have no resettable key
     /// (the composite Model / Serve easy rows). Single-key reset is reversible —
     /// just re-set the value — so it commits immediately without a confirm.
     fn reset_selected_setting(&mut self) {
-        // A corrupt/non-object config.json loads as all-defaults with an empty
+        // A corrupt config.toml loads as all-defaults with an empty
         // override set, so per-key reset would wrongly say "already default" (and
         // the writer refuses to clobber it anyway). Point the user at reset-all,
         // which is the recovery hatch.
         if let Some(warn) = self.config.warning.clone() {
-            self.last_reload = format!("config.json unreadable ({warn}); press R to reset all");
-            self.toast_error("config.json unreadable — use R (reset-all) to recover");
+            self.last_reload = format!("config.toml unreadable ({warn}); press R to reset all");
+            self.toast_error("config.toml unreadable — use R (reset-all) to recover");
             return;
         }
         let Some(k) = self.selected_setting_key() else {
@@ -1278,14 +1295,14 @@ impl App {
         }
     }
 
-    /// Commit the confirmed reset-all: overwrite config.json with `{}` (every key
+    /// Commit the confirmed reset-all: overwrite config.toml with only its schema
     /// falls back to inherited/default), reload, and re-clamp the cursor.
     fn confirm_reset_all_yes(&mut self) {
         self.confirm_reset_all = false;
         match writer::reset_all(&self.paths.config) {
             Ok(()) => {
                 self.reload_config_after_reset();
-                self.last_reload = "all settings reset to defaults (config.json cleared)".into();
+                self.last_reload = "all settings reset to defaults (config.toml cleared)".into();
                 self.toast_info("all settings reset to defaults");
             }
             Err(err) => {
@@ -1385,8 +1402,7 @@ impl App {
                         self.last_reload = status;
                     }
                     Some(_) => {
-                        self.last_reload =
-                            format!("{k} is numeric/text; press Enter to edit");
+                        self.last_reload = format!("{k} is numeric/text; press Enter to edit");
                     }
                     None => {
                         self.last_reload = format!("{k} is not editable from the TUI");
@@ -1418,7 +1434,10 @@ impl App {
                     | Some(FieldKind::Float { .. })
                     | Some(FieldKind::FreeStr { .. }) => {
                         let buffer = self.current_setting_value(&k);
-                        self.settings_edit = Some(EditState { key: k.clone(), buffer });
+                        self.settings_edit = Some(EditState {
+                            key: k.clone(),
+                            buffer,
+                        });
                         self.last_reload =
                             format!("editing {k}: type a value, Enter to save, Esc to cancel");
                     }
@@ -1427,8 +1446,7 @@ impl App {
                             format!("{k}: Left/Right/Space to preview values, Enter to commit");
                     }
                     Some(FieldKind::Bool) => {
-                        self.last_reload =
-                            format!("{k} is on/off; Left/Right/Space toggles");
+                        self.last_reload = format!("{k} is on/off; Left/Right/Space toggles");
                     }
                     None => {
                         self.last_reload = format!("{k} is not editable from the TUI");
@@ -1487,13 +1505,26 @@ impl App {
         if let Some(rx) = self.chat.rx.take() {
             while let Ok(event) = rx.try_recv() {
                 match event {
-                    ChatEvent::Delta(text) => {
+                    ChatEvent::Reasoning(text) => {
+                        if let Some(last) = self.chat.messages.last_mut() {
+                            let rc = last.reasoning_content.get_or_insert_with(String::new);
+                            rc.push_str(&text);
+                        }
+                        self.chat.gen_tokens += 1;
+                    }
+                    ChatEvent::Content(text) => {
                         if let Some(last) = self.chat.messages.last_mut() {
                             last.content.push_str(&text);
                         }
                         self.chat.gen_tokens += 1;
                     }
                     ChatEvent::Done => {
+                        // Normalize empty reasoning to None so serialization omits it.
+                        if let Some(last) = self.chat.messages.last_mut() {
+                            if last.reasoning_content.as_deref().is_some_and(|s| s.is_empty()) {
+                                last.reasoning_content = None;
+                            }
+                        }
                         // Record throughput + drop a zero-delta empty assistant.
                         if let Some((stats, secs)) = self.chat.finalize_generation() {
                             self.log_request(stats, secs);
@@ -1503,6 +1534,12 @@ impl App {
                         finished = true;
                     }
                     ChatEvent::Error(err) => {
+                        // Normalize empty reasoning as with Done.
+                        if let Some(last) = self.chat.messages.last_mut() {
+                            if last.reasoning_content.as_deref().is_some_and(|s| s.is_empty()) {
+                                last.reasoning_content = None;
+                            }
+                        }
                         // finalize drops the trailing empty assistant so a failed
                         // request doesn't read as a blank reply; surface the cause.
                         // An errored partial is NOT logged to the inspector
@@ -1631,7 +1668,11 @@ impl ChatState {
             }
         }
         if let Some(last) = self.messages.last() {
-            if last.role == "assistant" && last.content.is_empty() {
+            let reasoning_empty = last
+                .reasoning_content
+                .as_deref()
+                .map_or(true, |s| s.is_empty());
+            if last.role == "assistant" && last.content.is_empty() && reasoning_empty {
                 self.messages.pop();
             }
         }
@@ -1668,7 +1709,7 @@ mod tests {
     }
 
     /// Build an App whose config writes target an isolated temp file, so the
-    /// settings tests never touch the user's real ~/.hipfire/config.json.
+    /// settings tests never touch the user's real ~/.hipfire/config.toml.
     fn test_app() -> (App, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!(
             "hipfire-tui-app-{}-{}",
@@ -1679,11 +1720,14 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let cfg = dir.join("config.json");
-        std::fs::write(&cfg, "{}\n").unwrap();
+        let cfg = dir.join("config.toml");
+        std::fs::write(&cfg, "schema_version = 1\n").unwrap();
 
         let mut app = App::load().expect("load app");
+        app.paths.root = dir.clone();
         app.paths.config = cfg;
+        app.paths.legacy_config = dir.join("config.json");
+        app.config = ConfigState::load(&app.paths);
         app.tab = Tab::Settings;
         (app, dir)
     }
@@ -1747,11 +1791,18 @@ mod tests {
         // 5a: an explicit override is removed from disk and the in-memory value
         // falls back to the hardcoded default after a config reload.
         let (mut app, dir) = test_app();
-        std::fs::write(&app.paths.config, "{\n  \"kv_cache\": \"q8\"\n}\n").unwrap();
+        std::fs::write(
+            &app.paths.config,
+            "schema_version = 1\n[memory]\nkv_cache = \"q8\"\n",
+        )
+        .unwrap();
         app.config = ConfigState::load(&app.paths);
         app.settings_easy = false;
         assert!(app.config.is_override("kv_cache"));
-        assert_eq!(app.config.values.get("kv_cache").map(String::as_str), Some("q8"));
+        assert_eq!(
+            app.config.values.get("kv_cache").map(String::as_str),
+            Some("q8")
+        );
 
         // Select kv_cache in the advanced list and reset it.
         app.settings_selected = app
@@ -1763,11 +1814,15 @@ mod tests {
         app.handle_settings_key(key(KeyCode::Delete));
 
         // Gone from disk, no longer an override, reverted to the default literal.
-        let raw = std::fs::read_to_string(&app.paths.config).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert!(!parsed.as_object().unwrap().contains_key("kv_cache"));
+        let loaded =
+            hipfire_config::load_global(&hipfire_config::ConfigPaths::under(&app.paths.root))
+                .unwrap();
+        assert!(loaded.layer.get("kv_cache").is_none());
         assert!(!app.config.is_override("kv_cache"));
-        assert_eq!(app.config.values.get("kv_cache").map(String::as_str), Some("auto"));
+        assert_eq!(
+            app.config.values.get("kv_cache").map(String::as_str),
+            Some("auto")
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1776,7 +1831,11 @@ mod tests {
     fn reset_selected_is_noop_when_already_default() {
         // Resetting a key that has no override must not write the file.
         let (mut app, dir) = test_app();
-        std::fs::write(&app.paths.config, "{\n  \"thinking\": \"off\"\n}\n").unwrap();
+        std::fs::write(
+            &app.paths.config,
+            "schema_version = 1\n[reasoning]\nmode = \"off\"\n",
+        )
+        .unwrap();
         app.config = ConfigState::load(&app.paths);
         app.settings_easy = false;
         // kv_cache is NOT overridden here.
@@ -1801,7 +1860,7 @@ mod tests {
         let (mut app, dir) = test_app();
         std::fs::write(
             &app.paths.config,
-            "{\n  \"kv_cache\": \"q8\",\n  \"dflash_mode\": \"auto\"\n}\n",
+            "schema_version = 1\n[memory]\nkv_cache = \"q8\"\n[speculation]\ndflash = \"auto\"\n",
         )
         .unwrap();
         app.config = ConfigState::load(&app.paths);
@@ -1811,17 +1870,19 @@ mod tests {
         assert!(app.confirm_reset_all, "Shift+R arms the confirm");
         app.handle_settings_key(key(KeyCode::Char('n')));
         assert!(!app.confirm_reset_all, "n cancels");
-        let still: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&app.paths.config).unwrap()).unwrap();
-        assert_eq!(still.as_object().unwrap().len(), 2, "cancel keeps overrides");
+        let still =
+            hipfire_config::load_global(&hipfire_config::ConfigPaths::under(&app.paths.root))
+                .unwrap();
+        assert_eq!(still.layer.values.len(), 2, "cancel keeps overrides");
 
-        // Arm again and CONFIRM — config.json becomes {}.
+        // Arm again and CONFIRM — config.toml retains only schema_version.
         app.handle_settings_key(key(KeyCode::Char('R')));
         app.handle_settings_key(key(KeyCode::Char('y')));
         assert!(!app.confirm_reset_all);
-        let cleared: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&app.paths.config).unwrap()).unwrap();
-        assert_eq!(cleared, serde_json::json!({}), "confirm clears the file");
+        let cleared =
+            hipfire_config::load_global(&hipfire_config::ConfigPaths::under(&app.paths.root))
+                .unwrap();
+        assert!(cleared.layer.values.is_empty(), "confirm clears overrides");
         assert!(!app.config.is_override("kv_cache"));
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1832,7 +1893,7 @@ mod tests {
         // 5a review #1: a setting changed this session (via cycle/persist) is
         // immediately an override, so Delete can reset it without a full reload.
         let (mut app, dir) = test_app();
-        std::fs::write(&app.paths.config, "{}\n").unwrap();
+        std::fs::write(&app.paths.config, "schema_version = 1\n").unwrap();
         app.config = ConfigState::load(&app.paths);
         app.settings_easy = false;
         // Cycle kv_cache off its default (auto -> q8): previews, then Enter commits
@@ -1845,13 +1906,22 @@ mod tests {
             .unwrap();
         app.handle_settings_key(key(KeyCode::Right));
         app.handle_settings_key(key(KeyCode::Enter));
-        assert!(app.config.is_override("kv_cache"), "commit marks the override");
-        assert_ne!(app.config.values.get("kv_cache").map(String::as_str), Some("auto"));
+        assert!(
+            app.config.is_override("kv_cache"),
+            "commit marks the override"
+        );
+        assert_ne!(
+            app.config.values.get("kv_cache").map(String::as_str),
+            Some("auto")
+        );
 
         // Now Delete must actually reset it (not report "already default").
         app.handle_settings_key(key(KeyCode::Delete));
         assert!(!app.config.is_override("kv_cache"));
-        assert_eq!(app.config.values.get("kv_cache").map(String::as_str), Some("auto"));
+        assert_eq!(
+            app.config.values.get("kv_cache").map(String::as_str),
+            Some("auto")
+        );
         assert!(app.last_reload.contains("reset to default"));
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1859,30 +1929,33 @@ mod tests {
 
     #[test]
     fn reset_all_keeps_cursor_on_surviving_key() {
-        // 5a review #4: reset-all removes disk-only keys ("aaa" here), shifting a
-        // surviving default key (kv_cache) up the BTreeMap. The cursor must follow
-        // kv_cache to its new index, not stay on the stale numeric position.
+        // Reset-all rebuilds from the typed schema. The cursor must follow the
+        // selected key rather than relying on an old numeric position.
         let (mut app, dir) = test_app();
         std::fs::write(
             &app.paths.config,
-            "{\n  \"aaa\": \"x\",\n  \"kv_cache\": \"q8\"\n}\n",
+            "schema_version = 1\n[memory]\nkv_cache = \"q8\"\n[attention]\nflash = \"always\"\n",
         )
         .unwrap();
         app.config = ConfigState::load(&app.paths);
         app.settings_easy = false;
-        app.settings_selected = app.config.values.keys().position(|k| k == "kv_cache").unwrap();
-        let before_idx = app.settings_selected;
-
+        app.settings_selected = app
+            .config
+            .values
+            .keys()
+            .position(|k| k == "kv_cache")
+            .unwrap();
         // Confirmed reset-all.
         app.handle_settings_key(key(KeyCode::Char('R')));
         app.handle_settings_key(key(KeyCode::Char('y')));
 
-        // "aaa" is gone; kv_cache survives (a default key) at a NEW, lower index.
-        assert!(!app.config.values.contains_key("aaa"));
-        let new_idx = app.config.values.keys().position(|k| k == "kv_cache").unwrap();
-        assert!(new_idx < before_idx, "kv_cache shifted up after aaa removed");
+        // kv_cache survives as a schema default and remains selected.
         assert_eq!(
-            app.config.values.keys().nth(app.settings_selected).map(String::as_str),
+            app.config
+                .values
+                .keys()
+                .nth(app.settings_selected)
+                .map(String::as_str),
             Some("kv_cache"),
             "cursor follows kv_cache to its new row"
         );
@@ -1892,12 +1965,15 @@ mod tests {
 
     #[test]
     fn reset_on_corrupt_config_points_to_reset_all() {
-        // 5a review #5: a corrupt config.json is not "already default" — direct
+        // 5a review #5: a corrupt config.toml is not "already default" — direct
         // the user to reset-all (the recovery hatch).
         let (mut app, dir) = test_app();
         std::fs::write(&app.paths.config, "{ broken not json").unwrap();
         app.config = ConfigState::load(&app.paths);
-        assert!(app.config.warning.is_some(), "corrupt file loads with a warning");
+        assert!(
+            app.config.warning.is_some(),
+            "corrupt file loads with a warning"
+        );
         app.settings_easy = false;
         app.settings_selected = 0;
         app.handle_settings_key(key(KeyCode::Delete));
@@ -1907,7 +1983,10 @@ mod tests {
             app.last_reload
         );
         // The corrupt file was NOT clobbered by the single-key path.
-        assert_eq!(std::fs::read_to_string(&app.paths.config).unwrap(), "{ broken not json");
+        assert_eq!(
+            std::fs::read_to_string(&app.paths.config).unwrap(),
+            "{ broken not json"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1920,7 +1999,10 @@ mod tests {
         app.handle_settings_key(key(KeyCode::Char('R')));
         assert!(app.confirm_reset_all);
         app.handle_settings_key(key(KeyCode::Char('j'))); // would normally move
-        assert!(app.confirm_reset_all, "unrelated key is swallowed, stays armed");
+        assert!(
+            app.confirm_reset_all,
+            "unrelated key is swallowed, stays armed"
+        );
         app.handle_settings_key(key(KeyCode::Esc));
         assert!(!app.confirm_reset_all, "Esc cancels");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1934,10 +2016,10 @@ mod tests {
 
     #[test]
     fn enum_cycle_previews_without_writing() {
-        // 5b core: cycling an enum stages a preview and does NOT touch config.json
+        // 5b core: cycling an enum stages a preview and does NOT touch config.toml
         // — merely browsing options can no longer mutate config.
         let (mut app, dir) = test_app();
-        std::fs::write(&app.paths.config, "{}\n").unwrap();
+        std::fs::write(&app.paths.config, "schema_version = 1\n").unwrap();
         app.config = ConfigState::load(&app.paths);
         select_advanced(&mut app, "dflash_mode");
 
@@ -1947,9 +2029,15 @@ mod tests {
         assert_eq!(pending.key, "dflash_mode");
         assert_ne!(pending.value, "off", "cycled off the default");
         // ...but nothing was written and the committed value is unchanged.
-        assert_eq!(std::fs::read_to_string(&app.paths.config).unwrap(), "{}\n");
+        assert_eq!(
+            std::fs::read_to_string(&app.paths.config).unwrap(),
+            "schema_version = 1\n"
+        );
         assert!(!app.config.is_override("dflash_mode"));
-        assert_eq!(app.config.values.get("dflash_mode").map(String::as_str), Some("off"));
+        assert_eq!(
+            app.config.values.get("dflash_mode").map(String::as_str),
+            Some("off")
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1958,7 +2046,7 @@ mod tests {
     fn enum_preview_commits_on_enter() {
         // Enter writes the staged preview to disk and marks the override.
         let (mut app, dir) = test_app();
-        std::fs::write(&app.paths.config, "{}\n").unwrap();
+        std::fs::write(&app.paths.config, "schema_version = 1\n").unwrap();
         app.config = ConfigState::load(&app.paths);
         select_advanced(&mut app, "dflash_mode");
 
@@ -1966,14 +2054,21 @@ mod tests {
         let staged = app.settings_pending.as_ref().unwrap().value.clone();
         app.handle_settings_key(key(KeyCode::Enter)); // commit
 
-        assert!(app.settings_pending.is_none(), "preview cleared after commit");
+        assert!(
+            app.settings_pending.is_none(),
+            "preview cleared after commit"
+        );
         assert!(app.config.is_override("dflash_mode"));
-        assert_eq!(app.config.values.get("dflash_mode").cloned(), Some(staged.clone()));
-        let parsed: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&app.paths.config).unwrap()).unwrap();
         assert_eq!(
-            parsed.as_object().unwrap().get("dflash_mode").unwrap(),
-            &serde_json::Value::String(staged)
+            app.config.values.get("dflash_mode").cloned(),
+            Some(staged.clone())
+        );
+        let loaded =
+            hipfire_config::load_global(&hipfire_config::ConfigPaths::under(&app.paths.root))
+                .unwrap();
+        assert_eq!(
+            loaded.layer.get("dflash_mode"),
+            Some(&hipfire_config::ConfigValue::String(staged))
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1983,7 +2078,7 @@ mod tests {
     fn enum_preview_cancels_on_esc_and_on_navigation() {
         // Esc OR moving off the row discards the preview without writing.
         let (mut app, dir) = test_app();
-        std::fs::write(&app.paths.config, "{}\n").unwrap();
+        std::fs::write(&app.paths.config, "schema_version = 1\n").unwrap();
         app.config = ConfigState::load(&app.paths);
         select_advanced(&mut app, "dflash_mode");
 
@@ -1992,14 +2087,23 @@ mod tests {
         assert!(app.settings_pending.is_some());
         app.handle_settings_key(key(KeyCode::Esc));
         assert!(app.settings_pending.is_none(), "Esc cancels preview");
-        assert_eq!(std::fs::read_to_string(&app.paths.config).unwrap(), "{}\n");
+        assert_eq!(
+            std::fs::read_to_string(&app.paths.config).unwrap(),
+            "schema_version = 1\n"
+        );
 
         // Navigation path: Down discards.
         app.handle_settings_key(key(KeyCode::Right));
         assert!(app.settings_pending.is_some());
         app.handle_settings_key(key(KeyCode::Down));
-        assert!(app.settings_pending.is_none(), "moving off the row discards preview");
-        assert_eq!(std::fs::read_to_string(&app.paths.config).unwrap(), "{}\n");
+        assert!(
+            app.settings_pending.is_none(),
+            "moving off the row discards preview"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&app.paths.config).unwrap(),
+            "schema_version = 1\n"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2009,7 +2113,7 @@ mod tests {
         // Two Rights advance through the allowlist from the PREVIEW, not the
         // committed value (so you can browse forward without committing).
         let (mut app, dir) = test_app();
-        std::fs::write(&app.paths.config, "{}\n").unwrap();
+        std::fs::write(&app.paths.config, "schema_version = 1\n").unwrap();
         app.config = ConfigState::load(&app.paths);
         select_advanced(&mut app, "dflash_mode"); // allowlist: on, off, auto; cur=off
 
@@ -2019,7 +2123,10 @@ mod tests {
         let second = app.settings_pending.as_ref().unwrap().value.clone();
         assert_ne!(first, second, "second cycle advances from the preview");
         // Still nothing written.
-        assert_eq!(std::fs::read_to_string(&app.paths.config).unwrap(), "{}\n");
+        assert_eq!(
+            std::fs::read_to_string(&app.paths.config).unwrap(),
+            "schema_version = 1\n"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2029,18 +2136,19 @@ mod tests {
         // 5b: booleans are a binary decision, not browsing — they keep
         // toggle-on-key (immediate write), no preview.
         let (mut app, dir) = test_app();
-        std::fs::write(&app.paths.config, "{}\n").unwrap();
+        std::fs::write(&app.paths.config, "schema_version = 1\n").unwrap();
         app.config = ConfigState::load(&app.paths);
         select_advanced(&mut app, "cask"); // default false
 
         app.handle_settings_key(key(KeyCode::Char(' ')));
         assert!(app.settings_pending.is_none(), "bool does not preview");
         assert!(app.config.is_override("cask"));
-        let parsed: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&app.paths.config).unwrap()).unwrap();
+        let loaded =
+            hipfire_config::load_global(&hipfire_config::ConfigPaths::under(&app.paths.root))
+                .unwrap();
         assert_eq!(
-            parsed.as_object().unwrap().get("cask").unwrap(),
-            &serde_json::Value::Bool(true)
+            loaded.layer.get("cask"),
+            Some(&hipfire_config::ConfigValue::Bool(true))
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -2050,13 +2158,16 @@ mod tests {
     fn tab_switch_discards_preview() {
         // Leaving the Settings tab drops an uncommitted preview.
         let (mut app, dir) = test_app();
-        std::fs::write(&app.paths.config, "{}\n").unwrap();
+        std::fs::write(&app.paths.config, "schema_version = 1\n").unwrap();
         app.config = ConfigState::load(&app.paths);
         select_advanced(&mut app, "dflash_mode");
         app.handle_settings_key(key(KeyCode::Right));
         assert!(app.settings_pending.is_some());
         app.next_tab();
-        assert!(app.settings_pending.is_none(), "tab switch discards preview");
+        assert!(
+            app.settings_pending.is_none(),
+            "tab switch discards preview"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2145,11 +2256,15 @@ mod tests {
     fn drain_serve_command_consumes_outcome_and_toasts() {
         let (mut app, dir) = test_app();
         let (tx, rx) = std::sync::mpsc::channel();
-        tx.send(ServeOutcome::Ok("serve start: done".into())).unwrap();
+        tx.send(ServeOutcome::Ok("serve start: done".into()))
+            .unwrap();
         app.inject_serve_cmd(rx);
         assert!(app.serve_cmd_running());
         app.drain_serve_command();
-        assert!(!app.serve_cmd_running(), "outcome clears the in-flight command");
+        assert!(
+            !app.serve_cmd_running(),
+            "outcome clears the in-flight command"
+        );
         assert!(app.toast.is_some(), "outcome raises a toast");
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -2159,7 +2274,10 @@ mod tests {
         let (mut app, dir) = test_app();
         app.confirm_delete = Some("qwen3.5:9b".into());
         app.cancel_delete();
-        assert!(app.confirm_delete.is_none(), "Esc/n clears the armed delete");
+        assert!(
+            app.confirm_delete.is_none(),
+            "Esc/n clears the armed delete"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -2184,7 +2302,10 @@ mod tests {
         .unwrap();
         app.inject_pull("qwen3.5:9b".into(), rx);
         app.drain_pull();
-        let job = app.pull.as_ref().expect("pull stays active during progress");
+        let job = app
+            .pull
+            .as_ref()
+            .expect("pull stays active during progress");
         assert_eq!(job.percent, Some(42.0));
         assert_eq!(job.line, "[bar] 42.0% 8 MB/s");
         let _ = std::fs::remove_dir_all(dir);
@@ -2217,6 +2338,7 @@ mod tests {
         app.chat.messages.push(ChatMessage {
             role: "user".into(),
             content: "hi".into(),
+            reasoning_content: None,
         });
         app.handle_chat_command("clear");
         assert!(app.chat.messages.is_empty());
@@ -2228,7 +2350,10 @@ mod tests {
     fn chat_unknown_command_toasts_does_not_panic() {
         let (mut app, dir) = test_app();
         app.handle_chat_command("definitely-not-a-command");
-        assert!(app.toast.is_some(), "unknown command surfaces an error toast");
+        assert!(
+            app.toast.is_some(),
+            "unknown command surfaces an error toast"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -2241,10 +2366,12 @@ mod tests {
             ChatMessage {
                 role: "user".into(),
                 content: "hi".into(),
+                reasoning_content: None,
             },
             ChatMessage {
                 role: "assistant".into(),
                 content: "hello".into(),
+                reasoning_content: None,
             },
         ];
         app.handle_chat_command("save debug");
@@ -2272,10 +2399,12 @@ mod tests {
             ChatMessage {
                 role: "user".into(),
                 content: "first".into(),
+                reasoning_content: None,
             },
             ChatMessage {
                 role: "assistant".into(),
                 content: "reply".into(),
+                reasoning_content: None,
             },
         ];
         app.handle_chat_command("edit");
@@ -2295,10 +2424,12 @@ mod tests {
             ChatMessage {
                 role: "user".into(),
                 content: "q".into(),
+                reasoning_content: None,
             },
             ChatMessage {
                 role: "assistant".into(),
                 content: "the answer".into(),
+                reasoning_content: None,
             },
         ];
         app.handle_chat_command("copy");
@@ -2311,7 +2442,10 @@ mod tests {
         let (mut app, dir) = test_app();
         app.tab = Tab::Chat;
         app.handle_chat_command("regen");
-        assert!(app.toast.is_some(), "regenerate with no turn to redo toasts");
+        assert!(
+            app.toast.is_some(),
+            "regenerate with no turn to redo toasts"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -2324,16 +2458,22 @@ mod tests {
             ChatMessage {
                 role: "user".into(),
                 content: "q".into(),
+                reasoning_content: None,
             },
             ChatMessage {
                 role: "assistant".into(),
                 content: "a".into(),
+                reasoning_content: None,
             },
         ];
         app.regenerate();
         // Serve-readiness is checked BEFORE the destructive pop, so the reply
         // survives an offline regen attempt.
-        assert_eq!(app.chat.messages.len(), 2, "reply preserved when serve offline");
+        assert_eq!(
+            app.chat.messages.len(),
+            2,
+            "reply preserved when serve offline"
+        );
         assert_eq!(app.chat.messages[1].content, "a");
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -2346,10 +2486,12 @@ mod tests {
             ChatMessage {
                 role: "user".into(),
                 content: "hi".into(),
+                reasoning_content: None,
             },
             ChatMessage {
                 role: "assistant".into(),
-                content: String::new(), // empty slot, no deltas streamed
+                content: String::new(),
+            reasoning_content: None, // empty slot, no deltas streamed
             },
         ];
         let (tx, rx) = std::sync::mpsc::channel();
@@ -2359,7 +2501,10 @@ mod tests {
         tx.send(ChatEvent::Done).unwrap();
         app.drain_chat_events();
         assert_eq!(app.chat.messages.len(), 1, "empty assistant bubble dropped");
-        assert!(app.chat.last_stats.is_none(), "no stats when zero tokens streamed");
+        assert!(
+            app.chat.last_stats.is_none(),
+            "no stats when zero tokens streamed"
+        );
         assert!(!app.chat.sending);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -2373,7 +2518,10 @@ mod tests {
             tps: 99.0,
         });
         app.handle_chat_command("clear");
-        assert!(app.chat.last_stats.is_none(), "tok/s cleared with the conversation");
+        assert!(
+            app.chat.last_stats.is_none(),
+            "tok/s cleared with the conversation"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -2385,10 +2533,12 @@ mod tests {
             ChatMessage {
                 role: "user".into(),
                 content: "hi".into(),
+                reasoning_content: None,
             },
             ChatMessage {
                 role: "assistant".into(),
                 content: String::new(),
+                reasoning_content: None,
             },
         ];
         let (tx, rx) = std::sync::mpsc::channel();
@@ -2396,8 +2546,8 @@ mod tests {
         app.chat.sending = true;
         app.chat.gen_start = Some(Instant::now());
         app.chat.gen_model = "qwen3.5:9b".into();
-        tx.send(ChatEvent::Delta("hello".into())).unwrap();
-        tx.send(ChatEvent::Delta(" world".into())).unwrap();
+        tx.send(ChatEvent::Content("hello".into())).unwrap();
+        tx.send(ChatEvent::Content(" world".into())).unwrap();
         tx.send(ChatEvent::Done).unwrap();
         app.drain_chat_events();
         assert_eq!(app.request_log.len(), 1, "completed request is logged");
@@ -2414,10 +2564,12 @@ mod tests {
             ChatMessage {
                 role: "user".into(),
                 content: "hi".into(),
+                reasoning_content: None,
             },
             ChatMessage {
                 role: "assistant".into(),
                 content: String::new(),
+                reasoning_content: None,
             },
         ];
         let (tx, rx) = std::sync::mpsc::channel();
@@ -2425,7 +2577,7 @@ mod tests {
         app.chat.sending = true;
         app.chat.gen_start = Some(Instant::now());
         app.chat.gen_model = "qwen3.5:9b".into();
-        tx.send(ChatEvent::Delta("partial".into())).unwrap();
+        tx.send(ChatEvent::Content("partial".into())).unwrap();
         tx.send(ChatEvent::Error("boom".into())).unwrap();
         app.drain_chat_events();
         assert!(
@@ -2446,6 +2598,92 @@ mod tests {
             app.registry.expanded_groups.contains("qwen"),
             "reload must carry expanded groups across the registry reload"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn drain_chat_events_separates_reasoning_and_content() {
+        // SSE fold now routes Reasoning and Content to separate accumulators;
+        // rendering keeps visual order but history must keep them distinct.
+        let (mut app, dir) = test_app();
+        app.tab = Tab::Chat;
+        app.chat.messages = vec![
+            ChatMessage {
+                role: "user".into(),
+                content: "hi".into(),
+                reasoning_content: None,
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: String::new(),
+                reasoning_content: None,
+            },
+        ];
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.chat.rx = Some(rx);
+        app.chat.sending = true;
+        app.chat.gen_start = Some(Instant::now());
+        app.chat.gen_model = "test".into();
+        tx.send(ChatEvent::Reasoning("think ".into())).unwrap();
+        tx.send(ChatEvent::Reasoning("step".into())).unwrap();
+        tx.send(ChatEvent::Content("answer".into())).unwrap();
+        tx.send(ChatEvent::Done).unwrap();
+        app.drain_chat_events();
+        let last = app.chat.messages.last().unwrap();
+        assert_eq!(
+            last.reasoning_content.as_deref(),
+            Some("think step"),
+            "reasoning deltas accumulated separately"
+        );
+        assert_eq!(last.content, "answer", "content deltas accumulated separately");
+        // Serialized request keeps them as distinct keys for prefix-cache.
+        let v = serde_json::to_value(&*app.chat.messages).unwrap();
+        let asst = &v[1];
+        assert_eq!(asst["content"], "answer");
+        assert_eq!(asst["reasoning_content"], "think step");
+        assert_eq!(app.chat.gen_tokens, 3);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn chat_message_legacy_json_without_reasoning_deserializes() {
+        // Old chat_history.json files lack the field; they must load as None.
+        let msg: ChatMessage = serde_json::from_value(serde_json::json!({
+            "role": "assistant",
+            "content": "old"
+        }))
+        .unwrap();
+        assert!(msg.reasoning_content.is_none());
+        let v = serde_json::to_value(&msg).unwrap();
+        assert!(v.get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn reasoning_empty_normalizes_to_none_on_done() {
+        let (mut app, dir) = test_app();
+        app.tab = Tab::Chat;
+        app.chat.messages = vec![
+            ChatMessage {
+                role: "user".into(),
+                content: "hi".into(),
+                reasoning_content: None,
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: String::new(),
+                reasoning_content: None,
+            },
+        ];
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.chat.rx = Some(rx);
+        app.chat.sending = true;
+        app.chat.gen_start = Some(Instant::now());
+        // No reasoning deltas, but an empty Some("") was somehow set.
+        app.chat.messages.last_mut().unwrap().reasoning_content = Some(String::new());
+        tx.send(ChatEvent::Content("hi".into())).unwrap();
+        tx.send(ChatEvent::Done).unwrap();
+        app.drain_chat_events();
+        assert!(app.chat.messages.last().unwrap().reasoning_content.is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

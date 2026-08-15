@@ -714,3 +714,72 @@ Execute methodically. Stop when checklist is complete.
 ```
 
 
+
+---
+
+## Outbound Apache-2.0 for v0.3.0 (2026-07-26)
+
+**Date:** 2026-07-26
+**Decided by:** Kaden Schutt (`@Kaden-Schutt`, `kaden@hipfire.dev`)
+**Status:** Implemented on the `beta` release line for v0.3.0.
+
+### What changed
+
+The project's **outbound** license — the license offered for the work
+as a whole — moves from "MIT OR Apache-2.0, at the recipient's option"
+to **Apache-2.0**. v0.3.0 is the first Apache-only release.
+
+### What did NOT change
+
+This is deliberately *not* a repeat of commit `79167568`, the unilateral
+whole-codebase relicense that the 2026-05-19 course correction reverted.
+Specifically:
+
+- **No per-file `SPDX-License-Identifier` was rewritten.** The tree
+  keeps its authorship-derived tags: 1073 `Apache-2.0`, 69
+  `MIT OR Apache-2.0`, 48 `MIT`.
+- **`LICENSE-MIT` is retained**, and remains the operative grant for
+  every MIT-tagged file.
+- **No contributor's work was relicensed in absentia.** The 119
+  MIT/dual files still carry their authors' original grants. Issue #305
+  (dual-license opt-in) remains the mechanism for changing any of them,
+  and remains open.
+- Releases up to and including **v0.2.1 stay dual-licensed**. That
+  grant is irrevocable for anyone holding those versions.
+
+### Legal basis
+
+Unchanged from the original analysis above: MIT's conditions (preserve
+copyright + permission notice) are a strict subset of Apache License
+2.0 § 4, and the ASF classifies MIT/X11 as Category A — freely
+combinable into an Apache-2.0 work. Offering the aggregate under
+Apache-2.0 while individual components remain MIT is the ordinary,
+well-trodden posture for a project with mixed contribution history; it
+requires no contributor consent because it grants no rights the
+contributors did not already grant.
+
+What recipients lose is the *option* to take the whole work under MIT.
+That is a downstream-consumer change, not a contributor-rights change,
+and it is the copyright holder's to make for his own Apache-2.0 files.
+
+### Files touched
+
+```
+Cargo.toml            license = "MIT" -> "Apache-2.0"   (was also simply
+                      wrong: it under-declared the then-dual posture)
+LICENSE               dual pointer -> Apache-2.0 + MIT-component note
+NOTICE                outbound Apache-2.0; MIT components retained;
+                      prior-history section extended
+CONTRIBUTING.md       licensing section + MIT-only election wording
+README.md             License section
+CITATION.cff          license: Apache-2.0; version 0.2.0 -> 0.3.0
+```
+
+### Follow-up
+
+To reach a *pure* Apache-2.0 tree (no MIT-tagged files), issue #305
+would need to be strengthened: it currently asks contributors to move
+MIT → `MIT OR Apache-2.0`, which is not sufficient. Affected copyright
+holders on the 119 files are Björn Bösel, alpineq, Robin Van Cauter,
+nickfinease, mad-lab-kbando, Grégory D, and Daniil Markevich. Absent
+their opt-in, those files stay MIT and `LICENSE-MIT` stays in the tree.

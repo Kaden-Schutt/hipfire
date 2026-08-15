@@ -1,0 +1,11 @@
+crates/hipfire-cli/src/main.rs
+crates/hipfire-dispatch/src/pipeline/mod.rs
+crates/rdna-compute/src/feature_flags.rs
+crates/rdna-compute/src/gemm.rs
+crates/rdna-compute/src/gemv.rs
+crates/rdna-compute/src/kernels.rs
+kernels/src/deepseek4_attn_swa_batched.hip
+kernels/src/deepseek4_attn_swa_buf.hip
+kernels/src/deepseek4_attn_swa_topk_batched.hip
+kernels/src/deepseek4_attn_swa_topk_buf.hip
+kernels/src/deepseek4_attn_swa_topk_direct_batched.hip

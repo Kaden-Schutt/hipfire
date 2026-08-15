@@ -1,0 +1,20 @@
+[feed] label=B-2052-mcp8192
+[feed] daemon=/mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/target/release/examples/daemon
+[feed] model=/mnt/scratch/models/deepseek-v4-flash-mq2r/deepseek-v4-flash.mq2r
+[feed] >> {"type":"ping"}
+GPU dev 0: gfx942 (205.8 GB VRAM, HIP 7.0)
+  pre-compiled kernels: /mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/.hipfire_kernels/gfx942
+[feed] << {"type":"pong"}
+[feed] pong in 0.26s
+[feed] >> {"type":"load","model":"/mnt/scratch/models/deepseek-v4-flash-mq2r/deepseek-v4-flash.mq2r","params":{"max_seq":4096,"kv_mode":"q8","kv_backend":"contiguous","speculation":"off","dflash_mode":"off","mtp_mode":"off","ngram_draft":false,"dspark_mode":"off"}}
+[rocblas] loaded for gfx942
+deepseek4: MQ2R P3 tensor recipe verified; gfx1151 route v2 is ineligible on gfx942, using portable dispatch
+[feed] << {"type":"loaded","arch":"deepseek4","dim":0,"layers":0,"vocab":0,"vl":false,"cache_capable":true,"retry_reset_eligible":false}
+[feed] loaded in 76.24s
+[feed] DECODE_PHASE_BEGIN
+[feed] >> {"type":"generate","id":"g0-B-2052-mcp8192","attempt_id":1,"prompt":"User: I need a production-grade explanation of ordinary batch-1 autoregressive decode on a DeepSeek V4 Flash style mixture-of-experts model running on AMD Instinct MI300X (gfx942). Please treat this as a measurement contract discussion rather than marketing. Cover the end-to-end path from a frozen prompt fixture through tokenizer identity, prefill, KV write, and token-by-token decode under Q8 KV with speculation fully disabled.
+[feed] << {"type":"error","message":"deepseek4prefill failed: \"htod n_active_topk_arr: HipError { code: 700, message: \\\"hipMemcpy H2D: an illegal memory access was encountered\\\" }\"","class":"internal","retryable":false,"rolled_back":false,"attempt_id":1,"id":"g0-B-2052-mcp8192"}
+[feed] terminal error: {'type': 'error', 'message': 'deepseek4prefill failed: "htod n_active_topk_arr: HipError { code: 700, message: \\"hipMemcpy H2D: an illegal memory access was encountered\\" }"', 'class': 'internal', 'retryable': False, 'rolled_back': False, 'attempt_id': 1, 'id': 'g0-B-2052-mcp8192'}
+[feed] DECODE_PHASE_END
+[feed] >> {"type":"unload"}
+[feed] << {"type":"unloaded"}

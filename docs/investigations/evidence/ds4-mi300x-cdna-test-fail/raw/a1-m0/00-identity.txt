@@ -1,0 +1,143 @@
+=== hostname / date ===
+7
+Sat Aug  1 02:01:39 PM UTC 2026
+
+=== rocminfo gfx ===
+  Marketing Name:          INTEL(R) XEON(R) PLATINUM 8568Y+   
+  Max Queue Number:        0(0x0)                             
+  Device Type:             CPU                                
+  BDFID:                   0                                  
+  Compute Unit:            20                                 
+  Name:                    gfx942                             
+  Marketing Name:          AMD Instinct MI300X VF             
+  Max Queue Number:        128(0x80)                          
+
+=== rocm-smi vram ===
+
+
+============================ ROCm System Management Interface ============================
+================================== Memory Usage (Bytes) ==================================
+GPU[0]		: VRAM Total Memory (B): 205822885888
+GPU[0]		: VRAM Total Used Memory (B): 299687936
+==========================================================================================
+================================== End of ROCm SMI Log ===================================
+
+=== rocm-smi pids ===
+
+
+============================ ROCm System Management Interface ============================
+===================================== KFD Processes ======================================
+KFD process information:
+PID 	PROCESS NAME	GPU(s)	VRAM USED	SDMA USED	CU OCCUPANCY	
+1823	gpuagent    	0     	0        	0        	0           	
+==========================================================================================
+================================== End of ROCm SMI Log ===================================
+
+=== kfd processes ===
+total 0
+drwxr-xr-x 3 root root 0 Aug  1 14:01 .
+drwxr-xr-x 5 root root 0 Aug  1 08:22 ..
+drwxr-xr-x 6 root root 0 Aug  1 12:16 1823
+pid=1823 cmd=/usr/local/bin/gpuagent 
+
+=== worktree identity ===
+pwd=/mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx
+branch=codex/ds4-mi300x-agentmaxx
+HEAD=d4ab7434a9dad15d0bf6456c8f3c12779ac0edb5
+diff_sha256=e14962b0c587642fc6661284569250a9dea23726b9597e7bd038efdffb17d1b2
+status_porcelain_count=33
+
+=== binaries ===
+target/release/hipfire size=7974176 sha256=fa7aa7fa257c6e249bc0e25f06908ff4b41d6a9576a6c7f581aea5461e8bdc88
+target/release/hipfire md5=6a03d862665e7b8237f6eb107af6f151
+target/release/examples/daemon size=24996920 sha256=838034a0efa6acdd172311f5aabe65e61370f59882b2840aa0f158120a800ca8
+target/release/examples/daemon md5=ce713501043c4f5775ec87c49779d51c
+target/release/examples/ds4_prompt_fixture size=4152928 sha256=01306dcc98606c12aaa9e407ffd923ade4ee20b0c3d1c5e997319759d4d4005a
+target/release/examples/ds4_prompt_fixture md5=529246273cf3d4a2261bd16eff3fd8f4
+target/release/examples/deepseek4_prefill_bench size=9868664 sha256=04eaad37512e59052d68297d407c463f203a97c7b22a05e057fcc4715a82890c
+target/release/examples/deepseek4_prefill_bench md5=91acba6a779db4dfe5e1ff59ac54db5a
+
+=== model ===
+-rw-rw-r-- 1 1000 1000 82191362222 Jul 24 22:20 /mnt/scratch/models/deepseek-v4-flash-mq2r/deepseek-v4-flash.mq2r
+model_size=82191362222
+
+=== free space ===
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/vdc1       5.0T  316G  4.5T   7% /mnt/scratch
+/dev/vda1       697G   54G  643G   8% /
+
+=== rocm / hipcc ===
+7.0.2
+HIP version: 7.14.60850-0000000
+AMD clang version 23.0.0git (https://github.com/ROCm/llvm-project.git 46fcb339fb61119b337f973c7ca9e710a319fdd0+PATCHED:440716f8b87be9d8e20ed910e10e5b6d14d57cf6)
+Target: x86_64-unknown-linux-gnu
+Thread model: posix
+InstalledDir: /opt/rocm-7.0.2/core-7.14/lib/llvm/bin
+
+=== env cargo ===
+/root/.cargo/bin/rustc
+/root/.cargo/bin/cargo
+rustc 1.97.1 (8bab26f4f 2026-07-14)
+
+=== existing bandwidth tools ===
+ls: cannot access '/opt/rocm/bin/rocm_bandwidth_test': No such file or directory
+ls: cannot access '/opt/rocm/bin/hipBusBandwidth': No such file or directory
+
+=== examples present ===
+total 80616
+drwxr-xr-x 2 root root     4096 Aug  1 13:50 .
+drwxr-xr-x 7 root root     4096 Aug  1 13:50 ..
+-rwxr-xr-x 2 root root 24996920 Aug  1 13:50 daemon
+-rwxr-xr-x 2 root root 24996920 Aug  1 13:50 daemon-02fcb105c0edf76e
+-rw-r--r-- 1 root root      323 Aug  1 13:50 daemon-02fcb105c0edf76e.d
+-rw-r--r-- 1 root root   116817 Aug  1 13:50 daemon.d
+-rwxr-xr-x 2 root root  9868664 Aug  1 12:45 deepseek4_prefill_bench
+-rwxr-xr-x 2 root root  9868664 Aug  1 12:45 deepseek4_prefill_bench-a263e473f6efee5a
+-rw-r--r-- 1 root root      429 Aug  1 12:45 deepseek4_prefill_bench-a263e473f6efee5a.d
+-rw-r--r-- 1 root root   109404 Aug  1 12:45 deepseek4_prefill_bench.d
+-rwxr-xr-x 2 root root  4152928 Aug  1 12:45 ds4_prompt_fixture
+-rwxr-xr-x 2 root root  4152928 Aug  1 12:45 ds4_prompt_fixture-d6cbf5e5ad0b923e
+-rw-r--r-- 1 root root      383 Aug  1 12:45 ds4_prompt_fixture-d6cbf5e5ad0b923e.d
+-rw-r--r-- 1 root root   116841 Aug  1 12:45 ds4_prompt_fixture.d
+-rwxr-xr-x 2 root root  2044368 Aug  1 12:45 test_kernels
+-rwxr-xr-x 2 root root  2044368 Aug  1 12:45 test_kernels-3046053f4b1704ff
+-rw-r--r-- 1 root root      353 Aug  1 12:45 test_kernels-3046053f4b1704ff.d
+-rw-r--r-- 1 root root   116829 Aug  1 12:45 test_kernels.d
+
+=== g0 driver ===
+-rwxr-xr-x 1 root root 7863 Aug  1 13:46 /mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/g0-coherence-driver.py
+total 404
+drwxr-xr-x  4 root root  4096 Aug  1 13:49 .
+drwxr-xr-x 12 root root  4096 Aug  1 12:43 ..
+-rw-r--r--  1 root root  4431 Aug  1 12:43 adaptive_kv_long_prefill.txt
+-rw-r--r--  1 root root  3132 Aug  1 12:43 agentic_hermes_system.txt
+-rw-r--r--  1 root root  5274 Aug  1 12:43 agentic_pi_system.txt
+-rw-r--r--  1 root root   913 Aug  1 12:43 agentic_synthetic_corrupt.txt
+-rw-r--r--  1 root root   104 Aug  1 12:43 agentic_user_multistep.txt
+-rw-r--r--  1 root root    82 Aug  1 12:43 agentic_user_read.txt
+-rw-r--r--  1 root root   159 Aug  1 12:43 bare_factual.txt
+-rw-r--r--  1 root root 24592 Aug  1 12:43 cohere2moe_long.txt
+-rw-r--r--  1 root root   727 Aug  1 12:43 coherence_lloyd_long.txt
+-rw-r--r--  1 root root 44844 Aug  1 12:43 deepseek4_mq2r_prose_ctx8192.txt
+-rw-r--r--  1 root root    76 Aug  1 12:43 dflash_resident_smoke.txt
+drwxr-xr-x  2 root root  4096 Aug  1 12:43 dirty
+-rw-rw-r--  1 1000 1000 18377 Aug  1 12:28 ds4-gfx942-ar-2048.source.txt
+-rw-r--r--  1 root root   134 Aug  1 12:43 fiction_lighthouse.txt
+-rw-r--r--  1 root root   158 Aug  1 12:43 gfx1100_router_sheep.json
+-rw-r--r--  1 root root   348 Aug  1 12:43 humaneval_0_has_close_elements.txt
+-rw-r--r--  1 root root   329 Aug  1 12:43 humaneval_2_truncate.txt
+-rw-r--r--  1 root root   448 Aug  1 12:43 humaneval_3_below_zero.txt
+-rw-r--r--  1 root root 46765 Aug  1 12:43 longcode_pflash.jsonl
+-rw-r--r--  1 root root 59028 Aug  1 12:43 longcode_pflash.tok.jsonl
+-rw-r--r--  1 root root 45311 Aug  1 12:43 longprose_multidoc.jsonl
+-rw-r--r--  1 root root 40020 Aug  1 12:43 longprose_multidoc.tok.jsonl
+-rw-r--r--  1 root root   885 Aug  1 12:43 lru_cache_pep8_strict.txt
+-rw-r--r--  1 root root   883 Aug  1 12:43 lru_cache_single_blank.txt
+-rw-r--r--  1 root root   140 Aug  1 12:43 merge_sort_thinking_off.txt
+-rw-r--r--  1 root root   175 Aug  1 12:43 mixed_code_then_prose.txt
+-rw-r--r--  1 root root   260 Aug  1 12:43 prose_river_short.txt
+-rw-r--r--  1 root root    83 Aug  1 12:43 qwen2_smoke.txt
+drwxr-xr-x  2 root root  4096 Aug  1 12:43 sweep
+-rw-r--r--  1 root root    45 Aug  1 12:43 tool_call_read_file.txt
+-rw-r--r--  1 root root   755 Aug  1 12:43 tool_call_system.txt
+-rw-r--r--  1 root root   206 Aug  1 12:43 trains-meet.txt

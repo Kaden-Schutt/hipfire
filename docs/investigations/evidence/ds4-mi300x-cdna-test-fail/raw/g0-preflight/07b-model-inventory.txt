@@ -1,0 +1,2531 @@
+=== TREE models ===
+d 4096 2026-08-01T08:41 /mnt/scratch/models
+d 4096 2026-08-01T08:32 /mnt/scratch/models/DeepSeek-V4-Flash-0731
+d 4096 2026-08-01T08:31 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache
+d 4096 2026-08-01T08:31 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface
+f 1 2026-08-01T08:31 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/.gitignore
+f 191 2026-08-01T08:31 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/CACHEDIR.TAG
+d 16384 2026-08-01T08:32 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download
+d 4096 2026-08-01T08:31 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/trees
+f 1519 2026-08-01T08:31 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.gitattributes
+f 1084 2026-08-01T08:31 /mnt/scratch/models/DeepSeek-V4-Flash-0731/LICENSE
+f 7238 2026-08-01T08:31 /mnt/scratch/models/DeepSeek-V4-Flash-0731/README.md
+f 1888 2026-08-01T08:31 /mnt/scratch/models/DeepSeek-V4-Flash-0731/config.json
+d 4096 2026-08-01T08:31 /mnt/scratch/models/DeepSeek-V4-Flash-0731/encoding
+f 9168 2026-08-01T08:31 /mnt/scratch/models/DeepSeek-V4-Flash-0731/encoding/README.md
+f 29001 2026-08-01T08:31 /mnt/scratch/models/DeepSeek-V4-Flash-0731/encoding/encoding_dsv4.py
+f 3741 2026-08-01T08:31 /mnt/scratch/models/DeepSeek-V4-Flash-0731/encoding/test_encoding_dsv4.py
+d 4096 2026-08-01T08:31 /mnt/scratch/models/DeepSeek-V4-Flash-0731/encoding/tests
+f 2748 2026-08-01T08:31 /mnt/scratch/models/DeepSeek-V4-Flash-0731/encoding/tests/test_input_1.json
+f 526 2026-08-01T08:31 /mnt/scratch/models/DeepSeek-V4-Flash-0731/encoding/tests/test_input_2.json
+f 4546 2026-08-01T08:31 /mnt/scratch/models/DeepSeek-V4-Flash-0731/encoding/tests/test_input_3.json
+f 2730 2026-08-01T08:31 /mnt/scratch/models/DeepSeek-V4-Flash-0731/encoding/tests/test_input_4.json
+f 2390 2026-08-01T08:31 /mnt/scratch/models/DeepSeek-V4-Flash-0731/encoding/tests/test_output_1.txt
+f 342 2026-08-01T08:31 /mnt/scratch/models/DeepSeek-V4-Flash-0731/encoding/tests/test_output_2.txt
+f 3313 2026-08-01T08:31 /mnt/scratch/models/DeepSeek-V4-Flash-0731/encoding/tests/test_output_3.txt
+f 2552 2026-08-01T08:31 /mnt/scratch/models/DeepSeek-V4-Flash-0731/encoding/tests/test_output_4.txt
+f 170 2026-08-01T08:31 /mnt/scratch/models/DeepSeek-V4-Flash-0731/generation_config.json
+d 4096 2026-08-01T08:31 /mnt/scratch/models/DeepSeek-V4-Flash-0731/inference
+f 951 2026-08-01T08:31 /mnt/scratch/models/DeepSeek-V4-Flash-0731/inference/README.md
+f 1162 2026-08-01T08:31 /mnt/scratch/models/DeepSeek-V4-Flash-0731/inference/config.json
+f 6639 2026-08-01T08:31 /mnt/scratch/models/DeepSeek-V4-Flash-0731/inference/convert.py
+f 5804 2026-08-01T08:31 /mnt/scratch/models/DeepSeek-V4-Flash-0731/inference/generate.py
+f 22198 2026-08-01T08:31 /mnt/scratch/models/DeepSeek-V4-Flash-0731/inference/kernel.py
+f 45118 2026-08-01T08:31 /mnt/scratch/models/DeepSeek-V4-Flash-0731/inference/model.py
+f 92 2026-08-01T08:31 /mnt/scratch/models/DeepSeek-V4-Flash-0731/inference/requirements.txt
+f 1059061856 2026-08-01T08:31 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00001-of-00048.safetensors
+f 3566321192 2026-08-01T08:32 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00002-of-00048.safetensors
+f 3566321192 2026-08-01T08:32 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00003-of-00048.safetensors
+f 3596229272 2026-08-01T08:32 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00004-of-00048.safetensors
+f 3568768976 2026-08-01T08:32 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00005-of-00048.safetensors
+f 3590024776 2026-08-01T08:32 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00006-of-00048.safetensors
+f 3568768976 2026-08-01T08:32 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00007-of-00048.safetensors
+f 3590024776 2026-08-01T08:32 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00008-of-00048.safetensors
+f 3568768976 2026-08-01T08:32 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00009-of-00048.safetensors
+f 3590024776 2026-08-01T08:32 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00010-of-00048.safetensors
+f 3568768976 2026-08-01T08:32 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00011-of-00048.safetensors
+f 3590026352 2026-08-01T08:32 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00012-of-00048.safetensors
+f 3568770544 2026-08-01T08:32 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00013-of-00048.safetensors
+f 3590026352 2026-08-01T08:32 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00014-of-00048.safetensors
+f 3568770544 2026-08-01T08:32 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00015-of-00048.safetensors
+f 3590026352 2026-08-01T08:32 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00016-of-00048.safetensors
+f 3568770544 2026-08-01T08:32 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00017-of-00048.safetensors
+f 3590026352 2026-08-01T08:32 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00018-of-00048.safetensors
+f 3568770544 2026-08-01T08:32 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00019-of-00048.safetensors
+f 3590026352 2026-08-01T08:32 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00020-of-00048.safetensors
+f 3568770544 2026-08-01T08:32 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00021-of-00048.safetensors
+f 3590026352 2026-08-01T08:32 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00022-of-00048.safetensors
+f 3568770544 2026-08-01T08:32 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00023-of-00048.safetensors
+f 3590026352 2026-08-01T08:32 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00024-of-00048.safetensors
+f 3568770544 2026-08-01T08:32 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00025-of-00048.safetensors
+f 3590026352 2026-08-01T08:32 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00026-of-00048.safetensors
+f 3568770544 2026-08-01T08:32 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00027-of-00048.safetensors
+f 3590026352 2026-08-01T08:32 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00028-of-00048.safetensors
+f 3568770544 2026-08-01T08:32 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00029-of-00048.safetensors
+f 3590026352 2026-08-01T08:32 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00030-of-00048.safetensors
+f 3568770544 2026-08-01T08:32 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00031-of-00048.safetensors
+f 3590026352 2026-08-01T08:32 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00032-of-00048.safetensors
+f 3568770544 2026-08-01T08:32 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00033-of-00048.safetensors
+f 3590026352 2026-08-01T08:32 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00034-of-00048.safetensors
+f 3568770544 2026-08-01T08:32 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00035-of-00048.safetensors
+f 3590026352 2026-08-01T08:32 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00036-of-00048.safetensors
+f 3568770544 2026-08-01T08:32 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00037-of-00048.safetensors
+f 3590026352 2026-08-01T08:32 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00038-of-00048.safetensors
+f 3568770544 2026-08-01T08:32 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00039-of-00048.safetensors
+f 3590026352 2026-08-01T08:32 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00040-of-00048.safetensors
+f 3568770544 2026-08-01T08:32 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00041-of-00048.safetensors
+f 3590026352 2026-08-01T08:32 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00042-of-00048.safetensors
+f 3568770544 2026-08-01T08:32 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00043-of-00048.safetensors
+f 3590026352 2026-08-01T08:32 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00044-of-00048.safetensors
+f 1059332516 2026-08-01T08:32 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00045-of-00048.safetensors
+f 3610455184 2026-08-01T08:32 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00046-of-00048.safetensors
+f 3560111960 2026-08-01T08:32 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00047-of-00048.safetensors
+f 3692775244 2026-08-01T08:32 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00048-of-00048.safetensors
+f 5602871 2026-08-01T08:32 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model.safetensors.index.json
+f 6367146 2026-08-01T08:32 /mnt/scratch/models/DeepSeek-V4-Flash-0731/tokenizer.json
+f 801 2026-08-01T08:32 /mnt/scratch/models/DeepSeek-V4-Flash-0731/tokenizer_config.json
+d 4096 2026-08-01T08:34 /mnt/scratch/models/deepseek-v4-flash-mq2r
+f 82191362222 2026-07-24T22:20 /mnt/scratch/models/deepseek-v4-flash-mq2r/deepseek-v4-flash.mq2r
+d 4096 2026-05-27T03:11 /mnt/scratch/models/existing-deepseek-v4-flash
+d 4096 2026-05-27T03:02 /mnt/scratch/models/existing-deepseek-v4-flash/.cache
+d 4096 2026-05-27T03:02 /mnt/scratch/models/existing-deepseek-v4-flash/.cache/huggingface
+f 1 2026-05-27T03:02 /mnt/scratch/models/existing-deepseek-v4-flash/.cache/huggingface/.gitignore
+d 4096 2026-05-27T03:11 /mnt/scratch/models/existing-deepseek-v4-flash/.cache/huggingface/download
+f 1998047355 2026-05-27T03:03 /mnt/scratch/models/existing-deepseek-v4-flash/deepseek-v4-flash-mtp.mq2lloyd
+f 86184307283 2026-05-27T03:11 /mnt/scratch/models/existing-deepseek-v4-flash/deepseek-v4-flash.mq2lloyd
+d 4096 2026-08-01T08:41 /mnt/scratch/models/qwen3.5-0.8b
+f 549221504 2026-04-11T00:03 /mnt/scratch/models/qwen3.5-0.8b/qwen3.5-0.8b.mq4
+
+=== TREE hipfire models ===
+d 4096 2026-08-01T08:28 /root/.hipfire/models
+d 4096 2026-08-01T08:28 /root/.hipfire/models/hipfire-deepseek-v4-flash
+d 4096 2026-08-01T08:28 /root/.hipfire/models/hipfire-deepseek-v4-flash/.cache
+d 4096 2026-08-01T08:28 /root/.hipfire/models/hipfire-deepseek-v4-flash/.cache/huggingface
+d 4096 2026-05-27T03:11 /root/.hipfire/models/hipfire-deepseek-v4-flash/.cache/huggingface/download
+f 24117248 2026-08-01T08:28 /root/.hipfire/models/hipfire-deepseek-v4-flash/deepseek-v4-flash-mtp.mq2lloyd
+
+=== candidate binary/weight files fingerprint ===
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/.gitattributes.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/LICENSE.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/README.md.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/README.md.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/config.json.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/README.md.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/README.md.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/encoding_dsv4.py.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/test_encoding_dsv4.py.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_input_1.json.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_input_2.json.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_input_3.json.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_input_4.json.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_output_1.txt.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_output_2.txt.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_output_3.txt.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_output_4.txt.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/generation_config.json.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/inference/README.md.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/inference/README.md.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/inference/config.json.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/inference/convert.py.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/inference/generate.py.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/inference/kernel.py.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/inference/model.py.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/inference/requirements.txt.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00001-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00002-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00003-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00004-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00005-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00006-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00007-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00008-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00009-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00010-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00011-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00012-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00013-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00014-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00015-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00016-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00017-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00018-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00019-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00020-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00021-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00022-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00023-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00024-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00025-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00026-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00027-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00028-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00029-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00030-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00031-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00032-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00033-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00034-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00035-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00036-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00037-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00038-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00039-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00040-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00041-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00042-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00043-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00044-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00045-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00046-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00047-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00048-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model.safetensors.index.json.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/tokenizer.json.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/tokenizer.json.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/tokenizer_config.json.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/tokenizer_config.json.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/trees/7872f01b1d1fe23eabc4c98b48bffcef5a386062.json
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.gitattributes
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/README.md
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/config.json
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/encoding/README.md
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/encoding/tests/test_input_1.json
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/encoding/tests/test_input_2.json
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/encoding/tests/test_input_3.json
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/encoding/tests/test_input_4.json
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/generation_config.json
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/inference/README.md
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/inference/config.json
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00001-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00002-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00003-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00004-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00005-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00006-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00007-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00008-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00009-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00010-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00011-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00012-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00013-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00014-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00015-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00016-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00017-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00018-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00019-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00020-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00021-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00022-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00023-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00024-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00025-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00026-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00027-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00028-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00029-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00030-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00031-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00032-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00033-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00034-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00035-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00036-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00037-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00038-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00039-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00040-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00041-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00042-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00043-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00044-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00045-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00046-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00047-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00048-of-00048.safetensors
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/model.safetensors.index.json
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/tokenizer.json
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/tokenizer_config.json
+/mnt/scratch/models/deepseek-v4-flash-mq2r/deepseek-v4-flash.mq2r
+/mnt/scratch/models/existing-deepseek-v4-flash/.cache/huggingface/download/deepseek-v4-flash-mtp.mq2lloyd.metadata
+/mnt/scratch/models/existing-deepseek-v4-flash/.cache/huggingface/download/deepseek-v4-flash.mq2lloyd.metadata
+/mnt/scratch/models/existing-deepseek-v4-flash/deepseek-v4-flash-mtp.mq2lloyd
+/mnt/scratch/models/existing-deepseek-v4-flash/deepseek-v4-flash.mq2lloyd
+/mnt/scratch/models/qwen3.5-0.8b/qwen3.5-0.8b.mq4
+/root/.hipfire/models/hipfire-deepseek-v4-flash/deepseek-v4-flash-mtp.mq2lloyd
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/.gitattributes.metadata ----
+SIZE_BYTES=101
+MTIME=2026-08-01 08:31:56.001780513 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a6136333434616163386330393235336233623633306662
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a61 3633 3434 6161  5a386062.a6344aa
+00000030: 6338 6330 3932 3533 6233 6236 3330 6662  c8c09253b3b630fb
+FULL_SHA256=bd2584622eef9bafa684fe1ac69439387f14f6f9887e63e9bba7c8cbc1734af9  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/.gitattributes.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/LICENSE.metadata ----
+SIZE_BYTES=100
+MTIME=2026-08-01 08:31:56.098778384 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a6436326533626566396630353466323162376663363136
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a64 3632 6533 6265  5a386062.d62e3be
+00000030: 6639 6630 3534 6632 3162 3766 6336 3136  f9f054f21b7fc616
+FULL_SHA256=df3556611c21bbb211c49159c9beec0c1bf7b911629289eba17d9984deb50783  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/LICENSE.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/README.md.lock ----
+SIZE_BYTES=0
+MTIME=2026-08-01 08:31:56.030779876 +0000
+HEAD64_HEX=HEAD64_ASCII=FULL_SHA256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/README.md.lock
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/README.md.metadata ----
+SIZE_BYTES=101
+MTIME=2026-08-01 08:31:56.031779854 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a6431316565636132303133363234346536343364636232
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a64 3131 6565 6361  5a386062.d11eeca
+00000030: 3230 3133 3632 3434 6536 3433 6463 6232  20136244e643dcb2
+FULL_SHA256=a9c36327f3b3204f171c4fb8ce808888e5f2435387ed06111d0afc517fbb19ef  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/README.md.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/config.json.metadata ----
+SIZE_BYTES=101
+MTIME=2026-08-01 08:31:56.001780513 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a3566326461393130303033366233396532366562653561
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a35 6632 6461 3931  5a386062.5f2da91
+00000030: 3030 3033 3662 3339 6532 3665 6265 3561  00036b39e26ebe5a
+FULL_SHA256=2b707c3297e29debc0dde6e8f4196ee6edd368a4bc42c25505fd4f36d669fe27  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/config.json.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/README.md.lock ----
+SIZE_BYTES=0
+MTIME=2026-08-01 08:31:56.020780096 +0000
+HEAD64_HEX=HEAD64_ASCII=FULL_SHA256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/README.md.lock
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/README.md.metadata ----
+SIZE_BYTES=101
+MTIME=2026-08-01 08:31:56.021780074 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a3738643933613861346464323433373833353635323339
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a37 3864 3933 6138  5a386062.78d93a8
+00000030: 6134 6464 3234 3337 3833 3536 3532 3339  a4dd243783565239
+FULL_SHA256=5d1ba9c1ef5a742c1ef47337bc4acb011b1991142bd50394870f0d1aa0d934b4  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/README.md.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/encoding_dsv4.py.metadata ----
+SIZE_BYTES=101
+MTIME=2026-08-01 08:31:56.023780030 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a3636663264333065636535613933653038666261623437
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a36 3666 3264 3330  5a386062.66f2d30
+00000030: 6563 6535 6139 3365 3038 6662 6162 3437  ece5a93e08fbab47
+FULL_SHA256=f8ae840b95981959f400ff496ff18d05c444fb69e79dd9da6ff10662c5e44d65  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/encoding_dsv4.py.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/test_encoding_dsv4.py.metadata ----
+SIZE_BYTES=101
+MTIME=2026-08-01 08:31:56.023780030 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a3163383936653739376533663063633661393566366464
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a31 6338 3936 6537  5a386062.1c896e7
+00000030: 3937 6533 6630 6363 3661 3935 6636 6464  97e3f0cc6a95f6dd
+FULL_SHA256=9f824118207816fb32edbd924226256a197a6c785251b46c75ef9c297a87ba16  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/test_encoding_dsv4.py.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_input_1.json.metadata ----
+SIZE_BYTES=101
+MTIME=2026-08-01 08:31:56.037779722 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a6434323362323231666138383135336138323666373732
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a64 3432 3362 3232  5a386062.d423b22
+00000030: 3166 6138 3831 3533 6138 3236 6637 3732  1fa88153a826f772
+FULL_SHA256=edcb55c7fe9ad3c4a1cce9acba00061c472938a3f390d15daf347954e281e185  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_input_1.json.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_input_2.json.metadata ----
+SIZE_BYTES=101
+MTIME=2026-08-01 08:31:56.063779152 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a3133623334353461393032646565636166653735363434
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a31 3362 3334 3534  5a386062.13b3454
+00000030: 6139 3032 6465 6563 6166 6537 3536 3434  a902deecafe75644
+FULL_SHA256=a14c51be610d12cbdf328507737104373849e264c603d710a050aa025f564180  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_input_2.json.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_input_3.json.metadata ----
+SIZE_BYTES=101
+MTIME=2026-08-01 08:31:56.020780096 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a3130303334383434656466633333623935346165353330
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a31 3030 3334 3834  5a386062.1003484
+00000030: 3465 6466 6333 3362 3935 3461 6535 3330  4edfc33b954ae530
+FULL_SHA256=4d6a4b596acade3c6b52740e9ff14feb43720019d78e9c566e81f67babc01a4f  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_input_3.json.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_input_4.json.metadata ----
+SIZE_BYTES=101
+MTIME=2026-08-01 08:31:56.052779393 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a6435653037393164643639393761323030376633616139
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a64 3565 3037 3931  5a386062.d5e0791
+00000030: 6464 3639 3937 6132 3030 3766 3361 6139  dd6997a2007f3aa9
+FULL_SHA256=1aa92bdc9df551f8f6b34dcca09d9e3679fcce049032bf55b2a60b0638d12031  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_input_4.json.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_output_1.txt.metadata ----
+SIZE_BYTES=101
+MTIME=2026-08-01 08:31:56.065779108 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a3765336339626435613339343631376630326437363338
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a37 6533 6339 6264  5a386062.7e3c9bd
+00000030: 3561 3339 3436 3137 6630 3264 3736 3338  5a394617f02d7638
+FULL_SHA256=0c145d06627329334ce402d531b677545d0604c94e3ab1366d8c42e45069e8d3  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_output_1.txt.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_output_2.txt.metadata ----
+SIZE_BYTES=101
+MTIME=2026-08-01 08:31:56.056779305 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a6663333937656635343937323861643630383361353737
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a66 6333 3937 6566  5a386062.fc397ef
+00000030: 3534 3937 3238 6164 3630 3833 6135 3737  549728ad6083a577
+FULL_SHA256=b2c74f341696591dc393c9aa48e48d5029437665d0b353d7faa1cead548515a9  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_output_2.txt.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_output_3.txt.metadata ----
+SIZE_BYTES=100
+MTIME=2026-08-01 08:31:56.076778867 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a6564656535363333303064343962306334366166313432
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a65 6465 6535 3633  5a386062.edee563
+00000030: 3330 3064 3439 6230 6334 3661 6631 3432  300d49b0c46af142
+FULL_SHA256=412e930cd6e1d8a192bd6e0078749101d126478a1c5bc959c68e047dd9b6ab10  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_output_3.txt.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_output_4.txt.metadata ----
+SIZE_BYTES=101
+MTIME=2026-08-01 08:31:56.059779240 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a6433306264356430366366333966653131306263343430
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a64 3330 6264 3564  5a386062.d30bd5d
+00000030: 3036 6366 3339 6665 3131 3062 6334 3430  06cf39fe110bc440
+FULL_SHA256=5ce847b46cf31647d70c95a705a0da975d2df56c8cfa4389a9a1e30dbd84ed28  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_output_4.txt.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/generation_config.json.metadata ----
+SIZE_BYTES=101
+MTIME=2026-08-01 08:31:56.070778998 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a6335366138633562663036666637373430623661333365
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a63 3536 6138 6335  5a386062.c56a8c5
+00000030: 6266 3036 6666 3737 3430 6236 6133 3365  bf06ff7740b6a33e
+FULL_SHA256=e5829147ab45905cbce28adcf3fe509fac68435ad5a9f2e881dca881377abfb0  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/generation_config.json.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/inference/README.md.lock ----
+SIZE_BYTES=0
+MTIME=2026-08-01 08:31:56.090778559 +0000
+HEAD64_HEX=HEAD64_ASCII=FULL_SHA256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/inference/README.md.lock
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/inference/README.md.metadata ----
+SIZE_BYTES=101
+MTIME=2026-08-01 08:31:56.091778537 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a6531313537373232396535653562366638326636383766
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a65 3131 3537 3732  5a386062.e115772
+00000030: 3239 6535 6535 6236 6638 3266 3638 3766  29e5e5b6f82f687f
+FULL_SHA256=39f3cef84b14b479c80db255f9af8760cd8fc38e1da4bbfd79cc00439ece81f0  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/inference/README.md.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/inference/config.json.metadata ----
+SIZE_BYTES=100
+MTIME=2026-08-01 08:31:56.087778625 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a6165383231613234316564653230353132633834663465
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a61 6538 3231 6132  5a386062.ae821a2
+00000030: 3431 6564 6532 3035 3132 6338 3466 3465  41ede20512c84f4e
+FULL_SHA256=1af7abc5cf0cc669a4a15f22aa1eb0ec0a1a68a5bed2a3874862f5153b895590  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/inference/config.json.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/inference/convert.py.metadata ----
+SIZE_BYTES=101
+MTIME=2026-08-01 08:31:56.158777067 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a6162306233636237613132326337383562616430663832
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a61 6230 6233 6362  5a386062.ab0b3cb
+00000030: 3761 3132 3263 3738 3562 6164 3066 3832  7a122c785bad0f82
+FULL_SHA256=b4ec0a51175d72cea2585d43454db4b5631a42cec2048f0a3d8447dd46644848  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/inference/convert.py.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/inference/generate.py.metadata ----
+SIZE_BYTES=101
+MTIME=2026-08-01 08:31:56.095778449 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a3766396261393236363266636163363266373135633962
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a37 6639 6261 3932  5a386062.7f9ba92
+00000030: 3636 3266 6361 6336 3266 3731 3563 3962  662fcac62f715c9b
+FULL_SHA256=f7abf7c188f322cb54cf1bb8f29b9874737d4ed8014ca848b74b26250e74f064  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/inference/generate.py.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/inference/kernel.py.metadata ----
+SIZE_BYTES=101
+MTIME=2026-08-01 08:31:56.097778406 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a6164353530636531333338326139363465633536313361
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a61 6435 3530 6365  5a386062.ad550ce
+00000030: 3133 3338 3261 3936 3465 6335 3631 3361  13382a964ec5613a
+FULL_SHA256=8f54b95b9e7735364a8a18d73e98a684f71919858a7ff69d163d094d91ddbe0c  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/inference/kernel.py.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/inference/model.py.metadata ----
+SIZE_BYTES=101
+MTIME=2026-08-01 08:31:56.096778427 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a3736313232646139386139616264336563616239653365
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a37 3631 3232 6461  5a386062.76122da
+00000030: 3938 6139 6162 6433 6563 6162 3965 3365  98a9abd3ecab9e3e
+FULL_SHA256=f7932a5836820a9a1ea138f7741770e86542bba95aeac14d1497fa1bb8094d95  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/inference/model.py.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/inference/requirements.txt.metadata ----
+SIZE_BYTES=100
+MTIME=2026-08-01 08:31:56.103778274 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a3765316363373863333331323335383263303035333861
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a37 6531 6363 3738  5a386062.7e1cc78
+00000030: 6333 3331 3233 3538 3263 3030 3533 3861  c33123582c00538a
+FULL_SHA256=20875869f797d3012756bfad6f4d547c2f2ed9be083f5ee4d51c420a43b3f6e0  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/inference/requirements.txt.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00001-of-00048.safetensors.metadata ----
+SIZE_BYTES=125
+MTIME=2026-08-01 08:31:57.596745591 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a6633363638626134636363663163613661376562383465
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a66 3336 3638 6261  5a386062.f3668ba
+00000030: 3463 6363 6631 6361 3661 3765 6238 3465  4cccf1ca6a7eb84e
+FULL_SHA256=f19a4e1edbaa6d5d2b1de6a2f5ab73a39eb3741a4f41787d13b502499b843ea6  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00001-of-00048.safetensors.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00002-of-00048.safetensors.metadata ----
+SIZE_BYTES=125
+MTIME=2026-08-01 08:32:15.224382824 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a3737623236633933396130653235623331313363386436
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a37 3762 3236 6339  5a386062.77b26c9
+00000030: 3339 6130 6532 3562 3331 3133 6338 6436  39a0e25b3113c8d6
+FULL_SHA256=2d7f226d005e0e550a94e45d5f5d87dddbce0bd25d89265c59d4737ebf79dc1c  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00002-of-00048.safetensors.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00003-of-00048.safetensors.metadata ----
+SIZE_BYTES=125
+MTIME=2026-08-01 08:32:07.014546580 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a3431326162663463393036666161646332323165663063
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a34 3132 6162 6634  5a386062.412abf4
+00000030: 6339 3036 6661 6164 6332 3231 6566 3063  c906faadc221ef0c
+FULL_SHA256=2b91c8950cc759b7f14b94cff9c92c8199e4568372d48a33e6a161b095c81c86  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00003-of-00048.safetensors.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00004-of-00048.safetensors.metadata ----
+SIZE_BYTES=125
+MTIME=2026-08-01 08:32:06.161564110 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a3936313066353662633538376662306666396138623638
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a39 3631 3066 3536  5a386062.9610f56
+00000030: 6263 3538 3766 6230 6666 3961 3862 3638  bc587fb0ff9a8b68
+FULL_SHA256=7f2bfd67a720606747626052ce733f6ec8e2588bfffdc62d310662e03e541428  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00004-of-00048.safetensors.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00005-of-00048.safetensors.metadata ----
+SIZE_BYTES=125
+MTIME=2026-08-01 08:32:07.116544497 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a6638376135616337623862656363333166396333313639
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a66 3837 6135 6163  5a386062.f87a5ac
+00000030: 3762 3862 6563 6333 3166 3963 3331 3639  7b8becc31f9c3169
+FULL_SHA256=7e9b27851d0d0fa35be73af1e030009b08b0af5e81f3014dd366680426e14d61  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00005-of-00048.safetensors.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00006-of-00048.safetensors.metadata ----
+SIZE_BYTES=124
+MTIME=2026-08-01 08:32:07.292540904 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a3461346633373634653366633737326239666261363766
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a34 6134 6633 3736  5a386062.4a4f376
+00000030: 3465 3366 6337 3732 6239 6662 6136 3766  4e3fc772b9fba67f
+FULL_SHA256=a87ad43627ee60f7b296183bb9a73e4ad8b242f578dc1ec2af663993dbc5906a  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00006-of-00048.safetensors.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00007-of-00048.safetensors.metadata ----
+SIZE_BYTES=124
+MTIME=2026-08-01 08:32:07.675533083 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a6466383162623830653237613638396530316661353739
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a64 6638 3162 6238  5a386062.df81bb8
+00000030: 3065 3237 6136 3839 6530 3166 6135 3739  0e27a689e01fa579
+FULL_SHA256=24c347b212a80ed525260a76de5e5a17e62d64b26ff8a56ec9ec8e6d0835d765  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00007-of-00048.safetensors.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00008-of-00048.safetensors.metadata ----
+SIZE_BYTES=125
+MTIME=2026-08-01 08:32:05.407579687 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a3232343936386432623237663836363933363565633038
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a32 3234 3936 3864  5a386062.224968d
+00000030: 3262 3237 6638 3636 3933 3635 6563 3038  2b27f8669365ec08
+FULL_SHA256=25b3c97f292e85bc67f98109bc9777bdf0e3a5c68fb4dfbf125ef8657f7bbbd2  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00008-of-00048.safetensors.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00009-of-00048.safetensors.metadata ----
+SIZE_BYTES=125
+MTIME=2026-08-01 08:32:07.525536146 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a3034643639656631303731666666383732316336323936
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a30 3464 3639 6566  5a386062.04d69ef
+00000030: 3130 3731 6666 6638 3732 3163 3632 3936  1071fff8721c6296
+FULL_SHA256=87a4813186e709f74311b035826b2c565d9ca700959f5bf571b78fad6e2e8258  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00009-of-00048.safetensors.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00010-of-00048.safetensors.metadata ----
+SIZE_BYTES=125
+MTIME=2026-08-01 08:32:09.528495518 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a3632373134356634656265623163633366356264643033
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a36 3237 3134 3566  5a386062.627145f
+00000030: 3465 6265 6231 6363 3366 3562 6464 3033  4ebeb1cc3f5bdd03
+FULL_SHA256=82efc6945b2170e13bd6d3624f9014c528b9457e068baac053a9dd416764f960  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00010-of-00048.safetensors.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00011-of-00048.safetensors.metadata ----
+SIZE_BYTES=125
+MTIME=2026-08-01 08:32:14.428398328 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a6534623865363031646362656265393032653031303265
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a65 3462 3865 3630  5a386062.e4b8e60
+00000030: 3164 6362 6562 6539 3032 6530 3130 3265  1dcbebe902e0102e
+FULL_SHA256=7ddfd071e56fcc70fee9302e7eaec8224ef765b06032f0924a0f10a30b7fb1e4  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00011-of-00048.safetensors.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00012-of-00048.safetensors.metadata ----
+SIZE_BYTES=124
+MTIME=2026-08-01 08:32:13.428417913 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a3634656434653566363132366261303239633436326339
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a36 3465 6434 6535  5a386062.64ed4e5
+00000030: 6636 3132 3662 6130 3239 6334 3632 6339  f6126ba029c462c9
+FULL_SHA256=4d8dad513a3582051c70fa50c4cf5d0adecf4ba772e05281e8ef1e4ed09e44e8  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00012-of-00048.safetensors.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00013-of-00048.safetensors.metadata ----
+SIZE_BYTES=125
+MTIME=2026-08-01 08:32:11.570454640 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a3864666531393964303763303764646431343163326330
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a38 6466 6531 3939  5a386062.8dfe199
+00000030: 6430 3763 3037 6464 6431 3431 6332 6330  d07c07ddd141c2c0
+FULL_SHA256=02f36339f834ed8b8d65fa19aa68891fc65349baeae35a822751ea55f3a43cc7  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00013-of-00048.safetensors.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00014-of-00048.safetensors.metadata ----
+SIZE_BYTES=125
+MTIME=2026-08-01 08:32:10.907467843 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a3435646232663534306638323566393234353363353033
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a34 3564 6232 6635  5a386062.45db2f5
+00000030: 3430 6638 3235 6639 3234 3533 6335 3033  40f825f92453c503
+FULL_SHA256=0053774afac1b06ecb2f1a1c827d2484f67c22b2f69d4a386160a71cce96293a  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00014-of-00048.safetensors.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00015-of-00048.safetensors.metadata ----
+SIZE_BYTES=125
+MTIME=2026-08-01 08:32:12.500436202 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a3538313033383161306630356237333831633030326432
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a35 3831 3033 3831  5a386062.5810381
+00000030: 6130 6630 3562 3733 3831 6330 3032 6432  a0f05b7381c002d2
+FULL_SHA256=7278741dc61fada4b0f9b1ff90621ee88647887801215d47773799458f452bf3  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00015-of-00048.safetensors.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00016-of-00048.safetensors.metadata ----
+SIZE_BYTES=125
+MTIME=2026-08-01 08:32:16.402360037 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a6530353330623730323437373162306365326466396234
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a65 3035 3330 6237  5a386062.e0530b7
+00000030: 3032 3437 3731 6230 6365 3264 6639 6234  024771b0ce2df9b4
+FULL_SHA256=b6aa64cb77c3f70e8a68d404419ed39ea7038396f90ce9997046b09625625012  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00016-of-00048.safetensors.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00017-of-00048.safetensors.metadata ----
+SIZE_BYTES=125
+MTIME=2026-08-01 08:32:17.031347924 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a6564313131333032343731313862313835616465383933
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a65 6431 3131 3330  5a386062.ed11130
+00000030: 3234 3731 3138 6231 3835 6164 6538 3933  247118b185ade893
+FULL_SHA256=6f312fc1869a2a3a7a4f0b2d2fe7dd32ae0a06ccfa1f9632124caa4c0b0fdf50  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00017-of-00048.safetensors.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00018-of-00048.safetensors.metadata ----
+SIZE_BYTES=125
+MTIME=2026-08-01 08:32:18.048328466 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a6533393366656139366461326133343134656630383933
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a65 3339 3366 6561  5a386062.e393fea
+00000030: 3936 6461 3261 3334 3134 6566 3038 3933  96da2a3414ef0893
+FULL_SHA256=ead47f228428cc70c470d55654eae9b29b298306e67d743fcb5b075496cacc51  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00018-of-00048.safetensors.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00019-of-00048.safetensors.metadata ----
+SIZE_BYTES=125
+MTIME=2026-08-01 08:32:18.857313082 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a6137346361346433653865383263653230633435386262
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a61 3734 6361 3464  5a386062.a74ca4d
+00000030: 3365 3865 3832 6365 3230 6334 3538 6262  3e8e82ce20c458bb
+FULL_SHA256=f52b366aed38c710b720c7ba0fa4dcb2f66981815e7f96a2cf29fe77f54463f4  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00019-of-00048.safetensors.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00020-of-00048.safetensors.metadata ----
+SIZE_BYTES=125
+MTIME=2026-08-01 08:32:19.702297098 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a3966353536373639393236653630333039653864656665
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a39 6635 3536 3736  5a386062.9f55676
+00000030: 3939 3236 6536 3033 3039 6538 6465 6665  9926e60309e8defe
+FULL_SHA256=8d3c0ecb8d08f4f51a2947f77ec0a4a081d94723bc37a0fc6fca20f05efad524  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00020-of-00048.safetensors.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00021-of-00048.safetensors.metadata ----
+SIZE_BYTES=124
+MTIME=2026-08-01 08:32:20.299285854 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a3136373163636537663930643738316637393662356361
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a31 3637 3163 6365  5a386062.1671cce
+00000030: 3766 3930 6437 3831 6637 3936 6235 6361  7f90d781f796b5ca
+FULL_SHA256=ccf3bc6cd269d99489b684c70f7412c92530ab33aa36b9abb5f31731b1ef6c90  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00021-of-00048.safetensors.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00022-of-00048.safetensors.metadata ----
+SIZE_BYTES=124
+MTIME=2026-08-01 08:32:20.876275022 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a6465636436376134626439376137356661333638363164
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a64 6563 6436 3761  5a386062.decd67a
+00000030: 3462 6439 3761 3735 6661 3336 3836 3164  4bd97a75fa36861d
+FULL_SHA256=ce87786250b04d0451b02fb5c9008d226ab50b2c8454a452461f52366dbe17cc  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00022-of-00048.safetensors.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00023-of-00048.safetensors.metadata ----
+SIZE_BYTES=125
+MTIME=2026-08-01 08:32:21.740258890 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a6336316133653137396364626565313962666238636263
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a63 3631 6133 6531  5a386062.c61a3e1
+00000030: 3739 6364 6265 6531 3962 6662 3863 6263  79cdbee19bfb8cbc
+FULL_SHA256=c7cddaacf5878a4552887b6348ab87fa6ecadf5c049d93ca296f753cfc3d7d81  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00023-of-00048.safetensors.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00024-of-00048.safetensors.metadata ----
+SIZE_BYTES=125
+MTIME=2026-08-01 08:32:22.217250017 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a6663323761656234323333353334663666373738316463
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a66 6332 3761 6562  5a386062.fc27aeb
+00000030: 3432 3333 3533 3466 3666 3737 3831 6463  4233534f6f7781dc
+FULL_SHA256=5139595b403c06a7a2ae5433347a25e1f33c397d65a4785f172d057696549ed2  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00024-of-00048.safetensors.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00025-of-00048.safetensors.metadata ----
+SIZE_BYTES=125
+MTIME=2026-08-01 08:32:22.798239248 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a6136366236623864353832316236386635623531316534
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a61 3636 6236 6238  5a386062.a66b6b8
+00000030: 6435 3832 3162 3638 6635 6235 3131 6534  d5821b68f5b511e4
+FULL_SHA256=b1c0e8730dce6f4542a6d2494f1aceb007baf27f18dc4ccf70c4ebb9e29d242a  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00025-of-00048.safetensors.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00026-of-00048.safetensors.metadata ----
+SIZE_BYTES=125
+MTIME=2026-08-01 08:32:23.914218670 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a3635376238393331346662616636656565346163636532
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a36 3537 6238 3933  5a386062.657b893
+00000030: 3134 6662 6166 3665 6565 3461 6363 6532  14fbaf6eee4acce2
+FULL_SHA256=ca9126597d532d9788900c8b3a7961055a3a3aa375024692d46124599459926a  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00026-of-00048.safetensors.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00027-of-00048.safetensors.metadata ----
+SIZE_BYTES=125
+MTIME=2026-08-01 08:32:24.522207534 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a6662303166323161306461303434366230626466323561
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a66 6230 3166 3231  5a386062.fb01f21
+00000030: 6130 6461 3034 3436 6230 6264 6632 3561  a0da0446b0bdf25a
+FULL_SHA256=a3624ad7c9ac858f75bcd98ede988f0d2af2b7dcce6b7575ffdc6bc8e95ad96a  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00027-of-00048.safetensors.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00028-of-00048.safetensors.metadata ----
+SIZE_BYTES=124
+MTIME=2026-08-01 08:32:24.950199701 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a6232666435636262623633396631366536373362633438
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a62 3266 6435 6362  5a386062.b2fd5cb
+00000030: 6262 3633 3966 3136 6536 3733 6263 3438  bb639f16e673bc48
+FULL_SHA256=056f6de863eef9c4d4a09cd2d469c1205bc521966fd0780e67fb7b266b899bc5  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00028-of-00048.safetensors.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00029-of-00048.safetensors.metadata ----
+SIZE_BYTES=125
+MTIME=2026-08-01 08:32:25.273193822 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a3965633266646639303032373564616561633039383034
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a39 6563 3266 6466  5a386062.9ec2fdf
+00000030: 3930 3032 3735 6461 6561 6330 3938 3034  900275daeac09804
+FULL_SHA256=e789302894a41dc6411f6b75c079ec782f7ae771a6c7cd8b3a0f7f480b372aa9  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00029-of-00048.safetensors.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00030-of-00048.safetensors.metadata ----
+SIZE_BYTES=125
+MTIME=2026-08-01 08:32:25.945181602 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a3965643363333137626639363764333231333361643361
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a39 6564 3363 3331  5a386062.9ed3c31
+00000030: 3762 6639 3637 6433 3231 3333 6164 3361  7bf967d32133ad3a
+FULL_SHA256=f3aab8a0092e194521b5773da2acd32efe0937a51ecbcc0e215552a1ab068813  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00030-of-00048.safetensors.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00031-of-00048.safetensors.metadata ----
+SIZE_BYTES=124
+MTIME=2026-08-01 08:32:26.615169489 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a6435303738633366636133653633373030343336303665
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a64 3530 3738 6333  5a386062.d5078c3
+00000030: 6663 6133 6536 3337 3030 3433 3630 3665  fca3e6370043606e
+FULL_SHA256=0ba8eb8916b0a1ec63b16c9419028a4adc95cdad70e75ef4033e57e7870ac34e  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00031-of-00048.safetensors.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00032-of-00048.safetensors.metadata ----
+SIZE_BYTES=124
+MTIME=2026-08-01 08:32:27.608151615 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a3136333635333834386630303237313864336465616136
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a31 3633 3635 3338  5a386062.1636538
+00000030: 3438 6630 3032 3731 3864 3364 6561 6136  48f002718d3deaa6
+FULL_SHA256=686ead9b454b83ab06067af988241b1bb85c6bba5455b8b6dd214ab65376dfa6  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00032-of-00048.safetensors.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00033-of-00048.safetensors.metadata ----
+SIZE_BYTES=125
+MTIME=2026-08-01 08:32:28.126142329 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a6632636666643433663261356634393166343639316638
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a66 3263 6666 6434  5a386062.f2cffd4
+00000030: 3366 3261 3566 3439 3166 3436 3931 6638  3f2a5f491f4691f8
+FULL_SHA256=8c0a265f3606837d60da6f5f65437429a6a0abf1fcb8d89eaa2e0dab8724ca82  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00033-of-00048.safetensors.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00034-of-00048.safetensors.metadata ----
+SIZE_BYTES=124
+MTIME=2026-08-01 08:32:28.963127395 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a3066393439343531323134373463666462366139616231
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a30 6639 3439 3435  5a386062.0f94945
+00000030: 3132 3134 3734 6366 6462 3661 3961 6231  121474cfdb6a9ab1
+FULL_SHA256=089a5e3d1600740f1f1b30e57e29b1dd5f5229bb965319246c002158ec0ac5dd  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00034-of-00048.safetensors.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00035-of-00048.safetensors.metadata ----
+SIZE_BYTES=125
+MTIME=2026-08-01 08:32:29.289121612 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a3963623661333136393839663763373338356533656332
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a39 6362 3661 3331  5a386062.9cb6a31
+00000030: 3639 3839 6637 6337 3338 3565 3365 6332  6989f7c7385e3ec2
+FULL_SHA256=b9a77f0415478e3f3e7bec370ccf5b967c3de1dceb3d1bb04d655a29033dd09f  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00035-of-00048.safetensors.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00036-of-00048.safetensors.metadata ----
+SIZE_BYTES=125
+MTIME=2026-08-01 08:32:29.783112853 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a3765363736313432316665393434633231343365623839
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a37 6536 3736 3134  5a386062.7e67614
+00000030: 3231 6665 3934 3463 3231 3433 6562 3839  21fe944c2143eb89
+FULL_SHA256=7ac876b849fa564ec38ffd01d9d1a5b0d71d775b50627821eeea88bc459072d6  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00036-of-00048.safetensors.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00037-of-00048.safetensors.metadata ----
+SIZE_BYTES=125
+MTIME=2026-08-01 08:32:29.909110619 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a6135396436363266313134333539366435366334353261
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a61 3539 6436 3632  5a386062.a59d662
+00000030: 6631 3134 3335 3936 6435 3663 3435 3261  f1143596d56c452a
+FULL_SHA256=68e023739c6ed2d59e22fd0f94561158e66d5cb2e57595a0172f76655e8609b8  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00037-of-00048.safetensors.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00038-of-00048.safetensors.metadata ----
+SIZE_BYTES=123
+MTIME=2026-08-01 08:32:30.427101483 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a3133376661363137613734626138653733666437366262
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a31 3337 6661 3631  5a386062.137fa61
+00000030: 3761 3734 6261 3865 3733 6664 3736 6262  7a74ba8e73fd76bb
+FULL_SHA256=25dc86e1e3996d3efbfdd0926273f9f0f9c704d688aebadef4f24d33d1db73e2  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00038-of-00048.safetensors.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00039-of-00048.safetensors.metadata ----
+SIZE_BYTES=124
+MTIME=2026-08-01 08:32:31.270086662 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a6132396166316161353139643763653732363233356561
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a61 3239 6166 3161  5a386062.a29af1a
+00000030: 6135 3139 6437 6365 3732 3632 3335 6561  a519d7ce726235ea
+FULL_SHA256=b30f6a4c76af07fd87cc61601684a74b1c43ef965e438adc4f8101bca0267aad  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00039-of-00048.safetensors.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00040-of-00048.safetensors.metadata ----
+SIZE_BYTES=125
+MTIME=2026-08-01 08:32:31.949074774 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a3862633933643861376431393837646338366231346532
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a38 6263 3933 6438  5a386062.8bc93d8
+00000030: 6137 6431 3938 3764 6338 3662 3134 6532  a7d1987dc86b14e2
+FULL_SHA256=0dfe971ee85152e47d7bd8f75684e82ac957704aad62ea1d63faee7151bc23af  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00040-of-00048.safetensors.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00041-of-00048.safetensors.metadata ----
+SIZE_BYTES=124
+MTIME=2026-08-01 08:32:32.105072055 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a6664333132653766646436636235373936646633353661
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a66 6433 3132 6537  5a386062.fd312e7
+00000030: 6664 6436 6362 3537 3936 6466 3335 3661  fdd6cb5796df356a
+FULL_SHA256=d18a1c6420545067e0db4a384903067ac06952fb5666f81fc60fcd7b5bc62040  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00041-of-00048.safetensors.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00042-of-00048.safetensors.metadata ----
+SIZE_BYTES=123
+MTIME=2026-08-01 08:32:33.433048999 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a3464313962663336383038336339613138336362303834
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a34 6431 3962 6633  5a386062.4d19bf3
+00000030: 3638 3038 3363 3961 3138 3363 6230 3834  68083c9a183cb084
+FULL_SHA256=7850da2d40c7fa0e7a2178ee05bfb21a9204d29b8578d58cc8786cca1afecd7b  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00042-of-00048.safetensors.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00043-of-00048.safetensors.metadata ----
+SIZE_BYTES=125
+MTIME=2026-08-01 08:32:33.396049638 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a6237313033383432636562373038343866393830346635
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a62 3731 3033 3834  5a386062.b710384
+00000030: 3263 6562 3730 3834 3866 3938 3034 6635  2ceb70848f9804f5
+FULL_SHA256=917a839a3fdaf366887b44989d7497f5e336c38d734ef5effdf2bd791b1d15f6  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00043-of-00048.safetensors.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00044-of-00048.safetensors.metadata ----
+SIZE_BYTES=125
+MTIME=2026-08-01 08:32:33.531047305 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a3432326433383839666132306332333862376639373436
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a34 3232 6433 3838  5a386062.422d388
+00000030: 3966 6132 3063 3233 3862 3766 3937 3436  9fa20c238b7f9746
+FULL_SHA256=3f873fa9366dd12887f0ee397a998691109cbd5e70cb0a6fb7d62bc5a23f4f91  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00044-of-00048.safetensors.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00045-of-00048.safetensors.metadata ----
+SIZE_BYTES=125
+MTIME=2026-08-01 08:32:32.344067897 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a6135626536616564376238346663383765633432623564
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a61 3562 6536 6165  5a386062.a5be6ae
+00000030: 6437 6238 3466 6338 3765 6334 3262 3564  d7b84fc87ec42b5d
+FULL_SHA256=69c8795d10d42837c0d32540f1c5c6a1f1756ff463aff91afe2a125c82289608  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00045-of-00048.safetensors.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00046-of-00048.safetensors.metadata ----
+SIZE_BYTES=125
+MTIME=2026-08-01 08:32:34.321033682 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a3564623932346361393037653064393361636439373562
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a35 6462 3932 3463  5a386062.5db924c
+00000030: 6139 3037 6530 6439 3361 6364 3937 3562  a907e0d93acd975b
+FULL_SHA256=6c59b7d4d08d9c2ef8701a98c6cd3a2d62b972a35af4e36b059888e37a2bae0e  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00046-of-00048.safetensors.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00047-of-00048.safetensors.metadata ----
+SIZE_BYTES=125
+MTIME=2026-08-01 08:32:34.742026449 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a3632383136313733663966366531333662323062343865
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a36 3238 3136 3137  5a386062.6281617
+00000030: 3366 3966 3665 3133 3662 3230 6234 3865  3f9f6e136b20b48e
+FULL_SHA256=a0a571cfc9cec626dcdd73fa5d01f61c14495548a0e40d9c712cf9734ea9f4e0  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00047-of-00048.safetensors.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00048-of-00048.safetensors.metadata ----
+SIZE_BYTES=125
+MTIME=2026-08-01 08:32:35.214018363 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a6363343337343262643234616536626364656133343361
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a63 6334 3337 3432  5a386062.cc43742
+00000030: 6264 3234 6165 3662 6364 6561 3334 3361  bd24ae6bcdea343a
+FULL_SHA256=48e87583cf102b6926014fdfbbf407cacd0be58a400c80502115ffae52f2bc97  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00048-of-00048.safetensors.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model.safetensors.index.json.metadata ----
+SIZE_BYTES=101
+MTIME=2026-08-01 08:32:28.200141009 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a6333623130643435613832393534356662663064396432
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a63 3362 3130 6434  5a386062.c3b10d4
+00000030: 3561 3832 3935 3435 6662 6630 6439 6432  5a829545fbf0d9d2
+FULL_SHA256=174c508c79add4943447461ea4cc910b4b29b077d90a4b3ffb5f0a285bb45ca4  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model.safetensors.index.json.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/tokenizer.json.lock ----
+SIZE_BYTES=0
+MTIME=2026-08-01 08:32:28.299139242 +0000
+HEAD64_HEX=HEAD64_ASCII=FULL_SHA256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/tokenizer.json.lock
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/tokenizer.json.metadata ----
+SIZE_BYTES=100
+MTIME=2026-08-01 08:32:28.299139242 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a3632386533333634636161643131626466396536376365
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a36 3238 6533 3336  5a386062.628e336
+00000030: 3463 6161 6431 3162 6466 3965 3637 6365  4caad11bdf9e67ce
+FULL_SHA256=b3ddacfd202ab4c6926f36a6234134c8f8095ba04662ad1028d18e12935a7e71  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/tokenizer.json.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/tokenizer_config.json.lock ----
+SIZE_BYTES=0
+MTIME=2026-08-01 08:32:28.357138207 +0000
+HEAD64_HEX=HEAD64_ASCII=FULL_SHA256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/tokenizer_config.json.lock
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/tokenizer_config.json.metadata ----
+SIZE_BYTES=101
+MTIME=2026-08-01 08:32:28.357138207 +0000
+HEAD64_HEX=373837326630316231643166653233656162633463393862343862666663656635613338363036320a6633646164333838613262626664366138363035626430
+HEAD64_ASCII=00000000: 3738 3732 6630 3162 3164 3166 6532 3365  7872f01b1d1fe23e
+00000010: 6162 6334 6339 3862 3438 6266 6663 6566  abc4c98b48bffcef
+00000020: 3561 3338 3630 3632 0a66 3364 6164 3338  5a386062.f3dad38
+00000030: 3861 3262 6266 6436 6138 3630 3562 6430  8a2bbfd6a8605bd0
+FULL_SHA256=08010a58907a70f2abe520bd97fba1613dc3aea8edb05e85361de02f57be6ed7  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/tokenizer_config.json.metadata
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/trees/7872f01b1d1fe23eabc4c98b48bffcef5a386062.json ----
+SIZE_BYTES=18262
+MTIME=2026-08-01 08:31:55.932782037 +0000
+HEAD64_HEX=7b0a2022666f726d61745f76657273696f6e223a20312c0a202266696c6573223a207b0a2020222e67697461747472696275746573223a207b0a202020227369
+HEAD64_ASCII=00000000: 7b0a 2022 666f 726d 6174 5f76 6572 7369  {. "format_versi
+00000010: 6f6e 223a 2031 2c0a 2022 6669 6c65 7322  on": 1,. "files"
+00000020: 3a20 7b0a 2020 222e 6769 7461 7474 7269  : {.  ".gitattri
+00000030: 6275 7465 7322 3a20 7b0a 2020 2022 7369  butes": {.   "si
+FULL_SHA256=fbc2467b8da6edd7030ee75b2bf967d62aaf62f0d7be41018af483e961357d38  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/trees/7872f01b1d1fe23eabc4c98b48bffcef5a386062.json
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/.gitattributes ----
+SIZE_BYTES=1519
+MTIME=2026-08-01 08:31:55.987780822 +0000
+HEAD64_HEX=2a2e377a2066696c7465723d6c667320646966663d6c6673206d657267653d6c6673202d746578740a2a2e6172726f772066696c7465723d6c66732064696666
+HEAD64_ASCII=00000000: 2a2e 377a 2066 696c 7465 723d 6c66 7320  *.7z filter=lfs 
+00000010: 6469 6666 3d6c 6673 206d 6572 6765 3d6c  diff=lfs merge=l
+00000020: 6673 202d 7465 7874 0a2a 2e61 7272 6f77  fs -text.*.arrow
+00000030: 2066 696c 7465 723d 6c66 7320 6469 6666   filter=lfs diff
+FULL_SHA256=11ad7efa24975ee4b0c3c3a38ed18737f0658a5f75a0a96787b576a78a023361  /mnt/scratch/models/DeepSeek-V4-Flash-0731/.gitattributes
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/README.md ----
+SIZE_BYTES=7238
+MTIME=2026-08-01 08:31:56.025779986 +0000
+HEAD64_HEX=2d2d2d0a6c6963656e73653a206d69740a6c6962726172795f6e616d653a207472616e73666f726d6572730a2d2d2d0a2320446565705365656b2d56342d466c
+HEAD64_ASCII=00000000: 2d2d 2d0a 6c69 6365 6e73 653a 206d 6974  ---.license: mit
+00000010: 0a6c 6962 7261 7279 5f6e 616d 653a 2074  .library_name: t
+00000020: 7261 6e73 666f 726d 6572 730a 2d2d 2d0a  ransformers.---.
+00000030: 2320 4465 6570 5365 656b 2d56 342d 466c  # DeepSeek-V4-Fl
+FULL_SHA256=252acafdc9204d0dba3fde1b0a93d71cd1664a4ceadfe222b60117ed0ccc56ff  /mnt/scratch/models/DeepSeek-V4-Flash-0731/README.md
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/config.json ----
+SIZE_BYTES=1888
+MTIME=2026-08-01 08:31:55.989780778 +0000
+HEAD64_HEX=7b0a20202261726368697465637475726573223a205b0a2020202022446565707365656b5634466f7243617573616c4c4d220a20205d2c0a202022617474656e
+HEAD64_ASCII=00000000: 7b0a 2020 2261 7263 6869 7465 6374 7572  {.  "architectur
+00000010: 6573 223a 205b 0a20 2020 2022 4465 6570  es": [.    "Deep
+00000020: 7365 656b 5634 466f 7243 6175 7361 6c4c  seekV4ForCausalL
+00000030: 4d22 0a20 205d 2c0a 2020 2261 7474 656e  M".  ],.  "atten
+FULL_SHA256=6c8f3d2d3b48707541b88f32f22ef3f0f8a6b57d8523281e2b8d3cdb0ae9a023  /mnt/scratch/models/DeepSeek-V4-Flash-0731/config.json
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/encoding/README.md ----
+SIZE_BYTES=9168
+MTIME=2026-08-01 08:31:56.018780140 +0000
+HEAD64_HEX=2320446565705365656b2d563420456e636f64696e670a0a5468697320646f63756d656e7420646573637269626573207468652070726f6d707420656e636f64
+HEAD64_ASCII=00000000: 2320 4465 6570 5365 656b 2d56 3420 456e  # DeepSeek-V4 En
+00000010: 636f 6469 6e67 0a0a 5468 6973 2064 6f63  coding..This doc
+00000020: 756d 656e 7420 6465 7363 7269 6265 7320  ument describes 
+00000030: 7468 6520 7072 6f6d 7074 2065 6e63 6f64  the prompt encod
+FULL_SHA256=294ed6493ebfe5a487f172154d60c494899997fed8806fdd3352dd8e3c33f9de  /mnt/scratch/models/DeepSeek-V4-Flash-0731/encoding/README.md
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/encoding/tests/test_input_1.json ----
+SIZE_BYTES=2748
+MTIME=2026-08-01 08:31:56.032779832 +0000
+HEAD64_HEX=7b0a2020202022746f6f6c73223a205b0a20202020202020207b0a2020202020202020202020202274797065223a202266756e6374696f6e222c0a2020202020
+HEAD64_ASCII=00000000: 7b0a 2020 2020 2274 6f6f 6c73 223a 205b  {.    "tools": [
+00000010: 0a20 2020 2020 2020 207b 0a20 2020 2020  .        {.     
+00000020: 2020 2020 2020 2022 7479 7065 223a 2022         "type": "
+00000030: 6675 6e63 7469 6f6e 222c 0a20 2020 2020  function",.     
+FULL_SHA256=10e0c074c977c3a80daab758af28219c6b1c2bd7f3f5cf2890c84b361cc32897  /mnt/scratch/models/DeepSeek-V4-Flash-0731/encoding/tests/test_input_1.json
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/encoding/tests/test_input_2.json ----
+SIZE_BYTES=526
+MTIME=2026-08-01 08:31:56.059779240 +0000
+HEAD64_HEX=5b0a20207b0a2020202022726f6c65223a202273797374656d222c0a2020202022636f6e74656e74223a2022596f752061726520612068656c7066756c206173
+HEAD64_ASCII=00000000: 5b0a 2020 7b0a 2020 2020 2272 6f6c 6522  [.  {.    "role"
+00000010: 3a20 2273 7973 7465 6d22 2c0a 2020 2020  : "system",.    
+00000020: 2263 6f6e 7465 6e74 223a 2022 596f 7520  "content": "You 
+00000030: 6172 6520 6120 6865 6c70 6675 6c20 6173  are a helpful as
+FULL_SHA256=c44ae0db20fafff38a6021e8068d7ed6e28605d76cafd20be80b03398509f447  /mnt/scratch/models/DeepSeek-V4-Flash-0731/encoding/tests/test_input_2.json
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/encoding/tests/test_input_3.json ----
+SIZE_BYTES=4546
+MTIME=2026-08-01 08:31:56.017780161 +0000
+HEAD64_HEX=5b0a20207b0a2020202022726f6c65223a202273797374656d222c0a2020202022636f6e74656e74223a2022e8afa5e58aa9e6898be4b8ba446565705365656b
+HEAD64_ASCII=00000000: 5b0a 2020 7b0a 2020 2020 2272 6f6c 6522  [.  {.    "role"
+00000010: 3a20 2273 7973 7465 6d22 2c0a 2020 2020  : "system",.    
+00000020: 2263 6f6e 7465 6e74 223a 2022 e8af a5e5  "content": "....
+00000030: 8aa9 e689 8be4 b8ba 4465 6570 5365 656b  ........DeepSeek
+FULL_SHA256=37bf8ef95e0411ea5f411be0b02fbafec7363438b6ccefddca0c52ec9aeaf69a  /mnt/scratch/models/DeepSeek-V4-Flash-0731/encoding/tests/test_input_3.json
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/encoding/tests/test_input_4.json ----
+SIZE_BYTES=2730
+MTIME=2026-08-01 08:31:56.042779613 +0000
+HEAD64_HEX=5b0a20207b0a2020202022726f6c65223a202273797374656d222c0a2020202022636f6e74656e74223a2022e8afa5e58aa9e6898be4b8ba446565705365656b
+HEAD64_ASCII=00000000: 5b0a 2020 7b0a 2020 2020 2272 6f6c 6522  [.  {.    "role"
+00000010: 3a20 2273 7973 7465 6d22 2c0a 2020 2020  : "system",.    
+00000020: 2263 6f6e 7465 6e74 223a 2022 e8af a5e5  "content": "....
+00000030: 8aa9 e689 8be4 b8ba 4465 6570 5365 656b  ........DeepSeek
+FULL_SHA256=c45bbd0a1b7a2f75033d8db4ba74ee5b7653bd01114045a52f79d3b387663465  /mnt/scratch/models/DeepSeek-V4-Flash-0731/encoding/tests/test_input_4.json
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/generation_config.json ----
+SIZE_BYTES=170
+MTIME=2026-08-01 08:31:56.061779196 +0000
+HEAD64_HEX=7b0a2020225f66726f6d5f6d6f64656c5f636f6e666967223a20747275652c0a202022626f735f746f6b656e5f6964223a20302c0a202022656f735f746f6b65
+HEAD64_ASCII=00000000: 7b0a 2020 225f 6672 6f6d 5f6d 6f64 656c  {.  "_from_model
+00000010: 5f63 6f6e 6669 6722 3a20 7472 7565 2c0a  _config": true,.
+00000020: 2020 2262 6f73 5f74 6f6b 656e 5f69 6422    "bos_token_id"
+00000030: 3a20 302c 0a20 2022 656f 735f 746f 6b65  : 0,.  "eos_toke
+FULL_SHA256=5fccff80f55a4d455bbe516bdd552edf3e9623df95e99fbf2a3c3389fdf91af0  /mnt/scratch/models/DeepSeek-V4-Flash-0731/generation_config.json
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/inference/README.md ----
+SIZE_BYTES=951
+MTIME=2026-08-01 08:31:56.085778669 +0000
+HEAD64_HEX=2320496e666572656e636520636f646520666f7220446565705365656b206d6f64656c730a0a466972737420636f6e766572742068756767696e676661636520
+HEAD64_ASCII=00000000: 2320 496e 6665 7265 6e63 6520 636f 6465  # Inference code
+00000010: 2066 6f72 2044 6565 7053 6565 6b20 6d6f   for DeepSeek mo
+00000020: 6465 6c73 0a0a 4669 7273 7420 636f 6e76  dels..First conv
+00000030: 6572 7420 6875 6767 696e 6766 6163 6520  ert huggingface 
+FULL_SHA256=b9fe8027f91f2160b46582b61eaaf7b9873b3da36ee9f98bc76a900e7c1fed94  /mnt/scratch/models/DeepSeek-V4-Flash-0731/inference/README.md
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/inference/config.json ----
+SIZE_BYTES=1162
+MTIME=2026-08-01 08:31:56.084778691 +0000
+HEAD64_HEX=7b0a2020202022766f6361625f73697a65223a203132393238302c0a202020202264696d223a20343039362c0a20202020226d6f655f696e7465725f64696d22
+HEAD64_ASCII=00000000: 7b0a 2020 2020 2276 6f63 6162 5f73 697a  {.    "vocab_siz
+00000010: 6522 3a20 3132 3932 3830 2c0a 2020 2020  e": 129280,.    
+00000020: 2264 696d 223a 2034 3039 362c 0a20 2020  "dim": 4096,.   
+00000030: 2022 6d6f 655f 696e 7465 725f 6469 6d22   "moe_inter_dim"
+FULL_SHA256=c90861f3d10a9e4ef5954f8f1a34c529d480da1c5799f84660028f4e38e14e71  /mnt/scratch/models/DeepSeek-V4-Flash-0731/inference/config.json
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00001-of-00048.safetensors ----
+SIZE_BYTES=1059061856
+MTIME=2026-08-01 08:31:57.055757387 +0000
+HEAD64_HEX=58000000000000007b22656d6265642e776569676874223a7b226474797065223a2242463136222c227368617065223a5b3132393238302c343039365d2c2264
+HEAD64_ASCII=00000000: 5800 0000 0000 0000 7b22 656d 6265 642e  X.......{"embed.
+00000010: 7765 6967 6874 223a 7b22 6474 7970 6522  weight":{"dtype"
+00000020: 3a22 4246 3136 222c 2273 6861 7065 223a  :"BF16","shape":
+00000030: 5b31 3239 3238 302c 3430 3936 5d2c 2264  [129280,4096],"d
+FULL_SHA256=SKIPPED_FULL_GT_512MB
+HEAD4096_SHA256=3e4db2ab44cb31366208d818d27ef3930a20e311d63955d00e3b3a940294da41  -
+TAIL4096_SHA256=50d8b21c67d331f54b3bf879aafbd7af0c9b53d00b61845c317da994d881af1c  -
+NEEDS_FULL_HASH_LATER=yes
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00002-of-00048.safetensors ----
+SIZE_BYTES=3566321192
+MTIME=2026-08-01 08:32:14.217402445 +0000
+HEAD64_HEX=c8a00200000000007b226c61796572732e302e66666e2e676174652e74696432656964223a7b226474797065223a22493634222c227368617065223a5b313239
+HEAD64_ASCII=00000000: c8a0 0200 0000 0000 7b22 6c61 7965 7273  ........{"layers
+00000010: 2e30 2e66 666e 2e67 6174 652e 7469 6432  .0.ffn.gate.tid2
+00000020: 6569 6422 3a7b 2264 7479 7065 223a 2249  eid":{"dtype":"I
+00000030: 3634 222c 2273 6861 7065 223a 5b31 3239  64","shape":[129
+FULL_SHA256=DEFERRED_GT_2GB
+HEAD4096_SHA256=5faa506f2f648511540ab956954c72ac4cc88bc0ec8aff7bd8374e9ca45d58d9  -
+TAIL4096_SHA256=4d8e18356c84bfe12577b05d03c8f31b80c4c9a2cb7b85608f8576e766259c25  -
+NEEDS_FULL_HASH_LATER=yes
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00003-of-00048.safetensors ----
+SIZE_BYTES=3566321192
+MTIME=2026-08-01 08:32:06.288561500 +0000
+HEAD64_HEX=c8a00200000000007b226c61796572732e312e66666e2e676174652e74696432656964223a7b226474797065223a22493634222c227368617065223a5b313239
+HEAD64_ASCII=00000000: c8a0 0200 0000 0000 7b22 6c61 7965 7273  ........{"layers
+00000010: 2e31 2e66 666e 2e67 6174 652e 7469 6432  .1.ffn.gate.tid2
+00000020: 6569 6422 3a7b 2264 7479 7065 223a 2249  eid":{"dtype":"I
+00000030: 3634 222c 2273 6861 7065 223a 5b31 3239  64","shape":[129
+FULL_SHA256=DEFERRED_GT_2GB
+HEAD4096_SHA256=3d6dc754fef8c092df3126633e73bf892b8c25cca59ba0b1bb9cc10af1af828e  -
+TAIL4096_SHA256=426b05a3675c100caabbe841d560edb9cf658eeba90052a14663b042497238b0  -
+NEEDS_FULL_HASH_LATER=yes
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00004-of-00048.safetensors ----
+SIZE_BYTES=3596229272
+MTIME=2026-08-01 08:32:05.539576956 +0000
+HEAD64_HEX=38a60200000000007b226c61796572732e322e66666e2e676174652e74696432656964223a7b226474797065223a22493634222c227368617065223a5b313239
+HEAD64_ASCII=00000000: 38a6 0200 0000 0000 7b22 6c61 7965 7273  8.......{"layers
+00000010: 2e32 2e66 666e 2e67 6174 652e 7469 6432  .2.ffn.gate.tid2
+00000020: 6569 6422 3a7b 2264 7479 7065 223a 2249  eid":{"dtype":"I
+00000030: 3634 222c 2273 6861 7065 223a 5b31 3239  64","shape":[129
+FULL_SHA256=DEFERRED_GT_2GB
+HEAD4096_SHA256=c6ac9edb46cd20a3de2c3e41bc3c97daa426f964a70cd0d90cbbbdb05894dd65  -
+TAIL4096_SHA256=6bcce64d81f2c514df3ffe245ef9c6d8e5aff3cf2c5fc35ac2386ecb724a8e23  -
+NEEDS_FULL_HASH_LATER=yes
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00005-of-00048.safetensors ----
+SIZE_BYTES=3568768976
+MTIME=2026-08-01 08:32:06.521556711 +0000
+HEAD64_HEX=70a20200000000007b226c61796572732e332e6174746e2e6174746e5f73696e6b223a7b226474797065223a22463332222c227368617065223a5b36345d2c22
+HEAD64_ASCII=00000000: 70a2 0200 0000 0000 7b22 6c61 7965 7273  p.......{"layers
+00000010: 2e33 2e61 7474 6e2e 6174 746e 5f73 696e  .3.attn.attn_sin
+00000020: 6b22 3a7b 2264 7479 7065 223a 2246 3332  k":{"dtype":"F32
+00000030: 222c 2273 6861 7065 223a 5b36 345d 2c22  ","shape":[64],"
+FULL_SHA256=DEFERRED_GT_2GB
+HEAD4096_SHA256=7034f6dcd5948aa7b51c2f906c75313a3907e3a4e7c59aeddce03d7077b48bcf  -
+TAIL4096_SHA256=2e0d881ac3cc138e2979a78fa92e0251cc6d10eaf6ba896eb97317fea10d2b0a  -
+NEEDS_FULL_HASH_LATER=yes
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00006-of-00048.safetensors ----
+SIZE_BYTES=3590024776
+MTIME=2026-08-01 08:32:06.721552600 +0000
+HEAD64_HEX=e8a50200000000007b226c61796572732e342e6174746e2e6174746e5f73696e6b223a7b226474797065223a22463332222c227368617065223a5b36345d2c22
+HEAD64_ASCII=00000000: e8a5 0200 0000 0000 7b22 6c61 7965 7273  ........{"layers
+00000010: 2e34 2e61 7474 6e2e 6174 746e 5f73 696e  .4.attn.attn_sin
+00000020: 6b22 3a7b 2264 7479 7065 223a 2246 3332  k":{"dtype":"F32
+00000030: 222c 2273 6861 7065 223a 5b36 345d 2c22  ","shape":[64],"
+FULL_SHA256=DEFERRED_GT_2GB
+HEAD4096_SHA256=8b956a734ffaeff3ab45c4461f157dff8b238186e9f4818b68b75b5d00ddcbdb  -
+TAIL4096_SHA256=ebc88ca4c8542aa210e9b76cf625febf65373d84ffa822122413063223790d51  -
+NEEDS_FULL_HASH_LATER=yes
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00007-of-00048.safetensors ----
+SIZE_BYTES=3568768976
+MTIME=2026-08-01 08:32:07.080545232 +0000
+HEAD64_HEX=70a20200000000007b226c61796572732e352e6174746e2e6174746e5f73696e6b223a7b226474797065223a22463332222c227368617065223a5b36345d2c22
+HEAD64_ASCII=00000000: 70a2 0200 0000 0000 7b22 6c61 7965 7273  p.......{"layers
+00000010: 2e35 2e61 7474 6e2e 6174 746e 5f73 696e  .5.attn.attn_sin
+00000020: 6b22 3a7b 2264 7479 7065 223a 2246 3332  k":{"dtype":"F32
+00000030: 222c 2273 6861 7065 223a 5b36 345d 2c22  ","shape":[64],"
+FULL_SHA256=DEFERRED_GT_2GB
+HEAD4096_SHA256=fd5ed95d85b2102ed01ecae5a425e99bcfd5cb8be604dc65819a496b17d6967b  -
+TAIL4096_SHA256=a58062285f4363cee3a2b6427d7e6840449bc239d3b802f58bf093b20d015be6  -
+NEEDS_FULL_HASH_LATER=yes
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00008-of-00048.safetensors ----
+SIZE_BYTES=3590024776
+MTIME=2026-08-01 08:32:04.551597456 +0000
+HEAD64_HEX=e8a50200000000007b226c61796572732e362e6174746e2e6174746e5f73696e6b223a7b226474797065223a22463332222c227368617065223a5b36345d2c22
+HEAD64_ASCII=00000000: e8a5 0200 0000 0000 7b22 6c61 7965 7273  ........{"layers
+00000010: 2e36 2e61 7474 6e2e 6174 746e 5f73 696e  .6.attn.attn_sin
+00000020: 6b22 3a7b 2264 7479 7065 223a 2246 3332  k":{"dtype":"F32
+00000030: 222c 2273 6861 7065 223a 5b36 345d 2c22  ","shape":[64],"
+FULL_SHA256=DEFERRED_GT_2GB
+HEAD4096_SHA256=0f381805f5479313eb769fc3f6c871af6bbf6ba626e8c3f4d55658a7a5307e1b  -
+TAIL4096_SHA256=3c92e874b1872fcec6f804352d081dc726b08eabb23d1f85ab56c6507911d13c  -
+NEEDS_FULL_HASH_LATER=yes
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00009-of-00048.safetensors ----
+SIZE_BYTES=3568768976
+MTIME=2026-08-01 08:32:07.000546866 +0000
+HEAD64_HEX=70a20200000000007b226c61796572732e372e6174746e2e6174746e5f73696e6b223a7b226474797065223a22463332222c227368617065223a5b36345d2c22
+HEAD64_ASCII=00000000: 70a2 0200 0000 0000 7b22 6c61 7965 7273  p.......{"layers
+00000010: 2e37 2e61 7474 6e2e 6174 746e 5f73 696e  .7.attn.attn_sin
+00000020: 6b22 3a7b 2264 7479 7065 223a 2246 3332  k":{"dtype":"F32
+00000030: 222c 2273 6861 7065 223a 5b36 345d 2c22  ","shape":[64],"
+FULL_SHA256=DEFERRED_GT_2GB
+HEAD4096_SHA256=8af8503bd300df5ed501f843cbc6b0cdd608f8c73e9d0d98d5345a799d566726  -
+TAIL4096_SHA256=b53298a5bb2bced1bb332cec8deba6272833fcdfdaa1cc8a9d7bae7a20af2d22  -
+NEEDS_FULL_HASH_LATER=yes
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00010-of-00048.safetensors ----
+SIZE_BYTES=3590024776
+MTIME=2026-08-01 08:32:08.626513747 +0000
+HEAD64_HEX=e8a50200000000007b226c61796572732e382e6174746e2e6174746e5f73696e6b223a7b226474797065223a22463332222c227368617065223a5b36345d2c22
+HEAD64_ASCII=00000000: e8a5 0200 0000 0000 7b22 6c61 7965 7273  ........{"layers
+00000010: 2e38 2e61 7474 6e2e 6174 746e 5f73 696e  .8.attn.attn_sin
+00000020: 6b22 3a7b 2264 7479 7065 223a 2246 3332  k":{"dtype":"F32
+00000030: 222c 2273 6861 7065 223a 5b36 345d 2c22  ","shape":[64],"
+FULL_SHA256=DEFERRED_GT_2GB
+HEAD4096_SHA256=b18e25a8da9262927ea224aeb7f4897fdaf38941e8195dd5e5f96b97b6be1db9  -
+TAIL4096_SHA256=770c13a1273c6192c578b8d7d52f13b679580d018413631cb2ee80e97e78d79c  -
+NEEDS_FULL_HASH_LATER=yes
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00011-of-00048.safetensors ----
+SIZE_BYTES=3568768976
+MTIME=2026-08-01 08:32:13.226421880 +0000
+HEAD64_HEX=70a20200000000007b226c61796572732e392e6174746e2e6174746e5f73696e6b223a7b226474797065223a22463332222c227368617065223a5b36345d2c22
+HEAD64_ASCII=00000000: 70a2 0200 0000 0000 7b22 6c61 7965 7273  p.......{"layers
+00000010: 2e39 2e61 7474 6e2e 6174 746e 5f73 696e  .9.attn.attn_sin
+00000020: 6b22 3a7b 2264 7479 7065 223a 2246 3332  k":{"dtype":"F32
+00000030: 222c 2273 6861 7065 223a 5b36 345d 2c22  ","shape":[64],"
+FULL_SHA256=DEFERRED_GT_2GB
+HEAD4096_SHA256=2fecec2d1e1936acca950e39ee56154d8fa68f66a9d5f63a71a2d1759ee9d780  -
+TAIL4096_SHA256=7f639b51c2692477201aad5588a2e2806f218e176a0359b8c03858b77ab24aa0  -
+NEEDS_FULL_HASH_LATER=yes
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00012-of-00048.safetensors ----
+SIZE_BYTES=3590026352
+MTIME=2026-08-01 08:32:12.708432091 +0000
+HEAD64_HEX=10ac0200000000007b226c61796572732e31302e6174746e2e6174746e5f73696e6b223a7b226474797065223a22463332222c227368617065223a5b36345d2c
+HEAD64_ASCII=00000000: 10ac 0200 0000 0000 7b22 6c61 7965 7273  ........{"layers
+00000010: 2e31 302e 6174 746e 2e61 7474 6e5f 7369  .10.attn.attn_si
+00000020: 6e6b 223a 7b22 6474 7970 6522 3a22 4633  nk":{"dtype":"F3
+00000030: 3222 2c22 7368 6170 6522 3a5b 3634 5d2c  2","shape":[64],
+FULL_SHA256=DEFERRED_GT_2GB
+HEAD4096_SHA256=b5835ae231a4bae68e0e9011b34aceffbd80c2b5b49be0e4466e394d451ff145  -
+TAIL4096_SHA256=b224bf1bdf0c08c48b5d7f9fbbf117d848b52973942b9085ee4ee44eb416d382  -
+NEEDS_FULL_HASH_LATER=yes
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00013-of-00048.safetensors ----
+SIZE_BYTES=3568770544
+MTIME=2026-08-01 08:32:10.835469284 +0000
+HEAD64_HEX=90a80200000000007b226c61796572732e31312e6174746e2e6174746e5f73696e6b223a7b226474797065223a22463332222c227368617065223a5b36345d2c
+HEAD64_ASCII=00000000: 90a8 0200 0000 0000 7b22 6c61 7965 7273  ........{"layers
+00000010: 2e31 312e 6174 746e 2e61 7474 6e5f 7369  .11.attn.attn_si
+00000020: 6e6b 223a 7b22 6474 7970 6522 3a22 4633  nk":{"dtype":"F3
+00000030: 3222 2c22 7368 6170 6522 3a5b 3634 5d2c  2","shape":[64],
+FULL_SHA256=DEFERRED_GT_2GB
+HEAD4096_SHA256=29229ea31949cba88b6184cb0f635c2f55f4797298a4b54fa6fc546ff42d4525  -
+TAIL4096_SHA256=a56a4511a2e7946d7341ed814d32cf7ecd1ecec8ced87753376939f5c0734c8f  -
+NEEDS_FULL_HASH_LATER=yes
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00014-of-00048.safetensors ----
+SIZE_BYTES=3590026352
+MTIME=2026-08-01 08:32:09.849489048 +0000
+HEAD64_HEX=10ac0200000000007b226c61796572732e31322e6174746e2e6174746e5f73696e6b223a7b226474797065223a22463332222c227368617065223a5b36345d2c
+HEAD64_ASCII=00000000: 10ac 0200 0000 0000 7b22 6c61 7965 7273  ........{"layers
+00000010: 2e31 322e 6174 746e 2e61 7474 6e5f 7369  .12.attn.attn_si
+00000020: 6e6b 223a 7b22 6474 7970 6522 3a22 4633  nk":{"dtype":"F3
+00000030: 3222 2c22 7368 6170 6522 3a5b 3634 5d2c  2","shape":[64],
+FULL_SHA256=DEFERRED_GT_2GB
+HEAD4096_SHA256=afab2477869bbf2b2736ba1672076adf62f68804127da0916149800ebcdc1193  -
+TAIL4096_SHA256=cbc1d1bcf782c48a4b93f694f6aa2ab7c36e9f7aca8e8c09a0f4388bd417f954  -
+NEEDS_FULL_HASH_LATER=yes
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00015-of-00048.safetensors ----
+SIZE_BYTES=3568770544
+MTIME=2026-08-01 08:32:11.575454541 +0000
+HEAD64_HEX=90a80200000000007b226c61796572732e31332e6174746e2e6174746e5f73696e6b223a7b226474797065223a22463332222c227368617065223a5b36345d2c
+HEAD64_ASCII=00000000: 90a8 0200 0000 0000 7b22 6c61 7965 7273  ........{"layers
+00000010: 2e31 332e 6174 746e 2e61 7474 6e5f 7369  .13.attn.attn_si
+00000020: 6e6b 223a 7b22 6474 7970 6522 3a22 4633  nk":{"dtype":"F3
+00000030: 3222 2c22 7368 6170 6522 3a5b 3634 5d2c  2","shape":[64],
+FULL_SHA256=DEFERRED_GT_2GB
+HEAD4096_SHA256=1f0a8845ec3df098d168fd83507b4a86cf2acfbefcd68c20137a836939a59f4a  -
+TAIL4096_SHA256=0cdff3785c9cc637cd306f79250bd917309b51b748e5ebaf08700e25f0443321  -
+NEEDS_FULL_HASH_LATER=yes
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00016-of-00048.safetensors ----
+SIZE_BYTES=3590026352
+MTIME=2026-08-01 08:32:15.396379490 +0000
+HEAD64_HEX=10ac0200000000007b226c61796572732e31342e6174746e2e6174746e5f73696e6b223a7b226474797065223a22463332222c227368617065223a5b36345d2c
+HEAD64_ASCII=00000000: 10ac 0200 0000 0000 7b22 6c61 7965 7273  ........{"layers
+00000010: 2e31 342e 6174 746e 2e61 7474 6e5f 7369  .14.attn.attn_si
+00000020: 6e6b 223a 7b22 6474 7970 6522 3a22 4633  nk":{"dtype":"F3
+00000030: 3222 2c22 7368 6170 6522 3a5b 3634 5d2c  2","shape":[64],
+FULL_SHA256=DEFERRED_GT_2GB
+HEAD4096_SHA256=1c681494d2791ba3ce6aa5456c902e8057b868da6234f360779644f98386b0ad  -
+TAIL4096_SHA256=fa0e5cdaf0002825997b826885d19385ecf5b07ce3083f3748139b5c0f51dc7f  -
+NEEDS_FULL_HASH_LATER=yes
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00017-of-00048.safetensors ----
+SIZE_BYTES=3568770544
+MTIME=2026-08-01 08:32:16.079366258 +0000
+HEAD64_HEX=90a80200000000007b226c61796572732e31352e6174746e2e6174746e5f73696e6b223a7b226474797065223a22463332222c227368617065223a5b36345d2c
+HEAD64_ASCII=00000000: 90a8 0200 0000 0000 7b22 6c61 7965 7273  ........{"layers
+00000010: 2e31 352e 6174 746e 2e61 7474 6e5f 7369  .15.attn.attn_si
+00000020: 6e6b 223a 7b22 6474 7970 6522 3a22 4633  nk":{"dtype":"F3
+00000030: 3222 2c22 7368 6170 6522 3a5b 3634 5d2c  2","shape":[64],
+FULL_SHA256=DEFERRED_GT_2GB
+HEAD4096_SHA256=47717280245a01eb164fa24f62049fdaba0ee5fa5f82ae0415fdc29e4e95317a  -
+TAIL4096_SHA256=0c8e979f6a7a1858fda9b20f86350e64378b8634219416d171749e77da57fff1  -
+NEEDS_FULL_HASH_LATER=yes
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00018-of-00048.safetensors ----
+SIZE_BYTES=3590026352
+MTIME=2026-08-01 08:32:16.833351734 +0000
+HEAD64_HEX=10ac0200000000007b226c61796572732e31362e6174746e2e6174746e5f73696e6b223a7b226474797065223a22463332222c227368617065223a5b36345d2c
+HEAD64_ASCII=00000000: 10ac 0200 0000 0000 7b22 6c61 7965 7273  ........{"layers
+00000010: 2e31 362e 6174 746e 2e61 7474 6e5f 7369  .16.attn.attn_si
+00000020: 6e6b 223a 7b22 6474 7970 6522 3a22 4633  nk":{"dtype":"F3
+00000030: 3222 2c22 7368 6170 6522 3a5b 3634 5d2c  2","shape":[64],
+FULL_SHA256=DEFERRED_GT_2GB
+HEAD4096_SHA256=bbd4a025762b02b5bff0174a7c2a571d61a34448beb80752466c6342465ff5dd  -
+TAIL4096_SHA256=563cef71aa9c1ac431be52d702bf359f4ffab0d57ad4ef699dfa20ac72ea8d7d  -
+NEEDS_FULL_HASH_LATER=yes
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00019-of-00048.safetensors ----
+SIZE_BYTES=3568770544
+MTIME=2026-08-01 08:32:17.729334565 +0000
+HEAD64_HEX=90a80200000000007b226c61796572732e31372e6174746e2e6174746e5f73696e6b223a7b226474797065223a22463332222c227368617065223a5b36345d2c
+HEAD64_ASCII=00000000: 90a8 0200 0000 0000 7b22 6c61 7965 7273  ........{"layers
+00000010: 2e31 372e 6174 746e 2e61 7474 6e5f 7369  .17.attn.attn_si
+00000020: 6e6b 223a 7b22 6474 7970 6522 3a22 4633  nk":{"dtype":"F3
+00000030: 3222 2c22 7368 6170 6522 3a5b 3634 5d2c  2","shape":[64],
+FULL_SHA256=DEFERRED_GT_2GB
+HEAD4096_SHA256=52abaf65bfa85e1d09850914f864fa34976637b7888cacaae9bc817f791cddf0  -
+TAIL4096_SHA256=7c1c3b93fafea7e19162e19563b266219e37e7e46dd3c2fd1f11409514338116  -
+NEEDS_FULL_HASH_LATER=yes
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00020-of-00048.safetensors ----
+SIZE_BYTES=3590026352
+MTIME=2026-08-01 08:32:19.010310173 +0000
+HEAD64_HEX=10ac0200000000007b226c61796572732e31382e6174746e2e6174746e5f73696e6b223a7b226474797065223a22463332222c227368617065223a5b36345d2c
+HEAD64_ASCII=00000000: 10ac 0200 0000 0000 7b22 6c61 7965 7273  ........{"layers
+00000010: 2e31 382e 6174 746e 2e61 7474 6e5f 7369  .18.attn.attn_si
+00000020: 6e6b 223a 7b22 6474 7970 6522 3a22 4633  nk":{"dtype":"F3
+00000030: 3222 2c22 7368 6170 6522 3a5b 3634 5d2c  2","shape":[64],
+FULL_SHA256=DEFERRED_GT_2GB
+HEAD4096_SHA256=eabc356bac6955b2cf32632caad4564a68ceafae744dd24e784cc02834d41571  -
+TAIL4096_SHA256=51eb7df092bb980c444c53d29543f4ad7187c82b73f9ae9927f6268cea96b594  -
+NEEDS_FULL_HASH_LATER=yes
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00021-of-00048.safetensors ----
+SIZE_BYTES=3568770544
+MTIME=2026-08-01 08:32:18.786314432 +0000
+HEAD64_HEX=90a80200000000007b226c61796572732e31392e6174746e2e6174746e5f73696e6b223a7b226474797065223a22463332222c227368617065223a5b36345d2c
+HEAD64_ASCII=00000000: 90a8 0200 0000 0000 7b22 6c61 7965 7273  ........{"layers
+00000010: 2e31 392e 6174 746e 2e61 7474 6e5f 7369  .19.attn.attn_si
+00000020: 6e6b 223a 7b22 6474 7970 6522 3a22 4633  nk":{"dtype":"F3
+00000030: 3222 2c22 7368 6170 6522 3a5b 3634 5d2c  2","shape":[64],
+FULL_SHA256=DEFERRED_GT_2GB
+HEAD4096_SHA256=67edea60f435ca909d1a9430c8f7506b10c71523b3befabf6fe3ecb6a2dcb427  -
+TAIL4096_SHA256=44f413bd6e81651f204b522ed979a426ab3f318ef09c651ecc65d7d390b87438  -
+NEEDS_FULL_HASH_LATER=yes
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00022-of-00048.safetensors ----
+SIZE_BYTES=3590026352
+MTIME=2026-08-01 08:32:19.844294415 +0000
+HEAD64_HEX=10ac0200000000007b226c61796572732e32302e6174746e2e6174746e5f73696e6b223a7b226474797065223a22463332222c227368617065223a5b36345d2c
+HEAD64_ASCII=00000000: 10ac 0200 0000 0000 7b22 6c61 7965 7273  ........{"layers
+00000010: 2e32 302e 6174 746e 2e61 7474 6e5f 7369  .20.attn.attn_si
+00000020: 6e6b 223a 7b22 6474 7970 6522 3a22 4633  nk":{"dtype":"F3
+00000030: 3222 2c22 7368 6170 6522 3a5b 3634 5d2c  2","shape":[64],
+FULL_SHA256=DEFERRED_GT_2GB
+HEAD4096_SHA256=ef3dcf1991afa1c616dfd22bf00f59f8b284ab2d5efe2796d55b845bc51b76ad  -
+TAIL4096_SHA256=da3ae74a8cc96b4baa18d02eb2e7a2e2951c135a225325ae8add0eca4b88dfa0  -
+NEEDS_FULL_HASH_LATER=yes
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00023-of-00048.safetensors ----
+SIZE_BYTES=3568770544
+MTIME=2026-08-01 08:32:20.431283376 +0000
+HEAD64_HEX=90a80200000000007b226c61796572732e32312e6174746e2e6174746e5f73696e6b223a7b226474797065223a22463332222c227368617065223a5b36345d2c
+HEAD64_ASCII=00000000: 90a8 0200 0000 0000 7b22 6c61 7965 7273  ........{"layers
+00000010: 2e32 312e 6174 746e 2e61 7474 6e5f 7369  .21.attn.attn_si
+00000020: 6e6b 223a 7b22 6474 7970 6522 3a22 4633  nk":{"dtype":"F3
+00000030: 3222 2c22 7368 6170 6522 3a5b 3634 5d2c  2","shape":[64],
+FULL_SHA256=DEFERRED_GT_2GB
+HEAD4096_SHA256=7319862e8cb28ffe8b012b93d28f45bcec5846a8482e5abc2e8aeba224ef74ff  -
+TAIL4096_SHA256=2022581da8729c80ecadf6560696469b2788d1f99ef8bc7274c719fceadc9e0e  -
+NEEDS_FULL_HASH_LATER=yes
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00024-of-00048.safetensors ----
+SIZE_BYTES=3590026352
+MTIME=2026-08-01 08:32:21.545262527 +0000
+HEAD64_HEX=10ac0200000000007b226c61796572732e32322e6174746e2e6174746e5f73696e6b223a7b226474797065223a22463332222c227368617065223a5b36345d2c
+HEAD64_ASCII=00000000: 10ac 0200 0000 0000 7b22 6c61 7965 7273  ........{"layers
+00000010: 2e32 322e 6174 746e 2e61 7474 6e5f 7369  .22.attn.attn_si
+00000020: 6e6b 223a 7b22 6474 7970 6522 3a22 4633  nk":{"dtype":"F3
+00000030: 3222 2c22 7368 6170 6522 3a5b 3634 5d2c  2","shape":[64],
+FULL_SHA256=DEFERRED_GT_2GB
+HEAD4096_SHA256=3018d06408547577c561f4670faa968b01d26ddc0b2ff6197d751817c7f31b87  -
+TAIL4096_SHA256=6152de016c9b2f027d91f89ebc1bb804ac3d1c1942951f5914a90a6902c198b4  -
+NEEDS_FULL_HASH_LATER=yes
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00025-of-00048.safetensors ----
+SIZE_BYTES=3568770544
+MTIME=2026-08-01 08:32:21.735258983 +0000
+HEAD64_HEX=90a80200000000007b226c61796572732e32332e6174746e2e6174746e5f73696e6b223a7b226474797065223a22463332222c227368617065223a5b36345d2c
+HEAD64_ASCII=00000000: 90a8 0200 0000 0000 7b22 6c61 7965 7273  ........{"layers
+00000010: 2e32 332e 6174 746e 2e61 7474 6e5f 7369  .23.attn.attn_si
+00000020: 6e6b 223a 7b22 6474 7970 6522 3a22 4633  nk":{"dtype":"F3
+00000030: 3222 2c22 7368 6170 6522 3a5b 3634 5d2c  2","shape":[64],
+FULL_SHA256=DEFERRED_GT_2GB
+HEAD4096_SHA256=cfaebde623bfcd6c2db80bcaaf52e6195b9fba9839cf5067241520787ec8e8aa  -
+TAIL4096_SHA256=390ac94627e511a5b0f110506a87a6312ed225dd7b5662737d4b1b31f32b985a  -
+NEEDS_FULL_HASH_LATER=yes
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00026-of-00048.safetensors ----
+SIZE_BYTES=3590026352
+MTIME=2026-08-01 08:32:23.040234767 +0000
+HEAD64_HEX=10ac0200000000007b226c61796572732e32342e6174746e2e6174746e5f73696e6b223a7b226474797065223a22463332222c227368617065223a5b36345d2c
+HEAD64_ASCII=00000000: 10ac 0200 0000 0000 7b22 6c61 7965 7273  ........{"layers
+00000010: 2e32 342e 6174 746e 2e61 7474 6e5f 7369  .24.attn.attn_si
+00000020: 6e6b 223a 7b22 6474 7970 6522 3a22 4633  nk":{"dtype":"F3
+00000030: 3222 2c22 7368 6170 6522 3a5b 3634 5d2c  2","shape":[64],
+FULL_SHA256=DEFERRED_GT_2GB
+HEAD4096_SHA256=7bc365caa3c88b4c49f8e81f27f5b95e525c429059e10cd482431a662c7bacc7  -
+TAIL4096_SHA256=06b433c59a892644706684a892f8f61c86a5ff705b40e8c66b5ccc6c3d53270d  -
+NEEDS_FULL_HASH_LATER=yes
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00027-of-00048.safetensors ----
+SIZE_BYTES=3568770544
+MTIME=2026-08-01 08:32:23.646223606 +0000
+HEAD64_HEX=90a80200000000007b226c61796572732e32352e6174746e2e6174746e5f73696e6b223a7b226474797065223a22463332222c227368617065223a5b36345d2c
+HEAD64_ASCII=00000000: 90a8 0200 0000 0000 7b22 6c61 7965 7273  ........{"layers
+00000010: 2e32 352e 6174 746e 2e61 7474 6e5f 7369  .25.attn.attn_si
+00000020: 6e6b 223a 7b22 6474 7970 6522 3a22 4633  nk":{"dtype":"F3
+00000030: 3222 2c22 7368 6170 6522 3a5b 3634 5d2c  2","shape":[64],
+FULL_SHA256=DEFERRED_GT_2GB
+HEAD4096_SHA256=72b1b8299a10295c6ca718ad992c1fede507d3ebd92197bad4d344aca9190fdc  -
+TAIL4096_SHA256=d162a47a085132f1da0ac79fd0654e9652af8f3f5bcba025e4b6cd79c31ddbb0  -
+NEEDS_FULL_HASH_LATER=yes
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00028-of-00048.safetensors ----
+SIZE_BYTES=3590026352
+MTIME=2026-08-01 08:32:23.909218763 +0000
+HEAD64_HEX=10ac0200000000007b226c61796572732e32362e6174746e2e6174746e5f73696e6b223a7b226474797065223a22463332222c227368617065223a5b36345d2c
+HEAD64_ASCII=00000000: 10ac 0200 0000 0000 7b22 6c61 7965 7273  ........{"layers
+00000010: 2e32 362e 6174 746e 2e61 7474 6e5f 7369  .26.attn.attn_si
+00000020: 6e6b 223a 7b22 6474 7970 6522 3a22 4633  nk":{"dtype":"F3
+00000030: 3222 2c22 7368 6170 6522 3a5b 3634 5d2c  2","shape":[64],
+FULL_SHA256=DEFERRED_GT_2GB
+HEAD4096_SHA256=b9bfd848ab030d1333e8b86bf94596395929e5fff92f2d5dc279ae13baf9dc24  -
+TAIL4096_SHA256=537eba44e5a7a511dbbc626d1e2c00d7a83fc8d85877a9d6c605c42a6bfa23e3  -
+NEEDS_FULL_HASH_LATER=yes
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00029-of-00048.safetensors ----
+SIZE_BYTES=3568770544
+MTIME=2026-08-01 08:32:24.375210224 +0000
+HEAD64_HEX=90a80200000000007b226c61796572732e32372e6174746e2e6174746e5f73696e6b223a7b226474797065223a22463332222c227368617065223a5b36345d2c
+HEAD64_ASCII=00000000: 90a8 0200 0000 0000 7b22 6c61 7965 7273  ........{"layers
+00000010: 2e32 372e 6174 746e 2e61 7474 6e5f 7369  .27.attn.attn_si
+00000020: 6e6b 223a 7b22 6474 7970 6522 3a22 4633  nk":{"dtype":"F3
+00000030: 3222 2c22 7368 6170 6522 3a5b 3634 5d2c  2","shape":[64],
+FULL_SHA256=DEFERRED_GT_2GB
+HEAD4096_SHA256=26c1296211ea9eeabfbfbce7949c93af176b906f3bb7e13592a1b796f57950f5  -
+TAIL4096_SHA256=a927ebd1951f0525cda69793c024002883b67af0ba5228e507567c29aaeb80df  -
+NEEDS_FULL_HASH_LATER=yes
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00030-of-00048.safetensors ----
+SIZE_BYTES=3590026352
+MTIME=2026-08-01 08:32:25.128196458 +0000
+HEAD64_HEX=10ac0200000000007b226c61796572732e32382e6174746e2e6174746e5f73696e6b223a7b226474797065223a22463332222c227368617065223a5b36345d2c
+HEAD64_ASCII=00000000: 10ac 0200 0000 0000 7b22 6c61 7965 7273  ........{"layers
+00000010: 2e32 382e 6174 746e 2e61 7474 6e5f 7369  .28.attn.attn_si
+00000020: 6e6b 223a 7b22 6474 7970 6522 3a22 4633  nk":{"dtype":"F3
+00000030: 3222 2c22 7368 6170 6522 3a5b 3634 5d2c  2","shape":[64],
+FULL_SHA256=DEFERRED_GT_2GB
+HEAD4096_SHA256=c898263b8b2573dff5254b53b73d92661d02d28e1a18b2e00444cb4506dde7b7  -
+TAIL4096_SHA256=31444a9b2aa08014240e11e615f658af5d37787b380f32051d926f7f22cd2cc5  -
+NEEDS_FULL_HASH_LATER=yes
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00031-of-00048.safetensors ----
+SIZE_BYTES=3568770544
+MTIME=2026-08-01 08:32:25.737185384 +0000
+HEAD64_HEX=90a80200000000007b226c61796572732e32392e6174746e2e6174746e5f73696e6b223a7b226474797065223a22463332222c227368617065223a5b36345d2c
+HEAD64_ASCII=00000000: 90a8 0200 0000 0000 7b22 6c61 7965 7273  ........{"layers
+00000010: 2e32 392e 6174 746e 2e61 7474 6e5f 7369  .29.attn.attn_si
+00000020: 6e6b 223a 7b22 6474 7970 6522 3a22 4633  nk":{"dtype":"F3
+00000030: 3222 2c22 7368 6170 6522 3a5b 3634 5d2c  2","shape":[64],
+FULL_SHA256=DEFERRED_GT_2GB
+HEAD4096_SHA256=e69f45153dca850ccb08f1c18b979b37e8e48d251b04a8dc56fb9a583d0e87fb  -
+TAIL4096_SHA256=493c21152bc6d2504a57c1b781b1645b9de7e37dcfe176fa92c2f7a72c007710  -
+NEEDS_FULL_HASH_LATER=yes
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00032-of-00048.safetensors ----
+SIZE_BYTES=3590026352
+MTIME=2026-08-01 08:32:25.940181693 +0000
+HEAD64_HEX=10ac0200000000007b226c61796572732e33302e6174746e2e6174746e5f73696e6b223a7b226474797065223a22463332222c227368617065223a5b36345d2c
+HEAD64_ASCII=00000000: 10ac 0200 0000 0000 7b22 6c61 7965 7273  ........{"layers
+00000010: 2e33 302e 6174 746e 2e61 7474 6e5f 7369  .30.attn.attn_si
+00000020: 6e6b 223a 7b22 6474 7970 6522 3a22 4633  nk":{"dtype":"F3
+00000030: 3222 2c22 7368 6170 6522 3a5b 3634 5d2c  2","shape":[64],
+FULL_SHA256=DEFERRED_GT_2GB
+HEAD4096_SHA256=5436eba15959923d5a77325c9cac231d4216762f36a56c59f5a76f2d8d954da1  -
+TAIL4096_SHA256=f164b4c40e6fb0dfece8864c07104aa3f37380a5b10e2a12d2ff7765613c86bd  -
+NEEDS_FULL_HASH_LATER=yes
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00033-of-00048.safetensors ----
+SIZE_BYTES=3568770544
+MTIME=2026-08-01 08:32:27.317156840 +0000
+HEAD64_HEX=90a80200000000007b226c61796572732e33312e6174746e2e6174746e5f73696e6b223a7b226474797065223a22463332222c227368617065223a5b36345d2c
+HEAD64_ASCII=00000000: 90a8 0200 0000 0000 7b22 6c61 7965 7273  ........{"layers
+00000010: 2e33 312e 6174 746e 2e61 7474 6e5f 7369  .31.attn.attn_si
+00000020: 6e6b 223a 7b22 6474 7970 6522 3a22 4633  nk":{"dtype":"F3
+00000030: 3222 2c22 7368 6170 6522 3a5b 3634 5d2c  2","shape":[64],
+FULL_SHA256=DEFERRED_GT_2GB
+HEAD4096_SHA256=fdc4b3cf74fc8754aeb3689d41e632f37d4136fee1208333a03b7bc3e4f80af4  -
+TAIL4096_SHA256=af3367674472609758fc26c2de935e260922ed9d963edf839e1864e115b39553  -
+NEEDS_FULL_HASH_LATER=yes
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00034-of-00048.safetensors ----
+SIZE_BYTES=3590026352
+MTIME=2026-08-01 08:32:27.810147989 +0000
+HEAD64_HEX=10ac0200000000007b226c61796572732e33322e6174746e2e6174746e5f73696e6b223a7b226474797065223a22463332222c227368617065223a5b36345d2c
+HEAD64_ASCII=00000000: 10ac 0200 0000 0000 7b22 6c61 7965 7273  ........{"layers
+00000010: 2e33 322e 6174 746e 2e61 7474 6e5f 7369  .32.attn.attn_si
+00000020: 6e6b 223a 7b22 6474 7970 6522 3a22 4633  nk":{"dtype":"F3
+00000030: 3222 2c22 7368 6170 6522 3a5b 3634 5d2c  2","shape":[64],
+FULL_SHA256=DEFERRED_GT_2GB
+HEAD4096_SHA256=cf9dde1e0904430d28857c538c51ad12c751f6e5f230835497f5274f40dee4cc  -
+TAIL4096_SHA256=eb61e0f42fe5bd763b101798148e54be1759d436172a174f8af7ab1649f081b2  -
+NEEDS_FULL_HASH_LATER=yes
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00035-of-00048.safetensors ----
+SIZE_BYTES=3568770544
+MTIME=2026-08-01 08:32:28.622133479 +0000
+HEAD64_HEX=90a80200000000007b226c61796572732e33332e6174746e2e6174746e5f73696e6b223a7b226474797065223a22463332222c227368617065223a5b36345d2c
+HEAD64_ASCII=00000000: 90a8 0200 0000 0000 7b22 6c61 7965 7273  ........{"layers
+00000010: 2e33 332e 6174 746e 2e61 7474 6e5f 7369  .33.attn.attn_si
+00000020: 6e6b 223a 7b22 6474 7970 6522 3a22 4633  nk":{"dtype":"F3
+00000030: 3222 2c22 7368 6170 6522 3a5b 3634 5d2c  2","shape":[64],
+FULL_SHA256=DEFERRED_GT_2GB
+HEAD4096_SHA256=0f943c01970b48d9922d8f69c7d32a8d9faea39712b6976f0dbeb6a597e52671  -
+TAIL4096_SHA256=a8e7d521e7d1def3827c2b46a94ed8a2c126461025512c3a93c4f29d672de161  -
+NEEDS_FULL_HASH_LATER=yes
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00036-of-00048.safetensors ----
+SIZE_BYTES=3590026352
+MTIME=2026-08-01 08:32:28.944127734 +0000
+HEAD64_HEX=10ac0200000000007b226c61796572732e33342e6174746e2e6174746e5f73696e6b223a7b226474797065223a22463332222c227368617065223a5b36345d2c
+HEAD64_ASCII=00000000: 10ac 0200 0000 0000 7b22 6c61 7965 7273  ........{"layers
+00000010: 2e33 342e 6174 746e 2e61 7474 6e5f 7369  .34.attn.attn_si
+00000020: 6e6b 223a 7b22 6474 7970 6522 3a22 4633  nk":{"dtype":"F3
+00000030: 3222 2c22 7368 6170 6522 3a5b 3634 5d2c  2","shape":[64],
+FULL_SHA256=DEFERRED_GT_2GB
+HEAD4096_SHA256=2f8b2cce8710b09b8749375dcbe5a35351219dfa7a5835fba5909142444333d9  -
+TAIL4096_SHA256=21312b552e0c47ba4634f448aeed4b3b32994321baba5d928f4a73453028d0df  -
+NEEDS_FULL_HASH_LATER=yes
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00037-of-00048.safetensors ----
+SIZE_BYTES=3568770544
+MTIME=2026-08-01 08:32:29.020126381 +0000
+HEAD64_HEX=90a80200000000007b226c61796572732e33352e6174746e2e6174746e5f73696e6b223a7b226474797065223a22463332222c227368617065223a5b36345d2c
+HEAD64_ASCII=00000000: 90a8 0200 0000 0000 7b22 6c61 7965 7273  ........{"layers
+00000010: 2e33 352e 6174 746e 2e61 7474 6e5f 7369  .35.attn.attn_si
+00000020: 6e6b 223a 7b22 6474 7970 6522 3a22 4633  nk":{"dtype":"F3
+00000030: 3222 2c22 7368 6170 6522 3a5b 3634 5d2c  2","shape":[64],
+FULL_SHA256=DEFERRED_GT_2GB
+HEAD4096_SHA256=3510b6f65f97f97afef64c06f81fa0953fd8c22458974a8ce0c788c9d3ce83ec  -
+TAIL4096_SHA256=0b7ad599b64723a641e3717a9dc320db962355417e0ff82e7308419d6ce9cd42  -
+NEEDS_FULL_HASH_LATER=yes
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00038-of-00048.safetensors ----
+SIZE_BYTES=3590026352
+MTIME=2026-08-01 08:32:29.095125051 +0000
+HEAD64_HEX=10ac0200000000007b226c61796572732e33362e6174746e2e6174746e5f73696e6b223a7b226474797065223a22463332222c227368617065223a5b36345d2c
+HEAD64_ASCII=00000000: 10ac 0200 0000 0000 7b22 6c61 7965 7273  ........{"layers
+00000010: 2e33 362e 6174 746e 2e61 7474 6e5f 7369  .36.attn.attn_si
+00000020: 6e6b 223a 7b22 6474 7970 6522 3a22 4633  nk":{"dtype":"F3
+00000030: 3222 2c22 7368 6170 6522 3a5b 3634 5d2c  2","shape":[64],
+FULL_SHA256=DEFERRED_GT_2GB
+HEAD4096_SHA256=c177cd5d0b752134dc6ce123a2001db614642f2f8815ffbbd74a56e911f338b5  -
+TAIL4096_SHA256=3e3251996685935fc8f127f698faa9cd7034813b7a600d8dc0684542133662b8  -
+NEEDS_FULL_HASH_LATER=yes
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00039-of-00048.safetensors ----
+SIZE_BYTES=3568770544
+MTIME=2026-08-01 08:32:30.418101642 +0000
+HEAD64_HEX=90a80200000000007b226c61796572732e33372e6174746e2e6174746e5f73696e6b223a7b226474797065223a22463332222c227368617065223a5b36345d2c
+HEAD64_ASCII=00000000: 90a8 0200 0000 0000 7b22 6c61 7965 7273  ........{"layers
+00000010: 2e33 372e 6174 746e 2e61 7474 6e5f 7369  .37.attn.attn_si
+00000020: 6e6b 223a 7b22 6474 7970 6522 3a22 4633  nk":{"dtype":"F3
+00000030: 3222 2c22 7368 6170 6522 3a5b 3634 5d2c  2","shape":[64],
+FULL_SHA256=DEFERRED_GT_2GB
+HEAD4096_SHA256=b1223a02d5c99a0d0ba0f4d93bd1d773ee5100599d8840b1c0f77c0623371c2b  -
+TAIL4096_SHA256=81dc24219767d6a9abdb1ba405b8069460a21aceac918dd76a4803326b35b4d1  -
+NEEDS_FULL_HASH_LATER=yes
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00040-of-00048.safetensors ----
+SIZE_BYTES=3590026352
+MTIME=2026-08-01 08:32:30.621098066 +0000
+HEAD64_HEX=10ac0200000000007b226c61796572732e33382e6174746e2e6174746e5f73696e6b223a7b226474797065223a22463332222c227368617065223a5b36345d2c
+HEAD64_ASCII=00000000: 10ac 0200 0000 0000 7b22 6c61 7965 7273  ........{"layers
+00000010: 2e33 382e 6174 746e 2e61 7474 6e5f 7369  .38.attn.attn_si
+00000020: 6e6b 223a 7b22 6474 7970 6522 3a22 4633  nk":{"dtype":"F3
+00000030: 3222 2c22 7368 6170 6522 3a5b 3634 5d2c  2","shape":[64],
+FULL_SHA256=DEFERRED_GT_2GB
+HEAD4096_SHA256=3608146d3a180e0df24a9450d6bb9023f22c88366b9c1343c0fdf93eb10ae541  -
+TAIL4096_SHA256=b9192029033cf216f623546b91796eb31561b669ac640cc91dd75dee1646e44f  -
+NEEDS_FULL_HASH_LATER=yes
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00041-of-00048.safetensors ----
+SIZE_BYTES=3568770544
+MTIME=2026-08-01 08:32:31.515082372 +0000
+HEAD64_HEX=90a80200000000007b226c61796572732e33392e6174746e2e6174746e5f73696e6b223a7b226474797065223a22463332222c227368617065223a5b36345d2c
+HEAD64_ASCII=00000000: 90a8 0200 0000 0000 7b22 6c61 7965 7273  ........{"layers
+00000010: 2e33 392e 6174 746e 2e61 7474 6e5f 7369  .39.attn.attn_si
+00000020: 6e6b 223a 7b22 6474 7970 6522 3a22 4633  nk":{"dtype":"F3
+00000030: 3222 2c22 7368 6170 6522 3a5b 3634 5d2c  2","shape":[64],
+FULL_SHA256=DEFERRED_GT_2GB
+HEAD4096_SHA256=f7469553bd8a3b26b7f0c6bb9cf1d2f546e0e5801904d692537ac28bbc8cfed4  -
+TAIL4096_SHA256=63b51cfb1844fb90ca3f458f2b4c373698a33a863f35849685123d720235260c  -
+NEEDS_FULL_HASH_LATER=yes
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00042-of-00048.safetensors ----
+SIZE_BYTES=3590026352
+MTIME=2026-08-01 08:32:33.008056346 +0000
+HEAD64_HEX=10ac0200000000007b226c61796572732e34302e6174746e2e6174746e5f73696e6b223a7b226474797065223a22463332222c227368617065223a5b36345d2c
+HEAD64_ASCII=00000000: 10ac 0200 0000 0000 7b22 6c61 7965 7273  ........{"layers
+00000010: 2e34 302e 6174 746e 2e61 7474 6e5f 7369  .40.attn.attn_si
+00000020: 6e6b 223a 7b22 6474 7970 6522 3a22 4633  nk":{"dtype":"F3
+00000030: 3222 2c22 7368 6170 6522 3a5b 3634 5d2c  2","shape":[64],
+FULL_SHA256=DEFERRED_GT_2GB
+HEAD4096_SHA256=c352acb4aabda10e350d1445065a99db93e4d3c63716c584f62b5c55b79aa82c  -
+TAIL4096_SHA256=6ee002e341082447d044bdff015e8a7e35ebd0b602161e016c7d9576c477bc60  -
+NEEDS_FULL_HASH_LATER=yes
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00043-of-00048.safetensors ----
+SIZE_BYTES=3568770544
+MTIME=2026-08-01 08:32:32.394067027 +0000
+HEAD64_HEX=90a80200000000007b226c61796572732e34312e6174746e2e6174746e5f73696e6b223a7b226474797065223a22463332222c227368617065223a5b36345d2c
+HEAD64_ASCII=00000000: 90a8 0200 0000 0000 7b22 6c61 7965 7273  ........{"layers
+00000010: 2e34 312e 6174 746e 2e61 7474 6e5f 7369  .41.attn.attn_si
+00000020: 6e6b 223a 7b22 6474 7970 6522 3a22 4633  nk":{"dtype":"F3
+00000030: 3222 2c22 7368 6170 6522 3a5b 3634 5d2c  2","shape":[64],
+FULL_SHA256=DEFERRED_GT_2GB
+HEAD4096_SHA256=c5b0aff2eab37a0928491b06278b7e87b5dc5d38b165a987f03fc18ea22ce383  -
+TAIL4096_SHA256=7ff24f4157db00997e2d7d7d113e10a079cb1315151686705f21450c5cacdc17  -
+NEEDS_FULL_HASH_LATER=yes
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00044-of-00048.safetensors ----
+SIZE_BYTES=3590026352
+MTIME=2026-08-01 08:32:32.854059024 +0000
+HEAD64_HEX=10ac0200000000007b226c61796572732e34322e6174746e2e6174746e5f73696e6b223a7b226474797065223a22463332222c227368617065223a5b36345d2c
+HEAD64_ASCII=00000000: 10ac 0200 0000 0000 7b22 6c61 7965 7273  ........{"layers
+00000010: 2e34 322e 6174 746e 2e61 7474 6e5f 7369  .42.attn.attn_si
+00000020: 6e6b 223a 7b22 6474 7970 6522 3a22 4633  nk":{"dtype":"F3
+00000030: 3222 2c22 7368 6170 6522 3a5b 3634 5d2c  2","shape":[64],
+FULL_SHA256=DEFERRED_GT_2GB
+HEAD4096_SHA256=8589b95c2e2bb39d625317b3ac2c00aa606d3bb8e4f9c016d9ad6302ca94dcd1  -
+TAIL4096_SHA256=16ddf63befd264c0129055a6d7bf90471fc8dfd899adeebf2a9dca86ff3e2955  -
+NEEDS_FULL_HASH_LATER=yes
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00045-of-00048.safetensors ----
+SIZE_BYTES=1059332516
+MTIME=2026-08-01 08:32:32.101072124 +0000
+HEAD64_HEX=88010000000000007b2268635f686561645f62617365223a7b226474797065223a22463332222c227368617065223a5b345d2c22646174615f6f666673657473
+HEAD64_ASCII=00000000: 8801 0000 0000 0000 7b22 6863 5f68 6561  ........{"hc_hea
+00000010: 645f 6261 7365 223a 7b22 6474 7970 6522  d_base":{"dtype"
+00000020: 3a22 4633 3222 2c22 7368 6170 6522 3a5b  :"F32","shape":[
+00000030: 345d 2c22 6461 7461 5f6f 6666 7365 7473  4],"data_offsets
+FULL_SHA256=SKIPPED_FULL_GT_512MB
+HEAD4096_SHA256=199eeda3f6449123f335be78cc56460a11b7688a112ab56b1ab35f878244c13c  -
+TAIL4096_SHA256=8b50d3e26a229ca6b1b31e4c4d62d1d19a21b005b43a32a8487c71b51992b4a2  -
+NEEDS_FULL_HASH_LATER=yes
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00046-of-00048.safetensors ----
+SIZE_BYTES=3610455184
+MTIME=2026-08-01 08:32:33.428049085 +0000
+HEAD64_HEX=308f0200000000007b226d74702e302e6174746e2e6174746e5f73696e6b223a7b226474797065223a22463332222c227368617065223a5b36345d2c22646174
+HEAD64_ASCII=00000000: 308f 0200 0000 0000 7b22 6d74 702e 302e  0.......{"mtp.0.
+00000010: 6174 746e 2e61 7474 6e5f 7369 6e6b 223a  attn.attn_sink":
+00000020: 7b22 6474 7970 6522 3a22 4633 3222 2c22  {"dtype":"F32","
+00000030: 7368 6170 6522 3a5b 3634 5d2c 2264 6174  shape":[64],"dat
+FULL_SHA256=DEFERRED_GT_2GB
+HEAD4096_SHA256=3b4b41b7c048682bb0058ae47074433ef3c1e72f618219116b7bf4dae90cd00d  -
+TAIL4096_SHA256=3b9ba4a029a58bb3016eb4475cc573e1c12ddee8336e3f8ca59ec22657a55b90  -
+NEEDS_FULL_HASH_LATER=yes
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00047-of-00048.safetensors ----
+SIZE_BYTES=3560111960
+MTIME=2026-08-01 08:32:33.708044245 +0000
+HEAD64_HEX=f88d0200000000007b226d74702e312e6174746e2e6174746e5f73696e6b223a7b226474797065223a22463332222c227368617065223a5b36345d2c22646174
+HEAD64_ASCII=00000000: f88d 0200 0000 0000 7b22 6d74 702e 312e  ........{"mtp.1.
+00000010: 6174 746e 2e61 7474 6e5f 7369 6e6b 223a  attn.attn_sink":
+00000020: 7b22 6474 7970 6522 3a22 4633 3222 2c22  {"dtype":"F32","
+00000030: 7368 6170 6522 3a5b 3634 5d2c 2264 6174  shape":[64],"dat
+FULL_SHA256=DEFERRED_GT_2GB
+HEAD4096_SHA256=8d33f8c1350f6b1d10c6e8db69a3a4bf46c40fe1426baf4455728491a6944ae9  -
+TAIL4096_SHA256=134829a9e1209c0a966d33f6884534c50747cbbacef38fb13039ebdb5a57aed2  -
+NEEDS_FULL_HASH_LATER=yes
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00048-of-00048.safetensors ----
+SIZE_BYTES=3692775244
+MTIME=2026-08-01 08:32:34.538029954 +0000
+HEAD64_HEX=d8930200000000007b226d74702e322e6174746e2e6174746e5f73696e6b223a7b226474797065223a22463332222c227368617065223a5b36345d2c22646174
+HEAD64_ASCII=00000000: d893 0200 0000 0000 7b22 6d74 702e 322e  ........{"mtp.2.
+00000010: 6174 746e 2e61 7474 6e5f 7369 6e6b 223a  attn.attn_sink":
+00000020: 7b22 6474 7970 6522 3a22 4633 3222 2c22  {"dtype":"F32","
+00000030: 7368 6170 6522 3a5b 3634 5d2c 2264 6174  shape":[64],"dat
+FULL_SHA256=DEFERRED_GT_2GB
+HEAD4096_SHA256=09c79d66916f69d3349bad1689303cc92a4c766e3cd155f04e548f2c415d2b09  -
+TAIL4096_SHA256=89232b81a2ed1cc3502da4ee5f46b1fdb7c247e07921c14a0275e4a3d51b1c24  -
+NEEDS_FULL_HASH_LATER=yes
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/model.safetensors.index.json ----
+SIZE_BYTES=5602871
+MTIME=2026-08-01 08:32:28.192141151 +0000
+HEAD64_HEX=7b0a2020226d65746164617461223a207b0a2020202022746f74616c5f73697a65223a203136363837383533363434300a20207d2c0a2020227765696768745f
+HEAD64_ASCII=00000000: 7b0a 2020 226d 6574 6164 6174 6122 3a20  {.  "metadata": 
+00000010: 7b0a 2020 2020 2274 6f74 616c 5f73 697a  {.    "total_siz
+00000020: 6522 3a20 3136 3638 3738 3533 3634 3430  e": 166878536440
+00000030: 0a20 207d 2c0a 2020 2277 6569 6768 745f  .  },.  "weight_
+FULL_SHA256=98efab455cf08dfbbbaaba6f570e1bf10bf927d2b4c3c453a59c2f6f0e3be92b  /mnt/scratch/models/DeepSeek-V4-Flash-0731/model.safetensors.index.json
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/tokenizer.json ----
+SIZE_BYTES=6367146
+MTIME=2026-08-01 08:32:28.295139314 +0000
+HEAD64_HEX=7b0a20202276657273696f6e223a2022312e30222c0a2020227472756e636174696f6e223a206e756c6c2c0a20202270616464696e67223a206e756c6c2c0a20
+HEAD64_ASCII=00000000: 7b0a 2020 2276 6572 7369 6f6e 223a 2022  {.  "version": "
+00000010: 312e 3022 2c0a 2020 2274 7275 6e63 6174  1.0",.  "truncat
+00000020: 696f 6e22 3a20 6e75 6c6c 2c0a 2020 2270  ion": null,.  "p
+00000030: 6164 6469 6e67 223a 206e 756c 6c2c 0a20  adding": null,. 
+FULL_SHA256=8f9f37ca37fdc4f5fd36d5cf4d3b0e8392edb4e894fd10cc0d70b4957c8633cf  /mnt/scratch/models/DeepSeek-V4-Flash-0731/tokenizer.json
+
+---- FILE: /mnt/scratch/models/DeepSeek-V4-Flash-0731/tokenizer_config.json ----
+SIZE_BYTES=801
+MTIME=2026-08-01 08:32:28.357138207 +0000
+HEAD64_HEX=7b0a2020226164645f626f735f746f6b656e223a2066616c73652c0a2020226164645f656f735f746f6b656e223a2066616c73652c0a202022626f735f746f6b
+HEAD64_ASCII=00000000: 7b0a 2020 2261 6464 5f62 6f73 5f74 6f6b  {.  "add_bos_tok
+00000010: 656e 223a 2066 616c 7365 2c0a 2020 2261  en": false,.  "a
+00000020: 6464 5f65 6f73 5f74 6f6b 656e 223a 2066  dd_eos_token": f
+00000030: 616c 7365 2c0a 2020 2262 6f73 5f74 6f6b  alse,.  "bos_tok
+FULL_SHA256=6ac8c8dc065ed118161d02dd532749ae3f52c243deac27872134fae2f50d8547  /mnt/scratch/models/DeepSeek-V4-Flash-0731/tokenizer_config.json
+
+---- FILE: /mnt/scratch/models/deepseek-v4-flash-mq2r/deepseek-v4-flash.mq2r ----
+SIZE_BYTES=82191362222
+MTIME=2026-07-24 22:20:40.157517809 +0000
+HEAD64_HEX=4846514d0100000009000000af850000200000000000000000d08b00000000007b22617263686974656374757265223a22646565707365656b5f7634222c2263
+HEAD64_ASCII=00000000: 4846 514d 0100 0000 0900 0000 af85 0000  HFQM............
+00000010: 2000 0000 0000 0000 00d0 8b00 0000 0000   ...............
+00000020: 7b22 6172 6368 6974 6563 7475 7265 223a  {"architecture":
+00000030: 2264 6565 7073 6565 6b5f 7634 222c 2263  "deepseek_v4","c
+FULL_SHA256=DEFERRED_GT_2GB
+HEAD4096_SHA256=04607e941e54cbca13af6f3f1e6c027489254c1f5656e70b03b3f6e741b0a655  -
+TAIL4096_SHA256=32f00859364d4f7aa46efa5c57a5a34d7f790d5c986fd495fbba1f3a3b9d1cbc  -
+NEEDS_FULL_HASH_LATER=yes
+
+---- FILE: /mnt/scratch/models/existing-deepseek-v4-flash/.cache/huggingface/download/deepseek-v4-flash-mtp.mq2lloyd.metadata ----
+SIZE_BYTES=125
+MTIME=2026-05-27 03:03:22.928105525 +0000
+HEAD64_HEX=666665323666393336396539653139383862613430383337653465343866313765313038636630310a3539366162353539643430333139666430373062616133
+HEAD64_ASCII=00000000: 6666 6532 3666 3933 3639 6539 6531 3938  ffe26f9369e9e198
+00000010: 3862 6134 3038 3337 6534 6534 3866 3137  8ba40837e4e48f17
+00000020: 6531 3038 6366 3031 0a35 3936 6162 3535  e108cf01.596ab55
+00000030: 3964 3430 3331 3966 6430 3730 6261 6133  9d40319fd070baa3
+FULL_SHA256=2315b9dbfe5878288288f4e038245f098e684c4067cc816e2c8e428258b42597  /mnt/scratch/models/existing-deepseek-v4-flash/.cache/huggingface/download/deepseek-v4-flash-mtp.mq2lloyd.metadata
+
+---- FILE: /mnt/scratch/models/existing-deepseek-v4-flash/.cache/huggingface/download/deepseek-v4-flash.mq2lloyd.metadata ----
+SIZE_BYTES=125
+MTIME=2026-05-27 03:11:10.348075968 +0000
+HEAD64_HEX=666665323666393336396539653139383862613430383337653465343866313765313038636630310a6162386138393030663637393231393939373565376532
+HEAD64_ASCII=00000000: 6666 6532 3666 3933 3639 6539 6531 3938  ffe26f9369e9e198
+00000010: 3862 6134 3038 3337 6534 6534 3866 3137  8ba40837e4e48f17
+00000020: 6531 3038 6366 3031 0a61 6238 6138 3930  e108cf01.ab8a890
+00000030: 3066 3637 3932 3139 3939 3735 6537 6532  0f6792199975e7e2
+FULL_SHA256=175080568e7186b6bec5d61aec6e765350fd9ed80dddf4edd185a76631b25d9a  /mnt/scratch/models/existing-deepseek-v4-flash/.cache/huggingface/download/deepseek-v4-flash.mq2lloyd.metadata
+
+---- FILE: /mnt/scratch/models/existing-deepseek-v4-flash/deepseek-v4-flash-mtp.mq2lloyd ----
+SIZE_BYTES=1998047355
+MTIME=2026-05-27 03:03:15.078827775 +0000
+HEAD64_HEX=4846514d01000000090000001d030000200000000000000085196e00000000007b22617263686974656374757265223a22646565707365656b5f7634222c2263
+HEAD64_ASCII=00000000: 4846 514d 0100 0000 0900 0000 1d03 0000  HFQM............
+00000010: 2000 0000 0000 0000 8519 6e00 0000 0000   .........n.....
+00000020: 7b22 6172 6368 6974 6563 7475 7265 223a  {"architecture":
+00000030: 2264 6565 7073 6565 6b5f 7634 222c 2263  "deepseek_v4","c
+FULL_SHA256=SKIPPED_FULL_GT_512MB
+HEAD4096_SHA256=0ccd64e27265b97b431d1ca2565ca06f911ca71c886b73366165a23ba2dd878e  -
+TAIL4096_SHA256=2f5acead90c602ad4b249c1240b69ceb99e81b048c3eb828e7dff8ac83160c18  -
+NEEDS_FULL_HASH_LATER=yes
+
+---- FILE: /mnt/scratch/models/existing-deepseek-v4-flash/deepseek-v4-flash.mq2lloyd ----
+SIZE_BYTES=86184307283
+MTIME=2026-05-27 03:11:10.098000731 +0000
+HEAD64_HEX=4846514d0100000009000000af8500002000000000000000a5c58b00000000007b22617263686974656374757265223a22646565707365656b5f7634222c2263
+HEAD64_ASCII=00000000: 4846 514d 0100 0000 0900 0000 af85 0000  HFQM............
+00000010: 2000 0000 0000 0000 a5c5 8b00 0000 0000   ...............
+00000020: 7b22 6172 6368 6974 6563 7475 7265 223a  {"architecture":
+00000030: 2264 6565 7073 6565 6b5f 7634 222c 2263  "deepseek_v4","c
+FULL_SHA256=DEFERRED_GT_2GB
+HEAD4096_SHA256=70212da2e13587609981fb7ae1f294940bc4ccee27eeced5d89245d0fcbcf9c3  -
+TAIL4096_SHA256=32f00859364d4f7aa46efa5c57a5a34d7f790d5c986fd495fbba1f3a3b9d1cbc  -
+NEEDS_FULL_HASH_LATER=yes
+
+---- FILE: /mnt/scratch/models/qwen3.5-0.8b/qwen3.5-0.8b.mq4 ----
+SIZE_BYTES=549221504
+MTIME=2026-04-11 00:03:16.340546734 +0000
+HEAD64_HEX=4846514d010000000500000040010000200000000000000000e0da00000000007b22617263686974656374757265223a227177656e335f35222c22636f6e6669
+HEAD64_ASCII=00000000: 4846 514d 0100 0000 0500 0000 4001 0000  HFQM........@...
+00000010: 2000 0000 0000 0000 00e0 da00 0000 0000   ...............
+00000020: 7b22 6172 6368 6974 6563 7475 7265 223a  {"architecture":
+00000030: 2271 7765 6e33 5f35 222c 2263 6f6e 6669  "qwen3_5","confi
+FULL_SHA256=SKIPPED_FULL_GT_512MB
+HEAD4096_SHA256=ec1fea7b6d41f35643db692deeb9ae76efafb9449489884fdae0bc52a46cc755  -
+TAIL4096_SHA256=62e74940a356d928942c2bd89f410b994de371756ef34169c9c1088b33cbe586  -
+NEEDS_FULL_HASH_LATER=yes
+
+---- FILE: /root/.hipfire/models/hipfire-deepseek-v4-flash/deepseek-v4-flash-mtp.mq2lloyd ----
+SIZE_BYTES=24117248
+MTIME=2026-08-01 08:28:58.382013971 +0000
+HEAD64_HEX=4846514d01000000090000001d030000200000000000000085196e00000000007b22617263686974656374757265223a22646565707365656b5f7634222c2263
+HEAD64_ASCII=00000000: 4846 514d 0100 0000 0900 0000 1d03 0000  HFQM............
+00000010: 2000 0000 0000 0000 8519 6e00 0000 0000   .........n.....
+00000020: 7b22 6172 6368 6974 6563 7475 7265 223a  {"architecture":
+00000030: 2264 6565 7073 6565 6b5f 7634 222c 2263  "deepseek_v4","c
+FULL_SHA256=5c6b8e3d1995b6e5646106a52520adfd84441698e0346dbdc8108a99f63d7b8b  /root/.hipfire/models/hipfire-deepseek-v4-flash/deepseek-v4-flash-mtp.mq2lloyd
+
+=== 0731 snapshot completeness ===
+DIR=/mnt/scratch/models/DeepSeek-V4-Flash-0731
+1 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/.gitignore
+191 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/CACHEDIR.TAG
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/.gitattributes.lock
+101 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/.gitattributes.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/LICENSE.lock
+100 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/LICENSE.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/README.md.lock
+101 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/README.md.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/config.json.lock
+101 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/config.json.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/README.md.lock
+101 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/README.md.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/encoding_dsv4.py.lock
+101 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/encoding_dsv4.py.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/test_encoding_dsv4.py.lock
+101 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/test_encoding_dsv4.py.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_input_1.json.lock
+101 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_input_1.json.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_input_2.json.lock
+101 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_input_2.json.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_input_3.json.lock
+101 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_input_3.json.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_input_4.json.lock
+101 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_input_4.json.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_output_1.txt.lock
+101 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_output_1.txt.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_output_2.txt.lock
+101 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_output_2.txt.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_output_3.txt.lock
+100 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_output_3.txt.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_output_4.txt.lock
+101 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_output_4.txt.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/generation_config.json.lock
+101 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/generation_config.json.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/inference/README.md.lock
+101 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/inference/README.md.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/inference/config.json.lock
+100 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/inference/config.json.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/inference/convert.py.lock
+101 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/inference/convert.py.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/inference/generate.py.lock
+101 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/inference/generate.py.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/inference/kernel.py.lock
+101 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/inference/kernel.py.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/inference/model.py.lock
+101 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/inference/model.py.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/inference/requirements.txt.lock
+100 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/inference/requirements.txt.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00001-of-00048.safetensors.lock
+125 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00001-of-00048.safetensors.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00002-of-00048.safetensors.lock
+125 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00002-of-00048.safetensors.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00003-of-00048.safetensors.lock
+125 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00003-of-00048.safetensors.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00004-of-00048.safetensors.lock
+125 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00004-of-00048.safetensors.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00005-of-00048.safetensors.lock
+125 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00005-of-00048.safetensors.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00006-of-00048.safetensors.lock
+124 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00006-of-00048.safetensors.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00007-of-00048.safetensors.lock
+124 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00007-of-00048.safetensors.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00008-of-00048.safetensors.lock
+125 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00008-of-00048.safetensors.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00009-of-00048.safetensors.lock
+125 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00009-of-00048.safetensors.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00010-of-00048.safetensors.lock
+125 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00010-of-00048.safetensors.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00011-of-00048.safetensors.lock
+125 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00011-of-00048.safetensors.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00012-of-00048.safetensors.lock
+124 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00012-of-00048.safetensors.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00013-of-00048.safetensors.lock
+125 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00013-of-00048.safetensors.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00014-of-00048.safetensors.lock
+125 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00014-of-00048.safetensors.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00015-of-00048.safetensors.lock
+125 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00015-of-00048.safetensors.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00016-of-00048.safetensors.lock
+125 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00016-of-00048.safetensors.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00017-of-00048.safetensors.lock
+125 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00017-of-00048.safetensors.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00018-of-00048.safetensors.lock
+125 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00018-of-00048.safetensors.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00019-of-00048.safetensors.lock
+125 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00019-of-00048.safetensors.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00020-of-00048.safetensors.lock
+125 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00020-of-00048.safetensors.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00021-of-00048.safetensors.lock
+124 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00021-of-00048.safetensors.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00022-of-00048.safetensors.lock
+124 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00022-of-00048.safetensors.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00023-of-00048.safetensors.lock
+125 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00023-of-00048.safetensors.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00024-of-00048.safetensors.lock
+125 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00024-of-00048.safetensors.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00025-of-00048.safetensors.lock
+125 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00025-of-00048.safetensors.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00026-of-00048.safetensors.lock
+125 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00026-of-00048.safetensors.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00027-of-00048.safetensors.lock
+125 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00027-of-00048.safetensors.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00028-of-00048.safetensors.lock
+124 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00028-of-00048.safetensors.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00029-of-00048.safetensors.lock
+125 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00029-of-00048.safetensors.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00030-of-00048.safetensors.lock
+125 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00030-of-00048.safetensors.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00031-of-00048.safetensors.lock
+124 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00031-of-00048.safetensors.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00032-of-00048.safetensors.lock
+124 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00032-of-00048.safetensors.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00033-of-00048.safetensors.lock
+125 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00033-of-00048.safetensors.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00034-of-00048.safetensors.lock
+124 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00034-of-00048.safetensors.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00035-of-00048.safetensors.lock
+125 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00035-of-00048.safetensors.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00036-of-00048.safetensors.lock
+125 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00036-of-00048.safetensors.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00037-of-00048.safetensors.lock
+125 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00037-of-00048.safetensors.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00038-of-00048.safetensors.lock
+123 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00038-of-00048.safetensors.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00039-of-00048.safetensors.lock
+124 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00039-of-00048.safetensors.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00040-of-00048.safetensors.lock
+125 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00040-of-00048.safetensors.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00041-of-00048.safetensors.lock
+124 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00041-of-00048.safetensors.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00042-of-00048.safetensors.lock
+123 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00042-of-00048.safetensors.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00043-of-00048.safetensors.lock
+125 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00043-of-00048.safetensors.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00044-of-00048.safetensors.lock
+125 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00044-of-00048.safetensors.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00045-of-00048.safetensors.lock
+125 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00045-of-00048.safetensors.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00046-of-00048.safetensors.lock
+125 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00046-of-00048.safetensors.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00047-of-00048.safetensors.lock
+125 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00047-of-00048.safetensors.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00048-of-00048.safetensors.lock
+125 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00048-of-00048.safetensors.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model.safetensors.index.json.lock
+101 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model.safetensors.index.json.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/tokenizer.json.lock
+100 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/tokenizer.json.metadata
+0 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/tokenizer_config.json.lock
+101 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/tokenizer_config.json.metadata
+18262 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/trees/7872f01b1d1fe23eabc4c98b48bffcef5a386062.json
+1519 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.gitattributes
+1084 /mnt/scratch/models/DeepSeek-V4-Flash-0731/LICENSE
+7238 /mnt/scratch/models/DeepSeek-V4-Flash-0731/README.md
+1888 /mnt/scratch/models/DeepSeek-V4-Flash-0731/config.json
+9168 /mnt/scratch/models/DeepSeek-V4-Flash-0731/encoding/README.md
+29001 /mnt/scratch/models/DeepSeek-V4-Flash-0731/encoding/encoding_dsv4.py
+3741 /mnt/scratch/models/DeepSeek-V4-Flash-0731/encoding/test_encoding_dsv4.py
+2748 /mnt/scratch/models/DeepSeek-V4-Flash-0731/encoding/tests/test_input_1.json
+526 /mnt/scratch/models/DeepSeek-V4-Flash-0731/encoding/tests/test_input_2.json
+4546 /mnt/scratch/models/DeepSeek-V4-Flash-0731/encoding/tests/test_input_3.json
+2730 /mnt/scratch/models/DeepSeek-V4-Flash-0731/encoding/tests/test_input_4.json
+2390 /mnt/scratch/models/DeepSeek-V4-Flash-0731/encoding/tests/test_output_1.txt
+342 /mnt/scratch/models/DeepSeek-V4-Flash-0731/encoding/tests/test_output_2.txt
+3313 /mnt/scratch/models/DeepSeek-V4-Flash-0731/encoding/tests/test_output_3.txt
+2552 /mnt/scratch/models/DeepSeek-V4-Flash-0731/encoding/tests/test_output_4.txt
+170 /mnt/scratch/models/DeepSeek-V4-Flash-0731/generation_config.json
+951 /mnt/scratch/models/DeepSeek-V4-Flash-0731/inference/README.md
+1162 /mnt/scratch/models/DeepSeek-V4-Flash-0731/inference/config.json
+6639 /mnt/scratch/models/DeepSeek-V4-Flash-0731/inference/convert.py
+5804 /mnt/scratch/models/DeepSeek-V4-Flash-0731/inference/generate.py
+22198 /mnt/scratch/models/DeepSeek-V4-Flash-0731/inference/kernel.py
+45118 /mnt/scratch/models/DeepSeek-V4-Flash-0731/inference/model.py
+92 /mnt/scratch/models/DeepSeek-V4-Flash-0731/inference/requirements.txt
+1059061856 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00001-of-00048.safetensors
+3566321192 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00002-of-00048.safetensors
+3566321192 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00003-of-00048.safetensors
+3596229272 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00004-of-00048.safetensors
+3568768976 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00005-of-00048.safetensors
+3590024776 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00006-of-00048.safetensors
+3568768976 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00007-of-00048.safetensors
+3590024776 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00008-of-00048.safetensors
+3568768976 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00009-of-00048.safetensors
+3590024776 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00010-of-00048.safetensors
+3568768976 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00011-of-00048.safetensors
+3590026352 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00012-of-00048.safetensors
+3568770544 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00013-of-00048.safetensors
+3590026352 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00014-of-00048.safetensors
+3568770544 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00015-of-00048.safetensors
+3590026352 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00016-of-00048.safetensors
+3568770544 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00017-of-00048.safetensors
+3590026352 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00018-of-00048.safetensors
+3568770544 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00019-of-00048.safetensors
+3590026352 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00020-of-00048.safetensors
+3568770544 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00021-of-00048.safetensors
+3590026352 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00022-of-00048.safetensors
+3568770544 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00023-of-00048.safetensors
+3590026352 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00024-of-00048.safetensors
+3568770544 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00025-of-00048.safetensors
+3590026352 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00026-of-00048.safetensors
+3568770544 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00027-of-00048.safetensors
+3590026352 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00028-of-00048.safetensors
+3568770544 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00029-of-00048.safetensors
+3590026352 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00030-of-00048.safetensors
+3568770544 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00031-of-00048.safetensors
+3590026352 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00032-of-00048.safetensors
+3568770544 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00033-of-00048.safetensors
+3590026352 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00034-of-00048.safetensors
+3568770544 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00035-of-00048.safetensors
+3590026352 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00036-of-00048.safetensors
+3568770544 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00037-of-00048.safetensors
+3590026352 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00038-of-00048.safetensors
+3568770544 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00039-of-00048.safetensors
+3590026352 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00040-of-00048.safetensors
+3568770544 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00041-of-00048.safetensors
+3590026352 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00042-of-00048.safetensors
+3568770544 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00043-of-00048.safetensors
+3590026352 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00044-of-00048.safetensors
+1059332516 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00045-of-00048.safetensors
+3610455184 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00046-of-00048.safetensors
+3560111960 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00047-of-00048.safetensors
+3692775244 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00048-of-00048.safetensors
+5602871 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model.safetensors.index.json
+6367146 /mnt/scratch/models/DeepSeek-V4-Flash-0731/tokenizer.json
+801 /mnt/scratch/models/DeepSeek-V4-Flash-0731/tokenizer_config.json
+
+INCOMPLETE_LOCK:
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00033-of-00048.safetensors.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/README.md.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_output_4.txt.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_input_3.json.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_output_3.txt.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_input_2.json.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_input_1.json.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_output_1.txt.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_input_3.json.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_input_1.json.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_output_4.txt.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_output_2.txt.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_output_1.txt.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_output_3.txt.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_output_2.txt.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_input_4.json.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_input_4.json.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/tests/test_input_2.json.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/test_encoding_dsv4.py.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/encoding_dsv4.py.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/test_encoding_dsv4.py.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/encoding_dsv4.py.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/encoding/README.md.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00036-of-00048.safetensors.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00042-of-00048.safetensors.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00031-of-00048.safetensors.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00012-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/config.json.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/config.json.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00020-of-00048.safetensors.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00047-of-00048.safetensors.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00040-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00041-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00021-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00030-of-00048.safetensors.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00007-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/README.md.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00044-of-00048.safetensors.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00032-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00026-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00034-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00039-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/.gitattributes.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/tokenizer.json.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00030-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00008-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00037-of-00048.safetensors.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00016-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/.gitattributes.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00025-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00022-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00042-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00024-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00024-of-00048.safetensors.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/tokenizer_config.json.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/LICENSE.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00035-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00004-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00001-of-00048.safetensors.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00034-of-00048.safetensors.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00002-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00011-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/inference/config.json.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/inference/config.json.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/inference/kernel.py.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/inference/README.md.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/inference/convert.py.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/inference/requirements.txt.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/inference/requirements.txt.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/inference/convert.py.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/inference/generate.py.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/inference/generate.py.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/inference/README.md.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/inference/model.py.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/inference/model.py.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/inference/kernel.py.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00019-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00013-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00043-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/tokenizer.json.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/LICENSE.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00043-of-00048.safetensors.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00037-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00026-of-00048.safetensors.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00006-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00007-of-00048.safetensors.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00036-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00027-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00010-of-00048.safetensors.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00018-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00029-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00017-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00048-of-00048.safetensors.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00009-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00002-of-00048.safetensors.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00040-of-00048.safetensors.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00014-of-00048.safetensors.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00013-of-00048.safetensors.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00011-of-00048.safetensors.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00003-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00031-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00021-of-00048.safetensors.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00045-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/generation_config.json.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00020-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00008-of-00048.safetensors.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00015-of-00048.safetensors.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00027-of-00048.safetensors.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/generation_config.json.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00023-of-00048.safetensors.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00005-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00019-of-00048.safetensors.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00009-of-00048.safetensors.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00032-of-00048.safetensors.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00033-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00012-of-00048.safetensors.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00010-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00047-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model.safetensors.index.json.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model.safetensors.index.json.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00006-of-00048.safetensors.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00028-of-00048.safetensors.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00003-of-00048.safetensors.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00028-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00046-of-00048.safetensors.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00029-of-00048.safetensors.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00044-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00004-of-00048.safetensors.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00001-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00039-of-00048.safetensors.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00022-of-00048.safetensors.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/README.md.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00046-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00048-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00023-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00015-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/tokenizer_config.json.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00014-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00035-of-00048.safetensors.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00018-of-00048.safetensors.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00005-of-00048.safetensors.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00038-of-00048.safetensors.metadata
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00038-of-00048.safetensors.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00045-of-00048.safetensors.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00016-of-00048.safetensors.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00041-of-00048.safetensors.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00025-of-00048.safetensors.lock
+/mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download/model-00017-of-00048.safetensors.lock
+
+==== config.json: /mnt/scratch/models/DeepSeek-V4-Flash-0731/inference/config.json ====
+{
+    "vocab_size": 129280,
+    "dim": 4096,
+    "moe_inter_dim": 2048,
+    "n_layers": 43,
+    "n_hash_layers": 3,
+    "n_mtp_layers": 3,
+    "dspark_block_size": 5,
+    "dspark_noise_token_id": 128799,
+    "dspark_target_layer_ids": [40, 41, 42],
+    "dspark_markov_rank": 256,
+    "n_heads": 64,
+    "n_routed_experts": 256,
+    "n_shared_experts": 1,
+    "n_activated_experts": 6,
+    "score_func": "sqrtsoftplus",
+    "route_scale": 1.5,
+    "swiglu_limit": 10.0,
+    "q_lora_rank": 1024,
+    "head_dim": 512,
+    "rope_head_dim": 64,
+    "o_groups": 8,
+    "o_lora_rank": 1024,
+    "window_size": 128,
+    "original_seq_len": 65536,
+    "rope_theta": 10000,
+    "rope_factor": 16,
+    "beta_fast": 32,
+    "beta_slow": 1,
+    "index_n_heads": 64,
+    "index_head_dim": 128,
+    "index_topk": 512,
+    "hc_mult": 4,
+    "hc_sinkhorn_iters": 20,
+    "dtype": "fp8",
+    "scale_fmt": "ue8m0",
+    "expert_dtype": "fp4",
+    "compress_rope_theta": 160000,
+    "compress_ratios": [0, 0, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 0, 0, 0]
+}
+
+==== config.json: /mnt/scratch/models/DeepSeek-V4-Flash-0731/config.json ====
+{
+  "architectures": [
+    "DeepseekV4ForCausalLM"
+  ],
+  "attention_bias": false,
+  "attention_dropout": 0.0,
+  "bos_token_id": 0,
+  "eos_token_id": 1,
+  "expert_dtype": "fp4",
+  "hc_eps": 1e-06,
+  "hc_mult": 4,
+  "hc_sinkhorn_iters": 20,
+  "head_dim": 512,
+  "hidden_act": "silu",
+  "hidden_size": 4096,
+  "index_head_dim": 128,
+  "index_n_heads": 64,
+  "index_topk": 512,
+  "initializer_range": 0.02,
+  "max_position_embeddings": 1048576,
+  "model_type": "deepseek_v4",
+  "moe_intermediate_size": 2048,
+  "n_routed_experts": 256,
+  "n_shared_experts": 1,
+  "norm_topk_prob": true,
+  "num_attention_heads": 64,
+  "num_experts_per_tok": 6,
+  "num_hidden_layers": 43,
+  "num_hash_layers": 3,
+  "num_key_value_heads": 1,
+  "num_nextn_predict_layers": 1,
+  "o_groups": 8,
+  "o_lora_rank": 1024,
+  "q_lora_rank": 1024,
+  "qk_rope_head_dim": 64,
+  "quantization_config": {
+    "activation_scheme": "dynamic",
+    "fmt": "e4m3",
+    "quant_method": "fp8",
+    "scale_fmt": "ue8m0",
+    "weight_block_size": [
+      128,
+      128
+    ]
+  },
+  "rms_norm_eps": 1e-06,
+  "rope_scaling": {
+    "beta_fast": 32,
+    "beta_slow": 1,
+    "factor": 16,
+    "original_max_position_embeddings": 65536,
+    "type": "yarn"
+  },
+  "rope_theta": 10000,
+  "routed_scaling_factor": 1.5,
+  "scoring_func": "sqrtsoftplus",
+  "sliding_window": 128,
+  "swiglu_limit": 10.0,
+  "tie_word_embeddings": false,
+  "topk_method": "noaux_tc",
+  "torch_dtype": "bfloat16",
+  "transformers_version": "4.57.1",
+  "use_cache": true,
+  "vocab_size": 129280,
+  "compress_rope_theta": 160000,
+  "compress_ratios": [0, 0, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 0, 0, 0],
+  "dspark_block_size": 5,
+  "dspark_noise_token_id": 128799,
+  "dspark_target_layer_ids": [40, 41, 42],
+  "dspark_markov_rank": 256
+}
+
+==== index.json: /mnt/scratch/models/DeepSeek-V4-Flash-0731/model.safetensors.index.json ====
+keys ['metadata', 'weight_map']
+metadata {'total_size': 166878536440}
+num_tensors 72317
+num_shards 48
+SHARD model-00001-of-00048.safetensors
+SHARD model-00002-of-00048.safetensors
+SHARD model-00003-of-00048.safetensors
+SHARD model-00004-of-00048.safetensors
+SHARD model-00005-of-00048.safetensors
+SHARD model-00006-of-00048.safetensors
+SHARD model-00007-of-00048.safetensors
+SHARD model-00008-of-00048.safetensors
+SHARD model-00009-of-00048.safetensors
+SHARD model-00010-of-00048.safetensors
+SHARD model-00011-of-00048.safetensors
+SHARD model-00012-of-00048.safetensors
+SHARD model-00013-of-00048.safetensors
+SHARD model-00014-of-00048.safetensors
+SHARD model-00015-of-00048.safetensors
+SHARD model-00016-of-00048.safetensors
+SHARD model-00017-of-00048.safetensors
+SHARD model-00018-of-00048.safetensors
+SHARD model-00019-of-00048.safetensors
+SHARD model-00020-of-00048.safetensors
+SHARD model-00021-of-00048.safetensors
+SHARD model-00022-of-00048.safetensors
+SHARD model-00023-of-00048.safetensors
+SHARD model-00024-of-00048.safetensors
+SHARD model-00025-of-00048.safetensors
+SHARD model-00026-of-00048.safetensors
+SHARD model-00027-of-00048.safetensors
+SHARD model-00028-of-00048.safetensors
+SHARD model-00029-of-00048.safetensors
+SHARD model-00030-of-00048.safetensors
+SHARD model-00031-of-00048.safetensors
+SHARD model-00032-of-00048.safetensors
+SHARD model-00033-of-00048.safetensors
+SHARD model-00034-of-00048.safetensors
+SHARD model-00035-of-00048.safetensors
+SHARD model-00036-of-00048.safetensors
+SHARD model-00037-of-00048.safetensors
+SHARD model-00038-of-00048.safetensors
+SHARD model-00039-of-00048.safetensors
+SHARD model-00040-of-00048.safetensors
+SHARD model-00041-of-00048.safetensors
+SHARD model-00042-of-00048.safetensors
+SHARD model-00043-of-00048.safetensors
+SHARD model-00044-of-00048.safetensors
+SHARD model-00045-of-00048.safetensors
+SHARD model-00046-of-00048.safetensors
+SHARD model-00047-of-00048.safetensors
+SHARD model-00048-of-00048.safetensors
+
+=== find depth structure ===
+d 16384 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/download
+d 4096 /mnt/scratch/models/DeepSeek-V4-Flash-0731
+d 4096 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache
+d 4096 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface
+d 4096 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/trees
+d 4096 /mnt/scratch/models/DeepSeek-V4-Flash-0731/encoding
+d 4096 /mnt/scratch/models/DeepSeek-V4-Flash-0731/encoding/tests
+d 4096 /mnt/scratch/models/DeepSeek-V4-Flash-0731/inference
+f 1 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/.gitignore
+f 1059061856 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00001-of-00048.safetensors
+f 1059332516 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00045-of-00048.safetensors
+f 1084 /mnt/scratch/models/DeepSeek-V4-Flash-0731/LICENSE
+f 1162 /mnt/scratch/models/DeepSeek-V4-Flash-0731/inference/config.json
+f 1519 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.gitattributes
+f 170 /mnt/scratch/models/DeepSeek-V4-Flash-0731/generation_config.json
+f 1888 /mnt/scratch/models/DeepSeek-V4-Flash-0731/config.json
+f 191 /mnt/scratch/models/DeepSeek-V4-Flash-0731/.cache/huggingface/CACHEDIR.TAG
+f 22198 /mnt/scratch/models/DeepSeek-V4-Flash-0731/inference/kernel.py
+f 2390 /mnt/scratch/models/DeepSeek-V4-Flash-0731/encoding/tests/test_output_1.txt
+f 2552 /mnt/scratch/models/DeepSeek-V4-Flash-0731/encoding/tests/test_output_4.txt
+f 2730 /mnt/scratch/models/DeepSeek-V4-Flash-0731/encoding/tests/test_input_4.json
+f 2748 /mnt/scratch/models/DeepSeek-V4-Flash-0731/encoding/tests/test_input_1.json
+f 29001 /mnt/scratch/models/DeepSeek-V4-Flash-0731/encoding/encoding_dsv4.py
+f 3313 /mnt/scratch/models/DeepSeek-V4-Flash-0731/encoding/tests/test_output_3.txt
+f 342 /mnt/scratch/models/DeepSeek-V4-Flash-0731/encoding/tests/test_output_2.txt
+f 3560111960 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00047-of-00048.safetensors
+f 3566321192 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00002-of-00048.safetensors
+f 3566321192 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00003-of-00048.safetensors
+f 3568768976 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00005-of-00048.safetensors
+f 3568768976 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00007-of-00048.safetensors
+f 3568768976 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00009-of-00048.safetensors
+f 3568768976 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00011-of-00048.safetensors
+f 3568770544 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00013-of-00048.safetensors
+f 3568770544 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00015-of-00048.safetensors
+f 3568770544 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00017-of-00048.safetensors
+f 3568770544 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00019-of-00048.safetensors
+f 3568770544 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00021-of-00048.safetensors
+f 3568770544 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00023-of-00048.safetensors
+f 3568770544 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00025-of-00048.safetensors
+f 3568770544 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00027-of-00048.safetensors
+f 3568770544 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00029-of-00048.safetensors
+f 3568770544 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00031-of-00048.safetensors
+f 3568770544 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00033-of-00048.safetensors
+f 3568770544 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00035-of-00048.safetensors
+f 3568770544 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00037-of-00048.safetensors
+f 3568770544 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00039-of-00048.safetensors
+f 3568770544 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00041-of-00048.safetensors
+f 3568770544 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00043-of-00048.safetensors
+f 3590024776 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00006-of-00048.safetensors
+f 3590024776 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00008-of-00048.safetensors
+f 3590024776 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00010-of-00048.safetensors
+f 3590026352 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00012-of-00048.safetensors
+f 3590026352 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00014-of-00048.safetensors
+f 3590026352 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00016-of-00048.safetensors
+f 3590026352 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00018-of-00048.safetensors
+f 3590026352 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00020-of-00048.safetensors
+f 3590026352 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00022-of-00048.safetensors
+f 3590026352 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00024-of-00048.safetensors
+f 3590026352 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00026-of-00048.safetensors
+f 3590026352 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00028-of-00048.safetensors
+f 3590026352 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00030-of-00048.safetensors
+f 3590026352 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00032-of-00048.safetensors
+f 3590026352 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00034-of-00048.safetensors
+f 3590026352 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00036-of-00048.safetensors
+f 3590026352 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00038-of-00048.safetensors
+f 3590026352 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00040-of-00048.safetensors
+f 3590026352 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00042-of-00048.safetensors
+f 3590026352 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00044-of-00048.safetensors
+f 3596229272 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00004-of-00048.safetensors
+f 3610455184 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00046-of-00048.safetensors
+f 3692775244 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model-00048-of-00048.safetensors
+f 3741 /mnt/scratch/models/DeepSeek-V4-Flash-0731/encoding/test_encoding_dsv4.py
+f 45118 /mnt/scratch/models/DeepSeek-V4-Flash-0731/inference/model.py
+f 4546 /mnt/scratch/models/DeepSeek-V4-Flash-0731/encoding/tests/test_input_3.json
+f 526 /mnt/scratch/models/DeepSeek-V4-Flash-0731/encoding/tests/test_input_2.json
+f 5602871 /mnt/scratch/models/DeepSeek-V4-Flash-0731/model.safetensors.index.json
+f 5804 /mnt/scratch/models/DeepSeek-V4-Flash-0731/inference/generate.py
+f 6367146 /mnt/scratch/models/DeepSeek-V4-Flash-0731/tokenizer.json
+f 6639 /mnt/scratch/models/DeepSeek-V4-Flash-0731/inference/convert.py
+f 7238 /mnt/scratch/models/DeepSeek-V4-Flash-0731/README.md
+f 801 /mnt/scratch/models/DeepSeek-V4-Flash-0731/tokenizer_config.json
+f 9168 /mnt/scratch/models/DeepSeek-V4-Flash-0731/encoding/README.md
+f 92 /mnt/scratch/models/DeepSeek-V4-Flash-0731/inference/requirements.txt
+f 951 /mnt/scratch/models/DeepSeek-V4-Flash-0731/inference/README.md
+
+=== existing-deepseek-v4-flash detail ===
+d 4096 2026-05-27 /mnt/scratch/models/existing-deepseek-v4-flash
+d 4096 2026-05-27 /mnt/scratch/models/existing-deepseek-v4-flash/.cache
+d 4096 2026-05-27 /mnt/scratch/models/existing-deepseek-v4-flash/.cache/huggingface
+d 4096 2026-05-27 /mnt/scratch/models/existing-deepseek-v4-flash/.cache/huggingface/download
+f 1 2026-05-27 /mnt/scratch/models/existing-deepseek-v4-flash/.cache/huggingface/.gitignore
+f 125 2026-05-27 /mnt/scratch/models/existing-deepseek-v4-flash/.cache/huggingface/download/deepseek-v4-flash-mtp.mq2lloyd.metadata
+f 125 2026-05-27 /mnt/scratch/models/existing-deepseek-v4-flash/.cache/huggingface/download/deepseek-v4-flash.mq2lloyd.metadata
+f 1998047355 2026-05-27 /mnt/scratch/models/existing-deepseek-v4-flash/deepseek-v4-flash-mtp.mq2lloyd
+f 86184307283 2026-05-27 /mnt/scratch/models/existing-deepseek-v4-flash/deepseek-v4-flash.mq2lloyd
+
+=== mq2r dir ===
+d 4096 /mnt/scratch/models/deepseek-v4-flash-mq2r
+f 82191362222 /mnt/scratch/models/deepseek-v4-flash-mq2r/deepseek-v4-flash.mq2r
+
+=== hipfire registry cache (paths only / model names) ===
+<class 'dict'> ['fetched_at', 'url', 'registry']
+KEY fetched_at <class 'int'> 1785574068643
+KEY url <class 'str'> https://raw.githubusercontent.com/warpfront/hipfire/master/registry/v1.json
+KEY registry subkeys ['schema_version', 'generated_at', '_comment', 'models', 'aliases']

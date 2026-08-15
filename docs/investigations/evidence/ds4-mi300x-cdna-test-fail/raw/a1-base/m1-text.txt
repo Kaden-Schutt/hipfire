@@ -1,0 +1,20 @@
+## Technical Brief: DeepSeek V4 Flash MDP on AMD MI300X (gfx942) – Measurement Contract for Batch-1, Q8 KV, Greedy AR Decode
+
+This document is a strict technical specification for benchmarking a single inference request on a **DeepSeek V4 Flash** style Mixture-of-Experts (MoE) model, running on an **AMD Instinct MI300X (gfx942)** GPU. The measurement is for a **production-grade, non-speculative, greedy, single-batch inference pipeline**. The focus is on **reproducibility, correctness, and performance measurement integrity**, not marketing.
+
+---
+
+### 1. The Core Contract: What Must Be Frozen
+
+The measurement is defined by a **frozen, deterministic pipeline**. Any deviation invalidates the benchmark.
+
+#### 1.1. The Prompt Fixture: Not Just "Text"
+
+The prompt is **not** a string. It is a **byte sequence** with a specific provenance:
+
+- **Source Corpus:** A **revisioned, non-trivial text** (e.g., a technical document, not random words or repeated sentences). This ensures realistic attention patterns and expert activation patterns.
+- **Tokenization:** The prompt is tokenized using the **exact, production tokenizer** (e.g., `tokenizer.hfq_metadata()`) from the model's artifact. **No Python-based Hugging Face tokenaries** are used; they have different pre-tokenization rules (e.g., regex, byte fallbacks, BOS policies) that would change the token IDs and MD5.
+- **Round-Trip Validation:** The tokenized IDs must be decoded back to text, re-tokenized, and produce the **exact same sequence of IDs**. This ensures no truncation, padding, or formatting issues.
+- **No Trailing Newline:** The final prompt file has **no trailing newline** (e.g., `printf -n ...`). This ensures `PROMP_ARG=$(<file)` preserves exact bytes.
+- **Exact Token Count:** The prompt is exactly **2048 tokens**. If the source corpus yields fewer, the generator fails. If it yields more, it takes the first 2048 tokens.
+- **Verification via MD5/SHA-256:** The prompt bytes and the resulting token ID sequence (as a little-endian u32 dump) are hashed. These hashes are **mandatory fields** in the benchmark

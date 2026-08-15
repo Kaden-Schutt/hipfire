@@ -4,7 +4,7 @@
 
 //! Background runners for Models-tab actions: pull (with live progress) and rm.
 //!
-//! Both shell out to `bun cli/index.ts <...>` on a dedicated thread so the UI
+//! Both invoke the native `hipfire` binary on a dedicated thread so the UI
 //! thread never blocks. `pull` streams the CLI's stderr progress line (which is
 //! carriage-return-updated, so we split on '\r' AND '\n') and reports a parsed
 //! percentage; `remove` runs `rm <tag> --yes` (the TUI does its own y/n confirm
@@ -18,14 +18,17 @@ use std::{
     thread,
 };
 
-use crate::hipfire::cli_command;
+use crate::hipfire::native_cli_command;
 
 /// Streamed events from a `pull` run.
 #[derive(Clone, Debug, PartialEq)]
 pub enum PullEvent {
     /// A progress update: parsed percent (None if not yet sampled) + the raw
     /// CLI progress line (bar / rate / ETA / bytes) for display.
-    Progress { percent: Option<f64>, line: String },
+    Progress {
+        percent: Option<f64>,
+        line: String,
+    },
     Done,
     Failed(String),
 }
@@ -37,7 +40,7 @@ pub enum RmOutcome {
     Failed(String),
 }
 
-/// Spawn `bun cli/index.ts pull <tag>`, streaming progress on the returned
+/// Spawn native `hipfire pull <tag>`, streaming progress on the returned
 /// receiver and finishing with Done or Failed.
 pub fn pull(tag: String) -> Receiver<PullEvent> {
     let (tx, rx) = mpsc::channel();
@@ -45,7 +48,7 @@ pub fn pull(tag: String) -> Receiver<PullEvent> {
     rx
 }
 
-/// Spawn `bun cli/index.ts rm <tag> --yes`; the single outcome arrives on the
+/// Spawn native `hipfire rm <tag> --yes`; the single outcome arrives on the
 /// returned receiver.
 pub fn remove(tag: String) -> Receiver<RmOutcome> {
     let (tx, rx) = mpsc::channel();
@@ -72,11 +75,11 @@ pub fn parse_percent(line: &str) -> Option<f64> {
 }
 
 fn pull_inner(tag: String, tx: Sender<PullEvent>) {
-    let mut cmd = match cli_command() {
+    let mut cmd = match native_cli_command() {
         Some(c) => c,
         None => {
             let _ = tx.send(PullEvent::Failed(
-                "cli/index.ts not found (set HIPFIRE_CLI_SCRIPT or run from the repo root)".into(),
+                "native hipfire binary not found (set HIPFIRE_CLI_BIN or install hipfire)".into(),
             ));
             return;
         }
@@ -182,11 +185,11 @@ fn flush_progress(buf: &mut Vec<u8>, tx: &Sender<PullEvent>) -> Option<String> {
 }
 
 fn remove_inner(tag: &str) -> RmOutcome {
-    let mut cmd = match cli_command() {
+    let mut cmd = match native_cli_command() {
         Some(c) => c,
         None => {
             return RmOutcome::Failed(
-                "cli/index.ts not found (set HIPFIRE_CLI_SCRIPT or run from the repo root)".into(),
+                "native hipfire binary not found (set HIPFIRE_CLI_BIN or install hipfire)".into(),
             )
         }
     };
@@ -217,7 +220,10 @@ mod tests {
             parse_percent("[████▏      ]  45.2%   8.1 MB/s   ETA 1m12s   123/272 MB"),
             Some(45.2)
         );
-        assert_eq!(parse_percent("[          ]   0.0%   —   123/272 MB"), Some(0.0));
+        assert_eq!(
+            parse_percent("[          ]   0.0%   —   123/272 MB"),
+            Some(0.0)
+        );
         assert_eq!(parse_percent("[██████████] 100.0% done"), Some(100.0));
         // Unknown-total downloads render "?%" — must yield None (drives the
         // PullEvent::Progress { percent: None } path).
