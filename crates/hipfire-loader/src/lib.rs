@@ -40,7 +40,6 @@ use std::sync::{Arc, Mutex};
 
 // ─── Object-safe Carrier trait ──────────────────────────────────────
 
-/// One arch's complete load contract. Object-safe → usable as `&dyn Carrier`.
 pub trait Carrier: Send + Sync {
     fn name(&self) -> &'static str;
     /// Whether this carrier claims a given `arch_id`. `is_dir` distinguishes
@@ -55,6 +54,18 @@ pub trait Carrier: Send + Sync {
         matches!(src.arch_id(), Some(id) if self.claims_arch_id(id, src.is_dir()))
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String>;
+
+    /// Declared capabilities for this arch. Default is the conservative
+    /// “no capability” set — carriers override to declare what they support.
+    fn caps(&self) -> saddle_core::caps::ArchCaps {
+        saddle_core::caps::ArchCaps::default()
+    }
+
+    /// Per-arch sampling defaults (`temp`, `top_p`, `repeat_penalty`).
+    /// Default is the `else` arm of the daemon ladder (`0.3/0.8/1.0`).
+    fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
+        saddle_core::sampling::SamplingDefaults::default()
+    }
 
     /// Borrow this model's spec-decode target out of `state`, arch-erased as a
     /// [`SpecTargetGuard`]. This is the daemon's single dispatch for the
