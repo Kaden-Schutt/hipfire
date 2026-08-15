@@ -45,6 +45,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use crate::llama::KvCacheExt;
 use hip_bridge::HipResult;
 use hipfire_dispatch::families::kv_tier::KTier;
 use rdna_compute::{DType, Gpu, GpuTensor};

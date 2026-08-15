@@ -69,6 +69,7 @@ serve-fault-inject = []
 hip-bridge = { path = "../hip-bridge" }
 hipfire-config = { path = "../hipfire-config" }
 rdna-compute = { path = "../rdna-compute" }
+saddle-core = { path = "../saddle-core" }
 hipfire-dispatch = { path = "../hipfire-dispatch" }
 memmap2 = "0.9"
 safetensors.workspace = true

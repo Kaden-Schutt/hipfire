@@ -1093,6 +1093,7 @@ dependencies = [
  "rayon",
  "rdna-compute",
  "regex",
+ "saddle-core",
  "safetensors",
  "serde",
  "serde_json",
