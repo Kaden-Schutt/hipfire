@@ -1,0 +1,127 @@
+{
+  "canonical": [
+    {
+      "value": {"b": 2, "a": 1},
+      "canonical_utf8": "{\"a\":1,\"b\":2}",
+      "sha256": "43258cff783fe7036d8a43033f830adfc60ec037382473548ac742b888292777"
+    },
+    {
+      "value": {"text": "café", "values": [true, null, -3]},
+      "canonical_utf8": "{\"text\":\"café\",\"values\":[true,null,-3]}",
+      "sha256": "13b3712cf60d89b3a47e42b72db671a4be0070e92874d762067d73bdd9e3621a"
+    },
+    {
+      "value": {"control\u0000": "line\n\"\\", "é": "é"},
+      "canonical_utf8": "{\"control\\u0000\":\"line\\n\\\"\\\\\",\"é\":\"é\"}",
+      "sha256": "048e6ddfe4314bb7916de29cf2b3e0630733973080d3b2388a31658c7e928b1a"
+    },
+    {
+      "value": {"\ue000": "bmp", "𐀀": "astral"},
+      "canonical_utf8": "{\"𐀀\":\"astral\",\"\ue000\":\"bmp\"}",
+      "sha256": "5e72745dd500f8b8d997ef851679707b89099da29d2aca4b93dfd85810ebaa20"
+    }
+  ],
+  "metadata": [
+    {
+      "value": {
+        "report_body_sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "target_key": "target-1",
+        "metadata_digest": "pending"
+      },
+      "digest": "55fdd8e2b046ba068ad1e5367d8b380d6674833b0607fdfdac1af13d6d879634"
+    }
+  ],
+  "regressions": {
+    "safe_integer_min": -9007199254740991,
+    "safe_integer_max": 9007199254740991,
+    "unsafe_integers": [9007199254740992, 1152921504606846976],
+    "overflow_value": "abcd",
+    "overflow_limit": 3,
+    "aware_timestamp_early": "2026-01-01T00:30:00+02:00",
+    "aware_timestamp_late": "2025-12-31T23:00:00Z",
+    "floats": [
+      {"value": 1.5, "canonical_utf8": "1.5", "sha256": "9f29a130438b81170b92a42650f9a94291ecad60bd47af2a3886e75f7f728725"},
+      {"value": 1e-6, "canonical_utf8": "0.000001", "sha256": "159fb29a827ad04b260aa6c8ab6d8637f8f2b38af5c4f3cb49d6a21205e040f8"},
+      {"value": 1e-7, "canonical_utf8": "1e-7", "sha256": "5b33e02f2c5103a05d32f6ba9cb058294452bfbf393967f68bb30c1bdcbbab22"},
+      {"value": 1e20, "canonical_utf8": "100000000000000000000", "sha256": "c344e9487bfbd5c4e03c9fb90d62a5dde5e00b54d55c46e9f4a803aea162b80c"},
+      {"value": 1e21, "canonical_utf8": "1e+21", "sha256": "241c4643fa70b1dcde1205b71be4e3bebb17e9f880c8e1a33d0ead6c27271d3c"},
+      {"value": -0.0, "canonical_utf8": "0", "sha256": "5feceb66ffc86f38d952786c6d696c79c2dbc239dd4e91b46729d73a27fb57e9"}
+    ]
+  },
+  "validation": {
+    "valid_ledger": {
+      "configuration_source_digest": "sha256:f50fac7baf709a3546c934ef9a691ceea5e192895fa7a078dedc30c5b91b99cb",
+      "capsule_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "capsule_paths": ["src/main.py"],
+      "capsule_target_key": "target-vector",
+      "scope": {
+        "model_architectures": ["qwen3.6-27b"],
+        "hardware_architectures": ["gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151"]
+      },
+      "validation_ledger": [
+        {
+          "request_id": "vr-03fbaa4bfe42cff0",
+          "profile_snapshot": {
+            "id": "rdna3-smoke",
+            "capability_id": "hipfire/rdna3-smoke@1",
+            "model_architecture": "qwen3.6-27b",
+            "fixture_id": "qwen3.6-27b-rdna3-smoke-v1",
+            "fixture_digest": "sha256:528982998da1cba57acec9e0acf782c2603634f0443dc7f7f4b6be7e4c3bf628",
+            "representative_hardware": "gfx1100",
+            "covered_hardware": ["gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151"]
+          },
+          "profile_digest": "sha256:283a5d190ff873c7dd4d7892998baa01940587ddbe1bad7c40dde4d61f162489",
+          "capability_id": "hipfire/rdna3-smoke@1",
+          "contract_digest": "sha256:a3399687fc211d9073ed52daa02162cc052c63c79f923fce25acf5409c9852d9",
+          "model_architecture": "qwen3.6-27b",
+          "fixture_id": "qwen3.6-27b-rdna3-smoke-v1",
+          "fixture_digest": "sha256:528982998da1cba57acec9e0acf782c2603634f0443dc7f7f4b6be7e4c3bf628",
+          "representative_hardware": "gfx1100",
+          "covered_hardware": ["gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151"],
+          "coverage_kind": "representative",
+          "status": "pending",
+          "validator_snapshot": {},
+          "result_snapshot": {},
+          "rationales": ["run the protected smoke validation"]
+        }
+      ]
+    },
+    "invalid_profile_config_binding": {
+      "configuration_source_digest": "sha256:f50fac7baf709a3546c934ef9a691ceea5e192895fa7a078dedc30c5b91b99cb",
+      "capsule_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "capsule_paths": ["src/main.py"],
+      "capsule_target_key": "target-vector",
+      "scope": {
+        "model_architectures": ["qwen3.6-27b"],
+        "hardware_architectures": ["gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151"]
+      },
+      "validation_ledger": [
+        {
+          "request_id": "vr-03fbaa4bfe42cff0",
+          "profile_snapshot": {
+            "id": "rdna3-smoke",
+            "capability_id": "hipfire/rdna3-smoke@1",
+            "model_architecture": "qwen3.6-27b-mutated",
+            "fixture_id": "qwen3.6-27b-rdna3-smoke-v1",
+            "fixture_digest": "sha256:528982998da1cba57acec9e0acf782c2603634f0443dc7f7f4b6be7e4c3bf628",
+            "representative_hardware": "gfx1100",
+            "covered_hardware": ["gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151"]
+          },
+          "profile_digest": "sha256:fcca6017e6086b92352fe4461dd25de654f478e064be59e50feeb9e7122140ef",
+          "capability_id": "hipfire/rdna3-smoke@1",
+          "contract_digest": "sha256:a3399687fc211d9073ed52daa02162cc052c63c79f923fce25acf5409c9852d9",
+          "model_architecture": "qwen3.6-27b-mutated",
+          "fixture_id": "qwen3.6-27b-rdna3-smoke-v1",
+          "fixture_digest": "sha256:528982998da1cba57acec9e0acf782c2603634f0443dc7f7f4b6be7e4c3bf628",
+          "representative_hardware": "gfx1100",
+          "covered_hardware": ["gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151"],
+          "coverage_kind": "representative",
+          "status": "pending",
+          "validator_snapshot": {},
+          "result_snapshot": {},
+          "rationales": ["run the protected smoke validation"]
+        }
+      ]
+    }
+  }
+}
