@@ -11,7 +11,8 @@
 //!
 //! Usage:
 //!   deepseek4_perplexity <model.hfq> <corpus.txt> \
-//!       [--ctx 2048] [--warmup 8] [--offset 0] [--dump-logits <path>]
+//!       [--ctx 2048] [--warmup 8] [--offset 0] [--dump-logits <path>] \
+//!       [--dump-dense-acts <directory>]
 //!
 //! Set `HIPFIRE_DEEPSEEK4_REAP_KEEPMAP=<dir>` to evaluate the REAP-pruned
 //! (e.g. 162B / 144-expert) variant of the SAME quant — the loader keeps only
@@ -44,6 +45,7 @@ fn main() {
     let mut warmup: usize = 8;
     let mut offset: usize = 0;
     let mut dump_logits: Option<String> = None;
+    let mut dump_dense_acts: Option<String> = None;
     while let Some(flag) = args.next() {
         let val = args.next().expect("flag missing value");
         match flag.as_str() {
@@ -51,6 +53,7 @@ fn main() {
             "--warmup" => warmup = val.parse().unwrap(),
             "--offset" => offset = val.parse().unwrap(),
             "--dump-logits" => dump_logits = Some(val),
+            "--dump-dense-acts" => dump_dense_acts = Some(val),
             _ => panic!("unknown flag: {flag}"),
         }
     }
@@ -58,6 +61,14 @@ fn main() {
         ctx_len > warmup + 4,
         "ctx must exceed warmup by enough to score"
     );
+    if let Some(path) = dump_dense_acts.as_ref() {
+        // Single-threaded process initialization, before the forward path's
+        // OnceLock snapshots the calibration destination.
+        unsafe {
+            std::env::set_var("HIPFIRE_DS4_DENSE_ACT_DIR", path);
+        }
+        eprintln!("Dumping DeepSeek P1 dense activations to {path}");
+    }
 
     let want_bytes = (offset + ctx_len) * 8;
     let raw = std::fs::read(&corpus_path).expect("read corpus");
@@ -182,6 +193,8 @@ fn main() {
             }
         }
     }
+    hipfire_arch_deepseek4::forward::finish_dense_activation_dump()
+        .expect("finalize DeepSeek P1 dense activation dump");
 
     let avg_nll = if scored > 0 {
         total_nll / scored as f64

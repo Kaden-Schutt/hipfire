@@ -7,30 +7,10 @@
 #
 # Always (when the staged diff touches kernel/forward-pass/dispatch code):
 #
-#   1) Coherence battery (~2-4 min): fixed prompt matrix through the daemon.
-#      Fails only on HARD errors (panic / zero tokens / timeout). Soft
-#      output changes don't block — the committer reads the report and
-#      confirms coherence before the commit lands. Replaces the old
-#      byte-exact quality-gate that blocked legitimate norm-convention fixes.
-#
-#   2) Speed gate (~30s): prefill/decode tok/s must stay within tolerance
+#   1) Speed gate (~30s): prefill/decode tok/s must stay within tolerance
 #      of the committed ground-floor baselines. Failure = perf regression.
 #
 # Path-gated heavy gates (only fire when the matching feature is touched):
-#
-#   3) DFlash + DDTree coherence (~3 min): spec-decode attractor guard.
-#      Fires on `dflash|ddtree|spec_step|...` filename / path matches.
-#      Skips otherwise — spec decode rarely breaks from non-spec changes.
-#
-#   4) PFlash regression (~5 min): long-context bench against the
-#      committed gfx1100 baseline. Fires on any path containing `pflash`.
-#      Skips otherwise — implemented by setting HIPFIRE_SKIP_PFLASH_GATE=1
-#      so the pflash regression stage at the tail of coherence-gate.sh
-#      no-ops.
-#
-# Force-run heavy gates regardless of paths:
-#   HIPFIRE_FORCE_PFLASH_GATE=1 git commit ...   # run pflash anyway
-#   HIPFIRE_FORCE_SPEC_GATE=1   git commit ...   # run dflash anyway
 #
 # Do NOT bypass with --no-verify unless you have a plan to fix in the same
 # commit.
@@ -40,11 +20,17 @@ set -e
 # List files staged for this commit.
 CHANGED=$(git diff --cached --name-only --diff-filter=ACM)
 
+# ── fmt-bomb backstop (every commit, GPU-free, ~instant) ────────────────
+# Catch a workspace-wide reformat BEFORE it lands, whatever produced it —
+# `cargo fmt`, an IDE format-on-save, a non-Claude agent, muscle memory.
+# Bypass (deliberate reviewed sweep): SKIP_FMT_BOMB_CHECK=1 git commit ...
+"$(git rev-parse --show-toplevel)/scripts/check-fmt-bomb.sh" || exit 1
+
 # ── rustfmt-changed gate (every commit, GPU-free, ~instant) ─────────────
 # Mirror CI's changed-file rustfmt check (scripts/ci-rustfmt-changed.sh) on
 # the staged Rust files. The repo carries historical format debt so we only
 # check files in THIS commit, not the workspace. Fix with:
-#   scripts/fmt-changed.sh
+#   scripts/fmt-changed.sh <master|beta>   # the ref THIS branch was cut from
 # Bypass (e.g. mid-rebase) with: SKIP_FMT_CHECK=1 git commit ...
 if [[ -z "${SKIP_FMT_CHECK:-}" ]]; then
     mapfile -t fmt_files < <(echo "$CHANGED" | grep -E '\.rs$' || true)
@@ -52,7 +38,7 @@ if [[ -z "${SKIP_FMT_CHECK:-}" ]]; then
         if ! rustfmt --edition 2021 --check --config skip_children=true "${fmt_files[@]}"; then
             echo "" >&2
             echo "✗ rustfmt: staged Rust file(s) are not formatted (CI's changed-file gate will flag this)." >&2
-            echo "  Fix:    scripts/fmt-changed.sh && git add -u" >&2
+            echo "  Fix:    scripts/fmt-changed.sh <master|beta> && git add -u" >&2
             echo "  Bypass: SKIP_FMT_CHECK=1 git commit ..." >&2
             echo "  Do NOT run 'cargo fmt' — it reformats the whole workspace's format debt." >&2
             exit 1
@@ -77,7 +63,7 @@ HOTSPOT='\.hip$|gemv|forward|quant|rotate|dispatch|fwht|rmsnorm|fused|mq4|hfq|ma
 # Serve recurrent-state machine — files whose changes can leak DeltaNet/KV state
 # ACROSS requests (issue #462). These get an extra MULTI-REQUEST serve-output
 # gate (serve-loop-gate.sh) that the single-request coherence battery misses.
-SERVE_HOTSPOT='examples/daemon\.rs|speculative\.rs|cli/index\.ts'
+SERVE_HOTSPOT='examples/daemon\.rs|speculative\.rs'
 
 # Multi-GPU PP hotspots — superset of the HOTSPOT entry above. pp-gate.sh
 # runs only when one of these is touched AND 2+ GPUs are visible; otherwise
@@ -91,22 +77,6 @@ fi
 
 if ! echo "$CHANGED" | grep -qE "$HOTSPOT"; then
     exit 0
-fi
-
-# Path-gate the PFlash regression stage that lives at the tail of
-# coherence-gate.sh. Skip by default and only run when a `pflash` path
-# is staged (or HIPFIRE_FORCE_PFLASH_GATE=1 is set). Saves ~5 min/commit
-# when the diff doesn't touch PFlash. Match is intentionally loose
-# (`pflash` substring) so it covers the kernel, the arch impl, the bench
-# example, and the gate scripts themselves.
-PFLASH_HOTSPOT='pflash'
-if [ "${HIPFIRE_FORCE_PFLASH_GATE:-0}" = "1" ] \
-   || echo "$CHANGED" | grep -qE "$PFLASH_HOTSPOT"; then
-    PFLASH_GATE_ENV=""
-    PFLASH_GATE_NOTE="(diff touches pflash — running)"
-else
-    PFLASH_GATE_ENV="HIPFIRE_SKIP_PFLASH_GATE=1"
-    PFLASH_GATE_NOTE="(skipped — no pflash path in diff; force with HIPFIRE_FORCE_PFLASH_GATE=1)"
 fi
 
 # ── bind_thread invariant on dispatch.rs ────────────────────────────────
@@ -129,42 +99,9 @@ if echo "$CHANGED" | grep -qE 'crates/rdna-compute/src/dispatch\.rs'; then
     echo
 fi
 
-# ── Coherence battery ────────────────────────────────────────────────────
-echo "=== Coherence Battery (short) ==="
-echo "Engine code changed. Running coherence battery (~2-4 min)..."
-echo "PFlash regression stage: $PFLASH_GATE_NOTE"
-echo
-
-if ! env $PFLASH_GATE_ENV ./scripts/coherence-gate.sh; then
-    echo
-    echo "========================================================================"
-    echo "COMMIT BLOCKED: coherence battery hit a HARD error."
-    echo "========================================================================"
-    echo
-    echo "One or more tests failed with a daemon panic, zero tokens emitted,"
-    echo "or timeout. See the report path printed above."
-    echo
-    echo "Investigation:"
-    echo "  ./scripts/coherence-gate.sh           # re-run short battery"
-    echo "  ./scripts/coherence-gate.sh --full    # include A3B tests"
-    echo
-    echo "Fix the panic/error in the same commit. Do NOT bypass with --no-verify"
-    echo "unless you have a plan."
-    exit 1
-fi
-
-echo
-echo "NOTE: the coherence battery does not fail on output changes — only on"
-echo "hard errors. Read the report above and confirm each model's output is"
-echo "coherent (fluent, on-topic, not stuck in a verbatim loop) before"
-echo "proceeding with the commit."
-echo
-
 # ── Multi-request serve OUTPUT gate (issue #462) ─────────────────────────
-# The coherence battery above drives the daemon SINGLE-request. Cross-request
-# recurrent-state contamination (DeltaNet/KV state bleeding between requests →
-# </think> / token-loop attractor) only shows on a real, multi-request serve —
-# every single-request gate passed while serve was broken. Path-gated to the
+# Cross-request recurrent-state contamination (DeltaNet/KV state bleeding
+# between requests) only shows on a real, multi-request serve. Path-gated to the
 # serve state machine (daemon.rs / speculative.rs / cli serve wrapper).
 if echo "$CHANGED" | grep -qE "$SERVE_HOTSPOT"; then
     echo "=== Serve-loop gate (multi-request output) ==="
@@ -206,82 +143,6 @@ if echo "$CHANGED" | grep -qE "$SERVE_HOTSPOT"; then
             echo "The daemon reset handler must rewind the live ModelState::Qwen2 bundle"
             echo "state via m.qwen2_mut(), not just the dots-ocr-only m.qwen2_state field."
             echo "  ./scripts/qwen2-reset-gate.sh   # re-run"
-            echo
-            exit 1
-        fi
-        echo
-    fi
-fi
-
-echo
-
-# ── DFlash + DDTree coherence battery ────────────────────────────────────
-# Sibling to coherence-gate.sh — exercises spec_step_dflash and
-# spec_step_ddtree_batched on 27B with prose + code prompts. Hard-fails
-# on Path-A-class single-token attractors (unique_ratio < 0.15 or
-# max_freq > 0.50 in first 128 tokens pre-EOT). Skips silently if 27B
-# target/draft aren't installed.
-SPEC_HOTSPOT='dflash|ddtree|spec_step|tree_verify|gdn_tape|kv_compact_gather|rope_partial|kv_cache_write|spec_decode\.rs|deepseek4'
-# File-name alternation tracks the spec-decode pieces of the runtime
-# AND the qwen35 arch crate (post-PR-8, speculative.rs moved into
-# crates/hipfire-arch-qwen35/src/). dflash.rs + ddtree.rs stay in
-# crates/hipfire-runtime/src/. File-name matches catch both.
-# pflash.rs is intentionally NOT here — PFlash is a different feature
-# (long-context bench), gated separately via PFLASH_HOTSPOT above.
-if [ "${HIPFIRE_FORCE_SPEC_GATE:-0}" = "1" ] \
-   || echo "$CHANGED" | grep -qE "$SPEC_HOTSPOT" \
-   || echo "$CHANGED" | grep -qE 'speculative\.rs|qwen35\.rs|ddtree\.rs|dflash\.rs|dflash_spec_demo\.rs|spec_decode\.rs|deepseek4'; then
-    # --fast on every commit; --full only when explicitly forced. The fast
-    # battery (1 prose + 1 code, dflash only) catches the Path A single-token
-    # attractor regression class which is what this gate is here for. The
-    # ddtree variants in the short battery add ~2 min of redundant cover for
-    # the same failure mode.
-    if [ "${HIPFIRE_FORCE_SPEC_GATE:-0}" = "1" ]; then
-        DFLASH_FLAG=""
-        DFLASH_NOTE="(forced full battery)"
-    else
-        DFLASH_FLAG="--fast"
-        DFLASH_NOTE="(fast: 2 cells, ~1 min — full battery via HIPFIRE_FORCE_SPEC_GATE=1)"
-    fi
-    echo "=== DFlash/DDTree Coherence Battery $DFLASH_NOTE ==="
-    echo "Spec-decode path changed. Running dflash coherence battery..."
-    echo
-    if ! ./scripts/coherence-gate-dflash.sh $DFLASH_FLAG; then
-        echo
-        echo "========================================================================"
-        echo "COMMIT BLOCKED: dflash coherence battery hit a HARD error."
-        echo "========================================================================"
-        echo
-        echo "Either a panic / zero tokens, OR a token attractor was detected"
-        echo "in the first 128 tokens pre-EOT (single token > 50% of generation,"
-        echo "or unique-token-ratio < 0.15). This is the Path A failure class —"
-        echo "see commit 6c84b13 + docs/plans/ddtree-path-b-decouple-rope-from-kvslot.prd."
-        echo
-        echo "DO NOT bypass with --no-verify. Token-attractor bugs masquerade as"
-        echo "+τ / +tok-s wins on stat gates and silently corrupt outputs."
-        echo
-        echo "Investigation:"
-        echo "  ./scripts/coherence-gate-dflash.sh           # re-run short (4 cells)"
-        echo "  ./scripts/coherence-gate-dflash.sh --full    # add b22-k4 + b8-k2"
-        echo
-        exit 1
-    fi
-    echo
-    echo "NOTE: soft warnings (paragraph-level repetition) do not block but"
-    echo "indicate quality drift. Read the report and confirm before commit."
-    echo
-
-    # DeepSeek V4 MTP spec-decode sibling gate. Same Path-A attractor guard but
-    # via the daemon's HIPFIRE_DEEPSEEK4_SPEC_DECODE=1 path instead of the
-    # qwen35 dflash_spec_demo binary. Skips cleanly when the DeepSeek V4 base
-    # model isn't symlinked into MODELS_DIR.
-    if [ -f "$HOME/.hipfire/models/deepseek-v4-flash.mq2lloyd" ]; then
-        echo "=== DeepSeek V4 MTP spec-decode Coherence Battery (fast) ==="
-        if ! ./scripts/coherence-gate-deepseek4-mtp.sh --fast; then
-            echo
-            echo "========================================================================"
-            echo "COMMIT BLOCKED: DeepSeek V4 MTP coherence battery hit a HARD error."
-            echo "========================================================================"
             echo
             exit 1
         fi

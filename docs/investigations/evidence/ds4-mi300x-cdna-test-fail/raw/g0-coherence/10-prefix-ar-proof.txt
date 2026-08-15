@@ -1,0 +1,17 @@
+=== events with drafter ===
+62:{"type":"commit_ready","id":"g0-prefix","tokens":64,"tok_s":3.9017252941535085,"prompt_tokens":14,"prefill_tokens":14,"cached_tokens":0,"prefill_ms":17532,"total_ms":33935,"finish_reason":"length","drafter":"ar","attempt_id":1}
+=== daemon stderr full ===
+GPU dev 0: gfx942 (205.8 GB VRAM, HIP 7.0)
+  pre-compiled kernels: .hipfire_kernels/gfx942
+[rocblas] loaded for gfx942
+deepseek4: MQ2R P3 tensor recipe verified; gfx1151 route v2 is ineligible on gfx942, using portable dispatch
+[daemon-control] received commit for id=g0-prefix attempt_id=1
+=== driver stderr greps ===
+9:[driver] >> {"type":"load","model":"/mnt/scratch/models/deepseek-v4-flash-mq2r/deepseek-v4-flash.mq2r","params":{"max_seq":4096,"kv_mode":"q8","kv_backend":"contiguous","speculation":"off","dflash_mode":"off","mtp_mode":"off","ngram_draft":false,"dspark_mode":"off"}}
+75:[driver] << {"type":"commit_ready","id":"g0-prefix","tokens":64,"tok_s":3.9017252941535085,"prompt_tokens":14,"prefill_tokens":14,"cached_tokens":0,"prefill_ms":17532,"total_ms":33935,"finish_reason":"length","drafter":"ar","attempt_id":1}
+=== decoded text verbatim ===
+A GPU kernel is a function or small program that runs on the GPU's cores in parallel,鼎antsay *}---|---|--- económ中海 licensierad(migrations dátummal hostility变成一个acleTreeLabel弯腰allas Presence atividistoitu peيارىгӀ الساعيهually.”# الشعاعيه marketplace- 
+
+）”）” opportunityies a function the next:0b0008 8
+=== decoded sha ===
+fdaeae308323eaaaed5a7bc64d54db5dcf85c8c22a5d805ca0dd9f3b421f391c  /mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/10-prefix-decoded.txt

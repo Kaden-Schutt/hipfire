@@ -1,0 +1,44 @@
+{
+  "label": "depth-256",
+  "text": "Understood. This response is framed as a technical briefing for operators and implementers who must keep the product path honest. The measurement fixture is ordinary batch-1",
+  "text_sha256": "215487e7cc5945773fc725befce6ffd8937aa29eec2eb48838d93e4784ba225c",
+  "prompt": "User: I need a production-grade explanation of ordinary batch-1 autoregressive decode on a DeepSeek V4 Flash style mixture-of-experts model running on AMD Instinct MI300X (gfx942). Please treat this as a measurement contract discussion rather than marketing. Cover the end-to-end path from a frozen prompt fixture through tokenizer identity, prefill, KV write, and token-by-token decode under Q8 KV with speculation fully disabled. I will use your answer as background for a benchmark fixture that must re-tokenize to exactly 2048 prompt tokens and request 510 greedy generations at temperature zero.\n\nAssistant: Understood. This response is framed as a technical briefing for operators and implementers who must keep the product path honest. The measurement fixture is ordinary batch-1 AR, temperature 0, Q8 KV, a 2048-token prompt, 510 generated tokens, and no speculation of any kind. Nothing below invents alternate routes, draft models, tree verification, or retained PM4 shortcuts as substitutes for the ordinary HIP path.\n\nUser: Start with why prompt bytes matter more than prompt \"text\" in this setting.\n\nAssistant: Benchmarks collapse when two runs believe they share a prompt but do not share bytes. Command substitution",
+  "prompt_sha256": "1424dae0e4eb642a11307a4b58d4919d84da455936614e3c75e30b257ae38692",
+  "max_tokens": 32,
+  "temperature": 0.0,
+  "done": {
+    "type": "commit_ready",
+    "id": "g0-depth-256",
+    "tokens": 32,
+    "tok_s": 34.85838779956427,
+    "prompt_tokens": 259,
+    "prefill_tokens": 259,
+    "cached_tokens": 0,
+    "prefill_ms": 2793,
+    "total_ms": 3711,
+    "finish_reason": "length",
+    "drafter": "ar",
+    "attempt_id": 1
+  },
+  "terminal": {
+    "type": "aborted",
+    "id": "g0-depth-256",
+    "reason": "client_cancelled",
+    "attempt_id": 1
+  },
+  "loaded": {
+    "type": "loaded",
+    "arch": "deepseek4",
+    "dim": 0,
+    "layers": 0,
+    "vocab": 0,
+    "vl": false,
+    "cache_capable": true,
+    "retry_reset_eligible": false
+  },
+  "elapsed_gen_s": 33.718169927597046,
+  "elapsed_load_s": 75.41321897506714,
+  "n_token_events": 29,
+  "daemon_bin": "/mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/target/release/examples/daemon",
+  "model": "/mnt/scratch/models/deepseek-v4-flash-mq2r/deepseek-v4-flash.mq2r"
+}

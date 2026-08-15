@@ -1,0 +1,7 @@
+GPU dev 0: gfx942 (205.8 GB VRAM, HIP 7.14)
+  pre-compiled kernels: /mnt/scratch/hipfire-kernels/rocm714/gfx942
+[rocblas] loaded for gfx942
+PASS M=2048 K=4096 raw_bits=4096 guards=4x16 repeats=28 trials=7 serial_2_ms=0.017447 pair_1_ms=0.013173 speedup=1.3245x serial_effective_GBps=516.50 pair_effective_GBps=684.08
+PASS M=1024 K=4096 raw_bits=2048 guards=4x16 repeats=56 trials=7 serial_2_ms=0.012926 pair_1_ms=0.008530 speedup=1.5153x serial_effective_GBps=349.21 pair_effective_GBps=529.16
+PASS M=512 K=4096 raw_bits=1024 guards=4x16 repeats=64 trials=7 serial_2_ms=0.012934 pair_1_ms=0.006525 speedup=1.9822x serial_effective_GBps=175.13 pair_effective_GBps=347.15
+PASS M=256 K=4096 raw_bits=512 guards=4x16 repeats=64 trials=7 serial_2_ms=0.012835 pair_1_ms=0.006485 speedup=1.9790x serial_effective_GBps=88.88 pair_effective_GBps=175.89

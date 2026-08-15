@@ -6,7 +6,8 @@ license.workspace = true
 description = "Thin Rust FFI to AMD HSA/ROCr runtime via dlopen — bypasses HIP launch overhead"
 
 [dependencies]
-libloading = "0.8"
+hipfire-config = { path = "../hipfire-config" }
+libloading.workspace = true
 thiserror = "2"
 
 [dev-dependencies]

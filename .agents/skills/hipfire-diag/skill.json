@@ -1,12 +1,34 @@
 {
   "name": "hipfire-diag",
   "version": "0.0.1",
-  "description": "Run hipfire GPU diagnostics, interpret results, and suggest fixes. Works with any AI agent framework.",
-  "triggers": ["test hipfire", "diagnose hipfire", "what's wrong", "run tests", "check gpu", "hipfire not working"],
+  "description": "Run and interpret hipfire GPU diagnostics for ROCm/HIP bring-up, missing kernels, test_kernels failures, inference smoke failures, and install/runtime environment problems. Use when a user asks to diagnose hipfire, check GPU readiness, run baseline tests, or explain diagnostic output. Read-only inventory for a source checkout; hand serve/runtime repair to hipfire-autoheal.",
+  "triggers": [
+    "test hipfire",
+    "diagnose hipfire",
+    "what's wrong",
+    "run tests",
+    "check gpu",
+    "hipfire not working",
+    "GPU readiness",
+    "missing kernels",
+    "test_kernels",
+    "ROCm bring-up",
+    "run-diagnostics"
+  ],
   "entry": "./run-diagnostics.sh",
   "interpret": "./interpret.md",
+  "references": {
+    "interpret": "./interpret.md",
+    "fix-suggestions": "./fix-suggestions.md",
+    "validation-routes": "../../../docs/VALIDATION.md",
+    "product-diag": "../../../docs/CLI.md"
+  },
   "requires": {
-    "gpu": "AMD (ROCm/HIP)",
-    "binary": "target/release/examples/test_kernels OR test_kernelsQA"
-  }
+    "gpu": "AMD ROCm/HIP (KFD)",
+    "cwd": "hipfire repo root",
+    "optional_binary": "target/release/examples/test_kernels or test_kernelsQA"
+  },
+  "related": [
+    "hipfire-autoheal"
+  ]
 }

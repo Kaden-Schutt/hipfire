@@ -34,7 +34,6 @@ The shape of this file is lifted from
 | [thiserror](https://docs.rs/thiserror) | Error type derivation in the bridge crates. |
 | [image](https://docs.rs/image) | PNG / JPEG decode for vision-model preprocessing. |
 | [libc](https://docs.rs/libc) | ioctl / syscall plumbing for the redline direct-KMD path. |
-| [Bun](https://bun.sh) | TypeScript runtime for the `hipfire` CLI in `cli/`. Picked over Node for fast startup and zero-build single-file scripts. |
 
 ## Papers
 
@@ -132,11 +131,12 @@ new PRs merge). Hand-edits inside the auto block will be overwritten.
 
 ## License
 
-hipfire is dual-licensed under MIT or Apache-2.0 at your option (see
-[LICENSE](LICENSE), [LICENSE-MIT](LICENSE-MIT),
+hipfire is licensed under Apache-2.0 as of v0.3.0; individual files
+whose authors have not elected Apache-2.0 remain MIT-licensed per
+their SPDX header (see [LICENSE](LICENSE), [LICENSE-MIT](LICENSE-MIT),
 [LICENSE-APACHE](LICENSE-APACHE), and [NOTICE](NOTICE)). The
-canonical repository transitioned from MIT-only to dual-licensing in
-May 2026; see
+canonical repository transitioned MIT-only -> dual in May 2026, then
+dual -> outbound Apache-2.0 for v0.3.0; see
 [docs/governance/relicense-2026-05.md](docs/governance/relicense-2026-05.md)
 for the full decision record including the course correction from
 a unilateral Apache-2.0 relicense to dual licensing.

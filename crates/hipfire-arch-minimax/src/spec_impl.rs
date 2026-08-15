@@ -50,11 +50,12 @@ impl SpecTarget for MiniMaxBundle {
         self
     }
 
-    fn reset_recurrent(&mut self, _gpu: &mut Gpu) {
+    fn reset_recurrent(&mut self, _gpu: &mut Gpu) -> Result<(), String> {
         // Pure attention: no recurrent state to zero. Rewind the position cursor
         // so the next prefill writes from slot 0. Mirrors the daemon's
         // arch_id=10 reset handler.
         self.state.reset();
+        Ok(())
     }
 
     fn new_spec_scratch(
@@ -106,7 +107,10 @@ impl SpecTarget for MiniMaxBundle {
             .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(i, _)| i as u32)
             .unwrap_or(0);
-        Ok(SpecAdvance::Ready { last_argmax })
+        Ok(SpecAdvance::Ready {
+            last_argmax,
+            last_logits: Some(last_logits),
+        })
     }
 
     fn verify_block(

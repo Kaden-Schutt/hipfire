@@ -1,7 +1,6 @@
 { lib
 , rustPlatform
 , rocmPackages
-, bun
 , makeWrapper
 , rocmSupport ? true
 , src ? lib.cleanSource ./..
@@ -25,6 +24,7 @@ rustPlatform.buildRustPackage {
     cargo build --release --features deltanet \
       --example daemon --example infer --example infer_hfq \
       -p hipfire-runtime
+    cargo build --release -p hipfire-cli
     runHook postBuild
   '';
 
@@ -52,22 +52,10 @@ rustPlatform.buildRustPackage {
     cp target/release/examples/infer $out/bin/hipfire-infer 2>/dev/null || true
     cp target/release/examples/infer_hfq $out/bin/hipfire-infer-hfq 2>/dev/null || true
 
-    # Install CLI (TypeScript, invoked via bun)
-    mkdir -p $out/share/hipfire/cli
-    cp -r cli/. $out/share/hipfire/cli/
-    # Remove dev artifacts
-    rm -rf $out/share/hipfire/cli/node_modules \
-           $out/share/hipfire/cli/.gitignore \
-           $out/share/hipfire/cli/tsconfig.json \
-           $out/share/hipfire/cli/bun.lock
-    find $out/share/hipfire/cli/ -maxdepth 1 -type f \
-         \( -name '*.test.ts' -o -name 'test_*.ts' -o -name 'bench_*.ts' \) \
-         -delete 2>/dev/null || true
-
-    # Create hipfire CLI wrapper
-    # HIPFIRE_DAEMON_BIN tells the CLI where to find the wrapped daemon
-    makeWrapper ${bun}/bin/bun $out/bin/hipfire \
-      --add-flags "run $out/share/hipfire/cli/index.ts" \
+    # Install the native Rust control plane. HIPFIRE_DAEMON_BIN points it at
+    # the ROCm-wrapped daemon rather than relying on a source-tree layout.
+    cp target/release/hipfire $out/bin/hipfire-unwrapped
+    makeWrapper $out/bin/hipfire-unwrapped $out/bin/hipfire \
       --set HIPFIRE_DAEMON_BIN $out/bin/hipfire-daemon \
       ${lib.optionalString rocmSupport
         "--prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [
@@ -82,7 +70,7 @@ rustPlatform.buildRustPackage {
 
   meta = with lib; {
     description = "LLM inference for AMD RDNA GPUs";
-    homepage = "https://github.com/Kaden-Schutt/hipfire";
+    homepage = "https://github.com/warpfront/hipfire";
     license = licenses.mit;
     platforms = [ "x86_64-linux" ];
     mainProgram = "hipfire";

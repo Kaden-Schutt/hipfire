@@ -7,6 +7,7 @@
 
 # Pre-compile all HIP kernels for target GPU architectures.
 # Usage: ./scripts/compile-kernels.sh [arch1 arch2 ...]
+#        ./scripts/compile-kernels.sh --print-rocm-resolution
 # Default: gfx906 gfx1010 gfx1030 gfx1100 gfx1200 gfx1201
 #
 # Parallelism: jobs run in parallel via `xargs -P`. Default is $(nproc);
@@ -26,10 +27,52 @@ fi
 
 JOBS="${JOBS:-$(nproc)}"
 
+ROCM_RESOLUTION="$(
+    cargo run --quiet --locked --manifest-path "$SCRIPT_DIR/Cargo.toml" \
+        -p hipfire-config --bin hipfire-rocm-resolve
+)" || exit 1
+SELECTED_ROCM_ROOT="$(printf '%s\n' "$ROCM_RESOLUTION" | sed -n 's/^ROCM_ROOT=//p')"
+HIPCC_BIN="$(printf '%s\n' "$ROCM_RESOLUTION" | sed -n 's/^HIPCC=//p')"
+if [ -z "$SELECTED_ROCM_ROOT" ] || [ -z "$HIPCC_BIN" ]; then
+    echo "ERROR: internal ROCm resolver returned incomplete output." >&2
+    exit 1
+fi
+export HIPCC_BIN SELECTED_ROCM_ROOT
+
 echo "=== hipfire kernel compiler ==="
+echo "hipcc: $HIPCC_BIN"
+echo "ROCm root: $SELECTED_ROCM_ROOT"
+if [ "${1:-}" = "--print-rocm-resolution" ]; then
+    exit 0
+fi
 echo "Source: $SRC_DIR"
 echo "Architectures: ${ARCHS[*]}"
 echo "Parallel jobs: $JOBS"
+
+# Pre-build the packaging-hash helper (reuses compiler.rs hash_parts with toolchain_id="").
+# This is the SAME hashing path the runtime uses; KERNEL_CACHE_ABI or field-order
+# changes cannot diverge between JIT and packaging because both call hash_parts.
+if ! cargo build --quiet --locked --manifest-path "$SCRIPT_DIR/Cargo.toml" \
+    -p rdna-compute --bin hipfire-kernel-hash 2>/dev/null; then
+    echo "ERROR: failed to build hipfire-kernel-hash" >&2
+    exit 1
+fi
+# Cargo places the binary under target/debug or target/release depending on profile
+HASH_BIN_CANDIDATE="$SCRIPT_DIR/target/debug/hipfire-kernel-hash"
+if [ ! -x "$HASH_BIN_CANDIDATE" ]; then
+    HASH_BIN_CANDIDATE="$SCRIPT_DIR/target/release/hipfire-kernel-hash"
+fi
+if [ ! -x "$HASH_BIN_CANDIDATE" ]; then
+    # Fallback: locate via cargo metadata
+    HASH_BIN_CANDIDATE="$(cargo metadata --format-version 1 --no-deps 2>/dev/null | python3 -c 'import json,sys,os; d=json.load(sys.stdin); print(os.path.join(d["target_directory"],"debug","hipfire-kernel-hash"))' 2>/dev/null || echo "")"
+fi
+HASH_BIN="$HASH_BIN_CANDIDATE"
+if [ ! -x "$HASH_BIN" ]; then
+    echo "ERROR: hipfire-kernel-hash binary not found after build" >&2
+    exit 1
+fi
+export HASH_BIN
+echo "hash helper: $HASH_BIN"
 
 # Variant-tag regex: matches .gfxNNNN.hip (chip, e.g. .gfx1201.hip) and
 # .gfxNN.hip (family, e.g. .gfx12.hip). Files matching this are treated as
@@ -80,6 +123,14 @@ for arch in "${ARCHS[@]}"; do
             esac
         fi
 
+        # Broken kernels: missing TURBO_C3_512 / fwht_shfl_forward_512 (WIP hd512)
+        case "$name" in
+            attention_flash_fwht3_tile_hd512|attention_flash_fwht3_tile_hd512_batched)
+                echo "  - $name SKIP (broken hd512, missing TURBO_C3_512)"
+                continue
+                ;;
+        esac
+
         # Variant precedence:
         #   1. ${name}.${arch}.hip          (chip-specific, e.g. .gfx1100.)
         #   2. ${name}.${arch_family}.hip   (family, e.g. .gfx12.)
@@ -111,11 +162,32 @@ worker() {
     local arch name src out
     IFS='|' read -r arch name src out <<< "$job"
 
-    if hipcc --genco --offload-arch="$arch" -O3 -I "$SCRIPT_DIR/kernels/src" \
+    if ROCM_PATH="$SELECTED_ROCM_ROOT" "$HIPCC_BIN" \
+        --genco --offload-arch="$arch" -O3 \
+        --rocm-path="$SELECTED_ROCM_ROOT" --hip-path="$SELECTED_ROCM_ROOT" \
+        -I "$SELECTED_ROCM_ROOT/include" -I "$SCRIPT_DIR/kernels/src" \
         -o "$out" "$src" 2>/dev/null; then
-        local size
-        size=$(stat -c%s "$out" 2>/dev/null || stat -f%z "$out" 2>/dev/null)
-        printf 'OK  %-8s %s (%d KB)\n' "$arch" "$name" "$(( size / 1024 ))"
+        local hash_out="${out%.hsaco}.hash"
+        # Packaging hash: same source+arch+flags+ABI as runtime, but toolchain_id=""
+        # (what a hipcc-free runtime computes). Reuses compiler.rs hash_parts.
+        local hash_ok=0
+        if [ -n "${HIPFIRE_HIPCC_EXTRA_FLAGS:-}" ]; then
+            if "$HASH_BIN" --arch "$arch" --extra-flags "$HIPFIRE_HIPCC_EXTRA_FLAGS" --name "$name" "$src" > "$hash_out" 2>/dev/null; then
+                hash_ok=1
+            fi
+        else
+            if "$HASH_BIN" --arch "$arch" --name "$name" "$src" > "$hash_out" 2>/dev/null; then
+                hash_ok=1
+            fi
+        fi
+        if [ "$hash_ok" -eq 1 ]; then
+            local size
+            size=$(stat -c%s "$out" 2>/dev/null || stat -f%z "$out" 2>/dev/null)
+            printf 'OK  %-8s %s (%d KB)\n' "$arch" "$name" "$(( size / 1024 ))"
+        else
+            rm -f "$out" "$hash_out"
+            printf 'FAIL %-8s %s (hash)\n' "$arch" "$name"
+        fi
     else
         rm -f "$out"
         printf 'FAIL %-8s %s\n' "$arch" "$name"

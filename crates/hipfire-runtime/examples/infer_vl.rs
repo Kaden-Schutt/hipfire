@@ -276,9 +276,12 @@ fn main() {
         in_thinking = false;
     }
 
-    // First token: download logits from scratch, apply n-gram block, sample on CPU
-    let mut logits = gpu.download_f32(&scratch.logits).unwrap();
-    llama::apply_ngram_block(&mut logits, &prompt_tokens);
+    // First token: download logits and sample on CPU. No hard n-gram ban —
+    // exact transcription legitimately repeats HTML/Markdown n-grams (`<tr>`,
+    // `<td>`, table delimiters, boilerplate), and banning them forces a
+    // lower-ranked token whenever a 3..6-gram recurs. The configured repeat
+    // penalty still applies during sampling.
+    let logits = gpu.download_f32(&scratch.logits).unwrap();
     let temp = if in_thinking {
         sc.think_temp
     } else {
@@ -343,18 +346,9 @@ fn main() {
         )
         .expect("forward_scratch failed");
 
-        // N-gram block (requires CPU roundtrip — TODO: GPU kernel)
-        // Disabled for perf measurement — re-enable after implementing GPU n-gram kernel
-        if std::env::var("NO_NGRAM").is_err() {
-            logits = gpu.download_f32(&scratch.logits).unwrap();
-            llama::apply_ngram_block(&mut logits, &token_history);
-            let logits_bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(logits.as_ptr() as *const u8, logits.len() * 4)
-            };
-            gpu.hip
-                .memcpy_htod(&scratch.logits.buf, logits_bytes)
-                .unwrap();
-        }
+        // No CPU n-gram ban on the VL path (see the first-token comment): it
+        // corrupts exact transcription, and it cost a per-token D2H+H2D round
+        // trip. Repeat penalty is applied GPU-side in `sample_top_p` below.
 
         // GPU sampling
         let hist_start = token_history.len().saturating_sub(sc.repeat_window);

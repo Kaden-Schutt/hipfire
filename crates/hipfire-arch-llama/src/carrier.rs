@@ -33,6 +33,7 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<LlamaBundle, S
     };
     let config = <Llama as Architecture>::config_from_hfq(&hfq).map_err(|e| e.to_string())?;
     let weights = <Llama as Architecture>::load_weights(&mut hfq, &config, ctx.gpu)?;
+    hipfire_runtime::maybe_screen_mmq(&weights, ctx.gpu);
     // Size scratch (flash-attention partials) for the runtime KV cap so the
     // asym/flash attends, which index partials by ceil(physical_cap/128), don't
     // overflow it (the trait `new_state` only knows the model's declared max).
@@ -47,7 +48,7 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<LlamaBundle, S
     };
     let kv = KvCache::from_mode(
         hipfire_runtime::kv_mode::resolve(
-            "",
+            ctx.kv_mode_override.unwrap_or(""),
             &hipfire_runtime::kv_mode::LLAMA_HFQ_POLICY,
             config.head_dim,
         )

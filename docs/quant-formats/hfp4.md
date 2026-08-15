@@ -1,268 +1,278 @@
-# HFP4 — Hipfire FP4 Quantization (RDNA-optimal E2M1 family)
+# HFP4 — Hipfire FP4 (RDNA-oriented E2M1 family)
 
-**Status:** v1 (HFP4G32) and v1.5 MFP4G32 (HFP4G32 + offline FWHT, drop-in MQ4 replacement) shipped. WMMA-FP8 hero kernel, HFP4G16/G64 ablations, and online rotation variants are v2/v3 (deferred — see `docs/QUANTIZATION.md` for the production format index).
+**Status (member metadata — INDEX truth labels):**
 
-**Related**: [`docs/QUANTIZATION.md`](../QUANTIZATION.md) (production format index) · [`docs/QUANTIZE.md`](../QUANTIZE.md) (CLI usage) · `crates/hipfire-quantize/src/main.rs` (quantizer) · `kernels/src/gemv_hfp4g32*.hip` (kernels).
+| Variant | Wire qt | State |
+|---|---|---|
+| `HFP4G32` | 21 | **shipped / ref-pinned** — encoder, GEMV, WMMA prefill on RDNA3/4 |
+| `MFP4G32` | 24 | **shipped / ref-pinned** — HFP4G32 + offline FWHT (MQ4-class drop-in) |
+| `MFP4G32Lloyd` / `MFP4G32P` / `MFP4G32E8` (+ SoA) / `MFP3G32E8` / `MFP2G32E8` | 32–37 | **shipped / ref-pinned** encoders + selective kernels; experimental opt-in qualifier — not CLI defaults |
+| HFP4G16 / G64 / MX / NV aliases, online rotation (`MFP4G32R`), HFP8 | see ID table | **planned** (unbuilt) or **reassigned** wire slots — do not claim shipped |
+
+Broader production index: [`docs/QUANTIZATION.md`](../QUANTIZATION.md).
+CLI: [`docs/QUANTIZE.md`](../QUANTIZE.md) · quantizer `crates/hipfire-quantize` ·
+kernels `kernels/src/gemv_hfp4g32*.hip`, `gemm_*_hfp4g32_wmma*.hip`.
 
 ---
 
 ## Mission
 
-HFP4 is hipfire's RDNA-optimal answer to MXFP4 (OCP) and NVFP4 (Blackwell). Both reference formats are designed for non-AMD silicon and don't exploit AMD-specific RDNA ISA features (`v_ldexp_f32` for free UE8M0 dequant, native FP8 WMMA on gfx1201, V_PERMLANE16 cross-lane scale broadcast, VOPD dual-issue on RDNA3+).
+HFP4 is hipfire’s RDNA-oriented answer to OCP **MXFP4** and NVIDIA **NVFP4**.
+Those reference formats target non-AMD silicon and do not exploit RDNA-specific
+ISA levers (`v_ldexp_f32` for UE8M0 dequant, native FP8 WMMA on gfx12,
+`V_PERMLANE16` scale broadcast, VOPD dual-issue on RDNA3+).
 
-HFP4 keeps the OCP E2M1 element wire-compatible — so MXFP4 / NVFP4 checkpoints can be re-quantized to HFP4 by transforming only the scale layer, not the codes — while specifying scale in the way that's cheapest to dequant on RDNA. The format is documented here so other AMD-side projects can adopt it.
+HFP4 keeps the **OCP E2M1** nibble lattice (same sixteen codes). There is
+**no** implemented MXFP4 or NVFP4 checkpoint importer in the quantizer today —
+foreign checkpoints require full **re-quantization** into HFP4/MFP4. NVFP4’s
+G16 / E4M3 scaling cannot generally become HFP4 G32 / UE8M0 by transforming
+scales while preserving codes. Documented so other AMD-side projects can adopt
+the layout.
 
 ## Format taxonomy
 
 ```
-HFP4G16   — E2M1 + UE8M0 g16 + FP16 row scale       (NV-aligned, FP16-WMMA-K aligned)
-HFP4G32   — E2M1 + UE8M0 g32 + FP16 row scale       canonical (FP8-WMMA-K aligned)
-HFP4G64   — E2M1 + UE8M0 g64 + FP16 row scale       (best amortization, RDNA1/2 sweet spot)
-MFP4G32   — HFP4G32 + offline FWHT rotation         (drop-in MQ4 replacement; v1.5)
-MFP4G32R  — HFP4G32 + online block-diag-128         (AMD recipe; v3)
-HFP4G32MX — HFP4G32 with no row scale               (strict OCP MXFP4 interop alias; v2)
-HFP4G16NV — HFP4G16 + E4M3 scale + FP32 tensor      (strict NVFP4 interop alias; v2)
+HFP4G32   — E2M1 + UE8M0 g32 + FP16 row scale       canonical (qt 21)
+MFP4G32   — HFP4G32 + offline FWHT-256              drop-in MQ4-class (qt 24)
+MFP4G32P  — MFP4 with E4M3 (non-PoT) block scale    experimental (qt 33)
+MFP4G32E8 — E8 lattice codewords in MFP4+P frame    experimental (qt 34+)
+MFP4G32Lloyd — per-tensor 16-entry Lloyd codebook   experimental (qt 32)
+
+# Reserved / not product defaults
+HFP4G16   — was qt 22 reservation; **ID 22 reassigned to TidI32** (DeepSeek tables)
+HFP4G64   — **reserved** qt 23 (ablation; not built as product)
+HFP4G32MX / HFP4G16NV / HFP8* — former 25–27 reservations; still **reserved**, unbuilt
+MFP4G32R (online-R) — former qt 29; **reassigned to PARO4G128T** — online-R has no live reserved ID
 ```
 
-## Element format (locked to OCP E2M1)
+## Element format (OCP E2M1)
 
 4-bit signed FP. Sixteen codes; eight magnitudes:
 
-| nibble | sign | exp | mant | value | nibble | sign | exp | mant | value |
-|:------:|:----:|:---:|:----:|:-----:|:------:|:----:|:---:|:----:|:-----:|
-| 0000   | +    | 0   | 0    | +0.0  | 1000   | −    | 0   | 0    | −0.0  |
-| 0001   | +    | 0   | 1    | +0.5  | 1001   | −    | 0   | 1    | −0.5  |
-| 0010   | +    | 1   | 0    | +1.0  | 1010   | −    | 1   | 0    | −1.0  |
-| 0011   | +    | 1   | 1    | +1.5  | 1011   | −    | 1   | 1    | −1.5  |
-| 0100   | +    | 2   | 0    | +2.0  | 1100   | −    | 2   | 0    | −2.0  |
-| 0101   | +    | 2   | 1    | +3.0  | 1101   | −    | 2   | 1    | −3.0  |
-| 0110   | +    | 3   | 0    | +4.0  | 1110   | −    | 3   | 0    | −4.0  |
-| 0111   | +    | 3   | 1    | +6.0  | 1111   | −    | 3   | 1    | −6.0  |
+| nibble | value | nibble | value |
+|:------:|:-----:|:------:|:-----:|
+| 0000 | +0.0 | 1000 | −0.0 |
+| 0001 | +0.5 | 1001 | −0.5 |
+| 0010 | +1.0 | 1010 | −1.0 |
+| 0011 | +1.5 | 1011 | −1.5 |
+| 0100 | +2.0 | 1100 | −2.0 |
+| 0101 | +3.0 | 1101 | −3.0 |
+| 0110 | +4.0 | 1110 | −4.0 |
+| 0111 | +6.0 | 1111 | −6.0 |
 
-Locked to spec: changing the magnitudes breaks RDNA4 hardware path (`v_cvt_pk_fp8_e2m1`), the LUT-decode lever (gfx12 dominant strategy), and MX/NVFP4 interop.
+Locked to spec: changing magnitudes breaks RDNA4 hardware paths
+(`v_cvt_pk_fp8_e2m1` where used), LUT-decode strategies, and MX/NV interop.
 
 ## Block scale — UE8M0
 
-Every block of `g` elements (g ∈ {16, 32, 64}) carries **one UE8M0 byte** = unsigned 8-bit exponent-only scale. The encoded value `e ∈ [0, 254]` represents `2^(e − 127)`. The reserved code `0xFF` encodes block-NaN (every element in the block is NaN).
+Every block of `g` elements (canonical **g = 32**) carries one **UE8M0** byte:
+unsigned exponent-only. Encoded `e ∈ [0, 254]` means `2^(e − 127)`. `0xFF` is
+block-NaN.
 
-Why UE8M0 (RDNA-specific justification): on every RDNA tier `v_ldexp_f32(acc, e − 127)` is one VALU op (no multiply, no constant load). NVFP4's E4M3 scale costs one FP8→FP16 conversion + one FP16 multiply per block; on Hopper this is amortized by the FMA pipeline, but on RDNA the `v_ldexp` path is strictly faster.
+On RDNA, `v_ldexp_f32(acc, e − 127)` is one VALU op (no multiply). UE8M0 alone
+is coarse (OCP MX notes ~1–2% PPL loss vs FP16 in literature), so HFP4 adds a
+FP16 **row** scale.
 
-UE8M0 alone is too coarse — the OCP MX paper documents 1–2% perplexity loss vs FP16 — so HFP4 layers a FP16 row-scale on top.
+## Per-row second-level scale (FP16)
 
-## Per-row second-level scale (FP16, the AMD-specific lever)
-
-Each weight row carries a 16-byte aligned header containing two FP16 row scales (`row_scale_a`, `row_scale_b`) plus format flags. Effective dequant per element:
+Each weight row has a 16-byte aligned header with `row_scale_a`, a reserved
+`row_scale_b` slot, block count, and `format_flags`. Effective dequant (v1):
 
 ```
 value = row_scale_a * 2^(block_e − 127) * E2M1_LUT[nibble]
 ```
 
-The `row_scale_a` multiply hoists outside the K loop (applied once per row at GEMV finalize, or folded into the WMMA output stage on gfx11/gfx12). `row_scale_b` exists for fused dual-output kernels where the same input row produces two output columns with different per-row scales (e.g., gate+up FFN, qkv fused projection). When `row_scale_b == 0` the kernel skips the second scale.
+`row_scale_a` hoists outside the K loop (GEMV finalize or WMMA output stage).
+**`row_scale_b` is reserved:** the encoder always writes zero, and current
+kernels read only `row_scale_a` — it does **not** control or skip a second
+scale today. Format flag bit 1 remains defined for a future dual-output use.
 
-Why this beats single-level FP16 row-scale (HFQ-style): finer block granularity (g=32 vs 256) catches outlier groups within a row that a row-shared scale alone would clip or under-quantize. Why this beats single-level UE8M0 (MX-strict): the FP16 row-scale gives full FP16 dynamic range without paying for it in the dequant inner loop.
+Finer blocks (g=32 vs HFQ/MQ G256) catch within-row outliers a single row scale
+would clip; the FP16 row scale restores dynamic range without paying a multiply
+in the inner dequant loop beyond `ldexp`.
 
 ## Byte layout — HFP4G32 (canonical)
 
-For a row of K elements (K must be a multiple of 32):
+For a row of K elements (**format** is K%32-aligned; **v1 GEMV/WMMA path
+requires K%256==0** — quantizer and loaders enforce the kernel constraint):
 
 ```
 Per row (16 B, aligned):
-  +0  : f16  row_scale_a      // primary FP16 second-level scale
-  +2  : f16  row_scale_b      // secondary scale for fused-dual outputs (else 0)
-  +4  : u8   block_count_lo   // K / 32, low 8 bits
-  +5  : u8   block_count_hi   // K / 32, high 8 bits  (supports K up to 16M)
-  +6  : u8   format_flags     // bit 0: rotation present
-                              // bit 1: row_scale_b used
-                              // bits 2-3: rotation_kind
-                              //   00 = off
-                              //   01 = offline FWHT (existing MQ pattern)
-                              //   10 = online block-diag-128 (v3)
-                              //   11 = online HadaCore-16 (v3)
-                              // bits 4-7: reserved
+  +0  : f16  row_scale_a
+  +2  : f16  row_scale_b      // reserved; encoder writes 0; kernels ignore
+  +4  : u8   block_count_lo   // K/32 low
+  +5  : u8   block_count_hi
+  +6  : u8   format_flags
+              bit 0: rotation present
+              bit 1: row_scale_b used
+              bits 2-3: rotation_kind
+                00 = off
+                01 = offline FWHT (MFP4)
+                10 = online block-diag-128 (planned)
+                11 = online HadaCore-16 (planned)
+              bits 4-7: reserved
   +7  : u8   reserved
-  +8  : u32  reserved         // future: D_diag pointer offset (joint-D smoothing)
+  +8  : u32  reserved
   +12 : u32  reserved
 
-Per block × (K / 32):
-  +0  : u8   block_e          // UE8M0 power-of-2 exponent
-  +1  : u8[16] nibbles        // 32 E2M1 codes, low nibble = even index, high nibble = odd
-                              // ordering bit-identical to MX/NVFP4 wire format
+Per block × (K/32):
+  +0  : u8   block_e          // UE8M0
+  +1  : u8[16] nibbles        // 32 E2M1 codes; low nibble = even index
 ```
 
-**Total per row**: `16 + 17 × (K / 32)` bytes.
+**Total per row:** `16 + 17 × (K / 32)` bytes.
+**Effective bpw:** 4.25 from per-block payload + `128/K` from the row header.
 
-For a 5120-dim Qwen3.5-9B `q_proj` row: `16 + 17 × 160 = 2736 B` (vs MQ4G256's 2720 B; +0.6% with finer scale granularity and FP16 row-scale).
+MFP4 stamps `format_flags = 0x05` (rotation present + offline FWHT) after the
+same row pack; runtime uses the shared MQ FWHT signs (seeds 42 / 1042).
 
-**Effective bpw**: `(17 × 8) / 32 = 4.25 bpw` from the per-block payload, plus `128 / K` extra bits per weight from the per-row header (negligible for large K — for K=5120, header overhead is 0.025 bpw).
+### Nibble packing
 
-### Worked example
+Byte `b` encodes elements `2b` (low nibble) and `2b+1` (high nibble). Matches
+HFQ4 extract patterns and MX/NVFP4 wire ordering.
 
-A row with K=64 (two blocks):
+## Quantization recipe (HFP4G32)
 
-```
-Offset  Bytes                                       Meaning
-------  ------------------------------------------  ----------------------------------
-0x00    BC 3F  00 00  02 00  00 00  00 00 00 00     row_scale_a = 0.99 (FP16: 0x3FBC)
-        00 00 00 00                                 row_scale_b = 0
-                                                    block_count = 2
-                                                    format_flags = 0x00 (no rotation)
-                                                    reserved
-0x10    7F  31 22 13 04 F5 E6 D7 C8 31 22 13 04 ... block 0: block_e=127 (=2^0=1.0)
-        ...                                         + 16 bytes of packed nibbles
-0x21    7E  ...                                     block 1: block_e=126 (=2^-1=0.5)
-        ...                                         + 16 bytes of packed nibbles
-0x32    EOF
-```
+For each row `W[K]`:
 
-The second block's `block_e=126` = `2^-1`, meaning every element in that block is half the magnitude of an equivalent block 0 nibble. The `row_scale_a` then scales both blocks' final values uniformly.
+1. `row_scale_a = max_abs(W) / 6.0` (E2M1 max ±6).
+2. Normalize: `W_n = W / row_scale_a`.
+3. Per 32-element block: pick UE8M0 `e` so `2^e` covers `block_max/6`; divide;
+   round-to-nearest on the E2M1 lattice; pack nibbles.
 
-### Nibble packing convention
+Round-trip per-block max-abs error is bounded by the **local half-gap** of the
+E2M1 lattice under nearest rounding. Gaps are not uniform: adjacent magnitudes
+include steps of 0.5, 1.0, and **2.0** (between 4 and 6), so the largest
+half-gap is **1.0** scaled unit. A valid **global** bound is therefore
+`row_scale_a · 2^(block_e − 127) · 1.0` (not `· 0.5`). Example: a normalized
+value of 5 can round to 4 or 6 with unit error 1.0 before scales.
 
-Within each 16-byte payload, byte `b` at position `b ∈ [0, 16)` encodes elements at indices `2b` (low nibble = `byte & 0x0F`) and `2b + 1` (high nibble = `byte >> 4`). This matches the existing HFQ4 packing (kernels can reuse the bit-extract pattern verbatim) and is bit-identical to MX/NVFP4 wire format.
+MFP4 applies offline FWHT-256 on the row (same signs as MQ4) before the HFP pack.
 
-## Quantization recipe
+## Rotation modes
 
-For each row of FP16 weights `W[K]`:
+| Mode | Storage | flags bits 2–3 | Status |
+|------|---------|----------------|--------|
+| `off` | unrotated | 00 | HFP4 default |
+| `offline-fwht` | pre-rotated weights; `mq_rotate_x` on x | 01 | **MFP4 shipped** |
+| `online-bd128` | unrotated + fused online Hadamard | 10 | planned |
+| `hadacore-16` | WMMA-fragment Hadamard | 11 | planned / research |
 
-1. Compute the FP16 row scale: `row_scale_a = max_abs(W) / 6.0` (E2M1 max code is ±6.0).
-2. Normalize: `W_n[i] = W[i] / row_scale_a`. Now `|W_n[i]| ≤ 6.0`.
-3. For each 32-element block:
-   a. Compute the UE8M0 block exponent. `block_max = max_abs(W_n[block])`. Pick `e` such that `2^e` is the largest power-of-2 ≤ `block_max / 6.0`. Encode as UE8M0 with bias 127: `block_e = clamp(round(log2(block_max / 6.0)) + 127, 0, 254)`.
-   b. Apply block scale: `W_b[i] = W_n[block][i] / 2^(block_e − 127)`.
-   c. Round-to-nearest in the E2M1 lattice: `nibble[i] = argmin_k |E2M1_LUT[k] − W_b[i]|`.
-   d. Pack nibbles into 16 bytes (low nibble = even index).
+Online modes block fused QKV/gate_up until fused-rotation siblings exist.
+Offline mode reuses MQ infrastructure (`mq_rotate_x`, fused rmsnorm/silu+rotate,
+signs1/signs2) unchanged.
 
-Round-trip per-block max-abs error is bounded by `row_scale_a · 2^(block_e − 127) · 0.5` (half the smallest E2M1 step at the scale's working magnitude).
-
-## Rotation modes (configurable, default `off` in v1)
-
-| Mode | Storage | Rotation kind bits | When used |
-|------|---------|---------------------|-----------|
-| `off` | unrotated weights, plain `x` | 00 | v1 default; calibration baseline; well-conditioned models |
-| `offline-fwht` | pre-rotated weights; `x_rot` computed once per layer via existing `mq_rotate_x` | 01 | drop-in MQ4 replacement; ships v1.5 as `MFP4G32` |
-| `online-bd128` | unrotated weights; per-block 128-elt block-diag Hadamard fused with dequant | 10 | v3 — matches AMD ROCm blog recipe; requires Stiefel-manifold calibration |
-| `hadacore-16` | unrotated weights; 16×16 Hadamard via WMMA fragments | 11 | v3 research path; gfx1201 only |
-
-Online modes (`10`, `11`) block fused QKV/QKVZA/gate_up kernels until their fused-rotation siblings exist. Offline mode (`01`) reuses the existing MQ infrastructure (`mq_rotate_x`, `fused_rmsnorm_mq_rotate`, `fused_silu_mul_mq_rotate`, signs1/signs2 buffers) without modification.
-
-## Quant-type IDs (`.hfq` file format)
+## Quant-type IDs
 
 | ID | Variant | Status |
 |:--:|---------|--------|
-| 21 | `HFP4G32` | v1 — first kernel target (shipped) |
-| 22 | `HFP4G16` | v1.5 ablation |
-| 23 | `HFP4G64` | v1.5 ablation |
-| 24 | `MFP4G32` | v1.5 — HFP4G32 + offline FWHT (shipped, drop-in MQ4 replacement) |
-| 25 | `HFP4G32MX` | v2 (strict OCP MXFP4 interop alias) |
-| 26 | `HFP4G16NV` | v2 (strict NVFP4 interop alias) |
-| 27 | `HFP8E4M3G32` | v2 HFP8 family |
-| 28 | `HFP8E5M2G32` | v2 HFP8 family |
-| 29 | `MFP4G32R` | v3 (online block-diag rotation) |
+| 21 | `HFP4G32` | **shipped / ref-pinned** |
+| 22 | **`TidI32`** (DeepSeek tid2eid) | **reassigned** from former HFP4G16 reservation — do not emit HFP4G16 as 22 |
+| 23 | HFP4G64 | **reserved** ablation (not product) |
+| 24 | `MFP4G32` | **shipped / ref-pinned** |
+| 25–27 | MX/NV/HFP8 reservations | **reserved** / unbuilt (**planned** product intent only) |
+| 28 | PARO4G128 (unrelated family) | **shipped / ref-pinned** load path — listed so IDs are not squatted |
+| 29 | PARO4G128T (unrelated) | **reassigned** from former `MFP4G32R` online-R slot |
+| 30 | MQ4G256Lloyd (unrelated) | **shipped / ref-pinned** research MQ opt-in — renumbered off 21 |
+| 32 | `MFP4G32Lloyd` | **shipped / ref-pinned** impl; experimental opt-in |
+| 33 | `MFP4G32P` | **shipped / ref-pinned** impl; experimental opt-in |
+| 34 | `MFP4G32E8` | **shipped / ref-pinned** impl; experimental opt-in |
+| 35 | `MFP4G32E8SOA` | **shipped / ref-pinned** impl; experimental opt-in |
+| 36 | `MFP3G32E8` | **shipped / ref-pinned** impl; experimental cold-tier opt-in |
+| 37 | `MFP2G32E8` | **shipped / ref-pinned** impl; experimental cold-tier opt-in |
 
-IDs 21–29 are reserved at v1 ship time. Future PRs MUST NOT squat these IDs even if the corresponding variant has not yet shipped.
+**Current reserved wire IDs:** 23 and 25–27. IDs 22, 29, and 30 were reassigned.
+Planned online-R / HFP8 variants have no reserved ID beyond this table.
+Future PRs must not reuse reserved HFP slots for unrelated formats except the
+documented reassignments above.
 
 ## Configurability
 
-### Compile-time (kernel macros, set per-kernel-source)
+### Runtime env (live)
 
-| Macro | Values | Default |
-|-------|--------|---------|
-| `HFP4_BLOCK_SIZE` | 16 / 32 / 64 / 128 | 32 |
-| `HFP4_SCALE_FORMAT` | `UE8M0` / `E4M3` / `FP16` | `UE8M0` |
-| `HFP4_SECOND_LEVEL` | 0 / 1 | 1 |
-| `HFP4_ROTATION_KIND` | 0–3 (matches `format_flags` bits 2–3) | 0 |
-| `HFP4_R` | 1 / 2 / 4 multirow | 1 |
+| Variable | Effect |
+|----------|--------|
+| `HIPFIRE_FP8_WMMA=1` | **Live.** Default **off**. On gfx12 with WMMA w32, enables the FP8-WMMA HFP path when `batch_size >= FP8_WMMA_MIN_BATCH` (**1024**); otherwise FP16-WMMA is used. Sources: `feature_flags.rs`, `dispatch.rs`, `gemm.rs`. |
 
-### Runtime (env vars, matching existing `HIPFIRE_*` taxonomy)
+There are **no** current source definitions for `HFP4_BLOCK_SIZE`,
+`HFP4_SCALE_FORMAT`, `HFP4_SECOND_LEVEL`, `HFP4_ROTATION_KIND`, `HFP4_R`,
+`HIPFIRE_HFP_USE_FP8_WMMA`, `HIPFIRE_HFP_ROTATION`, or `HIPFIRE_HFP_VARIANT`.
+Treat any of those names as **planned** only — do not document them as live
+controls.
 
-| Variable | Values | Effect |
-|----------|--------|--------|
-| `HIPFIRE_HFP_USE_FP8_WMMA` | 0 / 1 | gfx12 only; 0 forces FP16-WMMA path for ablation |
-| `HIPFIRE_HFP_ROTATION` | `off` / `offline` / `online-bd128` | overrides per-tensor metadata for ablation |
-| `HIPFIRE_HFP_VARIANT` | kernel-variant name | pin specific variant for debugging |
-
-### Quantize CLI (`hipfire-quantize`)
+### Quantize CLI / binary
 
 | Flag | Effect |
 |------|--------|
-| `--format hfp4` (or `hfp4g32`, `hf4p`, `fp4`) | HFP4G32 quant — v1 default |
-| `--format hfp4g16` | HFP4G16 ablation (v1.5) |
-| `--format hfp4g64` | HFP4G64 ablation (v1.5) |
-| `--format mfp4` (or `mfp4g32`, `mf4p`) | HFP4G32 + offline FWHT rotation (shipped v1.5) |
-| `--block-size {16,32,64}` | override block size for HFP4 family |
-| `--rotation {off,offline-fwht}` | override rotation mode |
+| `--format hfp4` (`hfp4g32`, `hf4p`, `fp4`) | HFP4G32 |
+| `--format mfp4` (`mfp4g32`, `mf4p`) | MFP4G32 + offline FWHT |
+| `--format mfp4p` / `mfp4e8` / `mfp4l` / … | experimental siblings (binary) |
 
-## Per-arch dequant ISA targets
+Thin `hipfire quantize` help emphasizes mq/hf defaults; HFP/MFP are available on
+the full `hipfire-quantize` format alias set.
 
-| Arch | Path | Lever | Expected |
-|------|------|-------|----------|
-| gfx1201/1200 (RDNA4) | LDS-LUT → FP8 → `v_wmma_f32_16x16x32_fp8_fp8` → `ldexpf` per block → `v_pk_mul_f16` per row | native FP8 WMMA | 55–65 TFLOPS (vs rdna4-guide's 40.8) |
-| gfx1100/1151 (RDNA3 / 3.5) | SGPR-LUT → FP16 → `v_wmma_f32_16x16x16_f16` + VOPD-paired dequant + V_PERMLANE16 scale broadcast | WMMA-FP16 + VOPD | 70–75% WMMA-FP16 theoretical |
-| gfx1030 (RDNA2) | SGPR-LUT → FP16 → `v_dot2_f32_f16` + V_PERMLANE16 + R=2 multirow | V_DOT2 | parity ±5% vs MQ4G256 |
-| gfx1010 (RDNA1) | LDS-LUT → packed FP16 → `v_pk_fma_f16` only + `__shfl_sync` scale broadcast | BW-bound (no dot, no WMMA) | 85–90% peak BW |
-| gfx906 (CDNA1) | wave64 + `v_pk_fma_f16` + LDS scale broadcast | BW-bound | parity with gfx1010 path |
+## Runtime support boundaries
 
-The first kernel (`gemv_hfp4g32.gfx1100.hip`) is the **correctness anchor** — no WMMA, no FP8, no rotation — so byte-exact gating works against the existing infrastructure. WMMA-FP8 hero kernel is v2.
+| Concern | Behavior |
+|---------|----------|
+| Batched prefill | `HFP4G32` / `MFP4G32` are runtime batch-eligible under `is_batchable_la` on WMMA arches (gfx11/115x/12) only — runtime batch eligibility, **not** registry admission ([`admissions.yml`](../admissions.yml)) |
+| Decode GEMV | `gemv_hfp4g32` family (scalar / arch variants); MFP uses prerotated path |
+| Fused QKV / gate_up prefill | WMMA-only HFP keys on RDNA3/4 — no scalar fused fallback |
+| K alignment | Loaders refuse K%256≠0 for v1 kernels |
+| CDNA / pre-WMMA | Fall back or reject batch path; do not claim parity |
 
-## v1 first-kernel inner loop
+## v1 correctness-anchor inner loop
 
-Mirrors the HFQ4G256 4-accumulator + tail-by-`g%4` invariant from `kernels/src/gemv_hfq4g256.hip:33–124`. Diff from HFQ4 is one substitution + drop the zero-point load:
+Mirrors HFQ4G256 multi-accumulator structure with E2M1 LUT + `ldexpf` instead of
+INT4×scale+zp:
 
 ```c
-// In kernel preamble:
-__shared__ _Float16 lut[16];
-if (threadIdx.x < 16) {
-    static const _Float16 E2M1[16] = {
-         (_Float16)+0.0f, (_Float16)+0.5f, (_Float16)+1.0f, (_Float16)+1.5f,
-         (_Float16)+2.0f, (_Float16)+3.0f, (_Float16)+4.0f, (_Float16)+6.0f,
-         (_Float16)-0.0f, (_Float16)-0.5f, (_Float16)-1.0f, (_Float16)-1.5f,
-         (_Float16)-2.0f, (_Float16)-3.0f, (_Float16)-4.0f, (_Float16)-6.0f,
-    };
-    lut[threadIdx.x] = E2M1[threadIdx.x];
-}
-__syncthreads();
-
-// Per-block in inner loop:  sc = row_scale_a * ldexpf(1.0f, block_e - 127);
-// Per-element:               value = sc * (float)lut[nibble];
+// preamble: shared E2M1 lut[16]
+// per block: sc = row_scale_a * ldexpf(1.0f, block_e - 127);
+// per nibble: value = sc * (float)lut[nibble];
 ```
 
-Compared to HFQ4: `(sc * (float)((pk) & 0xFu) + zp)` becomes `sc * (float)lut[(pk) & 0xFu]`. The `zp` argument and `+ zp` term drop because E2M1 is signed.
+No zero-point term (E2M1 is signed).
 
-## Validation
+## Validation (how to claim quality/perf)
 
-The first-kernel ships are gated by:
+Do **not** treat the historical checklist below as a universal gate (see
+[VALIDATION.md](../VALIDATION.md)). For HFP work, prefer:
 
-1. CPU round-trip: per-tensor max-abs error ≤ `row_scale_a · 2^(block_e − 127) · 0.5` per group.
-2. CPU vs kernel: per-element error ≤ `1e-3 · max(|y_ref|)` on (M=512, K=2048) random tensors.
-3. NRMSE vs FP16: per-tensor NRMSE < 5e-3 across all weight tensors of Qwen3.5-0.8B and Qwen3.5-9B.
-4. Quality regression vs MQ4G256: HFP4G32 NRMSE ≤ MQ4G256 NRMSE on geomean across 50 prompts.
-5. Coherence gate (`scripts/coherence-gate.sh`): fluent output on 9B + 27B HFP4 conversions.
-6. Speed gate (`scripts/probe_commits.sh master HEAD`): decode tok/s within ±5% of MQ4G256 baseline.
-7. Zero spills + register budget per `docs/skills/gfx-kernel-metadata`.
+1. CPU round-trip max-abs ≤ local half-gap (global ≤ `row_scale · 2^(e−127) · 1.0`).
+2. CPU vs kernel element error on fixed (M,K) tensors.
+3. NRMSE / KLD vs FP16 or MQ4 baselines on **named** models — report as
+   **measured** with fixture identity.
+4. Prefill path proof: rocprof / internal profile shows HFP WMMA symbols when
+   claiming WMMA prefill.
+5. No coherence-gate battery as product admission.
+
+Aspirational speed numbers (e.g. TFLOPS vs third-party MXFP4 demos) are
+**not** route-certified here.
 
 ## Comparison to neighbors
 
 | Property | HFQ4G256 | MQ4G256 | MXFP4 (strict) | NVFP4 | **HFP4G32** |
 |----------|:---:|:---:|:---:|:---:|:---:|
-| Element format | INT4 uniform | INT4 uniform (FWHT-rotated) | E2M1 | E2M1 | E2M1 |
+| Element | INT4 | INT4 + FWHT | E2M1 | E2M1 | E2M1 |
 | Block size | 256 | 256 | 32 | 16 | 32 |
-| Block scale | FP16 (in FP32 slot) | FP32 | UE8M0 | E4M3 | UE8M0 |
-| Block-scale dequant cost | 1 multiply | 1 multiply | 1 `ldexpf` (free) | 1 mul (1 FP8→FP16 + 1 FP16 mul) | 1 `ldexpf` (free) |
-| Secondary scale | none | none | none | FP32 per-tensor | FP16 per-row |
-| Per-group bytes (excl. row hdr) | 136 | 136 | 17 | ~10 | 17 |
-| Effective bpw | 4.25 | 4.25 | 4.25 | 4.5 | 4.25 + ~0.025 (row hdr) |
-| Rotation | none | offline FWHT (mandatory) | none | none | configurable |
-| MX import path | re-quant | re-quant | byte-identical | n/a | re-scale only (codes preserve) |
-| FP8-WMMA on gfx12 | n/a | n/a | external demo | n/a | first-class (v2) |
-| Adoptable spec | HFQ-house | MQ-house | OCP standard | NV-only | HFP-spec (this doc) |
+| Block scale | f32 affine scale + f32 min | f32 affine scale + f32 min | UE8M0 | E4M3 | UE8M0 |
+| Secondary scale | none | none | none | FP32 tensor | FP16 row (`row_scale_a`; `row_scale_b` reserved) |
+| ~bpw | 4.25 | 4.25 | 4.25 | ~4.5 | ~4.25 |
+| Rotation | none | offline FWHT (`R=D2·H·D1/16`) | none | none | offline FWHT on MFP4; online **planned** |
+| MX/NV import | re-quant | re-quant | **no importer** (re-quant) | **no importer** (re-quant; G16/E4M3 ≠ G32/UE8M0 scale-only) | re-quant only |
 
-## References
+## Provenance / references
 
-- OCP Microscaling Formats (MX) Specification v1.0 — <https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf>
-- AMD ROCm Blog — High-Accuracy MXFP4, MXFP6 — <https://rocm.blogs.amd.com/software-tools-optimization/mxfp4-mxfp6-quantization/README.html>
-- AMD ROCm Blog — Advanced MXFP4 with Online Rotation — <https://rocm.blogs.amd.com/software-tools-optimization/mxfp4-online-rotation/README.html>
-- NVIDIA — Introducing NVFP4 — <https://developer.nvidia.com/blog/introducing-nvfp4-for-efficient-and-accurate-low-precision-inference/>
-- rdna4-wmma-guide (40.8 TFLOPS MXFP4 on R9700) — <https://github.com/JohnTDI-cpu/rdna4-wmma-guide>
+- OCP Microscaling Formats (MX) v1.0 — <https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf>
+- AMD ROCm — MXFP4/MXFP6 quantization — <https://rocm.blogs.amd.com/software-tools-optimization/mxfp4-mxfp6-quantization/README.html>
+- AMD ROCm — MXFP4 online rotation — <https://rocm.blogs.amd.com/software-tools-optimization/mxfp4-online-rotation/README.html>
+- NVIDIA NVFP4 — <https://developer.nvidia.com/blog/introducing-nvfp4-for-efficient-and-accurate-low-precision-inference/>
+- rdna4-wmma-guide (third-party MXFP4 demo) — <https://github.com/JohnTDI-cpu/rdna4-wmma-guide>
 - HadaCore — <https://pytorch.org/blog/hadacore/>
 - SpinQuant (arXiv 2405.16406) — <https://arxiv.org/abs/2405.16406>
-- AMD RDNA4 ISA Reference — <https://docs.amd.com/v/u/en-US/rdna4-instruction-set-architecture>
+- AMD RDNA4 ISA — <https://docs.amd.com/v/u/en-US/rdna4-instruction-set-architecture>
+
+HFP4 is an original hipfire layout specification; E2M1 magnitudes follow OCP MX.
+MQ/FWHT attribution: MagnumQuant rotation (seeds 42/1042) shared with the MQ
+weight family in QUANTIZATION.md.

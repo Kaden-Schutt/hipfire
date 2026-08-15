@@ -1,0 +1,52 @@
+[feed] label=depth-256
+[feed] daemon=/mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/target/release/examples/daemon
+[feed] model=/mnt/scratch/models/deepseek-v4-flash-mq2r/deepseek-v4-flash.mq2r
+[feed] >> {"type":"ping"}
+GPU dev 0: gfx942 (205.8 GB VRAM, HIP 7.0)
+  pre-compiled kernels: /mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/.hipfire_kernels/gfx942
+[rocblas] loaded for gfx942
+[feed] << {"type":"pong"}
+[feed] pong in 0.25s
+[feed] >> {"type":"load","model":"/mnt/scratch/models/deepseek-v4-flash-mq2r/deepseek-v4-flash.mq2r","params":{"max_seq":4096,"kv_mode":"q8","kv_backend":"contiguous","speculation":"off","dflash_mode":"off","mtp_mode":"off","ngram_draft":false,"dspark_mode":"off"}}
+deepseek4: MQ2R P3 tensor recipe verified; gfx1151 route v2 is ineligible on gfx942, using portable dispatch
+[feed] << {"type":"loaded","arch":"deepseek4","dim":0,"layers":0,"vocab":0,"vl":false,"cache_capable":true,"retry_reset_eligible":false}
+[feed] loaded in 75.41s
+[feed] DECODE_PHASE_BEGIN
+[feed] >> {"type":"generate","id":"g0-depth-256","attempt_id":1,"prompt":"User: I need a production-grade explanation of ordinary batch-1 autoregressive decode on a DeepSeek V4 Flash style mixture-of-experts model running on AMD Instinct MI300X (gfx942). Please treat this as a measurement contract discussion rather than marketing. Cover the end-to-end path from a frozen prompt fixture through tokenizer identity, prefill, KV write, and token-by-token decode under Q8 KV with speculation fully disabled. I wi
+[feed] << {"type":"token","id":"g0-depth-256","text":"Und","attempt_id":1}
+[feed] << {"type":"token","id":"g0-depth-256","text":"ers","attempt_id":1}
+[feed] << {"type":"token","id":"g0-depth-256","text":"tood. T","attempt_id":1}
+[feed] << {"type":"token","id":"g0-depth-256","text":"his","attempt_id":1}
+[feed] << {"type":"token","id":"g0-depth-256","text":" r","attempt_id":1}
+[feed] << {"type":"token","id":"g0-depth-256","text":"esponse is","attempt_id":1}
+[feed] << {"type":"token","id":"g0-depth-256","text":" framed a","attempt_id":1}
+[feed] << {"type":"token","id":"g0-depth-256","text":"s a ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-depth-256","text":"technical ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-depth-256","text":"brie","attempt_id":1}
+[feed] << {"type":"token","id":"g0-depth-256","text":"fing for o","attempt_id":1}
+[feed] << {"type":"token","id":"g0-depth-256","text":"per","attempt_id":1}
+[feed] << {"type":"token","id":"g0-depth-256","text":"ator","attempt_id":1}
+[feed] << {"type":"token","id":"g0-depth-256","text":"s and","attempt_id":1}
+[feed] << {"type":"token","id":"g0-depth-256","text":" impl","attempt_id":1}
+[feed] << {"type":"token","id":"g0-depth-256","text":"emen","attempt_id":1}
+[feed] << {"type":"token","id":"g0-depth-256","text":"ters who","attempt_id":1}
+[feed] << {"type":"token","id":"g0-depth-256","text":" must","attempt_id":1}
+[feed] << {"type":"token","id":"g0-depth-256","text":" keep t","attempt_id":1}
+[feed] << {"type":"token","id":"g0-depth-256","text":"h","attempt_id":1}
+[feed] << {"type":"token","id":"g0-depth-256","text":"e pr","attempt_id":1}
+[feed] << {"type":"token","id":"g0-depth-256","text":"oduct path h","attempt_id":1}
+[feed] << {"type":"token","id":"g0-depth-256","text":"onest. T","attempt_id":1}
+[feed] << {"type":"token","id":"g0-depth-256","text":"he ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-depth-256","text":"measureme","attempt_id":1}
+[feed] << {"type":"token","id":"g0-depth-256","text":"nt fix","attempt_id":1}
+[feed] << {"type":"token","id":"g0-depth-256","text":"t","attempt_id":1}
+[feed] << {"type":"token","id":"g0-depth-256","text":"u","attempt_id":1}
+[feed] << {"type":"token","id":"g0-depth-256","text":"re is ordinary batch-1","attempt_id":1}
+[feed] << {"type":"commit_ready","id":"g0-depth-256","tokens":32,"tok_s":34.85838779956427,"prompt_tokens":259,"prefill_tokens":259,"cached_tokens":0,"prefill_ms":2793,"total_ms":3711,"finish_reason":"length","drafter":"ar","attempt_id":1}
+[feed] >> {"type":"commit","id":"g0-depth-256","attempt_id":1}
+[feed] << {"type":"aborted","id":"g0-depth-256","reason":"client_cancelled","attempt_id":1}
+[feed] terminal aborted: {'type': 'aborted', 'id': 'g0-depth-256', 'reason': 'client_cancelled', 'attempt_id': 1}
+[feed] DECODE_PHASE_END
+[feed] >> {"type":"unload"}
+[daemon-control] received commit for id=g0-depth-256 attempt_id=1
+[feed] << {"type":"done","id":"g0-depth-256","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":32,"prefill_ms":0,"decode_ms":0,"attempt_id":1}

@@ -7,6 +7,9 @@ pub struct QuantOverride {
     pub role: Role,
     /// Only meaningful for `Role::RoutedExperts`; empty ⇒ whole role at this layer.
     pub experts: Vec<u32>,
+    /// Optional exact tensor-name allowlist. Empty means the whole role (subject
+    /// to `experts`); non-empty narrows the override to these names only.
+    pub tensors: Vec<String>,
     pub tier: String,
 }
 
@@ -216,6 +219,37 @@ impl ReapPlan {
                         "reap: quant_override[{i}] lists experts but role is not routed_experts"
                     ));
                 }
+                let tensors: Vec<String> = if let Some(a) = o["tensors"].as_array() {
+                    let layer_tok = format!("layers.{layer}.");
+                    let global_role = matches!(role, Role::LmHead | Role::Embed);
+                    let mut seen = std::collections::HashSet::with_capacity(a.len());
+                    a.iter()
+                        .enumerate()
+                        .map(|(j, x)| {
+                            let name = x.as_str().ok_or_else(|| {
+                                format!("reap: quant_override[{i}] tensors[{j}] not a string")
+                            })?;
+                            if name.is_empty() {
+                                return Err(format!(
+                                    "reap: quant_override[{i}] tensors[{j}] is empty"
+                                ));
+                            }
+                            if !global_role && !name.contains(&layer_tok) {
+                                return Err(format!(
+                                    "reap: quant_override[{i}] tensor '{name}' does not belong to layer {layer}"
+                                ));
+                            }
+                            if !seen.insert(name) {
+                                return Err(format!(
+                                    "reap: quant_override[{i}] has duplicate tensor '{name}'"
+                                ));
+                            }
+                            Ok(name.to_string())
+                        })
+                        .collect::<Result<Vec<_>, String>>()?
+                } else {
+                    Vec::new()
+                };
                 let tier = o["tier"]
                     .as_str()
                     .ok_or_else(|| format!("reap: quant_override[{i}] missing tier"))?
@@ -224,6 +258,7 @@ impl ReapPlan {
                     layer,
                     role,
                     experts,
+                    tensors,
                     tier,
                 });
             }
@@ -253,28 +288,29 @@ impl ReapPlan {
         Self::load_legacy_keepmap(dir, num_layers_expected, orig_experts_expected)
     }
 
-    /// Resolve a REAP plan from the environment for an arch's config loader.
+    /// Resolve a REAP plan from the immutable process policy for an arch's
+    /// config loader.
     ///
     /// Reads `HIPFIRE_REAP_PLAN` (and `legacy_alias_env` if given — e.g. ds4's
     /// `HIPFIRE_DEEPSEEK4_REAP_KEEPMAP`). On a hit it rejects a dense
     /// (`orig_experts == 0`) checkpoint, loads the plan via [`Self::load_any`]
     /// validated against the ORIGINAL counts, logs the active prune, and returns
-    /// `Ok(Some(plan))`. No env var set ⇒ `Ok(None)` (no pruning). The caller
+    /// `Ok(Some(plan))`. No configured path means `Ok(None)` (no pruning). The caller
     /// then overrides its own routed-expert count field to `plan.kept_per_layer()`
     /// and stores the plan — that assignment differs per arch (`num_experts` /
     /// `n_routed_experts` / `num_local_experts`) so it stays at the call site.
     /// Consolidates the env-read + dense-guard + load + log boilerplate that was
     /// duplicated across the four arch loaders (review #10). `arch` names the
     /// caller in the error/log messages.
-    pub fn from_env(
+    pub fn from_config(
         arch: &str,
         legacy_alias_env: Option<&str>,
         num_layers: usize,
         orig_experts: usize,
     ) -> Result<Option<Self>, String> {
-        let dir = std::env::var("HIPFIRE_REAP_PLAN")
+        let dir = hipfire_config::developer_var("HIPFIRE_REAP_PLAN")
             .ok()
-            .or_else(|| legacy_alias_env.and_then(|e| std::env::var(e).ok()));
+            .or_else(|| legacy_alias_env.and_then(|name| hipfire_config::developer_var(name).ok()));
         let Some(dir) = dir else { return Ok(None) };
         // MoE-only feature: a dense (orig_experts == 0) checkpoint has no routed
         // experts to prune. Refuse rather than silently divide-by-zero / mislead.
@@ -417,13 +453,18 @@ mod tests {
         let d = write_plan(
             r#"{"original_experts":4,"num_layers":2,
                 "keep":{"per_layer":[[0,2,3],[1,2,3]]},
-                "quant_overrides":[{"layer":1,"role":"routed_experts","experts":[2],"tier":"mq3lloyd"}]}"#,
+                "quant_overrides":[{"layer":1,"role":"routed_experts","experts":[2],
+                "tensors":["layers.1.ffn.experts.2.w1.weight"],"tier":"mq3lloyd"}]}"#,
         );
         let p = ReapPlan::load(d.path().to_str().unwrap(), 2, 4).unwrap();
         assert_eq!(p.kept_per_layer(), 3);
         assert_eq!(p.keep.as_ref().unwrap()[0], vec![0, 2, 3]);
         assert_eq!(p.quant_overrides.len(), 1);
         assert_eq!(p.quant_overrides[0].tier, "mq3lloyd");
+        assert_eq!(
+            p.quant_overrides[0].tensors,
+            vec!["layers.1.ffn.experts.2.w1.weight"]
+        );
     }
 
     #[test]
@@ -458,6 +499,40 @@ mod tests {
         );
         let err = ReapPlan::load(d.path().to_str().unwrap(), 1, 4).unwrap_err();
         assert!(err.contains("not an integer"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_exact_tensor_from_wrong_layer() {
+        let d = write_plan(
+            r#"{"original_experts":4,"num_layers":2,
+                "quant_overrides":[{"layer":0,"role":"attention",
+                "tensors":["layers.1.attn.wq_b.weight"],"tier":"mfp4e8soa"}]}"#,
+        );
+        let err = ReapPlan::load(d.path().to_str().unwrap(), 2, 4).unwrap_err();
+        assert!(err.contains("does not belong to layer 0"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_duplicate_exact_tensor() {
+        let d = write_plan(
+            r#"{"original_experts":4,"num_layers":1,
+                "quant_overrides":[{"layer":0,"role":"attention",
+                "tensors":["layers.0.attn.wq_b.weight","layers.0.attn.wq_b.weight"],
+                "tier":"mfp4e8soa"}]}"#,
+        );
+        let err = ReapPlan::load(d.path().to_str().unwrap(), 1, 4).unwrap_err();
+        assert!(err.contains("duplicate tensor"), "got: {err}");
+    }
+
+    #[test]
+    fn global_head_allowlist_does_not_require_layer_token() {
+        let d = write_plan(
+            r#"{"original_experts":256,"num_layers":43,
+                "quant_overrides":[{"layer":0,"role":"lm_head",
+                "tensors":["head.weight"],"tier":"mfp4e8soa"}]}"#,
+        );
+        let plan = ReapPlan::load_unchecked(d.path().to_str().unwrap()).unwrap();
+        assert_eq!(plan.quant_overrides[0].tensors, ["head.weight"]);
     }
 
     #[test]

@@ -1,17 +1,18 @@
-#!/bin/bash
-# hipfire CLI wrapper — routes to Bun CLI
+#!/usr/bin/env bash
+# Repository/developer shim for the native Rust control plane.
+set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-HIPFIRE_DIR="$HOME/.hipfire"
+ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# Find the CLI
-CLI=""
-for candidate in "$SCRIPT_DIR/../cli/index.ts" "$HIPFIRE_DIR/cli/index.ts" "$(dirname "$SCRIPT_DIR")/cli/index.ts"; do
-    if [ -f "$candidate" ]; then CLI="$candidate"; break; fi
+for candidate in "$ROOT/target/release/hipfire" "$ROOT/target/debug/hipfire" "$HOME/.hipfire/bin/hipfire"; do
+    if [ -x "$candidate" ]; then
+        exec "$candidate" "$@"
+    fi
 done
 
-if [ -z "$CLI" ]; then
-    echo "hipfire CLI not found. Re-run the installer."
-    exit 1
+if command -v cargo >/dev/null 2>&1; then
+    exec cargo run --quiet --manifest-path "$ROOT/Cargo.toml" -p hipfire-cli -- "$@"
 fi
 
-exec bun run "$CLI" "$@"
+echo "hipfire: native CLI not built; run 'cargo build --release -p hipfire-cli'" >&2
+exit 127

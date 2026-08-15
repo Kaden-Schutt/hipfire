@@ -1,297 +1,303 @@
 # Tuning levers catalog
 
-The actual optimization patterns hipfire uses, with pointers to the
-commits where they landed (or were tried-and-reverted). Pick the one
-that matches the bottleneck you root-caused in `playbook.md` step 2.
+Patterns hipfire has used on real kernels. Pick **one** per commit after
+`playbook.md` root-cause. Paths are under `kernels/src/` unless noted.
+Commits are historical anchors — verify the hash exists in your checkout
+before citing externally.
 
-Rule of thumb: pick ONE lever per commit. Bundling makes bisect
-useless when the win turns out to be one of three changes and the
-other two are wash-or-regression.
+Perf numbers are **measured** snapshots, not floors or admissions. Protocol:
+[`docs/methodology/perf-benchmarking.md`](../../../docs/methodology/perf-benchmarking.md).
+Variant allowlisting:
+[`docs/methodology/perf-arch-discipline.md`](../../../docs/methodology/perf-arch-discipline.md).
 
-## 1. Wave-size port (CDNA3 ⇄ RDNA)
+## How to choose
 
-**When**: target arch is wave64 (CDNA1/2/3) and you're running a
-wave32 kernel — half the lanes are silently masked out, kernel
-correctness still works but throughput is halved or worse.
+| Diagnosed bottleneck | Start here |
+|---|---|
+| Wave32 kernel on wave64-native CDNA | §1 Wave-size port |
+| Decode launch-bound / low GB/s GEMV | §2 Multi-row GEMV |
+| Prefill GEMM K-loop overhead | §3 K-tile depth |
+| Prefill batch with idle matrix units | §4 WMMA / MFMA |
+| Decode L2 misses on gfx12 weights | §5 `s_prefetch_data` |
+| Multiple projections share `x` | §6 Fused projections |
+| One kernel wants special hipcc flags | §7 Per-kernel hipcc flags |
+| Large-M CDNA prefill | §8 rocBLAS / library GEMM |
+| Multi-wave WG, BW% ≪ peak, barrier in loop | §10 Barrier-free / nosync |
+| Already tried below | §9 Negative results — new mechanism only |
 
-**Reference commit**: `4105035` — "perf(cdna3): full wave64 port of
-all hot HFQ4 kernels — MI300X decode 48.6 → 96 tok/s". Ten HFQ4
-kernels ported to 2-rows-per-block wave64 layout. A3B decode jumped
-from 48.6 to 96 tok/s, matching 7900 XTX on the same model.
+---
 
-**Pattern**: separate `<name>.wave64.hip` file (or `.gfx942.hip`
-chip-specific) using wave-64 lane decomposition (32 M-rows × 2 K
-groups). Dispatch via the chip detection in `Gpu::init`.
+## 1. Wave-size port (CDNA ⇄ RDNA)
 
-**Don't try**: porting wave64 → wave32 for RDNA. RDNA is wave32
-native; the wave64 mode (when supported) costs occupancy and rarely
-helps inference.
+**When:** target is wave64-native (gfx94x / selected GCN) but the hot kernel
+is wave32 — half the lanes mask out; output can still be correct at ~½
+throughput.
+
+**Pattern:** separate `*.wave64.hip` (or chip `.gfx942.hip`) with wave64 lane
+decomposition; dispatch only via wave64-native capability, not as a perf
+tweak on RDNA.
+
+**Shipped anchor:** `4105035` — full wave64 port of hot HFQ4 kernels; MI300X
+decode roughly 2× on the measured A3B setup (`case-studies.md` §1).
+
+**Tree examples:** `fused_qkv_hfq4g256_wave64.hip`,
+`gemv_hfq4g256_residual` wave64 siblings, `moe_router_softmax_topk_k8_wave64.hip`.
+
+**Don't:** force wave64 mode on RDNA inference paths expecting free wins —
+occupancy cost usually dominates.
+
+---
 
 ## 2. Multi-row GEMV
 
-**When**: decode is launch-overhead-bound (kernel-launch count
-dominates per-token cost), not BW-bound. Profile shows low GB/s on
-GEMV kernels but high invocation count.
+**When:** decode is launch- or latency-bound on GEMV; profile shows modest
+GB/s and high invoke count. Share `x` across R output rows per warp.
 
-**Pattern**: process R output rows per warp instead of 1, sharing
-the `x` register state across rows. R=2 / R=4 / R=8 variants exist
-in the tree:
+**Pattern:** R=2/4/8 entry points; tune R per arch (VGPR budget).
+
+**Tree (verify before edit):**
 
 ```
 kernels/src/gemv_hfq4g256_multirow.hip
-kernels/src/gemv_hfq4g256_multirow.gfx1100.hip      # chip-tuned
+kernels/src/gemv_hfq4g256_multirow.gfx1100.hip
 kernels/src/gemv_hfq4g256_residual_multirow.gfx1100.hip
 ```
 
-**Trade-off**: more VGPR pressure. Past R=8 you spill on RDNA3 and
-the win disappears. Tuning is per-arch — gfx1100 likes R=4–8 for
-hot decode kernels; gfx1010 prefers R=2 because of the smaller VGPR
-budget.
+Dispatch maps multirow module names to `r2`/`r4`/`r8` symbols in
+`crates/rdna-compute` (see `gemv_hfq4g256_multirow_*` registration). Env
+knobs such as `HIPFIRE_GEMV_ROWS` may select R — confirm in current
+`feature_flags` / Atlas dispatch provenance before assuming defaults.
 
-**Reference**: existing `*_multirow*` kernels. Don't reinvent —
-fork the closest existing variant and adjust R.
+**Trade-off:** higher R → VGPR pressure → spills. Past comfortable R the win
+vanishes (often ≤8 on RDNA3 dGPU; tighter on smaller VGPR budgets).
+
+**Don't reinvent** — fork the closest existing multirow file.
+
+---
 
 ## 3. K-tile depth (K2 / K4 / K-split)
 
-**When**: WMMA-bound prefill kernel where the inner K-tile loop
-dominates wall-clock. Deeper unrolls amortize per-tile overhead but
-push register pressure.
+**When:** WMMA prefill GEMM inner K-loop dominates; deeper unroll amortizes
+tile setup until registers spill.
 
-**Pattern**: K2 (process 2 K-tiles per loop body, soft-pipelined
-via early load + lagged WMMA) is the canonical baseline. K4 has
-more software pipelining headroom. K-split is for when K isn't a
-multiple of the tile depth.
+**Pattern:** K2 soft-pipeline is the common baseline; K4 / ksplit are
+opt-in or shape-selected variants.
 
-**Reference (positive)**: `gemm_hfq4g256_residual_wmma_k2.hip` is
-the deployed baseline across all dominant prefill GEMMs
-(`gemm_gate_up_hfq4g256_wmma`, `gemm_qkv_hfq4g256_wmma`,
-`gemm_qkvza_hfq4g256_wmma`, residual). The K2 step is fully shipped.
+**Tree examples:**
 
-**K4 step status**: `gemm_hfq4g256_residual_wmma_k4.hip` had a
-swapped-output-mapping investigation (case-studies §8). After fix, K4
-ties K2 byte-for-byte at m=4096 on 9B residual but loses to ksplit by
-~33% per-call at small batch (CU-starved grid: 3.3 vs 13 blocks/CU under
-K4's `__launch_bounds__(32, 1)`). Verify the current dispatch policy
-before using K4, and do not cite an exact historical hash unless it exists
-in the checkout you are reporting from.
+```
+kernels/src/gemm_hfq4g256_residual_wmma.hip          # baseline family
+kernels/src/gemm_gate_up_hfq4g256_wmma_k4.hip        # HIPFIRE_GATE_UP_VARIANT=k4
+kernels/src/gemm_hfq4g256_residual_wmma_ksplit_det.hip
+```
 
-**Reference (NEGATIVE — null result, important to know)**: commit
-`f670e16` — "experiment(gemm): k2x32 wider-row lm_head — null
-result". 32-row block × K2 unroll measured 46% **slower** at
-M=248320. Hypothesis: doubled accumulator + 4× dequant live ranges
-push past comfortable register budget, forcing spills. Lesson:
-register pressure is the gating constraint past a certain point;
-more parallel work doesn't help when you can't pipeline it.
+**Positive:** residual/gate_up/qkv HFQ4 WMMA K2 paths are production workhorses.
+
+**Null result anchor:** `f670e16` — k2x32 wider-row lm_head **slower** from
+register pressure (`case-studies.md` §3). Revisit only with an LDS/B-share
+plan and a fresh ISA budget.
+
+**Policy:** K-split / K4 selection must be measured per arch class — do not
+key off a broad `is_rdna3p5()` without a ledger-style note
+(`perf-arch-discipline.md`).
+
+---
 
 ## 4. WMMA / MFMA matrix engine
 
-**When**: prefill GEMM (batch_size > 1) on an arch with a matrix
-engine. Hipfire dispatches WMMA on gfx11/gfx12 and MFMA on gfx94x;
-non-WMMA archs (gfx1010, gfx1030) fall through to the dot2 / scalar
-path.
+**When:** prefill (batch ≫ 1) on an arch with matrix engines. Hipfire uses
+WMMA on gfx11/gfx12 and MFMA on gfx94x; adjacent fallbacks are
+**packed-FP16** (e.g. gfx1010/gfx1013 HFQ4 batched QKV/gate-up) and **dot2**
+(gfx1030-class), with **scalar** only as the final kernel-family-dependent
+baseline.
 
-**Pattern**: 16×16×16 fp16→fp32 tile is the workhorse. The actual
-builtin name + operand layout differs per arch family — see
-`.agents/skills/hipfire-arch-port/wmma-matrix.md` if you're porting to a
-new arch.
+**Pattern:** 16×16×16 fp16→fp32 tiles are common; **builtin name and C-mapping
+differ by family**. gfx12 needs `_w32_gfx12` sisters — gfx11 builtins do not
+lower (`has_wmma_w32` vs `has_wmma_w32_gfx12` in `arch_caps.rs`).
 
-**Reference (positive)**: PR #56 — gfx12 WMMA port, channel-tested
-on R9700, all 6 hot fused-projection kernels covered.
+**Tree examples:**
 
-**Reference (silent-corruption cautionary tale)**: commit `b7ac66a`
-— gfx11 C-mapping (`acc[j] = C[2*j + (tid>>4)][tid & 15]`) was
-silently wrong for ~6 weeks. WMMA passed every functional test that
-didn't compare element-by-element against a CPU reference. Lesson:
-**channel-test is non-negotiable** for any WMMA / MFMA work.
+```
+kernels/src/gemm_gate_up_hfq4g256_wmma.hip
+kernels/src/gemm_gate_up_hfq4g256_wmma.gfx12.hip
+kernels/src/gemm_qkv_hfq4g256_wmma*.hip
+kernels/src/gemm_hfq4g256_moe_grouped_wmma.gfx12.hip
+```
+
+**Port skill:** new ISA shapes → `.agents/skills/hipfire-arch-port/`, not this
+catalog alone.
+
+**Correctness:** channel-test element-wise vs reference is mandatory. The
+gfx11 WMMA C-mapping bug was **fixed in `b7ac66a`** after ~6 weeks latent;
+speed/serve-shaped checks had stayed green (`case-studies.md` §4).
+
+---
 
 ## 5. Software prefetch (`s_prefetch_data`)
 
-**When**: hot decode kernel that re-reads weights every token; the
-profiler shows L2 misses dominating decode latency. Available on
-gfx12 (RDNA4) only.
+**When:** hot decode weight streaming on **gfx12 / RDNA4**; L2 miss dominated.
 
-**Reference**: `kernels/src/gemv_hfq4g256.gfx1201.hip` — uses
-`s_prefetch_data` for 2-group lookahead (~272 bytes). Comment in
-the kernel header explains: "RDNA4 allows 96 VGPRs at max 16-wave
-occupancy" — bigger budget there enables more aggressive prefetch.
+**Pattern:** chip or family override using RDNA4 prefetch intrinsic.
 
-**Pattern**: chip-specific override. `<name>.gfx1201.hip` covers
-9070 XT only; if you want 9070 XT + R9700 (also gfx1201), the family
-tag `<name>.gfx12.hip` covers both. See `cross-arch.md`.
+**Tree:**
 
-**Don't try**: porting `s_prefetch_data` to gfx11. The RDNA3
-intrinsic doesn't expose the same prefetch primitive.
+```
+kernels/src/gemv_hfq4g256.gfx1201.hip
+```
 
-## 6. Fused projections (multi-output kernels)
+Header comments document VGPR/occupancy trade for lookahead groups. Prefer
+`.gfx1201.hip` for 9070-class chip tuning; `.gfx12.hip` when the same binary
+must cover gfx1200+gfx1201 without chip splits (`cross-arch.md` resolution
+order).
 
-**When**: multiple GEMM/GEMV calls share an input vector (Q, K, V
-all read the same x; gate + up share the same x). Each separate
-launch eats kernel-launch overhead; fusing into one kernel lets you
-load x once and write multiple Y outputs.
+**Don't:** expect the same intrinsic on gfx11.
 
-**Pattern**: kernels named `gemm_qkv_*` (3-way fused QKV),
-`gemm_qkvza_*` (4-way for DeltaNet), `gemm_gate_up_*` (2-way for
-SwiGLU FFN). Each takes multiple A weight buffers + multiple Y
-output buffers in one launch.
+---
 
-**Reference (positive)**: `9d05c9f` — "perf(fused-projection):
-consolidate gfx1100 + baseline kernels into one cross-arch family".
-The fused QKV path is one of the main reasons hipfire's decode
-beats llama.cpp's by 1.7–2.1× on small models — llama.cpp does 3
-separate GEMV launches per layer; hipfire does 1.
+## 6. Fused projections
 
-**Caveat**: fused kernels are bigger (more VGPRs). On VRAM-tight
-arches (gfx1010, gfx1013, gfx1032) they sometimes lose to the
-unfused path because of occupancy. Fall back via the dispatch tree
-when this matters.
+**When:** Q/K/V (and DeltaNet z/β/α) or gate+up share one `x`; separate
+launches dominate small-M decode.
 
-## 7. Per-kernel hipcc flags (magic comments)
+**Pattern:** multi-output kernels — `fused_qkv_*`, `fused_qkvza_*`,
+`gemm_gate_up_*`, `fused_gate_up_*`.
 
-**When**: a single kernel benefits from non-default compiler flags
-(`-mcumode`, `-fno-unroll-loops`, custom `-ffast-math`-style, etc.)
-that you don't want to apply globally.
+**Anchor:** fused QKV consolidation work (e.g. `9d05c9f` family) is a major
+reason decode can beat unfused baselines on small models — one weight pass,
+multiple Y buffers.
 
-**Reference**: `5f65005` — "feat(compile): per-kernel hipcc flag
-magic-comment plumbing + bisect helpers". The kernel JIT picks up
-`// HIPCC_FLAGS: -foo -bar` magic comments at the top of the .hip
-file and adds them to that kernel's compile invocation only.
+**Trade-off:** larger live ranges; on VRAM/occupancy-tight chips the unfused
+path can win. Keep fall-through in dispatch.
 
-**Pattern**: add the magic comment, rebuild kernel hashes
-(`./scripts/write-kernel-hashes.sh`), validate via the three gates.
-Per-kernel flags don't propagate to other kernels in the tree, so
-this is the safe way to experiment without globally affecting
-compilation.
+---
 
-## 8. rocBLAS / cuBLAS-class GEMM fallback
+## 7. Per-kernel hipcc flags
 
-**When**: prefill GEMM on a CDNA3 arch (gfx94x). The MFMA path
-through rocBLAS can outpace hipfire's hand-rolled MFMA at very
-large M.
+**When:** one kernel wants non-default compile flags without global `-Xclang`
+risk.
 
-**Reference**: `07a2b1c` and friends — "feat(rocblas): wire CDNA3
-MFMA path into gemm_hfq4g256 + gate_up". `HIPFIRE_ROCBLAS_OFF=1`
-kill-switch (`1316f8e`) for A/B benching;
-`HIPFIRE_ROCBLAS_ALL_ARCHS=1` opens the path to RDNA3 (`05d104d`).
+**Pattern:** magic comment picked up by the kernel JIT, e.g.
+`// HIPFIRE_COMPILER_FLAGS: ...` at top of the `.hip` file (plumbing anchor `5f65005`).
+Rebuild kernel hashes if your tree still uses
+`scripts/write-kernel-hashes.sh` for the path you touched.
 
-**Caveat**: rocBLAS dispatch is per-arch. Don't enable on RDNA
-unless you've measured a win on YOUR arch — the default off for
-RDNA is an empirical decision.
+Validate with the claim-scoped correctness route + fresh-process measure —
+flags can change numerics under fast-math-like options.
 
-## 9. Things to NOT try (negative results documented)
+---
 
-These failed in past experiments. Don't burn cycles re-running
-unless you have a NEW idea about why this time would be different.
+## 8. rocBLAS / library GEMM fallback
 
-### `nontemporal` weight loads on gfx1100
+**When:** very large-M prefill on CDNA3 where library MFMA beats hand-rolled
+paths.
 
-Commit `34eb024` (revert of `0532579`). Original commit claimed
-+2% based on within-session A/B. Bisect against the committed
-baseline showed actual −13% on 9B MQ4 decode. Hypothesis: bypassing
-cache-line allocation also defeats wave-level coalescing on RDNA3.
-Don't re-try without a different mechanism for cache control.
+**Pattern:** optional rocBLAS route behind env kill-switches (historically
+`HIPFIRE_ROCBLAS_OFF`, `HIPFIRE_ROCBLAS_ALL_ARCHS` — confirm names in
+`docs/env-vars.md` / `feature_flags` before teaching defaults).
 
-### k2x32 wider-row variant
+**Default posture:** measured enablement per arch; do not broad-enable on
+RDNA because CDNA won.
 
-Commit `f670e16` — null result, kept the kernel for future revisit.
-46% slower on 27B M=248320 lm_head due to register-pressure spills.
-If you want to retry, lead with an LDS-staged B-share + manual
-register budget plan.
+---
+
+## 9. Negative results (do not re-burn casually)
+
+### Nontemporal weight loads on gfx1100
+
+- Candidate `0532579` claimed small within-session gain; revert `34eb024`
+  showed large decode regression vs clean baseline.
+- Mechanism guess: nontemporal broke beneficial coalescing/cache behavior.
+- **Revisit only** with a different cache-control mechanism + fresh-process
+  proof.
+
+### k2x32 wider-row lm_head
+
+- `f670e16` — large slowdown from register pressure at huge M.
+- Kept as experiment/opt-in history; not an auto path.
 
 ### Always-on hipGraph capture
 
-Commits `33b8861` / `5705a59` / `0180b68` / `688b4fd` — series of
-fixes to make hipGraph capture safe. Default-on hipGraph caused
-silent garbage output (dangling stack-pointer kernargs from raw
-`launch_kernel` calls in `forward_scratch_layers`). Now opt-in via
-`HIPFIRE_GRAPH=1` only, and even then perf-neutral or slightly
-worse on most archs. Don't make it default-on without a thorough
-correctness pass.
+- Series (`33b8861` / `5705a59` / …): default-on capture produced garbage
+  from dangling kernargs in some forward paths.
+- Opt-in only (`HIPFIRE_GRAPH`-class flags); not a free decode win.
 
-### LDS-staged X share on gate_up (gfx1100)
+### LDS-staged X on gate_up (ldsx)
 
-Historical branch note: variant kernel `gemm_gate_up_hfq4g256_wmma_ldsx.hip`
-opt-in via `HIPFIRE_GATE_UP_VARIANT=ldsx`, default off. ISA-clean (75 VGPRs vs
-80 baseline, single-wave block makes `__syncthreads()` a no-op so
-the compiler kept weight prefetch above the LDS-write phase) but
-**per-call wall regressed +20% / +29% / +37% at pp32 / pp128 /
-pp512 on Qwen 3.5 9B**. Replaced the baseline's 2 VMEM stalls per
-inner-iteration with 3 VMEM + 2 LGKM stalls — the new stalls
-weren't hidden by wave-level ILP the way the original `vmcnt(0)`
-was. See case-studies §7 for the full diagnosis. Don't re-try
-without (a) a fundamentally different LDS layout that doesn't
-serialize through register, or (b) on RDNA4 (gfx12), where
-`s_prefetch_data` may change the calculus.
+- `gemm_gate_up_hfq4g256_wmma_ldsx.hip`, opt-in `HIPFIRE_GATE_UP_VARIANT=ldsx`.
+- ISA looked cleaner; wall-clock prefill **regressed** on measured gfx1100
+  shapes (`case-studies.md` §7).
+- Revisit only with a different LDS role (e.g. weights not X) or on archs
+  with different prefetch (gfx12).
 
-## 10. Barrier-free syncthreads elimination (LDS → direct global)
+### Capability-inherited perf variants
 
-**When**: a kernel inside a loop does cooperative LDS staging (all
-warps load data into LDS, then `__syncthreads()`, then each warp
-reads from LDS, then `__syncthreads()` to release). Profiling shows
-low BW utilization (<10% of peak) — meaning the redundant global
-reads from independent per-warp loads are cheaper than the barrier
-serialization.
+- Not a kernel micro-opt — a **dispatch** anti-pattern.
+- `ldscoop` measured best on gfx115x, then selected via `is_rdna3()` and
+  harmed gfx1100 (~14% DFlash class regression; fix narrative `24e4baa9`).
+- Rule: capability ≠ perf allowlist. See `perf-arch-discipline.md`.
 
-**Pattern**: remove the LDS buffer and both `__syncthreads()` calls.
-Each warp loads its data directly from global memory on demand. For
-X/activation staging (each warp needs all 16 slots), each warp reads
-all 16 from global — 4× redundant. For weight staging (each warp
-needs its own subset), no redundancy.
+### MoE grouped dead ends (campaign-specific)
 
-**Reference commits**:
-- `7e0ac9b9` — "perf(deepseek4): barrier-free MoE grouped WMMA
-  kernel (+39-43%)". LDS X-staging removed from 4-warp MQ2-Lloyd
-  grouped WMMA. +25% occupancy from VGPR optimization produced 0%
-  gain — the real win was removing the barriers.
-- `7d51a401` — "perf: barrier-free gate_up + MoE grouped WMMA
-  kernels". Repeats the pattern on the HFQ4 `gemm_gate_up_hfq4g256
-  _wmma_ldscoop` kernel: +53%.
+- Indexed `_k8` GEMV decode paths and some `m2` / `i8` grouped variants have
+  been **falsified or negative** on specific campaigns (e.g. LFM/Qwen MoE
+  prefill notes). Before retrying, read the owning plan/ledger and current
+  `run_moe_prefill` Path-2 grouped WMMA substrate — do not resurrect from
+  memory.
 
-**Prerequisites**:
-1. Kernel BW utilization < 15% of peak (check per-kernel timer in
-   profile output: `total_MiB / total_us` vs arch peak).
-2. The LDS data is either per‑lane‑partitioned (each lane reads one
-   element from the LDS share — zero redundancy cost) or shared only
-   within a warp (all lanes in a warp read the same element — 1/4 ×
-   number_of_warps redundancy).
-3. The `__syncthreads()` is inside a loop, not a one-time phase
-   barrier.
+---
 
-**Don't try**: on kernels where the LDS share is genuinely
-cross-warp (e.g. DFlash attention V page). That requires a
-fundamentally different algorithm (per-wave V buffering) to
-eliminate barriers.
+## 10. Barrier-free / nosync (LDS → direct global)
 
-**Anti-pattern**: "barriers are free on single-wave blocks." A
-1-wave kernel's `__syncthreads()` is a compiler fence, not a HW
-barrier — it doesn't stall. The optimization only applies to
-multi-wave workgroups (128 threads/4 waves in hipfire's canonical
-layout). Don't add nosync variants for 1-wave kernels.
+**When:** multi-wave workgroup stages through LDS + `__syncthreads()` inside
+a loop, yet effective BW% is low — barriers serialize more than redundant
+global loads cost.
 
-**Completed implementations** (all with `_nosync.hip` variant created,
-build-verified, correctness-tested):
+**Pattern:** remove shared LDS stage and both barriers; each warp loads from
+global. Accept redundant reads when they are cheaper than barrier rounds.
 
-| Kernel | Status | Production-active? |
-|--------|--------|-------------------|
-| `gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload` | **+43% measured** (PR #356) | ✅ DeepSeek V4 MoE |
-| `gemm_gate_up_hfq4g256_wmma_ldscoop` | **+53% measured** (PR #359) | ✅ HFQ4 gate_up |
-| `gemm_gate_up_hfq4g256_wmma_mmq.gfx1151` | nosync created, build OK | ❌ Not wired yet |
-| `gemm_gate_up_hfq4g256_wmma_mmq_k4.gfx1151` | nosync created, build OK | ❌ Not wired yet |
-| `gemm_gate_up_mq4g256_lloyd_wmma` | nosync created, tested | ❌ Not wired yet |
-| `gemm_gate_up_mq4g256_lloyd_wmma_mb4` | nosync created, tested | ❌ Not wired yet |
-| `gemm_gate_up_mq4g256_lloyd_wmma.gfx1151` | nosync created, tested | ❌ Not wired yet |
-| `gemm_gate_up_mq4g256_lloyd_wmma_mb4.gfx1151` | nosync created, tested | ❌ Not wired yet |
-| `gemm_gate_up_mq3g256_lloyd_wmma` | nosync created, tested | ❌ Not wired yet |
-| `gemm_gate_up_mq3g256_lloyd_wmma_mb4` | nosync created, tested | ❌ Not wired yet |
-| `gemm_q8_0_wmma_4w` | nosync wired, `HIPFIRE_Q8_NOSYNC=1` | ✅ Q8_0 path |
+**Shipped-style anchors (verify wiring in your tree):**
 
-The unwired kernels pass the `test_gemm_fused_mq4g256_lloyd_wmma` 
-correctness test but aren't linked from the arch forward pass
-(`qwen35.rs`). When they get productionized, the `_nosync` variants
-are ready and the `HIPFIRE_GATE_UP_NOSYNC=1` env var gates them.
+| Kernel stem | Notes |
+|---|---|
+| `gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload_nosync` | Grouped MoE barrier-free work |
+| `gemm_gate_up_hfq4g256_wmma_ldscoop_nosync` | HFQ4 gate_up nosync sister |
+| `gemm_gate_up_mq4g256_lloyd_wmma*_nosync` | Lloyd MQ4 family; some gfx1151 tags |
+| `gemm_gate_up_mq3g256_lloyd_wmma*_nosync` | Lloyd MQ3 family |
 
-## When you're done
+Env gates seen in tree: `HIPFIRE_GATE_UP_NOSYNC`, variant selectors under
+`HIPFIRE_GATE_UP_VARIANT`. **Unwired** nosync files may pass channel tests
+without production dispatch — check forward/gemm call sites before claiming
+product impact.
 
-Commit your win (or your null-result revert) with the commit-message
-template from `playbook.md` step 6. The next contributor reading the
-git log saves the same hours you spent — that's the durable value
-of this kind of writeup.
+**Prerequisites:**
+
+1. Low BW utilization relative to arch peak on the hot kernel.
+2. LDS data is per-warp or redundant-cheap — not true cross-warp shares
+   that need a different algorithm (e.g. some attention V pages).
+3. Barrier is **inside** a loop, not a one-shot phase fence.
+
+**Anti-pattern:** "barriers are free on single-wave blocks." A 1-wave
+`__syncthreads` is largely a compiler fence; nosync variants there do not
+apply the multi-wave lesson.
+
+---
+
+## Variant selection checklist (all levers)
+
+Before enabling a sub-variant on an arch:
+
+1. **Capability legal?** (`arch_caps` / ISA builtin exists)
+2. **Measured on this arch atom or class?** If no → portable default only.
+3. **Env kill-switch** for A/B when landing experimental paths.
+4. **Atlas or rocprof proof** the intended symbol runs in the timed arm.
+5. **Rejection log** if it loses — update this section or the commit body.
+
+---
+
+## After the lever
+
+Return to `playbook.md` steps 5–9: claim-scoped correctness, fresh-process
+measure, adjacent-arch story, promote or reject with hashes. Use Kernel Atlas
+`suggest` / `task` / `eval` when you want structured experiment ledgers
+([`docs/methodology/kernel-atlas.md`](../../../docs/methodology/kernel-atlas.md)) —
+suggestions are queues, not predicted wins.

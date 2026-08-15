@@ -1,0 +1,41 @@
+# cargo-deny policy for the resolved Hipfire workspace dependency graph.
+# Keep the allowlist narrow: every added license or source should be reviewed.
+
+[graph]
+all-features = true
+
+[advisories]
+yanked = "deny"
+unmaintained = "workspace"
+unsound = "workspace"
+
+[licenses]
+confidence-threshold = 0.8
+allow = [
+    "Apache-2.0",
+    # subtle 2.6.1, reached via rustls 0.23. Permissive, OSI-approved,
+    # Apache-2.0-compatible; notice-retention only, no source obligation.
+    "BSD-3-Clause",
+    # webpki-roots 1.0.7, reached via ureq 3.3 -> hipfire-cli. Permissive
+    # data-set license covering the bundled Mozilla CA root store.
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+[bans]
+multiple-versions = "warn"
+# Hipfire's workspace crates intentionally use versionless sibling path
+# dependencies. Registry and git provenance is enforced separately below.
+wildcards = "allow"
+highlight = "all"
+skip = [
+    { name = "hashbrown", version = "=0.16.1", reason = "safetensors 0.8 and ratatui 0.30 currently resolve adjacent hashbrown releases" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

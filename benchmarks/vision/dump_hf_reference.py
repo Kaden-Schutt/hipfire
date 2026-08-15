@@ -24,33 +24,23 @@ from pathlib import Path
 import numpy as np
 import torch
 from PIL import Image
-from transformers import AutoProcessor, AutoModelForImageTextToText
+from transformers import AutoModelForImageTextToText, Qwen2VLImageProcessor
 
 
-HF_MODEL_PATH = "Qwen/Qwen3.5-0.8B"  # cached at ~/.cache/huggingface/hub
+HF_MODEL_PATH = "Qwen/Qwen3.5-0.8B"  # override with --model for fine-tunes
 
 
-def dump_one(image_path: Path, out_dir: Path, model, processor, device: str):
+def dump_one(image_path: Path, out_dir: Path, model, processor, device: str, model_path: str):
     out_dir.mkdir(parents=True, exist_ok=True)
 
     image = Image.open(image_path).convert("RGB")
     print(f"  image: {image.size} ({image.width}x{image.height})")
 
-    # Use the same prompt-shape the daemon uses (single-turn user msg + image).
-    messages = [{
-        "role": "user",
-        "content": [
-            {"type": "image", "image": image},
-            {"type": "text", "text": "Describe this image."},
-        ],
-    }]
-    inputs = processor.apply_chat_template(
-        messages,
-        tokenize=True,
-        add_generation_prompt=True,
-        return_dict=True,
-        return_tensors="pt",
-    ).to(device)
+    # Vision-only reference: bypass AutoProcessor's video component so this
+    # diagnostic does not require torchvision. The slow Qwen2-VL image
+    # processor implements the same patch extraction contract.
+    inputs = processor(images=[image], return_tensors="pt")
+    inputs = {key: value.to(device) for key, value in inputs.items()}
 
     pixel_values = inputs["pixel_values"]
     grid_thw = inputs["image_grid_thw"]
@@ -96,6 +86,14 @@ def dump_one(image_path: Path, out_dir: Path, model, processor, device: str):
             image_features = out
         print(f"  image_features: shape={tuple(image_features.shape)} dtype={image_features.dtype}")
 
+        # This addition happens between patch_embed and block 0. It is not a
+        # module, so derive it explicitly for a direct Hipfire stage diff.
+        pos_embed = visual.fast_pos_embed_interpolate(grid_thw)
+        captured["post_pos_embed"] = (
+            torch.from_numpy(captured["patch_embed"]).to(pos_embed)
+            + pos_embed
+        ).cpu().float().numpy()
+
     for h in handles:
         h.remove()
 
@@ -123,7 +121,7 @@ def dump_one(image_path: Path, out_dir: Path, model, processor, device: str):
         "pixel_values_shape": list(pixel_values.shape),
         "grid_thw": grid_thw.tolist(),
         "image_features_shape": list(image_features.shape),
-        "model": HF_MODEL_PATH,
+        "model": model_path,
         "captured_keys": sorted(captured.keys()),
     }
     (out_dir / "meta.json").write_text(json.dumps(meta, indent=2))
@@ -134,14 +132,22 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("images", nargs="+", help="image paths")
     ap.add_argument("--out", default="hf-ref", help="output directory root")
+    ap.add_argument("--model", default=HF_MODEL_PATH, help="HF model id or local checkpoint")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument(
+        "--dtype",
+        choices=("float32", "float16", "bfloat16"),
+        default="bfloat16",
+        help="reference compute dtype",
+    )
     args = ap.parse_args()
 
-    print(f"loading {HF_MODEL_PATH} on {args.device}...")
-    processor = AutoProcessor.from_pretrained(HF_MODEL_PATH)
+    dtype = getattr(torch, args.dtype)
+    print(f"loading {args.model} on {args.device} ({args.dtype})...")
+    processor = Qwen2VLImageProcessor.from_pretrained(args.model)
     model = AutoModelForImageTextToText.from_pretrained(
-        HF_MODEL_PATH,
-        dtype=torch.bfloat16,
+        args.model,
+        dtype=dtype,
         device_map=args.device,
     )
     model.eval()
@@ -152,7 +158,14 @@ def main():
     for img_path in args.images:
         img_path = Path(img_path)
         print(f"\n== {img_path.name} ==")
-        dump_one(img_path, out_root / img_path.stem, model, processor, args.device)
+        dump_one(
+            img_path,
+            out_root / img_path.stem,
+            model,
+            processor,
+            args.device,
+            args.model,
+        )
 
     print(f"\nDone. Dumps at: {out_root.absolute()}")
 

@@ -1,0 +1,306 @@
+{
+  "schema_version": 1,
+  "description": "BenchLocal nine-pack campaign manifest. Every field is reconstructed from the preserved 2026-07-31 campaign provenance; see docs/methodology/benchlocal-campaign.md for the evidence trail. Consumed by scripts/benchlocal_campaign.py and scripts/benchlocal_score.py.",
+
+  "provenance": {
+    "nas_archive": "/mnt/nas/kaden/hipfire/benchlocal/2026-07-31-quality/",
+    "campaigns": {
+      "baseline": {
+        "campaign_id": "benchlocal-full-20260731T091750Z",
+        "thinking": "disabled",
+        "local_root": "/home/kaden/.cache/benchlocal-full-20260731T091750Z",
+        "remote_root": "/home/kaden/benchlocal-full-20260731T091750Z",
+        "summary_file": "full-battery-summary.json",
+        "summary_sha256": "b47890257e39678d71156ed9e49f0e4b7b6df4483a858c72e6c07be85b72eaef"
+      },
+      "medium": {
+        "campaign_id": "benchlocal-medium-20260731T194729Z",
+        "thinking": "medium",
+        "local_root": "/home/kaden/.cache/benchlocal-medium-20260731T194729Z",
+        "remote_root": "/home/kaden/benchlocal-medium-20260731T194729Z",
+        "summary_file": "full-battery-medium-summary.json",
+        "summary_sha256": "46c2a94ec88970d7ac5e9eafe14b0a1649e70451ac882805711aad533cc67f49"
+      }
+    },
+    "engine": {
+      "serve_host": "hiptrx",
+      "hipfire_md5": "2638db7b487a43745c55fb39c345534e",
+      "daemon_md5": "e4af3aa26e79aa07a45fe696104dbf50",
+      "note": "Four concurrent daemons, one per GPU, each with an isolated HOME (homes/gpu0..gpu3). The medium campaign reused the baseline campaign's immutable binaries."
+    },
+    "sampling_proxy_sha256": {
+      "baseline": "578f2be2b530ad4fb7ed76459ff76ba81c538376ee296af26369cf2af72099a2",
+      "medium": "8a221d7c3ad11abc66302876d5c0d0ebf441d36c4d71d1b055009e4bc1af4c3d",
+      "pre_thinkfix": "b87fb8658860d6fe971ae2c9a5b750e304278411c1edc100bc510906ab1b918f"
+    }
+  },
+
+  "sampling": {
+    "base": {
+      "temperature": 1.0,
+      "top_p": 0.95,
+      "top_k": 20,
+      "min_p": 0.0,
+      "repetition_penalty": 1.0
+    },
+    "presence_penalty_by_family": {
+      "qwen27": 0.0,
+      "a3b": 1.5
+    },
+    "presence_penalty_note": "qwen27 direct pack runners omit presence_penalty (server default 0); the Hermes proxy forces 0.0. a3b routes get 1.5 injected by the proxy on every request.",
+    "thinking_variants": {
+      "disabled": { "enable_thinking": false },
+      "medium": { "enable_thinking": true, "reasoning_effort": "medium", "max_think_tokens": 1024 }
+    },
+    "request_timeout_seconds": 300
+  },
+
+  "topology": {
+    "serve_port_base": 12180,
+    "proxy_port_base": 12280,
+    "proxy_listen_host": "0.0.0.0",
+    "docker_bridge_host": "172.17.0.1",
+    "port_rule": "serve_port = serve_port_base + route.gpu; proxy_port = serve_port + 100. Containerised packs reach host endpoints via docker_bridge_host on the same port.",
+    "smoke": {
+      "max_tokens": 1152,
+      "prompt_expectation": "finish_reason=stop, answer 42",
+      "note": "A 96-token smoke cap exposes open think spans on reasoning routes and must not be used as a health gate."
+    }
+  },
+
+  "routes": [
+    {
+      "slug": "qwen27-ar",
+      "display_name": "Qwen3.6-27B AR",
+      "family": "qwen27",
+      "gpu": 0,
+      "model_path": "/home/kaden/.hipfire/models/qwen3-27b-3.6.mq4-awq.remote-mi300x",
+      "model_sha256": "86a5f80fd29d545abb1093dead242725ced6d68b8607c6d566d897b1a82442dc",
+      "mode": { "kv": "q8", "dflash": "off", "mtp": "off" },
+      "proxy_scope": "hermes-only",
+      "endpoints": {
+        "serve_port": 12180,
+        "proxy_port": 12280,
+        "non_hermes_base": "http://127.0.0.1:12180",
+        "hermes_docker_base": "http://172.17.0.1:12280/v1",
+        "cli40_docker_base": "http://172.17.0.1:13180/v1"
+      },
+      "evidence": "results/qwen27-ar/qwen27-ar.runner-commands.json"
+    },
+    {
+      "slug": "qwen27-dflash",
+      "display_name": "Qwen3.6-27B DFlash",
+      "family": "qwen27",
+      "gpu": 1,
+      "model_path": "/home/kaden/.hipfire/models/qwen3-27b-3.6.mq4-awq.remote-mi300x",
+      "model_sha256": "86a5f80fd29d545abb1093dead242725ced6d68b8607c6d566d897b1a82442dc",
+      "mode": { "kv": "q8", "dflash": "on", "dflash_ctx_cap": 0, "mtp": "off" },
+      "proxy_scope": "hermes-only",
+      "endpoints": {
+        "serve_port": 12181,
+        "proxy_port": 12281,
+        "non_hermes_base": "http://127.0.0.1:12181",
+        "hermes_docker_base": "http://172.17.0.1:12281/v1",
+        "cli40_docker_base": "http://172.17.0.1:12181/v1"
+      },
+      "evidence": "results/qwen27-dflash/qwen27-dflash.runner-commands.json"
+    },
+    {
+      "slug": "a3b-mq4r",
+      "display_name": "Qwen3.6-35B-A3B MQ4R",
+      "family": "a3b",
+      "gpu": 2,
+      "model_path": "/home/kaden/.hipfire/models/qwen3.6-35b-a3b.mq4r",
+      "model_sha256": "4685c140c46b1a6f31a0fd9053bf09d5faf1d2529d715b84794249b66cde0428",
+      "mode": { "kv": "q8", "mtp": "off" },
+      "proxy_scope": "all",
+      "endpoints": {
+        "serve_port": 12182,
+        "proxy_port": 12282,
+        "non_hermes_base": "http://127.0.0.1:12282",
+        "hermes_docker_base": "http://172.17.0.1:12282/v1",
+        "cli40_docker_base": "http://172.17.0.1:12282/v1"
+      },
+      "evidence": "results/a3b-mq4r/sampling-attestations.jsonl"
+    },
+    {
+      "slug": "a3b-mq4p",
+      "display_name": "Qwen3.6-35B-A3B MQ4P",
+      "family": "a3b",
+      "gpu": 3,
+      "model_path": "/home/kaden/.hipfire/models/qwen3.6-35b-a3b.mq4p",
+      "model_sha256": "8eb3be6912aa9db2dcc89c3233b05ccdfe81a84a8d6ef43202f2098d7f2fc78f",
+      "model_sha256_note": "The baseline summary recorded only 63 hex characters for this artifact. Repaired 2026-08-02 by re-hashing the local copy: the archive had dropped the trailing 'f'. The sibling a3b-mq4r hash matched byte-for-byte, confirming the local copies are the artifacts the campaign served.",
+      "mode": { "kv": "q8", "mtp": "off" },
+      "proxy_scope": "all",
+      "endpoints": {
+        "serve_port": 12183,
+        "proxy_port": 12283,
+        "non_hermes_base": "http://127.0.0.1:12283",
+        "hermes_docker_base": "http://172.17.0.1:12283/v1",
+        "cli40_docker_base": "http://172.17.0.1:12283/v1"
+      },
+      "evidence": "results/a3b-mq4p/hermesagent-20-provenance.json"
+    }
+  ],
+
+  "packs": [
+    {
+      "id": "dataextract-15",
+      "dir": "DataExtract-15",
+      "repo": "https://github.com/stevibe/DataExtract-15.git",
+      "revision": "00d90bf7506a1d7ffe98943d9ffd8c6eb795dbdb",
+      "version": "1.0.0",
+      "scenario_count": 15,
+      "order": 1,
+      "runner": { "kind": "benchlocal-cli", "argv": ["node", "dist-cli/cli/run.js"] },
+      "tool_pack": false,
+      "sidecar": null
+    },
+    {
+      "id": "instructfollow-15",
+      "dir": "InstructFollow-15",
+      "repo": "https://github.com/stevibe/InstructFollow-15.git",
+      "revision": "187af97cb2b892ad57de176b16a254aba7565a65",
+      "version": "1.0.0",
+      "scenario_count": 15,
+      "order": 2,
+      "runner": { "kind": "benchlocal-cli", "argv": ["node", "dist-cli/cli/run.js"] },
+      "tool_pack": false,
+      "sidecar": null
+    },
+    {
+      "id": "reasonmath-15",
+      "dir": "ReasonMath-15",
+      "repo": "https://github.com/stevibe/ReasonMath-15.git",
+      "revision": "b97632020fa373c52ba92373dbe5dc58b744ce48",
+      "version": "1.0.0",
+      "scenario_count": 15,
+      "order": 3,
+      "runner": { "kind": "benchlocal-cli", "argv": ["node", "dist-cli/cli/run.js"] },
+      "tool_pack": false,
+      "sidecar": null
+    },
+    {
+      "id": "toolcall-15",
+      "dir": "ToolCall-15",
+      "repo": "https://github.com/stevibe/ToolCall-15.git",
+      "revision": "edd6cefe4261b67e8166e9f6d77d671042560294",
+      "version": "1.0.1",
+      "scenario_count": 15,
+      "order": 4,
+      "runner": { "kind": "benchlocal-cli", "argv": ["node", "dist-cli/cli/run.js"] },
+      "tool_pack": true,
+      "sidecar": null
+    },
+    {
+      "id": "promptauthority-15",
+      "dir": "PromptAuthority-15",
+      "repo": "https://github.com/stevibe/PromptAuthority-15.git",
+      "revision": "6ed261b42fcca0df15e4794eeb4da628b1666952",
+      "version": "1.0.0",
+      "scenario_count": 15,
+      "order": 5,
+      "runner": { "kind": "benchlocal-cli", "argv": ["node", "dist-cli/cli/run.js"] },
+      "tool_pack": true,
+      "sidecar": null
+    },
+    {
+      "id": "structoutput-15",
+      "dir": "StructOutput-15",
+      "repo": "https://github.com/stevibe/StructOutput-15.git",
+      "revision": "00de86e9bfc9dd3d86ba397d0cf35bcbc04efd1c",
+      "version": "1.0.0",
+      "scenario_count": 15,
+      "order": 6,
+      "runner": { "kind": "benchlocal-cli", "argv": ["node", "dist-cli/cli/run.js"] },
+      "tool_pack": false,
+      "sidecar": {
+        "kind": "docker",
+        "build_context": "./verification",
+        "container_port": 4010,
+        "host_port": 4011,
+        "url_env": "STRUCTOUTPUT_VALIDATOR_URL",
+        "cli_flag": "--validator-url",
+        "note": "Pack metadata declares container port 4010; the campaign remapped the host port to 4011 to avoid colliding with the BugFind-15 sandbox."
+      }
+    },
+    {
+      "id": "bugfind-15",
+      "dir": "BugFind-15",
+      "repo": "https://github.com/stevibe/BugFind-15.git",
+      "revision": "eea2224a531f0937a8fffb4949abcd6db81f4d11",
+      "version": "1.0.1",
+      "scenario_count": 15,
+      "order": 7,
+      "runner": { "kind": "benchlocal-cli", "argv": ["node", "dist-cli/cli/run.js"] },
+      "tool_pack": false,
+      "sidecar": {
+        "kind": "docker",
+        "build_context": "./verification",
+        "container_port": 4010,
+        "host_port": 4010,
+        "url_env": "BUGFIND_SANDBOX_URL",
+        "cli_flag": "--sandbox-url"
+      }
+    },
+    {
+      "id": "cli-40",
+      "dir": "CLI-40",
+      "repo": "https://github.com/stevibe/CLI-40.git",
+      "revision": "3b95f86e6edac47183348381a9bb211ffaf09404",
+      "version": "1.0.2",
+      "scenario_count": 40,
+      "order": 8,
+      "runner": {
+        "kind": "cli40",
+        "argv": ["node", "dist/cli/run.js", "--all"],
+        "docker_image": "cli40-dev",
+        "auth_mode": "none",
+        "provider": "llamacpp"
+      },
+      "tool_pack": false,
+      "sampling_source": "hardcoded in the campaign dist: temperature 1.0, top_p 0.95, top_k 20, min_p 0.0, repetition_penalty 1.0, request_timeout_seconds 300; no presence_penalty",
+      "sidecar": { "kind": "docker", "build_context": "./verification", "container_port": 4040 }
+    },
+    {
+      "id": "hermesagent-20",
+      "dir": "HermesAgent-20",
+      "repo": "https://github.com/stevibe/HermesAgent-20.git",
+      "revision": "fa40ab9fb84a329421bbdfc3062cf28f1670de71",
+      "version": "1.0.0",
+      "scenario_count": 20,
+      "order": 9,
+      "runner": {
+        "kind": "hermes",
+        "argv": ["node", "scripts/run-scenarios.mjs", "--all"],
+        "docker_image": "hermesagent20-dev",
+        "provider": "custom",
+        "auth_mode": "bearer",
+        "api_key": "benchlocal",
+        "scenario_flag": "--scenario",
+        "scenario_ids": ["HA-01", "HA-02", "HA-03", "HA-04", "HA-05", "HA-06", "HA-07", "HA-08", "HA-09", "HA-10", "HA-11", "HA-12", "HA-13", "HA-14", "HA-15", "HA-16", "HA-17", "HA-18", "HA-19", "HA-20"]
+      },
+      "tool_pack": false,
+      "always_via_proxy": true,
+      "sampling_source": "runner sends only temperature and top_p; the proxy injects top_k, min_p, presence_penalty, repetition_penalty and the thinking variant",
+      "sidecar": { "kind": "docker", "build_context": "./verification", "container_port": 4010 }
+    }
+  ],
+
+  "scoring": {
+    "macro_score_definition": "Unweighted mean of the nine pack headline scores.",
+    "scenario_weighted_score_definition": "Pack headline scores weighted by pack scenario count (seven 15-scenario packs, HermesAgent-20 at 20, CLI-40 at 40).",
+    "status_totals_definition": "Sum of canonical pack pass/partial/fail counts.",
+    "runnable_scenarios_per_route": 165,
+    "runnable_scenario_attempts": 660,
+    "unsupported_packs": ["formsight", "pixelate"]
+  },
+
+  "exclusions": [
+    { "path_pattern": "results/*-no-presence", "reason": "a3b sampling policy missing presence_penalty=1.5" },
+    { "path_pattern": "results/*/hermesagent-20*openai-kwargs-failure*", "reason": "pinned Hermes OpenAI SDK rejected top_k before HTTP; not model quality" },
+    { "path_pattern": "results/*/hermesagent-20*{partial,fetch-failure,socket-hang,preload-fail,prepare-eacces,oom}*", "reason": "preserved infrastructure diagnostics; excluded from canonical score" },
+    { "path_pattern": "results/*/cli-40.*infra-fail*", "reason": "docker bind collision; the canonical cli-40.* retry is complete" }
+  ]
+}

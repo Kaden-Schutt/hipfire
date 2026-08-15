@@ -1,0 +1,1 @@
+**Measurement Contract for DeepSeek V4 Flash (MoE) on AMD MI300X (gfx942) – Q8 KV, No Speculation

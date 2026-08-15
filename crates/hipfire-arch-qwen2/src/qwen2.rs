@@ -40,6 +40,7 @@ use hipfire_runtime::weight_backend::{
     dequant_norm, dequant_weight_raw, flat_name_candidates, load_embedding, resolve_lm_head,
     HfqBackend, WeightBackend,
 };
+use hipfire_runtime::{screen_weight_tensor, MmqScreenable};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use serde::Deserialize;
 
@@ -296,6 +297,27 @@ impl Qwen2Weights {
             let _ = gpu.free_tensor(l.w_up.buf);
             let _ = gpu.free_tensor(l.w_down.buf);
         }
+    }
+}
+
+impl MmqScreenable for Qwen2Weights {
+    fn screen_mmq_weights(&self, gpu: &mut Gpu) -> (usize, usize) {
+        let (mut safe, mut unsafe_count) = (0usize, 0usize);
+        screen_weight_tensor(&self.output, gpu, &mut safe, &mut unsafe_count);
+        for layer in &self.layers {
+            for weight in [
+                &layer.wq,
+                &layer.wk,
+                &layer.wv,
+                &layer.wo,
+                &layer.w_gate,
+                &layer.w_up,
+                &layer.w_down,
+            ] {
+                screen_weight_tensor(weight, gpu, &mut safe, &mut unsafe_count);
+            }
+        }
+        (safe, unsafe_count)
     }
 }
 
@@ -1228,7 +1250,7 @@ fn forward_step_after_x(
         // (2 for dots.ocr), so lower occupancy but eliminates the partials
         // DRAM round-trip + reduce dispatch. Probe of launch-overhead vs
         // occupancy tradeoff.
-        let use_fused = std::env::var("HIPFIRE_GQA_FUSED")
+        let use_fused = hipfire_config::developer_var("HIPFIRE_GQA_FUSED")
             .map(|v| v == "1")
             .unwrap_or(false);
         if use_fused && n_kv_heads < n_heads {
@@ -1891,7 +1913,12 @@ pub fn forward_verify_block_batched(
 fn qwen2_forward_lowered_enabled() -> bool {
     use std::sync::OnceLock;
     static F: OnceLock<bool> = OnceLock::new();
-    *F.get_or_init(|| std::env::var("HIPFIRE_FORWARD_LOWERED").ok().as_deref() != Some("0"))
+    *F.get_or_init(|| {
+        hipfire_config::developer_var("HIPFIRE_FORWARD_LOWERED")
+            .ok()
+            .as_deref()
+            != Some("0")
+    })
 }
 
 /// Lowered (#397 Ship 6) per-layer decode loop + final norm/head. Behaviorally
@@ -2012,7 +2039,7 @@ impl DenseArch for Qwen2Dense<'_> {
         gpu.kv_cache_write(&st.k_cache[l], &st.k, &st.pos_buf, k.kv_dim)?;
         gpu.kv_cache_write(&st.v_cache[l], &st.v, &st.pos_buf, k.kv_dim)?;
         // Attention — 4-way select (exact mirror of the SuperOp run_attend path).
-        let use_fused = std::env::var("HIPFIRE_GQA_FUSED")
+        let use_fused = hipfire_config::developer_var("HIPFIRE_GQA_FUSED")
             .map(|v| v == "1")
             .unwrap_or(false);
         if use_fused && k.n_kv_heads < k.n_heads {
@@ -2084,7 +2111,7 @@ impl DenseArch for Qwen2Dense<'_> {
         let k = &self.knobs;
         // Read HIPFIRE_GQA_FUSED here, mirroring the hand attend() (which also
         // reads it per layer) — same result, strict no-op.
-        let fused = std::env::var("HIPFIRE_GQA_FUSED")
+        let fused = hipfire_config::developer_var("HIPFIRE_GQA_FUSED")
             .map(|v| v == "1")
             .unwrap_or(false);
         let pos = self.seq_len - 1;
@@ -2140,6 +2167,7 @@ impl DenseArch for Qwen2Dense<'_> {
             tree_bias: None,
             block_start: 0,
             block_cols: 0,
+            output_gate: None,
             output: &st.attn_out,
         };
         Ok(Some((plan, io)))

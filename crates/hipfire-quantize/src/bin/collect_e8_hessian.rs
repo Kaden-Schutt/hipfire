@@ -19,8 +19,7 @@
 //
 // INPUT (this CLI, the simplest disjoint interface for Validate's forward):
 //   --acts <file>   raw activation dump: [u32 n_rows][u32 K][f32 rows row-major]
-//                   (one file per (tensor,expert); rows = pre-rotation x for the
-//                    tokens routed to this expert).
+//                   (repeat to combine disjoint calibration corpora).
 //   --name <tname>  full safetensors tensor name (the loader key).
 //   --out-dir <dir> where to write <name>.hblk.
 //
@@ -108,52 +107,80 @@ fn main() {
             .position(|a| a == k)
             .and_then(|i| args.get(i + 1).cloned())
     };
-    let acts = match arg("--acts") {
-        Some(a) => a,
-        None => {
-            eprintln!(
-                "usage: collect_e8_hessian --acts <dump> --name <tensor> --out-dir <dir>\n\
-                 dump format: [u32 n_rows][u32 K][f32 rows row-major]"
-            );
-            std::process::exit(2);
-        }
-    };
+    let acts: Vec<String> = args
+        .windows(2)
+        .filter(|pair| pair[0] == "--acts")
+        .map(|pair| pair[1].clone())
+        .collect();
+    if acts.is_empty() {
+        eprintln!(
+            "usage: collect_e8_hessian --acts <dump> [--acts <dump> ...] \
+             --name <tensor> --out-dir <dir>\n\
+             dump format: [u32 n_rows][u32 K][f32 rows row-major]"
+        );
+        std::process::exit(2);
+    }
     let name = arg("--name").unwrap_or_else(|| {
         eprintln!("error: --name <full-safetensors-name> required");
         std::process::exit(2);
     });
     let out_dir = arg("--out-dir").unwrap_or_else(|| "/mnt/vol/e8-hessians".to_string());
 
-    let bytes = std::fs::read(&acts).unwrap_or_else(|e| {
-        eprintln!("error: cannot read --acts {acts}: {e}");
-        std::process::exit(1);
-    });
-    if bytes.len() < 8 {
-        eprintln!("error: activation dump too small");
-        std::process::exit(1);
-    }
-    let n_rows = read_u32(&bytes, 0) as usize;
-    let k = read_u32(&bytes, 4) as usize;
-    if k % 256 != 0 {
-        eprintln!("error: K={k} not divisible by 256");
-        std::process::exit(1);
-    }
-    let want = 8 + n_rows * k * 4;
-    if bytes.len() < want {
-        eprintln!("error: dump truncated ({} < {})", bytes.len(), want);
-        std::process::exit(1);
-    }
-    let mut h = BlockHessian::new(k);
-    let mut row = vec![0.0f32; k];
-    let mut off = 8usize;
-    for _ in 0..n_rows {
-        for c in 0..k {
-            row[c] =
-                f32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]);
-            off += 4;
+    let mut h: Option<BlockHessian> = None;
+    let mut total_rows = 0usize;
+    for acts_path in &acts {
+        let bytes = std::fs::read(acts_path).unwrap_or_else(|e| {
+            eprintln!("error: cannot read --acts {acts_path}: {e}");
+            std::process::exit(1);
+        });
+        if bytes.len() < 8 {
+            eprintln!("error: activation dump too small: {acts_path}");
+            std::process::exit(1);
         }
-        h.accumulate_row(&row);
+        let n_rows = read_u32(&bytes, 0) as usize;
+        let k = read_u32(&bytes, 4) as usize;
+        if k % 256 != 0 {
+            eprintln!("error: K={k} not divisible by 256");
+            std::process::exit(1);
+        }
+        let want = 8 + n_rows * k * 4;
+        if bytes.len() != want {
+            eprintln!(
+                "error: activation dump size mismatch for {acts_path} ({} != {want})",
+                bytes.len()
+            );
+            std::process::exit(1);
+        }
+        let acc = h.get_or_insert_with(|| BlockHessian::new(k));
+        if acc.k != k {
+            eprintln!(
+                "error: activation K mismatch for {acts_path}: {} != {}",
+                k, acc.k
+            );
+            std::process::exit(1);
+        }
+        let mut row = vec![0.0f32; k];
+        let mut off = 8usize;
+        for _ in 0..n_rows {
+            for value in &mut row {
+                *value = f32::from_le_bytes([
+                    bytes[off],
+                    bytes[off + 1],
+                    bytes[off + 2],
+                    bytes[off + 3],
+                ]);
+                off += 4;
+            }
+            acc.accumulate_row(&row);
+        }
+        total_rows += n_rows;
+        eprintln!("accumulated {n_rows} rows from {acts_path}");
     }
+    let h = h.expect("non-empty --acts set");
+    eprintln!(
+        "combined {total_rows} rows from {} activation dump(s)",
+        acts.len()
+    );
     h.write_hblk(Path::new(&out_dir), &name)
         .unwrap_or_else(|e| {
             eprintln!("error: write_hblk failed: {e}");
@@ -209,5 +236,37 @@ mod tests {
         let v00 = f32::from_le_bytes([b[12], b[13], b[14], b[15]]) as f64;
         assert!((v00 - h.blocks[0][0]).abs() < 1e-3 * (h.blocks[0][0].abs() + 1.0));
         std::fs::remove_file(&path).ok();
+    }
+
+    /// Python `reference_gptq/formats.py` E8H1 writer → Rust header/layout reader.
+    #[test]
+    fn python_fixture_e8h1_roundtrip() {
+        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("reference_gptq/fixtures/layers.0.mlp.experts.3.gate_up_proj.weight.hblk");
+        assert!(path.is_file(), "missing fixture {path:?}");
+        let b = std::fs::read(&path).unwrap();
+        assert_eq!(read_u32(&b, 0), 0x45_38_48_31, "magic");
+        assert_eq!(read_u32(&b, 4), 2, "n_blocks");
+        assert_eq!(read_u32(&b, 8), 512, "K");
+        assert_eq!(b.len(), 12 + 2 * 256 * 256 * 4);
+
+        // entry block1[3,5] from make_fixtures.py meta
+        let mut meta_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        meta_path.push("reference_gptq/fixtures/e8h1_meta.txt");
+        let meta = std::fs::read_to_string(&meta_path).unwrap();
+        let mut expect35 = None;
+        for line in meta.lines() {
+            if let Some(v) = line.strip_prefix("entry_b1_3_5=") {
+                expect35 = Some(v.parse::<f64>().unwrap());
+            }
+        }
+        let expect35 = expect35.expect("meta entry");
+        let off = 12 + (1 * 256 * 256 + 3 * 256 + 5) * 4;
+        let got = f32::from_le_bytes(b[off..off + 4].try_into().unwrap()) as f64;
+        // f64→f32→f64 store path in the Python writer
+        assert!(
+            (got - expect35).abs() < 1e-5 * (expect35.abs() + 1.0),
+            "block1[3,5] got={got} expect={expect35}"
+        );
     }
 }

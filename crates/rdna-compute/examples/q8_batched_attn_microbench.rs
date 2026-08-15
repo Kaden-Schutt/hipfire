@@ -33,6 +33,7 @@ fn main() {
     let hd = env_usize("HD", 256);
     let n = env_usize("N", 512); // query rows in the prefill chunk
     let ctx = env_usize("CTX", 20000); // max_ctx_len — above the 15k cliff
+    let warmups = env_usize("WARMUPS", 3);
     let iters = env_usize("ITERS", 5);
 
     assert!(hd % 32 == 0, "head_dim must be a multiple of 32");
@@ -85,7 +86,9 @@ fn main() {
     );
 
     let time = |gpu: &mut Gpu, f: &dyn Fn(&mut Gpu)| -> f64 {
-        f(gpu); // warmup
+        for _ in 0..warmups {
+            f(gpu);
+        }
         gpu.hip.device_synchronize().unwrap();
         let mut ts = vec![];
         for _ in 0..iters {
@@ -105,15 +108,75 @@ fn main() {
     // while still paying O(ctx) tile-launch + reduce overhead.
     let window = env_usize("WINDOW", 0) as i32;
     let new_ms = time(&mut gpu, &|g: &mut Gpu| {
-        g.attention_flash_q8_0_batched_masked_windowed(
-            &q, &k_cache, &v_cache, &out, &positions, nh, nkv, hd, ctx, ctx, n, &partials, None, 0,
-            0, window,
-        )
-        .expect("windowed batched");
+        if window == 0 {
+            g.attention_flash_q8_0_batched_masked(
+                &q, &k_cache, &v_cache, &out, &positions, nh, nkv, hd, ctx, ctx, n, &partials,
+                None, 0, 0,
+            )
+            .expect("non-windowed batched");
+        } else {
+            g.attention_flash_q8_0_batched_masked_windowed(
+                &q, &k_cache, &v_cache, &out, &positions, nh, nkv, hd, ctx, ctx, n, &partials,
+                None, 0, 0, window,
+            )
+            .expect("windowed batched");
+        }
     });
 
     println!(
         "WINDOW={window:6} CTX={ctx:6} N={n:4} HD={hd} : batched flash {new_ms:8.2} ms  ({:6.1} us/query-row)",
         new_ms * 1000.0 / n as f64
     );
+
+    // Query-tiled flash prefill. BR/BC swept via env; LDS is independent of ctx.
+    let br = env_usize("BR", 16);
+    let bc = env_usize("BC", 32);
+    let flash_ms = time(&mut gpu, &|g: &mut Gpu| {
+        g.attention_q8_0_flash_prefill(
+            &q, &k_cache, &v_cache, &out, &positions, nh, nkv, hd, ctx, n, br, bc,
+        )
+        .expect("flash prefill");
+    });
+    println!(
+        "flash_prefill br={br} bc={bc} CTX={ctx} N={n}: {flash_ms:8.2} ms  \
+         ({:6.1} us/query-row)  speedup_vs_tiled={:.2}x",
+        flash_ms * 1000.0 / n as f64,
+        new_ms / flash_ms
+    );
+
+    // WMMA (matrix-core) variant of the query-tiled kernel. Fixed 16x16 tiles.
+    let wmma_ms = time(&mut gpu, &|g: &mut Gpu| {
+        g.attention_q8_0_flash_prefill_wmma(
+            &q, &k_cache, &v_cache, &out, &positions, nh, nkv, hd, n,
+        )
+        .expect("wmma flash prefill");
+    });
+    println!(
+        "flash_wmma       CTX={ctx} N={n}: {wmma_ms:8.2} ms  \
+         ({:6.1} us/query-row)  vs_tiled={:.2}x  vs_scalar_flash={:.2}x",
+        wmma_ms * 1000.0 / n as f64,
+        new_ms / wmma_ms,
+        flash_ms / wmma_ms
+    );
+
+    // The legacy LDS-backed kernel is only launchable while
+    // (max_ctx_len + block + head_dim) * 4 <= 64 KB; above that it cannot run
+    // at all, which is exactly why dispatch crosses over at 8192.
+    let legacy_lds = (ctx + 256 + hd) * 4;
+    if legacy_lds <= 64 * 1024 {
+        let legacy_ms = time(&mut gpu, &|g: &mut Gpu| {
+            g.attention_q8_0_kv_batched_masked(
+                &q, &k_cache, &v_cache, &out, &positions, nh, nkv, hd, ctx, ctx, n, None, 0, 0,
+            )
+            .expect("legacy lds kernel");
+        });
+        println!(
+            "legacy_lds       CTX={ctx} N={n}: {legacy_ms:8.2} ms  \
+             ({:6.1} us/query-row)  flash_speedup_vs_legacy={:.2}x",
+            legacy_ms * 1000.0 / n as f64,
+            legacy_ms / flash_ms
+        );
+    } else {
+        println!("legacy_lds       CTX={ctx}: N/A (needs {legacy_lds} B LDS > 64 KB)");
+    }
 }

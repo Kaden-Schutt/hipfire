@@ -1,0 +1,40 @@
+# Example ~/.hipfire/config.toml for reproducible developer experiments.
+# These values are process-wide. Do not place them in a model overlay.
+schema_version = 1
+
+[hardware]
+# One physical list drives ROCr and the matching post-filter HIP logical IDs.
+# Replaces HIPFIRE_DEVICES=0. Use a comma-separated string for multiple GPUs;
+# the selected devices are exposed to the engine as logical 0..N-1.
+devices = "0"
+allow_mixed_arch = false
+tp_use_rccl = true
+
+[kernel]
+# "auto" preserves architecture-selected policy.
+mmq = "auto"
+prefill_batched = true
+lm_head_f16 = "auto"
+
+[experimental.graph]
+# Replaces the former graph environment controls.
+forward = "auto"
+ar = true
+moe = true
+
+[diagnostic]
+prompt_token_heat = false
+prompt_heat_json = false
+prompt_heat_limit = 64
+
+[diagnostic.kernel]
+# Typed replacements for HIPFIRE_GEMV_ROWS and
+# HIPFIRE_GFX11_WEIGHT_LOAD_POLICY. Remove them to inherit arch policy.
+gemv_rows = "4"
+gfx11_weight_load_policy = "buffer"
+
+[developer]
+# Flat escape hatch for experiments that do not yet have stable schema keys.
+# Boolean TOML values are exposed to legacy-shaped internal consumers as 1/0.
+verify_graph = false       # HIPFIRE_VERIFY_GRAPH=0
+dspark_profile = true      # HIPFIRE_DSPARK_PROFILE=1

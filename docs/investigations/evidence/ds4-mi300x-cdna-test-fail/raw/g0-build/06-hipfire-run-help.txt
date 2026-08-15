@@ -1,0 +1,39 @@
+Generate text through a fresh native daemon process
+
+Usage: hipfire run [OPTIONS] <MODEL> [PROMPT]...
+
+Arguments:
+  <MODEL>      Registry tag, local alias, filename, or model path
+  [PROMPT]...  Prompt words. Quote the prompt to preserve exact whitespace
+
+Options:
+  -t, --temp <TEMP>
+          Sampling temperature in 0..=2
+      --top-p <TOP_P>
+          Nucleus probability in (0, 1]
+      --repeat-penalty <REPEAT_PENALTY>
+          Multiplicative repetition penalty
+  -n, --max-tokens <MAX_TOKENS>
+          Maximum generated tokens
+      --kv-mode <KV_MODE>
+          One-shot KV format override for this model load
+      --kv-backend <KV_BACKEND>
+          One-shot KV storage backend override for this model load [possible values: contiguous, vmm]
+      --spec <SPECULATION>
+          Select one speculative mechanism: off, auto, ngram, dflash, mtp, or dspark
+      --model-draft <MODEL_DRAFT>
+          Explicit DFlash draft model
+      --draft-max <DRAFT_MAX>
+          Override the active MTP/n-gram draft window
+      --dspark-conf-threshold <DSPARK_CONF_THRESHOLD>
+          DSpark confidence cutoff
+      --system <SYSTEM>
+          Override the resolved system prompt
+      --image <IMAGE>
+          Local image path for a vision-language model
+  -j, --json
+          Emit one JSON result object
+      --no-stream
+          Buffer visible output instead of streaming it
+  -h, --help
+          Print help

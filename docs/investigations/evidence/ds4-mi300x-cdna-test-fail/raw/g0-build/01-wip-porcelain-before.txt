@@ -1,0 +1,238 @@
+ M AGENTS.md
+ M CLAUDE.md
+ M crates/hip-bridge/examples/kernel_launch.rs
+ M crates/hip-bridge/examples/peer_smoke.rs
+ M crates/hip-bridge/examples/smoke.rs
+ M crates/hip-bridge/examples/smokeQA.rs
+ M crates/hip-bridge/src/kernarg.rs
+ M crates/hipfire-arch-deepseek4/examples/deepseek4_chat.rs
+ M crates/hipfire-arch-deepseek4/examples/deepseek4_perplexity.rs
+ M crates/hipfire-arch-deepseek4/examples/dspark_bench.rs
+ M crates/hipfire-arch-deepseek4/examples/dump_hfq_dtypes.rs
+ M crates/hipfire-arch-deepseek4/src/arch.rs
+ M crates/hipfire-arch-deepseek4/src/deepseek4.rs
+ M crates/hipfire-arch-deepseek4/src/dspark_speculator.rs
+ M crates/hipfire-arch-deepseek4/src/forward.rs
+ M crates/hipfire-arch-deepseek4/src/grammar.rs
+ M crates/hipfire-arch-deepseek4/src/mtp_speculator.rs
+ M crates/hipfire-arch-deepseek4/src/spec_decode.rs
+ M crates/hipfire-arch-deepseek4/src/spec_impl.rs
+ M crates/hipfire-arch-dots-ocr/examples/dump_proj_weight.rs
+ M crates/hipfire-arch-dots-ocr/examples/infer_dots_ocr.rs
+ M crates/hipfire-arch-dots-ocr/examples/ocr_e2e.rs
+ M crates/hipfire-arch-dots-ocr/src/arch.rs
+ M crates/hipfire-arch-dots-ocr/src/rope.rs
+ M crates/hipfire-arch-lfm2moe/examples/infer_lfm2moe.rs
+ M crates/hipfire-arch-llama/examples/qwen35_dspark_parity.rs
+ M crates/hipfire-arch-minimax/examples/ep_minimax.rs
+ M crates/hipfire-arch-qwen2/src/arch.rs
+ M crates/hipfire-arch-qwen35-vl/src/lib.rs
+ M crates/hipfire-arch-qwen35-vl/src/qwen35_vl.rs
+ M crates/hipfire-arch-qwen35-vl/tests/image_from_bytes.rs
+ M crates/hipfire-arch-toy/src/arch.rs
+ M crates/hipfire-atlas/src/lib.rs
+ M crates/hipfire-atlas/src/main.rs
+ M crates/hipfire-atlas/src/parse.rs
+ M crates/hipfire-atlas/src/profile_report.rs
+ M crates/hipfire-atlas/src/schema.rs
+ M crates/hipfire-atlas/src/suggest.rs
+ M crates/hipfire-cli/src/main.rs
+ M crates/hipfire-config/src/lib.rs
+ M crates/hipfire-detect/src/attractor.rs
+ M crates/hipfire-detect/src/eos_immediate.rs
+ M crates/hipfire-detect/src/lib.rs
+ M crates/hipfire-detect/src/ngram.rs
+ M crates/hipfire-detect/src/report.rs
+ M crates/hipfire-detect/src/self_check.rs
+ M crates/hipfire-detect/src/special_leak.rs
+ M crates/hipfire-detect/src/timing.rs
+ M crates/hipfire-detect/src/toolcall.rs
+ M crates/hipfire-detect/src/whitespace_only.rs
+ M crates/hipfire-detect/tests/replay.rs
+ M crates/hipfire-dispatch-tests/src/deepseek4.rs
+ M crates/hipfire-dispatch-tests/src/dtype.rs
+ M crates/hipfire-dispatch-tests/src/lib.rs
+ M crates/hipfire-dispatch-tests/src/qwen2.rs
+ M crates/hipfire-dispatch-tests/tests/golden.rs
+ M crates/hipfire-dispatch/src/coverage_tests.rs
+ M crates/hipfire-dispatch/src/families/gemm.rs
+ M crates/hipfire-dispatch/src/families/gemv.rs
+ M crates/hipfire-dispatch/src/families/rotation.rs
+ M crates/hipfire-dispatch/src/pipeline/mod.rs
+ M crates/hipfire-dispatch/src/tables/fused_qkv_table.rs
+ M crates/hipfire-dispatch/src/tables/gemv_table.rs
+ M crates/hipfire-dispatch/src/tables/mod.rs
+ M crates/hipfire-dispatch/src/tables/rotation_table.rs
+ M crates/hipfire-dispatch/src/tests.rs
+ M crates/hipfire-dispatch/src/types.rs
+ M crates/hipfire-quantize/src/bin/mq4_merge_mtp.rs
+ M crates/hipfire-quantize/src/main.rs
+ M crates/hipfire-quantize/src/reap_overlay.rs
+ M crates/hipfire-runtime/examples/daemon.rs
+ M crates/hipfire-runtime/examples/profile_prefill_deepseek4.rs
+ M crates/hipfire-runtime/examples/run.rs
+ M crates/hipfire-runtime/src/dspark_core.rs
+ M crates/hipfire-runtime/src/hfq.rs
+ M crates/hsa-bridge/examples/hip_graph_extra_poc.rs
+ M crates/hsa-bridge/examples/hip_graph_gemv_poc.rs
+ M crates/rdna-compute/examples/bench_attention_vision.rs
+ M crates/rdna-compute/examples/bench_decode_attention.rs
+ M crates/rdna-compute/examples/bench_dsa_direct_wmma.rs
+ M crates/rdna-compute/examples/bench_dsa_wmma.rs
+ M crates/rdna-compute/examples/bench_gate_up_hfq4_variants.rs
+ M crates/rdna-compute/examples/bench_gemv_hfp4g32_bw.rs
+ M crates/rdna-compute/examples/bench_gemv_mfp4g32_rotate.rs
+ M crates/rdna-compute/examples/bench_mq2g256_lloyd_moe_4w.rs
+ M crates/rdna-compute/examples/bench_q8_wmma_4w.rs
+ M crates/rdna-compute/examples/bench_q8_wmma_variants.rs
+ M crates/rdna-compute/examples/bench_rocblas_vs_wmma_f16.rs
+ M crates/rdna-compute/examples/bench_stream_overlap.rs
+ M crates/rdna-compute/examples/bench_wo_per_group_q8_4w.rs
+ M crates/rdna-compute/examples/burst_real_kernels.rs
+ M crates/rdna-compute/examples/channel_q8_mmq_gfx1030.rs
+ M crates/rdna-compute/examples/dual_gpu_smoke.rs
+ M crates/rdna-compute/examples/gen_kernel_hashes.rs
+ M crates/rdna-compute/examples/hip_graph_poc.rs
+ M crates/rdna-compute/examples/parity_causal_wmma.rs
+ M crates/rdna-compute/examples/rocblas_sanity.rs
+ M crates/rdna-compute/examples/rope_compact_offset_check.rs
+ M crates/rdna-compute/examples/sample_accept_parity.rs
+ M crates/rdna-compute/examples/test_attention_dflash.rs
+ M crates/rdna-compute/examples/test_conv1d_tree.rs
+ M crates/rdna-compute/examples/test_dots_ocr_wmma_gfx12.rs
+ M crates/rdna-compute/examples/test_fused_gate_up_dp4a.rs
+ M crates/rdna-compute/examples/test_gated_delta_net_f32_tree.rs
+ M crates/rdna-compute/examples/test_gated_delta_net_tree.rs
+ M crates/rdna-compute/examples/test_gemm_fused_mq3g256_lloyd_wmma.rs
+ M crates/rdna-compute/examples/test_gemm_fused_mq4g256_lloyd_wmma.rs
+ M crates/rdna-compute/examples/test_gemm_hfp4g32.rs
+ M crates/rdna-compute/examples/test_gemm_hfp4g32_fp8.rs
+ M crates/rdna-compute/examples/test_gemm_hfq3g256_wmma.rs
+ M crates/rdna-compute/examples/test_gemm_hfq4_dp4a.rs
+ M crates/rdna-compute/examples/test_gemm_hfq4g256_residual.rs
+ M crates/rdna-compute/examples/test_gemm_mq3g256_lloyd_residual_wmma.rs
+ M crates/rdna-compute/examples/test_gemm_mq4g256_lloyd_residual_wmma.rs
+ M crates/rdna-compute/examples/test_gemm_q8_gate_up_wmma.rs
+ M crates/rdna-compute/examples/test_gemm_q8_qkv_wmma.rs
+ M crates/rdna-compute/examples/test_gemm_q8_qkvza_wmma.rs
+ M crates/rdna-compute/examples/test_gemm_q8_residual_wmma.rs
+ M crates/rdna-compute/examples/test_gemm_qkv_and_gate_up.rs
+ M crates/rdna-compute/examples/test_gemm_qkvza_hfq4g256.rs
+ M crates/rdna-compute/examples/test_gemv.rs
+ M crates/rdna-compute/examples/test_gemvQA.rs
+ M crates/rdna-compute/examples/test_gemv_hfp4g32.rs
+ M crates/rdna-compute/examples/test_gemv_hfp4g32_dot2.rs
+ M crates/rdna-compute/examples/test_gemv_hfp4g32_fp8.rs
+ M crates/rdna-compute/examples/test_gemv_mfp4g32.rs
+ M crates/rdna-compute/examples/test_gemv_mq3g256_lloyd_tail.rs
+ M crates/rdna-compute/examples/test_gemv_mq4g256_lloyd_tail.rs
+ M crates/rdna-compute/examples/test_gfx906_mmq_correctness.rs
+ M crates/rdna-compute/examples/test_gfx906_mmq_realdata.rs
+ M crates/rdna-compute/examples/test_hfq4_fused_dp4a.rs
+ M crates/rdna-compute/examples/test_hfq4_residual_dp4a.rs
+ M crates/rdna-compute/examples/test_hfq4g256_mmq_portable.rs
+ M crates/rdna-compute/examples/test_hfq6_residual_wmma_gfx12.rs
+ M crates/rdna-compute/examples/test_hfq6_sigmoid_scaled.rs
+ M crates/rdna-compute/examples/test_indexer_top_k_buf.rs
+ M crates/rdna-compute/examples/test_moe_grouped_mmq_gfx1151.rs
+ M crates/rdna-compute/examples/test_moe_grouped_mmq_gfx11_dgpu.rs
+ M crates/rdna-compute/examples/test_moe_grouped_mmq_gfx12.rs
+ M crates/rdna-compute/examples/test_moe_grouped_mmq_k4_gfx1151.rs
+ M crates/rdna-compute/examples/test_moe_grouped_mmq_k4_gfx12.rs
+ M crates/rdna-compute/examples/test_moe_grouped_mmq_k8_gfx1151.rs
+ M crates/rdna-compute/examples/test_moe_grouped_wmma_hfp4.rs
+ M crates/rdna-compute/examples/test_moe_grouped_wmma_hfq3.rs
+ M crates/rdna-compute/examples/test_moe_grouped_wmma_hfq6_v2.rs
+ M crates/rdna-compute/examples/test_moe_grouped_wmma_m2.rs
+ M crates/rdna-compute/examples/test_moe_scatter_permute_k8.rs
+ M crates/rdna-compute/examples/test_mq2g256_lloyd_moe_grouped_mmq_gfx1030.rs
+ M crates/rdna-compute/examples/test_mq4g256_lloyd_fused_parity.rs
+ M crates/rdna-compute/src/attention.rs
+ M crates/rdna-compute/src/compiler.rs
+ M crates/rdna-compute/src/feature_flags.rs
+ M crates/rdna-compute/src/gemm.rs
+ M crates/rdna-compute/src/gemv.rs
+ M crates/rdna-compute/src/kernels.rs
+ M crates/rdna-compute/src/moe.rs
+ M crates/rdna-compute/src/norm.rs
+ M crates/rdna-compute/src/pool.rs
+ M crates/rdna-compute/src/profile.rs
+ M crates/rdna-compute/src/profiler.rs
+ M crates/rdna-compute/src/replay.rs
+ M crates/redline-dispatch/src/aql/mod.rs
+ M crates/redline/examples/bench_dispatch.rs
+ M crates/redline/examples/chain_debug.rs
+ M crates/redline/examples/poc_chain.rs
+ M crates/redline/examples/poc_device.rs
+ M crates/redline/examples/poc_dispatch_noop.rs
+ M crates/redline/examples/poc_dispatch_raw.rs
+ M crates/redline/examples/poc_gemm.rs
+ M crates/redline/examples/poc_hsaco.rs
+ M crates/redline/examples/poc_rmsnorm.rs
+ M crates/redline/examples/poc_silu.rs
+ M crates/redline/examples/poc_submit.rs
+ M crates/redline/examples/poc_vector_add.rs
+ M crates/redline/examples/poc_write_data.rs
+ M crates/redline/examples/test_aql_dispatch.rs
+ M crates/redline/examples/test_chain_dispatch.rs
+ M crates/redline/examples/test_dispatch_api.rs
+ M crates/redline/src/device.rs
+ M crates/redline/src/dispatch.rs
+ M crates/redline/src/drm.rs
+ M crates/redline/src/hsaco.rs
+ M crates/redline/src/kfd.rs
+ M crates/redline/src/lib.rs
+ M crates/redline/src/pm4.rs
+ M crates/redline/src/queue.rs
+ M docs/env-vars.md
+ M kernels/src/deepseek4_attn_swa_topk_buf.hip
+ M kernels/src/gemv_mfp4g32_e8_soa_grouped.gfx1151.hip
+ M kernels/src/gemv_mfp4g32_e8_soa_u4.hip
+ M registry/deepseek4-mq2r-gfx1151-v2.json
+ M registry/models.json
+ M registry/v1.json
+ M scripts/reap/hfq_overlay_bake.rs
+ M tools/redline/product_bench.py
+ M tools/redline/tests/test_product_bench.py
+?? .gitnexusrc
+?? crates/rdna-compute/examples/bench_ds4_attn_scoregrid_xlane.rs
+?? crates/rdna-compute/examples/bench_ds4_topk_kv_gather_tiled.rs
+?? crates/rdna-compute/examples/bench_e8_weight_cache.rs
+?? crates/rdna-compute/examples/bench_scoregrid_shape.rs
+?? crates/rdna-compute/examples/rocprof_top.rs
+?? crates/rdna-compute/examples/test_deepseek4_cdna_channels.rs
+?? crates/rdna-compute/examples/test_gemv_mfp3g32_e8.rs
+?? crates/rdna-compute/examples/test_gfx1151_xor_shuffle.rs
+?? crates/rdna-compute/examples/test_mq2_grouped_mfma_gfx942.rs
+?? crates/rdna-compute/examples/test_mq_rotate_gfx942.rs
+?? docs/specs/2026-07-25-kernel-lever-outcome-predictor.md
+?? kernels/src/deepseek4_topk_kv_gather_tiled.gfx1151.hip
+?? kernels/src/gemm_hfq4g256_residual_mfma_v5.gfx942.hip
+?? kernels/src/gemm_hfq4g256_residual_mfma_v6.gfx942.hip
+?? kernels/src/gemm_mq2g256_lloyd_moe_grouped_mfma.gfx942.hip
+?? kernels/src/gemv_mfp3g32_e8.hip
+?? kernels/src/gemv_mfp4g32_e8_soa.gfx942.hip
+?? kernels/src/gemv_mfp4g32_e8_soa_fp8_mfma.gfx942.hip
+?? kernels/src/gemv_mfp4g32_e8_soa_grouped.gfx942.hip
+?? kernels/src/gemv_mfp4g32_e8_soa_u4_buffer.hip
+?? kernels/src/gemv_mq2g256_lloyd_moe_down_allranks.gfx942.hip
+?? kernels/src/gemv_mq2g256_lloyd_moe_down_expanded_k4.gfx942.hip
+?? kernels/src/gemv_mq2g256_lloyd_moe_down_indexed.gfx942.hip
+?? kernels/src/gemv_mq2g256_lloyd_moe_down_indexed_mfma.gfx942.hip
+?? kernels/src/gemv_mq2g256_lloyd_moe_down_indexed_mfma_f16.gfx942.hip
+?? kernels/src/gemv_mq2g256_lloyd_moe_gate_up_indexed.gfx942.hip
+?? kernels/src/gemv_mq2g256_lloyd_moe_gate_up_indexed_mfma.gfx942.hip
+?? kernels/src/gemv_mq2g256_lloyd_moe_gate_up_indexed_mfma_f16.gfx942.hip
+?? kernels/src/gfx1151_xor_shuffle.h
+?? kernels/src/indexer_top_k_buf_bounded.gfx1151.hip
+?? kernels/src/indexer_top_k_buf_unrolled.gfx1151.hip
+?? kernels/src/mq_rotate_x.gfx942.hip
+?? registry/deepseek4-mq2r-gfx1151-v3.json
+?? scripts/quant_distortion_bench.py
+?? scripts/quant_rate_sweep.py
+?? scripts/reap/build_deepseek4_mfp3_p1_gptq.sh
+?? scripts/reap/collect_deepseek4_mfp3_p1_hessians.sh
+?? scripts/reap/deepseek4_mfp3_p1_plan.rs
+?? scripts/reap/deepseek4_mfp3_p1_subset_plan.rs
+?? scripts/reap/run_deepseek4_mfp3_p1_quality.sh
+?? scripts/reap/run_deepseek4_mfp3_p1_standalone_quality.sh

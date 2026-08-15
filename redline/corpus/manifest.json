@@ -1,0 +1,39 @@
+{
+  "aql_contracts": 391,
+  "archs": [
+    "gfx1030",
+    "gfx1100",
+    "gfx1151",
+    "gfx1201"
+  ],
+  "bench_rows": 2354,
+  "boxes": [
+    "k9lin",
+    "hipx",
+    "hiptrx"
+  ],
+  "captures": 1718,
+  "distinct_artifacts": 247,
+  "distinct_kernels": 223,
+  "harvest_iso": "2026-07-24T01:24:35Z",
+  "harvest_ts": 1784856275,
+  "kernarg_captured_exceeds_loader": 184,
+  "kernarg_differs": 277,
+  "launch_shapes": 515,
+  "malformed": {},
+  "pm4_shadow_bit_exact": 1274,
+  "pm4_shadows": 1362,
+  "raw_launches": 1080413,
+  "sequence_hashes": 277,
+  "shapes_seen": {
+    "bench": 4690,
+    "capture": 961,
+    "claim": 660,
+    "inspection": 644,
+    "other": 3109,
+    "product": 2,
+    "speedup": 287
+  },
+  "total_launches": 1138649,
+  "unreachable": {}
+}

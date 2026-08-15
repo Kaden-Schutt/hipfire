@@ -1,0 +1,1 @@
+## Technical Brief: DeepSeek V4 Flash (MoE) — Single-Batch Greedy Decode on AMD MI300X (gfx942

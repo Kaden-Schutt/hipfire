@@ -1,0 +1,1 @@
+Explain what a GPU kernel is in two sentences.

@@ -1,0 +1,17 @@
+: This is a detailed technical response for the specified measurement contract. The following covers the full path from frozen prompt fixture through tokenizer identity, prefill, KV write, and token-by-token decode under the specified conditions (Q8 KV, no speculation, batch 1, 2048 prompt tokens, 510 greedy generations, temperature zero) on a DeepSeek V4 Flash style MoE model running on AMD Instinct MI300X (gfx942). The response is structured as a measurement contract discussion, focusing on the technical details and constraints for a benchmark fixture.
+
+**1. The Frozen Prompt Fixture: Why "Bytes" Over "Text"**
+
+The measurement contract begins with a deterministic, versioned prompt fixture. The reason "bytes" matter over "text" is that any variation in the source text (e.g., trailing newlines, character encoding, or tokenizer-specific pre-processing) will produce different token IDs. This invalidates any comparison between runs. The contract therefore mandates:
+
+- **Source Corpus:** A specific, revisioned piece of prose or chat text (not random words or repetitive text). This ensures a realistic mixture of tokens and attention patterns.
+- **Tokenization:** The exact tokenizer (from the model's metadata, not a Python proxy) must be used to convert the source corpus to token IDs.
+- **Verification:** A round-trip check (decode then re-encode) must produce the exact same sequence of IDs. This ensures the tokenizer is correctly handling the text.
+- **Format:** The final prompt is a strict prefix of the source corpus, cut at a token boundary. It is stored as a file with no trailing newline (so `PROMP_ARG=$(<file)` preserves the exact bytes). An optional `--tokens-out` flag outputs the token IDs as a little-endian u32 file for verification.
+
+**2. The Generation Request: `HIPFIRE_SPECULATION=off` and `--kv-mode q8`**
+
+The measurement uses a single, deterministic generation request. The key parameters are:
+
+- **`HIPFIRE_SPECULATION=off`**: This disables any speculative decoding (e.g., draft models, tree verification, or other acceleration techniques). The generation is purely autoregressive (AR) with a single token per step.
+- **`--kv-mode q8`**: The Key-Value (KV) cache is stored in 8-bit quantized format. This is the "control" for the benchmark. It

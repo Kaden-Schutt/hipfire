@@ -10,6 +10,8 @@
 //! would let seq_pos overflow the binding buffer. n_kv_heads cancels in each
 //! per-buffer ratio, so the caps are `max_seq * floor_bph / cur_bph`.
 use crate::llama::VMode;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// K-cache tier. Mirrors VMode for the V side. fwht4/fwht2 rotate 128-wide,
 /// fwht3 rotates 256-wide.
@@ -117,6 +119,14 @@ pub struct KvAdaptive {
     pub next_step: usize,       // index into steps
     pub thresholds: Vec<usize>, // seq_pos at which steps[i] fires
     pub margin: usize,          // fire this many tokens before the cap
+    /// Sticky failure after a partial tier transition. Further generation must
+    /// refuse until unload/reload; reset does not clear poison.
+    poisoned: bool,
+    poison_reason: Option<String>,
+    /// Optional one-way transition into an eviction policy. The shared gate
+    /// stays closed until every adaptive transcode has completed successfully.
+    handoff_at: Option<usize>,
+    eviction_ready: Option<Arc<AtomicBool>>,
 }
 
 impl KvAdaptive {
@@ -152,8 +162,8 @@ impl KvAdaptive {
             // was set to the aggressive floor (fwht2/lloyd2), making the two presets
             // identical. K/V bit-gap stays ≤ 1 tier at every rung.
             Preset::Conservative => (KMode::Fwht4, VMode::Lloyd4),
-            Preset::Balanced     => (KMode::Fwht3, VMode::Lloyd3),
-            Preset::Aggressive   => (KMode::Fwht2, VMode::Lloyd2),
+            Preset::Balanced => (KMode::Fwht3, VMode::Lloyd3),
+            Preset::Aggressive => (KMode::Fwht2, VMode::Lloyd2),
         };
         Self::new(max_seq, n_kv_heads, head_dim, k_floor, v_floor)
     }
@@ -187,6 +197,10 @@ impl KvAdaptive {
             // 256 is comfortably conservative.
             thresholds: Vec::new(),
             margin: crate::llama::PREFILL_MAX_BATCH,
+            poisoned: false,
+            poison_reason: None,
+            handoff_at: None,
+            eviction_ready: None,
         };
         s.recompute_thresholds();
         s
@@ -242,14 +256,78 @@ impl KvAdaptive {
         }
     }
 
-    /// Reset the tier state to the start (Q8/fwht4) position.  Call this
-    /// whenever the KV cache is cold-reset (context-full rollover, explicit
-    /// "reset" command) so the threshold sequence restarts from the beginning
-    /// instead of staying pinned at the floor tier permanently.
+    /// Controller-only tier rewind to FWHT4/Q8 step 0. Prefer
+    /// [`Self::reset_with_cache`] so cache mode flags stay synchronized.
     pub fn reset(&mut self) {
         self.cur_k = KMode::Fwht4;
         self.cur_v = crate::llama::VMode::Q8;
         self.next_step = 0;
+        if let Some(ready) = &self.eviction_ready {
+            ready.store(false, Ordering::Release);
+        }
+    }
+
+    /// Configure a one-way transition to eviction at a committed position.
+    /// The returned gate is consumed by the eviction context; it remains
+    /// closed until all remaining adaptive steps have succeeded.
+    pub fn configure_eviction_handoff(&mut self, at: usize) -> Arc<AtomicBool> {
+        let ready = Arc::new(AtomicBool::new(false));
+        self.handoff_at = Some(at);
+        self.eviction_ready = Some(Arc::clone(&ready));
+        ready
+    }
+
+    pub fn handoff_at(&self) -> Option<usize> {
+        self.handoff_at
+    }
+
+    pub fn handoff_complete(&self) -> bool {
+        self.eviction_ready
+            .as_ref()
+            .is_some_and(|ready| ready.load(Ordering::Acquire))
+    }
+
+    pub fn eviction_gate(&self) -> Option<Arc<AtomicBool>> {
+        self.eviction_ready.as_ref().map(Arc::clone)
+    }
+
+    fn target_step_count(&self, seq_pos: usize) -> usize {
+        if self.handoff_at.is_some_and(|at| seq_pos >= at) {
+            self.steps.len()
+        } else {
+            self.thresholds
+                .iter()
+                .take_while(|&&threshold| seq_pos >= threshold)
+                .count()
+        }
+    }
+
+    /// Atomically restore controller + cache encoding to the adaptive start
+    /// tier (K=fwht4, V=q8, step 0), then invalidate captured HipGraphs and
+    /// retained replay recorded under the previous tier. Does not clear poison
+    /// — a poisoned model still requires unload/reload.
+    pub fn reset_with_cache(
+        &mut self,
+        gpu: &mut rdna_compute::Gpu,
+        kv: &mut crate::llama::KvCache,
+    ) {
+        self.reset();
+        kv.restore_adaptive_start_flags();
+        gpu.invalidate_for_kv_mode_switch();
+    }
+
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    pub fn poison_reason(&self) -> Option<&str> {
+        self.poison_reason.as_deref()
+    }
+
+    pub fn poison(&mut self, reason: impl Into<String>) {
+        let reason = reason.into();
+        self.poisoned = true;
+        self.poison_reason = Some(reason);
     }
 
     /// Apply ALL downshift steps whose threshold seq_pos has crossed (handles
@@ -257,26 +335,62 @@ impl KvAdaptive {
     /// point). Called after each committed token write at the same site as
     /// `maybe_evict`. The common case (no threshold crossed) is a single integer
     /// compare returning an empty Vec. Returns the steps applied this call.
+    ///
+    /// On any transcode failure after zero or more successful steps in this
+    /// call, the controller is poisoned and the error propagates. Callers must
+    /// not continue generation on a poisoned model.
     pub fn maybe_downshift(
         &mut self,
         gpu: &mut rdna_compute::Gpu,
         kv: &mut crate::llama::KvCache,
         seq_pos: usize,
     ) -> hip_bridge::HipResult<Vec<Step>> {
+        if self.poisoned {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "adaptive KV is poisoned{}; unload/reload required",
+                    self.poison_reason
+                        .as_deref()
+                        .map(|r| format!(" ({r})"))
+                        .unwrap_or_default()
+                ),
+            ));
+        }
         let mut applied = Vec::new();
-        while self.next_step < self.steps.len() && seq_pos >= self.thresholds[self.next_step] {
-            match self.steps[self.next_step] {
-                Step::V(nv) => {
-                    kv.transcode_v_step(gpu, nv, seq_pos)?;
+        let handoff_crossed = self.handoff_at.is_some_and(|at| seq_pos >= at);
+        let target_step_count = self.target_step_count(seq_pos);
+        while self.next_step < target_step_count {
+            let step = self.steps[self.next_step];
+            let result = match step {
+                Step::V(nv) => kv.transcode_v_step(gpu, nv, seq_pos).map(|()| {
                     self.cur_v = nv;
-                }
-                Step::K(nk) => {
-                    kv.transcode_k_step(gpu, nk.bits(), seq_pos)?;
+                }),
+                Step::K(nk) => kv.transcode_k_step(gpu, nk.bits(), seq_pos).map(|()| {
                     self.cur_k = nk;
+                }),
+            };
+            if let Err(err) = result {
+                self.poison(format!(
+                    "partial adaptive transition at seq_pos={seq_pos} step={step:?}: {err}"
+                ));
+                return Err(err);
+            }
+            applied.push(step);
+            self.next_step += 1;
+        }
+        if handoff_crossed {
+            // Release only after every transcode above completed. Eviction's
+            // Acquire pairs with this store, so it cannot observe stale mode
+            // flags or cache bytes on another serving thread.
+            if let Some(ready) = &self.eviction_ready {
+                if !ready.swap(true, Ordering::AcqRel) {
+                    eprintln!(
+                        "[adaptive-kv] handoff complete @ pos {seq_pos}: K={:?} V={:?}; eviction active",
+                        self.cur_k, self.cur_v
+                    );
                 }
             }
-            applied.push(self.steps[self.next_step]);
-            self.next_step += 1;
         }
         Ok(applied)
     }
@@ -359,16 +473,38 @@ mod tests {
         // chain descends V to lloyd3, then K to fwht3 (no final lloyd2 step — that
         // belongs to aggressive).
         let a = KvAdaptive::from_preset(Preset::Balanced, 10_000, 4, 256);
-        assert_eq!(a.steps, vec![
-            Step::V(VMode::Lloyd4), Step::V(VMode::Lloyd3), Step::K(KMode::Fwht3),
-        ]);
+        assert_eq!(
+            a.steps,
+            vec![
+                Step::V(VMode::Lloyd4),
+                Step::V(VMode::Lloyd3),
+                Step::K(KMode::Fwht3),
+            ]
+        );
         // thresholds non-decreasing.
-        for w in a.thresholds.windows(2) { assert!(w[1] >= w[0], "thresholds {:?}", a.thresholds); }
+        for w in a.thresholds.windows(2) {
+            assert!(w[1] >= w[0], "thresholds {:?}", a.thresholds);
+        }
         // first threshold = start-tier cap - margin (computed at the new floors so
         // it can't drift to a stale magic number).
-        let start_cap = cap_min(10_000, 256, KMode::Fwht3, VMode::Lloyd3, KMode::Fwht4, VMode::Q8);
-        assert_eq!(a.current_cap(), start_cap, "current_cap at construction == start-tier cap");
-        assert_eq!(a.thresholds[0], start_cap - a.margin, "first threshold = start_cap - margin");
+        let start_cap = cap_min(
+            10_000,
+            256,
+            KMode::Fwht3,
+            VMode::Lloyd3,
+            KMode::Fwht4,
+            VMode::Q8,
+        );
+        assert_eq!(
+            a.current_cap(),
+            start_cap,
+            "current_cap at construction == start-tier cap"
+        );
+        assert_eq!(
+            a.thresholds[0],
+            start_cap - a.margin,
+            "first threshold = start_cap - margin"
+        );
     }
 
     #[test]
@@ -402,6 +538,54 @@ mod tests {
         let a = KvAdaptive::from_preset(Preset::Conservative, 10_000, 4, 256);
         assert_eq!(a.steps, vec![Step::V(VMode::Lloyd4)]);
     }
+    #[test]
+    fn reset_restores_start_tier_and_step_index() {
+        let mut a = KvAdaptive::from_preset(Preset::Aggressive, 10_000, 4, 256);
+        a.cur_k = KMode::Fwht2;
+        a.cur_v = VMode::Lloyd2;
+        a.next_step = a.steps.len();
+        a.reset();
+        assert_eq!(a.cur_k, KMode::Fwht4);
+        assert_eq!(a.cur_v, VMode::Q8);
+        assert_eq!(a.next_step, 0);
+        assert!(!a.is_poisoned());
+    }
+
+    #[test]
+    fn handoff_forces_floor_and_reset_recloses_gate() {
+        let mut a = KvAdaptive::from_preset(Preset::Aggressive, 10_000, 4, 256);
+        let first_natural_threshold = a.thresholds[0];
+        let handoff_at = first_natural_threshold / 2;
+        let gate = a.configure_eviction_handoff(handoff_at);
+
+        assert!(!gate.load(Ordering::Acquire));
+        assert_eq!(a.target_step_count(handoff_at - 1), 0);
+        assert_eq!(
+            a.target_step_count(handoff_at),
+            a.steps.len(),
+            "handoff must finish every remaining transcode before eviction"
+        );
+
+        gate.store(true, Ordering::Release);
+        assert!(a.handoff_complete());
+        a.reset();
+        assert!(!gate.load(Ordering::Acquire));
+        assert!(!a.handoff_complete());
+    }
+
+    #[test]
+    fn poison_is_sticky_across_reset() {
+        let mut a = KvAdaptive::from_preset(Preset::Balanced, 10_000, 4, 256);
+        a.poison("transcode failed mid-step");
+        assert!(a.is_poisoned());
+        assert_eq!(a.poison_reason(), Some("transcode failed mid-step"));
+        a.reset();
+        assert!(
+            a.is_poisoned(),
+            "reset must not clear poison; unload/reload is required"
+        );
+    }
+
     #[test]
     fn advanced_k_fwht3_floor() {
         let a = KvAdaptive::new(10_000, 4, 256, KMode::Fwht3, VMode::Lloyd2);

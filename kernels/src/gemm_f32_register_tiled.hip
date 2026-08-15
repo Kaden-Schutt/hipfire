@@ -20,7 +20,14 @@
 //   y : [batch_size, M]          row-major F32 outputs
 //
 // Grid:  [M, (batch_size + BATCH_TILE - 1) / BATCH_TILE, 1]
-// Block: [32, 1, 1]    — one wave per (row, batch_tile) pair
+// Block: [32, 1, 1]    — one logical warp of 32 threads per (row, batch_tile)
+//
+// CDNA3 (gfx942) note: wavefront size is 64. All __shfl*_down calls MUST pass
+// width=32 so the reduction stays inside the 32 active lanes. Default width is
+// warpSize=64; with only 32 threads launched the upper half is inactive and
+// __shfl_down without an explicit width reads undefined sources (same class of
+// bug as the G0.6 attention softmax fix). Parent HC control projections
+// (`parent_f32_linear` → this kernel) are on the critical path for every layer.
 //
 // At batch_size == 1 (single tile, local_bs==1) produces the same
 // output as gemm_f32 / gemv_f32. Math: FMA order matches a
@@ -78,7 +85,7 @@ __global__ void gemm_f32_register_tiled(
         if (b >= local_bs) continue;
         float val = acc[b];
         for (int offset = 16; offset > 0; offset >>= 1) {
-            val += __shfl_down(val, offset);
+            val += __shfl_down(val, offset, 32);
         }
         if (tid == 0) {
             y[(size_t)(batch_start + b) * M + row] = val;

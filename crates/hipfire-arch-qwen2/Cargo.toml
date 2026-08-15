@@ -12,6 +12,7 @@ description = "Qwen2 dense text decoder (GQA + RMSNorm + SwiGLU + 1-D RoPE, atte
 # See docs/plans/qwen_2.5_vlm.md phase 1 for the full bring-up plan.
 
 [dependencies]
+hipfire-config = { path = "../hipfire-config" }
 hipfire-runtime = { path = "../hipfire-runtime" }
 hipfire-dispatch = { path = "../hipfire-dispatch" }
 hip-bridge = { path = "../hip-bridge" }

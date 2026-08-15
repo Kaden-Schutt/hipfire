@@ -1,0 +1,14 @@
+GPU dev 0: gfx942 (205.8 GB VRAM, HIP 7.14)
+  pre-compiled kernels: /mnt/scratch/hipfire-kernels/rocm714/gfx942
+[rocblas] loaded for gfx942
+deepseek4: MQ2R P3 tensor recipe verified; selected exact gfx942 backend (554 E8 tensors; routed experts qt=19)
+deepseek4 gfx942 A2 levers: L1 compressor_gate=OFF (HIPFIRE_DEEPSEEK4_GFX942_COMPRESSOR_GATE default OFF, =1 enables) ; L3 e8_wo_grouped=ON (gfx942-v1 default ON, HIPFIRE_DEEPSEEK4_GFX942_E8_WO_GROUPED=0 disables) ; L2 hc_finalize_fused=OFF (default OFF, HIPFIRE_DEEPSEEK4_GFX942_HC_FINALIZE_FUSED=1 enables) ; F1 indexer_topk_parallel=ON (gfx942-v1 default ON, HIPFIRE_DEEPSEEK4_GFX942_INDEXER_TOPK_PARALLEL=0 disables) ; C1 ffn_overlap=OFF (default OFF, HIPFIRE_DEEPSEEK4_GFX942_FFN_OVERLAP=1 enables)
+hipfire bench
+  model:  /mnt/scratch/models/deepseek-v4-flash-mq2r/deepseek-v4-flash.mq2r
+  arch:   deepseek4
+  gpu:    gfx942
+  runs:   1
+  max_tokens: 32
+[daemon-control] received commit for id=chatcmpl-156961-1 attempt_id=1
+[req chatcmpl-156961-1] drafter=ar tau=1.00 tok/s=38.0 decode (9 tok, autoregressive)
+hipfire: daemon error: [internal retryable=false rolled_back=false attempt=1] deepseek4prefill failed: "ffn_batched l0 dispatch: HIP error: HipError(0): hipcc compilation failed for gemm_mq2g256_lloyd_moe_grouped_wmma_k2:\n/mnt/scratch/hipfire-kernels/rocm714/gfx942/gemm_mq2g256_lloyd_moe_grouped_wmma_k2.hip:136:19: error: '__builtin_amdgcn_wmma_f32_16x16x16_f16_w32' needs target feature wmma-256b-insts,wavefrontsize32\n  136 |             acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_a, b_a, acc);\n      |                   ^\n/mnt/scratch/hipfire-kernels/rocm714/gfx942/gemm_mq2g256_lloyd_moe_grouped_wmma_k2.hip:145:19: error: '__builtin_amdgcn_wmma_f32_16x16x16_f16_w32' needs target feature wmma-256b-insts,wavefrontsize32\n  145 |             acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_a, b_b, acc);\n      |                   ^\n2 errors generated when compiling for gfx942.\nfailed to execute:/opt/rocm/core-7.14/lib/llvm/bin/clang++  --offload-arch=gfx942  --cuda-device-only -O3 --rocm-path=/opt/rocm/core-7.14 --hip-path=/opt/rocm/core-7.14 -I/opt/rocm/core-7.14/include -o \"/mnt/scratch/hipfire-kernels/rocm714/gfx942/.gemm_mq2g256_lloyd_moe_grouped_wmma_k2.156962_0_1785619318953984786.hsaco.tmp\" -x hip /mnt/scratch/hipfire-kernels/rocm714/gfx942/gemm_mq2g256_lloyd_moe_grouped_wmma_k2.hip\n (hipError=0)"

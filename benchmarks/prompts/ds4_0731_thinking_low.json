@@ -1,0 +1,7 @@
+[
+  {
+    "genre": "reason",
+    "prompt": "A store reduces an $80 item by 25%, then adds 10% sales tax. What is the final price? Show concise reasoning.",
+    "expect": ["66"]
+  }
+]

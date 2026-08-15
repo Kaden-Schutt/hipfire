@@ -1,0 +1,69 @@
+=== df -hT ===
+Filesystem     Type     Size  Used Avail Use% Mounted on
+tmpfs          tmpfs     24G  1.5M   24G   1% /run
+/dev/vda1      ext4     697G   54G  643G   8% /
+tmpfs          tmpfs    118G   68K  118G   1% /dev/shm
+tmpfs          tmpfs    5.0M     0  5.0M   0% /run/lock
+/dev/vda16     ext4     881M  248M  572M  31% /boot
+/dev/vda15     vfat     105M  6.2M   99M   6% /boot/efi
+overlay        overlay  697G   54G  643G   8% /var/lib/docker/rootfs/overlayfs/92286c5d4d67ba7d4cb10363abf2bdd67d3ac5fcc4ebf11282a9b9b0de8687b7
+/dev/vdc1      ext4     5.0T  316G  4.5T   7% /mnt/scratch
+tmpfs          tmpfs     24G   16K   24G   1% /run/user/0
+
+=== df -B1 ===
+Filesystem         1B-blocks         Used     Available Use% Mounted on
+tmpfs            25334706176      1523712   25333182464   1% /run
+/dev/vda1       747760488448  57536753664  690206957568   8% /
+tmpfs           126673518592        69632  126673448960   1% /dev/shm
+tmpfs                5242880            0       5242880   0% /run/lock
+/dev/vda16         923156480    259239936     599273472  31% /boot
+/dev/vda15         109395456      6399488     102995968   6% /boot/efi
+overlay         747760488448  57536753664  690206957568   8% /var/lib/docker/rootfs/overlayfs/92286c5d4d67ba7d4cb10363abf2bdd67d3ac5fcc4ebf11282a9b9b0de8687b7
+/dev/vdc1      5453049012224 338406522880 4839747813376   7% /mnt/scratch
+tmpfs            25334702080        16384   25334685696   1% /run/user/0
+
+=== lsblk -f ===
+NAME    FSTYPE  FSVER LABEL           UUID                                 FSAVAIL FSUSE% MOUNTPOINTS
+vda                                                                                       
+├─vda1  ext4    1.0   cloudimg-rootfs cc6f3ac6-f24d-4276-abe9-c242adec4e04  642.8G     8% /
+├─vda14                                                                                   
+├─vda15 vfat    FAT32 UEFI            2499-3554                              98.2M     6% /boot/efi
+└─vda16 ext4    1.0   BOOT            3688c225-cd18-4633-bbc4-c62e00c21b95  571.5M    28% /boot
+vdb     iso9660       config-2        2026-08-01-08-21-17-00                              
+vdc                                                                                       
+└─vdc1  ext4    1.0   DOSCRATCH       a8059b15-c3d5-42cb-812b-f4ae16710044    4.4T     6% /mnt/scratch
+
+=== mount | sort ===
+/dev/vda1 on / type ext4 (rw,relatime,discard,errors=remount-ro,commit=30)
+/dev/vda15 on /boot/efi type vfat (rw,relatime,fmask=0077,dmask=0077,codepage=437,iocharset=iso8859-1,shortname=mixed,errors=remount-ro)
+/dev/vda16 on /boot type ext4 (rw,relatime)
+/dev/vdc1 on /mnt/scratch type ext4 (rw,relatime)
+binfmt_misc on /proc/sys/fs/binfmt_misc type binfmt_misc (rw,nosuid,nodev,noexec,relatime)
+bpf on /sys/fs/bpf type bpf (rw,nosuid,nodev,noexec,relatime,mode=700)
+cgroup2 on /sys/fs/cgroup type cgroup2 (rw,nosuid,nodev,noexec,relatime,nsdelegate,memory_recursiveprot)
+configfs on /sys/kernel/config type configfs (rw,nosuid,nodev,noexec,relatime)
+debugfs on /sys/kernel/debug type debugfs (rw,nosuid,nodev,noexec,relatime)
+devpts on /dev/pts type devpts (rw,nosuid,noexec,relatime,gid=5,mode=620,ptmxmode=000)
+fusectl on /sys/fs/fuse/connections type fusectl (rw,nosuid,nodev,noexec,relatime)
+hugetlbfs on /dev/hugepages type hugetlbfs (rw,nosuid,nodev,relatime,pagesize=2M)
+mqueue on /dev/mqueue type mqueue (rw,nosuid,nodev,noexec,relatime)
+nsfs on /run/docker/netns/4a874e9efbbf type nsfs (rw)
+overlay on /var/lib/docker/rootfs/overlayfs/92286c5d4d67ba7d4cb10363abf2bdd67d3ac5fcc4ebf11282a9b9b0de8687b7 type overlay (rw,relatime,lowerdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/55/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/35/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/34/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/33/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/32/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/31/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/30/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/29/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/28/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/27/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/26/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/1/fs,upperdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/56/fs,workdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/56/work,nouserxattr)
+proc on /proc type proc (rw,nosuid,nodev,noexec,relatime)
+pstore on /sys/fs/pstore type pstore (rw,nosuid,nodev,noexec,relatime)
+securityfs on /sys/kernel/security type securityfs (rw,nosuid,nodev,noexec,relatime)
+sysfs on /sys type sysfs (rw,nosuid,nodev,noexec,relatime)
+systemd-1 on /proc/sys/fs/binfmt_misc type autofs (rw,relatime,fd=32,pgrp=1,timeout=0,minproto=5,maxproto=5,direct,pipe_ino=24587)
+tmpfs on /dev/shm type tmpfs (rw,nosuid,nodev,inode64)
+tmpfs on /run type tmpfs (rw,nosuid,nodev,noexec,relatime,size=24740924k,mode=755,inode64)
+tmpfs on /run/lock type tmpfs (rw,nosuid,nodev,noexec,relatime,size=5120k,inode64)
+tmpfs on /run/user/0 type tmpfs (rw,nosuid,nodev,relatime,size=24740920k,nr_inodes=6185230,mode=700,inode64)
+tracefs on /sys/kernel/tracing type tracefs (rw,nosuid,nodev,noexec,relatime)
+udev on /dev type devtmpfs (rw,nosuid,relatime,size=123629560k,nr_inodes=30907390,mode=755,inode64)
+
+=== writability probes (root) ===
+WRITABLE /
+WRITABLE /mnt/scratch
+WRITABLE /tmp
+WRITABLE /dev/shm
+WRITABLE /root

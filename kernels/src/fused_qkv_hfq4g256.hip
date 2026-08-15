@@ -4,6 +4,32 @@
 
 #include <hip/hip_runtime.h>
 
+#if defined(HIPFIRE_RDNA3_QKV_X_BUFFER)
+using hipfire_qkv_i32x4 = int __attribute__((ext_vector_type(4)));
+using hipfire_qkv_f32x4 = float __attribute__((ext_vector_type(4)));
+#endif
+
+#ifndef HIPFIRE_QKV_KERNEL_NAME
+#define HIPFIRE_QKV_KERNEL_NAME fused_qkv_hfq4g256
+#endif
+
+#if defined(HIPFIRE_QKV_WITH_BIAS)
+#define HIPFIRE_QKV_BIAS_ARGS \
+    , const float* __restrict__ bias_q \
+    , const float* __restrict__ bias_k \
+    , const float* __restrict__ bias_v
+#define HIPFIRE_QKV_BIAS_DECL const float* bias;
+#define HIPFIRE_QKV_BIAS_Q bias = bias_q;
+#define HIPFIRE_QKV_BIAS_K bias = bias_k;
+#define HIPFIRE_QKV_BIAS_V bias = bias_v;
+#else
+#define HIPFIRE_QKV_BIAS_ARGS
+#define HIPFIRE_QKV_BIAS_DECL
+#define HIPFIRE_QKV_BIAS_Q
+#define HIPFIRE_QKV_BIAS_K
+#define HIPFIRE_QKV_BIAS_V
+#endif
+
 // 3-way fused HFQ4-G256 GEMV for the Qwen3.5 FullAttention layer preamble.
 // One kernel launch performs all three projections from a single shared
 // x_rot input:
@@ -23,7 +49,7 @@
 // Bit-exact with three sequential gemv_hfq4g256 calls.
 
 __launch_bounds__(32, 16)
-extern "C" __global__ void fused_qkv_hfq4g256(
+extern "C" __global__ void HIPFIRE_QKV_KERNEL_NAME(
     const char*  __restrict__ A_q,
     const char*  __restrict__ A_k,
     const char*  __restrict__ A_v,
@@ -32,7 +58,7 @@ extern "C" __global__ void fused_qkv_hfq4g256(
     float*       __restrict__ y_k,
     float*       __restrict__ y_v,
     int q_m, int k_m, int v_m,
-    int K
+    int K HIPFIRE_QKV_BIAS_ARGS
 ) {
     const int gid = blockIdx.x;
     const int total_m = q_m + k_m + v_m;
@@ -42,18 +68,30 @@ extern "C" __global__ void fused_qkv_hfq4g256(
     const char* A;
     float* y;
     int row;
+    HIPFIRE_QKV_BIAS_DECL
     if (gid < q_m) {
-        A = A_q; y = y_q; row = gid;
+        A = A_q; y = y_q; row = gid; HIPFIRE_QKV_BIAS_Q
     } else if (gid < q_m + k_m) {
-        A = A_k; y = y_k; row = gid - q_m;
+        A = A_k; y = y_k; row = gid - q_m; HIPFIRE_QKV_BIAS_K
     } else {
-        A = A_v; y = y_v; row = gid - q_m - k_m;
+        A = A_v; y = y_v; row = gid - q_m - k_m; HIPFIRE_QKV_BIAS_V
     }
 
     const int tid = threadIdx.x;
+#if defined(HIPFIRE_RDNA3_QKV_K2048)
+    const int groups_per_row = 8;
+#else
     const int groups_per_row = K / 256;
+#endif
     const char* row_ptr = A + (long long)row * groups_per_row * 136;
     const int boff = tid * 4;
+#if HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS
+    const auto row_rsrc = HIPFIRE_WEIGHT_RSRC(row_ptr);
+#endif
+#if defined(HIPFIRE_RDNA3_QKV_X_BUFFER)
+    const auto x_rsrc = __builtin_amdgcn_make_buffer_rsrc(
+        const_cast<float*>(x), 0, 0xffffffffu, 0x31004000u);
+#endif
 
     float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
     const int quads = groups_per_row >> 2;
@@ -66,22 +104,62 @@ extern "C" __global__ void fused_qkv_hfq4g256(
         const char* gp2 = gp1 + 136;
         const char* gp3 = gp2 + 136;
 
-        float sc0 = __builtin_bit_cast(float, *(const unsigned int*)(gp0));
-        float zp0 = __builtin_bit_cast(float, *(const unsigned int*)(gp0 + 4));
-        float sc1 = __builtin_bit_cast(float, *(const unsigned int*)(gp1));
-        float zp1 = __builtin_bit_cast(float, *(const unsigned int*)(gp1 + 4));
-        float sc2 = __builtin_bit_cast(float, *(const unsigned int*)(gp2));
-        float zp2 = __builtin_bit_cast(float, *(const unsigned int*)(gp2 + 4));
-        float sc3 = __builtin_bit_cast(float, *(const unsigned int*)(gp3));
-        float zp3 = __builtin_bit_cast(float, *(const unsigned int*)(gp3 + 4));
+        float sc0 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp0, (g + 0) * 136));
+        float zp0 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp0 + 4, (g + 0) * 136 + 4));
+        float sc1 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp1, (g + 1) * 136));
+        float zp1 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp1 + 4, (g + 1) * 136 + 4));
+        float sc2 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp2, (g + 2) * 136));
+        float zp2 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp2 + 4, (g + 2) * 136 + 4));
+        float sc3 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp3, (g + 3) * 136));
+        float zp3 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp3 + 4, (g + 3) * 136 + 4));
 
-        unsigned int pk0 = *(const unsigned int*)(gp0 + 8 + boff);
-        unsigned int pk1 = *(const unsigned int*)(gp1 + 8 + boff);
-        unsigned int pk2 = *(const unsigned int*)(gp2 + 8 + boff);
-        unsigned int pk3 = *(const unsigned int*)(gp3 + 8 + boff);
+        unsigned int pk0 = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp0 + 8 + boff, (g + 0) * 136 + 8 + boff);
+        unsigned int pk1 = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp1 + 8 + boff, (g + 1) * 136 + 8 + boff);
+        unsigned int pk2 = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp2 + 8 + boff, (g + 2) * 136 + 8 + boff);
+        unsigned int pk3 = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp3 + 8 + boff, (g + 3) * 136 + 8 + boff);
 
         int base = g * 256 + tid * 8;
 
+#if defined(HIPFIRE_RDNA3_QKV_X_BUFFER)
+        const hipfire_qkv_f32x4 xv0a = __builtin_bit_cast(
+            hipfire_qkv_f32x4, __builtin_amdgcn_raw_buffer_load_b128(
+                x_rsrc, (base + 0) * 4, 0, 0));
+        const hipfire_qkv_f32x4 xv0b = __builtin_bit_cast(
+            hipfire_qkv_f32x4, __builtin_amdgcn_raw_buffer_load_b128(
+                x_rsrc, (base + 4) * 4, 0, 0));
+        const hipfire_qkv_f32x4 xv1a = __builtin_bit_cast(
+            hipfire_qkv_f32x4, __builtin_amdgcn_raw_buffer_load_b128(
+                x_rsrc, (base + 256) * 4, 0, 0));
+        const hipfire_qkv_f32x4 xv1b = __builtin_bit_cast(
+            hipfire_qkv_f32x4, __builtin_amdgcn_raw_buffer_load_b128(
+                x_rsrc, (base + 260) * 4, 0, 0));
+        const hipfire_qkv_f32x4 xv2a = __builtin_bit_cast(
+            hipfire_qkv_f32x4, __builtin_amdgcn_raw_buffer_load_b128(
+                x_rsrc, (base + 512) * 4, 0, 0));
+        const hipfire_qkv_f32x4 xv2b = __builtin_bit_cast(
+            hipfire_qkv_f32x4, __builtin_amdgcn_raw_buffer_load_b128(
+                x_rsrc, (base + 516) * 4, 0, 0));
+        const hipfire_qkv_f32x4 xv3a = __builtin_bit_cast(
+            hipfire_qkv_f32x4, __builtin_amdgcn_raw_buffer_load_b128(
+                x_rsrc, (base + 768) * 4, 0, 0));
+        const hipfire_qkv_f32x4 xv3b = __builtin_bit_cast(
+            hipfire_qkv_f32x4, __builtin_amdgcn_raw_buffer_load_b128(
+                x_rsrc, (base + 772) * 4, 0, 0));
+        #define DOG_V(pk, sc, zp, a, x0, x1, x2, x3, x4, x5, x6, x7) \
+            (a) += (sc * (float)((pk) & 0xFu)         + zp) * (x0) \
+                 + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * (x1) \
+                 + (sc * (float)(((pk) >> 8) & 0xFu)  + zp) * (x2) \
+                 + (sc * (float)(((pk) >> 12) & 0xFu) + zp) * (x3) \
+                 + (sc * (float)(((pk) >> 16) & 0xFu) + zp) * (x4) \
+                 + (sc * (float)(((pk) >> 20) & 0xFu) + zp) * (x5) \
+                 + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * (x6) \
+                 + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * (x7)
+        DOG_V(pk0, sc0, zp0, acc0, xv0a.x,xv0a.y,xv0a.z,xv0a.w,xv0b.x,xv0b.y,xv0b.z,xv0b.w);
+        DOG_V(pk1, sc1, zp1, acc1, xv1a.x,xv1a.y,xv1a.z,xv1a.w,xv1b.x,xv1b.y,xv1b.z,xv1b.w);
+        DOG_V(pk2, sc2, zp2, acc2, xv2a.x,xv2a.y,xv2a.z,xv2a.w,xv2b.x,xv2b.y,xv2b.z,xv2b.w);
+        DOG_V(pk3, sc3, zp3, acc3, xv3a.x,xv3a.y,xv3a.z,xv3a.w,xv3b.x,xv3b.y,xv3b.z,xv3b.w);
+        #undef DOG_V
+#else
         #define DOG(pk, sc, zp, b, a) \
             (a) += (sc * (float)((pk) & 0xFu)        + zp) * x[(b)]     \
                  + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * x[(b) + 1] \
@@ -97,6 +175,7 @@ extern "C" __global__ void fused_qkv_hfq4g256(
         DOG(pk2, sc2, zp2, base + 512, acc2);
         DOG(pk3, sc3, zp3, base + 768, acc3);
         #undef DOG
+#endif
     }
 
     // Tail handling: preserve acc[gi] interleaving. See 5302926 bug report.
@@ -143,5 +222,9 @@ extern "C" __global__ void fused_qkv_hfq4g256(
     for (int offset = 16; offset > 0; offset >>= 1)
         acc += __shfl_down(acc, offset);
 
+#if defined(HIPFIRE_QKV_WITH_BIAS)
+    if (tid == 0) y[row] = acc + (bias ? bias[row] : 0.0f);
+#else
     if (tid == 0) y[row] = acc;
+#endif
 }

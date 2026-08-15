@@ -1,0 +1,53 @@
+PATH /mnt/scratch/models/deepseek-v4-flash-mq2r/deepseek-v4-flash.mq2r
+ header {'magic': 'HFQM', 'ver': 1, 'arch_id': 9, 'n_tensors': 34223, 'meta_off': 32, 'data_off': 9162752, 'file_size': 82191362222}
+ architecture deepseek_v4
+ config_subset {'model_type': 'deepseek_v4', 'num_hidden_layers': 43, 'num_experts_per_tok': 6, 'n_routed_experts': 256, 'hidden_size': 4096, 'expert_dtype': 'fp4', 'vocab_size': 129280}
+ catalog_start 7172305
+ parsed 34223 total_data_bytes 82182199470 data_region_bytes 82182199470 match True
+ DTYPE_COUNTS:
+  qt=  1 F16              n=   641 e.g. [('hc_head_base', [4], 0, 8), ('hc_head_fn', [4, 16384], 0, 131072)]
+  qt=  3 Q8F16            n=     1 e.g. [('embed.weight', [129280, 4096], 32, 562626560)]
+  qt= 19 MQ2G256Lloyd     n= 33024 e.g. [('layers.0.ffn.experts.0.w1.weight', [2048, 4096], 256, 2359296), ('layers.0.ffn.experts.0.w2.weight', [4096, 2048], 256, 2359296)]
+  qt= 22 TidI32           n=     3 e.g. [('layers.0.ffn.gate.tid2eid', [129280, 6], 0, 3102720), ('layers.1.ffn.gate.tid2eid', [129280, 6], 0, 3102720)]
+  qt= 35 MFP4SoA_or_35    n=   554 e.g. [('head.weight', [129280, 4096], 32, 283381760), ('layers.0.attn.wkv.weight', [512, 4096], 32, 1122304)]
+ has_MQ4G256(13) 0 has_MQ4G256Lloyd(30) 0 has_MQ2G256(18) 0 has_MQ2G256Lloyd(19) 33024 has_MFP4SoA(35) 554
+====
+PATH /mnt/scratch/models/existing-deepseek-v4-flash/deepseek-v4-flash.mq2lloyd
+ header {'magic': 'HFQM', 'ver': 1, 'arch_id': 9, 'n_tensors': 34223, 'meta_off': 32, 'data_off': 9160101, 'file_size': 86184307283}
+ architecture deepseek_v4
+ config_subset {'model_type': 'deepseek_v4', 'num_hidden_layers': 43, 'num_experts_per_tok': 6, 'n_routed_experts': 256, 'hidden_size': 4096, 'expert_dtype': 'fp4', 'vocab_size': 129280}
+ catalog_start 7172305
+ parsed 34223 total_data_bytes 86175147182 data_region_bytes 86175147182 match True
+ DTYPE_COUNTS:
+  qt=  1 F16              n=   807 e.g. [('hc_head_base', [4], 0, 8), ('hc_head_fn', [4, 16384], 0, 131072)]
+  qt=  3 Q8F16            n=   389 e.g. [('embed.weight', [129280, 4096], 32, 562626560), ('head.weight', [129280, 4096], 32, 562626560)]
+  qt= 19 MQ2G256Lloyd     n= 33024 e.g. [('layers.0.ffn.experts.0.w1.weight', [2048, 4096], 256, 2359296), ('layers.0.ffn.experts.0.w2.weight', [4096, 2048], 256, 2359296)]
+  qt= 22 TidI32           n=     3 e.g. [('layers.0.ffn.gate.tid2eid', [129280, 6], 0, 3102720), ('layers.1.ffn.gate.tid2eid', [129280, 6], 0, 3102720)]
+ has_MQ4G256(13) 0 has_MQ4G256Lloyd(30) 0 has_MQ2G256(18) 0 has_MQ2G256Lloyd(19) 33024 has_MFP4SoA(35) 0
+====
+PATH /mnt/scratch/models/existing-deepseek-v4-flash/deepseek-v4-flash-mtp.mq2lloyd
+ header {'magic': 'HFQM', 'ver': 1, 'arch_id': 9, 'n_tensors': 797, 'meta_off': 32, 'data_off': 7215493, 'file_size': 1998047355}
+ architecture deepseek_v4
+ config_subset {'model_type': 'deepseek_v4', 'num_hidden_layers': 43, 'num_experts_per_tok': 6, 'n_routed_experts': 256, 'hidden_size': 4096, 'expert_dtype': 'fp4', 'vocab_size': 129280}
+ catalog_start 7172345
+ PARSE_ERR at tensor 796 unpack_from requires a buffer of at least 7215463 bytes for unpacking 2 bytes at offset 7215461 (actual buffer size is 7215461)
+====
+PATH /root/.hipfire/models/hipfire-deepseek-v4-flash/deepseek-v4-flash-mtp.mq2lloyd
+ header {'magic': 'HFQM', 'ver': 1, 'arch_id': 9, 'n_tensors': 797, 'meta_off': 32, 'data_off': 7215493, 'file_size': 24117248}
+ architecture deepseek_v4
+ config_subset {'model_type': 'deepseek_v4', 'num_hidden_layers': 43, 'num_experts_per_tok': 6, 'n_routed_experts': 256, 'hidden_size': 4096, 'expert_dtype': 'fp4', 'vocab_size': 129280}
+ catalog_start 7172345
+ PARSE_ERR at tensor 796 unpack_from requires a buffer of at least 7215463 bytes for unpacking 2 bytes at offset 7215461 (actual buffer size is 7215461)
+====
+PATH /mnt/scratch/models/qwen3.5-0.8b/qwen3.5-0.8b.mq4
+ header {'magic': 'HFQM', 'ver': 1, 'arch_id': 5, 'n_tensors': 320, 'meta_off': 32, 'data_off': 14344192, 'file_size': 549221504}
+ architecture qwen3_5
+ config_subset {'model_type': 'qwen3_5', 'num_hidden_layers': None, 'num_experts_per_tok': None, 'n_routed_experts': None, 'hidden_size': None, 'expert_dtype': None, 'vocab_size': None}
+ catalog_start 14316616
+ parsed 320 total_data_bytes 534877312 data_region_bytes 534877312 match True
+ DTYPE_COUNTS:
+  qt=  1 F16              n=   115 e.g. [('model.language_model.layers.0.input_layernorm.weight', [1024], 0, 2048), ('model.language_model.layers.0.linear_attn.A_log', [16], 0, 32)]
+  qt=  3 Q8F16            n=     1 e.g. [('model.language_model.embed_tokens.weight', [248320, 1024], 32, 270172160)]
+  qt= 13 MQ4G256          n=   204 e.g. [('model.language_model.layers.0.linear_attn.conv1d.weight', [6144, 1, 4], 256, 13056), ('model.language_model.layers.0.linear_attn.in_proj_a.weight', [16, 1024], 256, 8704)]
+ has_MQ4G256(13) 204 has_MQ4G256Lloyd(30) 0 has_MQ2G256(18) 0 has_MQ2G256Lloyd(19) 0 has_MFP4SoA(35) 0
+====

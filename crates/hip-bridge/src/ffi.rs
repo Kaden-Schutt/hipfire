@@ -110,8 +110,18 @@ type HipFunction = *mut c_void;
 type HipEvent = *mut c_void;
 type HipGraph = *mut c_void;
 type HipGraphExec = *mut c_void;
+pub type HipMemGenericAllocationHandle = *mut c_void;
 
 const HIP_SUCCESS: u32 = 0;
+pub const HIP_MEM_LOCATION_TYPE_DEVICE: u32 = 1;
+pub const HIP_MEM_ALLOCATION_TYPE_PINNED: u32 = 1;
+pub const HIP_MEM_ACCESS_FLAGS_PROT_READ_WRITE: u32 = 3;
+pub const HIP_MEM_ALLOCATION_GRANULARITY_MINIMUM: u32 = 0;
+pub const HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED: u32 = 1;
+/// Dependency event: omit profiling state and retain the default system fence.
+pub const HIP_EVENT_DISABLE_TIMING: u32 = 0x2;
+/// Request an explicit system-scope release when recording an event.
+pub const HIP_EVENT_RELEASE_TO_SYSTEM: u32 = 0x8000_0000;
 
 /// `hipPointerAttribute_t` per ROCm 6.4.3 layout. ROCm 5.x not supported.
 #[repr(C)]
@@ -134,6 +144,72 @@ impl Default for HipPointerAttribute {
             host_pointer: ptr::null_mut(),
             is_managed: 0,
             allocation_flags: 0,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct HipMemLocation {
+    pub type_: u32,
+    pub id: c_int,
+}
+
+impl HipMemLocation {
+    pub fn device(id: i32) -> Self {
+        Self {
+            type_: HIP_MEM_LOCATION_TYPE_DEVICE,
+            id,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct HipMemAllocationFlags {
+    pub compression_type: u8,
+    pub gpu_direct_rdma_capable: u8,
+    pub usage: u16,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct HipMemAllocationProp {
+    pub type_: u32,
+    pub requested_handle_types: u32,
+    pub location: HipMemLocation,
+    pub win32_handle_meta_data: *mut c_void,
+    pub alloc_flags: HipMemAllocationFlags,
+}
+
+impl HipMemAllocationProp {
+    pub fn device_pinned(device: i32) -> Self {
+        Self {
+            type_: HIP_MEM_ALLOCATION_TYPE_PINNED,
+            requested_handle_types: 0,
+            location: HipMemLocation::device(device),
+            win32_handle_meta_data: ptr::null_mut(),
+            alloc_flags: HipMemAllocationFlags {
+                compression_type: 0,
+                gpu_direct_rdma_capable: 0,
+                usage: 0,
+            },
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct HipMemAccessDesc {
+    pub location: HipMemLocation,
+    pub flags: u32,
+}
+
+impl HipMemAccessDesc {
+    pub fn read_write_device(device: i32) -> Self {
+        Self {
+            location: HipMemLocation::device(device),
+            flags: HIP_MEM_ACCESS_FLAGS_PROT_READ_WRITE,
         }
     }
 }
@@ -164,12 +240,35 @@ pub struct HipRuntime {
 
     // Memory
     fn_malloc: unsafe extern "C" fn(*mut *mut c_void, usize) -> u32,
+    fn_ext_malloc_with_flags: Option<unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> u32>,
     fn_free: unsafe extern "C" fn(*mut c_void) -> u32,
+    fn_mem_get_address_range:
+        unsafe extern "C" fn(*mut *mut c_void, *mut usize, *mut c_void) -> u32,
     fn_memcpy: unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_uint) -> u32,
     fn_memcpy_async:
         unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_uint, HipStream) -> u32,
     fn_memset: unsafe extern "C" fn(*mut c_void, c_int, usize) -> u32,
     fn_memset_async: unsafe extern "C" fn(*mut c_void, c_int, usize, HipStream) -> u32,
+    fn_mem_address_reserve:
+        Option<unsafe extern "C" fn(*mut *mut c_void, usize, usize, *mut c_void, u64) -> u32>,
+    fn_mem_address_free: Option<unsafe extern "C" fn(*mut c_void, usize) -> u32>,
+    fn_mem_create: Option<
+        unsafe extern "C" fn(
+            *mut HipMemGenericAllocationHandle,
+            usize,
+            *const HipMemAllocationProp,
+            u64,
+        ) -> u32,
+    >,
+    fn_mem_get_allocation_granularity:
+        Option<unsafe extern "C" fn(*mut usize, *const HipMemAllocationProp, u32) -> u32>,
+    fn_mem_map: Option<
+        unsafe extern "C" fn(*mut c_void, usize, usize, HipMemGenericAllocationHandle, u64) -> u32,
+    >,
+    fn_mem_unmap: Option<unsafe extern "C" fn(*mut c_void, usize) -> u32>,
+    fn_mem_set_access:
+        Option<unsafe extern "C" fn(*mut c_void, usize, *const HipMemAccessDesc, usize) -> u32>,
+    fn_mem_release: Option<unsafe extern "C" fn(HipMemGenericAllocationHandle) -> u32>,
 
     // Streams
     fn_stream_create: unsafe extern "C" fn(*mut HipStream) -> u32,
@@ -196,6 +295,7 @@ pub struct HipRuntime {
 
     // Events
     fn_event_create: unsafe extern "C" fn(*mut HipEvent) -> u32,
+    fn_event_create_with_flags: unsafe extern "C" fn(*mut HipEvent, c_uint) -> u32,
     fn_event_record: unsafe extern "C" fn(HipEvent, HipStream) -> u32,
     fn_event_synchronize: unsafe extern "C" fn(HipEvent) -> u32,
     fn_event_elapsed_time: unsafe extern "C" fn(*mut f32, HipEvent, HipEvent) -> u32,
@@ -216,6 +316,8 @@ pub struct HipRuntime {
     fn_graph_destroy: unsafe extern "C" fn(HipGraph) -> u32,
     // Stream memory ops (HIP 7.2+)
     fn_stream_write_value32: unsafe extern "C" fn(HipStream, *mut c_void, u32, c_uint) -> u32,
+    fn_stream_wait_value32:
+        Option<unsafe extern "C" fn(HipStream, *mut c_void, u32, c_uint, u32) -> u32>,
     fn_device_synchronize: unsafe extern "C" fn() -> u32,
     fn_get_device_properties: unsafe extern "C" fn(*mut u8, c_int) -> u32,
     fn_get_device_attribute: unsafe extern "C" fn(*mut c_int, c_int, c_int) -> u32,
@@ -235,63 +337,62 @@ macro_rules! load_fn {
     }};
 }
 
+macro_rules! load_optional_fn {
+    ($lib:expr, $name:expr, $ty:ty) => {{
+        $lib.get::<$ty>($name.as_bytes())
+            .ok()
+            .map(|sym| *sym.into_raw())
+    }};
+}
+
 impl HipRuntime {
     /// Load the HIP runtime via dlopen.
-    /// Searches standard paths: /opt/rocm/lib, system library path.
+    /// Uses the shared ROCm resolver so runtime, headers, and hipcc stay within
+    /// one selected installation.
     pub fn load() -> HipResult<Self> {
-        #[cfg(target_os = "windows")]
+        // Windows and Unix share one candidate policy in hipfire_config::rocm so a
+        // selected/configured root never falls through to another install's DLL
+        // (user cache or bare PATH names). HIP_RUNTIME_LIBRARIES already encodes
+        // the host's preferred filenames (amdhip64*.dll vs libamdhip64.so*).
+        let candidates =
+            hipfire_config::rocm::library_candidates(hipfire_config::rocm::HIP_RUNTIME_LIBRARIES);
         let lib = unsafe {
-            let userprofile = std::env::var("USERPROFILE").unwrap_or_default();
-            let hip_path = std::env::var("HIP_PATH").unwrap_or_default();
-            let p1 = format!(r"{userprofile}\.hipfire\runtime\amdhip64.dll");
-            let p2 = format!(r"{hip_path}\bin\amdhip64.dll");
-            // Try unversioned first, then versioned names (HIP SDK 7.x installs amdhip64_7.dll)
-            Library::new(&p1)
-                .or_else(|_| Library::new(&p2))
-                .or_else(|_| Library::new("amdhip64.dll"))
-                .or_else(|_| Library::new("amdhip64_7.dll"))
-                .or_else(|_| Library::new("amdhip64_6.dll"))
-                .or_else(|_| {
-                    // Try versioned names in explicit paths (runtime dir + HIP_PATH)
-                    let rt = format!(r"{userprofile}\.hipfire\runtime");
-                    let hp = format!(r"{hip_path}\bin");
-                    Library::new(&format!(r"{rt}\amdhip64_7.dll"))
-                        .or_else(|_| Library::new(&format!(r"{rt}\amdhip64_6.dll")))
-                        .or_else(|_| Library::new(&format!(r"{hp}\amdhip64_7.dll")))
-                        .or_else(|_| Library::new(&format!(r"{hp}\amdhip64_6.dll")))
-                })
-                .map_err(|e| {
-                    HipError::new(
+            let mut loaded = None;
+            let mut last_err = None;
+            for candidate in &candidates {
+                match Library::new(candidate) {
+                    Ok(l) => {
+                        loaded = Some(l);
+                        break;
+                    }
+                    Err(e) => last_err = Some(e),
+                }
+            }
+            match loaded {
+                Some(l) => l,
+                None => {
+                    let runtime_label = if cfg!(target_os = "windows") {
+                        "the HIP runtime (amdhip64.dll)"
+                    } else {
+                        "the HIP runtime (libamdhip64.so)"
+                    };
+                    let short_name = if cfg!(target_os = "windows") {
+                        "amdhip64.dll"
+                    } else {
+                        "libamdhip64.so"
+                    };
+                    return Err(HipError::new(
                         0,
                         &format!(
-                            "failed to load amdhip64.dll: {e}. \
-                             Searched: {p1}, {p2}, amdhip64.dll, amdhip64_7.dll, amdhip64_6.dll (PATH). \
-                             Is ROCm/HIP installed?"
+                            "failed to load {short_name}: {}.\n{}",
+                            last_err
+                                .map(|e| e.to_string())
+                                .unwrap_or_else(|| "no candidates".into()),
+                            hipfire_config::rocm::resolution_failure(runtime_label, &candidates)
                         ),
-                    )
-                })?
-        };
-
-        #[cfg(not(target_os = "windows"))]
-        let lib = unsafe {
-            // Try unversioned first (canonical with rocm-hip-devel symlink),
-            // then versioned SONAMEs. Fedora's `rocm-hip` package ships only
-            // `libamdhip64.so.6` — the unversioned `.so` symlink is in the
-            // `-devel` package which most users don't have. Reported in #64.
-            Library::new("libamdhip64.so")
-                .or_else(|_| Library::new("libamdhip64.so.7"))
-                .or_else(|_| Library::new("libamdhip64.so.6"))
-                .or_else(|_| Library::new("libamdhip64.so.5"))
-                .map_err(|e| {
-                    HipError::new(
-                        0,
-                        &format!(
-                            "failed to dlopen libamdhip64.so: {e}. \
-                             Tried: libamdhip64.so, libamdhip64.so.7, .so.6, .so.5. \
-                             Is ROCm installed?"
-                        ),
-                    )
-                })?
+                    ));
+                }
+            }
         };
 
         let runtime = unsafe {
@@ -355,7 +456,17 @@ impl HipRuntime {
                     "hipMalloc",
                     unsafe extern "C" fn(*mut *mut c_void, usize) -> u32
                 ),
+                fn_ext_malloc_with_flags: load_optional_fn!(
+                    lib,
+                    "hipExtMallocWithFlags",
+                    unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> u32
+                ),
                 fn_free: load_fn!(lib, "hipFree", unsafe extern "C" fn(*mut c_void) -> u32),
+                fn_mem_get_address_range: load_fn!(
+                    lib,
+                    "hipMemGetAddressRange",
+                    unsafe extern "C" fn(*mut *mut c_void, *mut usize, *mut c_void) -> u32
+                ),
                 fn_memcpy: load_fn!(
                     lib,
                     "hipMemcpy",
@@ -381,6 +492,57 @@ impl HipRuntime {
                     lib,
                     "hipMemsetAsync",
                     unsafe extern "C" fn(*mut c_void, c_int, usize, HipStream) -> u32
+                ),
+                fn_mem_address_reserve: load_optional_fn!(
+                    lib,
+                    "hipMemAddressReserve",
+                    unsafe extern "C" fn(*mut *mut c_void, usize, usize, *mut c_void, u64) -> u32
+                ),
+                fn_mem_address_free: load_optional_fn!(
+                    lib,
+                    "hipMemAddressFree",
+                    unsafe extern "C" fn(*mut c_void, usize) -> u32
+                ),
+                fn_mem_create: load_optional_fn!(
+                    lib,
+                    "hipMemCreate",
+                    unsafe extern "C" fn(
+                        *mut HipMemGenericAllocationHandle,
+                        usize,
+                        *const HipMemAllocationProp,
+                        u64,
+                    ) -> u32
+                ),
+                fn_mem_get_allocation_granularity: load_optional_fn!(
+                    lib,
+                    "hipMemGetAllocationGranularity",
+                    unsafe extern "C" fn(*mut usize, *const HipMemAllocationProp, u32) -> u32
+                ),
+                fn_mem_map: load_optional_fn!(
+                    lib,
+                    "hipMemMap",
+                    unsafe extern "C" fn(
+                        *mut c_void,
+                        usize,
+                        usize,
+                        HipMemGenericAllocationHandle,
+                        u64,
+                    ) -> u32
+                ),
+                fn_mem_unmap: load_optional_fn!(
+                    lib,
+                    "hipMemUnmap",
+                    unsafe extern "C" fn(*mut c_void, usize) -> u32
+                ),
+                fn_mem_set_access: load_optional_fn!(
+                    lib,
+                    "hipMemSetAccess",
+                    unsafe extern "C" fn(*mut c_void, usize, *const HipMemAccessDesc, usize) -> u32
+                ),
+                fn_mem_release: load_optional_fn!(
+                    lib,
+                    "hipMemRelease",
+                    unsafe extern "C" fn(HipMemGenericAllocationHandle) -> u32
                 ),
                 fn_stream_create: load_fn!(
                     lib,
@@ -433,6 +595,11 @@ impl HipRuntime {
                     lib,
                     "hipEventCreate",
                     unsafe extern "C" fn(*mut HipEvent) -> u32
+                ),
+                fn_event_create_with_flags: load_fn!(
+                    lib,
+                    "hipEventCreateWithFlags",
+                    unsafe extern "C" fn(*mut HipEvent, c_uint) -> u32
                 ),
                 fn_event_record: load_fn!(
                     lib,
@@ -506,6 +673,11 @@ impl HipRuntime {
                     "hipStreamWriteValue32",
                     unsafe extern "C" fn(HipStream, *mut c_void, u32, c_uint) -> u32
                 ),
+                fn_stream_wait_value32: load_optional_fn!(
+                    lib,
+                    "hipStreamWaitValue32",
+                    unsafe extern "C" fn(HipStream, *mut c_void, u32, c_uint, u32) -> u32
+                ),
                 fn_device_synchronize: load_fn!(
                     lib,
                     "hipDeviceSynchronize",
@@ -552,6 +724,12 @@ impl HipRuntime {
                 Some(&self.fn_get_error_string),
             ))
         }
+    }
+
+    fn missing_vmm_symbol<T>(&self, symbol: &str, value: Option<T>) -> HipResult<T> {
+        value.ok_or_else(|| {
+            HipError::new(0, &format!("{symbol} is not available in this HIP runtime"))
+        })
     }
 
     // ── Version ────────────────────────────────────────────────
@@ -698,14 +876,165 @@ impl HipRuntime {
         let mut ptr: *mut c_void = ptr::null_mut();
         let code = unsafe { (self.fn_malloc)(&mut ptr, size) };
         self.check(code, "hipMalloc")?;
-        Ok(DeviceBuffer { ptr, size })
+        Ok(DeviceBuffer {
+            ptr,
+            size,
+            ownership: crate::DeviceBufferOwnership::HipMalloc,
+        })
+    }
+
+    /// Allocate system-visible signal memory for stream wait/write operations.
+    ///
+    /// This is an optional ROCm capability. Loading `HipRuntime` remains
+    /// compatible with runtimes that do not export `hipExtMallocWithFlags`;
+    /// callers receive a scoped error only when they request signal memory.
+    pub fn malloc_signal(&self, size: usize) -> HipResult<DeviceBuffer> {
+        const HIP_MALLOC_SIGNAL_MEMORY: c_uint = 0x2;
+        let Some(ext_malloc) = self.fn_ext_malloc_with_flags else {
+            return Err(HipError::new(
+                0,
+                "hipExtMallocWithFlags unavailable; signal memory is unsupported",
+            ));
+        };
+        let mut ptr: *mut c_void = ptr::null_mut();
+        let code = unsafe { ext_malloc(&mut ptr, size, HIP_MALLOC_SIGNAL_MEMORY) };
+        self.check(code, "hipExtMallocWithFlags(hipMallocSignalMemory)")?;
+        Ok(DeviceBuffer {
+            ptr,
+            size,
+            ownership: crate::DeviceBufferOwnership::HipMalloc,
+        })
     }
 
     /// # Safety
     /// Caller must ensure the buffer is not in use by any pending GPU operations.
     pub fn free(&self, buf: DeviceBuffer) -> HipResult<()> {
+        if !buf.is_hip_allocation() {
+            return Err(HipError::new(
+                0,
+                "hipFree rejected a borrowed or VMM DeviceBuffer",
+            ));
+        }
         let code = unsafe { (self.fn_free)(buf.ptr) };
         self.check(code, "hipFree")
+    }
+
+    pub fn mem_get_allocation_granularity(
+        &self,
+        prop: &HipMemAllocationProp,
+        option: u32,
+    ) -> HipResult<usize> {
+        let func = self.missing_vmm_symbol(
+            "hipMemGetAllocationGranularity",
+            self.fn_mem_get_allocation_granularity,
+        )?;
+        let mut granularity: usize = 0;
+        let code = unsafe {
+            func(
+                &mut granularity,
+                prop as *const HipMemAllocationProp,
+                option,
+            )
+        };
+        self.check(code, "hipMemGetAllocationGranularity")?;
+        Ok(granularity)
+    }
+
+    pub fn mem_address_reserve(&self, size: usize, alignment: usize) -> HipResult<*mut c_void> {
+        let func = self.missing_vmm_symbol("hipMemAddressReserve", self.fn_mem_address_reserve)?;
+        let mut ptr: *mut c_void = ptr::null_mut();
+        let code = unsafe { func(&mut ptr, size, alignment, ptr::null_mut(), 0) };
+        self.check(code, "hipMemAddressReserve")?;
+        Ok(ptr)
+    }
+
+    /// # Safety
+    /// `ptr` and `size` must describe an unmapped reservation returned by
+    /// [`Self::mem_address_reserve`] that has not already been freed.
+    pub unsafe fn mem_address_free(&self, ptr: *mut c_void, size: usize) -> HipResult<()> {
+        let func = self.missing_vmm_symbol("hipMemAddressFree", self.fn_mem_address_free)?;
+        let code = unsafe { func(ptr, size) };
+        self.check(code, "hipMemAddressFree")
+    }
+
+    pub fn mem_create(
+        &self,
+        size: usize,
+        prop: &HipMemAllocationProp,
+    ) -> HipResult<HipMemGenericAllocationHandle> {
+        let func = self.missing_vmm_symbol("hipMemCreate", self.fn_mem_create)?;
+        let mut handle: HipMemGenericAllocationHandle = ptr::null_mut();
+        let code = unsafe { func(&mut handle, size, prop as *const HipMemAllocationProp, 0) };
+        self.check(code, "hipMemCreate")?;
+        Ok(handle)
+    }
+
+    /// # Safety
+    /// `ptr..ptr+size` must be a valid, currently unmapped VMM reservation and
+    /// `handle` must be a live allocation handle covering at least `size`.
+    pub unsafe fn mem_map(
+        &self,
+        ptr: *mut c_void,
+        size: usize,
+        handle: HipMemGenericAllocationHandle,
+    ) -> HipResult<()> {
+        let func = self.missing_vmm_symbol("hipMemMap", self.fn_mem_map)?;
+        let code = unsafe { func(ptr, size, 0, handle, 0) };
+        self.check(code, "hipMemMap")
+    }
+
+    /// # Safety
+    /// `ptr..ptr+size` must describe a currently mapped VMM range.
+    pub unsafe fn mem_unmap(&self, ptr: *mut c_void, size: usize) -> HipResult<()> {
+        let func = self.missing_vmm_symbol("hipMemUnmap", self.fn_mem_unmap)?;
+        let code = unsafe { func(ptr, size) };
+        self.check(code, "hipMemUnmap")
+    }
+
+    /// # Safety
+    /// `ptr..ptr+size` must describe a mapped VMM range and every descriptor
+    /// must identify a device allowed by the backing allocation.
+    pub unsafe fn mem_set_access(
+        &self,
+        ptr: *mut c_void,
+        size: usize,
+        descs: &[HipMemAccessDesc],
+    ) -> HipResult<()> {
+        let func = self.missing_vmm_symbol("hipMemSetAccess", self.fn_mem_set_access)?;
+        let code = unsafe { func(ptr, size, descs.as_ptr(), descs.len()) };
+        self.check(code, "hipMemSetAccess")
+    }
+
+    /// # Safety
+    /// `handle` must be live, owned by the caller, and no mapped range may
+    /// still reference it.
+    pub unsafe fn mem_release(&self, handle: HipMemGenericAllocationHandle) -> HipResult<()> {
+        let func = self.missing_vmm_symbol("hipMemRelease", self.fn_mem_release)?;
+        let code = unsafe { func(handle) };
+        self.check(code, "hipMemRelease")
+    }
+
+    /// Return the base and byte extent of the HIP allocation containing
+    /// `device_ptr`. This is used by retained replay to conservatively treat
+    /// distinct subviews of one allocation as aliasing resources.
+    ///
+    /// HIP treats `device_ptr` as an opaque GPU address; Rust never dereferences it.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn mem_get_address_range(
+        &self,
+        device_ptr: *mut c_void,
+    ) -> HipResult<(*mut c_void, usize)> {
+        let mut base = ptr::null_mut();
+        let mut size = 0usize;
+        let code = unsafe { (self.fn_mem_get_address_range)(&mut base, &mut size, device_ptr) };
+        self.check(code, "hipMemGetAddressRange")?;
+        if base.is_null() || size == 0 {
+            return Err(HipError::new(
+                0,
+                "hipMemGetAddressRange returned an empty allocation",
+            ));
+        }
+        Ok((base, size))
     }
 
     /// Copy host data into GPU buffer at a byte offset.
@@ -815,8 +1144,12 @@ impl HipRuntime {
         let elapsed = t.elapsed().as_nanos() as u64;
         crate::ffi::launch_counters::memcpy_dtoh::record_bytes(elapsed, dst.len() as u64);
         static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let dump =
-            *DUMP.get_or_init(|| std::env::var("HIPFIRE_DTOH_DUMP").ok().as_deref() == Some("1"));
+        let dump = *DUMP.get_or_init(|| {
+            hipfire_config::developer_var("HIPFIRE_DTOH_DUMP")
+                .ok()
+                .as_deref()
+                == Some("1")
+        });
         if dump {
             eprintln!(
                 "dtoh bytes={} us={} at {}:{}",
@@ -859,8 +1192,12 @@ impl HipRuntime {
         let elapsed = t.elapsed().as_nanos() as u64;
         crate::ffi::launch_counters::memcpy_dtoh::record_bytes(elapsed, dst.len() as u64);
         static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let dump =
-            *DUMP.get_or_init(|| std::env::var("HIPFIRE_DTOH_DUMP").ok().as_deref() == Some("1"));
+        let dump = *DUMP.get_or_init(|| {
+            hipfire_config::developer_var("HIPFIRE_DTOH_DUMP")
+                .ok()
+                .as_deref()
+                == Some("1")
+        });
         if dump {
             eprintln!(
                 "dtoh_at bytes={} us={} at {}:{}",
@@ -902,8 +1239,12 @@ impl HipRuntime {
         let elapsed = t.elapsed().as_nanos() as u64;
         crate::ffi::launch_counters::memset::record_bytes(elapsed, size as u64);
         static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let dump =
-            *DUMP.get_or_init(|| std::env::var("HIPFIRE_MEMSET_DUMP").ok().as_deref() == Some("1"));
+        let dump = *DUMP.get_or_init(|| {
+            hipfire_config::developer_var("HIPFIRE_MEMSET_DUMP")
+                .ok()
+                .as_deref()
+                == Some("1")
+        });
         if dump {
             eprintln!(
                 "memset bytes={} us={} at {}:{}",
@@ -933,8 +1274,12 @@ impl HipRuntime {
         let elapsed = t.elapsed().as_nanos() as u64;
         crate::ffi::launch_counters::memset::record_bytes(elapsed, size as u64);
         static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let dump =
-            *DUMP.get_or_init(|| std::env::var("HIPFIRE_MEMSET_DUMP").ok().as_deref() == Some("1"));
+        let dump = *DUMP.get_or_init(|| {
+            hipfire_config::developer_var("HIPFIRE_MEMSET_DUMP")
+                .ok()
+                .as_deref()
+                == Some("1")
+        });
         if dump {
             eprintln!(
                 "memset_async bytes={} us={} at {}:{}",
@@ -1105,6 +1450,18 @@ impl HipRuntime {
         Ok(Event(event))
     }
 
+    /// Create an event with HIP runtime flags.
+    ///
+    /// Dependency events should normally use [`HIP_EVENT_DISABLE_TIMING`]
+    /// without `hipEventDisableSystemFence`. Cross-device producers may add
+    /// [`HIP_EVENT_RELEASE_TO_SYSTEM`] to make the release scope explicit.
+    pub fn event_create_with_flags(&self, flags: u32) -> HipResult<Event> {
+        let mut event: HipEvent = ptr::null_mut();
+        let code = unsafe { (self.fn_event_create_with_flags)(&mut event, flags) };
+        self.check(code, "hipEventCreateWithFlags")?;
+        Ok(Event(event))
+    }
+
     pub fn event_record(&self, event: &Event, stream: Option<&Stream>) -> HipResult<()> {
         let stream_raw = stream.map_or(ptr::null_mut(), |s| s.0);
         let code = unsafe { (self.fn_event_record)(event.0, stream_raw) };
@@ -1210,6 +1567,35 @@ impl HipRuntime {
         self.check(code, "hipMemcpyAsync D2D offset")
     }
 
+    /// Async D→D copy with offsets on the legacy/default stream
+    /// (`hipStream_t` null). Host-asynchronous and ordered on that stream;
+    /// intended for non-capture hot paths where a sync `memcpy_dtod_at`
+    /// would stall the host. Not suitable for hipGraph capture (use
+    /// `memcpy_dtod_async_at` with an explicit stream instead).
+    pub fn memcpy_dtod_async_default_at(
+        &self,
+        dst: &DeviceBuffer,
+        dst_offset: usize,
+        src: &DeviceBuffer,
+        src_offset: usize,
+        size: usize,
+    ) -> HipResult<()> {
+        assert!(dst_offset + size <= dst.size);
+        assert!(src_offset + size <= src.size);
+        let dst_ptr = unsafe { (dst.ptr as *mut u8).add(dst_offset) as *mut c_void };
+        let src_ptr = unsafe { (src.ptr as *const u8).add(src_offset) as *const c_void };
+        let code = unsafe {
+            (self.fn_memcpy_async)(
+                dst_ptr,
+                src_ptr,
+                size,
+                MemcpyKind::DeviceToDevice as c_uint,
+                ptr::null_mut(),
+            )
+        };
+        self.check(code, "hipMemcpyAsync D2D offset default stream")
+    }
+
     // ── Graph capture & replay ──────────────────────────────────
 
     /// Begin capturing all operations on `stream` into a graph.
@@ -1268,6 +1654,26 @@ impl HipRuntime {
     ) -> HipResult<()> {
         let code = unsafe { (self.fn_stream_write_value32)(stream.0, ptr.as_ptr(), value, flags) };
         self.check(code, "hipStreamWriteValue32")
+    }
+
+    /// Wait until a 32-bit signal-memory value satisfies the requested condition.
+    /// Operations submitted later to `stream` remain blocked until it does.
+    pub fn stream_wait_value32(
+        &self,
+        stream: &Stream,
+        ptr: &DeviceBuffer,
+        value: u32,
+        flags: u32,
+        mask: u32,
+    ) -> HipResult<()> {
+        let Some(wait_value32) = self.fn_stream_wait_value32 else {
+            return Err(HipError::new(
+                0,
+                "hipStreamWaitValue32 unavailable; stream signal waits are unsupported",
+            ));
+        };
+        let code = unsafe { wait_value32(stream.0, ptr.as_ptr(), value, flags, mask) };
+        self.check(code, "hipStreamWaitValue32")
     }
 
     pub fn device_synchronize(&self) -> HipResult<()> {

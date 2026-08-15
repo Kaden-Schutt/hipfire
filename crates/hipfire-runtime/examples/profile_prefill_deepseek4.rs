@@ -98,14 +98,14 @@ fn main() {
     eprintln!("Weights loaded in {:.2}s", t_load.elapsed().as_secs_f64());
 
     let mut state = DeepseekV4State::new(&config).expect("state");
-    let pbs =
+    let mut pbs =
         hipfire_arch_deepseek4::forward::PrefillBatchScratch::new(&mut gpu, &config, pp_batch)
             .expect("pbs");
 
     // Deterministic synthetic prompt.
     let prompt_tokens: Vec<u32> = (0..prefill_len as u32).map(|t| (t % 1000) + 100).collect();
 
-    let run_prefill = |state: &mut DeepseekV4State, gpu: &mut rdna_compute::Gpu| {
+    let mut run_prefill = |state: &mut DeepseekV4State, gpu: &mut rdna_compute::Gpu| {
         state.reset();
         let _ = gpu.hip.device_synchronize();
         let t = Instant::now();
@@ -115,7 +115,7 @@ fn main() {
                 &weights,
                 state,
                 gpu,
-                &pbs,
+                &mut pbs,
                 &prompt_tokens,
                 0,
             )
@@ -128,7 +128,7 @@ fn main() {
                 gpu,
                 &prompt_tokens,
                 0,
-                &pbs,
+                &mut pbs,
             )
             .expect("prefill failed")
         };

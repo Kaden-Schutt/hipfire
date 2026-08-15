@@ -1,0 +1,27 @@
+: This is a detailed technical breakdown for the specified measurement scenario. The focus is on the exact path from frozen prompt to token-by-token greedy generation under the specified conditions, with no speculation or optimization shortcuts.
+
+Here is the requested explanation structured for a measurement contract discussion.
+
+---
+
+### Measurement Contract: DeepSeV4 Flash-style MoM on AMD MI300X (gfx942) – Batch-1, Q8 KV, No Speculation
+
+This document defines the precise technical conditions and measurement boundaries for a benchmark fixture targeting a single inference request. The goal is to measure the performance of a specific, deterministic inference path without any speculative or optimization techniques that could alter the numerical or timing profile.
+
+#### 1. The Frozen Prompt Fixture: Why "Bytes" over "Text"
+
+The benchmark begins with a **frozen, deterministic prompt fixture**. This is not simply "text" because the exact byte sequence determines the tokenization output. Any variation in the source file (e.g., trailing newlines, line endings, or character encoding) will produce a different token sequence, invalidating any comparison between runs.
+
+**The Contract:**
+*   **Source Corpus:** A specific, revision-controlled text file (e.g., a technical document or conversation). This is not a random string or a repeated phrase. It must have realistic structure to exercise the model's attention patterns and expert routing.
+*   **Tokenization:** The exact tokenizer (e.g., `tokenizer.json` from the model's HuggingFace metadata) is used to convert the source corpus into a sequence of token IDs.
+*   **Verification:** A round-trip check is mandatory: `encode(decode(encode(cor)))` must produce the exact same sequence of IDs. This ensures the tokenizer is correctly loaded and the process is deterministic.
+*   **Output:** The final fixture is a file containing the first N token IDs (e.g., 2048) as raw, little-endian 32-bit integers. This file is the sole input to the inference engine. Its MD5 and SHA-256 hashes are recorded as part of the measurement metadata.
+
+#### 2. The Inference Path: From Token to Token
+
+The inference process is a strict sequence of phases, each with specific performance implications.
+
+**A. Prefill Phase (Processing the 2048 Tok):**
+*   **Input:** The 2040 token IDs from the fixture.
+*   **Process:** The model processes the entire prompt in a single forward pass. This involves

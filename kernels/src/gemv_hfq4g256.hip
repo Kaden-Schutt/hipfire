@@ -4,6 +4,14 @@
 
 #include <hip/hip_runtime.h>
 
+#ifndef HIPFIRE_HFQ4G256_KERNEL
+#define HIPFIRE_HFQ4G256_KERNEL gemv_hfq4g256
+#endif
+
+#ifndef HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS
+#define HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS 0
+#endif
+
 // HFQ4-G256 GEMV: default (arch-agnostic) kernel.
 //
 // Ported from gemv_hfq4g256.gfx1100.hip in order to produce BYTE-EXACT
@@ -35,7 +43,7 @@
 // potentially picking a different FMA/MADD sequence.
 
 __launch_bounds__(32, 16)
-extern "C" __global__ void gemv_hfq4g256(
+extern "C" __global__ void HIPFIRE_HFQ4G256_KERNEL(
     const char* __restrict__ A,
     const float* __restrict__ x,
     float* __restrict__ y,
@@ -45,9 +53,29 @@ extern "C" __global__ void gemv_hfq4g256(
     if (row >= M) return;
     const int tid = threadIdx.x;
 
+#if defined(HIPFIRE_HFQ4G256_K2048)
+    const int groups_per_row = 8;
+#else
     const int groups_per_row = K / 256;
+#endif
     const char* row_ptr = A + (long long)row * groups_per_row * 136;
+    const unsigned int row_weight_offset =
+        (unsigned int)((long long)row * groups_per_row * 136);
     const int boff = tid * 4;
+#if HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS
+    const auto weight_rsrc = HIPFIRE_WEIGHT_RSRC(A);
+    #if defined(HIPFIRE_GFX1151_LM_HEAD_HYBRID_BUFFER)
+        #define LOAD_WEIGHT_HEADER(ptr, offset) (*(const unsigned int*)(ptr))
+    #else
+        #define LOAD_WEIGHT_HEADER(ptr, offset) \
+            HIPFIRE_WEIGHT_LOAD_U32(weight_rsrc, (offset))
+    #endif
+    #define LOAD_WEIGHT_PACKED(ptr, offset) \
+        HIPFIRE_WEIGHT_LOAD_U32(weight_rsrc, (offset))
+#else
+    #define LOAD_WEIGHT_HEADER(ptr, offset) (*(const unsigned int*)(ptr))
+    #define LOAD_WEIGHT_PACKED(ptr, offset) (*(const unsigned int*)(ptr))
+#endif
 
     float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
     const int quads = groups_per_row >> 2;
@@ -60,19 +88,20 @@ extern "C" __global__ void gemv_hfq4g256(
         const char* gp2 = gp1 + 136;
         const char* gp3 = gp2 + 136;
 
-        float sc0 = __builtin_bit_cast(float, *(const unsigned int*)(gp0));
-        float zp0 = __builtin_bit_cast(float, *(const unsigned int*)(gp0 + 4));
-        float sc1 = __builtin_bit_cast(float, *(const unsigned int*)(gp1));
-        float zp1 = __builtin_bit_cast(float, *(const unsigned int*)(gp1 + 4));
-        float sc2 = __builtin_bit_cast(float, *(const unsigned int*)(gp2));
-        float zp2 = __builtin_bit_cast(float, *(const unsigned int*)(gp2 + 4));
-        float sc3 = __builtin_bit_cast(float, *(const unsigned int*)(gp3));
-        float zp3 = __builtin_bit_cast(float, *(const unsigned int*)(gp3 + 4));
+        const unsigned int goff = row_weight_offset + (unsigned int)g * 136u;
+        float sc0 = __builtin_bit_cast(float, LOAD_WEIGHT_HEADER(gp0, goff));
+        float zp0 = __builtin_bit_cast(float, LOAD_WEIGHT_HEADER(gp0 + 4, goff + 4u));
+        float sc1 = __builtin_bit_cast(float, LOAD_WEIGHT_HEADER(gp1, goff + 136u));
+        float zp1 = __builtin_bit_cast(float, LOAD_WEIGHT_HEADER(gp1 + 4, goff + 140u));
+        float sc2 = __builtin_bit_cast(float, LOAD_WEIGHT_HEADER(gp2, goff + 272u));
+        float zp2 = __builtin_bit_cast(float, LOAD_WEIGHT_HEADER(gp2 + 4, goff + 276u));
+        float sc3 = __builtin_bit_cast(float, LOAD_WEIGHT_HEADER(gp3, goff + 408u));
+        float zp3 = __builtin_bit_cast(float, LOAD_WEIGHT_HEADER(gp3 + 4, goff + 412u));
 
-        unsigned int pk0 = *(const unsigned int*)(gp0 + 8 + boff);
-        unsigned int pk1 = *(const unsigned int*)(gp1 + 8 + boff);
-        unsigned int pk2 = *(const unsigned int*)(gp2 + 8 + boff);
-        unsigned int pk3 = *(const unsigned int*)(gp3 + 8 + boff);
+        unsigned int pk0 = LOAD_WEIGHT_PACKED(gp0 + 8 + boff, goff + 8u + boff);
+        unsigned int pk1 = LOAD_WEIGHT_PACKED(gp1 + 8 + boff, goff + 144u + boff);
+        unsigned int pk2 = LOAD_WEIGHT_PACKED(gp2 + 8 + boff, goff + 280u + boff);
+        unsigned int pk3 = LOAD_WEIGHT_PACKED(gp3 + 8 + boff, goff + 416u + boff);
 
         int base = g * 256 + tid * 8;
 
@@ -110,31 +139,36 @@ extern "C" __global__ void gemv_hfq4g256(
     if (tail >= 1) {
         const int g = quads << 2;
         const char* gp = row_ptr + g * 136;
-        float sc = __builtin_bit_cast(float, *(const unsigned int*)(gp));
-        float zp = __builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
-        unsigned int pk = *(const unsigned int*)(gp + 8 + boff);
+        const unsigned int goff = row_weight_offset + (unsigned int)g * 136u;
+        float sc = __builtin_bit_cast(float, LOAD_WEIGHT_HEADER(gp, goff));
+        float zp = __builtin_bit_cast(float, LOAD_WEIGHT_HEADER(gp + 4, goff + 4u));
+        unsigned int pk = LOAD_WEIGHT_PACKED(gp + 8 + boff, goff + 8u + boff);
         int base = g * 256 + tid * 8;
         TAIL_DOG(pk, sc, zp, base, acc0);
     }
     if (tail >= 2) {
         const int g = (quads << 2) + 1;
         const char* gp = row_ptr + g * 136;
-        float sc = __builtin_bit_cast(float, *(const unsigned int*)(gp));
-        float zp = __builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
-        unsigned int pk = *(const unsigned int*)(gp + 8 + boff);
+        const unsigned int goff = row_weight_offset + (unsigned int)g * 136u;
+        float sc = __builtin_bit_cast(float, LOAD_WEIGHT_HEADER(gp, goff));
+        float zp = __builtin_bit_cast(float, LOAD_WEIGHT_HEADER(gp + 4, goff + 4u));
+        unsigned int pk = LOAD_WEIGHT_PACKED(gp + 8 + boff, goff + 8u + boff);
         int base = g * 256 + tid * 8;
         TAIL_DOG(pk, sc, zp, base, acc1);
     }
     if (tail >= 3) {
         const int g = (quads << 2) + 2;
         const char* gp = row_ptr + g * 136;
-        float sc = __builtin_bit_cast(float, *(const unsigned int*)(gp));
-        float zp = __builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
-        unsigned int pk = *(const unsigned int*)(gp + 8 + boff);
+        const unsigned int goff = row_weight_offset + (unsigned int)g * 136u;
+        float sc = __builtin_bit_cast(float, LOAD_WEIGHT_HEADER(gp, goff));
+        float zp = __builtin_bit_cast(float, LOAD_WEIGHT_HEADER(gp + 4, goff + 4u));
+        unsigned int pk = LOAD_WEIGHT_PACKED(gp + 8 + boff, goff + 8u + boff);
         int base = g * 256 + tid * 8;
         TAIL_DOG(pk, sc, zp, base, acc2);
     }
     #undef TAIL_DOG
+    #undef LOAD_WEIGHT_PACKED
+    #undef LOAD_WEIGHT_HEADER
 
     float acc = (acc0 + acc1) + (acc2 + acc3);
     for (int offset = 16; offset > 0; offset >>= 1)

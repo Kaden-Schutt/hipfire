@@ -1,0 +1,70 @@
+{
+  "assembled_at": "2026-07-31T11:45:50.356646+00:00",
+  "model": "/home/kaden/.hipfire/models/qwen3-27b-3.6.mq4-awq.remote-mi300x",
+  "results_root": "/home/kaden/.cache/benchlocal-full-20260731T091750Z/results/qwen27-dflash",
+  "note": "Qwen27 DFlash direct route predates Hermes sampling proxy. Non-Hermes packs hit 12181 with explicit CLI sampling flags. Hermes uses proxy :12281 only.",
+  "shared_env_non_hermes": {
+    "LLAMACPP_HOST": "http://127.0.0.1:12181",
+    "LLM_MODELS": "llamacpp:/home/kaden/.hipfire/models/qwen3-27b-3.6.mq4-awq.remote-mi300x",
+    "MODEL_REQUEST_TIMEOUT_SECONDS": "300"
+  },
+  "sampling_contract": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 20,
+    "min_p": 0.0,
+    "timeout": 300,
+    "tool_packs_extra": {
+      "repetition_penalty": 1.0,
+      "tools_format": "default"
+    }
+  },
+  "source_artifacts": {
+    "wave1_summary": "/home/kaden/.cache/benchlocal-full-20260731T091750Z/results/qwen27-dflash/wave1-summary.json",
+    "hermes_attestations": "/home/kaden/.cache/benchlocal-full-20260731T091750Z/results/qwen27-dflash/hermes-sampling-attestations.jsonl",
+    "hermes_provenance": "/home/kaden/.cache/benchlocal-full-20260731T091750Z/results/qwen27-dflash/hermesagent-20-provenance.json",
+    "hermes_meta": "/home/kaden/.cache/benchlocal-full-20260731T091750Z/results/qwen27-dflash/hermesagent-20-rerun-meta.txt"
+  },
+  "packs": {
+    "wave1_cli_pattern": {
+      "command_pattern": "cd /home/kaden/.cache/benchlocal-full-20260731T091750Z/packs/<Pack> && LLAMACPP_HOST=http://127.0.0.1:12181 LLM_MODELS=llamacpp:/home/kaden/.hipfire/models/qwen3-27b-3.6.mq4-awq.remote-mi300x MODEL_REQUEST_TIMEOUT_SECONDS=300 node dist-cli/cli/run.js --model llamacpp:/home/kaden/.hipfire/models/qwen3-27b-3.6.mq4-awq.remote-mi300x --temperature 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 --timeout 300 --show-raw --json",
+      "tool_packs_extra_flags": "--repetition-penalty 1.0 --tools-format default",
+      "packs": [
+        "DataExtract-15",
+        "InstructFollow-15",
+        "ReasonMath-15",
+        "ToolCall-15",
+        "PromptAuthority-15",
+        "StructOutput-15",
+        "BugFind-15"
+      ],
+      "sampling_fields_proof": "CLI flags --temperature/--top-p/--top-k/--min-p map to GenerationParams; llm-client forwards on chat/completions. Tool packs also send repetition_penalty=1.0. No presence_penalty on direct Qwen route.",
+      "endpoint": "http://127.0.0.1:12181"
+    },
+    "cli-40": {
+      "cwd": "/home/kaden/.cache/benchlocal-full-20260731T091750Z/packs/CLI-40",
+      "command": "cd /home/kaden/.cache/benchlocal-full-20260731T091750Z/packs/CLI-40 && node dist/cli/run.js --all --model /home/kaden/.hipfire/models/qwen3-27b-3.6.mq4-awq.remote-mi300x --provider llamacpp --base-url http://127.0.0.1:12181/v1 --docker-base-url http://172.17.0.1:12181/v1 --auth-mode none --image cli40-dev --json --verbose",
+      "sampling_fields_proof": "CLI-40 hardcodes generation temperature=1.0 top_p=0.95 top_k=20 min_p=0.0 repetition_penalty=1.0; no presence_penalty."
+    },
+    "hermesagent-20": {
+      "cwd": "/home/kaden/.cache/benchlocal-full-20260731T091750Z/packs/HermesAgent-20",
+      "command": "cd /home/kaden/.cache/benchlocal-full-20260731T091750Z/packs/HermesAgent-20 && node scripts/run-scenarios.mjs --all --image hermesagent20-dev --provider custom --base-url http://172.17.0.1:12281/v1 --auth-mode bearer --api-key benchlocal --model /home/kaden/.hipfire/models/qwen3-27b-3.6.mq4-awq.remote-mi300x --provider-model /home/kaden/.hipfire/models/qwen3-27b-3.6.mq4-awq.remote-mi300x --verbose --json",
+      "isolated_remainder_commands": [
+        "node scripts/run-scenarios.mjs --scenario HA-17 --image hermesagent20-dev --provider custom --base-url http://172.17.0.1:12281/v1 --auth-mode bearer --api-key benchlocal --model /home/kaden/.hipfire/models/qwen3-27b-3.6.mq4-awq.remote-mi300x --provider-model /home/kaden/.hipfire/models/qwen3-27b-3.6.mq4-awq.remote-mi300x --verbose --json",
+        "node scripts/run-scenarios.mjs --scenario HA-18 ...",
+        "node scripts/run-scenarios.mjs --scenario HA-19 ...",
+        "node scripts/run-scenarios.mjs --scenario HA-20 ..."
+      ],
+      "sampling_fields_proof": "Runner sends only temperature=1.0 top_p=0.95; proxy :12281 forces top_k=20 min_p=0 presence_penalty=0 repetition_penalty=1 (and enable_thinking=false for stability). Attestations: hermes-sampling-attestations.jsonl (349 rows, 0 bad).",
+      "proxy_health": "http://127.0.0.1:12281/__sampling_proxy/health",
+      "forced_sampling": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0,
+        "presence_penalty": 0,
+        "repetition_penalty": 1.0
+      }
+    }
+  }
+}

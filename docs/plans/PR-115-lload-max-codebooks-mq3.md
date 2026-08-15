@@ -1,7 +1,7 @@
 # PR #115 — K4-unroll + LDS-resident codebook fix for Lloyd-MQ3 GEMV
 
 **Branch:** `lloyd-max-mq3-spike`
-**PR:** https://github.com/Kaden-Schutt/hipfire/pull/115
+**PR:** https://github.com/warpfront/hipfire/pull/115
 **Target:** clear the open decode-perf ship gate — 9B MQ3-Lloyd from 44 → ≥120 tok/s on gfx1100.
 **Hardware:** gfx1100 (7900 XTX). Same arch the PR's tok/s table is measured on.
 **Date:** 2026-05-06 (rev 2 — folded findings from gemini, glm5, and Claude adversarial reviews; see `PR-115-lloyd-max-cb-plan-rev-claude.md`).
@@ -360,7 +360,7 @@ scope for this PR; production gating is decided when/if the
 
 ## References
 
-- PR: https://github.com/Kaden-Schutt/hipfire/pull/115
+- PR: https://github.com/warpfront/hipfire/pull/115
 - `kernels/src/gemv_mq3g256_lloyd.hip` — current generic Lloyd kernel
   (slow switch dispatch, baseline fallback).
 - `kernels/src/gemv_hfq3g256.gfx1100.hip` — K4-unroll reference; mirror

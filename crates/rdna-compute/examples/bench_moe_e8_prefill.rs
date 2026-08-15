@@ -95,6 +95,10 @@ fn main() {
         println!("SKIP — arch {} lacks RDNA3/RDNA4 WMMA", arch);
         return;
     }
+    if std::env::var_os("HIPFIRE_DS4_MOE_UNSCATTER_ONLY").is_some() {
+        run_ds4_unscatter_fusion(&mut gpu);
+        return;
+    }
     println!(
         "arch={}  (gate_up A/B: per-token GEMV[1 launch] vs grouped-WMMA[x2])",
         arch
@@ -223,4 +227,124 @@ fn main() {
             n, m_total, gemv_us, flops / gemv_us / 1e6, grp_us, flops / grp_us / 1e6, gemv_us / grp_us
         );
     }
+}
+
+fn run_ds4_unscatter_fusion(gpu: &mut Gpu) {
+    assert_eq!(gpu.arch, "gfx1151", "DS4 fusion screen is gfx1151-only");
+    const BATCH: usize = 1024;
+    const K_TOP: usize = 6;
+    const IM: usize = 2048;
+    const N_EXP: usize = 256;
+    const BLOCK_M: usize = 16;
+    const TRIALS: usize = 20;
+    const SWIGLU_LIMIT: f32 = 10.0;
+
+    let valid_slots = BATCH * K_TOP;
+    let m_total = valid_slots + N_EXP * BLOCK_M;
+    let y_grouped_host = build_x_f32(m_total, 2 * IM, 0xD54F_0510);
+    let mut sorted = vec![-1i32; m_total];
+    for (slot, flat) in sorted.iter_mut().take(valid_slots).enumerate() {
+        *flat = ((slot * 5) % valid_slots) as i32;
+    }
+
+    let y_grouped = upload_f32(gpu, &y_grouped_host);
+    let sorted_slot_index = upload_i32(gpu, &sorted);
+    let gate = alloc_f32_zeros(gpu, valid_slots * IM);
+    let up = alloc_f32_zeros(gpu, valid_slots * IM);
+    let fused = alloc_f32_zeros(gpu, valid_slots * IM);
+
+    let mut run_baseline = |gpu: &mut Gpu| {
+        gpu.moe_gate_up_unscatter_k8(
+            &y_grouped,
+            &sorted_slot_index,
+            &gate,
+            &up,
+            IM,
+            K_TOP,
+            m_total,
+        )
+        .expect("baseline unscatter");
+        gpu.deepseek4_silu_mul_clamp_f32_batched(&gate, &up, &gate, IM, valid_slots, SWIGLU_LIMIT)
+            .expect("baseline SwiGLU");
+    };
+    let mut run_fused = |gpu: &mut Gpu| {
+        gpu.moe_unscatter_silu_clamp_k8(
+            &y_grouped,
+            &sorted_slot_index,
+            &fused,
+            IM,
+            K_TOP,
+            m_total,
+            SWIGLU_LIMIT,
+        )
+        .expect("fused unscatter SwiGLU");
+    };
+
+    for _ in 0..5 {
+        run_baseline(gpu);
+        run_fused(gpu);
+    }
+    gpu.hip.device_synchronize().expect("warm synchronize");
+
+    let mut baseline_host = vec![0.0f32; valid_slots * IM];
+    let mut fused_host = vec![0.0f32; valid_slots * IM];
+    gpu.hip
+        .memcpy_dtoh(
+            unsafe {
+                std::slice::from_raw_parts_mut(
+                    baseline_host.as_mut_ptr() as *mut u8,
+                    baseline_host.len() * 4,
+                )
+            },
+            &gate.buf,
+        )
+        .expect("download baseline");
+    gpu.hip
+        .memcpy_dtoh(
+            unsafe {
+                std::slice::from_raw_parts_mut(
+                    fused_host.as_mut_ptr() as *mut u8,
+                    fused_host.len() * 4,
+                )
+            },
+            &fused.buf,
+        )
+        .expect("download fused");
+    let exact = baseline_host
+        .iter()
+        .zip(&fused_host)
+        .filter(|(a, b)| a.to_bits() == b.to_bits())
+        .count();
+    assert_eq!(
+        exact,
+        baseline_host.len(),
+        "fused unscatter SwiGLU must be raw-bit exact"
+    );
+
+    let time_arm = |gpu: &mut Gpu, run: &mut dyn FnMut(&mut Gpu)| -> f64 {
+        let start = Instant::now();
+        for _ in 0..TRIALS {
+            run(gpu);
+        }
+        gpu.hip.device_synchronize().expect("timing synchronize");
+        start.elapsed().as_secs_f64() * 1.0e6 / TRIALS as f64
+    };
+    let a0 = time_arm(gpu, &mut run_baseline);
+    let b0 = time_arm(gpu, &mut run_fused);
+    let b1 = time_arm(gpu, &mut run_fused);
+    let a1 = time_arm(gpu, &mut run_baseline);
+    let baseline_us = 0.5 * (a0 + a1);
+    let fused_us = 0.5 * (b0 + b1);
+
+    println!("=== DS4 grouped-MoE unscatter + SwiGLU fusion ===");
+    println!(
+        "arch={} B={} K_TOP={} IM={} m_total={} trials={}",
+        gpu.arch, BATCH, K_TOP, IM, m_total, TRIALS
+    );
+    println!("raw_bit_exact={exact}/{}", baseline_host.len());
+    println!(
+        "baseline_us={baseline_us:.3} fused_us={fused_us:.3} speedup={:.4}x delta={:.3}%",
+        baseline_us / fused_us,
+        (baseline_us / fused_us - 1.0) * 100.0
+    );
 }

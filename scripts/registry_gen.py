@@ -2,12 +2,12 @@
 """Generate registry/v1.json — the dynamic model registry (task #47).
 
 Sources of truth:
-  - cli/registry.json : curated overlay — tags, repos, files, size_gb,
+  - registry/models.json : curated overlay — tags, repos, files, size_gb,
     min_vram_gb, desc, aliases. Hand-edited; stays the editing surface.
   - Hugging Face Hub API : per-file LFS sha256 + size_bytes (ground truth
     for what is actually downloadable), probed live on every run.
 
-Output (registry/v1.json) is a STRICT SUPERSET of cli/registry.json:
+Output (registry/v1.json) is a STRICT SUPERSET of registry/models.json:
 old CLIs that read {models, aliases} keep working unchanged; new fields are
 purely additive:
   top-level : schema_version, generated_at
@@ -20,8 +20,8 @@ size_gb, unmappable arch_id/quant, alias pointing at a missing tag, or a
 superset violation — aborts with exit 1 and does NOT write output. A broken
 run must never replace a good committed registry.
 
-Namespace probe: every repo in the hipfire-models and schuttdev namespaces
-is enumerated; repos that exist on HF but have no curated entry are listed
+Namespace probe: every repo in the hipfire-models namespace is enumerated;
+repos that exist on HF but have no curated entry are listed
 as warnings (discovery aid), never auto-added — the curated overlay is
 authoritative for what the CLI offers.
 
@@ -47,7 +47,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 HF_API = "https://huggingface.co"
-PROBE_NAMESPACES = ("hipfire-models", "schuttdev")
+PROBE_NAMESPACES = ("hipfire-models",)
 SCHEMA_VERSION = 1
 # Curated size_gb is a rounded decimal-GB figure; the HF byte count is ground
 # truth. Disagreement beyond this fraction means the curated entry is stale
@@ -58,6 +58,7 @@ SIZE_TOLERANCE = 0.25
 KNOWN_QUANTS = {
     "mq2lloyd",
     "mq2",
+    "mq2r",
     "mq3",
     "mq3p",
     "mq4",
@@ -72,11 +73,13 @@ KNOWN_QUANTS = {
     "hfq",
 }
 # Allowlist for the optional per-entry `default_kv_mode` field (the registry is
-# the per-model card). MUST stay in sync with cli/index.ts validateConfigValue
-# /resolveKvMode and cli/registry_loader.ts REGISTRY_KV_MODE_VALUES. A curated
+# the per-model card). MUST stay in sync with the hipfire-config schema and
+# hipfire-registry parser. A curated
 # entry carrying an unknown value fails the run (fail-closed, like arch_id/quant).
 KNOWN_KV_MODES = {
     "auto",
+    "f32",
+    "f16",
     "q8",
     "asym4",
     "asym3",
@@ -89,10 +92,11 @@ KNOWN_KV_MODES = {
     "turbo3",
     "turbo2",
 }
+KNOWN_TOOL_FORMATS = {"hermes", "qwen_xml"}
 
 # Bounds for the optional curated `recommended_settings` (author-recommended
 # inference settings inherited from the parent model card). MUST stay in sync
-# with cli/registry_loader.ts validRecommendedSettings. Each present numeric
+# with hipfire-registry's recommended-settings validation. Each present numeric
 # knob is range-checked; an out-of-range value fails the run (fail-closed).
 #   (lo, hi, int_only)
 RECOMMENDED_BOUNDS = {
@@ -103,12 +107,16 @@ RECOMMENDED_BOUNDS = {
     "presence_penalty": (0.0, 2.0, False),
     "repeat_penalty": (0.5, 2.0, False),
 }
+# Mirrors hipfire-config's REASONING_EFFORTS. Includes Qwen3.8's ladder
+# (`low|medium|xhigh`) plus generic OpenAI-style values for other parents.
+REASONING_EFFORTS = {"auto", "none", "low", "medium", "high", "xhigh", "max"}
+THINKING_BUDGETS = {"off", "low", "med", "high", "xhigh", "max", "uncapped"}
 
 
 def validate_recommended_settings(tag: str, rs: object, errors: list) -> None:
     """Carry-through validator for `recommended_settings` (verbatim in v1.json).
 
-    Mirrors cli/registry_loader.ts validRecommendedSettings bounds. Adds a
+    Mirrors hipfire-registry's recommended-settings bounds. Adds a
     descriptive error per offending key; does not mutate rs (deepcopy already
     carries it through)."""
     if rs is None:
@@ -116,7 +124,11 @@ def validate_recommended_settings(tag: str, rs: object, errors: list) -> None:
     if not isinstance(rs, dict):
         errors.append(f"{tag}: recommended_settings must be an object, got {type(rs).__name__}")
         return
-    allowed = set(RECOMMENDED_BOUNDS) | {"system_prompt"}
+    allowed = set(RECOMMENDED_BOUNDS) | {
+        "system_prompt",
+        "reasoning_effort",
+        "thinking_budget",
+    }
     for key, val in rs.items():
         if key not in allowed:
             errors.append(f"{tag}: recommended_settings has unknown key {key!r} (allowed: {sorted(allowed)})")
@@ -124,6 +136,20 @@ def validate_recommended_settings(tag: str, rs: object, errors: list) -> None:
         if key == "system_prompt":
             if not isinstance(val, str):
                 errors.append(f"{tag}: recommended_settings.system_prompt must be a string")
+            continue
+        if key == "reasoning_effort":
+            if val not in REASONING_EFFORTS:
+                errors.append(
+                    f"{tag}: recommended_settings.reasoning_effort must be one of "
+                    f"{sorted(REASONING_EFFORTS)}, got {val!r}"
+                )
+            continue
+        if key == "thinking_budget":
+            if val not in THINKING_BUDGETS:
+                errors.append(
+                    f"{tag}: recommended_settings.thinking_budget must be one of "
+                    f"{sorted(THINKING_BUDGETS)}, got {val!r}"
+                )
             continue
         lo, hi, int_only = RECOMMENDED_BOUNDS[key]
         if isinstance(val, bool) or not isinstance(val, (int, float)):
@@ -137,7 +163,7 @@ def validate_recommended_settings(tag: str, rs: object, errors: list) -> None:
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-CURATED_PATH = REPO_ROOT / "cli" / "registry.json"
+CURATED_PATH = REPO_ROOT / "registry" / "models.json"
 OUTPUT_PATH = REPO_ROOT / "registry" / "v1.json"
 
 
@@ -150,24 +176,31 @@ def log(msg: str) -> None:
 # Derived from the tag family + file name. Unknown families return None and
 # fail the run: every new model family must be mapped here explicitly.
 #   1  = plain Qwen3 (llama-crate config_from_hfq branch)
-#   5  = Qwen3.5/3.6 dense hybrid (incl. carnice / qwopus finetunes)
-#   6  = Qwen3.5/3.6 MoE / A3B
+#   5  = Qwen3.5/3.6/3.8 dense hybrid (incl. carnice / qwopus finetunes)
+#   6  = Qwen3.5/3.6/3.8 MoE / A3B
 #   9  = DeepSeek V4 Flash
 #   11 = LFM2.5 family
 #   12 = Cohere2-MoE / North-Mini-Code
+#   14 = Muse Glimmer dense text tower
 #   20 = DFlash drafter sidecar (crates/hipfire-quantize/src/bin/dflash_convert.rs)
+#   23 = Muse Glimmer DFlash drafter (muse_glimmer_assistant)
 def arch_id_for(tag: str, entry: dict) -> int | None:
     file = entry.get("file", "")
+    family = tag.split(":", 1)[0]
+    # Glimmer is checked before the generic dflash rule: its drafter is
+    # muse_glimmer_assistant (23), not the arch-20 sidecar, even though the
+    # filename says dflash.
+    if family == "muse-glimmer":
+        return 23 if "dflash" in file else 14
     if "dflash" in file:
         return 20
-    family = tag.split(":", 1)[0]
-    if family in ("qwen3.5", "qwen3.6", "qwopus3.6", "carnice", "qwopus"):
+    if family in ("qwen3.5", "qwen3.6", "qwen3.8", "qwopus3.6", "carnice", "qwopus"):
         return 6 if "a3b" in tag else 5
     if family == "nex-n2":
         return 6  # Nex-N2-mini = Qwen3.5-35B-A3B MoE (a3b not in tag name)
     if family == "qwen3":
         return 1
-    if family == "deepseek-v4-flash":
+    if family in ("deepseek-v4-flash", "deepseek-v4-flash-preview"):
         return 9
     if family == "minimax" or family.startswith("minimax-"):
         return 10
@@ -175,6 +208,8 @@ def arch_id_for(tag: str, entry: dict) -> int | None:
         return 11
     if family == "north-mini-code":
         return 12
+    if family == "vibethinker":
+        return 7   # Qwen2 dense (WeiboAI/VibeThinker-3B base)
     return None
 
 
@@ -316,14 +351,45 @@ def build_registry(curated: dict, token: str | None) -> tuple[dict | None, list[
                 f"(allowed: {sorted(KNOWN_KV_MODES)})"
             )
 
+        tool_format = entry.get("default_tool_format")
+        if tool_format is not None and tool_format not in KNOWN_TOOL_FORMATS:
+            errors.append(
+                f"{tag}: invalid default_tool_format {tool_format!r} "
+                f"(allowed: {sorted(KNOWN_TOOL_FORMATS)})"
+            )
         # Optional curated recommended_settings (carried verbatim by deepcopy).
-        # Validate bounds — fail-closed, mirroring registry_loader.ts.
+        # Validate bounds — fail-closed, matching hipfire-registry.
         validate_recommended_settings(tag, entry.get("recommended_settings"), errors)
+
+        # Optional per-mode sampling_profiles (carried verbatim by deepcopy).
+        # Validate each present profile with the same bounds — fail-closed,
+        # matching hipfire-registry's SamplingProfiles parser.
+        profiles = entry.get("sampling_profiles")
+        if profiles is not None:
+            if not isinstance(profiles, dict):
+                errors.append(f"{tag}: sampling_profiles must be an object")
+            else:
+                for mode, rs in profiles.items():
+                    if mode not in ("general", "coding", "instruct"):
+                        errors.append(
+                            f"{tag}: sampling_profiles has unknown mode {mode!r} "
+                            f"(allowed: ['coding', 'general', 'instruct'])"
+                        )
+                        continue
+                    validate_recommended_settings(f"{tag} sampling_profiles.{mode}", rs, errors)
 
         repo = entry.get("repo", "")
         if not repo:
-            # Local-only entry (pull short-circuits). Nothing to probe.
-            new_entry.update({"sha256": None, "size_bytes": None})
+            # Local-only entry (pull short-circuits). A campaign artifact may
+            # still carry a curated content identity even though there is no
+            # Hugging Face tree to probe. Preserve it verbatim and validate it
+            # below through the generated registry parser.
+            new_entry.update(
+                {
+                    "sha256": entry.get("sha256"),
+                    "size_bytes": entry.get("size_bytes"),
+                }
+            )
         elif repo in trees:
             tree = trees[repo]
             item = tree.get(entry["file"])
@@ -344,7 +410,7 @@ def build_registry(curated: dict, token: str | None) -> tuple[dict | None, list[
                             errors.append(
                                 f"{tag}: size mismatch — curated {curated_gb} GB vs "
                                 f"HF {size_bytes / 1e9:.2f} GB ({drift:.0%} drift); "
-                                f"update cli/registry.json"
+                                f"update registry/models.json"
                             )
             for kind in ("triattn", "mtp"):
                 if isinstance(entry.get(kind), dict):
@@ -361,8 +427,8 @@ def build_registry(curated: dict, token: str | None) -> tuple[dict | None, list[
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "_comment": (
             "GENERATED by scripts/registry_gen.py — do not hand-edit. "
-            "Edit cli/registry.json (curated overlay) and re-run the generator. "
-            "Strict superset of cli/registry.json: models/aliases keep the legacy "
+            "Edit registry/models.json (curated overlay) and re-run the generator. "
+            "Strict superset of registry/models.json: models/aliases keep the curated "
             "shape; sha256/size_bytes come from the HF LFS API; arch_id per "
             "docs/architecture-ids.md; min_vram_gb gates pull/run on VRAM."
         ),

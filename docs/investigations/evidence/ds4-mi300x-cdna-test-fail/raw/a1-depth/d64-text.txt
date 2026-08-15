@@ -1,0 +1,1 @@
+This is a technical, production-grade breakdown of the inference path for a **DeepSeV4-Flash-style MoE model** on an **AMD MI300

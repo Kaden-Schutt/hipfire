@@ -81,3 +81,47 @@ extern "C" __global__ void indexer_top_k_batched(
     // so slots [0, k_fill) are all written; pad [k_fill, k_stride) with -1.
     for (int r = k_fill + tid; r < k_stride; r += T) top_indices[out_base + r] = -1;
 }
+
+// Capture/retained-replay twin. Each row reads its live iteration bound from
+// a persistent device buffer refreshed before replay; launch geometry and
+// kernargs are therefore position-independent.
+extern "C" __global__ void indexer_top_k_batched_buf(
+    const float* __restrict__ scores,
+    int*         __restrict__ top_indices,
+    const int*   __restrict__ n_per_batch,
+    int n_idx_heads,
+    int n_stride,
+    int k_stride,
+    int batch_size
+) {
+    const int head = blockIdx.x;
+    const int b    = blockIdx.y;
+    if (head >= n_idx_heads || b >= batch_size) return;
+
+    const int n_iter = max(0, min(n_per_batch[b], n_stride));
+    const int k_fill = min(k_stride, n_iter);
+    const size_t out_base = (size_t)b * n_idx_heads * k_stride
+                          + (size_t)head * k_stride;
+    const int tid = threadIdx.x;
+    const int T = blockDim.x;
+
+    if (n_iter <= k_fill) {
+        for (int i = tid; i < k_stride; i += T) {
+            top_indices[out_base + i] = (i < n_iter) ? i : -1;
+        }
+        return;
+    }
+
+    const size_t scores_base = (size_t)b * n_idx_heads * n_stride
+                             + (size_t)head * n_stride;
+    for (int i = tid; i < n_iter; i += T) {
+        const float si = scores[scores_base + i];
+        int rank = 0;
+        for (int j = 0; j < n_iter; ++j) {
+            const float sj = scores[scores_base + j];
+            rank += (sj > si) || (sj == si && j < i);
+        }
+        if (rank < k_fill) top_indices[out_base + rank] = i;
+    }
+    for (int r = k_fill + tid; r < k_stride; r += T) top_indices[out_base + r] = -1;
+}

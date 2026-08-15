@@ -1134,4 +1134,77 @@ mod tests {
     fn roundtrip_parity_mfp2() {
         roundtrip_parity_for_n(2, QUANT_STEP_MFP2);
     }
+
+    /// Quantization shrinkage: does the E8 round-trip preserve magnitude?
+    ///
+    /// MSE-optimal quantization of a zero-mean distribution is systematically
+    /// *shrinking* — the reconstruction correlates with the source but is
+    /// shorter than it, because spending error budget on magnitude is cheaper
+    /// than on direction. The retained-energy ratio `E[w_hat.w] / E[w^2]`
+    /// quantifies it, and `E[w_hat.w] / E[w_hat^2]` is the per-group rescale
+    /// that would undo it.
+    ///
+    /// This matters beyond curiosity. DeepSeek V4 ships a `route_scale` of 1.8
+    /// (mq2r) and 2.2 (other builds) where the checkpoint declares 1.5, and the
+    /// PyTorch reference scores PPL 4.693 at 1.5 — so 1.5 is right for the
+    /// model and our routed branch is systematically weak. `route_scale`
+    /// multiplies *only* the routed-expert branch, which is exactly the tier
+    /// quantized through this codec, so shrinkage here is a candidate cause and
+    /// a global scalar is at best its average.
+    ///
+    /// Informational: asserts only that the round-trip is sane (positive
+    /// correlation, no blow-up), and prints the factors under `--nocapture`.
+    #[test]
+    fn e8_shrinkage_on_fwht_gaussian() {
+        // xorshift + Box-Muller; no dev-dependency, fully deterministic.
+        let mut s: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s >> 11) as f32 / (1u64 << 53) as f32
+        };
+        let mut gauss = move || {
+            let u1 = next().max(1e-12);
+            let u2 = next();
+            (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos()
+        };
+
+        println!("\nE8 shrinkage (QUANT_STEP={QUANT_STEP}, E8_SIGMA={E8_SIGMA})");
+        println!(
+            "{:<10} {:>10} {:>12} {:>12}",
+            "sigma", "retained", "|wh|/|w|", "opt_gain"
+        );
+        for sigma in [1.0f32, E8_SIGMA, 2.5] {
+            let (mut dot, mut ss_w, mut ss_h) = (0.0f64, 0.0f64, 0.0f64);
+            for _ in 0..40_000 {
+                let mut w = [0.0f32; 8];
+                for v in w.iter_mut() {
+                    *v = gauss() * sigma;
+                }
+                let h = dequantize8(quantize8(&w, QUANT_STEP), QUANT_STEP);
+                for i in 0..8 {
+                    dot += f64::from(h[i]) * f64::from(w[i]);
+                    ss_w += f64::from(w[i]) * f64::from(w[i]);
+                    ss_h += f64::from(h[i]) * f64::from(h[i]);
+                }
+            }
+            let retained = dot / ss_w;
+            let norm_ratio = (ss_h / ss_w).sqrt();
+            let opt_gain = dot / ss_h;
+            println!("{sigma:<10} {retained:>10.4} {norm_ratio:>12.4} {opt_gain:>12.4}");
+            assert!(
+                retained > 0.3 && retained < 1.3,
+                "sigma={sigma}: retained energy {retained} is not a sane round-trip"
+            );
+            assert!(
+                norm_ratio.is_finite() && norm_ratio > 0.0,
+                "sigma={sigma}: degenerate reconstruction"
+            );
+        }
+        println!(
+            "opt_gain is the per-group rescale minimising MSE; a global \
+             route_scale can only approximate its average.\n"
+        );
+    }
 }

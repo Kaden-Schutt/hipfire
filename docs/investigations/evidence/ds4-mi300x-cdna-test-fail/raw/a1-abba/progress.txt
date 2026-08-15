@@ -1,0 +1,10 @@
+pair=warm arm=A decode_tok_s=2.3035 md5=89c159c1fb93d00fdd81144cc5d9088b
+pair=warm arm=B decode_tok_s=15.2672 md5=83f0c650305e9b4d9eab9fcdc665ad3a
+pair=1 arm=A decode_tok_s=2.0288 md5=73d7b67493846afd225d4bd60cddd4f7
+pair=1 arm=B decode_tok_s=32.0271 md5=7f252cc4c86409c43869802db414fd01
+pair=1 arm=B decode_tok_s=32.0614 md5=65598ecd1f80c1bbb96c7b8c03e19232
+pair=1 arm=A decode_tok_s=2.0289 md5=0830a45dddfd454bd75904c8cdc0c1bb
+PAIR
+pair=2 arm=A decode_tok_s=2.0288 md5=ab10bacf5ad5118f2b03b12fe2fe3191
+pair=2 arm=B decode_tok_s=32.0533 md5=336a76c374ea8202c37c2b66593120b9
+pair=2 arm=B decode_tok_s=32.0312 md5=0b36c6dbf339a07904a45d6f783831f5

@@ -136,9 +136,12 @@ fn main() {
     eprintln!("Weights loaded in {:.2}s", t_load.elapsed().as_secs_f64());
 
     let kv_seq = (prefill_len + warmup_len + gen_len + 16).max(512);
-    // KV cache mode via HIPFIRE_KV_MODE env var:
+    // KV cache mode via resolved TOML policy:
     //   q8 (default) | asym4 | asym3 | asym2
-    let kv_mode = std::env::var("HIPFIRE_KV_MODE").unwrap_or_else(|_| "q8".to_string());
+    let kv_mode = match hipfire_runtime::config::get().kv_mode.as_str() {
+        "auto" => "q8".to_string(),
+        mode => mode.to_string(),
+    };
     eprintln!("KV mode: {kv_mode}");
     let mut kv_cache = match kv_mode.as_str() {
         "q8" => KvCache::new_gpu_q8(

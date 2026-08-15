@@ -1,0 +1,23 @@
+The following is a production-grade technical briefing for a measurement contract governing the evaluation of a DeepSeek V4 Flash-style Mixture-of-Experts (MoE) model on AMD Instinct MI300X (gfx942) hardware. The focus is on the specific inference path: batch-1, no speculation, Q8 KV precision, a fixed 2044-token prompt, and 510 greedy tokens at temperature zero. This is intended as a background for a benchmark fixture and assumes no prior optimization or speculative shortcuts.
+
+---
+
+### 1. The Primacy of Prompt Bytes Over "Text"
+
+The measurement contract must treat the prompt as a deterministic byte sequence, not a human-readable string. This is critical because:
+
+- **Tokenization is byte-dependent**: A trailing newline, a different line-ending convention (CR vs. LF), or a subtle whitespace difference (e.g., a tab vs. two spaces) changes the token sequence. The tokenizer embedded in the runtime (typically `hfq_tokenizer` or similar) is the only authority. A Python-based tokenizer from Hugging Face is not interchangeable; its pre-tokenization regex, byte-fallback rules, and special-token handling differ.
+
+- **Reproducibility**: The benchmark must be anchored to a specific, versioned corpus. The corpus must be a realistic, non-repetistic text (e.g., a technical discussion or prose), not a random string or a repeated paragraph. Repetition distorts attention patterns and timing.
+
+- **The Fixture Generation Protocol**:
+    1. The source corpus is read as bytes.
+    2. The runtime tokenizer encodes the entire corpus.
+    3. The first N tokens (exactly 2044) are extracted.
+    4. The extracted token sequence is decoded back to text via the runtime's `decode()` API.
+    5. The decoded text is re-encoded.
+    6. **Critical Check**: The re-encoded token IDs must exactly match the original N tokens. If they do not, the fixture generator must fail (fail-closed). This ensures the tokenization is stable and deterministic.
+    7. The final prompt file contains no trailing newline (so `PROMP_ARG=$(<file)` preserves exact bytes).
+    8. Optionally, a separate file contains the token IDs as little-endian u32 integers.
+
+The prompt's MD5 and SHA-256 are recorded as part of the ledger, not as optional metadata. This ensures that any two runs claiming

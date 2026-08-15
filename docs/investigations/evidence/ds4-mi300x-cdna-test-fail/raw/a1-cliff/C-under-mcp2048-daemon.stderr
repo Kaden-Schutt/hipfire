@@ -1,0 +1,6 @@
+GPU dev 0: gfx942 (205.8 GB VRAM, HIP 7.0)
+  pre-compiled kernels: /mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/.hipfire_kernels/gfx942
+[rocblas] loaded for gfx942
+deepseek4: MQ2R P3 tensor recipe verified; gfx1151 route v2 is ineligible on gfx942, using portable dispatch
+[daemon-control] received commit for id=g0-C-under-mcp2048 attempt_id=1
+[req g0-C-under-mcp2048] drafter=ar tau=1.00 tok/s=33.0 decode (32 tok, autoregressive)

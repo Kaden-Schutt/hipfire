@@ -1,0 +1,5 @@
+[continued from user: ...]I'll continue the assistant's response in the same technical, no-nonsly style.
+
+The assistant's response:
+
+...detection must reject any candidate that does not match the target architecture. For this campaign, the target is DeepSeek V4 Flash class models on AMD Instinct

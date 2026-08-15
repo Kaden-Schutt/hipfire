@@ -46,3 +46,26 @@ extern "C" __global__ void swa_ring_write_batched_f32(
         cache[((size_t)h * head_dim + d) * window + slot] = v;
     }
 }
+
+
+// Capture/retained-replay twin: absolute positions live in a persistent
+// device buffer refreshed before replay.
+extern "C" __global__ void swa_ring_write_batched_pos_f32(
+    const float* __restrict__ kv_batch,
+    float*       __restrict__ cache,
+    const int*   __restrict__ positions,
+    int n_kv_heads,
+    int head_dim,
+    int window,
+    int batch_size
+) {
+    const int d = blockIdx.x * BLOCK + threadIdx.x;
+    const int b = blockIdx.y;
+    if (d >= head_dim || b >= batch_size) return;
+
+    const int slot = positions[b] % window;
+    const float v = kv_batch[(size_t)b * head_dim + d];
+    for (int h = 0; h < n_kv_heads; ++h) {
+        cache[((size_t)h * head_dim + d) * window + slot] = v;
+    }
+}

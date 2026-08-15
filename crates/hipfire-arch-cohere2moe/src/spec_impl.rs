@@ -81,18 +81,13 @@ impl SpecTarget for Cohere2MoeBundle {
         self
     }
 
-    fn reset_recurrent(&mut self, gpu: &mut Gpu) {
+    fn reset_recurrent(&mut self, gpu: &mut Gpu) -> Result<(), String> {
         // Pure attention: no recurrent state to zero. Clear the KV cache and
         // rewind the position cursor so the next prefill writes from slot 0.
         // Mirrors the daemon's arch_id=12 reset handler.
-        //
-        // Note: `Cohere2MoeState::reset` takes `&mut Gpu` because it zeros the
-        // KV buffers on device (unlike qwen2's cursor-only rewind). We ignore
-        // the GPU error here (alloc failures on a zero-size memset are
-        // structurally impossible; log-and-continue is the codebase pattern).
-        if let Err(e) = self.state.reset(gpu) {
-            eprintln!("cohere2moe spec reset_recurrent: {e}");
-        }
+        self.state
+            .reset(gpu)
+            .map_err(|e| format!("cohere2moe reset_recurrent: {e}"))
     }
 
     fn new_spec_scratch(
@@ -157,7 +152,10 @@ impl SpecTarget for Cohere2MoeBundle {
                 .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
                 .map(|(idx, _)| idx as u32)
                 .unwrap_or(0);
-            return Ok(SpecAdvance::Ready { last_argmax });
+            return Ok(SpecAdvance::Ready {
+                last_argmax,
+                last_logits: Some(last_logits),
+            });
         }
         for &tok in tokens {
             if abort() {
@@ -174,10 +172,14 @@ impl SpecTarget for Cohere2MoeBundle {
             // double-steps (KV scattered across 0,2,4,… → corrupt context).
         }
         // decode_step leaves the logits in state.logits. Take the argmax.
+        // GPU-only argmax — no host row materialised here.
         let last_argmax = gpu
             .argmax_f32(&self.state.logits, self.config.vocab_size)
             .map_err(|e| format!("{e:?}"))?;
-        Ok(SpecAdvance::Ready { last_argmax })
+        Ok(SpecAdvance::Ready {
+            last_argmax,
+            last_logits: None,
+        })
     }
 
     fn verify_block(

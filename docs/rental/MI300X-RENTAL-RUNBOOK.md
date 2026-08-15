@@ -1,3 +1,51 @@
+<!-- lifecycle-banner: additive only; body below is immutable historical prose -->
+> **Lifecycle — historical (not current procedure).**
+> Collection policy: [`docs/INDEX.md`](../INDEX.md) labels `docs/rental/` and this
+> runbook **historical**. The body below is a retained campaign record from the
+> original MI300X DigitalOcean v3 / sub-0.10 sweep. It is **not** a product
+> default, **not** an admission path, and **not** current executable operator
+> procedure. Do not promote numbers, stop conditions, or script expectations
+> here into live floors or validation routes.
+>
+> **Truth / validation.** Present-tense validation authority is only
+> [`docs/VALIDATION.md`](../VALIDATION.md). Scripts named in the body
+> (`mi300x_smoke_gfx942.sh`, matrix helpers, retired coherence probes) are
+> supporting/manual campaign tools — not selector minimum routes. Quant-quality
+> (KLD/PPL) and multi-GPU claim classes stay **blocked** where the selector has
+> no route. No-GPU CI green never substitutes for GPU evidence.
+>
+> **Known campaign hazards (do not “fix” the historical body — read these first):**
+> - **KLD generation is blocked on a fresh tree.** `mi300x_v3_matrix.sh::ensure_kldref`
+>   looks for nonexistent `crates/hipfire-runtime/examples/make_kldref.rs` and
+>   nonexistent `scripts/make_kldref_torch.py` (audited ref
+>   `692a726dde53508cb53de1a74c720e75a7c9f33e`). A fresh matrix stops at KLD
+>   unless matching `$WORK/kldref/<slug>-bf16.kldref.bin` files are **preseeded**.
+>   Do not treat “generated kldref as scripted” as a live route.
+> - **Bootstrap is destructive.** `scripts/mi300x_bootstrap.sh` runs
+>   `git reset --hard origin/$HIPFIRE_BRANCH` on the clone. Reruns destroy
+>   uncommitted work. `HIPFIRE_BRANCH` tracks a moving branch tip, not an
+>   immutable commit. Use only a disposable clone; pin and record the resulting
+>   HEAD and binary hash before any measurement.
+> - **Unauthenticated `curl | bash` tip.** The documented raw.githubusercontent
+>   fetch executes a branch-tip script as root without integrity verification.
+> - **Smoke fallback cost.** If no prebuilt 9B mq4 is present, the smoke path
+>   downloads and quantizes the full pinned Qwen3.5-9B snapshot — not a tiny
+>   stand-in.
+> - **Env knobs that exist in `mi300x_v3_matrix.sh`:** `EVAL_KV_MODE`, `EVAL_CTX`,
+>   `BENCH_MAX`, `COHERENCE_MAX_TOKENS` (and related script-header knobs).
+>   `A3B_INCLUDE_ROUTER` does **not** appear in that script — ignore that body
+>   mention as stale campaign prose.
+> - **Optional `/root` helpers bill indefinitely without teardown.**
+>   `mi300_after_3m.sh` polls forever for
+>   `/root/models/qwen3.6-35b-a3b.mq4.triattn.3m.bin`, then may launch two
+>   10k-step jobs. Neither `mi300_after_3m.sh` nor `mi300_chain_runner.sh`
+>   powers off or destroys the droplet. Budget ceiling, external timeout, and
+>   provider alerts are entirely manual; the waiter can bill if its marker never
+>   appears.
+>
+> **Preservation.** Everything after this banner is the committed historical
+> body, retained byte-for-byte. Do not rewrite it into active Part A procedure.
+
 # MI300X Rental Runbook — DigitalOcean
 
 One-page reference for spinning up a 1× MI300x droplet on DigitalOcean and
@@ -67,7 +115,7 @@ require it). Get one at https://huggingface.co/settings/tokens.
 export HF_TOKEN="hf_..."  # your token
 
 # Fetch just the bootstrap script (avoids needing a full clone yet)
-curl -sL https://raw.githubusercontent.com/Kaden-Schutt/hipfire/worktree-awq-raw-sumsq-converter/scripts/mi300x_bootstrap.sh \
+curl -sL https://raw.githubusercontent.com/warpfront/hipfire/worktree-awq-raw-sumsq-converter/scripts/mi300x_bootstrap.sh \
     -o /tmp/mi300x_bootstrap.sh
 chmod +x /tmp/mi300x_bootstrap.sh
 ```

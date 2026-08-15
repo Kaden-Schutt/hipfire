@@ -225,10 +225,10 @@ pub fn sample(
 }
 
 /// CPU-only fallback: same math as [`sample`] but operates on a host
-/// `logits` slice. Used by the VL path (`generate_vl` in daemon.rs)
-/// where the argmax/top-p selection runs after a CPU-side
-/// `apply_ngram_block` + `apply_repeat_penalty` pass that has no GPU
-/// equivalent.
+/// `logits` slice. Used by the VL path (`generate_vl` in daemon.rs), where
+/// the argmax/top-p selection runs after CPU-side policy mutations that have
+/// no GPU equivalent. Callers that want a positional n-gram ban apply
+/// [`llama::apply_ngram_block`] before calling this function.
 ///
 /// This is a thin wrapper over `llama::apply_repeat_penalty` +
 /// `llama::sample_top_p` that exists so call sites have one import

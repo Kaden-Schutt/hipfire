@@ -358,8 +358,7 @@ impl KvTierPlan {
 /// attention based on context length and capture mode. Shared between the
 /// `is_boundary` and `quant_q8` branches of `derive`.
 fn q8_attend_key(pos: usize, flash_mode: usize, capture_mode: bool) -> KernelKey {
-    let use_flash =
-        capture_mode || flash_mode == 2 || (flash_mode == 1 && pos + 1 >= 2048) || pos + 1 > 15000;
+    let use_flash = capture_mode || flash_mode == 2 || (flash_mode == 1 && pos + 1 >= 2048);
     if use_flash {
         KernelKey::AttnFlashQ8_0
     } else {
@@ -745,7 +744,9 @@ mod tests {
     }
 
     #[test]
-    fn q8_flash_very_long_context() {
+    fn q8_non_flash_very_long_context() {
+        // flash_mode=0 never selects flash merely because pos is large;
+        // only capture / flash_mode=2 / (flash_mode=1 && long) do.
         let inputs = KvTierInputs {
             quant_q8: true,
             pos: 15000,
@@ -755,7 +756,7 @@ mod tests {
         };
         let plan = KvTierPlan::derive(inputs).unwrap();
         assert_eq!(plan.write_key, KernelKey::KvWriteQ8_0);
-        assert_eq!(plan.attend_key, KernelKey::AttnFlashQ8_0);
+        assert_eq!(plan.attend_key, KernelKey::AttnQ8_0Kv);
     }
 
     #[test]

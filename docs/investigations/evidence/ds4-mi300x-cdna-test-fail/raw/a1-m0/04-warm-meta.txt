@@ -1,0 +1,12 @@
+daemon_sha=838034a0efa6acdd172311f5aabe65e61370f59882b2840aa0f158120a800ca8
+hipfire_sha=fa7aa7fa257c6e249bc0e25f06908ff4b41d6a9576a6c7f581aea5461e8bdc88
+
+
+============================ ROCm System Management Interface ============================
+===================================== KFD Processes ======================================
+KFD process information:
+PID 	PROCESS NAME	GPU(s)	VRAM USED	SDMA USED	CU OCCUPANCY	
+1823	gpuagent    	0     	0        	0        	0           	
+==========================================================================================
+================================== End of ROCm SMI Log ===================================
+Sat Aug  1 02:04:08 PM UTC 2026

@@ -50,6 +50,37 @@ pub struct HfqTensorInfo {
     pub data_offset: usize,
     pub data_size: usize,
 }
+/// Ordered absolute tensor manifest entry for source identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HfqTensorManifestEntry {
+    pub name: String,
+    pub quant_type: u8,
+    pub shape: Vec<u32>,
+    pub group_size: u32,
+    pub data_offset: usize,
+    pub data_size: usize,
+}
+
+/// Exact immutable source seal for an HFQ file.
+///
+/// Equality is exact byte/field equality over canonical path, platform file
+/// identity (dev/ino), file length, mtime, arch, metadata_json, and the
+/// ordered absolute tensor manifest (name, quant_type, shape, group_size,
+/// data_offset, data_size). The opened base offset is captured through the
+/// absolute data_offset values. This is an immutable value; callers store it
+/// behind an `Arc` and never mutate it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HfqSourceIdentity {
+    pub canonical_path: std::path::PathBuf,
+    pub dev: u64,
+    pub ino: u64,
+    pub len: u64,
+    pub mtime_secs: i64,
+    pub mtime_nanos: u32,
+    pub arch_id: u32,
+    pub metadata_json: String,
+    pub manifest: Vec<HfqTensorManifestEntry>,
+}
 
 /// Author-recommended sampling defaults baked into a .hfq's
 /// `generation_config` metadata, surfaced by [`HfqFile::recommended_sampling`].
@@ -97,15 +128,22 @@ pub struct HfqFile {
 
 impl HfqFile {
     pub fn open(path: &Path) -> std::io::Result<Self> {
+        let reap_plan = hipfire_config::developer_var("HIPFIRE_REAP_PLAN")
+            .ok()
+            .map(std::path::PathBuf::from);
+        Self::open_with_reap_plan(path, reap_plan.as_deref())
+    }
+
+    fn open_with_reap_plan(path: &Path, reap_plan: Option<&Path>) -> std::io::Result<Self> {
         let mut f = Self::open_at_offset(path, 0)?;
-        // REAP load-time overlay splice (SP3): when HIPFIRE_REAP_PLAN points
+        // REAP load-time overlay splice (SP3): when the process policy points
         // at a dir containing `overlay.hfq`, attach it so its re-quantized
         // tensors shadow the base by name. Opened via `open_at_offset` (NOT
-        // `open`) so the overlay does NOT recursively env-attach. A mismatched
+        // `open`) so the overlay does NOT recursively auto-attach. A mismatched
         // arch_id is logged and we proceed base-only — the safe default for
-        // unrelated model opens that happen to share the env var.
-        if let Ok(dir) = std::env::var("HIPFIRE_REAP_PLAN") {
-            let ov_path = std::path::Path::new(&dir).join("overlay.hfq");
+        // unrelated model opens that happen to share the process policy.
+        if let Some(dir) = reap_plan {
+            let ov_path = dir.join("overlay.hfq");
             if ov_path.exists() {
                 // NOTE: a failure to attach (unreadable overlay, arch mismatch,
                 // missing tensor, or shape mismatch) is logged and we proceed
@@ -201,15 +239,33 @@ impl HfqFile {
         }
 
         let base = base_offset as usize;
-        assert!(
-            base + 32 <= mmap.len(),
-            "HfqFile::open_at_offset: base ({base}) + 32 > file size ({}); not enough bytes for header",
-            mmap.len(),
-        );
+        let file_len = mmap.len();
+        // A truncated or corrupt container must surface as an error instead of
+        // panicking on an out-of-bounds slice: open_at_offset advertises a
+        // fallible signature, so malformed input is an `Err`, not a panic (#578).
+        let need = |end: usize, what: &str| -> std::io::Result<()> {
+            if end > file_len {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "HfqFile: truncated or corrupt HFQ container: reading {what} \
+                         needs {end} bytes but the file is only {file_len}"
+                    ),
+                ))
+            } else {
+                Ok(())
+            }
+        };
+        need(base + 32, "the 32-byte header")?;
 
         // Parse header (32 bytes) at base offset.
         let magic = &mmap[base..base + 4];
-        assert_eq!(magic, b"HFQM", "Not an HFQ container at offset {base}");
+        if magic != b"HFQM" {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("HfqFile: not an HFQ container at offset {base}"),
+            ));
+        }
         let _version = u32::from_le_bytes(mmap[base + 4..base + 8].try_into().unwrap());
         let arch_id = u32::from_le_bytes(mmap[base + 8..base + 12].try_into().unwrap());
         let n_tensors = u32::from_le_bytes(mmap[base + 12..base + 16].try_into().unwrap()) as usize;
@@ -219,6 +275,17 @@ impl HfqFile {
             u64::from_le_bytes(mmap[base + 16..base + 24].try_into().unwrap()) as usize + base;
         let data_offset =
             u64::from_le_bytes(mmap[base + 24..base + 32].try_into().unwrap()) as usize + base;
+        // Guard the metadata slice below: a truncated/corrupt container can hold
+        // offsets that overrun the file or cross over each other (#578).
+        if metadata_offset > data_offset || data_offset > file_len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "HfqFile: invalid metadata/data offsets ({metadata_offset}, {data_offset}) \
+                     for a {file_len}-byte file"
+                ),
+            ));
+        }
 
         // Read metadata JSON
         // Metadata ends at the tensor index, which starts right after metadata
@@ -285,8 +352,16 @@ impl HfqFile {
 
         // Parse tensor index (follows metadata JSON)
         let mut pos = metadata_offset + json_end;
+        need(pos + 4, "the tensor-index count")?;
         let idx_n = u32::from_le_bytes(mmap[pos..pos + 4].try_into().unwrap()) as usize;
-        assert_eq!(idx_n, n_tensors);
+        if idx_n != n_tensors {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "HfqFile: tensor-index count {idx_n} does not match header count {n_tensors}"
+                ),
+            ));
+        }
         pos += 4;
 
         let mut tensors = Vec::with_capacity(n_tensors);
@@ -294,19 +369,24 @@ impl HfqFile {
         let mut cumulative_offset = data_offset;
 
         for i in 0..n_tensors {
+            need(pos + 2, "a tensor name length")?;
             let name_len = u16::from_le_bytes(mmap[pos..pos + 2].try_into().unwrap()) as usize;
             pos += 2;
+            need(pos + name_len, "a tensor name")?;
             let name = String::from_utf8_lossy(&mmap[pos..pos + name_len]).to_string();
             pos += name_len;
+            need(pos + 2, "a tensor quant type and dimension count")?;
             let quant_type = mmap[pos];
             pos += 1;
             let n_dims = mmap[pos] as usize;
             pos += 1;
+            need(pos + n_dims * 4, "a tensor shape")?;
             let mut shape = Vec::with_capacity(n_dims);
             for _ in 0..n_dims {
                 shape.push(u32::from_le_bytes(mmap[pos..pos + 4].try_into().unwrap()));
                 pos += 4;
             }
+            need(pos + 12, "a tensor group and data size")?;
             let group_size = u32::from_le_bytes(mmap[pos..pos + 4].try_into().unwrap());
             pos += 4;
             let data_size = u64::from_le_bytes(mmap[pos..pos + 8].try_into().unwrap()) as usize;
@@ -783,6 +863,67 @@ impl HfqFile {
     /// `tensor_data_vec`.
     pub fn tensors(&self) -> &[HfqTensorInfo] {
         &self.tensors
+    }
+
+    /// Compute the exact immutable source identity for this opened HFQ file.
+    ///
+    /// Equality is over canonical path, platform file identity (dev/ino on
+    /// Unix), file length, mtime, arch_id, exact metadata_json, and the
+    /// ordered absolute tensor manifest (name, quant_type, shape, group_size,
+    /// data_offset, data_size). The base offset is captured via the absolute
+    /// data_offset values. This must be called before any EP GPU allocation
+    /// so the admitted seal binds the exact bytes that will be loaded.
+    pub fn load_identity(&self) -> HipResult<HfqSourceIdentity> {
+        let canonical_path =
+            std::fs::canonicalize(&self.path).unwrap_or_else(|_| self.path.clone());
+        let meta = std::fs::metadata(&self.path).map_err(|e| {
+            HipError::new(
+                0,
+                &format!("HfqFile::load_identity: metadata({:?}): {}", self.path, e),
+            )
+        })?;
+        let len = meta.len();
+        #[cfg(unix)]
+        let (dev, ino) = {
+            use std::os::unix::fs::MetadataExt;
+            (meta.dev(), meta.ino())
+        };
+        #[cfg(not(unix))]
+        let (dev, ino) = (0u64, 0u64);
+        let (mtime_secs, mtime_nanos) = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| (d.as_secs() as i64, d.subsec_nanos()))
+            .unwrap_or((0, 0));
+        let manifest = self
+            .tensors
+            .iter()
+            .map(|t| HfqTensorManifestEntry {
+                name: t.name.clone(),
+                quant_type: t.quant_type,
+                shape: t.shape.clone(),
+                group_size: t.group_size,
+                data_offset: t.data_offset,
+                data_size: t.data_size,
+            })
+            .collect();
+        Ok(HfqSourceIdentity {
+            canonical_path,
+            dev,
+            ino,
+            len,
+            mtime_secs,
+            mtime_nanos,
+            arch_id: self.arch_id,
+            metadata_json: self.metadata_json.clone(),
+            manifest,
+        })
+    }
+
+    /// Convenience: load the source identity wrapped in an immutable `Arc`.
+    pub fn load_identity_arc(&self) -> HipResult<std::sync::Arc<HfqSourceIdentity>> {
+        self.load_identity().map(std::sync::Arc::new)
     }
 }
 
@@ -1743,7 +1884,6 @@ mod overlay_tests {
     use super::*;
     use crate::model_source::ModelSource; // for `tensor_names`
     use std::io::Write;
-    use std::sync::Mutex;
 
     /// Minimal HFQ writer mirroring `hipfire-quantize`'s `write_hfq`
     /// (`crates/hipfire-quantize/src/main.rs:3398`) byte-for-byte for the
@@ -1798,17 +1938,51 @@ mod overlay_tests {
         f.flush().unwrap();
     }
 
-    // Env vars are process-global. `HfqFile::open` READS `HIPFIRE_REAP_PLAN`
-    // on every call, so EVERY test here that calls `open` must serialize on
-    // this mutex — otherwise the env-attach test's `set_var` leaks into a
-    // concurrent `open` in another test and attaches the wrong overlay.
-    // Hold the lock for the whole test body so env stays consistent across
-    // every `open` within it.
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+    #[test]
+    fn truncated_container_errors_instead_of_panicking() {
+        // #578: open_at_offset advertises `io::Result` but used to panic on an
+        // out-of-bounds slice for a truncated/corrupt container. Every prefix of
+        // a valid container that lands in the header/metadata/index region (i.e.
+        // below the 4096-aligned data region, which open does not read) must now
+        // return Err rather than panic.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.hfq");
+        write_min_hfq(&path, 9, &[("A", 3, &[2, 4], &vec![1u8; 8])]);
+
+        // Sanity: the full, valid container opens.
+        assert!(HfqFile::open_at_offset(&path, 0).is_ok());
+
+        let full = std::fs::read(&path).unwrap();
+        for len in [0usize, 4, 16, 31, 32, 34, 40, 100, 2048, 4095] {
+            let p = dir.path().join(format!("trunc_{len}.hfq"));
+            std::fs::write(&p, &full[..len]).unwrap();
+            assert!(
+                HfqFile::open_at_offset(&p, 0).is_err(),
+                "truncating to {len} bytes should error, not panic"
+            );
+        }
+
+        // A header-valid container whose tensor-index name length runs past the
+        // end of the file must also error (exercises the index-loop bounds check
+        // rather than the header/offset guards).
+        let mut crafted = Vec::new();
+        crafted.extend_from_slice(b"HFQM");
+        crafted.extend_from_slice(&1u32.to_le_bytes()); // version
+        crafted.extend_from_slice(&9u32.to_le_bytes()); // arch_id
+        crafted.extend_from_slice(&1u32.to_le_bytes()); // n_tensors
+        crafted.extend_from_slice(&32u64.to_le_bytes()); // metadata_offset
+        crafted.extend_from_slice(&40u64.to_le_bytes()); // data_offset (== file len)
+        crafted.extend_from_slice(b"{}"); // metadata JSON (offsets 32..34)
+        crafted.extend_from_slice(&1u32.to_le_bytes()); // index tensor count (34..38)
+        crafted.extend_from_slice(&9999u16.to_le_bytes()); // name_len past EOF (38..40)
+        assert_eq!(crafted.len(), 40);
+        let cpath = dir.path().join("bad_namelen.hfq");
+        std::fs::write(&cpath, &crafted).unwrap();
+        assert!(HfqFile::open_at_offset(&cpath, 0).is_err());
+    }
 
     #[test]
     fn overlay_tensor_shadows_base() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("base.hfq");
         let ov = dir.path().join("overlay.hfq");
@@ -1840,7 +2014,6 @@ mod overlay_tests {
 
     #[test]
     fn overlay_arch_mismatch_rejected() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("b.hfq");
         let ov = dir.path().join("o.hfq");
@@ -1852,10 +2025,7 @@ mod overlay_tests {
     }
 
     #[test]
-    fn open_auto_attaches_overlay_from_env() {
-        // Env mutation is process-global; lock so this serializes with any
-        // other env-mutating test in this module.
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    fn open_auto_attaches_overlay_from_process_policy() {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("base.hfq");
         write_min_hfq(&base, 9, &[("A", 3, &[1, 4], &vec![1u8; 4])]);
@@ -1866,17 +2036,13 @@ mod overlay_tests {
             9,
             &[("A", 8, &[1, 4], &vec![7u8; 4])],
         );
-        std::env::set_var("HIPFIRE_REAP_PLAN", plan.path());
-        let f = HfqFile::open(&base).unwrap();
-        std::env::remove_var("HIPFIRE_REAP_PLAN");
+        let f = HfqFile::open_with_reap_plan(&base, Some(plan.path())).unwrap();
         assert!(f.has_overlay());
         assert_eq!(f.find_tensor_info("A").unwrap().quant_type, 8); // overlay won
     }
 
     #[test]
     fn overlay_with_foreign_tensor_rejected() {
-        let _g = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("HIPFIRE_REAP_PLAN");
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("b.hfq");
         let ov = dir.path().join("o.hfq");

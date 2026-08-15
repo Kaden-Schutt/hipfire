@@ -27,7 +27,7 @@ fn main() -> Result<()> {
     // Non-interactive argument handling (headless-safe, no TTY required).
     // Only the first argument is inspected — every branch returns/exits, so
     // there is never a second iteration.
-    if let Some(arg) = std::env::args().nth(1) {
+    let profile_wizard = if let Some(arg) = std::env::args().nth(1) {
         match arg.as_str() {
             "--version" | "-V" => {
                 println!("hipfire-tui {VERSION}");
@@ -40,20 +40,26 @@ fn main() -> Result<()> {
             "--check" => {
                 return run_check();
             }
+            "--config-profile-wizard" => true,
             other => {
                 eprintln!("hipfire-tui: unknown argument '{other}'");
                 print_help();
                 std::process::exit(2);
             }
         }
-    }
+    } else {
+        false
+    };
 
     let mut terminal = setup_terminal()?;
-    let result = run(&mut terminal);
+    let result = if profile_wizard {
+        hipfire::profile_wizard::run(&mut terminal)
+    } else {
+        run(&mut terminal)
+    };
     restore_terminal(&mut terminal)?;
     result
 }
-
 fn print_help() {
     println!(
         "hipfire-tui {VERSION} - terminal UI for hipfire\n\
@@ -62,13 +68,15 @@ fn print_help() {
              hipfire-tui [FLAGS]\n\
          \n\
          FLAGS:\n    \
-             -h, --help       Print this help and exit\n    \
-             -V, --version    Print version and exit\n        \
-                 --check      Load config/registry/models without entering the\n                         \
-                              render loop, then exit 0 on success (headless smoke)\n\
+             -h, --help               Print this help and exit\n    \
+             -V, --version            Print version and exit\n    \
+                 --check              Load config/registry/models without entering the\n                         \
+                                      render loop, then exit 0 on success (headless smoke)\n    \
+                 --config-profile-wizard\n                         \
+                                      Select/create profiles and browse config variables\n\
          \n\
          With no flags, hipfire-tui launches the interactive ratatui UI (requires a TTY).\n\
-         Tabs: Home, Dashboard, Chat, Models, Settings, System. Tab/BackTab to switch, q to quit."
+         Tabs: Home, Dashboard, Chat, Models, Settings, System. Tab/Shift+Tab to switch, q to quit."
     );
 }
 
