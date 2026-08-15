@@ -165,8 +165,11 @@ class Daemon:
         env = os.environ.copy()
         if runtime_home is not None:
             runtime_home.mkdir(parents=True, exist_ok=True)
-            (runtime_home / ".hipfire").mkdir(exist_ok=True)
+            hipfire_home = runtime_home / ".hipfire"
+            hipfire_home.mkdir(exist_ok=True)
             env["HOME"] = str(runtime_home.resolve())
+            env["HIPFIRE_HOME"] = str(hipfire_home.resolve())
+            env.pop("HIPFIRE_MODELS_DIR", None)
         env["HIP_VISIBLE_DEVICES"] = physical_gpu
         env["HIPFIRE_GEMMA4_GRAPH"] = "0"
         env["HIPFIRE_GEMMA4_EAGLE"] = "0"
@@ -334,11 +337,14 @@ def load_tasks(args: argparse.Namespace) -> tuple[list[dict], dict | None]:
 
 def summarize(rows: list[dict], config: dict) -> dict:
     valid = [row for row in rows if not row.get("error")]
-    scored = [row for row in valid if row.get("gold")]
+    labelled = [row for row in valid if row.get("gold")]
+    scored = [row for row in labelled if row.get("pred") is not None]
     return {
         "completed": len(rows),
         "valid": len(valid),
         "errors": len(rows) - len(valid),
+        "scored": len(scored),
+        "unscored": len(labelled) - len(scored),
         "accuracy": (
             sum(bool(row.get("correct")) for row in scored) / len(scored) if scored else None
         ),
@@ -555,7 +561,11 @@ def main() -> int:
                     "gold": task.get("gold"),
                     "pred": pred,
                     "pred_source": pred_source,
-                    "correct": pred == task.get("gold") if task.get("gold") else None,
+                    "correct": (
+                        pred == task.get("gold")
+                        if task.get("gold") and pred is not None
+                        else None
+                    ),
                     "wall_s": wall_s,
                     **{key: done.get(key) for key in (
                         "type", "finish_reason", "tokens", "tok_s", "prefill_tokens",

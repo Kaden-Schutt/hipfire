@@ -18,6 +18,7 @@ MAX_TOKENS="${MAX_TOKENS:-1536}"
 LIMIT="${LIMIT:-30}"
 COOLDOWN="${COOLDOWN:-10}"
 MAX_ACCURACY_DROP="${MAX_ACCURACY_DROP:-0.05}"
+MAX_CORRECTNESS_REGRESSIONS="${MAX_CORRECTNESS_REGRESSIONS:-0}"
 RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 OUT_ROOT="${OUT_ROOT:-$ROOT/target/validation/gemma4-longbench-prefill/$EXPECTED_ARCH/$RUN_ID}"
 
@@ -61,14 +62,19 @@ for mode in off auto; do
     sleep "$COOLDOWN"
 done
 
-python3 - "$OUT_ROOT" "$MAX_ACCURACY_DROP" <<'PY'
+python3 - "$OUT_ROOT" "$MAX_ACCURACY_DROP" "$MAX_CORRECTNESS_REGRESSIONS" <<'PY'
 import json
 import pathlib
 import sys
 
 root = pathlib.Path(sys.argv[1])
 max_drop = float(sys.argv[2])
-report = {"max_accuracy_drop": max_drop, "models": {}}
+max_regressions = int(sys.argv[3])
+report = {
+    "max_accuracy_drop": max_drop,
+    "max_correctness_regressions": max_regressions,
+    "models": {},
+}
 for model in ("e2b", "e4b"):
     summaries = {
         mode: json.loads((root / mode / model / "summary.json").read_text())
@@ -89,6 +95,12 @@ for model in ("e2b", "e4b"):
         raise SystemExit(f"{model}: execution errors in LongBench A/B")
     if off["completed"] != auto["completed"] or off["valid"] != auto["valid"]:
         raise SystemExit(f"{model}: off/auto completion mismatch")
+    if off["scored"] != off["completed"] or auto["scored"] != auto["completed"]:
+        raise SystemExit(
+            f"{model}: missing explicit final answers: "
+            f"off={off['scored']}/{off['completed']}, "
+            f"auto={auto['scored']}/{auto['completed']}"
+        )
     if auto["accuracy"] + max_drop < off["accuracy"]:
         raise SystemExit(
             f"{model}: accuracy regressed by more than {max_drop:.3f}: "
@@ -113,6 +125,11 @@ for model in ("e2b", "e4b"):
         not bool(rows["off"][key].get("correct")) and bool(rows["auto"][key].get("correct"))
         for key in common
     )
+    if regressions > max_regressions:
+        raise SystemExit(
+            f"{model}: {regressions} per-example correctness regressions "
+            f"exceed allowed {max_regressions}"
+        )
     result = {
         "completed": off["completed"],
         "off_accuracy": off["accuracy"],
