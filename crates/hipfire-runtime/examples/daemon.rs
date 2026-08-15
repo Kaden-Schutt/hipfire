@@ -29332,6 +29332,12 @@ fn generate_gemma4(
         emit_error_with_id(stdout, id, "tokenizer not loaded");
         return;
     }
+    // Open the stream contract BEFORE any GPU work or token emission: the CLI's
+    // StreamContractGate fail-closes on any event preceding `gen_start`, so
+    // without this the first `token` is rejected, the client aborts, and the
+    // HTTP handler waits forever. Same fix as DS4 (e99583afa) and lfm2moe.
+    let gen_contract = gen_start_contract_version_for_arch(m.arch_id);
+    emit_gen_start(stdout, id, false, gen_contract);
     let Some(ModelState::Gemma4(bundle)) = m.state.as_mut() else {
         emit_error_with_id(
             stdout,
@@ -29673,8 +29679,16 @@ fn generate_gemma4(
         };
         let _ = writeln!(
             stdout,
-            r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_ms":{},"total_ms":{},"spec":"gemma4_eagle","rounds":{},"tau":{:.3},"draft_len":{}}}"#,
-            id, generated_count, tok_s, prefill_ms, total_ms, rounds, tau, draft_len,
+            r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_ms":{},"total_ms":{},"spec":"gemma4_eagle","rounds":{},"tau":{:.3},"draft_len":{},"attempt_id":{}}}"#,
+            id,
+            generated_count,
+            tok_s,
+            prefill_ms,
+            total_ms,
+            rounds,
+            tau,
+            draft_len,
+            active_attempt_id(),
         );
         let _ = stdout.flush();
         return;
@@ -29706,6 +29720,7 @@ fn generate_gemma4(
             "type": "token",
             "id": id,
             "text": frag,
+            "attempt_id": active_attempt_id(),
         });
         let _ = writeln!(stdout, "{}", envelope);
         let _ = stdout.flush();
@@ -29748,8 +29763,13 @@ fn generate_gemma4(
     };
     let _ = writeln!(
         stdout,
-        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_ms":{},"total_ms":{}}}"#,
-        id, generated_count, tok_s, prefill_ms, total_ms,
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_ms":{},"total_ms":{},"attempt_id":{}}}"#,
+        id,
+        generated_count,
+        tok_s,
+        prefill_ms,
+        total_ms,
+        active_attempt_id(),
     );
     let _ = stdout.flush();
 }
