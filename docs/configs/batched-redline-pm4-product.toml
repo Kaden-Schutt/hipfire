@@ -1,0 +1,41 @@
+# Certified fixed-slot sampled AR batch route for gfx1201 Qwen3.6 A3B MQ4R.
+#
+# Admission evidence:
+# - the exact 1,184-dispatch HIP tape was replayed through ordinary HIP first;
+# - retained PM4 matched logits, KV, and recurrent state bit-for-bit twice;
+# - the B63 tape remained exact across eight advancing decode positions.
+#
+# Keep the batch shape fixed for the lifetime of the retained plan. Slot
+# refill changes device inputs and state, not the captured launch sequence.
+schema_version = 1
+
+[replay]
+backend = "redline"
+transport = "pm4"
+
+[diagnostic.replay]
+independent_batch = true
+manual_capture = false
+pm4_queues = "1"
+pm4_register_policy = "static"
+pm4_wait_policy = "resource"
+pm4_acquire_policy = "required-only"
+pm4_gcr_trim = true
+pm4_dynamic_grid = false
+
+[speculation]
+mode = "off"
+dflash = "off"
+mtp = "off"
+ngram = "off"
+
+[memory]
+kv_cache = "q8"
+
+[generation]
+loop_guard_threshold = 0
+
+[developer]
+# The adaptive bt4 family regresses this exact A3B batch shape at B64.
+# Retaining bt1 removes that cliff and is a no-op below B64.
+gate_up_bt = false
