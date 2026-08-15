@@ -23041,7 +23041,10 @@ fn generate_multi(
         Vec::new()
     };
     let grammar_active = !tool_schemas_qwen.is_empty();
-    let mut grammar_matcher = hipfire_arch_qwen35::grammar::Matcher::new(tool_schemas_qwen);
+    let mut grammar_matcher = hipfire_arch_qwen35::grammar::Matcher::with_config(
+        tool_schemas_qwen,
+        hipfire_arch_qwen35::grammar_config::resolve_qwen35_grammar_config(),
+    );
     let grammar_vocab: Vec<String> = if grammar_active {
         let n = tokenizer.vocab_size();
         (0..n).map(|id| tokenizer.decode(&[id as u32])).collect()
@@ -26282,7 +26285,10 @@ fn generate(
             Vec::new()
         };
         let grammar_active = !tool_schemas_qwen.is_empty();
-        let mut grammar_matcher = hipfire_arch_qwen35::grammar::Matcher::new(tool_schemas_qwen);
+        let mut grammar_matcher = hipfire_arch_qwen35::grammar::Matcher::with_config(
+            tool_schemas_qwen,
+            hipfire_arch_qwen35::grammar_config::resolve_qwen35_grammar_config(),
+        );
         // One-time vocab decode for token mask construction. Reuses the
         // model-level cache so subsequent requests on the same model skip
         // the ~150k-entry decode.

@@ -79,6 +79,15 @@ pub mod speculative;
 /// implementation lives in `saddle_core::grammar::json`.
 pub use saddle_core::grammar::json as grammar;
 
+/// qwen35 grammar `Config` resolver that restores the `HIPFIRE_QWEN35_*` env
+/// overrides lost in the B1 unification. Reads the two tunables via
+/// `hipfire_config::developer_var` with the same parse/bounds as the
+/// pre-merge `grammar.rs:128-153` and falls back to `Config::default()`.
+/// Exposed here so the daemon example (outside this crate) can use the same
+/// single source of truth.
+pub mod grammar_config;
+pub use grammar_config::{resolve_grammar_config, resolve_qwen35_grammar_config};
+
 /// Per-token spec-decode emission (`SpecEmit`). Pure CPU; named here because it
 /// drives the qwen35 `grammar` matcher. Built via [`spec_emit::Qwen35Emit::from_ctx`].
 pub mod spec_emit;
