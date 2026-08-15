@@ -1,6 +1,7 @@
 # ksml — design grounding
 
 Status: **draft, planning only. No code changes authorized by this document.**
+Name: `ksml` is a PLACEHOLDER pending § 9.1.
 Date: 2026-08-15
 Branch: `arch/ksml` (based on `8510ca5f2`)
 
@@ -254,16 +255,49 @@ find src/models -name '*.cpp' | xargs wc -l | tail -1
 
 ## 9 · Open questions
 
-1. **Does `ksml` ship as a separate repository or a workspace boundary inside
-   hipfire?** Separate repo makes the "substrate others build on" story real
-   and forces the API to be honest; it also doubles release overhead for a
-   single maintainer.
-2. **Where does the trainer live?** Referenced as a goal; not yet measured in
-   this document.
-3. **XDNA feasibility.** No AIE work has been done. The heterogeneous
-   NPU-draft/GPU-target idea in § 3.1 is unvalidated.
-4. **Quantizer competitive claim.** Trained-FWHT + MQ/MFP beating unsloth at
-   lower bpw is `[INFERENCE]`. Settled cheaply by KLD + perplexity at matched
-   bpw against `UD-Q4_K_XL` on one model and one committed fixture.
-5. **Does `arch/release-and-layering` get retired?** It is 0 ahead / 261
-   behind and was never pushed.
+Resolved in the 2026-08-15 ideation pass are marked **[resolved]**; the
+reasoning is kept because it constrains later decisions.
+
+1. **Naming.** `ggml` = Georgi Gerganov + ML; `GGUF` = Georgi Gerganov
+   Universal Format. Personal initials, not an industry standard, and the
+   exception rather than the pattern — MLX, candle, burn, tinygrad, JAX and
+   PyTorch are all descriptive. The objection to `ksml` is not modesty but
+   adoption mechanics: personal initials signal "one person's project" exactly
+   when the name needs to signal "substrate others build on," and no hardware
+   vendor standardizes on an individual's initials. `wmml` (warpfront) is
+   org-branded and travels further, but resolves to the same person unless
+   warpfront becomes a distinct org identity. A descriptive name in the
+   established house style — hipfire, redline, radiowave, Magnum Quant,
+   DFlash — is the recommendation; attribution belongs in `NOTICE`,
+   `CREDITS.md`, and `CITATION.cff`, which already carry it. **Open: the name
+   itself.** This document uses `ksml` as a placeholder only.
+2. **Separate repository, or workspace boundary?** **[resolved — workspace
+   boundary first.]** The experiment has already been run: `warpfront/redline`
+   exists as a public repository *and* `crates/redline`, `crates/redline-dispatch`
+   and `crates/redline-rocr` are in-tree. The split produced two homes rather
+   than a boundary. A workspace boundary delivers most of the API discipline
+   at a fraction of the release overhead for a single maintainer. Split only
+   when a consumer outside hipfire actually depends on the crate.
+3. **Where does the trainer live?** **[resolved — `origin/feat/mtp-dflash-training`.]**
+   21 ahead / **1,832 behind** `master`, last commit `8ec8ff756` 2026-06-26
+   (*"re-impl KL-topk loss backward, add target-init loader, fix smoke"*),
+   +6,747 lines across 41 files. This is Path C — the target-aligned custom
+   DFlash draft that AGENTS.md § 8 lists as the roadmap fix for the prose and
+   DDTree regressions. It is on the same decay trajectory that left PR #527
+   817 commits behind, and should be triaged before it becomes unrecoverable.
+4. **Quantizer competitive claim.** **[deferred to stage 2, after the
+   refactor.]** Trained-FWHT + MQ/MFP beating unsloth at lower bpw remains
+   `[INFERENCE]`. When taken up, it is settled cheaply by KLD + perplexity at
+   matched bpw against `UD-Q4_K_XL` on one model and one committed fixture.
+5. **`arch/release-and-layering`.** **[resolved — retired.]** 0 ahead / 261
+   behind, never pushed. `arch/ksml` is the refactor branch.
+6. **XDNA feasibility.** No AIE work has been done. The heterogeneous
+   NPU-draft / GPU-target idea in § 3.1 is unvalidated `[INFERENCE]`.
+7. **Where do the parent oracles land?** `hipfire-quantize` is the thematic
+   home — it already owns Lloyd (640 references), FWHT (440), Hessian (217),
+   GPTQ (382), AWQ (304), E8, and the MQ/MFP formats. But it is itself a
+   monolith: 24,863 lines of which `main.rs` is **15,522 (62%)**. Moving
+   20,782 lines of `parent/` into it trades one problem for another. The
+   proposal is a `*-quant` **family** — quantizer, calibration, and per-arch
+   parent oracles as siblings — with that `main.rs` decomposed in the same
+   pass.
