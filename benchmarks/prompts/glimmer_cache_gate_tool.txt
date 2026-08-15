@@ -1,0 +1,1 @@
+You must call weather.get_forecast exactly once. Use location Paris; options units celsius and days [1,2]; include_alerts true; fallback null. Do not answer directly.

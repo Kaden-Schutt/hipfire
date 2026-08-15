@@ -29,11 +29,12 @@
 //! gating `engine::qwen35_vl` had pre-Phase-2.
 
 #[cfg(feature = "deltanet")]
-pub mod qwen35_vl;
+pub mod arch;
 #[cfg(feature = "deltanet")]
 pub mod image;
+pub mod mrope;
 #[cfg(feature = "deltanet")]
-pub mod arch;
+pub mod qwen35_vl;
 
 #[cfg(feature = "deltanet")]
 pub use arch::Qwen35Vl;

@@ -102,7 +102,7 @@ invocations; nothing in this directory needs to know their paths.
 
 1. **One-time** — generate the slice via `make_slice.sh`, dump BF16
    references on gfx1151 (via `build_kld_ref.rs`), upload to
-   `hipfire-models/hipfire-eval-refs`, fill `manifest.json` with
+   `hipfire-models/eval-refs`, fill `manifest.json` with
    sha256 + `hf_repo` + producer metadata.
 
 2. **Per quant variant** — run `eval_hipfire` (hipfire candidates)

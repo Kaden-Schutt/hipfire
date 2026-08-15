@@ -761,6 +761,16 @@ impl Engine {
             }
 
             if let Err(cb_err) = event(&value) {
+                // A daemon `error` event is already terminal: the daemon has
+                // finished this request and returned to its command loop, so it
+                // will never answer an abort and the drain below would block
+                // forever. That is exactly what a pre-`gen_start` error does —
+                // StreamContractGate rejects it as a PreStartEvent, the callback
+                // fails, and the request hangs instead of surfacing the reason.
+                // Report the daemon's error, which is the useful one anyway.
+                if ty == Some("error") {
+                    return Err(daemon_error_from_value(&value));
+                }
                 return self.abort_and_drain_with_rx(request_id, attempt_id, rx, cb_err);
             }
 

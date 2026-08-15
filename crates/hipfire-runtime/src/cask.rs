@@ -91,6 +91,9 @@ impl CaskCtx {
         kv: &mut KvCache,
         current_physical: usize,
     ) -> HipResult<Option<EvictionResult>> {
+        if !self.base.is_active() {
+            return Ok(None);
+        }
         if current_physical < self.base.budget + self.base.beta {
             return Ok(None);
         }

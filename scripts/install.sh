@@ -181,6 +181,8 @@ Options:
   --tag TAG                  Install from tag TAG
   --commit SHA               Install from commit SHA
   --rocm-root PATH           ROCm installation root (forwarded to setup)
+  --hipcc PATH               ROCm device compiler (hipcc) when in different prefix (forwarded to setup)
+  --strict-rocm              Disable cross-root compiler fallback (forwarded to setup)
   --gpu-arch ARCH            GPU architecture (forwarded to setup)
   --profile auto|hip|redline Replay profile (forwarded to setup)
   --yes, -y, --non-interactive
@@ -250,9 +252,12 @@ while [ "$#" -gt 0 ]; do
             esac
             shift 2
             ;;
-        --rocm-root|--gpu-arch)
+        --rocm-root|--gpu-arch|--hipcc)
             [ "$#" -ge 2 ] || { echo "ERROR: $1 requires a value" >&2; exit 1; }
             shift 2
+            ;;
+        --strict-rocm)
+            shift
             ;;
         --yes|-y|--non-interactive)
             YES=1
@@ -268,7 +273,6 @@ while [ "$#" -gt 0 ]; do
             ;;
     esac
 done
-
 if [ "$SELECTOR_COUNT" -gt 1 ]; then
     echo "ERROR: choose only one of --branch, --ref, --tag, or --commit" >&2
     exit 2
