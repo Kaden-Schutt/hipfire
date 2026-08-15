@@ -51,9 +51,7 @@ def metric_stats(rows: list[dict], key: str) -> dict:
 def extract_choice(text: str) -> str | None:
     patterns = (
         r"the\s+correct\s+answer\s+is\s*\(?\s*([ABCD])(?![A-Za-z])\s*\)?",
-        r"(?:答案|选项)\s*(?:是|为|：|:)\s*\(?\s*([ABCD])(?![A-Za-z])\s*\)?",
-        r"\(([ABCD])\)",
-        r"\b([ABCD])\b",
+        r"(?:答案|选项)\s*(?:是|为)\s*(?:：|:)?\s*\(?\s*([ABCD])(?![A-Za-z])\s*\)?",
     )
     for pattern in patterns:
         matches = re.findall(pattern, text, flags=re.IGNORECASE)
