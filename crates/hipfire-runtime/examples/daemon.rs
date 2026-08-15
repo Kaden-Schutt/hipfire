@@ -1172,42 +1172,31 @@ fn batch_rng_for_key(key: &AttemptKey) -> u64 {
 /// Eligibility for continuous batching. Conservative: only single-GPU
 /// exact HIP Qwen 5/6 and dense LFM 11 stateless text without excluded features.
 fn is_batch_eligible(
-    arch_id: usize,
-    pp: usize,
-    ep_is_some: bool,
-    has_image: bool,
-    has_tools: bool,
-    has_stop: bool,
-    has_speculator: bool,
-    has_adaptive: bool,
-    has_pflash: bool,
-    has_messages_history: bool,
-    think_mode_is_nonthink: bool,
-    serve_continuous_batch: bool,
-    continuous_batch_size: usize,
+    caps: &saddle_core::caps::ArchCaps,
+    req: &saddle_core::caps::BatchEligibilityRequest,
 ) -> bool {
-    if !serve_continuous_batch {
+    if !req.serve_continuous_batch {
         return false;
     }
-    if continuous_batch_size <= 1 {
+    if req.continuous_batch_size <= 1 {
         return false;
     }
-    if arch_id != 5 && arch_id != 6 && arch_id != 11 {
+    if !caps.supports_continuous_batch {
         return false;
     }
-    if pp != 1 || ep_is_some {
+    if req.pp != 1 || req.ep_is_some {
         return false;
     }
-    if has_image || has_tools || has_stop {
+    if req.has_image || req.has_tools || req.has_stop {
         return false;
     }
-    if has_speculator || has_adaptive || has_pflash {
+    if req.has_speculator || req.has_adaptive || req.has_pflash {
         return false;
     }
-    if has_messages_history {
+    if req.has_messages_history {
         return false;
     }
-    if !think_mode_is_nonthink {
+    if !req.think_mode_is_nonthink {
         return false;
     }
     true
@@ -1307,19 +1296,10 @@ fn parse_serve_continuous_batch(msg: &serde_json::Value) -> bool {
 /// arm uses. Preserves `.hfq` recommendations and request aliases; never
 /// invents fake defaults (`0.3/0.8/max=4`) or drops min-p/penalties.
 fn resolve_batch_sampling(msg: &serde_json::Value, m: &LoadedModel) -> BatchSampling {
-    let (arch_default_temp, arch_default_top_p) = if m.arch_id == 11 {
-        (0.1_f64, 0.80_f64)
-    } else if m.arch_id == 9 {
-        (0.0_f64, 1.0_f64)
-    } else if m.arch_id == 10 {
-        (1.0_f64, 1.0_f64)
-    } else if m.arch_id == 12 {
-        (1.0_f64, 0.95_f64)
-    } else if m.arch_id == 13 {
-        (1.0_f64, 0.95_f64)
-    } else {
-        (0.3_f64, 0.8_f64)
-    };
+    let defaults = hipfire_loader::carrier_for(m.arch_id)
+        .map(|c| c.sampling_defaults())
+        .unwrap_or_default();
+    let (arch_default_temp, arch_default_top_p) = (defaults.temp, defaults.top_p);
     let default_temp = m
         .rec_temperature
         .map(|x| x as f64)
@@ -1333,7 +1313,7 @@ fn resolve_batch_sampling(msg: &serde_json::Value, m: &LoadedModel) -> BatchSamp
         .get("top_p")
         .and_then(|v| v.as_f64())
         .unwrap_or(default_top_p) as f32;
-    let default_repeat = if m.arch_id == 11 { 1.05_f64 } else { 1.0_f64 };
+    let default_repeat = defaults.repeat_penalty;
     let repeat_penalty = msg
         .get("repeat_penalty")
         .or_else(|| msg.get("repetition_penalty"))
@@ -1494,6 +1474,9 @@ fn is_batch_request_eligible(
     // messages: absent OR exactly one user turn (HTTP chat shape).
     let has_spec = m.speculator.is_some();
     let has_adaptive = m.kv_adaptive.is_some();
+    let caps = hipfire_loader::carrier_for(m.arch_id)
+        .map(|c| c.caps())
+        .unwrap_or_default();
     // For route check we need temp etc to compute GenerationRoute; use resolved sampling temp
     let sampling = resolve_batch_sampling(msg, m);
     let user_explicit = [
@@ -1535,41 +1518,39 @@ fn is_batch_request_eligible(
         kv_adaptive: has_adaptive,
     };
     let route = select_generation_route(&route_inputs);
-    match m.arch_id {
-        5 | 6 => {
-            if route != GenerationRoute::QwenAr {
-                return false;
-            }
-            if m.qwen35_decode_batch.is_none() {
-                return false;
-            }
-            if let Some(ModelState::Qwen35(bundle)) = m.state.as_ref() {
-                if !qwen_batch_weight_formats_supported(&bundle.weights) {
-                    return false;
-                }
-            } else {
-                return false;
-            }
+    if caps.has_deltanet {
+        if route != GenerationRoute::QwenAr {
+            return false;
         }
-        11 => {
-            if route != GenerationRoute::LfmAr {
-                return false;
-            }
-            if m.lfm2_decode_batch.is_none() {
-                return false;
-            }
-            if let Some(ModelState::Lfm2Moe(bundle)) = m.state.as_ref() {
-                if !bundle.config.is_dense() {
-                    return false;
-                }
-                if lfm2moe::batch_weight_formats_supported(&bundle.weights).is_err() {
-                    return false;
-                }
-            } else {
-                return false;
-            }
+        if m.qwen35_decode_batch.is_none() {
+            return false;
         }
-        _ => return false,
+        if let Some(ModelState::Qwen35(bundle)) = m.state.as_ref() {
+            if !qwen_batch_weight_formats_supported(&bundle.weights) {
+                return false;
+            }
+        } else {
+            return false;
+        }
+    } else if caps.supports_continuous_batch {
+        if route != GenerationRoute::LfmAr {
+            return false;
+        }
+        if m.lfm2_decode_batch.is_none() {
+            return false;
+        }
+        if let Some(ModelState::Lfm2Moe(bundle)) = m.state.as_ref() {
+            if !bundle.config.is_dense() {
+                return false;
+            }
+            if lfm2moe::batch_weight_formats_supported(&bundle.weights).is_err() {
+                return false;
+            }
+        } else {
+            return false;
+        }
+    } else {
+        return false;
     }
     // No multi-turn/history/tools/images/custom stops etc.
     if !batch_messages_are_single_user(msg) || has_tools || has_image || has_stop {
@@ -1581,7 +1562,7 @@ fn is_batch_request_eligible(
     if m.pp != 1 || m.ep.is_some() {
         return false;
     }
-    if !(m.arch_id == 5 || m.arch_id == 6 || m.arch_id == 11) {
+    if !caps.supports_continuous_batch {
         return false;
     }
     if !serve_continuous_batch || continuous_batch_size <= 1 {
@@ -3915,6 +3896,9 @@ fn is_qwen_ep_batch_request_eligible(
     serve_continuous_batch: bool,
     pflash_active: bool,
 ) -> bool {
+    let caps = hipfire_loader::carrier_for(m.arch_id)
+        .map(|c| c.caps())
+        .unwrap_or_default();
     if !serve_continuous_batch || continuous_batch_size <= 1 {
         return false;
     }
@@ -3935,7 +3919,7 @@ fn is_qwen_ep_batch_request_eligible(
     if batch.is_none() {
         return false;
     }
-    if !(m.arch_id == 5 || m.arch_id == 6) {
+    if !caps.supports_ep_batch {
         return false;
     }
     if m.qwen35_decode_batch.is_some() || m.lfm2_decode_batch.is_some() {
@@ -5474,93 +5458,80 @@ mod continuous_batch_tests {
         }
     }
 
+    fn caps_for(arch_id: u32) -> saddle_core::caps::ArchCaps {
+        hipfire_loader::carrier_for(arch_id)
+            .map(|c| c.caps())
+            .unwrap_or_default()
+    }
+    fn elig(
+        arch_id: u32,
+        pp: usize,
+        ep_is_some: bool,
+        has_image: bool,
+        has_tools: bool,
+        has_stop: bool,
+        has_speculator: bool,
+        has_adaptive: bool,
+        has_pflash: bool,
+        has_messages_history: bool,
+        think_mode_is_nonthink: bool,
+        serve_continuous_batch: bool,
+        continuous_batch_size: usize,
+    ) -> bool {
+        let caps = caps_for(arch_id);
+        let req = saddle_core::caps::BatchEligibilityRequest {
+            pp,
+            ep_is_some,
+            has_image,
+            has_tools,
+            has_stop,
+            has_speculator,
+            has_adaptive,
+            has_pflash,
+            has_messages_history,
+            think_mode_is_nonthink,
+            serve_continuous_batch,
+            continuous_batch_size,
+        };
+        is_batch_eligible(&caps, &req)
+    }
     #[test]
     fn batch_eligible_only_qwen_text_single_gpu() {
         let _l = begin();
-        assert!(is_batch_eligible(
-            5, 1, false, false, false, false, false, false, false, false, true, true, 4
-        ));
-        assert!(is_batch_eligible(
-            6, 1, false, false, false, false, false, false, false, false, true, true, 2
-        ));
-        assert!(!is_batch_eligible(
-            5, 1, false, false, false, false, false, false, false, false, true, false, 4
-        ));
-        assert!(!is_batch_eligible(
-            5, 1, false, false, false, false, false, false, false, false, true, true, 1
-        ));
-        assert!(!is_batch_eligible(
-            9, 1, false, false, false, false, false, false, false, false, true, true, 4
-        ));
-        assert!(!is_batch_eligible(
-            5, 2, false, false, false, false, false, false, false, false, true, true, 4
-        ));
-        assert!(!is_batch_eligible(
-            5, 1, true, false, false, false, false, false, false, false, true, true, 4
-        ));
-        assert!(!is_batch_eligible(
-            5, 1, false, true, false, false, false, false, false, false, true, true, 4
-        ));
-        assert!(!is_batch_eligible(
-            5, 1, false, false, true, false, false, false, false, false, true, true, 4
-        ));
-        assert!(!is_batch_eligible(
-            5, 1, false, false, false, true, false, false, false, false, true, true, 4
-        ));
-        assert!(!is_batch_eligible(
-            5, 1, false, false, false, false, true, false, false, false, true, true, 4
-        ));
-        assert!(!is_batch_eligible(
-            5, 1, false, false, false, false, false, true, false, false, true, true, 4
-        ));
-        assert!(!is_batch_eligible(
-            5, 1, false, false, false, false, false, false, true, false, true, true, 4
-        ));
-        assert!(!is_batch_eligible(
-            5, 1, false, false, false, false, false, false, false, true, true, true, 4
-        ));
+        assert!(elig(5, 1, false, false, false, false, false, false, false, false, true, true, 4));
+        assert!(elig(6, 1, false, false, false, false, false, false, false, false, true, true, 2));
+        assert!(!elig(5, 1, false, false, false, false, false, false, false, false, true, false, 4));
+        assert!(!elig(5, 1, false, false, false, false, false, false, false, false, true, true, 1));
+        assert!(!elig(9, 1, false, false, false, false, false, false, false, false, true, true, 4));
+        assert!(!elig(5, 2, false, false, false, false, false, false, false, false, true, true, 4));
+        assert!(!elig(5, 1, true, false, false, false, false, false, false, false, true, true, 4));
+        assert!(!elig(5, 1, false, true, false, false, false, false, false, false, true, true, 4));
+        assert!(!elig(5, 1, false, false, true, false, false, false, false, false, true, true, 4));
+        assert!(!elig(5, 1, false, false, false, true, false, false, false, false, true, true, 4));
+        assert!(!elig(5, 1, false, false, false, false, true, false, false, false, true, true, 4));
+        assert!(!elig(5, 1, false, false, false, false, false, true, false, false, true, true, 4));
+        assert!(!elig(5, 1, false, false, false, false, false, false, true, false, true, true, 4));
+        assert!(!elig(5, 1, false, false, false, false, false, false, false, true, true, true, 4));
     }
 
     #[test]
     fn batch_eligible_allows_dense_lfm11_and_preserves_qwen() {
         let _l = begin();
         // LFM dense (arch 11) follows same pure exclusions as Qwen; MoE status is not checked here.
-        assert!(is_batch_eligible(
-            11, 1, false, false, false, false, false, false, false, false, true, true, 4
-        ));
-        assert!(is_batch_eligible(
-            11, 1, false, false, false, false, false, false, false, false, true, true, 2
-        ));
+        assert!(elig(11, 1, false, false, false, false, false, false, false, false, true, true, 4));
+        assert!(elig(11, 1, false, false, false, false, false, false, false, false, true, true, 2));
         // Same pure exclusions as Qwen: B=1, pp!=1, ep, images, tools, stops, spec, adaptive, pflash, history, think.
-        assert!(!is_batch_eligible(
-            11, 1, false, false, false, false, false, false, false, false, true, false, 4
-        ));
-        assert!(!is_batch_eligible(
-            11, 1, false, false, false, false, false, false, false, false, true, true, 1
-        ));
-        assert!(!is_batch_eligible(
-            11, 2, false, false, false, false, false, false, false, false, true, true, 4
-        ));
-        assert!(!is_batch_eligible(
-            11, 1, true, false, false, false, false, false, false, false, true, true, 4
-        ));
-        assert!(!is_batch_eligible(
-            11, 1, false, true, false, false, false, false, false, false, true, true, 4
-        ));
+        assert!(!elig(11, 1, false, false, false, false, false, false, false, false, true, false, 4));
+        assert!(!elig(11, 1, false, false, false, false, false, false, false, false, true, true, 1));
+        assert!(!elig(11, 2, false, false, false, false, false, false, false, false, true, true, 4));
+        assert!(!elig(11, 1, true, false, false, false, false, false, false, false, true, true, 4));
+        assert!(!elig(11, 1, false, true, false, false, false, false, false, false, true, true, 4));
         // Unknown arch beside 5/6/11 stays ineligible.
-        assert!(!is_batch_eligible(
-            12, 1, false, false, false, false, false, false, false, false, true, true, 4
-        ));
-        assert!(!is_batch_eligible(
-            9, 1, false, false, false, false, false, false, false, false, true, true, 4
-        ));
+        assert!(!elig(12, 1, false, false, false, false, false, false, false, false, true, true, 4));
+        assert!(!elig(9, 1, false, false, false, false, false, false, false, false, true, true, 4));
         // Qwen still eligible (preserve existing behavior).
-        assert!(is_batch_eligible(
-            5, 1, false, false, false, false, false, false, false, false, true, true, 4
-        ));
-        assert!(is_batch_eligible(
-            6, 1, false, false, false, false, false, false, false, false, true, true, 4
-        ));
+        assert!(elig(5, 1, false, false, false, false, false, false, false, false, true, true, 4));
+        assert!(elig(6, 1, false, false, false, false, false, false, false, false, true, true, 4));
     }
 
     #[test]
@@ -10596,13 +10567,9 @@ fn emit_ds4_ep_gen_start(stdout: &mut impl std::io::Write, id: &str, think_mode:
 const GLIMMER_SEMANTIC_CONTRACT_VERSION: u32 = 2;
 
 fn gen_start_contract_version_for_arch(arch_id: u32) -> Option<u32> {
-    if arch_id == 5 || arch_id == 6 {
-        Some(QWEN_AR_SEMANTIC_CONTRACT_VERSION)
-    } else if arch_id == 14 {
-        Some(GLIMMER_SEMANTIC_CONTRACT_VERSION)
-    } else {
-        None
-    }
+    hipfire_loader::carrier_for(arch_id)
+        .map(|c| c.caps().semantic_contract_version)
+        .unwrap_or(None)
 }
 
 /// Pure terminal decision shared by DS4 AR, EP, and speculative DSML paths.
@@ -10698,12 +10665,6 @@ fn ds4_absorb_stream_event(
         }
     }
 }
-
-/// Pure AR/EP terminal decision after the full turn has been absorbed.
-///
-/// A later malformed/unclosed block discards every earlier buffered call.
-/// Length is never tool-safe. Complete calls release only on a non-length
-/// tool-safe terminal.
 fn ds4_ar_ep_finish_route(
     malformed: Option<String>,
     tool_calls_buf: Vec<hipfire_runtime::prompt_frame::ToolCall>,
@@ -14615,43 +14576,10 @@ fn main() {
                 // curated registry `recommended_settings` reach this handler as
                 // explicit request fields (CLI explicit-send guard), so they sit
                 // above the .hfq layer on that path.
-                let (arch_default_temp, arch_default_top_p) = if m.arch_id == 11 {
-                    // LFM2.5 (11): Liquid's model card recommends temperature=0.1,
-                    // top_k=50, repetition_penalty=1.05. The daemon sampler is
-                    // temp + top_p + repeat_penalty (no user-facing top_k — the
-                    // sample_top_p kernel's top-K is a fixed candidate gather), so
-                    // we apply temp=0.1 + rep=1.05 (set below) and keep a tight
-                    // top_p=0.80; at temp 0.1 the top_k-vs-top_p choice is near
-                    // moot (the distribution is already peaked).
-                    (0.1_f64, 0.80_f64)
-                } else if m.arch_id == 9 {
-                    // DeepSeek V4 Flash (9): MTP spec-decode is greedy-only and,
-                    // since the k=2 + K+1 shared-accept-core work, ~3× faster than
-                    // AR (measured 81.7% accept / 24 vs 7.8 tok/s on the
-                    // deepseek4-mtp code bench). Default to temp=0 so an omitted
-                    // `temperature` gets that spec speedup; explicit temp>0 is
-                    // still honored and routes to the AR sampler (spec is
-                    // greedy-only). Was 1.0 to dodge block-level attractors at low
-                    // temp — coherence-gate-deepseek4-mtp re-validates greedy.
-                    (0.0_f64, 1.0_f64)
-                } else if m.arch_id == 10 {
-                    // MiniMax-M2 (10): quantized instruct model that falls into
-                    // block-level attractors at lower temperatures — keep the
-                    // card-recommended temp=1.0/top_p=1.0.
-                    (1.0_f64, 1.0_f64)
-                } else if m.arch_id == 12 {
-                    // Cohere2-MoE / North-Mini-Code: Cohere-style agentic
-                    // markers are sampled best with the model-card nucleus
-                    // defaults.
-                    (1.0_f64, 0.95_f64)
-                } else if m.arch_id == 13 {
-                    // Gemma4: Gemma family model cards recommend
-                    // temperature=1.0, top_p=0.95, top_k=64. The daemon
-                    // sampler is temp + top_p (top-K is fixed candidate gather).
-                    (1.0_f64, 0.95_f64)
-                } else {
-                    (0.3_f64, 0.8_f64)
-                };
+                let defaults = hipfire_loader::carrier_for(m.arch_id)
+                    .map(|c| c.sampling_defaults())
+                    .unwrap_or_default();
+                let (arch_default_temp, arch_default_top_p) = (defaults.temp, defaults.top_p);
                 // Layer the .hfq-baked author recommendation OVER the arch
                 // ladder. Per-knob: a model that bakes only `temperature` still
                 // gets the arch-ladder `top_p`.
@@ -14694,7 +14622,7 @@ fn main() {
                 // Clients can still opt in to a non-1.0 value per request.
                 // LFM2.5-MoE (arch_id 11): Liquid's card recommends
                 // repetition_penalty=1.05; default to it (others stay 1.0/off).
-                let default_repeat_penalty = if m.arch_id == 11 { 1.05_f64 } else { 1.0_f64 };
+                let default_repeat_penalty = defaults.repeat_penalty;
                 // Accept HF-style `repetition_penalty` as a request ALIAS for our
                 // `repeat_penalty` field, used only when the canonical key is
                 // absent. (OpenAI/HF clients send `repetition_penalty`.)
@@ -19681,7 +19609,9 @@ fn generate_dflash(
     // finish_reason, and cache store. Length without decoded EOT never
     // releases calls or stores cache. Other arches keep whole-output extract.
     let tokenizer = m.tokenizer.as_ref().unwrap();
-    let qwen_semantic_v2 = m.arch_id == 5 || m.arch_id == 6;
+    let qwen_semantic_v2 = hipfire_loader::carrier_for(m.arch_id)
+        .map(|c| c.caps().has_deltanet)
+        .unwrap_or(false);
 
     // Trim the trailing `<|im_end|>` + newline trailer from streamed_tokens so
     // the cached body slots cleanly between the assistant_prefix and the
@@ -23856,10 +23786,13 @@ fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
     }
 
     // 4. Qwen native MTP (before DFlash).
+    let caps = hipfire_loader::carrier_for(i.arch_id)
+        .map(|c| c.caps())
+        .unwrap_or_default();
     if i.qwen_mtp_opt_in
         && i.qwen_mtp_head
         && (i.temp <= 1e-6 || i.mtp_sampled_on)
-        && (i.arch_id == 5 || i.arch_id == 6)
+        && caps.supports_mtp
     {
         return GenerationRoute::QwenMtp;
     }
@@ -23874,16 +23807,16 @@ fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
         && i.fast_sample_on
         && !dflash_min_p_present
         && !i.temp_spec_env_off;
-    let qwen_dflash_route = (i.arch_id == 5 || i.arch_id == 6)
+    let qwen_dflash_route = caps.is_qwen_dflash()
         && (i.temp <= 1e-6 || ddtree_swor_route || chain_sample_route);
-    let llama_dflash_route = (i.arch_id == 0 || i.arch_id == 1)
+    let llama_dflash_route = caps.is_llama_dflash()
         && (i.temp <= 1e-6 || ddtree_swor_route || chain_sample_route);
     if i.has_speculator
         && !i.force_ar_chat
         && (qwen_dflash_route || llama_dflash_route)
-        && !(i.kv_adaptive && (i.arch_id == 5 || i.arch_id == 6))
+        && !(i.kv_adaptive && caps.spec_excludes_adaptive)
     {
-        return if i.arch_id == 0 || i.arch_id == 1 {
+        return if caps.is_llama_dflash() {
             GenerationRoute::LlamaSpec
         } else {
             GenerationRoute::QwenDflash
@@ -23891,10 +23824,12 @@ fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
     }
 
     // 6. Default AR / unknown.
-    match i.arch_id {
-        5 | 6 => GenerationRoute::QwenAr,
-        0 | 1 => GenerationRoute::LlamaAr,
-        _ => GenerationRoute::Unknown,
+    if caps.is_qwen_dflash() {
+        GenerationRoute::QwenAr
+    } else if caps.is_llama_dflash() {
+        GenerationRoute::LlamaAr
+    } else {
+        GenerationRoute::Unknown
     }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24874,7 +24809,9 @@ fn generate(
             // temp>0 DFlash-disabled visibility (warning text only; route is AR).
             if temp > 1e-6
                 && m.speculator.is_some()
-                && (m.arch_id == 5 || m.arch_id == 6 || m.arch_id == 0 || m.arch_id == 1)
+                && hipfire_loader::carrier_for(m.arch_id)
+                    .map(|c| c.caps().supports_dflash())
+                    .unwrap_or(false)
                 && !route_inputs.force_ar_chat
             {
                 let reason = if route_inputs.temp_spec_env_off {
@@ -25894,7 +25831,9 @@ fn generate(
     emit_gen_start(stdout, id, started_in_think, gen_contract);
     let t0 = Instant::now();
 
-    if m.arch_id == 5 || m.arch_id == 6 {
+    if hipfire_loader::carrier_for(m.arch_id)
+        .map(|c| c.caps().has_deltanet)
+        .unwrap_or(false) {
         // Qwen3.5 / Qwen3.5-MoE — multi-turn: prefill only the NEW turn tokens,
         // continuing from m.seq_pos (KV cache + DeltaNet state are cumulative)
         let ModelState::Qwen35(b) = m.state.as_mut().unwrap() else {

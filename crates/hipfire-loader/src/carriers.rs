@@ -130,6 +130,20 @@ impl Carrier for Qwen2Carrier {
         // llama-family Dir loader drops them).
         arch_id == 7
     }
+    fn caps(&self) -> saddle_core::caps::ArchCaps {
+        saddle_core::caps::ArchCaps {
+            supports_continuous_batch: false,
+            supports_ep_batch: false,
+            dflash: None,
+            supports_mtp: false,
+            spec_excludes_adaptive: false,
+            semantic_contract_version: None,
+            has_deltanet: false,
+        }
+    }
+    fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
+        saddle_core::sampling::SamplingDefaults::new(0.3, 0.8, 1.0)
+    }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
             return Err("qwen2: pipeline-parallel (pp>1) unsupported".into());
@@ -331,6 +345,20 @@ impl Carrier for Qwen35Carrier {
     fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
         // 5 = dense (+VL), 6 = MoE — same ids in both namespaces.
         matches!(arch_id, 5 | 6)
+    }
+    fn caps(&self) -> saddle_core::caps::ArchCaps {
+        saddle_core::caps::ArchCaps {
+            supports_continuous_batch: true,
+            supports_ep_batch: true,
+            dflash: Some(saddle_core::caps::DflashKind::Qwen),
+            supports_mtp: true,
+            spec_excludes_adaptive: true,
+            semantic_contract_version: Some(2),
+            has_deltanet: true,
+        }
+    }
+    fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
+        saddle_core::sampling::SamplingDefaults::new(0.3, 0.8, 1.0)
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.kv_backend == KvBackend::Vmm && ctx.pp > 1 {
@@ -571,6 +599,20 @@ impl Carrier for LlamaCarrier {
         // Explicit allowlist (was an open `< 5` range that would silently
         // swallow any future HFQ id in 2..=4 into the llama path).
         matches!(arch_id, 0 | 1)
+    }
+    fn caps(&self) -> saddle_core::caps::ArchCaps {
+        saddle_core::caps::ArchCaps {
+            supports_continuous_batch: false,
+            supports_ep_batch: false,
+            dflash: Some(saddle_core::caps::DflashKind::Llama),
+            supports_mtp: false,
+            spec_excludes_adaptive: false,
+            semantic_contract_version: None,
+            has_deltanet: false,
+        }
+    }
+    fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
+        saddle_core::sampling::SamplingDefaults::new(0.3, 0.8, 1.0)
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
@@ -871,6 +913,20 @@ impl Carrier for DotsOcrCarrier {
     fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
         arch_id == 8
     }
+    fn caps(&self) -> saddle_core::caps::ArchCaps {
+        saddle_core::caps::ArchCaps {
+            supports_continuous_batch: false,
+            supports_ep_batch: false,
+            dflash: None,
+            supports_mtp: false,
+            spec_excludes_adaptive: false,
+            semantic_contract_version: None,
+            has_deltanet: false,
+        }
+    }
+    fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
+        saddle_core::sampling::SamplingDefaults::new(0.3, 0.8, 1.0)
+    }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
             return Err(match &src {
@@ -986,6 +1042,20 @@ impl Carrier for Deepseek4Carrier {
     }
     fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
         arch_id == 9
+    }
+    fn caps(&self) -> saddle_core::caps::ArchCaps {
+        saddle_core::caps::ArchCaps {
+            supports_continuous_batch: false,
+            supports_ep_batch: false,
+            dflash: None,
+            supports_mtp: false,
+            spec_excludes_adaptive: false,
+            semantic_contract_version: None,
+            has_deltanet: false,
+        }
+    }
+    fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
+        saddle_core::sampling::SamplingDefaults::new(0.0, 1.0, 1.0)
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
@@ -1224,6 +1294,20 @@ impl Carrier for MinimaxCarrier {
     fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
         arch_id == 10
     }
+    fn caps(&self) -> saddle_core::caps::ArchCaps {
+        saddle_core::caps::ArchCaps {
+            supports_continuous_batch: false,
+            supports_ep_batch: false,
+            dflash: None,
+            supports_mtp: false,
+            spec_excludes_adaptive: false,
+            semantic_contract_version: None,
+            has_deltanet: false,
+        }
+    }
+    fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
+        saddle_core::sampling::SamplingDefaults::new(1.0, 1.0, 1.0)
+    }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
             // Preserve the two per-source error strings byte-for-byte.
@@ -1329,6 +1413,20 @@ impl Carrier for Lfm2MoeCarrier {
     fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
         arch_id == 11
     }
+    fn caps(&self) -> saddle_core::caps::ArchCaps {
+        saddle_core::caps::ArchCaps {
+            supports_continuous_batch: true,
+            supports_ep_batch: false,
+            dflash: None,
+            supports_mtp: false,
+            spec_excludes_adaptive: false,
+            semantic_contract_version: None,
+            has_deltanet: false,
+        }
+    }
+    fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
+        saddle_core::sampling::SamplingDefaults::new(0.1, 0.80, 1.05)
+    }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
             return Err(match &src {
@@ -1427,6 +1525,20 @@ impl Carrier for Cohere2MoeCarrier {
     fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
         // 12 = Cohere2-MoE in both the HFQ and safetensors-Dir namespaces.
         arch_id == 12
+    }
+    fn caps(&self) -> saddle_core::caps::ArchCaps {
+        saddle_core::caps::ArchCaps {
+            supports_continuous_batch: false,
+            supports_ep_batch: false,
+            dflash: None,
+            supports_mtp: false,
+            spec_excludes_adaptive: false,
+            semantic_contract_version: None,
+            has_deltanet: false,
+        }
+    }
+    fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
+        saddle_core::sampling::SamplingDefaults::new(1.0, 0.95, 1.0)
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
@@ -1546,6 +1658,20 @@ impl Carrier for Gemma4Carrier {
         // "no carrier" error and keeps the two namespaces aligned. Primary serve of 22 alone
         // would still need a target model, so it naturally fails later in generate routing.
         matches!(arch_id, 13 | 22)
+    }
+    fn caps(&self) -> saddle_core::caps::ArchCaps {
+        saddle_core::caps::ArchCaps {
+            supports_continuous_batch: false,
+            supports_ep_batch: false,
+            dflash: None,
+            supports_mtp: false,
+            spec_excludes_adaptive: false,
+            semantic_contract_version: None,
+            has_deltanet: false,
+        }
+    }
+    fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
+        saddle_core::sampling::SamplingDefaults::new(1.0, 0.95, 1.0)
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
@@ -1847,6 +1973,20 @@ impl Carrier for MuseGlimmerCarrier {
     }
     fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
         arch_id == 14
+    }
+    fn caps(&self) -> saddle_core::caps::ArchCaps {
+        saddle_core::caps::ArchCaps {
+            supports_continuous_batch: false,
+            supports_ep_batch: false,
+            dflash: None,
+            supports_mtp: false,
+            spec_excludes_adaptive: false,
+            semantic_contract_version: Some(2),
+            has_deltanet: false,
+        }
+    }
+    fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
+        saddle_core::sampling::SamplingDefaults::new(0.3, 0.8, 1.0)
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.kv_backend == KvBackend::Vmm && ctx.cask.sidecar.is_some() {
