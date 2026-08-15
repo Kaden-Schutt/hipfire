@@ -1914,7 +1914,7 @@ def spawn_serve(cfg, home, log):
     # process comm → the CLI's reapOrphans `pkill -x <name>` stays scoped to THIS
     # instance). HIPFIRE_DAEMON_NAME/ID pass through from os.environ untouched.
     env = dict(os.environ, HOME=home, HIP_VISIBLE_DEVICES=os.environ.get("HIP_VISIBLE_DEVICES","0"),
-               HIPFIRE_DAEMON_BIN=os.environ.get("HIPFIRE_DAEMON_BIN", os.path.join(REPO, "target/release/examples/daemon")),
+               HIPFIRE_DAEMON_BIN=os.environ.get("HIPFIRE_DAEMON_BIN", os.path.join(REPO, "target/release/daemon")),
                HIPFIRE_KV_MODE=cfg["kv"], HIPFIRE_CASK_OFF="1", HIPFIRE_MODEL=cfg["model"])
     if cfg["mtp"] == "on":
         env.update(HIPFIRE_QWEN_MTP="1", HIPFIRE_MTP_SAMPLED="1", HIPFIRE_MTP_PREFIX_CACHE="1")
@@ -2105,7 +2105,7 @@ def _tool_result_feedback(tool_call_id, content, feedback_shape=None, name=None)
 
 def _daemon_binary_md5():
     """Return (md5_hex, path) for the daemon binary per AGENTS.md discipline."""
-    cand = os.environ.get("HIPFIRE_DAEMON_BIN") or os.path.join(REPO, "target/release/examples/daemon")
+    cand = os.environ.get("HIPFIRE_DAEMON_BIN") or os.path.join(REPO, "target/release/daemon")
     # Fallback to HIPFIRE_CLI_BIN if daemon not found
     if not os.path.exists(cand):
         alt = os.environ.get("HIPFIRE_CLI_BIN") or os.path.join(REPO, "target/release/hipfire")

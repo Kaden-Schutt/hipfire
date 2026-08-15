@@ -17,11 +17,18 @@ crates/
 ├── hip-bridge/              # dlopen HIP FFI (libamdhip64)
 ├── hsa-bridge/              # thin public HSA queue/AQL helpers
 ├── rdna-compute/            # Gpu, kernel compile/cache, HIP launch families
+├── radiowave/               # signal/scheduling support for the compute layer
+├── saddle-core/             # the substrate: grammar, KV, caps, sampling policy
 ├── hipfire-runtime/         # arch-agnostic infra + Architecture trait; LLaMA forward still lives here
-├── hipfire-loader/          # Carrier registry, load_model, LoadedModel
+├── hipfire-loader/          # Carrier registry, load_model, LoadedModel, batch staging
+├── hipfire-engine/          # arch-free serve engine: scheduler, terminal, emit, prompt
+├── hipfire-generate/        # generation bodies: ar, qwen, dense, vision, batch, redline fixtures
+├── hipfire-daemon/          # the product binary — [[bin]] name = "daemon", no required-features
 ├── hipfire-dispatch/        # dtype/arch family tables + MoE/attn pipelines
 ├── hipfire-dispatch-tests/  # dispatch coverage tests
-├── hipfire-arch-*/          # per-family config/weights/state/forward
+├── hipfire-arch-*/          # per-family config/weights/state/forward (12)
+├── hipfire-ds4-parent/      # DeepSeek-V4 parent/teacher tooling (name provisional)
+├── hipfire-pflash/          # PFlash prefill compression — retained legacy research, default off
 ├── hipfire-quantize/        # CPU encoder (safetensors/GGUF → .mq* / .hfq*)
 ├── hipfire-detect/          # observational JSONL behavior detectors
 ├── hipfire-atlas/           # Kernel Atlas schema + emit helpers
@@ -31,6 +38,7 @@ crates/
 ├── hipfire-cli/             # native operator and HTTP service
 ├── hipfire-tui/             # terminal UI
 ├── hipfire-reap/            # utility crate
+├── saddle-lab/              # research examples and one-off harnesses
 ├── redline/                 # experimental direct-KMD / bare-libdrm research
 ├── redline-dispatch/        # retained-tape record/replay + plan selection
 └── redline-rocr/            # public ROCr/HSA ABI + PM4 packet builders
@@ -44,15 +52,40 @@ operator runtime.
 | Layer | Crates | Role |
 |---|---|---|
 | Operator | `hipfire-cli`, `hipfire-config`, `hipfire-registry`, `hipfire-client`, `hipfire-tui` | Tag resolve, typed config, pull, HTTP service/client, one-shot daemon spawn |
-| Composition root | `hipfire-loader`, `hipfire-runtime/examples/daemon.rs` | Single load dispatch; HTTP/JSONL serve; generate ladders |
+| Product binary | `hipfire-daemon` | `[[bin]] name = "daemon"`. Message dispatch and process lifetime only |
+| Generation | `hipfire-generate` | The generate bodies: `ar`, `qwen`, `dense`, `vision`, `batch`, plus the Redline fixtures |
+| Serve engine | `hipfire-engine` | Scheduler, terminal control, emit, prompt. **Zero arch dependencies** |
+| Composition root | `hipfire-loader` | Carrier registry, single `load_model` dispatch, `LoadedModel`, continuous-batch staging |
 | Arch forward | `hipfire-arch-*` | Config / weights / state / static-dispatch forward (LLaMA exception: canonical forward remains in runtime) |
-| Shared infra | `hipfire-runtime` | HFQ/safetensors, tokenizer, sampler, framing, KV policy, spec primitives, `Architecture` trait |
+| Shared infra | `hipfire-runtime` | HFQ/safetensors, tokenizer, sampler, framing, spec primitives, `Architecture` trait |
+| Substrate | `saddle-core` | Grammar, KV cache, `ArchCaps`, sampling policy. Depends only on `rdna-compute`, `hip-bridge`, `serde` |
 | Kernel select | `hipfire-dispatch`, `rdna-compute` | Family tables + `Gpu` methods that pick WMMA/dot/baseline |
 | Device FFI | `hip-bridge`, `hsa-bridge` | HIP runtime; optional HSA AQL helpers |
 | Encode | `hipfire-quantize` | No GPU deps; CI-safe quantizer |
 | Observability | `hipfire-detect`, `hipfire-atlas` | Detectors; bench corpus schema |
 | Retained replay | `redline-dispatch`, `redline-rocr`, `rdna-compute::replay` | Product-integrated Redline path (see below) |
-| Direct-KMD research | `redline` | Not the serving transport |
+| Direct-KMD research | `redline`, `saddle-lab`, `hipfire-pflash` | Not the serving transport |
+
+The dependency edge runs one way and is checked by `cargo tree`:
+
+```text
+saddle-core → hipfire-runtime → hipfire-loader → hipfire-engine
+                                      → hipfire-generate → hipfire-daemon
+```
+
+Two invariants hold today and are worth keeping:
+
+- **`saddle-core` never depends upward.** Its only dependencies are
+  `rdna-compute`, `hip-bridge` and `serde`; `cargo tree -p saddle-core -e normal`
+  matches nothing under `hipfire-{runtime,loader,engine,generate,daemon,arch-*}`.
+- **`hipfire-engine` declares no arch crate at all.** The daemon reaches an
+  architecture only through `hipfire-loader`'s `Carrier` and the
+  `hipfire-generate` entry points; `main.rs` names no `hipfire_arch_*` type,
+  in shipped code or tests.
+
+`hipfire-runtime` lists the arch crates under `[dev-dependencies]` for its own
+examples. That is not a cycle — dev-dependencies do not participate in the
+build graph of anything that depends on it.
 
 `hipfire-loader` depends on arch crates and is the **only** top-of-DAG
 `load_model` entry the daemon uses. Forward stays **statically dispatched** on
@@ -76,7 +109,7 @@ Native CLI (`crates/hipfire-cli`)
   else → spawn one-shot daemon binary
         │
         ▼
-Daemon (crates/hipfire-runtime/examples/daemon.rs)
+Daemon (crates/hipfire-daemon/src/main.rs)
   hipfire_loader::load_model(path, …, &mut Gpu)
         │
         ▼
@@ -230,7 +263,7 @@ Some arch crates also ship crate-local HIP (registered through their own
 
 ## Serve / generate path
 
-Composition root: `crates/hipfire-runtime/examples/daemon.rs`.
+Composition root: `crates/hipfire-daemon/src/main.rs`.
 
 After `load_model`, request handling builds sampling defaults
 (request → HFQ `generation_config` recommendations → arch ladder) and enters
