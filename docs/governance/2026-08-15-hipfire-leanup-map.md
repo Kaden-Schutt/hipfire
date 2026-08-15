@@ -159,6 +159,104 @@ deliberately non-generic — but the *ratio* is the honest target.
 
 ---
 
+## 5b · Execution plan — parallel waves
+
+The binding constraint on fan-out is **file ownership**, not logical
+dependency. Items are therefore grouped into waves in which every agent owns a
+disjoint file set, so N agents edit concurrently without stepping on one
+another.
+
+### Standing rules for every dispatched agent
+
+1. Work in an **isolated worktree**. Never the shared checkout.
+2. **Never** run `cargo fmt`, `cargo clippy`, or the full workspace test suite.
+   Build only the crates you touch. Mid-flight validation blocks siblings.
+3. Touch only the files listed as yours. If you need a file you do not own,
+   message the owner over IRC rather than editing it.
+4. Preserve SPDX headers and copyright lines verbatim on any moved file.
+   Use `git mv` so history follows.
+5. Do not reformat code you are only relocating.
+
+### Contracts fixed before any fan-out
+
+These are decided here so no agent has to negotiate them mid-flight.
+
+- **`saddle-core` may depend on `rdna-compute`, `hip-bridge`, `serde`, and
+  `std` — nothing else.** Never `hipfire-runtime`, never `hipfire-arch-*`,
+  never `hipfire-dispatch`. It sits *below* the runtime. Verified safe:
+  both `grammar.rs` files have zero external `use` statements, and `llama.rs`
+  imports only `crate`, `hip_bridge`, `rdna_compute`, `std`.
+- **`saddle-core/src/lib.rs` and `saddle-core/Cargo.toml` are owned by the
+  scaffold (wave 0) and by no agent.** Module files are pre-declared and
+  pre-stubbed so each agent fills exactly one.
+- Module layout: `grammar`, `kv`, `caps`, `sampling`. `spec` is added at
+  wave 4, not before.
+
+### Wave 0 — scaffold (serial, not delegated)
+
+Create `crates/saddle-core` with its full dependency set declared up front,
+`lib.rs` declaring all four modules, and an empty stub per module. Register it
+in the workspace `members`. This is what makes wave 1 conflict-free.
+
+### Wave 1 — eight agents, zero file overlap
+
+| agent | item | owns exclusively |
+|---|---|---|
+| `Glossary` | A3 | `docs/GLOSSARY.md` (new), `AGENTS.md` |
+| `ExampleTriage` | A1 | **read-only** — produces a classification report, deletes nothing |
+| `Positioning` | A4 | `README.md` |
+| `QuantSplit` | B4 | `crates/hipfire-quantize/**` |
+| `DeadTrait` | D1 | `crates/hipfire-runtime/src/loader_api.rs` |
+| `GrammarUnify` | B1 | `saddle-core/src/grammar.rs`, both arch `grammar.rs`, both arch `Cargo.toml` |
+| `KvExtract` | C1 | `saddle-core/src/kv.rs`, `hipfire-runtime/src/llama.rs`, `hipfire-runtime/Cargo.toml` |
+| `ForwardSplit` | D2 | `crates/hipfire-arch-qwen35/src/qwen35.rs` |
+
+`DeadTrait` and `KvExtract` are both inside `hipfire-runtime` but own different
+files (`loader_api.rs` vs `llama.rs` + `Cargo.toml`). `GrammarUnify` and
+`ForwardSplit` are both inside `hipfire-arch-qwen35` but own `grammar.rs` vs
+`qwen35.rs`. Neither pair collides.
+
+### Wave 2 — two agents, both editing `daemon.rs`
+
+| agent | item | owns |
+|---|---|---|
+| `CarrierPolicy` | C3 + C4 | `hipfire-loader/src/{carriers,lib}.rs`, `daemon.rs` capability and sampling-default sites |
+| `PflashEvict` | B3 | `qwen35/src/pflash.rs` -> its new home, `daemon.rs` PFlash sites (206 refs) |
+
+C3 and C4 are merged into one agent because both move per-arch data onto
+`Carrier` and both touch `carriers.rs`; splitting them would create the only
+genuine conflict in the wave. The two agents share `daemon.rs` but address
+disjoint concerns, which auto-resolves.
+
+### Wave 3 — two agents
+
+| agent | item | owns |
+|---|---|---|
+| `DaemonBin` | A2 | `hipfire-runtime/Cargo.toml`, `daemon.rs` head, the 8 `.rs` consumers, scripts |
+| `DaemonTests` | D4 | the 22 `#[cfg(test)]` blocks -> `hipfire-runtime/tests/` |
+
+A2 requires wave 2 complete: `required-features` cannot drop to zero while
+`daemon.rs` still names arch crates directly.
+
+### Wave 4 — speculation (B2), the hard one
+
+Two agents (`SpecQwen35`, `SpecDs4`) against a shared `saddle-core::spec`
+contract that must be written **before** dispatch, not discovered during it.
+20k lines and the highest-risk item on the list; it gets its own wave and its
+own design pass.
+
+### Wave 5 — arch slimming (D3)
+
+Per-arch agents, one crate each, once every shared concern has moved out.
+
+### Verification
+
+The parent re-runs every gate in § 3 after each wave. A subagent's self-report
+is never the evidence. Full-workspace build, `cargo fmt` and `clippy` run
+**once per wave, by the parent**, after the wave lands — never inside an agent.
+
+---
+
 ## 6 · What is explicitly out of scope
 
 `rdna-compute` (88,447), the kernel family, Redline/PM4 lowering, `radiowave`,
