@@ -752,7 +752,10 @@ impl KvCache {
 
     /// Flag bundle applied by the unified static VMM constructor.
     /// Returns (quant_q8, quant_asym4, quant_asym3, quant_asym2, quant_fwht).
-    fn vmm_mode_flags(mode: KvMode) -> (bool, bool, bool, bool, bool) {
+    /// Pure classification of a `KvMode` into its five VMM layout flags.
+    /// Public so callers one layer up can build a cache in a known layout
+    /// without duplicating the mapping.
+    pub fn vmm_mode_flags(mode: KvMode) -> (bool, bool, bool, bool, bool) {
         match mode {
             KvMode::Q8 => (true, false, false, false, false),
             KvMode::Asym2 => (false, false, false, true, false),
@@ -1340,7 +1343,8 @@ impl KvCache {
     }
 
     /// Resolve the current K `KvMode` from live cache flags.
-    fn current_kv_mode(&self) -> HipResult<KvMode> {
+    /// Read-only: the mode this cache is currently laid out for.
+    pub fn current_kv_mode(&self) -> HipResult<KvMode> {
         if self.quant_q8 {
             return Ok(KvMode::Q8);
         }
@@ -3905,4 +3909,400 @@ impl KvCache {
     // — Stage 6 forward dispatch reads from the per-device replicas in
     // `Gpus` instead.
 
+}
+
+/// KV VMM-layout and adaptive-reset contract tests.
+///
+/// These ten tests were dropped when `KvCache` moved out of
+/// `hipfire-runtime::llama` (wave 1, C1) and were never restored. Recovered
+/// verbatim from `8510ca5f2`. They live inside this module rather than in
+/// `tests/` because they exercise private layout internals — moving them out
+/// would have meant widening `KvCache`'s public API to keep its own tests.
+#[cfg(test)]
+mod vmm_layout_tests {
+    use super::*;
+    use rdna_compute::Gpu;
+
+    fn expected_k_bph(mode: KvMode, head_dim: usize) -> usize {
+        match mode {
+            KvMode::Q8 => (head_dim / 32) * 34,
+            KvMode::Asym2 | KvMode::Fwht2 => 4 + head_dim / 4,
+            KvMode::Asym3 | KvMode::Fwht3 => 4 + (head_dim * 3) / 8,
+            KvMode::Asym4 | KvMode::Fwht4 => 4 + head_dim / 2,
+            KvMode::Asym3Auto => panic!("Asym3Auto is not a layout mode"),
+        }
+    }
+
+    fn expected_v_bph(v_mode: VMode, head_dim: usize) -> usize {
+        match v_mode {
+            VMode::Q8 => (head_dim / 32) * 34,
+            VMode::Lloyd2 => 4 + head_dim / 4,
+            VMode::Lloyd3 => 4 + (head_dim * 3) / 8,
+            VMode::Lloyd4 => 4 + head_dim / 2,
+        }
+    }
+
+    fn flag_standin(mode: KvMode, v_mode: VMode, n_kv_heads: usize, head_dim: usize) -> KvCache {
+        let (q8, a4, a3, a2, fwht) = KvCache::vmm_mode_flags(mode);
+        KvCache {
+            k_gpu: vec![],
+            v_gpu: vec![],
+            k_scales: vec![],
+            v_scales: vec![],
+            kv_dim: n_kv_heads * head_dim,
+            max_seq: 128,
+            physical_cap: 128,
+            n_kv_heads,
+            head_dim,
+            quantized: true,
+            quant_q8: q8,
+            quant_int8: false,
+            quant_hfq4: false,
+            quant_asym4: a4,
+            quant_asym3: a3,
+            quant_asym2: a2,
+            quant_fwht: fwht,
+            boundary_layers: 0,
+            givens_cos: None,
+            givens_sin: None,
+            layer_is_boundary: vec![],
+            compact_offset: 0,
+            v_mode,
+        }
+    }
+
+    fn vmm_mask_dims(
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        physical_cap: usize,
+    ) -> KvDims {
+        KvDims {
+            layers: KvLayers::Mask(vec![true, false, true]),
+            n_kv_heads,
+            head_dim,
+            max_seq,
+            physical_cap: Some(physical_cap),
+        }
+    }
+
+
+    #[test]
+    fn fwht3_vmm_layout_matches_asym3_byte_geometry() {
+        let n_kv_heads = 4;
+        let head_dim = 256;
+        let physical_cap = 128;
+        let asym = KvCache::asym3_vmm_layout(n_kv_heads, head_dim, physical_cap).unwrap();
+        let fwht = KvCache::fwht3_vmm_layout(n_kv_heads, head_dim, physical_cap).unwrap();
+        assert_eq!(fwht, asym, "fwht3 VMM must reuse asym3 K/V byte layout");
+        // Explicit stride math: K 100 B/head, V Q8 272 B/head at head_dim=256.
+        assert_eq!(fwht.3, 4 + (head_dim * 3) / 8);
+        assert_eq!(fwht.4, (head_dim / 32) * 34);
+        let k_bytes = physical_cap * n_kv_heads * fwht.3;
+        let v_bytes = physical_cap * n_kv_heads * fwht.4;
+        assert_eq!(fwht.1, (k_bytes + 3) / 4);
+        assert_eq!(fwht.2, (v_bytes + 3) / 4);
+        assert_eq!(fwht.0, n_kv_heads * head_dim);
+    }
+
+    #[test]
+    fn independent_k_v_capacity_math_from_reserve_and_current() {
+        // Simulate lopsided adaptive start: K floor 68, V floor 68, current K132/V272.
+        let n_kv_heads = 4;
+        let head_dim = 256;
+        let physical_cap = 1000;
+        let layout = KvCache::vmm_layout_with_reserve(
+            KvMode::Fwht4,
+            VMode::Q8,
+            n_kv_heads,
+            head_dim,
+            physical_cap,
+            expected_k_bph(KvMode::Fwht2, head_dim),
+            VMode::Lloyd2,
+        )
+        .unwrap();
+        let k_tokens = layout.k_reserve_bytes / layout.k_bytes_per_token;
+        let v_tokens = layout.v_reserve_bytes / layout.v_bytes_per_token;
+        // Must NOT sum K+V bytes into a shared pool.
+        let naive_shared = (layout.k_reserve_bytes + layout.v_reserve_bytes)
+            / (layout.k_bytes_per_token + layout.v_bytes_per_token);
+        assert_ne!(
+            k_tokens.min(v_tokens),
+            naive_shared,
+            "min-of-two must differ from shared-pool sum"
+        );
+        assert_eq!(k_tokens.min(v_tokens), v_tokens);
+    }
+
+    #[test]
+    fn validate_mode_admits_all_seven_static_vmm_modes() {
+        let dims = vmm_mask_dims(4, 256, 4096, 1024);
+        for mode in [
+            KvMode::Q8,
+            KvMode::Asym2,
+            KvMode::Asym3,
+            KvMode::Asym4,
+            KvMode::Fwht2,
+            KvMode::Fwht3,
+            KvMode::Fwht4,
+        ] {
+            KvCache::validate_mode_with_backend(mode, KvBackend::Vmm, true, &dims)
+                .unwrap_or_else(|e| panic!("mode={mode:?}: {e}"));
+            // Contiguous admission remains open (no VMM-only gate).
+            KvCache::validate_mode_with_backend(mode, KvBackend::Contiguous, true, &dims)
+                .unwrap_or_else(|e| panic!("contiguous mode={mode:?}: {e}"));
+        }
+    }
+
+    #[test]
+    fn validate_mode_rejects_multi_gpu_flat_and_asym3auto_vmm() {
+        let mask = vmm_mask_dims(4, 256, 4096, 1024);
+        let err = KvCache::validate_mode_with_backend(KvMode::Fwht3, KvBackend::Vmm, false, &mask)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("single-GPU"), "{err}");
+
+        let flat = KvDims {
+            layers: KvLayers::Flat(8),
+            n_kv_heads: 4,
+            head_dim: 256,
+            max_seq: 4096,
+            physical_cap: Some(1024),
+        };
+        let err = KvCache::validate_mode_with_backend(KvMode::Fwht3, KvBackend::Vmm, true, &flat)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("filtered"), "{err}");
+
+        let err =
+            KvCache::validate_mode_with_backend(KvMode::Asym3Auto, KvBackend::Vmm, true, &mask)
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("Asym3Auto"), "{err}");
+    }
+
+    #[test]
+    fn vmm_bytes_per_token_matches_layout_for_all_static_modes() {
+        let n_kv_heads = 4;
+        let head_dim = 256;
+        for mode in [
+            KvMode::Q8,
+            KvMode::Asym2,
+            KvMode::Asym3,
+            KvMode::Asym4,
+            KvMode::Fwht2,
+            KvMode::Fwht3,
+            KvMode::Fwht4,
+        ] {
+            let cache = flag_standin(mode, VMode::Q8, n_kv_heads, head_dim);
+            let (k, v) = cache.vmm_bytes_per_token().unwrap();
+            assert_eq!(k, n_kv_heads * expected_k_bph(mode, head_dim), "{mode:?}");
+            assert_eq!(
+                v,
+                n_kv_heads * expected_v_bph(VMode::Q8, head_dim),
+                "{mode:?}"
+            );
+        }
+        // FWHT-K + Lloyd-V current strides.
+        for v_mode in [VMode::Lloyd2, VMode::Lloyd3, VMode::Lloyd4] {
+            let cache = flag_standin(KvMode::Fwht4, v_mode, n_kv_heads, head_dim);
+            let (k, v) = cache.vmm_bytes_per_token().unwrap();
+            assert_eq!(
+                k,
+                n_kv_heads * expected_k_bph(KvMode::Fwht4, head_dim),
+                "{v_mode:?}"
+            );
+            assert_eq!(
+                v,
+                n_kv_heads * expected_v_bph(v_mode, head_dim),
+                "{v_mode:?}"
+            );
+        }
+        // Asym-K + Lloyd-V must fail (illegal pair).
+        let bad = flag_standin(KvMode::Asym3, VMode::Lloyd3, n_kv_heads, head_dim);
+        assert!(bad.vmm_bytes_per_token().is_err());
+    }
+
+    #[test]
+    fn vmm_layout_rejects_illegal_pairs() {
+        // Asym-K + Lloyd-V is illegal.
+        for mode in [KvMode::Asym2, KvMode::Asym3, KvMode::Asym4, KvMode::Q8] {
+            let err = KvCache::vmm_static_layout(mode, VMode::Lloyd4, 4, 256, 64)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("lloyd-V") || err.contains("VMode::Q8"),
+                "mode={mode:?} err={err}"
+            );
+        }
+        // FWHT3 / Asym3 require head_dim=256.
+        for mode in [KvMode::Fwht3, KvMode::Asym3] {
+            let err = KvCache::vmm_static_layout(mode, VMode::Q8, 4, 128, 64)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("head_dim"), "mode={mode:?} err={err}");
+        }
+        // n_kv_heads == 0.
+        let err = KvCache::vmm_static_layout(KvMode::Fwht3, VMode::Q8, 0, 256, 64)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("n_kv_heads>0"), "{err}");
+        // Lloyd-V with FWHT-K but head_dim != 256.
+        let err = KvCache::vmm_static_layout(KvMode::Fwht4, VMode::Lloyd2, 4, 128, 64)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("head_dim=256"), "{err}");
+    }
+
+    #[test]
+    fn vmm_layout_with_reserve_separates_current_and_floor() {
+        // Adaptive-style: current FWHT4/Q8, reserve at fwht2/lloyd2 floors.
+        let n_kv_heads = 4;
+        let head_dim = 256;
+        let physical_cap = 1000;
+        let k_floor_bph = expected_k_bph(KvMode::Fwht2, head_dim); // 68
+        let layout = KvCache::vmm_layout_with_reserve(
+            KvMode::Fwht4,
+            VMode::Q8,
+            n_kv_heads,
+            head_dim,
+            physical_cap,
+            k_floor_bph,
+            VMode::Lloyd2,
+        )
+        .unwrap();
+        // Current strides are start encoding.
+        assert_eq!(
+            layout.k_bytes_per_token,
+            n_kv_heads * expected_k_bph(KvMode::Fwht4, head_dim)
+        );
+        assert_eq!(
+            layout.v_bytes_per_token,
+            n_kv_heads * expected_v_bph(VMode::Q8, head_dim)
+        );
+        // Reserve is floor-sized.
+        assert_eq!(
+            layout.k_reserve_bytes,
+            physical_cap * n_kv_heads * k_floor_bph
+        );
+        assert_eq!(
+            layout.v_reserve_bytes,
+            physical_cap * n_kv_heads * expected_v_bph(VMode::Lloyd2, head_dim)
+        );
+        // Token capacity at start is min of reserve/current (V binds: 68/272).
+        let k_cap = layout.k_reserve_bytes / layout.k_bytes_per_token;
+        let v_cap = layout.v_reserve_bytes / layout.v_bytes_per_token;
+        assert_eq!(
+            k_cap,
+            physical_cap * k_floor_bph / expected_k_bph(KvMode::Fwht4, head_dim)
+        );
+        assert_eq!(
+            v_cap,
+            physical_cap * expected_v_bph(VMode::Lloyd2, head_dim)
+                / expected_v_bph(VMode::Q8, head_dim)
+        );
+        assert!(v_cap < k_cap, "V should bind at FWHT4/Q8 start");
+        // Source-prefix bytes remain current-stride × n_pos (not floor).
+        assert_eq!(
+            layout.prefix_k_bytes(10).unwrap(),
+            10 * layout.k_bytes_per_token
+        );
+        assert_eq!(
+            layout.prefix_v_bytes(10).unwrap(),
+            10 * layout.v_bytes_per_token
+        );
+        assert_eq!(layout.rotation_table_len, 256);
+    }
+
+    #[test]
+    fn vmm_static_layout_covers_all_seven_k_modes_with_q8_v() {
+        let n_kv_heads = 4;
+        let head_dim = 256;
+        let physical_cap = 128;
+        let modes = [
+            KvMode::Q8,
+            KvMode::Asym2,
+            KvMode::Asym3,
+            KvMode::Asym4,
+            KvMode::Fwht2,
+            KvMode::Fwht3,
+            KvMode::Fwht4,
+        ];
+        for mode in modes {
+            let layout =
+                KvCache::vmm_static_layout(mode, VMode::Q8, n_kv_heads, head_dim, physical_cap)
+                    .unwrap_or_else(|e| panic!("mode={mode:?}: {e}"));
+            let k_bph = expected_k_bph(mode, head_dim);
+            let v_bph = expected_v_bph(VMode::Q8, head_dim);
+            assert_eq!(layout.k_bytes_per_head, k_bph, "mode={mode:?}");
+            assert_eq!(layout.v_bytes_per_head, v_bph, "mode={mode:?}");
+            assert_eq!(
+                layout.k_bytes_per_token,
+                n_kv_heads * k_bph,
+                "mode={mode:?}"
+            );
+            assert_eq!(
+                layout.v_bytes_per_token,
+                n_kv_heads * v_bph,
+                "mode={mode:?}"
+            );
+            // Static: reserve == current.
+            assert_eq!(
+                layout.k_reserve_bytes,
+                physical_cap * layout.k_bytes_per_token,
+                "mode={mode:?}"
+            );
+            assert_eq!(
+                layout.v_reserve_bytes,
+                physical_cap * layout.v_bytes_per_token,
+                "mode={mode:?}"
+            );
+            assert_eq!(
+                layout.k_reserve_elems,
+                (layout.k_reserve_bytes + 3) / 4,
+                "mode={mode:?}"
+            );
+            assert_eq!(
+                layout.v_reserve_elems,
+                (layout.v_reserve_bytes + 3) / 4,
+                "mode={mode:?}"
+            );
+            assert_eq!(layout.kv_dim, n_kv_heads * head_dim);
+            // Independent K vs V capacity at equal physical_cap is just physical_cap.
+            let k_cap = layout.k_reserve_bytes / layout.k_bytes_per_token;
+            let v_cap = layout.v_reserve_bytes / layout.v_bytes_per_token;
+            assert_eq!(k_cap.min(v_cap), physical_cap, "mode={mode:?}");
+        }
+    }
+
+    #[test]
+    fn vmm_static_layout_covers_fwht_k_with_lloyd_v() {
+        let n_kv_heads = 4;
+        let head_dim = 256;
+        let physical_cap = 64;
+        let k_modes = [KvMode::Fwht2, KvMode::Fwht3, KvMode::Fwht4];
+        let v_modes = [VMode::Lloyd2, VMode::Lloyd3, VMode::Lloyd4];
+        for mode in k_modes {
+            for v_mode in v_modes {
+                let layout =
+                    KvCache::vmm_static_layout(mode, v_mode, n_kv_heads, head_dim, physical_cap)
+                        .unwrap_or_else(|e| panic!("{mode:?}/{v_mode:?}: {e}"));
+                assert_eq!(layout.k_bytes_per_head, expected_k_bph(mode, head_dim));
+                assert_eq!(layout.v_bytes_per_head, expected_v_bph(v_mode, head_dim));
+                // Lloyd-V forces 256-wide signs even for fwht2/4.
+                assert_eq!(layout.rotation_table_len, 256, "{mode:?}/{v_mode:?}");
+                assert!(layout.uses_fwht_signs, "{mode:?}/{v_mode:?}");
+                // Prefix helpers use current stride, not reserve.
+                let n_pos = 17;
+                assert_eq!(
+                    layout.prefix_k_bytes(n_pos).unwrap(),
+                    n_pos * layout.k_bytes_per_token
+                );
+                assert_eq!(
+                    layout.prefix_v_bytes(n_pos).unwrap(),
+                    n_pos * layout.v_bytes_per_token
+                );
+            }
+        }
+    }
 }

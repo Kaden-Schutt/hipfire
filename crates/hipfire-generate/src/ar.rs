@@ -4384,3 +4384,56 @@ pub fn deepseek4_spec_requested(m: &LoadedModel) -> bool {
         m.mtp_weights_present,
     )
 }
+
+/// Emit the full Qwen AR `done` envelope via serde (hostile-id safe).
+pub fn emit_qwen_ar_done(
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    finish_reason: &str,
+    generated: usize,
+    tok_s: f64,
+    prefill_tokens: usize,
+    prefill_ms: f64,
+    prefill_tok_s: f64,
+    decode_tok_s: f64,
+    ttft_ms: f64,
+    cached_tokens: usize,
+    pflash_fragment_json: &str,
+) {
+    let envelope = qwen_ar_done_value(
+        id,
+        finish_reason,
+        generated,
+        tok_s,
+        prefill_tokens,
+        prefill_ms,
+        prefill_tok_s,
+        decode_tok_s,
+        ttft_ms,
+        cached_tokens,
+        pflash_fragment_json,
+    );
+    emit_staged_terminal_done(stdout, &envelope);
+}
+
+pub fn model_retry_reset_eligible(arch_id: u32) -> bool {
+    hipfire_runtime::reset_core::is_retry_reset_eligible(reset_core_arch_key(arch_id))
+}
+
+
+/// Map LoadedModel.arch_id to reset_core inventory arch key.
+pub fn reset_core_arch_key(arch_id: u32) -> &'static str {
+    match arch_id {
+        0 | 1 => "llama",
+        5 | 6 => "qwen35",
+        7 => "qwen2",
+        8 => "dots-ocr",
+        9 => "deepseek4",
+        10 => "minimax",
+        11 => "lfm2moe",
+        12 => "cohere2moe",
+        13 => "gemma4",
+        14 => "muse_glimmer",
+        _ => "unknown",
+    }
+}
