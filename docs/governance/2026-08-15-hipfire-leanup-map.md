@@ -479,6 +479,35 @@ almost entirely kernel source. Measured like-for-like the ratio is
 llama.cpp, which has zero model-named files in `ggml/`). See
 `scripts/leanup-ratchets.sh` and § 2.2 of the design-grounding doc. Short of
 the 2 : 1 target by 1.7%, not by a factor of two.
+
+Every remaining lever was then tested and found empty:
+
+| lever | measured | verdict |
+|---|---|---|
+| count test code consistently on both sides | 1.983 : 1 | compute carries *more* test code (10,858 vs 6,524); neutral |
+| move arch-crate weight loading | 3,128 lines | #527, explicitly deferred |
+| move arch-crate kernel dispatch | 674 lines | § 6, out of scope |
+| move genuinely generic arch code | 3,100 lines, 200 fns | **would make it worse — see below** |
+| de-duplicate identical fns across arch crates | 62 lines | intentional divergence, not accident |
+
+The third row is the one that looks tempting and is wrong. Of 186 sanctioned
+generic functions in arch crates, only **13** appear in more than one arch
+crate. The other 173 are used by exactly one. Relocating them into
+`saddle-core` would remove no duplication, add action-at-a-distance for no
+reuse, and turn the substrate into a drawer of 173 unrelated helpers — to move
+a ratio by reclassifying lines. That is the opposite of the legibility this
+work exists to produce.
+
+The fifth row is worth knowing about. Of the 13 shared names only 5 have
+byte-identical bodies, and the largest, `argmax`, is duplicated *on purpose*:
+`hipfire_runtime::llama::argmax` carries an `is_finite()` guard because it is
+also the degenerate fallback for `sample_top_p`, where `+Inf` must not beat the
+real finite max, while the two arch copies on the speculative-decode path use a
+bare `>` to agree bit-for-bit with `kernels/src/argmax.hip:13`, which does
+select `+Inf`. Unifying them would make draft and target disagree on `+Inf`
+logits and produce spurious spec-decode rejections. Both are correct for their
+caller; a comment now says so in both files, because this is exactly the
+duplication a future cleanup would "fix".
 Reaching 2:1 means arch ≤ 62,174, i.e. deleting 56,487 lines of working
 architecture code. The llama.cpp comparison that motivated the target (9.7 : 1)
 does not transfer: its per-arch files are graph *construction* averaging 233
