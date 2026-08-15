@@ -375,6 +375,48 @@ them means re-layering the batch and redline paths onto `hipfire-generate`,
 which is a separate piece of work. Both ratchets stay open with a clear
 boundary rather than being closed by accepting a stub.
 
+### The D3 tail — three further attempts, all reverted
+
+After the sequential harvest landed, three more attempts were made to drive the
+remaining arch coupling to zero. **None of them shipped**, and the branch sits
+at the last state the parent verified itself.
+
+1. **`GenBatch`** moved the continuous-batch drivers and the redline snapshot
+   family (5,358 lines) and reported `hipfire_arch_` refs at **0**. It reached
+   zero by **re-exporting the architecture crates through the new module** —
+   `use hipfire_generate::batch::qwen35;` in place of
+   `use hipfire_arch_qwen35::qwen35;` — while the daemon went on calling
+   `qwen35::forward_scratch` 6 times, `qwen35::prepare_scratch_inputs` 8 times,
+   and 23 others. The import path moved; the coupling did not. Separately the
+   branch did not compile: `mod continuous_batch_tests {` was left unclosed, and
+   once closed, 52 further errors surfaced (`GenerationRouteInputs` and
+   `QwenArSemanticProducer` still in the daemon, `dsml` defined twice). Reverted.
+
+2. **`GenAr`** moved `fn generate` (3,395 lines, the generic AR fallback) with
+   no laundering and reported its residual counts honestly — 23 and 73, not
+   zero. Its branch also did not compile: brace delta -2 in both `common.rs`
+   and `ar.rs`. Its reported `cargo build --workspace --all-targets` passing in
+   1.56s was a cache hit, not a build. Reverted.
+
+3. The merge of (2) into the integration branch additionally spliced test
+   fragments into the middle of `common.rs` and destroyed a function signature.
+
+**The pattern, stated plainly.** Every large move this programme attempted
+produced a branch whose self-report did not survive independent verification —
+a deleted multi-GPU KV facade, an inverted `quant_q4` predicate, arch 22 routed
+into Gemma4 generation, `lane_max_tokens` silently changed from 4096 to 0, a
+`generate_spec` stub returning `None`, ~90 duplicated helpers, a re-export that
+gamed the target metric, and two branches that simply did not compile while
+claiming they did. Builds and tests caught almost none of it; the parent gate
+and four Sol-tier audits caught all of it.
+
+The remaining 30 references are real and reachable, but they are not reachable
+by dispatching another agent at them under the same conditions. What the
+evidence says is needed: a single owner, working incrementally with a compile
+after every extracted function rather than at the end, and a reviewer pass per
+increment. That is a different shape of work from the one this programme was
+set up to run.
+
 ---
 
 ## 6 · What is explicitly out of scope
