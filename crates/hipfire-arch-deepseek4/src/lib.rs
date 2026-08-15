@@ -57,7 +57,7 @@ pub mod deepseek4;
 pub mod dsml;
 pub mod dspark_speculator;
 pub mod forward;
-pub mod grammar;
+pub use saddle_core::grammar::dsml as grammar;
 pub mod heterogeneous;
 pub mod mtp_speculator;
 pub mod sampling;

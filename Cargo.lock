@@ -778,6 +778,7 @@ dependencies = [
  "libloading",
  "memmap2",
  "rdna-compute",
+ "saddle-core",
  "serde",
  "serde_json",
 ]
@@ -880,6 +881,7 @@ dependencies = [
  "hipfire-reap",
  "hipfire-runtime",
  "rdna-compute",
+ "saddle-core",
  "serde",
  "serde_json",
 ]
