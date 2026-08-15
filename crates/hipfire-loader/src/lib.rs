@@ -113,36 +113,6 @@ pub trait Carrier: Send + Sync {
         None
     }
 
-    /// Whether this carrier is the dots.ocr arch (daemon.rs:14839
-    /// `is_dots_ocr = m.arch_id == 8`).
-    fn is_dots_ocr(&self) -> bool {
-        false
-    }
-
-    /// Whether this carrier supports the continuous-batch staging path that
-    /// the daemon gates on `m.arch_id == 11` (daemon.rs:14061) or
-    /// `matches!(m.arch_id, 5|6)` for Qwen. Returns true for the two
-    /// batch-capable families, false otherwise. The daemon keeps the
-    /// staging bodies but dispatches via this predicate instead of
-    /// `arch_id ==`.
-    fn supports_continuous_batch(&self) -> bool {
-        false
-    }
-
-    /// Try to handle `bench_decode` redline dispatch (daemon.rs:16125 arch 9,
-    /// 16141 arch 11). Return `Some(Ok(json))` or `Some(Err(reason))` if
-    /// this carrier handled the request (daemon must write/flush and
-    /// `continue`), `None` to fall through to the generic Qwen/Glimmer
-    /// bench_decode path.
-    fn try_bench_decode(
-        &self,
-        _m: &mut LoadedModel,
-        _gpu: &mut Gpu,
-        _msg: &serde_json::Value,
-    ) -> Option<Result<serde_json::Value, String>> {
-        None
-    }
-
     /// Bench-decode prime for the generic Qwen/Glimmer path
     /// (daemon.rs:16238 `prime_error` if arch_id==14 else Qwen). Return
     /// `Some(prime_error)` if handled, `None` if not this carrier's arch.
@@ -172,37 +142,6 @@ pub trait Carrier: Send + Sync {
     ) -> Option<bool> {
         None
     }
-
-    /// EP prompt construction (daemon.rs:17695 `prompt_ids` if arch_id==9
-    /// else Jinja). Return `Some(ids)` if this carrier handles the EP
-    /// prompt, `None` otherwise.
-    fn ep_prompt_ids(
-        &self,
-        _m: &mut LoadedModel,
-        _prompt: &str,
-        _system_prompt: Option<&str>,
-        _tools: Option<&[serde_json::Value]>,
-        _messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
-        _think_mode: hipfire_runtime::prompt_frame::ThinkMode,
-    ) -> Option<Vec<u32>> {
-        None
-    }
-
-    /// EP EOS token selection (daemon.rs:17812 `eos_tok` if arch_id==10
-    /// else deepseek4). Return `Some(tok)` if handled.
-    fn ep_eos_tok(&self, _m: &LoadedModel) -> Option<u32> {
-        None
-    }
-
-    /// Early generate short-circuit for Gemma4 (13) and Glimmer (14)
-    /// (daemon.rs:24179,24231). Return true if this carrier claims the
-    /// generate path and the daemon should treat it as handled (i.e. the
-    /// caller must `return`), false otherwise. The daemon keeps the
-    /// `generate_gemma4` / `generate_muse_glimmer` bodies but gates them
-    /// via this predicate instead of `arch_id ==`.
-    fn handles_generate_early(&self) -> bool {
-        false
-    }
 }
 
 /// The single registry lookup the daemon's spec path routes through: resolve the
@@ -218,6 +157,113 @@ pub fn carrier_for(arch_id: u32) -> Option<&'static dyn Carrier> {
         .copied()
         .find(|c| c.claims_arch_id(arch_id, false))
 }
+
+// ─── Typed routing (replaces stringly `c.name() == "..."` predicates) ──────
+// Each route is an exact `arch_id` match — no carrier `name()` or broader
+// `claims_arch_id` set leaks through. Gemma 22 is deliberately excluded from
+// `GenerationEarlyRoute::Gemma4` (arch 22 is a sidecar drafter, never a
+// primary generate target). See blocker 1.
+
+/// Continuous-batch staging route. `None` = not batch-capable (fallback to sequential).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContinuousBatchRoute {
+    Qwen35,
+    Lfm2Moe,
+}
+/// Exact arch_id -> continuous-batch route. Mirrors the two batch-capable
+/// families (qwen35 5|6, lfm2moe 11). No carrier probing — pure id match.
+pub fn continuous_batch_route(arch_id: u32) -> Option<ContinuousBatchRoute> {
+    match arch_id {
+        5 | 6 => Some(ContinuousBatchRoute::Qwen35),
+        11 => Some(ContinuousBatchRoute::Lfm2Moe),
+        _ => None,
+    }
+}
+
+/// Bench-decode redline route. Exhaustive — every arch maps to exactly one
+/// variant, so a `match` without wildcard is a compile error when a new
+/// bench arch is added.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BenchDecodeRoute {
+    Deepseek4,
+    Lfm2Moe,
+    Qwen35,
+    MuseGlimmer,
+    Unsupported,
+}
+pub fn bench_decode_route(arch_id: u32) -> BenchDecodeRoute {
+    match arch_id {
+        9 => BenchDecodeRoute::Deepseek4,
+        11 => BenchDecodeRoute::Lfm2Moe,
+        5 | 6 => BenchDecodeRoute::Qwen35,
+        14 => BenchDecodeRoute::MuseGlimmer,
+        _ => BenchDecodeRoute::Unsupported,
+    }
+}
+
+/// Vision route. `None` = no vision encoder (text-only). The daemon still
+/// gates on `has_image`/`has_vl`; this route only selects the per-arch
+/// vision implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisionRoute {
+    DotsOcr,
+    QwenVl,
+    None,
+}
+pub fn vision_route(arch_id: u32) -> VisionRoute {
+    match arch_id {
+        8 => VisionRoute::DotsOcr,
+        5 | 6 => VisionRoute::QwenVl,
+        _ => VisionRoute::None,
+    }
+}
+
+/// EP prompt construction route. DeepSeek4 (arch 9) uses the DSML prompt
+/// builder; all other EP arches (10 MiniMax, etc.) use Jinja.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpPromptRoute {
+    Dsml,
+    Jinja,
+}
+pub fn ep_prompt_route(arch_id: u32) -> EpPromptRoute {
+    match arch_id {
+        9 => EpPromptRoute::Dsml,
+        _ => EpPromptRoute::Jinja,
+    }
+}
+
+/// EP EOS token selection route. MiniMax (10) carries its own EOS; all others
+/// (including DeepSeek4) use `deepseek4_eos_tok`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpEosRoute {
+    Deepseek4,
+    Minimax,
+}
+pub fn ep_eos_route(arch_id: u32) -> EpEosRoute {
+    match arch_id {
+        10 => EpEosRoute::Minimax,
+        _ => EpEosRoute::Deepseek4,
+    }
+}
+
+/// Early generation short-circuit route (Gemma4 eager, Glimmer eager).
+/// `None` = no early short-circuit (fall through to the generic
+/// `select_generation_route` / DFlash/spec dispatch). Critically, arch 22
+/// (Gemma4 EAGLE drafter sidecar) maps to `None` — only arch 13 is a
+/// primary Gemma4 generate target. See blocker 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenerationEarlyRoute {
+    Gemma4,
+    MuseGlimmer,
+}
+pub fn generation_early_route(arch_id: u32) -> Option<GenerationEarlyRoute> {
+    match arch_id {
+        13 => Some(GenerationEarlyRoute::Gemma4),
+        14 => Some(GenerationEarlyRoute::MuseGlimmer),
+        _ => None,
+    }
+}
+
 
 // ─── Registry ─────────────────────────────────────────────────────────
 
