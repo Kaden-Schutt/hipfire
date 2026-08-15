@@ -6735,15 +6735,16 @@ fn apply_reasoning_request(
                 request["reasoning_effort"] = serde_json::json!("none");
                 return Ok(());
             }
-            // low/med are uncapped: the Jinja instruction is the effort
-            // mechanism (medium injects none, matching the uncapped
-            // effort-less baseline), and a hard cap force-closes </think>
-            // mid-derivation on hard prompts. high keeps a safety cap.
+            // All budget levels are uncapped — the effort instruction is the
+            // mechanism, and a hard cap force-closes </think> mid-derivation
+            // on hard prompts. A deliberate bound is still available via the
+            // explicit `reasoning.max_tokens` override (above) or the
+            // cross-reopen `reasoning.max_total_tokens` bound.
             "low" => 0,
             "med" => 0,
-            "high" => 8192,
-            "xhigh" => 24576,
-            "max" => 32768,
+            "high" => 0,
+            "xhigh" => 0,
+            "max" => 0,
             "uncapped" => 0,
             value => bail!("unknown reasoning budget {value}"),
         }
@@ -6816,20 +6817,19 @@ fn apply_http_reasoning_request(
     request["assistant_prefix"] = serde_json::json!("open_think");
     if let Some(effort) = effort {
         if !deepseek4_effort_contract {
-            // Budget ladder: high gets a safety cap, everything else is
-            // instruction-steered and uncapped so the effort instruction
-            // decides the natural endpoint. `minimal`/`low` and
-            // `medium`/`med` were hard-capped (512 / 2048); both
-            // force-closed </think> mid-derivation on hard prompts
-            // (measured live: 12-coin plan cut at ~523, the three-gods
-            // puzzle cut at ~2048 mid-case-analysis). `medium` injects no
-            // instruction, so it must match the effort-less baseline, which
-            // is uncapped by config. The earlier ladder (64/256/1024/4096)
-            // was worse (low cut at "(3" mid-derivation).
+            // No effort level carries a hard cap: the template instruction
+            // is the mechanism, and any finite cap force-closes </think>
+            // mid-derivation on hard prompts (measured live: 12-coin plan
+            // cut at ~523, three-gods puzzle cut at ~2048 mid-case-analysis).
+            // `medium` injects no instruction, matching the effort-less
+            // baseline, which is uncapped by config. The earlier ladders
+            // (64/256/1024/4096, then 512/2048/8192) all cut mid-thought.
+            // A deliberate bound is still available via the explicit
+            // `reasoning.max_tokens` config override.
             let max_think = match effort {
                 "minimal" | "low" => 0,
                 "medium" | "med" => 0,
-                "high" => 8192,
+                "high" => 0,
                 "xhigh" | "max" | "uncapped" => 0,
                 other => bail!("unknown reasoning effort '{other}'"),
             };
@@ -11878,7 +11878,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(request["reasoning_effort"], "high");
-        assert_eq!(request["max_think_tokens"], 8192);
+        assert_eq!(request["max_think_tokens"], 0);
         assert_eq!(request["chat_template_kwargs"]["reasoning_effort"], "high");
 
         let mut low = serde_json::json!({});

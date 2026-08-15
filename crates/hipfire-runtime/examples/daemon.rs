@@ -14804,9 +14804,10 @@ fn main() {
                 // block. 0 = uncapped (model thinks until it naturally closes).
                 // Triggered from the CLI by per-model `max_think_tokens` config,
                 // OpenAI `chat_template_kwargs.enable_thinking=false` (cap=1),
-                // and `reasoning.effort` (none/off/chat=1, minimal/low=0
-                // and medium/med=0 instruction-steered, high=8192,
-                // xhigh/max/uncapped=0). The
+                // and `reasoning.effort` (none/off/chat=1,
+                // minimal/low/medium/med/high/xhigh/max/uncapped=0 — no
+                // effort level carries a hard cap; the template instruction
+                // decides the endpoint). The
                 // matching effort is forwarded into the Jinja render
                 // (qwen_jinja_reasoning → JinjaChatFrame.reasoning_effort); the
                 // arch 5/6 template injects the model-native effort instruction
