@@ -44,6 +44,7 @@ use std::{
 };
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
+mod bench_concurrency;
 mod setup;
 use setup::setup_command;
 
@@ -415,7 +416,7 @@ struct ChatArgs {
     no_color: bool,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Clone)]
 struct BenchArgs {
     model: String,
     #[arg(long, default_value_t = 5)]
@@ -460,9 +461,23 @@ struct BenchArgs {
     /// Speculation mode to benchmark (off, dflash, mtp, ngram, dspark, or auto).
     #[arg(long = "spec")]
     speculation: Option<String>,
-    /// Start generation in answer mode, matching `hipfire run` when reasoning is off.
+    /// Let the model think during the benchmark. Off by default: a reasoning
+    /// model cannot close its `<think>` span inside the benchmark's token
+    /// budget, and the daemon fails such a turn closed as a validation error.
+    /// Pair this with `--max-tokens` large enough for the span to close.
+    #[arg(long = "reasoning-on")]
+    reasoning_on: bool,
+    /// Sweep concurrent stream counts, e.g. `1,2,3,4`. Absent leaves bench
+    /// on its single-stream path, unchanged.
     #[arg(long)]
-    reasoning_off: bool,
+    concurrency: Option<String>,
+    /// Which backend to drive: slots (multi-slot engine), noslots (sequential
+    /// daemon baseline), batch (beta continuous batching), or both.
+    #[arg(long, value_parser = ["slots", "noslots", "batch", "both"], default_value = "both")]
+    backend: String,
+    /// Which workload arm to run: stateless, multiturn, or both.
+    #[arg(long, value_parser = ["stateless", "multiturn", "both"], default_value = "both")]
+    workload: String,
     /// Prompt words for the standard benchmark.
     #[arg(num_args = 0..)]
     prompt: Vec<String>,
@@ -2320,6 +2335,19 @@ struct ServeShared {
     retry_backoff: Duration,
     /// Test seam: when set, invoked instead of `thread::sleep` during retry backoff.
     backoff_hook: Mutex<Option<Arc<dyn Fn(Duration) + Send + Sync>>>,
+    /// Concurrent multi-slot backend (`serve.multi_slot`). Deliberately NOT
+    /// inside `runtime`: that mutex is exactly what serialises requests today,
+    /// so an engine behind it would serve one caller at a time and change
+    /// nothing.
+    slot_engine: Option<Arc<SlotBackend>>,
+}
+
+/// The multi-slot backend plus what the HTTP layer needs to talk to it: a
+/// tokenizer to render chat messages into ids and to turn generated ids back
+/// into text for the SSE deltas.
+struct SlotBackend {
+    engine: hipfire_arch_qwen35::serve_engine::SlotEngine,
+    tokenizer: hipfire_runtime::tokenizer::Tokenizer,
 }
 
 #[derive(Debug)]
@@ -2509,7 +2537,10 @@ fn longest_control_prefix_suffix(text: &str) -> usize {
 
 #[derive(Debug, Default)]
 struct AdmissionState {
+    /// Batch-eligible requests currently admitted. The single-daemon backend
+    /// caps this at one; the multi-slot engine admits `capacity` at once.
     eligible: usize,
+    /// A batch-ineligible request holds the backend exclusively.
     ineligible_busy: bool,
     queued: usize,
     batch_model: Option<String>,
@@ -2521,6 +2552,10 @@ struct Admission {
     available: Condvar,
     max_queue: usize,
     timeout: Duration,
+    /// How many batch-eligible requests may be in flight at once. One for the
+    /// single-daemon backend -- this gate is what protects it -- and the slot
+    /// count when the multi-slot engine is active, which has its own admission
+    /// behind it.
     capacity: usize,
 }
 
@@ -3080,7 +3115,45 @@ fn serve_foreground(
         .clone()
         .unwrap_or(config_string(&global, "serve.default_model")?);
     let instance_token = serve_instance_token();
+    // Opt-in concurrent backend. Built before ServeShared so a failure here is
+    // a clean startup error rather than a half-configured server.
+    let slot_engine = match config_bool(&global, "serve.multi_slot") {
+        Ok(true) => {
+            let model_path = find_model_path(paths, &registry, &default_model)
+                .ok_or_else(|| anyhow!("multi_slot: cannot resolve model {default_model}"))?;
+            let n_slots = config_u64(&global, "serve.multi_slot_slots").unwrap_or(4) as usize;
+            let cap_tokens = config_u64(&global, "serve.multi_slot_ctx").unwrap_or(8192) as usize;
+            let mut hfq = hipfire_runtime::hfq::HfqFile::open(&model_path)
+                .with_context(|| format!("multi_slot: open {}", model_path.display()))?;
+            let tokenizer =
+                hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
+                    .map_err(|e| anyhow!("multi_slot: tokenizer: {e}"))?;
+            drop(hfq);
+            let engine = hipfire_arch_qwen35::serve_engine::SlotEngine::spawn(
+                hipfire_arch_qwen35::serve_engine::EngineConfig {
+                    model_path: model_path.clone(),
+                    n_slots,
+                    cap_tokens,
+                    host_budget_bytes: 16 * 1024 * 1024 * 1024,
+                    swap_dir: std::env::temp_dir().join("hipfire-serve-swap"),
+                },
+            )
+            .map_err(|e| anyhow!("multi_slot: {e}"))?;
+            eprintln!(
+                "serve: multi-slot backend up ({} slots, {} ctx) - requests run concurrently",
+                n_slots, cap_tokens
+            );
+            Some(Arc::new(SlotBackend { engine, tokenizer }))
+        }
+        _ => None,
+    };
+    let slot_concurrency = if slot_engine.is_some() {
+        config_u64(&global, "serve.multi_slot_slots").unwrap_or(4) as usize
+    } else {
+        1
+    };
     let shared = Arc::new(ServeShared {
+        slot_engine,
         runtime: Mutex::new(ServeRuntime {
             engine,
             paths: paths.clone(),
@@ -3107,10 +3180,16 @@ fn serve_foreground(
             last_activity: Instant::now(),
         }),
         max_request_bytes,
+        // The HTTP gate must admit as many requests as the live backend can
+        // actually run, or they queue here and never reach it -- the exact
+        // serialisation both batching paths exist to remove. Two independent
+        // mechanisms feed this: the multi-slot engine's slot count (1 when it
+        // is off) and the single-daemon continuous batch width. Take the
+        // larger; each has its own admission behind this gate.
         admission: Arc::new(Admission::new_with_capacity(
             max_queue,
             queue_timeout,
-            continuous_batch_size as usize,
+            slot_concurrency.max(continuous_batch_size as usize),
         )),
         idle_timeout,
         retry_enabled,
@@ -4930,6 +5009,223 @@ fn complete_request_attempt(
 /// dropped with it); admission is re-acquired after the backoff, and a
 /// re-acquire failure surfaces the original error. The public completion id is
 /// allocated once and reused; attempt ids are distinct and monotonic.
+/// Serve one chat completion through the multi-slot engine.
+///
+/// Renders the chat messages with the model's frame, submits, and turns the
+/// engine's `Event`s into the same `{"type":"token","text":...}` events the
+/// SSE writer already consumes -- so streaming, terminal acks and the HTTP
+/// layer are all unchanged.
+fn complete_request_slots(
+    backend: &SlotBackend,
+    body: &serde_json::Value,
+    identity: &(String, u64),
+    event_callback: &mut dyn FnMut(&serde_json::Value) -> Result<(), hipfire_client::ClientError>,
+    terminal_callback: &mut dyn FnMut(&Completion) -> Result<(), hipfire_client::ClientError>,
+) -> Result<Completion> {
+    use hipfire_runtime::emit_text::{ThinkOutputRouter, ThinkRouteEvent};
+    use hipfire_runtime::prompt_frame::{AssistantPrefix, ChatFrame, Role};
+    use hipfire_runtime::serve::{Event, SubmitRequest};
+
+    let model = body
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .to_owned();
+    let max_tokens = body
+        .get("max_tokens")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(512) as usize;
+
+    // Messages -> the shape ChatFrame actually wants. This is not a free
+    // mapping: `build_multi_turn` PANICS on a System or Tool role inside the
+    // history, because system text belongs in `ChatFrame.system` and the final
+    // user turn in `ChatFrame.user`. History carries only the prior
+    // User/Assistant exchange.
+    let mut system: Option<String> = None;
+    let mut turns: Vec<(Role, String)> = Vec::new();
+    let Some(msgs) = body.get("messages").and_then(serde_json::Value::as_array) else {
+        bail!("messages is required");
+    };
+    for m in msgs {
+        let text = m
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        match m.get("role").and_then(serde_json::Value::as_str) {
+            Some("system") => {
+                // Multiple system messages concatenate, matching how the
+                // single-session path folds them.
+                match system.as_mut() {
+                    Some(existing) => {
+                        existing.push('\n');
+                        existing.push_str(&text);
+                    }
+                    None => system = Some(text),
+                }
+            }
+            Some("assistant") => turns.push((Role::Assistant, text)),
+            // A tool result reads as user-side context to the model.
+            Some("tool") => turns.push((Role::User, text)),
+            _ => turns.push((Role::User, text)),
+        }
+    }
+    // The final user turn is the prompt; everything before it is history.
+    let last_user = match turns.iter().rposition(|(r, _)| *r == Role::User) {
+        Some(i) => turns.remove(i).1,
+        None => bail!("messages must contain at least one user message"),
+    };
+    let history: Vec<(Role, &str)> = turns.iter().map(|(r, t)| (*r, t.as_str())).collect();
+    // A thinking model must be handed an OPEN <think> block, as the daemon's
+    // spec_assistant_prefix does. With Plain, the model has to emit `<think>`
+    // itself and instead loops on `</think>` and re-opens user turns.
+    let prefix = if backend.tokenizer.special_token_id("<think>").is_some() {
+        AssistantPrefix::OpenThink
+    } else {
+        AssistantPrefix::Plain
+    };
+    let frame = ChatFrame {
+        tokenizer: &backend.tokenizer,
+        system: system.as_deref(),
+        user: &last_user,
+        assistant_prefix: prefix,
+        raw: false,
+    };
+    let prompt_tokens = frame.build_multi_turn(&history);
+
+    // Conversation identity is the USER turns. The assistant side is whatever
+    // we generated, and the client's echo of it may differ (reasoning split to
+    // its own channel, whitespace, an edited message), so it cannot be part of
+    // the key.
+    fn turn_hash(s: &str) -> u64 {
+        let mut h = 0xcbf29ce484222325_u64;
+        for b in s.as_bytes() {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h
+    }
+    let mut convo: Vec<u64> = turns
+        .iter()
+        .filter(|(r, _)| *r == Role::User)
+        .map(|(_, t)| turn_hash(t))
+        .collect();
+    convo.push(turn_hash(&last_user));
+
+    // Tokens that continue the previous assistant turn into this user turn.
+    // The engine appends these to the session's exact stored tokens instead of
+    // re-rendering the history, which is what makes the result a strict
+    // extension of the KV. Only meaningful from turn 2 onwards.
+    let continuation = if convo.len() >= 2 {
+        hipfire_runtime::prompt_frame::continuation_suffix(&backend.tokenizer, &last_user, prefix)
+    } else {
+        Vec::new()
+    };
+
+    let (tx, rx) = mpsc::channel::<Event>();
+    backend
+        .engine
+        .submit(SubmitRequest {
+            session: None,
+            prompt_tokens,
+            convo,
+            continuation,
+            max_tokens,
+            reply: tx,
+        })
+        .map_err(|e| anyhow!("multi_slot submit: {e}"))?;
+
+    let mut content = String::new();
+    let mut reasoning_content = String::new();
+    let mut finish = "stop";
+
+    // Split <think> spans out of the visible answer. Without this the whole
+    // reasoning preamble lands in `content` -- a 4B answer arrives as ~2 KB of
+    // "Thinking Process: 1. **Analyze the Request**..." with reasoning_content
+    // empty. `started_in_think` is true because the prompt itself opened the
+    // block (AssistantPrefix::OpenThink above), so generation begins inside it
+    // and there is no opening marker in the generated stream to detect.
+    let mut think = ThinkOutputRouter::new(matches!(prefix, AssistantPrefix::OpenThink));
+    let mut routed: Vec<ThinkRouteEvent> = Vec::new();
+
+    let mut drain_routed = |routed: &mut Vec<ThinkRouteEvent>,
+                            content: &mut String,
+                            reasoning_content: &mut String,
+                            cb: &mut dyn FnMut(
+        &serde_json::Value,
+    ) -> Result<(), hipfire_client::ClientError>| {
+        for ev in routed.drain(..) {
+            match ev {
+                ThinkRouteEvent::Content(text) => {
+                    content.push_str(&text);
+                    let _ = cb(&serde_json::json!({ "type": "token", "text": text }));
+                }
+                ThinkRouteEvent::Reasoning(text) => {
+                    reasoning_content.push_str(&text);
+                    let _ = cb(&serde_json::json!({ "type": "reasoning", "text": text }));
+                }
+            }
+        }
+    };
+
+    while let Ok(ev) = rx.recv() {
+        match ev {
+            Event::Accepted { .. } => {}
+            Event::Token { id } => {
+                let text = backend.tokenizer.decode(&[id]);
+                if !text.is_empty() {
+                    think.push_into(&text, &mut routed);
+                    drain_routed(
+                        &mut routed,
+                        &mut content,
+                        &mut reasoning_content,
+                        event_callback,
+                    );
+                }
+            }
+            Event::Done { reason } => {
+                finish = match reason {
+                    hipfire_runtime::serve::DoneReason::MaxTokens => "length",
+                    _ => "stop",
+                };
+                break;
+            }
+            Event::Rejected { reason } => {
+                // Saturation is a real, expected answer here, not a crash: all
+                // slots busy means the caller should retry, not that anything
+                // failed.
+                bail!("multi_slot rejected: {reason}");
+            }
+        }
+    }
+
+    // Flush any trailing partial marker as ordinary text in its channel.
+    think.finish_into(&mut routed);
+    drain_routed(
+        &mut routed,
+        &mut content,
+        &mut reasoning_content,
+        event_callback,
+    );
+
+    let completion = Completion {
+        id: identity.0.clone(),
+        created: identity.1,
+        model,
+        content,
+        reasoning_content,
+        preserve_thinking: false,
+        tool_calls: Vec::new(),
+        done: serde_json::json!({ "finish_reason": finish }),
+    };
+    // The terminal callback is what stages the response body and signals the
+    // HTTP handler that the request succeeded. Skipping it leaves the handler
+    // waiting on a status that never arrives, which surfaces to the client as
+    // "generation worker disconnected".
+    terminal_callback(&completion).map_err(|e| anyhow!("terminal callback: {e}"))?;
+    Ok(completion)
+}
+
 fn complete_request(
     shared: &ServeShared,
     body: &serde_json::Value,
@@ -4939,6 +5235,22 @@ fn complete_request(
     mut terminal_callback: impl FnMut(&Completion) -> Result<(), hipfire_client::ClientError>,
 ) -> Result<Completion> {
     let identity = request_identity.unwrap_or_else(|| (request_id(), unix_timestamp()));
+
+    // Concurrent path. Takes no `shared.runtime` lock, which is the entire
+    // point: that mutex is what makes concurrent callers queue today. The
+    // retry/attempt machinery below is for the daemon Engine's cold-reset
+    // semantics and has no analogue here -- the engine either admits a request
+    // or rejects it with a reason.
+    if let Some(backend) = shared.slot_engine.clone() {
+        return complete_request_slots(
+            &backend,
+            body,
+            &identity,
+            &mut event_callback,
+            &mut terminal_callback,
+        );
+    }
+
     let mut attempt_index = 1u32;
     let mut guard = guard;
     loop {
@@ -6471,6 +6783,25 @@ fn apply_http_reasoning_request(
         request["reasoning_effort"] = serde_json::json!("none");
         return Ok(());
     }
+    // Thinking is ON from here down (config default, or explicit
+    // enable_thinking=true / reasoning effort >= minimal). OPEN the <think>
+    // block so the model actually reasons instead of emitting an empty
+    // <think></think> and answering directly.
+    //
+    // Only the thinking-OFF cases above used to set assistant_prefix; the ON
+    // path set none, so the daemon fell back to plain framing and generic
+    // OpenAI clients -- which never send assistant_prefix -- silently got
+    // no-think behaviour. On Qwen3.6 that reasons in plain prose and derails
+    // (LiveBench reasoning ~0).
+    //
+    // This was fixed in the TypeScript CLI in June 2026 (98c65020) and lost
+    // when the CLI was rewritten in Rust: that commit edits cli/index.ts,
+    // which no longer exists, so the fix cannot be cherry-picked -- only
+    // re-applied here.
+    //
+    // Safe for non-thinking models: the daemon's prompt frame falls back to
+    // Plain when the tokenizer has no `<think>` special token.
+    request["assistant_prefix"] = serde_json::json!("open_think");
     if let Some(effort) = effort {
         if !deepseek4_effort_contract {
             let max_think = match effort {
@@ -6810,6 +7141,16 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
     if args.exp && args.json {
         bail!("--json is not supported with --exp");
     }
+    // --exp runs a fixed 128-token protocol across five RDNA2 variants and
+    // ignores --max-tokens, so it can never give a think span room to close.
+    // Reject the combination rather than silently drop the flag and abort
+    // later on an open-think terminal.
+    if args.exp && args.reasoning_on {
+        bail!("--reasoning-on is not supported with --exp (its token budget is fixed at 128)");
+    }
+    if let Some(spec) = args.concurrency.clone() {
+        return bench_concurrency_command(paths, &args, &spec);
+    }
     for (name, values) in [
         ("--pp", &args.pp),
         ("--ctx", &args.ctx),
@@ -6866,7 +7207,11 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
     if args.matrix || args.redline {
         bench_matrix(&mut engine, &args, &loaded, &post_diag)
     } else {
-        let _ = bench_generate_with_reasoning(&mut engine, "Hello", 16, args.reasoning_off)?;
+        // The warmup exists to populate kernel caches and its output is
+        // discarded, so it stays in answer mode even under --reasoning-on: a
+        // 16-token budget cannot close a think span, and letting the warmup
+        // think would abort the run before a single measured sample.
+        let _ = bench_generate(&mut engine, "Hello", 16)?;
         let mut decode = Vec::new();
         let mut prefill = Vec::new();
         let mut wall = Vec::new();
@@ -6876,7 +7221,7 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
                 &mut engine,
                 &prompt,
                 args.max_tokens as u64,
-                args.reasoning_off,
+                args.reasoning_on,
             )?;
             if let Some(value) = done.get("decode_tok_s").and_then(serde_json::Value::as_f64) {
                 decode.push(value);
@@ -6922,6 +7267,182 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
         }
         Ok(())
     }
+}
+
+/// Concurrency sweep across both concurrent backends. Only reached when
+/// `--concurrency` is given; the single-stream path above is untouched.
+fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Result<()> {
+    use crate::bench_concurrency::{
+        parse_concurrency, render_table, sweep_backend, BackendSel, ConcurrencyBackend,
+        DaemonDriver, Point, SequentialDriver, SlotDriver, WorkloadSel,
+    };
+
+    let points = parse_concurrency(spec)?;
+    let max_k = *points.iter().max().expect("non-empty");
+    let backend_sel = match args.backend.as_str() {
+        "slots" => BackendSel::Slots,
+        "noslots" => BackendSel::Sequential,
+        "batch" => BackendSel::Batch,
+        _ => BackendSel::Both,
+    };
+    let arms: Vec<WorkloadSel> = match args.workload.as_str() {
+        "stateless" => vec![WorkloadSel::Stateless],
+        "multiturn" => vec![WorkloadSel::Multiturn],
+        _ => vec![WorkloadSel::Stateless, WorkloadSel::Multiturn],
+    };
+
+    eprintln!("hipfire bench — concurrency sweep");
+    eprintln!("  model:       {}", args.model);
+    eprintln!("  concurrency: {points:?}");
+    eprintln!("  runs/point:  {}", args.runs);
+    eprintln!("  max_tokens:  {}", args.max_tokens);
+
+    let mut out: Vec<Point> = Vec::new();
+
+    // The two backends run STRICTLY SEQUENTIALLY, and the scope below is what
+    // enforces it. Each holds a full copy of the model's weights -- 18.7 GB for
+    // a 35B-A3B mq4r -- so overlapping them doubles resident footprint. On a
+    // box with no swap that is not "slower", it is an OOM kill. `SlotEngine`'s
+    // Drop closes its channel and joins the worker thread that owns the Gpu,
+    // weights and KV arenas, so leaving this scope is what actually frees the
+    // first model before the daemon loads the second.
+    if matches!(backend_sel, BackendSel::Slots | BackendSel::Both) {
+        let registry = load_registry(&paths.registry).registry;
+        let model_path = find_model_path(paths, &registry, &args.model)
+            .ok_or_else(|| anyhow!("model not found: {}", args.model))?;
+        // 2048-token slots, not the serve default of 8192: the sweep's prompts
+        // are one short turn and --max-tokens is small, so a larger arena buys
+        // nothing and multiplies per-slot KV by four.
+        match SlotDriver::start(&model_path, max_k, 2048) {
+            Ok(mut d) => {
+                eprintln!("  slots backend up ({max_k} slots)");
+                let r = sweep_backend(
+                    &mut d as &mut dyn ConcurrencyBackend,
+                    &arms,
+                    &points,
+                    args.runs,
+                    args.max_tokens as u64,
+                    &mut out,
+                );
+                // Free the weights before the batch backend loads its own copy,
+                // even on the error path.
+                drop(d);
+                r?;
+            }
+            // A backend that cannot run this model is a RESULT, not a crash.
+            Err(e) => eprintln!("  slots backend unavailable: {e}"),
+        }
+    }
+
+    // No-slots baseline: k requests one after another through the ordinary
+    // daemon path. Runs after the slots engine has been dropped, so only one
+    // copy of the weights is ever resident.
+    if matches!(backend_sel, BackendSel::Sequential | BackendSel::Both) {
+        preflight_headroom_for_model(paths, &args.model)?;
+        let mut seq_args = args.clone();
+        seq_args.concurrency = None;
+        let (engine, _, _, _) = open_bench_engine(paths, &seq_args, None)?;
+        let mut d = SequentialDriver::start(engine, max_k)?;
+        eprintln!("  noslots backend up (sequential daemon path)");
+        let r = sweep_backend(
+            &mut d as &mut dyn ConcurrencyBackend,
+            &arms,
+            &points,
+            args.runs,
+            args.max_tokens as u64,
+            &mut out,
+        );
+        drop(d);
+        r?;
+    }
+
+    if matches!(backend_sel, BackendSel::Batch | BackendSel::Both) {
+        preflight_headroom_for_model(paths, &args.model)?;
+        let mut batch_args = args.clone();
+        batch_args.concurrency = None;
+        let (engine, loaded, _, _) = open_bench_engine_batched(paths, &batch_args, max_k)?;
+        let capable = loaded
+            .get("continuous_batch_capable")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        match DaemonDriver::start(engine, max_k, capable) {
+            Ok(mut d) => {
+                eprintln!("  batch backend up (continuous_batch_size={max_k})");
+                sweep_backend(
+                    &mut d as &mut dyn ConcurrencyBackend,
+                    &arms,
+                    &points,
+                    args.runs,
+                    args.max_tokens as u64,
+                    &mut out,
+                )?;
+            }
+            Err(e) => eprintln!("  batch backend unavailable: {e}"),
+        }
+    }
+
+    println!("{}", render_table(&out));
+    Ok(())
+}
+
+/// Refuse to load a model that will not fit in available host memory.
+///
+/// The GPU allocates from system RAM on this class of box and there is no
+/// swap, so an overcommit is an OOM kill of the whole machine rather than a
+/// slow run. Checked between the two backends because that is precisely where
+/// a leaked first model would show up: if the slots engine did not actually
+/// release its weights, `MemAvailable` is still depressed here and this stops
+/// the sweep instead of taking the box down.
+fn preflight_headroom_for_model(paths: &Paths, model: &str) -> Result<()> {
+    let registry = load_registry(&paths.registry).registry;
+    let Some(path) = find_model_path(paths, &registry, model) else {
+        return Ok(());
+    };
+    let Ok(meta) = std::fs::metadata(&path) else {
+        return Ok(());
+    };
+    let need = meta.len();
+    let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") else {
+        return Ok(());
+    };
+    let avail_kb = meminfo
+        .lines()
+        .find_map(|l| l.strip_prefix("MemAvailable:"))
+        .and_then(|v| v.split_whitespace().next())
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    let avail = avail_kb * 1024;
+    // 20% headroom over the raw weight bytes for KV arenas and scratch.
+    let want = need + need / 5;
+    if avail < want {
+        bail!(
+            "refusing to load {}: needs ~{:.1} GB with headroom, only {:.1} GB available. \
+             A previous backend may not have released its weights.",
+            path.display(),
+            want as f64 / 1e9,
+            avail as f64 / 1e9
+        );
+    }
+    Ok(())
+}
+
+/// `open_bench_engine`, but loading with `continuous_batch_size` set so the
+/// daemon allocates batch lanes and advertises `continuous_batch_capable`.
+/// The value is fixed per load, which is why the sweep holds it at max.
+fn open_bench_engine_batched(
+    paths: &Paths,
+    args: &BenchArgs,
+    batch_size: usize,
+) -> Result<(
+    Engine,
+    serde_json::Value,
+    serde_json::Value,
+    serde_json::Value,
+)> {
+    std::env::set_var("HIPFIRE_BENCH_CONTINUOUS_BATCH", batch_size.to_string());
+    let r = open_bench_engine(paths, args, None);
+    std::env::remove_var("HIPFIRE_BENCH_CONTINUOUS_BATCH");
+    r
 }
 
 fn open_bench_engine(
@@ -6999,13 +7520,43 @@ fn open_bench_engine(
         let configured = params["max_seq"].as_u64().unwrap_or(0);
         params["max_seq"] = serde_json::json!(configured.max(requested));
     }
+    if let Ok(n) = std::env::var("HIPFIRE_BENCH_CONTINUOUS_BATCH") {
+        if let Ok(n) = n.parse::<u64>() {
+            params["continuous_batch_size"] = serde_json::json!(n);
+        }
+    }
     let loaded = engine.load(&path, params)?;
     let post_diag = engine.request(&serde_json::json!({ "type": "diag" }))?;
     Ok((engine, loaded, pre_diag, post_diag))
 }
 
+/// The standard benchmark generate: greedy, fixed budget, and **answer mode**.
+///
+/// Answer mode is the default rather than an opt-in because a benchmark that
+/// lets the model think cannot complete. A reasoning model (any Qwen3.6 SKU,
+/// for one) opens `<think>` within its first tokens and has no chance of
+/// closing it inside the benchmark's budget — 16 tokens for the warmup, 128
+/// for a measured run. The daemon ranks an unclosed think span at finish above
+/// the length cap in both terminal classifiers (`QwenArTerminalCause::resolve`
+/// and `qwen_dflash_wire_terminal`), so it reports the truncation as a
+/// non-retryable validation error rather than `finish_reason=length`. The
+/// benchmark then aborts on the warmup generate, before recording a sample.
+///
+/// Benchmarks measure tokens per second and never read the text, so asking for
+/// answer mode costs nothing and removes the dependency on the model finishing
+/// a thought inside an arbitrary budget. `--reasoning-on` restores the
+/// thinking turn for anyone who wants to measure that path — with a budget
+/// large enough to close the span.
 fn bench_generate_request(prompt: &str, max_tokens: u64) -> serde_json::Value {
-    serde_json::json!({
+    bench_generate_request_reasoning(prompt, max_tokens, false)
+}
+
+fn bench_generate_request_reasoning(
+    prompt: &str,
+    max_tokens: u64,
+    reasoning_on: bool,
+) -> serde_json::Value {
+    let mut request = serde_json::json!({
         "type": "generate",
         "id": request_id(),
         "prompt": prompt,
@@ -7014,7 +7565,13 @@ fn bench_generate_request(prompt: &str, max_tokens: u64) -> serde_json::Value {
         "repeat_penalty": 1.1,
         "max_tokens": max_tokens,
         "attempt_id": 1,
-    })
+    });
+    if !reasoning_on {
+        request["max_think_tokens"] = serde_json::json!(1);
+        request["assistant_prefix"] = serde_json::json!("closed_think");
+        request["reasoning_effort"] = serde_json::json!("none");
+    }
+    request
 }
 
 fn bench_generate(engine: &mut Engine, prompt: &str, max_tokens: u64) -> Result<serde_json::Value> {
@@ -7025,14 +7582,9 @@ fn bench_generate_with_reasoning(
     engine: &mut Engine,
     prompt: &str,
     max_tokens: u64,
-    reasoning_off: bool,
+    reasoning_on: bool,
 ) -> Result<serde_json::Value> {
-    let mut request = bench_generate_request(prompt, max_tokens);
-    if reasoning_off {
-        request["max_think_tokens"] = serde_json::json!(1);
-        request["assistant_prefix"] = serde_json::json!("closed_think");
-        request["reasoning_effort"] = serde_json::json!("none");
-    }
+    let request = bench_generate_request_reasoning(prompt, max_tokens, reasoning_on);
     Ok(engine.generate(&request, |_| Ok(()))?)
 }
 
@@ -7244,7 +7796,10 @@ fn profile_command(paths: &Paths, args: ProfileArgs) -> Result<()> {
             kv_backend: None,
             redline: false,
             speculation: None,
-            reasoning_off: false,
+            reasoning_on: false,
+            concurrency: None,
+            backend: "both".to_owned(),
+            workload: "both".to_owned(),
             prompt: Vec::new(),
         };
         let (mut engine, _, _, _) = open_bench_engine(paths, &bench, None)?;
@@ -14471,6 +15026,8 @@ for line in sys.stdin:
 
             let registry = hipfire_registry::bundled().unwrap();
             let shared = Arc::new(ServeShared {
+                // Test harness drives the single-daemon path.
+                slot_engine: None,
                 runtime: Mutex::new(ServeRuntime {
                     engine,
                     paths: paths.clone(),
@@ -15352,6 +15909,47 @@ for line in sys.stdin:
             Some("bench prompt")
         );
         assert_eq!(req.get("max_tokens").and_then(|v| v.as_u64()), Some(37));
+    }
+
+    /// Every benchmark generate must ask for answer mode.
+    ///
+    /// A reasoning model opens `<think>` in its first tokens and cannot close
+    /// it inside a benchmark's fixed budget (16 tokens for the warmup, 128 for
+    /// the measured runs). The daemon classifies an unclosed think span at
+    /// finish as a non-retryable validation terminal *ahead of* the length cap
+    /// — `QwenArTerminalCause::resolve` and `qwen_dflash_wire_terminal` in the
+    /// daemon both order it that way — so a thinking benchmark aborts on the
+    /// warmup, before it records a single sample.
+    #[test]
+    fn bench_generate_request_is_answer_mode_by_default() {
+        let req = bench_generate_request("bench prompt", 128);
+        assert_eq!(
+            req.get("max_think_tokens").and_then(|v| v.as_u64()),
+            Some(1),
+            "benchmark generates must cap thinking"
+        );
+        assert_eq!(
+            req.get("assistant_prefix").and_then(|v| v.as_str()),
+            Some("closed_think"),
+            "benchmark generates must start in answer mode"
+        );
+        assert_eq!(
+            req.get("reasoning_effort").and_then(|v| v.as_str()),
+            Some("none")
+        );
+    }
+
+    /// `--reasoning-on` restores the thinking turn for anyone who wants to
+    /// benchmark that path, and must produce a request carrying none of the
+    /// answer-mode fields.
+    #[test]
+    fn bench_reasoning_on_opts_back_into_thinking() {
+        let req = bench_generate_request_reasoning("bench prompt", 128, true);
+        assert!(req.get("max_think_tokens").is_none());
+        assert!(req.get("assistant_prefix").is_none());
+        assert!(req.get("reasoning_effort").is_none());
+        // Still an ordinary benchmark generate otherwise.
+        assert_eq!(req.get("max_tokens").and_then(|v| v.as_u64()), Some(128));
     }
 
     #[test]

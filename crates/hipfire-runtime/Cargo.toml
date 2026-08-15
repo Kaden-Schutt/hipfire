@@ -245,6 +245,10 @@ name = "greedy_dump_top5"
 required-features = ["arch-qwen35"]
 
 [[example]]
+name = "kv_mode_kld"
+required-features = ["arch-qwen35"]
+
+[[example]]
 name = "logit_dump"
 required-features = ["arch-qwen35"]
 
@@ -311,6 +315,18 @@ required-features = ["arch-qwen35"]
 [[example]]
 name = "test_qwen35_loadQA"
 required-features = ["arch-qwen35"]
+
+[[example]]
+name = "test_forward_slots_golden"
+required-features = ["arch-qwen35", "deltanet"]
+
+[[example]]
+name = "demo_multislot_generate"
+required-features = ["arch-qwen35", "deltanet"]
+
+[[example]]
+name = "demo_concurrent_serve"
+required-features = ["arch-qwen35", "deltanet"]
 
 [[example]]
 name = "triattn_accuracy_sweep"

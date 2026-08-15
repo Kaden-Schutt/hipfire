@@ -3,6 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 #include <hip/hip_runtime.h>
+#include "kv_slot_desc.h"
 
 extern "C" __global__ void kv_cache_write_q8_0_batched(
     unsigned char* __restrict__ dst,
@@ -10,7 +11,9 @@ extern "C" __global__ void kv_cache_write_q8_0_batched(
     const int* __restrict__ positions,    // [batch_size]
     int n_kv_heads,
     int head_dim,
-    int batch_size
+    int batch_size,
+    const KvSlotDesc* __restrict__ slot_descs,  // [n_slots] or nullptr = legacy
+    const int* __restrict__ row_slot            // [batch_size] or nullptr = legacy
 ) {
     const int gid = blockIdx.x;           // Q8_0 block index within one position
     const int bid = blockIdx.y;           // batch index
@@ -20,6 +23,15 @@ extern "C" __global__ void kv_cache_write_q8_0_batched(
     const int blocks_per_head = head_dim / 32;
     const int total_blocks = n_kv_heads * blocks_per_head;
     if (gid >= total_blocks) return;
+
+    // One code path for both modes: in legacy mode we synthesise a zero-base
+    // descriptor, so the address arithmetic below is unchanged and the
+    // output is bitwise identical to the pre-SP2 kernel.
+    const int slot = (row_slot != nullptr) ? row_slot[bid] : 0;
+    const KvSlotDesc desc = (slot_descs != nullptr)
+        ? slot_descs[slot]
+        : kv_slot_legacy(0, 0);
+    const int per_pos_bytes = total_blocks * 34;
 
     const int pos = positions[bid];
     const int head_idx = gid / blocks_per_head;
@@ -39,7 +51,7 @@ extern "C" __global__ void kv_cache_write_q8_0_batched(
     int q = __float2int_rn(val * inv_scale);
     q = max(-127, min(127, q));
 
-    unsigned char* out = dst + (size_t)pos * total_blocks * 34 + gid * 34;
+    unsigned char* out = dst + kv_offset_for_k(desc, pos, per_pos_bytes) + gid * 34;
     if (tid == 0) *((_Float16*)(out)) = (_Float16)scale;
     out[2 + tid] = (unsigned char)(signed char)q;
 }
