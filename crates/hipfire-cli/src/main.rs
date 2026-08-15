@@ -3451,18 +3451,71 @@ fn respond_streaming(
         );
         finish_sse_stream(sender, result);
     });
-    request.respond(Response::new(
-        StatusCode(200),
-        vec![
-            header("Content-Type", "text/event-stream"),
-            header("Cache-Control", "no-cache"),
-            header("Connection", "keep-alive"),
-            header("Access-Control-Allow-Origin", "*"),
-        ],
-        ChannelReader::new(receiver),
-        None,
-        None,
-    ))?;
+    let mut writer = request.into_writer();
+    // Write status line + headers manually. We own the socket, so use
+    // Connection: close and close after the terminal chunk; do not emit
+    // keep-alive which we would then violate.
+    let header_bytes = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+    if writer.write_all(header_bytes).is_err() || writer.flush().is_err() {
+        // Client disconnected before headers — fail any queued ack and stop.
+        // Receiver will be dropped; sender's ack waiters see channel close as Cancelled.
+        return Ok(());
+    }
+    // Any write failure here means the client is gone; the shape of the error
+    // does not change what we do, so it is not inspected.
+    loop {
+        let chunk = match receiver.recv() {
+            Ok(c) => c,
+            Err(_) => break,
+        };
+        if chunk.fail {
+            if let Some(ack) = chunk.ack {
+                let _ = ack.send(Err(()));
+            }
+            // Unclean failure — abort; HTTP terminator still sent below
+            // so the client sees a clean HTTP EOF with incomplete SSE.
+            break;
+        }
+        if chunk.bytes.is_empty() {
+            // Empty chunks carry no wire bytes. Per contract never fire an ack for
+            // an empty chunk — drop it without sending.
+            drop(chunk.ack);
+            continue;
+        }
+        // Framed chunk: "{len:x}\r\n" + payload + "\r\n", then flush.
+        let len_hex = format!("{:x}\r\n", chunk.bytes.len());
+        let write_res = (|| -> std::io::Result<()> {
+            writer.write_all(len_hex.as_bytes())?;
+            writer.write_all(&chunk.bytes)?;
+            writer.write_all(b"\r\n")?;
+            writer.flush()?;
+            Ok(())
+        })();
+        match write_res {
+            Ok(()) => {
+                if let Some(ack) = chunk.ack {
+                    let _ = ack.send(Ok(()));
+                }
+            }
+            Err(_) => {
+                if let Some(ack) = chunk.ack {
+                    let _ = ack.send(Err(()));
+                }
+                break;
+            }
+        }
+    }
+    // Always send the HTTP chunked terminator so the HTTP body is
+    // considered complete. For clean close this is the normal end;
+    // for fail (premature EOF) the terminator makes the HTTP layer
+    // succeed, letting `read_openai_sse` see an SSE EOF without
+    // finish/DONE and return `PrematureEof` (the expected test shape)
+    // rather than a lower-level `Io(UnexpectedEof)`.
+    let _ = writer.write_all(b"0\r\n\r\n");
+    let _ = writer.flush();
+    // Dropping the writer closes the socket, which is what `Connection: close`
+    // promised; the client then sees EOF.
+    drop(writer);
     Ok(())
 }
 
