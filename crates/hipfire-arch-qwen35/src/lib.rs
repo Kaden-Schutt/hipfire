@@ -72,11 +72,12 @@ pub mod serve_engine;
 mod spec_impl;
 pub mod speculative;
 
-/// Grammar-guided decoding for qwen35 tool-call format. Independent of
-/// the deltanet feature gate — pure data-structure work, no GPU
-/// dependencies. See module docs for design and the Pi turn-12
-/// failure mode this prevents.
-pub mod grammar;
+/// Grammar-guided decoding for tool-call format — re-exported from `saddle_core::grammar::json`.
+///
+/// Unified in `saddle-core` (lean-up map B1). This re-export preserves the
+/// `hipfire_arch_qwen35::grammar` path for existing consumers while the
+/// implementation lives in `saddle_core::grammar::json`.
+pub use saddle_core::grammar::json as grammar;
 
 /// Per-token spec-decode emission (`SpecEmit`). Pure CPU; named here because it
 /// drives the qwen35 `grammar` matcher. Built via [`spec_emit::Qwen35Emit::from_ctx`].
