@@ -204,8 +204,17 @@ and methodology notice.
 | Model | Config | Decode tok/s |
 |---|---|---:|
 | Qwen2 1.5B HFQ4 | single GPU | **266** |
-| DeepSeek V4 Flash (82 GB MQ2-Lloyd) | 4× R9700, `hipfire serve --tp 4` (EP) | **25.6** |
+| DeepSeek V4 Flash (82 GB MQ2R) | 4× R9700, `hipfire serve --tp 3` (EP) | **53.1** |
+| DeepSeek V4 Flash (82 GB MQ2R) | 4× R9700, `hipfire serve --tp 4` (EP) | **54.3** |
+| DeepSeek V4 Flash (82 GB MQ2-Lloyd, superseded SKU) | 4× R9700, `hipfire serve --tp 4` (EP) | 25.6 |
 | Gemma 4 12B MQ4 | single GPU (integration branch, pre-merge) | **~47** |
+
+The DeepSeek V4 Flash rows are n=3 fresh-process medians on
+`deepseek-v4-flash-0731.mq2r` (sha256 `cbf2bbcf…`), greedy, speculation off,
+`--kv f32`, 2052-token prompt. MQ2R is the current `deepseek-v4-flash` SKU and
+roughly doubles the superseded MQ2-Lloyd row below it; benchmark against MQ2R,
+not the Lloyd figure. TP3 trades ~2% decode for ~24% faster prefill (481 vs
+389 tok/s) and leaves a fourth card free.
 
 Experimental long-context compression and eviction are opt-in. PFlash is off
 by default, TriAttention sidecars do not auto-attach, and CASK m-folding is
