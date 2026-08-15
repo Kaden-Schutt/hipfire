@@ -1,0 +1,411 @@
+# Adversarial Review — Gemma 4 Forward-as-Pipeline Migration Plan
+
+**Reviewer:** Claude (Opus 4.8)
+**Date:** 2026-06-09
+**Plan under review:** `docs/plans/gemma4_forward_as_pipeline.md`
+**Method:** Every structural claim cross-checked against the real source
+(`crates/hipfire-arch-gemma4/src/gemma4.rs`,
+`crates/hipfire-dispatch/src/pipeline/superop.rs`, and the qwen35 / LFM2 /
+MiniMax / DeepSeek-V4 reference impls). Citations below are real file:line.
+
+**Incorporates:** findings from the independent Gemini review
+(`gemma4_forward_as_pipeline_plan_rev_gemini.md`, REV-01…REV-06), each
+re-verified against source. Cross-review agreement and the two findings Gemini
+surfaced that this review originally missed (post-attn double-norm, the
+spec-decode-vs-graph-capture gate misreading) are noted inline.
+
+> **Filename note:** the requested output path ends in `.mde`, which almost
+> certainly should be `.md` (it will not render as markdown otherwise).
+> Written verbatim to the requested path; rename to `.md` before committing.
+
+---
+
+## Verdict
+
+The **substrate claims are sound** — `SuperOpKind`, `ForwardBindings`,
+`run_layer_program`, `OpBinding`, `EscapeKind::GemmaLogitSoftcap`, `OpFlavor::Act`,
+`AttnFlavor`, `ActFlavor::GeluTanhMul` all exist exactly as the plan describes, and
+the 3-step pattern (lower → bind → gate) is the genuine fleet convention. The plan
+is a faithful *port* of a pattern that already shipped default-ON for four arches.
+
+But three classes of problem make it **not yet safe to implement as written**:
+
+1. **Two concrete correctness bugs in the layer-program tables** — Full variants list
+   `Proj(V)` for a layer type that has no `v_proj` (B1), and the post-attention RMSNorm
+   is specified to run twice (B4). Both blocking, must fix before Step 1.
+2. **Several reference-implementation citations are simply wrong** (method counts,
+   opcode counts, line numbers, and a fabricated DeepSeek-V4 "6 Escape kinds"
+   claim). These don't break the build but they erode trust in the plan's grounding
+   and would mislead an implementer who pattern-matches off them.
+3. **The Full-layer attention/projection path is materially more divergent from the
+   Sliding path than the plan's opcode tables admit**, so the "factor out a shared
+   helper" framing in Step 3 understates the real work and the real risk.
+
+None of these kill the approach. The migration is worth doing and the design is the
+right one. The plan needs a revision pass on the layer-program tables and the
+reference section before it's executable.
+
+---
+
+## Blocking issues (fix before writing code)
+
+### B1. Full-layer programs list `Proj(V)`, but Full layers have **no** `v_proj`
+
+> **Cross-review:** independently flagged by Gemini as **REV-01 (Critical)** — full
+> agreement. Gemini's concrete fix is the cleanest: replace `Proj(QKV)` + `Proj(V)`
+> in the Full programs with two separate opcodes `Proj(Q)` / `Proj(K)` (each a
+> standalone `weight_gemv`), and do the `V←K` copy inside `Attend(FULL)`. This review
+> reaches the same place via B1+B3; adopt the explicit `PROJ_Q`/`PROJ_K` opcodes.
+
+
+The plan's `FullDense` / `FullMoe` programs (plan lines 188–207) both include:
+
+```
+Proj(QKV)
+Proj(V)        ← WRONG for Full layers
+```
+
+and the opcode table defines `PROJ_V = 1  // v_proj (standalone)`.
+
+In the real code, **Full layers do not have a `v_proj` weight at all.** `V` is a
+*memcpy of the pre-k_norm `K`*:
+
+```rust
+// gemma4.rs:2267-2276  (full_layer_decode_impl)
+weight_gemv(gpu, &lw.q_proj, &scratch.tmp, &scratch.q)?;
+weight_gemv(gpu, &lw.k_proj, &scratch.tmp, &scratch.k)?;
+// CRITICAL: capture pre-k_norm bytes as V before applying k_norm.
+gpu.hip.memcpy_dtod(&scratch.v.buf, &scratch.k.buf, kv_bytes)?;
+```
+
+And `FullLayerWeights` has `q_proj, k_proj, o_proj, …` but **no `v_proj` field**
+(confirmed: the struct at `gemma4.rs:297-322`). The plan's own §"Full layer"
+narrative even says `k_eq_v = true` (plan line 90) — yet the program table then
+emits `Proj(V)` anyway. The two halves of the plan contradict each other.
+
+**Consequence if implemented as written:** `run_proj(PROJ_V)` on a Full layer has no
+weight tensor to bind → panic or wrong-buffer GEMV. This is exactly the kind of
+silent attractor-inducing miscompute the coherence gate exists to catch, but it
+would also likely just crash.
+
+**Fix:** Drop `Proj(V)` from the Full programs. The V-copy is a *prep* step that
+belongs inside `run_attend(FULL)` (it must run *before* k_norm, see B2). Either:
+- fold the `memcpy(V←K)` into the `run_attend(FULL)` handler as its first action, or
+- introduce a Full-specific opcode (`ATTEND_FULL` already carries the variant, so
+  the handler can branch on it — no new SuperOp needed).
+
+### B2. The V-copy ordering constraint is a known correctness trap and the plan buries it
+
+The plan files `k_eq_v` under "Attend prelude" (plan line 192). But the real
+ordering is load-bearing and *interleaved with the projection/norm region*, not
+inside flash-attention:
+
+```
+q_proj, k_proj  →  memcpy V←K (PRE-norm)  →  q_norm, k_norm, v_norm(no-scale)  →  scale_q  →  partial_rope  →  Step::Attend
+```
+
+(`gemma4.rs:2267-2305`). The code literally comments `// CRITICAL: capture
+pre-k_norm bytes as V before applying k_norm`. If the lowered `run_attend(FULL)`
+copies V *after* k_norm (the "obvious" place if you treat it as an attention
+prelude), you get a subtly wrong V and a coherence failure that won't show up until
+long-context decode.
+
+**Fix:** The plan's Step 3 must call this out explicitly as the #1 parity risk and
+the byte-parity gate must include a Full-layer (26B) case at long context — the plan's
+Step 3 validation only mentions the **12B model, which has no Full layers** (all 30
+layers are Sliding; plan line 84 says "none on 12B"). **So Step 3 as written can pass
+100% while the entire Full-attention path is untested.** That's a validation gap that
+defeats the purpose of the staged rollout.
+
+### B3. Sliding vs Full projection dispatch is not uniform — `run_proj` must be variant-aware
+
+The plan's `run_proj` table (plan line 247) maps `QKV → execute_steps`. That's the
+**Sliding** path, which fuses q+k via `execute_steps([q, k])` + a separate
+`weight_gemv(v)` (`gemma4.rs:1988-1994`). The **Full** path uses **two separate
+`weight_gemv` calls** for q and k and no v (`gemma4.rs:2267-2268`), and the **o_proj**
+is `weight_gemv` on Full vs `execute_steps` on Sliding.
+
+The opcode alone (`PROJ_QKV`, `PROJ_O`) does **not** encode which kernel path to take.
+The handler must inspect `self.layer` (the `LayerWeights::Sliding | Full` discriminant)
+to choose. The plan never says this. It's implementable — qwen35's bindings do branch
+on `self.layer` (`qwen35.rs:12680`) — but the plan's "just match opcode → helper"
+framing (plan line 296) hides a real branch that, if missed, sends Full layers down
+the Sliding kernel path.
+
+**Fix:** State that every `run_proj` / `run_attend` arm dispatches on
+`(opcode, layer_variant)`, not opcode alone. Consider encoding the variant into the
+opcode space (e.g. `PROJ_QK_FULL` distinct from `PROJ_QKV_SLIDING`) so the program is
+self-describing and the handler can't silently take the wrong arm.
+
+### B4. Post-attention RMSNorm is specified to run **twice** (plan-internal contradiction)
+
+> **Cross-review:** surfaced by Gemini as **REV-02 (High)**; this review originally
+> missed it. Re-verified against source and confirmed real — promoting to blocking.
+
+The `SlidingDense` / `FullDense` program tables list **two** post-attn steps:
+
+```
+Norm(POST_ATTN)          — rmsnorm           (plan line 179 / 194)
+ResidualGemv(POST_ATTN)  — memcpy residual + add
+```
+
+But Step 4's prose (plan line 330) redefines the *second* one to also norm:
+
+> `RESID_POST_ATTN: memcpy residual + add_inplace + post_attn_norm + memcpy residual again`
+
+If `Norm(POST_ATTN)` does the rmsnorm **and** `run_residual_gemv(POST_ATTN)` does
+`post_attn_norm` again, the post-attention norm executes **twice** → corrupted hidden
+state → immediate parity failure. The hand path applies it exactly once
+(`gemma4.rs:2115`: `rmsnorm_f32(tmp, post_attn_norm → tmp)`), then
+memcpy `x←residual` / `add_inplace(x, tmp)` / memcpy `residual←x`
+(`gemma4.rs:2119-2131`).
+
+**Fix:** Pick one owner. Cleanest: `Norm(POST_ATTN)` owns the rmsnorm
+(writes `scratch.tmp`); `ResidualGemv(POST_ATTN)` does **only** the residual plumbing
+— `x ← residual`, `x += tmp`, `residual ← x` (the re-save that seeds the FFN/MoE
+residual stream). Delete `+ post_attn_norm` from the Step-4 prose. Same correction
+applies to the implicit `Norm(NONE)` gelu row (plan line 178) — make sure the
+activation isn't also re-applied inside `Proj(DOWN)`'s fold and the standalone row.
+
+---
+
+## Major issues (revise the plan; not necessarily code-blocking)
+
+### M1. The reference-implementation section is substantially inaccurate
+
+The plan leans on these as the proof-of-pattern. Verified against source, the
+specifics are wrong often enough to be a liability:
+
+| Plan claim | Reality | Cite |
+|---|---|---|
+| qwen35 `lower_variant` at `qwen35.rs:12490` | Line 12490 is a *comment*; the fn is at **12555** | `qwen35.rs:12555` |
+| qwen35 "`ForwardBindings` with **5 methods**" | Implements **10** methods (8 core + `run_moe_ep` + `ep_add_into_residual`) | `qwen35.rs:12616-12840` |
+| qwen35 "**8 opcodes**" | **10** opcode constants in `q35_op` | `qwen35.rs:12502-12516` |
+| LFM2 "~5 opcodes" | **2** explicit (`DENSE_GATE_UP`, `DENSE_DOWN`); Conv/Attend reuse code 0 | `lfm2.../forward.rs:540-542` |
+| DeepSeek V4 "**6 Escape kinds** for compressor/indexer/SWA" | **Zero.** `run_escape` returns `Err`; compressor/indexer/SWA are bundled **inside the `Attend` handler**, not Escapes | deepseek4 `forward.rs:2063` |
+
+The DeepSeek-V4 claim is the most damaging: a reader who copies that "Escape-per-stage"
+model for Gemma's softcap would be following a precedent that *doesn't exist*. Gemma's
+softcap-as-Escape is fine on its own merits (`EscapeKind::GemmaLogitSoftcap` is real,
+`superop.rs:123`), but the cited justification is fabricated.
+
+**Fix:** Re-derive the reference table from source, or delete the specific
+counts/line-numbers and keep only "qwen35 is the canonical 4-variant reference,
+default-ON since 2026-06-07."
+
+### M2. "Runs in parallel with the dense FFN" is misleading and risks a wrong implementation
+
+The plan repeatedly calls the MoE branch "parallel" (plan lines 96, 437). In dataflow
+terms the two branches *do* both read the post-attn residual — defensible. But the real
+`apply_moe_branch` (`gemma4.rs:1250-1508`) executes **sequentially after** the dense FFN,
+*consumes the dense output* as `cur_mlp = post_ffn_norm_1(ffn_out)`
+(`gemma4.rs:1269`), and produces the combined `cur_mlp + cur_moe`, then the outer
+post-FFN norm, internally (`gemma4.rs:1501-1505`). The caller then adds the residual
+and scales (`gemma4.rs:2175-2184`).
+
+Critically: on MoE layers the standalone `post_feedforward_layernorm` is **skipped** —
+`apply_moe_branch` subsumes it (`gemma4.rs:2168-2173`). The plan's `SlidingMoe` table
+does correctly drop the standalone `Norm(POST_FFN)` and replace it with
+`Moe(MOE_BRANCH)` — good — but anyone reading "parallel" might (a) try to wire a second
+stream, or (b) re-emit the post-FFN norm and double-normalize. State explicitly:
+`run_moe` must encapsulate *both sandwich norms + the cur_mlp/cur_moe combination + the
+outer norm*, and the trailing `ResidualGemv(POST_FFN)` does only the final
+`residual + tmp` add and `scale(layer_scalar)`.
+
+**Corollary (Gemini REV-03, verified):** the plan's Step 5 says to "adjust
+`RESID_POST_FFN` to handle the MoE variant (`x = cur_mlp + moe_out + residual`)." That
+adjustment is **unnecessary**. Because `apply_moe_branch` already leaves
+`scratch.tmp = post_ffn_norm(cur_mlp + cur_moe)` (`gemma4.rs:1501-1505`), the
+layer-level residual op is `x = residual + tmp` — **byte-for-byte identical** to the
+dense path. Keep `run_residual_gemv(POST_FFN)` *the same* for dense and MoE; do **not**
+add a MoE-specific branch. A divergent branch here is both redundant and a fresh
+opportunity to desync from the hand path. Drop the Step-5 "adjust RESID_POST_FFN" item.
+
+### M3. `gelu_tanh + mul` recommendation (Option B) is fine — but note qwen35 can't be the template here
+
+The plan correctly identifies that qwen35's `weight_gemv_swiglu_residual`
+(real: `qwen35.rs:12680`, `RESID_DOWN_SWIGLU` opcode `qwen35.rs:12510`) is **SiLU**, not
+GeLU-tanh, and recommends folding `gelu_tanh + mul` into the `Proj(DOWN)` handler
+(Option B). That's the right call and matches the hand path
+(`gemma4.rs:2149-2155`: `gelu_tanh_f32` → `mul_f32` → down GEMV). ✅
+
+One refinement: `ActFlavor::GeluTanhMul` **already exists** (`superop.rs:70`). If you
+want the program self-describing later, the down-proj `OpBinding` can carry
+`OpFlavor::Act(GeluTanhMul)` instead of an implicit fold. Not required for v1 — just
+note it so the "Non-goals → AttnFlavor population" follow-up knows the activation
+flavor is also available, not just the attention flavor.
+
+---
+
+## Minor issues / nits
+
+- **N1 — opcode-in-`weights[0]` claim is CORRECT (do not "fix" it).** The plan says the
+  opcode lives in `weights[0]` (plan line 25). One might object that `OpBinding` has no
+  opcode field — but the fleet convention is exactly to stash it as `weights:
+  vec![WeightSlot(code)]` (`qwen35.rs:12545`, doc-commented at `qwen35.rs:12497`:
+  "encoded into `OpBinding.weights[0].0`"). The plan is right. Flagging only because a
+  cursory struct read makes it look wrong.
+
+- **N2 — Dead opcodes.** `PROJ_LM_HEAD` (=5) and `NORM_FINAL` (=4) are defined but never
+  placed in any `LayerProgram`; the plan's own §"Output stage" runs the final
+  norm + lm_head + softcap *outside* `run_layer_program` via direct `execute_steps`
+  (plan lines 257-272), matching qwen35 (`qwen35.rs:12038-12046`). So those two opcodes
+  are unreachable. Harmless but confusing — either delete them or actually build a
+  one-shot "output program" and route through it.
+
+- **N3 — Output-stage pseudocode field names check out.** `weights.final_norm`
+  (`gemma4.rs:388`, used at `:1855`) and `weights.lm_head` (`:386`, used at `:1869`) are
+  the real field names; `scratch.tmp` / `scratch.logits` are real. The plan's output
+  snippet (plan lines 263-272) will compile close to as-is. Good. Note `lm_head`
+  **aliases** `embed_tokens` when tied (`gemma4.rs:382, 747-758`) — the handler must use
+  `lm_head.dispatch_ref()` (as the plan does), not re-load.
+
+- **N4 — Sliding v_norm is also no-scale; plan's layer pseudocode implies a learned
+  weight.** Plan line 66 shows `v = v_norm(v)` for the Sliding layer as if there's a
+  learned `v_norm`. There isn't — `SlidingLayerWeights` has `q_norm`/`k_norm` but **no**
+  `v_norm`; both Sliding and Full use the shared no-scale `scratch.v_norm_ones_full`
+  ones-buffer (`gemma4.rs:2009-2010` and `2282-2283`). The Attend table (plan line 321)
+  gets this right for Sliding but the narrative §"Sliding layer" oversells it. Cosmetic.
+
+- **N5 — `Gemma4Scratch` sketch omits `v_norm_ones_full` and all `pb_*`/`moe_*_batch`
+  buffers.** The bindings struct will need access to `v_norm_ones_full`; it's a real
+  field the plan's struct sketch (plan line 230) doesn't mention. Make sure the
+  bindings borrow the full `&Gemma4Scratch`, not a hand-picked subset.
+
+- **N6 — Cargo.toml "add hipfire-dispatch if not already present" is moot — it's already
+  a dependency.** gemma4.rs already imports `execute_steps`, `Step`, `GemvInput`,
+  `KvTierPlan`, `AttnParams`, `DispatchCtx` (`gemma4.rs:21` region). The dep exists; the
+  plan's File-changes row overstates the work.
+
+- **N7 — The "gate off for graph-capture" mitigation misreads the qwen35 precedent
+  (Gemini REV-04, verified — upgraded).** The plan's risk row says "Gate off for
+  graph-capture mode (same as qwen35: `hidden_rb.is_none()` equivalent)" (plan line 438).
+  That conflates two unrelated things. qwen35's real gate is
+  `forward_lowered_enabled() && hidden_rb.is_none()` (`qwen35.rs:11616`), and its own
+  comment says the lowered path is skipped only "when a hidden-state ring buffer is
+  active (**spec-decode capture** engages only the hand path for now)" — i.e. the
+  `hidden_rb` gate is about **DFlash draft/verify**, *not* hipGraph capture. So the
+  qwen35 precedent does **not** justify gating the lowered path off under graph capture.
+  Gemma 4 has no equivalent `HiddenStateRingBuffer` spec-decode path, so this bypass
+  has nothing to gate on; don't invent one.
+  *Caveat on Gemini's stronger claim:* Gemini says qwen35 "successfully records and
+  replays the lowered path" under graph capture — unproven. `use_graph` is hardwired
+  `false` in **both** qwen35 (`qwen35.rs:5342`) and gemma4
+  (`!false /* graph-capture-not-wired */`, ~`gemma4.rs:1769`), so graph-capture
+  compatibility of the lowered path is **untested everywhere**. Net: drop the
+  "gate off for graph capture" risk row (it's based on a misreading), but do **not**
+  assume graph+lowered is validated — it isn't, in any arch. If/when gemma4 graph
+  capture is wired, that combination needs its own parity check.
+
+---
+
+- **N8 — Prefill is mischaracterized as "latency-dominated" (Gemini REV-05).** The
+  Non-goals section (plan line 397) defers prefill because "prefill is latency-dominated,
+  not throughput-dominated." That's backwards: **prefill** ingests many tokens at once →
+  compute-bound → **throughput-dominated**; **decode** is one-token → bandwidth-bound →
+  **latency-dominated**. The *decision* to defer prefill is still correct, but for the
+  right reason: the per-resolve overhead amortizes over many tokens, so it's negligible
+  per token. Fix the justification, keep the deferral.
+
+- **N9 — `forward_scratch_layers` is a qwen35 name; gemma4's is `forward_scratch` /
+  `forward_scratch_inner` (Gemini REV-06).** The plan references `forward_scratch_layers`
+  as the gate site and removal target (Steps 1, 8, 9; plan lines 286, 412). That symbol
+  does not exist in gemma4 — the entry is `forward_scratch` (`gemma4.rs:1704`) and the
+  per-layer loop is `forward_scratch_inner` (`gemma4.rs:1807`). Update the plan's symbol
+  references so an implementer greps the right function. (This review's earlier agent
+  pass also caught this; calling it out explicitly here.)
+
+## Process / validation concerns
+
+### P1. "Byte-identical" is asserted as the goal but the gate accepts "within epsilon"
+
+The Goal (plan line 14) and Steps 3-5 say "byte-identical output." But Step 7's gate
+criterion (plan line 370) softens to "byte-identical *(or within floating-point
+epsilon)*" and then falls back to "identical *token sequences*." Those are three
+different bars. qwen35 achieved genuine **byte-identical-to-hand-path** parity because
+the lowered path issues the *same kernels in the same order*. Gemma can hit the same bar
+**iff** the handlers preserve kernel-call order exactly (esp. the residual save/restore
+and the V-copy ordering, B2).
+
+**Recommendation:** Commit to *bit-exact kernel-call equivalence* as the **design
+invariant** (not "epsilon"), because (a) it's achievable here and (b) "within epsilon"
+greedy decode can still diverge into a different argmax → different token → cascading
+divergence (cf. `feedback_attention_precision`: 5% attn error → attractor within ~10
+tokens). The token-sequence check is the *symptom* gate; bit-exact logits is the
+*mechanism* gate. Keep both, but don't let "epsilon" become the accepted standard.
+
+### P2. The staged validation under-covers the Full path and MoE (see B2)
+
+- Step 2 & 3 validate on **12B**, which is **all-Sliding** — the Full path (head_dim=512,
+  partial rope, k_eq_v, n_kv=1, asym3 KV cache) gets **zero coverage** until Step 5's
+  26B run. Two of the highest-risk handlers (Full attend, the V-copy ordering) are
+  validated last and only once.
+- **Recommendation:** Add a 26B-A4B short-context parity check at **Step 3** (right after
+  `run_attend` lands), gated to exercise at least the 5 Full layers, before moving on.
+  The cost is one extra bench; the payoff is catching B1/B2 the moment Attend is wired
+  rather than three steps later tangled with MoE.
+
+### P3. Coherence gate is mandatory here and the plan doesn't mention it
+
+This change touches dispatch + forward pass → per CLAUDE.md it **must** pass
+`./scripts/coherence-gate.sh` before each commit, and there's a pre-commit hook. The
+plan's Step 7 invents a bespoke "5 consecutive identical runs" gate but never references
+the existing mandatory coherence battery. Use the existing gate (it's the project
+standard and the committer eyeballs fluency/loops); the bespoke parity harness is a
+*supplement* for logit-diffing, not a replacement.
+
+### P4. Effort estimate is optimistic on Steps 3-4
+
+"~600 lines, mostly boilerplate" undersells Step 3 (two genuinely different attention
+paths with the V-copy ordering trap) and Step 4 (Gemma's sandwich-norm residual has
+more save/restore points than qwen35's single residual — the plan itself flags this at
+line 336 as "the trickiest part"). The boilerplate framing sits awkwardly next to "the
+trickiest part." Reset expectations: Steps 1-2 and 5-6 are boilerplate; Steps 3-4 are
+the real engineering and where parity will break first.
+
+---
+
+## Things the plan gets right (credit where due)
+
+- Substrate API surface is described accurately: `SuperOpKind` (8 variants),
+  `ForwardBindings` (8 core methods + 2 EP defaults that correctly stay `Err`),
+  `run_layer_program`, `OpBinding`, `LayerProgram = Vec<SuperOp>`,
+  `EscapeKind::GemmaLogitSoftcap`, `OpFlavor::Act(ActFlavor::GeluTanhMul)`,
+  `AttnFlavor` — all real, all as described.
+- The opcode-in-`weights[0]` convention (N1) and the separate output-stage handling
+  (N3) match qwen35 exactly.
+- The default-OFF → byte-parity → default-ON → remove-hand-path rollout mirrors the
+  proven qwen35 sequence (`HIPFIRE_FORWARD_LOWERED`, OnceLock, `!= Some("0")`).
+- Non-goals (EP, prefill, AttnFlavor population, slot binding) are correctly scoped out;
+  leaving `run_moe_ep`/`ep_add_into_residual` at their `Err` defaults is right.
+- The `gelu_tanh + mul → Proj(DOWN)` fold (Option B) is the correct choice and correctly
+  reasoned (qwen35's swiglu helper is SiLU, not reusable).
+
+---
+
+## Required edits before this plan is executable
+
+1. **B1 (= Gemini REV-01):** Remove `Proj(V)` from `FullDense`/`FullMoe`; use separate
+   `PROJ_Q`/`PROJ_K` opcodes (each `weight_gemv`); fold the `memcpy(V←K)` into
+   `run_attend(FULL)` (before k_norm).
+2. **B2:** Document the pre-k_norm V-capture ordering as the #1 parity risk; add a Full
+   layer to the Step-3 byte-parity gate.
+3. **B3:** State that `run_proj`/`run_attend` dispatch on `(opcode, layer_variant)`;
+   consider variant-distinct opcodes so programs are self-describing.
+4. **B4 (= Gemini REV-02):** Delete `+ post_attn_norm` from the Step-4 `RESID_POST_ATTN`
+   prose so the post-attention norm runs once; `Norm(POST_ATTN)` owns it,
+   `ResidualGemv(POST_ATTN)` does only residual plumbing.
+5. **M1:** Correct or remove the reference-impl counts/line-numbers; delete the
+   DeepSeek-V4 "6 Escape kinds" claim entirely.
+6. **M2 (incl. Gemini REV-03):** Replace "runs in parallel" with the actual sequential
+   consume-dense-then-combine semantics; spell out what `run_moe` must encapsulate; drop
+   the Step-5 "adjust RESID_POST_FFN for MoE" item (it's identical to the dense path).
+7. **N7 (= Gemini REV-04):** Drop the "gate off for graph capture" risk row — it misreads
+   qwen35's `hidden_rb` (spec-decode) gate; don't assume graph+lowered is validated.
+8. **N8/N9 (= Gemini REV-05/06):** Fix the prefill throughput-vs-latency wording; rename
+   `forward_scratch_layers` → `forward_scratch` / `forward_scratch_inner`.
+9. **P1-P3:** Commit to bit-exact kernel-call parity as the invariant; add 26B/Full
+   coverage at Step 3; route validation through the mandatory `coherence-gate.sh`.
+
+With those edits the approach is sound and worth executing. The design is correct; the
+plan's *bill of materials* just doesn't yet match the territory.

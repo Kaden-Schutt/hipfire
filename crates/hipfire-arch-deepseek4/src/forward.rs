@@ -3083,13 +3083,8 @@ fn compressor_forward_impl(
     }
     comp_dbg_commit_row(&*gpu, "kv_cache(rope)");
     if cache_is_f16 {
-        gpu.cast_f32_to_f16_at_slot_buf(
-            commit_f32,
-            kv_cache,
-            &commit_slot_buf,
-            head_dim as i32,
-        )
-        .map_err(|e| format!("comp cache f16 store buf l{layer_idx}: {e:?}"))?;
+        gpu.cast_f32_to_f16_at_slot_buf(commit_f32, kv_cache, &commit_slot_buf, head_dim as i32)
+            .map_err(|e| format!("comp cache f16 store buf l{layer_idx}: {e:?}"))?;
     }
     if overlap {
         gpu.state_overlap_shift_f32_buf(kv_state, &shift_slot_buf, ratio as i32, proj_dim as i32)
@@ -12592,9 +12587,7 @@ fn attention_block_batched_mixed(
                         batch_size as i32,
                     )
                     .map_err(|e| {
-                        format!(
-                            "deepseek4_topk_kv_gather_batched_tiled_f16 l{layer_idx}: {e:?}"
-                        )
+                        format!("deepseek4_topk_kv_gather_batched_tiled_f16 l{layer_idx}: {e:?}")
                     })?;
                 } else if tiled_gfx1201 || tiled_gfx1151 {
                     gpu.deepseek4_topk_kv_gather_batched_tiled_gfx1201(

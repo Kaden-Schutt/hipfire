@@ -15,8 +15,10 @@ pub mod spec_build;
 use hipfire_arch_cohere2moe as cohere2moe;
 use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_dots_ocr::dots_ocr;
+use hipfire_arch_gemma4 as gemma4;
 use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_minimax as minimax;
+use hipfire_arch_muse_glimmer as glimmer;
 use hipfire_arch_qwen2::qwen2;
 use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35ScratchSet};
 use hipfire_arch_qwen35::speculative::DeltaNetSnapshot;
@@ -103,6 +105,8 @@ const REGISTRY: &[&dyn Carrier] = &[
     &MinimaxCarrier,
     &Lfm2MoeCarrier,
     &Cohere2MoeCarrier,
+    &Gemma4Carrier,
+    &MuseGlimmerCarrier,
 ];
 
 // ─── Constants ────────────────────────────────────────────────────────
@@ -115,6 +119,9 @@ const FROGGERIC_QWEN35_TEMPLATE: &str =
 /// Built-in LFM2.5 chat template.
 const LFM2_TEMPLATE: &str =
     include_str!("../../hipfire-runtime/templates/eval/lfm2-liquidai.jinja");
+
+/// Built-in Gemma 4 IT chat template (arch_id=13).
+const GEMMA4_TEMPLATE: &str = include_str!("../../hipfire-runtime/templates/gemma-4-it.jinja");
 
 // ─── Eviction policy wrapper ──────────────────────────────────────────
 
@@ -166,7 +173,7 @@ impl Eviction {
 /// Per-turn token cache for V4F prefix-cache stability.
 pub struct AsstTurnCache {
     cap: Option<usize>,
-    map: std::collections::HashMap<u64, Vec<u32>>,
+    map: std::collections::HashMap<u64, hipfire_runtime::prompt_frame::CachedAssistantTurn>,
     order: std::collections::VecDeque<u64>,
 }
 
@@ -204,7 +211,7 @@ impl AsstTurnCache {
         self.map.contains_key(fp)
     }
 
-    pub fn get(&mut self, fp: &u64) -> Option<&Vec<u32>> {
+    pub fn get(&mut self, fp: &u64) -> Option<&hipfire_runtime::prompt_frame::CachedAssistantTurn> {
         if self.map.contains_key(fp) {
             self.touch_mru(*fp);
             self.map.get(fp)
@@ -213,9 +220,9 @@ impl AsstTurnCache {
         }
     }
 
-    pub fn insert(&mut self, fp: u64, tokens: Vec<u32>) {
+    pub fn insert(&mut self, fp: u64, turn: hipfire_runtime::prompt_frame::CachedAssistantTurn) {
         if self.map.contains_key(&fp) {
-            self.map.insert(fp, tokens);
+            self.map.insert(fp, turn);
             self.touch_mru(fp);
             return;
         }
@@ -228,7 +235,7 @@ impl AsstTurnCache {
                 }
             }
         }
-        self.map.insert(fp, tokens);
+        self.map.insert(fp, turn);
         self.order.push_back(fp);
     }
 
@@ -261,8 +268,11 @@ pub enum ModelState {
     Lfm2Moe(Lfm2MoeBundle),
     Minimax(MiniMaxBundle),
     Cohere2Moe(Cohere2MoeBundle),
+    Gemma4(Gemma4Bundle),
+    Gemma4Lowered(Gemma4LoweredBundle),
     Deepseek4(hipfire_arch_deepseek4::Deepseek4Bundle),
     Deepseek4Heterogeneous(Deepseek4HeterogeneousBundle),
+    MuseGlimmer(MuseGlimmerBundle),
 }
 
 /// Self-owned gfx1100+dense / gfx1151+routed DeepSeek V4 state. The model
@@ -291,6 +301,249 @@ pub use minimax::MiniMaxBundle;
 /// n-gram verify seam) lives next to the forward it drives (orphan rule).
 /// Field-identical to the prior loader-local struct.
 pub use cohere2moe::Cohere2MoeBundle;
+
+/// Gemma 4 EAGLE speculative-decode scratch state (arch-22 drafter riding an
+/// arch-13 target). Populated only when `LoadCtx::gemma4_drafter_path` is
+/// `Some`. The drafter has NO KV cache of its own — it queries the target's
+/// KV at a constant position, so the only per-session state is the target's
+/// `Gemma4State` plus this scratch. Mirrors the PR's `Gemma4EagleState`.
+pub struct Gemma4EagleState {
+    pub drafter_config: gemma4::drafter::Gemma4DrafterConfig,
+    pub drafter_weights: gemma4::drafter::Gemma4DrafterWeights,
+    pub drafter_scratch: gemma4::drafter::Gemma4DrafterScratch,
+    /// Reusable seed/draft/verify hidden buffers for `spec_step_gemma4_eagle`,
+    /// sized for `draft_len` at load time.
+    pub spec_scratch: gemma4::speculative::Gemma4SpecScratch,
+    /// Drafts per round (verify block = draft_len + 1).
+    pub draft_len: usize,
+}
+
+/// Gemma 4 dense text (arch_id=13) GPU bundle — eager dense path. Re-exported
+/// from the arch crate, which owns config/weights/state so `impl SpecTarget`
+/// can live there when needed. The `eagle` field holds the optional EAGLE
+/// drafter state (arch-22) when `gemma4_drafter_path` was supplied; `None`
+/// is AR-only. This keeps one `ModelState::Gemma4` variant for the dense
+/// path, matching beta's pattern for other arches.
+pub struct Gemma4Bundle {
+    pub config: gemma4::config::Gemma4Config,
+    pub weights: gemma4::gemma4::Gemma4Weights,
+    pub state: gemma4::gemma4::Gemma4State,
+    pub eos_tok: u32,
+    pub eagle: Option<Gemma4EagleState>,
+}
+
+/// Lowered / MoE Gemma 4 execution bundle (arch_id=13 26B-A4B + opt-in
+/// batched/WMMA dense prefill). Uses `lowered::{Gemma4Config, Gemma4Weights,
+/// Gemma4Scratch}` plus TWO `hipfire_runtime::llama::KvCache`s (q8
+/// ring-buffered sliding + asym3 full) and `eos_tok`. Mutually exclusive
+/// with `Gemma4Bundle` (eager) via the `ModelState` enum — a given
+/// `LoadedModel` populates exactly one of the two variants.
+/// Chose second `ModelState` variant over enum-inside-bundle to keep
+/// `Gemma4Bundle`'s struct shape stable for the existing eager AR path that
+/// `Gemma4Generate` already matches as `Some(ModelState::Gemma4(bundle))`.
+pub struct Gemma4LoweredBundle {
+    pub config: gemma4::lowered::Gemma4Config,
+    pub weights: gemma4::lowered::Gemma4Weights,
+    pub scratch: gemma4::lowered::Gemma4Scratch,
+    pub kv_sliding: llama::KvCache,
+    pub kv_full: llama::KvCache,
+    pub eos_tok: u32,
+}
+
+/// Muse Glimmer 30B dense text (arch_id=14) GPU bundle — eager dense path.
+/// Mirrors Gemma4Bundle exactly (per cross-agent contract).
+pub struct MuseGlimmerBundle {
+    pub config: glimmer::config::GlimmerConfig,
+    pub weights: glimmer::glimmer::GlimmerWeights,
+    pub state: glimmer::glimmer::GlimmerState,
+    pub eos_tok: u32,
+    /// Optional DFlash drafter (arch 23, 5-layer diffusion) loaded when
+    /// `HIPFIRE_DFLASH_DRAFT` (or `params.draft`) is set. OFF by default
+    /// (`dflash_mode=off` forces `ctx.draft_path=None`). When `None`, the
+    /// daemon runs AR-only; when `Some`, the target can be driven via the
+    /// generic DFlash `Speculator` (see `carriers.rs`).
+    pub drafter: Option<GlimmerDrafterBundle>,
+    /// Host-side target hidden history for DFlash: per-position concat of
+    /// residual hidden at target_layer_ids [1,13,25,37,49] (5*6656=33280 f32/pos)
+    /// in that order. Grows by 1 row per committed token; used as
+    /// `target_hidden` input to the drafter's encoder.fc. Empty until first
+    /// prefill completes. Order matches the concat the drafter's fc expects —
+    /// mixing layers silently degrades tau.
+    ///
+    /// Authoritative only when device hidden capture is disabled. When the
+    /// device log is enabled, that log is the source of truth and this vector
+    /// is retained solely as an exact host fallback (session rewind must not
+    /// mutate it in device mode).
+    pub target_hidden_host: Vec<f32>,
+}
+
+impl MuseGlimmerBundle {
+    /// f32 elements per captured position (`num_extract * hidden`), or `None`
+    /// when no DFlash drafter is loaded.
+    #[inline]
+    pub fn capture_row_elems(&self) -> Option<usize> {
+        self.drafter
+            .as_ref()
+            .map(|d| d.config.num_extract() * d.config.hidden)
+    }
+
+    /// Full session reset: target KV cursor + device log metadata, host capture
+    /// vector, and drafter absolute history watermarks.
+    pub fn reset_session_state(&mut self) {
+        self.state.reset();
+        self.target_hidden_host.clear();
+        if let Some(d) = self.drafter.as_mut() {
+            d.scratch.reset_history();
+        }
+    }
+
+    /// Whether [`Self::rewind_session_to`] can safely land on `target`.
+    ///
+    /// Rejects `target > state.n_tokens`. Device capture requires an Idle log
+    /// that still retains `target` in its ring. Host-backed DFlash requires the
+    /// host vector to be an exact whole-row packing of the current
+    /// `state.n_tokens` (no gap/partial row) with at least `target` rows. With
+    /// no drafter, rewind is target-KV-only and always allowed within range.
+    pub fn can_rewind_session_to(&self, target: usize) -> bool {
+        if target > self.state.n_tokens {
+            return false;
+        }
+        if self.state.device_hidden_capture_enabled() {
+            return self
+                .state
+                .target_hidden_log()
+                .map(|log| log.can_rewind_to(target))
+                .unwrap_or(false);
+        }
+        match self.capture_row_elems() {
+            None => true,
+            Some(row_elems) => {
+                if row_elems == 0 {
+                    return false;
+                }
+                let host_len = self.target_hidden_host.len();
+                if host_len % row_elems != 0 {
+                    return false;
+                }
+                let host_rows = host_len / row_elems;
+                host_rows >= target && host_rows == self.state.n_tokens
+            }
+        }
+    }
+
+    /// Rewind target KV (+ device log when enabled), host capture (host-backed
+    /// DFlash only), and drafter history to `target`.
+    ///
+    /// All fallible checks run before any mutation. Device mode never touches
+    /// `target_hidden_host`. On success: `state.n_tokens == target`, device log
+    /// end == target when enabled, host rows == target when host-backed+dflash,
+    /// and drafter `kv_abs_end <= target`.
+    pub fn rewind_session_to(&mut self, target: usize) -> Result<(), String> {
+        if !self.can_rewind_session_to(target) {
+            return Err(format!(
+                "muse glimmer: cannot rewind session to {target} (n_tokens={}, device_capture={})",
+                self.state.n_tokens,
+                self.state.device_hidden_capture_enabled()
+            ));
+        }
+
+        // Compute host truncate length before mutating anything.
+        let host_new_len = if self.state.device_hidden_capture_enabled() {
+            None
+        } else if let Some(row_elems) = self.capture_row_elems() {
+            let new_len = target.checked_mul(row_elems).ok_or_else(|| {
+                format!(
+                    "muse glimmer: host capture truncate overflow target={target} row_elems={row_elems}"
+                )
+            })?;
+            Some(new_len)
+        } else {
+            None
+        };
+
+        glimmer::forward::rollback_to(&mut self.state, target)?;
+
+        if let Some(new_len) = host_new_len {
+            self.target_hidden_host.truncate(new_len);
+        }
+        if let Some(d) = self.drafter.as_mut() {
+            d.scratch.rewind_history(target);
+        }
+        Ok(())
+    }
+
+    /// Current target KV cursor (`state.n_tokens`).
+    #[inline]
+    pub fn n_tokens(&self) -> usize {
+        self.state.n_tokens
+    }
+
+    /// Whether the device hidden-capture log is installed on the target state.
+    #[inline]
+    pub fn device_hidden_capture_enabled(&self) -> bool {
+        self.state.device_hidden_capture_enabled()
+    }
+
+    /// Committed absolute end of the device hidden log, when installed.
+    #[inline]
+    pub fn device_hidden_log_end(&self) -> Option<usize> {
+        self.state
+            .target_hidden_log()
+            .map(|log| log.committed_abs_end())
+    }
+
+    /// Drafter scratch ctx capacity (`None` without a drafter).
+    #[inline]
+    pub fn drafter_ctx_capacity(&self) -> Option<usize> {
+        self.drafter.as_ref().map(|d| d.scratch.ctx_capacity())
+    }
+
+    /// Host-backed capture row count when `capture_row_elems` is known and the
+    /// host vector is an exact whole-row packing; otherwise `None`.
+    #[inline]
+    pub fn host_capture_rows(&self) -> Option<usize> {
+        let row_elems = self.capture_row_elems()?;
+        if row_elems == 0 || self.target_hidden_host.len() % row_elems != 0 {
+            return None;
+        }
+        Some(self.target_hidden_host.len() / row_elems)
+    }
+}
+
+/// Muse Glimmer DFlash drafter (arch 23) — `muse_glimmer_assistant` 5-layer
+/// diffusion draft head (encoder.fc + output_norm_enc, block 16, mask 201818,
+/// target_layer_ids [1,13,25,37,49]). No embed/lm_head (uses target's).
+/// Stored alongside the arch-14 target when `HIPFIRE_DFLASH_DRAFT` is set.
+pub struct GlimmerDrafterBundle {
+    pub config: glimmer::drafter::GlimmerDrafterConfig,
+    pub weights: glimmer::drafter::GlimmerDrafterWeights,
+    /// Scratch sized to `max_seq` (target's ctx capacity). Allocated once at
+    /// load time, freed on unload.
+    pub scratch: glimmer::drafter::GlimmerDrafterScratch,
+}
+
+/// v1 draft length for gemma4 EAGLE (`params.spec`). dl=3 is the validated
+/// config.
+pub const GEMMA4_EAGLE_DRAFT_LEN: usize = 3;
+
+/// Gate for the `params.spec` knob: draft_len 1..=5 accepted; absent means
+/// the validated default (`GEMMA4_EAGLE_DRAFT_LEN` = 3). Mirrors the PR's
+/// `gemma4_eagle_spec_len` — refuse-don't-degrade for unvalidated lengths.
+pub fn gemma4_eagle_spec_len(spec: Option<u64>) -> Result<usize, String> {
+    match spec {
+        None => Ok(GEMMA4_EAGLE_DRAFT_LEN),
+        Some(n) if (1..=5).contains(&n) => Ok(n as usize),
+        Some(n) => Err(format!(
+            "gemma4 EAGLE supports spec=1..=5 (draft_len; default 3, dl <= 5              parity-validated on gfx1201); got spec={n} — reload with a              supported spec or drop params.drafter."
+        )),
+    }
+}
+
+/// Env opt-in for the gemma4 batched/WMMA prefill
+/// (`HIPFIRE_BATCHED_PREFILL=1` / `HIPFIRE_WMMA_PREFILL=1`).
+pub fn gemma4_batched_prefill_optin(_gpu: &Gpu) -> bool {
+    gemma4::lowered::batched_prefill_enabled() || gemma4::lowered::wmma_prefill_enabled()
+}
 
 // ─── LoadedModel ──────────────────────────────────────────────────────
 
@@ -657,6 +910,79 @@ fn resolve_chat_template(hfq: &HfqFile, model_path: &str) -> Option<String> {
     hfq.chat_template()
 }
 
+/// Rewrite the Onyx/Harmony chat template for Muse Glimmer (arch 14) so
+/// its tool accessors match the flat `prompt_frame::ToolCall` (`tc.name`,
+/// `tc.arguments`) and so a spliced cached tool body (`tc.rendered_body`)
+/// replaces the regenerated ATEM text. Validates substitution counts and
+/// fails loudly on upstream drift (a silent miss would revive the present
+/// bug where the whole render raises and falls back to a bare unframed
+/// prompt).
+pub fn rewrite_muse_glimmer_onyx_template(template: &str) -> Result<String, String> {
+    // Validate and count upstream accessor forms before mutating.
+    let name_count = template.matches("tc.function.name").count();
+    if name_count != 3 {
+        return Err(format!(
+            "muse_glimmer Onyx template rewrite: expected 3 occurrences of `tc.function.name`, found {name_count}; upstream template drift?"
+        ));
+    }
+    let args_count = template.matches("tc.function.arguments").count();
+    if args_count != 1 {
+        return Err(format!(
+            "muse_glimmer Onyx template rewrite: expected 1 occurrence of `tc.function.arguments`, found {args_count}; upstream template drift?"
+        ));
+    }
+    let header = "{%- macro render_atem(tc) -%}";
+    let header_count = template.matches(header).count();
+    if header_count != 1 {
+        return Err(format!(
+            "muse_glimmer Onyx template rewrite: expected 1 `render_atem` header, found {header_count}; upstream template drift?"
+        ));
+    }
+    let tail = "{{- '</atem:invoke>\\n</atem:function_calls>' -}}{%- endmacro -%}";
+    let tail_count = template.matches(tail).count();
+    if tail_count != 2 {
+        return Err(format!(
+            "muse_glimmer Onyx template rewrite: expected 2 ATEM tails, found {tail_count}; upstream template drift?"
+        ));
+    }
+
+    // Flat accessors.
+    let mut out = template
+        .replace("tc.function.name", "tc.name")
+        .replace("tc.function.arguments", "tc.arguments");
+
+    // Verbatim splice branch: if a cached body was spliced as `rendered_body`,
+    // emit it directly, otherwise render the ATEM XML.
+    out = out.replacen(
+        header,
+        &format!(
+            "{}{}",
+            header,
+            "{%- if tc.rendered_body is defined and tc.rendered_body -%}{{- tc.rendered_body -}}{%- else -%}"
+        ),
+        1,
+    );
+    out = out.replacen(
+        tail,
+        "{{- '</atem:invoke>\\n</atem:function_calls>' -}}{%- endif -%}{%- endmacro -%}",
+        1,
+    );
+
+    // Post-condition: no leftover nested accessor, branch present.
+    if out.contains("tc.function.") {
+        return Err(
+            "muse_glimmer Onyx template rewrite: leftover `tc.function.` after rewrite".into(),
+        );
+    }
+    if !out.contains("tc.rendered_body") {
+        return Err(
+            "muse_glimmer Onyx template rewrite: missing `tc.rendered_body` branch after rewrite"
+                .into(),
+        );
+    }
+    Ok(out)
+}
+
 pub(crate) fn parse_state_quant(
     mode: Option<&str>,
 ) -> Result<hipfire_arch_qwen35::qwen35::StateQuant, String> {
@@ -701,6 +1027,7 @@ fn rollback_unfinished_qwen35(
 fn build_qwen35_eviction(
     config: &hipfire_arch_qwen35::qwen35::Qwen35Config,
     physical_cap: usize,
+    activation_gate: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ctx: &mut LoadCtx,
 ) -> Result<Option<Eviction>, String> {
     use hipfire_arch_qwen35::qwen35::LayerType;
@@ -740,7 +1067,7 @@ fn build_qwen35_eviction(
         return Ok(None);
     }
     let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
-    let base = EvictionCtx::new(
+    let mut base = EvictionCtx::new(
         ctx.gpu,
         &centers,
         fa_layer_ids,
@@ -754,6 +1081,9 @@ fn build_qwen35_eviction(
         physical_cap,
     )
     .map_err(|e| format!("build EvictionCtx: {e}"))?;
+    if let Some(gate) = activation_gate {
+        base.set_activation_gate(gate);
+    }
     if ctx.cask.cask_m_folding {
         eprintln!(
             "  eviction: CASK α={:.2} m={} budget={} β={} physical_cap={}",
@@ -790,7 +1120,11 @@ fn finish_qwen35_load(
 ) -> Result<LoadedModel, String> {
     // ── Eviction (only hard-error stage before publish) ────────────
     // Built before long-lived borrows so rollback can move `bundle`.
-    let eviction = match build_qwen35_eviction(&bundle.config, physical_cap, ctx) {
+    let activation_gate = bundle
+        .kv_adaptive
+        .as_ref()
+        .and_then(|adaptive| adaptive.eviction_gate());
+    let eviction = match build_qwen35_eviction(&bundle.config, physical_cap, activation_gate, ctx) {
         Ok(e) => e,
         Err(e) => {
             return Err(rollback_unfinished_qwen35(
@@ -1268,6 +1602,8 @@ pub fn load_model_with_kv_backend(
         pp,
         spec,
         gpu,
+        gemma4_drafter_path: None,
+        gemma4_draft_len: GEMMA4_EAGLE_DRAFT_LEN,
     };
 
     // Carrier registry dispatch. Collect all matches so an overlap between
@@ -1285,9 +1621,11 @@ pub fn load_model_with_kv_backend(
             other.name()
         ));
     }
-    if kv_backend == KvBackend::Vmm && !matches!(carrier.name(), "qwen35" | "deepseek4") {
+    if kv_backend == KvBackend::Vmm
+        && !matches!(carrier.name(), "qwen35" | "deepseek4" | "muse_glimmer")
+    {
         return Err(format!(
-            "KV backend 'vmm' currently supports qwen3.5 and deepseek4 only (selected carrier: {})",
+            "KV backend 'vmm' currently supports qwen3.5, deepseek4, and Muse Glimmer only (selected carrier: {})",
             carrier.name()
         ));
     }
@@ -1298,6 +1636,120 @@ pub fn load_model_with_kv_backend(
     // Apply the author-recommended sampling extracted pre-allocation (see above).
     // Do NOT reparse the .hfq metadata here: a post-allocation / pre-capture parse
     // is the gfx12 hipGraph-replay regression root-caused above.
+    if let Some(rec) = rec_sampling {
+        result.rec_temperature = rec.temperature;
+        result.rec_top_p = rec.top_p;
+        result.rec_top_k = rec.top_k.map(|k| k as f32);
+    }
+    Ok(result)
+}
+
+/// Load a model with Gemma4 EAGLE drafter support. Mirrors
+/// `load_model_with_kv_backend` but threads `gemma4_drafter_path` /
+/// `gemma4_draft_len` (params.drafter / params.spec) separately from
+/// `draft_path` (Qwen DFlash) so a DFlash .hfq can never be routed into the
+/// EAGLE loader by accident. When `gemma4_drafter_path` is `None` the Gemma4
+/// eager path is AR-only.
+#[allow(clippy::too_many_arguments)]
+pub fn load_model_with_gemma4_drafter(
+    path: &str,
+    max_seq: usize,
+    deepseek4_experts_per_token: Option<usize>,
+    deepseek4_compute_placement: hipfire_config::Deepseek4ComputePlacement,
+    draft_path: Option<&str>,
+    gemma4_drafter_path: Option<&str>,
+    gemma4_draft_len: usize,
+    kv_mode_override: Option<&str>,
+    kv_backend_override: Option<&str>,
+    kv_adaptive_override: Option<&str>,
+    state_quant_override: Option<&str>,
+    cask: &CaskConfig,
+    pp: usize,
+    spec: SpecLoadCfg,
+    gpu: &mut rdna_compute::Gpu,
+) -> Result<LoadedModel, String> {
+    // Validate draft_len early (refuse-don't-degrade, same rule as daemon).
+    let _ = gemma4_eagle_spec_len(Some(gemma4_draft_len as u64))
+        .map_err(|e| format!("gemma4 drafter: {e}"))?;
+    ensure_vmm_ready_for_load(gpu)?;
+    let src = ModelSource::from_path(path)?;
+    let kv_backend_raw = kv_backend_override.unwrap_or("contiguous");
+    let kv_backend: KvBackend = kv_backend_raw.parse().map_err(|err| format!("{err}"))?;
+    let rec_sampling = match &src {
+        ModelSource::Hfq(hfq) => hfq.recommended_sampling(),
+        _ => None,
+    };
+    // Reuse DFlash quant checks for draft_path (unchanged)
+    if draft_path.is_some() {
+        if let ModelSource::Hfq(ref hfq) = src {
+            let lm_qt = hfq
+                .tensor_data("lm_head.weight")
+                .or_else(|| hfq.tensor_data("model.language_model.lm_head.weight"))
+                .or_else(|| hfq.tensor_data("model.language_model.embed_tokens.weight"))
+                .or_else(|| hfq.tensor_data("model.embed_tokens.weight"))
+                .map(|(info, _)| info.quant_type);
+            let arch_is_gfx11 = matches!(
+                gpu.arch.as_str(),
+                "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" | "gfx1200" | "gfx1201"
+            );
+            let supported = match lm_qt {
+                Some(3 | 6 | 13) => true,
+                Some(17) => arch_is_gfx11,
+                _ => false,
+            };
+            if !supported {
+                let qt_desc = match lm_qt {
+                    Some(qt) => format!("quant_type={qt}"),
+                    None => "no lm_head/embed_tokens tensor found".to_string(),
+                };
+                return Err(format!(
+                    "DFlash draft requested but target lm_head {} is not supported ({}).",
+                    qt_desc, gpu.arch
+                ));
+            }
+        }
+    }
+    let mut ctx = LoadCtx {
+        path,
+        max_seq,
+        deepseek4_compute_placement,
+        deepseek4_experts_per_token,
+        draft_path,
+        kv_mode_override,
+        kv_backend,
+        kv_adaptive_override,
+        state_quant_override,
+        cask,
+        pp,
+        spec,
+        gpu,
+        gemma4_drafter_path,
+        gemma4_draft_len,
+    };
+    let mut matches = REGISTRY.iter().filter(|c| c.probe(&src));
+    let carrier = matches
+        .next()
+        .ok_or_else(|| format!("no carrier for {}", src.describe()))?;
+    if let Some(other) = matches.next() {
+        return Err(format!(
+            "ambiguous carrier dispatch for {}: '{}' and '{}' both claim it",
+            src.describe(),
+            carrier.name(),
+            other.name()
+        ));
+    }
+    if kv_backend == KvBackend::Vmm
+        && !matches!(carrier.name(), "qwen35" | "deepseek4" | "muse_glimmer")
+    {
+        return Err(format!(
+            "KV backend 'vmm' currently supports qwen3.5, deepseek4, and Muse Glimmer only (selected carrier: {})",
+            carrier.name()
+        ));
+    }
+    let mut result = carrier.load(src, &mut ctx)?;
+    if result.pp > 1 && result.pp_gpus.is_none() {
+        return Err("pp>1 LoadedModel missing pp_gpus — carrier bug".into());
+    }
     if let Some(rec) = rec_sampling {
         result.rec_temperature = rec.temperature;
         result.rec_top_p = rec.top_p;
@@ -1657,8 +2109,11 @@ pub fn load_model_ep_with_kv_mode(
     max_seq: usize,
     tp: usize,
     kv_mode: Option<&str>,
+    kv_backend: Option<&str>,
 ) -> Result<LoadedModel, String> {
     let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
+    let kv_backend_raw = kv_backend.unwrap_or("contiguous");
+    let kv_backend: KvBackend = kv_backend_raw.parse().map_err(|err| format!("{err}"))?;
     match hfq.arch_id {
         9 => load_model_ep_ds4(
             path,
@@ -1666,7 +2121,13 @@ pub fn load_model_ep_with_kv_mode(
             tp,
             resolve_deepseek4_compressor_cache_kv_mode(kv_mode)?,
         ),
+        10 if kv_backend == KvBackend::Vmm => {
+            Err(format!("KV backend '{kv_backend_raw}' requires tp=1"))
+        }
         10 => load_model_ep_minimax(path, max_seq, tp),
+        5 | 6 if kv_backend == KvBackend::Vmm => {
+            Err(format!("KV backend '{kv_backend_raw}' requires tp=1"))
+        }
         5 | 6 => load_model_ep_qwen35(path, max_seq, tp),
         id => Err(format!(
             "EP not supported for arch_id={id} (expected 5|6 for Qwen3.5, 9 for DeepSeek V4 or 10 for MiniMax)"
@@ -2324,8 +2785,11 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
             | Some(ModelState::Lfm2Moe(_))
             | Some(ModelState::Minimax(_))
             | Some(ModelState::Cohere2Moe(_))
+            | Some(ModelState::Gemma4(_))
+            | Some(ModelState::Gemma4Lowered(_))
             | Some(ModelState::Deepseek4(_))
             | Some(ModelState::Deepseek4Heterogeneous(_))
+            | Some(ModelState::MuseGlimmer(_))
             | None => {}
         }
         for g in gpus.devices.iter_mut() {
@@ -2405,6 +2869,21 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
                 b.state.free_gpu(gpu);
                 b.weights.free_gpu(gpu);
             }
+            ModelState::Gemma4(b) => {
+                if let Some(eagle) = b.eagle {
+                    eagle.spec_scratch.free(gpu);
+                    eagle.drafter_scratch.free_gpu(gpu);
+                    eagle.drafter_weights.free_gpu(gpu);
+                }
+                b.state.free_gpu(gpu);
+                b.weights.free_gpu(gpu);
+            }
+            ModelState::Gemma4Lowered(b) => {
+                b.scratch.free_gpu(gpu);
+                note(b.kv_sliding.free_gpu(gpu).map_err(|e| e.to_string()));
+                note(b.kv_full.free_gpu(gpu).map_err(|e| e.to_string()));
+                b.weights.free_gpu(gpu);
+            }
             ModelState::Deepseek4(b) => {
                 b.state.free_gpu(gpu);
                 b.weights.free_gpu(gpu);
@@ -2413,6 +2892,19 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
                 // Self-owned two-device transaction. Dropping `model` frees
                 // each resource on its exact owner and drains both pools.
                 drop(b);
+            }
+            ModelState::MuseGlimmer(b) => {
+                // Glimmer teardown is exactly the PR #566 pattern: free BOTH
+                // the per-layer scratch/KV state AND the weight allocations.
+                // Freeing only one side leaks ~1.3 GB over 5 cycles (the
+                // weights are ~650 MB + state ~650 MB; each reload without
+                // the companion free retains the prior cycle's allocation).
+                if let Some(drafter) = b.drafter {
+                    drafter.scratch.free_gpu(gpu);
+                    drafter.weights.free_gpu(gpu);
+                }
+                b.state.free_gpu(gpu);
+                b.weights.free_gpu(gpu);
             }
         }
     }
@@ -2562,5 +3054,69 @@ mod registry_tests {
                 .count();
             assert_eq!(n, 0, "arch_id={id} (unassigned) should match no carrier");
         }
+    }
+
+    /// The Onyx/Harmony template exactly as Muse Glimmer's .hfq carries it, checked in so
+    /// the rewrite's substitution-count contract is pinned against the real artifact rather
+    /// than a hand-written approximation. If upstream republishes the template with a
+    /// different accessor shape, THIS TEST fails before a user ever sees a bare unframed
+    /// prompt at runtime.
+    const ONYX_TEMPLATE: &str =
+        include_str!("../../hipfire-runtime/templates/muse-glimmer-onyx.jinja");
+
+    #[test]
+    fn muse_glimmer_onyx_template_rewrite() {
+        use super::rewrite_muse_glimmer_onyx_template;
+
+        // The real carried template must rewrite cleanly.
+        let out = rewrite_muse_glimmer_onyx_template(ONYX_TEMPLATE)
+            .expect("the checked-in Onyx template must rewrite");
+
+        // Flat accessors: the runtime's `prompt_frame::ToolCall` is flat, so every
+        // `tc.function.*` dereference must be gone or the template's own
+        // `raise_exception` fires and the whole render falls back to a bare prompt.
+        assert_eq!(out.matches("tc.function.").count(), 0);
+        assert_eq!(
+            out.matches("tc.name").count(),
+            ONYX_TEMPLATE.matches("tc.function.name").count()
+        );
+        assert_eq!(
+            out.matches("tc.arguments").count(),
+            ONYX_TEMPLATE.matches("tc.function.arguments").count()
+        );
+
+        // The verbatim-splice branch must wrap `render_atem`'s body exactly once, so a
+        // cached tool body replaces the regenerated ATEM XML.
+        // `{%- if tc.rendered_body is defined and tc.rendered_body -%}{{- tc.rendered_body -}}`
+        assert_eq!(out.matches("tc.rendered_body").count(), 3);
+        assert!(out.contains("{%- if tc.rendered_body is defined and tc.rendered_body -%}"));
+        assert!(out.contains("{%- endif -%}{%- endmacro -%}"));
+
+        // Only `render_atem` is wrapped. `render_tool_defs` ends with a BYTE-IDENTICAL ATEM
+        // tail (it embeds a worked example of the call syntax), so a `replace`-all here
+        // would inject a stray `{%- endif -%}` into the tool-definition preamble and break
+        // every tools-bearing prompt. Pin both halves: exactly one tail stays bare, exactly
+        // one is wrapped.
+        let bare_tail = "{{- '</atem:invoke>\\n</atem:function_calls>' -}}{%- endmacro -%}";
+        let wrapped_tail =
+            "{{- '</atem:invoke>\\n</atem:function_calls>' -}}{%- endif -%}{%- endmacro -%}";
+        assert_eq!(
+            out.matches(bare_tail).count(),
+            1,
+            "render_tool_defs tail must stay bare"
+        );
+        assert_eq!(
+            out.matches(wrapped_tail).count(),
+            1,
+            "render_atem tail must be wrapped"
+        );
+
+        // Upstream drift must fail LOUDLY rather than silently leaving nested accessors.
+        let missing = "{%- macro render_atem(tc) -%}hello{%- endmacro -%}";
+        let err = rewrite_muse_glimmer_onyx_template(missing).unwrap_err();
+        assert!(
+            err.contains("expected 3 occurrences"),
+            "unexpected error for drifted template: {err}"
+        );
     }
 }

@@ -1,0 +1,18 @@
+[
+  {
+    "content": "You are an expert coding assistant. Task: Write a Python function `merge_sorted(a, b)` that merges two already-sorted lists into one sorted list without using sorted(). Include a short docstring and handle empty input edge cases. Reply concisely.",
+    "expect": ["merge_sorted", "def"]
+  },
+  {
+    "content": "You must call weather.get_forecast exactly once to ground the next step. Use location Paris; options units celsius and days [1,2]; include_alerts true; fallback null. Expected arguments: {\"location\":\"Paris\",\"options\":{\"units\":\"celsius\",\"days\":[1,2]},\"include_alerts\":true,\"fallback\":null}. Do not answer directly — make the tool call.",
+    "expect": []
+  },
+  {
+    "content": "Tool result for weather.get_forecast: {\"location\":\"Paris\",\"units\":\"celsius\",\"days\":[{\"day\":1,\"high\":18},{\"day\":2,\"high\":20}],\"alerts\":[],\"fallback_used\":null}. Now in one sentence summarize the Paris forecast and then provide a Python snippet that formats it as `Paris: 18C day1, 20C day2`.",
+    "expect": ["Paris", "18", "20"]
+  },
+  {
+    "content": "Finally, combine the merge_sorted implementation with the Paris forecast summary as a code comment, and explain why the tool arguments included nested options, an integer array, a boolean, and a null.",
+    "expect": ["merge_sorted", "Paris", "options", "fallback"]
+  }
+]

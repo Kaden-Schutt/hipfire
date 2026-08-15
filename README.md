@@ -39,8 +39,8 @@ hipfire run qwen3.5:4b "What is the capital of France?"
 The daemon exposes an OpenAI-compatible API on `0.0.0.0:11435`.
 
 Current stable release: **v0.2.1**. The next release is **v0.3.0**,
-headlined by MQ4R and Redline across RDNA. See
-[CHANGELOG.md](CHANGELOG.md).
+headlined by MQ4R and Redline across RDNA, and adding Qwen 3.8 27B and
+Muse Glimmer 30B. See [CHANGELOG.md](CHANGELOG.md).
 
 Curated weights are published through
 [huggingface.co/hipfire-models](https://huggingface.co/hipfire-models)
@@ -117,7 +117,7 @@ OpenAI-compatible client.
 
 ## Curated model registry
 
-The registry currently contains 54 pullable model entries. Run
+The registry currently contains 61 pullable model entries. Run
 `hipfire list -r` to see the authoritative live list.
 
 | Registry family | Pull tags and variants |
@@ -126,6 +126,8 @@ The registry currently contains 54 pullable model entries. Run
 | Qwen 3.5 MoE | `qwen3.5:35b-a3b` |
 | Qwen 3.6 dense | `qwen3.6:27b`, `qwen3.6:27b-mq3`, `qwen3.6:27b-draft`, `qwen3.6:27b-draft-mq3` |
 | Qwen 3.6 35B-A3B | `qwen3.6:35b-a3b` (MQ4P default), `qwen3.6:35b-a3b-mq2`, `qwen3.6:35b-a3b-mq3p`, `qwen3.6:35b-a3b-mq4p`, `qwen3.6:35b-a3b-mfp4`, `qwen3.6:35b-a3b-mq4r`, `qwen3.6:35b-a3b-mq5`, `qwen3.6:35b-a3b-mq6` |
+| Qwen 3.8 dense | `qwen3.8:27b` (MQ4 quality trunk, default), `qwen3.8:27b-fast` (MQ4R speed SKU) |
+| Muse Glimmer | `muse-glimmer` (MQ4 quality trunk), `muse-glimmer:fast` (MQ4R speed SKU), `muse-glimmer:draft` |
 | DeepSeek V4 Flash | `deepseek-v4-flash` |
 | MiniMax-M2.7 | `minimax-m2.7` |
 | North-Mini-Code-1.0 | `north-mini-code` |
@@ -136,8 +138,8 @@ The registry currently contains 54 pullable model entries. Run
 | NEX N2 Mini | `nex-n2:mini` |
 | VibeThinker-3B | `vibethinker:3b`, `vibethinker:3b-mq6` |
 
-Common aliases include `qwen3.5`, `qwen3.6`, `qwen3`, `carnice`,
-`qwopus`, `deepseek4`, `deepseek-v4`, and `vibethinker`.
+Common aliases include `qwen3.5`, `qwen3.6`, `qwen3.8`, `qwen3`, `carnice`,
+`qwopus`, `deepseek4`, `deepseek-v4`, `muse-glimmer`, and `vibethinker`.
 
 Carnice uses the Hermes tool-call format. Plain Qwen 3.5 and 3.6 use
 their native Qwen XML tool-call format.
@@ -202,8 +204,17 @@ and methodology notice.
 | Model | Config | Decode tok/s |
 |---|---|---:|
 | Qwen2 1.5B HFQ4 | single GPU | **266** |
-| DeepSeek V4 Flash (82 GB MQ2-Lloyd) | 4× R9700, `hipfire serve --tp 4` (EP) | **25.6** |
+| DeepSeek V4 Flash (82 GB MQ2R) | 4× R9700, `hipfire serve --tp 3` (EP) | **53.1** |
+| DeepSeek V4 Flash (82 GB MQ2R) | 4× R9700, `hipfire serve --tp 4` (EP) | **54.3** |
+| DeepSeek V4 Flash (82 GB MQ2-Lloyd, superseded SKU) | 4× R9700, `hipfire serve --tp 4` (EP) | 25.6 |
 | Gemma 4 12B MQ4 | single GPU (integration branch, pre-merge) | **~47** |
+
+The DeepSeek V4 Flash rows are n=3 fresh-process medians on
+`deepseek-v4-flash-0731.mq2r` (sha256 `cbf2bbcf…`), greedy, speculation off,
+`--kv f32`, 2052-token prompt. MQ2R is the current `deepseek-v4-flash` SKU and
+roughly doubles the superseded MQ2-Lloyd row below it; benchmark against MQ2R,
+not the Lloyd figure. TP3 trades ~2% decode for ~24% faster prefill (481 vs
+389 tok/s) and leaves a fourth card free.
 
 Experimental long-context compression and eviction are opt-in. PFlash is off
 by default, TriAttention sidecars do not auto-attach, and CASK m-folding is

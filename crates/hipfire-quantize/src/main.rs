@@ -4945,6 +4945,18 @@ fn is_promote_pair_supported(base: GgufFormat, promote: GgufFormat) -> bool {
 /// Handles both safetensors (`layers.{N}.`) and GGUF (`blk.{N}.`) patterns.
 /// Uses unanchored search to handle any prefix (model.layers, model.language_model.layers, etc.).
 fn parse_layer_idx(name: &str) -> Option<usize> {
+    // Vision towers contain `vision_tower.layers.N` — don't treat that as a
+    // text layer index (would pick up edge-layer Promote6 for vision). Return
+    // None early for vision prefixes additively (no behaviour change for text).
+    if name.starts_with("model.vision_tower.")
+        || name.starts_with("vision_tower.")
+        || name.starts_with("model.vision_adapter.")
+        || name.starts_with("model.vision_projection.")
+        || name.starts_with("model.visual.")
+        || name.starts_with("visual.")
+    {
+        return None;
+    }
     // Try safetensors pattern: "layers.{N}."
     if let Some(pos) = name.find("layers.") {
         let after = &name[pos + 7..]; // skip "layers."
@@ -4999,6 +5011,19 @@ fn kmap_resolve(name: &str, n_layers: usize, is_moe: bool) -> QuantLevel {
 }
 
 fn kmap_resolve_mode(name: &str, n_layers: usize, is_moe: bool, kmap_mode: u8) -> QuantLevel {
+    // Vision tensors (809 on Glimmer) stay F16 and must not be mis-classified
+    // as text. This also prevents `vision_tower.layers.N` from being parsed
+    // as a text layer index for edge-layer Promote6. Additive: text tensors
+    // never match these prefixes, so no existing arch changes.
+    if name.starts_with("model.vision_tower.")
+        || name.starts_with("vision_tower.")
+        || name.starts_with("model.vision_adapter.")
+        || name.starts_with("model.vision_projection.")
+        || name.starts_with("model.visual.")
+        || name.starts_with("visual.")
+    {
+        return QuantLevel::F16;
+    }
     // Rule 1: norms, biases, 1D (GGUF path mainly)
     if name.contains("norm") || name.contains("bias") {
         return QuantLevel::F16;
@@ -5014,7 +5039,11 @@ fn kmap_resolve_mode(name: &str, n_layers: usize, is_moe: bool, kmap_mode: u8) -
     }
 
     // Rule 3: MoE routers
-    if is_moe && (name.ends_with("mlp.gate.weight") || name.contains("shared_expert_gate")) {
+    if is_moe
+        && (name.ends_with("mlp.gate.weight")
+            || name.contains("shared_expert_gate")
+            || name.ends_with("router.proj.weight"))
+    {
         return QuantLevel::Q8;
     }
 
@@ -5033,6 +5062,9 @@ fn kmap_resolve_mode(name: &str, n_layers: usize, is_moe: bool, kmap_mode: u8) -
     }
 
     // Mode 2 (typed): promote ffn_down and attn_v in all layers.
+    // UNCHANGED semantics — every model that already ships with `--kmap-mode
+    // typed` must keep producing byte-identical output. Gemma 4's variant of
+    // this rule lives in mode 3 below rather than mutating this one.
     if kmap_mode == 2 {
         let is_down = name.contains("down_proj") || name.contains("ffn_down");
         let is_v = name.contains("v_proj") || name.contains("attn_v");
@@ -5043,6 +5075,38 @@ fn kmap_resolve_mode(name: &str, n_layers: usize, is_moe: bool, kmap_mode: u8) -
             if let Some(idx) = parse_layer_idx(name) {
                 if idx < 2 || idx >= n_layers.saturating_sub(2) {
                     return QuantLevel::Promote6;
+                }
+            }
+        }
+        return QuantLevel::Base;
+    }
+
+    // Mode 3 (typed-gemma4): mode 2, except edge layers promote FFN + v_proj
+    // only and leave attn q/k/o at Base — dense attn promotion regresses PPL
+    // +3.1% on 27B (see ppl_kmap_20260508.md).
+    //
+    // This is a SEPARATE mode rather than a tweak to mode 2 so that no model
+    // already quantized with `--kmap-mode typed` changes bytes. Selected
+    // automatically for gemma4 (arch_id 13); reachable explicitly as
+    // `--kmap-mode typed-gemma4`.
+    if kmap_mode == 3 {
+        let is_down = name.contains("down_proj") || name.contains("ffn_down");
+        let is_v = name.contains("v_proj") || name.contains("attn_v");
+        if is_down || is_v {
+            return QuantLevel::Promote6;
+        }
+        if n_layers > 0 {
+            if let Some(idx) = parse_layer_idx(name) {
+                if idx < 2 || idx >= n_layers.saturating_sub(2) {
+                    let is_attn_qko = name.contains("q_proj")
+                        || name.contains("attn_q")
+                        || name.contains("k_proj")
+                        || name.contains("attn_k")
+                        || name.contains("o_proj")
+                        || name.contains("attn_o");
+                    if !is_attn_qko {
+                        return QuantLevel::Promote6;
+                    }
                 }
             }
         }
@@ -5346,14 +5410,18 @@ fn find_safetensors(dir: &Path) -> Vec<PathBuf> {
 fn should_quantize(name: &str) -> bool {
     // Vision encoder weights stay FP16 (only ~500M params, run once per image).
     // Qwen3.5-VL uses `model.visual.*` / `visual.*`; dots.ocr uses
-    // `vision_tower.*`. Both arches keep vision F16 during bring-up so the
-    // per-stage diff against the HF reference activations
-    // (`benchmarks/references/<image>_activations/`) doesn't have to absorb
-    // both forward-pass implementation noise AND quant noise — clean
+    // `vision_tower.*`. Glimmer uses `model.vision_tower.*`,
+    // `model.vision_adapter.*`, `model.vision_projection.*`. All vision stays
+    // F16 during bring-up so the per-stage diff against the HF reference
+    // activations (`benchmarks/references/<image>_activations/`) doesn't have
+    // to absorb both forward-pass implementation noise AND quant noise — clean
     // attribution. See memory `feedback_dots_ocr_vision_f16_during_bringup`.
     if name.starts_with("model.visual.")
         || name.starts_with("visual.")
         || name.starts_with("vision_tower.")
+        || name.starts_with("model.vision_tower.")
+        || name.starts_with("model.vision_adapter.")
+        || name.starts_with("model.vision_projection.")
     {
         return false;
     }
@@ -5518,7 +5586,10 @@ fn q8_class_of(name: &str) -> Option<&'static str> {
         Some("lm_head")
     } else if name.contains("embed") {
         Some("embed")
-    } else if name.ends_with("mlp.gate.weight") || name.ends_with("mlp.shared_expert_gate.weight") {
+    } else if name.ends_with("mlp.gate.weight")
+        || name.ends_with("mlp.shared_expert_gate.weight")
+        || name.ends_with("router.proj.weight")
+    {
         Some("router")
     } else if name.contains("self_attn")
         || name.contains("attn_q")
@@ -5790,6 +5861,13 @@ fn safetensors_to_ggml_name(name: &str) -> Option<String> {
         "self_attn.k_proj" => "attn_k",
         "self_attn.v_proj" => "attn_v",
         "self_attn.o_proj" => "attn_output",
+        // Glimmer gates attention output before o_proj under a name Qwen does
+        // not use (see hipfire-arch-muse-glimmer lib.rs). llama.cpp exports it
+        // as blk.{N}.attn_gate, so without this arm the 52 Glimmer gate tensors
+        // silently miss AWQ despite `awq_eligible` matching `gate_proj.weight`
+        // and the imatrix carrying the entry. No collision with the linear-attn
+        // arm below: a layer is either full- or linear-attention, never both.
+        "self_attn.gate_proj" => "attn_gate",
         // LinearAttention layer tensors (Mamba-2 / hybrid-arch SSM naming).
         "linear_attn.in_proj_qkv" => "attn_qkv",
         "linear_attn.in_proj_z" => "attn_gate",
@@ -6179,7 +6257,10 @@ fn awq_eligible(name: &str) -> bool {
         // as mlp.gate.weight: q8_router (set for is_minimax via is_moe_like)
         // keeps the router at Q8 so HFQ4 noise can't flip top-k selection.
         || name.ends_with("block_sparse_moe.gate.weight")
-        || name.ends_with("router.weight");
+        || name.ends_with("router.weight")
+        // Gemma4 26B-A4B MoE router: `router.proj.weight` (hidden_size × num_experts).
+        // Same precision-sensitivity as Qwen3.5's `mlp.gate.weight`.
+        || name.ends_with("router.proj.weight");
     if f1_only {
         return f1_match;
     }
@@ -6463,6 +6544,14 @@ fn run_gguf_pipeline(
         "qwen3" | "qwen2" => 1,
         "qwen3_5" | "qwen3_5_text" | "qwen35" => 5,
         "qwen3moe" => 6,
+        // Gemma4 EAGLE drafter (arch_id 22) — must come before the gemma4
+        // catch-all below so that a GGUF with general.architecture =
+        // "gemma4_unified_assistant" is not mis-tagged as arch 13.
+        "gemma4_unified_assistant" => 22,
+        // Gemma 4 family (dense + MoE) => hipfire-arch-gemma4 (arch_id 13).
+        // Require a "gemma4"-prefixed arch string; bare "gemma"/"gemma2"/
+        // "gemma3" GGUFs are different architectures and must not be mis-tagged.
+        g4 if g4.starts_with("gemma4") => 13,
         other => {
             // Structural-pillar guard: a qwen3* GGUF that doesn't match an
             // explicit arm above must NOT be silently stamped arch_id=0
@@ -6540,6 +6629,7 @@ fn run_gguf_pipeline(
 
     // K-map setup for GGUF path
     let is_moe = arch_id == 6;
+    let is_gemma4 = arch_id == 13;
     let n_layers: usize = config_json
         .get("num_hidden_layers")
         .and_then(|v| v.as_u64())
@@ -6554,7 +6644,10 @@ fn run_gguf_pipeline(
     // ship-default is the conservative shape per maintainer directive
     // (2026-05-08): never silently change dense quantization. Users who
     // want K-map on dense pass `--kmap-dense` (see flag parsing below).
-    let kmap: HashMap<String, QuantLevel> = if no_kmap || (!is_moe && !kmap_dense) {
+    // K-map is enabled for: MoE models (default), gemma4 (arch_id 13,
+    // default mode=2), or any dense model with --kmap-dense.
+    // Suppress with --no-kmap / --uniform.
+    let kmap: HashMap<String, QuantLevel> = if no_kmap || (!is_moe && !is_gemma4 && !kmap_dense) {
         HashMap::new()
     } else {
         let mut map = HashMap::new();
@@ -7696,12 +7789,11 @@ fn main() {
     // q8-fast = Q8 attn + Q4-as-Q8 FFN (all Q8 occupancy, most VRAM)
     // q8hfq = all weights Q8_HFQ (split-metadata, 128B-aligned rows)
     let use_q8 = format == "q8f16" || format == "q8";
-    // F1 native-bf16 oracle: full-precision passthrough. Every tensor stored
+    // F32 oracle: full-precision passthrough. Every tensor stored
     // as QuantType::F32 (qt=2) -- weights, norms, embeddings. The bf16 source
     // is widened bf16->f32 (lossless), giving the engine a superset-precision
     // reference forward for self-sufficient KLD eval.
-    let use_f32_passthrough =
-        format == "f32" || format == "f32-passthrough" || format == "bf16" || format == "oracle";
+    let use_f32_passthrough = format == "f32" || format == "f32-passthrough" || format == "oracle";
     let use_mixed = format == "q8-mixed" || format == "mixed";
     let use_fast = format == "q8-fast" || format == "fast";
     let use_q8hfq = format == "q8hfq";
@@ -7748,10 +7840,9 @@ fn main() {
     let use_hfq_mixed = format == "hfq-mixed"; // Q8 attn + HFQ4 FFN
     let use_mq6g256 = format == "mq6" || format == "mq6g256";
     let use_mq5g256 = format == "mq5" || format == "mq5g256";
-    // Native-bf16 reference (the KLD/PPL oracle): cohere2moe stores matmul
-    // weights as the EXACT downloaded bf16 bytes (~61 GB, fits gfx1151's GTT;
-    // the all-F32 `oracle` passthrough is 122 GB and does NOT fit). `f16` is a
-    // lossy-reconvert alternative tier, kept available but not the reference.
+    // Native-bf16 reference. Cohere2MoE and Qwen3.5 store matmul weights as
+    // the exact downloaded BF16 bytes; `f16` is a lossy-reconvert alternative
+    // tier, while the all-F32 `oracle` doubles storage.
     let use_bf16 = format == "bf16" || format == "bf16-passthrough" || format == "oracle";
     let use_f16 = format == "f16" || format == "f16-passthrough";
     // ── Graded per-expert mixed precision (HIPFIRE_MOE_GRADED) ────────────
@@ -8266,10 +8357,11 @@ fn main() {
     // K-map mode: 0=full (all candidates promoted), 1=alternating (edge + every 3rd),
     // 2=typed (ffn_down+attn_v everywhere). Default: alternating — same PPL as full
     // at 17% less model size on MoE (22.9 vs 27.7 GB, PPL 8K: 19.96 vs 20.07).
-    let kmap_mode: u8 = match args.kmap_mode.as_str() {
+    let mut kmap_mode: u8 = match args.kmap_mode.as_str() {
         "full" | "0" => 0,
         "alternating" | "alt" | "1" => 1,
         "typed" | "2" => 2,
+        "typed-gemma4" | "3" => 3,
         _ => {
             eprintln!(
                 "warning: unknown --kmap-mode '{}', using alternating",
@@ -8488,6 +8580,36 @@ fn main() {
         // Per-expert pre-split tensors (mlp.experts.{j}.{gate,up,down}_proj) like
         // lfm2/deepseek. Crate hipfire-arch-cohere2moe (arch_id 12).
         "cohere2_moe" => 12,
+        // Gemma 4 family (dense + MoE) -> hipfire-arch-gemma4 (arch_id 13).
+        // 12B-unified (google/gemma-4-12B-it, model_type "gemma4_unified") is
+        // dense unified multimodal; we quantize ONLY the text decoder
+        // (model.language_model.*). GQA + SWA + dual-RoPE + GeGLU + 4 sandwich
+        // norms + logit softcap. 26B-A4B MoE uses model_type "gemma4" (3D
+        // stacked experts.gate_up_proj/down_proj + router.proj/router.scale).
+        // NOTE: flat-MQ4 is a known-poor recipe for this architecture — do not
+        // use `--format mq4` as a quality baseline. Qwen 9B flat-MQ4 measured
+        // 0.3215 KLD and AWQ+GPTQ v3 reached 0.1257 at identical file size;
+        // gemma4 shows the same flat-MQ4 degradation. The intended path is
+        // AWQ+GPTQ (see docs/investigations/2026-05-18-awq-gptq-sub-0.10-kld/).
+        "gemma4_unified" | "gemma4_unified_text" | "gemma4" | "gemma4_text" => 13,
+        // Gemma4 EAGLE drafter (google/gemma-4-12B-it-assistant): the 422M
+        // single-block speculative-decode draft head for the arch-13 target.
+        // FLAT `model.*` names (NOT `model.language_model.`-prefixed) + two
+        // top-level projections (pre_projection / post_projection). Text-only:
+        // no vision/audio tower to skip. 5 decoder layers, hybrid 3:1
+        // sliding(hd256)/full(hd512) attn, tied lm_head, per-layer scalar.
+        // Quantize everything Q8 (`--format q8`): it is a tiny draft model and
+        // draft accuracy directly gates spec-decode acceptance. arch_id 22 is
+        // the next free slot after 21 (Qwen3.5 MTP head). Crate (future):
+        // hipfire-arch-gemma4 drafter loader.
+        "gemma4_unified_assistant" => 22,
+        // Muse Glimmer (arch_id 14) and its DFlash drafter (23).
+        // Glimmer is dense 52-layer text + ViT tower; model_type "muse_glimmer"
+        // (and "muse_glimmer_text" for text-only exports). The assistant
+        // drafter uses model_type "muse_glimmer_assistant" (5 layers, DFlash).
+        // Arch 14 = dense text tower, 23 = assistant drafter.
+        "muse_glimmer" | "muse_glimmer_text" => 14,
+        "muse_glimmer_assistant" => 23,
         other => {
             eprintln!("Warning: unknown architecture '{other}', treating as llama");
             0
@@ -8532,7 +8654,20 @@ fn main() {
     // kernel family). Raw HF tensor names are written verbatim (no rename);
     // the hipfire loader looks them up.
     let is_minimax = arch_id == 10;
-    let is_moe_like = is_moe || is_deepseek4 || is_lfm2moe || is_minimax || is_cohere2moe;
+    let is_gemma4 = arch_id == 13;
+    // Covers both the dense arch-13 (12B/26B unified) and the EAGLE drafter
+    // (arch-22). Both have the same AWQ-unsuitability: √d_model embedding scale
+    // (not RMSNorm-anchored) corrupts AWQ saliency for FFN; embed/lm_head are
+    // tied + scaled by √3840 making AWQ scale saliency meaningless there.
+    let is_gemma4_family = arch_id == 13 || arch_id == 22;
+    let is_moe_like = is_moe || is_deepseek4 || is_lfm2moe || is_minimax || is_cohere2moe || is_gemma4;
+    // Gemma4 (arch_id 13) defaults to kmap_mode=3 (typed-gemma4): promote down_proj,
+    // v_proj, and edge-layer non-attn-qko tensors. Attn q/k/o are excluded even
+    // in edge layers (dense attn promotion regresses PPL +3.1% on 27B).
+    // The explicit --kmap-mode flag overrides this default.
+    if is_gemma4 && args.kmap_mode == "alternating" {
+        kmap_mode = 3;
+    }
     // Q8 "router" — a misnomer: `is_q8_tensor` covers the whole FIXED tier
     // (attention q/k/v/o, linear_attn projections, conv1d, lm_head, embed, and
     // the MoE router), not just `mlp.gate.weight`. On for MoE-class models by
@@ -8549,6 +8684,38 @@ fn main() {
     let no_q8_router_flag = args.no_q8_router
         || std::env::var("HIPFIRE_NO_Q8_ROUTER").ok().as_deref() == Some("1");
     let q8_router = (is_moe_like || q8_router_flag) && !no_q8_router_flag;
+    // Muse Glimmer (arch 14): untied lm_head defaults to Q8, like embed.
+    //
+    // Glimmer sets `tie_word_embeddings=false`, so `lm_head.weight` is a
+    // SEPARATE [202048, 6656] tensor rather than an alias of the embedding
+    // table. `embed_tokens` stays Q8 through its own `is_embed` arm, but an
+    // untied lm_head has no such arm — on a dense model `q8_router` is off by
+    // default, so the K-map's Q8 verdict for lm_head is never reached and it
+    // follows `--format` down to MQ4. That is a 4-bit output projection over a
+    // 202k vocab, and nothing in the pipeline flags it. The first Glimmer MQ4
+    // build shipped exactly that way while the K-map unit tests passed.
+    //
+    // Rather than widen the shared `is_moe_like` default (which would drag
+    // attention into Q8 for every dense arch and change their artifacts), this
+    // enables the fixed tier for arch 14 only and narrows it to the two classes
+    // that must be Q8. `--no-q8-router` still wins, and an explicit
+    // HIPFIRE_Q8_CLASSES still wins, so both levers stay available.
+    //
+    // Cost on the 30B: 15.51 GB -> 16.26 GB, decode 33.06 -> 31.62 tok/s
+    // (gfx1201, 64 tok greedy). Both artifacts decode coherently.
+    let glimmer_q8_head = arch_id == 14 && !no_q8_router_flag;
+    if glimmer_q8_head {
+        if std::env::var("HIPFIRE_Q8_CLASSES").is_err() {
+            // SAFETY: single-threaded CLI setup, before any worker threads spawn.
+            unsafe { std::env::set_var("HIPFIRE_Q8_CLASSES", "lm_head,embed") };
+        }
+        eprintln!(
+            "note: muse_glimmer (arch 14) — untied lm_head + embed held at Q8F16;\n\
+             all other tensors follow --format. Override with HIPFIRE_Q8_CLASSES\n\
+             or disable with --no-q8-router."
+        );
+    }
+    let q8_router = q8_router || glimmer_q8_head;
     if no_q8_router_flag {
         eprintln!(
             "note: --no-q8-router — the fixed tier (attention / lm_head / router /\n\
@@ -8710,9 +8877,16 @@ fn main() {
                 continue;
             }
             if let Some(stem) = name.strip_suffix(".scale") {
-                // Sibling weight name (drop `.scale`, add `.weight`).
-                let w_name = format!("{stem}.weight");
-                fp8_scale_for.insert(w_name, (fi, name.to_string()));
+                // FP8 scale siblings: `foo.scale` is the per-tensor scale for
+                // `foo.weight`. Skip from quantization; attach at quant time.
+                // Exception: Gemma4's `router.scale` is a real model weight
+                // (multiplicative scale on router input), NOT an FP8 scale.
+                if name.contains("router.scale") {
+                    all_tensors.push((name, fi));
+                } else {
+                    let w_name = format!("{stem}.weight");
+                    fp8_scale_for.insert(w_name, (fi, name.to_string()));
+                }
                 continue;
             }
             all_tensors.push((name, fi));
@@ -8898,7 +9072,10 @@ fn main() {
     // the K-map default-on path because the routed-expert promotion is
     // the headline win and the empirical regression there is tighter
     // (+1.7% PPL at 2K, gated below the dense regression threshold).
-    let kmap: HashMap<String, QuantLevel> = if no_kmap || (!is_moe && !kmap_dense) {
+    // K-map is enabled for: MoE models (default), gemma4 (arch_id 13,
+    // default mode=2), or any dense model with --kmap-dense.
+    // Suppress with --no-kmap / --uniform.
+    let kmap: HashMap<String, QuantLevel> = if no_kmap || (!is_moe && !is_gemma4 && !kmap_dense) {
         HashMap::new()
     } else {
         let mut map = HashMap::new();
@@ -9048,6 +9225,15 @@ fn main() {
     // gate_proj's up_proj sibling (which may live in a different shard).
     let name_to_file: std::collections::HashMap<&str, usize> =
         all_tensors.iter().map(|(n, fi)| (*n, *fi)).collect();
+    // Gemma4 (arch 13): unified multimodal checkpoints prefix the text decoder
+    // with `model.language_model.`; text-only checkpoints (model_type
+    // "gemma4_text") use flat `model.*` names. Only arm the tower-skip when the
+    // multimodal prefix actually exists, else a text-only checkpoint would be
+    // skipped wholesale.
+    let gemma4_skip_non_lm = arch_id == 13
+        && all_tensors
+            .iter()
+            .any(|(n, _)| n.starts_with("model.language_model."));
     for (name, file_idx) in &all_tensors {
         // --include-prefix filter (highest priority — runs before mtp/vision skips).
         if let Some(p) = include_prefix {
@@ -9060,13 +9246,25 @@ fn main() {
         }
         // Skip MTP head; optionally include vision encoder for VL inference.
         // Qwen3.5-VL names vision tensors `model.visual.*` / `visual.*`;
-        // dots.ocr names them `vision_tower.*`. Both fall through to the
-        // F16 fallback path (see should_quantize: vision_tower.* is
-        // skipped from quantization) when --include-vision is set.
+        // dots.ocr names them `vision_tower.*`; Glimmer names them
+        // `model.vision_tower.*`, `model.vision_adapter.*`,
+        // `model.vision_projection.*`. All fall through to the F16 fallback
+        // path (see should_quantize) when --include-vision is set.
         let is_vision = name.starts_with("model.visual.")
             || name.starts_with("visual.")
-            || name.starts_with("vision_tower.");
+            || name.starts_with("vision_tower.")
+            || name.starts_with("model.vision_tower.")
+            || name.starts_with("model.vision_adapter.")
+            || name.starts_with("model.vision_projection.");
         if is_vision && !include_vision {
+            let (meta, _) = st_files[*file_idx].tensor_data(name).unwrap();
+            let n: usize = meta.shape.iter().product();
+            skipped_params += n as u64;
+            continue;
+        }
+        // Gemma4 unified (arch 13): text-only bring-up — skip the vision/audio
+        // towers + multimodal projectors; quantize only the text decoder.
+        if gemma4_skip_non_lm && !name.starts_with("model.language_model.") {
             let (meta, _) = st_files[*file_idx].tensor_data(name).unwrap();
             let n: usize = meta.shape.iter().product();
             skipped_params += n as u64;
@@ -9432,6 +9630,87 @@ fn main() {
                 data: bytes,
                 spilled_len: 0,
             });
+            st_files[*file_idx].drop_tensor_pages(name);
+            if let Some(ref mut sp) = spill {
+                maybe_spill(&mut hfq_tensors, sp, 2 * 1024 * 1024 * 1024);
+            }
+            continue;
+        }
+
+        // Source-precision BF16 passthrough for non-vision model tensors.
+        // Unlike the F32 oracle above, this preserves the checkpoint's native
+        // two-byte representation on disk. The qwen35 loader can consume
+        // qt=16 losslessly; vision remains on the established F16 ingest path
+        // because its kernels consume F16 matrices.
+        if use_bf16 && matches!(arch_id, 5 | 6) && !is_vision {
+            let bf16_bytes = if meta.dtype == "BF16" {
+                raw_data.to_vec()
+            } else {
+                tensor_to_f32_with_optional_fp8_scale(
+                    name,
+                    raw_data,
+                    meta,
+                    &fp8_scale_for,
+                    &st_files,
+                )
+                .iter()
+                .flat_map(|&value| {
+                    let bits = value.to_bits();
+                    let rounded = bits.wrapping_add(0x7fff + ((bits >> 16) & 1));
+                    ((rounded >> 16) as u16).to_le_bytes()
+                })
+                .collect()
+            };
+
+            if is_moe
+                && name.contains("mlp.experts.")
+                && (name.ends_with("gate_up_proj") || name.ends_with("down_proj"))
+                && meta.shape.len() == 3
+            {
+                let n_exp = meta.shape[0];
+                let inner_n: usize = meta.shape[1..].iter().product();
+                let base_name = if name.ends_with("gate_up_proj") {
+                    "gate_up_proj"
+                } else {
+                    "down_proj"
+                };
+                let parent = &name[..name.len() - base_name.len()];
+                let inner_shape: Vec<u32> = meta.shape[1..].iter().map(|&d| d as u32).collect();
+                for expert in 0..n_exp {
+                    let start = expert * inner_n * 2;
+                    let end = start + inner_n * 2;
+                    hfq_tensors.push(HfqTensor {
+                        name: format!("{parent}{expert}.{base_name}.weight"),
+                        quant_type: QuantType::BF16,
+                        shape: inner_shape.clone(),
+                        group_size: 0,
+                        data: bf16_bytes[start..end].to_vec(),
+                        spilled_len: 0,
+                    });
+                }
+                eprintln!(
+                    "  {:>8}: {} {:?} -> {} per-expert BF16 [source split]",
+                    "BF16", name, meta.shape, n_exp
+                );
+            } else {
+                eprintln!(
+                    "  {:>8}: {} {:?} ({} elements, {:.1} KB) [source passthrough]",
+                    "BF16",
+                    name,
+                    meta.shape,
+                    n_elements,
+                    bf16_bytes.len() as f64 / 1024.0
+                );
+                hfq_tensors.push(HfqTensor {
+                    name: name.to_string(),
+                    quant_type: QuantType::BF16,
+                    shape: meta.shape.iter().map(|&s| s as u32).collect(),
+                    group_size: 0,
+                    data: bf16_bytes,
+                    spilled_len: 0,
+                });
+            }
+            quantized_params += n_elements as u64;
             st_files[*file_idx].drop_tensor_pages(name);
             if let Some(ref mut sp) = spill {
                 maybe_spill(&mut hfq_tensors, sp, 2 * 1024 * 1024 * 1024);
@@ -10141,11 +10420,16 @@ fn main() {
             // Fall through to standard path for non-MQ2 formats.
         }
 
-        if is_moe
-            && name.contains("mlp.experts.")
-            && (name.ends_with("gate_up_proj") || name.ends_with("down_proj"))
-            && meta.shape.len() == 3
-        {
+        // Gemma 4 26B-A4B uses the SAME layout but at a different prefix
+        // (no `mlp.` — tensors live directly under `.experts.`):
+        //   model.language_model.layers.{N}.experts.gate_up_proj
+        //   model.language_model.layers.{N}.experts.down_proj
+        // Name-suffix match + shape check handles both qwen3.5 (mlp.experts.*)
+        // and gemma4 (experts.*) without prefix-specific conditions.
+        let is_moe_expert_3d = (is_moe || is_gemma4)
+            && (name.ends_with("experts.gate_up_proj") || name.ends_with("experts.down_proj"))
+            && meta.shape.len() == 3;
+        if is_moe_expert_3d {
             let n_experts = meta.shape[0];
             let inner_n: usize = meta.shape[1..].iter().product();
             let elem_size = match meta.dtype.as_str() {
@@ -11162,6 +11446,22 @@ fn main() {
                     if k_dim % 256 == 0 {
                         let signs1 = gen_fwht_signs(42, 256);
                         let signs2 = gen_fwht_signs(1042, 256);
+                        // ── Gemma4 (arch 13/22): embed/lm_head MUST NOT reach AWQ ──
+                        // They are always routed to Q8 by the K-map before this
+                        // branch, so they cannot arrive here. Assert the invariant
+                        // rather than leave it implicit: Gemma4's tied embed/lm_head
+                        // carries an implicit sqrt(d_model) scaling with no RMSNorm
+                        // anchor on the embedding dimension, which makes AWQ's
+                        // imatrix-saliency ratio meaningless and the per-channel
+                        // pre-scale actively harmful.
+                        debug_assert!(
+                            !(is_gemma4_family
+                                && (name.contains("embed_tokens") || name.contains("lm_head"))),
+                            "gemma4 embed/lm_head reached the MQ4 AWQ path — the kmap Q8 \
+                             guard should have prevented this (arch {} tensor {})",
+                            arch_id,
+                            name
+                        );
                         match override_fmt {
                             GgufFormat::Mq4 => {
                                 // Inline AWQ + MQ4 dance (mirrors the Base MQ4 arm).
@@ -15019,6 +15319,169 @@ mod tests {
                 / rotated.len() as f32
         };
         assert!(mse(&q_repaired) <= mse(&q_regular));
+    }
+
+    // ── Muse Glimmer (arch 14) classification locks ────────────────────────
+    // These pin the new Glimmer tensor names to their intended quant decisions so a
+    // future refactor cannot silently move them. Existing arches must not change.
+
+    #[test]
+    fn glimmer_lm_head_is_q8_separate_untied() {
+        // Glimmer tie_word_embeddings=false — lm_head is SEPARATE from embed (unlike
+        // Gemma4 which ties). Must land Q8 via Rule 2 (kmap_resolve_mode:50xx) and
+        // via q8_class_of:is_q8_tensor (56xx). should_quantize keeps it quantizable
+        // (contains "weight", not norm/bias, not vision).
+        let name = "lm_head.weight";
+        assert!(should_quantize(name), "lm_head must be quantizable (should_quantize:53xx)");
+        assert_eq!(q8_class_of(name), Some("lm_head"), "q8_class_of:55xx lm_head");
+        assert!(is_q8_tensor(name), "is_q8_tensor:59xx must be Q8");
+        assert_eq!(kmap_resolve(name, 52, false), QuantLevel::Q8, "kmap Rule2 Q8");
+        assert_eq!(kmap_resolve_mode(name, 52, false, 0), QuantLevel::Q8);
+        assert_eq!(kmap_resolve_mode(name, 52, false, 3), QuantLevel::Q8);
+    }
+
+    #[test]
+    fn glimmer_q8_classes_narrowing_keeps_lm_head_and_embed_only() {
+        // The arch-14 default sets HIPFIRE_Q8_CLASSES=lm_head,embed and turns the
+        // fixed tier on. This locks in what that narrowing actually selects: the
+        // two output-side tensors are held at Q8, and attention is NOT — dragging
+        // attention in would inflate the artifact for no stated requirement.
+        //
+        // Regression value: the first Glimmer MQ4 build shipped lm_head at
+        // MQ4G256 even though `kmap_resolve` returns Q8 for it, because on a
+        // dense model the fixed tier is off and the K-map verdict is never
+        // consulted. The K-map assertions in the sibling test passed the entire
+        // time. Only a check that pins the CLASS SELECTION catches that gap.
+        //
+        // SAFETY: single-threaded test; env is restored before returning.
+        let prev = std::env::var("HIPFIRE_Q8_CLASSES").ok();
+        unsafe { std::env::set_var("HIPFIRE_Q8_CLASSES", "lm_head,embed") };
+
+        assert!(is_q8_tensor("lm_head.weight"), "lm_head must be Q8");
+        assert!(
+            is_q8_tensor("model.language_model.embed_tokens.weight"),
+            "embed_tokens must be Q8"
+        );
+        let attn_q8 = is_q8_tensor("model.language_model.layers.0.self_attn.q_proj.weight");
+        let gate_q8 = is_q8_tensor("model.language_model.layers.0.self_attn.gate_proj.weight");
+        assert!(!attn_q8, "attention must NOT be pulled into Q8 by the glimmer default");
+        assert!(!gate_q8, "the Glimmer attention gate is a projection and must follow --format");
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("HIPFIRE_Q8_CLASSES", v) },
+            None => unsafe { std::env::remove_var("HIPFIRE_Q8_CLASSES") },
+        }
+    }
+
+    #[test]
+    fn glimmer_embed_tokens_is_q8() {
+        let name = "model.language_model.embed_tokens.weight";
+        assert!(should_quantize(name));
+        assert_eq!(q8_class_of(name), Some("embed"));
+        assert!(is_q8_tensor(name));
+        assert_eq!(kmap_resolve(name, 52, false), QuantLevel::Q8);
+        assert_eq!(kmap_resolve_mode(name, 52, false, 1), QuantLevel::Q8);
+    }
+
+    #[test]
+    fn glimmer_self_attn_gate_proj_is_attention_not_mlp_or_router() {
+        // NEW name in Glimmer: self_attn.gate_proj gates attention output before
+        // o_proj (see hipfire-arch-muse-glimmer lib.rs:24-27). Must be attn class,
+        // not MLP gate and not MoE router.
+        let attn_gate = "model.language_model.layers.0.self_attn.gate_proj.weight";
+        let mlp_gate = "model.language_model.layers.0.mlp.gate_proj.weight";
+        // q8_class_of:55xx — self_attn substring => "attn"; mlp gate has no
+        // self_attn/attn_q/class and is not a router, so None.
+        assert_eq!(q8_class_of(attn_gate), Some("attn"), "self_attn.gate_proj => attn (q8_class_of)");
+        assert_eq!(q8_class_of(mlp_gate), None, "mlp.gate_proj must not be attn/router");
+        assert!(is_q8_tensor(attn_gate), "attn gate must be fixed-tier Q8");
+        assert!(!is_q8_tensor(mlp_gate), "mlp gate is not fixed-tier (unless --q8-router on MoE)");
+        // should_quantize:53xx — both are weights, not norms/bias/vision => true
+        assert!(should_quantize(attn_gate));
+        assert!(should_quantize(mlp_gate));
+        // awq_eligible:61xx — ends_with("gate_proj.weight") catches BOTH. This is
+        // CORRECT for the attention gate: it is an input-side projection from the
+        // normed hidden (post_input_layernorm) whose runtime path is the same
+        // fused_rmsnorm_rotate AWQ kernel as mlp gate/up. The scale s[j] multiplies
+        // the gate's input channels and is divided at inference before the gate;
+        // the gate's output then scales attn_out via sigmoid. Input-side AWQ is
+        // mathematically valid regardless of where the gate's output is applied.
+        assert!(awq_eligible(attn_gate), "attn gate must be AWQ-eligible (input-side)");
+        assert!(awq_eligible(mlp_gate), "mlp gate must be AWQ-eligible");
+        // kmap: dense edge-layer rule promotes FFN only, not attn — so even in
+        // edge layer 0, the attn gate stays Base (not Promote6). This matches the
+        // dense policy (attn promotion regresses PPL +3.1%).
+        assert_eq!(kmap_resolve(attn_gate, 52, false), QuantLevel::Base);
+        // MoE is irrelevant for Glimmer (dense), but verify router rule does not
+        // mis-fire even if is_moe were true: attn gate is not mlp.gate.weight.
+        // For MoE edge-layer (0 is edge), full promotion returns Promote6 for every
+        // tensor including attn — that is the expected MoE policy, not a router.
+        assert_eq!(kmap_resolve_mode("model.layers.0.self_attn.gate_proj.weight", 52, true, 0), QuantLevel::Promote6);
+    }
+
+    #[test]
+    fn glimmer_norms_are_f16_never_lowbit() {
+        // Sandwich RMSNorms: input, post_attn, pre_ffn, post_ffn + final norm.
+        // All contain "norm" => Rule1 F16 (kmap_resolve_mode:50xx) and
+        // should_quantize:false (53xx). Must never be quantized.
+        let norms = [
+            "model.language_model.layers.0.input_layernorm.weight",
+            "model.language_model.layers.0.post_attention_layernorm.weight",
+            "model.language_model.layers.0.pre_feedforward_layernorm.weight",
+            "model.language_model.layers.0.post_feedforward_layernorm.weight",
+            "model.language_model.layers.51.input_layernorm.weight",
+            "model.language_model.norm.weight",
+        ];
+        for name in norms {
+            assert!(!should_quantize(name), "norm {name} must not be quantizable");
+            assert_eq!(kmap_resolve(name, 52, false), QuantLevel::F16, "kmap F16 for {name}");
+            assert_eq!(kmap_resolve_mode(name, 52, false, 1), QuantLevel::F16);
+            assert_eq!(kmap_resolve_mode(name, 52, false, 2), QuantLevel::F16);
+            assert_eq!(kmap_resolve_mode(name, 52, false, 3), QuantLevel::F16);
+            assert_eq!(kmap_resolve(name, 52, true), QuantLevel::F16, "even MoE must be F16");
+            // q8_class_of is unrelated to norms — must be None / not Q8
+            assert!(!is_q8_tensor(name));
+        }
+    }
+
+    #[test]
+    fn glimmer_vision_prefixes_are_f16_and_not_parsed_as_text_layers() {
+        // Glimmer vision tensors are model.vision_tower.*, model.vision_adapter.*,
+        // model.vision_projection.* (809 total). Previously is_vision/should_quantize
+        // only matched model.visual./visual./vision_tower. — so
+        // model.vision_tower.* fell through to text quant. Now extended additively
+        // (should_quantize:53xx, main is_vision, parse_layer_idx:49xx).
+        let vision = [
+            "model.vision_tower.layers.0.attn.q_proj.weight",
+            "model.vision_tower.layers.49.mlp.fc2.weight",
+            "model.vision_tower.layers.25.norm1.weight",
+            "model.vision_adapter.fc1.weight",
+            "model.vision_projection.weight",
+        ];
+        for name in vision {
+            assert!(!should_quantize(name), "vision {name} must stay F16 (should_quantize)");
+            assert_eq!(kmap_resolve(name, 52, false), QuantLevel::F16, "kmap vision F16 for {name}");
+            assert_eq!(kmap_resolve_mode(name, 52, false, 0), QuantLevel::F16);
+            assert_eq!(kmap_resolve_mode(name, 52, true, 1), QuantLevel::F16);
+            // parse_layer_idx must NOT extract vision_tower.layers.N as text layer
+            assert_eq!(parse_layer_idx(name), None, "vision {name} must not parse as layer idx");
+            // The old unanchored find("layers.") would have returned Some(0/49)
+            // and edge-layer Promote6 could have fired — locked to None now.
+        }
+        // Plain vision_tower. prefix (dots.ocr style) must still be F16
+        assert_eq!(kmap_resolve("vision_tower.layers.0.attn.q_proj.weight", 52, false), QuantLevel::F16);
+        assert_eq!(parse_layer_idx("vision_tower.layers.0.attn.q_proj.weight"), None);
+        // model.visual.* (Qwen3.5-VL) unchanged
+        assert!(!should_quantize("model.visual.patch_embed.weight"));
+        assert_eq!(parse_layer_idx("model.visual.layers.0.weight"), None);
+    }
+
+    #[test]
+    fn glimmer_text_layers_still_parse() {
+        // Sanity: text layers must still parse correctly (no regression for non-vision).
+        assert_eq!(parse_layer_idx("model.language_model.layers.0.self_attn.q_proj.weight"), Some(0));
+        assert_eq!(parse_layer_idx("model.language_model.layers.51.mlp.down_proj.weight"), Some(51));
+        assert_eq!(parse_layer_idx("model.layers.3.self_attn.gate_proj.weight"), Some(3));
     }
 
     #[test]

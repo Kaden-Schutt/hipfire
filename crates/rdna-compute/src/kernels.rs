@@ -1053,6 +1053,10 @@ pub const GEMV_MQ4G128_SRC: &str = include_str!("../../../kernels/src/gemv_mq4g1
 pub const GEMV_MQ8G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq8g256.hip");
 /// MQ6-G256 GEMV: FWHT-rotated HFQ6 (6-bit, 200 B/group). Uses pre-rotated x.
 pub const GEMV_MQ6G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq6g256.hip");
+/// MQ6-G256 batched GEMM for pre-rotated x. Scalar baseline mirroring
+/// gemm_hfq4g256.hip (BATCH_TILE=8, 32 threads/row, __shfl_down reduction).
+/// Used by gemma4 `proj_gemm_batched` for Promote6 tensors (v_proj, down_proj).
+pub const GEMM_MQ6G256_SRC: &str = include_str!("../../../kernels/src/gemm_mq6g256.hip");
 /// MQ5-G256 GEMV: FWHT-rotated HFQ5 (5-bit, 168 B/group). Uses pre-rotated x.
 pub const GEMV_MQ5G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq5g256.hip");
 pub const FUSED_RMSNORM_MQ_ROTATE_SRC: &str =
@@ -2817,6 +2821,87 @@ pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma.gfx12.hip");
 pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_BT_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_gfx12_bt.hip");
+/// Muse Glimmer-owned batch-tiled gfx12 residual GEMM. Sibling of
+/// `GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_BT_SRC`; same math, register-lean
+/// full-tile variants only. Used exclusively by hipfire-arch-muse-glimmer.
+pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_MUSE_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_gfx12_muse.hip");
+/// Muse Glimmer-owned batch-tiled gfx1100 residual GEMM (K2). Sibling of
+/// `GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_MUSE_SRC`; full-tile widths 4/6/8/12/16
+/// for gate/up shape measurement. Used exclusively by hipfire-arch-muse-glimmer.
+pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_BT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_gfx1100_muse_bt.hip");
+/// Muse Glimmer-owned batch-tiled gfx1100 residual GEMM with LDS HFQ affine
+/// codebook precompute (16 values per output-row/group). Sibling of
+/// `GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_BT_SRC`; full-tile widths 4/6/12
+/// only. Used exclusively by hipfire-arch-muse-glimmer.
+pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_CB_BT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_gfx1100_muse_cb_bt.hip");
+/// Muse Glimmer-owned multi-wave batch-tiled gfx1100 residual GEMM (K2, BT4).
+/// Sibling of `GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_BT_SRC`; groups
+/// NWAVES identical BT4 row waves into one block to expose activation-cache
+/// reuse/scheduling for exact gate/up. Used exclusively by
+/// hipfire-arch-muse-glimmer. Full-tile only (`batch % 64 == 0`).
+pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_MW_BT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_gfx1100_muse_mw_bt.hip");
+/// Muse Glimmer-owned batch-tiled gfx1100 residual GEMM, deterministic
+/// K-split phase 1 (partials only). Sibling of
+/// `GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_BT_SRC`; same K2 arithmetic and
+/// batch-tile structure but partitioned over K_SPLITS=4. Writes plain
+/// partials to the existing `[K_SPLITS][batch][M]` scratch layout — no
+/// atomicAdd, no residual. Finalize remains `gemm_ksplit_det_finalize`.
+/// Used exclusively by hipfire-arch-muse-glimmer. Full-tile only
+/// (`batch % (16*bt) == 0`).
+pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_KS_BT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_gfx1100_muse_ks_bt.hip");
+/// Muse Glimmer-owned multi-wave LDS-staged-X gfx1100 residual GEMM
+/// (K2, MW8, BT6). Sibling of `GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_MW_BT_SRC`
+/// and `…_MUSE_BT_SRC`; stages one 96×256 FP16 X group into static LDS and
+/// reuses it across 8 row waves. Exact gate/up only (M=19968, K=6656,
+/// batch % 96 == 0). Used exclusively by hipfire-arch-muse-glimmer.
+pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_LDS_G256_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_gfx1100_muse_lds_g256.hip");
+/// Muse Glimmer-owned row-reuse batch-tiled gfx1100 residual GEMM (K2).
+/// Sibling of `GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_BT_SRC`; each wave owns
+/// RM row tiles × BV batch tiles with RM*BV=12, loading each B half16 once per
+/// batch tile and reusing it across RM WMMA calls. Exact gate/up only
+/// (M=19968, K=6656, rm in {2,3,4,6}, batch % (16*BV) == 0). RM2/BV6 is
+/// production for gfx1100 B=192 gate/up via `gemm_hfq4g256_batched_lmhead`;
+/// other RM/BV instantiations remain measurement-only.
+pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_RM_BT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_gfx1100_muse_rm_bt.hip");
+/// Muse Glimmer-owned row-reuse gfx1100 residual GEMM with half-broadcast A
+/// dequant (K2). Sibling of `GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_RM_BT_SRC`;
+/// only lanes 0..15 load/dequant each A fragment and bit-broadcast the raw
+/// half16 u32s to the paired lane via wave32 shuffle. Exact gate/up only
+/// (M=19968, K=6656, rm in {2,4}, batch % (16*BV) == 0). Measurement-only;
+/// used exclusively by hipfire-arch-muse-glimmer.
+pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_RM_HB_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_gfx1100_muse_rm_hb.hip");
+/// Muse Glimmer-owned row-reuse gfx1100 residual GEMM with packed-half2 A
+/// dequant (K2). Sibling of `GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_RM_BT_SRC`;
+/// dequants each 16-nibble A fragment via eight `__hfma2` half2 ops and
+/// reinterprets as the half16 WMMA operand. Exact gate/up only
+/// (M=19968, K=6656, rm in {1,2}, batch % (16*BV) == 0). Measurement-only;
+/// used exclusively by hipfire-arch-muse-glimmer. Packed path is not assumed
+/// bit-exact vs scalar; full-output bit oracle is authoritative.
+pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_RM_PK_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_gfx1100_muse_rm_pk.hip");
+/// Muse Glimmer-owned row-reuse gfx1100 residual GEMM with two-slot X-fragment
+/// software pipeline (K2). Sibling of `GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_RM_BT_SRC`;
+/// RM2/BV6 only. For each g/kt fragment issues B loads ahead of A dequant and
+/// keeps at most two live B fragments. Scalar and packed-half2 dequant symbols
+/// share one module. Exact gate/up only (M=19968, K=6656, batch=192).
+/// Measurement-only; used exclusively by hipfire-arch-muse-glimmer.
+pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_RM_PIPE_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_gfx1100_muse_rm_pipe.hip");
+
+
+
+
+
+
+
 pub const GEMM_HFQ4G256_LMHEAD_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_lmhead_wmma.gfx12.hip");
 // Q8_1 MMQ prefill variant — opt-in via HIPFIRE_MMQ=1, gated to RDNA3/3.5.
@@ -3541,6 +3626,19 @@ pub const FUSED_QKVZA_HFQ4G256_K2048_GFX1100_SRC: &str = concat!(
     include_str!("../../../kernels/src/fused_qkvza_hfq4g256.hip")
 );
 
+// Muse Glimmer gfx1100 AR decode: one fused Q+K+V+attention_gate HFQ4/MQ4
+// projection at exact shape q=4096, k=256, v=256, attention_gate=4096, K=6656
+// (26 groups). Host enforces dimensions and selects this identity; reuses the
+// generic fused_qkvza_hfq4g256 arithmetic template with fixed groups_per_row.
+// No buffer-load or experimental schedule opts — weight-cache policy only.
+pub const FUSED_GLIMMER_QKVG_HFQ4G256_K6656_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    "#define HIPFIRE_GLIMMER_QKVG_K6656 1\n",
+    "#define HIPFIRE_QKVZA_KERNEL_NAME fused_glimmer_qkvg_hfq4g256_k6656_gfx1100\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkvza_hfq4g256.hip")
+);
+
 /// Radiowave gfx1100 dual-row QKVZA probe. Two adjacent rows share each
 /// K=2048 activation load while preserving independent weight streams and the
 /// shipping four-chain reduction order.
@@ -3958,6 +4056,16 @@ pub const GEMV_Q6K_SRC: &str = include_str!("../../../kernels/src/gemv_q6k.hip")
 /// RMSNorm: y[i] = x[i] * weight[i] / sqrt(mean(x^2) + eps)
 pub const RMSNORM_SRC: &str = include_str!("../../../kernels/src/rmsnorm.hip");
 
+/// Fused sandwich post-norm + residual-add: out = residual + rmsnorm(x, weight).
+/// Collapses (rmsnorm + memcpy + add_inplace) 3 launches into 1 (gemma4 L4).
+pub const RMSNORM_RESIDUAL_ADD_SRC: &str =
+    include_str!("../../../kernels/src/rmsnorm_residual_add.hip");
+
+/// gemma4 L3: fused per-head weighted q/k RMSNorm + q prescale + dual RoPE.
+/// Collapses (q_norm + k_norm + scale_f32(q) + rope) 4 launches into 1.
+pub const FUSED_GEMMA4_QK_NORM_ROPE_SRC: &str =
+    include_str!("../../../kernels/src/fused_gemma4_qk_norm_rope.hip");
+
 /// TriAttention sidecar calibration: GPU band-statistics accumulator.
 /// Replaces the CPU BandAccumulator loop (99% of sidecar cal wall time).
 pub const TRIATTN_ACCUMULATE_SRC: &str =
@@ -4042,6 +4150,18 @@ pub const FUSED_GATE_UP_HFQ4G256_SRC: &str = concat!(
 pub const FUSED_GATE_UP_HFQ4G256_K1024_GFX1201_SRC: &str = concat!(
     "#define HIPFIRE_FUSED_GATE_UP_KERNEL fused_gate_up_hfq4g256_k1024_gfx1201\n",
     "#define HIPFIRE_FUSED_GATE_UP_K1024 1\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_gate_up_hfq4g256.hip")
+);
+// Muse Glimmer gfx1100 AR decode: one fused gate+up HFQ4/MQ4 projection at
+// exact shape gate_m=up_m=19968, K=6656 (26 groups). Host enforces dimensions
+// and selects this identity; reuses the generic fused_gate_up_hfq4g256
+// arithmetic template with fixed groups_per_row. No buffer-load or
+// experimental schedule opts — weight-cache policy only.
+pub const FUSED_GLIMMER_GATE_UP_HFQ4G256_K6656_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_FUSED_GATE_UP_KERNEL fused_glimmer_gate_up_hfq4g256_k6656_gfx1100\n",
+    "#define HIPFIRE_GLIMMER_GATE_UP_K6656 1\n",
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/fused_gate_up_hfq4g256.hip")
@@ -4158,6 +4278,13 @@ pub const KV_CACHE_WRITE_Q8_0_PAIR_GFX1100_SRC: &str =
 /// K and V caches stored as [max_seq × n_kv_heads × blocks_per_head × 34].
 pub const ATTENTION_Q8_0_KV_SRC: &str = include_str!("../../../kernels/src/attention_q8_0_kv.hip");
 
+/// Sliding-window variant of ATTENTION_Q8_0_KV_SRC. Adds a `window`
+/// parameter: 0 = full causal (identical to the baseline), >0 = attend only
+/// to the last `window` keys ([max(0, seq_len - window), seq_len)). Used by
+/// Gemma 4 sliding layers (window=1024); full layers call with window=0.
+pub const ATTENTION_Q8_0_KV_SWA_SRC: &str =
+    include_str!("../../../kernels/src/attention_q8_0_kv_swa.hip");
+
 /// Batched counterpart of ATTENTION_Q8_0_KV_SRC. Processes N queries in
 /// one launch with per-row causal windows from a positions[] array.
 pub const ATTENTION_Q8_0_KV_BATCHED_SRC: &str =
@@ -4179,6 +4306,48 @@ pub const ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SRC: &str =
 /// the gfx12-specific WMMA builtin/output mapping.
 pub const ATTENTION_Q8_0_FLASH_PREFILL_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/attention_q8_0_flash_prefill_wmma.gfx12.hip");
+
+/// Benchmark-only gfx1201 LongSpec partition WMMA flash: same arithmetic as
+/// `ATTENTION_Q8_0_FLASH_PREFILL_WMMA_GFX12_SRC` but writes retained online-
+/// softmax state `[m,l,O_unnormalized]` per query/head instead of normalized O.
+/// JIT-only via `attention_q8_0_flash_prefill_wmma_partial_gfx1201_bench`.
+pub const ATTENTION_Q8_0_FLASH_PREFILL_WMMA_PARTIAL_GFX1201_SRC: &str =
+    include_str!("../../../kernels/src/attention_q8_0_flash_prefill_wmma_partial.gfx1201.hip");
+
+/// Benchmark-only stable LSE merge of two `[m,l,O_unnormalized]` partials into
+/// normalized O. JIT-only via `attention_partition_merge_f32_bench`.
+pub const ATTENTION_PARTITION_MERGE_F32_SRC: &str =
+    include_str!("../../../kernels/src/attention_partition_merge_f32.hip");
+
+/// Muse Glimmer-owned sliding-window variant of
+/// `ATTENTION_Q8_0_FLASH_PREFILL_WMMA_GFX12_SRC`. Same WMMA tiling and Q8
+/// dequant; adds a `window` argument, a tile-aligned lower bound so fully
+/// out-of-window key tiles are skipped, and the matching mask term.
+/// `window <= 0` reproduces the parent exactly.
+pub const ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SWA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/attention_q8_0_flash_prefill_wmma_swa.gfx12.hip");
+
+/// RDNA3 counterpart of `ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SWA_GFX12_SRC`.
+/// Same algorithm and `window` contract; WMMA tiling uses the gfx11
+/// interleaved accumulator mapping and 16-element K-lane split.
+/// `window <= 0` reproduces the parent `ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SRC` exactly.
+pub const ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SWA_SRC: &str =
+    include_str!("../../../kernels/src/attention_q8_0_flash_prefill_wmma_swa.hip");
+
+/// Gfx1100 (discrete RDNA3) arch-isolated variant of `ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SWA_SRC`.
+/// Byte-identical to the plain `..._swa.hip` at introduction; the split exists
+/// solely so per-arch tuning (prefetch, LDS pressure, FIXED_HEAD_DIM defaults)
+/// can diverge without arch-bleed. See `autoresearch/ar/certify/cross_arch.py:66`
+/// `check_cross_arch` — arch-suffixed files (`*.gfxNNNN.hip`) are dispatch-
+/// isolated and skipped by the gate, while an un-suffixed shared file would
+/// require `#if`-gating and would be flagged as bleed.
+pub const ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SWA_GFX1100_SRC: &str =
+    include_str!("../../../kernels/src/attention_q8_0_flash_prefill_wmma_swa.gfx1100.hip");
+
+/// Gfx1151 (RDNA3.5 APU, Strix Halo) arch-isolated variant. Same contract as
+/// the gfx1100 sister; byte-identical at introduction.
+pub const ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SWA_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/attention_q8_0_flash_prefill_wmma_swa.gfx1151.hip");
 
 /// Phase-timed variant of ATTENTION_Q8_0_KV_SRC. Functionally equivalent
 /// to the baseline kernel but instrumented with wall_clock64() around each
@@ -4338,6 +4507,9 @@ pub const TRIATTN_SCORE_ASYM4_SRC: &str =
 /// TriAttention scoring on asym2 (Givens-rotated 2-bit) K cache.
 pub const TRIATTN_SCORE_ASYM2_SRC: &str =
     include_str!("../../../kernels/src/triattn_score_asym2.hip");
+/// TriAttention scoring for adaptive signed-FWHT K caches.
+pub const TRIATTN_SCORE_FWHT_SRC: &str =
+    include_str!("../../../kernels/src/triattn_score_fwht.hip");
 
 /// Gather-based compaction for KV eviction: copy `budget` src rows to dst.
 pub const KV_COMPACT_GATHER_SRC: &str = include_str!("../../../kernels/src/kv_compact_gather.hip");
@@ -4437,6 +4609,18 @@ pub const ROPE_PARTIAL_INTERLEAVED_SRC: &str =
 #[cfg(feature = "deltanet")]
 pub const ROPE_PARTIAL_HALFSPLIT_SRC: &str =
     include_str!("../../../kernels/src/rope_partial_halfsplit.hip");
+
+/// Gemma 4 full-attention partial RoPE (HF `rotate_half` pairing). head_dim=512
+/// but only the first `n_rot_pairs` pairs (i, i+head_dim/2) rotate; the rest are
+/// NoPE pass-through. Pairs differ from the interleaved/halfsplit variants — see
+/// `kernels/src/rope_partial_halved.hip` for the proportional-RoPE math.
+pub const ROPE_PARTIAL_HALVED_SRC: &str =
+    include_str!("../../../kernels/src/rope_partial_halved.hip");
+
+/// Batched (N-token) counterpart to `ROPE_PARTIAL_HALVED_SRC`, used by Gemma 4
+/// batched prefill. Reads one i32 position per token from a device array.
+pub const ROPE_PARTIAL_HALVED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/rope_partial_halved_batched.hip");
 
 /// Exact gfx1100 Qwen3.6 full-attention decode preparation: deinterleave Q and
 /// gate, RMS-normalize Q/K, then apply partial half-split RoPE head-locally.
@@ -4642,6 +4826,22 @@ pub const ROPE_PARTIAL_INTERLEAVED_BATCHED_SRC: &str =
 #[cfg(feature = "deltanet")]
 pub const ROPE_PARTIAL_HALFSPLIT_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/rope_partial_halfsplit_batched.hip");
+
+/// 3D mrope, half-split convention. Twin of ROPE_PARTIAL_HALFSPLIT_SRC,
+/// differing only in which position each frequency index reads: band mapping
+/// is H if (d%3==1 && d < 3*sec_h), W if (d%3==2 && d < 3*sec_w), else T
+/// (the interleaved [THWTHW...TT] layout HF's apply_interleaved_mrope
+/// produces). See `hipfire_arch_qwen35_vl::mrope::mrope_axis_for_freq` for
+/// the CPU-side spec this arithmetic must match exactly.
+#[cfg(feature = "deltanet")]
+pub const ROPE_MROPE_HALFSPLIT_SRC: &str =
+    include_str!("../../../kernels/src/rope_mrope_halfsplit.hip");
+
+/// Batched twin of ROPE_MROPE_HALFSPLIT_SRC — see that const for the
+/// band-mapping rationale.
+#[cfg(feature = "deltanet")]
+pub const ROPE_MROPE_HALFSPLIT_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/rope_mrope_halfsplit_batched.hip");
 
 /// 1D causal depthwise convolution (kernel_size=4) with persistent ring buffer state.
 /// For decode: one token at a time. conv_state: [n_channels × 3] ring buffer.
@@ -5082,6 +5282,10 @@ pub const LAYERNORM_SRC: &str = include_str!("../../../kernels/src/layernorm.hip
 
 /// GELU activation (tanh approximation, matches gelu_pytorch_tanh).
 pub const GELU_TANH_SRC: &str = include_str!("../../../kernels/src/gelu_tanh.hip");
+
+/// Gemma 4 final-logit soft-capping (in-place): x = tanh(x/cap)*cap. Applied to
+/// the LM-head output before sampling. Gemma 4 has NO per-attention-layer softcap.
+pub const LOGIT_SOFTCAP_SRC: &str = include_str!("../../../kernels/src/logit_softcap.hip");
 
 /// Transpose: out[c, r] = in[r, c]. Converts [rows, cols] → [cols, rows].
 pub const TRANSPOSE_SRC: &str = include_str!("../../../kernels/src/transpose.hip");
@@ -5763,6 +5967,41 @@ pub const V4F_CONVERT_F32_TO_F16_SRC: &str =
 /// output layout. Drop-in for `gemm_hfq4g256` (scalar FMA path).
 pub const GEMM_HFQ4G256_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_wmma.hip");
+
+/// gfx12 (RDNA4) sibling of GEMM_HFQ4G256_WMMA_SRC -- half8 operands,
+/// _w32_gfx12 builtin, rows-contiguous C mapping. Plain store (no residual).
+pub const GEMM_HFQ4G256_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g256_wmma.gfx12.hip");
+
+/// Q8_0 indexed MoE gate_up GEMV (Gemma 4 26B-A4B with --expert-q8).
+/// Same device-side expert-pointer table + topk_indices contract;
+/// Q8_0 weight layout (34 B/block of 32 elements).
+pub const GEMV_Q8_0_MOE_GATE_UP_K8_INDEXED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_q8_0_moe_gate_up_k8_indexed.hip");
+
+/// Q8_0 indexed MoE down-projection with fused scaled atomicAdd.
+pub const GEMV_Q8_0_MOE_DOWN_RESIDUAL_SCALED_K8_INDEXED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_q8_0_moe_down_residual_scaled_k8_indexed.hip");
+
+// ─── Gemma 4 hd512 attention + KV write kernels ─────────────────────────
+// (ROPE_PARTIAL_HALVED_SRC / LOGIT_SOFTCAP_SRC already defined above.)
+
+pub const ATTENTION_FLASH_ASYM3_TILE_HD512_SRC: &str =
+    include_str!("../../../kernels/src/attention_flash_asym3_tile_hd512.hip");
+pub const ATTENTION_FLASH_ASYM3_TILE_HD512_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/attention_flash_asym3_tile_hd512_batched.hip");
+pub const KV_CACHE_WRITE_ASYM_K_GIVENS3_HD512_SRC: &str =
+    include_str!("../../../kernels/src/kv_cache_write_asym_k_givens3_hd512.hip");
+pub const KV_CACHE_WRITE_ASYM_K_GIVENS3_HD512_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/kv_cache_write_asym_k_givens3_hd512_batched.hip");
+pub const KV_CACHE_WRITE_FWHT3_HD512_SRC: &str =
+    include_str!("../../../kernels/src/kv_cache_write_fwht3_hd512.hip");
+pub const KV_CACHE_WRITE_FWHT3_HD512_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/kv_cache_write_fwht3_hd512_batched.hip");
+pub const ATTENTION_FLASH_FWHT3_TILE_HD512_SRC: &str =
+    include_str!("../../../kernels/src/attention_flash_fwht3_tile_hd512.hip");
+pub const ATTENTION_FLASH_FWHT3_TILE_HD512_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/attention_flash_fwht3_tile_hd512_batched.hip");
 
 /// DeepSeek V4 compressor batched ALIGNED compress events. Replaces the
 /// 3-kernel per-event chain (overlap_concat × 2 + softmax_pool)

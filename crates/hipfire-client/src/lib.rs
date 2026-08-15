@@ -761,11 +761,29 @@ impl Engine {
             }
 
             if let Err(cb_err) = event(&value) {
-                // A terminal event has already closed the transaction daemon-side, so
-                // `apply_terminal_control` drops the abort and never emits the
-                // `aborted`+`done` pair this drain blocks on. Same rule the post-commit
-                // path already follows.
-                if matches!(ty, Some("error") | Some("done")) {
+                // Terminal events have already closed the transaction daemon-side:
+                // - `error` is terminal by definition — the daemon has finished
+                //   this request and returned to its command loop, so it will
+                //   never answer an abort and the drain below would block forever.
+                //   This is exactly what a pre-`gen_start` error does — the
+                //   StreamContractGate rejects it as a PreStartEvent, the callback
+                //   fails, and the request hangs instead of surfacing the reason
+                //   (beta fix 2132a4de5). Report the daemon's error, which is the
+                //   useful one anyway.
+                // - `done` is likewise terminal — `apply_terminal_control` drops
+                //   the abort and never emits the `aborted`+`done` pair this drain
+                //   blocks on (PR 579).
+                // Both sides agree: never abort a terminated transaction. Reconciled
+                // by keeping beta's daemon_error for `error` (with a Cancelled
+                // carve-out to preserve PR579's explicit-cancellation test) and
+                // PR579's `done` handling which beta lacked.
+                if ty == Some("error") {
+                    if matches!(cb_err, ClientError::Cancelled) {
+                        return Err(cb_err);
+                    }
+                    return Err(daemon_error_from_value(&value));
+                }
+                if matches!(ty, Some("done")) {
                     return Err(cb_err);
                 }
                 return self.abort_and_drain_with_rx(request_id, attempt_id, rx, cb_err);

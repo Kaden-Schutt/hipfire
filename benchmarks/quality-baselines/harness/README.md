@@ -33,7 +33,7 @@ already have the ref locally.
 1. Make sure the BF16 reference for the model exists. If not, run
    `build_kld_ref` (see plan §"Reference dump methodology") on the
    gfx1151 host (only host with enough UMA RAM for 27B BF16). Upload
-   to `hipfire-models/hipfire-eval-refs` and add an entry to
+   to `hipfire-models/eval-refs` and add an entry to
    `manifest.json` with `sha256`, `hf_repo`, `producer_cmd`,
    `llamacpp_commit`, `slice_md5`, and shape metadata.
 
