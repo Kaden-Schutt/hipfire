@@ -50,3 +50,6 @@ pub mod dense;
 /// Vision and OCR: Qwen3.5-VL and dots.ocr, including the text-only
 /// dots.ocr path.
 pub mod vision;
+
+/// Redline capture/replay fixtures lifted out of the daemon.
+pub mod redline;
