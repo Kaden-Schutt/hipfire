@@ -6,6 +6,7 @@
 //! holds only what the arch crates need to implement a carrier.
 
 use crate::hfq::HfqFile;
+use crate::kv_backend::KvBackend;
 use crate::safetensors_source::SafetensorsSource;
 use rdna_compute::Gpu;
 use std::path::Path;
@@ -60,14 +61,30 @@ impl ModelSource {
 pub struct LoadCtx<'a> {
     pub path: &'a str,
     pub max_seq: usize,
+    /// DeepSeek V4-only physical compute placement. The default is `Single`;
+    /// other carriers must ignore it.
+    pub deepseek4_compute_placement: hipfire_config::Deepseek4ComputePlacement,
+    /// DeepSeek V4-only routed-expert fanout override. `None` preserves the
+    /// checkpoint value; other carriers must ignore it.
+    pub deepseek4_experts_per_token: Option<usize>,
     pub draft_path: Option<&'a str>,
     pub kv_mode_override: Option<&'a str>,
+    pub kv_backend: KvBackend,
     pub kv_adaptive_override: Option<&'a str>,
     pub state_quant_override: Option<&'a str>,
     pub cask: &'a CaskConfig,
     pub pp: usize,
     pub spec: SpecLoadCfg,
     pub gpu: &'a mut Gpu,
+    /// Gemma4 EAGLE drafter path (arch 22 `gemma4_unified_assistant`), separate
+    /// from `draft_path` (Qwen DFlash) so a DFlash .hfq can never be routed
+    /// into the EAGLE loader by accident. `None` = no drafter (AR-only).
+    /// Only `Gemma4Carrier` reads this.
+    pub gemma4_drafter_path: Option<&'a str>,
+    /// Gemma4 EAGLE draft_len (verify block = draft_len + 1). Validated at
+    /// load time via `gemma4_eagle_spec_len` (1..=5, default 3). Meaningful
+    /// only when `gemma4_drafter_path` is `Some`.
+    pub gemma4_draft_len: usize,
 }
 
 /// Per-load model-free n-gram speculator settings, resolved by the CLI through

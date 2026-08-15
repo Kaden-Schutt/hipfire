@@ -141,7 +141,7 @@ impl MtpComposeState {
         // Qwen35MtpHeadKvCache::free_gpu does `drop(inner)` which does not
         // release GPU memory (llama::KvCache has no Drop). Call the inner
         // KvCache's own free_gpu directly to properly hipFree each tensor.
-        self.mtp_kv.inner.free_gpu(gpu);
+        let _ = self.mtp_kv.inner.free_gpu(gpu);
     }
 }
 
@@ -565,6 +565,7 @@ pub fn spec_step_dflash_mtp(
         position,
         n_verify,
         rows_to_keep,
+        draft_scratch.ctx_modulus(),
     )?;
     let co = target.kv_cache.compact_offset as i32;
     draft_scratch
@@ -711,7 +712,7 @@ impl MtpComposeTreeState {
         // Qwen35MtpHeadKvCache::free_gpu does `drop(inner)` which does not
         // release GPU memory (llama::KvCache has no Drop). Call the inner
         // KvCache's own free_gpu directly to properly hipFree each tensor.
-        self.mtp_kv.inner.free_gpu(gpu);
+        let _ = self.mtp_kv.inner.free_gpu(gpu);
     }
 }
 
@@ -1258,6 +1259,7 @@ pub fn spec_step_dflash_mtp_tree(
         position,
         n_total,
         rows_to_keep,
+        draft_scratch.ctx_modulus(),
     )?;
     draft_scratch
         .thlog

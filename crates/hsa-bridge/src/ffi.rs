@@ -130,8 +130,7 @@ pub struct HsaLib {
         callback: unsafe extern "C" fn(HsaAgentHandle, *mut c_void) -> HsaStatus,
         data: *mut c_void,
     ) -> HsaStatus,
-    pub fn_agent_get_info:
-        unsafe extern "C" fn(HsaAgentHandle, u32, *mut c_void) -> HsaStatus,
+    pub fn_agent_get_info: unsafe extern "C" fn(HsaAgentHandle, u32, *mut c_void) -> HsaStatus,
 
     // Queues
     pub fn_queue_create: unsafe extern "C" fn(
@@ -145,8 +144,7 @@ pub struct HsaLib {
         queue: *mut *mut HsaQueue,
     ) -> HsaStatus,
     pub fn_queue_destroy: unsafe extern "C" fn(queue: *mut HsaQueue) -> HsaStatus,
-    pub fn_queue_load_write_index_relaxed:
-        unsafe extern "C" fn(queue: *const HsaQueue) -> u64,
+    pub fn_queue_load_write_index_relaxed: unsafe extern "C" fn(queue: *const HsaQueue) -> u64,
     pub fn_queue_store_write_index_release:
         unsafe extern "C" fn(queue: *const HsaQueue, value: u64),
 
@@ -159,8 +157,7 @@ pub struct HsaLib {
     ) -> HsaStatus,
     pub fn_signal_destroy: unsafe extern "C" fn(signal: HsaSignalHandle) -> HsaStatus,
     pub fn_signal_store_relaxed: unsafe extern "C" fn(signal: HsaSignalHandle, value: i64),
-    pub fn_signal_store_screlease:
-        unsafe extern "C" fn(signal: HsaSignalHandle, value: i64),
+    pub fn_signal_store_screlease: unsafe extern "C" fn(signal: HsaSignalHandle, value: i64),
     pub fn_signal_load_relaxed: unsafe extern "C" fn(signal: HsaSignalHandle) -> i64,
     pub fn_signal_wait_scacquire: unsafe extern "C" fn(
         signal: HsaSignalHandle,
@@ -216,12 +213,9 @@ pub struct HsaLib {
         options: *const c_char,
         loaded_code_object: *mut u64,
     ) -> HsaStatus,
-    pub fn_executable_freeze: unsafe extern "C" fn(
-        executable: HsaExecutableHandle,
-        options: *const c_char,
-    ) -> HsaStatus,
-    pub fn_executable_destroy:
-        unsafe extern "C" fn(executable: HsaExecutableHandle) -> HsaStatus,
+    pub fn_executable_freeze:
+        unsafe extern "C" fn(executable: HsaExecutableHandle, options: *const c_char) -> HsaStatus,
+    pub fn_executable_destroy: unsafe extern "C" fn(executable: HsaExecutableHandle) -> HsaStatus,
     pub fn_executable_get_symbol_by_name: unsafe extern "C" fn(
         executable: HsaExecutableHandle,
         symbol_name: *const c_char,
@@ -242,10 +236,7 @@ unsafe impl Sync for HsaLib {}
 macro_rules! load_fn {
     ($lib:expr, $name:expr, $ty:ty) => {{
         let sym: Symbol<'_, $ty> = $lib.get($name.as_bytes()).map_err(|e| {
-            crate::error::HsaError::new(
-                0,
-                &format!("failed to load symbol {}: {e}", $name),
-            )
+            crate::error::HsaError::new(0, &format!("failed to load symbol {}: {e}", $name))
         })?;
         *sym.into_raw()
     }};
@@ -253,31 +244,54 @@ macro_rules! load_fn {
 
 impl HsaLib {
     /// Dlopen libhsa-runtime64.so and resolve all function pointers.
-    /// Searches /opt/rocm/lib then the default loader path.
+    ///
+    /// Candidates come from `hipfire_config::rocm`, which honours
+    /// `HIPFIRE_ROCM_PATH` / `ROCM_PATH` / `HIP_PATH`, derives the root from a
+    /// device compiler on `PATH`, and understands versioned layouts such as
+    /// `/opt/rocm/core-7.14`. Only one selected root is tried; version selection
+    /// is never delegated to a bare loader soname. This previously hardcoded
+    /// `/opt/rocm/lib`, which fails on every non-default install.
     pub fn load() -> crate::error::HsaResult<Self> {
+        let candidates = hipfire_config::rocm::library_candidates(&[
+            "libhsa-runtime64.so.1",
+            "libhsa-runtime64.so",
+        ]);
         let lib = unsafe {
-            Library::new("/opt/rocm/lib/libhsa-runtime64.so.1")
-                .or_else(|_| Library::new("/opt/rocm/lib/libhsa-runtime64.so"))
-                .or_else(|_| Library::new("libhsa-runtime64.so.1"))
-                .or_else(|_| Library::new("libhsa-runtime64.so"))
-                .map_err(|e| {
-                    crate::error::HsaError::new(
+            let mut loaded = None;
+            let mut last_err = None;
+            for candidate in &candidates {
+                match Library::new(candidate) {
+                    Ok(l) => {
+                        loaded = Some(l);
+                        break;
+                    }
+                    Err(e) => last_err = Some(e),
+                }
+            }
+            match loaded {
+                Some(l) => l,
+                None => {
+                    return Err(crate::error::HsaError::new(
                         0,
                         &format!(
-                            "failed to dlopen libhsa-runtime64.so: {e}. Is ROCm installed?"
+                            "failed to dlopen libhsa-runtime64.so: {}.\n{}",
+                            last_err
+                                .map(|e| e.to_string())
+                                .unwrap_or_else(|| "no candidates".into()),
+                            hipfire_config::rocm::resolution_failure(
+                                "the HSA runtime (libhsa-runtime64.so)",
+                                &candidates,
+                            )
                         ),
-                    )
-                })?
+                    ));
+                }
+            }
         };
 
         unsafe {
             Ok(Self {
                 fn_init: load_fn!(lib, "hsa_init", unsafe extern "C" fn() -> HsaStatus),
-                fn_shut_down: load_fn!(
-                    lib,
-                    "hsa_shut_down",
-                    unsafe extern "C" fn() -> HsaStatus
-                ),
+                fn_shut_down: load_fn!(lib, "hsa_shut_down", unsafe extern "C" fn() -> HsaStatus),
 
                 fn_iterate_agents: load_fn!(
                     lib,
@@ -457,11 +471,7 @@ impl HsaLib {
                 fn_executable_symbol_get_info: load_fn!(
                     lib,
                     "hsa_executable_symbol_get_info",
-                    unsafe extern "C" fn(
-                        HsaExecutableSymbolHandle,
-                        u32,
-                        *mut c_void,
-                    ) -> HsaStatus
+                    unsafe extern "C" fn(HsaExecutableSymbolHandle, u32, *mut c_void) -> HsaStatus
                 ),
                 _lib: lib,
             })

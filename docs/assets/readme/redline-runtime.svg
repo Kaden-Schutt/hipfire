@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="600" viewBox="0 0 1600 600" role="img" aria-labelledby="title desc">
+  <title id="title">Hipfire runtime and Redline validated replay path</title>
+  <desc id="desc">Model registry, Rust runtime and architecture-specific kernels form a graph; Redline validates and retains it before dispatching through ROCr to AMD GPUs, with ordinary HIP as a fail-closed fallback.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" x2="1"><stop stop-color="#100c0c"/><stop offset="1" stop-color="#1b1210"/></linearGradient>
+    <linearGradient id="accent" x1="0" x2="1"><stop stop-color="#fb3519"/><stop offset="1" stop-color="#ff9b1b"/></linearGradient>
+    <filter id="glow" x="-20%" y="-40%" width="140%" height="180%"><feGaussianBlur stdDeviation="8" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+  </defs>
+  <rect width="1600" height="600" rx="32" fill="url(#bg)"/>
+  <g font-family="Arial, Helvetica, sans-serif">
+    <text x="90" y="95" fill="#ffb25c" font-size="23" font-weight="700" letter-spacing="5">THE EXECUTION PATH</text>
+    <text x="90" y="151" fill="#fff7ed" font-size="44" font-weight="700">Ordinary graph first. Retained replay only after it proves safe.</text>
+    <path d="M282 318H389M611 318H718M940 318H1047M1269 318H1376" stroke="#ff6f1d" stroke-width="7" stroke-linecap="round" filter="url(#glow)"/>
+    <g fill="#ff6f1d"><path d="M389 306l24 12-24 12z"/><path d="M718 306l24 12-24 12z"/><path d="M1047 306l24 12-24 12z"/><path d="M1376 306l24 12-24 12z"/></g>
+    <g>
+      <rect x="90" y="240" width="192" height="156" rx="18" fill="#fff" fill-opacity=".06" stroke="#fff" stroke-opacity=".16"/>
+      <text x="118" y="289" fill="#fff7ed" font-size="24" font-weight="700">Model registry</text><text x="118" y="324" fill="#c8bbb3" font-size="18">pull · serve · chat</text><text x="118" y="353" fill="#c8bbb3" font-size="18">curated weights</text>
+      <rect x="419" y="240" width="192" height="156" rx="18" fill="#fff" fill-opacity=".06" stroke="#fff" stroke-opacity=".16"/>
+      <text x="447" y="289" fill="#fff7ed" font-size="24" font-weight="700">Rust runtime</text><text x="447" y="324" fill="#c8bbb3" font-size="18">model graph</text><text x="447" y="353" fill="#c8bbb3" font-size="18">typed dispatch</text>
+      <rect x="748" y="230" width="192" height="176" rx="18" fill="#f64c19" fill-opacity=".18" stroke="#ff8b25" stroke-width="2"/>
+      <text x="776" y="283" fill="#fff7ed" font-size="25" font-weight="700">Redline</text><text x="776" y="317" fill="#ffb25c" font-size="18" font-weight="700">VALIDATE + RETAIN</text><text x="776" y="350" fill="#d9ccc5" font-size="18">resource deps</text><text x="776" y="378" fill="#d9ccc5" font-size="18">invariant PM4 state</text>
+      <rect x="1077" y="240" width="192" height="156" rx="18" fill="#fff" fill-opacity=".06" stroke="#fff" stroke-opacity=".16"/>
+      <text x="1105" y="289" fill="#fff7ed" font-size="24" font-weight="700">ROCr queues</text><text x="1105" y="324" fill="#c8bbb3" font-size="18">public interfaces</text><text x="1105" y="353" fill="#c8bbb3" font-size="18">queue + signal</text>
+      <rect x="1406" y="240" width="104" height="156" rx="18" fill="#fff" fill-opacity=".06" stroke="#fff" stroke-opacity=".16"/>
+      <text x="1458" y="289" fill="#fff7ed" font-size="21" font-weight="700" text-anchor="middle">AMD</text><text x="1458" y="319" fill="#fff7ed" font-size="21" font-weight="700" text-anchor="middle">GPU</text><text x="1458" y="353" fill="#c8bbb3" font-size="16" text-anchor="middle">RDNA</text>
+    </g>
+    <path d="M844 433V475H515V433" fill="none" stroke="#8b7d76" stroke-width="3" stroke-dasharray="8 9"/><path d="M515 433l-11 17h22z" fill="#8b7d76"/>
+    <text x="680" y="515" fill="#c8bbb3" font-size="20" text-anchor="middle">Unsupported graph, failed validation, ABI mismatch, queue fault, or model change</text>
+    <text x="680" y="550" fill="#ffb25c" font-size="22" font-weight="700" text-anchor="middle">FAIL CLOSED → ordinary HIP dispatch</text>
+  </g>
+</svg>

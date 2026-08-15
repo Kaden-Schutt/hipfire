@@ -1,0 +1,81 @@
+[driver] label=prefix
+[driver] daemon=/mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/target/release/examples/daemon
+[driver] model=/mnt/scratch/models/deepseek-v4-flash-mq2r/deepseek-v4-flash.mq2r
+[driver] prompt_bytes=46 sha256=9a151396bc7ae69dcc2c8a5607ec464391419ae94772e1a63cf096c4885342b1
+[driver] max_tokens=64 temp=0.0
+[driver] >> {"type":"ping"}
+GPU dev 0: gfx942 (205.8 GB VRAM, HIP 7.0)
+[driver] << {"type":"pong"}
+[driver] >> {"type":"load","model":"/mnt/scratch/models/deepseek-v4-flash-mq2r/deepseek-v4-flash.mq2r","params":{"max_seq":4096,"kv_mode":"q8","kv_backend":"contiguous","speculation":"off","dflash_mode":"off","mtp_mode":"off","ngram_draft":false,"dspark_mode":"off"}}
+  pre-compiled kernels: .hipfire_kernels/gfx942
+[rocblas] loaded for gfx942
+deepseek4: MQ2R P3 tensor recipe verified; gfx1151 route v2 is ineligible on gfx942, using portable dispatch
+[driver] << {"type":"loaded","arch":"deepseek4","dim":0,"layers":0,"vocab":0,"vl":false,"cache_capable":true,"retry_reset_eligible":false}
+[driver] LOADED in 74.5s
+[driver] >> {"type":"generate","id":"g0-prefix","attempt_id":1,"prompt":"Explain what a GPU kernel is in two sentences.","max_tokens":64,"temperature":0.0}
+[driver] << {"type":"token","id":"g0-prefix","text":"A GP","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":"U k","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":"ernel ","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":"is a fun","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":"ction","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":" or s","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":"mal","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":"l pr","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":"ogra","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":"m ","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":"that r","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":"uns","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":" on the G","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":"P","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":"U's","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":" cores","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":" i","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":"n ","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":"parallel,","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":"鼎antsay","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":" *}---","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":"|---|--- eco","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":"nóm中海 ","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":"licensiera","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":"d(migratio","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":"ns dátummal","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":" hos","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":"tility变","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":"成一","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":"个ac","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":"leTreeLab","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":"el弯","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":"腰allas ","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":"Pre","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":"sence at","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":"ivid","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":"istoitu peيا","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":"رىг","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":"Ӏ ا","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":"لساعيهually","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":".”# الش","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":"عا","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":"عيه","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":" marke","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":"tplace- \n\n","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":"）","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":"”","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":"）” opp","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":"ortu","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":"nityi","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":"e","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":"s","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":" ","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":"a","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":" f","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":"u","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":"n","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":"c","attempt_id":1}
+[driver] << {"type":"token","id":"g0-prefix","text":"tion the next:0b0008 8","attempt_id":1}
+[driver] << {"type":"commit_ready","id":"g0-prefix","tokens":64,"tok_s":3.9017252941535085,"prompt_tokens":14,"prefill_tokens":14,"cached_tokens":0,"prefill_ms":17532,"total_ms":33935,"finish_reason":"length","drafter":"ar","attempt_id":1}
+[driver] >> {"type":"commit","id":"g0-prefix","attempt_id":1}
+[driver] << {"type":"aborted","id":"g0-prefix","reason":"client_cancelled","attempt_id":1}
+[driver] terminal aborted: {'type': 'aborted', 'id': 'g0-prefix', 'reason': 'client_cancelled', 'attempt_id': 1}
+[driver] >> {"type":"unload"}
+[daemon-control] received commit for id=g0-prefix attempt_id=1
+[driver] << {"type":"done","id":"g0-prefix","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":64,"prefill_ms":0,"decode_ms":0,"attempt_id":1}

@@ -4,6 +4,10 @@
 
 #include <hip/hip_runtime.h>
 
+#ifndef HIPFIRE_FUSED_GATE_UP_KERNEL
+#define HIPFIRE_FUSED_GATE_UP_KERNEL fused_gate_up_hfq4g256
+#endif
+
 // Fused Gate+Up HFQ4-G256: two GEMVs in one launch (saves 1 launch per
 // FFN layer vs separate gate/up calls). Grid = [gate_m + up_m] — each
 // block processes one row from either A_gate or A_up based on its index.
@@ -18,7 +22,7 @@
 // budget and keep codegen similar across archs.
 
 __launch_bounds__(32, 16)
-extern "C" __global__ void fused_gate_up_hfq4g256(
+extern "C" __global__ void HIPFIRE_FUSED_GATE_UP_KERNEL(
     const char* __restrict__ A_gate,
     const char* __restrict__ A_up,
     const float* __restrict__ x,
@@ -38,9 +42,22 @@ extern "C" __global__ void fused_gate_up_hfq4g256(
         A = A_up; y = y_up; local_row = gid - gate_m;
     }
 
+#if defined(HIPFIRE_FUSED_GATE_UP_K1024)
+    const int groups_per_row = 4;
+#elif defined(HIPFIRE_GLIMMER_GATE_UP_K6656)
+    // Muse Glimmer AR decode fused gate+up path: exact host-enforced shape is
+    // gate_m=up_m=19968, K=6656 (26 groups, quads=6, tail=2). Arithmetic
+    // (accumulator ownership, FMA order, tail placement, reduction tree)
+    // stays identical to the generic template.
+    const int groups_per_row = 26;
+#else
     const int groups_per_row = K / 256;
+#endif
     const char* row_ptr = A + (long long)local_row * groups_per_row * 136;
     const int boff = tid * 4;
+#if HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS
+    const auto row_rsrc = HIPFIRE_WEIGHT_RSRC(row_ptr);
+#endif
 
     float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
     const int quads = groups_per_row >> 2;
@@ -53,19 +70,19 @@ extern "C" __global__ void fused_gate_up_hfq4g256(
         const char* gp2 = gp1 + 136;
         const char* gp3 = gp2 + 136;
 
-        float sc0 = __builtin_bit_cast(float, *(const unsigned int*)(gp0));
-        float zp0 = __builtin_bit_cast(float, *(const unsigned int*)(gp0 + 4));
-        float sc1 = __builtin_bit_cast(float, *(const unsigned int*)(gp1));
-        float zp1 = __builtin_bit_cast(float, *(const unsigned int*)(gp1 + 4));
-        float sc2 = __builtin_bit_cast(float, *(const unsigned int*)(gp2));
-        float zp2 = __builtin_bit_cast(float, *(const unsigned int*)(gp2 + 4));
-        float sc3 = __builtin_bit_cast(float, *(const unsigned int*)(gp3));
-        float zp3 = __builtin_bit_cast(float, *(const unsigned int*)(gp3 + 4));
+        float sc0 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp0, (g + 0) * 136));
+        float zp0 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp0 + 4, (g + 0) * 136 + 4));
+        float sc1 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp1, (g + 1) * 136));
+        float zp1 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp1 + 4, (g + 1) * 136 + 4));
+        float sc2 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp2, (g + 2) * 136));
+        float zp2 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp2 + 4, (g + 2) * 136 + 4));
+        float sc3 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp3, (g + 3) * 136));
+        float zp3 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp3 + 4, (g + 3) * 136 + 4));
 
-        unsigned int pk0 = *(const unsigned int*)(gp0 + 8 + boff);
-        unsigned int pk1 = *(const unsigned int*)(gp1 + 8 + boff);
-        unsigned int pk2 = *(const unsigned int*)(gp2 + 8 + boff);
-        unsigned int pk3 = *(const unsigned int*)(gp3 + 8 + boff);
+        unsigned int pk0 = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp0 + 8 + boff, (g + 0) * 136 + 8 + boff);
+        unsigned int pk1 = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp1 + 8 + boff, (g + 1) * 136 + 8 + boff);
+        unsigned int pk2 = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp2 + 8 + boff, (g + 2) * 136 + 8 + boff);
+        unsigned int pk3 = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp3 + 8 + boff, (g + 3) * 136 + 8 + boff);
 
         int base = g * 256 + tid * 8;
 
@@ -101,27 +118,27 @@ extern "C" __global__ void fused_gate_up_hfq4g256(
     if (tail >= 1) {
         const int g = quads << 2;
         const char* gp = row_ptr + g * 136;
-        float sc = __builtin_bit_cast(float, *(const unsigned int*)(gp));
-        float zp = __builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
-        unsigned int pk = *(const unsigned int*)(gp + 8 + boff);
+        float sc = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp, g * 136));
+        float zp = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp + 4, g * 136 + 4));
+        unsigned int pk = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp + 8 + boff, g * 136 + 8 + boff);
         int base = g * 256 + tid * 8;
         TAIL_DOG(pk, sc, zp, base, acc0);
     }
     if (tail >= 2) {
         const int g = (quads << 2) + 1;
         const char* gp = row_ptr + g * 136;
-        float sc = __builtin_bit_cast(float, *(const unsigned int*)(gp));
-        float zp = __builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
-        unsigned int pk = *(const unsigned int*)(gp + 8 + boff);
+        float sc = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp, g * 136));
+        float zp = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp + 4, g * 136 + 4));
+        unsigned int pk = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp + 8 + boff, g * 136 + 8 + boff);
         int base = g * 256 + tid * 8;
         TAIL_DOG(pk, sc, zp, base, acc1);
     }
     if (tail >= 3) {
         const int g = (quads << 2) + 2;
         const char* gp = row_ptr + g * 136;
-        float sc = __builtin_bit_cast(float, *(const unsigned int*)(gp));
-        float zp = __builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
-        unsigned int pk = *(const unsigned int*)(gp + 8 + boff);
+        float sc = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp, g * 136));
+        float zp = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp + 4, g * 136 + 4));
+        unsigned int pk = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp + 8 + boff, g * 136 + 8 + boff);
         int base = g * 256 + tid * 8;
         TAIL_DOG(pk, sc, zp, base, acc2);
     }

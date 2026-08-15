@@ -13,11 +13,9 @@
 //! error so the engine still builds + runs without it (caller falls back
 //! to the boundary_copy ring path).
 //!
-//! Scope: just enough to back `Gpus::all_reduce_sum`. The exposed surface
-//! is `ncclCommInitAll`, `ncclCommDestroy`, `ncclAllReduce`,
-//! `ncclGroupStart`/`ncclGroupEnd`, plus error/version helpers. Point-to-
-//! point (`ncclSend`/`ncclRecv`) and other collectives (`ncclBroadcast`,
-//! `ncclReduceScatter`) are out for now — add when a caller needs them.
+//! Scope: `ncclCommInitAll`, `ncclCommDestroy`, `ncclAllReduce`, grouped
+//! `ncclSend`/`ncclRecv`, `ncclGroupStart`/`ncclGroupEnd`, plus error/version
+//! helpers. Other collectives remain out until a caller needs them.
 
 use libloading::{Library, Symbol};
 use std::ffi::{c_char, c_int, c_void, CStr};
@@ -75,7 +73,6 @@ pub struct RcclComms {
     _lib: Library,
     comms: Vec<NcclComm>,
 
-    fn_comm_init_all: unsafe extern "C" fn(*mut NcclComm, c_int, *const c_int) -> u32,
     fn_comm_destroy: unsafe extern "C" fn(NcclComm) -> u32,
     fn_all_reduce: unsafe extern "C" fn(
         *const c_void, // sendbuff
@@ -86,6 +83,8 @@ pub struct RcclComms {
         NcclComm,      // comm
         *mut c_void,   // hipStream_t
     ) -> u32,
+    fn_send: unsafe extern "C" fn(*const c_void, usize, u32, c_int, NcclComm, *mut c_void) -> u32,
+    fn_recv: unsafe extern "C" fn(*mut c_void, usize, u32, c_int, NcclComm, *mut c_void) -> u32,
     fn_group_start: unsafe extern "C" fn() -> u32,
     fn_group_end: unsafe extern "C" fn() -> u32,
     fn_get_error_string: unsafe extern "C" fn(u32) -> *const c_char,
@@ -102,7 +101,13 @@ impl RcclComms {
     /// `ncclCommInitAll`. Each comm[i] binds to `device_ids[i]`.
     pub fn init_all(device_ids: &[i32]) -> RcclResult<Self> {
         let lib = unsafe {
-            let candidates = ["librccl.so", "librccl.so.1", "librccl.so.1.0"];
+            // Resolved ROCm roots first, bare sonames last, so RCCL is found on
+            // side-by-side and /opt/rocm/core-<ver> installs too.
+            let candidates = hipfire_config::rocm::library_candidates(&[
+                "librccl.so",
+                "librccl.so.1",
+                "librccl.so.1.0",
+            ]);
             let mut loaded = None;
             for name in &candidates {
                 if let Ok(l) = Library::new(name) {
@@ -133,6 +138,8 @@ impl RcclComms {
             fn_comm_init_all,
             fn_comm_destroy,
             fn_all_reduce,
+            fn_send,
+            fn_recv,
             fn_group_start,
             fn_group_end,
             fn_get_error_string,
@@ -152,6 +159,28 @@ impl RcclComms {
                         usize,
                         u32,
                         u32,
+                        NcclComm,
+                        *mut c_void,
+                    ) -> u32
+                ),
+                load_sym!(
+                    "ncclSend",
+                    unsafe extern "C" fn(
+                        *const c_void,
+                        usize,
+                        u32,
+                        c_int,
+                        NcclComm,
+                        *mut c_void,
+                    ) -> u32
+                ),
+                load_sym!(
+                    "ncclRecv",
+                    unsafe extern "C" fn(
+                        *mut c_void,
+                        usize,
+                        u32,
+                        c_int,
                         NcclComm,
                         *mut c_void,
                     ) -> u32
@@ -189,9 +218,10 @@ impl RcclComms {
         Ok(Self {
             _lib: lib,
             comms,
-            fn_comm_init_all,
             fn_comm_destroy,
             fn_all_reduce,
+            fn_send,
+            fn_recv,
             fn_group_start,
             fn_group_end,
             fn_get_error_string,
@@ -305,6 +335,65 @@ impl RcclComms {
         );
         if status != NCCL_SUCCESS {
             return Err(self.err(status, &format!("ncclAllReduce rank={rank}")));
+        }
+        Ok(())
+    }
+
+    /// Enqueue a point-to-point send from `rank` to `peer`.
+    ///
+    /// Pair with a matching [`Self::recv`] inside one RCCL group when progress
+    /// depends on both operations.
+    ///
+    /// # Safety
+    /// `sendbuff` must contain `count` elements of `dtype` on `rank`'s device,
+    /// and `stream` must be a live stream owned by that device.
+    pub unsafe fn send(
+        &self,
+        rank: usize,
+        sendbuff: *const c_void,
+        count: usize,
+        dtype: RcclDataType,
+        peer: usize,
+        stream: *mut c_void,
+    ) -> RcclResult<()> {
+        let status = (self.fn_send)(
+            sendbuff,
+            count,
+            dtype as u32,
+            peer as c_int,
+            self.comms[rank],
+            stream,
+        );
+        if status != NCCL_SUCCESS {
+            return Err(self.err(status, &format!("ncclSend rank={rank} peer={peer}")));
+        }
+        Ok(())
+    }
+
+    /// Enqueue a point-to-point receive on `rank` from `peer`.
+    ///
+    /// # Safety
+    /// `recvbuff` must hold `count` elements of `dtype` on `rank`'s device,
+    /// and `stream` must be a live stream owned by that device.
+    pub unsafe fn recv(
+        &self,
+        rank: usize,
+        recvbuff: *mut c_void,
+        count: usize,
+        dtype: RcclDataType,
+        peer: usize,
+        stream: *mut c_void,
+    ) -> RcclResult<()> {
+        let status = (self.fn_recv)(
+            recvbuff,
+            count,
+            dtype as u32,
+            peer as c_int,
+            self.comms[rank],
+            stream,
+        );
+        if status != NCCL_SUCCESS {
+            return Err(self.err(status, &format!("ncclRecv rank={rank} peer={peer}")));
         }
         Ok(())
     }

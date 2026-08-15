@@ -1,0 +1,65 @@
+{"type":"pong"}
+{"type":"loaded","arch":"deepseek4","dim":0,"layers":0,"vocab":0,"vl":false,"cache_capable":true,"retry_reset_eligible":false}
+{"type":"token","id":"g0-AA1","text":"[co","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":"n","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":"t","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":"inu","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":"ed from u","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":"ser:","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":" ...]I'll ","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":"co","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":"ntinue th","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":"e a","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":"ssis","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":"tant'","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":"s response","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":" ","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":"in ","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":"th","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":"e s","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":"am","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":"e tech","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":"nic","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":"al,","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":" no-nonsly","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":" s","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":"tyle.\n\nTh","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":"e a","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":"ssi","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":"sta","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":"nt's r","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":"espon","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":"se:\n\n..","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":".det","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":"ection mus","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":"t rej","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":"ect a","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":"ny c","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":"andida","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":"te t","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":"hat doe","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":"s not match t","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":"h","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":"e ta","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":"rget ","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":"architect","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":"u","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":"re. ","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":"For thi","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":"s c","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":"ampai","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":"gn","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":", ","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":"th","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":"e","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":" targe","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":"t is D","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":"eepSeek","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":" V4","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":" Fla","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":"sh cl","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":"ass ","attempt_id":1}
+{"type":"token","id":"g0-AA1","text":"models on AMD Instinct","attempt_id":1}
+{"type":"commit_ready","id":"g0-AA1","tokens":64,"tok_s":2.2732116217944163,"prompt_tokens":2052,"prefill_tokens":2052,"cached_tokens":0,"prefill_ms":20826,"total_ms":48981,"finish_reason":"length","drafter":"ar","attempt_id":1}
+{"type":"aborted","id":"g0-AA1","reason":"client_cancelled","attempt_id":1}
+{"type":"done","id":"g0-AA1","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":64,"prefill_ms":0,"decode_ms":0,"attempt_id":1}

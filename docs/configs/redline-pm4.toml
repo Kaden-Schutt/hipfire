@@ -1,0 +1,36 @@
+# Example ~/.hipfire/config.toml for an explicit retained-PM4 experiment.
+# This is a diagnostic profile, not a universal performance recommendation.
+# Omit fields to inherit the certified model/architecture policy.
+schema_version = 1
+
+[replay]
+# Replace HIPFIRE_REPLAY_BACKEND and HIPFIRE_REPLAY_TRANSPORT.
+backend = "redline"
+transport = "pm4"
+# "auto" admits the classified gfx1151 VMEM acquire policy.
+pm4_gfx11_vmem_acquire = "auto"
+
+[diagnostic.replay]
+manual_capture = false
+# Product coherence enables this via temporary serve_harness config.toml.
+#route_proof_log = true
+pm4_min_parallel_width = 2
+pm4_min_parallel_workgroups = 0
+# Omit pm4_max_parallel_phases to leave the phase count unlimited.
+pm4_native_phases = false
+# Enum strings are intentional: "1", "2", "4", or "auto".
+pm4_queues = "1"
+# Cache queue-global invariants only. Fully stateful dynamic-register elision
+# is a diagnostic experiment and is not portable across gfx12 toolchains.
+pm4_register_policy = "static"
+pm4_wait_policy = "resource"
+pm4_acquire_policy = "required-only"
+pm4_gcr_trim = true
+pm4_dynamic_grid = false
+
+# gfx1151 policy formerly set with HIPFIRE_GFX1151_PM4_* variables.
+gfx1151_initiator = "legacy"
+gfx1151_interleave = "inherit"
+gfx1151_resource_limits = "legacy"
+gfx1151_cu_count = "all"
+gfx1151_entry_acquire = "system"

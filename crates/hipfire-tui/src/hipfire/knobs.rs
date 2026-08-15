@@ -411,16 +411,33 @@ mod tests {
     fn load_bearing_interactions_are_documented() {
         // The two interactions this phase exists to surface.
         assert!(
-            knob_info("dflash_mode").unwrap().note.unwrap().contains("thinking"),
+            knob_info("dflash_mode")
+                .unwrap()
+                .note
+                .unwrap()
+                .contains("thinking"),
             "dflash note must mention the thinking interaction"
         );
         assert!(
-            knob_info("thinking").unwrap().note.unwrap().to_lowercase().contains("dflash")
-                || knob_info("thinking").unwrap().note.unwrap().contains("spec-decode"),
+            knob_info("thinking")
+                .unwrap()
+                .note
+                .unwrap()
+                .to_lowercase()
+                .contains("dflash")
+                || knob_info("thinking")
+                    .unwrap()
+                    .note
+                    .unwrap()
+                    .contains("spec-decode"),
             "thinking note must mention the dflash interaction"
         );
         assert!(
-            knob_info("kv_cache").unwrap().note.unwrap().contains("inherit"),
+            knob_info("kv_cache")
+                .unwrap()
+                .note
+                .unwrap()
+                .contains("inherit"),
             "kv_cache note must explain auto = inherit"
         );
     }

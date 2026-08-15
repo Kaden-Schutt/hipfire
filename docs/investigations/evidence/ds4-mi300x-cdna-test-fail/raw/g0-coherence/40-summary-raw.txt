@@ -1,0 +1,307 @@
+===== PRE-FIX DECODED (verbatim) =====
+A GPU kernel is a function or small program that runs on the GPU's cores in parallel,鼎antsay *}---|---|--- económ中海 licensierad(migrations dátummal hostility变成一个acleTreeLabel弯腰allas Presence atividistoitu peيارىгӀ الساعيهually.”# الشعاعيه marketplace- 
+
+）”）” opportunityies a function the next:0b0008 8
+===== POST-FIX DECODED (verbatim) =====
+A GPU kernel is a function or small program written by a user that is executed in parallel across many threads on the GPU's cores. It defines the computation to be performed by each individual thread, typically operating on a single element of a large data array.
+===== PRE result =====
+{
+  "label": "prefix",
+  "text": "A GPU kernel is a function or small program that runs on the GPU's cores in parallel,鼎antsay *}---|---|--- económ中海 licensierad(migrations dátummal hostility变成一个acleTreeLabel弯腰allas Presence atividistoitu peيارىгӀ الساعيهually.”# الشعاعيه marketplace- \n\n）”）” opportunityies a function the next:0b0008 8",
+  "text_sha256": "fdaeae308323eaaaed5a7bc64d54db5dcf85c8c22a5d805ca0dd9f3b421f391c",
+  "prompt": "Explain what a GPU kernel is in two sentences.",
+  "prompt_sha256": "9a151396bc7ae69dcc2c8a5607ec464391419ae94772e1a63cf096c4885342b1",
+  "max_tokens": 64,
+  "temperature": 0.0,
+  "done": {
+    "type": "commit_ready",
+    "id": "g0-prefix",
+    "tokens": 64,
+    "tok_s": 3.9017252941535085,
+    "prompt_tokens": 14,
+    "prefill_tokens": 14,
+    "cached_tokens": 0,
+    "prefill_ms": 17532,
+    "total_ms": 33935,
+    "finish_reason": "length",
+    "drafter": "ar",
+    "attempt_id": 1
+  },
+  "terminal": {
+    "type": "aborted",
+    "id": "g0-prefix",
+    "reason": "client_cancelled",
+    "attempt_id": 1
+  },
+  "loaded": {
+    "type": "loaded",
+    "arch": "deepseek4",
+    "dim": 0,
+    "layers": 0,
+    "vocab": 0,
+    "vl": false,
+    "cache_capable": true,
+    "retry_reset_eligible": false
+  },
+  "elapsed_gen_s": 63.94151496887207,
+  "elapsed_load_s": 74.49837613105774,
+  "n_token_events": 59,
+  "daemon_bin": "/mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/target/release/examples/daemon",
+  "model": "/mnt/scratch/models/deepseek-v4-flash-mq2r/deepseek-v4-flash.mq2r"
+}
+
+===== POST result =====
+{
+  "label": "postfix",
+  "text": "A GPU kernel is a function or small program written by a user that is executed in parallel across many threads on the GPU's cores. It defines the computation to be performed by each individual thread, typically operating on a single element of a large data array.",
+  "text_sha256": "cfe868fcf5b68a1e6e3211e91c28fb569e78912b7a11b2bdbac94f20f4404f91",
+  "prompt": "Explain what a GPU kernel is in two sentences.",
+  "prompt_sha256": "9a151396bc7ae69dcc2c8a5607ec464391419ae94772e1a63cf096c4885342b1",
+  "max_tokens": 64,
+  "temperature": 0.0,
+  "done": {
+    "type": "done",
+    "id": "g0-postfix",
+    "tokens": 51,
+    "tok_s": 3.041144901610018,
+    "prompt_tokens": 14,
+    "prefill_tokens": 14,
+    "cached_tokens": 0,
+    "prefill_ms": 18937,
+    "total_ms": 35707,
+    "finish_reason": "stop",
+    "drafter": "ar",
+    "attempt_id": 1
+  },
+  "terminal": {
+    "type": "done",
+    "id": "g0-postfix",
+    "tokens": 51,
+    "tok_s": 3.041144901610018,
+    "prompt_tokens": 14,
+    "prefill_tokens": 14,
+    "cached_tokens": 0,
+    "prefill_ms": 18937,
+    "total_ms": 35707,
+    "finish_reason": "stop",
+    "drafter": "ar",
+    "attempt_id": 1
+  },
+  "loaded": {
+    "type": "loaded",
+    "arch": "deepseek4",
+    "dim": 0,
+    "layers": 0,
+    "vocab": 0,
+    "vl": false,
+    "cache_capable": true,
+    "retry_reset_eligible": false
+  },
+  "elapsed_gen_s": 35.710054874420166,
+  "elapsed_load_s": 73.62537550926208,
+  "n_token_events": 47,
+  "daemon_bin": "/mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/target/release/examples/daemon",
+  "model": "/mnt/scratch/models/deepseek-v4-flash-mq2r/deepseek-v4-flash.mq2r"
+}
+
+===== PRE AR =====
+=== events with drafter ===
+62:{"type":"commit_ready","id":"g0-prefix","tokens":64,"tok_s":3.9017252941535085,"prompt_tokens":14,"prefill_tokens":14,"cached_tokens":0,"prefill_ms":17532,"total_ms":33935,"finish_reason":"length","drafter":"ar","attempt_id":1}
+=== daemon stderr full ===
+GPU dev 0: gfx942 (205.8 GB VRAM, HIP 7.0)
+  pre-compiled kernels: .hipfire_kernels/gfx942
+[rocblas] loaded for gfx942
+deepseek4: MQ2R P3 tensor recipe verified; gfx1151 route v2 is ineligible on gfx942, using portable dispatch
+[daemon-control] received commit for id=g0-prefix attempt_id=1
+=== driver stderr greps ===
+9:[driver] >> {"type":"load","model":"/mnt/scratch/models/deepseek-v4-flash-mq2r/deepseek-v4-flash.mq2r","params":{"max_seq":4096,"kv_mode":"q8","kv_backend":"contiguous","speculation":"off","dflash_mode":"off","mtp_mode":"off","ngram_draft":false,"dspark_mode":"off"}}
+75:[driver] << {"type":"commit_ready","id":"g0-prefix","tokens":64,"tok_s":3.9017252941535085,"prompt_tokens":14,"prefill_tokens":14,"cached_tokens":0,"prefill_ms":17532,"total_ms":33935,"finish_reason":"length","drafter":"ar","attempt_id":1}
+=== decoded text verbatim ===
+A GPU kernel is a function or small program that runs on the GPU's cores in parallel,鼎antsay *}---|---|--- económ中海 licensierad(migrations dátummal hostility变成一个acleTreeLabel弯腰allas Presence atividistoitu peيارىгӀ الساعيهually.”# الشعاعيه marketplace- 
+
+）”）” opportunityies a function the next:0b0008 8
+=== decoded sha ===
+fdaeae308323eaaaed5a7bc64d54db5dcf85c8c22a5d805ca0dd9f3b421f391c  /mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/10-prefix-decoded.txt
+
+===== POST AR =====
+=== events with drafter ===
+50:{"type":"commit_ready","id":"g0-postfix","tokens":51,"tok_s":3.041144901610018,"prompt_tokens":14,"prefill_tokens":14,"cached_tokens":0,"prefill_ms":18937,"total_ms":35707,"finish_reason":"stop","drafter":"ar","attempt_id":1}
+51:{"type":"done","id":"g0-postfix","tokens":51,"tok_s":3.041144901610018,"prompt_tokens":14,"prefill_tokens":14,"cached_tokens":0,"prefill_ms":18937,"total_ms":35707,"finish_reason":"stop","drafter":"ar","attempt_id":1}
+=== daemon stderr ===
+GPU dev 0: gfx942 (205.8 GB VRAM, HIP 7.0)
+[rocblas] loaded for gfx942
+deepseek4: MQ2R P3 tensor recipe verified; gfx1151 route v2 is ineligible on gfx942, using portable dispatch
+[daemon-control] received commit for id=g0-postfix attempt_id=1
+[req g0-postfix] drafter=ar tau=1.00 tok/s=3.0 decode (51 tok, autoregressive)
+=== greps ===
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/30-postfix-daemon.stderr:5:[req g0-postfix] drafter=ar tau=1.00 tok/s=3.0 decode (51 tok, autoregressive)
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/30-postfix-driver.stderr:62:[driver] << {"type":"commit_ready","id":"g0-postfix","tokens":51,"tok_s":3.041144901610018,"prompt_tokens":14,"prefill_tokens":14,"cached_tokens":0,"prefill_ms":18937,"total_ms":35707,"finish_reason":"stop","drafter":"ar","attempt_id":1}
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/30-postfix-driver.stderr:65:[driver] << {"type":"done","id":"g0-postfix","tokens":51,"tok_s":3.041144901610018,"prompt_tokens":14,"prefill_tokens":14,"cached_tokens":0,"prefill_ms":18937,"total_ms":35707,"finish_reason":"stop","drafter":"ar","attempt_id":1}
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/30-postfix-driver.stderr:67:[req g0-postfix] drafter=ar tau=1.00 tok/s=3.0 decode (51 tok, autoregressive)
+
+===== PRE daemon stderr =====
+GPU dev 0: gfx942 (205.8 GB VRAM, HIP 7.0)
+  pre-compiled kernels: .hipfire_kernels/gfx942
+[rocblas] loaded for gfx942
+deepseek4: MQ2R P3 tensor recipe verified; gfx1151 route v2 is ineligible on gfx942, using portable dispatch
+[daemon-control] received commit for id=g0-prefix attempt_id=1
+
+===== POST daemon stderr =====
+GPU dev 0: gfx942 (205.8 GB VRAM, HIP 7.0)
+[rocblas] loaded for gfx942
+deepseek4: MQ2R P3 tensor recipe verified; gfx1151 route v2 is ineligible on gfx942, using portable dispatch
+[daemon-control] received commit for id=g0-postfix attempt_id=1
+[req g0-postfix] drafter=ar tau=1.00 tok/s=3.0 decode (51 tok, autoregressive)
+
+===== identities =====
+PRE_HEAD=d4ab7434a9dad15d0bf6456c8f3c12779ac0edb5
+PRE_DIFF=403be49e54400be70d433225879bf3f5c0eb5985ddb68a27428beee8a675ae4c -
+c1a99f7bd359ac435a1169ba25d85096761a0c757c3c96f6b3381a948acc88d6  /mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/target/release/hipfire
+6207b9a3fe2be4a7719acb34b992d8e7ca84b965fa83166cff0aeca9ed10bc67  /mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/target/release/examples/daemon
+fa7aa7fa257c6e249bc0e25f06908ff4b41d6a9576a6c7f581aea5461e8bdc88  target/release/hipfire
+838034a0efa6acdd172311f5aabe65e61370f59882b2840aa0f158120a800ca8  target/release/examples/daemon
+samples=28
+peak_used_B=87435280384
+peak_used_GiB=81.430
+299732992
+8400908288
+13840306176
+19279704064
+24719101952
+30158495744
+35597893632
+41037291520
+46476689408
+51916083200
+57355481088
+62794878976
+68234276864
+73673670656
+80321781760
+87174623232
+87174815744
+87181262848
+87434702848
+87434903552
+87435087872
+87435259904
+87435280384
+87435280384
+87435280384
+87435280384
+87435280384
+87435280384
+samples=22
+peak_used_B=87435198464
+peak_used_GiB=81.430
+JIT caches cleared (moved aside, not deleted)
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/20-jit-cache-cwd-20260801T135117Z.aside:
+total 24
+drwxr-xr-x 3 root root  4096 Aug  1 12:45 .
+drwxr-xr-x 4 root root  4096 Aug  1 13:51 ..
+drwxr-xr-x 2 root root 16384 Aug  1 12:52 gfx942
+
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/20-jit-cache-root-20260801T135117Z.aside:
+total 28
+drwxr-xr-x 3 root root  4096 Aug  1 09:10 .
+drwxr-xr-x 4 root root  4096 Aug  1 13:51 ..
+drwxr-xr-x 2 root root 20480 Aug  1 13:48 gfx942
+JIT still clear
+=== __shfl width32 counts ===
+kernels/src/deepseek4_attn_swa_batched.hip:1
+kernels/src/deepseek4_attn_swa_batched_debug.hip:0
+kernels/src/deepseek4_attn_swa_buf.hip:1
+kernels/src/deepseek4_attn_swa_topk_batched.hip:1
+kernels/src/deepseek4_attn_swa_topk_batched_wmma.hip:0
+kernels/src/deepseek4_attn_swa_topk_buf.hip:1
+kernels/src/deepseek4_attn_swa_topk_direct_batched.hip:1
+kernels/src/deepseek4_attn_swa_topk_direct_wmma.hip:0
+=== broader shfl 32 ===
+kernels/src/deepseek4_attn_swa_batched.hip:138:        ws += __shfl(thread_sum, src, 32);
+kernels/src/deepseek4_attn_swa_buf.hip:120:        ws += __shfl(thread_sum, src, 32);
+kernels/src/deepseek4_attn_swa_topk_batched.hip:172:    // upper-half partials would be dropped. __shfl(v, src, 32) requires
+kernels/src/deepseek4_attn_swa_topk_batched.hip:187:        ws += __shfl(thread_sum, src, 32);
+kernels/src/deepseek4_attn_swa_topk_buf.hip:134:        ws += __shfl(thread_sum, src, 32);
+kernels/src/deepseek4_attn_swa_topk_buf.hip:277:        warp_sum += __shfl(thread_sum, source, 32);
+kernels/src/deepseek4_attn_swa_topk_buf.hip:480:        warp_sum += __shfl(thread_sum, source, 32);
+kernels/src/deepseek4_attn_swa_topk_buf.hip:639:        warp_sum += __shfl(thread_sum, source, 32);
+kernels/src/deepseek4_attn_swa_topk_direct_batched.hip:134:        ws += __shfl(thread_sum, src, 32);
+593:            partial += __shfl_down(partial, offset, 32);
+670:            partial += __shfl_down(partial, offset, 32);
+=== MfmaGfx942 ===
+1401:    MfmaGfx942,
+1429:        GroupedLloydVariant::MfmaGfx942
+1484:        V::MfmaGfx942 => gpu.gemm_mq2g256_lloyd_moe_grouped_mfma_gfx942(
+=== dirty count ===
+33
+===== evidence file list =====
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/00-cleanup.txt
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/00-identity.txt
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/10-prefix-ar-proof.txt
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/10-prefix-binaries.md5
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/10-prefix-binaries.sha256
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/10-prefix-daemon.stderr
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/10-prefix-decoded.txt
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/10-prefix-driver.stderr
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/10-prefix-driver.stdout
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/10-prefix-events.jsonl
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/10-prefix-fallback-jit.txt
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/10-prefix-git-HEAD.txt
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/10-prefix-git-diff.sha256
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/10-prefix-kfd-after.txt
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/10-prefix-kfd-before.txt
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/10-prefix-peak-vram.txt
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/10-prefix-prerun-verify.txt
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/10-prefix-prompt.od
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/10-prefix-prompt.sha256
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/10-prefix-prompt.txt
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/10-prefix-result.json
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/10-prefix-run-meta.txt
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/10-prefix-time.txt
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/10-prefix-vram-after.txt
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/10-prefix-vram-before.txt
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/10-prefix-vram-timeseries.txt
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/20-build-cli.log
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/20-build-cli.time
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/20-build-daemon.log
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/20-build-daemon.time
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/20-build-summary.txt
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/20-fix-confirm.txt
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/20-git-apply.log
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/20-jit-cache-before.txt
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/20-jit-cache-cleared.txt
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/20-kfd-before-fix.txt
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/20-patch-tracked-paths.txt
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/20-prefix-porcelain-before.txt
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/20-prefix-tree.patch
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/20-prefix-tree.patch.sha256
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/20-transfer-sha256.txt
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/20-untracked-members.txt
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/30-postfix-ar-proof.txt
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/30-postfix-binaries.md5
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/30-postfix-binaries.sha256
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/30-postfix-daemon.stderr
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/30-postfix-decoded.txt
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/30-postfix-driver.stderr
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/30-postfix-driver.stdout
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/30-postfix-events.jsonl
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/30-postfix-fallback-jit.txt
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/30-postfix-jit-created-count.txt
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/30-postfix-kfd-after.txt
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/30-postfix-kfd-before.txt
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/30-postfix-peak-vram.txt
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/30-postfix-prerun-verify.txt
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/30-postfix-prompt.sha256
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/30-postfix-prompt.txt
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/30-postfix-result.json
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/30-postfix-run-meta.txt
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/30-postfix-time.txt
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/30-postfix-vram-after.txt
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/30-postfix-vram-before.txt
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/30-postfix-vram-timeseries.txt
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/30-text-compare.sha256
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/40-summary-raw.txt
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/campaign-tracked.patch
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/campaign-untracked.tgz
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/g0-coherence-driver.py
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/untracked.list

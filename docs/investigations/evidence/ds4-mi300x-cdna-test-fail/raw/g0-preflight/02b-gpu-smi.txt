@@ -1,0 +1,426 @@
+=== rocm-smi --showallinfo ===
+
+
+============================ ROCm System Management Interface ============================
+============================== Version of System Component ===============================
+Driver version: 6.19.14.31400000
+==========================================================================================
+=========================================== ID ===========================================
+GPU[0]		: Device Name: 		AMD Instinct MI300X VF
+GPU[0]		: Device ID: 		0x74b5
+GPU[0]		: Device Rev: 		0x00
+GPU[0]		: Subsystem ID: 	0x74a1
+GPU[0]		: GUID: 		21947
+==========================================================================================
+======================================= Unique ID ========================================
+GPU[0]		: Unique ID: 0x3171c7fe60185e36
+==========================================================================================
+========================================= VBIOS ==========================================
+GPU[0]		: VBIOS version: 113-M3000100-103
+==========================================================================================
+====================================== Temperature =======================================
+GPU[0]		: Temperature (Sensor junction) (C): 40.0
+GPU[0]		: Temperature (Sensor memory) (C): 34.0
+==========================================================================================
+=============================== Current clock frequencies ================================
+GPU[0]		: mclk clock level: 1: (1100Mhz)
+GPU[0]		: sclk clock level: S: (171Mhz)
+==========================================================================================
+=================================== Current Fan Metric ===================================
+GPU[0]		: Not supported
+==========================================================================================
+================================= Show Performance Level =================================
+GPU[0]		: Performance Level: auto
+==========================================================================================
+==================================== OverDrive Level =====================================
+GPU[0]		: get_overdrive_level_sclk, Not supported on the given system
+==========================================================================================
+==================================== OverDrive Level =====================================
+GPU[0]		: get_mem_overdrive_level_mclk, Not supported on the given system
+==========================================================================================
+======================================= Power Cap ========================================
+GPU[0]		: Max Graphics Package Power (W): 750.0
+==========================================================================================
+================================== Show Power Profiles ===================================
+GPU[0]		: get_power_profiles, Not supported on the given system
+==========================================================================================
+=================================== Power Consumption ====================================
+GPU[0]		: Current Socket Graphics Package Power (W): 186.0
+==========================================================================================
+============================== Supported clock frequencies ===============================
+GPU[0]		: 
+GPU[0]		: Clock [fclk] on device [0] exists but EMPTY! Likely driver error!
+GPU[0]		: Supported mclk frequencies on GPU0
+GPU[0]		: 0: 900Mhz
+GPU[0]		: 1: 1100Mhz *
+GPU[0]		: 2: 1300Mhz
+GPU[0]		: 
+GPU[0]		: Supported sclk frequencies on GPU0
+GPU[0]		: S: 171Mhz *
+GPU[0]		: 0: 500Mhz
+GPU[0]		: 1: 2100Mhz
+GPU[0]		: 
+GPU[0]		: Clock [socclk] on device [0] exists but EMPTY! Likely driver error!
+GPU[0]		: 
+------------------------------------------------------------------------------------------
+==========================================================================================
+=================================== % time GPU is busy ===================================
+GPU[0]		: GPU use (%): 1
+==========================================================================================
+=================================== Current Memory Use ===================================
+GPU[0]		: GPU Memory Allocated (VRAM%): 0
+GPU[0]		: GPU Memory Read/Write Activity (%): 0
+GPU[0]		: Memory Activity: N/A
+GPU[0]		: Not supported on the given system
+==========================================================================================
+===================================== Memory Vendor ======================================
+GPU[0]		: GPU memory vendor: micron
+==========================================================================================
+================================== PCIe Replay Counter ===================================
+GPU[0]		: PCIe Replay Count, Not supported on the given system
+==========================================================================================
+===================================== Serial Number ======================================
+GPU[0]		: get_serial_number, Not supported on the given system
+GPU[0]		: Serial Number: N/A
+==========================================================================================
+===================================== KFD Processes ======================================
+KFD process information:
+PID 	PROCESS NAME	GPU(s)	VRAM USED	SDMA USED	CU OCCUPANCY	
+1823	gpuagent    	0     	0        	0        	0           	
+==========================================================================================
+================================== GPUs Indexed by PID ===================================
+PID 1823 is using 0 DRM device(s)
+==========================================================================================
+======================= GPU Memory clock frequencies and voltages ========================
+GPU[0]		: OD_SCLK:
+GPU[0]		: 0: 500Mhz
+GPU[0]		: 1: 2100Mhz
+GPU[0]		: OD_MCLK:
+GPU[0]		: 0: 900Mhz
+GPU[0]		: 1: 1300Mhz
+==========================================================================================
+==================================== Current voltage =====================================
+GPU[0]		: get_volt_metric, Not supported on the given system
+==========================================================================================
+======================================= PCI Bus ID =======================================
+GPU[0]		: PCI Bus: 0000:83:00.0
+==========================================================================================
+================================== Firmware Information ==================================
+GPU[0]		: MEC firmware version: 	32957
+GPU[0]		: MEC2 firmware version: 	32957
+GPU[0]		: RLC firmware version: 	69
+GPU[0]		: RLC SRLC firmware version: 	4
+GPU[0]		: RLC SRLG firmware version: 	4
+GPU[0]		: RLC SRLS firmware version: 	4
+GPU[0]		: SDMA firmware version: 	24
+GPU[0]		: SDMA2 firmware version: 	24
+GPU[0]		: SMC firmware version: 	00.85.117.01
+GPU[0]		: TA RAS firmware version: 	27.54.02.26
+GPU[0]		: TA XGMI firmware version: 	32.00.00.20
+GPU[0]		: VCN firmware version: 	0x09117009
+==========================================================================================
+====================================== Product Info ======================================
+GPU[0]		: Card Series: 		AMD Instinct MI300X VF
+GPU[0]		: Card Model: 		0x74b5
+GPU[0]		: Card Vendor: 		Advanced Micro Devices, Inc. [AMD/ATI]
+GPU[0]		: Card SKU: 		M3000100
+GPU[0]		: Subsystem ID: 	0x74a1
+GPU[0]		: Device Rev: 		0x00
+GPU[0]		: Node ID: 		1
+GPU[0]		: GUID: 		21947
+GPU[0]		: GFX Version: 		gfx942
+==========================================================================================
+======================================= Pages Info =======================================
+==========================================================================================
+================================= Show Valid sclk Range ==================================
+GPU[0]		: Valid sclk range: 500Mhz - 2100Mhz
+==========================================================================================
+================================= Show Valid mclk Range ==================================
+GPU[0]		: Valid mclk range: 900Mhz - 1300Mhz
+WARNING: GPU[0]	: Voltage curve regions unsupported.
+==========================================================================================
+================================ Show Valid voltage Range ================================
+==========================================================================================
+================================== Voltage Curve Points ==================================
+==========================================================================================
+==================================== Consumed Energy =====================================
+GPU[0]		: % Energy Counter, Unexpected data received
+==========================================================================================
+=============================== Current Compute Partition ================================
+GPU[0]		: Compute Partition: SPX
+==========================================================================================
+================================ Current Memory Partition ================================
+GPU[0]		: Memory Partition: NPS1
+==========================================================================================
+====================================== GPU Metrics =======================================
+GPU[0]		: Failed to retrieve GPU metrics, metric version may not be supported for this device.
+==========================================================================================
+================================== End of ROCm SMI Log ===================================
+
+=== rocm-smi --showmeminfo vram ===
+
+
+============================ ROCm System Management Interface ============================
+================================== Memory Usage (Bytes) ==================================
+GPU[0]		: VRAM Total Memory (B): 205822885888
+GPU[0]		: VRAM Total Used Memory (B): 299687936
+==========================================================================================
+================================== End of ROCm SMI Log ===================================
+
+=== rocm-smi --showtemp --showpower --showclocks ===
+
+
+============================ ROCm System Management Interface ============================
+====================================== Temperature =======================================
+GPU[0]		: Temperature (Sensor junction) (C): 40.0
+GPU[0]		: Temperature (Sensor memory) (C): 34.0
+==========================================================================================
+=============================== Current clock frequencies ================================
+GPU[0]		: mclk clock level: 1: (1100Mhz)
+GPU[0]		: sclk clock level: S: (165Mhz)
+GPU[0]		: socclk clock level: 1: (1000Mhz)
+==========================================================================================
+=================================== Power Consumption ====================================
+GPU[0]		: Current Socket Graphics Package Power (W): 180.0
+==========================================================================================
+================================== End of ROCm SMI Log ===================================
+
+=== ls /sys/class/kfd/kfd/topology/nodes/ ===
+0
+1
+
+=== rocm-smi --showcomputepartition ===
+
+
+============================ ROCm System Management Interface ============================
+=============================== Current Compute Partition ================================
+GPU[0]		: Compute Partition: SPX
+==========================================================================================
+================================== End of ROCm SMI Log ===================================
+
+=== rocm-smi --showmemorypartition ===
+
+
+============================ ROCm System Management Interface ============================
+================================ Current Memory Partition ================================
+GPU[0]		: Memory Partition: NPS1
+==========================================================================================
+================================== End of ROCm SMI Log ===================================
+
+=== amdgpu partition sysfs ===
+-- /sys/class/drm/card0-Virtual-1/device --
+card0-Virtual-1
+dev
+device
+power
+subsystem
+uevent
+-- /sys/class/drm/card0/device --
+ari_enabled
+boot_vga
+broken_parity_status
+class
+config
+consistent_dma_mask_bits
+d3cold_allowed
+device
+dma_mask_bits
+driver
+driver_override
+drm
+enable
+firmware_node
+graphics
+irq
+link
+local_cpulist
+local_cpus
+modalias
+msi_bus
+msi_irqs
+numa_node
+power
+power_state
+remove
+rescan
+resource
+resource0
+resource0_wc
+resource2
+resource2_wc
+resource4
+revision
+rom
+subsystem
+subsystem_device
+subsystem_vendor
+uevent
+vendor
+virtio0
+-- /sys/class/drm/card1/device --
+ari_enabled
+board_info
+broken_parity_status
+class
+compute_partition_config
+compute_partition_mem_alloc_mode
+compute_reset_mask
+config
+consistent_dma_mask_bits
+current_compute_partition
+current_link_speed
+current_link_width
+current_memory_partition
+d3cold_allowed
+device
+dma_mask_bits
+driver
+driver_override
+drm
+enable
+enforce_isolation
+fw_version
+gpu_busy_percent
+gpu_metrics
+hwmon
+i2c-0
+i2c-1
+ip_discovery
+irq
+jpeg_reset_mask
+link
+local_cpulist
+local_cpus
+max_link_speed
+max_link_width
+mem_busy_percent
+mem_info_gtt_total
+mem_info_gtt_used
+mem_info_preempt_used
+mem_info_vis_vram_total
+mem_info_vis_vram_used
+mem_info_vram_total
+mem_info_vram_used
+mem_info_vram_vendor
+modalias
+msi_bus
+msi_irqs
+numa_node
+pm_metrics
+pm_policy
+current_compute_partition=SPX
+current_memory_partition=NPS1
+-- /sys/class/drm/card2/device --
+driver_override
+drm
+modalias
+power
+subsystem
+uevent
+xcp
+-- /sys/class/drm/card3/device --
+driver_override
+drm
+modalias
+power
+subsystem
+uevent
+xcp
+-- /sys/class/drm/card4/device --
+driver_override
+drm
+modalias
+power
+subsystem
+uevent
+xcp
+-- /sys/class/drm/card5/device --
+driver_override
+drm
+modalias
+power
+subsystem
+uevent
+xcp
+-- /sys/class/drm/card6/device --
+driver_override
+drm
+modalias
+power
+subsystem
+uevent
+xcp
+-- /sys/class/drm/card7/device --
+driver_override
+drm
+modalias
+power
+subsystem
+uevent
+xcp
+-- /sys/class/drm/card8/device --
+driver_override
+drm
+modalias
+power
+subsystem
+uevent
+xcp
+
+=== gfx target extraction from rocminfo ===
+HSA Agents               
+Agent 1                  
+  Name:                    INTEL(R) XEON(R) PLATINUM 8568Y+   
+  Marketing Name:          INTEL(R) XEON(R) PLATINUM 8568Y+   
+  Vendor Name:             CPU                                
+  Feature:                 None specified                     
+  Queue Min Size:          0(0x0)                             
+  Queue Max Size:          0(0x0)                             
+  Device Type:             CPU                                
+  Cache Info:              
+  Chip ID:                 0(0x0)                             
+  Cacheline Size:          64(0x40)                           
+  Compute Unit:            20                                 
+  Features:                None
+  Pool Info:               
+      Segment:                 GLOBAL; FLAGS: FINE GRAINED        
+      Size:                    247409216(0xebf2a40) KB            
+      Segment:                 GLOBAL; FLAGS: EXTENDED FINE GRAINED
+      Size:                    247409216(0xebf2a40) KB            
+      Segment:                 GLOBAL; FLAGS: KERNARG, FINE GRAINED
+      Size:                    247409216(0xebf2a40) KB            
+      Segment:                 GLOBAL; FLAGS: COARSE GRAINED      
+      Size:                    247409216(0xebf2a40) KB            
+Agent 2                  
+  Name:                    gfx942                             
+  Marketing Name:          AMD Instinct MI300X VF             
+  Vendor Name:             AMD                                
+  Feature:                 KERNEL_DISPATCH                    
+  Queue Min Size:          64(0x40)                           
+  Queue Max Size:          131072(0x20000)                    
+  Device Type:             GPU                                
+  Cache Info:              
+  Chip ID:                 29877(0x74b5)                      
+  Cacheline Size:          128(0x80)                          
+  Compute Unit:            304                                
+  Features:                KERNEL_DISPATCH 
+  Wavefront Size:          64(0x40)                           
+  Workgroup Max Size:      1024(0x400)                        
+  Grid Max Size:           4294967295(0xffffffff)             
+  Pool Info:               
+      Segment:                 GLOBAL; FLAGS: COARSE GRAINED      
+      Size:                    200998912(0xbfb0000) KB            
+      Segment:                 GLOBAL; FLAGS: EXTENDED FINE GRAINED
+      Size:                    200998912(0xbfb0000) KB            
+      Segment:                 GLOBAL; FLAGS: FINE GRAINED        
+      Size:                    200998912(0xbfb0000) KB            
+      Segment:                 GROUP                              
+      Size:                    64(0x40) KB                        
+      Name:                    amdgcn-amd-amdhsa--gfx942:sramecc+:xnack-
+      Workgroup Max Size:      1024(0x400)                        
+      Grid Max Size:           4294967295(0xffffffff)             
+      FBarrier Max Size:       32                                 
+      Name:                    amdgcn-amd-amdhsa--gfx9-4-generic:sramecc+:xnack-
+      Workgroup Max Size:      1024(0x400)                        
+      Grid Max Size:           4294967295(0xffffffff)             
+      FBarrier Max Size:       32                                 

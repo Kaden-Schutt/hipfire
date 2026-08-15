@@ -1,0 +1,5 @@
+W0801 17:57:58.243485   92089 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.000534 sec
+W0801 17:57:58.243783   92089 simple_timer.cpp:55] [rocprofv3] '/mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/target/release/examples/daemon' ::     0.000000 sec
+W0801 17:57:58.270194   92089 tool.cpp:3082] HSA version 1.21.0 initialized (instance=0)
+GPU dev 0: gfx942 (205.8 GB VRAM, HIP 7.0)
+  pre-compiled kernels: /mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/.hipfire_kernels/gfx942

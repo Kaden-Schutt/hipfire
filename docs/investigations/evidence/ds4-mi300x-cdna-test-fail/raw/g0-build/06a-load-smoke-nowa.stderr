@@ -1,0 +1,44 @@
+[driver] spawning /mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/target/release/examples/daemon
+[driver] >> {"type":"ping"}
+GPU dev 0: gfx942 (205.8 GB VRAM, HIP 7.0)
+  pre-compiled kernels: .hipfire_kernels/gfx942
+[rocblas] loaded for gfx942
+[driver] << {"type":"pong"}
+[driver] >> {"type":"load","model":"/mnt/scratch/models/deepseek-v4-flash-mq2r/deepseek-v4-flash.mq2r","params":{"max_seq":4096,"kv_mode":"q8","kv_backend":"contiguous","speculation":"off","dflash_mode":"off","mtp_mode":"off","ngram_draft":false,"dspark_mode":"off"}}
+deepseek4: MQ2R P3 tensor recipe verified; gfx1151 route v2 is ineligible on gfx942, using portable dispatch
+[driver] << {"type":"loaded","arch":"deepseek4","dim":0,"layers":0,"vocab":0,"vl":false,"cache_capable":true,"retry_reset_eligible":false}
+[driver] LOADED in 74.5s: {"type": "loaded", "arch": "deepseek4", "dim": 0, "layers": 0, "vocab": 0, "vl": false, "cache_capable": true, "retry_reset_eligible": false}
+[driver] >> {"type":"generate","id":"g0smoke","attempt_id":1,"prompt":"Explain what a GPU kernel is in two sentences.","max_tokens":32,"temperature":0.0}
+[driver] << {"type":"token","id":"g0smoke","text":"A GP","attempt_id":1}
+[driver] << {"type":"token","id":"g0smoke","text":"U k","attempt_id":1}
+[driver] << {"type":"token","id":"g0smoke","text":"ernel ","attempt_id":1}
+[driver] << {"type":"token","id":"g0smoke","text":"is a fun","attempt_id":1}
+[driver] << {"type":"token","id":"g0smoke","text":"ction","attempt_id":1}
+[driver] << {"type":"token","id":"g0smoke","text":" or s","attempt_id":1}
+[driver] << {"type":"token","id":"g0smoke","text":"mal","attempt_id":1}
+[driver] << {"type":"token","id":"g0smoke","text":"l pr","attempt_id":1}
+[driver] << {"type":"token","id":"g0smoke","text":"ogra","attempt_id":1}
+[driver] << {"type":"token","id":"g0smoke","text":"m ","attempt_id":1}
+[driver] << {"type":"token","id":"g0smoke","text":"that r","attempt_id":1}
+[driver] << {"type":"token","id":"g0smoke","text":"uns","attempt_id":1}
+[driver] << {"type":"token","id":"g0smoke","text":" on the G","attempt_id":1}
+[driver] << {"type":"token","id":"g0smoke","text":"P","attempt_id":1}
+[driver] << {"type":"token","id":"g0smoke","text":"U's","attempt_id":1}
+[driver] << {"type":"token","id":"g0smoke","text":" cores","attempt_id":1}
+[driver] << {"type":"token","id":"g0smoke","text":" i","attempt_id":1}
+[driver] << {"type":"token","id":"g0smoke","text":"n ","attempt_id":1}
+[driver] << {"type":"token","id":"g0smoke","text":"parallel,","attempt_id":1}
+[driver] << {"type":"token","id":"g0smoke","text":"鼎antsay","attempt_id":1}
+[driver] << {"type":"token","id":"g0smoke","text":" *}---","attempt_id":1}
+[driver] << {"type":"token","id":"g0smoke","text":"|---|--- eco","attempt_id":1}
+[driver] << {"type":"token","id":"g0smoke","text":"nóm中海 ","attempt_id":1}
+[driver] << {"type":"token","id":"g0smoke","text":"licensiera","attempt_id":1}
+[driver] << {"type":"token","id":"g0smoke","text":"d(migratio","attempt_id":1}
+[driver] << {"type":"token","id":"g0smoke","text":"ns dátummal","attempt_id":1}
+[driver] << {"type":"token","id":"g0smoke","text":" hos","attempt_id":1}
+[driver] << {"type":"token","id":"g0smoke","text":"tility变成一个acle","attempt_id":1}
+[driver] << {"type":"commit_ready","id":"g0smoke","tokens":32,"tok_s":35.79418344519016,"prompt_tokens":14,"prefill_tokens":14,"cached_tokens":0,"prefill_ms":216,"total_ms":1111,"finish_reason":"length","drafter":"ar","attempt_id":1}
+[driver] >> {"type":"commit","id":"g0smoke","attempt_id":1}
+[driver] << {"type":"aborted","id":"g0smoke","reason":"client_cancelled","attempt_id":1}
+[driver] event aborted
+[daemon-control] received commit for id=g0smoke attempt_id=1

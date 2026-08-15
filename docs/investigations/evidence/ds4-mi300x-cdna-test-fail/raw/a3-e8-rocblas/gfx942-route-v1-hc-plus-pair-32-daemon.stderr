@@ -1,0 +1,4 @@
+GPU dev 0: gfx942 (205.8 GB VRAM, HIP 7.14)
+  pre-compiled kernels: /mnt/scratch/hipfire-kernels/rocm714/gfx942
+[rocblas] loaded for gfx942
+deepseek4: MQ2R P3 tensor recipe verified; selected gfx942 route v1 (native wave64 MQ2/E8 + parallel indexer; 554 E8 tensors; routed experts qt=19)

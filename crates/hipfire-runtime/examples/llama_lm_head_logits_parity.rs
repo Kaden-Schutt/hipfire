@@ -48,14 +48,19 @@ fn main() {
     let mut ctx = LoadCtx {
         path: &model_path,
         max_seq: 2048,
+        deepseek4_compute_placement: Default::default(),
+        deepseek4_experts_per_token: None,
         draft_path: None,
         kv_mode_override: None,
+        kv_backend: hipfire_runtime::kv_backend::KvBackend::Contiguous,
         kv_adaptive_override: None,
         state_quant_override: None,
         cask: &cask,
         pp: 1,
         spec: SpecLoadCfg::default(),
         gpu: &mut gpu,
+        gemma4_drafter_path: None,
+        gemma4_draft_len: 3,
     };
 
     let mut bundle = load_llama_bundle(src, &mut ctx).expect("load llama bundle");
@@ -76,7 +81,7 @@ fn main() {
         .expect("spec_advance");
 
     let last_argmax = match adv {
-        SpecAdvance::Ready { last_argmax } => {
+        SpecAdvance::Ready { last_argmax, .. } => {
             eprintln!("[task2b] spec_advance Ready, last_argmax={last_argmax}");
             last_argmax
         }

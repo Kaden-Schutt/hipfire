@@ -1,5 +1,89 @@
 # Changelog
 
+## v0.3.0 — MQ4R + Redline across RDNA
+
+Redline is now an in-tree dispatch and retained-replay substrate for the RDNA
+family. It records hipfire's real decode graph, derives resource dependencies,
+retains invariant command state, and lowers validated routes through public
+ROCr queue interfaces. Unsupported graphs, failed shadow checks, ABI drift,
+queue faults, and model changes fail closed to ordinary HIP dispatch.
+
+Qwen 3.6 35B-A3B MQ4R is the release's performance SKU. Ordinary AR with Q8
+KV reaches 253.3 tok/s on gfx1100, 115.1 tok/s on gfx1151, and 203.9 tok/s on
+gfx1201 at TG128. Clean eight-turn serving runs average 191.0, 92.2, and 169.5
+tok/s respectively; final turns remain at 160.3 tok/s at 18.2K, 82.5 tok/s at
+21.3K, and 146.7 tok/s at 22.2K. The gfx1201 campaign raised the path from
+approximately 110 to 203.9 tok/s without speculative decoding or manual clock
+pinning.
+
+Two model families join the registry. Qwen 3.8 27B is a dense arch-5 text
+tower with native 262K context and an xhigh thinking default, shipping as a
+quality trunk (`qwen3.8:27b`, MQ4) plus a cheaper MQ4R speed SKU
+(`qwen3.8:27b-fast`). Muse Glimmer 30B is a new architecture (arch 14): a
+dense text tower with a perception encoder and a 3:1 sliding/full attention
+layout where the full layers are NoPE, shipping as `muse-glimmer` (MQ4 body,
+Q8 attention and lm_head), `muse-glimmer:fast` (MQ4R), and a block-diffusion
+DFlash drafter (`muse-glimmer:draft`, arch 23) that reuses the target's embed
+and lm_head and pairs with either SKU. Glimmer's `.mq4r` SKU is not lowered to
+Redline PM4 yet, so automatic Redline admission is withheld for it.
+
+Single-GPU Qwen A3B `.mq4r` models now request retained PM4 by default on
+gfx1100, gfx1151, and gfx1201. gfx1200 and other architectures remain opt-in;
+the built-in `hip` configuration profile disables the automatic Redline route.
+
+gfx1151 QKVZA uses the hybrid header-load kernel for the K=2048/total_m=1281
+production shape and the all-buffer kernel for its production shape. The Silver
+baseline repairs the hybrid path's coefficient-domain numerics and certifies
+coherent retained-PM4 output. Its 114.209 tok/s high-water is 0.812 tok/s
+(0.71%, approximately 1 tok/s) below the 115.021 tok/s Golden floor. ROCm 7.14
+is only a hypothesis for that gap; neither causality nor absence of a Redline
+route regression is proven.
+
+Contributor deltas staged for this release:
+
+- #465: LLaMA Site A attention dispatch and expanded HFQ KV policy.
+- #466: Qwen2 instruct chat-template application.
+- #468: dots.ocr text-only daemon generation.
+- #473: VibeThinker-3B MQ4 and MQ6 registry entries.
+- #476: DeepSeek V4 gfx1151 i8-WMMA prefill.
+- #479: MiniMax gfx1151 grouped/dense prefill kernels and fail-closed guards.
+- #480: MiniMax projection routing through `execute_steps`.
+- #482: fused QKV bias across per-row dtypes, isolated from Redline's ABI.
+- #487: architecture-generic MMQ screening.
+- #496: default-off RDNA3 QKVZA split-tail experiment.
+- #497: multi-stage runtime and GPU gate-runner Containerfile.
+- #501: DSpark request telemetry and non-fatal pre-warm recovery.
+- #513: native Qwen XML tool calls across CLI, daemon, and cached history.
+- #528: DeepSeek V4 DSpark sidecar registration and re-pull discovery.
+- #529: quickstart refresh and historical benchmark labeling.
+
+The user-facing control plane is now Rust-only. `hipfire-cli`,
+`hipfire-config`, `hipfire-registry`, `hipfire-client`, and `hipfire-tui` own
+install, config, model lifecycle, chat, serving, and OpenAI-compatible HTTP;
+the installed binary and runtime images carry no Bun, Node.js, or TypeScript
+payload. Sparse typed TOML is the persistent policy surface, while environment
+variables remain for bootstrap, one-shot compatibility, and explicit developer
+experiments.
+
+Named `default`, `dev`, `hip`, and `redline` configuration profiles now have a
+clean `hipfire config profile set|create` control surface. The `hip` profile is
+an explicit automatic-Redline opt-out. Bare `hipfire config profile` opens a
+profile wizard that can select or snapshot profiles and search the complete
+typed variable catalog by key, compatibility name, environment variable,
+scope, category, or help text.
+
+Registry `recommended_settings` now lower through the typed config resolver,
+including temperature, top-p, top-k, min-p, presence penalty, repeat penalty,
+and fallback system prompts. The Rust client also restores chat-history
+framing, stable OpenAI response metadata, base64 vision passthrough,
+cached-token accounting, and DeepSeek cache-fingerprint normalization. PFlash,
+TriAttention sidecar auto-attach, and CASK m-folding remain disabled by default.
+
+The release also refreshes the Rust dependency surface, adds standard
+`clap`/`safetensors`/`half`/`tracing` support, introduces Redline property
+coverage, enables `cargo-deny` in CI, removes the stale modular-rebase helper,
+and removes the dead AWQ router exclusion.
+
 ## v0.2.1 — Dispatch unification (#397)
 
 The centralized kernel-dispatch program lands: every GEMV/GEMM/attention/
@@ -785,7 +869,7 @@ replacement for anyone running v0.1.7-alpha.
 ### Upgrade path
 
 ```
-curl -fsSL https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/warpfront/hipfire/master/install.sh | bash
 # or: hipfire update
 ```
 
@@ -1013,7 +1097,7 @@ eligibility check requires a dense DeltaNet layer), so pp ≈ decode at
 
 ### Known issues
 
-- **hipGraph + MoE multi-turn corruption** ([#19](https://github.com/Kaden-Schutt/hipfire/issues/19)).
+- **hipGraph + MoE multi-turn corruption** ([#19](https://github.com/warpfront/hipfire/issues/19)).
   Single-shot short decodes with `HIPFIRE_GRAPH=1` on A3B look healthy
   (162 tok/s, byte-coherent at 30 tokens), but state diverges from the
   direct path after ~40 decoded tokens — the model starts skipping a

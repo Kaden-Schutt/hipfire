@@ -1,0 +1,15 @@
+The architecture identifier must match `gfx942` exactly. If the runtime reports a different architecture, the measurement must abort with a clear error, not silently fall back to a different kernel path. The same applies to the model identifier: the binary must reject any mismatch between the loaded model and the expected architecture. This ensures that a benchmark run targeting a specific hardware and model configuration does not accidentally measure a different configuration due to a misconfigured environment.
+
+Furthermore, the runtime must validate that the loaded model's architecture matches the expected one. For example, if the model is a DeepSeV4Flash model, the runtime should verify that the loaded model's architecture identifier matches that. If it does not, the measurement should fail rather than silently fall back to a different model type. This ensures that the benchmark results are reproducible and accurate for the intended configuration.
+
+The same principle applies to the device type: if the runtime is configured to run on an AMD Instinct MI300X (gfx942), it should verify that the device type matches. If it does not, the measurement should fail rather than silently fall back to a different device type. This ensures that the benchmark results are reproducible and accurate for the intended hardware.
+
+Finally, the runtime should also verify that the model's architecture and device type match the expected ones. If they do not, the measurement should fail rather than silently fall back to a different configuration. This ensures that the benchmark results are reproducible and accurate for the intended configuration.
+
+In summary, the runtime should enforce strict validation of the architecture and device type to ensure that the benchmark results are accurate and reproducible for the intended configuration. This is crucial for ensuring that the benchmark results are meaningful and can be used for performance analysis and optimization.
+
+The runtime should also ensure that the model's architecture and device type are validated before any measurement begins. This ensures that the benchmark results are accurate and reproducible for the intended configuration. This is crucial for ensuring that the benchmark results are meaningful and can be used for performance analysis and optimization.
+
+The runtime should also ensure that the model's architecture and device type are validated before any measurement begins. This ensures that the benchmark results are accurate and reproducible for the intended configuration. This is crucial for ensuring that the benchmark results are meaningful and can be used for performance analysis and optimization.
+
+The runtime should also ensure that the model's architecture and device type are validated before any measurement begins. This ensures that the benchmark results are accurate and reproducible for the intended configuration. This is crucial for ensuring that the benchmark

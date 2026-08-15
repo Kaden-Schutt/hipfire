@@ -1,0 +1,1 @@
+-rw-rw-r-- 1 1000 1000 82191362222 Jul 24 22:20 /mnt/scratch/models/deepseek-v4-flash-mq2r/deepseek-v4-flash.mq2r

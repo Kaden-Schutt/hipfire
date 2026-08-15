@@ -65,7 +65,7 @@ extern "C" __global__ __launch_bounds__(512, 1) void deepseek4_attn_swa_buf(
         local_max = fmaxf(local_max, attn_sink[h]);
     }
     for (int off = 16; off > 0; off >>= 1) {
-        local_max = fmaxf(local_max, __shfl_down(local_max, off));
+        local_max = fmaxf(local_max, __shfl_down(local_max, off, 32));
     }
     const int warp_id = t >> 5;
     const int lane_id = t & 31;
@@ -79,7 +79,7 @@ extern "C" __global__ __launch_bounds__(512, 1) void deepseek4_attn_swa_buf(
         const int n_warps = (blockDim.x + 31) >> 5;
         float v = (lane_id < n_warps) ? warp_scratch[lane_id] : -1e30f;
         for (int off = 16; off > 0; off >>= 1) {
-            v = fmaxf(v, __shfl_down(v, off));
+            v = fmaxf(v, __shfl_down(v, off, 32));
         }
         if (lane_id == 0) {
             warp_scratch[0] = v;
@@ -107,14 +107,17 @@ extern "C" __global__ __launch_bounds__(512, 1) void deepseek4_attn_swa_buf(
     }
 
     // Phase 4c: warp-wide deterministic sum via __shfl broadcasts in fixed
-    // lane order 0..31. Top-of-kernel `if (h >= n_heads) return;` is
-    // block-uniform, so all wave lanes participate here.
+    // lane order 0..31. Width is explicit 32 because HIP defaults __shfl
+    // width to warpSize, which is 64 on CDNA3; without it every lane would
+    // read physical lanes 0..31 only and upper-half partials would be dropped.
+    // Top-of-kernel `if (h >= n_heads) return;` is block-uniform, so all
+    // wave lanes participate here.
     const int warp_id4 = t >> 5;
     const int lane_id4 = t & 31;
     float ws = 0.0f;
     #pragma unroll
     for (int src = 0; src < 32; ++src) {
-        ws += __shfl(thread_sum, src);
+        ws += __shfl(thread_sum, src, 32);
     }
     if (lane_id4 == 0) {
         warp_scratch[warp_id4] = ws;

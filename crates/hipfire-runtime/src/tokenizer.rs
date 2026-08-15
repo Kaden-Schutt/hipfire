@@ -157,6 +157,21 @@ pub struct Tokenizer {
     pub eot_id: Option<u32>,
     /// True for GPT-2 BPE (Qwen), false for SentencePiece (LLaMA).
     is_gpt2_bpe: bool,
+    /// SentencePiece `add_dummy_prefix`: when true, `encode_sentencepiece`
+    /// prepends a `▁` to each raw text segment (the LLaMA convention —
+    /// `normalizer: [Prepend("▁"), Replace(" "→"▁")]`). CONFIG-DRIVEN, not
+    /// hardcoded: Gemma 4's tokenizer.json normalizer is a bare
+    /// `Replace(" "→"▁")` with NO Prepend, so "The capital of France is"
+    /// must encode to [818 ("The"), …] — the unconditional prefix shifted
+    /// the first word to 669 ("▁The"), a one-token divergence from the HF
+    /// ground truth that made short raw prompts OOD (gemma4 12B garbage
+    /// replies, 2026-06-09). Resolved per-source:
+    ///   - HF tokenizer.json → `sp_dummy_prefix_from_hf_json` (normalizer
+    ///     Prepend / Metaspace pre_tokenizer signals);
+    ///   - GGUF → `tokenizer.ggml.add_space_prefix` (default true, the
+    ///     llama.cpp SPM convention).
+    /// Unused on the GPT-2 BPE path.
+    sp_dummy_prefix: bool,
 }
 
 /// Resolve a list of `(left_string, right_string)` merge pairs into a
@@ -237,6 +252,72 @@ fn build_byte_to_id(token_to_id: &HashMap<String, u32>) -> Result<[u32; 256], To
     Ok(out)
 }
 
+/// Decide whether the SentencePiece encode path should prepend a dummy `▁`
+/// by reading the HF tokenizer.json normalizer / pre_tokenizer config
+/// instead of assuming the LLaMA convention.
+///
+/// Signals that mean "yes, prepend":
+///   - a `Prepend` normalizer, top-level or inside a `Sequence` — the
+///     LLaMA-2 style `[Prepend("▁"), Replace(" "→"▁")]` chain;
+///   - a `Metaspace` pre_tokenizer (top-level or inside a `Sequence`)
+///     whose `prepend_scheme` is `"always"`/`"first"`, or — legacy
+///     serialization — whose `add_prefix_space` is true (the T5-style
+///     `Precompiled` charsmap + `Metaspace` pairing; the charsmap itself
+///     never carries the dummy-prefix flag, Metaspace does).
+///
+/// No signal (e.g. Gemma 4's bare `Replace(" "→"▁")` normalizer, null
+/// pre_tokenizer) means the model's tokenizer does NOT want a dummy
+/// prefix — see the `sp_dummy_prefix` field doc for the gemma4 failure
+/// mode that motivated this.
+fn sp_dummy_prefix_from_hf_json(tok: &serde_json::Value) -> bool {
+    fn normalizer_prepends(n: &serde_json::Value) -> bool {
+        match n.get("type").and_then(|v| v.as_str()) {
+            Some("Prepend") => true,
+            Some("Sequence") => n
+                .get("normalizers")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().any(normalizer_prepends))
+                .unwrap_or(false),
+            _ => false,
+        }
+    }
+    fn pretokenizer_prepends(p: &serde_json::Value) -> bool {
+        match p.get("type").and_then(|v| v.as_str()) {
+            Some("Metaspace") => match p.get("prepend_scheme").and_then(|v| v.as_str()) {
+                Some("always") | Some("first") => true,
+                Some(_) => false, // "never"
+                // Legacy Metaspace serialization (tokenizers < 0.14):
+                // `add_prefix_space: bool`, default true.
+                None => p
+                    .get("add_prefix_space")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true),
+            },
+            Some("Sequence") => p
+                .get("pretokenizers")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().any(pretokenizer_prepends))
+                .unwrap_or(false),
+            _ => false,
+        }
+    }
+    let normalizer = tok.get("normalizer").filter(|v| !v.is_null());
+    let pre_tokenizer = tok.get("pre_tokenizer").filter(|v| !v.is_null());
+    // A tokenizer.json that declares NEITHER stage tells us nothing, and the
+    // historic behaviour for those was an unconditional dummy prefix (the
+    // LLaMA convention). Preserve that exactly — changing the default here
+    // would silently re-tokenize every already-supported SentencePiece model.
+    // Gemma 4 is not affected by this fallback: it DOES declare a normalizer
+    // (a bare `Replace(" "→"▁")`), so it reaches the derived answer below and
+    // correctly resolves to false.
+    if normalizer.is_none() && pre_tokenizer.is_none() {
+        return true;
+    }
+    normalizer.map(normalizer_prepends).unwrap_or(false)
+        || pre_tokenizer.map(pretokenizer_prepends).unwrap_or(false)
+}
+
+
 impl Tokenizer {
     /// Load tokenizer from GGUF metadata.
     pub fn from_gguf(gguf: &GgufFile) -> Result<Self, TokenizerError> {
@@ -300,6 +381,12 @@ impl Tokenizer {
         // Detect tokenizer type
         let model_type = gguf.meta_str("tokenizer.ggml.model").unwrap_or("llama");
         let is_gpt2_bpe = model_type == "gpt2";
+        // SP dummy prefix: GGUF carries it as `tokenizer.ggml.add_space_prefix`
+        // (llama.cpp SPM convention, default true when absent).
+        let sp_dummy_prefix = match gguf.meta("tokenizer.ggml.add_space_prefix") {
+            Some(MetaValue::Bool(b)) => *b,
+            _ => true,
+        };
 
         // Build special tokens list: vocab entries matching <|...|> or </...> patterns
         let mut special_tokens: Vec<(String, u32)> = Vec::new();
@@ -337,6 +424,7 @@ impl Tokenizer {
             add_bos: false,
             eot_id,
             is_gpt2_bpe,
+            sp_dummy_prefix,
         })
     }
 
@@ -441,7 +529,29 @@ impl Tokenizer {
             _ => None,
         };
 
-        let is_gpt2_bpe = token_to_id.contains_key("Ġthe") || token_to_id.contains_key("Ġ");
+        // GPT-2 byte-level BPE uses Ġ-prefixed space tokens (Qwen); SentencePiece
+        // BPE uses ▁ (Gemma, LLaMA).
+        //
+        // The historic test was `contains("Ġthe") || contains("Ġ")`. Gemma 4
+        // carries exactly ONE stray Ġ token against ~137k ▁ tokens, so the bare
+        // `contains("Ġ")` clause misfired and sent it down the GPT-2 path, where
+        // byte-coverage construction fails.
+        //
+        // The added `n_gpt2 > n_sp` guard is deliberately conjunctive with the
+        // original Ġ clause rather than replacing it, so this can only change
+        // the verdict for a vocabulary in which ▁ strictly OUTNUMBERS Ġ. Such a
+        // vocabulary is SentencePiece by construction and was already being
+        // misclassified; every vocabulary the old test got right keeps its
+        // previous answer. Real GPT-2 BPE vocabularies match "Ġthe" and never
+        // reach the second clause at all.
+        let n_gpt2 = token_to_id.keys().filter(|t| t.starts_with('Ġ')).count();
+        let n_sp = token_to_id.keys().filter(|t| t.starts_with('▁')).count();
+        let is_gpt2_bpe =
+            token_to_id.contains_key("Ġthe") || (token_to_id.contains_key("Ġ") && n_gpt2 > n_sp);
+        // SP dummy prefix is a property of the model's normalizer /
+        // pre_tokenizer config, NOT of SentencePiece itself — read it from
+        // the tokenizer.json instead of assuming the LLaMA convention.
+        let sp_dummy_prefix = sp_dummy_prefix_from_hf_json(&tok);
 
         let (merges, merge_pair_rank) = resolve_merges(&merges_strings, &token_to_id)?;
         let byte_to_id = if is_gpt2_bpe {
@@ -462,6 +572,7 @@ impl Tokenizer {
             add_bos: false,
             eot_id,
             is_gpt2_bpe,
+            sp_dummy_prefix,
         })
     }
 
@@ -510,10 +621,29 @@ impl Tokenizer {
                 }
             }
             // Honor HF `add_bos_token` from the embedded tokenizer_config (e.g.
-            // Cohere2 = true). Drives the BOS prepend in `encode()`.
-            if let Some(tc) = meta.get("tokenizer_config") {
-                if let Some(ab) = tc.get("add_bos_token").and_then(|v| v.as_bool()) {
-                    t.add_bos = ab;
+            // Cohere2 = true). Drives the BOS prepend in `encode()`. An explicit
+            // true or false is authoritative; only fall through to arch defaults
+            // when the key is absent.
+            let add_bos_explicit = meta
+                .get("tokenizer_config")
+                .and_then(|tc| tc.get("add_bos_token"))
+                .and_then(|v| v.as_bool());
+            if let Some(ab) = add_bos_explicit {
+                t.add_bos = ab;
+            } else if let Some(arch) = meta.get("architecture").and_then(|v| v.as_str()) {
+                // LFM2.5 family (arch "lfm2" / "lfm2_moe") is BOS-trained: the
+                // chat_template starts with `{{- bos_token -}}` and HF's
+                // AutoTokenizer adds BOS for raw prompts (verified: 350M
+                // "The capital of France is" -> [1, 1098, ...] via HF, but
+                // hipfire's add_bos is false when tokenizer_config lacks
+                // `add_bos_token`, so raw prompts miss BOS and the model
+                // sees position-shifted inputs -> single-token attractor
+                // (230M: 856 " is" x8, 350M: 540 x8). Default add_bos true
+                // for LFM only when the flag is absent; encode() still
+                // suppresses a double-BOS when text already starts with the
+                // BOS literal (Jinja-rendered chat path).
+                if arch == "lfm2" || arch == "lfm2_moe" {
+                    t.add_bos = true;
                 }
             }
             return Ok(t);
@@ -587,6 +717,12 @@ impl Tokenizer {
             .and_then(|v| v.as_str())
             .unwrap_or("llama");
         let is_gpt2_bpe = model_type == "gpt2";
+        // Mirrors `from_gguf`: llama.cpp SPM convention defaults the dummy
+        // prefix ON when `tokenizer.ggml.add_space_prefix` is absent.
+        let sp_dummy_prefix = meta
+            .get("tokenizer.ggml.add_space_prefix")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
 
         let mut special_tokens: Vec<(String, u32)> = Vec::new();
         for (i, tok) in vocab.iter().enumerate() {
@@ -620,6 +756,7 @@ impl Tokenizer {
             add_bos: false,
             eot_id,
             is_gpt2_bpe,
+            sp_dummy_prefix,
         })
     }
 
@@ -697,13 +834,19 @@ impl Tokenizer {
     /// segments are encoded via BPE or SentencePiece.
     pub fn encode(&self, text: &str) -> Vec<u32> {
         let mut result = Vec::new();
-        // Honor HF `add_bos_token` (Cohere2 add_bos_token=true, BOS=2): prepend
-        // the BOS id once. Raw-text/PPL eval relies on this; without it
-        // BOS-trained models degenerate. (A chat-template serving path that
-        // already emits <BOS_TOKEN> must encode with add_bos disabled to avoid
-        // a double BOS — a serving concern, separate from raw encode.)
+        // Honor HF `add_bos_token` (Cohere2/LFM2): prepend bos_id once for
+        // raw prompts. Suppress a duplicate when `text` already begins with
+        // the BOS vocabulary literal (Jinja chat templates emit
+        // `{{- bos_token -}}` up front).
         if self.add_bos {
-            result.push(self.bos_id);
+            let bos_str = self
+                .vocab
+                .get(self.bos_id as usize)
+                .map(|s| s.as_str())
+                .unwrap_or("");
+            if bos_str.is_empty() || !text.starts_with(bos_str) {
+                result.push(self.bos_id);
+            }
         }
         if self.special_tokens.is_empty() {
             result.extend(self.encode_raw(text));
@@ -753,7 +896,10 @@ impl Tokenizer {
         self.encode_gpt2_bpe(text)
     }
 
-    /// SentencePiece greedy encoding: prepend ▁ for spaces, longest-match lookup.
+    /// SentencePiece greedy encoding: spaces become ▁, longest-match lookup.
+    /// A leading dummy `▁` is prepended only when the tokenizer config asks
+    /// for it (`sp_dummy_prefix` — see the field doc; gemma4 says no,
+    /// LLaMA says yes).
     ///
     /// Each suffix trial is a `&str` slice of `sp_text` keyed against
     /// `token_to_id` (HashMap's `Borrow<str>` impl matches `String` keys
@@ -775,7 +921,8 @@ impl Tokenizer {
     /// `unwrap_or(0)`. Fix is a separate concern from this PR.
     fn encode_sentencepiece(&self, text: &str) -> Vec<u32> {
         let mut tokens = Vec::new();
-        // SentencePiece convention: spaces become ▁, start of text gets ▁.
+        // Spaces become ▁; start of text gets ▁ ONLY if the model's
+        // tokenizer config has the dummy prefix (sp_dummy_prefix).
         // Single-pass build: the prior `text.replace(...)` + `format!(...)`
         // allocated twice; iterating chars and pushing into a pre-sized
         // String allocates once. ▁ is 3 bytes UTF-8, so the worst case
@@ -783,7 +930,9 @@ impl Tokenizer {
         // inputs fit in the lower-bound hint and the String grows only
         // if needed.
         let mut sp_text = String::with_capacity(text.len() + 3);
-        sp_text.push('\u{2581}');
+        if self.sp_dummy_prefix {
+            sp_text.push('\u{2581}');
+        }
         for ch in text.chars() {
             sp_text.push(if ch == ' ' { '\u{2581}' } else { ch });
         }
@@ -799,11 +948,23 @@ impl Tokenizer {
         let n_chars = boundaries.len() - 1;
 
         let mut pos = 0usize;
+        // Cap the greedy scan at the longest vocab token (in chars). The
+        // uncapped (pos+1..=n_chars).rev() scan is O(text^2) hash work over
+        // megabyte-long candidate slices on corpus-sized inputs (the wt2
+        // KLD slice never finished tokenizing). No vocab entry longer than
+        // max_tok_chars can ever match, so capping is byte-identical.
+        let max_tok_chars = self
+            .token_to_id
+            .keys()
+            .map(|t| t.chars().count())
+            .max()
+            .unwrap_or(1);
         while pos < n_chars {
             // Greedy longest match from vocabulary (high-`end` first).
             let mut best_len = 0;
             let mut best_id = 0u32;
-            for end in (pos + 1..=n_chars).rev() {
+            let scan_end = (pos + max_tok_chars).min(n_chars);
+            for end in (pos + 1..=scan_end).rev() {
                 let candidate = &sp_text[boundaries[pos]..boundaries[end]];
                 if let Some(&id) = self.token_to_id.get(candidate) {
                     best_len = end - pos;
@@ -1492,18 +1653,16 @@ pub fn strip_trailing_line_ws(s: &str) -> String {
 /// is itself a no-op fast-path when its trigger pattern is absent.
 pub fn maybe_normalize_prompt(s: &str) -> std::borrow::Cow<'_, str> {
     // Default ON. Explicit "0" / "false" / "off" / "no" opts out (parsed once in
-    // RuntimeConfig::from_env). Delegates to the flag-parameterized core so the
+    // RuntimeConfig::from_process_config). Delegates to the flag-parameterized core so the
     // pipeline is unit-testable without the memoized `config::get()` singleton.
     normalize_prompt_with(s, crate::config::get().normalize_prompt)
 }
 
 /// Core prompt-normalization pipeline, parameterized on the enable flag.
 /// `maybe_normalize_prompt` is the production entry point; tests call this
-/// directly with an explicit flag. (The global `config::get()` is a memoized
-/// `OnceLock`, so toggling `HIPFIRE_NORMALIZE_PROMPT` per-call can't drive it
-/// in a shared test process — that mismatch is what silently broke the
-/// opt-out tests until CI surfaced it.)
-fn normalize_prompt_with(s: &str, enabled: bool) -> std::borrow::Cow<'_, str> {
+/// directly with an explicit flag. The global `config::get()` is an immutable
+/// process snapshot, so per-call mutation is intentionally unsupported.
+pub fn normalize_prompt_with(s: &str, enabled: bool) -> std::borrow::Cow<'_, str> {
     use std::borrow::Cow;
     if !enabled {
         return Cow::Borrowed(s);
@@ -1619,6 +1778,7 @@ mod bpe_tests {
             add_bos: false,
             eot_id: None,
             is_gpt2_bpe: true,
+            sp_dummy_prefix: true,
         }
     }
 
@@ -1927,6 +2087,11 @@ mod sp_tests {
             add_bos: false,
             eot_id: None,
             is_gpt2_bpe: false,
+            // The pre-existing SP unit tests below were written against the
+            // unconditional-prefix behavior; keep them on the LLaMA
+            // convention. Config-driven coverage lives in
+            // `sp_dummy_prefix_tests`.
+            sp_dummy_prefix: true,
         }
     }
 
@@ -2286,5 +2451,283 @@ mod prompt_norm_tests {
         let out = normalize_prompt_with(s, false);
         assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
         assert_eq!(out.as_ref(), s);
+    }
+}
+
+
+#[cfg(test)]
+mod sp_dummy_prefix_tests {
+    //! Config-driven SP dummy-prefix coverage (gemma4 first-word bug,
+    //! 2026-06-09). The unconditional `▁` prefix in `encode_sentencepiece`
+    //! shifted the FIRST word of every raw prompt on models whose
+    //! tokenizer.json has a no-dummy-prefix normalizer: gemma4 12B encoded
+    //! "The capital of France is" as [2, 669 ("▁The"), …] vs the HF ground
+    //! truth [2, 818 ("The"), …] — a one-token divergence that made short
+    //! raw prompts OOD (garbage replies on hiptrx). All expected ids below
+    //! are REAL google/gemma-4-12B-it ids, snapshotted from the hiptrx
+    //! model's tokenizer.json and cross-checked against HF `tokenizers`
+    //! 0.22.2 (`Tokenizer.encode`, 2026-06-09).
+
+    use super::*;
+
+    /// Minimal gemma4-12B HFQ-metadata fixture: real token ids, real
+    /// normalizer shape (bare `Replace(" "→"▁")`, NO Prepend), real
+    /// `Split(MergedWithPrevious)` pre_tokenizer, real special-token ids.
+    /// The ▁-variants (669 "▁The", 3305 "▁thought", 2430 "▁user") are
+    /// deliberately included so the pre-fix encoder's output is
+    /// representable — the regression would resurface as 669/3305/2430
+    /// instead of silently degrading to char fallback.
+    fn gemma4_fixture_metadata() -> String {
+        let tok_json = serde_json::json!({
+            "normalizer": {
+                "type": "Replace",
+                "pattern": {"String": " "},
+                "content": "▁"
+            },
+            "pre_tokenizer": {
+                "type": "Split",
+                "pattern": {"String": " "},
+                "behavior": "MergedWithPrevious",
+                "invert": false
+            },
+            "model": {
+                "type": "BPE",
+                "vocab": {
+                    "The": 818,
+                    "▁The": 669,
+                    "▁capital": 5279,
+                    "▁of": 529,
+                    "▁France": 7001,
+                    "▁is": 563,
+                    "thought": 45518,
+                    "▁thought": 3305,
+                    "user": 2364,
+                    "▁user": 2430,
+                    "model": 4368,
+                    "\n": 107
+                },
+                "merges": []
+            },
+            "added_tokens": [
+                {"id": 0, "content": "<pad>", "special": true},
+                {"id": 1, "content": "<eos>", "special": true},
+                {"id": 2, "content": "<bos>", "special": true},
+                {"id": 3, "content": "<unk>", "special": true},
+                {"id": 100, "content": "<|channel>", "special": true},
+                {"id": 101, "content": "<channel|>", "special": true},
+                {"id": 105, "content": "<|turn>", "special": true},
+                {"id": 106, "content": "<turn|>", "special": true}
+            ]
+        });
+        serde_json::json!({
+            "tokenizer": tok_json.to_string(),
+            "generation_config": {"bos_token_id": 2, "eos_token_id": 1}
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn gemma4_no_dummy_prefix_first_word_matches_hf() {
+        let t = Tokenizer::from_hfq_metadata(&gemma4_fixture_metadata())
+            .expect("fixture parses");
+        assert_eq!(t.bos_id, 2, "generation_config bos override");
+        let mut ids = vec![t.bos_id];
+        ids.extend(t.encode("The capital of France is"));
+        assert_eq!(ids, vec![2, 818, 5279, 529, 7001, 563]);
+    }
+
+    #[test]
+    fn gemma4_chat_tail_thought_channel_matches_hf() {
+        let t = Tokenizer::from_hfq_metadata(&gemma4_fixture_metadata())
+            .expect("fixture parses");
+        assert_eq!(
+            t.encode("<|channel>thought\n<channel|>The capital of France is"),
+            vec![100, 45518, 107, 101, 818, 5279, 529, 7001, 563],
+        );
+    }
+
+    #[test]
+    fn llama_style_prepend_normalizer_keeps_dummy_prefix() {
+        let tok_json = serde_json::json!({
+            "normalizer": {
+                "type": "Sequence",
+                "normalizers": [
+                    {"type": "Prepend", "prepend": "▁"},
+                    {"type": "Replace", "pattern": {"String": " "}, "content": "▁"}
+                ]
+            },
+            "model": {
+                "type": "BPE",
+                "vocab": {"▁The": 10, "The": 11, "▁capital": 12},
+                "merges": []
+            },
+            "added_tokens": []
+        });
+        let t = Tokenizer::from_hf_json(&tok_json.to_string()).expect("parses");
+        assert_eq!(t.encode("The capital"), vec![10, 12]);
+    }
+
+    #[test]
+    fn detection_signals() {
+        use serde_json::json;
+        assert!(!sp_dummy_prefix_from_hf_json(&json!({
+            "normalizer": {"type": "Replace", "pattern": {"String": " "}, "content": "▁"},
+            "pre_tokenizer": {"type": "Split", "pattern": {"String": " "}, "behavior": "MergedWithPrevious"}
+        })));
+        // Empty tokenizer.json declares neither stage — same class as the
+        // null/null case below: historic LLaMA default (prepend).
+        assert!(sp_dummy_prefix_from_hf_json(&json!({})));
+        // Neither stage declared -> historic LLaMA default (prepend). Changing
+        // this to false would silently re-tokenize every existing SP model.
+        assert!(sp_dummy_prefix_from_hf_json(
+            &json!({"normalizer": null, "pre_tokenizer": null})
+        ));
+        // Gemma 4 shape: a normalizer IS declared but does not prepend.
+        assert!(!sp_dummy_prefix_from_hf_json(&json!({
+            "normalizer": {"type": "Replace"},
+            "pre_tokenizer": null
+        })));
+        assert!(sp_dummy_prefix_from_hf_json(&json!({
+            "normalizer": {"type": "Prepend", "prepend": "▁"}
+        })));
+        for (scheme, want) in [("always", true), ("first", true), ("never", false)] {
+            assert_eq!(
+                sp_dummy_prefix_from_hf_json(&json!({
+                    "pre_tokenizer": {"type": "Metaspace", "replacement": "▁", "prepend_scheme": scheme}
+                })),
+                want,
+                "Metaspace prepend_scheme={scheme}",
+            );
+        }
+        assert!(sp_dummy_prefix_from_hf_json(&json!({
+            "normalizer": {"type": "Precompiled", "precompiled_charsmap": ""},
+            "pre_tokenizer": {"type": "Metaspace", "replacement": "▁", "add_prefix_space": true}
+        })));
+        assert!(sp_dummy_prefix_from_hf_json(&json!({
+            "pre_tokenizer": {"type": "Metaspace", "replacement": "▁"}
+        })));
+        assert!(!sp_dummy_prefix_from_hf_json(&json!({
+            "pre_tokenizer": {"type": "Metaspace", "replacement": "▁", "add_prefix_space": false}
+        })));
+        assert!(sp_dummy_prefix_from_hf_json(&json!({
+            "pre_tokenizer": {"type": "Sequence", "pretokenizers": [
+                {"type": "Split", "pattern": {"String": " "}},
+                {"type": "Metaspace", "replacement": "▁", "prepend_scheme": "always"}
+            ]}
+        })));
+    }
+
+    #[test]
+    fn gguf_add_space_prefix_default_on_and_explicit_off() {
+        use serde_json::json;
+        let meta = json!({
+            "tokenizer.ggml.tokens": ["▁hello", "▁world", "hello"],
+            "tokenizer.ggml.model": "llama"
+        });
+        let t = Tokenizer::from_gguf_meta_json(&meta).expect("parses");
+        assert_eq!(t.encode("hello"), vec![0], "default: dummy prefix ON");
+        let meta = json!({
+            "tokenizer.ggml.tokens": ["▁hello", "▁world", "hello"],
+            "tokenizer.ggml.model": "llama",
+            "tokenizer.ggml.add_space_prefix": false
+        });
+        let t = Tokenizer::from_gguf_meta_json(&meta).expect("parses");
+        assert_eq!(t.encode("hello"), vec![2], "explicit off: no prefix");
+    }
+}
+
+#[cfg(test)]
+mod lfm2_bos_tests {
+    //! Behavioral coverage for LFM2/lfm2_moe `add_bos` resolution in
+    //! `from_hfq_metadata` and the encode-time single-BOS guard.
+    use super::*;
+    use serde_json::json;
+
+    /// Smallest HF tokenizer.json that `from_hf_json` accepts and that can
+    /// encode ASCII via the SentencePiece path (no `Ġ` → non-GPT2).
+    fn minimal_tok_json() -> String {
+        json!({
+            "model": {
+                "type": "BPE",
+                "vocab": {
+                    "<unk>": 0,
+                    "h": 3,
+                    "i": 4,
+                    "\u{2581}": 5
+                },
+                "merges": []
+            },
+            "added_tokens": [
+                {"id": 1, "content": "<|startoftext|>", "special": true},
+                {"id": 2, "content": "<|endoftext|>", "special": true}
+            ]
+        })
+        .to_string()
+    }
+
+    fn lfm_meta(add_bos_token: Option<bool>) -> String {
+        let mut root = json!({
+            "architecture": "lfm2",
+            "tokenizer": minimal_tok_json(),
+            "generation_config": {
+                "bos_token_id": 1,
+                "eos_token_id": 2
+            },
+            "tokenizer_config": {}
+        });
+        if let Some(ab) = add_bos_token {
+            root["tokenizer_config"]["add_bos_token"] = json!(ab);
+        }
+        root.to_string()
+    }
+
+    #[test]
+    fn lfm2_absent_add_bos_defaults_true_and_prepends_once() {
+        let tok = Tokenizer::from_hfq_metadata(&lfm_meta(None)).expect("meta");
+        assert!(
+            tok.add_bos,
+            "absent add_bos_token must default true for lfm2"
+        );
+        assert_eq!(tok.bos_id, 1);
+        let ids = tok.encode("hi");
+        assert_eq!(
+            ids.first().copied(),
+            Some(1),
+            "raw text must begin with bos_id"
+        );
+        assert_eq!(
+            ids.iter().filter(|&&id| id == 1).count(),
+            1,
+            "exactly one leading bos_id"
+        );
+    }
+
+    #[test]
+    fn lfm2_explicit_false_is_authoritative() {
+        let tok = Tokenizer::from_hfq_metadata(&lfm_meta(Some(false))).expect("meta");
+        assert!(
+            !tok.add_bos,
+            "explicit add_bos_token=false must not be overwritten by LFM default"
+        );
+        let ids = tok.encode("hi");
+        assert_ne!(
+            ids.first().copied(),
+            Some(tok.bos_id),
+            "must not prepend bos when add_bos is false"
+        );
+    }
+
+    #[test]
+    fn lfm2_jinja_bos_literal_not_double_prepended() {
+        let tok = Tokenizer::from_hfq_metadata(&lfm_meta(None)).expect("meta");
+        assert!(tok.add_bos);
+        // Jinja chat path already emits the BOS vocabulary string.
+        let ids = tok.encode("<|startoftext|>hi");
+        assert_eq!(ids.first().copied(), Some(tok.bos_id));
+        assert_eq!(
+            ids.iter().take_while(|&&id| id == tok.bos_id).count(),
+            1,
+            "must not double-prepend when text already starts with BOS literal"
+        );
     }
 }

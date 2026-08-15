@@ -1,0 +1,530 @@
+[feed] label=p2-B-20260801T174818Z
+[feed] daemon=/mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/target/release/examples/daemon
+[feed] model=/mnt/scratch/models/deepseek-v4-flash-mq2r/deepseek-v4-flash.mq2r
+[feed] >> {"type":"ping"}
+GPU dev 0: gfx942 (205.8 GB VRAM, HIP 7.0)
+  pre-compiled kernels: /mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/.hipfire_kernels/gfx942
+[feed] << {"type":"pong"}
+[feed] pong in 0.24s
+[feed] >> {"type":"load","model":"/mnt/scratch/models/deepseek-v4-flash-mq2r/deepseek-v4-flash.mq2r","params":{"max_seq":4096,"kv_mode":"q8","kv_backend":"contiguous","speculation":"off","dflash_mode":"off","mtp_mode":"off","ngram_draft":false,"dspark_mode":"off"}}
+[rocblas] loaded for gfx942
+deepseek4: MQ2R P3 tensor recipe verified; gfx1151 route v2 is ineligible on gfx942, using portable dispatch
+[feed] << {"type":"loaded","arch":"deepseek4","dim":0,"layers":0,"vocab":0,"vl":false,"cache_capable":true,"retry_reset_eligible":false}
+[feed] loaded in 76.29s
+[feed] DECODE_PHASE_BEGIN
+[feed] >> {"type":"generate","id":"g0-p2-B-20260801T174818Z","attempt_id":1,"prompt":"User: I need a production-grade explanation of ordinary batch-1 autoregressive decode on a DeepSeek V4 Flash style mixture-of-experts model running on AMD Instinct MI300X (gfx942). Please treat this as a measurement contract discussion rather than marketing. Cover the end-to-end path from a frozen prompt fixture through tokenizer identity, prefill, KV write, and token-by-token decode under Q8 KV with speculation fully di
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":": This i","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"s a detai","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"led ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"tech","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"nical resp","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"onse for the","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" specifie","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"d","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" mea","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"surement c","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ontract","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":". Th","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"e fol","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"lowin","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"g cov","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ers the","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" full p","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ath from","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" frozen ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"prompt","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" fix","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ture thro","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"u","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"gh t","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"oken","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"i","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"zer","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" ident","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"i","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ty, ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"prefil","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"l, ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"KV","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" wri","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"te, and","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" token","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"-by-","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"token deco","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"de under th","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"e ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"s","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"p","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"eci","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"f","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ied","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" conditions ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"(","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"Q8 KV,","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"n","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"o","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"spe","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"c","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ulation","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":", batch","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"1","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":", 2","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"048 pro","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"mpt tokens, ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"5","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"10 greedy ge","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"nerat","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"i","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ons","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":", ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"tempe","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ra","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"tu","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"re","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"zero) ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"on a D","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"eep","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"S","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"eek V4","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" Flash s","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"tyl","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"e Mo","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"E mod","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"el r","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"unn","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ing","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"on","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"AM","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"D I","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ns","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"tinc","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"t MI300X ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"(gf","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"x942). The ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"res","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"po","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"nse is struc","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"tured as ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"a measureme","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"n","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"t contrac","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"t d","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"iscu","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ssion, foc","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"using on","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" the","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" technical d","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"etai","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ls","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" and const","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"raints f","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"or ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"a ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"b","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"e","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"nchm","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ark fix","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ture.\n\n","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"**1","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":". The","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"Froz","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"en","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" Prom","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"p","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"t Fix","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"tu","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"re: ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"W","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"hy \"","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"Byt","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"es\" Over \"Te","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"xt\"**\n\nTh","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"e measu","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"remen","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"t ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"contract begin","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"s","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" with a ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"de","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"termini","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"stic, ve","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"r","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"sion","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ed prom","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"pt","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" fixt","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"u","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"re. The","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" reas","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"on","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" \"by","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"t","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"es\"","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" matt","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"er o","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ver \"text\"","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" is","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" tha","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"t any v","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ariat","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"io","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"n","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" i","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"n ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"the sourc","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"e te","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"xt (e","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":".","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"g., traili","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ng newlin","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"e","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"s, ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"charac","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ter ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"encoding,","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" or ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"tokenizer-s","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"p","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ecifi","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"c pre-pr","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ocessing) ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"will p","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"rodu","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"c","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"e dif","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ferent t","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"oken","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" IDs","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":". This inva","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"lidates ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"any c","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"o","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"mpar","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ison betw","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"een runs. ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"The contr","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"act","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"the","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"refore","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" mandat","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"es:","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"\n\n","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"- **Sourc","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"e","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" Corpus:*","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"* ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"A spec","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ifi","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"c, rev","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"isi","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"oned ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"piece","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" o","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"f p","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"rose or","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" chat ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"tex","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"t (not rand","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"om wo","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"rd","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"s or ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"repetiti","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ve","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" text). Th","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"is ensur","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"es ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"a reali","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"stic","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" mixture o","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"f tokens ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"an","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"d","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" at","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"tenti","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"on patt","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ern","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"s.\n-","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" **Tok","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"enizat","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ion:","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"**","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" The","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" exa","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ct tok","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"en","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"izer (fro","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"m","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" the","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" m","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"odel's ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"metada","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"t","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"a, no","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"t a","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" Pyth","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"on ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"proxy) m","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ust ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"be used","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" to con","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ver","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"t the ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"sour","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ce","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"cor","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"pus","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" to token","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" ID","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"s.","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"\n- **V","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"er","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ifi","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"cation","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":":*","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"* A ro","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"und-t","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"rip","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"check ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"(","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"decod","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"e then r","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"e-en","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"code) ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"must ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"produce t","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"he ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"exac","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"t","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" same","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" sequenc","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"e of","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" IDs. ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"This","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" en","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"sures the ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"tokenizer","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" is ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"corre","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ct","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"l","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"y h","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"andlin","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"g t","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"he t","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ext.\n-","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" **Form","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"at:","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"**","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" The fi","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"nal pro","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"mpt","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" is ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"a stric","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"t prefi","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"x","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" of ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"the","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" s","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ource ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"corpus, c","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"u","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"t a","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"t a","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" token ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"bou","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"nd","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ary. ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"It is","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" st","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ored as a","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" fil","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"e wi","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"th","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" n","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"o ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"tra","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"il","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ing ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"new","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"l","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ine ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"(s","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"o `PROMP_A","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"RG=$","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"(<file","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":")` pre","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"se","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"rve","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"s the exa","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ct","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" b","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"y","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"tes).","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" An ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"o","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ption","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"al `--to","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"kens","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"-out` ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"flag","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" ou","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"tp","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"uts the","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" tok","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"en ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ID","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"s ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"as a ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"litt","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"le-endian u32","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" fi","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"le","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"f","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"or v","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"erification","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":".\n\n**2. ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"T","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"he","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" Ge","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"n","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"era","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"t","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ion ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"Request","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":":","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" `H","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"I","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"PFIR","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"E_","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"SP","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"EC","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ULATI","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ON","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"=","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"o","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ff` ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"and","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" `--kv-mode ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"q8`**","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"\n\n","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"The mea","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"s","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"urement uses a","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" single, de","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"terminis","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"t","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ic g","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ener","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ation reque","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"st. ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"The","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"key","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"par","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"a","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"met","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"e","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"rs a","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"re:\n\n- ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"*","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"*`H","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"I","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"PFI","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"RE_SP","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ECUL","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ATION","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"=off","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"`**: This di","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"sables an","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"y ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"s","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"pe","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"cu","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"lative","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" decodi","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"n","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"g (e.","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"g., draft mod","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"e","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ls,","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" tree ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"verification,","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" or other a","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"cc","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"eler","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ation techn","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"iqu","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"es). Th","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"e gener","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ation is","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" p","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ur","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"e","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ly au","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"to","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"regress","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ive (A","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"R) w","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ith a","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" s","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"i","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ngl","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"e","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" t","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ok","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"en pe","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"r ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"s","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"t","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ep.","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"\n- *","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"*`--","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"k","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"v-mod","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"e ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"q8","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"`","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"**: Th","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"e K","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ey-Valu","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"e (","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"K","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"V","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":") ca","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"che is","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" sto","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"red in ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"8","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"-bit ","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"qua","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ntiz","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ed","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" format","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":".","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" Thi","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"s is","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" the \"cont","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"r","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":"ol\"","attempt_id":1}
+[feed] << {"type":"token","id":"g0-p2-B-20260801T174818Z","text":" for the benchmark. It","attempt_id":1}
+[feed] << {"type":"commit_ready","id":"g0-p2-B-20260801T174818Z","tokens":510,"tok_s":32.03316374599586,"prompt_tokens":2052,"prefill_tokens":2052,"cached_tokens":0,"prefill_ms":20816,"total_ms":36738,"finish_reason":"length","drafter":"ar","attempt_id":1}
+[feed] >> {"type":"commit","id":"g0-p2-B-20260801T174818Z","attempt_id":1}
+[feed] << {"type":"aborted","id":"g0-p2-B-20260801T174818Z","reason":"client_cancelled","attempt_id":1}
+[feed] terminal aborted: {'type': 'aborted', 'id': 'g0-p2-B-20260801T174818Z', 'reason': 'client_cancelled', 'attempt_id': 1}
+[feed] DECODE_PHASE_END
+[feed] >> {"type":"unload"}
+deepseek4 gfx942 A2 levers: L1 compressor_gate=OFF (HIPFIRE_DEEPSEEK4_GFX942_COMPRESSOR_GATE default OFF, =1 enables) ; L3 e8_wo_grouped=OFF (HIPFIRE_DEEPSEEK4_GFX942_E8_WO_GROUPED default OFF, =1 enables) ; F1 indexer_topk_parallel=ON (HIPFIRE_DEEPSEEK4_GFX942_INDEXER_TOPK_PARALLEL default OFF, =1 enables)
+[daemon-control] received commit for id=g0-p2-B-20260801T174818Z attempt_id=1
+[feed] << {"type":"done","id":"g0-p2-B-20260801T174818Z","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":510,"prefill_ms":0,"decode_ms":0,"attempt_id":1}

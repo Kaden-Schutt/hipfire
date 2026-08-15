@@ -57,6 +57,11 @@ pub struct AttnParams<'a> {
     pub block_start: usize,
     /// Tree window cols (0 for plain causal).
     pub block_cols: usize,
+    /// Optional Qwen decode gate. When present on the narrow Q8 single-token
+    /// path, the family pairs the K/V writes and applies the gate plus MQ
+    /// rotation in the flash-reduce epilogue; all other callers leave this
+    /// `None`.
+    pub output_gate: Option<&'a GpuTensor>,
     pub output: &'a GpuTensor,
 }
 
@@ -127,7 +132,7 @@ impl AttentionFamily {
         self.resolve(plan.write_key, ctx, Some(&shape))?; // arch-gate check
         dispatch_kv_write(gpu, plan.write_key, plan, io)?;
         let attend_var = self.resolve(plan.attend_key, ctx, Some(&shape))?;
-        dispatch_attend(gpu, plan.attend_key, attend_var.tile, plan, io)
+        dispatch_attend(ctx, gpu, plan.attend_key, attend_var.tile, plan, io)
     }
 
     /// Full-attention entry point (no KV cache — vision / DFlash cross-attention).
@@ -337,14 +342,32 @@ fn dispatch_kv_write(
         }
         KernelKey::KvWriteQ8_0 => {
             debug_assert_eq!(plan.batch_size, 1);
-            hip!(gpu.kv_cache_write_q8_0(
-                io.k_cache,
-                io.k,
-                io.pos_buf,
-                io.n_kv_heads,
-                io.head_dim
-            ))?;
-            hip!(gpu.kv_cache_write_q8_0(io.v_cache, io.v, io.pos_buf, io.n_kv_heads, io.head_dim))
+            if io.output_gate.is_some() {
+                hip!(gpu.kv_cache_write_q8_0_pair(
+                    io.k_cache,
+                    io.v_cache,
+                    io.k,
+                    io.v,
+                    io.pos_buf,
+                    io.n_kv_heads,
+                    io.head_dim,
+                ))
+            } else {
+                hip!(gpu.kv_cache_write_q8_0(
+                    io.k_cache,
+                    io.k,
+                    io.pos_buf,
+                    io.n_kv_heads,
+                    io.head_dim
+                ))?;
+                hip!(gpu.kv_cache_write_q8_0(
+                    io.v_cache,
+                    io.v,
+                    io.pos_buf,
+                    io.n_kv_heads,
+                    io.head_dim,
+                ))
+            }
         }
         KernelKey::KvWriteAsym4 => {
             debug_assert_eq!(plan.batch_size, 1);
@@ -634,7 +657,49 @@ fn dispatch_kv_write(
 
 // ── Attention dispatch ─────────────────────────────────
 
+/// Default envelope for the gfx12 16-query Q8 WMMA prefill kernel.
+///
+/// R9700/ROCm 7.14, `nh=8,nkv=2,hd=256`, fresh-process medians after three
+/// discarded warmups (five processes, eleven timed kernel iterations each):
+///
+/// - ctx 8K:  #554 M4 5.670 ms, query16 2.836 ms (1.999x)
+/// - ctx 32K: #554 M4 21.524 ms, query16 10.704 ms (2.011x)
+///
+/// At least 128 `(query tile, head)` workgroups are needed to cover the GPU.
+/// Above ~60K the combined K+V working set crosses the R9700 last-level-cache
+/// boundary and the lower-workgroup query16 path can lose, so 32K is the
+/// certified upper bound. Explicit `HIPFIRE_FLASH_PREFILL=1` remains available
+/// for research outside this envelope.
+fn gfx12_query16_default_eligible(
+    n_heads: usize,
+    head_dim: usize,
+    batch_size: usize,
+    max_ctx_len: usize,
+) -> bool {
+    const QUERY_TILE: usize = 16;
+    const MIN_WORKGROUPS: usize = 128;
+    const MIN_CTX: usize = 256;
+    const MAX_CTX: usize = 32_768;
+
+    matches!(head_dim, 64 | 128 | 256)
+        && (MIN_CTX..=MAX_CTX).contains(&max_ctx_len)
+        && batch_size.div_ceil(QUERY_TILE) * n_heads >= MIN_WORKGROUPS
+}
+
+#[inline]
+fn gfx12_query16_workload_eligible(ctx: &DispatchCtx) -> bool {
+    ctx.workload != crate::context::DispatchWorkload::SpeculativeVerify
+}
+
+/// Default-on query16 is measured only on gfx1201 (R9700). Sibling gfx12 atoms
+/// and other families stay opt-in via explicit `HIPFIRE_FLASH_PREFILL=1`.
+#[inline]
+fn gfx12_query16_arch_default_eligible(arch: &str) -> bool {
+    arch == "gfx1201"
+}
+
 fn dispatch_attend(
+    ctx: &DispatchCtx,
     gpu: &mut Gpu,
     key: KernelKey,
     tile: TileImpl,
@@ -716,19 +781,36 @@ fn dispatch_attend(
                 debug_assert_eq!(plan.batch_size, 1);
                 let seq_len = io.pos + 1;
                 let fp = io.flash_partials.unwrap();
-                hip!(gpu.attention_flash_q8_0(
-                    io.q,
-                    io.k_cache,
-                    io.v_cache,
-                    io.output,
-                    io.pos_buf,
-                    seq_len,
-                    io.n_heads,
-                    io.n_kv_heads,
-                    io.head_dim,
-                    io.physical_cap,
-                    fp,
-                ))
+                if let Some(gate) = io.output_gate {
+                    hip!(gpu.attention_flash_q8_0_gated_mq_rotate_gfx1100(
+                        io.q,
+                        io.k_cache,
+                        io.v_cache,
+                        io.output,
+                        gate,
+                        io.pos_buf,
+                        seq_len,
+                        io.n_heads,
+                        io.n_kv_heads,
+                        io.head_dim,
+                        io.physical_cap,
+                        fp,
+                    ))
+                } else {
+                    hip!(gpu.attention_flash_q8_0(
+                        io.q,
+                        io.k_cache,
+                        io.v_cache,
+                        io.output,
+                        io.pos_buf,
+                        seq_len,
+                        io.n_heads,
+                        io.n_kv_heads,
+                        io.head_dim,
+                        io.physical_cap,
+                        fp,
+                    ))
+                }
             }
             KernelKey::AttnFlashQ8_0Windowed => {
                 debug_assert_eq!(plan.batch_size, 1);
@@ -1192,13 +1274,162 @@ fn dispatch_attend(
                     plan.v_mode_bits,
                 ))
             }
-            // Q8_0 batched: use old batched kernel for short ctx (fewer dispatches,
-            // faster), fall back to tiled kernel for long ctx where LDS would overflow.
-            // LDS = (max_ctx_len + nthreads + head_dim) * 4 bytes; 64KB hardware limit
-            // gives ~16K tokens for head_dim=128. Use 8K threshold for margin.
+            // Q8_0 batched: single-launch LDS-backed kernel for short ctx, tiled
+            // flash kernel (partials + reduce pass) for long ctx.
+            //
+            // The crossover is NOT a capacity margin — it is the measured point
+            // where the LDS kernel stops being faster. Its shared memory grows
+            // LINEARLY with context: (max_ctx_len + nthreads + head_dim) * 4. At
+            // ctx 14336 / head_dim 256 that is 59,392 B of the 65,536 B limit, so
+            // only ONE such workgroup fits per CU and occupancy collapses. The
+            // tiled kernel uses fixed O(tile) LDS and holds occupancy flat. So
+            // "fits in 64 KB" (~16K tokens) is NOT the same question as "is still
+            // faster", and the original 8192-for-margin comment conflated them.
+            //
+            // Measured on gfx1201 (R9700, ROCm 7.14), --kv-mode q8, prefill tok/s,
+            // 3 fresh processes x 3 samples per context, per-rep VRAM verified
+            // constant. Fixtures by digest: 27B `86a5f80f..`, 0.8b `aedfe31b..`.
+            //
+            //   RAISING to 15616 REGRESSES, and worsens as ctx grows:
+            //     ctx      8704   10240   12288   14336
+            //     27B     0.970x  0.902x  0.789x  0.720x
+            //     0.8b    0.948x  0.849x  0.712x  0.637x
+            //
+            //   LOWERING to 4096 WINS, monotonically in ctx:
+            //     ctx      4096*   5120    6144    6656    7168    8192
+            //     27B     0.996x  1.025x  1.052x  1.070x  1.081x  1.123x
+            //     0.8b    0.980x  0.998x  0.999x  1.000x  1.103x  1.163x
+            //     (* ctx 4096 stays on LDS under both arms — same-path control)
+            //
+            // The monotonic rise is the occupancy mechanism above: the further past
+            // the switch, the more LDS the single-pass kernel demands and the worse
+            // its occupancy, while the tiled kernel is flat. The 0.8b is at parity
+            // mid-band and wins only at 7168+, consistent with its much smaller
+            // hidden (1024 vs 5120) making attention a smaller share of prefill;
+            // it shows no regression anywhere, and the 27B is authoritative here.
+            //
+            // Decoded output was byte-identical across arms at ctx ~10K, temp 0
+            // (139/139 and 131/131 characters).
+            //
+            // gfx12 is hoisted (see attention_flash_q8_0_tile_batched.hip: 16 VMEM
+            // loads/lane/row -> 2), which is what flips the ranking; a pre-hoist
+            // gfx1151 measurement showed the opposite. Other arches keep 8192
+            // until measured — do not globalise this without per-arch evidence.
             KernelKey::AttnQ8_0KvBatchedMasked => {
-                const Q8_BATCHED_LDS_CROSSOVER: usize = 8192;
-                if io.max_ctx_len <= Q8_BATCHED_LDS_CROSSOVER {
+                // Query-tiled flash prefill. Its LDS depends only on BR/BC and
+                // never on context, so it has no capacity ceiling and no
+                // occupancy decay. Measured on gfx1151 (nh=8 nkv=2 hd=256,
+                // N=256): ~1.8x the tiled fallback at every context, but it
+                // LOSES to the LDS-backed kernel below ~10.2K (0.67x at 2048,
+                // 0.96x at 8192) because that kernel has 8x the workgroups.
+                // Break-even measured between CTX 10240 (0.95x) and 11264
+                // (1.17x), so it only takes over above MIN_CTX — where it
+                // replaces the 2.3x-worse tiled path outright.
+                // Opt-in until Stage A end-to-end validation completes.
+                // Causal non-tree only; the windowed traffic uses a separate
+                // KernelKey, and batch_size == 1 is decode.
+                // DEFAULT-ON for gfx11xx (RDNA3/3.5), where the WMMA kernel is
+                // validated: faster than the legacy LDS kernel at every context
+                // (1.21x @2048 .. 2.47x @12288), no measurable perplexity
+                // regression (paired n=2048: +0.0066 nats, 95% CI
+                // [-0.0105,+0.0237], not significant; bounded < +2.4% ppl), and
+                // top-1 preserved at 95.2% with divergence confined to
+                // near-ties (f32 top-1 stays inside f16 top-8 in 99.76%).
+                //
+                // gfx12 has a dedicated source with its different half-wave
+                // operand and accumulator mapping. It is default-on only
+                // inside `gfx12_query16_default_eligible`'s measured envelope;
+                // outside that envelope dispatch falls back directly to the
+                // legacy LDS/tiled paths.
+                // HIPFIRE_FLASH_PREFILL=0 forces off anywhere.
+                let gfx12_query16_route_ok = gpu.arch_caps.has_wmma_w32_gfx12()
+                    && gfx12_query16_arch_default_eligible(&gpu.arch)
+                    && gfx12_query16_workload_eligible(ctx)
+                    && gfx12_query16_default_eligible(
+                        io.n_heads,
+                        io.head_dim,
+                        io.batch_size,
+                        io.max_ctx_len,
+                    );
+                let flash_default_on = gpu.arch.starts_with("gfx11") || gfx12_query16_route_ok;
+                let flash_optin = match hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL")
+                    .ok()
+                    .as_deref()
+                {
+                    Some("0") | Some("off") | Some("false") => false,
+                    Some("1") | Some("on") | Some("true") => true,
+                    _ => flash_default_on,
+                };
+                let flash_min_ctx: usize =
+                    hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_MIN_CTX")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(10240);
+                if flash_optin && io.tree_bias.is_none() && io.batch_size > 1 {
+                    // WMMA is the default variant: it beats the legacy LDS
+                    // kernel at EVERY context (1.21x @2048 .. 2.47x @12288) and
+                    // is ~1.9x the scalar flash kernel, so it needs no MIN_CTX
+                    // gate. The scalar variant keeps its measured break-even.
+                    // It computes in f16 (relative L2 ~1e-3 vs the f32
+                    // reference) — a real precision/speed trade, hence opt-in.
+                    let variant = hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_KERNEL")
+                        .unwrap_or_else(|_| "wmma".to_owned());
+                    // Kernel bounds: Q8_0 blocks are 32 dims wide, and O_frags
+                    // is a fixed float8_t[MAX_D_CHUNKS=16] => head_dim <= 256.
+                    let wmma_ok = variant != "scalar"
+                        && (gpu.arch_caps.has_wmma_w32() || gpu.arch_caps.has_wmma_w32_gfx12())
+                        && (!gpu.arch_caps.has_wmma_w32_gfx12()
+                            || gfx12_query16_workload_eligible(ctx))
+                        && io.head_dim % 32 == 0
+                        && io.head_dim <= 256;
+                    if wmma_ok {
+                        return hip!(gpu.attention_q8_0_flash_prefill_wmma(
+                            io.q,
+                            io.k_cache,
+                            io.v_cache,
+                            io.output,
+                            io.positions(),
+                            io.n_heads,
+                            io.n_kv_heads,
+                            io.head_dim,
+                            io.batch_size,
+                        ));
+                    }
+                    if io.max_ctx_len > flash_min_ctx {
+                        let br: usize = hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_BR")
+                            .ok()
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(8);
+                        let bc: usize = hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_BC")
+                            .ok()
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(16);
+                        return hip!(gpu.attention_q8_0_flash_prefill(
+                            io.q,
+                            io.k_cache,
+                            io.v_cache,
+                            io.output,
+                            io.positions(),
+                            io.n_heads,
+                            io.n_kv_heads,
+                            io.head_dim,
+                            io.max_ctx_len,
+                            io.batch_size,
+                            br,
+                            bc,
+                        ));
+                    }
+                }
+                // Arch-aware crossover (ours): gfx1200/gfx1201 measured optimum is
+                // 4096, not the historical 8192 — see the measured table above.
+                // Only reached when the flash-prefill gate above declines (non-gfx11
+                // by default, tree bias, decode, or head_dim out of its bounds).
+                let crossover: usize = if gpu.arch_caps.is_gfx1200() || gpu.arch_caps.is_gfx1201() {
+                    4096
+                } else {
+                    8192
+                };
+                if io.max_ctx_len <= crossover {
                     // Fast path: single-launch batched kernel, LDS-backed attention tile.
                     let positions = io.positions.unwrap();
                     hip!(gpu.attention_q8_0_kv_batched_masked(
@@ -1355,6 +1586,39 @@ const DISPATCHED_FULL_ATTENTION_KEYS: &[KernelKey] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gfx12_query16_default_envelope_is_conservative() {
+        // 128 query-tile/head workgroups: admitted at both head-count shapes.
+        assert!(gfx12_query16_default_eligible(8, 256, 256, 8_192));
+        assert!(gfx12_query16_default_eligible(4, 256, 512, 32_768));
+
+        // 120 workgroups, short context, long context, and unvalidated HD.
+        assert!(!gfx12_query16_default_eligible(8, 256, 240, 8_192));
+        assert!(!gfx12_query16_default_eligible(8, 256, 256, 255));
+        assert!(!gfx12_query16_default_eligible(8, 256, 256, 32_769));
+        assert!(!gfx12_query16_default_eligible(8, 192, 256, 8_192));
+    }
+
+    #[test]
+    fn gfx12_query16_never_routes_speculative_verify() {
+        let standard = DispatchCtx::for_test("gfx1201");
+        let speculative = DispatchCtx::for_test("gfx1201")
+            .with_workload(crate::context::DispatchWorkload::SpeculativeVerify);
+
+        assert!(gfx12_query16_workload_eligible(&standard));
+        assert!(!gfx12_query16_workload_eligible(&speculative));
+    }
+
+    #[test]
+    fn gfx12_query16_arch_default_admits_only_measured_r9700_target() {
+        // Default admission is measured only on gfx1201 (R9700). Sibling gfx1200,
+        // gfx11, and unknown gfx12-looking atoms stay opt-in-only.
+        assert!(gfx12_query16_arch_default_eligible("gfx1201"));
+        assert!(!gfx12_query16_arch_default_eligible("gfx1200"));
+        assert!(!gfx12_query16_arch_default_eligible("gfx1100"));
+        assert!(!gfx12_query16_arch_default_eligible("gfx1202"));
+    }
 
     /// Bidirectional completeness check for `dispatch_kv_write`.
     /// Every registered KV write key must have an arm, and every arm key

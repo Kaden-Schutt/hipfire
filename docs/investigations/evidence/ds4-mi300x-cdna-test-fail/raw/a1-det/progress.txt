@@ -1,0 +1,19 @@
+--- warm f1=on tok=16 allranks=1 ---
+{"type":"commit_ready","id":"g0-warm","tokens":16,"tok_s":14.571948998178506,"prompt_tokens":2052,"prefill_tokens":2052,"cached_tokens":0,"prefill_ms":20789,"total_ms":21888,"finish_reason":"length","drafter":"ar","attempt_id":1}
+--- D1off f1=off tok=510 allranks=1 ---
+{"type":"commit_ready","id":"g0-D1off","tokens":510,"tok_s":2.032439325708365,"prompt_tokens":2052,"prefill_tokens":2052,"cached_tokens":0,"prefill_ms":20847,"total_ms":271777,"finish_reason":"length","drafter":"ar","attempt_id":1}
+--- D2off f1=off tok=510 allranks=1 ---
+{"type":"commit_ready","id":"g0-D2off","tokens":510,"tok_s":2.0324312261139514,"prompt_tokens":2052,"prefill_tokens":2052,"cached_tokens":0,"prefill_ms":20816,"total_ms":271748,"finish_reason":"length","drafter":"ar","attempt_id":1}
+--- D3on f1=on tok=510 allranks=1 ---
+{"type":"commit_ready","id":"g0-D3on","tokens":510,"tok_s":32.68392719815432,"prompt_tokens":2052,"prefill_tokens":2052,"cached_tokens":0,"prefill_ms":20813,"total_ms":36417,"finish_reason":"length","drafter":"ar","attempt_id":1}
+--- D4on f1=on tok=510 allranks=1 ---
+{"type":"commit_ready","id":"g0-D4on","tokens":504,"tok_s":32.72089852626112,"prompt_tokens":2052,"prefill_tokens":2052,"cached_tokens":0,"prefill_ms":20818,"total_ms":36221,"finish_reason":"stop","drafter":"ar","attempt_id":1}
+=== md5 ===
+d5fdd6ff896ed131f907f0ec6d7b7ed1  /mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/a1-det/D1off-text.txt
+5646cfa7d88c9df4dcecc6b4b614ddf3  /mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/a1-det/D2off-text.txt
+7cd162746f0db243cdf686510af11a71  /mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/a1-det/D3on-text.txt
+42b40d0aa2ae7e4f5a33eaff8cc21a89  /mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/a1-det/D4on-text.txt
+DETERMINISM_off_off=NO
+DETERMINISM_on_on=NO
+F1_EXACTNESS=NO
+DETDONE

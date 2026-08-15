@@ -1,175 +1,231 @@
-# Cross-arch portability
+# Cross-arch portability (kernel tuning)
 
-The rule that makes hipfire run on RDNA1 → RDNA4 + APU + CDNA3
-without per-arch forks is: **dispatch is layered, kernels are
-arch-tagged, and the speed-gate enforces no regression on the
-baseline**. Get this right and your fast path adds a win on the
-target arch without breaking anyone else.
+How a tuning change stays correct on arches you are not sitting in front
+of. This skill covers **making an already-supported kernel faster**
+without breaking the fallback matrix. Brand-new ISA ports belong in
+`.agents/skills/hipfire-arch-port/`.
 
-## The dispatch tree
+Mutable inventories (exact baseline numbers, env tables, admission rows)
+live in their owners — link, do not copy:
 
-`crates/rdna-compute/src/dispatch.rs` is the kernel-selection hot
-path. Every GEMM / GEMV / norm / fused op routes through here:
+| Concern | Owner |
+|---|---|
+| Validation route per claim class | [`docs/VALIDATION.md`](../../../docs/VALIDATION.md) |
+| Capability vs perf-variant selection | [`docs/methodology/perf-arch-discipline.md`](../../../docs/methodology/perf-arch-discipline.md) |
+| Bench protocol / noise / prompt md5 | [`docs/methodology/perf-benchmarking.md`](../../../docs/methodology/perf-benchmarking.md) |
+| Arch capability atoms/molecules | `crates/rdna-compute/src/arch_caps.rs` |
+| Low-level Gpu / kernel load | `crates/rdna-compute/src/{dispatch,gemm,gemv}.rs` |
+| Table-driven KernelKey predicates | `crates/hipfire-dispatch/src/tables/` |
+| Speed floors (when a file exists) | `tests/speed-baselines/<arch>.txt` |
+| Kernel compile chip→family→base | `scripts/compile-kernels.sh` |
 
-```rust
-pub fn gemm_qkv_hfq4g256(&self, ...) -> HipResult<()> {
-    if has_wmma_f16(&self.arch) {
-        return self.gemm_qkv_hfq4g256_wmma(...);   // gfx11 (validated)
-    }
-    if has_dot2_f32_f16(&self.arch) {
-        return self.gemm_qkv_hfq4g256_dot2(...);   // gfx10/11/12 fallback
-    }
-    self.gemm_qkv_hfq4g256_baseline(...)             // scalar, last resort
-}
+---
+
+## 1. Capability layers (source of truth)
+
+`ArchCaps` is a three-layer descriptor built once at `Gpu::init`:
+
+1. **Atoms** — exact chip codes (`is_gfx1100`, `is_gfx1201`, `is_gfx942`, …).
+2. **Molecules** — families (`is_rdna2`, `is_rdna3`, `is_rdna3_dgpu`,
+   `is_rdna3p5`, `is_rdna4`, `is_cdna3`, …).
+3. **Capabilities** — ISA features (`has_wmma`, `has_wmma_w32`,
+   `has_wmma_w32_gfx12`, `has_dot2_f32_f16`, `is_wave64_native`, …).
+
+**Use capabilities for correctness** (“does this chip have this
+intrinsic family?”). **Do not** use a broad capability molecule to pick
+a *perf sub-variant* of the same kernel (e.g. `plain` vs `ldscoop`).
+That failure class is documented in
+`docs/methodology/perf-arch-discipline.md` and in
+`case-studies.md` CS-9.
+
+Illustrative capability *names* (not a live membership table — re-read
+`crates/rdna-compute/src/arch_caps.rs` for current atoms/molecules):
+
+- `has_wmma` / `has_wmma_w32` / `has_wmma_w32_gfx12` — WMMA family split
+  (gfx11 vs gfx12 builtins are distinct; do not lower gfx11 on gfx12)
+- `has_dot2_f32_f16` — chip allowlist is **not** “all RDNA”; some gfx10
+  atoms are excluded. Read source before claiming membership.
+- `is_wave64_native` / `is_wave32` — wave-size molecules
+
+RDNA3 is intentionally broad as a molecule (dGPU + Strix-class APUs).
+Memory hierarchy still differs (dGPU GDDR6+IC vs Strix LPDDR5X vs small
+APU caches) — hence perf allowlists must name atoms or narrow molecules
+(`is_rdna3_dgpu`, `is_rdna3p5`), not bare `is_rdna3()`, when selecting
+sub-variants. Confirm which atoms each molecule covers in `arch_caps.rs`.
+
+---
+
+## 2. Where selection actually lives
+
+There is no single `dispatch.rs` mega-tree that owns every GEMM anymore.
+For tuning work, expect to touch one or more of:
+
+| Layer | Role |
+|---|---|
+| `rdna-compute` `Gpu` methods (`gemm.rs`, `gemv.rs`, …) | Concrete kernel name, grid, arch-specific sibling call |
+| `rdna-compute` `ArchCaps` / feature flags | ISA gates and env overrides |
+| `hipfire-dispatch` tables + family arms | `KernelKey` → `ArchPredicate` (correctness availability) |
+| Arch crate forward (e.g. qwen35, lfm2moe) | Model-shaped batching; may further gate by atom/env/fixture — read that crate’s forward/daemon gate; truth state via `docs/INDEX.md` / empty `docs/admissions.yml` |
+
+When you add a fast path:
+
+1. Prefer an existing capability helper over stringly `starts_with`.
+2. Put the new branch **above** slower fallbacks; baseline/scalar last.
+3. **No unreachable branches** — if a more-specific check absorbs an
+   arch a broader check used to handle, narrow the broader check in the
+   **same** diff (arch-port skill enforces this for new chips; tuning
+   inherits the rule).
+4. Perf sub-variant defaults stay **conservative portable**, with
+   measured atom/class allowlists for wins — never “inherit best tuned
+   variant by capability.”
+
+---
+
+## 3. File-level arch tags
+
+Per-arch HIP sources use the compile script’s variant tags:
+
+```
+kernels/src/<base>.hip                 # default all archs
+kernels/src/<base>.gfx1100.hip         # chip override
+kernels/src/<base>.gfx12.hip           # family (gfx1200 + gfx1201)
+kernels/src/<base>.gfx1201.hip         # chip beats family
+kernels/src/<base>.wave64.hip          # wave-size variant (where used)
 ```
 
-Three principles:
+Resolution in `scripts/compile-kernels.sh`:
 
-### 1. Fast paths first; baseline last
+1. `${name}.${arch}.hip` — chip
+2. `${name}.${arch_family}.hip` — family (`${arch:0:5}`, e.g. `gfx12`, `gfx94`)
+3. `${name}.hip` — default
 
-Each branch is a feature predicate (`has_wmma_f16`,
-`has_dot2_f32_f16`) defined at the top of `dispatch.rs`. Predicate
-helpers exist so the same arch-feature check doesn't get duplicated
-across 6 call sites. Add a new fast path ABOVE the existing
-fallbacks; the chain falls through naturally to the slowest path
-that's still correct.
+Default compile arch list: read the header of `scripts/compile-kernels.sh`
+(mutable; do not freeze a second copy here).
 
-### 2. No unreachable branches
+Use **family** tags when one source is correct for every chip in the
+family; use **chip** tags for occupancy/prefetch/tuning that is not
+portable even inside the family.
 
-When you add a more-specific check that absorbs an arch the broader
-check used to handle, **narrow the broader check in the same diff**.
-The skill `.agents/skills/hipfire-arch-port/` enforces this — it's how the
-gfx12 dispatch (PR #56) didn't introduce a dead `|| starts_with("gfx12")`
-clause in the gfx11 branch.
+---
 
-Predicate helpers like `has_dot2_f32_f16` that legitimately cover a
-broad family (RDNA1.5 / RDNA2 / RDNA3 / RDNA4) typically don't need
-narrowing — the helper intentionally covers the family, and downstream
-sites rely on that coverage. Edit the helper definition only if it's
-genuinely wrong for the new arch.
+## 4. Adding a tuned fast path (minimum workflow)
 
-### 3. Speed-gate the baseline arch every dispatch.rs change
+1. **Author** the kernel with the right tag (chip vs family vs wave64).
+2. **Register** source (`include_str!` / ensure-kernel path used by that
+   crate — follow neighbors, not a single hard-coded `kernels.rs` myth).
+3. **Wire** a `Gpu` method or extend an existing one (grid, kernarg, name).
+4. **Gate** with the narrowest correct capability or atom allowlist.
+5. **Validate** with the **narrowest** route in `docs/VALIDATION.md`
+   for your claim class — typically:
+   - new/changed `.hip` numeric → `test_kernels` on the target arch, **then**
+     the applicable model/path-level manual route from
+     [`docs/VALIDATION.md`](../../../docs/VALIDATION.md). If that route or a
+     required oracle does not exist, mark the claim **BLOCKED** — do not
+     proceed to perf or public dispatch on channel alone
+   - dispatch bind surface → `scripts/verify-bind-thread.sh`
+   - perf claim → `docs/methodology/perf-benchmarking.md` +
+     `scripts/speed-gate.sh` / fresh-process probe when applicable
+6. **Retired batteries** are not current evidence — use [`docs/VALIDATION.md`](../../../docs/VALIDATION.md).
 
-The pre-commit hook fires `./scripts/speed-gate.sh --fast` whenever a
-staged file matches the hotspot regex. This catches inlining /
-register-allocator regressions from "should-be-no-op" refactors.
+If you cannot measure the target arch: land the kernel + channel-test
+**without** flipping the public default dispatch (methods available,
+path opt-in or unrouted). Flip only after a dated measurement on real
+hardware. That is how gfx12 landed initially and how unbenched perf
+variants stay fail-closed.
 
-Real example from this session: commit `a048544` looked like a pure
-refactor (replace 6 inline `||` checks with one predicate function);
-the gate flagged a "50% prefill regression" that turned out to be
-a stale-binary measurement artifact. The lesson is *not* "avoid
-predicate helpers" — it's "trust the gate, run it from a clean build".
-See `playbook.md` step 6.
+---
 
-## File-level arch tags
+## 5. Speed baselines vs support
 
-Per-arch kernel variants follow the dot-separated convention:
+`tests/speed-baselines/<arch>.txt` is the speed-gate floor **when the
+file exists**. Presence of a baseline is not the same as “supported,”
+and absence is not “unsupported” — it means the gate has nothing to
+compare unless `HIPFIRE_BASELINE_ARCH` / an authored file says otherwise.
 
+**Lookup, do not copy.** List baseline files and their header hardware notes
+from disk before any completeness claim:
+
+```bash
+ls tests/speed-baselines/
+# read each file header for capture notes (chip / SKU / date / commit)
 ```
-kernels/src/<base>.hip                  # default for all archs
-kernels/src/<base>.gfx1100.hip          # chip-specific override
-kernels/src/<base>.gfx12.hip            # family-wide override (gfx1200 + gfx1201)
-kernels/src/<base>.gfx1030.v4.hip       # versioned variant (multiple ABIs for one chip)
-kernels/src/<base>.wave64.hip           # wave-size variant (CDNA / RDNA wave64 mode)
+
+Absence of a `<arch>.txt` means the speed-gate has nothing to compare for
+that atom unless `HIPFIRE_BASELINE_ARCH` / an authored file says otherwise —
+**not** permission to inherit a parent arch’s floors or expected shape.
+Contributing a new baseline is welcome via the tester skill / bench flow;
+it is not required to land a gated fast path you measured and left
+unrouted on other chips.
+
+**KV defaults:** the old CLI `archDefaults` table is **removed**. KV mode
+defaults are product/registry concerns (`default_kv_mode` / runtime), not
+a per-arch table inside this skill. Do not resurrect arch→KV maps here.
+
+---
+
+## 6. What “won’t break other arches” means
+
+For each arch that can execute the touched path:
+
+- If your fast path **matches**, speed-gate (or an equivalent fresh
+  protocol measurement) must stay within the baseline tolerance policy
+  for that arch’s baseline file when one applies.
+- If your fast path **misses**, the code visible to that arch should be
+  a no-op delta: same kernel name, same fallback, no accidental predicate
+  widen that steals the path onto unmeasured chips.
+
+Local pre-commit speed-gate only sees **this machine’s** arch. Multi-branch
+dispatch edits need either contributor hardware, remote rental, or an
+explicit “unrouted until measured” landing.
+
+Compile-check the matrix you claim:
+
+```bash
+./scripts/compile-kernels.sh gfx1010 gfx1030 gfx1100 gfx1200 gfx1201
+# add gfx906 / gfx942 / gfx1151 when those paths changed
 ```
 
-Resolution priority in `scripts/compile-kernels.sh`:
+---
 
-1. `<base>.<chip>.hip` (e.g. `.gfx1201.hip`) — chip-specific wins.
-2. `<base>.<family>.hip` (e.g. `.gfx12.hip`) — family wide if no chip-specific.
-3. `<base>.hip` — default.
+## 7. Model-arch gates are not GPU-arch gates
 
-Family detection uses `${arch:0:5}` — works for RDNA1-4 (gfx10/11/12)
-and CDNA3 (gfx94X → gfx94). The shipped scaffold for gfx12 (PR #56)
-uses the family tag because the same kernel is correct for both
-gfx1200 and gfx1201; if you're tuning specifically for a chip
-(prefetch parameters, occupancy, etc.) use the chip tag.
+GPU `ArchCaps` ≠ model `arch_id`. Model-local gates (batch path, fixture
+shape, env flag, product state) are **crate source + admissions**, not this
+skill. Example discipline for LFM batched prefill — **re-read source**, do
+not freeze predicates here:
 
-## Adding a new fast path
+1. Read the gate in `crates/hipfire-arch-lfm2moe/src/forward.rs` (and any
+   daemon/bench call site) for the current GPU atom, env flag, and fixture
+   shape checks.
+2. Label truth via [`docs/INDEX.md`](../../../docs/INDEX.md): branch work is
+   **branch-implemented** until admitted; [`docs/admissions.yml`](../../../docs/admissions.yml)
+   is empty / fail-closed — runtime presence ≠ product admission.
+3. Never promote on capability molecules (`is_rdna4`, `has_wmma`) when the
+   crate names a single chip atom.
 
-The minimum-viable workflow:
+When tuning LFM or any crate-local path, read that crate’s gate before
+assuming family-wide or capability-wide promotion.
 
-1. **Author the kernel** with the arch-tag naming convention.
-   `kernels/src/<existing>.<chip>.hip` for chip-specific or
-   `<existing>.<family>.hip` for a family.
-2. **Register the source** in
-   `crates/rdna-compute/src/kernels.rs` via `include_str!`.
-3. **Add a method to `Gpu`** that wires the kernel: parameters,
-   grid/block dims, kernarg blob.
-4. **Add the dispatch branch** in `dispatch.rs` above the existing
-   fallback. Follow the no-unreachable-branches rule (step 2 of
-   `playbook.md`).
-5. **Run the three gates** per `playbook.md` step 5.
+Model id table owner: [`docs/architecture-ids.md`](../../../docs/architecture-ids.md).
 
-## What "won't break other arches" actually means
+---
 
-Concretely: for every arch in `tests/speed-baselines/`:
+## 8. Anti-patterns
 
-- If your fast path applies (the predicate matches), the speed-gate
-  must measure ≥ baseline × (1 - tolerance) on that arch.
-- If your fast path doesn't apply (predicate misses), nothing
-  about the dispatch tree visible to that arch should have
-  changed — the speed-gate should be a no-op delta.
+| Anti-pattern | Instead |
+|---|---|
+| `if is_rdna3() { best_strix_variant }` | Atom/class allowlist + portable default |
+| Copying `tests/speed-baselines` numbers into PRs as “current SOTA” | Cite baseline file + commit; re-measure for claims |
+| Enabling public dispatch for an arch you never ran | Opt-in / unrouted until dated evidence |
+| Retired batteries as current evidence | [`docs/VALIDATION.md`](../../../docs/VALIDATION.md) claim → route map |
+| Assuming gfx1200 ≡ gfx1201 for chip-tagged kernels | Family tag only when source is truly shared |
+| Treating multi-GPU PP baseline as single-GPU floor | Separate files / separate claims |
 
-The pre-commit hook only runs the speed-gate against the local
-arch (typically gfx1100). For changes that touch dispatch.rs in
-ways that affect multiple branches, you OR a contributor with the
-target hardware should run the gate on each affected arch before
-merging. This is what issue #57 is for on the gfx12 path — Robin
-or another R9700-equipped contributor will measure and flip the
-public dispatch when the perf delta is verified.
+---
 
-## When you can't validate every arch
+## 9. Related skills
 
-Reality: the maintainer has gfx1100 + gfx1010 + gfx1030 (V620) +
-gfx1013 (BC-250 APU) + remote MI300X access. Other arches require
-contributor hardware:
-
-- gfx1031 / gfx1032 — expected to work via gfx1030 family path
-- gfx1100 / gfx1101 / gfx1102 — same family, gfx1100 numbers
-  generalize within ~5%
-- gfx1150 / gfx1151 — Strix Halo (issue #50), no local hardware
-- gfx1200 / gfx1201 — RDNA4 (issue #57), validated on R9700 by
-  PR #56 contributor
-
-If your change is a fast path on an arch you DON'T have hardware
-for: **do not enable it in the public dispatch**. Land the kernel
-+ channel-test as PR #56 did (methods exposed on `Gpu`, not routed
-through the public path), and open an issue for the dispatch flip
-that asks for a perf measurement on real hardware. That's how Robin
-contributed gfx12 — code now, dispatch flip after numbers.
-
-## Cross-arch matrix (current targets)
-
-From `cli/index.ts::archDefaults` + the speed-baselines tree
-(`tests/speed-baselines/`). The "Speed-baseline" column is literal:
-yes = a `<arch>.txt` file exists on disk and the speed-gate
-compares against it; no = the gate refuses to run for that arch
-unless `HIPFIRE_BASELINE_ARCH` overrides AND a baseline file is
-authored.
-
-| Arch | Wave | Matrix engine | KV default | Speed-baseline |
-|---|---|---|---|---|
-| gfx1010 (RX 5700 XT) | 32 | none | asym2 | no |
-| gfx1013 (BC-250 APU) | 32 | none | asym2 | yes (`gfx1013.txt`) |
-| gfx1030 (V620 / RX 6800 XT) | 32 | dot2 | asym3 | yes (`gfx1030.txt`) |
-| gfx1031 (RX 6700 XT) | 32 | dot2 | asym3 | no (gfx1030-class) |
-| gfx1032 (RX 6600 XT) | 32 | dot2 | asym2 | no |
-| gfx1100 (7900 XTX) | 32 | WMMA | asym3 | yes (`gfx1100.txt`) |
-| gfx1101 (7900 XT) | 32 | WMMA | asym3 | no (gfx1100-class) |
-| gfx1102 (7800 XT) | 32 | WMMA | asym3 | no (gfx1100-class) |
-| gfx1150 (Strix Halo APU) | 32 | WMMA | asym2 | no (issue #50 reproducer pending) |
-| gfx1200 (Radeon AI Pro R9700) | 32 | WMMA-gfx12 | asym3 | no |
-| gfx1201 (RX 9070 XT) | 32 | WMMA-gfx12 | asym3 | no (issue #57 — needs first measurement) |
-| gfx94x (MI300X) | 64 | MFMA | asym3 (default) | no (remote rentals only) |
-
-A row reading "no (gfx1100-class)" means the chip is in the same
-arch family with the same matrix engine and is expected to inherit
-the parent's perf shape within ~5%; if you have one, contributing a
-`gfx1101.txt` (etc.) is welcome — see [`hipfire-tester`](../hipfire-tester/)
-for the bench-submission flow.
-
-If you add a new arch, update `archDefaults`, ship a speed-baseline
-file, and add a row here. Adding the row without the file is the
-mistake this section was just rewritten to fix — Codex stop-time
-review caught it on the initial draft, 2026-04-27.
+- **hipfire-arch-port** — new chip ISA, WMMA builtin matrix, first bring-up
+- **hipfire-tester** — bench submission / hardware matrix runs
+- **hipfire-kernel-atlas** — phase-aware measurement corpus (not policy)
+- **hipfire-autoheal** — runtime/JIT bring-up failures, not lever selection

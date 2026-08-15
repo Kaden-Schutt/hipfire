@@ -192,7 +192,10 @@ mod tests {
         let lines = render_body("use the `foo` function", &theme());
         assert_eq!(lines.len(), 1);
         let spans = &lines[0].spans;
-        let foo = spans.iter().find(|s| s.content == "foo").expect("inline code span");
+        let foo = spans
+            .iter()
+            .find(|s| s.content == "foo")
+            .expect("inline code span");
         assert_eq!(foo.style.bg, Some(Color::Black));
     }
 
@@ -223,7 +226,11 @@ mod tests {
     fn unbalanced_fence_keeps_trailing_lines_as_code() {
         // A code block that is never closed: every following line stays code.
         let lines = render_body("intro\n```\ncode one\ncode two", &theme());
-        assert_ne!(lines[0].spans[0].style.bg, Some(Color::Black), "intro is prose");
+        assert_ne!(
+            lines[0].spans[0].style.bg,
+            Some(Color::Black),
+            "intro is prose"
+        );
         assert_eq!(lines[2].spans[0].style.bg, Some(Color::Black), "code one");
         assert_eq!(lines[3].spans[0].style.bg, Some(Color::Black), "code two");
     }

@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Kaden Schutt <kaden@hipfire.dev>
+#
+# VENDORED from the Redline repository — see crates/radiowave/VENDOR.md before
+# editing, or the two copies will drift.
+#   upstream: https://github.com/Kaden-Schutt/redline
+#   commit:   f4a0994e2315645b74eef8dec9305c58d252e699
+#   path:     crates/radiowave
+#
+# This manifest is deliberately NOT workspace-inherited. hipfire's
+# [workspace.package] is edition 2021 / license MIT, and does not define
+# rust-version, authors, repository or homepage. radiowave is edition 2024 /
+# Apache-2.0 — inheriting would fail to resolve AND misstate the license.
+[package]
+name = "radiowave"
+version.workspace = true
+edition = "2024"
+rust-version = "1.85"
+license.workspace = true
+authors = ["Kaden Schutt"]
+repository = "https://github.com/Kaden-Schutt/redline"
+homepage = "https://github.com/Kaden-Schutt/redline"
+description = "Policy-driven HIP compiler and AMDGPU code-object inspector for Redline"
+
+[features]
+default = []
+# Experimental RDNA3/RDNA4 OCP FP8 recipe catalog (Wave 2+). Off by default.
+experimental-fp8 = []
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10.9"
+thiserror = "2.0.17"
+
+[[bin]]
+name = "radiowave"
+path = "src/main.rs"

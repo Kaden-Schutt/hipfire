@@ -40,7 +40,7 @@ description = "Inference orchestrator for RDNA GPUs"
 # block below) which serves both as documentation of which features
 # each example needs and as the gate for downstream library consumers
 # who attempt to build examples through their own build script.
-default = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-cohere2moe", "arch-dots-ocr", "deltanet"]
+default = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-cohere2moe", "arch-dots-ocr", "arch-gemma4", "arch-muse-glimmer", "deltanet"]
 deltanet = ["rdna-compute/deltanet", "hipfire-dispatch/deltanet"]
 arch-qwen35 = []
 arch-qwen35-vl = []
@@ -49,6 +49,8 @@ arch-qwen2 = []
 arch-deepseek4 = []
 arch-cohere2moe = []
 arch-dots-ocr = []
+arch-gemma4 = []
+arch-muse-glimmer = []
 # ep-fault-inject: enables the EP partial-load fault-injection knob
 # (HIPFIRE_EP_FAIL_RANK) in the daemon example, which makes a chosen EP rank
 # return a synthetic Err after uploading its weights so the staging-guard VRAM
@@ -57,11 +59,20 @@ arch-dots-ocr = []
 # and the synthetic-error branches OUT, so HIPFIRE_EP_FAIL_RANK has no effect.
 # Build the GPU cleanup test with `--features deltanet,ep-fault-inject`.
 ep-fault-inject = []
+# serve-fault-inject: test-only GPU fault injection + test_state_snapshot for
+# serve-hardening retry parity. NOT in the default set: production builds
+# compile the generate field, one-shot after-prefill hooks, and snapshot
+# command OUT. Build the GPU parity harness daemon with
+# `--features deltanet,serve-fault-inject`.
+serve-fault-inject = []
 [dependencies]
 hip-bridge = { path = "../hip-bridge" }
+hipfire-config = { path = "../hipfire-config" }
 rdna-compute = { path = "../rdna-compute" }
 hipfire-dispatch = { path = "../hipfire-dispatch" }
 memmap2 = "0.9"
+safetensors.workspace = true
+half.workspace = true
 byteorder = "1"
 serde = { version = "1", features = ["derive"] }
 # preserve_order: keep JSON object key insertion-order (IndexMap) instead of the
@@ -99,6 +110,7 @@ minijinja = { version = "2", features = ["loop_controls", "json", "preserve_orde
 # work on plain Jinja values — required by the Qwen3 family
 # template which uses these throughout.
 minijinja-contrib = { version = "2", features = ["pycompat"] }
+tracing = "0.1"
 
 # Examples in this crate (daemon, infer_qwen35, infer_qwen3, infer_vl, etc.)
 # consume the arch crates. These are dev-dependencies — cargo refuses
@@ -118,11 +130,14 @@ hipfire-arch-minimax = { path = "../hipfire-arch-minimax" }
 hipfire-arch-cohere2moe = { path = "../hipfire-arch-cohere2moe" }
 hipfire-arch-deepseek4 = { path = "../hipfire-arch-deepseek4" }
 hipfire-arch-dots-ocr = { path = "../hipfire-arch-dots-ocr" }
+hipfire-arch-gemma4 = { path = "../hipfire-arch-gemma4" }
+hipfire-arch-muse-glimmer = { path = "../hipfire-arch-muse-glimmer" }
 hipfire-loader = { path = "../hipfire-loader" }
 hipfire-detect = { path = "../hipfire-detect" }
 hipfire-atlas = { path = "../hipfire-atlas" }
 # In-test minimal HFQ writer (overlay resolution tests in src/hfq.rs).
 tempfile = "3"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 
 # Each example below carries `required-features` listing the cargo
 # features its `use hipfire_arch_*` imports depend on. This documents
@@ -135,7 +150,7 @@ tempfile = "3"
 
 [[example]]
 name = "daemon"
-required-features = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-cohere2moe", "arch-dots-ocr"]
+required-features = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-cohere2moe", "arch-dots-ocr", "arch-gemma4", "arch-muse-glimmer"]
 
 [[example]]
 name = "hfq_split"
@@ -180,6 +195,10 @@ required-features = ["arch-qwen35"]
 [[example]]
 name = "a3b_multiturn_oneshot"
 required-features = ["arch-qwen35"]
+
+[[example]]
+name = "qwen35_batch_generate"
+required-features = ["arch-qwen35", "deltanet"]
 
 [[example]]
 name = "a3b_smoke_forward"

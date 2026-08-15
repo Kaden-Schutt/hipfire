@@ -1,292 +1,221 @@
-# Contributor onboarding for arch ports
+# Contributor onboarding for GPU arch ports
 
-Hipfire is a small team (effectively one maintainer + occasional
-help) with a fixed set of test hardware (currently gfx1100 / gfx1030
-on the local bench, gfx942 / MI300X via remote rentals, gfx1010 on
-shelf). New arch support **only happens** when someone with the
-hardware contributes the port — there's no emulator path, no
-maintainer with a 9070 XT in their drawer.
+Hipfire expands ISA coverage when someone **with the target GPU** lands a validated port. There is no full emulator path for WMMA/MFMA channel proof.
 
-If you're reading this because you have hardware that hipfire
-doesn't yet support, this is the doc that gets you from "I have a
-GPU" to "I landed a port".
+If you have hardware hipfire does not yet exercise well, this is the path from “I have a GPU” to a reviewable PR.
 
 ## What you need
 
-- The target GPU, accessible from a Linux box with ROCm 7.0+
-  installed (`rocminfo` should list your arch — `gfx1201`, `gfx1200`,
-  `gfx1151`, etc.).
-- Time to run a few hour-long benches. The validation gates aren't
-  fast.
-- A GitHub account and a hipfire fork. Comfort with `git`,
-  `cargo`, and `bash`.
-- Patience. The first WMMA port took ~2 weeks of work plus a
-  6-week silent-corruption bug to discover and fix.
+- Target GPU on Linux with ROCm new enough for your chip (`rocminfo` lists e.g. `gfx1201` or `gfx942`).
+- Time for channel tests and, when applicable, required speed-gate / model-level routes on real hardware (yours or a baseline holder’s).
+- GitHub **fork** + comfort with `git`, `cargo`, `bash`.
+- Optional but useful: an agent that loads **this** skill under `.agents/skills/hipfire-arch-port/` (sole executable skill root).
 
-## What you do NOT need
+## What you do not need
 
-- Privileged repo access (no commit bit required — this is fork +
-  PR).
-- A high-bandwidth conversation with the maintainer. The skill in
-  `.agents/skills/hipfire-arch-port/` and the codebase patterns are
-  enough to do a port end-to-end without supervision.
-- An LLM agent — but **agent assistance is genuinely helpful**.
-  Most of this skill is written assuming you're collaborating with
-  one (Claude Code, Cursor, etc.). See "Working with an agent"
-  below.
+- Commit bit on the upstream repo (fork + PR).
+- Continuous maintainer pairing — the playbook and source patterns are meant to stand alone.
+- An LLM — helpful, not required.
 
-## The 7-step contributor workflow
+## Non-goals / policy
 
-### 1. Reproduce the issue (or pick a port target)
+- **No universal gate.** Pick routes from [`docs/VALIDATION.md`](../../../docs/VALIDATION.md).
+- **Retired** `scripts/coherence-gate*.sh` batteries (`coherence-gate.sh` may be absent) **must not be used as current acceptance evidence**. Do not block on them.
+- **Implementation ≠ certification.** A merged kernel path is still not a product admission; [`docs/admissions.yml`](../../../docs/admissions.yml) stays empty until earned rows exist.
+- Model IDs and crates: [`docs/architecture-ids.md`](../../../docs/architecture-ids.md) — separate from GPU ISA work.
+- Hard contribution rules (hooks, DCO, SPDX, branch names): [`CONTRIBUTING.md`](../../../CONTRIBUTING.md).
 
-If responding to a bug report (e.g. issue #54):
+---
+
+## Workflow
+
+### 1. Fork, clone, and install hooks
+
+1. Fork `https://github.com/warpfront/hipfire` on GitHub (you have no upstream commit bit).
+2. Clone **your fork** as `origin`, add upstream for fetch/rebase:
 
 ```bash
-git clone https://github.com/Kaden-Schutt/hipfire
+git clone https://github.com/<you>/hipfire.git
 cd hipfire
+git remote add upstream https://github.com/warpfront/hipfire.git
+git fetch upstream
+git checkout -b port/<arch>-<kernel>   # e.g. port/gfx1201-qkv-wmma or port/gfx942-residual-mfma
+./scripts/install-hooks.sh             # required; sets core.hooksPath=.githooks
+rocminfo | rg -n 'gfx[0-9]+' | head
 cargo build --release --features deltanet -p hipfire-runtime --example daemon
-./target/release/examples/daemon
-# In another shell:
-hipfire run qwen3.5:0.8b "What is the capital of France?"
+# exercise the failing path the issue describes, or a small pull+run smoke
 ```
 
-Confirm the failure mode the reporter described. If you can't
-reproduce, file a comment on the issue with what you saw — the
-debug surface narrows fast.
+If you cannot reproduce a reported crash, comment on the issue with GPU / ROCm / exact command / log — that still helps.
 
-If picking a port target proactively (e.g. you have a 9070 XT and
-want full perf, not just the safe fallback):
+Proactive port: if `rocminfo` shows a chip that only hits a slow fallback or fails codegen, start from [`playbook.md`](playbook.md).
+
+### 2. Read the skill owners
+
+1. [`playbook.md`](playbook.md)
+2. [`wmma-matrix.md`](wmma-matrix.md) — then verify builtins on **your** ROCm tree (WMMA for RDNA, MFMA for CDNA)
+3. [`docs/methodology/arch-port-validation.md`](../../../docs/methodology/arch-port-validation.md)
+4. [`docs/VALIDATION.md`](../../../docs/VALIDATION.md) claim → route map
+5. [`CONTRIBUTING.md`](../../../CONTRIBUTING.md) — DCO, SPDX, hooks, PR expectations
+
+Do not assume a single-file `#ifdef` WMMA rename is enough (gfx11 vs gfx12 operand packing). CDNA is MFMA + wave64, not a WMMA rename.
+
+### 3. Start with one kernel you can channel-test
+
+Prefer a fused GEMM with an existing **same-family** sibling over the largest multi-output kernel. Get lane mapping right first; scale later.
+
+Inventory current sources (pick the family you are porting):
 
 ```bash
-rocminfo | grep gfx
-# If your arch isn't in dispatch.rs's WMMA / dot2 dispatch tree,
-# this skill's `playbook.md` is the starting point.
+# RDNA / WMMA
+ls kernels/src/*wmma* kernels/src/*gfx12* 2>/dev/null | head
+rg -n 'has_wmma_w32_gfx12|is_rdna4' crates/rdna-compute/src/gemm.rs | head
+
+# CDNA / MFMA
+ls kernels/src/*mfma* kernels/src/*gfx942* 2>/dev/null | head
+rg -n 'is_cdna3|is_wave64_native' crates/rdna-compute/src/gemm.rs | head
 ```
 
-### 2. Read the playbook + matrix
+Reference siblings: RDNA `kernels/src/gemm_qkv_hfq4g256_wmma.gfx12.hip`; CDNA `kernels/src/gemm_hfq4g256_residual_mfma.gfx942.hip`.
 
-`.agents/skills/hipfire-arch-port/playbook.md` end-to-end. Then
-`.agents/skills/hipfire-arch-port/wmma-matrix.md` for the operand-shape
-table.
+### 4. Author tagged `.hip` + wire `rdna-compute`
 
-The most common arch-port mistake: assuming a single-file
-`#ifdef __gfx12__` macro swap of the WMMA builtin name is enough.
-It isn't — operand vector lengths differ between gfx11 and gfx12.
+- File forms (one tag segment): `kernels/src/<base_name>.gfxNNNN.hip` (chip) or `kernels/src/<base_name>.gfxNN.hip` (family) — see playbook naming. Examples: `….gfx12.hip`, `….gfx1201.hip`, `….gfx942.hip`.
+- **New `.hip` files:** add SPDX header (default Apache-2.0 sole-author template in CONTRIBUTING / governance relicense doc).
+- Register: `crates/rdna-compute/src/kernels.rs` (`include_str!`).
+- Launch method: `crates/rdna-compute/src/gemm.rs` / related + `ArchCaps` branch (RDNA: `has_wmma*`; CDNA: `is_cdna3` / `is_wave64_native`). More specific arm above broader; remove dead clauses same diff.
+- Public entries: keep `bind_thread` discipline (`scripts/verify-bind-thread.sh`).
+- **Compile first**, every chip you touch: `./scripts/compile-kernels.sh …` (all selected arches must succeed).
+- **Only after** successful compiles, when committing precompiled blobs: `./scripts/write-kernel-hashes.sh` so new `.hsaco` blobs get matching trust sidecars.
 
-### 3. Pick a small kernel to port first
+Do **not** bury new ISA matrices inside a random `hipfire-arch-*` crate unless the kernel is intentionally crate-local.
 
-Don't start with `gemm_qkvza_hfq4g256_wmma` — that's a six-output
-kernel with complex LDS staging. Start with something like
-`gemm_qkv_hfq4g256_wmma` or even smaller. Get the lane-mapping
-right on a kernel you can debug on your own hardware before
-scaling.
+### 5. Add channel coverage on the new symbol
 
-### 4. Author the kernel(s) as separate `.hip` files
+Extend `crates/hipfire-runtime/examples/test_kernels.rs` (or a focused example) so the new path is forced on your GPU. A port without numeric coverage on its kernel is not ready.
 
-`kernels/src/<existing_name>.<arch_tag>.hip` (dot-separated). The
-tag is `.gfxNN.` (family) or `.gfxNNNN.` (chip). Naming convention
-+ family-tag resolution is documented in `playbook.md` step 4.
+### 6. Run claim-scoped validation (on hardware)
 
-**Read the canonical reference first:**
-`kernels/src/gemm_qkv_hfq4g256_wmma.gfx12.hip` (commit 6924f2a) is
-the worked-out gfx12 port of `gemm_qkv_hfq4g256_wmma.hip`. It
-documents inline:
+Use [`docs/VALIDATION.md`](../../../docs/VALIDATION.md) and [`docs/methodology/arch-port-validation.md`](../../../docs/methodology/arch-port-validation.md). Validation is **not optional** for merge of a new ISA route.
 
-- LDS staging changes (K-packing per lane goes 16→8 for gfx12).
-- WMMA call (swap builtin name AND adjust operand vector types from
-  `half16_t` to `half8_t`).
-- K-direction split across 2 lane-groups via `tid >> 4`.
-- Output writeback hypothesis (rows contiguous per lane-group on
-  gfx12 vs interleaved on gfx11) — marked as needing channel-test
-  validation.
-
-Fork the canonical file as the starting point for each of the five
-remaining gfx11 WMMA kernels (`qkvza-hfq4`, `gate_up-hfq4`, plus
-the three `hfq6` variants).
-
-### 5. Wire dispatch + add the channel-test case
-
-`crates/rdna-compute/src/kernels.rs`: add `include_str!` for the
-new kernel.
-
-`crates/rdna-compute/src/dispatch.rs`: add the dispatch branch
-for the new arch and **simultaneously remove the new arch from
-any older check that now has a more specific match**. Don't leave
-dead `|| starts_with("gfxN")` clauses in master — the dispatch
-tree must accurately reflect which arch each branch serves, or
-the next reader (human or agent) will be misled about routing.
-
-Two principles:
-
-1. **Each arch must appear in exactly one dispatch branch per
-   site.** When you add `if starts_with("gfx12")` above a check
-   that previously matched gfx12 via `gfx11 || gfx12`, simplify
-   the older check to just `starts_with("gfx11")` in the same diff.
-
-2. **Match the surrounding style**: if the nearby code uses inline
-   `arch.starts_with(...)`, match it. If it uses a `has_<feature>`
-   helper, match that. Don't invent a new convention for your one
-   arch.
-
-Example:
-
-```rust
-// New arch port (gfx12, RDNA4):
-if self.arch.starts_with("gfx12") {
-    return self.gemm_<x>_wmma_gfx12(...);
-}
-// Existing gfx11 path — `|| starts_with("gfx12")` removed
-// because the new arch is fully handled above:
-if self.arch.starts_with("gfx11") {
-    return self.gemm_<x>_wmma(...);
-}
-```
-
-Run the speed-gate after the combined change. If the gate
-regresses on the baseline arch (gfx1100), **root-cause it before
-landing** — see `validation.md`'s troubleshooting table (stale
-build cache and firmware shadowing are the most common false-
-positive sources). Do NOT split the diff into "add new arch" +
-"clean up dead branch" as a workaround for a regressing gate.
-
-`crates/hipfire-runtime/examples/test_kernels.rs`: add a test case
-that exercises your new kernel on the new arch.
-
-### 6. Run all three gates locally
+**Required for a new/changed numeric GPU-port path:**
 
 ```bash
-./scripts/coherence-gate.sh
-./scripts/coherence-gate-dflash.sh
+cargo build --release --features deltanet -p hipfire-runtime --example test_kernels
+./target/release/examples/test_kernels          # Tier C — on TARGET hardware
+
+# bind invariant (if hooks not installed)
+./scripts/verify-bind-thread.sh
+```
+
+Then, from VALIDATION / arch-port-validation:
+
+1. **Model-level manual route** for the arch under test after any new/changed numeric `.hip` path (channel alone is incomplete).
+2. **Tier P** whenever the change can alter forward/state — run the path-specific parity/oracle for that arch/surface. If **no oracle exists**, record parity as **blocked** (fail closed); do not substitute serve smoke.
+3. **Tier S** on **every baseline arch** whose shared edited path/predicate the diff can touch, when a committed `tests/speed-baselines/<arch>.txt` exists:
+
+```bash
+# on each applicable baseline box — not optional when the path is shared
+# rm the bench binary first if comparing before/after
 ./scripts/speed-gate.sh --fast
-cargo run --release -p hipfire-runtime --example test_kernels
 ```
 
-All three must pass. If channel-test fails, you've got a per-lane
-mapping wrong — go back to step 4 and instrument with `eprintln!`s
-of `(tid, output_index)` to derive the correct mapping.
+**Blocked hardware handoff:** if you cannot run a required route (no target GPU for Tier C, no baseline box for Tier S, no oracle for Tier P), **do not treat it as skipped**. In the PR, name the route **blocked**, what hardware/oracle is missing, and hand it to a holder who can execute it. Do not merge on “should be identical.”
 
-### 7. Open a PR
+If the change can break forward numbers/state and an oracle **does** exist, run it. User-facing smoke (`scripts/serve_harness.py --model …`) is semantics only **after** numeric routes.
 
-PR template (recommended structure for arch ports):
+**Retired** coherence-gate scripts **must not be used as current acceptance evidence** or merge criteria.
+
+Perf claims: follow [`docs/methodology/perf-benchmarking.md`](../../../docs/methodology/perf-benchmarking.md) (fresh process, warmup, identity hashes). Measured numbers are not admissions.
+
+### 7. Commit (DCO), push branch, open PR
+
+Every commit must use DCO sign-off (`git commit -s`). PRs without sign-off on every commit will be asked to amend. Do not bypass hooks with `--no-verify` unless the maintainer authorized that exact change in writing.
+
+```bash
+git add -A
+git status   # no debug prints / scratch files
+git commit -s -m "port: <arch> <kernel> …"
+git push -u origin HEAD
+```
+
+Then open a PR from `port/<arch>-<kernel>` on your fork against upstream `master` (or the branch the issue names).
+
+Suggested structure:
 
 ```markdown
 ## What this is
-Arch port: gfx<XYZ> (e.g. gfx1201 / 9070 XT).
+GPU ISA port: gfx<XYZ> (<product name>). Family: RDNA WMMA | CDNA MFMA.
 
 ## What it adds
-- New kernels: `kernels/src/gemm_*_<arch>.hip` (list)
-- Dispatch branches in `dispatch.rs` (line ranges)
-- `kernels.rs` includes
-- `test_kernels.rs` cases
+- Kernels: `kernels/src/…` (list; SPDX on new files)
+- `crates/rdna-compute/src/kernels.rs` registration
+- `ArchCaps` / `gemm.rs` (or related) branches (point at functions)
+- Channel coverage: test_kernels / example names
 
 ## Hardware tested
-- <Your GPU model> on <distro / kernel / ROCm version>
-- channel-test: PASS/FAIL on each kernel
-- coherence-gate: clean (attach report path)
-- speed-gate --fast: passes on gfx<your-baseline-arch>
+- GPU, distro, kernel, ROCm, hipcc/LLVM where relevant
+- Tier C channel: PASS/FAIL per new kernel symbol (target GPU)
+- Bind check: pass/fail
+- Model-level manual route: command + model identity + result (or blocked + reason)
+- Tier P oracle: name + result (or blocked — no oracle / no hardware)
+- Tier S speed-gate: every baseline arch touched + result (or blocked — no baseline box / no baseline file)
+- Any serve routes actually run (name script + model identity) — semantics only
 
-## What's NOT in this PR
-- Things you deliberately scoped out (e.g. fp8 mixed-precision
-  variants, MoE kernels). List them with rationale.
+## Scope / not in this PR
+- Explicit non-goals (other quant paths, default-on flip, other chips)
 
-## Known limitations
-- ...
+## Limitations
+- Env gates still off? chip-strict vs family?
+- Capability only — not requesting admissions.yml rows unless policy says so
+- Blocked routes handed to: <who/hardware>
 ```
 
-The maintainer will review. Likely 1-2 rounds of feedback before
-merge — most arch-port PRs end up needing per-lane mapping
-adjustments based on the maintainer's reading of the lane layout.
+Expect review on lane mapping and routing breadth. Style: `cargo fmt` / clippy clean; one logical change per PR. Branch naming: `port/<arch>-<kernel>` ([CONTRIBUTING.md](../../../CONTRIBUTING.md)).
 
-## Working with an agent (Claude Code / Cursor / Codex)
+---
 
-This skill (the one you're reading) is **designed for agent
-collaboration**. If you're working with Claude Code:
+## Working with an agent
 
 ```
-> Read .agents/skills/hipfire-arch-port/ first. I want to port gfx1201
-> WMMA. I have a 9070 XT to test on.
+Read .agents/skills/hipfire-arch-port/ first. Port <gfxNNNN> <WMMA|MFMA> for <kernel>.
+I have a <GPU> for channel tests. Retired coherence-gate scripts must not be used as current acceptance evidence.
+Select validation from docs/VALIDATION.md (Tier C + model route + Tier P when numbers can change + Tier S on shared baseline arches).
+Record blocked routes; do not skip them silently.
+Follow CONTRIBUTING.md: hooks, git commit -s, SPDX on new kernels.
 ```
 
-The agent will read the playbook + matrix + validation docs,
-locate the existing gfx11 kernels, and propose a port plan. You
-review the plan before any code is written, then iterate.
+Useful prompts:
 
-**Useful agent prompts:**
+- Walk LDS / operand changes gfx11 → gfx12 (or MFMA layout on gfx942) for a named kernel; no code yet.
+- Cite ROCm header evidence for the C-mapping / accumulator hypothesis.
+- Channel-test failed with `expected … got …` at index N — derive lane mapping.
 
-- "Walk me through the gfx11 → gfx12 LDS staging changes for
-  `gemm_qkv_hfq4g256_wmma.hip`. Don't write code yet."
-- "What's the C-mapping for gfx12 WMMA? Cite the ROCm header
-  source."
-- "I'm seeing channel-test fail with `expected 1.0, got 4.0` on
-  output index 3. Derive the lane mapping that would produce
-  this." (then paste the failure output)
+Guardrails:
 
-**Important agent guardrails for this codebase:**
+- No `--no-verify` to skip hooks without maintainer written OK for that change.
+- No treating serve harness green as numeric proof.
+- No inventing a universal replacement gate.
+- No treating Tier S / model-level / Tier P as optional when VALIDATION says they apply.
+- Check `git status` before commit so debug prints and scratch files stay out.
+- Sole executable skill root is `.agents/skills/` — do not add parallel skill trees.
 
-- The agent **cannot bypass the speed-gate with `--no-verify`**.
-  This is enforced by repo policy. If the agent suggests
-  `--no-verify`, push back — it's almost always wrong.
-- The agent **must run `./scripts/coherence-gate-dflash.sh` after kernel
-  changes**, not just claim "should be fine". `./scripts/coherence-gate.sh`
-  is still useful as an AR smoke gate, but the DFlash gate is the canonical
-  correctness gate for the silent-corruption class.
-- The agent **must check git status before each commit** to make
-  sure no stray test files / debug prints land.
+---
 
 ## Communication
 
-- Issue tracker: https://github.com/Kaden-Schutt/hipfire/issues
-- Tag the maintainer (@Kaden-Schutt) when:
-  - You've reproduced an issue and want a sanity check on direction
-    before sinking time into a port.
-  - The port is done and the PR is ready for review.
-  - You've hit a wall (channel-test fails, gate breaks) and want
-    a second set of eyes.
+- Issues: https://github.com/warpfront/hipfire/issues
+- Ping maintainer when: direction check before a large port, PR ready, channel-test wall after self-debug, or blocked Tier S/C handoff needs a baseline holder.
+- Prefer issue-thread progress notes over pings for routine status.
 
-- Don't tag for:
-  - Routine progress updates (post in the issue thread instead).
-  - Pre-port reading questions (the skill should answer most of
-    them; if not, that's a skill-improvement PR opportunity).
+## Provenance (historical, not procedure)
 
-## What landed this session
+Past sessions documented: issue #54 codegen crash class on 9070 XT; stale-binary speed-gate false regression; early gfx12 WMMA pattern file; family-tag resolution in `compile-kernels.sh`. Current default-on status of any path is **whatever source + env gates say today** — re-read `crates/rdna-compute/src/kernels.rs` / `gemm.rs` / feature flags rather than this paragraph.
 
-- Issue #54 (9070 XT crash) was reported 2026-04-27 by an external
-  user.
-- A naive dispatch fallback was attempted (commit `a048544`) and
-  reverted (`1f3bad3`) because:
-  - It bypassed the speed-gate inappropriately.
-  - The "no-op" predicate refactor APPEARED to regress gfx1100
-    prefill 50%.
-- Re-tested in 6e100c2 with forced rebuild after `rm
-  target/release/examples/bench_qwen35_mq4`: the regression was a
-  stale-binary measurement artifact. The predicate refactor is
-  functionally identical for gfx1100 codegen. **Lesson:** the
-  speed-gate's `ensure_build` is a no-op when the binary already
-  exists, so a "stash and re-bench" verification flow can lie. Force
-  a rebuild before drawing any conclusion from a re-bench.
-- This skill was authored to capture the lessons before the next
-  port attempt (commits `a088396` → `f676520`).
-- The gfx12 dispatch fallback in 6e100c2 provided the original working
-  baseline for 9070 XT users after the codegen crash report.
-- The first gfx12 WMMA kernel (`gemm_qkv_hfq4g256_wmma.gfx12.hip`)
-  shipped in 6924f2a as the canonical pattern reference. Current checkouts
-  include additional gfx12 sibling kernels and selectors; inspect
-  `kernels.rs`, `dispatch.rs`, and env gates such as `HIPFIRE_LLOYD_GFX12`
-  before claiming a path is enabled by default.
-- `scripts/compile-kernels.sh` now resolves family tags
-  (`.gfxNN.hip`) in addition to chip tags (`.gfxNNNN.hip`), so a
-  single `name.gfx12.hip` file covers both gfx1200 and gfx1201.
-- External RDNA4 hardware remains the source of truth for channel-test and
-  coherence data on any newly routed gfx12 path.
+External RDNA4 / CDNA (and other) hardware remains the source of truth for channel data on newly routed symbols.
 
-## You're contributing into a small, opinionated codebase
+## Bar
 
-That's not a complaint, that's an invitation. The maintainer cares
-deeply about arch coverage and will work with you to get a port
-landed. The flip side: code style / commit hygiene / test
-discipline matter, and PRs that skip the gates or hand-wave the
-correctness story don't get merged. The gates are not bureaucracy
-— they exist because every one of them caught a real bug at some
-point.
+Gates and harnesses exist because each class caught real bugs. PRs that skip channel proof on the target ISA, hand-wave C-mapping/MFMA layout, treat applicable Tier S or model-level routes as optional, or claim product certification from a single smoke run do not merge cleanly.
 
 Welcome aboard.

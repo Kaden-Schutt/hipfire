@@ -1,359 +1,229 @@
 # Perf benchmarking methodology
 
-The protocol for measuring kernel-level tok/s honestly. Read this
-before claiming any win in a commit message; the gates assume you've
-followed it.
+How to measure hipfire throughput so a delta is reproducible and
+auditable. This file is **protocol only** — not an executable gate, not
+a number store, and not a route selector.
 
-## Warm the cache and DPM state first
+| Concern | Owner |
+|---|---|
+| Which validation route to run | [`docs/VALIDATION.md`](../VALIDATION.md) |
+| Published / dated tables | [`docs/BENCHMARKS.md`](../BENCHMARKS.md) |
+| Dated campaign ledgers | [`docs/perf-checkpoints/`](../perf-checkpoints/) |
+| Daemon suite layout | [`bench-suite.md`](bench-suite.md) |
+| Perf-variant allowlist discipline | [`perf-arch-discipline.md`](perf-arch-discipline.md) |
+| Redline timed-arm proof | [`docs/REDLINE.md`](../REDLINE.md) |
+| rocprof blindspot audit | [`rocprof-coverage.md`](rocprof-coverage.md) |
 
-The single biggest cause of "noisy" benches is **measuring a cold
-process before the kernel JIT cache and DPM state have warmed up**.
-A first run after `cargo build` is 3-7× slower than steady state
-because hipcc compiles kernels on first dispatch and the GPU
-clocks haven't ramped. **That's not "DPM noise" — that's measurement
-error.** Warm first, then measure.
+Truth labels for any number you produce: **measured** (named fixture +
+identity + date), **historical** (retained snapshot), or **planned**.
+A measured number is never a product floor, admission, or default.
 
-Warmup options (any of these is sufficient):
-- `HIPFIRE_DPM_WARMUP_SECS=10` env var on the bench binary
-  (built into `bench_qwen35_mq4`, `dflash_spec_demo`, daemon)
-- A throwaway warmup run with the same prompt before the timed run
-- Use `scripts/probe_commits.sh` (handles warmup automatically)
+## Identity before timing
 
-## The within-session noise band
+Record these on every claim you intend to keep. Missing identity → the
+number is exploratory only.
 
-Once warm, the within-session A/B noise band on gfx1100 (7900 XTX)
-is **±1–3%** on a fresh process. **A 3%+ delta is real signal worth
-investigating, not noise to wave off.** Earlier versions of this doc
-quoted ±10-15% — that figure conflated cold-start overhead with
-true noise and let real regressions slip through. Don't repeat the
-mistake: if you see a 3% delta, it's a real change. Bisect it.
+| Field | What |
+|---|---|
+| Source | Branch + commit; clean/dirty tree note |
+| Binary | Path + **md5** of the executable that ran (daemon or in-process example) |
+| Model | Full path + **md5** of the weight artifact; arch id; quant; sidecars + digests |
+| Prompt | Committed file path + **md5 of prompt bytes**, or a deterministic token stream + digest |
+| GPU | Product, gfx arch, PCI/visible-device selection, ROCm/driver identity |
+| Config | KV mode, context, gen length, sampler/seed, graph/spec flags, every route-affecting `HIPFIRE_*` (set or unset) |
+| Policy | Fresh-process vs resident-daemon; warmup policy; run order; run count |
 
-Sources of REAL drift, ranked by impact (all distinct from the
-cold-start overhead above):
+Hash basis is **md5** for model, prompt, and binary — one convention
+across harness, ledger, and report. Do not mix sha256 on one side and
+md5 on the other.
 
-1. **Stale build cache**. The speed-gate's `ensure_build()` is a
-   no-op when the bench binary already exists. A "stash and re-bench"
-   flow leaves the post-change binary in place, so both runs measure
-   the same code. Always `rm target/release/examples/<bench>` before
-   re-running.
-2. **Firmware shadowing**. `/lib/firmware/updates/amdgpu` overrides
-   the kernel's bundled firmware; if the dkms-installed firmware
-   doesn't match the kernel-installed firmware, you get a SMU IF
-   mismatch and ~50% prefill cratering. Fix:
-   `sudo mv /lib/firmware/updates/amdgpu /lib/firmware/updates/amdgpu.bak
-   && sudo reboot`. Symptoms in `dmesg | tail -40`.
-3. **Thermal throttle**. After 10+ minutes of sustained DFlash runs
-   with the case closed, the 7900 XTX throttles. Check
-   `cat /sys/class/drm/card*/device/hwmon/hwmon*/temp*_input`.
-4. **DPM state ON COLD START** (mitigated by warmup). The GPU clocks
-   ramp up over the first ~5 seconds of sustained load. This is the
-   confound the old "±10-15%" claim was actually measuring. Solved by
-   warmup; not a steady-state noise source.
+### Byte-identical prompts
 
-## Cross-process verification
+Whitespace changes that keep token count fixed can still swing DFlash τ
+by double-digit percent on large models (historical observation:
+single-blank vs PEP-8 triple-blank on 27B). Rules:
 
-To trust a perf delta as real:
+1. Prefer committed fixtures under `benchmarks/prompts/`.
+2. Do not rely on heredocs or editor-reformatted inline strings for
+   cross-session or promotion claims.
+3. Record `prompt_md5` next to the result. No md5 → comparison is
+   unreliable.
+4. Engine entry may collapse `\n{3,}` → `\n\n` when
+   `prompt_normalize=true`. Paths that bypass engine entry still need
+   fixture discipline.
 
-```bash
-# 1. Pin to the candidate commit
-git checkout <candidate>
+## Warmup (DPM + JIT)
 
-# 2. Rebuild from clean
-cargo clean -p rdna-compute
-rm -f target/release/examples/bench_qwen35_mq4
-cargo build --release --features deltanet -p hipfire-runtime \
-    --example bench_qwen35_mq4
+Cold first-forward after build pays hipcc JIT and GPU clock ramp.
+Treating that as “noise” is measurement error.
 
-# 3. Run the gate
-./scripts/speed-gate.sh --fast
-
-# 4. Same procedure for the baseline
-git checkout <baseline>
-# ... (same build + bench)
-```
-
-Or via the harness directly:
+**Recommended for timed work:**
 
 ```bash
-./scripts/probe_commits.sh <baseline-sha> <candidate-sha>
+export HIPFIRE_DPM_WARMUP_SECS=10
 ```
 
-`probe_commits.sh` does this end-to-end with fresh process per commit
-+ a multi-run median. A delta that survives this protocol is real;
-one that doesn't probably isn't.
+Honored by the daemon (warmup **before** the `loaded` ack — so clients
+do not fold warmup into TTFT) and by `bench_qwen35_mq4`. On
+`dflash_spec_demo`, the same env is applied **pre-decode / per-row only**
+(after prefill has already been timed): it stabilizes DFlash **decode**,
+not the reported `prefill_tok_s`. Retain DFlash prefill only after a
+separate throwaway or warmed-prefill protocol; do not treat DPM alone as
+prefill warmup for that harness. Default is off so production load
+latency is unchanged.
 
-## Daemon-driven perf measurement
+Two phases when using the native serve suite
+([`scripts/serve_harness.py`](../../scripts/serve_harness.py)):
 
-The in-process `bench_qwen35_mq4` and `dflash_spec_demo` examples are
-the canonical perf tools — they run a 10s `dpm_warmup` (memset loop
-that pins the GPU at high sclk/mclk) before the timed gen window, so
-their `gen_tok_s` numbers reflect steady-state silicon throughput.
+1. **Load-time DPM** — `HIPFIRE_DPM_WARMUP_SECS` pins clocks before `loaded`.
+2. **Throwaway forward** — run an unrecorded matching request so JIT completes
+   and clocks re-ramp after JIT idle.
 
-Anything that talks to the daemon (`coherence_probe`, agent CLIs, eval
-scripts) used to run *without* DPM warmup, leaving the GPU at a low
-power state when the first request arrived. That produced ~5–10%
-lower decode-rate measurements than the in-process bench tools. The
-gap was especially confusing because `coherence_probe` reported
-`tok_s = total_tokens / wall_ms`, which folds TTFT (and any new warmup
-time) into the headline number — so short generations can look
-catastrophically slow even when steady-state decode is fine.
+Measure only after both. Continuous measured passes keep DPM high.
 
-Two fixes ship together:
+## Sampling policy
 
-- **`HIPFIRE_DPM_WARMUP_SECS=N` is honored by the daemon.** When set
-  and positive, the daemon runs `gpu.dpm_warmup(N)` after weight
-  upload but **before emitting the `loaded` ack**. The contract
-  becomes: `loaded` means daemon is fully ready, including DPM-pinned.
-  This ordering is load-bearing: if warmup ran *after* the ack, the
-  probe would receive `loaded`, immediately send `generate`, and the
-  daemon (still inside the load handler doing warmup) wouldn't
-  process the `generate` until warmup finished. From the probe's POV
-  that warmup time would fold into the measured TTFT, breaking
-  `tok_s = total_tokens / wall_ms`. With warmup-before-ack, the probe
-  sees `loaded` only when the daemon really is ready, and TTFT
-  measures real prefill alone.
-  Default OFF (production load latency unchanged). Recommended `10`
-  for perf-bench runs, matching the bench tools.
-
-- **`coherence_probe` reports both probe-derived and daemon-authoritative
-  numbers.** Read the daemon ones for perf comparisons.
-  - **Daemon-authoritative** (right number for perf): `daemon perf:
-    prefill X tok/s (Yms / real ttft) | decode Z tok/s | overall W tok/s`.
-    These come from the `done` event the daemon emits — `prefill_ms`
-    is the real `forward_prefill_batch` timer, `decode_tok_s` is
-    steady-state post-prefill, `ttft_ms` is real first-prefill-token
-    latency. Apples-to-apples with `bench_qwen35_mq4 prefill_tok_s` /
-    `gen_tok_s`.
-  - **Probe-derived** (UX framing only, NOT perf-comparable): `tokens:
-    N (probe wall A tok/s, probe gen B tok/s, probe ttft Cms)`. The
-    probe sets `ttft` on the first non-synthetic `token` event it
-    receives — but the daemon strips `<think>...</think>` content
-    by default, so on thinking models (Qwen3.5, Qwen3.6) the first
-    visible token only arrives *after* think closes. Probe `ttft`
-    therefore folds prefill + entire think phase + `</think>` into
-    one number, and `wall tok/s` / `gen tok/s` derived from it look
-    catastrophically slow vs in-process bench. They aren't —
-    they're just measuring something different (user-perceived
-    time-to-visible-content).
-
-  When in doubt: read the `daemon perf:` line, ignore `probe wall/gen`.
-  The JSON report carries `daemon_prefill_tok_s`, `daemon_decode_tok_s`,
-  `daemon_ttft_ms`, `daemon_tok_s` for downstream tooling.
-
-Use:
-
-```bash
-HIPFIRE_DPM_WARMUP_SECS=10 \
-  ./target/release/examples/coherence_probe \
-    --model some.hfq --prompt-file p.txt --max-tokens 400
-```
-
-The expected residual gap between probe `gen tok/s` and bench
-`gen_tok_s` after this is ~10% — that's daemon per-token overhead
-(JSONL streaming, detokenize, stop-condition checks). Closing it
-further is a separate workstream; it is uniform across quant formats
-so does not interfere with format ranking.
-
-## eval_hipfire wall-clock is NOT a kernel-speed meter
-
-`eval_hipfire`'s reported `tok/s` (the trailing `(N tok/s)` line) is
-**scored-tokens-per-wall-second across the entire eval loop**, not
-forward-pass throughput. The eval loop runs, per chunk:
-
-1. `forward_prefill_batch` (prefix, no logit capture)
-2. `forward_prefill_batch` (scored region, with hidden-state capture)
-3. **`weight_gemv` × `scored_per_chunk` (≈1023) for the lm_head fan-out**
-4. `score_position` × scored_per_chunk (CPU-side KLD compute, F32→F16
-   block I/O against the ref file)
-
-For non-F16 lm_head dtypes (Q8_0, MQ4G256, …), step 3 issues one GEMV
-call per scored position against the full lm_head matrix (vocab=248K
-on Qwen3.5). On Q8 that's ~1 GB read per call × 1023 calls = ~1 TB/chunk
-of HBM traffic just for lm_head. That dominates the wall-clock and
-masks any projection-kernel win. Concrete numbers from `feat/q8-prefill-tier2`
-validation on gfx1100 / RX 7900 XT:
-
-| Path | eval_hipfire tok/s | daemon `prefill_tok_s` |
-|---|---:|---:|
-| q8f16 (Q8 lm_head, T3 WMMA projections) | 27 | 1069 |
-| q8f16-f16lm (F16 lm_head batched, T3 WMMA) | 187 | 1069 |
-| mq4 (MQ4 lm_head, MQ4 batched projections) | 248 | ~1100+ |
-
-**Rules:**
-
-- **For kernel-speed perf claims**, read `daemon prefill_tok_s` from
-  the daemon's `done` event (`coherence_probe`, `coherence-gate.sh`
-  matrix rows all expose it), or use `scripts/probe_commits.sh`
-  which also uses the daemon. Do NOT cite eval_hipfire `tok/s`.
-- **For KLD validation and silent-corruption checks**, eval_hipfire
-  is the right tool — its wall-clock is incidental, only the slice-mean
-  KLD and PPL matter.
-- **For end-to-end "user-visible" throughput** (TTFT + decode), use
-  the daemon. eval_hipfire's scoring loop is not representative of
-  any production workload.
-
-The lm_head fan-out itself is fixable — see PR #242 (F16 batched
-fan-out via `gemm_f16_batched_lmhead`) for the pattern; a parallel
-batched Q8 lm_head kernel is currently out of scope per
-`docs/plans/q8-fused-prefill-kernels.md §Out of scope`.
-
-## Speed-gate baselines
-
-`tests/speed-baselines/<arch>.txt` records the "ground floor" decode
-+ prefill numbers per arch. The pre-commit hook runs
-`scripts/speed-gate.sh --fast` automatically when the staged diff
-touches kernel / dispatch / forward-pass files. Tolerance is ±5% from
-the committed baseline.
-
-If a legitimate change trades a small regression on the baseline arch
-for a much bigger win on another arch (rare, but happens), update the
-baseline in the same commit:
-
-```bash
-./scripts/speed-gate.sh --update-baselines
-git add tests/speed-baselines/
-git commit
-```
-
-The baseline change stays in the same commit so a reviewer sees the
-trade-off explicitly. Don't sneak baseline updates into separate
-"chore" commits.
-
-**Do not use `--no-verify` to bypass the gate.** A regression that
-the gate catches is information you need; bypassing produces a commit
-that masks the issue from `git bisect` later. Authorized exceptions
-must be explicitly stated in writing by the maintainer for that
-specific change.
-
-## Prompt structure matters
-
-Two prompts that tokenize to the same number of tokens but with
-different whitespace patterns produce dramatically different DFlash τ.
-Same model, same flags, same binary md5:
-
-```
-PEP-8 strict (\n\n\n between top-level defs):    27B-3.5  τ=8.07  → 161 tok/s
-Single-blank (\n\n between top-level defs):      27B-3.5  τ=9.42  → 184 tok/s
-```
-
-A 14% perf swing from a whitespace cleanup is invisible in code
-review but catastrophic for benchmarking. **All cross-session perf
-comparisons MUST use byte-identical prompts**:
-
-- Embed prompts as committed files (not heredocs in scripts that
-  editors reformat).
-- Record the prompt md5 alongside the result.
-- If you can't verify the prompt md5, treat the comparison as
-  unreliable.
-
-The engine collapses `\n{3,}` → `\n\n` at prompt entry by default
-(`prompt_normalize=true`). This eliminates the whitespace-variance
-source for normal use, but bench scripts that bypass the engine entry
-point still need the prompt-md5 discipline.
-
-## Resident-bench mode (avoid per-row 17 GB model reload)
-
-Bench scripts that shell out to `dflash_spec_demo` once per row pay
-the full target+drafter H2D on every invocation. On a 27 B mq4 pair
-that's ~56 s of model load to measure ~1.5 s of decode — a 24-row A/B
-battery is ~25 min wallclock for ~36 s of GPU compute, and
-`amdgpu_top` mostly shows the H2D rather than the kernel under test.
-
-Use `--prompts-file <path>` instead of `--prompt`: the binary loads
-target+drafter once and runs each manifest row against the resident
-pair, with full state reset between rows. Manifest is JSON-lines:
-
-```
-{"label":"humaneval-0","prompt":"...","max":16}
-{"label":"lru-cache","prompt":"...","max":16}
-```
-
-Each row's stderr output is bracketed by `@@@ ROW <i>: <label> @@@`
-and `@@@ ROW <i> END @@@` markers so a downstream parser can split
-the multi-row stream. Single `--prompt` mode is unchanged
-(byte-identical output, no separators).
-
-**Prompt-fixture discipline still applies** (§"Prompt structure
-matters"): assemble the manifest at runtime from committed `.txt`
-fixtures rather than inlining prompts in heredocs. Either `jq` or
-`python3 -c` works — the only requirement is byte-stable output:
-
-```bash
-# jq form
-jq -nR --arg p "$(cat benchmarks/prompts/humaneval_0_has_close_elements.txt)" \
-   '{label:"humaneval-0", prompt:$p, max:16}' >  manifest.jsonl
-jq -nR --arg p "$(cat benchmarks/prompts/lru_cache_pep8_strict.txt)" \
-   '{label:"lru-cache",  prompt:$p, max:16}' >> manifest.jsonl
-
-# python3 form (no jq dependency; see scripts/dflash_bench_resident_smoke.sh)
-python3 -c '
-import json, sys
-for label, path in [("humaneval-0","benchmarks/prompts/humaneval_0_has_close_elements.txt"),
-                    ("lru-cache", "benchmarks/prompts/lru_cache_pep8_strict.txt")]:
-    print(json.dumps({"label":label, "prompt":open(path).read(), "max":16}))
-' > manifest.jsonl
-
-dflash_spec_demo --target T --draft D --prompts-file manifest.jsonl …
-```
-
-Or commit the JSONL fixture directly (see
-`benchmarks/prompts/longcode_pflash.jsonl` for the shape).
-
-Caveats:
-- `--prompts-file` rejects `--cask-sidecar` — `EvictionCtx.eviction_count`
-  has no per-row reset, and a cumulative count is silently misleading
-  in the FlashCASK report. Run CASK benches as separate per-row
-  invocations.
-- `--prompts-file` rejects `--pflash` for now; PFlash drafter loading
-  and compression state are single-prompt only. Run PFlash benches as
-  separate invocations until a per-row reset path exists.
-- Cross-row validation: pass the same prompt twice with `--temp 0`;
-  the two `DFlash tokens: [...]` lines must match byte-for-byte.
-  `scripts/dflash_bench_resident_smoke.sh` is the reference check.
-- Per-process flags (e.g. `HIPFIRE_MMQ_MIN_BATCH` cutover, ddtree
-  budget/topk, kv-mode) still vary across invocations, not within.
-  Group manifest rows by these flags and run one invocation per group.
-
-See issue #173 for the full design.
-
-## DFlash speed gate
-
-`scripts/coherence-gate-dflash.sh` runs the spec-decode coherence
-battery: a fixed (model × prompt × spec-mode) matrix that catches
-token-attractor regressions (output that passes the perf gate while
-emitting `[1734 2357 2733 283 869 1734 2357 ...]` for 1500 tokens).
-
-Three-tier thresholds:
-
-| Tier | Window | Hard fail if |
+| Policy | Use when | Rules |
 |---|---|---|
-| 1 | First 128 tokens | unique_token_ratio < 0.15 OR max_token_freq > 0.50 |
-| 2 | Last 128 tokens | unique_token_ratio < 0.30 OR max_token_freq > 0.50 |
-| 3 | Full output | 3-gram repetition density > 50% in second half |
+| **Fresh process** | Commit A/B, promotion, regression floors, any number you will cite later | One process per sample; rebuild when code changes; do not mix with resident samples in one A/B |
+| **Resident daemon** | Multi-row sweeps on one loaded model (e.g. DFlash `--prompts-file`, one `serve_harness.py` JSON) | One suite JSON = one resident-process sample; state reset between independent rows; still record identity; do not call resident medians “fresh-process” |
+| **ABBA / interleave** | Ordering scheme **on top of** matched fresh-process samples when order/thermal bias matters | Order A→B→B→A (or declared interleave); archive **raw** samples; report min / median / max — never best-of-one. ABBA is not a substitute for the fresh-process policy |
 
-Why both ends: single-token attractors show up in the first 128;
-block-level structural loops (5+ token sequences repeating) appear
-later. The CASK m-fold + DFlash 2026-04-26 case (τ=8.98, tight
-stddev) passed the first-128 gate but emitted 76+ block-loop reps in
-the last 1000 tokens.
+Do not promote on a single point estimate. Archive raw values and the
+report path with the claim. Promotion and retained A/B evidence use
+**matched fresh-process samples** (separate process per sample); apply
+declared ABBA or interleave **ordering** when bias matters — never
+“fresh-process **or** ABBA” as alternative policies.
 
-Any DFlash perf bench that lacks the unique-token + max-frequency
-checks AND visual eyeballing of output is unreliable. **Tight stddev
-on a spec-decode bench is actively suspicious, not reassuring**:
-real acceptance noise is wider; tight stddev correlates with
-deterministic attractors.
+Supporting scripts (claim-scoped, not universal):
 
-## What the gates do NOT catch
+| Script | Role |
+|---|---|
+| [`scripts/bench-cold.sh`](../../scripts/bench-cold.sh) | N fresh processes; min/median/max/spread for in-process `bench_qwen35_mq4` |
+| [`scripts/probe_commits.sh`](../../scripts/probe_commits.sh) | Fresh-process commit pair compare (optional arm of `gates.sh --perf`) |
+| [`scripts/speed-gate.sh`](../../scripts/speed-gate.sh) | Prefill/decode vs committed `tests/speed-baselines/<arch>.txt` when that path’s policy applies |
+| [`scripts/serve_harness.py`](../../scripts/serve_harness.py) | Native Rust HTTP service battery/session driver (production path timings) |
 
-- Per-lane WMMA mapping bugs (see commit `b7ac66a` — the gfx11 C-mapping
-  was silently wrong for 6 weeks while the gates were green).
-- Output drift that's coherent but worse on a benchmark task hipfire
-  doesn't measure. The coherence gate is unique-token / repetition; it
-  doesn't measure HumanEval pass-rate.
-- Long-context drift past the prompts the gates exercise.
+Route selection for “must I run X?” stays in
+[`VALIDATION.md`](../VALIDATION.md).
 
-For correctness on a new arch port: run
-`crates/hipfire-runtime/examples/test_kernels.rs` on the target hardware. It
-runs each kernel through small golden cases against a CPU reference.
-That's the load-bearing correctness gate; the perf and coherence
-gates are optimization gates.
+## Which number is authoritative
+
+| Source | Use for | Do not use for |
+|---|---|---|
+| Daemon `done` fields (`prefill_tok_s`, `decode_tok_s`, `ttft_ms`) | Production-path throughput | — |
+| `serve_harness.py` JSON | Native service-path ledger rows (when hashes present) | Unsigned exploratory if hashes missing |
+| In-process `bench_qwen35_mq4` | Kernel profile, rocprof attach, speed-gate floor, bisect lower bound | Citing as production MoE decode (misses daemon AR hipGraph) |
+| Probe-derived wall/gen tok/s | UX framing only | Kernel or format ranking |
+| `eval_hipfire` trailing tok/s | Never as forward throughput | Kernel-speed claims (lm_head scoring loop dominates wall) |
+
+On thinking models, probe TTFT can include the full think phase when
+visible tokens are stripped — that is not prefill. Prefer daemon fields.
+
+## Noise and confounders
+
+There is **no single universal noise band** for every GPU, harness, and
+campaign. Treat noise as something you **characterize on the fixture**,
+not a constant copied from another arch.
+
+1. **Declare** the comparison rule before measuring (e.g. “median of N
+   fresh processes; accept only if |Δ| exceeds this run’s observed
+   spread and transfers to a second bucket”).
+2. **Investigate** before accepting or rejecting:
+   - Stale binary (rebuild; delete the example binary if `ensure_build` is a no-op).
+   - Cold DPM/JIT (warmup missing).
+   - Thermal throttle after long sustained runs.
+   - Firmware / SMU mismatch (`dmesg`; `/lib/firmware/updates/amdgpu` shadowing).
+   - Multi-GPU contention (pin `HIP_VISIBLE_DEVICES`).
+   - Different harness, KV mode, graph flag, or prompt bytes than the baseline.
+3. Historical within-session notes (e.g. tight bands on a warm gfx1100
+   fresh process, wider bands when cold-start was mislabeled as noise)
+   are **scoped observations**, not global law. Campaign docs may set a
+   stricter predeclared bar (Redline and LFM plans often use a ≥5% wall
+   bar above local noise) — that bar is campaign-local.
+
+A spread that is large relative to the claimed delta means more samples
+or a cleaner fixture — not a hand-waved “noise” win.
+
+## Profiling attribution
+
+Wall tok/s alone does not name the hot kernel. Profiled runs are
+**attribution-only** — not headline throughput.
+
+1. End-to-end headline deltas and noise: **unprofiled** stationary
+   production-path runs (daemon `done` fields or the production suite).
+   Never use profiled tok/s for A/B acceptance or noise bands.
+2. Internal timers: `HIPFIRE_PROFILE=1` / `HIPFIRE_PROFILE_DECODE=1` on
+   an in-process bench when needed. These paths **synchronize after every
+   kernel**, serializing launches and destroying normal async overlap —
+   so their tok/s is not a valid performance A/B sample.
+3. Device truth: `scripts/rocprof-wrap.sh` + `scripts/coverage-audit.py`
+   ([`rocprof-coverage.md`](rocprof-coverage.md)).
+4. Reconcile internal totals to rocprof. Blindspots (historical: large
+   fraction of prefill time missing from internal profile) block
+   confident attribution until timers land.
+5. Do not blame “launch overhead” until rocprof shows it.
+
+`hipfire profile --pp/--tg` drives synthetic `bench_prefill` /
+`bench_decode` handlers — **not** a production `generate` / `done` path.
+Treat those workload numbers as synthetic probes. Production-path
+authority remains daemon `done` fields and the production suite
+([`bench-suite.md`](bench-suite.md)).
+
+Kernel Atlas collection and ISA views: [`kernel-atlas.md`](kernel-atlas.md).
+
+## Spec-decode and output health
+
+Perf without output checks can crown an attractor. For DFlash/spec
+claims, pair timing with decoded-output health (unique-token /
+repetition checks and eyeball) on the **same** fixture identity.
+Retired `scripts/coherence-gate-*.sh` batteries are **historical
+reproduction only** — not current acceptance
+([`VALIDATION.md`](../VALIDATION.md) § Retired coherence-gate scripts).
+
+Tight stddev on spec-decode is suspicious if acceptance noise should be
+wider; inspect tokens.
+
+Resident multi-row: `dflash_spec_demo --prompts-file` with fixtures
+assembled from committed `.txt` files (see `benchmarks/prompts/`).
+Per-row flag changes still need separate process groups.
+
+## Disposition
+
+Every kept result ends in one disposition:
+
+| Disposition | Meaning |
+|---|---|
+| **Exploratory** | Local only; incomplete identity or single sample |
+| **Measured** | Full identity + raw samples + declared rule; not a product default |
+| **Historical** | Superseded config or methodology; retain, do not re-baseline product on it |
+| **Rejected / null** | Failed rule or confounder; record and stop — do not accumulate speculative “wins” |
+| **Promotion candidate** | Matched **fresh-process** A/B samples with declared ABBA/interleave **order** where order bias matters, gain above characterized noise, transfers across required buckets, intended path proven active (rocprof/profile on separate attribution runs), correctness route from VALIDATION still green | Still needs the owner’s admission/policy step — measurement alone does not write [`admissions.yml`](../admissions.yml) |
+
+Redline-attributed promotion additionally requires the certification
+ladder in [`REDLINE.md`](../REDLINE.md). Capture success ≠ timed-arm
+route proof.
+
+## Evidence durability
+
+- Prefer append-only dated files under `docs/perf-checkpoints/` or a
+  campaign ledger over editing old tables in place.
+- Published snapshots live in [`BENCHMARKS.md`](../BENCHMARKS.md) and
+  stay labeled historical/measured as that file states.
+- Raw reports (JSONL, rocprof CSV, ABBA logs) keep paths and digests in
+  the write-up; workstation-local paths are limitations, not secrets to
+  omit.
+- Stale baseline smell test: if `binary_md5` or model/prompt identity
+  does not match the claim’s fixture, re-measure — do not argue from a
+  weeks-old recalled number.
+
+## Explicit non-goals
+
+- No universal GPU gate and no restoration of retired coherence batteries
+  as acceptance.
+- No promotion by point estimate, best run, or harness success without
+  the proof the claim needs.
+- No copying mutable speed matrices into this file — link BENCHMARKS /
+  checkpoints.
+- No treating speed-gate floors or in-process lower bounds as production
+  throughput.

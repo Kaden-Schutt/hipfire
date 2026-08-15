@@ -84,7 +84,7 @@ if [ -z "$BASELINE_ARCH" ]; then
 fi
 
 BASELINE_FILE="tests/speed-baselines/${BASELINE_ARCH}.txt"
-MODELS_DIR="${HIPFIRE_MODELS_DIR:-/home/kaden/ClaudeCode/autorocm/hipfire/models}"
+MODELS_DIR="${HIPFIRE_MODELS_DIR:-${HIPFIRE_DIR:-$HOME/.hipfire}/models}"
 
 FAST=0
 UPDATE=0
@@ -149,7 +149,7 @@ bench_dflash_27b_lru() {
     local target draft
     for dir in "$MODELS_DIR" "$HOME/.hipfire/models"; do
         [ -f "$dir/qwen3.5-27b.mq4" ] && [ -z "${target:-}" ] && target="$dir/qwen3.5-27b.mq4"
-        # Registry filename is `qwen35-27b-dflash-mq4.hfq` (cli/index.ts:469).
+        # Registry filename is `qwen35-27b-dflash-mq4.hfq` (registry/models.json).
         # The legacy `qwen35-27b-dflash.mq4` was renamed when the registry
         # standardized on `<base>-<quant>.hfq`. Accept both for back-compat
         # with older pulls; #61 reporter hit MISSING_DRAFT here.

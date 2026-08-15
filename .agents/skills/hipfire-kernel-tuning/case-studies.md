@@ -1,568 +1,308 @@
-# Case studies — wins, losses, and the methodology in action
+# Case studies — dated evidence, not live floors
 
-Five worked examples from the actual hipfire git log. Each shows
-the workflow from `playbook.md` running on real engineering — a
-mix of decisive wins, fake wins caught by discipline, and silent
-corruption caught by gating. The lessons are the durable artifact;
-the numbers will move as the engine evolves.
+Historical kernel-tuning outcomes from the hipfire git log and branch
+campaigns. Each entry is **measured** or **historical**: a commit (or
+explicit branch note), a fixture scope, a disposition, and a durable
+lesson.
 
----
+**Not** product floors, admissions, or “current best” numbers. Live
+baselines live in `tests/speed-baselines/<arch>.txt` and are owned by
+the speed-gate workflow. Methodology owners:
 
-## §1 — wave64 CDNA3 port (decisive 2× win)
+- Perf protocol: [`docs/methodology/perf-benchmarking.md`](../../../docs/methodology/perf-benchmarking.md)
+- Capability vs perf-variant selection: [`docs/methodology/perf-arch-discipline.md`](../../../docs/methodology/perf-arch-discipline.md)
+- Validation route selector: [`docs/VALIDATION.md`](../../../docs/VALIDATION.md)
 
-**Commit**: `4105035` — "perf(cdna3): full wave64 port of all hot
-HFQ4 kernels — MI300X decode 48.6 → 96 tok/s"
+Disposition vocabulary used below:
 
-**Bottleneck**: MI300X (gfx94x) is wave64 native, but hipfire's
-HFQ4 kernels were wave32. On a wave64 wave running a wave32 kernel,
-half the lanes silently mask out — the kernel produces correct
-output but at 50% effective throughput.
-
-**Lever**: per-arch wave64 variant. Ten kernels ported with
-2-rows-per-block wave64 lane decomposition.
-
-**Numbers**:
-
-```
-A3B decode pre-port:  48.6 tok/s on MI300X (gfx942)
-A3B decode post-port: 96.0 tok/s — matches 7900 XTX on the same model
-```
-
-**Validation path**:
-- Channel-test against CPU reference on synthetic HFQ4 weights
-  (caught a wave-lane-mapping bug pre-merge).
-- Coherence-gate ran against the standard model matrix.
-- Speed-gate on the MI300X showed no regression on RDNA archs
-  (the wave64 path is gated by `arch.starts_with("gfx94")`).
-
-**Lesson**: wave-size mismatch is a 2× perf cliff, not a small
-inefficiency. Worth a proper port any time the target arch's wave
-size differs from your kernel's. The pattern (separate `.wave64.hip`
-or `.gfx942.hip` file) keeps RDNA dispatch unaffected.
+| Disposition | Meaning |
+|---|---|
+| **shipped** | Landed on the tuned path for the stated scope |
+| **reverted** | Candidate was rejected after measurement; keep the lesson |
+| **rejected / null** | Tried, did not win; may remain opt-in only |
+| **correctness fix** | Restored numeric correctness; not a perf claim |
+| **harness / measurement** | Root cause was fixture or process, not a kernel lever |
 
 ---
 
-## §2 — nontemporal weight-load fake win (caught by clean-baseline bisect)
+## CS-1 — wave64 CDNA3 port (shipped win)
 
-**Commits**: `0532579` (the candidate) → `34eb024` (the revert).
+| Field | Value |
+|---|---|
+| **Date / era** | 2026-04 (commit `4105035`) |
+| **Commit** | `4105035` — *perf(cdna3): full wave64 port of all hot HFQ4 kernels — MI300X decode 48.6 → 96 tok/s* |
+| **Fixture** | MI300X / gfx942; A3B 3.5-35B MQ4 decode; Fourier-explanation prompt; ctx=512, max=64 |
+| **Lever** | Wave-size port (`.wave64.hip` / wave64-native dispatch) |
+| **Disposition** | **shipped** on wave64-native CDNA3 path |
 
-**Setup**: an experiment to use `__builtin_nontemporal_load` for
-weight reads on hot decode kernels, intuition being that decode
-weights are streaming-read (each token re-reads them once) and
-shouldn't pollute L2.
+**What happened:** gfx94x is wave64-native; wave32 HFQ4 kernels left half
+the lanes masked. Porting the hot HFQ4 set with 2-rows-per-block wave64
+lane decomposition roughly doubled decode on the recorded MI300X fixture
+in that commit message (48.6 → 96 tok/s).
 
-**Initial measurement** (within-session A/B): +2.0% decode tok/s on
-9B MQ4. Looked plausible, committed.
+**Validation (as of that work):** cold same-prompt smoke on MI300X was
+byte-exact vs 7900 XTX (gfx1100) on the Fourier prompt. Warm outputs
+could diverge at a single token from MoE-down `atomicAdd` ordering
+(already present on the wave32 base path; not introduced by the port).
+That commit does **not** record a CPU-reference synthetic channel-test
+as its acceptance. Do not treat retired `coherence-gate-*.sh` batteries
+as current acceptance — see `docs/VALIDATION.md`.
 
-**Bisect against committed speed-gate baseline** (April 12 anchor):
-**−13% decode**. 131 → 113 tok/s on 7900 XTX 9B MQ4.
-
-The within-session A/B happened in a GPU state already skewed by
-many preceding bench runs — preceding warmup put L2 in a state
-where the nontemporal change *appeared* to win, but a fresh process
-with a cold cache showed the actual regression.
-
-**Hypothesis** (in the revert commit message): on RDNA3, the
-nontemporal load path bypasses cache-line allocation but ALSO
-defeats wave-level coalescing/prefetch behavior the default load
-path gets for free. Each wave was issuing one coalesced 128-byte
-transaction for 32 packed-u32 weight reads; the nontemporal hint
-broke that coalescing pattern.
-
-**Lessons**:
-1. **Always bisect against the committed baseline**, not your last
-   bench run. The speed-gate baseline file
-   (`tests/speed-baselines/<arch>.txt`) exists for exactly this reason.
-2. **Hypothesis without measurement = noise**. The nontemporal
-   intuition was reasonable on paper. The hardware behavior was
-   different.
-3. **Reverts are first-class commits**. The revert commit message
-   captures the WHY so the next contributor doesn't try the same
-   thing for the same reasons.
+**Lesson:** wave-size mismatch is a cliff, not a small inefficiency.
+Gate the path with `ArchCaps::is_wave64_native()` (or equivalent atom
+allowlist) so RDNA wave32 dispatch stays untouched.
 
 ---
 
-## §3 — k2x32 wider-row variant (null result, kept for posterity)
+## CS-2 — nontemporal weight-load (reverted fake win)
 
-**Commit**: `f670e16` — "experiment(gemm): k2x32 wider-row lm_head —
-null result"
+| Field | Value |
+|---|---|
+| **Date / era** | 2026-04 |
+| **Commits** | `0532579` (candidate) → `34eb024` (revert) |
+| **Fixture** | gfx1100; 9B MQ4 decode; within-session A/B then clean-baseline bisect |
+| **Lever** | `__builtin_nontemporal_load` on hot decode weight reads |
+| **Disposition** | **reverted** |
 
-**Hypothesis**: on the M=248320 lm_head kernel, a 32-row block
-(versus the 16-row default) would halve block count and amortize
-X-fragment loads across 2 WMMA issues per K-tile.
+**What happened:** Within-session A/B looked like a small decode win and
+was committed. Bisect against the committed speed-gate baseline showed a
+large regression (commit message order-of-magnitude: on the order of
+−13% decode on that 9B MQ4 / 7900 XTX fixture). Warm L2 / skewed GPU
+state hid the real cold-path behavior.
 
-**Result**: 46% **slower** at the target shape. 1564 µs (k2 baseline)
-→ 2280 µs (k2x32). Effective BW dropped from 446 GB/s to 307 GB/s.
+**Hypothesis retained in the revert message:** nontemporal loads on
+RDNA3 defeated wave-level coalescing/prefetch the default path got for
+free.
 
-**Root cause**: doubled accumulator (`float8_t × 2`) plus 4× dequant
-live ranges pushed wave register pressure past the compiler's
-budget, forcing spills or reducing effective occupancy. 310 GB/s
-(32% of 960 peak) signals latency-bound, not BW-bound — more
-parallel WMMAs don't help when you can't pipeline them.
+**Lesson:**
 
-**Why kept**: the kernel + `HIPFIRE_WO_WMMA_VARIANT=k2x32` env
-override stayed in the tree even though auto-dispatch routes around
-it. A future revisit with LDS-staged B-share + manual register
-budgeting might unlock it. The negative result is a known-checkpoint
-that future tuning passes don't have to re-discover.
-
-**Lesson**: register pressure is the gating constraint past a
-certain point. More parallel work does not help when the compiler
-can't pipeline the issue chain. When you measure a kernel at
-~30% peak BW and the obvious "do more" lever loses, the bottleneck
-is latency, not BW — different lever class.
+1. Bisect against the **committed** baseline / fresh process, not the
+   last bench in the same shell.
+2. Reasonable ISA intuition is not evidence.
+3. Reverts are first-class: keep the WHY so the lever is not retried
+   blindly.
 
 ---
 
-## §4 — gfx11 WMMA C-mapping silent corruption (caught only by channel-test)
+## CS-3 — k2x32 wider-row lm_head (null result, opt-in kept)
 
-**Commit**: `b7ac66a` — "wmma correctness fix + MQ6 family +
-cross-arch prefill + gate framework"
+| Field | Value |
+|---|---|
+| **Date / era** | pre-2026-05 (commit `f670e16`) |
+| **Commit** | `f670e16` — *experiment(gemm): k2x32 wider-row lm_head — null result* |
+| **Fixture** | gfx1100 / 7900 XTX; 27B MQ4 lm_head at M=248320, K=5120, B=16; k2 baseline vs k2x32 |
+| **Lever** | Wider-row / deeper multi-row WMMA issue |
+| **Disposition** | **rejected / null** on that gfx1100 lm_head fixture; auto-dispatch remained **k2** for that fixture/commit (`M>=8192` per `fe4ccb4`); variant retained behind `HIPFIRE_WO_WMMA_VARIANT=k2x32` |
 
-**Setup**: gfx11 (RDNA3) WMMA was the WMMA workhorse for hipfire
-since the v0.1.4 line. The C-output mapping
-(`acc[j] = C[2*j + (tid>>4)][tid & 15]`) was silently wrong for
-**~6 weeks**.
+**What happened:** 32-row blocks vs 16-row were supposed to amortize
+X-fragment loads on the 27B lm_head shape. Measured slower on that
+gfx1100 fixture (k2 ~1564–1587 µs / ~446–452 GB/s vs k2x32 ~2280–2297 µs
+/ ~307–310 GB/s). Root cause attributed to doubled accumulators + dequant
+live ranges → register pressure / occupancy loss (latency-bound, not
+BW-bound).
 
-**How it stayed hidden**:
-- All speed-gates passed — the kernel produced numbers, just wrong
-  ones in the same ballpark.
-- Coherence-gates passed — output was English-shaped, on-topic-ish,
-  no panics or zero-tokens or attractor loops.
-- Functional tests passed — comparing kernel output to itself
-  doesn't catch a systematic mapping error.
-- Real-model tok/s didn't regress noticeably — quality degradation
-  was within "MQ4 is lossy by nature" range.
+**Later, separate evidence (not a reversal of this null):** current
+`crates/rdna-compute/src/gemm.rs` auto-selects `k2x32` on RDNA3.5
+(`gfx115x`) for a **distinct** small-M / prefill residual shape
+(`m < 8192`). That is a different arch + shape + dated path; it does not
+un-reject the original gfx1100 large-M lm_head null.
 
-**How it got caught**: a channel-test that compared kernel output
-**element by element against a CPU reference on synthetic
-deterministic inputs** flagged a row-mod-16 pattern of mismatches.
-The histogram diagnostic that landed in PR #56's gfx12 channel
-tests is the tool that would have caught this in 30 seconds.
-
-**Lessons**:
-1. **Channel-test is the load-bearing correctness gate**, not
-   speed-gate or coherence-gate. The other two are weaker signals
-   that miss systematic errors.
-2. **Per-lane mappings are silent-corruption magnets.** WMMA, MFMA,
-   and any cooperative-thread reduction has implicit mapping
-   conventions that you can get wrong without any obvious symptom.
-3. **The row-mod-16 histogram diagnostic is reusable** — every
-   future WMMA / MFMA channel-test should include it (it would
-   have caught this in seconds).
-
-The arch-port skill (`.agents/skills/hipfire-arch-port/`) explicitly cites
-this commit as the cautionary tale for new contributors. PR #56
-followed that guidance and avoided the trap entirely on gfx12.
+**Lesson:** past a VGPR wall, “do more parallel WMMA” loses on the shape
+you measured. Negative results with a named env override
+(`HIPFIRE_WO_WMMA_VARIANT=k2x32` in that era) save the next pass from
+rediscovery. Null ≠ delete history; later wins on other atoms/shapes need
+their own dated cases.
 
 ---
 
-## §5 — 27B DFlash perf recovery (root-causing a real regression)
+## CS-4 — gfx11 WMMA C-mapping silent corruption (correctness fix)
 
-**Commit**: `9a2c667` — "perf-recovery: restore 27B DFlash perf +
-flip prompt_normalize default ON + DFlash speed-gate"
+| Field | Value |
+|---|---|
+| **Date / era** | fixed in `b7ac66a` after ~6 weeks latent |
+| **Commit** | `b7ac66a` — *wmma correctness fix + MQ6 family + cross-arch prefill + gate framework* |
+| **Fixture** | gfx11 WMMA path; synthetic deterministic channel-test inputs |
+| **Lever** | none (mapping bug) |
+| **Disposition** | **correctness fix** |
 
-**Setup**: 27B DFlash decode regressed 30-40% suddenly. Looked
-catastrophic.
+**What happened:** C-output mapping
+`acc[j] = C[2*j + (tid>>4)][tid & 15]` was wrong. Speed floors and
+English-shaped smoke still passed; quality looked like “quant loss.”
+Element-wise channel-test vs CPU reference exposed a row-mod-16 mismatch
+pattern.
 
-**Investigation path** (over 6 hours of bisecting):
+**Lesson:**
 
-1. Suspect rocBLAS — null. `HIPFIRE_ROCBLAS_OFF=1` made no difference.
-2. Suspect DKMS / firmware — null. `dmesg` clean, kernel firmware
-   versions matched.
-3. Suspect mold / sccache — null. Clean rebuild reproduces.
-4. Suspect DPM / thermal — null. `pp_dpm_sclk` looked normal.
-5. **Found it**: prompt structure. A whitespace-cleanup edit to a
-   bench script changed `\n\n\n` → `\n\n`. Same prompt by token
-   count, totally different by token sequence. τ collapsed from
-   9.42 to 8.07; tok/s from 199 to 161.
+1. Channel-test / numeric oracle is the load-bearing correctness route
+   for kernels — not speed floors and not retired coherence batteries
+   (`docs/VALIDATION.md`).
+2. Cooperative-lane mappings are silent-corruption magnets.
+3. Row-mod-16 (or equivalent dimensional) histograms belong in every
+   WMMA/MFMA channel-test.
 
-**Lessons** (now codified in CLAUDE.md and AGENTS.md):
-1. **Prompt structure dictates τ.** One newline character can swing
-   τ by 17%. Embed prompts as committed files, record prompt md5
-   alongside results.
-2. **Tight stddev on a spec-decode bench is suspicious, not
-   reassuring.** The "before" measurement had tight stddev
-   suggesting a deterministic attractor; real acceptance is wider.
-3. **Bisect attribution is hard when the cause is in the test
-   harness, not the engine.** Always reproduce the regression on
-   a different prompt before deep-diving the engine.
-
-The fix: implement engine-side `\n{3,}` → `\n\n` collapse default-on
-(`prompt_normalize` config key, commit `9a2c667`). +24% τ on PEP-8-
-style code prompts vs the opt-out path.
+Cited by `.agents/skills/hipfire-arch-port/` as the cautionary tale for
+new matrix-engine ports.
 
 ---
 
-## §6 — wave64 residual gemv on MI300X (small win, BW-saturation ceiling)
+## CS-5 — 27B DFlash recovery: deleted residual-WMMA kernels (shipped)
 
-**Commit**: this branch — "perf(cdna3): wave64 port of gemv_hfq4g256_residual"
+| Field | Value |
+|---|---|
+| **Date / era** | recovery commit `9a2c667` |
+| **Commit** | `9a2c667` — *perf-recovery: restore 27B DFlash perf + flip prompt_normalize default ON + DFlash speed-gate* |
+| **Fixture** | gfx1100 / 7900 XTX; 27B-3.5 DFlash LRU-code decode (broken master ~95 tok/s → post-fix ~199 tok/s) |
+| **Lever** | none new — restore load-bearing residual-WMMA sources removed as “dead” |
+| **Disposition** | **shipped** recovery; DFlash metric added to speed-gate |
 
-**Bottleneck**: rocprof on 27B 3.6 mq4 decode (50 gen tokens, asym3 KV)
-showed `gemv_hfq4g256_residual.kd` at 19.2% of GPU time — the largest
-non-wave64 kernel after the 2026-04-17 (`4105035`) wave64 port. The
-original commit ported 10 hot HFQ4 kernels but missed the residual
-variants of gemv (`_residual` and `_wide`).
+**What happened:** Decode looked ~half speed (95 → 199 tok/s after fix on
+that fixture). Root cause in `9a2c667`: PR #32 cleanup deleted
+`gemm_hfq4g256_residual_wmma{,2,_k4}.hip` as dead weight, but they were
+load-bearing on the K4 dispatch path for 27B verify-shape GEMMs (per-cycle
+cost on 64-layer × B=16 verify jumped ~57 → 100+ ms). Restoring those
+kernels recovered DFlash.
 
-**Hypothesis**: wave64 port should give 1.5-2× per-call speedup
-(matching the original commit's win on the same kernel family).
+**Not the root cause of this regression:** prompt whitespace / shape.
+Prompt normalization was measured earlier in `8a4a211` (PEP-8 raw
+157.1 → normalized 199.0 tok/s on 27B-3.5 DFlash) and was only
+**default-flipped ON** as a separate deliverable inside `9a2c667`. Treat
+prompt-shape τ sensitivity as its own harness lesson (commit prompts,
+record md5 — see perf-benchmarking); do not attribute the `9a2c667`
+kernel-deletion regression to prompt bytes.
 
-**Lever**: §1 wave-size port. New `gemv_hfq4g256_residual_wave64.hip`
-with 2-rows-per-block layout (warp_id selects row, lane drives the
-32-lane reduction unchanged). Dispatch routes via `has_wave64_native(arch)`.
+**Lesson:**
 
-**Numbers**:
-
-```
-27B 3.6 decode pre-port:  66.0 tok/s on MI300X (gfx942)
-27B 3.6 decode post-port: 68.1 tok/s     (+3.2%, within noise)
-
-per-call kernel time:
-  pre-port:   28783 ns/call (single-row wave32 on wave64 hardware)
-  post-port:  25222 ns/call (two-rows-per-block wave64)              -12.4%
-
-A3B 3.6 decode pre/post: 194.6 → 198.0 tok/s (+1.7%, within noise)
-```
-
-**Why the small wall-clock delta despite -12% kernel time**: residual
-gemv on this shape (M ~ 5120, K ~ 5120, single output row per warp32) is
-**bandwidth-bound, not lane-bound**. Each row already saturates a wide
-HBM3 read on MI300X regardless of wave size — the wave32 kernel was
-issuing one coalesced 128-byte transaction every 32 packed-u32 weight
-reads, and the new wave64 kernel pays the same BW for half the lanes.
-The 12% per-call drop is real (less ALU pressure on the unused upper
-lanes) but the wall-clock is dominated by the BW transfer, not the
-compute pipeline.
-
-**Lesson**: wave64 port wins biggest on kernels that are
-**lane-utilization-bound** (multi-row fused projections like qkv, where
-each lane has its own row-output to compute). On per-row gemv shapes
-that are already BW-saturated, the win is incremental — ship it because
-it's correctness-preserving and additive with future fusion work, but
-don't expect 2× decode.
-
-**Cross-arch**: gated by `has_wave64_native(&self.arch)`, so
-gfx908/gfx940/gfx941/gfx942 only. RDNA archs unchanged. Speed-gate on
-gfx1100 should pass byte-exact.
+1. Kernel-cleanup PRs must prove DFlash (not only AR) before/after; AR-only
+   speed-gate missed a ~40% DFlash hit until this recovery added the metric.
+2. “Unused” residual-WMMA siblings can still be selected by shape/dispatch —
+   deletion needs call-graph + bench evidence, not name hygiene.
+3. Spec-decode τ is also prompt-byte-sensitive (`8a4a211`); embed prompts as
+   committed files and record prompt md5 — orthogonal to this kernel case.
 
 ---
 
-## §7 — LDS-staged X share on gate_up (null result, kept opt-in for posterity)
+## CS-6 — wave64 residual gemv on MI300X (small additive win)
 
-**Historical branch note**: "experiment(gate_up): LDS-staged X share
-variant — pp512 prefill -12% (null result)". Verify the exact commit exists
-in your checkout before citing a hash externally.
+| Field | Value |
+|---|---|
+| **Date / era** | 2026-04-28 era (gfx942 baseline capture notes residual wave64 close-out after `4105035`) |
+| **Commit** | branch-era residual port; baseline file `tests/speed-baselines/gfx942.txt` cites the residual gemv lever in its header narrative — verify tip hash before external citation |
+| **Fixture** | MI300X gfx942; 27B / A3B mq4 decode; rocprof attribution on residual gemv |
+| **Lever** | Wave64 port of residual gemv family |
+| **Disposition** | **shipped** additive; wall-clock lift small on BW-saturated shapes |
 
-**Variant kernel**: `kernels/src/gemm_gate_up_hfq4g256_wmma_ldsx.hip`,
-opt-in via `HIPFIRE_GATE_UP_VARIANT=ldsx`. Investigation tracked in
-issue #60 (which has the v2 plan + three independent adversarial
-reviews recorded in the comment thread).
+**What happened:** Hot residual gemv still wave32 after the main wave64
+port. Per-call kernel time improved in the recorded rocprof; end-to-end
+decode moved only a few percent (inside or near noise on some rows)
+because the shape was already HBM-bound.
 
-**Bottleneck identified**: per-wave VMEM latency in front of WMMA B in
-the baseline `gemm_gate_up_hfq4g256_wmma` inner loop. ISA dump shows
-`s_waitcnt vmcnt(0)` immediately before the second WMMA each
-K-tile-pair iteration — the compiler couldn't schedule enough
-independent work to hide the b_b load latency.
+**Lesson:** wave64 pays most when lanes are under-utilized (multi-row
+fused projections). On saturated per-row gemv, ship if correctness-safe
+and additive, but do not promise another 2× decode.
 
-**Lever attempted**: LDS-staged X share — the "unfinished follow-up"
-from §3's k2x32 lessons. Cooperative global → LDS load once per
-K-tile-pair, then ds_read into the WMMA B operand. Theory: replace
-the ~50 cycle `vmcnt(0)` VMEM stall with a ~20 cycle `lgkmcnt`
-LDS-read stall, hidden by the dequant work that already sits between
-the X load and WMMA.
-
-**Design**: per-K-tile-pair LDS slab (1 KB stages, 2 KB
-double-buffered) — chosen specifically to *avoid* the occupancy
-collapse the v1 design sketch would have hit at 16 KB per block.
-Cooperative load mapping splits the 16 batches × 32 K-element tile
-across all 32 lanes (each loads its own unique 16 fp16) to fix the
-wave-redundancy where lanes 0-15 and lanes 16-31 currently re-read
-the same X columns.
-
-**Numbers** (Qwen 3.5 9B MQ4, gfx1100, ROCm 7.2,
-`HIPFIRE_PROFILE=1 ... --warmup 5 --gen 0`):
-
-| | baseline gate_up µs/call | LDSX gate_up µs/call | Δ per-call |
-|---:|---:|---:|---:|
-| pp32 | 261 | 314 | **+20.3%** |
-| pp128 | 895 | 1157 | **+29.3%** |
-| pp512 | 1760 | 2415 | **+37.2%** |
-
-| | baseline prefill tok/s | LDSX prefill tok/s | Δ |
-|---:|---:|---:|---:|
-| pp32 | 598 | 492 | −17.7% |
-| pp128 | 792 | 760 | −4.0% |
-| pp512 | 1155 | 1012 | −12.4% |
-
-Effective BW collapses 178 → 64 → 41 GiB/s on gate_up as batch grows.
-The kernel is *more* memory-bound at large M than the baseline, not
-less.
-
-**Validation path**:
-
-- **Gate 0 (ISA inspection) — PASSED.** `hipcc -save-temps -S -O3
-  --offload-arch=gfx1100` showed: 75 VGPRs (down from baseline 80),
-  no `s_barrier` emitted (single-wave-per-block elides
-  `__syncthreads()`), weight load preserved at the top of the
-  inner loop, ds_read followed by ~145 instructions of dequant
-  before WMMA. All four Gate 0 criteria from the v2 plan
-  satisfied.
-- **Gate 1 (microbench) — FAILED.** Per-call wall time regressed
-  at every pp size. Issue #60 thread documents the full per-pp
-  breakdown plus the comparison vs the baseline ISA.
-
-**Why ISA-clean still regressed**: the baseline inner loop has
-2 VMEM stalls per K-tile-pair (`vmcnt(2)` before WMMA A,
-`vmcnt(0)` before WMMA B). The LDSX inner loop has 3 VMEM stalls
-+ 2 LGKM stalls per iteration (vmcnt waits in the LDS-store phase,
-vmcnt before dequant for the weight load, and lgkmcnt waits before
-each WMMA). More stall events, smaller individual latencies.
-Critically, the baseline's `vmcnt(0)` was already partially hidden
-by wave-level ILP (2 waves/SIMD baseline → wave scheduler swaps to
-sibling wave during the stall), so eliminating it didn't free as
-much wall time as the static analysis suggested. Meanwhile the
-new LDS round-trip costs were paid in full.
-
-**Why kept**: the kernel + dispatch arm stay in the tree
-(default-off opt-in via `HIPFIRE_GATE_UP_VARIANT=ldsx`) so future
-revisits — possibly on RDNA4 (gfx12 gains `s_prefetch_data`) or
-with a fundamentally different LDS layout (e.g., LDS holds
-*dequantized* weights instead of X, making the lever go after the
-A-side load not the B-side) — don't have to rebuild the
-infrastructure from scratch. Mirrors the §3 k2x32 disposition.
-
-**Three reviews caught the headline issues, two of them caught
-issues that turned out to be moot, one caught the issue that
-mattered most**:
-
-- All three (Claude, Gemini, GLM-5): "32× X-load reduction" framing
-  was wrong on multiple axes. Confirmed empirically.
-- Gemini §1 + GLM §2: occupancy collapse risk if LDS budget grows
-  to 16 KB/block. **Moot** — v2 design used 2 KB and Gate 0 ISA
-  showed VGPRs went *down* not up.
-- GLM §4: `__syncthreads()` would force a pipeline flush and
-  destroy compiler scheduling freedom. **Moot** — single-wave
-  blocks elide the barrier entirely.
-- GLM §2: ~50% of `vmcnt(0)` stalls are already hidden by
-  wave-level ILP. **This was the load-bearing critique.**
-  Eliminating already-hidden stalls is the textbook recipe for a
-  null result, and that's exactly what we got — except worse,
-  because we replaced them with new stalls the wave scheduler
-  couldn't hide as well.
-
-**Lesson**: ISA inspection alone is insufficient. A clean ISA
-(no barrier emitted, weight prefetch preserved, VGPR budget healthy)
-predicted a net win that didn't materialize on the bench. The
-missing piece was wave-scheduler-level latency hiding, which is
-invisible in static analysis but dominant in wall-time measurement.
-**Always pair ISA inspection with cycle-counting microbench before
-committing to a kernel rewrite.** And if a stall you're trying to
-remove is in a kernel that's already running at meaningful
-SIMD-utilization (≥20%), assume the wave scheduler is hiding
-*some* of it — your ceiling is smaller than the per-iteration
-cycle count suggests.
-
-**For future revisit**: don't re-try this exact design. If you want
-to attack the same `vmcnt(0)` stall with a different mechanism,
-the candidates are:
-
-- Pre-dequantize the A-side into LDS (move the lever to weights, not
-  X — A is read-once-per-row, X is read-once-per-batch, but A's
-  dequant work is what's currently filling the stall window —
-  removing it changes the schedule).
-- gfx12 `s_prefetch_data` (per `levers.md §5`) — different
-  hardware, different tradeoffs.
-- Restructure the inner loop to issue more independent WMMAs in
-  parallel, giving the scheduler more work to hide individual
-  stalls behind. This loops back to the K4 / K8 deeper-pipelining
-  discussion that's currently blocked on K4's correctness bug.
+**Cross-arch:** gate with `is_wave64_native()`; RDNA unchanged.
 
 ---
 
-## §8 — K4 output-mapping bug fix (correctness restored, no perf change)
+## CS-7 — LDS-staged X share on gate_up (null; opt-in retained)
 
-**Historical branch note**: "fix(gemm): K4 output mapping — was swapped
-relative to canonical wave32 WMMA C-mapping". Verify the exact commit exists
-in your checkout before citing a hash externally.
+| Field | Value |
+|---|---|
+| **Date / era** | issue #60 campaign (gfx1100, ROCm 7.2 era) |
+| **Commit** | historical branch experiment — verify hash in your checkout before external citation |
+| **Artifact** | `kernels/src/gemm_gate_up_hfq4g256_wmma_ldsx.hip`; opt-in `HIPFIRE_GATE_UP_VARIANT=ldsx` |
+| **Fixture** | Qwen 3.5 9B MQ4; gfx1100; `HIPFIRE_PROFILE=1`; pp32/128/512 |
+| **Lever** | LDS-staged X share to hide VMEM before WMMA B |
+| **Disposition** | **rejected / null** for default; infrastructure kept opt-in |
 
-**Companion commits**:
+**Measured shape (that campaign):** per-call gate_up and end-to-end
+prefill both regressed at every recorded pp; effective BW collapsed as
+batch grew. ISA Gate 0 looked clean (VGPR healthy, barrier elided on
+single-wave blocks); microbench still failed.
 
-- prerequisite channel-test patch: row-varying weights
-  + K∈{256,512,4096} sweep. The bug was invisible to the original
-  test at batch=1.
-- Investigation tracked in issue #60 (which has the v2 plan + three
-  independent adversarial reviews recorded in the comment thread).
+**Why ISA-clean lost:** baseline already hid much of `vmcnt(0)` via
+wave-level ILP; LDSX added more stall events the scheduler hid less
+well.
 
-**Bottleneck identified**: `gemm_hfq4g256_residual_wmma_k4.hip` was
-labeled "output-mapping bug, τ=0 on dflash, debug only" in
-`dispatch.rs` and gated behind `HIPFIRE_WO_WMMA_VARIANT=k4`, never
-auto-dispatched. The K4 author had written the output block against
-an incorrect mental model of the RDNA3 wave32 WMMA accumulator
-layout — same class as commit `b7ac66a` (case-studies §4).
+**Lesson:** pair ISA inspection with wall-time microbench before
+committing a rewrite. Do not re-try this exact design; different
+mechanisms (weight-side LDS, gfx12 prefetch, deeper independent WMMA
+issue) are separate experiments.
 
-**Lever**: §3 K-tile depth (specifically the K4 step). The K2 step
-of the same lever has been deployed across all dominant prefill
-GEMMs since long before this work. The K4 step was broken; this
-commit fixes it.
+---
 
-**The author's mental model vs. the hardware**:
+## CS-8 — K4 output-mapping fix (correctness; no auto-dispatch win)
 
-- Hardware: `acc[j] = C[2*j + (tid >> 4)][tid & 15]`. Each lane
-  holds 8 rows of one batch column.
-- K4 author wrote: `acc[j] = C[tid & 15][(tid >> 4) * 8 + j]`.
-  Each lane holds 8 batches of one row.
+| Field | Value |
+|---|---|
+| **Date / era** | issue #60 follow-on; fix commit `48aa9d5` |
+| **Commit** | `48aa9d5` — *fix(gemm): K4 output mapping — was swapped relative to canonical wave32 WMMA C-mapping* |
+| **Artifact** | `kernels/src/gemm_hfq4g256_residual_wmma_k4.hip`; env `HIPFIRE_WO_WMMA_VARIANT=k4` |
+| **Fixture** | Qwen 3.5 9B MQ4; gfx1100; channel-test K×batch matrix + residual microbench |
+| **Lever** | K-tile depth (K4) — blocked until mapping fixed |
+| **Disposition** | **correctness fix**; remains opt-in; auto-dispatch unchanged |
 
-These mappings are transposed. Output corruption grew with batch
-size because at batch=1 the mismatch happened to coincide on a
-single column.
+**What happened:** K4 used a transposed mental model of wave32 WMMA C
+layout (same class as CS-4). Broken channel-test showed near-total bad
+cells; fixed mapping matched K2. At m&lt;8192 on that fixture, K4 did not
+beat ksplit; not promoted.
 
-**Numbers (Qwen 3.5 9B MQ4, gfx1100, ROCm 7.2)**:
+**Methodology bugs caught alongside the kernel bug:**
 
-Channel-test before fix (broken K4):
+1. Stale precompiled HSACO / hash sidecars can make a “fix” look
+   bit-identical-wrong — force invalidate compiled blobs and confirm a
+   recompile log line.
+2. Row-invariant synthetic weights hide row-shuffle bugs at batch=1 —
+   vary every dimension the kernel could permute.
+3. Multi-reviewer plans beat single-reviewer confident misdiagnosis on
+   high-stakes mapping work.
 
-| K | batch | bad cells |
-|---|---|---|
-| 256 | 1 | 15/16 |
-| 256 | 2 | 30/32 |
-| 4096 | 16 | 224/256 |
+---
 
-Channel-test after fix (K4 with K2-mirror output mapping):
+## CS-9 — capability predicate selected wrong perf variant (shipped discipline)
 
-| K | batch | bad cells |
-|---|---|---|
-| 256 | 1 | 0/16 |
-| 256 | 2 | 0/32 |
-| 4096 | 16 | 0/256 |
+| Field | Value |
+|---|---|
+| **Date / era** | 2026-06-12 mandate; fix `24e4baa9` |
+| **Commits** | `303d69e9` (`ldscoop` falsified on gfx1100); `e3232034` (nosync on gfx1150/1151, `ldscoop` catch-all on others); `24e4baa9` (restore plain on RDNA3 dGPU) |
+| **Fixture** | gfx1100 DFlash / gate_up hfq4g256 WMMA sub-variants (`plain` vs `ldscoop` vs `ldscoop_nosync`) |
+| **Lever** | none new — selection polarity |
+| **Disposition** | **shipped** selection fix; full ledger discipline in methodology doc |
 
-K4-fixed matches K2 byte-for-byte across the full matrix.
+**What happened:** The measured Strix (gfx1150/1151, LPDDR) winner was
+`gemm_gate_up_hfq4g256_wmma_ldscoop_nosync`, not plain `ldscoop`.
+`e3232034` defaulted nosync on gfx1150/1151 and used `ldscoop` as the
+catch-all “others” default — which routed gfx1100 dGPU (GDDR6 + Infinity
+Cache) onto `ldscoop`, a variant already falsified slower on that chip
+(`303d69e9`). rocprof attributed most of a ~14% DFlash decode regression
+to the wrong variant. `24e4baa9` restored **plain** WMMA on RDNA3 dGPU
+via `is_rdna3_dgpu()`; Strix kept nosync; RDNA4 left on `ldscoop` pending
+its own measurement.
 
-Bench Phase 3a (residual at m=4096, 9B):
+**Rule (durable):** capability predicates answer ISA correctness.
+Perf sub-variants use an explicit arch allowlist + measured ledger
+defaulting to the portable choice. See
+`docs/methodology/perf-arch-discipline.md`. Do not copy the 2026-06-12
+ledger table into this skill as if it were live — the methodology owner
+and any machine ledger file are authoritative.
 
-| | ksplit µs/call | K2 µs/call | K4-fixed µs/call |
-|---:|---:|---:|---:|
-| pp32 | 95 | 126 | 126 |
-| pp128 | 315 | 327 | 331 |
-| pp512 | 626 | 651 | 628 |
-
-K4 ties K2 within FP drift but doesn't beat ksplit at m<8192
-because ksplit's K-split + atomicAdd is the right structural lever
-for CU-starved small-m grids (~13 blocks/CU vs K4's 3.3 blocks/CU
-under `__launch_bounds__(32, 1)`). Auto-dispatch logic unchanged.
-
-K4 vs K2 at m≥8192 not benched — no model with residual m≥8192
-available locally. Future work.
-
-**Validation path**:
-
-- **Channel-test patched first** — the original test
-  used row-invariant weights (`w[r][k] = 1.0` along the diagonal),
-  making `C[r][b]` independent of r. That hid row-shuffle errors
-  at batch=1 entirely. Patched test uses `w[r][k] = (r+1)*0.05`
-  along the diagonal, exposing the dimensional mismatch
-  immediately.
-- **K4 source patched** to mirror K2's canonical output mapping.
-- **Cache layers force-invalidated** before re-test (see Lesson).
-- **Channel-test green** at K∈{256,512,4096} × batch∈{1,2,4,16}.
-- **Bench Phase 3a** confirmed no regression vs K2 at m<8192.
-
-**Lesson 1 (the methodology bug, equal weight to the kernel
-fix)**: A previous attempt to apply this exact same fix during
-the LDSX investigation session reported "bit-identical wrong
-output between original K4 and K2-mirror K4" — and was used to
-conclude that the bug was NOT in the output mapping. That
-conclusion was wrong. Reconstructed evidence:
-
-- Post-fix test run did NOT print
-  `pre-compiled blob has no hash file, recompiling`.
-- Post-revert test run DID print it.
-- Same test, same input, asymmetric cache behavior across two
-  back-to-back runs.
-
-Almost certainly the post-fix run served the cached unmodified
-K4 binary because:
-
-- `write-kernel-hashes.sh` updates source-hash sidecars without
-  recompiling the precompiled blob.
-- The runtime checks the sidecar but does not verify against the
-  blob.
-- Three cache layers exist (`kernels/compiled/gfx1100/`,
-  `.hipfire_kernels/gfx1100/`, `.hipfire_kernels/`); at least
-  one served stale data.
-
-**For any kernel-source change, the cache invalidation procedure
-is**:
-
-```bash
-rm -f kernels/compiled/<arch>/<kernel>.hsaco
-rm -f kernels/compiled/<arch>/<kernel>.hash
-rm -rf $HOME/.hipfire_kernels/<arch>/<kernel>.*
-rm -f .hipfire_kernels/<kernel>.*
-rm -f .hipfire_kernels/<arch>/<kernel>.*
-./scripts/write-kernel-hashes.sh
-rm -f target/release/examples/<bin>
-cargo build --release ...
-```
-
-Verify the `recompiling` message appears at first invocation.
-**If it doesn't, the test is running stale code.** Don't trust
-any null result that didn't print this message.
-
-**Lesson 2 (the test-design bug)**: A channel-test that uses
-row-invariant data has a silent false-negative for the
-row-shuffle bug class — exactly the class that the WMMA C-mapping
-errors fall into (case-studies §4 / §8). Always use data that
-varies independently along every dimension the kernel could
-shuffle. Pattern:
-
-```rust
-// row-varying:    weight[r][diag_position] = (r+1) * 0.05
-// batch-varying:  x[b][k] = (b+1) * 0.1
-// → C[r][b] varies with both. Row-shuffle / batch-shuffle visible.
-```
-
-Original test used `weight = 1.0` (row-invariant), missed it.
-
-**Lesson 3 (multi-reviewer value)**: This bug went undetected
-through the LDSX session because the single-reviewer process
-caught the wrong thing — I diagnosed a hypothetical WMMA
-issue-rate constraint (case-studies §7-class hypothesis) and
-missed both the cache flaw and the test blind spot. Three
-independent reviews (Claude v1, Gemini, GLM-5) of the K4 plan
-*all* identified the misdiagnosis from different angles:
-
-- Gemini: "The Output Stage Fallacy" — output mapping is broken
-  by direct source inspection.
-- GLM-5: "The session's K4 fix experiment was likely invalidated
-  by stale precompiled-blob caching" + "channel-test has a
-  row-invariance blind spot at batch=1."
-- Claude v2 (post-peer-review): synthesized both into the v2 plan
-  that proceeded H0-first.
-
-The single-reviewer pass (Claude v1) was confidently wrong in a
-way that would have wasted ~2-3 days of bisect-the-wrong-thing
-investigation. The 3-reviewer pass converged on the right
-diagnosis in one round. **For high-stakes investigation plans,
-run multiple independent reviews before executing.**
-
-**Why kept the variant opt-in**: the K4 dispatch arm stays in the
-tree. K4 vs K2 at m≥8192 has not been benched on the available
-hardware/models — future work on a 70B-class model could test
-whether K4's deeper unroll wins where ksplit's atomicAdd overhead
-no longer pays off. The fix means K4 is *available* for that
-future test, not that it currently beats anything.
+---
 
 ## How to add a case study
 
-If you land a real perf win or revert worth documenting, append a
-new §N section here. Required fields:
+Append a new `CS-N` section. Required fields:
 
-- **Commit** — the canonical commit hash.
-- **Bottleneck** — what the profile said.
-- **Lever** — which entry from `levers.md` you used.
-- **Numbers** — before / after with binary md5 + prompt md5.
-- **Validation path** — which gates ran, what they showed.
-- **Lesson** — the durable insight a future contributor needs.
+- **Date / era** and **commit** (or explicit “verify hash” branch note)
+- **Fixture** — arch, model/quant, prompt or bench identity when known
+- **Lever** — name from `levers.md` or “none”
+- **Disposition** — shipped / reverted / rejected / correctness / harness
+- **Lesson** — what a future contributor must not re-learn the hard way
 
-Negative results (null lift, fake win caught) are equally
-valuable — they save the next person from re-running the same
-experiment. Don't omit them just because they "didn't ship."
+Rules:
+
+- Quote numbers only as **that fixture’s measured record**. Never
+  restate them as current floors or admissions.
+- Rejected and null results stay rejected — do not soften into “maybe
+  ship later” without new dated evidence.
+- Prefer linking methodology and `docs/VALIDATION.md` over inventing a
+  universal gate list here.

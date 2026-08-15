@@ -1,0 +1,26 @@
+=== build start 2026-08-01T13:49:50Z ===
+3783 |     fn contract(&self) -> Option<StreamContract> {
+     |        ^^^^^^^^
+
+warning: `hipfire-cli` (bin "hipfire") generated 4 warnings
+    Finished `release` profile [optimized] target(s) in 42.44s
+cli done
+10308 | fn release_held_finish_tool_calls(
+      |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `hipfire-runtime` (example "daemon") generated 14 warnings (run `cargo fix --example "daemon" -p hipfire-runtime` to apply 1 suggestion)
+    Finished `release` profile [optimized] target(s) in 21.71s
+daemon done
+=== build end 2026-08-01T13:50:55Z ===
+fa7aa7fa257c6e249bc0e25f06908ff4b41d6a9576a6c7f581aea5461e8bdc88  target/release/hipfire
+838034a0efa6acdd172311f5aabe65e61370f59882b2840aa0f158120a800ca8  target/release/examples/daemon
+6a03d862665e7b8237f6eb107af6f151  target/release/hipfire
+ce713501043c4f5775ec87c49779d51c  target/release/examples/daemon
+=== compare to prefix ===
+PRE:
+c1a99f7bd359ac435a1169ba25d85096761a0c757c3c96f6b3381a948acc88d6  /mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/target/release/hipfire
+6207b9a3fe2be4a7719acb34b992d8e7ca84b965fa83166cff0aeca9ed10bc67  /mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/target/release/examples/daemon
+POST:
+fa7aa7fa257c6e249bc0e25f06908ff4b41d6a9576a6c7f581aea5461e8bdc88  target/release/hipfire
+838034a0efa6acdd172311f5aabe65e61370f59882b2840aa0f158120a800ca8  target/release/examples/daemon
+BINARIES DIFFER OK

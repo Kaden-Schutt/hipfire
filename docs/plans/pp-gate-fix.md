@@ -508,7 +508,7 @@ actual case-by-case results here from validation run.]
 ```
 
 After landing locally, open a parallel PR to
-`Kaden-Schutt/hipfire#216` referencing this commit's SHA. The script
+`warpfront/hipfire#216` referencing this commit's SHA. The script
 file is shared between the upstream and this fork; merging upstream
 without this commit landed there will create conflicts on the next
 sync.

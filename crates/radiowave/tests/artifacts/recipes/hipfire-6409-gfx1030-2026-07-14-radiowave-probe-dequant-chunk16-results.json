@@ -1,0 +1,9 @@
+{
+  "external_archive_sha256": "d4d0911e751e891b952f2983c0a78e05c304b854321ce5f438794ca7a8abda2b",
+  "kind": "radiowave_recipe_provenance",
+  "note": "Full raw result history is externally archived; this fixture is a deterministic provenance record only and does not embed measurement rows.",
+  "original_byte_size": 89561,
+  "original_result_path": "examples/hipfire-6409/results/gfx1030/2026-07-14-radiowave-probe-dequant-chunk16/results.json",
+  "original_sha256": "e5028cbf529dc3cb3f66b869cb53f79011dd18d1d6a0086f2a8851a0b143604d",
+  "schema_version": 1
+}

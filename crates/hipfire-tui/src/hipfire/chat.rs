@@ -3,7 +3,6 @@
 // hipfire - see LICENSE and NOTICE in the project root.
 
 use std::{
-    io::{BufRead, BufReader},
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::Sender,
@@ -12,19 +11,23 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
+use hipfire_client::{stream_openai_chat, ClientError, OpenAiSseEvent};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::json;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 #[derive(Debug)]
 pub enum ChatEvent {
-    Delta(String),
+    Reasoning(String),
+    Content(String),
     Done,
     Error(String),
 }
@@ -57,17 +60,8 @@ fn stream_chat_inner(
     tx: &Sender<ChatEvent>,
     abort: &Arc<AtomicBool>,
 ) -> Result<()> {
-    let url = format!("http://{host}:{port}/v1/chat/completions");
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(600))
-        // Per-read bound: a stalled socket (half-open TCP, server hang) errors out
-        // within this window instead of parking the worker thread for the full
-        // total timeout — paired with the optimistic UI abort in request_abort.
-        .timeout_read(Duration::from_secs(120))
-        .build();
     let mut body = json!({
         "model": model,
-        "stream": true,
         "messages": messages,
     });
     // Per-session sampling overrides (set via /temp and /top_p).
@@ -77,74 +71,96 @@ fn stream_chat_inner(
     if let Some(p) = top_p {
         body["top_p"] = json!(p);
     }
-    let resp = match agent
-        .post(&url)
-        .set("Content-Type", "application/json")
-        .send_string(&body.to_string())
-    {
-        Ok(resp) => resp,
-        Err(ureq::Error::Status(code, resp)) => {
-            let text = resp.into_string().unwrap_or_default();
-            return Err(anyhow!(
-                "HTTP {code}: {}",
-                text.chars().take(240).collect::<String>()
-            ));
+    match stream_openai_chat(
+        host,
+        port,
+        body,
+        Duration::from_secs(600),
+        |event| {
+            match event {
+                OpenAiSseEvent::Reasoning { text } => {
+                    let _ = tx.send(ChatEvent::Reasoning(text));
+                }
+                OpenAiSseEvent::Content { text } => {
+                    let _ = tx.send(ChatEvent::Content(text));
+                }
+                OpenAiSseEvent::Role { .. }
+                | OpenAiSseEvent::ToolCall { .. }
+                | OpenAiSseEvent::Finish { .. }
+                | OpenAiSseEvent::Usage { .. }
+                | OpenAiSseEvent::Done => {}
+            }
+            Ok(())
+        },
+        || abort.load(Ordering::Relaxed),
+    ) {
+        Ok(()) => {
+            let _ = tx.send(ChatEvent::Done);
+            Ok(())
         }
-        Err(err) => return Err(anyhow!(err.to_string())),
-    };
+        // Explicit client cancel (Esc) is not an error and is never retried.
+        Err(ClientError::Cancelled) => {
+            let _ = tx.send(ChatEvent::Done);
+            Ok(())
+        }
+        Err(err) => Err(err.into()),
+    }
+}
 
-    let reader = BufReader::new(resp.into_reader());
-    for line in reader.lines() {
-        // Cooperative cancel: checked once per streamed line, so an in-flight
-        // generation stops within ~one token of the user pressing Esc. The
-        // partial reply already streamed stays on screen.
-        if abort.load(Ordering::Relaxed) {
-            let _ = tx.send(ChatEvent::Done);
-            return Ok(());
-        }
-        let line = line?;
-        let trimmed = line.trim();
-        if !trimmed.starts_with("data:") {
-            continue;
-        }
-        let payload = trimmed.trim_start_matches("data:").trim();
-        if payload == "[DONE]" {
-            let _ = tx.send(ChatEvent::Done);
-            return Ok(());
-        }
-        let Ok(value) = serde_json::from_str::<Value>(payload) else {
-            continue;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chat_message_reasoning_serialization() {
+        // None is omitted; Some is emitted as reasoning_content.
+        let msg_none = ChatMessage {
+            role: "assistant".into(),
+            content: "answer".into(),
+            reasoning_content: None,
         };
-        if let Some(err) = value.get("error") {
-            let msg = err
-                .get("message")
-                .and_then(Value::as_str)
-                .or_else(|| err.as_str())
-                .unwrap_or("server error")
-                .to_string();
-            return Err(anyhow!(msg));
-        }
-        let Some(delta) = value
-            .get("choices")
-            .and_then(|c| c.get(0))
-            .and_then(|c| c.get("delta"))
-        else {
-            continue;
+        let v = serde_json::to_value(&msg_none).unwrap();
+        assert_eq!(v["role"], "assistant");
+        assert_eq!(v["content"], "answer");
+        assert!(v.get("reasoning_content").is_none(), "None must not serialize");
+
+        let msg_some = ChatMessage {
+            role: "assistant".into(),
+            content: "answer".into(),
+            reasoning_content: Some("think".into()),
         };
-        // Coalesce reasoning + content into ONE Delta per chunk so the UI's
-        // delta-count token proxy isn't double-counted for reasoning models.
-        let mut chunk = String::new();
-        if let Some(text) = delta.get("reasoning_content").and_then(Value::as_str) {
-            chunk.push_str(text);
-        }
-        if let Some(text) = delta.get("content").and_then(Value::as_str) {
-            chunk.push_str(text);
-        }
-        if !chunk.is_empty() {
-            let _ = tx.send(ChatEvent::Delta(chunk));
-        }
+        let v = serde_json::to_value(&msg_some).unwrap();
+        assert_eq!(v["reasoning_content"], "think");
+        assert_eq!(v["content"], "answer");
+
+        // Deserializing legacy JSON without the field yields None.
+        let legacy: ChatMessage = serde_json::from_value(serde_json::json!({
+            "role": "assistant",
+            "content": "hello"
+        }))
+        .unwrap();
+        assert!(legacy.reasoning_content.is_none());
+
+        // Deserializing with reasoning_content populates it.
+        let with_reasoning: ChatMessage = serde_json::from_value(serde_json::json!({
+            "role": "assistant",
+            "content": "hello",
+            "reasoning_content": "plan"
+        }))
+        .unwrap();
+        assert_eq!(with_reasoning.reasoning_content.as_deref(), Some("plan"));
     }
 
-    let _ = tx.send(ChatEvent::Done);
-    Ok(())
+    #[test]
+    fn chat_message_reasoning_empty_string_round_trips_but_omits_on_none() {
+        // Some("") serializes as empty string (not omitted by is_none; caller should use None for empty).
+        // The TUI fold normalizes empty to None before storing.
+        let msg_empty = ChatMessage {
+            role: "assistant".into(),
+            content: "answer".into(),
+            reasoning_content: Some(String::new()),
+        };
+        let v = serde_json::to_value(&msg_empty).unwrap();
+        assert_eq!(v["reasoning_content"], "");
+    }
 }

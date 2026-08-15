@@ -52,7 +52,9 @@ use rdna_compute::Gpu;
 fn verify_sequential() -> bool {
     use std::sync::OnceLock;
     static F: OnceLock<bool> = OnceLock::new();
-    *F.get_or_init(|| std::env::var("HIPFIRE_QWEN2_VERIFY_SEQ").as_deref() == Ok("1"))
+    *F.get_or_init(|| {
+        hipfire_config::developer_var("HIPFIRE_QWEN2_VERIFY_SEQ").as_deref() == Ok("1")
+    })
 }
 
 /// Qwen2 verify scratch: nothing persistent. The verify reuses the bundle's own
@@ -73,11 +75,12 @@ impl SpecTarget for Qwen2Bundle {
         self
     }
 
-    fn reset_recurrent(&mut self, _gpu: &mut Gpu) {
+    fn reset_recurrent(&mut self, _gpu: &mut Gpu) -> Result<(), String> {
         // Pure attention: no recurrent state to zero. Rewind the KV position
         // cursor so the next prefill writes from slot 0 (O(1); KV is overwritten
         // in place). Mirrors the daemon's arch_id=7 reset handler.
         self.state.reset();
+        Ok(())
     }
 
     fn new_spec_scratch(
@@ -112,10 +115,14 @@ impl SpecTarget for Qwen2Bundle {
                 .map_err(|e| format!("{e:?}"))?;
         }
         // forward_step leaves the last position's logits in state.logits.
+        // GPU-only argmax — no host row materialised here.
         let last_argmax = gpu
             .argmax_f32(&self.state.logits, self.config.vocab_size)
             .map_err(|e| format!("{e:?}"))?;
-        Ok(SpecAdvance::Ready { last_argmax })
+        Ok(SpecAdvance::Ready {
+            last_argmax,
+            last_logits: None,
+        })
     }
 
     fn verify_block(

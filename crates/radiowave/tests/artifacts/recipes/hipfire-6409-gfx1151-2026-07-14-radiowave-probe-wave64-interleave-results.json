@@ -1,0 +1,9 @@
+{
+  "external_archive_sha256": "d4d0911e751e891b952f2983c0a78e05c304b854321ce5f438794ca7a8abda2b",
+  "kind": "radiowave_recipe_provenance",
+  "note": "Full raw result history is externally archived; this fixture is a deterministic provenance record only and does not embed measurement rows.",
+  "original_byte_size": 90983,
+  "original_result_path": "examples/hipfire-6409/results/gfx1151/2026-07-14-radiowave-probe-wave64-interleave/results.json",
+  "original_sha256": "3c49ed975203ea244098e1f687179b37ab818dd043d2c025998e87bb1f64e4a3",
+  "schema_version": 1
+}

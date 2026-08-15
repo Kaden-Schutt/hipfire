@@ -2,7 +2,7 @@
 
 **Branch:** `feature/ship-4.1-moe-family-resolution` off `integration/dispatch-unification`
 (per `feedback_branch_per_feature`).
-**Tracking:** [#397](https://github.com/Kaden-Schutt/hipfire/issues/397) Step 4.1.
+**Tracking:** [#397](https://github.com/warpfront/hipfire/issues/397) Step 4.1.
 **Owner:** Kevin — **taken over from Nick** (Kevin aligns with Nick out-of-band). Fork (ii)
 edits `families/moe.rs` **and** `pipeline/mod.rs` (the MoE dispatch core, normally Nick's Ship-4
 surface), so this is a deliberate cross-lane takeover, not a qwen35-only cut. See Ownership note.

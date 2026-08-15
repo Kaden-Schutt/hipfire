@@ -206,6 +206,7 @@ pub(crate) fn paro_load_moe_ffn(
     Ok(MoeFfnWeights {
         router,
         experts,
+        packed_expert_owners: None,
         shared_expert,
         shared_expert_gate,
         expert_gate_up_ptrs,
@@ -215,5 +216,7 @@ pub(crate) fn paro_load_moe_ffn(
         layer_idx,
         expert_shape: None,
         paro_shared: Some(shared),
+        global_expert_dtypes: None,
+        ep_dummy_buffers: Vec::new(),
     })
 }

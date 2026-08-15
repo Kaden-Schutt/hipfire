@@ -1,0 +1,76 @@
+=== arrival hashes ===
+4c89628621803f578f11c67f30d627c89ed9caafaaba6e9c81f76d2e1b228f0b  /mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-build/campaign-tracked.patch
+1073c55755e14625dc624e1f964ba63633d145989e5a9b9e0e9bcea9addf7c1c  /mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-build/campaign-untracked.tgz
+=== expected ===
+4c89628621803f578f11c67f30d627c89ed9caafaaba6e9c81f76d2e1b228f0b  campaign-tracked.patch
+1073c55755e14625dc624e1f964ba63633d145989e5a9b9e0e9bcea9addf7c1c  campaign-untracked.tgz
+HASHES_OK
+=== git apply --check ===
+CHECK_OK
+=== git apply ===
+APPLY_OK
+=== tar xzf untracked ===
+TAR_OK
+=== porcelain ===
+ M crates/hipfire-cli/src/main.rs
+ M crates/rdna-compute/src/feature_flags.rs
+ M crates/rdna-compute/src/gemm.rs
+ M crates/rdna-compute/src/gemv.rs
+ M crates/rdna-compute/src/kernels.rs
+?? .omp/
+?? benchmarks/prompts/ds4-gfx942-ar-2048.source.txt
+?? crates/hipfire-runtime/examples/ds4_prompt_fixture.rs
+?? kernels/src/deepseek4_topk_kv_gather_tiled.gfx1151.hip
+?? kernels/src/gemm_mq2g256_lloyd_moe_grouped_mfma.gfx942.hip
+?? kernels/src/gemv_mfp3g32_e8.hip
+?? kernels/src/gemv_mfp4g32_e8_soa.gfx942.hip
+?? kernels/src/gemv_mfp4g32_e8_soa_fp8_mfma.gfx942.hip
+?? kernels/src/gemv_mfp4g32_e8_soa_grouped.gfx942.hip
+?? kernels/src/gemv_mfp4g32_e8_soa_u4_buffer.hip
+?? kernels/src/gemv_mq2g256_lloyd_moe_down_allranks.gfx942.hip
+?? kernels/src/gemv_mq2g256_lloyd_moe_down_expanded_k4.gfx942.hip
+?? kernels/src/gemv_mq2g256_lloyd_moe_down_indexed.gfx942.hip
+?? kernels/src/gemv_mq2g256_lloyd_moe_down_indexed_mfma.gfx942.hip
+?? kernels/src/gemv_mq2g256_lloyd_moe_down_indexed_mfma_f16.gfx942.hip
+?? kernels/src/gemv_mq2g256_lloyd_moe_gate_up_indexed.gfx942.hip
+?? kernels/src/gemv_mq2g256_lloyd_moe_gate_up_indexed_mfma.gfx942.hip
+?? kernels/src/gemv_mq2g256_lloyd_moe_gate_up_indexed_mfma_f16.gfx942.hip
+?? kernels/src/gfx1151_xor_shuffle.h
+?? kernels/src/indexer_top_k_buf_bounded.gfx1151.hip
+?? kernels/src/indexer_top_k_buf_unrolled.gfx1151.hip
+?? kernels/src/mq_rotate_x.gfx942.hip
+=== porcelain count ===
+27
+=== diff sha256 ===
+403be49e54400be70d433225879bf3f5c0eb5985ddb68a27428beee8a675ae4c  -
+=== gfx942 kernel files ===
+kernels/src/fused_gate_up_hfq4g256_v2.gfx942.hip
+kernels/src/fused_qkv_hfq4g256_v2.gfx942.hip
+kernels/src/fused_qkvza_hfq4g256_v2.gfx942.hip
+kernels/src/gemm_bf16_mfma.gfx942.hip
+kernels/src/gemm_hfq4g256_residual_mfma.gfx942.hip
+kernels/src/gemm_hfq4g256_residual_mfma_v2.gfx942.hip
+kernels/src/gemm_hfq4g256_residual_mfma_v3.gfx942.hip
+kernels/src/gemm_hfq4g256_residual_mfma_v4.gfx942.hip
+kernels/src/gemm_mq2g256_lloyd_moe_grouped_mfma.gfx942.hip
+kernels/src/gemv_hfq4g256_residual.gfx942.hip
+kernels/src/gemv_hfq4g256_residual_v2.gfx942.hip
+kernels/src/gemv_hfq4g256_residual_v3.gfx942.hip
+kernels/src/gemv_mfp4g32_e8_soa.gfx942.hip
+kernels/src/gemv_mfp4g32_e8_soa_fp8_mfma.gfx942.hip
+kernels/src/gemv_mfp4g32_e8_soa_grouped.gfx942.hip
+kernels/src/gemv_mq2g256_lloyd_moe_down_allranks.gfx942.hip
+kernels/src/gemv_mq2g256_lloyd_moe_down_expanded_k4.gfx942.hip
+kernels/src/gemv_mq2g256_lloyd_moe_down_indexed.gfx942.hip
+kernels/src/gemv_mq2g256_lloyd_moe_down_indexed_mfma.gfx942.hip
+kernels/src/gemv_mq2g256_lloyd_moe_down_indexed_mfma_f16.gfx942.hip
+kernels/src/gemv_mq2g256_lloyd_moe_gate_up_indexed.gfx942.hip
+kernels/src/gemv_mq2g256_lloyd_moe_gate_up_indexed_mfma.gfx942.hip
+kernels/src/gemv_mq2g256_lloyd_moe_gate_up_indexed_mfma_f16.gfx942.hip
+kernels/src/mq_rotate_x.gfx942.hip
+kernels/src/rmsnorm_reduce.gfx942.hip
+kernels/src/rotate_with_rms.gfx942.hip
+=== gfx942 count ===
+26
+=== original WIP still 238? ===
+WIP=238

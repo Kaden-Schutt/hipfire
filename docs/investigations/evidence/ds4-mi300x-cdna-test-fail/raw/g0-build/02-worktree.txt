@@ -1,0 +1,17 @@
+=== existing worktrees ===
+/root/hipfire-work/ds4-gfx942-port  d4ab7434 [ds4-gfx1151-opt]
+=== branch check ===
+branch_absent
+=== create worktree ===
+Preparing worktree (new branch 'codex/ds4-mi300x-agentmaxx')
+HEAD is now at d4ab7434 Merge origin/beta into ds4-gfx1151-opt
+=== new worktree status ===
+d4ab7434a9dad15d0bf6456c8f3c12779ac0edb5
+0
+On branch codex/ds4-mi300x-agentmaxx
+nothing to commit, working tree clean
+d4ab7434 Merge origin/beta into ds4-gfx1151-opt
+=== original WIP porcelain after worktree add ===
+WIP_AFTER=238
+/root/hipfire-work/ds4-gfx942-port              d4ab7434 [ds4-gfx1151-opt]
+/mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx  d4ab7434 [codex/ds4-mi300x-agentmaxx]

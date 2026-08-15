@@ -1,0 +1,6 @@
+--- A-2052-mcp2048-default mcp=default ---
+{"type":"commit_ready","id":"g0-A-2052-mcp2048-default","tokens":32,"tok_s":2.2917711093604525,"prompt_tokens":2052,"prefill_tokens":2052,"cached_tokens":0,"prefill_ms":20838,"total_ms":34801,"finish_reason":"length","drafter":"ar","attempt_id":1}
+--- B-2052-mcp8192 mcp=8192 ---
+--- C-under-mcp2048 mcp=default ---
+{"type":"commit_ready","id":"g0-C-under-mcp2048","tokens":32,"tok_s":32.9557157569516,"prompt_tokens":1903,"prefill_tokens":1903,"cached_tokens":0,"prefill_ms":19270,"total_ms":20241,"finish_reason":"length","drafter":"ar","attempt_id":1}
+CLIFFDONE
