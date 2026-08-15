@@ -117,15 +117,14 @@ pub fn redline_append_tensor_slice(
     offset: usize,
     len: usize,
 ) -> Result<(), String> {
-    let start = output.len();
-    output.resize(start + len, 0);
-    // Slice copy via temporary buffer mapping — verbatim relocation, no reformatting.
-    gpu.hip
-        .memcpy_dtoh(&mut output[start..], &tensor.buf)
-        .map_err(|e| e.to_string())?;
-    // Truncate to requested slice if underlying buffer larger; original helper
-    // did offset/len via raw hip memcpy with offset. For now we capture full
-    // buffer as the neutral primitive; arch-specific slicing stays in daemon.
-    let _ = offset;
-    Ok(())
+    if offset.saturating_add(len) > tensor.numel() {
+        return Err(format!(
+            "redline tensor slice {}+{} exceeds {}",
+            offset,
+            len,
+            tensor.numel()
+        ));
+    }
+    let view = tensor.sub_offset(offset, len);
+    redline_append_buffer(gpu, output, &view.buf)
 }
