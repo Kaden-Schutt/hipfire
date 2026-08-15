@@ -6735,11 +6735,12 @@ fn apply_reasoning_request(
                 request["reasoning_effort"] = serde_json::json!("none");
                 return Ok(());
             }
-            // low is uncapped: the Jinja brief-thought instruction is the
-            // low-effort mechanism, and a hard cap force-closes </think>
-            // mid-derivation on hard prompts. med/high keep safety caps.
+            // low/med are uncapped: the Jinja instruction is the effort
+            // mechanism (medium injects none, matching the uncapped
+            // effort-less baseline), and a hard cap force-closes </think>
+            // mid-derivation on hard prompts. high keeps a safety cap.
             "low" => 0,
-            "med" => 2048,
+            "med" => 0,
             "high" => 8192,
             "xhigh" => 24576,
             "max" => 32768,
@@ -6815,17 +6816,19 @@ fn apply_http_reasoning_request(
     request["assistant_prefix"] = serde_json::json!("open_think");
     if let Some(effort) = effort {
         if !deepseek4_effort_contract {
-            // Budget ladder: low/medium/high get a safety cap, xhigh-class
-            // stays uncapped so the xhigh instruction decides the natural
-            // endpoint. `minimal`/`low` are ALSO uncapped: the template's
-            // brief-thought instruction is the low-effort mechanism, and the
-            // previous 512 cap force-closed </think> mid-derivation on hard
-            // prompts (measured: 12-coin plan cut at ~523 think tokens, tank
-            // rates cut mid-list). The earlier ladder (64/256/1024/4096) was
-            // worse (low cut at "(3" mid-derivation).
+            // Budget ladder: high gets a safety cap, everything else is
+            // instruction-steered and uncapped so the effort instruction
+            // decides the natural endpoint. `minimal`/`low` and
+            // `medium`/`med` were hard-capped (512 / 2048); both
+            // force-closed </think> mid-derivation on hard prompts
+            // (measured live: 12-coin plan cut at ~523, the three-gods
+            // puzzle cut at ~2048 mid-case-analysis). `medium` injects no
+            // instruction, so it must match the effort-less baseline, which
+            // is uncapped by config. The earlier ladder (64/256/1024/4096)
+            // was worse (low cut at "(3" mid-derivation).
             let max_think = match effort {
                 "minimal" | "low" => 0,
-                "medium" | "med" => 2048,
+                "medium" | "med" => 0,
                 "high" => 8192,
                 "xhigh" | "max" | "uncapped" => 0,
                 other => bail!("unknown reasoning effort '{other}'"),
@@ -11901,6 +11904,8 @@ mod tests {
         assert_eq!(minimal["max_think_tokens"], 0);
         assert_eq!(minimal["chat_template_kwargs"]["reasoning_effort"], "minimal");
 
+        // medium/med follow low: instruction-steered (no instruction for
+        // medium), uncapped — matches the effort-less baseline.
         let mut medium = serde_json::json!({});
         apply_http_reasoning_request(
             &serde_json::json!({ "reasoning_effort": "medium" }),
@@ -11909,7 +11914,8 @@ mod tests {
             false,
         )
         .unwrap();
-        assert_eq!(medium["max_think_tokens"], 2048);
+        assert_eq!(medium["max_think_tokens"], 0);
+        assert_eq!(medium["chat_template_kwargs"]["reasoning_effort"], "medium");
 
         // xhigh is uncapped: the template instruction decides the endpoint.
         let mut uncapped = serde_json::json!({});
@@ -11939,7 +11945,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(kwargs["reasoning_effort"], "medium");
-        assert_eq!(kwargs["max_think_tokens"], 2048);
+        assert_eq!(kwargs["max_think_tokens"], 0);
         assert_eq!(kwargs["chat_template_kwargs"]["preserve_thinking"], true);
         assert_eq!(kwargs["chat_template_kwargs"]["reasoning_effort"], "medium");
 

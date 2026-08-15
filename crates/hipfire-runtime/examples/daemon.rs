@@ -14805,7 +14805,7 @@ fn main() {
                 // Triggered from the CLI by per-model `max_think_tokens` config,
                 // OpenAI `chat_template_kwargs.enable_thinking=false` (cap=1),
                 // and `reasoning.effort` (none/off/chat=1, minimal/low=0
-                // instruction-steered, medium/med=2048, high=8192,
+                // and medium/med=0 instruction-steered, high=8192,
                 // xhigh/max/uncapped=0). The
                 // matching effort is forwarded into the Jinja render
                 // (qwen_jinja_reasoning → JinjaChatFrame.reasoning_effort); the
