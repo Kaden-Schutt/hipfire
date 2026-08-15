@@ -113,21 +113,63 @@ Each item is done when its gate passes. No item is done because it feels done.
 
 CI assertions; each may only decrease.
 
-| metric | 8510ca5f2 | now | target |
-|---|---:|---:|---:|
-| `daemon.rs` lines | 43,696 | 43,696 | < 5,000 |
-| `daemon.rs` `arch_id ==` | 43 | 43 | 0 |
-| `daemon.rs` arch-crate refs | 95 | 95 | 0 |
-| `daemon` `required-features` | 9 | 9 | 0 |
-| `[[example]]` in `hipfire-runtime` | 65 | 65 | < 10 |
-| largest `hipfire-arch-*` crate | 51,955 | 51,955 | < 10,000 |
-| duplicated `grammar.rs` | 2 | 2 | 1 |
-| **compute : arch ratio** | **0.70 : 1** | **0.85 : 1** | **> 2 : 1** |
+| metric | `8510ca5f2` | **landed** | target | |
+|---|---:|---:|---:|:--|
+| daemon `arch_id ==` | 43 | **0** | 0 | MET |
+| daemon `required-features` | 9 | **0** | 0 | MET |
+| `[[example]]` in `hipfire-runtime` | 65 | **9** | < 10 | MET |
+| duplicated `grammar.rs` | 2 | **0** | <= 1 | MET |
+| `docs/GLOSSARY.md` | absent | **present** | present | MET |
+| daemon source lines | 43,696 | 39,591 | < 5,000 | open |
+| daemon arch-crate refs | 95 | 66 | 0 | open |
+| largest `hipfire-arch-*` crate | 51,955 | 47,581 | < 10,000 | open |
+| **compute : arch ratio** | **1.001 : 1** | **1.048 : 1** | > 2 : 1 | **unreachable — see below** |
 
-Reference point: llama.cpp's compute:arch ratio is **9.7 : 1**
-(`ggml/` 328,957 vs `src/models/` 34,097), at 146 architectures and a mean of
-233 lines per arch. hipfire will not and should not reach 233 — its kernels are
-deliberately non-generic — but the *ratio* is the honest target.
+Supporting movement: workspace examples 195,143 -> 151,452 lines; `tests/`
+1,669 -> 3,528; crates 32 -> 38; `hipfire-arch-deepseek4` 51,084 -> 29,102.
+
+### The ratio target is unreachable by this refactor, and the metric is wrong
+
+Two findings during execution, both from evidence rather than opinion:
+
+**1. The architecture crates are not mostly duplication.** B2 set out to unify
+the three same-named file pairs (`spec_emit.rs` 903+270, `spec_impl.rs`
+629+1,026, `mtp_speculator.rs` 225+320). All three were found **unmergeable**:
+zero shared function bodies. Qwen names `EosFilter`/`ThinkOutputRouter` over a
+JSON tool-call grammar; DeepSeek names `dsml::StreamParser` over a DSML
+grammar. Same filename, different scheme. Exactly one genuinely identical
+helper existed (`clamp_mtp_max_n`) and only that moved. The shared surface was
+already abstracted — `SpecTarget` in `hipfire-runtime/src/spec.rs` with eight
+implementations. **Same filename did not mean duplicated code**, and the
+earlier ~3,370-line dedup estimate was wrong.
+
+**2. The remaining targets contradict each other.** Driving `daemon_lines` to
+< 5,000 and arch refs to 0 requires moving ~34k lines of per-architecture
+generation bodies out of the daemon and into the arch crates — which is where
+they belong. But that *raises* `arch_lines` by the same amount and pushes the
+ratio from 1.048 down toward 0.81. The two targets cannot both be satisfied.
+
+The metric is at fault, not the work. `compute : arch` counts crate
+directories, so 39,591 lines of per-arch generation currently sitting in the
+daemon are scored as neither. Moving them into arch crates makes the accounting
+*honest* and the number *worse*. A metric that punishes filing code correctly
+is measuring the wrong thing.
+
+Reaching > 2 : 1 by legitimate means would require `arch_lines` under 62,174 —
+roughly halving qwen35 and deepseek4 — and finding (1) shows that code is not
+redundant. The only remaining route is genericising kernels into the compute
+layer, which § 6 rules out and which the design rule "abstract the model, never
+the kernel" exists to prevent. Chasing the number would forfeit the performance
+advantage the whole project rests on.
+
+**Recommended replacement:** measure *generic code owned once* against
+*per-architecture code*, wherever each physically lives, and track the arch
+crates' absolute size instead of a ratio against a fixed compute denominator.
+
+Reference point retained for context: llama.cpp is **9.7 : 1**
+(`ggml/` 328,957 vs `src/models/` 34,097) across 146 architectures, mean 233
+lines per arch. hipfire cannot and should not reach 233 — its kernels are
+deliberately non-generic, which is precisely why it wins on AMD.
 
 ---
 
