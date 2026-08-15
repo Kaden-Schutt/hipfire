@@ -1105,6 +1105,18 @@ pub static FIELDS: &[ConfigField] = &[
         "Eviction hysteresis."
     ),
     field!(
+        "memory.cask.handoff_tokens",
+        "cask_handoff_tokens",
+        Memory,
+        ModelLoad,
+        DefaultValue::Integer(0),
+        ValueRule::Integer { min: 0, max: 1048576 },
+        true,
+        false,
+        None,
+        "One-way kv_adaptive to plain TriAttention handoff position; zero disables it."
+    ),
+    field!(
         "memory.cask.core_fraction",
         "cask_core_frac",
         Memory,

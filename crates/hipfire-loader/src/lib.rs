@@ -1027,6 +1027,7 @@ fn rollback_unfinished_qwen35(
 fn build_qwen35_eviction(
     config: &hipfire_arch_qwen35::qwen35::Qwen35Config,
     physical_cap: usize,
+    activation_gate: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ctx: &mut LoadCtx,
 ) -> Result<Option<Eviction>, String> {
     use hipfire_arch_qwen35::qwen35::LayerType;
@@ -1066,7 +1067,7 @@ fn build_qwen35_eviction(
         return Ok(None);
     }
     let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
-    let base = EvictionCtx::new(
+    let mut base = EvictionCtx::new(
         ctx.gpu,
         &centers,
         fa_layer_ids,
@@ -1080,6 +1081,9 @@ fn build_qwen35_eviction(
         physical_cap,
     )
     .map_err(|e| format!("build EvictionCtx: {e}"))?;
+    if let Some(gate) = activation_gate {
+        base.set_activation_gate(gate);
+    }
     if ctx.cask.cask_m_folding {
         eprintln!(
             "  eviction: CASK α={:.2} m={} budget={} β={} physical_cap={}",
@@ -1116,7 +1120,11 @@ fn finish_qwen35_load(
 ) -> Result<LoadedModel, String> {
     // ── Eviction (only hard-error stage before publish) ────────────
     // Built before long-lived borrows so rollback can move `bundle`.
-    let eviction = match build_qwen35_eviction(&bundle.config, physical_cap, ctx) {
+    let activation_gate = bundle
+        .kv_adaptive
+        .as_ref()
+        .and_then(|adaptive| adaptive.eviction_gate());
+    let eviction = match build_qwen35_eviction(&bundle.config, physical_cap, activation_gate, ctx) {
         Ok(e) => e,
         Err(e) => {
             return Err(rollback_unfinished_qwen35(
