@@ -1000,6 +1000,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-engine"
+version = "0.3.0"
+dependencies = [
+ "hip-bridge",
+ "hipfire-config",
+ "hipfire-dispatch",
+ "hipfire-loader",
+ "hipfire-runtime",
+ "rdna-compute",
+ "saddle-core",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "hipfire-loader"
 version = "0.3.0"
 dependencies = [
@@ -1100,6 +1116,7 @@ dependencies = [
  "hipfire-config",
  "hipfire-detect",
  "hipfire-dispatch",
+ "hipfire-engine",
  "hipfire-loader",
  "hipfire-pflash",
  "libc",

@@ -33,6 +33,7 @@ members = [
     "crates/hipfire-tui",
     "crates/hipfire-reap",
     "crates/hipfire-loader",
+    "crates/hipfire-engine",
     "crates/hipfire-config",
     "crates/hipfire-registry",
     "crates/hipfire-cli",
