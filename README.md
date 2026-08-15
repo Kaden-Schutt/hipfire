@@ -117,7 +117,7 @@ OpenAI-compatible client.
 
 ## Curated model registry
 
-The registry currently contains 54 pullable model entries. Run
+The registry currently contains 61 pullable model entries. Run
 `hipfire list -r` to see the authoritative live list.
 
 | Registry family | Pull tags and variants |
@@ -126,6 +126,8 @@ The registry currently contains 54 pullable model entries. Run
 | Qwen 3.5 MoE | `qwen3.5:35b-a3b` |
 | Qwen 3.6 dense | `qwen3.6:27b`, `qwen3.6:27b-mq3`, `qwen3.6:27b-draft`, `qwen3.6:27b-draft-mq3` |
 | Qwen 3.6 35B-A3B | `qwen3.6:35b-a3b` (MQ4P default), `qwen3.6:35b-a3b-mq2`, `qwen3.6:35b-a3b-mq3p`, `qwen3.6:35b-a3b-mq4p`, `qwen3.6:35b-a3b-mfp4`, `qwen3.6:35b-a3b-mq4r`, `qwen3.6:35b-a3b-mq5`, `qwen3.6:35b-a3b-mq6` |
+| Qwen 3.8 dense | `qwen3.8:27b` (MQ4 quality trunk, default), `qwen3.8:27b-fast` (MQ4R speed SKU) |
+| Muse Glimmer | `muse-glimmer` (MQ4 quality trunk), `muse-glimmer:fast` (MQ4R speed SKU), `muse-glimmer:draft` |
 | DeepSeek V4 Flash | `deepseek-v4-flash` |
 | MiniMax-M2.7 | `minimax-m2.7` |
 | North-Mini-Code-1.0 | `north-mini-code` |
@@ -136,8 +138,8 @@ The registry currently contains 54 pullable model entries. Run
 | NEX N2 Mini | `nex-n2:mini` |
 | VibeThinker-3B | `vibethinker:3b`, `vibethinker:3b-mq6` |
 
-Common aliases include `qwen3.5`, `qwen3.6`, `qwen3`, `carnice`,
-`qwopus`, `deepseek4`, `deepseek-v4`, and `vibethinker`.
+Common aliases include `qwen3.5`, `qwen3.6`, `qwen3.8`, `qwen3`, `carnice`,
+`qwopus`, `deepseek4`, `deepseek-v4`, `muse-glimmer`, and `vibethinker`.
 
 Carnice uses the Hermes tool-call format. Plain Qwen 3.5 and 3.6 use
 their native Qwen XML tool-call format.

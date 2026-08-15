@@ -755,6 +755,16 @@ mod tests {
         assert_eq!(model.arch_id, Some(5));
         assert_eq!(model.quant.as_deref(), Some("mq4"));
         assert_eq!(model.default_kv_mode.as_deref(), Some("q8"));
+        // Content identity: the entry previously carried the MQ4R artifact's
+        // digest/size under the `.mq4` filename, and every other assertion in
+        // this test still passed. Pin sha256 + size_bytes so that swap cannot
+        // slip through again.
+        assert_eq!(
+            model.sha256.as_deref(),
+            Some("d220334acc374548ad8582ba24d4ca5f7d94622d6f8c10268be75e5ee0aee4f6")
+        );
+        assert_eq!(model.size_bytes, Some(15655791616));
+
 
         for alias in ["qwen3.8", "qwen3.8:latest"] {
             let (resolved, _) = registry
@@ -765,6 +775,37 @@ mod tests {
                 "{alias} resolves to the canonical tag"
             );
         }
+
+        // The speed SKU is a distinct entry on the MQ4R artifact, not an alias
+        // of the trunk.
+        let (fast_tag, fast) = registry.model("qwen3.8:27b-fast").unwrap();
+        assert_eq!(fast_tag, "qwen3.8:27b-fast");
+        assert_eq!(fast.file, "qwen3.8-27b.mq4r");
+        assert_eq!(fast.arch_id, Some(5));
+        assert_eq!(fast.quant.as_deref(), Some("mq4r"));
+        assert_eq!(fast.default_kv_mode.as_deref(), Some("q8"));
+        assert_eq!(
+            fast.sha256.as_deref(),
+            Some("61072980798ac1d3325020a63171d1a9cf99103eaa5bb1675a37845ea7d7762e")
+        );
+        assert_eq!(fast.size_bytes, Some(14980361216));
+        assert_ne!(
+            fast.file, model.file,
+            "the two SKUs are different artifacts"
+        );
+        assert_ne!(
+            fast.sha256, model.sha256,
+            "the two SKUs must not share a content digest"
+        );
+
+        let (fast_alias, _) = registry
+            .model("qwen3.8:fast")
+            .expect("qwen3.8:fast must resolve");
+        assert_eq!(
+            fast_alias, "qwen3.8:27b-fast",
+            "qwen3.8:fast resolves to the speed SKU"
+        );
+
 
         let settings = model
             .recommended_settings
@@ -810,6 +851,22 @@ mod tests {
         );
         assert_eq!(
             layer.get("generation.max_tokens"),
+            Some(&ConfigValue::Integer(81920))
+        );
+        // Tag policy keys off the family before ':' and excludes only draft/dflash
+        // tags, so the fast SKU receives the same VMM + 262K + 81920 lowers.
+        let fast_layer = config_layer_for_tag(fast_tag, fast)
+            .expect("qwen3.8:27b-fast tag policy lowers cleanly");
+        assert_eq!(
+            fast_layer.get("memory.kv_backend"),
+            Some(&ConfigValue::String("vmm".into()))
+        );
+        assert_eq!(
+            fast_layer.get("memory.max_seq"),
+            Some(&ConfigValue::Integer(262144))
+        );
+        assert_eq!(
+            fast_layer.get("generation.max_tokens"),
             Some(&ConfigValue::Integer(81920))
         );
         assert_eq!(
@@ -884,6 +941,10 @@ mod tests {
             registry.resolve_tag("qwen3.6-35b-a3b.mq4r"),
             "qwen3.6:35b-a3b-mq4r"
         );
+        assert_eq!(registry.resolve_tag("qwen3.8-27b.mq4"), "qwen3.8:27b");
+        assert_eq!(registry.resolve_tag("qwen3.8-27b.mq4r"), "qwen3.8:27b-fast");
+        assert_eq!(registry.resolve_tag("qwen3.8:fast"), "qwen3.8:27b-fast");
+
         assert_eq!(registry.resolve_tag("deepseek4"), "deepseek-v4-flash");
         assert_eq!(registry.resolve_tag("deepseek4:0731"), "deepseek-v4-flash");
         // `:mq2r` names now land on the default tag, since MQ2R *is* the default.

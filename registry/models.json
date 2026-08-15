@@ -698,10 +698,40 @@
     "qwen3.8:27b": {
       "repo": "hipfire-models/qwen3.8-27b",
       "file": "qwen3.8-27b.mq4",
-      "size_gb": 15.0,
+      "size_gb": 15.66,
+      "min_vram_gb": 17,
+      "default_kv_mode": "q8",
+      "desc": "Qwen3.8 27B MQ4 text tower, native 262K context, xhigh thinking default. Quality trunk; qwen3.8:27b-fast is the cheaper MQ4R speed SKU. Validated on gfx1100/gfx1201.",
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.0,
+        "reasoning_effort": "xhigh",
+        "thinking_budget": "uncapped"
+      },
+      "sampling_profiles": {
+        "general": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0,
+          "reasoning_effort": "xhigh",
+          "thinking_budget": "uncapped"
+        }
+      }
+    },
+    "qwen3.8:27b-fast": {
+      "repo": "hipfire-models/qwen3.8-27b",
+      "file": "qwen3.8-27b.mq4r",
+      "size_gb": 14.98,
       "min_vram_gb": 16,
       "default_kv_mode": "q8",
-      "desc": "Qwen3.8 27B MQ4 text tower, native 262K context, xhigh thinking default. Validated on gfx1100/gfx1201.",
+      "desc": "Speed SKU of qwen3.8:27b, 0.68 GB smaller than the quality trunk. The .mq4r suffix marks it an MQ4R Redline SKU, so a single-GPU load on gfx1100/gfx1151/gfx1201 takes the automatic Redline PM4 route.",
       "recommended_settings": {
         "temperature": 1.0,
         "top_p": 0.95,
@@ -1121,6 +1151,7 @@
     "qwen3.6:a3b": "qwen3.6:35b-a3b",
     "qwen3.8": "qwen3.8:27b",
     "qwen3.8:latest": "qwen3.8:27b",
+    "qwen3.8:fast": "qwen3.8:27b-fast",
     "qwen3": "qwen3:8b",
     "carnice": "carnice:9b",
     "qwopus": "qwopus:9b",

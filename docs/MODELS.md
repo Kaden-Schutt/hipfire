@@ -79,6 +79,13 @@ Several A3B entries carry an `mtp.file` sidecar name (`qwen3.6-35b-a3b.mtp`). MT
 | `qwen3.6:27b` | `qwen3.6-27b.mq4` | 15.0 | 16 | q8 | Ships `triattn.file` in registry |
 | `qwen3.6:27b-mq3` | `qwen3.6-27b.mq3` | 10.7 | 12 | | MQ3 alpha |
 
+### Qwen 3.8 dense
+
+| Tag | File | Size GB | Min VRAM | Default KV | Notes |
+|---|---|---:|---:|---|---|
+| `qwen3.8:27b` | `qwen3.8-27b.mq4` | 15.66 | 17 | q8 | MQ4 quality trunk; default |
+| `qwen3.8:27b-fast` | `qwen3.8-27b.mq4r` | 14.98 | 16 | q8 | MQ4R speed SKU |
+
 ### DFlash draft artifacts (registry)
 
 | Tag | File | Size GB | Min VRAM | Pairs with (by name) |
@@ -88,6 +95,7 @@ Several A3B entries carry an `mtp.file` sidecar name (`qwen3.6-35b-a3b.mtp`). MT
 | `qwen3.5:27b-draft-mq3` | `qwen35-27b-dflash-mq3.hfq` | 0.67 | 12 | `qwen3.5:27b` (mq3 draft) |
 | `qwen3.6:27b-draft` | `qwen36-27b-dflash-mq4.hfq` | 0.92 | 16 | `qwen3.6:27b` |
 | `qwen3.6:27b-draft-mq3` | `qwen36-27b-dflash-mq3.hfq` | 0.67 | 12 | `qwen3.6:27b` |
+| `muse-glimmer:draft` | `muse-glimmer-30b-dflash.mq4` | 1.36 | 26 | `muse-glimmer` / `muse-glimmer:fast` |
 
 Draft **loading** is controlled by `dflash_mode` / `speculation` / `HIPFIRE_DFLASH_DRAFT` ([`CONFIG.md`](CONFIG.md), [`env-vars.md`](env-vars.md)). Default `dflash_mode` is **off**. Filename auto-match may wire a sibling draft when present; that is discovery, not an admission that DFlash wins on every prompt.
 
@@ -126,6 +134,8 @@ Draft **loading** is controlled by `dflash_mode` / `speculation` / `HIPFIRE_DFLA
 | `north-mini-code` | `north-mini-code.mq4.hfq` | 16 | 24 | Cohere2-MoE arch_id=12; registry `sampling` block is **inert metadata** today |
 | `vibethinker:3b` | `vibethinker-3b.mq4.hfq` | 1.82 | 3.5 | Qwen2 MQ4 |
 | `vibethinker:3b-mq6` | `vibethinker-3b.mq6.hfq` | 2.51 | 5.0 | Qwen2 MQ6 |
+| `muse-glimmer` | `muse-glimmer-30b.mq4` | 18.61 | 26 | 30B dense + perception encoder; MQ4 quality trunk (Q8 attention / Q8 lm_head) |
+| `muse-glimmer:fast` | `muse-glimmer-30b.mq4r` | 16.26 | 24 | MQ4R speed SKU (MQ4 body and attention, Q8 lm_head) |
 
 ### LFM2.5 (registry)
 
@@ -226,6 +236,9 @@ downloads). **Partial table** — for the complete surface read that file or run
 | `qwen3.5:small` | `qwen3.5:0.8b` |
 | `qwen3.5:large` | `qwen3.5:27b` |
 | `qwen3.6` / `qwen3.6:a3b` | `qwen3.6:35b-a3b` |
+| `qwen3.8` / `qwen3.8:latest` | `qwen3.8:27b` |
+| `qwen3.8:fast` | `qwen3.8:27b-fast` |
+| `muse-glimmer:latest` / `muse-glimmer:quality` / `muse-glimmer:30b` | `muse-glimmer` |
 | `qwen3` | `qwen3:8b` |
 | `carnice` | `carnice:9b` |
 | `qwopus` | `qwopus:9b` |
