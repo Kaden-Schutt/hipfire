@@ -26,6 +26,7 @@ members = [
     "crates/hipfire-tui",
     "crates/hipfire-reap",
     "crates/hipfire-loader",
+    "crates/hipfire-ar-hook",
 ]
 
 [workspace.package]

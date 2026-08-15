@@ -357,6 +357,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-ar-hook"
+version = "0.2.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "hipfire-arch-cohere2moe"
 version = "0.2.1"
 dependencies = [
