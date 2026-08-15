@@ -1534,7 +1534,14 @@ impl Gpu {
     }
 
     /// Batched Q8_0 KV cache write: quantize multiple positions in one launch.
-    pub fn kv_cache_write_q8_0_batched(
+    ///
+    /// `slot_descs` / `row_slot`: when both `Some`, `row_slot[b]` selects the
+    /// `KvSlotDesc` used to translate the destination address for batch row
+    /// `b`, letting one launch write several independent sequences into
+    /// disjoint KV slabs. When either is `None` the kernel falls back to
+    /// legacy single-arena addressing derived from `positions`, byte-identical
+    /// to the pre-slot kernel.
+    pub fn kv_cache_write_q8_0_batched_slots(
         &mut self,
         dst: &GpuTensor,
         src: &GpuTensor,
@@ -1542,19 +1549,47 @@ impl Gpu {
         n_kv_heads: usize,
         head_dim: usize,
         batch_size: usize,
+        slot_descs: Option<&GpuTensor>,
+        row_slot: Option<&GpuTensor>,
     ) -> HipResult<()> {
+        assert_eq!(
+            slot_descs.is_some(),
+            row_slot.is_some(),
+            "kv_cache_write_q8_0_batched_slots: slot_descs and row_slot are both-or-neither. \
+             Passing only slot_descs silently pins every row to slot 0, writing every \
+             sequence's KV into slot 0's slab."
+        );
         self.bind_thread()?;
-        self.ensure_kernel(
-            "kv_cache_write_q8_0_batched",
-            kernels::KV_CACHE_WRITE_Q8_0_BATCHED_SRC,
-            "kv_cache_write_q8_0_batched",
-        )?;
+        // The kernel source `#include`s kv_slot_desc.h, but the runtime hipcc
+        // compile happens in a cache dir with no -I to kernels/src. Strip the
+        // directive and prepend the header body instead (same pattern as
+        // attention_q8_0_kv_batched_masked_slots). Guarded behind the
+        // functions cache check so the format!/replace allocation only runs
+        // once, not on every launch of this hot path.
+        if !self.functions.contains_key("kv_cache_write_q8_0_batched") {
+            let stripped =
+                kernels::KV_CACHE_WRITE_Q8_0_BATCHED_SRC.replace("#include \"kv_slot_desc.h\"", "");
+            let src = format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped);
+            self.ensure_kernel(
+                "kv_cache_write_q8_0_batched",
+                &src,
+                "kv_cache_write_q8_0_batched",
+            )?;
+        }
         let mut d = dst.buf.as_ptr();
         let mut s = src.buf.as_ptr();
         let mut p = positions.buf.as_ptr();
         let mut nkv = n_kv_heads as i32;
         let mut hd = head_dim as i32;
         let mut bs = batch_size as i32;
+        let mut desc_ptr: *mut std::ffi::c_void = match slot_descs {
+            Some(t) => t.buf.as_ptr(),
+            None => std::ptr::null_mut(),
+        };
+        let mut rs_ptr: *mut std::ffi::c_void = match row_slot {
+            Some(t) => t.buf.as_ptr(),
+            None => std::ptr::null_mut(),
+        };
         let mut params: Vec<*mut c_void> = vec![
             &mut d as *mut _ as *mut c_void,
             &mut s as *mut _ as *mut c_void,
@@ -1562,8 +1597,12 @@ impl Gpu {
             &mut nkv as *mut _ as *mut c_void,
             &mut hd as *mut _ as *mut c_void,
             &mut bs as *mut _ as *mut c_void,
+            &mut desc_ptr as *mut _ as *mut c_void,
+            &mut rs_ptr as *mut _ as *mut c_void,
         ];
         let total_blocks = (n_kv_heads * head_dim / 32) as u32;
+        let desc_raw = desc_ptr; // alias for move into closure
+        let rs_raw = rs_ptr; // alias for move into closure
         self.launch_maybe_blob(
             "kv_cache_write_q8_0_batched",
             [total_blocks, batch_size as u32, 1],
@@ -1578,8 +1617,27 @@ impl Gpu {
                 b.push_i32(nkv);
                 b.push_i32(hd);
                 b.push_i32(bs);
+                b.push_ptr(desc_raw);
+                b.push_ptr(rs_raw);
                 b
             },
+        )
+    }
+
+    /// Legacy single-sequence entry point. Preserved so existing call sites are
+    /// untouched; passes null descriptors, which the kernel treats as legacy
+    /// mode with bitwise-identical output.
+    pub fn kv_cache_write_q8_0_batched(
+        &mut self,
+        dst: &GpuTensor,
+        src: &GpuTensor,
+        positions: &GpuTensor,
+        n_kv_heads: usize,
+        head_dim: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.kv_cache_write_q8_0_batched_slots(
+            dst, src, positions, n_kv_heads, head_dim, batch_size, None, None,
         )
     }
 
@@ -1718,6 +1776,7 @@ impl Gpu {
             },
         )
     }
+
     /// Write KV vector to Q8_0 quantized cache (same format as GGML Q8_0).
     pub fn kv_cache_write_q8_0(
         &mut self,
@@ -1892,8 +1951,23 @@ impl Gpu {
     /// Shared memory: the tree-mode `seq_len` is always `block_start +
     /// block_cols`. Caller must pass `max_ctx_len` ≥ that value so the
     /// scores[] LDS slice is sized correctly.
+    ///
+    /// `slot_descs` / `row_slot`: MUST be both `Some` or both `None` (see the
+    /// assertion at the top of this function). When both `Some`,
+    /// `row_slot[b]` selects the `KvSlotDesc` used to translate KV addresses
+    /// for batch row `b`, letting one launch serve several independent
+    /// sequences with disjoint KV slabs — the row's own causal bound still
+    /// comes from `positions[b]`, never from `desc.seq_len` (they are
+    /// different quantities: a per-row causal bound vs. a slot's logical KV
+    /// length; see the kernel source). When both `None` the kernel falls
+    /// back to legacy single-arena addressing derived from
+    /// `positions`/`max_seq`, byte-identical to the pre-slot kernel.
+    /// `slot_descs: Some, row_slot: None` is NOT a supported "partial" mode
+    /// — the kernel keys `slot` off `row_slot` (defaulting to 0) but `desc`
+    /// off `slot_descs`, so it would silently pin every row to slot 0's
+    /// descriptor while still running descriptor addressing.
     #[allow(clippy::too_many_arguments)]
-    pub fn attention_q8_0_kv_batched_masked(
+    pub fn attention_q8_0_kv_batched_masked_slots(
         &mut self,
         q: &GpuTensor,
         k_cache: &GpuTensor,
@@ -1909,13 +1983,38 @@ impl Gpu {
         tree_bias: Option<&GpuTensor>,
         block_start: usize,
         block_cols: usize,
+        slot_descs: Option<&GpuTensor>,
+        row_slot: Option<&GpuTensor>,
     ) -> HipResult<()> {
+        assert_eq!(
+            slot_descs.is_some(),
+            row_slot.is_some(),
+            "slot_descs and row_slot must be both Some or both None (see \
+             doc comment above)"
+        );
+        assert!(
+            !(slot_descs.is_some() && tree_bias.is_some()),
+            "tree_bias combined with multi-slot descriptors has no defined \
+             contract and no coverage; tree-verify + multi-slot is \
+             deliberately out of SP1 scope"
+        );
         self.bind_thread()?;
-        self.ensure_kernel(
-            "attention_q8_0_kv_batched",
-            kernels::ATTENTION_Q8_0_KV_BATCHED_SRC,
-            "attention_q8_0_kv_batched",
-        )?;
+        // The kernel source `#include`s kv_slot_desc.h, but the runtime hipcc
+        // compile happens in a cache dir with no -I to kernels/src. Strip the
+        // directive and prepend the header body instead (same pattern as
+        // ensure_givens4_kernel's turbo_common/givens_common handling).
+        if !self.functions.contains_key("attention_q8_0_kv_batched") {
+            let attn_q8_batched_src = {
+                let stripped = kernels::ATTENTION_Q8_0_KV_BATCHED_SRC
+                    .replace("#include \"kv_slot_desc.h\"", "");
+                format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped)
+            };
+            self.ensure_kernel(
+                "attention_q8_0_kv_batched",
+                &attn_q8_batched_src,
+                "attention_q8_0_kv_batched",
+            )?;
+        }
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut q_ptr = q.buf.as_ptr();
         let mut k_ptr = k_cache.buf.as_ptr();
@@ -1934,6 +2033,14 @@ impl Gpu {
         let mut sc = scale;
         let mut bs = block_start as i32;
         let mut bc = block_cols as i32;
+        let mut desc_ptr: *mut std::ffi::c_void = match slot_descs {
+            Some(t) => t.buf.as_ptr(),
+            None => std::ptr::null_mut(),
+        };
+        let mut rs_ptr: *mut std::ffi::c_void = match row_slot {
+            Some(t) => t.buf.as_ptr(),
+            None => std::ptr::null_mut(),
+        };
         let mut params: Vec<*mut c_void> = vec![
             &mut q_ptr as *mut _ as *mut c_void,
             &mut k_ptr as *mut _ as *mut c_void,
@@ -1948,6 +2055,8 @@ impl Gpu {
             &mut sc as *mut _ as *mut c_void,
             &mut bs as *mut _ as *mut c_void,
             &mut bc as *mut _ as *mut c_void,
+            &mut desc_ptr as *mut _ as *mut c_void,
+            &mut rs_ptr as *mut _ as *mut c_void,
         ];
         let block_size = (max_ctx_len.max(head_dim) as u32)
             .next_power_of_two()
@@ -1961,6 +2070,8 @@ impl Gpu {
         let timer =
             crate::profile::begin_timer(&self.hip, "attention", "attention_q8_0_kv_batched", bytes);
         let bias_raw = bias_ptr; // alias for move into closure
+        let desc_raw = desc_ptr; // alias for move into closure
+        let rs_raw = rs_ptr; // alias for move into closure
         let result = self.launch_maybe_blob(
             "attention_q8_0_kv_batched",
             [n_heads as u32, batch_size as u32, 1],
@@ -1982,6 +2093,8 @@ impl Gpu {
                 b.push_f32(sc);
                 b.push_i32(bs);
                 b.push_i32(bc);
+                b.push_ptr(desc_raw);
+                b.push_ptr(rs_raw);
                 b
             },
         );
@@ -1989,6 +2102,47 @@ impl Gpu {
             t.finish(&self.hip);
         }
         result
+    }
+
+    /// Legacy single-sequence entry point. Preserved so existing call sites
+    /// are untouched; passes null descriptors, which the kernel treats as
+    /// legacy mode with bitwise-identical output.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_q8_0_kv_batched_masked(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        tree_bias: Option<&GpuTensor>,
+        block_start: usize,
+        block_cols: usize,
+    ) -> HipResult<()> {
+        self.attention_q8_0_kv_batched_masked_slots(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+            max_ctx_len,
+            batch_size,
+            tree_bias,
+            block_start,
+            block_cols,
+            None,
+            None,
+        )
     }
 
     /// Q8 attention for a batch of independent decode sequences. Every row
@@ -2034,6 +2188,13 @@ impl Gpu {
         let mut sc = scale;
         let mut bs = 0i32;
         let mut bc = 0i32;
+        // The independent path predates multi-slot descriptors and addresses
+        // KV purely through the negative-`max_seq` lane contract, which the
+        // kernel now reaches via `kv_slot_legacy_lane`. Both descriptor
+        // pointers must still be pushed — the kernel signature carries them
+        // unconditionally — and both must be null to select that legacy mode.
+        let mut desc_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut rs_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
         let mut params: Vec<*mut c_void> = vec![
             &mut q_ptr as *mut _ as *mut c_void,
             &mut k_ptr as *mut _ as *mut c_void,
@@ -2048,6 +2209,8 @@ impl Gpu {
             &mut sc as *mut _ as *mut c_void,
             &mut bs as *mut _ as *mut c_void,
             &mut bc as *mut _ as *mut c_void,
+            &mut desc_ptr as *mut _ as *mut c_void,
+            &mut rs_ptr as *mut _ as *mut c_void,
         ];
         // LDS / block geometry are locked to lane_capacity (not live max_ctx_len
         // or physical_cap): independent rows only ever score one lane.
@@ -2061,6 +2224,8 @@ impl Gpu {
         let timer =
             crate::profile::begin_timer(&self.hip, "attention", "attention_q8_0_kv_batched", bytes);
         let bias_raw = bias_ptr;
+        let desc_raw = desc_ptr; // alias for move into closure
+        let rs_raw = rs_ptr; // alias for move into closure
         let result = self.launch_maybe_blob(
             "attention_q8_0_kv_batched",
             [n_heads as u32, batch_size as u32, 1],
@@ -2082,6 +2247,8 @@ impl Gpu {
                 b.push_f32(sc);
                 b.push_i32(bs);
                 b.push_i32(bc);
+                b.push_ptr(desc_raw);
+                b.push_ptr(rs_raw);
                 b
             },
         );
@@ -2351,6 +2518,123 @@ impl Gpu {
         br: usize,
         bc: usize,
     ) -> HipResult<()> {
+        self.attention_q8_0_flash_prefill_slots(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
+            batch_size,
+            br,
+            bc,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// Multi-slot variant of `attention_q8_0_flash_prefill`.
+    ///
+    /// The prefill kernel is the one entry point in SP1 that genuinely needs
+    /// the tile arrays from Task 3 (`build_tiles`), because `BR > 1` here: a
+    /// tile can span several query rows of one slot, unlike the decode
+    /// kernels (`BR == 1`) where `row_slot[row]` alone is enough.
+    ///
+    /// `slot_descs` / `tile_slot` / `tile_row0` / `tile_qbase` MUST be all
+    /// `Some` or all `None` (see the assertion below) — a partially
+    /// configured combination has no defined contract. When all `Some`:
+    /// - `tile_slot[t]` selects the `KvSlotDesc` for tile `t`'s K/V base
+    ///   address (never a causal bound — `positions[]` stays authoritative,
+    ///   same rule as every other `_slots` entry point in this file).
+    /// - `tile_row0[t]` is ABI-reserved and **intentionally unused by the
+    ///   kernel**: the kernel's causal loop reads `positions[]` indexed by
+    ///   global flat row, so a slot-relative row0 lookup would be wrong, not
+    ///   redundant. Kept in the signature because kernel arguments are
+    ///   positional and it sits between `tile_slot` and `tile_qbase`.
+    /// - `tile_qbase[t]` is the tile's first row in the *global* flat row
+    ///   space, i.e. how `q`/`out`/`positions` are indexed. Conflating
+    ///   `tile_row0` and `tile_qbase` leaves slot 0 correct and every later
+    ///   slot reading the wrong query.
+    ///
+    /// When all `None` this is byte-identical to
+    /// [`attention_q8_0_flash_prefill`]. The grid is `[n_tiles, n_heads]`
+    /// where `n_tiles = tile_slot.len()` in multi-slot mode, or
+    /// `batch_size.div_ceil(br)` in legacy mode.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_q8_0_flash_prefill_slots(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        br: usize,
+        bc: usize,
+        slot_descs: Option<&GpuTensor>,
+        tile_slot: Option<&GpuTensor>,
+        tile_row0: Option<&GpuTensor>,
+        tile_qbase: Option<&GpuTensor>,
+    ) -> HipResult<()> {
+        let multi_slot = slot_descs.is_some();
+        assert_eq!(
+            multi_slot,
+            tile_slot.is_some(),
+            "slot_descs and tile_slot must be both Some or both None"
+        );
+        assert_eq!(
+            multi_slot,
+            tile_row0.is_some(),
+            "slot_descs and tile_row0 must be both Some or both None"
+        );
+        assert_eq!(
+            multi_slot,
+            tile_qbase.is_some(),
+            "slot_descs and tile_qbase must be both Some or both None: a \
+             partially configured combination has no defined contract (the \
+             kernel keys `slot`/`row0`/`qbase` off the tile arrays \
+             independently of `slot_descs`, so a partial combination would \
+             silently fall back to legacy indexing for whichever array is \
+             `None` while still translating KV addresses through a real \
+             descriptor)"
+        );
+        if multi_slot {
+            let ts_len = tile_slot.unwrap().numel();
+            let tr_len = tile_row0.unwrap().numel();
+            let tq_len = tile_qbase.unwrap().numel();
+            assert_eq!(
+                ts_len, tr_len,
+                "tile_slot and tile_row0 must have equal length (both are \
+                 indexed by the kernel's blockIdx.x): got tile_slot.len()={} \
+                 and tile_row0.len()={}. A mismatch causes the kernel to read \
+                 past the end of the shorter array, folding uninitialised data \
+                 into row0, slot, or both",
+                ts_len, tr_len
+            );
+            assert_eq!(
+                ts_len, tq_len,
+                "tile_slot and tile_qbase must have equal length (both are \
+                 indexed by the kernel's blockIdx.x): got tile_slot.len()={} \
+                 and tile_qbase.len()={}. A mismatch causes the kernel to read \
+                 past the end of the shorter array, folding uninitialised data \
+                 into qbase or slot",
+                ts_len, tq_len
+            );
+            debug_assert!(
+                batch_size > 0,
+                "batch_size must be > 0 in multi-slot mode (needed as rows_end \
+                 fallback for the kernel's final tile)"
+            );
+        }
         self.bind_thread()?;
         const NTHREADS: usize = 256;
         // The kernel's per-thread accumulator is a fixed float[32]; dpt must
@@ -2362,11 +2646,20 @@ impl Gpu {
              raise NTHREADS or lower br"
         );
         let module = format!("attention_q8_0_flash_prefill_br{br}_bc{bc}");
-        let src = format!(
-            "#define BR {br}\n#define BC {bc}\n#define NTHREADS {NTHREADS}\n{}",
-            kernels::ATTENTION_Q8_0_FLASH_PREFILL_SRC
-        );
-        self.ensure_kernel(&module, &src, "attention_q8_0_flash_prefill")?;
+        // The kernel source `#include`s kv_slot_desc.h, but the runtime hipcc
+        // compile happens in a cache dir with no -I to kernels/src. Strip the
+        // directive and prepend the header body instead (same pattern as
+        // ensure_givens4_kernel's turbo_common/givens_common handling).
+        if !self.functions.contains_key("attention_q8_0_flash_prefill") {
+            let stripped = kernels::ATTENTION_Q8_0_FLASH_PREFILL_SRC
+                .replace("#include \"kv_slot_desc.h\"", "");
+            let src = format!(
+                "#define BR {br}\n#define BC {bc}\n#define NTHREADS {NTHREADS}\n{}\n{}",
+                kernels::KV_SLOT_DESC_H,
+                stripped
+            );
+            self.ensure_kernel(&module, &src, "attention_q8_0_flash_prefill")?;
+        }
 
         let bph = head_dim / 32;
         let lds = (br * bc + 3 * br + br * head_dim) * 4 + 2 * bc * bph * 34;
@@ -2387,6 +2680,22 @@ impl Gpu {
         let mut bs = batch_size as i32;
         let mut sc = scale;
         let _ = max_ctx_len; // cache stride derives from n_kv_heads/head_dim
+        let mut desc_ptr: *mut std::ffi::c_void = match slot_descs {
+            Some(t) => t.buf.as_ptr(),
+            None => std::ptr::null_mut(),
+        };
+        let mut tile_slot_ptr: *mut std::ffi::c_void = match tile_slot {
+            Some(t) => t.buf.as_ptr(),
+            None => std::ptr::null_mut(),
+        };
+        let mut tile_row0_ptr: *mut std::ffi::c_void = match tile_row0 {
+            Some(t) => t.buf.as_ptr(),
+            None => std::ptr::null_mut(),
+        };
+        let mut tile_qbase_ptr: *mut std::ffi::c_void = match tile_qbase {
+            Some(t) => t.buf.as_ptr(),
+            None => std::ptr::null_mut(),
+        };
         let mut params: Vec<*mut c_void> = vec![
             &mut q_ptr as *mut _ as *mut c_void,
             &mut k_ptr as *mut _ as *mut c_void,
@@ -2398,8 +2707,16 @@ impl Gpu {
             &mut hd as *mut _ as *mut c_void,
             &mut bs as *mut _ as *mut c_void,
             &mut sc as *mut _ as *mut c_void,
+            &mut desc_ptr as *mut _ as *mut c_void,
+            &mut tile_slot_ptr as *mut _ as *mut c_void,
+            &mut tile_row0_ptr as *mut _ as *mut c_void,
+            &mut tile_qbase_ptr as *mut _ as *mut c_void,
         ];
-        let grid_x = batch_size.div_ceil(br) as u32;
+        let grid_x = if let Some(ts) = tile_slot {
+            ts.numel() as u32
+        } else {
+            batch_size.div_ceil(br) as u32
+        };
         self.launch_maybe_blob(
             "attention_q8_0_flash_prefill",
             [grid_x, n_heads as u32, 1],
@@ -2418,6 +2735,10 @@ impl Gpu {
                 b.push_i32(hd);
                 b.push_i32(bs);
                 b.push_f32(sc);
+                b.push_ptr(desc_ptr);
+                b.push_ptr(tile_slot_ptr);
+                b.push_ptr(tile_row0_ptr);
+                b.push_ptr(tile_qbase_ptr);
                 b
             },
         )
@@ -2441,6 +2762,60 @@ impl Gpu {
         head_dim: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.attention_q8_0_flash_prefill_wmma_slots(
+            q, k_cache, v_cache, out, positions, n_heads, n_kv_heads, head_dim, batch_size, None,
+            None, None, None,
+        )
+    }
+
+    /// Multi-slot variant of `attention_q8_0_flash_prefill_wmma`.
+    ///
+    /// Same tile-array ABI as [`attention_q8_0_flash_prefill_slots`] (the
+    /// scalar sibling): `tile_slot[t]` selects the `KvSlotDesc` for tile `t`'s
+    /// K/V base address (never a causal bound — `positions[]` stays
+    /// authoritative), `tile_row0[t]` is ABI-reserved and unread, and
+    /// `tile_qbase[t]` is how `q`/`out`/`positions` are indexed. Tiles here are
+    /// fixed at `M_TILE = 16` rows (the WMMA fragment shape) rather than the
+    /// scalar kernel's tunable `BR` — build the tile arrays with
+    /// `kv_slots::build_tiles(slot_query_counts, 16)`.
+    ///
+    /// `slot_descs` / `tile_slot` / `tile_row0` / `tile_qbase` MUST be all
+    /// `Some` or all `None`. When all `None` this is byte-identical to
+    /// [`attention_q8_0_flash_prefill_wmma`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_q8_0_flash_prefill_wmma_slots(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        batch_size: usize,
+        slot_descs: Option<&GpuTensor>,
+        tile_slot: Option<&GpuTensor>,
+        tile_row0: Option<&GpuTensor>,
+        tile_qbase: Option<&GpuTensor>,
+    ) -> HipResult<()> {
+        let multi_slot = slot_descs.is_some();
+        assert_eq!(
+            multi_slot,
+            tile_slot.is_some(),
+            "slot_descs and tile_slot must be both Some or both None"
+        );
+        assert_eq!(
+            multi_slot,
+            tile_row0.is_some(),
+            "slot_descs and tile_row0 must be both Some or both None"
+        );
+        assert_eq!(
+            multi_slot,
+            tile_qbase.is_some(),
+            "slot_descs and tile_qbase must be both Some or both None: a \
+             partially configured combination has no defined contract"
+        );
         self.bind_thread()?;
         assert!(
             head_dim % 32 == 0,
@@ -2494,11 +2869,27 @@ impl Gpu {
         } else {
             kernels::ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SRC
         };
-        let src = format!(
-            "#define SPLIT_Q {}\n#define FIXED_HEAD_DIM {}\n#define PREFETCH_V {}\n{}",
-            split_q as u32, fixed_hd, prefetch_v as u32, kernel_src
-        );
-        self.ensure_kernel(&module, &src, "attention_q8_0_flash_prefill_wmma")?;
+        // The kernel source `#include`s kv_slot_desc.h, but the runtime hipcc
+        // compile happens in a cache dir with no -I to kernels/src. Strip the
+        // directive and prepend the header body instead (same pattern as
+        // attention_q8_0_flash_prefill_slots and ensure_givens4_kernel). The
+        // module name varies by variant but the loaded function name does
+        // not, so gate on that — mirrors the scalar port's guard.
+        if !self
+            .functions
+            .contains_key("attention_q8_0_flash_prefill_wmma")
+        {
+            let stripped = kernel_src.replace("#include \"kv_slot_desc.h\"", "");
+            let src = format!(
+                "#define SPLIT_Q {}\n#define FIXED_HEAD_DIM {}\n#define PREFETCH_V {}\n{}\n{}",
+                split_q as u32,
+                fixed_hd,
+                prefetch_v as u32,
+                kernels::KV_SLOT_DESC_H,
+                stripped
+            );
+            self.ensure_kernel(&module, &src, "attention_q8_0_flash_prefill_wmma")?;
+        }
         const M_TILE: usize = 16;
         const N_TILE: usize = 16;
         const S_STRIDE: usize = 18;
@@ -2527,6 +2918,22 @@ impl Gpu {
         let mut hd = head_dim as i32;
         let mut bs = batch_size as i32;
         let mut sc = scale;
+        let mut desc_ptr: *mut std::ffi::c_void = match slot_descs {
+            Some(t) => t.buf.as_ptr(),
+            None => std::ptr::null_mut(),
+        };
+        let mut tile_slot_ptr: *mut std::ffi::c_void = match tile_slot {
+            Some(t) => t.buf.as_ptr(),
+            None => std::ptr::null_mut(),
+        };
+        let mut tile_row0_ptr: *mut std::ffi::c_void = match tile_row0 {
+            Some(t) => t.buf.as_ptr(),
+            None => std::ptr::null_mut(),
+        };
+        let mut tile_qbase_ptr: *mut std::ffi::c_void = match tile_qbase {
+            Some(t) => t.buf.as_ptr(),
+            None => std::ptr::null_mut(),
+        };
         let mut params: Vec<*mut c_void> = vec![
             &mut q_ptr as *mut _ as *mut c_void,
             &mut k_ptr as *mut _ as *mut c_void,
@@ -2538,8 +2945,16 @@ impl Gpu {
             &mut hd as *mut _ as *mut c_void,
             &mut bs as *mut _ as *mut c_void,
             &mut sc as *mut _ as *mut c_void,
+            &mut desc_ptr as *mut _ as *mut c_void,
+            &mut tile_slot_ptr as *mut _ as *mut c_void,
+            &mut tile_row0_ptr as *mut _ as *mut c_void,
+            &mut tile_qbase_ptr as *mut _ as *mut c_void,
         ];
-        let grid_x = batch_size.div_ceil(M_TILE) as u32;
+        let grid_x = if let Some(ts) = tile_slot {
+            ts.numel() as u32
+        } else {
+            batch_size.div_ceil(M_TILE) as u32
+        };
         self.launch_maybe_blob(
             "attention_q8_0_flash_prefill_wmma",
             [grid_x, n_heads as u32, 1],
@@ -2558,6 +2973,10 @@ impl Gpu {
                 b.push_i32(hd);
                 b.push_i32(bs);
                 b.push_f32(sc);
+                b.push_ptr(desc_ptr);
+                b.push_ptr(tile_slot_ptr);
+                b.push_ptr(tile_row0_ptr);
+                b.push_ptr(tile_qbase_ptr);
                 b
             },
         )
@@ -3052,6 +3471,66 @@ impl Gpu {
             V_MODE_Q8,
             /*window=*/ 0,
             /*force_wmma_grid=*/ false,
+            None,
+            None,
+        )
+    }
+
+    /// Multi-slot Q8_0 tiled flash attention. `slot_descs` is `[n_slots]`
+    /// `KvSlotDesc`; `row_slot` is `[batch_size]` slot indices per query row.
+    /// Passing `None` for both is exactly the legacy single-sequence path
+    /// (identical to [`attention_flash_q8_0_batched_masked`]). This is the
+    /// long-context entry point: `attention_flash_q8_0_tile_batched` has no
+    /// LDS context cap, unlike the LDS kernel that degenerates above
+    /// `LDS_CTX_LIMIT`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_flash_q8_0_batched_masked_slots(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        partials: &GpuTensor,
+        tree_bias: Option<&GpuTensor>,
+        block_start: usize,
+        block_cols: usize,
+        slot_descs: Option<&GpuTensor>,
+        row_slot: Option<&GpuTensor>,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.launch_asym_flash_batched(
+            "attention_flash_q8_0_tile_batched",
+            kernels::ATTENTION_FLASH_Q8_0_TILE_BATCHED_SRC,
+            "attention_flash_q8_0_tile_batched",
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            q, // cos_theta dummy — kernel ignores
+            q, // sin_theta dummy — kernel ignores
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+            max_ctx_len,
+            batch_size,
+            partials,
+            tree_bias,
+            block_start,
+            block_cols,
+            V_MODE_Q8,
+            /*window=*/ 0,
+            /*force_wmma_grid=*/ false,
+            slot_descs,
+            row_slot,
         )
     }
 
@@ -3105,6 +3584,8 @@ impl Gpu {
             V_MODE_Q8,
             window,
             /*force_wmma_grid=*/ false,
+            None,
+            None,
         )
     }
 
@@ -3431,15 +3912,35 @@ impl Gpu {
         if self.functions.contains_key(func_name) {
             return Ok(());
         }
+        // The runtime hipcc compile happens in a cache dir with no -I to
+        // kernels/src, so a literal #include of any of these headers does not
+        // resolve. Strip the directive and prepend the header body instead
+        // (same pattern the lazy ensure_kernel callers use for
+        // kv_slot_desc.h). kv_slot_desc.h is only stripped/prepended for
+        // kernels that actually #include it (currently just the q8 tile
+        // kernel — Task 5) so the other tile kernels' compiled source is
+        // untouched.
+        let needs_kv_slot_desc = body_src.contains("#include \"kv_slot_desc.h\"");
         let stripped = body_src
             .replace("#include \"turbo_common.h\"", "")
-            .replace("#include \"givens_common.h\"", "");
-        let full_src = format!(
-            "{}\n{}\n{}",
-            kernels::TURBO_COMMON_H,
-            kernels::GIVENS_COMMON_SRC,
-            stripped
-        );
+            .replace("#include \"givens_common.h\"", "")
+            .replace("#include \"kv_slot_desc.h\"", "");
+        let full_src = if needs_kv_slot_desc {
+            format!(
+                "{}\n{}\n{}\n{}",
+                kernels::TURBO_COMMON_H,
+                kernels::GIVENS_COMMON_SRC,
+                kernels::KV_SLOT_DESC_H,
+                stripped
+            )
+        } else {
+            format!(
+                "{}\n{}\n{}",
+                kernels::TURBO_COMMON_H,
+                kernels::GIVENS_COMMON_SRC,
+                stripped
+            )
+        };
         let obj_path = self.compiler.compile(name, &full_src)?;
         let obj_path_str = obj_path.to_str().unwrap().to_string();
         if !self.modules.contains_key(name) {
@@ -4420,15 +4921,69 @@ impl Gpu {
         // wrappers that already know their kernel is WMMA. Scalar callers
         // pass `false` (original behavior).
         force_wmma_grid: bool,
+        // `slot_descs`/`row_slot`: MUST be both `Some` or both `None` — see
+        // the assertion just below `use_wmma_grid`. When both `Some`,
+        // `row_slot[row]` (GLOBAL row, i.e. batch_offset + blockIdx.z)
+        // selects the `KvSlotDesc` used to translate KV addresses for that
+        // row, letting one launch serve several independent sequences with
+        // disjoint KV slabs; the row's own causal bound still comes from
+        // `positions[row]`, never from `desc.seq_len` (see the kernel source
+        // for why those two must not be conflated). When both `None` the
+        // tile kernel falls back to legacy single-arena addressing derived
+        // from `positions`/`max_seq`, byte-identical to the pre-SP1 kernel.
+        // `slot_descs: Some, row_slot: None` is NOT a supported "partial"
+        // mode — the kernel keys `slot` off `row_slot` (defaulting to 0) but
+        // `desc` off `slot_descs`, so that combination would silently pin
+        // every row to slot 0's descriptor while still running the
+        // descriptor addressing path. Pushed unconditionally as the last two
+        // non-WMMA kernargs below for every caller of this launcher; only
+        // the q8 and asym3 tile kernels declare trailing parameters for them
+        // today (see the assertion below for the WMMA exclusion) — every
+        // other tile kernel routed through here (fwht/lloyd/asym2/asym4)
+        // simply has fewer declared params and ignores the extra trailing
+        // kernarg bytes, the same way they already ignore `window`.
+        slot_descs: Option<&GpuTensor>,
+        row_slot: Option<&GpuTensor>,
     ) -> HipResult<()> {
-        const TILE_SIZE: usize = 128;
+        assert_eq!(
+            slot_descs.is_some(),
+            row_slot.is_some(),
+            "slot_descs and row_slot must be both Some or both None: \
+             slot_descs=Some,row_slot=None would silently pin every row to \
+             slot 0 (the kernel keys `slot` off row_slot, defaulting to 0, \
+             but keys `desc` off slot_descs, so the half-configured \
+             combination runs the descriptor addressing path anyway)"
+        );
+        assert!(
+            !(slot_descs.is_some() && tree_bias.is_some()),
+            "tree_bias combined with multi-slot descriptors has no defined \
+             contract and no coverage: tree-verify batches are single-slot \
+             (block_start/block_cols index one shared linearized tree), and \
+             row_slot-per-row addressing for a tree-verify batch has not \
+             been designed. Tree-verify + multi-slot is deliberately out of \
+             SP1 scope."
+        );
+        // gfx1151 is the dev box; gfx1201 is the target. Never bake a tuned
+        // constant into a `const` — see spec §11. Resolution lives in
+        // `kv_slots::attn_tile_size` — the single source of truth every
+        // caller of this value must share (see that function's doc comment
+        // for the corruption bug three independent copies of this exact
+        // logic caused).
+        let tile_size: usize = self.attn_tile_size();
         const WMMA_BLOCK_M: usize = 16;
-        let max_tiles = (max_ctx_len + TILE_SIZE - 1) / TILE_SIZE;
+        let max_tiles = (max_ctx_len + tile_size - 1) / tile_size;
         let stride = 2 + head_dim;
-        let per_pos_bytes = n_heads * max_tiles * stride * 4;
+        // Bytes of `partials` consumed per query row (n_heads * max_tiles *
+        // (2+head_dim) floats) — drives how many rows fit in one sub-batch
+        // chunk. Distinct from the `.hip`-side `per_pos_bytes`, which means
+        // KV bytes per cached position (n_kv_heads * head_dim/32 * 34); the
+        // two are unrelated quantities that happened to share a name.
+        let partials_bytes_per_row = n_heads * max_tiles * stride * 4;
         let partials_capacity = partials.numel() * 4;
-        let sub_batch = if per_pos_bytes > 0 {
-            (partials_capacity / per_pos_bytes).max(1).min(batch_size)
+        let sub_batch = if partials_bytes_per_row > 0 {
+            (partials_capacity / partials_bytes_per_row)
+                .max(1)
+                .min(batch_size)
         } else {
             batch_size
         };
@@ -4461,6 +5016,12 @@ impl Gpu {
         // True when either the inline env-gated ladder fires (scalar→WMMA
         // upgrade) OR the dispatch path explicitly routes to a WMMA variant.
         let use_wmma_grid = wmma_ok || force_wmma_grid;
+        assert!(
+            !(use_wmma_grid && (slot_descs.is_some() || row_slot.is_some())),
+            "multi-slot descriptors are not supported on the WMMA tile grid; \
+             the WMMA kernarg layout differs (omits v_mode_bits, slot_descs, \
+             and row_slot entirely) and asym4-WMMA is out of SP1 scope"
+        );
         let (eff_tile_key, eff_tile_src, eff_tile_func): (
             &'static str,
             &'static str,
@@ -4509,13 +5070,21 @@ impl Gpu {
                 let hd = head_dim as i32;
                 let ms = max_seq as i32;
                 let sc = scale;
-                let ts = TILE_SIZE as i32;
+                let ts = tile_size as i32;
                 let mt = max_tiles as i32;
                 let bo = offset as i32;
                 let bs = block_start as i32;
                 let bc = block_cols as i32;
                 let vm = v_mode_bits;
                 let wn = window;
+                let desc_ptr: *mut std::ffi::c_void = match slot_descs {
+                    Some(t) => t.buf.as_ptr(),
+                    None => std::ptr::null_mut(),
+                };
+                let row_slot_ptr: *mut std::ffi::c_void = match row_slot {
+                    Some(t) => t.buf.as_ptr(),
+                    None => std::ptr::null_mut(),
+                };
                 let mut params: Vec<*mut c_void> = vec![
                     &q_ptr as *const _ as *mut c_void,
                     &k_ptr as *const _ as *mut c_void,
@@ -4539,6 +5108,8 @@ impl Gpu {
                 if !use_wmma_grid {
                     params.push(&vm as *const _ as *mut c_void);
                     params.push(&wn as *const _ as *mut c_void);
+                    params.push(&desc_ptr as *const _ as *mut c_void);
+                    params.push(&row_slot_ptr as *const _ as *mut c_void);
                 }
                 let (grid, lds_bytes): ([u32; 3], u32) = if use_wmma_grid {
                     let m_tiles = (chunk + WMMA_BLOCK_M - 1) / WMMA_BLOCK_M;
@@ -4546,7 +5117,7 @@ impl Gpu {
                 } else {
                     (
                         [n_heads as u32, max_tiles as u32, chunk as u32],
-                        (TILE_SIZE * 4) as u32,
+                        (tile_size * 4) as u32,
                     )
                 };
                 self.launch_maybe_blob(
@@ -4578,6 +5149,8 @@ impl Gpu {
                         if !use_wmma_grid {
                             b.push_i32(vm);
                             b.push_i32(wn);
+                            b.push_ptr(desc_ptr);
+                            b.push_ptr(row_slot_ptr);
                         }
                         b
                     },
@@ -4590,7 +5163,7 @@ impl Gpu {
                 let pos_ptr = positions.buf.as_ptr();
                 let nh = n_heads as i32;
                 let hd = head_dim as i32;
-                let ts = TILE_SIZE as i32;
+                let ts = tile_size as i32;
                 let mt = max_tiles as i32;
                 let bo = offset as i32;
                 let bs = block_start as i32;
@@ -4915,6 +5488,8 @@ impl Gpu {
             V_MODE_Q8,
             /*window=*/ 0,
             /*force_wmma_grid=*/ false,
+            None,
+            None,
         )
     }
 
@@ -4968,6 +5543,8 @@ impl Gpu {
             V_MODE_Q8,
             /*window=*/ 0,
             /*force_wmma_grid=*/ true,
+            None,
+            None,
         )
     }
 
@@ -5018,6 +5595,8 @@ impl Gpu {
             V_MODE_Q8,
             /*window=*/ 0,
             /*force_wmma_grid=*/ true,
+            None,
+            None,
         )
     }
 
@@ -5114,6 +5693,8 @@ impl Gpu {
             v_mode_bits,
             /*window=*/ 0,
             /*force_wmma_grid=*/ false,
+            None,
+            None,
         )
     }
 
@@ -5161,6 +5742,8 @@ impl Gpu {
             V_MODE_Q8,
             /*window=*/ 0,
             /*force_wmma_grid=*/ false,
+            None,
+            None,
         )
     }
 
@@ -5209,6 +5792,8 @@ impl Gpu {
             v_mode_bits,
             /*window=*/ 0,
             /*force_wmma_grid=*/ false,
+            None,
+            None,
         )
     }
 
@@ -5377,6 +5962,64 @@ impl Gpu {
         block_start: usize,
         block_cols: usize,
     ) -> HipResult<()> {
+        self.attention_flash_asym3_batched_masked_slots(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            cos_theta,
+            sin_theta,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+            max_ctx_len,
+            batch_size,
+            partials,
+            tree_bias,
+            block_start,
+            block_cols,
+            None,
+            None,
+        )
+    }
+
+    /// Multi-slot variant of `attention_flash_asym3_batched_masked`.
+    ///
+    /// `slot_descs` / `row_slot`: MUST be both `Some` or both `None` (see the
+    /// assertion inside `launch_asym_flash_batched`, which this delegates
+    /// to). When both `Some`, `row_slot[row]` (GLOBAL row, i.e. batch_offset
+    /// + blockIdx.z) selects the `KvSlotDesc` used to translate K/V
+    /// addresses for that row, letting one launch serve several independent
+    /// sequences with disjoint KV slabs — the row's own causal bound still
+    /// comes from `positions[row]`, never from `desc.seq_len` (a slot
+    /// verifying M>1 draft tokens has rows at different positions that must
+    /// not share one bound; see the kernel source). When both `None` this is
+    /// byte-identical to [`attention_flash_asym3_batched_masked`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_flash_asym3_batched_masked_slots(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        cos_theta: &GpuTensor,
+        sin_theta: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        partials: &GpuTensor,
+        tree_bias: Option<&GpuTensor>,
+        block_start: usize,
+        block_cols: usize,
+        slot_descs: Option<&GpuTensor>,
+        row_slot: Option<&GpuTensor>,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         self.launch_asym_flash_batched(
             "attention_flash_asym3_tile_batched",
@@ -5402,6 +6045,8 @@ impl Gpu {
             V_MODE_Q8,
             /*window=*/ 0,
             /*force_wmma_grid=*/ false,
+            slot_descs,
+            row_slot,
         )
     }
 
@@ -5495,6 +6140,8 @@ impl Gpu {
             v_mode_bits,
             /*window=*/ 0,
             /*force_wmma_grid=*/ false,
+            None,
+            None,
         )
     }
 

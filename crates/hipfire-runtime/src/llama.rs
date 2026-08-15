@@ -1836,7 +1836,14 @@ impl PrefillBatchScratch {
         let q_dim = config.n_heads * config.head_dim;
         let kv_dim = config.n_kv_heads * config.head_dim;
 
-        let tile_size = 128usize;
+        // Size `flash_partials` for the SMALLEST tile the launcher might use.
+        // `launch_asym_flash_batched` resolves its tile via `Gpu::attn_tile_size()`
+        // (HIPFIRE_ATTN_TILE_SIZE); a smaller tile means MORE tiles and therefore
+        // more partials bytes per query row. Sizing against a hardcoded 128 while
+        // the launcher used a smaller value would silently undersize this buffer.
+        // Raising the tile is always safe here; lowering it is what this min()
+        // covers.
+        let tile_size = 128usize.min(gpu.attn_tile_size());
         let max_tiles = (kv_max_seq + tile_size - 1) / tile_size;
         let batch_mult = crate::config::get()
             .flash_partials_batch

@@ -920,6 +920,7 @@ dependencies = [
  "anyhow",
  "clap",
  "ctrlc",
+ "hipfire-arch-qwen35",
  "hipfire-client",
  "hipfire-config",
  "hipfire-registry",

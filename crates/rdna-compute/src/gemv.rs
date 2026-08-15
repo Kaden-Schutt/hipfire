@@ -6350,6 +6350,84 @@ impl Gpu {
         }
     }
 
+    /// Largest `batch` `gemv_hfq4g256_xbatch` accepts. Must stay in step with
+    /// `HIPFIRE_HFQ4G256_XBATCH_MAX` in `GEMV_HFQ4G256_XBATCH_SRC`, which sizes
+    /// the kernel's accumulator arrays.
+    pub const HFQ4G256_XBATCH_MAX: usize = 4;
+
+    /// x-batched HFQ4-G256 GEMV: `y[b][row] = A[row] . x[b]` for b in 0..batch,
+    /// reading each weight row ONCE instead of once per b.
+    ///
+    /// `x_rot` is `[batch x k]` and `y` is `[batch x m]`, both row-major and
+    /// f32. For MQ4G256 the caller must have rotated every row already (the
+    /// weights are FWHT-rotated HFQ4-G256).
+    ///
+    /// `batch` must not exceed `HFQ4G256_XBATCH_MAX`; the kernel's accumulator
+    /// arrays are that size. Callers with more rows should chunk.
+    pub fn gemv_hfq4g256_xbatch(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_rot: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch: usize,
+    ) -> HipResult<()> {
+        assert!(
+            batch >= 1 && batch <= Self::HFQ4G256_XBATCH_MAX,
+            "gemv_hfq4g256_xbatch: batch {batch} outside 1..={}",
+            Self::HFQ4G256_XBATCH_MAX
+        );
+        assert_eq!(
+            k % 256,
+            0,
+            "gemv_hfq4g256_xbatch: k must be a multiple of 256"
+        );
+        self.bind_thread()?;
+        // The K2048 build hard-codes groups_per_row=8; anything else needs the
+        // runtime K/256 form.
+        let name = if k == 2048 {
+            self.ensure_kernel(
+                "gemv_hfq4g256_xbatch",
+                kernels::GEMV_HFQ4G256_XBATCH_SRC,
+                "gemv_hfq4g256_xbatch",
+            )?;
+            "gemv_hfq4g256_xbatch"
+        } else {
+            self.ensure_kernel(
+                "gemv_hfq4g256_xbatch_gen",
+                kernels::GEMV_HFQ4G256_XBATCH_GEN_SRC,
+                "gemv_hfq4g256_xbatch_gen",
+            )?;
+            "gemv_hfq4g256_xbatch_gen"
+        };
+        let func = &self.functions[name];
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x_rot.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let b_val = batch as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &b_val as *const _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [m as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// HFQ4-G256 GEMV: flat 4-bit with 256-weight groups. K must be multiple of 256.
     pub fn gemv_hfq4g256(
         &mut self,

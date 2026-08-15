@@ -19,6 +19,8 @@
 //
 // Grid: [n_heads, max_tiles, sub_batch_size]. Block: [32, 1, 1].
 #include <hip/hip_runtime.h>
+#include <assert.h>
+#include "kv_slot_desc.h"
 
 static __device__ __forceinline__ unsigned int q8_tile_load_u32(
     const unsigned char* p
@@ -59,7 +61,9 @@ __global__ void attention_flash_q8_0_tile_batched(
     int /*v_mode_bits*/,                       // consumed-but-unused: the shared
                                                // launcher pushes V_MODE_* here for
                                                // the asym tile kernels; Q8 ignores it.
-    int window                                 // sliding-window span; <= 0 = full causal
+    int window,                                // sliding-window span; <= 0 = full causal
+    const KvSlotDesc* __restrict__ slot_descs, // [n_slots] or nullptr = legacy
+    const int* __restrict__ row_slot           // [total_batch] or nullptr = legacy
 ) {
     const int h = blockIdx.x;
     const int tile_id = blockIdx.y;
@@ -77,13 +81,56 @@ __global__ void attention_flash_q8_0_tile_batched(
     // Eager (non-capture) value is identical, so this is a no-op off-graph.
     const int eff_block_start = tree_mode ? positions[0] : block_start;
     const int seq_len = tree_mode ? (eff_block_start + block_cols) : (positions[global_bid] + 1);
-    // Sliding-window lower bound: a query at position seq_len-1 attends only to
-    // keys in [seq_len-window, seq_len); keys at t < win_lo are masked out.
-    // window <= 0 = full causal (legacy behavior, no lower bound).
-    const int win_lo = (window > 0) ? (seq_len - window) : 0;
+
+    // One code path for both modes: in legacy mode we synthesise a descriptor
+    // with zero bases, so the address arithmetic below is unchanged and the
+    // output is bitwise identical to the pre-SP1 kernel. row_slot is indexed
+    // by GLOBAL row (batch_offset + blockIdx.z, i.e. global_bid above) — using
+    // the local blockIdx.z alone would silently read the wrong slot once the
+    // partials buffer forces the launcher into sub-batching (correct at small
+    // batch, silent cross-slot corruption once chunking kicks in).
+    const int slot = (row_slot != nullptr) ? row_slot[global_bid] : 0;
+    const KvSlotDesc desc = (slot_descs != nullptr)
+        ? slot_descs[slot]
+        : kv_slot_legacy(seq_len, max_seq);
+    const int per_pos_bytes = n_kv_heads * (head_dim / 32) * 34;
+    // `positions[row] + 1` (== `seq_len` above) is the PER-ROW CAUSAL BOUND:
+    // how far this specific query row is allowed to attend. `desc.seq_len` is
+    // the SLOT's logical KV length — allocation/capacity metadata, not a
+    // per-row quantity. The two coincide only when a slot has exactly one
+    // query row (M=1 decode); a slot verifying M>1 draft tokens has rows at
+    // positions p, p+1, ..., p+M-1 that legitimately differ, and row 0 must
+    // NOT see row 2's key. `desc` supplies the K/V slab BASE ADDRESS (via
+    // kv_offset_for_k/v below) — it must never override the row's own
+    // causal bound. This also keeps tile-count agreement with
+    // attention_flash_asym_reduce_batched, which independently derives its
+    // n_tiles from positions[global_bid]+1 and has no way to learn a
+    // different eff_seq_len computed here; disagreement would make the
+    // reduce iterate tiles this kernel early-returned from without writing a
+    // partial, folding stale (possibly another slot's) memory into the
+    // output.
+    const int eff_seq_len = seq_len;
+
+    // Sanity invariant, not a correctness mechanism: a row may never attend
+    // past its own slot's logical KV length. Descriptor construction must
+    // keep desc.seq_len in sync with (max positions[row]+1 over that slot's
+    // rows); this simply catches a violation early in debug builds.
+    // NOTE: a debug `assert(seq_len <= desc.seq_len)` used to sit here. It was
+    // removed: crates/rdna-compute/src/compiler.rs never passes -DNDEBUG, so the
+    // assert shipped in RELEASE and cost 64 bytes/lane of scratch on every one of
+    // these kernels. The paired `__builtin_assume` was worse than useless — it
+    // would only take effect under -DNDEBUG, where it becomes a UB licence on a
+    // fact the kernel never otherwise uses, buying no optimisation. The invariant
+    // is documented on KvSlotDesc and checked host-side by the builders instead.
+
+    // Sliding-window lower bound: a query at position eff_seq_len-1 attends
+    // only to keys in [eff_seq_len-window, eff_seq_len); keys at t < win_lo
+    // are masked out. window <= 0 = full causal (legacy behavior, no lower
+    // bound).
+    const int win_lo = (window > 0) ? (eff_seq_len - window) : 0;
     const int tile_start = tile_id * tile_size;
-    if (tile_start >= seq_len) return;
-    const int tile_end = min(tile_start + tile_size, seq_len);
+    if (tile_start >= eff_seq_len) return;
+    const int tile_end = min(tile_start + tile_size, eff_seq_len);
     const int tile_len = tile_end - tile_start;
 
     // Sliding-window fast path: a tile entirely below win_lo has no in-window
@@ -109,10 +156,12 @@ __global__ void attention_flash_q8_0_tile_batched(
     const int q_dim = n_heads * head_dim;
 
     // Both K and V are Q8_0: head_dim/32 blocks/head, 34 bytes/block.
+    // per_pos_bytes (computed above, next to `desc`) is n_kv_heads *
+    // blocks_per_head * 34 — the same per-position stride this used to call
+    // row_stride, now routed through kv_offset_for_k/v so a real descriptor's
+    // slot-local base is honored.
     const int blocks_per_head = head_dim / 32;
-    const int total_blocks    = n_kv_heads * blocks_per_head;
     const int kv_head_blk     = kv_h * blocks_per_head;
-    const int row_stride      = total_blocks * 34;
 
     extern __shared__ float sdata[];
     float* scores = sdata;
@@ -147,7 +196,7 @@ __global__ void attention_flash_q8_0_tile_batched(
         if (lane_one_q8_block && dpt == 8) {
             const int bi = d0 / 32;
             const int bj = d0 % 32;
-            const unsigned char* kb = k_cache + (size_t)t * row_stride
+            const unsigned char* kb = k_cache + kv_offset_for_k(desc, t, per_pos_bytes)
                                     + (kv_head_blk + bi) * 34;
             const float ks = (float)*((const _Float16*)kb);
             const unsigned long long packed = q8_tile_load_u64(kb + 2 + bj);
@@ -159,7 +208,7 @@ __global__ void attention_flash_q8_0_tile_batched(
         } else if (lane_one_q8_block && dpt == 4) {
             const int bi = d0 / 32;
             const int bj = d0 % 32;
-            const unsigned char* kb = k_cache + (size_t)t * row_stride
+            const unsigned char* kb = k_cache + kv_offset_for_k(desc, t, per_pos_bytes)
                                     + (kv_head_blk + bi) * 34;
             const float ks = (float)*((const _Float16*)kb);
             const unsigned int packed = q8_tile_load_u32(kb + 2 + bj);
@@ -173,7 +222,7 @@ __global__ void attention_flash_q8_0_tile_batched(
                 const int d = d0 + i;
                 const int bi = d / 32;
                 const int bj = d % 32;
-                const unsigned char* kb = k_cache + (size_t)t * row_stride
+                const unsigned char* kb = k_cache + kv_offset_for_k(desc, t, per_pos_bytes)
                                         + (kv_head_blk + bi) * 34;
                 const float ks = (float)*((const _Float16*)kb);
                 partial += mq[i] * (ks * (float)((signed char)kb[2 + bj]));
@@ -218,7 +267,7 @@ __global__ void attention_flash_q8_0_tile_batched(
         for (int t_local = 0; t_local < tile_len; t_local++) {
             const float w = scores[t_local];
             const int t = tile_start + t_local;
-            const unsigned char* vbh = v_cache + (size_t)t * row_stride
+            const unsigned char* vbh = v_cache + kv_offset_for_v(desc, t, per_pos_bytes)
                                      + (kv_head_blk + bi) * 34;
             const float vs = (float)*((const _Float16*)vbh);
             const unsigned long long packed = q8_tile_load_u64(vbh + 2 + bj);
@@ -234,7 +283,7 @@ __global__ void attention_flash_q8_0_tile_batched(
         for (int t_local = 0; t_local < tile_len; t_local++) {
             const float w = scores[t_local];
             const int t = tile_start + t_local;
-            const unsigned char* vbh = v_cache + (size_t)t * row_stride
+            const unsigned char* vbh = v_cache + kv_offset_for_v(desc, t, per_pos_bytes)
                                      + (kv_head_blk + bi) * 34;
             const float vs = (float)*((const _Float16*)vbh);
             const unsigned int packed = q8_tile_load_u32(vbh + 2 + bj);
@@ -248,7 +297,7 @@ __global__ void attention_flash_q8_0_tile_batched(
         for (int t_local = 0; t_local < tile_len; t_local++) {
             const float w = scores[t_local];
             const int t = tile_start + t_local;
-            const unsigned char* vb = v_cache + (size_t)t * row_stride;
+            const unsigned char* vb = v_cache + kv_offset_for_v(desc, t, per_pos_bytes);
             for (int i = 0; i < dpt; i++) {
                 const int d = d0 + i;
                 const int bi = d / 32;

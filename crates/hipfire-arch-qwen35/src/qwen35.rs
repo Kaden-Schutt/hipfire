@@ -6653,7 +6653,11 @@ impl Qwen35Scratch {
                     config.head_dim,
                     kv_max_seq,
                 )
-                .min(128);
+                .min(128)
+                // See llama.rs: also floor against the batched-attention tile,
+                // since a smaller HIPFIRE_ATTN_TILE_SIZE raises max_tiles and
+                // would undersize this same buffer.
+                .min(gpu.attn_tile_size());
                 let max_tiles = (kv_max_seq + tile_size - 1) / tile_size;
                 let batch_mult = hipfire_runtime::config::get()
                     .flash_partials_batch
@@ -12707,7 +12711,10 @@ pub fn prefill_batch_pbs_eligible(
 /// routed grouped-WMMA MQ6 fast-path (its unrelated Q8 WMMA prefill family is
 /// gated separately by `q8_prefill_wmma_enabled`). Override per-arch with
 /// `HIPFIRE_MOE_MQ6_ADMIT=0|1`.
-fn mq6_batched_admit_enabled_from_env(value: Option<&str>, arch: &str) -> bool {
+// pub(crate): also used by forward_slots.rs (MoE slots port) to compute the
+// same admit_mq6 predicate before calling `moe_ffn_batched_admissible`.
+// Visibility change only — behavior and existing callers are unchanged.
+pub(crate) fn mq6_batched_admit_enabled_from_env(value: Option<&str>, arch: &str) -> bool {
     match value {
         Some("0") | Some("off") | Some("false") => false,
         Some("1") | Some("on") | Some("true") => true,
@@ -12736,7 +12743,10 @@ fn q8_prefill_wmma_enabled_from_env(value: Option<&str>, arch: &str, has_wmma: b
     }
 }
 
-fn q8_prefill_wmma_enabled(gpu: &Gpu) -> bool {
+// pub(crate): also used by forward_slots.rs (SP3 Task 2) to pick the same
+// Q8 WMMA fused-kernel gate the dense batched-prefill path uses. Visibility
+// change only — behavior and callers inside this file are unchanged.
+pub(crate) fn q8_prefill_wmma_enabled(gpu: &Gpu) -> bool {
     q8_prefill_wmma_enabled_from_env(
         hipfire_config::developer_var("HIPFIRE_Q8_PREFILL_WMMA")
             .ok()
@@ -12746,7 +12756,11 @@ fn q8_prefill_wmma_enabled(gpu: &Gpu) -> bool {
     )
 }
 
-fn moe_ffn_batched_admissible(ffn: &MoeFfnWeights, admit_mq6: bool, arch: &str) -> bool {
+// pub(crate): also used by forward_slots.rs (MoE slots port) to gate entry
+// into `prefill_moe_ffn_body_batched` from the slot-aware path, mirroring
+// this file's own `prefill_batch_pbs_eligible` precondition check. Visibility
+// change only — behavior and existing callers are unchanged.
+pub(crate) fn moe_ffn_batched_admissible(ffn: &MoeFfnWeights, admit_mq6: bool, arch: &str) -> bool {
     let Some(dtypes) = MoePrefillDtypes::from_ffn(ffn) else {
         return false;
     };
@@ -12828,7 +12842,10 @@ fn moe_ffn_batched_admissible(ffn: &MoeFfnWeights, admit_mq6: bool, arch: &str) 
 /// fused QKVZA / gate+up kernels are NOT plain GEMMs and are migrated in later
 /// slices (they need new table entries).
 #[inline]
-fn run_plain_gemm_key(
+// pub(crate): also used by forward_slots.rs (SP3 Task 2), which mirrors this
+// file's Q8_0 batched-prefill dispatch for the slot-aware path. Visibility
+// change only — body and existing callers are untouched.
+pub(crate) fn run_plain_gemm_key(
     gpu: &mut Gpu,
     key: hipfire_dispatch::types::KernelKey,
     w_buf: &GpuTensor,
@@ -12878,7 +12895,7 @@ fn run_plain_gemm_key(
 /// admits the current arch (it is NOT used to front-run the kernel's dispatch).
 #[inline]
 #[allow(clippy::too_many_arguments)]
-fn run_residual_gemm_key(
+pub(crate) fn run_residual_gemm_key(
     gpu: &mut Gpu,
     key: hipfire_dispatch::types::KernelKey,
     w_buf: &GpuTensor,
@@ -12931,7 +12948,7 @@ fn run_residual_gemm_key(
 /// admits the current arch — it does NOT front-run the kernel's internal dispatch.
 #[inline]
 #[allow(clippy::too_many_arguments)]
-fn run_fused_gate_up_key(
+pub(crate) fn run_fused_gate_up_key(
     gpu: &mut Gpu,
     key: hipfire_dispatch::types::KernelKey,
     w_gate: &GpuTensor,
@@ -12977,7 +12994,7 @@ fn run_fused_gate_up_key(
 /// ArchPredicate admits the current arch.
 #[inline]
 #[allow(clippy::too_many_arguments)]
-fn run_fused_qkv_key(
+pub(crate) fn run_fused_qkv_key(
     gpu: &mut Gpu,
     key: hipfire_dispatch::types::KernelKey,
     wq: &GpuTensor,
@@ -13021,7 +13038,7 @@ fn run_fused_qkv_key(
 /// call-site WMMA-vs-base arch split internally.
 #[inline]
 #[allow(clippy::too_many_arguments)]
-fn run_fused_qkvza_key(
+pub(crate) fn run_fused_qkvza_key(
     gpu: &mut Gpu,
     key: hipfire_dispatch::types::KernelKey,
     w_qkv: &GpuTensor,
@@ -13073,8 +13090,13 @@ fn run_fused_qkvza_key(
 /// per-token launch replaced by its N-batched equivalent. Byte-exact
 /// except for atomicAdd nondeterminism in the routed-down accumulation
 /// (same as the single-token indexed kernel it replaces).
+// pub(crate): also called directly by forward_slots.rs (MoE slots port) —
+// the MoE FFN body is stateless per row (no kv_cache, no dn_state, no
+// positions), so the flat N-row batch this function already expects is
+// exactly what a multi-slot step produces; no slot-aware variant is needed.
+// Visibility change only — behavior and existing callers are unchanged.
 #[allow(clippy::too_many_arguments)]
-fn prefill_moe_ffn_body_batched(
+pub(crate) fn prefill_moe_ffn_body_batched(
     gpu: &mut Gpu,
     ffn: &MoeFfnWeights,
     ffn_norm: &GpuTensor,
