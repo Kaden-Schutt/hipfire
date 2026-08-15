@@ -2295,11 +2295,18 @@ impl Executable {
 }
 
 const CLANG_OFFLOAD_BUNDLE_MAGIC: &[u8] = b"__CLANG_OFFLOAD_BUNDLE__";
+const COMPRESSED_OFFLOAD_BUNDLE_MAGIC: &[u8] = b"CCOB";
 
 /// HIP accepts a clang offload bundle at `hipModuleLoad`, while the public HSA
 /// code-object reader accepts only the embedded AMDGPU ELF. Unwrap exactly one
 /// AMDGPU entry in-process so HIP and AQL consume byte-identical device code.
 fn unwrap_clang_offload_bundle(code: Arc<[u8]>) -> Result<Arc<[u8]>, RuntimeError> {
+    if code.starts_with(COMPRESSED_OFFLOAD_BUNDLE_MAGIC) {
+        return Err(RuntimeError::InvalidOffloadBundle(
+            "compressed bundle (CCOB); rebuild the kernel cache so hipcc runs with \
+             --no-offload-compress, or unbundle it with clang-offload-bundler",
+        ));
+    }
     if !code.starts_with(CLANG_OFFLOAD_BUNDLE_MAGIC) {
         return Ok(code);
     }
@@ -2774,6 +2781,27 @@ mod tests {
         ) {
             let _ = parse_kernel_pm4_metadata(&elf, "kernel.kd", loaded_descriptor);
         }
+    }
+
+    #[test]
+    fn compressed_offload_bundle_is_named_not_passed_to_rocr() {
+        // CCOB v3 header prefix as clang emits it, followed by a zstd frame magic.
+        let mut blob = b"CCOB".to_vec();
+        blob.extend_from_slice(&[3, 0, 1, 0]);
+        blob.extend_from_slice(&[0x28, 0xb5, 0x2f, 0xfd]);
+        let err = unwrap_clang_offload_bundle(Arc::from(blob.as_slice()))
+            .expect_err("a compressed bundle must not reach the HSA code-object reader");
+        assert!(
+            err.to_string().contains("CCOB"),
+            "error must name the container: {err}"
+        );
+    }
+
+    #[test]
+    fn plain_code_object_passes_through_unwrapped() {
+        let elf: Vec<u8> = vec![0x7f, b'E', b'L', b'F', 2, 1, 1, 0];
+        let out = unwrap_clang_offload_bundle(Arc::from(elf.as_slice())).unwrap();
+        assert_eq!(&out[..], &elf[..]);
     }
 
     #[test]
