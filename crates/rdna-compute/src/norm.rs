@@ -477,29 +477,38 @@ impl Gpu {
     pub fn mul_f32(&mut self, a: &GpuTensor, b: &GpuTensor, c: &GpuTensor) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("mul", kernels::MUL_SRC, "mul_f32")?;
-        let func = &self.functions["mul_f32"];
 
         let n = a.numel() as i32;
-        let mut a_ptr = a.buf.as_ptr();
-        let mut b_ptr = b.buf.as_ptr();
-        let mut c_ptr = c.buf.as_ptr();
-        let mut n_val = n;
+        let a_ptr = a.buf.as_ptr();
+        let b_ptr = b.buf.as_ptr();
+        let c_ptr = c.buf.as_ptr();
 
         let mut params: Vec<*mut c_void> = vec![
-            &mut a_ptr as *mut _ as *mut c_void,
-            &mut b_ptr as *mut _ as *mut c_void,
-            &mut c_ptr as *mut _ as *mut c_void,
-            &mut n_val as *mut _ as *mut c_void,
+            &a_ptr as *const _ as *mut c_void,
+            &b_ptr as *const _ as *mut c_void,
+            &c_ptr as *const _ as *mut c_void,
+            &n as *const _ as *mut c_void,
         ];
 
         let block = 256u32;
         let grid = ((n as u32) + block - 1) / block;
         let bytes = crate::profile::elementwise_bytes(n as usize);
         let timer = crate::profile::begin_timer(&self.hip, "elementwise", "mul_f32", bytes);
-        let result = unsafe {
-            self.hip
-                .launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, None, &mut params)
-        };
+        let result = self.launch_maybe_blob(
+            "mul_f32",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(a_ptr);
+                blob.push_ptr(b_ptr);
+                blob.push_ptr(c_ptr);
+                blob.push_i32(n);
+                blob
+            },
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
