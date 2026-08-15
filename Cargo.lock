@@ -977,6 +977,7 @@ dependencies = [
  "hipfire-config",
  "hipfire-dispatch",
  "hipfire-engine",
+ "hipfire-generate",
  "hipfire-loader",
  "hipfire-pflash",
  "hipfire-runtime",
