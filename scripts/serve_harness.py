@@ -2725,7 +2725,11 @@ def main():
     ap.add_argument("--sampling", default="registry",
                     help="registry | registry:general|coding|instruct | greedy | recipe:general|coding|nothink | json:{...}")
     ap.add_argument("--mode", default="battery", choices=["battery", "chain", "session"])
-    ap.add_argument("--session", default="/home/kaden/mv/session_coding.json")
+    ap.add_argument(
+        "--session",
+        default=os.path.join(REPO, "benchmarks", "prompts", "session_coding.json"),
+        help="Multi-turn session fixture (default: the committed 8-turn coding chain).",
+    )
     ap.add_argument("--port", type=int, default=11520)
     ap.add_argument("--home", default=os.path.expanduser("~/.cache/serve_harness_home"))
     ap.add_argument("--serve-log", default="/tmp/serve_harness.serve.log")
