@@ -133,6 +133,7 @@ hipfire-arch-deepseek4 = { path = "../hipfire-arch-deepseek4" }
 hipfire-arch-dots-ocr = { path = "../hipfire-arch-dots-ocr" }
 hipfire-arch-gemma4 = { path = "../hipfire-arch-gemma4" }
 hipfire-arch-muse-glimmer = { path = "../hipfire-arch-muse-glimmer" }
+hipfire-pflash = { path = "../hipfire-pflash" }
 hipfire-loader = { path = "../hipfire-loader" }
 hipfire-detect = { path = "../hipfire-detect" }
 hipfire-atlas = { path = "../hipfire-atlas" }

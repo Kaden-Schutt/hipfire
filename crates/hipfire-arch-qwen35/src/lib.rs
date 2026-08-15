@@ -7,15 +7,18 @@
 //! This crate implements the [`hipfire_runtime::arch::Architecture`] trait
 //! for Qwen3.5. It owns the model forward pass, weight loading, KV-state
 //! layout, and the speculative-decoding glue that today is qwen35-specific
-//! (`speculative.rs`, `pflash.rs`).
+//! (`speculative.rs`; `pflash.rs` evacuated to `hipfire-pflash` per lean-up
+//! map B3 — retained legacy research, not mainline).
 //!
 //! Future work (per docs/plans/engine-modularization.prd Phase 2):
-//!   - `speculative.rs` and `pflash.rs` will become arch-generic and move
-//!     back into `hipfire-runtime`. They live here today because the
-//!     existing impls are deeply coupled to `qwen35::*` symbols (config,
-//!     weights, scratch, forward functions). PR 8 freezes the dep direction
-//!     `arch-qwen35 → runtime`, but accepts that today's spec/pflash are
-//!     not generic enough to live above the arch boundary.
+//!   - `speculative.rs` will become arch-generic and move back into
+//!     `hipfire-runtime`. It lives here today because the existing impl is
+//!     deeply coupled to `qwen35::*` symbols (config, weights, scratch,
+//!     forward functions). `pflash.rs` was evacuated to `hipfire-pflash`
+//!     per lean-up map B3 (§5.1) — retained legacy research, historical
+//!     reproduction only. PR 8 freezes the dep direction `arch-qwen35 →
+//!     runtime`, but accepts that today's spec is not generic enough to
+//!     live above the arch boundary.
 //!
 //! The `arch` module exposes the trait impl for use by the runtime's
 //! daemon and other consumers via `hipfire_arch_qwen35::Qwen35`.
@@ -59,8 +62,6 @@ pub mod mtp_spec;
 pub mod mtp_speculator;
 #[cfg(feature = "deltanet")]
 pub(crate) mod paro_moe;
-#[cfg(feature = "deltanet")]
-pub mod pflash;
 #[cfg(feature = "deltanet")]
 pub mod qwen35;
 #[cfg(feature = "deltanet")]

@@ -13,7 +13,7 @@
 //! verdict. Exit 0 on PASS (loaded + compat), 1 on tokenizer mismatch, 2 on
 //! load failure.
 
-use hipfire_arch_qwen35::pflash::{self, PflashConfig, PflashState};
+use hipfire_pflash::pflash::{self, PflashConfig, PflashState};
 use hipfire_arch_qwen35::qwen35;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::tokenizer::Tokenizer;
@@ -110,7 +110,7 @@ fn main() {
     }
 
     // Demonstrate the gating result that the daemon will see.
-    use hipfire_arch_qwen35::pflash::{decide_bypass, PflashMode, RequestKind};
+    use hipfire_pflash::pflash::{decide_bypass, PflashMode, RequestKind};
     let demo_cfg = PflashConfig {
         mode: PflashMode::Always,
         ..cfg.clone()
@@ -147,7 +147,7 @@ fn main() {
             min_keep_tokens: 0,
             ..cfg.clone()
         };
-        match hipfire_arch_qwen35::pflash::maybe_compress_prompt(
+        match hipfire_pflash::pflash::maybe_compress_prompt(
             &mut gpu,
             &mut state,
             &demo_cfg2,
@@ -155,7 +155,7 @@ fn main() {
             RequestKind::Text,
             &[],
         ) {
-            Ok(hipfire_arch_qwen35::pflash::PflashDecision::Compressed(cp)) => {
+            Ok(hipfire_pflash::pflash::PflashDecision::Compressed(cp)) => {
                 eprintln!(
                     "maybe_compress_prompt: source={} kept={} ratio={:.3}",
                     cp.source_tokens,
@@ -198,13 +198,13 @@ fn main() {
                 let scorer_health_ok = {
                     let mut probe_state = state.drafter_loaded;
                     if probe_state {
-                        let cpu = hipfire_arch_qwen35::pflash::compute_scores_batched(
+                        let cpu = hipfire_pflash::pflash::compute_scores_batched(
                             &mut state,
                             &mut gpu,
                             &toy_prompt,
                             demo_cfg2.block_size,
                         );
-                        let gpu_res = hipfire_arch_qwen35::pflash::compute_scores_batched_gpu(
+                        let gpu_res = hipfire_pflash::pflash::compute_scores_batched_gpu(
                             &mut state,
                             &mut gpu,
                             &toy_prompt,
@@ -251,7 +251,7 @@ fn main() {
                 );
                 length_ok && spans_disjoint && monotone_tokens && md5_present && scorer_health_ok
             }
-            Ok(hipfire_arch_qwen35::pflash::PflashDecision::Bypass { reason }) => {
+            Ok(hipfire_pflash::pflash::PflashDecision::Bypass { reason }) => {
                 eprintln!("maybe_compress_prompt unexpectedly bypassed: {reason:?}");
                 false
             }

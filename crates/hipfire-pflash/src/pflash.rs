@@ -26,7 +26,7 @@ use rdna_compute::{DType, Gpu};
 use std::path::Path;
 
 #[cfg(feature = "deltanet")]
-use crate::qwen35;
+use hipfire_arch_qwen35::qwen35;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PflashMode {

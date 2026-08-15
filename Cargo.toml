@@ -8,6 +8,7 @@ members = [
     "crates/radiowave",
     "crates/hipfire-runtime",
     "crates/hipfire-arch-qwen35",
+    "crates/hipfire-pflash",
     "crates/hipfire-arch-qwen35-vl",
     "crates/hipfire-arch-llama",
     "crates/hipfire-arch-deepseek4",

@@ -13080,11 +13080,11 @@ fn main() {
     // includes a `prefill_drafter` path AND `prefill_compression` != "off".
     // Lives alongside `model` so unload_model + this state are paired
     // teardowns.
-    let mut pflash_state: Option<hipfire_arch_qwen35::pflash::PflashState> = None;
+    let mut pflash_state: Option<hipfire_pflash::pflash::PflashState> = None;
     // The PflashConfig captured at load time. Per-request `prefill_*`
     // params override individual fields; the rest fall back to these
     // load-time defaults. Cleared alongside `pflash_state`.
-    let mut pflash_cfg: Option<hipfire_arch_qwen35::pflash::PflashConfig> = None;
+    let mut pflash_cfg: Option<hipfire_pflash::pflash::PflashConfig> = None;
     // Hetero PFlash: when prefill_drafter_device differs from the target,
     // the drafter weights/KV/scratch live on a sibling device. The compress
     // output is a host-side Vec<u32>, so no peer-copy is needed — generate
@@ -14311,11 +14311,11 @@ fn main() {
                                     batch_poisoned = None;
                                     continue;
                                 }
-                                let pf_cfg = hipfire_arch_qwen35::pflash::PflashConfig {
-                                    mode: hipfire_arch_qwen35::pflash::PflashMode::parse(
+                                let pf_cfg = hipfire_pflash::pflash::PflashConfig {
+                                    mode: hipfire_pflash::pflash::PflashMode::parse(
                                         &pflash_mode_str,
                                     )
-                                    .unwrap_or(hipfire_arch_qwen35::pflash::PflashMode::Off),
+                                    .unwrap_or(hipfire_pflash::pflash::PflashMode::Off),
                                     threshold_tokens: pflash_threshold,
                                     keep_ratio: pflash_keep_ratio,
                                     alpha: pflash_alpha,
@@ -14328,7 +14328,7 @@ fn main() {
                                     sparse_threshold: pflash_sparse_threshold,
                                 };
                                 let mut pf_state =
-                                    hipfire_arch_qwen35::pflash::PflashState::new(&pf_cfg);
+                                    hipfire_pflash::pflash::PflashState::new(&pf_cfg);
                                 // Pull the target tokenizer out of the loaded model
                                 // for the compat check. Both Qwen3.5 and plain
                                 // Qwen3 paths expose `tokenizer` on LoadedModel.
@@ -14359,7 +14359,7 @@ fn main() {
                                     let dg: &mut rdna_compute::Gpu =
                                         sibling.as_mut().unwrap_or(&mut gpu);
                                     dg.bind_thread_or_warn();
-                                    match hipfire_arch_qwen35::pflash::load_drafter(
+                                    match hipfire_pflash::pflash::load_drafter(
                                         &mut pf_state,
                                         dg,
                                         std::path::Path::new(pf_drafter_path),
@@ -14985,7 +14985,7 @@ fn main() {
                             .and_then(|p| p.get("prefill_compression"))
                             .and_then(|v| v.as_str())
                         {
-                            if let Some(m) = hipfire_arch_qwen35::pflash::PflashMode::parse(s) {
+                            if let Some(m) = hipfire_pflash::pflash::PflashMode::parse(s) {
                                 c.mode = m;
                             }
                         }
@@ -15061,7 +15061,7 @@ fn main() {
                     // Check EP eligibility first so batch-only enforcement fires before single-GPU fallback.
                     let serve_continuous_batch = parse_serve_continuous_batch(&msg);
                     let pflash_active = pf_cfg_owned.as_ref().is_some_and(|c| {
-                        !matches!(c.mode, hipfire_arch_qwen35::pflash::PflashMode::Off)
+                        !matches!(c.mode, hipfire_pflash::pflash::PflashMode::Off)
                     });
                     let ep_batch_eligible = if batch_scheduler.is_some() && m.ep.is_some() {
                         is_qwen_ep_batch_request_eligible(
@@ -22532,8 +22532,8 @@ fn generate_qwen35_mtp(
 fn generate_multi(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
-    pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>,
-    pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>,
+    pflash_state: Option<&mut hipfire_pflash::pflash::PflashState>,
+    pflash_cfg: Option<&hipfire_pflash::pflash::PflashConfig>,
     stdout: &mut std::io::Stdout,
     id: &str,
     prompt: &str,
@@ -22651,16 +22651,16 @@ fn generate_multi(
                 .map(|s| tokenizer.encode(s).iter().any(|&t| t == tid))
                 .unwrap_or(false);
             if in_user || in_system {
-                hipfire_arch_qwen35::pflash::RequestKind::ToolCall
+                hipfire_pflash::pflash::RequestKind::ToolCall
             } else {
-                hipfire_arch_qwen35::pflash::RequestKind::Text
+                hipfire_pflash::pflash::RequestKind::Text
             }
         }
-        None => hipfire_arch_qwen35::pflash::RequestKind::Text,
+        None => hipfire_pflash::pflash::RequestKind::Text,
     };
     let q_tokens = if let (Some(state), Some(cfg)) = (pflash_state, pflash_cfg) {
         if m.seq_pos == 0 {
-            match hipfire_arch_qwen35::pflash::maybe_compress_prompt(
+            match hipfire_pflash::pflash::maybe_compress_prompt(
                 gpu,
                 state,
                 cfg,
@@ -22668,7 +22668,7 @@ fn generate_multi(
                 request_kind,
                 &[],
             ) {
-                Ok(hipfire_arch_qwen35::pflash::PflashDecision::Compressed(cp)) => {
+                Ok(hipfire_pflash::pflash::PflashDecision::Compressed(cp)) => {
                     let _ = writeln!(
                         stdout,
                         r#"{{"type":"pflash_compressed","id":"{}","source_tokens":{},"kept_tokens":{},"keep_ratio":{:.6},"source_md5":"{}","compressed_md5":"{}","score_ms":{},"total_ms":{}}}"#,
@@ -22684,8 +22684,8 @@ fn generate_multi(
                     let _ = stdout.flush();
                     cp.token_ids
                 }
-                Ok(hipfire_arch_qwen35::pflash::PflashDecision::Bypass { reason }) => {
-                    if !matches!(reason, hipfire_arch_qwen35::pflash::BypassReason::ModeOff) {
+                Ok(hipfire_pflash::pflash::PflashDecision::Bypass { reason }) => {
+                    if !matches!(reason, hipfire_pflash::pflash::BypassReason::ModeOff) {
                         let _ = writeln!(
                             stdout,
                             r#"{{"type":"pflash_bypass","id":"{}","reason":"{}"}}"#,
@@ -24115,8 +24115,8 @@ fn generate(
     budget_alert_text: &str,
     max_think_tokens: usize,
     assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
-    pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>,
-    pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>,
+    pflash_state: Option<&mut hipfire_pflash::pflash::PflashState>,
+    pflash_cfg: Option<&hipfire_pflash::pflash::PflashConfig>,
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
     think_mode: ThinkMode,
@@ -24823,7 +24823,7 @@ fn generate(
             let mut dflash_bypass_reason: Option<&'static str> = None;
             let dflash_alpha = pflash_cfg.as_ref().map(|c| c.alpha);
             if let Some(cfg) = pflash_cfg.as_ref() {
-                if cfg.mode != hipfire_arch_qwen35::pflash::PflashMode::Off {
+                if cfg.mode != hipfire_pflash::pflash::PflashMode::Off {
                     let _ = writeln!(
                         stdout,
                         r#"{{"type":"pflash_bypass","id":"{}","reason":"dflash_decode_active (pflash compression on the DFlash path is a follow-up; set dflash_mode=off to compress with AR decode)"}}"#,
@@ -25015,18 +25015,18 @@ fn generate(
                 .map(|s| tokenizer.encode(s).iter().any(|&t| t == tid))
                 .unwrap_or(false);
             if in_user || in_system {
-                hipfire_arch_qwen35::pflash::RequestKind::ToolCall
+                hipfire_pflash::pflash::RequestKind::ToolCall
             } else {
-                hipfire_arch_qwen35::pflash::RequestKind::Text
+                hipfire_pflash::pflash::RequestKind::Text
             }
         }
-        None => hipfire_arch_qwen35::pflash::RequestKind::Text,
+        None => hipfire_pflash::pflash::RequestKind::Text,
     };
 
     // Stashed CompressedPrompt summary (when compression actually fired);
     // appended to the `done` event later so a streaming client gets one
     // consolidated line. None means no compression happened on this request.
-    let mut pflash_summary: Option<hipfire_arch_qwen35::pflash::CompressedPrompt> = None;
+    let mut pflash_summary: Option<hipfire_pflash::pflash::CompressedPrompt> = None;
     // Bypass reason when compression was attempted but skipped (mode != Off
     // and a drafter was loaded). PRD §3.1 requires "bypass reason if
     // skipped" in the done object.
@@ -25041,7 +25041,7 @@ fn generate(
     //   - nothing: empty string so backwards-compatible clients see the
     //     original done shape
     fn pflash_done_fragment(
-        s: &Option<hipfire_arch_qwen35::pflash::CompressedPrompt>,
+        s: &Option<hipfire_pflash::pflash::CompressedPrompt>,
         bypass_reason: &Option<String>,
         alpha: Option<f32>,
     ) -> String {
@@ -25080,7 +25080,7 @@ fn generate(
             // Sibling-device drafter: bind its device before compress, then
             // restore the target binding for decode. No-op when shared.
             compress_gpu.bind_thread_or_warn();
-            let decision = hipfire_arch_qwen35::pflash::maybe_compress_prompt(
+            let decision = hipfire_pflash::pflash::maybe_compress_prompt(
                 compress_gpu,
                 state,
                 cfg,
@@ -25090,7 +25090,7 @@ fn generate(
             );
             gpu.bind_thread_or_warn();
             match decision {
-                Ok(hipfire_arch_qwen35::pflash::PflashDecision::Compressed(cp)) => {
+                Ok(hipfire_pflash::pflash::PflashDecision::Compressed(cp)) => {
                     eprintln!(
                         "[pflash] COMPRESSED {} -> {} tok dev1 ({}ms)",
                         cp.source_tokens, cp.kept_tokens, cp.timings.total_ms
@@ -25114,7 +25114,7 @@ fn generate(
                     pflash_summary = Some(cp);
                     token_ids
                 }
-                Ok(hipfire_arch_qwen35::pflash::PflashDecision::Bypass { reason }) => {
+                Ok(hipfire_pflash::pflash::PflashDecision::Bypass { reason }) => {
                     eprintln!(
                         "[pflash] BYPASS reason={} q={}",
                         reason.as_str(),
@@ -25122,7 +25122,7 @@ fn generate(
                     );
                     // Only emit bypass events for non-trivial reasons.
                     // ModeOff is the silent default; nothing to report.
-                    if !matches!(reason, hipfire_arch_qwen35::pflash::BypassReason::ModeOff) {
+                    if !matches!(reason, hipfire_pflash::pflash::BypassReason::ModeOff) {
                         let r = reason.as_str();
                         let _ = writeln!(
                             stdout,
@@ -25324,7 +25324,7 @@ fn generate(
     // is not reversible to position M<N so partial rollback is unsafe.
     let cache_kill_switch = std::env::var("HIPFIRE_QWEN_PROMPT_CACHE").ok().as_deref() == Some("0");
     let pflash_active = pflash_cfg
-        .map(|c| !matches!(c.mode, hipfire_arch_qwen35::pflash::PflashMode::Off))
+        .map(|c| !matches!(c.mode, hipfire_pflash::pflash::PflashMode::Off))
         .unwrap_or(false);
     // Jinja-on disqualification: when `HIPFIRE_JINJA_CHAT=1` the first
     // turn renders through the upstream HF chat template (which the

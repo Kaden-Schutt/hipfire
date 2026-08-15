@@ -31,7 +31,7 @@
 //! of kept token IDs, so no peer-copy plumbing is required. ROCR_VISIBLE_DEVICES
 //! controls which physical GPUs the device indices resolve to.
 
-use hipfire_arch_qwen35::pflash::{
+use hipfire_pflash::pflash::{
     self, BypassReason, PflashConfig, PflashDecision, PflashMode, PflashState, RequestKind,
 };
 use hipfire_arch_qwen35::qwen35::{self, DeltaNetState};

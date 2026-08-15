@@ -166,10 +166,11 @@ works, what to measure, what counts as pass/fail.
   still needs `hipfire config set dflash_mode auto` or
   `HIPFIRE_DFLASH_DRAFT=<path>` first.
 - **PFlash is retained legacy research, not mainline or production functionality.**
-  Prefix caching supersedes it for supported serving workloads. Its remaining
-  code and artifacts exist only for historical reference and reproduction;
-  agents must not treat PFlash as a production element, recommendation,
-  acceptance route, or basis for a current performance claim.
+  It lives in `crates/hipfire-pflash` outside `crates/hipfire-arch-*` and exists
+  only for historical reference and reproduction; prefix caching supersedes it
+  for supported serving workloads. Agents must not treat PFlash as a production
+  element, recommendation, acceptance route, or basis for a current
+  performance claim.
 
 ---
 

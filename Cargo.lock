@@ -1022,6 +1022,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-pflash"
+version = "0.3.0"
+dependencies = [
+ "hip-bridge",
+ "hipfire-arch-qwen35",
+ "hipfire-config",
+ "hipfire-dispatch",
+ "hipfire-runtime",
+ "rdna-compute",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hipfire-quantize"
 version = "0.3.0"
 dependencies = [
@@ -1086,6 +1100,7 @@ dependencies = [
  "hipfire-detect",
  "hipfire-dispatch",
  "hipfire-loader",
+ "hipfire-pflash",
  "libc",
  "memmap2",
  "minijinja",

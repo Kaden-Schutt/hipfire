@@ -19,7 +19,7 @@
 //! is fast to iterate on. PRD §6 Phase 1 scope: prove the compress->target
 //! prefill plumbing, not Lucebox-class retrieval numbers.
 
-use hipfire_arch_qwen35::pflash::{
+use hipfire_pflash::pflash::{
     self, BypassReason, PflashConfig, PflashDecision, PflashMode, PflashState, RequestKind,
 };
 use hipfire_runtime::hfq::{self, HfqFile};
