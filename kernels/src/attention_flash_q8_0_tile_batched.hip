@@ -120,10 +120,9 @@ __global__ void attention_flash_q8_0_tile_batched(
     // Load Q for this batch position: 8 consecutive dims per thread (matches
     // asym3 tile so the dim-indexed partials/reduce layout is identical).
     const float* q_head = q + local_bid * q_dim + h * head_dim;
-    // Dims-per-thread = head_dim/32 (4 for hd=128, 8 for hd=256). The block is
+    // Dims-per-thread = head_dim/32 (4/8/16 for hd=128/256/512). The block is
     // always 32 lanes, so the __shfl_xor reductions below still sum over all
-    // head_dim dims; only the per-thread span (d0) scales with head_dim. The
-    // mq[]/out_vec[] arrays stay sized 8 (the hd=256 max).
+    // head_dim dims; only the per-thread span (d0) scales with head_dim.
     const int dpt = head_dim / 32;
     const int d0 = tid * dpt;
     // dpt is a runtime kernarg-derived trip count, so LLVM cannot prove that
@@ -134,7 +133,7 @@ __global__ void attention_flash_q8_0_tile_batched(
     // original per-dimension addressing as the fallback for every other shape.
     const bool lane_one_q8_block = head_dim % 32 == 0 && dpt <= 32
                                 && (d0 % 32) + dpt <= 32;
-    float mq[8];
+    float mq[16];
     for (int i = 0; i < dpt; i++) mq[i] = q_head[d0 + i];
 
     // Phase A: Q·K (Q8_0 dequant — 8 dims, spanning bi = d0/32, bj = d0%32).
@@ -212,7 +211,7 @@ __global__ void attention_flash_q8_0_tile_batched(
     __syncthreads();
 
     // Phase D: V-weighted accumulation (Q8_0)
-    float out_vec[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+    float out_vec[16] = { 0.0f };
     if (lane_one_q8_block && dpt == 8) {
         const int bi = d0 / 32;
         const int bj = d0 % 32;

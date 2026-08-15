@@ -12283,6 +12283,23 @@ fn vl_no_eviction_kv_cap(physical_cap: usize, max_seq: usize, adaptive_engaged: 
     }
 }
 
+/// Bound an eviction-enabled Qwen prefill write while an adaptive cache still
+/// owns the layout.  Before the one-way handoff, the eviction window is not a
+/// capacity limit (its gate is closed); writes must instead stop at every
+/// adaptive transition boundary.  After handoff, the normal budget window
+/// again determines how much can be appended before compaction.
+fn qwen_ar_eviction_prefill_chunk_limit(
+    seq_pos: usize,
+    eviction_window: usize,
+    adaptive_staging: bool,
+) -> usize {
+    if adaptive_staging {
+        qwen35::PREFILL_MAX_BATCH
+    } else {
+        eviction_window.saturating_sub(seq_pos).max(1)
+    }
+}
+
 /// Cold-reset VL trunk after a GPU/VMM/adaptive failure so the next request
 /// cannot inherit partial DN/KV/seq or mismatched conversation history.
 ///
@@ -12557,6 +12574,33 @@ mod mtp_host_timing_contract {
         assert_eq!(arr[0]["wall_us"], 1);
         assert_eq!(arr[1]["wall_us"], 2);
         assert_eq!(arr[2]["wall_us"], 3);
+    }
+}
+
+#[cfg(test)]
+mod adaptive_eviction_prefill_contract {
+    use super::qwen_ar_eviction_prefill_chunk_limit;
+    use hipfire_arch_qwen35::qwen35::PREFILL_MAX_BATCH;
+
+    #[test]
+    fn staging_uses_adaptive_boundaries_until_handoff() {
+        let window = 2048 + 128;
+        assert_eq!(
+            qwen_ar_eviction_prefill_chunk_limit(0, window, true),
+            PREFILL_MAX_BATCH
+        );
+        assert_eq!(
+            qwen_ar_eviction_prefill_chunk_limit(8192 - PREFILL_MAX_BATCH, window, true),
+            PREFILL_MAX_BATCH
+        );
+        assert_eq!(
+            qwen_ar_eviction_prefill_chunk_limit(2048, window, false),
+            128
+        );
+        assert_eq!(
+            qwen_ar_eviction_prefill_chunk_limit(window, window, false),
+            1
+        );
     }
 }
 
@@ -13489,6 +13533,11 @@ fn main() {
                     .and_then(|p| p.get("cask_beta"))
                     .and_then(|v| v.as_u64())
                     .unwrap_or(128) as usize;
+                let cask_handoff_tokens = msg
+                    .get("params")
+                    .and_then(|p| p.get("cask_handoff_tokens"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as usize;
                 let cask_core_frac = msg
                     .get("params")
                     .and_then(|p| p.get("cask_core_frac"))
@@ -13517,6 +13566,7 @@ fn main() {
                 let cask = CaskConfig {
                     sidecar: cask_sidecar,
                     cask_m_folding: cask_m_folding_effective,
+                    handoff_tokens: cask_handoff_tokens,
                     budget: cask_budget,
                     beta: cask_beta,
                     core_frac: cask_core_frac,
@@ -25927,8 +25977,13 @@ fn generate(
                     prefill_aborted = true;
                     break;
                 }
-                let space = window.saturating_sub(m.seq_pos).max(1);
-                let chunk_len = remaining.len().min(space);
+                let adaptive_staging = m
+                    .kv_adaptive
+                    .as_ref()
+                    .is_some_and(|ad| !ad.handoff_complete());
+                let chunk_limit =
+                    qwen_ar_eviction_prefill_chunk_limit(m.seq_pos, window, adaptive_staging);
+                let chunk_len = remaining.len().min(chunk_limit);
                 let (chunk, rest) = remaining.split_at(chunk_len);
                 if let Err(e) = qwen35::forward_prefill_batch(
                     gpu, weights, config, chunk, m.seq_pos, kv, dn, scratch, None, None, None, None,
@@ -25947,6 +26002,42 @@ fn generate(
                     return;
                 }
                 m.seq_pos += chunk_len;
+                // The eviction gate remains closed until adaptive KV reaches
+                // its explicit handoff point and finishes every transcode.
+                // Drive that transition at the same bounded committed-prefix
+                // boundaries as the ordinary adaptive prefill path, before
+                // asking eviction to observe the gate.
+                if let Some(ad) = m.kv_adaptive.as_mut() {
+                    match ad.maybe_downshift(gpu, kv, m.seq_pos) {
+                        Ok(steps) => {
+                            for step in steps {
+                                eprintln!(
+                                    "[adaptive-kv] downshift @ pos {} (eviction prefill): {:?} (K={:?} V={:?})",
+                                    m.seq_pos, step, ad.cur_k, ad.cur_v
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[adaptive-kv] maybe_downshift error @ pos {} (eviction prefill): {:?} — poisoning model",
+                                m.seq_pos, e
+                            );
+                            reset_ar_uncommitted_state!();
+                            emit_active_attempt_error(
+                                stdout,
+                                Some(id),
+                                &format!(
+                                    "adaptive KV transition failed during eviction prefill: {e}"
+                                ),
+                                "transient",
+                                true,
+                                false,
+                            );
+                            let _ = stdout.flush();
+                            return;
+                        }
+                    }
+                }
                 if let Some(hipfire_runtime::triattn::EvictionResult {
                     new_physical: new_phys,
                     ..
@@ -29241,6 +29332,12 @@ fn generate_gemma4(
         emit_error_with_id(stdout, id, "tokenizer not loaded");
         return;
     }
+    // Open the stream contract BEFORE any GPU work or token emission: the CLI's
+    // StreamContractGate fail-closes on any event preceding `gen_start`, so
+    // without this the first `token` is rejected, the client aborts, and the
+    // HTTP handler waits forever. Same fix as DS4 (e99583afa) and lfm2moe.
+    let gen_contract = gen_start_contract_version_for_arch(m.arch_id);
+    emit_gen_start(stdout, id, false, gen_contract);
     let Some(ModelState::Gemma4(bundle)) = m.state.as_mut() else {
         emit_error_with_id(
             stdout,
@@ -29369,27 +29466,57 @@ fn generate_gemma4(
 
     let t0 = Instant::now();
 
-    // ── Prefill: eager decode_step per prompt token. The LAST decode_step's
-    // logits are the predictions for the first generated token. ──
+    // ── Prefill. `forward_batch` preserves the eager result/KV contract while
+    // reading projection weights once for a small token block. Keep the path
+    // opt-in until long-context parity is certified on each supported board.
     let mut last_logits: Vec<f32> = Vec::new();
     {
-        let mut position = bundle.state.n_tokens as u32;
-        for &tok in &prompt_ids {
-            match gemma4::forward::decode_step(
-                &bundle.config,
-                &bundle.weights,
-                &mut bundle.state,
-                gpu,
-                tok,
-                position,
-            ) {
+        let requested_prefill_batch = std::env::var("HIPFIRE_GEMMA4_PREFILL_BATCH")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1)
+            .clamp(1, 64);
+        let prefill_batch = if requested_prefill_batch > 1
+            && !gemma4::forward::supports_batched_prefill(&bundle.weights)
+        {
+            eprintln!(
+                "[daemon] Gemma4 batched prefill is unavailable for this weight format; using eager prefill"
+            );
+            1
+        } else {
+            requested_prefill_batch
+        };
+        let mut offset = 0usize;
+        while offset < prompt_ids.len() {
+            let width = prefill_batch.min(prompt_ids.len() - offset);
+            let start_pos = bundle.state.n_tokens;
+            let result = if width == 1 {
+                gemma4::forward::decode_step(
+                    &bundle.config,
+                    &bundle.weights,
+                    &mut bundle.state,
+                    gpu,
+                    prompt_ids[offset],
+                    start_pos as u32,
+                )
+            } else {
+                gemma4::forward::forward_batch(
+                    &bundle.config,
+                    &bundle.weights,
+                    &mut bundle.state,
+                    gpu,
+                    &prompt_ids[offset..offset + width],
+                    start_pos,
+                )
+            };
+            match result {
                 Ok(logits) => last_logits = logits,
                 Err(e) => {
                     emit_error_with_id(stdout, id, format!("gemma4 prefill failed: {e:?}"));
                     return;
                 }
             }
-            position += 1;
+            offset += width;
         }
     }
     for &tok in &prompt_ids {
@@ -29462,6 +29589,7 @@ fn generate_gemma4(
         let mut rounds = 0usize;
         let mut total_accepted = 0usize;
         let mut stop = false;
+        let mut ttft_ms: Option<f64> = None;
         let decode_t0 = Instant::now();
         while !stop && generated_count < max_tokens {
             let committed_len = bundle.state.n_tokens;
@@ -29509,6 +29637,9 @@ fn generate_gemma4(
                 if stop_set.contains(&t) {
                     stop = true;
                     break;
+                }
+                if ttft_ms.is_none() {
+                    ttft_ms = Some(t0.elapsed().as_secs_f64() * 1000.0);
                 }
                 let frag = {
                     let tokenizer = m.tokenizer.as_ref().unwrap();
@@ -29574,6 +29705,8 @@ fn generate_gemma4(
         } else {
             0.0
         };
+        let prefill_tok_s = prompt_ids.len() as f64 * 1000.0 / prefill_ms.max(1) as f64;
+        let ttft_ms = ttft_ms.unwrap_or(total_ms as f64);
         // τ = mean tokens committed per round (accepted drafts + 1 bonus).
         let tau = if rounds > 0 {
             (total_accepted + rounds) as f64 / rounds as f64
@@ -29582,8 +29715,20 @@ fn generate_gemma4(
         };
         let _ = writeln!(
             stdout,
-            r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_ms":{},"total_ms":{},"spec":"gemma4_eagle","rounds":{},"tau":{:.3},"draft_len":{}}}"#,
-            id, generated_count, tok_s, prefill_ms, total_ms, rounds, tau, draft_len,
+            r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_tokens":{},"prefill_ms":{},"prefill_tok_s":{:.2},"decode_tok_s":{:.2},"ttft_ms":{:.3},"total_ms":{},"spec":"gemma4_eagle","rounds":{},"tau":{:.3},"draft_len":{},"attempt_id":{}}}"#,
+            id,
+            generated_count,
+            tok_s,
+            prompt_ids.len(),
+            prefill_ms,
+            prefill_tok_s,
+            tok_s,
+            ttft_ms,
+            total_ms,
+            rounds,
+            tau,
+            draft_len,
+            active_attempt_id(),
         );
         let _ = stdout.flush();
         return;
@@ -29597,6 +29742,7 @@ fn generate_gemma4(
     let mut rng = deepseek4::sampling::Xorshift::new(seed);
 
     let mut generated_count: usize = 0;
+    let mut ttft_ms: Option<f64> = None;
     let decode_t0 = Instant::now();
     loop {
         if generated_count >= max_tokens {
@@ -29607,6 +29753,10 @@ fn generate_gemma4(
             break;
         }
 
+        if ttft_ms.is_none() {
+            ttft_ms = Some(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+
         let frag = {
             let tokenizer = m.tokenizer.as_ref().unwrap();
             tokenizer.decode(&[next_tok])
@@ -29615,6 +29765,7 @@ fn generate_gemma4(
             "type": "token",
             "id": id,
             "text": frag,
+            "attempt_id": active_attempt_id(),
         });
         let _ = writeln!(stdout, "{}", envelope);
         let _ = stdout.flush();
@@ -29655,10 +29806,21 @@ fn generate_gemma4(
     } else {
         0.0
     };
+    let prefill_tok_s = prompt_ids.len() as f64 * 1000.0 / prefill_ms.max(1) as f64;
+    let ttft_ms = ttft_ms.unwrap_or(total_ms as f64);
     let _ = writeln!(
         stdout,
-        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_ms":{},"total_ms":{}}}"#,
-        id, generated_count, tok_s, prefill_ms, total_ms,
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_tokens":{},"prefill_ms":{},"prefill_tok_s":{:.2},"decode_tok_s":{:.2},"ttft_ms":{:.3},"total_ms":{},"attempt_id":{}}}"#,
+        id,
+        generated_count,
+        tok_s,
+        prompt_ids.len(),
+        prefill_ms,
+        prefill_tok_s,
+        tok_s,
+        ttft_ms,
+        total_ms,
+        active_attempt_id(),
     );
     let _ = stdout.flush();
 }
