@@ -13,6 +13,7 @@ description = "DeepSeek V4 Flash architecture for hipfire (Hyper-Connections + c
 [dependencies]
 hipfire-config = { path = "../hipfire-config" }
 hipfire-runtime = { path = "../hipfire-runtime" }
+hipfire-ds4-parent = { path = "../hipfire-ds4-parent" }
 hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
 serde = { version = "1", features = ["derive"] }

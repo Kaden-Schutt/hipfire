@@ -772,6 +772,7 @@ dependencies = [
  "hip-bridge",
  "hipfire-config",
  "hipfire-dispatch",
+ "hipfire-ds4-parent",
  "hipfire-reap",
  "hipfire-runtime",
  "libloading",
@@ -980,6 +981,20 @@ dependencies = [
  "hipfire-dispatch",
  "hipfire-runtime",
  "rdna-compute",
+]
+
+[[package]]
+name = "hipfire-ds4-parent"
+version = "0.3.0"
+dependencies = [
+ "hip-bridge",
+ "hipfire-config",
+ "hipfire-runtime",
+ "libloading",
+ "memmap2",
+ "rdna-compute",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

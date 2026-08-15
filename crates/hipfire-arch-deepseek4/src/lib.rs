@@ -60,7 +60,6 @@ pub mod forward;
 pub mod grammar;
 pub mod heterogeneous;
 pub mod mtp_speculator;
-pub mod parent;
 pub mod sampling;
 pub mod spec_decode;
 pub mod spec_emit;

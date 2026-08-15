@@ -17,11 +17,11 @@
 //! decode state is fully reset (`reset` + `zero_decode_caches`).
 
 use hipfire_arch_deepseek4::forward::decode_step;
-use hipfire_arch_deepseek4::parent::manifest::{
+use hipfire_ds4_parent::manifest::{
     sha256_bytes, sha256_file, CaptureBoundary, CaptureInfo, CorpusInfo, ModelInfo, ModelQuantInfo,
     OutputInfo, OutputKind, ParentManifest, ShardInfo, SourceInfo, MANIFEST_SCHEMA,
 };
-use hipfire_arch_deepseek4::parent::plog::PlogWriter;
+use hipfire_ds4_parent::plog::PlogWriter;
 use hipfire_arch_deepseek4::{DeepseekV4, DeepseekV4Config};
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;

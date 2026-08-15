@@ -719,7 +719,7 @@ mod config_cache {
     /// per-build default, which beats the checkpoint value. Every deviation
     /// from the header is logged — a silent one survived two months.
     ///
-    /// The parent-calibration path (`crate::parent`) must always use the
+    /// The parent-calibration path (parent) must always use the
     /// checkpoint value — inheriting a serving compensation into a reference
     /// forward is exactly the failure this whole effort exists to prevent.
     #[inline]
