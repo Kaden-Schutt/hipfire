@@ -120,8 +120,8 @@ CI assertions; each may only decrease.
 | `[[example]]` in `hipfire-runtime` | 65 | **9** | < 10 | MET |
 | duplicated `grammar.rs` | 2 | **0** | <= 1 | MET |
 | `docs/GLOSSARY.md` | absent | **present** | present | MET |
-| daemon source lines | 43,696 | 37,642 | < 5,000 | open |
-| daemon arch-crate refs | 95 | 57 | 0 | open |
+| daemon source lines | 43,696 | **22,440** | < 5,000 | open |
+| daemon arch-crate refs | 95 | **30** | 0 | open |
 | largest `hipfire-arch-*` crate | 51,955 | 47,581 | < 10,000 | open |
 | **compute : arch ratio** | **1.001 : 1** | **1.048 : 1** | > 2 : 1 | **unreachable — see below** |
 
@@ -343,9 +343,37 @@ scaffold plus the `vision` module already establish the pattern. The two
 rejected branches remain available to harvest their verbatim bodies once
 `common` exists.
 
-**Consequence for the ratchets.** `daemon arch refs` reaches 57, not 0, and
-daemon lines 37,642, not < 5,000. Both remain open and both are reachable by
-the sequential route above. They were not closed by accepting a stub.
+**The sequential retry then completed it (`dcab4abc0`).** A single agent built
+`hipfire-generate::common` from the shared tail first, then harvested the qwen
+and dense bodies onto it from the two rejected branches. Result:
+
+```
+daemon lines   37,642 -> 22,440      arch refs   57 -> 30
+'Stub for isolated build'  0 occurrences
+generate_spec  defined exactly once, in qwen.rs; dense.rs:515 calls the real one
+arch 22 still excluded from generate_gemma4 (generation_early_route matches 13 only)
+```
+
+The parent had to repair one defect the agent's own gate missed: it substituted
+fully-qualified crate paths *inside* `use super::{..}` brace lists, so each
+resolved as `super::hipfire_generate::*` and the test target failed with 34
+E0433s. Four blocks split; workspace `--all-targets` clean.
+
+Verified after the move, on hardware, not just by building:
+
+| path | tokens | tok/s | |
+|---|---:|---:|---|
+| local gfx1201 | 192 | 181.99 | vs 181.07 pre-move |
+| hiptrx single GPU | 4,096 | 420.4 | coherent |
+| hiptrx **pp=2 multi-GPU** | 793 | 385.3 | vs 257.4 pre-move |
+
+**Consequence for the ratchets.** `daemon arch refs` reaches 30, not 0, and
+daemon lines 22,440, not < 5,000. The remaining 30 are `use hipfire_arch_*`
+imports serving the batch and redline helpers (`drive_qwen35_ep_continuous_batch`,
+`redline_deepseek4_*`) — not `generate_*` bodies, and outside D3's scope. Moving
+them means re-layering the batch and redline paths onto `hipfire-generate`,
+which is a separate piece of work. Both ratchets stay open with a clear
+boundary rather than being closed by accepting a stub.
 
 ---
 
