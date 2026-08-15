@@ -2826,6 +2826,82 @@ pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_BT_SRC: &str =
 /// full-tile variants only. Used exclusively by hipfire-arch-muse-glimmer.
 pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_MUSE_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_gfx12_muse.hip");
+/// Muse Glimmer-owned batch-tiled gfx1100 residual GEMM (K2). Sibling of
+/// `GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_MUSE_SRC`; full-tile widths 4/6/8/12/16
+/// for gate/up shape measurement. Used exclusively by hipfire-arch-muse-glimmer.
+pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_BT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_gfx1100_muse_bt.hip");
+/// Muse Glimmer-owned batch-tiled gfx1100 residual GEMM with LDS HFQ affine
+/// codebook precompute (16 values per output-row/group). Sibling of
+/// `GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_BT_SRC`; full-tile widths 4/6/12
+/// only. Used exclusively by hipfire-arch-muse-glimmer.
+pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_CB_BT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_gfx1100_muse_cb_bt.hip");
+/// Muse Glimmer-owned multi-wave batch-tiled gfx1100 residual GEMM (K2, BT4).
+/// Sibling of `GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_BT_SRC`; groups
+/// NWAVES identical BT4 row waves into one block to expose activation-cache
+/// reuse/scheduling for exact gate/up. Used exclusively by
+/// hipfire-arch-muse-glimmer. Full-tile only (`batch % 64 == 0`).
+pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_MW_BT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_gfx1100_muse_mw_bt.hip");
+/// Muse Glimmer-owned batch-tiled gfx1100 residual GEMM, deterministic
+/// K-split phase 1 (partials only). Sibling of
+/// `GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_BT_SRC`; same K2 arithmetic and
+/// batch-tile structure but partitioned over K_SPLITS=4. Writes plain
+/// partials to the existing `[K_SPLITS][batch][M]` scratch layout — no
+/// atomicAdd, no residual. Finalize remains `gemm_ksplit_det_finalize`.
+/// Used exclusively by hipfire-arch-muse-glimmer. Full-tile only
+/// (`batch % (16*bt) == 0`).
+pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_KS_BT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_gfx1100_muse_ks_bt.hip");
+/// Muse Glimmer-owned multi-wave LDS-staged-X gfx1100 residual GEMM
+/// (K2, MW8, BT6). Sibling of `GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_MW_BT_SRC`
+/// and `…_MUSE_BT_SRC`; stages one 96×256 FP16 X group into static LDS and
+/// reuses it across 8 row waves. Exact gate/up only (M=19968, K=6656,
+/// batch % 96 == 0). Used exclusively by hipfire-arch-muse-glimmer.
+pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_LDS_G256_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_gfx1100_muse_lds_g256.hip");
+/// Muse Glimmer-owned row-reuse batch-tiled gfx1100 residual GEMM (K2).
+/// Sibling of `GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_BT_SRC`; each wave owns
+/// RM row tiles × BV batch tiles with RM*BV=12, loading each B half16 once per
+/// batch tile and reusing it across RM WMMA calls. Exact gate/up only
+/// (M=19968, K=6656, rm in {2,3,4,6}, batch % (16*BV) == 0). RM2/BV6 is
+/// production for gfx1100 B=192 gate/up via `gemm_hfq4g256_batched_lmhead`;
+/// other RM/BV instantiations remain measurement-only.
+pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_RM_BT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_gfx1100_muse_rm_bt.hip");
+/// Muse Glimmer-owned row-reuse gfx1100 residual GEMM with half-broadcast A
+/// dequant (K2). Sibling of `GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_RM_BT_SRC`;
+/// only lanes 0..15 load/dequant each A fragment and bit-broadcast the raw
+/// half16 u32s to the paired lane via wave32 shuffle. Exact gate/up only
+/// (M=19968, K=6656, rm in {2,4}, batch % (16*BV) == 0). Measurement-only;
+/// used exclusively by hipfire-arch-muse-glimmer.
+pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_RM_HB_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_gfx1100_muse_rm_hb.hip");
+/// Muse Glimmer-owned row-reuse gfx1100 residual GEMM with packed-half2 A
+/// dequant (K2). Sibling of `GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_RM_BT_SRC`;
+/// dequants each 16-nibble A fragment via eight `__hfma2` half2 ops and
+/// reinterprets as the half16 WMMA operand. Exact gate/up only
+/// (M=19968, K=6656, rm in {1,2}, batch % (16*BV) == 0). Measurement-only;
+/// used exclusively by hipfire-arch-muse-glimmer. Packed path is not assumed
+/// bit-exact vs scalar; full-output bit oracle is authoritative.
+pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_RM_PK_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_gfx1100_muse_rm_pk.hip");
+/// Muse Glimmer-owned row-reuse gfx1100 residual GEMM with two-slot X-fragment
+/// software pipeline (K2). Sibling of `GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_RM_BT_SRC`;
+/// RM2/BV6 only. For each g/kt fragment issues B loads ahead of A dequant and
+/// keeps at most two live B fragments. Scalar and packed-half2 dequant symbols
+/// share one module. Exact gate/up only (M=19968, K=6656, batch=192).
+/// Measurement-only; used exclusively by hipfire-arch-muse-glimmer.
+pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_RM_PIPE_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_gfx1100_muse_rm_pipe.hip");
+
+
+
+
+
+
+
 pub const GEMM_HFQ4G256_LMHEAD_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_lmhead_wmma.gfx12.hip");
 // Q8_1 MMQ prefill variant — opt-in via HIPFIRE_MMQ=1, gated to RDNA3/3.5.
@@ -4431,6 +4507,9 @@ pub const TRIATTN_SCORE_ASYM4_SRC: &str =
 /// TriAttention scoring on asym2 (Givens-rotated 2-bit) K cache.
 pub const TRIATTN_SCORE_ASYM2_SRC: &str =
     include_str!("../../../kernels/src/triattn_score_asym2.hip");
+/// TriAttention scoring for adaptive signed-FWHT K caches.
+pub const TRIATTN_SCORE_FWHT_SRC: &str =
+    include_str!("../../../kernels/src/triattn_score_fwht.hip");
 
 /// Gather-based compaction for KV eviction: copy `budget` src rows to dst.
 pub const KV_COMPACT_GATHER_SRC: &str = include_str!("../../../kernels/src/kv_compact_gather.hip");
@@ -4747,6 +4826,22 @@ pub const ROPE_PARTIAL_INTERLEAVED_BATCHED_SRC: &str =
 #[cfg(feature = "deltanet")]
 pub const ROPE_PARTIAL_HALFSPLIT_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/rope_partial_halfsplit_batched.hip");
+
+/// 3D mrope, half-split convention. Twin of ROPE_PARTIAL_HALFSPLIT_SRC,
+/// differing only in which position each frequency index reads: band mapping
+/// is H if (d%3==1 && d < 3*sec_h), W if (d%3==2 && d < 3*sec_w), else T
+/// (the interleaved [THWTHW...TT] layout HF's apply_interleaved_mrope
+/// produces). See `hipfire_arch_qwen35_vl::mrope::mrope_axis_for_freq` for
+/// the CPU-side spec this arithmetic must match exactly.
+#[cfg(feature = "deltanet")]
+pub const ROPE_MROPE_HALFSPLIT_SRC: &str =
+    include_str!("../../../kernels/src/rope_mrope_halfsplit.hip");
+
+/// Batched twin of ROPE_MROPE_HALFSPLIT_SRC — see that const for the
+/// band-mapping rationale.
+#[cfg(feature = "deltanet")]
+pub const ROPE_MROPE_HALFSPLIT_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/rope_mrope_halfsplit_batched.hip");
 
 /// 1D causal depthwise convolution (kernel_size=4) with persistent ring buffer state.
 /// For decode: one token at a time. conv_state: [n_channels × 3] ring buffer.

@@ -10,6 +10,7 @@
 
 use crate::config::GlimmerConfig;
 use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::kv_backend::KvBackend;
 use hipfire_runtime::llama::{f16_to_f32, EmbeddingFormat, KvCache, WeightTensor};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -1723,6 +1724,32 @@ impl GlimmerState {
         cfg: &GlimmerConfig,
         max_seq: usize,
     ) -> Result<Self, String> {
+        // `HIPFIRE_GLIMMER_KV_VMM=0` falls back to the contiguous allocator.
+        // Default remains VMM so examples/tools keep working without a LoadCtx.
+        let use_vmm = std::env::var("HIPFIRE_GLIMMER_KV_VMM")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(true);
+        let backend = if use_vmm {
+            KvBackend::Vmm
+        } else {
+            KvBackend::Contiguous
+        };
+        Self::new_with_max_seq_backend(gpu, cfg, max_seq, backend)
+    }
+
+    /// Allocate Glimmer state with an explicit KV storage backend.
+    ///
+    /// Chooses VMM iff `backend == KvBackend::Vmm`; otherwise contiguous.
+    /// Does not read or mutate process environment — loader callers pass
+    /// `ctx.kv_backend` so registry defaults and explicit overrides are
+    /// deterministic. Non-loader callers should keep using
+    /// [`Self::new_with_max_seq`], which still honors `HIPFIRE_GLIMMER_KV_VMM`.
+    pub fn new_with_max_seq_backend(
+        gpu: &mut Gpu,
+        cfg: &GlimmerConfig,
+        max_seq: usize,
+        backend: KvBackend,
+    ) -> Result<Self, String> {
         struct StateGuard {
             kv_sliding: Option<KvCache>,
             kv_full: Option<KvCache>,
@@ -1860,10 +1887,9 @@ impl GlimmerState {
         // wraparound in every consumer; this does not.
         //
         // Precedent: DeepSeek4 (hipfire-arch-deepseek4/src/forward.rs:1813).
-        // `HIPFIRE_GLIMMER_KV_VMM=0` falls back to the contiguous allocator.
-        let use_vmm = std::env::var("HIPFIRE_GLIMMER_KV_VMM")
-            .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(true);
+        // Backend is chosen by the caller (typed ctor) or by
+        // `HIPFIRE_GLIMMER_KV_VMM` via `new_with_max_seq`.
+        let use_vmm = backend == KvBackend::Vmm;
         if use_vmm {
             let sliding_layers = vec![true; cfg.n_sliding_layers()];
             let full_layers = vec![true; cfg.n_full_layers()];

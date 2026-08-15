@@ -290,6 +290,7 @@ fn main() {
         enable_thinking,
         bos_token: None,
         reasoning_strength: None,
+        reasoning_effort: None,
     };
 
     let t_render = Instant::now();

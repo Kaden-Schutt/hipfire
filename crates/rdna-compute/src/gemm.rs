@@ -11114,6 +11114,920 @@ impl Gpu {
         Ok(true)
     }
 
+    /// Muse Glimmer-owned HFQ4-G256 residual GEMM (gfx1100 only, K2 batch-tiled).
+    ///
+    /// Sibling of [`Self::gemm_hfq4g256_residual_muse`], NOT a replacement: it
+    /// touches no shared selector, heuristic, or tile constant, and nothing
+    /// outside hipfire-arch-muse-glimmer (or its measurement oracle) calls it.
+    ///
+    /// Preserves gfx1100 K2 arithmetic from
+    /// `gemm_hfq4g256_residual_wmma_k2.hip` while sharing each weight dequant
+    /// across independent 16-column batch tiles. Full-tile only
+    /// (`batch_size % (16*bt) == 0`); candidate widths 4/6/8/12/16.
+    /// Exact gate/up shape only: M=19968, K=6656.
+    ///
+    /// Returns `Ok(false)` without bind/compile when arch/shape/width/batch
+    /// preconditions fail. Does not zero Y; performs `Y += W@X`.
+    pub fn gemm_hfq4g256_residual_muse_gfx1100(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        bt: usize,
+    ) -> HipResult<bool> {
+        let kname = match bt {
+            4 => "gemm_hfq4g256_residual_wmma_gfx1100_muse_full4",
+            6 => "gemm_hfq4g256_residual_wmma_gfx1100_muse_full6",
+            8 => "gemm_hfq4g256_residual_wmma_gfx1100_muse_full8",
+            12 => "gemm_hfq4g256_residual_wmma_gfx1100_muse_full12",
+            16 => "gemm_hfq4g256_residual_wmma_gfx1100_muse_full16",
+            _ => return Ok(false),
+        };
+        if !self.arch_caps.is_gfx1100()
+            || m != 19_968
+            || k != 6_656
+            || batch_size == 0
+            || batch_size % (16 * bt) != 0
+        {
+            return Ok(false);
+        }
+        self.bind_thread()?;
+        // Module name is the FILE, not the symbol, so the source compiles once
+        // instead of once per requested width.
+        self.ensure_kernel(
+            "gemm_hfq4g256_residual_wmma_gfx1100_muse_bt",
+            kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_BT_SRC,
+            kname,
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+
+        let mut a_ptr = a.buf.as_ptr();
+        let mut x_ptr = x_f16_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+
+        let row_tiles = (m + 15) / 16;
+        let batch_tiles = batch_size / (16 * bt);
+
+        let bytes =
+            crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * k * 2 + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kname, bytes);
+        let result = self.launch_maybe_blob(
+            kname,
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(bs_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result?;
+        Ok(true)
+    }
+
+    /// Second experimental Muse-only gfx1100 residual GEMM candidate: LDS
+    /// codebook of the 16 affine HFQ values per output-row/group, then the
+    /// same bit-exact batch-tiled WMMA accumulation as
+    /// [`Self::gemm_hfq4g256_residual_muse_gfx1100`].
+    ///
+    /// Sibling of that method, NOT a replacement: touches no shared selector,
+    /// heuristic, or tile constant. Full-tile only (`batch_size % (16*bt) == 0`);
+    /// candidate widths 4/6/12. Exact gate/up shape only: M=19968, K=6656.
+    ///
+    /// Returns `Ok(false)` without bind/compile when arch/shape/width/batch
+    /// preconditions fail. Does not zero Y; performs `Y += W@X`.
+    pub fn gemm_hfq4g256_residual_muse_gfx1100_cb(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        bt: usize,
+    ) -> HipResult<bool> {
+        let kname = match bt {
+            4 => "gemm_hfq4g256_residual_wmma_gfx1100_muse_cb_full4",
+            6 => "gemm_hfq4g256_residual_wmma_gfx1100_muse_cb_full6",
+            12 => "gemm_hfq4g256_residual_wmma_gfx1100_muse_cb_full12",
+            _ => return Ok(false),
+        };
+        if !self.arch_caps.is_gfx1100()
+            || m != 19_968
+            || k != 6_656
+            || batch_size == 0
+            || batch_size % (16 * bt) != 0
+        {
+            return Ok(false);
+        }
+        self.bind_thread()?;
+        // Module name is the FILE, not the symbol, so the source compiles once
+        // instead of once per requested width.
+        self.ensure_kernel(
+            "gemm_hfq4g256_residual_wmma_gfx1100_muse_cb_bt",
+            kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_CB_BT_SRC,
+            kname,
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+
+        let mut a_ptr = a.buf.as_ptr();
+        let mut x_ptr = x_f16_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+
+        let row_tiles = (m + 15) / 16;
+        let batch_tiles = batch_size / (16 * bt);
+
+        let bytes =
+            crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * k * 2 + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kname, bytes);
+        let result = self.launch_maybe_blob(
+            kname,
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(bs_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result?;
+        Ok(true)
+    }
+
+    /// Muse Glimmer-owned multi-wave batch-tiled gfx1100 residual GEMM (K2, BT4).
+    ///
+    /// Sibling of [`Self::gemm_hfq4g256_residual_muse_gfx1100`], NOT a replacement:
+    /// it touches no shared selector, heuristic, or tile constant, and nothing
+    /// outside hipfire-arch-muse-glimmer (or its measurement oracle) calls it.
+    ///
+    /// Groups NWAVES identical BT4 row waves into one block to expose
+    /// activation-cache reuse/scheduling for exact gate/up. Each wave
+    /// independently owns one adjacent 16-row tile and the same 64-column batch
+    /// tile, preserving the exact WMMA order and output mapping per wave.
+    /// Full-tile only (`batch % 64 == 0`); candidate waves 2/4/8. Exact gate/up
+    /// shape only: M=19968, K=6656. Grid `[ceil(ceil(M/16)/waves), batch/64, 1]`,
+    /// block `[32*waves, 1, 1]`. Does not zero Y; performs `Y += W@X`.
+    ///
+    /// Returns `Ok(false)` without bind/compile when arch/shape/waves/batch
+    /// preconditions fail.
+    pub fn gemm_hfq4g256_residual_muse_gfx1100_mw(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        waves: usize,
+    ) -> HipResult<bool> {
+        let kname = match waves {
+            2 => "gemm_hfq4g256_residual_wmma_gfx1100_muse_mw2_bt4",
+            4 => "gemm_hfq4g256_residual_wmma_gfx1100_muse_mw4_bt4",
+            8 => "gemm_hfq4g256_residual_wmma_gfx1100_muse_mw8_bt4",
+            _ => return Ok(false),
+        };
+        if !self.arch_caps.is_gfx1100()
+            || m != 19_968
+            || k != 6_656
+            || batch_size == 0
+            || batch_size % 64 != 0
+        {
+            return Ok(false);
+        }
+        self.bind_thread()?;
+        // Module name is the FILE, not the symbol, so the source compiles once
+        // instead of once per requested waves.
+        self.ensure_kernel(
+            "gemm_hfq4g256_residual_wmma_gfx1100_muse_mw_bt",
+            kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_MW_BT_SRC,
+            kname,
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+
+        let mut a_ptr = a.buf.as_ptr();
+        let mut x_ptr = x_f16_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+
+        let row_tiles = (m + 15) / 16;
+        let grid_x = (row_tiles + waves - 1) / waves;
+        let batch_tiles = batch_size / 64;
+
+        let bytes =
+            crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * k * 2 + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kname, bytes);
+        let result = self.launch_maybe_blob(
+            kname,
+            [grid_x as u32, batch_tiles as u32, 1],
+            [32 * waves as u32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(bs_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result?;
+        Ok(true)
+    }
+
+    /// Muse Glimmer-owned multi-wave LDS-staged-X gfx1100 residual GEMM
+    /// (K2, MW8, BT6).
+    ///
+    /// Sibling of [`Self::gemm_hfq4g256_residual_muse_gfx1100_mw`] and
+    /// [`Self::gemm_hfq4g256_residual_muse_gfx1100`], NOT a replacement: it
+    /// touches no shared selector, heuristic, or tile constant, and nothing
+    /// outside hipfire-arch-muse-glimmer (or its measurement oracle) calls it.
+    ///
+    /// Stages one full HFQ group of activations for 96 batch columns into
+    /// static LDS (96×256 FP16 = 49,152 B), then reuses it across 8 row waves
+    /// (128 output rows). Preserves exact per-accumulator K2 g/kt WMMA order.
+    /// Exact gate/up shape only: M=19968, K=6656. Full-tile only
+    /// (`batch % 96 == 0`; B192 canonical). Grid `[M/128, batch/96, 1]`,
+    /// block `[256, 1, 1]`, dynamic shared_mem=0 (LDS is static). Does not
+    /// zero Y; performs `Y += W@X`.
+    ///
+    /// Returns `Ok(false)` without bind/compile when arch/shape/batch
+    /// preconditions fail.
+    pub fn gemm_hfq4g256_residual_muse_gfx1100_lds_g256(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<bool> {
+        const KNAME: &str = "gemm_hfq4g256_residual_wmma_gfx1100_muse_lds_g256_mw8_bt6";
+        if !self.arch_caps.is_gfx1100()
+            || m != 19_968
+            || k != 6_656
+            || batch_size == 0
+            || batch_size % 96 != 0
+        {
+            return Ok(false);
+        }
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_hfq4g256_residual_wmma_gfx1100_muse_lds_g256",
+            kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_LDS_G256_SRC,
+            KNAME,
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+
+        let mut a_ptr = a.buf.as_ptr();
+        let mut x_ptr = x_f16_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+
+        let grid_x = m / 128;
+        let batch_tiles = batch_size / 96;
+
+        let bytes =
+            crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * k * 2 + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", KNAME, bytes);
+        let result = self.launch_maybe_blob(
+            KNAME,
+            [grid_x as u32, batch_tiles as u32, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(bs_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result?;
+        Ok(true)
+    }
+
+    /// Muse Glimmer-owned batch-tiled gfx1100 residual GEMM, deterministic
+    /// K-split (o/down). Sibling of
+    /// [`Self::gemm_hfq4g256_residual_wmma_ksplit_det`], NOT a replacement: it
+    /// touches no shared selector, heuristic, or tile constant, and nothing
+    /// outside hipfire-arch-muse-glimmer (or its measurement oracle) calls it.
+    ///
+    /// Keeps K_SPLITS=4 and the same g_start/g_end partition as ksplit_det.
+    /// Each independent BV accumulator sees the same per-split g/kt A-then-B
+    /// WMMA order as production ksplit_det; weight dequant is shared once
+    /// across BV 16-column batch tiles. Writes plain partials to the existing
+    /// `[K_SPLITS][batch][M]` scratch layout — no atomicAdd, no residual.
+    /// Finalize remains `gemm_ksplit_det_finalize` (fixed-order, residual +
+    /// partials → Y). Full-tile only (`batch % (16*bt) == 0`); candidate widths
+    /// 4/6/12. Exact o/down shapes only: M=6656, K in {4096, 19968}. Grid phase1
+    /// `[row_tiles, batch/(16*bt), 4]`, block `[32,1,1]`; phase2 finalize over
+    /// all cells. Timer covers both phases. Does not zero Y.
+    ///
+    /// Returns `Ok(false)` without bind/compile when arch/shape/width/batch
+    /// preconditions fail.
+    pub fn gemm_hfq4g256_residual_muse_gfx1100_ksplit(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        bt: usize,
+    ) -> HipResult<bool> {
+        let kname = match bt {
+            4 => "gemm_hfq4g256_residual_wmma_gfx1100_muse_ks_full4",
+            6 => "gemm_hfq4g256_residual_wmma_gfx1100_muse_ks_full6",
+            12 => "gemm_hfq4g256_residual_wmma_gfx1100_muse_ks_full12",
+            _ => return Ok(false),
+        };
+        if !self.arch_caps.is_gfx1100()
+            || m != 6_656
+            || (k != 4_096 && k != 19_968)
+            || batch_size == 0
+            || batch_size % (16 * bt) != 0
+        {
+            return Ok(false);
+        }
+        self.bind_thread()?;
+        const K_SPLITS: u32 = 4;
+        self.ensure_kernel(
+            "gemm_hfq4g256_residual_wmma_gfx1100_muse_ks_bt",
+            kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_KS_BT_SRC,
+            kname,
+        )?;
+        self.ensure_kernel(
+            "gemm_ksplit_det_finalize",
+            kernels::GEMM_KSPLIT_DET_FINALIZE_SRC,
+            "gemm_ksplit_det_finalize",
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+        let n_cells = batch_size * m;
+        let partials_ptr = self.ensure_ksplit_det_partials(K_SPLITS as usize * n_cells * 4)?;
+
+        let bytes =
+            crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * k * 2 + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kname, bytes);
+
+        // ── Phase 1: per-split partials (plain store, no atomic) ──
+        let mut a_ptr = a.buf.as_ptr();
+        let mut x_ptr = x_f16_ptr;
+        let mut p_ptr = partials_ptr;
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+        let mut params1: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut p_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+        let row_tiles = ((m + 15) / 16) as u32;
+        let batch_tiles = (batch_size / (16 * bt)) as u32;
+        self.launch_maybe_blob(
+            kname,
+            [row_tiles, batch_tiles, K_SPLITS],
+            [32, 1, 1],
+            0,
+            &mut params1,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(p_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(bs_val);
+                b
+            },
+        )?;
+
+        // ── Phase 2: fixed-order finalize (residual + partials → Y) ──
+        let mut y_ptr = y.buf.as_ptr();
+        let mut p_ptr2 = partials_ptr;
+        let mut bs_val2 = batch_size as i32;
+        let mut m_val2 = m as i32;
+        let mut params2: Vec<*mut c_void> = vec![
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut p_ptr2 as *mut _ as *mut c_void,
+            &mut bs_val2 as *mut _ as *mut c_void,
+            &mut m_val2 as *mut _ as *mut c_void,
+        ];
+        let fin_grid = ((n_cells + 255) / 256) as u32;
+        let r = self.launch_maybe_blob(
+            "gemm_ksplit_det_finalize",
+            [fin_grid, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params2,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(y_ptr);
+                b.push_ptr(p_ptr2);
+                b.push_i32(bs_val2);
+                b.push_i32(m_val2);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        r?;
+        Ok(true)
+    }
+
+    /// Muse Glimmer-owned row-reuse batch-tiled gfx1100 residual GEMM (K2).
+    ///
+    /// Production for exact gate/up through [`Self::gemm_hfq4g256_batched_lmhead`]
+    /// when gfx1100 + M=19968 + K=6656 + B=192 with `rm=2` (symbol
+    /// `gemm_hfq4g256_residual_wmma_gfx1100_muse_rm2_bv6`). Other rm
+    /// instantiations (3/4/6 → BV 4/3/2) remain measurement-only. Sibling of
+    /// [`Self::gemm_hfq4g256_residual_muse_gfx1100`]; no shared selector,
+    /// heuristic, or tile constant beyond that exact production gate.
+    ///
+    /// Each wave owns RM row tiles × BV batch tiles with RM*BV=12. For each g/kt
+    /// pair it loads/dequants one A fragment per row tile, loads each B half16
+    /// once per batch tile, and reuses that B fragment across all RM WMMA calls.
+    /// Preserves exact per-accumulator K2 g/kt WMMA order and `Y +=` semantics.
+    /// Full-tile only (`batch % (16*BV) == 0`); candidate rm 2/3/4/6
+    /// (BV 6/4/3/2). Exact gate/up shape only: M=19968, K=6656.
+    /// Grid `[M/(16*RM), batch/(16*BV), 1]`, block `[32, 1, 1]`.
+    ///
+    /// Returns `Ok(false)` without bind/compile when arch/shape/rm/batch
+    /// preconditions fail. Does not zero Y; performs `Y += W@X`.
+    pub fn gemm_hfq4g256_residual_muse_gfx1100_rm(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        rm: usize,
+    ) -> HipResult<bool> {
+        let (kname, bv) = match rm {
+            2 => (
+                "gemm_hfq4g256_residual_wmma_gfx1100_muse_rm2_bv6",
+                6usize,
+            ),
+            3 => (
+                "gemm_hfq4g256_residual_wmma_gfx1100_muse_rm3_bv4",
+                4usize,
+            ),
+            4 => (
+                "gemm_hfq4g256_residual_wmma_gfx1100_muse_rm4_bv3",
+                3usize,
+            ),
+            6 => (
+                "gemm_hfq4g256_residual_wmma_gfx1100_muse_rm6_bv2",
+                2usize,
+            ),
+            _ => return Ok(false),
+        };
+        if !self.arch_caps.is_gfx1100()
+            || m != 19_968
+            || k != 6_656
+            || batch_size == 0
+            || batch_size % (16 * bv) != 0
+        {
+            return Ok(false);
+        }
+        self.bind_thread()?;
+        // Module name is the FILE, not the symbol, so the source compiles once
+        // instead of once per requested rm.
+        self.ensure_kernel(
+            "gemm_hfq4g256_residual_wmma_gfx1100_muse_rm_bt",
+            kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_RM_BT_SRC,
+            kname,
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+
+        let mut a_ptr = a.buf.as_ptr();
+        let mut x_ptr = x_f16_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+
+        let row_tiles = m / (16 * rm);
+        let batch_tiles = batch_size / (16 * bv);
+
+        let bytes =
+            crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * k * 2 + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kname, bytes);
+        let result = self.launch_maybe_blob(
+            kname,
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(bs_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result?;
+        Ok(true)
+    }
+
+    /// Muse Glimmer-owned row-reuse gfx1100 residual GEMM with half-broadcast A
+    /// dequant (K2).
+    ///
+    /// Sibling of [`Self::gemm_hfq4g256_residual_muse_gfx1100_rm`], NOT a
+    /// replacement: measurement-only; touches no shared selector. For every A
+    /// fragment only lanes 0..15 load/dequant; the resulting raw 8×u32 half16
+    /// representation is wave32-broadcast from source lane `(tid&15)` to its
+    /// paired lane, then bitcast back. B remains directly loaded. Preserves
+    /// exact per-accumulator K2 g/kt WMMA order and `Y +=` semantics.
+    /// Full-tile only (`batch % (16*BV) == 0`); rm 2→BV6, rm 4→BV3.
+    /// Exact gate/up shape only: M=19968, K=6656.
+    /// Grid `[M/(16*RM), batch/(16*BV), 1]`, block `[32, 1, 1]`.
+    ///
+    /// Returns `Ok(false)` without bind/compile when arch/shape/rm/batch
+    /// preconditions fail. Does not zero Y; performs `Y += W@X`.
+    pub fn gemm_hfq4g256_residual_muse_gfx1100_rm_hb(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        rm: usize,
+    ) -> HipResult<bool> {
+        let (kname, bv) = match rm {
+            2 => (
+                "gemm_hfq4g256_residual_wmma_gfx1100_muse_rm2_bv6_hb",
+                6usize,
+            ),
+            4 => (
+                "gemm_hfq4g256_residual_wmma_gfx1100_muse_rm4_bv3_hb",
+                3usize,
+            ),
+            _ => return Ok(false),
+        };
+        if !self.arch_caps.is_gfx1100()
+            || m != 19_968
+            || k != 6_656
+            || batch_size == 0
+            || batch_size % (16 * bv) != 0
+        {
+            return Ok(false);
+        }
+        self.bind_thread()?;
+        // Module name is the FILE, not the symbol, so the source compiles once
+        // instead of once per requested rm.
+        self.ensure_kernel(
+            "gemm_hfq4g256_residual_wmma_gfx1100_muse_rm_hb",
+            kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_RM_HB_SRC,
+            kname,
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+
+        let mut a_ptr = a.buf.as_ptr();
+        let mut x_ptr = x_f16_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+
+        let row_tiles = m / (16 * rm);
+        let batch_tiles = batch_size / (16 * bv);
+
+        let bytes =
+            crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * k * 2 + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kname, bytes);
+        let result = self.launch_maybe_blob(
+            kname,
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(bs_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result?;
+        Ok(true)
+    }
+
+    /// Muse Glimmer-owned row-reuse gfx1100 residual GEMM with packed-half2 A
+    /// dequant (K2).
+    ///
+    /// Sibling of [`Self::gemm_hfq4g256_residual_muse_gfx1100_rm`], NOT a
+    /// replacement: measurement-only; touches no shared selector. Each A
+    /// fragment's 16 nibbles are dequantized as eight `__half2` values via
+    /// `__floats2half2_rn` + `__hfma2` (sc2/zp2 from scalar halves), then
+    /// bit-reinterpreted as the half16 WMMA operand. Preserves exact
+    /// per-accumulator K2 g/kt WMMA order and `Y +=` semantics.
+    /// Full-tile only (`batch % (16*BV) == 0`); rm 1→BV12, rm 2→BV6.
+    /// Exact gate/up shape only: M=19968, K=6656.
+    /// Grid `[M/(16*RM), batch/(16*BV), 1]`, block `[32, 1, 1]`.
+    ///
+    /// Packed dequant is not assumed bit-identical to scalar; callers must
+    /// gate with the full-output bit oracle. Returns `Ok(false)` without
+    /// bind/compile when arch/shape/rm/batch preconditions fail. Does not
+    /// zero Y; performs `Y += W@X`.
+    pub fn gemm_hfq4g256_residual_muse_gfx1100_rm_pk(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        rm: usize,
+    ) -> HipResult<bool> {
+        let (kname, bv) = match rm {
+            1 => (
+                "gemm_hfq4g256_residual_wmma_gfx1100_muse_rm1_bv12_pk",
+                12usize,
+            ),
+            2 => (
+                "gemm_hfq4g256_residual_wmma_gfx1100_muse_rm2_bv6_pk",
+                6usize,
+            ),
+            _ => return Ok(false),
+        };
+        if !self.arch_caps.is_gfx1100()
+            || m != 19_968
+            || k != 6_656
+            || batch_size == 0
+            || batch_size % (16 * bv) != 0
+        {
+            return Ok(false);
+        }
+        self.bind_thread()?;
+        // Module name is the FILE, not the symbol, so the source compiles once
+        // instead of once per requested rm.
+        self.ensure_kernel(
+            "gemm_hfq4g256_residual_wmma_gfx1100_muse_rm_pk",
+            kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_RM_PK_SRC,
+            kname,
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+
+        let mut a_ptr = a.buf.as_ptr();
+        let mut x_ptr = x_f16_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+
+        let row_tiles = m / (16 * rm);
+        let batch_tiles = batch_size / (16 * bv);
+
+        let bytes =
+            crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * k * 2 + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kname, bytes);
+        let result = self.launch_maybe_blob(
+            kname,
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(bs_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result?;
+        Ok(true)
+    }
+
+    /// Muse Glimmer-owned RM2/BV6 gfx1100 residual GEMM with two-slot X-fragment
+    /// software pipeline (K2).
+    ///
+    /// Sibling of [`Self::gemm_hfq4g256_residual_muse_gfx1100_rm`], NOT a
+    /// replacement: measurement-only; touches no shared selector. For each
+    /// g/kt fragment issues B0/B1 loads before A row0/row1 dequant, then
+    /// overlaps subsequent B loads with WMMA consumption while keeping at most
+    /// two live B fragments. `packed=false` selects scalar dequant;
+    /// `packed=true` selects packed-half2. Preserves exact per-accumulator K2
+    /// g/kt WMMA order and `Y +=` semantics. Exact gate/up only: M=19968,
+    /// K=6656, batch=192. Grid `[624, 2, 1]`, block `[32, 1, 1]`, LDS 0.
+    ///
+    /// Returns `Ok(false)` without bind/compile when arch/shape/batch
+    /// preconditions fail. Does not zero Y; performs `Y += W@X`.
+    pub fn gemm_hfq4g256_residual_muse_gfx1100_rm2_pipe(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        packed: bool,
+    ) -> HipResult<bool> {
+        let kname = if packed {
+            "gemm_hfq4g256_residual_wmma_gfx1100_muse_rm2_bv6_pipe_pk2"
+        } else {
+            "gemm_hfq4g256_residual_wmma_gfx1100_muse_rm2_bv6_pipe_scalar"
+        };
+        if !self.arch_caps.is_gfx1100()
+            || m != 19_968
+            || k != 6_656
+            || batch_size != 192
+        {
+            return Ok(false);
+        }
+        self.bind_thread()?;
+        // Module name is the FILE, not the symbol, so scalar and packed share
+        // one compile.
+        self.ensure_kernel(
+            "gemm_hfq4g256_residual_wmma_gfx1100_muse_rm_pipe",
+            kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_RM_PIPE_SRC,
+            kname,
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+
+        let mut a_ptr = a.buf.as_ptr();
+        let mut x_ptr = x_f16_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+
+        let bytes =
+            crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * k * 2 + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kname, bytes);
+        let result = self.launch_maybe_blob(
+            kname,
+            [624, 2, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(bs_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result?;
+        Ok(true)
+    }
+
+
+
+
+
+
     /// HFQ4-G256 GEMV with fused residual add: y[row] += A[row] · x.
     /// Same math as `gemv_hfq4g256` but the final write accumulates into `y`
     /// instead of overwriting. Used for wo / w_down projections where the
@@ -18060,6 +18974,18 @@ impl Gpu {
             return if arch.starts_with("gfx12") {
                 self.gemm_hfq4g256_residual_wmma_gfx12(a_raw, x, y, m, k, batch_size)
             } else {
+                // Exact gfx1100 gate/up (M=19968, K=6656, B=192): Muse RM2/BV6
+                // residual. Y is already zeroed once above; residual does Y+=.
+                // Ok(false) must not be treated as success — fall through.
+                if self.arch_caps.is_gfx1100()
+                    && m == 19_968
+                    && k == 6_656
+                    && batch_size == 192
+                    && self
+                        .gemm_hfq4g256_residual_muse_gfx1100_rm(a_raw, x, y, m, k, batch_size, 2)?
+                {
+                    return Ok(());
+                }
                 self.gemm_hfq4g256_residual_wmma(a_raw, x, y, m, k, batch_size)
             };
         }

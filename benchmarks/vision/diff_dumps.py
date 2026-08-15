@@ -56,7 +56,10 @@ def main():
 
     # 1. Compare patches (post-preprocessor, pre-vision-tower).
     hf_pixels = np.load(hf_dir / "pixel_values.npy")
-    hp_patches, hp_meta = load_hipfire_blob(hp_dir / "hipfire_patches")
+    patch_stem = hp_dir / "pixel_values"
+    if not patch_stem.with_suffix(".bin").exists():
+        patch_stem = hp_dir / "hipfire_patches"
+    hp_patches, hp_meta = load_hipfire_blob(patch_stem)
     print(f"hipfire patches meta: {hp_meta}")
     print(f"HF grid_thw: {json.load((hf_dir / 'meta.json').open())['grid_thw']}")
     print()
@@ -127,6 +130,26 @@ def main():
             # would be HF's (R,G,B); applying the reverse permutation to hipfire
             # is equivalent to swapping channels 1 and 2).
             # Already tested above as hp_2x2_rgb.
+
+    print("\n=== Vision tower stages ===")
+    stage_names = [
+        "patch_embed",
+        "post_pos_embed",
+        *[f"block_{i:02d}" for i in range(128)],
+        "pre_merger",
+        "post_merger",
+    ]
+    compared = 0
+    for name in stage_names:
+        hf_path = hf_dir / f"{name}.npy"
+        hp_stem = hp_dir / name
+        if not hf_path.exists() or not hp_stem.with_suffix(".bin").exists():
+            continue
+        print()
+        diff(np.load(hf_path), load_hipfire_blob(hp_stem)[0], name)
+        compared += 1
+    if compared == 0:
+        print("  no matching stage dumps found")
 
 
 if __name__ == "__main__":

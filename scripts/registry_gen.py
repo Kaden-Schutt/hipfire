@@ -20,8 +20,8 @@ size_gb, unmappable arch_id/quant, alias pointing at a missing tag, or a
 superset violation — aborts with exit 1 and does NOT write output. A broken
 run must never replace a good committed registry.
 
-Namespace probe: every repo in the hipfire-models and schuttdev namespaces
-is enumerated; repos that exist on HF but have no curated entry are listed
+Namespace probe: every repo in the hipfire-models namespace is enumerated;
+repos that exist on HF but have no curated entry are listed
 as warnings (discovery aid), never auto-added — the curated overlay is
 authoritative for what the CLI offers.
 
@@ -47,7 +47,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 HF_API = "https://huggingface.co"
-PROBE_NAMESPACES = ("hipfire-models", "schuttdev")
+PROBE_NAMESPACES = ("hipfire-models",)
 SCHEMA_VERSION = 1
 # Curated size_gb is a rounded decimal-GB figure; the HF byte count is ground
 # truth. Disagreement beyond this fraction means the curated entry is stale
@@ -78,6 +78,8 @@ KNOWN_QUANTS = {
 # entry carrying an unknown value fails the run (fail-closed, like arch_id/quant).
 KNOWN_KV_MODES = {
     "auto",
+    "f32",
+    "f16",
     "q8",
     "asym4",
     "asym3",
@@ -105,7 +107,9 @@ RECOMMENDED_BOUNDS = {
     "presence_penalty": (0.0, 2.0, False),
     "repeat_penalty": (0.5, 2.0, False),
 }
-REASONING_EFFORTS = {"auto", "none", "low", "high", "max"}
+# Mirrors hipfire-config's REASONING_EFFORTS. Includes Qwen3.8's ladder
+# (`low|medium|xhigh`) plus generic OpenAI-style values for other parents.
+REASONING_EFFORTS = {"auto", "none", "low", "medium", "high", "xhigh", "max"}
 THINKING_BUDGETS = {"off", "low", "med", "high", "xhigh", "max", "uncapped"}
 
 
@@ -172,18 +176,25 @@ def log(msg: str) -> None:
 # Derived from the tag family + file name. Unknown families return None and
 # fail the run: every new model family must be mapped here explicitly.
 #   1  = plain Qwen3 (llama-crate config_from_hfq branch)
-#   5  = Qwen3.5/3.6 dense hybrid (incl. carnice / qwopus finetunes)
-#   6  = Qwen3.5/3.6 MoE / A3B
+#   5  = Qwen3.5/3.6/3.8 dense hybrid (incl. carnice / qwopus finetunes)
+#   6  = Qwen3.5/3.6/3.8 MoE / A3B
 #   9  = DeepSeek V4 Flash
 #   11 = LFM2.5 family
 #   12 = Cohere2-MoE / North-Mini-Code
+#   14 = Muse Glimmer dense text tower
 #   20 = DFlash drafter sidecar (crates/hipfire-quantize/src/bin/dflash_convert.rs)
+#   23 = Muse Glimmer DFlash drafter (muse_glimmer_assistant)
 def arch_id_for(tag: str, entry: dict) -> int | None:
     file = entry.get("file", "")
+    family = tag.split(":", 1)[0]
+    # Glimmer is checked before the generic dflash rule: its drafter is
+    # muse_glimmer_assistant (23), not the arch-20 sidecar, even though the
+    # filename says dflash.
+    if family == "muse-glimmer":
+        return 23 if "dflash" in file else 14
     if "dflash" in file:
         return 20
-    family = tag.split(":", 1)[0]
-    if family in ("qwen3.5", "qwen3.6", "qwopus3.6", "carnice", "qwopus"):
+    if family in ("qwen3.5", "qwen3.6", "qwen3.8", "qwopus3.6", "carnice", "qwopus"):
         return 6 if "a3b" in tag else 5
     if family == "nex-n2":
         return 6  # Nex-N2-mini = Qwen3.5-35B-A3B MoE (a3b not in tag name)
@@ -346,7 +357,6 @@ def build_registry(curated: dict, token: str | None) -> tuple[dict | None, list[
                 f"{tag}: invalid default_tool_format {tool_format!r} "
                 f"(allowed: {sorted(KNOWN_TOOL_FORMATS)})"
             )
-
         # Optional curated recommended_settings (carried verbatim by deepcopy).
         # Validate bounds — fail-closed, matching hipfire-registry.
         validate_recommended_settings(tag, entry.get("recommended_settings"), errors)

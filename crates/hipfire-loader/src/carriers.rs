@@ -338,12 +338,6 @@ impl Carrier for Qwen35Carrier {
                     .into(),
             );
         }
-        if ctx.kv_backend == KvBackend::Vmm && ctx.cask.sidecar.is_some() {
-            return Err(
-                "qwen35: KV backend 'vmm' does not yet support CASK/TriAttention eviction; disable the sidecar or use 'contiguous'"
-                    .into(),
-            );
-        }
         // Dir + pp>1: early return before any diagnostics/meta resolution,
         // preserving the original error string and preventing tokenizer work.
         if ctx.pp > 1 {
@@ -363,17 +357,7 @@ impl Carrier for Qwen35Carrier {
                 }
 
                 // ── pp=1 path (single-GPU) ────────────────────
-                let physical_cap = if ctx.cask.sidecar.is_some() {
-                    let env_override = hipfire_config::developer_var("HIPFIRE_KV_PHYSICAL_CAP")
-                        .ok()
-                        .and_then(|s| s.parse::<usize>().ok());
-                    let safety = 256usize;
-                    let floor = ctx.cask.budget + ctx.cask.beta + 4;
-                    let derived = ctx.cask.budget + ctx.cask.beta + safety;
-                    env_override.unwrap_or(derived).clamp(floor, ctx.max_seq)
-                } else {
-                    ctx.max_seq
-                };
+                let physical_cap = ctx.cask.physical_cap(ctx.max_seq)?;
 
                 // VL detection — loads weights from hfq_file in-place
                 let (vision_config, vision_weights) = {
@@ -1188,7 +1172,7 @@ impl Carrier for Deepseek4Carrier {
         };
         let advertised_context = config.max_position_embeddings;
         eprintln!(
-            "  deepseek4 compressed cache: automatic VMM growth to advertised context {advertised_context}"
+            "  deepseek4 KV cache: automatic VMM growth to advertised context {advertised_context}"
         );
         Ok(LoadedModel {
             state: Some(crate::ModelState::Deepseek4(deepseek4::Deepseek4Bundle {
@@ -1864,6 +1848,12 @@ impl Carrier for MuseGlimmerCarrier {
         arch_id == 14
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
+        if ctx.kv_backend == KvBackend::Vmm && ctx.cask.sidecar.is_some() {
+            return Err(
+                "muse_glimmer: KV backend 'vmm' does not support CASK/TriAttention eviction; disable the sidecar or use 'contiguous'"
+                    .into(),
+            );
+        }
         if ctx.pp > 1 {
             return Err(match &src {
                 ModelSource::Hfq(_) => "muse_glimmer: pipeline-parallel (pp>1) unsupported",
@@ -1881,22 +1871,24 @@ impl Carrier for MuseGlimmerCarrier {
         let meta = resolve_source_meta(&src, ctx.path)?;
         match src {
             ModelSource::Hfq(hfq) => {
-                // HFQ load path via the crate API (contract: from_hfq / load / new_with_max_seq)
+                // HFQ load path via the crate API (contract: from_hfq / load /
+                // new_with_max_seq_backend with ctx.kv_backend).
                 let config = hipfire_arch_muse_glimmer::config::GlimmerConfig::from_hfq(&hfq)?;
                 let weights = hipfire_arch_muse_glimmer::glimmer::GlimmerWeights::load(
                     &hfq, &config, ctx.gpu,
                 )?;
                 let mut state =
-                    match hipfire_arch_muse_glimmer::glimmer::GlimmerState::new_with_max_seq(
+                    match hipfire_arch_muse_glimmer::glimmer::GlimmerState::new_with_max_seq_backend(
                         ctx.gpu,
                         &config,
                         ctx.max_seq,
+                        ctx.kv_backend,
                     ) {
                         Ok(s) => s,
                         Err(e) => {
                             weights.free_gpu(ctx.gpu);
                             return Err(format!(
-                                "muse_glimmer: GlimmerState::new_with_max_seq failed: {e}"
+                                "muse_glimmer: GlimmerState::new_with_max_seq_backend failed: {e}"
                             ));
                         }
                     };

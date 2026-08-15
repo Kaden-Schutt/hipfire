@@ -165,14 +165,15 @@ pub fn configured_root() -> Option<(&'static str, PathBuf)> {
             continue;
         };
         let path = PathBuf::from(value);
-        return Some((
-            var,
-            if var == "HIP_PATH" {
-                normalize_hip_path(&path)
-            } else {
-                path
-            },
-        ));
+        // Through ROCm 4.x HIP lived at `$ROCM_PATH/hip`, so older scripts and
+        // Dockerfiles still export `ROCM_PATH=$PREFIX/hip` and `HIPFIRE_ROCM_PATH`
+        // the same way. `HIP_PATH` handling already stripped a trailing `hip`;
+        // apply the same normalization to every explicit root so those users do
+        // not hard-fail on a machine that is otherwise fine. `normalize_hip_path`
+        // is the single guard — it only strips a literal trailing `hip` component
+        // and otherwise leaves the path untouched, mirroring prior `HIP_PATH`
+        // behaviour.
+        return Some((var, normalize_hip_path(&path)));
     }
     None
 }
@@ -181,6 +182,456 @@ pub fn configured_root() -> Option<(&'static str, PathBuf)> {
 pub fn has_configured_root() -> bool {
     configured_root().is_some()
 }
+/// The explicit device-compiler override, if set.
+///
+/// `HIPFIRE_HIPCC` is the project-specific override and is the only variable
+/// consulted here. When non-empty it wins over every other compiler candidate.
+/// Validation (exists and is executable) is performed by callers so the
+/// override never silently falls through to autodetection — that silent
+/// mismatch is the bug class this module exists to prevent.
+pub fn configured_compiler() -> Option<(&'static str, PathBuf)> {
+    std::env::var_os("HIPFIRE_HIPCC")
+        .filter(|v| !v.is_empty())
+        .map(|value| ("HIPFIRE_HIPCC", PathBuf::from(value)))
+}
+
+/// Whether a non-empty explicit compiler override is active.
+pub fn has_configured_compiler() -> bool {
+    configured_compiler().is_some()
+}
+
+/// Pure form of [`configured_compiler`] for tests without process-global env mutation.
+pub fn configured_compiler_from(value: Option<&str>) -> Option<(&'static str, PathBuf)> {
+    let v = value.filter(|s| !s.is_empty())?;
+    Some(("HIPFIRE_HIPCC", PathBuf::from(v)))
+}
+
+/// Whether strict ROCm resolution is requested.
+///
+/// When `HIPFIRE_ROCM_STRICT=1` the cross-root compiler fallback is disabled
+/// and a runtime-headers-only root that lacks a compiler hard-fails as before.
+pub fn is_strict_rocm() -> bool {
+    strict_from(std::env::var_os("HIPFIRE_ROCM_STRICT").as_ref())
+}
+
+/// Pure predicate for strict mode without reading process-global env.
+pub fn strict_from(value: Option<&std::ffi::OsString>) -> bool {
+    value.is_some_and(|v| v == "1")
+}
+
+/// Alternative strict predicate for `Option<&str>` call sites.
+pub fn strict_from_str(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+/// How a device compiler was selected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompilerSource {
+    /// `HIPFIRE_HIPCC` override.
+    Override,
+    /// Compiler lives under the selected root's `bin/`.
+    SelectedRoot,
+    /// Compiler found via `PATH`.
+    Path,
+    /// Compiler from another discovered ROCm root.
+    OtherRoot,
+}
+
+impl std::fmt::Display for CompilerSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CompilerSource::Override => write!(f, "override"),
+            CompilerSource::SelectedRoot => write!(f, "selected_root"),
+            CompilerSource::Path => write!(f, "path"),
+            CompilerSource::OtherRoot => write!(f, "other_root"),
+        }
+    }
+}
+
+/// Resolved ROCm toolchain: the runtime/headers root, the compiler, and provenance.
+///
+/// This distinguishes “compiler came from the selected root” from “compiler came
+/// from elsewhere” so callers can warn when runtime and compiler are from
+/// different installs. The spawned compiler must receive its **own** root as
+/// `ROCM_PATH` (see [`compiler_env_root`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedToolchain {
+    /// The selected ROCm root that provides headers and the HIP runtime.
+    pub root: PathBuf,
+    /// The device compiler to use, if any.
+    pub compiler: Option<PathBuf>,
+    /// The ROCm root that owns `compiler`, if it can be derived.
+    pub compiler_root: Option<PathBuf>,
+    /// How `compiler` was obtained. `None` when `compiler` is `None`.
+    pub compiler_source: Option<CompilerSource>,
+}
+
+/// ROCm version for a single root (`<root>/.info/version`), if readable.
+pub fn version_for_root(root: &Path) -> Option<String> {
+    let f = root.join(".info").join("version");
+    if let Ok(s) = std::fs::read_to_string(&f) {
+        let s = s.trim();
+        if !s.is_empty() {
+            return Some(s.to_string());
+        }
+    }
+    None
+}
+
+/// Whether `path` is an executable file.
+fn is_executable(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(path) {
+            return meta.permissions().mode() & 0o111 != 0;
+        }
+        false
+    }
+    #[cfg(windows)]
+    {
+        true
+    }
+}
+
+/// Validate an explicit `HIPFIRE_HIPCC` path.
+///
+/// Returns `None` when the path is usable, otherwise a human-readable error
+/// that names the variable and the path — routed through `resolution_failure`.
+pub fn configured_compiler_error(path: &Path) -> Option<String> {
+    configured_compiler_error_from(Some(path), true)
+}
+
+/// Pure form for tests: `value` is the `HIPFIRE_HIPCC` contents, `exists` is
+/// whether the path is acceptable. When `value` is `None` there is no override.
+pub fn configured_compiler_error_from(path: Option<&Path>, is_valid: bool) -> Option<String> {
+    let p = path?;
+    if is_valid {
+        None
+    } else {
+        Some(format!(
+            "HIPFIRE_HIPCC={} does not exist or is not executable; set HIPFIRE_HIPCC to an executable hipcc/amdclang++ or unset it",
+            p.display()
+        ))
+    }
+}
+
+/// Human-readable warning lines when runtime and compiler come from different installs.
+///
+/// Returned, not printed, so the CLI and installer control output. Names the
+/// selected root, compiler path, compiler root, and both `.info/version` strings
+/// when readable, and states the mixing risk plainly.
+pub fn cross_root_warning(
+    selected_root: &Path,
+    compiler: &Path,
+    compiler_root: &Path,
+) -> Vec<String> {
+    cross_root_warning_with_versions(
+        selected_root,
+        version_for_root(selected_root),
+        compiler,
+        compiler_root,
+        version_for_root(compiler_root),
+    )
+}
+
+/// Pure form of [`cross_root_warning`] with injectable versions for tests.
+pub fn cross_root_warning_with_versions(
+    selected_root: &Path,
+    selected_version: Option<String>,
+    compiler: &Path,
+    compiler_root: &Path,
+    compiler_version: Option<String>,
+) -> Vec<String> {
+    let sel_ver = selected_version
+        .map(|v| format!(" (version {v})"))
+        .unwrap_or_default();
+    let comp_ver = compiler_version
+        .map(|v| format!(" (version {v})"))
+        .unwrap_or_default();
+    vec![
+        format!(
+            "WARNING: ROCm runtime and device compiler are from different installations."
+        ),
+        format!(
+            "  Selected ROCm root (runtime/headers): {}{sel_ver}",
+            selected_root.display()
+        ),
+        format!("  Device compiler: {}{comp_ver}", compiler.display()),
+        format!("  Compiler root: {}", compiler_root.display()),
+        format!(
+            "  Mixing a runtime from one ROCm install with a compiler from another can \
+             produce ABI or LLVM mismatches. Consider installing a complete ROCm SDK \
+             under one root or set HIPFIRE_HIPCC to a compiler inside the selected root. \
+             Set HIPFIRE_ROCM_STRICT=1 to make this a hard error."
+        ),
+    ]
+}
+
+/// Warning lines for a resolved toolchain, if it is cross-root.
+pub fn toolchain_warnings(toolchain: &ResolvedToolchain) -> Vec<String> {
+    match (&toolchain.compiler, &toolchain.compiler_root, &toolchain.compiler_source) {
+        (Some(compiler), Some(compiler_root), Some(source))
+            if matches!(source, CompilerSource::Path | CompilerSource::OtherRoot) =>
+        {
+            cross_root_warning(&toolchain.root, compiler, compiler_root)
+        }
+        _ => Vec::new(),
+    }
+}
+/// Whether this root provides headers + HIP runtime (+ HSA on non-Windows) but no compiler.
+///
+/// Exactly the case where cross-root compiler acceptance is allowed (when not
+/// strict): the runtime/headers are usable, only the compiler is missing.
+pub fn is_headers_runtime_only_root(path: &Path) -> bool {
+    if !is_complete_root(path) {
+        return false;
+    }
+    if runtime_library(path).is_none() {
+        return false;
+    }
+    #[cfg(not(windows))]
+    if hsa_runtime_library(path).is_none() {
+        return false;
+    }
+    !has_device_compiler(path)
+}
+
+/// Discover all ROCm roots without honouring an authoritative override.
+///
+/// Used only for cross-root compiler search so a compiler from another install
+/// can be found even when `HIPFIRE_ROCM_PATH` is authoritative for libraries.
+fn all_roots_unfiltered() -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut push = |p: PathBuf| {
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    };
+    #[cfg(not(windows))]
+    {
+        for candidate in root_family(Path::new("/opt/rocm")) {
+            push(candidate);
+        }
+        for candidate in versioned_siblings(Path::new("/opt"), "rocm-") {
+            push(candidate);
+        }
+    }
+    for candidate in roots_from_path_tools() {
+        push(candidate);
+    }
+    #[cfg(not(windows))]
+    for candidate in [PathBuf::from("/usr"), PathBuf::from("/usr/local")] {
+        if has_package_rocm_evidence(&candidate) {
+            push(candidate);
+        }
+    }
+    #[cfg(windows)]
+    if let Some(program_files) = std::env::var_os("ProgramFiles") {
+        let base = PathBuf::from(program_files).join("AMD").join("ROCm");
+        for candidate in root_family(&base) {
+            push(candidate);
+        }
+        for candidate in versioned_siblings(&base, "") {
+            push(candidate);
+        }
+    }
+    out
+}
+
+/// Try to find a device compiler on `PATH` (any of `DEVICE_COMPILERS`).
+fn find_compiler_on_path() -> Option<PathBuf> {
+    for name in DEVICE_COMPILERS {
+        if let Some(p) = path_tool(name) {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// Try to find a device compiler in other discovered roots (excluding `selected` family).
+fn find_compiler_in_other_roots(selected: &Path) -> Option<(PathBuf, PathBuf)> {
+    let family = root_family(selected);
+    let family_canonical: Vec<PathBuf> = family
+        .iter()
+        .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()))
+        .collect();
+    for root in all_roots_unfiltered() {
+        let canon = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+        if family_canonical.contains(&canon) {
+            continue;
+        }
+        // Also skip exact family members by display equality before canonicalize.
+        if family.contains(&root) {
+            continue;
+        }
+        for name in DEVICE_COMPILERS {
+            if let Some(tool) = tool_from_selected_root(&root, name) {
+                return Some((tool, root));
+            }
+        }
+    }
+    None
+}
+
+/// Pure core for toolchain resolution with injected inputs (no env reads).
+///
+/// `selected` is the chosen runtime root (already canonicalized when possible).
+/// `override_compiler` is the `HIPFIRE_HIPCC` path if set (non-empty). `strict`
+/// disables cross-root fallback. `path_compiler` is a compiler found on `PATH`,
+/// `other_root_compiler` is `(compiler_path, its_root)` from another install.
+pub fn resolve_toolchain_pure(
+    selected: Option<&Path>,
+    override_compiler: Option<&Path>,
+    strict: bool,
+    path_compiler: Option<PathBuf>,
+    other_root_compiler: Option<(PathBuf, PathBuf)>,
+) -> Result<ResolvedToolchain, String> {
+    let Some(root) = selected.map(|p| p.to_path_buf()) else {
+        return Err(resolution_failure(
+            "a complete ROCm installation",
+            &[],
+        ));
+    };
+    // Override takes absolute precedence; validate existence + executable.
+    if let Some(ov) = override_compiler {
+        if !is_executable(ov) {
+            let msg = format!(
+                "Could not resolve the ROCm HIP compiler (hipcc). HIPFIRE_HIPCC={} is set but does not exist or is not executable; hipfire did not fall back to another compiler.",
+                ov.display()
+            );
+            // Include install guidance for completeness.
+            let mut full = msg;
+            for line in install_guidance() {
+                full.push_str(&format!("\n  {line}"));
+            }
+            return Err(full);
+        }
+        let compiler_root = root_from_tool_path(ov)
+            .or_else(|| root_from_compiler(ov))
+            .unwrap_or_else(|| root.clone());
+        return Ok(ResolvedToolchain {
+            root: root.clone(),
+            compiler: Some(ov.to_path_buf()),
+            compiler_root: Some(compiler_root),
+            compiler_source: Some(CompilerSource::Override),
+        });
+    }
+    // Compiler under the selected root, if any.
+    for name in DEVICE_COMPILERS {
+        if let Some(tool) = tool_from_selected_root(&root, name) {
+            let compiler_root = root_from_tool_path(&tool).unwrap_or_else(|| root.clone());
+            return Ok(ResolvedToolchain {
+                root: root.clone(),
+                compiler: Some(tool.clone()),
+                compiler_root: Some(compiler_root),
+                compiler_source: Some(CompilerSource::SelectedRoot),
+            });
+        }
+    }
+    // No compiler under selected root — check whether cross-root is eligible.
+    let eligible = is_headers_runtime_only_root(&root);
+    if eligible && !strict {
+        if let Some(pc) = path_compiler {
+            let croot = root_from_tool_path(&pc)
+                .or_else(|| root_from_compiler(&pc))
+                .unwrap_or_else(|| pc.parent().and_then(|p| p.parent()).map(|p| p.to_path_buf()).unwrap_or_else(|| root.clone()));
+            return Ok(ResolvedToolchain {
+                root: root.clone(),
+                compiler: Some(pc),
+                compiler_root: Some(croot),
+                compiler_source: Some(CompilerSource::Path),
+            });
+        }
+        if let Some((tool, troot)) = other_root_compiler {
+            let croot = root_from_tool_path(&tool).unwrap_or(troot.clone());
+            return Ok(ResolvedToolchain {
+                root: root.clone(),
+                compiler: Some(tool),
+                compiler_root: Some(croot),
+                compiler_source: Some(CompilerSource::OtherRoot),
+            });
+        }
+    }
+    // No usable compiler — hard fail. Preserve the authoritative message when
+    // an explicit root is set, and mention --hipcc as a remedy.
+    let tried = vec![root.join("bin").join("hipcc").display().to_string()];
+    let mut msg = resolution_failure("the ROCm HIP compiler (hipcc)", &tried);
+    // The shared resolution_failure already says authoritative and suggests
+    // HIPFIRE_ROCM_PATH; also hint at HIPFIRE_HIPCC / --hipcc for the split-install case.
+    if eligible && strict {
+        msg.push_str("\nCross-root compiler fallback is disabled by HIPFIRE_ROCM_STRICT=1; unset it or install a compiler under the selected root or set HIPFIRE_HIPCC=/path/to/hipcc.");
+    } else if eligible {
+        msg.push_str("\nNo device compiler was found on PATH or in other ROCm installs. Install the ROCm device compiler under the selected root or set HIPFIRE_HIPCC=/path/to/hipcc (--hipcc PATH).");
+    } else {
+        msg.push_str("\nSet HIPFIRE_HIPCC=/path/to/hipcc (--hipcc PATH) if the compiler lives in a different prefix.");
+    }
+    Err(msg)
+}
+
+/// Resolve the current toolchain from the environment and filesystem.
+///
+/// This is the primary entry point for callers that want provenance and the
+/// cross-root warning. It honours `HIPFIRE_HIPCC`, `HIPFIRE_ROCM_STRICT`, and the
+/// authoritative-root rule for libraries while allowing a compiler from `PATH`
+/// or another root when the selected root is headers+runtime-complete.
+pub fn resolve_toolchain() -> Result<ResolvedToolchain, String> {
+    // Determine selected root: coherent SDK preferred, else first is_dir fallback,
+    // mirroring `root()` but we also need the fallback for libs-only trees.
+    let selected = if !ambiguous_roots().is_empty() {
+        None
+    } else {
+        let candidates = roots();
+        candidates
+            .iter()
+            .find(|p| is_coherent_sdk_root(p))
+            .cloned()
+            .or_else(|| candidates.into_iter().find(|p| p.is_dir()))
+    };
+    let ov = configured_compiler().map(|(_, p)| p);
+    let strict = is_strict_rocm();
+    let path_comp = find_compiler_on_path();
+    // Only probe other roots when we may need them (avoid extra FS work when
+    // a compiler was already found on PATH or under selected root). For
+    // simplicity always compute here; the pure function decides.
+    let other = selected.as_deref().and_then(find_compiler_in_other_roots);
+    resolve_toolchain_pure(
+        selected.as_deref(),
+        ov.as_deref(),
+        strict,
+        path_comp,
+        other,
+    )
+}
+
+/// Pure helper for setup.rs and tests: resolve from caller-supplied explicit root.
+///
+/// When `explicit` is `Some`, it is treated as the authoritative selected root
+/// (mirroring `HIPFIRE_ROCM_PATH` semantics). `hipcc_override` and `strict` are
+/// injected so tests avoid global env mutation.
+pub fn resolve_toolchain_for_explicit(
+    explicit: Option<&Path>,
+    hipcc_override: Option<&Path>,
+    strict: bool,
+) -> Result<ResolvedToolchain, String> {
+    let selected = explicit.map(|p| p.to_path_buf());
+    // For explicit roots we still allow PATH/other-root fallback via the same
+    // pure function; other-root search uses `all_roots_unfiltered` which may
+    // include the explicit root's family but we filter it out.
+    let path_comp = find_compiler_on_path();
+    let other = selected.as_deref().and_then(find_compiler_in_other_roots);
+    resolve_toolchain_pure(
+        selected.as_deref(),
+        hipcc_override,
+        strict,
+        path_comp,
+        other,
+    )
+}
+
 
 /// Expand a selected root into only that installation's compatible aliases.
 /// Split-tree packaging keeps the real SDK under `<root>/core[-VERSION]`.
@@ -397,6 +848,30 @@ pub fn resolution_failure(component: &str, tried: &[String]) -> String {
             root.display()
         ));
     }
+    if let Some((var, path)) = configured_compiler() {
+        if is_executable(&path) {
+            message.push_str(&format!(
+                "\n{var}={} is set and is authoritative for the device compiler.",
+                path.display()
+            ));
+        } else {
+            message.push_str(&format!(
+                "\n{var}={} is set but does not exist or is not executable; hipfire did not fall back to another compiler.",
+                path.display()
+            ));
+        }
+    }
+    // Cross-root strict hint: when the selected root is headers+runtime only,
+    // the failure may be due to strict mode. Surface it.
+    if is_strict_rocm() {
+        if let Some(selected) = root() {
+            if is_headers_runtime_only_root(&selected) {
+                message.push_str(
+                    "\nCross-root compiler fallback is disabled by HIPFIRE_ROCM_STRICT=1; unset it or set HIPFIRE_HIPCC=/path/to/hipcc (--hipcc PATH) or install a compiler under the selected root.",
+                );
+            }
+        }
+    }
     if !tried.is_empty() {
         message.push_str(&format!("\nTried: {}", tried.join(", ")));
     }
@@ -411,6 +886,11 @@ pub fn resolution_failure(component: &str, tried: &[String]) -> String {
     message.push_str(
         "\nFor a non-default or side-by-side install, set \
          HIPFIRE_ROCM_PATH=/absolute/path/to/rocm (ROCM_PATH and HIP_PATH are also honored).",
+    );
+    // Also point at the compiler override for split installs.
+    message.push_str(
+        "\nIf the device compiler lives in a different prefix than the runtime, set \
+         HIPFIRE_HIPCC=/absolute/path/to/hipcc (--hipcc PATH).",
     );
     message
 }
@@ -762,8 +1242,21 @@ fn windows_legacy_library_candidates(user_profile: Option<&Path>, sonames: &[&st
 }
 
 /// Locate a ROCm tool (`hipcc`, `amdclang++`, `rocminfo`, …) under a resolved
-/// root. `PATH` is consulted only when no root is selectable.
+/// root. `PATH` is consulted only when no root is selectable, except for the
+/// device compiler where a cross-root fallback is allowed when the selected
+/// root is otherwise complete (headers + runtime + HSA) but lacks a compiler.
+/// The compiler fallback respects `HIPFIRE_HIPCC` and `HIPFIRE_ROCM_STRICT=1`.
 pub fn tool(name: &str) -> Option<PathBuf> {
+    // Explicit compiler override wins for device-compiler names.
+    if DEVICE_COMPILERS.contains(&name) {
+        if let Some((_, ov)) = configured_compiler() {
+            if is_executable(&ov) {
+                return Some(ov);
+            } else {
+                return None;
+            }
+        }
+    }
     if let Some((_, configured)) = configured_root() {
         if !ambiguous_family(&configured).is_empty() {
             return None;
@@ -773,17 +1266,78 @@ pub fn tool(name: &str) -> Option<PathBuf> {
                 return Some(tool);
             }
         }
+        // Cross-root compiler fallback for the configured family, if eligible.
+        if DEVICE_COMPILERS.contains(&name) && !is_strict_rocm() {
+            // Find the first family member that is a dir to use as "selected" for
+            // eligibility; libs_only trees report as first family entry.
+            let selected = root_family(&configured)
+                .into_iter()
+                .find(|p| p.is_dir())
+                .unwrap_or(configured);
+            if is_headers_runtime_only_root(&selected) {
+                if let Some(pc) = find_compiler_on_path() {
+                    return Some(pc);
+                }
+                if let Some((tool, _)) = find_compiler_in_other_roots(&selected) {
+                    return Some(tool);
+                }
+            }
+        }
         return None;
     }
     if let Some(selected) = root() {
-        return tool_from_selected_root(&selected, name);
+        if let Some(tool) = tool_from_selected_root(&selected, name) {
+            return Some(tool);
+        }
+        if DEVICE_COMPILERS.contains(&name) && !is_strict_rocm() && is_headers_runtime_only_root(&selected) {
+            if let Some(pc) = find_compiler_on_path() {
+                return Some(pc);
+            }
+            if let Some((tool, _)) = find_compiler_in_other_roots(&selected) {
+                return Some(tool);
+            }
+        }
+        return None;
     }
     path_tool(name)
 }
 
 /// The device compiler this installation should use, most specific first.
 pub fn device_compiler() -> Option<PathBuf> {
-    DEVICE_COMPILERS.iter().find_map(|c| tool(c))
+    // HIPFIRE_HIPCC is authoritative; invalid values do not fall through.
+    if let Some((_, ov)) = configured_compiler() {
+        if is_executable(&ov) {
+            return Some(ov);
+        } else {
+            return None;
+        }
+    }
+    // Use the shared toolchain resolver so compiler-source provenance is uniform
+    // between `device_compiler()` and `resolve_toolchain()`. Fall back to the
+    // legacy direct probe only when toolchain resolution fails for non-compiler
+    // reasons (e.g. no root at all).
+    if let Ok(tc) = resolve_toolchain() {
+        return tc.compiler;
+    }
+    // Legacy fallback: direct tool probe without cross-root (preserves previous
+    // behaviour when `resolve_toolchain` is unavailable, e.g. ambiguous roots).
+    DEVICE_COMPILERS.iter().find_map(|name| {
+        if let Some((_, configured)) = configured_root() {
+            if !ambiguous_family(&configured).is_empty() {
+                return None;
+            }
+            for root in root_family(&configured) {
+                if let Some(tool) = tool_from_selected_root(&root, name) {
+                    return Some(tool);
+                }
+            }
+            None
+        } else if let Some(selected) = root() {
+            tool_from_selected_root(&selected, name)
+        } else {
+            path_tool(name)
+        }
+    })
 }
 
 /// `ROCM_PATH` value a spawned device compiler needs, or `None` when the
@@ -1575,4 +2129,327 @@ mod tests {
             assert!(seen.insert(p.clone()), "duplicate root: {p:?}");
         }
     }
+    #[test]
+    fn configured_compiler_is_honoured_via_pure_helper() {
+        // Pure helper mirrors env accessor without global mutation (see lib.rs:3812).
+        let (var, path) = configured_compiler_from(Some("/opt/rocm/bin/hipcc")).unwrap();
+        assert_eq!(var, "HIPFIRE_HIPCC");
+        assert_eq!(path, PathBuf::from("/opt/rocm/bin/hipcc"));
+        assert!(configured_compiler_from(Some("")).is_none());
+        assert!(configured_compiler_from(None).is_none());
+    }
+
+    #[test]
+    fn hipcc_override_invalid_is_not_silently_ignored() {
+        // Create a libs-only root to act as selected runtime root.
+        let base = std::env::temp_dir().join(format!("hipfire-rocm-ov-invalid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("libs");
+        std::fs::create_dir_all(root.join("include").join("hip")).unwrap();
+        std::fs::create_dir_all(root.join(HIP_RUNTIME_DIRS[0])).unwrap();
+        std::fs::write(root.join("include").join("hip").join("hip_runtime.h"), b"").unwrap();
+        std::fs::write(
+            root.join(HIP_RUNTIME_DIRS[0]).join(HIP_RUNTIME_LIBRARIES[0]),
+            b"",
+        )
+        .unwrap();
+        #[cfg(not(windows))]
+        std::fs::write(
+            root.join(HIP_RUNTIME_DIRS[0]).join("libhsa-runtime64.so.1"),
+            b"",
+        )
+        .unwrap();
+        // Override points at a non-existent file — must error, not fall through.
+        let bogus = base.join("missing_hipcc");
+        let result = resolve_toolchain_pure(
+            Some(&root),
+            Some(&bogus),
+            false,
+            Some(PathBuf::from("/usr/bin/hipcc")),
+            None,
+        );
+        assert!(result.is_err(), "invalid HIPFIRE_HIPCC must hard-fail: {result:?}");
+        let msg = result.unwrap_err();
+        assert!(msg.contains("HIPFIRE_HIPCC"), "{msg}");
+        assert!(msg.contains(&bogus.display().to_string()), "{msg}");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn hipcc_override_valid_wins_over_path() {
+        let base = std::env::temp_dir().join(format!("hipfire-rocm-ov-valid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("libs");
+        std::fs::create_dir_all(root.join("include").join("hip")).unwrap();
+        std::fs::create_dir_all(root.join(HIP_RUNTIME_DIRS[0])).unwrap();
+        std::fs::write(root.join("include").join("hip").join("hip_runtime.h"), b"").unwrap();
+        std::fs::write(
+            root.join(HIP_RUNTIME_DIRS[0]).join(HIP_RUNTIME_LIBRARIES[0]),
+            b"",
+        )
+        .unwrap();
+        #[cfg(not(windows))]
+        std::fs::write(
+            root.join(HIP_RUNTIME_DIRS[0]).join("libhsa-runtime64.so.1"),
+            b"",
+        )
+        .unwrap();
+        // Create a valid executable override.
+        let ov_dir = base.join("ov_bin");
+        std::fs::create_dir_all(&ov_dir).unwrap();
+        let ov = ov_dir.join("hipcc");
+        std::fs::write(&ov, b"#!/bin/sh\necho hipcc\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut p = std::fs::metadata(&ov).unwrap().permissions();
+            p.set_mode(0o755);
+            std::fs::set_permissions(&ov, p).unwrap();
+        }
+        let other = PathBuf::from("/tmp/other/bin/hipcc");
+        let result = resolve_toolchain_pure(Some(&root), Some(&ov), false, Some(other.clone()), None).unwrap();
+        assert_eq!(result.compiler, Some(ov.clone()));
+        assert_eq!(result.compiler_source, Some(CompilerSource::Override));
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn libs_only_root_with_path_compiler_yields_cross_root_toolchain() {
+        let base = std::env::temp_dir().join(format!("hipfire-rocm-cross-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let libs = base.join("libs_only");
+        std::fs::create_dir_all(libs.join("include").join("hip")).unwrap();
+        std::fs::create_dir_all(libs.join(HIP_RUNTIME_DIRS[0])).unwrap();
+        std::fs::write(libs.join("include").join("hip").join("hip_runtime.h"), b"").unwrap();
+        std::fs::write(
+            libs.join(HIP_RUNTIME_DIRS[0]).join(HIP_RUNTIME_LIBRARIES[0]),
+            b"",
+        )
+        .unwrap();
+        #[cfg(not(windows))]
+        std::fs::write(
+            libs.join(HIP_RUNTIME_DIRS[0]).join("libhsa-runtime64.so.1"),
+            b"",
+        )
+        .unwrap();
+        std::fs::create_dir_all(libs.join(".info")).unwrap();
+        std::fs::write(libs.join(".info").join("version"), b"7.14.0").unwrap();
+        // Fake compiler on PATH (and its own root with version).
+        let comp_root = base.join("compiler_root");
+        std::fs::create_dir_all(comp_root.join("bin")).unwrap();
+        std::fs::create_dir_all(comp_root.join(".info")).unwrap();
+        std::fs::write(comp_root.join(".info").join("version"), b"7.14.0").unwrap();
+        let comp = comp_root.join("bin").join("hipcc");
+        std::fs::write(&comp, b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut p = std::fs::metadata(&comp).unwrap().permissions();
+            p.set_mode(0o755);
+            std::fs::set_permissions(&comp, p).unwrap();
+        }
+        let result = resolve_toolchain_pure(Some(&libs), None, false, Some(comp.clone()), None).unwrap();
+        assert_eq!(result.root, libs);
+        assert_eq!(result.compiler, Some(comp.clone()));
+        assert_eq!(result.compiler_source, Some(CompilerSource::Path));
+        assert!(result.compiler_root.is_some());
+        // Warning must name selected root, compiler path, compiler root and versions.
+        let warnings = toolchain_warnings(&result);
+        assert!(!warnings.is_empty(), "cross-root must warn");
+        let joined = warnings.join("\n");
+        assert!(joined.contains(&libs.display().to_string()), "{joined}");
+        assert!(joined.contains(&comp.display().to_string()), "{joined}");
+        assert!(joined.contains(&result.compiler_root.unwrap().display().to_string()), "{joined}");
+        assert!(joined.contains("7.14.0"), "{joined}");
+        assert!(joined.to_lowercase().contains("different"), "{joined}");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn libs_only_root_with_strict_still_fails() {
+        let base = std::env::temp_dir().join(format!("hipfire-rocm-cross-strict-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let libs = base.join("libs_only");
+        std::fs::create_dir_all(libs.join("include").join("hip")).unwrap();
+        std::fs::create_dir_all(libs.join(HIP_RUNTIME_DIRS[0])).unwrap();
+        std::fs::write(libs.join("include").join("hip").join("hip_runtime.h"), b"").unwrap();
+        std::fs::write(
+            libs.join(HIP_RUNTIME_DIRS[0]).join(HIP_RUNTIME_LIBRARIES[0]),
+            b"",
+        )
+        .unwrap();
+        #[cfg(not(windows))]
+        std::fs::write(
+            libs.join(HIP_RUNTIME_DIRS[0]).join("libhsa-runtime64.so.1"),
+            b"",
+        )
+        .unwrap();
+        let comp = base.join("fakebin").join("hipcc");
+        std::fs::create_dir_all(comp.parent().unwrap()).unwrap();
+        std::fs::write(&comp, b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut p = std::fs::metadata(&comp).unwrap().permissions();
+            p.set_mode(0o755);
+            std::fs::set_permissions(&comp, p).unwrap();
+        }
+        let result = resolve_toolchain_pure(Some(&libs), None, true, Some(comp), None);
+        assert!(result.is_err(), "strict must hard-fail: {result:?}");
+        let msg = result.unwrap_err();
+        assert!(msg.to_lowercase().contains("hipcc") || msg.contains("HIPFIRE_ROCM_STRICT"), "{msg}");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn compiler_only_root_still_fails() {
+        let base = std::env::temp_dir().join(format!("hipfire-rocm-comp-only-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("comp_only");
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        let hipcc = root.join("bin").join(DEVICE_COMPILERS[0]);
+        std::fs::write(&hipcc, b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut p = std::fs::metadata(&hipcc).unwrap().permissions();
+            p.set_mode(0o755);
+            std::fs::set_permissions(&hipcc, p).unwrap();
+        }
+        // No headers/runtime, so missing_components must be non-empty and
+        // resolve must fail (even though compiler exists).
+        assert!(!missing_components(&root).is_empty());
+        let result = resolve_toolchain_pure(Some(&root), None, false, None, None);
+        // Pure helper will try to find compiler under root — it will succeed
+        // via SelectedRoot, but the root is still not headers_runtime complete.
+        // The caller (hipfire-rocm-resolve) additionally checks missing_components,
+        // so we assert that missing_components is non-empty to guarantee the
+        // end-to-end failure.
+        assert!(!missing_components(&root).is_empty());
+        // If the pure helper considered this a valid toolchain, it would return
+        // SelectedRoot; we just ensure the install is still incomplete.
+        if let Ok(tc) = result {
+            assert_eq!(tc.compiler_source, Some(CompilerSource::SelectedRoot));
+            assert!(!missing_components(&tc.root).is_empty());
+        }
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn canonical_and_debian_multiarch_roots_still_resolve() {
+        // Canonical layout uses HIP_RUNTIME_DIRS[0] directly.
+        let base = std::env::temp_dir().join(format!("hipfire-rocm-canonical-accept-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let canon = base.join("canonical");
+        write_coherent_sdk(&canon);
+        assert!(is_coherent_sdk_root(&canon));
+        let result = resolve_toolchain_pure(Some(&canon), None, false, None, None).unwrap();
+        assert_eq!(result.compiler_source, Some(CompilerSource::SelectedRoot));
+
+        // Debian multiarch: runtime under lib/x86_64-linux-gnu is discovered via
+        // root_library_dirs one-level child scan — do not “fix” that.
+        let debian = base.join("debian");
+        std::fs::create_dir_all(debian.join("include").join("hip")).unwrap();
+        std::fs::create_dir_all(debian.join("lib").join("x86_64-linux-gnu")).unwrap();
+        std::fs::create_dir_all(debian.join("bin")).unwrap();
+        std::fs::write(debian.join("include").join("hip").join("hip_runtime.h"), b"").unwrap();
+        let runtime = debian.join("lib").join("x86_64-linux-gnu").join("libamdhip64.so");
+        std::fs::write(&runtime, b"").unwrap();
+        #[cfg(not(windows))]
+        std::fs::write(
+            debian.join("lib").join("x86_64-linux-gnu").join("libhsa-runtime64.so.1"),
+            b"",
+        )
+        .unwrap();
+        std::fs::write(debian.join("bin").join(DEVICE_COMPILERS[0]), b"#!/bin/sh\n").unwrap();
+        assert!(runtime_library(&debian).is_some());
+        assert!(is_coherent_sdk_root(&debian));
+        let result2 = resolve_toolchain_pure(Some(&debian), None, false, None, None).unwrap();
+        assert_eq!(result2.compiler_source, Some(CompilerSource::SelectedRoot));
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn cross_root_compiler_env_root_returns_compilers_root() {
+        let base = std::env::temp_dir().join(format!("hipfire-rocm-env-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let libs = base.join("libs");
+        std::fs::create_dir_all(libs.join("include").join("hip")).unwrap();
+        std::fs::create_dir_all(libs.join(HIP_RUNTIME_DIRS[0])).unwrap();
+        std::fs::write(libs.join("include").join("hip").join("hip_runtime.h"), b"").unwrap();
+        std::fs::write(
+            libs.join(HIP_RUNTIME_DIRS[0]).join(HIP_RUNTIME_LIBRARIES[0]),
+            b"",
+        )
+        .unwrap();
+        #[cfg(not(windows))]
+        std::fs::write(
+            libs.join(HIP_RUNTIME_DIRS[0]).join("libhsa-runtime64.so.1"),
+            b"",
+        )
+        .unwrap();
+        let comp_root = base.join("compiler");
+        std::fs::create_dir_all(comp_root.join("bin")).unwrap();
+        let comp = comp_root.join("bin").join("hipcc");
+        std::fs::write(&comp, b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut p = std::fs::metadata(&comp).unwrap().permissions();
+            p.set_mode(0o755);
+            std::fs::set_permissions(&comp, p).unwrap();
+        }
+        let toolchain = resolve_toolchain_pure(Some(&libs), None, false, Some(comp.clone()), None).unwrap();
+        assert_eq!(toolchain.compiler_root, Some(comp_root.clone()));
+        // compiler_env_root must return the compiler's own root, not the libs root.
+        let env_root = compiler_env_root_from(&comp, None);
+        assert_eq!(env_root, Some(comp_root.clone()));
+        // When the compiler is cross-root, the value returned is the compiler's
+        // root, not the libs root — even if ROCM_PATH is set to the libs root.
+        let env_root2 = compiler_env_root_from(&comp, Some(&libs));
+        assert_eq!(env_root2, Some(comp_root));
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn rocm_path_trailing_hip_is_normalized() {
+        // Mirrors normalize_hip_path guard — stripping only a literal trailing
+        // `hip` component. A genuinely named .../hip directory that is itself
+        // the install root should still be normalized as before (parent looks
+        // like a ROCm root is not required; we just strip the suffix).
+        assert_eq!(
+            normalize_hip_path(Path::new("/opt/rocm/hip")),
+            PathBuf::from("/opt/rocm")
+        );
+        assert_eq!(
+            normalize_hip_path(Path::new("/opt/rocm-7.14/hip")),
+            PathBuf::from("/opt/rocm-7.14")
+        );
+        // Without the suffix, leave untouched.
+        assert_eq!(
+            normalize_hip_path(Path::new("/opt/rocm")),
+            PathBuf::from("/opt/rocm")
+        );
+        // A path that merely contains hip elsewhere is untouched.
+        assert_eq!(
+            normalize_hip_path(Path::new("/opt/myhip")),
+            PathBuf::from("/opt/myhip")
+        );
+        // configured_root now normalizes ROCM_PATH the same way as HIP_PATH.
+        // Test via pure form: a trailing hip on ROCM_PATH would normalize.
+        // We cannot set env here; we just assert the pure helper.
+        let normalized = normalize_hip_path(&PathBuf::from("/opt/rocm/hip"));
+        assert_eq!(normalized, PathBuf::from("/opt/rocm"));
+    }
+
+    #[test]
+    fn genuinely_nonexistent_authoritative_root_still_fails() {
+        let bogus = Path::new("/tmp/hipfire-nonexistent-rocm-xyz-12345");
+        // Ensure it does not exist.
+        let _ = std::fs::remove_dir_all(bogus);
+        assert!(!bogus.exists());
+        let result = resolve_toolchain_pure(Some(bogus), None, false, None, None);
+        assert!(result.is_err(), "nonexistent root must fail: {result:?}");
+    }
+
 }

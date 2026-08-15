@@ -1150,6 +1150,7 @@ fn main() {
                         &state.logits,
                         &state.logits_batch,
                         &state.argmax_batch,
+                        None,
                     )
                     .expect("glimmer drafter lm_head");
                     gpu.free_tensor(hidden_for_draft).ok();
@@ -1170,6 +1171,7 @@ fn main() {
                             &mut gpu,
                             &block,
                             cur_pos,
+                            None,
                         )
                         .expect("glimmer verify device")
                     } else {
@@ -1182,6 +1184,7 @@ fn main() {
                             cur_pos,
                             &tap_layers,
                             &mut target_hidden_host,
+                            None,
                         )
                         .expect("glimmer verify host")
                     };

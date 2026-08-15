@@ -1027,6 +1027,7 @@ fn rollback_unfinished_qwen35(
 fn build_qwen35_eviction(
     config: &hipfire_arch_qwen35::qwen35::Qwen35Config,
     physical_cap: usize,
+    activation_gate: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ctx: &mut LoadCtx,
 ) -> Result<Option<Eviction>, String> {
     use hipfire_arch_qwen35::qwen35::LayerType;
@@ -1066,7 +1067,7 @@ fn build_qwen35_eviction(
         return Ok(None);
     }
     let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
-    let base = EvictionCtx::new(
+    let mut base = EvictionCtx::new(
         ctx.gpu,
         &centers,
         fa_layer_ids,
@@ -1080,6 +1081,9 @@ fn build_qwen35_eviction(
         physical_cap,
     )
     .map_err(|e| format!("build EvictionCtx: {e}"))?;
+    if let Some(gate) = activation_gate {
+        base.set_activation_gate(gate);
+    }
     if ctx.cask.cask_m_folding {
         eprintln!(
             "  eviction: CASK α={:.2} m={} budget={} β={} physical_cap={}",
@@ -1116,7 +1120,11 @@ fn finish_qwen35_load(
 ) -> Result<LoadedModel, String> {
     // ── Eviction (only hard-error stage before publish) ────────────
     // Built before long-lived borrows so rollback can move `bundle`.
-    let eviction = match build_qwen35_eviction(&bundle.config, physical_cap, ctx) {
+    let activation_gate = bundle
+        .kv_adaptive
+        .as_ref()
+        .and_then(|adaptive| adaptive.eviction_gate());
+    let eviction = match build_qwen35_eviction(&bundle.config, physical_cap, activation_gate, ctx) {
         Ok(e) => e,
         Err(e) => {
             return Err(rollback_unfinished_qwen35(
@@ -1613,9 +1621,11 @@ pub fn load_model_with_kv_backend(
             other.name()
         ));
     }
-    if kv_backend == KvBackend::Vmm && !matches!(carrier.name(), "qwen35" | "deepseek4") {
+    if kv_backend == KvBackend::Vmm
+        && !matches!(carrier.name(), "qwen35" | "deepseek4" | "muse_glimmer")
+    {
         return Err(format!(
-            "KV backend 'vmm' currently supports qwen3.5 and deepseek4 only (selected carrier: {})",
+            "KV backend 'vmm' currently supports qwen3.5, deepseek4, and Muse Glimmer only (selected carrier: {})",
             carrier.name()
         ));
     }
@@ -1728,9 +1738,11 @@ pub fn load_model_with_gemma4_drafter(
             other.name()
         ));
     }
-    if kv_backend == KvBackend::Vmm && !matches!(carrier.name(), "qwen35" | "deepseek4") {
+    if kv_backend == KvBackend::Vmm
+        && !matches!(carrier.name(), "qwen35" | "deepseek4" | "muse_glimmer")
+    {
         return Err(format!(
-            "KV backend 'vmm' currently supports qwen3.5 and deepseek4 only (selected carrier: {})",
+            "KV backend 'vmm' currently supports qwen3.5, deepseek4, and Muse Glimmer only (selected carrier: {})",
             carrier.name()
         ));
     }
@@ -2097,8 +2109,11 @@ pub fn load_model_ep_with_kv_mode(
     max_seq: usize,
     tp: usize,
     kv_mode: Option<&str>,
+    kv_backend: Option<&str>,
 ) -> Result<LoadedModel, String> {
     let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
+    let kv_backend_raw = kv_backend.unwrap_or("contiguous");
+    let kv_backend: KvBackend = kv_backend_raw.parse().map_err(|err| format!("{err}"))?;
     match hfq.arch_id {
         9 => load_model_ep_ds4(
             path,
@@ -2106,7 +2121,13 @@ pub fn load_model_ep_with_kv_mode(
             tp,
             resolve_deepseek4_compressor_cache_kv_mode(kv_mode)?,
         ),
+        10 if kv_backend == KvBackend::Vmm => {
+            Err(format!("KV backend '{kv_backend_raw}' requires tp=1"))
+        }
         10 => load_model_ep_minimax(path, max_seq, tp),
+        5 | 6 if kv_backend == KvBackend::Vmm => {
+            Err(format!("KV backend '{kv_backend_raw}' requires tp=1"))
+        }
         5 | 6 => load_model_ep_qwen35(path, max_seq, tp),
         id => Err(format!(
             "EP not supported for arch_id={id} (expected 5|6 for Qwen3.5, 9 for DeepSeek V4 or 10 for MiniMax)"

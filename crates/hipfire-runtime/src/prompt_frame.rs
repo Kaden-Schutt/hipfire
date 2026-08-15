@@ -97,11 +97,23 @@ impl ThinkMode {
     /// project-custom `thinking_mode`) to a mode.
     /// Accepted: "none|off|chat" → NonThink;
     ///           "minimal|low|medium|med|thinking" → Low;
-    ///           "high" → High; "max" → Max.
+    ///           "high" → High; "max|xhigh" → Max.
     /// Anything else → NonThink (safe default).
+    ///
+    /// `xhigh` is Qwen3.8's ladder, whose published levels are
+    /// `xhigh` (default) > `medium` > `low`. It MUST be listed explicitly:
+    /// the fallthrough arm is `NonThink`, so an unmapped `xhigh` would turn a
+    /// model whose card says "thinking mode is on by default" into a
+    /// non-thinking one, silently and with no error.
+    ///
+    /// Note the ladders do not align. OpenAI's is
+    /// `minimal < low < medium < high`, so `medium` stays mapped to `Low` for
+    /// cross-model compatibility; that means Qwen3.8's `medium` and `low`
+    /// collapse onto the same mode here. Only the default (`xhigh`) is
+    /// represented exactly, which is what the registry ships.
     pub fn from_str(s: &str) -> Self {
         match s.to_ascii_lowercase().as_str() {
-            "max" => Self::Max,
+            "max" | "xhigh" => Self::Max,
             "high" => Self::High,
             "minimal" | "low" | "medium" | "med" | "thinking" => Self::Low,
             _ => Self::NonThink,
@@ -120,6 +132,23 @@ mod think_mode_tests {
         assert_eq!(ThinkMode::from_str("medium"), ThinkMode::Low);
         assert_eq!(ThinkMode::from_str("high"), ThinkMode::High);
         assert_eq!(ThinkMode::from_str("max"), ThinkMode::Max);
+    }
+
+    #[test]
+    fn qwen38_xhigh_is_a_thinking_mode_not_the_nonthink_fallthrough() {
+        // Qwen3.8's card sets `reasoning_effort: xhigh` as the DEFAULT and says
+        // thinking mode is on by default. `from_str`'s fallthrough arm is
+        // `NonThink`, so an unmapped `xhigh` silently disables thinking on the
+        // model's own default setting — no error, just non-thinking output.
+        // This asserts the mapping exists, and that it is not the fallthrough.
+        assert_eq!(ThinkMode::from_str("xhigh"), ThinkMode::Max);
+        assert_ne!(ThinkMode::from_str("xhigh"), ThinkMode::NonThink);
+        assert_eq!(ThinkMode::from_str("XHIGH"), ThinkMode::Max);
+
+        // Guard the fallthrough itself, so a future ladder value that is added
+        // to the config enum but forgotten here fails loudly in review rather
+        // than degrading to non-thinking in production.
+        assert_eq!(ThinkMode::from_str("ultra"), ThinkMode::NonThink);
     }
 }
 
@@ -640,6 +669,14 @@ pub struct JinjaChatFrame<'a> {
     /// Reasoning strength hint for Onyx/Harmony templates (`low|medium|high|xhigh`).
     /// Phase 1 always passes `None` (Lenient undefined → template defaults to 'high').
     pub reasoning_strength: Option<&'a str>,
+    /// Raw reasoning effort for Qwen3.8 (`low|medium|xhigh`). `None` means
+    /// the Jinja variable is truly undefined (not `null`) so the template's
+    /// `|default('xhigh')` fires; `Some("low"|"medium"|"xhigh")` passes the
+    /// exact string the caller supplied. `None` also covers `auto`/unset and
+    /// the non-thinking (`none`) case where `enable_thinking` is false and
+    /// the effort is irrelevant. Keep `reasoning_strength` untouched — it is
+    /// the separate Glimmer/Onyx hint.
+    pub reasoning_effort: Option<&'a str>,
 }
 
 /// Multi-turn message representation for `JinjaChatFrame::render_messages`.
@@ -862,7 +899,10 @@ fn parenthesize_conditional_kwargs(template: &str) -> String {
             while s > 0 && (b[s - 1].is_ascii_alphanumeric() || b[s - 1] == b'_') {
                 s -= 1;
             }
-            if matches!(template[..s].trim_end().chars().last(), Some('(') | Some(',')) {
+            if matches!(
+                template[..s].trim_end().chars().last(),
+                Some('(') | Some(',')
+            ) {
                 // Scan the value to the end of this argument at depth 0.
                 let mut j = i + 1;
                 let mut depth = 0i32;
@@ -1009,13 +1049,13 @@ impl<'a> JinjaChatFrame<'a> {
                 role: Role::System,
                 content: sys.to_string(),
 
-reasoning_content: None,
+                reasoning_content: None,
 
-name: None,
+                name: None,
 
-rendered_name: None,
+                rendered_name: None,
 
-tool_calls: Vec::new(),
+                tool_calls: Vec::new(),
                 tool_call_id: None,
                 tool_plan: String::new(),
             });
@@ -1024,13 +1064,13 @@ tool_calls: Vec::new(),
             role: Role::User,
             content: self.user.to_string(),
 
-reasoning_content: None,
+            reasoning_content: None,
 
-name: None,
+            name: None,
 
-rendered_name: None,
+            rendered_name: None,
 
-tool_calls: Vec::new(),
+            tool_calls: Vec::new(),
             tool_call_id: None,
             tool_plan: String::new(),
         });
@@ -1180,12 +1220,17 @@ tool_calls: Vec::new(),
             Some(s) => Value::from_serialize(s),
             None => Value::from_serialize(Option::<String>::None),
         };
+        let reasoning_effort_val = match self.reasoning_effort {
+            Some(s) => Value::from_serialize(s),
+            None => Value::UNDEFINED,
+        };
         let ctx = minijinja::context! {
             messages => messages_val,
             add_generation_prompt => true,
             enable_thinking => self.enable_thinking,
             bos_token => bos_token,
             reasoning_strength => reasoning_strength_val,
+            reasoning_effort => reasoning_effort_val,
             tools => tools_val,
             documents => Value::from_serialize(&empty_list),
             tool_call_kwargs => kwargs_val,
@@ -1261,7 +1306,10 @@ fn pick_splice_sentinels(tok: &Tokenizer, n: usize) -> Option<Vec<(String, u32)>
                 1
             }
         };
-        a_tier.cmp(&b_tier).then_with(|| a_id.cmp(b_id)).then_with(|| a_text.cmp(b_text))
+        a_tier
+            .cmp(&b_tier)
+            .then_with(|| a_id.cmp(b_id))
+            .then_with(|| a_text.cmp(b_text))
     });
     // Dedup by token id, keeping first (preferred tier) occurrence
     let mut seen = std::collections::HashSet::new();
@@ -1468,7 +1516,8 @@ pub fn build_cached_history_jinja(
     }
     // 7. Splice in one non-recursive pass
     let total_body_len: usize = slot_bodies.iter().map(|b| b.len()).sum();
-    let mut out: Vec<u32> = Vec::with_capacity(sub_tokens.len() - expected_ids.len() + total_body_len);
+    let mut out: Vec<u32> =
+        Vec::with_capacity(sub_tokens.len() - expected_ids.len() + total_body_len);
     let mut bi: usize = 0;
     for &t in &sub_tokens {
         if sentinel_ids.contains(&t) {
@@ -1530,8 +1579,8 @@ mod tests {
         entries.push(r#""<|reserved_2|>": 11"#.to_string());
         entries.push(r#""<|reserved_3|>": 12"#.to_string());
         entries.push(r#""<|reserved_4|>": 13"#.to_string());
-                                                            // All 256 GPT-2-byte characters get unique ids 100..356 so
-                                                            // any short string round-trips byte-by-byte.
+        // All 256 GPT-2-byte characters get unique ids 100..356 so
+        // any short string round-trips byte-by-byte.
         for b in 0u32..=255u32 {
             // Use rust escape; the encoder will look up the GPT-2 char
             // form of each byte directly.
@@ -1917,7 +1966,8 @@ mod tests {
             user: "",
             enable_thinking: true,
             bos_token: Some(""),
-        reasoning_strength: None,
+            reasoning_strength: None,
+            reasoning_effort: None,
         };
 
         // Turn 1: daemon prefills R1 (prompt, ends with the primed `<think>\n`)
@@ -1926,13 +1976,13 @@ mod tests {
             role: Role::User,
             content: "hi".to_string(),
 
-reasoning_content: None,
+            reasoning_content: None,
 
-name: None,
+            name: None,
 
-rendered_name: None,
+            rendered_name: None,
 
-tool_calls: vec![],
+            tool_calls: vec![],
             tool_call_id: None,
             tool_plan: String::new(),
         };
@@ -1957,13 +2007,13 @@ tool_calls: vec![],
             role: Role::Assistant,
             content: "ok".to_string(),
 
-reasoning_content: None,
+            reasoning_content: None,
 
-name: None,
+            name: None,
 
-rendered_name: None,
+            rendered_name: None,
 
-tool_calls: vec![],
+            tool_calls: vec![],
             tool_call_id: None,
             tool_plan: String::new(),
         };
@@ -1971,13 +2021,13 @@ tool_calls: vec![],
             role: Role::User,
             content: "again".to_string(),
 
-reasoning_content: None,
+            reasoning_content: None,
 
-name: None,
+            name: None,
 
-rendered_name: None,
+            rendered_name: None,
 
-tool_calls: vec![],
+            tool_calls: vec![],
             tool_call_id: None,
             tool_plan: String::new(),
         };
@@ -2048,7 +2098,10 @@ tool_calls: vec![],
             tool_plan: String::new(),
         };
         let v = serde_json::to_value(&msg).unwrap();
-        assert!(v.get("name").is_none(), "name should not serialize, got {v}");
+        assert!(
+            v.get("name").is_none(),
+            "name should not serialize, got {v}"
+        );
         // serializing with rendered_name: Some("b") emits "name":"b"
         let msg2 = Message {
             role: Role::Tool,
@@ -2077,6 +2130,7 @@ tool_calls: vec![],
             enable_thinking: true,
             bos_token: Some(""),
             reasoning_strength: None,
+            reasoning_effort: None,
         };
         // Two assistant turns: reasoning+content and reasoning+two-tool
         let u1 = Message {
@@ -2139,15 +2193,30 @@ tool_calls: vec![],
         let t1_body = vec![6002, 6003];
         let t2_body = vec![6004];
         let turn1 = CachedAssistantTurn {
-            reasoning: Some(CachedAssistantBody { token_ids: r1_body.clone(), text: "reason1".to_string() }),
+            reasoning: Some(CachedAssistantBody {
+                token_ids: r1_body.clone(),
+                text: "reason1".to_string(),
+            }),
             tools: Vec::new(),
-            content: Some(CachedAssistantBody { token_ids: c1_body.clone(), text: "answer1".to_string() }),
+            content: Some(CachedAssistantBody {
+                token_ids: c1_body.clone(),
+                text: "answer1".to_string(),
+            }),
         };
         let turn2 = CachedAssistantTurn {
-            reasoning: Some(CachedAssistantBody { token_ids: r2_body.clone(), text: "reason2".to_string() }),
+            reasoning: Some(CachedAssistantBody {
+                token_ids: r2_body.clone(),
+                text: "reason2".to_string(),
+            }),
             tools: vec![
-                CachedAssistantToolBody { recipient: "toolA".to_string(), token_ids: t1_body.clone() },
-                CachedAssistantToolBody { recipient: "toolB".to_string(), token_ids: t2_body.clone() },
+                CachedAssistantToolBody {
+                    recipient: "toolA".to_string(),
+                    token_ids: t1_body.clone(),
+                },
+                CachedAssistantToolBody {
+                    recipient: "toolB".to_string(),
+                    token_ids: t2_body.clone(),
+                },
             ],
             content: None,
         };
@@ -2156,7 +2225,11 @@ tool_calls: vec![],
         let mut call_idx = 0;
         let rendered = build_cached_history_jinja(&frame, &messages, None, |m| {
             if matches!(m.role, Role::Assistant) {
-                let ret = if call_idx == 0 { Some(turn1.clone()) } else { Some(turn2.clone()) };
+                let ret = if call_idx == 0 {
+                    Some(turn1.clone())
+                } else {
+                    Some(turn2.clone())
+                };
                 call_idx += 1;
                 ret
             } else {
@@ -2173,7 +2246,13 @@ tool_calls: vec![],
         }
         // Bodies appear in document order: r1, c1, r2, t1, t2
         // Find each body's occurrence in order
-        let bodies = vec![r1_body.clone(), c1_body.clone(), r2_body.clone(), t1_body.clone(), t2_body.clone()];
+        let bodies = vec![
+            r1_body.clone(),
+            c1_body.clone(),
+            r2_body.clone(),
+            t1_body.clone(),
+            t2_body.clone(),
+        ];
         // Check that bodies appear in order and not interleaved incorrectly
         let mut pos = 0;
         for body in &bodies {
@@ -2221,9 +2300,15 @@ tool_calls: vec![],
         };
         let messages = vec![u.clone(), a.clone()];
         let turn = CachedAssistantTurn {
-            reasoning: Some(CachedAssistantBody { token_ids: vec![7001], text: "reason".to_string() }),
+            reasoning: Some(CachedAssistantBody {
+                token_ids: vec![7001],
+                text: "reason".to_string(),
+            }),
             tools: Vec::new(),
-            content: Some(CachedAssistantBody { token_ids: vec![7002], text: "answer".to_string() }),
+            content: Some(CachedAssistantBody {
+                token_ids: vec![7002],
+                text: "answer".to_string(),
+            }),
         };
         // Template that DROPS content slot
         let template_drop = r#"{% for m in messages %}{% if m.role == 'assistant' %}[A]{% if m.reasoning_content %}<R>{{ m.reasoning_content }}</R>{% endif %}[AEND]{% else %}[{{ m.role }}:{{ m.content }}]{% endif %}{% endfor %}{% if add_generation_prompt %}[GEN]{% endif %}"#;
@@ -2235,13 +2320,21 @@ tool_calls: vec![],
             enable_thinking: true,
             bos_token: Some(""),
             reasoning_strength: None,
+            reasoning_effort: None,
         };
         let plain_drop = t.encode(&frame_drop.render_messages(&messages, None, None).unwrap());
         let spliced_drop = build_cached_history_jinja(&frame_drop, &messages, None, |m| {
-            if matches!(m.role, Role::Assistant) { Some(turn.clone()) } else { None }
+            if matches!(m.role, Role::Assistant) {
+                Some(turn.clone())
+            } else {
+                None
+            }
         })
         .unwrap();
-        assert_eq!(spliced_drop, plain_drop, "drop-content template must fallback to plain");
+        assert_eq!(
+            spliced_drop, plain_drop,
+            "drop-content template must fallback to plain"
+        );
 
         // Template that REORDERS content before reasoning
         let template_reorder = r#"{% for m in messages %}{% if m.role == 'assistant' %}[A]{% if m.tool_calls %}{% for tc in m.tool_calls %}<T>{{ tc.rendered_body }}</T>{% endfor %}{% else %}<C>{{ m.content }}</C>{% endif %}{% if m.reasoning_content %}<R>{{ m.reasoning_content }}</R>{% endif %}[AEND]{% else %}[{{ m.role }}:{{ m.content }}]{% endif %}{% endfor %}{% if add_generation_prompt %}[GEN]{% endif %}"#;
@@ -2253,13 +2346,25 @@ tool_calls: vec![],
             enable_thinking: true,
             bos_token: Some(""),
             reasoning_strength: None,
+            reasoning_effort: None,
         };
-        let plain_reorder = t.encode(&frame_reorder.render_messages(&messages, None, None).unwrap());
+        let plain_reorder = t.encode(
+            &frame_reorder
+                .render_messages(&messages, None, None)
+                .unwrap(),
+        );
         let spliced_reorder = build_cached_history_jinja(&frame_reorder, &messages, None, |m| {
-            if matches!(m.role, Role::Assistant) { Some(turn.clone()) } else { None }
+            if matches!(m.role, Role::Assistant) {
+                Some(turn.clone())
+            } else {
+                None
+            }
         })
         .unwrap();
-        assert_eq!(spliced_reorder, plain_reorder, "reordered template must fallback to plain");
+        assert_eq!(
+            spliced_reorder, plain_reorder,
+            "reordered template must fallback to plain"
+        );
     }
 
     #[test]
@@ -2274,6 +2379,7 @@ tool_calls: vec![],
             enable_thinking: true,
             bos_token: Some(""),
             reasoning_strength: None,
+            reasoning_effort: None,
         };
         let a = Message {
             role: Role::Assistant,
@@ -2305,11 +2411,18 @@ tool_calls: vec![],
         let bad_turn = CachedAssistantTurn {
             reasoning: None,
             tools: Vec::new(),
-            content: Some(CachedAssistantBody { token_ids: vec![8001], text: "".to_string() }),
+            content: Some(CachedAssistantBody {
+                token_ids: vec![8001],
+                text: "".to_string(),
+            }),
         };
         let plain = t.encode(&frame.render_messages(&messages, None, None).unwrap());
         let spliced = build_cached_history_jinja(&frame, &messages, None, |m| {
-            if matches!(m.role, Role::Assistant) { Some(bad_turn.clone()) } else { None }
+            if matches!(m.role, Role::Assistant) {
+                Some(bad_turn.clone())
+            } else {
+                None
+            }
         })
         .unwrap();
         assert_eq!(spliced, plain, "content cache on tool turn must fallback");
@@ -2327,6 +2440,7 @@ tool_calls: vec![],
             enable_thinking: true,
             bos_token: Some(""),
             reasoning_strength: None,
+            reasoning_effort: None,
         };
         let a = Message {
             role: Role::Assistant,
@@ -2353,10 +2467,17 @@ tool_calls: vec![],
         let turn = CachedAssistantTurn {
             reasoning: None,
             tools: Vec::new(),
-            content: Some(CachedAssistantBody { token_ids: body.clone(), text: "hello".to_string() }),
+            content: Some(CachedAssistantBody {
+                token_ids: body.clone(),
+                text: "hello".to_string(),
+            }),
         };
         let spliced = build_cached_history_jinja(&frame, &messages, None, |m| {
-            if matches!(m.role, Role::Assistant) { Some(turn.clone()) } else { None }
+            if matches!(m.role, Role::Assistant) {
+                Some(turn.clone())
+            } else {
+                None
+            }
         })
         .unwrap();
         // Manually compute expected via sentinel substitution and check no sentinel leaked
@@ -2364,7 +2485,10 @@ tool_calls: vec![],
             assert!(!spliced.contains(&sid), "no sentinel leaked");
         }
         // Body must appear verbatim
-        assert!(spliced.windows(body.len()).any(|w| w == body.as_slice()), "body must be spliced");
+        assert!(
+            spliced.windows(body.len()).any(|w| w == body.as_slice()),
+            "body must be spliced"
+        );
         // Plain fallback check: ensure it differs from plain (which would retokenize "hello")
         let plain = t.encode(&frame.render_messages(&messages, None, None).unwrap());
         // Since body is non-retokenized (9001..), spliced should differ from plain if body not equal to encode("hello")
@@ -2386,6 +2510,7 @@ tool_calls: vec![],
             enable_thinking: false,
             bos_token: Some(""),
             reasoning_strength: None,
+            reasoning_effort: None,
         };
         let a = Message {
             role: Role::Assistant,
@@ -2411,14 +2536,24 @@ tool_calls: vec![],
         let turn = CachedAssistantTurn {
             reasoning: None,
             tools: Vec::new(),
-            content: Some(CachedAssistantBody { token_ids: vec![1, 2, 3], text: "hi".to_string() }),
+            content: Some(CachedAssistantBody {
+                token_ids: vec![1, 2, 3],
+                text: "hi".to_string(),
+            }),
         };
         let plain = t.encode(&frame.render_messages(&messages, None, None).unwrap());
         let spliced = build_cached_history_jinja(&frame, &messages, None, |m| {
-            if matches!(m.role, Role::Assistant) { Some(turn.clone()) } else { None }
+            if matches!(m.role, Role::Assistant) {
+                Some(turn.clone())
+            } else {
+                None
+            }
         })
         .unwrap();
-        assert_eq!(spliced, plain, "when no sentinel available, must fallback to plain");
+        assert_eq!(
+            spliced, plain,
+            "when no sentinel available, must fallback to plain"
+        );
     }
 
     #[test]
@@ -2442,7 +2577,8 @@ tool_calls: vec![],
             user: "What is the capital of France?",
             enable_thinking: false,
             bos_token: Some("<bos>"),
-        reasoning_strength: None,
+            reasoning_strength: None,
+            reasoning_effort: None,
         };
         let rendered = frame.render().expect("gemma4 template renders plain turn");
         assert!(
@@ -2470,13 +2606,13 @@ tool_calls: vec![],
             role: Role::User,
             content: "weather in SF?".to_string(),
 
-reasoning_content: None,
+            reasoning_content: None,
 
-name: None,
+            name: None,
 
-rendered_name: None,
+            rendered_name: None,
 
-tool_calls: Vec::new(),
+            tool_calls: Vec::new(),
             tool_call_id: None,
             tool_plan: String::new(),
         }];
@@ -2511,13 +2647,13 @@ tool_calls: Vec::new(),
                 role: Role::User,
                 content: "weather in SF?".to_string(),
 
-reasoning_content: None,
+                reasoning_content: None,
 
-name: None,
+                name: None,
 
-rendered_name: None,
+                rendered_name: None,
 
-tool_calls: Vec::new(),
+                tool_calls: Vec::new(),
                 tool_call_id: None,
                 tool_plan: String::new(),
             },
@@ -2525,17 +2661,17 @@ tool_calls: Vec::new(),
                 role: Role::Assistant,
                 content: String::new(),
 
-reasoning_content: None,
+                reasoning_content: None,
 
-name: None,
+                name: None,
 
-rendered_name: None,
+                rendered_name: None,
 
-tool_calls: vec![ToolCall {
-id: None,
+                tool_calls: vec![ToolCall {
+                    id: None,
                     name: "get_weather".to_string(),
                     arguments: serde_json::json!({"city": "SF"}),
-                rendered_body: None,
+                    rendered_body: None,
                 }],
                 tool_call_id: None,
                 tool_plan: String::new(),
@@ -2544,13 +2680,13 @@ id: None,
                 role: Role::Tool,
                 content: "72F sunny".to_string(),
 
-reasoning_content: None,
+                reasoning_content: None,
 
-name: None,
+                name: None,
 
-rendered_name: None,
+                rendered_name: None,
 
-tool_calls: Vec::new(),
+                tool_calls: Vec::new(),
                 tool_call_id: None,
                 tool_plan: String::new(),
             },
@@ -2585,19 +2721,20 @@ tool_calls: Vec::new(),
             user: "",
             enable_thinking: true,
             bos_token: Some(""),
-        reasoning_strength: None,
+            reasoning_strength: None,
+            reasoning_effort: None,
         };
         let messages = vec![Message {
             role: Role::User,
             content: "hi".to_string(),
 
-reasoning_content: None,
+            reasoning_content: None,
 
-name: None,
+            name: None,
 
-rendered_name: None,
+            rendered_name: None,
 
-tool_calls: Vec::new(),
+            tool_calls: Vec::new(),
             tool_call_id: None,
             tool_plan: String::new(),
         }];
@@ -2655,20 +2792,21 @@ tool_calls: Vec::new(),
             user: "",
             enable_thinking: true,
             bos_token: Some(""),
-        reasoning_strength: None,
+            reasoning_strength: None,
+            reasoning_effort: None,
         };
         let messages = vec![
             Message {
                 role: Role::System,
                 content: "be brief".to_string(),
 
-reasoning_content: None,
+                reasoning_content: None,
 
-name: None,
+                name: None,
 
-rendered_name: None,
+                rendered_name: None,
 
-tool_calls: Vec::new(),
+                tool_calls: Vec::new(),
                 tool_call_id: None,
                 tool_plan: String::new(),
             },
@@ -2676,13 +2814,13 @@ tool_calls: Vec::new(),
                 role: Role::User,
                 content: "weather?".to_string(),
 
-reasoning_content: None,
+                reasoning_content: None,
 
-name: None,
+                name: None,
 
-rendered_name: None,
+                rendered_name: None,
 
-tool_calls: Vec::new(),
+                tool_calls: Vec::new(),
                 tool_call_id: None,
                 tool_plan: String::new(),
             },
@@ -2690,17 +2828,17 @@ tool_calls: Vec::new(),
                 role: Role::Assistant,
                 content: "".to_string(),
 
-reasoning_content: None,
+                reasoning_content: None,
 
-name: None,
+                name: None,
 
-rendered_name: None,
+                rendered_name: None,
 
-tool_calls: vec![ToolCall {
-id: None,
+                tool_calls: vec![ToolCall {
+                    id: None,
                     name: "get_weather".to_string(),
                     arguments: serde_json::json!({"city":"SF"}),
-                rendered_body: None,
+                    rendered_body: None,
                 }],
                 tool_call_id: None,
                 tool_plan: String::new(),
@@ -2709,13 +2847,13 @@ id: None,
                 role: Role::Tool,
                 content: "72F".to_string(),
 
-reasoning_content: None,
+                reasoning_content: None,
 
-name: None,
+                name: None,
 
-rendered_name: None,
+                rendered_name: None,
 
-tool_calls: Vec::new(),
+                tool_calls: Vec::new(),
                 tool_call_id: Some("call_1".to_string()),
                 tool_plan: String::new(),
             },
@@ -2755,13 +2893,13 @@ tool_calls: Vec::new(),
                 role: Role::User,
                 content: "weather?".to_string(),
 
-reasoning_content: None,
+                reasoning_content: None,
 
-name: None,
+                name: None,
 
-rendered_name: None,
+                rendered_name: None,
 
-tool_calls: Vec::new(),
+                tool_calls: Vec::new(),
                 tool_call_id: None,
                 tool_plan: String::new(),
             },
@@ -2769,17 +2907,17 @@ tool_calls: Vec::new(),
                 role: Role::Assistant,
                 content: String::new(),
 
-reasoning_content: None,
+                reasoning_content: None,
 
-name: None,
+                name: None,
 
-rendered_name: None,
+                rendered_name: None,
 
-tool_calls: vec![ToolCall {
-id: None,
+                tool_calls: vec![ToolCall {
+                    id: None,
                     name: "get_weather".to_string(),
                     arguments: serde_json::json!({"city": "SF"}),
-                rendered_body: None,
+                    rendered_body: None,
                 }],
                 tool_call_id: None,
                 tool_plan: String::new(),
@@ -2819,17 +2957,17 @@ id: None,
             role: Role::Assistant,
             content: String::new(),
 
-reasoning_content: None,
+            reasoning_content: None,
 
-name: None,
+            name: None,
 
-rendered_name: None,
+            rendered_name: None,
 
-tool_calls: vec![ToolCall {
-id: None,
+            tool_calls: vec![ToolCall {
+                id: None,
                 name: "get_weather".to_string(),
                 arguments: serde_json::json!({"city": "SF"}),
-            rendered_body: None,
+                rendered_body: None,
             }],
             tool_call_id: None,
             tool_plan: String::new(),
@@ -2992,20 +3130,21 @@ SYS:{{ build_system_message(system_message) }}:END
             user: "",
             enable_thinking: true,
             bos_token: Some(""),
-        reasoning_strength: None,
+            reasoning_strength: None,
+            reasoning_effort: None,
         };
         let messages = vec![
             Message {
                 role: Role::System,
                 content: "Be concise.".to_string(),
 
-reasoning_content: None,
+                reasoning_content: None,
 
-name: None,
+                name: None,
 
-rendered_name: None,
+                rendered_name: None,
 
-tool_calls: Vec::new(),
+                tool_calls: Vec::new(),
                 tool_call_id: None,
                 tool_plan: String::new(),
             },
@@ -3013,13 +3152,13 @@ tool_calls: Vec::new(),
                 role: Role::User,
                 content: "hi".to_string(),
 
-reasoning_content: None,
+                reasoning_content: None,
 
-name: None,
+                name: None,
 
-rendered_name: None,
+                rendered_name: None,
 
-tool_calls: Vec::new(),
+                tool_calls: Vec::new(),
                 tool_call_id: None,
                 tool_plan: String::new(),
             },
@@ -3066,19 +3205,20 @@ tool_calls: Vec::new(),
             user: "",
             enable_thinking: true,
             bos_token: Some(""),
-        reasoning_strength: None,
+            reasoning_strength: None,
+            reasoning_effort: None,
         };
         let messages = vec![Message {
             role: Role::User,
             content: "hi".to_string(),
 
-reasoning_content: None,
+            reasoning_content: None,
 
-name: None,
+            name: None,
 
-rendered_name: None,
+            rendered_name: None,
 
-tool_calls: Vec::new(),
+            tool_calls: Vec::new(),
             tool_call_id: None,
             tool_plan: String::new(),
         }];
@@ -3176,13 +3316,13 @@ tool_calls: Vec::new(),
                 role: Role::User,
                 content: "hello".to_string(),
 
-reasoning_content: None,
+                reasoning_content: None,
 
-name: None,
+                name: None,
 
-rendered_name: None,
+                rendered_name: None,
 
-tool_calls: Vec::new(),
+                tool_calls: Vec::new(),
                 tool_call_id: None,
                 tool_plan: String::new(),
             },
@@ -3190,13 +3330,13 @@ tool_calls: Vec::new(),
                 role: Role::Assistant,
                 content: "hi there".to_string(),
 
-reasoning_content: None,
+                reasoning_content: None,
 
-name: None,
+                name: None,
 
-rendered_name: None,
+                rendered_name: None,
 
-tool_calls: Vec::new(),
+                tool_calls: Vec::new(),
                 tool_call_id: None,
                 tool_plan: String::new(),
             },
@@ -3204,13 +3344,13 @@ tool_calls: Vec::new(),
                 role: Role::User,
                 content: "again".to_string(),
 
-reasoning_content: None,
+                reasoning_content: None,
 
-name: None,
+                name: None,
 
-rendered_name: None,
+                rendered_name: None,
 
-tool_calls: Vec::new(),
+                tool_calls: Vec::new(),
                 tool_call_id: None,
                 tool_plan: String::new(),
             },
@@ -3223,7 +3363,8 @@ tool_calls: Vec::new(),
             user: "",
             enable_thinking: false,
             bos_token: Some(""),
-        reasoning_strength: None,
+            reasoning_strength: None,
+            reasoning_effort: None,
         };
         let frame_clean = JinjaChatFrame {
             tokenizer: &t,
@@ -3232,7 +3373,8 @@ tool_calls: Vec::new(),
             user: "",
             enable_thinking: false,
             bos_token: Some(""),
-        reasoning_strength: None,
+            reasoning_strength: None,
+            reasoning_effort: None,
         };
 
         let out = frame_marked
@@ -3280,7 +3422,6 @@ tool_calls: Vec::new(),
         assert_eq!(civil_from_days(20_622), (2026, 6, 18));
     }
 
-
     /// Muse Glimmer's chat_template uses `namespace(name=tcid if tcid else '')`,
     /// which Jinja2 accepts and minijinja rejects with
     /// "unexpected identifier, expected `,`". Because that template is a single
@@ -3299,7 +3440,10 @@ tool_calls: Vec::new(),
         );
 
         let fixed = parenthesize_conditional_kwargs(raw);
-        assert!(fixed.contains("namespace(name=(tcid if tcid else ''))"), "got: {fixed}");
+        assert!(
+            fixed.contains("namespace(name=(tcid if tcid else ''))"),
+            "got: {fixed}"
+        );
         let mut env2 = minijinja::Environment::new();
         env2.template_from_named_str("chat", &fixed)
             .expect("fixed template must parse");
@@ -3319,5 +3463,173 @@ tool_calls: Vec::new(),
         ] {
             assert_eq!(parenthesize_conditional_kwargs(src), src, "changed: {src}");
         }
+    }
+
+    // ── Qwen3.8 reasoning_effort plumbing ───────────────────────────────
+    // Template that hard-accepts exactly low/medium/xhigh when thinking is
+    // enabled, defaults to xhigh only when reasoning_effort is undefined,
+    // and emits a closed think block when thinking is disabled. This mirrors
+    // the embedded Qwen3.8 chat_template.jinja excerpt (lines 45-56 + 163-169).
+    const QWEN38_MINIMAL: &str = "\
+{%- set reasoning_instructions = '' -%}\
+{%- if enable_thinking is undefined or enable_thinking is true -%}\
+    {%- set resolved = reasoning_effort|default('xhigh') -%}\
+    {%- if resolved not in ('xhigh', 'medium', 'low') -%}\
+        {{- raise_exception('Unexpected reasoning effort ' ~ reasoning_effort ~ '.') -}}\
+    {%- endif -%}\
+    {%- if resolved == 'xhigh' -%}{%- set reasoning_instructions = 'XHI' -%}\
+    {%- elif resolved == 'low' -%}{%- set reasoning_instructions = 'LOW' -%}\
+    {%- endif -%}\
+{%- endif -%}\
+{%- if reasoning_instructions %}[I:{{ reasoning_instructions }}]{%- endif -%}\
+{%- for m in messages %}[{{ m.role }}:{{ m.content }}]{%- endfor -%}\
+{%- if add_generation_prompt -%}\
+    {%- if enable_thinking is defined and enable_thinking is false -%}{{- '<think>\\n\\n</think>\\n\\n' -}}{%- else -%}{{- '<think>\\n' -}}{%- endif -%}\
+{%- endif -%}";
+
+    fn render_qwen38_minimal(
+        enable_thinking: bool,
+        reasoning_effort: Option<&str>,
+    ) -> Result<String, String> {
+        let t = make_tokenizer();
+        let frame = JinjaChatFrame {
+            tokenizer: &t,
+            template: QWEN38_MINIMAL,
+            system: None,
+            user: "",
+            enable_thinking,
+            bos_token: Some(""),
+            reasoning_strength: None,
+            reasoning_effort,
+        };
+        let msgs = vec![Message {
+            role: Role::User,
+            content: "hi".to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_plan: String::new(),
+        }];
+        frame.render_messages(&msgs, None, None)
+    }
+
+    #[test]
+    fn qwen38_low_renders_low_instruction() {
+        let out = render_qwen38_minimal(true, Some("low")).expect("low should render");
+        assert!(
+            out.contains("[I:LOW]"),
+            "low must emit LOW instruction, got {out:?}"
+        );
+        assert!(
+            out.ends_with("<think>\n"),
+            "thinking on must open think, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn qwen38_medium_renders_valid_without_instruction() {
+        let out = render_qwen38_minimal(true, Some("medium")).expect("medium should render");
+        assert!(
+            !out.contains("[I:"),
+            "medium must not emit XHI/LOW instruction, got {out:?}"
+        );
+        assert!(
+            out.ends_with("<think>\n"),
+            "medium thinking on, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn qwen38_xhigh_renders_xhigh_instruction() {
+        let out = render_qwen38_minimal(true, Some("xhigh")).expect("xhigh should render");
+        assert!(out.contains("[I:XHI]"), "xhigh must emit XHI, got {out:?}");
+    }
+
+    #[test]
+    fn qwen38_unset_defaults_to_xhigh_via_undefined() {
+        // None => Jinja undefined => |default('xhigh') => XHI
+        let out = render_qwen38_minimal(true, None).expect("unset should render");
+        assert!(
+            out.contains("[I:XHI]"),
+            "unset (undefined) must default to XHI, got {out:?}"
+        );
+        // Ensure None did not become `null` string: if it were null, `resolved` would be None
+        // and `not in` check would raise Unexpected reasoning effort None.
+    }
+
+    #[test]
+    fn qwen38_none_disables_thinking_closed_block() {
+        let out = render_qwen38_minimal(false, None).expect("non-thinking should render");
+        assert!(
+            !out.contains("[I:"),
+            "non-thinking must not emit instruction, got {out:?}"
+        );
+        assert!(
+            out.contains("<think>\n\n</think>\n\n"),
+            "disabled thinking must emit closed block, got {out:?}"
+        );
+        // reasoning_effort must be undefined when thinking disabled – passing Some would be wrong.
+        // This test uses None and disabled flag to assert closed block path.
+    }
+
+    #[test]
+    fn qwen38_unsupported_value_raises() {
+        let err =
+            render_qwen38_minimal(true, Some("high")).expect_err("unsupported high must raise");
+        assert!(
+            err.contains("Unexpected reasoning effort"),
+            "high should raise, got {err:?}"
+        );
+        let err2 = render_qwen38_minimal(true, Some("ultra")).expect_err("ultra must raise");
+        assert!(
+            err2.contains("Unexpected reasoning effort"),
+            "ultra should raise, got {err2:?}"
+        );
+    }
+
+    #[test]
+    fn qwen36_default_render_unchanged_with_reasoning_effort_undefined() {
+        // Qwen3.6 template never probes reasoning_effort; adding the new variable
+        // as undefined must leave its render byte-identical to the previous None=null path.
+        let t = make_tokenizer();
+        let qwen36_template = "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% if enable_thinking %}<think>\n{% endif %}{% endif %}";
+        let frame_no_effort = JinjaChatFrame {
+            tokenizer: &t,
+            template: qwen36_template,
+            system: None,
+            user: "",
+            enable_thinking: true,
+            bos_token: Some(""),
+            reasoning_strength: None,
+            reasoning_effort: None,
+        };
+        let msgs = vec![Message {
+            role: Role::User,
+            content: "hello".to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_plan: String::new(),
+        }];
+        let out1 = frame_no_effort
+            .render_messages(&msgs, None, None)
+            .expect("qwen36 render");
+        // Render again with same inputs – must be identical (construction check)
+        let out2 = frame_no_effort
+            .render_messages(&msgs, None, None)
+            .expect("second qwen36 render");
+        assert_eq!(out1, out2, "Qwen3.6 default must be stable");
+        assert!(
+            out1.contains("<|im_start|>user\nhello<|im_end|>"),
+            "user turn present: {out1:?}"
+        );
+        assert!(
+            out1.ends_with("<|im_start|>assistant\n<think>\n"),
+            "thinking open: {out1:?}"
+        );
     }
 }

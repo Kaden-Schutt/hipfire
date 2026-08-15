@@ -5861,6 +5861,13 @@ fn safetensors_to_ggml_name(name: &str) -> Option<String> {
         "self_attn.k_proj" => "attn_k",
         "self_attn.v_proj" => "attn_v",
         "self_attn.o_proj" => "attn_output",
+        // Glimmer gates attention output before o_proj under a name Qwen does
+        // not use (see hipfire-arch-muse-glimmer lib.rs). llama.cpp exports it
+        // as blk.{N}.attn_gate, so without this arm the 52 Glimmer gate tensors
+        // silently miss AWQ despite `awq_eligible` matching `gate_proj.weight`
+        // and the imatrix carrying the entry. No collision with the linear-attn
+        // arm below: a layer is either full- or linear-attention, never both.
+        "self_attn.gate_proj" => "attn_gate",
         // LinearAttention layer tensors (Mamba-2 / hybrid-arch SSM naming).
         "linear_attn.in_proj_qkv" => "attn_qkv",
         "linear_attn.in_proj_z" => "attn_gate",
@@ -7782,12 +7789,11 @@ fn main() {
     // q8-fast = Q8 attn + Q4-as-Q8 FFN (all Q8 occupancy, most VRAM)
     // q8hfq = all weights Q8_HFQ (split-metadata, 128B-aligned rows)
     let use_q8 = format == "q8f16" || format == "q8";
-    // F1 native-bf16 oracle: full-precision passthrough. Every tensor stored
+    // F32 oracle: full-precision passthrough. Every tensor stored
     // as QuantType::F32 (qt=2) -- weights, norms, embeddings. The bf16 source
     // is widened bf16->f32 (lossless), giving the engine a superset-precision
     // reference forward for self-sufficient KLD eval.
-    let use_f32_passthrough =
-        format == "f32" || format == "f32-passthrough" || format == "bf16" || format == "oracle";
+    let use_f32_passthrough = format == "f32" || format == "f32-passthrough" || format == "oracle";
     let use_mixed = format == "q8-mixed" || format == "mixed";
     let use_fast = format == "q8-fast" || format == "fast";
     let use_q8hfq = format == "q8hfq";
@@ -7834,10 +7840,9 @@ fn main() {
     let use_hfq_mixed = format == "hfq-mixed"; // Q8 attn + HFQ4 FFN
     let use_mq6g256 = format == "mq6" || format == "mq6g256";
     let use_mq5g256 = format == "mq5" || format == "mq5g256";
-    // Native-bf16 reference (the KLD/PPL oracle): cohere2moe stores matmul
-    // weights as the EXACT downloaded bf16 bytes (~61 GB, fits gfx1151's GTT;
-    // the all-F32 `oracle` passthrough is 122 GB and does NOT fit). `f16` is a
-    // lossy-reconvert alternative tier, kept available but not the reference.
+    // Native-bf16 reference. Cohere2MoE and Qwen3.5 store matmul weights as
+    // the exact downloaded BF16 bytes; `f16` is a lossy-reconvert alternative
+    // tier, while the all-F32 `oracle` doubles storage.
     let use_bf16 = format == "bf16" || format == "bf16-passthrough" || format == "oracle";
     let use_f16 = format == "f16" || format == "f16-passthrough";
     // ── Graded per-expert mixed precision (HIPFIRE_MOE_GRADED) ────────────
@@ -9625,6 +9630,87 @@ fn main() {
                 data: bytes,
                 spilled_len: 0,
             });
+            st_files[*file_idx].drop_tensor_pages(name);
+            if let Some(ref mut sp) = spill {
+                maybe_spill(&mut hfq_tensors, sp, 2 * 1024 * 1024 * 1024);
+            }
+            continue;
+        }
+
+        // Source-precision BF16 passthrough for non-vision model tensors.
+        // Unlike the F32 oracle above, this preserves the checkpoint's native
+        // two-byte representation on disk. The qwen35 loader can consume
+        // qt=16 losslessly; vision remains on the established F16 ingest path
+        // because its kernels consume F16 matrices.
+        if use_bf16 && matches!(arch_id, 5 | 6) && !is_vision {
+            let bf16_bytes = if meta.dtype == "BF16" {
+                raw_data.to_vec()
+            } else {
+                tensor_to_f32_with_optional_fp8_scale(
+                    name,
+                    raw_data,
+                    meta,
+                    &fp8_scale_for,
+                    &st_files,
+                )
+                .iter()
+                .flat_map(|&value| {
+                    let bits = value.to_bits();
+                    let rounded = bits.wrapping_add(0x7fff + ((bits >> 16) & 1));
+                    ((rounded >> 16) as u16).to_le_bytes()
+                })
+                .collect()
+            };
+
+            if is_moe
+                && name.contains("mlp.experts.")
+                && (name.ends_with("gate_up_proj") || name.ends_with("down_proj"))
+                && meta.shape.len() == 3
+            {
+                let n_exp = meta.shape[0];
+                let inner_n: usize = meta.shape[1..].iter().product();
+                let base_name = if name.ends_with("gate_up_proj") {
+                    "gate_up_proj"
+                } else {
+                    "down_proj"
+                };
+                let parent = &name[..name.len() - base_name.len()];
+                let inner_shape: Vec<u32> = meta.shape[1..].iter().map(|&d| d as u32).collect();
+                for expert in 0..n_exp {
+                    let start = expert * inner_n * 2;
+                    let end = start + inner_n * 2;
+                    hfq_tensors.push(HfqTensor {
+                        name: format!("{parent}{expert}.{base_name}.weight"),
+                        quant_type: QuantType::BF16,
+                        shape: inner_shape.clone(),
+                        group_size: 0,
+                        data: bf16_bytes[start..end].to_vec(),
+                        spilled_len: 0,
+                    });
+                }
+                eprintln!(
+                    "  {:>8}: {} {:?} -> {} per-expert BF16 [source split]",
+                    "BF16", name, meta.shape, n_exp
+                );
+            } else {
+                eprintln!(
+                    "  {:>8}: {} {:?} ({} elements, {:.1} KB) [source passthrough]",
+                    "BF16",
+                    name,
+                    meta.shape,
+                    n_elements,
+                    bf16_bytes.len() as f64 / 1024.0
+                );
+                hfq_tensors.push(HfqTensor {
+                    name: name.to_string(),
+                    quant_type: QuantType::BF16,
+                    shape: meta.shape.iter().map(|&s| s as u32).collect(),
+                    group_size: 0,
+                    data: bf16_bytes,
+                    spilled_len: 0,
+                });
+            }
+            quantized_params += n_elements as u64;
             st_files[*file_idx].drop_tensor_pages(name);
             if let Some(ref mut sp) = spill {
                 maybe_spill(&mut hfq_tensors, sp, 2 * 1024 * 1024 * 1024);

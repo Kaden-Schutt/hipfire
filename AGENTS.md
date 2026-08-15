@@ -324,10 +324,10 @@ Standalone: `./target/release/examples/encode_prompt MODEL.hfq PROMPT.txt --heat
 
 ### E. DFlash draft endpoints (HuggingFace)
 
-- `schuttdev/hipfire-qwen3.5-9b/qwen35-9b-dflash-mq4.hfq`
-- `schuttdev/hipfire-qwen3.5-27b/qwen35-27b-dflash-mq4.hfq`
-- `schuttdev/hipfire-qwen3.6-27b/qwen36-27b-dflash-mq4.hfq` (+ the 3.6 27B
-  target `schuttdev/hipfire-qwen3.6-27b/qwen3.6-27b.mq4`)
+- `hipfire-models/qwen3.5-9b/qwen35-9b-dflash-mq4.hfq`
+- `hipfire-models/qwen3.5-27b/qwen35-27b-dflash-mq4.hfq`
+- `hipfire-models/qwen3.6-27b/qwen36-27b-dflash-mq4.hfq` (+ the 3.6 27B
+  target `hipfire-models/qwen3.6-27b/qwen3.6-27b.mq4`)
 
 Pullable via `hipfire pull qwen3.{5,6}:{9b,27b}-draft` and `hipfire pull qwen3.6:27b`.
 
@@ -515,7 +515,9 @@ AWQ/MQ4 files are not comparable.
 The canonical trunk is whichever local artifact byte-matches the current
 Hugging Face `.mq4` artifact:
 
-- HF repo: `schuttdev/hipfire-qwen3.6-27b`
+- HF repo: `hipfire-models/qwen3.6-27b` (moved from `schuttdev/hipfire-qwen3.6-27b`
+  on 2026-08-14; HF redirects the old path, and the commit/digest pins below are
+  unchanged by the move)
 - HF file: `qwen3.6-27b.mq4`
 - HF repo commit when pinned: `f9b326a657f14cbc400e384ff84a4b9b4b726ba2`
 - File size: `14984158208`

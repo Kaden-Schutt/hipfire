@@ -7,20 +7,20 @@
 //! This binary owns hipfire's operator surface and never shells out to a
 //! JavaScript or TypeScript runtime.
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use hipfire_client::{
-    Engine, OpenAiSseEvent, complete_openai_chat, probe_host, service_ready, service_url,
-    stream_openai_chat,
+    complete_openai_chat, probe_host, service_ready, service_url, stream_openai_chat, Engine,
+    OpenAiSseEvent,
 };
 use hipfire_config::{
-    CONFIG_SCHEMA_VERSION, CatalogFormat, ConfigFormat, ConfigLayer, ConfigPaths, ConfigSource,
-    NamedLayer, ValueRule, apply_config_profile, canonical_config_key, create_config_profile,
-    developer_env_for_key, field, fields, is_developer_key, load_catalog, load_env_layer,
-    load_global, resolve, write_catalog_toml, write_global_toml,
+    apply_config_profile, canonical_config_key, create_config_profile, developer_env_for_key,
+    field, fields, is_developer_key, load_catalog, load_env_layer, load_global, resolve,
+    write_catalog_toml, write_global_toml, CatalogFormat, ConfigFormat, ConfigLayer, ConfigPaths,
+    ConfigSource, NamedLayer, ValueRule, CONFIG_SCHEMA_VERSION,
 };
 use hipfire_registry::{
-    LoadedRegistry, ModelEntry, RegistryPaths, RegistrySource, RegistryV1, load as load_registry,
+    load as load_registry, LoadedRegistry, ModelEntry, RegistryPaths, RegistrySource, RegistryV1,
 };
 use hipfire_runtime::prompt_frame::ToolCall;
 use serde::{Deserialize, Serialize};
@@ -36,9 +36,8 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command},
     sync::{
-        Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
-        mpsc,
+        mpsc, Arc, Condvar, Mutex,
     },
     thread,
     time::{Duration, Instant},
@@ -216,6 +215,14 @@ struct SetupArgs {
     source: PathBuf,
     #[arg(long, value_name = "PATH")]
     rocm_root: Option<PathBuf>,
+    /// Explicit device compiler (hipcc/amdclang++) when it lives in a different
+    /// prefix than the runtime. Also set via HIPFIRE_HIPCC.
+    #[arg(long, value_name = "PATH")]
+    hipcc: Option<PathBuf>,
+    /// Disable cross-root compiler fallback; require the compiler under the
+    /// selected root. Also set via HIPFIRE_ROCM_STRICT=1.
+    #[arg(long)]
+    strict_rocm: bool,
     #[arg(long, value_name = "ARCH")]
     gpu_arch: Option<String>,
     /// auto (default) leaves replay.backend=auto so .mq4r models select Redline.
@@ -2238,7 +2245,8 @@ fn chat_command(paths: &Paths, args: ChatArgs) -> Result<()> {
             messages.pop();
             return Err(error.into());
         }
-        let mut assistant_msg = serde_json::json!({ "role": "assistant", "content": assistant_content });
+        let mut assistant_msg =
+            serde_json::json!({ "role": "assistant", "content": assistant_content });
         if !assistant_reasoning.is_empty() {
             assistant_msg["reasoning_content"] = serde_json::Value::String(assistant_reasoning);
         }
@@ -3159,50 +3167,48 @@ fn serve_foreground(
     }
     if !shared.idle_timeout.is_zero() {
         let shared = Arc::clone(&shared);
-        thread::spawn(move || {
-            loop {
-                thread::sleep(Duration::from_secs(1));
-                if shared.admission.inflight() != 0 {
-                    continue;
-                }
-                let expired = {
-                    let meta = shared
-                        .meta
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner());
-                    idle_model_expired(&meta, shared.idle_timeout)
-                };
-                if !expired {
-                    continue;
-                }
-                let unloaded = {
-                    let mut runtime = shared
-                        .runtime
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner());
-                    if runtime.current_path.is_some() {
-                        let result = runtime.engine.unload();
-                        if result.is_ok() {
-                            runtime.current_path = None;
-                            runtime.current_arch = None;
-                            runtime.current_max_seq = 0;
-                            runtime.cache_capable = false;
-                        }
-                        result
-                    } else {
-                        Ok(())
+        thread::spawn(move || loop {
+            thread::sleep(Duration::from_secs(1));
+            if shared.admission.inflight() != 0 {
+                continue;
+            }
+            let expired = {
+                let meta = shared
+                    .meta
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                idle_model_expired(&meta, shared.idle_timeout)
+            };
+            if !expired {
+                continue;
+            }
+            let unloaded = {
+                let mut runtime = shared
+                    .runtime
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                if runtime.current_path.is_some() {
+                    let result = runtime.engine.unload();
+                    if result.is_ok() {
+                        runtime.current_path = None;
+                        runtime.current_arch = None;
+                        runtime.current_max_seq = 0;
+                        runtime.cache_capable = false;
                     }
-                };
-                if unloaded.is_ok() {
-                    let mut meta = shared
-                        .meta
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner());
-                    meta.current_model = None;
-                    meta.loading_model = None;
-                    meta.last_activity = Instant::now();
-                    eprintln!("[hipfire] unloaded idle model");
+                    result
+                } else {
+                    Ok(())
                 }
+            };
+            if unloaded.is_ok() {
+                let mut meta = shared
+                    .meta
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                meta.current_model = None;
+                meta.loading_model = None;
+                meta.last_activity = Instant::now();
+                eprintln!("[hipfire] unloaded idle model");
             }
         });
     }
@@ -3445,18 +3451,71 @@ fn respond_streaming(
         );
         finish_sse_stream(sender, result);
     });
-    request.respond(Response::new(
-        StatusCode(200),
-        vec![
-            header("Content-Type", "text/event-stream"),
-            header("Cache-Control", "no-cache"),
-            header("Connection", "keep-alive"),
-            header("Access-Control-Allow-Origin", "*"),
-        ],
-        ChannelReader::new(receiver),
-        None,
-        None,
-    ))?;
+    let mut writer = request.into_writer();
+    // Write status line + headers manually. We own the socket, so use
+    // Connection: close and close after the terminal chunk; do not emit
+    // keep-alive which we would then violate.
+    let header_bytes = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+    if writer.write_all(header_bytes).is_err() || writer.flush().is_err() {
+        // Client disconnected before headers — fail any queued ack and stop.
+        // Receiver will be dropped; sender's ack waiters see channel close as Cancelled.
+        return Ok(());
+    }
+    // Any write failure here means the client is gone; the shape of the error
+    // does not change what we do, so it is not inspected.
+    loop {
+        let chunk = match receiver.recv() {
+            Ok(c) => c,
+            Err(_) => break,
+        };
+        if chunk.fail {
+            if let Some(ack) = chunk.ack {
+                let _ = ack.send(Err(()));
+            }
+            // Unclean failure — abort; HTTP terminator still sent below
+            // so the client sees a clean HTTP EOF with incomplete SSE.
+            break;
+        }
+        if chunk.bytes.is_empty() {
+            // Empty chunks carry no wire bytes. Per contract never fire an ack for
+            // an empty chunk — drop it without sending.
+            drop(chunk.ack);
+            continue;
+        }
+        // Framed chunk: "{len:x}\r\n" + payload + "\r\n", then flush.
+        let len_hex = format!("{:x}\r\n", chunk.bytes.len());
+        let write_res = (|| -> std::io::Result<()> {
+            writer.write_all(len_hex.as_bytes())?;
+            writer.write_all(&chunk.bytes)?;
+            writer.write_all(b"\r\n")?;
+            writer.flush()?;
+            Ok(())
+        })();
+        match write_res {
+            Ok(()) => {
+                if let Some(ack) = chunk.ack {
+                    let _ = ack.send(Ok(()));
+                }
+            }
+            Err(_) => {
+                if let Some(ack) = chunk.ack {
+                    let _ = ack.send(Err(()));
+                }
+                break;
+            }
+        }
+    }
+    // Always send the HTTP chunked terminator so the HTTP body is
+    // considered complete. For clean close this is the normal end;
+    // for fail (premature EOF) the terminator makes the HTTP layer
+    // succeed, letting `read_openai_sse` see an SSE EOF without
+    // finish/DONE and return `PrematureEof` (the expected test shape)
+    // rather than a lower-level `Io(UnexpectedEof)`.
+    let _ = writer.write_all(b"0\r\n\r\n");
+    let _ = writer.flush();
+    // Dropping the writer closes the socket, which is what `Connection: close`
+    // promised; the client then sees EOF.
+    drop(writer);
     Ok(())
 }
 
@@ -4544,8 +4603,7 @@ fn complete_request_attempt(
         if runtime.current_max_seq < required_max_seq {
             runtime.ensure_model(&model, &shared.meta, Some(required_max_seq))?;
         }
-        let include_reasoning_content =
-            runtime.current_arch.as_deref() == Some("muse_glimmer");
+        let include_reasoning_content = runtime.current_arch.as_deref() == Some("muse_glimmer");
         let mut normalized_messages =
             normalize_openai_messages(body.get("messages"), include_reasoning_content);
         let default_system = request_string(&resolved, "prompt.system", None)?;
@@ -5178,7 +5236,10 @@ fn inline_thinking(text: &str) -> Option<String> {
     (!reasoning.is_empty()).then(|| reasoning.to_owned())
 }
 
-fn normalize_openai_tool_call(call: &serde_json::Value, include_reasoning_content: bool) -> serde_json::Value {
+fn normalize_openai_tool_call(
+    call: &serde_json::Value,
+    include_reasoning_content: bool,
+) -> serde_json::Value {
     let function = call.get("function").unwrap_or(call);
     let name = function
         .get("name")
@@ -6074,18 +6135,14 @@ fn resolved_for_model(
 ) -> Result<hipfire_config::ResolvedConfig> {
     let loaded = load_global(&paths.config)?;
     let mut layers = Vec::new();
-    if let (Some(tag), Some(settings)) = (
-        tag,
-        entry.and_then(|entry| entry.recommended_settings.as_ref()),
-    ) {
+    if let (Some(tag), Some(entry)) = (tag, entry) {
         layers.push(NamedLayer {
             source: ConfigSource::RegistryModel {
                 tag: tag.to_owned(),
                 revision: "v1".into(),
             },
-            layer: settings
-                .config_layer()
-                .map_err(|error| anyhow!("invalid registry recommendations: {error}"))?,
+            layer: hipfire_registry::config_layer_for_tag(tag, entry)
+                .map_err(|error| anyhow!("invalid registry model defaults: {error}"))?,
         });
     }
     layers.push(NamedLayer {
@@ -6195,10 +6252,11 @@ fn load_params(
     field("memory.kv_cache")
         .expect("schema field")
         .parse_cli(&kv_mode)?;
+    let configured_backend = config_string(resolved, "memory.kv_backend")?;
     let kv_backend = kv_backend_override
         .map(str::to_owned)
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "contiguous".into())
+        .unwrap_or(configured_backend)
         .to_ascii_lowercase();
     if !matches!(kv_backend.as_str(), "contiguous" | "vmm") {
         bail!("--kv-backend must be contiguous or vmm");
@@ -6237,6 +6295,7 @@ fn load_params(
         "cask": config_bool(resolved, "memory.cask.enabled")?,
         "cask_budget": config_u64(resolved, "memory.cask.budget")?,
         "cask_beta": config_u64(resolved, "memory.cask.beta")?,
+        "cask_handoff_tokens": config_u64(resolved, "memory.cask.handoff_tokens")?,
         "cask_core_frac": config_f64(resolved, "memory.cask.core_fraction")?,
         "cask_fold_m": config_u64(resolved, "memory.cask.fold")?,
         "prefill_compression": config_string(resolved, "speculation.prefill.mode")?,
@@ -6381,7 +6440,7 @@ fn apply_reasoning_request(
             request["assistant_prefix"] = serde_json::json!("closed_think");
             request["reasoning_effort"] = serde_json::json!("none");
         }
-        effort @ ("low" | "high" | "max") => {
+        effort @ ("low" | "medium" | "high" | "max" | "xhigh") => {
             request["reasoning_effort"] = serde_json::json!(effort);
         }
         effort => bail!("unknown reasoning effort '{effort}'"),
@@ -7626,6 +7685,8 @@ fn run_update_installer(repo: &Path, paths: &Paths, resolved: &ResolvedRevision)
         &resolved.selector,
         recorded.rocm_root.as_deref(),
         recorded.gpu_arch.as_deref(),
+        recorded.hipcc.as_deref(),
+        recorded.strict_rocm,
     ) {
         installer_cmd.arg(arg);
     }
@@ -7702,6 +7763,8 @@ fn installer_handoff_args(
     selector: &RevisionSelector,
     rocm_root: Option<&Path>,
     gpu_arch: Option<&str>,
+    hipcc: Option<&Path>,
+    strict_rocm: bool,
 ) -> Vec<String> {
     let mut args = vec!["--yes".to_owned()];
     match selector.kind {
@@ -7730,6 +7793,17 @@ fn installer_handoff_args(
         args.push("--gpu-arch".to_owned());
         args.push(arch.to_owned());
     }
+    if let Some(hipcc) = hipcc
+        .map(|p| p.to_string_lossy().into_owned())
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+    {
+        args.push("--hipcc".to_owned());
+        args.push(hipcc);
+    }
+    if strict_rocm {
+        args.push("--strict-rocm".to_owned());
+    }
     args
 }
 
@@ -7737,8 +7811,9 @@ fn installer_handoff_args(
 struct RecordedInstallMetadata {
     rocm_root: Option<PathBuf>,
     gpu_arch: Option<String>,
+    hipcc: Option<PathBuf>,
+    strict_rocm: bool,
 }
-
 fn recorded_install_metadata(install_home: &Path) -> RecordedInstallMetadata {
     let text = match fs::read_to_string(install_home.join("install.json")) {
         Ok(text) => text,
@@ -7760,9 +7835,26 @@ fn recorded_install_metadata(install_home: &Path) -> RecordedInstallMetadata {
         .map(str::trim)
         .filter(|arch| !arch.is_empty())
         .map(str::to_owned);
+    let hipcc = value
+        .get("hipcc")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from);
+    let strict_rocm = match value.get("strict_rocm") {
+        Some(serde_json::Value::Bool(b)) => *b,
+        Some(serde_json::Value::String(s)) => {
+            let s = s.trim();
+            s == "1" || s.eq_ignore_ascii_case("true")
+        }
+        Some(serde_json::Value::Number(n)) => n.as_u64().is_some_and(|v| v != 0),
+        _ => false,
+    };
     RecordedInstallMetadata {
         rocm_root,
         gpu_arch,
+        hipcc,
+        strict_rocm,
     }
 }
 
@@ -8944,12 +9036,10 @@ mod tests {
             find_model_path(&paths, &registry, "example-model"),
             Some(fs::canonicalize(&nested).unwrap())
         );
-        assert!(
-            list_local_models(&paths, &registry)
-                .unwrap()
-                .iter()
-                .any(|model| model.path == fs::canonicalize(&nested).unwrap())
-        );
+        assert!(list_local_models(&paths, &registry)
+            .unwrap()
+            .iter()
+            .any(|model| model.path == fs::canonicalize(&nested).unwrap()));
         fs::remove_dir_all(&paths.root).unwrap();
     }
 
@@ -8972,6 +9062,7 @@ mod tests {
         let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
         let params = load_params(&defaults, Some(entry), &model_path, 64, None, None).unwrap();
         assert_eq!(params["cask"], false);
+        assert_eq!(params["cask_handoff_tokens"], 0);
         assert_eq!(params["cask_sidecar"], "");
         assert_eq!(params["prefill_compression"], "off");
 
@@ -8998,6 +9089,407 @@ mod tests {
         let params =
             load_params(&defaults, None, &model_path, 64, Some("q8"), Some("vmm")).unwrap();
         assert_eq!(params["kv_backend"], "vmm");
+    }
+
+    #[test]
+    fn load_params_defaults_to_schema_contiguous_backend() {
+        let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let model_path = PathBuf::from("/tmp/test-model.mq4");
+        let params = load_params(&defaults, None, &model_path, 64, Some("q8"), None).unwrap();
+        assert_eq!(params["kv_backend"], "contiguous");
+        assert_eq!(params["max_seq"], 32768);
+    }
+
+    #[test]
+    fn resolved_for_model_applies_qwen_tag_policy_and_excludes_original_and_sidecars() {
+        let paths = test_paths("registry-qwen-tag-policy");
+        fs::create_dir_all(&paths.root).unwrap();
+        let raw = r#"{
+            "schema_version":1,
+            "generated_at":"now",
+            "models":{
+                "qwen3.5:4b":{"repo":"x","file":"qwen3.5-4b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x","default_kv_mode":"q8"},
+                "qwen3.6:35b-a3b":{"repo":"x","file":"qwen3.6-35b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"},
+                "qwen3.8:27b":{"repo":"x","file":"qwen3.8-27b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x","default_kv_mode":"q8"},
+                "qwen3.8:27b-fast":{"repo":"x","file":"qwen3.8-27b.mq4r","size_gb":1,"min_vram_gb":1,"desc":"x","default_kv_mode":"q8"},
+                "qwen3:8b":{"repo":"x","file":"qwen3-8b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x","default_kv_mode":"q8"},
+                "qwen3.5:9b-draft":{"repo":"x","file":"qwen35-9b-dflash.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"},
+                "qwen3.6:27b-dflash":{"repo":"x","file":"qwen36-27b-dflash.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"}
+            },
+            "aliases":{}
+        }"#;
+        let registry = RegistryV1::parse(raw, "test").unwrap();
+
+        // Exact Qwen families get VMM + 262144 + 81920
+        for tag in ["qwen3.5:4b", "qwen3.6:35b-a3b", "qwen3.8:27b", "qwen3.8:27b-fast"] {
+            let (_, entry) = registry.model(tag).unwrap();
+            let resolved = resolved_for_model(&paths, tag, Some(tag), Some(entry)).unwrap();
+            assert_eq!(
+                config_string(&resolved, "memory.kv_backend").unwrap(),
+                "vmm",
+                "{tag}"
+            );
+            assert_eq!(
+                config_u64(&resolved, "memory.max_seq").unwrap(),
+                262144,
+                "{tag}"
+            );
+            assert_eq!(
+                config_u64(&resolved, "generation.max_tokens").unwrap(),
+                81920,
+                "{tag}"
+            );
+        }
+
+        // Original qwen3:* stays contiguous (no automatic policy) — original Qwen3 uses default schema.
+        let (_, entry) = registry.model("qwen3:8b").unwrap();
+        let resolved =
+            resolved_for_model(&paths, "qwen3:8b", Some("qwen3:8b"), Some(entry)).unwrap();
+        assert_eq!(
+            config_string(&resolved, "memory.kv_backend").unwrap(),
+            "contiguous",
+            "original qwen3 must keep the built-in contiguous backend"
+        );
+        assert_eq!(config_u64(&resolved, "memory.max_seq").unwrap(), 32768);
+        assert_eq!(
+            config_u64(&resolved, "generation.max_tokens").unwrap(),
+            4096
+        );
+        // More directly, check the helper layer itself has no policy.
+        let direct = hipfire_registry::config_layer_for_tag("qwen3:8b", entry).unwrap();
+        assert!(direct.get("memory.kv_backend").is_none());
+        assert!(direct.get("memory.max_seq").is_none());
+        assert!(direct.get("generation.max_tokens").is_none());
+
+        // Draft/dflash sidecars do not get the Qwen policy even though family matches.
+        for tag in ["qwen3.5:9b-draft", "qwen3.6:27b-dflash"] {
+            let (_, entry) = registry.model(tag).unwrap();
+            let direct = hipfire_registry::config_layer_for_tag(tag, entry).unwrap();
+            assert!(
+                direct.get("memory.kv_backend").is_none(),
+                "{tag} sidecar must not get vmm"
+            );
+            assert!(direct.get("memory.max_seq").is_none());
+            assert!(direct.get("generation.max_tokens").is_none());
+        }
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn resolved_for_model_applies_glimmer_and_deepseek_targets() {
+        let paths = test_paths("registry-glimmer-deepseek-tag-policy");
+        fs::create_dir_all(&paths.root).unwrap();
+        let raw = r#"{
+            "schema_version":1,
+            "generated_at":"now",
+            "models":{
+                "muse-glimmer":{"repo":"x","file":"muse-glimmer-30b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"},
+                "muse-glimmer:fast":{"repo":"x","file":"muse-glimmer-30b.mq4r","size_gb":1,"min_vram_gb":1,"desc":"x"},
+                "muse-glimmer:draft":{"repo":"x","file":"muse-glimmer-draft.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"},
+                "deepseek-v4-flash":{"repo":"x","file":"deepseek-v4-flash-0731.mq2r","size_gb":1,"min_vram_gb":1,"desc":"x"},
+                "deepseek-v4-flash:mq2lloyd":{"repo":"x","file":"deepseek-v4-flash-0731.mq2lloyd","size_gb":1,"min_vram_gb":1,"desc":"x"},
+                "deepseek-v4-flash-preview":{"repo":"x","file":"deepseek-v4-flash-preview.mq2r","size_gb":1,"min_vram_gb":1,"desc":"x"},
+                "deepseek-v4-flash:draft":{"repo":"x","file":"deepseek-v4-flash-draft.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"},
+                "other:model":{"repo":"x","file":"other.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"}
+            },
+            "aliases":{
+                "deepseek4":"deepseek-v4-flash",
+                "ds4":"deepseek-v4-flash",
+                "deepseek4:preview":"deepseek-v4-flash-preview",
+                "muse-glimmer:quality":"muse-glimmer"
+            }
+        }"#;
+        let registry = RegistryV1::parse(raw, "test").unwrap();
+
+        // Muse Glimmer quality and fast targets get VMM + native 131072, no invented max_tokens.
+        for tag in ["muse-glimmer", "muse-glimmer:fast"] {
+            let (_, entry) = registry.model(tag).unwrap();
+            let resolved = resolved_for_model(&paths, tag, Some(tag), Some(entry)).unwrap();
+            assert_eq!(
+                config_string(&resolved, "memory.kv_backend").unwrap(),
+                "vmm",
+                "{tag}"
+            );
+            assert_eq!(
+                config_u64(&resolved, "memory.max_seq").unwrap(),
+                131072,
+                "{tag}"
+            );
+            let direct = hipfire_registry::config_layer_for_tag(tag, entry).unwrap();
+            assert_eq!(
+                direct.get("memory.kv_backend"),
+                Some(&hipfire_config::ConfigValue::String("vmm".into()))
+            );
+            assert_eq!(
+                direct.get("memory.max_seq"),
+                Some(&hipfire_config::ConfigValue::Integer(131072)),
+                "{tag} should get 131072"
+            );
+            assert!(
+                direct.get("generation.max_tokens").is_none(),
+                "{tag} must not get max_tokens"
+            );
+        }
+        // quality alias lands on trunk policy.
+        let (resolved_tag, entry) = registry.model("muse-glimmer:quality").unwrap();
+        assert_eq!(resolved_tag, "muse-glimmer");
+        let direct = hipfire_registry::config_layer_for_tag(resolved_tag, entry).unwrap();
+        assert_eq!(
+            direct.get("memory.max_seq"),
+            Some(&hipfire_config::ConfigValue::Integer(131072))
+        );
+
+        // Muse Glimmer draft receives none.
+        let (_, entry) = registry.model("muse-glimmer:draft").unwrap();
+        let direct = hipfire_registry::config_layer_for_tag("muse-glimmer:draft", entry).unwrap();
+        assert!(direct.get("memory.kv_backend").is_none());
+        assert!(direct.get("memory.max_seq").is_none());
+        assert!(direct.get("generation.max_tokens").is_none());
+        let resolved = resolved_for_model(
+            &paths,
+            "muse-glimmer:draft",
+            Some("muse-glimmer:draft"),
+            Some(entry),
+        )
+        .unwrap();
+        assert!(
+            resolved.get("memory.kv_backend").is_none()
+                || config_string(&resolved, "memory.kv_backend").unwrap() != "vmm"
+        );
+
+        // DeepSeek official / MQ2Lloyd / preview targets get VMM + 1M + 384Ki.
+        for tag in [
+            "deepseek-v4-flash",
+            "deepseek-v4-flash:mq2lloyd",
+            "deepseek-v4-flash-preview",
+        ] {
+            let (resolved_tag, entry) = registry.model(tag).unwrap();
+            let resolved =
+                resolved_for_model(&paths, resolved_tag, Some(resolved_tag), Some(entry)).unwrap();
+            assert_eq!(
+                config_string(&resolved, "memory.kv_backend").unwrap(),
+                "vmm",
+                "{tag}"
+            );
+            assert_eq!(
+                config_u64(&resolved, "memory.max_seq").unwrap(),
+                1048576,
+                "{tag}"
+            );
+            assert_eq!(
+                config_u64(&resolved, "generation.max_tokens").unwrap(),
+                393216,
+                "{tag}"
+            );
+            let direct = hipfire_registry::config_layer_for_tag(resolved_tag, entry).unwrap();
+            assert_eq!(
+                direct.get("memory.kv_backend"),
+                Some(&hipfire_config::ConfigValue::String("vmm".into()))
+            );
+            assert_eq!(
+                direct.get("memory.max_seq"),
+                Some(&hipfire_config::ConfigValue::Integer(1048576))
+            );
+            assert_eq!(
+                direct.get("generation.max_tokens"),
+                Some(&hipfire_config::ConfigValue::Integer(393216))
+            );
+        }
+        for alias in ["deepseek4", "ds4", "deepseek4:preview"] {
+            let (resolved_tag, entry) = registry.model(alias).unwrap();
+            let direct = hipfire_registry::config_layer_for_tag(resolved_tag, entry).unwrap();
+            assert_eq!(
+                direct.get("memory.max_seq"),
+                Some(&hipfire_config::ConfigValue::Integer(1048576)),
+                "{alias}->{resolved_tag}"
+            );
+            assert_eq!(
+                direct.get("generation.max_tokens"),
+                Some(&hipfire_config::ConfigValue::Integer(393216)),
+                "{alias}->{resolved_tag}"
+            );
+        }
+        // DeepSeek draft sidecar receives none.
+        let (_, entry) = registry.model("deepseek-v4-flash:draft").unwrap();
+        let direct =
+            hipfire_registry::config_layer_for_tag("deepseek-v4-flash:draft", entry).unwrap();
+        assert!(direct.get("memory.kv_backend").is_none());
+        assert!(direct.get("memory.max_seq").is_none());
+        assert!(direct.get("generation.max_tokens").is_none());
+
+        // Absent policy: unrelated model gets no automatic policy.
+        let (_, entry) = registry.model("other:model").unwrap();
+        let direct = hipfire_registry::config_layer_for_tag("other:model", entry).unwrap();
+        assert!(direct.get("memory.kv_backend").is_none());
+        assert!(direct.get("memory.max_seq").is_none());
+        assert!(direct.get("generation.max_tokens").is_none());
+
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn resolved_for_model_tag_policy_is_overridable_by_user() {
+        let paths = test_paths("registry-tag-policy-override");
+        fs::create_dir_all(&paths.root).unwrap();
+        let raw = r#"{
+            "schema_version":1,
+            "generated_at":"now",
+            "models":{"qwen3.8:27b":{"repo":"x","file":"qwen3.8-27b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"}},
+            "aliases":{}
+        }"#;
+        let registry = RegistryV1::parse(raw, "test").unwrap();
+        let (tag, entry) = registry.model("qwen3.8:27b").unwrap();
+        let resolved = resolved_for_model(&paths, tag, Some(tag), Some(entry)).unwrap();
+        assert_eq!(
+            config_string(&resolved, "memory.kv_backend").unwrap(),
+            "vmm"
+        );
+        assert_eq!(config_u64(&resolved, "memory.max_seq").unwrap(), 262144);
+        assert_eq!(
+            config_u64(&resolved, "generation.max_tokens").unwrap(),
+            81920
+        );
+
+        // Global user override wins over registry tag policy (registry below global).
+        let mut user_layer = ConfigLayer::default();
+        user_layer
+            .set_cli("memory.kv_backend", "contiguous")
+            .unwrap();
+        user_layer.set_cli("memory.max_seq", "32768").unwrap();
+        user_layer.set_cli("generation.max_tokens", "1024").unwrap();
+        let overridden = hipfire_config::resolve(vec![
+            hipfire_config::NamedLayer {
+                source: hipfire_config::ConfigSource::RegistryModel {
+                    tag: tag.to_owned(),
+                    revision: "v1".into(),
+                },
+                layer: hipfire_registry::config_layer_for_tag(tag, entry).unwrap(),
+            },
+            hipfire_config::NamedLayer {
+                source: hipfire_config::ConfigSource::GlobalUser {
+                    path: std::path::PathBuf::from("/tmp/test.toml"),
+                },
+                layer: user_layer,
+            },
+        ])
+        .unwrap();
+        assert_eq!(
+            config_string(&overridden, "memory.kv_backend").unwrap(),
+            "contiguous"
+        );
+        assert_eq!(config_u64(&overridden, "memory.max_seq").unwrap(), 32768);
+        assert_eq!(
+            config_u64(&overridden, "generation.max_tokens").unwrap(),
+            1024
+        );
+
+        // Also verify load_params respects explicit kv_backend override over configured vmm.
+        let model_path = PathBuf::from("/tmp/test-model.mq4");
+        let params = load_params(
+            &resolved,
+            Some(entry),
+            &model_path,
+            64,
+            Some("q8"),
+            Some("contiguous"),
+        )
+        .unwrap();
+        assert_eq!(params["kv_backend"], "contiguous");
+        // Without explicit override, load_params uses the resolved vmm.
+        let params2 =
+            load_params(&resolved, Some(entry), &model_path, 64, Some("q8"), None).unwrap();
+        assert_eq!(params2["kv_backend"], "vmm");
+        assert_eq!(params2["max_seq"], 262144);
+
+        // Glimmer target likewise overridable (backend + max_seq).
+        let raw2 = r#"{
+            "schema_version":1,
+            "generated_at":"now",
+            "models":{"muse-glimmer":{"repo":"x","file":"muse-glimmer-30b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"}},
+            "aliases":{}
+        }"#;
+        let registry2 = RegistryV1::parse(raw2, "test").unwrap();
+        let (g_tag, g_entry) = registry2.model("muse-glimmer").unwrap();
+        let g_layer = hipfire_registry::config_layer_for_tag(g_tag, g_entry).unwrap();
+        assert_eq!(
+            g_layer.get("memory.kv_backend"),
+            Some(&hipfire_config::ConfigValue::String("vmm".into()))
+        );
+        assert_eq!(
+            g_layer.get("memory.max_seq"),
+            Some(&hipfire_config::ConfigValue::Integer(131072))
+        );
+        assert!(g_layer.get("generation.max_tokens").is_none());
+        let mut g_user = ConfigLayer::default();
+        g_user.set_cli("memory.kv_backend", "contiguous").unwrap();
+        g_user.set_cli("memory.max_seq", "8192").unwrap();
+        let g_resolved = hipfire_config::resolve(vec![
+            hipfire_config::NamedLayer {
+                source: hipfire_config::ConfigSource::RegistryModel {
+                    tag: g_tag.to_owned(),
+                    revision: "v1".into(),
+                },
+                layer: g_layer,
+            },
+            hipfire_config::NamedLayer {
+                source: hipfire_config::ConfigSource::GlobalUser {
+                    path: std::path::PathBuf::from("/tmp/test2.toml"),
+                },
+                layer: g_user,
+            },
+        ])
+        .unwrap();
+        assert_eq!(
+            config_string(&g_resolved, "memory.kv_backend").unwrap(),
+            "contiguous"
+        );
+        assert_eq!(config_u64(&g_resolved, "memory.max_seq").unwrap(), 8192);
+
+        // DeepSeek target override wins over 1M/384Ki policy.
+        let raw3 = r#"{
+            "schema_version":1,
+            "generated_at":"now",
+            "models":{"deepseek-v4-flash":{"repo":"x","file":"ds4.mq2r","size_gb":1,"min_vram_gb":1,"desc":"x"}},
+            "aliases":{}
+        }"#;
+        let registry3 = RegistryV1::parse(raw3, "test").unwrap();
+        let (d_tag, d_entry) = registry3.model("deepseek-v4-flash").unwrap();
+        let d_resolved = resolved_for_model(&paths, d_tag, Some(d_tag), Some(d_entry)).unwrap();
+        assert_eq!(
+            config_string(&d_resolved, "memory.kv_backend").unwrap(),
+            "vmm"
+        );
+        assert_eq!(config_u64(&d_resolved, "memory.max_seq").unwrap(), 1048576);
+        assert_eq!(
+            config_u64(&d_resolved, "generation.max_tokens").unwrap(),
+            393216
+        );
+        let mut d_user = ConfigLayer::default();
+        d_user.set_cli("memory.max_seq", "65536").unwrap();
+        d_user.set_cli("generation.max_tokens", "2048").unwrap();
+        let d_overridden = hipfire_config::resolve(vec![
+            hipfire_config::NamedLayer {
+                source: hipfire_config::ConfigSource::RegistryModel {
+                    tag: d_tag.to_owned(),
+                    revision: "v1".into(),
+                },
+                layer: hipfire_registry::config_layer_for_tag(d_tag, d_entry).unwrap(),
+            },
+            hipfire_config::NamedLayer {
+                source: hipfire_config::ConfigSource::GlobalUser {
+                    path: std::path::PathBuf::from("/tmp/test3.toml"),
+                },
+                layer: d_user,
+            },
+        ])
+        .unwrap();
+        assert_eq!(config_u64(&d_overridden, "memory.max_seq").unwrap(), 65536);
+        assert_eq!(
+            config_u64(&d_overridden, "generation.max_tokens").unwrap(),
+            2048
+        );
+
+        fs::remove_dir_all(&paths.root).unwrap();
     }
 
     #[test]
@@ -9293,7 +9785,7 @@ mod tests {
         let _hf_endpoint = EnvRestore("HF_ENDPOINT", env::var_os("HF_ENDPOINT"));
         let registry = hipfire_registry::bundled().unwrap();
         let (_, entry) = registry.model("qwen3.6:35b-a3b-mq4r").unwrap();
-        let suffix = "schuttdev/hipfire-qwen3.6-35b-a3b/resolve/main/qwen3.6-35b-a3b.mq4r";
+        let suffix = "hipfire-models/qwen3.6-35b-a3b/resolve/main/qwen3.6-35b-a3b.mq4r";
 
         env::remove_var("HIPFIRE_HF_BASE");
         env::remove_var("HF_ENDPOINT");
@@ -9673,6 +10165,8 @@ mod tests {
             },
             recorded.rocm_root.as_deref(),
             recorded.gpu_arch.as_deref(),
+            recorded.hipcc.as_deref(),
+            recorded.strict_rocm,
         );
         assert_eq!(
             args,
@@ -9695,6 +10189,8 @@ mod tests {
         let empty = recorded_install_metadata(&home);
         assert!(empty.rocm_root.is_none());
         assert!(empty.gpu_arch.is_none());
+        assert!(empty.hipcc.is_none());
+        assert!(!empty.strict_rocm);
         let bare = installer_handoff_args(
             &RevisionSelector {
                 value: "deadbeef".into(),
@@ -9702,6 +10198,8 @@ mod tests {
             },
             None,
             None,
+            None,
+            false,
         );
         assert_eq!(
             bare,
@@ -9720,6 +10218,8 @@ mod tests {
             },
             None,
             Some("gfx1100"),
+            None,
+            false,
         );
         assert_eq!(
             arch_only,
@@ -9731,6 +10231,76 @@ mod tests {
                 "gfx1100".to_owned(),
             ]
         );
+        fs::remove_dir_all(home).unwrap();
+    }
+    #[test]
+    fn update_handoff_forwards_hipcc_and_strict_with_backward_compat() {
+        let home = env::temp_dir().join(format!(
+            "hipfire-update-hipcc-{}-{}",
+            std::process::id(),
+            unix_timestamp()
+        ));
+        fs::create_dir_all(&home).unwrap();
+        // New format with hipcc and strict_rocm.
+        fs::write(
+            home.join("install.json"),
+            r#"{"rocm_root":"/opt/rocm","hipcc":"/usr/bin/hipcc","strict_rocm":true,"gpu_arch":"gfx1201"}"#,
+        )
+        .unwrap();
+        let recorded = recorded_install_metadata(&home);
+        assert_eq!(recorded.hipcc.as_deref(), Some(Path::new("/usr/bin/hipcc")));
+        assert!(recorded.strict_rocm);
+        assert_eq!(recorded.rocm_root.as_deref(), Some(Path::new("/opt/rocm")));
+        let args = installer_handoff_args(
+            &RevisionSelector {
+                value: "master".into(),
+                kind: RevisionKind::Auto,
+            },
+            recorded.rocm_root.as_deref(),
+            recorded.gpu_arch.as_deref(),
+            recorded.hipcc.as_deref(),
+            recorded.strict_rocm,
+        );
+        assert!(args.contains(&"--hipcc".to_owned()));
+        assert!(args.contains(&"/usr/bin/hipcc".to_owned()));
+        assert!(args.contains(&"--strict-rocm".to_owned()));
+        assert!(args.contains(&"--rocm-root".to_owned()));
+        // Empty/whitespace hipcc is treated as None, like rocm_root.
+        fs::write(
+            home.join("install.json"),
+            r#"{"hipcc":"  ","strict_rocm":false}"#,
+        )
+        .unwrap();
+        let empty = recorded_install_metadata(&home);
+        assert!(empty.hipcc.is_none());
+        assert!(!empty.strict_rocm);
+        let bare = installer_handoff_args(
+            &RevisionSelector {
+                value: "beta".into(),
+                kind: RevisionKind::Branch,
+            },
+            None,
+            None,
+            empty.hipcc.as_deref(),
+            empty.strict_rocm,
+        );
+        assert!(!bare.contains(&"--hipcc".to_owned()));
+        assert!(!bare.contains(&"--strict-rocm".to_owned()));
+        // Older file without hipcc key loads without error (backward compat).
+        fs::write(
+            home.join("install.json"),
+            r#"{"rocm_root":"/opt/rocm","gpu_arch":"gfx1100"}"#,
+        )
+        .unwrap();
+        let old = recorded_install_metadata(&home);
+        assert_eq!(old.rocm_root.as_deref(), Some(Path::new("/opt/rocm")));
+        assert!(old.hipcc.is_none());
+        assert!(!old.strict_rocm);
+        // Strict can be stored as string \"1\" or number 1 for compat.
+        fs::write(home.join("install.json"), r#"{"strict_rocm":"1"}"#).unwrap();
+        assert!(recorded_install_metadata(&home).strict_rocm);
+        fs::write(home.join("install.json"), r#"{"strict_rocm":1}"#).unwrap();
+        assert!(recorded_install_metadata(&home).strict_rocm);
         fs::remove_dir_all(home).unwrap();
     }
 
@@ -10105,12 +10675,10 @@ mod tests {
             "role": "user",
             "content": [{ "type": "image_url", "image_url": { "url": "https://example/image.png" } }]
         }]);
-        assert!(
-            request_image_base64(Some(&remote))
-                .unwrap_err()
-                .to_string()
-                .contains("remote")
-        );
+        assert!(request_image_base64(Some(&remote))
+            .unwrap_err()
+            .to_string()
+            .contains("remote"));
     }
 
     #[test]
@@ -10161,7 +10729,10 @@ mod tests {
         assert_eq!(normalized_on[2]["content"], "");
         assert_eq!(normalized_on[2]["tool_plan"], "tool reasoning");
         assert_eq!(normalized_on[2]["reasoning_content"], "tool reasoning");
-        assert_eq!(normalized_on[2]["reasoning_content"], normalized_on[2]["tool_plan"]);
+        assert_eq!(
+            normalized_on[2]["reasoning_content"],
+            normalized_on[2]["tool_plan"]
+        );
         assert_eq!(normalized_on[2]["tool_calls"][0]["id"], "call_1");
     }
 
@@ -10318,9 +10889,15 @@ mod tests {
             }]
         });
         let off = normalize_openai_messages(body.get("messages"), false);
-        assert_eq!(off[0]["tool_calls"][0]["arguments"], serde_json::json!({ "_raw": "not-json" }));
+        assert_eq!(
+            off[0]["tool_calls"][0]["arguments"],
+            serde_json::json!({ "_raw": "not-json" })
+        );
         let on = normalize_openai_messages(body.get("messages"), true);
-        assert_eq!(on[0]["tool_calls"][0]["arguments"], serde_json::Value::String("not-json".into()));
+        assert_eq!(
+            on[0]["tool_calls"][0]["arguments"],
+            serde_json::Value::String("not-json".into())
+        );
         // JSON string that parses to non-object (array) also surfaces as string under glimmer
         let body_arr = serde_json::json!({
             "messages": [{
@@ -10332,10 +10909,16 @@ mod tests {
             }]
         });
         let on_arr = normalize_openai_messages(body_arr.get("messages"), true);
-        assert_eq!(on_arr[0]["tool_calls"][0]["arguments"], serde_json::Value::String("[1,2]".into()));
+        assert_eq!(
+            on_arr[0]["tool_calls"][0]["arguments"],
+            serde_json::Value::String("[1,2]".into())
+        );
         let off_arr = normalize_openai_messages(body_arr.get("messages"), false);
         // non-glimmer keeps parsed array (today's behaviour is to keep whatever parsed)
-        assert_eq!(off_arr[0]["tool_calls"][0]["arguments"], serde_json::json!([1,2]));
+        assert_eq!(
+            off_arr[0]["tool_calls"][0]["arguments"],
+            serde_json::json!([1, 2])
+        );
     }
 
     #[test]
@@ -10815,11 +11398,65 @@ mod tests {
             preserved_json["choices"][0]["message"]["content"],
             "<think>private chain</think>\nanswer"
         );
+        assert!(preserved_json["choices"][0]["message"]
+            .get("reasoning_content")
+            .is_none());
+    }
+    #[test]
+    fn apply_reasoning_request_accepts_medium_and_xhigh() {
+        use hipfire_config::{resolve, ConfigLayer, ConfigSource, NamedLayer};
+        use std::path::PathBuf;
+        for effort in ["low", "medium", "xhigh", "high", "max"] {
+            let mut layer = ConfigLayer::default();
+            layer.set_cli("reasoning.effort", effort).unwrap();
+            layer.set_cli("reasoning.max_tokens", "0").unwrap();
+            let resolved = resolve([NamedLayer {
+                source: ConfigSource::GlobalUser {
+                    path: PathBuf::from("config.toml"),
+                },
+                layer,
+            }])
+            .unwrap();
+            let mut req = serde_json::json!({});
+            super::apply_reasoning_request(&resolved, &mut req).unwrap();
+            assert_eq!(
+                req["reasoning_effort"], effort,
+                "effort {effort} must pass through unchanged"
+            );
+        }
+        // auto stays unset (no key), none disables
+        let mut auto_layer = ConfigLayer::default();
+        auto_layer.set_cli("reasoning.effort", "auto").unwrap();
+        auto_layer.set_cli("reasoning.max_tokens", "0").unwrap();
+        let auto_resolved = resolve([NamedLayer {
+            source: ConfigSource::GlobalUser {
+                path: PathBuf::from("config.toml"),
+            },
+            layer: auto_layer,
+        }])
+        .unwrap();
+        let mut auto_req = serde_json::json!({});
+        super::apply_reasoning_request(&auto_resolved, &mut auto_req).unwrap();
         assert!(
-            preserved_json["choices"][0]["message"]
-                .get("reasoning_content")
-                .is_none()
+            auto_req.get("reasoning_effort").is_none(),
+            "auto must stay undefined"
         );
+
+        let mut none_layer = ConfigLayer::default();
+        none_layer.set_cli("reasoning.effort", "none").unwrap();
+        none_layer.set_cli("reasoning.max_tokens", "0").unwrap();
+        let none_resolved = resolve([NamedLayer {
+            source: ConfigSource::GlobalUser {
+                path: PathBuf::from("config.toml"),
+            },
+            layer: none_layer,
+        }])
+        .unwrap();
+        let mut none_req = serde_json::json!({});
+        super::apply_reasoning_request(&none_resolved, &mut none_req).unwrap();
+        assert_eq!(none_req["reasoning_effort"], "none");
+        assert_eq!(none_req["max_think_tokens"], 1);
+        assert_eq!(none_req["assistant_prefix"], "closed_think");
     }
 
     #[test]
@@ -11316,20 +11953,16 @@ mod tests {
             Some(serde_json::json!({ "reasoning_content": "plan" }))
         );
         // Mid-stream tool_calls must never become an SSE delta.
-        assert!(
-            openai_stream_delta_for_event(&serde_json::json!({
-                "type": "tool_calls",
-                "calls": [{ "name": "read_file", "arguments": {} }]
-            }))
-            .is_none()
-        );
-        assert!(
-            openai_stream_delta_for_event(&serde_json::json!({
-                "type": "done",
-                "finish_reason": "stop"
-            }))
-            .is_none()
-        );
+        assert!(openai_stream_delta_for_event(&serde_json::json!({
+            "type": "tool_calls",
+            "calls": [{ "name": "read_file", "arguments": {} }]
+        }))
+        .is_none());
+        assert!(openai_stream_delta_for_event(&serde_json::json!({
+            "type": "done",
+            "finish_reason": "stop"
+        }))
+        .is_none());
     }
 
     #[test]
@@ -11458,13 +12091,11 @@ mod tests {
         );
 
         // Mid-stream fold forward never includes tool_calls.
-        assert!(
-            openai_stream_delta_for_event(&serde_json::json!({
-                "type": "tool_calls",
-                "calls": fold.executable_tool_calls()
-            }))
-            .is_none()
-        );
+        assert!(openai_stream_delta_for_event(&serde_json::json!({
+            "type": "tool_calls",
+            "calls": fold.executable_tool_calls()
+        }))
+        .is_none());
 
         let stream_chunks = openai_stream_terminal_chunks(&completion, true);
         assert_eq!(
@@ -11523,21 +12154,17 @@ mod tests {
 
         let nonstream = completion_json(&completion);
         assert_eq!(nonstream["choices"][0]["finish_reason"], "length");
-        assert!(
-            nonstream["choices"][0]["message"]
-                .get("tool_calls")
-                .is_none()
-        );
+        assert!(nonstream["choices"][0]["message"]
+            .get("tool_calls")
+            .is_none());
         assert_eq!(nonstream["choices"][0]["message"]["content"], "partial");
 
         let stream_chunks = openai_stream_terminal_chunks(&completion, true);
         assert_eq!(stream_chunks.len(), 2); // terminal + usage, no tool release
         assert_eq!(stream_chunks[0]["choices"][0]["finish_reason"], "length");
-        assert!(
-            stream_chunks[0]["choices"][0]["delta"]
-                .get("tool_calls")
-                .is_none()
-        );
+        assert!(stream_chunks[0]["choices"][0]["delta"]
+            .get("tool_calls")
+            .is_none());
         assert_eq!(stream_chunks[1]["choices"], serde_json::json!([]));
     }
 

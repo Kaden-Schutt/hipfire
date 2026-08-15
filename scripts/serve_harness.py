@@ -60,21 +60,127 @@ GENRE_BATTERY = [
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 
+def _registry_entry(tag, registry_path):
+    """Return (canonical_tag, entry_dict) for *tag*, following aliases."""
+    registry = json.load(open(registry_path))
+    canonical = (registry.get("aliases") or {}).get(tag, tag)
+    entry = (registry.get("models") or {}).get(canonical, {}) or {}
+    return canonical, entry
+
+
+def resolve_model_default(explicit, tag, registry_path, field, fallback, explicit_label):
+    """Resolve an optional CLI override, then registry *field*, then *fallback*.
+
+    Returns ``(value, source_label)``. Explicit None means "omitted" so registry
+    defaults can apply; non-None always wins.
+    """
+    if explicit is not None:
+        return explicit, explicit_label
+    try:
+        canonical, entry = _registry_entry(tag, registry_path)
+        val = entry.get(field)
+        if val is not None:
+            return val, f"registry({canonical})"
+    except Exception as e:
+        print(f"  [warn] could not resolve {field} from {registry_path}: {e}",
+              file=sys.stderr)
+    return fallback, f"default({fallback})"
+
+
 def resolve_kv_mode(explicit, tag, registry_path):
     """Resolve the cache mode from an explicit override or the model registry."""
+    return resolve_model_default(
+        explicit, tag, registry_path, "default_kv_mode", "auto", "explicit(--kv)")
+
+
+def _tag_load_policy(canonical_tag):
+    """Automatic load policy keyed by canonical registry tag.
+
+    Mirrors hipfire-registry's tag-aware config layer (not wire fields):
+      - family qwen3.5 / qwen3.6 / qwen3.8, non-draft/non-dflash target
+        → kv_backend=vmm, max_seq=262144, max_tokens=81920
+      - family deepseek-v4-flash / deepseek-v4-flash-preview, non-draft/non-dflash
+        → kv_backend=vmm, max_seq=1048576, max_tokens=393216
+      - muse-glimmer / muse-glimmer:fast
+        → kv_backend=vmm, max_seq=131072 (max_tokens stays harness fallback)
+      - original qwen3:*, muse-glimmer:draft, draft/dflash sidecars, others
+        → no policy (harness fallbacks apply)
+    """
+    if not canonical_tag:
+        return {}
+    tag = canonical_tag
+    if "draft" in tag or "dflash" in tag:
+        return {}
+    family = tag.split(":", 1)[0]
+    if family in ("qwen3.5", "qwen3.6", "qwen3.8"):
+        return {
+            "kv_backend": "vmm",
+            "max_seq": 262144,
+            "max_tokens": 81920,
+        }
+    if family in ("deepseek-v4-flash", "deepseek-v4-flash-preview"):
+        return {
+            "kv_backend": "vmm",
+            "max_seq": 1048576,
+            "max_tokens": 393216,
+        }
+    if tag in ("muse-glimmer", "muse-glimmer:fast"):
+        return {
+            "kv_backend": "vmm",
+            "max_seq": 131072,
+        }
+    return {}
+
+
+def resolve_kv_backend(explicit, tag, registry_path):
+    """Resolve KV allocator backend: explicit → tag policy → contiguous."""
     if explicit is not None:
-        return explicit, "explicit(--kv)"
+        return explicit, "explicit(--kv-backend)"
     try:
-        registry = json.load(open(registry_path))
-        canonical = (registry.get("aliases") or {}).get(tag, tag)
-        entry = (registry.get("models") or {}).get(canonical, {})
-        mode = entry.get("default_kv_mode")
-        if mode:
-            return mode, f"registry({canonical})"
+        canonical, entry = _registry_entry(tag, registry_path)
     except Exception as e:
-        print(f"  [warn] could not resolve default_kv_mode from {registry_path}: {e}",
+        print(f"  [warn] could not resolve kv_backend policy from {registry_path}: {e}",
               file=sys.stderr)
-    return "auto", "default(auto)"
+        canonical, entry = tag, {}
+    policy = _tag_load_policy(canonical) if entry else {}
+    if "kv_backend" in policy:
+        return policy["kv_backend"], f"tag-policy({canonical})"
+    return "contiguous", "default(contiguous)"
+
+
+def resolve_max_seq(explicit, tag, registry_path):
+    """Resolve context length: explicit → tag policy → 32768."""
+    if explicit is not None:
+        return explicit, "explicit(--max-seq)"
+    try:
+        canonical, entry = _registry_entry(tag, registry_path)
+    except Exception as e:
+        print(f"  [warn] could not resolve max_seq policy from {registry_path}: {e}",
+              file=sys.stderr)
+        canonical, entry = tag, {}
+    policy = _tag_load_policy(canonical) if entry else {}
+    if "max_seq" in policy:
+        return policy["max_seq"], f"tag-policy({canonical})"
+    return 32768, "default(32768)"
+
+
+def resolve_max_tokens(explicit, tag, registry_path):
+    """Resolve generation cap: explicit → tag policy → 2048."""
+    if explicit is not None:
+        return explicit, "explicit(--max-tokens)"
+    try:
+        canonical, entry = _registry_entry(tag, registry_path)
+    except Exception as e:
+        print(f"  [warn] could not resolve max_tokens policy from {registry_path}: {e}",
+              file=sys.stderr)
+        canonical, entry = tag, {}
+    policy = _tag_load_policy(canonical) if entry else {}
+    if "max_tokens" in policy:
+        return policy["max_tokens"], f"tag-policy({canonical})"
+    return 2048, "default(2048)"
+
+
+
 
 
 def resolve_sampling(spec, tag, registry_path):
@@ -98,9 +204,9 @@ def resolve_sampling(spec, tag, registry_path):
         # `general` falls back to recommended_settings when no profile map is set.
         profile = spec.split(":", 1)[1] if ":" in spec else None
         rec = {}
+        canonical = tag
         try:
-            reg = json.load(open(registry_path))["models"]
-            entry = reg.get(tag, {})
+            canonical, entry = _registry_entry(tag, registry_path)
             if profile is None:
                 rec = entry.get("recommended_settings", {}) or {}
             else:
@@ -111,7 +217,7 @@ def resolve_sampling(spec, tag, registry_path):
                     rec = profiles.get(profile, {}) or {}
         except Exception as e:
             print(f"  [warn] could not read registry {registry_path}: {e}", file=sys.stderr)
-        label = f"registry({tag}:{profile})" if profile else f"registry({tag})"
+        label = f"registry({canonical}:{profile})" if profile else f"registry({canonical})"
         vals, source = {}, {}
         for k in ["temperature", "top_p", "top_k", "min_p", "presence_penalty",
                   "repeat_penalty", "reasoning_effort", "thinking_budget"]:
@@ -152,10 +258,15 @@ def infer_tag(model_path):
             return "deepseek-v4-flash:mq2r"
         if b.endswith(".mq2lloyd"):
             return "deepseek-v4-flash"
-    # Muse Glimmer ships as muse-glimmer-30b*.mq4 (also -default / -q8head / -assistant
-    # variants, which share the model card's sampling contract). Without this the tag
-    # resolves to None and sampling silently falls back to recipe(general) top_k=20,
-    # contradicting the card's top_k=64.
+    # Draft/assistant artifacts are sidecars, not standalone Glimmer targets.
+    # Classify them before the broad target filename pattern so inferred tags
+    # cannot inherit target-only VMM policy.
+    if b.startswith("muse-glimmer-") and any(
+        marker in b for marker in ("-draft", "-dflash", "-assistant")
+    ):
+        return "muse-glimmer:draft"
+    # Muse Glimmer targets ship as muse-glimmer-30b*.mq4 (including historical
+    # -default / -q8head variants, which share the model card's sampling contract).
     m = re.match(r"muse-glimmer-(\d+(?:\.\d+)?b)", b)
     if m:
         return f"muse-glimmer:{m.group(1)}"
@@ -168,6 +279,12 @@ def infer_tag(model_path):
 def build_config(args):
     tag = args.tag or infer_tag(args.model)
     kv, kv_source = resolve_kv_mode(args.kv, tag, args.registry)
+    kv_backend, kv_backend_source = resolve_kv_backend(
+        getattr(args, "kv_backend", None), tag, args.registry)
+    max_seq, max_seq_source = resolve_max_seq(
+        getattr(args, "max_seq", None), tag, args.registry)
+    max_tokens, max_tokens_source = resolve_max_tokens(
+        getattr(args, "max_tokens", None), tag, args.registry)
     samp, samp_src = resolve_sampling(args.sampling, tag, args.registry)
     # Effort is parent-model prompt semantics. Budget is an independent hipfire
     # cap policy and must never be inferred from the effort level.
@@ -183,7 +300,7 @@ def build_config(args):
     if selected_budget is None:
         if registry_budget is not None:
             selected_budget = registry_budget
-        elif samp.get("reasoning_effort") in ("low", "high", "max"):
+        elif samp.get("reasoning_effort") in ("low", "medium", "high", "xhigh", "max"):
             selected_budget = "uncapped"
         else:
             selected_budget = "med"
@@ -275,7 +392,10 @@ def build_config(args):
     return {
         "model": args.model, "tag": tag, "kv": kv, "kv_source": kv_source,
         "mtp": args.mtp,
-        "kv_backend": getattr(args, "kv_backend", "contiguous") or "contiguous",
+        "kv_backend": kv_backend,
+        "kv_backend_source": kv_backend_source,
+        "max_seq": max_seq,
+        "max_seq_source": max_seq_source,
         "dflash": dflash,
         "ngram": ngram,
         "ngram_k": getattr(args, "ngram_k", None),
@@ -285,7 +405,9 @@ def build_config(args):
         "mtp_ngram_max": mtp_ngram_max,
         "draft": draft,
         "thinking_budget": selected_budget, "thinking_cap_tokens": think_cap,
-        "max_tokens": args.max_tokens, "sampling": samp, "sampling_source": samp_src,
+        "max_tokens": max_tokens,
+        "max_tokens_source": max_tokens_source,
+        "sampling": samp, "sampling_source": samp_src,
         "mode": args.mode, "port": args.port, "seed": getattr(args, "seed", None),
         "prompts_file": getattr(args, "prompts_file", None),
         "prompt_file": getattr(args, "prompt_file", None),
@@ -297,6 +419,8 @@ def build_config(args):
         "tp": getattr(args, "tp", None),
         "replay_route_proof_log": bool(getattr(args, "replay_route_proof_log", False)),
     }
+
+
 
 
 
@@ -340,7 +464,10 @@ def show_config(cfg):
     print(f"  registry tag  : {cfg['tag'] or '(none — sampling cannot be registry-resolved)'}")
     print(f"  kv_mode       : {cfg['kv']} [{cfg.get('kv_source', 'unknown')}]"
           f"   kv_backend: {cfg.get('kv_backend', 'contiguous')}"
+          f" [{cfg.get('kv_backend_source', 'unknown')}]"
           f"   mtp_mode: {cfg['mtp']}   mode: {cfg['mode']}")
+    print(f"  max_seq       : {cfg.get('max_seq', 32768)}"
+          f" [{cfg.get('max_seq_source', 'unknown')}]")
     print(f"  dflash        : {cfg.get('dflash', 'off')}   draft: {cfg.get('draft') or '(none / filename auto-match)'}")
     print(f"  ngram         : {cfg.get('ngram', 'off')}   ngram_k: {cfg.get('ngram_k') if cfg.get('ngram_k') is not None else '(loader default 12)'}")
     _mn_match = cfg.get("mtp_ngram_match")
@@ -375,7 +502,8 @@ def show_config(cfg):
              else 'uncapped think budget' if _cap == 0
              else f'> think cap {_cap} — model can answer' if cfg['max_tokens'] > _cap
              else f'<= think cap {_cap} — INVALID (think-only); run will hard-fail')
-    print(f"  max_tokens     : {cfg['max_tokens']}  ({_note})")
+    print(f"  max_tokens     : {cfg['max_tokens']}"
+          f" [{cfg.get('max_tokens_source', 'unknown')}]  ({_note})")
     print("  sampling (what IS set):")
     for k in SAMPLE_KEYS:
         if k in cfg["sampling"]:
@@ -684,10 +812,14 @@ def _startup_path_proof_failures(cfg, txt):
     failures = []
 
     if cfg.get("kv_backend") == "vmm":
-        # KvCache constructors emit e.g. "KV cache: q8 vmm (...", "KV cache: fwht3 vmm (...".
-        if not re.search(r"KV cache:.*\bvmm\b", txt):
+        # Generic KV caches and DS4's model-owned KV cache use different
+        # load markers for the same typed backend.
+        vmm_loaded = re.search(r"KV cache:.*\bvmm\b", txt, re.IGNORECASE) or re.search(
+            r"deepseek4 KV cache:\s+automatic VMM growth\b", txt
+        )
+        if not vmm_loaded:
             failures.append(
-                "kv_backend=vmm requested but serve log has no 'KV cache: … vmm' marker"
+                "kv_backend=vmm requested but serve log has no VMM allocation marker"
             )
 
     dflash = cfg.get("dflash", "off") or "off"
@@ -826,6 +958,11 @@ def _self_test_serve_path_proofs():
         cur = _serve_log_text(path, offset)
         fails = _startup_path_proof_failures(cfg_vmm, cur)
         check(not fails, f"current-attempt VMM must pass, got {fails!r}")
+        ds4_fails = _startup_path_proof_failures(
+            cfg_vmm,
+            "  deepseek4 KV cache: automatic VMM growth to advertised context 1048576\n",
+        )
+        check(not ds4_fails, f"DeepSeek V4 VMM marker must pass, got {ds4_fails!r}")
 
         # --- draft-loaded without request execution must fail ---
         cfg_df = {"kv_backend": "contiguous", "dflash": "on"}
@@ -929,6 +1066,283 @@ def _self_test_kv_resolution():
     print("serve_harness: kv-resolution self-test OK", flush=True)
 
 
+def _self_test_load_defaults():
+    """Canonical-tag load policy for kv_backend/max_seq/max_tokens; explicit CLI wins."""
+    import argparse
+
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as tmp:
+        # Wire fields intentionally absent: policy is tag-keyed, not registry JSON.
+        json.dump({
+            "models": {
+                "qwen3.8:27b": {
+                    "default_kv_mode": "q8",
+                    "recommended_settings": {
+                        "temperature": 1.0,
+                        "reasoning_effort": "xhigh",
+                        "thinking_budget": "uncapped",
+                    },
+                },
+                "qwen3.5:4b": {"default_kv_mode": "q8"},
+                "qwen3.6:35b-a3b": {"default_kv_mode": "q8"},
+                "deepseek-v4-flash": {"default_kv_mode": "f32"},
+                "deepseek-v4-flash:mq2lloyd": {"default_kv_mode": "f32"},
+                "deepseek-v4-flash-preview": {"default_kv_mode": "f32"},
+                "muse-glimmer": {"file": "muse-glimmer-30b.mq4"},
+                "muse-glimmer:fast": {"file": "muse-glimmer-30b.mq4r"},
+                "muse-glimmer:draft": {"file": "muse-glimmer-30b-dflash.mq4"},
+                "qwen3.5:4b-draft": {},
+                "qwen3.6:35b-a3b-dflash": {},
+            },
+            "aliases": {
+                "qwen38:27b": "qwen3.8:27b",
+                "qwen3:latest": "qwen3:8b",
+                "ds4": "deepseek-v4-flash",
+                "deepseek4:mq2lloyd": "deepseek-v4-flash:mq2lloyd",
+                "ds4:preview": "deepseek-v4-flash-preview",
+                "muse-glimmer:quality": "muse-glimmer",
+            },
+        }, tmp)
+        path = tmp.name
+    try:
+        # Qwen3.8 family (alias → canonical) gets full native settings.
+        assert resolve_kv_backend(None, "qwen38:27b", path) == (
+            "vmm", "tag-policy(qwen3.8:27b)")
+        assert resolve_max_seq(None, "qwen38:27b", path) == (
+            262144, "tag-policy(qwen3.8:27b)")
+        assert resolve_max_tokens(None, "qwen38:27b", path) == (
+            81920, "tag-policy(qwen3.8:27b)")
+        vals, sources = resolve_sampling("registry", "qwen38:27b", path)
+        assert vals["temperature"] == 1.0
+        assert vals["reasoning_effort"] == "xhigh"
+        assert vals["thinking_budget"] == "uncapped"
+        assert sources["temperature"] == "registry(qwen3.8:27b)"
+        # Exact Qwen family tags keep the same native context contract.
+        for tag in ("qwen3.5:4b", "qwen3.6:35b-a3b", "qwen3.8:27b"):
+            assert resolve_kv_backend(None, tag, path) == (
+                "vmm", f"tag-policy({tag})")
+            assert resolve_max_seq(None, tag, path) == (
+                262144, f"tag-policy({tag})")
+            assert resolve_max_tokens(None, tag, path) == (
+                81920, f"tag-policy({tag})")
+        # Explicit CLI overrides beat tag policy.
+        assert resolve_kv_backend("contiguous", "qwen38:27b", path) == (
+            "contiguous", "explicit(--kv-backend)")
+        assert resolve_max_seq(4096, "qwen38:27b", path) == (
+            4096, "explicit(--max-seq)")
+        assert resolve_max_tokens(512, "qwen38:27b", path) == (
+            512, "explicit(--max-tokens)")
+        # Original Qwen3 stays on contiguous/32768/2048 fallbacks.
+        assert resolve_kv_backend(None, "qwen3:latest", path) == (
+            "contiguous", "default(contiguous)")
+        assert resolve_max_seq(None, "qwen3:latest", path) == (
+            32768, "default(32768)")
+        assert resolve_max_tokens(None, "qwen3:latest", path) == (
+            2048, "default(2048)")
+        # DeepSeek V4 Flash canonical targets: VMM + 1M ctx + 384Ki output.
+        for tag in (
+            "deepseek-v4-flash",
+            "deepseek-v4-flash:mq2lloyd",
+            "deepseek-v4-flash-preview",
+        ):
+            assert resolve_kv_backend(None, tag, path) == (
+                "vmm", f"tag-policy({tag})")
+            assert resolve_max_seq(None, tag, path) == (
+                1048576, f"tag-policy({tag})")
+            assert resolve_max_tokens(None, tag, path) == (
+                393216, f"tag-policy({tag})")
+        # Aliases resolve to the same DeepSeek canonical policy.
+        assert resolve_kv_backend(None, "ds4", path) == (
+            "vmm", "tag-policy(deepseek-v4-flash)")
+        assert resolve_max_seq(None, "ds4", path) == (
+            1048576, "tag-policy(deepseek-v4-flash)")
+        assert resolve_max_tokens(None, "ds4", path) == (
+            393216, "tag-policy(deepseek-v4-flash)")
+        assert resolve_kv_backend(None, "deepseek4:mq2lloyd", path) == (
+            "vmm", "tag-policy(deepseek-v4-flash:mq2lloyd)")
+        assert resolve_max_seq(None, "deepseek4:mq2lloyd", path) == (
+            1048576, "tag-policy(deepseek-v4-flash:mq2lloyd)")
+        assert resolve_max_tokens(None, "ds4:preview", path) == (
+            393216, "tag-policy(deepseek-v4-flash-preview)")
+        # Explicit overrides still beat DeepSeek policy.
+        assert resolve_kv_backend("contiguous", "deepseek-v4-flash", path) == (
+            "contiguous", "explicit(--kv-backend)")
+        assert resolve_max_seq(8192, "deepseek-v4-flash", path) == (
+            8192, "explicit(--max-seq)")
+        assert resolve_max_tokens(256, "deepseek-v4-flash", path) == (
+            256, "explicit(--max-tokens)")
+        # Muse Glimmer quality + fast: VMM + native 131072; tokens stay fallback.
+        assert resolve_kv_backend(None, "muse-glimmer", path) == (
+            "vmm", "tag-policy(muse-glimmer)")
+        assert resolve_max_seq(None, "muse-glimmer", path) == (
+            131072, "tag-policy(muse-glimmer)")
+        assert resolve_max_tokens(None, "muse-glimmer", path) == (
+            2048, "default(2048)")
+        assert resolve_kv_backend(None, "muse-glimmer:fast", path) == (
+            "vmm", "tag-policy(muse-glimmer:fast)")
+        assert resolve_max_seq(None, "muse-glimmer:fast", path) == (
+            131072, "tag-policy(muse-glimmer:fast)")
+        assert resolve_max_tokens(None, "muse-glimmer:fast", path) == (
+            2048, "default(2048)")
+        # Quality alias lands on the same canonical Glimmer policy.
+        assert resolve_max_seq(None, "muse-glimmer:quality", path) == (
+            131072, "tag-policy(muse-glimmer)")
+        # Draft / dflash sidecars and unknown tags: no policy.
+        assert resolve_kv_backend(None, "muse-glimmer:draft", path) == (
+            "contiguous", "default(contiguous)")
+        assert resolve_max_seq(None, "muse-glimmer:draft", path) == (
+            32768, "default(32768)")
+        assert resolve_max_tokens(None, "muse-glimmer:draft", path) == (
+            2048, "default(2048)")
+        assert resolve_kv_backend(None, "qwen3.5:4b-draft", path) == (
+            "contiguous", "default(contiguous)")
+        assert resolve_max_seq(None, "qwen3.5:4b-draft", path) == (
+            32768, "default(32768)")
+        assert resolve_max_tokens(None, "qwen3.5:4b-draft", path) == (
+            2048, "default(2048)")
+        assert resolve_kv_backend(None, "qwen3.6:35b-a3b-dflash", path) == (
+            "contiguous", "default(contiguous)")
+        assert resolve_max_seq(None, "qwen3.6:35b-a3b-dflash", path) == (
+            32768, "default(32768)")
+        assert resolve_kv_backend(None, "missing", path) == (
+            "contiguous", "default(contiguous)")
+        assert resolve_max_seq(None, "missing", path) == (32768, "default(32768)")
+        assert resolve_max_tokens(None, "missing", path) == (2048, "default(2048)")
+        # Family-looking tags absent from the registry are not registry-selected.
+        for tag in (
+            "qwen3.8:missing",
+            "deepseek-v4-flash:missing",
+            "deepseek-v4-flash-preview:missing",
+        ):
+            assert resolve_kv_backend(None, tag, path) == (
+                "contiguous", "default(contiguous)")
+            assert resolve_max_seq(None, tag, path) == (
+                32768, "default(32768)")
+            assert resolve_max_tokens(None, tag, path) == (
+                2048, "default(2048)")
+
+        def _ns(**kw):
+            base = dict(
+                model="/models/qwen3.8-27b.mq4",
+                tag="qwen38:27b",
+                registry=path,
+                kv=None,
+                kv_backend=None,
+                mtp="off",
+                dflash="off",
+                ngram="off",
+                ngram_k=None,
+                mtp_ngram="off",
+                mtp_ngram_match=None,
+                mtp_ngram_min=None,
+                mtp_ngram_max=None,
+                draft=None,
+                thinking="off",
+                thinking_effort=None,
+                max_tokens=None,
+                max_seq=None,
+                sampling="greedy",
+                mode="battery",
+                port=11520,
+                seed=None,
+                prompts_file=None,
+                prompt_file=None,
+                niah_file=None,
+                speculation=None,
+                deepseek4_experts_per_token=None,
+                deepseek4_compute_placement="single",
+                devices=None,
+                tp=None,
+                replay_route_proof_log=False,
+            )
+            base.update(kw)
+            return argparse.Namespace(**base)
+
+        cfg = build_config(_ns())
+        assert cfg["kv_backend"] == "vmm", cfg
+        assert cfg["kv_backend_source"] == "tag-policy(qwen3.8:27b)"
+        assert cfg["max_seq"] == 262144
+        assert cfg["max_seq_source"] == "tag-policy(qwen3.8:27b)"
+        assert cfg["max_tokens"] == 81920
+        assert cfg["max_tokens_source"] == "tag-policy(qwen3.8:27b)"
+        assert cfg["kv"] == "q8"
+
+        cfg = build_config(_ns(kv_backend="contiguous", max_seq=8192, max_tokens=256))
+        assert cfg["kv_backend"] == "contiguous"
+        assert cfg["kv_backend_source"] == "explicit(--kv-backend)"
+        assert cfg["max_seq"] == 8192
+        assert cfg["max_seq_source"] == "explicit(--max-seq)"
+        assert cfg["max_tokens"] == 256
+        assert cfg["max_tokens_source"] == "explicit(--max-tokens)"
+
+        cfg = build_config(_ns(tag="qwen3:latest", model="/models/qwen3-8b.mq4"))
+        assert cfg["kv_backend"] == "contiguous"
+        assert cfg["max_seq"] == 32768
+        assert cfg["max_tokens"] == 2048
+
+        cfg = build_config(_ns(
+            tag="deepseek-v4-flash",
+            model="/models/deepseek-v4-flash-0731.mq2r",
+        ))
+        assert cfg["kv_backend"] == "vmm"
+        assert cfg["kv_backend_source"] == "tag-policy(deepseek-v4-flash)"
+        assert cfg["max_seq"] == 1048576
+        assert cfg["max_seq_source"] == "tag-policy(deepseek-v4-flash)"
+        assert cfg["max_tokens"] == 393216
+        assert cfg["max_tokens_source"] == "tag-policy(deepseek-v4-flash)"
+
+        cfg = build_config(_ns(
+            tag="deepseek-v4-flash:mq2lloyd",
+            model="/models/deepseek-v4-flash-0731.mq2lloyd",
+        ))
+        assert cfg["kv_backend"] == "vmm"
+        assert cfg["max_seq"] == 1048576
+        assert cfg["max_tokens"] == 393216
+
+        cfg = build_config(_ns(
+            tag="deepseek-v4-flash-preview",
+            model="/models/deepseek-v4-flash.mq2lloyd",
+        ))
+        assert cfg["kv_backend"] == "vmm"
+        assert cfg["max_seq"] == 1048576
+        assert cfg["max_tokens"] == 393216
+
+        cfg = build_config(_ns(tag="muse-glimmer", model="/models/muse-glimmer-30b.mq4"))
+        assert cfg["kv_backend"] == "vmm"
+        assert cfg["kv_backend_source"] == "tag-policy(muse-glimmer)"
+        assert cfg["max_seq"] == 131072
+        assert cfg["max_seq_source"] == "tag-policy(muse-glimmer)"
+        assert cfg["max_tokens"] == 2048
+        assert cfg["max_tokens_source"] == "default(2048)"
+
+        cfg = build_config(_ns(tag="muse-glimmer:fast", model="/models/muse-glimmer-30b.mq4r"))
+        assert cfg["kv_backend"] == "vmm"
+        assert cfg["max_seq"] == 131072
+        assert cfg["max_tokens"] == 2048
+
+        cfg = build_config(_ns(tag="muse-glimmer:draft", model="/models/muse-glimmer-30b-assistant.q8.hfq"))
+        assert cfg["kv_backend"] == "contiguous"
+        assert cfg["max_seq"] == 32768
+        assert cfg["max_tokens"] == 2048
+        assert infer_tag("/models/muse-glimmer-30b-dflash.mq4") == "muse-glimmer:draft"
+        assert infer_tag("/models/muse-glimmer-30b-assistant.q8.hfq") == "muse-glimmer:draft"
+        cfg = build_config(_ns(
+            tag=None,
+            model="/models/muse-glimmer-30b-dflash.mq4",
+        ))
+        assert cfg["kv_backend"] == "contiguous"
+        assert cfg["max_seq"] == 32768
+        assert cfg["max_tokens"] == 2048
+
+        cfg = build_config(_ns(tag="missing", model="/models/unknown.mq4"))
+        assert cfg["kv_backend"] == "contiguous"
+        assert cfg["max_seq"] == 32768
+        assert cfg["max_tokens"] == 2048
+    finally:
+        os.unlink(path)
+    print("serve_harness: load-defaults self-test OK", flush=True)
+
+
+
 def _self_test_mtp_ngram_config():
     """Config exclusivity, default 24/48/64 gate, MTP TOML selector, and env isolation."""
     import argparse
@@ -939,8 +1353,8 @@ def _self_test_mtp_ngram_config():
             model="/models/x.mq4",
             tag=None,
             registry=os.path.join(REPO, "registry/v1.json"),
-            kv="auto",
-            kv_backend="contiguous",
+            kv=None,
+            kv_backend=None,
             mtp="off",
             dflash="off",
             ngram="off",
@@ -952,7 +1366,8 @@ def _self_test_mtp_ngram_config():
             draft=None,
             thinking=None,
             thinking_effort=None,
-            max_tokens=2048,
+            max_tokens=None,
+            max_seq=None,
             sampling="greedy",
             mode="battery",
             port=11520,
@@ -1259,6 +1674,67 @@ def _self_test_mtp_ngram_config():
     assert "HIPFIRE_MTP_NGRAM_K" not in captured["env"]
 
     print("serve_harness: mtp-ngram-config self-test OK", flush=True)
+
+
+def _self_test_thinking_effort():
+    """GPU-free: medium/xhigh are accepted, uncapped by default, sent unchanged."""
+    import argparse
+
+    def _ns(**kw):
+        base = dict(
+            model="/models/x.mq4",
+            tag=None,
+            registry=os.path.join(REPO, "registry/v1.json"),
+            kv=None,
+            kv_backend=None,
+            mtp="off",
+            dflash="off",
+            ngram="off",
+            ngram_k=None,
+            mtp_ngram="off",
+            mtp_ngram_match=None,
+            mtp_ngram_min=None,
+            mtp_ngram_max=None,
+            draft=None,
+            thinking=None,
+            thinking_effort=None,
+            max_tokens=None,
+            max_seq=None,
+            sampling="greedy",
+            mode="battery",
+            port=11520,
+            seed=None,
+            prompts_file=None,
+            prompt_file=None,
+            niah_file=None,
+            speculation=None,
+            deepseek4_experts_per_token=None,
+            deepseek4_compute_placement="single",
+            devices=None,
+            tp=None,
+            replay_route_proof_log=False,
+        )
+        base.update(kw)
+        return argparse.Namespace(**base)
+
+    for effort in ("medium", "xhigh"):
+        cfg = build_config(_ns(thinking_effort=effort))
+        assert cfg["sampling"]["reasoning_effort"] == effort, cfg["sampling"]
+        assert cfg["thinking_budget"] == "uncapped", (
+            f"{effort} without explicit budget must default uncapped, got "
+            f"{cfg['thinking_budget']!r}"
+        )
+        assert cfg["thinking_cap_tokens"] == 0, cfg["thinking_cap_tokens"]
+        assert cfg["sampling_source"].get("reasoning_effort") == "explicit(--thinking-effort)"
+
+    # Explicit --thinking still wins over the uncapped default.
+    cfg = build_config(_ns(thinking_effort="medium", thinking="high"))
+    assert cfg["sampling"]["reasoning_effort"] == "medium"
+    assert cfg["thinking_budget"] == "high"
+    assert cfg["thinking_cap_tokens"] == THINKING_BUDGET["high"]
+
+    print("serve_harness: thinking-effort self-test OK", flush=True)
+
 
 
 def _self_test_glimmer_feedback_shape():
@@ -2168,8 +2644,9 @@ def main():
     ap.add_argument("--registry", default=os.path.join(REPO, "registry/v1.json"))
     ap.add_argument("--kv", default=None,
                     help="cache mode override; omitted resolves the registry default")
-    ap.add_argument("--kv-backend", default="contiguous", choices=["contiguous", "vmm"],
-                    help="hipfire serve --kv-backend override (default contiguous; use vmm for PR #549 path)")
+    ap.add_argument("--kv-backend", default=None, choices=["contiguous", "vmm"],
+                    help="hipfire serve --kv-backend; omitted resolves canonical-tag "
+                         "policy then contiguous")
     ap.add_argument("--mtp", default="off", choices=["off", "on", "auto"])
     ap.add_argument("--dflash", default="off", choices=["off", "auto", "on"],
                     help="DFlash mode written to temporary [speculation] TOML (default off). "
@@ -2189,9 +2666,9 @@ def main():
         help="DeepSeek V4 routed experts per token for this model load; omitted preserves the checkpoint default.",
     )
     ap.add_argument("--thinking-effort", default=None,
-                    choices=["none", "low", "high", "max"],
+                    choices=["none", "low", "medium", "high", "xhigh", "max"],
                     help="parent-model reasoning_effort prompt semantics; independent of "
-                         "--thinking. With no explicit/registry budget, low/high/max is uncapped.")
+                         "--thinking. With no explicit/registry budget, low/medium/high/xhigh/max is uncapped.")
     ap.add_argument("--ngram", default="off", choices=["off", "on"],
                     help="Model-free n-gram/PLD speculator (default off). 'on' emits the "
                          "exclusive selector mode=ngram + ngram=on + dflash/mtp off, and is "
@@ -2241,8 +2718,10 @@ def main():
                     help="explicit reasoning cap policy. Default: registry thinking_budget; "
                          "otherwise uncapped for an explicit effort, med for legacy callers. "
                          "\"off\" disables thinking (cap sentinel 1).")
-    ap.add_argument("--max-tokens", type=int, default=2048)
-    ap.add_argument("--max-seq", type=int, default=32768)
+    ap.add_argument("--max-tokens", type=int, default=None,
+                    help="generation cap; omitted resolves canonical-tag policy then 2048")
+    ap.add_argument("--max-seq", type=int, default=None,
+                    help="context length; omitted resolves canonical-tag policy then 32768")
     ap.add_argument("--sampling", default="registry",
                     help="registry | registry:general|coding|instruct | greedy | recipe:general|coding|nothink | json:{...}")
     ap.add_argument("--mode", default="battery", choices=["battery", "chain", "session"])
@@ -2315,14 +2794,16 @@ def main():
         _self_test_prompt_sources()
         _self_test_device_config()
         _self_test_kv_resolution()
+        _self_test_load_defaults()
         _self_test_mtp_ngram_config()
+        _self_test_thinking_effort()
         _self_test_glimmer_feedback_shape()
         _self_test_glimmer_tool_delta_merge()
         _self_test_glimmer_transcript_and_trace()
         return
     if not args.model:
         ap.error("--model is required unless --self-test")
-    cfg = build_config(args); cfg["max_seq"] = args.max_seq
+    cfg = build_config(args)
     cfg["serve_warm_timeout_secs"] = args.serve_warm_timeout_secs
     show_config(cfg)
     if args.show_config:
@@ -2331,9 +2812,9 @@ def main():
     # think block is emitted at all, so the think-only-output guard does not apply.
     if (cfg['thinking_budget'] != 'off'
             and cfg['thinking_cap_tokens']
-            and args.max_tokens <= cfg['thinking_cap_tokens']):
+            and cfg['max_tokens'] <= cfg['thinking_cap_tokens']):
         sys.exit(
-            f"serve_harness: max_tokens ({args.max_tokens}) <= thinking budget "
+            f"serve_harness: max_tokens ({cfg['max_tokens']}) <= thinking budget "
             f"'{cfg['thinking_budget']}' ({cfg['thinking_cap_tokens']} tok) guarantees "
             f"think-only output with zero visible answer. Raise --max-tokens above "
             f"{cfg['thinking_cap_tokens']}, lower --thinking (low={THINKING_BUDGET['low']}), "

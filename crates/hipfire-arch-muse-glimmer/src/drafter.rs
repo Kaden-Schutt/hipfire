@@ -108,6 +108,55 @@
 //! `embed_norm` (scale-less RMSNorm). The AR path at `forward::embed_lookup`
 //! DOES apply it; the DFlash path deliberately does not.
 //!
+//! ## Logit calibration: ordering is good, magnitude is not
+//!
+//! The drafter's logits rank tokens well but carry almost no dynamic range, so
+//! their softmax is NOT a usable probability distribution. Measured 2026-08-14
+//! on hiptrx gfx1201, `muse-glimmer-30b.mq4` + `muse-glimmer-30b-dflash.mq4`,
+//! serve battery at registry sampling (temp 1.0), via a temporary accept-input
+//! dump (branch `glimmer-rejection-debug`, `HIPFIRE_GLIMMER_ACCEPT_DIAG=1`):
+//!
+//! | quantity | draft row | target row |
+//! |---|---|---|
+//! | row sum | 1.0000 | 1.0000 |
+//! | argmax token | 19669 | 19669 (same) |
+//! | probability at argmax | **0.0007** | **0.9998** |
+//!
+//! Rows are correctly aligned (draft row `i` and target row `i` both predict
+//! `drafts[i]`, and they agree on the argmax across windows: 19669, 200023,
+//! 10064). Both sum to 1. The target is near-deterministic while the draft is
+//! nearly flat — a uniform distribution over the 202048-token vocab would put
+//! 4.95e-6 on each token, and the draft's PEAK is 7e-4.
+//!
+//! Mechanism: the draft path norms `scratch.x` with the DRAFTER's `norm` and
+//! then applies the TARGET's `lm_head`, skipping the target's `final_norm`
+//! scaling that `forward.rs`'s verify path applies before its own lm_head.
+//! Right ordering with no contrast is the fingerprint of a scale mismatch, not
+//! of genuine drafter uncertainty.
+//!
+//! This costs nothing today because every shipped consumer is scale-invariant:
+//! greedy DFlash takes the argmax, and the sampled path
+//! (`hipfire_runtime::ddtree::naive_sample_chain`) accepts on `p_t(draft)` drawn
+//! from the TARGET's distribution. It matters if you write something that
+//! treats the drafter's softmax as a distribution. Speculative REJECTION
+//! sampling does exactly that, and it fails hard: drafts sampled from the flat
+//! `q` are effectively random, the target assigns them 1e-14..1e-8, and
+//! `u * q(draft) <= p(draft)` is never satisfied — measured `accepted 0` of 135
+//! proposals, tau 1.000, 27.2 tok/s against 28.1 on plain AR, with coherent
+//! output the whole time, so it fails SILENTLY.
+//!
+//! Two traps if you try to fix it:
+//!   - A positive scalar rescale leaves argmax (and therefore greedy) untouched,
+//!     but applying the target's `final_norm` is a per-channel transform and
+//!     WOULD change the argmax. Re-validate greedy tau before believing any
+//!     recalibration.
+//!   - Calibration alone buys no speculative throughput. Where the target sits
+//!     at 0.9998, naive chain-sample already accepts at ~that rate, and a
+//!     calibrated `min(1, p/q)` converges to the same value. The measured gap
+//!     (sampled 1.84x vs greedy 3.18x over AR) comes from temperature-1.0
+//!     sampling drawing a non-argmax token and breaking the chain, which no
+//!     lossless accept rule can recover — only a better-aligned drafter can.
+//!
 //! REUSE: no new kernels. Projections are `weight_gemv`, norms are
 //! `rmsnorm_batched`, RoPE is `rope_batched_f32` (half-split; n_heads_*=0 to
 //! skip the inactive side), attention is `attention_dflash_f32`.
@@ -207,7 +256,31 @@ pub const GLIMMER_DRAFTER_ARCH_ID: u32 = 23;
 /// Daemon/load default for `HIPFIRE_GLIMMER_CTX_CAP` when unset.
 /// Sampled once at carrier load and passed into scratch + device hidden log.
 /// Demo may choose a distinct default independently.
-pub const GLIMMER_DRAFTER_CTX_CAP_DEFAULT: usize = 256;
+///
+/// This is a sliding suffix window, not a hard context limit: once `cur_pos`
+/// exceeds it, `daemon.rs` pins `ctx_len` here and advances
+/// `cur_start = cur_pos - ctx_len`, so the drafter always sees the most recent
+/// rows. Rows sliding out leave the drafter's attention only — the target's KV
+/// is untouched and still verifies every token, so this bounds tau, never
+/// correctness.
+///
+/// 512 measured on hiptrx gfx1201, muse-glimmer-30b.mq4 (Q8 attention) + the
+/// mq4 drafter, greedy so each point is deterministic:
+///   - Long context (1024-token prompt fixture, cap is binding):
+///     64 -> 29.7 tok/s (tau 2.617) | 128 -> 31.7 (2.841) | 256 -> 50.7 (4.741)
+///     512 -> 55.9 (5.375) | 768 -> 48.5 (4.640) | 1024 -> 51.8 (5.160)
+///     4096 -> 39.2 (5.647)
+///     tau rises monotonically with the window, but per-window cost (the
+///     `ctx_len*kv_dim` D2D gather x2 x5 layers, plus attention over
+///     `ctx_len+block`) outruns it past ~512.
+///   - Short prompts (genre battery, <=256 generated): 256/512/1024 are
+///     IDENTICAL (tau 8.0/10.048/5.25/4.017/3.919, ~89 tok/s) because
+///     `ctx_len = min(cur_pos, cap)` never reaches the cap.
+/// So 512 is free in the short regime and ~+10% in the long one. `fc_input`
+/// VRAM is `cap * num_extract * hidden * 4` = 68 MB here (34 MB at 256,
+/// 545 MB at 4096). The surface is bumpy (768 lands below 256), so treat this
+/// as the measured best of the candidates rather than a smooth optimum.
+pub const GLIMMER_DRAFTER_CTX_CAP_DEFAULT: usize = 512;
 
 // ─── Config ─────────────────────────────────────────────────────────────
 
@@ -610,8 +683,8 @@ impl GlimmerDrafterWeights {
                 hfq,
                 &mut *p.gpu,
                 &format!("{prefix}.self_attn.o_proj.weight"),
-                cfg.q_dim(),
                 h,
+                cfg.q_dim(),
             ) {
                 Ok(v) => v,
                 Err(e) => {
@@ -703,8 +776,8 @@ impl GlimmerDrafterWeights {
                 hfq,
                 &mut *p.gpu,
                 &format!("{prefix}.mlp.down_proj.weight"),
-                cfg.intermediate,
                 h,
+                cfg.intermediate,
             ) {
                 Ok(v) => v,
                 Err(e) => {

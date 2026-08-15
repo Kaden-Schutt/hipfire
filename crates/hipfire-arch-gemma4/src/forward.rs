@@ -64,6 +64,13 @@ use hipfire_runtime::llama::{
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 
+/// Greedy EAGLE promises byte-identical target decisions.  Its batched verify
+/// must therefore use the same arithmetic family as eager decode rather than
+/// numerically-close fused/WMMA variants whose small drift accumulates in KV.
+fn eagle_strict_enabled() -> bool {
+    std::env::var("HIPFIRE_GEMMA4_EAGLE").ok().as_deref() == Some("1")
+}
+
 /// Master switch for the qwen35-mirror fused-projection FFN path
 /// (`fused_rmsnorm_rotate_mq` + `fused_gate_up_hfq4g256`). Default ON; opt out
 /// with `HIPFIRE_GEMMA4_FUSED_FFN=0`. Only fires when the FFN gate/up weights
@@ -96,12 +103,13 @@ fn fused_qk_enabled() -> bool {
 /// out with `HIPFIRE_GEMMA4_FUSED_POSTNORM=0`. Not byte-identical (the residual
 /// add rounds inside the norm kernel) -- coherence-validated.
 fn fused_postnorm_enabled() -> bool {
-    !matches!(
-        std::env::var("HIPFIRE_GEMMA4_FUSED_POSTNORM")
-            .ok()
-            .as_deref(),
-        Some("0") | Some("off") | Some("false")
-    )
+    !eagle_strict_enabled()
+        && !matches!(
+            std::env::var("HIPFIRE_GEMMA4_FUSED_POSTNORM")
+                .ok()
+                .as_deref(),
+            Some("0") | Some("off") | Some("false")
+        )
 }
 
 /// Master switch for the fused per-head weighted q/k RMSNorm + q prescale +
@@ -111,12 +119,13 @@ fn fused_postnorm_enabled() -> bool {
 /// separate. Default ON; opt out with `HIPFIRE_GEMMA4_FUSED_QK_ROPE=0`. Not
 /// byte-identical (fused rsqrt/rope rounds differently) -- coherence-validated.
 fn fused_qk_rope_enabled() -> bool {
-    !matches!(
-        std::env::var("HIPFIRE_GEMMA4_FUSED_QK_ROPE")
-            .ok()
-            .as_deref(),
-        Some("0") | Some("off") | Some("false")
-    )
+    !eagle_strict_enabled()
+        && !matches!(
+            std::env::var("HIPFIRE_GEMMA4_FUSED_QK_ROPE")
+                .ok()
+                .as_deref(),
+            Some("0") | Some("off") | Some("false")
+        )
 }
 
 /// q = q_proj(x); k = k_proj(x). Fused into one launch via `fused_gate_up_q8_0`
@@ -1315,9 +1324,14 @@ fn proj_gemm_batched(
         DType::F32 => gpu
             .gemm_f32_batched(&w.buf, x, y, w.m, w.k, b)
             .map_err(|e| format!("gemma4 batch {label} (f32): {e:?}")),
-        DType::Q8_0 => gpu
-            .gemm_q8_0_batched_chunked(&w.buf, x, y, w.m, w.k, b)
-            .map_err(|e| format!("gemma4 batch {label} (q8): {e:?}")),
+        DType::Q8_0 => {
+            let result = if eagle_strict_enabled() {
+                gpu.gemm_q8_0_batched(&w.buf, x, y, w.m, w.k, b)
+            } else {
+                gpu.gemm_q8_0_batched_chunked(&w.buf, x, y, w.m, w.k, b)
+            };
+            result.map_err(|e| format!("gemma4 batch {label} (q8): {e:?}"))
+        }
         DType::MQ4G256 | DType::HFQ4G256 => {
             // FWHT-rotate the shared input once, then run the prerotated GEMM.
             // rotate_x_mq_batched_for handles the AWQ-aware branch (no-op AWQ
@@ -1566,6 +1580,7 @@ pub fn forward_batch_spec(
         .memcpy_htod(&pos_array.buf, &pos_bytes)
         .map_err(|e| format!("gemma4 forward_batch htod pos: {e:?}"))?;
 
+
     // ── Embedding: per-token lookup into x[B,dim], then ×√dim over all rows. ──
     {
         let x_single = alloc(gpu, dim, "x_single")?;
@@ -1786,15 +1801,27 @@ pub fn forward_batch_spec(
                 // (tanh-scaled), so argmax(softcap(z)) == argmax(z). The accept
                 // decision is an argmax, so this is bit-exact in the decision.
                 let logits_b = alloc(gpu, b * vocab, "spec_logits_b")?;
-                gpu.gemm_q8_0_batched_chunked(
-                    &weights.lm_head.buf,
-                    normed_hidden,
-                    &logits_b,
-                    weights.lm_head.m,
-                    weights.lm_head.k,
-                    b,
-                )
-                .map_err(|e| format!("gemma4 forward_batch_spec batched lm_head: {e:?}"))?;
+                let lm_result = if eagle_strict_enabled() {
+                    gpu.gemm_q8_0_batched(
+                        &weights.lm_head.buf,
+                        normed_hidden,
+                        &logits_b,
+                        weights.lm_head.m,
+                        weights.lm_head.k,
+                        b,
+                    )
+                } else {
+                    gpu.gemm_q8_0_batched_chunked(
+                        &weights.lm_head.buf,
+                        normed_hidden,
+                        &logits_b,
+                        weights.lm_head.m,
+                        weights.lm_head.k,
+                        b,
+                    )
+                };
+                lm_result
+                    .map_err(|e| format!("gemma4 forward_batch_spec batched lm_head: {e:?}"))?;
                 // GPU per-row argmax over [B, vocab]; only B indices land on PCIe.
                 let idx_buf = alloc(gpu, b, "spec_argmax_idx")?;
                 gpu.argmax_f32_batched(&logits_b, &idx_buf, vocab, b)
