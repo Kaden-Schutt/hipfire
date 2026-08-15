@@ -24,13 +24,19 @@ OUT_ROOT="${OUT_ROOT:-$ROOT/target/validation/gemma4-longbench-prefill/$EXPECTED
 for file in "$DAEMON" "$E2B" "$E4B" "$DATASET" "$MANIFEST"; do
     [[ -f "$file" ]] || { echo "missing required file: $file" >&2; exit 2; }
 done
+if [[ -d "$OUT_ROOT" ]] && find "$OUT_ROOT" -mindepth 1 -print -quit | grep -q .; then
+    echo "refusing to mix LongBench results in non-empty OUT_ROOT: $OUT_ROOT" >&2
+    exit 2
+fi
 
 run_one() {
     local mode="$1" model="$2" artifact="$3"
     local feature_args=()
     if [[ "$mode" == off ]]; then
         feature_args+=(
+            --no-q8-fused-prefill
             --no-batched-embedding-prefill
+            --no-ple-batched-prefill
             --no-ple-branch-batched-prefill
             --no-ple-activation-fused-prefill
         )
@@ -44,7 +50,6 @@ run_one() {
         --runtime-home "/tmp/hipfire-gemma4-${model}-${EXPECTED_ARCH}-longbench-${mode}" \
         --max-seq "$MAX_SEQ" --max-tokens "$MAX_TOKENS" --limit "$LIMIT" \
         --prefill-batch "$PREFILL_BATCH" --timeout 3600 \
-        --no-q8-fused-prefill --no-ple-batched-prefill \
         "${feature_args[@]}"
 }
 
@@ -90,6 +95,11 @@ for model in ("e2b", "e4b"):
             f"{off['accuracy']:.4f} -> {auto['accuracy']:.4f}"
         )
     common = sorted(set(rows["off"]) & set(rows["auto"]))
+    if set(rows["off"]) != set(rows["auto"]) or len(common) != off["completed"]:
+        raise SystemExit(
+            f"{model}: incomplete paired sample set: off={len(rows['off'])}, "
+            f"auto={len(rows['auto'])}, common={len(common)}, completed={off['completed']}"
+        )
     same_prediction = sum(
         rows["off"][key].get("prediction_sha256")
         == rows["auto"][key].get("prediction_sha256")
