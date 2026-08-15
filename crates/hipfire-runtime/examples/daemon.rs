@@ -11886,7 +11886,8 @@ fn main() {
                         let mut staged_ep_slots: usize = 0;
                         let mut staged_ep_lane_cap: usize = 0;
                         if parsed_continuous_batch_size > 1 && m.pp == 1 && m.ep.is_none() {
-                            if hipfire_loader::carrier_for(m.arch_id).map(|c| c.name() == "qwen35").unwrap_or(false) {
+                            match hipfire_loader::continuous_batch_route(m.arch_id) {
+                                Some(hipfire_loader::ContinuousBatchRoute::Qwen35) => {
                                 if let Some(ModelState::Qwen35(bundle)) = m.state.as_ref() {
                                     if !qwen_batch_weight_formats_supported(&bundle.weights) {
                                         eprintln!(
@@ -11947,7 +11948,8 @@ fn main() {
                                 } else {
                                     eprintln!("[daemon] continuous batch requested but model state not Qwen35 — fallback to sequential");
                                 }
-                            } else if hipfire_loader::carrier_for(m.arch_id).map(|c| c.name() == "lfm2moe").unwrap_or(false) {
+                                }
+                                Some(hipfire_loader::ContinuousBatchRoute::Lfm2Moe) => {
                                 if let Some(ModelState::Lfm2Moe(bundle)) = m.state.as_ref() {
                                     if !bundle.config.is_dense() {
                                         eprintln!(
@@ -12012,8 +12014,10 @@ fn main() {
                                 } else {
                                     eprintln!("[daemon] continuous batch requested but model state not Lfm2Moe — fallback to sequential");
                                 }
-                            } else {
+                                }
+                                None => {
                                 eprintln!("[daemon] continuous batch requested but not capable (arch_id={} pp={} ep={:?}) — fallback to sequential", m.arch_id, m.pp, m.ep.is_some());
+                                }
                             }
                         } else if parsed_continuous_batch_size > 1 && m.pp == 1 && m.ep.is_some() {
                             // EP Qwen35 pure expert-parallel batch route: TP=4, 4×gfx1201, batch-only.
@@ -12692,8 +12696,8 @@ fn main() {
                 };
 
                 let has_image = image_base64.is_some() || image.is_some();
-                let is_dots_ocr = hipfire_loader::carrier_for(m.arch_id).map(|c| c.is_dots_ocr()).unwrap_or(false);
-                let has_vl = m.vision_config.is_some() || is_dots_ocr;
+                let vision_route = hipfire_loader::vision_route(m.arch_id);
+                let has_vl = m.vision_config.is_some() || vision_route == hipfire_loader::VisionRoute::DotsOcr;
 
                 if has_image && !has_vl {
                     write_error(&mut stdout, id, "model has no vision encoder");
@@ -12817,10 +12821,9 @@ fn main() {
                         max_think_tokens: vl_max_think_tokens,
                         assistant_prefix,
                     };
-                    if is_dots_ocr {
-                        generate_vl_dots_ocr(m, &mut gpu, &mut stdout, &params);
-                    } else {
-                        generate_vl(m, &mut gpu, &mut stdout, &params);
+                    match vision_route {
+                        hipfire_loader::VisionRoute::DotsOcr => generate_vl_dots_ocr(m, &mut gpu, &mut stdout, &params),
+                        _ => generate_vl(m, &mut gpu, &mut stdout, &params),
                     }
                 } else {
                     // Per-request PflashConfig: clone the load-time cfg
@@ -13738,37 +13741,40 @@ fn main() {
                         continue;
                     }
                 };
-                if hipfire_loader::carrier_for(m.arch_id).map(|c| c.name() == "deepseek4").unwrap_or(false) {
-                    match redline_bench_decode_deepseek4(&mut gpu, m, &msg) {
-                        Ok(response) => {
-                            let _ = writeln!(stdout, "{response}");
+                match hipfire_loader::bench_decode_route(m.arch_id) {
+                    hipfire_loader::BenchDecodeRoute::Deepseek4 => {
+                        match redline_bench_decode_deepseek4(&mut gpu, m, &msg) {
+                            Ok(response) => {
+                                let _ = writeln!(stdout, "{response}");
+                            }
+                            Err(reason) => {
+                                let _ = writeln!(
+                                    stdout,
+                                    "{}",
+                                    serde_json::json!({"type": "error", "message": reason})
+                                );
+                            }
                         }
-                        Err(reason) => {
-                            let _ = writeln!(
-                                stdout,
-                                "{}",
-                                serde_json::json!({"type": "error", "message": reason})
-                            );
-                        }
+                        let _ = stdout.flush();
+                        continue;
                     }
-                    let _ = stdout.flush();
-                    continue;
-                }
-                if hipfire_loader::carrier_for(m.arch_id).map(|c| c.name() == "lfm2moe").unwrap_or(false) {
-                    match redline_bench_decode_lfm2moe(&mut gpu, m, &msg) {
-                        Ok(response) => {
-                            let _ = writeln!(stdout, "{response}");
+                    hipfire_loader::BenchDecodeRoute::Lfm2Moe => {
+                        match redline_bench_decode_lfm2moe(&mut gpu, m, &msg) {
+                            Ok(response) => {
+                                let _ = writeln!(stdout, "{response}");
+                            }
+                            Err(reason) => {
+                                let _ = writeln!(
+                                    stdout,
+                                    "{}",
+                                    serde_json::json!({"type": "error", "message": reason})
+                                );
+                            }
                         }
-                        Err(reason) => {
-                            let _ = writeln!(
-                                stdout,
-                                "{}",
-                                serde_json::json!({"type": "error", "message": reason})
-                            );
-                        }
+                        let _ = stdout.flush();
+                        continue;
                     }
-                    let _ = stdout.flush();
-                    continue;
+                    _ => {}
                 }
                 // arch 5/6 = Qwen3.5, arch 14 = Muse Glimmer. Both prime with a
                 // batched prefill and then step tokens one at a time, so the
@@ -13851,9 +13857,13 @@ fn main() {
                 m.conversation_tokens.clear();
                 let _ = reset_qwen35_recurrent(m, &mut gpu);
                 let synthetic: Vec<u32> = (0..context as u32).map(|i| 10 + (i % 1000)).collect();
-                let prime_error: Option<String> = hipfire_loader::carrier_for(m.arch_id)
-                    .and_then(|c| c.bench_decode_prime(m, &mut gpu, &synthetic))
-                    .unwrap_or(None);
+                let prime_error: Option<String> = match hipfire_loader::bench_decode_route(m.arch_id) {
+                    hipfire_loader::BenchDecodeRoute::Qwen35 | hipfire_loader::BenchDecodeRoute::MuseGlimmer => hipfire_loader::carrier_for(m.arch_id)
+                        .and_then(|c| c.bench_decode_prime(m, &mut gpu, &synthetic))
+                        .unwrap_or_else(|| Some(format!("bench_decode_prime: carrier missing or unimplemented for arch_id={}", m.arch_id))),
+                    hipfire_loader::BenchDecodeRoute::Unsupported => Some(format!("bench_decode unsupported for arch_id={}", m.arch_id)),
+                    _ => Some(format!("bench_decode unsupported for arch_id={}", m.arch_id)),
+                };
                 let _ = gpu.hip.device_synchronize();
                 if let Some(error) = prime_error {
                     emit_uncorrelated_error(
@@ -13891,9 +13901,19 @@ fn main() {
                 let _ = gpu.hip.device_synchronize();
                 let t0 = Instant::now();
                 let mut decode_err: Option<String> = None;
-                let run_ok = hipfire_loader::carrier_for(m.arch_id)
-                    .and_then(|c| c.bench_decode_run(m, &mut gpu, context, iterations, &mut decode_err))
-                    .unwrap_or(false);
+                let run_ok = match hipfire_loader::bench_decode_route(m.arch_id) {
+                    hipfire_loader::BenchDecodeRoute::Qwen35 | hipfire_loader::BenchDecodeRoute::MuseGlimmer => hipfire_loader::carrier_for(m.arch_id)
+                        .and_then(|c| c.bench_decode_run(m, &mut gpu, context, iterations, &mut decode_err))
+                        .unwrap_or(false),
+                    hipfire_loader::BenchDecodeRoute::Unsupported => {
+                        decode_err = Some(format!("bench_decode unsupported for arch_id={}", m.arch_id));
+                        false
+                    }
+                    _ => {
+                        decode_err = Some(format!("bench_decode unsupported for arch_id={}", m.arch_id));
+                        false
+                    }
+                };
                 let _ = gpu.hip.device_synchronize();
                 let elapsed = t0.elapsed().as_secs_f64();
                 let replay_after = gpu.replay.replay_observation();
@@ -15212,7 +15232,8 @@ fn generate_ep(
     // `primed_think` records whether the render ended on the MiniMax `<think>`
     // generation primer (re-emitted display-only in ep_serve_minimax). ──
     let mut primed_think = false;
-    let prompt_ids: Vec<u32> = if hipfire_loader::carrier_for(m.arch_id).map(|c| c.name() == "deepseek4").unwrap_or(false) {
+    let prompt_ids: Vec<u32> = match hipfire_loader::ep_prompt_route(m.arch_id) {
+        hipfire_loader::EpPromptRoute::Dsml => {
         primed_think = false;
         let tokenizer = m.tokenizer.as_ref().unwrap();
         let eos_tok = m.deepseek4_eos_tok;
@@ -15226,7 +15247,8 @@ fn generate_ep(
             eos_tok,
             &mut m.asst_turn_cache,
         )
-    } else {
+        }
+        hipfire_loader::EpPromptRoute::Jinja => {
         let tokenizer = m.tokenizer.as_ref().unwrap();
         if let Some(template) = m.chat_template.as_ref() {
             let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
@@ -15303,6 +15325,7 @@ fn generate_ep(
             ids.extend(tokenizer.encode(&format!("<｜User｜>{prompt}<｜Assistant｜>")));
             ids
         }
+        }
     };
     if std::env::var("HIPFIRE_DEEPSEEK4_DUMP_PROMPT")
         .ok()
@@ -15329,12 +15352,13 @@ fn generate_ep(
         let _ = stdout.flush();
         return;
     }
-    let eos_tok = if hipfire_loader::carrier_for(m.arch_id).map(|c| c.name() == "minimax").unwrap_or(false) {
+    let eos_tok = match hipfire_loader::ep_eos_route(m.arch_id) {
+        hipfire_loader::EpEosRoute::Minimax => {
         // MiniMax EP state lives in `m.ep`, not `m.state`, so `minimax()` is
         // None here — read the EP eos carried on LoadedModel (set at load).
         m.minimax_eos_tok
-    } else {
-        m.deepseek4_eos_tok
+        }
+        hipfire_loader::EpEosRoute::Deepseek4 => m.deepseek4_eos_tok,
     };
     match m.arch_id {
         10 => ep_serve_minimax(
@@ -21702,11 +21726,8 @@ fn generate(
         return;
     }
 
-    // arch_id=13 (Gemma 4 dense): eager AR path. Same shape as the
-    // lfm2moe/minimax short-circuits: bypass the DFlash/spec/sampler-budget
-    // scaffolding below (all refused at load for arch 13). Without this arm
-    // arch 13 falls through to the Qwen AR arm — the bug this fixes.
-    if hipfire_loader::carrier_for(m.arch_id).map(|c| c.name() == "gemma4").unwrap_or(false) {
+    match hipfire_loader::generation_early_route(m.arch_id) {
+        Some(hipfire_loader::GenerationEarlyRoute::Gemma4) => {
         // The loader publishes one of two mutually-exclusive Gemma4 states:
         // eager dense (ModelState::Gemma4) and lowered/MoE
         // (ModelState::Gemma4Lowered). The generate body is eager-only, so a
@@ -21754,11 +21775,8 @@ fn generate(
             messages_history,
         );
         return;
-    }
-    // arch_id=14 (Muse Glimmer dense): eager AR path. Same shape as the
-    // gemma4 short-circuit: bypass the DFlash/spec/sampler-budget scaffolding
-    // below. Without this arm arch 14 falls through to the Qwen AR arm.
-    if hipfire_loader::carrier_for(m.arch_id).map(|c| c.name() == "muse_glimmer").unwrap_or(false) {
+        }
+        Some(hipfire_loader::GenerationEarlyRoute::MuseGlimmer) => {
         let _ = (
             budget_alert_at_tok,
             budget_alert_text,
@@ -21793,6 +21811,8 @@ fn generate(
             messages_history,
         );
         return;
+        }
+        None => {}
     }
 
     // hunt3 M-E: seed the process-global CPU sampler RNG with this request's

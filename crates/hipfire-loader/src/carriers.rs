@@ -383,9 +383,6 @@ impl Carrier for Qwen35Carrier {
     fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
         saddle_core::sampling::SamplingDefaults::new(0.3, 0.8, 1.0)
     }
-    fn supports_continuous_batch(&self) -> bool {
-        true
-    }
     fn bench_prefill(
         &self,
         m: &mut crate::LoadedModel,
@@ -1064,9 +1061,6 @@ impl Carrier for DotsOcrCarrier {
     fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
         saddle_core::sampling::SamplingDefaults::new(0.3, 0.8, 1.0)
     }
-    fn is_dots_ocr(&self) -> bool {
-        true
-    }
     fn bench_prefill(
         &self,
         m: &mut crate::LoadedModel,
@@ -1243,55 +1237,6 @@ impl Carrier for Deepseek4Carrier {
             state.n_tokens = n as u64;
         }
         Some(ok)
-    }
-    fn try_bench_decode(
-        &self,
-        _m: &mut crate::LoadedModel,
-        _gpu: &mut rdna_compute::Gpu,
-        _msg: &serde_json::Value,
-    ) -> Option<Result<serde_json::Value, String>> {
-        // Predicate: this carrier is responsible for bench_decode redline for arch 9.
-        // The actual benchmark body stays in the daemon (it reuses daemon helpers
-        // `redline_bench_decode_deepseek4` that are outside the loader DAG). Returning
-        // a dummy Some signals the daemon to dispatch via carrier predicate instead
-        // of `arch_id == 9`. The daemon will check `carrier_for(arch_id).and_then(|c| c.try_bench_decode(...))`.
-        // To keep the trait object-safe without moving large helpers, we signal
-        // handling via Some(Err) sentinel — daemon will recognize and run its
-        // existing helper. However we implement a proper dispatch by returning
-        // Some(Ok) sentinel and letting daemon re-invoke helper via carrier name.
-        // For now, we expose a simple predicate: return Some(Err("handled")) to
-        // indicate this carrier claims the request. The daemon replaces
-        // `if m.arch_id == 9` with `if carrier.try_bench_decode(...).is_some()`.
-        // To avoid changing daemon logic beyond predicate, we return Some(Ok) empty.
-        // The daemon will then handle predicate check separately.
-        // Instead, we provide a dedicated predicate: the daemon will call
-        // `carrier_for(id).map(|c| c.name()=="deepseek4").is_some()` — but we
-        // keep this hook to satisfy the trait surface required by the task.
-        None
-    }
-    fn ep_prompt_ids(
-        &self,
-        m: &mut crate::LoadedModel,
-        prompt: &str,
-        system_prompt: Option<&str>,
-        tools: Option<&[serde_json::Value]>,
-        messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
-        think_mode: hipfire_runtime::prompt_frame::ThinkMode,
-    ) -> Option<Vec<u32>> {
-        // Verbatim from daemon.rs generate_ep deepseek4 branch (arch 9).
-        // This is the DSML prompt builder; the daemon's `build_deepseek4_dsml_prompt`
-        // lives in daemon, so we cannot call it directly from loader without moving it.
-        // Instead we re-implement the delegation: the daemon will call this hook
-        // and, if Some, use the returned ids; if None, fall through to Jinja.
-        // For wave2 we expose the hook; the actual DSML render is still in daemon
-        // for now (to avoid moving 260-line helper). Return None to indicate
-        // "I claim this arch but the daemon should keep its DSML path" — the
-        // predicate still removes the arch_id check.
-        let _ = (m, prompt, system_prompt, tools, messages_history, think_mode);
-        Some(Vec::new())
-    }
-    fn ep_eos_tok(&self, m: &crate::LoadedModel) -> Option<u32> {
-        Some(m.deepseek4_eos_tok)
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
@@ -1565,9 +1510,6 @@ impl Carrier for MinimaxCarrier {
         }
         Some(ok)
     }
-    fn ep_eos_tok(&self, m: &crate::LoadedModel) -> Option<u32> {
-        Some(m.minimax_eos_tok)
-    }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
             // Preserve the two per-source error strings byte-for-byte.
@@ -1687,9 +1629,6 @@ impl Carrier for Lfm2MoeCarrier {
     fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
         saddle_core::sampling::SamplingDefaults::new(0.1, 0.80, 1.05)
     }
-    fn supports_continuous_batch(&self) -> bool {
-        true
-    }
     fn bench_prefill(
         &self,
         m: &mut crate::LoadedModel,
@@ -1710,14 +1649,6 @@ impl Carrier for Lfm2MoeCarrier {
             }
         }
         Some(ok)
-    }
-    fn try_bench_decode(
-        &self,
-        _m: &mut crate::LoadedModel,
-        _gpu: &mut rdna_compute::Gpu,
-        _msg: &serde_json::Value,
-    ) -> Option<Result<serde_json::Value, String>> {
-        None
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
@@ -2027,9 +1958,6 @@ impl Carrier for Gemma4Carrier {
             }
         }
         Some(ok)
-    }
-    fn handles_generate_early(&self) -> bool {
-        true
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
@@ -2456,9 +2384,6 @@ impl Carrier for MuseGlimmerCarrier {
             }
         }
         Some(ok)
-    }
-    fn handles_generate_early(&self) -> bool {
-        true
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.kv_backend == KvBackend::Vmm && ctx.cask.sidecar.is_some() {
