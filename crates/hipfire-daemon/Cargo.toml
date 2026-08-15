@@ -17,7 +17,7 @@ deltanet = [
     "hipfire-dispatch/deltanet",
     "hipfire-pflash/deltanet",
 ]
-serve-fault-inject = ["hipfire-runtime/serve-fault-inject"]
+serve-fault-inject = ["hipfire-runtime/serve-fault-inject", "hipfire-generate/serve-fault-inject"]
 ep-fault-inject = ["hipfire-loader/ep-fault-inject", "hipfire-runtime/ep-fault-inject"]
 
 [dependencies]

@@ -1265,3 +1265,85 @@ pub struct SpecRun {
     pub total_s: f64,
     pub decode_s: f64,
 }
+
+/// Fire one-shot after-prefill fault on qwen AR (host LoadedModel path).
+/// Returns true when the fault was taken (caller must return immediately).
+///
+/// Spec is reset via `crate::common::production_fail_closed_rollback(..., None)` which
+/// reborrows `m.speculator` internally — do not pass both `m` and a
+/// split `m.speculator` borrow.
+#[cfg(feature = "serve-fault-inject")]
+use crate::ar::take_fault_after_prefill;
+
+#[cfg(feature = "serve-fault-inject")]
+pub fn maybe_inject_fault_after_prefill_ar(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut impl std::io::Write,
+    id: &str,
+) -> bool {
+    if !take_fault_after_prefill() {
+        return false;
+    }
+    // Only qwen35 AR/DFlash are fault-inject eligible.
+    if !matches!(m.arch_id, 5 | 6) {
+        return false;
+    }
+    let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
+    crate::common::emit_fail_closed_error(
+        stdout,
+        Some(id),
+        "injected fault after prefill",
+        "gpu",
+        true,
+        &ep,
+    );
+    true
+}
+
+/// Fire one-shot after-prefill fault on qwen DFlash (live slot/spec path).
+///
+/// Takes host counters/rings as disjoint reborrows so the RAII target guard's
+/// `&mut m.state` (via `slot`) and `m.speculator` (via `spec`) stay live —
+/// same pattern as [`crate::common::production_fail_closed_rollback_live`].
+/// Returns true when the fault was taken (caller must return immediately).
+#[cfg(feature = "serve-fault-inject")]
+pub fn maybe_inject_fault_after_prefill_dflash(
+    arch_id: u32,
+    seq_pos: &mut usize,
+    conversation_tokens: &mut Vec<u32>,
+    prefill_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    dflash_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    asst_turn_cache: &mut hipfire_loader::AsstTurnCache,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    slot: &mut dyn SpecTarget,
+    spec: &mut dyn Speculator,
+) -> bool {
+    if !take_fault_after_prefill() {
+        return false;
+    }
+    if !matches!(arch_id, 5 | 6) {
+        return false;
+    }
+    let ep = crate::common::production_fail_closed_rollback_live(
+        seq_pos,
+        conversation_tokens,
+        prefill_checkpoints,
+        dflash_checkpoints,
+        asst_turn_cache,
+        gpu,
+        slot,
+        spec,
+    );
+    crate::common::emit_fail_closed_error(
+        stdout,
+        Some(id),
+        "injected fault after prefill",
+        "gpu",
+        true,
+        &ep,
+    );
+    true
+}

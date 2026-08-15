@@ -46,3 +46,6 @@ base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 tracing = "0.1"
+
+[features]
+serve-fault-inject = ["hipfire-runtime/serve-fault-inject"]
