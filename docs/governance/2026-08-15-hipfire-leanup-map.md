@@ -470,7 +470,15 @@ remit — leaves the crate at **45,569**, still 4.5× the target. The only route
 to 10,000 are splitting one architecture across five crates, which renames
 rather than reduces and costs legibility, or deleting working code.
 
-**"compute:arch ratio > 2:1."** Currently 124,348 : 118,661 = 1.048 : 1.
+**"compute:arch ratio > 2:1."** The ratchet that produced 1.048 : 1 was
+measuring the wrong thing: it counted `.rs` in eight compute crates and left
+out `kernels/` — 119,820 lines of HIP, which § 6 of this document names as part
+of the compute layer — while comparing against llama.cpp's `ggml/`, which is
+almost entirely kernel source. Measured like-for-like the ratio is
+**1.967 : 1** (strict: arch-named kernels charged to the arch side, matching
+llama.cpp, which has zero model-named files in `ggml/`). See
+`scripts/leanup-ratchets.sh` and § 2.2 of the design-grounding doc. Short of
+the 2 : 1 target by 1.7%, not by a factor of two.
 Reaching 2:1 means arch ≤ 62,174, i.e. deleting 56,487 lines of working
 architecture code. The llama.cpp comparison that motivated the target (9.7 : 1)
 does not transfer: its per-arch files are graph *construction* averaging 233

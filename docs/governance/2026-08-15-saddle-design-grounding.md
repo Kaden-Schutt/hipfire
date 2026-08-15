@@ -40,25 +40,57 @@ Examples are **47%** of src and **117x** the integration-test code.
 `hipfire-runtime` alone carries 99,166 lines of examples across 65 targets,
 including `daemon.rs` — the product — at 43,696 lines.
 
-### 2.2 The inverted ratio
+### 2.2 The inverted ratio — and a correction to how it was measured
 
-Grouping crates by role:
+> **Correction, 2026-08-15.** The table below originally compared hipfire's
+> compute *crates* against llama.cpp's entire `ggml/` tree and reported
+> **0.7 : 1**. That is not like-for-like. `ggml/` is almost entirely kernel
+> source — measured locally at 292,285 lines, of which `.cu` 21,004,
+> `.cl` 17,329, `.comp` 12,580, `.metal` 10,549, the rest C/C++ CPU kernels —
+> while hipfire's equivalent, `kernels/` at **119,820 lines** of HIP across
+> 883 files, was left out of hipfire's own compute side entirely. § 6 of the
+> leanup map names "the kernel family" as part of the compute layer, so the
+> measurement contradicted its own definition. The corrected figures are
+> below; `scripts/leanup-ratchets.sh` reproduces all of them.
 
-| layer | crates | lines |
+Grouping by role, measured at `d3eaac9a4`:
+
+| layer | what counts | lines |
 |---|---|---:|
 | compute | `rdna-compute`, `redline-*`, `radiowave`, `hip-bridge`, `hsa-bridge`, `hipfire-detect` | 124,348 |
-| architecture | `hipfire-arch-*` (12) | 167,000+ |
+| compute | `kernels/` — generic | 116,202 |
+| architecture | `hipfire-arch-*` (12) | 118,661 |
+| architecture | `kernels/` — arch-named (`deepseek4_*`, `fused_gemma4_*`, …) | 3,618 |
 
-Compared against llama.cpp at the same commit-time snapshot:
+Against llama.cpp, applying the same rule to both sides:
 
 | | compute layer | arch layer | ratio |
 |---|---:|---:|---:|
-| llama.cpp | `ggml/` 328,957 | `src/models/` 34,097 | **9.7 : 1** |
-| hipfire | 124,348 | 167,000+ | **0.7 : 1** |
+| llama.cpp | `ggml/` 292,285 | `src/models/` 18,040 | **16.2 : 1** |
+| hipfire, crates only (the old, unfair rule) | 124,348 | 118,661 | 1.048 : 1 |
+| hipfire, all kernels as compute | 244,168 | 118,661 | 2.058 : 1 |
+| **hipfire, strict** | **240,550** | **122,279** | **1.967 : 1** |
 
-**This inversion is the finding.** ggml carries ten times more compute code
-than architecture code. hipfire carries more architecture code than compute
-code. Everything generic that ggml owns once, hipfire re-implements per arch.
+**Strict is the number to quote.** llama.cpp has *zero* model-named files in
+`ggml/` — verified by scanning every `.c/.cpp/.cu/.cl/.comp` basename — so its
+arch layer contains no kernels at all. hipfire's does, and the honest analogue
+charges those 3,618 lines to the arch side.
+
+**The inversion was real and it is now nearly gone.** The original 0.7 : 1
+overstated it by excluding half of hipfire's compute layer, but the direction
+was right: ggml does own generically what hipfire had spread across arch
+crates. After the leanup the corrected ratio is 1.967 : 1, against a 2 : 1
+target — short by 1.7%.
+
+Closing that last 1.7% is blocked by scope, not by effort. Scanning every
+top-level free function in all eleven arch crates for one that names no
+architecture finds 7,047 lines, which would be enough. But the bulk of it is
+`load_weight_tensor_raw` and `load_vision_weights*` — weight loading, which
+belongs to #527 and is explicitly deferred — and `*_via_execute_steps`,
+`batched_gemm_single_weight`, `q8_attend_slots`, which are kernel dispatch and
+out of scope under § 6. What is left after removing both is too small to close
+the gap. The remaining distance is a deliberate consequence of the two
+standing decisions, not an unfinished task.
 
 ### 2.3 Per-architecture cost
 
