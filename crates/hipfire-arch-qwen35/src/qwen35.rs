@@ -6919,6 +6919,24 @@ fn ar_graph_eligible_for_kv(requested: bool, compact_offset: usize) -> bool {
     requested && compact_offset == 0
 }
 
+#[inline]
+fn retained_replay_eligible(
+    requested: bool,
+    automatic_lifecycle: bool,
+    layer_types: &[LayerType],
+) -> bool {
+    // Production retained AQL/PM4 does not yet reproduce ordinary HIP for
+    // hybrid DeltaNet decode.  The first captured forward is correct, but the
+    // recurrent state diverges after the route takes over.  Keep manual
+    // capture available for the state/logit shadow oracle while serving fails
+    // closed to HIP.  Full-attention-only Qwen carriers are unaffected.
+    requested
+        && !(automatic_lifecycle
+            && layer_types
+                .iter()
+                .any(|kind| *kind == LayerType::LinearAttention))
+}
+
 /// Zero-alloc forward pass using pre-allocated scratch buffers.
 /// Logits stay on GPU in scratch.logits. Returns nothing — caller uses scratch.logits.
 pub fn forward_scratch(
@@ -7051,7 +7069,12 @@ pub fn forward_scratch(
     // Redline's plain-AR capture/replay has the same eligibility contract as
     // the AR HipGraph. MTP/spec re-seed and verify calls must not contaminate
     // or consume the immutable single-token replay sequence.
-    gpu.replay.set_forward_eligible(graph_eligible);
+    let retained_eligible = retained_replay_eligible(
+        graph_eligible,
+        gpu.replay.automatic_lifecycle_enabled(),
+        &config.layer_types,
+    );
+    gpu.replay.set_forward_eligible(retained_eligible);
     gpu.replay
         .begin_auto_capture_if_armed()
         .map_err(|reason| HipError::new(0, reason))?;
@@ -24671,5 +24694,14 @@ mod tests {
         assert!(!ar_graph_eligible_for_kv(true, 1));
         assert!(!ar_graph_eligible_for_kv(true, 128));
         assert!(!ar_graph_eligible_for_kv(false, 0));
+    }
+    #[test]
+    fn automatic_retained_replay_fails_closed_for_deltanet() {
+        let hybrid = [LayerType::LinearAttention, LayerType::FullAttention];
+        let full_only = [LayerType::FullAttention, LayerType::FullAttention];
+        assert!(!retained_replay_eligible(true, true, &hybrid));
+        assert!(retained_replay_eligible(true, false, &hybrid));
+        assert!(retained_replay_eligible(true, true, &full_only));
+        assert!(!retained_replay_eligible(false, true, &full_only));
     }
 }
