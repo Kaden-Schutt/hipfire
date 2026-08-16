@@ -235,7 +235,7 @@
         "queues": 1,
         "phases": 1,
         "queue_id": 2,
-        "command_dwords": 20511,
+        "command_dwords": 20502,
         "unique_kernels": 23,
         "sequence_hash": "3318ffca3daf2338",
         "observed_positions": [
