@@ -35,17 +35,6 @@ hipfire-generate = { path = "../hipfire-generate" }
 hipfire-pflash = { path = "../hipfire-pflash" }
 
 # All arch crates — unconditional, no features.
-hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35" }
-hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl" }
-hipfire-arch-llama = { path = "../hipfire-arch-llama" }
-hipfire-arch-qwen2 = { path = "../hipfire-arch-qwen2" }
-hipfire-arch-deepseek4 = { path = "../hipfire-arch-deepseek4" }
-hipfire-arch-dots-ocr = { path = "../hipfire-arch-dots-ocr" }
-hipfire-arch-lfm2moe = { path = "../hipfire-arch-lfm2moe" }
-hipfire-arch-minimax = { path = "../hipfire-arch-minimax" }
-hipfire-arch-cohere2moe = { path = "../hipfire-arch-cohere2moe" }
-hipfire-arch-gemma4 = { path = "../hipfire-arch-gemma4" }
-hipfire-arch-muse-glimmer = { path = "../hipfire-arch-muse-glimmer" }
 
 # Direct external deps used by daemon.rs
 base64 = "0.22"
