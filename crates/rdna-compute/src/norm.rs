@@ -2466,41 +2466,51 @@ impl Gpu {
             kernels::GATED_DELTA_NET_SRC,
             "gated_delta_net_f32",
         )?;
-        let func = &self.functions["gated_delta_net_f32"];
-        let mut qp = q.buf.as_ptr();
-        let mut kp = k.buf.as_ptr();
-        let mut vp = v.buf.as_ptr();
-        let mut gp = gate.buf.as_ptr();
-        let mut bp = beta.buf.as_ptr();
-        let mut sp = state.buf.as_ptr();
-        let mut op = output.buf.as_ptr();
-        let mut nt = n_tokens as i32;
-        let mut nh = n_heads as i32;
-        let mut hd = head_dim as i32;
+        let qp = q.buf.as_ptr();
+        let kp = k.buf.as_ptr();
+        let vp = v.buf.as_ptr();
+        let gp = gate.buf.as_ptr();
+        let bp = beta.buf.as_ptr();
+        let sp = state.buf.as_ptr();
+        let op = output.buf.as_ptr();
+        let nt = n_tokens as i32;
+        let nh = n_heads as i32;
+        let hd = head_dim as i32;
         let mut params: Vec<*mut c_void> = vec![
-            &mut qp as *mut _ as *mut c_void,
-            &mut kp as *mut _ as *mut c_void,
-            &mut vp as *mut _ as *mut c_void,
-            &mut gp as *mut _ as *mut c_void,
-            &mut bp as *mut _ as *mut c_void,
-            &mut sp as *mut _ as *mut c_void,
-            &mut op as *mut _ as *mut c_void,
-            &mut nt as *mut _ as *mut c_void,
-            &mut nh as *mut _ as *mut c_void,
-            &mut hd as *mut _ as *mut c_void,
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &gp as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &nt as *const _ as *mut c_void,
+            &nh as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
         ];
         // 32 threads, tiled S in LDS (4KB per tile). Grid: [n_heads, 128/8=16].
         let n_tiles = (128 / 4) as u32;
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [n_heads as u32, n_tiles, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            "gated_delta_net_f32",
+            [n_heads as u32, n_tiles, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp);
+                b.push_ptr(kp);
+                b.push_ptr(vp);
+                b.push_ptr(gp);
+                b.push_ptr(bp);
+                b.push_ptr(sp);
+                b.push_ptr(op);
+                b.push_i32(nt);
+                b.push_i32(nh);
+                b.push_i32(hd);
+                b
+            },
+        )
     }
 
     /// GDN recurrence with Q8-quantized S state — tiled LDS + warp-shuffle.

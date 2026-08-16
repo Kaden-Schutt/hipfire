@@ -924,6 +924,15 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             write(56),
             write(80),
         ]),
+        "gated_delta_net_f32" => Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            read(32),
+            write(40),
+            write(48),
+        ]),
         "gated_norm_f32" => Some(vec![read(0), read(8), read(16), write(24)]),
         "gated_norm_mq_rotate_gfx1100" | "gated_norm_mq_rotate_gfx1151" => Some(vec![
             read(0),
@@ -1323,7 +1332,31 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "fused_qkvza_hfq4g256_ldsx8"
         | "fused_qkvza_hfq4g256_reduce_chain"
         | "gated_delta_net_q8_fast" => Some(96),
+        "gated_delta_net_f32" => Some(80),
         _ => None,
+    }
+}
+
+fn apply_qwen_q8_full_attention_visibility(
+    launches: &[RecordedHipLaunch],
+    headers: &mut [HeaderPolicy],
+) {
+    // The Q8 full-attention body carries intermediate Q/K/V, tile reductions,
+    // and the gated attention result through separate global-memory buffers.
+    // Same-queue barriers alone reproduced stale intermediates on gfx1201;
+    // restoring the captured HIP dispatches' system scopes for this narrow
+    // body makes the multi-position AQL state/logit/KV shadow bit-exact.
+    debug_assert_eq!(launches.len(), headers.len());
+    let mut full_attention_body = false;
+    for (launch, header) in launches.iter().zip(headers) {
+        let kernel = launch.kernel.as_str();
+        full_attention_body |= kernel == "fused_qkv_hfq4g256";
+        if full_attention_body {
+            *header = HeaderPolicy::RECORDED_DISPATCH;
+        }
+        if full_attention_body && kernel == "gemv_hfq4g256_residual" {
+            full_attention_body = false;
+        }
     }
 }
 
@@ -3260,6 +3293,13 @@ impl ReplayController {
         self.request != ReplayBackendRequest::Hip && self.state != ReplayState::Fallback
     }
 
+    /// Whether this controller owns the production one-shot capture lifecycle.
+    /// Manual shadow/profiling controllers deliberately remain available for
+    /// diagnosing routes which are not yet safe for automatic serving.
+    pub fn automatic_lifecycle_enabled(&self) -> bool {
+        self.auto_lifecycle
+    }
+
     pub fn should_auto_finalize_capture(&self) -> bool {
         self.auto_lifecycle && self.is_recording()
     }
@@ -3467,6 +3507,7 @@ impl ReplayController {
                 _ => {}
             }
         }
+        apply_qwen_q8_full_attention_visibility(&self.recorded[..prefix], &mut headers);
         let graph = if self.request == ReplayBackendRequest::Auto {
             SingleQueueBatchGraph::create_unprofiled_with_dispatch_headers(
                 &device,
@@ -5082,6 +5123,48 @@ mod tests {
 
         assert!(expected_kernarg_bytes("unknown_kernel_xyz").is_none());
         assert!(pointer_effects("unknown_kernel_xyz").is_none());
+    }
+
+    #[test]
+    fn deltanet_f32_retained_effect_contract_covers_recurrent_state() {
+        assert_eq!(expected_kernarg_bytes("gated_delta_net_f32"), Some(80));
+        let effects = pointer_effects("gated_delta_net_f32").expect("GDN FP32 contract");
+        assert_eq!(effects.len(), 7);
+        assert_eq!(effects[5].offset, 40);
+        assert_eq!(effects[5].mode, RecordedAccessMode::Write);
+        assert_eq!(effects[6].offset, 48);
+        assert_eq!(effects[6].mode, RecordedAccessMode::Write);
+    }
+
+    #[test]
+    fn qwen_q8_full_attention_aql_body_uses_system_visibility() {
+        let launch = |kernel: &str| RecordedHipLaunch {
+            kernel: kernel.to_owned(),
+            artifact: None,
+            grid: [1; 3],
+            block: [32, 1, 1],
+            shared_mem: 0,
+            grid_binding: None,
+            kernarg: Vec::new(),
+            accesses: None,
+        };
+        let launches = vec![
+            launch("before"),
+            launch("fused_qkv_hfq4g256"),
+            launch("attention_flash_q8_0_tile"),
+            launch("attention_flash_q8_0_reduce"),
+            launch("gemv_hfq4g256_residual"),
+            launch("after"),
+        ];
+        let mut headers = vec![HeaderPolicy::BATCH_BOUNDARY_INTERNAL_SERIAL; launches.len()];
+
+        apply_qwen_q8_full_attention_visibility(&launches, &mut headers);
+
+        assert_eq!(headers[0], HeaderPolicy::BATCH_BOUNDARY_INTERNAL_SERIAL);
+        assert!(headers[1..=4]
+            .iter()
+            .all(|header| *header == HeaderPolicy::RECORDED_DISPATCH));
+        assert_eq!(headers[5], HeaderPolicy::BATCH_BOUNDARY_INTERNAL_SERIAL);
     }
 
     #[test]
