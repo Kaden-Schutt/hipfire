@@ -51,6 +51,23 @@ import time
 AMD_SMI = "/opt/rocm/core-7.14/bin/amd-smi"
 
 
+def vram_used_total_mib(devices: list[int]) -> int | None:
+    """Summed used VRAM across devices.
+
+    Pipeline parallelism spreads one model over several GPUs, so a per-device
+    sample can look flat while another card leaks. `skeleton_pp` sets four
+    multi-GPU fields as a unit precisely because dropping one leaks silently,
+    and a single-device probe would not see it.
+    """
+    total = 0
+    for d in devices:
+        v = vram_used_mib(d)
+        if v is None:
+            return None
+        total += v
+    return total
+
+
 def vram_used_mib(device: int = 0) -> int | None:
     """Used VRAM in MiB, or None when no probe is available.
 
@@ -74,7 +91,9 @@ def vram_used_mib(device: int = 0) -> int | None:
     return None
 
 
-def cycle(daemon: str, model: str, max_seq: int, cycles: int, device: int) -> int:
+def cycle(
+    daemon: str, model: str, max_seq: int, cycles: int, devices: list[int], pp: int
+) -> int:
     env = dict(os.environ)
     env["HOME"] = env.get("VRAM_HARNESS_HOME", "/home/kaden/.vram-harness")
     os.makedirs(os.path.join(env["HOME"], ".hipfire"), exist_ok=True)
@@ -106,13 +125,18 @@ def cycle(daemon: str, model: str, max_seq: int, cycles: int, device: int) -> in
                 return None
         return None
 
-    baseline = vram_used_mib(device)
+    baseline = vram_used_total_mib(devices)
     print(f"  baseline used VRAM: {baseline if baseline is not None else 'unavailable'} MiB")
     deltas: list[int] = []
     rc = 0
 
     for i in range(1, cycles + 1):
-        send({"type": "load", "model": model, "params": {"max_seq": max_seq}})
+        params: dict = {"max_seq": max_seq}
+        if pp > 1:
+            # pp is reachable only through the daemon's load params -- there is
+            # no `serve --pp` flag -- and is Qwen3.5 dense/MoE only.
+            params["pp"] = pp
+        send({"type": "load", "model": model, "params": params})
         if await_kind("loaded") is None:
             print(f"  cycle {i}: load FAILED")
             rc = 2
@@ -123,7 +147,7 @@ def cycle(daemon: str, model: str, max_seq: int, cycles: int, device: int) -> in
             rc = 2
             break
         time.sleep(2.0)  # let the allocator settle before sampling
-        after = vram_used_mib(device)
+        after = vram_used_total_mib(devices)
         if baseline is None or after is None:
             print(f"  cycle {i}: ok (no VRAM probe)")
             continue
@@ -176,13 +200,15 @@ def main() -> int:
     ap.add_argument("--model", required=True)
     ap.add_argument("--cycles", type=int, default=5)
     ap.add_argument("--max-seq", type=int, default=4096)
-    ap.add_argument("--device", type=int, default=0)
+    ap.add_argument("--devices", default="0", help="comma-separated, e.g. 0,1,2,3")
+    ap.add_argument("--pp", type=int, default=1, help="pipeline-parallel degree")
     a = ap.parse_args()
     if not os.path.exists(a.daemon):
         print(f"daemon not found: {a.daemon}")
         return 2
-    print(f"  model: {a.model}")
-    return cycle(a.daemon, a.model, a.max_seq, a.cycles, a.device)
+    devices = [int(x) for x in a.devices.split(",") if x.strip() != ""]
+    print(f"  model: {a.model}  pp={a.pp}  devices={devices}")
+    return cycle(a.daemon, a.model, a.max_seq, a.cycles, devices, a.pp)
 
 
 if __name__ == "__main__":
