@@ -100,8 +100,21 @@ def main(src, dst, keep_suffix=".imatrix"):
     meta_bytes = json.dumps(new_meta, separators=(",", ":")).encode()
 
     index = b"".join(e[5] for _, e in keep)
+
+    # The 32-byte header carries counts/offsets that the index rewrite
+    # invalidates (hfq.rs:272-280): n_tensors at [12,16), metadata_offset at
+    # [16,24), data_offset at [24,32). Copying it verbatim leaves n_tensors at
+    # the original count and the loader rejects the file with
+    # "index count N != header M" — and a stale data_offset would be worse,
+    # silently reading payloads from the wrong place.
+    hdr = bytearray(head[:32])
+    data_off = 32 + len(meta_bytes) + 4 + len(index)
+    struct.pack_into("<I", hdr, 12, len(keep))
+    struct.pack_into("<Q", hdr, 16, 32)
+    struct.pack_into("<Q", hdr, 24, data_off)
+
     out = open(dst, "wb")
-    out.write(head[:32])
+    out.write(bytes(hdr))
     out.write(meta_bytes)
     out.write(struct.pack("<I", len(keep)))
     out.write(index)
