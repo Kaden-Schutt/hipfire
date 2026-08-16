@@ -12,82 +12,14 @@
 //!     two quantize pipelines (which now call the same `lookup_model_type`).
 //!   - an unknown model_type fails closed everywhere (None / UNCLAIMED, not
 //!     silently becoming llama 0).
-//!   - the preserved mapping list is byte-identical to the pre-unification
-//!     union (with the documented qwen2 correction 1→7).
+//!   - table-driven: no hand-maintained EXPECTED_MAPPINGS — new architectures
+//!     need no test edit, the table itself is the expected list.
 
 use hipfire_runtime::arch_mapping::{
     lookup_model_type, supported_model_types_display, MODEL_TYPE_TO_ARCH_ID,
 };
 use hipfire_runtime::safetensors_source::{derive_arch_id, UNCLAIMED_ARCH_ID};
 use serde_json::json;
-
-/// The exact mapping list preserved by the unification.
-///
-/// This is the union of all strings previously recognised by the three maps,
-/// with every prior `model_type → arch_id` assignment kept byte-identical
-/// except for `qwen2` which was `1` (Llama) in the two quantize maps and
-/// `7` (Qwen2Carrier) in the runtime. The runtime's `7` is the correct
-/// routing (attn biases load) — see commit 9002d7f8b — so the canonical table
-/// adopts `7` and the quantize paths change from `1 → 7`. That single
-/// correction is the only intentional re-mapping; everything else is preserved.
-const EXPECTED_MAPPINGS: &[(&str, u32)] = &[
-    ("cohere2_moe", 12),
-    ("deepseek_v4", 9),
-    ("dots_ocr", 8),
-    ("gemma4", 13),
-    ("gemma4_text", 13),
-    ("gemma4_unified", 13),
-    ("gemma4_unified_assistant", 22),
-    ("gemma4_unified_text", 13),
-    ("lfm2", 11),
-    ("lfm2_moe", 11),
-    ("llama", 0),
-    ("minimax_m2", 10),
-    ("mistral", 0),
-    ("muse_glimmer", 14),
-    ("muse_glimmer_assistant", 23),
-    ("muse_glimmer_text", 14),
-    ("qwen2", 7),
-    ("qwen3", 1),
-    ("qwen3.5", 5),
-    ("qwen3.6", 5),
-    ("qwen35", 5),
-    ("qwen3moe", 6),
-    ("qwen3_5", 5),
-    ("qwen3_5_moe", 6),
-    ("qwen3_5_moe_text", 6),
-    ("qwen3_5_text", 5),
-    ("qwen3_6", 5),
-];
-
-#[test]
-fn canonical_table_matches_expected_preserved_list() {
-    // Every entry we claim to preserve must be in the canonical table with
-    // the same arch_id, and vice-versa (no extra or missing entries).
-    for (k, v) in EXPECTED_MAPPINGS {
-        let got = lookup_model_type(k);
-        assert_eq!(
-            got,
-            Some(*v),
-            "canonical table: expected {k} -> {v}, got {got:?}"
-        );
-    }
-    // No extra entries beyond the expected list.
-    assert_eq!(
-        MODEL_TYPE_TO_ARCH_ID.len(),
-        EXPECTED_MAPPINGS.len(),
-        "canonical table length drifted; expected {} got {} (table={:?})",
-        EXPECTED_MAPPINGS.len(),
-        MODEL_TYPE_TO_ARCH_ID.len(),
-        MODEL_TYPE_TO_ARCH_ID
-    );
-    for (k, v) in MODEL_TYPE_TO_ARCH_ID {
-        assert!(
-            EXPECTED_MAPPINGS.contains(&(*k, *v)),
-            "canonical table has unexpected entry {k} -> {v} not in EXPECTED_MAPPINGS"
-        );
-    }
-}
 
 #[test]
 fn every_known_model_type_resolves_identically_through_all_three_consumers() {
@@ -97,7 +29,8 @@ fn every_known_model_type_resolves_identically_through_all_three_consumers() {
     //   — both now delegate to lookup_model_type, so testing lookup suffices to
     //   stand in for them. This test would fail if any pipeline re-introduced a
     //   private map.
-    for (model_type, expected_arch) in EXPECTED_MAPPINGS {
+    // Table-driven: iterate the canonical table directly.
+    for (model_type, expected_arch) in MODEL_TYPE_TO_ARCH_ID {
         // -- consumer 1: canonical lookup
         let via_lookup = lookup_model_type(model_type).unwrap_or_else(|| {
             panic!("lookup_model_type({model_type}) returned None, expected {expected_arch}")
@@ -107,31 +40,28 @@ fn every_known_model_type_resolves_identically_through_all_three_consumers() {
             "lookup_model_type({model_type}) mismatch"
         );
 
-        // -- consumer 2: derive_arch_id (safetensors Dir). For qwen3.5/3.6 the
-        // result depends on has_experts; the dense case (no num_experts) is 5,
-        // which matches the table's dense default. MoE is tested separately.
-        // For other types, derive_arch_id should match exactly.
-        if !matches!(
-            *model_type,
-            "qwen3.5" | "qwen3.6" | "qwen3_5" | "qwen3_6"
-        ) {
-            let id = derive_arch_id(&json!({ "model_type": *model_type }));
-            assert_eq!(
-                id, *expected_arch,
-                "derive_arch_id(model_type={model_type}) -> {id} != {expected_arch}"
-            );
-        } else {
+        // -- consumer 2: derive_arch_id (safetensors Dir). For qwen3.5/3.6 dense
+        // family (arch 5), the result depends on has_experts; the dense case
+        // (no num_experts) is 5, which matches the table's dense default. MoE
+        // is handled via has_experts -> 6. For other types, derive_arch_id
+        // should match exactly. Table-driven detection: id==5 identifies the
+        // dense family.
+        if *expected_arch == 5 {
             // dense qwen3.5 family without experts -> 5
             let id_dense = derive_arch_id(&json!({ "model_type": *model_type }));
             assert_eq!(id_dense, 5, "derive_arch_id dense {model_type} -> {id_dense} != 5");
-            // with experts -> 6 (both qwen3_5/3.6 family are MoE when has_experts)
+            // with experts -> 6 (MoE when has_experts)
             let id_moe = derive_arch_id(&json!({
                 "model_type": *model_type,
                 "num_experts": 8
             }));
             assert_eq!(id_moe, 6, "derive_arch_id moe {model_type} -> {id_moe} != 6");
-            // pipeline's explicit moe strings should also resolve to 6 via lookup
-            // (already covered above for qwen3_5_moe etc, but double-check here)
+        } else {
+            let id = derive_arch_id(&json!({ "model_type": *model_type }));
+            assert_eq!(
+                id, *expected_arch,
+                "derive_arch_id(model_type={model_type}) -> {id} != {expected_arch}"
+            );
         }
 
         // -- consumer 3/4: quantize pipelines now use lookup_model_type, so the

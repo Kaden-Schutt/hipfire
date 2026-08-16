@@ -202,8 +202,19 @@ pub fn derive_arch_id(config: &serde_json::Value) -> u32 {
         .unwrap_or(0)
         > 0;
 
+    // Architectures field takes priority over model_type (HF convention).
+    // This loop is table-driven: any known model_type substring inside the
+    // architecture string is resolved via the canonical table, longest key
+    // wins so gemma4_unified_assistant (22) beats gemma4 (13) and
+    // muse_glimmer_assistant (23) beats muse_glimmer (14). The table alone
+    // cannot express the priority ordering nor the qwen3.5/3.6 dense-vs-MoE
+    // has_experts decision, so those remain explicit.
     for arch in &archs {
         let arch_lower = arch.to_lowercase();
+        // qwen3.5/3.6 family: dense (5) vs MoE (6) decided by has_experts.
+        // This is the only per-arch substring check that must remain: the
+        // table maps the four dense strings to 5, but a MoE checkpoint uses
+        // the same strings with num_experts>0 to mean 6.
         if arch_lower.contains("qwen3_5")
             || arch_lower.contains("qwen3.5")
             || arch_lower.contains("qwen3_6")
@@ -211,49 +222,33 @@ pub fn derive_arch_id(config: &serde_json::Value) -> u32 {
         {
             return if has_experts { 6 } else { 5 };
         }
-        // qwen2 → arch_id=7 (Qwen2Carrier loads the Q/K/V attention biases the
-        // llama-family Dir loader drops); qwen3 → arch_id=1 (LlamaCarrier).
-        if arch_lower.contains("qwen2") {
-            return 7;
+        // Generic table-driven substring match for all other architectures.
+        let mut best: Option<(&'static str, u32)> = None;
+        for (k, v) in crate::arch_mapping::MODEL_TYPE_TO_ARCH_ID {
+            if arch_lower.contains(*k) {
+                match best {
+                    Some((bk, _)) if k.len() <= bk.len() => {}
+                    _ => best = Some((*k, *v)),
+                }
+            }
         }
-        if arch_lower.contains("qwen3") {
-            return 1;
-        }
-        if arch_lower.contains("llama") || arch_lower.contains("mistral") {
-            return 0;
-        }
-        if arch_lower.contains("gemma4_unified_assistant") {
-            return 22;
-        }
-        if arch_lower.contains("gemma4") {
-            return 13;
-        }
-        if arch_lower.contains("muse_glimmer_assistant") {
-            return 23;
-        }
-        if arch_lower.contains("muse_glimmer") {
-            return 14;
+        if let Some((_, id)) = best {
+            return id;
         }
     }
 
     // Fallback: check model_type via the canonical table (single source of truth).
-    // qwen3.5/3.6 family is special: arch 5 (dense) vs 6 (MoE) is decided by
-    // has_experts rather than a distinct model_type string. The table maps those
-    // four strings to 5 (dense default); we override to 6 when experts present
-    // so both `qwen3_5` + num_experts and the explicit `qwen3_5_moe` strings
-    // route correctly. All other model_types go through the canonical lookup.
     let model_type = config
         .get("model_type")
         .or_else(|| text_config.get("model_type"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    // qwen3.5/3.6 dense vs MoE determined by num_experts (HF convention).
-    if matches!(model_type, "qwen3_5" | "qwen3.5" | "qwen3_6" | "qwen3.6") {
-        return if has_experts { 6 } else { 5 };
-    }
-
-    if let Some(id) = crate::arch_mapping::lookup_model_type(model_type) {
+    if let Some(mut id) = crate::arch_mapping::lookup_model_type(model_type) {
+        // qwen3.5/3.6 dense entries are 5 in the table; has_experts flips to 6.
+        if id == 5 && has_experts {
+            id = 6;
+        }
         return id;
     }
 

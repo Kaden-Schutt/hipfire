@@ -30,9 +30,7 @@ impl ArchModel for Lfm2MoeBundle {
     }
 
     fn reset_session_state(&mut self, gpu: &mut Gpu) -> Result<(), String> {
-        self.state.reset(gpu)?;
-        self.state.kv.compact_offset = 0;
-        Ok(())
+        self.state.reset(gpu)
     }
 
     fn free_gpu(self: Box<Self>, gpu: &mut Gpu) {

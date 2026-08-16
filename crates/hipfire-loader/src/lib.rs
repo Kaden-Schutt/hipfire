@@ -504,6 +504,11 @@ impl hipfire_runtime::arch_model::ArchModel for MuseGlimmerBundle {
         // runtime `KvCache` directly, so there is nothing to hand back.
         None
     }
+    fn reset_session_state(&mut self, _gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
+        // Mirrors daemon reset arms (main.rs:3339 / 3390): `bundle.reset_session_state()`.
+        MuseGlimmerBundle::reset_session_state(self);
+        Ok(())
+    }
     fn free_gpu(self: Box<Self>, gpu: &mut rdna_compute::Gpu) {
         // This WAS the `ModelState::MuseGlimmer` arm of `unload_model`, moved
         // verbatim, drafter first. Per PR #566: freeing only one of
@@ -540,6 +545,11 @@ impl hipfire_runtime::arch_model::ArchModel for Gemma4Bundle {
     }
     fn kv_cache_mut(&mut self) -> Option<&mut hipfire_runtime::llama::KvCache> {
         None
+    }
+    fn reset_session_state(&mut self, _gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
+        // Mirrors daemon reset arms (main.rs:3336 / 3387): `bundle.state.reset()`.
+        self.state.reset();
+        Ok(())
     }
     fn free_gpu(self: Box<Self>, gpu: &mut rdna_compute::Gpu) {
         let b = *self;
