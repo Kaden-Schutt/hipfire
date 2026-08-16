@@ -581,11 +581,12 @@ ROUTES: dict[str, Route] = {
             "scripts/redline_daemon_harness.py",
             "--model",
             "{model}",
+            "--skip-prefill",
             "--out",
             "{out}",
         ),
         8.0,
-        "Resident-daemon Redline phase fingerprint + shadow/parity "
+        "Resident-daemon Redline decode fingerprint + shadow/parity "
         "(scripts/redline_daemon_harness.py; docs/VALIDATION.md retained replay claim — "
         "discovery evidence, not product PM4/AQL route proof without REDLINE.md ladder).",
         models=("qwen3.5-4b.mq4",),
