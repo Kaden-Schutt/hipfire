@@ -104,14 +104,9 @@ fn gfx1010_dependency_policy_from_config(
     device_name: &str,
 ) -> Result<Gfx1010DependencyPolicy, String> {
     let raw = hipfire_config::process_value("HIPFIRE_REPLAY_PM4_GFX1010_DEPENDENCY");
-    let policy =
-        gfx1010_dependency_policy_from_value(architecture, device_name, raw.as_deref())?;
+    let policy = gfx1010_dependency_policy_from_value(architecture, device_name, raw.as_deref())?;
     if gfx1010_release_wait_required(architecture, device_name) {
-        let source = if raw.is_none() {
-            "default"
-        } else {
-            "explicit"
-        };
+        let source = if raw.is_none() { "default" } else { "explicit" };
         eprintln!("[redline] gfx1010 PM4 dependency mode={policy:?} ({source})");
     }
     Ok(policy)
@@ -4852,8 +4847,7 @@ mod tests {
     #[test]
     fn gfx1010_dependency_policy_defaults_to_release_wait() {
         assert_eq!(
-            gfx1010_dependency_policy_from_value(Pm4Architecture::Gfx10, "gfx1010", None)
-                .unwrap(),
+            gfx1010_dependency_policy_from_value(Pm4Architecture::Gfx10, "gfx1010", None).unwrap(),
             Gfx1010DependencyPolicy::ReleaseWait
         );
         assert_eq!(
@@ -4894,12 +4888,9 @@ mod tests {
             "true",
             "falsé",
         ] {
-            let err = gfx1010_dependency_policy_from_value(
-                Pm4Architecture::Gfx10,
-                "gfx1010",
-                Some(raw),
-            )
-            .unwrap_err();
+            let err =
+                gfx1010_dependency_policy_from_value(Pm4Architecture::Gfx10, "gfx1010", Some(raw))
+                    .unwrap_err();
             assert!(
                 err.contains("HIPFIRE_REPLAY_PM4_GFX1010_DEPENDENCY"),
                 "missing key in error for {raw:?}: {err}"

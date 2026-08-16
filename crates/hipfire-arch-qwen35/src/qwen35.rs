@@ -436,7 +436,10 @@ impl MropeCtx {
             "MropeCtx::pos3 called below base ({pos} < {})",
             self.base
         );
-        match pos.checked_sub(self.base).and_then(|i| self.positions.get(i)) {
+        match pos
+            .checked_sub(self.base)
+            .and_then(|i| self.positions.get(i))
+        {
             Some(p) => *p,
             None => [pos as i32 + self.rope_delta; 3],
         }
@@ -18063,7 +18066,9 @@ pub fn forward_scratch_mrope(
     mrope: Option<&MropeCtx>,
 ) -> HipResult<()> {
     let Some(mc) = mrope else {
-        return forward_scratch(gpu, weights, config, token, pos, kv_cache, dn_state, scratch);
+        return forward_scratch(
+            gpu, weights, config, token, pos, kv_cache, dn_state, scratch,
+        );
     };
     mark_mrope_forward_ineligible(gpu);
     // Embedding lookup into scratch.x + the 1D pos scalar (still consumed by
