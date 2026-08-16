@@ -2,6 +2,25 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
+//! ## Status: intra-crate helper, NOT the architecture contract
+//!
+//! This trait once competed with `hipfire_loader::Carrier` to be "the" arch
+//! contract. It no longer does, and the distinction matters when adding a model:
+//!
+//! - **The contract** is `Carrier` (registration + load, in the loader because
+//!   `Carrier::load` returns `LoadedModel`) plus
+//!   [`crate::arch_model::ArchModel`] (the arch-agnostic view of a loaded model,
+//!   implemented in the arch crate).
+//! - **This trait** is a typed bring-up convenience — associated
+//!   `Config`/`Weights`/`State` plus `config_from_hfq` / `load_weights` /
+//!   `new_state`. It is used only *within* arch crates, by their own
+//!   `load_<arch>_bundle` functions. Measured: zero consumers in
+//!   `hipfire-loader`, `hipfire-generate` or `hipfire-daemon`.
+//!
+//! It is therefore optional. `hipfire-arch-muse-glimmer` implements it not at
+//! all and loads fine. Adopt it if the typed shape helps your crate; skip it if
+//! it does not. Its four override hooks were deleted as dead in an earlier pass.
+//!
 //! The bring-up contract for a hipfire architecture. Implement this
 //! trait in your arch crate (e.g. `hipfire-arch-qwen35`) to plug a
 //! model into the runtime. Generation, sampling, eviction, spec
