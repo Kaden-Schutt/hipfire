@@ -1729,30 +1729,12 @@ fn main() {
                         }
                         let vl = m.vision_config.is_some() || m.dots_ocr_config.is_some();
                         let (dim, layers, vocab) = match m.state.as_ref() {
-                            Some(ModelState::Qwen35(b)) => {
-                                (b.config.dim, b.config.n_layers, b.config.vocab_size)
+                            Some(st) => {
+                                let arch = st.as_arch_model();
+                                (arch.dim(), arch.n_layers(), arch.vocab_size())
                             }
-                            Some(ModelState::Llama(b)) => {
-                                (b.config.dim, b.config.n_layers, b.config.vocab_size)
-                            }
-                            Some(ModelState::Qwen2(b)) => (
-                                b.config.hidden_size,
-                                b.config.num_hidden_layers,
-                                b.config.vocab_size,
-                            ),
-                            Some(ModelState::Cohere2Moe(b)) => (
-                                b.config.hidden_size,
-                                b.config.num_hidden_layers,
-                                b.config.vocab_size,
-                            ),
-                            Some(ModelState::Gemma4(b)) => {
-                                (b.config.dim, b.config.n_layers, b.config.vocab_size)
-                            }
-                            Some(ModelState::MuseGlimmer(b)) => {
-                                (b.config.dim, b.config.n_layers, b.config.vocab_size)
-                            }
-                            _ => {
-                                if let Some(ref c) = m.dots_ocr_config {
+                            None => {
+                                if let Some(c) = &m.dots_ocr_config {
                                     (
                                         c.text.hidden_size,
                                         c.text.num_hidden_layers,
@@ -2456,7 +2438,7 @@ fn main() {
                             }
                         }
                         // qwen35(-vl) recurrent state lives in the bundle
-                        // (ModelState::Qwen35). There is no
+                        // (qwen35 arch bundle, accessed via ArchModel). There is no
                         // `LoadedModel.dn_state` — it was removed as vestigial
                         // (always None); the live DeltaNet state is inside the
                         // bundle. `m.kv_cache` is likewise vestigial on this path.
@@ -2477,8 +2459,8 @@ fn main() {
                         if let Some(ref mut s) = m.qwen2_state {
                             s.reset();
                         }
-                        // Live plain-qwen2 state is in the ModelState::Qwen2
-                        // bundle, not the (dots-ocr-only) qwen2_state field —
+                        // Live plain-qwen2 state is in the qwen2 arch bundle
+                        // (not the (dots-ocr-only) qwen2_state field) —
                         // rewind it too for defense-in-depth.
                         if let Some(b) = m.qwen2_mut() {
                             b.state.reset();
@@ -3330,15 +3312,16 @@ fn main() {
 
                 // Reset state BEFORE timing so we're measuring cold prefill, not
                 // prefill-on-top-of-prior-state. qwen35 recurrent state lives in
-                // the bundle (ModelState::Qwen35); `LoadedModel.dn_state` was
-                // removed (was always None) — the live DeltaNet state is in the bundle.
+                // the bundle (qwen35 arch bundle, accessed via ArchModel);
+                // `LoadedModel.dn_state` was removed (was always None) — the live
+                // DeltaNet state is in the bundle.
                 m.seq_pos = 0;
                 m.conversation_tokens.clear();
                 let _ = hipfire_generate::common::reset_qwen35_recurrent(m, &mut gpu);
                 // Qwen2 (arch_id=7) doesn't have a separate KV buffer — the cache
                 // and the per-step scratch share `Qwen2State`. Reset its position
                 // cursor here so bench_prefill measures cold prefill. The live
-                // state is in the ModelState::Qwen2 bundle; `qwen2_state` is only
+                // state is in the qwen2 arch bundle; `qwen2_state` is only
                 // dots-ocr's — rewind both, else this measures warm prefill.
                 if let Some(ref mut s) = m.qwen2_state {
                     s.reset();
@@ -3384,8 +3367,9 @@ fn main() {
 
                 // Reset state AFTER measurement — we've written N KV slots and a
                 // DeltaNet state that the next real request must not inherit.
-                // qwen35 recurrent state lives in the bundle (ModelState::Qwen35),
-                // not the always-None m.dn_state.
+                // qwen35 recurrent state lives in the bundle (qwen35 arch bundle,
+                // accessed via ArchModel); `LoadedModel.dn_state` was removed
+                // (was always None).
                 m.seq_pos = 0;
                 m.conversation_tokens.clear();
                 let _ = hipfire_generate::common::reset_qwen35_recurrent(m, &mut gpu);

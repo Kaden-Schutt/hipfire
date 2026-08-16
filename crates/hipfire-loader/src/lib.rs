@@ -14,6 +14,7 @@ pub use carriers::*;
 pub mod spec_build;
 
 use hipfire_arch_cohere2moe as cohere2moe;
+use hipfire_runtime::arch_model::ArchModel;
 use hipfire_runtime::llama::KvCacheExt;
 use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_dots_ocr::dots_ocr;
@@ -448,8 +449,10 @@ impl AsstTurnCache {
 /// (vestigial `dn_state` was removed — the live DeltaNet state lives in the
 /// Qwen3.5 bundle inside `ModelState::Qwen35`).
 ///
-/// `unload_model` matches this exhaustively with NO wildcard: adding a variant
-/// without a teardown arm is a compile error, which is the whole point of
+/// The pp>1 path of `unload_model` still matches this exhaustively with NO
+/// wildcard; the single-GPU path tears down via `ArchModel::free_gpu`, whose
+/// per-variant impls are also exhaustive. Either way, adding a variant without
+/// teardown is a compile error, which is the whole point of
 /// folding self-contained arch state in here rather than leaving it as loose
 /// `Option<…>` fields that a reload can silently leak.
 pub enum ModelState {
@@ -491,9 +494,10 @@ impl hipfire_runtime::arch_model::ArchModel for MuseGlimmerBundle {
         None
     }
     fn free_gpu(self: Box<Self>, gpu: &mut rdna_compute::Gpu) {
-        // Mirrors the `ModelState::MuseGlimmer` arm of `unload_model` exactly,
-        // drafter first. Per PR #566: freeing only one of state/weights leaks
-        // ~1.3 GB over five load cycles, so both sides are mandatory.
+        // This WAS the `ModelState::MuseGlimmer` arm of `unload_model`, moved
+        // verbatim, drafter first. Per PR #566: freeing only one of
+        // state/weights leaks ~1.3 GB over five load cycles, so both sides
+        // are mandatory.
         let b = *self;
         if let Some(drafter) = b.drafter {
             drafter.scratch.free_gpu(gpu);
@@ -631,6 +635,48 @@ impl ModelState {
             ModelState::Deepseek4(b) => b,
             ModelState::Deepseek4Heterogeneous(b) => b,
             ModelState::MuseGlimmer(b) => b,
+        }
+    }
+}
+
+/// `ArchModel` for the enum itself, so teardown can consume it as
+/// `Box<dyn ArchModel>` (`Box::new(state).free_gpu(gpu)` in `unload_model`).
+/// Scalar methods forward through the adapters above; `free_gpu` re-boxes the
+/// inner bundle and dispatches to the variant impl, which is where each free
+/// sequence actually lives. This match moves ownership — it is the third and
+/// last exhaustive destructure alongside the two adapters.
+impl hipfire_runtime::arch_model::ArchModel for ModelState {
+    fn dim(&self) -> usize {
+        self.as_arch_model().dim()
+    }
+    fn n_layers(&self) -> usize {
+        self.as_arch_model().n_layers()
+    }
+    fn vocab_size(&self) -> usize {
+        self.as_arch_model().vocab_size()
+    }
+    fn arch_key(&self) -> &'static str {
+        self.as_arch_model().arch_key()
+    }
+    fn kv_cache_mut(&mut self) -> Option<&mut hipfire_runtime::llama::KvCache> {
+        self.as_arch_model_mut().kv_cache_mut()
+    }
+    fn reset_session_state(&mut self, gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
+        self.as_arch_model_mut().reset_session_state(gpu)
+    }
+    fn free_gpu(self: Box<Self>, gpu: &mut rdna_compute::Gpu) {
+        match *self {
+            ModelState::Qwen2(b) => Box::new(b).free_gpu(gpu),
+            ModelState::Qwen35(b) => Box::new(b).free_gpu(gpu),
+            ModelState::Llama(b) => Box::new(b).free_gpu(gpu),
+            ModelState::Lfm2Moe(b) => Box::new(b).free_gpu(gpu),
+            ModelState::Minimax(b) => Box::new(b).free_gpu(gpu),
+            ModelState::Cohere2Moe(b) => Box::new(b).free_gpu(gpu),
+            ModelState::Gemma4(b) => Box::new(b).free_gpu(gpu),
+            ModelState::Gemma4Lowered(b) => Box::new(b).free_gpu(gpu),
+            ModelState::Deepseek4(b) => Box::new(b).free_gpu(gpu),
+            ModelState::Deepseek4Heterogeneous(b) => Box::new(b).free_gpu(gpu),
+            ModelState::MuseGlimmer(b) => Box::new(b).free_gpu(gpu),
         }
     }
 }
@@ -3194,81 +3240,18 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
     if let Some(batch_state) = m.lfm2_decode_batch.take() {
         batch_state.free_gpu(gpu);
     }
-    // Free arch-specific GPU state from the carrier bundle
+    // Free arch-specific GPU state from the carrier bundle. Each variant's
+    // free sequence lives in its `ArchModel::free_gpu` impl (verified arm-by-arm
+    // against the match this call replaced); the enum impl only re-boxes.
     if let Some(state) = m.state {
-        match state {
-            ModelState::Qwen2(b) => {
-                b.state.free_gpu(gpu);
-                b.weights.free_gpu(gpu);
-            }
-            ModelState::Qwen35(b) => {
-                note(b.kv_cache.free_gpu(gpu).map_err(|e| e.to_string()));
-                b.scratch.free_gpu(gpu);
-                b.weights.free_gpu(gpu);
-                b.dn_state.free_gpu(gpu);
-            }
-            ModelState::Llama(b) => {
-                b.scratch.free_gpu(gpu);
-                b.weights.free_gpu(gpu);
-                note(b.kv.free_gpu(gpu).map_err(|e| e.to_string()));
-            }
-            ModelState::Lfm2Moe(b) => {
-                b.state.free_gpu(gpu);
-                b.weights.free_gpu(gpu);
-            }
-            ModelState::Minimax(b) => {
-                b.state.free_gpu(gpu);
-                b.weights.free_gpu(gpu);
-            }
-            ModelState::Cohere2Moe(b) => {
-                b.state.free_gpu(gpu);
-                b.weights.free_gpu(gpu);
-            }
-            ModelState::Gemma4(b) => {
-                if let Some(eagle) = b.eagle {
-                    eagle.spec_scratch.free(gpu);
-                    eagle.drafter_scratch.free_gpu(gpu);
-                    eagle.drafter_weights.free_gpu(gpu);
-                }
-                b.state.free_gpu(gpu);
-                b.weights.free_gpu(gpu);
-            }
-            ModelState::Gemma4Lowered(b) => {
-                b.scratch.free_gpu(gpu);
-                note(b.kv_sliding.free_gpu(gpu).map_err(|e| e.to_string()));
-                note(b.kv_full.free_gpu(gpu).map_err(|e| e.to_string()));
-                b.weights.free_gpu(gpu);
-            }
-            ModelState::Deepseek4(b) => {
-                b.state.free_gpu(gpu);
-                b.weights.free_gpu(gpu);
-            }
-            ModelState::Deepseek4Heterogeneous(b) => {
-                // Self-owned two-device transaction. Dropping `model` frees
-                // each resource on its exact owner and drains both pools.
-                drop(b);
-            }
-            ModelState::MuseGlimmer(b) => {
-                // Glimmer teardown is exactly the PR #566 pattern: free BOTH
-                // the per-layer scratch/KV state AND the weight allocations.
-                // Freeing only one side leaks ~1.3 GB over 5 cycles (the
-                // weights are ~650 MB + state ~650 MB; each reload without
-                // the companion free retains the prior cycle's allocation).
-                if let Some(drafter) = b.drafter {
-                    drafter.scratch.free_gpu(gpu);
-                    drafter.weights.free_gpu(gpu);
-                }
-                b.state.free_gpu(gpu);
-                b.weights.free_gpu(gpu);
-            }
-        }
+        Box::new(state).free_gpu(gpu);
     }
     // Non-core arch weights
     if let Some(s) = m.qwen2_state {
         s.free_gpu(gpu);
     }
     // deepseek4 single-GPU scratch lives outside the bundle (relocated later);
-    // its config/weights/state freed via ModelState::Deepseek4 above.
+    // its config/weights/state freed via the trait free_gpu above.
     if let Some(pbs) = m.deepseek4_pbs {
         pbs.free_gpu(gpu);
     }
