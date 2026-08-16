@@ -2097,6 +2097,19 @@ pub fn load_model_with_kv_backend(
             carrier.name()
         ));
     }
+    // The allowlist above gates on CARRIER, which let `vmm` + `pp>1` through:
+    // qwen35 is allowlisted, so a pipeline-parallel Qwen3.5 load passed it. But
+    // VMM is strictly per-device — `ensure_vmm_ready_for_load` takes a single
+    // `&mut Gpu`, `multi_gpu.rs` has no VMM path at all, and the pp>1 load tail
+    // never mentions it. Refusing here, BEFORE any allocation, beats letting a
+    // single-device KV backend be half-applied to a model spread across devices.
+    if kv_backend == KvBackend::Vmm && ctx.pp > 1 {
+        return Err(
+            "KV backend 'vmm' is single-device and does not support pipeline parallelism (pp>1); \
+             use a different kv_cache backend or load with pp=1"
+                .to_string(),
+        );
+    }
     let mut result = carrier.load(src, &mut ctx)?;
     if result.pp > 1 && result.pp_gpus.is_none() {
         return Err("pp>1 LoadedModel missing pp_gpus — carrier bug".into());
@@ -2213,6 +2226,19 @@ pub fn load_model_with_gemma4_drafter(
             "KV backend 'vmm' currently supports qwen3.5, deepseek4, and Muse Glimmer only (selected carrier: {})",
             carrier.name()
         ));
+    }
+    // The allowlist above gates on CARRIER, which let `vmm` + `pp>1` through:
+    // qwen35 is allowlisted, so a pipeline-parallel Qwen3.5 load passed it. But
+    // VMM is strictly per-device — `ensure_vmm_ready_for_load` takes a single
+    // `&mut Gpu`, `multi_gpu.rs` has no VMM path at all, and the pp>1 load tail
+    // never mentions it. Refusing here, BEFORE any allocation, beats letting a
+    // single-device KV backend be half-applied to a model spread across devices.
+    if kv_backend == KvBackend::Vmm && ctx.pp > 1 {
+        return Err(
+            "KV backend 'vmm' is single-device and does not support pipeline parallelism (pp>1); \
+             use a different kv_cache backend or load with pp=1"
+                .to_string(),
+        );
     }
     let mut result = carrier.load(src, &mut ctx)?;
     if result.pp > 1 && result.pp_gpus.is_none() {
