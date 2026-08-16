@@ -707,6 +707,122 @@ pub struct JinjaChatFrame<'a> {
     pub reasoning_effort: Option<&'a str>,
 }
 
+/// The reasoning-effort rungs hipfire can be asked for, in increasing order.
+/// `auto`/`none` are deliberately absent: `auto` means "leave the Jinja
+/// variable undefined so the template's own default fires", and `none` is
+/// expressed through `enable_thinking = false`, not through an effort value.
+pub const EFFORT_RUNGS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+
+/// What a specific model's chat template will actually accept for
+/// `reasoning_effort`, discovered by rendering it rather than by hardcoding a
+/// per-model table.
+///
+/// A per-arch constant would drift across a 61-model registry, and it would be
+/// a second copy of a fact the template already states. Probing asks the model
+/// itself. It also degrades correctly: a template that ignores
+/// `reasoning_effort` accepts every rung and varies for none of them, which
+/// reports `native == false` and imposes no constraint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffortCapability {
+    /// Rungs from `EFFORT_RUNGS` that render without the template raising.
+    pub supported: Vec<&'static str>,
+    /// True when `reasoning_effort` actually changes the rendered prompt.
+    /// False means the template ignores it, so the caller should fall back to
+    /// the legacy token-budget ladder instead of pretending the dial works.
+    pub native: bool,
+}
+
+impl EffortCapability {
+    /// Project a requested rung onto the rungs this model really has.
+    ///
+    /// Rank-preserving: the lowest supported rung at or above the request, or
+    /// the highest supported rung when the request outranks all of them. So a
+    /// 5-rung request lands on a 3-rung model without inventing a level and
+    /// without silently *lowering* the ask.
+    ///
+    /// Returns `None` when the model is not effort-native or supports nothing,
+    /// which is the caller's signal to use the budget ladder.
+    pub fn project(&self, requested: &str) -> Option<&'static str> {
+        if !self.native || self.supported.is_empty() {
+            return None;
+        }
+        let rank = |v: &str| EFFORT_RUNGS.iter().position(|r| *r == v);
+        // An unknown request (not a rung at all) is passed to the model only if
+        // the model itself accepts it; otherwise there is nothing to project.
+        let want = match rank(requested) {
+            Some(r) => r,
+            None => return self.supported.iter().copied().find(|s| *s == requested),
+        };
+        self.supported
+            .iter()
+            .copied()
+            .filter(|s| rank(s).is_some_and(|r| r >= want))
+            .min_by_key(|s| rank(s).unwrap_or(usize::MAX))
+            .or_else(|| {
+                self.supported
+                    .iter()
+                    .copied()
+                    .max_by_key(|s| rank(s).unwrap_or(0))
+            })
+    }
+}
+
+/// Discover a template's `reasoning_effort` contract by rendering it once with
+/// the variable undefined and once per rung.
+///
+/// Cost is a handful of string renders, paid once at model load. This is the
+/// classifier behind the effort-native / budget-ladder split: a model that
+/// consumes effort gets its own vocabulary, and one that does not keeps the
+/// legacy ladder.
+pub fn probe_effort_capability(tokenizer: &Tokenizer, template: &str) -> EffortCapability {
+    let probe = |effort: Option<&str>| -> Result<String, String> {
+        let frame = JinjaChatFrame {
+            tokenizer,
+            template,
+            system: None,
+            user: "",
+            enable_thinking: true,
+            bos_token: Some(""),
+            reasoning_strength: None,
+            reasoning_effort: effort,
+        };
+        let msgs = vec![Message {
+            role: Role::User,
+            content: "hi".to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_plan: String::new(),
+        }];
+        frame.render_messages(&msgs, None, None)
+    };
+    // Baseline with the variable undefined. If even this fails the template is
+    // unusable for reasons unrelated to effort; report no capability rather
+    // than misattributing the failure to the dial.
+    let baseline = match probe(None) {
+        Ok(b) => b,
+        Err(_) => {
+            return EffortCapability {
+                supported: Vec::new(),
+                native: false,
+            }
+        }
+    };
+    let mut supported = Vec::new();
+    let mut native = false;
+    for rung in EFFORT_RUNGS {
+        if let Ok(rendered) = probe(Some(rung)) {
+            if rendered != baseline {
+                native = true;
+            }
+            supported.push(rung);
+        }
+    }
+    EffortCapability { supported, native }
+}
+
 /// Multi-turn message representation for `JinjaChatFrame::render_messages`.
 ///
 /// The fields are intentionally serialize-friendly so the entire `&[Message]`
@@ -3541,6 +3657,68 @@ SYS:{{ build_system_message(system_message) }}:END
             tool_plan: String::new(),
         }];
         frame.render_messages(&msgs, None, None)
+    }
+
+    // ── effort capability probe (F1 classifier) ─────────────────────────
+    // QWEN38_MINIMAL mirrors the shipped template: accepts exactly
+    // low/medium/xhigh, defaults to xhigh when undefined, raises otherwise.
+
+    #[test]
+    fn probe_reports_qwen38_three_rungs_and_native() {
+        let t = make_tokenizer();
+        let cap = probe_effort_capability(&t, QWEN38_MINIMAL);
+        assert_eq!(
+            cap.supported,
+            vec!["low", "medium", "xhigh"],
+            "high/max must be rejected by the model, not by a hipfire table"
+        );
+        assert!(cap.native, "the template varies on effort, so it is native");
+    }
+
+    #[test]
+    fn probe_reports_not_native_when_template_ignores_effort() {
+        // A thinking template with no reasoning_effort branch at all: every
+        // rung renders, none changes the output. Must degrade to the legacy
+        // budget ladder rather than pretending the dial works.
+        const IGNORES: &str = "\
+{%- for m in messages %}[{{ m.role }}:{{ m.content }}]{%- endfor -%}\
+{%- if add_generation_prompt -%}{{- '<think>\\n' -}}{%- endif -%}";
+        let t = make_tokenizer();
+        let cap = probe_effort_capability(&t, IGNORES);
+        assert_eq!(cap.supported.len(), 5, "a permissive template accepts all");
+        assert!(!cap.native, "invariant output means not effort-native");
+        assert_eq!(cap.project("low"), None, "not native => no projection");
+    }
+
+    #[test]
+    fn projection_is_rank_preserving_onto_a_three_rung_model() {
+        let t = make_tokenizer();
+        let cap = probe_effort_capability(&t, QWEN38_MINIMAL);
+        // Exact rungs survive untouched — medium in particular, which DS4's
+        // hardcoded table folds into low and would erase here.
+        assert_eq!(cap.project("low"), Some("low"));
+        assert_eq!(cap.project("medium"), Some("medium"));
+        assert_eq!(cap.project("xhigh"), Some("xhigh"));
+        // Rungs this model lacks round UP to the next real one, never down:
+        // asking for more reasoning must not quietly deliver less.
+        assert_eq!(cap.project("high"), Some("xhigh"));
+        // Above every rung, saturate at the top rather than failing.
+        assert_eq!(cap.project("max"), Some("xhigh"));
+    }
+
+    #[test]
+    fn every_projection_is_a_value_the_model_actually_accepts() {
+        // The whole point of the probe: nothing hipfire can ask for may reach
+        // the template as a value that raises.
+        let t = make_tokenizer();
+        let cap = probe_effort_capability(&t, QWEN38_MINIMAL);
+        for rung in EFFORT_RUNGS {
+            let projected = cap.project(rung).expect("native model projects");
+            assert!(
+                render_qwen38_minimal(true, Some(projected)).is_ok(),
+                "{rung} projected to {projected}, which the template rejects"
+            );
+        }
     }
 
     #[test]
