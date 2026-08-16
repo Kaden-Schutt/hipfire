@@ -1,73 +1,149 @@
 # hipfire-arch-toy
 
-A minimum-viable [`Architecture`] trait implementation. Use as a starting
-template for new arch crates.
+The reference template for adding a model architecture to hipfire. **It is
+deliberately unshippable**: `arch_id = 0xFF`, no carrier claims it, and
+`load_toy_bundle` always returns `Err`. Nothing can ever dispatch it — that
+is the point. Copy the directory, claim a real id, fill in the bodies.
 
-## What this crate is
+## What the crate shows
 
-The smallest impl that compiles, type-checks against
-`hipfire_runtime::arch::Architecture`, and demonstrates every required
-method. Each method is a one-liner with a doc-comment explaining what a
-real arch would do.
+A faithful skeleton of the three things every shippable arch crate has:
 
-The four optional override structs (`LoopGuardOverrides`,
-`SamplerOverrides`, `PromptFrameOverrides`, `EosFilterOverrides`) are
-shown with their default value plus an example of when you'd override.
+| File | Mirrors | Contract |
+|---|---|---|
+| `src/arch_model.rs` | `hipfire-arch-minimax/src/arch_model.rs` | `ToyBundle` + `impl hipfire_runtime::arch_model::ArchModel` (6 required methods: `dim`, `n_layers`, `vocab_size`, `arch_key`, `kv_cache_mut`, `free_gpu`; `reset_session_state` has a default) |
+| `src/carrier.rs` | `hipfire-arch-minimax/src/carrier.rs` | `pub fn load_toy_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<ToyBundle, String>` — honestly stubbed |
+| `src/arch.rs` | `hipfire-arch-cohere2moe/src/arch.rs` | `impl hipfire_runtime::arch::Architecture` — intra-crate typed bring-up helper (no consumers outside arch crates today) |
+
+The layer rule that shapes this: **arch crates must not depend on
+`hipfire-loader`** (cycle). So the `Carrier` impl — which returns the
+loader's `LoadedModel` — lives in `crates/hipfire-loader/src/carriers.rs`,
+and it calls *into* your crate's `load_<arch>_bundle` for all model work.
+
+## Checklist: adding a new architecture
+
+Verified against the tree on branch `arch/saddle` (2026-08-15). Every path
+below was opened and confirmed. Sites marked ⚙️ are **compile-enforced** —
+skip one and the workspace stops building (exhaustive `match` on
+`ModelState`, a missing `GenerationRoute` arm, etc.).
+
+### Tier A — the arch crate itself
+
+1. `crates/hipfire-arch-<name>/` — copy this crate. Replace the stub types in
+   `src/toy_model.rs` (config parsed from HFQ `metadata_json` /
+   safetensors `config.json`; GPU-resident weights via
+   `hipfire_runtime::llama::WeightTensor`; per-decode state sized by config),
+   fill in `load_<name>_bundle`, and add your forward as free functions
+   (`src/forward.rs`) — forward is statically dispatched, never `dyn`.
+
+### Tier B — loader (all ⚙️)
+
+2. ⚙️ `crates/hipfire-loader/Cargo.toml` — add the arch crate dependency
+   (plain, non-optional, matching the five newest arches).
+3. ⚙️ `crates/hipfire-loader/src/lib.rs` —
+   `ModelState` variant; arms in `as_arch_model`, `as_arch_model_mut`,
+   the `free_gpu` match, and the pp>1 `unload_model` match (no wildcards —
+   that is the leak guard); `&NewCarrier` in `REGISTRY`; optional
+   `LoadedModel` accessors (`minimax()`/`cohere2moe()` pattern).
+4. ⚙️ `crates/hipfire-loader/src/carriers.rs` — `pub struct <Name>Carrier`
+   implementing `Carrier`: `name`, `claims_arch_id` (exact id match —
+   never an open range), `load` (calls your `load_<name>_bundle`, then
+   `resolve_source_meta` + `build_speculator` + `LoadedModel::skeleton`),
+   `caps`, `sampling_defaults`; `spec_target_guard` / `make_spec_emitter`
+   when the arch joins the n-gram spec path; `arch_default_template` arm
+   if you ship a built-in chat template. Registry tests at the bottom of
+   `lib.rs` (`carriers_are_disjoint`, `known_ids_route_as_expected`) pin
+   your claim.
+
+### Tier C — generation (all ⚙️)
+
+5. ⚙️ `crates/hipfire-generate/Cargo.toml` — add the arch crate dependency.
+6. ⚙️ `crates/hipfire-generate/src/ar.rs` — `GenerationRoute` variants +
+   `ALL` + `name()`; the `match i.arch_id` arm in
+   `select_generation_route`; the dispatch arm in `generate` that calls
+   your body.
+7. ⚙️ `crates/hipfire-generate/src/dense.rs` — `generate_<name>`
+   (prefill loop + decode loop + JSONL events; `generate_lfm2moe` /
+   `generate_cohere2moe` are the current small references).
+8. `crates/hipfire-generate/src/common.rs` — session-reset arm for your
+   `ModelState` variant (drop recurrent state, reset `compact_offset`).
+   Not compile-enforced: the `if let Some(ModelState::…)` chains just never
+   fire for your variant, so stale state survives resets until you add one.
+
+### Tier D — routing into the crate
+
+9. `crates/hipfire-runtime/src/arch_mapping.rs` — `MODEL_TYPE_TO_ARCH_ID`
+   row(s) for your HF `model_type` string(s). Single source of truth for
+   the quantizer and the safetensors-dir path.
+10. `crates/hipfire-runtime/src/safetensors_source.rs` — a
+    `derive_arch_id` arm only when your `architectures[]` strings need
+    special-casing (see the qwen3.5/qwen2/llama prefix arms); plain
+    `model_type` lookups already flow through (9).
+11. `crates/hipfire-runtime/Cargo.toml` — `arch-<name>` feature in the
+    default list + the crate as a `[dev-dependencies]` entry (the dev-dep
+    cycle-exclusion trick; see the comment block there).
+12. `crates/hipfire-runtime/tests/arch_id_unification.rs` — add your
+    mapping to `EXPECTED_MAPPINGS`.
+13. `crates/hipfire-quantize/src/pipeline.rs` — per-arch ingest flags
+    (`is_<name> = arch_id == <N>`) when your tensors need special quant
+    routing (MoE experts, tied-embed guards). Dense plain-vanilla arches
+    may need nothing.
+    (`pipeline_gguf.rs` needs no edit — it calls the same
+    `lookup_model_type`.)
+14. `crates/hipfire-daemon/src/main.rs` — session-reset arm(s) beside the
+    `ModelState::Gemma4`/`MuseGlimmer` blocks (only if your state isn't
+    fully covered by `ArchModel::reset_session_state`).
+
+### Tier E — optional capability surfaces
+
+15. `crates/hipfire-generate/src/batch.rs` — continuous-batch admission, if
+    your arch supports it.
+16. `crates/hipfire-generate/src/redline.rs` — bench-fixture routes, if you
+    want Redline capture.
+17. `crates/hipfire-runtime/src/reset_core.rs` — retry-eligibility
+    inventory row (your `arch_key()` string must match).
+18. `crates/hipfire-cli/Cargo.toml` — only if the CLI itself needs your
+    types (precedent: qwen35 multi-slot).
+
+### Tier F — registry & docs
+
+19. `docs/architecture-ids.md` — claim your id. Never reuse 2–4 (deliberately
+    unassigned) or 0xFF (this template).
+20. `docs/ARCHITECTURE.md` — carrier table row + crate table row.
+21. `registry/models.json` — model entries for your artifacts, then
+    `scripts/registry_gen.py` regenerates `registry/v1.json` (which is where
+    the `arch_id` column lands; never hand-edit `v1.json`).
+22. `docs/MODELS.md` — catalog rows.
+23. `docs/env-vars.md` — any new `HIPFIRE_*` knobs and feature-flag notes.
+24. `CLAUDE.md` — the arch-id list in the crate summary.
+
+Also run `scripts/check-crate-maps.py <name>` to seed your crate's own
+`map.md` (in-crate, so not counted above).
+
+## The count
+
+**23 out-of-crate files** a new architecture must touch today (checklist
+items 2–24 above), down from the pre-programme recon count of ~28 — despite
+*more* arches, because the loader's `LoadedModel` per-arch `Option<…>`
+fields, the daemon's per-arch `arch_id` match ladders, and the bespoke
+spec-decode wiring were folded into `ModelState`/`ArchModel`/`Carrier`.
+Six are compile-enforced (all of Tier B plus Tier C items 5–7: the
+`ModelState` and `GenerationRoute` matches are exhaustive, so a new variant
+without its arms does not build); the rest fail closed or silently skip.
 
 ## What this crate is not
 
-- Not a real model. `config_from_hfq` ignores its input and returns
-  hardcoded constants; `load_weights` returns a zero-initialized
-  embedding table; `new_state` returns a bare counter. There is no
+- Not a real model. `load_toy_bundle` never returns `Ok`. There is no
   forward pass.
-- Not consumed by the daemon, runtime examples, or any binary. It
-  exists purely as a template. The workspace builds it to keep the
-  template from rotting, but nothing depends on it at runtime.
-- Not a vehicle for shared scaffolding. If a piece of code is useful
-  to more than one arch crate, it belongs in `hipfire-runtime`, not
-  here.
+- Not registered. Do not add a `ToyCarrier` to the loader; do not add 0xFF
+  to `arch_mapping.rs`. `docs/architecture-ids.md` lists 0xFF as reserved
+  precisely so nobody ships it.
+- Not consumed by the daemon, generate, or any binary. The workspace builds
+  it only to keep the template from rotting.
 
-## How to use this as a template
+## Production references
 
-1. Copy `crates/hipfire-arch-toy/` to `crates/hipfire-arch-<your-name>/`.
-2. Update `Cargo.toml`: `name`, `description`. Add the new crate to
-   the workspace `Cargo.toml` `members` list and to
-   `crates/hipfire-runtime/Cargo.toml`'s `[dev-dependencies]` if your
-   arch is consumed by a runtime example/binary.
-3. Replace the stub types in `src/toy_model.rs`:
-   - `ToyConfig` → your arch's config (parsed out of
-     `hfq.metadata_json`). Reference: `Qwen35Config::from_hfq` in
-     `hipfire-arch-qwen35`.
-   - `ToyWeights` → your arch's GPU-resident weight handles. Use
-     `WeightTensor` from `hipfire-runtime::llama` for upload + dispatch
-     plumbing; arch crates do not implement quant unpack themselves.
-   - `ToyState` → your arch's per-step scratch (KV cache, attention
-     workspace, recurrent state for hybrid archs).
-4. Update `src/arch.rs` `impl Architecture for Toy` to call your new
-   types. The trait surface is fixed: same five required methods
-   (`arch_id`, `name`, `config_from_hfq`, `load_weights`, `new_state`)
-   plus the four optional overrides.
-5. Implement your forward pass as free functions in your model module
-   (e.g. `forward`, `forward_prefill_batch`). The trait deliberately
-   does **not** route forward through dyn dispatch — see the rationale
-   in `crates/hipfire-arch-qwen35/src/arch.rs` module docs.
-6. Add an `arch_id` constant to `docs/architecture-ids.md` (when that
-   file exists) or coordinate via PR review to claim an unused id.
-
-Rough effort estimate for a real arch port:
-- Bring-up triple (config / weights / state): a few hundred lines.
-- Forward pass: a couple thousand lines for a dense LLaMA-style model;
-  more for hybrid attention or MoE.
-- Kernel work for any new ops: stays in `kernels/src/*.hip` and
-  `crates/rdna-compute`, **not** in your arch crate. See
-  `CONTRIBUTING.md` "Crate topology" decision tree.
-- Coherence + speed-gate validation: see `scripts/coherence-gate.sh`
-  and `scripts/speed-gate.sh`.
-
-## Production reference
-
-Read `crates/hipfire-arch-qwen35/` for a complete arch implementation
-with hybrid DeltaNet attention, MoE expert routing, weight paging,
-speculative decoding, and PFlash long-context paging. That's the bar.
-
-[`Architecture`]: ../../crates/hipfire-runtime/src/arch.rs
+- Smallest current load body: `crates/hipfire-arch-minimax/src/carrier.rs`.
+- Smallest `ArchModel` impl: `crates/hipfire-arch-qwen2/src/arch_model.rs`.
+- Full bar (hybrid attention, MoE, paging, spec decode):
+  `crates/hipfire-arch-qwen35/`.

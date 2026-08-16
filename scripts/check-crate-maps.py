@@ -253,7 +253,7 @@ def check_crate(crate: Path) -> list[str]:
 
     old_deps = parse_block_deps(old_block)
     new_deps_raw = parse_manifest(crate)
-    new_deps = set(new_deps_raw["path"]) | set(new_deps_raw["external"])
+    new_deps = set(new_deps_raw["path"]) | set(new_deps_raw["external"]) | set(new_deps_raw["dev"]) | set(new_deps_raw["build"])
     for name in sorted(old_deps - new_deps):
         problems.append(f"{crate.name}: stale declared dependency in map: {name}")
     for name in sorted(new_deps - old_deps):
