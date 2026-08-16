@@ -436,10 +436,7 @@ impl MropeCtx {
             "MropeCtx::pos3 called below base ({pos} < {})",
             self.base
         );
-        match pos
-            .checked_sub(self.base)
-            .and_then(|i| self.positions.get(i))
-        {
+        match pos.checked_sub(self.base).and_then(|i| self.positions.get(i)) {
             Some(p) => *p,
             None => [pos as i32 + self.rope_delta; 3],
         }
@@ -6922,14 +6919,6 @@ fn ar_graph_eligible_for_kv(requested: bool, compact_offset: usize) -> bool {
     requested && compact_offset == 0
 }
 
-#[inline]
-fn retained_replay_eligible(requested: bool) -> bool {
-    // DeltaNet state updates are part of the retained tape, and gfx12 now
-    // performs the required pre-writer vector-cache acquire.  Hybrid Qwen
-    // routes therefore share the ordinary plain-AR eligibility contract.
-    requested
-}
-
 /// Zero-alloc forward pass using pre-allocated scratch buffers.
 /// Logits stay on GPU in scratch.logits. Returns nothing — caller uses scratch.logits.
 pub fn forward_scratch(
@@ -7062,8 +7051,7 @@ pub fn forward_scratch(
     // Redline's plain-AR capture/replay has the same eligibility contract as
     // the AR HipGraph. MTP/spec re-seed and verify calls must not contaminate
     // or consume the immutable single-token replay sequence.
-    let retained_eligible = retained_replay_eligible(graph_eligible);
-    gpu.replay.set_forward_eligible(retained_eligible);
+    gpu.replay.set_forward_eligible(graph_eligible);
     gpu.replay
         .begin_auto_capture_if_armed()
         .map_err(|reason| HipError::new(0, reason))?;
@@ -18066,9 +18054,7 @@ pub fn forward_scratch_mrope(
     mrope: Option<&MropeCtx>,
 ) -> HipResult<()> {
     let Some(mc) = mrope else {
-        return forward_scratch(
-            gpu, weights, config, token, pos, kv_cache, dn_state, scratch,
-        );
+        return forward_scratch(gpu, weights, config, token, pos, kv_cache, dn_state, scratch);
     };
     mark_mrope_forward_ineligible(gpu);
     // Embedding lookup into scratch.x + the 1D pos scalar (still consumed by
@@ -24685,10 +24671,5 @@ mod tests {
         assert!(!ar_graph_eligible_for_kv(true, 1));
         assert!(!ar_graph_eligible_for_kv(true, 128));
         assert!(!ar_graph_eligible_for_kv(false, 0));
-    }
-    #[test]
-    fn automatic_retained_replay_accepts_repaired_deltanet_routes() {
-        assert!(retained_replay_eligible(true));
-        assert!(!retained_replay_eligible(false));
     }
 }
