@@ -682,11 +682,7 @@ pub fn free_checkpoints(
 pub fn reset_qwen35_recurrent(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
     let mut first_err: Option<String> = None;
     if m.pp > 1 {
-        if let (Some(ModelState::Qwen35(b)), Some(gpus), Some(la)) = (
-            m.state.as_ref(),
-            m.pp_gpus.as_mut(),
-            m.pp_dn_la_to_device.as_ref(),
-        ) {
+        if let (Some(b), Some(gpus), Some(la)) = (m.state.as_mut().and_then(|s| s.as_arch_model_mut().as_any_mut().downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()), m.pp_gpus.as_mut(), m.pp_dn_la_to_device.as_ref()) {
             let dn = &b.dn_state;
             for (i, s) in dn.s_matrices.iter().enumerate() {
                 let g = &mut gpus.devices[la[i] as usize];
@@ -1103,7 +1099,7 @@ pub fn fail_closed_reset_target_and_spec(
             bundle.reset_session_state();
         }
         if let Some(ad) = m.kv_adaptive.as_mut() {
-            if let Some(ModelState::Qwen35(b)) = m.state.as_mut() {
+            if let Some(b) = m.state.as_mut().and_then(|s| s.as_arch_model_mut().as_any_mut().downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()) {
                 ad.reset_with_cache(gpu, &mut b.kv_cache);
             } else {
                 ad.reset();

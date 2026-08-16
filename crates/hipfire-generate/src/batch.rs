@@ -226,8 +226,12 @@ pub fn drive_qwen_continuous_batch(
     };
     let batch_state = unsafe { &mut *batch_state_ptr };
     let (config_ptr, weights_ptr, scratch_ptr, tokenizer_ptr, chat_template_clone) =
-        match model.state.as_ref() {
-            Some(ModelState::Qwen35(b)) => (
+        match model
+            .state
+            .as_mut()
+            .and_then(|s| s.as_arch_model_mut().as_any_mut().downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>())
+        {
+            Some(b) => (
                 &b.config as *const qwen35::Qwen35Config,
                 &b.weights as *const qwen35::Qwen35Weights,
                 &b.scratch as *const qwen35::Qwen35Scratch,
@@ -1131,8 +1135,12 @@ pub fn drive_lfm_continuous_batch(
     };
     let batch_state = unsafe { &mut *batch_state_ptr };
     let (config_ptr, weights_ptr, tokenizer_ptr, chat_template_clone, eos_tok) =
-        match model.state.as_ref() {
-            Some(ModelState::Lfm2Moe(b)) => (
+        match model
+            .state
+            .as_mut()
+            .and_then(|s| s.as_arch_model_mut().as_any_mut().downcast_mut::<hipfire_arch_lfm2moe::Lfm2MoeBundle>())
+        {
+            Some(b) => (
                 &b.config as *const lfm2moe::config::Lfm2MoeConfig,
                 &b.weights as *const lfm2moe::Lfm2MoeWeights,
                 match model.tokenizer.as_ref() {

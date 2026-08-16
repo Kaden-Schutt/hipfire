@@ -14,7 +14,7 @@ use hipfire_arch_minimax as minimax;
 use hipfire_arch_muse_glimmer as glimmer;
 use hipfire_arch_qwen2::qwen2;
 
-use hipfire_loader::{AsstTurnCache, LoadedModel, ModelState};
+use hipfire_loader::{AsstTurnCache, LoadedModel};
 use hipfire_runtime::prompt_frame::ThinkMode;
 use std::io::Write;
 use std::time::Instant;
@@ -755,7 +755,11 @@ pub fn generate_deepseek4(
     // `ModelState::Deepseek4`. Field-borrow it disjointly so `cfg`/`weights`
     // (shared) and `state` (`&mut`) are live simultaneously, exactly as the
     // forward path needs.
-    let Some(ModelState::Deepseek4(b)) = m.state.as_mut() else {
+    let Some(b) = m
+        .state
+        .as_mut()
+        .and_then(|s| s.as_arch_model_mut().as_any_mut().downcast_mut::<hipfire_arch_deepseek4::Deepseek4Bundle>())
+    else {
         let _ = writeln!(
             stdout,
             r#"{{"type":"error","id":"{}","message":"deepseek4_config missing on arch_id=9 generate"}}"#,
@@ -1532,8 +1536,12 @@ pub fn generate_deepseek4_heterogeneous(
         emit_error_with_id(stdout, id, "tokenizer not loaded");
         return;
     };
-    let eos_tok = match m.state.as_ref() {
-        Some(ModelState::Deepseek4Heterogeneous(bundle)) => bundle.eos_tok,
+    let eos_tok = match m
+        .state
+        .as_mut()
+        .and_then(|s| s.as_arch_model_mut().as_any_mut().downcast_mut::<hipfire_loader::Deepseek4HeterogeneousBundle>())
+    {
+        Some(bundle) => bundle.eos_tok,
         _ => {
             emit_error_with_id(stdout, id, "deepseek4 heterogeneous state missing");
             return;
@@ -1570,7 +1578,11 @@ pub fn generate_deepseek4_heterogeneous(
     let total_t0 = Instant::now();
     let prefill_t0 = Instant::now();
     let (mut logits, prefill_ms) = {
-        let Some(ModelState::Deepseek4Heterogeneous(bundle)) = m.state.as_mut() else {
+        let Some(bundle) = m
+            .state
+            .as_mut()
+            .and_then(|s| s.as_arch_model_mut().as_any_mut().downcast_mut::<hipfire_loader::Deepseek4HeterogeneousBundle>())
+        else {
             emit_error_with_id(stdout, id, "deepseek4 heterogeneous state missing");
             return;
         };
@@ -1667,7 +1679,11 @@ pub fn generate_deepseek4_heterogeneous(
         if generated >= max_tokens {
             break;
         }
-        let Some(ModelState::Deepseek4Heterogeneous(bundle)) = m.state.as_mut() else {
+        let Some(bundle) = m
+            .state
+            .as_mut()
+            .and_then(|s| s.as_arch_model_mut().as_any_mut().downcast_mut::<hipfire_loader::Deepseek4HeterogeneousBundle>())
+        else {
             emit_error_with_id(stdout, id, "deepseek4 heterogeneous state disappeared");
             return;
         };
@@ -1744,7 +1760,11 @@ pub fn generate_deepseek4_heterogeneous(
     let decision = await_client_terminal_commit(stdout, id, &pending_done);
     let effects = ds4_client_commit_effects(decision, !wire_tool_calls.is_empty(), true);
     if !effects.emit_done {
-        let Some(ModelState::Deepseek4Heterogeneous(bundle)) = m.state.as_mut() else {
+        let Some(bundle) = m
+            .state
+            .as_mut()
+            .and_then(|s| s.as_arch_model_mut().as_any_mut().downcast_mut::<hipfire_loader::Deepseek4HeterogeneousBundle>())
+        else {
             emit_error_with_id(
                 stdout,
                 id,
@@ -1828,7 +1848,11 @@ pub fn generate_gemma4(
     // HTTP handler waits forever. Same fix as DS4 (e99583afa) and lfm2moe.
     let gen_contract = gen_start_contract_version_for_arch(m.arch_id);
     emit_gen_start(stdout, id, false, gen_contract);
-    let Some(ModelState::Gemma4(bundle)) = m.state.as_mut() else {
+    let Some(bundle) = m
+        .state
+        .as_mut()
+        .and_then(|s| s.as_arch_model_mut().as_any_mut().downcast_mut::<hipfire_loader::Gemma4Bundle>())
+    else {
         emit_error_with_id(
             stdout,
             id,
@@ -3756,7 +3780,11 @@ pub fn generate_muse_glimmer(
     // Contract: ModelState::MuseGlimmer(bundle) — see cross-agent contract.
     // If the loader has not yet published this variant, this match will fail
     // to compile, which is intentional (loud Err rather than silent drop).
-    let Some(ModelState::MuseGlimmer(bundle)) = m.state.as_mut() else {
+    let Some(bundle) = m
+        .state
+        .as_mut()
+        .and_then(|s| s.as_arch_model_mut().as_any_mut().downcast_mut::<hipfire_loader::MuseGlimmerBundle>())
+    else {
         emit_error_with_id(
             stdout,
             id,
@@ -7016,8 +7044,12 @@ pub fn generate_qwen2(
             return;
         }
     };
-    let state_ref = match m.state.as_mut() {
-        Some(ModelState::Qwen2(b)) => b,
+    let state_ref = match m
+        .state
+        .as_mut()
+        .and_then(|s| s.as_arch_model_mut().as_any_mut().downcast_mut::<hipfire_arch_qwen2::Qwen2Bundle>())
+    {
+        Some(b) => b,
         _ => {
             emit_active_attempt_error(
                 stdout,

@@ -20,7 +20,7 @@ use hipfire_engine::terminal::{
     active_attempt_id, await_client_terminal_commit, check_abort, emit_staged_terminal_done,
     ClientTerminalDecision,
 };
-use hipfire_loader::{LoadedModel, ModelState};
+use hipfire_loader::LoadedModel;
 use hipfire_runtime::sampler::{self, SamplerConfig};
 use hipfire_runtime::spec::{PrefillOutcome, Speculator};
 use std::io::Write;
@@ -485,7 +485,11 @@ pub fn generate_vl(
         // (ModelState::Qwen35), not the always-None m.dn_state/m.kv_cache.
         // Inlined (disjoint field access) because a `&tokenizer` borrow of `m`
         // is live here.
-        if let Some(ModelState::Qwen35(b)) = m.state.as_ref() {
+        if let Some(b) = m
+            .state
+            .as_mut()
+            .and_then(|s| s.as_arch_model_mut().as_any_mut().downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>())
+        {
             let dn = &b.dn_state;
             for s in &dn.s_matrices {
                 let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
@@ -500,11 +504,19 @@ pub fn generate_vl(
                 let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
             }
         }
-        if let Some(ModelState::Qwen35(b)) = m.state.as_mut() {
+        if let Some(b) = m
+            .state
+            .as_mut()
+            .and_then(|s| s.as_arch_model_mut().as_any_mut().downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>())
+        {
             b.kv_cache.compact_offset = 0;
         }
         if let Some(ad) = m.kv_adaptive.as_mut() {
-            if let Some(ModelState::Qwen35(b)) = m.state.as_mut() {
+            if let Some(b) = m
+                .state
+                .as_mut()
+                .and_then(|s| s.as_arch_model_mut().as_any_mut().downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>())
+            {
                 ad.reset_with_cache(gpu, &mut b.kv_cache);
             } else {
                 ad.reset();
@@ -525,7 +537,11 @@ pub fn generate_vl(
         return;
     }
 
-    let ModelState::Qwen35(b) = m.state.as_mut().unwrap() else {
+    let Some(b) = m
+        .state
+        .as_mut()
+        .and_then(|s| s.as_arch_model_mut().as_any_mut().downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>())
+    else {
         unreachable!()
     };
     let config = &b.config;
@@ -1364,9 +1380,13 @@ pub fn generate_vl_dots_ocr(
     let text_cfg = config.text.clone();
     let dim = text_cfg.hidden_size;
     // Weights/state via raw pointers to allow owned config while keeping disjoint borrows.
-    let bundle_ptr: *mut hipfire_arch_dots_ocr::DotsOcrBundle = match &mut m.state {
-        Some(hipfire_loader::ModelState::DotsOcr(b)) => b as *mut _,
-        _ => unreachable!(),
+    let bundle_ptr: *mut hipfire_arch_dots_ocr::DotsOcrBundle = match m
+        .state
+        .as_mut()
+        .and_then(|s| s.as_arch_model_mut().as_any_mut().downcast_mut::<hipfire_arch_dots_ocr::DotsOcrBundle>())
+    {
+        Some(b) => b as *mut _,
+        None => unreachable!(),
     };
     let weights = unsafe { &(*bundle_ptr).weights };
     let state = unsafe { &mut (*bundle_ptr).state };
@@ -1536,9 +1556,13 @@ pub fn generate_vl_dots_ocr(
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let config = m.dots_ocr().unwrap().config.clone();
     let text_cfg = config.text.clone();
-    let bundle_ptr: *mut hipfire_arch_dots_ocr::DotsOcrBundle = match &mut m.state {
-        Some(hipfire_loader::ModelState::DotsOcr(b)) => b as *mut _,
-        _ => unreachable!(),
+    let bundle_ptr: *mut hipfire_arch_dots_ocr::DotsOcrBundle = match m
+        .state
+        .as_mut()
+        .and_then(|s| s.as_arch_model_mut().as_any_mut().downcast_mut::<hipfire_arch_dots_ocr::DotsOcrBundle>())
+    {
+        Some(b) => b as *mut _,
+        None => unreachable!(),
     };
     let weights = unsafe { &(*bundle_ptr).weights };
     let state = unsafe { &mut (*bundle_ptr).state };
@@ -1875,9 +1899,13 @@ pub fn generate_dots_ocr_text(
     let text_cfg = config.text.clone();
     let dim = text_cfg.hidden_size;
     // Weights/state via raw pointers to allow owned config while keeping disjoint borrows.
-    let bundle_ptr: *mut hipfire_arch_dots_ocr::DotsOcrBundle = match &mut m.state {
-        Some(hipfire_loader::ModelState::DotsOcr(b)) => b as *mut _,
-        _ => unreachable!(),
+    let bundle_ptr: *mut hipfire_arch_dots_ocr::DotsOcrBundle = match m
+        .state
+        .as_mut()
+        .and_then(|s| s.as_arch_model_mut().as_any_mut().downcast_mut::<hipfire_arch_dots_ocr::DotsOcrBundle>())
+    {
+        Some(b) => b as *mut _,
+        None => unreachable!(),
     };
     let weights = unsafe { &(*bundle_ptr).weights };
     let state = unsafe { &mut (*bundle_ptr).state };
