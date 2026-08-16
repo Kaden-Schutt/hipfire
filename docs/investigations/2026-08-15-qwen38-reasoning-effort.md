@@ -165,3 +165,87 @@ test at the layer that actually broke:
 Then a live turn on `qwen3.8:27b` at each rung, reading the decoded output and
 comparing think-block length — numbers alone never prove this one, since the
 failure mode is a *plausible-looking truncated trace*.
+
+## 6 · Resolved design (maintainer, 2026-08-15)
+
+The rule set below was proposed by the maintainer and is adopted. Three of its
+four clauses already exist as the **DS4 effort contract**
+(`hipfire-cli/src/main.rs:6805-6854`), hardcoded to `arch == deepseek4`. The
+work is to generalise that contract into a capability, not to invent one.
+
+| clause | behaviour | status |
+|---|---|---|
+| thinking off **+ sampling on** | use the card's non-thinking numbers | new (F5) |
+| **greedy**, thinking on or off | greedy and the user's effort are both honoured | already true by construction |
+| model **is** effort-native | adopt the model's own vocabulary; effort owns the default and the budget is not invented | exists for DS4; generalise |
+| model has thinking but is **not** effort-native | legacy budget ladder | exists (`main.rs:6807-6817`) |
+
+### Why greedy and effort compose without special-casing
+
+They are different layers: greedy is a **sampling** decision (`temp=0`), effort
+is **prompt text**. Nothing should couple them, and nothing currently does. The
+card's mode-dependent sampling (clause 1) is therefore scoped to the
+sampling-on case only — under greedy those numbers are moot.
+
+### Keep DS4's nuance: never *invent* a cap, but honour an *explicit* one
+
+`main.rs:6832-6834` states the contract exactly right:
+
+> *"Effort selects the parent model's prompt semantics. It never invents a
+> hipfire token cap; absent an explicit cap, 0 means uncapped."*
+
+and `:6825-6834` still honours a caller-supplied `max_think_tokens`. That
+distinction is worth preserving verbatim. It kills the silent
+inherited-budget guillotine (§3) while leaving a real cost guard-rail for a
+caller who explicitly asks for one. "Effort overrides budget" should mean
+*effort owns the default*, not *the budget becomes unreachable*.
+
+### What must NOT be copied from DS4: the hardcoded projection
+
+`main.rs:6819-6823` folds `minimal|medium|med|low → low`. DS4's rungs are
+`low/high/max`; Qwen3.8's are `low/medium/xhigh`. Reusing that table would
+**erase `medium`**, which on Qwen3.8 is a real rung (the unsteered baseline).
+The projection must be computed against the model's own set — which is what F1
+produces — rather than a per-arch constant. `ThinkMode`'s `medium → Low` fold
+(D3) is the same defect in a second place.
+
+### F1 becomes a classifier, not just a validator
+
+Extend the load-time probe: render once with `reasoning_effort` unset and once
+per candidate value.
+
+- **Output invariant across all values** → the template ignores effort → the
+  model is not effort-native → legacy budget ladder (clause 4).
+- **Output varies** → effort-native → take the accepted set as the model's
+  vocabulary, and apply clause 3.
+
+That single probe implements the clause 3 / clause 4 split with no per-arch
+hardcode, and it retires the `deepseek4_effort_contract` boolean that currently
+threads through `apply_http_reasoning_request`.
+
+### Rejected: synthesising effort text for non-effort-native models
+
+The open question was whether a non-effort-native model should get an injected
+*"reasoning effort is set to low"* sentence. **No, not by default.** Inventing
+instruction text a model was not trained on is unvalidated steering: it costs
+prompt tokens, it changes the prompt prefix (so it invalidates prefix-cache
+reuse across turns), and there is no evidence behind it.
+
+The repo already holds this line in both directions — DS4's contract *"never
+invents a hipfire token cap"*, and `glimmer_reasoning_strength`
+(`hipfire-generate/src/dense.rs:2397-2424`) injects a strength only because Muse
+Glimmer's card defines that Onyx block. The same principle should govern text:
+**inject only what the model's own card or template defines.** If it is wanted
+later it must be per-model, card-derived, opt-in, and measured against a
+no-injection arm.
+
+### Correction owed on a stale claim
+
+`hipfire-tui/src/hipfire/knobs.rs:106,120` states that an active thinking budget
+*"routes DFlash to plain decode: the dispatch gate bails when
+max_think_tokens > 0"*. I could not find that dispatch-level bail. What exists
+is the spec loop **handling** a budget inline (`hipfire-generate/src/qwen.rs:4390`,
+`:4449`). So either the note is stale or the gate lives elsewhere. This matters
+because clause 3 (effort ⇒ no invented cap ⇒ `max_think_tokens = 0`) would
+otherwise imply a free spec-decode re-enablement — **do not claim that win
+until the gate is located and measured.**
