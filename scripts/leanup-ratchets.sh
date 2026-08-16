@@ -26,8 +26,24 @@
 #                 `ggml/` is measured under.
 #   strict        arch-named kernels (deepseek4_*, fused_gemma4_*, …) moved
 #                 to the arch side. llama.cpp has zero model-named files in
-#                 `ggml/` — verified — so this is the closest true analogue
-#                 and is the number to quote.
+#                 `ggml/` — verified.
+#   +substrate    strict, plus the engine substrate. SECOND measurement defect:
+#                 the compute list below was written before the saddle layering
+#                 existed and was never updated, so `saddle-core`,
+#                 `hipfire-engine` and `hipfire-dispatch` — which carry ZERO
+#                 `hipfire_arch_*` references and ZERO arch Cargo deps, and so
+#                 cannot be arch code under any reading — were counted on
+#                 NEITHER side. llama.cpp's analogue (`src/` minus
+#                 `src/models/`: llama-context, llama-kv-cache, llama-batch,
+#                 llama-sampling) is 53,974 lines and is likewise not arch.
+#                 Quote THIS one; it is the conservative figure.
+#   +dispatchers  also counts hipfire-runtime/loader/generate, which reference
+#                 arch only to dispatch into it, exactly as llama.cpp's
+#                 `llama-model.cpp` switches over `LLM_ARCH_*`. Upper bound.
+#
+# Measured llama.cpp for calibration (see docs/governance): ggml:src/models is
+# 16.20 : 1 and (ggml+substrate):src/models is 19.19 : 1. The 9.7 : 1 figure
+# quoted in the original grounding doc could not be reproduced from the tree.
 set -uo pipefail
 cd "${1:-.}" || exit 1
 
@@ -72,6 +88,26 @@ p compute_crates_rs "$c"
 p kernels_total "$k_all"
 p kernels_arch_named "$k_arch"
 p arch_crates_rs "$a"
+# Engine substrate: the layers the saddle work created. Split by whether the
+# crate names an architecture at all, so the conservative figure stands without
+# argument.
+sub_clean=0
+for x in saddle-core hipfire-engine hipfire-dispatch; do
+  sub_clean=$((sub_clean + $(lines "crates/$x/src" "$RS")))
+done
+sub_disp=0
+for x in hipfire-runtime hipfire-loader hipfire-generate; do
+  sub_disp=$((sub_disp + $(lines "crates/$x/src" "$RS")))
+done
+# Guard the conservative bucket: if any of those three ever gains an arch
+# reference it stops being unambiguous substrate and this must be revisited.
+leak=$(grep -roE 'hipfire_arch_[a-z0-9_]+' crates/saddle-core/src crates/hipfire-engine/src \
+        crates/hipfire-dispatch/src 2>/dev/null | wc -l)
+p substrate_clean "$sub_clean"
+p substrate_dispatching "$sub_disp"
+p substrate_clean_arch_refs "$leak$([ "$leak" -eq 0 ] && echo '' || echo '  <- NOT clean; conservative ratio invalid')"
 p 'ratio (crates-only)' "$(r $c $a)   <- original ratchet; not like-for-like"
 p 'ratio (all-kernels)' "$(r $((c+k_all)) $a)"
-p 'ratio (strict)' "$(r $((c+k_gen)) $((a+k_arch)))   <- quote this one"
+p 'ratio (strict)' "$(r $((c+k_gen)) $((a+k_arch)))   <- kernels fixed, substrate still omitted"
+p 'ratio (+substrate)' "$(r $((c+k_gen+sub_clean)) $((a+k_arch)))   <- quote this one"
+p 'ratio (+dispatchers)' "$(r $((c+k_gen+sub_clean+sub_disp)) $((a+k_arch)))   <- upper bound"

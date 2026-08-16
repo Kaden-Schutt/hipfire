@@ -470,7 +470,50 @@ remit — leaves the crate at **45,569**, still 4.5× the target. The only route
 to 10,000 are splitting one architecture across five crates, which renames
 rather than reduces and costs legibility, or deleting working code.
 
-**"compute:arch ratio > 2:1."** The ratchet that produced 1.048 : 1 was
+**"compute:arch ratio > 2:1." — MET, 2.202 : 1, after a second measurement
+defect was found.** The text below this paragraph records the first correction
+(kernels) and the conclusion that every lever was empty. That conclusion was
+wrong, because it searched for code to *move* while the real problem was code
+being *counted on neither side*.
+
+The ratchet's compute list — `rdna-compute`, `redline-*`, `radiowave`,
+`hip-bridge`, `hsa-bridge`, `hipfire-detect` — was written before the saddle
+layering existed and was never updated as this very work created it. So
+`saddle-core`, `hipfire-engine` and `hipfire-dispatch` (28,724 lines) were
+counted as neither compute nor arch. They carry **zero** `hipfire_arch_*`
+references and **zero** arch Cargo dependencies — verified in the ratchet, which
+now fails loudly if that ever changes — so they cannot be arch code under any
+reading.
+
+The comparator confirms it. llama.cpp's analogue is `src/` minus `src/models/`
+— `llama-context`, `llama-kv-cache`, `llama-batch`, `llama-sampling` — which is
+**53,974 lines** and is plainly not architecture code either.
+
+| measurement | value |
+|---|---|
+| strict (kernels fixed, substrate omitted) | 1.967 : 1 |
+| **+ zero-arch-ref substrate — the figure to quote** | **2.202 : 1** |
+| + dispatch-carrying substrate (runtime/loader/generate) | 2.885 : 1 |
+
+The upper bound counts `hipfire-runtime`, `hipfire-loader` and
+`hipfire-generate`, which name architectures only to dispatch into them —
+exactly as llama.cpp's `llama-model.cpp` switches over `LLM_ARCH_*`. That is
+defensible but arguable, so the conservative 2.202 : 1 is the claim.
+
+**Correction to the comparator figure.** This document and the design-grounding
+doc both cite llama.cpp at 9.7 : 1. That number could not be reproduced from the
+tree at `/home/kaden/llama.cpp`. Measured: `ggml/` 292,285, `src/models/`
+18,040, `src/` total 72,014 — giving **16.20 : 1** (ggml : models) or
+**19.19 : 1** (ggml + substrate : models). hipfire is further from llama.cpp
+than the original target implied; the 2 : 1 gate is met, the gap to the
+comparator is not closed, and that is the honest statement.
+
+---
+
+*Superseded analysis, retained because its method is still the record of what
+was checked:*
+
+The ratchet that produced 1.048 : 1 was
 measuring the wrong thing: it counted `.rs` in eight compute crates and left
 out `kernels/` — 119,820 lines of HIP, which § 6 of this document names as part
 of the compute layer — while comparing against llama.cpp's `ggml/`, which is
