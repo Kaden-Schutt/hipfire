@@ -9112,6 +9112,69 @@ fn emit_visible_token(stdout: &mut impl std::io::Write, id: &str, text: &str) {
     let _ = stdout.flush();
 }
 
+/// Emit one streamed text fragment, skipping holdback steps.
+///
+/// `TokenTextStream::push` returns `""` while a multi-byte character is still
+/// split across tokens (every emoji, CJK under byte-fallback, `∑∫`). Emitting
+/// that verbatim would put a contentless `{"type":"token"}` chunk on the wire
+/// for every byte of every such character, so the plain JSONL emit sites route
+/// their per-token fragment through here instead of repeating the check.
+///
+/// Paths that classify a fragment before emitting (reasoning vs visible,
+/// harmony channels, DSML sections) keep their own routing and only need the
+/// same `is_empty()` skip.
+fn emit_text_fragment(stdout: &mut impl std::io::Write, id: &str, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    emit_visible_token(stdout, id, text);
+}
+
+/// True when a single token decodes to a bare EOS-class marker string.
+///
+/// The id-based stop sets miss `<|endoftext|>` on several vocabs — encoding
+/// the literal string doesn't round-trip to the special-token id (it yields
+/// subwords), so the real id is never in the set and the decode loops also
+/// guard on the decoded text.
+///
+/// Deliberately checked on the token's OWN bytes rather than on a
+/// `TokenTextStream` fragment: a fragment can carry the completion bytes of a
+/// preceding split character, and the leading replacement char would defeat
+/// the `trim()` match. Uses `decode_bytes`, so it is not the lossy per-token
+/// `decode(&[tok])` this module bans for client output.
+fn is_eos_class_marker_token(
+    tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+    token: u32,
+) -> bool {
+    let bytes = tokenizer.decode_bytes(&[token]);
+    matches!(
+        std::str::from_utf8(&bytes).map(str::trim),
+        Ok("<|endoftext|>" | "</s>" | "<|im_end|>")
+    )
+}
+
+/// True when a single token decodes to a bare `<|UPPER_SNAKE|>` structural
+/// marker (`<|START_OF_TURN_TOKEN|>`, `<|CHATBOT_TOKEN|>`, …).
+///
+/// Like [`is_eos_class_marker_token`], checked on the token's own bytes rather
+/// than on a `TokenTextStream` fragment, which can carry a preceding split
+/// character's completion bytes and so no longer match the `<|…|>` shape.
+fn is_bracketed_marker_token(
+    tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+    token: u32,
+) -> bool {
+    let bytes = tokenizer.decode_bytes(&[token]);
+    let Ok(s) = std::str::from_utf8(&bytes) else {
+        return false;
+    };
+    s.len() > 4
+        && s.starts_with("<|")
+        && s.ends_with("|>")
+        && s[2..s.len() - 2]
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c == '_')
+}
+
 /// Emit one producer-classified reasoning fragment.
 fn emit_reasoning_token(stdout: &mut impl std::io::Write, id: &str, text: &str) {
     let envelope = serde_json::json!({
@@ -17852,14 +17915,21 @@ fn ep_emit_token(
     stop: &[String],
 ) -> bool {
     text_acc.push_str(piece);
-    let _ = writeln!(
-        stdout,
-        r#"{{"type":"token","id":"{}","text":{},"attempt_id":{}}}"#,
-        id,
-        serde_json::to_string(piece).unwrap_or_else(|_| "\"\"".to_string()),
-        active_attempt_id()
-    );
-    let _ = stdout.flush();
+    // Holdback step: `TokenTextStream::push` returns "" while a character's
+    // UTF-8 is still split across tokens. Skip the wire event — emitting it
+    // would put a contentless chunk on the stream for every byte of every
+    // emoji. The stop-string check still runs; `text_acc` is unchanged, so it
+    // yields the same answer it did on the previous token.
+    if !piece.is_empty() {
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"token","id":"{}","text":{},"attempt_id":{}}}"#,
+            id,
+            serde_json::to_string(piece).unwrap_or_else(|_| "\"\"".to_string()),
+            active_attempt_id()
+        );
+        let _ = stdout.flush();
+    }
     stop.iter().any(|s| !s.is_empty() && text_acc.ends_with(s))
 }
 
@@ -18311,6 +18381,7 @@ fn ep_serve_ds4(
     let mut pos = prompt_n;
     let mut text_acc = String::new();
     let mut local_emitted_ids: Vec<u32> = Vec::new();
+    let mut text_stream = hipfire_runtime::tokenizer::TokenTextStream::new();
     while generated < max_tokens {
         // FIX #3 (ep-no-abort): client cancel mid-decode → emit aborted+done,
         // reset EP cursors, stop. Without this a Pi/CLI cancel leaves the EP
@@ -18336,10 +18407,17 @@ fn ep_serve_ds4(
         if next == eos_tok {
             break;
         }
-        let piece = m.tokenizer.as_ref().unwrap().decode(&[next]);
-        for ev in parser.feed(&piece) {
-            absorb_event(&ev);
-            emit_stream_event(stdout, id, ev);
+        // Incremental decode with holdback — never `decode(&[next])`, which is
+        // lossy per token and feeds the DSML parser FFFD for every byte of a
+        // multi-token character. `piece` is "" while a character is still
+        // split; the grammar matcher shares it and simply sees the completed
+        // character one step later instead of a replacement char.
+        let piece = text_stream.push(m.tokenizer.as_ref().unwrap(), next);
+        if !piece.is_empty() {
+            for ev in parser.feed(&piece) {
+                absorb_event(&ev);
+                emit_stream_event(stdout, id, ev);
+            }
         }
         emit_committed_event(
             stdout,
@@ -18349,7 +18427,7 @@ fn ep_serve_ds4(
             t_decode.elapsed().as_millis() as u64,
         );
         let _ = stdout.flush();
-        if grammar_active {
+        if grammar_active && !piece.is_empty() {
             matcher.advance(&piece);
         }
         local_emitted_ids.push(next);
@@ -18408,6 +18486,17 @@ fn ep_serve_ds4(
             },
             None => break,
         };
+    }
+    // Generation can stop mid-character (max_tokens reached between two
+    // byte-fallback tokens). Feed the held-back tail through the DSML parser
+    // before finishing it — dropping it is a silent truncation.
+    let tail = text_stream.flush();
+    if !tail.is_empty() {
+        text_acc.push_str(&tail);
+        for ev in parser.feed(&tail) {
+            absorb_event(&ev);
+            emit_stream_event(stdout, id, ev);
+        }
     }
     for ev in parser.finish() {
         absorb_event(&ev);
@@ -18715,6 +18804,7 @@ fn ep_serve_minimax(
     let mut generated = 0usize;
     let mut pos = prompt_n;
     let mut text_acc = String::new();
+    let mut text_stream = hipfire_runtime::tokenizer::TokenTextStream::new();
     while generated < max_tokens {
         // FIX #3 (ep-no-abort): client cancel mid-decode → emit aborted+done,
         // reset EP cursors, stop.
@@ -18736,7 +18826,11 @@ fn ep_serve_minimax(
         if next == eos_tok {
             break;
         }
-        let piece = m.tokenizer.as_ref().unwrap().decode(&[next]);
+        // Incremental decode with holdback — never `decode(&[next])`, which
+        // is lossy per token and splits multi-token UTF-8 into FFFD. `piece`
+        // is "" while a character is still split; `ep_emit_token` skips the
+        // wire event for those but still evaluates the stop strings.
+        let piece = text_stream.push(m.tokenizer.as_ref().unwrap(), next);
         generated += 1;
         m.conversation_tokens.push(next);
         if ep_emit_token(stdout, id, &piece, &mut text_acc, stop) {
@@ -18788,6 +18882,12 @@ fn ep_serve_minimax(
                 return;
             }
         };
+    }
+    // Generation can stop mid-character (max_tokens reached between two
+    // byte-fallback tokens). Without this flush those bytes are dropped.
+    let tail = text_stream.flush();
+    if !tail.is_empty() {
+        ep_emit_token(stdout, id, &tail, &mut text_acc, stop);
     }
     ep_emit_done(
         stdout,
@@ -28755,6 +28855,7 @@ fn generate_deepseek4(
                 &mut dsml_malformed,
             );
         };
+        let mut text_stream = hipfire_runtime::tokenizer::TokenTextStream::new();
 
         while generated_count < max_tokens && next_tok != eos_tok {
             if check_abort(id) {
@@ -28772,10 +28873,19 @@ fn generate_deepseek4(
                 );
                 return;
             }
-            let frag = tokenizer.decode(&[next_tok]);
-            for ev in parser.feed(&frag) {
-                absorb_event(&ev);
-                emit_stream_event(stdout, id, ev);
+            // Incremental decode with holdback. Never
+            // `tokenizer.decode(&[next_tok])` — that is lossy per token and
+            // turns any character whose UTF-8 spans several tokens (emoji,
+            // byte-fallback CJK) into FFFD on the way to the DSML parser and
+            // the client. `frag` is "" while a character is still split; the
+            // grammar matcher shares it and simply sees the completed
+            // character one step later instead of a replacement char.
+            let frag = text_stream.push(tokenizer, next_tok);
+            if !frag.is_empty() {
+                for ev in parser.feed(&frag) {
+                    absorb_event(&ev);
+                    emit_stream_event(stdout, id, ev);
+                }
             }
             emit_committed_event(
                 stdout,
@@ -28786,7 +28896,7 @@ fn generate_deepseek4(
             );
             let _ = stdout.flush();
             m.conversation_tokens.push(next_tok);
-            if grammar_active {
+            if grammar_active && !frag.is_empty() {
                 matcher.advance(&frag);
             }
             generated_count += 1;
@@ -28810,6 +28920,17 @@ fn generate_deepseek4(
                     let _ = stdout.flush();
                     return;
                 }
+            }
+        }
+        // Generation can stop mid-character (max_tokens reached between two
+        // byte-fallback tokens). Feed the held-back tail through the DSML
+        // parser before finishing it — dropping it here is a silent
+        // truncation of the visible turn.
+        let tail = text_stream.flush();
+        if !tail.is_empty() {
+            for ev in parser.feed(&tail) {
+                absorb_event(&ev);
+                emit_stream_event(stdout, id, ev);
             }
         }
         // Flush any buffered partial markers / content.
@@ -29151,17 +29272,23 @@ fn generate_deepseek4_heterogeneous(
     let mut emit_text_buf = String::new();
     let mut emit_tool_calls_buf = Vec::new();
     let mut dsml_malformed = None;
+    let mut text_stream = hipfire_runtime::tokenizer::TokenTextStream::new();
 
     while generated < max_tokens && next_tok != eos_tok {
-        let fragment = tokenizer.decode(&[next_tok]);
-        for event in parser.feed(&fragment) {
-            ds4_absorb_stream_event(
-                &event,
-                &mut emit_text_buf,
-                &mut emit_tool_calls_buf,
-                &mut dsml_malformed,
-            );
-            emit_stream_event(stdout, id, event);
+        // Incremental decode with holdback — never
+        // `tokenizer.decode(&[next_tok])`, which is lossy per token and feeds
+        // the DSML parser FFFD for every byte of a multi-token character.
+        let fragment = text_stream.push(tokenizer, next_tok);
+        if !fragment.is_empty() {
+            for event in parser.feed(&fragment) {
+                ds4_absorb_stream_event(
+                    &event,
+                    &mut emit_text_buf,
+                    &mut emit_tool_calls_buf,
+                    &mut dsml_malformed,
+                );
+                emit_stream_event(stdout, id, event);
+            }
         }
         emit_committed_event(
             stdout,
@@ -29210,6 +29337,20 @@ fn generate_deepseek4_heterogeneous(
             state.n_tokens = pos as u64;
         }
         next_tok = deepseek4::sampling::sample_token(&logits, temp, top_k, top_p, &mut rng);
+    }
+    // Generation can stop mid-character; route the held-back tail through the
+    // DSML parser before finishing it, or those bytes vanish silently.
+    let tail = text_stream.flush();
+    if !tail.is_empty() {
+        for event in parser.feed(&tail) {
+            ds4_absorb_stream_event(
+                &event,
+                &mut emit_text_buf,
+                &mut emit_tool_calls_buf,
+                &mut dsml_malformed,
+            );
+            emit_stream_event(stdout, id, event);
+        }
     }
     for event in parser.finish() {
         ds4_absorb_stream_event(
@@ -29591,6 +29732,7 @@ fn generate_gemma4(
         let mut stop = false;
         let mut ttft_ms: Option<f64> = None;
         let decode_t0 = Instant::now();
+        let mut text_stream = hipfire_runtime::tokenizer::TokenTextStream::new();
         while !stop && generated_count < max_tokens {
             let committed_len = bundle.state.n_tokens;
             // KV/seq bound: the verify block occupies [L-1, L-1+draft_len+1).
@@ -29641,17 +29783,22 @@ fn generate_gemma4(
                 if ttft_ms.is_none() {
                     ttft_ms = Some(t0.elapsed().as_secs_f64() * 1000.0);
                 }
+                // Incremental decode with holdback — never `decode(&[t])`,
+                // which is lossy per token and splits multi-token UTF-8 into
+                // FFFD. `frag` is "" while a character is still incomplete.
                 let frag = {
                     let tokenizer = m.tokenizer.as_ref().unwrap();
-                    tokenizer.decode(&[t])
+                    text_stream.push(tokenizer, t)
                 };
-                let envelope = serde_json::json!({
-                    "type": "token",
-                    "id": id,
-                    "text": frag,
-                });
-                let _ = writeln!(stdout, "{}", envelope);
-                let _ = stdout.flush();
+                if !frag.is_empty() {
+                    let envelope = serde_json::json!({
+                        "type": "token",
+                        "id": id,
+                        "text": frag,
+                    });
+                    let _ = writeln!(stdout, "{}", envelope);
+                    let _ = stdout.flush();
+                }
                 m.conversation_tokens.push(t);
                 generated_count += 1;
                 if generated_count >= max_tokens {
@@ -29668,6 +29815,20 @@ fn generate_gemma4(
             if stop {
                 break;
             }
+        }
+
+        // Generation can stop mid-character (max_tokens or EOS landing between
+        // two byte-fallback tokens). Without this flush those bytes are
+        // dropped silently.
+        let tail = text_stream.flush();
+        if !tail.is_empty() {
+            let envelope = serde_json::json!({
+                "type": "token",
+                "id": id,
+                "text": tail,
+            });
+            let _ = writeln!(stdout, "{}", envelope);
+            let _ = stdout.flush();
         }
 
         // ── Cursor settle. `spec_step` leaves n_tokens = L+accept_len+1 with
@@ -29744,6 +29905,7 @@ fn generate_gemma4(
     let mut generated_count: usize = 0;
     let mut ttft_ms: Option<f64> = None;
     let decode_t0 = Instant::now();
+    let mut text_stream = hipfire_runtime::tokenizer::TokenTextStream::new();
     loop {
         if generated_count >= max_tokens {
             break;
@@ -29757,18 +29919,13 @@ fn generate_gemma4(
             ttft_ms = Some(t0.elapsed().as_secs_f64() * 1000.0);
         }
 
+        // Incremental decode with holdback — never `decode(&[next_tok])`,
+        // which is lossy per token and splits multi-token UTF-8 into FFFD.
         let frag = {
             let tokenizer = m.tokenizer.as_ref().unwrap();
-            tokenizer.decode(&[next_tok])
+            text_stream.push(tokenizer, next_tok)
         };
-        let envelope = serde_json::json!({
-            "type": "token",
-            "id": id,
-            "text": frag,
-            "attempt_id": active_attempt_id(),
-        });
-        let _ = writeln!(stdout, "{}", envelope);
-        let _ = stdout.flush();
+        emit_text_fragment(stdout, id, &frag);
         m.conversation_tokens.push(next_tok);
         generated_count += 1;
 
@@ -29796,6 +29953,11 @@ fn generate_gemma4(
             }
         }
     }
+
+    // Generation can stop mid-character (max_tokens or the KV-capacity guard
+    // firing between two byte-fallback tokens). Without this flush those bytes
+    // are dropped silently.
+    emit_text_fragment(stdout, id, &text_stream.flush());
 
     m.seq_pos = bundle.state.n_tokens;
 
@@ -29887,6 +30049,89 @@ enum GlimmerEmit {
     Reasoning(String),
     Token(String),
     Tool(String),
+}
+
+/// Route one decoded fragment through the harmony channel router, emit
+/// whatever it yields, and record it. Returns the router's stop signal.
+///
+/// Every glimmer emit site (AR seed, AR loop, spec fallback, accepted block,
+/// stop-token flush, profit-probe prediction) funnels through here. They were
+/// seven verbatim copies of this body, which is exactly how the per-token
+/// `decode(&[tok])` bug survived in some of them — a fix applied idiom-by-
+/// idiom skips the copies it doesn't recognise.
+///
+/// `frag` is "" on a `TokenTextStream` holdback step; the router already
+/// treats an empty fragment as a no-op and the recorder's text append is
+/// likewise empty, while `token` is still recorded so `token_ids` stays
+/// complete.
+#[allow(clippy::too_many_arguments)]
+fn glimmer_route_fragment(
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    router: &mut GlimmerHarmonyRouter,
+    recorder: &mut GlimmerChannelRecorder,
+    visible_acc: &mut String,
+    tool_acc: &mut String,
+    token: u32,
+    frag: &str,
+) -> bool {
+    let (events, should_stop) = router.push(frag);
+    for ev in events {
+        match ev {
+            GlimmerEmit::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
+            GlimmerEmit::Token(text) => {
+                visible_acc.push_str(&text);
+                emit_visible_token(stdout, id, &text);
+            }
+            GlimmerEmit::Tool(text) => {
+                tool_acc.push_str(&text);
+            }
+        }
+    }
+    if router.just_forced() {
+        recorder.mark_forced_reasoning_close();
+    }
+    recorder.push(token, frag);
+    should_stop
+}
+
+/// End-of-stream counterpart to [`glimmer_route_fragment`]: route the
+/// `TokenTextStream` tail down whichever harmony channel was open when
+/// generation ended.
+///
+/// Generation can stop mid-character (max_tokens or a stop token landing
+/// between two byte-fallback tokens); dropping the tail is a silent
+/// truncation of the visible turn. The tail carries no token id of its own —
+/// see [`GlimmerChannelRecorder::push_trailing_text`].
+fn glimmer_route_trailing_fragment(
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    router: &mut GlimmerHarmonyRouter,
+    recorder: &mut GlimmerChannelRecorder,
+    visible_acc: &mut String,
+    tool_acc: &mut String,
+    frag: &str,
+) {
+    if frag.is_empty() {
+        return;
+    }
+    let (events, _) = router.push(frag);
+    for ev in events {
+        match ev {
+            GlimmerEmit::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
+            GlimmerEmit::Token(text) => {
+                visible_acc.push_str(&text);
+                emit_visible_token(stdout, id, &text);
+            }
+            GlimmerEmit::Tool(text) => {
+                tool_acc.push_str(&text);
+            }
+        }
+    }
+    if router.just_forced() {
+        recorder.mark_forced_reasoning_close();
+    }
+    recorder.push_trailing_text(frag);
 }
 
 /// Map the request's think budget onto Muse Glimmer's `Reasoning strength:` control.
@@ -30430,6 +30675,24 @@ impl GlimmerChannelRecorder {
             GlimmerRecorderState::AwaitingStart => {
                 self.state = GlimmerRecorderState::Refused(GlimmerRecordRefusal::UnexpectedMarker);
             }
+            _ => {}
+        }
+    }
+    /// Append end-of-stream text that has no owning token id.
+    ///
+    /// Used only for a `TokenTextStream::flush`: generation stopped
+    /// mid-character, so those bytes belong to a token whose id was already
+    /// recorded (its `push` carried an empty fragment while the character was
+    /// still split across tokens). Routing the tail back through `push` with a
+    /// synthetic id would append a phantom token to `token_ids` and corrupt
+    /// the verbatim-splice replay.
+    fn push_trailing_text(&mut self, decoded_frag: &str) {
+        if decoded_frag.is_empty() {
+            return;
+        }
+        match &mut self.state {
+            GlimmerRecorderState::Body(body) => body.text.push_str(decoded_frag),
+            GlimmerRecorderState::Header { decoded, .. } => decoded.push_str(decoded_frag),
             _ => {}
         }
     }
@@ -31679,6 +31942,11 @@ fn generate_muse_glimmer(
     let mut glimmer_emitted_ids: Vec<u32> = Vec::new();
     let mut glimmer_visible_acc: String = String::new();
     let mut glimmer_tool_acc: String = String::new();
+    // One incremental decoder for the whole turn — every emit site (AR seed,
+    // AR loop, spec fallback, accepted block, stop flush, profit probe) shares
+    // it, so a character split across the boundary between two of those paths
+    // still reassembles.
+    let mut text_stream = hipfire_runtime::tokenizer::TokenTextStream::new();
     // Speculative path: greedy is the validated 3.17x path; sampled chain-sample
     // (temp>0) is gated on dflash_fast_sample + batched logits + !min_p.
     // The drafter presence is gated by HIPFIRE_DFLASH_DRAFT / dflash_mode=off
@@ -31781,25 +32049,20 @@ fn generate_muse_glimmer(
         // commit the stop token into KV/capture — fall through to shared post-spec finalization.
         let mut skip_spec_loop = false;
         if !stop_set.contains(&last_pick) && generated_count < max_tokens {
-            let frag = m.tokenizer.as_ref().unwrap().decode(&[last_pick]);
+            // Incremental decode with holdback — never `decode(&[last_pick])`,
+            // which is lossy per token and splits multi-token UTF-8 into FFFD.
             // Feed through harmony router; header fragments produce no visible event
-            let (events, should_stop_seed) = harmony_router.push(&frag);
-            for ev in events {
-                match ev {
-                    GlimmerEmit::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
-                    GlimmerEmit::Token(text) => {
-                        glimmer_visible_acc.push_str(&text);
-                        emit_visible_token(stdout, id, &text)
-                    }
-                    GlimmerEmit::Tool(text) => {
-                        glimmer_tool_acc.push_str(&text);
-                    }
-                }
-            }
-            if harmony_router.just_forced() {
-                glimmer_recorder.mark_forced_reasoning_close();
-            }
-            glimmer_recorder.push(last_pick, &frag);
+            let frag = text_stream.push(m.tokenizer.as_ref().unwrap(), last_pick);
+            let should_stop_seed = glimmer_route_fragment(
+                stdout,
+                id,
+                &mut harmony_router,
+                &mut glimmer_recorder,
+                &mut glimmer_visible_acc,
+                &mut glimmer_tool_acc,
+                last_pick,
+                &frag,
+            );
             // Seed was routed through harmony; if it indicated stop, we still count it but don't enter spec loop
             m.conversation_tokens.push(last_pick);
             glimmer_emitted_ids.push(last_pick);
@@ -32078,26 +32341,17 @@ fn generate_muse_glimmer(
                                 last_pick = next_tok;
                                 break;
                             }
-                            let frag = m.tokenizer.as_ref().unwrap().decode(&[next_tok]);
-                            let (events, should_stop_fb) = harmony_router.push(&frag);
-                            for ev in events {
-                                match ev {
-                                    GlimmerEmit::Reasoning(text) => {
-                                        emit_reasoning_token(stdout, id, &text)
-                                    }
-                                    GlimmerEmit::Token(text) => {
-                                        glimmer_visible_acc.push_str(&text);
-                                        emit_visible_token(stdout, id, &text)
-                                    }
-                                    GlimmerEmit::Tool(text) => {
-                                        glimmer_tool_acc.push_str(&text);
-                                    }
-                                }
-                            }
-                            if harmony_router.just_forced() {
-                                glimmer_recorder.mark_forced_reasoning_close();
-                            }
-                            glimmer_recorder.push(next_tok, &frag);
+                            let frag = text_stream.push(m.tokenizer.as_ref().unwrap(), next_tok);
+                            let should_stop_fb = glimmer_route_fragment(
+                                stdout,
+                                id,
+                                &mut harmony_router,
+                                &mut glimmer_recorder,
+                                &mut glimmer_visible_acc,
+                                &mut glimmer_tool_acc,
+                                next_tok,
+                                &frag,
+                            );
                             m.conversation_tokens.push(next_tok);
                             glimmer_emitted_ids.push(next_tok);
                             generated_count += 1;
@@ -32433,26 +32687,17 @@ fn generate_muse_glimmer(
                         break;
                     }
                     if stop_set.contains(&tok) {
-                        let frag = m.tokenizer.as_ref().unwrap().decode(&[tok]);
-                        let (events, _) = harmony_router.push(&frag);
-                        for ev in events {
-                            match ev {
-                                GlimmerEmit::Reasoning(text) => {
-                                    emit_reasoning_token(stdout, id, &text)
-                                }
-                                GlimmerEmit::Token(text) => {
-                                    glimmer_visible_acc.push_str(&text);
-                                    emit_visible_token(stdout, id, &text)
-                                }
-                                GlimmerEmit::Tool(text) => {
-                                    glimmer_tool_acc.push_str(&text);
-                                }
-                            }
-                        }
-                        if harmony_router.just_forced() {
-                            glimmer_recorder.mark_forced_reasoning_close();
-                        }
-                        glimmer_recorder.push(tok, &frag);
+                        let frag = text_stream.push(m.tokenizer.as_ref().unwrap(), tok);
+                        glimmer_route_fragment(
+                            stdout,
+                            id,
+                            &mut harmony_router,
+                            &mut glimmer_recorder,
+                            &mut glimmer_visible_acc,
+                            &mut glimmer_tool_acc,
+                            tok,
+                            &frag,
+                        );
                         last_pick = tok;
                         m.conversation_tokens.push(tok);
                         glimmer_emitted_ids.push(tok);
@@ -32460,24 +32705,17 @@ fn generate_muse_glimmer(
                         should_stop_block = true;
                         break;
                     }
-                    let frag = m.tokenizer.as_ref().unwrap().decode(&[tok]);
-                    let (events, should_stop) = harmony_router.push(&frag);
-                    for ev in events {
-                        match ev {
-                            GlimmerEmit::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
-                            GlimmerEmit::Token(text) => {
-                                glimmer_visible_acc.push_str(&text);
-                                emit_visible_token(stdout, id, &text)
-                            }
-                            GlimmerEmit::Tool(text) => {
-                                glimmer_tool_acc.push_str(&text);
-                            }
-                        }
-                    }
-                    if harmony_router.just_forced() {
-                        glimmer_recorder.mark_forced_reasoning_close();
-                    }
-                    glimmer_recorder.push(tok, &frag);
+                    let frag = text_stream.push(m.tokenizer.as_ref().unwrap(), tok);
+                    let should_stop = glimmer_route_fragment(
+                        stdout,
+                        id,
+                        &mut harmony_router,
+                        &mut glimmer_recorder,
+                        &mut glimmer_visible_acc,
+                        &mut glimmer_tool_acc,
+                        tok,
+                        &frag,
+                    );
                     m.conversation_tokens.push(tok);
                     glimmer_emitted_ids.push(tok);
                     generated_count += 1;
@@ -32629,26 +32867,17 @@ fn generate_muse_glimmer(
                             if generated_count >= max_tokens {
                                 break;
                             }
-                            let frag = m.tokenizer.as_ref().unwrap().decode(&[pred]);
-                            let (events, should_stop_pred) = harmony_router.push(&frag);
-                            for ev in events {
-                                match ev {
-                                    GlimmerEmit::Reasoning(text) => {
-                                        emit_reasoning_token(stdout, id, &text)
-                                    }
-                                    GlimmerEmit::Token(text) => {
-                                        glimmer_visible_acc.push_str(&text);
-                                        emit_visible_token(stdout, id, &text)
-                                    }
-                                    GlimmerEmit::Tool(text) => {
-                                        glimmer_tool_acc.push_str(&text);
-                                    }
-                                }
-                            }
-                            if harmony_router.just_forced() {
-                                glimmer_recorder.mark_forced_reasoning_close();
-                            }
-                            glimmer_recorder.push(pred, &frag);
+                            let frag = text_stream.push(m.tokenizer.as_ref().unwrap(), pred);
+                            let should_stop_pred = glimmer_route_fragment(
+                                stdout,
+                                id,
+                                &mut harmony_router,
+                                &mut glimmer_recorder,
+                                &mut glimmer_visible_acc,
+                                &mut glimmer_tool_acc,
+                                pred,
+                                &frag,
+                            );
                             m.conversation_tokens.push(pred);
                             glimmer_emitted_ids.push(pred);
                             generated_count += 1;
@@ -32729,49 +32958,35 @@ fn generate_muse_glimmer(
             // eos/eot always stop; eom is handled via router text marker
             if stop_set.contains(&next_tok) {
                 // Flush any pending via router marker path then stop
-                let frag = m.tokenizer.as_ref().unwrap().decode(&[next_tok]);
-                let (events, _) = harmony_router.push(&frag);
-                for ev in events {
-                    match ev {
-                        GlimmerEmit::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
-                        GlimmerEmit::Token(text) => {
-                            glimmer_visible_acc.push_str(&text);
-                            emit_visible_token(stdout, id, &text)
-                        }
-                        GlimmerEmit::Tool(text) => {
-                            glimmer_tool_acc.push_str(&text);
-                        }
-                    }
-                }
-                if harmony_router.just_forced() {
-                    glimmer_recorder.mark_forced_reasoning_close();
-                }
-                glimmer_recorder.push(next_tok, &frag);
+                let frag = text_stream.push(m.tokenizer.as_ref().unwrap(), next_tok);
+                glimmer_route_fragment(
+                    stdout,
+                    id,
+                    &mut harmony_router,
+                    &mut glimmer_recorder,
+                    &mut glimmer_visible_acc,
+                    &mut glimmer_tool_acc,
+                    next_tok,
+                    &frag,
+                );
                 // Push stop token to KV? No — mirror prior break-before-push for eos.
                 break;
             }
 
             let frag = {
                 let tokenizer = m.tokenizer.as_ref().unwrap();
-                tokenizer.decode(&[next_tok])
+                text_stream.push(tokenizer, next_tok)
             };
-            let (events, should_stop) = harmony_router.push(&frag);
-            for ev in events {
-                match ev {
-                    GlimmerEmit::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
-                    GlimmerEmit::Token(text) => {
-                        glimmer_visible_acc.push_str(&text);
-                        emit_visible_token(stdout, id, &text)
-                    }
-                    GlimmerEmit::Tool(text) => {
-                        glimmer_tool_acc.push_str(&text);
-                    }
-                }
-            }
-            if harmony_router.just_forced() {
-                glimmer_recorder.mark_forced_reasoning_close();
-            }
-            glimmer_recorder.push(next_tok, &frag);
+            let should_stop = glimmer_route_fragment(
+                stdout,
+                id,
+                &mut harmony_router,
+                &mut glimmer_recorder,
+                &mut glimmer_visible_acc,
+                &mut glimmer_tool_acc,
+                next_tok,
+                &frag,
+            );
             if should_stop {
                 break;
             }
@@ -32810,6 +33025,19 @@ fn generate_muse_glimmer(
                 }
             }
         }
+        // Generation can stop mid-character; route the held-back tail down the
+        // open channel BEFORE draining the router, so it is classified like
+        // every other fragment rather than dropped.
+        let tail = text_stream.flush();
+        glimmer_route_trailing_fragment(
+            stdout,
+            id,
+            &mut harmony_router,
+            &mut glimmer_recorder,
+            &mut glimmer_visible_acc,
+            &mut glimmer_tool_acc,
+            &tail,
+        );
         // Flush any trailing incomplete channel text
         for ev in harmony_router.flush() {
             match ev {
@@ -32821,6 +33049,20 @@ fn generate_muse_glimmer(
             }
         }
     }
+
+    // A pure-spec turn (`ar_pending` never set) skips the AR tail above and so
+    // never reached that flush. `TokenTextStream::flush` is idempotent — this
+    // is a no-op when the AR tail already drained it.
+    let tail = text_stream.flush();
+    glimmer_route_trailing_fragment(
+        stdout,
+        id,
+        &mut harmony_router,
+        &mut glimmer_recorder,
+        &mut glimmer_visible_acc,
+        &mut glimmer_tool_acc,
+        &tail,
+    );
 
     // A parse failure here used to vanish into `unwrap_or_default()`: the model
     // emits a whole turn into the tool channel, ATEM refuses it, and the caller
@@ -33225,6 +33467,7 @@ fn generate_lfm2moe(
 
     let mut generated_count: usize = 0;
     let decode_t0 = Instant::now();
+    let mut text_stream = hipfire_runtime::tokenizer::TokenTextStream::new();
     loop {
         if check_abort(id) {
             let ep = production_fail_closed_rollback(m, gpu, None, None);
@@ -33239,27 +33482,22 @@ fn generate_lfm2moe(
             break;
         }
 
-        let frag = {
-            let tokenizer = m.tokenizer.as_ref().unwrap();
-            tokenizer.decode(&[next_tok])
-        };
         // String-level EOS-class guard. The id-based `stop_toks` above misses
         // `<|endoftext|>` because encoding the literal STRING doesn't round-trip
         // to the special-token id (it yields subwords), so the real token id is
-        // never in the set. The daemon decodes one token at a time, so the
-        // leaking turn-end token arrives as its own frag — catch it on the
-        // decoded text and stop WITHOUT emitting (was: "...Paris.<|endoftext|>").
-        if matches!(frag.trim(), "<|endoftext|>" | "</s>" | "<|im_end|>") {
+        // never in the set. Catch it on the token's decoded text and stop
+        // WITHOUT emitting (was: "...Paris.<|endoftext|>").
+        if is_eos_class_marker_token(m.tokenizer.as_ref().unwrap(), next_tok) {
             break;
         }
-        let envelope = serde_json::json!({
-            "type": "token",
-            "id": id,
-            "text": frag,
-            "attempt_id": active_attempt_id(),
-        });
-        let _ = writeln!(stdout, "{}", envelope);
-        let _ = stdout.flush();
+        // Incremental decode with holdback: a character whose UTF-8 spans
+        // several tokens yields "" until its last byte arrives. Never
+        // `decode(&[next_tok])` — lossy per token, splits UTF-8 into FFFD.
+        let frag = {
+            let tokenizer = m.tokenizer.as_ref().unwrap();
+            text_stream.push(tokenizer, next_tok)
+        };
+        emit_text_fragment(stdout, id, &frag);
         m.conversation_tokens.push(next_tok);
         generated_count += 1;
 
@@ -33296,6 +33534,10 @@ fn generate_lfm2moe(
         emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
         return;
     }
+
+    // Generation can stop mid-character (max_tokens reached between two
+    // byte-fallback tokens). Without this flush those bytes are dropped.
+    emit_text_fragment(stdout, id, &text_stream.flush());
 
     m.seq_pos = m.lfm2moe().unwrap().state.n_tokens;
 
@@ -33682,6 +33924,7 @@ fn generate_minimax(
 
     let mut generated_count: usize = 0;
     let decode_t0 = Instant::now();
+    let mut text_stream = hipfire_runtime::tokenizer::TokenTextStream::new();
     loop {
         if generated_count >= max_tokens {
             break;
@@ -33692,20 +33935,17 @@ fn generate_minimax(
             break;
         }
 
-        // Emit the text fragment. Build through serde_json so a user-supplied
-        // `id` or arbitrary-UTF-8 fragment can't corrupt the JSONL line.
+        // Emit the text fragment through the incremental decoder, which holds
+        // back a character whose UTF-8 spans several tokens until its last
+        // byte arrives (never `decode(&[next_tok])` — lossy per token, splits
+        // UTF-8 into FFFD). `emit_text_fragment` builds through serde_json so
+        // a user-supplied `id` or arbitrary-UTF-8 fragment can't corrupt the
+        // JSONL line, and skips the "" holdback steps.
         let frag = {
             let tokenizer = m.tokenizer.as_ref().unwrap();
-            tokenizer.decode(&[next_tok])
+            text_stream.push(tokenizer, next_tok)
         };
-        let envelope = serde_json::json!({
-            "type": "token",
-            "id": id,
-            "text": frag,
-            "attempt_id": active_attempt_id(),
-        });
-        let _ = writeln!(stdout, "{}", envelope);
-        let _ = stdout.flush();
+        emit_text_fragment(stdout, id, &frag);
         m.conversation_tokens.push(next_tok);
         generated_count += 1;
 
@@ -33729,6 +33969,10 @@ fn generate_minimax(
             }
         }
     }
+
+    // Generation can stop mid-character (max_tokens reached between two
+    // byte-fallback tokens). Without this flush those bytes are dropped.
+    emit_text_fragment(stdout, id, &text_stream.flush());
 
     m.seq_pos = m.minimax().unwrap().state.n_tokens;
 
@@ -34122,6 +34366,55 @@ fn generate_cohere2moe(
         Text,
         Action,
     }
+    /// Route one decoded text fragment down whichever agentic channel is
+    /// currently open. Shared by the decode loop and the end-of-stream flush,
+    /// so a character that completed only at the flush lands on the same
+    /// channel the turn ended on instead of being dropped — dropping it is a
+    /// silent truncation.
+    ///
+    /// Skips empty fragments: `TokenTextStream::push` returns "" on every
+    /// holdback step, and emitting those would put a contentless chunk on the
+    /// wire for each byte of each emoji.
+    #[allow(clippy::too_many_arguments)]
+    fn route_fragment(
+        stdout: &mut impl std::io::Write,
+        id: &str,
+        sec: Sec,
+        frag: &str,
+        action_buf: &mut String,
+        vis_buf: &mut String,
+        think_count: &mut usize,
+        emitted_visible: &mut bool,
+    ) {
+        if frag.is_empty() {
+            return;
+        }
+        match sec {
+            Sec::Action => action_buf.push_str(frag),
+            Sec::Think => {
+                // Reasoning channel: tagged so clients can fold it; the CLI
+                // (ignoring unknown fields) shows it inline.
+                let _ = writeln!(
+                    stdout,
+                    "{}",
+                    serde_json::json!({"type": "token", "id": id, "text": frag, "reasoning": true, "attempt_id": active_attempt_id()})
+                );
+                let _ = stdout.flush();
+                *think_count += 1;
+            }
+            Sec::Text | Sec::Pre => {
+                vis_buf.push_str(frag);
+                let _ = writeln!(
+                    stdout,
+                    "{}",
+                    serde_json::json!({"type": "token", "id": id, "text": frag, "attempt_id": active_attempt_id()})
+                );
+                let _ = stdout.flush();
+                *emitted_visible = true;
+            }
+        }
+    }
+
     let mut sec = Sec::Pre;
     let mut action_buf = String::new();
 
@@ -34208,6 +34501,7 @@ fn generate_cohere2moe(
 
     let mut generated_count: usize = 0;
     let decode_t0 = Instant::now();
+    let mut text_stream = hipfire_runtime::tokenizer::TokenTextStream::new();
     loop {
         if generated_count >= max_tokens {
             break;
@@ -34335,12 +34629,6 @@ fn generate_cohere2moe(
             }
             sec = Sec::Pre;
         } else {
-            // Build the fragment through serde_json so arbitrary UTF-8 can't
-            // corrupt the JSONL line.
-            let frag = {
-                let tokenizer = m.tokenizer.as_ref().unwrap();
-                tokenizer.decode(&[next_tok])
-            };
             // Defense-in-depth: never emit a Cohere structural marker into
             // visible output / the action buffer. The ID state machine above
             // handles the 6 THINKING/TEXT/ACTION markers; this catches any OTHER
@@ -34348,40 +34636,32 @@ fn generate_cohere2moe(
             // CHATBOT_TOKEN, START_TOOL_RESULT, …) — each decodes to a full
             // `<|MARKER|>`. The token is still fed to decode_step below; only its
             // emit is dropped, so a state-machine miss can never leak a marker.
-            let is_marker = frag.len() > 4
-                && frag.starts_with("<|")
-                && frag.ends_with("|>")
-                && frag[2..frag.len() - 2]
-                    .chars()
-                    .all(|c| c.is_ascii_uppercase() || c == '_');
-            if is_marker {
-                // suppressed
-            } else {
-                match sec {
-                    Sec::Action => action_buf.push_str(&frag),
-                    Sec::Think => {
-                        // Reasoning channel: tagged so clients can fold it; the CLI
-                        // (ignoring unknown fields) shows it inline.
-                        let _ = writeln!(
-                            stdout,
-                            "{}",
-                            serde_json::json!({"type": "token", "id": id, "text": frag, "reasoning": true, "attempt_id": active_attempt_id()})
-                        );
-                        let _ = stdout.flush();
-                        think_count += 1;
-                    }
-                    Sec::Text | Sec::Pre => {
-                        vis_buf.push_str(&frag);
-                        let _ = writeln!(
-                            stdout,
-                            "{}",
-                            serde_json::json!({"type": "token", "id": id, "text": frag, "attempt_id": active_attempt_id()})
-                        );
-                        let _ = stdout.flush();
-                        emitted_visible = true;
-                    }
+            //
+            // Tested on the token's OWN bytes, not on the stream fragment: a
+            // fragment can carry the completion bytes of a preceding split
+            // character, whose leading char would defeat the `<|…|>` shape
+            // match.
+            let frag = {
+                let tokenizer = m.tokenizer.as_ref().unwrap();
+                if is_bracketed_marker_token(tokenizer, next_tok) {
+                    String::new()
+                } else {
+                    // Incremental decode with holdback — never
+                    // `decode(&[next_tok])`, which is lossy per token and
+                    // splits multi-token UTF-8 into FFFD.
+                    text_stream.push(tokenizer, next_tok)
                 }
-            }
+            };
+            route_fragment(
+                stdout,
+                id,
+                sec,
+                &frag,
+                &mut action_buf,
+                &mut vis_buf,
+                &mut think_count,
+                &mut emitted_visible,
+            );
         }
 
         // Advance one step on the freshly sampled token (plain eager decode —
@@ -34402,6 +34682,23 @@ fn generate_cohere2moe(
             }
         }
     }
+
+    // Generation can stop mid-character (max_tokens or a degenerate-output
+    // guard firing between two byte-fallback tokens). Route the held-back
+    // tail down whichever channel was open when the turn ended — dropping it
+    // is a silent truncation, and it must reach `vis_buf` / `action_buf` too
+    // so the tool-call recovery below sees the complete text.
+    let tail = text_stream.flush();
+    route_fragment(
+        stdout,
+        id,
+        sec,
+        &tail,
+        &mut action_buf,
+        &mut vis_buf,
+        &mut think_count,
+        &mut emitted_visible,
+    );
 
     m.seq_pos = m.cohere2moe().unwrap().state.n_tokens;
 
@@ -34647,6 +34944,7 @@ fn generate_qwen2(
     let mut generated_count: usize = 0;
     let eos_set: &[u32] = &cfg.eos_token_ids;
     let decode_t0 = Instant::now();
+    let mut text_stream = hipfire_runtime::tokenizer::TokenTextStream::new();
     let mut next_tok = match gpu.argmax_f32(&state.logits, cfg.vocab_size) {
         Ok(t) => t,
         Err(e) => {
@@ -34663,21 +34961,16 @@ fn generate_qwen2(
         if eos_set.contains(&next_tok) {
             break;
         }
-        // Emit text fragment for this token. Tokenizer.decode handles
-        // BPE byte-fragment reassembly; for special tokens that decode
-        // to an empty string we still advance the loop. Build through
-        // serde_json so `id` (user-supplied) and `frag` (arbitrary
-        // UTF-8 with possible `"` / `\` / control chars) can't corrupt
-        // the JSONL line.
-        let frag = tokenizer.decode(&[next_tok]);
-        let envelope = serde_json::json!({
-            "type": "token",
-            "id": id,
-            "text": frag,
-            "attempt_id": active_attempt_id(),
-        });
-        let _ = writeln!(stdout, "{}", envelope);
-        let _ = stdout.flush();
+        // Emit text fragment for this token through the incremental
+        // decoder: a character whose UTF-8 spans several tokens (emoji,
+        // byte-fallback CJK) yields "" until its last byte arrives, and
+        // `emit_text_fragment` skips those holdback steps. Never
+        // `tokenizer.decode(&[next_tok])` here — that is lossy per token
+        // and splits UTF-8 into FFFD. The envelope is built through
+        // serde_json so `id` (user-supplied) and the text (arbitrary UTF-8
+        // with possible `"` / `\` / control chars) can't corrupt the line.
+        let frag = text_stream.push(tokenizer, next_tok);
+        emit_text_fragment(stdout, id, &frag);
         m.conversation_tokens.push(next_tok);
         generated_count += 1;
 
@@ -34690,6 +34983,10 @@ fn generate_qwen2(
             }
         }
     }
+
+    // Generation can stop mid-character (max_tokens reached between two
+    // byte-fallback tokens). Without this flush those bytes are dropped.
+    emit_text_fragment(stdout, id, &text_stream.flush());
 
     // Daemon bookkeeping: seq_pos matches Qwen2State's internal cursor.
     m.seq_pos = state.next_pos;
@@ -43692,5 +43989,194 @@ mod serve_fault_inject_tests {
         assert!(model_retry_reset_eligible(6));
         assert!(!model_retry_reset_eligible(9)); // deepseek4
         assert!(!model_retry_reset_eligible(0)); // llama
+    }
+}
+
+/// Emit-level coverage for the incremental token → text decode.
+///
+/// The helper's own invariants live in `hipfire-runtime`'s
+/// `token_text_stream_tests`; these drive the daemon's *wiring* — the JSONL
+/// events a client actually receives — with a synthetic byte-fallback vocab, no
+/// GPU and no model file. What they pin that nothing else does: no `U+FFFD` on
+/// the wire, and no contentless `{"type":"token"}` chunk per holdback step.
+#[cfg(test)]
+mod streaming_emit_tests {
+    use super::*;
+
+    /// Synthetic SentencePiece vocab whose ids `0..=255` are the `<0xHH>`
+    /// byte-fallback tokens. Built through the public `from_hf_json` path (no
+    /// `Ġ` in the vocab ⇒ the SentencePiece branch), so a character's UTF-8
+    /// spreads across one token per byte — exactly the shape that produced
+    /// `"emoji: ���������"`.
+    fn byte_fallback_tokenizer() -> hipfire_runtime::tokenizer::Tokenizer {
+        let mut vocab = serde_json::Map::new();
+        for b in 0u32..=255 {
+            vocab.insert(format!("<0x{b:02X}>"), serde_json::json!(b));
+        }
+        let json = serde_json::json!({
+            "model": { "type": "Unigram", "vocab": vocab },
+        })
+        .to_string();
+        hipfire_runtime::tokenizer::Tokenizer::from_hf_json(&json)
+            .expect("synthetic byte-fallback vocab must load")
+    }
+
+    /// Split `text` into one byte-fallback token per UTF-8 byte.
+    fn byte_tokens(text: &str) -> Vec<u32> {
+        text.as_bytes().iter().map(|&b| b as u32).collect()
+    }
+
+    /// Parse captured JSONL into the `(type, text)` pairs a client would see.
+    fn events(buf: &[u8]) -> Vec<(String, String)> {
+        String::from_utf8(buf.to_vec())
+            .expect("emitted JSONL must be valid UTF-8")
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| {
+                let v: serde_json::Value =
+                    serde_json::from_str(l).unwrap_or_else(|e| panic!("bad JSONL {l:?}: {e}"));
+                (
+                    v["type"].as_str().unwrap_or_default().to_string(),
+                    v["text"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// Drive the plain JSONL emit path exactly as an arch decode loop does.
+    fn drive_plain(text: &str) -> Vec<(String, String)> {
+        let tk = byte_fallback_tokenizer();
+        let mut out: Vec<u8> = Vec::new();
+        let mut stream = hipfire_runtime::tokenizer::TokenTextStream::new();
+        for tok in byte_tokens(text) {
+            let frag = stream.push(&tk, tok);
+            emit_text_fragment(&mut out, "req-1", &frag);
+        }
+        emit_text_fragment(&mut out, "req-1", &stream.flush());
+        events(&out)
+    }
+
+    #[test]
+    fn emitted_tokens_carry_no_replacement_chars() {
+        for text in ["emoji: 🎉🔥🚀", "math ∑∫≈", "中文测试", "café naïve"] {
+            let evs = drive_plain(text);
+            for (_, t) in &evs {
+                assert!(
+                    !t.contains('\u{FFFD}'),
+                    "emitted {t:?} contains U+FFFD for input {text:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn concatenated_token_events_equal_the_source_text() {
+        for text in ["emoji: 🎉🔥🚀", "math ∑∫≈", "中文测试", "plain ascii", "🎉"]
+        {
+            let joined: String = drive_plain(text).into_iter().map(|(_, t)| t).collect();
+            assert_eq!(joined, text, "round-trip failed for {text:?}");
+        }
+    }
+
+    /// The holdback contract. Without it every byte of every emoji puts a
+    /// contentless chunk on the wire — the one thing no helper-level test
+    /// covers, because it is about the wiring rather than the decoder.
+    #[test]
+    fn no_empty_text_events_are_emitted() {
+        let evs = drive_plain("emoji: 🎉🔥🚀 中文 ∑");
+        assert!(!evs.is_empty(), "expected at least one token event");
+        for (ty, t) in &evs {
+            assert_eq!(ty, "token");
+            assert!(!t.is_empty(), "holdback step leaked an empty token event");
+        }
+    }
+
+    /// Baseline: the same loop written the old way really does corrupt, so
+    /// these tests would fail against the pre-fix daemon.
+    #[test]
+    fn per_token_decode_baseline_is_corrupt() {
+        let tk = byte_fallback_tokenizer();
+        let corrupt: String = byte_tokens("emoji: 🎉")
+            .iter()
+            .map(|&t| tk.decode(&[t]))
+            .collect();
+        assert!(corrupt.contains('\u{FFFD}'));
+        assert_ne!(corrupt, "emoji: 🎉");
+    }
+
+    /// Generation stopping mid-character must not silently drop the tail.
+    #[test]
+    fn truncated_generation_flushes_its_tail() {
+        let tk = byte_fallback_tokenizer();
+        let all = byte_tokens("ok 🎉");
+        let truncated = &all[..all.len() - 1]; // cut inside the emoji
+        let mut out: Vec<u8> = Vec::new();
+        let mut stream = hipfire_runtime::tokenizer::TokenTextStream::new();
+        for &tok in truncated {
+            let frag = stream.push(&tk, tok);
+            emit_text_fragment(&mut out, "req-1", &frag);
+        }
+        let joined_before: String = events(&out).into_iter().map(|(_, t)| t).collect();
+        assert_eq!(
+            joined_before, "ok ",
+            "partial char must not be emitted early"
+        );
+
+        emit_text_fragment(&mut out, "req-1", &stream.flush());
+        let joined: String = events(&out).into_iter().map(|(_, t)| t).collect();
+        assert!(
+            joined.len() > joined_before.len(),
+            "flush dropped the truncated tail entirely"
+        );
+        assert!(joined.starts_with("ok "));
+    }
+
+    /// The glimmer harmony router path: same guarantees, but the fragment is
+    /// channel-classified before it reaches the wire.
+    #[test]
+    fn glimmer_router_path_reassembles_multi_token_characters() {
+        let tk = byte_fallback_tokenizer();
+        let body = "Hello 🎉 中文 ∑!";
+        let text = format!(" to=user<|message|>{body}");
+        let mut out: Vec<u8> = Vec::new();
+        let mut router = GlimmerHarmonyRouter::new(0);
+        let mut recorder = GlimmerChannelRecorder::new();
+        let mut visible = String::new();
+        let mut tool = String::new();
+        let mut stream = hipfire_runtime::tokenizer::TokenTextStream::new();
+
+        for tok in byte_tokens(&text) {
+            let frag = stream.push(&tk, tok);
+            glimmer_route_fragment(
+                &mut out,
+                "req-1",
+                &mut router,
+                &mut recorder,
+                &mut visible,
+                &mut tool,
+                tok,
+                &frag,
+            );
+        }
+        let tail = stream.flush();
+        glimmer_route_trailing_fragment(
+            &mut out,
+            "req-1",
+            &mut router,
+            &mut recorder,
+            &mut visible,
+            &mut tool,
+            &tail,
+        );
+
+        assert!(
+            !visible.contains('\u{FFFD}'),
+            "harmony-routed visible text mojibaked: {visible:?}"
+        );
+        assert_eq!(visible, body, "harmony router lost or corrupted characters");
+        for (_, t) in events(&out) {
+            assert!(!t.is_empty(), "holdback step leaked an empty token event");
+            assert!(!t.contains('\u{FFFD}'));
+        }
     }
 }
