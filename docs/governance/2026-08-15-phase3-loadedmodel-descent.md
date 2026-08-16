@@ -1,6 +1,6 @@
 # Phase 3 — the `LoadedModel` descent
 
-**Status: scoped and measured, not started.** This is the only remaining path to two
+**Status: two of four steps landed and byte-verified. Two remain, both blocked on missing harnesses.** This is the only remaining path to two
 Phase-2 deliverables that are otherwise structurally unreachable. Everything below was
 measured against `arch/saddle` at `1f1bf9d1c`, not estimated.
 
@@ -93,3 +93,52 @@ Do the side-car rehoming **first**, as its own landable change. Moving `vision_c
 valuable, independently verifiable, and shrinks the descent to the `state` field alone. A
 single change that moves `LoadedModel`, deletes `ModelState`, rehomes six fields and rewrites
 143 call sites is not reviewable.
+
+
+---
+
+## Progress log
+
+### Landed — arch-typed `LoadedModel` fields 6 -> 2
+
+**Step 1, vision side-cars.** `dots_ocr_config` / `dots_ocr_weights` collapsed into one
+bundle; `vision_config` / `vision_weights` moved into `Qwen35Bundle`, staying `Option`
+because `Qwen35Carrier` side-loads the tower only after probing
+`model.visual.patch_embed.proj.weight` and a text-only Qwen3.5 has none. Created a new
+`qwen35 -> qwen35-vl` edge — acyclic, and the crate-map drift check caught it unprompted.
+
+**Step 2, dots-ocr normalised.** Ten architectures lived in `ModelState`; dots-ocr alone rode
+as a separate field, so every consumer had to know two places a model could live. Now
+`ModelState::DotsOcr`. Its `pp>1` unload arm is empty by design — dots-ocr has no pipeline
+parallelism — but the match stays exhaustive so omission is a compile error.
+
+**Verification method, both steps.** A decoded baseline was captured BEFORE each change from
+a real dots-ocr run over `benchmarks/images/dots_ocr_smoke_001.jpg` — 19,520 patches through
+the RDNA4 WMMA vision path, producing HTML tables from a scientific paper — and diffed after.
+**Byte-identical, 8,286 bytes, both times.** Text-only generation confirmed separately. A
+compile proves nothing on these paths.
+
+### Remaining — and why each is blocked
+
+```
+pub state:           Option<ModelState>            // the enum itself
+pub pp_scratch_set:  Option<Qwen35ScratchSet>      // pipeline-parallel scratch
+```
+
+**`state`** needs the 143-site `hipfire-generate` conversion to downcasts. Unchanged from the
+original scoping.
+
+**`pp_scratch_set` is NOT a single field and must not be moved as one.** `skeleton_pp`
+(`hipfire-loader/src/lib.rs:1241-1262`) sets four multi-GPU fields as a unit, and its own
+comment says why: *"a dropped `pp_scratch_set` is a silent VRAM leak; `pp_gpus` /
+`pp_dn_la_to_device` are `.expect()`ed in unload."* Moving one breaks a coupling that exists
+deliberately to prevent that leak.
+
+Moving all four also drags `Gpus` — device placement — which the layering deliberately keeps
+out of `saddle-core`.
+
+Pipeline parallelism is reachable only through the daemon's `load` params (`pp`), not a
+`serve` flag, is restricted to Qwen3.5 dense and MoE, and is mutually exclusive with `tp>1`.
+There is no PP fixture or harness, and the failure mode is a *silent* VRAM leak — which a
+functional smoke test would not catch. **This step needs a load/unload VRAM-delta harness
+built first.** That is the prerequisite, not the refactor.
