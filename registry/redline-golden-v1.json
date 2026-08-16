@@ -7,7 +7,7 @@
     "file": "qwen3.6-35b-a3b.mq4r",
     "size_bytes": 18700048128,
     "sha256": "4685c140c46b1a6f31a0fd9053bf09d5faf1d2529d715b84794249b66cde0428",
-    "registry_card_sha256": "6a22ac8300e938c3ca562eeb9b5a3159c4e3c8621b1403a69eb3b43eb8707239",
+    "registry_card_sha256": "be7a9f72e572b9e3c33e75954119d6753e0f77c276487ee68717beba9a28fc7f",
     "sampling_profile": "general",
     "sampling_sha256": "6d64d79ecd36dd3f1b026db2fb1ddbcf2e40433349df61c5c182f482e18c6ce4",
     "sampling": {
@@ -71,14 +71,14 @@
         "settle_max_median_drift_pct": 0.5
       },
       "route": {
-        "dispatches": 604,
+        "dispatches": 603,
         "packets": 1,
         "queues": 1,
         "phases": 1,
         "queue_id": 2,
-        "command_dwords": 16832,
+        "command_dwords": 16733,
         "unique_kernels": 22,
-        "sequence_hash": "43754a60ca25f47c",
+        "sequence_hash": "9a15e1013970b7d7",
         "observed_positions": [
           128,
           255
@@ -230,14 +230,14 @@
         "settle_max_median_drift_pct": 0.5
       },
       "route": {
-        "dispatches": 733,
+        "dispatches": 693,
         "packets": 1,
         "queues": 1,
         "phases": 1,
         "queue_id": 2,
-        "command_dwords": 20502,
-        "unique_kernels": 23,
-        "sequence_hash": "3318ffca3daf2338",
+        "command_dwords": 20798,
+        "unique_kernels": 22,
+        "sequence_hash": "c3e02aad4cf40828",
         "observed_positions": [
           128,
           255
