@@ -3240,6 +3240,14 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
                 let la_to_device = m.pp_dn_la_to_device.expect("pp>1 must carry la_to_device");
                 b.dn_state.free_gpu_multi(&mut gpus, &la_to_device);
                 b.weights.free_gpu_multi(&mut gpus);
+                // The pp>1 load allocates TWO scratches: the per-device
+                // `Qwen35ScratchSet` freed above as `pp_scratch_set`, and the
+                // bundle's own single-device `Qwen35Scratch`
+                // (`Qwen35Scratch::new_with_kv_max`, carriers.rs pp tail). Only
+                // the set was being freed, so the bundle's scratch leaked on
+                // every pp>1 unload — measured at +18.1 MiB/cycle, R^2 0.980,
+                // against a perfectly flat pp=1 control for the same model.
+                b.scratch.free_gpu(&mut gpus.devices[0]);
             }
             // Only Qwen35 supports pp>1 today, so the other carriers can never
             // reach this arm with multi-GPU state to free — dropping is correct.
