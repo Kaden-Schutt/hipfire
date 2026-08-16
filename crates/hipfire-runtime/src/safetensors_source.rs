@@ -187,7 +187,7 @@ impl ModelSource for SafetensorsSource {
     }
 }
 
-fn derive_arch_id(config: &serde_json::Value) -> u32 {
+pub fn derive_arch_id(config: &serde_json::Value) -> u32 {
     let archs = config
         .get("architectures")
         .and_then(|a| a.as_array())
@@ -236,50 +236,37 @@ fn derive_arch_id(config: &serde_json::Value) -> u32 {
         }
     }
 
-    // Fallback: check model_type
+    // Fallback: check model_type via the canonical table (single source of truth).
+    // qwen3.5/3.6 family is special: arch 5 (dense) vs 6 (MoE) is decided by
+    // has_experts rather than a distinct model_type string. The table maps those
+    // four strings to 5 (dense default); we override to 6 when experts present
+    // so both `qwen3_5` + num_experts and the explicit `qwen3_5_moe` strings
+    // route correctly. All other model_types go through the canonical lookup.
     let model_type = config
         .get("model_type")
         .or_else(|| text_config.get("model_type"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    match model_type {
-        "qwen3_5" | "qwen3.5" | "qwen3_6" | "qwen3.6" => {
-            if has_experts {
-                6
-            } else {
-                5
-            }
-        }
-        "qwen3" => 1,
-        // qwen2 dirs route to arch_id=7 (Qwen2Carrier / hipfire-arch-qwen2) so
-        // the Q/K/V `attention_bias=true` biases load — the llama-family Dir
-        // loader (arch_id=1) drops them and produces garbage.
-        "qwen2" => 7,
-        "llama" | "mistral" => 0,
-        // Per-expert / VLM arches whose safetensors Dir paths route to their
-        // dedicated carriers. model_type strings mirror the quantizer ingest
-        // map (hipfire-quantize/src/main.rs auto_arch_id).
-        "dots_ocr" => 8,
-        "deepseek_v4" => 9,
-        "minimax_m2" => 10,
-        "lfm2_moe" | "lfm2" => 11,
-        "cohere2_moe" => 12,
-        "gemma4_text" | "gemma4" => 13,
-        "gemma4_unified_assistant" => 22,
-        "muse_glimmer" | "muse_glimmer_text" => 14,
-        "muse_glimmer_assistant" => 23,
-        _ => {
-            // C1: unrecognized model_type → an explicit unclaimed sentinel that NO
-            // carrier matches, so `load_model` fails cleanly with "no carrier for
-            // <dir>" instead of silently mis-routing to Qwen35 (arch_id=5) and dying
-            // deep in weight loading with a confusing error.
-            eprintln!(
-                "warning: unrecognized model_type '{model_type}'; no carrier claims it \
-                 (add a carrier or extend derive_arch_id's model_type mapping)"
-            );
-            UNCLAIMED_ARCH_ID
-        }
+    // qwen3.5/3.6 dense vs MoE determined by num_experts (HF convention).
+    if matches!(model_type, "qwen3_5" | "qwen3.5" | "qwen3_6" | "qwen3.6") {
+        return if has_experts { 6 } else { 5 };
+    }
+
+    if let Some(id) = crate::arch_mapping::lookup_model_type(model_type) {
+        return id;
+    }
+
+    // C1: unrecognized model_type → an explicit unclaimed sentinel that NO
+    // carrier matches, so `load_model` fails cleanly with "no carrier for
+    // <dir>" instead of silently mis-routing to Qwen35 (arch_id=5) and dying
+    // deep in weight loading with a confusing error.
+    {
+        let supported = crate::arch_mapping::supported_model_types_display();
+        eprintln!(
+            "warning: unrecognized model_type '{model_type}'; no carrier claims it              (supported model_types: {supported})"
+        );
+        UNCLAIMED_ARCH_ID
     }
 }
 
@@ -287,7 +274,7 @@ fn derive_arch_id(config: &serde_json::Value) -> u32 {
 /// `model_type`. No carrier's `claims_arch_id` matches it, so routing fails
 /// loudly with a clean "no carrier" error rather than silently defaulting to
 /// Qwen35. Far outside the assigned range (0..=64) the registry tests sweep.
-const UNCLAIMED_ARCH_ID: u32 = u32::MAX;
+pub const UNCLAIMED_ARCH_ID: u32 = u32::MAX;
 
 fn parse_quant_config(config: &serde_json::Value) -> Option<QuantConfig> {
     let qc = config.get("quantization_config")?;

@@ -22,7 +22,7 @@ use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_minimax as minimax;
 use hipfire_arch_muse_glimmer as glimmer;
 use hipfire_arch_qwen2::qwen2;
-use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35ScratchSet};
+use hipfire_arch_qwen35::qwen35::{self, Qwen35ScratchSet};
 use hipfire_arch_qwen35::speculative::DeltaNetSnapshot;
 use hipfire_arch_qwen35::Qwen35Bundle;
 use hipfire_arch_qwen35_vl::qwen35_vl;
@@ -443,10 +443,10 @@ impl AsstTurnCache {
     }
 }
 
-// ─── ModelState ────────────────────────────────────────────────────────
-
 /// Arch-specific core state, dispatched in `LoadedModel.state`.
-/// Shared fields (kv_cache, dn_state) stay on `LoadedModel` directly.
+/// `kv_cache` is a legacy shared field that stays on `LoadedModel` directly
+/// (vestigial `dn_state` was removed — the live DeltaNet state lives in the
+/// Qwen3.5 bundle inside `ModelState::Qwen35`).
 ///
 /// `unload_model` matches this exhaustively with NO wildcard: adding a variant
 /// without a teardown arm is a compile error, which is the whole point of
@@ -750,7 +750,6 @@ pub struct LoadedModel {
     pub qwen35_decode_batch: Option<hipfire_arch_qwen35::qwen35::Qwen35DecodeBatchState>,
     pub lfm2_decode_batch: Option<hipfire_arch_lfm2moe::batch::Lfm2DecodeBatchState>,
     pub kv_cache: Option<llama::KvCache>,
-    pub dn_state: Option<DeltaNetState>,
     // Reusable Qwen2 recurrent state (used by dots_ocr and Qwen2 non-core falcon)
     pub qwen2_state: Option<qwen2::Qwen2State>,
     // DeepSeek V4 Flash (arch_id=9) single-GPU config/weights/state/eos now live
@@ -852,7 +851,6 @@ impl LoadedModel {
             qwen35_decode_batch: None,
             lfm2_decode_batch: None,
             kv_cache: None,
-            dn_state: None,
             qwen2_state: None,
             deepseek4_pbs: None,
             deepseek4_eos_tok: 0,
@@ -3014,9 +3012,6 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
     };
     if let Some(kv) = m.kv_cache {
         note(kv.free_gpu(gpu).map_err(|e| e.to_string()));
-    }
-    if let Some(dn) = m.dn_state {
-        dn.free_gpu(gpu);
     }
     for (_, snap) in m.prefill_checkpoints {
         snap.free_gpu(gpu);

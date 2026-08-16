@@ -58,6 +58,12 @@ p daemon_lines "$(wc -l < $DAEMON)"
 p daemon_arch_id "$(grep -cE 'arch_id *==' $DAEMON)"
 p daemon_arch_refs "$(grep -coE 'hipfire_arch_[a-z0-9_]+' $DAEMON)"
 p required_features "$(grep -c 'required-features' crates/hipfire-daemon/Cargo.toml)"
+# `daemon_arch_refs` greps `hipfire_arch_*`, which `ModelState::Qwen35` does NOT match:
+# ModelState is a LOADER-owned enum wrapping arch bundles. The daemon therefore reported
+# 0 arch refs while still doing a 7-way architecture dispatch (main.rs:1732-1751). Count
+# the laundered form too, or the gate certifies a decoupling that has not happened.
+p daemon_modelstate "$(grep -co 'ModelState::' $DAEMON)"
+p loader_modelstate "$(grep -rho 'ModelState::' crates/hipfire-loader/src | wc -l)"
 p runtime_examples "$(grep -c '^\[\[example\]\]' crates/hipfire-runtime/Cargo.toml)"
 p grammar_copies "$(find crates/hipfire-arch-*/src -name grammar.rs 2>/dev/null | wc -l)"
 p glossary "$([ -f docs/GLOSSARY.md ] && echo present || echo MISSING)"

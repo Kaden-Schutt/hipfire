@@ -2456,8 +2456,10 @@ fn main() {
                             }
                         }
                         // qwen35(-vl) recurrent state lives in the bundle
-                        // (ModelState::Qwen35), not the always-None
-                        // m.dn_state/m.kv_cache direct fields.
+                        // (ModelState::Qwen35). There is no
+                        // `LoadedModel.dn_state` — it was removed as vestigial
+                        // (always None); the live DeltaNet state is inside the
+                        // bundle. `m.kv_cache` is likewise vestigial on this path.
                         if let Err(e) = hipfire_generate::common::reset_qwen35_recurrent(m, &mut gpu) {
                             hipfire_generate::dense::emit_active_attempt_error(
                                 &mut stdout,
@@ -3328,7 +3330,8 @@ fn main() {
 
                 // Reset state BEFORE timing so we're measuring cold prefill, not
                 // prefill-on-top-of-prior-state. qwen35 recurrent state lives in
-                // the bundle (ModelState::Qwen35), not the always-None m.dn_state.
+                // the bundle (ModelState::Qwen35); `LoadedModel.dn_state` was
+                // removed (was always None) — the live DeltaNet state is in the bundle.
                 m.seq_pos = 0;
                 m.conversation_tokens.clear();
                 let _ = hipfire_generate::common::reset_qwen35_recurrent(m, &mut gpu);

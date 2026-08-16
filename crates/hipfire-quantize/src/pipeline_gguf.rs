@@ -148,35 +148,28 @@ pub(crate) fn run_gguf_pipeline(
         .meta_str("general.architecture")
         .unwrap_or("llama")
         .to_string();
-    let auto_arch_id: u32 = match arch_str.as_str() {
-        "llama" => 0,
-        "qwen3" | "qwen2" => 1,
-        "qwen3_5" | "qwen3_5_text" | "qwen35" => 5,
-        "qwen3moe" => 6,
-        // Gemma4 EAGLE drafter (arch_id 22) — must come before the gemma4
-        // catch-all below so that a GGUF with general.architecture =
-        // "gemma4_unified_assistant" is not mis-tagged as arch 13.
-        "gemma4_unified_assistant" => 22,
-        // Gemma 4 family (dense + MoE) => hipfire-arch-gemma4 (arch_id 13).
-        // Require a "gemma4"-prefixed arch string; bare "gemma"/"gemma2"/
-        // "gemma3" GGUFs are different architectures and must not be mis-tagged.
-        g4 if g4.starts_with("gemma4") => 13,
-        other => {
-            // Structural-pillar guard: a qwen3* GGUF that doesn't match an
-            // explicit arm above must NOT be silently stamped arch_id=0
-            // (llama). That would route it off the qwen35 crate AND off the
-            // froggeric chat-template pillar at serve time. Loud-fail so the
-            // operator stamps it explicitly with --arch-id 5 or 6.
-            if other.to_lowercase().contains("qwen3") {
+    // Single source of truth lives in hipfire-runtime::arch_mapping. Fail-closed
+    // on unknown architecture: error listing supported types, unless an explicit
+    // --arch-id override is supplied. The old qwen3* pillar guard is subsumed
+    // by this uniform check — any unknown qwen3* now fails with the same clear
+    // error instead of a bespoke branch.
+    let auto_arch_id: u32 = match hipfire_runtime::arch_mapping::lookup_model_type(arch_str.as_str()) {
+        Some(id) => id,
+        None => {
+            if let Some(ov) = arch_id_override {
                 eprintln!(
-                    "error: GGUF architecture '{other}' looks like a qwen3* family model but maps to no known arch_id; \
-                     refusing to silently stamp arch_id=0 (would break the froggeric pillar). \
-                     Re-run with an explicit --arch-id 5 (dense) or 6 (MoE)."
+                    "warning: unknown GGUF architecture '{}' but --arch-id {} override supplied; proceeding with override",
+                    arch_str, ov
+                );
+                ov
+            } else {
+                let supported = hipfire_runtime::arch_mapping::supported_model_types_display();
+                eprintln!(
+                    "error: unknown GGUF architecture '{}'; supported architectures are: [{}]. Hint: pass --arch-id <id> to override for this model",
+                    arch_str, supported
                 );
                 std::process::exit(1);
             }
-            eprintln!("warning: unknown GGUF architecture '{other}', tagging as llama-compatible");
-            0
         }
     };
     // --arch-id <u32> overrides the auto-detected id. Use when the

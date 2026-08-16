@@ -1206,78 +1206,26 @@ pub(crate) fn run() {
         .get("model_type")
         .and_then(|v| v.as_str())
         .unwrap_or("llama");
-    let auto_arch_id = match arch_str {
-        "llama" => 0u32,
-        "qwen3" | "qwen2" => 1,
-        "qwen3_5" | "qwen3_5_text" | "qwen35" => 5,
-        // Qwen3.5 MoE (Qwen3.5-35B-A3B and friends): hybrid LA+FA attention identical
-        // to qwen3_5 dense, but every layer's FFN is MoE with stacked-3D expert
-        // tensors (mlp.experts.gate_up_proj/down_proj are [num_experts, ...]).
-        "qwen3_5_moe" | "qwen3_5_moe_text" => 6,
-        // dots.ocr (Qwen2-VL family layout-extraction VLM): plain Qwen2-1.5B
-        // text decoder + 42-block DotsVisionTransformer with 2-D RoPE,
-        // SwiGLU, RMSNorm. Crate: hipfire-arch-dots-ocr. See docs/plans/
-        // dots-ocr-prd.md.
-        "dots_ocr" => 8,
-        // DeepSeek V4 Flash: 256 routed + 1 shared experts, Hyper-Connections,
-        // compressed-KV indexer, FP8 E4M3 + UE8M0 block-scale storage. See
-        // crates/hipfire-arch-deepseek4. Phase 1 ingest only — no forward
-        // path yet; tensor names ship in DeepSeek V4's native shape (split w1/w2/w3,
-        // per-expert) and are translated when the forward bring-up lands.
-        "deepseek_v4" => 9,
-        // MiniMax-M2 (Mixtral-style MoE): GQA + per-layer QK-norm + partial
-        // rotate_half RoPE; 256 routed experts top-8 sigmoid+e_score_bias, no
-        // shared expert; FP8 E4M3 + F32 weight_scale_inv block-128 storage;
-        // split per-expert w1/w3/w2 (like deepseek_v4). Crate hipfire-arch-minimax.
-        "minimax_m2" => 10,
-        // LFM2.5 (LiquidAI): hybrid short-conv + GQA-attn layers, SwiGLU FFN.
-        //   "lfm2_moe" = A1B (dense MLP head layers + top-4 MoE); per-expert
-        //               pre-split w1/w2/w3 → MQ4G256, everything else → Q8.
-        //   "lfm2"     = dense (Lfm2ForCausalLM, e.g. 350M/1.2B) — no experts,
-        //               every layer dense SwiGLU; the ingest Q8s all tensors.
-        // Crate hipfire-arch-lfm2moe (arch_id 11); loader handles both via
-        // num_dense_layers == num_hidden_layers for the dense variant.
-        "lfm2_moe" | "lfm2" => 11,
-        // Cohere2-MoE (CohereLabs/North-Mini-Code-1.0): parallel-block
-        // transformer, interleaved sliding(RoPE)/global(NoPE) GQA, mean-centered
-        // Cohere2LayerNorm, sigmoid 128-expert MoE (norm_topk_prob=false, no bias,
-        // no shared), dense layer-0 (first_k_dense_replace=1), tied embeddings.
-        // Per-expert pre-split tensors (mlp.experts.{j}.{gate,up,down}_proj) like
-        // lfm2/deepseek. Crate hipfire-arch-cohere2moe (arch_id 12).
-        "cohere2_moe" => 12,
-        // Gemma 4 family (dense + MoE) -> hipfire-arch-gemma4 (arch_id 13).
-        // 12B-unified (google/gemma-4-12B-it, model_type "gemma4_unified") is
-        // dense unified multimodal; we quantize ONLY the text decoder
-        // (model.language_model.*). GQA + SWA + dual-RoPE + GeGLU + 4 sandwich
-        // norms + logit softcap. 26B-A4B MoE uses model_type "gemma4" (3D
-        // stacked experts.gate_up_proj/down_proj + router.proj/router.scale).
-        // NOTE: flat-MQ4 is a known-poor recipe for this architecture — do not
-        // use `--format mq4` as a quality baseline. Qwen 9B flat-MQ4 measured
-        // 0.3215 KLD and AWQ+GPTQ v3 reached 0.1257 at identical file size;
-        // gemma4 shows the same flat-MQ4 degradation. The intended path is
-        // AWQ+GPTQ (see docs/investigations/2026-05-18-awq-gptq-sub-0.10-kld/).
-        "gemma4_unified" | "gemma4_unified_text" | "gemma4" | "gemma4_text" => 13,
-        // Gemma4 EAGLE drafter (google/gemma-4-12B-it-assistant): the 422M
-        // single-block speculative-decode draft head for the arch-13 target.
-        // FLAT `model.*` names (NOT `model.language_model.`-prefixed) + two
-        // top-level projections (pre_projection / post_projection). Text-only:
-        // no vision/audio tower to skip. 5 decoder layers, hybrid 3:1
-        // sliding(hd256)/full(hd512) attn, tied lm_head, per-layer scalar.
-        // Quantize everything Q8 (`--format q8`): it is a tiny draft model and
-        // draft accuracy directly gates spec-decode acceptance. arch_id 22 is
-        // the next free slot after 21 (Qwen3.5 MTP head). Crate (future):
-        // hipfire-arch-gemma4 drafter loader.
-        "gemma4_unified_assistant" => 22,
-        // Muse Glimmer (arch_id 14) and its DFlash drafter (23).
-        // Glimmer is dense 52-layer text + ViT tower; model_type "muse_glimmer"
-        // (and "muse_glimmer_text" for text-only exports). The assistant
-        // drafter uses model_type "muse_glimmer_assistant" (5 layers, DFlash).
-        // Arch 14 = dense text tower, 23 = assistant drafter.
-        "muse_glimmer" | "muse_glimmer_text" => 14,
-        "muse_glimmer_assistant" => 23,
-        other => {
-            eprintln!("Warning: unknown architecture '{other}', treating as llama");
-            0
+    // Single source of truth for model_type -> arch_id lives in hipfire-runtime::arch_mapping.
+    // Fail-closed on unknown model_type: error naming the type and listing supported ones,
+    // unless an explicit --arch-id override is supplied (operator knows best).
+    let auto_arch_id: u32 = match hipfire_runtime::arch_mapping::lookup_model_type(arch_str) {
+        Some(id) => id,
+        None => {
+            if let Some(ov) = args.arch_id {
+                eprintln!(
+                    "warning: unknown model_type '{}' but --arch-id {} override supplied; proceeding with override",
+                    arch_str, ov
+                );
+                ov
+            } else {
+                let supported = hipfire_runtime::arch_mapping::supported_model_types_display();
+                eprintln!(
+                    "error: unknown model_type '{}'; supported model_types are: [{}]. Hint: pass --arch-id <id> to override for this model",
+                    arch_str, supported
+                );
+                std::process::exit(1);
+            }
         }
     };
     // --arch-id <u32> overrides the auto-detected id. Use when the

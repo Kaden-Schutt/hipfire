@@ -216,3 +216,7 @@ required-features = []
 name = "collect_hessian"
 path = "src/bin/collect_hessian.rs"
 required-features = []
+
+[[test]]
+name = "arch_id_unification"
+path = "tests/arch_id_unification.rs"
