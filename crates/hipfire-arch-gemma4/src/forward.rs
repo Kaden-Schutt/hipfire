@@ -2440,21 +2440,29 @@ fn apply_per_layer_input_branch_batched(
     gpu.hip
         .memcpy_dtod_at(&residual.buf, 0, &x.buf, 0, b * dim * 4)
         .map_err(|e| format!("gemma4 batch ple save residual: {e:?}"))?;
-    let batched_projections = supports_gemma4_batched_prefill_arch(&gpu.arch)
+    let exact_batching = supports_gemma4_batched_prefill_arch(&gpu.arch)
         && gpu.flags.gemma4_ple_branch_batched_prefill
-        && b > 1
-        && ple_weights.input_gate.gpu_dtype == DType::Q8_0
-        && ple_weights.projection.gpu_dtype == DType::Q8_0;
-    if batched_projections {
-        proj_gemm_batched(
-            gpu,
-            &ple_weights.input_gate,
+        && b > 1;
+    let batch_input_gate = exact_batching
+        && supports_exact_batched_q8_ple_projection(
+            ple_weights.input_gate.gpu_dtype,
+            ple_weights.input_gate.k,
+        );
+    let batch_projection = exact_batching
+        && supports_exact_batched_q8_ple_projection(
+            ple_weights.projection.gpu_dtype,
+            ple_weights.projection.k,
+        );
+    if batch_input_gate {
+        gpu.gemm_q8_0_batched_wide_exact(
+            &ple_weights.input_gate.buf,
             x,
             ple.gate,
-            nrm,
+            ple_weights.input_gate.m,
+            ple_weights.input_gate.k,
             b,
-            "ple input_gate",
-        )?;
+        )
+        .map_err(|e| format!("gemma4 batch ple input_gate (q8 wide-exact): {e:?}"))?;
     } else {
         for row in 0..b {
             let x_row = x.sub_offset(row * dim, dim);
@@ -2489,16 +2497,16 @@ fn apply_per_layer_input_branch_batched(
                 .map_err(|e| format!("gemma4 batch ple mul row {row}: {e:?}"))?;
         }
     }
-    if batched_projections {
-        proj_gemm_batched(
-            gpu,
-            &ple_weights.projection,
+    if batch_projection {
+        gpu.gemm_q8_0_batched_wide_exact(
+            &ple_weights.projection.buf,
             ple.hidden,
             ple.out,
-            nrm,
+            ple_weights.projection.m,
+            ple_weights.projection.k,
             b,
-            "ple projection",
-        )?;
+        )
+        .map_err(|e| format!("gemma4 batch ple projection (q8 wide-exact): {e:?}"))?;
     } else {
         for row in 0..b {
             let hidden_row = ple.hidden.sub_offset(row * ple_dim, ple_dim);
@@ -2528,11 +2536,16 @@ fn supports_gemma4_batched_prefill_arch(arch: &str) -> bool {
     matches!(arch, "gfx1100" | "gfx1201")
 }
 
+#[inline]
+fn supports_exact_batched_q8_ple_projection(dtype: DType, k: usize) -> bool {
+    dtype == DType::Q8_0 && k > 0 && k <= 1536 && k % 32 == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         checked_batch_seq_len, supports_batched_projection_dtype,
-        supports_gemma4_batched_prefill_arch,
+        supports_exact_batched_q8_ple_projection, supports_gemma4_batched_prefill_arch,
     };
     use rdna_compute::DType;
 
@@ -2563,6 +2576,15 @@ mod tests {
         ] {
             assert!(!supports_batched_projection_dtype(dtype));
         }
+    }
+
+    #[test]
+    fn exact_ple_batching_matches_the_wide_gemv_dispatch_boundary() {
+        assert!(supports_exact_batched_q8_ple_projection(DType::Q8_0, 1536));
+        assert!(!supports_exact_batched_q8_ple_projection(DType::Q8_0, 1535));
+        assert!(!supports_exact_batched_q8_ple_projection(DType::Q8_0, 1537));
+        assert!(!supports_exact_batched_q8_ple_projection(DType::Q8_0, 0));
+        assert!(!supports_exact_batched_q8_ple_projection(DType::F32, 256));
     }
 
     #[test]

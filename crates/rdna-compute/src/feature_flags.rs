@@ -188,8 +188,8 @@ pub struct FeatureFlags {
     /// Batch the E-series per-layer-input model projection on exact gfx1100
     /// instead of re-streaming the same matrix through one GEMV per row.
     pub gemma4_ple_batched_prefill: bool,
-    /// Experimental batched E-series PLE branch projections. Explicit opt-in:
-    /// the WMMA route can change long greedy trajectories.
+    /// Exact-arithmetic batched E-series PLE branch projections. Explicit
+    /// opt-in until the cross-model, cross-architecture quality gate passes.
     pub gemma4_ple_branch_batched_prefill: bool,
     /// Fuse the E-series PLE GELU and strided per-layer multiply on validated
     /// gfx1100 and gfx1201 paths.

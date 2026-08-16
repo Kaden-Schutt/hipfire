@@ -4026,6 +4026,8 @@ pub const FUSED_GATE_UP_Q4K_SRC: &str = include_str!("../../../kernels/src/fused
 /// Each thread processes K/256 elements strided, then tree-reduce via shared memory.
 /// Better for dim=1024 where 32-thread kernel underutilizes the GPU.
 pub const GEMV_Q8_0_WIDE_SRC: &str = include_str!("../../../kernels/src/gemv_q8_0_wide.hip");
+pub const GEMM_Q8_0_BATCHED_WIDE_EXACT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_q8_0_batched_wide_exact.hip");
 
 pub const GEMV_Q8_0_SRC: &str = include_str!("../../../kernels/src/gemv_q8_0.hip");
 

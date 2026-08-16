@@ -2419,7 +2419,7 @@ pub static FIELDS: &[ConfigField] = &[
         Kernel,
         true,
         "HIPFIRE_GEMMA4_PLE_BRANCH_BATCHED_PREFILL",
-        "Experimental Gemma 4 E-series PLE branch batching; auto remains disabled, explicit true enables gfx1100/gfx1201."
+        "Exact-arithmetic Gemma 4 E-series PLE branch batching; auto remains disabled pending the cross-model quality gate."
     ),
     process_auto_bool_field!(
         "kernel.gemma4_ple_activation_fused_prefill",

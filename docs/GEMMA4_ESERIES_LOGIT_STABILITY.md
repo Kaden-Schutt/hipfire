@@ -58,6 +58,23 @@ A scalar-batched Q8 experiment was evaluated as a possible numerically safer rep
 
 On gfx1201 the scalar-batched route was numerically farther from the baseline: step-0 mean absolute error was 0.076518 with max absolute error 0.182679; at step 88 mean absolute error was 0.070736 with max absolute error 0.356346. Its accumulator structure also differs from the row-wise wide GEMV reduction, so it does not preserve the reference arithmetic contract.
 
+## Exact Batched Resolution
+
+The replacement kernel `gemm_q8_0_batched_wide_exact` shares each Q8_0 weight load across at most eight input rows without changing the reference arithmetic. Each row retains four independent FP32 accumulators, the same `(acc0 + acc1) + (acc2 + acc3)` combine, and the same wave32 shuffle reduction as `gemv_q8_0_wide`. It does not convert activations to FP16.
+
+The dispatcher applies this kernel independently to each PLE projection only when its input width is within the existing wide-GEMV contract (`Q8_0` and `K <= 1536`). A wider projection continues through the original row-wise `weight_gemv` path. This distinction is required: E4B's wider input-gate projection uses the single-accumulator GEMV contract, while its smaller projection uses the four-accumulator wide contract. Applying one batched reduction shape to both matrices changed E4B's greedy trajectory.
+
+| Architecture / model / case | Prefill baseline | Prefill exact-batched | Change | Logit trace result |
+|---|---:|---:|---:|---|
+| gfx1100 / E2B / LongBench 22 | 420.85 tok/s | 450.31 tok/s | +7.00% | 192/192 steps exact |
+| gfx1201 / E2B / LongBench 01 | 454.32 tok/s | 487.34 tok/s | +7.27% | 128/128 steps exact |
+| gfx1100 / E4B / LongBench 01 | 354.17 tok/s | 370.55 tok/s | +4.63% | 128/128 steps exact |
+| gfx1201 / E4B / LongBench 01 | 398.32 tok/s | 412.48 tok/s | +3.55% | 128/128 steps exact |
+
+“Exact” here means no divergence in recorded top-k FP32 values, token order, membership, top-1, or sampled token. An E2B step-0 full-vocabulary comparison additionally matched all 262,144 FP32 logits exactly (`max_abs=0`, `exact_fraction=1.0`). The compiled kernel uses 56 VGPRs and 46 SGPRs with no reported register spill or private segment on both gfx1100 and gfx1201.
+
+Two wider-input batching alternatives were rejected. The existing 64-row scalar-batched kernel restored E4B correctness but was performance-neutral and compiled with 107 SGPRs and 98 SGPR spills. A purpose-built eight-row single-accumulator kernel removed the spills (20 VGPRs, 46 SGPRs) but reduced E4B prefill by 1.69%, so it was removed. Keeping the wider matrix row-wise is both the exact and faster policy in the measured case.
+
 ## Performance Context
 
 The original PLE branch WMMA route showed meaningful single-case prefill gains: 451.78 to 510.28 tok/s on gfx1201 LongBench 01 (+12.95%) and 419.06 to 463.95 tok/s on gfx1100 LongBench 22 (+10.71%). Those gains are not suitable for a default route because the same implementation repeatedly changes deterministic greedy trajectories.
@@ -66,7 +83,7 @@ The gfx1201 route-isolation run measured 454.03 tok/s for baseline, 453.29 tok/s
 
 ## Production Decision
 
-`gemma4_ple_branch_batched_prefill` is experimental and defaults to disabled on gfx1100 and gfx1201. It remains available as an explicit opt-in for continued kernel research. Batched embedding and fused PLE activation remain enabled on the validated architectures because their isolated 256-step traces were identical to the row-wise baseline. The final cross-architecture LongBench gate explicitly passes `--no-ple-branch-batched-prefill` so the evidence does not depend on future default changes.
+`gemma4_ple_branch_batched_prefill` remains an explicit opt-in on gfx1100 and gfx1201 until the exact replacement completes the full cross-model hard30 gate. The short and full-vocabulary diagnostics above establish the arithmetic repair, but they do not by themselves justify changing the production default. Batched embedding and fused PLE activation remain enabled on the validated architectures because their isolated 256-step traces were identical to the row-wise baseline. The prior cross-architecture LongBench gate explicitly passed `--no-ple-branch-batched-prefill`, so its evidence does not depend on this candidate.
 
 The final hard30 gate ran 30 paired prompts for both E2B and E4B on each architecture with an 8,192-token output cap. All 120 safe-policy predictions were byte-identical to their corresponding all-routes-off baselines, with zero correctness regressions or gains.
 

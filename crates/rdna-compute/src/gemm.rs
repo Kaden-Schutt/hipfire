@@ -21402,6 +21402,70 @@ impl Gpu {
         result
     }
 
+    /// Batched Q8_0 GEMM with the same four-way FP32 summation contract as
+    /// `gemv_q8_0_wide`. Sub-batching bounds VGPR use while sharing weights.
+    pub fn gemm_q8_0_batched_wide_exact(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        debug_assert!(
+            k > 0 && k % 32 == 0,
+            "gemm_q8_0_batched_wide_exact: K must be a positive multiple of 32"
+        );
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_q8_0_batched_wide_exact",
+            kernels::GEMM_Q8_0_BATCHED_WIDE_EXACT_SRC,
+            "gemm_q8_0_batched_wide_exact",
+        )?;
+
+        const MAX_BATCH: usize = 8;
+        let mut off = 0;
+        while off < batch_size {
+            let take = (batch_size - off).min(MAX_BATCH);
+            let x_sub = x.sub_offset(off * k, take * k);
+            let y_sub = y.sub_offset(off * m, take * m);
+            let mut a_ptr = a_raw.buf.as_ptr();
+            let mut x_ptr = x_sub.buf.as_ptr();
+            let mut y_ptr = y_sub.buf.as_ptr();
+            let mut m_val = m as i32;
+            let mut k_val = k as i32;
+            let mut bs_val = take as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &mut a_ptr as *mut _ as *mut c_void,
+                &mut x_ptr as *mut _ as *mut c_void,
+                &mut y_ptr as *mut _ as *mut c_void,
+                &mut m_val as *mut _ as *mut c_void,
+                &mut k_val as *mut _ as *mut c_void,
+                &mut bs_val as *mut _ as *mut c_void,
+            ];
+            self.launch_maybe_blob(
+                "gemm_q8_0_batched_wide_exact",
+                [m as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(a_ptr);
+                    b.push_ptr(x_ptr);
+                    b.push_ptr(y_ptr);
+                    b.push_i32(m_val);
+                    b.push_i32(k_val);
+                    b.push_i32(bs_val);
+                    b
+                },
+            )?;
+            off += take;
+        }
+        Ok(())
+    }
+
     /// Q8_0 batched GEMM driver that handles `n` rows by sub-batching at the
     /// kernel's MAX_BATCH=64. Y[n, m] = X[n, k] @ A_q8[m, k]^T.
     ///
