@@ -54,8 +54,8 @@ pub mod sampler;
 pub mod serve;
 pub mod spec;
 
-pub mod spec_ngram;
 pub mod ngram_mod;
+pub mod spec_ngram;
 pub mod swap;
 pub mod tp_shard;
 #[cfg(feature = "deltanet")]
@@ -68,6 +68,10 @@ pub mod eos_filter;
 pub mod prompt_frame;
 pub mod semantic;
 pub mod session_table;
+/// Source guard: no per-token `decode(&[tok])` on a client-output path.
+/// Test-only; see the module docs for why the guard exists at all.
+#[cfg(test)]
+mod streaming_decode_guard;
 pub mod tokenizer;
 
 pub mod tool_call;

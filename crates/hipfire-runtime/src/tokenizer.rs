@@ -317,7 +317,6 @@ fn sp_dummy_prefix_from_hf_json(tok: &serde_json::Value) -> bool {
         || pre_tokenizer.map(pretokenizer_prepends).unwrap_or(false)
 }
 
-
 impl Tokenizer {
     /// Load tokenizer from GGUF metadata.
     pub fn from_gguf(gguf: &GgufFile) -> Result<Self, TokenizerError> {
@@ -1731,6 +1730,133 @@ fn needs_trailing_ws_strip(s: &str) -> bool {
     false
 }
 
+/// Incremental token → text decoder for streaming emit paths.
+///
+/// `Tokenizer::decode()` reassembles byte fragments only *within a single
+/// call*, so calling it once per streamed token (`decode(&[tok])`) runs
+/// `from_utf8_lossy` over a partial sequence. Byte-level BPE and
+/// SentencePiece byte-fallback both spread one character across several
+/// tokens (`中` = `<0xE4> <0xB8> <0xAD>`, every emoji, `∑∫`), so per-token
+/// decode yields U+FFFD for each fragment and the client sees `���` where
+/// the model emitted an emoji.
+///
+/// `TokenTextStream` holds back only the trailing *incomplete* codepoint and
+/// emits everything before it. `Tokenizer::decode_bytes` is exactly
+/// concatenative over tokens, so this needs a pending-byte buffer and nothing
+/// else: **O(1) per token**, with the buffer never exceeding 3 bytes between
+/// `push` calls. Do not implement streaming decode by re-decoding the whole
+/// streamed-token vector each step — that is quadratic and unnecessary.
+///
+/// ```ignore
+/// let mut stream = TokenTextStream::new();
+/// for tok in tokens {
+///     let frag = stream.push(&tokenizer, tok);  // "" while a char is split
+///     if !frag.is_empty() { emit(&frag); }
+/// }
+/// let tail = stream.flush();                    // mid-character truncation only
+/// if !tail.is_empty() { emit(&tail); }
+/// ```
+///
+/// Two requirements that are easy to miss:
+///
+/// 1. **`flush()` at end of stream.** Generation can stop mid-character (max
+///    tokens reached between two byte-fallback tokens). Without the flush
+///    those bytes are dropped silently.
+/// 2. **A holdback step returns `""`.** Emit sites must skip empty fragments,
+///    or every byte of every emoji puts a contentless chunk on the wire.
+#[derive(Debug, Clone, Default)]
+pub struct TokenTextStream {
+    /// Trailing bytes of an incomplete UTF-8 codepoint, awaiting continuation.
+    /// Never longer than 3 bytes once `push_bytes` returns.
+    pending: Vec<u8>,
+}
+
+impl TokenTextStream {
+    pub fn new() -> Self {
+        Self {
+            pending: Vec::with_capacity(4),
+        }
+    }
+
+    /// Feed one token; return the text that became complete because of it.
+    /// Returns `""` when the token only extended a partial codepoint.
+    pub fn push(&mut self, tokenizer: &Tokenizer, token: u32) -> String {
+        self.push_bytes(&tokenizer.decode_bytes(&[token]))
+    }
+
+    /// Feed several tokens at once (accepted spec-decode block, batch step).
+    /// Equivalent to `push` per token, concatenated.
+    pub fn push_tokens(&mut self, tokenizer: &Tokenizer, tokens: &[u32]) -> String {
+        self.push_bytes(&tokenizer.decode_bytes(tokens))
+    }
+
+    /// Feed raw decoded bytes. The byte-level entry point; `push` /
+    /// `push_tokens` are thin wrappers over it.
+    pub fn push_bytes(&mut self, bytes: &[u8]) -> String {
+        if bytes.is_empty() {
+            return String::new();
+        }
+        self.pending.extend_from_slice(bytes);
+        let mut out = String::new();
+        loop {
+            match std::str::from_utf8(&self.pending) {
+                Ok(s) => {
+                    out.push_str(s);
+                    self.pending.clear();
+                    return out;
+                }
+                Err(e) => {
+                    let valid = e.valid_up_to();
+                    if valid > 0 {
+                        // `valid_up_to` guarantees this prefix is well-formed.
+                        out.push_str(
+                            std::str::from_utf8(&self.pending[..valid]).unwrap_or_default(),
+                        );
+                    }
+                    match e.error_len() {
+                        // Incomplete trailing sequence — hold it back and wait
+                        // for the next token to supply the continuation bytes.
+                        None => {
+                            self.pending.drain(..valid);
+                            return out;
+                        }
+                        // Genuinely invalid bytes: they can never become valid,
+                        // and holding them stalls the buffer and mutes the rest
+                        // of the turn — worse than the mojibake being fixed.
+                        // Emit one replacement char and step past.
+                        Some(bad) => {
+                            out.push(char::REPLACEMENT_CHARACTER);
+                            self.pending.drain(..valid + bad);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Drain any held-back bytes at end of stream. Only ever non-empty when
+    /// generation stopped mid-character; the truncated bytes decode lossily
+    /// rather than vanishing. Call once, after the decode loop.
+    pub fn flush(&mut self) -> String {
+        if self.pending.is_empty() {
+            return String::new();
+        }
+        let tail = String::from_utf8_lossy(&self.pending).into_owned();
+        self.pending.clear();
+        tail
+    }
+
+    /// True when nothing is held back (no partial codepoint in flight).
+    pub fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    /// Number of held-back bytes. Always `0..=3` outside of `push_bytes`.
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+}
+
 #[cfg(test)]
 mod bpe_tests {
     use super::*;
@@ -2454,7 +2580,6 @@ mod prompt_norm_tests {
     }
 }
 
-
 #[cfg(test)]
 mod sp_dummy_prefix_tests {
     //! Config-driven SP dummy-prefix coverage (gemma4 first-word bug,
@@ -2528,8 +2653,7 @@ mod sp_dummy_prefix_tests {
 
     #[test]
     fn gemma4_no_dummy_prefix_first_word_matches_hf() {
-        let t = Tokenizer::from_hfq_metadata(&gemma4_fixture_metadata())
-            .expect("fixture parses");
+        let t = Tokenizer::from_hfq_metadata(&gemma4_fixture_metadata()).expect("fixture parses");
         assert_eq!(t.bos_id, 2, "generation_config bos override");
         let mut ids = vec![t.bos_id];
         ids.extend(t.encode("The capital of France is"));
@@ -2538,8 +2662,7 @@ mod sp_dummy_prefix_tests {
 
     #[test]
     fn gemma4_chat_tail_thought_channel_matches_hf() {
-        let t = Tokenizer::from_hfq_metadata(&gemma4_fixture_metadata())
-            .expect("fixture parses");
+        let t = Tokenizer::from_hfq_metadata(&gemma4_fixture_metadata()).expect("fixture parses");
         assert_eq!(
             t.encode("<|channel>thought\n<channel|>The capital of France is"),
             vec![100, 45518, 107, 101, 818, 5279, 529, 7001, 563],
@@ -2729,5 +2852,396 @@ mod lfm2_bos_tests {
             1,
             "must not double-prepend when text already starts with BOS literal"
         );
+    }
+}
+
+#[cfg(test)]
+mod token_text_stream_tests {
+    use super::*;
+
+    /// Synthetic SentencePiece vocab with full byte-fallback coverage: ids
+    /// `0..=255` are the `<0xHH>` fallback tokens, followed by a few
+    /// whole-character literals. No model file needed — this is the vocab
+    /// shape that produces the bug (one character spread over several
+    /// tokens), reproduced in-test so the invariant runs in CI.
+    fn synth_byte_fallback() -> Tokenizer {
+        let mut vocab: Vec<String> = (0u32..=255).map(|b| format!("<0x{b:02X}>")).collect();
+        // Whole-character / multi-char literals, so a sequence mixes
+        // fallback runs with tokens that are already complete UTF-8.
+        for lit in LITERALS {
+            vocab.push((*lit).to_string());
+        }
+        let token_to_id: HashMap<String, u32> = vocab
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.clone(), i as u32))
+            .collect();
+        Tokenizer {
+            vocab,
+            token_to_id,
+            merges: Vec::new(),
+            merge_pair_rank: HashMap::new(),
+            byte_to_id: None,
+            special_tokens: Vec::new(),
+            bos_id: 0,
+            eos_id: 0,
+            add_bos: false,
+            eot_id: None,
+            is_gpt2_bpe: false,
+            sp_dummy_prefix: false,
+        }
+    }
+
+    const LITERALS: &[&str] = &["hello", "中", "🎉", " world", "∑", "!"];
+
+    /// Token id of the `<0xHH>` fallback token for byte `b`.
+    fn byte_tok(b: u8) -> u32 {
+        b as u32
+    }
+
+    /// Encode a string as a pure byte-fallback token run.
+    fn as_byte_tokens(s: &str) -> Vec<u32> {
+        s.as_bytes().iter().map(|&b| byte_tok(b)).collect()
+    }
+
+    /// Feed a whole sequence through the stream and return the concatenation
+    /// of every fragment plus the flushed tail.
+    fn stream_all(tk: &Tokenizer, seq: &[u32]) -> String {
+        let mut stream = TokenTextStream::new();
+        let mut out = String::new();
+        for &t in seq {
+            out.push_str(&stream.push(tk, t));
+            assert!(
+                stream.pending_len() <= 3,
+                "holdback buffer must never exceed 3 bytes, got {}",
+                stream.pending_len()
+            );
+        }
+        out.push_str(&stream.flush());
+        assert!(stream.is_empty(), "flush must drain the buffer");
+        out
+    }
+
+    /// Deterministic xorshift64* — keeps the randomised tests reproducible
+    /// and dependency-free.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    /// The bug this helper exists to fix, pinned as a test: per-token
+    /// `decode()` mojibakes anything whose UTF-8 spans several tokens, and
+    /// the stream does not.
+    #[test]
+    fn per_token_decode_is_lossy_but_stream_is_not() {
+        let tk = synth_byte_fallback();
+        let text = "emoji: 🎉🔥🚀";
+        let seq = as_byte_tokens(text);
+
+        let per_token: String = seq.iter().map(|&t| tk.decode(&[t])).collect();
+        assert!(
+            per_token.contains('\u{FFFD}'),
+            "baseline: per-token decode must reproduce the reported corruption"
+        );
+        assert_ne!(per_token, text);
+
+        assert_eq!(stream_all(&tk, &seq), text);
+        assert_eq!(stream_all(&tk, &seq), tk.decode(&seq));
+    }
+
+    /// The core invariant: streaming decode is exactly equivalent to
+    /// whole-sequence decode, for any token sequence.
+    #[test]
+    fn streaming_equals_batch_decode_over_random_sequences() {
+        let tk = synth_byte_fallback();
+        let vocab_len = 256 + LITERALS.len();
+        let mut rng = Rng(0x5EED_1234_ABCD_0001);
+        for _ in 0..2000 {
+            let len = 1 + rng.below(24);
+            let seq: Vec<u32> = (0..len).map(|_| rng.below(vocab_len) as u32).collect();
+            assert_eq!(
+                stream_all(&tk, &seq),
+                tk.decode(&seq),
+                "streaming != batch for {seq:?}"
+            );
+        }
+    }
+
+    /// Same invariant, but over sequences built from real text rather than
+    /// uniform-random ids — guarantees the well-formed case dominates.
+    #[test]
+    fn streaming_equals_batch_decode_over_text_sequences() {
+        let tk = synth_byte_fallback();
+        for text in [
+            "emoji: 🎉🔥🚀",
+            "math ∑∫≈",
+            "中文测试",
+            "café naïve",
+            "plain ascii",
+            "",
+            "🎉",
+        ] {
+            let seq = as_byte_tokens(text);
+            assert_eq!(stream_all(&tk, &seq), text, "text {text:?}");
+            assert_eq!(stream_all(&tk, &seq), tk.decode(&seq));
+        }
+    }
+
+    /// Byte-split fuzz: split a UTF-8 string's bytes at every possible
+    /// combination of boundaries, feed the pieces, assert reassembly.
+    #[test]
+    fn byte_split_at_every_boundary_reassembles() {
+        let text = "a🎉b∑";
+        let bytes = text.as_bytes();
+        let n = bytes.len();
+        assert!(n <= 12, "keep the 2^(n-1) enumeration cheap");
+        for mask in 0u32..(1 << (n - 1)) {
+            let mut stream = TokenTextStream::new();
+            let mut out = String::new();
+            let mut start = 0usize;
+            for i in 0..n {
+                let cut = i == n - 1 || (mask >> i) & 1 == 1;
+                if cut {
+                    out.push_str(&stream.push_bytes(&bytes[start..=i]));
+                    start = i + 1;
+                }
+            }
+            out.push_str(&stream.flush());
+            assert_eq!(out, text, "mask {mask:#b} lost bytes");
+        }
+    }
+
+    /// A split mid-character yields `""` — the holdback contract emit sites
+    /// depend on.
+    #[test]
+    fn holdback_returns_empty_mid_character() {
+        let mut stream = TokenTextStream::new();
+        // U+1F389 🎉 = F0 9F 8E 89.
+        assert_eq!(stream.push_bytes(&[0xF0]), "");
+        assert_eq!(stream.push_bytes(&[0x9F]), "");
+        assert_eq!(stream.push_bytes(&[0x8E]), "");
+        assert_eq!(stream.push_bytes(&[0x89]), "🎉");
+        assert!(stream.is_empty());
+    }
+
+    /// Requirement 1: generation stopping mid-character must not silently
+    /// drop the trailing bytes.
+    #[test]
+    fn flush_recovers_truncated_tail() {
+        let tk = synth_byte_fallback();
+        let mut stream = TokenTextStream::new();
+        // "a" then a truncated 🎉 (max tokens hit between fallback tokens).
+        assert_eq!(stream.push(&tk, byte_tok(b'a')), "a");
+        assert_eq!(stream.push(&tk, byte_tok(0xF0)), "");
+        assert_eq!(stream.push(&tk, byte_tok(0x9F)), "");
+        let tail = stream.flush();
+        assert!(!tail.is_empty(), "truncated bytes must not vanish silently");
+        assert_eq!(tail, String::from_utf8_lossy(&[0xF0, 0x9Fu8]));
+        assert!(stream.is_empty());
+    }
+
+    /// Requirement 2, the subtlest part of the fix: genuinely invalid bytes
+    /// can never become valid, so the stream must emit a replacement char
+    /// and step past instead of holding them. A stall here would mute the
+    /// rest of the turn — worse than the mojibake being fixed.
+    #[test]
+    fn invalid_bytes_never_stall_the_stream() {
+        let mut rng = Rng(0xD1CE_0000_0BAD_F00D);
+        for _ in 0..3000 {
+            let mut stream = TokenTextStream::new();
+            let len = 1 + rng.below(16);
+            let junk: Vec<u8> = (0..len).map(|_| (rng.next() & 0xFF) as u8).collect();
+            for (i, &b) in junk.iter().enumerate() {
+                stream.push_bytes(&[b]);
+                assert!(
+                    stream.pending_len() <= 3,
+                    "stream stalled at byte {i} of {junk:?} with {} pending",
+                    stream.pending_len()
+                );
+            }
+            // Any held-back bytes must drain within 3 further pushes of a
+            // byte that cannot continue a multi-byte sequence.
+            for _ in 0..3 {
+                if stream.is_empty() {
+                    break;
+                }
+                stream.push_bytes(b"a");
+            }
+            assert!(
+                stream.is_empty(),
+                "stream failed to drain after junk {junk:?}"
+            );
+        }
+    }
+
+    /// A lone continuation byte (0x80) is invalid on its own, not
+    /// incomplete — it must not be held back at all.
+    #[test]
+    fn lone_continuation_byte_emits_immediately() {
+        let mut stream = TokenTextStream::new();
+        assert_eq!(stream.push_bytes(&[0x80]), "\u{FFFD}");
+        assert!(stream.is_empty());
+        assert_eq!(stream.push_bytes(&[0xFF, 0xFE]), "\u{FFFD}\u{FFFD}");
+        assert!(stream.is_empty());
+    }
+
+    /// `push_tokens` (accepted spec-decode block) is equivalent to pushing
+    /// each token individually.
+    #[test]
+    fn push_tokens_matches_per_token_pushes() {
+        let tk = synth_byte_fallback();
+        let seq = as_byte_tokens("🎉 中 ∑");
+        let mut a = TokenTextStream::new();
+        let batched = {
+            let mut s = a.push_tokens(&tk, &seq);
+            s.push_str(&a.flush());
+            s
+        };
+        assert_eq!(batched, stream_all(&tk, &seq));
+        assert_eq!(batched, tk.decode(&seq));
+    }
+}
+
+/// Full-vocab sweep against a real model's tokenizer.
+///
+/// This is what catches vocab-specific surprises — precisely the kind that let
+/// CJK pass while emoji failed on the qwen3.5-9b vocab (whole-character CJK
+/// tokens, byte-fallback emoji). Ignored by default and gated on a model file,
+/// so CI stays model-free:
+///
+/// ```text
+/// HIPFIRE_TEST_MODEL=/path/to/model.hfq \
+///   cargo test -p hipfire-runtime --lib --release full_vocab -- --ignored --nocapture
+/// ```
+#[cfg(test)]
+mod token_text_stream_vocab_sweep {
+    use super::*;
+
+    fn load_tokenizer() -> Option<Tokenizer> {
+        let path = std::env::var("HIPFIRE_TEST_MODEL").ok()?;
+        let path = std::path::Path::new(&path);
+        let json = if path.extension().and_then(|e| e.to_str()) == Some("json") {
+            std::fs::read_to_string(path).ok()?
+        } else {
+            let hfq = crate::hfq::HfqFile::open(path)
+                .unwrap_or_else(|e| panic!("HIPFIRE_TEST_MODEL {path:?} did not open: {e}"));
+            use crate::model_source::ModelSource;
+            hfq.metadata_json().to_string()
+        };
+        let tk = if path.extension().and_then(|e| e.to_str()) == Some("json") {
+            Tokenizer::from_hf_json(&json)
+        } else {
+            Tokenizer::from_hfq_metadata(&json)
+        };
+        Some(tk.unwrap_or_else(|e| panic!("tokenizer from {path:?} failed: {e:?}")))
+    }
+
+    /// Feed a sequence through the stream, returning text + flushed tail.
+    fn streamed(tk: &Tokenizer, seq: &[u32]) -> String {
+        let mut s = TokenTextStream::new();
+        let mut out = s.push_tokens(tk, seq);
+        out.push_str(&s.flush());
+        out
+    }
+
+    /// Every single token id: streaming decode must equal batch decode.
+    #[test]
+    #[ignore = "requires HIPFIRE_TEST_MODEL"]
+    fn full_vocab_singles_match_batch_decode() {
+        let Some(tk) = load_tokenizer() else {
+            eprintln!("HIPFIRE_TEST_MODEL unset — skipping");
+            return;
+        };
+        let n = tk.vocab.len();
+        let mut fffd_only_in_stream = 0usize;
+        for id in 0..n as u32 {
+            let batch = tk.decode(&[id]);
+            let stream = streamed(&tk, &[id]);
+            assert_eq!(stream, batch, "id {id} diverged");
+            if stream.contains('\u{FFFD}') && !batch.contains('\u{FFFD}') {
+                fffd_only_in_stream += 1;
+            }
+        }
+        assert_eq!(fffd_only_in_stream, 0);
+        eprintln!("swept {n} single ids");
+    }
+
+    /// Adjacent pairs. Only a token whose bytes end mid-codepoint can start a
+    /// split, so the exhaustive cross is `openers × whole vocab` rather than
+    /// `vocab²` — the same coverage for the failure mode, without the
+    /// quadratic blow-up. The opener count is printed so a truncated sweep is
+    /// never mistaken for a clean one.
+    #[test]
+    #[ignore = "requires HIPFIRE_TEST_MODEL"]
+    fn full_vocab_adjacent_pairs_match_batch_decode() {
+        let Some(tk) = load_tokenizer() else {
+            eprintln!("HIPFIRE_TEST_MODEL unset — skipping");
+            return;
+        };
+        let n = tk.vocab.len();
+        let openers: Vec<u32> = (0..n as u32)
+            .filter(|&id| {
+                let bytes = tk.decode_bytes(&[id]);
+                !bytes.is_empty() && std::str::from_utf8(&bytes).is_err()
+            })
+            .collect();
+        eprintln!(
+            "vocab {n}, {} openers (tokens ending mid-codepoint) → {} pairs",
+            openers.len(),
+            openers.len() * n
+        );
+        assert!(
+            !openers.is_empty(),
+            "no byte-fallback openers in this vocab — the pair sweep would be vacuous; \
+             use a vocab with byte-level fallback (emoji coverage) instead"
+        );
+        for &a in &openers {
+            for b in 0..n as u32 {
+                let seq = [a, b];
+                let batch = tk.decode(&seq);
+                let stream = streamed(&tk, &seq);
+                assert_eq!(stream, batch, "pair ({a}, {b}) diverged");
+            }
+        }
+    }
+
+    /// End-to-end on real text: encode, stream-decode per token, compare.
+    /// Always includes emoji — a CJK-only reproduction passes on a fully
+    /// broken path when the vocab has whole-character CJK tokens.
+    #[test]
+    #[ignore = "requires HIPFIRE_TEST_MODEL"]
+    fn real_text_round_trips_through_the_stream() {
+        let Some(tk) = load_tokenizer() else {
+            eprintln!("HIPFIRE_TEST_MODEL unset — skipping");
+            return;
+        };
+        for text in [
+            "emoji: 🎉🔥🚀",
+            "math ∑∫≈",
+            "中文测试 with English",
+            "café naïve — em dash",
+            "mixed 🎉 中 ∑ ascii",
+        ] {
+            let ids = tk.encode(text);
+            let batch = tk.decode(&ids);
+            let stream = streamed(&tk, &ids);
+            assert_eq!(stream, batch, "streaming diverged for {text:?}");
+            assert!(
+                !stream.contains('\u{FFFD}') || batch.contains('\u{FFFD}'),
+                "streaming introduced U+FFFD for {text:?}"
+            );
+        }
     }
 }

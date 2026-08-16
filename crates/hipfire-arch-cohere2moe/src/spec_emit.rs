@@ -27,7 +27,7 @@ use hipfire_runtime::prompt_frame::ToolCall;
 use hipfire_runtime::spec::{
     ClientEvent, EmitOutcome, FinishSummary, SpecEmit, SpecEmitCtx, StopReason,
 };
-use hipfire_runtime::tokenizer::Tokenizer;
+use hipfire_runtime::tokenizer::{TokenTextStream, Tokenizer};
 
 const MAX_EOS_SUPPRESS: usize = 3;
 
@@ -66,6 +66,31 @@ pub struct Cohere2MoeEmit<'a> {
     tool_calls_emitted: bool,
     /// Tokens the loop must force after the current step (drained by `take_forced`).
     forced: Vec<u32>,
+    /// Incremental token → text decoder. Byte-level BPE and byte-fallback
+    /// spread one character across several tokens, so decoding per token would
+    /// surface a U+FFFD per fragment instead of the character. Holds back only
+    /// the trailing incomplete codepoint; drained in `finish`.
+    text_stream: TokenTextStream,
+}
+
+/// True when a single token decodes to a bare `<|UPPER_SNAKE|>` structural
+/// marker.
+///
+/// Checked on the token's own bytes rather than on a `TokenTextStream`
+/// fragment: a fragment can carry the completion bytes of a preceding split
+/// character, whose leading char would defeat the `<|…|>` shape match. Uses
+/// `decode_bytes`, not the lossy per-token `decode(&[tok])`.
+fn is_bracketed_marker_token(tokenizer: &Tokenizer, token: u32) -> bool {
+    let bytes = tokenizer.decode_bytes(&[token]);
+    let Ok(s) = std::str::from_utf8(&bytes) else {
+        return false;
+    };
+    s.len() > 4
+        && s.starts_with("<|")
+        && s.ends_with("|>")
+        && s[2..s.len() - 2]
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c == '_')
 }
 
 impl<'a> Cohere2MoeEmit<'a> {
@@ -110,6 +135,7 @@ impl<'a> Cohere2MoeEmit<'a> {
             tool_calls_buf: Vec::new(),
             tool_calls_emitted: false,
             forced: Vec::new(),
+            text_stream: TokenTextStream::new(),
         })
     }
 
@@ -123,6 +149,26 @@ impl<'a> Cohere2MoeEmit<'a> {
             idx: self.emitted_count,
         });
         self.emitted_count += 1;
+    }
+
+    /// Route one decoded text fragment down whichever agentic channel is
+    /// currently open. Shared by `process` and the end-of-stream flush in
+    /// `finish`, so a character that completed only at the flush lands on the
+    /// channel the turn ended on rather than being dropped — dropping it is a
+    /// silent truncation.
+    fn route(&mut self, frag: String, events: &mut Vec<ClientEvent>) {
+        match self.sec {
+            Sec::Action => self.action_buf.push_str(&frag),
+            Sec::Think => {
+                events.push(ClientEvent::Reasoning(frag));
+                self.think_count += 1;
+            }
+            Sec::Text | Sec::Pre => {
+                self.vis_buf.push_str(&frag);
+                events.push(ClientEvent::Token(frag));
+                self.emitted_visible = true;
+            }
+        }
     }
 
     /// The shared begin/observe body: run one committed token through the marker
@@ -179,30 +225,24 @@ impl<'a> Cohere2MoeEmit<'a> {
             self.sec = Sec::Pre;
             self.committed(token, &mut events);
         } else {
-            let frag = self.tokenizer.decode(&[token]);
             // Defense-in-depth: never surface a Cohere structural marker the id
             // state machine missed (START_OF_TURN_TOKEN, CHATBOT_TOKEN, …). The
             // token is still committed (target advanced over it); only its emit
             // is dropped, so a state-machine miss can never leak a marker.
-            let is_marker = frag.len() > 4
-                && frag.starts_with("<|")
-                && frag.ends_with("|>")
-                && frag[2..frag.len() - 2]
-                    .chars()
-                    .all(|c| c.is_ascii_uppercase() || c == '_');
-            if !is_marker {
-                match self.sec {
-                    Sec::Action => self.action_buf.push_str(&frag),
-                    Sec::Think => {
-                        events.push(ClientEvent::Reasoning(frag));
-                        self.think_count += 1;
-                    }
-                    Sec::Text | Sec::Pre => {
-                        self.vis_buf.push_str(&frag);
-                        events.push(ClientEvent::Token(frag));
-                        self.emitted_visible = true;
-                    }
-                }
+            //
+            // Tested on the token's OWN bytes, not on the stream fragment: a
+            // fragment can carry the completion bytes of a preceding split
+            // character, whose leading char would defeat the `<|…|>` match.
+            let frag = if is_bracketed_marker_token(self.tokenizer, token) {
+                String::new()
+            } else {
+                // Incremental decode with holdback — never
+                // `self.tokenizer.decode(&[token])`, which is lossy per token
+                // and splits multi-token UTF-8 into FFFD. Empty on a holdback.
+                self.text_stream.push(self.tokenizer, token)
+            };
+            if !frag.is_empty() {
+                self.route(frag, &mut events);
             }
             self.committed(token, &mut events);
         }
@@ -238,6 +278,14 @@ impl<'a> SpecEmit for Cohere2MoeEmit<'a> {
 
     fn finish(mut self: Box<Self>) -> FinishSummary {
         let mut events = Vec::new();
+        // Generation can stop mid-character (max_tokens reached between two
+        // byte-fallback tokens). Route the held-back tail down whichever
+        // channel was open when the turn ended, BEFORE the recovery below so
+        // it sees the complete `vis_buf`. Dropping it is a silent truncation.
+        let tail = self.text_stream.flush();
+        if !tail.is_empty() {
+            self.route(tail, &mut events);
+        }
         // Tool-call-as-text recovery: a non-Cohere harness can prime North to
         // write a tool-call JSON array as TEXT instead of via <|START_ACTION|>.
         if !self.tool_calls_emitted {

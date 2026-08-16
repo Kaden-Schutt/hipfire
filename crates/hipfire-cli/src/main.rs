@@ -5147,6 +5147,12 @@ fn complete_request_slots(
     // and there is no opening marker in the generated stream to detect.
     let mut think = ThinkOutputRouter::new(matches!(prefix, AssistantPrefix::OpenThink));
     let mut routed: Vec<ThinkRouteEvent> = Vec::new();
+    // Incremental token -> text decoder. Byte-level BPE and byte-fallback
+    // spread one character across several tokens, so decoding per token would
+    // hand the think router (and the HTTP client) a U+FFFD per fragment --
+    // "emoji: <emoji>" arriving as "emoji: ???". Holds back only the trailing
+    // incomplete codepoint; drained after the receive loop.
+    let mut text_stream = hipfire_runtime::tokenizer::TokenTextStream::new();
 
     let mut drain_routed = |routed: &mut Vec<ThinkRouteEvent>,
                             content: &mut String,
@@ -5172,7 +5178,9 @@ fn complete_request_slots(
         match ev {
             Event::Accepted { .. } => {}
             Event::Token { id } => {
-                let text = backend.tokenizer.decode(&[id]);
+                // Never `backend.tokenizer.decode(&[id])` -- lossy per token,
+                // splits multi-token UTF-8 into FFFD. Empty on a holdback step.
+                let text = text_stream.push(&backend.tokenizer, id);
                 if !text.is_empty() {
                     think.push_into(&text, &mut routed);
                     drain_routed(
@@ -5199,6 +5207,13 @@ fn complete_request_slots(
         }
     }
 
+    // Generation can stop mid-character (max_tokens reached between two
+    // byte-fallback tokens). Route the held-back tail through the think router
+    // before finishing it, or those bytes are dropped silently.
+    let tail = text_stream.flush();
+    if !tail.is_empty() {
+        think.push_into(&tail, &mut routed);
+    }
     // Flush any trailing partial marker as ordinary text in its channel.
     think.finish_into(&mut routed);
     drain_routed(
@@ -9676,7 +9691,12 @@ mod tests {
         let registry = RegistryV1::parse(raw, "test").unwrap();
 
         // Exact Qwen families get VMM + 262144 + 81920
-        for tag in ["qwen3.5:4b", "qwen3.6:35b-a3b", "qwen3.8:27b", "qwen3.8:27b-fast"] {
+        for tag in [
+            "qwen3.5:4b",
+            "qwen3.6:35b-a3b",
+            "qwen3.8:27b",
+            "qwen3.8:27b-fast",
+        ] {
             let (_, entry) = registry.model(tag).unwrap();
             let resolved = resolved_for_model(&paths, tag, Some(tag), Some(entry)).unwrap();
             assert_eq!(
