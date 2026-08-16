@@ -3515,4 +3515,145 @@ mod registry_tests {
             );
         }
     }
+
+    /// Pin every carrier's declared `ArchCaps` AND every arch_id route-table
+    /// output. The route tables in `lib.rs` (continuous_batch / bench_decode /
+    /// vision / ep_prompt / ep_eos / generation_early) are ROUTING
+    /// discriminators — each variant selects a distinct function body — so
+    /// they cannot be expressed as a boolean capability and must not drift
+    /// silently when a carrier's caps row is edited. If you intentionally
+    /// re-route an architecture, update this pin in the same commit.
+    #[test]
+    fn caps_and_route_tables_are_pinned() {
+        use saddle_core::caps::{ArchCaps, DflashKind};
+        use super::{
+            bench_decode_route, continuous_batch_route, ep_eos_route, ep_prompt_route,
+            generation_early_route, vision_route, BenchDecodeRoute, ContinuousBatchRoute,
+            EpEosRoute, EpPromptRoute, GenerationEarlyRoute, VisionRoute,
+        };
+
+        let caps_of = |name: &str| -> ArchCaps {
+            REGISTRY
+                .iter()
+                .find(|c| c.name() == name)
+                .unwrap_or_else(|| panic!("{name} carrier missing"))
+                .caps()
+        };
+
+        // ── Per-carrier declared capabilities (11 architectures) ──
+        let text_only = ArchCaps::default();
+        assert_eq!(caps_of("qwen2"), text_only);
+        assert_eq!(
+            caps_of("qwen35"),
+            ArchCaps {
+                supports_continuous_batch: true,
+                supports_ep_batch: true,
+                dflash: Some(DflashKind::Qwen),
+                supports_mtp: true,
+                spec_excludes_adaptive: true,
+                semantic_contract_version: Some(2),
+                has_deltanet: true,
+                supports_images: true,
+            }
+        );
+        assert_eq!(
+            caps_of("llama"),
+            ArchCaps {
+                dflash: Some(DflashKind::Llama),
+                ..text_only
+            }
+        );
+        assert_eq!(
+            caps_of("dots_ocr"),
+            ArchCaps {
+                supports_images: true,
+                ..text_only
+            }
+        );
+        assert_eq!(caps_of("deepseek4"), text_only);
+        assert_eq!(caps_of("minimax"), text_only);
+        assert_eq!(
+            caps_of("lfm2moe"),
+            ArchCaps {
+                supports_continuous_batch: true,
+                ..text_only
+            }
+        );
+        assert_eq!(caps_of("cohere2moe"), text_only);
+        assert_eq!(caps_of("gemma4"), text_only);
+        assert_eq!(
+            caps_of("muse_glimmer"),
+            ArchCaps {
+                semantic_contract_version: Some(2),
+                ..text_only
+            }
+        );
+
+        // ── continuous_batch_route: 5|6 -> Qwen35, 11 -> Lfm2Moe ──
+        // The Some/None half duplicates caps().supports_continuous_batch; the
+        // variant picks between two distinct staging bodies in batch_staging.
+        for id in 0u32..=14 {
+            let want = match id {
+                5 | 6 => Some(ContinuousBatchRoute::Qwen35),
+                11 => Some(ContinuousBatchRoute::Lfm2Moe),
+                _ => None,
+            };
+            assert_eq!(continuous_batch_route(id), want, "continuous_batch_route({id})");
+            // The capability half must stay consistent with the declared cap.
+            let declared = super::carrier_for(id)
+                .map(|c| c.caps().supports_continuous_batch)
+                .unwrap_or(false);
+            assert_eq!(
+                want.is_some(),
+                declared,
+                "continuous_batch_route({id}).is_some() disagrees with carrier caps"
+            );
+        }
+
+        // ── bench_decode_route: 9, 11, 5|6, 14; everything else Unsupported ──
+        for id in 0u32..=14 {
+            let want = match id {
+                9 => BenchDecodeRoute::Deepseek4,
+                11 => BenchDecodeRoute::Lfm2Moe,
+                5 | 6 => BenchDecodeRoute::Qwen35,
+                14 => BenchDecodeRoute::MuseGlimmer,
+                _ => BenchDecodeRoute::Unsupported,
+            };
+            assert_eq!(bench_decode_route(id), want, "bench_decode_route({id})");
+        }
+
+        // ── vision_route: 8 -> DotsOcr, 5|6 -> QwenVl, gated by supports_images ──
+        for id in 0u32..=14 {
+            let want = match id {
+                8 => VisionRoute::DotsOcr,
+                5 | 6 => VisionRoute::QwenVl,
+                _ => VisionRoute::None,
+            };
+            assert_eq!(vision_route(id), want, "vision_route({id})");
+        }
+
+        // ── ep_prompt_route: 9 -> Dsml, everything else Jinja ──
+        for id in 0u32..=14 {
+            let want = if id == 9 { EpPromptRoute::Dsml } else { EpPromptRoute::Jinja };
+            assert_eq!(ep_prompt_route(id), want, "ep_prompt_route({id})");
+        }
+
+        // ── ep_eos_route: 10 -> Minimax, everything else Deepseek4 ──
+        for id in 0u32..=14 {
+            let want = if id == 10 { EpEosRoute::Minimax } else { EpEosRoute::Deepseek4 };
+            assert_eq!(ep_eos_route(id), want, "ep_eos_route({id})");
+        }
+
+        // ── generation_early_route: 13 -> Gemma4, 14 -> MuseGlimmer; arch 22
+        // (Gemma4 EAGLE drafter sidecar) must stay None — it is never a
+        // primary generate target.
+        for id in (0u32..=14).chain([22]) {
+            let want = match id {
+                13 => Some(GenerationEarlyRoute::Gemma4),
+                14 => Some(GenerationEarlyRoute::MuseGlimmer),
+                _ => None,
+            };
+            assert_eq!(generation_early_route(id), want, "generation_early_route({id})");
+        }
+    }
 }
