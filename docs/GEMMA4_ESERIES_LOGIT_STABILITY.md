@@ -83,7 +83,16 @@ The gfx1201 route-isolation run measured 454.03 tok/s for baseline, 453.29 tok/s
 
 ## Production Decision
 
-`gemma4_ple_branch_batched_prefill` remains an explicit opt-in on gfx1100 and gfx1201 until the exact replacement completes the full cross-model hard30 gate. The short and full-vocabulary diagnostics above establish the arithmetic repair, but they do not by themselves justify changing the production default. Batched embedding and fused PLE activation remain enabled on the validated architectures because their isolated 256-step traces were identical to the row-wise baseline. The prior cross-architecture LongBench gate explicitly passed `--no-ple-branch-batched-prefill`, so its evidence does not depend on this candidate.
+The exact replacement passed the full cross-model hard30 gate and is therefore enabled by auto policy on gfx1100 and gfx1201. It remains independently disableable through `HIPFIRE_GEMMA4_PLE_BRANCH_BATCHED_PREFILL=0`; other architectures remain off. Across E2B and E4B on both validated architectures, all 120 candidate predictions were byte-identical to their paired all-routes-off baselines, with no correctness regressions or gains.
+
+| Architecture | Model | Accuracy off -> exact | Prefill off -> exact | Prefill delta | TTFT off -> exact | TTFT delta | Identical predictions |
+|---|---|---|---:|---:|---:|---:|---:|
+| gfx1100 W7900 | E2B Q8 | 0.4000 -> 0.4000 | 451.875 -> 529.285 tok/s | +17.13% | 56.081 -> 47.879 s | -14.63% | 30/30 |
+| gfx1100 W7900 | E4B Q8 | 0.4000 -> 0.4000 | 382.485 -> 426.435 tok/s | +11.49% | 66.255 -> 59.426 s | -10.31% | 30/30 |
+| gfx1201 | E2B Q8 | 0.4000 -> 0.4000 | 493.955 -> 568.280 tok/s | +15.05% | 51.303 -> 44.593 s | -13.08% | 30/30 |
+| gfx1201 | E4B Q8 | 0.4667 -> 0.4667 | 429.620 -> 474.880 tok/s | +10.53% | 58.986 -> 53.364 s | -9.53% | 30/30 |
+
+The exact-policy artifacts are under `target/validation/gemma4-longbench-prefill/gfx1100/exact-ple-hard30-w7900-r1-20260816` and, on the gfx1201 validation host, `target/validation/gemma4-longbench-prefill/gfx1201/exact-ple-hard30-gfx1201-r1-20260816`.
 
 The final hard30 gate ran 30 paired prompts for both E2B and E4B on each architecture with an 8,192-token output cap. All 120 safe-policy predictions were byte-identical to their corresponding all-routes-off baselines, with zero correctness regressions or gains.
 

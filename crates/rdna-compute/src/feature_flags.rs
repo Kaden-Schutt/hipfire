@@ -188,8 +188,8 @@ pub struct FeatureFlags {
     /// Batch the E-series per-layer-input model projection on exact gfx1100
     /// instead of re-streaming the same matrix through one GEMV per row.
     pub gemma4_ple_batched_prefill: bool,
-    /// Exact-arithmetic batched E-series PLE branch projections. Explicit
-    /// opt-in until the cross-model, cross-architecture quality gate passes.
+    /// Exact-arithmetic batched E-series PLE branch projections on validated
+    /// gfx1100/gfx1201 paths. Remains independently disableable.
     pub gemma4_ple_branch_batched_prefill: bool,
     /// Fuse the E-series PLE GELU and strided per-layer multiply on validated
     /// gfx1100 and gfx1201 paths.
@@ -508,7 +508,7 @@ impl FeatureFlags {
             gemma4_ple_branch_batched_prefill: parse_bool(
                 "HIPFIRE_GEMMA4_PLE_BRANCH_BATCHED_PREFILL",
             )
-            .unwrap_or(false),
+            .unwrap_or(matches!(arch, "gfx1100" | "gfx1201")),
             gemma4_ple_activation_fused_prefill: parse_bool(
                 "HIPFIRE_GEMMA4_PLE_ACTIVATION_FUSED_PREFILL",
             )
@@ -802,14 +802,14 @@ mod tests {
 
         let gfx1100 = FeatureFlags::from_process_config("gfx1100", &process);
         assert!(gfx1100.gemma4_batched_embedding_prefill);
-        assert!(!gfx1100.gemma4_ple_branch_batched_prefill);
+        assert!(gfx1100.gemma4_ple_branch_batched_prefill);
         assert!(gfx1100.gemma4_ple_activation_fused_prefill);
         assert!(!gfx1100.gemma4_q8_fused_prefill);
         assert!(!gfx1100.gemma4_ple_batched_prefill);
 
         let gfx1201 = FeatureFlags::from_process_config("gfx1201", &process);
         assert!(gfx1201.gemma4_batched_embedding_prefill);
-        assert!(!gfx1201.gemma4_ple_branch_batched_prefill);
+        assert!(gfx1201.gemma4_ple_branch_batched_prefill);
         assert!(gfx1201.gemma4_ple_activation_fused_prefill);
         assert!(!gfx1201.gemma4_q8_fused_prefill);
         assert!(!gfx1201.gemma4_ple_batched_prefill);
