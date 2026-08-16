@@ -358,6 +358,18 @@ impl Pm4Commands {
         }
     }
 
+    fn gfx12_system_acquire(&mut self) -> Result<(), String> {
+        match self {
+            Self::Gfx12(commands) => {
+                commands.acquire_system_gfx12();
+                Ok(())
+            }
+            Self::Legacy { .. } => {
+                Err("gfx12 system acquire requested for a legacy PM4 stream".to_owned())
+            }
+        }
+    }
+
     #[cfg(test)]
     fn dependency_mode(&self) -> Option<LegacyDependencyMode> {
         match self {
@@ -2409,6 +2421,12 @@ fn required_mid_acquire(previous: &str, current: &str) -> bool {
     )
 }
 
+/// Reused rotate destinations need their stale GC12 vector-cache line
+/// invalidated before the writer executes in a retained IB.
+fn requires_gfx12_pre_dispatch_vmem_acquire(current: &str) -> bool {
+    current == "mq_rotate_x" || current == "fused_silu_mul_mq_rotate"
+}
+
 fn conservative_mid_acquire_except(previous: &str, current: &str, excluded: Option<&str>) -> bool {
     if previous.starts_with("gated_delta_net_q8_compact2_")
         || current.starts_with("gated_delta_net_q8_compact2_")
@@ -3844,7 +3862,13 @@ impl ReplayController {
                         }
                         Pm4WaitPolicy::Resource => resources_independent,
                     };
-                    if !independent {
+                    // GC12 can retain a vector-cache line for the reused
+                    // rotated-output allocation across dispatches in one IB.
+                    // Invalidate it before the writer starts; a consumer-side
+                    // acquire after the writer is too late for this hazard.
+                    let gfx12_pre_dispatch_acquire = pm4_architecture == Pm4Architecture::Gfx12
+                        && requires_gfx12_pre_dispatch_vmem_acquire(current);
+                    if gfx12_pre_dispatch_acquire || !independent {
                         dependency_waits += 1;
                         boundary.wait_compute_idle = true;
                         commands.wait_compute_idle()?;
@@ -3854,7 +3878,11 @@ impl ReplayController {
                         || self
                             .pm4_mid_acquire_policy
                             .acquire_between(previous, current);
-                    if acquire {
+                    if gfx12_pre_dispatch_acquire {
+                        dependency_acquires += 1;
+                        boundary.acquire_vmem = true;
+                        commands.gfx12_system_acquire()?;
+                    } else if acquire {
                         dependency_acquires += 1;
                         boundary.acquire_vmem = pm4_vmem_acquire_enabled(
                             pm4_architecture,
@@ -5434,6 +5462,16 @@ mod tests {
         assert!(!independent_sibling(
             "gemv_hfq4g256_moe_gate_up_k8_indexed",
             "fused_silu_mul_mq_rotate",
+        ));
+    }
+
+    #[test]
+    fn gfx12_rotated_vmem_writers_require_a_pre_dispatch_acquire() {
+        for producer in ["mq_rotate_x", "fused_silu_mul_mq_rotate"] {
+            assert!(requires_gfx12_pre_dispatch_vmem_acquire(producer));
+        }
+        assert!(!requires_gfx12_pre_dispatch_vmem_acquire(
+            "gemv_hfq4g256_residual"
         ));
     }
 

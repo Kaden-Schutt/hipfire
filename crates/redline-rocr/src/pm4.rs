@@ -104,7 +104,7 @@ impl Gfx12Pm4CommandBuffer {
     /// scalar, and vector cache visibility without carrying removed gfx11
     /// GL1/metadata bits into the merged RDNA4 hierarchy.
     pub fn acquire_system_gfx12(&mut self) {
-        self.emit_acquire_gcr(0x1c1d1);
+        self.emit_acquire_gcr(0xc3b1);
     }
 
     /// Return a copy bracketed by GPU-clock writes. The end timestamp follows
@@ -260,10 +260,10 @@ impl Gfx12Pm4CommandBuffer {
             packet3(PACKET3_ACQUIRE_MEM, 7, false),
             0,
             u32::MAX,
-            0xff,
+            0x00ff_ffff,
             0,
             0,
-            4,
+            0x0000_000a,
             gcr_cntl,
         ]);
     }
@@ -687,9 +687,13 @@ mod tests {
         assert_eq!(commands.dwords()[0], 0xc006_5800);
         assert_eq!(commands.dwords()[7], 0x1c3f1);
         assert_eq!(commands.dwords()[8], 0xc006_5800);
-        assert_eq!(commands.dwords()[15], 0x1c1d1);
+        assert_eq!(commands.dwords()[15], 0xc3b1);
         assert_eq!(commands.dwords()[16], 0xc006_5800);
         assert_eq!(commands.dwords()[23], 0x10180);
+        for base in [8, 16] {
+            assert_eq!(commands.dwords()[base + 3], 0x00ff_ffff);
+            assert_eq!(commands.dwords()[base + 6], 0x0000_000a);
+        }
         assert_eq!(&commands.dwords()[24..], &[0xc000_4600, 0x407]);
     }
 
