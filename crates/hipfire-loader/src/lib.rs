@@ -466,6 +466,175 @@ pub enum ModelState {
     MuseGlimmer(MuseGlimmerBundle),
 }
 
+/// `ArchModel` for the one bundle the loader defines itself.
+///
+/// Every other architecture implements the trait in its own crate. Glimmer's
+/// bundle type lives here rather than in `hipfire-arch-muse-glimmer`, so the
+/// impl has to live here too — the orphan rule leaves no choice. Moving the
+/// type into its crate is Phase 2's job; until then this is the honest place.
+impl hipfire_runtime::arch_model::ArchModel for MuseGlimmerBundle {
+    fn dim(&self) -> usize {
+        self.config.dim
+    }
+    fn n_layers(&self) -> usize {
+        self.config.n_layers
+    }
+    fn vocab_size(&self) -> usize {
+        self.config.vocab_size
+    }
+    fn arch_key(&self) -> &'static str {
+        "muse_glimmer"
+    }
+    fn kv_cache_mut(&mut self) -> Option<&mut hipfire_runtime::llama::KvCache> {
+        // Glimmer keeps its KV inside GlimmerState rather than owning a
+        // runtime `KvCache` directly, so there is nothing to hand back.
+        None
+    }
+    fn free_gpu(self: Box<Self>, gpu: &mut rdna_compute::Gpu) {
+        // Mirrors the `ModelState::MuseGlimmer` arm of `unload_model` exactly,
+        // drafter first. Per PR #566: freeing only one of state/weights leaks
+        // ~1.3 GB over five load cycles, so both sides are mandatory.
+        let b = *self;
+        if let Some(drafter) = b.drafter {
+            drafter.scratch.free_gpu(gpu);
+            drafter.weights.free_gpu(gpu);
+        }
+        b.state.free_gpu(gpu);
+        b.weights.free_gpu(gpu);
+    }
+}
+
+/// `ArchModel` for the three bundles the loader defines itself.
+///
+/// `Gemma4Bundle`, `Gemma4LoweredBundle` and `Deepseek4HeterogeneousBundle` are
+/// declared here rather than in their arch crates, so — orphan rule — the impls
+/// must be here too. Each `free_gpu` mirrors its `unload_model` arm exactly;
+/// freeing less leaks, freeing more double-frees.
+impl hipfire_runtime::arch_model::ArchModel for Gemma4Bundle {
+    fn dim(&self) -> usize {
+        self.config.dim
+    }
+    fn n_layers(&self) -> usize {
+        self.config.n_layers
+    }
+    fn vocab_size(&self) -> usize {
+        self.config.vocab_size
+    }
+    fn arch_key(&self) -> &'static str {
+        "gemma4"
+    }
+    fn kv_cache_mut(&mut self) -> Option<&mut hipfire_runtime::llama::KvCache> {
+        None
+    }
+    fn free_gpu(self: Box<Self>, gpu: &mut rdna_compute::Gpu) {
+        let b = *self;
+        if let Some(eagle) = b.eagle {
+            eagle.spec_scratch.free(gpu);
+            eagle.drafter_scratch.free_gpu(gpu);
+            eagle.drafter_weights.free_gpu(gpu);
+        }
+        b.state.free_gpu(gpu);
+        b.weights.free_gpu(gpu);
+    }
+}
+
+impl hipfire_runtime::arch_model::ArchModel for Gemma4LoweredBundle {
+    fn dim(&self) -> usize {
+        self.config.dim
+    }
+    fn n_layers(&self) -> usize {
+        self.config.n_layers
+    }
+    fn vocab_size(&self) -> usize {
+        self.config.vocab_size
+    }
+    fn arch_key(&self) -> &'static str {
+        "gemma4"
+    }
+    fn kv_cache_mut(&mut self) -> Option<&mut hipfire_runtime::llama::KvCache> {
+        // Two caches (q8 sliding + asym3 full) and no basis for preferring
+        // one, so expose neither rather than silently picking.
+        None
+    }
+    fn free_gpu(self: Box<Self>, gpu: &mut rdna_compute::Gpu) {
+        let b = *self;
+        b.scratch.free_gpu(gpu);
+        let _ = b.kv_sliding.free_gpu(gpu);
+        let _ = b.kv_full.free_gpu(gpu);
+        b.weights.free_gpu(gpu);
+    }
+}
+
+impl hipfire_runtime::arch_model::ArchModel for Deepseek4HeterogeneousBundle {
+    fn dim(&self) -> usize {
+        self.model.config.hidden_size
+    }
+    fn n_layers(&self) -> usize {
+        self.model.config.num_hidden_layers
+    }
+    fn vocab_size(&self) -> usize {
+        self.model.config.vocab_size
+    }
+    fn arch_key(&self) -> &'static str {
+        "deepseek4"
+    }
+    fn kv_cache_mut(&mut self) -> Option<&mut hipfire_runtime::llama::KvCache> {
+        None
+    }
+    fn free_gpu(self: Box<Self>, _gpu: &mut rdna_compute::Gpu) {
+        // Self-owned two-device transaction: `Drop` frees each resource on its
+        // exact owner and drains both pools. Calling anything else here would
+        // double-free, which is why this body is a drop and not a sequence.
+        drop(self);
+    }
+}
+
+impl ModelState {
+    /// The architecture-agnostic view of whichever model is loaded.
+    ///
+    /// This is deliberately the ONLY place the enum is destructured for
+    /// infrastructure purposes. Everything downstream — load acknowledgement,
+    /// session reset, unload — asks the trait instead of matching eleven
+    /// variants, which is how the daemon stopped doing a seven-arm
+    /// architecture dispatch to compute three integers.
+    ///
+    /// `hipfire-generate` still matches variants directly, and should: it is
+    /// the architecture composition root and legitimately needs concrete
+    /// bundles to call per-arch forward passes.
+    pub fn as_arch_model(&self) -> &dyn hipfire_runtime::arch_model::ArchModel {
+        match self {
+            ModelState::Qwen2(b) => b,
+            ModelState::Qwen35(b) => b,
+            ModelState::Llama(b) => b,
+            ModelState::Lfm2Moe(b) => b,
+            ModelState::Minimax(b) => b,
+            ModelState::Cohere2Moe(b) => b,
+            ModelState::Gemma4(b) => b,
+            ModelState::Gemma4Lowered(b) => b,
+            ModelState::Deepseek4(b) => b,
+            ModelState::Deepseek4Heterogeneous(b) => b,
+            ModelState::MuseGlimmer(b) => b,
+        }
+    }
+
+    /// Mutable counterpart of [`ModelState::as_arch_model`].
+    pub fn as_arch_model_mut(&mut self) -> &mut dyn hipfire_runtime::arch_model::ArchModel {
+        match self {
+            ModelState::Qwen2(b) => b,
+            ModelState::Qwen35(b) => b,
+            ModelState::Llama(b) => b,
+            ModelState::Lfm2Moe(b) => b,
+            ModelState::Minimax(b) => b,
+            ModelState::Cohere2Moe(b) => b,
+            ModelState::Gemma4(b) => b,
+            ModelState::Gemma4Lowered(b) => b,
+            ModelState::Deepseek4(b) => b,
+            ModelState::Deepseek4Heterogeneous(b) => b,
+            ModelState::MuseGlimmer(b) => b,
+        }
+    }
+}
+
 /// Self-owned gfx1100+dense / gfx1151+routed DeepSeek V4 state. The model
 /// owns both HIP devices and tears them down in its `Drop` implementation;
 /// the daemon's ordinary single-device `Gpu` must never free these buffers.

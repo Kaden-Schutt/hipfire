@@ -18,6 +18,7 @@
 //!   * LIV conv    -> conv1d_gated_decode_f32 (NEW: K=3, fused B*x / C*conv_out
 //!                    gates + rolling conv-state cache)
 pub mod arch;
+pub mod arch_model;
 pub mod batch;
 pub mod config;
 pub mod forward;

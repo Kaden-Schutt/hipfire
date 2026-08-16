@@ -52,6 +52,7 @@
 //!   and the raw SWA + compressed-KV KV-cache layout).
 
 pub mod arch;
+pub mod arch_model;
 mod backend;
 pub mod deepseek4;
 pub mod dsml;

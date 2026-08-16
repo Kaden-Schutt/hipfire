@@ -31,6 +31,8 @@
 #[cfg(feature = "deltanet")]
 pub mod arch;
 #[cfg(feature = "deltanet")]
+pub mod arch_model;
+#[cfg(feature = "deltanet")]
 pub mod carrier;
 /// Qwen3.5 DFlash / DDTree speculative-decode state (`DflashState`,
 /// `load_dflash_state`) and the `DflashSpeculator` impl of the arch-generic

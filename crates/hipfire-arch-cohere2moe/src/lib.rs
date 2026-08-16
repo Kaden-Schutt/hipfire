@@ -24,13 +24,13 @@
 //! sigmoid/no-renorm router.
 
 pub mod arch;
+pub mod arch_model;
 pub mod cohere2moe;
 pub mod config;
 pub mod forward;
 pub mod paro_dir;
 pub mod spec_emit;
 pub mod spec_impl;
-
 pub use arch::Cohere2Moe;
 pub use cohere2moe::{
     Cohere2MoeLayerWeights, Cohere2MoeState, Cohere2MoeWeights, ExpertWeights, MoeFfn,

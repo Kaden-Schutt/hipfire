@@ -21,6 +21,7 @@
 //! `moe_scatter/unscatter/down_combine_k8` family.
 
 pub mod arch;
+pub mod arch_model;
 pub mod forward;
 pub mod minimax;
 /// MiniMax-M2 impl of the arch-generic `hipfire_runtime::spec` seam

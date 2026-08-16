@@ -15,6 +15,7 @@
 
 pub mod admission;
 pub mod arch;
+pub mod arch_model;
 pub mod arch_spec;
 pub mod augmentor;
 pub mod bf16_loader;
