@@ -357,13 +357,11 @@ pub fn generate_deepseek4_spec(
     }
 
     // eos token (for the DSML prompt build) from the bundle — immutable peek.
-    let eos_tok = match m.state.as_ref() {
-        Some(ModelState::Deepseek4(b)) => b.eos_tok,
-        _ => {
-            emit_error_with_id(stdout, id, "deepseek4 bundle missing on arch_id=9 spec");
-            return;
-        }
+    let Some(b) = m.deepseek4() else {
+        emit_error_with_id(stdout, id, "deepseek4 bundle missing on arch_id=9 spec");
+        return;
     };
+    let eos_tok = b.eos_tok;
 
     // DSML prompt render (same builder the bespoke loop uses).
     let prompt_ids = {
@@ -436,7 +434,7 @@ pub fn generate_deepseek4_spec(
         .start_pos
         .saturating_add(suffix.len())
         .saturating_add(max_tokens);
-    if let Some(ModelState::Deepseek4(bundle)) = m.state.as_mut() {
+    if let Some(bundle) = m.deepseek4_mut() {
         if let Err(error) = deepseek4::forward::ensure_compressor_capacity(
             &bundle.config,
             &mut bundle.state,
@@ -457,7 +455,7 @@ pub fn generate_deepseek4_spec(
     // zero the position-indexed rings + invalidate the captured decode graph so a
     // fresh conversation reproduces a freshly-launched daemon's clean state.
     if !plan.cache_hit {
-        if let Some(ModelState::Deepseek4(b)) = m.state.as_mut() {
+        if let Some(b) = m.deepseek4_mut() {
             b.state.zero_decode_caches(gpu);
         }
         gpu.invalidate_graph_state();
@@ -719,10 +717,7 @@ pub fn generate_deepseek4(
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
 ) {
-    if matches!(
-        m.state.as_ref(),
-        Some(ModelState::Deepseek4Heterogeneous(_))
-    ) {
+    if m.deepseek4_heterogeneous_mut().is_some() {
         generate_deepseek4_heterogeneous(
             m,
             stdout,

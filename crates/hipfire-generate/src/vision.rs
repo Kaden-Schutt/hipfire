@@ -1360,10 +1360,7 @@ pub fn generate_vl_dots_ocr(
 
     // 2. Model state (disjoint field borrows of `m`).
     let tokenizer = m.tokenizer.as_ref().unwrap();
-    let config = match &m.state {
-        Some(hipfire_loader::ModelState::DotsOcr(b)) => b.config.clone(),
-        _ => unreachable!("generate_vl_dots_ocr requires ModelState::DotsOcr"),
-    };
+    let config = m.dots_ocr().unwrap().config.clone();
     let text_cfg = config.text.clone();
     let dim = text_cfg.hidden_size;
     // Weights/state via raw pointers to allow owned config while keeping disjoint borrows.
@@ -1537,10 +1534,7 @@ pub fn generate_vl_dots_ocr(
         return;
     }
     let tokenizer = m.tokenizer.as_ref().unwrap();
-    let config = match &m.state {
-        Some(hipfire_loader::ModelState::DotsOcr(b)) => b.config.clone(),
-        _ => unreachable!(),
-    };
+    let config = m.dots_ocr().unwrap().config.clone();
     let text_cfg = config.text.clone();
     let bundle_ptr: *mut hipfire_arch_dots_ocr::DotsOcrBundle = match &mut m.state {
         Some(hipfire_loader::ModelState::DotsOcr(b)) => b as *mut _,
@@ -1877,10 +1871,7 @@ pub fn generate_dots_ocr_text(
 
     // Model state (disjoint field borrows of `m`).
     let tokenizer = m.tokenizer.as_ref().unwrap();
-    let config = match &m.state {
-        Some(hipfire_loader::ModelState::DotsOcr(b)) => b.config.clone(),
-        _ => unreachable!(),
-    };
+    let config = m.dots_ocr().unwrap().config.clone();
     let text_cfg = config.text.clone();
     let dim = text_cfg.hidden_size;
     // Weights/state via raw pointers to allow owned config while keeping disjoint borrows.

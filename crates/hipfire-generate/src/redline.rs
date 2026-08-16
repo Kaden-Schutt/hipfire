@@ -293,10 +293,10 @@ pub fn redline_is_dense_lfm(loaded: &LoadedModel) -> bool {
     if loaded.pp != 1 || loaded.ep.is_some() {
         return false;
     }
-    match loaded.state.as_ref() {
-        Some(ModelState::Lfm2Moe(bundle)) => bundle.config.is_dense(),
-        _ => false,
-    }
+    let Some(bundle) = loaded.lfm2moe() else {
+        return false;
+    };
+    bundle.config.is_dense()
 }
 
 pub fn redline_append_tensor_slice(

@@ -202,3 +202,37 @@ corroboration that the freed allocation was exactly the missing scratch.
 configuration it belongs to, which is what the step was waiting for. The blocker is
 discharged; what remains is the `state` field and its 143-site `hipfire-generate`
 conversion.
+
+
+## Step 4 attempted: the accessor indirection is only partly viable
+
+`LoadedModel` is now down to ONE architecture-typed field, `state`. The plan was to convert
+`hipfire-generate`'s call sites to typed accessors first, so the eventual storage swap to
+`Box<dyn ArchModel>` would change only the accessor bodies rather than ~143 call sites at the
+same time as the type.
+
+The accessor set was completed (twelve bundles, all reachable the same way). The conversion
+then landed **15 sites of 154**, and the reasons the rest resisted are the real finding.
+
+**Rust borrow semantics, not volume, are the constraint.** A direct
+`if let Some(ModelState::Qwen35(b)) = m.state.as_mut()` borrows only the `state` FIELD, so
+the same expression can touch `m.prefill_checkpoints` alongside it. An accessor
+`m.qwen35_mut()` borrows **all of `m`**, so those sites stop compiling. `ar.rs:2581` is the
+clean example: it binds the bundle and a prefill checkpoint in one `if let` tuple.
+
+Three categories resisted, all correctly:
+
+| category | why |
+|---|---|
+| borrow-disjointness | accessor borrows whole `m`; direct match borrows one field |
+| multi-arm dispatch | `map_or`/`and_then` closures matching 2+ architectures — an `if let` chain changes control flow |
+| construction (~10) | building `Some(ModelState::X(..))` must name the variant; correct as-is |
+
+**Consequence for the descent.** 124 code sites remain, and a meaningful fraction of them are
+borrow-shape-sensitive rather than mechanical. `Box<dyn ArchModel>` + `Any` downcast has the
+same borrow property as the accessor — `downcast_mut` on a boxed field borrows the field, so
+disjoint-field cases may actually survive better than the accessor did. That is worth
+checking before committing: it flips the difficulty estimate.
+
+The 15 that did convert are strictly better and are kept. No behaviour changed; workspace
+builds and 1,997 lib tests pass.

@@ -1118,6 +1118,85 @@ impl LoadedModel {
     }
 
     /// LFM2.5-MoE bundle if this model is arch_id=11, else None.
+    /// Typed accessors for the remaining bundles.
+    ///
+    /// Six of these already existed; these six close the set so EVERY bundle is
+    /// reachable the same way. That uniformity is the point: once every
+    /// consumer goes through an accessor instead of destructuring
+    /// `ModelState` itself, swapping the storage to `Box<dyn ArchModel>`
+    /// changes these bodies and nothing else. Without them, that swap would
+    /// have to rewrite ~143 call sites in `hipfire-generate` at the same time
+    /// as changing the type — one unreviewable change instead of two safe ones.
+    pub fn qwen35(&self) -> Option<&hipfire_arch_qwen35::Qwen35Bundle> {
+        match &self.state {
+            Some(ModelState::Qwen35(b)) => Some(b),
+            _ => None,
+        }
+    }
+
+    pub fn qwen35_mut(&mut self) -> Option<&mut hipfire_arch_qwen35::Qwen35Bundle> {
+        match &mut self.state {
+            Some(ModelState::Qwen35(b)) => Some(b),
+            _ => None,
+        }
+    }
+
+    pub fn llama(&self) -> Option<&hipfire_arch_llama::LlamaBundle> {
+        match &self.state {
+            Some(ModelState::Llama(b)) => Some(b),
+            _ => None,
+        }
+    }
+
+    pub fn llama_mut(&mut self) -> Option<&mut hipfire_arch_llama::LlamaBundle> {
+        match &mut self.state {
+            Some(ModelState::Llama(b)) => Some(b),
+            _ => None,
+        }
+    }
+
+    pub fn gemma4(&self) -> Option<&Gemma4Bundle> {
+        match &self.state {
+            Some(ModelState::Gemma4(b)) => Some(b),
+            _ => None,
+        }
+    }
+
+    pub fn gemma4_mut(&mut self) -> Option<&mut Gemma4Bundle> {
+        match &mut self.state {
+            Some(ModelState::Gemma4(b)) => Some(b),
+            _ => None,
+        }
+    }
+
+    pub fn gemma4_lowered_mut(&mut self) -> Option<&mut Gemma4LoweredBundle> {
+        match &mut self.state {
+            Some(ModelState::Gemma4Lowered(b)) => Some(b),
+            _ => None,
+        }
+    }
+
+    pub fn muse_glimmer(&self) -> Option<&MuseGlimmerBundle> {
+        match &self.state {
+            Some(ModelState::MuseGlimmer(b)) => Some(b),
+            _ => None,
+        }
+    }
+
+    pub fn muse_glimmer_mut(&mut self) -> Option<&mut MuseGlimmerBundle> {
+        match &mut self.state {
+            Some(ModelState::MuseGlimmer(b)) => Some(b),
+            _ => None,
+        }
+    }
+
+    pub fn deepseek4_heterogeneous_mut(&mut self) -> Option<&mut Deepseek4HeterogeneousBundle> {
+        match &mut self.state {
+            Some(ModelState::Deepseek4Heterogeneous(b)) => Some(b),
+            _ => None,
+        }
+    }
+
     pub fn lfm2moe(&self) -> Option<&Lfm2MoeBundle> {
         match &self.state {
             Some(ModelState::Lfm2Moe(b)) => Some(b),

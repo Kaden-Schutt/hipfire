@@ -1090,7 +1090,7 @@ pub fn generate(
         // (ModelState::Gemma4Lowered). The generate body is eager-only, so a
         // lowered load must fail loudly here rather than silently run eager
         // against lowered weights.
-        if matches!(m.state.as_ref(), Some(ModelState::Gemma4Lowered(_))) {
+        if m.gemma4_lowered_mut().is_some() {
             emit_error_with_id(
                 stdout,
                 id,

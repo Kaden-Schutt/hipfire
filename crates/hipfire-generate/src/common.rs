@@ -727,7 +727,7 @@ pub fn reset_qwen35_recurrent(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu) 
                 }
             }
         }
-    } else if let Some(ModelState::Qwen35(b)) = m.state.as_ref() {
+    } else if let Some(b) = m.qwen35() {
         let dn = &b.dn_state;
         for s in &dn.s_matrices {
             if let Err(e) = gpu.hip.memset(&s.buf, 0, s.buf.size()) {
@@ -750,7 +750,7 @@ pub fn reset_qwen35_recurrent(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu) 
             }
         }
     }
-    if let Some(ModelState::Qwen35(b)) = m.state.as_mut() {
+    if let Some(b) = m.qwen35_mut() {
         b.kv_cache.compact_offset = 0;
     }
     match first_err {
@@ -1064,7 +1064,7 @@ pub fn fail_closed_reset_target_and_spec(
         if let Err(e) = reset_qwen35_recurrent(m, gpu) {
             push_reset_err(&mut first_err, "reset_qwen35_recurrent", e);
         }
-        if let Some(ModelState::Llama(b)) = m.state.as_mut() {
+        if let Some(b) = m.llama_mut() {
             b.kv.compact_offset = 0;
         }
         if let Some(s) = &mut m.qwen2_state {
@@ -1092,14 +1092,14 @@ pub fn fail_closed_reset_target_and_spec(
                 push_reset_err(&mut first_err, "cohere2moe.reset", e);
             }
         }
-        if let Some(ModelState::Gemma4(bundle)) = m.state.as_mut() {
+        if let Some(bundle) = m.gemma4_mut() {
             // Gemma4State::reset is cursor-only (n_tokens = 0); the
             // captured decode hipGraph stays valid across resets (position
             // is re-staged via pos_host on every replay and attention
             // geometry is sized for max_seq).
             bundle.state.reset();
         }
-        if let Some(ModelState::MuseGlimmer(bundle)) = m.state.as_mut() {
+        if let Some(bundle) = m.muse_glimmer_mut() {
             bundle.reset_session_state();
         }
         if let Some(ad) = m.kv_adaptive.as_mut() {
