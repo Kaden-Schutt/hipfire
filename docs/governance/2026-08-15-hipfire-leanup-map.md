@@ -630,3 +630,47 @@ residue is the forward pass.
 and the quant formats. That is 124,348 lines of genuine differentiation, it is
 where the performance advantage lives, and **none of it is what is broken.**
 The compute layer is not touched by any item in § 1.
+
+## §5d · Runtime verification at completion (2026-08-15, hiptrx 4x R9700 gfx1201)
+
+Evidence for the DoD item *"`cargo build --release` with no `--features`
+produces a working `hipfire` binary loading all 12 architectures."* Run at
+`d1158ed6e` from `/home/kaden/hf-saddle`, isolated `HOME` so the shared daemon
+flock and the operator's serve were untouched. Decoded text was read in every
+case; a load alone was not accepted as evidence.
+
+| architecture | fixture | result |
+|---|---|---|
+| `lfm2moe` | `lfm2.5-1.2b.mq4.hfq` | coherent — *"2. **Green** 3. **Blue**"* |
+| `gemma4` | `g4it.mq4.hfq` (12B IT) | coherent — additive/subtractive colour breakdown |
+| `muse_glimmer` | `muse-glimmer-30b.mq4` | coherent |
+| `qwen3_5` | `qwen3.6-27b.mq4` | loads + generates |
+| `qwen3_5` | `qwen3.8-27b.mq4` | loads + generates |
+| `deepseek4` | `deepseek-v4-flash.mq2lloyd` | loads + generates |
+| `minimax` | `minimax-m2.mq2lloyd` | loads |
+
+### Two failures found, both proven PRE-EXISTING
+
+Neither is attributable to the leanup, and both are worth their own issue.
+
+**1. Gemma 4 31B cannot load — unconditional QKV bias.**
+`gemma-4-31b.mq4` and `gemma-4-31b-it.mg4.hfq` both panic in ~2 s with
+`tensor not found: layers.0.self_attn.q_proj.bias`
+(`hipfire-runtime/src/weight_backend.rs:1018`). The 12B loads and generates
+normally, so this is not a corrupt download — Gemma 4 31B carries no QKV
+biases and `WeightBackend::bias()` requires them unconditionally.
+`git log 8510ca5f2..HEAD -- crates/hipfire-runtime/src/weight_backend.rs
+crates/hipfire-arch-gemma4/` is **empty**: the leanup never touched either path.
+Secondary defect: an unsupported model should surface a clean error, not
+`panic!`.
+
+**2. `lfm2.5-8b-a1b` emits a `</think>` attractor.**
+The MoE variant returns nothing but repeated `</think>` tokens. The dense 1.2B
+of the same architecture is coherent, so it is the MoE path specifically.
+Reproduced at the pre-saddle baseline `8510ca5f2`, built in a separate worktree
+and driven through that era's product path (`hipfire-cli` +
+`hipfire-runtime/examples/daemon`), with byte-identical output. **Pre-existing.**
+
+The first attempt at this baseline check used `examples/run`, which is the
+qwen35 runner and misrouted the model into a `norm.weight` panic — recorded
+because a reader could otherwise repeat the same mistake.
