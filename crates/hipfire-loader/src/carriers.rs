@@ -328,6 +328,8 @@ fn load_qwen35_pp(
         dn_state: dn,
         // Adaptive is single-GPU only; PP path never engages the controller.
         kv_adaptive: None,
+        vision_config: None,
+        vision_weights: None,
     };
     Ok(LoadedModel {
         state: Some(ModelState::Qwen35(bundle)),
@@ -639,7 +641,6 @@ impl Carrier for Qwen35Carrier {
                         return Err(note);
                     }
                 };
-
                 let scratch = match hipfire_arch_qwen35::qwen35::Qwen35Scratch::new_with_kv_max(
                     ctx.gpu,
                     &config,
@@ -657,7 +658,6 @@ impl Carrier for Qwen35Carrier {
                         return Err(note);
                     }
                 };
-
                 let bundle = hipfire_arch_qwen35::Qwen35Bundle {
                     config,
                     weights,
@@ -666,6 +666,8 @@ impl Carrier for Qwen35Carrier {
                     dn_state,
                     // Dir/safetensors path does not engage adaptive (HFQ carrier only).
                     kv_adaptive: None,
+                    vision_config: None,
+                    vision_weights: None,
                 };
                 Ok(LoadedModel {
                     state: Some(ModelState::Qwen35(bundle)),
@@ -1029,9 +1031,10 @@ impl Carrier for DotsOcrCarrier {
         _n: usize,
         _prefill_err: &mut Option<String>,
     ) -> Option<bool> {
-        let state = m.qwen2_state.as_mut().unwrap();
-        let config = m.dots_ocr_config.as_ref().unwrap();
-        let weights = m.dots_ocr_weights.as_ref().unwrap();
+        let bundle = m.dots_ocr_bundle.as_mut().unwrap();
+        let state = &mut bundle.state;
+        let config = &bundle.config;
+        let weights = &bundle.weights;
         let mut ok = true;
         for &tok in synthetic {
             if hipfire_arch_qwen2::qwen2::forward_step(gpu, &weights.text, &config.text, state, tok).is_err() {
@@ -1068,9 +1071,7 @@ impl Carrier for DotsOcrCarrier {
             ctx.spec,
         );
         Ok(LoadedModel {
-            qwen2_state: Some(bundle.state),
-            dots_ocr_config: Some(bundle.config),
-            dots_ocr_weights: Some(bundle.weights),
+            dots_ocr_bundle: Some(bundle),
             speculator,
             ..LoadedModel::skeleton(
                 meta.arch_id,

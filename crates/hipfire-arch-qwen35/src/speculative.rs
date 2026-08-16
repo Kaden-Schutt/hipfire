@@ -529,6 +529,11 @@ pub struct ModelSlot {
     /// `set_dflash_extract_layers` / `capture_seed_main_hidden` so the per-window
     /// verify captures hidden at exactly the sidecar's layer ids.
     pub dspark_extract_layers: Vec<usize>,
+    /// Vision tower carried through the slot guard so `Qwen35Bundle` round-trips
+    /// without loss. The slot never drives `vision_forward`; it just parks the
+    /// tower while the bundle is out of `ModelState`.
+    pub vision_config: Option<hipfire_arch_qwen35_vl::qwen35_vl::VisionConfig>,
+    pub vision_weights: Option<hipfire_arch_qwen35_vl::qwen35_vl::VisionWeights>,
 }
 
 impl ModelSlot {
@@ -555,6 +560,8 @@ impl ModelSlot {
             kv_cache,
             dn_state,
             kv_adaptive: _,
+            vision_config,
+            vision_weights,
         } = bundle;
         Ok(Self {
             name: String::from("target"),
@@ -566,6 +573,8 @@ impl ModelSlot {
             scratch,
             slot_config: ModelSlotConfig::default(),
             dspark_extract_layers: Vec::new(),
+            vision_config,
+            vision_weights,
         })
     }
 
@@ -582,6 +591,8 @@ impl ModelSlot {
             dn_state: self.dn_state,
             // Controller lives on LoadedModel, not ModelSlot.
             kv_adaptive: None,
+            vision_config: self.vision_config,
+            vision_weights: self.vision_weights,
         }
     }
 }
@@ -697,6 +708,8 @@ impl ModelSlot {
             scratch,
             slot_config,
             dspark_extract_layers: Vec::new(),
+            vision_config: None,
+            vision_weights: None,
         })
     }
 

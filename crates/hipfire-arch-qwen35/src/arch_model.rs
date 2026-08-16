@@ -49,7 +49,9 @@ impl ArchModel for Qwen35Bundle {
         //   b.scratch.free_gpu(gpu);
         //   b.weights.free_gpu(gpu);
         //   b.dn_state.free_gpu(gpu);
-        // Order is kv → scratch → weights → dn. Errors are aggregated via
+        //   plus optional vision tower (one-shot; freed after prefill in
+        //   non-persistent paths, but persistent VL keeps it here).
+        // Order is kv → scratch → weights → dn → vision. Errors are aggregated via
         // `note` in the loader but `ArchModel::free_gpu` is infallible, so
         // failures here are dropped (same as weight/dn frees which already
         // ignore errors).
@@ -60,10 +62,15 @@ impl ArchModel for Qwen35Bundle {
             kv_cache,
             dn_state,
             kv_adaptive: _,
+            vision_config: _,
+            vision_weights,
         } = *self;
         let _ = kv_cache.free_gpu(gpu);
         let _ = scratch.free_gpu(gpu);
         weights.free_gpu(gpu);
         dn_state.free_gpu(gpu);
+        if let Some(vw) = vision_weights {
+            vw.free_gpu(gpu);
+        }
     }
 }

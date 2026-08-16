@@ -876,6 +876,7 @@ name = "hipfire-arch-qwen35"
 version = "0.3.0"
 dependencies = [
  "hip-bridge",
+ "hipfire-arch-qwen35-vl",
  "hipfire-config",
  "hipfire-dispatch",
  "hipfire-reap",

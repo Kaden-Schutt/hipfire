@@ -3849,6 +3849,8 @@ pub fn generate_qwen35_mtp(
         kv_cache,
         dn_state,
         kv_adaptive: _,
+        vision_config,
+        vision_weights,
     } = match m.state.take() {
         Some(ModelState::Qwen35(b)) => b,
         _ => {
@@ -3867,7 +3869,9 @@ pub fn generate_qwen35_mtp(
                 scratch,
                 kv_cache,
                 dn_state,
-                kv_adaptive: None,
+                                kv_adaptive: None,
+                vision_config,
+                vision_weights,
             }));
             return;
         }
@@ -3882,6 +3886,8 @@ pub fn generate_qwen35_mtp(
         scratch,
         slot_config: ModelSlotConfig::default(),
         dspark_extract_layers: Vec::new(),
+        vision_config,
+        vision_weights,
     };
 
     // Helper closure analog: every early return must put the bundle back. We
@@ -3918,7 +3924,9 @@ pub fn generate_qwen35_mtp(
             scratch: target.scratch,
             kv_cache: target.kv_cache,
             dn_state: target.dn_state,
-            kv_adaptive: None,
+                            kv_adaptive: None,
+                vision_config: target.vision_config,
+                vision_weights: target.vision_weights,
         }));
         return;
     }
@@ -3951,7 +3959,9 @@ pub fn generate_qwen35_mtp(
                     scratch: target.scratch,
                     kv_cache: target.kv_cache,
                     dn_state: target.dn_state,
-                    kv_adaptive: None,
+                                    kv_adaptive: None,
+                vision_config: target.vision_config,
+                vision_weights: target.vision_weights,
                 }));
                 return;
             }
@@ -3967,7 +3977,9 @@ pub fn generate_qwen35_mtp(
                     scratch: target.scratch,
                     kv_cache: target.kv_cache,
                     dn_state: target.dn_state,
-                    kv_adaptive: None,
+                                    kv_adaptive: None,
+                vision_config: target.vision_config,
+                vision_weights: target.vision_weights,
                 }));
                 return;
             }
@@ -3987,7 +3999,9 @@ pub fn generate_qwen35_mtp(
                 scratch: target.scratch,
                 kv_cache: target.kv_cache,
                 dn_state: target.dn_state,
-                kv_adaptive: None,
+                                kv_adaptive: None,
+                vision_config: target.vision_config,
+                vision_weights: target.vision_weights,
             }));
             return;
         }
@@ -4000,7 +4014,9 @@ pub fn generate_qwen35_mtp(
                 scratch: target.scratch,
                 kv_cache: target.kv_cache,
                 dn_state: target.dn_state,
-                kv_adaptive: None,
+                                kv_adaptive: None,
+                vision_config: target.vision_config,
+                vision_weights: target.vision_weights,
             }));
             return;
         }
@@ -4083,7 +4099,9 @@ pub fn generate_qwen35_mtp(
             scratch: target.scratch,
             kv_cache: target.kv_cache,
             dn_state: target.dn_state,
-            kv_adaptive: None,
+                            kv_adaptive: None,
+                vision_config: target.vision_config,
+                vision_weights: target.vision_weights,
         }));
         return;
     }
@@ -4103,7 +4121,9 @@ pub fn generate_qwen35_mtp(
                 scratch: target.scratch,
                 kv_cache: target.kv_cache,
                 dn_state: target.dn_state,
-                kv_adaptive: None,
+                                kv_adaptive: None,
+                vision_config: target.vision_config,
+                vision_weights: target.vision_weights,
             }));
             return;
         }
@@ -4572,7 +4592,9 @@ pub fn generate_qwen35_mtp(
         scratch: target.scratch,
         kv_cache: target.kv_cache,
         dn_state: target.dn_state,
-        kv_adaptive: None,
+                        kv_adaptive: None,
+                vision_config: target.vision_config,
+                vision_weights: target.vision_weights,
     }));
 
     if let Some(e) = step_error {

@@ -355,7 +355,7 @@ pub fn generate_vl(
         }
     }
     let tokenizer = m.tokenizer.as_ref().unwrap();
-    let vision_config = m.vision_config.as_ref().unwrap();
+    let vision_config = m.vision_config().unwrap().clone();
 
     // Vision special-token IDs resolved from the tokenizer rather than
     // hardcoded constants. Different VL-capable Qwen variants ship with
@@ -533,7 +533,7 @@ pub fn generate_vl(
     let scratch = &b.scratch;
     let kv = &mut b.kv_cache;
     let dn = &mut b.dn_state;
-    let vision_weights = m.vision_weights.as_ref().unwrap();
+    let vision_weights = b.vision_weights.as_ref().unwrap();
 
     // Build the actual prompt token sequence BEFORE running the GPU vision
     // encoder so the hard capacity check uses the real prefill length, not
@@ -629,7 +629,7 @@ pub fn generate_vl(
     let visual_tokens = match qwen35_vl::vision_forward(
         gpu,
         vision_weights,
-        vision_config,
+        &vision_config,
         &patches,
         grid_h,
         grid_w,
@@ -1360,11 +1360,13 @@ pub fn generate_vl_dots_ocr(
 
     // 2. Model state (disjoint field borrows of `m`).
     let tokenizer = m.tokenizer.as_ref().unwrap();
-    let config = m.dots_ocr_config.as_ref().unwrap();
-    let weights = m.dots_ocr_weights.as_ref().unwrap();
-    let state = m.qwen2_state.as_mut().unwrap();
-    let text_cfg = &config.text;
+    let config = m.dots_ocr_bundle.as_ref().unwrap().config.clone();
+    let text_cfg = config.text.clone();
     let dim = text_cfg.hidden_size;
+    // Weights/state via raw pointers to allow owned config
+    let bundle_ptr: *mut hipfire_arch_dots_ocr::DotsOcrBundle = m.dots_ocr_bundle.as_mut().unwrap() as *mut _;
+    let weights = unsafe { &(*bundle_ptr).weights };
+    let state = unsafe { &mut (*bundle_ptr).state };
 
     // 3. Build the prompt (HF-exact framing; imgpad count == n_visual by construction).
     let prompt_ids = dots_ocr::build_prompt_ids(tokenizer, prompt, n_visual);
@@ -1494,7 +1496,7 @@ pub fn generate_vl_dots_ocr(
         return;
     }
     if let Err(e) =
-        qwen2::forward_prefill_batch_embeds(gpu, &weights.text, text_cfg, state, &embeds)
+        qwen2::forward_prefill_batch_embeds(gpu, &weights.text, &text_cfg, state, &embeds)
     {
         write_error(
             stdout,
@@ -1530,10 +1532,11 @@ pub fn generate_vl_dots_ocr(
         return;
     }
     let tokenizer = m.tokenizer.as_ref().unwrap();
-    let config = m.dots_ocr_config.as_ref().unwrap();
-    let text_cfg = &config.text;
-    let weights = m.dots_ocr_weights.as_ref().unwrap();
-    let state = m.qwen2_state.as_mut().unwrap();
+    let config = m.dots_ocr_bundle.as_ref().unwrap().config.clone();
+    let text_cfg = config.text.clone();
+    let bundle_ptr: *mut hipfire_arch_dots_ocr::DotsOcrBundle = m.dots_ocr_bundle.as_mut().unwrap() as *mut _;
+    let weights = unsafe { &(*bundle_ptr).weights };
+    let state = unsafe { &mut (*bundle_ptr).state };
 
     // Greedy decode, streaming in the daemon JSONL protocol.
     let eos_set: Vec<u32> = if text_cfg.eos_token_ids.is_empty() {
@@ -1586,7 +1589,7 @@ pub fn generate_vl_dots_ocr(
             emitted_bytes += valid_len;
         }
 
-        match qwen2::forward_step_greedy(gpu, &weights.text, text_cfg, state, next) {
+        match qwen2::forward_step_greedy(gpu, &weights.text, &text_cfg, state, next) {
             Ok(t) => next = t,
             Err(e) => {
                 write_error(stdout, id, &format!("dots.ocr decode failed: {e:?}"));
@@ -1643,11 +1646,7 @@ pub fn decode_vl_dots_ocr_ngram(
 ) {
     use hipfire_arch_dots_ocr::DotsOcrBundle;
     // Move the live decoder state into a SpecTarget bundle; restored on return.
-    let mut bundle = DotsOcrBundle {
-        config: m.dots_ocr_config.take().unwrap(),
-        weights: m.dots_ocr_weights.take().unwrap(),
-        state: m.qwen2_state.take().unwrap(),
-    };
+    let mut bundle = m.dots_ocr_bundle.take().unwrap();
     let mut spec = m.speculator.take().unwrap();
     // `m.tokenizer` is a disjoint field → coexists with the takes above and the
     // restore below; the loop never touches `m`.
@@ -1665,9 +1664,7 @@ pub fn decode_vl_dots_ocr_ngram(
         prefill_tokens,
         prefill_s,
     );
-    m.dots_ocr_config = Some(bundle.config);
-    m.dots_ocr_weights = Some(bundle.weights);
-    m.qwen2_state = Some(bundle.state);
+    m.dots_ocr_bundle = Some(bundle);
     m.speculator = Some(spec);
 }
 
@@ -1867,11 +1864,13 @@ pub fn generate_dots_ocr_text(
 
     // Model state (disjoint field borrows of `m`).
     let tokenizer = m.tokenizer.as_ref().unwrap();
-    let config = m.dots_ocr_config.as_ref().unwrap();
-    let weights = m.dots_ocr_weights.as_ref().unwrap();
-    let state = m.qwen2_state.as_mut().unwrap();
-    let text_cfg = &config.text;
+    let config = m.dots_ocr_bundle.as_ref().unwrap().config.clone();
+    let text_cfg = config.text.clone();
     let dim = text_cfg.hidden_size;
+    // Weights/state via raw pointers to allow owned config
+    let bundle_ptr: *mut hipfire_arch_dots_ocr::DotsOcrBundle = m.dots_ocr_bundle.as_mut().unwrap() as *mut _;
+    let weights = unsafe { &(*bundle_ptr).weights };
+    let state = unsafe { &mut (*bundle_ptr).state };
 
     // Tokenize the text prompt directly (no image tokens).
     let prompt_ids = tokenizer.encode(prompt);
@@ -1930,7 +1929,7 @@ pub fn generate_dots_ocr_text(
         return;
     }
     if let Err(e) =
-        qwen2::forward_prefill_batch_embeds(gpu, &weights.text, text_cfg, state, &embeds)
+        qwen2::forward_prefill_batch_embeds(gpu, &weights.text, &text_cfg, state, &embeds)
     {
         write_error(
             stdout,
@@ -1988,7 +1987,7 @@ pub fn generate_dots_ocr_text(
             emitted_bytes += valid_len;
         }
 
-        match qwen2::forward_step_greedy(gpu, &weights.text, text_cfg, state, next) {
+        match qwen2::forward_step_greedy(gpu, &weights.text, &text_cfg, state, next) {
             Ok(t) => next = t,
             Err(e) => {
                 write_error(stdout, id, &format!("dots.ocr decode failed: {e:?}"));

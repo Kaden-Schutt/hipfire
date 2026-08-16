@@ -986,7 +986,16 @@ pub struct LoadedModel {
     pub qwen35_decode_batch: Option<hipfire_arch_qwen35::qwen35::Qwen35DecodeBatchState>,
     pub lfm2_decode_batch: Option<hipfire_arch_lfm2moe::batch::Lfm2DecodeBatchState>,
     pub kv_cache: Option<llama::KvCache>,
-    // Reusable Qwen2 recurrent state (used by dots_ocr and Qwen2 non-core falcon)
+    // dots.ocr bundle — holds DotsOcrConfig + DotsOcrWeights (vision tower
+    // included) + Qwen2State. Replaces the previous three loose
+    // `Option<…>` fields (`qwen2_state`, `dots_ocr_config`, `dots_ocr_weights`)
+    // so the loader no longer pins the dots.ocr crate via `LoadedModel`'s
+    // field types beyond this single bundle. The vision tower is one-shot
+    // per image (freed after prefill), but the bundle keeps the text
+    // decoder state live for the decode loop.
+    pub dots_ocr_bundle: Option<hipfire_arch_dots_ocr::DotsOcrBundle>,
+    // Reusable Qwen2 recurrent state (used by Qwen2 non-core falcon only).
+    // Dots_ocr's state now lives inside `dots_ocr_bundle` above.
     pub qwen2_state: Option<qwen2::Qwen2State>,
     // DeepSeek V4 Flash (arch_id=9) single-GPU config/weights/state/eos now live
     // in `state` as ModelState::Deepseek4(Deepseek4Bundle) so unload teardown is
@@ -1018,12 +1027,6 @@ pub struct LoadedModel {
     // against it (so the recurrent MTP-KV never bleeds across requests). None
     // for every other arch and for qwen35 trunks without an MTP head.
     pub qwen35_mtp_head: Option<hipfire_arch_qwen35::mtp_head::Qwen35MtpHead>,
-    // dots.ocr state
-    pub dots_ocr_config: Option<dots_ocr::DotsOcrConfig>,
-    pub dots_ocr_weights: Option<dots_ocr::DotsOcrWeights>,
-    // Vision state
-    pub vision_config: Option<qwen35_vl::VisionConfig>,
-    pub vision_weights: Option<qwen35_vl::VisionWeights>,
     // Shared
     pub tokenizer: Option<hipfire_runtime::tokenizer::Tokenizer>,
     pub seq_pos: usize,
@@ -1088,6 +1091,7 @@ impl LoadedModel {
             lfm2_decode_batch: None,
             kv_cache: None,
             qwen2_state: None,
+            dots_ocr_bundle: None,
             deepseek4_pbs: None,
             deepseek4_eos_tok: 0,
             minimax_eos_tok: 0,
@@ -1096,10 +1100,6 @@ impl LoadedModel {
             mtp_k: 3,
             mtp_weights_present: false,
             qwen35_mtp_head: None,
-            dots_ocr_config: None,
-            dots_ocr_weights: None,
-            vision_config: None,
-            vision_weights: None,
             tokenizer: Some(tokenizer),
             seq_pos: 0,
             max_seq,
@@ -1194,6 +1194,46 @@ impl LoadedModel {
             Some(ModelState::Deepseek4(b)) => Some(b),
             _ => None,
         }
+    }
+
+    /// Qwen35-VL vision config if this model is arch_id=5|6 and was loaded
+    /// with a vision tower (`model.visual.patch_embed.proj.weight` present),
+    /// else None. Text-only Qwen35 returns None.
+    pub fn vision_config(&self) -> Option<&qwen35_vl::VisionConfig> {
+        match &self.state {
+            Some(ModelState::Qwen35(b)) => b.vision_config.as_ref(),
+            _ => None,
+        }
+    }
+
+    pub fn vision_weights(&self) -> Option<&qwen35_vl::VisionWeights> {
+        match &self.state {
+            Some(ModelState::Qwen35(b)) => b.vision_weights.as_ref(),
+            _ => None,
+        }
+    }
+
+    pub fn vision_config_mut(&mut self) -> Option<&mut qwen35_vl::VisionConfig> {
+        match &mut self.state {
+            Some(ModelState::Qwen35(b)) => b.vision_config.as_mut(),
+            _ => None,
+        }
+    }
+
+    pub fn vision_weights_mut(&mut self) -> Option<&mut qwen35_vl::VisionWeights> {
+        match &mut self.state {
+            Some(ModelState::Qwen35(b)) => b.vision_weights.as_mut(),
+            _ => None,
+        }
+    }
+
+    /// DotsOcr bundle if this model is arch_id=8, else None.
+    pub fn dots_ocr(&self) -> Option<&hipfire_arch_dots_ocr::DotsOcrBundle> {
+        self.dots_ocr_bundle.as_ref()
+    }
+
+    pub fn dots_ocr_mut(&mut self) -> Option<&mut hipfire_arch_dots_ocr::DotsOcrBundle> {
+        self.dots_ocr_bundle.as_mut()
     }
 
     /// pp>1 skeleton — sets all four load-bearing multi-GPU fields together so
@@ -1843,14 +1883,14 @@ fn finish_qwen35_load(
     // Move adaptive controller out of the bundle before parking the rest in
     // ModelState. LoadedModel.kv_adaptive is the runtime home for downshift hooks.
     let mut bundle = bundle;
+    bundle.vision_config = vision_config;
+    bundle.vision_weights = vision_weights;
     let kv_adaptive = bundle.kv_adaptive.take();
     let state = Some(ModelState::Qwen35(bundle));
     let mut model = LoadedModel {
         state,
         eviction,
         speculator,
-        vision_config,
-        vision_weights,
         max_seq: ctx.max_seq,
         kv_adaptive,
         ..LoadedModel::skeleton(
@@ -3276,14 +3316,13 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
     if let Some(pbs) = m.deepseek4_pbs {
         pbs.free_gpu(gpu);
     }
-    if let Some(w) = m.vision_weights {
-        w.free_gpu(gpu);
-    }
-    // lfm2moe / minimax teardown is now compiler-enforced via the exhaustive
-    // ModelState match above. dots_ocr already had a free_gpu, it just wasn't
-    // called here (still a loose Option — fold in a future pass).
-    if let Some(w) = m.dots_ocr_weights {
-        w.free_gpu(gpu);
+    // Qwen35 vision tower is now inside the bundle and freed via
+    // `ArchModel::free_gpu` above. Nothing to do here — the old
+    // `m.vision_weights` field is gone.
+    // DotsOcr bundle (config + weights + state) is freed as a unit.
+    if let Some(b) = m.dots_ocr_bundle.take() {
+        b.weights.free_gpu(gpu);
+        b.state.free_gpu(gpu);
     }
     gpu.invalidate_weight_caches();
     gpu.invalidate_graph_state();

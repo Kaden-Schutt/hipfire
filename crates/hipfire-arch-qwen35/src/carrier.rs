@@ -20,6 +20,11 @@ pub struct Qwen35Bundle {
     /// Adaptive KV controller when engaged at load. Moved into
     /// `LoadedModel.kv_adaptive` by `finish_qwen35_load`.
     pub kv_adaptive: Option<KvAdaptive>,
+    /// Optional Qwen3.5-VL vision tower — `Some` when the HFQ contained
+    /// `model.visual.patch_embed.proj.weight`. Remains `None` for pure
+    /// text checkpoints; the bundle's text path is unaffected.
+    pub vision_config: Option<hipfire_arch_qwen35_vl::qwen35_vl::VisionConfig>,
+    pub vision_weights: Option<hipfire_arch_qwen35_vl::qwen35_vl::VisionWeights>,
 }
 
 /// Build the Qwen35 GPU bundle from an HFQ source.
@@ -80,6 +85,8 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
         kv_cache: kv,
         dn_state: dn,
         kv_adaptive,
+        vision_config: None,
+        vision_weights: None,
     })
 }
 
@@ -430,8 +437,6 @@ fn construct_kv_cache(
     }
 }
 
-/// Free a fully constructed bundle. Used by loader finish-path rollback.
-/// Returns the first free error (VMM teardown) if any; always attempts full cleanup.
 pub fn free_qwen35_bundle(bundle: Qwen35Bundle, gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
     let Qwen35Bundle {
         config: _,
@@ -440,8 +445,10 @@ pub fn free_qwen35_bundle(bundle: Qwen35Bundle, gpu: &mut rdna_compute::Gpu) -> 
         kv_cache,
         dn_state,
         kv_adaptive: _,
+        vision_config: _,
+        vision_weights,
     } = bundle;
-    // Match unload_model Qwen35 order: kv → scratch → weights → dn.
+    // Match unload_model Qwen35 order: kv → scratch → weights → dn → vision.
     let mut first: Option<String> = None;
     if let Err(e) = kv_cache.free_gpu(gpu) {
         first = Some(e.to_string());
@@ -449,6 +456,9 @@ pub fn free_qwen35_bundle(bundle: Qwen35Bundle, gpu: &mut rdna_compute::Gpu) -> 
     scratch.free_gpu(gpu);
     weights.free_gpu(gpu);
     dn_state.free_gpu(gpu);
+    if let Some(vw) = vision_weights {
+        vw.free_gpu(gpu);
+    }
     let vmm = note_vmm_after_free(gpu);
     match (first, vmm) {
         (None, Ok(())) => Ok(()),
