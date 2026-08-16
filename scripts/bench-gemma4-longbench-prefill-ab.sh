@@ -42,9 +42,9 @@ run_one() {
             --no-ple-activation-fused-prefill
         )
     else
-        # The batched PLE branch WMMA route is experimental: logit tracing
-        # found long greedy trajectory changes on both gfx1100 and gfx1201.
-        feature_args+=(--no-ple-branch-batched-prefill)
+        # Candidate policy: validated embedding/activation routes plus the
+        # exact-arithmetic PLE branch batching under its explicit opt-in.
+        feature_args+=(--ple-branch-batched-prefill)
     fi
     python3 "$ROOT/scripts/eval_gemma4_eseries.py" \
         --daemon "$DAEMON" --model "$artifact" \
