@@ -69,6 +69,7 @@
 //!   the daemon plumbing (image preprocessing + IMGPAD splicing).
 
 pub mod arch;
+pub mod arch_model;
 pub mod carrier;
 pub mod dots_ocr;
 pub mod image;

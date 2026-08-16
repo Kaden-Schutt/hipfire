@@ -1031,7 +1031,7 @@ impl Carrier for DotsOcrCarrier {
         _n: usize,
         _prefill_err: &mut Option<String>,
     ) -> Option<bool> {
-        let bundle = m.dots_ocr_bundle.as_mut().unwrap();
+        let bundle = m.dots_ocr_mut().unwrap();
         let state = &mut bundle.state;
         let config = &bundle.config;
         let weights = &bundle.weights;
@@ -1071,7 +1071,7 @@ impl Carrier for DotsOcrCarrier {
             ctx.spec,
         );
         Ok(LoadedModel {
-            dots_ocr_bundle: Some(bundle),
+            state: Some(crate::ModelState::DotsOcr(bundle)),
             speculator,
             ..LoadedModel::skeleton(
                 meta.arch_id,

@@ -478,8 +478,8 @@ pub enum ModelState {
     Deepseek4(hipfire_arch_deepseek4::Deepseek4Bundle),
     Deepseek4Heterogeneous(Deepseek4HeterogeneousBundle),
     MuseGlimmer(MuseGlimmerBundle),
+    DotsOcr(hipfire_arch_dots_ocr::DotsOcrBundle),
 }
-
 /// `ArchModel` for the one bundle the loader defines itself.
 ///
 /// Every other architecture implements the trait in its own crate. Glimmer's
@@ -639,6 +639,7 @@ impl ModelState {
             ModelState::Deepseek4(b) => b,
             ModelState::Deepseek4Heterogeneous(b) => b,
             ModelState::MuseGlimmer(b) => b,
+            ModelState::DotsOcr(b) => b,
         }
     }
 
@@ -656,6 +657,7 @@ impl ModelState {
             ModelState::Deepseek4(b) => b,
             ModelState::Deepseek4Heterogeneous(b) => b,
             ModelState::MuseGlimmer(b) => b,
+            ModelState::DotsOcr(b) => b,
         }
     }
 }
@@ -698,6 +700,7 @@ impl hipfire_runtime::arch_model::ArchModel for ModelState {
             ModelState::Deepseek4(b) => Box::new(b).free_gpu(gpu),
             ModelState::Deepseek4Heterogeneous(b) => Box::new(b).free_gpu(gpu),
             ModelState::MuseGlimmer(b) => Box::new(b).free_gpu(gpu),
+            ModelState::DotsOcr(b) => Box::new(b).free_gpu(gpu),
         }
     }
 }
@@ -981,23 +984,17 @@ pub struct LoadedModel {
     pub pp_scratch_set: Option<Qwen35ScratchSet>,
     pub pp_dn_la_to_device: Option<Vec<u8>>,
     pub ep: Option<EpState>,
-    // Shared arch state
+    // Shared arch state — every arch lives here, including dots-ocr (arch_id=8)
+    // as ModelState::DotsOcr(DotsOcrBundle). The separate `dots_ocr_bundle`
+    // field was removed; all consumers go through `dots_ocr()`/`dots_ocr_mut()`
+    // or `ModelState::DotsOcr` directly.
     pub state: Option<ModelState>,
     pub qwen35_decode_batch: Option<hipfire_arch_qwen35::qwen35::Qwen35DecodeBatchState>,
     pub lfm2_decode_batch: Option<hipfire_arch_lfm2moe::batch::Lfm2DecodeBatchState>,
     pub kv_cache: Option<llama::KvCache>,
-    // dots.ocr bundle — holds DotsOcrConfig + DotsOcrWeights (vision tower
-    // included) + Qwen2State. Replaces the previous three loose
-    // `Option<…>` fields (`qwen2_state`, `dots_ocr_config`, `dots_ocr_weights`)
-    // so the loader no longer pins the dots.ocr crate via `LoadedModel`'s
-    // field types beyond this single bundle. The vision tower is one-shot
-    // per image (freed after prefill), but the bundle keeps the text
-    // decoder state live for the decode loop.
-    pub dots_ocr_bundle: Option<hipfire_arch_dots_ocr::DotsOcrBundle>,
     // Reusable Qwen2 recurrent state (used by Qwen2 non-core falcon only).
-    // Dots_ocr's state now lives inside `dots_ocr_bundle` above.
+    // dots-ocr's state lives inside `ModelState::DotsOcr` above.
     pub qwen2_state: Option<qwen2::Qwen2State>,
-    // DeepSeek V4 Flash (arch_id=9) single-GPU config/weights/state/eos now live
     // in `state` as ModelState::Deepseek4(Deepseek4Bundle) so unload teardown is
     // compiler-enforced and the bundle can be borrowed as a `SpecTarget`.
     pub deepseek4_pbs: Option<hipfire_arch_deepseek4::forward::PrefillBatchScratch>,
@@ -1091,7 +1088,6 @@ impl LoadedModel {
             lfm2_decode_batch: None,
             kv_cache: None,
             qwen2_state: None,
-            dots_ocr_bundle: None,
             deepseek4_pbs: None,
             deepseek4_eos_tok: 0,
             minimax_eos_tok: 0,
@@ -1229,13 +1225,18 @@ impl LoadedModel {
 
     /// DotsOcr bundle if this model is arch_id=8, else None.
     pub fn dots_ocr(&self) -> Option<&hipfire_arch_dots_ocr::DotsOcrBundle> {
-        self.dots_ocr_bundle.as_ref()
+        match &self.state {
+            Some(ModelState::DotsOcr(b)) => Some(b),
+            _ => None,
+        }
     }
 
     pub fn dots_ocr_mut(&mut self) -> Option<&mut hipfire_arch_dots_ocr::DotsOcrBundle> {
-        self.dots_ocr_bundle.as_mut()
+        match &mut self.state {
+            Some(ModelState::DotsOcr(b)) => Some(b),
+            _ => None,
+        }
     }
-
     /// pp>1 skeleton — sets all four load-bearing multi-GPU fields together so
     /// they cannot be set piecemeal (a dropped `pp_scratch_set` is a silent
     /// VRAM leak; `pp_gpus`/`pp_dn_la_to_device` are `.expect()`ed in unload).
@@ -3255,6 +3256,7 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
             | Some(ModelState::Deepseek4(_))
             | Some(ModelState::Deepseek4Heterogeneous(_))
             | Some(ModelState::MuseGlimmer(_))
+            | Some(ModelState::DotsOcr(_))
             | None => {}
         }
         for g in gpus.devices.iter_mut() {
@@ -3319,11 +3321,8 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
     // Qwen35 vision tower is now inside the bundle and freed via
     // `ArchModel::free_gpu` above. Nothing to do here — the old
     // `m.vision_weights` field is gone.
-    // DotsOcr bundle (config + weights + state) is freed as a unit.
-    if let Some(b) = m.dots_ocr_bundle.take() {
-        b.weights.free_gpu(gpu);
-        b.state.free_gpu(gpu);
-    }
+    // DotsOcr bundle (arch_id=8) is now `ModelState::DotsOcr` and freed via
+    // `Box::new(state).free_gpu(gpu)` above — no separate field to drain.
     gpu.invalidate_weight_caches();
     gpu.invalidate_graph_state();
     gpu.drain_pool();

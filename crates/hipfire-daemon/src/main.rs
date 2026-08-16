@@ -1727,23 +1727,13 @@ fn main() {
                                 gpu.replay.transport_name()
                             );
                         }
-                        let vl = m.vision_config().is_some() || m.dots_ocr_bundle.is_some();
+                        let vl = m.vision_config().is_some() || m.dots_ocr().is_some();
                         let (dim, layers, vocab) = match m.state.as_ref() {
                             Some(st) => {
                                 let arch = st.as_arch_model();
                                 (arch.dim(), arch.n_layers(), arch.vocab_size())
                             }
-                            None => {
-                                if let Some(b) = &m.dots_ocr_bundle {
-                                    (
-                                        b.config.text.hidden_size,
-                                        b.config.text.num_hidden_layers,
-                                        b.config.text.vocab_size,
-                                    )
-                                } else {
-                                    (0, 0, 0)
-                                }
-                            }
+                            None => (0, 0, 0),
                         };
 
                         // Apply MTP config from load-message params.
@@ -2395,7 +2385,7 @@ fn main() {
 
                 let has_image = image_base64.is_some() || image.is_some();
                 let vision_route = hipfire_loader::vision_route(m.arch_id);
-                let has_vl = m.vision_config().is_some() || m.dots_ocr_bundle.is_some();
+                let has_vl = m.vision_config().is_some() || m.dots_ocr().is_some();
 
                 if has_image && !has_vl {
                     write_error(&mut stdout, id, "model has no vision encoder");
@@ -2459,7 +2449,7 @@ fn main() {
                         if let Some(ref mut s) = m.qwen2_state {
                             s.reset();
                         }
-                        if let Some(b) = m.dots_ocr_bundle.as_mut() {
+                        if let Some(b) = m.dots_ocr_mut() {
                             b.state.reset();
                         }
                         // Live plain-qwen2 state is in the qwen2 arch bundle

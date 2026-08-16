@@ -1360,14 +1360,19 @@ pub fn generate_vl_dots_ocr(
 
     // 2. Model state (disjoint field borrows of `m`).
     let tokenizer = m.tokenizer.as_ref().unwrap();
-    let config = m.dots_ocr_bundle.as_ref().unwrap().config.clone();
+    let config = match &m.state {
+        Some(hipfire_loader::ModelState::DotsOcr(b)) => b.config.clone(),
+        _ => unreachable!("generate_vl_dots_ocr requires ModelState::DotsOcr"),
+    };
     let text_cfg = config.text.clone();
     let dim = text_cfg.hidden_size;
-    // Weights/state via raw pointers to allow owned config
-    let bundle_ptr: *mut hipfire_arch_dots_ocr::DotsOcrBundle = m.dots_ocr_bundle.as_mut().unwrap() as *mut _;
+    // Weights/state via raw pointers to allow owned config while keeping disjoint borrows.
+    let bundle_ptr: *mut hipfire_arch_dots_ocr::DotsOcrBundle = match &mut m.state {
+        Some(hipfire_loader::ModelState::DotsOcr(b)) => b as *mut _,
+        _ => unreachable!(),
+    };
     let weights = unsafe { &(*bundle_ptr).weights };
     let state = unsafe { &mut (*bundle_ptr).state };
-
     // 3. Build the prompt (HF-exact framing; imgpad count == n_visual by construction).
     let prompt_ids = dots_ocr::build_prompt_ids(tokenizer, prompt, n_visual);
     if prompt_ids.len().saturating_add(max_tokens) > max_seq {
@@ -1511,8 +1516,8 @@ pub fn generate_vl_dots_ocr(
     // 6. Decode. Opt-in n-gram speculative decode when a speculator was built at
     // load (HIPFIRE_NGRAM_DRAFT=1, arch_id=8 gate in `spec_build`); else the
     // bespoke greedy AR loop below. The vision prefill above already advanced the
-    // shared Qwen2 KV (`m.qwen2_state`), so both paths decode from the same warm
-    // state — only the drafting differs. The n-gram verify always falls back to
+    // dots-ocr Qwen2 state (`ModelState::DotsOcr`), so both paths decode from the
+    // same warm state — only the drafting differs. The n-gram verify always falls back to
     // the target's greedy argmax, so spec output is byte-identical to AR; only τ
     // (speed) changes. The prefill bindings above (`tokenizer`/`config`/`state`/…)
     // are released here so the speculative branch can take `&mut m`; the AR path
@@ -1532,12 +1537,17 @@ pub fn generate_vl_dots_ocr(
         return;
     }
     let tokenizer = m.tokenizer.as_ref().unwrap();
-    let config = m.dots_ocr_bundle.as_ref().unwrap().config.clone();
+    let config = match &m.state {
+        Some(hipfire_loader::ModelState::DotsOcr(b)) => b.config.clone(),
+        _ => unreachable!(),
+    };
     let text_cfg = config.text.clone();
-    let bundle_ptr: *mut hipfire_arch_dots_ocr::DotsOcrBundle = m.dots_ocr_bundle.as_mut().unwrap() as *mut _;
+    let bundle_ptr: *mut hipfire_arch_dots_ocr::DotsOcrBundle = match &mut m.state {
+        Some(hipfire_loader::ModelState::DotsOcr(b)) => b as *mut _,
+        _ => unreachable!(),
+    };
     let weights = unsafe { &(*bundle_ptr).weights };
     let state = unsafe { &mut (*bundle_ptr).state };
-
     // Greedy decode, streaming in the daemon JSONL protocol.
     let eos_set: Vec<u32> = if text_cfg.eos_token_ids.is_empty() {
         vec![text_cfg.eos_token_id]
@@ -1645,8 +1655,12 @@ pub fn decode_vl_dots_ocr_ngram(
     prefill_s: f64,
 ) {
     use hipfire_arch_dots_ocr::DotsOcrBundle;
+    use hipfire_loader::ModelState;
     // Move the live decoder state into a SpecTarget bundle; restored on return.
-    let mut bundle = m.dots_ocr_bundle.take().unwrap();
+    let mut bundle = match m.state.take().unwrap() {
+        ModelState::DotsOcr(b) => b,
+        _ => unreachable!("decode_vl_dots_ocr_ngram requires ModelState::DotsOcr"),
+    };
     let mut spec = m.speculator.take().unwrap();
     // `m.tokenizer` is a disjoint field → coexists with the takes above and the
     // restore below; the loop never touches `m`.
@@ -1664,10 +1678,9 @@ pub fn decode_vl_dots_ocr_ngram(
         prefill_tokens,
         prefill_s,
     );
-    m.dots_ocr_bundle = Some(bundle);
+    m.state = Some(ModelState::DotsOcr(bundle));
     m.speculator = Some(spec);
 }
-
 pub fn run_dots_ocr_ngram_loop(
     bundle: &mut hipfire_arch_dots_ocr::DotsOcrBundle,
     spec: &mut dyn hipfire_runtime::spec::Speculator,
@@ -1864,14 +1877,19 @@ pub fn generate_dots_ocr_text(
 
     // Model state (disjoint field borrows of `m`).
     let tokenizer = m.tokenizer.as_ref().unwrap();
-    let config = m.dots_ocr_bundle.as_ref().unwrap().config.clone();
+    let config = match &m.state {
+        Some(hipfire_loader::ModelState::DotsOcr(b)) => b.config.clone(),
+        _ => unreachable!(),
+    };
     let text_cfg = config.text.clone();
     let dim = text_cfg.hidden_size;
-    // Weights/state via raw pointers to allow owned config
-    let bundle_ptr: *mut hipfire_arch_dots_ocr::DotsOcrBundle = m.dots_ocr_bundle.as_mut().unwrap() as *mut _;
+    // Weights/state via raw pointers to allow owned config while keeping disjoint borrows.
+    let bundle_ptr: *mut hipfire_arch_dots_ocr::DotsOcrBundle = match &mut m.state {
+        Some(hipfire_loader::ModelState::DotsOcr(b)) => b as *mut _,
+        _ => unreachable!(),
+    };
     let weights = unsafe { &(*bundle_ptr).weights };
     let state = unsafe { &mut (*bundle_ptr).state };
-
     // Tokenize the text prompt directly (no image tokens).
     let prompt_ids = tokenizer.encode(prompt);
     if prompt_ids.len().saturating_add(max_tokens) > max_seq {
