@@ -1,5 +1,6 @@
 use crate::qwen35::{
-    DeltaNetState, LayerType, Qwen35Config, Qwen35Scratch, Qwen35Weights, StateQuant,
+    DeltaNetState, LayerType, Qwen35Config, Qwen35Scratch, Qwen35ScratchSet, Qwen35Weights,
+    StateQuant,
 };
 use crate::Qwen35;
 use hipfire_runtime::arch::Architecture;
@@ -20,6 +21,12 @@ pub struct Qwen35Bundle {
     /// Adaptive KV controller when engaged at load. Moved into
     /// `LoadedModel.kv_adaptive` by `finish_qwen35_load`.
     pub kv_adaptive: Option<KvAdaptive>,
+    /// Pipeline-parallel per-device scratch set. `Some` only when
+    /// `LoadedModel.pp > 1` — single-GPU loads leave this `None`.
+    /// Freed via `Qwen35ScratchSet::free_gpu_multi(&mut Gpus)` in the pp>1
+    /// unload arm, NOT via `ArchModel::free_gpu` (which takes a single
+    /// `&mut Gpu` and cannot free a per-device set).
+    pub pp_scratch_set: Option<Qwen35ScratchSet>,
     /// Optional Qwen3.5-VL vision tower — `Some` when the HFQ contained
     /// `model.visual.patch_embed.proj.weight`. Remains `None` for pure
     /// text checkpoints; the bundle's text path is unaffected.
@@ -85,6 +92,7 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
         kv_cache: kv,
         dn_state: dn,
         kv_adaptive,
+        pp_scratch_set: None,
         vision_config: None,
         vision_weights: None,
     })
@@ -445,9 +453,15 @@ pub fn free_qwen35_bundle(bundle: Qwen35Bundle, gpu: &mut rdna_compute::Gpu) -> 
         kv_cache,
         dn_state,
         kv_adaptive: _,
+        pp_scratch_set,
         vision_config: _,
         vision_weights,
     } = bundle;
+    debug_assert!(
+        pp_scratch_set.is_none(),
+        "free_qwen35_bundle: pp_scratch_set must be None on single-GPU free"
+    );
+    let _ = pp_scratch_set;
     // Match unload_model Qwen35 order: kv → scratch → weights → dn → vision.
     let mut first: Option<String> = None;
     if let Err(e) = kv_cache.free_gpu(gpu) {

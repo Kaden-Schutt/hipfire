@@ -328,6 +328,7 @@ fn load_qwen35_pp(
         dn_state: dn,
         // Adaptive is single-GPU only; PP path never engages the controller.
         kv_adaptive: None,
+        pp_scratch_set: Some(scratch_set),
         vision_config: None,
         vision_weights: None,
     };
@@ -342,7 +343,6 @@ fn load_qwen35_pp(
             meta.chat_template,
             pp,
             gpus,
-            scratch_set,
             la_to_device,
         )
     })
@@ -666,6 +666,7 @@ impl Carrier for Qwen35Carrier {
                     dn_state,
                     // Dir/safetensors path does not engage adaptive (HFQ carrier only).
                     kv_adaptive: None,
+                    pp_scratch_set: None,
                     vision_config: None,
                     vision_weights: None,
                 };

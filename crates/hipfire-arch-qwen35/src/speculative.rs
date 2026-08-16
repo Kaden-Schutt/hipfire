@@ -560,9 +560,15 @@ impl ModelSlot {
             kv_cache,
             dn_state,
             kv_adaptive: _,
+            pp_scratch_set,
             vision_config,
             vision_weights,
         } = bundle;
+        debug_assert!(
+            pp_scratch_set.is_none(),
+            "ModelSlot::from_bundle: pp_scratch_set must be None (pp>1 never enters spec slot)"
+        );
+        let _ = pp_scratch_set;
         Ok(Self {
             name: String::from("target"),
             hfq,
@@ -591,6 +597,7 @@ impl ModelSlot {
             dn_state: self.dn_state,
             // Controller lives on LoadedModel, not ModelSlot.
             kv_adaptive: None,
+            pp_scratch_set: None,
             vision_config: self.vision_config,
             vision_weights: self.vision_weights,
         }

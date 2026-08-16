@@ -3849,6 +3849,7 @@ pub fn generate_qwen35_mtp(
         kv_cache,
         dn_state,
         kv_adaptive: _,
+        pp_scratch_set: _, 
         vision_config,
         vision_weights,
     } = match m.state.take() {
@@ -3870,6 +3871,7 @@ pub fn generate_qwen35_mtp(
                 kv_cache,
                 dn_state,
                                 kv_adaptive: None,
+                pp_scratch_set: None,
                 vision_config,
                 vision_weights,
             }));
@@ -3925,6 +3927,7 @@ pub fn generate_qwen35_mtp(
             kv_cache: target.kv_cache,
             dn_state: target.dn_state,
                             kv_adaptive: None,
+                pp_scratch_set: None,
                 vision_config: target.vision_config,
                 vision_weights: target.vision_weights,
         }));
@@ -3960,6 +3963,7 @@ pub fn generate_qwen35_mtp(
                     kv_cache: target.kv_cache,
                     dn_state: target.dn_state,
                                     kv_adaptive: None,
+                pp_scratch_set: None,
                 vision_config: target.vision_config,
                 vision_weights: target.vision_weights,
                 }));
@@ -3978,6 +3982,7 @@ pub fn generate_qwen35_mtp(
                     kv_cache: target.kv_cache,
                     dn_state: target.dn_state,
                                     kv_adaptive: None,
+                pp_scratch_set: None,
                 vision_config: target.vision_config,
                 vision_weights: target.vision_weights,
                 }));
@@ -4000,6 +4005,7 @@ pub fn generate_qwen35_mtp(
                 kv_cache: target.kv_cache,
                 dn_state: target.dn_state,
                                 kv_adaptive: None,
+                pp_scratch_set: None,
                 vision_config: target.vision_config,
                 vision_weights: target.vision_weights,
             }));
@@ -4015,6 +4021,7 @@ pub fn generate_qwen35_mtp(
                 kv_cache: target.kv_cache,
                 dn_state: target.dn_state,
                                 kv_adaptive: None,
+                pp_scratch_set: None,
                 vision_config: target.vision_config,
                 vision_weights: target.vision_weights,
             }));
@@ -4100,6 +4107,7 @@ pub fn generate_qwen35_mtp(
             kv_cache: target.kv_cache,
             dn_state: target.dn_state,
                             kv_adaptive: None,
+                pp_scratch_set: None,
                 vision_config: target.vision_config,
                 vision_weights: target.vision_weights,
         }));
@@ -4122,6 +4130,7 @@ pub fn generate_qwen35_mtp(
                 kv_cache: target.kv_cache,
                 dn_state: target.dn_state,
                                 kv_adaptive: None,
+                pp_scratch_set: None,
                 vision_config: target.vision_config,
                 vision_weights: target.vision_weights,
             }));
@@ -4593,6 +4602,7 @@ pub fn generate_qwen35_mtp(
         kv_cache: target.kv_cache,
         dn_state: target.dn_state,
                         kv_adaptive: None,
+                pp_scratch_set: None,
                 vision_config: target.vision_config,
                 vision_weights: target.vision_weights,
     }));
@@ -5188,7 +5198,7 @@ pub fn generate_multi(
     };
     let config = &b.config;
     let weights = &b.weights;
-    let scratch_set = m.pp_scratch_set.as_ref().unwrap();
+    let scratch_set = b.pp_scratch_set.as_ref().unwrap();
     let kv = &mut b.kv_cache;
     let dn = &mut b.dn_state;
     let gpus = m.pp_gpus.as_mut().unwrap();

@@ -23,7 +23,7 @@ use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_minimax as minimax;
 use hipfire_arch_muse_glimmer as glimmer;
 use hipfire_arch_qwen2::qwen2;
-use hipfire_arch_qwen35::qwen35::{self, Qwen35ScratchSet};
+use hipfire_arch_qwen35::qwen35::{self};
 use hipfire_arch_qwen35::speculative::DeltaNetSnapshot;
 use hipfire_arch_qwen35::Qwen35Bundle;
 use hipfire_arch_qwen35_vl::qwen35_vl;
@@ -981,7 +981,6 @@ pub struct LoadedModel {
     pub arch_id: u32,
     pub pp: usize,
     pub pp_gpus: Option<Gpus>,
-    pub pp_scratch_set: Option<Qwen35ScratchSet>,
     pub pp_dn_la_to_device: Option<Vec<u8>>,
     pub ep: Option<EpState>,
     // Shared arch state — every arch lives here, including dots-ocr (arch_id=8)
@@ -1081,7 +1080,6 @@ impl LoadedModel {
             pp: 1,
             ep: None,
             pp_gpus: None,
-            pp_scratch_set: None,
             pp_dn_la_to_device: None,
             state: None,
             qwen35_decode_batch: None,
@@ -1237,9 +1235,15 @@ impl LoadedModel {
             _ => None,
         }
     }
-    /// pp>1 skeleton — sets all four load-bearing multi-GPU fields together so
-    /// they cannot be set piecemeal (a dropped `pp_scratch_set` is a silent
-    /// VRAM leak; `pp_gpus`/`pp_dn_la_to_device` are `.expect()`ed in unload).
+    /// pp>1 skeleton — sets the load-bearing multi-GPU fields together so
+    /// they cannot be set piecemeal (`pp_gpus`/`pp_dn_la_to_device` are
+    /// `.expect()`ed in unload). The per-device `Qwen35ScratchSet` that was
+    /// previously the fourth field here now lives inside `Qwen35Bundle`
+    /// (`b.pp_scratch_set`) and is freed via `free_gpu_multi` in the same
+    /// pp>1 unload arm — co-locating it with the bundle's own `scratch`
+    /// guarantees the set cannot be dropped without the bundle (and vice
+    /// versa), eliminating the silent-VRAM-leak window a standalone
+    /// `LoadedModel.pp_scratch_set: Option<Qwen35ScratchSet>` created.
     pub fn skeleton_pp(
         arch_id: u32,
         tokenizer: hipfire_runtime::tokenizer::Tokenizer,
@@ -1249,13 +1253,11 @@ impl LoadedModel {
         chat_template: Option<String>,
         pp: usize,
         pp_gpus: Gpus,
-        pp_scratch_set: Qwen35ScratchSet,
         pp_dn_la_to_device: Vec<u8>,
     ) -> Self {
         LoadedModel {
             pp,
             pp_gpus: Some(pp_gpus),
-            pp_scratch_set: Some(pp_scratch_set),
             pp_dn_la_to_device: Some(pp_dn_la_to_device),
             ..LoadedModel::skeleton(
                 arch_id,
@@ -3231,22 +3233,30 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
             // leaking if a test ever stages it.
             batch_state.free_gpu(gpu);
         }
-        if let Some(scratch_set) = m.pp_scratch_set {
-            scratch_set.free_gpu_multi(&mut gpus);
-        }
         match m.state.take() {
-            Some(ModelState::Qwen35(b)) => {
+            Some(ModelState::Qwen35(mut b)) => {
+                // The set now lives INSIDE the bundle (`b.pp_scratch_set`),
+                // so it cannot be forgotten independently of the bundle.
+                // Free it here via `free_gpu_multi(&mut Gpus)` — the ONLY
+                // site that frees the set. `ArchModel::free_gpu` (single
+                // `&mut Gpu` path) intentionally does NOT free it (see
+                // `crates/hipfire-arch-qwen35/src/arch_model.rs`) — that
+                // path is unreachable for pp>1 (`if m.pp > 1 { return }`
+                // guards `Box::new(state).free_gpu(gpu)` below), so the
+                // set is freed exactly once here. Double-free impossible
+                // (this arm consumes `b`); leak impossible (bundle owns
+                // it and teardown must match this arm).
+                if let Some(scratch_set) = b.pp_scratch_set.take() {
+                    scratch_set.free_gpu_multi(&mut gpus);
+                }
                 b.kv_cache.free_gpu_multi(&mut gpus);
                 let la_to_device = m.pp_dn_la_to_device.expect("pp>1 must carry la_to_device");
                 b.dn_state.free_gpu_multi(&mut gpus, &la_to_device);
                 b.weights.free_gpu_multi(&mut gpus);
                 // The pp>1 load allocates TWO scratches: the per-device
-                // `Qwen35ScratchSet` freed above as `pp_scratch_set`, and the
+                // `Qwen35ScratchSet` freed above as `b.pp_scratch_set`, and the
                 // bundle's own single-device `Qwen35Scratch`
-                // (`Qwen35Scratch::new_with_kv_max`, carriers.rs pp tail). Only
-                // the set was being freed, so the bundle's scratch leaked on
-                // every pp>1 unload — measured at +18.1 MiB/cycle, R^2 0.980,
-                // against a perfectly flat pp=1 control for the same model.
+                // (`Qwen35Scratch::new_with_kv_max`, carriers.rs pp tail).
                 b.scratch.free_gpu(&mut gpus.devices[0]);
             }
             // Only Qwen35 supports pp>1 today, so the other carriers can never

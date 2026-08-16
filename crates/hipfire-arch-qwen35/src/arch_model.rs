@@ -55,6 +55,16 @@ impl ArchModel for Qwen35Bundle {
         // `note` in the loader but `ArchModel::free_gpu` is infallible, so
         // failures here are dropped (same as weight/dn frees which already
         // ignore errors).
+        //
+        // `pp_scratch_set` is NOT freed here: it is `None` for every
+        // single-GPU load (constructed as `None` in `load_bundle`) and for
+        // pp>1 the set is freed via `free_gpu_multi(&mut Gpus)` in the
+        // `if m.pp > 1` branch of `unload_model` BEFORE this single-GPU
+        // `Box::new(state).free_gpu(gpu)` path is ever reached
+        // (`if m.pp > 1 { return Ok(()) }` guards it). Double-free is
+        // impossible because a bundle that took the pp>1 path never reaches
+        // this `&mut Gpu` free; a leak is impossible because the pp>1 path
+        // explicitly frees the set via `b.pp_scratch_set`.
         let Qwen35Bundle {
             config: _,
             weights,
@@ -62,9 +72,20 @@ impl ArchModel for Qwen35Bundle {
             kv_cache,
             dn_state,
             kv_adaptive: _,
+            pp_scratch_set,
             vision_config: _,
             vision_weights,
         } = *self;
+        debug_assert!(
+            pp_scratch_set.is_none(),
+            "Qwen35Bundle::free_gpu: pp_scratch_set must be None on single-GPU free (pp>1 sets are freed via free_gpu_multi)"
+        );
+        // Drop without freeing: the per-device set requires `&mut Gpus`
+        // and this method only has `&mut Gpu`. The debug_assert above
+        // guarantees this is `None` for every single-GPU bundle; a
+        // pp>1 bundle that incorrectly reaches here would leak, not
+        // double-free, and the assert surfaces the bug.
+        let _ = pp_scratch_set;
         let _ = kv_cache.free_gpu(gpu);
         let _ = scratch.free_gpu(gpu);
         weights.free_gpu(gpu);
