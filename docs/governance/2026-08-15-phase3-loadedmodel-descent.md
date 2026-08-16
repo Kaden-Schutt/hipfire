@@ -173,3 +173,32 @@ A `pp>1` run. Pipeline parallelism is reachable only through the daemon's `load`
 Qwen3.5 dense/MoE only, and is mutually exclusive with `tp>1`; the harness drives exactly
 that protocol, so extending it is `params: {"pp": 2}` plus a multi-device VRAM sample.
 That is a small change to a tool that now exists, rather than the missing capability it was.
+
+
+## The oracle found a live pp>1 leak, and it is fixed
+
+Building the harness to de-risk moving `pp_scratch_set` found the bug that field's own
+comment warns about — before any code moved.
+
+`qwen3.6-27b` on hiptrx, four load/unload cycles each:
+
+| | per-cycle delta | slope | |
+|---|---|---:|---|
+| pp=1 (control) | +202 ×4 | +0.0 | flat |
+| pp=2 **before** | +244, +269, +285, +299 | **+18.1** (R² 0.980) | leaking |
+| pp=2 **after** | +202 ×4 | **+0.0** (R² 1.000) | fixed |
+
+**Cause.** The pp>1 load allocates *two* scratches: a per-device `Qwen35ScratchSet` stored as
+`LoadedModel.pp_scratch_set`, and the bundle's own single-device `Qwen35Scratch`. Teardown
+freed only the set, orphaning `bundle.scratch` on every pp>1 unload. The single-GPU path
+frees all four GPU-owning bundle fields, which is why pp=1 was flat and only the multi-GPU
+arm drifted.
+
+**Pre-existing.** The pp>1 teardown diff against `8510ca5f2` is empty; this work did not
+introduce it. Post-fix steady state is 202 MiB — identical to pp=1, which is the
+corroboration that the freed allocation was exactly the missing scratch.
+
+**Consequence for the descent.** `pp_scratch_set` now has a clean, measured baseline on the
+configuration it belongs to, which is what the step was waiting for. The blocker is
+discharged; what remains is the `state` field and its 143-site `hipfire-generate`
+conversion.
