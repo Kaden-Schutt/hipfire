@@ -54,7 +54,7 @@ use rdna_compute::Gpu;
 /// Implemented by each architecture's bundle type in its own crate. The loader
 /// stores `Box<dyn ArchModel>` so that adding an architecture does not edit a
 /// closed enum, and the daemon asks questions instead of matching variants.
-pub trait ArchModel: Send {
+pub trait ArchModel: Send + std::any::Any {
     /// Hidden size. Spelled `dim` by some configs and `hidden_size` by others;
     /// the implementor resolves that, not the caller.
     fn dim(&self) -> usize;
@@ -85,6 +85,20 @@ pub trait ArchModel: Send {
     fn reset_session_state(&mut self, _gpu: &mut Gpu) -> Result<(), String> {
         Ok(())
     }
+
+    /// Downcast hatch for the architecture composition root.
+    ///
+    /// `hipfire-generate` legitimately needs the concrete bundle to call a
+    /// per-architecture forward pass — that is what a composition root does.
+    /// This exists so it can keep doing that once `ModelState` is replaced by
+    /// `Box<dyn ArchModel>`.
+    ///
+    /// Crucially it borrows only the receiver, so a caller can hold the
+    /// downcast bundle and a disjoint `LoadedModel` field at the same time.
+    /// A whole-struct accessor cannot: that distinction is why the accessor
+    /// experiment converted 15 sites of 154 and this hatch is expected to do
+    /// better.
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
 
     /// Return every GPU buffer this model owns.
     ///
@@ -120,6 +134,9 @@ mod tests {
         }
         fn kv_cache_mut(&mut self) -> Option<&mut KvCache> {
             None
+        }
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
         }
         fn free_gpu(self: Box<Self>, _gpu: &mut Gpu) {}
     }

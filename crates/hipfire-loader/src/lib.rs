@@ -487,6 +487,10 @@ pub enum ModelState {
 /// impl has to live here too — the orphan rule leaves no choice. Moving the
 /// type into its crate is Phase 2's job; until then this is the honest place.
 impl hipfire_runtime::arch_model::ArchModel for MuseGlimmerBundle {
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
     fn dim(&self) -> usize {
         self.config.dim
     }
@@ -531,6 +535,10 @@ impl hipfire_runtime::arch_model::ArchModel for MuseGlimmerBundle {
 /// must be here too. Each `free_gpu` mirrors its `unload_model` arm exactly;
 /// freeing less leaks, freeing more double-frees.
 impl hipfire_runtime::arch_model::ArchModel for Gemma4Bundle {
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
     fn dim(&self) -> usize {
         self.config.dim
     }
@@ -564,6 +572,10 @@ impl hipfire_runtime::arch_model::ArchModel for Gemma4Bundle {
 }
 
 impl hipfire_runtime::arch_model::ArchModel for Gemma4LoweredBundle {
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
     fn dim(&self) -> usize {
         self.config.dim
     }
@@ -591,6 +603,10 @@ impl hipfire_runtime::arch_model::ArchModel for Gemma4LoweredBundle {
 }
 
 impl hipfire_runtime::arch_model::ArchModel for Deepseek4HeterogeneousBundle {
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
     fn dim(&self) -> usize {
         self.model.config.hidden_size
     }
@@ -669,6 +685,10 @@ impl ModelState {
 /// sequence actually lives. This match moves ownership — it is the third and
 /// last exhaustive destructure alongside the two adapters.
 impl hipfire_runtime::arch_model::ArchModel for ModelState {
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
     fn dim(&self) -> usize {
         self.as_arch_model().dim()
     }

@@ -10,6 +10,10 @@ use hipfire_runtime::llama::KvCache;
 use rdna_compute::Gpu;
 
 impl ArchModel for Qwen35Bundle {
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
     fn dim(&self) -> usize {
         self.config.dim
     }

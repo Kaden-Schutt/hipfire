@@ -9,6 +9,10 @@ use rdna_compute::Gpu;
 use crate::spec_impl::Lfm2MoeBundle;
 
 impl ArchModel for Lfm2MoeBundle {
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
     fn dim(&self) -> usize {
         self.config.hidden_size
     }
