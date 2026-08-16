@@ -54,6 +54,7 @@
 pub mod arch;
 pub mod arch_model;
 mod backend;
+pub mod carrier;
 pub mod deepseek4;
 pub mod dsml;
 pub mod dspark_speculator;
@@ -67,6 +68,10 @@ pub mod spec_emit;
 pub mod spec_impl;
 
 pub use arch::{DeepseekV4, DeepseekV4HeterogeneousFault, DeepseekV4HeterogeneousProjection};
+pub use carrier::{
+    load_bundle as load_deepseek4_bundle,
+    load_heterogeneous_model as load_deepseek4_heterogeneous_model, Deepseek4LoadParts,
+};
 pub use deepseek4::{
     config_from_safetensors, CompressorCachePlacement, CompressorCacheShard, DeepseekV4Config,
     DeepseekV4DenseWeights, DeepseekV4HeterogeneousWeights, DeepseekV4OwnershipAudit,

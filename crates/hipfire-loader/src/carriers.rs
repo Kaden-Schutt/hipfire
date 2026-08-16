@@ -759,55 +759,7 @@ impl Carrier for LlamaCarrier {
         dir_diag(&src);
         let meta = resolve_source_meta(&src, ctx.path)?;
 
-        // ── source-varying seam: yields a LlamaBundle ──
-        let mut bundle = match src {
-            ModelSource::Hfq(hfq) => {
-                hipfire_arch_llama::load_llama_bundle(ModelSource::Hfq(hfq), ctx)?
-            }
-            ModelSource::Dir(source) => {
-                let config =
-                    hipfire_runtime::hfq::config_from_safetensors_llama(&source).map_err(|e| {
-                        format!("failed to parse LLaMA/Qwen3 config from config.json: {e}")
-                    })?;
-                let weights =
-                    hipfire_runtime::hfq::load_weights_paroquant_llama(&source, &config, ctx.gpu)
-                        .map_err(|e| format!("load_weights_paroquant_llama: {e:?}"))?;
-                hipfire_runtime::maybe_screen_mmq(&weights, ctx.gpu);
-                let mode = resolve_kv_mode(
-                    ctx,
-                    &hipfire_runtime::kv_mode::DIR_SAFETENSORS_POLICY,
-                    config.head_dim,
-                );
-                let dims = hipfire_runtime::llama::KvDims {
-                    layers: hipfire_runtime::llama::KvLayers::Flat(config.n_layers),
-                    n_kv_heads: config.n_kv_heads,
-                    head_dim: config.head_dim,
-                    max_seq: ctx.max_seq,
-                    physical_cap: Some(ctx.max_seq),
-                };
-                let kv = <hipfire_runtime::llama::KvCache as hipfire_runtime::llama::KvCacheExt>::from_mode(
-                    mode,
-                    hipfire_runtime::llama::KvTarget::Single(ctx.gpu),
-                    &dims,
-                )
-                .map_err(|e| format!("KvCache: {e}"))?;
-                let scratch = hipfire_runtime::llama::ForwardScratch::new_with_max_seq(
-                    ctx.gpu,
-                    &config,
-                    ctx.max_seq,
-                )
-                .map_err(|e| format!("ForwardScratch::new_with_max_seq: {e:?}"))?;
-                hipfire_arch_llama::LlamaBundle {
-                    config,
-                    weights,
-                    scratch,
-                    kv,
-                    dflash_extract_layers: Vec::new(),
-                    dspark_weights: None,
-                    dspark_assets: None,
-                }
-            }
-        };
+        let mut bundle = hipfire_arch_llama::load_llama_bundle(src, ctx)?;
 
         // ── DSpark sidecar discovery ──────────────────────────────────────────
         // When a `<stem>-dspark.<ext>` sidecar exists alongside the main model
@@ -1092,29 +1044,7 @@ impl Carrier for DotsOcrCarrier {
         dir_diag(&src);
         let meta = resolve_source_meta(&src, ctx.path)?;
 
-        use hipfire_arch_dots_ocr::dots_ocr::{DotsOcrConfig, DotsOcrWeights};
-        use hipfire_arch_dots_ocr::DotsOcr;
-        use hipfire_runtime::arch::Architecture;
-        // ── source-varying seam: (config, weights) only ──
-        let (config, weights) = match src {
-            ModelSource::Hfq(mut hfq) => {
-                let config = <DotsOcr as Architecture>::config_from_hfq(&hfq)?;
-                let weights = <DotsOcr as Architecture>::load_weights(&mut hfq, &config, ctx.gpu)?;
-                (config, weights)
-            }
-            ModelSource::Dir(source) => {
-                let config = DotsOcrConfig::from_source(&source)?;
-                let weights = DotsOcrWeights::load_weights_from_source(&source, &config, ctx.gpu)?;
-                (config, weights)
-            }
-        };
-        hipfire_runtime::maybe_screen_mmq(&weights, ctx.gpu);
-        let state = hipfire_arch_qwen2::qwen2::Qwen2State::new_with_max_seq(
-            ctx.gpu,
-            &config.text,
-            ctx.max_seq,
-        )
-        .map_err(|e| format!("dots-ocr: Qwen2State::new_with_max_seq failed: {e:?}"))?;
+        let bundle = hipfire_arch_dots_ocr::load_dots_ocr_bundle(src, ctx)?;
         // Opt-in model-free n-gram speculator (HIPFIRE_NGRAM_DRAFT=1). dots.ocr's
         // text decoder IS Qwen2, so the n-gram arm drives it via the
         // `DotsOcrBundle: SpecTarget` impl — a strong fit because layout-JSON
@@ -1130,9 +1060,9 @@ impl Carrier for DotsOcrCarrier {
             ctx.spec,
         );
         Ok(LoadedModel {
-            qwen2_state: Some(state),
-            dots_ocr_config: Some(config),
-            dots_ocr_weights: Some(weights),
+            qwen2_state: Some(bundle.state),
+            dots_ocr_config: Some(bundle.config),
+            dots_ocr_weights: Some(bundle.weights),
             speculator,
             ..LoadedModel::skeleton(
                 meta.arch_id,
@@ -1147,26 +1077,6 @@ impl Carrier for DotsOcrCarrier {
 }
 
 // ─── Deepseek4Carrier ────────────────────────────────────────────────
-
-fn apply_deepseek4_experts_per_token(
-    config: &mut hipfire_arch_deepseek4::DeepseekV4Config,
-    requested: Option<usize>,
-) -> Result<(), String> {
-    let Some(requested) = requested else {
-        return Ok(());
-    };
-    let checkpoint = config.num_experts_per_tok;
-    if requested == 0 || requested > checkpoint {
-        return Err(format!(
-            "deepseek4: experts-per-token override must be in 1..={checkpoint}, got {requested}"
-        ));
-    }
-    if requested != checkpoint {
-        eprintln!("deepseek4: runtime experts-per-token override {checkpoint} -> {requested}");
-        config.num_experts_per_tok = requested;
-    }
-    Ok(())
-}
 
 pub struct Deepseek4Carrier;
 impl Carrier for Deepseek4Carrier {
@@ -1255,37 +1165,10 @@ impl Carrier for Deepseek4Carrier {
             ctx.deepseek4_compute_placement,
             hipfire_config::Deepseek4ComputePlacement::Single
         ) {
-            if compressor_cache == hipfire_config::Deepseek4CompressorCache::F16 {
-                return Err(
-                    "deepseek4: kv_cache=f16 currently requires gfx1201 MQ2R TP3/TP4".into(),
-                );
-            }
-            if !matches!(&src, ModelSource::Hfq(_)) {
-                return Err(
-                    "deepseek4 heterogeneous placement requires the frozen MQ2R HFQ artifact"
-                        .into(),
-                );
-            }
-            if ctx
-                .deepseek4_experts_per_token
-                .is_some_and(|value| value != 6)
-            {
-                return Err("deepseek4 heterogeneous placement requires checkpoint top-k 6".into());
-            }
-            if ctx.draft_path.is_some() || ctx.spec.dspark == Some(true) {
-                return Err(
-                    "deepseek4 heterogeneous placement is direct-AR only until G6/G7".into(),
-                );
-            }
-            let artifact =
-                hipfire_arch_deepseek4::DeepseekV4VerifiedArtifact::verify(ctx.path.as_ref())?;
-            let plan = hipfire_arch_deepseek4::DeepseekV4HeterogeneousLoadPlan {
-                placement: ctx.deepseek4_compute_placement.clone(),
-                prefill_max_batch: 1024,
-                ..Default::default()
-            };
-            let model = hipfire_arch_deepseek4::DeepseekV4HeterogeneousModel::load_verified(
-                &artifact, plan,
+            let model = hipfire_arch_deepseek4::load_deepseek4_heterogeneous_model(
+                &src,
+                ctx,
+                compressor_cache,
             )?;
             let eos_tok = resolve_eos_tok(&meta.tokenizer, &["<｜end▁of▁sentence｜>"]);
             let advertised_context = model.config.max_position_embeddings;
@@ -1305,62 +1188,12 @@ impl Carrier for Deepseek4Carrier {
         }
 
         use hipfire_arch_deepseek4 as deepseek4;
-        use hipfire_runtime::arch::Architecture;
-        // ── source-varying seam: (config, weights) only ──
-        // NOTE: the Dir/safetensors arm is UNVALIDATED — no deepseek_v4
-        // checkpoint was available locally to verify load fidelity. Reviewer-ask.
-        // DSpark sidecar load gate: `speculation=dspark`/`auto` load the 3×MoE
-        // sidecar; any other mechanism (`Some(false)`) skips it so it never pages
-        // into VRAM. `None` (auto / directly-driven daemon) keeps default-on.
-        let load_dspark = ctx.spec.dspark != Some(false);
-        let (config, weights) = match src {
-            ModelSource::Hfq(mut hfq) => {
-                let mut config = <deepseek4::DeepseekV4 as Architecture>::config_from_hfq(&hfq)?;
-                apply_deepseek4_experts_per_token(&mut config, ctx.deepseek4_experts_per_token)?;
-                config.load_dspark = load_dspark;
-                let weights = <deepseek4::DeepseekV4 as Architecture>::load_weights(
-                    &mut hfq, &config, ctx.gpu,
-                )?;
-                (config, weights)
-            }
-            ModelSource::Dir(source) => {
-                let mut config = deepseek4::config_from_safetensors(&source).ok_or_else(|| {
-                    "deepseek4: failed to parse config from safetensors".to_string()
-                })?;
-                apply_deepseek4_experts_per_token(&mut config, ctx.deepseek4_experts_per_token)?;
-                config.load_dspark = load_dspark;
-                let weights = deepseek4::DeepseekV4::load_weights_from_safetensors(
-                    &source, &config, ctx.gpu,
-                )?;
-                (config, weights)
-            }
-        };
-        // F16 compressor cache on the single-device path: gfx1201 (certified)
-        // and gfx1151 (ported — the indexer score kernel's WMMA is
-        // generation-selected in the kernel source). Storage is confined to
-        // main_kv_cache and indexer_kv_cache; every other compressor buffer
-        // stays F32 and commit arithmetic completes in F32 before the single
-        // F32-to-F16 store.
-        let f16_ok =
-            config.mq2r && !config.mq2rxt && ctx.gpu.arch_caps.supports_ds4_f16_compressor_cache();
-        if compressor_cache == hipfire_config::Deepseek4CompressorCache::F16 && !f16_ok {
-            return Err(format!(
-                "deepseek4: kv_cache=f16 requires MQ2R on an architecture with wave32 WMMA (RDNA3/RDNA4); got arch={}, mq2r={}, mq2rxt={}",
-                ctx.gpu.arch, config.mq2r, config.mq2rxt
-            ));
-        }
-        let mut state = deepseek4::DeepseekV4State::new(&config)?;
-        state.compressor_cache_dtype =
-            if compressor_cache == hipfire_config::Deepseek4CompressorCache::F16 {
-                rdna_compute::DType::F16
-            } else {
-                rdna_compute::DType::F32
-            };
-        let pbs_max_batch: usize = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_PP_BATCH")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1024);
-        let pbs = deepseek4::forward::PrefillBatchScratch::new(ctx.gpu, &config, pbs_max_batch)?;
+        let deepseek4::Deepseek4LoadParts {
+            config,
+            weights,
+            state,
+            pbs,
+        } = deepseek4::load_deepseek4_bundle(src, ctx, compressor_cache)?;
         let eos_tok = resolve_eos_tok(&meta.tokenizer, &["<｜end▁of▁sentence｜>"]);
         // deepseek4 MTP spec-decode capability: present iff the MTP addon weights loaded
         // (HIPFIRE_DEEPSEEK4_MTP_ADDON / .mtp-addon.hfq / HIPFIRE_DEEPSEEK4_LOAD_MTP). The
@@ -1522,43 +1355,7 @@ impl Carrier for MinimaxCarrier {
         // Per-source diagnostic stays at the call site, before resolve_source_meta.
         dir_diag(&src);
         let meta = resolve_source_meta(&src, ctx.path)?;
-
-        // ── source-varying seam: (config, weights) only ──
-        use hipfire_runtime::arch::Architecture;
-        let (config, weights) = match src {
-            ModelSource::Hfq(mut hfq_file) => {
-                let config =
-                    <hipfire_arch_minimax::arch::MiniMaxM2 as Architecture>::config_from_hfq(
-                        &hfq_file,
-                    )?;
-                let weights =
-                    <hipfire_arch_minimax::arch::MiniMaxM2 as Architecture>::load_weights(
-                        &mut hfq_file,
-                        &config,
-                        ctx.gpu,
-                    )?;
-                (config, weights)
-            }
-            ModelSource::Dir(source) => {
-                let config = config_from_safetensors(&source)
-                    .map_err(|e| format!("failed to parse MiniMax config from config.json: {e}"))?;
-                let weights = load_weights_from_safetensors(&source, &config, ctx.gpu)?;
-                (config, weights)
-            }
-        };
-        hipfire_runtime::maybe_screen_mmq(&weights, ctx.gpu);
-
-        // ── single shared tail (byte-identical to the previous per-arm tails) ──
-        let state = MiniMaxState::new_with_max_seq(ctx.gpu, &config, ctx.max_seq)
-            .map_err(|e| format!("minimax: MiniMaxState::new_with_max_seq failed: {e}"))?;
-        let eos_tok = resolve_eos_tok(
-            &meta.tokenizer,
-            &["[e~[", "<|im_end|>", "</s>", "<|endoftext|>"],
-        );
-        // Opt-in model-free n-gram speculator (HIPFIRE_NGRAM_DRAFT=1). MiniMax-M2
-        // (arch_id=10) impls `SpecTarget` (pure GQA, no recurrent state), so it
-        // can be driven by the arch-generic spec loop with no draft model.
-        // `None` ⇒ AR-only (the bespoke `generate_minimax` path).
+        let bundle = hipfire_arch_minimax::load_minimax_bundle(src, ctx)?;
         let speculator = crate::spec_build::build_speculator(
             meta.arch_id,
             None,
@@ -1568,12 +1365,7 @@ impl Carrier for MinimaxCarrier {
             ctx.spec,
         );
         Ok(LoadedModel {
-            state: Some(ModelState::Minimax(crate::MiniMaxBundle {
-                config,
-                weights,
-                state,
-                eos_tok,
-            })),
+            state: Some(ModelState::Minimax(bundle)),
             speculator,
             ..LoadedModel::skeleton(
                 meta.arch_id,
@@ -1660,32 +1452,7 @@ impl Carrier for Lfm2MoeCarrier {
         }
         dir_diag(&src);
         let meta = resolve_source_meta(&src, ctx.path)?;
-
-        use hipfire_arch_lfm2moe as lfm2moe;
-        // ── source-varying seam: (config, weights) only ──
-        let (config, weights) = match src {
-            ModelSource::Hfq(mut hfq) => {
-                let config = lfm2moe::config::Lfm2MoeConfig::from_hfq(&hfq)?;
-                let weights = lfm2moe::lfm2moe::Lfm2MoeWeights::load(&mut hfq, &config, ctx.gpu)?;
-                (config, weights)
-            }
-            ModelSource::Dir(source) => {
-                let config = lfm2moe::config_from_source(&source).ok_or_else(|| {
-                    "lfm2moe: failed to parse config from safetensors".to_string()
-                })?;
-                let weights = lfm2moe::load_weights_from_source(&source, &config, ctx.gpu)?;
-                (config, weights)
-            }
-        };
-        hipfire_runtime::maybe_screen_mmq(&weights, ctx.gpu);
-
-        let state = lfm2moe::lfm2moe::Lfm2MoeState::new_with_max_seq(ctx.gpu, &config, ctx.max_seq)
-            .map_err(|e| format!("lfm2moe: Lfm2MoeState::new_with_max_seq failed: {e}"))?;
-        let eos_tok = resolve_eos_tok(&meta.tokenizer, &["<|im_end|>", "</s>", "<|endoftext|>"]);
-        // Opt-in model-free n-gram speculator (HIPFIRE_NGRAM_DRAFT=1). LFM2.5-MoE
-        // (arch_id=11) impls `SpecTarget` with conv-state snapshot/rollback in
-        // `verify_block`/`commit_prefix`, so it can be driven by the arch-generic
-        // spec loop with no draft model. `None` ⇒ AR-only (`generate_lfm2moe`).
+        let bundle = hipfire_arch_lfm2moe::load_lfm2moe_bundle(src, ctx)?;
         let speculator = crate::spec_build::build_speculator(
             meta.arch_id,
             None,
@@ -1695,12 +1462,7 @@ impl Carrier for Lfm2MoeCarrier {
             ctx.spec,
         );
         Ok(LoadedModel {
-            state: Some(ModelState::Lfm2Moe(crate::Lfm2MoeBundle {
-                config,
-                weights,
-                state,
-                eos_tok,
-            })),
+            state: Some(ModelState::Lfm2Moe(bundle)),
             speculator,
             ..LoadedModel::skeleton(
                 meta.arch_id,
@@ -1809,69 +1571,27 @@ impl Carrier for Cohere2MoeCarrier {
         }
         dir_diag(&src);
         let meta = resolve_source_meta(&src, ctx.path)?;
-        match src {
-            ModelSource::Hfq(hfq) => {
-                let tokenizer =
-                    hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
-                        .map_err(|e| format!("cohere2moe: tokenizer not found: {e}"))?;
-                let mut lm =
-                    crate::load_cohere2moe(hfq, tokenizer, ctx.gpu, ctx.max_seq, ctx.path)?;
-                // Opt-in model-free n-gram speculator (HIPFIRE_NGRAM_DRAFT=1).
-                lm.speculator = crate::spec_build::build_speculator(
-                    meta.arch_id,
-                    None,
-                    None,
-                    true,
-                    ctx.max_seq,
-                    ctx.spec,
-                );
-                Ok(lm)
-            }
-            ModelSource::Dir(source) => {
-                // Transparent ParoQuant safetensors-Dir path (North-Mini-Code).
-                let config = hipfire_arch_cohere2moe::Cohere2MoeConfig::from_safetensors(&source)
-                    .map_err(|e| {
-                    format!("failed to parse Cohere2-MoE config from config.json: {e}")
-                })?;
-                let weights =
-                    hipfire_arch_cohere2moe::paro_dir::load_from_source(&source, &config, ctx.gpu)?;
-                let state = hipfire_arch_cohere2moe::Cohere2MoeState::new_with_max_seq(
-                    ctx.gpu,
-                    &config,
-                    ctx.max_seq,
-                )
-                .map_err(|e| format!("cohere2moe: new_with_max_seq failed: {e}"))?;
-                let eos_tok = resolve_eos_tok(
-                    &meta.tokenizer,
-                    &["<|END_OF_TURN_TOKEN|>", "</s>", "<|endoftext|>"],
-                );
-                let speculator = crate::spec_build::build_speculator(
-                    meta.arch_id,
-                    None,
-                    None,
-                    true,
-                    ctx.max_seq,
-                    ctx.spec,
-                );
-                Ok(LoadedModel {
-                    state: Some(ModelState::Cohere2Moe(crate::Cohere2MoeBundle {
-                        config,
-                        weights,
-                        state,
-                        eos_tok,
-                    })),
-                    speculator,
-                    ..LoadedModel::skeleton(
-                        meta.arch_id,
-                        meta.tokenizer,
-                        ctx.max_seq,
-                        ctx.max_seq,
-                        ctx.path.to_string(),
-                        meta.chat_template,
-                    )
-                })
-            }
-        }
+        let bundle = hipfire_arch_cohere2moe::load_cohere2moe_bundle(src, ctx)?;
+        let speculator = crate::spec_build::build_speculator(
+            meta.arch_id,
+            None,
+            None,
+            true,
+            ctx.max_seq,
+            ctx.spec,
+        );
+        Ok(LoadedModel {
+            state: Some(ModelState::Cohere2Moe(bundle)),
+            speculator,
+            ..LoadedModel::skeleton(
+                meta.arch_id,
+                meta.tokenizer,
+                ctx.max_seq,
+                ctx.max_seq,
+                ctx.path.to_string(),
+                meta.chat_template,
+            )
+        })
     }
 }
 
@@ -1968,141 +1688,47 @@ impl Carrier for Gemma4Carrier {
         }
         dir_diag(&src);
         let meta = resolve_source_meta(&src, ctx.path)?;
-        match src {
-            ModelSource::Hfq(hfq) => {
-                // ── Lowered vs eager selection (MoE or batched prefill opt-in) ──
-                // Arch-13 MoE
-                // (26B-A4B `enable_moe_block`) must go through `lowered`, which
-                // carries the parallel-MoE branch. We also route DENSE models
-                // through `lowered` when the operator opts into batched/WMMA
-                // prefill — that path lives only in `lowered::forward_prefill_batch`.
-                // E2B/E4B stay on eager because lowered does not implement PLE,
-                // KV sharing, or E2B's double-wide shared-layer FFN.
-                // EAGLE spec-decode (`params.drafter`) requires the eager
-                // `Gemma4State`, so a drafter request always wins and keeps the
-                // eager path (batched prefill opt-in is ignored when a drafter
-                // is present). This is arch-gated: other carriers are unaffected.
-                let lowered_cfg = hipfire_arch_gemma4::lowered::config_from_hfq(&hfq);
-                let want_batched = crate::gemma4_batched_prefill_optin(ctx.gpu);
-                let lowered_is_moe = lowered_cfg
-                    .as_ref()
-                    .is_some_and(|lcfg| lcfg.enable_moe_block);
-                let eager_config = if lowered_is_moe {
-                    None
-                } else {
-                    Some(hipfire_arch_gemma4::config::Gemma4Config::from_hfq(&hfq)?)
-                };
-                let is_e_series = eager_config.as_ref().is_some_and(|cfg| {
-                    cfg.hidden_size_per_layer_input != 0 || cfg.num_kv_shared_layers != 0
-                });
-                if is_e_series {
-                    eager_config.as_ref().unwrap().e_series_variant()?;
-                }
-                gemma4_validate_drafter_route(is_e_series, ctx.gemma4_drafter_path.is_some())?;
-                let use_lowered = if let Some(ref lcfg) = lowered_cfg {
-                    gemma4_use_lowered(
-                        lcfg.enable_moe_block,
-                        want_batched,
-                        ctx.gemma4_drafter_path.is_some(),
-                        is_e_series,
-                    )
-                } else {
-                    false
-                };
-                if use_lowered {
-                    let lcfg = lowered_cfg.unwrap();
-                    let mut hfq2 = hfq;
-                    let weights =
-                        hipfire_arch_gemma4::lowered::load_weights(&mut hfq2, &lcfg, ctx.gpu)
-                            .map_err(|e| format!("gemma4 (lowered) load_weights: {e:?}"))?;
-                    let scratch =
-                        hipfire_arch_gemma4::lowered::Gemma4Scratch::new(ctx.gpu, &lcfg, 1)
-                            .map_err(|e| format!("gemma4 (lowered) scratch: {e:?}"))?;
-                    hipfire_arch_gemma4::lowered::init_scratch_constants(
-                        ctx.gpu,
-                        &scratch,
-                        lcfg.full_head_dim,
-                    )
-                    .map_err(|e| format!("gemma4 (lowered) init_scratch_constants: {e:?}"))?;
-                    let kv_sliding = hipfire_runtime::llama::KvCache::new_gpu_q8_capped(
-                        ctx.gpu,
-                        lcfg.n_layers,
-                        lcfg.sliding_n_kv_heads,
-                        lcfg.sliding_head_dim,
-                        ctx.max_seq,
-                        lcfg.sliding_window,
-                    )
-                    .map_err(|e| format!("gemma4 (lowered) sliding KV alloc (q8 ring): {e:?}"))?;
-                    let kv_full = hipfire_runtime::llama::KvCache::new_gpu_asym3_gemma4(
-                        ctx.gpu,
-                        lcfg.n_layers,
-                        lcfg.full_n_kv_heads,
-                        lcfg.full_head_dim,
-                        ctx.max_seq,
-                    )
-                    .map_err(|e| format!("gemma4 (lowered) full KV alloc: {e:?}"))?;
-                    let eos_tok = resolve_eos_tok(
-                        &meta.tokenizer,
-                        &["<end_of_turn>", "<turn|>", "<eos>", "<|im_end|>"],
-                    );
-                    let hfq_for_template = hfq2;
-                    let chat_template = resolve_chat_template(&hfq_for_template, ctx.path);
-                    eprintln!(
-                        "  gemma4 lowered path: moe={} batched_opt_in={} (sliding q8-ring + full asym3 KV)",
-                        lcfg.enable_moe_block, want_batched,
-                    );
-                    let speculator = crate::spec_build::build_speculator(
-                        meta.arch_id,
-                        None,
-                        None,
-                        true,
-                        ctx.max_seq,
-                        ctx.spec,
-                    );
-                    return Ok(LoadedModel {
-                        state: Some(ModelState::Gemma4Lowered(crate::Gemma4LoweredBundle {
-                            config: lcfg,
-                            weights,
-                            scratch,
-                            kv_sliding,
-                            kv_full,
-                            eos_tok,
-                        })),
-                        speculator,
-                        ..LoadedModel::skeleton(
-                            meta.arch_id,
-                            meta.tokenizer,
-                            ctx.max_seq,
-                            ctx.max_seq,
-                            ctx.path.to_string(),
-                            chat_template,
-                        )
-                    });
-                }
-                // ── Eager dense / E-series path ──
-                let config = match eager_config {
-                    Some(config) => config,
-                    None => hipfire_arch_gemma4::config::Gemma4Config::from_hfq(&hfq)?,
-                };
-                if is_e_series {
-                    eprintln!(
-                        "  gemma4 E-series eager path: {:?} (PLE + shared KV)",
-                        config.e_series_variant()?
-                    );
-                }
-                let weights =
-                    hipfire_arch_gemma4::gemma4::Gemma4Weights::load(&hfq, &config, ctx.gpu)?;
-                let state = hipfire_arch_gemma4::gemma4::Gemma4State::new_with_max_seq(
-                    ctx.gpu,
-                    &config,
-                    ctx.max_seq,
-                )
-                .map_err(|e| format!("gemma4: Gemma4State::new_with_max_seq failed: {e}"))?;
+        let bundle = hipfire_arch_gemma4::load_gemma4_bundle(src, ctx)?;
+        match bundle {
+            hipfire_arch_gemma4::Gemma4Bundle::Lowered(l) => {
                 let eos_tok = resolve_eos_tok(
                     &meta.tokenizer,
                     &["<end_of_turn>", "<turn|>", "<eos>", "<|im_end|>"],
                 );
-                let _ = &weights;
+                let speculator = crate::spec_build::build_speculator(
+                    meta.arch_id,
+                    None,
+                    None,
+                    true,
+                    ctx.max_seq,
+                    ctx.spec,
+                );
+                Ok(LoadedModel {
+                    state: Some(ModelState::Gemma4Lowered(crate::Gemma4LoweredBundle {
+                        config: l.config,
+                        weights: l.weights,
+                        scratch: l.scratch,
+                        kv_sliding: l.kv_sliding,
+                        kv_full: l.kv_full,
+                        eos_tok,
+                    })),
+                    speculator,
+                    ..LoadedModel::skeleton(
+                        meta.arch_id,
+                        meta.tokenizer,
+                        ctx.max_seq,
+                        ctx.max_seq,
+                        ctx.path.to_string(),
+                        meta.chat_template,
+                    )
+                })
+            }
+            hipfire_arch_gemma4::Gemma4Bundle::Eager(e) => {
+                let eos_tok = resolve_eos_tok(
+                    &meta.tokenizer,
+                    &["<end_of_turn>", "<turn|>", "<eos>", "<|im_end|>"],
+                );
+                let _ = &e.weights;
                 // Optional EAGLE drafter (arch-22) — populated only when
                 // `gemma4_drafter_path` is Some. Validates draft_len 1..=5,
                 // arch_id 22, and backbone_hidden == target dim. On failure
@@ -2111,7 +1737,7 @@ impl Carrier for Gemma4Carrier {
                 let eagle = if let Some(dp) = ctx.gemma4_drafter_path {
                     let draft_len = crate::gemma4_eagle_spec_len(Some(ctx.gemma4_draft_len as u64))
                         .map_err(|e| format!("gemma4 drafter spec_len: {e}"))?;
-                    match load_gemma4_eagle_state(dp, draft_len, &config, &weights, ctx.gpu) {
+                    match load_gemma4_eagle_state(dp, draft_len, &e.config, &e.weights, ctx.gpu) {
                         Ok(st) => {
                             eprintln!(
                                 "  gemma4 EAGLE drafter loaded: {} (layers={}, hidden={}, draft_len={})",
@@ -2140,9 +1766,9 @@ impl Carrier for Gemma4Carrier {
                 );
                 Ok(LoadedModel {
                     state: Some(ModelState::Gemma4(crate::Gemma4Bundle {
-                        config,
-                        weights,
-                        state,
+                        config: e.config,
+                        weights: e.weights,
+                        state: e.state,
                         eos_tok,
                         eagle,
                     })),
@@ -2156,10 +1782,6 @@ impl Carrier for Gemma4Carrier {
                         meta.chat_template,
                     )
                 })
-            }
-            ModelSource::Dir(source) => {
-                let _ = source;
-                return Err("gemma4: safetensors Dir load not yet wired — use HFQ (quantize with --arch-id 13) or add config_from_source to hipfire-arch-gemma4".into());
             }
         }
     }

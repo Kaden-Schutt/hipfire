@@ -69,10 +69,12 @@
 //!   the daemon plumbing (image preprocessing + IMGPAD splicing).
 
 pub mod arch;
+pub mod carrier;
 pub mod dots_ocr;
 pub mod image;
 pub mod rope;
 pub mod spec_impl;
 
 pub use arch::DotsOcr;
+pub use carrier::load_bundle as load_dots_ocr_bundle;
 pub use spec_impl::DotsOcrBundle;
