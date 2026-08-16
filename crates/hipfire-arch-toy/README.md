@@ -78,49 +78,46 @@ skip one and the workspace stops building (exhaustive `match` on
    safetensors-dir path (`derive_arch_id`) and both quantize pipelines now
    derive from this table, so a new arch needs no edit elsewhere for
    `arch_id` routing.
-10. `crates/hipfire-runtime/Cargo.toml` — `arch-<name>` feature in the
-    default list + the crate as a `[dev-dependencies]` entry (the dev-dep
-    cycle-exclusion trick; see the comment block there).
-11. `crates/hipfire-quantize/src/pipeline.rs` — per-arch ingest flags
+10. `crates/hipfire-quantize/src/pipeline.rs` — per-arch ingest flags
     (`is_<name> = arch_id == <N>`) when your tensors need special quant
     routing (MoE experts, tied-embed guards). Dense plain-vanilla arches
     may need nothing.
     (`pipeline_gguf.rs` needs no edit — it calls the same
     `lookup_model_type`.)
-12. `crates/hipfire-daemon/src/main.rs` — session-reset arm(s) beside the
+11. `crates/hipfire-daemon/src/main.rs` — session-reset arm(s) beside the
     `ModelState::Gemma4`/`MuseGlimmer` blocks (only if your state isn't
     fully covered by `ArchModel::reset_session_state`).
 
 ### Tier E — optional capability surfaces
 
-13. `crates/hipfire-generate/src/batch.rs` — continuous-batch admission, if
+12. `crates/hipfire-generate/src/batch.rs` — continuous-batch admission, if
     your arch supports it.
-14. `crates/hipfire-generate/src/redline.rs` — bench-fixture routes, if you
+13. `crates/hipfire-generate/src/redline.rs` — bench-fixture routes, if you
     want Redline capture.
-15. `crates/hipfire-runtime/src/reset_core.rs` — retry-eligibility
+14. `crates/hipfire-runtime/src/reset_core.rs` — retry-eligibility
     inventory row (your `arch_key()` string must match).
-16. `crates/hipfire-cli/Cargo.toml` — only if the CLI itself needs your
+15. `crates/hipfire-cli/Cargo.toml` — only if the CLI itself needs your
     types (precedent: qwen35 multi-slot).
 
 ### Tier F — registry & docs
 
-17. `docs/architecture-ids.md` — claim your id. Never reuse 2–4 (deliberately
+16. `docs/architecture-ids.md` — claim your id. Never reuse 2–4 (deliberately
     unassigned) or 0xFF (this template).
-18. `docs/ARCHITECTURE.md` — carrier table row + crate table row.
-19. `registry/models.json` — model entries for your artifacts, then
+17. `docs/ARCHITECTURE.md` — carrier table row + crate table row.
+18. `registry/models.json` — model entries for your artifacts, then
     `scripts/registry_gen.py` regenerates `registry/v1.json` (which is where
     the `arch_id` column lands; never hand-edit `v1.json`).
-20. `docs/MODELS.md` — catalog rows.
-21. `docs/env-vars.md` — any new `HIPFIRE_*` knobs and feature-flag notes.
-22. `CLAUDE.md` — the arch-id list in the crate summary.
+19. `docs/MODELS.md` — catalog rows.
+20. `docs/env-vars.md` — any new `HIPFIRE_*` knobs and feature-flag notes.
+21. `CLAUDE.md` — the arch-id list in the crate summary.
 
 Also run `scripts/check-crate-maps.py <name>` to seed your crate's own
 `map.md` (in-crate, so not counted above).
 
 ## The count
 
-**21 out-of-crate files** a new architecture must touch today (checklist
-items 2–22 above), down from 23 before this change (and ~28 pre-programme)
+**20 out-of-crate files** a new architecture must touch today (checklist
+items 2–21 above), down from 21 before this change (and ~28 pre-programme)
 — despite *more* arches, because the loader's `LoadedModel` per-arch
 `Option<…>` fields, the daemon's per-arch `arch_id` match ladders, and the
 bespoke spec-decode wiring were folded into `ModelState`/`ArchModel`/`Carrier`,
@@ -128,7 +125,6 @@ and `arch_id` routing is now a single site (`arch_mapping.rs`): `safetensors_sou
 is table-driven (longest-key substring match) and `tests/arch_id_unification.rs`
 iterates `MODEL_TYPE_TO_ARCH_ID` directly, so neither needs a per-arch edit.
 Six are compile-enforced (all of Tier B plus Tier C items 5–7: the
-`ModelState` and `GenerationRoute` matches are exhaustive, so a new variant
 without its arms does not build); the rest fail closed or silently skip.
 
 ## What this crate is not

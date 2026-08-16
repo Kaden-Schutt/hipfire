@@ -6,18 +6,13 @@ license.workspace = true
 description = "Inference orchestrator for RDNA GPUs"
 
 [features]
-# Cargo features for selective architecture inclusion (Phase 2 PR 12).
-#
-# Default keeps today's full-featured behavior: `cargo build --release`
-# produces the same daemon + example surface as before this PR.
-# Downstream library consumers may opt out of any subset of arches, e.g.
-#
-#   [dependencies]
-#   hipfire-runtime = { version = "...", default-features = false,
-#                       features = ["deltanet", "arch-qwen35"] }
-#
-# This trims the resolved dep graph to just the qwen35 arch crate plus
-# the deltanet runtime feature, with all other arch crates absent.
+# Default is the production surface: `cargo build --release` builds the
+# full daemon + example set. The historical `arch-*` stubs
+# (`arch-qwen35`, `arch-llama`, etc.) were empty features with no
+# `cfg(feature = "arch-*")` gating and no `hipfire-runtime/arch-*`
+# dependents — deleted as dead registration tax. Arch crates are consumed
+# via `[dev-dependencies]` below (cycle-exclusion trick) and via
+# `hipfire-loader` / `hipfire-generate`, not via runtime features.
 #
 # Internal example builds:
 # Each arch crate already lists `hipfire-runtime` in its
@@ -27,30 +22,12 @@ description = "Inference orchestrator for RDNA GPUs"
 # `[dev-dependencies]` of this crate. cargo's resolver excludes the
 # dev-dep edge from the cycle check.
 #
-# Side-effect: when a workspace example is built (via
-# `cargo build -p hipfire-daemon` etc.), cargo's resolver follows the
-# dev-dep edge in both directions, which activates the `default`
-# feature on `hipfire-runtime` from the dev-dep activation path. That
-# in turn re-activates all `arch-*` features, undoing any
-# `--no-default-features` the user passed for an example build. This
-# is a workspace-internal limitation only; it does NOT affect
-# downstream library consumers, who never enter the dev-dep cycle.
-#
 # Example-target gating uses `required-features` (per `[[example]]`
 # block below) which serves both as documentation of which features
 # each example needs and as the gate for downstream library consumers
 # who attempt to build examples through their own build script.
-default = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-cohere2moe", "arch-dots-ocr", "arch-gemma4", "arch-muse-glimmer", "deltanet"]
+default = ["deltanet"]
 deltanet = ["rdna-compute/deltanet", "hipfire-dispatch/deltanet"]
-arch-qwen35 = []
-arch-qwen35-vl = []
-arch-llama = []
-arch-qwen2 = []
-arch-deepseek4 = []
-arch-cohere2moe = []
-arch-dots-ocr = []
-arch-gemma4 = []
-arch-muse-glimmer = []
 # ep-fault-inject: enables the EP partial-load fault-injection knob
 # (HIPFIRE_EP_FAIL_RANK) in the daemon example, which makes a chosen EP rank
 # return a synthetic Err after uploading its weights so the staging-guard VRAM
@@ -113,14 +90,11 @@ minijinja = { version = "2", features = ["loop_controls", "json", "preserve_orde
 minijinja-contrib = { version = "2", features = ["pycompat"] }
 tracing = "0.1"
 
-# Examples in this crate (daemon, infer_qwen35, infer_qwen3, infer_vl, etc.)
+# Examples in this crate (bench_qwen35_mq4, dflash_spec_demo, etc.)
 # consume the arch crates. These are dev-dependencies — cargo refuses
 # optional dev-dependencies AND its cycle checker excludes the dev-dep
 # edge, which is what allows hipfire-runtime to list arch crates here
 # despite each arch crate already depending on hipfire-runtime.
-# Per-arch granularity for downstream consumers comes from the cargo
-# features above and `required-features` on each `[[example]]` block
-# below.
 [dev-dependencies]
 hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35" }
 hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl" }
@@ -142,14 +116,11 @@ hipfire-atlas = { path = "../hipfire-atlas" }
 tempfile = "3"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 
-# Each example below carries `required-features` listing the cargo
-# features its `use hipfire_arch_*` imports depend on. This documents
-# the per-example arch dependency and gates the example for downstream
-# library consumers (who do not enter the dev-dep cycle and so respect
-# the `--no-default-features` flag faithfully).
-#
-# Examples NOT listed here (bench_q8, probe_wmma, dump_meta, …) do not
-# touch arch crates and build under any feature combination.
+# Each example below carries `required-features` when it needs a
+# non-default feature (currently only `deltanet`). Arch crates are
+# consumed as dev-dependencies (no `arch-*` feature gating). Examples
+# not listed here (bench_q8, probe_wmma, dump_meta, …) build under any
+# feature combination.
 
 [[example]]
 name = "coherence_probe"
@@ -157,19 +128,19 @@ required-features = []
 
 [[example]]
 name = "bench_qwen35_mq4"
-required-features = ["arch-qwen35"]
+required-features = []
 
 [[example]]
 name = "dflash_spec_demo"
-required-features = ["arch-qwen35"]
+required-features = []
 
 [[example]]
 name = "triattn_validate"
-required-features = ["arch-qwen35"]
+required-features = []
 
 [[example]]
 name = "pp_parity_chatml"
-required-features = ["arch-qwen35", "deltanet"]
+required-features = ["deltanet"]
 
 # build_kld_ref needs no GPU / arch features — it just orchestrates
 # llama-perplexity and reduces uint16 logits to top-K. Stdlib-only.
@@ -179,7 +150,7 @@ required-features = []
 
 [[example]]
 name = "eval_hipfire"
-required-features = ["arch-qwen35", "deltanet"]
+required-features = ["deltanet"]
 
 # eval_gguf — KLD eval for GGUF candidates (FIFO + llama-perplexity).
 # Stdlib only; no GPU / arch features.
@@ -205,8 +176,7 @@ required-features = []
 #
 # Stdlib only at this stage; no GPU / arch features required for the
 # scaffold itself. When the forward pass lands these bins will pick up
-# `required-features = ["arch-qwen35", "arch-llama"]` (or whichever
-# arches the Tier 1 path supports).
+# `required-features = ["deltanet"]` if they need GPU-gated kernels.
 [[bin]]
 name = "collect_imatrix"
 path = "src/bin/collect_imatrix.rs"
