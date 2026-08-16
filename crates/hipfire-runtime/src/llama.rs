@@ -731,10 +731,10 @@ impl MmqScreenable for LlamaWeights {
 /// y = W * x where W is the weight tensor, x is F32 input, y is F32 output.
 
 pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor) -> HipResult<()> {
-    use hipfire_dispatch::context::DispatchCtx;
+    // Calibration tap: PRE-rotation input x (n=1, k=w.k). No-op when unarmed.
+    gpu.maybe_capture_activation(&w.buf, x, 1, w.k);
     use hipfire_dispatch::families::gemv::{GemvParams, WeightRef};
     use hipfire_dispatch::types::{dtype_needs_rotation, GemvVariant};
-
     let gemv = crate::llama::gemv_family();
     let ctx = DispatchCtx::new(gpu);
     let wr = WeightRef {
@@ -1191,6 +1191,8 @@ pub fn weight_gemv_prerotated(
     x_rot: Option<&GpuTensor>,
     y: &GpuTensor,
 ) -> HipResult<()> {
+    // Calibration tap: PRE-rotation input x (n=1, k=w.k). Must fire before any rotation.
+    gpu.maybe_capture_activation(&w.buf, x, 1, w.k);
     use hipfire_dispatch::context::DispatchCtx;
     use hipfire_dispatch::families::gemv::WeightRef;
     use hipfire_dispatch::types::dtype_needs_rotation;
@@ -1297,7 +1299,8 @@ pub fn weight_gemv_residual(
     x: &GpuTensor,
     y: &GpuTensor,
 ) -> HipResult<()> {
-    use hipfire_dispatch::context::DispatchCtx;
+    // Calibration tap: o_proj/out_proj input (residual path). PRE-rotation x.
+    gpu.maybe_capture_activation(&w.buf, x, 1, w.k);
     use hipfire_dispatch::families::gemv::{GemvParams, WeightRef};
     use hipfire_dispatch::types::GemvVariant;
 
@@ -1376,10 +1379,6 @@ pub fn weight_gemv_residual(
 ///   gemv_hfq4g256_residual(w_down, mq_x_rot, x)    // fused residual add
 /// so the entire w_down epilogue is two launches instead of four
 /// (silu_mul + rotate + gemv + add_inplace → fused_silu_rotate + gemv_residual).
-///
-/// Non-MQ path falls back to the pre-Phase-3.8 sequence (silu_mul_f32 +
-/// weight_gemv_residual). Byte-equivalent modulo FP reordering on the
-/// FWHT butterfly, which is the same butterfly as the standalone path.
 pub fn weight_gemv_swiglu_residual(
     gpu: &mut Gpu,
     w_down: &WeightTensor,
@@ -1388,6 +1387,9 @@ pub fn weight_gemv_swiglu_residual(
     ffn_hidden_scratch: &GpuTensor,
     x: &GpuTensor,
 ) -> HipResult<()> {
+    // Calibration tap: down_proj input is ffn_hidden_scratch (post-SiLU), K = w_down.k.
+    // For MQ4 this will be rotated inside; we capture PRE-rotation.
+    gpu.maybe_capture_activation(&w_down.buf, ffn_hidden_scratch, 1, w_down.k);
     use hipfire_dispatch::context::DispatchCtx;
     use hipfire_dispatch::families::gemv::{GemvParams, WeightRef};
     use hipfire_dispatch::types::GemvVariant;
@@ -1448,6 +1450,14 @@ pub fn weight_gemm(
     y: &GpuTensor,
     batch_size: usize,
 ) -> HipResult<()> {
+    // Calibration tap, batched twin of the four in `weight_gemv*`. Those pass
+    // n=1 because they are the decode path; here the real row count goes in, so
+    // one prefill call contributes `batch_size` rows to H and Σx² at once.
+    // This is what lets calibration run as batched MFMA instead of per-token
+    // GEMV — the difference between re-reading all weights per token
+    // (bandwidth-bound) and once per batch. Zero cost when no collector is
+    // armed (`active_capture.is_none()` early-returns).
+    gpu.maybe_capture_activation(&w.buf, x, batch_size, w.k);
     match w.gpu_dtype {
         DType::HFQ4G256 => gpu.gemm_hfq4g256(&w.buf, x, y, w.m, w.k, batch_size),
         DType::HFQ4G128 => gpu.gemm_hfq4g128(&w.buf, x, y, w.m, w.k, batch_size),

@@ -461,21 +461,22 @@ impl DType {
 pub trait ActivationCapture: Send + Sync {
     /// Called by linear-layer dispatch arms when calibration is active.
     ///
-    /// `tensor_name` — canonical .hfq / GGUF tensor name.
-    /// `input_ptr`   — device pointer to the input activation tensor.
-    /// `numel`       — number of elements at `input_ptr` (NOT bytes).
-    /// `dtype`       — element type of the captured activation.
-    /// `shape`       — full activation shape (e.g. `[batch, K]` for the
-    ///                 input of a `[K, M]` linear). Borrowed; do NOT
-    ///                 retain past the call.
-    fn capture(
-        &self,
-        tensor_name: &str,
-        input_ptr: *const c_void,
-        numel: usize,
-        dtype: DType,
-        shape: &[usize],
-    );
+    /// `gpu`         — the dispatcher, so the collector can run its on-GPU
+    ///                 reduction kernels (`calib_sumsq_reduce_f32` /
+    ///                 `calib_hessian_outer_f32`). Safe to take `&mut Gpu`:
+    ///                 the dispatch site clones the collector `Arc` before
+    ///                 calling, so `gpu.active_capture` is not aliased here.
+    /// `tensor_name` — canonical .hfq / GGUF tensor name (resolved from the
+    ///                 weight buffer pointer via `gpu.capture_names`).
+    /// `input`       — the input-activation buffer (borrowed; do NOT retain past
+    ///                 the call). NOTE its `.shape` may be a shared scratch sized
+    ///                 to `max(dim, hidden)`, so it is NOT a reliable source of
+    ///                 `k`/`n` — use the passed `n`/`k` instead.
+    /// `n`           — number of activation rows (tokens / batch) this call.
+    /// `k`           — the linear's input dim (the meaningful width of each row).
+    /// Interior mutability (`&self`) lets the collector accumulate without an
+    /// exclusive borrow.
+    fn capture(&self, gpu: &mut Gpu, tensor_name: &str, input: &GpuTensor, n: usize, k: usize);
 }
 
 /// Per-weight MMQ screening state (issue #87).
@@ -532,6 +533,19 @@ pub struct Gpu {
     /// so consumer cards stay on the wave32/64 hand-rolled GEMV path.
     fp16_shadow_cache: HashMap<usize, GpuTensor>,
 
+    /// Calibration activation capture (Tier-1 collector). When `Some`, the
+    /// instrumented linear dispatch arms resolve their weight buffer pointer
+    /// to a tensor name via `capture_names` and invoke `capture()` with the
+    /// input activation. `None` (the default) ⇒ the check is a single
+    /// `is_none()` and forwards are byte-identical. The collector is held by
+    /// `Arc` so the dispatch site can clone it (breaking the borrow on `self`)
+    /// before calling `capture(self, …)`.
+    pub active_capture: Option<Arc<dyn ActivationCapture>>,
+    /// Weight-buffer-pointer → canonical tensor name, populated when calibration
+    /// is armed. Lets capture fire from ANY forward path (hand or lowered,
+    /// fused or not) keyed by the weight the gemv received.
+    pub capture_names: HashMap<usize, String>,
+
     /// Native GPTQ-on-E8 Hessian collection. `None` in production (zero
     /// overhead -- a single `is_some()` branch in the MoE CPU-top-K fallback
     /// per routed expert). The `collect_e8_hessian_native` example sets this to
@@ -543,7 +557,6 @@ pub struct Gpu {
     /// `hipfire-dispatch::pipeline::run_moe_decode_cpu_fallback` for the hook.
     pub hessian_capture: Option<HessianCapture>,
 }
-
 /// Per-256-block XX^T accumulator for ONE weight tensor (one expert), keyed
 /// inside [`HessianCapture`] by the full safetensors name. Byte-for-byte the
 /// same accumulation + `.hblk` layout as
@@ -1037,8 +1050,11 @@ impl Gpu {
             },
             rocblas: None,
             fp16_shadow_cache: HashMap::new(),
+            active_capture: None,
+            capture_names: HashMap::new(),
             hessian_capture: None,
-        }).map(|mut gpu| {
+        })
+        .map(|mut gpu| {
             if gpu.flags.force_blob_path {
                 eprintln!("[diag] HIPFIRE_BLOB_FORCE=1: all kernel launches will use the blob path (kernelParams bypassed). Diagnostic only.");
             }
@@ -2823,6 +2839,267 @@ impl Gpu {
             Ok(())
         }
     }
+    /// Calibration capture hook for an instrumented linear: if a collector is
+    /// armed and `weight`'s buffer pointer is a known calibration target, invoke
+    /// `capture(name, input)`. Zero-cost (`is_none()` + return) when no collector
+    /// is armed, so non-calibration forwards are byte-identical. The collector
+    /// `Arc` is cloned before the call so `self` is not aliased by `active_capture`.
+    #[inline]
+    pub fn maybe_capture_activation(
+        &mut self,
+        weight: &GpuTensor,
+        input: &GpuTensor,
+        n: usize,
+        k: usize,
+    ) {
+        if self.active_capture.is_none() {
+            return;
+        }
+        let ptr = weight.buf.as_ptr() as usize;
+        let name = match self.capture_names.get(&ptr) {
+            Some(nm) => nm.clone(),
+            None => return,
+        };
+        if let Some(cap) = self.active_capture.clone() {
+            cap.capture(self, &name, input, n, k);
+        }
+    }
+
+    /// Calibration: `acc[c] += Σ_n x[n,c]²` (per-column sum-of-squares, the
+    /// imatrix / diag(H) signal). `x` is [N, K] F32; `acc` is [K] F32, ADDED into
+    /// (caller zeroes once, then accumulates across the calibration corpus).
+    pub fn calib_sumsq_reduce_f32(
+        &mut self,
+        x: &GpuTensor,
+        acc: &GpuTensor,
+        n: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "calib_reduce",
+            crate::kernels::CALIB_REDUCE_SRC,
+            "calib_sumsq_reduce_f32",
+        )?;
+        let x_ptr = x.buf.as_ptr();
+        let acc_ptr = acc.buf.as_ptr();
+        let n_i = n as i32;
+        let k_i = k as i32;
+        let block = 256u32;
+        let grid = ((k as u32) + block - 1) / block;
+        let mut params: Vec<*mut c_void> = vec![
+            &x_ptr as *const _ as *mut c_void,
+            &acc_ptr as *const _ as *mut c_void,
+            &n_i as *const _ as *mut c_void,
+            &k_i as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "calib_sumsq_reduce_f32",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(x_ptr);
+                blob.push_ptr(acc_ptr);
+                blob.push_i32(n_i);
+                blob.push_i32(k_i);
+                blob
+            },
+        )
+    }
+
+    /// Calibration: `H[i,j] += Σ_n x[n,i]·x[n,j]` (the K×K GPTQ Hessian, tiled
+    /// GEMM accumulate). `x` is [N, K] F32; `H` is [K, K] F32 row-major, ADDED
+    /// into (caller zeroes once, then accumulates across the calibration corpus).
+    pub fn calib_hessian_outer_f32(
+        &mut self,
+        x: &GpuTensor,
+        h: &GpuTensor,
+        n: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "calib_reduce",
+            crate::kernels::CALIB_REDUCE_SRC,
+            "calib_hessian_outer_f32",
+        )?;
+        let x_ptr = x.buf.as_ptr();
+        let h_ptr = h.buf.as_ptr();
+        let n_i = n as i32;
+        let k_i = k as i32;
+        let tile = 16u32;
+        let grid_x = ((k as u32) + tile - 1) / tile;
+        let grid_y = ((k as u32) + tile - 1) / tile;
+        let mut params: Vec<*mut c_void> = vec![
+            &x_ptr as *const _ as *mut c_void,
+            &h_ptr as *const _ as *mut c_void,
+            &n_i as *const _ as *mut c_void,
+            &k_i as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "calib_hessian_outer_f32",
+            [grid_x, grid_y, 1],
+            [tile, tile, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(x_ptr);
+                blob.push_ptr(h_ptr);
+                blob.push_i32(n_i);
+                blob.push_i32(k_i);
+                blob
+            },
+        )
+    }
+
+    /// `w[n] += (1/k)·Σ_c d[n,c]²` — per-row (per-token) mean-square of an
+    /// output-grad block `d[n,k]`. Used by GuidedQuant calibration to turn a
+    /// linear's output adjoint `∂ℓ/∂z` into a per-token Fisher weight. `w` is
+    /// caller-zeroed `[n]`.
+    pub fn calib_row_meansq_f32(
+        &mut self,
+        d: &GpuTensor,
+        w: &GpuTensor,
+        n: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "calib_reduce",
+            crate::kernels::CALIB_REDUCE_SRC,
+            "calib_row_meansq_f32",
+        )?;
+        let d_ptr = d.buf.as_ptr();
+        let w_ptr = w.buf.as_ptr();
+        let n_i = n as i32;
+        let k_i = k as i32;
+        let block = 64u32;
+        let grid = ((n as u32) + block - 1) / block;
+        let mut params: Vec<*mut c_void> = vec![
+            &d_ptr as *const _ as *mut c_void,
+            &w_ptr as *const _ as *mut c_void,
+            &n_i as *const _ as *mut c_void,
+            &k_i as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "calib_row_meansq_f32",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(d_ptr);
+                blob.push_ptr(w_ptr);
+                blob.push_i32(n_i);
+                blob.push_i32(k_i);
+                blob
+            },
+        )
+    }
+
+    /// `acc[c] += Σ_n w[n]·x[n,c]²` — the per-row-weighted column sum-of-squares,
+    /// i.e. the diagonal of the weighted Hessian. `w≡1` reduces to
+    /// [`Self::calib_sumsq_reduce_f32`].
+    pub fn calib_sumsq_weighted_f32(
+        &mut self,
+        x: &GpuTensor,
+        w: &GpuTensor,
+        acc: &GpuTensor,
+        n: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "calib_reduce",
+            crate::kernels::CALIB_REDUCE_SRC,
+            "calib_sumsq_weighted_f32",
+        )?;
+        let x_ptr = x.buf.as_ptr();
+        let w_ptr = w.buf.as_ptr();
+        let a_ptr = acc.buf.as_ptr();
+        let n_i = n as i32;
+        let k_i = k as i32;
+        let block = 64u32;
+        let grid = ((k as u32) + block - 1) / block;
+        let mut params: Vec<*mut c_void> = vec![
+            &x_ptr as *const _ as *mut c_void,
+            &w_ptr as *const _ as *mut c_void,
+            &a_ptr as *const _ as *mut c_void,
+            &n_i as *const _ as *mut c_void,
+            &k_i as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "calib_sumsq_weighted_f32",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(x_ptr);
+                blob.push_ptr(w_ptr);
+                blob.push_ptr(a_ptr);
+                blob.push_i32(n_i);
+                blob.push_i32(k_i);
+                blob
+            },
+        )
+    }
+
+    /// `H[i,j] += Σ_n w[n]·x[n,i]·x[n,j]` — the per-row-weighted (GuidedQuant /
+    /// empirical-Fisher) Hessian. `w≡1` reduces to [`Self::calib_hessian_outer_f32`].
+    pub fn calib_hessian_outer_weighted_f32(
+        &mut self,
+        x: &GpuTensor,
+        w: &GpuTensor,
+        h: &GpuTensor,
+        n: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "calib_reduce",
+            crate::kernels::CALIB_REDUCE_SRC,
+            "calib_hessian_outer_weighted_f32",
+        )?;
+        let x_ptr = x.buf.as_ptr();
+        let w_ptr = w.buf.as_ptr();
+        let h_ptr = h.buf.as_ptr();
+        let n_i = n as i32;
+        let k_i = k as i32;
+        let tile = 16u32;
+        let grid_x = ((k as u32) + tile - 1) / tile;
+        let grid_y = ((k as u32) + tile - 1) / tile;
+        let mut params: Vec<*mut c_void> = vec![
+            &x_ptr as *const _ as *mut c_void,
+            &w_ptr as *const _ as *mut c_void,
+            &h_ptr as *const _ as *mut c_void,
+            &n_i as *const _ as *mut c_void,
+            &k_i as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "calib_hessian_outer_weighted_f32",
+            [grid_x, grid_y, 1],
+            [tile, tile, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(x_ptr);
+                blob.push_ptr(w_ptr);
+                blob.push_ptr(h_ptr);
+                blob.push_i32(n_i);
+                blob.push_i32(k_i);
+                blob
+            },
+        )
+    }
+
 
     /// Free a newly allocated ordinary contiguous tensor immediately via HIP
     /// `free`, without returning the buffer to the reusable pool.
@@ -3918,6 +4195,89 @@ impl Gpu {
             self.compiler.compiled_kernels(),
             cu_hint,
         )
+    }
+
+    /// Bulk F32 → BF16 conversion with round-to-nearest-even.
+    ///
+    /// Elementwise `dst[i] = (bf16)src[i]` for `i < nelems`, matching the
+    /// host reference `round_to_bf16` (`crates/hipfire-arch-deepseek4/src/parent/codec.rs:92-110`).
+    /// Used to stage BF16 activations for `gemm_bf16_mfma_gfx942` under
+    /// `HIPFIRE_CALIB_BF16=1` so calibration GEMMs land on the CDNA3 MFMA
+    /// kernel instead of the scalar F32 kernel.
+    pub fn convert_f32_to_bf16(
+        &mut self,
+        src: &GpuTensor,
+        dst: &GpuTensor,
+        nelems: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if nelems == 0 {
+            return Ok(());
+        }
+        let src_need = nelems.checked_mul(4).ok_or_else(|| {
+            HipError::new(0, "convert_f32_to_bf16: nelems*4 overflow")
+        })?;
+        let dst_need = nelems.checked_mul(2).ok_or_else(|| {
+            HipError::new(0, "convert_f32_to_bf16: nelems*2 overflow")
+        })?;
+        if src.buf.size() < src_need {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "convert_f32_to_bf16: src buffer too small (have {} need {src_need} for nelems={nelems})",
+                    src.buf.size()
+                ),
+            ));
+        }
+        if dst.buf.size() < dst_need {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "convert_f32_to_bf16: dst buffer too small (have {} need {dst_need} for nelems={nelems})",
+                    dst.buf.size()
+                ),
+            ));
+        }
+        if nelems > i32::MAX as usize {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "convert_f32_to_bf16: nelems {nelems} exceeds i32::MAX"
+                ),
+            ));
+        }
+        const KERNEL: &str = "convert_f32_to_bf16";
+        const SRC: &str = include_str!("../../../kernels/src/convert_f32_to_bf16.hip");
+        self.ensure_kernel(KERNEL, SRC, KERNEL)?;
+        let src_ptr = src.buf.as_ptr();
+        let dst_ptr = dst.buf.as_ptr();
+        let nelems_i32 = nelems as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &src_ptr as *const _ as *mut c_void,
+            &dst_ptr as *const _ as *mut c_void,
+            &nelems_i32 as *const _ as *mut c_void,
+        ];
+        let grid = nelems.div_ceil(256) as u32;
+        let bytes = src_need + dst_need;
+        let timer = crate::profile::begin_timer(&self.hip, "convert", KERNEL, bytes);
+        let result = self.launch_maybe_blob(
+            KERNEL,
+            [grid, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(src_ptr);
+                blob.push_ptr(dst_ptr);
+                blob.push_i32(nelems_i32);
+                blob
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
     }
 }
 

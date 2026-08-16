@@ -19,6 +19,7 @@ fn proj_gemm_batched(
     x: &GpuTensor,
     y: &GpuTensor,
     x_rot: &GpuTensor,
+    bf16_scratch: &GpuTensor,
     b: usize,
     label: &str,
 ) -> Result<(), String> {
@@ -38,6 +39,76 @@ fn proj_gemm_batched(
             gpu.gemm_mq6g256_batched_lmhead(&w.buf, x_rot, y, w.m, w.k, b)
                 .map_err(|e| format!("glimmer batch {label} (mq6): {e:?}"))
         }
+        DType::F32 => {
+            // BF16 teacher widened to F32 — routed through GemmF32Batched (Always,
+            // gfx942). No new kernel; run_key validates arch + captures for cal.
+            use hipfire_dispatch::context::DispatchCtx;
+            use hipfire_dispatch::families::gemm::GemmParams;
+            use hipfire_dispatch::families::gemv::WeightRef;
+            let ctx = DispatchCtx::new(gpu);
+            let w_ref = WeightRef {
+                buf: &w.buf,
+                dtype: w.gpu_dtype,
+                m: w.m,
+                k: w.k,
+                row_stride: w.k,
+                rotation: None,
+                awq_scale: None,
+            };
+            let params = GemmParams {
+                w: &w_ref,
+                x,
+                y,
+                batch_size: b,
+            };
+            hipfire_runtime::llama::gemm_family()
+                .run_key(
+                    hipfire_dispatch::types::KernelKey::GemmF32Batched,
+                    &ctx,
+                    gpu,
+                    &params,
+                )
+                .map_err(|e| format!("glimmer batch {label} (f32 dispatch): {e:?}"))?;
+            Ok(())
+        }
+        DType::BF16 => {
+            // Calibration capture: F32 source before BF16 staging. Zero-cost when
+            // unarmed (active_capture is None). Do NOT capture the BF16 tensor.
+            gpu.maybe_capture_activation(&w.buf, x, b, w.k);
+            // Calibration BF16 — stage F32 activation to BF16 scratch once per
+            // projection (hoisted at caller for shared x), then MFMA.
+            let x_bf16 = bf16_scratch.sub_offset(0, b * w.k);
+            gpu.convert_f32_to_bf16(x, &x_bf16, b * w.k)
+                .map_err(|e| format!("glimmer batch {label} f32->bf16: {e:?}"))?;
+            use hipfire_dispatch::context::DispatchCtx;
+            use hipfire_dispatch::families::gemm::GemmParams;
+            use hipfire_dispatch::families::gemv::WeightRef;
+            let ctx = DispatchCtx::new(gpu);
+            let w_ref = WeightRef {
+                buf: &w.buf,
+                dtype: w.gpu_dtype,
+                m: w.m,
+                k: w.k,
+                row_stride: w.k,
+                rotation: None,
+                awq_scale: None,
+            };
+            let params = GemmParams {
+                w: &w_ref,
+                x: &x_bf16,
+                y,
+                batch_size: b,
+            };
+            hipfire_runtime::llama::gemm_family()
+                .run_key(
+                    hipfire_dispatch::types::KernelKey::GemmBf16Mfma,
+                    &ctx,
+                    gpu,
+                    &params,
+                )
+                .map_err(|e| format!("glimmer batch {label} (bf16 dispatch): {e:?}"))?;
+            Ok(())
+        }
         _ => {
             for i in 0..b {
                 let x_row = x.sub_offset(i * w.k, w.k);
@@ -48,6 +119,47 @@ fn proj_gemm_batched(
             Ok(())
         }
     }
+}
+
+/// BF16 dispatch helper for hoisted shared-x cases: assumes x_bf16 already
+/// staged (caller did convert_f32_to_bf16 once). Used for q/k/v/attn_gate and
+/// gate/up where one F32 x feeds multiple GEMMs.
+fn dispatch_bf16_batched(
+    gpu: &mut Gpu,
+    w: &WeightTensor,
+    x_bf16: &GpuTensor,
+    y: &GpuTensor,
+    b: usize,
+    label: &str,
+) -> Result<(), String> {
+    use hipfire_dispatch::context::DispatchCtx;
+    use hipfire_dispatch::families::gemm::GemmParams;
+    use hipfire_dispatch::families::gemv::WeightRef;
+    let ctx = DispatchCtx::new(gpu);
+    let w_ref = WeightRef {
+        buf: &w.buf,
+        dtype: w.gpu_dtype,
+        m: w.m,
+        k: w.k,
+        row_stride: w.k,
+        rotation: None,
+        awq_scale: None,
+    };
+    let params = GemmParams {
+        w: &w_ref,
+        x: x_bf16,
+        y,
+        batch_size: b,
+    };
+    hipfire_runtime::llama::gemm_family()
+        .run_key(
+            hipfire_dispatch::types::KernelKey::GemmBf16Mfma,
+            &ctx,
+            gpu,
+            &params,
+        )
+        .map_err(|e| format!("glimmer batch {label} (bf16 hoisted): {e:?}"))?;
+    Ok(())
 }
 
 /// Public entry: stages host tokens/positions into device batch buffers then
@@ -215,6 +327,8 @@ pub(crate) fn forward_decode_batch_prepared_glimmer(
     let tok_view = state.tokens.sub_offset(0, b);
 
     // embedding: batched lookup + scale-less norm into x
+    // F32 has no batched lookup kernel — per-token gather loop (B ≤64, negligible
+    // vs projections). Same approach sibling lfm2moe uses for F32 teachers.
     {
         let ok = match weights.embd_format {
             EmbeddingFormat::HFQ4G256 => {
@@ -232,32 +346,34 @@ pub(crate) fn forward_decode_batch_prepared_glimmer(
                     .map_err(|e| format!("glimmer batch embed q8 batched: {e:?}"))?;
                 true
             }
-            _ => false,
+            EmbeddingFormat::F32 => {
+                // No batched F32 lookup kernel exists — loop per-token over
+                // gpu.embedding_lookup into batch rows (B ≤64, gather cost
+                // negligible beside projections). Tokens are staged on device
+                // in tok_view; download scalar per row.
+                for i in 0..b {
+                    let tok = {
+                        let mut one = [0u8; 4];
+                        let src_ptr = unsafe { (tok_view.buf.as_ptr() as *const u8).add(i * 4) };
+                        let tmp_buf = unsafe {
+                            hip_bridge::DeviceBuffer::from_raw(src_ptr as *mut std::ffi::c_void, 4)
+                        };
+                        gpu.hip
+                            .memcpy_dtoh(&mut one, &tmp_buf)
+                            .map_err(|e| format!("glimmer batch embed f32 fallback dtoh token: {e:?}"))?;
+                        std::mem::forget(tmp_buf);
+                        u32::from_ne_bytes(one)
+                    };
+                    let x_row = x.sub_offset(i * dim, dim);
+                    gpu.embedding_lookup(&weights.embed_tokens, &x_row, tok, dim)
+                        .map_err(|e| format!("glimmer batch embed f32 row {i}: {e:?}"))?;
+                }
+                true
+            }
+            EmbeddingFormat::Q4K => false,
         };
         if !ok {
-            // Fallback per-row for F32 (not admitted by gate, but keep explicit)
-            for i in 0..b {
-                let tok = {
-                    // already staged, but read host tok for scalar lookup
-                    // we have host copy via tok_i32 earlier; instead use weight_gemv style?
-                    // For F32, use embedding_lookup per row
-                    // Need to fetch token id from host; we already have tok_view but need scalar.
-                    // Download one i32
-                    let mut one = [0u8; 4];
-                    let src_ptr = unsafe { (tok_view.buf.as_ptr() as *const u8).add(i * 4) };
-                    let tmp_buf = unsafe {
-                        hip_bridge::DeviceBuffer::from_raw(src_ptr as *mut std::ffi::c_void, 4)
-                    };
-                    gpu.hip
-                        .memcpy_dtoh(&mut one, &tmp_buf)
-                        .map_err(|e| format!("glimmer batch embed fallback dtoh token: {e:?}"))?;
-                    std::mem::forget(tmp_buf);
-                    u32::from_ne_bytes(one)
-                };
-                let x_row = x.sub_offset(i * dim, dim);
-                gpu.embedding_lookup(&weights.embed_tokens, &x_row, tok, dim)
-                    .map_err(|e| format!("glimmer batch embed f32 row {i}: {e:?}"))?;
-            }
+            return Err("glimmer batch: unsupported embedding format Q4K".to_string());
         }
         gpu.rmsnorm_batched(&x, &state.embed_norm_ones, &x, b, dim, rms_eps)
             .map_err(|e| format!("glimmer batch embed_norm batched: {e:?}"))?;
@@ -278,23 +394,80 @@ pub(crate) fn forward_decode_batch_prepared_glimmer(
         gpu.rmsnorm_batched(&x, &lw.input_layernorm, &tmp, b, dim, rms_eps)
             .map_err(|e| format!("glimmer batch L{layer_idx} input rmsnorm: {e:?}"))?;
 
-        // q/k/v/gate projections (separate batched GEMMs, separate rotates)
-        proj_gemm_batched(gpu, &lw.q_proj, &tmp, &q, &x_rot, b, "q_proj")?;
-        proj_gemm_batched(gpu, &lw.k_proj, &tmp, &k, &x_rot, b, "k_proj")?;
-        proj_gemm_batched(gpu, &lw.v_proj, &tmp, &v, &x_rot, b, "v_proj")?;
-        proj_gemm_batched(
-            gpu,
-            &lw.attn_gate_proj,
-            &tmp,
-            &attn_gate,
-            &x_rot,
-            b,
-            "attn_gate",
-        )?;
-
-        // scale-less QK norm + q scale
-        gpu.rmsnorm_batched(&q, &state.qk_norm_ones, &q, b * n_heads, hd, rms_eps)
-            .map_err(|e| format!("glimmer batch L{layer_idx} q_norm: {e:?}"))?;
+        // q/k/v/gate projections: hoist BF16 staging where one x feeds 4 GEMMs.
+        // For BF16 teacher, tmp (F32, B*dim) is converted ONCE to BF16 scratch
+        // (persistent, sized to max_batch*hidden_dim) and reused for all four.
+        // Non-BF16 (Q8/MQ4/F32) keep their existing kernels byte-identically.
+        let bf16_scratch = &state.bf16_scratch;
+        let q_is_bf16 = lw.q_proj.gpu_dtype == DType::BF16;
+        let k_is_bf16 = lw.k_proj.gpu_dtype == DType::BF16;
+        let v_is_bf16 = lw.v_proj.gpu_dtype == DType::BF16;
+        let gate_is_bf16 = lw.attn_gate_proj.gpu_dtype == DType::BF16;
+        let any_qkv_bf16 = q_is_bf16 || k_is_bf16 || v_is_bf16 || gate_is_bf16;
+        if any_qkv_bf16 {
+            // Calibration capture: shared F32 `tmp` (input layernorm output) before
+            // BF16 staging. One capture per BF16 constituent against same tmp.
+            if q_is_bf16 {
+                gpu.maybe_capture_activation(&lw.q_proj.buf, &tmp, b, lw.q_proj.k);
+            }
+            if k_is_bf16 {
+                gpu.maybe_capture_activation(&lw.k_proj.buf, &tmp, b, lw.k_proj.k);
+            }
+            if v_is_bf16 {
+                gpu.maybe_capture_activation(&lw.v_proj.buf, &tmp, b, lw.v_proj.k);
+            }
+            if gate_is_bf16 {
+                gpu.maybe_capture_activation(&lw.attn_gate_proj.buf, &tmp, b, lw.attn_gate_proj.k);
+            }
+            // Stage once, reuse for all BF16 projections in this group.
+            // BF16 scratch is sized to hidden_dim, but we only need dim prefix.
+            let bf16_tmp = bf16_scratch.sub_offset(0, b * dim);
+            gpu.convert_f32_to_bf16(&tmp, &bf16_tmp, b * dim)
+                .map_err(|e| format!("glimmer batch L{layer_idx} f32->bf16 qkv: {e:?}"))?;
+            if q_is_bf16 {
+                dispatch_bf16_batched(gpu, &lw.q_proj, &bf16_tmp, &q, b, "q_proj")?;
+            } else {
+                proj_gemm_batched(gpu, &lw.q_proj, &tmp, &q, &x_rot, bf16_scratch, b, "q_proj")?;
+            }
+            if k_is_bf16 {
+                dispatch_bf16_batched(gpu, &lw.k_proj, &bf16_tmp, &k, b, "k_proj")?;
+            } else {
+                proj_gemm_batched(gpu, &lw.k_proj, &tmp, &k, &x_rot, bf16_scratch, b, "k_proj")?;
+            }
+            if v_is_bf16 {
+                dispatch_bf16_batched(gpu, &lw.v_proj, &bf16_tmp, &v, b, "v_proj")?;
+            } else {
+                proj_gemm_batched(gpu, &lw.v_proj, &tmp, &v, &x_rot, bf16_scratch, b, "v_proj")?;
+            }
+            if gate_is_bf16 {
+                dispatch_bf16_batched(gpu, &lw.attn_gate_proj, &bf16_tmp, &attn_gate, b, "attn_gate")?;
+            } else {
+                proj_gemm_batched(
+                    gpu,
+                    &lw.attn_gate_proj,
+                    &tmp,
+                    &attn_gate,
+                    &x_rot,
+                    bf16_scratch,
+                    b,
+                    "attn_gate",
+                )?;
+            }
+        } else {
+            proj_gemm_batched(gpu, &lw.q_proj, &tmp, &q, &x_rot, bf16_scratch, b, "q_proj")?;
+            proj_gemm_batched(gpu, &lw.k_proj, &tmp, &k, &x_rot, bf16_scratch, b, "k_proj")?;
+            proj_gemm_batched(gpu, &lw.v_proj, &tmp, &v, &x_rot, bf16_scratch, b, "v_proj")?;
+            proj_gemm_batched(
+                gpu,
+                &lw.attn_gate_proj,
+                &tmp,
+                &attn_gate,
+                &x_rot,
+                bf16_scratch,
+                b,
+                "attn_gate",
+            )?;
+        }
         gpu.rmsnorm_batched(&k, &state.qk_norm_ones, &k, b * n_kv, hd, rms_eps)
             .map_err(|e| format!("glimmer batch L{layer_idx} k_norm: {e:?}"))?;
         gpu.scale_f32(&q, cfg.qk_scale_factor)
@@ -395,12 +568,8 @@ pub(crate) fn forward_decode_batch_prepared_glimmer(
             }
         }
 
-        // gated attention
-        gpu.sigmoid_mul_f32(&attn_out, &attn_gate)
-            .map_err(|e| format!("glimmer batch L{layer_idx} sigmoid_mul: {e:?}"))?;
-
         // o_proj
-        proj_gemm_batched(gpu, &lw.o_proj, &attn_out, &o_out, &x_rot, b, "o_proj")?;
+        proj_gemm_batched(gpu, &lw.o_proj, &attn_out, &o_out, &x_rot, bf16_scratch, b, "o_proj")?;
 
         // sandwich post-attention norm + residual: x = residual + norm(o_out)
         gpu.rmsnorm_batched(
@@ -429,8 +598,35 @@ pub(crate) fn forward_decode_batch_prepared_glimmer(
         gpu.rmsnorm_batched(&x, &lw.pre_feedforward_layernorm, &tmp, b, dim, rms_eps)
             .map_err(|e| format!("glimmer batch L{layer_idx} pre_ffn rmsnorm: {e:?}"))?;
 
-        proj_gemm_batched(gpu, &lw.gate_proj, &tmp, &gate, &x_rot, b, "gate_proj")?;
-        proj_gemm_batched(gpu, &lw.up_proj, &tmp, &up, &x_rot, b, "up_proj")?;
+        // gate/up share same tmp (pre_ffn norm output) — hoist BF16 staging once.
+        let gate_is_bf16 = lw.gate_proj.gpu_dtype == DType::BF16;
+        let up_is_bf16 = lw.up_proj.gpu_dtype == DType::BF16;
+        let any_gate_up_bf16 = gate_is_bf16 || up_is_bf16;
+        if any_gate_up_bf16 {
+            // Calibration capture: shared F32 `tmp` (pre_ffn norm output) before BF16 staging.
+            if gate_is_bf16 {
+                gpu.maybe_capture_activation(&lw.gate_proj.buf, &tmp, b, lw.gate_proj.k);
+            }
+            if up_is_bf16 {
+                gpu.maybe_capture_activation(&lw.up_proj.buf, &tmp, b, lw.up_proj.k);
+            }
+            let bf16_tmp2 = bf16_scratch.sub_offset(0, b * dim);
+            gpu.convert_f32_to_bf16(&tmp, &bf16_tmp2, b * dim)
+                .map_err(|e| format!("glimmer batch L{layer_idx} f32->bf16 gate_up: {e:?}"))?;
+            if gate_is_bf16 {
+                dispatch_bf16_batched(gpu, &lw.gate_proj, &bf16_tmp2, &gate, b, "gate_proj")?;
+            } else {
+                proj_gemm_batched(gpu, &lw.gate_proj, &tmp, &gate, &x_rot, bf16_scratch, b, "gate_proj")?;
+            }
+            if up_is_bf16 {
+                dispatch_bf16_batched(gpu, &lw.up_proj, &bf16_tmp2, &up, b, "up_proj")?;
+            } else {
+                proj_gemm_batched(gpu, &lw.up_proj, &tmp, &up, &x_rot, bf16_scratch, b, "up_proj")?;
+            }
+        } else {
+            proj_gemm_batched(gpu, &lw.gate_proj, &tmp, &gate, &x_rot, bf16_scratch, b, "gate_proj")?;
+            proj_gemm_batched(gpu, &lw.up_proj, &tmp, &up, &x_rot, bf16_scratch, b, "up_proj")?;
+        }
 
         gpu.silu_mul_f32(&gate, &up, &ffn_hidden)
             .map_err(|e| format!("glimmer batch L{layer_idx} silu_mul: {e:?}"))?;
@@ -441,10 +637,10 @@ pub(crate) fn forward_decode_batch_prepared_glimmer(
             &ffn_hidden,
             &ffn_out,
             &down_rot,
+            bf16_scratch,
             b,
             "down_proj",
         )?;
-
         gpu.rmsnorm_batched(
             &ffn_out,
             &lw.post_feedforward_layernorm,
@@ -477,6 +673,9 @@ pub(crate) fn forward_decode_batch_prepared_glimmer(
     .map_err(|e| format!("glimmer batch final rmsnorm: {e:?}"))?;
 
     // lm_head -> logits (batched)
+    // Q8_0: batched chunked (WMMA). F32: generic batched GEMM (GemmF32Batched,
+    // Always on gfx942). BF16: MFMA (GemmBf16Mfma on gfx942) via convert + dispatch.
+    // No dedicated F32/BF16 batched-lmhead kernel exists — route through generic.
     match weights.lm_head.gpu_dtype {
         DType::Q8_0 => {
             gpu.gemm_q8_0_batched_chunked(
@@ -488,6 +687,71 @@ pub(crate) fn forward_decode_batch_prepared_glimmer(
                 b,
             )
             .map_err(|e| format!("glimmer batch lm_head q8 batched: {e:?}"))?;
+        }
+        DType::F32 => {
+            use hipfire_dispatch::context::DispatchCtx;
+            use hipfire_dispatch::families::gemm::GemmParams;
+            use hipfire_dispatch::families::gemv::WeightRef;
+            let ctx = DispatchCtx::new(gpu);
+            let w_ref = WeightRef {
+                buf: &weights.lm_head.buf,
+                dtype: weights.lm_head.gpu_dtype,
+                m: cfg.vocab_size,
+                k: dim,
+                row_stride: dim,
+                rotation: None,
+                awq_scale: None,
+            };
+            let params = GemmParams {
+                w: &w_ref,
+                x: &final_hidden_view,
+                y: &logits_view,
+                batch_size: b,
+            };
+            hipfire_runtime::llama::gemm_family()
+                .run_key(
+                    hipfire_dispatch::types::KernelKey::GemmF32Batched,
+                    &ctx,
+                    gpu,
+                    &params,
+                )
+                .map_err(|e| format!("glimmer batch lm_head f32 dispatch: {e:?}"))?;
+        }
+        DType::BF16 => {
+            // Calibration capture: F32 `final_hidden_view` before BF16 staging. Single projection.
+            gpu.maybe_capture_activation(&weights.lm_head.buf, &final_hidden_view, b, dim);
+            // BF16 lm_head: stage F32 hidden to BF16 scratch (persistent, sized to hidden_dim)
+            // then MFMA. Reuses same bf16_scratch as projections (max hidden_dim).
+            let bf16_hidden = state.bf16_scratch.sub_offset(0, b * dim);
+            gpu.convert_f32_to_bf16(&final_hidden_view, &bf16_hidden, b * dim)
+                .map_err(|e| format!("glimmer batch lm_head bf16 convert: {e:?}"))?;
+            use hipfire_dispatch::context::DispatchCtx;
+            use hipfire_dispatch::families::gemm::GemmParams;
+            use hipfire_dispatch::families::gemv::WeightRef;
+            let ctx = DispatchCtx::new(gpu);
+            let w_ref = WeightRef {
+                buf: &weights.lm_head.buf,
+                dtype: weights.lm_head.gpu_dtype,
+                m: cfg.vocab_size,
+                k: dim,
+                row_stride: dim,
+                rotation: None,
+                awq_scale: None,
+            };
+            let params = GemmParams {
+                w: &w_ref,
+                x: &bf16_hidden,
+                y: &logits_view,
+                batch_size: b,
+            };
+            hipfire_runtime::llama::gemm_family()
+                .run_key(
+                    hipfire_dispatch::types::KernelKey::GemmBf16Mfma,
+                    &ctx,
+                    gpu,
+                    &params,
+                )
+                .map_err(|e| format!("glimmer batch lm_head bf16 dispatch: {e:?}"))?;
         }
         _ => {
             for i in 0..b {
@@ -512,4 +776,5 @@ pub(crate) fn forward_decode_batch_prepared_glimmer(
         .map_err(|e| format!("glimmer batch softcap: {e:?}"))?;
     }
     Ok(())
+
 }

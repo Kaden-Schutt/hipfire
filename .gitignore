@@ -174,3 +174,7 @@ crates/hipfire-arch-deepseek4/reference_oracle/model.py
 crates/hipfire-arch-deepseek4/reference_oracle/kernel.py
 crates/hipfire-arch-deepseek4/reference_oracle/config.json
 crates/hipfire-arch-deepseek4/reference_oracle/__pycache__/
+
+# MI300X calibration deployment bundles (regenerable)
+dist/
+dist_test/

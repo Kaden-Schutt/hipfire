@@ -70,6 +70,7 @@ pub mod semantic;
 pub mod session_table;
 pub mod tokenizer;
 
+pub mod calibration;
 pub mod tool_call;
 pub mod weight_backend;
 

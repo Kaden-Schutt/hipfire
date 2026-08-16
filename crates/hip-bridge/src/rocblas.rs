@@ -53,6 +53,8 @@ pub enum RocblasOperation {
 pub enum RocblasDatatype {
     F16 = 150,
     F32 = 151,
+    /// `rocblas_datatype_f64_r = 152` — FP64 real.
+    F64 = 152,
     Bf16 = 168,
 }
 
@@ -128,6 +130,31 @@ type RocblasGemmExGetSolutionsFn = unsafe extern "C" fn(
     *mut i32, // list_array, list_size
 ) -> u32;
 
+/// FP64 typed GEMM: `rocblas_dgemm`.
+///
+/// Signature per rocblas.h:
+/// `rocblas_status rocblas_dgemm(rocblas_handle, rocblas_operation transA,
+///  rocblas_operation transB, rocblas_int m, rocblas_int n, rocblas_int k,
+///  const double *alpha, const double *A, rocblas_int lda,
+///  const double *B, rocblas_int ldb, const double *beta,
+///  double *C, rocblas_int ldc)`
+type RocblasDgemmFn = unsafe extern "C" fn(
+    RocblasHandle,
+    c_uint, // transA
+    c_uint, // transB
+    c_int,  // m
+    c_int,  // n
+    c_int,  // k
+    *const f64,
+    *const f64,
+    c_int, // A, lda
+    *const f64,
+    c_int, // B, ldb
+    *const f64,
+    *mut f64,
+    c_int, // C, ldc
+) -> u32;
+
 /// Loaded rocBLAS library + resolved function pointers.
 pub struct Rocblas {
     _lib: Library,
@@ -137,6 +164,7 @@ pub struct Rocblas {
     fn_set_stream: unsafe extern "C" fn(RocblasHandle, *mut c_void) -> u32,
     fn_gemm_ex: RocblasGemmExFn,
     fn_gemm_ex_get_solutions: Option<RocblasGemmExGetSolutionsFn>,
+    fn_dgemm: Option<RocblasDgemmFn>,
 }
 
 impl Rocblas {
@@ -194,6 +222,15 @@ impl Rocblas {
                 .get::<RocblasGemmExGetSolutionsFn>(b"rocblas_gemm_ex_get_solutions")
                 .ok()
                 .map(|symbol| *symbol);
+            // rocblas_dgemm is the typed FP64 entry point. It is resolved
+            // optionally so a library that only exposes gemm_ex (or no FP64
+            // at all) does not make Rocblas::load itself fail; callers that
+            // need FP64 should fall back to gemm_ex with F64 datatypes when
+            // this is None.
+            let fn_dgemm = lib
+                .get::<RocblasDgemmFn>(b"rocblas_dgemm")
+                .ok()
+                .map(|symbol| *symbol);
 
             let fn_create_handle = *fn_create_handle;
             let fn_destroy_handle = *fn_destroy_handle;
@@ -216,6 +253,7 @@ impl Rocblas {
                 fn_set_stream,
                 fn_gemm_ex,
                 fn_gemm_ex_get_solutions,
+                fn_dgemm,
             })
         }
     }
@@ -232,6 +270,19 @@ impl Rocblas {
             })
         }
     }
+    /// Raw rocBLAS handle for sharing with rocSOLVER.
+    ///
+    /// rocSOLVER reuse: rocSOLVER shares `rocblas_handle` — callers that load
+    /// `Rocsolver` must supply this handle rather than creating a second one.
+    /// The `Rocblas` instance must outlive any `Rocsolver` that borrows it.
+    pub fn handle(&self) -> *mut c_void {
+        self.handle
+    }
+
+    /// Whether this installation exports `rocblas_dgemm` (FP64 typed GEMM).
+    pub fn has_dgemm(&self) -> bool {
+        self.fn_dgemm.is_some()
+    }
 
     /// Whether this installation exports the beta solution-enumeration API.
     ///
@@ -241,6 +292,78 @@ impl Rocblas {
         self.fn_gemm_ex_get_solutions.is_some()
     }
 
+    /// FP64 GEMM wrapping `rocblas_dgemm` (column-major).
+    ///
+    /// Computes `C = alpha * op(A) * op(B) + beta * C` where `A, B, C` are
+    /// device pointers to FP64 column-major matrices. This is the typed
+    /// `rocblas_dgemm` entry point (not `gemm_ex`).
+    ///
+    /// # Memory layout
+    ///
+    /// rocBLAS (like BLAS/LAPACK) is **column-major**. `lda`, `ldb`, `ldc`
+    /// are leading dimensions in the column-major sense (`lda >= max(1,m)` when
+    /// not transposed). Callers that hold row-major data (Rust/C default) must
+    /// transpose the problem: a row-major `A*B` is equivalent to
+    /// `B^T * A^T` column-major, i.e. swap `A↔B`, `m↔n`, and transpose flags.
+    /// A silent row/column mismatch transposes every Hessian inverse.
+    ///
+    /// Design choice: exposed alongside `gemm_ex`.
+    /// `gemm_ex` with `RocblasDatatype::F64` already supports FP64 but carries
+    /// the full type/algo selection surface. `dgemm` is the simpler
+    /// strongly-typed path — fixed to `f64` with fewer mismatched-type errors,
+    /// mirroring the C library's `rocblas_dgemm` and matching the GPTQ caller's
+    /// "plain dense multiply of device pointers" requirement. Both assume
+    /// column-major; callers choose one.
+    ///
+    /// Soft failure: if `rocblas_dgemm` was not resolved (older library), returns
+    /// `Err` with `status==0` so the caller can fall back to `gemm_ex(F64)` or
+    /// to the CPU path. Absence of `librocblas.so` already fails at `load()`.
+    ///
+    /// # Safety
+    ///
+    /// All matrix and scalar pointers must be valid device pointers for the
+    /// rocBLAS call and remain alive for the duration of the call / stream.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn dgemm(
+        &self,
+        trans_a: RocblasOperation,
+        trans_b: RocblasOperation,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: *const f64,
+        a: *const f64,
+        lda: i32,
+        b: *const f64,
+        ldb: i32,
+        beta: *const f64,
+        c: *mut f64,
+        ldc: i32,
+    ) -> RocblasResult<()> {
+        let Some(dgemm) = self.fn_dgemm else {
+            return Err(RocblasError {
+                status: 0,
+                context: "rocblas_dgemm unavailable (symbol not resolved)".into(),
+            });
+        };
+        let st = dgemm(
+            self.handle,
+            trans_a as c_uint,
+            trans_b as c_uint,
+            m,
+            n,
+            k,
+            alpha,
+            a,
+            lda,
+            b,
+            ldb,
+            beta,
+            c,
+            ldc,
+        );
+        check_rocblas_status(st, "rocblas_dgemm")
+    }
     /// Column-major GEMM (rocBLAS convention) wrapping `rocblas_gemm_ex`.
     ///
     /// Computes D = alpha * op(A) * op(B) + beta * C with independent dtype

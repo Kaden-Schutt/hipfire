@@ -254,6 +254,10 @@ fn load_f32_vec(hfq: &HfqFile, name: &str, expected_n: usize) -> Result<Vec<f32>
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
+        16 => data
+            .chunks_exact(2)
+            .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+            .collect(),
         qt => return Err(format!("gemma4-drafter: expected F16/F32 for {name}, got qt={qt}")),
     };
     Ok(f32_data)
@@ -294,11 +298,31 @@ fn load_wt(
     let (info, data) = hfq
         .tensor_data(name)
         .ok_or_else(|| format!("gemma4-drafter: tensor not found: {name}"))?;
-    if info.quant_type == 1 {
-        let f32_data: Vec<f32> = data
-            .chunks_exact(2)
-            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-            .collect();
+    if info.quant_type == 1 || info.quant_type == 16 {
+        if info.quant_type == 16 && rdna_compute::calib_force_bf16() {
+            // Native BF16 teacher — keep raw BF16 for consistency (drafter decode is GEMV, not batched MFMA).
+            let buf = gpu
+                .upload_raw(data, &[m, k])
+                .map_err(|e| format!("gemma4-drafter: upload BF16 {name}: {e:?}"))?;
+            return Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::BF16,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            });
+        }
+        let f32_data: Vec<f32> = if info.quant_type == 16 {
+            data.chunks_exact(2)
+                .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+                .collect()
+        } else {
+            data.chunks_exact(2)
+                .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .collect()
+        };
         let bytes: &[u8] = unsafe {
             std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
         };
@@ -421,6 +445,18 @@ impl Gemma4DrafterWeights {
                 let f32_data: Vec<f32> = embed_data
                     .chunks_exact(2)
                     .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                    .collect();
+                (
+                    gpu.upload_f32(&f32_data, &[cfg.vocab_size, hidden])
+                        .map_err(|e| format!("gemma4-drafter: upload embed f32: {e:?}"))?,
+                    DType::F32,
+                    false,
+                )
+            }
+            16 => {
+                let f32_data: Vec<f32> = embed_data
+                    .chunks_exact(2)
+                    .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
                     .collect();
                 (
                     gpu.upload_f32(&f32_data, &[cfg.vocab_size, hidden])

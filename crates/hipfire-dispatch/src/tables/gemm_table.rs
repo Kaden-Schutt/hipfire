@@ -135,6 +135,18 @@ pub fn populate(registry: &mut KernelRegistry) {
         has_awq: false,
         tile: TileImpl::None,
     });
+    // BF16 MFMA — CDNA3 `v_mfma_f32_16x16x16bf16_1k`, gfx942 source only.
+    // The batched path for native-BF16 reference/teacher weights; already
+    // proven on gfx942 by the deepseek4 parent projections, which call
+    // `gemm_bf16_mfma_gfx942` directly.
+    registry.register(KernelVariant {
+        key: KernelKey::GemmBf16Mfma,
+        arch_required: ArchPredicate::IsGfx942,
+        shape_gate: None,
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
+        tile: TileImpl::None,
+    });
     // Q8_0 WMMA x64 (N%64 layout) — gfx11-family wave32 WMMA only
     // (gemm_q8_0_wmma.hip, no gfx12 sibling) → HasWmmaW32, NOT HasWmma.
     registry.register(KernelVariant {

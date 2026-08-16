@@ -57,6 +57,11 @@ impl GemmFamily {
         let key = match dtype {
             DType::F32 => KernelKey::GemmF32RegisterTiled,
             DType::F16 => KernelKey::GemmF16XF16Wmma,
+            // Native BF16 stays BF16: on gfx942 this is the MFMA GEMM. On any
+            // other arch the registry rejects IsGfx942 and resolve() returns
+            // UnsupportedVariant, so a caller must fall back explicitly rather
+            // than silently landing on a scalar kernel.
+            DType::BF16 => KernelKey::GemmBf16Mfma,
             DType::Q8_0 => {
                 let preferred = KernelKey::GemmQ8_0Wmma;
                 if self.registry.resolve(preferred, ctx, shape).is_ok() {
@@ -135,6 +140,25 @@ impl GemmFamily {
         let m = w.m;
         let k = w.k;
 
+        // Calibration tap. This is the batched chokepoint for every arch that
+        // migrated off `llama::weight_gemm` onto dispatcher-entry keys —
+        // gemma4 (`lowered.rs:173`), muse-glimmer (`forward.rs:80`) and
+        // qwen35's migrated prefill sites. Without it those arches capture
+        // NOTHING on the batched path, because `weight_gemm`'s tap never runs
+        // for them. `batch_size` is the real row count, so one prefill call
+        // contributes that many rows to H and Σx².
+        // Zero cost when unarmed (`active_capture.is_none()` early-returns).
+        //
+        // A BF16 `x` is a STAGED copy of an F32 activation, produced by an arch
+        // for GemmBf16Mfma. Do not capture it: the collector copies `n*k` F32
+        // elements, so a 2-byte-per-element buffer overruns (assert in
+        // `memcpy_dtod_at`), and even sized correctly it would record the
+        // bf16-rounded activation rather than the true one. Arches that stage
+        // MUST capture the original F32 source before converting.
+        if x.dtype != DType::BF16 {
+            gpu.maybe_capture_activation(w.buf, x, batch_size, k);
+        }
+
         macro_rules! hip {
             ($e:expr) => {
                 $e.map_err(|e| DispatchError::Hip(e.to_string()))
@@ -158,6 +182,25 @@ impl GemmFamily {
             K::GemmF16WmmaMb4 => hip!(gpu.gemm_f16_wmma_mb4(w.buf, x, y, m, k, batch_size)),
             K::GemmF16WmmaMb8 => hip!(gpu.gemm_f16_wmma_mb8(w.buf, x, y, m, k, batch_size)),
             K::GemmF32Batched => hip!(gpu.gemm_f32_batched(w.buf, x, y, m, k, batch_size)),
+            // Pure BF16 x BF16 -> F32. Takes `&DeviceBuffer` rather than the
+            // family's `&GpuTensor` convention, so reach through to the buffers.
+            //
+            // The activation MUST already be BF16. The wrapper only checks that
+            // `B` is large enough (batch*k*2), and an F32 activation buffer is
+            // batch*k*4 bytes — it passes that check and the kernel then reads
+            // F32 bytes as BF16, producing garbage with no diagnostic. Refuse
+            // instead: callers stage to BF16 before dispatching here.
+            K::GemmBf16Mfma => {
+                if x.dtype != DType::BF16 {
+                    return Err(DispatchError::UnsupportedVariant {
+                        family: "gemm",
+                        variant: "bf16_mfma_needs_bf16_activation",
+                        arch: "gfx942",
+                        quant: "",
+                    });
+                }
+                hip!(gpu.gemm_bf16_mfma_gfx942(&w.buf.buf, &x.buf, &y.buf, m, k, batch_size))
+            }
             K::GemmQ8_0WmmaX64 => hip!(gpu.gemm_q8_0_wmma_x64(w.buf, x, y, m, k, batch_size)),
             K::GemmQ8_0ResidualWmma => hip!(gpu.gemm_q8_0_residual_wmma(w.buf, x, y, m, k, batch_size)),
             K::GemmQ8_0ResidualWmmaGfx12 => hip!(gpu.gemm_q8_0_residual_wmma_gfx12(w.buf, x, y, m, k, batch_size)),

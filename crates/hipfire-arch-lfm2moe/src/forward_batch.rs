@@ -57,7 +57,11 @@ pub fn batch_weight_formats_supported(weights: &Lfm2MoeWeights) -> Result<(), St
 
 /// Single batched GEMM helper for dense projections.
 /// Supports Q8_0, HFQ4G256 directly; MQ4G256 via FWHT rotation into caller-provided
-/// scratch (must have capacity n*k). One GEMM per weight, no per-lane loop.
+/// scratch (must have capacity n*k); F32 via `gemm_f32_batched` (Always-available,
+/// used for BF16→F32 widened teachers, fallback when BF16 MFMA not available);
+/// BF16 via `GemmBf16Mfma` (gfx942 MFMA, `v_mfma_f32_16x16x16bf16_1k`) with F32→BF16
+/// staging into caller-provided persistent `bf16_scratch` (max_batch*max_k BF16,
+/// never per-call allocated). One GEMM per weight, no per-lane loop.
 fn batched_proj(
     gpu: &mut Gpu,
     w: &hipfire_runtime::llama::WeightTensor,
@@ -65,8 +69,69 @@ fn batched_proj(
     y: &rdna_compute::GpuTensor,
     batch: usize,
     rot_scratch: &rdna_compute::GpuTensor,
+    bf16_scratch: &rdna_compute::GpuTensor,
 ) -> HipResult<()> {
+    // Calibration tap #3. lfm2 bypasses BOTH other taps: it never calls
+    // `llama::weight_gemm` (tap 1) and never routes through
+    // `GemmFamily::run_key` (tap 2) — it calls the rdna-compute GEMM methods
+    // directly, below. Without this line arch 11 captures nothing on the
+    // batched path.
+    //
+    // Placed BEFORE the dtype match on purpose: the MQ4G256 arm rotates `x`
+    // into `rot_scratch`, and the Hessian/imatrix contract is the PRE-rotation
+    // activation (AWQ's per-channel importance only exists in the unrotated
+    // basis). Capturing `rot` instead would be silently wrong. For BF16,
+    // capturing the original F32 x is correct; staging to BF16 is post-capture.
+    gpu.maybe_capture_activation(&w.buf, x, batch, w.k);
     match w.gpu_dtype {
+        DType::BF16 => {
+            let needed = batch.checked_mul(w.k).ok_or_else(|| {
+                HipError::new(0, "batched_proj BF16: batch*k overflow")
+            })?;
+            if bf16_scratch.numel() < needed {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "batched_proj BF16: bf16_scratch too small {} < {} (batch {batch} * k {})",
+                        bf16_scratch.numel(),
+                        needed,
+                        w.k
+                    ),
+                ));
+            }
+            let bf16_x = bf16_scratch.sub_offset(0, needed);
+            gpu.convert_f32_to_bf16(x, &bf16_x, needed)
+                .map_err(|e| HipError::new(0, &format!("batched_proj BF16 staging: {e:?}")))?;
+            use hipfire_dispatch::context::DispatchCtx;
+            use hipfire_dispatch::families::gemm::GemmParams;
+            use hipfire_dispatch::families::gemv::WeightRef;
+            let ctx = DispatchCtx::new(gpu);
+            let w_ref = WeightRef {
+                buf: &w.buf,
+                dtype: w.gpu_dtype,
+                m: w.m,
+                k: w.k,
+                row_stride: w.k,
+                rotation: None,
+                awq_scale: None,
+            };
+            let params = GemmParams {
+                w: &w_ref,
+                x: &bf16_x,
+                y,
+                batch_size: batch,
+            };
+            hipfire_runtime::llama::gemm_family()
+                .run_key(
+                    hipfire_dispatch::types::KernelKey::GemmBf16Mfma,
+                    &ctx,
+                    gpu,
+                    &params,
+                )
+                .map_err(|e| HipError::new(0, &e.to_string()))?;
+            Ok(())
+        }
+        DType::F32 => gpu.gemm_f32_batched(&w.buf, x, y, w.m, w.k, batch),
         DType::Q8_0 => gpu.gemm_q8_0_batched_chunked(&w.buf, x, y, w.m, w.k, batch),
         DType::HFQ4G256 => gpu.gemm_hfq4g256(&w.buf, x, y, w.m, w.k, batch),
         DType::MQ4G256 => {
@@ -90,7 +155,7 @@ fn batched_proj(
         }
         other => Err(HipError::new(
             0,
-            &format!("batched_proj: unsupported dtype {other:?} (expected Q8/HFQ4/MQ4)"),
+            &format!("batched_proj: unsupported dtype {other:?} (expected Q8/HFQ4/MQ4/F32/BF16)"),
         )),
     }
 }
@@ -102,8 +167,66 @@ fn lm_head_batched_lfm(
     rot: &rdna_compute::GpuTensor,
     logits: &rdna_compute::GpuTensor,
     batch_size: usize,
+    bf16_scratch: &rdna_compute::GpuTensor,
 ) -> HipResult<()> {
     match out_weight.gpu_dtype {
+        DType::BF16 => {
+            let needed = batch_size.checked_mul(out_weight.k).ok_or_else(|| {
+                HipError::new(0, "lm_head BF16: batch*k overflow")
+            })?;
+            if bf16_scratch.numel() < needed {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "lm_head BF16: bf16_scratch too small {} < {} (batch {batch_size} * k {})",
+                        bf16_scratch.numel(),
+                        needed,
+                        out_weight.k
+                    ),
+                ));
+            }
+            let bf16_x = bf16_scratch.sub_offset(0, needed);
+            gpu.convert_f32_to_bf16(hidden, &bf16_x, needed)
+                .map_err(|e| HipError::new(0, &format!("lm_head BF16 staging: {e:?}")))?;
+            use hipfire_dispatch::context::DispatchCtx;
+            use hipfire_dispatch::families::gemm::GemmParams;
+            use hipfire_dispatch::families::gemv::WeightRef;
+            let ctx = DispatchCtx::new(gpu);
+            let w_ref = WeightRef {
+                buf: &out_weight.buf,
+                dtype: out_weight.gpu_dtype,
+                m: out_weight.m,
+                k: out_weight.k,
+                row_stride: out_weight.k,
+                rotation: None,
+                awq_scale: None,
+            };
+            let params = GemmParams {
+                w: &w_ref,
+                x: &bf16_x,
+                y: logits,
+                batch_size,
+            };
+            hipfire_runtime::llama::gemm_family()
+                .run_key(
+                    hipfire_dispatch::types::KernelKey::GemmBf16Mfma,
+                    &ctx,
+                    gpu,
+                    &params,
+                )
+                .map_err(|e| HipError::new(0, &e.to_string()))?;
+            Ok(())
+        }
+        // F32 has no dedicated *_batched_lmhead kernel — the generic batched GEMM
+        // is the correct path (same grid as the other F32 projections).
+        DType::F32 => gpu.gemm_f32_batched(
+            &out_weight.buf,
+            hidden,
+            logits,
+            out_weight.m,
+            out_weight.k,
+            batch_size,
+        ),
         DType::Q8_0 => gpu.gemm_q8_0_batched_chunked(
             &out_weight.buf,
             hidden,
@@ -254,6 +377,20 @@ pub fn prepare_decode_batch_inputs_lfm(
                 cfg.hidden_size,
             )?
         }
+        // F32 table (a BF16 teacher widens its embedding to F32 — see
+        // `lfm2moe.rs` embed loaders). There is no batched F32 lookup kernel, so
+        // gather row by row into the batch tensor. This is a dtod row copy per
+        // token, not a GEMM: at B=2048 x hidden=1024 it is ~8 MB of copies
+        // against multi-GFLOP projections, i.e. noise. Without this arm a
+        // full-precision teacher cannot run the batched path at all.
+        hipfire_runtime::llama::EmbeddingFormat::F32 => {
+            for i in 0..n {
+                let row = state
+                    .x_batch
+                    .sub_offset(i * cfg.hidden_size, cfg.hidden_size);
+                gpu.embedding_lookup(&weights.embed, &row, tokens[i], cfg.hidden_size)?;
+            }
+        }
         _ => {
             return Err(HipError::new(
                 0,
@@ -348,7 +485,7 @@ pub fn forward_decode_batch_prepared_lfm(
         match &layer.mixer {
             crate::lfm2moe::Mixer::Conv(c) => {
                 // in_proj batched: tmp [n, hidden] -> bcx [n, 3*hidden]
-                batched_proj(gpu, &c.in_proj, &tmp, &bcx, n, &state.proj_rot).map_err(|e| {
+                batched_proj(gpu, &c.in_proj, &tmp, &bcx, n, &state.proj_rot, &state.bf16_scratch).map_err(|e| {
                     HipError::new(0, &format!("lfm batch L{l} conv in_proj: {e:?}"))
                 })?;
 
@@ -372,7 +509,7 @@ pub fn forward_decode_batch_prepared_lfm(
                 // out_proj + residual: y -> x   (one batched GEMM then add)
                 // Use fa_out as temp for out_proj output (reusing attention scratch, not live in conv layer)
                 let tmp_out = fa_out.sub_offset(0, n * hidden);
-                batched_proj(gpu, &c.out_proj, &y, &tmp_out, n, &state.proj_rot).map_err(|e| {
+                batched_proj(gpu, &c.out_proj, &y, &tmp_out, n, &state.proj_rot, &state.bf16_scratch).map_err(|e| {
                     HipError::new(0, &format!("lfm batch L{l} conv out_proj: {e:?}"))
                 })?;
                 gpu.add_inplace_f32(&x, &tmp_out).map_err(|e| {
@@ -380,13 +517,91 @@ pub fn forward_decode_batch_prepared_lfm(
                 })?;
             }
             crate::lfm2moe::Mixer::Attention(a) => {
-                // q/k/v projections batched (Q8/HFQ4/MQ4 via one GEMM per weight)
-                batched_proj(gpu, &a.wq, &tmp, &fq, n, &state.proj_rot)
-                    .map_err(|e| HipError::new(0, &format!("lfm batch L{l} q_proj: {e:?}")))?;
-                batched_proj(gpu, &a.wk, &tmp, &fk, n, &state.proj_rot)
-                    .map_err(|e| HipError::new(0, &format!("lfm batch L{l} k_proj: {e:?}")))?;
-                batched_proj(gpu, &a.wv, &tmp, &fv, n, &state.proj_rot)
-                    .map_err(|e| HipError::new(0, &format!("lfm batch L{l} v_proj: {e:?}")))?;
+                // Hoisted BF16 staging for shared tmp -> q/k/v (stage ONCE, reuse).
+                // When any of q/k/v is BF16, convert tmp [n,hidden] once to
+                // bf16_scratch and reuse for all BF16 among them; non-BF16 go
+                // through batched_proj (Q8/HFQ4/MQ4/F32). This avoids 3x
+                // convert_f32_to_bf16 for the same activation.
+                let attn_needs_bf16 = matches!(a.wq.gpu_dtype, DType::BF16)
+                    || matches!(a.wk.gpu_dtype, DType::BF16)
+                    || matches!(a.wv.gpu_dtype, DType::BF16);
+                let bf16_tmp = if attn_needs_bf16 {
+                    let needed = n.checked_mul(hidden).ok_or_else(|| {
+                        HipError::new(0, "attn BF16 hoist: n*hidden overflow")
+                    })?;
+                    if state.bf16_scratch.numel() < needed {
+                        return Err(HipError::new(
+                            0,
+                            &format!(
+                                "attn BF16 hoist: bf16_scratch {} < {}",
+                                state.bf16_scratch.numel(),
+                                needed
+                            ),
+                        ));
+                    }
+                    let bf16_slice = state.bf16_scratch.sub_offset(0, needed);
+                    gpu.convert_f32_to_bf16(&tmp, &bf16_slice, needed)
+                        .map_err(|e| HipError::new(0, &format!("attn BF16 hoist staging: {e:?}")))?;
+                    Some(bf16_slice)
+                } else {
+                    None
+                };
+                let dispatch_bf16 = |gpu: &mut Gpu,
+                                     w: &hipfire_runtime::llama::WeightTensor,
+                                     bf16_x: &rdna_compute::GpuTensor,
+                                     y: &rdna_compute::GpuTensor|
+                 -> HipResult<()> {
+                    gpu.maybe_capture_activation(&w.buf, &tmp, n, w.k);
+                    use hipfire_dispatch::context::DispatchCtx;
+                    use hipfire_dispatch::families::gemm::GemmParams;
+                    use hipfire_dispatch::families::gemv::WeightRef;
+                    let ctx = DispatchCtx::new(gpu);
+                    let w_ref = WeightRef {
+                        buf: &w.buf,
+                        dtype: w.gpu_dtype,
+                        m: w.m,
+                        k: w.k,
+                        row_stride: w.k,
+                        rotation: None,
+                        awq_scale: None,
+                    };
+                    let params = GemmParams {
+                        w: &w_ref,
+                        x: bf16_x,
+                        y,
+                        batch_size: n,
+                    };
+                    hipfire_runtime::llama::gemm_family()
+                        .run_key(
+                            hipfire_dispatch::types::KernelKey::GemmBf16Mfma,
+                            &ctx,
+                            gpu,
+                            &params,
+                        )
+                        .map_err(|e| HipError::new(0, &e.to_string()))?;
+                    Ok(())
+                };
+                if a.wq.gpu_dtype == DType::BF16 {
+                    let bf16_x = bf16_tmp.as_ref().unwrap();
+                    dispatch_bf16(gpu, &a.wq, bf16_x, &fq)?;
+                } else {
+                    batched_proj(gpu, &a.wq, &tmp, &fq, n, &state.proj_rot, &state.bf16_scratch)
+                        .map_err(|e| HipError::new(0, &format!("lfm batch L{l} q_proj: {e:?}")))?;
+                }
+                if a.wk.gpu_dtype == DType::BF16 {
+                    let bf16_x = bf16_tmp.as_ref().unwrap();
+                    dispatch_bf16(gpu, &a.wk, bf16_x, &fk)?;
+                } else {
+                    batched_proj(gpu, &a.wk, &tmp, &fk, n, &state.proj_rot, &state.bf16_scratch)
+                        .map_err(|e| HipError::new(0, &format!("lfm batch L{l} k_proj: {e:?}")))?;
+                }
+                if a.wv.gpu_dtype == DType::BF16 {
+                    let bf16_x = bf16_tmp.as_ref().unwrap();
+                    dispatch_bf16(gpu, &a.wv, bf16_x, &fv)?;
+                } else {
+                    batched_proj(gpu, &a.wv, &tmp, &fv, n, &state.proj_rot, &state.bf16_scratch)
+                        .map_err(|e| HipError::new(0, &format!("lfm batch L{l} v_proj: {e:?}")))?;
+                }
                 // per-head qk norm: batch = n * n_heads vectors
                 gpu.rmsnorm_batched(
                     &fq,
@@ -460,7 +675,7 @@ pub fn forward_decode_batch_prepared_lfm(
 
                 // out_proj + residual
                 let tmp_out = state.conv_y_batch.sub_offset(0, n * hidden);
-                batched_proj(gpu, &a.wo, &fa_out, &tmp_out, n, &state.proj_rot)
+                batched_proj(gpu, &a.wo, &fa_out, &tmp_out, n, &state.proj_rot, &state.bf16_scratch)
                     .map_err(|e| HipError::new(0, &format!("lfm batch L{l} out_proj: {e:?}")))?;
                 gpu.add_inplace_f32(&x, &tmp_out).map_err(|e| {
                     HipError::new(0, &format!("lfm batch L{l} attn residual: {e:?}"))
@@ -473,14 +688,83 @@ pub fn forward_decode_batch_prepared_lfm(
             .map_err(|e| HipError::new(0, &format!("lfm batch L{l} ffn rmsnorm: {e:?}")))?;
         match &layer.ffn {
             crate::lfm2moe::Ffn::Dense(d) => {
-                batched_proj(gpu, &d.w1, &ffn_tmp, &gate, n, &state.proj_rot)
-                    .map_err(|e| HipError::new(0, &format!("lfm batch L{l} dense w1: {e:?}")))?;
-                batched_proj(gpu, &d.w3, &ffn_tmp, &up, n, &state.proj_rot)
-                    .map_err(|e| HipError::new(0, &format!("lfm batch L{l} dense w3: {e:?}")))?;
+                // Hoisted BF16 staging for shared ffn_tmp -> w1/w3 (stage ONCE, reuse).
+                let ffn_needs_bf16 = matches!(d.w1.gpu_dtype, DType::BF16)
+                    || matches!(d.w3.gpu_dtype, DType::BF16);
+                let bf16_ffn_tmp = if ffn_needs_bf16 {
+                    let needed = n.checked_mul(hidden).ok_or_else(|| {
+                        HipError::new(0, "ffn BF16 hoist: n*hidden overflow")
+                    })?;
+                    if state.bf16_scratch.numel() < needed {
+                        return Err(HipError::new(
+                            0,
+                            &format!(
+                                "ffn BF16 hoist: bf16_scratch {} < {}",
+                                state.bf16_scratch.numel(),
+                                needed
+                            ),
+                        ));
+                    }
+                    let bf16_slice = state.bf16_scratch.sub_offset(0, needed);
+                    gpu.convert_f32_to_bf16(&ffn_tmp, &bf16_slice, needed)
+                        .map_err(|e| HipError::new(0, &format!("ffn BF16 hoist staging: {e:?}")))?;
+                    Some(bf16_slice)
+                } else {
+                    None
+                };
+                let dispatch_ffn_bf16 = |gpu: &mut Gpu,
+                                         w: &hipfire_runtime::llama::WeightTensor,
+                                         bf16_x: &rdna_compute::GpuTensor,
+                                         y: &rdna_compute::GpuTensor|
+                 -> HipResult<()> {
+                    gpu.maybe_capture_activation(&w.buf, &ffn_tmp, n, w.k);
+                    use hipfire_dispatch::context::DispatchCtx;
+                    use hipfire_dispatch::families::gemm::GemmParams;
+                    use hipfire_dispatch::families::gemv::WeightRef;
+                    let ctx = DispatchCtx::new(gpu);
+                    let w_ref = WeightRef {
+                        buf: &w.buf,
+                        dtype: w.gpu_dtype,
+                        m: w.m,
+                        k: w.k,
+                        row_stride: w.k,
+                        rotation: None,
+                        awq_scale: None,
+                    };
+                    let params = GemmParams {
+                        w: &w_ref,
+                        x: bf16_x,
+                        y,
+                        batch_size: n,
+                    };
+                    hipfire_runtime::llama::gemm_family()
+                        .run_key(
+                            hipfire_dispatch::types::KernelKey::GemmBf16Mfma,
+                            &ctx,
+                            gpu,
+                            &params,
+                        )
+                        .map_err(|e| HipError::new(0, &e.to_string()))?;
+                    Ok(())
+                };
+                if d.w1.gpu_dtype == DType::BF16 {
+                    let bf16_x = bf16_ffn_tmp.as_ref().unwrap();
+                    dispatch_ffn_bf16(gpu, &d.w1, bf16_x, &gate)?;
+                } else {
+                    batched_proj(gpu, &d.w1, &ffn_tmp, &gate, n, &state.proj_rot, &state.bf16_scratch)
+                        .map_err(|e| HipError::new(0, &format!("lfm batch L{l} dense w1: {e:?}")))?;
+                }
+                if d.w3.gpu_dtype == DType::BF16 {
+                    let bf16_x = bf16_ffn_tmp.as_ref().unwrap();
+                    dispatch_ffn_bf16(gpu, &d.w3, bf16_x, &up)?;
+                } else {
+                    batched_proj(gpu, &d.w3, &ffn_tmp, &up, n, &state.proj_rot, &state.bf16_scratch)
+                        .map_err(|e| HipError::new(0, &format!("lfm batch L{l} dense w3: {e:?}")))?;
+                }
                 gpu.silu_mul_f32(&gate, &up, &act)
                     .map_err(|e| HipError::new(0, &format!("lfm batch L{l} silu_mul: {e:?}")))?;
                 let tmp_out = fa_out.sub_offset(0, n * hidden);
-                batched_proj(gpu, &d.w2, &act, &tmp_out, n, &state.proj_rot)
+                batched_proj(gpu, &d.w2, &act, &tmp_out, n, &state.proj_rot, &state.bf16_scratch)
                     .map_err(|e| HipError::new(0, &format!("lfm batch L{l} dense w2: {e:?}")))?;
                 gpu.add_inplace_f32(&x, &tmp_out).map_err(|e| {
                     HipError::new(0, &format!("lfm batch L{l} ffn residual: {e:?}"))
@@ -501,7 +785,7 @@ pub fn forward_decode_batch_prepared_lfm(
         .map_err(|e| HipError::new(0, &format!("lfm batch final rmsnorm: {e:?}")))?;
     let logits = state.logits.sub_offset(0, n * cfg.vocab_size);
     let rot = state.lm_rot.sub_offset(0, n * hidden);
-    lm_head_batched_lfm(gpu, &weights.lm_head, &final_hidden, &rot, &logits, n)
+    lm_head_batched_lfm(gpu, &weights.lm_head, &final_hidden, &rot, &logits, n, &state.bf16_scratch)
         .map_err(|e| HipError::new(0, &format!("lfm batch lm_head: {e:?}")))?;
 
     Ok(())

@@ -74,6 +74,7 @@ fn run_prefill_gemm(
     x: &GpuTensor,
     y: &GpuTensor,
     batch_size: usize,
+    bf16_scratch: Option<&GpuTensor>,
 ) -> HipResult<()> {
     // MQ4G256 weights are FWHT-rotated at quantize time. The per-token GEMV
     // path (weight_gemv) FWHT-rotates x before running the prerotated kernel;
@@ -94,7 +95,7 @@ fn run_prefill_gemm(
     };
     let x_gemm: &GpuTensor = x_rot_holder.as_ref().unwrap_or(x);
 
-    let result = run_prefill_gemm_inner(gpu, w, x, x_gemm, y, batch_size);
+    let result = run_prefill_gemm_inner(gpu, w, x, x_gemm, y, batch_size, bf16_scratch);
     if let Some(t) = x_rot_holder {
         gpu.free_tensor(t)?;
     }
@@ -111,7 +112,53 @@ fn run_prefill_gemm_inner(
     x_gemm: &GpuTensor,
     y: &GpuTensor,
     batch_size: usize,
+    bf16_scratch: Option<&GpuTensor>,
 ) -> HipResult<()> {
+    // BF16 MFMA path — calibration override, DEFAULT path (no WMMA gate).
+    // Stages F32 activation to BF16 via persistent scratch, then dispatches
+    // GemmBf16Mfma. The wrapper refuses F32 x, so this must be BF16.
+    if w.gpu_dtype == DType::BF16 {
+        let nelems = batch_size * w.k;
+        if x_gemm.dtype == DType::BF16 {
+            // Hoisted: caller already staged to BF16 (q/k/v or gate+up reuse).
+            // F32 source was captured at the hoist site before staging, so the
+            // run_key tap (which skips BF16 x) is bypassed correctly there.
+            let w_ref = WeightRef { buf: &w.buf, dtype: w.gpu_dtype, m: w.m, k: w.k, row_stride: w.k, rotation: None, awq_scale: None };
+            let ctx = DispatchCtx::new(gpu);
+            let params = GemmParams { w: &w_ref, x: x_gemm, y, batch_size };
+            let family = llama::gemm_family();
+            family.run_key(hipfire_dispatch::types::KernelKey::GemmBf16Mfma, &ctx, gpu, &params)
+                .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+            return Ok(());
+        }
+        // Non-hoisted BF16 path: capture the true F32 activation before
+        // staging to BF16. The GemmFamily::run_key tap deliberately skips
+        // BF16 x (would overrun and record rounded values), so this explicit
+        // F32 capture restores coverage. Zero-cost when unarmed.
+        gpu.maybe_capture_activation(&w.buf, x_gemm, batch_size, w.k);
+        if let Some(scratch) = bf16_scratch {
+            let bf16_view = scratch.sub_offset(0, nelems);
+            gpu.convert_f32_to_bf16(x_gemm, &bf16_view, nelems)?;
+            let w_ref = WeightRef { buf: &w.buf, dtype: w.gpu_dtype, m: w.m, k: w.k, row_stride: w.k, rotation: None, awq_scale: None };
+            let ctx = DispatchCtx::new(gpu);
+            let params = GemmParams { w: &w_ref, x: &bf16_view, y, batch_size };
+            let family = llama::gemm_family();
+            family.run_key(hipfire_dispatch::types::KernelKey::GemmBf16Mfma, &ctx, gpu, &params)
+                .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+            return Ok(());
+        }
+        // No persistent scratch — fallback per-call alloc (not hoisted, but functional).
+        let tmp = gpu.alloc_tensor(&[nelems], DType::BF16)?;
+        gpu.convert_f32_to_bf16(x_gemm, &tmp, nelems)?;
+        let w_ref = WeightRef { buf: &w.buf, dtype: w.gpu_dtype, m: w.m, k: w.k, row_stride: w.k, rotation: None, awq_scale: None };
+        let ctx = DispatchCtx::new(gpu);
+        let params = GemmParams { w: &w_ref, x: &tmp, y, batch_size };
+        let family = llama::gemm_family();
+        let res = family.run_key(hipfire_dispatch::types::KernelKey::GemmBf16Mfma, &ctx, gpu, &params)
+            .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()));
+        gpu.free_tensor(tmp)?;
+        return res;
+    }
     let ctx = DispatchCtx::new(gpu);
     let w_ref = WeightRef {
         buf: &w.buf,
@@ -583,6 +630,9 @@ fn load_f32_vec(hfq: &HfqFile, name: &str, expected_n: usize) -> HipResult<Vec<f
         2 => data.chunks_exact(4)
                  .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                  .collect(),
+        16 => data.chunks_exact(2)
+                 .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+                 .collect(),
         qt => return Err(hip_bridge::HipError::new(
             0, &format!("expected F16/F32 for {name}, got qt={qt}"),
         )),
@@ -643,12 +693,28 @@ fn load_gemma4_weight(hfq: &HfqFile, gpu: &mut Gpu, name: &str, m: usize, k: usi
             let buf = gpu.upload_raw(bytes, &[m, k])?;
             return Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0, awq_scale: None, paro: None });
         }
+        16 => {
+            if rdna_compute::calib_force_bf16() {
+                // Native BF16 teacher — keep raw 2-byte payload as BF16 for MFMA.
+                // Otherwise the batched GEMM would land on the scalar F32 kernel.
+                let buf = gpu.upload_raw(data, &[m, k])?;
+                return Ok(WeightTensor { buf, gpu_dtype: DType::BF16, m, k, row_stride: 0, awq_scale: None, paro: None });
+            }
+            // Default: BF16 → widen to F32 (shift, not f16 decode)
+            let f32_data: Vec<f32> = data.chunks_exact(2)
+                .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+                .collect();
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
+            };
+            let buf = gpu.upload_raw(bytes, &[m, k])?;
+            return Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0, awq_scale: None, paro: None });
+        }
         2 => {
             // F32 raw (oracle / --format f32 passthrough .hfq) — upload as-is.
             let buf = gpu.upload_raw(data, &[m, k])?;
             return Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0, awq_scale: None, paro: None });
         }
-        3  => DType::Q8_0,
         4  => DType::Q4K,
         6  => DType::HFQ4G256,
         7  => DType::HFQ4G128,
@@ -861,6 +927,13 @@ pub fn load_weights(hfq: &mut HfqFile, config: &Gemma4Config, gpu: &mut Gpu)
             eprintln!("  (F16 → F32)");
             let f32_data: Vec<f32> = embed_data.chunks_exact(2)
                 .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .collect();
+            (gpu.upload_f32(&f32_data, &[config.vocab_size, config.dim])?, EmbeddingFormat::F32)
+        }
+        16 => {
+            eprintln!("  (BF16 → F32)");
+            let f32_data: Vec<f32> = embed_data.chunks_exact(2)
+                .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
                 .collect();
             (gpu.upload_f32(&f32_data, &[config.vocab_size, config.dim])?, EmbeddingFormat::F32)
         }
@@ -1140,9 +1213,16 @@ pub struct Gemma4Scratch {
     pub pb_ffn_hidden: GpuTensor,
     /// `[N]` — i32 position buffer for batched RoPE.
     pub pb_positions: GpuTensor,
+    /// `[MAX_BATCH × maxK]` BF16 — persistent staging for BF16 MFMA prefill.
+    /// Sized once as `MAX_PREFILL_BATCH * max(dim, hidden_dim)` BF16 elements
+    /// (~5.5 MB on 31B). Used by `run_prefill_gemm_inner`'s BF16 arm via
+    /// `gpu.convert_f32_to_bf16(x, &pb_bf16_view, batch*k)`. Reused across
+    /// q/k/v and gate+up groups (hoisted once per shared x).
+    pub pb_bf16: GpuTensor,
     /// `[k_top × mi]` — gelu_tanh(gate)*up batched over k_top experts.
     pub moe_expert_hidden_batch: GpuTensor,
 }
+
 
 impl Gemma4Scratch {
     pub fn new(gpu: &mut Gpu, config: &Gemma4Config, _max_prefill: usize) -> HipResult<Self> {
@@ -1273,6 +1353,9 @@ impl Gemma4Scratch {
         let pb_up = gpu.zeros(&[MAX_PREFILL_BATCH, config.hidden_dim], DType::F32)?;
         let pb_ffn_hidden = gpu.zeros(&[MAX_PREFILL_BATCH, config.hidden_dim], DType::F32)?;
         let pb_positions = gpu.zeros(&[MAX_PREFILL_BATCH], DType::F32)?; // i32 packed in f32 slots
+        // BF16 staging for calibration MFMA: persistent, sized once.
+        let max_k_bf16 = config.dim.max(config.hidden_dim);
+        let pb_bf16 = gpu.zeros(&[MAX_PREFILL_BATCH * max_k_bf16], DType::BF16)?;
 
         Ok(Gemma4Scratch {
             x, residual, tmp, pos_buf,
@@ -1296,7 +1379,8 @@ impl Gemma4Scratch {
             pb_moe_gate_batch, pb_moe_up_batch, pb_moe_hidden_batch,
             pb_moe_cur_moe, pb_moe_cur_mlp, pb_residual,
             pb_tmp, pb_q, pb_attn_q, pb_flash_partials, pb_k, pb_v, pb_gate, pb_up, pb_ffn_hidden,
-            pb_positions,
+            pb_positions, pb_bf16,
+
         })
     }
 
@@ -1361,6 +1445,8 @@ impl Gemma4Scratch {
         let _ = gpu.free_tensor(self.pb_up);
         let _ = gpu.free_tensor(self.pb_ffn_hidden);
         let _ = gpu.free_tensor(self.pb_positions);
+        let _ = gpu.free_tensor(self.pb_bf16);
+
     }
 }
 
@@ -1710,7 +1796,7 @@ fn apply_moe_branch_batched(
 
     // 4) Router GEMM → logits [N × n_exp]
     run_prefill_gemm(gpu, &moe.router_proj, &scratch.pb_moe_router_in,
-        &scratch.pb_moe_router_logits, n_batch)?;
+        &scratch.pb_moe_router_logits, n_batch, Some(&scratch.pb_bf16))?;
 
     // 5) Batched top-K softmax + renorm.
     gpu.moe_softmax_topk_renorm_k8_batched(
@@ -2832,9 +2918,26 @@ fn forward_prefill_batch_v2(
                 gpu.rmsnorm_batched(&scratch.pb_residual, &lw.input_layernorm,
                     &scratch.pb_tmp, n_batch, dim, config.norm_eps)?;
                 if _dump_on { dbg_dump(gpu, "[v2] L0 after input_norm", &scratch.pb_tmp, dim); }
-                run_prefill_gemm(gpu, &lw.q_proj, &scratch.pb_tmp, &scratch.pb_q, n_batch)?;
-                run_prefill_gemm(gpu, &lw.k_proj, &scratch.pb_tmp, &scratch.pb_k, n_batch)?;
-                run_prefill_gemm(gpu, &lw.v_proj, &scratch.pb_tmp, &scratch.pb_v, n_batch)?;
+                // BF16 hoist: one F32->BF16 for the shared pb_tmp -> q/k/v group.
+                // Capture the shared F32 source (pb_tmp) once per constituent
+                // weight before staging — same src, per-weight k. The inner
+                // run_prefill_gemm_inner skips capture for BF16 x (hoisted),
+                // so this hoist-site capture restores coverage. Zero-cost when unarmed.
+                if lw.q_proj.gpu_dtype == DType::BF16 {
+                    let nelems = n_batch * dim;
+                    let bf16_x = scratch.pb_bf16.sub_offset(0, nelems);
+                    gpu.maybe_capture_activation(&lw.q_proj.buf, &scratch.pb_tmp, n_batch, lw.q_proj.k);
+                    gpu.maybe_capture_activation(&lw.k_proj.buf, &scratch.pb_tmp, n_batch, lw.k_proj.k);
+                    gpu.maybe_capture_activation(&lw.v_proj.buf, &scratch.pb_tmp, n_batch, lw.v_proj.k);
+                    gpu.convert_f32_to_bf16(&scratch.pb_tmp, &bf16_x, nelems)?;
+                    run_prefill_gemm(gpu, &lw.q_proj, &bf16_x, &scratch.pb_q, n_batch, Some(&scratch.pb_bf16))?;
+                    run_prefill_gemm(gpu, &lw.k_proj, &bf16_x, &scratch.pb_k, n_batch, Some(&scratch.pb_bf16))?;
+                    run_prefill_gemm(gpu, &lw.v_proj, &bf16_x, &scratch.pb_v, n_batch, Some(&scratch.pb_bf16))?;
+                } else {
+                    run_prefill_gemm(gpu, &lw.q_proj, &scratch.pb_tmp, &scratch.pb_q, n_batch, Some(&scratch.pb_bf16))?;
+                    run_prefill_gemm(gpu, &lw.k_proj, &scratch.pb_tmp, &scratch.pb_k, n_batch, Some(&scratch.pb_bf16))?;
+                    run_prefill_gemm(gpu, &lw.v_proj, &scratch.pb_tmp, &scratch.pb_v, n_batch, Some(&scratch.pb_bf16))?;
+                }
                 if _dump_on {
                     dbg_dump(gpu, "[v2] L0 after q_proj", &scratch.pb_q, q_dim);
                     dbg_dump(gpu, "[v2] L0 after k_proj", &scratch.pb_k, kv_dim);
@@ -2945,7 +3048,7 @@ fn forward_prefill_batch_v2(
                 sliding_kv_idx += 1;
                 if _dump_on { dbg_dump(gpu, "[v2] L0 after attention (pb_q)", &scratch.pb_q, q_dim); }
 
-                run_prefill_gemm(gpu, &lw.o_proj, &scratch.pb_q, &scratch.pb_attn_out, n_batch)?;
+                run_prefill_gemm(gpu, &lw.o_proj, &scratch.pb_q, &scratch.pb_attn_out, n_batch, Some(&scratch.pb_bf16))?;
                 if _dump_on { dbg_dump(gpu, "[v2] L0 after o_proj", &scratch.pb_attn_out, dim); }
                 gpu.rmsnorm_batched(&scratch.pb_attn_out, &lw.post_attention_layernorm,
                     &scratch.pb_attn_out, n_batch, dim, config.norm_eps)?;
@@ -2964,8 +3067,20 @@ fn forward_prefill_batch_v2(
 
                 gpu.rmsnorm_batched(&scratch.pb_residual, &lw.input_layernorm,
                     &scratch.pb_tmp, n_batch, dim, config.norm_eps)?;
-                run_prefill_gemm(gpu, &lw.q_proj, &scratch.pb_tmp, &scratch.pb_q, n_batch)?;
-                run_prefill_gemm(gpu, &lw.k_proj, &scratch.pb_tmp, &scratch.pb_k, n_batch)?;
+                // BF16 hoist for shared pb_tmp -> q/k (full). Capture shared F32
+                // pb_tmp once per weight before staging. Gate+up hoisted separately below.
+                if lw.q_proj.gpu_dtype == DType::BF16 {
+                    let nelems = n_batch * dim;
+                    let bf16_x = scratch.pb_bf16.sub_offset(0, nelems);
+                    gpu.maybe_capture_activation(&lw.q_proj.buf, &scratch.pb_tmp, n_batch, lw.q_proj.k);
+                    gpu.maybe_capture_activation(&lw.k_proj.buf, &scratch.pb_tmp, n_batch, lw.k_proj.k);
+                    gpu.convert_f32_to_bf16(&scratch.pb_tmp, &bf16_x, nelems)?;
+                    run_prefill_gemm(gpu, &lw.q_proj, &bf16_x, &scratch.pb_q, n_batch, Some(&scratch.pb_bf16))?;
+                    run_prefill_gemm(gpu, &lw.k_proj, &bf16_x, &scratch.pb_k, n_batch, Some(&scratch.pb_bf16))?;
+                } else {
+                    run_prefill_gemm(gpu, &lw.q_proj, &scratch.pb_tmp, &scratch.pb_q, n_batch, Some(&scratch.pb_bf16))?;
+                    run_prefill_gemm(gpu, &lw.k_proj, &scratch.pb_tmp, &scratch.pb_k, n_batch, Some(&scratch.pb_bf16))?;
+                }
                 if let Some(s) = gpu.active_stream.as_ref() {
                     gpu.hip.memcpy_dtod_async_at(&scratch.pb_v.buf, 0,
                         &scratch.pb_k.buf, 0, n_batch * kv_dim_bytes, s)?;
@@ -3125,7 +3240,7 @@ fn forward_prefill_batch_v2(
                 }
                 full_kv_idx += 1;
 
-                run_prefill_gemm(gpu, &lw.o_proj, &scratch.pb_attn_q, &scratch.pb_attn_out, n_batch)?;
+                run_prefill_gemm(gpu, &lw.o_proj, &scratch.pb_attn_q, &scratch.pb_attn_out, n_batch, Some(&scratch.pb_bf16))?;
                 gpu.rmsnorm_batched(&scratch.pb_attn_out, &lw.post_attention_layernorm,
                     &scratch.pb_attn_out, n_batch, dim, config.norm_eps)?;
                 gpu.add_inplace_f32(&scratch.pb_residual, &scratch.pb_attn_out)?;
@@ -3149,8 +3264,20 @@ fn forward_prefill_batch_v2(
                 gpu.rmsnorm_batched(&scratch.pb_residual, &lw.pre_feedforward_layernorm,
                     &scratch.pb_tmp, n_batch, dim, config.norm_eps)?;
                 if _dump_ffn { dbg_dump(gpu, "[v2] L0 after pre_ffn_norm", &scratch.pb_tmp, dim); }
-                run_prefill_gemm(gpu, &lw.gate_proj, &scratch.pb_tmp, &scratch.pb_gate, n_batch)?;
-                run_prefill_gemm(gpu, &lw.up_proj, &scratch.pb_tmp, &scratch.pb_up, n_batch)?;
+                // BF16 hoist for shared pb_tmp -> gate+up. Capture shared F32
+                // pb_tmp once per weight before staging.
+                if lw.gate_proj.gpu_dtype == DType::BF16 {
+                    let nelems = n_batch * dim;
+                    let bf16_x = scratch.pb_bf16.sub_offset(0, nelems);
+                    gpu.maybe_capture_activation(&lw.gate_proj.buf, &scratch.pb_tmp, n_batch, lw.gate_proj.k);
+                    gpu.maybe_capture_activation(&lw.up_proj.buf, &scratch.pb_tmp, n_batch, lw.up_proj.k);
+                    gpu.convert_f32_to_bf16(&scratch.pb_tmp, &bf16_x, nelems)?;
+                    run_prefill_gemm(gpu, &lw.gate_proj, &bf16_x, &scratch.pb_gate, n_batch, Some(&scratch.pb_bf16))?;
+                    run_prefill_gemm(gpu, &lw.up_proj, &bf16_x, &scratch.pb_up, n_batch, Some(&scratch.pb_bf16))?;
+                } else {
+                    run_prefill_gemm(gpu, &lw.gate_proj, &scratch.pb_tmp, &scratch.pb_gate, n_batch, Some(&scratch.pb_bf16))?;
+                    run_prefill_gemm(gpu, &lw.up_proj, &scratch.pb_tmp, &scratch.pb_up, n_batch, Some(&scratch.pb_bf16))?;
+                }
                 if _dump_ffn {
                     dbg_dump(gpu, "[v2] L0 after gate_proj", &scratch.pb_gate, config.hidden_dim);
                     dbg_dump(gpu, "[v2] L0 after up_proj", &scratch.pb_up, config.hidden_dim);
@@ -3159,18 +3286,30 @@ fn forward_prefill_batch_v2(
                     n_batch * config.hidden_dim)?;
                 gpu.mul_f32(&scratch.pb_ffn_hidden, &scratch.pb_up, &scratch.pb_ffn_hidden)?;
                 if _dump_ffn { dbg_dump(gpu, "[v2] L0 after gelu*up", &scratch.pb_ffn_hidden, config.hidden_dim); }
-                run_prefill_gemm(gpu, &lw.down_proj, &scratch.pb_ffn_hidden, &scratch.pb_ffn_out, n_batch)?;
+                run_prefill_gemm(gpu, &lw.down_proj, &scratch.pb_ffn_hidden, &scratch.pb_ffn_out, n_batch, Some(&scratch.pb_bf16))?;
                 if _dump_ffn { dbg_dump(gpu, "[v2] L0 after down_proj", &scratch.pb_ffn_out, dim); }
             }
             (LayerType::Full, LayerWeights::Full(lw)) => {
                 gpu.rmsnorm_batched(&scratch.pb_residual, &lw.pre_feedforward_layernorm,
                     &scratch.pb_tmp, n_batch, dim, config.norm_eps)?;
-                run_prefill_gemm(gpu, &lw.gate_proj, &scratch.pb_tmp, &scratch.pb_gate, n_batch)?;
-                run_prefill_gemm(gpu, &lw.up_proj, &scratch.pb_tmp, &scratch.pb_up, n_batch)?;
+                // BF16 hoist for shared pb_tmp -> gate+up (full). Capture shared
+                // F32 pb_tmp once per weight before staging.
+                if lw.gate_proj.gpu_dtype == DType::BF16 {
+                    let nelems = n_batch * dim;
+                    let bf16_x = scratch.pb_bf16.sub_offset(0, nelems);
+                    gpu.maybe_capture_activation(&lw.gate_proj.buf, &scratch.pb_tmp, n_batch, lw.gate_proj.k);
+                    gpu.maybe_capture_activation(&lw.up_proj.buf, &scratch.pb_tmp, n_batch, lw.up_proj.k);
+                    gpu.convert_f32_to_bf16(&scratch.pb_tmp, &bf16_x, nelems)?;
+                    run_prefill_gemm(gpu, &lw.gate_proj, &bf16_x, &scratch.pb_gate, n_batch, Some(&scratch.pb_bf16))?;
+                    run_prefill_gemm(gpu, &lw.up_proj, &bf16_x, &scratch.pb_up, n_batch, Some(&scratch.pb_bf16))?;
+                } else {
+                    run_prefill_gemm(gpu, &lw.gate_proj, &scratch.pb_tmp, &scratch.pb_gate, n_batch, Some(&scratch.pb_bf16))?;
+                    run_prefill_gemm(gpu, &lw.up_proj, &scratch.pb_tmp, &scratch.pb_up, n_batch, Some(&scratch.pb_bf16))?;
+                }
                 gpu.gelu_tanh_f32(&scratch.pb_gate, &scratch.pb_ffn_hidden,
                     n_batch * config.hidden_dim)?;
                 gpu.mul_f32(&scratch.pb_ffn_hidden, &scratch.pb_up, &scratch.pb_ffn_hidden)?;
-                run_prefill_gemm(gpu, &lw.down_proj, &scratch.pb_ffn_hidden, &scratch.pb_ffn_out, n_batch)?;
+                run_prefill_gemm(gpu, &lw.down_proj, &scratch.pb_ffn_hidden, &scratch.pb_ffn_out, n_batch, Some(&scratch.pb_bf16))?;
             }
             _ => unreachable!(),
         }

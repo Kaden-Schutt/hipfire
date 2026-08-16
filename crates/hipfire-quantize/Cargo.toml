@@ -6,6 +6,8 @@ license.workspace = true
 
 [dependencies]
 hipfire-config = { path = "../hipfire-config" }
+faer = { version = "0.24", default-features = false, features = ["rayon", "std"] }
+libloading = { workspace = true }
 memmap2 = "0.9"
 safetensors.workspace = true
 half.workspace = true

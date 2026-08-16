@@ -107,6 +107,7 @@ impl ArchPredicate {
             Self::HasMmq => ctx.arch.has_mmq() || ctx.arch.is_rdna4(),
             Self::HasCdna3LdsGemv => ctx.arch.has_cdna3_lds_gemv(),
             Self::HasDp4a => ctx.arch.gemv_dp4a_enabled(),
+            Self::IsGfx942 => ctx.arch.is_gfx942(),
         }
     }
 }

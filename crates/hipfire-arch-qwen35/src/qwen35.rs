@@ -7368,6 +7368,17 @@ pub struct PrefillBatchScratch {
     // `new`); currently always allocated when LA layers exist, like the Q8
     // tape. s_tape_f32: [max_batch × n_v_heads × head_dim × head_dim] f32.
     pub dn_s_tape_f32: Option<GpuTensor>,
+    // ── BF16 calibration staging ────────────────────────────────────
+    // Persistent BF16 scratch for F32→BF16 activation staging under
+    // HIPFIRE_CALIB_BF16=1 on gfx942. Sized to max_batch * max(dim, hidden_dim)
+    // BF16 elements (2 bytes each) — large enough for any batched GEMM's K
+    // (dim for qkv/gate/up, hidden_dim for down which stays F32 but size
+    // doesn't hurt). All BF16 GEMM sites reuse this single buffer via
+    // sub_offset(0, n*k) views and gpu.convert_f32_to_bf16, never allocating
+    // per call. The staging is hoisted: one conversion per distinct x feeds
+    // all projections that share it (e.g. qkvza's 4 weights share one staged
+    // x_rot_batch).
+    pub bf16_scratch: GpuTensor,
 }
 
 impl PrefillBatchScratch {
@@ -7609,6 +7620,10 @@ impl PrefillBatchScratch {
                     * config.linear_value_head_dim],
                 DType::F32
             ),
+            bf16_scratch: {
+                let max_bf16_k = dim.max(hidden_dim);
+                alloc!(&[max_batch * max_bf16_k], DType::BF16)
+            },
         })
     }
 
@@ -7650,6 +7665,7 @@ impl PrefillBatchScratch {
             self.fa_v_batch,
             self.fa_attn_out_batch,
             self.fa_attn_out_rot_batch,
+            self.bf16_scratch,
         ] {
             note(gpu.free_tensor(t));
         }
@@ -11844,6 +11860,13 @@ fn is_batchable_la(dt: DType, arch: &str) -> bool {
             .as_deref()
             == Some("1");
 
+    // BF16 calibration teacher (qt=16) — native BF16 GEMM on gfx942 (CDNA3
+    // MFMA v_mfma_f32_16x16x16bf16_1k). Gated on arch == gfx942 so the
+    // eligibility check correctly rejects BF16 on non-gfx942 and falls back
+    // to per-token forward_scratch, rather than admitting and then failing
+    // at dispatch with UnsupportedVariant.
+    let bf16_with_gfx942 = matches!(dt, DType::BF16) && arch == "gfx942" && rdna_compute::calib_force_bf16();
+
     mq3_uniform_with_wmma
         || mq3_uniform_with_gfx10_scalar
         || lloyd_mq3_with_gfx11_wmma
@@ -11852,6 +11875,7 @@ fn is_batchable_la(dt: DType, arch: &str) -> bool {
         || lloyd_mq4_with_gfx12_wmma
         || fp4_with_wmma
         || e8_with_wmma
+        || bf16_with_gfx942
 }
 /// Single source of truth for per-layer batchability and checked geometry.
 /// Called by `validate_ep_batch_compatibility`, `prefill_batch_pbs_eligible`,
@@ -14340,6 +14364,7 @@ fn forward_batch_chunk_impl(
                 // together (the all-together corruption-prevention rule from
                 // docs/plans/mq-lloyd-batched-prefill-followup.md). MQ4-Lloyd
                 // is wired in a separate PR (issue #182).
+                let is_bf16 = matches!(layer.wqkv.gpu_dtype, DType::BF16) && rdna_compute::calib_force_bf16();
                 let is_mq = matches!(
                     layer.wqkv.gpu_dtype,
                     DType::MQ4G256
@@ -14358,7 +14383,20 @@ fn forward_batch_chunk_impl(
                 // x_batch / x_rot_batch are [N × dim] contiguous. For HFQ
                 // we reuse x_rot_batch as the "normed, unrotated" output
                 // so the subsequent GEMM can read it the same way.
-                if is_mq {
+                // BF16: plain rmsnorm (no FWHT) — the weights are pure BF16,
+                // not pre-rotated, so no rotation is needed. The staged BF16
+                // activation is produced once below and reused for all 4
+                // projections.
+                if is_bf16 {
+                    gpu.rmsnorm_batched(
+                        &pbs.x_batch,
+                        &layer.attn_norm,
+                        &pbs.x_rot_batch,
+                        n,
+                        dim,
+                        config.norm_eps,
+                    )?;
+                } else if is_mq {
                     // AWQ-aware: next linear is LA's fused wqkv.
                     fused_rmsnorm_rotate_mq_batched_for(
                         gpu,
@@ -14382,7 +14420,66 @@ fn forward_batch_chunk_impl(
                 }
 
                 // Batched 4-way LA projection (wqkv + wz + w_beta + w_alpha).
-                if is_6bit {
+                if is_bf16 {
+                    // BF16 teacher on gfx942 — stage once, reuse for all 4.
+                    // Uses the persistent bf16_scratch (max_batch*max_k BF16)
+                    // via sub_offset views; no per-call allocation.
+                    let src = pbs.x_rot_batch.sub_offset(0, n * dim);
+                    let dst = pbs.bf16_scratch.sub_offset(0, n * dim);
+                    // Capture the F32 source, not the staged BF16 copy.
+                    // GemmFamily::run_key deliberately skips capture for a BF16
+                    // `x`, so calibration coverage for these four weights comes
+                    // from here. Same shared `src` for all four — that is the
+                    // shared-input identity the coverage gate checks.
+                    for w in [&layer.wqkv, &layer.wz, &layer.w_beta, &layer.w_alpha] {
+                        gpu.maybe_capture_activation(&w.buf, &src, n, w.k);
+                    }
+                    gpu.convert_f32_to_bf16(&src, &dst, n * dim)?;
+                    run_plain_gemm_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::GemmBf16Mfma,
+                        &layer.wqkv.buf,
+                        layer.wqkv.gpu_dtype,
+                        &dst,
+                        &pbs.dn_qkv_batch,
+                        layer.wqkv.m,
+                        layer.wqkv.k,
+                        n,
+                    )?;
+                    run_plain_gemm_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::GemmBf16Mfma,
+                        &layer.wz.buf,
+                        layer.wz.gpu_dtype,
+                        &dst,
+                        &pbs.dn_z_batch,
+                        layer.wz.m,
+                        layer.wz.k,
+                        n,
+                    )?;
+                    run_plain_gemm_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::GemmBf16Mfma,
+                        &layer.w_beta.buf,
+                        layer.w_beta.gpu_dtype,
+                        &dst,
+                        &pbs.dn_beta_batch,
+                        layer.w_beta.m,
+                        layer.w_beta.k,
+                        n,
+                    )?;
+                    run_plain_gemm_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::GemmBf16Mfma,
+                        &layer.w_alpha.buf,
+                        layer.w_alpha.gpu_dtype,
+                        &dst,
+                        &pbs.dn_alpha_batch,
+                        layer.w_alpha.m,
+                        layer.w_alpha.k,
+                        n,
+                    )?;
+                } else if is_6bit {
                     run_fused_qkvza_key(
                         gpu,
                         hipfire_dispatch::types::KernelKey::FusedQkvzaHfq6G256,
@@ -15047,6 +15144,7 @@ fn forward_batch_chunk_impl(
                 }
 
                 // FFN: rmsnorm (+ rotate for MQ).
+                let ffn_is_bf16 = matches!(layer.w_gate.gpu_dtype, DType::BF16) && rdna_compute::calib_force_bf16();
                 let ffn_is_mq = matches!(
                     layer.w_gate.gpu_dtype,
                     DType::MQ4G256
@@ -15061,7 +15159,16 @@ fn forward_batch_chunk_impl(
                 let ffn_is_mq3_lloyd = matches!(layer.w_gate.gpu_dtype, DType::MQ3G256Lloyd);
                 let ffn_is_fp4 = matches!(layer.w_gate.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
                 let ffn_is_q8 = matches!(layer.w_gate.gpu_dtype, DType::Q8_0);
-                if ffn_is_mq {
+                if ffn_is_bf16 {
+                    gpu.rmsnorm_batched(
+                        &pbs.x_batch,
+                        &layer.ffn_norm,
+                        &pbs.x_rot_batch,
+                        n,
+                        dim,
+                        config.norm_eps,
+                    )?;
+                } else if ffn_is_mq {
                     // AWQ-aware: next linear is w_gate (gate/up share input → same AWQ scale).
                     fused_rmsnorm_rotate_mq_batched_for(
                         gpu,
@@ -15091,7 +15198,39 @@ fn forward_batch_chunk_impl(
                 // GEMMs (not a fused kernel — slice 1). The HFQ3 WMMA-vs-base
                 // split is folded into the FusedGateUpHfq3G256 run-arm, which
                 // re-derives it from gpu.arch_caps.has_wmma() (== arch_has_wmma).
-                if ffn_is_6bit {
+                // BF16: stage once, two plain BF16 MFMA GEMMs (no fused BF16
+                // kernel exists; fused would be silently-wrong).
+                if ffn_is_bf16 {
+                    let src = pbs.x_rot_batch.sub_offset(0, n * dim);
+                    let dst = pbs.bf16_scratch.sub_offset(0, n * dim);
+                    // Capture F32 source; run_key skips capture for BF16 `x`.
+                    for w in [&layer.w_gate, &layer.w_up] {
+                        gpu.maybe_capture_activation(&w.buf, &src, n, w.k);
+                    }
+                    gpu.convert_f32_to_bf16(&src, &dst, n * dim)?;
+                    run_plain_gemm_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::GemmBf16Mfma,
+                        &layer.w_gate.buf,
+                        layer.w_gate.gpu_dtype,
+                        &dst,
+                        &pbs.gate_ffn_batch,
+                        layer.w_gate.m,
+                        layer.w_gate.k,
+                        n,
+                    )?;
+                    run_plain_gemm_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::GemmBf16Mfma,
+                        &layer.w_up.buf,
+                        layer.w_up.gpu_dtype,
+                        &dst,
+                        &pbs.up_batch,
+                        layer.w_up.m,
+                        layer.w_up.k,
+                        n,
+                    )?;
+                } else if ffn_is_6bit {
                     run_fused_gate_up_key(
                         gpu,
                         hipfire_dispatch::types::KernelKey::FusedGateUpHfq6G256,
@@ -15362,6 +15501,7 @@ fn forward_batch_chunk_impl(
                 // launch covers all N tokens at once.
                 let kv_dim = config.n_kv_heads * config.head_dim;
                 let q_dim = config.n_heads * config.head_dim;
+                let qkv_is_bf16 = matches!(layer.wq.gpu_dtype, DType::BF16) && rdna_compute::calib_force_bf16();
                 let qkv_is_mq = matches!(
                     layer.wq.gpu_dtype,
                     DType::MQ4G256
@@ -15388,7 +15528,17 @@ fn forward_batch_chunk_impl(
                     && layer.wv.gpu_dtype == layer.wq.gpu_dtype;
 
                 // 1. rmsnorm (+ rotate for MQ) for the attn preamble.
-                if qkv_is_mq {
+                // BF16: plain rmsnorm (no FWHT), stage later.
+                if qkv_is_bf16 {
+                    gpu.rmsnorm_batched(
+                        &pbs.x_batch,
+                        &layer.attn_norm,
+                        &pbs.x_rot_batch,
+                        n,
+                        dim,
+                        config.norm_eps,
+                    )?;
+                } else if qkv_is_mq {
                     // AWQ-aware: next linear is wq (Q/K/V share input → same AWQ scale).
                     fused_rmsnorm_rotate_mq_batched_for(
                         gpu,
@@ -15412,7 +15562,49 @@ fn forward_batch_chunk_impl(
                 }
 
                 // 2. Batched 3-way QKV projection (wq+wk+wv).
-                if qkv_is_6bit && qkv_same_dtype {
+                if qkv_is_bf16 && qkv_same_dtype {
+                    // BF16: stage x_rot once, three plain BF16 MFMA GEMMs.
+                    let src = pbs.x_rot_batch.sub_offset(0, n * dim);
+                    let dst = pbs.bf16_scratch.sub_offset(0, n * dim);
+                    // Capture F32 source; run_key skips capture for BF16 `x`.
+                    for w in [&layer.wq, &layer.wk, &layer.wv] {
+                        gpu.maybe_capture_activation(&w.buf, &src, n, w.k);
+                    }
+                    gpu.convert_f32_to_bf16(&src, &dst, n * dim)?;
+                    run_plain_gemm_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::GemmBf16Mfma,
+                        &layer.wq.buf,
+                        layer.wq.gpu_dtype,
+                        &dst,
+                        &pbs.fa_q_full_batch,
+                        layer.wq.m,
+                        layer.wq.k,
+                        n,
+                    )?;
+                    run_plain_gemm_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::GemmBf16Mfma,
+                        &layer.wk.buf,
+                        layer.wk.gpu_dtype,
+                        &dst,
+                        &pbs.fa_k_batch,
+                        layer.wk.m,
+                        layer.wk.k,
+                        n,
+                    )?;
+                    run_plain_gemm_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::GemmBf16Mfma,
+                        &layer.wv.buf,
+                        layer.wv.gpu_dtype,
+                        &dst,
+                        &pbs.fa_v_batch,
+                        layer.wv.m,
+                        layer.wv.k,
+                        n,
+                    )?;
+                } else if qkv_is_6bit && qkv_same_dtype {
                     run_fused_qkv_key(
                         gpu,
                         hipfire_dispatch::types::KernelKey::FusedQkvHfq6G256,
@@ -15888,6 +16080,7 @@ fn forward_batch_chunk_impl(
 
                 // 10. FFN: rmsnorm (+ rotate for MQ), gate+up, silu_mul
                 // (+ rotate for MQ), w_down residual.
+                let fa_ffn_is_bf16 = matches!(layer.w_gate.gpu_dtype, DType::BF16) && rdna_compute::calib_force_bf16();
                 let fa_ffn_is_mq = matches!(
                     layer.w_gate.gpu_dtype,
                     DType::MQ4G256
@@ -15903,7 +16096,16 @@ fn forward_batch_chunk_impl(
                 let fa_ffn_is_fp4 =
                     matches!(layer.w_gate.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
                 let fa_ffn_is_q8 = matches!(layer.w_gate.gpu_dtype, DType::Q8_0);
-                if fa_ffn_is_mq {
+                if fa_ffn_is_bf16 {
+                    gpu.rmsnorm_batched(
+                        &pbs.x_batch,
+                        &layer.ffn_norm,
+                        &pbs.x_rot_batch,
+                        n,
+                        dim,
+                        config.norm_eps,
+                    )?;
+                } else if fa_ffn_is_mq {
                     // AWQ-aware: next linear is w_gate (FA-FFN, gate/up share input).
                     fused_rmsnorm_rotate_mq_batched_for(
                         gpu,
@@ -15929,7 +16131,38 @@ fn forward_batch_chunk_impl(
                 // (batched-prefill gate+up variant), mirroring the LA-FFN block
                 // above. Q8-non-WMMA stays as two plain GEMMs; HFQ3 WMMA-vs-base
                 // is folded into the FusedGateUpHfq3G256 run-arm.
-                if fa_ffn_is_6bit {
+                // BF16: stage once → two plain BF16 MFMA GEMMs.
+                if fa_ffn_is_bf16 {
+                    let src = pbs.x_rot_batch.sub_offset(0, n * dim);
+                    let dst = pbs.bf16_scratch.sub_offset(0, n * dim);
+                    // Capture F32 source; run_key skips capture for BF16 `x`.
+                    for w in [&layer.w_gate, &layer.w_up] {
+                        gpu.maybe_capture_activation(&w.buf, &src, n, w.k);
+                    }
+                    gpu.convert_f32_to_bf16(&src, &dst, n * dim)?;
+                    run_plain_gemm_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::GemmBf16Mfma,
+                        &layer.w_gate.buf,
+                        layer.w_gate.gpu_dtype,
+                        &dst,
+                        &pbs.gate_ffn_batch,
+                        layer.w_gate.m,
+                        layer.w_gate.k,
+                        n,
+                    )?;
+                    run_plain_gemm_key(
+                        gpu,
+                        hipfire_dispatch::types::KernelKey::GemmBf16Mfma,
+                        &layer.w_up.buf,
+                        layer.w_up.gpu_dtype,
+                        &dst,
+                        &pbs.up_batch,
+                        layer.w_up.m,
+                        layer.w_up.k,
+                        n,
+                    )?;
+                } else if fa_ffn_is_6bit {
                     run_fused_gate_up_key(
                         gpu,
                         hipfire_dispatch::types::KernelKey::FusedGateUpHfq6G256,

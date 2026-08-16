@@ -286,6 +286,13 @@ pub enum KernelKey {
     GemmF16WmmaMb4,
     GemmF16WmmaMb8,
     GemmF32Batched,
+    // BF16 x BF16 -> F32 via CDNA3 `v_mfma_f32_16x16x16bf16_1k`
+    // (kernels/src/gemm_bf16_mfma.gfx942.hip). gfx942-only: the wrapper
+    // `Gpu::gemm_bf16_mfma_gfx942` hard-errors on any other arch. This is the
+    // batched path for a native-BF16 reference/teacher model — widening such a
+    // model to F32 would land on `GemmF32Batched`, a warp-per-output-element
+    // dot product with no data reuse, at a fraction of MFMA throughput.
+    GemmBf16Mfma,
     GemmQ8_0WmmaX64,
     GemmQ8_0ResidualWmma,
     GemmQ8_0ResidualWmmaGfx12,
@@ -485,6 +492,11 @@ pub enum ArchPredicate {
     /// Gates the gfx906 wave64 `v_dot4_i32_i8` (sdot4) fused kernels (HFQ6/MQ6).
     /// This IS AMD "dp4a" — `v_dot4_i32_i8` INT8 dot4 accumulate, gfx906/gfx908.
     HasDp4a,
+    /// `is_gfx942()` — CDNA3 MI300-series exactly. Gates kernels built from a
+    /// `.gfx942.hip` source with no sibling for any other arch, currently the
+    /// BF16 MFMA GEMM. Narrower than `is_cdna3()` on purpose: the wrapper
+    /// refuses non-gfx942 outright, so the predicate must match the wrapper.
+    IsGfx942,
 }
 
 #[derive(Clone, Debug)]

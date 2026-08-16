@@ -14,10 +14,13 @@
 mod e8;
 mod e8_gptq;
 mod gguf_input;
+mod gptq;
 mod reap_overlay;
 
 use clap::Parser;
 use hipfire_quantize::float16::{bf16_to_f32, f16_to_f32, f32_to_f16};
+use hipfire_quantize::hfhs_diag;
+use hipfire_quantize::hfqm::HfqmPackage;
 use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
 use std::collections::HashMap;
 use std::fs::File;
@@ -66,6 +69,38 @@ static IMATRIX: OnceLock<HashMap<String, Vec<f32>>> = OnceLock::new();
 // AWQ at alpha=0.55; --awq <value> sets explicit alpha. Alpha=0 disables;
 // alpha=1 is pure activation-magnitude scaling (no smoothing).
 static AWQ_ALPHA: OnceLock<f32> = OnceLock::new();
+// Unified Hessian source for LDLQ/GPTQ. Filled from --hessian if --ldlq is set.
+// Detection is via container magic at open time: HFQM ("HFQM") vs legacy HFHS ("HFHS").
+enum LdlqHessian {
+    Hfqm(HfqmPackage),
+    Hfhs(hfhs_diag::HfhsFull),
+}
+static LDLQ_HESSIAN: OnceLock<LdlqHessian> = OnceLock::new();
+impl LdlqHessian {
+    fn k_of(&self, name: &str) -> Option<usize> {
+        match self {
+            Self::Hfqm(p) => p.get(name).map(|r| r.k).or_else(|| p.get(name.strip_suffix(".weight").unwrap_or(name)).map(|r| r.k)),
+            Self::Hfhs(p) => p.k_of(name).or_else(|| p.k_of(name.strip_suffix(".weight").unwrap_or(name))),
+        }
+    }
+    fn get_full(&self, name: &str) -> Option<Vec<f32>> {
+        match self {
+            Self::Hfqm(p) => p.get(name).map(|r| r.to_dense_f32()).or_else(|| p.get(name.strip_suffix(".weight").unwrap_or(name)).map(|r| r.to_dense_f32())),
+            Self::Hfhs(p) => p.get_full(name).or_else(|| p.get_full(name.strip_suffix(".weight").unwrap_or(name))),
+        }
+    }
+}
+
+fn ldlq_hessian_for(name: &str, k: usize) -> Option<Vec<f32>> {
+    let h = LDLQ_HESSIAN.get()?;
+    let key = name.strip_suffix(".weight").unwrap_or(name);
+    let hk = h.k_of(key).or_else(|| h.k_of(name))?;
+    if hk != k {
+        eprintln!("  ldlq: skip {name} (Hessian K={hk} != weight K={k})");
+        return None;
+    }
+    h.get_full(key).or_else(|| h.get_full(name))
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -117,6 +152,25 @@ struct QuantizeArgs {
     /// llama.cpp imatrix GGUF used for activation-aware quantization.
     #[arg(long, value_name = "PATH")]
     imatrix: Option<PathBuf>,
+    /// HFQM calibration package (.calib.hfq) or legacy HFHS sidecar.
+    /// Same flag handles both containers; detection via magic bytes
+    /// (HFQM vs HFHS). Its `<name>.imatrix` feeds AWQ and
+    /// `<name>.hessian` feeds LDLQ/GPTQ when --ldlq is set.
+    #[arg(long, value_name = "PATH", alias = "calib")]
+    hessian: Option<PathBuf>,
+    /// Enable LDLQ/GPTQ using the full Hessian from --hessian.
+    #[arg(long)]
+    ldlq: bool,
+
+    /// Initial damping for GPTQ Cholesky (absolute, added to diag(H)).
+    /// Only used when --ldlq is set and dense MQ4 GPTQ fires.
+    #[arg(long, value_name = "DAMP")]
+    gptq_damp: Option<f64>,
+
+    /// Max damping multiplier for GPTQ adaptive damping (relative to mean(diag(H))).
+    /// Only used when --ldlq is set and dense MQ4 GPTQ fires.
+    #[arg(long, value_name = "MULTIPLIER")]
+    gptq_max_damp: Option<f64>,
 
     /// Per-tensor Hessian directory used by GPTQ-E8 recipes.
     #[arg(long, value_name = "DIR")]
@@ -869,6 +923,9 @@ pub(crate) fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
 /// Same binary format as HFQ4-G256 (136 bytes/group) — the rotation is baked
 /// into the weights. The GEMV kernel rotates x instead of inverse-rotating w.
 pub(crate) fn quantize_mq4g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+    if hipfire_quantize::mq_clipsearch_enabled() {
+        return quantize_mq4g256_clipsearch(f32_data, signs1, signs2);
+    }
     let group_size = 256;
     let block_bytes = 136;
     let n = f32_data.len();
@@ -908,10 +965,89 @@ pub(crate) fn quantize_mq4g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32])
     output
 }
 
+pub(crate) fn quantize_mq4g256_clipsearch(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+    let group_size = 256;
+    let block_bytes = 136;
+    let n = f32_data.len();
+    let n_blocks = (n + group_size - 1) / group_size;
+    let mut output = vec![0u8; n_blocks * block_bytes];
+    for b in 0..n_blocks {
+        let start = b * group_size;
+        let end = (start + group_size).min(n);
+        let mut group = [0.0f32; 256];
+        let actual_len = end - start;
+        group[..actual_len].copy_from_slice(&f32_data[start..end]);
+        cpu_fwht_256(&mut group, signs1, signs2);
+        let (best_lo, best_scale) = affine_clipsearch(&group, 15.0);
+        let scale = if best_scale > 0.0 { best_scale } else { 1.0 };
+        let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+        let out_off = b * block_bytes;
+        output[out_off..out_off + 4].copy_from_slice(&scale.to_le_bytes());
+        output[out_off + 4..out_off + 8].copy_from_slice(&best_lo.to_le_bytes());
+        for i in 0..128 {
+            let lo_q = ((group[2 * i] - best_lo) * inv + 0.5).clamp(0.0, 15.0) as u8;
+            let hi_q = ((group[2 * i + 1] - best_lo) * inv + 0.5).clamp(0.0, 15.0) as u8;
+            output[out_off + 8 + i] = lo_q | (hi_q << 4);
+        }
+    }
+    output
+}
+
+fn affine_clipsearch(group: &[f32], levels: f32) -> (f32, f32) {
+    const CLIP_GRID: [f32; 9] = [1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6];
+    let min_val = group.iter().cloned().fold(f32::INFINITY, f32::min);
+    let max_val = group.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let mid = 0.5 * (min_val + max_val);
+    let half = 0.5 * (max_val - min_val);
+    let (mut best_lo, mut best_scale) = (min_val, (max_val - min_val) / levels);
+    let mut best_err = f32::INFINITY;
+    for &c in &CLIP_GRID {
+        let lo = mid - c * half;
+        let scale = (2.0 * c * half / levels).max(1e-12);
+        let inv = 1.0 / scale;
+        let mut err = 0.0f32;
+        for &v in group.iter() {
+            let q = ((v - lo) * inv + 0.5).floor().clamp(0.0, levels);
+            let d = v - (q * scale + lo);
+            err += d * d;
+        }
+        if err < best_err {
+            best_err = err;
+            best_lo = lo;
+            best_scale = scale;
+        }
+    }
+    (best_lo, if best_scale > 0.0 { best_scale } else { 1.0 })
+}
+
+pub(crate) fn symmetric_clipsearch(group: &[f32], qmax: f32) -> f32 {
+    const CLIP_GRID: [f32; 9] = [1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6];
+    let amax = group.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+    let (mut best_scale, mut best_err) = (amax / qmax, f32::INFINITY);
+    for &c in &CLIP_GRID {
+        let scale = (c * amax / qmax).max(1e-12);
+        let inv = 1.0 / scale;
+        let mut err = 0.0f32;
+        for &v in group.iter() {
+            let q = (v * inv).round().clamp(-qmax, qmax);
+            let d = v - q * scale;
+            err += d * d;
+        }
+        if err < best_err {
+            best_err = err;
+            best_scale = scale;
+        }
+    }
+    if best_scale > 0.0 { best_scale } else { 1.0 }
+}
+
 /// MagnumQuant MQ6-G256: FWHT-rotated 6-bit quantization.
 /// Same binary format as HFQ6-G256 (200 bytes/group) — the rotation is baked
 /// into the weights. The GEMV kernel rotates x instead of inverse-rotating w.
 pub(crate) fn quantize_mq6g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+    if hipfire_quantize::mq_clipsearch_enabled() {
+        return quantize_mq6g256_clipsearch(f32_data, signs1, signs2);
+    }
     let group_size = 256;
     let block_bytes = 200; // 8 (scale+zero) + 192 (packed 6-bit)
     let n = f32_data.len();
@@ -959,6 +1095,34 @@ pub(crate) fn quantize_mq6g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32])
         }
     }
 
+    output
+}
+pub(crate) fn quantize_mq6g256_clipsearch(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+    let group_size = 256;
+    let block_bytes = 200;
+    let n = f32_data.len();
+    let n_blocks = (n + group_size - 1) / group_size;
+    let mut output = vec![0u8; n_blocks * block_bytes];
+    for b in 0..n_blocks {
+        let start = b * group_size;
+        let end = (start + group_size).min(n);
+        let mut group = [0.0f32; 256];
+        group[..end - start].copy_from_slice(&f32_data[start..end]);
+        cpu_fwht_256(&mut group, signs1, signs2);
+        let (lo, scale) = affine_clipsearch(&group, 63.0);
+        let inv = 1.0 / scale;
+        let out_off = b * block_bytes;
+        output[out_off..out_off + 4].copy_from_slice(&scale.to_le_bytes());
+        output[out_off + 4..out_off + 8].copy_from_slice(&lo.to_le_bytes());
+        for i in (0..256).step_by(4) {
+            let q = |j: usize| (((group[i + j] - lo) * inv + 0.5).clamp(0.0, 63.0)) as u8;
+            let (q0, q1, q2, q3) = (q(0), q(1), q(2), q(3));
+            let bo = out_off + 8 + (i / 4) * 3;
+            output[bo] = q0 | (q1 << 6);
+            output[bo + 1] = (q1 >> 2) | (q2 << 4);
+            output[bo + 2] = (q2 >> 4) | (q3 << 2);
+        }
+    }
     output
 }
 
@@ -1036,6 +1200,9 @@ fn quantize_mq5g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8>
 /// Symmetric: scale = max(abs(group)) / 127, q = round(val / scale), no zero-point.
 /// Target: dp4a (v_dot4_i32_iu8) on gfx1100 for 4x VALU throughput.
 fn quantize_mq8g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+    if hipfire_quantize::mq_clipsearch_enabled() {
+        return quantize_mq8g256_clipsearch(f32_data, signs1, signs2);
+    }
     let group_size = 256;
     let block_bytes = 258; // 2 (f16 scale) + 256 (int8 values)
     let n = f32_data.len();
@@ -1072,6 +1239,31 @@ fn quantize_mq8g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8>
         }
     }
 
+    output
+}
+fn quantize_mq8g256_clipsearch(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+    let group_size = 256;
+    let block_bytes = 258;
+    let n = f32_data.len();
+    let n_blocks = (n + group_size - 1) / group_size;
+    let mut output = vec![0u8; n_blocks * block_bytes];
+    for b in 0..n_blocks {
+        let start = b * group_size;
+        let end = (start + group_size).min(n);
+        let mut group = [0.0f32; 256];
+        group[..end - start].copy_from_slice(&f32_data[start..end]);
+        cpu_fwht_256(&mut group, signs1, signs2);
+        let scale = symmetric_clipsearch(&group, 127.0);
+        let inv = 1.0 / scale;
+        let out_off = b * block_bytes;
+        let scale_f16 = f32_to_f16(scale);
+        output[out_off] = (scale_f16 & 0xFF) as u8;
+        output[out_off + 1] = (scale_f16 >> 8) as u8;
+        for i in 0..256 {
+            let q = (group[i] * inv).round().clamp(-128.0, 127.0) as i8;
+            output[out_off + 2 + i] = q as u8;
+        }
+    }
     output
 }
 
@@ -1962,6 +2154,14 @@ pub(crate) fn load_hessian_blocks(dir: &Path, tensor_name: &str) -> Vec<e8_gptq:
 /// means a KEY-MISMATCH BUG (filenames != hessian_key), not a flat result.
 static GPTQ_E8_FIRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static GPTQ_E8_FALLBACK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// MQ4-GPTQ fired/fallback telemetry — dense MQ4 path only.
+/// `fired` = Hessian found and gptq_pipeline_mq4g256 succeeded;
+/// `fallback` = missing Hessian OR Cholesky failure → RTN MQ4.
+/// When --ldlq is set, a mostly-RTN build (low fired ratio) is a
+/// correctness bug, not a flat result, so we always print the summary.
+static GPTQ_MQ4_FIRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GPTQ_MQ4_FALLBACK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// GPTQ-E8 wrapper that wires the production helpers into the e8_gptq module.
 /// `h_blocks` empty -> RTN fallback (byte-identical to quantize_mfp4g32_e8_2d).
@@ -7391,6 +7591,16 @@ fn main() {
     let input_dir = args.input.as_str();
     let output_path = args.output.as_str();
     let format = args.format.as_str();
+    // mqN+ clip-search modifier: trailing '+' enables MSE-optimal clip-searched
+    // affine/symmetric range (eb233f004). Zero-byte quality lever, same wire format.
+    let format_original = format;
+    let (format, _mq_plus) = if format_original.ends_with('+') {
+        hipfire_quantize::set_mq_clipsearch(true);
+        eprintln!("mq+ clip-search enabled; AWQ auto-on (needs --hessian/--imatrix)");
+        (&format_original[..format_original.len() - 1], true)
+    } else {
+        (format_original, false)
+    };
 
     if matches!(
         format,
@@ -8311,10 +8521,130 @@ fn main() {
         eprintln!("imatrix loaded from {}", path.display());
     }
 
+    // --hessian <path>: HFQM .calib.hfq container OR legacy HFHS sidecar.
+    // Detection via magic bytes: HFQM ("HFQM") vs HFHS ("HFHS").
+    // * IMATRIX fallback: if --imatrix was not given, derive AWQ's in_sum2
+    //   from the container — for HFQM, explicit `<name>.imatrix` vectors are
+    //   imported first-class plus Hessian diagonals (H[j,j]=Σx²) as fallback;
+    //   for HFHS, diagonals are extracted via hfhs_diag::read_diagonals.
+    // * LDLQ source: when --ldlq is set, the full K×K Hessians are retained
+    //   in LDLQ_HESSIAN for gptq_pipeline_mq4g256 (qt=130 expanded to dense
+    //   f32 on demand). Requires --hessian.
+    if let Some(hpath) = args.hessian.clone() {
+        if !hpath.exists() {
+            eprintln!("error: --hessian path not found: {}", hpath.display());
+            std::process::exit(1);
+        }
+        // Peek magic to decide HFQM vs HFHS before consuming.
+        let is_hfqm = {
+            if let Ok(f) = File::open(&hpath) {
+                if let Ok(mmap) = unsafe { memmap2::Mmap::map(&f) } {
+                    mmap.len() >= 4 && &mmap[0..4] == b"HFQM"
+                } else { false }
+            } else { false }
+        };
+        let is_hfhs = {
+            if let Ok(f) = File::open(&hpath) {
+                if let Ok(mmap) = unsafe { memmap2::Mmap::map(&f) } {
+                    mmap.len() >= 4 && &mmap[0..4] == b"HFHS"
+                } else { false }
+            } else { false }
+        };
+        if !is_hfqm && !is_hfhs {
+            eprintln!("error: --hessian {} has unknown magic (expected HFQM or HFHS)", hpath.display());
+            std::process::exit(1);
+        }
+        // IMATRIX fallback: populate from container if --imatrix wasn't given.
+        if IMATRIX.get().is_none() {
+            if is_hfqm {
+                match HfqmPackage::open(&hpath) {
+                    Ok(pkg) => {
+                        let n_h = pkg.n_tensors();
+                        let n_i = pkg.n_imatrix_tensors();
+                        let mut table: HashMap<String, Vec<f32>> = HashMap::with_capacity((n_h + n_i)*2);
+                        for r in pkg.tensors() {
+                            let diag: Vec<f32> = (0..r.k).map(|i| r.at(i,i) as f32).collect();
+                            table.insert(format!("{}.weight", r.name), diag.clone());
+                            table.insert(r.name.to_string(), diag);
+                        }
+                        for r in pkg.imatrices() {
+                            let v: Vec<f32> = r.iter_f32().collect();
+                            table.insert(format!("{}.weight", r.name), v.clone());
+                            table.insert(r.name.to_string(), v);
+                        }
+                        let n = table.len();
+                        IMATRIX.set(table).expect("IMATRIX set twice");
+                        eprintln!("imatrix derived from HFQM calibration ({:?}): {} keys ({} Hessian diagonals, {} imatrix vectors)", hpath, n, n_h, n_i);
+                    }
+                    Err(e) => {
+                        eprintln!("error: --hessian HFQM open failed ({}): {e}", hpath.display());
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                match hfhs_diag::read_diagonals(&hpath) {
+                    Ok(diags) => {
+                        let mut table: HashMap<String, Vec<f32>> = HashMap::with_capacity(diags.len()*2);
+                        for (name, diag) in diags {
+                            table.insert(format!("{name}.weight"), diag.clone());
+                            table.insert(name, diag);
+                        }
+                        let n = table.len();
+                        IMATRIX.set(table).expect("IMATRIX set twice");
+                        eprintln!("imatrix derived from HFHS diagonals ({:?}): {} keys", hpath, n);
+                    }
+                    Err(e) => {
+                        eprintln!("error: --hessian HFHS diagonal read failed ({}): {e}", hpath.display());
+                        std::process::exit(1);
+                    }
+                }
+            }
+        } else {
+            eprintln!("note: --imatrix already supplied; --hessian {} imatrix entries ignored (Hessian still used for LDLQ if --ldlq)", hpath.display());
+        }
+        // LDLQ full-Hessian source (requires --ldlq).
+        if args.ldlq {
+            if is_hfqm {
+                match HfqmPackage::open(&hpath) {
+                    Ok(pkg) => {
+                        eprintln!("ldlq: HFQM full Hessian index opened ({:?})", hpath);
+                        let _ = LDLQ_HESSIAN.set(LdlqHessian::Hfqm(pkg));
+                    }
+                    Err(e) => {
+                        eprintln!("error: --ldlq could not open HFQM ({:?}): {e}", hpath);
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                match hfhs_diag::HfhsFull::open(&hpath) {
+                    Ok(pkg) => {
+                        eprintln!("ldlq: HFHS full Hessian index opened ({:?})", hpath);
+                        let _ = LDLQ_HESSIAN.set(LdlqHessian::Hfhs(pkg));
+                    }
+                    Err(e) => {
+                        eprintln!("error: --ldlq could not open HFHS ({:?}): {e}", hpath);
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
+        if args.ldlq {
+            let d = args.gptq_damp.unwrap_or(0.01);
+            let m = args.gptq_max_damp.unwrap_or(1.0);
+            if args.gptq_damp.is_none() && args.gptq_max_damp.is_none() {
+                eprintln!("ldlq: GPTQ damping defaults: initial_damp={d} (absolute), max_damp_multiplier={m} (relative to mean(diag(H)))");
+            } else {
+                eprintln!("ldlq: GPTQ damping: initial_damp={d}, max_damp_multiplier={m}");
+            }
+        }
+    } else if args.ldlq {
+        eprintln!("error: --ldlq requires --hessian <HFQM .calib.hfq or HFHS .hessian.bin>");
+        std::process::exit(1);
+    }
     // ── Phase A Stage A: AWQ (Activation-aware Weight Quantization) ──
     // --awq           → enable AWQ at default alpha=0.55
     // --awq-alpha <f> → enable AWQ at explicit alpha (overrides default)
-    // Requires --imatrix (we derive RMS_act from imatrix's in_sum2 values).
+    // Requires --imatrix OR --hessian (we derive RMS_act from in_sum2).
     // Per-channel scaling: W' = W · diag(s) at quantize time, sidecar
     // 1D F16 tensor <weight>.awq_scale stored alongside the parent weight.
     // Runtime path divides activations by s before the rotation kernel —
@@ -8332,7 +8662,7 @@ fn main() {
     if awq_enabled {
         if IMATRIX.get().is_none() {
             eprintln!(
-                "error: --awq requires --imatrix (we derive RMS_act per channel from imatrix in_sum2 values)"
+                "error: --awq requires --imatrix or --hessian (we derive RMS_act per channel from imatrix/Hessian diagonal in_sum2 values)"
             );
             std::process::exit(1);
         }
@@ -9639,10 +9969,19 @@ fn main() {
 
         // Source-precision BF16 passthrough for non-vision model tensors.
         // Unlike the F32 oracle above, this preserves the checkpoint's native
-        // two-byte representation on disk. The qwen35 loader can consume
-        // qt=16 losslessly; vision remains on the established F16 ingest path
+        // two-byte representation on disk. Vision stays on the F16 ingest path
         // because its kernels consume F16 matrices.
-        if use_bf16 && matches!(arch_id, 5 | 6) && !is_vision {
+        //
+        // The arch gate here used to be `matches!(arch_id, 5 | 6)`, which was
+        // arbitrary: this body is arch-agnostic (it copies raw BF16 bytes, or
+        // converts-and-round-to-nearest-even, plus a generic 3D-expert split).
+        // The narrow gate silently denied bf16 to EVERY non-qwen arch — lfm2
+        // (11), gemma4 (13), glimmer (14) — so `--format bf16` on those fell
+        // through to an arch-specific default. On lfm2 that meant the hardcoded
+        // Q8 route below, which produced a Q8 "bf16" teacher with no warning.
+        // A Q8 teacher is actively wrong for calibration: its per-block scale
+        // compresses the outlier channels AWQ exists to protect.
+        if use_bf16 && !is_vision {
             let bf16_bytes = if meta.dtype == "BF16" {
                 raw_data.to_vec()
             } else {
@@ -11817,50 +12156,123 @@ fn main() {
                         if k_dim % 256 == 0 {
                             let signs1 = gen_fwht_signs(42, 256);
                             let signs2 = gen_fwht_signs(1042, 256);
-                            // Phase A Stage A — AWQ pre-scaling, when --awq is enabled
-                            // AND we have imatrix data for this tensor AND the tensor
-                            // is on the AWQ whitelist (see `awq_eligible`). Mutates a
-                            // local copy of the weights so the original f32_data
-                            // returned by to_f32() is left intact for downstream
-                            // consumers (we don't currently have any here, but this
-                            // is hygienic).
-                            //
-                            // The `awq_eligible(name)` guard is critical: pre-scaling
-                            // weights whose runtime path lacks the inverse divide
-                            // produces `(W·s)·x ≠ W·x` and catastrophically corrupts
-                            // logits (KLD 0.67 → 13.5 measured on 0.8B Qwen3.5 before
-                            // this guard landed). See `docs/plans/awq_fix_claude.md`.
-                            let q = if let (Some(alpha), Some(im_weights)) =
-                                (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
-                            {
-                                if awq_eligible(name) {
-                                    debug_assert_eq!(
-                                        im_weights.len(),
-                                        k_dim,
-                                        "imatrix length ({}) != K dim ({}) for {}",
-                                        im_weights.len(),
-                                        k_dim,
-                                        name
-                                    );
-                                    let scales = compute_awq_scales(im_weights, alpha);
-                                    // Stash for sidecar emission after the main tensor push.
-                                    awq_sidecar_scales = Some(scales.clone());
-                                    let m_dim = meta.shape[0];
-                                    // Copy weights so we don't mutate to_f32's buffer
-                                    // (might be shared/borrowed depending on dtype path).
-                                    let mut scaled = f32_data.clone();
-                                    awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
-                                    quantize_mq4g256(&scaled, &signs1, &signs2)
+                            // ── AWQ scales computed once for both RTN and GPTQ ──
+                            // Same vector feeds the sidecar emission and the GPTQ
+                            // pipeline's H-rescaling, so AWQ and GPTQ compose
+                            // rather than double-apply.
+                            let awq_scales_opt: Option<Vec<f32>> =
+                                if let (Some(alpha), Some(im_weights)) =
+                                    (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
+                                {
+                                    if awq_eligible(name) {
+                                        debug_assert_eq!(
+                                            im_weights.len(),
+                                            k_dim,
+                                            "imatrix length ({}) != K dim ({}) for {}",
+                                            im_weights.len(),
+                                            k_dim,
+                                            name
+                                        );
+                                        let scales = compute_awq_scales(im_weights, alpha);
+                                        awq_sidecar_scales = Some(scales.clone());
+                                        Some(scales)
+                                    } else {
+                                        None
+                                    }
                                 } else {
-                                    // Runtime path for this weight has no AWQ inverse
-                                    // (rotate_x_mq for o_proj/out_proj/wo, or
-                                    // fused_silu_mul_rotate_mq for down_proj/w_down).
-                                    // Skip AWQ for this tensor — emit plain MQ4 and
-                                    // no sidecar.
-                                    quantize_mq4g256(&f32_data, &signs1, &signs2)
+                                    None
+                                };
+                            let initial_damp = args.gptq_damp.unwrap_or(0.01);
+                            let max_damp_multiplier = args.gptq_max_damp.unwrap_or(1.0);
+                            let q = if args.ldlq {
+                                if let Some(h) = ldlq_hessian_for(name, k_dim) {
+                                    // Hessian exists — attempt full-Hessian GPTQ.
+                                    let awq_scales_f64: Vec<f64> =
+                                        if let Some(sc) = &awq_scales_opt {
+                                            sc.iter().map(|&v| v as f64).collect()
+                                        } else {
+                                            vec![1.0f64; k_dim]
+                                        };
+                                    let m_dim = if meta.shape.len() == 2 {
+                                        meta.shape[0]
+                                    } else {
+                                        1
+                                    };
+                                    // Pipeline expects post-AWQ weights (docs line 632).
+                                    // Pre-scale here exactly as the RTN path does.
+                                    let weights_for_gptq: Vec<f32> =
+                                        if let Some(sc) = &awq_scales_opt {
+                                            let mut w = f32_data.clone();
+                                            awq_pre_scale_weights(&mut w, m_dim, k_dim, sc);
+                                            w
+                                        } else {
+                                            f32_data.clone()
+                                        };
+                                    match gptq::gptq_pipeline_mq4g256(
+                                        &weights_for_gptq,
+                                        m_dim,
+                                        k_dim,
+                                        &h,
+                                        &awq_scales_f64,
+                                        &signs1,
+                                        &signs2,
+                                        initial_damp,
+                                        max_damp_multiplier,
+                                        name,
+                                    ) {
+                                        Ok(bytes) => {
+                                            GPTQ_MQ4_FIRED
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            bytes
+                                        }
+                                        Err(e) => {
+                                            eprintln!(
+                                                "  gptq: Cholesky failed for {name} (K={k_dim}): {e}; falling back to RTN MQ4"
+                                            );
+                                            GPTQ_MQ4_FALLBACK
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            if awq_scales_opt.is_some() {
+                                                quantize_mq4g256(
+                                                    &weights_for_gptq,
+                                                    &signs1,
+                                                    &signs2,
+                                                )
+                                            } else {
+                                                quantize_mq4g256(&f32_data, &signs1, &signs2)
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    // --ldlq set but no Hessian for this tensor.
+                                    GPTQ_MQ4_FALLBACK
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    if let Some(sc) = &awq_scales_opt {
+                                        let m_dim = if meta.shape.len() == 2 {
+                                            meta.shape[0]
+                                        } else {
+                                            1
+                                        };
+                                        let mut w = f32_data.clone();
+                                        awq_pre_scale_weights(&mut w, m_dim, k_dim, sc);
+                                        quantize_mq4g256(&w, &signs1, &signs2)
+                                    } else {
+                                        quantize_mq4g256(&f32_data, &signs1, &signs2)
+                                    }
                                 }
                             } else {
-                                quantize_mq4g256(&f32_data, &signs1, &signs2)
+                                // --ldlq not set — byte-identical to the pre-GPTQ path.
+                                if let Some(sc) = &awq_scales_opt {
+                                    let m_dim = if meta.shape.len() == 2 {
+                                        meta.shape[0]
+                                    } else {
+                                        1
+                                    };
+                                    let mut w = f32_data.clone();
+                                    awq_pre_scale_weights(&mut w, m_dim, k_dim, sc);
+                                    quantize_mq4g256(&w, &signs1, &signs2)
+                                } else {
+                                    quantize_mq4g256(&f32_data, &signs1, &signs2)
+                                }
                             };
                             (q, QuantType::MQ4G256, 256u32, "MQ4G256")
                         } else {
@@ -12696,6 +13108,33 @@ fn main() {
                     "  WARNING: 0 GPTQ tensors fired with --hessian-dir set — likely a KEY-MISMATCH (.hblk filenames != hessian_key), NOT a flat result."
                 );
             }
+        }
+    }
+    {
+        let fired = GPTQ_MQ4_FIRED.load(std::sync::atomic::Ordering::Relaxed);
+        let fb = GPTQ_MQ4_FALLBACK.load(std::sync::atomic::Ordering::Relaxed);
+        if args.ldlq {
+            eprintln!(
+                "  GPTQ-MQ4: {fired} tensors GPTQ'd, {fb} fell back to RTN (missing Hessian or Cholesky failure). {:.1}% GPTQ.",
+                if fired + fb > 0 {
+                    100.0 * fired as f64 / (fired + fb) as f64
+                } else {
+                    0.0
+                }
+            );
+            if fired == 0 && fb > 0 {
+                eprintln!(
+                    "  WARNING: 0 MQ4 tensors GPTQ'd with --ldlq set — all fell back to RTN (check Hessian K-match and --hessian path)."
+                );
+            } else if fb > 0 {
+                eprintln!(
+                    "  note: {fb} dense MQ4 tensors had no Hessian entry (or Cholesky failed) and used RTN; N={fired} GPTQ, M={fb} fallback."
+                );
+            }
+        } else if fired + fb > 0 {
+            eprintln!(
+                "  GPTQ-MQ4: {fired} tensors GPTQ'd, {fb} fallback (unexpected when --ldlq not set)"
+            );
         }
     }
     let mean_quant_error = if quantized_params > 0 {

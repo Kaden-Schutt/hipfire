@@ -81,6 +81,14 @@ fn load_f32(
             // Q8_0: 32-elem blocks [f16 scale | 32 i8]. Dequant to f32.
             dequant_q8_0(&data)
         }
+        // BF16 norms always widen to F32: norms are applied in F32 regardless of
+        // the weight dtype, and they are a negligible fraction of parameters, so
+        // there is nothing to gain from keeping them narrow. This is independent
+        // of `calib_force_bf16()`, which governs GEMM weights only.
+        16 => data
+            .chunks_exact(2)
+            .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+            .collect(),
         _ => {
             return Err(format!(
                 "lfm2moe: expected F16/F32/Q8 for {name}, got qt={qt}"
@@ -168,6 +176,53 @@ fn wt_from_raw(
     m: usize,
     k: usize,
 ) -> Result<WeightTensor, String> {
+    // BF16 teacher (qt=16): when HIPFIRE_CALIB_BF16=1 keep native BF16
+    // (raw 2-byte payload, DType::BF16, MFMA kernel); otherwise widen to F32
+    // (Always-available kernel, lossless). F16 (qt=1) stays F16.
+    if qt == 16 {
+        if rdna_compute::calib_force_bf16() {
+            if data.len() % 2 != 0 {
+                return Err(format!(
+                    "lfm2moe wt_from_raw: BF16 byte length {} is not 2-aligned",
+                    data.len()
+                ));
+            }
+            let buf = gpu
+                .upload_raw(data, &[data.len()])
+                .map_err(|e| format!("upload_raw BF16 {m}x{k}: {e:?}"))?;
+            return Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::BF16,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            });
+        }
+        if data.len() % 2 != 0 {
+            return Err(format!(
+                "lfm2moe wt_from_raw: BF16 byte length {} is not 2-aligned",
+                data.len()
+            ));
+        }
+        let f32_data: Vec<f32> = data
+            .chunks_exact(2)
+            .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+            .collect();
+        let buf = gpu
+            .upload_f32(&f32_data, &[m, k])
+            .map_err(|e| format!("lfm2moe: upload F32 BF16->F32 {m}x{k}: {e:?}"))?;
+        return Ok(WeightTensor {
+            buf,
+            gpu_dtype: DType::F32,
+            m,
+            k,
+            row_stride: 0,
+            paro: None,
+            awq_scale: None,
+        });
+    }
     let dtype = match qt {
         3 => DType::Q8_0,
         6 => DType::HFQ4G256,
@@ -432,7 +487,6 @@ impl Lfm2MoeWeights {
         let moe_inter = cfg.moe_intermediate_size;
         let n_exp = cfg.num_experts;
         let k_conv = cfg.conv_kernel_size;
-
         // Globals. embed_tokens is the shared (tied) lm_head.
         let (_eqt, embed_bytes) = read_tensor(hfq, "model.embed_tokens.weight")?;
         let (embd_format, embed) = match _eqt {
@@ -469,9 +523,27 @@ impl Lfm2MoeWeights {
                     .map_err(|e| format!("lfm2moe: upload embed F32: {e:?}"))?;
                 (hipfire_runtime::llama::EmbeddingFormat::F32, buf)
             }
+            16 => {
+                // BF16 embedding (HFQ qt=16) → widen to F32 on host, mark F32.
+                // Gather path, not GEMM, so always F32 even under BF16 override.
+                if embed_bytes.len() % 2 != 0 {
+                    return Err(format!(
+                        "lfm2moe: BF16 embed byte length {} is not 2-aligned",
+                        embed_bytes.len()
+                    ));
+                }
+                let f32_data: Vec<f32> = embed_bytes
+                    .chunks_exact(2)
+                    .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+                    .collect();
+                let buf = gpu
+                    .upload_f32(&f32_data, &[cfg.vocab_size, cfg.hidden_size])
+                    .map_err(|e| format!("lfm2moe: upload embed BF16->F32: {e:?}"))?;
+                (hipfire_runtime::llama::EmbeddingFormat::F32, buf)
+            }
             other => {
                 return Err(format!(
-                    "lfm2moe: unsupported embedding quant_type {other} (expected 1,3,6)"
+                    "lfm2moe: unsupported embedding quant_type {other} (expected 1,3,6,16)"
                 ))
             }
         };
@@ -878,7 +950,10 @@ fn load_f32_from_source(
         // F16/BF16 (qt==1) and F32 (qt==2) widen via the shared dtype-aware
         // helper — it decodes BF16 with the correct bit layout (the old
         // f16_to_f32 path silently mis-decoded BF16 as F16).
-        1 | 2 => source_bytes_to_f32_vec(dtype, data),
+        // qt=16 is an explicit BF16 tensor (a BF16 teacher); the dtype-aware
+        // helper decodes it with the correct bit layout. Norms always widen to
+        // F32 — see `load_f32`.
+        1 | 2 | 16 => source_bytes_to_f32_vec(dtype, data),
         3 => {
             // Q8_0: 32-elem blocks [f16 scale | 32 i8]. Dequant to f32.
             dequant_q8_0(data)
@@ -908,9 +983,10 @@ fn load_wt_from_source(
 }
 
 /// Upload raw bytes as a WeightTensor, determining gpu_dtype from the
-/// (possibly inferred) quant_type. `src_dtype` is the source dtype string,
-/// used to narrow BF16 → F16 before upload (the GPU F16 path can't consume
-/// raw BF16 bytes — uploading them as-is yields silently-wrong values).
+/// (possibly inferred) quant_type. `src_dtype` is the source dtype string —
+/// when HIPFIRE_CALIB_BF16=1, BF16 payloads (qt==16 or qt==1+BF16) are kept as
+/// raw BF16 (DType::BF16, MFMA); otherwise they are widened to F32
+/// (Always-available kernel, lossless). F16 (qt==1+ F16) stays F16.
 fn wt_from_source_raw(
     gpu: &mut Gpu,
     qt: u8,
@@ -919,6 +995,51 @@ fn wt_from_source_raw(
     m: usize,
     k: usize,
 ) -> Result<WeightTensor, String> {
+    let is_bf16 = (qt == 1 && src_dtype == "BF16") || qt == 16;
+    if is_bf16 {
+        if rdna_compute::calib_force_bf16() {
+            if data.len() % 2 != 0 {
+                return Err(format!(
+                    "lfm2moe wt_from_source_raw: BF16 byte length {} is not 2-aligned",
+                    data.len()
+                ));
+            }
+            let buf = gpu
+                .upload_raw(data, &[data.len()])
+                .map_err(|e| format!("upload_raw BF16 {m}x{k}: {e:?}"))?;
+            return Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::BF16,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            });
+        }
+        if data.len() % 2 != 0 {
+            return Err(format!(
+                "lfm2moe wt_from_source_raw: BF16 byte length {} is not 2-aligned",
+                data.len()
+            ));
+        }
+        let f32_data: Vec<f32> = data
+            .chunks_exact(2)
+            .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+            .collect();
+        let buf = gpu
+            .upload_f32(&f32_data, &[m, k])
+            .map_err(|e| format!("lfm2moe: upload F32 BF16->F32 {m}x{k}: {e:?}"))?;
+        return Ok(WeightTensor {
+            buf,
+            gpu_dtype: DType::F32,
+            m,
+            k,
+            row_stride: 0,
+            paro: None,
+            awq_scale: None,
+        });
+    }
     let dtype = match qt {
         3 => DType::Q8_0,
         6 => DType::HFQ4G256,
@@ -932,16 +1053,6 @@ fn wt_from_source_raw(
         30 => DType::MQ4G256Lloyd,
         1 => DType::F16,
         other => return Err(format!("unsupported quant_type {other}")),
-    };
-    // BF16 sources arrive as raw 2-byte bf16 (qt==1, same size as F16);
-    // narrow to F16 bytes before the raw upload so the F16-tagged buffer holds
-    // correctly-decoded values.
-    let converted: Vec<u8>;
-    let data: &[u8] = if qt == 1 && src_dtype == "BF16" {
-        converted = bf16_bytes_to_f16(data);
-        &converted
-    } else {
-        data
     };
     let buf = gpu
         .upload_raw(data, &[data.len()])
@@ -1020,8 +1131,10 @@ pub fn load_weights_from_source(
                 .map_err(|e| format!("lfm2moe: upload embed: {e:?}"))?;
             (fmt, buf)
         }
-        1 => {
+        1 | 16 => {
             // F16/BF16 embedding → widen to F32 via dtype-aware helper, mark F32.
+            // Covers both qt==1 (dtype string distinguishes F16/BF16) and
+            // qt==16 (explicit BF16 from --format bf16). Gather path, not GEMM.
             let f32_data: Vec<f32> = source_bytes_to_f32_vec(edt, embed_bytes);
             // Validate element count matches vocab*hidden.
             let expected = cfg
@@ -1042,7 +1155,7 @@ pub fn load_weights_from_source(
         }
         other => {
             return Err(format!(
-                "lfm2moe: unsupported embedding quant_type {other} (expected 1,3,6)"
+                "lfm2moe: unsupported embedding quant_type {other} (expected 1,3,6,16)"
             ))
         }
     };
@@ -1505,18 +1618,15 @@ impl Lfm2MoeState {
 }
 
 /// Authoritative batch admissibility predicate.
-/// Embeddings: Q8_0, HFQ4G256 only (F32 is sequential-only).
-/// Dense projections: Q8_0, HFQ4G256, MQ4G256 (one GEMM per weight; MQ4 via FWHT).
-/// lm_head: Q8_0, HFQ4G256, MQ4G256, HFQ6G256, MQ6G256, MQ3G256 (existing kernel coverage).
+/// Embeddings: Q8_0, HFQ4G256, F32 (gather — B-loop, negligible vs GEMM).
+/// Dense projections: Q8_0, HFQ4G256, MQ4G256, F32, BF16 (batched GEMM; BF16 via MFMA on gfx942).
+/// lm_head: Q8_0, HFQ4G256, MQ4G256, HFQ6G256, MQ6G256, MQ3G256, F32, BF16 (batched GEMM).
 /// MoE FFN: not admitted (dense-only batch).
 pub fn batch_weight_formats_supported(weights: &Lfm2MoeWeights) -> Result<(), String> {
     use hipfire_runtime::llama::EmbeddingFormat;
-    // Embedding allowlist: Q8/HFQ4 only.
+    // Embedding allowlist: Q8/HFQ4/F32 (F32 via scalar gather loop).
     match weights.embd_format {
-        EmbeddingFormat::Q8_0 | EmbeddingFormat::HFQ4G256 => {}
-        EmbeddingFormat::F32 => {
-            return Err("batched decode: F32 embedding not supported".to_string())
-        }
+        EmbeddingFormat::Q8_0 | EmbeddingFormat::HFQ4G256 | EmbeddingFormat::F32 => {}
         _ => return Err("batched decode: unsupported embedding format".to_string()),
     }
     // lm_head allowlist (keep aligned with lm_head_batched_lfm kernels).
@@ -1526,23 +1636,25 @@ pub fn batch_weight_formats_supported(weights: &Lfm2MoeWeights) -> Result<(), St
         | DType::MQ4G256
         | DType::HFQ6G256
         | DType::MQ6G256
-        | DType::MQ3G256 => {}
+        | DType::MQ3G256
+        | DType::F32
+        | DType::BF16 => {}
         other => {
             return Err(format!(
                 "batched decode: unsupported lm_head dtype {other:?}"
             ))
         }
     }
-    // Dense projections: Q8/HFQ4/MQ4 only.
+    // Dense projections: Q8/HFQ4/MQ4/F32/BF16.
     for layer in &weights.layers {
         match &layer.mixer {
             crate::lfm2moe::Mixer::Conv(c) => {
                 for w in [&c.in_proj, &c.out_proj] {
                     match w.gpu_dtype {
-                        DType::Q8_0 | DType::HFQ4G256 | DType::MQ4G256 => {}
+                        DType::Q8_0 | DType::HFQ4G256 | DType::MQ4G256 | DType::F32 | DType::BF16 => {}
                         other => {
                             return Err(format!(
-                                "batched decode: conv projection dtype {other:?} not supported (expected Q8/HFQ4/MQ4)"
+                                "batched decode: conv projection dtype {other:?} not supported (expected Q8/HFQ4/MQ4/F32/BF16)"
                             ))
                         }
                     }
@@ -1551,7 +1663,7 @@ pub fn batch_weight_formats_supported(weights: &Lfm2MoeWeights) -> Result<(), St
             crate::lfm2moe::Mixer::Attention(a) => {
                 for w in [&a.wq, &a.wk, &a.wv, &a.wo] {
                     match w.gpu_dtype {
-                        DType::Q8_0 | DType::HFQ4G256 | DType::MQ4G256 => {}
+                        DType::Q8_0 | DType::HFQ4G256 | DType::MQ4G256 | DType::F32 | DType::BF16 => {}
                         other => {
                             return Err(format!(
                                 "batched decode: attention projection dtype {other:?} not supported"
@@ -1565,7 +1677,7 @@ pub fn batch_weight_formats_supported(weights: &Lfm2MoeWeights) -> Result<(), St
             crate::lfm2moe::Ffn::Dense(d) => {
                 for w in [&d.w1, &d.w3, &d.w2] {
                     match w.gpu_dtype {
-                        DType::Q8_0 | DType::HFQ4G256 | DType::MQ4G256 => {}
+                        DType::Q8_0 | DType::HFQ4G256 | DType::MQ4G256 | DType::F32 | DType::BF16 => {}
                         other => {
                             return Err(format!(
                                 "batched decode: dense FFN dtype {other:?} not supported"
@@ -1612,10 +1724,16 @@ mod batch_format_tests {
     use rdna_compute::DType;
 
     fn is_embedding_supported(fmt: EmbeddingFormat) -> bool {
-        matches!(fmt, EmbeddingFormat::Q8_0 | EmbeddingFormat::HFQ4G256)
+        matches!(
+            fmt,
+            EmbeddingFormat::Q8_0 | EmbeddingFormat::HFQ4G256 | EmbeddingFormat::F32
+        )
     }
     fn is_dense_proj_supported(dtype: DType) -> bool {
-        matches!(dtype, DType::Q8_0 | DType::HFQ4G256 | DType::MQ4G256)
+        matches!(
+            dtype,
+            DType::Q8_0 | DType::HFQ4G256 | DType::MQ4G256 | DType::F32 | DType::BF16
+        )
     }
     fn is_lm_head_supported(dtype: DType) -> bool {
         matches!(
@@ -1626,6 +1744,8 @@ mod batch_format_tests {
                 | DType::HFQ6G256
                 | DType::MQ6G256
                 | DType::MQ3G256
+                | DType::F32
+                | DType::BF16
         )
     }
 
@@ -1678,31 +1798,33 @@ mod batch_format_tests {
 
     #[test]
     fn predicate_families() {
-        // Embeddings: only Q8/HFQ4 batch-admissible, F32 sequential-only.
+        // Embeddings: Q8/HFQ4/F32 (F32 via scalar gather loop) batch-admissible.
         assert!(is_embedding_supported(EmbeddingFormat::Q8_0));
         assert!(is_embedding_supported(EmbeddingFormat::HFQ4G256));
-        assert!(!is_embedding_supported(EmbeddingFormat::F32));
+        assert!(is_embedding_supported(EmbeddingFormat::F32));
         assert!(!is_embedding_supported(EmbeddingFormat::HFQ4G128));
         assert!(!is_embedding_supported(EmbeddingFormat::Q4K));
 
-        // Dense projections: Q8/HFQ4/MQ4 only.
+        // Dense projections: Q8/HFQ4/MQ4/F32/BF16.
         assert!(is_dense_proj_supported(DType::Q8_0));
         assert!(is_dense_proj_supported(DType::HFQ4G256));
         assert!(is_dense_proj_supported(DType::MQ4G256));
-        assert!(!is_dense_proj_supported(DType::F32));
+        assert!(is_dense_proj_supported(DType::F32));
+        assert!(is_dense_proj_supported(DType::BF16));
         assert!(!is_dense_proj_supported(DType::F16));
         assert!(!is_dense_proj_supported(DType::HFQ6G256));
         assert!(!is_dense_proj_supported(DType::MQ6G256));
         assert!(!is_dense_proj_supported(DType::MQ3G256));
 
-        // lm_head: broader allowlist includes HFQ6/MQ6/MQ3 but still rejects F32/F16.
+        // lm_head: broader allowlist includes HFQ6/MQ6/MQ3 and F32/BF16 (generic GEMM / MFMA).
         assert!(is_lm_head_supported(DType::Q8_0));
         assert!(is_lm_head_supported(DType::HFQ4G256));
         assert!(is_lm_head_supported(DType::MQ4G256));
         assert!(is_lm_head_supported(DType::HFQ6G256));
         assert!(is_lm_head_supported(DType::MQ6G256));
         assert!(is_lm_head_supported(DType::MQ3G256));
-        assert!(!is_lm_head_supported(DType::F32));
+        assert!(is_lm_head_supported(DType::F32));
+        assert!(is_lm_head_supported(DType::BF16));
         assert!(!is_lm_head_supported(DType::F16));
         assert!(!is_lm_head_supported(DType::MQ2G256));
     }

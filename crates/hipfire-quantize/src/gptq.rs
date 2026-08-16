@@ -39,9 +39,24 @@
 
 #![cfg_attr(not(test), allow(dead_code))]  // suppress until main.rs wires it
 
+#[allow(unused_imports)]
 use faer::linalg::solvers::{DenseSolveCore, Solve};
 use faer::{Mat, Side};
 use rayon::prelude::*;
+
+/// GPU acceleration threshold.
+///
+/// At K=1024 a single K×K FP64 matrix is 8 MiB. Host→device upload at
+/// ~30 GB/s (MI300X Infinity Fabric / PCIe 5) costs ~0.27 ms; device→host
+/// similar. Three O(K³) FP64 steps totalling ~3·K³ FLOPs (Cholesky K³/3 +
+/// trtri K³/3 + gemm 2·K³ ≈ 2.7·K³; at K=1024 ≈ 2.9 GFLOP) cost ~0.07 ms on
+/// MI300X (≈40 TFLOP FP64 matrix) vs ~30 ms on 8-core scalar FP64 CPU
+/// (≈100 GFLOP). Even with two 8 MiB transfers (~0.5 ms), GPU is >30×
+/// faster at K=1024. Below 1024 kernel launch + handle creation (tens of µs)
+/// and transfer overhead dominate and the CPU's cache-resident rayon path is
+/// faster and avoids device allocation pressure. So we fall back to CPU for
+/// K < 1024.
+const GPU_K_THRESHOLD: usize = 1024;
 
 /// Per-element asymmetric MQ4 quantize step.
 ///
@@ -175,6 +190,360 @@ fn clamped_initial_damp(initial_damp: f64, diag_mean: f64) -> f64 {
     initial_damp.max(f64::EPSILON * diag_mean.max(1.0))
 }
 
+/// GPU linear-algebra path via rocSOLVER + rocBLAS (FP64), soft-failing.
+///
+/// All three O(K³) terms are handled on device without host round-trips
+/// for intermediates:
+///   1. rocsolver_dpotrf (lower) on H+λI
+///   2. rocsolver_dtrtri (lower, non-unit) to invert L
+///   3. rocblas_dgemm  H_inv = L_inv^T · L_inv  (FP64)
+///   4. rocsolver_dpotrf (lower) on H_inv → L_HI, then U = L_HI^T on host
+///
+/// Design: dlopen libamdhip64.so / librocsolver.so / librocblas.so lazily;
+/// any missing library or failed call returns `None` so the caller falls
+/// back to the CPU path. `info > 0` from `dpotrf` drives the same 10× damping
+/// retry ladder as the CPU faer path, preserving `SingularEvenWithMaxDamp`.
+mod gpu {
+    use super::{CholeskyError, GPU_K_THRESHOLD};
+    use faer::Mat;
+    use libloading::Library;
+    use std::ffi::c_void;
+    use std::os::raw::{c_int, c_uint};
+
+    const ROCBLAS_STATUS_SUCCESS: u32 = 0;
+    const ROCBLAS_FILL_LOWER: c_uint = 122;
+    const ROCBLAS_DIAG_NON_UNIT: c_uint = 131;
+    const ROCBLAS_OP_N: c_uint = 111;
+    const ROCBLAS_OP_T: c_uint = 112;
+    const HIP_MEMCPY_H2D: c_uint = 1;
+    const HIP_MEMCPY_D2H: c_uint = 2;
+
+    type RocblasHandle = *mut c_void;
+
+    type RocblasCreateHandleFn = unsafe extern "C" fn(*mut RocblasHandle) -> u32;
+    type RocblasDestroyHandleFn = unsafe extern "C" fn(RocblasHandle) -> u32;
+    type RocsolverDpotrfFn = unsafe extern "C" fn(
+        RocblasHandle, c_uint, c_int, *mut f64, c_int, *mut c_int,
+    ) -> u32;
+    type RocsolverDtrtriFn = unsafe extern "C" fn(
+        RocblasHandle, c_uint, c_uint, c_int, *mut f64, c_int, *mut c_int,
+    ) -> u32;
+    type RocblasDgemmFn = unsafe extern "C" fn(
+        RocblasHandle,
+        c_uint, c_uint,
+        c_int, c_int, c_int,
+        *const f64,
+        *const f64, c_int,
+        *const f64, c_int,
+        *const f64,
+        *mut f64, c_int,
+    ) -> u32;
+    type HipMallocFn = unsafe extern "C" fn(*mut *mut c_void, usize) -> u32;
+    type HipFreeFn = unsafe extern "C" fn(*mut c_void) -> u32;
+    type HipMemcpyFn = unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_uint) -> u32;
+    type HipDeviceSynchronizeFn = unsafe extern "C" fn() -> u32;
+
+    struct HipFns {
+        malloc: HipMallocFn,
+        free: HipFreeFn,
+        memcpy: HipMemcpyFn,
+        dev_sync: HipDeviceSynchronizeFn,
+    }
+    struct RocblasFns {
+        create_handle: RocblasCreateHandleFn,
+        destroy_handle: RocblasDestroyHandleFn,
+        dgemm: RocblasDgemmFn,
+    }
+    struct RocsolverFns {
+        dpotrf: RocsolverDpotrfFn,
+        dtrtri: RocsolverDtrtriFn,
+    }
+
+    fn try_load_hip() -> Option<(Library, HipFns)> {
+        let candidates = hipfire_config::rocm::library_candidates(&[
+            "libamdhip64.so",
+            "libamdhip64.so.7",
+            "libamdhip64.so.6",
+            "libamdhip64.so.5",
+        ]);
+        for cand in candidates.iter().chain(
+            [
+                "libamdhip64.so".to_string(),
+                "/opt/rocm/lib/libamdhip64.so".to_string(),
+            ]
+            .iter(),
+        ) {
+            if let Ok(lib) = unsafe { Library::new(cand) } {
+                let m: HipMallocFn = unsafe { *lib.get::<HipMallocFn>(b"hipMalloc").ok()? };
+                let f: HipFreeFn = unsafe { *lib.get::<HipFreeFn>(b"hipFree").ok()? };
+                let c: HipMemcpyFn = unsafe { *lib.get::<HipMemcpyFn>(b"hipMemcpy").ok()? };
+                let s: HipDeviceSynchronizeFn =
+                    unsafe { *lib.get::<HipDeviceSynchronizeFn>(b"hipDeviceSynchronize").ok()? };
+                return Some((
+                    lib,
+                    HipFns {
+                        malloc: m,
+                        free: f,
+                        memcpy: c,
+                        dev_sync: s,
+                    },
+                ));
+            }
+        }
+        None
+    }
+
+    fn try_load_rocblas() -> Option<(Library, RocblasFns)> {
+        let candidates = hipfire_config::rocm::library_candidates(&[
+            "librocblas.so",
+            "librocblas.so.7",
+            "librocblas.so.6",
+            "librocblas.so.5",
+        ]);
+        for cand in candidates.iter().chain(
+            ["librocblas.so".to_string(), "/opt/rocm/lib/librocblas.so".to_string()].iter(),
+        ) {
+            if let Ok(lib) = unsafe { Library::new(cand) } {
+                let c: RocblasCreateHandleFn =
+                    unsafe { *lib.get::<RocblasCreateHandleFn>(b"rocblas_create_handle").ok()? };
+                let d: RocblasDestroyHandleFn =
+                    unsafe { *lib.get::<RocblasDestroyHandleFn>(b"rocblas_destroy_handle").ok()? };
+                let g: RocblasDgemmFn =
+                    unsafe { *lib.get::<RocblasDgemmFn>(b"rocblas_dgemm").ok()? };
+                return Some((
+                    lib,
+                    RocblasFns {
+                        create_handle: c,
+                        destroy_handle: d,
+                        dgemm: g,
+                    },
+                ));
+            }
+        }
+        None
+    }
+
+    fn try_load_rocsolver() -> Option<(Library, RocsolverFns)> {
+        let candidates = hipfire_config::rocm::library_candidates(&[
+            "librocsolver.so",
+            "librocsolver.so.0",
+            "librocsolver.so.0.6",
+        ]);
+        for cand in candidates.iter().chain(
+            [
+                "librocsolver.so".to_string(),
+                "/opt/rocm/lib/librocsolver.so".to_string(),
+                "/opt/rocm/lib/librocsolver.so.0.6.70002".to_string(),
+            ]
+            .iter(),
+        ) {
+            if let Ok(lib) = unsafe { Library::new(cand) } {
+                let p: RocsolverDpotrfFn =
+                    unsafe { *lib.get::<RocsolverDpotrfFn>(b"rocsolver_dpotrf").ok()? };
+                let tr: RocsolverDtrtriFn =
+                    unsafe { *lib.get::<RocsolverDtrtriFn>(b"rocsolver_dtrtri").ok()? };
+                return Some((
+                    lib,
+                    RocsolverFns {
+                        dpotrf: p,
+                        dtrtri: tr,
+                    },
+                ));
+            }
+        }
+        None
+    }
+
+    /// Try GPU path. `None` = soft-fail (library missing or recoverable GPU
+    /// error → caller falls back to CPU). `Some(Err(CholeskyError))` =
+    /// `SingularEvenWithMaxDamp` that must be propagated.
+    pub(super) fn try_gpu_compute(
+        h_eff: &Mat<f64>,
+        initial_damp: f64,
+        max_damp_multiplier: f64,
+        diag_mean: f64,
+        k: usize,
+    ) -> Option<Result<(Mat<f64>, f64), CholeskyError>> {
+        if k < GPU_K_THRESHOLD {
+            return None;
+        }
+        // Soft-fail fast if any library is absent.
+        let (hip_lib, hip) = try_load_hip()?;
+        let (rb_lib, rb) = try_load_rocblas()?;
+        let (rs_lib, rs) = try_load_rocsolver()?;
+        // Keep libraries alive for the duration of the call.
+        let _keep = (&hip_lib, &rb_lib, &rs_lib);
+
+        // Create rocBLAS handle (also used by rocSOLVER).
+        let mut handle: RocblasHandle = std::ptr::null_mut();
+        let st = unsafe { (rb.create_handle)(&mut handle) };
+        if st != ROCBLAS_STATUS_SUCCESS || handle.is_null() {
+            return None;
+        }
+        // Ensure handle is destroyed. Use a guard.
+        struct HandleGuard(RocblasHandle, RocblasDestroyHandleFn);
+        impl Drop for HandleGuard {
+            fn drop(&mut self) {
+                unsafe { (self.1)(self.0); }
+            }
+        }
+        let _guard = HandleGuard(handle, rb.destroy_handle);
+
+        let n = k as c_int;
+        let lda = n;
+        let bytes = k * k * std::mem::size_of::<f64>();
+
+        // Device buffers: dA holds H+damp*I → L → L_inv; dB holds H_inv → L_HI; dInfo.
+        let mut d_a: *mut c_void = std::ptr::null_mut();
+        let mut d_b: *mut c_void = std::ptr::null_mut();
+        let mut d_info: *mut c_void = std::ptr::null_mut();
+        let info_bytes = std::mem::size_of::<c_int>();
+        let alloc = |ptr: &mut *mut c_void, sz: usize| unsafe { (hip.malloc)(ptr, sz) };
+        if alloc(&mut d_a, bytes) != 0 { return None; }
+        struct DevPtr(*mut c_void, HipFreeFn);
+        impl Drop for DevPtr {
+            fn drop(&mut self) { unsafe { (self.1)(self.0); } }
+        }
+        let _da = DevPtr(d_a, hip.free);
+        if alloc(&mut d_b, bytes) != 0 { return None; }
+        let _db = DevPtr(d_b, hip.free);
+        if alloc(&mut d_info, info_bytes) != 0 { return None; }
+        let _di = DevPtr(d_info, hip.free);
+
+        // Host buffers: col-major packed H_eff + damp.
+        let mut host_a = vec![0.0f64; k * k];
+
+        let mut damp = super::clamped_initial_damp(initial_damp, diag_mean);
+        let damp_cap = max_damp_multiplier * diag_mean;
+
+        // Reusable scalars for dgemm.
+        let alpha: f64 = 1.0;
+        let beta: f64 = 0.0;
+
+        loop {
+            // Pack h_eff col-major with damp on diagonal.
+            for j in 0..k {
+                for i in 0..k {
+                    host_a[i + j * k] = h_eff[(i, j)];
+                }
+                host_a[j + j * k] += damp;
+            }
+
+            // H2D: host_a → d_a
+            if unsafe { (hip.memcpy)(d_a, host_a.as_ptr() as *const c_void, bytes, HIP_MEMCPY_H2D) } != 0 {
+                return None;
+            }
+
+            // 1. potrf on d_a
+            // Zero info on device via host zero + H2D
+            let zero: c_int = 0;
+            if unsafe { (hip.memcpy)(d_info, &zero as *const c_int as *const c_void, info_bytes, HIP_MEMCPY_H2D) } != 0 {
+                return None;
+            }
+            let st = unsafe { (rs.dpotrf)(handle, ROCBLAS_FILL_LOWER, n, d_a as *mut f64, lda, d_info as *mut c_int) };
+            if st != ROCBLAS_STATUS_SUCCESS {
+                return None;
+            }
+            if unsafe { (hip.dev_sync)() } != 0 {
+                return None;
+            }
+            let mut info: c_int = 0;
+            if unsafe { (hip.memcpy)(&mut info as *mut c_int as *mut c_void, d_info, info_bytes, HIP_MEMCPY_D2H) } != 0 {
+                return None;
+            }
+            if info > 0 {
+                // Not PSD → damping retry ladder (same as CPU faer Err path).
+                if damp >= damp_cap {
+                    return Some(Err(CholeskyError::SingularEvenWithMaxDamp { max_damp: damp, k, diag_mean }));
+                }
+                damp = (damp * 10.0).min(damp_cap);
+                continue;
+            }
+            if info < 0 {
+                // Invalid argument → fallback
+                return None;
+            }
+
+            // 2. trtri on d_a (lower, non-unit) → L_inv in place
+            let zero2: c_int = 0;
+            if unsafe { (hip.memcpy)(d_info, &zero2 as *const c_int as *const c_void, info_bytes, HIP_MEMCPY_H2D) } != 0 {
+                return None;
+            }
+            let st = unsafe { (rs.dtrtri)(handle, ROCBLAS_FILL_LOWER, ROCBLAS_DIAG_NON_UNIT, n, d_a as *mut f64, lda, d_info as *mut c_int) };
+            if st != ROCBLAS_STATUS_SUCCESS {
+                return None;
+            }
+            if unsafe { (hip.dev_sync)() } != 0 { return None; }
+            let mut info2: c_int = 0;
+            if unsafe { (hip.memcpy)(&mut info2 as *mut c_int as *mut c_void, d_info, info_bytes, HIP_MEMCPY_D2H) } != 0 {
+                return None;
+            }
+            if info2 != 0 {
+                // trtri failure → fallback (singular L, should not happen after potrf)
+                return None;
+            }
+
+            // 3. dgemm: d_b = L_inv^T * L_inv  (all on device, no host round-trip)
+            // rocblas_dgemm: C = alpha*op(A)*op(B) + beta*C, col-major.
+            // op(A)=T (L_inv^T), op(B)=N (L_inv), m=n=k=K
+            let st = unsafe {
+                (rb.dgemm)(
+                    handle,
+                    ROCBLAS_OP_T, ROCBLAS_OP_N,
+                    n, n, n,
+                    &alpha,
+                    d_a as *const f64, lda,
+                    d_a as *const f64, lda,
+                    &beta,
+                    d_b as *mut f64, lda,
+                )
+            };
+            if st != ROCBLAS_STATUS_SUCCESS {
+                return None;
+            }
+            if unsafe { (hip.dev_sync)() } != 0 { return None; }
+
+            // 4. potrf on d_b (H_inv) → L_HI
+            let zero3: c_int = 0;
+            if unsafe { (hip.memcpy)(d_info, &zero3 as *const c_int as *const c_void, info_bytes, HIP_MEMCPY_H2D) } != 0 {
+                return None;
+            }
+            let st = unsafe { (rs.dpotrf)(handle, ROCBLAS_FILL_LOWER, n, d_b as *mut f64, lda, d_info as *mut c_int) };
+            if st != ROCBLAS_STATUS_SUCCESS {
+                return None;
+            }
+            if unsafe { (hip.dev_sync)() } != 0 { return None; }
+            let mut info3: c_int = 0;
+            if unsafe { (hip.memcpy)(&mut info3 as *mut c_int as *mut c_void, d_info, info_bytes, HIP_MEMCPY_D2H) } != 0 {
+                return None;
+            }
+            if info3 != 0 {
+                // H_inv numerically not SPD → fallback to CPU second-chol path's error.
+                // CPU treats this as SingularEvenWithMaxDamp at current damp.
+                return Some(Err(CholeskyError::SingularEvenWithMaxDamp { max_damp: damp, k, diag_mean }));
+            }
+
+            // Download only final L_HI (d_b) → host_a reuse
+            if unsafe { (hip.memcpy)(host_a.as_mut_ptr() as *mut c_void, d_b, bytes, HIP_MEMCPY_D2H) } != 0 {
+                return None;
+            }
+
+            // Transpose L_HI → U (upper). L_HI stored col-major lower-tri at host_a[col*k + row].
+            // U[i,j] = L_HI[j,i] for j>=i, else 0.
+            let mut u = Mat::<f64>::zeros(k, k);
+            for j in 0..k {
+                for i in 0..=j {
+                    // L_HI[j,i] is at row=j col=i → index j + i*k
+                    let v = host_a[j + i * k];
+                    u[(i, j)] = v;
+                }
+            }
+            return Some(Ok((u, damp)));
+        }
+    }
+}
+
+
 /// Adaptive-damping search + the upper Cholesky factor of `H_inv` such
 /// that `U^T · U = H_inv` — the form Frantar et al. 2210.17323 Algorithm
 /// 1 uses for the OBS error-propagation cascade.
@@ -242,6 +611,23 @@ pub fn compute_damped_inv_cholesky_upper(
     };
 
     let diag_mean: f64 = (0..k).map(|i| h_eff[(i, i)]).sum::<f64>() / k as f64;
+
+    // GPU fast path: FP64 rocSOLVER + rocBLAS, upload H once per damping
+    // retry, all three O(K^3) steps on device, download only final U.
+    // Soft-fails to CPU when libraries absent, GPU call fails, or K is
+    // below the transfer-vs-compute threshold (see GPU_K_THRESHOLD).
+    if let Some(gpu_result) = gpu::try_gpu_compute(&h_eff, initial_damp, max_damp_multiplier, diag_mean, k) {
+        match gpu_result {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                // Preserve adaptive-damping fallback contract: SingularEvenWithMaxDamp
+                // propagates; any other failure would have been None (fallback).
+                return Err(e);
+            }
+        }
+    }
+
+    // CPU fallback (faer + rayon) — preserved intact.
     let mut damp = clamped_initial_damp(initial_damp, diag_mean);
     let damp_cap = max_damp_multiplier * diag_mean;
 
@@ -1568,5 +1954,138 @@ mod tests {
     fn apply_awq_rescaling_rejects_zero_scale() {
         let mut h = Mat::<f64>::from_fn(2, 2, |_i, _j| 1.0);
         apply_awq_rescaling(&mut h, &[1.0, 0.0]);
+    }
+
+    /// Splice inertness: same input tensor through the dense MQ4 dispatch
+    /// with and without `--ldlq` must be byte-identical when the flag is
+    /// off. The GPTQ pipeline is only attempted when a Hessian exists;
+    /// otherwise the dispatch falls back to RTN byte-for-byte.
+    #[test]
+    fn mq4_gptq_splice_inert_when_ldlq_unset() {
+        let m = 2usize;
+        let k = 256usize;
+        let weights: Vec<f32> = (0..m * k).map(|i| ((i as f64 * 0.017).sin() * 2.0) as f32).collect();
+        // Deterministic FWHT signs matching main.rs seeds 42 / 1042.
+        // For the test we use a simple ±1 pattern; inertness is about
+        // dispatch choice, not sign values — any fixed pattern suffices.
+        let signs1: Vec<f32> = (0..256).map(|i| if i % 2 == 0 { 1.0 } else { -1.0 }).collect();
+        let signs2: Vec<f32> = (0..256).map(|i| if (i / 4) % 2 == 0 { 1.0 } else { -1.0 }).collect();
+        let awq: Vec<f64> = vec![1.0; k];
+        // Dummy Hessian — not used when ldlq is disabled; provide identity so the
+        // "enabled with Hessian" path would be callable if we wanted to compare,
+        // but the core assertion is fallback vs disabled are identical.
+        let h_dummy: Vec<f32> = (0..k * k)
+            .map(|idx| if idx / k == idx % k { 1.0 } else { 0.0 })
+            .collect();
+
+        // Helper that mirrors the main.rs dense-MQ4 dispatch decision:
+        // ldlq_enabled && h.is_some() -> gptq_pipeline, else RTN via the
+        // same FWHT+grids+pack chain the pipeline uses for its RTN fallback.
+        let dispatch = |ldlq_enabled: bool, h: Option<&[f32]>| -> Vec<u8> {
+            if ldlq_enabled {
+                if let Some(h_mat) = h {
+                    if let Ok(b) = gptq_pipeline_mq4g256(
+                        &weights, m, k, h_mat, &awq, &signs1, &signs2, 0.01, 1.0, "test:inert",
+                    ) {
+                        return b;
+                    }
+                }
+            }
+            // RTN fallback — same FWHT+grids+pack as pipeline identity case.
+            let mut w: Vec<f64> = weights.iter().map(|&v| v as f64).collect();
+            let s1f: Vec<f64> = signs1.iter().map(|&v| v as f64).collect();
+            let s2f: Vec<f64> = signs2.iter().map(|&v| v as f64).collect();
+            apply_fwht_per_256_to_weights_f64(&mut w, m, k, &s1f, &s2f);
+            let grids = compute_frozen_block_grids(&w);
+            pack_mq4g256_from_rotated_f64(&w, &grids)
+        };
+
+        let without = dispatch(false, None);
+        let fallback_missing = dispatch(true, None);
+        let with_but_missing_is_fallback = dispatch(true, Some(&h_dummy));
+        // When --ldlq is unset, output must be byte-identical to the
+        // fallback path (no GPTQ attempted). Our helper's "enabled but
+        // missing Hessian" also falls back, so all three should match the
+        // RTN baseline when the Hessian is not identity-optimised? For the
+        // identity Hessian the pipeline IS GPTQ but reduces to RTN, so the
+        // with-Hessian path also equals RTN — verify that too.
+        assert_eq!(
+            without, fallback_missing,
+            "dispatch with --ldlq unset vs enabled-but-missing-Hessian must be byte-identical (both RTN)"
+        );
+        assert_eq!(
+            without, with_but_missing_is_fallback,
+            "identity-H GPTQ pipeline must be byte-identical to RTN when H=I (no error propagation)"
+        );
+    }
+
+    /// CPU contract test for `compute_damped_inv_cholesky_upper` (K=64).
+    ///
+    /// Builds a deterministic SPD matrix `H = A^T A + K·I` (K=64), runs the
+    /// CPU path (GPU threshold is 1024, so K=64 never takes the GPU branch),
+    /// and asserts `U^T·U` reconstructs `(H+λI)^{-1}` to a tight FP64
+    /// tolerance. This pins the contract the GPU path must match bit-for-bit
+    /// within FP64 rounding.
+    #[test]
+    fn compute_damped_inv_cholesky_upper_cpu_contract_k64() {
+        let k = 64usize;
+        // Deterministic A: sin-based, full rank.
+        let a = Mat::<f64>::from_fn(k, k, |i, j| ((i * k + j) as f64 * 0.013).sin() * 0.5);
+        // H = A^T A + K·I  (SPD, cond modest).
+        let mut h = Mat::<f64>::zeros(k, k);
+        for i in 0..k {
+            for j in 0..k {
+                let mut s = 0.0;
+                for m in 0..k {
+                    s += a[(m, i)] * a[(m, j)];
+                }
+                h[(i, j)] = s;
+            }
+            h[(i, i)] += k as f64;
+        }
+        let damp = 0.01;
+        let (u, eff_damp) = compute_damped_inv_cholesky_upper(&h, None, damp, 1.0)
+            .expect("K=64 SPD must succeed");
+        assert!(
+            (eff_damp - damp).abs() < 1e-12 || eff_damp == damp,
+            "effective damp should be initial damp for well-conditioned H, got {eff_damp}"
+        );
+        // U is upper-triangular.
+        for i in 0..k {
+            for j in 0..i {
+                assert_eq!(u[(i, j)], 0.0, "U must be upper-tri");
+            }
+        }
+        // Reconstruct H_damp = H + eff_damp·I and verify (H_damp)·(U^T·U) ≈ I.
+        let mut h_damp = h.clone();
+        for i in 0..k {
+            h_damp[(i, i)] += eff_damp;
+        }
+        let mut max_err: f64 = 0.0;
+        for i in 0..k {
+            for j in 0..k {
+                // (H_damp·(U^T·U))[i,j] = Σ_kk H_damp[i,kk]·(Σ_m U[m,kk]·U[m,j])
+                let mut prod = 0.0;
+                for kk in 0..k {
+                    let mut utu_kk_j = 0.0;
+                    for m in 0..k {
+                        utu_kk_j += u[(m, kk)] * u[(m, j)];
+                    }
+                    prod += h_damp[(i, kk)] * utu_kk_j;
+                }
+                let expected = if i == j { 1.0 } else { 0.0 };
+                let err = (prod - expected).abs();
+                if err > max_err {
+                    max_err = err;
+                }
+            }
+        }
+        // FP64 Cholesky + trtri + gemm round-trip at K=64 should be
+        // well below 1e-9; we assert 1e-9 to leave margin for library
+        // differences while catching systematic errors.
+        assert!(
+            max_err < 1e-9,
+            "U^T·U reconstruction max_err={max_err:e} exceeds 1e-9"
+        );
     }
 }

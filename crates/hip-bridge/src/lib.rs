@@ -11,6 +11,7 @@ mod ffi;
 mod kernarg;
 mod rccl;
 mod rocblas;
+mod rocsolver;
 mod vmm;
 
 pub use error::{
@@ -27,6 +28,9 @@ pub use ffi::{
 pub use kernarg::KernargBlob;
 pub use rccl::{RcclComms, RcclDataType, RcclError, RcclRedOp, RcclResult, NCCL_SUCCESS};
 pub use rocblas::{Rocblas, RocblasDatatype, RocblasError, RocblasOperation, RocblasResult};
+pub use rocsolver::{
+    Rocsolver, RocsolverError, RocsolverResult, RocblasDiagonal, RocblasFill, ROCSOLVER_STATUS_SUCCESS,
+};
 pub use vmm::{clear_vmm_faults, inject_vmm_fault, VmmArena, VmmFaultKind};
 
 /// Re-export memory copy direction for callers.
