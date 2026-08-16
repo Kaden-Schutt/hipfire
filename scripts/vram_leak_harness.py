@@ -145,11 +145,25 @@ def cycle(daemon: str, model: str, max_seq: int, cycles: int, device: int) -> in
         mx, my = sum(xs) / n, sum(deltas) / n
         denom = sum((x - mx) ** 2 for x in xs)
         slope = sum((x - mx) * (y - my) for x, y in zip(xs, deltas)) / denom if denom else 0.0
-        print(f"  slope: {slope:+.1f} MiB/cycle over {n} cycles")
-        # 32 MiB/cycle is well below the 260 MiB/cycle the Glimmer bug leaked,
-        # and well above allocator jitter observed on gfx1201.
+        # Magnitude alone is the wrong test. Measured on gfx1201, lfm2moe
+        # grows +6 MiB per cycle EXACTLY -- five samples, zero scatter. That is
+        # far under any sane magnitude threshold and yet unmistakably a leak,
+        # because real allocator jitter is noisy and a leak is not. So score
+        # linearity too: R^2 near 1.0 on a positive slope means something is
+        # retained every cycle, however small.
+        ss_tot = sum((y - my) ** 2 for y in deltas)
+        ss_res = sum((y - (my + slope * (x - mx))) ** 2 for x, y in zip(xs, deltas))
+        r2 = 1.0 - ss_res / ss_tot if ss_tot > 1e-9 else 1.0
+        print(f"  slope: {slope:+.1f} MiB/cycle over {n} cycles (R^2 {r2:.3f})")
+        # 32 MiB/cycle is well under the ~260 MiB/cycle the Glimmer bug leaked.
         if slope > 32.0:
             print(f"  LEAK: VRAM grows {slope:.1f} MiB per cycle")
+            rc = 1
+        elif slope > 1.0 and r2 > 0.95:
+            print(
+                f"  SUSPECT: {slope:.1f} MiB/cycle with R^2 {r2:.3f} -- too linear for"
+                " allocator noise. Small, but it never comes back."
+            )
             rc = 1
         else:
             print("  no sustained growth")
