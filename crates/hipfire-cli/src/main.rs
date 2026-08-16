@@ -3723,6 +3723,41 @@ fn tool_call_from_legacy_value(value: &serde_json::Value) -> Result<ToolCall, St
     tool_call_from_canonical_value(value)
 }
 
+/// Absorb canonical `calls` staged on a legacy terminal payload
+/// (`commit_ready` / `done`) into the legacy tool-call buffer.
+///
+/// Legacy-contract daemons deliver tool calls two ways: a separate `tool_calls`
+/// event, or `calls` staged on the terminal payload by `stage_terminal_tool_calls`.
+/// Archs that never advertise `contract_version: 2` (DS4, arch_id=9) only stage,
+/// so a buffer fed exclusively by the separate event stays empty and the terminal
+/// drops the calls. A staged array is authoritative and *replaces* the buffer —
+/// same rule as [`SemanticEventFold::absorb_terminal_calls`] — so a daemon that
+/// both emits and stages never double-counts. A terminal without `calls` leaves
+/// the buffer untouched, keeping the separate-event path intact.
+fn absorb_legacy_terminal_calls(
+    terminal: &serde_json::Value,
+    buffered: &mut Vec<ToolCall>,
+) -> Result<(), String> {
+    let finish = terminal
+        .get("finish_reason")
+        .and_then(serde_json::Value::as_str);
+    if finish != Some("tool_calls") {
+        return Ok(());
+    }
+    let Some(calls_val) = terminal.get("calls") else {
+        return Ok(());
+    };
+    let calls = calls_val
+        .as_array()
+        .ok_or_else(|| "tool_calls terminal `calls` must be a JSON array".to_owned())?;
+    let mut parsed = Vec::with_capacity(calls.len());
+    for call in calls {
+        parsed.push(tool_call_from_legacy_value(call)?);
+    }
+    *buffered = parsed;
+    Ok(())
+}
+
 /// Endpoint adapter kinds known to the serve HTTP surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EndpointAdapterKind {
@@ -4594,6 +4629,10 @@ fn fold_complete_request_stream(
             })
         }
         StreamContract::Legacy => {
+            if let Some(terminal) = legacy_done.as_ref() {
+                absorb_legacy_terminal_calls(terminal, &mut legacy_tool_calls)
+                    .map_err(|detail| StreamContractError::MalformedToolCall { detail })?;
+            }
             let finish = legacy_done
                 .as_ref()
                 .and_then(|d| d.get("finish_reason"))
@@ -4833,6 +4872,16 @@ fn complete_request_attempt(
                         &mut event_callback,
                     )?;
                     legacy_done = Some(staged.clone());
+                    // Terminal delivery happens here, not on the post-commit
+                    // `done`, so calls staged on the payload must be absorbed
+                    // before the completion is built.
+                    absorb_legacy_terminal_calls(&staged, &mut legacy_tool_calls).map_err(
+                        |detail| {
+                            hipfire_client::ClientError::Protocol(format!(
+                                "malformed canonical tool call: {detail}"
+                            ))
+                        },
+                    )?;
                     let finish = staged
                         .get("finish_reason")
                         .and_then(serde_json::Value::as_str);
@@ -4977,6 +5026,10 @@ fn complete_request_attempt(
     }
 
     let done = legacy_done.unwrap_or(done);
+    // Idempotent when commit_ready already staged the same payload; the live
+    // absorb for a legacy stream that skipped staging and ended on plain `done`.
+    absorb_legacy_terminal_calls(&done, &mut legacy_tool_calls)
+        .map_err(|detail| anyhow!("malformed canonical tool call: {detail}"))?;
     let finish = done
         .get("finish_reason")
         .and_then(serde_json::Value::as_str);
@@ -9676,7 +9729,12 @@ mod tests {
         let registry = RegistryV1::parse(raw, "test").unwrap();
 
         // Exact Qwen families get VMM + 262144 + 81920
-        for tag in ["qwen3.5:4b", "qwen3.6:35b-a3b", "qwen3.8:27b", "qwen3.8:27b-fast"] {
+        for tag in [
+            "qwen3.5:4b",
+            "qwen3.6:35b-a3b",
+            "qwen3.8:27b",
+            "qwen3.8:27b-fast",
+        ] {
             let (_, entry) = registry.model(tag).unwrap();
             let resolved = resolved_for_model(&paths, tag, Some(tag), Some(entry)).unwrap();
             assert_eq!(
@@ -13746,6 +13804,120 @@ mod tests {
         .expect("contract_version 1 is legacy");
         assert_eq!(legacy_v1.contract, StreamContract::Legacy);
         assert_eq!(legacy_v1.content, "plain");
+    }
+
+    #[test]
+    fn legacy_terminal_staged_tool_calls_are_absorbed() {
+        let gen_start = serde_json::json!({
+            "type": "gen_start",
+            "id": "req-9",
+            "attempt_id": 9
+        });
+        let staged_done = serde_json::json!({
+            "type": "done",
+            "finish_reason": "tool_calls",
+            "calls": [{"name": "get_current_date_time", "arguments": {}}],
+            "id": "req-9",
+            "attempt_id": 9
+        });
+        let separate_event = serde_json::json!({
+            "type": "tool_calls",
+            "calls": [{"name": "get_current_date_time", "arguments": {}}],
+            "id": "req-9",
+            "attempt_id": 9
+        });
+
+        // Staging only (DS4 shape): no separate tool_calls event is ever emitted,
+        // so the terminal payload is the sole source of the calls.
+        let staged_only =
+            fold_complete_request_stream("req-9", 9, &[gen_start.clone(), staged_done.clone()])
+                .expect("staged legacy tool-call terminal");
+        assert_eq!(staged_only.contract, StreamContract::Legacy);
+        assert_eq!(staged_only.tool_calls.len(), 1);
+        assert_eq!(staged_only.tool_calls[0].name, "get_current_date_time");
+
+        // Emitted *and* staged: the staged array replaces the buffer, so the two
+        // delivery shapes never double-count.
+        let both = fold_complete_request_stream(
+            "req-9",
+            9,
+            &[gen_start.clone(), separate_event.clone(), staged_done],
+        )
+        .expect("emitted + staged legacy tool-call terminal");
+        assert_eq!(both.tool_calls.len(), 1);
+
+        // Separate event with no `calls` on the terminal keeps the legacy path.
+        let emitted_only = fold_complete_request_stream(
+            "req-9",
+            9,
+            &[
+                gen_start.clone(),
+                separate_event,
+                serde_json::json!({
+                    "type": "done",
+                    "finish_reason": "tool_calls",
+                    "id": "req-9",
+                    "attempt_id": 9
+                }),
+            ],
+        )
+        .expect("emitted-only legacy tool-call terminal");
+        assert_eq!(emitted_only.tool_calls.len(), 1);
+
+        // A non-tool terminal never absorbs calls — nothing is invented.
+        let stopped = fold_complete_request_stream(
+            "req-9",
+            9,
+            &[
+                gen_start.clone(),
+                serde_json::json!({
+                    "type": "token",
+                    "text": "answer",
+                    "id": "req-9",
+                    "attempt_id": 9
+                }),
+                serde_json::json!({
+                    "type": "done",
+                    "finish_reason": "stop",
+                    "calls": [{"name": "get_current_date_time", "arguments": {}}],
+                    "id": "req-9",
+                    "attempt_id": 9
+                }),
+            ],
+        )
+        .expect("stop terminal");
+        assert_eq!(stopped.content, "answer");
+        assert!(stopped.tool_calls.is_empty());
+
+        // Malformed staged payloads fail closed rather than silently dropping.
+        let malformed = fold_complete_request_stream(
+            "req-9",
+            9,
+            &[
+                gen_start,
+                serde_json::json!({
+                    "type": "done",
+                    "finish_reason": "tool_calls",
+                    "calls": [{"arguments": {}}],
+                    "id": "req-9",
+                    "attempt_id": 9
+                }),
+            ],
+        )
+        .expect_err("staged call without a name");
+        assert!(
+            matches!(malformed, StreamContractError::MalformedToolCall { .. }),
+            "unexpected error: {malformed:?}"
+        );
+
+        let mut buffered = Vec::new();
+        let non_array = absorb_legacy_terminal_calls(
+            &serde_json::json!({"finish_reason": "tool_calls", "calls": {}}),
+            &mut buffered,
+        )
+        .expect_err("non-array calls");
+        assert!(non_array.contains("must be a JSON array"), "{non_array}");
+        assert!(buffered.is_empty());
     }
 
     // ── Task 6: canonical OpenAI tool-call adapter + endpoint registry ──
