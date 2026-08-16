@@ -1010,7 +1010,7 @@ fn main() {
             let mut chunk_nll_count: usize = 0;
 
             if args.scoring_mode == "prefill" {
-                // Prefill prefix chunked 192
+                // Prefill prefix chunked 192 (mirrors calib_sweep glimmer_prefill_chunk_size 192)
                 let mut pos = 0usize;
                 while pos < scoring_start {
                     let end = (pos + glimmer_chunk).min(scoring_start);
@@ -1018,21 +1018,119 @@ fn main() {
                     glimmer_fwd::prefill_with_capture(&cfg, &weights, &mut state, &mut gpu, sub, pos as u32, &[], &mut Vec::new()).expect("glimmer prefill prefix");
                     pos = end;
                 }
-                for pos in scoring_start..(n_ctx - 1) {
-                    let logits = glimmer_fwd::decode_step(&cfg, &weights, &mut state, &mut gpu, chunk_tokens[pos], pos as u32).expect("glimmer decode");
+                // Batched scored window: one 52-layer batched forward capturing hidden states,
+                // mirroring qwen35's prefill shape (prefix batched, scored batched capturing, then
+                // per-position lm_head on captured states).
+                //
+                // capture_layers = [cfg.n_layers - 1] i.e. [51] (0-based). Rationale:
+                //   - `prefill_chunk_batched` (forward.rs:3738-3755) captures post-layer residuals
+                //     `x` after each decoder layer (sandwich post-norm + residual already applied).
+                //     See doc at forward.rs:1159-1164 "post-layer residual `x`".
+                //   - `decode_step_body` (forward.rs:462-504) runs 52 layers (0..51), then
+                //     `rmsnorm_f32(&state.x, &weights.final_norm, &state.tmp, eps=1e-5)` ->
+                //     `weight_gemv(&state.tmp, lm_head)` -> scale -> softcap.
+                //     The tensor lm_head consumes is the FINAL-NORMED hidden (tmp), NOT the
+                //     raw residual. No capture tap can directly yield post-final-norm because
+                //     final norm lives outside the layer loop (forward.rs:485-487).
+                //   - Therefore we capture the last layer's post-residual (layer 51) which
+                //     is `state.x` before final norm, then run `rmsnorm_batched` over the
+                //     captured buffer so the lm_head sees exactly the same input as decode_step.
+                //     Capturing 51 is correct because cfg.n_layers==52 (config.rs:27).
+                //
+                // hidden_out layout (forward.rs:3890-3893, 2836-2852, 2647-2659):
+                //   Host Host path: `cap_buf` sized `b*cap_cnt*dim` then `hidden_out.extend_from_slice`.
+                //   For cap_cnt=1, total `B*dim` floats, position-major row-major `[B, dim]`.
+                //   Row j at offset j*dim corresponds to scored position pos=scoring_start+j
+                //   predicting token chunk_tokens[pos+1] — identical to per-token `actual_next`
+                //   alignment. Verified via prefill_chunk_batched download loops (x is [B*dim]).
+                let scored_slice = &chunk_tokens[scoring_start..(n_ctx - 1)];
+                let scored_len = scored_slice.len(); // == scored_per_chunk
+                assert_eq!(scored_len, scored_per_chunk);
+                let cap_layer = cfg.n_layers - 1;
+                let mut hidden_host: Vec<f32> = Vec::with_capacity(scored_len * cfg.dim);
+                glimmer_fwd::prefill_with_capture(
+                    &cfg,
+                    &weights,
+                    &mut state,
+                    &mut gpu,
+                    scored_slice,
+                    scoring_start as u32,
+                    &[cap_layer],
+                    &mut hidden_host,
+                )
+                .expect("glimmer prefill scored capture");
+                assert_eq!(hidden_host.len(), scored_len * cfg.dim, "hidden_out layout: B*dim");
+                // Move captured pre-norm hidden to GPU for batched final norm.
+                // Upload as flat [B*dim] F32, then rmsnorm_batched -> normed.
+                let hidden_gpu = gpu
+                    .upload_f32(&hidden_host, &[scored_len * cfg.dim])
+                    .expect("upload hidden");
+                let normed_gpu = gpu
+                    .alloc_tensor(&[scored_len * cfg.dim], rdna_compute::DType::F32)
+                    .expect("alloc normed");
+                gpu.rmsnorm_batched(
+                    &hidden_gpu,
+                    &weights.final_norm,
+                    &normed_gpu,
+                    scored_len,
+                    cfg.dim,
+                    cfg.rms_norm_eps,
+                )
+                .expect("rmsnorm_batched scored");
+                // Per-position lm_head on the final-normed hidden. Glimmer's lm_head is
+                // typically HFQ4/MQ4 (not F16), so `gemm_f16_batched_lmhead` is absent
+                // (qwen uses it only when weights.output.gpu_dtype==F16). Use the
+                // cheap per-row weight_gemv fallback that qwen also uses for non-F16
+                // — one GEMV per scored token is negligible vs the 52-layer forward
+                // that we already collapsed from 1024 passes to one batched pass.
+                let logits_gpu = gpu
+                    .alloc_tensor(&[cfg.vocab_size], rdna_compute::DType::F32)
+                    .expect("alloc logits");
+                for j in 0..scored_len {
+                    let pos = scoring_start + j;
+                    let row = normed_gpu.sub_offset(j * cfg.dim, cfg.dim);
+                    hipfire_runtime::llama::weight_gemv(&mut gpu, &weights.lm_head, &row, &logits_gpu)
+                        .expect("glimmer lm_head");
+                    if cfg.output_multiplier != 1.0 {
+                        gpu.scale_f32(&logits_gpu, cfg.output_multiplier)
+                            .expect("scale");
+                    }
+                    if cfg.final_logit_softcapping > 0.0 {
+                        gpu.logit_softcap_f32(
+                            &logits_gpu,
+                            cfg.vocab_size,
+                            cfg.final_logit_softcapping,
+                        )
+                        .expect("softcap");
+                    }
+                    let logits = gpu.download_f32(&logits_gpu).expect("download logits");
                     let actual_next = chunk_tokens[pos + 1] as usize;
                     ref_in.read_exact(&mut block_buf).expect("read ref block");
                     let (kld, nll) = kld_from_block(&logits, &block_buf, top_k, actual_next);
                     chunk_klds.push(kld);
-                    if let Some(n) = nll { chunk_nll_sum += n; chunk_nll_count += 1; }
+                    if let Some(n) = nll {
+                        chunk_nll_sum += n;
+                        chunk_nll_count += 1;
+                    }
                     total_scored_done += 1;
                     if total_scored_done % 1024 == 0 || total_scored_done == total_scored {
                         let pct = total_scored_done as f64 * 100.0 / total_scored as f64;
                         let elapsed = t0.elapsed().as_secs_f64();
                         let rate = total_scored_done as f64 / elapsed.max(1e-9);
-                        eprint!("\r  chunk {:4}/{}  scored {:8}/{:8}  ({:5.1}%, {:.0} tok/s)   ", c+1, effective_n_chunk, total_scored_done, total_scored, pct, rate);
+                        eprint!(
+                            "\r  chunk {:4}/{}  scored {:8}/{:8}  ({:5.1}%, {:.0} tok/s)   ",
+                            c + 1,
+                            effective_n_chunk,
+                            total_scored_done,
+                            total_scored,
+                            pct,
+                            rate
+                        );
                     }
                 }
+                let _ = gpu.free_tensor(hidden_gpu);
+                let _ = gpu.free_tensor(normed_gpu);
+                let _ = gpu.free_tensor(logits_gpu);
             } else {
                 for pos in 0..(n_ctx - 1) {
                     let logits = glimmer_fwd::decode_step(&cfg, &weights, &mut state, &mut gpu, chunk_tokens[pos], pos as u32).expect("glimmer decode");
