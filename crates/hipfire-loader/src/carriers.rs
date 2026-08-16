@@ -139,6 +139,7 @@ impl Carrier for Qwen2Carrier {
             spec_excludes_adaptive: false,
             semantic_contract_version: None,
             has_deltanet: false,
+            supports_images: false,
         }
     }
     fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
@@ -378,6 +379,11 @@ impl Carrier for Qwen35Carrier {
             spec_excludes_adaptive: true,
             semantic_contract_version: Some(2),
             has_deltanet: true,
+            // Architectural capability: Qwen3.5-VL tower is optional per-model
+            // (probed via `model.visual.patch_embed.proj.weight`); this flag
+            // declares that the arch CAN accept images when that tower is
+            // present. Per-instance gating still checks `LoadedModel::vision_config`.
+            supports_images: true,
         }
     }
     fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
@@ -715,6 +721,7 @@ impl Carrier for LlamaCarrier {
             spec_excludes_adaptive: false,
             semantic_contract_version: None,
             has_deltanet: false,
+            supports_images: false,
         }
     }
     fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
@@ -1008,6 +1015,7 @@ impl Carrier for DotsOcrCarrier {
             spec_excludes_adaptive: false,
             semantic_contract_version: None,
             has_deltanet: false,
+            supports_images: true,
         }
     }
     fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
@@ -1116,6 +1124,7 @@ impl Carrier for Deepseek4Carrier {
             spec_excludes_adaptive: false,
             semantic_contract_version: None,
             has_deltanet: false,
+            supports_images: false,
         }
     }
     fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
@@ -1317,6 +1326,7 @@ impl Carrier for MinimaxCarrier {
             spec_excludes_adaptive: false,
             semantic_contract_version: None,
             has_deltanet: false,
+            supports_images: false,
         }
     }
     fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
@@ -1416,6 +1426,7 @@ impl Carrier for Lfm2MoeCarrier {
             spec_excludes_adaptive: false,
             semantic_contract_version: None,
             has_deltanet: false,
+            supports_images: false,
         }
     }
     fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
@@ -1520,6 +1531,7 @@ impl Carrier for Cohere2MoeCarrier {
             spec_excludes_adaptive: false,
             semantic_contract_version: None,
             has_deltanet: false,
+            supports_images: false,
         }
     }
     fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
@@ -1651,6 +1663,7 @@ impl Carrier for Gemma4Carrier {
             spec_excludes_adaptive: false,
             semantic_contract_version: None,
             has_deltanet: false,
+            supports_images: false,
         }
     }
     fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
@@ -1891,6 +1904,7 @@ impl Carrier for MuseGlimmerCarrier {
             spec_excludes_adaptive: false,
             semantic_contract_version: Some(2),
             has_deltanet: false,
+            supports_images: false,
         }
     }
     fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {

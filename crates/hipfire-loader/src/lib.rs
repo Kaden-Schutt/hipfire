@@ -232,6 +232,17 @@ pub enum VisionRoute {
     None,
 }
 pub fn vision_route(arch_id: u32) -> VisionRoute {
+    // Declared-capability gate: text-only arches declare `supports_images == false`
+    // and must return `None` even if the arch_id table would say otherwise.
+    // The table itself cannot be removed: it discriminates *which* vision
+    // implementation to run (QwenVl vs DotsOcr have distinct generate bodies in
+    // `hipfire_generate::vision::{generate_vl, generate_vl_dots_ocr}`), not just
+    // whether vision is present. Consulting caps here makes the gate declarative
+    // without changing behaviour.
+    let caps = carrier_for(arch_id).map(|c| c.caps()).unwrap_or_default();
+    if !caps.supports_images {
+        return VisionRoute::None;
+    }
     match arch_id {
         8 => VisionRoute::DotsOcr,
         5 | 6 => VisionRoute::QwenVl,
@@ -3456,5 +3467,42 @@ mod registry_tests {
             err.contains("expected 3 occurrences"),
             "unexpected error for drifted template: {err}"
         );
+    }
+
+    #[test]
+    fn vision_caps_declare_images() {
+        // Text-only arches must not declare image support; the two VL
+        // arches (Qwen3.5-VL 5/6 and dots.ocr 8) must.
+        let qwen35 = REGISTRY
+            .iter()
+            .find(|c| c.name() == "qwen35")
+            .expect("qwen35 carrier missing");
+        let dots = REGISTRY
+            .iter()
+            .find(|c| c.name() == "dots_ocr")
+            .expect("dots_ocr carrier missing");
+        assert!(
+            qwen35.caps().supports_images,
+            "qwen35 (arch 5/6) must declare supports_images"
+        );
+        assert!(
+            dots.caps().supports_images,
+            "dots_ocr (arch 8) must declare supports_images"
+        );
+        // VisionRoute must be declarative via caps, not just arch_id.
+        assert_eq!(super::vision_route(5), super::VisionRoute::QwenVl);
+        assert_eq!(super::vision_route(6), super::VisionRoute::QwenVl);
+        assert_eq!(super::vision_route(8), super::VisionRoute::DotsOcr);
+        assert_eq!(super::vision_route(0), super::VisionRoute::None);
+        assert_eq!(super::vision_route(7), super::VisionRoute::None);
+        assert_eq!(super::vision_route(9), super::VisionRoute::None);
+        // Text-only carriers must stay false.
+        for name in ["qwen2", "llama", "deepseek4", "minimax", "lfm2moe", "cohere2moe", "gemma4", "muse_glimmer"] {
+            let c = REGISTRY.iter().find(|c| c.name() == name).unwrap();
+            assert!(
+                !c.caps().supports_images,
+                "{name} must not declare supports_images"
+            );
+        }
     }
 }

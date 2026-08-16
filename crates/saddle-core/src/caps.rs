@@ -69,6 +69,16 @@ pub struct ArchCaps {
     /// execution branch at `daemon.rs:25894` and the `qwen_semantic_v2`
     /// predicate at `:19684`.
     pub has_deltanet: bool,
+
+    /// Whether this architecture can accept image input (vision).
+    ///
+    /// True for Qwen3.5-VL (5,6) when a vision tower is present and
+    /// dots.ocr (8). The daemon's `has_image && !has_vl` gate and the
+    /// `VisionRoute::None` check become queries of this field; the
+    /// arch_id table in `vision_route` remains only to discriminate which
+    /// vision implementation to run (QwenVl vs DotsOcr have distinct generate
+    /// bodies). Default `false` so every text-only arch is unaffected.
+    pub supports_images: bool,
 }
 
 impl ArchCaps {
@@ -109,6 +119,7 @@ impl Default for ArchCaps {
             spec_excludes_adaptive: false,
             semantic_contract_version: None,
             has_deltanet: false,
+            supports_images: false,
         }
     }
 }
@@ -145,4 +156,53 @@ pub struct BatchEligibilityRequest {
     pub serve_continuous_batch: bool,
     /// Value of `continuous_batch_size` (must be >1 for batch).
     pub continuous_batch_size: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_is_text_only_no_images() {
+        let caps = ArchCaps::default();
+        assert!(!caps.supports_images, "text-only default must not support images");
+        // All other caps also false/None for text-only baseline.
+        assert!(!caps.supports_continuous_batch);
+        assert!(!caps.supports_ep_batch);
+        assert!(caps.dflash.is_none());
+        assert!(!caps.supports_mtp);
+        assert!(!caps.spec_excludes_adaptive);
+        assert!(caps.semantic_contract_version.is_none());
+        assert!(!caps.has_deltanet);
+    }
+
+    #[test]
+    fn vl_arch_caps_declare_images() {
+        // Mirrors Qwen35Carrier and DotsOcrCarrier declarations.
+        let qwen35_vl = ArchCaps {
+            supports_continuous_batch: true,
+            supports_ep_batch: true,
+            dflash: Some(DflashKind::Qwen),
+            supports_mtp: true,
+            spec_excludes_adaptive: true,
+            semantic_contract_version: Some(2),
+            has_deltanet: true,
+            supports_images: true,
+        };
+        let dots_ocr = ArchCaps {
+            supports_images: true,
+            ..ArchCaps::default()
+        };
+        assert!(qwen35_vl.supports_images, "Qwen3.5-VL must declare image support");
+        assert!(dots_ocr.supports_images, "dots.ocr must declare image support");
+
+        // Text-only archetypes must stay false.
+        let llama = ArchCaps {
+            dflash: Some(DflashKind::Llama),
+            ..ArchCaps::default()
+        };
+        let qwen2 = ArchCaps::default();
+        assert!(!llama.supports_images, "Llama (text-only) must not declare image support");
+        assert!(!qwen2.supports_images, "Qwen2 (text-only) must not declare image support");
+    }
 }
