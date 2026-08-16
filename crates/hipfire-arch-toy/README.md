@@ -84,9 +84,6 @@ skip one and the workspace stops building (exhaustive `match` on
     may need nothing.
     (`pipeline_gguf.rs` needs no edit — it calls the same
     `lookup_model_type`.)
-11. `crates/hipfire-daemon/src/main.rs` — session-reset arm(s) beside the
-    `ModelState::Gemma4`/`MuseGlimmer` blocks (only if your state isn't
-    fully covered by `ArchModel::reset_session_state`).
 
 ### Tier E — optional capability surfaces
 
@@ -116,14 +113,17 @@ Also run `scripts/check-crate-maps.py <name>` to seed your crate's own
 
 ## The count
 
-**20 out-of-crate files** a new architecture must touch today (checklist
-items 2–21 above), down from 21 before this change (and ~28 pre-programme)
+**19 out-of-crate files** a new architecture must touch today (checklist
+items 2–10 and 12–21 above), down from 20 before this change (and ~28 pre-programme)
 — despite *more* arches, because the loader's `LoadedModel` per-arch
 `Option<…>` fields, the daemon's per-arch `arch_id` match ladders, and the
 bespoke spec-decode wiring were folded into `ModelState`/`ArchModel`/`Carrier`,
 and `arch_id` routing is now a single site (`arch_mapping.rs`): `safetensors_source.rs`
 is table-driven (longest-key substring match) and `tests/arch_id_unification.rs`
 iterates `MODEL_TYPE_TO_ARCH_ID` directly, so neither needs a per-arch edit.
+The daemon's `bench_prefill` session-reset cascade (previously item 11) is now
+fully covered by `ArchModel::reset_session_state` plus a narrow `arch_key()`
+check for the DeepSeek4 graph teardown, so no per-architecture edit remains there.
 Six are compile-enforced (all of Tier B plus Tier C items 5–7: the
 without its arms does not build); the rest fail closed or silently skip.
 

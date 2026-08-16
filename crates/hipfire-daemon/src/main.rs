@@ -3326,22 +3326,12 @@ fn main() {
                 if let Some(ref mut s) = m.qwen2_state {
                     s.reset();
                 }
-                if let Some(b) = m.qwen2_mut() {
-                    b.state.reset();
-                }
-                if let Some(b) = m.cohere2moe_mut() {
-                    let _ = b.state.reset(&mut gpu);
-                }
-                if let Some(ModelState::Gemma4(bundle)) = m.state.as_mut() {
-                    bundle.state.reset();
-                }
-                if let Some(ModelState::MuseGlimmer(bundle)) = m.state.as_mut() {
-                    bundle.reset_session_state();
-                }
-                if let Some(ModelState::Deepseek4(b)) = m.state.as_mut() {
-                    b.state.reset();
-                    b.state.zero_decode_caches(&mut gpu);
-                    gpu.invalidate_graph_state();
+                if let Some(st) = m.state.as_mut() {
+                    let key = st.as_arch_model().arch_key();
+                    let _ = st.as_arch_model_mut().reset_session_state(&mut gpu);
+                    if key == "deepseek4" {
+                        gpu.invalidate_graph_state();
+                    }
                 }
 
                 // Flush any residual GPU work so it doesn't bleed into the
@@ -3373,26 +3363,12 @@ fn main() {
                 m.seq_pos = 0;
                 m.conversation_tokens.clear();
                 let _ = hipfire_generate::common::reset_qwen35_recurrent(m, &mut gpu);
-                // LFM2.5-MoE state carries its own KV + conv-state cache;
-                // reset cursors (takes gpu) so the next request starts cold.
-                if let Some(b) = m.lfm2moe_mut() {
-                    let _ = b.state.reset(&mut gpu);
-                }
-                // MiniMax-M2 (arch_id=10): KV cache + scratch share MiniMaxState;
-                // reset its cursor (no gpu) for a cold prefill on the next request.
-                if let Some(b) = m.minimax_mut() {
-                    b.state.reset();
-                }
-                if let Some(ModelState::Gemma4(bundle)) = m.state.as_mut() {
-                    bundle.state.reset();
-                }
-                if let Some(ModelState::MuseGlimmer(bundle)) = m.state.as_mut() {
-                    bundle.reset_session_state();
-                }
-                if let Some(ModelState::Deepseek4(b)) = m.state.as_mut() {
-                    b.state.reset();
-                    b.state.zero_decode_caches(&mut gpu);
-                    gpu.invalidate_graph_state();
+                if let Some(st) = m.state.as_mut() {
+                    let key = st.as_arch_model().arch_key();
+                    let _ = st.as_arch_model_mut().reset_session_state(&mut gpu);
+                    if key == "deepseek4" {
+                        gpu.invalidate_graph_state();
+                    }
                 }
 
                 if run_ok {
