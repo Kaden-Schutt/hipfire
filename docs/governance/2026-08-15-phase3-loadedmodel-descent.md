@@ -142,3 +142,34 @@ Pipeline parallelism is reachable only through the daemon's `load` params (`pp`)
 There is no PP fixture or harness, and the failure mode is a *silent* VRAM leak — which a
 functional smoke test would not catch. **This step needs a load/unload VRAM-delta harness
 built first.** That is the prerequisite, not the refactor.
+
+
+## Blocker update — the VRAM oracle exists and Qwen3.5's baseline is clean
+
+`scripts/vram_leak_harness.py` was the named prerequisite for the `pp_scratch_set` step. It
+now exists, and it discriminates.
+
+Measured on hiptrx (gfx1201, single GPU), five/four load-unload cycles:
+
+| model | per-cycle delta | slope | verdict |
+|---|---|---:|---|
+| `qwen3.6-27b.mq4` | +202, +202, +202, +202 | **+0.0 MiB/cycle** | clean |
+| `lfm2.5-8b-a1b.mq4` | +212, +218, +224, +230, +236 | **+6.0 MiB/cycle** | SUSPECT |
+
+Two things follow.
+
+**Qwen3.5 single-GPU teardown is provably clean**, which is the baseline the
+`pp_scratch_set` work needs — that field belongs to Qwen3.5's pipeline-parallel path, and
+any drift introduced by moving it would now be visible against a flat control.
+
+**lfm2moe retains ~6 MiB on every unload.** Small, but five samples with zero scatter is not
+allocator jitter. Recorded, not chased: it wants its own investigation. It is also why the
+harness scores R² rather than magnitude alone — a 32 MiB/cycle threshold called this clean,
+and it is not.
+
+### What the step still needs
+
+A `pp>1` run. Pipeline parallelism is reachable only through the daemon's `load` params, is
+Qwen3.5 dense/MoE only, and is mutually exclusive with `tp>1`; the harness drives exactly
+that protocol, so extending it is `params: {"pp": 2}` plus a multi-device VRAM sample.
+That is a small change to a tool that now exists, rather than the missing capability it was.
