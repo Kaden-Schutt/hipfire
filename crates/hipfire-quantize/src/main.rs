@@ -4439,19 +4439,14 @@ fn mq2g256gl_roundtrip_f32(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> 
             group[..actual].copy_from_slice(&f32_data[start..end]);
             cpu_fwht_256(&mut group, signs1, signs2);
 
-            // Per-block scale, rounded through fp16 exactly as the on-disk
-            // format would store it.
             let ss: f64 = group.iter().map(|v| (*v as f64) * (*v as f64)).sum();
             let rms = (ss / 256.0).sqrt() as f32;
-            let scale = if rms > 0.0 {
-                f16_to_f32(f32_to_fp16_bits(rms))
-            } else {
-                0.0
-            };
-            let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
-
-            for v in group.iter_mut() {
-                let z = *v * inv;
+            let sbits0 = f32_to_fp16_bits(rms);
+            let scale0 = f16_to_f32(sbits0);
+            let inv0 = if scale0 > 0.0 { 1.0 / scale0 } else { 0.0 };
+            let mut idx = [0u8; 256];
+            for (i, v) in group.iter().enumerate() {
+                let z = *v * inv0;
                 let mut best = 0usize;
                 let mut best_d = (z - CB[0]).abs();
                 for (k, &c) in CB.iter().enumerate().skip(1) {
@@ -4461,7 +4456,46 @@ fn mq2g256gl_roundtrip_f32(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> 
                         best = k;
                     }
                 }
-                *v = scale * CB[best];
+                idx[i] = best as u8;
+            }
+            let mut scale = scale0;
+            let mut sbits = sbits0;
+            if scale0 != 0.0 {
+                for _ in 0..2 {
+                    let mut dot_wc: f64 = 0.0;
+                    let mut dot_cc: f64 = 0.0;
+                    for i in 0..256 {
+                        let c = CB[idx[i] as usize] as f64;
+                        dot_wc += group[i] as f64 * c;
+                        dot_cc += c * c;
+                    }
+                    if dot_cc == 0.0 { break; }
+                    let s_star = (dot_wc / dot_cc) as f32;
+                    if !s_star.is_finite() || s_star <= 0.0 { break; }
+                    let sbits1 = f32_to_fp16_bits(s_star);
+                    let scale1 = f16_to_f32(sbits1);
+                    if scale1 == 0.0 { scale = scale1; sbits = sbits1; break; }
+                    if sbits1 == sbits { scale = scale1; sbits = sbits1; break; }
+                    let inv1 = 1.0 / scale1;
+                    for (i, v) in group.iter().enumerate() {
+                        let z = *v * inv1;
+                        let mut best = 0usize;
+                        let mut best_d = (z - CB[0]).abs();
+                        for (k, &c) in CB.iter().enumerate().skip(1) {
+                            let d = (z - c).abs();
+                            if d < best_d {
+                                best_d = d;
+                                best = k;
+                            }
+                        }
+                        idx[i] = best as u8;
+                    }
+                    scale = scale1;
+                    sbits = sbits1;
+                }
+            }
+            for (i, v) in group.iter_mut().enumerate() {
+                *v = scale * CB[idx[i] as usize];
             }
 
             cpu_inv_fwht_256(&mut group, signs1, signs2);
@@ -4653,7 +4687,8 @@ fn mq4g256gl_roundtrip_f32(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> 
 #[cfg(test)]
 
 /// Shared body for the GL round-trip probes — the 2-, 3- and 4-bit variants
-/// differ only in which global codebook they snap to.
+/// differ only in which global codebook they snap to. LS-optimal scale: one
+/// refinement pass over RMS seed, fp16-rounded storage.
 fn gl_roundtrip_f32(f32_data: &[f32], signs1: &[f32], signs2: &[f32], cb: &[f32]) -> Vec<f32> {
     let group_size = 256;
     let n = f32_data.len();
@@ -4670,19 +4705,14 @@ fn gl_roundtrip_f32(f32_data: &[f32], signs1: &[f32], signs2: &[f32], cb: &[f32]
             group[..actual].copy_from_slice(&f32_data[start..end]);
             cpu_fwht_256(&mut group, signs1, signs2);
 
-            // Per-block scale, rounded through fp16 exactly as the on-disk
-            // format would store it.
             let ss: f64 = group.iter().map(|v| (*v as f64) * (*v as f64)).sum();
             let rms = (ss / 256.0).sqrt() as f32;
-            let scale = if rms > 0.0 {
-                f16_to_f32(f32_to_fp16_bits(rms))
-            } else {
-                0.0
-            };
-            let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
-
-            for v in group.iter_mut() {
-                let z = *v * inv;
+            let sbits0 = f32_to_fp16_bits(rms);
+            let scale0 = f16_to_f32(sbits0);
+            let inv0 = if scale0 > 0.0 { 1.0 / scale0 } else { 0.0 };
+            let mut idx = [0u8; 256];
+            for (i, v) in group.iter().enumerate() {
+                let z = *v * inv0;
                 let mut best = 0usize;
                 let mut best_d = (z - cb[0]).abs();
                 for (k, &c) in cb.iter().enumerate().skip(1) {
@@ -4692,7 +4722,46 @@ fn gl_roundtrip_f32(f32_data: &[f32], signs1: &[f32], signs2: &[f32], cb: &[f32]
                         best = k;
                     }
                 }
-                *v = scale * cb[best];
+                idx[i] = best as u8;
+            }
+            let mut scale = scale0;
+            let mut sbits = sbits0;
+            if scale0 != 0.0 {
+                for _ in 0..2 {
+                    let mut dot_wc: f64 = 0.0;
+                    let mut dot_cc: f64 = 0.0;
+                    for i in 0..256 {
+                        let c = cb[idx[i] as usize] as f64;
+                        dot_wc += group[i] as f64 * c;
+                        dot_cc += c * c;
+                    }
+                    if dot_cc == 0.0 { break; }
+                    let s_star = (dot_wc / dot_cc) as f32;
+                    if !s_star.is_finite() || s_star <= 0.0 { break; }
+                    let sbits1 = f32_to_fp16_bits(s_star);
+                    let scale1 = f16_to_f32(sbits1);
+                    if scale1 == 0.0 { scale = scale1; sbits = sbits1; break; }
+                    if sbits1 == sbits { scale = scale1; sbits = sbits1; break; }
+                    let inv1 = 1.0 / scale1;
+                    for (i, v) in group.iter().enumerate() {
+                        let z = *v * inv1;
+                        let mut best = 0usize;
+                        let mut best_d = (z - cb[0]).abs();
+                        for (k, &c) in cb.iter().enumerate().skip(1) {
+                            let d = (z - c).abs();
+                            if d < best_d {
+                                best_d = d;
+                                best = k;
+                            }
+                        }
+                        idx[i] = best as u8;
+                    }
+                    scale = scale1;
+                    sbits = sbits1;
+                }
+            }
+            for (i, v) in group.iter_mut().enumerate() {
+                *v = scale * cb[idx[i] as usize];
             }
 
             cpu_inv_fwht_256(&mut group, signs1, signs2);
@@ -4746,8 +4815,11 @@ fn mq4g256_roundtrip_f32(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Ve
 
 /// Encode one FWHT-rotated 256-block against a global codebook.
 /// Returns the fp16-rounded per-block scale and writes indices into `idx`.
+/// LS-optimal: one refinement pass `s* = dot(w,c)/dot(c,c)` after the RMS seed,
+/// fp16-rounded for storage and re-encoded. Degenerate (dot==0) falls back to RMS.
+/// RMS path remains reachable via `gl_encode_block_rms` for harness comparison.
 #[inline]
-fn gl_encode_block(group: &[f32; 256], cb: &[f32], idx: &mut [u8; 256]) -> u16 {
+fn gl_encode_block_rms(group: &[f32; 256], cb: &[f32], idx: &mut [u8; 256]) -> u16 {
     let ss: f64 = group.iter().map(|v| (*v as f64) * (*v as f64)).sum();
     let rms = (ss / 256.0).sqrt() as f32;
     let sbits = f32_to_fp16_bits(rms);
@@ -4765,6 +4837,75 @@ fn gl_encode_block(group: &[f32; 256], cb: &[f32], idx: &mut [u8; 256]) -> u16 {
             }
         }
         idx[i] = best as u8;
+    }
+    sbits
+}
+#[inline]
+fn gl_encode_block(group: &[f32; 256], cb: &[f32], idx: &mut [u8; 256]) -> u16 {
+    // Initial RMS encode to get seed codes.
+    let ss: f64 = group.iter().map(|v| (*v as f64) * (*v as f64)).sum();
+    let rms = (ss / 256.0).sqrt() as f32;
+    let sbits0 = f32_to_fp16_bits(rms);
+    let scale0 = f16_to_f32(sbits0);
+    let inv0 = if scale0 > 0.0 { 1.0 / scale0 } else { 0.0 };
+    for (i, v) in group.iter().enumerate() {
+        let z = *v * inv0;
+        let mut best = 0usize;
+        let mut best_d = (z - cb[0]).abs();
+        for (k, &c) in cb.iter().enumerate().skip(1) {
+            let d = (z - c).abs();
+            if d < best_d {
+                best_d = d;
+                best = k;
+            }
+        }
+        idx[i] = best as u8;
+    }
+    if scale0 == 0.0 {
+        return sbits0;
+    }
+    // Iterative LS refinement: up to 2 passes (early exit if sbits stable).
+    let mut sbits = sbits0;
+    let mut scale = scale0;
+    for _ in 0..2 {
+        let mut dot_wc: f64 = 0.0;
+        let mut dot_cc: f64 = 0.0;
+        for i in 0..256 {
+            let c = cb[idx[i] as usize] as f64;
+            dot_wc += group[i] as f64 * c;
+            dot_cc += c * c;
+        }
+        if dot_cc == 0.0 {
+            return sbits;
+        }
+        let s_star = (dot_wc / dot_cc) as f32;
+        if !s_star.is_finite() || s_star <= 0.0 {
+            return sbits;
+        }
+        let sbits1 = f32_to_fp16_bits(s_star);
+        let scale1 = f16_to_f32(sbits1);
+        if scale1 == 0.0 {
+            return sbits1;
+        }
+        if sbits1 == sbits {
+            return sbits1;
+        }
+        let inv1 = 1.0 / scale1;
+        for (i, v) in group.iter().enumerate() {
+            let z = *v * inv1;
+            let mut best = 0usize;
+            let mut best_d = (z - cb[0]).abs();
+            for (k, &c) in cb.iter().enumerate().skip(1) {
+                let d = (z - c).abs();
+                if d < best_d {
+                    best_d = d;
+                    best = k;
+                }
+            }
+            idx[i] = best as u8;
+        }
+        sbits = sbits1;
+        scale = scale1;
     }
     sbits
 }
@@ -4971,11 +5112,11 @@ pub(crate) fn quantize_mq35g256gl(
         });
     out
 }
-
 /// Encode one FWHT-rotated 256-block as 128 pair codes against the 2D VQ codebook.
 /// Returns fp16-rounded per-block scale and writes 7-bit indices into `pair_idx` (0..127).
+/// RMS path remains reachable via `gl_encode_block_vq35_rms`.
 #[inline]
-fn gl_encode_block_vq35(group: &[f32; 256], cb: &[[f32; 2]; 128], pair_idx: &mut [u8; 128]) -> u16 {
+fn gl_encode_block_vq35_rms(group: &[f32; 256], cb: &[[f32; 2]; 128], pair_idx: &mut [u8; 128]) -> u16 {
     let ss: f64 = group.iter().map(|v| (*v as f64) * (*v as f64)).sum();
     let rms = (ss / 256.0).sqrt() as f32;
     let sbits = f32_to_fp16_bits(rms);
@@ -4994,6 +5135,73 @@ fn gl_encode_block_vq35(group: &[f32; 256], cb: &[[f32; 2]; 128], pair_idx: &mut
             }
         }
         pair_idx[p] = best as u8;
+    }
+    sbits
+}
+#[inline]
+fn gl_encode_block_vq35(group: &[f32; 256], cb: &[[f32; 2]; 128], pair_idx: &mut [u8; 128]) -> u16 {
+    let ss: f64 = group.iter().map(|v| (*v as f64) * (*v as f64)).sum();
+    let rms = (ss / 256.0).sqrt() as f32;
+    let sbits0 = f32_to_fp16_bits(rms);
+    let scale0 = f16_to_f32(sbits0);
+    let inv0 = if scale0 > 0.0 { 1.0 / scale0 } else { 0.0 };
+    for p in 0..128 {
+        let z0 = group[2 * p] * inv0;
+        let z1 = group[2 * p + 1] * inv0;
+        let mut best = 0usize;
+        let mut best_d = (z0 - cb[0][0]).powi(2) + (z1 - cb[0][1]).powi(2);
+        for (j, c) in cb.iter().enumerate().skip(1) {
+            let d = (z0 - c[0]).powi(2) + (z1 - c[1]).powi(2);
+            if d < best_d {
+                best_d = d;
+                best = j;
+            }
+        }
+        pair_idx[p] = best as u8;
+    }
+    if scale0 == 0.0 {
+        return sbits0;
+    }
+    let mut sbits = sbits0;
+    for _ in 0..2 {
+        let mut dot_wc: f64 = 0.0;
+        let mut dot_cc: f64 = 0.0;
+        for p in 0..128 {
+            let c = cb[pair_idx[p] as usize];
+            dot_wc += group[2 * p] as f64 * c[0] as f64 + group[2 * p + 1] as f64 * c[1] as f64;
+            dot_cc += (c[0] as f64) * (c[0] as f64) + (c[1] as f64) * (c[1] as f64);
+        }
+        if dot_cc == 0.0 {
+            return sbits;
+        }
+        let s_star = (dot_wc / dot_cc) as f32;
+        if !s_star.is_finite() || s_star <= 0.0 {
+            return sbits;
+        }
+        let sbits1 = f32_to_fp16_bits(s_star);
+        let scale1 = f16_to_f32(sbits1);
+        if scale1 == 0.0 {
+            return sbits1;
+        }
+        if sbits1 == sbits {
+            return sbits1;
+        }
+        let inv1 = 1.0 / scale1;
+        for p in 0..128 {
+            let z0 = group[2 * p] * inv1;
+            let z1 = group[2 * p + 1] * inv1;
+            let mut best = 0usize;
+            let mut best_d = (z0 - cb[0][0]).powi(2) + (z1 - cb[0][1]).powi(2);
+            for (j, c) in cb.iter().enumerate().skip(1) {
+                let d = (z0 - c[0]).powi(2) + (z1 - c[1]).powi(2);
+                if d < best_d {
+                    best_d = d;
+                    best = j;
+                }
+            }
+            pair_idx[p] = best as u8;
+        }
+        sbits = sbits1;
     }
     sbits
 }
@@ -5124,19 +5332,45 @@ pub(crate) fn quantize_mq1g1024gl(
                 let mut group = [0.0f32; 1024];
                 group.copy_from_slice(&f32_data[start..start + 1024]);
                 cpu_fwht_1024(&mut group, &signs1_1024, &signs2_1024);
-                // Per-block scale via RMS, fp16 rounded.
+                // LS-optimal scale: up to 2 refinement passes (s* -> fp16 -> re-encode).
                 let ss: f64 = group.iter().map(|v| (*v as f64) * (*v as f64)).sum();
                 let rms = (ss / 1024.0).sqrt() as f32;
-                let sbits = f32_to_fp16_bits(rms);
-                let scale = f16_to_f32(sbits);
-                let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+                let sbits0 = f32_to_fp16_bits(rms);
+                let scale0 = f16_to_f32(sbits0);
+                let inv0 = if scale0 > 0.0 { 1.0 / scale0 } else { 0.0 };
                 let mut codes = [0u8; 1024];
                 for (i, v) in group.iter().enumerate() {
-                    let z = *v * inv;
-                    // Nearest of the two levels: GL_CB1[0] negative, GL_CB1[1] positive.
+                    let z = *v * inv0;
                     let d0 = (z - GL_CB1[0]).abs();
                     let d1 = (z - GL_CB1[1]).abs();
                     codes[i] = if d1 < d0 { 1 } else { 0 };
+                }
+                let mut sbits = sbits0;
+                if scale0 != 0.0 {
+                    for _ in 0..2 {
+                        let mut dot_wc: f64 = 0.0;
+                        let mut dot_cc: f64 = 0.0;
+                        for i in 0..1024 {
+                            let c = GL_CB1[codes[i] as usize] as f64;
+                            dot_wc += group[i] as f64 * c;
+                            dot_cc += c * c;
+                        }
+                        if dot_cc == 0.0 { break; }
+                        let s_star = (dot_wc / dot_cc) as f32;
+                        if !s_star.is_finite() || s_star <= 0.0 { break; }
+                        let sbits1 = f32_to_fp16_bits(s_star);
+                        let scale1 = f16_to_f32(sbits1);
+                        if scale1 == 0.0 { sbits = sbits1; break; }
+                        if sbits1 == sbits { sbits = sbits1; break; }
+                        let inv1 = 1.0 / scale1;
+                        for (i, v) in group.iter().enumerate() {
+                            let z = *v * inv1;
+                            let d0 = (z - GL_CB1[0]).abs();
+                            let d1 = (z - GL_CB1[1]).abs();
+                            codes[i] = if d1 < d0 { 1 } else { 0 };
+                        }
+                        sbits = sbits1;
+                    }
                 }
                 let base = g * 128;
                 for b in 0..128 {
@@ -16352,12 +16586,45 @@ mod tests {
                 cpu_fwht_1024(&mut grp, &s1_1024, &s2_1024);
                 let ss: f64 = grp.iter().map(|v| (*v as f64) * (*v as f64)).sum();
                 let rms = (ss / 1024.0).sqrt() as f32;
-                let sbits = f32_to_fp16_bits(rms);
-                let scale = f16_to_f32(sbits);
+                let sbits0 = f32_to_fp16_bits(rms);
+                let scale0 = f16_to_f32(sbits0);
+                let inv0 = if scale0 > 0.0 { 1.0 / scale0 } else { 0.0 };
+                let mut codes = [0u8; 1024];
                 for i in 0..1024 {
-                    let z = if scale > 0.0 { grp[i] / scale } else { 0.0 };
+                    let z = if scale0 > 0.0 { grp[i] / scale0 } else { 0.0 };
                     let c = if (z - GL_CB1[1]).abs() < (z - GL_CB1[0]).abs() { 1 } else { 0 };
-                    expect[start + i] = scale * GL_CB1[c];
+                    codes[i] = c;
+                }
+                let mut scale = scale0;
+                let mut sbits = sbits0;
+                if scale0 != 0.0 {
+                    let mut dot_wc: f64 = 0.0;
+                    let mut dot_cc: f64 = 0.0;
+                    for i in 0..1024 {
+                        let c = GL_CB1[codes[i] as usize] as f64;
+                        dot_wc += grp[i] as f64 * c;
+                        dot_cc += c * c;
+                    }
+                    if dot_cc != 0.0 {
+                        let s_star = (dot_wc / dot_cc) as f32;
+                        if s_star.is_finite() && s_star > 0.0 {
+                            let sbits1 = f32_to_fp16_bits(s_star);
+                            let scale1 = f16_to_f32(sbits1);
+                            if scale1 != 0.0 {
+                                if sbits1 != sbits0 {
+                                    let inv1 = 1.0 / scale1;
+                                    for i in 0..1024 {
+                                        let z = grp[i] * inv1;
+                                        codes[i] = if (z - GL_CB1[1]).abs() < (z - GL_CB1[0]).abs() { 1 } else { 0 };
+                                    }
+                                }
+                                scale = scale1;
+                            }
+                        }
+                    }
+                }
+                for i in 0..1024 {
+                    expect[start + i] = scale * GL_CB1[codes[i] as usize];
                 }
             }
         }
@@ -16367,7 +16634,6 @@ mod tests {
             assert!(ulp <= 1, "mq1 roundtrip mismatch i={i} got={} expect={} ulp={ulp}", got[i], expect[i]);
         }
     }
-
     #[test]
     fn mq2gl_blob_layout_and_roundtrip() {
         let (m, k) = (2usize, 512usize);
@@ -16387,7 +16653,7 @@ mod tests {
         assert_eq!((blob2[0] >> 2) & 0x3, 1);
         assert_eq!((blob2[0] >> 4) & 0x3, 2);
         assert_eq!((blob2[0] >> 6) & 0x3, 3);
-        // Round-trip encode->decode in rotated domain.
+        // Round-trip encode->decode in rotated domain (LS scale).
         let blob = quantize_mq2g256gl(&w, m, k, &s1, &s2);
         let gpr = k / 256;
         let idx_bytes = m * gpr * 64;
@@ -16398,20 +16664,11 @@ mod tests {
                 let mut grp = [0.0f32; 256];
                 grp.copy_from_slice(&w[start..start + 256]);
                 cpu_fwht_256(&mut grp, &s1, &s2);
-                let ss: f64 = grp.iter().map(|v| (*v as f64) * (*v as f64)).sum();
-                let rms = (ss / 256.0).sqrt() as f32;
-                let sbits = f32_to_fp16_bits(rms);
+                let mut codes = [0u8; 256];
+                let sbits = gl_encode_block(&grp, &GL_CB2, &mut codes);
                 let scale = f16_to_f32(sbits);
-                let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
                 for i in 0..256 {
-                    let z = grp[i] * inv;
-                    let mut best = 0usize;
-                    let mut bd = (z - GL_CB2[0]).abs();
-                    for (k, &c) in GL_CB2.iter().enumerate().skip(1) {
-                        let d = (z - c).abs();
-                        if d < bd { bd = d; best = k; }
-                    }
-                    expect[start + i] = scale * GL_CB2[best];
+                    expect[start + i] = scale * GL_CB2[codes[i] as usize];
                 }
             }
         }
@@ -16434,7 +16691,6 @@ mod tests {
         }
         for i in 0..got.len() { assert!((got[i] - expect[i]).abs() <= 1e-6, "mq2gl mismatch {}", i); }
     }
-
     #[test]
     fn mq3gl_blob_layout_and_roundtrip() {
         let (m, k) = (2usize, 512usize);
@@ -16463,7 +16719,7 @@ mod tests {
         out[6] = (b2 >> 2) & 7;
         out[7] = (b2 >> 5) & 7;
         assert_eq!(out, codes);
-        // Round-trip encode->decode
+        // Round-trip encode->decode (LS scale)
         let gpr = k / 256;
         let idx_bytes = m * gpr * 96;
         let mut expect = vec![0.0f32; m * k];
@@ -16473,20 +16729,11 @@ mod tests {
                 let mut grp = [0.0f32; 256];
                 grp.copy_from_slice(&w[start..start + 256]);
                 cpu_fwht_256(&mut grp, &s1, &s2);
-                let ss: f64 = grp.iter().map(|v| (*v as f64) * (*v as f64)).sum();
-                let rms = (ss / 256.0).sqrt() as f32;
-                let sbits = f32_to_fp16_bits(rms);
+                let mut codes = [0u8; 256];
+                let sbits = gl_encode_block(&grp, &GL_CB3, &mut codes);
                 let scale = f16_to_f32(sbits);
-                let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
                 for i in 0..256 {
-                    let z = grp[i] * inv;
-                    let mut best = 0usize;
-                    let mut bd = (z - GL_CB3[0]).abs();
-                    for (k, &c) in GL_CB3.iter().enumerate().skip(1) {
-                        let d = (z - c).abs();
-                        if d < bd { bd = d; best = k; }
-                    }
-                    expect[start + i] = scale * GL_CB3[best];
+                    expect[start + i] = scale * GL_CB3[codes[i] as usize];
                 }
             }
         }
@@ -16513,7 +16760,6 @@ mod tests {
     }
     #[test]
     fn mq35_blob_layout_and_roundtrip() {
-        // MQ35-G256-GL: 112 B indices (7 bits per pair) +2 B scale =114 B per 256 =3.5625 bpw.
         // Packing: 8 pairs ×7 bits =56 bits =7 bytes, 16 chunks.
         let (m, k) = (2usize, 512usize);
         let s1 = gen_fwht_signs(0xA11CE, 256);

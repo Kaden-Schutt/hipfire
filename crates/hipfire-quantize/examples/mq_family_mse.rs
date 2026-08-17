@@ -1,5 +1,6 @@
 //! MQ family MSE harness — rotated-domain quality vs bpw.
 //! Measures affine 4-bit, GL_CB4, GL_CB3, GL_CB2, GL_CB1 on real post-FWHT weights.
+//! + RMS-vs-LS paired columns for every GL codebook (LS = s* = dot(w,c)/dot(c,c), fp16-rounded).
 //! Template: crates/hipfire-quantize/examples/poly_fit.rs
 //! Run: cargo run -q -p hipfire-quantize --example mq_family_mse --release
 
@@ -84,6 +85,136 @@ const GL_CB4: [f32; 16] = [
     -2.7326, -2.0690, -1.6180, -1.2562, -0.9423, -0.6568, -0.3880, -0.1284,
     0.1284, 0.3880, 0.6568, 0.9423, 1.2562, 1.6180, 2.0690, 2.7326,
 ];
+const GL_CB35: [[f32; 2]; 128] = [
+    [-3.036506, 0.557011],
+    [-2.902707, -0.608592],
+    [-2.486214, 1.544335],
+    [-2.464717, -1.467453],
+    [-2.417152, -0.023972],
+    [-2.295932, 0.706263],
+    [-2.162351, -0.730994],
+    [-1.947877, 0.306698],
+    [-1.934456, -2.409281],
+    [-1.895991, -0.228143],
+    [-1.885129, 1.082130],
+    [-1.802912, 2.411955],
+    [-1.743065, -1.124332],
+    [-1.706713, -1.677137],
+    [-1.685550, 1.663885],
+    [-1.600927, -0.650825],
+    [-1.593014, 0.659777],
+    [-1.544414, 0.152975],
+    [-1.450453, -0.269551],
+    [-1.394326, 1.156593],
+    [-1.254734, -1.360016],
+    [-1.243292, -0.909463],
+    [-1.220646, 0.410975],
+    [-1.209120, -2.058067],
+    [-1.179515, -0.024031],
+    [-1.150258, 1.595281],
+    [-1.142204, 0.814831],
+    [-1.117422, -0.488152],
+    [-1.056154, 2.141912],
+    [-0.932642, 1.212272],
+    [-0.907086, 0.198202],
+    [-0.880944, -1.642492],
+    [-0.865366, -0.820827],
+    [-0.861729, -0.183285],
+    [-0.853414, -2.848194],
+    [-0.851236, 0.573600],
+    [-0.823025, 2.881643],
+    [-0.817329, -1.191992],
+    [-0.718535, -0.511478],
+    [-0.706018, 0.898155],
+    [-0.691930, 1.711770],
+    [-0.605064, 0.367565],
+    [-0.590630, -2.134673],
+    [-0.581430, 0.061727],
+    [-0.537026, 1.304575],
+    [-0.505917, -0.234563],
+    [-0.483035, -0.831881],
+    [-0.459100, -1.613037],
+    [-0.438526, -1.205364],
+    [-0.430598, 0.631694],
+    [-0.378955, 2.245666],
+    [-0.365405, -0.493880],
+    [-0.343728, 0.964808],
+    [-0.286504, 0.295790],
+    [-0.256216, -0.032611],
+    [-0.251191, 1.744736],
+    [-0.143569, 1.333993],
+    [-0.127799, -1.014336],
+    [-0.117265, -0.675589],
+    [-0.082967, -0.312776],
+    [-0.081779, -1.424501],
+    [-0.081717, 0.631896],
+    [-0.079977, -1.920818],
+    [-0.054644, -2.570277],
+    [-0.019024, 0.970040],
+    [0.013778, 0.298853],
+    [0.049626, -0.021871],
+    [0.130522, 2.925998],
+    [0.168374, 1.710445],
+    [0.168862, -0.492120],
+    [0.200595, -0.825208],
+    [0.220961, -1.184709],
+    [0.233563, 1.253369],
+    [0.236452, 2.223155],
+    [0.258488, 0.521816],
+    [0.279151, 0.851728],
+    [0.309002, 0.157230],
+    [0.315732, -1.632396],
+    [0.323335, -0.213913],
+    [0.440193, -2.126922],
+    [0.480347, -0.565665],
+    [0.533287, 1.516962],
+    [0.549216, -0.924366],
+    [0.555097, 0.372449],
+    [0.575936, -1.307392],
+    [0.584788, -0.015324],
+    [0.589135, 1.098487],
+    [0.597830, 0.722098],
+    [0.700796, -2.967724],
+    [0.707100, -0.338488],
+    [0.731491, 1.954455],
+    [0.819098, 0.204463],
+    [0.839814, -1.646037],
+    [0.843593, -0.704436],
+    [0.901551, 0.549277],
+    [0.917409, -1.124217],
+    [0.929044, 1.410108],
+    [0.943199, 0.946930],
+    [0.963024, -0.094088],
+    [0.990743, 2.622817],
+    [0.994562, -2.242123],
+    [1.106773, -0.427862],
+    [1.152424, 0.263105],
+    [1.241635, -0.816511],
+    [1.263196, 0.701724],
+    [1.272961, 1.810202],
+    [1.312531, -1.273730],
+    [1.318652, 1.197619],
+    [1.347748, -0.085024],
+    [1.350326, -1.776562],
+    [1.508685, 0.354619],
+    [1.548087, -0.466790],
+    [1.668620, 0.866390],
+    [1.706376, -0.913996],
+    [1.778556, -0.034955],
+    [1.791853, 1.454724],
+    [1.797822, -2.373145],
+    [1.810372, 2.283694],
+    [1.863575, -1.481466],
+    [1.939231, 0.442107],
+    [2.074944, -0.428416],
+    [2.232601, 0.910838],
+    [2.283314, -0.947652],
+    [2.356225, 0.114156],
+    [2.557220, 1.613256],
+    [2.653772, -1.641341],
+    [2.899535, -0.451693],
+    [2.944135, 0.598941],
+];
 
 fn mse_gl(blocks: &[Vec<f32>], scales: &[f32], cb: &[f32]) -> f64 {
     let mut sse = 0.0f64;
@@ -130,6 +261,242 @@ fn mse_affine(blocks: &[Vec<f32>]) -> f64 {
     }
     sse / n as f64
 }
+
+// --- LS-aware metrics ---
+
+#[derive(Clone, Copy)]
+struct Metrics {
+    mse: f64,
+    retained: f64,
+    norm_ratio: f64,
+}
+
+fn metrics_scalar(blocks: &[Vec<f32>], cb: &[f32], use_ls: bool, two_pass: bool) -> Metrics {
+    let mut sse = 0.0f64;
+    let mut dot = 0.0f64;
+    let mut ss_w = 0.0f64;
+    let mut ss_h = 0.0f64;
+    let mut n = 0usize;
+    for grp in blocks {
+        let g = grp.len();
+        // RMS seed
+        let ss: f64 = grp.iter().map(|v| (*v as f64) * (*v as f64)).sum();
+        let rms = (ss / g as f64).sqrt() as f32;
+        let sbits0 = f32_to_fp16_bits(rms);
+        let scale0 = f16_to_f32(sbits0);
+        let inv0 = if scale0 > 0.0 { 1.0 / scale0 } else { 0.0 };
+        let mut codes: Vec<u8> = Vec::with_capacity(g);
+        for &v in grp.iter() {
+            let z = v * inv0;
+            let mut best = 0usize;
+            let mut bd = (z - cb[0]).abs();
+            for (k, &c) in cb.iter().enumerate().skip(1) {
+                let d = (z - c).abs();
+                if d < bd { bd = d; best = k; }
+            }
+            codes.push(best as u8);
+        }
+        let mut scale = scale0;
+        let mut sbits = sbits0;
+        let mut final_codes = codes.clone();
+        if use_ls && scale0 != 0.0 {
+            let mut dot_wc: f64 = 0.0;
+            let mut dot_cc: f64 = 0.0;
+            for i in 0..g {
+                let c = cb[codes[i] as usize] as f64;
+                dot_wc += grp[i] as f64 * c;
+                dot_cc += c * c;
+            }
+            if dot_cc != 0.0 {
+                let s_star = (dot_wc / dot_cc) as f32;
+                if s_star.is_finite() && s_star > 0.0 {
+                    let sbits1 = f32_to_fp16_bits(s_star);
+                    let scale1 = f16_to_f32(sbits1);
+                    if scale1 != 0.0 {
+                        if sbits1 != sbits0 {
+                            let inv1 = 1.0 / scale1;
+                            for i in 0..g {
+                                let z = grp[i] * inv1;
+                                let mut best = 0usize;
+                                let mut bd = (z - cb[0]).abs();
+                                for (k, &c) in cb.iter().enumerate().skip(1) {
+                                    let d = (z - c).abs();
+                                    if d < bd { bd = d; best = k; }
+                                }
+                                final_codes[i] = best as u8;
+                            }
+                        }
+                        scale = scale1;
+                        sbits = sbits1;
+                        if two_pass {
+                            let mut dot_wc2: f64 = 0.0;
+                            let mut dot_cc2: f64 = 0.0;
+                            for i in 0..g {
+                                let c = cb[final_codes[i] as usize] as f64;
+                                dot_wc2 += grp[i] as f64 * c;
+                                dot_cc2 += c * c;
+                            }
+                            if dot_cc2 != 0.0 {
+                                let s_star2 = (dot_wc2 / dot_cc2) as f32;
+                                if s_star2.is_finite() && s_star2 > 0.0 {
+                                    let sbits2 = f32_to_fp16_bits(s_star2);
+                                    let scale2 = f16_to_f32(sbits2);
+                                    if scale2 != 0.0 {
+                                        if sbits2 != sbits {
+                                            let inv2 = 1.0 / scale2;
+                                            for i in 0..g {
+                                                let z = grp[i] * inv2;
+                                                let mut best = 0usize;
+                                                let mut bd = (z - cb[0]).abs();
+                                                for (k, &c) in cb.iter().enumerate().skip(1) {
+                                                    let d = (z - c).abs();
+                                                    if d < bd { bd = d; best = k; }
+                                                }
+                                                final_codes[i] = best as u8;
+                                            }
+                                        }
+                                        scale = scale2;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for i in 0..g {
+            let recon = scale * cb[final_codes[i] as usize];
+            let w = grp[i] as f64;
+            let r = recon as f64;
+            let e = w - r;
+            sse += e * e;
+            dot += w * r;
+            ss_w += w * w;
+            ss_h += r * r;
+        }
+        n += g;
+    }
+    let retained = if ss_w > 0.0 { dot / ss_w } else { 0.0 };
+    let norm_ratio = if ss_w > 0.0 { (ss_h / ss_w).sqrt() } else { 0.0 };
+    Metrics { mse: sse / n as f64, retained, norm_ratio }
+}
+
+fn metrics_vq35(blocks: &[Vec<f32>], use_ls: bool, two_pass: bool) -> Metrics {
+    let mut sse = 0.0f64;
+    let mut dot = 0.0f64;
+    let mut ss_w = 0.0f64;
+    let mut ss_h = 0.0f64;
+    let mut n = 0usize;
+    for grp in blocks {
+        let g = grp.len();
+        assert_eq!(g, 256);
+        let ss: f64 = grp.iter().map(|v| (*v as f64) * (*v as f64)).sum();
+        let rms = (ss / 256.0).sqrt() as f32;
+        let sbits0 = f32_to_fp16_bits(rms);
+        let scale0 = f16_to_f32(sbits0);
+        let inv0 = if scale0 > 0.0 { 1.0 / scale0 } else { 0.0 };
+        let mut codes = [0u8; 128];
+        for p in 0..128 {
+            let z0 = grp[2*p] * inv0;
+            let z1 = grp[2*p+1] * inv0;
+            let mut best = 0usize;
+            let mut bd = (z0 - GL_CB35[0][0]).powi(2) + (z1 - GL_CB35[0][1]).powi(2);
+            for (j,c) in GL_CB35.iter().enumerate().skip(1) {
+                let d = (z0 - c[0]).powi(2) + (z1 - c[1]).powi(2);
+                if d < bd { bd = d; best = j; }
+            }
+            codes[p]=best as u8;
+        }
+        let mut scale = scale0;
+        let mut sbits = sbits0;
+        let mut final_codes = codes;
+        if use_ls && scale0 != 0.0 {
+            let mut dot_wc: f64 = 0.0;
+            let mut dot_cc: f64 = 0.0;
+            for p in 0..128 {
+                let c = GL_CB35[codes[p] as usize];
+                dot_wc += grp[2*p] as f64 * c[0] as f64 + grp[2*p+1] as f64 * c[1] as f64;
+                dot_cc += (c[0] as f64)*(c[0] as f64) + (c[1] as f64)*(c[1] as f64);
+            }
+            if dot_cc != 0.0 {
+                let s_star = (dot_wc/dot_cc) as f32;
+                if s_star.is_finite() && s_star>0.0 {
+                    let sbits1 = f32_to_fp16_bits(s_star);
+                    let scale1 = f16_to_f32(sbits1);
+                    if scale1 != 0.0 {
+                        if sbits1 != sbits0 {
+                            let inv1 = 1.0/scale1;
+                            for p in 0..128 {
+                                let z0 = grp[2*p]*inv1;
+                                let z1 = grp[2*p+1]*inv1;
+                                let mut best=0usize;
+                                let mut bd=(z0 - GL_CB35[0][0]).powi(2)+(z1-GL_CB35[0][1]).powi(2);
+                                for (j,c) in GL_CB35.iter().enumerate().skip(1){
+                                    let d=(z0-c[0]).powi(2)+(z1-c[1]).powi(2);
+                                    if d<bd{bd=d;best=j;}
+                                }
+                                final_codes[p]=best as u8;
+                            }
+                        }
+                        scale=scale1;
+                        sbits=sbits1;
+                        if two_pass {
+                            let mut dot_wc2: f64=0.0;
+                            let mut dot_cc2: f64=0.0;
+                            for p in 0..128{
+                                let c=GL_CB35[final_codes[p] as usize];
+                                dot_wc2+=grp[2*p]as f64*c[0]as f64 + grp[2*p+1]as f64*c[1]as f64;
+                                dot_cc2+=(c[0]as f64)*(c[0]as f64)+(c[1]as f64)*(c[1]as f64);
+                            }
+                            if dot_cc2!=0.0{
+                                let s_star2=(dot_wc2/dot_cc2)as f32;
+                                if s_star2.is_finite()&&s_star2>0.0{
+                                    let sbits2=f32_to_fp16_bits(s_star2);
+                                    let scale2=f16_to_f32(sbits2);
+                                    if scale2!=0.0{
+                                        if sbits2!=sbits{
+                                            let inv2=1.0/scale2;
+                                            for p in 0..128{
+                                                let z0=grp[2*p]*inv2;
+                                                let z1=grp[2*p+1]*inv2;
+                                                let mut best=0usize;
+                                                let mut bd=(z0-GL_CB35[0][0]).powi(2)+(z1-GL_CB35[0][1]).powi(2);
+                                                for (j,c) in GL_CB35.iter().enumerate().skip(1){
+                                                    let d=(z0-c[0]).powi(2)+(z1-c[1]).powi(2);
+                                                    if d<bd{bd=d;best=j;}
+                                                }
+                                                final_codes[p]=best as u8;
+                                            }
+                                        }
+                                        scale=scale2;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for p in 0..128 {
+            let c = GL_CB35[final_codes[p] as usize];
+            let r0 = scale * c[0];
+            let r1 = scale * c[1];
+            let w0 = grp[2*p] as f64;
+            let w1 = grp[2*p+1] as f64;
+            let e0 = w0 - r0 as f64;
+            let e1 = w1 - r1 as f64;
+            sse += e0*e0 + e1*e1;
+            dot += w0 * r0 as f64 + w1 * r1 as f64;
+            ss_w += w0*w0 + w1*w1;
+            ss_h += (r0 as f64)*(r0 as f64) + (r1 as f64)*(r1 as f64);
+        }
+        n += g;
+    }
+    let retained = if ss_w>0.0 { dot/ss_w } else {0.0};
+    let norm_ratio = if ss_w>0.0 { (ss_h/ss_w).sqrt() } else {0.0};
+    Metrics{ mse: sse/n as f64, retained, norm_ratio }
+}
+
 fn collect_blocks_256(f32d: &[f32], m: usize, k: usize, s1: &[f32], s2: &[f32], budget: usize) -> (Vec<Vec<f32>>, Vec<f32>) {
     let gpr = k / 256;
     let mut groups = Vec::new();
@@ -227,20 +594,21 @@ fn main() {
         all_s1024.extend(r.scales_1024.clone());
     }
     println!("\nCombined {} x256 groups, {} x1024 groups", all_b256.len(), all_b1024.len());
+    // --- Baseline RMS table (kept for self-validation) ---
     let mse_aff = mse_affine(&all_b256);
-    let mse_cb4 = mse_gl(&all_b256, &all_s256, &GL_CB4);
-    let mse_cb3 = mse_gl(&all_b256, &all_s256, &GL_CB3);
-    let mse_cb2 = mse_gl(&all_b256, &all_s256, &GL_CB2);
-    let mse_cb1 = mse_gl(&all_b1024, &all_s1024, &GL_CB1);
+    let mse_cb4_rms = mse_gl(&all_b256, &all_s256, &GL_CB4);
+    let mse_cb3_rms = mse_gl(&all_b256, &all_s256, &GL_CB3);
+    let mse_cb2_rms = mse_gl(&all_b256, &all_s256, &GL_CB2);
+    let mse_cb1_rms = mse_gl(&all_b1024, &all_s1024, &GL_CB1);
     println!("\n=== Combined MSE (rotated domain, fp16 RMS) ===");
     println!(" affine (4-bit uniform) : {:.8e}", mse_aff);
-    println!(" GL_CB4 (4-bit)         : {:.8e}  gain {:.2}% vs affine", mse_cb4, 100.0 * (1.0 - mse_cb4 / mse_aff));
-    println!(" GL_CB3 (3-bit)         : {:.8e}  vs GL_CB4 {:.2}%  vs affine {:.2}%", mse_cb3, 100.0 * (mse_cb3 / mse_cb4 - 1.0), 100.0 * (1.0 - mse_cb3 / mse_aff));
-    println!(" GL_CB2 (2-bit)         : {:.8e}  vs GL_CB4 {:.2}%  vs affine {:.2}%", mse_cb2, 100.0 * (mse_cb2 / mse_cb4 - 1.0), 100.0 * (1.0 - mse_cb2 / mse_aff));
-    println!(" GL_CB1 (1-bit)         : {:.8e}  vs GL_CB4 {:.2}%  vs affine {:.2}%", mse_cb1, 100.0 * (mse_cb1 / mse_cb4 - 1.0), 100.0 * (1.0 - mse_cb1 / mse_aff));
+    println!(" GL_CB4 (4-bit)         : {:.8e}  gain {:.2}% vs affine", mse_cb4_rms, 100.0 * (1.0 - mse_cb4_rms / mse_aff));
+    println!(" GL_CB3 (3-bit)         : {:.8e}  vs GL_CB4 {:.2}%  vs affine {:.2}%", mse_cb3_rms, 100.0 * (mse_cb3_rms / mse_cb4_rms - 1.0), 100.0 * (1.0 - mse_cb3_rms / mse_aff));
+    println!(" GL_CB2 (2-bit)         : {:.8e}  vs GL_CB4 {:.2}%  vs affine {:.2}%", mse_cb2_rms, 100.0 * (mse_cb2_rms / mse_cb4_rms - 1.0), 100.0 * (1.0 - mse_cb2_rms / mse_aff));
+    println!(" GL_CB1 (1-bit)         : {:.8e}  vs GL_CB4 {:.2}%  vs affine {:.2}%", mse_cb1_rms, 100.0 * (mse_cb1_rms / mse_cb4_rms - 1.0), 100.0 * (1.0 - mse_cb1_rms / mse_aff));
 
-    // Per-tensor table
-    println!("\n=== Per-tensor MSE ===");
+    // Per-tensor RMS table
+    println!("\n=== Per-tensor MSE (RMS) ===");
     println!("{:<35} {:>12} {:>12} {:>12} {:>12} {:>12}", "tensor", "affine", "GL_CB4", "GL_CB3", "GL_CB2", "GL_CB1");
     for r in &recs {
         let a = mse_affine(&r.blocks_256);
@@ -251,19 +619,73 @@ fn main() {
         println!("{:<35} {:>12.8e} {:>12.8e} {:>12.8e} {:>12.8e} {:>12.8e}", r.name, a, c4, c3, c2, c1);
     }
 
-    // Family table with bpw
+    // --- LS metrics (one pass) and two-pass check ---
+    let m_cb4_rms = metrics_scalar(&all_b256, &GL_CB4, false, false);
+    let m_cb4_ls  = metrics_scalar(&all_b256, &GL_CB4, true, false);
+    let m_cb4_ls2 = metrics_scalar(&all_b256, &GL_CB4, true, true);
+    let m_cb3_rms = metrics_scalar(&all_b256, &GL_CB3, false, false);
+    let m_cb3_ls  = metrics_scalar(&all_b256, &GL_CB3, true, false);
+    let m_cb3_ls2 = metrics_scalar(&all_b256, &GL_CB3, true, true);
+    let m_cb2_rms = metrics_scalar(&all_b256, &GL_CB2, false, false);
+    let m_cb2_ls  = metrics_scalar(&all_b256, &GL_CB2, true, false);
+    let m_cb2_ls2 = metrics_scalar(&all_b256, &GL_CB2, true, true);
+    let m_cb1_rms = metrics_scalar(&all_b1024, &GL_CB1, false, false);
+    let m_cb1_ls  = metrics_scalar(&all_b1024, &GL_CB1, true, false);
+    let m_cb1_ls2 = metrics_scalar(&all_b1024, &GL_CB1, true, true);
+    let m_cb35_rms = metrics_vq35(&all_b256, false, false);
+    let m_cb35_ls  = metrics_vq35(&all_b256, true, false);
+    let m_cb35_ls2 = metrics_vq35(&all_b256, true, true);
+
+    // Paired RMS-vs-LS table
+    println!("\n=== Paired RMS vs LS (one refinement pass, fp16-rounded s*) ===");
+    println!("{:<8} {:>4} {:>14} {:>14} {:>8} {:>10} {:>10} {:>10} {:>10}", "cb", "bits", "MSE(RMS)", "MSE(LS)", "gain%", "ret(RMS)", "ret(LS)", "|wh|/|w|(RMS)", "|wh|/|w|(LS)");
+    let rows = vec![
+        ("GL_CB1", 1, m_cb1_rms, m_cb1_ls),
+        ("GL_CB2", 2, m_cb2_rms, m_cb2_ls),
+        ("GL_CB3", 3, m_cb3_rms, m_cb3_ls),
+        ("GL_CB4", 4, m_cb4_rms, m_cb4_ls),
+        ("GL_CB35", 3, m_cb35_rms, m_cb35_ls), // 7b per pair ~3.5b per weight, label bits approx
+    ];
+    for (name, bits, rms, ls) in rows {
+        let gain = 100.0 * (1.0 - ls.mse / rms.mse);
+        println!("{:<8} {:>4} {:>14.8e} {:>14.8e} {:>7.3}% {:>10.5} {:>10.5} {:>10.5} {:>10.5}", name, bits, rms.mse, ls.mse, gain, rms.retained, ls.retained, rms.norm_ratio, ls.norm_ratio);
+    }
+
+    // Explicit report table requested in spec
+    println!("\n=== Report table: codebook, bits, MSE(RMS), MSE(LS), relative improvement, retained before, retained after ===");
+    println!("{:<8} {:>4} {:>14} {:>14} {:>8} {:>14} {:>14}", "cb", "bits", "MSE_RMS", "MSE_LS", "impr%", "retained_RMS", "retained_LS");
+    for (name, bits, rms, ls) in vec![("GL_CB4",4,m_cb4_rms,m_cb4_ls),("GL_CB3",3,m_cb3_rms,m_cb3_ls),("GL_CB2",2,m_cb2_rms,m_cb2_ls),("GL_CB1",1,m_cb1_rms,m_cb1_ls)] {
+        let impr = 100.0*(1.0 - ls.mse / rms.mse);
+        println!("{:<8} {:>4} {:>14.8e} {:>14.8e} {:>7.3}% {:>14.5} {:>14.5}", name, bits, rms.mse, ls.mse, impr, rms.retained, ls.retained);
+    }
+    println!(" GL_CB35 (VQ 7b/pair ~3.5b/w) : MSE_RMS {:.8e} MSE_LS {:.8e} impr {:.3}% retained {:.5}->{:.5}", m_cb35_rms.mse, m_cb35_ls.mse, 100.0*(1.0 - m_cb35_ls.mse/m_cb35_rms.mse), m_cb35_rms.retained, m_cb35_ls.retained);
+
+    // Shrinkage visibility
+    println!("\n=== Shrinkage: retained = dot(w,w_hat)/dot(w,w), norm = |w_hat|/|w| ===");
+    for (name, rms, ls) in vec![("GL_CB4",m_cb4_rms,m_cb4_ls),("GL_CB3",m_cb3_rms,m_cb3_ls),("GL_CB2",m_cb2_rms,m_cb2_ls),("GL_CB1",m_cb1_rms,m_cb1_ls),("GL_CB35",m_cb35_rms,m_cb35_ls)] {
+        println!(" {}: retained RMS {:.5} -> LS {:.5} (delta {:+.5}), norm RMS {:.5} -> LS {:.5}", name, rms.retained, ls.retained, ls.retained - rms.retained, rms.norm_ratio, ls.norm_ratio);
+    }
+
+    // Second pass delta
+    println!("\n=== Second refinement pass delta (LS1 vs LS2) ===");
+    for (name, ls1, ls2) in vec![("GL_CB4",m_cb4_ls,m_cb4_ls2),("GL_CB3",m_cb3_ls,m_cb3_ls2),("GL_CB2",m_cb2_ls,m_cb2_ls2),("GL_CB1",m_cb1_ls,m_cb1_ls2),("GL_CB35",m_cb35_ls,m_cb35_ls2)] {
+        let d = 100.0*(1.0 - ls2.mse / ls1.mse);
+        println!(" {}: LS1 {:.8e} LS2 {:.8e}  LS2 gain over LS1 {:.4}%", name, ls1.mse, ls2.mse, d);
+    }
+
+    // Family table with bpw (RMS baseline kept)
     let baseline_aff = mse_aff;
-    let baseline_cb4 = mse_cb4;
-    println!("\n=== Family table (group, bytes/group, bpw, MSE, vs GL_CB4, vs affine) ===");
+    let baseline_cb4 = mse_cb4_rms;
+    println!("\n=== Family table (group, bytes/group, bpw, MSE_RMS, vs GL_CB4, vs affine) ===");
     println!("{:<10} {:>6} {:>10} {:>8} {:>14} {:>12} {:>12}", "format", "group", "bytes/grp", "bpw", "MSE", "vs GL_CB4", "vs affine");
     let rows: Vec<(&str, usize, usize, f64, f64)> = vec![
-        ("mq1", 1024, 130, 1.015625, mse_cb1),
-        ("mq2gl", 256, 66, 2.0625, mse_cb2),
-        ("mq3gl", 256, 98, 3.0625, mse_cb3),
-        ("mq4gl", 256, 130, 4.0625, mse_cb4),
-        ("affine", 256, 136, 4.25, mse_aff), // reference: uniform 4-bit with f32 scale/zero 136B
+        ("mq1", 1024, 130, 1.015625, mse_cb1_rms),
+        ("mq2gl", 256, 66, 2.0625, mse_cb2_rms),
+        ("mq3gl", 256, 98, 3.0625, mse_cb3_rms),
+        ("mq35gl", 256, 114, 3.5625, m_cb35_rms.mse),
+        ("mq4gl", 256, 130, 4.0625, mse_cb4_rms),
+        ("affine", 256, 136, 4.25, mse_aff),
     ];
-    // Sort by bpw ascending already
     for (fmt, grp, bytes, bpw, mse) in rows {
         let vs_cb4 = if baseline_cb4 > 0.0 { mse / baseline_cb4 - 1.0 } else { 0.0 };
         let vs_aff = if baseline_aff > 0.0 { mse / baseline_aff - 1.0 } else { 0.0 };
@@ -273,16 +695,24 @@ fn main() {
     println!("Expected baselines (poly_fit): affine 1.85588400e-06  GL_CB4 1.47499897e-06");
     // Flag ordering check
     println!("\n=== Ordering check (lower bpw should NOT beat higher bpw if codebook is correct) ===");
-    let ordered = vec![("mq1", mse_cb1), ("mq2gl", mse_cb2), ("mq3gl", mse_cb3), ("mq4gl", mse_cb4)];
+    let ordered = vec![("mq1", m_cb1_rms.mse), ("mq2gl", m_cb2_rms.mse), ("mq3gl", m_cb3_rms.mse), ("mq35gl", m_cb35_rms.mse), ("mq4gl", m_cb4_rms.mse)];
     for w in ordered.windows(2) {
         let (low_fmt, low_mse) = w[0];
         let (high_fmt, high_mse) = w[1];
         if low_mse < high_mse {
-            println!("  FLAG: {} (lower bpw) MSE {:.8e} < {} {:.8e} — indicates bug, not real result", low_fmt, low_mse, high_fmt, high_mse);
+            println!("  FLAG: {} (lower bpw) MSE {:.8e} < {} {:.8e} — indicates bug", low_fmt, low_mse, high_fmt, high_mse);
         } else {
             println!("  OK: {} {:.8e} >= {} {:.8e}", low_fmt, low_mse, high_fmt, high_mse);
         }
     }
+    // Bytes-per-group unchanged confirmation
+    println!("\n=== Bytes per group (on-disk layout UNCHANGED) ===");
+    println!(" mq1    : 130 B / 1024  = 1.015625 bpw  (128 idx +2 scale)");
+    println!(" mq2gl  :  66 B / 256   = 2.0625  bpw  (64 idx +2 scale)");
+    println!(" mq3gl  :  98 B / 256   = 3.0625  bpw  (96 idx +2 scale)");
+    println!(" mq35gl : 114 B / 256   = 3.5625  bpw  (112 idx +2 scale)");
+    println!(" mq4gl  : 130 B / 256   = 4.0625  bpw  (128 idx +2 scale)");
+    println!(" Layout SoA: [m*gpr*IDX][m*gpr*2 scale] — same bytes per group, only VALUE in scale field changes.");
     // Lane alignment report
     println!("\n=== Lane alignment (group * bits / 32) ===");
     println!(" mq1     : 1024*1/32 = 32 bits = 4 B = 1 u32/lane  => exactly aligned, no unroll");
@@ -290,4 +720,8 @@ fn main() {
     println!(" mq3gl   : 256*3/32 = 24 bits = 3 B => needs K4 unroll (existing MQ3 kernels are K4-unrolled)");
     println!(" mq4gl   : 256*4/32 = 32 bits = 4 B = 1 u32/lane => exactly aligned, no unroll");
     println!(" affine  : same as mq4gl (4 bits, G256, 32 bits/lane)");
+    // LS exposure note
+    println!("\n=== LS scale exposure ===");
+    println!(" RMS path kept reachable via gl_encode_block_rms / gl_encode_block_vq35_rms in src/main.rs (and via use_ls=false in this harness).");
+    println!(" Production path gl_encode_block / gl_encode_block_vq35 / quantize_mq1g1024gl now use LS one-pass (s* -> fp16 -> re-encode).");
 }
