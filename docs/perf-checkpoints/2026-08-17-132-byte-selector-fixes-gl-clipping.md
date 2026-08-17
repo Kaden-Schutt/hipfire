@@ -157,3 +157,75 @@ profile. The 16 live levels load into SGPRs via scalar loads (8 × `s_load_b64`
 from `sel * 64` bytes): no LDS allocation, no per-lane table traffic, no barrier,
 occupancy untouched. Pressure moves to SGPRs, so the kernel report must include
 the SGPR count alongside VGPRs and the zero-spill check.
+
+---
+
+## Amendment 2 — the selector was optimising the wrong criterion, and affine's header is misallocated
+
+Two measurements that change what this format *is*.
+
+### The selection criterion is a free 4.65× on the tail
+
+The encoder was specified to pick the profile with least SSE. That is
+bulk-dominated by construction — 255 of 256 coefficients are bulk — so the
+selector systematically chose bulk-favouring profiles and left the tail badly
+served. Weighting each coefficient's squared error by `|z|^p` costs nothing:
+same family, same 132 B layout, encoder-only.
+
+| selection weight | overall MSE | tail-1% MSE | vs affine tail |
+|---|---|---|---|
+| p = 0 (plain SSE) | **1.0501e-06** | 4.8093e-06 | 6.09× |
+| p = 1 | 1.1669e-06 | 2.1896e-06 | 2.77× |
+| **p = 2** | 1.3030e-06 | 1.4869e-06 | **1.88×** |
+| p = 4 | 1.4436e-06 | 1.1425e-06 | 1.45× |
+| p = 8 | 1.5128e-06 | 1.0341e-06 | 1.31× |
+| *affine qt=1 reference* | *1.4642e-06* | *7.8961e-07* | *1.00×* |
+
+The criterion alone moves the tail **4.65×**. p=2 is the balance point taken to
+scoring: **11.0% better than affine on overall MSE while 1.88× behind on the
+tail**, versus 6.09× behind at p=0. Exposed as `HIPFIRE_MQ4SEL_P` (default 2.0)
+so the curve is sweepable without a rebuild, with p=0 reproducing plain SSE
+exactly to anchor it.
+
+This is the same lesson as the format-level one, one level down: an
+MSE-optimal *choice* over a tail-aware *family* still lands in the wrong place.
+Both the codebook and the thing selecting it have to know what matters.
+
+### Affine's 8-byte header is over-provisioned for rotated data
+
+Post-FWHT block asymmetry, `(max+min)/(max-min)`: mean **+0.0004**, mean absolute
+**0.0757**, p99 0.2439. Blocks are essentially symmetric — the rotation
+symmetrises them, as the CLT argument predicts.
+
+So affine spends **4 bytes on a zero-point worth almost nothing**, while qt=43
+spends 1 byte on a shape selector worth 2.89× on the tail. That is the real
+architectural claim, and it is now quantified rather than asserted: on
+FWHT-rotated data affine's header is misallocated, not merely larger.
+
+| format | B | header | align | bpw | what the header buys |
+|---|---|---|---|---|---|
+| affine qt=1 | 136 | 8 B (f32 scale + f32 zero) | 8 B | 4.2500 | range + asymmetry (asymmetry ≈ worthless post-FWHT) |
+| GL qt=40 | 130 | 2 B (fp16 rms) | 2 B | 4.0625 | scale only — clips 82.57% of blocks |
+| **SEL qt=43** | **132** | **4 B (fp16 max + 6b sel + pad)** | **4 B** | **4.1250** | **exact max + per-block level shape** |
+
+### Where that leaves the format family
+
+qt=43 **strictly dominates qt=40** — better overall MSE, 2.89× better tail, zero
+clipping versus 10.859%, and 4-byte versus 2-byte alignment, for two bytes. qt=40
+is superseded; there is no configuration in which it is the right choice.
+
+Whether qt=43 should *replace* affine as the default G256 4-bit spec is the open
+question, and it is a KLD question, not an MSE one. It is genuinely competitive
+rather than dominated — 2.9% fewer bytes, 11.0% better overall MSE, 1.88× worse
+tail, non-clipping, better-allocated header — but every number here is still a
+proxy, and this campaign has already converted a 22.69% codec-MSE win into an
+11.28% KLD loss once.
+
+Baselines re-verified same-host / same-harness on hiptrx, all six figures
+reproduced from logs:
+
+| arm | bytes | md5 | WT2 KLD | v6sel KLD |
+|---|---|---|---|---|
+| mq4 affine qt=1 | 15,662,615,552 | `da5b877ea9a8` | 0.043776 | 0.587566 |
+| mq4gl qt=40 | 15,085,075,456 | `9630c21ed568` | 0.048713 | 0.749238 |
+| mq4sel qt=43 @ p=2 | pending | — | pending | pending |
