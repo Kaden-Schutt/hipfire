@@ -6,7 +6,7 @@
 //! Supports pre-compiled .hsaco blobs for deployment without ROCm SDK.
 
 use hip_bridge::HipResult;
-use radiowave::{CodeObjectCertification, ExistingCodeObjectRequest};
+use radiowave::{CodeObjectCertification, ExistingCodeObjectRequest, SchedulerProfile};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -298,6 +298,9 @@ pub struct KernelCompiler {
     /// ROCM_PATH handed to the spawned compiler so it can find its own LLVM.
     /// None when the environment already sets it.
     rocm_env_root: Option<std::path::PathBuf>,
+    /// Override scheduler profile applied to all kernels when set via
+    /// `HIPFIRE_SCHED_PROFILE`. `None` selects the per-kernel table.
+    sched_profile_override: Option<SchedulerProfile>,
 }
 
 impl KernelCompiler {
@@ -470,6 +473,10 @@ impl KernelCompiler {
             eprintln!("  gfx1151 CU-mode modules: {}", modules.join(","));
         }
 
+        let sched_profile_override = hipfire_config::developer_var("HIPFIRE_SCHED_PROFILE")
+            .ok()
+            .and_then(|value| SchedulerProfile::parse(&value));
+
         Ok(Self {
             cache_dir,
             arch: arch.to_string(),
@@ -482,6 +489,7 @@ impl KernelCompiler {
             extra_flags,
             gfx1151_cumode_modules,
             toolchain_id,
+            sched_profile_override,
         })
     }
 
@@ -518,7 +526,28 @@ impl KernelCompiler {
     }
 
     fn module_flags(&self, name: &str) -> Vec<String> {
-        Self::module_flags_for(&self.arch, name, &self.gfx1151_cumode_modules)
+        let mut flags = Self::module_flags_for(&self.arch, name, &self.gfx1151_cumode_modules);
+        let profile = self.scheduler_profile_for(name);
+        flags.extend(profile.llvm_args().iter().map(|flag| flag.to_string()));
+        flags
+    }
+
+    /// Select the scheduler profile for a kernel. The per-kernel table is the
+    /// primary source; `HIPFIRE_SCHED_PROFILE` overrides everything when set.
+    ///
+    /// Measured justification for `gemv_mq4g256gl_multirow` -> `MemoryClause`
+    /// (gfx1201, wave32):
+    ///   r4 VGPR 120 -> 109, max consecutive VMEM 10 -> 16, zero spills.
+    /// All ILP profiles are strictly worse; `IterativeIlp` spills 138 VGPRs on
+    /// this kernel and must not be used.
+    fn scheduler_profile_for(&self, name: &str) -> SchedulerProfile {
+        if let Some(profile) = self.sched_profile_override {
+            return profile;
+        }
+        match name {
+            "gemv_mq4g256gl_multirow" => SchedulerProfile::MemoryClause,
+            _ => SchedulerProfile::Default,
+        }
     }
 
     /// Single hashing sequence for all kernel cache keys. Every caller must
@@ -530,6 +559,7 @@ impl KernelCompiler {
         extra_flags: &str,
         module_flags: &[String],
         toolchain_id: &str,
+        scheduler_profile: SchedulerProfile,
     ) -> String {
         let mut hasher = DefaultHasher::new();
         source.hash(&mut hasher);
@@ -540,6 +570,7 @@ impl KernelCompiler {
             module_flags.hash(&mut hasher);
         }
         toolchain_id.hash(&mut hasher);
+        scheduler_profile.as_str().hash(&mut hasher);
         KERNEL_CACHE_ABI.hash(&mut hasher);
         format!("{:016x}", hasher.finish())
     }
@@ -551,6 +582,7 @@ impl KernelCompiler {
             &self.extra_flags,
             &self.module_flags(name),
             &self.toolchain_id,
+            self.scheduler_profile_for(name),
         )
     }
 
@@ -571,6 +603,7 @@ impl KernelCompiler {
             &self.extra_flags,
             &self.module_flags(name),
             "",
+            self.scheduler_profile_for(name),
         )
     }
 
@@ -590,7 +623,21 @@ impl KernelCompiler {
             HashSet::new()
         };
         let module_flags = Self::module_flags_for(arch, name, &gfx1151_cumode_modules);
-        Self::hash_parts(source, arch, extra_flags, &module_flags, "")
+        let sched_profile_override = hipfire_config::developer_var("HIPFIRE_SCHED_PROFILE")
+            .ok()
+            .and_then(|value| SchedulerProfile::parse(&value));
+        let scheduler_profile = sched_profile_override.unwrap_or(match name {
+            "gemv_mq4g256gl_multirow" => SchedulerProfile::MemoryClause,
+            _ => SchedulerProfile::Default,
+        });
+        Self::hash_parts(
+            source,
+            arch,
+            extra_flags,
+            &module_flags,
+            "",
+            scheduler_profile,
+        )
     }
 
     /// Persistent install dir for writeback. None when no cold location was
@@ -646,7 +693,8 @@ impl KernelCompiler {
                 "hipfire-kernel-cache".to_owned(),
                 name.to_owned(),
             ])
-            .manifest(&manifest);
+            .manifest(&manifest)
+            .scheduler_profile(self.scheduler_profile_for(name));
         if let Err(error) = radiowave::Compiler.certify_existing(&request) {
             eprintln!(
                 "  WARNING: {name}: Radiowave could not certify existing cache artifact: {error}"

@@ -78,6 +78,17 @@ fn main() {
     );
     any_fail |= !uni_ok;
 
+    // Host `Instant` timing around launch + device_synchronize carries a
+    // MEASURED ~22.1 us constant sync round-trip on gfx1201 (flat across a 24x
+    // byte range; see examples/dispatch_floor_probe.rs). HIP's dispatch floor
+    // is only ~2.13 us, so that term is sync, not submission. Differences
+    // between arms here are single-digit microseconds, i.e. small compared to
+    // an uncontrolled 22 us term, so host medians alone cannot rank these
+    // arms. Collect GPU-event time in parallel: the gemv/gemm wrappers already
+    // feed `profile::begin_timer` with a byte count, so a single
+    // start/stop around every timed call yields per-kernel device time.
+    rdna_compute::profile::start();
+
     let gl_med = time_gemv_gl(&mut gpu, m, k);
     let lloyd_med = time_gemv_lloyd(&mut gpu, m, k);
     let uni_med = time_gemv_uniform(&mut gpu, m, k);
@@ -104,6 +115,41 @@ fn main() {
             med * 1e6,
             gbps
         );
+    }
+
+    // Device-side truth. Median per kernel over every timed launch above, with
+    // the byte count the wrapper recorded, so GB/s is not re-derived from a
+    // host-side assumption. Host medians above are retained for comparison;
+    // the difference is the sync round-trip, not kernel work.
+    if let Some(entries) = rdna_compute::profile::stop() {
+        use std::collections::BTreeMap;
+        let mut by_kernel: BTreeMap<&str, (Vec<f64>, usize)> = BTreeMap::new();
+        for e in &entries {
+            let slot = by_kernel.entry(e.kernel).or_insert_with(|| (Vec::new(), e.bytes));
+            slot.0.push(e.time_us);
+        }
+        eprintln!("\nGPU-event time (device-side, excludes ~22.1 us host sync round-trip):");
+        eprintln!(
+            "  {:38} {:>8} {:>11} {:>10} {:>9}",
+            "kernel", "n", "bytes", "median_us", "GB/s"
+        );
+        for (kernel, (mut times, bytes)) in by_kernel {
+            times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let med_us = times[times.len() / 2];
+            let gbps = if bytes > 0 && med_us > 0.0 {
+                bytes as f64 / (med_us * 1e-6) / 1e9
+            } else {
+                f64::NAN
+            };
+            eprintln!(
+                "  {:38} {:>8} {:>11} {:>10.3} {:>9.1}",
+                kernel,
+                times.len(),
+                bytes,
+                med_us,
+                gbps
+            );
+        }
     }
 
     if any_fail {
