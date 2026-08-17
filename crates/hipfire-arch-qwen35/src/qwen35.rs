@@ -851,11 +851,10 @@ fn dtype_from_quant_type(qt: u8) -> HipResult<DType> {
         30 => Ok(DType::MQ4G256Lloyd),
         34 => Ok(DType::MFP4G32E8),
         36 => Ok(DType::MFP3G32E8),
-        37 => Ok(DType::MFP2G32E8),
         38 => Ok(DType::MQ2G256GL),
         39 => Ok(DType::MQ3G256GL),
         40 => Ok(DType::MQ4G256GL),
-        6 => Ok(DType::HFQ4G256),
+        43 => Ok(DType::MQ4G256SEL),
         3 => Ok(DType::Q8_0),
         1 => Ok(DType::F16),
         2 => Ok(DType::F32),
@@ -2860,6 +2859,58 @@ fn load_weight_tensor_raw(
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ4G256GL,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        43 => {
+            // MQ4G256SEL: AoS 132 B/group, 6-bit selector 0..63, pad 0
+            if k % 256 != 0 {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "MQ4G256SEL has K={k} but requires K%256==0"
+                    ),
+                ));
+            }
+            let gpr = k / 256;
+            let expected = m * gpr * 132;
+            if data.len() != expected {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "MQ4G256SEL blob length mismatch: expected {expected}, got {}",
+                        data.len()
+                    ),
+                ));
+            }
+            for (gi, chunk) in data.chunks_exact(132).enumerate() {
+                let sel = chunk[130];
+                if sel >= 64 {
+                    return Err(HipError::new(
+                        0,
+                        &format!(
+                            "MQ4G256SEL invalid selector {sel} at group {gi} (must be 0..63)"
+                        ),
+                    ));
+                }
+                if chunk[131] != 0 {
+                    return Err(HipError::new(
+                        0,
+                        &format!(
+                            "MQ4G256SEL pad byte non-zero {} at group {gi}",
+                            chunk[131]
+                        ),
+                    ));
+                }
+            }
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MQ4G256SEL,
                 m,
                 k,
                 row_stride: 0,

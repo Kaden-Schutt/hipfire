@@ -12291,6 +12291,327 @@ impl Gpu {
         result
     }
 
+    /// Dense MQ4-G256-GLW GEMV — activation-weighted twin of `gemv_mq4g256gl`.
+    /// Same weight blob (SoA 130 B/group) but the codebook is `GL_CB4W`.
+    pub fn gemv_mq4g256glw(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_rot: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_mq4g256glw",
+            kernels::GEMV_MQ4G256GL_SRC,
+            "gemv_mq4g256gl",
+        )?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x_rot.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let cb = crate::GL_CB4W;
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &cb[0] as *const _ as *mut c_void,
+            &cb[1] as *const _ as *mut c_void,
+            &cb[2] as *const _ as *mut c_void,
+            &cb[3] as *const _ as *mut c_void,
+            &cb[4] as *const _ as *mut c_void,
+            &cb[5] as *const _ as *mut c_void,
+            &cb[6] as *const _ as *mut c_void,
+            &cb[7] as *const _ as *mut c_void,
+            &cb[8] as *const _ as *mut c_void,
+            &cb[9] as *const _ as *mut c_void,
+            &cb[10] as *const _ as *mut c_void,
+            &cb[11] as *const _ as *mut c_void,
+            &cb[12] as *const _ as *mut c_void,
+            &cb[13] as *const _ as *mut c_void,
+            &cb[14] as *const _ as *mut c_void,
+            &cb[15] as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        let gpr = k / 256;
+        let w_bytes = m * gpr * (crate::GL_MQ4_GROUP_IDX_BYTES + crate::GL_GROUP_SCALE_BYTES);
+        let bytes = w_bytes + k * 4 + m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_mq4g256glw", bytes);
+        let result = self.launch_maybe_blob(
+            "gemv_mq4g256gl",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            ((16 + gpr) * 4) as u32,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                for c in cb {
+                    b.push_f32(c);
+                }
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// MQ4-G256-GLW multirow — R rows per warp, mirroring `gemv_mq4g256gl_multirow`.
+    pub fn gemv_mq4g256glw_multirow(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_rot: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        let rows = self.arch_caps.gemv_rows_default() as usize;
+        if rows <= 1 {
+            return self.gemv_mq4g256glw(a_raw, x_rot, y, m, k);
+        }
+        let rows = match rows {
+            2 | 4 | 8 => rows,
+            _ => 2,
+        };
+        self.gemv_mq4g256glw_multirow_with_rows(a_raw, x_rot, y, m, k, rows)
+    }
+
+    pub fn gemv_mq4g256glw_multirow_with_rows(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_rot: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        rows: usize,
+    ) -> HipResult<()> {
+        assert!(
+            matches!(rows, 2 | 4 | 8),
+            "gemv_mq4g256glw_multirow: rows must be 2,4,8 (got {rows})"
+        );
+        self.bind_thread()?;
+        let func_name = match rows {
+            2 => "gemv_mq4g256gl_multirow_r2",
+            4 => "gemv_mq4g256gl_multirow_r4",
+            8 => "gemv_mq4g256gl_multirow_r8",
+            _ => unreachable!(),
+        };
+        self.ensure_kernel(
+            "gemv_mq4g256glw_multirow",
+            kernels::GEMV_MQ4G256GL_MULTIROW_SRC,
+            func_name,
+        )?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x_rot.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let cb = crate::GL_CB4W;
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &cb[0] as *const _ as *mut c_void,
+            &cb[1] as *const _ as *mut c_void,
+            &cb[2] as *const _ as *mut c_void,
+            &cb[3] as *const _ as *mut c_void,
+            &cb[4] as *const _ as *mut c_void,
+            &cb[5] as *const _ as *mut c_void,
+            &cb[6] as *const _ as *mut c_void,
+            &cb[7] as *const _ as *mut c_void,
+            &cb[8] as *const _ as *mut c_void,
+            &cb[9] as *const _ as *mut c_void,
+            &cb[10] as *const _ as *mut c_void,
+            &cb[11] as *const _ as *mut c_void,
+            &cb[12] as *const _ as *mut c_void,
+            &cb[13] as *const _ as *mut c_void,
+            &cb[14] as *const _ as *mut c_void,
+            &cb[15] as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        let gpr = k / 256;
+        let w_bytes = m * gpr * (crate::GL_MQ4_GROUP_IDX_BYTES + crate::GL_GROUP_SCALE_BYTES);
+        let bytes = w_bytes + k * 4 + m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_mq4g256glw_multirow", bytes);
+        let grid = ((m as u32) + rows as u32 - 1) / rows as u32;
+        let lds = ((16 + rows * gpr) * 4) as u32;
+        let result = self.launch_maybe_blob(
+            func_name,
+            [grid, 1, 1],
+            [32, 1, 1],
+            lds,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                for c in cb {
+                    b.push_f32(c);
+                }
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Dense MQ4-G256-SEL GEMV (qt=43): 64-profile selector family, max-normalised, AoS 132 B/group.
+    /// `x` must be FWHT-pre-rotated. Codebook is 64x16 `SEL_TABLE` embedded in the kernel (constant,
+    /// 4 KiB). Selector per group (6-bit, 0..63) is wave-uniform, loaded via SGPRs — no LDS for codebook.
+    /// Scales are hoisted to LDS. Layout `w = cb[sel][nibble] * scale`.
+    pub fn gemv_mq4g256sel(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_rot: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_mq4g256sel",
+            kernels::GEMV_MQ4G256SEL_SRC,
+            "gemv_mq4g256sel",
+        )?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x_rot.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        let gpr = k / 256;
+        let w_bytes = m * gpr * crate::GL_MQ4SEL_GROUP_BYTES;
+        let bytes = w_bytes + k * 4 + m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_mq4g256sel", bytes);
+        let result = self.launch_maybe_blob(
+            "gemv_mq4g256sel",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            (gpr * 4) as u32,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// MQ4-G256-SEL multirow GEMV — R rows per warp, mirroring `gemv_mq4g256gl_multirow`.
+    /// Selector per group is wave-uniform, codebook lives in SGPRs via constant table.
+    pub fn gemv_mq4g256sel_multirow(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_rot: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        let rows = self.arch_caps.gemv_rows_default() as usize;
+        if rows <= 1 {
+            return self.gemv_mq4g256sel(a_raw, x_rot, y, m, k);
+        }
+        let rows = match rows {
+            2 | 4 | 8 => rows,
+            _ => 2,
+        };
+        self.gemv_mq4g256sel_multirow_with_rows(a_raw, x_rot, y, m, k, rows)
+    }
+
+    /// Explicit-R variant for benchmarking (`R` in {2,4,8}).
+    pub fn gemv_mq4g256sel_multirow_with_rows(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_rot: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        rows: usize,
+    ) -> HipResult<()> {
+        assert!(
+            matches!(rows, 2 | 4 | 8),
+            "gemv_mq4g256sel_multirow: rows must be 2,4,8 (got {rows})"
+        );
+        self.bind_thread()?;
+        let func_name = match rows {
+            2 => "gemv_mq4g256sel_multirow_r2",
+            4 => "gemv_mq4g256sel_multirow_r4",
+            8 => "gemv_mq4g256sel_multirow_r8",
+            _ => unreachable!(),
+        };
+        self.ensure_kernel(
+            "gemv_mq4g256sel_multirow",
+            kernels::GEMV_MQ4G256SEL_MULTIROW_SRC,
+            func_name,
+        )?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x_rot.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        let gpr = k / 256;
+        let w_bytes = m * gpr * crate::GL_MQ4SEL_GROUP_BYTES;
+        let bytes = w_bytes + k * 4 + m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_mq4g256sel_multirow", bytes);
+        let grid = ((m as u32) + rows as u32 - 1) / rows as u32;
+        let lds = (rows * gpr * 4) as u32;
+        let result = self.launch_maybe_blob(
+            func_name,
+            [grid, 1, 1],
+            [32, 1, 1],
+            lds,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
 
     pub fn deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed_batched_k4(
         &mut self,

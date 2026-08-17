@@ -422,9 +422,11 @@ pub(crate) const RAW_CODECS: &[RawCodec] = &[
         quant_type: 40,
         dtype: DType::MQ4G256GL,
     },
+    RawCodec {
+        quant_type: 43,
+        dtype: DType::MQ4G256SEL,
+    },
 ];
-
-/// Look up the passthrough codec for `quant_type`, or `None` if it is host-decode
 /// (1/2/16) or genuinely unsupported.
 pub(crate) fn raw_codec(quant_type: u8) -> Option<&'static RawCodec> {
     RAW_CODECS.iter().find(|c| c.quant_type == quant_type)
@@ -450,6 +452,42 @@ pub(crate) fn decode_raw_codec(
                 codec.dtype
             ),
         ));
+    }
+    if codec.dtype == DType::MQ4G256SEL {
+        // AoS 132 B/group = 128 idx + 2 scale + 1 selector + 1 pad.
+        // Selector 0..63 valid, 64..255 invalid — reject rather than mask.
+        // Pad byte MUST be 0.
+        let gpr = k / 256;
+        let expected = m * gpr * 132;
+        if data.len() != expected {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "MQ4G256SEL blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name})",
+                    data.len()
+                ),
+            ));
+        }
+        for (gi, chunk) in data.chunks_exact(132).enumerate() {
+            let sel = chunk[130];
+            if sel >= 64 {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!(
+                        "MQ4G256SEL invalid selector {sel} at group {gi} (must be 0..63) in {name}"
+                    ),
+                ));
+            }
+            if chunk[131] != 0 {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!(
+                        "MQ4G256SEL pad byte non-zero {} at group {gi} in {name}",
+                        chunk[131]
+                    ),
+                ));
+            }
+        }
     }
     let buf = gpu.upload_raw(data, &[data.len()])?;
     Ok(WeightTensor {

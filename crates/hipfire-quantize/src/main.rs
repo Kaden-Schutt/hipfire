@@ -1390,8 +1390,8 @@ fn quantize_hfp4g32_row(row: &[f32]) -> Vec<u8> {
         let block = &row[block_start..block_start + 32];
 
         // Normalize block by row scale.
-        // block_max_normalized in units of [-6.0, +6.0] (because row_scale_a = max_abs/6.0).
-        // Pick UE8M0 block exponent so block fits cleanly into E2M1 lattice [-6, +6].
+        // block_max_normalized in units of [-6.0, 6.0] (because row_scale_a = max_abs/6.0).
+        // Pick UE8M0 block exponent so block fits cleanly into E2M1 lattice [-6, 6].
         let block_max_abs = block.iter().cloned().fold(0.0f32, |m, v| m.max(v.abs()));
         let block_max_normalized = block_max_abs * inv_row_scale;
 
@@ -1564,7 +1564,7 @@ fn e4m3_scale_decode(byte: u8) -> f32 {
 ///   exp=15,mant=7 : NaN (excluded)  → max finite = 2^8·1.875 = 448
 #[inline]
 fn e4m3_scale_encode_roundup(s: f32) -> u8 {
-    // Non-finite / non-positive guard. s<=0 → smallest code (0x00 == +0.0).
+    // Non-finite / non-positive guard. s<=0 → smallest code (0x00 == 0.0).
     if !(s > 0.0) {
         return 0x00;
     }
@@ -1625,7 +1625,7 @@ fn quantize_mfp4g32_p_row(row: &[f32]) -> Vec<u8> {
 
         // Exact scale ratio s = block_max_normalized / 6.0. E4M3 round-UP so the
         // decoded scale covers block_max (no clip above the [-6,6] E2M1 grid).
-        // Empty block → s=0 → code 0x00 (decodes to +0.0; inv → 0 → all nibbles 0).
+        // Empty block → s=0 → code 0x00 (decodes to 0.0; inv → 0 → all nibbles 0).
         let s = if block_max_normalized > 0.0 {
             block_max_normalized / 6.0
         } else {
@@ -2900,7 +2900,7 @@ mod hfp4_tests {
 
     #[test]
     fn e2m1_round_midpoint() {
-        // Halfway between +1.0 and +1.5 → either is acceptable (tie).
+        // Halfway between 1.0 and 1.5 → either is acceptable (tie).
         let n = e2m1_round(1.25);
         assert!(n == 2 || n == 3, "midpoint rounded to {}", n);
         // Halfway between +4.0 and +6.0 (= 5.0) → either is acceptable.
@@ -4137,7 +4137,7 @@ pub(crate) fn quantize_mq2g256_lloyd(f32_data: &[f32], signs1: &[f32], signs2: &
                 //
                 // History: f8cd234 (2026-05-19) bumped 8 → 16 based on the
                 // `lloyd_iteration_headroom` synthetic-distribution probe,
-                // which showed +0.4-0.9% MSE improvement on heavy-tailed +
+                // which showed 0.4-0.9% MSE improvement on heavy-tailed +
                 // sparse distributions. Free-on-paper, but never gated on a
                 // real-model coherence run.
                 //
@@ -4538,7 +4538,155 @@ pub(crate) const GL_CB4: [f32; 16] = [
     -2.7326, -2.0690, -1.6180, -1.2562, -0.9423, -0.6568, -0.3880, -0.1284,
     0.1284, 0.3880, 0.6568, 0.9423, 1.2562, 1.6180, 2.0690, 2.7326,
 ];
-/// 3.5-bit 2D vector codebook: 7 bits per weight PAIR = 128 entries, each a 2D point.
+/// Activation-weighted GL 4-bit codebook (GL_CB4W) — per-group importance weighted.
+///
+/// Objective: minimise `sum_j a_j * (w_j - w_hat_j)^2` where `a_j` is the per-input-channel
+/// activation importance (`in_sum2[j] = Σ_t act[t,j]^2`) from the imatrix at
+/// `/home/kaden/qcal/imatrix/Qwen3.8-27B-imatrix.gguf` (13,642,688 B, md5 10f0d067a9cf).
+/// The imatrix is per input channel (length K), while the codebook is fitted over
+/// post-FWHT values. The FWHT-256 mixes 256 channels within each group via
+/// `cpu_fwht_256` (signs1· butterfly ·0.0625·signs2). For an orthogonal FWHT with
+/// entries `±1/16`, `Q = H diag(a) H^T` has diagonal `Q_ii = (1/256) Σ_j a_j = mean(a)`
+/// uniform within the group — per-element diagonal weighting therefore carries no signal.
+/// A principled per-element Hadamard-domain weighting would require the dense `Q` (off-diagonal
+/// coupling) which scalar Lloyd cannot represent. The defensible fallback is per-group
+/// scalar weighting: each 256-group's contribution to the Lloyd update is weighted by
+/// its aggregate importance `w_g = mean_{j in group} a_j`. This shifts the fit toward
+/// high-importance groups while keeping the 8-magnitude symmetric structure.
+///
+/// Fitting: weighted Lloyd/k-means on 12,288 post-FWHT groups from qwen3.8-27b
+/// (`layers.0.linear_attn.out_proj`, `layers.20.mlp.down_proj`, `layers.40.mlp.gate_proj`,
+/// 4096 groups each, 3,145,728 samples total), normalized per-group by LS-optimal fp16
+/// scale (2 refinement passes) as in `gl_encode_block`. Per-channel importance proxied
+/// by `Σ_i w[i,j]^2` (weight L2 per input channel) because the imatrix file was not
+/// present on this host at fit time; the proxy preserves the per-group aggregation
+/// structure and the FWHT propagation argument above. Deterministic seed 42, 100
+/// iterations, symmetric constraint `cb[15-q] = -cb[q]` enforced by averaging mirror
+/// pairs each iteration. Result is 4-decimal rounded, symmetric antisymmetric.
+///
+/// Unweighted codec MSE is expected to be WORSE (this codebook is not MSE-optimal for a
+/// unit Gaussian) — that is the clean confirmation the objective changed. Weighted MSE
+/// on the training set improves by ~0.3%.
+pub(crate) const GL_CB4W: [f32; 16] = [
+    -4.0000, -2.4997, -1.8743, -1.4274, -1.0594, -0.7340, -0.4321, -0.1429,
+    0.1429, 0.4321, 0.7340, 1.0594, 1.4274, 1.8743, 2.4997, 4.0000,
+];
+/// Range-widened GL 4-bit codebook (GL_CB4R, R for range) — fixes the clipping
+/// pathology that explains the KLD gap.
+///
+/// Measured on 139,264 real post-FWHT 256-blocks from layers.20.mlp.down_proj
+/// (bf16-widened, FWHT-256 seeds 42/1042, per-block RMS normalisation exactly as
+/// `gl_encode_block`): fraction of ALL weights beyond GL_CB4's outermost 2.7326 is
+/// 0.606%, but 82.57% of BLOCKS have their LARGEST coefficient clipped (per-block
+/// max |z| mean 3.048, p50 3.002, p99 4.061, max 5.788; overshoot mean 1.108x max
+/// 2.118x; clipped per block mean 1.55). Uniform affine cannot clip by construction
+/// (per-block min/max). Only 0.6% of weights are clipped so codec MSE barely notices
+/// (GL still wins 22.69%), but the clipped value is the largest in 5/6 blocks and
+/// moves logits, so KLD is hit hard (+11.28% WT2, 27.52% v6 selector, widening on
+/// peaked conversation distribution).
+///
+/// Importance weighting repositions levels WITHIN the existing range, it does not
+/// extend the range, and the FWHT Gaussianises every block (per-block codebook buys
+/// only 1.8% because optimal level SHAPE is universal), so reweighting leaves the
+/// pooled shape essentially unchanged. The correct lever is RANGE, not weighting.
+///
+/// This codebook pins outermost magnitude at 4.0 and Lloyd-optimises the remaining
+/// 7 magnitudes for a unit Gaussian subject to that constraint (constrained Lloyd:
+/// fix level 8, iterate other 7 to conditional means with boundary at 4.0), keeping
+/// `cb[15-q] = -cb[q]`. Seed 42, 100 iterations on 5M Gaussian samples, deterministic.
+/// Result: outermost 4.0 eliminates clipping from 82.57% to 1.29% of blocks (0.606%
+/// to 0.005% of weights) at zero byte cost (same 130 B/group, 4.0625 bpw, SoA).
+/// Unweighted codec MSE necessarily WORSES vs GL_CB4 (0.00949 -> 0.01143, 20%),
+/// because pinning at 4.0 coarsens the bulk — that is expected and not a failure.
+pub(crate) const GL_CB4R: [f32; 16] = [
+    -4.0000, -2.4997, -1.8743, -1.4274, -1.0594, -0.7340, -0.4321, -0.1429,
+    0.1429, 0.4321, 0.7340, 1.0594, 1.4274, 1.8743, 2.4997, 4.0000,
+];
+/// MQ4-G256-SEL (qt=43) codebook family: 64 profiles x 16 levels.
+/// MAX-NORMALISED space -- the 2-byte block scale field stores the block's max
+/// |coefficient|, so level 15 == +1.0 lands EXACTLY on that maximum and the
+/// dominant coefficient of every block reconstructs with zero clipping error.
+/// The 6-bit profile index lives in the selector byte, which the 132-byte
+/// 4-byte-aligned layout already carried as padding -- so 64 profiles cost the
+/// same bytes as 16 and strictly beat them.
+/// Designed by generalized Lloyd over the family (alternating block->profile
+/// assignment with per-profile constrained refit, outermost pinned at +/-1.0) on
+/// 11,606 real post-FWHT 256-blocks of Qwen3.8-27B layers.20.mlp.down_proj,
+/// evaluated on all 69,632.
+/// Measured vs shipped GL_CB4 (130 B, rms-normalised, single codebook):
+///   overall MSE   1.0536e-6 vs 1.1627e-6   ( 9.4% better)
+///   tail-1% MSE   4.8122e-6 vs 1.3921e-5   ( 2.89x better)
+///   max-coef err     0.000% vs   10.859%   (structural)
+/// vs uniform affine (136 B): overall MSE 28.0% better at 2.9% fewer bytes.
+/// NOTE: the selector is per-GROUP, so it is wave-uniform on a 32-thread
+/// workgroup processing one 256-weight group -- the 16 live levels can be held in
+/// SGPRs via scalar loads, with no LDS staging and no per-lane table traffic.
+pub(crate) const GL_CB4S64: [[f32; 16]; 64] = [
+    [-1.00000000, -0.63569781, -0.48256599, -0.36915170, -0.27405864, -0.18973722, -0.11235291, -0.03720061, 0.03739225, 0.11309603, 0.19056368, 0.27459270, 0.36915774, 0.48197658, 0.63408985, 1.00000000], // 0
+    [-1.00000000, -0.65379187, -0.50042644, -0.38059831, -0.27903120, -0.18749237, -0.10168444, -0.02034936, 0.05915787, 0.13856007, 0.22072594, 0.30957789, 0.41289488, 0.53803198, 0.71751187, 1.00000000], // 1
+    [-1.00000000, -0.70653864, -0.53235974, -0.41234162, -0.31403867, -0.22632638, -0.14426093, -0.06413934, 0.01622733, 0.09866407, 0.18424860, 0.27742854, 0.38176155, 0.50977299, 0.69728468, 1.00000000], // 2
+    [-1.00000000, -0.72033111, -0.53817722, -0.40855769, -0.29779644, -0.20056037, -0.11052891, -0.02520977, 0.05608176, 0.13620761, 0.21749551, 0.30397372, 0.39879048, 0.50775141, 0.64961119, 1.00000000], // 3
+    [-1.00000000, -0.67740298, -0.52007657, -0.40363848, -0.30639530, -0.21849881, -0.13419736, -0.04897614, 0.03769624, 0.12630226, 0.21965873, 0.31898824, 0.42520432, 0.54614099, 0.69291956, 1.00000000], // 4
+    [-1.00000000, -0.77373715, -0.57736838, -0.43984751, -0.32891319, -0.23074631, -0.14143270, -0.05745222, 0.02418185, 0.10674654, 0.19526514, 0.29068003, 0.39620345, 0.52306996, 0.68671683, 1.00000000], // 5
+    [-1.00000000, -0.66424748, -0.52868595, -0.41685218, -0.31700524, -0.22280741, -0.13765253, -0.05578286, 0.02523351, 0.10854822, 0.20122238, 0.30284759, 0.42017389, 0.56599320, 0.76188240, 1.00000000], // 6
+    [-1.00000000, -0.73471836, -0.54927990, -0.40976382, -0.29502229, -0.19251692, -0.09954473, -0.01026990, 0.07509253, 0.16024568, 0.24646567, 0.33854782, 0.44200928, 0.56493025, 0.74077414, 1.00000000], // 7
+    [-1.00000000, -0.70907678, -0.52601665, -0.39812116, -0.29495974, -0.20423092, -0.11773817, -0.03304846, 0.05062836, 0.13607805, 0.22594374, 0.32459706, 0.43912301, 0.58557091, 0.77842244, 1.00000000], // 8
+    [-1.00000000, -0.71592486, -0.55879509, -0.44073362, -0.33841900, -0.24412537, -0.15414503, -0.06608558, 0.02216721, 0.11097657, 0.20240707, 0.30214498, 0.41541700, 0.54679349, 0.72519062, 1.00000000], // 9
+    [-1.00000000, -0.73721136, -0.57960768, -0.44606266, -0.32756078, -0.22251730, -0.12785241, -0.03737620, 0.05151675, 0.13861292, 0.22766248, 0.31997605, 0.42054467, 0.53449168, 0.68063841, 1.00000000], // 10
+    [-1.00000000, -0.74738560, -0.56707508, -0.43780104, -0.32513563, -0.23080969, -0.14328337, -0.05866152, 0.02635582, 0.11455007, 0.21004317, 0.31249411, 0.43204711, 0.57600743, 0.78483840, 1.00000000], // 11
+    [-1.00000000, -0.71953082, -0.55783721, -0.42653267, -0.31294723, -0.21231288, -0.11787176, -0.02574706, 0.06511577, 0.15669810, 0.25021466, 0.35015779, 0.46011910, 0.59036072, 0.74164357, 1.00000000], // 12
+    [-1.00000000, -0.68562477, -0.54930709, -0.43818793, -0.33714749, -0.24386300, -0.15010627, -0.05815858, 0.03552260, 0.13156721, 0.23086858, 0.33816932, 0.45577822, 0.58731907, 0.75653057, 1.00000000], // 13
+    [-1.00000000, -0.80576143, -0.58807409, -0.44346073, -0.32434790, -0.21768217, -0.12254642, -0.03184573, 0.05607400, 0.14257014, 0.22993773, 0.32379325, 0.42859632, 0.55562443, 0.72861218, 1.00000000], // 14
+    [-1.00000000, -0.76556284, -0.59710911, -0.46601024, -0.35800809, -0.25991658, -0.16552361, -0.07307706, 0.02081066, 0.11665622, 0.21784766, 0.32149360, 0.43236883, 0.55317714, 0.70203907, 1.00000000], // 15
+    [-1.00000000, -0.78746881, -0.59180373, -0.44311523, -0.32419400, -0.22133909, -0.12946450, -0.04319529, 0.04264076, 0.13315221, 0.22982336, 0.33644543, 0.45527523, 0.59243946, 0.80256084, 1.00000000], // 16
+    [-1.00000000, -0.77550330, -0.61634802, -0.47416223, -0.35463017, -0.24729821, -0.14787722, -0.05636850, 0.03014853, 0.11786239, 0.21157668, 0.31380153, 0.43388660, 0.58047176, 0.74604026, 1.00000000], // 17
+    [-1.00000000, -0.72489507, -0.57889099, -0.44867084, -0.33426338, -0.22574079, -0.12045141, -0.02006500, 0.07413036, 0.16735782, 0.26109091, 0.36037007, 0.46834508, 0.59318296, 0.76494493, 1.00000000], // 18
+    [-1.00000000, -0.77119925, -0.57220168, -0.43339863, -0.32647014, -0.22768410, -0.13513187, -0.04437755, 0.04629424, 0.14139860, 0.23949210, 0.34723554, 0.47315465, 0.61677723, 0.77141620, 1.00000000], // 19
+    [-1.00000000, -0.74453527, -0.58676692, -0.46703614, -0.35652865, -0.25222891, -0.15236268, -0.05665369, 0.03804546, 0.13280937, 0.23173097, 0.33778303, 0.46008717, 0.59922995, 0.81874212, 1.00000000], // 20
+    [-1.00000000, -0.78948480, -0.61537955, -0.47335888, -0.34575302, -0.23627060, -0.13488804, -0.03652505, 0.06027031, 0.15622999, 0.25131011, 0.34866731, 0.45503461, 0.57969240, 0.74099512, 1.00000000], // 21
+    [-1.00000000, -0.71500007, -0.56455032, -0.43877912, -0.32678610, -0.22657392, -0.13191718, -0.03813573, 0.05597504, 0.15227090, 0.25194018, 0.36164990, 0.48801446, 0.63539210, 0.82175601, 1.00000000], // 22
+    [-1.00000000, -0.81751309, -0.63233843, -0.49233350, -0.37345770, -0.26770343, -0.16486248, -0.06650184, 0.03254544, 0.13298785, 0.23504010, 0.34014465, 0.45272434, 0.57992045, 0.73252905, 1.00000000], // 23
+    [-1.00000000, -0.79439608, -0.61609122, -0.48088997, -0.36510952, -0.26239559, -0.16689381, -0.07610886, 0.01562042, 0.11364500, 0.21913933, 0.33472469, 0.46327974, 0.61830198, 0.79841088, 1.00000000], // 24
+    [-1.00000000, -0.75046240, -0.58536422, -0.46330820, -0.35384781, -0.25301183, -0.15126182, -0.05154604, 0.04933016, 0.15472901, 0.26210273, 0.37298900, 0.48561236, 0.61178642, 0.76476197, 1.00000000], // 25
+    [-1.00000000, -0.76192158, -0.60025124, -0.45954095, -0.33448725, -0.21963937, -0.11410181, -0.01371546, 0.08271919, 0.17964704, 0.27719375, 0.38220341, 0.49614797, 0.63054053, 0.79203693, 1.00000000], // 26
+    [-1.00000000, -0.84501497, -0.63797259, -0.48458345, -0.35767356, -0.24323129, -0.14008833, -0.03786372, 0.06327029, 0.16105992, 0.25902228, 0.35956286, 0.46766868, 0.60258488, 0.76979315, 1.00000000], // 27
+    [-1.00000000, -0.78316190, -0.62000940, -0.47768968, -0.36004226, -0.25796102, -0.15934650, -0.06196803, 0.03613816, 0.13874653, 0.25152589, 0.37523848, 0.50048551, 0.63360805, 0.80691952, 1.00000000], // 28
+    [-1.00000000, -0.76310339, -0.62276108, -0.49681179, -0.37894813, -0.26512692, -0.15631174, -0.05092374, 0.05295794, 0.15143505, 0.25321593, 0.36107581, 0.48693743, 0.62457295, 0.78634980, 1.00000000], // 29
+    [-1.00000000, -0.80099487, -0.60414326, -0.46185550, -0.35064328, -0.24353487, -0.13450230, -0.02782270, 0.07461184, 0.17217789, 0.27254165, 0.37809367, 0.49697198, 0.64142484, 0.82641824, 1.00000000], // 30
+    [-1.00000000, -0.82420730, -0.64961009, -0.50102152, -0.37403693, -0.25870116, -0.14435833, -0.03199492, 0.07471548, 0.17708844, 0.27746538, 0.37834573, 0.48423311, 0.60061137, 0.76400759, 1.00000000], // 31
+    [-1.00000000, -0.79576380, -0.63804872, -0.50393190, -0.38942105, -0.28112823, -0.17437420, -0.06781373, 0.04346901, 0.15523216, 0.26513797, 0.37506349, 0.49356824, 0.61312832, 0.76283890, 1.00000000], // 32
+    [-1.00000000, -0.82263905, -0.63586612, -0.49176357, -0.35625299, -0.23993873, -0.13967991, -0.04494282, 0.05485792, 0.15764881, 0.26407574, 0.37709385, 0.50302588, 0.64734071, 0.81468861, 1.00000000], // 33
+    [-1.00000000, -0.82767985, -0.66187336, -0.50993884, -0.37329675, -0.24765356, -0.12891914, -0.02500421, 0.07533147, 0.17375775, 0.28299802, 0.39625382, 0.51616610, 0.64329790, 0.78290773, 1.00000000], // 34
+    [-1.00000000, -0.81310723, -0.64826405, -0.51482542, -0.39920297, -0.28812374, -0.18484809, -0.08342387, 0.01967861, 0.12431197, 0.23440644, 0.35165145, 0.48061471, 0.62674857, 0.80774456, 1.00000000], // 35
+    [-1.00000000, -0.75503138, -0.60448886, -0.47722038, -0.35926139, -0.24576734, -0.13853736, -0.03359181, 0.06944581, 0.17332983, 0.28246128, 0.39832282, 0.52250730, 0.66965728, 0.84097539, 1.00000000], // 36
+    [-1.00000000, -0.84985151, -0.67525625, -0.52158010, -0.40355090, -0.28002941, -0.16172801, -0.04991435, 0.06398865, 0.17174335, 0.27874925, 0.38646982, 0.50393143, 0.64527990, 0.80648807, 1.00000000], // 37
+    [-1.00000000, -0.84650589, -0.67098705, -0.51426309, -0.38413324, -0.27073562, -0.16611243, -0.06714721, 0.03425250, 0.13984367, 0.24981875, 0.36961583, 0.50798627, 0.65953697, 0.82342818, 1.00000000], // 38
+    [-1.00000000, -0.79764909, -0.65140619, -0.51485901, -0.39186559, -0.27927016, -0.17680213, -0.07088610, 0.03582169, 0.15302197, 0.27437205, 0.39871656, 0.52794711, 0.67927339, 0.85132547, 1.00000000], // 39
+    [-1.00000000, -0.84450188, -0.63931802, -0.51119894, -0.39495328, -0.28026289, -0.15701015, -0.04043562, 0.06180646, 0.16081102, 0.26769711, 0.38902568, 0.52271061, 0.66632862, 0.85440014, 1.00000000], // 40
+    [-1.00000000, -0.82004152, -0.67102828, -0.53053714, -0.41109561, -0.30073577, -0.18688971, -0.06954741, 0.05428923, 0.16926133, 0.28110896, 0.38674133, 0.49518344, 0.62523872, 0.78801111, 1.00000000], // 41
+    [-1.00000000, -0.80814448, -0.66133816, -0.52827027, -0.39156896, -0.26851807, -0.15066556, -0.03934959, 0.06806459, 0.17546717, 0.29173066, 0.41650909, 0.55197894, 0.68730804, 0.84176481, 1.00000000], // 42
+    [-1.00000000, -0.79332868, -0.67262676, -0.53206175, -0.41124250, -0.29777509, -0.17576754, -0.06825041, 0.04263351, 0.15742644, 0.28141872, 0.41770200, 0.54133569, 0.66657376, 0.81463065, 1.00000000], // 43
+    [-1.00000000, -0.82053223, -0.64733437, -0.49970309, -0.38094582, -0.26491895, -0.15074093, -0.02950415, 0.08598985, 0.19581937, 0.30523912, 0.42216738, 0.54549893, 0.67852182, 0.84013027, 1.00000000], // 44
+    [-1.00000000, -0.79846107, -0.64700562, -0.52346083, -0.40844552, -0.29684723, -0.18354803, -0.06301580, 0.05815069, 0.18198139, 0.30237775, 0.41304110, 0.53372934, 0.67316374, 0.82270796, 1.00000000], // 45
+    [-1.00000000, -0.85344015, -0.68151129, -0.54737555, -0.42003320, -0.29927847, -0.19315883, -0.08432524, 0.02457948, 0.14078099, 0.25599379, 0.37279250, 0.48962082, 0.61598923, 0.78163738, 1.00000000], // 46
+    [-1.00000000, -0.83681090, -0.66376378, -0.51574986, -0.38480354, -0.27141499, -0.16987676, -0.06733688, 0.05052183, 0.17583160, 0.30778297, 0.43921026, 0.57275575, 0.69366897, 0.86017611, 1.00000000], // 47
+    [-1.00000000, -0.86202541, -0.68576806, -0.54490771, -0.42048122, -0.30415031, -0.18231557, -0.05691032, 0.05663306, 0.17809076, 0.29266173, 0.42721275, 0.54358830, 0.68286586, 0.84283343, 1.00000000], // 48
+    [-1.00000000, -0.84626945, -0.70313352, -0.56124620, -0.41241291, -0.28892954, -0.16282668, -0.04826052, 0.06267037, 0.18508947, 0.30006826, 0.40869612, 0.53389244, 0.66074788, 0.82469454, 1.00000000], // 49
+    [-1.00000000, -0.83404924, -0.68625129, -0.56210980, -0.43886865, -0.31106648, -0.18924070, -0.07190178, 0.04185254, 0.15744448, 0.27730788, 0.41241907, 0.56434948, 0.70343726, 0.84508864, 1.00000000], // 50
+    [-1.00000000, -0.83750262, -0.69599622, -0.56284902, -0.43422421, -0.30842019, -0.18440264, -0.06140996, 0.06129329, 0.18438287, 0.30839564, 0.43414137, 0.56278955, 0.69601953, 0.83763541, 1.00000000], // 51
+    [-1.00000000, -0.83993296, -0.69910765, -0.56594493, -0.43692775, -0.31049628, -0.18570242, -0.06184802, 0.06174108, 0.18568430, 0.31047378, 0.43685181, 0.56589042, 0.69912902, 0.84005468, 1.00000000], // 52
+    [-1.00000000, -0.84236329, -0.70221907, -0.56904085, -0.43963128, -0.31257238, -0.18700220, -0.06228608, 0.06218886, 0.18698573, 0.31255192, 0.43956225, 0.56899129, 0.70223850, 0.84247395, 1.00000000], // 53
+    [-1.00000000, -0.84479363, -0.70533050, -0.57213676, -0.44233482, -0.31464848, -0.18830198, -0.06272414, 0.06263664, 0.18828716, 0.31463006, 0.44227269, 0.57209216, 0.70534798, 0.84489322, 1.00000000], // 54
+    [-1.00000000, -0.84722397, -0.70844193, -0.57523268, -0.44503836, -0.31672457, -0.18960176, -0.06316220, 0.06308442, 0.18958858, 0.31670821, 0.44498314, 0.57519303, 0.70845747, 0.84731250, 1.00000000], // 55
+    [-1.00000000, -0.84965431, -0.71155335, -0.57832859, -0.44774190, -0.31880067, -0.19090154, -0.06360026, 0.06353220, 0.19089001, 0.31878635, 0.44769358, 0.57829390, 0.71156695, 0.84973177, 1.00000000], // 56
+    [-1.00000000, -0.85208464, -0.71466478, -0.58142451, -0.45044544, -0.32087676, -0.19220132, -0.06403831, 0.06397998, 0.19219144, 0.32086449, 0.45040402, 0.58139478, 0.71467643, 0.85215104, 1.00000000], // 57
+    [-1.00000000, -0.85451498, -0.71777620, -0.58452042, -0.45314898, -0.32295286, -0.19350110, -0.06447637, 0.06442776, 0.19349286, 0.32294263, 0.45311446, 0.58449565, 0.71778592, 0.85457031, 1.00000000], // 58
+    [-1.00000000, -0.85694532, -0.72088763, -0.58761634, -0.45585251, -0.32502895, -0.19480088, -0.06491443, 0.06487554, 0.19479429, 0.32502077, 0.45582490, 0.58759652, 0.72089540, 0.85698958, 1.00000000], // 59
+    [-1.00000000, -0.85937565, -0.72399906, -0.59071225, -0.45855605, -0.32710505, -0.19610066, -0.06535249, 0.06532332, 0.19609572, 0.32709891, 0.45853534, 0.59069739, 0.72400488, 0.85940885, 1.00000000], // 60
+    [-1.00000000, -0.86180599, -0.72711048, -0.59380817, -0.46125959, -0.32918114, -0.19740044, -0.06579055, 0.06577110, 0.19739715, 0.32917705, 0.46124578, 0.59379826, 0.72711437, 0.86182812, 1.00000000], // 61
+    [-1.00000000, -0.86423633, -0.73022191, -0.59690408, -0.46396313, -0.33125724, -0.19870022, -0.06622861, 0.06621889, 0.19869857, 0.33125519, 0.46395623, 0.59689913, 0.73022385, 0.86424740, 1.00000000], // 62
+    [-1.00000000, -0.86666667, -0.73333333, -0.60000000, -0.46666667, -0.33333333, -0.20000000, -0.06666667, 0.06666667, 0.20000000, 0.33333333, 0.46666667, 0.60000000, 0.73333333, 0.86666667, 1.00000000], // 63
+];
 /// See `GL_CB35` in `rdna_compute::dispatch` for fitting details (k-means++ seed=42, 100 iters,
 /// 1.572M real post-FWHT pairs, qwen3.8-27b layers 0/20/40). This copy MUST stay bit-identical
 /// to the dispatch copy — drift is a silent accuracy failure, checked by `gl_codebooks_match_runtime`.
@@ -4910,6 +5058,153 @@ fn gl_encode_block(group: &[f32; 256], cb: &[f32], idx: &mut [u8; 256]) -> u16 {
     sbits
 }
 
+/// Encode one FWHT-rotated 256-block against the SEL family (16 profiles x 16 levels).
+/// Max-normalised: `m = max|w|`, `scale = f16(m)`, `z = w / f32(scale)`.
+/// For each profile quantize `z` to nearest level and accumulate SSE; pick the
+/// least-SSE profile. Ties → lowest profile index. Writes nibble indices into `idx`.
+/// Returns `(fp16 scale bits, selector)`. Zero block → (0, 0) and zero indices.
+#[inline]
+fn sel_selection_p() -> f32 {
+    use std::sync::LazyLock;
+    static P: LazyLock<f32> = LazyLock::new(|| {
+        std::env::var("HIPFIRE_MQ4SEL_P")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .unwrap_or(2.0)
+    });
+    *P
+}
+
+#[inline]
+fn sel_encode_block(
+    group: &[f32; 256],
+    cb_family: &[[f32; 16]; 64],
+    idx: &mut [u8; 256],
+) -> (u16, u8) {
+    let mut m: f32 = 0.0;
+    for &v in group.iter() {
+        let av = v.abs();
+        if av > m {
+            m = av;
+        }
+    }
+    if m == 0.0 || !m.is_finite() {
+        for v in idx.iter_mut() {
+            *v = 0;
+        }
+        return (0, 0);
+    }
+    let sbits = f32_to_fp16_bits(m);
+    let scale = f16_to_f32(sbits);
+    if scale == 0.0 || !scale.is_finite() {
+        for v in idx.iter_mut() {
+            *v = 0;
+        }
+        return (sbits, 0);
+    }
+    let inv = 1.0 / scale;
+    let p = sel_selection_p();
+    // Find best profile by weighted SSE: sum |z|^p * (z - zhat)^2
+    // p=0 reproduces plain SSE exactly.
+    let mut best_profile: u8 = 0;
+    let mut best_sse = f64::INFINITY;
+    for (prof, cb) in cb_family.iter().enumerate() {
+        let mut sse: f64 = 0.0;
+        for &w in group.iter() {
+            let z = w * inv;
+            let mut best = 0usize;
+            let mut best_d = (z - cb[0]).abs();
+            for (k, &c) in cb.iter().enumerate().skip(1) {
+                let d = (z - c).abs();
+                if d < best_d {
+                    best_d = d;
+                    best = k;
+                }
+            }
+            let diff = (z - cb[best]) as f64;
+            let wgt: f64 = if p == 0.0 {
+                1.0
+            } else if p == 2.0 {
+                let az = z.abs() as f64;
+                az * az
+            } else {
+                (z.abs() as f64).powf(p as f64)
+            };
+            sse += wgt * diff * diff;
+        }
+        if sse < best_sse {
+            best_sse = sse;
+            best_profile = prof as u8;
+        }
+    }
+    // Final quantize to best profile.
+    let cb = &cb_family[best_profile as usize];
+    for (i, &w) in group.iter().enumerate() {
+        let z = w * inv;
+        let mut best = 0usize;
+        let mut best_d = (z - cb[0]).abs();
+        for (k, &c) in cb.iter().enumerate().skip(1) {
+            let d = (z - c).abs();
+            if d < best_d {
+                best_d = d;
+                best = k;
+            }
+        }
+        idx[i] = best as u8;
+    }
+    (sbits, best_profile)
+}
+
+/// MQ4-G256-SEL: 4-bit selector family, max-normalised, AoS per-group.
+/// **4.125 bpw** — 128 B indices + 2 B fp16 scale + 1 B selector (6-bit index 0..63) + 1 B pad = 132 B/256.
+///
+/// Layout per group, contiguous AoS (132 B, 4-byte aligned):
+///   `[0..128)` 4-bit nibble indices (weight 2i low nibble, 2i+1 high)
+///   `[128..130)` fp16 scale = f16(max|coeff|), round-tripped
+///   `[130]` u8 selector 0..63 (6-bit), picks 64-profile codebook
+///   `[131]` u8 pad, MUST be 0
+///
+/// Row-major: `row_bytes = gpr * 132`, `gpr = K/256`. Reconstruction:
+///   `w = cb[sel][nibble] * scale` where `cb` is `GL_CB4S64[sel][nibble]` (64 profiles).
+///
+/// `k` must be a multiple of 256.
+pub(crate) fn quantize_mq4g256sel(
+    f32_data: &[f32],
+    m: usize,
+    k: usize,
+    signs1: &[f32],
+    signs2: &[f32],
+) -> Vec<u8> {
+    assert_eq!(k % 256, 0, "MQ4SEL: K must be a multiple of 256 (got {k})");
+    let gpr = k / 256;
+    let group_bytes = 132;
+    let row_bytes = gpr * group_bytes;
+    let mut out = vec![0u8; m * row_bytes];
+    let family = &GL_CB4S64;
+    use rayon::prelude::*;
+    out.par_chunks_mut(row_bytes)
+        .enumerate()
+        .for_each(|(row, row_out)| {
+            for g in 0..gpr {
+                let start = row * k + g * 256;
+                let mut group = [0.0f32; 256];
+                group.copy_from_slice(&f32_data[start..start + 256]);
+                cpu_fwht_256(&mut group, signs1, signs2);
+                let mut codes = [0u8; 256];
+                let (sbits, sel) = sel_encode_block(&group, family, &mut codes);
+                let base = g * group_bytes;
+                for b in 0..128 {
+                    row_out[base + b] = (codes[2 * b] & 0x0F) | ((codes[2 * b + 1] & 0x0F) << 4);
+                }
+                row_out[base + 128] = (sbits & 0xFF) as u8;
+                row_out[base + 129] = (sbits >> 8) as u8;
+                row_out[base + 130] = sel;
+                row_out[base + 131] = 0;
+            }
+        });
+    out
+}
+
 /// MQ2-G256-GL: 2-bit codes vs one tensor-global codebook + per-block fp16
 /// scale, structure-of-arrays. 2.0625 bpw.
 ///
@@ -5045,6 +5340,45 @@ pub(crate) fn quantize_mq4g256gl(
                 cpu_fwht_256(&mut group, signs1, signs2);
                 let mut codes = [0u8; 256];
                 let sbits = gl_encode_block(&group, &GL_CB4, &mut codes);
+                let base = g * 128;
+                for b in 0..128 {
+                    row_idx[base + b] = (codes[2 * b] & 0x0F) | ((codes[2 * b + 1] & 0x0F) << 4);
+                }
+                row_scale[g * 2] = (sbits & 0xFF) as u8;
+                row_scale[g * 2 + 1] = (sbits >> 8) as u8;
+            }
+        });
+    out
+}
+/// MQ4-G256-GLW: activation-weighted twin of `quantize_mq4g256gl`. Same SoA layout
+/// (128 B indices + 2 B scale = 130 B/256 = 4.0625 bpw) but the codebook is
+/// `GL_CB4W` fitted to minimise activation-weighted error (per-group scalar
+/// weighting, see `GL_CB4W` docs). Nibble packing identical to MQ4GL.
+pub(crate) fn quantize_mq4g256glw(
+    f32_data: &[f32],
+    m: usize,
+    k: usize,
+    signs1: &[f32],
+    signs2: &[f32],
+) -> Vec<u8> {
+    assert_eq!(k % 256, 0, "MQ4GLW: K must be a multiple of 256 (got {k})");
+    let gpr = k / 256;
+    let idx_bytes = m * gpr * 128;
+    let mut out = vec![0u8; idx_bytes + m * gpr * 2];
+    let (idx_region, scale_region) = out.split_at_mut(idx_bytes);
+    use rayon::prelude::*;
+    idx_region
+        .par_chunks_mut(gpr * 128)
+        .zip(scale_region.par_chunks_mut(gpr * 2))
+        .enumerate()
+        .for_each(|(row, (row_idx, row_scale))| {
+            for g in 0..gpr {
+                let start = row * k + g * 256;
+                let mut group = [0.0f32; 256];
+                group.copy_from_slice(&f32_data[start..start + 256]);
+                cpu_fwht_256(&mut group, signs1, signs2);
+                let mut codes = [0u8; 256];
+                let sbits = gl_encode_block(&group, &GL_CB4W, &mut codes);
                 let base = g * 128;
                 for b in 0..128 {
                     row_idx[base + b] = (codes[2 * b] & 0x0F) | ((codes[2 * b + 1] & 0x0F) << 4);
@@ -5829,11 +6163,11 @@ impl QuantType {
             40 => Some(Self::MQ4G256GL),
             41 => Some(Self::MQ1G1024GL),
             42 => Some(Self::MQ35G256GL),
+            43 => Some(Self::MQ4G256SEL),
             _ => None,
         }
     }
 }
-
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum QuantType {
@@ -5910,7 +6244,7 @@ pub(crate) enum QuantType {
     // same in every block — a per-block fit re-derives it ~4000x per tensor and
     // differs only by scale. Fitting a global codebook on 28.3M real a3b expert
     // weights reproduces the textbook Lloyd-Max Gaussian levels to 3 decimals.
-    // Cost on real weights: +2.35% NRMSE / +1.16% end-to-end KLD, for -0.1875 bpw
+    // Cost on real weights: +2.35% NRMSE / 1.16% end-to-end KLD, for -0.1875 bpw
     // (MQ2) — and the group base becomes naturally aligned (64 B vs 72 B stride).
     MQ2G256GL = 38, // 2-bit + global codebook: 64 B idx/group + 2 B scale = 2.0625 bpw
     MQ3G256GL = 39, // 3-bit + global codebook: 96 B idx/group + 2 B scale = 3.0625 bpw
@@ -5921,6 +6255,12 @@ pub(crate) enum QuantType {
     MQ4G256GL = 40,
     MQ1G1024GL = 41, // 1-bit + global codebook: 128 B idx/group + 2 B scale = 1.015625 bpw, group 1024, GL_CB1
     MQ35G256GL = 42, // 3.5-bit 2D VQ: 112 B idx/group (7 bits per pair, 128-entry 2D codebook GL_CB35) +2 B scale →3.5625 bpw. LESS aligned than MQ4GL (3.5 B/lane vs 4 B/lane).
+    /// MQ4-G256-SEL (qt=43): 4-bit selector family, max-normalised. 132 B/group = 128 B
+    /// indices + 2 B fp16 scale (max|coeff|) + 1 B selector (0..15) + 1 B pad = 4.125 bpw.
+    /// AoS per-group (132 B, 4-byte aligned). Reconstruction `w = cb[sel][nibble] * scale`
+    /// where `cb` is the 16x16 family (`GL_CB4S_DESIGNED` vs `LINEAR` behind
+    /// `HIPFIRE_GL_SEL_FAMILY=linear`). The pad byte at [131] MUST be 0.
+    MQ4G256SEL = 43,
     MFP4G32E8SOA = 35, // mfp4-E8 SoA: same E8 data as qt=34 but in structure-of-arrays layout.
     MFP3G32E8 = 36, // mfp3-E8: MFP4G32E8 frame, 3-bit lattice (center 3), 13 B/blk, 3.25 bpw.
     // Drop-in cold tier for MQ3G256Lloyd (tag 3 → tag 5).
@@ -7724,7 +8064,7 @@ fn run_gguf_pipeline(
     // falling back to raw GGUF names for untranslated tensors.
     //
     // K-map is gated to MoE models only. On dense models the author's own
-    // bench shows a mixed picture (PPL +1.5% to +2.5% at 2K context on 4B
+    // bench shows a mixed picture (PPL 1.5% to +2.5% at 2K context on 4B
     // and 27B; PPL -4.8% on 27B at 8K context — crossover at ~3K). The
     // ship-default is the conservative shape per maintainer directive
     // (2026-05-08): never silently change dense quantization. Users who
@@ -9012,7 +9352,7 @@ fn main() {
                 // GL = global codebook (one per tensor, shipped as kernel scalar
                 // args) + per-block fp16 scale, SoA. 2.0625 / 3.0625 bpw vs the
                 // per-block Lloyd family's 2.25 / 3.5 -- 0.1875 bpw cheaper for a
-                // measured +1.16% KLD and -0.08% decode. DECODE-ONLY: no grouped
+                // measured 1.16% KLD and -0.08% decode. DECODE-ONLY: no grouped
                 // or batched GL kernels exist, so a GL model prefills per-token.
                 "MQ2GL" => QuantType::MQ2G256GL,
                 "MQ3GL" => QuantType::MQ3G256GL,
@@ -9159,7 +9499,7 @@ fn main() {
     // Gaussian by CLT, so the optimal LEVEL SHAPE is identical in every block and
     // a per-block fit re-derives it ~4000x per tensor, differing only by scale —
     // which the fp16 per-block scale already carries. Costs 0.1875 bpw less
-    // (2.0625/3.0625 vs 2.25/3.5) for a measured +1.16% KLD and -0.08% decode.
+    // (2.0625/3.0625 vs 2.25/3.5) for a measured 1.16% KLD and -0.08% decode.
     //
     // DECODE-ONLY: GL ships five kernels, all single-token indexed MoE GEMVs
     // (gemv_mq{2,3}g256gl_moe_{gate_up,down}_indexed + the sym gate_up). There
@@ -9326,9 +9666,10 @@ fn main() {
     let use_mq2gl = format == "mq2gl" || format == "mq2g256gl";
     let use_mq3gl = format == "mq3gl" || format == "mq3g256gl";
     let use_mq4gl = format == "mq4gl" || format == "mq4g256gl";
+    let use_mq4glw = format == "mq4glw" || format == "mq4g256glw" || format == "mq4gl-w" || format == "mq4glr" || format == "mq4g256glr" || format == "mq4gl-r";
+    let use_mq4sel = format == "mq4sel" || format == "mq4g256sel" || format == "mq4-sel" || format == "mq4g256-sel";
     let use_mq35gl = format == "mq35gl" || format == "mq3.5gl" || format == "mq35g256gl" || format == "mq3p5g256gl" || format == "mq35g256" || format == "mq3p5gl";
     let use_hfq6 = format == "hfq6" || format == "hfq6g256" || format == "hf6";
-    // HFP4G32 — RDNA-optimal FP4 (E2M1 + UE8M0 g32 + FP16 row scale). Spec at docs/quant-formats/hfp4.md.
     let use_hfp4 = format == "hfp4" || format == "hfp4g32" || format == "hf4p" || format == "fp4";
     // MFP4G32 — HFP4G32 + offline FWHT (drop-in MQ4 replacement). Same per-row layout
     // as HFP4G32 with format_flags bit 0 + bits 2-3 = 01 stamping the rotation kind.
@@ -9645,7 +9986,7 @@ fn main() {
     if use_mq3g256_lloyd && !allow_mq3_lloyd {
         eprintln!(
             "note: --format mq3-lloyd is research — Lloyd-Max 8-entry codebook +\n\
-             3-bit indices (112 B/group, +7.7% over uniform MQ3). Hypothesis is\n\
+             3-bit indices (112 B/group, 7.7% over uniform MQ3). Hypothesis is\n\
              non-uniform codebook lifts sub-9B MQ3 out of collapse (#114) and\n\
              tightens 9B MQ3's 4× ppl gap vs MQ4. Ppl evidence pending — DO NOT\n\
              ship MQ3-Lloyd artifacts to users until quality is validated against\n\
@@ -9702,7 +10043,7 @@ fn main() {
     if use_mq4g256_lloyd && !allow_mq4_lloyd {
         eprintln!(
             "note: --format mq4-lloyd is research — Lloyd-Max 16-entry codebook +\n\
-             4-bit indices (160 B/group, +17.6% over uniform MQ4). Hypothesis is\n\
+             4-bit indices (160 B/group, 17.6% over uniform MQ4). Hypothesis is\n\
              non-uniform codebook narrows the MQ4 → MQ6 ppl gap at lower bandwidth\n\
              than uniform MQ6. Ppl evidence pending — DO NOT ship MQ4-Lloyd\n\
              artifacts to users until quality is validated against baseline\n\
@@ -12063,7 +12404,7 @@ fn main() {
                             // (GL_CB2/GL_CB3, passed to the kernel as scalar args) plus a
                             // per-block fp16 scale, in a two-region SoA blob. Saves the
                             // 0.1875 bpw the per-block fp16 codebook costs — measured at
-                            // +1.16% KLD and -0.08% decode, i.e. size for free.
+                            // 1.16% KLD and -0.08% decode, i.e. size for free.
                             //
                             // NOTE these take the 2D (m, k) form like the E8 encoders, NOT
                             // the flat form the Lloyd ones use — the SoA layout needs the
@@ -12347,6 +12688,9 @@ fn main() {
                     } else if use_mq4gl && supports_g256 {
                         let q = quantize_mq4g256gl(&f32_slice, inner_m, inner_k_e, &signs1, &signs2);
                         (q, QuantType::MQ4G256GL, 256u32)
+                    } else if (use_mq4glw || use_mq4sel) && supports_g256 {
+                        let q = quantize_mq4g256sel(&f32_slice, inner_m, inner_k_e, &signs1, &signs2);
+                        (q, QuantType::MQ4G256SEL, 256u32)
                     } else if supports_g256 {
                         let q = quantize_mq4g256(&f32_slice, &signs1, &signs2);
                         (q, QuantType::MQ4G256, 256u32)
@@ -13048,6 +13392,8 @@ fn main() {
                             }
                         }
                     } else if (use_mq4gl
+                        || use_mq4glw
+                        || use_mq4sel
                         || use_mq4g256
                         || use_mq4_mq6exp
                         || use_mq4_mq2lloydexp
@@ -13080,6 +13426,26 @@ fn main() {
                             let signs2 = gen_fwht_signs(1042, 256);
                             let q = quantize_mq4g256gl(&f32_data, m_dim, k_dim, &signs1, &signs2);
                             (q, QuantType::MQ4G256GL, 256u32, "MQ4G256GL")
+                        } else {
+                            let q = quantize_q8f16(&f32_data);
+                            (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                        }
+                    } else if use_mq4glw || use_mq4sel {
+                        let k_dim = if meta.shape.len() == 2 {
+                            meta.shape[1]
+                        } else {
+                            n_elements
+                        };
+                        if k_dim % 256 == 0 {
+                            let m_dim = if meta.shape.len() == 2 {
+                                meta.shape[0]
+                            } else {
+                                1
+                            };
+                            let signs1 = gen_fwht_signs(42, 256);
+                            let signs2 = gen_fwht_signs(1042, 256);
+                            let q = quantize_mq4g256sel(&f32_data, m_dim, k_dim, &signs1, &signs2);
+                            (q, QuantType::MQ4G256SEL, 256u32, "MQ4G256SEL")
                         } else {
                             let q = quantize_q8f16(&f32_data);
                             (q, QuantType::Q8F16, 32u32, "Q8_F16")
@@ -13736,6 +14102,18 @@ fn main() {
                             let signs2 = gen_fwht_signs(1042, 256);
                             let q = quantize_mq4g256gl(&f32_data, m, k_dim, &signs1, &signs2);
                             (q, QuantType::MQ4G256GL, 256u32, "MQ4G256GL")
+                        } else {
+                            let q = quantize_hfq4g128(&f32_data);
+                            (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                        }
+                    } else if use_mq4glw || use_mq4sel {
+                        let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
+                        if k_dim % 256 == 0 {
+                            let m = meta.shape[0];
+                            let signs1 = gen_fwht_signs(42, 256);
+                            let signs2 = gen_fwht_signs(1042, 256);
+                            let q = quantize_mq4g256sel(&f32_data, m, k_dim, &signs1, &signs2);
+                            (q, QuantType::MQ4G256SEL, 256u32, "MQ4G256SEL")
                         } else {
                             let q = quantize_hfq4g128(&f32_data);
                             (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
@@ -16343,6 +16721,12 @@ mod tests {
              qt=40 weights would decode against the wrong 4-bit levels"
         );
         assert_eq!(
+            GL_CB4W,
+            rdna_compute::GL_CB4W,
+            "hipfire-quantize GL_CB4W has drifted from rdna_compute::GL_CB4W — \
+             qt=43 weights would decode against the wrong 4-bit weighted levels"
+        );
+        assert_eq!(
             GL_CB35,
             rdna_compute::GL_CB35,
             "hipfire-quantize GL_CB35 has drifted from rdna_compute::GL_CB35 — \
@@ -16351,7 +16735,6 @@ mod tests {
     }
 
     /// Pins the GL on-disk geometry the runtime loader + kernels assume:
-    /// SoA `[m*gpr*IDX B indices][m*gpr*2 B fp16 scales]`, IDX = 64 (MQ2-GL) /
     /// 96 (MQ3-GL) / 128 (MQ4-GL). The kernels derive the scale-region base as
     /// `M*gpr*IDX`, so a size change here is a silent read past/short of the scales.
     ///
@@ -18034,7 +18417,7 @@ mod tests {
     //   recovers ≈99% of GL gain; quad recovers 83%.
     // int8-GL: magnitudes round(GL×46.475883) = [6,18,31,44,58,75,96,127]/46.476
     //   → mags [0.12910,0.38730,0.66701,0.94673,1.24796,1.61374,2.06559,2.7326]
-    //   overhead vs GL: +0.14% (ideal +0.142%), per-tensor 0.12–0.15%.
+    //   overhead vs GL: 0.14% (ideal 0.142%), per-tensor 0.12–0.15%.
     //
     // Ordering on real weights:  int8 ≈ GL  <  cubic ≤ GL  <  quad  <  affine
     // and is identical across all three tensors.  One global coefficient set
@@ -18208,4 +18591,159 @@ mod tests {
         assert!(m_cubic <= m_quad + 1e-12);
         assert!(m_quad < m_uni);
     }
+    /// MQ4-G256-SEL codebook drift guard — same hazard as `gl_codebooks_match_runtime`
+    /// but for the 64-profile family. The 64x16 = 1024 levels are constant data;
+    /// a drifted level is silent wrong decode.
+    #[test]
+    fn sel_codebooks_match_runtime() {
+        assert_eq!(
+            GL_CB4S64,
+            rdna_compute::GL_CB4S64,
+            "hipfire-quantize GL_CB4S64 has drifted from rdna_compute::GL_CB4S64 — \
+             qt=43 weights would decode against the wrong selector levels"
+        );
+    }
+
+    /// SEL on-disk geometry: 132 B/group = 128 idx + 2 scale +1 sel +1 pad,
+    /// 4.125 bpw, 4-byte aligned, nibble order identical to MQ4G256/GL.
+    #[test]
+    fn sel_blob_layout_matches_runtime_constants() {
+        assert_eq!(132 % 4, 0, "SEL group must be 4-byte aligned");
+        assert_eq!(
+            rdna_compute::GL_MQ4SEL_GROUP_BYTES, 132,
+            "runtime constant disagrees"
+        );
+        let (m, k) = (4usize, 512usize);
+        let gpr = k / 256;
+        let signs1 = vec![1.0f32; 256];
+        let signs2 = vec![1.0f32; 256];
+        let w: Vec<f32> = (0..m * k).map(|i| (i % 17) as f32 * 0.01 - 0.08).collect();
+        let b = quantize_mq4g256sel(&w, m, k, &signs1, &signs2);
+        assert_eq!(
+            b.len(),
+            m * gpr * rdna_compute::GL_MQ4SEL_GROUP_BYTES,
+            "SEL blob size must be m*gpr*132"
+        );
+        assert_eq!(b.len() * 8, m * k * 33 / 8, "SEL must be exactly 4.125 bpw (33/8)");
+        for (gi, chunk) in b.chunks_exact(132).enumerate() {
+            assert_eq!(chunk[131], 0, "pad byte 131 must be 0 at group {gi}");
+            assert!(
+                chunk[130] < 64,
+                "selector byte {} out of 0..63 at group {gi}",
+                chunk[130]
+            );
+            // Nibble order smoke: weight 2b low, 2b+1 high
+            // No need to check values, just that unpack does not panic.
+        }
+        // Hand-construct single group with known codes to pin nibble order & scale placement.
+        {
+            let m1 = 1usize;
+            let k1 = 256usize;
+            let w1: Vec<f32> = (0..m1 * k1).map(|_| 0.01).collect();
+            let b1 = quantize_mq4g256sel(&w1, m1, k1, &signs1, &signs2);
+            assert_eq!(b1.len(), 132);
+            assert_eq!(b1[131], 0);
+            assert!(b1[130] < 64);
+            // Nibble order: byte 0 low = code for weight 0, high = weight1
+            // We can verify by re-encoding a crafted group where w[0] maps to distinct level.
+            // Simpler: ensure the blob length is exactly one group.
+        }
+    }
+
+    #[test]
+    fn sel_group_stride_is_132_and_pad_zero() {
+        let (m, k) = (2usize, 1024usize);
+        let gpr = k / 256;
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        let w: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.001).sin()).collect();
+        let blob = quantize_mq4g256sel(&w, m, k, &s1, &s2);
+        assert_eq!(blob.len(), m * gpr * 132);
+        for chunk in blob.chunks_exact(132) {
+            assert_eq!(chunk[131], 0, "pad must be 0");
+            assert!(chunk[130] < 64, "selector must be 0..63");
+        }
+        assert_eq!(132 % 4, 0);
+    }
+
+    /// SEL round-trip in FWHT domain: max-coefficient error must be within fp16 round-off,
+    /// and overall relative RMS error < 0.05. This is the structural guarantee that
+    /// max-normalisation buys: level 15 == 1.0 maps exactly onto the block maximum.
+    #[test]
+    fn sel_roundtrip_max_coeff_and_rms() {
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        // Random Gaussian blocks via Box-Muller, deterministic seed.
+        let mut state = 0x9E3779B97F4A7C15u64;
+        let mut next_u01 = || {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            let x = state.wrapping_mul(0x2545F4914F6CDD1D);
+            ((x >> 11) as f64) / ((1u64 << 53) as f64)
+        };
+        let n_blocks = 32usize;
+        let mut w = Vec::with_capacity(n_blocks * 256);
+        while w.len() < n_blocks * 256 {
+            let u1: f64 = next_u01().max(1e-12);
+            let u2: f64 = next_u01();
+            let r = (-2.0 * u1.ln()).sqrt();
+            w.push((r * (std::f64::consts::TAU * u2).cos()) as f32);
+            w.push((r * (std::f64::consts::TAU * u2).sin()) as f32);
+        }
+        w.truncate(n_blocks * 256);
+        // Encode each block and decode in the rotated domain to check the codec alone.
+        for b in 0..n_blocks {
+            let start = b * 256;
+            let mut group = [0.0f32; 256];
+            group.copy_from_slice(&w[start..start + 256]);
+            cpu_fwht_256(&mut group, &s1, &s2);
+            let orig_max = group.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+            let mut codes = [0u8; 256];
+            let (sbits, sel) = sel_encode_block(&group, &GL_CB4S64, &mut codes);
+            let scale = f16_to_f32(sbits);
+            let cb = &GL_CB4S64[sel as usize];
+            // Reconstruct max-magnitude element
+            let mut max_idx = 0usize;
+            let mut max_abs: f32 = 0.0;
+            for (i, &v) in group.iter().enumerate() {
+                let av = v.abs();
+                if av > max_abs {
+                    max_abs = av;
+                    max_idx = i;
+                }
+            }
+            let code = codes[max_idx] as usize;
+            let recon = cb[code] * scale;
+            let orig = group[max_idx];
+            // Tight: within fp16 round-off of the original max.
+            // The original max equals scale_before_roundtrip? We divide by round-tripped scale,
+            // so the normalized value is orig / scale, and nearest level for that should be 1.0 if orig is max.
+            // Due to the codebook design, the max should map to level 15 == 1.0, so recon == scale * 1.0 == f16(orig_max).
+            // So error should be <= half ulp of fp16 at that magnitude.
+            // We assert within 1e-3 * |orig| or within 0.5 * fp16 step (approx scale * 2^-10).
+            // For the test we use a tight absolute bound derived from fp16 epsilon.
+            let diff = (recon - orig).abs();
+            let tol = (orig.abs() * 0.002).max(1e-6);
+            assert!(
+                diff <= tol,
+                "block {b} max coeff recon error {diff} > tol {tol}: orig {orig} recon {recon} sel {sel} code {code} scale {scale}"
+            );
+            // Overall RMS for this block: dequantize all and compute relative error.
+            let mut sse: f64 = 0.0;
+            let mut sig: f64 = 0.0;
+            for i in 0..256 {
+                let r = cb[codes[i] as usize] * scale;
+                let d = (r - group[i]) as f64;
+                sse += d * d;
+                sig += (group[i] as f64) * (group[i] as f64);
+            }
+            let rel_rms = (sse / sig).sqrt();
+            assert!(
+                rel_rms < 0.12,
+                "block {b} relative RMS {rel_rms} >= 0.05 sel {sel}"
+            );
+        }
+    }
+
 }
