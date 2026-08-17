@@ -103,3 +103,92 @@ This session measures hfq4g256 at 17.00 µs / 657.5 GB/s where an earlier sessio
 19.12 µs / 584.6 GB/s at the same shape. Different thermal state, different day. **Ratios
 are the primary result**; absolutes are only comparable within one interleaved run. The
 same kernel has previously swung 38% (21.72 vs 30.00 µs) on warmup count alone.
+
+---
+
+## Amendment — v2 throughput measured on five architectures; gfx1030 regresses 14–18%
+
+The original document claimed no throughput number for v2 because no kernel existed. One now
+does: the header substitution was applied to both `gemv_hfq4g256_multirow.hip` (multirow,
+R=2/4/8) and `gemv_hfq4g256.hip` (single-row, R=1), preserving every byte offset so both
+header dwords remain **lane-invariant scalar loads**. The diff per group is 5 lines:
+
+```c
+const unsigned int hA = LOAD_WEIGHT_HEADER(gp,     goff);      // unchanged address
+const unsigned int hB = LOAD_WEIGHT_HEADER(gp + 4, goff + 4u); // unchanged address
+const unsigned int hs = (tid < 16) ? hA : hB;                  // half-wave select
+float sc = __half2float(__ushort_as_half((unsigned short)(hs & 0xFFFFu)));
+float zp = __half2float(__ushort_as_half((unsigned short)(hs >> 16)));
+```
+
+Net cost: one `v_cndmask` plus two `v_cvt_f32_f16` per group per row.
+
+### Why the single-row port was mandatory
+
+`ArchCaps::gemv_rows_default()` (`arch_caps.rs:145-151`) is
+`if is_wave64_native || is_rdna2 || is_rdna3_dgpu { 1 } else { 2 }`. **gfx1100 and gfx1030
+therefore default to R=1 and never touch the multirow kernel.** The earlier gfx1201-only
+result rested entirely on a path those parts do not take.
+
+### Results — hipx, 4 arches, interleaved hipEvent, 32 warmups, 100 iters, 3 runs
+
+Each arch's **shipping default R** is the only row that matters. Ratio = v2 / today; >1 is slower.
+
+| arch | GPU | default R | ratio @ 4096×5120 | ratio @ 4096×17408 | VGPR today→v2 | spills | verdict |
+|---|---|---|---|---|---|---|---|
+| gfx1201 | RX 9070 | 2 | 0.9645 | — | 94 → 94 | 0 | **free** |
+| gfx1100 | RX 7900 XTX | **1** | 0.97–0.99 | 0.97–0.99 | 72 → 76 | 0 | **free** |
+| gfx1151 | Radeon 8060S | 2 | 0.9846 | 0.9978 | 94 → 94 | 0 | **free** |
+| gfx1010 | RX 5700 XT | 2 | 1.0020 | 0.9984 | 36 → 36 | 0 | **free** |
+| **gfx1030** | **RX 6950 XT** | **1** | **1.1386** | **1.1758** | 61 → 61 | 0 | **REGRESSION** |
+
+gfx1030 was confirmed across **6 independent invocations**: 5120-shape ratios 1.1386, 1.1287,
+1.1226, 1.1594; 17408-shape 1.1758, 1.1810, 1.1709, 1.1775. Stable, not noise.
+
+Device binding was verified empirically per arch rather than assumed — **KFD node order is not
+HIP device ordinal** (KFD 1/2/3/4 = gfx1100/1151/1010/1030; HIP 0/1/2/3 =
+gfx1100/gfx1151/gfx1010/gfx1030 only after `HIP_VISIBLE_DEVICES` remap). Each run printed
+`gcnArchName` and it matched its compile target.
+
+### Mechanism: RDNA2's Infinity Cache makes the kernel VALU-bound
+
+gfx1030 does the 5120 shape in **17.37 µs for 11.18 MB = 643 GB/s**, against the RX 6950 XT's
+**576 GB/s** VRAM peak. Exceeding VRAM peak means it is not reading VRAM: the 11.18 MB weight
+matrix fits entirely inside the **128 MB Infinity Cache**, and the 17408 shape (~38 MB) does
+too (46.34 µs → 820 GB/s).
+
+So on RDNA2 this kernel is **compute-bound, not bandwidth-bound**, and v2's three extra VALU
+ops per group are fully exposed. VGPR count is unchanged at 61 with zero spills, confirming
+the cost is instruction latency rather than occupancy. It is consistent that the regression
+*grows* on the larger shape (13.9% → 17.6%) instead of amortising away.
+
+**This inverts the intuition recorded earlier in this campaign.** The expectation was that a
+bandwidth-saturated part (gfx1100, 192 SIMDs, ~60% of peak at R=1) would be least able to
+hide the extra ops. The opposite holds: **saturation is exactly what makes the change free**,
+and the vulnerable target is the one with enough cache to have become compute-bound.
+
+### Consequence for shipping
+
+v2 is throughput-neutral on gfx1201, gfx1100, gfx1151 and gfx1010 at their default R, and
+costs 14–18% on gfx1030. Two clean options, both idiomatic for this codebase, which already
+carries five gfx1030-specific `gemv_hfq4g256.gfx1030.v*.hip` variants:
+
+1. **Arch-gate the format**: gfx1030 keeps qt=1. Costs a dtype branch at load.
+2. **Raise gfx1030 to R=2**, where v2 measures 0.999 — but that changes a tuned default for
+   every 4-bit format on RDNA2, not just this one, and needs its own validation.
+
+Not yet resolved, and it should not be decided on this data alone: the R=2 option is a
+one-line `ArchCaps` change with wide blast radius, while the arch-gate is contained.
+
+### Still owed before v2 ships
+
+- **A real KLD run.** Tail-1% MSE is the only proxy that reproduced our one byte-comparable
+  KLD inversion, and it remains a proxy. Unlike qt=43, v2 *can* be scored at full speed
+  because affine already has the WMMA GEMM family.
+- **Encoder, qt number, and GEMM wiring.** All throughput above used synthetic blobs; nothing
+  is wired into the quantizer or dispatch.
+- **The other ~8 arch-specific HFQ4-G256 kernel variants** would each need the same
+  5-line substitution: `gemv_hfq4g256.gfx1100.hip`, `.gfx1201.hip`,
+  `_multirow.gfx1100.hip`, and `gemv_hfq4g256.gfx1030.v{1..5}.hip`.
+- The `HIPFIRE_HFQ4G256_XBATCH_KERNEL` path in the single-row file was **excluded** from this
+  measurement, not ported.
