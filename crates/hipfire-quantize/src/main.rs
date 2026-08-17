@@ -6152,7 +6152,22 @@ fn run_hfq_requant_pipeline(
     // projection is wrong by a per-channel factor (up to ~5× on qwen3.6-27b).
     // Fold `s` out here instead, and drop the sidecar so a future AWQ-aware
     // ternary kernel can't double-correct.
-    let awq_aware_target = !matches!(format, GgufFormat::Ternary | GgufFormat::Binary);
+    //
+    // Enumerated per requant-capable target rather than written as a negation,
+    // so that adding a new one is a decision instead of a default. Defaulting
+    // "unknown target" to AWQ-aware is precisely the bug above: it silently
+    // ships `W·s` weights whose `x/s` never runs.
+    let awq_aware_target = match format {
+        // FWHT-rotated targets: the GEMV rotate pre-pass carries the AWQ hook,
+        // so the scale stays baked into the weights and the sidecar rides along.
+        GgufFormat::Mq2 | GgufFormat::Mq3 | GgufFormat::Mq4 | GgufFormat::Mq6 => true,
+        // No rotation plan => no AWQ hook anywhere in the forward => fold here.
+        GgufFormat::Ternary | GgufFormat::Binary => false,
+        // Everything else falls through the per-tensor match below without
+        // being requantized (weights are copied verbatim), so the source's AWQ
+        // arrangement is still internally consistent — leave it alone.
+        _ => true,
+    };
     let awq_scales: std::collections::HashMap<String, Vec<f32>> = if awq_aware_target {
         std::collections::HashMap::new()
     } else {
@@ -6186,6 +6201,21 @@ fn run_hfq_requant_pipeline(
     let mut awq_dropped = 0usize;
     let mut awq_imatrix_used = 0usize;
     let mut ternary_stats = Tq2PackStats::default();
+
+    // The α a checkpoint was AWQ-built with is not recorded anywhere in the
+    // .hfq (pre-provenance builds carry no build knobs at all), so
+    // `--awq-imatrix` has to assume one. Say so out loud: a wrong α re-sharpens
+    // the importance weighting, though it preserves channel ORDERING for any
+    // α > 0, so the failure mode is "less effective", not "wrong".
+    if let Some(alpha) = awq_imatrix_alpha {
+        if !metadata_json.contains("\"awq_alpha\"") {
+            eprintln!(
+                "hfq requant: --awq-imatrix using ASSUMED alpha={alpha} — the source \
+                 records no AWQ alpha. If it was built with a different --awq alpha, \
+                 the column weighting is mis-sharpened (channel ordering is unaffected)."
+            );
+        }
+    }
 
     for entry in &entries {
         let IndexEntry {
