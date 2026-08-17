@@ -5858,6 +5858,68 @@ mod bq1g128_gptq_tests {
 /// already unrotated and in their runtime-expected precision, so they pass
 /// through byte-verbatim — mirroring how the GGUF ternary/binary pipeline keeps
 /// embeddings at Q8F16 and norms at F16 regardless of `--format`.
+/// Attribution the operator supplies for a redistributable artifact.
+///
+/// Apache-2.0 §4 requires a derivative to carry the license notice AND to state
+/// that files were changed. `modifications` is filled in by the pipeline from
+/// the transforms it actually applied, so the artifact self-describes rather
+/// than relying on someone remembering to write it down.
+#[derive(Default, Clone)]
+struct Attribution {
+    source_url: Option<String>,
+    license: Option<String>,
+    modifications: Vec<String>,
+}
+
+/// Parse `--source-url` / `--license` for redistributable artifacts.
+fn attribution_from_args(args: &[String]) -> Attribution {
+    let get = |flag: &str| -> Option<String> {
+        args.iter()
+            .position(|a| a == flag)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
+    Attribution {
+        source_url: get("--source-url"),
+        license: get("--license"),
+        modifications: Vec::new(),
+    }
+}
+
+/// Provenance fields common to every `.hfq` this tool writes.
+///
+/// Shared by the `.hfq` requant path and the GGUF path so a published artifact
+/// is traceable no matter which produced it — a `.hfq` is a frozen snapshot of
+/// the convert path, and when convert changes the artifact silently goes stale.
+fn base_provenance(source: &str, format_label: &str, attr: &Attribution) -> serde_json::Value {
+    let built_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut m = serde_json::Map::new();
+    m.insert("source".into(), source.into());
+    m.insert("format".into(), format_label.into());
+    m.insert("built_unix".into(), built_unix.into());
+    m.insert("tool".into(), "hipfire-quantize".into());
+    m.insert("tool_version".into(), env!("CARGO_PKG_VERSION").into());
+    m.insert(
+        "git_commit".into(),
+        option_env!("HIPFIRE_GIT_COMMIT")
+            .unwrap_or("unknown")
+            .into(),
+    );
+    if let Some(u) = &attr.source_url {
+        m.insert("source_url".into(), u.clone().into());
+    }
+    if let Some(l) = &attr.license {
+        m.insert("license".into(), l.clone().into());
+    }
+    if !attr.modifications.is_empty() {
+        m.insert("modifications".into(), attr.modifications.clone().into());
+    }
+    serde_json::Value::Object(m)
+}
+
 /// Policy gate for requantizing an existing checkpoint DOWN to ternary/binary.
 ///
 /// Returns `Err(message)` when the target is a low-bit PTQ target and the
@@ -6084,6 +6146,7 @@ fn run_hfq_requant_pipeline(
     format: GgufFormat,
     awq_imatrix_alpha: Option<f32>,
     damping: f32,
+    attribution: Attribution,
 ) {
     // ── Read the source .hfq (mirrors bin/draft_to_mq4.rs::read_hfq — no
     //    cross-bin dependency; the parsing logic is copied here). ──
@@ -6471,21 +6534,16 @@ fn run_hfq_requant_pipeline(
 
     // Record what this artifact was built from, so a stale model can never
     // again be mistaken for a current one (see `stamp_provenance`).
-    let built_unix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let provenance = serde_json::json!({
-        "source": input_hfq.to_string_lossy(),
-        "format": format.label(),
-        "built_unix": built_unix,
-        "tool": "hipfire-quantize",
-        "tool_version": env!("CARGO_PKG_VERSION"),
-        "git_commit": option_env!("HIPFIRE_GIT_COMMIT").unwrap_or("unknown"),
-        "awq_imatrix_alpha": awq_imatrix_alpha,
-        "awq_folded": awq_folded,
-        "ternary_nonzero_fraction": ternary_stats.nonzero_fraction(),
-    });
+    let mut provenance =
+        base_provenance(&input_hfq.to_string_lossy(), format.label(), &attribution);
+    if let Some(o) = provenance.as_object_mut() {
+        o.insert("awq_imatrix_alpha".into(), awq_imatrix_alpha.into());
+        o.insert("awq_folded".into(), awq_folded.into());
+        o.insert(
+            "ternary_nonzero_fraction".into(),
+            ternary_stats.nonzero_fraction().into(),
+        );
+    }
     let metadata_json = stamp_provenance(&metadata_json, &provenance);
 
     write_hfq(output, arch_id, &metadata_json, &out_tensors, None).expect("write output .hfq");
@@ -6599,7 +6657,14 @@ mod hfq_requant_pipeline_tests {
         let outp = dir.join(format!("hfq_requant_out_{}.hfq", std::process::id()));
 
         write_hfq(&inp, 7, meta, &in_tensors, None).unwrap();
-        run_hfq_requant_pipeline(&inp, &outp, GgufFormat::Ternary, None, 0.0);
+        run_hfq_requant_pipeline(
+            &inp,
+            &outp,
+            GgufFormat::Ternary,
+            None,
+            0.0,
+            Attribution::default(),
+        );
 
         let (arch, out_meta, tensors) = read_hfq_back(&outp);
         assert_eq!(arch, 7, "arch preserved");
@@ -6658,7 +6723,14 @@ mod hfq_requant_pipeline_tests {
         let outp = dir.join(format!("hfq_prov_out_{}.hfq", std::process::id()));
 
         write_hfq(&inp, 7, meta, &in_tensors, None).unwrap();
-        run_hfq_requant_pipeline(&inp, &outp, GgufFormat::Ternary, Some(0.55), 0.0);
+        run_hfq_requant_pipeline(
+            &inp,
+            &outp,
+            GgufFormat::Ternary,
+            Some(0.55),
+            0.0,
+            Attribution::default(),
+        );
         let (_a, out_meta, _t) = read_hfq_back(&outp);
 
         let v: serde_json::Value =
@@ -6772,7 +6844,7 @@ mod hfq_requant_pipeline_tests {
             ));
 
             write_hfq(&inp, 7, meta, &in_tensors, None).unwrap();
-            run_hfq_requant_pipeline(&inp, &outp, fmt, None, 0.0);
+            run_hfq_requant_pipeline(&inp, &outp, fmt, None, 0.0, Attribution::default());
             let (_a, _m, tensors) = read_hfq_back(&outp);
 
             assert_eq!(tensors[0].1, want as u8, "{want:?} emitted");
@@ -6848,7 +6920,14 @@ mod hfq_requant_pipeline_tests {
         let outp = dir.join(format!("hfq_order_out_{}.hfq", std::process::id()));
 
         write_hfq(&inp, 7, meta, &in_tensors, None).unwrap();
-        run_hfq_requant_pipeline(&inp, &outp, GgufFormat::Ternary, None, 0.0);
+        run_hfq_requant_pipeline(
+            &inp,
+            &outp,
+            GgufFormat::Ternary,
+            None,
+            0.0,
+            Attribution::default(),
+        );
         let (_a, _m, tensors) = read_hfq_back(&outp);
 
         let got: Vec<String> = tensors.iter().map(|t| t.0.clone()).collect();
@@ -6919,7 +6998,14 @@ mod hfq_requant_pipeline_tests {
         let outp = dir.join(format!("hfq_sweep_out_{}.hfq", std::process::id()));
 
         write_hfq(&inp, 7, meta, &in_tensors, None).unwrap();
-        run_hfq_requant_pipeline(&inp, &outp, GgufFormat::Ternary, None, 0.0);
+        run_hfq_requant_pipeline(
+            &inp,
+            &outp,
+            GgufFormat::Ternary,
+            None,
+            0.0,
+            Attribution::default(),
+        );
         let (_a, _m, tensors) = read_hfq_back(&outp);
 
         let recovered = dequant_mq4g256_to_f32(&mq4_data, 512);
@@ -6997,7 +7083,14 @@ mod hfq_requant_pipeline_tests {
         let outp = dir.join(format!("hfq_awq_out_{}.hfq", std::process::id()));
 
         write_hfq(&inp, 7, meta, &in_tensors, None).unwrap();
-        run_hfq_requant_pipeline(&inp, &outp, GgufFormat::Ternary, None, 0.0);
+        run_hfq_requant_pipeline(
+            &inp,
+            &outp,
+            GgufFormat::Ternary,
+            None,
+            0.0,
+            Attribution::default(),
+        );
         let (_arch, _meta, tensors) = read_hfq_back(&outp);
 
         // Expected: ternary of the UNSCALED weights. Derived from the mq4
@@ -9239,6 +9332,27 @@ fn run_gguf_pipeline(
         100.0 * total_bytes_out as f64 / total_bytes_in as f64,
     );
 
+    // Stamp provenance + attribution. The GGUF path previously wrote NO
+    // provenance at all, so every Bonsai artifact we produced was unlabelled —
+    // exactly the condition that let a stale ternary .hfq stand as a published
+    // number for a month. `modifications` records the qwen35 onboarding
+    // transforms actually applied, which is what Apache-2.0 §4(b) asks for.
+    let mut attribution = attribution_from_args(&std::env::args().collect::<Vec<_>>());
+    if is_qwen35_arch(&arch_str) {
+        attribution.modifications.extend([
+            "converted GGUF -> hipfire .hfq container".to_string(),
+            "quantized weight VALUES unchanged (low-bit blocks copied verbatim)".to_string(),
+            "linear-attn value heads permuted tiled->grouped for hipfire's runtime".to_string(),
+            "ssm_a stored as A_log = ln(-A), inverting the upstream converter".to_string(),
+            "RMSNorm weights (except ssm_norm): upstream's baked +1 removed, \
+             re-added at load by QWEN35_NORM_BIAS"
+                .to_string(),
+            "conv1d kept full precision (F16)".to_string(),
+        ]);
+    }
+    let provenance = base_provenance(&input.to_string_lossy(), format.label(), &attribution);
+    let metadata_json = stamp_provenance(&metadata_json, &provenance);
+
     write_hfq(output, arch_id, &metadata_json, &hfq_tensors, None)?;
     eprintln!("\nWrote: {}", output.display());
     Ok(())
@@ -10366,6 +10480,7 @@ fn main() {
                 hfq_format,
                 awq_imatrix_alpha,
                 damping,
+                attribution_from_args(&args),
             );
             return;
         }

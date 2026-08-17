@@ -86,6 +86,14 @@ def describe(path):
         f"    source   {prov.get('source', '?')}",
         f"    format   {prov.get('format', '?')}",
     ]
+    if prov.get("source_url"):
+        lines.append(f"    upstream {prov['source_url']}")
+    if prov.get("license"):
+        lines.append(f"    license  {prov['license']}")
+    mods = prov.get("modifications") or []
+    if mods:
+        lines.append(f"    changes  ({len(mods)}) — Apache-2.0 §4(b) notice:")
+        lines.extend(f"      - {m}" for m in mods)
     knobs = []
     if prov.get("awq_imatrix_alpha") is not None:
         knobs.append(f"awq-imatrix alpha={prov['awq_imatrix_alpha']:.3g}")
