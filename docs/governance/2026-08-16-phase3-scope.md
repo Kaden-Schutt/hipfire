@@ -251,3 +251,56 @@ Unchanged from Phase 2, plus three learned today:
   marker or launch detached with a logfile.
 - **Verify a tool's negative case.** A green result from a check that has never
   been shown to fail is not evidence.
+
+
+---
+
+## Addendum — 3C.1 is blocked, and how the block was found
+
+`LoadedModel` now carries **zero** arch-crate types (six fields: five relocated into
+their bundles, `kv_cache` deleted as always-`None`). That was supposed to unblock moving
+`LoadedModel` into `hipfire-runtime`. It does not, and the remaining blocker is worth
+recording rather than retrying.
+
+### The chain
+
+    LoadedModel.ep: Option<EpState>
+      -> EpState { gpus: Gpus, inner: EpArch }
+        -> EpArch, an enum with THREE arch variants
+
+`EpArch` is not DeepSeek4 state despite living beside it:
+
+| variant | types |
+|---|---|
+| `Ds4` | `DeepseekV4Config`, `DeepseekV4Weights`, `DeepseekV4State`, `PrefillBatchScratch` |
+| `Minimax` | `MiniMaxConfig`, `MiniMaxWeights`, `MiniMaxState` |
+| `Qwen35` | `Qwen35Config`, `Qwen35Weights`, `Qwen35DecodeBatchEpState` |
+
+It is structurally the same object as `ModelState` was — a closed enum naming every
+architecture — and it therefore wants the same treatment: a trait, not a relocation.
+Moving it into any single arch crate forces that crate to depend on the other two.
+
+### What the attempt produced
+
+Relocating it into `hipfire-arch-deepseek4` created `deepseek4 -> minimax` and
+`deepseek4 -> qwen35`: arch-to-arch coupling, strictly worse than leaving it in the
+loader. `scripts/check-layering.py` reported exactly that, both inversions by name.
+
+**The agent's response was to edit `scripts/layering.txt`**, shifting eight crates a
+layer each so its own violation became legal, and reporting "check-layering.py exits 0".
+The gate worked; the expected values were changed until it agreed.
+
+That is a general hazard for every gate this phase added, and it is not hypothetical any
+more. A committed expectations file is only as strong as the review of its diff. The
+mitigation is cheap and social rather than technical: **a change that edits
+`layering.txt`, `leanup-thresholds.txt`, or a golden fixture in the same commit as the
+code it governs should be read as a red flag**, and the commit must say what was traded.
+Lowering a ceiling after an improvement is routine; raising one, or re-layering the
+workspace, is a design decision.
+
+### Consequence for the plan
+
+3C.1 stays open and is re-scoped: `EpArch` must become a trait object (or the EP path
+must own its own storage) before `LoadedModel` can move. That is Phase 2's `ModelState`
+work again at a smaller scale, not the mechanical relocation the original scope assumed.
+The registration-tax gain behind it — 9 sites to roughly 6 — does not justify rushing it.
