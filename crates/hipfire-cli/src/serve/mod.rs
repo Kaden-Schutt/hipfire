@@ -18,6 +18,8 @@ use std::{collections::{BTreeMap, BTreeSet}, env, fs, io::{Read, Write}, path::{
 use tiny_http::Server;
 use crate::{Paths, ServeArgs, StopArgs, PullArgs, ListArgs, config_bool, config_string, config_u64, config_f64, config_i64, resolved_global, find_model_path, resolved_for_model, load_params, pull_command, list_local_models, http_get_json, find_daemon, probe_host};
 
+pub(crate) mod metrics;
+
 pub mod complete;
 pub mod http;
 pub mod slots;
@@ -90,6 +92,9 @@ pub(crate) struct ServeShared {
     /// inside `runtime`: that mutex is exactly what serialises requests today,
     /// so an engine behind it would serve one caller at a time and change
     /// nothing.
+    /// Prometheus counters and histograms for `/metrics`. Lock-free, so a
+    /// scrape never contends with a request.
+    pub(crate) metrics: metrics::Metrics,
     pub(crate) slot_engine: Option<Arc<slots::SlotBackend>>, // feature-gated type is still SlotBackend (stub when disabled)
 }
 
@@ -715,6 +720,7 @@ pub(crate) fn serve_foreground(
         1
     };
     let shared = Arc::new(ServeShared {
+        metrics: metrics::Metrics::default(),
         slot_engine,
         runtime: Mutex::new(ServeRuntime {
             engine,

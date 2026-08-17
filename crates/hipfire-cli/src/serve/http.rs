@@ -59,6 +59,31 @@ pub(crate) fn handle_http(mut request: Request, shared: Arc<ServeShared>) -> Res
                 200,
             ))?;
         }
+        (&Method::Get, "/metrics") => {
+            // Prometheus text exposition. Deliberately does not touch the runtime
+            // mutex -- that is the lock a request holds for its whole duration, so
+            // scraping through it would make the monitoring stall whenever serving
+            // stalled, which is exactly when a scrape matters.
+            let (uptime, model) = {
+                let meta = shared
+                    .meta
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                (meta.started.elapsed().as_secs(), meta.current_model.clone())
+            };
+            let body = shared.metrics.render(
+                shared.admission.inflight(),
+                shared.admission.capacity(),
+                uptime,
+                model.as_deref(),
+            );
+            let header = Header::from_bytes(
+                &b"Content-Type"[..],
+                &b"text/plain; version=0.0.4; charset=utf-8"[..],
+            )
+            .expect("static header");
+            request.respond(Response::from_string(body).with_header(header))?;
+        }
         (&Method::Get, "/v1/models") => {
             let runtime = shared
                 .runtime

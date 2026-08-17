@@ -1146,8 +1146,22 @@ pub(crate) fn complete_request_attempt(
     event_callback: &mut dyn FnMut(&serde_json::Value) -> Result<(), hipfire_client::ClientError>,
     terminal_callback: &mut dyn FnMut(&Completion) -> Result<(), hipfire_client::ClientError>,
 ) -> Result<Completion> {
+    // Gateway-side timing. The daemon emits neither ttft_ms nor latency_ms --
+    // its `done` is {type,id,tokens,tok_s} -- so the gateway measures what it can
+    // actually observe. Measuring here is arguably more honest anyway: this
+    // interval includes admission queueing, which is exactly the component a
+    // serving operator needs when latency rises under load.
+    let attempt_started = std::time::Instant::now();
+    let first_token_at: std::cell::Cell<Option<std::time::Duration>> =
+        std::cell::Cell::new(None);
+
     // Latch retry-disabling observations on every event bound for the client.
     let mut event_callback = |event: &serde_json::Value| {
+        if first_token_at.get().is_none()
+            && event.get("type").and_then(serde_json::Value::as_str) == Some("token")
+        {
+            first_token_at.set(Some(attempt_started.elapsed()));
+        }
         latches.borrow_mut().observe(event);
         event_callback(event)
     };
@@ -1473,6 +1487,14 @@ pub(crate) fn complete_request_attempt(
         .unwrap_or_else(|error| error.into_inner());
     meta.requests_served = meta.requests_served.saturating_add(1);
     meta.recent_tok_s = done.get("tok_s").and_then(serde_json::Value::as_f64);
+    // Same payload the gateway already had; previously only `tok_s` survived, as a
+    // scalar overwritten by the next request. Distributions are what make a stall
+    // visible.
+    shared.metrics.observe_done(&done);
+    shared.metrics.observe_timing(
+        first_token_at.get().map(|d| d.as_secs_f64() * 1000.0),
+        attempt_started.elapsed().as_secs_f64() * 1000.0,
+    );
     meta.last_activity = Instant::now();
 
     if contract_gate.is_v2() {

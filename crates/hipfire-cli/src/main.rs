@@ -7381,6 +7381,7 @@ mod tests {
 
             let registry = hipfire_registry::bundled().unwrap();
             let shared = Arc::new(ServeShared {
+                metrics: crate::serve::metrics::Metrics::default(),
                 // Test harness drives the single-daemon path.
                 slot_engine: None,
                 runtime: Mutex::new(ServeRuntime {
