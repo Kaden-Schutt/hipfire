@@ -339,6 +339,23 @@ pub(crate) fn respond_nonstreaming(
     let (sender, receiver) = mpsc::channel::<ResponseChunk>();
     let (status_tx, status_rx) = mpsc::channel::<Result<(), String>>();
     thread::spawn(move || {
+        // Catch a panic so the client learns WHY. Without this any panic in the
+        // request path unwinds, drops `status_tx`, and `status_rx.recv()` below
+        // sees a closed channel -- which was reported to the caller as the
+        // useless "generation worker disconnected". A gemma4-12b load that OOMs
+        // at max_seq 9216 on a 17 GB card surfaced exactly that: the daemon
+        // emitted `hipMalloc: out of memory` naming the tensor, and the operator
+        // was told the worker disconnected.
+        let panic_status = status_tx.clone();
+        // The Ok arm below assumed the terminal callback had already sent a
+        // status. When `complete_request` returns Ok WITHOUT invoking it -- a
+        // completion that yields no terminal body -- nothing was ever sent, the
+        // channel closed, and every such request became the contentless
+        // "generation worker disconnected". Verified by instrumenting all four
+        // paths: only `recv-closed` fired.
+        let staged = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let staged_cb = staged.clone();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
         let result = complete_request(
             &shared,
             &body,
@@ -365,6 +382,7 @@ pub(crate) fn respond_nonstreaming(
                     })
                     .map_err(|_| hipfire_client::ClientError::Cancelled)?;
                 // Signal handler that terminal bytes are staged (success headers).
+                staged_cb.store(true, std::sync::atomic::Ordering::SeqCst);
                 let _ = status_tx.send(Ok(()));
                 match ack_rx.recv() {
                     Ok(Ok(())) => Ok(()),
@@ -374,6 +392,13 @@ pub(crate) fn respond_nonstreaming(
         );
         match result {
             Ok(_completion) => {
+                if !staged.load(std::sync::atomic::Ordering::SeqCst) {
+                    // Ok with no terminal staged: the generation completed without
+                    // producing a body. Report it rather than closing silently.
+                    let _ = status_tx.send(Err(
+                        "generation completed without a response body".to_string(),
+                    ));
+                }
                 // Terminal already delivered+acked; close body with no post-commit bytes.
                 drop(sender);
             }
@@ -382,6 +407,14 @@ pub(crate) fn respond_nonstreaming(
                     .downcast_ref::<hipfire_client::ClientError>()
                     .is_some_and(|err| matches!(err, hipfire_client::ClientError::Cancelled));
                 if cancelled {
+                    // Tell the handler before leaving. This branch used to `return`
+                    // outright, which dropped `status_tx`, left `status_rx.recv()`
+                    // with a closed channel, and produced the contentless
+                    // "generation worker disconnected" for every cause that mapped
+                    // to Cancelled -- including a daemon that died mid-request. If
+                    // the client really did go away nobody reads this, so sending is
+                    // free; if it did not, the caller finally learns something.
+                            let _ = status_tx.send(Err(error.to_string()));
                     // Drop without framing — unclean only if bytes already went out.
                     drop(sender);
                     return;
@@ -393,6 +426,17 @@ pub(crate) fn respond_nonstreaming(
                     drop(sender);
                 }
             }
+        }
+        }));
+        if let Err(payload) = outcome {
+            let detail = payload
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "non-string panic payload".to_string());
+            // Best effort: if the handler already took a status this is a no-op,
+            // and the body close below is what the client observes.
+            let _ = panic_status.send(Err(format!("generation worker panicked: {detail}")));
         }
     });
 
