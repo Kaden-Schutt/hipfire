@@ -158,16 +158,6 @@
       "min_vram_gb": 30,
       "desc": "Max quality; needs 30GB+."
     },
-    "qwen3.6:35b-a3b-mq4": {
-      "repo": "schuttdev/hipfire-qwen3.6-35b-a3b",
-      "mtp": {
-        "file": "qwen3.6-35b-a3b.mtp"
-      },
-      "file": "qwen3.6-35b-a3b.mq4",
-      "size_gb": 19.4,
-      "min_vram_gb": 22,
-      "desc": "MQ4 with Q8 attention + router (uniform MQ4 routed experts) - quality-protected 4-bit default; Q8 protects the precision-sensitive attention. ~122 tok/s decode (gfx1100)."
-    },
     "qwen3.6:35b-a3b-mq4r": {
       "repo": "schuttdev/hipfire-qwen3.6-35b-a3b",
       "mtp": {
