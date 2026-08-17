@@ -146,3 +146,110 @@ clear 0.043776, not 0.086790, to matter.
 Scoring must use **both** the WT2 prose tripwire and the v6 conversation selector:
 prose compresses chat-model arm margins ~3x relative and has already inverted a PPL
 ranking in this campaign.
+
+---
+
+## Amendment — the mechanism works perfectly and the ARTIFACT IS DEGENERATE
+
+The 27B run completed. Every mechanism this record was written to validate did
+exactly what it was built to do, across all 64 layers:
+
+```
+rescued=23   hard_failed=0   gpu_evd=23   nonconv=0
+artifact: 15,655,791,616 B, md5 prefix a5c1b76c0c5dad, "Done: 15655.8 MB written"
+```
+
+Zero hard failures. Every rescue on the rocSOLVER GPU path. No eigensolver
+non-convergence. Clamp rates modest and sane: min 0.000%, **median 0.776%**, max
+1.394% across 496 tensors. The packed-code oracle emitted no mismatch, no warning,
+no NaN, no assert.
+
+**And the artifact is degenerate.** Scored on hiptrx `gfx1201`:
+
+| arm | ref | KLD | NLL | PPL |
+|---|---|---|---|---|
+| `gptqpsd` | WT2 | **8.367924** | 10.124605 | **24949.4105** |
+| `gptqpsd` | v6 selector | **8.601600** | 9.444278 | 12635.6596 |
+| `mq4` (same size, no GPTQ) | WT2 | 0.043776 | 1.857666 | 6.4088 |
+| uncalibrated MQ4 | WT2 | 0.066668 | — | — |
+
+KLD 8.37 against a uniform-output ceiling of `ln(248320) = 12.42`. PPL 24,949
+against 6.41. **GPTQ made the model roughly 125x worse than doing nothing at
+all** — plain RTN MQ4 scores 0.066668.
+
+### What this means for the fix, stated precisely
+
+The PSD projection is **not** implicated by this evidence, and is also **not
+exonerated** by it. What is established:
+
+- The projection does what it claims: it converts hard Cholesky failures into
+  successes at default damping, on GPU, at scale, with no non-convergence.
+- Enabling GPTQ on ~62% more tensors made the output much worse. Before the fix,
+  those tensors silently fell back to RTN — which, given RTN scores 0.066668 and
+  GPTQ scores 8.37, means **the silent fallback was protecting the model from a
+  broken GPTQ implementation.**
+
+That is the uncomfortable reading and it is the honest one. A fix that removes a
+fallback is only an improvement if the primary path is correct, and this evidence
+says the primary path is not.
+
+### What was ruled out
+
+- **Basis mismatch — RULED OUT.** MQ4 is FWHT-rotated while the stored Hessian is
+  raw pre-rotation, which looked like the obvious culprit. But
+  `gptq_pipeline_mq4g256` takes `h_unrot_f32` and applies
+  `fwht_similarity_per_256(&mut h, ...)` at `gptq.rs:1656`, rotating the Hessian
+  into the weight basis, exactly as its module doc specifies
+  (`H_target = FWHT_per_256_similarity(diag(1/s) · H_unrot · diag(1/s))`). Since a
+  similarity transform preserves eigenvalues, the bf16-induced negative
+  eigenvalues survive it consistently, so the PSD analysis remains valid in the
+  rotated basis too.
+- **AWQ absence.** This run deliberately omitted `--awq` to isolate GPTQ, so the
+  `diag(1/s)` term is identity. That is the intended configuration, not a defect,
+  and identity scaling cannot explain a 125x regression.
+- **Numerical blowup.** Clamp rates peak at 1.394%. Weights are not being driven
+  out of range.
+
+### Correcting an earlier interpretation in this record
+
+An earlier note read the clamp rate *rising with depth* (0.236% at layer 0 to
+0.998% at layer 10) as "the signature of genuine sequential error compensation."
+That inference is withdrawn. Error accumulating with depth is equally the
+signature of a compensation term with the **wrong sign or wrong magnitude**
+accumulating with depth. The observation does not distinguish the two, and given
+the final KLD it more likely indicated the latter.
+
+### The isolation test, and what survives the producer's teardown
+
+The decisive experiment is whether GPTQ is broken *independently* of the PSD
+projection. Two cross-architecture arms completed with the projection **never
+firing**:
+
+| model | bytes | rescued | hard_failed | md5 |
+|---|---|---|---|---|
+| `lfm2.5-350m` | 229,474,032 | **0** | 0 | `7fcd86de6836` |
+| `lfm2.5-1.2b` | 698,645,168 | **0** | 0 | `48e4bb612ef6` |
+
+`rescued=0` on both is itself a clean confirmation of the linear-in-`K` law: at
+small `K`, `-lambda_min/mean(diag(H))` is far below the damping cap, so no rescue
+is needed and the fallback is correctly inert.
+
+Because PSD projection never ran on these two, **if their artifacts are also
+degenerate then GPTQ is broken on its own** and the projection is fully exonerated.
+Both were pulled off the producer before teardown (md5-verified against the
+producer's own record) specifically to preserve that test. Scoring them needs
+lfm2.5 KLD references, which do not exist yet.
+
+A `gemma4-12b` GPTQ run was in flight at teardown (`rescued=1, hard_failed=0`) and
+did not finish; `gemma4-12b.ref_wt2.bin` and `ref_ag.bin` exist on the Hub, so that
+remains the cleanest future isolation route on a mid-size model.
+
+### Disposition change
+
+The heading of this record — "works, and rocSOLVER confirmed" — stands as to the
+**mechanism** and must not be read as endorsing the **output**. Until GPTQ itself
+is validated end-to-end against a known-good reference, `--ldlq` should not be used
+to produce shippable artifacts. Note that LDLQ was already recorded elsewhere in
+this campaign as "never completed", i.e. it appears never to have been validated
+end-to-end at any point; this run is the first evidence of what it actually
+produces, and the answer is garbage.
