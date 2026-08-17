@@ -40,11 +40,22 @@ skip one and the workspace stops building (exhaustive `match` on
 
 2. ⚙️ `crates/hipfire-loader/Cargo.toml` — add the arch crate dependency
    (plain, non-optional, matching the five newest arches).
-3. ⚙️ `crates/hipfire-loader/src/lib.rs` —
-   `ModelState` variant; arms in `as_arch_model`, `as_arch_model_mut`,
-   the `free_gpu` match, and the pp>1 `unload_model` match (no wildcards —
-   that is the leak guard); `&NewCarrier` in `REGISTRY`; optional
-   `LoadedModel` accessors (`minimax()`/`cohere2moe()` pattern).
+3. ⚙️ `crates/hipfire-loader/src/lib.rs` — **one line**: `&NewCarrier` in
+   `REGISTRY`. Optionally a `LoadedModel` accessor
+   (`minimax()`/`cohere2moe()` pattern) if callers want your concrete bundle.
+
+   Everything else this item used to demand is gone. `LoadedModel.state` is
+   `Option<Box<dyn ArchModel>>`, so there is no enum variant to add, and
+   `as_arch_model`/`as_arch_model_mut` are `as_deref` one-liners with no arms.
+   `free_gpu` dispatches through the trait. The pp>1 `unload_model` match no
+   longer needs a per-arch row.
+
+   Keep the `REGISTRY` line explicit rather than reaching for `inventory` or
+   `linkme`. That array *is* the force-link: rustc only pulls an rlib into the
+   final binary when something references a symbol from it, and neither crate's
+   `#[used]` sections change that. Distributed registration would move this edit
+   to a `use arch as _;` and turn a forgotten registration from a compile error
+   into a silent "model does not exist" at runtime.
 4. ⚙️ `crates/hipfire-loader/src/carriers.rs` — `pub struct <Name>Carrier`
    implementing `Carrier`: `name`, `claims_arch_id` (exact id match —
    never an open range), `load` (calls your `load_<name>_bundle`, then
@@ -113,8 +124,8 @@ Also run `scripts/check-crate-maps.py <name>` to seed your crate's own
 
 ## The count
 
-**19 out-of-crate files** a new architecture must touch today (checklist
-items 2–10 and 12–21 above), down from 20 before this change (and ~28 pre-programme)
+**19 out-of-crate files**, of which **9 are required code sites** (items 2–10;
+12–15 are conditional, 16–21 are docs/catalog), down from ~28 pre-programme
 — despite *more* arches, because the loader's `LoadedModel` per-arch
 `Option<…>` fields, the daemon's per-arch `arch_id` match ladders, and the
 bespoke spec-decode wiring were folded into `ModelState`/`ArchModel`/`Carrier`,
@@ -124,6 +135,13 @@ iterates `MODEL_TYPE_TO_ARCH_ID` directly, so neither needs a per-arch edit.
 The daemon's `bench_prefill` session-reset cascade (previously item 11) is now
 fully covered by `ArchModel::reset_session_state` plus a narrow `arch_key()`
 check for the DeepSeek4 graph teardown, so no per-architecture edit remains there.
+
+The `ModelState` enum is **deleted**. `LoadedModel.state` is
+`Option<Box<dyn ArchModel>>`, which removed the last closed enum a new
+architecture had to edit in someone else's crate, and with it the four match
+ladders that hung off it. A trait object cannot be silently incomplete the way
+a `match` with a `_` arm can — that catch-all is what let five architectures
+report `dim=0, n_layers=0, vocab=0` to clients until it was found.
 Six are compile-enforced (all of Tier B plus Tier C items 5–7: the
 without its arms does not build); the rest fail closed or silently skip.
 
