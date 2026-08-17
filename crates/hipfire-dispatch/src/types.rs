@@ -122,7 +122,7 @@ pub fn dtype_rotation_plan(dtype: DType) -> RotationPlan {
         // MQ*-G256 dtype (`quantize_mq{2,3,4}g256gl` calls `cpu_fwht_256` per
         // group), so x MUST be FwhtG256-rotated before their kernels see it.
         MQ4G256 | MQ3G256 | MQ2G256 | MQ5G256 | MQ6G256 | MQ2G256Lloyd | MQ3G256Lloyd
-        | MQ4G256Lloyd | MQ2G256GL | MQ3G256GL | MQ4G256GL | MFP4G32 | MFP4G32Lloyd
+        | MQ4G256Lloyd | MQ2G256GL | MQ3G256GL | MQ4G256GL | MQ35G256GL | MQ1G1024GL | MFP4G32 | MFP4G32Lloyd
         | MFP4G32P | MFP4G32E8 | MFP4G32E8SOA | MFP3G32E8 | MFP2G32E8 => RotationPlan::FwhtG256,
         MQ4G128 => RotationPlan::FwhtG128,
         MQ8G256 => RotationPlan::Mq8Internal,
@@ -763,12 +763,9 @@ impl KernelKey {
             MQ5G256 => ArchPredicate::HasMmq,
             MQ6G256 | HFQ6G256 => ArchPredicate::HasMmq,
             MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd => ArchPredicate::HasWave32,
-            // MQ2/MQ3/MQ4-G256-GL: the indexed MoE GEMVs (and the forthcoming
+            // MQ2/MQ3/MQ4/MQ35-G256-GL + MQ1: the indexed MoE GEMVs (and the forthcoming
             // dense MQ4-GL GEMV) are WMMA-free [32,1,1] wave32 scalar kernels
-            // (plain fp16→f32 converts + a 5-step `__shfl_down` reduce), so the
-            // same HasWave32 gate as the Lloyd family is correct — RDNA1..RDNA4
-            // in, CDNA wave64 out.
-            MQ2G256GL | MQ3G256GL | MQ4G256GL => ArchPredicate::HasWave32,
+            MQ2G256GL | MQ3G256GL | MQ4G256GL | MQ35G256GL | MQ1G1024GL => ArchPredicate::HasWave32,
             Q8HFQ | Raw => ArchPredicate::Always,
         }
     }

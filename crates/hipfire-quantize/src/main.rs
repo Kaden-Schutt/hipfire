@@ -4504,6 +4504,140 @@ pub(crate) const GL_CB4: [f32; 16] = [
     -2.7326, -2.0690, -1.6180, -1.2562, -0.9423, -0.6568, -0.3880, -0.1284,
     0.1284, 0.3880, 0.6568, 0.9423, 1.2562, 1.6180, 2.0690, 2.7326,
 ];
+/// 3.5-bit 2D vector codebook: 7 bits per weight PAIR = 128 entries, each a 2D point.
+/// See `GL_CB35` in `rdna_compute::dispatch` for fitting details (k-means++ seed=42, 100 iters,
+/// 1.572M real post-FWHT pairs, qwen3.8-27b layers 0/20/40). This copy MUST stay bit-identical
+/// to the dispatch copy — drift is a silent accuracy failure, checked by `gl_codebooks_match_runtime`.
+pub(crate) const GL_CB35: [[f32; 2]; 128] = [
+    [-3.036506, 0.557011],
+    [-2.902707, -0.608592],
+    [-2.486214, 1.544335],
+    [-2.464717, -1.467453],
+    [-2.417152, -0.023972],
+    [-2.295932, 0.706263],
+    [-2.162351, -0.730994],
+    [-1.947877, 0.306698],
+    [-1.934456, -2.409281],
+    [-1.895991, -0.228143],
+    [-1.885129, 1.082130],
+    [-1.802912, 2.411955],
+    [-1.743065, -1.124332],
+    [-1.706713, -1.677137],
+    [-1.685550, 1.663885],
+    [-1.600927, -0.650825],
+    [-1.593014, 0.659777],
+    [-1.544414, 0.152975],
+    [-1.450453, -0.269551],
+    [-1.394326, 1.156593],
+    [-1.254734, -1.360016],
+    [-1.243292, -0.909463],
+    [-1.220646, 0.410975],
+    [-1.209120, -2.058067],
+    [-1.179515, -0.024031],
+    [-1.150258, 1.595281],
+    [-1.142204, 0.814831],
+    [-1.117422, -0.488152],
+    [-1.056154, 2.141912],
+    [-0.932642, 1.212272],
+    [-0.907086, 0.198202],
+    [-0.880944, -1.642492],
+    [-0.865366, -0.820827],
+    [-0.861729, -0.183285],
+    [-0.853414, -2.848194],
+    [-0.851236, 0.573600],
+    [-0.823025, 2.881643],
+    [-0.817329, -1.191992],
+    [-0.718535, -0.511478],
+    [-0.706018, 0.898155],
+    [-0.691930, 1.711770],
+    [-0.605064, 0.367565],
+    [-0.590630, -2.134673],
+    [-0.581430, 0.061727],
+    [-0.537026, 1.304575],
+    [-0.505917, -0.234563],
+    [-0.483035, -0.831881],
+    [-0.459100, -1.613037],
+    [-0.438526, -1.205364],
+    [-0.430598, 0.631694],
+    [-0.378955, 2.245666],
+    [-0.365405, -0.493880],
+    [-0.343728, 0.964808],
+    [-0.286504, 0.295790],
+    [-0.256216, -0.032611],
+    [-0.251191, 1.744736],
+    [-0.143569, 1.333993],
+    [-0.127799, -1.014336],
+    [-0.117265, -0.675589],
+    [-0.082967, -0.312776],
+    [-0.081779, -1.424501],
+    [-0.081717, 0.631896],
+    [-0.079977, -1.920818],
+    [-0.054644, -2.570277],
+    [-0.019024, 0.970040],
+    [0.013778, 0.298853],
+    [0.049626, -0.021871],
+    [0.130522, 2.925998],
+    [0.168374, 1.710445],
+    [0.168862, -0.492120],
+    [0.200595, -0.825208],
+    [0.220961, -1.184709],
+    [0.233563, 1.253369],
+    [0.236452, 2.223155],
+    [0.258488, 0.521816],
+    [0.279151, 0.851728],
+    [0.309002, 0.157230],
+    [0.315732, -1.632396],
+    [0.323335, -0.213913],
+    [0.440193, -2.126922],
+    [0.480347, -0.565665],
+    [0.533287, 1.516962],
+    [0.549216, -0.924366],
+    [0.555097, 0.372449],
+    [0.575936, -1.307392],
+    [0.584788, -0.015324],
+    [0.589135, 1.098487],
+    [0.597830, 0.722098],
+    [0.700796, -2.967724],
+    [0.707100, -0.338488],
+    [0.731491, 1.954455],
+    [0.819098, 0.204463],
+    [0.839814, -1.646037],
+    [0.843593, -0.704436],
+    [0.901551, 0.549277],
+    [0.917409, -1.124217],
+    [0.929044, 1.410108],
+    [0.943199, 0.946930],
+    [0.963024, -0.094088],
+    [0.990743, 2.622817],
+    [0.994562, -2.242123],
+    [1.106773, -0.427862],
+    [1.152424, 0.263105],
+    [1.241635, -0.816511],
+    [1.263196, 0.701724],
+    [1.272961, 1.810202],
+    [1.312531, -1.273730],
+    [1.318652, 1.197619],
+    [1.347748, -0.085024],
+    [1.350326, -1.776562],
+    [1.508685, 0.354619],
+    [1.548087, -0.466790],
+    [1.668620, 0.866390],
+    [1.706376, -0.913996],
+    [1.778556, -0.034955],
+    [1.791853, 1.454724],
+    [1.797822, -2.373145],
+    [1.810372, 2.283694],
+    [1.863575, -1.481466],
+    [1.939231, 0.442107],
+    [2.074944, -0.428416],
+    [2.232601, 0.910838],
+    [2.283314, -0.947652],
+    [2.356225, 0.114156],
+    [2.557220, 1.613256],
+    [2.653772, -1.641341],
+    [2.899535, -0.451693],
+    [2.944135, 0.598941],
+];
 
 /// MQ4-G256-GL codec round-trip in f32. 4-bit sibling of
 /// `mq2g256gl_roundtrip_f32`: FWHT, per-block fp16 RMS scale, nearest level in
@@ -4780,6 +4914,128 @@ pub(crate) fn quantize_mq4g256gl(
         });
     out
 }
+/// MQ3.5-G256-GL: 7 bits per weight PAIR (128-entry 2D VQ) + per-block fp16 scale.
+/// **3.5625 bpw** — 112 B of 7-bit pair indices per group + 2 B fp16 scale = 114 B/256.
+///
+/// Layout: `[m*gpr*112 B packed indices][m*gpr*2 B fp16 scales]`, both row-major.
+/// Packing: 8 pairs ×7 bits =56 bits =7 bytes, 16 chunks →112 B. Little-endian bitstream
+/// where code for pair `8*c + j` contributes `code << (7*j)` to the 56-bit accumulator
+/// of chunk `c`, stored as 7 LE bytes.
+///
+/// Versus MQ4GL this is 0.5 bpw cheaper but 61% higher codec MSE (0.01515 vs 0.00940 per dim
+/// normalized), i.e. the 0.17 dB 2D-VQ granular gain does NOT offset the 3 dB rate loss.
+/// Alignment: 256*3.5=896 bits →112 B →3.5 B/lane=0.875 u32 (NOT aligned); smallest aligned
+/// group is 2048→28 B/lane=7 u32 at 8× coarser scale granularity, so MQ35 is LESS aligned than
+/// MQ4GL (4 B/lane=1 u32). Implemented at G256 for quality parity; encode-only.
+///
+/// `k` must be a multiple of 256. ENCODE-ONLY: no kernel decodes qt=42 yet.
+pub(crate) fn quantize_mq35g256gl(
+    f32_data: &[f32],
+    m: usize,
+    k: usize,
+    signs1: &[f32],
+    signs2: &[f32],
+) -> Vec<u8> {
+    assert_eq!(k % 256, 0, "MQ35GL: K must be a multiple of 256 (got {k})");
+    let gpr = k / 256;
+    let idx_bytes = m * gpr * 112;
+    let mut out = vec![0u8; idx_bytes + m * gpr * 2];
+    let (idx_region, scale_region) = out.split_at_mut(idx_bytes);
+    use rayon::prelude::*;
+    idx_region
+        .par_chunks_mut(gpr * 112)
+        .zip(scale_region.par_chunks_mut(gpr * 2))
+        .enumerate()
+        .for_each(|(row, (row_idx, row_scale))| {
+            for g in 0..gpr {
+                let start = row * k + g * 256;
+                let mut group = [0.0f32; 256];
+                group.copy_from_slice(&f32_data[start..start + 256]);
+                cpu_fwht_256(&mut group, signs1, signs2);
+                let mut pair_codes = [0u8; 128];
+                let sbits = gl_encode_block_vq35(&group, &GL_CB35, &mut pair_codes);
+                let base = g * 112;
+                // 8 pairs ×7 bits =56 bits =7 bytes per chunk, 16 chunks.
+                for c in 0..16 {
+                    let mut acc: u64 = 0;
+                    for j in 0..8 {
+                        acc |= ((pair_codes[8 * c + j] as u64) & 0x7F) << (7 * j);
+                    }
+                    for b in 0..7 {
+                        row_idx[base + 7 * c + b] = ((acc >> (8 * b)) & 0xFF) as u8;
+                    }
+                }
+                row_scale[g * 2] = (sbits & 0xFF) as u8;
+                row_scale[g * 2 + 1] = (sbits >> 8) as u8;
+            }
+        });
+    out
+}
+
+/// Encode one FWHT-rotated 256-block as 128 pair codes against the 2D VQ codebook.
+/// Returns fp16-rounded per-block scale and writes 7-bit indices into `pair_idx` (0..127).
+#[inline]
+fn gl_encode_block_vq35(group: &[f32; 256], cb: &[[f32; 2]; 128], pair_idx: &mut [u8; 128]) -> u16 {
+    let ss: f64 = group.iter().map(|v| (*v as f64) * (*v as f64)).sum();
+    let rms = (ss / 256.0).sqrt() as f32;
+    let sbits = f32_to_fp16_bits(rms);
+    let scale = f16_to_f32(sbits);
+    let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+    for p in 0..128 {
+        let z0 = group[2 * p] * inv;
+        let z1 = group[2 * p + 1] * inv;
+        let mut best = 0usize;
+        let mut best_d = (z0 - cb[0][0]).powi(2) + (z1 - cb[0][1]).powi(2);
+        for (j, c) in cb.iter().enumerate().skip(1) {
+            let d = (z0 - c[0]).powi(2) + (z1 - c[1]).powi(2);
+            if d < best_d {
+                best_d = d;
+                best = j;
+            }
+        }
+        pair_idx[p] = best as u8;
+    }
+    sbits
+}
+
+#[cfg(test)]
+fn mq35g256gl_unpack_blob(blob: &[u8], m: usize, k: usize) -> Vec<f32> {
+    assert_eq!(k % 256, 0, "MQ35GL unpack: K must be a multiple of 256 (got {k})");
+    let gpr = k / 256;
+    let idx_bytes = m * gpr * rdna_compute::GL_MQ35_GROUP_IDX_BYTES;
+    let scale_bytes = m * gpr * rdna_compute::GL_GROUP_SCALE_BYTES;
+    assert_eq!(
+        blob.len(),
+        idx_bytes + scale_bytes,
+        "MQ35GL unpack: blob length {} != m*gpr*114 = {}",
+        blob.len(),
+        idx_bytes + scale_bytes
+    );
+    let mut out = vec![0.0f32; m * k];
+    for row in 0..m {
+        for g in 0..gpr {
+            let idx_base = (row * gpr + g) * rdna_compute::GL_MQ35_GROUP_IDX_BYTES;
+            let scale_base = idx_bytes + (row * gpr + g) * rdna_compute::GL_GROUP_SCALE_BYTES;
+            let sbits = u16::from_le_bytes([blob[scale_base], blob[scale_base + 1]]);
+            let scale = f16_to_f32(sbits);
+            let dst = row * k + g * 256;
+            for c in 0..16 {
+                let mut acc: u64 = 0;
+                for b in 0..7 {
+                    acc |= (blob[idx_base + 7 * c + b] as u64) << (8 * b);
+                }
+                for j in 0..8 {
+                    let code = ((acc >> (7 * j)) & 0x7F) as usize;
+                    let pair = 8 * c + j;
+                    out[dst + 2 * pair] = scale * GL_CB35[code][0];
+                    out[dst + 2 * pair + 1] = scale * GL_CB35[code][1];
+                }
+            }
+        }
+    }
+    out
+}
+
 
 /// CPU FWHT for 1024 elements (orthogonal, same LCG signs as 256 variant).
 /// Matches GPU `fwht_forward_1024` pattern: signs1 → butterfly → scale → signs2.
@@ -5338,6 +5594,7 @@ impl QuantType {
             39 => Some(Self::MQ3G256GL),
             40 => Some(Self::MQ4G256GL),
             41 => Some(Self::MQ1G1024GL),
+            42 => Some(Self::MQ35G256GL),
             _ => None,
         }
     }
@@ -5427,9 +5684,9 @@ pub(crate) enum QuantType {
     // bytes per group CHEAPER than MQ4G256 (136 B, 4.25 bpw) and 20.9% lower
     // codec MSE, because the 16 levels are the Lloyd-Max optimum for the
     // post-FWHT Gaussian instead of a uniform affine min-max grid.
-    // ENCODE-ONLY today: no GEMV kernel decodes qt=40 yet.
     MQ4G256GL = 40,
     MQ1G1024GL = 41, // 1-bit + global codebook: 128 B idx/group + 2 B scale = 1.015625 bpw, group 1024, GL_CB1
+    MQ35G256GL = 42, // 3.5-bit 2D VQ: 112 B idx/group (7 bits per pair, 128-entry 2D codebook GL_CB35) +2 B scale →3.5625 bpw. LESS aligned than MQ4GL (3.5 B/lane vs 4 B/lane).
     MFP4G32E8SOA = 35, // mfp4-E8 SoA: same E8 data as qt=34 but in structure-of-arrays layout.
     MFP3G32E8 = 36, // mfp3-E8: MFP4G32E8 frame, 3-bit lattice (center 3), 13 B/blk, 3.25 bpw.
     // Drop-in cold tier for MQ3G256Lloyd (tag 3 → tag 5).
@@ -8834,6 +9091,7 @@ fn main() {
     let use_mq1 = format == "mq1" || format == "mq1g1024" || format == "mq1g1024gl" || format == "mq1gl";
     let use_mq2gl = format == "mq2gl" || format == "mq2g256gl";
     let use_mq3gl = format == "mq3gl" || format == "mq3g256gl";
+    let use_mq35gl = format == "mq35gl" || format == "mq3.5gl" || format == "mq35g256gl" || format == "mq3p5g256gl" || format == "mq35g256" || format == "mq3p5gl";
     let use_hfq6 = format == "hfq6" || format == "hfq6g256" || format == "hf6";
     // HFP4G32 — RDNA-optimal FP4 (E2M1 + UE8M0 g32 + FP16 row scale). Spec at docs/quant-formats/hfp4.md.
     let use_hfp4 = format == "hfp4" || format == "hfp4g32" || format == "hf4p" || format == "fp4";
@@ -11848,6 +12106,9 @@ fn main() {
                     } else if use_mq3gl && supports_g256 {
                         let q = quantize_mq3g256gl(&f32_slice, inner_m, inner_k_e, &signs1, &signs2);
                         (q, QuantType::MQ3G256GL, 256u32)
+                    } else if use_mq35gl && supports_g256 {
+                        let q = quantize_mq35g256gl(&f32_slice, inner_m, inner_k_e, &signs1, &signs2);
+                        (q, QuantType::MQ35G256GL, 256u32)
                     } else if supports_g256 {
                         let q = quantize_mq4g256(&f32_slice, &signs1, &signs2);
                         (q, QuantType::MQ4G256, 256u32)
@@ -13192,6 +13453,18 @@ fn main() {
                             let signs2 = gen_fwht_signs(1042, 256);
                             let q = quantize_mq3g256gl(&f32_data, m, k_dim, &signs1, &signs2);
                             (q, QuantType::MQ3G256GL, 256u32, "MQ3G256GL")
+                        } else {
+                            let q = quantize_hfq4g128(&f32_data);
+                            (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                        }
+                    } else if use_mq35gl {
+                        let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
+                        if k_dim % 256 == 0 {
+                            let m = meta.shape[0];
+                            let signs1 = gen_fwht_signs(42, 256);
+                            let signs2 = gen_fwht_signs(1042, 256);
+                            let q = quantize_mq35g256gl(&f32_data, m, k_dim, &signs1, &signs2);
+                            (q, QuantType::MQ35G256GL, 256u32, "MQ35G256GL")
                         } else {
                             let q = quantize_hfq4g128(&f32_data);
                             (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
@@ -15798,6 +16071,12 @@ mod tests {
             "hipfire-quantize GL_CB4 has drifted from rdna_compute::GL_CB4 — \
              qt=40 weights would decode against the wrong 4-bit levels"
         );
+        assert_eq!(
+            GL_CB35,
+            rdna_compute::GL_CB35,
+            "hipfire-quantize GL_CB35 has drifted from rdna_compute::GL_CB35 — \
+             qt=42 weights would decode against the wrong 3.5-bit VQ levels"
+        );
     }
 
     /// Pins the GL on-disk geometry the runtime loader + kernels assume:
@@ -15824,12 +16103,6 @@ mod tests {
         );
 
         let b3 = quantize_mq3g256gl(&w, m, k, &signs1, &signs2);
-        assert_eq!(
-            b3.len(),
-            m * gpr * (rdna_compute::GL_MQ3_GROUP_IDX_BYTES + rdna_compute::GL_GROUP_SCALE_BYTES),
-            "MQ3G256GL blob size disagrees with GL_MQ3_GROUP_IDX_BYTES/GL_GROUP_SCALE_BYTES"
-        );
-
         let b4 = quantize_mq4g256gl(&w, m, k, &signs1, &signs2);
         assert_eq!(
             b4.len(),
@@ -15838,6 +16111,15 @@ mod tests {
         );
         // 130 B per 256 weights == 4.0625 bpw, the whole reason the format exists.
         assert_eq!(b4.len() * 8, m * k * 65 / 16, "MQ4-GL must be exactly 4.0625 bpw");
+
+        let b35 = quantize_mq35g256gl(&w, m, k, &signs1, &signs2);
+        assert_eq!(
+            b35.len(),
+            m * gpr * (rdna_compute::GL_MQ35_GROUP_IDX_BYTES + rdna_compute::GL_GROUP_SCALE_BYTES),
+            "MQ35G256GL blob size disagrees with GL_MQ35_GROUP_IDX_BYTES/GL_GROUP_SCALE_BYTES"
+        );
+        // 114 B per 256 weights == 3.5625 bpw = 3.5 + 0.0625 scale overhead.
+        assert_eq!(b35.len() * 8, m * k * 57 / 16, "MQ35-GL must be exactly 3.5625 bpw");
 
         // Hand-construct a single group whose 256 codes are known and distinct
         // enough to distinguish low-from-high nibble, then assert packing + scale
@@ -16192,6 +16474,61 @@ mod tests {
         }
         for i in 0..got.len() { assert!((got[i] - expect[i]).abs() <= 1e-6); }
     }
+    #[test]
+    fn mq35_blob_layout_and_roundtrip() {
+        // MQ35-G256-GL: 112 B indices (7 bits per pair) +2 B scale =114 B per 256 =3.5625 bpw.
+        // Packing: 8 pairs ×7 bits =56 bits =7 bytes, 16 chunks.
+        let (m, k) = (2usize, 512usize);
+        let s1 = gen_fwht_signs(0xA11CE, 256);
+        let s2 = gen_fwht_signs(0xB0B, 256);
+        let w: Vec<f32> = (0..m * k).map(|i| (i % 11) as f32 * 0.03 - 0.15).collect();
+        let blob = quantize_mq35g256gl(&w, m, k, &s1, &s2);
+        assert_eq!(blob.len(), m * (k / 256) * (112 + 2));
+        assert_eq!(blob.len() * 8, m * k * 57 / 16, "MQ35-GL must be 3.5625 bpw");
+        assert_eq!(
+            blob.len(),
+            m * (k / 256) * (rdna_compute::GL_MQ35_GROUP_IDX_BYTES + rdna_compute::GL_GROUP_SCALE_BYTES)
+        );
+        // 7-bit packing invert check: 8 codes (0..7) →56 bits →7 bytes → invert.
+        let mut codes = [0u8; 8];
+        for i in 0..8 { codes[i] = i as u8; }
+        let mut acc: u64 = 0;
+        for j in 0..8 { acc |= ((codes[j] as u64) & 0x7F) << (7 * j); }
+        let mut bytes = [0u8; 7];
+        for b in 0..7 { bytes[b] = ((acc >> (8 * b)) & 0xFF) as u8; }
+        let mut acc2: u64 = 0;
+        for b in 0..7 { acc2 |= (bytes[b] as u64) << (8 * b); }
+        let mut out = [0u8; 8];
+        for j in 0..8 { out[j] = ((acc2 >> (7 * j)) & 0x7F) as u8; }
+        assert_eq!(out, codes);
+        // Round-trip: encode → decode must equal encoder intent (scale*CB) within 1 ulp.
+        let gpr = k / 256;
+        let idx_bytes = m * gpr * 112;
+        let mut expect = vec![0.0f32; m * k];
+        for row in 0..m {
+            for g in 0..gpr {
+                let start = row * k + g * 256;
+                let mut grp = [0.0f32; 256];
+                grp.copy_from_slice(&w[start..start + 256]);
+                cpu_fwht_256(&mut grp, &s1, &s2);
+                let mut pair_codes = [0u8; 128];
+                let sbits = gl_encode_block_vq35(&grp, &GL_CB35, &mut pair_codes);
+                let scale = f16_to_f32(sbits);
+                for p in 0..128 {
+                    let c = pair_codes[p] as usize;
+                    expect[start + 2 * p] = scale * GL_CB35[c][0];
+                    expect[start + 2 * p + 1] = scale * GL_CB35[c][1];
+                }
+            }
+        }
+        let got = mq35g256gl_unpack_blob(&blob, m, k);
+        assert_eq!(got.len(), expect.len());
+        for i in 0..got.len() {
+            let ulp = (got[i].to_bits() as i32 - expect[i].to_bits() as i32).abs();
+            assert!(ulp <= 1, "mq35 roundtrip i={i} got={} expect={} ulp={ulp}", got[i], expect[i]);
+        }
+    }
+
 
     /// OCP E4M3 (1 sign / 4 exp / 3 mantissa, bias 7) round-to-nearest-even.
     /// Max finite 448 (`0x7E`); NaNs encode as `0x7F`/`0xFF`. Min normal 2^-6;
