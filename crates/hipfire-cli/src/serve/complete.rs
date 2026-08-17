@@ -29,6 +29,7 @@ pub(crate) struct Completion {
     pub(crate) preserve_thinking: bool,
     pub(crate) tool_calls: Vec<ToolCall>,
     pub(crate) done: serde_json::Value,
+    pub(crate) logprobs: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1237,12 +1238,17 @@ pub(crate) fn complete_request_attempt(
                 request_f64(&resolved, config_key, explicit)?,
             );
         }
+        // Validate OpenAI logprobs contract before forwarding; reject rather
+        // than silently clamping so callers notice a mismatch.
+        validate_logprobs_request(body)?;
         for name in [
             "tools",
             "tool_choice",
             "frequency_penalty",
             "stop",
             "reasoning_effort",
+            "logprobs",
+            "top_logprobs",
         ] {
             if let Some(value) = body.get(name) {
                 generate[name] = value.clone();
@@ -1307,6 +1313,10 @@ pub(crate) fn complete_request_attempt(
         .and_then(|v| v.as_str())
         .unwrap_or("unknown")
         .to_owned();
+    // Logprobs are only assembled when the client asked; otherwise the
+    // behaviour must be byte-identical to today (no field, no allocation).
+    let logprobs_requested = body.get("logprobs").and_then(|v| v.as_bool()) == Some(true);
+    let mut logprobs_entries: Vec<serde_json::Value> = Vec::new();
 
     let gen_result = engine_clone.generate(&generate, |event| {
         let event_type = event.get("type").and_then(serde_json::Value::as_str);
@@ -1341,6 +1351,11 @@ pub(crate) fn complete_request_attempt(
                     })?;
                     // Staged done is held on the fold; do not forward mid-stream.
                     let _ = forward;
+                    let logprobs = if logprobs_requested && !logprobs_entries.is_empty() {
+                        Some(logprobs_entries.clone())
+                    } else {
+                        None
+                    };
                     Completion {
                         id: id.clone(),
                         created,
@@ -1350,6 +1365,7 @@ pub(crate) fn complete_request_attempt(
                         preserve_thinking,
                         tool_calls: fold.executable_tool_calls().to_vec(),
                         done: fold.done().cloned().unwrap_or(staged),
+                        logprobs,
                     }
                 }
                 StreamContract::Legacy => {
@@ -1368,6 +1384,11 @@ pub(crate) fn complete_request_attempt(
                     } else {
                         Vec::new()
                     };
+                    let logprobs = if logprobs_requested && !logprobs_entries.is_empty() {
+                        Some(logprobs_entries.clone())
+                    } else {
+                        None
+                    };
                     Completion {
                         id: id.clone(),
                         created,
@@ -1377,10 +1398,10 @@ pub(crate) fn complete_request_attempt(
                         preserve_thinking,
                         tool_calls,
                         done: staged,
+                        logprobs,
                     }
                 }
             };
-
             terminal_callback(&preview)?;
             terminal_delivered = true;
             return Ok(());
@@ -1392,6 +1413,15 @@ pub(crate) fn complete_request_attempt(
 
         match contract {
             StreamContract::V2 => {
+                // Accumulate logprobs when the client asked. If the daemon
+                // sends no `logprob` on a token event, the entry is None and
+                // we skip it — the response will omit logprobs rather than
+                // emit nulls. This preserves byte-identity when not requested.
+                if logprobs_requested && event_type == Some("token") {
+                    if let Some(entry) = logprob_entry_from_token_event(event) {
+                        logprobs_entries.push(entry);
+                    }
+                }
                 let forward = fold
                     .push(event)
                     .map_err(|error| hipfire_client::ClientError::Protocol(error.to_string()))?;
@@ -1417,6 +1447,13 @@ pub(crate) fn complete_request_attempt(
                         }
                     }
                     Some("token") => {
+                        // Logprobs accumulation for legacy path. See V2 comment
+                        // about omitting rather than emitting nulls.
+                        if logprobs_requested {
+                            if let Some(entry) = logprob_entry_from_token_event(event) {
+                                logprobs_entries.push(entry);
+                            }
+                        }
                         if let Some(text) = event.get("text").and_then(serde_json::Value::as_str) {
                             let fragments =
                                 if event.get("reasoning").and_then(serde_json::Value::as_bool)
@@ -1499,6 +1536,11 @@ pub(crate) fn complete_request_attempt(
 
     if contract_gate.is_v2() {
         let done = fold.done().cloned().unwrap_or(done);
+        let logprobs = if logprobs_requested && !logprobs_entries.is_empty() {
+            Some(logprobs_entries)
+        } else {
+            None
+        };
         return Ok(Completion {
             id,
             created,
@@ -1508,6 +1550,7 @@ pub(crate) fn complete_request_attempt(
             preserve_thinking,
             tool_calls: fold.executable_tool_calls().to_vec(),
             done,
+            logprobs,
         });
     }
 
@@ -1520,6 +1563,11 @@ pub(crate) fn complete_request_attempt(
     } else {
         Vec::new()
     };
+    let logprobs = if logprobs_requested && !logprobs_entries.is_empty() {
+        Some(logprobs_entries)
+    } else {
+        None
+    };
     Ok(Completion {
         id,
         created,
@@ -1529,9 +1577,9 @@ pub(crate) fn complete_request_attempt(
         preserve_thinking,
         tool_calls,
         done,
+        logprobs,
     })
 }
-
 /// Server-owned one-retry driver over [`complete_request_attempt`].
 
 pub(crate) fn complete_request(
@@ -1906,6 +1954,77 @@ pub(crate) fn openai_finish_reason(done: &serde_json::Value) -> String {
     }
 }
 
+/// Validate OpenAI `logprobs` / `top_logprobs` contract before forwarding.
+/// `top_logprobs` must be integer 0..=20 and requires `logprobs == true`.
+/// Reject rather than silently clamping — a clamped value would make a caller
+/// think they got 20 when they got 5.
+pub(crate) fn validate_logprobs_request(body: &serde_json::Value) -> Result<()> {
+    if let Some(v) = body.get("top_logprobs") {
+        let logprobs_true = body.get("logprobs").and_then(|x| x.as_bool()) == Some(true);
+        if !logprobs_true {
+            bail!("top_logprobs requires logprobs to be true");
+        }
+        let n = if let Some(n) = v.as_u64() {
+            n
+        } else if let Some(n) = v.as_i64() {
+            if n < 0 {
+                bail!("top_logprobs must be an integer between 0 and 20");
+            }
+            n as u64
+        } else {
+            bail!("top_logprobs must be an integer between 0 and 20");
+        };
+        if n > 20 {
+            bail!("top_logprobs must be an integer between 0 and 20");
+        }
+    }
+    if let Some(v) = body.get("logprobs") {
+        if !v.is_boolean() {
+            bail!("logprobs must be a boolean");
+        }
+    }
+    Ok(())
+}
+
+/// Build one OpenAI logprobs content entry from a daemon token event.
+/// Returns None if the event lacks `logprob` — some paths do not yet compute
+/// it, and the response must omit `logprobs` entirely rather than emit entries
+/// with null logprob values. `bytes` is the UTF-8 bytes of the token text.
+pub(crate) fn logprob_entry_from_token_event(event: &serde_json::Value) -> Option<serde_json::Value> {
+    let text = event.get("text")?.as_str()?;
+    let logprob = event.get("logprob")?.as_f64()?;
+    let bytes: Vec<serde_json::Value> = text
+        .bytes()
+        .map(|b| serde_json::Value::Number(serde_json::Number::from(b as u64)))
+        .collect();
+    let top_logprobs = event.get("top_logprobs").and_then(|v| v.as_array());
+    let top_entries: Vec<serde_json::Value> = if let Some(arr) = top_logprobs {
+        arr.iter()
+            .filter_map(|e| {
+                let tok = e.get("token")?.as_str()?;
+                let lp = e.get("logprob")?.as_f64()?;
+                let b: Vec<serde_json::Value> = tok
+                    .bytes()
+                    .map(|b| serde_json::Value::Number(serde_json::Number::from(b as u64)))
+                    .collect();
+                Some(serde_json::json!({
+                    "token": tok,
+                    "logprob": lp,
+                    "bytes": b,
+                }))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Some(serde_json::json!({
+        "token": text,
+        "logprob": logprob,
+        "bytes": bytes,
+        "top_logprobs": top_entries,
+    }))
+}
+
 pub(crate) fn completion_json(completion: &Completion) -> serde_json::Value {
     let finish_reason = openai_finish_reason(&completion.done);
     // Structured calls only for a tool-safe terminal; never on length/error/cancel.
@@ -1940,22 +2059,31 @@ pub(crate) fn completion_json(completion: &Completion) -> serde_json::Value {
     if !tool_calls.is_empty() {
         message["tool_calls"] = serde_json::Value::Array(tool_calls);
     }
+    let mut choice = serde_json::json!({
+        "index": 0,
+        "message": message,
+        "finish_reason": finish_reason,
+    });
+    // Attach logprobs only when the client requested it and the daemon
+    // actually produced per-token logprob entries. If the daemon sends no
+    // `logprob` on token events (paths that do not yet compute it), omit the
+    // field entirely rather than emitting nulls or an empty object.
+    if let Some(entries) = &completion.logprobs {
+        if !entries.is_empty() {
+            choice["logprobs"] = serde_json::json!({ "content": entries });
+        }
+    }
     serde_json::json!({
         "id": completion.id,
         "object": "chat.completion",
         "created": completion.created,
         "model": completion.model,
-        "choices": [{
-            "index": 0,
-            "message": message,
-            "finish_reason": finish_reason,
-        }],
+        "choices": [choice],
         "usage": completion_usage(completion),
         "timings": completion_timings(completion),
         "hipfire": completion_hipfire(completion),
     })
 }
-
 pub(crate) fn completion_usage(completion: &Completion) -> serde_json::Value {
     let cached_tokens = completion
         .done
@@ -2232,6 +2360,7 @@ mod tests {
                 "cached_tokens": 1,
                 "tok_s": 10.0,
             }),
+            logprobs: None,
         }
     }
 
@@ -2243,7 +2372,6 @@ mod tests {
             rendered_body: None,
         }
     }
-
     fn sample_completion_with_done(
         content: &str,
         tool_calls: Vec<ToolCall>,
@@ -2258,6 +2386,7 @@ mod tests {
             preserve_thinking: false,
             tool_calls,
             done,
+            logprobs: None,
         }
     }
 
@@ -2292,6 +2421,7 @@ mod tests {
             preserve_thinking: false,
             tool_calls: Vec::new(),
             done,
+            logprobs: None,
         };
 
         let dflash = completion_timings(&completion(serde_json::json!({
@@ -2347,6 +2477,7 @@ mod tests {
                 "latency_ms": 250.5,
                 "tok_s": 20.0,
             }),
+            logprobs: None,
         };
         let timings = completion_timings(&completion);
         assert_eq!(timings["latency_ms"], 250.5);
@@ -2361,6 +2492,7 @@ mod tests {
             preserve_thinking: false,
             tool_calls: Vec::new(),
             done: serde_json::json!({"ttft_ms": 1.0}),
+            logprobs: None,
         });
         assert!(no_lat["latency_ms"].is_null());
     }
@@ -2394,6 +2526,7 @@ mod tests {
                 "tokens": 3,
                 "prefill_tokens": 8,
             }),
+            logprobs: None,
         };
         let hip = completion_hipfire(&completion);
         assert_eq!(hip["execution_mode"], "continuous_batch_independent");
@@ -2438,6 +2571,7 @@ mod tests {
                 "finish_reason": "stop",
                 "tokens": 2,
             }),
+            logprobs: None,
         };
         let seq_hip = completion_hipfire(&sequential);
         assert!(seq_hip["execution_mode"].is_null());
@@ -2846,6 +2980,7 @@ mod tests {
                 "ar_windows": 2,
                 "mtp_retired": true
             }),
+            logprobs: None,
         };
         let json = completion_json(&completion);
         assert_eq!(json["usage"]["total_tokens"], 19);
@@ -2874,6 +3009,7 @@ mod tests {
                 "cached_tokens": 12,
                 "tokens": 7
             }),
+            logprobs: None,
         };
         let qwen_json = completion_json(&qwen_cached);
         assert_eq!(qwen_json["usage"]["prompt_tokens"], 20);
@@ -3190,8 +3326,8 @@ mod tests {
             preserve_thinking: false,
             tool_calls: fold.executable_tool_calls().to_vec(),
             done: fold.done().cloned().unwrap(),
+            logprobs: None,
         };
-
         let nonstream = completion_json(&completion);
         assert!(nonstream["choices"][0]["message"]["content"].is_null());
         assert_eq!(nonstream["choices"][0]["finish_reason"], "tool_calls");
@@ -3263,8 +3399,8 @@ mod tests {
             preserve_thinking: false,
             tool_calls: fold.executable_tool_calls().to_vec(),
             done: fold.done().cloned().unwrap(),
+            logprobs: None,
         };
-        assert!(completion.tool_calls.is_empty());
 
         let nonstream = completion_json(&completion);
         assert_eq!(nonstream["choices"][0]["finish_reason"], "length");
@@ -4727,4 +4863,151 @@ mod tests {
         );
     }
 
+    #[test]
+    fn logprob_validation_accepts_boundary_0_to_20() {
+        for n in [0, 1, 5, 20] {
+            let body = serde_json::json!({ "logprobs": true, "top_logprobs": n });
+            validate_logprobs_request(&body).unwrap_or_else(|e| panic!("{n} should be valid: {e}"));
+        }
+        // logprobs true alone without top_logprobs is also valid
+        validate_logprobs_request(&serde_json::json!({ "logprobs": true })).expect("logprobs true alone");
+        // absent fields are valid
+        validate_logprobs_request(&serde_json::json!({})).expect("empty");
+        validate_logprobs_request(&serde_json::json!({ "logprobs": false })).expect("false");
+    }
+
+    #[test]
+    fn logprob_validation_rejects_out_of_range_and_non_integer() {
+        // >20 must bail
+        let bad = serde_json::json!({ "logprobs": true, "top_logprobs": 21 });
+        assert!(validate_logprobs_request(&bad).is_err(), "21 should fail");
+        let bad_neg = serde_json::json!({ "logprobs": true, "top_logprobs": -1 });
+        assert!(validate_logprobs_request(&bad_neg).is_err(), "-1 should fail");
+        // float must fail even if integral value
+        let bad_float = serde_json::json!({ "logprobs": true, "top_logprobs": 5.0 });
+        assert!(validate_logprobs_request(&bad_float).is_err(), "5.0 float should fail");
+        let bad_str = serde_json::json!({ "logprobs": true, "top_logprobs": "5" });
+        assert!(validate_logprobs_request(&bad_str).is_err(), "string should fail");
+        // logprobs must be bool
+        let bad_logprob_type = serde_json::json!({ "logprobs": "true" });
+        assert!(validate_logprobs_request(&bad_logprob_type).is_err(), "string logprobs should fail");
+    }
+
+    #[test]
+    fn logprob_validation_rejects_top_without_logprobs() {
+        let cases = [
+            serde_json::json!({ "top_logprobs": 5 }),
+            serde_json::json!({ "logprobs": false, "top_logprobs": 5 }),
+            serde_json::json!({ "logprobs": null, "top_logprobs": 0 }),
+        ];
+        for body in &cases {
+            let err = validate_logprobs_request(body).expect_err("should reject top without logprobs true");
+            assert!(err.to_string().contains("top_logprobs requires logprobs"), "err={}", err);
+        }
+    }
+
+    #[test]
+    fn logprob_absent_when_not_requested_is_byte_identical() {
+        let completion = Completion {
+            id: "chatcmpl_test".into(),
+            created: 42,
+            model: "qwen:test".into(),
+            content: "hello".into(),
+            reasoning_content: String::new(),
+            preserve_thinking: false,
+            tool_calls: Vec::new(),
+            done: serde_json::json!({ "finish_reason": "stop", "tokens": 1 }),
+            logprobs: None,
+        };
+        let json = completion_json(&completion);
+        assert!(json["choices"][0].get("logprobs").is_none(), "logprobs must be absent, not null");
+        // empty vec also absent
+        let empty = Completion {
+            logprobs: Some(vec![]),
+            ..Completion {
+                id: "chatcmpl_test".into(),
+                created: 42,
+                model: "qwen:test".into(),
+                content: "hello".into(),
+                reasoning_content: String::new(),
+                preserve_thinking: false,
+                tool_calls: Vec::new(),
+                done: serde_json::json!({ "finish_reason": "stop", "tokens": 1 }),
+                logprobs: None,
+            }
+        };
+        let json2 = completion_json(&empty);
+        assert!(json2["choices"][0].get("logprobs").is_none(), "empty content must also be absent");
+    }
+
+    #[test]
+    fn logprob_entry_builds_bytes_and_top() {
+        let event = serde_json::json!({
+            "type": "token",
+            "text": "The",
+            "logprob": -0.31,
+            "top_logprobs": [
+                { "token": "The", "logprob": -0.31 },
+                { "token": "A", "logprob": -1.2 }
+            ]
+        });
+        let entry = logprob_entry_from_token_event(&event).expect("entry");
+        assert_eq!(entry["token"], "The");
+        assert!((entry["logprob"].as_f64().unwrap() - (-0.31)).abs() < 1e-6);
+        assert_eq!(entry["bytes"], serde_json::json!([84, 104, 101]));
+        assert_eq!(entry["top_logprobs"][0]["token"], "The");
+        assert_eq!(entry["top_logprobs"][0]["bytes"], serde_json::json!([84, 104, 101]));
+        assert_eq!(entry["top_logprobs"][1]["token"], "A");
+        assert_eq!(entry["top_logprobs"][1]["bytes"], serde_json::json!([65]));
+        // UTF-8 multi-byte
+        let event2 = serde_json::json!({ "type": "token", "text": "é", "logprob": -0.5 });
+        let e2 = logprob_entry_from_token_event(&event2).unwrap();
+        assert_eq!(e2["bytes"], serde_json::json!([195, 169]));
+        assert_eq!(e2["top_logprobs"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn logprob_omits_when_daemon_sends_no_logprob() {
+        // If daemon sends no logprob, entry is None and completion must omit field.
+        let event_no_logprob = serde_json::json!({ "type": "token", "text": "hi" });
+        assert!(logprob_entry_from_token_event(&event_no_logprob).is_none());
+        // No entries => completion omits logprobs even when requested
+        let completion = Completion {
+            id: "chatcmpl_test".into(),
+            created: 42,
+            model: "qwen:test".into(),
+            content: "hi".into(),
+            reasoning_content: String::new(),
+            preserve_thinking: false,
+            tool_calls: Vec::new(),
+            done: serde_json::json!({ "finish_reason": "stop" }),
+            logprobs: None,
+        };
+        let json = completion_json(&completion);
+        assert!(json["choices"][0].get("logprobs").is_none());
+        // With entries => present
+        let entry = serde_json::json!({
+            "token": "hi",
+            "logprob": -0.1,
+            "bytes": [104, 105],
+            "top_logprobs": []
+        });
+        let with = Completion {
+            logprobs: Some(vec![entry]),
+            ..Completion {
+                id: "chatcmpl_test".into(),
+                created: 42,
+                model: "qwen:test".into(),
+                content: "hi".into(),
+                reasoning_content: String::new(),
+                preserve_thinking: false,
+                tool_calls: Vec::new(),
+                done: serde_json::json!({ "finish_reason": "stop" }),
+                logprobs: None,
+            }
+        };
+        let json2 = completion_json(&with);
+        assert_eq!(json2["choices"][0]["logprobs"]["content"][0]["token"], "hi");
+        assert_eq!(json2["choices"][0]["logprobs"]["content"][0]["bytes"], serde_json::json!([104, 105]));
+    }
 }

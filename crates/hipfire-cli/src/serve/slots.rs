@@ -236,6 +236,7 @@ pub(crate) fn complete_request_slots(
         preserve_thinking: false,
         tool_calls: Vec::new(),
         done: serde_json::json!({ "finish_reason": finish }),
+        logprobs: None,
     };
     // The terminal callback is what stages the response body and signals the
     // HTTP handler that the request succeeded. Skipping it leaves the handler

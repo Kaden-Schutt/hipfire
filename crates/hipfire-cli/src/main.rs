@@ -7168,6 +7168,7 @@ mod tests {
                 "cached_tokens": 1,
                 "tok_s": 10.0,
             }),
+            logprobs: None,
         }
     }
 
@@ -7179,7 +7180,6 @@ mod tests {
             rendered_body: None,
         }
     }
-
 
 
 
@@ -7205,6 +7205,7 @@ mod tests {
             preserve_thinking: false,
             tool_calls,
             done,
+            logprobs: None,
         }
     }
 
