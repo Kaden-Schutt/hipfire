@@ -117,13 +117,13 @@ pub enum RotationPlan {
 pub fn dtype_rotation_plan(dtype: DType) -> RotationPlan {
     use DType::*;
     match dtype {
-        // MQ2G256GL / MQ3G256GL: the GL ("global Lloyd") formats are encoded
-        // against FWHT-256-rotated blocks exactly like every other MQ*-G256
-        // dtype (`quantize_mq{2,3}g256gl` calls `cpu_fwht_256` per group), so
-        // x MUST be FwhtG256-rotated before their kernels see it.
+        // MQ2G256GL / MQ3G256GL / MQ4G256GL: the GL ("global Lloyd") formats are
+        // encoded against FWHT-256-rotated blocks exactly like every other
+        // MQ*-G256 dtype (`quantize_mq{2,3,4}g256gl` calls `cpu_fwht_256` per
+        // group), so x MUST be FwhtG256-rotated before their kernels see it.
         MQ4G256 | MQ3G256 | MQ2G256 | MQ5G256 | MQ6G256 | MQ2G256Lloyd | MQ3G256Lloyd
-        | MQ4G256Lloyd | MQ2G256GL | MQ3G256GL | MFP4G32 | MFP4G32Lloyd | MFP4G32P | MFP4G32E8
-        | MFP4G32E8SOA | MFP3G32E8 | MFP2G32E8 => RotationPlan::FwhtG256,
+        | MQ4G256Lloyd | MQ2G256GL | MQ3G256GL | MQ4G256GL | MFP4G32 | MFP4G32Lloyd
+        | MFP4G32P | MFP4G32E8 | MFP4G32E8SOA | MFP3G32E8 | MFP2G32E8 => RotationPlan::FwhtG256,
         MQ4G128 => RotationPlan::FwhtG128,
         MQ8G256 => RotationPlan::Mq8Internal,
         ParoQ4G128 => RotationPlan::Givens,
@@ -138,12 +138,13 @@ pub fn dtype_post_rotation_variant(dtype: DType) -> GemvVariant {
     use DType::*;
     match dtype {
         ParoQ4G128 => GemvVariant::Plain,
-        // NOTE MQ2G256GL / MQ3G256GL are deliberately NOT listed here. They are
-        // MoE-routed-expert-only formats: the only kernels that exist are the
-        // four indexed MoE GEMVs, so there is no dense "prerotated" GEMV to
-        // dispatch. Claiming Prerotated would make `for_gemv_prerotated` look
-        // resolvable and then fail deeper; leaving them on the `_` arm keeps the
-        // failure at the (correct) `UnsupportedVariant` boundary.
+        // NOTE MQ2G256GL / MQ3G256GL / MQ4G256GL are deliberately NOT listed here.
+        // They are MoE-routed-expert-only formats (MQ4-GL dense GEMV is slice B /
+        // later): the only kernels that exist today are the indexed MoE GEMVs for
+        // qt=38/39, so there is no dense "prerotated" GEMV to dispatch. Claiming
+        // Prerotated would make `for_gemv_prerotated` look resolvable and then fail
+        // deeper; leaving them on the `_` arm keeps the failure at the (correct)
+        // `UnsupportedVariant` boundary.
         MQ4G256 | MQ3G256 | MQ2G256 | MQ5G256 | MQ6G256 | MQ8G256 | MQ2G256Lloyd | MQ3G256Lloyd
         | MQ4G256Lloyd | MFP4G32 | MFP4G32Lloyd | MFP4G32P | MFP4G32E8 | MFP4G32E8SOA | MQ4G128 => {
             GemvVariant::Prerotated
@@ -762,11 +763,12 @@ impl KernelKey {
             MQ5G256 => ArchPredicate::HasMmq,
             MQ6G256 | HFQ6G256 => ArchPredicate::HasMmq,
             MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd => ArchPredicate::HasWave32,
-            // MQ2/MQ3-G256-GL: the four indexed MoE GEMVs are WMMA-free
-            // [32,1,1] wave32 scalar kernels (plain fp16→f32 converts + a
-            // 5-step `__shfl_down` reduce), so the same HasWave32 gate as the
-            // Lloyd family is correct — RDNA1..RDNA4 in, CDNA wave64 out.
-            MQ2G256GL | MQ3G256GL => ArchPredicate::HasWave32,
+            // MQ2/MQ3/MQ4-G256-GL: the indexed MoE GEMVs (and the forthcoming
+            // dense MQ4-GL GEMV) are WMMA-free [32,1,1] wave32 scalar kernels
+            // (plain fp16→f32 converts + a 5-step `__shfl_down` reduce), so the
+            // same HasWave32 gate as the Lloyd family is correct — RDNA1..RDNA4
+            // in, CDNA wave64 out.
+            MQ2G256GL | MQ3G256GL | MQ4G256GL => ArchPredicate::HasWave32,
             Q8HFQ | Raw => ArchPredicate::Always,
         }
     }

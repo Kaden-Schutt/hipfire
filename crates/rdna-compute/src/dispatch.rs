@@ -51,10 +51,12 @@ pub const LLOYD_MQ4_GROUP_BYTES: usize = 160;
 //                      [M*gpr*64 .. +M*gpr*2)  fp16 per-block scales  → 2.0625 bpw
 //   MQ3G256GL (qt 39): [0 .. M*gpr*96)   3-bit indices, 96 B/group
 //                      [M*gpr*96 .. +M*gpr*2)  fp16 per-block scales  → 3.0625 bpw
+//   MQ4G256GL (qt 40): [0 .. M*gpr*128)  4-bit indices, 128 B/group
+//                      [M*gpr*128 .. +M*gpr*2) fp16 per-block scales  → 4.0625 bpw
 //
 // with gpr = K/256. There is no inline per-group header — any loader or size
 // estimator that assumes "one contiguous blob per row with a header" is wrong
-// for these two dtypes.
+// for these dtypes.
 
 /// Per-group INDEX bytes for MQ2-G256-GL (2 bits × 256 weights). The fp16
 /// per-block scale lives in a SEPARATE trailing region, NOT in the group.
@@ -288,6 +290,14 @@ pub enum DType {
     MQ3G256GL, // MagnumQuant 3-bit + TENSOR-GLOBAL 8-entry codebook (GL_CB3), SoA:
     // [M*gpr*96 B indices][M*gpr*2 B fp16 per-block scales] = 3.0625 bpw. Same
     // MoE-only scope + scalar-arg codebook as MQ2G256GL.
+    /// MQ4-G256-GL (qt 40): MagnumQuant 4-bit + TENSOR-GLOBAL 16-entry codebook
+    /// ([`GL_CB4`]), SoA two-region layout with **no** inline per-group header:
+    ///   `[0 .. M*gpr*128)`            4-bit indices, 128 B/group
+    ///   `[M*gpr*128 .. +M*gpr*2)`     fp16 per-block scales, 2 B/group
+    /// → **130 B/group = 4.0625 bpw**. Codebook is a compile-time constant
+    /// passed as sixteen scalar kernel args, not stored in the file. Nibble
+    /// packing matches MQ4G256 (`lo | hi << 4`).
+    MQ4G256GL,
     HFP4G32, // HFP4: E2M1 element + UE8M0 g32 block scale + FP16 row scale.
     // Per-row header 16 B; per-block payload 17 B (UE8M0 + 16 packed nibbles).
     // See docs/quant-formats/hfp4.md.
@@ -351,6 +361,7 @@ impl DType {
             | DType::MQ4G256Lloyd
             | DType::MQ2G256GL
             | DType::MQ3G256GL
+            | DType::MQ4G256GL
             | DType::HFP4G32
             | DType::MFP4G32
             | DType::MFP4G32Lloyd
@@ -449,14 +460,18 @@ impl DType {
     /// gemv_hfp4g32 kernel + FWHT both need it). Refuse at load, not first
     /// dispatch. Centralizes the guard inlined at the weight-decode qt 21/24 arms.
     ///
-    /// MQ2/MQ3-G256-GL are included because their SoA region split is derived
+    /// MQ*-G256-GL are included because their SoA region split is derived
     /// from `gpr = K/256` on BOTH sides (encoder and kernel). A K that is not a
     /// multiple of 256 truncates `gpr`, which silently shifts the scale-region
     /// base — garbage weights with no error. Fail at load instead.
     pub fn requires_k_mod_256(self) -> bool {
         matches!(
             self,
-            DType::HFP4G32 | DType::MFP4G32 | DType::MQ2G256GL | DType::MQ3G256GL
+            DType::HFP4G32
+                | DType::MFP4G32
+                | DType::MQ2G256GL
+                | DType::MQ3G256GL
+                | DType::MQ4G256GL
         )
     }
 }

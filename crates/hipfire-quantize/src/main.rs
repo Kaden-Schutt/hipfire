@@ -4775,6 +4775,46 @@ pub(crate) fn quantize_mq4g256gl(
     out
 }
 
+/// CPU packed-dequant oracle for MQ4-G256-GL blobs.
+///
+/// Parses the frozen two-region layout produced by [`quantize_mq4g256gl`]:
+/// index region base 0 with group stride 128, scale region base `m*gpr*128`
+/// indexed `[row*gpr + g]`. Reconstructs each weight in the **rotated** domain
+/// as `scale * GL_CB4[code]` — deliberately does NOT inverse-FWHT, so a kernel
+/// (or future GPU parity test) can compare against the same numbers.
+#[cfg(test)]
+fn mq4g256gl_unpack_blob(blob: &[u8], m: usize, k: usize) -> Vec<f32> {
+    assert_eq!(k % 256, 0, "MQ4GL unpack: K must be a multiple of 256 (got {k})");
+    let gpr = k / 256;
+    let idx_bytes = m * gpr * rdna_compute::GL_MQ4_GROUP_IDX_BYTES;
+    let scale_bytes = m * gpr * rdna_compute::GL_GROUP_SCALE_BYTES;
+    assert_eq!(
+        blob.len(),
+        idx_bytes + scale_bytes,
+        "MQ4GL unpack: blob length {} != m*gpr*130 = {}",
+        blob.len(),
+        idx_bytes + scale_bytes
+    );
+    let mut out = vec![0.0f32; m * k];
+    for row in 0..m {
+        for g in 0..gpr {
+            let idx_base = (row * gpr + g) * rdna_compute::GL_MQ4_GROUP_IDX_BYTES;
+            let scale_base = idx_bytes + (row * gpr + g) * rdna_compute::GL_GROUP_SCALE_BYTES;
+            let sbits = u16::from_le_bytes([blob[scale_base], blob[scale_base + 1]]);
+            let scale = f16_to_f32(sbits);
+            let dst = row * k + g * 256;
+            for b in 0..128 {
+                let packed = blob[idx_base + b];
+                let c0 = (packed & 0x0F) as usize;
+                let c1 = (packed >> 4) as usize;
+                out[dst + 2 * b] = scale * GL_CB4[c0];
+                out[dst + 2 * b + 1] = scale * GL_CB4[c1];
+            }
+        }
+    }
+    out
+}
+
 /// Quantize F32 weights to HFQ3-G256: 3-bit with 256-weight groups.
 /// Block: [f32 scale][f32 zero][96B packed 3-bit] = 104 bytes per 256 weights (0.406 B/w).
 /// Packing: 8 weights × 3 bits = 24 bits = 3 bytes per thread-group.
@@ -15453,9 +15493,7 @@ mod tests {
     /// error — otherwise the format has no reason to exist, since its only other
     /// property (130 B vs 136 B per group) would just be losing precision cheaply.
     ///
-    /// Deliberately NOT part of `gl_codebooks_match_runtime`: there is no
-    /// `rdna_compute::GL_CB4` yet because no kernel decodes qt for MQ4-GL. Add it
-    /// there the moment one lands, or the drift guard will not cover it.
+    /// Covered by `gl_codebooks_match_runtime` once `rdna_compute::GL_CB4` landed.
     #[test]
     fn gl_cb4_beats_uniform_affine() {
         // Symmetric, strictly increasing, and centred — the structural
@@ -15557,8 +15595,12 @@ mod tests {
 
     /// Pins the GL on-disk geometry the runtime loader + kernels assume:
     /// SoA `[m*gpr*IDX B indices][m*gpr*2 B fp16 scales]`, IDX = 64 (MQ2-GL) /
-    /// 96 (MQ3-GL). The kernels derive the scale-region base as `M*gpr*IDX`, so
-    /// a size change here is a silent read past/short of the scales.
+    /// 96 (MQ3-GL) / 128 (MQ4-GL). The kernels derive the scale-region base as
+    /// `M*gpr*IDX`, so a size change here is a silent read past/short of the scales.
+    ///
+    /// Also pins NIBBLE ORDER and SCALE PLACEMENT for MQ4-GL: a test that only
+    /// checks `len()` would pass with nibbles swapped or the two regions
+    /// transposed — the exact bug class the wire oracle must exclude.
     #[test]
     fn gl_blob_layout_matches_runtime_constants() {
         let (m, k) = (4usize, 512usize);
@@ -15589,6 +15631,139 @@ mod tests {
         );
         // 130 B per 256 weights == 4.0625 bpw, the whole reason the format exists.
         assert_eq!(b4.len() * 8, m * k * 65 / 16, "MQ4-GL must be exactly 4.0625 bpw");
+
+        // Hand-construct a single group whose 256 codes are known and distinct
+        // enough to distinguish low-from-high nibble, then assert packing + scale
+        // placement without going through the encoder's FWHT path.
+        {
+            let m1 = 2usize;
+            let k1 = 256usize;
+            let gpr1 = 1usize;
+            let idx_bytes = m1 * gpr1 * rdna_compute::GL_MQ4_GROUP_IDX_BYTES;
+            let n_groups = m1 * gpr1;
+            let mut blob = vec![0u8; idx_bytes + n_groups * rdna_compute::GL_GROUP_SCALE_BYTES];
+            // Group (row=0,g=0): codes[i] = i % 16 — byte b holds lo=b%16? wait:
+            // weight 2b → low nibble = (2b)%16, weight 2b+1 → high = (2b+1)%16.
+            for b in 0..128 {
+                let lo = ((2 * b) % 16) as u8;
+                let hi = ((2 * b + 1) % 16) as u8;
+                blob[b] = lo | (hi << 4);
+            }
+            // Distinct non-zero scales at first and last group slots.
+            let s_first: u16 = 0x3C00; // fp16 1.0
+            let s_last: u16 = 0x4000; // fp16 2.0
+            blob[idx_bytes] = (s_first & 0xFF) as u8;
+            blob[idx_bytes + 1] = (s_first >> 8) as u8;
+            let last_off = idx_bytes + (n_groups - 1) * 2;
+            blob[last_off] = (s_last & 0xFF) as u8;
+            blob[last_off + 1] = (s_last >> 8) as u8;
+
+            // Nibble order: byte 0 low = weight 0, high = weight 1.
+            assert_eq!(blob[0] & 0x0F, 0, "byte0 low nibble must be weight 0 code");
+            assert_eq!(blob[0] >> 4, 1, "byte0 high nibble must be weight 1 code");
+            assert_eq!(blob[1] & 0x0F, 2, "byte1 low nibble must be weight 2 code");
+            assert_eq!(blob[1] >> 4, 3, "byte1 high nibble must be weight 3 code");
+
+            // Scale placement: first scale at m*gpr*128, last at + (n_groups-1)*2.
+            assert_eq!(
+                idx_bytes,
+                m1 * gpr1 * rdna_compute::GL_MQ4_GROUP_IDX_BYTES,
+                "scale region base"
+            );
+            assert_eq!(
+                last_off,
+                m1 * gpr1 * rdna_compute::GL_MQ4_GROUP_IDX_BYTES + (n_groups - 1) * 2,
+                "last scale offset"
+            );
+            let got_first = u16::from_le_bytes([blob[idx_bytes], blob[idx_bytes + 1]]);
+            let got_last = u16::from_le_bytes([blob[last_off], blob[last_off + 1]]);
+            assert_eq!(got_first, s_first);
+            assert_eq!(got_last, s_last);
+
+            // Oracle must honour the same nibble order + scale base.
+            let unpacked = mq4g256gl_unpack_blob(&blob, m1, k1);
+            assert!(
+                (unpacked[0] - f16_to_f32(s_first) * GL_CB4[0]).abs() < 1e-6,
+                "unpack w0"
+            );
+            assert!(
+                (unpacked[1] - f16_to_f32(s_first) * GL_CB4[1]).abs() < 1e-6,
+                "unpack w1"
+            );
+            // Last row's first weight uses s_last and code 0.
+            assert!(
+                (unpacked[k1] - f16_to_f32(s_last) * GL_CB4[0]).abs() < 1e-6,
+                "unpack last-row w0"
+            );
+        }
+    }
+
+    /// Wire oracle: encoder bytes parse back to the encoder's rotated-domain
+    /// intent (`scale * GL_CB4[code]`), independent of any GPU path.
+    #[test]
+    fn mq4gl_blob_parses_to_encoder_intent() {
+        let (m, k) = (3usize, 512usize);
+        let gpr = k / 256;
+        // Deterministic LCG — not random — so the oracle is bit-stable.
+        let mut state = 0xC0FFEE_u64;
+        let mut next_u01 = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1);
+            ((state >> 33) as f32) * (1.0 / (1u32 << 31) as f32)
+        };
+        let w: Vec<f32> = (0..m * k)
+            .map(|_| (next_u01() * 2.0 - 1.0) * 0.5)
+            .collect();
+        let signs1 = gen_fwht_signs(0xA11CE, 256);
+        let signs2 = gen_fwht_signs(0xB0B, 256);
+
+        let blob = quantize_mq4g256gl(&w, m, k, &signs1, &signs2);
+        let got = mq4g256gl_unpack_blob(&blob, m, k);
+
+        // Independently recompute encoder intent: FWHT → snap to GL_CB4 under
+        // the fp16 block scale. Stay in the rotated domain (no inv-FWHT).
+        let mut expect = vec![0.0f32; m * k];
+        for row in 0..m {
+            for g in 0..gpr {
+                let start = row * k + g * 256;
+                let mut group = [0.0f32; 256];
+                group.copy_from_slice(&w[start..start + 256]);
+                cpu_fwht_256(&mut group, &signs1, &signs2);
+                let mut codes = [0u8; 256];
+                let sbits = gl_encode_block(&group, &GL_CB4, &mut codes);
+                let scale = f16_to_f32(sbits);
+                for i in 0..256 {
+                    expect[start + i] = if scale == 0.0 {
+                        0.0
+                    } else {
+                        scale * GL_CB4[codes[i] as usize]
+                    };
+                }
+            }
+        }
+
+        assert_eq!(got.len(), expect.len());
+        for i in 0..got.len() {
+            if expect[i] == 0.0 {
+                assert_eq!(
+                    got[i], 0.0,
+                    "exact zero required where block scale is fp16 zero (i={i})"
+                );
+            } else {
+                let ulp = {
+                    let a = got[i].to_bits() as i32;
+                    let b = expect[i].to_bits() as i32;
+                    (a - b).abs()
+                };
+                assert!(
+                    ulp <= 2,
+                    "i={i}: got={} expect={} ulp={ulp}",
+                    got[i],
+                    expect[i]
+                );
+            }
+        }
     }
 
     #[test]
