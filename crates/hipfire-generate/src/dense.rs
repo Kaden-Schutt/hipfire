@@ -759,7 +759,7 @@ pub fn generate_deepseek4(
     let Some(b) = m
         .state
         .as_mut()
-        .and_then(|s| (s.as_arch_model_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_deepseek4::Deepseek4Bundle>())
+        .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_deepseek4::Deepseek4Bundle>())
     else {
         let _ = writeln!(
             stdout,
@@ -1540,7 +1540,7 @@ pub fn generate_deepseek4_heterogeneous(
     let eos_tok = match m
         .state
         .as_mut()
-        .and_then(|s| (s.as_arch_model_mut() as &mut dyn Any).downcast_mut::<hipfire_loader::Deepseek4HeterogeneousBundle>())
+        .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_loader::Deepseek4HeterogeneousBundle>())
     {
         Some(bundle) => bundle.eos_tok,
         _ => {
@@ -1582,7 +1582,7 @@ pub fn generate_deepseek4_heterogeneous(
         let Some(bundle) = m
             .state
             .as_mut()
-            .and_then(|s| (s.as_arch_model_mut() as &mut dyn Any).downcast_mut::<hipfire_loader::Deepseek4HeterogeneousBundle>())
+            .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_loader::Deepseek4HeterogeneousBundle>())
         else {
             emit_error_with_id(stdout, id, "deepseek4 heterogeneous state missing");
             return;
@@ -1683,7 +1683,7 @@ pub fn generate_deepseek4_heterogeneous(
         let Some(bundle) = m
             .state
             .as_mut()
-            .and_then(|s| (s.as_arch_model_mut() as &mut dyn Any).downcast_mut::<hipfire_loader::Deepseek4HeterogeneousBundle>())
+            .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_loader::Deepseek4HeterogeneousBundle>())
         else {
             emit_error_with_id(stdout, id, "deepseek4 heterogeneous state disappeared");
             return;
@@ -1764,7 +1764,7 @@ pub fn generate_deepseek4_heterogeneous(
         let Some(bundle) = m
             .state
             .as_mut()
-            .and_then(|s| (s.as_arch_model_mut() as &mut dyn Any).downcast_mut::<hipfire_loader::Deepseek4HeterogeneousBundle>())
+            .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_loader::Deepseek4HeterogeneousBundle>())
         else {
             emit_error_with_id(
                 stdout,
@@ -1852,7 +1852,7 @@ pub fn generate_gemma4(
     let Some(bundle) = m
         .state
         .as_mut()
-        .and_then(|s| (s.as_arch_model_mut() as &mut dyn Any).downcast_mut::<hipfire_loader::Gemma4Bundle>())
+        .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_loader::Gemma4Bundle>())
     else {
         emit_error_with_id(
             stdout,
@@ -3778,18 +3778,18 @@ pub fn generate_muse_glimmer(
         emit_error_with_id(stdout, id, "tokenizer not loaded");
         return;
     }
-    // Contract: ModelState::MuseGlimmer(bundle) — see cross-agent contract.
+    // Contract: MuseGlimmerBundle(bundle) — see cross-agent contract.
     // If the loader has not yet published this variant, this match will fail
     // to compile, which is intentional (loud Err rather than silent drop).
     let Some(bundle) = m
         .state
         .as_mut()
-        .and_then(|s| (s.as_arch_model_mut() as &mut dyn Any).downcast_mut::<hipfire_loader::MuseGlimmerBundle>())
+        .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_loader::MuseGlimmerBundle>())
     else {
         emit_error_with_id(
             stdout,
             id,
-            "muse_glimmer bundle missing on arch_id=14 generate (expected ModelState::MuseGlimmer)",
+            "muse_glimmer bundle missing on arch_id=14 generate (expected MuseGlimmerBundle)",
         );
         return;
     };
@@ -7048,7 +7048,7 @@ pub fn generate_qwen2(
     let state_ref = match m
         .state
         .as_mut()
-        .and_then(|s| (s.as_arch_model_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen2::Qwen2Bundle>())
+        .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen2::Qwen2Bundle>())
     {
         Some(b) => b,
         _ => {

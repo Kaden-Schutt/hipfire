@@ -86,7 +86,7 @@ pub fn stage_continuous_batch(
                         if requested > 1 && m.pp == 1 && m.ep.is_none() {
                             match crate::continuous_batch_route(m.arch_id) {
                                 Some(crate::ContinuousBatchRoute::Qwen35) => {
-                                if let Some(crate::ModelState::Qwen35(bundle)) = m.state.as_ref() {
+                                if let Some(bundle) = m.qwen35() {
                                     if !qwen_batch_weight_formats_supported(&bundle.weights) {
                                         eprintln!(
                                             "[daemon] continuous batch requested but weight formats unsupported (embd={:?} lm_head={:?}) — fallback to sequential",
@@ -145,7 +145,7 @@ pub fn stage_continuous_batch(
                                 }
                                 }
                                 Some(crate::ContinuousBatchRoute::Lfm2Moe) => {
-                                if let Some(crate::ModelState::Lfm2Moe(bundle)) = m.state.as_ref() {
+                                if let Some(bundle) = m.lfm2moe() {
                                     if !bundle.config.is_dense() {
                                         eprintln!(
                                             "[daemon] continuous batch requested but LFM MoE not supported (dense only) — fallback to sequential"

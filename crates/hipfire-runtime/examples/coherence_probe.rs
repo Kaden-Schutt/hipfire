@@ -70,7 +70,6 @@ struct Args {
     detect_timing: bool,
     no_strip_think: bool,
     self_check: bool,
-    emit_committed_jsonl: Option<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -98,7 +97,6 @@ fn parse_args() -> Result<Args, String> {
             }
             "--detect-timing" => args.detect_timing = true,
             "--no-strip-think" => args.no_strip_think = true,
-            "--emit-committed-jsonl" => args.emit_committed_jsonl = it.next(),
             "--self-check" => args.self_check = true,
             "-h" | "--help" => {
                 print_help();
@@ -129,7 +127,6 @@ fn print_help() {
           --stall-tokens N      enable think_stall detector with budget N\n  \
           --detect-timing       enable per-token step-time spike detector\n  \
           --no-strip-think      ask daemon to leave <think> bytes intact\n  \
-          --emit-committed-jsonl OUT  write committed token ids to JSONL\n  \
           --self-check          run synthetic+replay self-check (no GPU needed)\n"
     );
 }
@@ -451,18 +448,6 @@ fn drive_generate(
                 break;
             }
             _ => {} // ignore other event types
-        }
-    }
-
-    // Write committed token IDs to JSONL if requested.
-    if let Some(ref path) = args.emit_committed_jsonl {
-        if let Ok(mut f) = std::fs::File::create(path) {
-            use std::io::Write;
-            for (i, tok_id) in &committed_ids {
-                let _ = writeln!(f, r#"{{"i":{},"id":{}}}"#, i, tok_id);
-            }
-        } else {
-            eprintln!("[probe] warning: could not create {}", path);
         }
     }
 

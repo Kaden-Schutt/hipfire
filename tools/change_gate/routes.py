@@ -590,6 +590,19 @@ ROUTES: dict[str, Route] = {
         "discovery evidence, not product PM4/AQL route proof without REDLINE.md ladder).",
         models=("qwen3.5-4b.mq4",),
     ),
+    "golden.vl-dots-ocr": _R(
+        "golden.vl-dots-ocr",
+        "serve",
+        ("./scripts/vl-golden.sh",),
+        2.0,
+        "VL decoded-text byte-golden (dots-ocr.q8 + committed image). Guards the "
+        "loader/dispatch/model-storage seam: this is the check that caught nothing "
+        "during the saddle arch-contract refactor precisely because it was run at "
+        "every structural step -- ModelState -> Box<dyn ArchModel>, carrier rehoming, "
+        "and the LoadedModel descent each had to reproduce 8,286 identical bytes. "
+        "Runs the shipped binary the way a user does; NOT coherence_probe.",
+        models=("dots-ocr.q8.hfq",),
+    ),
     "redline.golden": _R(
         "redline.golden",
         "redline",
@@ -1198,8 +1211,17 @@ RULES: tuple[Rule, ...] = (
     ),
     Rule(
         surface="crates/hipfire-arch-dots-ocr/**",
-        route_ids=("unit.arch-dots-ocr", "serve.reset.qwen2"),
+        route_ids=("unit.arch-dots-ocr", "serve.reset.qwen2", "golden.vl-dots-ocr"),
         reason="dots-ocr still owns legacy qwen2_state field; reset path adjacency.",
+    ),
+    Rule(
+        surface="crates/hipfire-loader/**",
+        route_ids=("golden.vl-dots-ocr",),
+        reason=(
+            "Model storage and carrier dispatch. The VL golden is the cheapest check "
+            "that a loader change did not perturb decoded output; it caught the pp>1 "
+            "double-scratch leak class by staying byte-identical while VRAM drifted."
+        ),
     ),
     Rule(
         surface="crates/hipfire-arch-toy/**",

@@ -145,7 +145,7 @@ pub fn is_batch_request_eligible(
         if let Some(bundle) = m
             .state
             .as_ref()
-            .and_then(|s| (s.as_arch_model() as &dyn Any).downcast_ref::<hipfire_arch_qwen35::Qwen35Bundle>())
+            .and_then(|s| (s.as_ref() as &dyn Any).downcast_ref::<hipfire_arch_qwen35::Qwen35Bundle>())
         {
             if route != GenerationRoute::QwenAr {
                 return false;
@@ -159,7 +159,7 @@ pub fn is_batch_request_eligible(
         } else if let Some(bundle) = m
             .state
             .as_ref()
-            .and_then(|s| (s.as_arch_model() as &dyn Any).downcast_ref::<hipfire_arch_lfm2moe::Lfm2MoeBundle>())
+            .and_then(|s| (s.as_ref() as &dyn Any).downcast_ref::<hipfire_arch_lfm2moe::Lfm2MoeBundle>())
         {
             if route != GenerationRoute::LfmAr {
                 return false;
@@ -236,7 +236,7 @@ pub fn drive_qwen_continuous_batch(
         match model
             .state
             .as_mut()
-            .and_then(|s| (s.as_arch_model_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>())
+            .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>())
         {
             Some(b) => (
                 &b.config as *const qwen35::Qwen35Config,
@@ -1145,7 +1145,7 @@ pub fn drive_lfm_continuous_batch(
         match model
             .state
             .as_mut()
-            .and_then(|s| (s.as_arch_model_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_lfm2moe::Lfm2MoeBundle>())
+            .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_lfm2moe::Lfm2MoeBundle>())
         {
             Some(b) => (
                 &b.config as *const lfm2moe::config::Lfm2MoeConfig,

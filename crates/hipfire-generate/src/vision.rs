@@ -489,7 +489,7 @@ pub fn generate_vl(
         if let Some(b) = m
             .state
             .as_mut()
-            .and_then(|s| (s.as_arch_model_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>())
+            .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>())
         {
             let dn = &b.dn_state;
             for s in &dn.s_matrices {
@@ -508,7 +508,7 @@ pub fn generate_vl(
         if let Some(b) = m
             .state
             .as_mut()
-            .and_then(|s| (s.as_arch_model_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>())
+            .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>())
         {
             b.kv_cache.compact_offset = 0;
         }
@@ -516,7 +516,7 @@ pub fn generate_vl(
             if let Some(b) = m
                 .state
                 .as_mut()
-                .and_then(|s| (s.as_arch_model_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>())
+                .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>())
             {
                 ad.reset_with_cache(gpu, &mut b.kv_cache);
             } else {
@@ -541,7 +541,7 @@ pub fn generate_vl(
     let Some(b) = m
         .state
         .as_mut()
-        .and_then(|s| (s.as_arch_model_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>())
+        .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>())
     else {
         unreachable!()
     };
@@ -1384,7 +1384,7 @@ pub fn generate_vl_dots_ocr(
     let bundle_ptr: *mut hipfire_arch_dots_ocr::DotsOcrBundle = match m
         .state
         .as_mut()
-        .and_then(|s| (s.as_arch_model_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_dots_ocr::DotsOcrBundle>())
+        .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_dots_ocr::DotsOcrBundle>())
     {
         Some(b) => b as *mut _,
         None => unreachable!(),
@@ -1560,7 +1560,7 @@ pub fn generate_vl_dots_ocr(
     let bundle_ptr: *mut hipfire_arch_dots_ocr::DotsOcrBundle = match m
         .state
         .as_mut()
-        .and_then(|s| (s.as_arch_model_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_dots_ocr::DotsOcrBundle>())
+        .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_dots_ocr::DotsOcrBundle>())
     {
         Some(b) => b as *mut _,
         None => unreachable!(),
@@ -1674,12 +1674,8 @@ pub fn decode_vl_dots_ocr_ngram(
     prefill_s: f64,
 ) {
     use hipfire_arch_dots_ocr::DotsOcrBundle;
-    use hipfire_loader::ModelState;
-    // Move the live decoder state into a SpecTarget bundle; restored on return.
-    let mut bundle = match m.state.take().unwrap() {
-        ModelState::DotsOcr(b) => b,
-        _ => unreachable!("decode_vl_dots_ocr_ngram requires ModelState::DotsOcr"),
-    };
+        // Move the live decoder state into a SpecTarget bundle; restored on return.
+    let mut bundle = * (m.state.take().unwrap() as Box<dyn std::any::Any>).downcast::<DotsOcrBundle>().unwrap();
     let mut spec = m.speculator.take().unwrap();
     // `m.tokenizer` is a disjoint field → coexists with the takes above and the
     // restore below; the loop never touches `m`.
@@ -1697,7 +1693,7 @@ pub fn decode_vl_dots_ocr_ngram(
         prefill_tokens,
         prefill_s,
     );
-    m.state = Some(ModelState::DotsOcr(bundle));
+    m.state = Some(Box::new(bundle));
     m.speculator = Some(spec);
 }
 pub fn run_dots_ocr_ngram_loop(
@@ -1903,7 +1899,7 @@ pub fn generate_dots_ocr_text(
     let bundle_ptr: *mut hipfire_arch_dots_ocr::DotsOcrBundle = match m
         .state
         .as_mut()
-        .and_then(|s| (s.as_arch_model_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_dots_ocr::DotsOcrBundle>())
+        .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_dots_ocr::DotsOcrBundle>())
     {
         Some(b) => b as *mut _,
         None => unreachable!(),

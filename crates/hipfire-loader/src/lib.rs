@@ -10,7 +10,7 @@ pub use carriers::*;
 
 /// Speculative-decode build/glue (RAII slot guard now; `DflashSpeculator` +
 /// `build_speculator` at Stages 1-2). Lives here at the top of the DAG where
-/// both `LoadedModel`/`ModelState` and the arch crates are in scope.
+/// both `LoadedModel` and the arch crates are in scope.
 pub mod spec_build;
 
 use hipfire_arch_cohere2moe as cohere2moe;
@@ -37,10 +37,9 @@ use hipfire_runtime::ngram_mod::NgramModPool;
 use hipfire_runtime::spec::{SpecEmit, SpecEmitCtx, SpecTargetGuard, Speculator};
 use hipfire_runtime::triattn::{EvictionCtx, TriAttnCenters};
 use rdna_compute::Gpu;
+use std::any::Any;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-
-// ─── Object-safe Carrier trait ──────────────────────────────────────
 
 pub trait Carrier: Send + Sync {
     fn name(&self) -> &'static str;
@@ -95,7 +94,7 @@ pub trait Carrier: Send + Sync {
     /// only an override may `state.take()`.
     fn spec_target_guard<'m>(
         &self,
-        _state: &'m mut Option<ModelState>,
+        _state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
         _model_path: &str,
     ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
         Err(format!("{}: spec-decode target unsupported", self.name()))
@@ -455,31 +454,10 @@ impl AsstTurnCache {
     }
 }
 
-/// Arch-specific core state, dispatched in `LoadedModel.state`.
-/// `kv_cache` is a legacy shared field that stays on `LoadedModel` directly
-/// (vestigial `dn_state` was removed — the live DeltaNet state lives in the
-/// Qwen3.5 bundle inside `ModelState::Qwen35`).
-///
-/// The pp>1 path of `unload_model` still matches this exhaustively with NO
-/// wildcard; the single-GPU path tears down via `ArchModel::free_gpu`, whose
-/// per-variant impls are also exhaustive. Either way, adding a variant without
-/// teardown is a compile error, which is the whole point of
-/// folding self-contained arch state in here rather than leaving it as loose
-/// `Option<…>` fields that a reload can silently leak.
-pub enum ModelState {
-    Qwen2(hipfire_arch_qwen2::Qwen2Bundle),
-    Qwen35(hipfire_arch_qwen35::Qwen35Bundle),
-    Llama(hipfire_arch_llama::LlamaBundle),
-    Lfm2Moe(Lfm2MoeBundle),
-    Minimax(MiniMaxBundle),
-    Cohere2Moe(Cohere2MoeBundle),
-    Gemma4(Gemma4Bundle),
-    Gemma4Lowered(Gemma4LoweredBundle),
-    Deepseek4(hipfire_arch_deepseek4::Deepseek4Bundle),
-    Deepseek4Heterogeneous(Deepseek4HeterogeneousBundle),
-    MuseGlimmer(MuseGlimmerBundle),
-    DotsOcr(hipfire_arch_dots_ocr::DotsOcrBundle),
-}
+// `ModelState` was the closed 12-variant enum that stored `LoadedModel.state`.
+// It has been replaced by `Option<Box<dyn ArchModel>>` (see `LoadedModel.state`
+// below). All per-architecture teardown now lives in each bundle's
+// `ArchModel::free_gpu`; there is no central match any more.
 /// `ArchModel` for the one bundle the loader defines itself.
 ///
 /// Every other architecture implements the trait in its own crate. Glimmer's
@@ -614,96 +592,6 @@ impl hipfire_runtime::arch_model::ArchModel for Deepseek4HeterogeneousBundle {
     }
 }
 
-impl ModelState {
-    /// The architecture-agnostic view of whichever model is loaded.
-    ///
-    /// This is deliberately the ONLY place the enum is destructured for
-    /// infrastructure purposes. Everything downstream — load acknowledgement,
-    /// session reset, unload — asks the trait instead of matching eleven
-    /// variants, which is how the daemon stopped doing a seven-arm
-    /// architecture dispatch to compute three integers.
-    ///
-    /// `hipfire-generate` still matches variants directly, and should: it is
-    /// the architecture composition root and legitimately needs concrete
-    /// bundles to call per-arch forward passes.
-    pub fn as_arch_model(&self) -> &dyn hipfire_runtime::arch_model::ArchModel {
-        match self {
-            ModelState::Qwen2(b) => b,
-            ModelState::Qwen35(b) => b,
-            ModelState::Llama(b) => b,
-            ModelState::Lfm2Moe(b) => b,
-            ModelState::Minimax(b) => b,
-            ModelState::Cohere2Moe(b) => b,
-            ModelState::Gemma4(b) => b,
-            ModelState::Gemma4Lowered(b) => b,
-            ModelState::Deepseek4(b) => b,
-            ModelState::Deepseek4Heterogeneous(b) => b,
-            ModelState::MuseGlimmer(b) => b,
-            ModelState::DotsOcr(b) => b,
-        }
-    }
-
-    /// Mutable counterpart of [`ModelState::as_arch_model`].
-    pub fn as_arch_model_mut(&mut self) -> &mut dyn hipfire_runtime::arch_model::ArchModel {
-        match self {
-            ModelState::Qwen2(b) => b,
-            ModelState::Qwen35(b) => b,
-            ModelState::Llama(b) => b,
-            ModelState::Lfm2Moe(b) => b,
-            ModelState::Minimax(b) => b,
-            ModelState::Cohere2Moe(b) => b,
-            ModelState::Gemma4(b) => b,
-            ModelState::Gemma4Lowered(b) => b,
-            ModelState::Deepseek4(b) => b,
-            ModelState::Deepseek4Heterogeneous(b) => b,
-            ModelState::MuseGlimmer(b) => b,
-            ModelState::DotsOcr(b) => b,
-        }
-    }
-}
-
-/// `ArchModel` for the enum itself, so teardown can consume it as
-/// `Box<dyn ArchModel>` (`Box::new(state).free_gpu(gpu)` in `unload_model`).
-/// Scalar methods forward through the adapters above; `free_gpu` re-boxes the
-/// inner bundle and dispatches to the variant impl, which is where each free
-/// sequence actually lives. This match moves ownership — it is the third and
-/// last exhaustive destructure alongside the two adapters.
-impl hipfire_runtime::arch_model::ArchModel for ModelState {
-    fn dim(&self) -> usize {
-        self.as_arch_model().dim()
-    }
-    fn n_layers(&self) -> usize {
-        self.as_arch_model().n_layers()
-    }
-    fn vocab_size(&self) -> usize {
-        self.as_arch_model().vocab_size()
-    }
-    fn arch_key(&self) -> &'static str {
-        self.as_arch_model().arch_key()
-    }
-    fn kv_cache_mut(&mut self) -> Option<&mut hipfire_runtime::llama::KvCache> {
-        self.as_arch_model_mut().kv_cache_mut()
-    }
-    fn reset_session_state(&mut self, gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
-        self.as_arch_model_mut().reset_session_state(gpu)
-    }
-    fn free_gpu(self: Box<Self>, gpu: &mut rdna_compute::Gpu) {
-        match *self {
-            ModelState::Qwen2(b) => Box::new(b).free_gpu(gpu),
-            ModelState::Qwen35(b) => Box::new(b).free_gpu(gpu),
-            ModelState::Llama(b) => Box::new(b).free_gpu(gpu),
-            ModelState::Lfm2Moe(b) => Box::new(b).free_gpu(gpu),
-            ModelState::Minimax(b) => Box::new(b).free_gpu(gpu),
-            ModelState::Cohere2Moe(b) => Box::new(b).free_gpu(gpu),
-            ModelState::Gemma4(b) => Box::new(b).free_gpu(gpu),
-            ModelState::Gemma4Lowered(b) => Box::new(b).free_gpu(gpu),
-            ModelState::Deepseek4(b) => Box::new(b).free_gpu(gpu),
-            ModelState::Deepseek4Heterogeneous(b) => Box::new(b).free_gpu(gpu),
-            ModelState::MuseGlimmer(b) => Box::new(b).free_gpu(gpu),
-            ModelState::DotsOcr(b) => Box::new(b).free_gpu(gpu),
-        }
-    }
-}
 
 /// Self-owned gfx1100+dense / gfx1151+routed DeepSeek V4 state. The model
 /// owns both HIP devices and tears them down in its `Drop` implementation;
@@ -983,19 +871,19 @@ pub struct LoadedModel {
     pub pp_gpus: Option<Gpus>,
     pub pp_dn_la_to_device: Option<Vec<u8>>,
     pub ep: Option<EpState>,
-    // Shared arch state — every arch lives here, including dots-ocr (arch_id=8)
-    // as ModelState::DotsOcr(DotsOcrBundle). The separate `dots_ocr_bundle`
-    // field was removed; all consumers go through `dots_ocr()`/`dots_ocr_mut()`
-    // or `ModelState::DotsOcr` directly.
-    pub state: Option<ModelState>,
+    // Shared arch state — every arch lives here as `Box<dyn ArchModel>`.
+    // Previously `ModelState::DotsOcr` / `ModelState::Qwen35` etc; now a
+    // trait object so adding an architecture does not edit a closed enum.
+    // All consumers go through the typed accessors below (`dots_ocr()`,
+    // `qwen35()`, etc.) which downcast via `Any`.
+    pub state: Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
     pub qwen35_decode_batch: Option<hipfire_arch_qwen35::qwen35::Qwen35DecodeBatchState>,
     pub lfm2_decode_batch: Option<hipfire_arch_lfm2moe::batch::Lfm2DecodeBatchState>,
     pub kv_cache: Option<llama::KvCache>,
     // Reusable Qwen2 recurrent state (used by Qwen2 non-core falcon only).
-    // dots-ocr's state lives inside `ModelState::DotsOcr` above.
+    // dots-ocr's state lives inside the boxed `DotsOcrBundle` above.
     pub qwen2_state: Option<qwen2::Qwen2State>,
-    // in `state` as ModelState::Deepseek4(Deepseek4Bundle) so unload teardown is
-    // compiler-enforced and the bundle can be borrowed as a `SpecTarget`.
+    // DeepSeek V4 (arch_id=9) single-GPU scratch lives outside the bundle.
     pub deepseek4_pbs: Option<hipfire_arch_deepseek4::forward::PrefillBatchScratch>,
     // DeepSeek V4 (arch_id=9) EP serve eos. The EP path stores model state in
     // `ep` (EpArch::Ds4), NOT in `state`, so there is no Deepseek4Bundle for EP
@@ -1010,8 +898,8 @@ pub struct LoadedModel {
     // (mirrors `deepseek4_eos_tok` / `minimax_eos_tok`).
     pub qwen35_eos_tok: u32,
     // LFM2.5-8B-A1B (arch_id=11) and MiniMax-M2 (arch_id=10) live in
-    // `state` as ModelState::{Lfm2Moe,Minimax} so unload teardown is
-    // compiler-enforced (see ModelState).
+    // `state` as `Box<dyn ArchModel>` so unload teardown is
+    // via `ArchModel::free_gpu` (no central match any more).
     // MTP config
     pub mtp_mode: String,
     pub mtp_k: usize,
@@ -1128,191 +1016,167 @@ impl LoadedModel {
     /// have to rewrite ~143 call sites in `hipfire-generate` at the same time
     /// as changing the type — one unreviewable change instead of two safe ones.
     pub fn qwen35(&self) -> Option<&hipfire_arch_qwen35::Qwen35Bundle> {
-        match &self.state {
-            Some(ModelState::Qwen35(b)) => Some(b),
-            _ => None,
-        }
+        self.state
+            .as_deref()
+            .and_then(|s| (s as &dyn Any).downcast_ref::<hipfire_arch_qwen35::Qwen35Bundle>())
     }
 
     pub fn qwen35_mut(&mut self) -> Option<&mut hipfire_arch_qwen35::Qwen35Bundle> {
-        match &mut self.state {
-            Some(ModelState::Qwen35(b)) => Some(b),
-            _ => None,
-        }
+        self.state
+            .as_deref_mut()
+            .and_then(|s| (s as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>())
     }
 
     pub fn llama(&self) -> Option<&hipfire_arch_llama::LlamaBundle> {
-        match &self.state {
-            Some(ModelState::Llama(b)) => Some(b),
-            _ => None,
-        }
+        self.state
+            .as_deref()
+            .and_then(|s| (s as &dyn Any).downcast_ref::<hipfire_arch_llama::LlamaBundle>())
     }
 
     pub fn llama_mut(&mut self) -> Option<&mut hipfire_arch_llama::LlamaBundle> {
-        match &mut self.state {
-            Some(ModelState::Llama(b)) => Some(b),
-            _ => None,
-        }
+        self.state
+            .as_deref_mut()
+            .and_then(|s| (s as &mut dyn Any).downcast_mut::<hipfire_arch_llama::LlamaBundle>())
     }
 
     pub fn gemma4(&self) -> Option<&Gemma4Bundle> {
-        match &self.state {
-            Some(ModelState::Gemma4(b)) => Some(b),
-            _ => None,
-        }
+        self.state
+            .as_deref()
+            .and_then(|s| (s as &dyn Any).downcast_ref::<Gemma4Bundle>())
     }
 
     pub fn gemma4_mut(&mut self) -> Option<&mut Gemma4Bundle> {
-        match &mut self.state {
-            Some(ModelState::Gemma4(b)) => Some(b),
-            _ => None,
-        }
+        self.state
+            .as_deref_mut()
+            .and_then(|s| (s as &mut dyn Any).downcast_mut::<Gemma4Bundle>())
     }
 
     pub fn gemma4_lowered_mut(&mut self) -> Option<&mut Gemma4LoweredBundle> {
-        match &mut self.state {
-            Some(ModelState::Gemma4Lowered(b)) => Some(b),
-            _ => None,
-        }
+        self.state
+            .as_deref_mut()
+            .and_then(|s| (s as &mut dyn Any).downcast_mut::<Gemma4LoweredBundle>())
     }
 
     pub fn muse_glimmer(&self) -> Option<&MuseGlimmerBundle> {
-        match &self.state {
-            Some(ModelState::MuseGlimmer(b)) => Some(b),
-            _ => None,
-        }
+        self.state
+            .as_deref()
+            .and_then(|s| (s as &dyn Any).downcast_ref::<MuseGlimmerBundle>())
     }
 
     pub fn muse_glimmer_mut(&mut self) -> Option<&mut MuseGlimmerBundle> {
-        match &mut self.state {
-            Some(ModelState::MuseGlimmer(b)) => Some(b),
-            _ => None,
-        }
+        self.state
+            .as_deref_mut()
+            .and_then(|s| (s as &mut dyn Any).downcast_mut::<MuseGlimmerBundle>())
     }
 
     pub fn deepseek4_heterogeneous_mut(&mut self) -> Option<&mut Deepseek4HeterogeneousBundle> {
-        match &mut self.state {
-            Some(ModelState::Deepseek4Heterogeneous(b)) => Some(b),
-            _ => None,
-        }
+        self.state
+            .as_deref_mut()
+            .and_then(|s| (s as &mut dyn Any).downcast_mut::<Deepseek4HeterogeneousBundle>())
     }
 
     pub fn lfm2moe(&self) -> Option<&Lfm2MoeBundle> {
-        match &self.state {
-            Some(ModelState::Lfm2Moe(b)) => Some(b),
-            _ => None,
-        }
+        self.state
+            .as_deref()
+            .and_then(|s| (s as &dyn Any).downcast_ref::<Lfm2MoeBundle>())
     }
 
     pub fn lfm2moe_mut(&mut self) -> Option<&mut Lfm2MoeBundle> {
-        match &mut self.state {
-            Some(ModelState::Lfm2Moe(b)) => Some(b),
-            _ => None,
-        }
+        self.state
+            .as_deref_mut()
+            .and_then(|s| (s as &mut dyn Any).downcast_mut::<Lfm2MoeBundle>())
     }
 
     /// MiniMax-M2 bundle if this model is arch_id=10, else None.
     pub fn minimax(&self) -> Option<&MiniMaxBundle> {
-        match &self.state {
-            Some(ModelState::Minimax(b)) => Some(b),
-            _ => None,
-        }
+        self.state
+            .as_deref()
+            .and_then(|s| (s as &dyn Any).downcast_ref::<MiniMaxBundle>())
     }
 
     pub fn minimax_mut(&mut self) -> Option<&mut MiniMaxBundle> {
-        match &mut self.state {
-            Some(ModelState::Minimax(b)) => Some(b),
-            _ => None,
-        }
+        self.state
+            .as_deref_mut()
+            .and_then(|s| (s as &mut dyn Any).downcast_mut::<MiniMaxBundle>())
     }
 
     /// Qwen2 bundle if this model is arch_id=7 (plain qwen2 via `Qwen2Carrier`),
     /// else None. The live `Qwen2State` is at `.state`. NOTE: this is NOT the
     /// `qwen2_state` direct field — that is None for plain qwen2 and is only
-    /// populated by dots-ocr (arch_id=8). Reset/checkpoint sites must rewind
+    // populated by dots-ocr (arch_id=8). Reset/checkpoint sites must rewind
     /// BOTH or the reset silently no-ops (see scripts/qwen2-reset-gate.sh).
     pub fn qwen2_mut(&mut self) -> Option<&mut hipfire_arch_qwen2::Qwen2Bundle> {
-        match &mut self.state {
-            Some(ModelState::Qwen2(b)) => Some(b),
-            _ => None,
-        }
+        self.state
+            .as_deref_mut()
+            .and_then(|s| (s as &mut dyn Any).downcast_mut::<hipfire_arch_qwen2::Qwen2Bundle>())
     }
 
     /// Cohere2-MoE bundle if this model is arch_id=12, else None.
     pub fn cohere2moe(&self) -> Option<&Cohere2MoeBundle> {
-        match &self.state {
-            Some(ModelState::Cohere2Moe(b)) => Some(b),
-            _ => None,
-        }
+        self.state
+            .as_deref()
+            .and_then(|s| (s as &dyn Any).downcast_ref::<Cohere2MoeBundle>())
     }
 
     pub fn cohere2moe_mut(&mut self) -> Option<&mut Cohere2MoeBundle> {
-        match &mut self.state {
-            Some(ModelState::Cohere2Moe(b)) => Some(b),
-            _ => None,
-        }
+        self.state
+            .as_deref_mut()
+            .and_then(|s| (s as &mut dyn Any).downcast_mut::<Cohere2MoeBundle>())
     }
 
     /// DeepSeek V4 bundle if this model is a single-GPU arch_id=9, else None.
     /// (EP/pp ds4 keeps its state in `ep` (EpArch::Ds4), so this is None there.)
     pub fn deepseek4(&self) -> Option<&hipfire_arch_deepseek4::Deepseek4Bundle> {
-        match &self.state {
-            Some(ModelState::Deepseek4(b)) => Some(b),
-            _ => None,
-        }
+        self.state
+            .as_deref()
+            .and_then(|s| (s as &dyn Any).downcast_ref::<hipfire_arch_deepseek4::Deepseek4Bundle>())
     }
 
     pub fn deepseek4_mut(&mut self) -> Option<&mut hipfire_arch_deepseek4::Deepseek4Bundle> {
-        match &mut self.state {
-            Some(ModelState::Deepseek4(b)) => Some(b),
-            _ => None,
-        }
+        self.state
+            .as_deref_mut()
+            .and_then(|s| (s as &mut dyn Any).downcast_mut::<hipfire_arch_deepseek4::Deepseek4Bundle>())
     }
 
     /// Qwen35-VL vision config if this model is arch_id=5|6 and was loaded
     /// with a vision tower (`model.visual.patch_embed.proj.weight` present),
     /// else None. Text-only Qwen35 returns None.
     pub fn vision_config(&self) -> Option<&qwen35_vl::VisionConfig> {
-        match &self.state {
-            Some(ModelState::Qwen35(b)) => b.vision_config.as_ref(),
-            _ => None,
-        }
+        self.qwen35().and_then(|b| b.vision_config.as_ref())
     }
 
     pub fn vision_weights(&self) -> Option<&qwen35_vl::VisionWeights> {
-        match &self.state {
-            Some(ModelState::Qwen35(b)) => b.vision_weights.as_ref(),
-            _ => None,
-        }
+        self.qwen35().and_then(|b| b.vision_weights.as_ref())
     }
 
     pub fn vision_config_mut(&mut self) -> Option<&mut qwen35_vl::VisionConfig> {
-        match &mut self.state {
-            Some(ModelState::Qwen35(b)) => b.vision_config.as_mut(),
-            _ => None,
-        }
+        self.qwen35_mut().and_then(|b| b.vision_config.as_mut())
     }
 
     pub fn vision_weights_mut(&mut self) -> Option<&mut qwen35_vl::VisionWeights> {
-        match &mut self.state {
-            Some(ModelState::Qwen35(b)) => b.vision_weights.as_mut(),
-            _ => None,
-        }
+        self.qwen35_mut().and_then(|b| b.vision_weights.as_mut())
     }
 
     /// DotsOcr bundle if this model is arch_id=8, else None.
     pub fn dots_ocr(&self) -> Option<&hipfire_arch_dots_ocr::DotsOcrBundle> {
-        match &self.state {
-            Some(ModelState::DotsOcr(b)) => Some(b),
-            _ => None,
-        }
+        self.state
+            .as_deref()
+            .and_then(|s| (s as &dyn Any).downcast_ref::<hipfire_arch_dots_ocr::DotsOcrBundle>())
     }
 
     pub fn dots_ocr_mut(&mut self) -> Option<&mut hipfire_arch_dots_ocr::DotsOcrBundle> {
-        match &mut self.state {
-            Some(ModelState::DotsOcr(b)) => Some(b),
-            _ => None,
-        }
+        self.state
+            .as_deref_mut()
+            .and_then(|s| (s as &mut dyn Any).downcast_mut::<hipfire_arch_dots_ocr::DotsOcrBundle>())
+    }
+    /// Arch-agnostic view of the loaded model, when any is loaded.
+    pub fn as_arch_model(&self) -> Option<&dyn hipfire_runtime::arch_model::ArchModel> {
+        self.state.as_deref().map(|b| b as &dyn hipfire_runtime::arch_model::ArchModel)
+    }
+    pub fn as_arch_model_mut(&mut self) -> Option<&mut dyn hipfire_runtime::arch_model::ArchModel> {
+        self.state
+            .as_deref_mut()
+            .map(|b| b as &mut dyn hipfire_runtime::arch_model::ArchModel)
     }
     /// pp>1 skeleton — sets the load-bearing multi-GPU fields together so
     /// they cannot be set piecemeal (`pp_gpus`/`pp_dn_la_to_device` are
@@ -1963,12 +1827,12 @@ fn finish_qwen35_load(
     };
 
     // Move adaptive controller out of the bundle before parking the rest in
-    // ModelState. LoadedModel.kv_adaptive is the runtime home for downshift hooks.
+    // `Box<dyn ArchModel>`. LoadedModel.kv_adaptive is the runtime home for downshift hooks.
     let mut bundle = bundle;
     bundle.vision_config = vision_config;
     bundle.vision_weights = vision_weights;
     let kv_adaptive = bundle.kv_adaptive.take();
-    let state = Some(ModelState::Qwen35(bundle));
+    let state: Option<Box<dyn hipfire_runtime::arch_model::ArchModel>> = Some(Box::new(bundle));
     let mut model = LoadedModel {
         state,
         eviction,
@@ -2359,7 +2223,7 @@ fn load_cohere2moe(
     };
     let chat_template = resolve_chat_template(&hfq, path);
     Ok(LoadedModel {
-        state: Some(ModelState::Cohere2Moe(Cohere2MoeBundle {
+        state: Some(Box::new(Cohere2MoeBundle {
             config,
             weights,
             state,
@@ -3338,19 +3202,11 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
             // leaking if a test ever stages it.
             batch_state.free_gpu(gpu);
         }
-        match m.state.take() {
-            Some(ModelState::Qwen35(mut b)) => {
-                // The set now lives INSIDE the bundle (`b.pp_scratch_set`),
-                // so it cannot be forgotten independently of the bundle.
-                // Free it here via `free_gpu_multi(&mut Gpus)` — the ONLY
-                // site that frees the set. `ArchModel::free_gpu` (single
-                // `&mut Gpu` path) intentionally does NOT free it (see
-                // `crates/hipfire-arch-qwen35/src/arch_model.rs`) — that
-                // path is unreachable for pp>1 (`if m.pp > 1 { return }`
-                // guards `Box::new(state).free_gpu(gpu)` below), so the
-                // set is freed exactly once here. Double-free impossible
-                // (this arm consumes `b`); leak impossible (bundle owns
-                // it and teardown must match this arm).
+        if let Some(state) = m.state.take() {
+            // Only Qwen35 supports pp>1. Try to downcast; if it is Qwen35, free its
+            // multi-GPU resources. Otherwise just drop the box (original match did
+            // the same — non-qwen35 pp>1 is unreachable and had an empty arm).
+            if let Ok(mut b) = (state as Box<dyn Any>).downcast::<hipfire_arch_qwen35::Qwen35Bundle>() {
                 if let Some(scratch_set) = b.pp_scratch_set.take() {
                     scratch_set.free_gpu_multi(&mut gpus);
                 }
@@ -3358,29 +3214,8 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
                 let la_to_device = m.pp_dn_la_to_device.expect("pp>1 must carry la_to_device");
                 b.dn_state.free_gpu_multi(&mut gpus, &la_to_device);
                 b.weights.free_gpu_multi(&mut gpus);
-                // The pp>1 load allocates TWO scratches: the per-device
-                // `Qwen35ScratchSet` freed above as `b.pp_scratch_set`, and the
-                // bundle's own single-device `Qwen35Scratch`
-                // (`Qwen35Scratch::new_with_kv_max`, carriers.rs pp tail).
                 b.scratch.free_gpu(&mut gpus.devices[0]);
             }
-            // Only Qwen35 supports pp>1 today, so the other carriers can never
-            // reach this arm with multi-GPU state to free — dropping is correct.
-            // Listing them explicitly (rather than `_`) makes that a
-            // compiler-enforced invariant: adding a pp>1-capable carrier without
-            // a teardown arm here is a build error, not a silent VRAM leak.
-            Some(ModelState::Qwen2(_))
-            | Some(ModelState::Llama(_))
-            | Some(ModelState::Lfm2Moe(_))
-            | Some(ModelState::Minimax(_))
-            | Some(ModelState::Cohere2Moe(_))
-            | Some(ModelState::Gemma4(_))
-            | Some(ModelState::Gemma4Lowered(_))
-            | Some(ModelState::Deepseek4(_))
-            | Some(ModelState::Deepseek4Heterogeneous(_))
-            | Some(ModelState::MuseGlimmer(_))
-            | Some(ModelState::DotsOcr(_))
-            | None => {}
         }
         for g in gpus.devices.iter_mut() {
             g.invalidate_weight_caches();
@@ -3426,11 +3261,9 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
     if let Some(batch_state) = m.lfm2_decode_batch.take() {
         batch_state.free_gpu(gpu);
     }
-    // Free arch-specific GPU state from the carrier bundle. Each variant's
-    // free sequence lives in its `ArchModel::free_gpu` impl (verified arm-by-arm
-    // against the match this call replaced); the enum impl only re-boxes.
+    // Free arch-specific GPU state from the carrier bundle via `ArchModel::free_gpu`.
     if let Some(state) = m.state {
-        Box::new(state).free_gpu(gpu);
+        state.free_gpu(gpu);
     }
     // Non-core arch weights
     if let Some(s) = m.qwen2_state {
@@ -3444,8 +3277,6 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
     // Qwen35 vision tower is now inside the bundle and freed via
     // `ArchModel::free_gpu` above. Nothing to do here — the old
     // `m.vision_weights` field is gone.
-    // DotsOcr bundle (arch_id=8) is now `ModelState::DotsOcr` and freed via
-    // `Box::new(state).free_gpu(gpu)` above — no separate field to drain.
     gpu.invalidate_weight_caches();
     gpu.invalidate_graph_state();
     gpu.drain_pool();

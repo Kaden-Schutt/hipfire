@@ -7,9 +7,9 @@
 use crate::spec_build::Qwen35SlotGuard;
 use hipfire_runtime::llama::KvCacheExt;
 use crate::Carrier;
+use std::any::Any;
 use crate::{
     finish_qwen35_load, resolve_chat_template, resolve_chat_template_overrides, LoadedModel,
-    ModelState,
 };
 use hipfire_arch_minimax::{config_from_safetensors, load_weights_from_safetensors, MiniMaxState};
 use hipfire_runtime::kv_backend::KvBackend;
@@ -110,11 +110,11 @@ impl Carrier for Qwen2Carrier {
     }
     fn spec_target_guard<'m>(
         &self,
-        state: &'m mut Option<ModelState>,
+        state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
         _model_path: &str,
     ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
-        match state.as_mut() {
-            Some(ModelState::Qwen2(bundle)) => Ok(Box::new(InPlaceGuard { bundle })),
+        match state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen2::Qwen2Bundle>()) {
+            Some(bundle) => Ok(Box::new(InPlaceGuard { bundle })),
             _ => Err("qwen2: spec target state mismatch".into()),
         }
     }
@@ -153,9 +153,7 @@ impl Carrier for Qwen2Carrier {
         _n: usize,
         _prefill_err: &mut Option<String>,
     ) -> Option<bool> {
-        let crate::ModelState::Qwen2(b) = m.state.as_mut().unwrap() else {
-            unreachable!()
-        };
+        let b = m.qwen2_mut().unwrap();
         let config = &b.config;
         let weights = &b.weights;
         let state = &mut b.state;
@@ -186,7 +184,7 @@ impl Carrier for Qwen2Carrier {
             ctx.spec,
         );
         Ok(LoadedModel {
-            state: Some(ModelState::Qwen2(bundle)),
+            state: Some(Box::new(bundle)),
             speculator,
             ..LoadedModel::skeleton(
                 meta.arch_id,
@@ -333,7 +331,7 @@ fn load_qwen35_pp(
         vision_weights: None,
     };
     Ok(LoadedModel {
-        state: Some(ModelState::Qwen35(bundle)),
+        state: Some(Box::new(bundle)),
         ..LoadedModel::skeleton_pp(
             meta.arch_id,
             meta.tokenizer,
@@ -355,7 +353,7 @@ impl Carrier for Qwen35Carrier {
     }
     fn spec_target_guard<'m>(
         &self,
-        state: &'m mut Option<ModelState>,
+        state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
         model_path: &str,
     ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
         // qwen35 moves its bundle out of `state` into the RAII Qwen35SlotGuard
@@ -399,9 +397,7 @@ impl Carrier for Qwen35Carrier {
         _n: usize,
         _prefill_err: &mut Option<String>,
     ) -> Option<bool> {
-        let crate::ModelState::Qwen35(b) = m.state.as_mut().unwrap() else {
-            unreachable!()
-        };
+        let b = m.qwen35_mut().unwrap();
         let config = &b.config;
         let weights = &b.weights;
         let scratch = &b.scratch;
@@ -420,9 +416,7 @@ impl Carrier for Qwen35Carrier {
         gpu: &mut rdna_compute::Gpu,
         synthetic: &[u32],
     ) -> Option<Option<String>> {
-        let crate::ModelState::Qwen35(b) = m.state.as_mut().unwrap() else {
-            unreachable!()
-        };
+        let b = m.qwen35_mut().unwrap();
         Some(
             hipfire_arch_qwen35::qwen35::forward_prefill_batch(
                 gpu,
@@ -450,9 +444,7 @@ impl Carrier for Qwen35Carrier {
         iterations: usize,
         _decode_err: &mut Option<String>,
     ) -> Option<bool> {
-        let crate::ModelState::Qwen35(b) = m.state.as_mut().unwrap() else {
-            unreachable!()
-        };
+        let b = m.qwen35_mut().unwrap();
         let mut ok = true;
         for i in 0..iterations {
             let token = 101 + (i as u32 % 1000);
@@ -671,7 +663,7 @@ impl Carrier for Qwen35Carrier {
                     vision_weights: None,
                 };
                 Ok(LoadedModel {
-                    state: Some(ModelState::Qwen35(bundle)),
+                    state: Some(Box::new(bundle)),
                     ..LoadedModel::skeleton(
                         meta.arch_id,
                         meta.tokenizer,
@@ -695,11 +687,11 @@ impl Carrier for LlamaCarrier {
     }
     fn spec_target_guard<'m>(
         &self,
-        state: &'m mut Option<ModelState>,
+        state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
         _model_path: &str,
     ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
-        match state.as_mut() {
-            Some(ModelState::Llama(bundle)) => Ok(Box::new(InPlaceGuard { bundle })),
+        match state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_llama::LlamaBundle>()) {
+            Some(bundle) => Ok(Box::new(InPlaceGuard { bundle })),
             _ => Err("llama: spec target state mismatch".into()),
         }
     }
@@ -738,9 +730,7 @@ impl Carrier for LlamaCarrier {
         _n: usize,
         _prefill_err: &mut Option<String>,
     ) -> Option<bool> {
-        let crate::ModelState::Llama(b) = m.state.as_mut().unwrap() else {
-            unreachable!()
-        };
+        let b = m.llama_mut().unwrap();
         let config = &b.config;
         let weights = &b.weights;
         let scratch = &b.scratch;
@@ -983,7 +973,7 @@ impl Carrier for LlamaCarrier {
             )
         };
         Ok(LoadedModel {
-            state: Some(ModelState::Llama(bundle)),
+            state: Some(Box::new(bundle)),
             speculator,
             ..LoadedModel::skeleton(
                 meta.arch_id,
@@ -1072,7 +1062,7 @@ impl Carrier for DotsOcrCarrier {
             ctx.spec,
         );
         Ok(LoadedModel {
-            state: Some(crate::ModelState::DotsOcr(bundle)),
+            state: Some(Box::new(bundle)),
             speculator,
             ..LoadedModel::skeleton(
                 meta.arch_id,
@@ -1095,15 +1085,15 @@ impl Carrier for Deepseek4Carrier {
     }
     fn spec_target_guard<'m>(
         &self,
-        state: &'m mut Option<ModelState>,
+        state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
         _model_path: &str,
     ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
-        match state.as_mut() {
-            Some(ModelState::Deepseek4(bundle)) => Ok(Box::new(InPlaceGuard { bundle })),
-            Some(ModelState::Deepseek4Heterogeneous(_)) => {
-                Err("deepseek4 heterogeneous route is direct-AR only until G6".into())
-            }
-            _ => Err("deepseek4: spec target state mismatch".into()),
+        if state.as_ref().is_some_and(|s| (s.as_ref() as &dyn Any).is::<crate::Deepseek4HeterogeneousBundle>()) {
+            Err("deepseek4 heterogeneous route is direct-AR only until G6".into())
+        } else if let Some(b) = state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_deepseek4::Deepseek4Bundle>()) {
+            Ok(Box::new(InPlaceGuard { bundle: b }))
+        } else {
+            Err("deepseek4: spec target state mismatch".into())
         }
     }
     fn make_spec_emitter<'a>(
@@ -1144,9 +1134,7 @@ impl Carrier for Deepseek4Carrier {
             .deepseek4_pbs
             .as_mut()
             .expect("deepseek4_pbs missing on arch_id=9 bench_prefill");
-        let Some(crate::ModelState::Deepseek4(b)) = m.state.as_mut() else {
-            unreachable!("arch_id=9 requires deepseek4 bundle")
-        };
+        let b = m.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_deepseek4::Deepseek4Bundle>()).unwrap();
         let config = &b.config;
         let weights = &b.weights;
         let state = &mut b.state;
@@ -1184,7 +1172,7 @@ impl Carrier for Deepseek4Carrier {
             let eos_tok = resolve_eos_tok(&meta.tokenizer, &["<｜end▁of▁sentence｜>"]);
             let advertised_context = model.config.max_position_embeddings;
             return Ok(LoadedModel {
-                state: Some(crate::ModelState::Deepseek4Heterogeneous(
+                state: Some(Box::new(
                     crate::Deepseek4HeterogeneousBundle { model, eos_tok },
                 )),
                 ..LoadedModel::skeleton(
@@ -1271,7 +1259,7 @@ impl Carrier for Deepseek4Carrier {
             "  deepseek4 KV cache: automatic VMM growth to advertised context {advertised_context}"
         );
         Ok(LoadedModel {
-            state: Some(crate::ModelState::Deepseek4(deepseek4::Deepseek4Bundle {
+            state: Some(Box::new(deepseek4::Deepseek4Bundle {
                 config,
                 weights,
                 state,
@@ -1300,11 +1288,11 @@ impl Carrier for MinimaxCarrier {
     }
     fn spec_target_guard<'m>(
         &self,
-        state: &'m mut Option<ModelState>,
+        state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
         _model_path: &str,
     ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
-        match state.as_mut() {
-            Some(ModelState::Minimax(bundle)) => Ok(Box::new(InPlaceGuard { bundle })),
+        match state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<crate::MiniMaxBundle>()) {
+            Some(bundle) => Ok(Box::new(InPlaceGuard { bundle })),
             _ => Err("minimax: spec target state mismatch".into()),
         }
     }
@@ -1377,7 +1365,7 @@ impl Carrier for MinimaxCarrier {
             ctx.spec,
         );
         Ok(LoadedModel {
-            state: Some(ModelState::Minimax(bundle)),
+            state: Some(Box::new(bundle)),
             speculator,
             ..LoadedModel::skeleton(
                 meta.arch_id,
@@ -1400,11 +1388,11 @@ impl Carrier for Lfm2MoeCarrier {
     }
     fn spec_target_guard<'m>(
         &self,
-        state: &'m mut Option<ModelState>,
+        state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
         _model_path: &str,
     ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
-        match state.as_mut() {
-            Some(ModelState::Lfm2Moe(bundle)) => Ok(Box::new(InPlaceGuard { bundle })),
+        match state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<crate::Lfm2MoeBundle>()) {
+            Some(bundle) => Ok(Box::new(InPlaceGuard { bundle })),
             _ => Err("lfm2moe: spec target state mismatch".into()),
         }
     }
@@ -1475,7 +1463,7 @@ impl Carrier for Lfm2MoeCarrier {
             ctx.spec,
         );
         Ok(LoadedModel {
-            state: Some(ModelState::Lfm2Moe(bundle)),
+            state: Some(Box::new(bundle)),
             speculator,
             ..LoadedModel::skeleton(
                 meta.arch_id,
@@ -1503,11 +1491,11 @@ impl Carrier for Cohere2MoeCarrier {
     }
     fn spec_target_guard<'m>(
         &self,
-        state: &'m mut Option<ModelState>,
+        state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
         _model_path: &str,
     ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
-        match state.as_mut() {
-            Some(ModelState::Cohere2Moe(bundle)) => Ok(Box::new(InPlaceGuard { bundle })),
+        match state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<crate::Cohere2MoeBundle>()) {
+            Some(bundle) => Ok(Box::new(InPlaceGuard { bundle })),
             _ => Err("cohere2moe: spec target state mismatch".into()),
         }
     }
@@ -1595,7 +1583,7 @@ impl Carrier for Cohere2MoeCarrier {
             ctx.spec,
         );
         Ok(LoadedModel {
-            state: Some(ModelState::Cohere2Moe(bundle)),
+            state: Some(Box::new(bundle)),
             speculator,
             ..LoadedModel::skeleton(
                 meta.arch_id,
@@ -1637,7 +1625,7 @@ impl Carrier for Gemma4Carrier {
     }
     fn spec_target_guard<'m>(
         &self,
-        _state: &'m mut Option<ModelState>,
+        _state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
         _model_path: &str,
     ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
         Err("gemma4: spec decode not yet wired (AR-only)".into())
@@ -1679,9 +1667,7 @@ impl Carrier for Gemma4Carrier {
         _n: usize,
         _prefill_err: &mut Option<String>,
     ) -> Option<bool> {
-        let Some(crate::ModelState::Gemma4(bundle)) = m.state.as_mut() else {
-            unreachable!("arch_id=13 requires gemma4 bundle")
-        };
+        let bundle = m.gemma4_mut().unwrap();
         let config = &bundle.config;
         let weights = &bundle.weights;
         let state = &mut bundle.state;
@@ -1719,7 +1705,7 @@ impl Carrier for Gemma4Carrier {
                     ctx.spec,
                 );
                 Ok(LoadedModel {
-                    state: Some(ModelState::Gemma4Lowered(crate::Gemma4LoweredBundle {
+                    state: Some(Box::new(crate::Gemma4LoweredBundle {
                         config: l.config,
                         weights: l.weights,
                         scratch: l.scratch,
@@ -1780,7 +1766,7 @@ impl Carrier for Gemma4Carrier {
                     ctx.spec,
                 );
                 Ok(LoadedModel {
-                    state: Some(ModelState::Gemma4(crate::Gemma4Bundle {
+                    state: Some(Box::new(crate::Gemma4Bundle {
                         config: e.config,
                         weights: e.weights,
                         state: e.state,
@@ -1883,7 +1869,7 @@ impl Carrier for MuseGlimmerCarrier {
     }
     fn spec_target_guard<'m>(
         &self,
-        _state: &'m mut Option<ModelState>,
+        _state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
         _model_path: &str,
     ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
         Err("muse_glimmer: spec decode not yet wired (AR-only)".into())
@@ -1920,9 +1906,7 @@ impl Carrier for MuseGlimmerCarrier {
         _n: usize,
         prefill_err: &mut Option<String>,
     ) -> Option<bool> {
-        let Some(crate::ModelState::MuseGlimmer(bundle)) = m.state.as_mut() else {
-            unreachable!("arch_id=14 requires muse_glimmer bundle")
-        };
+        let bundle = m.muse_glimmer_mut().unwrap();
         Some(if bundle.device_hidden_capture_enabled() {
             match hipfire_arch_muse_glimmer::forward::prefill_with_device_capture(
                 &bundle.config,
@@ -1964,9 +1948,7 @@ impl Carrier for MuseGlimmerCarrier {
         gpu: &mut rdna_compute::Gpu,
         synthetic: &[u32],
     ) -> Option<Option<String>> {
-        let Some(crate::ModelState::MuseGlimmer(bundle)) = m.state.as_mut() else {
-            unreachable!("arch_id=14 requires muse_glimmer bundle")
-        };
+        let bundle = m.muse_glimmer_mut().unwrap();
         bundle.reset_session_state();
         Some(if bundle.device_hidden_capture_enabled() {
             hipfire_arch_muse_glimmer::forward::prefill_with_device_capture(
@@ -2001,9 +1983,7 @@ impl Carrier for MuseGlimmerCarrier {
         iterations: usize,
         decode_err: &mut Option<String>,
     ) -> Option<bool> {
-        let Some(crate::ModelState::MuseGlimmer(bundle)) = m.state.as_mut() else {
-            unreachable!("arch_id=14 requires muse_glimmer bundle")
-        };
+        let bundle = m.muse_glimmer_mut().unwrap();
         let config = &bundle.config;
         let weights = &bundle.weights;
         let state = &mut bundle.state;
@@ -2240,7 +2220,7 @@ impl Carrier for MuseGlimmerCarrier {
                     None => None,
                 };
                 Ok(LoadedModel {
-                    state: Some(ModelState::MuseGlimmer(crate::MuseGlimmerBundle {
+                    state: Some(Box::new(crate::MuseGlimmerBundle {
                         config,
                         weights,
                         state,

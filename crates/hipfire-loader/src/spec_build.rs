@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 
 //! Speculative-decode build/glue that lives at the top of the DAG, where both
-//! `LoadedModel`/`ModelState` and the arch crates are in scope.
+//! `LoadedModel` and the arch crates are in scope.
 //!
 //! Contents: the [`Qwen35SlotGuard`] RAII target borrow, and the generic
 //! [`build_speculator`] registry that dispatches on draft kind: a loaded DFlash
@@ -12,11 +12,11 @@
 //! `spec_ngram`). The registry is what lets the loader pick a drafter at load
 //! time without the daemon learning which ran.
 
-use crate::ModelState;
+use hipfire_arch_qwen35::Qwen35Bundle;
+use std::any::Any;
 use hipfire_arch_qwen35::dflash_spec::{build_dflash_speculator, DflashState};
 use hipfire_arch_qwen35::mtp_head::Qwen35MtpHead;
 use hipfire_arch_qwen35::speculative::ModelSlot;
-use hipfire_arch_qwen35::Qwen35Bundle;
 use hipfire_runtime::spec::{SpecTarget, SpecTargetGuard, Speculator};
 use hipfire_runtime::spec_ngram::{ChainSpeculator, NgramDrafter};
 use std::path::Path;
@@ -27,7 +27,7 @@ use std::path::Path;
 /// `m.state`.
 ///
 /// This is the single chokepoint that replaces the eight hand-written
-/// `m.state = Some(ModelState::Qwen35(..))` reconstructions in the daemon's
+/// `m.state = Some(Box::new(..))` reconstructions in the daemon's
 /// DFlash loop, structurally eliminating the "forgot to restore on early
 /// return" cross-request state-bleed class (#462): there is no longer a code
 /// path on which the bundle fails to return to `m.state`.
@@ -39,7 +39,7 @@ use std::path::Path;
 /// `Drop` to restore — so a reopen error can surface as `Err` without ever
 /// leaving `m.state == None`.
 pub struct Qwen35SlotGuard<'m> {
-    state_back: &'m mut Option<ModelState>,
+    state_back: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
     model_path: String,
     // `Option` only so `Drop` can move the contents out; it is `Some` for the
     // guard's entire observable lifetime.
@@ -66,13 +66,19 @@ impl<'m> Qwen35SlotGuard<'m> {
     /// untouched) if the model is not a loaded Qwen3.5 bundle — note the
     /// `matches!` guard *before* `take()` so a non-Qwen35 model is never moved
     /// out and dropped.
-    pub fn take(state: &'m mut Option<ModelState>, model_path: &str) -> Result<Self, String> {
-        if !matches!(state, Some(ModelState::Qwen35(_))) {
+    pub fn take(state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>, model_path: &str) -> Result<Self, String> {
+        if !state
+            .as_ref()
+            .is_some_and(|s| (s.as_ref() as &dyn Any).is::<Qwen35Bundle>())
+        {
             return Err("Qwen35SlotGuard: model state is not a loaded Qwen3.5 bundle".into());
         }
-        let Some(ModelState::Qwen35(bundle)) = state.take() else {
+        let Some(state_box) = state.take() else {
             unreachable!("guarded by the matches! above")
         };
+        let bundle = * (state_box as Box<dyn Any>)
+            .downcast::<Qwen35Bundle>()
+            .unwrap();
         Ok(Self {
             state_back: state,
             model_path: model_path.to_string(),
@@ -117,7 +123,7 @@ impl Drop for Qwen35SlotGuard<'_> {
             Some(Parked::Slot(slot)) => slot.into_bundle(),
             None => return, // only reachable if `Drop` ran twice — it cannot.
         };
-        *self.state_back = Some(ModelState::Qwen35(bundle));
+        *self.state_back = Some(Box::new(bundle));
     }
 }
 

@@ -39,7 +39,7 @@ use std::path::Path;
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use hipfire_loader::{AsstTurnCache, EpArch, EpState, Eviction, LoadedModel, ModelState};
+use hipfire_loader::{AsstTurnCache, EpArch, EpState, Eviction, LoadedModel};
 use hipfire_runtime::spec::{
     ClientEvent, EmitOutcome, EvictRetain, FinishSummary, PrefillOutcome, SpecAdvance, SpecEmit,
     SpecTarget, Speculator, StopReason,
@@ -325,8 +325,8 @@ fn write_test_state_snapshot(
             let arch = reset_core_arch_key(m.arch_id);
             let eligible: Vec<&'static str> =
                 hipfire_runtime::reset_core::fault_inject_eligible_routes(arch).to_vec();
-            let (kv_hash, kv_bytes, recurrent_hash, recurrent_bytes) = match m.state.as_ref() {
-                Some(ModelState::Qwen35(bundle)) => match redline_qwen_snapshot(gpu, bundle) {
+            let (kv_hash, kv_bytes, recurrent_hash, recurrent_bytes) = match m.qwen35() {
+                Some(bundle) => match redline_qwen_snapshot(gpu, bundle) {
                     Ok(snap) => (
                         format!("{:016x}", redline_hash(&snap.kv)),
                         snap.kv.len(),
@@ -1730,7 +1730,7 @@ fn main() {
                         let vl = m.vision_config().is_some() || m.dots_ocr().is_some();
                         let (dim, layers, vocab) = match m.state.as_ref() {
                             Some(st) => {
-                                let arch = st.as_arch_model();
+                                let arch = st.as_ref() as &dyn hipfire_runtime::arch_model::ArchModel;
                                 (arch.dim(), arch.n_layers(), arch.vocab_size())
                             }
                             None => (0, 0, 0),
@@ -2443,7 +2443,7 @@ fn main() {
                             );
                             continue;
                         }
-                        if let Some(ModelState::Llama(b)) = m.state.as_mut() {
+                        if let Some(b) = m.llama_mut() {
                             b.kv.compact_offset = 0;
                         }
                         if let Some(ref mut s) = m.qwen2_state {
@@ -2462,8 +2462,16 @@ fn main() {
                             b.state.reset();
                         }
                         if let Some(ad) = m.kv_adaptive.as_mut() {
-                            if let Some(ModelState::Qwen35(b)) = m.state.as_mut() {
-                                ad.reset_with_cache(&mut gpu, &mut b.kv_cache);
+                            if let Some(s) = m.state.as_mut() {
+                                if s.arch_key() == "qwen35" {
+                                    if let Some(kv) = s.kv_cache_mut() {
+                                        ad.reset_with_cache(&mut gpu, kv);
+                                    } else {
+                                        ad.reset();
+                                    }
+                                } else {
+                                    ad.reset();
+                                }
                             } else {
                                 ad.reset();
                             }
@@ -3320,8 +3328,8 @@ fn main() {
                     s.reset();
                 }
                 if let Some(st) = m.state.as_mut() {
-                    let key = st.as_arch_model().arch_key();
-                    let _ = st.as_arch_model_mut().reset_session_state(&mut gpu);
+                    let key = st.as_ref().arch_key();
+                    let _ = st.as_mut().reset_session_state(&mut gpu);
                     if key == "deepseek4" {
                         gpu.invalidate_graph_state();
                     }
@@ -3357,8 +3365,8 @@ fn main() {
                 m.conversation_tokens.clear();
                 let _ = hipfire_generate::common::reset_qwen35_recurrent(m, &mut gpu);
                 if let Some(st) = m.state.as_mut() {
-                    let key = st.as_arch_model().arch_key();
-                    let _ = st.as_arch_model_mut().reset_session_state(&mut gpu);
+                    let key = st.as_ref().arch_key();
+                    let _ = st.as_mut().reset_session_state(&mut gpu);
                     if key == "deepseek4" {
                         gpu.invalidate_graph_state();
                     }
