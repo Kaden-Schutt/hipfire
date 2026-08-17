@@ -34,369 +34,106 @@ use crate::calibration::*;
 use crate::pipeline_gguf::*;
 use crate::pipeline_deepseek::*;
 
+// ── Per-tensor grouping for disposition helpers ──────────────────────────
+struct PerTensorCtx<'a> {
+    name: &'a str,
+    file_idx: usize,
+    shape: &'a [usize],
+    n_elements: usize,
+    arch_id: u32,
+    dtype: &'a str,
+    is_vision: bool,
+}
+struct MainQuantFlags {
+    use_fast: bool,
+    use_gptq_e8: bool,
+    use_gptq_mfp2e8: bool,
+    use_gptq_mfp3e8: bool,
+    use_hfp4: bool,
+    use_hfq2g128: bool,
+    use_hfq2g256: bool,
+    use_hfq3g128: bool,
+    use_hfq3g256: bool,
+    use_hfq4g256: bool,
+    use_hfq6: bool,
+    use_hfq_mixed: bool,
+    use_mfp2e8_gptq_fmt: bool,
+    use_mfp3e8_gptq_fmt: bool,
+    use_mfp4: bool,
+    use_mfp4e8: bool,
+    use_mfp4e8soa: bool,
+    use_mfp4l: bool,
+    use_mfp4p: bool,
+    use_mixed: bool,
+    use_mq2g256: bool,
+    use_mq2g256_lloyd: bool,
+    use_mq3g256: bool,
+    use_mq3g256_lloyd: bool,
+    use_mq4_mq2glexp: bool,
+    use_mq4_mq2lloyd_gptq_all: bool,
+    use_mq4_mq2lloyd_imatrix: bool,
+    use_mq4_mq2lloyd_kmap: bool,
+    use_mq4_mq2lloyd_native: bool,
+    use_mq4_mq2lloydexp: bool,
+    use_mq4_mq3lloyd_kmap: bool,
+    use_mq4_mq6exp: bool,
+    use_mq4_mqlloyd_antirez: bool,
+    use_mq4_mqlloyd_antirez_gptq: bool,
+    use_mq4_mqlloyd_tiered: bool,
+    use_mq4g256: bool,
+    use_mq4g256_lloyd: bool,
+    use_mq5g256: bool,
+    use_mq6g256: bool,
+    use_mq8g256: bool,
+    use_q4k_all: bool,
+    use_q4k_q8embed: bool,
+    use_q8: bool,
+    use_q8hfq: bool,
+    is_gemma4_family: bool,
+    q8_conv1d_default: bool,
+    q8_router: bool,
+    arch_id: u32,
+    vision_quant: String,
+}
+
+struct MainQuantOuter<'a> {
+    kmap: &'a HashMap<String, QuantLevel>,
+    imatrix_gguf: &'a Option<gguf_input::GgufFile>,
+    hessian_dir: &'a Option<PathBuf>,
+}
+
+struct MainQuantState<'a> {
+    hfq_tensors: &'a mut Vec<HfqTensor>,
+    quantized_params: &'a mut u64,
+    total_quant_error: &'a mut f64,
+    max_quant_error: &'a mut f32,
+    _n_quant_groups: &'a mut u64,
+    spill: &'a mut Option<TensorSpill>,
+}
+
+
+
+
+struct FormatFlags {
+    use_f32_passthrough: bool,
+    use_bf16: bool,
+    use_q8: bool,
+    use_mixed: bool,
+    use_fast: bool,
+    use_q8hfq: bool,
+}
+
+
 pub(crate) fn run() {
     let args = QuantizeArgs::parse();
 
-    // Bound rayon's pool to 80% of cores (default cap; override with --threads N
-    // or HIPFIRE_QUANT_THREADS env). Quantization is CPU-bound and saturates
-    // memory bandwidth, so leaving headroom for the rest of the system avoids
-    // making the whole box unresponsive during a multi-hour quantize run.
-    let cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(8);
-    let default_threads = ((cores * 8) / 10).max(1);
-    let threads = args.threads.unwrap_or(default_threads);
-    let _ = rayon::ThreadPoolBuilder::new()
-        .num_threads(threads)
-        .build_global();
-    eprintln!(
-        "Rayon: {threads} worker threads ({cores} cores available, default 80% = {default_threads})"
-    );
+    setup_thread_pool(&args);
 
     let input_dir = args.input.as_str();
     let output_path = args.output.as_str();
     let format = args.format.as_str();
 
-    if matches!(
-        format,
-        "deepseek4-dense-mfp4e8soa-overlay" | "ds4-dense-e8soa-overlay"
-    ) {
-        if let Err(e) =
-            build_deepseek4_dense_e8soa_overlay(Path::new(input_dir), Path::new(output_path))
-        {
-            eprintln!("error: {e}");
-            std::process::exit(2);
-        }
-        return;
-    }
-
-    // ── deepseek4-dspark-e8soa: re-quantize an EXISTING DSpark/MTP sidecar's
-    // dense projections Q8F16 -> MFP4-E8-SoA so the drafter matches its MQ2R
-    // trunk. Input is the sidecar .hfq itself (NOT a checkpoint dir), so this
-    // needs no source safetensors. Routed experts stay MQ2-Lloyd; the
-    // `mq2r_sidecar` identity is stamped at build time.
-    //   hipfire-quantize --format deepseek4-dspark-e8soa \
-    //     --input <sidecar-in.mq2r> --output <sidecar-out.mq2r>
-    if matches!(
-        format,
-        "deepseek4-dspark-e8soa" | "ds4-dspark-e8soa" | "deepseek4-dspark-mq2r"
-    ) {
-        if let Err(e) =
-            build_deepseek4_dspark_e8soa_sidecar(Path::new(input_dir), Path::new(output_path))
-        {
-            eprintln!("error: {e}");
-            std::process::exit(2);
-        }
-        return;
-    }
-
-    // ── qwen3-dspark-q8: Qwen3DSparkModel drafter sidecar emission ──────────
-    // Produces a `<stem>-dspark.<ext>` HFQ carrying the 5-layer dense drafter
-    // body + DSpark globals (main_proj, main_norm, markov_w1/w2, confidence_proj
-    // + confidence_bias) + lm_head, with DSpark metadata keys so the arch-side
-    // loader can detect and configure the speculator.
-    //
-    // Quant recipe (small trained drafter — preserve precision):
-    //   2D matmul weights (attn q/k/v/o, mlp gate/up/down) → Q8F16
-    //   Everything else (norms, embed, main_proj/main_norm, markov, confidence,
-    //   lm_head, bias) → F16 (or F32 for scalar bias)
-    //
-    // Tensor name mapping (source → sidecar):
-    //   fc.weight           → main_proj.weight   (the `[hidden, 5*hidden]` concat)
-    //   hidden_norm.weight  → main_norm.weight    (RMSNorm after fc)
-    //   all others          → kept as-is
-    if format == "qwen3-dspark-q8" || format == "qwen35-dspark-q8" {
-        let input_dir = Path::new(input_dir);
-        let output_path = Path::new(output_path);
-
-        // Read config
-        let config_path = input_dir.join("config.json");
-        let config_str = std::fs::read_to_string(&config_path).unwrap_or_else(|e| {
-            eprintln!(
-                "qwen3-dspark-q8: cannot read {}: {e}",
-                config_path.display()
-            );
-            std::process::exit(1);
-        });
-        let config: serde_json::Value = serde_json::from_str(&config_str).unwrap_or_else(|e| {
-            eprintln!("qwen3-dspark-q8: config.json parse error: {e}");
-            std::process::exit(1);
-        });
-
-        // Verify architecture
-        let archs = config.get("architectures").and_then(|v| v.as_array());
-        let is_dspark = archs
-            .map(|a| {
-                a.iter().any(|v| {
-                    matches!(
-                        v.as_str(),
-                        Some("Qwen3DSparkModel" | "DSparkDraftModel" | "DSparkSpeculator")
-                    )
-                })
-            })
-            .unwrap_or(false);
-        if !is_dspark {
-            eprintln!(
-                "dspark-q8: architectures is not a DSpark drafter \
-                 (Qwen3DSparkModel / DSparkDraftModel / DSparkSpeculator); got {:?}",
-                archs
-            );
-            std::process::exit(1);
-        }
-
-        // Read DSpark config fields. speculators v0.6.0 (DSparkDraftModel) nests
-        // the body dims under `transformer_layer_config` and names the target
-        // taps `aux_hidden_state_layer_ids`; the legacy Qwen3DSparkModel puts
-        // dims / `target_layer_ids` at the top level. Handle both.
-        let tlc = config.get("transformer_layer_config");
-        let cfg_u64 = |k: &str, d: u64| -> u64 {
-            config
-                .get(k)
-                .or_else(|| tlc.and_then(|t| t.get(k)))
-                .and_then(|v| v.as_u64())
-                .unwrap_or(d)
-        };
-        let block_size = config
-            .get("block_size")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(7) as usize;
-        let target_layer_ids: Vec<u64> = config
-            .get("target_layer_ids")
-            .or_else(|| config.get("aux_hidden_state_layer_ids"))
-            .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|v| v.as_u64()).collect())
-            .unwrap_or_else(|| vec![1, 9, 17, 25, 33]);
-        let markov_rank = config
-            .get("markov_rank")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(256) as usize;
-        let noise_token_id = config
-            .get("mask_token_id")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(151669) as u32;
-        let draft_vocab_size = cfg_u64("draft_vocab_size", 0);
-        let confidence_with_markov = config
-            .get("confidence_head_with_markov")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let hidden_size = cfg_u64("hidden_size", 2048);
-        let head_dim = cfg_u64("head_dim", 128);
-        let num_hidden_layers = cfg_u64("num_hidden_layers", 0);
-        let num_attention_heads = cfg_u64("num_attention_heads", 0);
-        let num_key_value_heads = cfg_u64("num_key_value_heads", 0);
-        let intermediate_size = cfg_u64("intermediate_size", 0);
-        let vocab_size = cfg_u64("vocab_size", 0);
-        // rope params nest under transformer_layer_config.rope_parameters in v0.6.0.
-        let rope = tlc
-            .and_then(|t| t.get("rope_parameters"))
-            .or_else(|| config.get("rope_parameters"));
-        let partial_rotary_factor = rope
-            .and_then(|r| r.get("partial_rotary_factor"))
-            .or_else(|| config.get("partial_rotary_factor"))
-            .and_then(|v| v.as_f64())
-            .unwrap_or(1.0);
-        let rope_theta = rope
-            .and_then(|r| r.get("rope_theta"))
-            .and_then(|v| v.as_f64())
-            .unwrap_or(10000000.0);
-
-        eprintln!(
-            "qwen3-dspark-q8: block_size={block_size} target_layer_ids={target_layer_ids:?} \
-             markov_rank={markov_rank} noise_token_id={noise_token_id}"
-        );
-
-        // Build metadata JSON — mirrors the keys DsparkConfig::from_metadata_json reads.
-        let metadata = serde_json::json!({
-            "architecture": "qwen3",
-            "config": {
-                "dspark_block_size": block_size,
-                "dspark_target_layer_ids": target_layer_ids,
-                "dspark_num_targets": target_layer_ids.len(),
-                "dspark_markov_rank": markov_rank,
-                "dspark_noise_token_id": noise_token_id,
-                "dspark_enable_confidence": true,
-                "dspark_confidence_with_markov": confidence_with_markov,
-                "dspark_draft_vocab_size": draft_vocab_size,
-                "dspark_hidden_size": hidden_size,
-                "dspark_head_dim": head_dim,
-                "dspark_num_hidden_layers": num_hidden_layers,
-                "dspark_num_attention_heads": num_attention_heads,
-                "dspark_num_key_value_heads": num_key_value_heads,
-                "dspark_intermediate_size": intermediate_size,
-                "dspark_vocab_size": vocab_size,
-                "dspark_partial_rotary_factor": partial_rotary_factor,
-                "dspark_rope_theta": rope_theta,
-            },
-        });
-        let metadata_json = serde_json::to_string(&metadata).unwrap();
-
-        // Load safetensors
-        let st_paths = find_safetensors(input_dir);
-        if st_paths.is_empty() {
-            eprintln!(
-                "qwen3-dspark-q8: no safetensors found in {}",
-                input_dir.display()
-            );
-            std::process::exit(1);
-        }
-        let st_files: Vec<SafetensorsFile> = st_paths
-            .iter()
-            .map(|p| {
-                eprintln!("Loading: {}", p.display());
-                SafetensorsFile::open(p).unwrap()
-            })
-            .collect();
-
-        let mut all_tensors: Vec<(&str, usize)> = Vec::new();
-        for (fi, st) in st_files.iter().enumerate() {
-            for name in st.tensor_names() {
-                all_tensors.push((name, fi));
-            }
-        }
-        all_tensors.sort_by_key(|(name, _)| name.to_string());
-        eprintln!("qwen3-dspark-q8: {} tensors found", all_tensors.len());
-
-        // Determine which 2D weights get Q8F16 (attn projections + MLP projections)
-        let is_dspark_matmul_weight = |name: &str| -> bool {
-            // Attn projections: q/k/v/o_proj
-            let is_attn = name.contains("self_attn.")
-                && (name.ends_with("q_proj.weight")
-                    || name.ends_with("k_proj.weight")
-                    || name.ends_with("v_proj.weight")
-                    || name.ends_with("o_proj.weight"));
-            // MLP projections: gate/up/down_proj
-            let is_mlp = name.contains("mlp.")
-                && (name.ends_with("gate_proj.weight")
-                    || name.ends_with("up_proj.weight")
-                    || name.ends_with("down_proj.weight"));
-            is_attn || is_mlp
-        };
-
-        let mut hfq_tensors: Vec<HfqTensor> = Vec::new();
-        let mut total_params = 0u64;
-        let mut q8_params = 0u64;
-        let mut f16_params = 0u64;
-
-        for (name, file_idx) in &all_tensors {
-            let (meta, raw_data) = st_files[*file_idx].tensor_data(name).unwrap();
-            let n_elements: usize = meta.shape.iter().product();
-            total_params += n_elements as u64;
-
-            // Map source tensor name → sidecar name
-            let sidecar_name = if *name == "fc.weight" {
-                "main_proj.weight".to_string()
-            } else if *name == "hidden_norm.weight" {
-                "main_norm.weight".to_string()
-            } else {
-                name.to_string()
-            };
-
-            let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
-
-            // Reduced-vocab maps: `d2t` (draft→target token id, I64) and `t2d`
-            // (target→draft membership, BOOL). Store as F32 — token indices are
-            // < 2^24 so exact; the DSpark loader casts d2t→u32, t2d→bool. The
-            // float `to_f32` path can't read I64/BOOL.
-            if *name == "d2t" || *name == "t2d" {
-                let f32_data: Vec<f32> = if meta.dtype == "I64" {
-                    raw_data
-                        .chunks_exact(8)
-                        .map(|c| i64::from_le_bytes(c.try_into().unwrap()) as f32)
-                        .collect()
-                } else if meta.dtype == "BOOL" || meta.dtype == "U8" {
-                    raw_data
-                        .iter()
-                        .map(|&b| if b != 0 { 1.0 } else { 0.0 })
-                        .collect()
-                } else {
-                    to_f32(raw_data, &meta.dtype)
-                };
-                let bytes: Vec<u8> = f32_data.iter().flat_map(|&v| v.to_le_bytes()).collect();
-                eprintln!(
-                    "  {:>8}: {} {:?} ({} elems) [reduced-vocab map]",
-                    "F32", sidecar_name, meta.shape, n_elements
-                );
-                f16_params += n_elements as u64;
-                hfq_tensors.push(HfqTensor {
-                    name: sidecar_name,
-                    quant_type: QuantType::F32,
-                    shape,
-                    group_size: 0,
-                    data: bytes,
-                    spilled_len: 0,
-                });
-                continue;
-            }
-
-            if is_dspark_matmul_weight(name) && n_elements >= 32 {
-                // 2D matmul weight → Q8F16 (body layers, trained precision preserved)
-                let f32_data = to_f32(raw_data, &meta.dtype);
-                let q = quantize_q8f16(&f32_data);
-                eprintln!(
-                    "  {:>8}: {} {:?} ({} elems, {:.1} KB → {:.1} KB)",
-                    "Q8_F16",
-                    sidecar_name,
-                    meta.shape,
-                    n_elements,
-                    raw_data.len() as f64 / 1024.0,
-                    q.len() as f64 / 1024.0
-                );
-                q8_params += n_elements as u64;
-                hfq_tensors.push(HfqTensor {
-                    name: sidecar_name,
-                    quant_type: QuantType::Q8F16,
-                    shape,
-                    group_size: 32,
-                    data: q,
-                    spilled_len: 0,
-                });
-            } else {
-                // Everything else → F16 (norms, embeds, main_proj, markov, confidence, lm_head)
-                let f32_data = to_f32(raw_data, &meta.dtype);
-                let f16_bytes: Vec<u8> = f32_data
-                    .iter()
-                    .flat_map(|&v| f32_to_f16(v).to_le_bytes())
-                    .collect();
-                eprintln!(
-                    "  {:>8}: {} {:?} ({} elems, {:.1} KB → {:.1} KB)",
-                    "F16",
-                    sidecar_name,
-                    meta.shape,
-                    n_elements,
-                    raw_data.len() as f64 / 1024.0,
-                    f16_bytes.len() as f64 / 1024.0
-                );
-                f16_params += n_elements as u64;
-                hfq_tensors.push(HfqTensor {
-                    name: sidecar_name,
-                    quant_type: QuantType::F16,
-                    shape,
-                    group_size: 0,
-                    data: f16_bytes,
-                    spilled_len: 0,
-                });
-            }
-        }
-
-        eprintln!(
-            "\n=== qwen3-dspark-q8 Summary ===\n\
-             Total params:  {total_params}\n\
-             Q8F16 params:  {q8_params} ({:.1}%)\n\
-             F16 params:    {f16_params} ({:.1}%)\n\
-             Tensors:       {}",
-            100.0 * q8_params as f64 / total_params as f64,
-            100.0 * f16_params as f64 / total_params as f64,
-            hfq_tensors.len()
-        );
-
-        eprintln!("\nWriting: {}", output_path.display());
-        write_hfq(output_path, 1u32, &metadata_json, &hfq_tensors, None).unwrap_or_else(|e| {
-            eprintln!("qwen3-dspark-q8: write_hfq failed: {e}");
-            std::process::exit(2);
-        });
-
-        let file_size = std::fs::metadata(output_path).unwrap().len();
-        eprintln!("Done: {:.1} MB written", file_size as f64 / 1e6);
+    if handle_early_special_formats(&args) {
         return;
     }
 
@@ -1847,6 +1584,7 @@ pub(crate) fn run() {
         && all_tensors
             .iter()
             .any(|(n, _)| n.starts_with("model.language_model."));
+    
     for (name, file_idx) in &all_tensors {
         // --include-prefix filter (highest priority — runs before mtp/vision skips).
         if let Some(p) = include_prefix {
@@ -1966,99 +1704,14 @@ pub(crate) fn run() {
         let _gathered_bytes: Vec<u8>;
         let mut meta: &TensorMeta = meta;
         let mut raw_data: &[u8] = raw_data;
-        if bake_keep_active {
-            // SAFETY of indexing: bake_keep_active ⇒ reap_bake_plan.keep is Some.
-            let plan = reap_bake_plan.as_ref().unwrap();
-            let keep = plan.keep.as_ref().unwrap();
-            let layer = reap_overlay::bake_layer_of(name);
-
-            // Per-arch routed-expert (per-expert-named) tensors: drop pruned,
-            // record kept→compact rename for the post-loop pass.
-            if reap_overlay::expert_index_of(name, reap_arch).is_some() {
-                let l = layer.unwrap_or_else(|| {
-                    eprintln!("reap bake: routed-expert tensor '{name}' has no parseable layer");
-                    std::process::exit(2);
-                });
-                // ds4 hash-layer guard: pruning layers 0..=2 requires a tid2eid
-                // remap to the compact expert space — not supported in bake.
-                if reap_arch == reap_overlay::ReapArch::Deepseek4 && l <= 2 {
-                    eprintln!(
-                        "reap bake: ds4 hash-layer (0-2) tid2eid remap not supported in bake; \
-                         use the load-time keep-map for pruned ds4 hash layers"
-                    );
-                    std::process::exit(2);
-                }
-                if l >= keep.len() {
-                    eprintln!("reap bake: layer {l} for '{name}' out of keep-map range");
-                    std::process::exit(2);
-                }
-                match reap_overlay::bake_expert_rename(name, reap_arch, l, &keep[l]) {
-                    None => {
-                        // Pruned expert: drop entirely.
-                        st_files[*file_idx].drop_tensor_pages(name);
-                        continue;
-                    }
-                    Some(new_name) => {
-                        if &new_name != name {
-                            bake_rename.insert(name.to_string(), new_name);
-                        }
-                        // Fall through: the arch branch quantizes the ORIGINAL
-                        // bytes; the post-loop pass renames the output tensor.
-                    }
-                }
-            } else if let Some(l) = layer {
-                // Router weight (`*.gate.weight`, shape `[orig_experts, hidden]`)
-                // and per-expert bias (`*.gate.bias` / `e_score_correction_bias` /
-                // `expert_bias`, shape `[orig_experts]`): row-gather to the kept
-                // set BEFORE quant so the baked router/bias emit only kept rows in
-                // compact-slot order (mirrors the loader's load-time gather).
-                let is_router_w = reap_overlay::is_reap_router_weight(name, reap_arch)
-                    && meta.shape.len() == 2
-                    && meta.shape[0] == plan.original_experts;
-                let is_expert_bias = reap_overlay::is_reap_expert_bias(name, reap_arch)
-                    && meta.shape.len() == 1
-                    && meta.shape[0] == plan.original_experts;
-                if is_router_w || is_expert_bias {
-                    // ds4 hash-layer guard also covers the router of layers 0..=2.
-                    if reap_arch == reap_overlay::ReapArch::Deepseek4 && l <= 2 {
-                        eprintln!(
-                            "reap bake: ds4 hash-layer (0-2) router/tid2eid remap not supported \
-                             in bake; use the load-time keep-map for pruned ds4 hash layers"
-                        );
-                        std::process::exit(2);
-                    }
-                    if l >= keep.len() {
-                        eprintln!(
-                            "reap bake: layer {l} for router/bias '{name}' out of keep-map range"
-                        );
-                        std::process::exit(2);
-                    }
-                    let keep_l = &keep[l];
-                    match hipfire_reap::gather::gather_rows(&meta.shape, raw_data, keep_l) {
-                        Ok((new_shape, gathered)) => {
-                            _gathered_meta = TensorMeta {
-                                dtype: meta.dtype.clone(),
-                                shape: new_shape,
-                                data_offsets: meta.data_offsets,
-                            };
-                            _gathered_bytes = gathered;
-                            eprintln!(
-                                "  {:>8}: {} {:?} → rows[{}] (kept {} of {})",
-                                "GATHER",
-                                name,
-                                meta.shape,
-                                keep_l.len(),
-                                keep_l.len(),
-                                plan.original_experts
-                            );
-                            meta = &_gathered_meta;
-                            raw_data = &_gathered_bytes;
-                        }
-                        Err(e) => {
-                            eprintln!("reap bake: router/bias gather '{name}': {e}");
-                            std::process::exit(2);
-                        }
-                    }
+        if let Some(res) = handle_bake_keep_active(name, *file_idx, meta, raw_data, bake_keep_active, &reap_bake_plan, reap_arch, &mut bake_rename, &st_files) {
+            match res {
+                BakeKeepResult::Pruned => continue,
+                BakeKeepResult::Gathered { meta: gm, bytes: gb } => {
+                    _gathered_meta = gm;
+                    _gathered_bytes = gb;
+                    meta = &_gathered_meta;
+                    raw_data = &_gathered_bytes;
                 }
             }
         }
@@ -2167,87 +1820,11 @@ pub(crate) fn run() {
         // the produced .hfq is a full-precision reference the qwen35 loader
         // reads via its qt=2 arm and the engine forwards through the existing
         // F32 GEMV / attention_f32 path.
-        if use_f32_passthrough && !is_cohere2moe {
-            // 3D MoE experts MUST be split per-expert: the qwen35 loader reads
-            // `...experts.{X}.{base}.weight`, never the stacked 3D tensor. Without
-            // this, the oracle stores `experts.gate_up_proj [256,...]` and load
-            // panics "tensor not found: ...experts.0.gate_up_proj.weight".
-            if is_moe
-                && name.contains("mlp.experts.")
-                && (name.ends_with("gate_up_proj") || name.ends_with("down_proj"))
-                && meta.shape.len() == 3
-            {
-                let n_exp = meta.shape[0];
-                let inner_n: usize = meta.shape[1..].iter().product();
-                let base_name = if name.ends_with("gate_up_proj") {
-                    "gate_up_proj"
-                } else {
-                    "down_proj"
-                };
-                let parent = &name[..name.len() - base_name.len()]; // ends with "experts."
-                let inner_shape: Vec<u32> = meta.shape[1..].iter().map(|&d| d as u32).collect();
-                let f32_all = tensor_to_f32_with_optional_fp8_scale(
-                    name,
-                    raw_data,
-                    meta,
-                    &fp8_scale_for,
-                    &st_files,
-                );
-                for x in 0..n_exp {
-                    let slice = &f32_all[x * inner_n..(x + 1) * inner_n];
-                    let bytes: Vec<u8> = slice.iter().flat_map(|&v| v.to_le_bytes()).collect();
-                    hfq_tensors.push(HfqTensor {
-                        name: format!("{parent}{x}.{base_name}.weight"),
-                        quant_type: QuantType::F32,
-                        shape: inner_shape.clone(),
-                        group_size: 0,
-                        data: bytes,
-                        spilled_len: 0,
-                    });
-                }
-                quantized_params += n_elements as u64;
-                eprintln!(
-                    "  {:>8}: {} {:?} -> {} per-expert F32 [oracle split]",
-                    "F32", name, meta.shape, n_exp
-                );
-                st_files[*file_idx].drop_tensor_pages(name);
-                if let Some(ref mut sp) = spill {
-                    maybe_spill(&mut hfq_tensors, sp, 2 * 1024 * 1024 * 1024);
-                }
+        {
+            let __ctx = PerTensorCtx { name, file_idx: *file_idx, shape: &meta.shape, n_elements, arch_id, dtype: &meta.dtype, is_vision };
+            if handle_f32_passthrough(&__ctx, meta, raw_data, is_cohere2moe, is_moe, use_f32_passthrough, &fp8_scale_for, &st_files, &mut hfq_tensors, &mut quantized_params, &mut spill) {
                 continue;
             }
-            let f32_data = tensor_to_f32_with_optional_fp8_scale(
-                name,
-                raw_data,
-                meta,
-                &fp8_scale_for,
-                &st_files,
-            );
-            let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
-            let bytes: Vec<u8> = f32_data.iter().flat_map(|&v| v.to_le_bytes()).collect();
-            quantized_params += n_elements as u64;
-            eprintln!(
-                "  {:>8}: {} {:?} ({} elements, {:.1} KB -> {:.1} KB) [F32 oracle passthrough]",
-                "F32",
-                name,
-                meta.shape,
-                n_elements,
-                raw_data.len() as f64 / 1024.0,
-                bytes.len() as f64 / 1024.0
-            );
-            hfq_tensors.push(HfqTensor {
-                name: name.to_string(),
-                quant_type: QuantType::F32,
-                shape,
-                group_size: 0,
-                data: bytes,
-                spilled_len: 0,
-            });
-            st_files[*file_idx].drop_tensor_pages(name);
-            if let Some(ref mut sp) = spill {
-                maybe_spill(&mut hfq_tensors, sp, 2 * 1024 * 1024 * 1024);
-            }
-            continue;
         }
 
         // Source-precision BF16 passthrough for non-vision model tensors.
@@ -2255,232 +1832,15 @@ pub(crate) fn run() {
         // two-byte representation on disk. The qwen35 loader can consume
         // qt=16 losslessly; vision remains on the established F16 ingest path
         // because its kernels consume F16 matrices.
-        if use_bf16 && matches!(arch_id, 5 | 6) && !is_vision {
-            let bf16_bytes = if meta.dtype == "BF16" {
-                raw_data.to_vec()
-            } else {
-                tensor_to_f32_with_optional_fp8_scale(
-                    name,
-                    raw_data,
-                    meta,
-                    &fp8_scale_for,
-                    &st_files,
-                )
-                .iter()
-                .flat_map(|&value| {
-                    let bits = value.to_bits();
-                    let rounded = bits.wrapping_add(0x7fff + ((bits >> 16) & 1));
-                    ((rounded >> 16) as u16).to_le_bytes()
-                })
-                .collect()
-            };
-
-            if is_moe
-                && name.contains("mlp.experts.")
-                && (name.ends_with("gate_up_proj") || name.ends_with("down_proj"))
-                && meta.shape.len() == 3
-            {
-                let n_exp = meta.shape[0];
-                let inner_n: usize = meta.shape[1..].iter().product();
-                let base_name = if name.ends_with("gate_up_proj") {
-                    "gate_up_proj"
-                } else {
-                    "down_proj"
-                };
-                let parent = &name[..name.len() - base_name.len()];
-                let inner_shape: Vec<u32> = meta.shape[1..].iter().map(|&d| d as u32).collect();
-                for expert in 0..n_exp {
-                    let start = expert * inner_n * 2;
-                    let end = start + inner_n * 2;
-                    hfq_tensors.push(HfqTensor {
-                        name: format!("{parent}{expert}.{base_name}.weight"),
-                        quant_type: QuantType::BF16,
-                        shape: inner_shape.clone(),
-                        group_size: 0,
-                        data: bf16_bytes[start..end].to_vec(),
-                        spilled_len: 0,
-                    });
-                }
-                eprintln!(
-                    "  {:>8}: {} {:?} -> {} per-expert BF16 [source split]",
-                    "BF16", name, meta.shape, n_exp
-                );
-            } else {
-                eprintln!(
-                    "  {:>8}: {} {:?} ({} elements, {:.1} KB) [source passthrough]",
-                    "BF16",
-                    name,
-                    meta.shape,
-                    n_elements,
-                    bf16_bytes.len() as f64 / 1024.0
-                );
-                hfq_tensors.push(HfqTensor {
-                    name: name.to_string(),
-                    quant_type: QuantType::BF16,
-                    shape: meta.shape.iter().map(|&s| s as u32).collect(),
-                    group_size: 0,
-                    data: bf16_bytes,
-                    spilled_len: 0,
-                });
+        {
+            let __ctx = PerTensorCtx { name, file_idx: *file_idx, shape: &meta.shape, n_elements, arch_id, dtype: &meta.dtype, is_vision };
+            if handle_bf16_passthrough(&__ctx, meta, raw_data, use_bf16, arch_id, is_vision, is_moe, &fp8_scale_for, &st_files, &mut hfq_tensors, &mut quantized_params, &mut spill) {
+                continue;
             }
-            quantized_params += n_elements as u64;
-            st_files[*file_idx].drop_tensor_pages(name);
-            if let Some(ref mut sp) = spill {
-                maybe_spill(&mut hfq_tensors, sp, 2 * 1024 * 1024 * 1024);
-            }
-            continue;
         }
 
-        // ── LFM2.5 ingest (arch_id 11) ─────────────────────────────────────────
-        // Routed experts (A1B only) → MQ4G256; expert_bias → F32; everything else
-        // (conv in/out_proj, conv depthwise filter, attn q/k/v/out_proj + qk-norm,
-        // dense w1/w2/w3, router gate, operator/ffn/embedding norms, tied embed/
-        // lm_head) → Q8 (qt=3 Q8F16). Dense lfm2 (350M/1.2B) has no experts, so
-        // every tensor takes the final Q8 path. The loader's load_f32 dequantizes
-        // Q8 norms / conv-filter back to F32 on load.
-        if is_lfm2moe {
-            let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
-            if name.contains(".feed_forward.experts.")
-                && (name.ends_with(".w1.weight")
-                    || name.ends_with(".w2.weight")
-                    || name.ends_with(".w3.weight"))
-                && meta.shape.len() == 2
-                && meta.shape[1] % 256 == 0
-            {
-                let f32_data = tensor_to_f32_with_optional_fp8_scale(
-                    name,
-                    raw_data,
-                    meta,
-                    &fp8_scale_for,
-                    &st_files,
-                );
-                let signs1 = gen_fwht_signs(42, 256);
-                let signs2 = gen_fwht_signs(1042, 256);
-                let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
-                eprintln!(
-                    "  {:>8}: {} {:?} ({:.1} KB → {:.1} KB)",
-                    "MQ4-LFM",
-                    name,
-                    meta.shape,
-                    raw_data.len() as f64 / 1024.0,
-                    q.len() as f64 / 1024.0
-                );
-                hfq_tensors.push(HfqTensor {
-                    name: name.to_string(),
-                    quant_type: QuantType::MQ4G256,
-                    shape,
-                    group_size: 256,
-                    data: q,
-                    spilled_len: 0,
-                });
-                quantized_params += (meta.shape[0] * meta.shape[1]) as u64;
-                st_files[*file_idx].drop_tensor_pages(name);
-                if let Some(ref mut s) = spill {
-                    maybe_spill(&mut hfq_tensors, s, 2 * 1024 * 1024 * 1024);
-                }
-                continue;
-            }
-            if name.ends_with(".feed_forward.expert_bias") {
-                let f32_data = tensor_to_f32_with_optional_fp8_scale(
-                    name,
-                    raw_data,
-                    meta,
-                    &fp8_scale_for,
-                    &st_files,
-                );
-                let mut bytes = Vec::with_capacity(f32_data.len() * 4);
-                for v in &f32_data {
-                    bytes.extend_from_slice(&v.to_le_bytes());
-                }
-                eprintln!(
-                    "  {:>8}: {} {:?} (expert_bias F32)",
-                    "F32-LFM", name, meta.shape
-                );
-                hfq_tensors.push(HfqTensor {
-                    name: name.to_string(),
-                    quant_type: QuantType::F32,
-                    shape,
-                    group_size: 1,
-                    data: bytes,
-                    spilled_len: 0,
-                });
-                st_files[*file_idx].drop_tensor_pages(name);
-                continue;
-            }
-            // Dense mq4 (--format mq4): route the big 2D proj/FFN weight matrices
-            // (conv in/out_proj, attn q/k/v/out_proj, dense w1/w2/w3) → MQ4G256.
-            // The loader's weight_gemv / weight_gemv_residual auto-FWHT-rotate
-            // MQ4G256, so no forward change is needed. Keep the tied embed/lm_head
-            // (model.embed_tokens.weight), the router gate, norms, and the depthwise
-            // conv filter at Q8/F32 (small + precision-sensitive). Default (no mq4
-            // format) keeps the full-precision Q8 bring-up recipe.
-            if use_mq4g256
-                && meta.shape.len() == 2
-                && meta.shape[1] % 256 == 0
-                && !name.ends_with("embed_tokens.weight")
-                && (name.ends_with("_proj.weight")
-                    || name.ends_with(".w1.weight")
-                    || name.ends_with(".w2.weight")
-                    || name.ends_with(".w3.weight"))
-            {
-                let f32_data = tensor_to_f32_with_optional_fp8_scale(
-                    name,
-                    raw_data,
-                    meta,
-                    &fp8_scale_for,
-                    &st_files,
-                );
-                let signs1 = gen_fwht_signs(42, 256);
-                let signs2 = gen_fwht_signs(1042, 256);
-                let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
-                eprintln!(
-                    "  {:>8}: {} {:?} ({:.1} KB → {:.1} KB)",
-                    "MQ4-LFM",
-                    name,
-                    meta.shape,
-                    raw_data.len() as f64 / 1024.0,
-                    q.len() as f64 / 1024.0
-                );
-                hfq_tensors.push(HfqTensor {
-                    name: name.to_string(),
-                    quant_type: QuantType::MQ4G256,
-                    shape,
-                    group_size: 256,
-                    data: q,
-                    spilled_len: 0,
-                });
-                quantized_params += (meta.shape[0] * meta.shape[1]) as u64;
-                st_files[*file_idx].drop_tensor_pages(name);
-                if let Some(ref mut s) = spill {
-                    maybe_spill(&mut hfq_tensors, s, 2 * 1024 * 1024 * 1024);
-                }
-                continue;
-            }
-
-            // All remaining LFM2 tensors → Q8 (qt=3). quantize_q8f16 handles any
-            // 1D/2D/3D shape elementwise (conv.conv.weight is [hidden,1,K]).
-            let f32_data = tensor_to_f32_with_optional_fp8_scale(
-                name,
-                raw_data,
-                meta,
-                &fp8_scale_for,
-                &st_files,
-            );
-            let q = quantize_q8f16(&f32_data);
-            eprintln!("  {:>8}: {} {:?} (Q8)", "Q8-LFM", name, meta.shape);
-            hfq_tensors.push(HfqTensor {
-                name: name.to_string(),
-                quant_type: QuantType::Q8F16,
-                shape,
-                group_size: 32,
-                data: q,
-                spilled_len: 0,
-            });
-            quantized_params += n_elements as u64;
-            st_files[*file_idx].drop_tensor_pages(name);
-            continue;
-        }
-
+        // ── LFM2.5 ingest (arch_id 11) — extracted to try_handle_lfm2moe
+        if try_handle_lfm2moe(is_lfm2moe, use_mq4g256, name, meta, raw_data, &fp8_scale_for, &st_files, &mut hfq_tensors, &mut quantized_params, &mut spill, *file_idx, n_elements) {{ continue; }}
         // ── Cohere2-MoE ingest (arch_id 12) ─────────────────────────────────
         // North-Mini-Code-1.0. Sweep tiers via --format: f16 (BF16-class oracle)
         // | q8 | mq6 | mq4. The EXPERTS carry the bit-width knob; attention/dense
@@ -2489,170 +1849,7 @@ pub(crate) fn run() {
         // across the sweep so KLD isolates expert/attention precision); all
         // *norm* tensors -> F16. Experts ship per-expert pre-split (gate_proj/
         // up_proj/down_proj); the loader byte-fuses gate_proj||up_proj.
-        if is_cohere2moe {
-            let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
-            if name.contains("norm") {
-                let f32_data = tensor_to_f32_with_optional_fp8_scale(
-                    name,
-                    raw_data,
-                    meta,
-                    &fp8_scale_for,
-                    &st_files,
-                );
-                let f16_bytes: Vec<u8> = f32_data
-                    .iter()
-                    .flat_map(|&v| f32_to_f16(v).to_le_bytes())
-                    .collect();
-                eprintln!("  {:>8}: {} {:?} (norm F16)", "F16-COH", name, meta.shape);
-                hfq_tensors.push(HfqTensor {
-                    name: name.to_string(),
-                    quant_type: QuantType::F16,
-                    shape,
-                    group_size: 0,
-                    data: f16_bytes,
-                    spilled_len: 0,
-                });
-                quantized_params += n_elements as u64;
-                st_files[*file_idx].drop_tensor_pages(name);
-                continue;
-            }
-
-            if name.ends_with("embed_tokens.weight") {
-                let f32_data = tensor_to_f32_with_optional_fp8_scale(
-                    name,
-                    raw_data,
-                    meta,
-                    &fp8_scale_for,
-                    &st_files,
-                );
-                let q = quantize_q8f16(&f32_data);
-                eprintln!(
-                    "  {:>8}: {} {:?} (tied embed Q8)",
-                    "Q8-COH", name, meta.shape
-                );
-                hfq_tensors.push(HfqTensor {
-                    name: name.to_string(),
-                    quant_type: QuantType::Q8F16,
-                    shape,
-                    group_size: 32,
-                    data: q,
-                    spilled_len: 0,
-                });
-                quantized_params += n_elements as u64;
-                st_files[*file_idx].drop_tensor_pages(name);
-                continue;
-            }
-
-            if meta.shape.len() == 2 && meta.shape[1] % 256 == 0 {
-                let is_expert = name.contains(".mlp.experts.");
-                let is_router = name.ends_with(".mlp.gate.weight");
-                if use_bf16 && !is_router && meta.dtype == "BF16" {
-                    eprintln!(
-                        "  {:>8}: {} {:?} (native bf16)",
-                        "BF16-COH", name, meta.shape
-                    );
-                    hfq_tensors.push(HfqTensor {
-                        name: name.to_string(),
-                        quant_type: QuantType::BF16,
-                        shape,
-                        group_size: 0,
-                        data: raw_data.to_vec(),
-                        spilled_len: 0,
-                    });
-                    quantized_params += (meta.shape[0] * meta.shape[1]) as u64;
-                    st_files[*file_idx].drop_tensor_pages(name);
-                    if let Some(ref mut s) = spill {
-                        maybe_spill(&mut hfq_tensors, s, 2 * 1024 * 1024 * 1024);
-                    }
-                    continue;
-                }
-
-                let dt = if is_router {
-                    QuantType::Q8F16
-                } else if use_f16 {
-                    QuantType::F16
-                } else if is_expert {
-                    if use_mq6g256 {
-                        QuantType::MQ6G256
-                    } else if use_mq4g256 {
-                        QuantType::MQ4G256
-                    } else {
-                        QuantType::Q8F16
-                    }
-                } else {
-                    QuantType::Q8F16
-                };
-                let f32_data = tensor_to_f32_with_optional_fp8_scale(
-                    name,
-                    raw_data,
-                    meta,
-                    &fp8_scale_for,
-                    &st_files,
-                );
-                let (data, gs, tag): (Vec<u8>, u32, &str) = match dt {
-                    QuantType::F16 => (
-                        f32_data
-                            .iter()
-                            .flat_map(|&v| f32_to_f16(v).to_le_bytes())
-                            .collect(),
-                        0,
-                        "F16-COH",
-                    ),
-                    QuantType::MQ6G256 => {
-                        let s1 = gen_fwht_signs(42, 256);
-                        let s2 = gen_fwht_signs(1042, 256);
-                        (quantize_mq6g256(&f32_data, &s1, &s2), 256, "MQ6-COH")
-                    }
-                    QuantType::MQ4G256 => {
-                        let s1 = gen_fwht_signs(42, 256);
-                        let s2 = gen_fwht_signs(1042, 256);
-                        (quantize_mq4g256(&f32_data, &s1, &s2), 256, "MQ4-COH")
-                    }
-                    _ => (quantize_q8f16(&f32_data), 32, "Q8-COH"),
-                };
-                eprintln!(
-                    "  {:>8}: {} {:?} ({:.1} KB -> {:.1} KB)",
-                    tag,
-                    name,
-                    meta.shape,
-                    raw_data.len() as f64 / 1024.0,
-                    data.len() as f64 / 1024.0
-                );
-                hfq_tensors.push(HfqTensor {
-                    name: name.to_string(),
-                    quant_type: dt,
-                    shape,
-                    group_size: gs,
-                    data,
-                    spilled_len: 0,
-                });
-                quantized_params += (meta.shape[0] * meta.shape[1]) as u64;
-                st_files[*file_idx].drop_tensor_pages(name);
-                if let Some(ref mut s) = spill {
-                    maybe_spill(&mut hfq_tensors, s, 2 * 1024 * 1024 * 1024);
-                }
-                continue;
-            }
-
-            let f32_data = tensor_to_f32_with_optional_fp8_scale(
-                name,
-                raw_data,
-                meta,
-                &fp8_scale_for,
-                &st_files,
-            );
-            let q = quantize_q8f16(&f32_data);
-            eprintln!("  {:>8}: {} {:?} (Q8)", "Q8-COH", name, meta.shape);
-            hfq_tensors.push(HfqTensor {
-                name: name.to_string(),
-                quant_type: QuantType::Q8F16,
-                shape,
-                group_size: 32,
-                data: q,
-                spilled_len: 0,
-            });
-            quantized_params += n_elements as u64;
-            st_files[*file_idx].drop_tensor_pages(name);
+        if handle_cohere2moe(name, meta, raw_data, n_elements, is_cohere2moe, use_bf16, use_f16, use_mq6g256, use_mq4g256, &fp8_scale_for, &st_files, &mut hfq_tensors, &mut quantized_params, &mut spill, *file_idx) {
             continue;
         }
 
@@ -3042,7 +2239,1387 @@ pub(crate) fn run() {
         let is_moe_expert_3d = (is_moe || is_gemma4)
             && (name.ends_with("experts.gate_up_proj") || name.ends_with("experts.down_proj"))
             && meta.shape.len() == 3;
-        if is_moe_expert_3d {
+        {
+            let __ctx = PerTensorCtx { name, file_idx: *file_idx, shape: &meta.shape, n_elements, arch_id, dtype: &meta.dtype, is_vision };
+            if handle_moe_expert_3d(&__ctx, meta, raw_data, is_moe, is_gemma4, &kmap, &mq3_tier_layers, &imatrix_gguf, &moe_tier_map, use_moe_graded, moe_hot_frac, &hessian_dir, use_gptq_e8, use_gptq_mfp3e8, use_gptq_mfp2e8, use_mq6g256, use_mq4g256, use_mq4_mq6exp, use_mq4_mq2lloydexp, use_mq4_mq2glexp, use_mq4_mq2lloyd_native, use_mq4_mq2lloyd_kmap, use_mq4_mq2lloyd_imatrix, use_mq4_mq3lloyd_kmap, use_mq4_mqlloyd_tiered, use_mq4_mqlloyd_antirez, use_mq4_mqlloyd_antirez_gptq, use_mq4_mq2lloyd_gptq_all, use_mq5g256, use_hfq6, use_hfq4g256, use_hfq3g256, use_hfq3g128, use_hfq2g256, use_hfq2g128, use_hfq_mixed, use_mfp4, use_mfp4p, use_mfp4e8, use_mfp4e8soa, use_mfp3e8_gptq_fmt, use_mfp2e8_gptq_fmt, use_mq3g256, use_mq2g256, use_mq2g256_lloyd, use_mq3g256_lloyd, use_mq4g256_lloyd, use_hfp4, use_mfp4l, routed_gl, &imatrix_path, bake_keep_active, &reap_bake_plan, reap_arch, &st_files, &fp8_scale_for, &mut hfq_tensors, &mut quantized_params, &mut spill) {
+                continue;
+            }
+        }
+
+        // ── deepseek4-q8-mtp short-circuit ───────────────────────────────────────
+        // Routed experts (.ffn.experts.*) were claimed by the MQ2-Lloyd
+        // branch above. Here we handle everything else:
+        //
+        //   - antirez-precision-sensitive (compressor / indexer /
+        //     router gate.weight): keep as F16 on disk. The compressor
+        //     class alone regresses PPL +40-81% if dropped to MQ4
+        //     (memory: project_deepseek4_compressor_must_stay_f16); F16 → Q8
+        //     on these classes is a smaller hit but still unnecessary.
+        //   - All other weights: uniform Q8F16.
+        //   - Norms / biases / HC matrices: should_quantize() returns
+        //     false → fall through to F16 fallback at the bottom.
+        // deepseek4-mtp-precise: all mtp.0.* dense weights (anything that goes
+        // through gemv_auto in mtp_forward — wq_a/b, wkv, wo_a/b, e_proj,
+        // h_proj, shared experts, gate.weight) stay F16 to eliminate Q8
+        // quant noise on the MTP block. Routed experts (".ffn.experts.")
+        // are excluded — they MUST stay MQ2-Lloyd because the MoE GEMV
+        // kernel (`deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed`) only
+        // handles that format.
+        let keep_f16_mtp = use_mtp_precise
+            && name.starts_with("mtp.")
+            && !name.contains(".ffn.experts.")
+            && should_quantize(name);
+        if (use_deepseek4_source_precision && is_deepseek4_keep_f16(name) || keep_f16_mtp)
+            && n_elements >= 32
+        {
+            let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
+            let src_dtype = meta.dtype.as_str();
+            let f32_data = tensor_to_f32_with_optional_fp8_scale(
+                name,
+                raw_data,
+                meta,
+                &fp8_scale_for,
+                &st_files,
+            );
+            quantized_params += n_elements as u64;
+            let f16_bytes: Vec<u8> = f32_data
+                .iter()
+                .flat_map(|&v| f32_to_f16(v).to_le_bytes())
+                .collect();
+            eprintln!(
+                "  {:>8}: {} {:?} ({} elements, {:.1} KB → {:.1} KB) [src={src_dtype}, keep-F16]",
+                "F16",
+                name,
+                meta.shape,
+                n_elements,
+                raw_data.len() as f64 / 1024.0,
+                f16_bytes.len() as f64 / 1024.0
+            );
+            hfq_tensors.push(HfqTensor {
+                name: name.to_string(),
+                quant_type: QuantType::F16,
+                shape,
+                group_size: 0,
+                data: f16_bytes,
+                spilled_len: 0,
+            });
+            st_files[*file_idx].drop_tensor_pages(name);
+            if let Some(ref mut s) = spill {
+                maybe_spill(&mut hfq_tensors, s, 2 * 1024 * 1024 * 1024);
+            }
+            continue;
+        }
+        if use_deepseek4_source_precision && should_quantize(name) && n_elements >= 32 {
+            let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
+            let src_dtype = meta.dtype.as_str();
+            let f32_data = tensor_to_f32_with_optional_fp8_scale(
+                name,
+                raw_data,
+                meta,
+                &fp8_scale_for,
+                &st_files,
+            );
+            quantized_params += n_elements as u64;
+            let q = quantize_q8f16(&f32_data);
+            eprintln!(
+                "  {:>8}: {} {:?} ({} elements, {:.1} KB → {:.1} KB) [src={src_dtype}]",
+                "Q8_F16",
+                name,
+                meta.shape,
+                n_elements,
+                raw_data.len() as f64 / 1024.0,
+                q.len() as f64 / 1024.0
+            );
+            hfq_tensors.push(HfqTensor {
+                name: name.to_string(),
+                quant_type: QuantType::Q8F16,
+                shape,
+                group_size: 32,
+                data: q,
+                spilled_len: 0,
+            });
+            st_files[*file_idx].drop_tensor_pages(name);
+            if let Some(ref mut s) = spill {
+                maybe_spill(&mut hfq_tensors, s, 2 * 1024 * 1024 * 1024);
+            }
+            continue;
+        }
+
+        {
+            let flags = MainQuantFlags {
+                use_fast: use_fast,
+            use_gptq_e8: use_gptq_e8,
+            use_gptq_mfp2e8: use_gptq_mfp2e8,
+            use_gptq_mfp3e8: use_gptq_mfp3e8,
+            use_hfp4: use_hfp4,
+            use_hfq2g128: use_hfq2g128,
+            use_hfq2g256: use_hfq2g256,
+            use_hfq3g128: use_hfq3g128,
+            use_hfq3g256: use_hfq3g256,
+            use_hfq4g256: use_hfq4g256,
+            use_hfq6: use_hfq6,
+            use_hfq_mixed: use_hfq_mixed,
+            use_mfp2e8_gptq_fmt: use_mfp2e8_gptq_fmt,
+            use_mfp3e8_gptq_fmt: use_mfp3e8_gptq_fmt,
+            use_mfp4: use_mfp4,
+            use_mfp4e8: use_mfp4e8,
+            use_mfp4e8soa: use_mfp4e8soa,
+            use_mfp4l: use_mfp4l,
+            use_mfp4p: use_mfp4p,
+            use_mixed: use_mixed,
+            use_mq2g256: use_mq2g256,
+            use_mq2g256_lloyd: use_mq2g256_lloyd,
+            use_mq3g256: use_mq3g256,
+            use_mq3g256_lloyd: use_mq3g256_lloyd,
+            use_mq4_mq2glexp: use_mq4_mq2glexp,
+            use_mq4_mq2lloyd_gptq_all: use_mq4_mq2lloyd_gptq_all,
+            use_mq4_mq2lloyd_imatrix: use_mq4_mq2lloyd_imatrix,
+            use_mq4_mq2lloyd_kmap: use_mq4_mq2lloyd_kmap,
+            use_mq4_mq2lloyd_native: use_mq4_mq2lloyd_native,
+            use_mq4_mq2lloydexp: use_mq4_mq2lloydexp,
+            use_mq4_mq3lloyd_kmap: use_mq4_mq3lloyd_kmap,
+            use_mq4_mq6exp: use_mq4_mq6exp,
+            use_mq4_mqlloyd_antirez: use_mq4_mqlloyd_antirez,
+            use_mq4_mqlloyd_antirez_gptq: use_mq4_mqlloyd_antirez_gptq,
+            use_mq4_mqlloyd_tiered: use_mq4_mqlloyd_tiered,
+            use_mq4g256: use_mq4g256,
+            use_mq4g256_lloyd: use_mq4g256_lloyd,
+            use_mq5g256: use_mq5g256,
+            use_mq6g256: use_mq6g256,
+            use_mq8g256: use_mq8g256,
+            use_q4k_all: use_q4k_all,
+            use_q4k_q8embed: use_q4k_q8embed,
+            use_q8: use_q8,
+            use_q8hfq: use_q8hfq,
+            is_gemma4_family,
+            q8_conv1d_default,
+            q8_router,
+            arch_id,
+            vision_quant: vision_quant.to_string()
+            };
+            let outer = MainQuantOuter {
+                kmap: &kmap,
+                imatrix_gguf: &imatrix_gguf,
+                hessian_dir: &hessian_dir,
+            };
+            let mut state = MainQuantState {
+                hfq_tensors: &mut hfq_tensors,
+                quantized_params: &mut quantized_params,
+                total_quant_error: &mut total_quant_error,
+                max_quant_error: &mut max_quant_error,
+                _n_quant_groups: &mut _n_quant_groups,
+                spill: &mut spill,
+            };
+            let ctx = PerTensorCtx { name, file_idx: *file_idx, shape: &meta.shape, n_elements, arch_id, dtype: &meta.dtype, is_vision };
+            handle_main_quant(&ctx, meta, raw_data, &flags, &outer, &mut state, &fp8_scale_for, &st_files);
+        }        // Release source file page cache after each tensor to prevent
+        // mmap'd pages from starving GPU allocations on UMA systems.
+        st_files[*file_idx].drop_tensor_pages(name);
+        }
+
+    // Summary
+    if use_deepseek4_mq2rxt_overlay {
+        if arch_id != 9 {
+            eprintln!("MQ2RXT overlay requires DeepSeek V4 arch_id=9, got {arch_id}");
+            std::process::exit(2);
+        }
+        let sidecar = include_prefix.is_some_and(|prefix| prefix == "mtp.");
+        let expected = if sidecar { 24 } else { 554 };
+        if mq2rxt_overlay_count != expected {
+            eprintln!(
+                "MQ2RXT {} overlay selected {} tensors, expected {expected}; refusing partial recipe",
+                if sidecar { "DSpark" } else { "trunk" },
+                mq2rxt_overlay_count
+            );
+            std::process::exit(2);
+        }
+        eprintln!(
+            "MQ2RXT {} overlay: exact {expected}-tensor P3 map encoded directly from the parent",
+            if sidecar { "DSpark" } else { "trunk" }
+        );
+        metadata_json =
+            stamp_deepseek4_mq2rxt_metadata(&metadata_json, sidecar).unwrap_or_else(|error| {
+                eprintln!("MQ2RXT metadata: {error}");
+                std::process::exit(2);
+            });
+    }
+    let total_bytes: usize = hfq_tensors
+        .iter()
+        .map(|t| {
+            if t.spilled_len > 0 {
+                t.spilled_len as usize
+            } else {
+                t.data.len()
+            }
+        })
+        .sum();
+    {
+        let fired = GPTQ_E8_FIRED.load(std::sync::atomic::Ordering::Relaxed);
+        let fb = GPTQ_E8_FALLBACK.load(std::sync::atomic::Ordering::Relaxed);
+        if fired + fb > 0 {
+            eprintln!(
+                "  GPTQ-on-E8: {fired} tensors FIRED (Hessian-aware LDLQ), {fb} RTN-fallback (missing/singular H). {:.1}% fired.",
+                100.0 * fired as f64 / (fired + fb) as f64
+            );
+            if fired == 0 {
+                eprintln!(
+                    "  WARNING: 0 GPTQ tensors fired with --hessian-dir set — likely a KEY-MISMATCH (.hblk filenames != hessian_key), NOT a flat result."
+                );
+            }
+        }
+    }
+    let mean_quant_error = if quantized_params > 0 {
+        total_quant_error / quantized_params as f64
+    } else {
+        0.0
+    };
+
+    eprintln!("\n=== Quantization Summary ===");
+    if skipped_params > 0 {
+        eprintln!(
+            "  Skipped params:   {skipped_params} (mtp/visual — use --include-vision for VL)"
+        );
+    }
+    eprintln!("  Total params:     {total_params}");
+    eprintln!(
+        "  Quantized params: {quantized_params} ({:.1}%)",
+        100.0 * quantized_params as f64 / total_params as f64
+    );
+    eprintln!("  Mean quant error: {mean_quant_error:.8}");
+    eprintln!("  Max quant error:  {max_quant_error:.8}");
+    eprintln!("  Output size:      {:.1} MB", total_bytes as f64 / 1e6);
+
+    // ── SP4b: bake prune finalize (rename kept per-expert tensors + patch count) ──
+    // Applied only when a bake keep-map is active. Renames the per-expert-named
+    // kept tensors (ds4 score layers / lfm2 / minimax) recorded during the loop to
+    // their compact slots, then patches the output metadata's routed-expert count
+    // to `kept_per_layer` so the baked model loads standalone (no env var, no
+    // load-time keep-map). Spill preserves `.name`, so rename order vs. spill is
+    // irrelevant. (Qwen3.5 stacked experts + all routers/biases were already
+    // pruned/gathered in-loop.)
+    // Task A0: apply Qwen3.5-MoE pre-split expert fusion renames. Unconditional
+    // (unlike the bake rename below, which is gated on `bake_keep_active`):
+    // rewrite each fused gate_proj output tensor to the loader's
+    // `experts.{N}.gate_up_proj.weight`. The in-loop quant path kept the original
+    // gate_proj name so k-map/encoding used it. Spill preserves `.name`, so this
+    // works regardless of spill order. No-op (byte-identical) for every model
+    // that isn't a pre-split Qwen3.5-MoE.
+    if !expert_fuse_rename.is_empty() {
+        for t in hfq_tensors.iter_mut() {
+            if let Some(new_name) = expert_fuse_rename.get(&t.name) {
+                t.name = new_name.clone();
+            }
+        }
+        eprintln!(
+            "qwen35 expert fusion: renamed {} fused gate_up_proj tensors",
+            expert_fuse_rename.len()
+        );
+    }
+
+    if bake_keep_active {
+        let plan = reap_bake_plan.as_ref().unwrap();
+        if !bake_rename.is_empty() {
+            for t in hfq_tensors.iter_mut() {
+                if let Some(new_name) = bake_rename.get(&t.name) {
+                    t.name = new_name.clone();
+                }
+            }
+            eprintln!(
+                "REAP bake: renamed {} kept per-expert tensors to compact slots",
+                bake_rename.len()
+            );
+        }
+        let kept = plan.kept_per_layer();
+        match patch_expert_count_metadata(&metadata_json, reap_arch, kept) {
+            Ok(patched) => {
+                metadata_json = patched;
+                eprintln!("REAP bake: patched output metadata expert count → {kept}");
+            }
+            Err(e) => {
+                eprintln!("reap bake: failed to patch expert-count metadata: {e}");
+                std::process::exit(2);
+            }
+        }
+    }
+
+    // Write .hfq file
+    eprintln!("\nWriting: {}", output_path.display());
+    // Final spill before writing
+    if let Some(ref mut s) = spill {
+        maybe_spill(&mut hfq_tensors, s, 0); // spill everything remaining
+    }
+    write_hfq(
+        output_path,
+        arch_id,
+        &metadata_json,
+        &hfq_tensors,
+        spill.as_mut(),
+    )
+    .unwrap();
+    if let Some(s) = spill {
+        s.cleanup();
+    }
+
+    let file_size = std::fs::metadata(output_path).unwrap().len();
+    eprintln!("Done: {:.1} MB written", file_size as f64 / 1e6);
+}
+
+
+fn setup_thread_pool(args: &QuantizeArgs) {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8);
+    let default_threads = ((cores * 8) / 10).max(1);
+    let threads = args.threads.unwrap_or(default_threads);
+    let _ = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build_global();
+    eprintln!(
+        "Rayon: {threads} worker threads ({cores} cores available, default 80% = {default_threads})"
+    );
+}
+
+fn handle_early_special_formats(args: &QuantizeArgs) -> bool {
+    let input_dir = args.input.as_str();
+    let output_path = args.output.as_str();
+    let format = args.format.as_str();
+    if matches!(
+        format,
+        "deepseek4-dense-mfp4e8soa-overlay" | "ds4-dense-e8soa-overlay"
+    ) {
+        if let Err(e) =
+            build_deepseek4_dense_e8soa_overlay(Path::new(input_dir), Path::new(output_path))
+        {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+        return true;
+    }
+    // ── deepseek4-dspark-e8soa: re-quantize an EXISTING DSpark/MTP sidecar's
+    // dense projections Q8F16 -> MFP4-E8-SoA so the drafter matches its MQ2R
+    // trunk. Input is the sidecar .hfq itself (NOT a checkpoint dir), so this
+    // needs no source safetensors. Routed experts stay MQ2-Lloyd; the
+    // `mq2r_sidecar` identity is stamped at build time.
+    //   hipfire-quantize --format deepseek4-dspark-e8soa \
+    //     --input <sidecar-in.mq2r> --output <sidecar-out.mq2r>
+    if matches!(
+        format,
+        "deepseek4-dspark-e8soa" | "ds4-dspark-e8soa" | "deepseek4-dspark-mq2r"
+    ) {
+        if let Err(e) =
+            build_deepseek4_dspark_e8soa_sidecar(Path::new(input_dir), Path::new(output_path))
+        {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+        return true;
+    }
+    // ── qwen3-dspark-q8: Qwen3DSparkModel drafter sidecar emission ──────────
+    if format == "qwen3-dspark-q8" || format == "qwen35-dspark-q8" {
+        run_qwen3_dspark(args);
+        return true;
+    }
+    false
+}
+
+fn run_qwen3_dspark(args: &QuantizeArgs) {
+    let input_dir = Path::new(args.input.as_str());
+    let output_path = Path::new(args.output.as_str());
+
+    // Read config
+    let config_path = input_dir.join("config.json");
+    let config_str = std::fs::read_to_string(&config_path).unwrap_or_else(|e| {
+        eprintln!(
+            "qwen3-dspark-q8: cannot read {}: {e}",
+            config_path.display()
+        );
+        std::process::exit(1);
+    });
+    let config: serde_json::Value = serde_json::from_str(&config_str).unwrap_or_else(|e| {
+        eprintln!("qwen3-dspark-q8: config.json parse error: {e}");
+        std::process::exit(1);
+    });
+
+    // Verify architecture
+    let archs = config.get("architectures").and_then(|v| v.as_array());
+    let is_dspark = archs
+        .map(|a| {
+            a.iter().any(|v| {
+                matches!(
+                    v.as_str(),
+                    Some("Qwen3DSparkModel" | "DSparkDraftModel" | "DSparkSpeculator")
+                )
+            })
+        })
+        .unwrap_or(false);
+    if !is_dspark {
+        eprintln!(
+            "dspark-q8: architectures is not a DSpark drafter \
+             (Qwen3DSparkModel / DSparkDraftModel / DSparkSpeculator); got {:?}",
+            archs
+        );
+        std::process::exit(1);
+    }
+
+    // Read DSpark config fields. speculators v0.6.0 (DSparkDraftModel) nests
+    // the body dims under `transformer_layer_config` and names the target
+    // taps `aux_hidden_state_layer_ids`; the legacy Qwen3DSparkModel puts
+    // dims / `target_layer_ids` at the top level. Handle both.
+    let tlc = config.get("transformer_layer_config");
+    let cfg_u64 = |k: &str, d: u64| -> u64 {
+        config
+            .get(k)
+            .or_else(|| tlc.and_then(|t| t.get(k)))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(d)
+    };
+    let block_size = config
+        .get("block_size")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(7) as usize;
+    let target_layer_ids: Vec<u64> = config
+        .get("target_layer_ids")
+        .or_else(|| config.get("aux_hidden_state_layer_ids"))
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_u64()).collect())
+        .unwrap_or_else(|| vec![1, 9, 17, 25, 33]);
+    let markov_rank = config
+        .get("markov_rank")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(256) as usize;
+    let noise_token_id = config
+        .get("mask_token_id")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(151669) as u32;
+    let draft_vocab_size = cfg_u64("draft_vocab_size", 0);
+    let confidence_with_markov = config
+        .get("confidence_head_with_markov")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let hidden_size = cfg_u64("hidden_size", 2048);
+    let head_dim = cfg_u64("head_dim", 128);
+    let num_hidden_layers = cfg_u64("num_hidden_layers", 0);
+    let num_attention_heads = cfg_u64("num_attention_heads", 0);
+    let num_key_value_heads = cfg_u64("num_key_value_heads", 0);
+    let intermediate_size = cfg_u64("intermediate_size", 0);
+    let vocab_size = cfg_u64("vocab_size", 0);
+    // rope params nest under transformer_layer_config.rope_parameters in v0.6.0.
+    let rope = tlc
+        .and_then(|t| t.get("rope_parameters"))
+        .or_else(|| config.get("rope_parameters"));
+    let partial_rotary_factor = rope
+        .and_then(|r| r.get("partial_rotary_factor"))
+        .or_else(|| config.get("partial_rotary_factor"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(1.0);
+    let rope_theta = rope
+        .and_then(|r| r.get("rope_theta"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(10000000.0);
+
+    eprintln!(
+        "qwen3-dspark-q8: block_size={block_size} target_layer_ids={target_layer_ids:?} \
+         markov_rank={markov_rank} noise_token_id={noise_token_id}"
+    );
+
+    // Build metadata JSON — mirrors the keys DsparkConfig::from_metadata_json reads.
+    let metadata = serde_json::json!({
+        "architecture": "qwen3",
+        "config": {
+            "dspark_block_size": block_size,
+            "dspark_target_layer_ids": target_layer_ids,
+            "dspark_num_targets": target_layer_ids.len(),
+            "dspark_markov_rank": markov_rank,
+            "dspark_noise_token_id": noise_token_id,
+            "dspark_enable_confidence": true,
+            "dspark_confidence_with_markov": confidence_with_markov,
+            "dspark_draft_vocab_size": draft_vocab_size,
+            "dspark_hidden_size": hidden_size,
+            "dspark_head_dim": head_dim,
+            "dspark_num_hidden_layers": num_hidden_layers,
+            "dspark_num_attention_heads": num_attention_heads,
+            "dspark_num_key_value_heads": num_key_value_heads,
+            "dspark_intermediate_size": intermediate_size,
+            "dspark_vocab_size": vocab_size,
+            "dspark_partial_rotary_factor": partial_rotary_factor,
+            "dspark_rope_theta": rope_theta,
+        },
+    });
+    let metadata_json = serde_json::to_string(&metadata).unwrap();
+
+    // Load safetensors
+    let st_paths = find_safetensors(input_dir);
+    if st_paths.is_empty() {
+        eprintln!(
+            "qwen3-dspark-q8: no safetensors found in {}",
+            input_dir.display()
+        );
+        std::process::exit(1);
+    }
+    let st_files: Vec<SafetensorsFile> = st_paths
+        .iter()
+        .map(|p| {
+            eprintln!("Loading: {}", p.display());
+            SafetensorsFile::open(p).unwrap()
+        })
+        .collect();
+
+    let mut all_tensors: Vec<(&str, usize)> = Vec::new();
+    for (fi, st) in st_files.iter().enumerate() {
+        for name in st.tensor_names() {
+            all_tensors.push((name, fi));
+        }
+    }
+    all_tensors.sort_by_key(|(name, _)| name.to_string());
+    eprintln!("qwen3-dspark-q8: {} tensors found", all_tensors.len());
+
+    // Determine which 2D weights get Q8F16 (attn projections + MLP projections)
+    let is_dspark_matmul_weight = |name: &str| -> bool {
+        // Attn projections: q/k/v/o_proj
+        let is_attn = name.contains("self_attn.")
+            && (name.ends_with("q_proj.weight")
+                || name.ends_with("k_proj.weight")
+                || name.ends_with("v_proj.weight")
+                || name.ends_with("o_proj.weight"));
+        // MLP projections: gate/up/down_proj
+        let is_mlp = name.contains("mlp.")
+            && (name.ends_with("gate_proj.weight")
+                || name.ends_with("up_proj.weight")
+                || name.ends_with("down_proj.weight"));
+        is_attn || is_mlp
+    };
+
+    let mut hfq_tensors: Vec<HfqTensor> = Vec::new();
+    let mut total_params = 0u64;
+    let mut q8_params = 0u64;
+    let mut f16_params = 0u64;
+
+    for (name, file_idx) in &all_tensors {
+        let (meta, raw_data) = st_files[*file_idx].tensor_data(name).unwrap();
+        let n_elements: usize = meta.shape.iter().product();
+        total_params += n_elements as u64;
+
+        // Map source tensor name → sidecar name
+        let sidecar_name = if *name == "fc.weight" {
+            "main_proj.weight".to_string()
+        } else if *name == "hidden_norm.weight" {
+            "main_norm.weight".to_string()
+        } else {
+            name.to_string()
+        };
+
+        let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
+
+        // Reduced-vocab maps: `d2t` (draft→target token id, I64) and `t2d`
+        // (target→draft membership, BOOL). Store as F32 — token indices are
+        // < 2^24 so exact; the DSpark loader casts d2t→u32, t2d→bool. The
+        // float `to_f32` path can't read I64/BOOL.
+        if *name == "d2t" || *name == "t2d" {
+            let f32_data: Vec<f32> = if meta.dtype == "I64" {
+                raw_data
+                    .chunks_exact(8)
+                    .map(|c| i64::from_le_bytes(c.try_into().unwrap()) as f32)
+                    .collect()
+            } else if meta.dtype == "BOOL" || meta.dtype == "U8" {
+                raw_data
+                    .iter()
+                    .map(|&b| if b != 0 { 1.0 } else { 0.0 })
+                    .collect()
+            } else {
+                to_f32(raw_data, &meta.dtype)
+            };
+            let bytes: Vec<u8> = f32_data.iter().flat_map(|&v| v.to_le_bytes()).collect();
+            eprintln!(
+                "  {:>8}: {} {:?} ({} elems) [reduced-vocab map]",
+                "F32", sidecar_name, meta.shape, n_elements
+            );
+            f16_params += n_elements as u64;
+            hfq_tensors.push(HfqTensor {
+                name: sidecar_name,
+                quant_type: QuantType::F32,
+                shape,
+                group_size: 0,
+                data: bytes,
+                spilled_len: 0,
+            });
+            continue;
+        }
+
+        if is_dspark_matmul_weight(name) && n_elements >= 32 {
+            // 2D matmul weight → Q8F16 (body layers, trained precision preserved)
+            let f32_data = to_f32(raw_data, &meta.dtype);
+            let q = quantize_q8f16(&f32_data);
+            eprintln!(
+                "  {:>8}: {} {:?} ({} elems, {:.1} KB → {:.1} KB)",
+                "Q8_F16",
+                sidecar_name,
+                meta.shape,
+                n_elements,
+                raw_data.len() as f64 / 1024.0,
+                q.len() as f64 / 1024.0
+            );
+            q8_params += n_elements as u64;
+            hfq_tensors.push(HfqTensor {
+                name: sidecar_name,
+                quant_type: QuantType::Q8F16,
+                shape,
+                group_size: 32,
+                data: q,
+                spilled_len: 0,
+            });
+        } else {
+            // Everything else → F16 (norms, embeds, main_proj, markov, confidence, lm_head)
+            let f32_data = to_f32(raw_data, &meta.dtype);
+            let f16_bytes: Vec<u8> = f32_data
+                .iter()
+                .flat_map(|&v| f32_to_f16(v).to_le_bytes())
+                .collect();
+            eprintln!(
+                "  {:>8}: {} {:?} ({} elems, {:.1} KB → {:.1} KB)",
+                "F16",
+                sidecar_name,
+                meta.shape,
+                n_elements,
+                raw_data.len() as f64 / 1024.0,
+                f16_bytes.len() as f64 / 1024.0
+            );
+            f16_params += n_elements as u64;
+            hfq_tensors.push(HfqTensor {
+                name: sidecar_name,
+                quant_type: QuantType::F16,
+                shape,
+                group_size: 0,
+                data: f16_bytes,
+                spilled_len: 0,
+            });
+        }
+    }
+
+    eprintln!(
+        "\n=== qwen3-dspark-q8 Summary ===\n\
+         Total params:  {total_params}\n\
+         Q8F16 params:  {q8_params} ({:.1}%)\n\
+         F16 params:    {f16_params} ({:.1}%)\n\
+         Tensors:       {}",
+        100.0 * q8_params as f64 / total_params as f64,
+        100.0 * f16_params as f64 / total_params as f64,
+        hfq_tensors.len()
+    );
+
+    eprintln!("\nWriting: {}", output_path.display());
+    write_hfq(output_path, 1u32, &metadata_json, &hfq_tensors, None).unwrap_or_else(|e| {
+        eprintln!("qwen3-dspark-q8: write_hfq failed: {e}");
+        std::process::exit(2);
+    });
+
+    let file_size = std::fs::metadata(output_path).unwrap().len();
+    eprintln!("Done: {:.1} MB written", file_size as f64 / 1e6);
+}
+
+
+fn try_handle_lfm2moe(
+    is_lfm2moe: bool,
+    use_mq4g256: bool,
+    name: &str,
+    meta: &TensorMeta,
+    raw_data: &[u8],
+    fp8_scale_for: &HashMap<String, (usize, String)>,
+    st_files: &[SafetensorsFile],
+    hfq_tensors: &mut Vec<HfqTensor>,
+    quantized_params: &mut u64,
+    spill: &mut Option<TensorSpill>,
+    file_idx: usize,
+    n_elements: usize,
+) -> bool {
+// ── LFM2.5 ingest (arch_id 11) ─────────────────────────────────────────
+// Routed experts (A1B only) → MQ4G256; expert_bias → F32; everything else
+// (conv in/out_proj, conv depthwise filter, attn q/k/v/out_proj + qk-norm,
+// dense w1/w2/w3, router gate, operator/ffn/embedding norms, tied embed/
+// lm_head) → Q8 (qt=3 Q8F16). Dense lfm2 (350M/1.2B) has no experts, so
+// every tensor takes the final Q8 path. The loader's load_f32 dequantizes
+// Q8 norms / conv-filter back to F32 on load.
+if is_lfm2moe {
+    let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
+    if name.contains(".feed_forward.experts.")
+        && (name.ends_with(".w1.weight")
+            || name.ends_with(".w2.weight")
+            || name.ends_with(".w3.weight"))
+        && meta.shape.len() == 2
+        && meta.shape[1] % 256 == 0
+    {
+        let f32_data = tensor_to_f32_with_optional_fp8_scale(
+            name,
+            raw_data,
+            meta,
+            &fp8_scale_for,
+            &st_files,
+        );
+        let signs1 = gen_fwht_signs(42, 256);
+        let signs2 = gen_fwht_signs(1042, 256);
+        let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
+        eprintln!(
+            "  {:>8}: {} {:?} ({:.1} KB → {:.1} KB)",
+            "MQ4-LFM",
+            name,
+            meta.shape,
+            raw_data.len() as f64 / 1024.0,
+            q.len() as f64 / 1024.0
+        );
+        hfq_tensors.push(HfqTensor {
+            name: name.to_string(),
+            quant_type: QuantType::MQ4G256,
+            shape,
+            group_size: 256,
+            data: q,
+            spilled_len: 0,
+        });
+        *quantized_params += (meta.shape[0] * meta.shape[1]) as u64;
+        st_files[file_idx].drop_tensor_pages(name);
+        if let Some(s) = spill.as_mut() {
+            maybe_spill(hfq_tensors, s, 2 * 1024 * 1024 * 1024);
+        }
+        return true;
+    }
+    if name.ends_with(".feed_forward.expert_bias") {
+        let f32_data = tensor_to_f32_with_optional_fp8_scale(
+            name,
+            raw_data,
+            meta,
+            &fp8_scale_for,
+            &st_files,
+        );
+        let mut bytes = Vec::with_capacity(f32_data.len() * 4);
+        for v in &f32_data {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        eprintln!(
+            "  {:>8}: {} {:?} (expert_bias F32)",
+            "F32-LFM", name, meta.shape
+        );
+        hfq_tensors.push(HfqTensor {
+            name: name.to_string(),
+            quant_type: QuantType::F32,
+            shape,
+            group_size: 1,
+            data: bytes,
+            spilled_len: 0,
+        });
+        st_files[file_idx].drop_tensor_pages(name);
+        return true;
+    }
+    // Dense mq4 (--format mq4): route the big 2D proj/FFN weight matrices
+    // (conv in/out_proj, attn q/k/v/out_proj, dense w1/w2/w3) → MQ4G256.
+    // The loader's weight_gemv / weight_gemv_residual auto-FWHT-rotate
+    // MQ4G256, so no forward change is needed. Keep the tied embed/lm_head
+    // (model.embed_tokens.weight), the router gate, norms, and the depthwise
+    // conv filter at Q8/F32 (small + precision-sensitive). Default (no mq4
+    // format) keeps the full-precision Q8 bring-up recipe.
+    if use_mq4g256
+        && meta.shape.len() == 2
+        && meta.shape[1] % 256 == 0
+        && !name.ends_with("embed_tokens.weight")
+        && (name.ends_with("_proj.weight")
+            || name.ends_with(".w1.weight")
+            || name.ends_with(".w2.weight")
+            || name.ends_with(".w3.weight"))
+    {
+        let f32_data = tensor_to_f32_with_optional_fp8_scale(
+            name,
+            raw_data,
+            meta,
+            &fp8_scale_for,
+            &st_files,
+        );
+        let signs1 = gen_fwht_signs(42, 256);
+        let signs2 = gen_fwht_signs(1042, 256);
+        let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
+        eprintln!(
+            "  {:>8}: {} {:?} ({:.1} KB → {:.1} KB)",
+            "MQ4-LFM",
+            name,
+            meta.shape,
+            raw_data.len() as f64 / 1024.0,
+            q.len() as f64 / 1024.0
+        );
+        hfq_tensors.push(HfqTensor {
+            name: name.to_string(),
+            quant_type: QuantType::MQ4G256,
+            shape,
+            group_size: 256,
+            data: q,
+            spilled_len: 0,
+        });
+        *quantized_params += (meta.shape[0] * meta.shape[1]) as u64;
+        st_files[file_idx].drop_tensor_pages(name);
+        if let Some(s) = spill.as_mut() {
+            maybe_spill(hfq_tensors, s, 2 * 1024 * 1024 * 1024);
+        }
+        return true;
+    }
+
+    // All remaining LFM2 tensors → Q8 (qt=3). quantize_q8f16 handles any
+    // 1D/2D/3D shape elementwise (conv.conv.weight is [hidden,1,K]).
+    let f32_data = tensor_to_f32_with_optional_fp8_scale(
+        name,
+        raw_data,
+        meta,
+        &fp8_scale_for,
+        &st_files,
+    );
+    let q = quantize_q8f16(&f32_data);
+    eprintln!("  {:>8}: {} {:?} (Q8)", "Q8-LFM", name, meta.shape);
+    hfq_tensors.push(HfqTensor {
+        name: name.to_string(),
+        quant_type: QuantType::Q8F16,
+        shape,
+        group_size: 32,
+        data: q,
+        spilled_len: 0,
+    });
+    *quantized_params += n_elements as u64;
+    st_files[file_idx].drop_tensor_pages(name);
+    return true;
+}
+
+    false
+}
+
+enum BakeKeepResult {
+    Pruned,
+    Gathered { meta: TensorMeta, bytes: Vec<u8> },
+}
+
+fn handle_bake_keep_active(
+    name: &str,
+    file_idx: usize,
+    meta: &TensorMeta,
+    raw_data: &[u8],
+    bake_keep_active: bool,
+    reap_bake_plan: &Option<hipfire_reap::plan::ReapPlan>,
+    reap_arch: reap_overlay::ReapArch,
+    bake_rename: &mut HashMap<String, String>,
+    st_files: &[SafetensorsFile],
+) -> Option<BakeKeepResult> {
+    if !bake_keep_active {
+        return None;
+    }
+    let plan = reap_bake_plan.as_ref().unwrap();
+    let keep = plan.keep.as_ref().unwrap();
+    let layer = reap_overlay::bake_layer_of(name);
+    if reap_overlay::expert_index_of(name, reap_arch).is_some() {
+        let l = layer.unwrap_or_else(|| {
+            eprintln!("reap bake: routed-expert tensor '{name}' has no parseable layer");
+            std::process::exit(2);
+        });
+        if reap_arch == reap_overlay::ReapArch::Deepseek4 && l <= 2 {
+            eprintln!(
+                "reap bake: ds4 hash-layer (0-2) tid2eid remap not supported in bake;                  use the load-time keep-map for pruned ds4 hash layers"
+            );
+            std::process::exit(2);
+        }
+        if l >= keep.len() {
+            eprintln!("reap bake: layer {l} for '{name}' out of keep-map range");
+            std::process::exit(2);
+        }
+        match reap_overlay::bake_expert_rename(name, reap_arch, l, &keep[l]) {
+            None => {
+                st_files[file_idx].drop_tensor_pages(name);
+                return Some(BakeKeepResult::Pruned);
+            }
+            Some(new_name) => {
+                if &new_name != name {
+                    bake_rename.insert(name.to_string(), new_name);
+                }
+            }
+        }
+    } else if let Some(l) = layer {
+        let is_router_w = reap_overlay::is_reap_router_weight(name, reap_arch)
+            && meta.shape.len() == 2
+            && meta.shape[0] == plan.original_experts;
+        let is_expert_bias = reap_overlay::is_reap_expert_bias(name, reap_arch)
+            && meta.shape.len() == 1
+            && meta.shape[0] == plan.original_experts;
+        if is_router_w || is_expert_bias {
+            if reap_arch == reap_overlay::ReapArch::Deepseek4 && l <= 2 {
+                eprintln!(
+                    "reap bake: ds4 hash-layer (0-2) router/tid2eid remap not supported                      in bake; use the load-time keep-map for pruned ds4 hash layers"
+                );
+                std::process::exit(2);
+            }
+            if l >= keep.len() {
+                eprintln!(
+                    "reap bake: layer {l} for router/bias '{name}' out of keep-map range"
+                );
+                std::process::exit(2);
+            }
+            let keep_l = &keep[l];
+            match hipfire_reap::gather::gather_rows(&meta.shape, raw_data, keep_l) {
+                Ok((new_shape, gathered)) => {
+                    let gathered_meta = TensorMeta {
+                        dtype: meta.dtype.clone(),
+                        shape: new_shape,
+                        data_offsets: meta.data_offsets,
+                    };
+                    eprintln!(
+                        "  {:>8}: {} {:?} → rows[{}] (kept {} of {})",
+                        "GATHER",
+                        name,
+                        meta.shape,
+                        keep_l.len(),
+                        keep_l.len(),
+                        plan.original_experts
+                    );
+                    return Some(BakeKeepResult::Gathered { meta: gathered_meta, bytes: gathered });
+                }
+                Err(e) => {
+                    eprintln!("reap bake: router/bias gather '{name}': {e}");
+                    std::process::exit(2);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn handle_f32_passthrough(
+    ctx: &PerTensorCtx,
+    meta: &TensorMeta,
+    raw_data: &[u8],
+    is_cohere2moe: bool,
+    is_moe: bool,
+    use_f32_passthrough: bool,
+    fp8_scale_for: &HashMap<String, (usize, String)>,
+    st_files: &[SafetensorsFile],
+    hfq_tensors: &mut Vec<HfqTensor>,
+    quantized_params: &mut u64,
+    spill: &mut Option<TensorSpill>,
+) -> bool {
+    if !use_f32_passthrough || is_cohere2moe {
+        return false;
+    }
+    if is_moe
+        && ctx.name.contains("mlp.experts.")
+        && (ctx.name.ends_with("gate_up_proj") || ctx.name.ends_with("down_proj"))
+        && meta.shape.len() == 3
+    {
+        let n_exp = meta.shape[0];
+        let inner_n: usize = meta.shape[1..].iter().product();
+        let base_name = if ctx.name.ends_with("gate_up_proj") {
+            "gate_up_proj"
+        } else {
+            "down_proj"
+        };
+        let parent = &ctx.name[..ctx.name.len() - base_name.len()];
+        let inner_shape: Vec<u32> = meta.shape[1..].iter().map(|&d| d as u32).collect();
+        let f32_all = tensor_to_f32_with_optional_fp8_scale(
+            ctx.name,
+            raw_data,
+            meta,
+            fp8_scale_for,
+            st_files,
+        );
+        for x in 0..n_exp {
+            let slice = &f32_all[x * inner_n..(x + 1) * inner_n];
+            let bytes: Vec<u8> = slice.iter().flat_map(|&v| v.to_le_bytes()).collect();
+            hfq_tensors.push(HfqTensor {
+                name: format!("{parent}{x}.{base_name}.weight"),
+                quant_type: QuantType::F32,
+                shape: inner_shape.clone(),
+                group_size: 0,
+                data: bytes,
+                spilled_len: 0,
+            });
+        }
+        *quantized_params += ctx.n_elements as u64;
+        eprintln!(
+            "  {:>8}: {} {:?} -> {} per-expert F32 [oracle split]",
+            "F32", ctx.name, meta.shape, n_exp
+        );
+        st_files[ctx.file_idx].drop_tensor_pages(ctx.name);
+        if let Some(sp) = spill.as_mut() {
+            maybe_spill(hfq_tensors, sp, 2 * 1024 * 1024 * 1024);
+        }
+        return true;
+    }
+    let f32_data = tensor_to_f32_with_optional_fp8_scale(
+        ctx.name,
+        raw_data,
+        meta,
+        fp8_scale_for,
+        st_files,
+    );
+    let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
+    let bytes: Vec<u8> = f32_data.iter().flat_map(|&v| v.to_le_bytes()).collect();
+    *quantized_params += ctx.n_elements as u64;
+    eprintln!(
+        "  {:>8}: {} {:?} ({} elements, {:.1} KB -> {:.1} KB) [F32 oracle passthrough]",
+        "F32",
+        ctx.name,
+        meta.shape,
+        ctx.n_elements,
+        raw_data.len() as f64 / 1024.0,
+        bytes.len() as f64 / 1024.0
+    );
+    hfq_tensors.push(HfqTensor {
+        name: ctx.name.to_string(),
+        quant_type: QuantType::F32,
+        shape,
+        group_size: 0,
+        data: bytes,
+        spilled_len: 0,
+    });
+    st_files[ctx.file_idx].drop_tensor_pages(ctx.name);
+    if let Some(sp) = spill.as_mut() {
+        maybe_spill(hfq_tensors, sp, 2 * 1024 * 1024 * 1024);
+    }
+    true
+}
+
+fn handle_bf16_passthrough(
+    ctx: &PerTensorCtx,
+    meta: &TensorMeta,
+    raw_data: &[u8],
+    use_bf16: bool,
+    arch_id: u32,
+    is_vision: bool,
+    is_moe: bool,
+    fp8_scale_for: &HashMap<String, (usize, String)>,
+    st_files: &[SafetensorsFile],
+    hfq_tensors: &mut Vec<HfqTensor>,
+    quantized_params: &mut u64,
+    spill: &mut Option<TensorSpill>,
+) -> bool {
+    if !use_bf16 || !matches!(arch_id, 5 | 6) || is_vision {
+        return false;
+    }
+    let bf16_bytes = if meta.dtype == "BF16" {
+        raw_data.to_vec()
+    } else {
+        tensor_to_f32_with_optional_fp8_scale(
+            ctx.name,
+            raw_data,
+            meta,
+            fp8_scale_for,
+            st_files,
+        )
+        .iter()
+        .flat_map(|&value| {
+            let bits = value.to_bits();
+            let rounded = bits.wrapping_add(0x7fff + ((bits >> 16) & 1));
+            ((rounded >> 16) as u16).to_le_bytes()
+        })
+        .collect()
+    };
+
+    if is_moe
+        && ctx.name.contains("mlp.experts.")
+        && (ctx.name.ends_with("gate_up_proj") || ctx.name.ends_with("down_proj"))
+        && meta.shape.len() == 3
+    {
+        let n_exp = meta.shape[0];
+        let inner_n: usize = meta.shape[1..].iter().product();
+        let base_name = if ctx.name.ends_with("gate_up_proj") {
+            "gate_up_proj"
+        } else {
+            "down_proj"
+        };
+        let parent = &ctx.name[..ctx.name.len() - base_name.len()];
+        let inner_shape: Vec<u32> = meta.shape[1..].iter().map(|&d| d as u32).collect();
+        for expert in 0..n_exp {
+            let start = expert * inner_n * 2;
+            let end = start + inner_n * 2;
+            hfq_tensors.push(HfqTensor {
+                name: format!("{parent}{expert}.{base_name}.weight"),
+                quant_type: QuantType::BF16,
+                shape: inner_shape.clone(),
+                group_size: 0,
+                data: bf16_bytes[start..end].to_vec(),
+                spilled_len: 0,
+            });
+        }
+        eprintln!(
+            "  {:>8}: {} {:?} -> {} per-expert BF16 [source split]",
+            "BF16", ctx.name, meta.shape, n_exp
+        );
+    } else {
+        eprintln!(
+            "  {:>8}: {} {:?} ({} elements, {:.1} KB) [source passthrough]",
+            "BF16",
+            ctx.name,
+            meta.shape,
+            ctx.n_elements,
+            bf16_bytes.len() as f64 / 1024.0
+        );
+        hfq_tensors.push(HfqTensor {
+            name: ctx.name.to_string(),
+            quant_type: QuantType::BF16,
+            shape: meta.shape.iter().map(|&s| s as u32).collect(),
+            group_size: 0,
+            data: bf16_bytes,
+            spilled_len: 0,
+        });
+    }
+    *quantized_params += ctx.n_elements as u64;
+    st_files[ctx.file_idx].drop_tensor_pages(ctx.name);
+    if let Some(sp) = spill.as_mut() {
+        maybe_spill(hfq_tensors, sp, 2 * 1024 * 1024 * 1024);
+    }
+    true
+}
+
+fn handle_cohere2moe(
+    name: &str,
+    meta: &TensorMeta,
+    raw_data: &[u8],
+    n_elements: usize,
+    is_cohere2moe: bool,
+    use_bf16: bool,
+    use_f16: bool,
+    use_mq6g256: bool,
+    use_mq4g256: bool,
+    fp8_scale_for: &HashMap<String, (usize, String)>,
+    st_files: &[SafetensorsFile],
+    hfq_tensors: &mut Vec<HfqTensor>,
+    quantized_params: &mut u64,
+    spill: &mut Option<TensorSpill>,
+    file_idx: usize,
+) -> bool {
+    if !is_cohere2moe {
+        return false;
+    }
+    let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
+    if name.contains("norm") {
+        let f32_data = tensor_to_f32_with_optional_fp8_scale(
+            name,
+            raw_data,
+            meta,
+            fp8_scale_for,
+            st_files,
+        );
+        let f16_bytes: Vec<u8> = f32_data
+            .iter()
+            .flat_map(|&v| f32_to_f16(v).to_le_bytes())
+            .collect();
+        eprintln!("  {:>8}: {} {:?} (norm F16)", "F16-COH", name, meta.shape);
+        hfq_tensors.push(HfqTensor {
+            name: name.to_string(),
+            quant_type: QuantType::F16,
+            shape,
+            group_size: 0,
+            data: f16_bytes,
+            spilled_len: 0,
+        });
+        *quantized_params += n_elements as u64;
+        st_files[file_idx].drop_tensor_pages(name);
+        return true;
+    }
+
+    if name.ends_with("embed_tokens.weight") {
+        let f32_data = tensor_to_f32_with_optional_fp8_scale(
+            name,
+            raw_data,
+            meta,
+            fp8_scale_for,
+            st_files,
+        );
+        let q = quantize_q8f16(&f32_data);
+        eprintln!(
+            "  {:>8}: {} {:?} (tied embed Q8)",
+            "Q8-COH", name, meta.shape
+        );
+        hfq_tensors.push(HfqTensor {
+            name: name.to_string(),
+            quant_type: QuantType::Q8F16,
+            shape,
+            group_size: 32,
+            data: q,
+            spilled_len: 0,
+        });
+        *quantized_params += n_elements as u64;
+        st_files[file_idx].drop_tensor_pages(name);
+        return true;
+    }
+
+    if meta.shape.len() == 2 && meta.shape[1] % 256 == 0 {
+        let is_expert = name.contains(".mlp.experts.");
+        let is_router = name.ends_with(".mlp.gate.weight");
+        if use_bf16 && !is_router && meta.dtype == "BF16" {
+            eprintln!(
+                "  {:>8}: {} {:?} (native bf16)",
+                "BF16-COH", name, meta.shape
+            );
+            hfq_tensors.push(HfqTensor {
+                name: name.to_string(),
+                quant_type: QuantType::BF16,
+                shape,
+                group_size: 0,
+                data: raw_data.to_vec(),
+                spilled_len: 0,
+            });
+            *quantized_params += (meta.shape[0] * meta.shape[1]) as u64;
+            st_files[file_idx].drop_tensor_pages(name);
+            if let Some(s) = spill.as_mut() {
+                maybe_spill(hfq_tensors, s, 2 * 1024 * 1024 * 1024);
+            }
+            return true;
+        }
+
+        let dt = if is_router {
+            QuantType::Q8F16
+        } else if use_f16 {
+            QuantType::F16
+        } else if is_expert {
+            if use_mq6g256 {
+                QuantType::MQ6G256
+            } else if use_mq4g256 {
+                QuantType::MQ4G256
+            } else {
+                QuantType::Q8F16
+            }
+        } else {
+            QuantType::Q8F16
+        };
+        let f32_data = tensor_to_f32_with_optional_fp8_scale(
+            name,
+            raw_data,
+            meta,
+            fp8_scale_for,
+            st_files,
+        );
+        let (data, gs, tag): (Vec<u8>, u32, &str) = match dt {
+            QuantType::F16 => (
+                f32_data
+                    .iter()
+                    .flat_map(|&v| f32_to_f16(v).to_le_bytes())
+                    .collect(),
+                0,
+                "F16-COH",
+            ),
+            QuantType::MQ6G256 => {
+                let s1 = gen_fwht_signs(42, 256);
+                let s2 = gen_fwht_signs(1042, 256);
+                (quantize_mq6g256(&f32_data, &s1, &s2), 256, "MQ6-COH")
+            }
+            QuantType::MQ4G256 => {
+                let s1 = gen_fwht_signs(42, 256);
+                let s2 = gen_fwht_signs(1042, 256);
+                (quantize_mq4g256(&f32_data, &s1, &s2), 256, "MQ4-COH")
+            }
+            _ => (quantize_q8f16(&f32_data), 32, "Q8-COH"),
+        };
+        eprintln!(
+            "  {:>8}: {} {:?} ({:.1} KB -> {:.1} KB)",
+            tag,
+            name,
+            meta.shape,
+            raw_data.len() as f64 / 1024.0,
+            data.len() as f64 / 1024.0
+        );
+        hfq_tensors.push(HfqTensor {
+            name: name.to_string(),
+            quant_type: dt,
+            shape,
+            group_size: gs,
+            data,
+            spilled_len: 0,
+        });
+        *quantized_params += (meta.shape[0] * meta.shape[1]) as u64;
+        st_files[file_idx].drop_tensor_pages(name);
+        if let Some(s) = spill.as_mut() {
+            maybe_spill(hfq_tensors, s, 2 * 1024 * 1024 * 1024);
+        }
+        return true;
+    }
+
+    let f32_data = tensor_to_f32_with_optional_fp8_scale(
+        name,
+        raw_data,
+        meta,
+        fp8_scale_for,
+        st_files,
+    );
+    let q = quantize_q8f16(&f32_data);
+    eprintln!("  {:>8}: {} {:?} (Q8)", "Q8-COH", name, meta.shape);
+    hfq_tensors.push(HfqTensor {
+        name: name.to_string(),
+        quant_type: QuantType::Q8F16,
+        shape,
+        group_size: 32,
+        data: q,
+        spilled_len: 0,
+    });
+    *quantized_params += n_elements as u64;
+    st_files[file_idx].drop_tensor_pages(name);
+    true
+}
+
+fn handle_moe_expert_3d(
+    ctx: &PerTensorCtx,
+    meta: &TensorMeta,
+    raw_data: &[u8],
+    is_moe: bool,
+    is_gemma4: bool,
+    kmap: &HashMap<String, QuantLevel>,
+    mq3_tier_layers: &std::collections::HashSet<usize>,
+    imatrix_gguf: &Option<gguf_input::GgufFile>,
+    moe_tier_map: &Option<std::collections::HashMap<(usize, usize), QuantType>>,
+    use_moe_graded: bool,
+    moe_hot_frac: f64,
+    hessian_dir: &Option<PathBuf>,
+    use_gptq_e8: bool,
+    use_gptq_mfp3e8: bool,
+    use_gptq_mfp2e8: bool,
+    use_mq6g256: bool,
+    use_mq4g256: bool,
+    use_mq4_mq6exp: bool,
+    use_mq4_mq2lloydexp: bool,
+    use_mq4_mq2glexp: bool,
+    use_mq4_mq2lloyd_native: bool,
+    use_mq4_mq2lloyd_kmap: bool,
+    use_mq4_mq2lloyd_imatrix: bool,
+    use_mq4_mq3lloyd_kmap: bool,
+    use_mq4_mqlloyd_tiered: bool,
+    use_mq4_mqlloyd_antirez: bool,
+    use_mq4_mqlloyd_antirez_gptq: bool,
+    use_mq4_mq2lloyd_gptq_all: bool,
+    use_mq5g256: bool,
+    use_hfq6: bool,
+    use_hfq4g256: bool,
+    use_hfq3g256: bool,
+    use_hfq3g128: bool,
+    use_hfq2g256: bool,
+    use_hfq2g128: bool,
+    use_hfq_mixed: bool,
+    use_mfp4: bool,
+    use_mfp4p: bool,
+    use_mfp4e8: bool,
+    use_mfp4e8soa: bool,
+    use_mfp3e8_gptq_fmt: bool,
+    use_mfp2e8_gptq_fmt: bool,
+    use_mq3g256: bool,
+    use_mq2g256: bool,
+    use_mq2g256_lloyd: bool,
+    use_mq3g256_lloyd: bool,
+    use_mq4g256_lloyd: bool,
+    use_hfp4: bool,
+    use_mfp4l: bool,
+    routed_gl: bool,
+    imatrix_path: &Option<PathBuf>,
+    bake_keep_active: bool,
+    reap_bake_plan: &Option<hipfire_reap::plan::ReapPlan>,
+    reap_arch: reap_overlay::ReapArch,
+    st_files: &[SafetensorsFile],
+    fp8_scale_for: &HashMap<String, (usize, String)>,
+    hfq_tensors: &mut Vec<HfqTensor>,
+    quantized_params: &mut u64,
+    spill: &mut Option<TensorSpill>,
+) -> bool {
+    let name = ctx.name;
+    let file_idx = ctx.file_idx;
+    let n_elements = ctx.n_elements;
+    let arch_id = ctx.arch_id;
+    let is_vision = ctx.is_vision;
+
             let n_experts = meta.shape[0];
             let inner_n: usize = meta.shape[1..].iter().product();
             let elem_size = match meta.dtype.as_str() {
@@ -3072,7 +3649,7 @@ pub(crate) fn run() {
             // (e.g. "...mlp.experts.gate_up_proj") contains "mlp.experts."
             // so kmap_resolve rule 4 matches it. The kmap HashMap was built
             // from all_tensors which has these parent names as keys.
-            let kmap_promote = kmap.get(*name) == Some(&QuantLevel::Promote6);
+            let kmap_promote = kmap.get(name) == Some(&QuantLevel::Promote6);
             // Phase 5 tiering decision needs the layer index for this parent.
             // Computed once here and reused by both expert_mq2lloyd_native
             // and expert_mq3lloyd_native below.
@@ -3728,7 +4305,7 @@ pub(crate) fn run() {
                     new_tensors.push(sc);
                 }
             }
-            quantized_params += inner_n as u64 * n_out_experts as u64;
+            *quantized_params += inner_n as u64 * n_out_experts as u64;
             // Single eprintln to summarize the whole expert sweep.
             let label = if moe_tier_map.is_some() && parent_layer.is_some() {
                 "TierMap"
@@ -3797,112 +4374,32 @@ pub(crate) fn run() {
             );
             hfq_tensors.append(&mut new_tensors);
             // Drop source pages and spill quantized data after each expert batch.
-            st_files[*file_idx].drop_tensor_pages(name);
-            if let Some(ref mut s) = spill {
-                maybe_spill(&mut hfq_tensors, s, 2 * 1024 * 1024 * 1024); // 2 GB threshold
+            st_files[file_idx].drop_tensor_pages(name);
+            if let Some(s) = spill.as_mut() {
+                maybe_spill(hfq_tensors, s, 2 * 1024 * 1024 * 1024); // 2 GB threshold
             }
-            continue;
-        }
+            return true;
+        
+    false
+}
 
-        // ── deepseek4-q8-mtp short-circuit ───────────────────────────────────────
-        // Routed experts (.ffn.experts.*) were claimed by the MQ2-Lloyd
-        // branch above. Here we handle everything else:
-        //
-        //   - antirez-precision-sensitive (compressor / indexer /
-        //     router gate.weight): keep as F16 on disk. The compressor
-        //     class alone regresses PPL +40-81% if dropped to MQ4
-        //     (memory: project_deepseek4_compressor_must_stay_f16); F16 → Q8
-        //     on these classes is a smaller hit but still unnecessary.
-        //   - All other weights: uniform Q8F16.
-        //   - Norms / biases / HC matrices: should_quantize() returns
-        //     false → fall through to F16 fallback at the bottom.
-        // deepseek4-mtp-precise: all mtp.0.* dense weights (anything that goes
-        // through gemv_auto in mtp_forward — wq_a/b, wkv, wo_a/b, e_proj,
-        // h_proj, shared experts, gate.weight) stay F16 to eliminate Q8
-        // quant noise on the MTP block. Routed experts (".ffn.experts.")
-        // are excluded — they MUST stay MQ2-Lloyd because the MoE GEMV
-        // kernel (`deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed`) only
-        // handles that format.
-        let keep_f16_mtp = use_mtp_precise
-            && name.starts_with("mtp.")
-            && !name.contains(".ffn.experts.")
-            && should_quantize(name);
-        if (use_deepseek4_source_precision && is_deepseek4_keep_f16(name) || keep_f16_mtp)
-            && n_elements >= 32
-        {
-            let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
-            let src_dtype = meta.dtype.as_str();
-            let f32_data = tensor_to_f32_with_optional_fp8_scale(
-                name,
-                raw_data,
-                meta,
-                &fp8_scale_for,
-                &st_files,
-            );
-            quantized_params += n_elements as u64;
-            let f16_bytes: Vec<u8> = f32_data
-                .iter()
-                .flat_map(|&v| f32_to_f16(v).to_le_bytes())
-                .collect();
-            eprintln!(
-                "  {:>8}: {} {:?} ({} elements, {:.1} KB → {:.1} KB) [src={src_dtype}, keep-F16]",
-                "F16",
-                name,
-                meta.shape,
-                n_elements,
-                raw_data.len() as f64 / 1024.0,
-                f16_bytes.len() as f64 / 1024.0
-            );
-            hfq_tensors.push(HfqTensor {
-                name: name.to_string(),
-                quant_type: QuantType::F16,
-                shape,
-                group_size: 0,
-                data: f16_bytes,
-                spilled_len: 0,
-            });
-            st_files[*file_idx].drop_tensor_pages(name);
-            if let Some(ref mut s) = spill {
-                maybe_spill(&mut hfq_tensors, s, 2 * 1024 * 1024 * 1024);
-            }
-            continue;
-        }
-        if use_deepseek4_source_precision && should_quantize(name) && n_elements >= 32 {
-            let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
-            let src_dtype = meta.dtype.as_str();
-            let f32_data = tensor_to_f32_with_optional_fp8_scale(
-                name,
-                raw_data,
-                meta,
-                &fp8_scale_for,
-                &st_files,
-            );
-            quantized_params += n_elements as u64;
-            let q = quantize_q8f16(&f32_data);
-            eprintln!(
-                "  {:>8}: {} {:?} ({} elements, {:.1} KB → {:.1} KB) [src={src_dtype}]",
-                "Q8_F16",
-                name,
-                meta.shape,
-                n_elements,
-                raw_data.len() as f64 / 1024.0,
-                q.len() as f64 / 1024.0
-            );
-            hfq_tensors.push(HfqTensor {
-                name: name.to_string(),
-                quant_type: QuantType::Q8F16,
-                shape,
-                group_size: 32,
-                data: q,
-                spilled_len: 0,
-            });
-            st_files[*file_idx].drop_tensor_pages(name);
-            if let Some(ref mut s) = spill {
-                maybe_spill(&mut hfq_tensors, s, 2 * 1024 * 1024 * 1024);
-            }
-            continue;
-        }
-
+fn handle_main_quant(
+    ctx: &PerTensorCtx,
+    meta: &TensorMeta,
+    raw_data: &[u8],
+    flags: &MainQuantFlags,
+    outer: &MainQuantOuter,
+    state: &mut MainQuantState,
+    fp8_scale_for: &HashMap<String, (usize, String)>,
+    st_files: &[SafetensorsFile],
+) {
+    let name = ctx.name;
+    let n_elements = ctx.n_elements;
+    let is_vision = ctx.is_vision;
+    let arch_id = ctx.arch_id;
+    let vision_quant = flags.vision_quant.as_str();
+    let is_gemma4_family = flags.is_gemma4_family;
+    let q8_conv1d_default = flags.q8_conv1d_default;
         if should_quantize(name) && n_elements >= 32 {
             let f32_data = tensor_to_f32_with_optional_fp8_scale(
                 name,
@@ -3911,13 +4408,13 @@ pub(crate) fn run() {
                 &fp8_scale_for,
                 &st_files,
             );
-            quantized_params += n_elements as u64;
+            *state.quantized_params += n_elements as u64;
 
             let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
 
             // Q8HFQ path: split-metadata per-row layout (needs M and K)
             // Exclude embeddings — they use a lookup kernel, not GEMV
-            if use_q8hfq && meta.shape.len() == 2 && !name.contains("embed_tokens") {
+            if flags.use_q8hfq && meta.shape.len() == 2 && !name.contains("embed_tokens") {
                 let m = meta.shape[0];
                 let k = meta.shape[1];
                 let (quantized, row_stride) = quantize_q8hfq(&f32_data, m, k);
@@ -3937,10 +4434,10 @@ pub(crate) fn run() {
                             let dequant = scale * qval as f32;
                             let orig_idx = row * k + g * 32 + i;
                             let err = (dequant - f32_data[orig_idx]).abs();
-                            total_quant_error += err as f64;
-                            max_quant_error = max_quant_error.max(err);
+                            *state.total_quant_error += err as f64;
+                            *state.max_quant_error = (*state.max_quant_error).max(err);
                         }
-                        _n_quant_groups += 1;
+                        *state._n_quant_groups += 1;
                     }
                 }
 
@@ -3955,7 +4452,7 @@ pub(crate) fn run() {
                     row_stride
                 );
 
-                hfq_tensors.push(HfqTensor {
+                state.hfq_tensors.push(HfqTensor {
                     name: name.to_string(),
                     quant_type: QuantType::Q8HFQ,
                     shape,
@@ -3965,7 +4462,7 @@ pub(crate) fn run() {
                 });
             } else {
                 // ── K-map override ──────────────────────────────────────────────
-                let kmap_level = kmap.get(&**name).copied().unwrap_or(QuantLevel::Base);
+                let kmap_level = outer.kmap.get(name).copied().unwrap_or(QuantLevel::Base);
 
                 // AWQ sidecar scales for this tensor — populated only inside the
                 // MQ4G256 arm when --awq is enabled and an imatrix entry exists
@@ -3975,7 +4472,7 @@ pub(crate) fn run() {
                 // inference time.
                 let mut awq_sidecar_scales: Option<Vec<f32>> = None;
 
-                let (quantized, qt, gs, label) = if q8_conv1d_default && is_conv1d_tensor(name) {
+                let (quantized, qt, gs, label) = if flags.q8_conv1d_default && is_conv1d_tensor(name) {
                     // DeltaNet conv1d defaults to Q8 (see --no-q8-conv1d to disable).
                     let q = quantize_q8f16(&f32_data);
                     (q, QuantType::Q8F16, 32u32, "Q8_F16")
@@ -3997,44 +4494,44 @@ pub(crate) fn run() {
                     } else {
                         n_elements
                     };
-                    if (use_mq4g256
-                        || use_mq4_mq6exp
-                        || use_mq4_mq2lloydexp
-                        || use_mq4_mq2glexp
-                        || use_mq4_mq2lloyd_native
-                        || use_mq4_mq2lloyd_kmap
-                        || use_mq4_mq2lloyd_imatrix
-                        || use_mq4_mq3lloyd_kmap
-                        || use_mq4_mqlloyd_tiered
-                        || use_mq4_mqlloyd_antirez
-                        || use_mq4_mqlloyd_antirez_gptq
-                        || use_mq4_mq2lloyd_gptq_all
-                        || use_mq3g256
-                        || use_mq2g256
-                        || use_mq2g256_lloyd
-                        || use_mq3g256_lloyd)
+                    if (flags.use_mq4g256
+                        || flags.use_mq4_mq6exp
+                        || flags.use_mq4_mq2lloydexp
+                        || flags.use_mq4_mq2glexp
+                        || flags.use_mq4_mq2lloyd_native
+                        || flags.use_mq4_mq2lloyd_kmap
+                        || flags.use_mq4_mq2lloyd_imatrix
+                        || flags.use_mq4_mq3lloyd_kmap
+                        || flags.use_mq4_mqlloyd_tiered
+                        || flags.use_mq4_mqlloyd_antirez
+                        || flags.use_mq4_mqlloyd_antirez_gptq
+                        || flags.use_mq4_mq2lloyd_gptq_all
+                        || flags.use_mq3g256
+                        || flags.use_mq2g256
+                        || flags.use_mq2g256_lloyd
+                        || flags.use_mq3g256_lloyd)
                         && k_dim % 256 == 0
                     {
                         let signs1 = gen_fwht_signs(42, 256);
                         let signs2 = gen_fwht_signs(1042, 256);
                         let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
                         (q, QuantType::MQ6G256, 256u32, "MQ6G256")
-                    } else if (use_hfq4g256
-                        || use_hfq3g256
-                        || use_hfq3g128
-                        || use_hfq2g256
-                        || use_hfq2g128)
+                    } else if (flags.use_hfq4g256
+                        || flags.use_hfq3g256
+                        || flags.use_hfq3g128
+                        || flags.use_hfq2g256
+                        || flags.use_hfq2g128)
                         && k_dim % 256 == 0
                     {
                         let q = quantize_hfq6g256(&f32_data);
                         (q, QuantType::HFQ6G256, 256u32, "HFQ6G256")
-                    } else if use_mq6g256 && k_dim % 256 == 0 {
+                    } else if flags.use_mq6g256 && k_dim % 256 == 0 {
                         // Already 6-bit MQ — no-op promotion
                         let signs1 = gen_fwht_signs(42, 256);
                         let signs2 = gen_fwht_signs(1042, 256);
                         let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
                         (q, QuantType::MQ6G256, 256u32, "MQ6G256")
-                    } else if use_hfq6 && k_dim % 256 == 0 {
+                    } else if flags.use_hfq6 && k_dim % 256 == 0 {
                         // Already 6-bit HFQ — no-op promotion
                         let q = quantize_hfq6g256(&f32_data);
                         (q, QuantType::HFQ6G256, 256u32, "HFQ6G256")
@@ -4068,11 +4565,11 @@ pub(crate) fn run() {
                         // imatrix-saliency ratio meaningless and the per-channel
                         // pre-scale actively harmful.
                         debug_assert!(
-                            !(is_gemma4_family
+                            !(flags.is_gemma4_family
                                 && (name.contains("embed_tokens") || name.contains("lm_head"))),
-                            "gemma4 embed/lm_head reached the MQ4 AWQ path — the kmap Q8 \
+                            "gemma4 embed/lm_head reached the MQ4 AWQ path — the outer.kmap Q8 \
                              guard should have prevented this (arch {} tensor {})",
-                            arch_id,
+                            flags.arch_id,
                             name
                         );
                         match override_fmt {
@@ -4262,23 +4759,23 @@ pub(crate) fn run() {
                     // QuantLevel::Base — existing format-specific logic below
 
                     // Choose quant format per tensor
-                    let this_q8 = if use_q4k_all {
+                    let this_q8 = if flags.use_q4k_all {
                         false // everything Q4_K
-                    } else if use_q4k_q8embed {
+                    } else if flags.use_q4k_q8embed {
                         name.contains("embed") || name.contains("lm_head") // only embed/output Q8
-                    } else if use_mixed || use_fast {
+                    } else if flags.use_mixed || flags.use_fast {
                         is_q8_tensor(name)
                     } else {
-                        use_q8 || use_q8hfq // 1D Q8HFQ tensors fall back to Q8F16
+                        flags.use_q8 || flags.use_q8hfq // 1D Q8HFQ tensors fall back to Q8F16
                     };
-                    let this_q4as8 = use_fast && !this_q8; // FFN tensors in q8-fast mode
-                    let this_q4k = use_q4k_all || use_q4k_q8embed || use_mixed;
+                    let this_q4as8 = flags.use_fast && !this_q8; // FFN tensors in q8-fast mode
+                    let this_q4k = flags.use_q4k_all || flags.use_q4k_q8embed || flags.use_mixed;
 
                     // Embeddings stored as Q8 in HFQ4 mode — Q4 is too lossy for
                     // large-dim models (9B: dim=4096, values ~0.016, Q4 step ~0.007)
                     let is_embed = name.contains("embed_tokens");
 
-                    if use_hfq_mixed {
+                    if flags.use_hfq_mixed {
                         // hfq-mixed: Q8 for attention, HFQ4 for FFN (fits 9B in 8GB VRAM)
                         let is_ffn = name.contains("mlp.") || name.contains("ffn");
                         if !is_ffn {
@@ -4298,7 +4795,7 @@ pub(crate) fn run() {
                                 (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                             }
                         }
-                    } else if use_hfq6 {
+                    } else if flags.use_hfq6 {
                         // HFQ6-G256: all weights 6-bit, embeddings Q8
                         if is_embed {
                             let q = quantize_q8f16(&f32_data);
@@ -4307,13 +4804,13 @@ pub(crate) fn run() {
                             let q = quantize_hfq6g256(&f32_data);
                             (q, QuantType::HFQ6G256, 256u32, "HFQ6G256")
                         }
-                    } else if (use_hfq2g256 || use_hfq2g128) && is_embed {
+                    } else if (flags.use_hfq2g256 || flags.use_hfq2g128) && is_embed {
                         let q = quantize_q8f16(&f32_data);
                         (q, QuantType::Q8F16, 32u32, "Q8_F16")
-                    } else if use_hfq2g128 {
+                    } else if flags.use_hfq2g128 {
                         let q = quantize_hfq2g128(&f32_data);
                         (q, QuantType::HFQ2G128, 128u32, "HFQ2G128")
-                    } else if use_hfq2g256 {
+                    } else if flags.use_hfq2g256 {
                         let k_dim = if meta.shape.len() == 2 {
                             meta.shape[1]
                         } else {
@@ -4327,10 +4824,10 @@ pub(crate) fn run() {
                             let q = quantize_hfq4g128(&f32_data);
                             (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                         }
-                    } else if use_mq8g256 && is_embed {
+                    } else if flags.use_mq8g256 && is_embed {
                         let q = quantize_q8f16(&f32_data);
                         (q, QuantType::Q8F16, 32u32, "Q8_F16")
-                    } else if use_mq8g256 {
+                    } else if flags.use_mq8g256 {
                         let k_dim = if meta.shape.len() == 2 {
                             meta.shape[1]
                         } else {
@@ -4346,7 +4843,7 @@ pub(crate) fn run() {
                             let q = quantize_q8f16(&f32_data);
                             (q, QuantType::Q8F16, 32u32, "Q8_F16")
                         }
-                    } else if q8_router && is_q8_tensor(name) {
+                    } else if flags.q8_router && is_q8_tensor(name) {
                         // Fixed tier (attention / lm_head / embed / router) held above
                         // --format. Default Q8F16; `HIPFIRE_FIXED_TIER=<class>:<dtype>`
                         // overrides per class — the bit-allocation lever.
@@ -4393,34 +4890,34 @@ pub(crate) fn run() {
                                 (q, QuantType::Q8F16, 32u32, "Q8_F16")
                             }
                         }
-                    } else if (use_mq4g256
-                        || use_mq4_mq6exp
-                        || use_mq4_mq2lloydexp
-                        || use_mq4_mq2glexp
-                        || use_mq4_mq2lloyd_native
-                        || use_mq4_mq2lloyd_kmap
-                        || use_mq4_mq2lloyd_imatrix
-                        || use_mq4_mq3lloyd_kmap
-                        || use_mq4_mqlloyd_tiered
-                        || use_mq4_mqlloyd_antirez
-                        || use_mq4_mqlloyd_antirez_gptq
-                        || use_mq4_mq2lloyd_gptq_all)
+                    } else if (flags.use_mq4g256
+                        || flags.use_mq4_mq6exp
+                        || flags.use_mq4_mq2lloydexp
+                        || flags.use_mq4_mq2glexp
+                        || flags.use_mq4_mq2lloyd_native
+                        || flags.use_mq4_mq2lloyd_kmap
+                        || flags.use_mq4_mq2lloyd_imatrix
+                        || flags.use_mq4_mq3lloyd_kmap
+                        || flags.use_mq4_mqlloyd_tiered
+                        || flags.use_mq4_mqlloyd_antirez
+                        || flags.use_mq4_mqlloyd_antirez_gptq
+                        || flags.use_mq4_mq2lloyd_gptq_all)
                         && is_embed
                     {
                         let q = quantize_q8f16(&f32_data);
                         (q, QuantType::Q8F16, 32u32, "Q8_F16")
-                    } else if use_mq4g256
-                        || use_mq4_mq6exp
-                        || use_mq4_mq2lloydexp
-                        || use_mq4_mq2glexp
-                        || use_mq4_mq2lloyd_native
-                        || use_mq4_mq2lloyd_kmap
-                        || use_mq4_mq2lloyd_imatrix
-                        || use_mq4_mq3lloyd_kmap
-                        || use_mq4_mqlloyd_tiered
-                        || use_mq4_mqlloyd_antirez
-                        || use_mq4_mqlloyd_antirez_gptq
-                        || use_mq4_mq2lloyd_gptq_all
+                    } else if flags.use_mq4g256
+                        || flags.use_mq4_mq6exp
+                        || flags.use_mq4_mq2lloydexp
+                        || flags.use_mq4_mq2glexp
+                        || flags.use_mq4_mq2lloyd_native
+                        || flags.use_mq4_mq2lloyd_kmap
+                        || flags.use_mq4_mq2lloyd_imatrix
+                        || flags.use_mq4_mq3lloyd_kmap
+                        || flags.use_mq4_mqlloyd_tiered
+                        || flags.use_mq4_mqlloyd_antirez
+                        || flags.use_mq4_mqlloyd_antirez_gptq
+                        || flags.use_mq4_mq2lloyd_gptq_all
                     {
                         let k_dim = if meta.shape.len() == 2 {
                             meta.shape[1]
@@ -4481,12 +4978,12 @@ pub(crate) fn run() {
                             let q = quantize_hfq4g128(&f32_data);
                             (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                         }
-                    } else if use_hfp4 && is_embed {
+                    } else if flags.use_hfp4 && is_embed {
                         // HFP4 embeddings stay Q8F16 (matches MQ4 / HFQ4 pattern — embedding lookup is
                         // accuracy-sensitive, FP4 codes too lossy for vocab-sized tables).
                         let q = quantize_q8f16(&f32_data);
                         (q, QuantType::Q8F16, 32u32, "Q8_F16")
-                    } else if use_hfp4 {
+                    } else if flags.use_hfp4 {
                         let k_dim = if meta.shape.len() == 2 {
                             meta.shape[1]
                         } else {
@@ -4501,11 +4998,11 @@ pub(crate) fn run() {
                             let q = quantize_hfq4g128(&f32_data);
                             (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                         }
-                    } else if use_mfp4 && is_embed {
+                    } else if flags.use_mfp4 && is_embed {
                         // MFP4 embeddings stay Q8F16 (same rationale as HFP4 / MQ4).
                         let q = quantize_q8f16(&f32_data);
                         (q, QuantType::Q8F16, 32u32, "Q8_F16")
-                    } else if use_mfp4 {
+                    } else if flags.use_mfp4 {
                         let k_dim = if meta.shape.len() == 2 {
                             meta.shape[1]
                         } else {
@@ -4523,10 +5020,10 @@ pub(crate) fn run() {
                             let q = quantize_hfq4g128(&f32_data);
                             (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                         }
-                    } else if use_mfp4l && is_embed {
+                    } else if flags.use_mfp4l && is_embed {
                         let q = quantize_q8f16(&f32_data);
                         (q, QuantType::Q8F16, 32u32, "Q8_F16")
-                    } else if use_mfp4l {
+                    } else if flags.use_mfp4l {
                         let k_dim = if meta.shape.len() == 2 {
                             meta.shape[1]
                         } else {
@@ -4543,11 +5040,11 @@ pub(crate) fn run() {
                             let q = quantize_hfq4g128(&f32_data);
                             (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                         }
-                    } else if use_mfp4p && is_embed {
+                    } else if flags.use_mfp4p && is_embed {
                         // mfp4+P embeddings stay Q8F16 (same rationale as mfp4 / mfp4L).
                         let q = quantize_q8f16(&f32_data);
                         (q, QuantType::Q8F16, 32u32, "Q8_F16")
-                    } else if use_mfp4p {
+                    } else if flags.use_mfp4p {
                         let k_dim = if meta.shape.len() == 2 {
                             meta.shape[1]
                         } else {
@@ -4564,17 +5061,17 @@ pub(crate) fn run() {
                             let q = quantize_hfq4g128(&f32_data);
                             (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                         }
-                    } else if (use_mfp4e8
-                        || use_mfp4e8soa
-                        || use_mfp3e8_gptq_fmt
-                        || use_mfp2e8_gptq_fmt)
+                    } else if (flags.use_mfp4e8
+                        || flags.use_mfp4e8soa
+                        || flags.use_mfp3e8_gptq_fmt
+                        || flags.use_mfp2e8_gptq_fmt)
                         && is_embed
                     {
                         // mfp{2,3,4}-E8 embeddings stay Q8F16 (embedding lookup is accuracy-
                         // sensitive; matches the mfp4 / mfp4L pattern).
                         let q = quantize_q8f16(&f32_data);
                         (q, QuantType::Q8F16, 32u32, "Q8_F16")
-                    } else if use_mfp4e8 {
+                    } else if flags.use_mfp4e8 {
                         let k_dim = if meta.shape.len() == 2 {
                             meta.shape[1]
                         } else {
@@ -4587,8 +5084,8 @@ pub(crate) fn run() {
                             // GPTQ-E8 for dense tensors: keyed by the full
                             // safetensors name (no expert idx). Missing Hessian
                             // -> RTN fallback (byte-identical to plain mfp4e8).
-                            let q = if use_gptq_e8 {
-                                if let Some(hdir) = hessian_dir.as_deref() {
+                            let q = if flags.use_gptq_e8 {
+                                if let Some(hdir) = outer.hessian_dir.as_deref() {
                                     let hblk = load_hessian_blocks(hdir, name);
                                     if hblk.is_empty() {
                                         GPTQ_E8_FALLBACK
@@ -4612,7 +5109,7 @@ pub(crate) fn run() {
                             let q = quantize_hfq4g128(&f32_data);
                             (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                         }
-                    } else if use_mfp3e8_gptq_fmt {
+                    } else if flags.use_mfp3e8_gptq_fmt {
                         let k_dim = if meta.shape.len() == 2 {
                             meta.shape[1]
                         } else {
@@ -4623,8 +5120,8 @@ pub(crate) fn run() {
                             let signs2 = gen_fwht_signs(1042, 256);
                             let m = meta.shape[0];
                             // GPTQ-mfp3-E8 for dense tensors. Missing Hessian -> RTN fallback.
-                            let q = if use_gptq_mfp3e8 {
-                                if let Some(hdir) = hessian_dir.as_deref() {
+                            let q = if flags.use_gptq_mfp3e8 {
+                                if let Some(hdir) = outer.hessian_dir.as_deref() {
                                     let hblk = load_hessian_blocks(hdir, name);
                                     if hblk.is_empty() {
                                         GPTQ_E8_FALLBACK
@@ -4647,7 +5144,7 @@ pub(crate) fn run() {
                             let q = quantize_hfq4g128(&f32_data);
                             (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                         }
-                    } else if use_mfp2e8_gptq_fmt {
+                    } else if flags.use_mfp2e8_gptq_fmt {
                         let k_dim = if meta.shape.len() == 2 {
                             meta.shape[1]
                         } else {
@@ -4658,8 +5155,8 @@ pub(crate) fn run() {
                             let signs2 = gen_fwht_signs(1042, 256);
                             let m = meta.shape[0];
                             // GPTQ-mfp2-E8 for dense tensors. Missing Hessian -> RTN fallback.
-                            let q = if use_gptq_mfp2e8 {
-                                if let Some(hdir) = hessian_dir.as_deref() {
+                            let q = if flags.use_gptq_mfp2e8 {
+                                if let Some(hdir) = outer.hessian_dir.as_deref() {
                                     let hblk = load_hessian_blocks(hdir, name);
                                     if hblk.is_empty() {
                                         GPTQ_E8_FALLBACK
@@ -4682,7 +5179,7 @@ pub(crate) fn run() {
                             let q = quantize_hfq4g128(&f32_data);
                             (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                         }
-                    } else if use_mfp4e8soa {
+                    } else if flags.use_mfp4e8soa {
                         // mfp4-E8-SoA: same E8 encoding permuted to SoA layout for coalesced GEMV.
                         let k_dim = if meta.shape.len() == 2 {
                             meta.shape[1]
@@ -4700,12 +5197,12 @@ pub(crate) fn run() {
                             let q = quantize_hfq4g128(&f32_data);
                             (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                         }
-                    } else if use_mq5g256 && is_embed {
+                    } else if flags.use_mq5g256 && is_embed {
                         // MQ5 embeddings stay Q8F16 (embedding lookup is accuracy-
                         // sensitive; matches MQ4 / MQ6 / HFQ4 pattern).
                         let q = quantize_q8f16(&f32_data);
                         (q, QuantType::Q8F16, 32u32, "Q8_F16")
-                    } else if use_mq5g256 {
+                    } else if flags.use_mq5g256 {
                         let k_dim = if meta.shape.len() == 2 {
                             meta.shape[1]
                         } else {
@@ -4741,10 +5238,10 @@ pub(crate) fn run() {
                             let q = quantize_hfq4g128(&f32_data);
                             (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                         }
-                    } else if use_mq6g256 && is_embed {
+                    } else if flags.use_mq6g256 && is_embed {
                         let q = quantize_q8f16(&f32_data);
                         (q, QuantType::Q8F16, 32u32, "Q8_F16")
-                    } else if use_mq6g256 {
+                    } else if flags.use_mq6g256 {
                         let k_dim = if meta.shape.len() == 2 {
                             meta.shape[1]
                         } else {
@@ -4760,16 +5257,16 @@ pub(crate) fn run() {
                             let q = quantize_hfq6g256(&f32_data);
                             (q, QuantType::HFQ6G256, 256u32, "HFQ6G256")
                         }
-                    } else if (use_mq3g256
-                        || use_mq2g256
-                        || use_mq2g256_lloyd
-                        || use_mq3g256_lloyd
-                        || use_mq4g256_lloyd)
+                    } else if (flags.use_mq3g256
+                        || flags.use_mq2g256
+                        || flags.use_mq2g256_lloyd
+                        || flags.use_mq3g256_lloyd
+                        || flags.use_mq4g256_lloyd)
                         && is_embed
                     {
                         let q = quantize_q8f16(&f32_data);
                         (q, QuantType::Q8F16, 32u32, "Q8_F16")
-                    } else if use_mq4g256_lloyd {
+                    } else if flags.use_mq4g256_lloyd {
                         let k_dim = if meta.shape.len() == 2 {
                             meta.shape[1]
                         } else {
@@ -4785,7 +5282,7 @@ pub(crate) fn run() {
                             let q = quantize_hfq4g128(&f32_data);
                             (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                         }
-                    } else if use_mq3g256_lloyd {
+                    } else if flags.use_mq3g256_lloyd {
                         let k_dim = if meta.shape.len() == 2 {
                             meta.shape[1]
                         } else {
@@ -4817,7 +5314,7 @@ pub(crate) fn run() {
                             let q = quantize_hfq3g128(&f32_data);
                             (q, QuantType::HFQ3G128, 128u32, "HFQ3G128")
                         }
-                    } else if use_mq2g256_lloyd {
+                    } else if flags.use_mq2g256_lloyd {
                         let k_dim = if meta.shape.len() == 2 {
                             meta.shape[1]
                         } else {
@@ -4862,7 +5359,7 @@ pub(crate) fn run() {
                             let q = quantize_hfq2g128(&f32_data);
                             (q, QuantType::HFQ2G128, 128u32, "HFQ2G128")
                         }
-                    } else if use_mq3g256 {
+                    } else if flags.use_mq3g256 {
                         let k_dim = if meta.shape.len() == 2 {
                             meta.shape[1]
                         } else {
@@ -4898,7 +5395,7 @@ pub(crate) fn run() {
                             let q = quantize_hfq3g128(&f32_data);
                             (q, QuantType::HFQ3G128, 128u32, "HFQ3G128")
                         }
-                    } else if use_mq2g256 {
+                    } else if flags.use_mq2g256 {
                         let k_dim = if meta.shape.len() == 2 {
                             meta.shape[1]
                         } else {
@@ -4932,10 +5429,10 @@ pub(crate) fn run() {
                             let q = quantize_hfq2g128(&f32_data);
                             (q, QuantType::HFQ2G128, 128u32, "HFQ2G128")
                         }
-                    } else if (use_hfq3g256 || use_hfq3g128) && is_embed {
+                    } else if (flags.use_hfq3g256 || flags.use_hfq3g128) && is_embed {
                         let q = quantize_q8f16(&f32_data);
                         (q, QuantType::Q8F16, 32u32, "Q8_F16")
-                    } else if use_hfq3g128 {
+                    } else if flags.use_hfq3g128 {
                         let k_dim = if meta.shape.len() == 2 {
                             meta.shape[1]
                         } else {
@@ -4948,7 +5445,7 @@ pub(crate) fn run() {
                             let q = quantize_hfq3g128(&f32_data);
                             (q, QuantType::HFQ3G128, 128u32, "HFQ3G128")
                         }
-                    } else if use_hfq3g256 {
+                    } else if flags.use_hfq3g256 {
                         let k_dim = if meta.shape.len() == 2 {
                             meta.shape[1]
                         } else {
@@ -4961,7 +5458,7 @@ pub(crate) fn run() {
                             let q = quantize_hfq3g128(&f32_data);
                             (q, QuantType::HFQ3G128, 128u32, "HFQ3G128")
                         }
-                    } else if use_hfq4g256 && is_embed {
+                    } else if flags.use_hfq4g256 && is_embed {
                         // HFQ4 embeddings: half the size of Q8, same 18-VGPR lookup kernel
                         let k_dim = if meta.shape.len() == 2 {
                             meta.shape[1]
@@ -4975,7 +5472,7 @@ pub(crate) fn run() {
                             let q = quantize_hfq4g128(&f32_data);
                             (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                         }
-                    } else if use_hfq4g256 {
+                    } else if flags.use_hfq4g256 {
                         // Auto-select G128 vs G256 based on K dimension
                         // G256 preferred: better coalescing, fewer scale/zero overheads
                         // G128 only as fallback when K isn't divisible by 256
@@ -5048,8 +5545,8 @@ pub(crate) fn run() {
                             };
                             let dequant = scale * nibble as f32 + zero;
                             let err = (dequant - f32_data[start + i]).abs();
-                            total_quant_error += err as f64;
-                            max_quant_error = max_quant_error.max(err);
+                            *state.total_quant_error += err as f64;
+                            *state.max_quant_error = (*state.max_quant_error).max(err);
                         }
                     } else if label == "Q8_FP16" || label == "Q4asQ8" || label == "Q8_F16" {
                         // NB: string match because this_q8/this_q4as8 are scoped inside Base block.
@@ -5060,8 +5557,8 @@ pub(crate) fn run() {
                             let qval = quantized[off + 2 + i] as i8;
                             let dequant = scale * qval as f32;
                             let err = (dequant - f32_data[start + i]).abs();
-                            total_quant_error += err as f64;
-                            max_quant_error = max_quant_error.max(err);
+                            *state.total_quant_error += err as f64;
+                            *state.max_quant_error = (*state.max_quant_error).max(err);
                         }
                     } else {
                         let off = b * 36;
@@ -5080,11 +5577,11 @@ pub(crate) fn run() {
                             };
                             let dequant = nibble as f32 * scale + min_val;
                             let err = (dequant - f32_data[start + i]).abs();
-                            total_quant_error += err as f64;
-                            max_quant_error = max_quant_error.max(err);
+                            *state.total_quant_error += err as f64;
+                            *state.max_quant_error = (*state.max_quant_error).max(err);
                         }
                     }
-                    _n_quant_groups += 1;
+                        *state._n_quant_groups += 1;
                 }
 
                 eprintln!(
@@ -5096,7 +5593,7 @@ pub(crate) fn run() {
                     quantized.len() as f64 / 1024.0
                 );
 
-                hfq_tensors.push(HfqTensor {
+                state.hfq_tensors.push(HfqTensor {
                     name: name.to_string(),
                     quant_type: qt,
                     shape: shape.clone(),
@@ -5122,7 +5619,7 @@ pub(crate) fn run() {
                         scales.len(),
                         bytes.len()
                     );
-                    hfq_tensors.push(HfqTensor {
+                    state.hfq_tensors.push(HfqTensor {
                         name: sidecar_name,
                         quant_type: QuantType::F16,
                         shape: vec![scales.len() as u32],
@@ -5132,278 +5629,8 @@ pub(crate) fn run() {
                     });
                 }
             } // end else (non-Q8HFQ path)
-        } else if is_vision && vision_quant == "hfq4" && n_elements >= 32 {
-            // Quantize vision weights to HFQ4G256 (for speed-critical VL workloads)
-            let f32_data = to_f32(raw_data, &meta.dtype);
-            quantized_params += n_elements as u64;
-            let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
-            let k_dim = if shape.len() == 2 {
-                shape[1] as usize
-            } else {
-                n_elements
-            };
-            let (quantized, gs) = if k_dim % 256 == 0 {
-                (quantize_hfq4g256(&f32_data), 256u32)
-            } else {
-                (quantize_hfq4g128(&f32_data), 128u32)
-            };
-            let qt = if gs == 256 {
-                QuantType::HFQ4G256
-            } else {
-                QuantType::HFQ4G128
-            };
-            let label = if gs == 256 { "HFQ4G256" } else { "HFQ4G128" };
-            eprintln!(
-                "  {label:>8}: {} {:?} ({} elements, {:.1} KB -> {:.1} KB) [vision]",
-                name,
-                meta.shape,
-                n_elements,
-                raw_data.len() as f64 / 1024.0,
-                quantized.len() as f64 / 1024.0
-            );
-            hfq_tensors.push(HfqTensor {
-                name: name.to_string(),
-                quant_type: qt,
-                shape,
-                group_size: gs,
-                data: quantized,
-                spilled_len: 0,
-            });
-        } else if is_vision && vision_quant == "bf16" && meta.dtype == "BF16" {
-            // Store vision weights as original BF16 (zero precision loss)
-            quantized_params += n_elements as u64;
-            let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
-            eprintln!(
-                "  BF16:       {} {:?} ({} elements, {:.1} KB) [vision, lossless]",
-                name,
-                meta.shape,
-                n_elements,
-                raw_data.len() as f64 / 1024.0
-            );
-            hfq_tensors.push(HfqTensor {
-                name: name.to_string(),
-                quant_type: QuantType::BF16,
-                shape,
-                group_size: 0,
-                data: raw_data.to_vec(),
-                spilled_len: 0,
-            });
-        } else if is_vision && vision_quant == "bf16" {
-            // Non-BF16 source (F16/F32) — store as F16
-            let data = if meta.dtype == "F16" {
-                raw_data.to_vec()
-            } else {
-                let f32_vals = to_f32(raw_data, &meta.dtype);
-                f32_vals
-                    .iter()
-                    .flat_map(|&v| f32_to_f16(v).to_le_bytes())
-                    .collect()
-            };
-            quantized_params += n_elements as u64;
-            let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
-            eprintln!(
-                "  F16:        {} {:?} ({:.1} KB) [vision, bf16 fallback]",
-                name,
-                meta.shape,
-                data.len() as f64 / 1024.0
-            );
-            hfq_tensors.push(HfqTensor {
-                name: name.to_string(),
-                quant_type: QuantType::F16,
-                shape,
-                group_size: 0,
-                data,
-                spilled_len: 0,
-            });
-        } else {
-            // Keep as F16 (convert BF16 -> F16 if needed)
-            let f16_data = match meta.dtype.as_str() {
-                "F16" => raw_data.to_vec(),
-                "BF16" => {
-                    // BF16 → F32 → F16
-                    let f32_vals = to_f32(raw_data, "BF16");
-                    f32_vals
-                        .iter()
-                        .flat_map(|&v| f32_to_f16(v).to_le_bytes())
-                        .collect()
-                }
-                "F32" => {
-                    let f32_vals = to_f32(raw_data, "F32");
-                    f32_vals
-                        .iter()
-                        .flat_map(|&v| f32_to_f16(v).to_le_bytes())
-                        .collect()
-                }
-                other => panic!("unsupported dtype for norm/embd: {other}"),
-            };
-
-            let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
-            eprintln!(
-                "  F16:        {} {:?} ({} elements, {:.1} KB)",
-                name,
-                meta.shape,
-                n_elements,
-                f16_data.len() as f64 / 1024.0
-            );
-
-            hfq_tensors.push(HfqTensor {
-                name: name.to_string(),
-                quant_type: QuantType::F16,
-                shape,
-                group_size: 0,
-                data: f16_data,
-                spilled_len: 0,
-            });
         }
-        // Release source file page cache after each tensor to prevent
-        // mmap'd pages from starving GPU allocations on UMA systems.
-        st_files[*file_idx].drop_tensor_pages(name);
-    }
-
-    // Summary
-    if use_deepseek4_mq2rxt_overlay {
-        if arch_id != 9 {
-            eprintln!("MQ2RXT overlay requires DeepSeek V4 arch_id=9, got {arch_id}");
-            std::process::exit(2);
-        }
-        let sidecar = include_prefix.is_some_and(|prefix| prefix == "mtp.");
-        let expected = if sidecar { 24 } else { 554 };
-        if mq2rxt_overlay_count != expected {
-            eprintln!(
-                "MQ2RXT {} overlay selected {} tensors, expected {expected}; refusing partial recipe",
-                if sidecar { "DSpark" } else { "trunk" },
-                mq2rxt_overlay_count
-            );
-            std::process::exit(2);
-        }
-        eprintln!(
-            "MQ2RXT {} overlay: exact {expected}-tensor P3 map encoded directly from the parent",
-            if sidecar { "DSpark" } else { "trunk" }
-        );
-        metadata_json =
-            stamp_deepseek4_mq2rxt_metadata(&metadata_json, sidecar).unwrap_or_else(|error| {
-                eprintln!("MQ2RXT metadata: {error}");
-                std::process::exit(2);
-            });
-    }
-    let total_bytes: usize = hfq_tensors
-        .iter()
-        .map(|t| {
-            if t.spilled_len > 0 {
-                t.spilled_len as usize
-            } else {
-                t.data.len()
-            }
-        })
-        .sum();
-    {
-        let fired = GPTQ_E8_FIRED.load(std::sync::atomic::Ordering::Relaxed);
-        let fb = GPTQ_E8_FALLBACK.load(std::sync::atomic::Ordering::Relaxed);
-        if fired + fb > 0 {
-            eprintln!(
-                "  GPTQ-on-E8: {fired} tensors FIRED (Hessian-aware LDLQ), {fb} RTN-fallback (missing/singular H). {:.1}% fired.",
-                100.0 * fired as f64 / (fired + fb) as f64
-            );
-            if fired == 0 {
-                eprintln!(
-                    "  WARNING: 0 GPTQ tensors fired with --hessian-dir set — likely a KEY-MISMATCH (.hblk filenames != hessian_key), NOT a flat result."
-                );
-            }
-        }
-    }
-    let mean_quant_error = if quantized_params > 0 {
-        total_quant_error / quantized_params as f64
-    } else {
-        0.0
-    };
-
-    eprintln!("\n=== Quantization Summary ===");
-    if skipped_params > 0 {
-        eprintln!(
-            "  Skipped params:   {skipped_params} (mtp/visual — use --include-vision for VL)"
-        );
-    }
-    eprintln!("  Total params:     {total_params}");
-    eprintln!(
-        "  Quantized params: {quantized_params} ({:.1}%)",
-        100.0 * quantized_params as f64 / total_params as f64
-    );
-    eprintln!("  Mean quant error: {mean_quant_error:.8}");
-    eprintln!("  Max quant error:  {max_quant_error:.8}");
-    eprintln!("  Output size:      {:.1} MB", total_bytes as f64 / 1e6);
-
-    // ── SP4b: bake prune finalize (rename kept per-expert tensors + patch count) ──
-    // Applied only when a bake keep-map is active. Renames the per-expert-named
-    // kept tensors (ds4 score layers / lfm2 / minimax) recorded during the loop to
-    // their compact slots, then patches the output metadata's routed-expert count
-    // to `kept_per_layer` so the baked model loads standalone (no env var, no
-    // load-time keep-map). Spill preserves `.name`, so rename order vs. spill is
-    // irrelevant. (Qwen3.5 stacked experts + all routers/biases were already
-    // pruned/gathered in-loop.)
-    // Task A0: apply Qwen3.5-MoE pre-split expert fusion renames. Unconditional
-    // (unlike the bake rename below, which is gated on `bake_keep_active`):
-    // rewrite each fused gate_proj output tensor to the loader's
-    // `experts.{N}.gate_up_proj.weight`. The in-loop quant path kept the original
-    // gate_proj name so k-map/encoding used it. Spill preserves `.name`, so this
-    // works regardless of spill order. No-op (byte-identical) for every model
-    // that isn't a pre-split Qwen3.5-MoE.
-    if !expert_fuse_rename.is_empty() {
-        for t in hfq_tensors.iter_mut() {
-            if let Some(new_name) = expert_fuse_rename.get(&t.name) {
-                t.name = new_name.clone();
-            }
-        }
-        eprintln!(
-            "qwen35 expert fusion: renamed {} fused gate_up_proj tensors",
-            expert_fuse_rename.len()
-        );
-    }
-
-    if bake_keep_active {
-        let plan = reap_bake_plan.as_ref().unwrap();
-        if !bake_rename.is_empty() {
-            for t in hfq_tensors.iter_mut() {
-                if let Some(new_name) = bake_rename.get(&t.name) {
-                    t.name = new_name.clone();
-                }
-            }
-            eprintln!(
-                "REAP bake: renamed {} kept per-expert tensors to compact slots",
-                bake_rename.len()
-            );
-        }
-        let kept = plan.kept_per_layer();
-        match patch_expert_count_metadata(&metadata_json, reap_arch, kept) {
-            Ok(patched) => {
-                metadata_json = patched;
-                eprintln!("REAP bake: patched output metadata expert count → {kept}");
-            }
-            Err(e) => {
-                eprintln!("reap bake: failed to patch expert-count metadata: {e}");
-                std::process::exit(2);
-            }
-        }
-    }
-
-    // Write .hfq file
-    eprintln!("\nWriting: {}", output_path.display());
-    // Final spill before writing
-    if let Some(ref mut s) = spill {
-        maybe_spill(&mut hfq_tensors, s, 0); // spill everything remaining
-    }
-    write_hfq(
-        output_path,
-        arch_id,
-        &metadata_json,
-        &hfq_tensors,
-        spill.as_mut(),
-    )
-    .unwrap();
-    if let Some(s) = spill {
-        s.cleanup();
-    }
-
-    let file_size = std::fs::metadata(output_path).unwrap().len();
-    eprintln!("Done: {:.1} MB written", file_size as f64 / 1e6);
 }
+
+
 
