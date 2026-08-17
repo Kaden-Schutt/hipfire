@@ -197,3 +197,63 @@ made against `alpha=0.55`, the shipped default, which is a working artifact.
   against the default.
 - No statement that `alpha=0.05` should become a default. It is the KLD minimum
   under this fixture on this host, on one model.
+
+---
+
+## Addendum 2026-08-17 — bf16-Hessian non-PSD-ness grows LINEARLY in K
+
+Measured on the production GPTQ path with the PSD-projection fallback (commit
+`0fba538b5`) against `/scratch/work/qwen3.8-27b.calibv6-814d8fd.hfq`. Three
+independent K values, each normalized by its own matrix's `mean(diag(H))` so the
+comparison is scale-free:
+
+| K | `-lambda_min` | `mean(diag(H))` | ratio | linear-in-K prediction from K=1024 | error |
+|---|---|---|---|---|---|
+| 1,024 | 0.2088 | 1.0065 | 0.2075 | — | — |
+| 5,120 | 1.063657 | 0.9951136 | 1.0688 | 1.0375 | 2.9 % |
+| 17,408 | 0.107699 | 0.02967069 | 3.6299 | 3.528 | 2.9 % |
+
+A linear-in-`K` law fits all three points across a **17x span to within 3 %**. An
+earlier `sqrt(K)` estimate underpredicted K=17408 by 2x and is withdrawn.
+
+### Why this settles the design question
+
+`cholesky_with_adaptive_damping` caps damping at
+`max_damp_multiplier * mean(diag(H))`, default `1.0`. Since the required shift
+scales as `K`, that cap is not merely conservative — it is **asymptotically wrong**:
+
+| K | required damp multiplier |
+|---|---|
+| 5,120 | ~1.07 (right at the default cap, hence the observed 8-pass / 8-fail coin flip) |
+| 17,408 | ~3.63 (always over, hence 0/2) |
+| ~28,672 (a 70B-class `down_proj`) | ~6 (extrapolated) |
+
+So raising the cap does not scale: every wider model would need a larger constant,
+and the damping-based "fix" degrades GPTQ further at every step, because damping
+inflates the small eigenvalues that dominate the inverse Hessian GPTQ actually
+consumes (measured: damp `1.1x` moves the smallest eigenvalues from ~-0.15 to
+~+0.90, crushing the inverse's dominant components ~90x, against PSD projection's
+0.0000 % shift of the top 64).
+
+PSD projection is therefore the correct fix rather than the convenient one, and it
+becomes **more** necessary as models widen, not less.
+
+### Production evidence
+
+With the fallback active, at layer 1 of Qwen3.8-27B:
+
+```
+rescued=6   nonconv=0   hard_failed=0   fired=10
+rescued by K: 1x K=17408, 5x K=5120
+```
+
+against the pre-fix run's **10 hard failures** at the same point, each of which
+silently became round-to-nearest. Example rescue:
+
+```
+gptq: PSD projection rescued K=17408 Hessian
+      (lambda_min=-1.076990e-1 before projection); Cholesky succeeded at damp=1.000000e-2
+```
+
+`damp=1e-2` is the default — i.e. after projection the tensor needs no unusual
+damping at all, versus previously exhausting a cap of `2.967069e-2` and failing.
