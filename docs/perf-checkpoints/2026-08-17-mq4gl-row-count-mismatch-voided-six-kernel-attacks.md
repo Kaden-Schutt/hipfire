@@ -136,3 +136,84 @@ cleanly as *cold* R=2. Measured HFQ4 R=1 ranges 29.76–39.2 µs and R=2 ranges
 corresponds to hot R=2 or to R=4. This is the same thermal softness recorded
 above, and it is why only matched, interleaved ratios are quoted in the
 disposition.
+
+---
+
+## Amendment — the layout/padding hypothesis WAS tested. It is a NO-GO.
+
+The section above lists "the layout" as the untested hypothesis. It was
+subsequently tested and failed. Recording it here because the kernels were never
+committed and were later lost to file churn, so without this note the experiment
+would be re-attempted from scratch.
+
+Two arms, both measured device-side on gfx1201 with `HIPFIRE_GEMV_ROWS` set
+explicitly and arms interleaved sample-by-sample inside one thermal window
+(warmup 32, 3 runs x 10 launches):
+
+- **Arm A — row-level AoS, zero extra bpw.** Each row lays `gpr*128` B of indices
+  immediately followed by that row's `gpr*2` B of fp16 scales, row stride padded to
+  16 B (2608 B at gpr=20). The scale stream sits ~2.5 KB from the indices instead
+  of ~10 MB. Still **4.0625 bpw**.
+- **Arm B — per-group AoS, 4-byte aligned.** `[f32 scale][128 B indices]` = **132 B**
+  per group, so every group start and every `132g + 4 + 4*tid` per-lane `b32` load is
+  4-byte aligned, and the f32 header can lower to VOPD like HFQ4's. **4.125 bpw.**
+
+| R | arm | µs | GB/s | GL/HFQ4 GB/s ratio |
+|---|---|---|---|---|
+| 1 | SoA (baseline) | 30.760 | 347.4 | 0.605 |
+| 1 | AoS A | 30.120 | 355.9 | 0.620 |
+| 1 | AoS B | 30.721 | 353.2 | 0.616 |
+| **2** | **SoA (baseline)** | **21.720** | **492.0** | **0.843** |
+| **2** | **AoS A** | **21.880** | **489.9** | **0.840** |
+| **2** | **AoS B** | **21.480** | **505.1** | **0.866** |
+| 4 | SoA (baseline) | 22.000 | 485.7 | 0.902 |
+| 4 | AoS A | 22.080 | 485.5 | 0.902 |
+| 4 | AoS B | 21.800 | 497.7 | 0.924 |
+
+Bytes: SoA 10,649,600; AoS A 10,682,368; AoS B 10,813,440; HFQ4 11,141,120.
+
+### 1. Stream locality does nothing
+
+Arm A isolates locality at **zero bpw cost** and moves the R=2 ratio from 0.843 to
+**0.840** — a −0.003 change, inside the spread. At R=4 the two are identical
+(0.902 vs 0.902). **The ~10 MB SoA distance between the index and scale streams was
+never the deficit**, despite `gemv_mq4g256gl.hip`'s own comment blaming it
+("cannot be claused with the index load and each iteration stalls on it"). That
+comment is a plausible-sounding attribution that the measurement does not support.
+
+### 2. The f32 header buys ~2%, which does not clear its own byte cost
+
+Arm B does help, and the mechanism it was predicted to help by is confirmed
+present: `v_dual_fmac_f32` appears (multirow R=2: **48** in B vs 33 in A vs 191 in
+the SoA multirow), and `global_load_d16_b16` disappears entirely (0 in B vs 6 in
+A at R=2). But the gain is +0.023 ratio at R=2 (0.866 vs 0.843), i.e. ~2.7%
+bandwidth for a 1.5% byte cost — a net time win of ~0.4 µs (21.48 vs 21.88), about
+1.8%. That does not justify surrendering 0.0625 bpw, and it leaves the 10–16% gap
+substantially intact.
+
+### 3. `s_barrier` was never emitted at all
+
+The `__syncthreads()` in a 32-thread block was suspected of costing a real barrier.
+It never was one: `s_barrier` count is **0 in the SoA baseline and 0 in both AoS
+arms**, single-row and multirow. The compiler emits `s_waitcnt lgkmcnt` for a
+single-wave workgroup and no barrier instruction. Removing `__syncthreads()`
+changed nothing in the ISA and nothing in time. That hypothesis was wrong from the
+start, not merely unproductive.
+
+### Recommendation
+
+**Keep SoA at 4.0625 bpw (130 B/group).** If an AoS layout is ever wanted for code
+simplicity, prefer Arm A's row-level form, which costs zero extra bpw — but expect
+no performance benefit from it. Arm B's 4-byte-aligned 132 B group is the only
+variant that measurably helps and it is below a ship bar.
+
+Layout is therefore the **sixth** falsified mechanism for GL's residual bandwidth
+gap, alongside wide loads, stall density, ILP, prologue amortization, and
+register-resident codebooks. The remaining explanation is that the 16-entry LDS
+codebook lookup — a `ds_read` plus a dependent FMA chain — is simply not
+competitive with uniform affine's `sc*q + zp`, which dual-issues as VOPD. That is
+intrinsic to having a codebook at all, not to how the codebook is stored.
+
+**Kernels not preserved.** `gemv_mq4g256gl_aos_a` / `_aos_b` and their multirow
+variants were built and measured but never committed, and were lost to subsequent
+file churn. The numbers above are the surviving record.
