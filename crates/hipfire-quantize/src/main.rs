@@ -6954,7 +6954,17 @@ fn is_q8_tensor(name: &str) -> bool {
         return true;
     }
     match std::env::var("HIPFIRE_Q8_CLASSES") {
-        Ok(list) => list.split(',').any(|c| c.trim() == class),
+        Ok(list) => {
+            let trimmed = list.trim();
+            if trimmed.is_empty() {
+                // Empty string means "default" — same as not set for the fixed tier,
+                // but the fixed tier for dense models is only lm_head, embed, ssm_out, router.
+                // Attn is deliberately excluded (it would blow up the fixed tier to 354 Q8).
+                // This matches the mq4gl baseline census (50 Q8: lm_head+embed+48 ssm_out).
+                return class == "lm_head" || class == "embed" || class == "ssm_out" || class == "router";
+            }
+            trimmed.split(',').any(|c| c.trim() == class)
+        }
         Err(_) => true,
     }
 }
