@@ -13,6 +13,7 @@
 //
 // Grid: {RMS, MAX} normalisation x {single global cb, 64-profile selector, per-block Lloyd}.
 #include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -36,7 +37,7 @@ __device__ __constant__ float RMS_CB4[NLEV] = {
 __global__ __launch_bounds__(256) void eval_cb(
     const float* __restrict__ G, int nblk,
     const float* __restrict__ fam,
-    float tailthr, float p, int nsub, int cb_mode, int norm_mode, int lloyd_iters,
+    float tailthr, float p, int nsub, int cb_mode, int norm_mode, int lloyd_iters, int fp16_levels,
     double* __restrict__ out_sse, double* __restrict__ out_tail_sse,
     unsigned long long* __restrict__ out_n, unsigned long long* __restrict__ out_tailn)
 {
@@ -104,6 +105,11 @@ __global__ __launch_bounds__(256) void eval_cb(
                     sh_cb[sub][lane] = sh_sum[sub][lane] / (float)sh_cnt[sub][lane];
                 __syncthreads();
             }
+            // MQ4-Lloyd stores the fitted levels as fp16 -- charge that rounding,
+            // otherwise the comparison flatters it with f32 codebook precision.
+            if (lane < NLEV && fp16_levels)
+                sh_cb[sub][lane] = __half2float(__float2half(sh_cb[sub][lane]));
+            __syncthreads();
             float bd = 1e30f, bv = 0.0f;
             for (int l = 0; l < NLEV; ++l) {
                 const float d = fabsf(z - sh_cb[sub][l]);
@@ -187,16 +193,18 @@ int main(int argc, char** argv) {
     printf("  %-40s %-6s %5s %7s   %-13s %-13s\n","codebook","norm","totB","bpw","overall MSE","tail-1% MSE");
     printf("  %s\n","---------------------------------------------------------------------------------------------------");
 
-    struct Cfg { const char* name; int cb; int norm; int nsub; float p; int tot; };
+    struct Cfg { const char* name; int cb; int norm; int nsub; float p; int tot; int iters; int fp16; };
     const Cfg cfgs[] = {
-        {"single global (GL, qt=40 shape)",      CB_GLOBAL,NORM_RMS,1,0.f,130},
-        {"per-block Lloyd 16xfp16 (MQ4-Lloyd)",  CB_LLOYD, NORM_RMS,1,0.f,160},
-        {"single global",                        CB_GLOBAL,NORM_MAX,1,0.f,130},
-        {"64-profile selector, 6b",              CB_SELECT,NORM_MAX,1,0.f,132},
-        {"per-block Lloyd 16xfp16",              CB_LLOYD, NORM_MAX,1,0.f,160},
-        {"64-profile sel, 2x128 sub-block",      CB_SELECT,NORM_MAX,2,0.f,136},
-        {"per-block Lloyd, 2x128 sub-block",     CB_LLOYD, NORM_MAX,2,0.f,192},
+        {"64-profile sel, per-256",              CB_SELECT,NORM_MAX,1,0.f,132,0,0},
+        {"64-profile sel, 2x128 sub-block",      CB_SELECT,NORM_MAX,2,0.f,136,0,0},
+        {"per-block Lloyd 256, 12it, f32 lev",   CB_LLOYD, NORM_MAX,1,0.f,160,12,0},
+        {"per-block Lloyd 256, 40it, f32 lev",   CB_LLOYD, NORM_MAX,1,0.f,160,40,0},
+        {"per-block Lloyd 256, 40it, FP16 lev",  CB_LLOYD, NORM_MAX,1,0.f,160,40,1},
+        {"per-block Lloyd 2x128, 40it, f32 lev", CB_LLOYD, NORM_MAX,2,0.f,192,40,0},
+        {"per-block Lloyd 2x128, 40it, FP16 lev",CB_LLOYD, NORM_MAX,2,0.f,192,40,1},
+        {"per-block Lloyd 256 RMS,40it,FP16 lev",CB_LLOYD, NORM_RMS,1,0.f,160,40,1},
     };
+
     for (const auto& c : cfgs) {
         double z=0.0; unsigned long long zu=0;
         CK(hipMemcpy(dS,&z,sizeof(double),hipMemcpyHostToDevice));
@@ -204,7 +212,7 @@ int main(int argc, char** argv) {
         CK(hipMemcpy(dN,&zu,sizeof(unsigned long long),hipMemcpyHostToDevice));
         CK(hipMemcpy(dTN,&zu,sizeof(unsigned long long),hipMemcpyHostToDevice));
         hipLaunchKernelGGL(eval_cb, dim3(2048), dim3(256), 0, 0,
-                           dG,nblk,dF,tailthr,c.p,c.nsub,c.cb,c.norm,12,dS,dT,dN,dTN);
+                           dG,nblk,dF,tailthr,c.p,c.nsub,c.cb,c.norm,c.iters,c.fp16,dS,dT,dN,dTN);
         CK(hipDeviceSynchronize());
         double hs,ht; unsigned long long hn,htn;
         CK(hipMemcpy(&hs,dS,sizeof(double),hipMemcpyDeviceToHost));

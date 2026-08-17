@@ -6957,11 +6957,13 @@ fn is_q8_tensor(name: &str) -> bool {
         Ok(list) => {
             let trimmed = list.trim();
             if trimmed.is_empty() {
-                // Empty string means "default" — same as not set for the fixed tier,
-                // but the fixed tier for dense models is only lm_head, embed, ssm_out, router.
-                // Attn is deliberately excluded (it would blow up the fixed tier to 354 Q8).
-                // This matches the mq4gl baseline census (50 Q8: lm_head+embed+48 ssm_out).
-                return class == "lm_head" || class == "embed" || class == "ssm_out" || class == "router";
+                // Empty string means "default" — for dense models the fixed tier is only
+                // lm_head and embed (the 48 conv1d are Q8 via q8_conv1d_default, not via
+                // is_q8_tensor). ssm_out/attn/router stay at --format to keep the
+                // baseline census of 50 Q8 (lm_head+embed+48 conv1d). This matches the
+                // mq4gl baseline (qt40 496, Q8 50, F16 305) and the required mq4sel
+                // census (qt43 496, Q8 50, F16 305).
+                return class == "lm_head" || class == "embed";
             }
             trimmed.split(',').any(|c| c.trim() == class)
         }

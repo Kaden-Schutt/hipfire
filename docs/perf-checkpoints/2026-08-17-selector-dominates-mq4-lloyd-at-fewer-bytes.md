@@ -73,3 +73,61 @@ the Lloyd-Max optimum for a unit Gaussian — for the RMS arms, and seeding per-
 Lloyd from whichever codebook matches its space. **A codebook is only meaningful
 paired with the normalisation it was fitted in**; the harness now carries both and
 selects by `norm_mode`.
+
+---
+
+## Amendment — the title overstates it. At MATCHED granularity, Lloyd wins MSE.
+
+The claim above ("dominates MQ4-Lloyd on both axes at fewer bytes") compares the
+136 B selector, which carries **two** per-128 scales, against 160 B MQ4-Lloyd,
+which carries **one** per-256 codebook. That is a comparison across granularities,
+so it is a byte-efficiency statement, not a beats-the-optimum statement. Stated as
+written it is too strong.
+
+First, two fairness checks on the Lloyd arm, because a converged, fp16-charged
+Lloyd is the only honest opponent:
+
+| Lloyd variant | overall MSE | tail-1% MSE |
+|---|---|---|
+| 256, 12 iters, f32 levels | 9.1342e-07 | 5.3254e-06 |
+| 256, 40 iters, f32 levels | 9.1285e-07 | 5.3237e-06 |
+| 256, 40 iters, **fp16 levels** | 9.1286e-07 | 5.3237e-06 |
+
+**Converged at 12 iterations** (0.06% from 40) and the **fp16 level storage that
+real MQ4-Lloyd uses costs nothing** (16 levels in [−1,1] is comfortable for fp16).
+So the Lloyd arm was not a strawman in either direction.
+
+### Matched-granularity truth
+
+| granularity | Lloyd | selector | Lloyd MSE advantage | selector tail advantage |
+|---|---|---|---|---|
+| per-256 | 9.1285e-07 @ 160 B | 1.0338e-06 @ 132 B | **11.7%** | **8.3%** |
+| per-128 (2 sub-blocks) | 7.8525e-07 @ 192 B | 8.9482e-07 @ 136 B | **12.2%** | **24.1%** |
+
+**Lloyd-Max wins overall MSE by ~12% at both granularities, exactly as the theory
+requires** — nearest-neighbour assignment plus centroid reconstruction are its
+necessary conditions, so nothing beats it at its own objective. Nothing here does.
+
+**Lloyd loses the tail at both granularities**, and that is structural rather than a
+convergence artifact (40 iterations reproduce it identically): Lloyd's outermost
+level is the **conditional mean of the tail bin**, which lies strictly inside the
+block max. Being MSE-optimal *requires* under-reaching the extremes. The selector's
+profiles pin the outermost level at ±1.0, which max-normalisation makes exactly the
+block max.
+
+### What is actually true, then
+
+Lloyd-Max optimality is **per-block and MSE-scoped**. It is silent on the two things
+that decide this format:
+
+1. **How to divide a byte budget between codebook freedom and scale granularity.**
+   136 B spent on granularity (8.9482e-07) beats 160 B spent on codebook freedom
+   (9.1285e-07): better MSE for 15% fewer bytes. Per byte, granularity is the better
+   buy — but that is a *budget-allocation* result, not a refutation of Lloyd.
+2. **Tail fidelity**, which is orthogonal to MSE and is the axis measured to track
+   the observed KLD failure.
+
+So "FWHT + Lloyd is near-optimal" is correct **for MSE**, and MSE is the metric that
+already converted a 22.69% win into an 11.28% KLD loss in this exact format family.
+The selector's case rests entirely on the tail, and therefore entirely on qt=43's
+pending KLD.
