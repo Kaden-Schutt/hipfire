@@ -5881,6 +5881,31 @@ mod bq1g128_gptq_tests {
 /// already unrotated and in their runtime-expected precision, so they pass
 /// through byte-verbatim — mirroring how the GGUF ternary/binary pipeline keeps
 /// embeddings at Q8F16 and norms at F16 regardless of `--format`.
+/// Stamp build provenance into an .hfq's metadata JSON.
+///
+/// Inserted as a `hipfire_provenance` object immediately after the opening
+/// brace, so every source key survives byte-for-byte (the runtime parses this
+/// as a `serde_json::Value` and reads named keys, so an extra top-level key is
+/// inert — see `qwen35::config_from_metadata_json`).
+///
+/// This exists because of a concrete failure: the 2026-07-16 SP-E canary
+/// scored a Bonsai ternary .hfq built BEFORE that day's norm-bias fix and
+/// reported KLD 6.15 for a model that actually measures 0.61. Nothing in the
+/// artifact or the result table could reveal the staleness. Now it can.
+fn stamp_provenance(metadata_json: &str, prov: &serde_json::Value) -> String {
+    let body = serde_json::to_string(prov).unwrap_or_else(|_| "{}".to_string());
+    let trimmed = metadata_json.trim_start();
+    match trimmed.strip_prefix('{') {
+        // `{}` (or `{ }`) — no trailing comma, there is nothing after us.
+        Some(rest) if rest.trim_start().starts_with('}') => {
+            format!("{{\"hipfire_provenance\":{body}{rest}")
+        }
+        Some(rest) => format!("{{\"hipfire_provenance\":{body},{rest}"),
+        // Not an object; leave it alone rather than corrupt it.
+        None => metadata_json.to_string(),
+    }
+}
+
 /// Code-level statistics of a packed TQ2G128 buffer.
 #[derive(Default, Debug, Clone, Copy)]
 struct Tq2PackStats {
@@ -6291,6 +6316,25 @@ fn run_hfq_requant_pipeline(
 
     check_ternary_pack_health(ternary_stats);
 
+    // Record what this artifact was built from, so a stale model can never
+    // again be mistaken for a current one (see `stamp_provenance`).
+    let built_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let provenance = serde_json::json!({
+        "source": input_hfq.to_string_lossy(),
+        "format": format.label(),
+        "built_unix": built_unix,
+        "tool": "hipfire-quantize",
+        "tool_version": env!("CARGO_PKG_VERSION"),
+        "git_commit": option_env!("HIPFIRE_GIT_COMMIT").unwrap_or("unknown"),
+        "awq_imatrix_alpha": awq_imatrix_alpha,
+        "awq_folded": awq_folded,
+        "ternary_nonzero_fraction": ternary_stats.nonzero_fraction(),
+    });
+    let metadata_json = stamp_provenance(&metadata_json, &provenance);
+
     write_hfq(output, arch_id, &metadata_json, &out_tensors, None).expect("write output .hfq");
     eprintln!("wrote {}", output.display());
 }
@@ -6406,7 +6450,17 @@ mod hfq_requant_pipeline_tests {
 
         let (arch, out_meta, tensors) = read_hfq_back(&outp);
         assert_eq!(arch, 7, "arch preserved");
-        assert_eq!(out_meta, meta, "metadata reused verbatim");
+        // Source metadata carried through unchanged apart from the appended
+        // provenance stamp (see requant_stamps_provenance_into_metadata).
+        let src_meta: serde_json::Value = serde_json::from_str(meta).unwrap();
+        let out_val: serde_json::Value = serde_json::from_str(&out_meta).unwrap();
+        for (k, v) in src_meta.as_object().unwrap() {
+            assert_eq!(
+                out_val.get(k),
+                Some(v),
+                "source metadata key '{k}' preserved"
+            );
+        }
         assert_eq!(tensors.len(), 2);
 
         // Weight → TQ2G128 (38), group 128, 512 elems / 128 = 4 blocks * 34 B.
@@ -6418,6 +6472,70 @@ mod hfq_requant_pipeline_tests {
         // Norm → F16 passthrough, byte-verbatim.
         assert_eq!(tensors[1].1, QuantType::F16 as u8, "norm stays F16");
         assert_eq!(tensors[1].4, norm_data, "norm bytes verbatim");
+
+        let _ = std::fs::remove_file(&inp);
+        let _ = std::fs::remove_file(&outp);
+    }
+
+    /// Every requant output must record WHAT it was built from and WHEN.
+    ///
+    /// Motivation is not hygiene, it is a real month-long wrong conclusion: the
+    /// 2026-07-16 SP-E canary scored a `ternary-bonsai-27b.hfq` that had been
+    /// built BEFORE the norm-bias fix landed the same day, and reported the
+    /// model at KLD 6.15 when it actually measures 0.61. Nothing in the file or
+    /// the result table could have revealed that. A build timestamp would have.
+    #[test]
+    fn requant_stamps_provenance_into_metadata() {
+        let signs1 = gen_fwht_signs(42, 256);
+        let signs2 = gen_fwht_signs(1042, 256);
+        let weight_f32: Vec<f32> = (0..512).map(|i| ((i % 61) as f32 - 30.0) * 0.01).collect();
+
+        let in_tensors = vec![HfqTensor {
+            name: "model.layers.0.mlp.gate_proj.weight".to_string(),
+            quant_type: QuantType::MQ4G256,
+            shape: vec![2, 256],
+            group_size: 256,
+            data: quantize_mq4g256(&weight_f32, &signs1, &signs2),
+            spilled_len: 0,
+        }];
+
+        let meta = r#"{"architecture":"qwen3.6","num_hidden_layers":1}"#;
+        let dir = std::env::temp_dir();
+        let inp = dir.join(format!("hfq_prov_in_{}.hfq", std::process::id()));
+        let outp = dir.join(format!("hfq_prov_out_{}.hfq", std::process::id()));
+
+        write_hfq(&inp, 7, meta, &in_tensors, None).unwrap();
+        run_hfq_requant_pipeline(&inp, &outp, GgufFormat::Ternary, Some(0.55));
+        let (_a, out_meta, _t) = read_hfq_back(&outp);
+
+        let v: serde_json::Value =
+            serde_json::from_str(&out_meta).expect("output metadata is JSON");
+        let p = v
+            .get("hipfire_provenance")
+            .expect("hipfire_provenance stamped");
+        assert_eq!(p.get("format").and_then(|x| x.as_str()), Some("TQ2G128"));
+        assert_eq!(
+            p.get("source").and_then(|x| x.as_str()),
+            Some(inp.to_string_lossy().as_ref())
+        );
+        // f32 -> JSON widens (0.55f32 == 0.550000011920929f64), so compare loosely.
+        let alpha = p
+            .get("awq_imatrix_alpha")
+            .and_then(|x| x.as_f64())
+            .expect("awq_imatrix_alpha recorded");
+        assert!((alpha - 0.55).abs() < 1e-6, "alpha recorded as {alpha}");
+        assert!(
+            p.get("built_unix").and_then(|x| x.as_u64()).unwrap_or(0) > 1_700_000_000,
+            "built_unix must be a real epoch timestamp"
+        );
+        assert!(p.get("tool_version").and_then(|x| x.as_str()).is_some());
+        assert!(p.get("git_commit").is_some());
+
+        // Source keys survive.
+        assert_eq!(
+            v.get("architecture").and_then(|x| x.as_str()),
+            Some("qwen3.6")
+        );
 
         let _ = std::fs::remove_file(&inp);
         let _ = std::fs::remove_file(&outp);

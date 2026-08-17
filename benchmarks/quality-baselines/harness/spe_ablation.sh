@@ -62,7 +62,13 @@ else
     --max-chunks "$MAX_CHUNKS" --output "$REF"
 fi
 
-echo "=== [2] eval arms ==="; date
+echo "=== [2] provenance of every arm (what are we actually scoring?) ==="
+# Not decoration. The 2026-07-16 canary scored a Bonsai ternary built before
+# that day's norm-bias fix and reported KLD 6.15 for a model that measures
+# 0.61; nothing in the run said so. Print it, every time, before the numbers.
+python3 benchmarks/quality-baselines/harness/hfq_provenance.py "$MQ4" "${ARMS[@]}" || true
+
+echo "=== [3] eval arms ==="; date
 missing=()
 for variant in "${!ARMS[@]}"; do
   model="${ARMS[$variant]}"
@@ -79,7 +85,7 @@ for variant in "${!ARMS[@]}"; do
     --kv-mode asym3 --scoring-mode per-token --max-chunks "$MAX_CHUNKS"
 done
 
-echo "=== [3] reduce ==="; date
+echo "=== [4] reduce ==="; date
 python3 benchmarks/quality-baselines/harness/kld_reduce.py \
   --result-dir "$OUTDIR" \
   --out-md "$OUTDIR/result-table.md" \
