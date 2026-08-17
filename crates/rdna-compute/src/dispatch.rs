@@ -64,6 +64,14 @@ pub const GL_MQ2_GROUP_IDX_BYTES: usize = 64;
 /// split as MQ2-GL — the scale is in the trailing region, not inline.
 pub const GL_MQ3_GROUP_IDX_BYTES: usize = 96;
 
+/// Per-group INDEX bytes for MQ4-G256-GL (4 bits × 256 weights). Same SoA split
+/// as its 2- and 3-bit siblings: `[M*gpr*128 B indices][M*gpr*2 B fp16 scales]`
+/// → 130 B/group → **4.0625 bpw**, i.e. 6 B/group CHEAPER than MQ4G256's 136 B
+/// (4.25 bpw) while using Gaussian-optimal levels instead of a uniform affine
+/// grid. Nibble packing matches MQ4G256 (`lo | hi << 4`, weight 2i in the low
+/// nibble) so a decode path can share the unpack.
+pub const GL_MQ4_GROUP_IDX_BYTES: usize = 128;
+
 /// Bytes per group in the trailing fp16 scale region (both GL dtypes).
 pub const GL_GROUP_SCALE_BYTES: usize = 2;
 
@@ -94,6 +102,25 @@ pub const GL_CB2: [f32; 4] = [-1.5104, -0.4528, 0.4528, 1.5104];
 /// Gaussian levels (MSE 0.03454).
 pub const GL_CB3: [f32; 8] = [
     -2.1520, -1.3439, -0.7560, -0.2451, 0.2451, 0.7560, 1.3439, 2.1520,
+];
+
+/// **MUST STAY BIT-IDENTICAL TO `hipfire-quantize::main::GL_CB4`.**
+///
+/// 4-bit sibling of [`GL_CB2`] / [`GL_CB3`]; a decode kernel takes it as sixteen
+/// scalar float kernel args (`cb0..cb15`, ascending). Same drift hazard, same
+/// machine check (`gl_codebooks_match_runtime`).
+///
+/// Lloyd–Max reconstruction levels for a unit Gaussian at 4 bit, MSE 0.009501.
+/// Derived by running Lloyd iterations to convergence against the exact
+/// Gaussian moments; the same solver reproduces [`GL_CB2`] and [`GL_CB3`] to
+/// four decimals and their documented MSEs, which is what validates it.
+///
+/// NOTE: no kernel consumes this yet — MQ4-GL is currently encode-only. The
+/// constant lives here so the encoder/runtime pair is drift-guarded from the
+/// start rather than after a kernel lands and silently disagrees.
+pub const GL_CB4: [f32; 16] = [
+    -2.7326, -2.0690, -1.6180, -1.2562, -0.9423, -0.6568, -0.3880, -0.1284,
+    0.1284, 0.3880, 0.6568, 0.9423, 1.2562, 1.6180, 2.0690, 2.7326,
 ];
 
 /// Current layer index, set by the qwen35 forward_prefill_chunk at the
