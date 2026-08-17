@@ -61,6 +61,10 @@ pub mod caps;
 /// Per-architecture sampling policy — default temperature, top-p and repeat
 /// penalty. Currently duplicated verbatim at `daemon.rs:1310` and `:14618`.
 /// Lean-up map item **C4**.
+/// Top-K log-probabilities from a host logits slice. Arithmetic only -- no GPU,
+/// no tokenizer, no architecture knowledge -- so every generate path can reach it
+/// without a new dependency edge.
+pub mod logprobs;
 pub mod sampling;
 
 /// Speculative-decode orchestration shared across architectures. Absorbs the
