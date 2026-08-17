@@ -178,3 +178,38 @@ Prose remains valuable *as a tripwire* — it catches catastrophic regressions
 that a narrow in-distribution reference can mask — but it is not sufficient as
 the selector, because it demonstrably ranks arms in the wrong order at margins
 this campaign cares about.
+
+---
+
+## Amendment, same day — the disposition above overstates the KLD result
+
+The commit that introduced this record is titled *"prose references rank
+calibration arms in the wrong order."* That is **true only of PPL**, and the
+title should be read as amended to *"prose understates calibration margins ~3×
+and inverts the PPL ranking."*
+
+On **KLD**, both references select the same arm:
+
+| ref | v5 KLD | v6 KLD | winner |
+|---|---|---|---|
+| WikiText-2 | 0.087921 | 0.086790 | v6 |
+| v6 selector | 1.064046 | 1.023882 | v6 |
+
+This campaign ranked arms on **KLD**, not PPL. So the direction of prior
+prose-scored rankings was most likely correct; what was wrong was the
+**resolution** — prose compresses the margin by roughly 3× relative and 30×
+absolute.
+
+That narrows the rework this record implies. It is **not** "re-score
+everything." It is:
+
+- **Arm pairs previously declared a tie on prose are unresolved.** A tie at
+  prose resolution can be a ~4 % separation on the deployment distribution.
+  This is the actionable set.
+- **Clear prose wins probably survive**, since direction agreed here.
+- **Any ranking that turned on PPL rather than KLD is suspect outright**, because
+  PPL inverted.
+
+The original disposition's phrase "measured on the wrong instrument" remains
+accurate as to *sensitivity*, but should not be read as "measured the wrong
+winner." One 2×2 on one model at one format cannot support the stronger claim.
