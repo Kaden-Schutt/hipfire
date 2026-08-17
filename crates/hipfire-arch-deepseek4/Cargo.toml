@@ -27,3 +27,90 @@ memmap2 = "0.9"
 libloading.workspace = true
 
 [features]
+# Archived research probes; see the note by the [[example]] blocks.
+lab = []
+
+# ---------------------------------------------------------------------------
+# Archived research probes.
+#
+# One-question GPU experiments -- "is GPU argmax faster than downloading logits
+# at vocab 129,280 on gfx1201" -- written at roughly eleven a month since
+# 2026-03. They are the working method for kernel decisions and worth keeping:
+# a HIP kernel cannot be measured by a unit test.
+#
+# Gated because an answer obtained in April should not be type-checked on every
+# build in August. Ungated, they all compile under `cargo build --all-targets`,
+# so every refactor drags every probe with it -- several build breaks during the
+# ModelState removal were in probes nobody had run since the day they were
+# written.
+#
+# Run on demand:  cargo build -p <crate> --examples --features lab
+# The UNGATED example count is ratcheted; see scripts/leanup-ratchets.sh.
+# ---------------------------------------------------------------------------
+[[example]]
+name = "deepseek4_chat"
+required-features = ["lab"]
+
+[[example]]
+name = "deepseek4_decode_bytes"
+required-features = ["lab"]
+
+[[example]]
+name = "deepseek4_perplexity"
+required-features = ["lab"]
+
+[[example]]
+name = "deepseek4_prefill_bench"
+required-features = ["lab"]
+
+[[example]]
+name = "ds4_heterogeneous_load"
+required-features = ["lab"]
+
+[[example]]
+name = "ds4_longctx_probe"
+required-features = ["lab"]
+
+[[example]]
+name = "ds4_parent_buffer_sentinel"
+required-features = ["lab"]
+
+[[example]]
+name = "ds4_prod_vs_parent_trace"
+required-features = ["lab"]
+
+[[example]]
+name = "ds4_quant_plog"
+required-features = ["lab"]
+
+[[example]]
+name = "ds4_quant_plog_multi"
+required-features = ["lab"]
+
+[[example]]
+name = "dspark_bench"
+required-features = ["lab"]
+
+[[example]]
+name = "dspark_forward_smoke"
+required-features = ["lab"]
+
+[[example]]
+name = "dspark_load_smoke"
+required-features = ["lab"]
+
+[[example]]
+name = "dspark_parity"
+required-features = ["lab"]
+
+[[example]]
+name = "dump_hfq_dtypes"
+required-features = ["lab"]
+
+[[example]]
+name = "ep_deepseek4"
+required-features = ["lab"]
+
+[[example]]
+name = "ep_dspark_topology_probe"
+required-features = ["lab"]

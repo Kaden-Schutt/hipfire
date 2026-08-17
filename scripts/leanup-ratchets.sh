@@ -117,3 +117,34 @@ p 'ratio (all-kernels)' "$(r $((c+k_all)) $a)"
 p 'ratio (strict)' "$(r $((c+k_gen)) $((a+k_arch)))   <- kernels fixed, substrate still omitted"
 p 'ratio (+substrate)' "$(r $((c+k_gen+sub_clean)) $((a+k_arch)))   <- quote this one"
 p 'ratio (+dispatchers)' "$(r $((c+k_gen+sub_clean+sub_disp)) $((a+k_arch)))   <- upper bound"
+
+# --- ungated research probes -------------------------------------------------
+# Examples compile on every `cargo build --all-targets`. Archived one-question
+# GPU probes are gated behind `--features lab` so an answer obtained in April is
+# not type-checked in August. This counts the ones still UNGATED so the number
+# cannot silently drift back up -- which is exactly how the dead golden CASES
+# table accumulated five models, four of which do not exist.
+#
+# Counts example NAMES that have a required-features line inside their own
+# [[example]] block. An earlier version counted required-features LINES per
+# manifest and reported 16 where the answer was 32; a metric that is wrong is
+# worse than no metric, because it is believed.
+ungated_examples() {
+  python3 - <<'PYEOF'
+import glob, os, re
+total = {(p.split("/")[1], os.path.basename(p)[:-3]) for p in glob.glob("crates/*/examples/*.rs")}
+gated = set()
+for tm in glob.glob("crates/*/Cargo.toml"):
+    crate = tm.split("/")[1]
+    for blk in re.split(r'(?=\[\[example\]\])', open(tm, encoding='utf8').read()):
+        if not blk.startswith("[[example]]"):
+            continue
+        blk = re.split(r'\n\[(?!\[example)', blk)[0]
+        nm = re.search(r'name\s*=\s*"([^"]+)"', blk)
+        rf = re.search(r'required-features\s*=\s*\[([^\]]*)\]', blk)
+        if nm and rf and rf.group(1).strip():
+            gated.add((crate, nm.group(1)))
+print(len(total - gated))
+PYEOF
+}
+printf '%-26s %s\n' "ungated_examples" "$(ungated_examples)"

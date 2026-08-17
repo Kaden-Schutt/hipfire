@@ -6,6 +6,8 @@ license.workspace = true
 description = "Archived research harnesses and legacy benchmarks — not part of the default build graph. Each binary builds on request via `cargo build -p saddle-lab --examples` or `cargo build --workspace --all-targets`."
 
 [features]
+# Archived research probes; see the note by the [[example]] blocks.
+lab = []
 default = ["deltanet", "arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-cohere2moe", "arch-dots-ocr", "arch-gemma4", "arch-muse-glimmer"]
 deltanet = ["rdna-compute/deltanet", "hipfire-dispatch/deltanet"]
 arch-qwen35 = []
