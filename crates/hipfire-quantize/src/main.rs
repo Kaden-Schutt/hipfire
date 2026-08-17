@@ -5791,6 +5791,22 @@ fn q8_class_of(name: &str) -> Option<&'static str> {
         || name.ends_with("router.proj.weight")
     {
         Some("router")
+    } else if name.contains("linear_attn.out_proj") || name.ends_with("ssm_out.weight") {
+        // DeltaNet / SSM output projection, split out of the general `attn`
+        // class so it can be protected on its own.
+        //
+        // Unsloth's published Qwen3.5 ablation (2026-02-27, 121 single-group
+        // sweeps) measured this tensor as one of the two most
+        // quantization-sensitive in a hybrid model: dropping `ssm_out` alone
+        // to Q2 moved 99.9% KLD from ~0 to 1.202 while saving 0.6% of file
+        // size. Their production UD-Q4_K_XL keeps it Q8_0 on every layer even
+        // though the SKU is nominally 4-bit.
+        //
+        // NOTE: this narrows the `attn` class. An explicit
+        // `HIPFIRE_Q8_CLASSES=attn` no longer covers the SSM output
+        // projection — name `ssm_out` alongside it. An unset class list is
+        // unaffected (every class is on).
+        Some("ssm_out")
     } else if name.contains("self_attn")
         || name.contains("attn_q")
         || name.contains("attn_k")
@@ -5812,7 +5828,7 @@ fn q8_class_of(name: &str) -> Option<&'static str> {
 /// Fixed-tier tensors held at Q8F16 regardless of `--format`.
 ///
 /// `HIPFIRE_Q8_CLASSES=<comma list>` narrows this to a subset of
-/// {`lm_head`, `embed`, `router`, `attn`} — the lever for attributing which
+/// {`lm_head`, `embed`, `router`, `ssm_out`, `attn`} — the lever for attributing which
 /// fixed class actually carries the quality. Measured 2026-08-04: dropping the
 /// WHOLE fixed tier Q8 -> MQ4 costs **+35.2% KLD** (0.1742 -> 0.2356) while
 /// buying 1.75x decode speed, so the tier is emphatically not free — but the
@@ -5842,7 +5858,7 @@ fn is_q8_tensor(name: &str) -> bool {
 /// back to Q8F16 (the historic behaviour).
 ///
 /// Accepted dtypes: `q8`, `mq4`, `mq3l`, `mfp4e8`, `mfp4e8soa`. Accepted
-/// classes: `lm_head`, `embed`, `router`, `attn` (see `q8_class_of`).
+/// classes: `lm_head`, `embed`, `router`, `ssm_out`, `attn` (see `q8_class_of`).
 fn fixed_tier_dtype_for(name: &str) -> Option<&'static str> {
     let class = q8_class_of(name)?;
     let spec = std::env::var("HIPFIRE_FIXED_TIER").ok()?;
@@ -8657,7 +8673,17 @@ fn main() {
     // outlier mitigation techniques" — MR-GPTQ is the right lever there,
     // tracked as Stage C). HFP4/MFP4 are explicitly NOT awq-pre-scaled
     // in this patch.
-    let awq_enabled = args.awq || args.awq_alpha.is_some();
+    //
+    // `--imatrix` IMPLIES AWQ at the default alpha. Passing an imatrix and
+    // getting a byte-identical artifact was a silent no-op that cost real
+    // measurement time: every `imatrix_weights_for` callsite is gated on
+    // AWQ_ALPHA, so without an alpha the file loaded, reported its entry
+    // count, and was then never read. Measured 2026-08-16 on qwen3.8-27b:
+    // `--format mq4 --imatrix <gguf>` produced md5 129909ad0fed, byte-identical
+    // to the no-imatrix build, and an identical WT2 KLD of 0.066668 to six
+    // decimals. `--hessian` is deliberately NOT included here — it is the
+    // LDLQ/GPTQ input, and implying AWQ from it would change that path.
+    let awq_enabled = args.awq || args.awq_alpha.is_some() || args.imatrix.is_some();
     let awq_alpha = args.awq_alpha.unwrap_or(0.55);
     if awq_enabled {
         if IMATRIX.get().is_none() {
@@ -8674,6 +8700,13 @@ fn main() {
         AWQ_ALPHA
             .set(awq_alpha)
             .expect("AWQ_ALPHA set twice — should not happen");
+        if !args.awq && args.awq_alpha.is_none() {
+            eprintln!(
+                "note: --imatrix implies AWQ at the default alpha ({awq_alpha}). Pass\n\
+                 --awq-alpha <a> to choose another, or omit --imatrix for an\n\
+                 uncalibrated build. An imatrix is only consumed through AWQ."
+            );
+        }
         eprintln!(
             "AWQ pre-scaling: ENABLED (alpha={awq_alpha}, formula: s[j]=(RMS_act[j])^alpha, geo-mean normalized to 1)"
         );
