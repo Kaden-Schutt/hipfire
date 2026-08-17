@@ -181,6 +181,14 @@ while read -r _k _v; do
   case "$_k" in [a-z]*) p "$_k" "$_v" ;; esac
 done < <(python3 scripts/check-layering.py 2>/dev/null | grep -E '^[a-z_]+[[:space:]]+[0-9]+$')
 
+# --- arch-key dispatch (string form of arch_id ==) ---------------------------
+# arch_id == is asserted at 0, but the same coupling written as a string match
+# is invisible to it. `match arch { "gemma4" => .. }` was written into
+# hipfire-runtime during Phase 3B and reverted; nothing here would have objected.
+while read -r _k _v; do
+  case "$_k" in [a-z]*) p "$_k" "$_v" ;; esac
+done < <(python3 scripts/check-arch-dispatch.py 2>/dev/null | grep -E '^[a-z_]+[[:space:]]+[0-9]+$')
+
 # --- assertion -------------------------------------------------------------
 # The point of the file. A metric named in scripts/leanup-thresholds.txt must
 # satisfy its threshold or this exits non-zero.

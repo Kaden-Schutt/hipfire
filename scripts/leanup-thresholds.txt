@@ -38,3 +38,10 @@ ungated_examples            <= 32
 # daemon / cli fails the build.
 arch_depends_upward         == 0
 layer_unlisted_crates       == 0
+
+# Arch-key dispatch expressed as a string. A CEILING, not zero: hipfire-generate
+# is the architecture composition root by design, and the daemon keeps a narrow
+# arch_key() == "deepseek4" check because that arch's captured decode graph must
+# be invalidated across reset while gemma4's stays valid. Those have reasons; a
+# thirteenth needs one too.
+arch_key_dispatch           <= 12
