@@ -98,14 +98,7 @@ pub trait ArchModel: Send + std::any::Any {
     /// A whole-struct accessor cannot: that distinction is why the accessor
     /// experiment converted 15 sites of 154 and this hatch is expected to do
     /// better.
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
 
-    /// Shared-reference counterpart of [`ArchModel::as_any_mut`].
-    ///
-    /// Added because the mutable-only hatch forced read-only call sites to take
-    /// `as_mut()` purely to downcast, which is both misleading and sometimes
-    /// impossible — a site holding `&LoadedModel` cannot conjure a `&mut`.
-    fn as_any(&self) -> &dyn std::any::Any;
 
     /// Return every GPU buffer this model owns.
     ///
@@ -141,12 +134,6 @@ mod tests {
         }
         fn kv_cache_mut(&mut self) -> Option<&mut KvCache> {
             None
-        }
-        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-            self
-        }
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
         }
         fn free_gpu(self: Box<Self>, _gpu: &mut Gpu) {}
     }

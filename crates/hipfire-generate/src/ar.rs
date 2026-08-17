@@ -16,6 +16,7 @@
 //! Moved verbatim: identical branch order, identical GPU dispatch, identical
 //! wire strings and `unwrap_or` defaults.
 
+use std::any::Any;
 use crate::common::*;
 use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_lfm2moe as lfm2moe;
@@ -1849,7 +1850,7 @@ pub fn generate(
         // bundle (ModelState::Qwen35), not the always-None m.dn_state/m.kv_cache.
         // Use the canonical reset so newly added recurrent buffers (notably the
         // Q8 error-feedback residual) cannot leak across rollover boundaries.
-        if let Some(b) = m.state.as_mut().and_then(|s| s.as_arch_model_mut().as_any_mut().downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()) {
+        if let Some(b) = m.state.as_mut().and_then(|s| (s.as_arch_model_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()) {
             if let Err(e) = b.dn_state.reset(gpu) {
                 crate::dense::emit_active_attempt_error(
                     stdout,
@@ -1863,11 +1864,11 @@ pub fn generate(
             }
             b.kv_cache.compact_offset = 0;
         }
-        if let Some(b) = m.state.as_mut().and_then(|s| s.as_arch_model_mut().as_any_mut().downcast_mut::<hipfire_arch_llama::LlamaBundle>()) {
+        if let Some(b) = m.state.as_mut().and_then(|s| (s.as_arch_model_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_llama::LlamaBundle>()) {
             b.kv.compact_offset = 0;
         }
         if let Some(ad) = m.kv_adaptive.as_mut() {
-            if let Some(b) = m.state.as_mut().and_then(|s| s.as_arch_model_mut().as_any_mut().downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()) {
+            if let Some(b) = m.state.as_mut().and_then(|s| (s.as_arch_model_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()) {
                 ad.reset_with_cache(gpu, &mut b.kv_cache);
             } else {
                 ad.reset();
@@ -2556,11 +2557,11 @@ pub fn generate(
                 && m.state.as_ref().map_or(true, |s| {
                     let am = s.as_arch_model();
                     if let Some(b) =
-                        am.as_any().downcast_ref::<hipfire_arch_llama::LlamaBundle>()
+                        (am as &dyn Any).downcast_ref::<hipfire_arch_llama::LlamaBundle>()
                     {
                         b.kv.compact_offset == 0
                     } else if let Some(b) =
-                        am.as_any().downcast_ref::<hipfire_arch_qwen35::Qwen35Bundle>()
+                        (am as &dyn Any).downcast_ref::<hipfire_arch_qwen35::Qwen35Bundle>()
                     {
                         // qwen35's KV compact_offset lives in the bundle, not the
                         // always-None m.kv_cache direct field.
@@ -2587,7 +2588,7 @@ pub fn generate(
                 // RESTORE only (do NOT zero): roll the bundle's DeltaNet state
                 // back to the checkpoint. Disjoint split: m.state and
                 // m.prefill_checkpoints are different fields of `m`.
-                let ok = if let (Some(b), Some(ck)) = (m.state.as_mut().and_then(|s| s.as_arch_model_mut().as_any_mut().downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()), m.prefill_checkpoints.get(idx))
+                let ok = if let (Some(b), Some(ck)) = (m.state.as_mut().and_then(|s| (s.as_arch_model_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()), m.prefill_checkpoints.get(idx))
                 {
                     ck.1.restore_to(&mut b.dn_state, gpu).is_ok()
                 } else {
@@ -2624,7 +2625,7 @@ pub fn generate(
                     m.seq_pos = 0;
                     m.conversation_tokens.clear();
                     crate::common::free_checkpoints(&mut m.prefill_checkpoints, gpu);
-                    if let Some(b) = m.state.as_mut().and_then(|s| s.as_arch_model_mut().as_any_mut().downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()) {
+                    if let Some(b) = m.state.as_mut().and_then(|s| (s.as_arch_model_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()) {
                         let dn = &b.dn_state;
                         for s in &dn.s_matrices {
                             let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
@@ -2639,10 +2640,10 @@ pub fn generate(
                             let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
                         }
                     }
-                    if let Some(b) = m.state.as_mut().and_then(|s| s.as_arch_model_mut().as_any_mut().downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()) {
+                    if let Some(b) = m.state.as_mut().and_then(|s| (s.as_arch_model_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()) {
                         b.kv_cache.compact_offset = 0;
                     }
-                    if let Some(b) = m.state.as_mut().and_then(|s| s.as_arch_model_mut().as_any_mut().downcast_mut::<hipfire_arch_llama::LlamaBundle>()) {
+                    if let Some(b) = m.state.as_mut().and_then(|s| (s.as_arch_model_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_llama::LlamaBundle>()) {
                         b.kv.compact_offset = 0;
                     }
                     rendered
@@ -2698,7 +2699,7 @@ pub fn generate(
         // qwen35 recurrent state lives in the bundle (ModelState::Qwen35), not
         // the always-None m.dn_state/m.kv_cache. Inlined (disjoint field access)
         // because a `&tokenizer` borrow of `m` is live here.
-        if let Some(b) = m.state.as_mut().and_then(|s| s.as_arch_model_mut().as_any_mut().downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()) {
+        if let Some(b) = m.state.as_mut().and_then(|s| (s.as_arch_model_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()) {
             let dn = &b.dn_state;
             for s in &dn.s_matrices {
                 let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
@@ -2713,10 +2714,10 @@ pub fn generate(
                 let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
             }
         }
-        if let Some(b) = m.state.as_mut().and_then(|s| s.as_arch_model_mut().as_any_mut().downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()) {
+        if let Some(b) = m.state.as_mut().and_then(|s| (s.as_arch_model_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()) {
             b.kv_cache.compact_offset = 0;
         }
-        if let Some(b) = m.state.as_mut().and_then(|s| s.as_arch_model_mut().as_any_mut().downcast_mut::<hipfire_arch_llama::LlamaBundle>()) {
+        if let Some(b) = m.state.as_mut().and_then(|s| (s.as_arch_model_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_llama::LlamaBundle>()) {
             b.kv.compact_offset = 0;
         }
     }
@@ -2735,11 +2736,11 @@ pub fn generate(
             .and_then(|s| {
                 let am = s.as_arch_model();
                 if let Some(b) =
-                    am.as_any().downcast_ref::<hipfire_arch_llama::LlamaBundle>()
+                    (am as &dyn Any).downcast_ref::<hipfire_arch_llama::LlamaBundle>()
                 {
                     Some(b.kv.compact_offset)
                 } else if let Some(b) =
-                    am.as_any().downcast_ref::<hipfire_arch_qwen35::Qwen35Bundle>()
+                    (am as &dyn Any).downcast_ref::<hipfire_arch_qwen35::Qwen35Bundle>()
                 {
                     // qwen35 KV compact_offset lives in the bundle, not the
                     // always-None m.kv_cache direct field.
@@ -2822,7 +2823,7 @@ pub fn generate(
         .unwrap_or(false) {
         // Qwen3.5 / Qwen3.5-MoE — multi-turn: prefill only the NEW turn tokens,
         // continuing from m.seq_pos (KV cache + DeltaNet state are cumulative)
-        let b = m.state.as_mut().and_then(|s| s.as_arch_model_mut().as_any_mut().downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()).unwrap();
+        let b = m.state.as_mut().and_then(|s| (s.as_arch_model_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()).unwrap();
         let config = &b.config;
         let weights = &b.weights;
         let scratch = &b.scratch;
@@ -4147,7 +4148,7 @@ pub fn generate(
     } else {
         // LLaMA path -- multi-turn aware
         let has_eviction = m.eviction.is_some();
-        let b = m.state.as_mut().and_then(|s| s.as_arch_model_mut().as_any_mut().downcast_mut::<hipfire_arch_llama::LlamaBundle>()).unwrap();
+        let b = m.state.as_mut().and_then(|s| (s.as_arch_model_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_llama::LlamaBundle>()).unwrap();
         let config = &b.config;
         let weights = &b.weights;
         let scratch = &b.scratch;

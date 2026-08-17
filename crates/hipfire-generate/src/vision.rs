@@ -7,6 +7,7 @@
 //! Per-architecture generation bodies lifted verbatim from `crates/hipfire-daemon/src/main.rs`
 //! (wave 5 / D3). See `lib.rs` for layering rationale.
 
+use std::any::Any;
 use base64::Engine;
 use hipfire_arch_dots_ocr::dots_ocr;
 use hipfire_arch_qwen2::qwen2;
@@ -488,7 +489,7 @@ pub fn generate_vl(
         if let Some(b) = m
             .state
             .as_mut()
-            .and_then(|s| s.as_arch_model_mut().as_any_mut().downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>())
+            .and_then(|s| (s.as_arch_model_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>())
         {
             let dn = &b.dn_state;
             for s in &dn.s_matrices {
@@ -507,7 +508,7 @@ pub fn generate_vl(
         if let Some(b) = m
             .state
             .as_mut()
-            .and_then(|s| s.as_arch_model_mut().as_any_mut().downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>())
+            .and_then(|s| (s.as_arch_model_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>())
         {
             b.kv_cache.compact_offset = 0;
         }
@@ -515,7 +516,7 @@ pub fn generate_vl(
             if let Some(b) = m
                 .state
                 .as_mut()
-                .and_then(|s| s.as_arch_model_mut().as_any_mut().downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>())
+                .and_then(|s| (s.as_arch_model_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>())
             {
                 ad.reset_with_cache(gpu, &mut b.kv_cache);
             } else {
@@ -540,7 +541,7 @@ pub fn generate_vl(
     let Some(b) = m
         .state
         .as_mut()
-        .and_then(|s| s.as_arch_model_mut().as_any_mut().downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>())
+        .and_then(|s| (s.as_arch_model_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>())
     else {
         unreachable!()
     };
@@ -1383,7 +1384,7 @@ pub fn generate_vl_dots_ocr(
     let bundle_ptr: *mut hipfire_arch_dots_ocr::DotsOcrBundle = match m
         .state
         .as_mut()
-        .and_then(|s| s.as_arch_model_mut().as_any_mut().downcast_mut::<hipfire_arch_dots_ocr::DotsOcrBundle>())
+        .and_then(|s| (s.as_arch_model_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_dots_ocr::DotsOcrBundle>())
     {
         Some(b) => b as *mut _,
         None => unreachable!(),
@@ -1559,7 +1560,7 @@ pub fn generate_vl_dots_ocr(
     let bundle_ptr: *mut hipfire_arch_dots_ocr::DotsOcrBundle = match m
         .state
         .as_mut()
-        .and_then(|s| s.as_arch_model_mut().as_any_mut().downcast_mut::<hipfire_arch_dots_ocr::DotsOcrBundle>())
+        .and_then(|s| (s.as_arch_model_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_dots_ocr::DotsOcrBundle>())
     {
         Some(b) => b as *mut _,
         None => unreachable!(),
@@ -1902,7 +1903,7 @@ pub fn generate_dots_ocr_text(
     let bundle_ptr: *mut hipfire_arch_dots_ocr::DotsOcrBundle = match m
         .state
         .as_mut()
-        .and_then(|s| s.as_arch_model_mut().as_any_mut().downcast_mut::<hipfire_arch_dots_ocr::DotsOcrBundle>())
+        .and_then(|s| (s.as_arch_model_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_dots_ocr::DotsOcrBundle>())
     {
         Some(b) => b as *mut _,
         None => unreachable!(),

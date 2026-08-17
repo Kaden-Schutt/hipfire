@@ -6,6 +6,7 @@
 //! Verbatim move of generate_multi, generate_ep, generate_spec, generate_qwen35_mtp, generate_dflash
 //! plus their exclusive EP/cache/MTP helpers. No logic changes.
 
+use std::any::Any;
 use base64::Engine;
 use hipfire_arch_cohere2moe as cohere2moe;
 use hipfire_arch_deepseek4 as deepseek4;
@@ -3806,7 +3807,7 @@ pub fn generate_qwen35_mtp(
     // from position 0 over clean buffers. (No LCP prompt-cache in v1.)
     m.seq_pos = 0;
     m.conversation_tokens.clear();
-    if let Some(b) = m.state.as_mut().and_then(|s| s.as_arch_model_mut().as_any_mut().downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()) {
+    if let Some(b) = m.state.as_mut().and_then(|s| (s.as_arch_model_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()) {
         let dn = &b.dn_state;
         for s in &dn.s_matrices {
             let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
@@ -3821,7 +3822,7 @@ pub fn generate_qwen35_mtp(
             let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
         }
     }
-    if let Some(b) = m.state.as_mut().and_then(|s| s.as_arch_model_mut().as_any_mut().downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()) {
+    if let Some(b) = m.state.as_mut().and_then(|s| (s.as_arch_model_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()) {
         b.kv_cache.compact_offset = 0;
     }
     // Adaptive start-tier restore for single-turn MTP (no LCP): a prior AR
@@ -3831,7 +3832,7 @@ pub fn generate_qwen35_mtp(
     // already refused the request).
     if let Some(ad) = m.kv_adaptive.as_mut() {
         if !ad.is_poisoned() {
-            if let Some(b) = m.state.as_mut().and_then(|s| s.as_arch_model_mut().as_any_mut().downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()) {
+            if let Some(b) = m.state.as_mut().and_then(|s| (s.as_arch_model_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()) {
                 ad.reset_with_cache(gpu, &mut b.kv_cache);
             }
         }
@@ -4825,7 +4826,7 @@ pub fn generate_multi(
         // pp>1 per-LA-device path and the single-GPU path.
         if m.pp > 1 {
             if let (Some(b), Some(gpus), Some(la)) = (
-                m.state.as_mut().and_then(|s| s.as_arch_model_mut().as_any_mut().downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()),
+                m.state.as_mut().and_then(|s| (s.as_arch_model_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()),
                 m.pp_gpus.as_mut(),
                 m.pp_dn_la_to_device.as_ref(),
             ) {
@@ -4853,7 +4854,7 @@ pub fn generate_multi(
                     let _ = g.hip.memset(&s.buf, 0, s.buf.size());
                 }
             }
-        } else if let Some(b) = m.state.as_mut().and_then(|s| s.as_arch_model_mut().as_any_mut().downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()) {
+        } else if let Some(b) = m.state.as_mut().and_then(|s| (s.as_arch_model_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()) {
             let dn = &b.dn_state;
             for s in &dn.s_matrices {
                 let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
@@ -4868,11 +4869,11 @@ pub fn generate_multi(
                 let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
             }
         }
-        if let Some(b) = m.state.as_mut().and_then(|s| s.as_arch_model_mut().as_any_mut().downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()) {
+        if let Some(b) = m.state.as_mut().and_then(|s| (s.as_arch_model_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()) {
             b.kv_cache.compact_offset = 0;
         }
         if let Some(ad) = m.kv_adaptive.as_mut() {
-            if let Some(b) = m.state.as_mut().and_then(|s| s.as_arch_model_mut().as_any_mut().downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()) {
+            if let Some(b) = m.state.as_mut().and_then(|s| (s.as_arch_model_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()) {
                 ad.reset_with_cache(gpu, &mut b.kv_cache);
             } else {
                 ad.reset();
@@ -5100,7 +5101,7 @@ pub fn generate_multi(
         // the always-None m.dn_state/m.kv_cache. Covers pp>1 + single-GPU.
         if m.pp > 1 {
             if let (Some(b), Some(gpus), Some(la)) = (
-                m.state.as_mut().and_then(|s| s.as_arch_model_mut().as_any_mut().downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()),
+                m.state.as_mut().and_then(|s| (s.as_arch_model_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()),
                 m.pp_gpus.as_mut(),
                 m.pp_dn_la_to_device.as_ref(),
             ) {
@@ -5128,7 +5129,7 @@ pub fn generate_multi(
                     let _ = g.hip.memset(&s.buf, 0, s.buf.size());
                 }
             }
-        } else if let Some(b) = m.state.as_mut().and_then(|s| s.as_arch_model_mut().as_any_mut().downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()) {
+        } else if let Some(b) = m.state.as_mut().and_then(|s| (s.as_arch_model_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()) {
             let dn = &b.dn_state;
             for s in &dn.s_matrices {
                 let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
@@ -5143,10 +5144,10 @@ pub fn generate_multi(
                 let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
             }
         }
-        if let Some(b) = m.state.as_mut().and_then(|s| s.as_arch_model_mut().as_any_mut().downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()) {
+        if let Some(b) = m.state.as_mut().and_then(|s| (s.as_arch_model_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()) {
             b.kv_cache.compact_offset = 0;
         }
-        if let Some(b) = m.state.as_mut().and_then(|s| s.as_arch_model_mut().as_any_mut().downcast_mut::<hipfire_arch_llama::LlamaBundle>()) {
+        if let Some(b) = m.state.as_mut().and_then(|s| (s.as_arch_model_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_llama::LlamaBundle>()) {
             b.kv.compact_offset = 0;
         }
     }
@@ -5193,7 +5194,7 @@ pub fn generate_multi(
     let prefill_tokens = new_tokens.len();
     let t0 = Instant::now();
 
-    let Some(b) = m.state.as_mut().and_then(|s| s.as_arch_model_mut().as_any_mut().downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()) else {
+    let Some(b) = m.state.as_mut().and_then(|s| (s.as_arch_model_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()) else {
         unreachable!()
     };
     let config = &b.config;
@@ -5233,7 +5234,7 @@ pub fn generate_multi(
                 let _ = g.hip.memset(&s.buf, 0, s.buf.size());
             }
             kv.compact_offset = 0;
-            if let Some(b) = m.state.as_mut().and_then(|s| s.as_arch_model_mut().as_any_mut().downcast_mut::<hipfire_arch_llama::LlamaBundle>()) {
+            if let Some(b) = m.state.as_mut().and_then(|s| (s.as_arch_model_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_llama::LlamaBundle>()) {
                 b.kv.compact_offset = 0;
             }
         }};
