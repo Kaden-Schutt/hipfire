@@ -5,7 +5,15 @@
 #
 # Ratchets for docs/governance/2026-08-15-hipfire-leanup-map.md § 4.
 #
-# Run from the repository root. Every number is measured, never asserted.
+# Run from the repository root.
+#
+# Metrics listed in scripts/leanup-thresholds.txt are ASSERTED: a violation
+# exits non-zero. Everything else is reported and never fails the run.
+# `--report` prints without asserting.
+#
+# Until 2026-08-16 this script emitted 22 metrics and contained exactly one
+# `exit 1`, on the `cd` guard. Its header said "every number is measured, never
+# asserted", and it was believed to be a gate anyway.
 #
 # On the compute:arch ratio — read this before quoting it
 # -------------------------------------------------------
@@ -45,35 +53,48 @@
 # 16.20 : 1 and (ggml+substrate):src/models is 19.19 : 1. The 9.7 : 1 figure
 # quoted in the original grounding doc could not be reproduced from the tree.
 set -uo pipefail
+REPORT_ONLY=0
+if [ "${1:-}" = "--report" ]; then REPORT_ONLY=1; shift; fi
 cd "${1:-.}" || exit 1
 
 lines() { find $1 -type f \( ${2} \) 2>/dev/null | xargs wc -l 2>/dev/null | tail -1 | awk '{print $1+0}'; }
 RS='-name *.rs'
 KS='-name *.hip -o -name *.h -o -name *.hpp -o -name *.cpp -o -name *.cl'
-p() { printf '%-26s %s\n' "$1" "$2"; }
+declare -A METRIC
+p() { printf '%-26s %s\n' "$1" "$2"; METRIC["$1"]="$2"; }
 
 DAEMON=crates/hipfire-daemon/src/main.rs
 p HEAD "$(git rev-parse --short HEAD 2>/dev/null)"
 p daemon_lines "$(wc -l < $DAEMON)"
 p daemon_arch_id "$(grep -cE 'arch_id *==' $DAEMON)"
 p daemon_arch_refs "$(grep -coE 'hipfire_arch_[a-z0-9_]+' $DAEMON)"
-p required_features "$(grep -c 'required-features' crates/hipfire-daemon/Cargo.toml)"
+# Scoped to the daemon manifest on purpose: the product must build without a
+# feature incantation. Tree-wide `required-features` is a different thing
+# entirely and is a GOOD signal -- it is how archived probes stay out of the
+# default build. See `ungated_examples`.
+p required_features_daemon "$(grep -c 'required-features' crates/hipfire-daemon/Cargo.toml)"
 # `daemon_arch_refs` greps `hipfire_arch_*`, which `ModelState::Qwen35` does NOT match:
 # ModelState is a LOADER-owned enum wrapping arch bundles. The daemon therefore reported
 # 0 arch refs while still doing a 7-way architecture dispatch (main.rs:1732-1751). Count
 # the laundered form too, or the gate certifies a decoupling that has not happened.
 p daemon_modelstate "$(grep -co 'ModelState::' $DAEMON)"
-p loader_modelstate "$(grep -rho 'ModelState::' crates/hipfire-loader/src | wc -l)"
-p runtime_examples "$(grep -c '^\[\[example\]\]' crates/hipfire-runtime/Cargo.toml)"
+# Split code from prose. ModelState is deleted; the remaining mentions are
+# history in comments, and a gate that cannot tell those apart would either fail
+# on a comment or pass on a reintroduction.
+p loader_modelstate_all "$(grep -rho 'ModelState::' crates/hipfire-loader/src | wc -l)"
+p loader_modelstate_code "$(grep -rhn 'ModelState::' crates/hipfire-loader/src 2>/dev/null | grep -vE '^[0-9]+:[[:space:]]*(//|///|\*)' | grep -c 'ModelState::')"
+# `runtime_examples` used to count [[example]] declarations in hipfire-runtime.
+# Gating an archived probe ADDS a declaration, so the number rose while the
+# thing it meant to track improved. Direction inverted; removed. `ungated_examples`
+# below measures the intent -- how many examples the default build still pays for.
 p grammar_copies "$(find crates/hipfire-arch-*/src -name grammar.rs 2>/dev/null | wc -l)"
 p glossary "$([ -f docs/GLOSSARY.md ] && echo present || echo MISSING)"
 
-big=0
-for d in crates/hipfire-arch-*/; do
-  n=$(lines "$d/src" "$RS")
-  [ "${n:-0}" -gt 10000 ] && { p "OVER_10k" "$(basename $d) $n"; big=$((big+1)); }
-done
-p arch_crates_over_10k "$big"
+# The 10,000-line arch-crate gate is VOID (maintainer ruling, Phase 2): crates are
+# admissible at any size iff well-defined and legible, and no crate may be split
+# to satisfy a line budget. Reporting a count against a retired rule invites
+# someone to act on it, so it is gone. Legibility is tracked by module structure,
+# not line count.
 
 c=0
 for x in rdna-compute redline redline-dispatch redline-rocr radiowave \
@@ -147,4 +168,51 @@ for tm in glob.glob("crates/*/Cargo.toml"):
 print(len(total - gated))
 PYEOF
 }
-printf '%-26s %s\n' "ungated_examples" "$(ungated_examples)"
+p ungated_examples "$(ungated_examples)"
+
+# --- assertion -------------------------------------------------------------
+# The point of the file. A metric named in scripts/leanup-thresholds.txt must
+# satisfy its threshold or this exits non-zero.
+THRESH="scripts/leanup-thresholds.txt"
+if [ "$REPORT_ONLY" -eq 1 ]; then
+  echo
+  echo "(--report: thresholds not asserted)"
+  exit 0
+fi
+if [ ! -f "$THRESH" ]; then
+  echo
+  echo "leanup-ratchets: FAIL — $THRESH is missing."
+  echo "  Without it nothing is asserted, which is the state this gate exists to end."
+  exit 1
+fi
+
+fails=0
+checked=0
+while read -r metric op want; do
+  case "$metric" in ''|'#'*) continue ;; esac
+  got="${METRIC[$metric]:-}"
+  if [ -z "$got" ]; then
+    echo "leanup-ratchets: FAIL — threshold names unknown metric '$metric'."
+    echo "  A threshold on a metric that is not emitted silently protects nothing."
+    fails=$((fails+1)); continue
+  fi
+  got="${got%% *}"          # strip trailing annotation
+  checked=$((checked+1))
+  case "$op" in
+    "==") [ "$got" = "$want" ] || { echo "leanup-ratchets: FAIL $metric = $got, must be $want"; fails=$((fails+1)); } ;;
+    "<=") if [ "$got" -gt "$want" ] 2>/dev/null; then
+            echo "leanup-ratchets: FAIL $metric = $got, ceiling $want"; fails=$((fails+1))
+          fi ;;
+    *) echo "leanup-ratchets: FAIL — unknown operator '$op' for $metric"; fails=$((fails+1)) ;;
+  esac
+done < "$THRESH"
+
+echo
+if [ "$fails" -gt 0 ]; then
+  echo "leanup-ratchets: $fails violation(s) across $checked asserted metric(s)."
+  echo "  Lowering a ceiling after an improvement is expected. Raising one needs a"
+  echo "  sentence in the commit saying what was traded for it."
+  exit 1
+fi
+echo "leanup-ratchets: OK — $checked metric(s) asserted, 0 violations."
+

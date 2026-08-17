@@ -1,0 +1,32 @@
+# Committed thresholds for scripts/leanup-ratchets.sh.
+#
+# Format:  <metric> <op> <value>
+#   ==  must equal exactly
+#   <=  ceiling; may only decrease
+#
+# A metric with no line here is informational and never fails the run.
+#
+# Lowering a ceiling after an improvement is expected and encouraged. RAISING
+# one requires a sentence in the commit message saying what was traded for it --
+# otherwise the ratchet stops meaning anything, which is precisely the failure
+# this file exists to end. Before 2026-08-16 the script emitted 22 metrics and
+# contained exactly one `exit 1`, guarding `cd`.
+
+# --- decoupling invariants: a nonzero value is a regression, not a trend ---
+daemon_arch_id              == 0
+daemon_arch_refs            == 0
+daemon_modelstate           == 0
+loader_modelstate_code      == 0
+grammar_copies              == 0
+substrate_clean_arch_refs   == 0
+required_features_daemon    == 0
+
+# --- ceilings ---
+# hipfire-daemon/src/main.rs. Was 43,696 as hipfire-runtime/examples/daemon.rs
+# on master; the saddle layering moved it into a crate.
+daemon_lines                <= 3900
+
+# Examples compile on every `cargo build --all-targets`. Archived research
+# probes are gated behind `--features lab`; this is the count still ungated.
+# 28 of these are invoked by scripts or change_gate routes and are meant to stay.
+ungated_examples            <= 32

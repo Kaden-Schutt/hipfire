@@ -138,6 +138,19 @@ ROUTES: dict[str, Route] = {
         "Whitespace/conflict-marker hygiene for docs-only edits "
         "(docs/VALIDATION.md documentation checks).",
     ),
+    "unit.leanup-ratchets": _R(
+        "unit.leanup-ratchets",
+        "shell",
+        ("./scripts/leanup-ratchets.sh",),
+        0.1,
+        "Architecture decoupling invariants, asserted. Nine metrics carry a "
+        "committed threshold in scripts/leanup-thresholds.txt -- daemon arch refs, "
+        "ModelState code references, grammar copies and substrate arch leakage must "
+        "be exactly 0; daemon_lines and ungated_examples are ceilings. Fails closed "
+        "if the thresholds file is missing or names a metric nobody emits. Before "
+        "2026-08-16 this script printed 22 numbers and exited 0 regardless, which is "
+        "how a decoupling regression would have reached master unremarked.",
+    ),
     "unit.no-gpu-control": _R(
         "unit.no-gpu-control",
         "unit",
@@ -869,6 +882,16 @@ RULES: tuple[Rule, ...] = (
         surface="crates/hipfire-quantize/**",
         route_ids=("unit.hipfire-quantize", "serve.battery.qwen35-4b"),
         reason="Quantize tooling can break pack/load shapes → unit + one dense MQ4 smoke.",
+    ),
+    Rule(
+        surface="crates/hipfire-daemon/**",
+        route_ids=("unit.leanup-ratchets",),
+        reason="Daemon arch-reference and line-count invariants are asserted here.",
+    ),
+    Rule(
+        surface="scripts/leanup-thresholds.txt",
+        route_ids=("unit.leanup-ratchets",),
+        reason="Editing the thresholds must re-run the thing they threshold.",
     ),
     Rule(
         surface="crates/hipfire-loader/**",
