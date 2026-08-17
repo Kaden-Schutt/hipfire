@@ -12017,6 +12017,198 @@ impl Gpu {
         result
     }
 
+    /// Dense MQ4-G256-GL GEMV (qt=40): global 16-entry Lloyd codebook + per-block
+    /// fp16 scale, SoA two-region blob (128 B indices + 2 B scale per group).
+    /// Codebook is [`crate::GL_CB4`] — 16 scalar args, ascending. `x_rot` must be
+    /// FWHT-256 pre-rotated. No codebook parameter: the wrapper reads `GL_CB4`
+    /// internally so a caller cannot drift it.
+    pub fn gemv_mq4g256gl(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_rot: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_mq4g256gl",
+            kernels::GEMV_MQ4G256GL_SRC,
+            "gemv_mq4g256gl",
+        )?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x_rot.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let cb = crate::GL_CB4;
+        let m_val = m as i32;
+        let k_val = k as i32;
+        // extern "C": (A, x, y, cb0..cb15, M, K)
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &cb[0] as *const _ as *mut c_void,
+            &cb[1] as *const _ as *mut c_void,
+            &cb[2] as *const _ as *mut c_void,
+            &cb[3] as *const _ as *mut c_void,
+            &cb[4] as *const _ as *mut c_void,
+            &cb[5] as *const _ as *mut c_void,
+            &cb[6] as *const _ as *mut c_void,
+            &cb[7] as *const _ as *mut c_void,
+            &cb[8] as *const _ as *mut c_void,
+            &cb[9] as *const _ as *mut c_void,
+            &cb[10] as *const _ as *mut c_void,
+            &cb[11] as *const _ as *mut c_void,
+            &cb[12] as *const _ as *mut c_void,
+            &cb[13] as *const _ as *mut c_void,
+            &cb[14] as *const _ as *mut c_void,
+            &cb[15] as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        let gpr = k / 256;
+        let w_bytes = m * gpr * (crate::GL_MQ4_GROUP_IDX_BYTES + crate::GL_GROUP_SCALE_BYTES);
+        let bytes = w_bytes + k * 4 + m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_mq4g256gl", bytes);
+        let result = self.launch_maybe_blob(
+            "gemv_mq4g256gl",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            // Dynamic LDS: 16 f32 codebook + one f32 per group (row scales).
+            ((16 + gpr) * 4) as u32,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                for c in cb {
+                    b.push_f32(c);
+                }
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// MQ4-G256-GL multirow GEMV — R rows per warp, matching hfq4g256_multirow MLP.
+    /// Reads `crate::GL_CB4` internally (never a caller-provided codebook).
+    /// Grid `ceil(M/R)` blocks of 32, dynamic LDS `(16+R*gpr)*4`.
+    /// Honors `HIPFIRE_GEMV_ROWS` via `ArchCaps::gemv_rows_default()` (same as
+    /// `gemv_hfq4g256`); if you need a specific R for benchmarking, call
+    /// `gemv_mq4g256gl_multirow_with_rows`.
+    pub fn gemv_mq4g256gl_multirow(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_rot: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        let rows = self.arch_caps.gemv_rows_default() as usize;
+        if rows <= 1 {
+            return self.gemv_mq4g256gl(a_raw, x_rot, y, m, k);
+        }
+        let rows = match rows {
+            2 | 4 | 8 => rows,
+            _ => 2,
+        };
+        self.gemv_mq4g256gl_multirow_with_rows(a_raw, x_rot, y, m, k, rows)
+    }
+
+    /// Explicit-R variant for benchmarking (`R` in {2,4,8}). Grid `ceil(M/R)`,
+    /// handles M-not-divisible tail via clamped reads + masked writes in kernel.
+    pub fn gemv_mq4g256gl_multirow_with_rows(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_rot: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        rows: usize,
+    ) -> HipResult<()> {
+        assert!(
+            matches!(rows, 2 | 4 | 8),
+            "gemv_mq4g256gl_multirow: rows must be 2,4,8 (got {rows})"
+        );
+        self.bind_thread()?;
+        let func_name = match rows {
+            2 => "gemv_mq4g256gl_multirow_r2",
+            4 => "gemv_mq4g256gl_multirow_r4",
+            8 => "gemv_mq4g256gl_multirow_r8",
+            _ => unreachable!(),
+        };
+        self.ensure_kernel(
+            "gemv_mq4g256gl_multirow",
+            kernels::GEMV_MQ4G256GL_MULTIROW_SRC,
+            func_name,
+        )?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x_rot.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let cb = crate::GL_CB4;
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &cb[0] as *const _ as *mut c_void,
+            &cb[1] as *const _ as *mut c_void,
+            &cb[2] as *const _ as *mut c_void,
+            &cb[3] as *const _ as *mut c_void,
+            &cb[4] as *const _ as *mut c_void,
+            &cb[5] as *const _ as *mut c_void,
+            &cb[6] as *const _ as *mut c_void,
+            &cb[7] as *const _ as *mut c_void,
+            &cb[8] as *const _ as *mut c_void,
+            &cb[9] as *const _ as *mut c_void,
+            &cb[10] as *const _ as *mut c_void,
+            &cb[11] as *const _ as *mut c_void,
+            &cb[12] as *const _ as *mut c_void,
+            &cb[13] as *const _ as *mut c_void,
+            &cb[14] as *const _ as *mut c_void,
+            &cb[15] as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        let gpr = k / 256;
+        let w_bytes = m * gpr * (crate::GL_MQ4_GROUP_IDX_BYTES + crate::GL_GROUP_SCALE_BYTES);
+        let bytes = w_bytes + k * 4 + m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_mq4g256gl_multirow", bytes);
+        let grid = ((m as u32) + rows as u32 - 1) / rows as u32;
+        let lds = ((16 + rows * gpr) * 4) as u32;
+        let result = self.launch_maybe_blob(
+            func_name,
+            [grid, 1, 1],
+            [32, 1, 1],
+            lds,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                for c in cb {
+                    b.push_f32(c);
+                }
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+
     pub fn deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed_batched_k4(
         &mut self,
         expert_ptrs: &GpuTensor,
