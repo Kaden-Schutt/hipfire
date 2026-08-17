@@ -19,20 +19,24 @@ parent (layers 0 / 20 / 40, engine sign seeds 42/1042):
 - **f32 header precision is unused.** Storing scale and zero as fp16 instead of f32 changes
   overall MSE by **0.00%** (1.4415e-06 either way) and tail-1% MSE by **0.008%**
   (9.4643e-07 vs 9.4635e-07). This frees 4 of the 8 header bytes.
-- **The zero-point is NOT expendable.** An earlier draft of this spec claimed it was, reasoning
-  from block asymmetry `(max+min)/(max−min)` having mean **+0.0004** and mean absolute
-  **0.0757**. That was an inference, and measurement **falsified it**: dropping the zero and
-  using symmetric levels over `[−max, +max]` costs **12× on tail-1% MSE** (6.9468e-06 vs
-  5.6621e-07 for asymmetric at the same per-128 granularity). p99 asymmetry is 0.2439, and
-  more decisively, **asymmetric min/max fitting makes BOTH block extremes exactly
-  representable while symmetric makes only one.** That is the real reason affine wins the
-  tail, and it is why v2 keeps the zero-point.
+- **The zero-point is worth keeping, but narrowly — roughly one doubling of granularity.**
+  At matched 136 B, asymmetric per-128 beats symmetric per-64 by **1.4% MSE and 12.9%
+  tail** (1.2089e-06 / 5.6621e-07 vs 1.2253e-06 / 6.3948e-07). Since a zero costs the same
+  bytes as a scale, spending those bytes on the zero rather than on halving the group is the
+  better trade — but only just. Symmetric variants are viable, not disastrous:
+  sym 2×128 at 132 B gives 1.4554e-06 / 1.0203e-06, about 1% MSE and 7.8% tail behind v1.
 
-So the 8 header bytes are 2× over-precise but not otherwise wasteful. Halving the precision
-and spending the saving on **granularity** is what v2 does. Symmetric no-zero-point variants
-at 130 B / 132 B / 136 B were measured and **rejected** (tail 1.1287e-05 / 6.9468e-06 /
-3.9636e-06 respectively). Consequently **136 B is the hard floor for per-128 asymmetric**:
-two `(fp16 scale, fp16 zero)` pairs are 8 B, plus the 128 B payload.
+  *Two earlier claims in this document were wrong and are retracted.* The first asserted the
+  zero-point was "nearly worthless after rotation", inferred from mean-absolute asymmetry of
+  0.0757 without measuring it. The second asserted dropping it cost **12× on the tail** — that
+  came from a harness whose outer guard admitted only two of four codec modes, so the symmetric
+  arms never executed and silently reported a fall-through path. The numbers above are from the
+  fixed harness. Asymmetric fitting does make **both** block extremes exactly representable
+  where symmetric makes one, which is why it wins; the effect is just an order of magnitude
+  smaller than claimed.
+
+So the 8 header bytes are 2× over-precise, and the zero-point earns its keep by a modest
+margin. Halving the precision and spending the saving on **granularity** is what v2 does.
 
 ## 1b · v1.5 — a strictly free intermediate, worth taking independently
 
@@ -54,6 +58,37 @@ v2 the payload is **not** byte-identical to v1.
 
 **v1.5 and v2 are independent decisions.** v1.5 is size + speed at fixed quality; v2 is
 quality at fixed size. They cannot be combined, because per-128 asymmetric needs the full 8 B.
+
+## 1c · Above 136 B, hierarchical sub-scales beat raw fp16 ones
+
+Raw fp16 sub-headers cost 4 B per sub-block, so per-32 granularity costs 32 B of header
+(160 B total). Q4_K's approach — quantise each sub-block's scale and zero to **6 bits** against
+a per-256 fp16 super-scale `d` and super-zero `dmin` — costs `nsub × 12 bits + 4 B`, i.e. 16 B
+for per-32. Measured, data-free, all asymmetric:
+
+| variant | B | bpw | overall MSE | tail-1% MSE |
+|---|---|---|---|---|
+| v1 asym 1×256 f32 hdr | 136 | 4.2500 | 1.4415e-06 | 9.4635e-07 |
+| **v1.5** asym 1×256 fp16 hdr | **132** | 4.1250 | 1.4415e-06 | 9.4643e-07 |
+| **v2** asym 2×128 fp16 hdr | **136** | 4.2500 | 1.2089e-06 | 5.6621e-07 |
+| asym 4×64 fp16 hdr | 144 | 4.5000 | 9.7617e-07 | 3.2450e-07 |
+| **hier 8×32, 6-bit s+z** | **144** | 4.5000 | **7.4647e-07** | **2.1632e-07** |
+| hier 8×32, 8-bit s+z | 148 | 4.6250 | 7.4363e-07 | 1.8300e-07 |
+| asym 8×32 fp16 hdr | 160 | 5.0000 | 7.4343e-07 | 1.8091e-07 |
+| hier 16×16, 6-bit s+z | 156 | 4.8750 | 5.2008e-07 | 1.3329e-07 |
+
+Two conclusions:
+
+1. **Hierarchical per-32 at 144 B matches raw-fp16 per-32 at 160 B** (7.4647e-07 / 2.1632e-07
+   vs 7.4343e-07 / 1.8091e-07) — **16 bytes cheaper for essentially equal quality**. 6 bits is
+   enough; going to 8 bits buys 0.4% MSE for 4 more bytes.
+2. **At equal 144 B, hierarchical per-32 strictly dominates raw-fp16 per-64** by 23.5% MSE and
+   33% tail. So above 136 B the header encoding, not the granularity, is the binding choice.
+
+**This does not change v1.5 or v2**, which are the best options at 132 B and 136 B
+respectively — hierarchical encoding needs ≥3 sub-blocks before its 4 B super-header amortises.
+It does mean that **if bytes are available, 144 B hierarchical is the next format to build**,
+not 4×64 fp16, and it is worth 38% MSE / 62% tail over v2 for 5.9% more bytes.
 
 This is deliberately **not a codebook**. Level placement stays uniform over `[min, max]`,
 identical in rule to qt=1/6/13. See § 8 for why the codebook line (qt=40, qt=43) is retired.
