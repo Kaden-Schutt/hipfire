@@ -132,3 +132,57 @@ WMMA prefill family.
    kernels, so only encoder-side codec MSE is available for them. Given that codec
    MSE just failed to predict KLD for `mq4gl`, their MSE figures should **not** be
    read as quality predictions.
+
+---
+
+## Amendment — the second reference confirms it, and the gap WIDENS
+
+The v6 conversation-selector run completed. GL loses on **both** references, and
+loses by more on the deployment distribution:
+
+| arm | ref | KLD | NLL | PPL | PPL vs oracle |
+|---|---|---|---|---|---|
+| `mq4` affine | WT2 | **0.043776** | 1.857666 | 6.4088 | +2.7% |
+| `mq4gl` GL_CB4 | WT2 | 0.048713 | 1.844915 | 6.3276 | +1.4% |
+| `mq4` affine | v6 selector | **0.587566** | 2.499260 | 12.1735 | −5.5% |
+| `mq4gl` GL_CB4 | v6 selector | 0.749238 | 2.247360 | 9.4627 | **−26.5%** |
+
+GL versus affine (positive = GL worse):
+
+| ref | KLD | NLL | PPL |
+|---|---|---|---|
+| WT2 | **+11.28%** | −0.69% | −1.27% |
+| v6 selector | **+27.52%** | −10.08% | −22.27% |
+
+**The KLD gap widens from +11.28% to +27.52% on the deployment distribution.** That
+is consistent with the tail explanation: conversation data is more peaked and more
+structured than prose, so fidelity on large-magnitude weights — the ones a
+Gaussian-optimal codebook under-serves — matters more there.
+
+### PPL is now conclusively unusable on this fixture
+
+`mq4gl` scores selector PPL **9.4627 against an oracle of 12.8813 — 26.5% BELOW the
+teacher.** A quantized model cannot be more faithful than the model it was distilled
+from, so this is not a quality result; it is a measurement artifact.
+
+The mechanism is visible in the pair: GL simultaneously has **lower PPL** and
+**higher KLD**. That is the signature of a model that became more **confident** —
+a more peaked output distribution lowers perplexity on text it happens to predict
+while moving further from the teacher's actual distribution. KLD sees that; PPL
+cannot, by construction.
+
+This is the third independent instance of KLD/PPL divergence in this campaign
+(`attnfull` vs `ssmin`, then `mq6` vs `mq4`, now `mq4gl` vs `mq4`). The rule is now
+settled for this fixture: **rank on KLD; use PPL only as a degeneracy tripwire**
+(collapse reads PPL ~1.8e6). A PPL improvement unaccompanied by a KLD improvement
+should be treated as evidence of over-confidence, not of quality.
+
+### Verdict
+
+MQ4-GL as currently fitted is **rejected**: 0.57 GB smaller and +5.6% decode cost is
+not worth +11.3% KLD on prose and +27.5% on the deployment distribution. The
+unweighted-MSE version of GL's thesis is disproven.
+
+The importance-weighted refit remains the open question, and it is the only GL work
+worth doing — not kernels, not layout, not scale fitting. If an activation-weighted
+codebook does not close a 27.5% selector gap, GL should be retired.
