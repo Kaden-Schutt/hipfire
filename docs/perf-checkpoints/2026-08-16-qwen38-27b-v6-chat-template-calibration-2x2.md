@@ -213,3 +213,56 @@ everything." It is:
 The original disposition's phrase "measured on the wrong instrument" remains
 accurate as to *sensitivity*, but should not be read as "measured the wrong
 winner." One 2×2 on one model at one format cannot support the stronger claim.
+
+---
+
+## Amendment 2, same day — the 2×2 ran at the worst AWQ alpha, and its sanity check was invalid
+
+Two defects in how the WikiText-2 KLD of this 2×2 was justified. Neither changes
+the measured numbers, both bound what they support.
+
+**1. Both arms ran at AWQ `alpha=0.55`, the worst end of the documented sweep.**
+`2026-08-16-qwen38-27b-mq4-awq-alpha-kld.md` measured `alpha=0.05` at
+`KLD 0.063102 / NLL 1.875801 / PPL 6.5260` and found `alpha=0.05` beats the
+shipped `alpha=0.55` default by **24.3 %** on WikiText-2. This 2×2 held
+`alpha=0.55` fixed across both arms, so it is **internally valid** as a corpus
+comparison — but it was conducted roughly 24 % away from the achievable KLD at
+this format.
+
+The consequence: **the corpus × alpha interaction is unmeasured.** The v6 corpus
+wins at `alpha=0.55`; whether it still wins at `alpha=0.05` is not established by
+this record. A corpus that helps most when smoothing is aggressive could help
+less, or more, when smoothing is nearly off. Re-running this 2×2 at
+`alpha=0.05` is the experiment that would close it.
+
+**2. The originally-recorded sanity check was cross-architecture and
+arithmetically wrong.** The producing agent justified WT2 KLD 0.086–0.087 as
+"slightly above prior gfx1201 band 0.036–0.067 but within alpha-sweep range
+0.063–0.083." Both halves fail:
+
+- `0.087921 > 0.083`, so the value is **outside** the range cited to excuse it.
+- The alpha sweep it compared against was measured on **gfx942**; this 2×2 was
+  measured on **gfx1201**. Absolute KLD is not comparable across
+  architectures, so that band was never a valid reference for these numbers in
+  the first place.
+
+The value is not anomalous once alpha is accounted for — `alpha=0.55` *should*
+produce the sweep's worst KLD — but it was not anomalous *for the reason given*,
+and the reasoning as recorded should not be reused.
+
+**Host verification (unaffected, confirmed independently).** All four figures
+were re-read from the scoring logs on hiptrx after this record was first
+committed:
+
+```
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.14)
+eval_hipfire: arch=gfx1201  detected arch_id=5 (HFQ header)
+eval_hipfire: scored 24552 tokens in 147.6s (166 tok/s)
+v5 × wt2     KLD 0.087921  NLL 1.870233  PPL  6.4898
+v5 × v6sel   KLD 1.064046  NLL 2.582638  PPL 13.2320
+v6 × wt2     KLD 0.086790  NLL 1.898022  PPL  6.6727
+v6 × v6sel   KLD 1.023882  NLL 2.393972  PPL 10.9569
+```
+
+Scoring ran on hiptrx `gfx1201` as claimed, not on the gfx942 producer, and the
+recorded values match the logs exactly.
