@@ -2558,6 +2558,40 @@ def run(cfg, args):
         rate = (sa / sd) if sd else 0.0
         summary += f" ngram={sa}/{sd}@{rate:.2f}"
     print(summary, flush=True)
+
+    # Coherence is ASSERTED, not merely printed.
+    #
+    # runaway / empty / attractor are the harness's own judgement that generation
+    # went wrong -- LENGTH-truncated runaway, empty output, single-token attractor.
+    # Until 2026-08-16 they were counted into the summary line above and the
+    # process exited 0 regardless, so a battery could print `attractor=2` and pass.
+    # The lfm2.5-8b-a1b `</think>` attractor found during the saddle work is
+    # exactly that shape: statistically unremarkable, obviously broken to a reader,
+    # invisible to the gate. AGENTS.md has said "read the decoded text, numbers
+    # alone never prove coherence" the whole time; this makes the tool obey it.
+    #
+    # HIPFIRE_SERVE_ALLOW_INCOHERENT=1 opts out for deliberately characterising a
+    # known-bad model, and prints what it forgave rather than staying silent.
+    _incoherent = {
+        "runaway": sum(r["runaway"] for r in g),
+        "empty": sum(r["empty"] for r in g),
+        "attractor": sum(r["attractor"] for r in g),
+    }
+    if any(_incoherent.values()):
+        _detail = ", ".join(f"{k}={v}" for k, v in _incoherent.items() if v)
+        if os.environ.get("HIPFIRE_SERVE_ALLOW_INCOHERENT") == "1":
+            print(
+                f"[{label}] INCOHERENT ({_detail}) — forgiven by "
+                f"HIPFIRE_SERVE_ALLOW_INCOHERENT=1",
+                flush=True,
+            )
+        else:
+            raise SystemExit(
+                f"serve_harness: {label} produced incoherent output ({_detail}) "
+                f"across {len(g)} turn(s). Read the decoded text above. Set "
+                f"HIPFIRE_SERVE_ALLOW_INCOHERENT=1 to characterise a known-bad "
+                f"model on purpose."
+            )
     # ---- Glimmer gate: prompt / request / binary identities (AGENTS.md discipline) ----
     for r in g:
         if r.get("prompt_md5"):
