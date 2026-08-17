@@ -1835,6 +1835,9 @@ pub fn generate_gemma4(
     max_think_tokens: usize,
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    // `Some(k)` emits OpenAI logprobs with k candidates per token. `None` is the
+    // default and produces exactly the envelope this path emitted before.
+    logprobs_top_k: Option<usize>,
 ) {
     // v1 is non-thinking; the think budget only gates thinking-capable paths.
     let _ = max_think_tokens;
@@ -2276,12 +2279,23 @@ pub fn generate_gemma4(
             let tokenizer = m.tokenizer.as_ref().unwrap();
             tokenizer.decode(&[next_tok])
         };
-        let envelope = serde_json::json!({
+        let mut envelope = serde_json::json!({
             "type": "token",
             "id": id,
             "text": frag,
             "attempt_id": active_attempt_id(),
         });
+        // Logprobs are opt-in per request. When absent, this is exactly the
+        // envelope that was emitted before, so the default path is unchanged.
+        if let Some((lp, top)) = crate::common::token_logprob_fields(
+            &last_logits,
+            next_tok,
+            logprobs_top_k,
+            m.tokenizer.as_ref().unwrap(),
+        ) {
+            envelope["logprob"] = serde_json::json!(lp);
+            envelope["top_logprobs"] = top;
+        }
         let _ = writeln!(stdout, "{}", envelope);
         let _ = stdout.flush();
         m.conversation_tokens.push(next_tok);

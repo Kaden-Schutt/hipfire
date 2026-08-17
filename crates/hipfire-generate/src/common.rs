@@ -1464,3 +1464,41 @@ pub fn emit_ds4_malformed_terminal(stdout: &mut impl std::io::Write, id: &str, d
     );
     let _ = stdout.flush();
 }
+
+/// Build the `logprob` / `top_logprobs` fields for one token event.
+///
+/// Returns `None` when logprobs were not requested, so a caller can attach
+/// nothing rather than attach nulls. The gateway omits the whole `logprobs`
+/// object when no token carried one, and a null here would defeat that.
+///
+/// Cheap on the paths that call it: `logits` is already a host slice at sampling
+/// time — `hipfire_arch_deepseek4::sampling::sample_token` takes `&[f32]` — so
+/// this adds a log-sum-exp pass and a bounded top-K selection with no
+/// device-to-host copy. Do not call it from a path that would have to download
+/// logits for the purpose; a prior optimisation removed exactly that round-trip
+/// from the decode loop.
+///
+/// `bytes` is emitted per OpenAI's schema so a client can reconstruct tokens that
+/// are not valid UTF-8 on their own — a multi-byte character split across two
+/// tokens renders as replacement characters in `token` but is exact in `bytes`.
+pub fn token_logprob_fields(
+    logits: &[f32],
+    sampled: u32,
+    top_k: Option<usize>,
+    tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+) -> Option<(f64, serde_json::Value)> {
+    let k = top_k?;
+    let sampled_lp = saddle_core::logprobs::logprob_of(logits, sampled)?;
+    let top = saddle_core::logprobs::top_k_logprobs(logits, k)
+        .into_iter()
+        .map(|t| {
+            let text = tokenizer.decode(&[t.token_id]);
+            serde_json::json!({
+                "token": text,
+                "logprob": t.logprob,
+                "bytes": tokenizer.decode_bytes(&[t.token_id]),
+            })
+        })
+        .collect::<Vec<_>>();
+    Some((f64::from(sampled_lp), serde_json::Value::Array(top)))
+}

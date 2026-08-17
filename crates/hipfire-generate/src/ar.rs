@@ -1032,6 +1032,9 @@ pub fn generate(
     stop: &[String],
     reasoning_effort: Option<&str>,
     enable_thinking: bool,
+    // `Some(k)` emits OpenAI logprobs with k candidates per token. `None` is the
+    // default and leaves every token envelope byte-identical to before.
+    logprobs_top_k: Option<usize>,
 ) {
     // ── Producer-route authority (Task 6) ──────────────────────────────
     // Resolve the selected generation route BEFORE sampler RNG reset and
@@ -1131,6 +1134,7 @@ pub fn generate(
             max_think_tokens,
             tools,
             messages_history,
+            logprobs_top_k,
         );
         return;
         }

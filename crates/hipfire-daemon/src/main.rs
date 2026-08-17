@@ -2225,6 +2225,20 @@ fn main() {
                 // (higher acceptance τ, KL-bounded distortion) and applies only to a
                 // CACTUS-capable sampled verify (deepseek4 DSpark / qwen35 DFlash);
                 // other drafters ignore it. Never a default.
+                // OpenAI logprobs. The gateway has already validated the range
+                // (0..=20, requires logprobs=true) and rejects rather than clamps,
+                // so a value arriving here is well-formed. None leaves every token
+                // envelope byte-identical to before.
+                let logprobs_top_k: Option<usize> = msg
+                    .get("logprobs")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+                    .then(|| {
+                        msg.get("top_logprobs")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0) as usize
+                    })
+                    .filter(|k| *k > 0);
                 let cactus_delta = msg
                     .get("cactus_delta")
                     .and_then(|v| v.as_f64())
@@ -3006,6 +3020,8 @@ fn main() {
                         &stop_seqs, // hunt3 M-F
                         reasoning_effort_jinja.as_deref(),
                         enable_thinking_jinja,
+                    
+                        logprobs_top_k,
                     );
                 }
                 if let Some(marker) = gpu.replay.replay_observation_marker(id) {
