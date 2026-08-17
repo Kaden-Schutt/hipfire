@@ -4502,20 +4502,13 @@ mod tq2g128_tests {
 /// plain packer) before packing bytes identically to `quantize_tq2g128`.
 /// `col_weights.len()` must be a multiple of 128; the per-input-column slice
 /// for block `b` starts at `col_off = (b % (col_weights.len()/128)) * 128`.
-fn quantize_tq2g128_gptq(f32_data: &[f32], col_weights: &[f32]) -> Vec<u8> {
+fn quantize_tq2g128_gptq(f32_data: &[f32], col_weights: &[f32], damping: f32) -> Vec<u8> {
     const GROUP: usize = 128;
     const BLOCK_BYTES: usize = 34;
     let n = f32_data.len();
     let n_blocks = (n + GROUP - 1) / GROUP;
     let blocks_per_row = (col_weights.len() / GROUP).max(1);
     let mut output = vec![0u8; n_blocks * BLOCK_BYTES];
-
-    // Forward-propagation damping — same env knob as quantize_mq2g256_lloyd_gptq
-    // (:3502); default 0.0 leaves the residual pass a no-op.
-    let damping: f32 = std::env::var("HIPFIRE_GPTQ_DAMPING")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0.0);
 
     for b in 0..n_blocks {
         let start = b * GROUP;
@@ -4639,7 +4632,7 @@ mod tq2g128_gptq_tests {
             w[k] = 10.0;
         }
         let plain = quantize_tq2g128(&g);
-        let gptq = quantize_tq2g128_gptq(&g, &w);
+        let gptq = quantize_tq2g128_gptq(&g, &w, 0.0);
         assert!(
             weighted_mse(&g, &gptq, &w) <= weighted_mse(&g, &plain, &w) + 1e-9,
             "imatrix-weighted GPTQ error must be ≤ plain packer error"
@@ -4717,7 +4710,7 @@ mod tq2g128_gptq_tests {
         let w = vec![1.0f32; 128];
         for (label, packed) in [
             ("plain", quantize_tq2g128(&g)),
-            ("gptq", quantize_tq2g128_gptq(&g, &w)),
+            ("gptq", quantize_tq2g128_gptq(&g, &w, 0.0)),
         ] {
             let codes = tq2_codes(&packed);
             let bad = codes.iter().filter(|&&c| c == 3).count();
@@ -4738,7 +4731,7 @@ mod tq2g128_gptq_tests {
         g[0] = 6.0; // far above any swept d
         g[1] = -6.0;
         let w = vec![1.0f32; 128];
-        let codes = tq2_codes(&quantize_tq2g128_gptq(&g, &w));
+        let codes = tq2_codes(&quantize_tq2g128_gptq(&g, &w, 0.0));
         assert_eq!(codes[0], 2, "large positive must saturate to +d (code 2)");
         assert_eq!(codes[1], 0, "large negative must saturate to -d (code 0)");
     }
@@ -4770,7 +4763,7 @@ mod tq2g128_gptq_tests {
         let w = vec![1.0f32; 128];
 
         let plain = quantize_tq2g128(&g);
-        let gptq = quantize_tq2g128_gptq(&g, &w);
+        let gptq = quantize_tq2g128_gptq(&g, &w, 0.0);
 
         let nz = nonzero_fraction(&gptq, 128);
         assert!(
@@ -5774,18 +5767,13 @@ mod bq1g128_tests {
 /// (mirror of `quantize_mq2g256_lloyd_gptq`) is threaded across columns.
 /// `col_weights.len()` must be a multiple of 128;
 /// `col_off = (b % (col_weights.len()/128)) * 128`.
-fn quantize_bq1g128_gptq(f32_data: &[f32], col_weights: &[f32]) -> Vec<u8> {
+fn quantize_bq1g128_gptq(f32_data: &[f32], col_weights: &[f32], damping: f32) -> Vec<u8> {
     const GROUP: usize = 128;
     const BLOCK_BYTES: usize = 18;
     let n = f32_data.len();
     let n_blocks = (n + GROUP - 1) / GROUP;
     let blocks_per_row = (col_weights.len() / GROUP).max(1);
     let mut output = vec![0u8; n_blocks * BLOCK_BYTES];
-
-    let damping: f32 = std::env::var("HIPFIRE_GPTQ_DAMPING")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0.0);
 
     for b in 0..n_blocks {
         let start = b * GROUP;
@@ -5865,7 +5853,7 @@ mod bq1g128_gptq_tests {
             w[k] = 8.0;
         } // tail columns important
         let plain = quantize_bq1g128(&g);
-        let gptq = quantize_bq1g128_gptq(&g, &w);
+        let gptq = quantize_bq1g128_gptq(&g, &w, 0.0);
         assert!(wmse_bq1(&g, &gptq, &w) <= wmse_bq1(&g, &plain, &w) + 1e-9);
     }
 }
@@ -6045,6 +6033,7 @@ fn run_hfq_requant_pipeline(
     output: &Path,
     format: GgufFormat,
     awq_imatrix_alpha: Option<f32>,
+    damping: f32,
 ) {
     // ── Read the source .hfq (mirrors bin/draft_to_mq4.rs::read_hfq — no
     //    cross-bin dependency; the parsing logic is copied here). ──
@@ -6217,117 +6206,165 @@ fn run_hfq_requant_pipeline(
         }
     }
 
-    for entry in &entries {
-        let IndexEntry {
-            name,
-            qt,
-            shape,
-            group_size,
-            off,
-            size,
-        } = entry;
-        let (qt, group_size) = (*qt, *group_size);
-        let (name, shape) = (name.clone(), shape.clone());
-        let data = &mmap[*off..*off + *size];
+    use rayon::prelude::*;
 
-        let n_elems: usize = shape.iter().map(|&d| d as usize).product();
+    // Per-tensor work is independent (the mmap is read-only and every output is
+    // a fresh buffer), so this is a pure scheduling change. Sequential, the
+    // 13-candidate scale sweep over 27B params pegs ONE core for ~40 min while
+    // the rest of the tool already runs on a rayon pool.
+    //
+    // `collect()` on a rayon indexed parallel iterator preserves source order,
+    // which the .hfq index requires — it is positional, so any reordering
+    // silently repoints every tensor (pinned by
+    // `requant_preserves_tensor_order_across_many_tensors`). Counters are folded
+    // afterwards rather than shared, so the totals are scheduling-independent
+    // too.
+    struct TensorOutcome {
+        tensor: Option<HfqTensor>,
+        requant: usize,
+        passthrough: usize,
+        awq_folded: usize,
+        awq_dropped: usize,
+        awq_imatrix_used: usize,
+        stats: Tq2PackStats,
+    }
 
-        // A folded scale must not also ride along as a sidecar.
-        if !awq_aware_target && name.ends_with(".awq_scale.weight") {
-            awq_dropped += 1;
-            continue;
-        }
-
-        if qt == QuantType::MQ4G256 as u8 && shape.len() == 2 {
-            // Recover un-rotated F32, then re-pack to the requested format using
-            // the SAME per-format packers the GGUF Ternary/Binary/MQ arms use.
-            let mut f32_data = dequant_mq4g256_to_f32(data, n_elems);
-            if let Some(scale) = awq_scales.get(&name) {
-                let k = shape[1] as usize;
-                assert_eq!(
-                    scale.len(),
-                    k,
-                    "AWQ sidecar for '{name}' has length {} but K={k}",
-                    scale.len()
-                );
-                for (i, v) in f32_data.iter_mut().enumerate() {
-                    *v /= scale[i % k];
-                }
-                awq_folded += 1;
-            }
-            let f32_data = f32_data;
-            // Column importance for the low-bit packers. `--awq-imatrix` reuses
-            // the checkpoint's own AWQ sidecar as the imatrix (see
-            // `awq_col_weights`); otherwise uniform (or an explicit --imatrix).
-            let k = shape[1] as usize;
-            let col_weights = match (awq_imatrix_alpha, awq_scales.get(&name)) {
-                (Some(alpha), Some(s)) if k % 128 == 0 && s.len() == k => {
-                    awq_imatrix_used += 1;
-                    awq_col_weights(s, alpha)
-                }
-                _ => requant_col_weights(&name, k),
+    let outcomes: Vec<TensorOutcome> = entries
+        .par_iter()
+        .map(|entry| {
+            let mut oc = TensorOutcome {
+                tensor: None,
+                requant: 0,
+                passthrough: 0,
+                awq_folded: 0,
+                awq_dropped: 0,
+                awq_imatrix_used: 0,
+                stats: Tq2PackStats::default(),
             };
-            let (packed, out_qt, out_group) = match format {
-                GgufFormat::Ternary => {
-                    let p = quantize_tq2g128_gptq(&f32_data, &col_weights);
-                    ternary_stats.add(tq2_pack_stats(&p));
-                    (p, QuantType::TQ2G128, 128u32)
-                }
-                GgufFormat::Binary => (
-                    quantize_bq1g128_gptq(&f32_data, &col_weights),
-                    QuantType::BQ1G128,
-                    128u32,
-                ),
-                GgufFormat::Mq4 => (
-                    quantize_mq4g256(&f32_data, &signs1, &signs2),
-                    QuantType::MQ4G256,
-                    256u32,
-                ),
-                GgufFormat::Mq6 => (
-                    quantize_mq6g256(&f32_data, &signs1, &signs2),
-                    QuantType::MQ6G256,
-                    256u32,
-                ),
-                GgufFormat::Mq3 => (
-                    quantize_mq3g256(&f32_data, &signs1, &signs2),
-                    QuantType::MQ3G256,
-                    256u32,
-                ),
-                GgufFormat::Mq2 => (
-                    quantize_mq2g256(&f32_data, &signs1, &signs2),
-                    QuantType::MQ2G256,
-                    256u32,
-                ),
-                other => {
-                    eprintln!(
-                        "hfq requant: --format {} unsupported for mq4 2D weights; \
-                         keeping tensor '{name}' as MQ4G256",
-                        other.label()
-                    );
-                    (data.to_vec(), QuantType::MQ4G256, group_size)
-                }
-            };
-            requant += 1;
-            out_tensors.push(HfqTensor {
+            let IndexEntry {
                 name,
-                quant_type: out_qt,
-                shape,
-                group_size: out_group,
-                data: packed,
-                spilled_len: 0,
-            });
-        } else {
-            // Norms / embeddings / routers / tid tables — already unrotated and
-            // in runtime-expected precision; copy verbatim.
-            passthrough += 1;
-            out_tensors.push(HfqTensor {
-                name,
-                quant_type: quant_type_from_u8(qt),
+                qt,
                 shape,
                 group_size,
-                data: data.to_vec(),
-                spilled_len: 0,
-            });
+                off,
+                size,
+            } = entry;
+            let (qt, group_size) = (*qt, *group_size);
+            let (name, shape) = (name.clone(), shape.clone());
+            let data = &mmap[*off..*off + *size];
+
+            let n_elems: usize = shape.iter().map(|&d| d as usize).product();
+
+            // A folded scale must not also ride along as a sidecar.
+            if !awq_aware_target && name.ends_with(".awq_scale.weight") {
+                oc.awq_dropped += 1;
+                return oc;
+            }
+
+            if qt == QuantType::MQ4G256 as u8 && shape.len() == 2 {
+                // Recover un-rotated F32, then re-pack to the requested format using
+                // the SAME per-format packers the GGUF Ternary/Binary/MQ arms use.
+                let mut f32_data = dequant_mq4g256_to_f32(data, n_elems);
+                if let Some(scale) = awq_scales.get(&name) {
+                    let k = shape[1] as usize;
+                    assert_eq!(
+                        scale.len(),
+                        k,
+                        "AWQ sidecar for '{name}' has length {} but K={k}",
+                        scale.len()
+                    );
+                    for (i, v) in f32_data.iter_mut().enumerate() {
+                        *v /= scale[i % k];
+                    }
+                    oc.awq_folded += 1;
+                }
+                let f32_data = f32_data;
+                // Column importance for the low-bit packers. `--awq-imatrix` reuses
+                // the checkpoint's own AWQ sidecar as the imatrix (see
+                // `awq_col_weights`); otherwise uniform (or an explicit --imatrix).
+                let k = shape[1] as usize;
+                let col_weights = match (awq_imatrix_alpha, awq_scales.get(&name)) {
+                    (Some(alpha), Some(s)) if k % 128 == 0 && s.len() == k => {
+                        oc.awq_imatrix_used += 1;
+                        awq_col_weights(s, alpha)
+                    }
+                    _ => requant_col_weights(&name, k),
+                };
+                let (packed, out_qt, out_group) = match format {
+                    GgufFormat::Ternary => {
+                        let p = quantize_tq2g128_gptq(&f32_data, &col_weights, damping);
+                        oc.stats.add(tq2_pack_stats(&p));
+                        (p, QuantType::TQ2G128, 128u32)
+                    }
+                    GgufFormat::Binary => (
+                        quantize_bq1g128_gptq(&f32_data, &col_weights, damping),
+                        QuantType::BQ1G128,
+                        128u32,
+                    ),
+                    GgufFormat::Mq4 => (
+                        quantize_mq4g256(&f32_data, &signs1, &signs2),
+                        QuantType::MQ4G256,
+                        256u32,
+                    ),
+                    GgufFormat::Mq6 => (
+                        quantize_mq6g256(&f32_data, &signs1, &signs2),
+                        QuantType::MQ6G256,
+                        256u32,
+                    ),
+                    GgufFormat::Mq3 => (
+                        quantize_mq3g256(&f32_data, &signs1, &signs2),
+                        QuantType::MQ3G256,
+                        256u32,
+                    ),
+                    GgufFormat::Mq2 => (
+                        quantize_mq2g256(&f32_data, &signs1, &signs2),
+                        QuantType::MQ2G256,
+                        256u32,
+                    ),
+                    other => {
+                        eprintln!(
+                            "hfq requant: --format {} unsupported for mq4 2D weights; \
+                         keeping tensor '{name}' as MQ4G256",
+                            other.label()
+                        );
+                        (data.to_vec(), QuantType::MQ4G256, group_size)
+                    }
+                };
+                oc.requant += 1;
+                oc.tensor = Some(HfqTensor {
+                    name,
+                    quant_type: out_qt,
+                    shape,
+                    group_size: out_group,
+                    data: packed,
+                    spilled_len: 0,
+                });
+            } else {
+                // Norms / embeddings / routers / tid tables — already unrotated and
+                // in runtime-expected precision; copy verbatim.
+                oc.passthrough += 1;
+                oc.tensor = Some(HfqTensor {
+                    name,
+                    quant_type: quant_type_from_u8(qt),
+                    shape,
+                    group_size,
+                    data: data.to_vec(),
+                    spilled_len: 0,
+                });
+            }
+            oc
+        })
+        .collect();
+
+    for oc in outcomes {
+        requant += oc.requant;
+        passthrough += oc.passthrough;
+        awq_folded += oc.awq_folded;
+        awq_dropped += oc.awq_dropped;
+        awq_imatrix_used += oc.awq_imatrix_used;
+        ternary_stats.add(oc.stats);
+        if let Some(t) = oc.tensor {
+            out_tensors.push(t);
         }
     }
 
@@ -6476,7 +6513,7 @@ mod hfq_requant_pipeline_tests {
         let outp = dir.join(format!("hfq_requant_out_{}.hfq", std::process::id()));
 
         write_hfq(&inp, 7, meta, &in_tensors, None).unwrap();
-        run_hfq_requant_pipeline(&inp, &outp, GgufFormat::Ternary, None);
+        run_hfq_requant_pipeline(&inp, &outp, GgufFormat::Ternary, None, 0.0);
 
         let (arch, out_meta, tensors) = read_hfq_back(&outp);
         assert_eq!(arch, 7, "arch preserved");
@@ -6535,7 +6572,7 @@ mod hfq_requant_pipeline_tests {
         let outp = dir.join(format!("hfq_prov_out_{}.hfq", std::process::id()));
 
         write_hfq(&inp, 7, meta, &in_tensors, None).unwrap();
-        run_hfq_requant_pipeline(&inp, &outp, GgufFormat::Ternary, Some(0.55));
+        run_hfq_requant_pipeline(&inp, &outp, GgufFormat::Ternary, Some(0.55), 0.0);
         let (_a, out_meta, _t) = read_hfq_back(&outp);
 
         let v: serde_json::Value =
@@ -6566,6 +6603,98 @@ mod hfq_requant_pipeline_tests {
             v.get("architecture").and_then(|x| x.as_str()),
             Some("qwen3.6")
         );
+
+        let _ = std::fs::remove_file(&inp);
+        let _ = std::fs::remove_file(&outp);
+    }
+
+    /// Tensor order and contents must not depend on how the requant loop is
+    /// scheduled — the .hfq index is positional, so a reordering silently
+    /// repoints every tensor in the file.
+    #[test]
+    fn requant_preserves_tensor_order_across_many_tensors() {
+        let signs1 = gen_fwht_signs(42, 256);
+        let signs2 = gen_fwht_signs(1042, 256);
+        let wof = |layer: usize| -> Vec<f32> {
+            (0..256)
+                .map(|i| (((i * 31 + layer * 7) % 97) as f32 - 48.0) * 0.01)
+                .collect()
+        };
+        let scale_at = |i: usize| f16_to_f32(f32_to_f16(1.0 + (i % 5) as f32 * 0.1));
+
+        // Interleave requantized 2D weights, dropped AWQ sidecars and
+        // passed-through norms so an ordering bug cannot hide.
+        let mut in_tensors = Vec::new();
+        let mut expect_names = Vec::new();
+        for layer in 0..12 {
+            let wname = format!("model.layers.{layer}.mlp.gate_proj.weight");
+            in_tensors.push(HfqTensor {
+                name: wname.clone(),
+                quant_type: QuantType::MQ4G256,
+                shape: vec![1, 256],
+                group_size: 256,
+                data: quantize_mq4g256(&wof(layer), &signs1, &signs2),
+                spilled_len: 0,
+            });
+            expect_names.push(wname);
+
+            in_tensors.push(HfqTensor {
+                name: format!("model.layers.{layer}.mlp.gate_proj.awq_scale.weight"),
+                quant_type: QuantType::F16,
+                shape: vec![256],
+                group_size: 1,
+                data: (0..256)
+                    .flat_map(|i| f32_to_f16(1.0 + (i % 5) as f32 * 0.1).to_le_bytes())
+                    .collect(),
+                spilled_len: 0,
+            });
+
+            let nname = format!("model.layers.{layer}.input_layernorm.weight");
+            in_tensors.push(HfqTensor {
+                name: nname.clone(),
+                quant_type: QuantType::F16,
+                shape: vec![4],
+                group_size: 1,
+                data: (0..4)
+                    .flat_map(|i| f32_to_f16(0.5 + i as f32).to_le_bytes())
+                    .collect(),
+                spilled_len: 0,
+            });
+            expect_names.push(nname);
+        }
+
+        let meta = r#"{"architecture":"qwen3.6","num_hidden_layers":12}"#;
+        let dir = std::env::temp_dir();
+        let inp = dir.join(format!("hfq_order_in_{}.hfq", std::process::id()));
+        let outp = dir.join(format!("hfq_order_out_{}.hfq", std::process::id()));
+
+        write_hfq(&inp, 7, meta, &in_tensors, None).unwrap();
+        run_hfq_requant_pipeline(&inp, &outp, GgufFormat::Ternary, None, 0.0);
+        let (_a, _m, tensors) = read_hfq_back(&outp);
+
+        let got: Vec<String> = tensors.iter().map(|t| t.0.clone()).collect();
+        assert_eq!(
+            got, expect_names,
+            "tensor order preserved, sidecars dropped"
+        );
+
+        // Each requantized tensor must hold ITS OWN weights, not a neighbour's.
+        for (layer, t) in tensors
+            .iter()
+            .filter(|t| t.1 == QuantType::TQ2G128 as u8)
+            .enumerate()
+        {
+            let mq4 = quantize_mq4g256(&wof(layer), &signs1, &signs2);
+            let mut rec = dequant_mq4g256_to_f32(&mq4, 256);
+            for (i, v) in rec.iter_mut().enumerate() {
+                *v /= scale_at(i);
+            }
+            assert_eq!(
+                t.4,
+                quantize_tq2g128_gptq(&rec, &vec![1.0f32; 128], 0.0),
+                "layer {layer} content"
+            );
+        }
 
         let _ = std::fs::remove_file(&inp);
         let _ = std::fs::remove_file(&outp);
@@ -6611,14 +6740,14 @@ mod hfq_requant_pipeline_tests {
         let outp = dir.join(format!("hfq_sweep_out_{}.hfq", std::process::id()));
 
         write_hfq(&inp, 7, meta, &in_tensors, None).unwrap();
-        run_hfq_requant_pipeline(&inp, &outp, GgufFormat::Ternary, None);
+        run_hfq_requant_pipeline(&inp, &outp, GgufFormat::Ternary, None, 0.0);
         let (_a, _m, tensors) = read_hfq_back(&outp);
 
         let recovered = dequant_mq4g256_to_f32(&mq4_data, 512);
         let ones = vec![1.0f32; 128];
         assert_eq!(
             tensors[0].4,
-            quantize_tq2g128_gptq(&recovered, &ones),
+            quantize_tq2g128_gptq(&recovered, &ones, 0.0),
             "requant must use the scale-swept ternary packer"
         );
         assert_ne!(
@@ -6689,7 +6818,7 @@ mod hfq_requant_pipeline_tests {
         let outp = dir.join(format!("hfq_awq_out_{}.hfq", std::process::id()));
 
         write_hfq(&inp, 7, meta, &in_tensors, None).unwrap();
-        run_hfq_requant_pipeline(&inp, &outp, GgufFormat::Ternary, None);
+        run_hfq_requant_pipeline(&inp, &outp, GgufFormat::Ternary, None, 0.0);
         let (_arch, _meta, tensors) = read_hfq_back(&outp);
 
         // Expected: ternary of the UNSCALED weights. Derived from the mq4
@@ -6701,7 +6830,7 @@ mod hfq_requant_pipeline_tests {
             .enumerate()
             .map(|(i, &v)| v / scales_f16[i % 256])
             .collect();
-        let expected = quantize_tq2g128_gptq(&unscaled, &vec![1.0f32; 128]);
+        let expected = quantize_tq2g128_gptq(&unscaled, &vec![1.0f32; 128], 0.0);
 
         let w = tensors
             .iter()
@@ -10034,11 +10163,21 @@ fn main() {
                     .filter(|a| *a > 0.0)
                     .unwrap_or(0.55)
             });
+            // Read the damping knob ONCE, here at the CLI boundary. The packers
+            // take it as an argument so a pipeline run is deterministic and
+            // self-consistent: 25 rayon workers re-reading a process-global
+            // mid-run could otherwise emit a model with mixed damping, and a
+            // concurrently-mutating test made the packers' output unreproducible.
+            let damping: f32 = std::env::var("HIPFIRE_GPTQ_DAMPING")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.0);
             run_hfq_requant_pipeline(
                 raw_input,
                 Path::new(output_path),
                 hfq_format,
                 awq_imatrix_alpha,
+                damping,
             );
             return;
         }
