@@ -2565,7 +2565,7 @@ pub fn generate(
             // was silently disabled post-merge; gate on the bundle instead.
             let resume_idx = if ckpt_resume_enabled()
                 && evict_safe
-                && m.state.as_mut().and_then(|s| s.as_arch_model_mut().as_any_mut().downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()).is_some()
+                && m.state.as_ref().map_or(false, |s| s.as_arch_model().arch_key() == "qwen35")
             {
                 m.prefill_checkpoints
                     .iter()

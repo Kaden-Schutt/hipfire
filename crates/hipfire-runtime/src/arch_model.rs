@@ -100,6 +100,13 @@ pub trait ArchModel: Send + std::any::Any {
     /// better.
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
 
+    /// Shared-reference counterpart of [`ArchModel::as_any_mut`].
+    ///
+    /// Added because the mutable-only hatch forced read-only call sites to take
+    /// `as_mut()` purely to downcast, which is both misleading and sometimes
+    /// impossible — a site holding `&LoadedModel` cannot conjure a `&mut`.
+    fn as_any(&self) -> &dyn std::any::Any;
+
     /// Return every GPU buffer this model owns.
     ///
     /// Consumes the box: unload is terminal, and taking `self` by value makes
@@ -136,6 +143,9 @@ mod tests {
             None
         }
         fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
             self
         }
         fn free_gpu(self: Box<Self>, _gpu: &mut Gpu) {}

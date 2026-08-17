@@ -1942,7 +1942,10 @@ pub fn handle_redline_shadow(
     let eligible = model.as_ref().is_some_and(|loaded| {
         loaded.pp == 1
             && loaded.ep.is_none()
-            && matches!(loaded.state.as_ref(), Some(ModelState::Qwen35(_)))
+            && loaded
+                .state
+                .as_ref()
+                .map_or(false, |s| s.as_arch_model().arch_key() == "qwen35")
     });
     if !eligible {
         emit_uncorrelated_error(
@@ -2181,7 +2184,10 @@ pub fn handle_redline_dispatch_profile(
     let eligible = model.as_ref().is_some_and(|loaded| {
         loaded.pp == 1
             && loaded.ep.is_none()
-            && matches!(loaded.state.as_ref(), Some(ModelState::Qwen35(_)))
+            && loaded
+                .state
+                .as_ref()
+                .map_or(false, |s| s.as_arch_model().arch_key() == "qwen35")
     });
     let launch_count = gpu.replay.recorded_launches().len();
     if !eligible || launch_count == 0 || sample_replays == 0 {
@@ -2455,7 +2461,10 @@ pub fn handle_redline_pm4_prefix_profile(
     let eligible = model.as_ref().is_some_and(|loaded| {
         loaded.pp == 1
             && loaded.ep.is_none()
-            && matches!(loaded.state.as_ref(), Some(ModelState::Qwen35(_)))
+            && loaded
+                .state
+                .as_ref()
+                .map_or(false, |s| s.as_arch_model().arch_key() == "qwen35")
     });
     let launch_count = gpu.replay.recorded_launches().len();
     let start = msg
@@ -2774,7 +2783,10 @@ pub fn handle_redline_prefix_shadow(
     let eligible = model.as_ref().is_some_and(|loaded| {
         loaded.pp == 1
             && loaded.ep.is_none()
-            && matches!(loaded.state.as_ref(), Some(ModelState::Qwen35(_)))
+            && loaded
+                .state
+                .as_ref()
+                .map_or(false, |s| s.as_arch_model().arch_key() == "qwen35")
     });
     if !eligible {
         emit_uncorrelated_error(
@@ -2929,10 +2941,11 @@ pub fn handle_redline_prefix_shadow(
                 "hip": hip_dn_k[index],
             })
         });
-    let pointer_debug = model.as_ref().and_then(|loaded| {
-        let ModelState::Qwen35(bundle) = loaded.state.as_ref()? else {
-            return None;
-        };
+    let pointer_debug = model.as_mut().and_then(|loaded| {
+        let bundle = loaded
+            .state
+            .as_mut()
+            .and_then(|s| s.as_arch_model_mut().as_any_mut().downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>())?;
         let launch = gpu.replay.recorded_launches().get(prefix.checked_sub(1)?)?;
         let pointers = launch
             .kernarg

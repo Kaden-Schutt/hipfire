@@ -491,6 +491,9 @@ impl hipfire_runtime::arch_model::ArchModel for MuseGlimmerBundle {
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
     }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
     fn dim(&self) -> usize {
         self.config.dim
     }
@@ -539,6 +542,9 @@ impl hipfire_runtime::arch_model::ArchModel for Gemma4Bundle {
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
     }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
     fn dim(&self) -> usize {
         self.config.dim
     }
@@ -576,6 +582,9 @@ impl hipfire_runtime::arch_model::ArchModel for Gemma4LoweredBundle {
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
     }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
     fn dim(&self) -> usize {
         self.config.dim
     }
@@ -605,6 +614,9 @@ impl hipfire_runtime::arch_model::ArchModel for Gemma4LoweredBundle {
 impl hipfire_runtime::arch_model::ArchModel for Deepseek4HeterogeneousBundle {
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
         self
     }
     fn dim(&self) -> usize {
@@ -687,6 +699,9 @@ impl ModelState {
 impl hipfire_runtime::arch_model::ArchModel for ModelState {
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
         self
     }
     fn dim(&self) -> usize {

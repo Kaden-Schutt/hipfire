@@ -25,7 +25,7 @@ use hipfire_arch_qwen35::qwen35;
 use hipfire_engine::emit::*;
 use hipfire_engine::scheduler::*;
 use hipfire_engine::terminal::*;
-use hipfire_loader::{EpArch, EpState, LoadedModel, ModelState};
+use hipfire_loader::{EpArch, EpState, LoadedModel};
 use hipfire_engine::prompt::{batch_render_prompt_tokens, qwen_jinja_reasoning};
 use hipfire_arch_lfm2moe::forward_batch::forward_decode_batch_lfm;
 use hipfire_arch_lfm2moe::batch::Lfm2DecodeBatchState;
@@ -141,33 +141,39 @@ pub fn is_batch_request_eligible(
     };
     let route = select_generation_route(&route_inputs);
     if caps.supports_continuous_batch {
-        match m.state.as_ref() {
-            Some(ModelState::Qwen35(bundle)) => {
-                if route != GenerationRoute::QwenAr {
-                    return false;
-                }
-                if m.qwen35_decode_batch.is_none() {
-                    return false;
-                }
-                if !hipfire_loader::batch_staging::qwen_batch_weight_formats_supported(&bundle.weights) {
-                    return false;
-                }
+        if let Some(bundle) = m
+            .state
+            .as_ref()
+            .and_then(|s| s.as_arch_model().as_any().downcast_ref::<hipfire_arch_qwen35::Qwen35Bundle>())
+        {
+            if route != GenerationRoute::QwenAr {
+                return false;
             }
-            Some(ModelState::Lfm2Moe(bundle)) => {
-                if route != GenerationRoute::LfmAr {
-                    return false;
-                }
-                if m.lfm2_decode_batch.is_none() {
-                    return false;
-                }
-                if !bundle.config.is_dense() {
-                    return false;
-                }
-                if lfm2moe::batch_weight_formats_supported(&bundle.weights).is_err() {
-                    return false;
-                }
+            if m.qwen35_decode_batch.is_none() {
+                return false;
             }
-            _ => return false,
+            if !hipfire_loader::batch_staging::qwen_batch_weight_formats_supported(&bundle.weights) {
+                return false;
+            }
+        } else if let Some(bundle) = m
+            .state
+            .as_ref()
+            .and_then(|s| s.as_arch_model().as_any().downcast_ref::<hipfire_arch_lfm2moe::Lfm2MoeBundle>())
+        {
+            if route != GenerationRoute::LfmAr {
+                return false;
+            }
+            if m.lfm2_decode_batch.is_none() {
+                return false;
+            }
+            if !bundle.config.is_dense() {
+                return false;
+            }
+            if lfm2moe::batch_weight_formats_supported(&bundle.weights).is_err() {
+                return false;
+            }
+        } else {
+            return false;
         }
     } else {
         return false;
