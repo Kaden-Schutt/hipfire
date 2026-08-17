@@ -34,7 +34,7 @@ RUN="cargo run --release"
 
 MODE="${1:-canary}"
 case "$MODE" in
-  canary) MAX_CHUNKS="${2:-4}";  N_CTX="${3:-512}"; OUTDIR=/data/spe-canary ;;
+  canary) MAX_CHUNKS="${2:-4}";  N_CTX="${3:-512}"; OUTDIR=/data/spe-ablation-canary ;;
   full)   MAX_CHUNKS="${2:-32}"; N_CTX="${3:-512}"; OUTDIR=/data/spe-ablation ;;
   *) echo "usage: $0 {canary|full} [MAX_CHUNKS] [N_CTX]" >&2; exit 2 ;;
 esac
@@ -86,6 +86,22 @@ for variant in "${!ARMS[@]}"; do
 done
 
 echo "=== [4] reduce ==="; date
+# kld_reduce globs the whole directory, so ANY .kldseq left over from an earlier
+# run becomes a row in this run's table — indistinguishable from a fresh one.
+# That is how the 2026-07-16 numbers outlived the build they came from. Refuse
+# to reduce a directory containing results for variants we did not just score.
+stale=()
+for f in "$OUTDIR"/*.kldseq; do
+  [[ -e "$f" ]] || continue
+  v="$(basename "$f")"; v="${v%%__*}"
+  [[ -v "ARMS[$v]" ]] || stale+=("$(basename "$f")")
+done
+if (( ${#stale[@]} )); then
+  echo "REFUSING to reduce: $OUTDIR holds .kldseq files for variants not in this run:" >&2
+  printf '  %s\n' "${stale[@]}" >&2
+  echo "They would appear as rows of this table. Move or delete them, then re-run." >&2
+  exit 4
+fi
 python3 benchmarks/quality-baselines/harness/kld_reduce.py \
   --result-dir "$OUTDIR" \
   --out-md "$OUTDIR/result-table.md" \
