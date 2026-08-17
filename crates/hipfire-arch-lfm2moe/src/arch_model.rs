@@ -39,7 +39,11 @@ impl ArchModel for Lfm2MoeBundle {
             weights,
             state,
             eos_tok: _,
+            lfm2_decode_batch,
         } = *self;
+        if let Some(batch) = lfm2_decode_batch {
+            batch.free_gpu(gpu);
+        }
         state.free_gpu(gpu);
         weights.free_gpu(gpu);
     }

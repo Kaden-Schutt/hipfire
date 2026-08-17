@@ -1,6 +1,6 @@
 use crate::qwen35::{
-    DeltaNetState, LayerType, Qwen35Config, Qwen35Scratch, Qwen35ScratchSet, Qwen35Weights,
-    StateQuant,
+    DeltaNetState, LayerType, Qwen35Config, Qwen35DecodeBatchState, Qwen35Scratch,
+    Qwen35ScratchSet, Qwen35Weights, StateQuant,
 };
 use crate::Qwen35;
 use hipfire_runtime::arch::Architecture;
@@ -32,8 +32,19 @@ pub struct Qwen35Bundle {
     /// text checkpoints; the bundle's text path is unaffected.
     pub vision_config: Option<hipfire_arch_qwen35_vl::qwen35_vl::VisionConfig>,
     pub vision_weights: Option<hipfire_arch_qwen35_vl::qwen35_vl::VisionWeights>,
+    /// Native MTP (NextN) head (arch_id=21). Loaded once at model load when
+    /// a bundled `.mq4-mtp` trailer OR a sibling `.mtp` sidecar is present.
+    /// Persistent for the life of the model; `generate_qwen35_mtp` allocates
+    /// a fresh per-request `MtpSpecState` against it. `None` for trunks
+    /// without an MTP head. Previously lived on `LoadedModel`.
+    pub qwen35_mtp_head: Option<crate::mtp_head::Qwen35MtpHead>,
+    /// Continuous-batch decode state for Qwen3.5 (single-GPU). `Some` when
+    /// `HIPFIRE_CONTINUOUS_BATCH` staged a batch (arch 5/6, pp=1, non-EP).
+    /// Freed via `Qwen35DecodeBatchState::free_gpu` in `ArchModel::free_gpu`
+    /// or eagerly via `LoadedModel::qwen35_mut()` in `unload_model` before
+    /// `ArchModel::free_gpu`. Previously lived on `LoadedModel`.
+    pub qwen35_decode_batch: Option<Qwen35DecodeBatchState>,
 }
-
 /// Build the Qwen35 GPU bundle from an HFQ source.
 ///
 /// CPU-only config/compat validation runs **before** weight upload. Every
@@ -95,6 +106,8 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
         pp_scratch_set: None,
         vision_config: None,
         vision_weights: None,
+        qwen35_mtp_head: None,
+        qwen35_decode_batch: None,
     })
 }
 
@@ -456,12 +469,20 @@ pub fn free_qwen35_bundle(bundle: Qwen35Bundle, gpu: &mut rdna_compute::Gpu) -> 
         pp_scratch_set,
         vision_config: _,
         vision_weights,
+        qwen35_mtp_head,
+        qwen35_decode_batch,
     } = bundle;
     debug_assert!(
         pp_scratch_set.is_none(),
         "free_qwen35_bundle: pp_scratch_set must be None on single-GPU free"
     );
     let _ = pp_scratch_set;
+    if let Some(head) = qwen35_mtp_head {
+        head.free_gpu(gpu);
+    }
+    if let Some(batch) = qwen35_decode_batch {
+        let _ = batch.free_gpu(gpu);
+    }
     // Match unload_model Qwen35 order: kv → scratch → weights → dn → vision.
     let mut first: Option<String> = None;
     if let Err(e) = kv_cache.free_gpu(gpu) {

@@ -1055,7 +1055,7 @@ pub fn generate(
         ep: m.ep.is_some(),
         pp: m.pp,
         has_speculator: m.speculator.is_some(),
-        qwen_mtp_head: m.qwen35_mtp_head.is_some(),
+        qwen_mtp_head: m.state.as_ref().and_then(|s| (s.as_ref() as &dyn std::any::Any).downcast_ref::<hipfire_arch_qwen35::Qwen35Bundle>()).map_or(false, |b| b.qwen35_mtp_head.is_some()),
         qwen_mtp_opt_in: std::env::var("HIPFIRE_QWEN_MTP").ok().as_deref() == Some("1"),
         mtp_sampled_on: std::env::var("HIPFIRE_MTP_SAMPLED").ok().as_deref() == Some("1"),
         deepseek4_spec_requested: deepseek4_spec_requested(m),

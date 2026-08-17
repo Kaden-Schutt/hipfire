@@ -126,7 +126,7 @@ pub fn is_batch_request_eligible(
         ep: m.ep.is_some(),
         pp: m.pp,
         has_speculator: has_spec,
-        qwen_mtp_head: m.qwen35_mtp_head.is_some(),
+        qwen_mtp_head: m.state.as_ref().and_then(|s| (s.as_ref() as &dyn std::any::Any).downcast_ref::<hipfire_arch_qwen35::Qwen35Bundle>()).map_or(false, |b| b.qwen35_mtp_head.is_some()),
         qwen_mtp_opt_in: std::env::var("HIPFIRE_QWEN_MTP").ok().as_deref() == Some("1"),
         mtp_sampled_on: std::env::var("HIPFIRE_MTP_SAMPLED").ok().as_deref() == Some("1"),
         deepseek4_spec_requested: false,
@@ -150,7 +150,7 @@ pub fn is_batch_request_eligible(
             if route != GenerationRoute::QwenAr {
                 return false;
             }
-            if m.qwen35_decode_batch.is_none() {
+            if bundle.qwen35_decode_batch.is_none() {
                 return false;
             }
             if !hipfire_loader::batch_staging::qwen_batch_weight_formats_supported(&bundle.weights) {
@@ -164,7 +164,7 @@ pub fn is_batch_request_eligible(
             if route != GenerationRoute::LfmAr {
                 return false;
             }
-            if m.lfm2_decode_batch.is_none() {
+            if bundle.lfm2_decode_batch.is_none() {
                 return false;
             }
             if !bundle.config.is_dense() {
@@ -173,7 +173,6 @@ pub fn is_batch_request_eligible(
             if lfm2moe::batch_weight_formats_supported(&bundle.weights).is_err() {
                 return false;
             }
-        } else {
             return false;
         }
     } else {
@@ -223,33 +222,44 @@ pub fn drive_qwen_continuous_batch(
         return Ok(());
     }
     // SAFETY: borrow disjoint fields via raw pointers to avoid &mut aliasing
-    let batch_state_ptr = match model.qwen35_decode_batch.as_mut() {
-        Some(s) => s as *mut qwen35::Qwen35DecodeBatchState,
+    // qwen35_decode_batch now lives inside Qwen35Bundle.
+    let b_ptr = match model
+        .state
+        .as_mut()
+        .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>())
+    {
+        Some(b) => b as *mut hipfire_arch_qwen35::Qwen35Bundle,
         None => {
             return Err(BatchDriveError::Gpu(
-                "batch state not allocated".to_string(),
+                "batch model not Qwen35".to_string(),
             ))
         }
     };
+    let batch_state_ptr = unsafe {
+        let b = &mut *b_ptr;
+        match b.qwen35_decode_batch.as_mut() {
+            Some(s) => s as *mut qwen35::Qwen35DecodeBatchState,
+            None => {
+                return Err(BatchDriveError::Gpu(
+                    "batch state not allocated".to_string(),
+                ))
+            }
+        }
+    };
     let batch_state = unsafe { &mut *batch_state_ptr };
-    let (config_ptr, weights_ptr, scratch_ptr, tokenizer_ptr, chat_template_clone) =
-        match model
-            .state
-            .as_mut()
-            .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>())
-        {
-            Some(b) => (
-                &b.config as *const qwen35::Qwen35Config,
-                &b.weights as *const qwen35::Qwen35Weights,
-                &b.scratch as *const qwen35::Qwen35Scratch,
-                match model.tokenizer.as_ref() {
-                    Some(t) => t as *const _,
-                    None => return Err(BatchDriveError::Gpu("tokenizer missing".to_string())),
-                },
-                model.chat_template.clone(),
-            ),
-            _ => return Err(BatchDriveError::Gpu("batch model not Qwen35".to_string())),
-        };
+    let (config_ptr, weights_ptr, scratch_ptr, tokenizer_ptr, chat_template_clone) = unsafe {
+        let b = &*b_ptr;
+        (
+            &b.config as *const qwen35::Qwen35Config,
+            &b.weights as *const qwen35::Qwen35Weights,
+            &b.scratch as *const qwen35::Qwen35Scratch,
+            match model.tokenizer.as_ref() {
+                Some(t) => t as *const _,
+                None => return Err(BatchDriveError::Gpu("tokenizer missing".to_string())),
+            },
+            model.chat_template.clone(),
+        )
+    };
     let config = unsafe { &*config_ptr };
     let weights = unsafe { &*weights_ptr };
     let scratch = unsafe { &*scratch_ptr };
@@ -1132,33 +1142,36 @@ pub fn drive_lfm_continuous_batch(
     if batch_size == 0 {
         return Ok(());
     }
-    let batch_state_ptr = match model.lfm2_decode_batch.as_mut() {
-        Some(s) => s as *mut Lfm2DecodeBatchState,
-        None => {
-            return Err(BatchDriveError::Gpu(
-                "batch state not allocated".to_string(),
-            ))
-        }
-    };
-    let batch_state = unsafe { &mut *batch_state_ptr };
-    let (config_ptr, weights_ptr, tokenizer_ptr, chat_template_clone, eos_tok) =
+    let (batch_state_ptr, config_ptr, weights_ptr, tokenizer_ptr, chat_template_clone, eos_tok) =
         match model
             .state
             .as_mut()
             .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_lfm2moe::Lfm2MoeBundle>())
         {
-            Some(b) => (
-                &b.config as *const lfm2moe::config::Lfm2MoeConfig,
-                &b.weights as *const lfm2moe::Lfm2MoeWeights,
-                match model.tokenizer.as_ref() {
-                    Some(t) => t as *const _,
-                    None => return Err(BatchDriveError::Gpu("tokenizer missing".to_string())),
-                },
-                model.chat_template.clone(),
-                b.eos_tok,
-            ),
+            Some(b) => {
+                let batch_ptr = match b.lfm2_decode_batch.as_mut() {
+                    Some(s) => s as *mut Lfm2DecodeBatchState,
+                    None => {
+                        return Err(BatchDriveError::Gpu(
+                            "batch state not allocated".to_string(),
+                        ))
+                    }
+                };
+                (
+                    batch_ptr,
+                    &b.config as *const lfm2moe::config::Lfm2MoeConfig,
+                    &b.weights as *const lfm2moe::Lfm2MoeWeights,
+                    match model.tokenizer.as_ref() {
+                        Some(t) => t as *const _,
+                        None => return Err(BatchDriveError::Gpu("tokenizer missing".to_string())),
+                    },
+                    model.chat_template.clone(),
+                    b.eos_tok,
+                )
+            }
             _ => return Err(BatchDriveError::Gpu("batch model not Lfm2Moe".to_string())),
         };
+    let batch_state = unsafe { &mut *batch_state_ptr };
     let config = unsafe { &*config_ptr };
     let weights = unsafe { &*weights_ptr };
     let tokenizer: &hipfire_runtime::tokenizer::Tokenizer = unsafe { &*tokenizer_ptr };
@@ -2382,7 +2395,7 @@ pub fn is_qwen_ep_batch_request_eligible(
     if !caps.supports_ep_batch {
         return false;
     }
-    if m.qwen35_decode_batch.is_some() || m.lfm2_decode_batch.is_some() {
+    if m.qwen35().is_some_and(|b| b.qwen35_decode_batch.is_some()) || m.lfm2moe().and_then(|b| b.lfm2_decode_batch.as_ref()).is_some() {
         return false;
     }
     // EP batch is pure TP=4 gfx1201; validate via existing weight format gate.
@@ -2431,7 +2444,7 @@ pub fn is_qwen_ep_batch_request_eligible(
         ep: false,
         pp: m.pp,
         has_speculator: m.speculator.is_some(),
-        qwen_mtp_head: m.qwen35_mtp_head.is_some(),
+        qwen_mtp_head: m.state.as_ref().and_then(|s| (s.as_ref() as &dyn std::any::Any).downcast_ref::<hipfire_arch_qwen35::Qwen35Bundle>()).map_or(false, |b| b.qwen35_mtp_head.is_some()),
         qwen_mtp_opt_in: std::env::var("HIPFIRE_QWEN_MTP").ok().as_deref() == Some("1"),
         mtp_sampled_on: std::env::var("HIPFIRE_MTP_SAMPLED").ok().as_deref() == Some("1"),
         deepseek4_spec_requested: false,

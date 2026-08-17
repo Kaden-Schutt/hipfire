@@ -64,6 +64,7 @@ pub fn load_lfm2moe_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Lfm2Mo
                 weights,
                 state,
                 eos_tok,
+                lfm2_decode_batch: None,
             })
         }
         ModelSource::Dir(source) => {
@@ -81,6 +82,7 @@ pub fn load_lfm2moe_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Lfm2Mo
                 weights,
                 state,
                 eos_tok,
+                lfm2_decode_batch: None,
             })
         }
     }

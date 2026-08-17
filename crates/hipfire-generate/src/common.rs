@@ -1064,9 +1064,6 @@ pub fn fail_closed_reset_target_and_spec(
         if let Some(b) = m.llama_mut() {
             b.kv.compact_offset = 0;
         }
-        if let Some(s) = &mut m.qwen2_state {
-            s.reset();
-        }
         if let Some(b) = m.qwen2_mut() {
             b.state.reset();
         }
@@ -1106,14 +1103,18 @@ pub fn fail_closed_reset_target_and_spec(
                 ad.reset();
             }
         }
-        if let Some(bs) = m.qwen35_decode_batch.as_mut() {
-            if let Err(e) = bs.reset(gpu) {
-                push_reset_err(&mut first_err, "qwen35_decode_batch.reset", e);
+        if let Some(b) = m.qwen35_mut() {
+            if let Some(bs) = b.qwen35_decode_batch.as_mut() {
+                if let Err(e) = bs.reset(gpu) {
+                    push_reset_err(&mut first_err, "qwen35_decode_batch.reset", e);
+                }
             }
         }
-        if let Some(bs) = m.lfm2_decode_batch.as_mut() {
-            if let Err(e) = bs.reset(gpu) {
-                push_reset_err(&mut first_err, "lfm2_decode_batch.reset", e);
+        if let Some(b) = m.lfm2moe_mut() {
+            if let Some(bs) = b.lfm2_decode_batch.as_mut() {
+                if let Err(e) = bs.reset(gpu) {
+                    push_reset_err(&mut first_err, "lfm2_decode_batch.reset", e);
+                }
             }
         }
     }

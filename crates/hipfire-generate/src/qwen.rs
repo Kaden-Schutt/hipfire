@@ -3851,8 +3851,10 @@ pub fn generate_qwen35_mtp(
         dn_state,
         kv_adaptive: _,
         pp_scratch_set: _, 
+        qwen35_mtp_head: _,
         vision_config,
         vision_weights,
+        qwen35_decode_batch,
     } = match m.state.take().and_then(|s| (s as Box<dyn std::any::Any>).downcast::<Qwen35Bundle>().ok()).map(|b| *b) {
         Some(b) => b,
         None => {
@@ -3866,6 +3868,7 @@ pub fn generate_qwen35_mtp(
         Err(e) => {
             emit_error_with_id(stdout, id, format!("reopen model: {e}"));
             m.state = Some(Box::new(Qwen35Bundle {
+                qwen35_mtp_head: None,
                 config: orig_config,
                 weights,
                 scratch,
@@ -3873,6 +3876,7 @@ pub fn generate_qwen35_mtp(
                 dn_state,
                                 kv_adaptive: None,
                 pp_scratch_set: None,
+                qwen35_decode_batch,
                 vision_config,
                 vision_weights,
             }));
@@ -3880,6 +3884,7 @@ pub fn generate_qwen35_mtp(
         }
     };
     let mut target = ModelSlot {
+        qwen35_mtp_head: None,
         name: String::from("target"),
         hfq,
         config: target_config,
@@ -3922,6 +3927,7 @@ pub fn generate_qwen35_mtp(
             ),
         );
         m.state = Some(Box::new(Qwen35Bundle {
+                qwen35_mtp_head: None,
             config: orig_config,
             weights: target.weights,
             scratch: target.scratch,
@@ -3929,6 +3935,7 @@ pub fn generate_qwen35_mtp(
             dn_state: target.dn_state,
                             kv_adaptive: None,
                 pp_scratch_set: None,
+                qwen35_decode_batch,
                 vision_config: target.vision_config,
                 vision_weights: target.vision_weights,
         }));
@@ -3937,8 +3944,11 @@ pub fn generate_qwen35_mtp(
 
     // ── Allocate a FRESH per-request MtpSpecState (no cross-request bleed) ─
     let head = m
-        .qwen35_mtp_head
+        .state
         .as_ref()
+        .and_then(|s| (s.as_ref() as &dyn std::any::Any)
+            .downcast_ref::<hipfire_arch_qwen35::Qwen35Bundle>())
+        .and_then(|b| b.qwen35_mtp_head.as_ref())
         .expect("generate_qwen35_mtp reached without a loaded MTP head — dispatch gate is wrong");
     // Compressed (cvs) draft head? Copy the Option out now so we don't hold a
     // borrow of `head`/`m` past the state setup — the compressed-logits scratch
@@ -3958,6 +3968,7 @@ pub fn generate_qwen35_mtp(
             Err(e) => {
                 emit_error_with_id(stdout, id, format!("alloc MtpSpecState: {e:?}"));
                 m.state = Some(Box::new(Qwen35Bundle {
+                qwen35_mtp_head: None,
                     config: orig_config,
                     weights: target.weights,
                     scratch: target.scratch,
@@ -3965,6 +3976,7 @@ pub fn generate_qwen35_mtp(
                     dn_state: target.dn_state,
                                     kv_adaptive: None,
                 pp_scratch_set: None,
+                qwen35_decode_batch,
                 vision_config: target.vision_config,
                 vision_weights: target.vision_weights,
                 }));
@@ -3977,6 +3989,7 @@ pub fn generate_qwen35_mtp(
             Err(e) => {
                 emit_error_with_id(stdout, id, format!("alloc MtpSpecState: {e:?}"));
                 m.state = Some(Box::new(Qwen35Bundle {
+                qwen35_mtp_head: None,
                     config: orig_config,
                     weights: target.weights,
                     scratch: target.scratch,
@@ -3984,6 +3997,7 @@ pub fn generate_qwen35_mtp(
                     dn_state: target.dn_state,
                                     kv_adaptive: None,
                 pp_scratch_set: None,
+                qwen35_decode_batch,
                 vision_config: target.vision_config,
                 vision_weights: target.vision_weights,
                 }));
@@ -4000,6 +4014,7 @@ pub fn generate_qwen35_mtp(
             emit_error_with_id(stdout, id, format!("alloc logits_compressed: {e:?}"));
             state.free_gpu(gpu);
             m.state = Some(Box::new(Qwen35Bundle {
+                qwen35_mtp_head: None,
                 config: orig_config,
                 weights: target.weights,
                 scratch: target.scratch,
@@ -4007,6 +4022,7 @@ pub fn generate_qwen35_mtp(
                 dn_state: target.dn_state,
                                 kv_adaptive: None,
                 pp_scratch_set: None,
+                qwen35_decode_batch,
                 vision_config: target.vision_config,
                 vision_weights: target.vision_weights,
             }));
@@ -4016,6 +4032,7 @@ pub fn generate_qwen35_mtp(
             emit_error_with_id(stdout, id, format!("alloc mtp_lm_logits_compressed: {e:?}"));
             state.free_gpu(gpu);
             m.state = Some(Box::new(Qwen35Bundle {
+                qwen35_mtp_head: None,
                 config: orig_config,
                 weights: target.weights,
                 scratch: target.scratch,
@@ -4023,6 +4040,7 @@ pub fn generate_qwen35_mtp(
                 dn_state: target.dn_state,
                                 kv_adaptive: None,
                 pp_scratch_set: None,
+                qwen35_decode_batch,
                 vision_config: target.vision_config,
                 vision_weights: target.vision_weights,
             }));
@@ -4062,7 +4080,9 @@ pub fn generate_qwen35_mtp(
     // Boundary hook downshifts at exclusive committed pos before the next chunk
     // can write past the current-tier capacity. Prefill/spec HipResult failures
     // (incl. lazy VMM growth) are request errors — never unwrap/panic.
-    let head = m.qwen35_mtp_head.as_ref().unwrap();
+    let head = m.state.as_ref().and_then(|s| (s.as_ref() as &dyn std::any::Any).downcast_ref::<hipfire_arch_qwen35::Qwen35Bundle>())
+        .and_then(|b| b.qwen35_mtp_head.as_ref())
+        .expect("qwen35 MTP head must be loaded on this path");
     let prefill_res = {
         let adaptive = &mut m.kv_adaptive;
         mtp_spec::prefill_trunk_and_mtp_cache_with_boundary(
@@ -4102,6 +4122,7 @@ pub fn generate_qwen35_mtp(
         emit_error_with_id(stdout, id, format!("mtp prefill: {e:?}"));
         state.free_gpu(gpu);
         m.state = Some(Box::new(Qwen35Bundle {
+                qwen35_mtp_head: None,
             config: orig_config,
             weights: target.weights,
             scratch: target.scratch,
@@ -4109,6 +4130,7 @@ pub fn generate_qwen35_mtp(
             dn_state: target.dn_state,
                             kv_adaptive: None,
                 pp_scratch_set: None,
+                qwen35_decode_batch,
                 vision_config: target.vision_config,
                 vision_weights: target.vision_weights,
         }));
@@ -4125,6 +4147,7 @@ pub fn generate_qwen35_mtp(
             emit_error_with_id(stdout, id, format!("download seed logits: {e:?}"));
             state.free_gpu(gpu);
             m.state = Some(Box::new(Qwen35Bundle {
+                qwen35_mtp_head: None,
                 config: orig_config,
                 weights: target.weights,
                 scratch: target.scratch,
@@ -4132,6 +4155,7 @@ pub fn generate_qwen35_mtp(
                 dn_state: target.dn_state,
                                 kv_adaptive: None,
                 pp_scratch_set: None,
+                qwen35_decode_batch,
                 vision_config: target.vision_config,
                 vision_weights: target.vision_weights,
             }));
@@ -4597,6 +4621,7 @@ pub fn generate_qwen35_mtp(
     m.seq_pos = 0;
     m.conversation_tokens.clear();
     m.state = Some(Box::new(Qwen35Bundle {
+                qwen35_mtp_head: None,
         config: orig_config,
         weights: target.weights,
         scratch: target.scratch,
@@ -4604,6 +4629,7 @@ pub fn generate_qwen35_mtp(
         dn_state: target.dn_state,
                         kv_adaptive: None,
                 pp_scratch_set: None,
+                qwen35_decode_batch,
                 vision_config: target.vision_config,
                 vision_weights: target.vision_weights,
     }));

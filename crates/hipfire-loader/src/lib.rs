@@ -22,7 +22,6 @@ use hipfire_arch_gemma4 as gemma4;
 use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_minimax as minimax;
 use hipfire_arch_muse_glimmer as glimmer;
-use hipfire_arch_qwen2::qwen2;
 use hipfire_arch_qwen35::qwen35::{self};
 use hipfire_arch_qwen35::speculative::DeltaNetSnapshot;
 use hipfire_arch_qwen35::Qwen35Bundle;
@@ -877,17 +876,10 @@ pub struct LoadedModel {
     // All consumers go through the typed accessors below (`dots_ocr()`,
     // `qwen35()`, etc.) which downcast via `Any`.
     pub state: Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
-    pub qwen35_decode_batch: Option<hipfire_arch_qwen35::qwen35::Qwen35DecodeBatchState>,
-    pub lfm2_decode_batch: Option<hipfire_arch_lfm2moe::batch::Lfm2DecodeBatchState>,
-    pub kv_cache: Option<llama::KvCache>,
-    // Reusable Qwen2 recurrent state (used by Qwen2 non-core falcon only).
-    // dots-ocr's state lives inside the boxed `DotsOcrBundle` above.
-    pub qwen2_state: Option<qwen2::Qwen2State>,
-    // DeepSeek V4 (arch_id=9) single-GPU scratch lives outside the bundle.
-    pub deepseek4_pbs: Option<hipfire_arch_deepseek4::forward::PrefillBatchScratch>,
+    // DeepSeek V4 (arch_id=9) single-GPU prefill scratch now lives inside
+    // `Deepseek4Bundle.pbs` (moved from here so `LoadedModel` can become arch-free).
     // DeepSeek V4 (arch_id=9) EP serve eos. The EP path stores model state in
     // `ep` (EpArch::Ds4), NOT in `state`, so there is no Deepseek4Bundle for EP
-    // models — the eos must be carried here (mirrors `minimax_eos_tok`).
     pub deepseek4_eos_tok: u32,
     // MiniMax-M2 (arch_id=10) EP serve eos. The EP path stores model state in
     // `ep` (EpArch::Minimax), NOT in `state`, so `minimax()` is None for EP
@@ -910,7 +902,6 @@ pub struct LoadedModel {
     // `generate_qwen35_mtp` allocates a fresh per-request `MtpSpecState`
     // against it (so the recurrent MTP-KV never bleeds across requests). None
     // for every other arch and for qwen35 trunks without an MTP head.
-    pub qwen35_mtp_head: Option<hipfire_arch_qwen35::mtp_head::Qwen35MtpHead>,
     // Shared
     pub tokenizer: Option<hipfire_runtime::tokenizer::Tokenizer>,
     pub seq_pos: usize,
@@ -970,18 +961,12 @@ impl LoadedModel {
             pp_gpus: None,
             pp_dn_la_to_device: None,
             state: None,
-            qwen35_decode_batch: None,
-            lfm2_decode_batch: None,
-            kv_cache: None,
-            qwen2_state: None,
-            deepseek4_pbs: None,
             deepseek4_eos_tok: 0,
             minimax_eos_tok: 0,
             qwen35_eos_tok: 0,
             mtp_mode: "auto".to_string(),
             mtp_k: 3,
             mtp_weights_present: false,
-            qwen35_mtp_head: None,
             tokenizer: Some(tokenizer),
             seq_pos: 0,
             max_seq,
@@ -1101,10 +1086,7 @@ impl LoadedModel {
     }
 
     /// Qwen2 bundle if this model is arch_id=7 (plain qwen2 via `Qwen2Carrier`),
-    /// else None. The live `Qwen2State` is at `.state`. NOTE: this is NOT the
-    /// `qwen2_state` direct field — that is None for plain qwen2 and is only
-    // populated by dots-ocr (arch_id=8). Reset/checkpoint sites must rewind
-    /// BOTH or the reset silently no-ops (see scripts/qwen2-reset-gate.sh).
+    /// else None.
     pub fn qwen2_mut(&mut self) -> Option<&mut hipfire_arch_qwen2::Qwen2Bundle> {
         self.state
             .as_deref_mut()
@@ -1852,7 +1834,17 @@ fn finish_qwen35_load(
     // dspark probe set in the daemon's load handler). For qwen35 the presence of a
     // loaded MTP head IS the signal.
     model.mtp_weights_present = qwen35_mtp_head.is_some();
-    model.qwen35_mtp_head = qwen35_mtp_head;
+    // The head lives on the bundle, not on LoadedModel: per-arch state must not
+    // keep an arch type in the loader's struct, or LoadedModel can never move
+    // into arch-free hipfire-runtime.
+    if let Some(bundle) = model
+        .state
+        .as_mut()
+        .and_then(|s| (s.as_mut() as &mut dyn std::any::Any)
+            .downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>())
+    {
+        bundle.qwen35_mtp_head = qwen35_mtp_head;
+    }
     Ok(model)
 }
 
@@ -3169,17 +3161,13 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
             dev.drain_pool();
         }
         let _ = gpus.free_tp_graph_signals();
-        if let Some(batch_state) = m.lfm2_decode_batch.take() {
-            // Single-GPU dense LFM batch is not expected on EP, but free it on
-            // the provided single gpu before multi-device teardown to avoid
-            // leaking if staging ever leaves residual state.
-            batch_state.free_gpu(gpu);
-        }
-        if let Some(batch_state) = m.qwen35_decode_batch.take() {
-            // Single-GPU Qwen batch is not expected on EP, but free it on the
-            // provided single gpu before multi-device teardown to avoid leaking
-            // if staging ever leaves residual state.
-            batch_state.free_gpu(gpu);
+        if let Some(b) = m.qwen35_mut() {
+            if let Some(batch_state) = b.qwen35_decode_batch.take() {
+                // Single-GPU Qwen batch is not expected on EP, but free it on the
+                // provided single gpu before multi-device teardown to avoid leaking
+                // if staging ever leaves residual state.
+                let _ = batch_state.free_gpu(gpu);
+            }
         }
         let _ = gpu;
         if let Some(err) = ep_first_err {
@@ -3189,21 +3177,16 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
         // `gpus` drops here, tearing down comms + devices.
     }
     if m.pp > 1 {
-        let mut gpus = m.pp_gpus.expect("pp>1 must carry pp_gpus");
-        if let Some(batch_state) = m.qwen35_decode_batch.take() {
-            // Single-GPU batch state is not expected for pp>1, but free it on
-            // the provided single gpu before multi-device teardown to avoid
-            // leaking if a test ever stages it.
-            batch_state.free_gpu(gpu);
+        if let Some(b) = m.qwen35_mut() {
+            if let Some(batch_state) = b.qwen35_decode_batch.take() {
+                // Single-GPU batch state is not expected for pp>1, but free it on
+                // the provided single gpu before multi-device teardown to avoid
+                // leaking if a test ever stages it.
+                let _ = batch_state.free_gpu(gpu);
+            }
         }
-        if let Some(batch_state) = m.lfm2_decode_batch.take() {
-            // Single-GPU batch state is not expected for pp>1, but free it on
-            // the provided single gpu before multi-device teardown to avoid
-            // leaking if a test ever stages it.
-            batch_state.free_gpu(gpu);
-        }
+        let mut gpus = m.pp_gpus.take().expect("pp>1 must carry pp_gpus");
         if let Some(state) = m.state.take() {
-            // Only Qwen35 supports pp>1. Try to downcast; if it is Qwen35, free its
             // multi-GPU resources. Otherwise just drop the box (original match did
             // the same — non-qwen35 pp>1 is unreachable and had an empty arm).
             if let Ok(mut b) = (state as Box<dyn Any>).downcast::<hipfire_arch_qwen35::Qwen35Bundle>() {
@@ -3232,9 +3215,6 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
         // empty) is still drained below for defense-in-depth.
         spec.free(gpu);
     }
-    if let Some(head) = m.qwen35_mtp_head {
-        head.free_gpu(gpu);
-    }
     if let Some(ev) = m.eviction {
         ev.free_gpu(gpu);
     }
@@ -3246,34 +3226,23 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
             }
         }
     };
-    if let Some(kv) = m.kv_cache {
-        note(kv.free_gpu(gpu).map_err(|e| e.to_string()));
-    }
     for (_, snap) in m.prefill_checkpoints {
         snap.free_gpu(gpu);
     }
     for (_, snap) in m.dflash_checkpoints {
         snap.free_gpu(gpu);
     }
-    if let Some(batch_state) = m.qwen35_decode_batch.take() {
-        batch_state.free_gpu(gpu);
-    }
-    if let Some(batch_state) = m.lfm2_decode_batch.take() {
-        batch_state.free_gpu(gpu);
+    if let Some(state) = m.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()) {
+        if let Some(batch_state) = state.qwen35_decode_batch.take() {
+            let _ = batch_state.free_gpu(gpu);
+        }
     }
     // Free arch-specific GPU state from the carrier bundle via `ArchModel::free_gpu`.
     if let Some(state) = m.state {
         state.free_gpu(gpu);
     }
-    // Non-core arch weights
-    if let Some(s) = m.qwen2_state {
-        s.free_gpu(gpu);
-    }
-    // deepseek4 single-GPU scratch lives outside the bundle (relocated later);
-    // its config/weights/state freed via the trait free_gpu above.
-    if let Some(pbs) = m.deepseek4_pbs {
-        pbs.free_gpu(gpu);
-    }
+    // deepseek4 single-GPU scratch now lives inside `Deepseek4Bundle.pbs` and is
+    // freed via `ArchModel::free_gpu` above — no separate `m.deepseek4_pbs` block.
     // Qwen35 vision tower is now inside the bundle and freed via
     // `ArchModel::free_gpu` above. Nothing to do here — the old
     // `m.vision_weights` field is gone.

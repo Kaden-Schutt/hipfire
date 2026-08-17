@@ -534,6 +534,10 @@ pub struct ModelSlot {
     /// tower while the bundle is out of `ModelState`.
     pub vision_config: Option<hipfire_arch_qwen35_vl::qwen35_vl::VisionConfig>,
     pub vision_weights: Option<hipfire_arch_qwen35_vl::qwen35_vl::VisionWeights>,
+    /// Native MTP head parked through the slot guard so `Qwen35Bundle`
+    /// round-trips without loss. The slot never owns MTP serving; it just
+    /// carries the head while the bundle is out of `LoadedModel.state`.
+    pub qwen35_mtp_head: Option<crate::mtp_head::Qwen35MtpHead>,
 }
 
 impl ModelSlot {
@@ -563,12 +567,19 @@ impl ModelSlot {
             pp_scratch_set,
             vision_config,
             vision_weights,
+            qwen35_mtp_head,
+            qwen35_decode_batch,
         } = bundle;
         debug_assert!(
             pp_scratch_set.is_none(),
             "ModelSlot::from_bundle: pp_scratch_set must be None (pp>1 never enters spec slot)"
         );
         let _ = pp_scratch_set;
+        debug_assert!(
+            qwen35_decode_batch.is_none(),
+            "ModelSlot::from_bundle: qwen35_decode_batch must be None (batch staging is outside spec slot)"
+        );
+        let _ = qwen35_decode_batch;
         Ok(Self {
             name: String::from("target"),
             hfq,
@@ -581,6 +592,7 @@ impl ModelSlot {
             dspark_extract_layers: Vec::new(),
             vision_config,
             vision_weights,
+            qwen35_mtp_head,
         })
     }
 
@@ -600,12 +612,13 @@ impl ModelSlot {
             pp_scratch_set: None,
             vision_config: self.vision_config,
             vision_weights: self.vision_weights,
+            qwen35_mtp_head: self.qwen35_mtp_head,
+            qwen35_decode_batch: None,
         }
     }
 }
 
 impl ModelSlot {
-    /// Load a model from `path` into a slot. The caller-supplied `gpu` is used
     /// for all allocations. `name` is a human-readable label used in logs.
     pub fn load(
         gpu: &mut Gpu,
@@ -717,6 +730,7 @@ impl ModelSlot {
             dspark_extract_layers: Vec::new(),
             vision_config: None,
             vision_weights: None,
+            qwen35_mtp_head: None,
         })
     }
 

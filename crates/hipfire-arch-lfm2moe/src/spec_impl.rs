@@ -82,6 +82,12 @@ pub struct Lfm2MoeBundle {
     pub weights: Lfm2MoeWeights,
     pub state: Lfm2MoeState,
     pub eos_tok: u32,
+    /// Continuous-decode batch state (arch 11 dense, single-GPU). `Some` only
+    /// when continuous batch has been staged via `batch_staging::stage_continuous_batch`;
+    /// `None` is the common AR path. Lives in the bundle (not `LoadedModel`)
+    /// so `LoadedModel` can become arch-free. Previously
+    /// `LoadedModel.lfm2_decode_batch`.
+    pub lfm2_decode_batch: Option<crate::batch::Lfm2DecodeBatchState>,
 }
 
 /// LFM2.5-MoE verify scratch: the pre-verify conv-state snapshot.

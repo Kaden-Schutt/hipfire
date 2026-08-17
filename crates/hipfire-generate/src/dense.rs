@@ -746,16 +746,8 @@ pub fn generate_deepseek4(
             return;
         }
     };
-    // `pbs` is a disjoint field from `m.state`, so it borrows independently of
-    // the bundle's `&mut state` below.
-    let pbs = m
-        .deepseek4_pbs
-        .as_mut()
-        .expect("deepseek4_pbs missing on arch_id=9 generate");
-    // The single-GPU ds4 bundle (config/weights/state/eos) lives in
-    // `ModelState::Deepseek4`. Field-borrow it disjointly so `cfg`/`weights`
-    // (shared) and `state` (`&mut`) are live simultaneously, exactly as the
-    // forward path needs.
+    // The single-GPU ds4 bundle (config/weights/state/eos/pbs) lives in `Deepseek4Bundle`.
+    // `pbs` is now inside the bundle so we downcast once and split fields disjointly.
     let Some(b) = m
         .state
         .as_mut()
@@ -769,10 +761,19 @@ pub fn generate_deepseek4(
         let _ = stdout.flush();
         return;
     };
-    let cfg = &b.config;
-    let weights = &b.weights;
-    let state = &mut b.state;
-    let eos_tok = b.eos_tok;
+    // Split the bundle's fields disjointly so pbs (+state) and config/weights/eos do not overlap.
+    let hipfire_arch_deepseek4::Deepseek4Bundle {
+        config: cfg,
+        weights,
+        state,
+        pbs,
+        eos_tok,
+        ..
+    } = &mut *b;
+    let pbs = pbs.as_mut().expect("deepseek4_pbs missing on arch_id=9 generate");
+    let cfg = &*cfg;
+    let weights = &*weights;
+    let eos_tok = *eos_tok;
 
     let prompt_ids = build_deepseek4_dsml_prompt(
         tokenizer,

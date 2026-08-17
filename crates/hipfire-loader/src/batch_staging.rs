@@ -86,19 +86,28 @@ pub fn stage_continuous_batch(
                         if requested > 1 && m.pp == 1 && m.ep.is_none() {
                             match crate::continuous_batch_route(m.arch_id) {
                                 Some(crate::ContinuousBatchRoute::Qwen35) => {
-                                if let Some(bundle) = m.qwen35() {
-                                    if !qwen_batch_weight_formats_supported(&bundle.weights) {
+                                // Immutable borrow of `m` ends after this extraction; mutable borrow for batch field later is disjoint.
+                                let qwen_info = m.qwen35().map(|b| {
+                                    (
+                                        qwen_batch_weight_formats_supported(&b.weights),
+                                        b.scratch.repeat_buf.buf.size(),
+                                        b.config.head_dim,
+                                        b.config.clone(),
+                                        b.weights.embd_format,
+                                        b.weights.output.gpu_dtype,
+                                    )
+                                });
+                                if let Some((weight_ok, scratch_size, head_dim, config_clone, embd_fmt, out_dtype)) = qwen_info {
+                                    if !weight_ok {
                                         eprintln!(
                                             "[daemon] continuous batch requested but weight formats unsupported (embd={:?} lm_head={:?}) — fallback to sequential",
-                                            bundle.weights.embd_format,
-                                            bundle.weights.output.gpu_dtype
+                                            embd_fmt, out_dtype
                                         );
                                     } else {
-                                        let repeat_cap =
-                                            (bundle.scratch.repeat_buf.buf.size() / 4).max(1);
+                                        let repeat_cap = (scratch_size / 4).max(1);
                                         let max_attention_lane = gpu
                                             .attention_q8_0_kv_independent_max_lane_capacity(
-                                                bundle.config.head_dim,
+                                                head_dim,
                                             );
                                         let batch_lane_capacity = m.max_seq.min(max_attention_lane);
                                         if batch_lane_capacity == 0 {
@@ -115,13 +124,13 @@ pub fn stage_continuous_batch(
                                             }
                                             match hipfire_arch_qwen35::qwen35::Qwen35DecodeBatchState::new(
                                                 gpu,
-                                                &bundle.config,
+                                                &config_clone,
                                                 requested,
                                                 batch_lane_capacity,
                                                 repeat_cap,
                                             ) {
                                                 Ok(batch_state) => {
-                                                    m.qwen35_decode_batch = Some(batch_state);
+                                                    m.qwen35_mut().unwrap().qwen35_decode_batch = Some(batch_state);
                                                     out.slots = requested;
  out.lane_capacity = batch_lane_capacity;
                                                     out.capable = true;
@@ -145,46 +154,52 @@ pub fn stage_continuous_batch(
                                 }
                                 }
                                 Some(crate::ContinuousBatchRoute::Lfm2Moe) => {
-                                if let Some(bundle) = m.lfm2moe() {
-                                    if !bundle.config.is_dense() {
+                                if m.lfm2moe().is_none() {
+                                    eprintln!("[daemon] continuous batch requested but model state not Lfm2Moe — fallback to sequential");
+                                } else if !m.lfm2moe().unwrap().config.is_dense() {
+                                    eprintln!(
+                                        "[daemon] continuous batch requested but LFM MoE not supported (dense only) — fallback to sequential"
+                                    );
+                                } else if let Err(reason) =
+                                    hipfire_arch_lfm2moe::batch_weight_formats_supported(&m.lfm2moe().unwrap().weights)
+                                {
+                                    eprintln!(
+                                        "[daemon] continuous batch requested but weight formats unsupported: {} — fallback to sequential",
+                                        reason
+                                    );
+                                } else {
+                                    let repeat_cap = 2048usize.max(1);
+                                    let max_attention_lane = {
+                                        let b = m.lfm2moe().unwrap();
+                                        gpu.attention_q8_0_kv_independent_max_lane_capacity(
+                                            b.config.head_dim,
+                                        )
+                                    };
+                                    let batch_lane_capacity = m.max_seq.min(max_attention_lane);
+                                    if batch_lane_capacity == 0 {
                                         eprintln!(
-                                            "[daemon] continuous batch requested but LFM MoE not supported (dense only) — fallback to sequential"
-                                        );
-                                    } else if let Err(reason) =
-                                        hipfire_arch_lfm2moe::batch_weight_formats_supported(&bundle.weights)
-                                    {
-                                        eprintln!(
-                                            "[daemon] continuous batch requested but weight formats unsupported: {} — fallback to sequential",
-                                            reason
+                                            "[daemon] continuous batch unavailable: independent attention admits no lanes — fallback to sequential"
                                         );
                                     } else {
-                                        let repeat_cap = 2048usize.max(1);
-                                        let max_attention_lane = gpu
-                                            .attention_q8_0_kv_independent_max_lane_capacity(
-                                                bundle.config.head_dim,
-                                            );
-                                        let batch_lane_capacity = m.max_seq.min(max_attention_lane);
-                                        if batch_lane_capacity == 0 {
+                                        if batch_lane_capacity < m.max_seq {
                                             eprintln!(
-                                                "[daemon] continuous batch unavailable: independent attention admits no lanes — fallback to sequential"
+                                                "[daemon] continuous batch lane capacity clamped: requested={} supported={}",
+                                                m.max_seq,
+                                                batch_lane_capacity
                                             );
-                                        } else {
-                                            if batch_lane_capacity < m.max_seq {
-                                                eprintln!(
-                                                    "[daemon] continuous batch lane capacity clamped: requested={} supported={}",
-                                                    m.max_seq,
-                                                    batch_lane_capacity
-                                                );
-                                            }
-                                            match hipfire_arch_lfm2moe::batch::Lfm2DecodeBatchState::new(
-                                                gpu,
-                                                &bundle.config,
-                                                requested,
-                                                batch_lane_capacity,
-                                                repeat_cap,
-                                            ) {
-                                                Ok(batch_state) => {
-                                                    m.lfm2_decode_batch = Some(batch_state);
+                                        }
+                                        // Clone config for the call so the immutable borrow ends before the mutable one.
+                                        let cfg = m.lfm2moe().unwrap().config.clone();
+                                        match hipfire_arch_lfm2moe::batch::Lfm2DecodeBatchState::new(
+                                            gpu,
+                                            &cfg,
+                                            requested,
+                                            batch_lane_capacity,
+                                            repeat_cap,
+                                        ) {
+                                            Ok(batch_state) => {
+                                                if let Some(b) = m.lfm2moe_mut() {
+                                                    b.lfm2_decode_batch = Some(batch_state);
                                                     out.slots = requested;
  out.lane_capacity = batch_lane_capacity;
                                                     out.capable = true;
@@ -194,17 +209,19 @@ pub fn stage_continuous_batch(
                                                         batch_lane_capacity,
                                                         repeat_cap
                                                     );
+                                                } else {
+                                                    // Should be unreachable (we checked is_some above), but free to avoid leak.
+                                                    batch_state.free_gpu(gpu);
+                                                    eprintln!("[daemon] continuous batch requested but model state not Lfm2Moe — fallback to sequential");
                                                 }
-                                                Err(e) => {
-                                                    eprintln!(
-                                                        "[daemon] continuous batch allocation failed: {e} — fallback to sequential"
-                                                    );
-                                                }
+                                            }
+                                            Err(e) => {
+                                                eprintln!(
+                                                    "[daemon] continuous batch allocation failed: {e} — fallback to sequential"
+                                                );
                                             }
                                         }
                                     }
-                                } else {
-                                    eprintln!("[daemon] continuous batch requested but model state not Lfm2Moe — fallback to sequential");
                                 }
                                 }
                                 None => {

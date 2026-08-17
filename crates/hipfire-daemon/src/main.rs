@@ -1756,7 +1756,11 @@ fn main() {
                             .map(|b| b.weights.mtp_layer.is_some() || b.weights.dspark.is_some())
                             .unwrap_or(false);
                         m.mtp_weights_present =
-                            ds4_mtp || m.qwen35_mtp_head.is_some() || m.mtp_weights_present;
+                            // `mtp_weights_present` is set by the loader to exactly
+                            // `qwen35_mtp_head.is_some()`, so the old middle term was
+                            // redundant AND required the daemon to name an arch crate it
+                            // does not depend on.
+                            ds4_mtp || m.mtp_weights_present;
 
                         // ── Optional DPM stabilization (perf instrumentation) ──
                         //
@@ -2414,10 +2418,9 @@ fn main() {
                     // from a clean KV state.
                     //
                     // Must mirror the "reset" command handler (line ~2098).
-                    // VL only runs on qwen35-vl (arch_id 5/8), so
-                    // qwen2_state, deepseek4_state, and llama_kv are
-                    // None — but clear them anyway for defense-in-depth
-                    // in case a future arch adds VL support.
+                    // VL only runs on qwen35-vl (arch_id 5|6) and dots-ocr (arch_id 8), so
+                    // deepseek4_state and llama_kv are None — but clear them anyway
+                    // for defense-in-depth in case a future arch adds VL support.
                     if m.seq_pos > 0 {
                         eprintln!("[daemon/vl] non-zero seq_pos ({}) at VL dispatch — resetting conversation", m.seq_pos);
                         m.seq_pos = 0;
@@ -2460,15 +2463,9 @@ fn main() {
                         if let Some(b) = m.llama_mut() {
                             b.kv.compact_offset = 0;
                         }
-                        if let Some(ref mut s) = m.qwen2_state {
-                            s.reset();
-                        }
                         if let Some(b) = m.dots_ocr_mut() {
                             b.state.reset();
                         }
-                        // Live plain-qwen2 state is in the qwen2 arch bundle
-                        // (not the (dots-ocr-only) qwen2_state field) —
-                        // rewind it too for defense-in-depth.
                         if let Some(b) = m.qwen2_mut() {
                             b.state.reset();
                         }
@@ -3335,14 +3332,6 @@ fn main() {
                 m.seq_pos = 0;
                 m.conversation_tokens.clear();
                 let _ = hipfire_generate::common::reset_qwen35_recurrent(m, &mut gpu);
-                // Qwen2 (arch_id=7) doesn't have a separate KV buffer — the cache
-                // and the per-step scratch share `Qwen2State`. Reset its position
-                // cursor here so bench_prefill measures cold prefill. The live
-                // state is in the qwen2 arch bundle; `qwen2_state` is only
-                // dots-ocr's — rewind both, else this measures warm prefill.
-                if let Some(ref mut s) = m.qwen2_state {
-                    s.reset();
-                }
                 if let Some(st) = m.state.as_mut() {
                     let key = st.as_ref().arch_key();
                     let _ = st.as_mut().reset_session_state(&mut gpu);

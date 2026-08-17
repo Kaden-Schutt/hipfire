@@ -68,15 +68,19 @@ impl ArchModel for Deepseek4Bundle {
     }
 
     fn free_gpu(self: Box<Self>, gpu: &mut Gpu) {
-        // Mirrors unload_model's ModelState::Deepseek4 arm:
-        //   lib.rs:3073-3076  b.state.free_gpu(gpu); b.weights.free_gpu(gpu);
-        // Order: state first, then weights. Config/eos are plain drops.
-        // deepseek4_pbs lives outside the bundle on LoadedModel and is
-        // freed separately by unload_model; not owned here.
+        // Mirrors unload_model's former Deepseek4 arm plus the separate pbs free:
+        //   state -> weights -> pbs. Config/eos are plain drops. pbs is now owned
+        //   by the bundle (moved from LoadedModel) so it must be freed here.
         let Deepseek4Bundle {
-            state, weights, ..
+            state,
+            weights,
+            pbs,
+            ..
         } = *self;
         state.free_gpu(gpu);
         weights.free_gpu(gpu);
+        if let Some(pbs) = pbs {
+            pbs.free_gpu(gpu);
+        }
     }
 }

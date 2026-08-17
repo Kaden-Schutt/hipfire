@@ -608,22 +608,24 @@ pub fn redline_reset_deepseek4(
 pub fn redline_prime_deepseek4(
     gpu: &mut rdna_compute::Gpu,
     bundle: &mut deepseek4::Deepseek4Bundle,
-    pbs: &mut deepseek4::forward::PrefillBatchScratch,
     context: usize,
 ) -> Result<(), String> {
     let synthetic = (0..context as u32)
         .map(|index| 10 + (index % 1000))
         .collect::<Vec<_>>();
-    deepseek4::forward::forward_prefill_batch_chunked(
-        &bundle.config,
-        &bundle.weights,
-        &mut bundle.state,
-        gpu,
-        &synthetic,
-        0,
+    // Split bundle fields disjointly: pbs + state vs config/weights.
+    let deepseek4::Deepseek4Bundle {
+        config,
+        weights,
+        state,
         pbs,
+        ..
+    } = bundle;
+    let pbs = pbs.as_mut().ok_or_else(|| "DeepSeek4 prefill scratch missing".to_string())?;
+    deepseek4::forward::forward_prefill_batch_chunked(
+        config, weights, state, gpu, &synthetic, 0, pbs,
     )?;
-    bundle.state.n_tokens = context as u64;
+    state.n_tokens = context as u64;
     gpu.hip
         .device_synchronize()
         .map_err(|error| error.to_string())
@@ -664,12 +666,8 @@ pub fn redline_prime_retained_fixture(
         (s.as_mut() as &mut dyn Any)
             .downcast_mut::<deepseek4::Deepseek4Bundle>()
     }) {
-        let pbs = loaded
-            .deepseek4_pbs
-            .as_mut()
-            .ok_or_else(|| "DeepSeek4 prefill scratch missing".to_string())?;
         redline_reset_deepseek4(gpu, bundle)?;
-        redline_prime_deepseek4(gpu, bundle, pbs, context)
+        redline_prime_deepseek4(gpu, bundle, context)
     } else if let Some(bundle) = loaded.state.as_mut().and_then(|s| {
         (s.as_mut() as &mut dyn Any)
             .downcast_mut::<lfm2moe::Lfm2MoeBundle>()
@@ -877,15 +875,11 @@ pub fn redline_bench_decode_deepseek4(
 
     loaded.seq_pos = 0;
     loaded.conversation_tokens.clear();
-    let pbs = loaded
-        .deepseek4_pbs
-        .as_mut()
-        .ok_or_else(|| "DeepSeek4 prefill scratch missing".to_string())?;
     let Some(bundle) = loaded.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_deepseek4::Deepseek4Bundle>()) else {
         unreachable!()
     };
     redline_reset_deepseek4(gpu, bundle)?;
-    redline_prime_deepseek4(gpu, bundle, pbs, context)
+    redline_prime_deepseek4(gpu, bundle, context)
         .map_err(|error| format!("bench_decode prefill prime failed: {error}"))?;
     loaded.seq_pos = context;
 
@@ -1487,14 +1481,9 @@ pub fn redline_prime_dspark_shadow_arm(
     loaded: &mut LoadedModel,
     context: usize,
 ) -> Result<(), String> {
-    let pbs = loaded
-        .deepseek4_pbs
-        .as_mut()
-        .ok_or_else(|| "DSpark shadow: prefill scratch missing".to_string())?;
     let bundle = match loaded.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_deepseek4::Deepseek4Bundle>()) { Some(bundle) => bundle, None => return Err("DSpark shadow requires DeepSeek4".to_string()), };
     redline_reset_deepseek4(gpu, bundle)?;
-    redline_prime_deepseek4(gpu, bundle, pbs, context)?;
-    bundle.state.n_tokens = context as u64;
+    redline_prime_deepseek4(gpu, bundle, context)?;
     Ok(())
 }
 

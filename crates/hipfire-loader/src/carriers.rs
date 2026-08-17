@@ -319,6 +319,8 @@ fn load_qwen35_pp(
     )
     .map_err(|e| format!("{e}"))?;
     let bundle = hipfire_arch_qwen35::Qwen35Bundle {
+        // Moved off LoadedModel: per-arch state belongs to the arch bundle.
+        qwen35_mtp_head: None,
         config,
         weights,
         scratch: single_scratch,
@@ -329,6 +331,7 @@ fn load_qwen35_pp(
         pp_scratch_set: Some(scratch_set),
         vision_config: None,
         vision_weights: None,
+        qwen35_decode_batch: None,
     };
     Ok(LoadedModel {
         state: Some(Box::new(bundle)),
@@ -651,6 +654,8 @@ impl Carrier for Qwen35Carrier {
                     }
                 };
                 let bundle = hipfire_arch_qwen35::Qwen35Bundle {
+        // Moved off LoadedModel: per-arch state belongs to the arch bundle.
+        qwen35_mtp_head: None,
                     config,
                     weights,
                     scratch,
@@ -661,6 +666,7 @@ impl Carrier for Qwen35Carrier {
                     pp_scratch_set: None,
                     vision_config: None,
                     vision_weights: None,
+                    qwen35_decode_batch: None,
                 };
                 Ok(LoadedModel {
                     state: Some(Box::new(bundle)),
@@ -1130,11 +1136,8 @@ impl Carrier for Deepseek4Carrier {
         n: usize,
         _prefill_err: &mut Option<String>,
     ) -> Option<bool> {
-        let pbs = m
-            .deepseek4_pbs
-            .as_mut()
-            .expect("deepseek4_pbs missing on arch_id=9 bench_prefill");
         let b = m.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_deepseek4::Deepseek4Bundle>()).unwrap();
+        let pbs = b.pbs.as_mut().expect("deepseek4_pbs missing on arch_id=9 bench_prefill");
         let config = &b.config;
         let weights = &b.weights;
         let state = &mut b.state;
@@ -1264,9 +1267,9 @@ impl Carrier for Deepseek4Carrier {
                 weights,
                 state,
                 eos_tok,
+                pbs: Some(pbs),
             })),
             speculator,
-            deepseek4_pbs: Some(pbs),
             ..LoadedModel::skeleton(
                 meta.arch_id,
                 meta.tokenizer,
