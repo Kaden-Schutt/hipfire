@@ -35,11 +35,11 @@ at a fixed ~2 bpw:
 | spe-mq2-uniform | 2.25 | uniform 4-level | yes | 3.9225 | 472.05 |
 | spe-tq2-awqim | 2.125 | uniform 3-level + imatrix | no | 2.2418 | 86.57 |
 | **spe-mq2-lloyd** | **2.25** | **Lloyd-Max non-uniform** | **yes** | **0.6125** | **17.04** |
+| bonsai-ternary (PrismML) | 2.125 | uniform 3-level + *their transform* | no | 0.5363 | 16.69 |
 
-`spe-mq2-lloyd` also **generates coherently** (clean reasoning trace -> "Paris"),
+`spe-mq2-lloyd` also **generates coherently** (clean reasoning trace → "Paris"),
 unlike either ternary arm — checked because KLD alone is not sufficient (the
 2.24 ternary arm looked respectable and still collapsed to an immediate EOS).
-| bonsai-ternary (PrismML) | 2.125 | uniform 3-level + *their transform* | no | 0.5363 | 16.69 |
 
 **A plain PTQ with a non-uniform per-block codebook lands within noise of
 PrismML's proprietary transform** (0.61 vs 0.54 — Bonsai's CI is 0.4223-0.6715,
@@ -110,12 +110,19 @@ Bonsai. This is the headline caveat: a mid-range KLD does not imply usability,
 and no arm here should be reported as "close to Bonsai" on the strength of the
 number alone. **Always pair the KLD with a generation smoke.**
 
-**4. PrismML's transform is doing the essential work.** Their *1-bit* model
-(0.629) beats our best *2-bit* PTQ (2.242) by 3.6× while using half the bits,
-and theirs generate while ours do not. The 27B whitepaper's claim that the
-behaviour-preserving transform — not the packing — is the value is consistent
-with everything measured here. SP-E's original premise (reproduce the transform)
-is not reachable by scale-and-importance tuning alone.
+**4. The limitation is the wire format's fixed level set, not PrismML's
+transform.** An earlier draft of this document concluded the opposite — that
+the behaviour-preserving transform was doing the essential work and plain PTQ
+could not approach it. The codebook controls refute that: `mq2lloyd` reaches
+KLD 0.612 and generates, against Bonsai's 0.536, at the same bit budget with no
+transform. What our ternary arms were fighting is that Q2_0/Q1_0 pin the levels
+to `{-d, 0, +d}` and leave the encoder only `d`.
+
+Bonsai's remaining edge over `mq2lloyd` is 0.08 nats — inside the n=8 CI — at
+0.125 fewer bpw and a 20% smaller artifact. Real, but a size/packing edge
+rather than a quality tier. Their *1-bit* model (0.629) is the more impressive
+result: nothing we produce at 1 bit is usable (7.998 best), and that gap is
+not explained by codebook choice.
 
 ## Port fidelity — hipfire vs llama.cpp on byte-identical weights
 
