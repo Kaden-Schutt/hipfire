@@ -2559,36 +2559,45 @@ def run(cfg, args):
         summary += f" ngram={sa}/{sd}@{rate:.2f}"
     print(summary, flush=True)
 
-    # Coherence is ASSERTED, not merely printed.
+    # Coherence is ASSERTED, not merely printed -- but only for `attractor`.
     #
-    # runaway / empty / attractor are the harness's own judgement that generation
-    # went wrong -- LENGTH-truncated runaway, empty output, single-token attractor.
-    # Until 2026-08-16 they were counted into the summary line above and the
+    # Until 2026-08-16 all three flags were folded into the summary above and the
     # process exited 0 regardless, so a battery could print `attractor=2` and pass.
-    # The lfm2.5-8b-a1b `</think>` attractor found during the saddle work is
-    # exactly that shape: statistically unremarkable, obviously broken to a reader,
-    # invisible to the gate. AGENTS.md has said "read the decoded text, numbers
-    # alone never prove coherence" the whole time; this makes the tool obey it.
     #
-    # HIPFIRE_SERVE_ALLOW_INCOHERENT=1 opts out for deliberately characterising a
-    # known-bad model, and prints what it forgave rather than staying silent.
-    _incoherent = {
-        "runaway": sum(r["runaway"] for r in g),
-        "empty": sum(r["empty"] for r in g),
-        "attractor": sum(r["attractor"] for r in g),
-    }
-    if any(_incoherent.values()):
-        _detail = ", ".join(f"{k}={v}" for k, v in _incoherent.items() if v)
+    # Only `attractor` is fatal, and the first version of this gate got that wrong
+    # by failing on all three. Reading the decoded text is what corrected it:
+    #
+    #   [code]t1 finish=length gen=192 (think 103/ans 25w) !RUNAWAY | '```python...
+    #
+    # `runaway` is `finish == "length"` -- the turn hit max_tokens. That turn
+    # produced real Python and was truncated because 103 of its 192 tokens went to
+    # thinking. `empty` on the same run was the same budget problem: 150 words of
+    # think, zero visible answer, finish=None. Both are fixture configuration, not
+    # defects, and failing on them breaks every tight-budget benchmark -- qwen3.8
+    # and muse-glimmer, both healthy, tripped it on hiptrx.
+    #
+    # `attractor` is the one signal a token budget cannot explain: the model is
+    # emitting a degenerate repeated token. That is the lfm2.5-8b-a1b `</think>`
+    # shape -- statistically unremarkable, obviously broken to a reader.
+    #
+    # HIPFIRE_SERVE_ALLOW_INCOHERENT=1 opts out and prints what it forgave.
+    _n_attractor = sum(r["attractor"] for r in g)
+    if _n_attractor:
+        _ctx = (
+            f"attractor={_n_attractor}"
+            f" (runaway={sum(r['runaway'] for r in g)},"
+            f" empty={sum(r['empty'] for r in g)} — reported, not fatal)"
+        )
         if os.environ.get("HIPFIRE_SERVE_ALLOW_INCOHERENT") == "1":
             print(
-                f"[{label}] INCOHERENT ({_detail}) — forgiven by "
+                f"[{label}] ATTRACTOR {_ctx} — forgiven by "
                 f"HIPFIRE_SERVE_ALLOW_INCOHERENT=1",
                 flush=True,
             )
         else:
             raise SystemExit(
-                f"serve_harness: {label} produced incoherent output ({_detail}) "
-                f"across {len(g)} turn(s). Read the decoded text above. Set "
+                f"serve_harness: {label} produced a token attractor across "
+                f"{len(g)} turn(s): {_ctx}. Read the decoded text above. Set "
                 f"HIPFIRE_SERVE_ALLOW_INCOHERENT=1 to characterise a known-bad "
                 f"model on purpose."
             )

@@ -138,6 +138,44 @@ ROUTES: dict[str, Route] = {
         "Whitespace/conflict-marker hygiene for docs-only edits "
         "(docs/VALIDATION.md documentation checks).",
     ),
+    "unit.arch-gemma4": _R(
+        "unit.arch-gemma4",
+        "unit",
+        ("cargo", "test", "-p", "hipfire-arch-gemma4", "--lib", "--", "--quiet"),
+        0.4,
+        "hipfire-arch-gemma4 lib unit tests.",
+    ),
+    "unit.arch-muse-glimmer": _R(
+        "unit.arch-muse-glimmer",
+        "unit",
+        ("cargo", "test", "-p", "hipfire-arch-muse-glimmer", "--lib", "--", "--quiet"),
+        0.4,
+        "hipfire-arch-muse-glimmer lib unit tests.",
+    ),
+    "serve.battery.gemma4-12b": _R(
+        "serve.battery.gemma4-12b",
+        "serve",
+        _serve(max_tokens=256),
+        5.0,
+        "Gemma4 dense AR coherence. Until 2026-08-16 a change anywhere in "
+        "crates/hipfire-arch-gemma4/** selected ZERO routes -- no unit test, no "
+        "serve battery, nothing. Fixture is the 12B: gemma4-31b-it.mq4 panics at "
+        "load with `tensor not found: layers.0.self_attn.q_proj.bias` "
+        "(weight_backend.rs:1018), a pre-existing optional-bias gap unrelated to "
+        "this route.",
+        models=("gemma4-12b-it.mq4",),
+    ),
+    "serve.battery.muse-glimmer": _R(
+        "serve.battery.muse-glimmer",
+        "serve",
+        _serve(max_tokens=256),
+        6.0,
+        "Muse-Glimmer AR coherence. Same gap as gemma4: the crate selected zero "
+        "routes before 2026-08-16. Glimmer's bundle is loader-defined, so its "
+        "ArchModel impl lives in hipfire-loader and a loader change can break it "
+        "without touching the arch crate -- the surface rule covers both.",
+        models=("muse-glimmer-30b.mq4r",),
+    ),
     "unit.leanup-ratchets": _R(
         "unit.leanup-ratchets",
         "shell",
@@ -882,6 +920,22 @@ RULES: tuple[Rule, ...] = (
         surface="crates/hipfire-quantize/**",
         route_ids=("unit.hipfire-quantize", "serve.battery.qwen35-4b"),
         reason="Quantize tooling can break pack/load shapes → unit + one dense MQ4 smoke.",
+    ),
+    Rule(
+        surface="crates/hipfire-arch-gemma4/**",
+        route_ids=("unit.arch-gemma4", "serve.battery.gemma4-12b"),
+        reason=(
+            "Gemma4 selected no routes at all before 2026-08-16 -- a change here "
+            "ran nothing. Dense AR path plus the E-series drafter wiring."
+        ),
+    ),
+    Rule(
+        surface="crates/hipfire-arch-muse-glimmer/**",
+        route_ids=("unit.arch-muse-glimmer", "serve.battery.muse-glimmer"),
+        reason=(
+            "Muse-Glimmer selected no routes at all before 2026-08-16. Its bundle "
+            "is loader-defined, so pair this with the loader surface."
+        ),
     ),
     Rule(
         surface="crates/hipfire-daemon/**",
