@@ -166,3 +166,59 @@ identical KLD (0.066668) — a no-op that the metrics do not reveal.
 4. **`ssm_out`/`ssm_in` naming.** These are the DeltaNet / linear-attention
    projections on Qwen3.8, not a Mamba-style SSM. The class names come from the
    Q8-protection class table, not from the architecture.
+
+---
+
+## Amendment — decode measured; open gap 1 closed
+
+Measured on hiptrx `gfx1201` (34.2 GB VRAM, HIP 7.14, arch `qwen3_5`) via
+`hipfire bench --runs 5`, `max_tokens` 128, batch 1, bench binary md5 prefix
+`8cca7887e33c`. Each arm's on-disk size was asserted against the ladder before
+benching (all `SIZE_OK`).
+
+| arm | Q8 classes | size | KLD | decode tok/s | prefill tok/s | ttft ms |
+|---|---|---|---|---|---|---|
+| `ctl2` | head + `ssm_out` | 16.464 GB | 0.036746 | **33.20** | 396.3 | 60.6 |
+| `attnfull` | head + `ssm_out` + `attn_full` | 17.355 GB | 0.033862 | **31.70** | 383.0 | 62.7 |
+| `ssmin` | head + `ssm_out` + `ssm_in` | 18.614 GB | 0.030479 | **29.70** | 355.7 | 67.5 |
+
+Per-run decode samples: `ctl2` [33.2 ×5]; `attnfull` [31.8, 31.8, 31.7, 31.7,
+31.7]; `ssmin` [29.7 ×5].
+
+**`ctl2` independently reproduces the previously recorded 33.10 tok/s at 33.20**,
+which cross-validates the earlier figure and the harness.
+
+### The [INFERENCE] estimate was sound
+
+The original record predicted the winner at `33.10 × 16.464 / 18.614 ≈ 29.3`
+tok/s by naive byte scaling. **Measured: 29.70**, i.e. +1.1% against a prediction
+derived purely from size. Decode on this path is bandwidth-bound to within about
+a percent, so on this model family Q8-class size can be used to predict decode
+cost before paying to build an arm.
+
+### The real trade at the top of the ladder
+
+| step from `ctl2` | KLD | decode | size |
+|---|---|---|---|
+| → `attnfull` | **+7.8% better** | −4.5% | +5.4% |
+| → `ssmin` (best KLD) | **+17.1% better** | −10.5% | +13.1% |
+
+Quality gained per percent of decode surrendered: `attnfull` 1.73, `ssmin` 1.63.
+`attnfull` is marginally the more efficient exchange; `ssmin` buys more absolute
+quality and is the quality-first pick. The choice is a genuine product tradeoff,
+not a dominance relation — **the best-KLD arm costs 10.5% of decode throughput
+and 2.15 GB against the arm two rungs down.**
+
+### Caveat on the spread
+
+Every arm reports `stdev = 0.0` with samples identical to the reported median.
+This campaign's standing rule is that a suspiciously tight spread is a warning,
+not reassurance. Here it is benign and explained: `hipfire bench` rounds
+`decode_tok_s` to 0.1, and AR decode at batch 1 on a bandwidth-bound path is
+deterministic, so five runs land in the same 0.1 bucket. The `attnfull` samples
+(31.8, 31.8, 31.7, 31.7, 31.7) show the quantization boundary being crossed,
+confirming the values are measured rather than cached. This reasoning does **not**
+transfer to spec-decode `tau`, where a tight spread remains a red flag.
+
+Open gaps 2–4 from the original record (imatrix GGUF unhashed; prose-only
+scoring for the ladder; `ssm_out`/`ssm_in` naming) remain open.
