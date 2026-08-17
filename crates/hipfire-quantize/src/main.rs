@@ -5863,24 +5863,27 @@ mod bq1g128_gptq_tests {
 /// Returns `Err(message)` when the target is a low-bit PTQ target and the
 /// caller has not opted in. Pure, so it is testable; `main` owns the exit.
 ///
-/// 2 bpw PTQ is a measured collapse regime on this family, established three
-/// times independently:
-///   * `--format mq2` (uniform 4-level, rotated) is already reserved in-tree:
-///     "collapse on every model size validated locally (0.8B / 4B / 9B Qwen 3.5
-///     -> multilingual mojibake)".
-///   * `--format mq2-lloyd` (NON-uniform codebook, rotated) is research-only —
-///     it lifts uniform MQ2 by 41-55x ppl and is "still collapse" (9B ppl 2163
-///     vs MQ4 10, MQ3 42). Codebook shape is not the missing ingredient.
-///   * SP-E (2026-08-17): mq4 -> ternary at 27B scored KLD 5.10 and generated
-///     multilingual token soup; with an AWQ-derived imatrix, KLD 2.24 and an
-///     immediate EOS. Neither is a usable model.
+/// The problem is the CODEBOOK, not the bit budget. Measured on
+/// qwen3.6-27b (SP-E 2026-08-17, 8 chunks, KLD vs the mq4 teacher):
 ///
-/// What works at these widths is a behaviour-preserving weight transform
-/// applied BEFORE quantization: PrismML's Bonsai scores KLD 0.536 and generates
-/// fluently in this very format. So the supported ternary/binary path is
-/// byte-verbatim passthrough of an already-transformed source (the GGUF arm),
-/// not re-quantizing an ordinary checkpoint down. Research is still legitimate,
-/// hence the opt-in — matching how `mq2` and `mq2-lloyd` are gated.
+///   | target                              | bpw   | KLD   | PPL    |
+///   |-------------------------------------|-------|-------|--------|
+///   | ternary, uniform 3-level, unrotated  | 2.125 | 5.10  | 1436   |  token soup
+///   | ternary + AWQ imatrix                | 2.125 | 2.24  |   86.6 |  immediate EOS
+///   | MQ2 uniform 4-level, rotated         | 2.25  | 3.92  |  472   |
+///   | MQ2-LLOYD (non-uniform, rotated)     | 2.25  | 0.61  |   17.0 |  usable
+///   | PrismML Bonsai ternary (transformed) | 2.125 | 0.54  |   16.7 |
+///
+/// So ~2 bpw is NOT inherently hopeless: a non-uniform per-block codebook plus
+/// the FWHT rotation lands within noise of PrismML's proprietary transform.
+/// What collapses is the uniform, unrotated level set that the Q2_0/Q1_0 wire
+/// format fixes — `{-d, 0, +d}` leaves the encoder only `d` to choose, and no
+/// amount of scale search or importance weighting recovers it.
+///
+/// Hence: ternary/binary are supported as byte-verbatim passthrough of an
+/// already-transformed source (the GGUF arm), and `--format mq2lloyd` is the
+/// answer for ~2 bpw from an ordinary checkpoint. Research on low-bit PTQ is
+/// still legitimate, hence the opt-in.
 fn lowbit_ptq_gate(format: GgufFormat, allowed: bool) -> Result<(), String> {
     if allowed || !matches!(format, GgufFormat::Ternary | GgufFormat::Binary) {
         return Ok(());
@@ -5891,20 +5894,27 @@ fn lowbit_ptq_gate(format: GgufFormat, allowed: bool) -> Result<(), String> {
         "2.125"
     };
     Err(format!(
-        "error: --input <.hfq> --format {} re-quantizes an ordinary checkpoint down to \
-         {bpw} bpw, which is a MEASURED collapse regime — not a supported build.\n\
+        "error: --input <.hfq> --format {} re-quantizes an ordinary checkpoint into a \
+         UNIFORM {bpw}-bpw level set, which is a measured collapse — not a supported \
+         build.\n\
          \n\
-         Evidence: uniform MQ2 is reserved in-tree (\"collapse on every model\"); \
-         MQ2-Lloyd's non-uniform codebook lifts it 41-55x ppl and is still collapse \
-         (9B ppl 2163 vs MQ4 10); SP-E measured mq4->ternary at 27B as KLD 5.10 \
-         (multilingual token soup), or KLD 2.24 with an AWQ imatrix (immediate EOS).\n\
+         Measured on qwen3.6-27b (KLD vs the mq4 teacher, 8 chunks):\n\
+         \x20 ternary uniform            2.125 bpw  KLD 5.10  PPL 1436   (token soup)\n\
+         \x20 ternary + AWQ imatrix      2.125 bpw  KLD 2.24  PPL   86.6 (immediate EOS)\n\
+         \x20 mq2lloyd (non-uniform)     2.25  bpw  KLD 0.61  PPL   17.0 (usable)\n\
+         \x20 PrismML Bonsai ternary     2.125 bpw  KLD 0.54  PPL   16.7\n\
          \n\
-         Ternary/binary ship coherently ONLY as byte-verbatim passthrough of a source \
-         that already went through a behaviour-preserving transform (e.g. PrismML \
-         Bonsai Q2_0/Q1_0, KLD 0.536) — convert that GGUF directly instead.\n\
+         The bit budget is NOT the problem — the fixed uniform level set is. Q2_0/Q1_0 \
+         leave the encoder only the block scale to choose, and no scale search or \
+         importance weighting recovers it.\n\
+         \n\
+         For ~2 bpw from an ordinary checkpoint use --format mq2lloyd instead. \
+         Ternary/binary ship coherently as byte-verbatim passthrough of an \
+         already-transformed source (PrismML Bonsai Q2_0/Q1_0) — convert that GGUF \
+         directly.\n\
          \n\
          To do it anyway for research, pass --allow-lowbit-ptq or set \
-         HIPFIRE_ALLOW_LOWBIT_PTQ=1. Don't ship the artifacts to users.",
+         HIPFIRE_ALLOW_LOWBIT_PTQ=1.",
         format.label(),
     ))
 }
@@ -6685,13 +6695,18 @@ mod hfq_requant_pipeline_tests {
     }
 
     /// Ternary/binary requant of an ordinary checkpoint is gated (measured
-    /// collapse regime); the GGUF passthrough path and all other targets are
-    /// not. Matches how `mq2` / `mq2-lloyd` are handled.
+    /// collapse); the GGUF passthrough path and all other targets are not.
     #[test]
     fn lowbit_ptq_gate_blocks_only_ternary_binary_and_only_without_opt_in() {
         for fmt in [GgufFormat::Ternary, GgufFormat::Binary] {
             let err = lowbit_ptq_gate(fmt, false).expect_err("must be gated by default");
-            assert!(err.contains("collapse regime"), "explains why: {err}");
+            assert!(err.contains("collapse"), "explains what goes wrong: {err}");
+            // Must point at the target that DOES work at ~2 bpw rather than
+            // just refusing — mq2lloyd measured KLD 0.61 vs this path's 2.24.
+            assert!(
+                err.contains("mq2lloyd"),
+                "names the working alternative: {err}"
+            );
             assert!(
                 err.contains("--allow-lowbit-ptq"),
                 "names the opt-in: {err}"

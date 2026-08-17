@@ -23,6 +23,38 @@ FP16 — an arm cannot score below the teacher's own quantization error.
 Reference points: the mq4 teacher scores NLL ≈ 2.00 on this slice; uniform over
 the 248320-token vocab is NLL 11.9 / KLD ≈ 12.
 
+## Codebook controls — the decisive comparison
+
+Added after the first pass, because the first pass drew the wrong conclusion.
+Same source, same teacher, same slice; only the **codebook and rotation** vary
+at a fixed ~2 bpw:
+
+| target | bpw | codebook | rotated | KLD | PPL |
+|---|---|---|---|---:|---:|
+| spe-tq2-sweep | 2.125 | uniform 3-level | no | 5.1007 | 1436.38 |
+| spe-mq2-uniform | 2.25 | uniform 4-level | yes | 3.9225 | 472.05 |
+| spe-tq2-awqim | 2.125 | uniform 3-level + imatrix | no | 2.2418 | 86.57 |
+| **spe-mq2-lloyd** | **2.25** | **Lloyd-Max non-uniform** | **yes** | **0.6125** | **17.04** |
+| bonsai-ternary (PrismML) | 2.125 | uniform 3-level + *their transform* | no | 0.5363 | 16.69 |
+
+**A plain PTQ with a non-uniform per-block codebook lands within noise of
+PrismML's proprietary transform** (0.61 vs 0.54). No transform, no calibration
+corpus, no GPU pass — just Lloyd-Max centroids plus the FWHT rotation that
+hipfire's MQ formats already carry.
+
+This overturns the first pass's reading. **~2 bpw is not the problem; the fixed
+uniform level set is.** The Q2_0/Q1_0 wire format pins levels to `{-d, 0, +d}`,
+leaving the encoder only `d` to choose — and no amount of scale search
+(5.10) or importance weighting (2.24) recovers what a free codebook gets
+(0.61). Rotation alone is worth little (5.10 → 3.92); the non-uniform codebook
+is what matters.
+
+It also puts a bound on how much of Bonsai's advantage is the proprietary
+transform: on this evidence, most of it is reachable with a better codebook at
+the same bit budget. Note the in-tree gate for `mq2-lloyd` records "still
+collapse (9B ppl 2163)" — that verdict does not reproduce here at 27B, so it is
+either model-size-specific or stale.
+
 ## Findings
 
 **1. The AWQ sidecars are a usable imatrix, and worth 2.3× at 2 bits.**
