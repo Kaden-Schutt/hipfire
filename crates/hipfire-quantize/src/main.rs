@@ -904,7 +904,7 @@ fn cpu_fwht_256(x: &mut [f32], signs1: &[f32], signs2: &[f32]) {
 fn cpu_ifwht_256(x: &mut [f32], signs1: &[f32], signs2: &[f32]) {
     assert!(x.len() == 256);
     let scale = 0.0625; // 1/16, matches cpu_fwht_256
-    // Undo the trailing `x[i] *= scale * signs2[i]`.
+                        // Undo the trailing `x[i] *= scale * signs2[i]`.
     for i in 0..256 {
         x[i] *= signs2[i] / scale;
     }
@@ -1095,7 +1095,10 @@ mod dequant_mq4g256_tests {
             den += (orig[i] as f64) * (orig[i] as f64);
         }
         let rel_l2 = (num / den).sqrt();
-        assert!(rel_l2 < 0.2, "relative L2 error {rel_l2} too high for 4-bit");
+        assert!(
+            rel_l2 < 0.2,
+            "relative L2 error {rel_l2} too high for 4-bit"
+        );
     }
 }
 
@@ -2589,6 +2592,34 @@ mod awq_tests {
                 y_ref[i],
                 rel
             );
+        }
+    }
+
+    /// `awq_col_weights` inverts `compute_awq_scales`: an AWQ-pre-scaled
+    /// checkpoint carries its own imatrix, recoverable up to a per-tensor
+    /// constant (which the GPTQ packers' argmin is invariant to).
+    #[test]
+    fn awq_col_weights_recovers_imatrix_up_to_constant() {
+        for &alpha in &[0.3f32, 0.55, 0.8, 1.0] {
+            // Wide but non-pathological dynamic range (no clamp rail hits).
+            let in_sum2: Vec<f32> = (1..=64).map(|j| (j as f32).powf(1.7) * 3.0).collect();
+            let s = compute_awq_scales(&in_sum2, alpha);
+            let cw = awq_col_weights(&s, alpha);
+
+            // cw ∝ in_sum2 — check the ratio is constant across channels.
+            let ratios: Vec<f64> = cw
+                .iter()
+                .zip(&in_sum2)
+                .map(|(&c, &v)| c as f64 / v as f64)
+                .collect();
+            let mean = ratios.iter().sum::<f64>() / ratios.len() as f64;
+            for (i, r) in ratios.iter().enumerate() {
+                let rel = (r - mean).abs() / mean;
+                assert!(
+                    rel < 1e-3,
+                    "alpha={alpha}: channel {i} ratio {r} deviates {rel:.2e} from mean {mean}"
+                );
+            }
         }
     }
 
@@ -4315,6 +4346,12 @@ fn quantize_hfq2g128(f32_data: &[f32]) -> Vec<u8> {
 /// the re-quant fallback for non-Q2_0 tensors under `--format ternary` and
 /// the oracle the passthrough path is checked against.
 /// See findings/prismml-q2_0-layout.md for the frozen wire format.
+/// NOT used to encode shipped weights: `d = max|w|` is PrismML's DECODE
+/// convention, not a usable encoder for un-transformed weights (it zeroes
+/// ~85% of a Gaussian block). The requant pipeline routes through the
+/// scale-swept `quantize_tq2g128_gptq` instead; this stays as the byte-exact
+/// format reference (and is reproduced exactly by that packer at factor=1.0).
+#[cfg_attr(not(test), allow(dead_code))]
 fn quantize_tq2g128(f32_data: &[f32]) -> Vec<u8> {
     const GROUP: usize = 128;
     const BLOCK_BYTES: usize = 34;
@@ -4492,9 +4529,19 @@ fn quantize_tq2g128_gptq(f32_data: &[f32], col_weights: &[f32]) -> Vec<u8> {
         // Sweep candidate scales, pick the least imatrix-weighted *decoded*
         // error. factor=1.0 reproduces `quantize_tq2g128` exactly (same codes,
         // same f16 header, same decode), so the winner is always ≤ plain.
+        //
+        // The sweep MUST reach well below 0.6·amax. Levels are {-d, 0, +d} with
+        // nearest-neighbour coding, so a weight survives only when |w| ≥ d/2;
+        // at d = amax over a 128-sample Gaussian block (amax ≈ 2.9σ) that
+        // threshold is ~1.45σ and ~85% of the block is zeroed. The MSE-optimal
+        // 3-level scale for a Gaussian is d ≈ 1.22σ ≈ 0.42·amax (~54% non-zero;
+        // PrismML's own Bonsai ternary runs ~69% non-zero). A sweep floored at
+        // 0.6 bottoms out at ~38% non-zero and never reaches the optimum.
         let mut best_d = amax;
         let mut best_err = f64::INFINITY;
-        for &factor in &[0.6f32, 0.7, 0.8, 0.9, 1.0] {
+        for &factor in &[
+            0.20f32, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.70, 0.80, 0.90, 1.0,
+        ] {
             let d = amax * factor;
             let id = if d > 0.0 { 1.0 / d } else { 0.0 };
             let dd = f16_to_f32(f32_to_f16(d)) as f64; // decode uses the f16 scale
@@ -4585,6 +4632,69 @@ mod tq2g128_gptq_tests {
         assert!(
             weighted_mse(&g, &gptq, &w) <= weighted_mse(&g, &plain, &w) + 1e-9,
             "imatrix-weighted GPTQ error must be ≤ plain packer error"
+        );
+    }
+
+    /// Deterministic standard-normal block (Box–Muller over an LCG) — real
+    /// weights are Gaussian-ish, and the scale sweep must work on THOSE, not
+    /// just on the uniform ramp above (a ramp's `max|w|` is ~1 sigma-equivalent
+    /// so it hides a mis-ranged sweep entirely).
+    fn gaussian_block(n: usize, seed: u32) -> Vec<f32> {
+        let mut state = seed;
+        let mut next = || {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            ((state >> 8) as f32 + 0.5) / ((1u32 << 24) as f32)
+        };
+        (0..n)
+            .map(|_| {
+                let u1: f32 = next();
+                let u2: f32 = next();
+                (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos()
+            })
+            .collect()
+    }
+
+    fn nonzero_fraction(packed: &[u8], n: usize) -> f64 {
+        let info = gguf_input::TensorInfo {
+            name: "nz".to_string(),
+            shape: vec![n],
+            dtype: gguf_input::GgmlType::Q2_0,
+            offset: 0,
+        };
+        let deq = gguf_input::tensor_to_f32(&info, packed);
+        deq.iter().filter(|v| **v != 0.0).count() as f64 / deq.len() as f64
+    }
+
+    /// The ternary level set is `{-d, 0, +d}` with nearest-neighbour coding, so
+    /// a weight survives only when `|w| >= d/2`. With `d = max|w|` over a
+    /// 128-sample Gaussian block (`amax ~ 2.9 sigma`) the threshold lands at
+    /// ~1.45 sigma and ~85% of weights are zeroed — which is exactly what the
+    /// plain packer shipped for qwen3.6-27b (16.3% non-zero measured, vs 69.4%
+    /// for PrismML's own Bonsai ternary).
+    ///
+    /// The MSE-optimal 3-level scale for a Gaussian is `d ~ 1.22 sigma`
+    /// (thresholds at +/-0.61 sigma, ~54% non-zero) = ~0.42 * amax. The sweep
+    /// must therefore reach well below 0.6 * amax.
+    #[test]
+    fn gptq_ternary_scale_sweep_reaches_mse_optimum_on_gaussian() {
+        let g = gaussian_block(128, 12345);
+        let w = vec![1.0f32; 128];
+
+        let plain = quantize_tq2g128(&g);
+        let gptq = quantize_tq2g128_gptq(&g, &w);
+
+        let nz = nonzero_fraction(&gptq, 128);
+        assert!(
+            (0.45..=0.80).contains(&nz),
+            "swept-scale ternary should keep roughly half the weights alive on \
+             Gaussian input (MSE-optimal ~0.54); got non-zero fraction {nz:.3}"
+        );
+
+        let (e_gptq, e_plain) = (weighted_mse(&g, &gptq, &w), weighted_mse(&g, &plain, &w));
+        assert!(
+            e_gptq <= 0.6 * e_plain,
+            "swept scale must substantially beat d=max|w| on Gaussian input; \
+             got gptq={e_gptq:.5} vs plain={e_plain:.5}"
         );
     }
 }
@@ -5490,6 +5600,12 @@ fn quant_type_from_u8(qt: u8) -> QuantType {
 /// passthrough and cannot consume F32). Inverse of `dequant_q1_0`: block is
 /// `[FP16 d][16B sign bits]` = 18 bytes / 128 weights, `d = mean(|w|)` over the
 /// group; bit `j` (LSB-first in byte `j>>3`) is 1 for `w>=0` (+d), 0 for `w<0`.
+/// NOT used to encode shipped weights: `d = max|w|` is PrismML's DECODE
+/// convention, not a usable encoder for un-transformed weights (it zeroes
+/// ~85% of a Gaussian block). The requant pipeline routes through the
+/// scale-swept `quantize_bq1g128_gptq` instead; this stays as the byte-exact
+/// format reference (and is reproduced exactly by that packer at factor=1.0).
+#[cfg_attr(not(test), allow(dead_code))]
 fn quantize_bq1g128(f32_data: &[f32]) -> Vec<u8> {
     const GROUP: usize = 128;
     const BLOCK_BYTES: usize = 18;
@@ -5676,7 +5792,38 @@ mod bq1g128_gptq_tests {
 /// already unrotated and in their runtime-expected precision, so they pass
 /// through byte-verbatim — mirroring how the GGUF ternary/binary pipeline keeps
 /// embeddings at Q8F16 and norms at F16 regardless of `--format`.
-fn run_hfq_requant_pipeline(input_hfq: &Path, output: &Path, format: GgufFormat) {
+/// Per-input-column importance weights for a requantized tensor.
+///
+/// Returns the `--imatrix` row for `name` when one was supplied and its length
+/// is a usable multiple of the 128 group, else all-ones (a pure unweighted-MSE
+/// scale search). The GPTQ packers slice this as
+/// `col_weights[(b % blocks_per_row) * 128 ..][..128]`, so the length must be a
+/// multiple of 128 — an all-ones length-128 vector makes every block reuse the
+/// same (uniform) weights, which is exactly the no-imatrix behaviour.
+fn requant_col_weights(name: &str, k: usize) -> Vec<f32> {
+    if k % 128 == 0 {
+        if let Some(im) = IMATRIX.get() {
+            if let Some(v) = safetensors_to_ggml_name(name).and_then(|g| im.get(&g)) {
+                if v.len() == k {
+                    return v.clone();
+                }
+                eprintln!(
+                    "hfq requant: imatrix row for '{name}' has length {} but K={k}; \
+                     falling back to uniform weights",
+                    v.len()
+                );
+            }
+        }
+    }
+    vec![1.0f32; 128]
+}
+
+fn run_hfq_requant_pipeline(
+    input_hfq: &Path,
+    output: &Path,
+    format: GgufFormat,
+    awq_imatrix_alpha: Option<f32>,
+) {
     // ── Read the source .hfq (mirrors bin/draft_to_mq4.rs::read_hfq — no
     //    cross-bin dependency; the parsing logic is copied here). ──
     let file = File::open(input_hfq).expect("open input .hfq");
@@ -5731,45 +5878,153 @@ fn run_hfq_requant_pipeline(input_hfq: &Path, output: &Path, format: GgufFormat)
     let signs1 = gen_fwht_signs(42, 256);
     let signs2 = gen_fwht_signs(1042, 256);
 
+    // Parse the whole tensor index up front: folding the AWQ scale needs a
+    // weight's sidecar, which may sit anywhere in the index.
+    struct IndexEntry {
+        name: String,
+        qt: u8,
+        shape: Vec<u32>,
+        group_size: u32,
+        off: usize,
+        size: usize,
+    }
+    let mut entries: Vec<IndexEntry> = Vec::with_capacity(n_tensors);
+    {
+        let mut cumulative = data_offset;
+        for _ in 0..n_tensors {
+            let name_len = u16::from_le_bytes(mmap[pos..pos + 2].try_into().unwrap()) as usize;
+            pos += 2;
+            let name = String::from_utf8_lossy(&mmap[pos..pos + name_len]).to_string();
+            pos += name_len;
+            let qt = mmap[pos];
+            pos += 1;
+            let n_dims = mmap[pos] as usize;
+            pos += 1;
+            let mut shape = Vec::with_capacity(n_dims);
+            for _ in 0..n_dims {
+                shape.push(u32::from_le_bytes(mmap[pos..pos + 4].try_into().unwrap()));
+                pos += 4;
+            }
+            let group_size = u32::from_le_bytes(mmap[pos..pos + 4].try_into().unwrap());
+            pos += 4;
+            let data_size = u64::from_le_bytes(mmap[pos..pos + 8].try_into().unwrap()) as usize;
+            pos += 8;
+            entries.push(IndexEntry {
+                name,
+                qt,
+                shape,
+                group_size,
+                off: cumulative,
+                size: data_size,
+            });
+            cumulative += data_size;
+        }
+    }
+
+    // AWQ bakes `·s` into the stored weights and relies on the fused
+    // rmsnorm-rotate pre-pass upstream of the linear to apply the matching
+    // `x/s` (`(W·s)·(x/s) = W·x`; see `WeightTensor::awq_scale`). That pre-pass
+    // is keyed on `dtype_rotation_plan`, which is `RotationPlan::None` for
+    // TQ2G128 / BQ1G128 — so for a ternary/binary target the `x/s` half can
+    // NEVER run. Packing `W·s` would ship a model whose every AWQ-scaled
+    // projection is wrong by a per-channel factor (up to ~5× on qwen3.6-27b).
+    // Fold `s` out here instead, and drop the sidecar so a future AWQ-aware
+    // ternary kernel can't double-correct.
+    let awq_aware_target = !matches!(format, GgufFormat::Ternary | GgufFormat::Binary);
+    let awq_scales: std::collections::HashMap<String, Vec<f32>> = if awq_aware_target {
+        std::collections::HashMap::new()
+    } else {
+        entries
+            .iter()
+            .filter_map(|e| {
+                let stem = e.name.strip_suffix(".awq_scale.weight")?;
+                if e.qt != QuantType::F16 as u8 {
+                    eprintln!(
+                        "hfq requant: AWQ sidecar {} has quant_type={} (expected {}=F16); \
+                         NOT folding — output would be silently wrong",
+                        e.name,
+                        e.qt,
+                        QuantType::F16 as u8
+                    );
+                    return None;
+                }
+                let v: Vec<f32> = mmap[e.off..e.off + e.size]
+                    .chunks_exact(2)
+                    .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                    .collect();
+                Some((format!("{stem}.weight"), v))
+            })
+            .collect()
+    };
+
     let mut out_tensors: Vec<HfqTensor> = Vec::with_capacity(n_tensors);
-    let mut cumulative = data_offset;
     let mut requant = 0usize;
     let mut passthrough = 0usize;
+    let mut awq_folded = 0usize;
+    let mut awq_dropped = 0usize;
+    let mut awq_imatrix_used = 0usize;
 
-    for _ in 0..n_tensors {
-        let name_len = u16::from_le_bytes(mmap[pos..pos + 2].try_into().unwrap()) as usize;
-        pos += 2;
-        let name = String::from_utf8_lossy(&mmap[pos..pos + name_len]).to_string();
-        pos += name_len;
-        let qt = mmap[pos];
-        pos += 1;
-        let n_dims = mmap[pos] as usize;
-        pos += 1;
-        let mut shape = Vec::with_capacity(n_dims);
-        for _ in 0..n_dims {
-            shape.push(u32::from_le_bytes(mmap[pos..pos + 4].try_into().unwrap()));
-            pos += 4;
-        }
-        let group_size = u32::from_le_bytes(mmap[pos..pos + 4].try_into().unwrap());
-        pos += 4;
-        let data_size = u64::from_le_bytes(mmap[pos..pos + 8].try_into().unwrap()) as usize;
-        pos += 8;
-        let data = &mmap[cumulative..cumulative + data_size];
-        cumulative += data_size;
+    for entry in &entries {
+        let IndexEntry {
+            name,
+            qt,
+            shape,
+            group_size,
+            off,
+            size,
+        } = entry;
+        let (qt, group_size) = (*qt, *group_size);
+        let (name, shape) = (name.clone(), shape.clone());
+        let data = &mmap[*off..*off + *size];
 
         let n_elems: usize = shape.iter().map(|&d| d as usize).product();
+
+        // A folded scale must not also ride along as a sidecar.
+        if !awq_aware_target && name.ends_with(".awq_scale.weight") {
+            awq_dropped += 1;
+            continue;
+        }
 
         if qt == QuantType::MQ4G256 as u8 && shape.len() == 2 {
             // Recover un-rotated F32, then re-pack to the requested format using
             // the SAME per-format packers the GGUF Ternary/Binary/MQ arms use.
-            let f32_data = dequant_mq4g256_to_f32(data, n_elems);
+            let mut f32_data = dequant_mq4g256_to_f32(data, n_elems);
+            if let Some(scale) = awq_scales.get(&name) {
+                let k = shape[1] as usize;
+                assert_eq!(
+                    scale.len(),
+                    k,
+                    "AWQ sidecar for '{name}' has length {} but K={k}",
+                    scale.len()
+                );
+                for (i, v) in f32_data.iter_mut().enumerate() {
+                    *v /= scale[i % k];
+                }
+                awq_folded += 1;
+            }
+            let f32_data = f32_data;
+            // Column importance for the low-bit packers. `--awq-imatrix` reuses
+            // the checkpoint's own AWQ sidecar as the imatrix (see
+            // `awq_col_weights`); otherwise uniform (or an explicit --imatrix).
+            let k = shape[1] as usize;
+            let col_weights = match (awq_imatrix_alpha, awq_scales.get(&name)) {
+                (Some(alpha), Some(s)) if k % 128 == 0 && s.len() == k => {
+                    awq_imatrix_used += 1;
+                    awq_col_weights(s, alpha)
+                }
+                _ => requant_col_weights(&name, k),
+            };
             let (packed, out_qt, out_group) = match format {
-                GgufFormat::Ternary => {
-                    (quantize_tq2g128(&f32_data), QuantType::TQ2G128, 128u32)
-                }
-                GgufFormat::Binary => {
-                    (quantize_bq1g128(&f32_data), QuantType::BQ1G128, 128u32)
-                }
+                GgufFormat::Ternary => (
+                    quantize_tq2g128_gptq(&f32_data, &col_weights),
+                    QuantType::TQ2G128,
+                    128u32,
+                ),
+                GgufFormat::Binary => (
+                    quantize_bq1g128_gptq(&f32_data, &col_weights),
+                    QuantType::BQ1G128,
+                    128u32,
+                ),
                 GgufFormat::Mq4 => (
                     quantize_mq4g256(&f32_data, &signs1, &signs2),
                     QuantType::MQ4G256,
@@ -5824,12 +6079,16 @@ fn run_hfq_requant_pipeline(input_hfq: &Path, output: &Path, format: GgufFormat)
     }
 
     eprintln!(
-        "hfq requant {} → {}: {} tensors ({} requantized, {} passthrough)",
+        "hfq requant {} → {}: {} tensors ({} requantized, {} passthrough, \
+         {} AWQ-folded, {} AWQ sidecars dropped, {} AWQ-imatrix)",
         input_hfq.display(),
         format.label(),
         out_tensors.len(),
         requant,
-        passthrough
+        passthrough,
+        awq_folded,
+        awq_dropped,
+        awq_imatrix_used
     );
 
     write_hfq(output, arch_id, &metadata_json, &out_tensors, None).expect("write output .hfq");
@@ -5943,7 +6202,7 @@ mod hfq_requant_pipeline_tests {
         let outp = dir.join(format!("hfq_requant_out_{}.hfq", std::process::id()));
 
         write_hfq(&inp, 7, meta, &in_tensors, None).unwrap();
-        run_hfq_requant_pipeline(&inp, &outp, GgufFormat::Ternary);
+        run_hfq_requant_pipeline(&inp, &outp, GgufFormat::Ternary, None);
 
         let (arch, out_meta, tensors) = read_hfq_back(&outp);
         assert_eq!(arch, 7, "arch preserved");
@@ -5959,6 +6218,159 @@ mod hfq_requant_pipeline_tests {
         // Norm → F16 passthrough, byte-verbatim.
         assert_eq!(tensors[1].1, QuantType::F16 as u8, "norm stays F16");
         assert_eq!(tensors[1].4, norm_data, "norm bytes verbatim");
+
+        let _ = std::fs::remove_file(&inp);
+        let _ = std::fs::remove_file(&outp);
+    }
+
+    /// Ternary/binary requant must go through the scale-swept (GPTQ) packers,
+    /// not the plain `d = max|w|` reference packers.
+    ///
+    /// The plain packers mirror PrismML's decode convention and exist to pin
+    /// the on-disk format; they are NOT a usable encoder for un-transformed
+    /// weights (they zero ~85% of a Gaussian block). With no imatrix the
+    /// col_weights are all-ones, so this is a pure unweighted-MSE scale search.
+    #[test]
+    fn requant_routes_ternary_through_scale_swept_packer() {
+        let signs1 = gen_fwht_signs(42, 256);
+        let signs2 = gen_fwht_signs(1042, 256);
+
+        // Gaussian-ish weights — the ramp used elsewhere hides the scale bug.
+        let mut state = 987u32;
+        let weight_f32: Vec<f32> = (0..512)
+            .map(|_| {
+                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                let u1 = ((state >> 8) as f32 + 0.5) / ((1u32 << 24) as f32);
+                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                let u2 = ((state >> 8) as f32 + 0.5) / ((1u32 << 24) as f32);
+                (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos() * 0.02
+            })
+            .collect();
+        let mq4_data = quantize_mq4g256(&weight_f32, &signs1, &signs2);
+
+        let in_tensors = vec![HfqTensor {
+            name: "model.layers.0.mlp.gate_proj.weight".to_string(),
+            quant_type: QuantType::MQ4G256,
+            shape: vec![2, 256],
+            group_size: 256,
+            data: mq4_data.clone(),
+            spilled_len: 0,
+        }];
+
+        let meta = r#"{"architecture":"qwen3.6","num_hidden_layers":1}"#;
+        let dir = std::env::temp_dir();
+        let inp = dir.join(format!("hfq_sweep_in_{}.hfq", std::process::id()));
+        let outp = dir.join(format!("hfq_sweep_out_{}.hfq", std::process::id()));
+
+        write_hfq(&inp, 7, meta, &in_tensors, None).unwrap();
+        run_hfq_requant_pipeline(&inp, &outp, GgufFormat::Ternary, None);
+        let (_a, _m, tensors) = read_hfq_back(&outp);
+
+        let recovered = dequant_mq4g256_to_f32(&mq4_data, 512);
+        let ones = vec![1.0f32; 128];
+        assert_eq!(
+            tensors[0].4,
+            quantize_tq2g128_gptq(&recovered, &ones),
+            "requant must use the scale-swept ternary packer"
+        );
+        assert_ne!(
+            tensors[0].4,
+            quantize_tq2g128(&recovered),
+            "plain d=max|w| packer must NOT be what ships"
+        );
+
+        let _ = std::fs::remove_file(&inp);
+        let _ = std::fs::remove_file(&outp);
+    }
+
+    /// AWQ-scaled sources must have the per-input-channel scale divided OUT of
+    /// the recovered F32 before packing to a non-AWQ-aware target (ternary /
+    /// binary).
+    ///
+    /// The AWQ identity is `(W·s)·(x/s) = W·x`: the `·s` is baked into the
+    /// stored weights at quantize time and the `x/s` is applied by the
+    /// fused-rmsnorm-rotate pre-pass upstream of the linear. That pre-pass only
+    /// exists for rotated dtypes (`dtype_rotation_plan` → MQ/Paro families);
+    /// TQ2G128 / BQ1G128 are `RotationPlan::None`, so the `x/s` half NEVER
+    /// runs. Packing `W·s` into ternary therefore ships a model whose every
+    /// AWQ-scaled projection is wrong by a per-channel factor of up to ~5×.
+    ///
+    /// So: fold `s` out of the weights, and drop the now-meaningless sidecar.
+    #[test]
+    fn requant_mq4_hfq_to_ternary_divides_out_awq_scale() {
+        let signs1 = gen_fwht_signs(42, 256);
+        let signs2 = gen_fwht_signs(1042, 256);
+
+        // Stored (AWQ-pre-scaled) weight [m=2, k=256].
+        let stored_f32: Vec<f32> = (0..512)
+            .map(|i| (((i * 17 + 9) % 241) as f32 - 120.0) * 0.02)
+            .collect();
+        let mq4_data = quantize_mq4g256(&stored_f32, &signs1, &signs2);
+
+        // Non-unit per-input-channel AWQ scales, length K=256.
+        let scales: Vec<f32> = (0..256).map(|i| 0.9 + ((i % 7) as f32) * 0.35).collect();
+        let mut scale_data = Vec::new();
+        for &v in &scales {
+            scale_data.extend_from_slice(&f32_to_f16(v).to_le_bytes());
+        }
+        // What the loader will see after the F16 round-trip.
+        let scales_f16: Vec<f32> = scales.iter().map(|&v| f16_to_f32(f32_to_f16(v))).collect();
+
+        let in_tensors = vec![
+            HfqTensor {
+                name: "model.layers.0.mlp.gate_proj.weight".to_string(),
+                quant_type: QuantType::MQ4G256,
+                shape: vec![2, 256],
+                group_size: 256,
+                data: mq4_data.clone(),
+                spilled_len: 0,
+            },
+            HfqTensor {
+                name: "model.layers.0.mlp.gate_proj.awq_scale.weight".to_string(),
+                quant_type: QuantType::F16,
+                shape: vec![256],
+                group_size: 1,
+                data: scale_data,
+                spilled_len: 0,
+            },
+        ];
+
+        let meta = r#"{"architecture":"qwen3.6","num_hidden_layers":1}"#;
+        let dir = std::env::temp_dir();
+        let inp = dir.join(format!("hfq_awq_in_{}.hfq", std::process::id()));
+        let outp = dir.join(format!("hfq_awq_out_{}.hfq", std::process::id()));
+
+        write_hfq(&inp, 7, meta, &in_tensors, None).unwrap();
+        run_hfq_requant_pipeline(&inp, &outp, GgufFormat::Ternary, None);
+        let (_arch, _meta, tensors) = read_hfq_back(&outp);
+
+        // Expected: ternary of the UNSCALED weights. Derived from the mq4
+        // dequant (not from `stored_f32`) so this asserts ONLY the AWQ
+        // division, not mq4 round-trip fidelity.
+        let recovered = dequant_mq4g256_to_f32(&mq4_data, 512);
+        let unscaled: Vec<f32> = recovered
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| v / scales_f16[i % 256])
+            .collect();
+        let expected = quantize_tq2g128_gptq(&unscaled, &vec![1.0f32; 128]);
+
+        let w = tensors
+            .iter()
+            .find(|t| t.0 == "model.layers.0.mlp.gate_proj.weight")
+            .expect("weight present in output");
+        assert_eq!(w.1, QuantType::TQ2G128 as u8, "MQ4 → TQ2G128");
+        assert_eq!(
+            w.4, expected,
+            "ternary codes must encode W (AWQ scale divided out), not W·s"
+        );
+
+        // The sidecar is meaningless once folded in — and actively dangerous if
+        // a future ternary kernel learns to honor it (double correction).
+        assert!(
+            !tensors.iter().any(|t| t.0.ends_with(".awq_scale.weight")),
+            "AWQ sidecar must be dropped from a non-AWQ-aware output"
+        );
 
         let _ = std::fs::remove_file(&inp);
         let _ = std::fs::remove_file(&outp);
@@ -6328,6 +6740,33 @@ fn minimax_layer_awq_scales(
         compute_awq_scales(&gu, alpha),
         compute_awq_scales(&d, alpha),
     ))
+}
+
+/// Inverse of [`compute_awq_scales`]: recover per-input-channel imatrix
+/// importance (`Σ act²`) from an AWQ sidecar, up to a per-tensor constant.
+///
+/// `compute_awq_scales` emits `s[k] = exp((α/2)·ln(in_sum2[k]) − mean_log)`,
+/// i.e. `s[k] = C · in_sum2[k]^(α/2)` with `C` constant per tensor. So
+/// `in_sum2[k] ∝ s[k]^(2/α)`. The GPTQ packers use `col_weights` only inside a
+/// per-block `argmin_d Σ w_i·Δ_i²`, which is invariant to a positive global
+/// scale — so the unknown `C` (and the mean-normalization below) drops out.
+///
+/// This lets an AWQ-pre-scaled checkpoint act as its own imatrix: the
+/// calibration data is already baked into the sidecars, correctly aligned per
+/// input channel, with no llama.cpp dependency and no name-mapping risk.
+///
+/// `alpha` must match the α the checkpoint was built with (CLI default 0.55).
+/// A wrong α only changes how sharply importance is weighted — the channel
+/// ORDERING is preserved for any α > 0.
+fn awq_col_weights(scales: &[f32], alpha: f32) -> Vec<f32> {
+    debug_assert!(alpha > 0.0, "alpha must be positive");
+    let inv = 2.0 / (alpha as f64);
+    let raw: Vec<f64> = scales
+        .iter()
+        .map(|&s| (s as f64).max(1e-12).powf(inv))
+        .collect();
+    let mean = (raw.iter().sum::<f64>() / raw.len().max(1) as f64).max(1e-300);
+    raw.iter().map(|v| (v / mean) as f32).collect()
 }
 
 fn compute_awq_scales(in_sum2: &[f32], alpha: f32) -> Vec<f32> {
@@ -9236,7 +9675,23 @@ fn main() {
                 );
                 std::process::exit(1);
             });
-            run_hfq_requant_pipeline(raw_input, Path::new(output_path), hfq_format);
+            // --awq-imatrix [alpha=0.55]: treat the source checkpoint's AWQ
+            // sidecars as its imatrix for the low-bit packers' column
+            // weighting. alpha MUST match the α the source was built with
+            // (hipfire-quantize --awq default). Off by default so the plain
+            // requant stays an unweighted-MSE baseline.
+            let awq_imatrix_alpha = args.iter().position(|a| a == "--awq-imatrix").map(|i| {
+                args.get(i + 1)
+                    .and_then(|v| v.parse::<f32>().ok())
+                    .filter(|a| *a > 0.0)
+                    .unwrap_or(0.55)
+            });
+            run_hfq_requant_pipeline(
+                raw_input,
+                Path::new(output_path),
+                hfq_format,
+                awq_imatrix_alpha,
+            );
             return;
         }
     }
