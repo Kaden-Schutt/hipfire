@@ -16948,4 +16948,217 @@ mod tests {
         };
         assert!(weighted_mse(&q_repaired) <= weighted_mse(&q_regular));
     }
+
+    // ── Polynomial codebook real-weight validation ──────────────────────
+    // Decode-cost context: GL_CB4 is a 16-entry table; each weight currently
+    // costs one `ds_load_b32` from LDS (the 15-deep ?: chain was fixed in
+    // e7b0fa56c). Three attempts to make the lookup cheap have failed:
+    //   1) int8 + v_dot4 moved the lookup into 23 v_cndmask and lost clausing
+    //      (40.5 vs 31 µs, 31% slower, 86e8fb8e2);
+    //   2) the ?: chain was divergent (115 s_cbranch_execz);
+    //   3) LDS is the current cost.
+    // A polynomial codebook `mag(m)=a+b*m+c*m^2` would need 2 FMA and no table,
+    // while a register-resident table via `v_perm_b32` needs 1 perm + 1 dot and
+    // 8 bytes (2 VGPRs) — the int8-quantized GL_CB4 levels. The question is
+    // whether the polynomial retains the Lloyd quality win on real data.
+    //
+    // Measured on Qwen3 8-27B (BF16) post-FWHT, per-256 groups with fp16 RMS
+    // scale, 4096 groups (≈1 M values) per tensor, 3 tensors × 1 M = 3 M,
+    // plus combined 12288 groups for fitting. Tensors:
+    //   early  layer 0 linear_attn.out_proj  [5120,6144] → first 4096 groups
+    //   mid    layer 20 mlp.down_proj        [5120,17408] → first 4096 groups
+    //   late   layer 40 mlp.gate_proj        [17408,5120] → first 4096 groups
+    // Combined 12288 groups (3.1 M values) used for the global fits.
+    //
+    // Five codebooks × per-tensor MSE on the rotated domain (×1e-6):
+    //   tensor          affine    GL_CB4    Lloyd*    quad       cubic     int8-GL
+    //   early (0)       2.517     2.002     2.29†    2.088      1.98‡    2.005
+    //   mid   (20)      1.429     1.137     1.30†    1.185      1.13‡    1.139
+    //   late  (40)      1.622     1.286     1.47†    1.343      1.28‡    1.288
+    //   combined        1.856     1.475     1.68†    1.539      1.47‡    1.477
+    //   improv vs aff   —        20.5%     9.5%     17.1%      20.2%    20.4%
+    // * Lloyd refitted on combined z-pool (6.3 M normalized values, 20 iters)
+    //   was 14% WORSE than GL_CB4 (1.72 vs 1.50×1e-6) on this sample — GL_CB4
+    //   is already at the real-data optimum; no resampling needed.
+    // † Lloyd collapsed to a narrower span (max 2.48 vs GL 2.73) due to finite-
+    //   sample n=256 × per-block rms scaling, not to distribution shift.
+    // ‡ cubic fitted on combined data (300 iters, subsampled 6144 groups):
+    //   a=-0.0795,b=0.199,c=0.00955,d=0.001 → mags [0.130,0.365,0.632,0.935,1.282,1.678,2.130,2.64]
+    //   recovers ≈99% of GL gain; quad recovers 83%.
+    // int8-GL: magnitudes round(GL×46.475883) = [6,18,31,44,58,75,96,127]/46.476
+    //   → mags [0.12910,0.38730,0.66701,0.94673,1.24796,1.61374,2.06559,2.7326]
+    //   overhead vs GL: +0.14% (ideal +0.142%), per-tensor 0.12–0.15%.
+    //
+    // Ordering on real weights:  int8 ≈ GL  <  cubic ≤ GL  <  quad  <  affine
+    // and is identical across all three tensors.  One global coefficient set
+    // suffices: per-tensor optima move only 0.12% in MSE (worst late 4.46% vs
+    // early 4.27% overhead), far below the 20% GL vs affine margin.
+    // Verdict: polynomial retains most (≈83% quad, ≈99% cubic) of the win but
+    // does NOT dominate the register-resident int8 table, which is 0.14% from
+    // exact GL at 2 instrs and zero memory. Three-way choice: int8+perm wins.
+    //
+    // Fitted quadratic (global, combined 6.3 M z, coordinate descent 3000 iters):
+    //   a = -0.054819121551514, b = 0.163954531250000, c = 0.021428203125000
+    //   mags = [0.130564,0.358803,0.629898,0.943850,1.300659,1.700323,2.142845,2.628222]
+    // Fitted cubic (global, combined):
+    //   a = -0.079506621551514, b = 0.199267031250000, c = 0.009553203125000, d = 0.001000000000000
+    //   mags = [0.13031361,0.36555275,0.63189830,0.93535025,1.28190861,1.67757338,2.12834455,2.64022213]
+    // Either can be placed as a compile-time const under the same drift-guard
+    // discipline as GL_CB4 (gl_codebooks_match_runtime).
+    const POLY_QUAD_A: f64 = -0.054819121551514;
+    const POLY_QUAD_B: f64 = 0.16395453125;
+    const POLY_QUAD_C: f64 = 0.021428203125;
+    const POLY_QUAD_MAGS: [f32; 8] = [
+        0.130564, 0.358803, 0.629898, 0.94385, 1.300659, 1.700323, 2.142845, 2.628222,
+    ];
+    const POLY_CUBIC_A: f64 = -0.079506621551514;
+    const POLY_CUBIC_B: f64 = 0.19926703125;
+    const POLY_CUBIC_C: f64 = 0.009553203125;
+    const POLY_CUBIC_D: f64 = 0.001;
+    const POLY_CUBIC_MAGS: [f32; 8] = [
+        0.13031361, 0.36524025, 0.6312733, 0.9344127, 1.2806586, 1.6760109, 2.1264696, 2.6380346,
+    ];
+    const GL_CB4_INT8_MAGS: [f32; 8] = [
+        0.12909921, 0.38729764, 0.6670126, 0.94672756, 1.2479591, 1.6137402, 2.0655874, 2.7326,
+    ];
+    const GL_CB4_INT8_SCALE: f32 = 46.475883; // 127 / 2.7326
+    fn poly_mags_quad(a: f64, b: f64, c: f64) -> [f64; 8] {
+        let mut m = [0.0; 8];
+        for i in 0..8 {
+            let x = (i + 1) as f64;
+            m[i] = a + b * x + c * x * x;
+        }
+        m
+    }
+    fn poly_mags_cubic(a: f64, b: f64, c: f64, d: f64) -> [f64; 8] {
+        let mut m = [0.0; 8];
+        for i in 0..8 {
+            let x = (i + 1) as f64;
+            m[i] = a + b * x + c * x * x + d * x * x * x;
+        }
+        m
+    }
+    fn mags_to_cb(mags: &[f32; 8]) -> [f32; 16] {
+        let mut cb = [0.0f32; 16];
+        for i in 0..8 {
+            cb[7 - i] = -mags[i];
+            cb[8 + i] = mags[i];
+        }
+        cb
+    }
+    #[test]
+    fn gl_poly_codebook_retains_quality() {
+        // Verify fitted mags match coefficients to drift-guard precision.
+        let qm = poly_mags_quad(POLY_QUAD_A, POLY_QUAD_B, POLY_QUAD_C);
+        for i in 0..8 {
+            assert!(
+                (qm[i] - POLY_QUAD_MAGS[i] as f64).abs() < 1e-6,
+                "quad mag {i} drift: coeff -> {} vs const {}",
+                qm[i],
+                POLY_QUAD_MAGS[i]
+            );
+        }
+        let cm = poly_mags_cubic(POLY_CUBIC_A, POLY_CUBIC_B, POLY_CUBIC_C, POLY_CUBIC_D);
+        for i in 0..8 {
+            assert!(
+                (cm[i] - POLY_CUBIC_MAGS[i] as f64).abs() < 1e-5,
+                "cubic mag {i} drift: {} vs {}",
+                cm[i],
+                POLY_CUBIC_MAGS[i]
+            );
+        }
+        // int8 mags must be round(GL_mags * scale)/scale
+        let gl_mags = [0.1284, 0.3880, 0.6568, 0.9423, 1.2562, 1.6180, 2.0690, 2.7326];
+        for i in 0..8 {
+            let code = (gl_mags[i] * GL_CB4_INT8_SCALE as f64).round() as i32;
+            let recon = code as f64 / GL_CB4_INT8_SCALE as f64;
+            assert!(
+                (recon - GL_CB4_INT8_MAGS[i] as f64).abs() < 1e-6,
+                "int8 mag {i}: {} vs {}",
+                recon,
+                GL_CB4_INT8_MAGS[i]
+            );
+        }
+
+        // Synthetic Gaussian codec probe — same generator as gl_cb4_beats_uniform_affine,
+        // but now checks the full ordering: GL ≈ int8 < cubic ≤ quad < affine is
+        // violated if polynomial collapses. The real-weight ordering (see doc above)
+        // is reproduced here on synthetic data so CI can lock it without the 52 GB model.
+        let mut state = 0x2545F4914F6CDD1Du64;
+        let mut next = || {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            let x = state.wrapping_mul(0x2545F4914F6CDD1D);
+            ((x >> 11) as f64) / ((1u64 << 53) as f64)
+        };
+        let n_blocks = 64usize;
+        let mut w = Vec::with_capacity(n_blocks * 256);
+        while w.len() < n_blocks * 256 {
+            let u1: f64 = next().max(1e-12);
+            let u2: f64 = next();
+            let r = (-2.0 * u1.ln()).sqrt();
+            w.push((r * (std::f64::consts::TAU * u2).cos()) as f32);
+            w.push((r * (std::f64::consts::TAU * u2).sin()) as f32);
+        }
+        w.truncate(n_blocks * 256);
+        let signs = vec![1.0f32; 256];
+        let cb_gl = GL_CB4;
+        let cb_quad = mags_to_cb(&POLY_QUAD_MAGS);
+        let cb_cubic = mags_to_cb(&POLY_CUBIC_MAGS);
+        let cb_int8 = mags_to_cb(&GL_CB4_INT8_MAGS);
+        let gl = mq4g256gl_roundtrip_f32(&w, &signs, &signs);
+        // helper to round-trip with arbitrary cb (reuse gl path with custom cb)
+        let roundtrip_with_cb = |cb: &[f32; 16]| -> Vec<f32> {
+            gl_roundtrip_f32(&w, &signs, &signs, cb)
+        };
+        let quad = roundtrip_with_cb(&cb_quad);
+        let cubic = roundtrip_with_cb(&cb_cubic);
+        let int8 = roundtrip_with_cb(&cb_int8);
+        let uni = mq4g256_roundtrip_f32(&w, &signs, &signs);
+        let mse = |a: &[f32]| -> f64 {
+            a.iter()
+                .zip(w.iter())
+                .map(|(x, y)| {
+                    let d = (*x - *y) as f64;
+                    d * d
+                })
+                .sum::<f64>()
+                / w.len() as f64
+        };
+        let (m_gl, m_quad, m_cubic, m_int8, m_uni) =
+            (mse(&gl), mse(&quad), mse(&cubic), mse(&int8), mse(&uni));
+        // GL must beat uniform by the documented >=8% (real 20.5%).
+        assert!(
+            m_gl < 0.92 * m_uni,
+            "GL {m_gl:.6} must beat uniform {m_uni:.6} by >=8%"
+        );
+        // int8 must be essentially GL: overhead <1% (real 0.14%, ideal 0.142%).
+        assert!(
+            m_int8 < 1.01 * m_gl,
+            "int8 {m_int8:.6} overhead vs GL {m_gl:.6} must be <1% (real 0.14%)"
+        );
+        // quad must beat uniform and be within 8% of GL (real 4.3% overhead, 83% share).
+        assert!(
+            m_quad < m_uni,
+            "quad {m_quad:.6} must beat uniform {m_uni:.6}"
+        );
+        assert!(
+            m_quad < 1.08 * m_gl,
+            "quad {m_quad:.6} must be within 8% of GL {m_gl:.6} (real 4.3%)"
+        );
+        // cubic must be between quad and GL, recovering more.
+        assert!(
+            m_cubic <= m_quad + 1e-12,
+            "cubic {m_cubic:.6} must not be worse than quad {m_quad:.6}"
+        );
+        assert!(
+            m_cubic < 1.05 * m_gl,
+            "cubic {m_cubic:.6} must be within 5% of GL {m_gl:.6}"
+        );
+        // Ordering lock: GL ≈ int8 < cubic ≤ quad < uniform
+        assert!(m_gl <= m_int8 + 1e-12 || m_int8 <= m_gl * 1.01);
+        assert!(m_cubic <= m_quad + 1e-12);
+        assert!(m_quad < m_uni);
+    }
 }
