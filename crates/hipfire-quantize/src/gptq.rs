@@ -630,6 +630,12 @@ mod gpu {
         /// failure, device alloc failure). Caller falls back to CPU GEMM.
         /// Only HIP + rocBLAS are required; rocSOLVER is not needed for GEMM.
         pub(super) fn try_new(m: usize, k: usize, max_b: usize) -> Option<Self> {
+            // Refuse small K so CPU acceptance oracles cannot silently
+            // acquire a live GPU and stop being pure-CPU comparisons.
+            // Same threshold as try_gpu_compute (see GPU_K_THRESHOLD).
+            if k < GPU_K_THRESHOLD {
+                return None;
+            }
             let (hip_lib, hip) = try_load_hip()?;
             let (rb_lib, rb) = try_load_rocblas()?;
             let destroy_handle = rb.destroy_handle;
@@ -1596,7 +1602,7 @@ fn gptq_column_sequential_blocked(
                 // buffer `gpu_res_perm_col_major` must reflect intra-block updates so that
                 // the subsequent download of next block after GEMM is consistent.
                 // We apply the same intra-block deltas to the column-major perm copy.
-                if let Some(ref mut perm_res) = gpu_res_perm_col_major {
+                if let Some(perm_res) = &mut gpu_res_perm_col_major {
                     for row in 0..m {
                         let err = errs[row];
                         if err == 0.0 { continue; }
@@ -1622,7 +1628,7 @@ fn gptq_column_sequential_blocked(
             }
         }
         // Prefer GPU resident GEMM if available, else CPU scatter GEMM.
-        let gpu_ok = if let (Some(ref ctx), Some(ref mut perm_res)) = (&gpu_ctx, &mut gpu_res_perm_col_major) {
+        let gpu_ok = if let (Some(ctx), Some(_)) = (&gpu_ctx, &gpu_res_perm_col_major) {
             // Upload Err_block and U_block and do in-place tail GEMM on device permuted Res.
             // GEMM: perm_res tail (M×n_tail, col start = block_end) -= Err_block(M×B) * U_block(B×n_tail)
             let ok = ctx.apply_tail_gemm(&err_block, &u_block, block_end, b, n_tail);
@@ -1665,9 +1671,8 @@ fn gptq_column_sequential_blocked(
                         let mut sum = 0.0f64;
                         // dot of Err row slice with U col
                         for b_t in 0..b {
-                            let e = err_ref[b_t * m + row]; // Wait this is column-major vs row access — need indexing
                             // err_block is M×B column-major: err at (row, b_t) = err_block[b_t*m + row]
-                            // Actually we stored as t*m + row, so b_t*m + row is correct.
+                            let e = err_ref[b_t * m + row];
                             let uu = u_ref[tail_j * b + b_t];
                             sum += e * uu;
                         }
@@ -1677,21 +1682,9 @@ fn gptq_column_sequential_blocked(
                         }
                     }
                 });
-            // Also update permuted host mirror tail if resident (to keep mirror in sync for final download check)
-            if let Some(ref mut perm_res) = gpu_res_perm_col_major {
-                for row in 0..m {
-                    for tail_j in 0..n_tail {
-                        let mut sum = 0.0;
-                        for b_t in 0..b {
-                            let e = err_block[b_t * m + row];
-                            let uu = u_block[tail_j * b + b_t];
-                            sum += e * uu;
-                        }
-                        if sum != 0.0 { perm_res[(block_end + tail_j) * m + row] -= sum; }
-                    }
-                }
-                let _ = gpu_ok;
-            }
+            // Keep gpu_ok live so the discarded GPU tail remains attributable;
+            // the serial host mirror that previously consumed it is gone.
+            let _ = gpu_ok;
         }
         // If GPU resident and we wanted to demonstrate download of next block,
         // we would here call `ctx.download_block(block_end, b_next, &mut buf)` and
@@ -2490,13 +2483,19 @@ mod tests {
     ///
     /// Runs the SAME small problem (M=32, K=256, random SPD H = A^T A + K·I)
     /// through both paths with GPU disabled (K=256 < GPU_K_THRESHOLD so
-    /// Cholesky is CPU, and `GpuBlocked::try_new` soft-fails on this host
-    /// without ROCm → CPU tail GEMM). Asserts quantized outputs are
-    /// byte-identical when packed, or, if that strict equality is not
-    /// achievable due to FP summation order, asserts max element-wise
-    /// dequantized deviation < 1e-12 (tight — the blocked form is a
-    /// reassociation, not an approximation; at K=256 the rounding error
-    /// should be O(ε·K) ~ 1e-13).
+    /// Cholesky is CPU and `GpuBlocked::try_new` refuses). Asserts quantized
+    /// packed MQ4 bytes are **exactly** equal. Differing packed bytes ARE
+    /// differing 4-bit codes; a dequant tolerance must never waive a packed
+    /// mismatch — a weight near a quantization boundary flips on an
+    /// arbitrarily small perturbation.
+    ///
+    /// On failure the diagnostic reports flip count/rate, max code-level
+    /// distance, and the minimum distance to the nearest quantization
+    /// boundary across flips (z = (w-min)/scale before clamp; boundary
+    /// distance = distance from z to nearest half-integer). A flip whose z
+    /// sat ~1e-12 from a bin edge is floating-point reassociation; a mid-bin
+    /// flip is a bug. The diagnostic explains a failure — it does not excuse
+    /// one.
     ///
     /// This is the core acceptance bar for the §3.2 change.
     #[test]
@@ -2525,7 +2524,7 @@ mod tests {
         let mut blocked = weights_orig.clone();
         let damp2 = gptq_column_sequential_with_block_size(&mut blocked, &h, m, k, &frozen, 1e-6, 1.0, "test:blocked_vs_unblocked:blocked", 128).expect("blocked must succeed");
         assert!((damp1 - damp2).abs() < 1e-12, "damp mismatch: oracle {damp1} vs blocked {damp2}");
-        // Compare dequantized values element-wise
+        // Compare dequantized values element-wise (informational; packed equality is the gate)
         let mut max_abs: f64 = 0.0;
         let mut mismatched: usize = 0;
         for i in 0..m * k {
@@ -2533,16 +2532,74 @@ mod tests {
             if diff > max_abs { max_abs = diff; }
             if diff > 1e-12 { mismatched += 1; }
         }
-        // Also compare packed bytes: pack both through same frozen grids → byte-equality is the strongest bar
+        // Packed-code equality is unconditional. Differing packed bytes ARE
+        // differing 4-bit codes; never waive via dequant tolerance.
         let packed_oracle = pack_mq4g256_from_rotated_f64(&oracle, &frozen);
         let packed_blocked = pack_mq4g256_from_rotated_f64(&blocked, &frozen);
         if packed_oracle != packed_blocked {
-            eprintln!("[gptq-blocked-test] packed mismatch: max_abs={max_abs:e} mismatched={}/{} ({:.4}%)", mismatched, m*k, 100.0*mismatched as f64/(m*k) as f64);
-            // Fallback tolerance: max element-wise deviation must be < 1e-9 (justifies reassociation error)
-            assert!(max_abs < 1e-9, "blocked vs unblocked max_abs {max_abs:e} exceeds 1e-9; packed bytes also differ");
-            // If within 1e-9 we still warn but accept — the spec allows dequant deviation below stated tolerance
-        } else {
-            assert_eq!(max_abs, 0.0, "packed identical but max_abs {max_abs:e} non-zero (should be 0)");
+            // Diagnostic only — does not relax acceptance. Distinguishes
+            // FP reassociation (z ~1e-12 from a bin edge) from mid-bin bugs.
+            // For decision value z = (w - min)/scale, boundary distance is the
+            // distance from z to the nearest half-integer, BEFORE clamping.
+            // A flip whose z sat ~1e-12 from a bin edge is floating-point
+            // reassociation; a mid-bin flip is a bug. Reporting both counts
+            // and the minimum boundary distance separates those in one number.
+            let n_elem = m * k;
+            let mut flip_count: usize = 0;
+            let mut max_code_dist: i32 = 0;
+            let mut min_boundary_dist = f64::INFINITY;
+            let block_bytes = 136usize;
+            let n_blocks = n_elem / 256;
+            for b in 0..n_blocks {
+                let grid = frozen[b];
+                let inv_scale = if grid.scale > 0.0 { 1.0 / grid.scale } else { 0.0 };
+                let off = b * block_bytes + 8;
+                for i in 0..128 {
+                    let byte_a = packed_oracle[off + i];
+                    let byte_b = packed_blocked[off + i];
+                    if byte_a == byte_b {
+                        continue;
+                    }
+                    let codes_a = [byte_a & 0x0f, byte_a >> 4];
+                    let codes_b = [byte_b & 0x0f, byte_b >> 4];
+                    for nibble in 0..2 {
+                        let qa = codes_a[nibble] as i32;
+                        let qb = codes_b[nibble] as i32;
+                        if qa == qb {
+                            continue;
+                        }
+                        flip_count += 1;
+                        let dist = (qa - qb).abs();
+                        if dist > max_code_dist {
+                            max_code_dist = dist;
+                        }
+                        let flat = b * 256 + 2 * i + nibble;
+                        // Boundary distance from each side's decision value.
+                        // w here is the value fed to the packer (post-GPTQ
+                        // dequant); z is computed before any clamp.
+                        for &w in &[oracle[flat], blocked[flat]] {
+                            let z = (w - grid.min_val) * inv_scale;
+                            // Half-integer boundaries under round-half-up
+                            // floor(z + 0.5). Distance to nearest half-integer:
+                            let bd = (z - z.floor() - 0.5).abs();
+                            if bd < min_boundary_dist {
+                                min_boundary_dist = bd;
+                            }
+                        }
+                    }
+                }
+            }
+            let flip_rate = 100.0 * flip_count as f64 / n_elem as f64;
+            panic!(
+                "blocked vs unblocked packed MQ4 bytes differ (exact equality required). \
+                 flipped_codes={flip_count}/{n_elem} ({flip_rate:.4}%) \
+                 max_code_dist={max_code_dist} \
+                 min_boundary_dist={min_boundary_dist:e} \
+                 dequant_max_abs={max_abs:e} dequant_mismatched={mismatched}/{n_elem}. \
+                 (A flip with min_boundary_dist ~1e-12 is FP reassociation; a mid-bin flip is a bug. \
+                 This diagnostic does not relax acceptance.)"
+            );
         }
+        assert_eq!(max_abs, 0.0, "packed identical but max_abs {max_abs:e} non-zero (should be 0)");
     }
 }
