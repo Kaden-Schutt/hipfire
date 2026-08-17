@@ -16,7 +16,7 @@
 
 use crate::common::*;
 use crate::batch::emit_uncorrelated_error;
-use hipfire_loader::{LoadedModel, ModelState};
+use hipfire_loader::LoadedModel;
 use std::time::Instant;
 use hipfire_engine::redline::{
     redline_append_buffer, redline_append_tensor, redline_append_tensor_region,
@@ -293,7 +293,11 @@ pub fn redline_is_dense_lfm(loaded: &LoadedModel) -> bool {
     if loaded.pp != 1 || loaded.ep.is_some() {
         return false;
     }
-    let Some(bundle) = loaded.lfm2moe() else {
+    let Some(bundle) = loaded
+        .state
+        .as_ref()
+        .and_then(|s| s.as_arch_model().as_any().downcast_ref::<lfm2moe::Lfm2MoeBundle>())
+    else {
         return false;
     };
     bundle.config.is_dense()
@@ -403,20 +407,29 @@ pub fn redline_snapshot(
     gpu: &rdna_compute::Gpu,
     loaded: &LoadedModel,
 ) -> Result<RedlineSnapshot, String> {
-    match loaded.state.as_ref() {
-        Some(ModelState::Qwen35(bundle)) => {
-            redline_qwen_snapshot(gpu, bundle).map(RedlineSnapshot::Qwen)
+    if let Some(bundle) = loaded
+        .state
+        .as_ref()
+        .and_then(|s| s.as_arch_model().as_any().downcast_ref::<Qwen35Bundle>())
+    {
+        redline_qwen_snapshot(gpu, bundle).map(RedlineSnapshot::Qwen)
+    } else if let Some(bundle) = loaded.state.as_ref().and_then(|s| {
+        s.as_arch_model()
+            .as_any()
+            .downcast_ref::<deepseek4::Deepseek4Bundle>()
+    }) {
+        redline_deepseek4_snapshot(gpu, bundle).map(RedlineSnapshot::Deepseek4)
+    } else if let Some(bundle) = loaded.state.as_ref().and_then(|s| {
+        s.as_arch_model()
+            .as_any()
+            .downcast_ref::<lfm2moe::Lfm2MoeBundle>()
+    }) {
+        if !bundle.config.is_dense() {
+            return Err("retained snapshot requires dense LFM".to_string());
         }
-        Some(ModelState::Deepseek4(bundle)) => {
-            redline_deepseek4_snapshot(gpu, bundle).map(RedlineSnapshot::Deepseek4)
-        }
-        Some(ModelState::Lfm2Moe(bundle)) => {
-            if !bundle.config.is_dense() {
-                return Err("retained snapshot requires dense LFM".to_string());
-            }
-            redline_lfm2moe_snapshot(gpu, bundle).map(RedlineSnapshot::Lfm2Moe)
-        }
-        _ => Err("retained snapshot requires Qwen3.5, DeepSeek4 or dense LFM".to_string()),
+        redline_lfm2moe_snapshot(gpu, bundle).map(RedlineSnapshot::Lfm2Moe)
+    } else {
+        Err("retained snapshot requires Qwen3.5, DeepSeek4 or dense LFM".to_string())
     }
 }
 
@@ -642,49 +655,58 @@ pub fn redline_prime_retained_fixture(
     loaded: &mut LoadedModel,
     context: usize,
 ) -> Result<(), String> {
-    match loaded.state.as_mut() {
-        Some(ModelState::Qwen35(bundle)) => {
-            redline_reset_qwen(gpu, bundle)?;
-            redline_prime_qwen(gpu, bundle, context)
+    if let Some(bundle) = loaded.state.as_mut().and_then(|s| {
+        s.as_arch_model_mut()
+            .as_any_mut()
+            .downcast_mut::<Qwen35Bundle>()
+    }) {
+        redline_reset_qwen(gpu, bundle)?;
+        redline_prime_qwen(gpu, bundle, context)
+    } else if let Some(bundle) = loaded.state.as_mut().and_then(|s| {
+        s.as_arch_model_mut()
+            .as_any_mut()
+            .downcast_mut::<deepseek4::Deepseek4Bundle>()
+    }) {
+        let pbs = loaded
+            .deepseek4_pbs
+            .as_mut()
+            .ok_or_else(|| "DeepSeek4 prefill scratch missing".to_string())?;
+        redline_reset_deepseek4(gpu, bundle)?;
+        redline_prime_deepseek4(gpu, bundle, pbs, context)
+    } else if let Some(bundle) = loaded.state.as_mut().and_then(|s| {
+        s.as_arch_model_mut()
+            .as_any_mut()
+            .downcast_mut::<lfm2moe::Lfm2MoeBundle>()
+    }) {
+        if !bundle.config.is_dense() {
+            return Err("retained fixture requires dense LFM".to_string());
         }
-        Some(ModelState::Deepseek4(bundle)) => {
-            let pbs = loaded
-                .deepseek4_pbs
-                .as_mut()
-                .ok_or_else(|| "DeepSeek4 prefill scratch missing".to_string())?;
-            redline_reset_deepseek4(gpu, bundle)?;
-            redline_prime_deepseek4(gpu, bundle, pbs, context)
+        redline_reset_lfm2moe(gpu, bundle)?;
+        for pos in 0..context {
+            let token = 10 + (pos as u32 % 1000);
+            lfm2moe::forward::prepare_retained_decode_inputs(
+                &bundle.config,
+                &bundle.weights,
+                &mut bundle.state,
+                gpu,
+                token,
+                pos as u32,
+            )?;
+            lfm2moe::forward::run_retained_decode_body(
+                &bundle.config,
+                &bundle.weights,
+                &mut bundle.state,
+                gpu,
+                pos as u32,
+            )?;
         }
-        Some(ModelState::Lfm2Moe(bundle)) => {
-            if !bundle.config.is_dense() {
-                return Err("retained fixture requires dense LFM".to_string());
-            }
-            redline_reset_lfm2moe(gpu, bundle)?;
-            for pos in 0..context {
-                let token = 10 + (pos as u32 % 1000);
-                lfm2moe::forward::prepare_retained_decode_inputs(
-                    &bundle.config,
-                    &bundle.weights,
-                    &mut bundle.state,
-                    gpu,
-                    token,
-                    pos as u32,
-                )?;
-                lfm2moe::forward::run_retained_decode_body(
-                    &bundle.config,
-                    &bundle.weights,
-                    &mut bundle.state,
-                    gpu,
-                    pos as u32,
-                )?;
-            }
-            loaded.seq_pos = context;
-            gpu.hip
-                .device_synchronize()
-                .map_err(|error| error.to_string())?;
-            Ok(())
-        }
-        _ => Err("retained fixture requires Qwen3.5, DeepSeek4 or dense LFM".to_string()),
+        loaded.seq_pos = context;
+        gpu.hip
+            .device_synchronize()
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    } else {
+        Err("retained fixture requires Qwen3.5, DeepSeek4 or dense LFM".to_string())
     }
 }
 
@@ -694,8 +716,12 @@ pub fn redline_prepare_retained_fixture(
     token_id: u32,
     context: usize,
 ) -> Result<(), String> {
-    match loaded.state.as_mut() {
-        Some(ModelState::Qwen35(bundle)) => qwen35::prepare_scratch_inputs(
+    if let Some(bundle) = loaded.state.as_mut().and_then(|s| {
+        s.as_arch_model_mut()
+            .as_any_mut()
+            .downcast_mut::<Qwen35Bundle>()
+    }) {
+        qwen35::prepare_scratch_inputs(
             gpu,
             &bundle.weights,
             &bundle.config,
@@ -703,32 +729,39 @@ pub fn redline_prepare_retained_fixture(
             context,
             &bundle.scratch,
         )
-        .map_err(|error| error.to_string()),
-        Some(ModelState::Deepseek4(bundle)) => {
-            bundle.state.n_tokens = context as u64;
-            deepseek4::forward::prepare_retained_decode_inputs(
-                &bundle.config,
-                &bundle.weights,
-                &mut bundle.state,
-                gpu,
-                token_id,
-                context as u32,
-            )
+        .map_err(|error| error.to_string())
+    } else if let Some(bundle) = loaded.state.as_mut().and_then(|s| {
+        s.as_arch_model_mut()
+            .as_any_mut()
+            .downcast_mut::<deepseek4::Deepseek4Bundle>()
+    }) {
+        bundle.state.n_tokens = context as u64;
+        deepseek4::forward::prepare_retained_decode_inputs(
+            &bundle.config,
+            &bundle.weights,
+            &mut bundle.state,
+            gpu,
+            token_id,
+            context as u32,
+        )
+    } else if let Some(bundle) = loaded.state.as_mut().and_then(|s| {
+        s.as_arch_model_mut()
+            .as_any_mut()
+            .downcast_mut::<lfm2moe::Lfm2MoeBundle>()
+    }) {
+        if !bundle.config.is_dense() {
+            return Err("retained fixture requires dense LFM".to_string());
         }
-        Some(ModelState::Lfm2Moe(bundle)) => {
-            if !bundle.config.is_dense() {
-                return Err("retained fixture requires dense LFM".to_string());
-            }
-            lfm2moe::forward::prepare_retained_decode_inputs(
-                &bundle.config,
-                &bundle.weights,
-                &mut bundle.state,
-                gpu,
-                token_id,
-                context as u32,
-            )
-        }
-        _ => Err("retained fixture requires Qwen3.5, DeepSeek4 or dense LFM".to_string()),
+        lfm2moe::forward::prepare_retained_decode_inputs(
+            &bundle.config,
+            &bundle.weights,
+            &mut bundle.state,
+            gpu,
+            token_id,
+            context as u32,
+        )
+    } else {
+        Err("retained fixture requires Qwen3.5, DeepSeek4 or dense LFM".to_string())
     }
 }
 
@@ -738,64 +771,73 @@ pub fn redline_run_direct_fixture(
     context: usize,
     iterations: usize,
 ) -> Result<(), String> {
-    match loaded.state.as_mut() {
-        Some(ModelState::Qwen35(bundle)) => {
-            for index in 0..iterations {
-                qwen35::forward_scratch(
-                    gpu,
-                    &bundle.weights,
-                    &bundle.config,
-                    101 + index as u32,
-                    context + index,
-                    &mut bundle.kv_cache,
-                    &mut bundle.dn_state,
-                    &bundle.scratch,
-                )
-                .map_err(|error| error.to_string())?;
-            }
-            Ok(())
+    if let Some(bundle) = loaded.state.as_mut().and_then(|s| {
+        s.as_arch_model_mut()
+            .as_any_mut()
+            .downcast_mut::<Qwen35Bundle>()
+    }) {
+        for index in 0..iterations {
+            qwen35::forward_scratch(
+                gpu,
+                &bundle.weights,
+                &bundle.config,
+                101 + index as u32,
+                context + index,
+                &mut bundle.kv_cache,
+                &mut bundle.dn_state,
+                &bundle.scratch,
+            )
+            .map_err(|error| error.to_string())?;
         }
-        Some(ModelState::Deepseek4(bundle)) => {
-            for index in 0..iterations {
-                bundle.state.n_tokens = (context + index) as u64;
-                deepseek4::forward::decode_step(
-                    &bundle.config,
-                    &bundle.weights,
-                    &mut bundle.state,
-                    gpu,
-                    101 + index as u32,
-                    (context + index) as u32,
-                )?;
-            }
-            Ok(())
+        Ok(())
+    } else if let Some(bundle) = loaded.state.as_mut().and_then(|s| {
+        s.as_arch_model_mut()
+            .as_any_mut()
+            .downcast_mut::<deepseek4::Deepseek4Bundle>()
+    }) {
+        for index in 0..iterations {
+            bundle.state.n_tokens = (context + index) as u64;
+            deepseek4::forward::decode_step(
+                &bundle.config,
+                &bundle.weights,
+                &mut bundle.state,
+                gpu,
+                101 + index as u32,
+                (context + index) as u32,
+            )?;
         }
-        Some(ModelState::Lfm2Moe(bundle)) => {
-            if !bundle.config.is_dense() {
-                return Err("retained fixture requires dense LFM".to_string());
-            }
-            for index in 0..iterations {
-                let token = 101 + index as u32;
-                let pos = (context + index) as u32;
-                lfm2moe::forward::prepare_retained_decode_inputs(
-                    &bundle.config,
-                    &bundle.weights,
-                    &mut bundle.state,
-                    gpu,
-                    token,
-                    pos,
-                )?;
-                lfm2moe::forward::run_retained_decode_body(
-                    &bundle.config,
-                    &bundle.weights,
-                    &mut bundle.state,
-                    gpu,
-                    pos,
-                )?;
-            }
-            loaded.seq_pos = context + iterations;
-            Ok(())
+        Ok(())
+    } else if let Some(bundle) = loaded.state.as_mut().and_then(|s| {
+        s.as_arch_model_mut()
+            .as_any_mut()
+            .downcast_mut::<lfm2moe::Lfm2MoeBundle>()
+    }) {
+        if !bundle.config.is_dense() {
+            return Err("retained fixture requires dense LFM".to_string());
         }
-        _ => Err("retained fixture requires Qwen3.5, DeepSeek4 or dense LFM".to_string()),
+        for index in 0..iterations {
+            let token = 101 + index as u32;
+            let pos = (context + index) as u32;
+            lfm2moe::forward::prepare_retained_decode_inputs(
+                &bundle.config,
+                &bundle.weights,
+                &mut bundle.state,
+                gpu,
+                token,
+                pos,
+            )?;
+            lfm2moe::forward::run_retained_decode_body(
+                &bundle.config,
+                &bundle.weights,
+                &mut bundle.state,
+                gpu,
+                pos,
+            )?;
+        }
+        loaded.seq_pos = context + iterations;
+        Ok(())
+    } else {
+        Err("retained fixture requires Qwen3.5, DeepSeek4 or dense LFM".to_string())
     }
 }
 
@@ -806,7 +848,7 @@ pub fn redline_bench_decode_deepseek4(
 ) -> Result<serde_json::Value, String> {
     if loaded.pp > 1
         || loaded.ep.is_some()
-        || !matches!(loaded.state.as_ref(), Some(ModelState::Deepseek4(_)))
+        || !loaded.state.as_ref().is_some_and(|s| s.as_arch_model().as_any().is::<hipfire_arch_deepseek4::Deepseek4Bundle>())
     {
         return Err("bench_decode requires a loaded single-GPU DeepSeek4 model".to_string());
     }
@@ -1197,7 +1239,7 @@ pub fn redline_shadow_deepseek4(
 ) -> Result<serde_json::Value, String> {
     let is_ds4 = loaded.pp == 1
         && loaded.ep.is_none()
-        && matches!(loaded.state.as_ref(), Some(ModelState::Deepseek4(_)));
+        && loaded.state.as_ref().is_some_and(|s| s.as_arch_model().as_any().is::<hipfire_arch_deepseek4::Deepseek4Bundle>());
     let is_lfm = redline_is_dense_lfm(loaded);
     if !is_ds4 && !is_lfm {
         return Err(
@@ -1617,7 +1659,7 @@ pub fn redline_shadow_dspark_verify_pm4(
 ) -> Result<serde_json::Value, String> {
     if loaded.pp > 1
         || loaded.ep.is_some()
-        || !matches!(loaded.state.as_ref(), Some(ModelState::Deepseek4(_)))
+        || !loaded.state.as_ref().is_some_and(|s| s.as_arch_model().as_any().is::<hipfire_arch_deepseek4::Deepseek4Bundle>())
     {
         return Err("DSpark shadow requires a loaded single-GPU DeepSeek4 model".to_string());
     }
@@ -1751,7 +1793,7 @@ pub fn redline_pm4_prefix_profile_deepseek4(
 ) -> Result<serde_json::Value, String> {
     if loaded.pp > 1
         || loaded.ep.is_some()
-        || !matches!(loaded.state.as_ref(), Some(ModelState::Deepseek4(_)))
+        || !loaded.state.as_ref().is_some_and(|s| s.as_arch_model().as_any().is::<hipfire_arch_deepseek4::Deepseek4Bundle>())
     {
         return Err("prefix profile requires a loaded single-GPU DeepSeek4 model".to_string());
     }
@@ -1920,7 +1962,7 @@ pub fn handle_redline_shadow(
         .and_then(|value| value.as_u64())
         .unwrap_or(1) as usize;
     if model.as_ref().is_some_and(|loaded| {
-        matches!(loaded.state.as_ref(), Some(ModelState::Deepseek4(_)))
+        loaded.state.as_ref().is_some_and(|s| s.as_arch_model().as_any().is::<hipfire_arch_deepseek4::Deepseek4Bundle>())
             || redline_is_dense_lfm(loaded)
     }) {
         let loaded = model.as_mut().expect("retained route checked");
@@ -2428,7 +2470,7 @@ pub fn handle_redline_pm4_prefix_profile(
         .and_then(|value| value.as_bool())
         .unwrap_or(false);
     if model.as_ref().is_some_and(|loaded| {
-        matches!(loaded.state.as_ref(), Some(ModelState::Deepseek4(_)))
+        loaded.state.as_ref().is_some_and(|s| s.as_arch_model().as_any().is::<hipfire_arch_deepseek4::Deepseek4Bundle>())
     }) {
         let start = msg
             .get("start")

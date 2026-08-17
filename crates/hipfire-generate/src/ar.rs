@@ -2553,12 +2553,21 @@ pub fn generate(
             // Guarded by scripts/test-qwen35-abort-resume.sh.
             let evict_safe = m.pp <= 1
                 && m.eviction.is_none()
-                && m.state.as_ref().map_or(true, |s| match s {
-                    ModelState::Llama(b) => b.kv.compact_offset == 0,
-                    // qwen35's KV compact_offset lives in the bundle, not the
-                    // always-None m.kv_cache direct field.
-                    ModelState::Qwen35(b) => b.kv_cache.compact_offset == 0,
-                    _ => true,
+                && m.state.as_ref().map_or(true, |s| {
+                    let am = s.as_arch_model();
+                    if let Some(b) =
+                        am.as_any().downcast_ref::<hipfire_arch_llama::LlamaBundle>()
+                    {
+                        b.kv.compact_offset == 0
+                    } else if let Some(b) =
+                        am.as_any().downcast_ref::<hipfire_arch_qwen35::Qwen35Bundle>()
+                    {
+                        // qwen35's KV compact_offset lives in the bundle, not the
+                        // always-None m.kv_cache direct field.
+                        b.kv_cache.compact_offset == 0
+                    } else {
+                        true
+                    }
                 });
             // Resume is only valid for qwen35 (the DeltaNet recurrent state in the
             // bundle). The gate used to read the always-None m.dn_state → resume
@@ -2723,12 +2732,21 @@ pub fn generate(
     let absolute_pos = m.seq_pos.saturating_add(
         m.state
             .as_ref()
-            .and_then(|s| match s {
-                ModelState::Llama(b) => Some(b.kv.compact_offset),
-                // qwen35 KV compact_offset lives in the bundle, not the
-                // always-None m.kv_cache direct field.
-                ModelState::Qwen35(b) => Some(b.kv_cache.compact_offset),
-                _ => None,
+            .and_then(|s| {
+                let am = s.as_arch_model();
+                if let Some(b) =
+                    am.as_any().downcast_ref::<hipfire_arch_llama::LlamaBundle>()
+                {
+                    Some(b.kv.compact_offset)
+                } else if let Some(b) =
+                    am.as_any().downcast_ref::<hipfire_arch_qwen35::Qwen35Bundle>()
+                {
+                    // qwen35 KV compact_offset lives in the bundle, not the
+                    // always-None m.kv_cache direct field.
+                    Some(b.kv_cache.compact_offset)
+                } else {
+                    None
+                }
             })
             .unwrap_or(0),
     );
