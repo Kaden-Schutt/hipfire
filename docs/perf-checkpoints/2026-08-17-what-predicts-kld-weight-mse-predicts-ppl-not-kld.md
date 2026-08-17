@@ -137,3 +137,104 @@ the contamination may cancel, but no $m_2$ number from them is clean in absolute
 - **The 2×128 sub-block result is now the most interesting open item**, because finer
   scale granularity directly attacks within-block error correlation — the mechanism this
   synthesis implicates — rather than the MSE it was selected on.
+
+---
+
+## Amendment — the cross-term prediction was measured and FALSIFIED
+
+The discriminating experiment ran (`crates/hipfire-quantize/examples/mq_kld_proxy.rs`,
+3 tensors: layer-0 `linear_attn.out_proj`, layer-20 `mlp.down_proj`, layer-40
+`mlp.gate_proj`; 12,288 blocks / 3,145,728 weights; engine FWHT seeds 42/1042; imatrix
+`Qwen3.8-27B-imatrix.gguf`; **full** Hessians from
+`/home/kaden/qcal/qwen3.8-27b.calib.hfq`, 496 tensors, gfx942-sourced).
+
+| metric | affine | GL | Δ (gl−aff) | predicted | outcome |
+|---|---|---|---|---|---|
+| $M_0=\|E\|_F^2$ | 5.8381 | 4.6399 | **−20.52%** | −20.6% | GL wins ✓ |
+| $M_1$ diag-weighted | 2.0337 | 1.6111 | **−20.78%** | −10..−15% | GL wins, by *more* |
+| $M_2=\mathrm{Tr}(EA_{\text{rot}}E^\top)$ | 2.0036 | 1.6036 | **−19.96%** | **+8..+15% flip** | **no flip** |
+| $c/m_1$ cross term | — | — | **+1.24%** | ~64% | **negligible** |
+| $\rho$ | −0.015 | −0.005 | — | $\rho_{gl}\gg\rho_{aff}$ | tiny either way |
+
+**The cross term is 1.24% of the diagonal, not the ~64% that $(n_b-1)\rho_e\rho_a$ predicted
+at $n_b=256$.** Within-block error correlation is therefore **not** the mechanism. None of
+the four decision branches fired.
+
+More importantly: **activation weighting does not explain the inversion at all.** $m_1$
+(imatrix diagonal), $m_2$ (full activation covariance), activation-weighted MSE applied
+*before* rotation, and the same applied *after* — all four say GL wins by ~20%. The
+gfx942 provenance of the Hessians could distort $m_2$'s magnitude but cannot manufacture
+a consistent 20% sign agreement across four independent weightings.
+
+### What does reproduce the inversion
+
+| metric | affine | GL | gets affine < GL? |
+|---|---|---|---|
+| tail-99 MSE | 2.539e-06 | 2.015e-05 | **yes, 7.9×** |
+| tail-99.9 MSE | 5.006e-06 | 6.405e-05 | **yes, 12.8×** |
+| max-coefficient rel. error | ~0 | 0.1076 | **yes** (structural for affine) |
+| everything else tested | — | — | no |
+
+The agent discounted the tail metrics because they invert mq3 vs mq3lloyd. **That pair is
+not byte-matched** — 12,618,796,032 B at 3.25 bpw versus 13,379,750,912 B at 3.5 bpw, i.e.
+mq3lloyd carries 6.0% more bytes and duly wins KLD by 29.7%. A metric is not refuted by
+failing to predict that more bytes lose. **The mq4 affine-vs-GL pair remains the only
+byte-comparable comparison in the corpus, and only tail-restricted error gets it right.**
+
+## The predictor the literature names, which we have NOT tested
+
+**SqueezeLLM** ([arXiv:2306.07629](https://arxiv.org/abs/2306.07629)) is the closest
+published analogue — a codebook fitted to weights, exactly our construction — and its
+ablation is decisive: unweighted k-means gives PPL **28.26**; Fisher-weighted gives
+**7.75** at 3-bit LLaMA-7B. Objective:
+
+$$Q^*=\arg\min_Q (W-W_Q)^\top \mathcal F (W-W_Q)
+\;\xrightarrow{\ \mathrm{diag}\ }\;
+\arg\min\sum_i \mathcal F_{ii}\,(w_i-Q(w_i))^2,
+\qquad \mathcal F=\tfrac{1}{|D|}\sum_d g_d g_d^\top$$
+
+**$\mathcal F$ is the Fisher — gradient outer products — not $H=\mathbb{E}[xx^\top]$.**
+This checkpoint previously conflated them. GPTQ/QuIP weight by *activation* second
+moments (layer-local); SqueezeLLM weights by *loss* sensitivity (global). We measured the
+former and it failed; the latter is untested here.
+
+The structural reason they differ: for a linear layer
+$\mathcal F_{ij}\approx\mathbb{E}[g_i^2]\cdot\mathbb{E}[x_j^2]$ — a **per-output-row**
+factor times a per-input-column factor. Every metric tested above weights *columns* only.
+**We have never weighted rows**, and the row factor is where loss sensitivity lives.
+Obtaining it needs one backward pass over calibration data; the imatrix cannot supply it.
+
+## Ranked predictors, with our status against each
+
+| rank | predictor | data needed | literature status | our status |
+|---|---|---|---|---|
+| 1 | **teacher–student KLD** | teacher + student logits | demonstrated (EvoPress fitness, KL-Lens) | **in use as the gate** |
+| 2 | layer-output recon $\sum_\ell\|W_\ell X_\ell-\widehat W_\ell X_\ell\|_F^2$ | calib activations | demonstrated as *solver* objective | untested end-to-end |
+| 3 | Hessian-weighted $\mathrm{tr}(\Delta W H \Delta W^\top)$ | calib Gram | demonstrated as solver objective | **TESTED — FAILS our inversion** |
+| 4 | **Fisher-diagonal weighted codec MSE** | gradients | **demonstrated for codebooks** (SqueezeLLM) | **UNTESTED — the open lead** |
+| 5 | activation-RMS weighted (AWQ / imatrix) | $\mathbb{E}[x_j^2]$ | demonstrated for *scale* choice; weak post-FWHT | **TESTED — FAILS** |
+| 6 | unweighted rotated codec MSE | weights only | no paper validates it as a within-bpw KLD ranker | **TESTED — FAILS**, predicts PPL |
+
+## Structural findings that outrank any metric choice
+
+- **EvoPress** ([arXiv:2410.14649](https://arxiv.org/abs/2410.14649)): *error monotonicity
+  does not hold* — a lower sum of per-layer errors can be **worse** end-to-end, which is
+  why they use KL as the search fitness rather than layer error. This says no layer-local
+  metric, however weighted, is guaranteed to rank formats.
+- **QAM-W**: weight-Frobenius→layer-RMSE amplification varies **0.55–5.5×** across layers,
+  so equal weight error can mean 10× different layer harm.
+- **KL-Lens**: KL *direction* matters — student→teacher tracks PPL sensitivity while the
+  reverse direction is anti-correlated (τ≈−0.14). Worth confirming which direction
+  `eval_hipfire` computes before citing any KLD number as comparable to published work.
+- **Post-rotation diagonal weighting collapses to unweighted MSE.** Confirmed by
+  measurement: our after-rotation imatrix weighting reproduced the plain `mse_rot`
+  ordering exactly. If the imatrix is to be used at all, it must be applied in the
+  **pre-rotation** basis — and even that failed here.
+
+## Standing conclusion
+
+For format design at fixed bpw, **there is no validated cheap proxy.** The gold metric is
+teacher KLD, the one metric that reproduces our only byte-comparable inversion is
+tail-restricted error, and the one published predictor with direct evidence for codebook
+design — Fisher-diagonal weighting — requires gradients we have not collected. Codec MSE
+is confirmed as a PPL proxy and confirmed as a non-predictor of KLD.
