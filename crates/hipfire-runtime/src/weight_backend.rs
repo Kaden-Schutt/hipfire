@@ -413,6 +413,15 @@ pub(crate) const RAW_CODECS: &[RawCodec] = &[
         quant_type: 39,
         dtype: DType::MQ3G256GL,
     },
+    // qt 40 (MQ4-G256-GL). Its 2-bit and 3-bit siblings above were registered but
+    // qt 40 was not, so `dequant_weight_raw` rejected the format with
+    // "unsupported quant_type 40" at load time even though the GEMV dispatch,
+    // the encoder and `DType::{row_stride, requires_k_mod_256}` all handled it.
+    // A qt=40 artifact was therefore unloadable and unscoreable.
+    RawCodec {
+        quant_type: 40,
+        dtype: DType::MQ4G256GL,
+    },
 ];
 
 /// Look up the passthrough codec for `quant_type`, or `None` if it is host-decode
