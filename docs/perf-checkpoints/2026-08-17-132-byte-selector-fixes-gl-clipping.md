@@ -110,3 +110,50 @@ measured not to. The claim stands or falls on hiptrx:
 
 If qt=43 does not reach affine's KLD, the tensor-global-codebook family has been
 given its best shot and should be retired rather than tuned further.
+
+---
+
+## Amendment — the pad byte was worth spending: 64 profiles, not 16
+
+The 132 B layout was specified as 128 B indices + 2 B scale + 1 B selector +
+**1 B pad**. Those pad bits are free, so the selector width was swept on all
+69,632 blocks:
+
+| selector bits | profiles | overall MSE | tail-1% MSE | live / K | max share |
+|---|---|---|---|---|---|
+| 0 (max-norm only) | 1 | 1.1800e-06 | 5.3238e-06 | 1 / 1 | 100.00% |
+| 2 | 4 | 1.1217e-06 | 5.3911e-06 | 4 / 4 | 41.22% |
+| 4 | 16 | 1.0854e-06 | 5.1746e-06 | 16 / 16 | 16.63% |
+| **6** | **64** | **1.0501e-06** | **4.8093e-06** | **62 / 64** | 7.01% |
+
+6 bits buys **3.3% overall MSE and 8.0% tail** over 4 bits, and the tail is the
+KLD-relevant axis. 62 of 64 profiles stay live at a 7.01% max share, so 64 is
+near saturation and 256 is not worth pursuing. Same bytes, same alignment,
+strictly better — the format is 6-bit-selector.
+
+Final measured position:
+
+| format | B | bpw | overall MSE | tail-1% MSE | max-coef relerr |
+|---|---|---|---|---|---|
+| affine qt=1 | 136 | 4.2500 | 1.4642e-06 | 7.8961e-07 | 0.000% |
+| GL_CB4 qt=40 | 130 | 4.0625 | 1.1627e-06 | 1.3921e-05 | 10.859% |
+| **SEL qt=43** | **132** | **4.1250** | **1.0501e-06** | **4.8093e-06** | **0.000%** |
+
+9.7% better overall MSE than shipped GL, **2.89× better tail**, structurally
+non-clipping, and 28.3% better overall MSE than affine at 2.9% fewer bytes.
+
+Constants: [`2026-08-17-gl-cb4s64-family-constants.rs.txt`](2026-08-17-gl-cb4s64-family-constants.rs.txt).
+
+### The 64-entry table needs no LDS
+
+The initial kernel spec called for LDS-staging the codebook. That is wrong for
+this access pattern, and at 64 profiles (4 KiB f32) it would have been actively
+harmful: `__launch_bounds__(32, 16)` puts 16 waves on a CU, and 16 × 4 KiB
+exactly saturates the 64 KiB LDS budget, costing occupancy.
+
+It is unnecessary because **the selector is per-group and therefore wave-uniform**
+— a 32-thread workgroup processes one 256-weight group, so every lane shares one
+profile. The 16 live levels load into SGPRs via scalar loads (8 × `s_load_b64`
+from `sel * 64` bytes): no LDS allocation, no per-lane table traffic, no barrier,
+occupancy untouched. Pressure moves to SGPRs, so the kernel report must include
+the SGPR count alongside VGPRs and the zero-spill check.
