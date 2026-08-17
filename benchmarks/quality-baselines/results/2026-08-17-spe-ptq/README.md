@@ -55,6 +55,28 @@ the same bit budget. Note the in-tree gate for `mq2-lloyd` records "still
 collapse (9B ppl 2163)" — that verdict does not reproduce here at 27B, so it is
 either model-size-specific or stale.
 
+## Width sweep — where the uniform codebook actually fails
+
+| target | bpw | codebook | KLD | PPL |
+|---|---|---|---:|---:|
+| mq4 (the teacher itself) | 4.25 | uniform 16-level | 0.0000 | 7.42 |
+| spe-mq3-control | 3.25 | uniform 8-level | **0.2767** | 13.02 |
+| bonsai-ternary (PrismML) | 2.125 | uniform 3-level + transform | 0.5363 | 16.69 |
+| spe-mq2-lloyd | 2.25 | Lloyd non-uniform 4-level | 0.6125 | 17.04 |
+| spe-tq2-awqim | 2.125 | uniform 3-level + imatrix | 2.2418 | 86.57 |
+| spe-mq2-uniform | 2.25 | uniform 4-level | 3.9225 | 472.05 |
+| spe-tq2-sweep | 2.125 | uniform 3-level | 5.1007 | 1436.38 |
+
+A **uniform** codebook is fine at 8 levels (3 bpw, KLD 0.28) and falls apart at
+4 and 3 levels. The cliff is between 3 and 2 bits, and a non-uniform codebook
+steps across it.
+
+Practical reading for this checkpoint: **MQ3 is the best quality/bit trade
+available by plain PTQ (0.28 at 3.25 bpw), and MQ2-Lloyd is the floor that
+still works (0.61 at 2.25 bpw).** PrismML's transformed ternary sits between
+them at 2.125 bpw — better than our 2.25 bpw Lloyd by 0.08 nats, and worse than
+plain MQ3. It is a real but modest edge, not a different league.
+
 ## Findings
 
 **1. The AWQ sidecars are a usable imatrix, and worth 2.3× at 2 bits.**
@@ -82,6 +104,51 @@ and theirs generate while ours do not. The 27B whitepaper's claim that the
 behaviour-preserving transform — not the packing — is the value is consistent
 with everything measured here. SP-E's original premise (reproduce the transform)
 is not reachable by scale-and-importance tuning alone.
+
+## Port fidelity — hipfire vs llama.cpp on byte-identical weights
+
+The arms above are scored against a hipfire-native teacher, which measures
+model-vs-model distance, NOT whether our port of Bonsai is faithful. That
+needed its own check: score our byte-verbatim `ternary-bonsai-27b.hfq` against
+**PrismML's own llama.cpp running the same GGUF**, on llama's tokens, f32 KV.
+
+```
+build_kld_ref --bf16-gguf Ternary-Bonsai-27B-Q2_0.gguf --n-ctx 512 --top-k 256 \
+    --llama-perplexity-bin /data/prism-ref/build/bin/llama-perplexity
+eval_hipfire --model ternary-bonsai-27b.hfq --ref bonsai-llamacpp.kldref.bin \
+    --kv-mode f32 --scoring-mode per-token --max-chunks 4
+```
+
+**Result: mean KLD = 0.000153** (per-chunk 0.000176 / 0.000139 / 0.000191 /
+0.000107; p99 ≈ 1.5e-3). Corroborated on the realized-token metric: llama.cpp's
+own cumulative PPL after 4 chunks is **14.1907**, hipfire scores **14.1456** on
+the same tokens — 0.3% apart.
+
+So the ternary port is exact to numerical noise (GPU vs CPU reduction order,
+fp16 storage). This also validates the whole chain independently of the
+hipfire-native teacher: convert, loader, TQ2G128 GEMV, ternary lm_head,
+DeltaNet forward and scoring window all agree with the reference implementation.
+
+### This contradicts the recorded cross-engine floor
+
+`build_kld_ref_native`'s header and
+`docs/plans/2026-06-02-hfqv2-implementation/experiments/self-sufficient-eval/F2-native-eval.md`
+document a "~0.30-0.36 nat" hipfire-vs-llama.cpp floor (F1 measured 0.357 nats,
+87% top-1, top-256 logit cosine 0.854) and attribute it to "the two different
+Gated-DeltaNet ports". That premise is why the native reference tool exists.
+
+It does not reproduce here: **0.000153 vs a claimed 0.35 floor**, on a hybrid
+model whose layers are mostly linear-attn, with byte-identical weights on both
+sides — a strictly tighter control than F1's (which compared hipfire-F32
+against llama-bf16).
+
+Most likely explanation: the floor was a real hipfire bug that has since been
+fixed — SP-A (2026-07-15) found and fixed exactly this class of defect, a
+double-applied RMSNorm `+1` bias on qwen3.5/3.6 norms (`4af90702`), which
+postdates the F1/F2 measurement. Worth re-running F1 before continuing to treat
+llama-sourced references as structurally unusable; if this holds generally, the
+cross-harness confound that motivated F2 is gone, and llama.cpp tooling
+(imatrix, perplexity) becomes directly usable again.
 
 ## Provenance / validity
 
