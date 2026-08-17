@@ -38,8 +38,18 @@ CRATES = ROOT / "crates"
 BEGIN = "<!-- crate-map:generated:begin -->"
 END = "<!-- crate-map:generated:end -->"
 
+# Leading whitespace is REQUIRED to be optional here. Anchoring `^pub` at column
+# zero silently reported 0 public items for `rdna-compute/src/gemm.rs`, a file with
+# 296 of them -- every one is a method inside an `impl Gpu` block, so every one is
+# indented. Any crate whose API is methods rather than free functions was
+# under-counted the same way, and the drift check passed anyway because it
+# regenerates the map with the same counter: a self-consistent wrong measurement.
+#
+# Caveat this cannot resolve by regex: a `pub fn` inside a private `mod` is not
+# actually public API, so this over-counts in that case. Over-counting a few is
+# strictly better than reporting 296 as 0.
 PUB_ITEM = re.compile(
-    r"^pub\s+(?:unsafe\s+)?(?:async\s+)?(?:default\s+)?"
+    r"^\s*pub\s+(?:unsafe\s+)?(?:async\s+)?(?:default\s+)?"
     r"(fn|struct|enum|trait|type|const|static|mod|use)\s+([A-Za-z_][A-Za-z0-9_]*)"
 )
 TEST_ATTR = re.compile(r"#\[(?:[A-Za-z_:]+::)?test\]")
