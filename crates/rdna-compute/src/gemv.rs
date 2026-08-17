@@ -6668,6 +6668,46 @@ impl Gpu {
         result
     }
 
+    /// Explicit-R variant for benchmarking (`R` in {1,2,4,8}). Mirrors `gemv_mq4g256gl_multirow_with_rows`.
+    /// Allows `bench_gemv_paired_throughput` to sweep R without relying on `HIPFIRE_GEMV_ROWS` env caching.
+    pub fn gemv_hfq4g256_with_rows(&mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize, rows: usize) -> HipResult<()> {
+        if rows == 1 {
+            return self.gemv_hfq4g256(a_raw, x, y, m, k);
+        }
+        assert!(matches!(rows, 2|4|8), "gemv_hfq4g256_with_rows: rows must be 1,2,4,8 (got {rows})");
+        self.bind_thread()?;
+        let func_name = match rows { 2 => "gemv_hfq4g256_multirow_r2", 4 => "gemv_hfq4g256_multirow_r4", 8 => "gemv_hfq4g256_multirow_r8", _ => unreachable!() };
+        // Mirror the gfx1151/rdna3 branching from `gemv_hfq4g256` but force the default path on gfx1201.
+        // On gfx1201 the dispatch always picks `gemv_hfq4g256_multirow_default` (see gemv.rs use_multirow branch).
+        let is_rdna3_dgpu = self.arch_caps.is_rdna3_dgpu();
+        let is_gfx1151 = self.arch_caps.is_gfx1151();
+        // Replicate the timer/param setup from gemv_hfq4g256
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut std::ffi::c_void> = vec![&a_ptr as *const _ as *mut std::ffi::c_void, &x_ptr as *const _ as *mut std::ffi::c_void, &y_ptr as *const _ as *mut std::ffi::c_void, &m_val as *const _ as *mut std::ffi::c_void, &k_val as *const _ as *mut std::ffi::c_void];
+        let blob_builder = || { let mut b = hip_bridge::KernargBlob::new(); b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr); b.push_i32(m_val); b.push_i32(k_val); b };
+        let bytes = crate::profile::gemv_hfq4g256_bytes(m, k);
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_hfq4g256", bytes);
+        let result = if is_gfx1151 || is_rdna3_dgpu {
+            // Keep the arch-specific branching minimal: delegate to the standard dispatch for non-gfx1201.
+            // We cannot easily replicate the full gfx1151 cpol branching here; just call the generic gemv which will
+            // use the arch default (which on those archs is R=1 anyway, so R>1 is not the common case).
+            // For gfx1201 this branch is not taken.
+            self.ensure_kernel("gemv_hfq4g256_multirow_default", crate::kernels::GEMV_HFQ4G256_MULTIROW_SRC, func_name)?;
+            let grid = ((m as u32) + rows as u32 - 1) / rows as u32;
+            self.launch_maybe_blob(func_name, [grid,1,1], [32,1,1], 0, &mut params, blob_builder)
+        } else {
+            self.ensure_kernel("gemv_hfq4g256_multirow_default", crate::kernels::GEMV_HFQ4G256_MULTIROW_SRC, func_name)?;
+            let grid = ((m as u32) + rows as u32 - 1) / rows as u32;
+            self.launch_maybe_blob(func_name, [grid,1,1], [32,1,1], 0, &mut params, blob_builder)
+        };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// HFQ4-G256 GEMV with fused residual add: y[row] += A[row] · x.
     /// Same math as `gemv_hfq4g256` but the final write accumulates into `y`
     /// instead of overwriting. Used for wo / w_down projections where the
