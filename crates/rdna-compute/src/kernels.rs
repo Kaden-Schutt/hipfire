@@ -1050,6 +1050,8 @@ pub const GEMV_MQ4G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq4g2
 pub const GEMV_MQ4G256GL_SRC: &str = include_str!("../../../kernels/src/gemv_mq4g256gl.hip");
 pub const GEMV_MQ4G256GL_MULTIROW_SRC: &str =
     include_str!("../../../kernels/src/gemv_mq4g256gl_multirow.hip");
+pub const GEMV_MQ4G256GL_INT8_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq4g256gl_int8.hip");
 pub const MQ_ROTATE_X_GFX942_SRC: &str =
     include_str!("../../../kernels/src/mq_rotate_x.gfx942.hip");
 pub const GEMV_MQ4G128_SRC: &str = include_str!("../../../kernels/src/gemv_mq4g128.hip");

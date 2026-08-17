@@ -17,6 +17,29 @@ use half::f16;
 use rdna_compute::{Gpu, GL_CB4, GL_GROUP_SCALE_BYTES, GL_MQ4_GROUP_IDX_BYTES};
 use std::time::Instant;
 
+/// Locked int8 decode scale: 127 / GL_CB4[15] (= 127 / 2.7326).
+const GL_I8_SCALE: f32 = 127.0 / 2.7326;
+
+fn gl_levels_i8() -> [i8; 16] {
+    let mut out = [0i8; 16];
+    for i in 0..16 {
+        out[i] = (GL_CB4[i] * GL_I8_SCALE).round() as i8;
+    }
+    out
+}
+
+/// Per-vector absmax/127 host quant of activations (consumer-only gate).
+fn quantize_x_i8(x: &[f32]) -> (Vec<i8>, f32) {
+    let amax = x.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+    let scale = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+    let inv = if amax > 0.0 { 127.0 / amax } else { 0.0 };
+    let q: Vec<i8> = x
+        .iter()
+        .map(|&v| (v * inv).round().clamp(-128.0, 127.0) as i8)
+        .collect();
+    (q, scale)
+}
+
 fn main() {
     let mut gpu = Gpu::init().expect("Gpu::init");
     eprintln!("arch={}", gpu.arch);
@@ -63,6 +86,32 @@ fn main() {
         }
     }
 
+    // --- int8-dot consumer parity (host-quant x) ---
+    {
+        let lv = gl_levels_i8();
+        eprintln!("GL_I8_SCALE={GL_I8_SCALE} levels_i8={lv:?}");
+    }
+    let int8_shapes = [
+        (1usize, 256usize),
+        (3, 256),
+        (17, 256),
+        (1, 512),
+        (3, 512),
+        (17, 512),
+        (4096, 5120),
+    ];
+    for &(m, k) in &int8_shapes {
+        let (ok, max_nerr, peak, max_dev) = run_shape_parity_int8(&mut gpu, m, k);
+        eprintln!(
+            "int8_parity m={m} k={k}: {}  max_norm_err={:.6e}  peak={:.6e}  int8_vs_exact_dev={:.6e}",
+            if ok { "PASS" } else { "FAIL" },
+            max_nerr,
+            peak,
+            max_dev
+        );
+        any_fail |= !ok;
+    }
+
     // --- warm median timing at largest shape ---
     let (m, k) = (4096usize, 5120usize);
     let gpr = k / 256;
@@ -92,6 +141,7 @@ fn main() {
     let gl_med = time_gemv_gl(&mut gpu, m, k);
     let lloyd_med = time_gemv_lloyd(&mut gpu, m, k);
     let uni_med = time_gemv_uniform(&mut gpu, m, k);
+    let int8_med = time_gemv_gl_int8(&mut gpu, m, k);
     let gl_gbps = (gl_bytes as f64) / gl_med / 1e9;
     let lloyd_gbps = (lloyd_bytes as f64) / lloyd_med / 1e9;
     let uni_gbps = (uniform_bytes as f64) / uni_med / 1e9;
@@ -103,6 +153,10 @@ fn main() {
     eprintln!(
         "timing m={m} k={k}: mq4g256_uniform median={:.3} us  (n=30 after 5 warmup, gemv_mq4g256_prerotated)",
         uni_med * 1e6
+    );
+    eprintln!(
+        "timing m={m} k={k}: mq4g256gl_int8 median={:.3} us  (n=30 after 5 warmup, host Instant; device truth below)",
+        int8_med * 1e6
     );
     eprintln!(
         "bandwidth m={m} k={k}: gl bytes={gl_bytes} gbps={gl_gbps:.2}  lloyd bytes={lloyd_bytes} gbps={lloyd_gbps:.2}  uniform bytes={uniform_bytes} gbps={uni_gbps:.2}"
@@ -483,6 +537,147 @@ fn run_shape_parity_multirow(
         }
     }
     (ok, max_nerr, peak)
+}
+
+// ---------------------------------------------------------------------------
+// int8-dot path (host-quant activations; consumer-only)
+// ---------------------------------------------------------------------------
+
+/// Exact int8-model reference: same levels_i8, same x_q8, i64 acc, scales outside.
+fn ref_gemv_int8_f64(
+    codes: &[u8],
+    scales: &[f32],
+    x_q8: &[i8],
+    x_scale: f32,
+    m: usize,
+    k: usize,
+) -> (Vec<f64>, Vec<f64>) {
+    let levels = gl_levels_i8();
+    let gpr = k / 256;
+    let inv = 1.0f64 / (GL_I8_SCALE as f64);
+    let xs = x_scale as f64;
+    let mut y = vec![0.0f64; m];
+    let mut sum_abs = vec![0.0f64; m];
+    for row in 0..m {
+        let mut acc = 0.0f64;
+        let mut sab = 0.0f64;
+        for g in 0..gpr {
+            let scale = scales[row * gpr + g] as f64;
+            let base = g * 256;
+            let c0 = row * k + base;
+            let mut acc_i: i64 = 0;
+            for j in 0..256 {
+                let q = codes[c0 + j] as usize;
+                let wi = levels[q] as i64;
+                let xi = x_q8[base + j] as i64;
+                acc_i += wi * xi;
+            }
+            let term = scale * inv * xs * (acc_i as f64);
+            acc += term;
+            sab += term.abs();
+        }
+        y[row] = acc;
+        sum_abs[row] = sab;
+    }
+    (y, sum_abs)
+}
+
+fn gpu_gemv_gl_int8(
+    gpu: &mut Gpu,
+    blob: &[u8],
+    x_q8: &[i8],
+    x_scale: f32,
+    m: usize,
+    k: usize,
+) -> Vec<f32> {
+    let d_a = gpu.upload_raw(blob, &[blob.len()]).unwrap();
+    // Upload int8 bytes via raw path (no typed i8 helper).
+    let x_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(x_q8.as_ptr() as *const u8, x_q8.len()) };
+    let d_x = gpu.upload_raw(x_bytes, &[k]).unwrap();
+    let d_y = gpu.zeros(&[m], rdna_compute::DType::F32).unwrap();
+    gpu.gemv_mq4g256gl_int8(&d_a, &d_x, &d_y, m, k, x_scale)
+        .unwrap();
+    gpu.hip.device_synchronize().unwrap();
+    gpu.download_f32(&d_y).unwrap()
+}
+
+fn run_shape_parity_int8(gpu: &mut Gpu, m: usize, k: usize) -> (bool, f64, f64, f64) {
+    let w_rot: Vec<f32> = (0..m * k)
+        .map(|i| fract_sin(i as f32 * 0.731 + 1.337) * 0.5)
+        .collect();
+    let x_rot: Vec<f32> = (0..k)
+        .map(|i| fract_sin(i as f32 * 0.513 + 2.719))
+        .collect();
+    let (blob, codes, scales) = pack_mq4g256gl_rotated(&w_rot, m, k);
+    let (x_q8, x_scale) = quantize_x_i8(&x_rot);
+
+    let (want_i8, sum_abs) = ref_gemv_int8_f64(&codes, &scales, &x_q8, x_scale, m, k);
+    let peak = want_i8.iter().map(|v| v.abs()).fold(0.0f64, f64::max);
+    let got = gpu_gemv_gl_int8(gpu, &blob, &x_q8, x_scale, m, k);
+
+    let mut max_nerr = 0.0f64;
+    let mut ok = true;
+    for row in 0..m {
+        let nerr = norm_err(got[row], want_i8[row], sum_abs[row], peak);
+        if nerr > max_nerr {
+            max_nerr = nerr;
+        }
+        // Integer path on both sides → tight gate.
+        if nerr > 1e-6 {
+            ok = false;
+            if row < 8 {
+                eprintln!(
+                    "  int8 row {row}: got={:.6e} want={:.6e} nerr={:.3e}",
+                    got[row], want_i8[row], nerr
+                );
+            }
+        }
+    }
+
+    // Informational: int8 model vs exact GL (f32(scale)*GL_CB4[code]*x_rot).
+    let (want_exact, _) = ref_gemv_f64(&codes, &scales, &x_rot, m, k);
+    let mut max_dev = 0.0f64;
+    let peak_ex = want_exact.iter().map(|v| v.abs()).fold(0.0f64, f64::max).max(1e-12);
+    for row in 0..m {
+        let d = (want_i8[row] - want_exact[row]).abs() / peak_ex;
+        if d > max_dev {
+            max_dev = d;
+        }
+    }
+    (ok, max_nerr, peak, max_dev)
+}
+
+fn time_gemv_gl_int8(gpu: &mut Gpu, m: usize, k: usize) -> f64 {
+    let w_rot: Vec<f32> = (0..m * k)
+        .map(|i| fract_sin(i as f32 * 0.11 + 0.3) * 0.4)
+        .collect();
+    let x_rot: Vec<f32> = (0..k).map(|i| fract_sin(i as f32 * 0.07 + 1.1)).collect();
+    let (blob, _, _) = pack_mq4g256gl_rotated(&w_rot, m, k);
+    let (x_q8, x_scale) = quantize_x_i8(&x_rot);
+    let d_a = gpu.upload_raw(&blob, &[blob.len()]).unwrap();
+    let x_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(x_q8.as_ptr() as *const u8, x_q8.len()) };
+    let d_x = gpu.upload_raw(x_bytes, &[k]).unwrap();
+    let d_y = gpu.zeros(&[m], rdna_compute::DType::F32).unwrap();
+
+    for _ in 0..5 {
+        gpu.gemv_mq4g256gl_int8(&d_a, &d_x, &d_y, m, k, x_scale)
+            .unwrap();
+    }
+    gpu.hip.device_synchronize().unwrap();
+
+    let mut times = Vec::with_capacity(30);
+    for _ in 0..30 {
+        gpu.hip.device_synchronize().unwrap();
+        let t0 = Instant::now();
+        gpu.gemv_mq4g256gl_int8(&d_a, &d_x, &d_y, m, k, x_scale)
+            .unwrap();
+        gpu.hip.device_synchronize().unwrap();
+        times.push(t0.elapsed().as_secs_f64());
+    }
+    times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    times[times.len() / 2]
 }
 
 

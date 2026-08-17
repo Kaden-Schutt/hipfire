@@ -12096,6 +12096,89 @@ impl Gpu {
         result
     }
 
+    /// Dense MQ4-G256-GL GEMV int8-dot kill experiment (qt=40 consumer only).
+    /// Same weight blob as [`Self::gemv_mq4g256gl`]; `x_q8` is host-quantized
+    /// int8 activations and `x_scale` is the matching per-vector absmax/127
+    /// scale. Codebook is [`crate::GL_CB4`] — derived to int8 levels in-kernel.
+    pub fn gemv_mq4g256gl_int8(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_q8: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_scale: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_mq4g256gl_int8",
+            kernels::GEMV_MQ4G256GL_INT8_SRC,
+            "gemv_mq4g256gl_int8",
+        )?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x_q8.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let cb = crate::GL_CB4;
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let xs = x_scale;
+        // extern "C": (A, x_q8, y, cb0..cb15, M, K, x_scale)
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &cb[0] as *const _ as *mut c_void,
+            &cb[1] as *const _ as *mut c_void,
+            &cb[2] as *const _ as *mut c_void,
+            &cb[3] as *const _ as *mut c_void,
+            &cb[4] as *const _ as *mut c_void,
+            &cb[5] as *const _ as *mut c_void,
+            &cb[6] as *const _ as *mut c_void,
+            &cb[7] as *const _ as *mut c_void,
+            &cb[8] as *const _ as *mut c_void,
+            &cb[9] as *const _ as *mut c_void,
+            &cb[10] as *const _ as *mut c_void,
+            &cb[11] as *const _ as *mut c_void,
+            &cb[12] as *const _ as *mut c_void,
+            &cb[13] as *const _ as *mut c_void,
+            &cb[14] as *const _ as *mut c_void,
+            &cb[15] as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &xs as *const _ as *mut c_void,
+        ];
+        let gpr = k / 256;
+        let w_bytes = m * gpr * (crate::GL_MQ4_GROUP_IDX_BYTES + crate::GL_GROUP_SCALE_BYTES);
+        // x is int8 (1 B) + y f32; no f32 activation stream.
+        let bytes = w_bytes + k + m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_mq4g256gl_int8", bytes);
+        let result = self.launch_maybe_blob(
+            "gemv_mq4g256gl_int8",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            // Dynamic LDS: hoisted row scales only (int8 levels live in VGPRs).
+            (gpr * 4) as u32,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                for c in cb {
+                    b.push_f32(c);
+                }
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_f32(xs);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// MQ4-G256-GL multirow GEMV — R rows per warp, matching hfq4g256_multirow MLP.
     /// Reads `crate::GL_CB4` internally (never a caller-provided codebook).
     /// Grid `ceil(M/R)` blocks of 32, dynamic LDS `(16+R*gpr)*4`.
