@@ -30,3 +30,11 @@ daemon_lines                <= 3900
 # probes are gated behind `--features lab`; this is the count still ungated.
 # 28 of these are invoked by scripts or change_gate routes and are meant to stay.
 ungated_examples            <= 32
+
+# --- layering, derived from the Cargo graph (scripts/check-layering.py) ---
+# An arch crate must not depend on anything above the arch band. The band is
+# computed each run, so downward edges to hipfire-dispatch / saddle-core / 
+# hipfire-runtime stay legal and an edge to hipfire-loader / engine / generate /
+# daemon / cli fails the build.
+arch_depends_upward         == 0
+layer_unlisted_crates       == 0

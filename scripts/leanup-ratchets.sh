@@ -170,6 +170,17 @@ PYEOF
 }
 p ungated_examples "$(ungated_examples)"
 
+# --- layering, derived from the Cargo graph -------------------------------
+# scripts/check-layering.py computes the arch band from the real dependency
+# graph rather than from a declared rule. The Phase 3 scope asserted that arch
+# crates must not depend on saddle-core or hipfire-dispatch; measuring showed 11
+# such edges already exist and are correct -- those crates sit at layers 4-5,
+# BELOW the arch band at 6-7. A hardcoded rule would have failed on legitimate
+# structure.
+while read -r _k _v; do
+  case "$_k" in [a-z]*) p "$_k" "$_v" ;; esac
+done < <(python3 scripts/check-layering.py 2>/dev/null | grep -E '^[a-z_]+[[:space:]]+[0-9]+$')
+
 # --- assertion -------------------------------------------------------------
 # The point of the file. A metric named in scripts/leanup-thresholds.txt must
 # satisfy its threshold or this exits non-zero.
