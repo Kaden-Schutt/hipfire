@@ -765,7 +765,7 @@ impl KernelKey {
             MQ5G256 => ArchPredicate::HasMmq,
             MQ6G256 | HFQ6G256 => ArchPredicate::HasMmq,
             MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd => ArchPredicate::HasWave32,
-            MQ2G256GL | MQ3G256GL | MQ4G256GL | MQ4G256GLW | MQ4G256SEL | MQ35G256GL | MQ1G1024GL => ArchPredicate::HasWave32,
+            MQ2G256GL | MQ3G256GL | MQ4G256GL | MQ4G256SEL | MQ35G256GL | MQ1G1024GL => ArchPredicate::HasWave32,
             Q8HFQ | Raw => ArchPredicate::Always,
         }
     }
@@ -827,7 +827,6 @@ pub fn dtype_needs_rotation(dtype: DType) -> bool {
             | MQ2G256GL
             | MQ3G256GL
             | MQ4G256GL
-            | MQ4G256GLW
             | MQ4G256SEL
             | MQ35G256GL
             | MQ1G1024GL

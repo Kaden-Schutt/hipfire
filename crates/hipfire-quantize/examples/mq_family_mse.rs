@@ -85,10 +85,6 @@ const GL_CB4: [f32; 16] = [
     -2.7326, -2.0690, -1.6180, -1.2562, -0.9423, -0.6568, -0.3880, -0.1284,
     0.1284, 0.3880, 0.6568, 0.9423, 1.2562, 1.6180, 2.0690, 2.7326,
 ];
-const GL_CB4W: [f32; 16] = [
-    -4.0000, -2.4997, -1.8743, -1.4274, -1.0594, -0.7340, -0.4321, -0.1429,
-    0.1429, 0.4321, 0.7340, 1.0594, 1.4274, 1.8743, 2.4997, 4.0000,
-];
 const GL_CB35: [[f32; 2]; 128] = [
     [-3.036506, 0.557011],
     [-2.902707, -0.608592],
@@ -600,17 +596,17 @@ fn main() {
     println!("\nCombined {} x256 groups, {} x1024 groups", all_b256.len(), all_b1024.len());
     let mse_aff = mse_affine(&all_b256);
     let mse_cb4_rms = mse_gl(&all_b256, &all_s256, &GL_CB4);
-    let mse_cb4w_rms = mse_gl(&all_b256, &all_s256, &GL_CB4W);
     let mse_cb3_rms = mse_gl(&all_b256, &all_s256, &GL_CB3);
     let mse_cb2_rms = mse_gl(&all_b256, &all_s256, &GL_CB2);
     let mse_cb1_rms = mse_gl(&all_b1024, &all_s1024, &GL_CB1);
+    // --- Baseline RMS table (kept for self-validation) ---
     println!("\n=== Combined MSE (rotated domain, fp16 RMS) ===");
     println!(" affine (4-bit uniform) : {:.8e}", mse_aff);
     println!(" GL_CB4 (4-bit)         : {:.8e}  gain {:.2}% vs affine", mse_cb4_rms, 100.0 * (1.0 - mse_cb4_rms / mse_aff));
-    println!(" GL_CB4W weighted (4b)  : {:.8e}  vs GL_CB4 {:.2}%  vs affine {:.2}%  (EXPECTED WORSE unweighted; weighted objective)", mse_cb4w_rms, 100.0 * (mse_cb4w_rms / mse_cb4_rms - 1.0), 100.0 * (1.0 - mse_cb4w_rms / mse_aff));
     println!(" GL_CB3 (3-bit)         : {:.8e}  vs GL_CB4 {:.2}%  vs affine {:.2}%", mse_cb3_rms, 100.0 * (mse_cb3_rms / mse_cb4_rms - 1.0), 100.0 * (1.0 - mse_cb3_rms / mse_aff));
     println!(" GL_CB2 (2-bit)         : {:.8e}  vs GL_CB4 {:.2}%  vs affine {:.2}%", mse_cb2_rms, 100.0 * (mse_cb2_rms / mse_cb4_rms - 1.0), 100.0 * (1.0 - mse_cb2_rms / mse_aff));
     println!(" GL_CB1 (1-bit)         : {:.8e}  vs GL_CB4 {:.2}%  vs affine {:.2}%", mse_cb1_rms, 100.0 * (mse_cb1_rms / mse_cb4_rms - 1.0), 100.0 * (1.0 - mse_cb1_rms / mse_aff));
+    // Per-tensor RMS table
     println!("\n=== Per-tensor MSE (RMS) ===");
     println!("{:<35} {:>12} {:>12} {:>12} {:>12} {:>12}", "tensor", "affine", "GL_CB4", "GL_CB3", "GL_CB2", "GL_CB1");
     for r in &recs {
@@ -625,9 +621,6 @@ fn main() {
     let m_cb4_rms = metrics_scalar(&all_b256, &GL_CB4, false, false);
     let m_cb4_ls  = metrics_scalar(&all_b256, &GL_CB4, true, false);
     let m_cb4_ls2 = metrics_scalar(&all_b256, &GL_CB4, true, true);
-    let m_cb4w_rms = metrics_scalar(&all_b256, &GL_CB4W, false, false);
-    let m_cb4w_ls  = metrics_scalar(&all_b256, &GL_CB4W, true, false);
-    let m_cb4w_ls2 = metrics_scalar(&all_b256, &GL_CB4W, true, true);
     let m_cb3_rms = metrics_scalar(&all_b256, &GL_CB3, false, false);
     let m_cb3_ls  = metrics_scalar(&all_b256, &GL_CB3, true, false);
     let m_cb3_ls2 = metrics_scalar(&all_b256, &GL_CB3, true, true);
@@ -648,7 +641,6 @@ fn main() {
         ("GL_CB2", 2, m_cb2_rms, m_cb2_ls),
         ("GL_CB3", 3, m_cb3_rms, m_cb3_ls),
         ("GL_CB4", 4, m_cb4_rms, m_cb4_ls),
-        ("GL_CB4W", 4, m_cb4w_rms, m_cb4w_ls),
         ("GL_CB35", 3, m_cb35_rms, m_cb35_ls), // 7b per pair ~3.5b per weight, label bits approx
     ];
     for (name, bits, rms, ls) in rows {

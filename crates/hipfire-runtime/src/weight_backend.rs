@@ -427,6 +427,7 @@ pub(crate) const RAW_CODECS: &[RawCodec] = &[
         dtype: DType::MQ4G256SEL,
     },
 ];
+/// Look up the passthrough codec for `quant_type`, or `None` if it is host-decode
 /// (1/2/16) or genuinely unsupported.
 pub(crate) fn raw_codec(quant_type: u8) -> Option<&'static RawCodec> {
     RAW_CODECS.iter().find(|c| c.quant_type == quant_type)

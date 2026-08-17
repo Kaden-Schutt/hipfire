@@ -4538,37 +4538,6 @@ pub(crate) const GL_CB4: [f32; 16] = [
     -2.7326, -2.0690, -1.6180, -1.2562, -0.9423, -0.6568, -0.3880, -0.1284,
     0.1284, 0.3880, 0.6568, 0.9423, 1.2562, 1.6180, 2.0690, 2.7326,
 ];
-/// Range-widened GL 4-bit codebook (GL_CB4R, R for range) — fixes the clipping
-/// pathology that explains the KLD gap.
-///
-/// Measured on 139,264 real post-FWHT 256-blocks from layers.20.mlp.down_proj
-/// (bf16-widened, FWHT-256 seeds 42/1042, per-block RMS normalisation exactly as
-/// `gl_encode_block`): fraction of ALL weights beyond GL_CB4's outermost 2.7326 is
-/// 0.606%, but 82.57% of BLOCKS have their LARGEST coefficient clipped (per-block
-/// max |z| mean 3.048, p50 3.002, p99 4.061, max 5.788; overshoot mean 1.108x max
-/// 2.118x; clipped per block mean 1.55). Uniform affine cannot clip by construction
-/// (per-block min/max). Only 0.6% of weights are clipped so codec MSE barely notices
-/// (GL still wins 22.69%), but the clipped value is the largest in 5/6 blocks and
-/// moves logits, so KLD is hit hard (+11.28% WT2, 27.52% v6 selector, widening on
-/// peaked conversation distribution).
-///
-/// Importance weighting repositions levels WITHIN the existing range, it does not
-/// extend the range, and the FWHT Gaussianises every block (per-block codebook buys
-/// only 1.8% because optimal level SHAPE is universal), so reweighting leaves the
-/// pooled shape essentially unchanged. The correct lever is RANGE, not weighting.
-///
-/// This codebook pins outermost magnitude at 4.0 and Lloyd-optimises the remaining
-/// 7 magnitudes for a unit Gaussian subject to that constraint (constrained Lloyd:
-/// fix level 8, iterate other 7 to conditional means with boundary at 4.0), keeping
-/// `cb[15-q] = -cb[q]`. Seed 42, 100 iterations on 5M Gaussian samples, deterministic.
-/// Result: outermost 4.0 eliminates clipping from 82.57% to 1.29% of blocks (0.606%
-/// to 0.005% of weights) at zero byte cost (same 130 B/group, 4.0625 bpw, SoA).
-/// Unweighted codec MSE necessarily WORSES vs GL_CB4 (0.00949 -> 0.01143, 20%),
-/// because pinning at 4.0 coarsens the bulk — that is expected and not a failure.
-pub(crate) const GL_CB4R: [f32; 16] = [
-    -4.0000, -2.4997, -1.8743, -1.4274, -1.0594, -0.7340, -0.4321, -0.1429,
-    0.1429, 0.4321, 0.7340, 1.0594, 1.4274, 1.8743, 2.4997, 4.0000,
-];
 /// MQ4-G256-SEL (qt=43) codebook family: 64 profiles x 16 levels.
 /// MAX-NORMALISED space -- the 2-byte block scale field stores the block's max
 /// |coefficient|, so level 15 == +1.0 lands EXACTLY on that maximum and the
@@ -13984,6 +13953,9 @@ fn main() {
                             let q = quantize_hfq4g128(&f32_data);
                             (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                         }
+                    } else if (use_mq2gl || use_mq3gl || use_mq35gl || use_mq4gl || use_mq4sel) && is_embed {
+                        let q = quantize_q8f16(&f32_data);
+                        (q, QuantType::Q8F16, 32u32, "Q8_F16")
                     } else if use_mq2gl {
                         let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
                         if k_dim % 256 == 0 {
@@ -14121,6 +14093,21 @@ fn main() {
                         (q, QuantType::Q4F16G64, 64u32, "Q4_F16")
                     }
                 }; // end K-map outer if-else
+                // Regression guard: Q4F16G64 is legacy fallback — fail loudly unless explicitly requested.
+                // This catches silent fall-throughs like the mq4sel embed bug (qt=0 instead of Q8).
+                if qt == QuantType::Q4F16G64 {
+                    let is_q4_opt_in = format == "q4f16"
+                        || format == "q4f16g64"
+                        || format == "q4"
+                        || format == "q4f16_g64";
+                    if !is_q4_opt_in {
+                        eprintln!(
+                            "error: tensor '{}' fell through to QuantType::Q4F16G64 (qt=0, G64 fallback) with --format '{}'; this indicates a missing classification arm (likely is_embed). Add the format to the appropriate is_embed guard or explicitly request --format q4f16g64.",
+                            name, format
+                        );
+                        std::process::exit(1);
+                    }
+                }
 
                 // Compute quantization error (skip for Q8 embeddings — always negligible)
                 let block_size = gs as usize;
