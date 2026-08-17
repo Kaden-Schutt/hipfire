@@ -142,9 +142,9 @@ pub const GL_CB3: [f32; 8] = [
 /// Gaussian moments; the same solver reproduces [`GL_CB2`] and [`GL_CB3`] to
 /// four decimals and their documented MSEs, which is what validates it.
 ///
-/// NOTE: no kernel consumes this yet — MQ4-GL is currently encode-only. The
-/// constant lives here so the encoder/runtime pair is drift-guarded from the
-/// start rather than after a kernel lands and silently disagrees.
+/// Consumed by `gemv_mq4g256gl` / `gemv_mq4g256gl_multirow` (qt=40 decode,
+/// SoA 130 B/group = 4.0625 bpw). `GL_CB4` is passed as sixteen scalar kernel
+/// args (`cb0..cb15`); the quantized file carries only indices+scales.
 pub const GL_CB4: [f32; 16] = [
     -2.7326, -2.0690, -1.6180, -1.2562, -0.9423, -0.6568, -0.3880, -0.1284,
     0.1284, 0.3880, 0.6568, 0.9423, 1.2562, 1.6180, 2.0690, 2.7326,

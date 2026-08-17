@@ -138,15 +138,9 @@ pub fn dtype_post_rotation_variant(dtype: DType) -> GemvVariant {
     use DType::*;
     match dtype {
         ParoQ4G128 => GemvVariant::Plain,
-        // NOTE MQ2G256GL / MQ3G256GL / MQ4G256GL are deliberately NOT listed here.
-        // They are MoE-routed-expert-only formats (MQ4-GL dense GEMV is slice B /
-        // later): the only kernels that exist today are the indexed MoE GEMVs for
-        // qt=38/39, so there is no dense "prerotated" GEMV to dispatch. Claiming
-        // Prerotated would make `for_gemv_prerotated` look resolvable and then fail
-        // deeper; leaving them on the `_` arm keeps the failure at the (correct)
-        // `UnsupportedVariant` boundary.
         MQ4G256 | MQ3G256 | MQ2G256 | MQ5G256 | MQ6G256 | MQ8G256 | MQ2G256Lloyd | MQ3G256Lloyd
-        | MQ4G256Lloyd | MFP4G32 | MFP4G32Lloyd | MFP4G32P | MFP4G32E8 | MFP4G32E8SOA | MQ4G128 => {
+        | MQ4G256Lloyd | MFP4G32 | MFP4G32Lloyd | MFP4G32P | MFP4G32E8 | MFP4G32E8SOA | MQ4G128
+        | MQ4G256GL | MQ3G256GL | MQ2G256GL | MQ35G256GL | MQ1G1024GL => {
             GemvVariant::Prerotated
         }
         _ => GemvVariant::Plain,
@@ -234,6 +228,7 @@ pub enum KernelKey {
     GemvQ8HFQ,
     // GEMV prerotated
     GemvMq4G256Prerotated,
+    GemvMq4G256GlPrerotated,
     GemvMq3G256Prerotated,
     GemvMq2G256Prerotated,
     GemvMq5G256Prerotated,
@@ -644,6 +639,7 @@ impl KernelKey {
         use DType::*;
         match dtype {
             MQ4G256 => Ok(Self::GemvMq4G256Prerotated),
+            MQ4G256GL => Ok(Self::GemvMq4G256GlPrerotated),
             MQ3G256 => Ok(Self::GemvMq3G256Prerotated),
             MQ2G256 => Ok(Self::GemvMq2G256Prerotated),
             MQ5G256 => Ok(Self::GemvMq5G256Prerotated),
