@@ -81,5 +81,11 @@ Arm models are built with:
 ```
 hipfire-quantize --input ~/.hipfire/models/qwen3.6-27b.mq4 \
     --output /data/hipfire-models/spe-tq2-awqim.hfq \
-    --format ternary --awq-imatrix 0.55
+    --format ternary --awq-imatrix 0.55 --allow-lowbit-ptq
 ```
+
+`--allow-lowbit-ptq` is required as of this run: on the strength of these
+numbers, requantizing an ordinary checkpoint down to ternary/binary is now
+gated by default (`lowbit_ptq_gate`), matching how `mq2` and `mq2-lloyd` are
+handled. The GGUF byte-verbatim passthrough path used for Bonsai is
+unaffected.

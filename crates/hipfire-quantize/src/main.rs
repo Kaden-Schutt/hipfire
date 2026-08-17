@@ -5858,6 +5858,57 @@ mod bq1g128_gptq_tests {
 /// already unrotated and in their runtime-expected precision, so they pass
 /// through byte-verbatim — mirroring how the GGUF ternary/binary pipeline keeps
 /// embeddings at Q8F16 and norms at F16 regardless of `--format`.
+/// Policy gate for requantizing an existing checkpoint DOWN to ternary/binary.
+///
+/// Returns `Err(message)` when the target is a low-bit PTQ target and the
+/// caller has not opted in. Pure, so it is testable; `main` owns the exit.
+///
+/// 2 bpw PTQ is a measured collapse regime on this family, established three
+/// times independently:
+///   * `--format mq2` (uniform 4-level, rotated) is already reserved in-tree:
+///     "collapse on every model size validated locally (0.8B / 4B / 9B Qwen 3.5
+///     -> multilingual mojibake)".
+///   * `--format mq2-lloyd` (NON-uniform codebook, rotated) is research-only —
+///     it lifts uniform MQ2 by 41-55x ppl and is "still collapse" (9B ppl 2163
+///     vs MQ4 10, MQ3 42). Codebook shape is not the missing ingredient.
+///   * SP-E (2026-08-17): mq4 -> ternary at 27B scored KLD 5.10 and generated
+///     multilingual token soup; with an AWQ-derived imatrix, KLD 2.24 and an
+///     immediate EOS. Neither is a usable model.
+///
+/// What works at these widths is a behaviour-preserving weight transform
+/// applied BEFORE quantization: PrismML's Bonsai scores KLD 0.536 and generates
+/// fluently in this very format. So the supported ternary/binary path is
+/// byte-verbatim passthrough of an already-transformed source (the GGUF arm),
+/// not re-quantizing an ordinary checkpoint down. Research is still legitimate,
+/// hence the opt-in — matching how `mq2` and `mq2-lloyd` are gated.
+fn lowbit_ptq_gate(format: GgufFormat, allowed: bool) -> Result<(), String> {
+    if allowed || !matches!(format, GgufFormat::Ternary | GgufFormat::Binary) {
+        return Ok(());
+    }
+    let bpw = if matches!(format, GgufFormat::Binary) {
+        "1.14"
+    } else {
+        "2.125"
+    };
+    Err(format!(
+        "error: --input <.hfq> --format {} re-quantizes an ordinary checkpoint down to \
+         {bpw} bpw, which is a MEASURED collapse regime — not a supported build.\n\
+         \n\
+         Evidence: uniform MQ2 is reserved in-tree (\"collapse on every model\"); \
+         MQ2-Lloyd's non-uniform codebook lifts it 41-55x ppl and is still collapse \
+         (9B ppl 2163 vs MQ4 10); SP-E measured mq4->ternary at 27B as KLD 5.10 \
+         (multilingual token soup), or KLD 2.24 with an AWQ imatrix (immediate EOS).\n\
+         \n\
+         Ternary/binary ship coherently ONLY as byte-verbatim passthrough of a source \
+         that already went through a behaviour-preserving transform (e.g. PrismML \
+         Bonsai Q2_0/Q1_0, KLD 0.536) — convert that GGUF directly instead.\n\
+         \n\
+         To do it anyway for research, pass --allow-lowbit-ptq or set \
+         HIPFIRE_ALLOW_LOWBIT_PTQ=1. Don't ship the artifacts to users.",
+        format.label(),
+    ))
+}
+
 /// Stamp build provenance into an .hfq's metadata JSON.
 ///
 /// Inserted as a `hipfire_provenance` object immediately after the opening
@@ -6631,6 +6682,37 @@ mod hfq_requant_pipeline_tests {
 
         let _ = std::fs::remove_file(&inp);
         let _ = std::fs::remove_file(&outp);
+    }
+
+    /// Ternary/binary requant of an ordinary checkpoint is gated (measured
+    /// collapse regime); the GGUF passthrough path and all other targets are
+    /// not. Matches how `mq2` / `mq2-lloyd` are handled.
+    #[test]
+    fn lowbit_ptq_gate_blocks_only_ternary_binary_and_only_without_opt_in() {
+        for fmt in [GgufFormat::Ternary, GgufFormat::Binary] {
+            let err = lowbit_ptq_gate(fmt, false).expect_err("must be gated by default");
+            assert!(err.contains("collapse regime"), "explains why: {err}");
+            assert!(
+                err.contains("--allow-lowbit-ptq"),
+                "names the opt-in: {err}"
+            );
+            assert!(
+                lowbit_ptq_gate(fmt, true).is_ok(),
+                "opt-in must let research through"
+            );
+        }
+        // Everything else is unaffected — including the 4-bit default.
+        for fmt in [
+            GgufFormat::Mq4,
+            GgufFormat::Mq6,
+            GgufFormat::Mq3,
+            GgufFormat::Mq2Lloyd,
+        ] {
+            assert!(
+                lowbit_ptq_gate(fmt, false).is_ok(),
+                "{fmt:?} must not be gated here"
+            );
+        }
     }
 
     /// The Lloyd-Max targets must actually requantize, not silently fall
@@ -10234,6 +10316,15 @@ fn main() {
                 );
                 std::process::exit(1);
             });
+            // Refuse to requantize an ordinary checkpoint down to 2/1 bpw
+            // unless explicitly opted in — see `lowbit_ptq_gate`.
+            let allow_lowbit = args.iter().any(|a| a == "--allow-lowbit-ptq")
+                || std::env::var("HIPFIRE_ALLOW_LOWBIT_PTQ").ok().as_deref() == Some("1");
+            if let Err(msg) = lowbit_ptq_gate(hfq_format, allow_lowbit) {
+                eprintln!("{msg}");
+                std::process::exit(1);
+            }
+
             // --awq-imatrix [alpha=0.55]: treat the source checkpoint's AWQ
             // sidecars as its imatrix for the low-bit packers' column
             // weighting. alpha MUST match the α the source was built with
