@@ -469,9 +469,28 @@
         "presence_penalty": 1.5
       },
       "desc": "Qwen3.5-35B-A3B agentic MoE (nex-agi, SWE-bench Verified 74.4). 88 tok/s. T3-3L graded experts (MQ6/MQ4/MQ3L). Tool-use: qwen3 reasoning / qwen3_coder tool-call format."
+    },
+    "bonsai:27b-1bit": {
+      "repo": "hipfire-models/hipfire-bonsai-27b",
+      "file": "binary-bonsai-27b.hfq",
+      "size_gb": 3.8,
+      "min_vram_gb": 5,
+      "default_kv_mode": "q8",
+      "desc": "Bonsai-27B 1-bit (Prism ML, BQ1G128 1.14 bpw). Smallest usable 27B we ship: 3.8 GB, KLD 0.629 vs the mq4 teacher, ~13.5 tok/s decode on gfx1151. Apache-2.0; see repo NOTICE.",
+      "quant_recipe": "prismml-bonsai-q1_0-passthrough"
+    },
+    "bonsai:27b-ternary": {
+      "repo": "hipfire-models/hipfire-bonsai-27b",
+      "file": "ternary-bonsai-27b.hfq",
+      "size_gb": 7.16,
+      "min_vram_gb": 8,
+      "default_kv_mode": "q8",
+      "desc": "Bonsai-27B ternary (Prism ML, TQ2G128 2.125 bpw). 7.16 GB, KLD 0.536 vs the mq4 teacher, ~12.3 tok/s decode on gfx1151. Apache-2.0; see repo NOTICE.",
+      "quant_recipe": "prismml-bonsai-q2_0-passthrough"
     }
   },
   "aliases": {
+    "bonsai": "bonsai:27b-ternary",
     "qwen3.5": "qwen3.5:4b",
     "qwen3.5:latest": "qwen3.5:9b",
     "qwen3.5:small": "qwen3.5:0.8b",

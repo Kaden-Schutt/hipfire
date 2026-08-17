@@ -165,6 +165,9 @@ def arch_id_for(tag: str, entry: dict) -> int | None:
         return 6 if "a3b" in tag else 5
     if family == "nex-n2":
         return 6  # Nex-N2-mini = Qwen3.5-35B-A3B MoE (a3b not in tag name)
+    if family == "bonsai":
+        return 5  # Prism ML Bonsai-27B = behaviour-preserving transform of
+        # Qwen3.6-27B, architecture unchanged (dense qwen35).
     if family == "qwen3":
         return 1
     if family == "deepseek-v4-flash":
