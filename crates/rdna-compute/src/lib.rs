@@ -30,9 +30,9 @@ pub mod slot_pool;
 
 pub use compiler::KernelCompiler;
 pub use dispatch::{
-    gen_fwht_signs, ActivationCapture, BlockHessianAcc, DType, Gpu, GpuTensor, HessianCapture, GL_CB2, GL_CB3,
-    GL_CB4, GL_GROUP_SCALE_BYTES, GL_MQ2_GROUP_IDX_BYTES, GL_MQ3_GROUP_IDX_BYTES,
-    GL_MQ4_GROUP_IDX_BYTES, LLOYD_MQ3_GROUP_BYTES,
+    gen_fwht_signs, ActivationCapture, BlockHessianAcc, DType, Gpu, GpuTensor, HessianCapture, GL_CB1,
+    GL_CB2, GL_CB3, GL_CB4, GL_GROUP_SCALE_BYTES, GL_MQ1_GROUP_IDX_BYTES, GL_MQ1_GROUP_SIZE,
+    GL_MQ2_GROUP_IDX_BYTES, GL_MQ3_GROUP_IDX_BYTES, GL_MQ4_GROUP_IDX_BYTES, LLOYD_MQ3_GROUP_BYTES,
     LLOYD_MQ4_GROUP_BYTES, MMQ_CURRENT_LAYER,
 };
 pub use feature_flags::FeatureFlags;

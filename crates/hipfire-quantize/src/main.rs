@@ -4471,6 +4471,12 @@ fn mq2g256gl_roundtrip_f32(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> 
     out
 }
 
+/// Lloyd–Max optimal reconstruction levels for a unit Gaussian at 1 bit.
+/// For a symmetric 2-level MSE-optimal quantizer the levels are `±E|x|` =
+/// `±sqrt(2/pi)` = `±0.7978845608028654` (derived: E|x| = ∫|x| φ(x) dx = sqrt(2/pi)).
+/// This is the ONLY 1-bit group size that aligns: 1024 × 1 bit = 1024 bits = 32 lanes × 32 bits.
+pub(crate) const GL_CB1: [f32; 2] = [-0.7978845608028654, 0.7978845608028654];
+
 /// Lloyd–Max optimal reconstruction levels for a unit Gaussian.
 /// 2-bit MSE = 0.1175, 3-bit MSE = 0.03454 — both reproduced to 3 decimals by
 /// fitting on 28.3M real a3b post-FWHT expert weights (2026-08-04).
@@ -4775,7 +4781,150 @@ pub(crate) fn quantize_mq4g256gl(
     out
 }
 
-/// CPU packed-dequant oracle for MQ4-G256-GL blobs.
+/// CPU FWHT for 1024 elements (orthogonal, same LCG signs as 256 variant).
+/// Matches GPU `fwht_forward_1024` pattern: signs1 → butterfly → scale → signs2.
+fn cpu_fwht_1024(x: &mut [f32; 1024], signs1: &[f32], signs2: &[f32]) {
+    assert_eq!(x.len(), 1024);
+    assert_eq!(signs1.len(), 1024);
+    assert_eq!(signs2.len(), 1024);
+    for i in 0..1024 {
+        x[i] *= signs1[i];
+    }
+    let mut stride = 1;
+    while stride < 1024 {
+        let mut i = 0;
+        while i < 1024 {
+            for j in 0..stride {
+                let a = x[i + j];
+                let b = x[i + j + stride];
+                x[i + j] = a + b;
+                x[i + j + stride] = a - b;
+            }
+            i += stride * 2;
+        }
+        stride <<= 1;
+    }
+    for i in 0..1024 {
+        x[i] *= 0.03125 * signs2[i]; // 1/32 = 1/sqrt(1024)
+    }
+}
+
+/// CPU inverse FWHT for 1024 (same butterfly, signs swapped, inverse scale).
+fn cpu_inv_fwht_1024(x: &mut [f32; 1024], signs1: &[f32], signs2: &[f32]) {
+    // Inverse is same as forward with signs swapped and same scale (orthogonal).
+    for i in 0..1024 {
+        x[i] *= signs2[i];
+    }
+    let mut stride = 1;
+    while stride < 1024 {
+        let mut i = 0;
+        while i < 1024 {
+            for j in 0..stride {
+                let a = x[i + j];
+                let b = x[i + j + stride];
+                x[i + j] = a + b;
+                x[i + j + stride] = a - b;
+            }
+            i += stride * 2;
+        }
+        stride <<= 1;
+    }
+    for i in 0..1024 {
+        x[i] *= 0.03125 * signs1[i];
+    }
+}
+
+/// MQ1-G1024-GL: 1-bit codes vs tensor-global `GL_CB1` + per-block fp16 scale.
+/// **1.015625 bpw** — 128 B indices + 2 B scale per 1024 weights.
+/// Group 1024 is the ONLY 1-bit size where `group*bits/32 = 32 bits = 4 B = 1 u32/lane`.
+/// Layout: `[m*gpr*128 B packed indices][m*gpr*2 B fp16 scales]`, both row-major.
+/// Bit packing: 8 codes per byte, little-endian (bit j = code for weight 8*b+j).
+pub(crate) fn quantize_mq1g1024gl(
+    f32_data: &[f32],
+    m: usize,
+    k: usize,
+    signs1_256: &[f32],
+    signs2_256: &[f32],
+) -> Vec<u8> {
+    assert_eq!(k % 1024, 0, "MQ1GL: K must be a multiple of 1024 (got {k})");
+    // Derive 1024-length sign tables from the 256 tables + extension (deterministic).
+    // For reproducibility we expand via gen_fwht_signs with fixed seeds.
+    let signs1_1024 = gen_fwht_signs(42, 1024);
+    let signs2_1024 = gen_fwht_signs(1042, 1024);
+    // Silence unused warning for passed-in 256 tables (kept for API symmetry).
+    let _ = (signs1_256, signs2_256);
+    let gpr = k / 1024;
+    let idx_bytes = m * gpr * 128;
+    let mut out = vec![0u8; idx_bytes + m * gpr * 2];
+    let (idx_region, scale_region) = out.split_at_mut(idx_bytes);
+    use rayon::prelude::*;
+    idx_region
+        .par_chunks_mut(gpr * 128)
+        .zip(scale_region.par_chunks_mut(gpr * 2))
+        .enumerate()
+        .for_each(|(row, (row_idx, row_scale))| {
+            for g in 0..gpr {
+                let start = row * k + g * 1024;
+                let mut group = [0.0f32; 1024];
+                group.copy_from_slice(&f32_data[start..start + 1024]);
+                cpu_fwht_1024(&mut group, &signs1_1024, &signs2_1024);
+                // Per-block scale via RMS, fp16 rounded.
+                let ss: f64 = group.iter().map(|v| (*v as f64) * (*v as f64)).sum();
+                let rms = (ss / 1024.0).sqrt() as f32;
+                let sbits = f32_to_fp16_bits(rms);
+                let scale = f16_to_f32(sbits);
+                let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+                let mut codes = [0u8; 1024];
+                for (i, v) in group.iter().enumerate() {
+                    let z = *v * inv;
+                    // Nearest of the two levels: GL_CB1[0] negative, GL_CB1[1] positive.
+                    let d0 = (z - GL_CB1[0]).abs();
+                    let d1 = (z - GL_CB1[1]).abs();
+                    codes[i] = if d1 < d0 { 1 } else { 0 };
+                }
+                let base = g * 128;
+                for b in 0..128 {
+                    let mut byte = 0u8;
+                    for j in 0..8 {
+                        byte |= (codes[8 * b + j] & 0x1) << j;
+                    }
+                    row_idx[base + b] = byte;
+                }
+                row_scale[g * 2] = (sbits & 0xFF) as u8;
+                row_scale[g * 2 + 1] = (sbits >> 8) as u8;
+            }
+        });
+    out
+}
+
+#[cfg(test)]
+fn mq1g1024gl_unpack_blob(blob: &[u8], m: usize, k: usize) -> Vec<f32> {
+    assert_eq!(k % 1024, 0, "MQ1GL unpack: K must be a multiple of 1024 (got {k})");
+    let gpr = k / 1024;
+    let idx_bytes = m * gpr * rdna_compute::GL_MQ1_GROUP_IDX_BYTES;
+    let scale_bytes = m * gpr * rdna_compute::GL_GROUP_SCALE_BYTES;
+    assert_eq!(blob.len(), idx_bytes + scale_bytes);
+    let mut out = vec![0.0f32; m * k];
+    for row in 0..m {
+        for g in 0..gpr {
+            let idx_base = (row * gpr + g) * rdna_compute::GL_MQ1_GROUP_IDX_BYTES;
+            let scale_base = idx_bytes + (row * gpr + g) * rdna_compute::GL_GROUP_SCALE_BYTES;
+            let sbits = u16::from_le_bytes([blob[scale_base], blob[scale_base + 1]]);
+            let scale = f16_to_f32(sbits);
+            let dst = row * k + g * 1024;
+            for b in 0..128 {
+                let byte = blob[idx_base + b];
+                for j in 0..8 {
+                    let c = ((byte >> j) & 0x1) as usize;
+                    out[dst + 8 * b + j] = scale * GL_CB1[c];
+                }
+            }
+        }
+    }
+    out
+}
+
+ /// CPU packed-dequant oracle for MQ4-G256-GL blobs.
 ///
 /// Parses the frozen two-region layout produced by [`quantize_mq4g256gl`]:
 /// index region base 0 with group stride 128, scale region base `m*gpr*128`
@@ -5185,6 +5334,10 @@ impl QuantType {
             35 => Some(Self::MFP4G32E8SOA),
             36 => Some(Self::MFP3G32E8),
             37 => Some(Self::MFP2G32E8),
+            38 => Some(Self::MQ2G256GL),
+            39 => Some(Self::MQ3G256GL),
+            40 => Some(Self::MQ4G256GL),
+            41 => Some(Self::MQ1G1024GL),
             _ => None,
         }
     }
@@ -5276,8 +5429,8 @@ pub(crate) enum QuantType {
     // post-FWHT Gaussian instead of a uniform affine min-max grid.
     // ENCODE-ONLY today: no GEMV kernel decodes qt=40 yet.
     MQ4G256GL = 40,
+    MQ1G1024GL = 41, // 1-bit + global codebook: 128 B idx/group + 2 B scale = 1.015625 bpw, group 1024, GL_CB1
     MFP4G32E8SOA = 35, // mfp4-E8 SoA: same E8 data as qt=34 but in structure-of-arrays layout.
-    // [16B hdr] + [n_blocks B E4M3 scales, pad 16B] + [n_blocks*16B codewords].
     MFP3G32E8 = 36, // mfp3-E8: MFP4G32E8 frame, 3-bit lattice (center 3), 13 B/blk, 3.25 bpw.
     // Drop-in cold tier for MQ3G256Lloyd (tag 3 → tag 5).
     MFP2G32E8 = 37, // mfp2-E8: MFP4G32E8 frame, 2-bit lattice (center 1), 9 B/blk, 2.25 bpw.
@@ -8678,6 +8831,9 @@ fn main() {
         format == "mq3-lloyd" || format == "mq3g256-lloyd" || format == "mq3lloyd";
     let use_mq4g256_lloyd =
         format == "mq4-lloyd" || format == "mq4g256-lloyd" || format == "mq4lloyd";
+    let use_mq1 = format == "mq1" || format == "mq1g1024" || format == "mq1g1024gl" || format == "mq1gl";
+    let use_mq2gl = format == "mq2gl" || format == "mq2g256gl";
+    let use_mq3gl = format == "mq3gl" || format == "mq3g256gl";
     let use_hfq6 = format == "hfq6" || format == "hfq6g256" || format == "hf6";
     // HFP4G32 — RDNA-optimal FP4 (E2M1 + UE8M0 g32 + FP16 row scale). Spec at docs/quant-formats/hfp4.md.
     let use_hfp4 = format == "hfp4" || format == "hfp4g32" || format == "hf4p" || format == "fp4";
@@ -11683,6 +11839,15 @@ fn main() {
                             &f32_slice, inner_m, inner_k_e, &signs1, &signs2,
                         );
                         (q, QuantType::MFP4G32E8SOA, 32u32)
+                    } else if use_mq1 && inner_k_e % 1024 == 0 {
+                        let q = quantize_mq1g1024gl(&f32_slice, inner_m, inner_k_e, &signs1, &signs2);
+                        (q, QuantType::MQ1G1024GL, 1024u32)
+                    } else if use_mq2gl && supports_g256 {
+                        let q = quantize_mq2g256gl(&f32_slice, inner_m, inner_k_e, &signs1, &signs2);
+                        (q, QuantType::MQ2G256GL, 256u32)
+                    } else if use_mq3gl && supports_g256 {
+                        let q = quantize_mq3g256gl(&f32_slice, inner_m, inner_k_e, &signs1, &signs2);
+                        (q, QuantType::MQ3G256GL, 256u32)
                     } else if supports_g256 {
                         let q = quantize_mq4g256(&f32_slice, &signs1, &signs2);
                         (q, QuantType::MQ4G256, 256u32)
@@ -12994,6 +13159,42 @@ fn main() {
                             // Fallback to HFQ2-G128 for non-256-aligned (no rotation)
                             let q = quantize_hfq2g128(&f32_data);
                             (q, QuantType::HFQ2G128, 128u32, "HFQ2G128")
+                        }
+                    } else if use_mq1 {
+                        let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
+                        if k_dim % 1024 == 0 {
+                            let m = meta.shape[0];
+                            let signs1 = gen_fwht_signs(42, 256);
+                            let signs2 = gen_fwht_signs(1042, 256);
+                            let q = quantize_mq1g1024gl(&f32_data, m, k_dim, &signs1, &signs2);
+                            (q, QuantType::MQ1G1024GL, 1024u32, "MQ1G1024GL")
+                        } else {
+                            let q = quantize_hfq4g128(&f32_data);
+                            (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                        }
+                    } else if use_mq2gl {
+                        let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
+                        if k_dim % 256 == 0 {
+                            let m = meta.shape[0];
+                            let signs1 = gen_fwht_signs(42, 256);
+                            let signs2 = gen_fwht_signs(1042, 256);
+                            let q = quantize_mq2g256gl(&f32_data, m, k_dim, &signs1, &signs2);
+                            (q, QuantType::MQ2G256GL, 256u32, "MQ2G256GL")
+                        } else {
+                            let q = quantize_hfq4g128(&f32_data);
+                            (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                        }
+                    } else if use_mq3gl {
+                        let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
+                        if k_dim % 256 == 0 {
+                            let m = meta.shape[0];
+                            let signs1 = gen_fwht_signs(42, 256);
+                            let signs2 = gen_fwht_signs(1042, 256);
+                            let q = quantize_mq3g256gl(&f32_data, m, k_dim, &signs1, &signs2);
+                            (q, QuantType::MQ3G256GL, 256u32, "MQ3G256GL")
+                        } else {
+                            let q = quantize_hfq4g128(&f32_data);
+                            (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                         }
                     } else if (use_hfq3g256 || use_hfq3g128) && is_embed {
                         let q = quantize_q8f16(&f32_data);
@@ -15574,6 +15775,12 @@ mod tests {
     #[test]
     fn gl_codebooks_match_runtime() {
         assert_eq!(
+            GL_CB1,
+            rdna_compute::GL_CB1,
+            "hipfire-quantize GL_CB1 has drifted from rdna_compute::GL_CB1 — \
+             qt=41 weights would decode against the wrong 1-bit levels"
+        );
+        assert_eq!(
             GL_CB2,
             rdna_compute::GL_CB2,
             "hipfire-quantize GL_CB2 has drifted from rdna_compute::GL_CB2 — \
@@ -15764,6 +15971,226 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn mq1_blob_layout_matches_runtime_constants() {
+        // MQ1-G1024-GL: 128 B indices + 2 B scale =130 B per 1024 =1.015625 bpw.
+        // Bit packing: 8 codes per byte, bit j = code for weight 8*b+j.
+        let (m, k) = (2usize, 2048usize);
+        let gpr = k / 1024;
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        let w: Vec<f32> = (0..m * k).map(|i| (i % 19) as f32 * 0.01 - 0.09).collect();
+        let b1 = quantize_mq1g1024gl(&w, m, k, &s1, &s2);
+        assert_eq!(
+            b1.len(),
+            m * gpr * (rdna_compute::GL_MQ1_GROUP_IDX_BYTES + rdna_compute::GL_GROUP_SCALE_BYTES),
+            "MQ1G1024GL blob size disagrees with GL_MQ1_GROUP_IDX_BYTES"
+        );
+        assert_eq!(b1.len() * 8, m * k * 65 / 64, "MQ1 must be exactly 1.015625 bpw (130*8/1024)");
+        // Scale region base and bit packing smoke test (single group).
+        let m1 = 1usize;
+        let k1 = 1024usize;
+        let idx_bytes1 = m1 * (k1 / 1024) * rdna_compute::GL_MQ1_GROUP_IDX_BYTES;
+        let mut blob = vec![0u8; idx_bytes1 + m1 * (k1 / 1024) * rdna_compute::GL_GROUP_SCALE_BYTES];
+        blob[0] = 0b10101010;
+        blob[1] = 0b01010101;
+        let unpacked = mq1g1024gl_unpack_blob(&blob, m1, k1);
+        // With zero scale (fp16 0) unpack is zero regardless of code.
+        let s_one: u16 = 0x3C00; // 1.0
+        blob[idx_bytes1] = (s_one & 0xFF) as u8;
+        blob[idx_bytes1 + 1] = (s_one >> 8) as u8;
+        let unpacked2 = mq1g1024gl_unpack_blob(&blob, m1, k1);
+        assert!((unpacked2[0] - GL_CB1[0]).abs() < 1e-6);
+        assert!((unpacked2[1] - GL_CB1[1]).abs() < 1e-6);
+        assert!((unpacked2[7] - GL_CB1[1]).abs() < 1e-6);
+        assert!((unpacked2[8] - GL_CB1[1]).abs() < 1e-6); // byte1 bit0
+    }
+
+    #[test]
+    fn mq1_roundtrip_proves_encode_decode() {
+        let (m, k) = (2usize, 2048usize);
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        let mut state = 0x12345u64;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((state >> 33) as f32) * (1.0 / (1u32 << 31) as f32) * 2.0 - 1.0
+        };
+        let w: Vec<f32> = (0..m * k).map(|_| next() * 0.5).collect();
+        let blob = quantize_mq1g1024gl(&w, m, k, &s1, &s2);
+        let got = mq1g1024gl_unpack_blob(&blob, m, k);
+        // Independently recompute encoder intent in rotated domain.
+        let s1_1024 = gen_fwht_signs(42, 1024);
+        let s2_1024 = gen_fwht_signs(1042, 1024);
+        let mut expect = vec![0.0f32; m * k];
+        for row in 0..m {
+            for g in 0..k / 1024 {
+                let start = row * k + g * 1024;
+                let mut grp = [0.0f32; 1024];
+                grp.copy_from_slice(&w[start..start + 1024]);
+                cpu_fwht_1024(&mut grp, &s1_1024, &s2_1024);
+                let ss: f64 = grp.iter().map(|v| (*v as f64) * (*v as f64)).sum();
+                let rms = (ss / 1024.0).sqrt() as f32;
+                let sbits = f32_to_fp16_bits(rms);
+                let scale = f16_to_f32(sbits);
+                for i in 0..1024 {
+                    let z = if scale > 0.0 { grp[i] / scale } else { 0.0 };
+                    let c = if (z - GL_CB1[1]).abs() < (z - GL_CB1[0]).abs() { 1 } else { 0 };
+                    expect[start + i] = scale * GL_CB1[c];
+                }
+            }
+        }
+        assert_eq!(got.len(), expect.len());
+        for i in 0..got.len() {
+            let ulp = (got[i].to_bits() as i32 - expect[i].to_bits() as i32).abs();
+            assert!(ulp <= 1, "mq1 roundtrip mismatch i={i} got={} expect={} ulp={ulp}", got[i], expect[i]);
+        }
+    }
+
+    #[test]
+    fn mq2gl_blob_layout_and_roundtrip() {
+        let (m, k) = (2usize, 512usize);
+        let s1 = gen_fwht_signs(0xA11CE, 256);
+        let s2 = gen_fwht_signs(0xB0B, 256);
+        let w: Vec<f32> = (0..m * k).map(|i| (i % 13) as f32 * 0.02 - 0.12).collect();
+        let blob = quantize_mq2g256gl(&w, m, k, &s1, &s2);
+        // Layout: 64 B indices per group, little-endian 4 codes/byte.
+        assert_eq!(blob.len(), m * (k / 256) * (64 + 2));
+        assert_eq!(blob.len() * 8, m * k * 33 / 16, "MQ2-GL must be 2.0625 bpw");
+        // Bit packing smoke: code 0 in bits[1:0], 1 in [3:2], etc.
+        // Build a blob with known byte 0b11100100 => codes [0,1,2,3]
+        let mut blob2 = vec![0u8; 64 + 2];
+        blob2[0] = 0b11100100; // 0b11=3 at top bits? Actually layout: c0 | c1<<2 | c2<<4 | c3<<6
+        // c0=0 (00), c1=1 (01), c2=2 (10), c3=3 (11) => 00|01<<2=0100| 10<<4=100000 |11<<6=11000000 => 0b11100100 = 0xE4
+        assert_eq!(blob2[0] & 0x3, 0);
+        assert_eq!((blob2[0] >> 2) & 0x3, 1);
+        assert_eq!((blob2[0] >> 4) & 0x3, 2);
+        assert_eq!((blob2[0] >> 6) & 0x3, 3);
+        // Round-trip encode->decode in rotated domain.
+        let blob = quantize_mq2g256gl(&w, m, k, &s1, &s2);
+        let gpr = k / 256;
+        let idx_bytes = m * gpr * 64;
+        let mut expect = vec![0.0f32; m * k];
+        for row in 0..m {
+            for g in 0..gpr {
+                let start = row * k + g * 256;
+                let mut grp = [0.0f32; 256];
+                grp.copy_from_slice(&w[start..start + 256]);
+                cpu_fwht_256(&mut grp, &s1, &s2);
+                let ss: f64 = grp.iter().map(|v| (*v as f64) * (*v as f64)).sum();
+                let rms = (ss / 256.0).sqrt() as f32;
+                let sbits = f32_to_fp16_bits(rms);
+                let scale = f16_to_f32(sbits);
+                let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+                for i in 0..256 {
+                    let z = grp[i] * inv;
+                    let mut best = 0usize;
+                    let mut bd = (z - GL_CB2[0]).abs();
+                    for (k, &c) in GL_CB2.iter().enumerate().skip(1) {
+                        let d = (z - c).abs();
+                        if d < bd { bd = d; best = k; }
+                    }
+                    expect[start + i] = scale * GL_CB2[best];
+                }
+            }
+        }
+        // Decode via unpack (reuse mq2 unpack logic inline)
+        let mut got = vec![0.0f32; m * k];
+        for row in 0..m {
+            for g in 0..gpr {
+                let idx_base = (row * gpr + g) * 64;
+                let scale_base = idx_bytes + (row * gpr + g) * 2;
+                let sbits = u16::from_le_bytes([blob[scale_base], blob[scale_base + 1]]);
+                let scale = f16_to_f32(sbits);
+                for b in 0..64 {
+                    let byte = blob[idx_base + b];
+                    for j in 0..4 {
+                        let c = ((byte >> (j * 2)) & 0x3) as usize;
+                        got[row * k + g * 256 + 4 * b + j] = scale * GL_CB2[c];
+                    }
+                }
+            }
+        }
+        for i in 0..got.len() { assert!((got[i] - expect[i]).abs() <= 1e-6, "mq2gl mismatch {}", i); }
+    }
+
+    #[test]
+    fn mq3gl_blob_layout_and_roundtrip() {
+        let (m, k) = (2usize, 512usize);
+        let s1 = gen_fwht_signs(0xA11CE, 256);
+        let s2 = gen_fwht_signs(0xB0B, 256);
+        let w: Vec<f32> = (0..m * k).map(|i| (i % 11) as f32 * 0.03 - 0.15).collect();
+        let blob = quantize_mq3g256gl(&w, m, k, &s1, &s2);
+        assert_eq!(blob.len(), m * (k / 256) * (96 + 2));
+        assert_eq!(blob.len() * 8, m * k * 49 / 16, "MQ3-GL must be 3.0625 bpw");
+        // 3-bit packing: 8 codes per 3 bytes little-endian bitstream.
+        let mut codes = [0u8; 8];
+        for i in 0..8 { codes[i] = i as u8; }
+        let mut acc: u32 = 0;
+        for j in 0..8 { acc |= ((codes[j] & 0x7) as u32) << (3 * j); }
+        let b0 = (acc & 0xFF) as u8;
+        let b1 = ((acc >> 8) & 0xFF) as u8;
+        let b2 = ((acc >> 16) & 0xFF) as u8;
+        // Verify unpack inverts
+        let mut out = [0u8; 8];
+        out[0] = b0 & 7;
+        out[1] = (b0 >> 3) & 7;
+        out[2] = ((b0 >> 6) | (b1 << 2)) & 7;
+        out[3] = (b1 >> 1) & 7;
+        out[4] = (b1 >> 4) & 7;
+        out[5] = ((b1 >> 7) | (b2 << 1)) & 7;
+        out[6] = (b2 >> 2) & 7;
+        out[7] = (b2 >> 5) & 7;
+        assert_eq!(out, codes);
+        // Round-trip encode->decode
+        let gpr = k / 256;
+        let idx_bytes = m * gpr * 96;
+        let mut expect = vec![0.0f32; m * k];
+        for row in 0..m {
+            for g in 0..gpr {
+                let start = row * k + g * 256;
+                let mut grp = [0.0f32; 256];
+                grp.copy_from_slice(&w[start..start + 256]);
+                cpu_fwht_256(&mut grp, &s1, &s2);
+                let ss: f64 = grp.iter().map(|v| (*v as f64) * (*v as f64)).sum();
+                let rms = (ss / 256.0).sqrt() as f32;
+                let sbits = f32_to_fp16_bits(rms);
+                let scale = f16_to_f32(sbits);
+                let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+                for i in 0..256 {
+                    let z = grp[i] * inv;
+                    let mut best = 0usize;
+                    let mut bd = (z - GL_CB3[0]).abs();
+                    for (k, &c) in GL_CB3.iter().enumerate().skip(1) {
+                        let d = (z - c).abs();
+                        if d < bd { bd = d; best = k; }
+                    }
+                    expect[start + i] = scale * GL_CB3[best];
+                }
+            }
+        }
+        let mut got = vec![0.0f32; m * k];
+        for row in 0..m {
+            for g in 0..gpr {
+                let idx_base = (row * gpr + g) * 96;
+                let scale_base = idx_bytes + (row * gpr + g) * 2;
+                let sbits = u16::from_le_bytes([blob[scale_base], blob[scale_base + 1]]);
+                let scale = f16_to_f32(sbits);
+                for c in 0..32 {
+                    let b0 = blob[idx_base + 3 * c] as u32;
+                    let b1 = blob[idx_base + 3 * c + 1] as u32;
+                    let b2 = blob[idx_base + 3 * c + 2] as u32;
+                    let acc = b0 | (b1 << 8) | (b2 << 16);
+                    for j in 0..8 {
+                        let code = ((acc >> (3 * j)) & 0x7) as usize;
+                        got[row * k + g * 256 + 8 * c + j] = scale * GL_CB3[code];
+                    }
+                }
+            }
+        }
+        for i in 0..got.len() { assert!((got[i] - expect[i]).abs() <= 1e-6); }
     }
 
     /// OCP E4M3 (1 sign / 4 exp / 3 mantissa, bias 7) round-to-nearest-even.

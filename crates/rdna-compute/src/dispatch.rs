@@ -74,6 +74,15 @@ pub const GL_MQ3_GROUP_IDX_BYTES: usize = 96;
 /// nibble) so a decode path can share the unpack.
 pub const GL_MQ4_GROUP_IDX_BYTES: usize = 128;
 
+/// Per-group INDEX bytes for MQ1-G1024-GL (1 bit × 1024 weights). The fp16
+/// per-block scale lives in a SEPARATE trailing region, NOT in the group.
+/// 1024*1/8 = 128 B indices + 2 B scale = 130 B per 1024 weights = 1.015625 bpw.
+/// Group 1024 is the ONLY 1-bit size that aligns to 32×4 B (1 u32/lane): 1024*1 = 1024 bits.
+pub const GL_MQ1_GROUP_IDX_BYTES: usize = 128;
+
+/// Group size for MQ1-GL: 1024 weights per group (see alignment law).
+pub const GL_MQ1_GROUP_SIZE: usize = 1024;
+
 /// Bytes per group in the trailing fp16 scale region (both GL dtypes).
 pub const GL_GROUP_SCALE_BYTES: usize = 2;
 
@@ -124,6 +133,14 @@ pub const GL_CB4: [f32; 16] = [
     -2.7326, -2.0690, -1.6180, -1.2562, -0.9423, -0.6568, -0.3880, -0.1284,
     0.1284, 0.3880, 0.6568, 0.9423, 1.2562, 1.6180, 2.0690, 2.7326,
 ];
+
+/// **MUST STAY BIT-IDENTICAL TO `hipfire-quantize::main::GL_CB1`.**
+///
+/// 1-bit sibling of [`GL_CB2`]/[`GL_CB3`]/[`GL_CB4`]; for a symmetric 2-level
+/// MSE-optimal quantizer of a unit Gaussian the levels are `±E|x|` =
+/// `±sqrt(2/pi)` = `±0.7978845608028654`. Derivation: E|x| = ∫|x|·φ(x)dx =
+/// sqrt(2/pi). No kernel consumes this yet — encode-only endpoint of the family.
+pub const GL_CB1: [f32; 2] = [-0.7978845608028654, 0.7978845608028654];
 
 /// Current layer index, set by the qwen35 forward_prefill_chunk at the
 /// start of each layer iteration. Used by `hfq3_mmq_layer_gate_pass` to
@@ -298,9 +315,13 @@ pub enum DType {
     /// passed as sixteen scalar kernel args, not stored in the file. Nibble
     /// packing matches MQ4G256 (`lo | hi << 4`).
     MQ4G256GL,
+    MQ1G1024GL, // MagnumQuant 1-bit + TENSOR-GLOBAL 2-entry codebook (GL_CB1), SoA:
+    // [M*gpr*128 B indices][M*gpr*2 B fp16 scales] where gpr=K/1024.
+    // 128 B idx +2 B scale per 1024 weights =1.015625 bpw.
+    // Alignment: 1024*1/32 =32 bits =4 B =1 u32/lane (the ONLY 1-bit group size that aligns).
+    // Encode-only: no kernel consumes this yet, same drift guard as GL_CB4.
     HFP4G32, // HFP4: E2M1 element + UE8M0 g32 block scale + FP16 row scale.
     // Per-row header 16 B; per-block payload 17 B (UE8M0 + 16 packed nibbles).
-    // See docs/quant-formats/hfp4.md.
     MFP4G32, // MFP4: HFP4G32 + offline FWHT (drop-in MQ4 replacement). Same byte layout
     // as HFP4G32; format_flags bit 0 + bits 2-3 = 01 stamps the rotation kind.
     // Runtime applies the matching FWHT to x via mq_rotate_x; the kernel itself
@@ -362,6 +383,7 @@ impl DType {
             | DType::MQ2G256GL
             | DType::MQ3G256GL
             | DType::MQ4G256GL
+            | DType::MQ1G1024GL
             | DType::HFP4G32
             | DType::MFP4G32
             | DType::MFP4G32Lloyd
@@ -472,7 +494,15 @@ impl DType {
                 | DType::MQ2G256GL
                 | DType::MQ3G256GL
                 | DType::MQ4G256GL
+                | DType::MQ1G1024GL
         )
+    }
+
+    /// Whether this format requires K % 1024 == 0 (MQ1-G1024-GL). Subset of
+    /// `requires_k_mod_256` — 1024 multiple implies 256 multiple, but we
+    /// expose it so a future kernel can enforce the tighter alignment.
+    pub fn requires_k_mod_1024(self) -> bool {
+        matches!(self, DType::MQ1G1024GL)
     }
 }
 

@@ -217,6 +217,16 @@ pub fn project_to_psd(h: &Mat<f64>) -> Option<(Mat<f64>, f64)> {
     let k = h.nrows();
     assert_eq!(h.nrows(), h.ncols(), "Hessian must be square");
 
+    // GPU fast path: rocsolver_dsyevd + on-device W*W^T reconstruction.
+    // Soft-fails (None) when ROCm is absent, K is below threshold, or any
+    // GPU call fails — identical discipline to try_gpu_compute.
+    if let Some(v) = gpu::try_gpu_project_to_psd(h, k) {
+        eprintln!("  gptq: PSD projection via GPU rocsolver_dsyevd (K={k})");
+        return Some(v);
+    }
+
+    eprintln!("  gptq: PSD projection via CPU faer eigh (K={k})");
+
     // faer 0.24: Mat::self_adjoint_eigen(&self, side: Side)
     //   -> Result<SelfAdjointEigen<C::Canonical>, EvdError>
     // SelfAdjointEigen exposes U() (eigenvectors) and S() (eigenvalues,
@@ -313,6 +323,8 @@ mod gpu {
     const ROCBLAS_DIAG_NON_UNIT: c_uint = 131;
     const ROCBLAS_OP_N: c_uint = 111;
     const ROCBLAS_OP_T: c_uint = 112;
+    /// rocblas_evect_original — compute eigenvectors of the original matrix.
+    const ROCBLAS_EVECT_ORIGINAL: c_uint = 211;
     const HIP_MEMCPY_H2D: c_uint = 1;
     const HIP_MEMCPY_D2H: c_uint = 2;
 
@@ -326,6 +338,20 @@ mod gpu {
     type RocsolverDtrtriFn = unsafe extern "C" fn(
         RocblasHandle, c_uint, c_uint, c_int, *mut f64, c_int, *mut c_int,
     ) -> u32;
+    /// rocsolver_dsyevd: symmetric divide-and-conquer eigensolver (FP64).
+    /// On exit A holds orthonormal eigenvectors (columns) when evect=original;
+    /// D holds eigenvalues in ascending order; E is internal tridiagonal work.
+    type RocsolverDsyevdFn = unsafe extern "C" fn(
+        RocblasHandle,
+        c_uint, // evect (rocblas_evect)
+        c_uint, // uplo  (rocblas_fill)
+        c_int,  // n
+        *mut f64, // A (lda*n), eigenvectors on exit
+        c_int,    // lda
+        *mut f64, // D (n) eigenvalues ascending
+        *mut f64, // E (n) internal workspace
+        *mut c_int, // info
+    ) -> u32;
     type RocblasDgemmFn = unsafe extern "C" fn(
         RocblasHandle,
         c_uint, c_uint,
@@ -335,6 +361,14 @@ mod gpu {
         *const f64, c_int,
         *const f64,
         *mut f64, c_int,
+    ) -> u32;
+    /// rocblas_dscal: x := alpha * x (column-scale eigenvectors in place).
+    type RocblasDscalFn = unsafe extern "C" fn(
+        RocblasHandle,
+        c_int,      // n
+        *const f64, // alpha
+        *mut f64,   // x
+        c_int,      // incx
     ) -> u32;
     type HipMallocFn = unsafe extern "C" fn(*mut *mut c_void, usize) -> u32;
     type HipFreeFn = unsafe extern "C" fn(*mut c_void) -> u32;
@@ -351,10 +385,12 @@ mod gpu {
         create_handle: RocblasCreateHandleFn,
         destroy_handle: RocblasDestroyHandleFn,
         dgemm: RocblasDgemmFn,
+        dscal: RocblasDscalFn,
     }
     struct RocsolverFns {
         dpotrf: RocsolverDpotrfFn,
         dtrtri: RocsolverDtrtriFn,
+        dsyevd: RocsolverDsyevdFn,
     }
 
     fn try_load_hip() -> Option<(Library, HipFns)> {
@@ -408,12 +444,15 @@ mod gpu {
                     unsafe { *lib.get::<RocblasDestroyHandleFn>(b"rocblas_destroy_handle").ok()? };
                 let g: RocblasDgemmFn =
                     unsafe { *lib.get::<RocblasDgemmFn>(b"rocblas_dgemm").ok()? };
+                let s: RocblasDscalFn =
+                    unsafe { *lib.get::<RocblasDscalFn>(b"rocblas_dscal").ok()? };
                 return Some((
                     lib,
                     RocblasFns {
                         create_handle: c,
                         destroy_handle: d,
                         dgemm: g,
+                        dscal: s,
                     },
                 ));
             }
@@ -440,11 +479,14 @@ mod gpu {
                     unsafe { *lib.get::<RocsolverDpotrfFn>(b"rocsolver_dpotrf").ok()? };
                 let tr: RocsolverDtrtriFn =
                     unsafe { *lib.get::<RocsolverDtrtriFn>(b"rocsolver_dtrtri").ok()? };
+                let sy: RocsolverDsyevdFn =
+                    unsafe { *lib.get::<RocsolverDsyevdFn>(b"rocsolver_dsyevd").ok()? };
                 return Some((
                     lib,
                     RocsolverFns {
                         dpotrf: p,
                         dtrtri: tr,
+                        dsyevd: sy,
                     },
                 ));
             }
@@ -797,6 +839,252 @@ mod gpu {
             if unsafe { (self.hip.dev_sync)() } != 0 { return false; }
             true
         }
+    }
+
+    /// GPU PSD projection via `rocsolver_dsyevd` + on-device reconstruction.
+    ///
+    /// Semantics match CPU `project_to_psd`:
+    ///   evals, evecs = eigh(H)   // ascending
+    ///   H_psd = evecs * clip(evals, 0, inf) * evecs^T
+    ///   H_psd = (H_psd + H_psd^T) / 2
+    ///   return (H_psd, lambda_min_of_input)
+    ///
+    /// Reconstruction: scale eigenvector columns by `sqrt(S_clipped)` in place
+    /// via `rocblas_dscal` to form `W`, then one `rocblas_dgemm` as `W * W^T`.
+    /// Equivalent to a diagonal scale plus GEMM but one GEMM and symmetric by
+    /// construction. Host downloads only eigenvalues (for lambda_min) and the
+    /// final matrix.
+    ///
+    /// `None` = soft-fail (threshold / missing lib / any GPU status failure).
+    /// Never panics — same contract as the CPU path's `None`-on-nonconvergence.
+    pub(super) fn try_gpu_project_to_psd(h: &Mat<f64>, k: usize) -> Option<(Mat<f64>, f64)> {
+        if k < GPU_K_THRESHOLD {
+            return None;
+        }
+        let (hip_lib, hip) = try_load_hip()?;
+        let (rb_lib, rb) = try_load_rocblas()?;
+        let (rs_lib, rs) = try_load_rocsolver()?;
+        let _keep = (&hip_lib, &rb_lib, &rs_lib);
+
+        let mut handle: RocblasHandle = std::ptr::null_mut();
+        let st = unsafe { (rb.create_handle)(&mut handle) };
+        if st != ROCBLAS_STATUS_SUCCESS || handle.is_null() {
+            return None;
+        }
+        struct HandleGuard(RocblasHandle, RocblasDestroyHandleFn);
+        impl Drop for HandleGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    (self.1)(self.0);
+                }
+            }
+        }
+        let _guard = HandleGuard(handle, rb.destroy_handle);
+
+        let n = k as c_int;
+        let lda = n;
+        let bytes = k * k * std::mem::size_of::<f64>();
+        let n_bytes = k * std::mem::size_of::<f64>();
+        let info_bytes = std::mem::size_of::<c_int>();
+
+        // d_a: H in, eigenvectors out (then column-scaled to W);
+        // d_d: eigenvalues; d_e: syevd work; d_c: H_psd; d_info.
+        let mut d_a: *mut c_void = std::ptr::null_mut();
+        let mut d_d: *mut c_void = std::ptr::null_mut();
+        let mut d_e: *mut c_void = std::ptr::null_mut();
+        let mut d_c: *mut c_void = std::ptr::null_mut();
+        let mut d_info: *mut c_void = std::ptr::null_mut();
+
+        struct DevPtr(*mut c_void, HipFreeFn);
+        impl Drop for DevPtr {
+            fn drop(&mut self) {
+                if !self.0.is_null() {
+                    unsafe {
+                        (self.1)(self.0);
+                    }
+                }
+            }
+        }
+        let alloc = |ptr: &mut *mut c_void, sz: usize| unsafe { (hip.malloc)(ptr, sz) };
+        if alloc(&mut d_a, bytes) != 0 {
+            return None;
+        }
+        let _da = DevPtr(d_a, hip.free);
+        if alloc(&mut d_d, n_bytes) != 0 {
+            return None;
+        }
+        let _dd = DevPtr(d_d, hip.free);
+        if alloc(&mut d_e, n_bytes) != 0 {
+            return None;
+        }
+        let _de = DevPtr(d_e, hip.free);
+        if alloc(&mut d_c, bytes) != 0 {
+            return None;
+        }
+        let _dc = DevPtr(d_c, hip.free);
+        if alloc(&mut d_info, info_bytes) != 0 {
+            return None;
+        }
+        let _di = DevPtr(d_info, hip.free);
+
+        // Pack H col-major and upload once.
+        let mut host_a = vec![0.0f64; k * k];
+        for j in 0..k {
+            for i in 0..k {
+                host_a[i + j * k] = h[(i, j)];
+            }
+        }
+        if unsafe {
+            (hip.memcpy)(
+                d_a,
+                host_a.as_ptr() as *const c_void,
+                bytes,
+                HIP_MEMCPY_H2D,
+            )
+        } != 0
+        {
+            return None;
+        }
+
+        let zero: c_int = 0;
+        if unsafe {
+            (hip.memcpy)(
+                d_info,
+                &zero as *const c_int as *const c_void,
+                info_bytes,
+                HIP_MEMCPY_H2D,
+            )
+        } != 0
+        {
+            return None;
+        }
+
+        // 1. dsyevd: A ← eigenvectors (columns), D ← eigenvalues ascending.
+        let st = unsafe {
+            (rs.dsyevd)(
+                handle,
+                ROCBLAS_EVECT_ORIGINAL,
+                ROCBLAS_FILL_LOWER,
+                n,
+                d_a as *mut f64,
+                lda,
+                d_d as *mut f64,
+                d_e as *mut f64,
+                d_info as *mut c_int,
+            )
+        };
+        if st != ROCBLAS_STATUS_SUCCESS {
+            return None;
+        }
+        if unsafe { (hip.dev_sync)() } != 0 {
+            return None;
+        }
+        let mut info: c_int = 0;
+        if unsafe {
+            (hip.memcpy)(
+                &mut info as *mut c_int as *mut c_void,
+                d_info,
+                info_bytes,
+                HIP_MEMCPY_D2H,
+            )
+        } != 0
+        {
+            return None;
+        }
+        if info != 0 {
+            // Non-convergence or invalid arg → soft-fail to CPU (which may also
+            // return None). Never panic mid-quantization.
+            return None;
+        }
+
+        // Download eigenvalues only (need lambda_min before clip).
+        let mut host_d = vec![0.0f64; k];
+        if unsafe {
+            (hip.memcpy)(
+                host_d.as_mut_ptr() as *mut c_void,
+                d_d,
+                n_bytes,
+                HIP_MEMCPY_D2H,
+            )
+        } != 0
+        {
+            return None;
+        }
+        let lambda_min = host_d[0];
+
+        // 2. Column-scale eigenvectors in place: W[:, j] *= sqrt(max(S[j], 0)).
+        // Keeps the n×n eigenvector matrix on device; only the n scales leave
+        // the host (already in host_d).
+        for j in 0..k {
+            let alpha = host_d[j].max(0.0).sqrt();
+            // Pointer to column j of A (col-major, lda = n).
+            let col_ptr = unsafe { (d_a as *mut f64).add(j * k) };
+            let st = unsafe { (rb.dscal)(handle, n, &alpha, col_ptr, 1) };
+            if st != ROCBLAS_STATUS_SUCCESS {
+                return None;
+            }
+        }
+        if unsafe { (hip.dev_sync)() } != 0 {
+            return None;
+        }
+
+        // 3. dgemm: C = W * W^T  (one GEMM, symmetric by construction).
+        let alpha: f64 = 1.0;
+        let beta: f64 = 0.0;
+        let st = unsafe {
+            (rb.dgemm)(
+                handle,
+                ROCBLAS_OP_N,
+                ROCBLAS_OP_T,
+                n,
+                n,
+                n,
+                &alpha,
+                d_a as *const f64,
+                lda,
+                d_a as *const f64,
+                lda,
+                &beta,
+                d_c as *mut f64,
+                lda,
+            )
+        };
+        if st != ROCBLAS_STATUS_SUCCESS {
+            return None;
+        }
+        if unsafe { (hip.dev_sync)() } != 0 {
+            return None;
+        }
+
+        // Download final H_psd only.
+        if unsafe {
+            (hip.memcpy)(
+                host_a.as_mut_ptr() as *mut c_void,
+                d_c,
+                bytes,
+                HIP_MEMCPY_D2H,
+            )
+        } != 0
+        {
+            return None;
+        }
+
+        let mut m = Mat::<f64>::zeros(k, k);
+        for j in 0..k {
+            for i in 0..k {
+                m[(i, j)] = host_a[i + j * k];
+            }
+        }
+        // Kill reconstruction asymmetry — same host pass as the CPU path so
+        // both agree exactly on the symmetrized result.
+        for i in 0..k {
+            for j in (i + 1)..k {
+                let v = 0.5 * (m[(i, j)] + m[(j, i)]);
+                m[(i, j)] = v;
+                m[(j, i)] = v;
+            }
+        }
+        Some((m, lambda_min))
     }
 
 }
@@ -2936,5 +3224,88 @@ mod tests {
             max_abs < 1e-9,
             "PSD projection must be ~identity on PSD input, max_abs={max_abs:.3e}"
         );
+    }
+
+    /// GPU PSD projection must match the faer CPU path when ROCm is present,
+    /// and soft-skip cleanly when it is not. k >= GPU_K_THRESHOLD so the GPU
+    /// path is eligible (it returns None immediately below the threshold).
+    #[test]
+    fn psd_projection_gpu_matches_cpu_or_skips() {
+        let k = super::GPU_K_THRESHOLD; // 1024
+        let n_rows = k + 64;
+        let x = Mat::<f64>::from_fn(n_rows, k, |i, j| {
+            let t = (i * 97 + j * 41 + 11) as f64 * 0.023;
+            t.sin() * 0.55 + (i as f64 * 0.01 - j as f64 * 0.007).cos()
+        });
+        let mut g = Mat::<f64>::zeros(k, k);
+        for i in 0..k {
+            for j in 0..=i {
+                let mut s = 0.0_f64;
+                for r in 0..n_rows {
+                    s += x[(r, i)] * x[(r, j)];
+                }
+                g[(i, j)] = s;
+                g[(j, i)] = s;
+            }
+        }
+        // bf16-perturb off-diagonals like HFQM storage.
+        let mut h = g.clone();
+        for i in 0..k {
+            for j in 0..i {
+                let v = h[(i, j)] as f32;
+                let bits = v.to_bits();
+                let bf16_trunc = f32::from_bits(bits & 0xFFFF_0000);
+                let t = bf16_trunc as f64;
+                h[(i, j)] = t;
+                h[(j, i)] = t;
+            }
+        }
+
+        // CPU reference — call faer path directly by going through the
+        // public function only if GPU is unavailable; otherwise compute
+        // CPU EVD inline so we can compare apples-to-apples.
+        let eigen = h
+            .self_adjoint_eigen(Side::Lower)
+            .expect("CPU eigh must converge");
+        let u = eigen.U();
+        let s = eigen.S();
+        let lambda_min_cpu = s[0];
+        let s_clipped = Col::from_fn(k, |i| s[i].max(0.0));
+        let mut h_cpu = &u * s_clipped.as_diagonal() * u.transpose();
+        for i in 0..k {
+            for j in (i + 1)..k {
+                let v = 0.5 * (h_cpu[(i, j)] + h_cpu[(j, i)]);
+                h_cpu[(i, j)] = v;
+                h_cpu[(j, i)] = v;
+            }
+        }
+        let lambda_max = s[k - 1].abs().max(1e-30);
+
+        match super::gpu::try_gpu_project_to_psd(&h, k) {
+            None => {
+                // Expected on hosts without a live AMD GPU / ROCm stack.
+                // Soft-fail is the contract; nothing else to assert.
+            }
+            Some((h_gpu, lambda_min_gpu)) => {
+                assert!(
+                    (lambda_min_gpu - lambda_min_cpu).abs() / lambda_max < 1e-9,
+                    "lambda_min mismatch: gpu={lambda_min_gpu:.6e} cpu={lambda_min_cpu:.6e}"
+                );
+                let mut max_abs = 0.0_f64;
+                for i in 0..k {
+                    for j in 0..k {
+                        let d = (h_gpu[(i, j)] - h_cpu[(i, j)]).abs();
+                        if d > max_abs {
+                            max_abs = d;
+                        }
+                    }
+                }
+                let rel = max_abs / lambda_max;
+                assert!(
+                    rel < 1e-9,
+                    "GPU vs CPU PSD max abs elementwise rel diff {rel:.3e}                      (abs={max_abs:.3e}, lambda_max={lambda_max:.3e})"
+                );
+            }
+        }
     }
 }
