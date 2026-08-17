@@ -4381,11 +4381,16 @@ fn quantize_tq2g128(f32_data: &[f32]) -> Vec<u8> {
                 let idx = 4 * i + j;
                 let w = if idx < actual_len { group[idx] } else { 0.0 };
                 let mut q = (w * id).round() as i32 + 1;
+                // Clamp to the TERNARY set {0,1,2} == {-d, 0, +d}. NOT 3: both
+                // decoders compute `(code-1)*d`, so code 3 decodes to +2d and
+                // makes this an asymmetric 4-level quantizer (negatives
+                // saturating at -d while positives reach +2d). Only reachable
+                // once d < max|w|, i.e. under the scale sweep.
                 if q < 0 {
                     q = 0;
                 }
-                if q > 3 {
-                    q = 3;
+                if q > 2 {
+                    q = 2;
                 }
                 byte_val |= (q as u8) << (j * 2);
             }
@@ -4549,11 +4554,16 @@ fn quantize_tq2g128_gptq(f32_data: &[f32], col_weights: &[f32]) -> Vec<u8> {
             for i in 0..GROUP {
                 let w = if i < actual { group[i] } else { 0.0 };
                 let mut q = (w * id).round() as i32 + 1;
+                // Clamp to the TERNARY set {0,1,2} == {-d, 0, +d}. NOT 3: both
+                // decoders compute `(code-1)*d`, so code 3 decodes to +2d and
+                // makes this an asymmetric 4-level quantizer (negatives
+                // saturating at -d while positives reach +2d). Only reachable
+                // once d < max|w|, i.e. under the scale sweep.
                 if q < 0 {
                     q = 0;
                 }
-                if q > 3 {
-                    q = 3;
+                if q > 2 {
+                    q = 2;
                 }
                 let recon = (q - 1) as f64 * dd;
                 let diff = w as f64 - recon;
@@ -4576,11 +4586,12 @@ fn quantize_tq2g128_gptq(f32_data: &[f32], col_weights: &[f32]) -> Vec<u8> {
             let w = if i < actual { group[i] } else { 0.0 };
             let target = w + residual;
             let mut q = (target * id).round() as i32 + 1;
+            // Ternary set {0,1,2}; see the note above — 3 would decode to +2d.
             if q < 0 {
                 q = 0;
             }
-            if q > 3 {
-                q = 3;
+            if q > 2 {
+                q = 2;
             }
             let recon = (q - 1) as f32 * dd;
             residual = (target - recon) * damping;
@@ -4652,6 +4663,84 @@ mod tq2g128_gptq_tests {
                 (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos()
             })
             .collect()
+    }
+
+    /// `tq2_pack_stats` is the shipping guard's eye: it must count the two
+    /// things that silently broke real requants — how much of the model got
+    /// zeroed, and whether any out-of-set code was emitted.
+    #[test]
+    fn tq2_pack_stats_counts_zeros_and_out_of_set_codes() {
+        // One block, 128 codes. Byte 0 = codes [0,1,2,3] (LSB-first, 2 b each)
+        // = 0b11_10_01_00 = 0xE4. Remaining 31 bytes = 0x55 = codes [1,1,1,1],
+        // i.e. all zero-level.
+        let mut blk = vec![0u8; 34];
+        blk[0..2].copy_from_slice(&f32_to_f16(0.5).to_le_bytes());
+        blk[2] = 0xE4;
+        for b in blk.iter_mut().skip(3) {
+            *b = 0x55;
+        }
+
+        let st = tq2_pack_stats(&blk);
+        assert_eq!(st.n_codes, 128);
+        // Non-zero = code != 1 → the 0, 2 and 3 in byte 0.
+        assert_eq!(st.nonzero, 3);
+        assert_eq!(st.out_of_set, 1, "exactly one code 3");
+    }
+
+    /// Raw 2-bit codes out of a TQ2G128 buffer (34 B/block: [f16 d][32 B qs]).
+    fn tq2_codes(packed: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for blk in packed.chunks_exact(34) {
+            for &byte in &blk[2..] {
+                for j in 0..4 {
+                    out.push((byte >> (j * 2)) & 0x3);
+                }
+            }
+        }
+        out
+    }
+
+    /// The ternary level set is {-d, 0, +d} == codes {0, 1, 2}. Code 3 decodes
+    /// to `(3-1)*d = +2d` in BOTH decoders (gguf_input::dequant_q2_0 and
+    /// kernels/src/gemv_tq2g128.hip), so emitting it silently turns the
+    /// quantizer into an ASYMMETRIC 4-level one: negatives saturate at -d while
+    /// positives reach +2d. PrismML's own Bonsai ternary never emits code 3
+    /// (measured 0.0000 across 4 tensors).
+    ///
+    /// The `q > 3 => 3` clamp was unreachable while d = max|w| (|w/d| <= 1, so
+    /// round() is at most 1). Widening the scale sweep to 0.20*amax makes
+    /// |w/d| >> 1 reachable — which is how this surfaced: 5.9% of codes on a
+    /// real 27B requant.
+    #[test]
+    fn ternary_packers_never_emit_the_out_of_set_code() {
+        let g = gaussian_block(128, 4242);
+        let w = vec![1.0f32; 128];
+        for (label, packed) in [
+            ("plain", quantize_tq2g128(&g)),
+            ("gptq", quantize_tq2g128_gptq(&g, &w)),
+        ] {
+            let codes = tq2_codes(&packed);
+            let bad = codes.iter().filter(|&&c| c == 3).count();
+            assert_eq!(
+                bad,
+                0,
+                "{label}: emitted out-of-set code 3 ({bad} of {} codes) — decodes to +2d",
+                codes.len()
+            );
+        }
+    }
+
+    /// Saturation must be symmetric: with a scale below max|w|, mirrored
+    /// out-of-range weights must land on mirrored levels.
+    #[test]
+    fn ternary_saturation_is_symmetric() {
+        let mut g = gaussian_block(128, 99);
+        g[0] = 6.0; // far above any swept d
+        g[1] = -6.0;
+        let w = vec![1.0f32; 128];
+        let codes = tq2_codes(&quantize_tq2g128_gptq(&g, &w));
+        assert_eq!(codes[0], 2, "large positive must saturate to +d (code 2)");
+        assert_eq!(codes[1], 0, "large negative must saturate to -d (code 0)");
     }
 
     fn nonzero_fraction(packed: &[u8], n: usize) -> f64 {
@@ -5792,6 +5881,114 @@ mod bq1g128_gptq_tests {
 /// already unrotated and in their runtime-expected precision, so they pass
 /// through byte-verbatim — mirroring how the GGUF ternary/binary pipeline keeps
 /// embeddings at Q8F16 and norms at F16 regardless of `--format`.
+/// Code-level statistics of a packed TQ2G128 buffer.
+#[derive(Default, Debug, Clone, Copy)]
+struct Tq2PackStats {
+    /// Codes decoding to a non-zero level (i.e. code != 1).
+    nonzero: u64,
+    /// Codes equal to 3 — outside the ternary set, decoding to +2d.
+    out_of_set: u64,
+    n_codes: u64,
+}
+
+impl Tq2PackStats {
+    fn add(&mut self, o: Tq2PackStats) {
+        self.nonzero += o.nonzero;
+        self.out_of_set += o.out_of_set;
+        self.n_codes += o.n_codes;
+    }
+    fn nonzero_fraction(&self) -> f64 {
+        if self.n_codes == 0 {
+            return 0.0;
+        }
+        self.nonzero as f64 / self.n_codes as f64
+    }
+}
+
+/// Count zero / non-zero / out-of-set codes in a TQ2G128 buffer
+/// (34 B per 128-weight block: `[f16 d][32 B codes]`, 4 codes per byte).
+fn tq2_pack_stats(data: &[u8]) -> Tq2PackStats {
+    let mut st = Tq2PackStats::default();
+    for blk in data.chunks_exact(34) {
+        for &byte in &blk[2..] {
+            for j in 0..4 {
+                let code = (byte >> (j * 2)) & 0x3;
+                st.n_codes += 1;
+                if code != 1 {
+                    st.nonzero += 1;
+                }
+                if code == 3 {
+                    st.out_of_set += 1;
+                }
+            }
+        }
+    }
+    st
+}
+
+/// Refuse to write a ternary model that the code histogram says is broken.
+///
+/// This is the cheap observable that would have caught both shipped defects
+/// immediately, without a GPU or an eval:
+///
+///   * `d = max|w|` as an ENCODER zeroed 83.7% of a real 27B requant (16.3%
+///     non-zero). Healthy is ~54% (Gaussian MSE optimum) to ~69% (PrismML's
+///     own Bonsai ternary). A model below `MIN_NONZERO` is not "lossy", it is
+///     mostly deleted.
+///   * code 3 decodes to `+2d` in both decoders, turning the quantizer into an
+///     asymmetric 4-level one. PrismML never emits it; neither should we.
+///
+/// Escape hatch `HIPFIRE_ALLOW_DEGENERATE_TERNARY=1` downgrades to a warning.
+fn check_ternary_pack_health(st: Tq2PackStats) {
+    const MIN_NONZERO: f64 = 0.25;
+    if st.n_codes == 0 {
+        return;
+    }
+    let nz = st.nonzero_fraction();
+    eprintln!(
+        "ternary pack health: {:.1}% non-zero codes ({} of {}), {} out-of-set",
+        nz * 100.0,
+        st.nonzero,
+        st.n_codes,
+        st.out_of_set
+    );
+    let degenerate = nz < MIN_NONZERO;
+    if !degenerate && st.out_of_set == 0 {
+        return;
+    }
+    let mut why = Vec::new();
+    if degenerate {
+        why.push(format!(
+            "only {:.1}% of codes are non-zero (expected >={:.0}%; healthy 54-69%) \
+             — {:.1}% of the model is zeroed",
+            nz * 100.0,
+            MIN_NONZERO * 100.0,
+            (1.0 - nz) * 100.0
+        ));
+    }
+    if st.out_of_set > 0 {
+        why.push(format!(
+            "{} codes are 3, which decodes to +2d (outside the ternary set)",
+            st.out_of_set
+        ));
+    }
+    let msg = why.join("; ");
+    if std::env::var("HIPFIRE_ALLOW_DEGENERATE_TERNARY")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
+        eprintln!("WARNING: degenerate ternary pack ({msg}) — allowed by HIPFIRE_ALLOW_DEGENERATE_TERNARY=1");
+        return;
+    }
+    eprintln!("error: refusing to write a degenerate ternary model: {msg}.");
+    eprintln!(
+        "       Set HIPFIRE_ALLOW_DEGENERATE_TERNARY=1 to write it anyway (it will \
+         not serve coherently)."
+    );
+    std::process::exit(3);
+}
+
 /// Per-input-column importance weights for a requantized tensor.
 ///
 /// Returns the `--imatrix` row for `name` when one was supplied and its length
@@ -5963,6 +6160,7 @@ fn run_hfq_requant_pipeline(
     let mut awq_folded = 0usize;
     let mut awq_dropped = 0usize;
     let mut awq_imatrix_used = 0usize;
+    let mut ternary_stats = Tq2PackStats::default();
 
     for entry in &entries {
         let IndexEntry {
@@ -6015,11 +6213,11 @@ fn run_hfq_requant_pipeline(
                 _ => requant_col_weights(&name, k),
             };
             let (packed, out_qt, out_group) = match format {
-                GgufFormat::Ternary => (
-                    quantize_tq2g128_gptq(&f32_data, &col_weights),
-                    QuantType::TQ2G128,
-                    128u32,
-                ),
+                GgufFormat::Ternary => {
+                    let p = quantize_tq2g128_gptq(&f32_data, &col_weights);
+                    ternary_stats.add(tq2_pack_stats(&p));
+                    (p, QuantType::TQ2G128, 128u32)
+                }
                 GgufFormat::Binary => (
                     quantize_bq1g128_gptq(&f32_data, &col_weights),
                     QuantType::BQ1G128,
@@ -6090,6 +6288,8 @@ fn run_hfq_requant_pipeline(
         awq_dropped,
         awq_imatrix_used
     );
+
+    check_ternary_pack_health(ternary_stats);
 
     write_hfq(output, arch_id, &metadata_json, &out_tensors, None).expect("write output .hfq");
     eprintln!("wrote {}", output.display());
