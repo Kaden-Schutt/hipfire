@@ -41,7 +41,7 @@
 
 #[allow(unused_imports)]
 use faer::linalg::solvers::{DenseSolveCore, Solve};
-use faer::{Mat, Side};
+use faer::{Col, Mat, Side};
 use rayon::prelude::*;
 
 /// GPU acceleration threshold.
@@ -188,6 +188,56 @@ pub fn cholesky_with_adaptive_damping(
 #[inline]
 fn clamped_initial_damp(initial_damp: f64, diag_mean: f64) -> f64 {
     initial_damp.max(f64::EPSILON * diag_mean.max(1.0))
+}
+
+/// Project a symmetric matrix onto the PSD cone via self-adjoint EVD.
+///
+/// Reference semantics (numpy `eigh` + clip + reconstruct + re-symmetrize):
+/// ```text
+/// evals, evecs = eigh(H)
+/// H = (evecs * clip(evals, 0, None)) @ evecs.T
+/// H = (H + H.T) / 2
+/// ```
+///
+/// Used only as a fallback when Cholesky fails at the damping cap because
+/// bf16 off-diagonal storage in HFQM perturbs a Gram matrix slightly out of
+/// PSD. Must not run on the success path — EVD is much heavier than Cholesky.
+///
+/// Returns `Some((H_psd, lambda_min))` where `lambda_min` is the smallest
+/// eigenvalue of the *input* (cheap; already computed by the EVD), or `None`
+/// if the eigensolver fails to converge.
+///
+/// Non-convergence returns `None` rather than panicking **on purpose**. This
+/// function only ever runs on a matrix that already defeated the damped
+/// Cholesky ladder, i.e. the pathological tail, and it is called partway
+/// through a multi-hour whole-model quantization. A panic here would destroy
+/// the entire run to salvage one tensor; `None` degrades that single tensor to
+/// RTN, which is exactly what would have happened without this fallback.
+pub fn project_to_psd(h: &Mat<f64>) -> Option<(Mat<f64>, f64)> {
+    let k = h.nrows();
+    assert_eq!(h.nrows(), h.ncols(), "Hessian must be square");
+
+    // faer 0.24: Mat::self_adjoint_eigen(&self, side: Side)
+    //   -> Result<SelfAdjointEigen<C::Canonical>, EvdError>
+    // SelfAdjointEigen exposes U() (eigenvectors) and S() (eigenvalues,
+    // nondecreasing). Reconstruction: U * clip(S, 0) * U^T.
+    let eigen = h.self_adjoint_eigen(Side::Lower).ok()?;
+    let u = eigen.U();
+    let s = eigen.S();
+    let lambda_min = s[0];
+
+    let s_clipped = Col::from_fn(k, |i| s[i].max(0.0));
+    let mut m = &u * s_clipped.as_diagonal() * u.transpose();
+
+    // Kill reconstruction asymmetry.
+    for i in 0..k {
+        for j in (i + 1)..k {
+            let v = 0.5 * (m[(i, j)] + m[(j, i)]);
+            m[(i, j)] = v;
+            m[(j, i)] = v;
+        }
+    }
+    Some((m, lambda_min))
 }
 
 /// GPU linear-algebra path via rocSOLVER + rocBLAS (FP64), soft-failing.
@@ -824,18 +874,71 @@ pub fn compute_damped_inv_cholesky_upper(
     // retry, all three O(K^3) steps on device, download only final U.
     // Soft-fails to CPU when libraries absent, GPU call fails, or K is
     // below the transfer-vs-compute threshold (see GPU_K_THRESHOLD).
+    //
+    // On SingularEvenWithMaxDamp, fall through to the CPU path so the
+    // PSD-projection rescue can still fire. Other GPU errors (none today)
+    // would also fall through; success returns immediately — byte-identical
+    // to the pre-PSD path.
     if let Some(gpu_result) = gpu::try_gpu_compute(&h_eff, initial_damp, max_damp_multiplier, diag_mean, k) {
         match gpu_result {
             Ok(v) => return Ok(v),
-            Err(e) => {
-                // Preserve adaptive-damping fallback contract: SingularEvenWithMaxDamp
-                // propagates; any other failure would have been None (fallback).
-                return Err(e);
+            Err(CholeskyError::SingularEvenWithMaxDamp { .. }) => {
+                // Fall through to CPU + optional PSD projection rather than
+                // propagating RTN immediately.
             }
         }
     }
 
-    // CPU fallback (faer + rayon) — preserved intact.
+    // CPU path (faer + rayon). First attempt uses the raw permuted Hessian —
+    // tensors that already succeed pay zero extra cost and remain byte-identical.
+    match try_cpu_damped_inv_cholesky_upper(&h_eff, initial_damp, max_damp_multiplier, diag_mean, k) {
+        Ok(v) => Ok(v),
+        Err(e @ CholeskyError::SingularEvenWithMaxDamp { .. }) => {
+            // bf16 off-diagonals in HFQM can push a structurally-sound Gram
+            // slightly out of PSD. Project onto the PSD cone and retry once.
+            // If the eigensolver itself fails to converge, surface the original
+            // Cholesky error so this tensor degrades to RTN — the outcome
+            // without this fallback — rather than aborting the whole model.
+            let Some((h_psd, lambda_min)) = project_to_psd(&h_eff) else {
+                eprintln!(
+                    "  gptq: PSD projection did not converge for K={k} Hessian; \
+                     falling back to RTN for this tensor"
+                );
+                return Err(e);
+            };
+            match try_cpu_damped_inv_cholesky_upper(
+                &h_psd,
+                initial_damp,
+                max_damp_multiplier,
+                diag_mean,
+                k,
+            ) {
+                Ok((u, damp)) => {
+                    eprintln!(
+                        "  gptq: PSD projection rescued K={k} Hessian \
+                         (lambda_min={lambda_min:.6e} before projection); \
+                         Cholesky succeeded at damp={damp:.6e}"
+                    );
+                    Ok((u, damp))
+                }
+                Err(e) => Err(e),
+            }
+        }
+    }
+}
+
+/// CPU damping ladder + inverse-Cholesky upper factor for one Hessian.
+///
+/// Extracted so the PSD-projection fallback can retry the identical loop
+/// without duplicating the O(K³) inversion body. Callers that succeed on the
+/// first attempt never pay for projection.
+fn try_cpu_damped_inv_cholesky_upper(
+    h_eff: &Mat<f64>,
+    initial_damp: f64,
+    max_damp_multiplier: f64,
+    diag_mean: f64,
+    k: usize,
+) -> Result<(Mat<f64>, f64), CholeskyError> {
     let mut damp = clamped_initial_damp(initial_damp, diag_mean);
     let damp_cap = max_damp_multiplier * diag_mean;
 
@@ -2601,5 +2704,237 @@ mod tests {
             );
         }
         assert_eq!(max_abs, 0.0, "packed identical but max_abs {max_abs:e} non-zero (should be 0)");
+    }
+
+    /// bf16 truncation of off-diagonals (HFQM storage) can push a Gram
+    /// matrix slightly out of PSD. At production K the resulting
+    /// `-lambda_min` reaches ~mean(diag) and Cholesky fails at the damp
+    /// cap; at unit-test K=64 the raw bf16 noise is only ~0.01×mean(diag),
+    /// so after applying the same truncation we amplify the negative
+    /// eigencomponents to production severity (ratio ≈ 1.1) while keeping
+    /// the diagonal and the positive subspace intact. Projection must then
+    /// rescue Cholesky at the production damp cap of 1.0×mean(diag).
+    #[test]
+    fn psd_projection_rescues_bf16_perturbed_hessian() {
+        let k = 64usize;
+        let n_rows = 48usize;
+        // Random-ish tall X → PSD Gram G = X^T X.
+        let x = Mat::<f64>::from_fn(n_rows, k, |i, j| {
+            let t = (i * 131 + j * 17 + 3) as f64 * 0.017;
+            t.sin() * 0.7 + t.cos() * 0.3
+        });
+        let mut g = Mat::<f64>::zeros(k, k);
+        for i in 0..k {
+            for j in 0..=i {
+                let mut s = 0.0_f64;
+                for r in 0..n_rows {
+                    s += x[(r, i)] * x[(r, j)];
+                }
+                g[(i, j)] = s;
+                g[(j, i)] = s;
+            }
+        }
+
+        // Round strict-lower off-diagonals through bf16 truncation
+        // (f32_bits >> 16 << 16) while keeping the diagonal exact — matches
+        // hfqm.rs Bf16TrilDiagF32 storage.
+        let mut h = g.clone();
+        for i in 0..k {
+            for j in 0..i {
+                let v = h[(i, j)] as f32;
+                let bits = v.to_bits();
+                let bf16_trunc = f32::from_bits(bits & 0xFFFF_0000);
+                let t = bf16_trunc as f64;
+                h[(i, j)] = t;
+                h[(j, i)] = t;
+            }
+        }
+
+        // Assert the bf16-perturbed matrix has at least one negative eigenvalue.
+        let eigen = h
+            .self_adjoint_eigen(Side::Lower)
+            .expect("eigh must succeed");
+        let u = eigen.U();
+        let s = eigen.S();
+        let n_neg = (0..k).filter(|&i| s[i] < 0.0).count();
+        assert!(
+            n_neg >= 1,
+            "expected bf16 perturbation to create ≥1 negative eigenvalue, got 0 \
+             (lambda_min={})",
+            s[0]
+        );
+
+        // Scale negative eigenvalues to production severity so
+        // `-lambda_min ≈ 1.1 * mean(diag)` — the regime where the damp
+        // cap of 1.0 fails. Positive spectrum and eigenvectors stay put.
+        let diag_mean: f64 = (0..k).map(|i| h[(i, i)]).sum::<f64>() / k as f64;
+        let target_min = -1.1 * diag_mean;
+        let lambda_min_raw = s[0];
+        assert!(lambda_min_raw < 0.0);
+        let scale = target_min / lambda_min_raw; // > 1
+        let s_scaled = Col::from_fn(k, |i| {
+            let e = s[i];
+            if e < 0.0 {
+                e * scale
+            } else {
+                e
+            }
+        });
+        let mut h_severe = &u * s_scaled.as_diagonal() * u.transpose();
+        for i in 0..k {
+            for j in (i + 1)..k {
+                let v = 0.5 * (h_severe[(i, j)] + h_severe[(j, i)]);
+                h_severe[(i, j)] = v;
+                h_severe[(j, i)] = v;
+            }
+        }
+
+        // At production damp cap 1.0×mean(diag), raw Cholesky must fail.
+        let diag_mean_s: f64 =
+            (0..k).map(|i| h_severe[(i, i)]).sum::<f64>() / k as f64;
+        let fail = cholesky_with_adaptive_damping(&h_severe, 0.01 * diag_mean_s, 1.0);
+        assert!(
+            matches!(fail, Err(CholeskyError::SingularEvenWithMaxDamp { .. })),
+            "raw bf16-perturbed H should fail Cholesky at damp cap 1.0, got {fail:?}"
+        );
+
+        // After PSD projection, small damp must succeed.
+        let (h_psd, lambda_min) = project_to_psd(&h_severe).expect("EVD converges");
+        assert!(lambda_min < 0.0, "lambda_min before projection should be negative");
+        let (_l, damp) = cholesky_with_adaptive_damping(&h_psd, 0.01 * diag_mean_s, 1.0)
+            .expect("PSD-projected H must Cholesky at small damp");
+        assert!(
+            damp <= 0.01 * diag_mean_s * 1.0001 + f64::EPSILON,
+            "expected success near initial damp, got damp={damp}"
+        );
+
+        // Production path must also rescue via compute_damped_inv_cholesky_upper.
+        let (_u, damp_u) =
+            compute_damped_inv_cholesky_upper(&h_severe, None, 0.01 * diag_mean_s, 1.0)
+                .expect("production path must PSD-rescue bf16-perturbed H");
+        assert!(damp_u > 0.0);
+    }
+
+    /// Projection must preserve the dominant subspace (top eigenvalues
+    /// essentially unchanged) and keep relative Frobenius change small —
+    /// under 1% for a bf16-perturbed Gram. Parent measured 0.0000% top-64
+    /// shift and 0.1004% rel Frobenius on real HFQM data.
+    #[test]
+    fn psd_projection_preserves_dominant_subspace() {
+        let k = 64usize;
+        let n_rows = 80usize;
+        let x = Mat::<f64>::from_fn(n_rows, k, |i, j| {
+            let t = (i * 97 + j * 41 + 11) as f64 * 0.023;
+            t.sin() * 0.55 + (i as f64 * 0.01 - j as f64 * 0.007).cos()
+        });
+        let mut g = Mat::<f64>::zeros(k, k);
+        for i in 0..k {
+            for j in 0..=i {
+                let mut s = 0.0_f64;
+                for r in 0..n_rows {
+                    s += x[(r, i)] * x[(r, j)];
+                }
+                g[(i, j)] = s;
+                g[(j, i)] = s;
+            }
+        }
+        let mut h = g.clone();
+        for i in 0..k {
+            for j in 0..i {
+                let v = h[(i, j)] as f32;
+                let bits = v.to_bits();
+                let bf16_trunc = f32::from_bits(bits & 0xFFFF_0000);
+                let t = bf16_trunc as f64;
+                h[(i, j)] = t;
+                h[(j, i)] = t;
+            }
+        }
+
+        let evals_before = h
+            .self_adjoint_eigenvalues(Side::Lower)
+            .expect("eigh before");
+        let (h_psd, _) = project_to_psd(&h).expect("EVD converges");
+        let evals_after = h_psd
+            .self_adjoint_eigenvalues(Side::Lower)
+            .expect("eigh after");
+
+        // Top-16 eigenvalues (largest = last in nondecreasing order).
+        let top_n = 16;
+        let mut max_rel_shift = 0.0_f64;
+        for t in 0..top_n {
+            let a = evals_before[k - 1 - t];
+            let b = evals_after[k - 1 - t];
+            let rel = (a - b).abs() / a.abs().max(1e-30);
+            if rel > max_rel_shift {
+                max_rel_shift = rel;
+            }
+        }
+        assert!(
+            max_rel_shift < 1e-6,
+            "top eigenvalues shifted too much: max_rel={max_rel_shift:.3e}"
+        );
+
+        // Relative Frobenius ||H_psd - H||_F / ||H||_F < 1%.
+        let mut num = 0.0_f64;
+        let mut den = 0.0_f64;
+        for i in 0..k {
+            for j in 0..k {
+                let d = h_psd[(i, j)] - h[(i, j)];
+                num += d * d;
+                den += h[(i, j)] * h[(i, j)];
+            }
+        }
+        let rel_frob = num.sqrt() / den.sqrt().max(1e-30);
+        assert!(
+            rel_frob < 0.01,
+            "relative Frobenius change {rel_frob:.4e} exceeds 1%"
+        );
+    }
+
+    /// On an already-PSD matrix the projection is a no-op to tight
+    /// tolerance — this is what licenses using it as a pure fallback.
+    #[test]
+    fn psd_projection_is_identity_on_psd_input() {
+        let k = 32usize;
+        let n_rows = 48usize;
+        let x = Mat::<f64>::from_fn(n_rows, k, |i, j| {
+            ((i + 1) as f64 * 0.11 + (j + 3) as f64 * 0.07).sin()
+        });
+        let mut g = Mat::<f64>::zeros(k, k);
+        for i in 0..k {
+            for j in 0..=i {
+                let mut s = 0.0_f64;
+                for r in 0..n_rows {
+                    s += x[(r, i)] * x[(r, j)];
+                }
+                // Tiny ridge so the matrix is strictly PD, not just PSD.
+                if i == j {
+                    s += 1e-6;
+                }
+                g[(i, j)] = s;
+                g[(j, i)] = s;
+            }
+        }
+
+        let (h_psd, lambda_min) = project_to_psd(&g).expect("EVD converges");
+        assert!(
+            lambda_min >= -1e-12,
+            "input was constructed PSD, lambda_min={lambda_min}"
+        );
+
+        let mut max_abs = 0.0_f64;
+        for i in 0..k {
+            for j in 0..k {
+                let d = (h_psd[(i, j)] - g[(i, j)]).abs();
+                if d > max_abs {
+                    max_abs = d;
+                }
+            }
+        }
+        // EVD round-trip noise on a well-conditioned PD matrix is tiny.
+        assert!(
+            max_abs < 1e-9,
+            "PSD projection must be ~identity on PSD input, max_abs={max_abs:.3e}"
+        );
     }
 }
