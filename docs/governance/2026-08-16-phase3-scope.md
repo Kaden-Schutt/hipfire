@@ -304,3 +304,62 @@ workspace, is a design decision.
 must own its own storage) before `LoadedModel` can move. That is Phase 2's `ModelState`
 work again at a smaller scale, not the mechanical relocation the original scope assumed.
 The registration-tax gain behind it — 9 sites to roughly 6 — does not justify rushing it.
+
+
+---
+
+## Addendum — 3D is blocked: the redline oracle is red, and has been since 2026-08-14
+
+3D carried a hard precondition: *the redline/PM4 replay oracle MUST be shown to fail on a
+deliberate break before a line of kernel dispatch moves.* That control was attempted on
+hiptrx (gfx1201, the arch the fixture targets) and **could not even establish a passing
+baseline**:
+
+```
+golden-redline: MQ4R registry card changed:
+  expected 6a22ac8300e938c3ca562eeb9b5a3159c4e3c862...
+  got      be7a9f72e572b9e3c33e75954...
+```
+
+### Why
+
+`tools/redline/golden.py:79 validate_model_registry_card` hashes the model's entry in
+`registry/v1.json` and compares it to `registry_card_sha256` pinned in
+`registry/redline-golden-v1.json`. The pinned tag is `qwen3.6:35b-a3b-mq4r`, sealed
+**2026-07-23** at commit `319905cb4`.
+
+Commit `f9e0a8312` (2026-08-14, *"consolidate models under hipfire-models, drop the
+hipfire- prefix"*) rewrote every card's `repo` field:
+
+```
+- "repo": "schuttdev/hipfire-qwen3.6-35b-a3b"
++ "repo": "hipfire-models/qwen3.6-35b-a3b"
+```
+
+The card hash changed. Nothing about the model bytes, the kernels or the route changed —
+`sha256` of the artifact is untouched — but the seal covers the whole card.
+
+### This is the oracle behaving correctly
+
+It is fail-closed on model identity, and refusing to compare performance across a changed
+model definition is the right instinct. `registry/v1.json` is generated from
+`models.json`, so any registry edit anywhere can invalidate every seal that pins a card
+hash. Seventeen commits have touched the registry since sealing.
+
+The consequence is still that **the one validation asset with real acceptance criteria has
+been silently unusable for two days**, and it was found only by trying to use it. It is
+wired as route `redline.golden` and would have failed the same way for anyone who ran it.
+
+### What 3D needs before it can start
+
+1. Re-seal the fixture: a trusted gfx1201 run at a known-good commit, recording a fresh
+   `registry_card_sha256`. That is a decision about which commit is trustworthy, not a
+   mechanical refresh, and the perf-checkpoint rules make it append-only.
+2. Consider whether the seal should cover the card's *identity* fields (repo, file,
+   sha256) rather than the whole card, so that editing a `desc` or a sampling default does
+   not invalidate a kernel-route proof. That is a design question with a real tradeoff:
+   narrowing the seal makes it survive cosmetic edits and also makes it blind to a
+   sampling change that would legitimately move tok/s.
+
+Until then the perf and route axes of the oracle are **unverified**, and `gemm.rs` must not
+be restructured. The precondition was written precisely to stop that, and it worked.
