@@ -12,20 +12,48 @@ tail-1% MSE** at **zero size change**, data-free, throughput-neutral on 4 of 5 a
 
 ## 1 · Why
 
-Affine's header is over-provisioned for FWHT-rotated weights. Two measurements, both on
-278,528 real post-FWHT 256-blocks from the Qwen3.8-27B bf16 parent (layers 0 / 20 / 40,
-engine sign seeds 42/1042):
+Affine's header is over-provisioned for FWHT-rotated weights — but **only in precision, not in
+the zero-point.** Measured on 278,528 real post-FWHT 256-blocks from the Qwen3.8-27B bf16
+parent (layers 0 / 20 / 40, engine sign seeds 42/1042):
 
-- **The zero-point is nearly worthless after rotation.** Block asymmetry
-  `(max+min)/(max−min)` has mean **+0.0004** and mean absolute **0.0757**. Rotation
-  symmetrises blocks, as the CLT argument predicts.
 - **f32 header precision is unused.** Storing scale and zero as fp16 instead of f32 changes
   overall MSE by **0.00%** (1.4415e-06 either way) and tail-1% MSE by **0.008%**
-  (9.4643e-07 vs 9.4635e-07).
+  (9.4643e-07 vs 9.4635e-07). This frees 4 of the 8 header bytes.
+- **The zero-point is NOT expendable.** An earlier draft of this spec claimed it was, reasoning
+  from block asymmetry `(max+min)/(max−min)` having mean **+0.0004** and mean absolute
+  **0.0757**. That was an inference, and measurement **falsified it**: dropping the zero and
+  using symmetric levels over `[−max, +max]` costs **12× on tail-1% MSE** (6.9468e-06 vs
+  5.6621e-07 for asymmetric at the same per-128 granularity). p99 asymmetry is 0.2439, and
+  more decisively, **asymmetric min/max fitting makes BOTH block extremes exactly
+  representable while symmetric makes only one.** That is the real reason affine wins the
+  tail, and it is why v2 keeps the zero-point.
 
-So 4 of the 8 header bytes are pure waste and the other 4 are 2× over-precise. Spending the
-same 8 bytes on **granularity instead of precision** is strictly better on quality metrics
-at identical size.
+So the 8 header bytes are 2× over-precise but not otherwise wasteful. Halving the precision
+and spending the saving on **granularity** is what v2 does. Symmetric no-zero-point variants
+at 130 B / 132 B / 136 B were measured and **rejected** (tail 1.1287e-05 / 6.9468e-06 /
+3.9636e-06 respectively). Consequently **136 B is the hard floor for per-128 asymmetric**:
+two `(fp16 scale, fp16 zero)` pairs are 8 B, plus the 128 B payload.
+
+## 1b · v1.5 — a strictly free intermediate, worth taking independently
+
+Applying only the fp16-header half of the change, at per-256 granularity, gives a **132 B**
+format with **identical quality to v1** (MSE 1.4415e-06, tail 9.4643e-07) that is **smaller
+and faster**:
+
+| | header loads | added VALU | B | R=2 ratio | R=4 ratio |
+|---|---|---|---|---|---|
+| v1 | 2 scalar (f32 scale, f32 zero) | 0 (`bit_cast` is free) | 136 | 1.0000 | 1.0000 |
+| **v1.5** | **1 scalar** (packed fp16 pair) | 2 `cvt_f32_f16` | **132** | **0.9847** | **0.9773** |
+| v2 | 2 scalar | 1 `cndmask` + 2 `cvt` | 136 | 0.9766 | 1.0128 |
+
+v1.5 both **halves the header load count** and cuts **2.9% of weight traffic**, so on a
+bandwidth-bound kernel it wins outright at quality parity. It also has no `cndmask`, which is
+why it avoids v2's R=4 regression. Layout: `[0..2)` fp16 scale, `[2..4)` fp16 zero,
+`[4..132)` nibbles — note the payload offset moves 8 → 4 and the stride 136 → 132, so unlike
+v2 the payload is **not** byte-identical to v1.
+
+**v1.5 and v2 are independent decisions.** v1.5 is size + speed at fixed quality; v2 is
+quality at fixed size. They cannot be combined, because per-128 asymmetric needs the full 8 B.
 
 This is deliberately **not a codebook**. Level placement stays uniform over `[min, max]`,
 identical in rule to qt=1/6/13. See § 8 for why the codebook line (qt=40, qt=43) is retired.
@@ -297,19 +325,59 @@ not inspection:
 - [ ] `kernels.rs` `include_str!` per new kernel file
 - [ ] `embed_classify` only if the format can ever back an embedding table
 
-### Port surface, and the refactor that should precede it
+### Port surface — the ACTUAL minimal set for gfx1201 dense
 
-The `f32 scale + f32 zero` header is read at **~700 sites across ~127 kernel files** (GEMV 33
-files / 392 sites; GEMM 78 / 308; plus fused QKV/QKVZA/gate_up, MoE, embeddings, dequant).
-`gemv_hfq4g256_residual_scaled.hip` alone has 42.
+Traced through the dispatch tables (`forward_slots.rs`, `families/fused_qkv.rs`,
+`families/gemm.rs`, `families/gemv.rs`, `rdna-compute/src/gemm.rs`, `gemv.rs`), a dense
+Qwen3.5/3.8-27b (arch_id=5) on gfx1201 touches **11 translation units, ~13 header site
+pairs** — not the ~700 sites across ~127 files that the whole HFQ4-G256 family spans.
 
-**Do not hand-port 700 sites.** Factor the header decode into one shared inline first —
-`hfq4_load_hdr(gp, goff, tid, &sc, &zp)` — as a pure refactor with bit-identical output, then
-v2 becomes a single edit plus a qt number, reversible and arch-gateable in one place. The
-codebase is already halfway there with `LOAD_WEIGHT_HEADER`, `LOAD_LM_HEADER`, and
-`HIPFIRE_RESIDUAL_LOAD_SC/ZP`. A large fraction of the 127 files are research variants
-(`muse_*`, `ldscoop`, `ldsx`, `.v1`–`.v5`) that no dispatch table selects; the live set per
-arch is closer to 10–20.
+**Prefill** — gfx12 WMMA fused GEMMs plus residual. `_bt` siblings are separate sources
+selected when `HIPFIRE_GATE_UP_BT` is on and the batch triggers BT, so they are required, not
+optional:
+
+| file | serves | header pairs |
+|---|---|---|
+| `gemm_qkvza_hfq4g256_wmma.gfx12.hip` | linear-attn `in_proj_qkv/z/a/b` | 1 |
+| `gemm_qkvza_hfq4g256_wmma_gfx12_bt.hip` | same, BT path | 1 |
+| `gemm_qkv_hfq4g256_wmma.gfx12.hip` | full-attn `q/k/v_proj` | 1 |
+| `gemm_gate_up_hfq4g256_wmma.gfx12.hip` | `mlp.gate/up_proj` (+ `ldsstage` symbol, same source) | 2 |
+| `gemm_gate_up_hfq4g256_wmma_gfx12_bt.hip` | same, BT path | 1 |
+| `gemm_hfq4g256_residual_wmma.gfx12.hip` | `o_proj` / `down_proj` (+ `ldsstage`) | 2 |
+| `gemm_hfq4g256_residual_wmma_gfx12_bt.hip` | same, BT path | 1 |
+
+**Decode** — fused projections plus residual GEMV:
+
+| file | serves |
+|---|---|
+| `fused_qkvza_hfq4g256.hip` | linear-attn projections |
+| `fused_qkv_hfq4g256.hip` | full-attn projections |
+| `fused_gate_up_hfq4g256.hip` | MLP gate+up |
+| `gemv_hfq4g256_residual.hip` | `o_proj` / `down_proj`, **rows forced to 1 on non-RDNA3**, so R=1 on gfx1201 |
+
+**Correction to earlier measurements in this campaign.** All the v1 / v1.5 / v2 throughput
+numbers in § 6 were taken on `gemv_hfq4g256_multirow`, which the scout established is **NOT on
+the dense MQ4 projection path** — fused kernels cover qkv/qkvza/gate_up and the residual GEMV
+covers o_proj/down_proj. Those numbers remain valid as a *proxy* for the header change (same
+payload access, same header pattern, same lane mapping) but they are **not** measurements of
+the shipping decode path. Re-measure on `fused_*` and `gemv_hfq4g256_residual` before quoting
+throughput for a shipped v2.
+
+**Explicitly out of scope**, and porting them speculatively costs real work for nothing: all
+MoE variants (`gemv_hfq4g256_moe_*`, `gemm_*_moe_grouped_*`), all `muse_*` research variants,
+`.gfx11*` / `.gfx942` / `.gfx1030` / wave64 / dp4a / cpol variants, `ldscoop`, `ldsx`,
+`.v1`-`.v5`, and the `XBATCH` single-row path.
+
+### On factoring the header decode
+
+The kernels do support shared headers — `turbo_common.h` is included by 51 files — but the
+mechanism is textual: the Rust side strips the `#include` and prepends the header source
+(`attention.rs:3925`, `.replace("#include \"turbo_common.h\"", "")`). So a shared
+`hfq4_load_hdr` helper needs per-launcher plumbing on top of the kernel edits.
+
+At 11 files with 13 site pairs, **inline the substitution per kernel**; the bit-identity test
+in § 9 is what makes the port safe, not the factoring. Factoring is the right move for a
+broader quantization refactor covering all ~127 files, where the launcher plumbing amortises.
 
 ### Prototypes and harnesses that exist
 
