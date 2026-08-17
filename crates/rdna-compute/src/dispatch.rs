@@ -41,22 +41,27 @@ pub const LLOYD_MQ3_GROUP_BYTES: usize = 112;
 /// docs/plans/mq-lloyd-batched-prefill-followup.md).
 pub const LLOYD_MQ4_GROUP_BYTES: usize = 160;
 
-// ── MQ*-G256-GL ("global Lloyd") format constants ────────────────────────────
+// ── MQ*-GL ("global Lloyd") format constants ────────────────────────────
 //
 // GL = one codebook shared by the WHOLE tensor + a per-block fp16 scale, laid
 // out as TWO SoA regions rather than the interleaved per-group header the
 // MQ2/MQ3-Lloyd formats use:
 //
-//   MQ2G256GL (qt 38): [0 .. M*gpr*64)   2-bit indices, 64 B/group
-//                      [M*gpr*64 .. +M*gpr*2)  fp16 per-block scales  → 2.0625 bpw
-//   MQ3G256GL (qt 39): [0 .. M*gpr*96)   3-bit indices, 96 B/group
-//                      [M*gpr*96 .. +M*gpr*2)  fp16 per-block scales  → 3.0625 bpw
-//   MQ4G256GL (qt 40): [0 .. M*gpr*128)  4-bit indices, 128 B/group
-//                      [M*gpr*128 .. +M*gpr*2) fp16 per-block scales  → 4.0625 bpw
+//   MQ2G256GL  (qt 38): [0 .. M*gpr*64)   2-bit indices, 64 B/group
+//                       [M*gpr*64 .. +M*gpr*2)  fp16 per-block scales  → 2.0625 bpw
+//   MQ3G256GL  (qt 39): [0 .. M*gpr*96)   3-bit indices, 96 B/group
+//                       [M*gpr*96 .. +M*gpr*2)  fp16 per-block scales  → 3.0625 bpw
+//   MQ4G256GL  (qt 40): [0 .. M*gpr*128)  4-bit indices, 128 B/group
+//                       [M*gpr*128 .. +M*gpr*2) fp16 per-block scales  → 4.0625 bpw
+//   MQ35G256GL (qt 42): [0 .. M*gpr*112)  3.5-bit indices (7 bits per weight pair, 128-entry 2D VQ), 112 B/group
+//                       [M*gpr*112 .. +M*gpr*2) fp16 per-block scales  → 3.5625 bpw
+//   MQ1G1024GL (qt 41): [0 .. M*gpr*128)  1-bit indices, 128 B/group (gpr=K/1024)
+//                       [M*gpr*128 .. +M*gpr*2) fp16 per-block scales  → 1.015625 bpw
 //
-// with gpr = K/256. There is no inline per-group header — any loader or size
+// with gpr = K/256 except MQ1 where gpr=K/1024. There is no inline per-group header — any loader or size
 // estimator that assumes "one contiguous blob per row with a header" is wrong
 // for these dtypes.
+
 
 /// Per-group INDEX bytes for MQ2-G256-GL (2 bits × 256 weights). The fp16
 /// per-block scale lives in a SEPARATE trailing region, NOT in the group.
@@ -82,6 +87,17 @@ pub const GL_MQ1_GROUP_IDX_BYTES: usize = 128;
 
 /// Group size for MQ1-GL: 1024 weights per group (see alignment law).
 pub const GL_MQ1_GROUP_SIZE: usize = 1024;
+
+/// Per-group INDEX bytes for MQ3.5-G256-GL (7 bits per weight PAIR, 128-entry 2D VQ).
+/// 256 weights = 128 pairs × 7 bits = 896 bits = 112 B. +2 B scale = 114 B/group → 3.5625 bpw.
+/// Alignment: 256*3.5=896 bits → 112 B → 3.5 B/lane = 0.875 u32/lane (NOT aligned).
+/// The smallest aligned group is 2048 weights: 2048*3.5=7168 bits=896 B →28 B/lane=7 u32/lane,
+/// but that costs 8× coarser scale granularity. MQ35 therefore is LESS aligned than MQ4GL
+/// (which at G256 gives exactly 4 B/lane=1 u32/lane). Implemented at G256 for quality parity.
+pub const GL_MQ35_GROUP_IDX_BYTES: usize = 112;
+
+/// Group size for MQ3.5-GL: 256 weights per group (128 pairs). See alignment note above.
+pub const GL_MQ35_GROUP_SIZE: usize = 256;
 
 /// Bytes per group in the trailing fp16 scale region (both GL dtypes).
 pub const GL_GROUP_SCALE_BYTES: usize = 2;
@@ -141,6 +157,147 @@ pub const GL_CB4: [f32; 16] = [
 /// `±sqrt(2/pi)` = `±0.7978845608028654`. Derivation: E|x| = ∫|x|·φ(x)dx =
 /// sqrt(2/pi). No kernel consumes this yet — encode-only endpoint of the family.
 pub const GL_CB1: [f32; 2] = [-0.7978845608028654, 0.7978845608028654];
+
+/// **MUST STAY BIT-IDENTICAL TO `hipfire-quantize::main::GL_CB35`.**
+///
+/// 3.5-bit 2D vector codebook: 7 bits per weight PAIR = 128 entries, each a 2D point for a
+/// normalized post-FWHT pair. Fitted with Lloyd/k-means on 1.572M real post-FWHT pairs from
+/// Qwen3.8-27B (layers 0 linear_attn.out_proj, 20 mlp.down_proj, 40 mlp.gate_proj, 4096 groups
+/// each, 12,288 groups total), seeded with k-means++ seed=42, 100 iterations, sorted by x then y
+/// for deterministic order. Normalized-domain MSE 0.01515 per dim vs 0.00940 for GL_CB4 (scalar
+/// 4-bit), i.e. 61% worse absolute but at 0.5 fewer bits. See `mq35_vq_fit` for the harness.
+/// No kernel consumes this yet — encode-only.
+pub const GL_CB35: [[f32; 2]; 128] = [
+    [-3.036506, 0.557011],
+    [-2.902707, -0.608592],
+    [-2.486214, 1.544335],
+    [-2.464717, -1.467453],
+    [-2.417152, -0.023972],
+    [-2.295932, 0.706263],
+    [-2.162351, -0.730994],
+    [-1.947877, 0.306698],
+    [-1.934456, -2.409281],
+    [-1.895991, -0.228143],
+    [-1.885129, 1.082130],
+    [-1.802912, 2.411955],
+    [-1.743065, -1.124332],
+    [-1.706713, -1.677137],
+    [-1.685550, 1.663885],
+    [-1.600927, -0.650825],
+    [-1.593014, 0.659777],
+    [-1.544414, 0.152975],
+    [-1.450453, -0.269551],
+    [-1.394326, 1.156593],
+    [-1.254734, -1.360016],
+    [-1.243292, -0.909463],
+    [-1.220646, 0.410975],
+    [-1.209120, -2.058067],
+    [-1.179515, -0.024031],
+    [-1.150258, 1.595281],
+    [-1.142204, 0.814831],
+    [-1.117422, -0.488152],
+    [-1.056154, 2.141912],
+    [-0.932642, 1.212272],
+    [-0.907086, 0.198202],
+    [-0.880944, -1.642492],
+    [-0.865366, -0.820827],
+    [-0.861729, -0.183285],
+    [-0.853414, -2.848194],
+    [-0.851236, 0.573600],
+    [-0.823025, 2.881643],
+    [-0.817329, -1.191992],
+    [-0.718535, -0.511478],
+    [-0.706018, 0.898155],
+    [-0.691930, 1.711770],
+    [-0.605064, 0.367565],
+    [-0.590630, -2.134673],
+    [-0.581430, 0.061727],
+    [-0.537026, 1.304575],
+    [-0.505917, -0.234563],
+    [-0.483035, -0.831881],
+    [-0.459100, -1.613037],
+    [-0.438526, -1.205364],
+    [-0.430598, 0.631694],
+    [-0.378955, 2.245666],
+    [-0.365405, -0.493880],
+    [-0.343728, 0.964808],
+    [-0.286504, 0.295790],
+    [-0.256216, -0.032611],
+    [-0.251191, 1.744736],
+    [-0.143569, 1.333993],
+    [-0.127799, -1.014336],
+    [-0.117265, -0.675589],
+    [-0.082967, -0.312776],
+    [-0.081779, -1.424501],
+    [-0.081717, 0.631896],
+    [-0.079977, -1.920818],
+    [-0.054644, -2.570277],
+    [-0.019024, 0.970040],
+    [0.013778, 0.298853],
+    [0.049626, -0.021871],
+    [0.130522, 2.925998],
+    [0.168374, 1.710445],
+    [0.168862, -0.492120],
+    [0.200595, -0.825208],
+    [0.220961, -1.184709],
+    [0.233563, 1.253369],
+    [0.236452, 2.223155],
+    [0.258488, 0.521816],
+    [0.279151, 0.851728],
+    [0.309002, 0.157230],
+    [0.315732, -1.632396],
+    [0.323335, -0.213913],
+    [0.440193, -2.126922],
+    [0.480347, -0.565665],
+    [0.533287, 1.516962],
+    [0.549216, -0.924366],
+    [0.555097, 0.372449],
+    [0.575936, -1.307392],
+    [0.584788, -0.015324],
+    [0.589135, 1.098487],
+    [0.597830, 0.722098],
+    [0.700796, -2.967724],
+    [0.707100, -0.338488],
+    [0.731491, 1.954455],
+    [0.819098, 0.204463],
+    [0.839814, -1.646037],
+    [0.843593, -0.704436],
+    [0.901551, 0.549277],
+    [0.917409, -1.124217],
+    [0.929044, 1.410108],
+    [0.943199, 0.946930],
+    [0.963024, -0.094088],
+    [0.990743, 2.622817],
+    [0.994562, -2.242123],
+    [1.106773, -0.427862],
+    [1.152424, 0.263105],
+    [1.241635, -0.816511],
+    [1.263196, 0.701724],
+    [1.272961, 1.810202],
+    [1.312531, -1.273730],
+    [1.318652, 1.197619],
+    [1.347748, -0.085024],
+    [1.350326, -1.776562],
+    [1.508685, 0.354619],
+    [1.548087, -0.466790],
+    [1.668620, 0.866390],
+    [1.706376, -0.913996],
+    [1.778556, -0.034955],
+    [1.791853, 1.454724],
+    [1.797822, -2.373145],
+    [1.810372, 2.283694],
+    [1.863575, -1.481466],
+    [1.939231, 0.442107],
+    [2.074944, -0.428416],
+    [2.232601, 0.910838],
+    [2.283314, -0.947652],
+    [2.356225, 0.114156],
+    [2.557220, 1.613256],
+    [2.653772, -1.641341],
+    [2.899535, -0.451693],
+    [2.944135, 0.598941],
+];
+
 
 /// Current layer index, set by the qwen35 forward_prefill_chunk at the
 /// start of each layer iteration. Used by `hfq3_mmq_layer_gate_pass` to
@@ -315,6 +472,12 @@ pub enum DType {
     /// passed as sixteen scalar kernel args, not stored in the file. Nibble
     /// packing matches MQ4G256 (`lo | hi << 4`).
     MQ4G256GL,
+    /// MQ3.5-G256-GL (qt 42): 7 bits per weight PAIR (128-entry 2D VQ) + per-block fp16 scale, SoA:
+    /// `[0 .. M*gpr*112)` 7-bit indices (8 pairs → 7 bytes, 16 chunks →112 B/group)
+    /// `[M*gpr*112 .. +M*gpr*2)` fp16 per-block scales → 114 B/group → 3.5625 bpw.
+    /// 256*3.5=896 bits →3.5 B/lane (NOT aligned). Smallest aligned group is 2048→28 B/lane=7 u32.
+    /// Therefore LESS aligned than MQ4GL (4 B/lane=1 u32). Encode-only.
+    MQ35G256GL,
     MQ1G1024GL, // MagnumQuant 1-bit + TENSOR-GLOBAL 2-entry codebook (GL_CB1), SoA:
     // [M*gpr*128 B indices][M*gpr*2 B fp16 scales] where gpr=K/1024.
     // 128 B idx +2 B scale per 1024 weights =1.015625 bpw.
@@ -383,6 +546,7 @@ impl DType {
             | DType::MQ2G256GL
             | DType::MQ3G256GL
             | DType::MQ4G256GL
+            | DType::MQ35G256GL
             | DType::MQ1G1024GL
             | DType::HFP4G32
             | DType::MFP4G32
@@ -494,9 +658,11 @@ impl DType {
                 | DType::MQ2G256GL
                 | DType::MQ3G256GL
                 | DType::MQ4G256GL
+                | DType::MQ35G256GL
                 | DType::MQ1G1024GL
         )
     }
+
 
     /// Whether this format requires K % 1024 == 0 (MQ1-G1024-GL). Subset of
     /// `requires_k_mod_256` — 1024 multiple implies 256 multiple, but we
