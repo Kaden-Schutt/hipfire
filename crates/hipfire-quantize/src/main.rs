@@ -15766,6 +15766,508 @@ mod tests {
         }
     }
 
+    /// OCP E4M3 (1 sign / 4 exp / 3 mantissa, bias 7) round-to-nearest-even.
+    /// Max finite 448 (`0x7E`); NaNs encode as `0x7F`/`0xFF`. Min normal 2^-6;
+    /// subnormal step 2^-9. Host oracle for every qt=40 FP8 prefill path — do not
+    /// hardcode GL→E4 tables; derive bytes from `rdna_compute::GL_CB4` via this.
+    #[cfg(test)]
+    fn e4m3_rne(x: f32) -> u8 {
+        if x.is_nan() {
+            return 0x7F;
+        }
+        let sign = if x.is_sign_negative() { 0x80u8 } else { 0 };
+        let ax = x.abs();
+        // Saturate to max finite before the scan so +inf and huge values match HW.
+        if ax >= 448.0 {
+            return sign | 0x7E;
+        }
+        let mut best = 0u8;
+        let mut best_err = f32::INFINITY;
+        // Finite codes only: exp=0xF mant=0x7 is NaN in OCP E4M3FN.
+        for code in 0u8..0x7F {
+            let y = e4m3_decode(code);
+            let err = (y - ax).abs();
+            // Strictly closer wins; ties break to even mantissa LSB (RNE).
+            if err < best_err {
+                best_err = err;
+                best = code;
+            } else if err == best_err && (code & 1) == 0 && (best & 1) == 1 {
+                best = code;
+            }
+        }
+        sign | best
+    }
+
+    #[cfg(test)]
+    fn e4m3_decode(bits: u8) -> f32 {
+        let sign = if bits & 0x80 != 0 { -1.0f32 } else { 1.0 };
+        let exp = (bits >> 3) & 0x0F;
+        let mant = bits & 0x07;
+        if exp == 0 {
+            // Subnormal: mant/8 * 2^-6 = mant * 2^-9.
+            return sign * (mant as f32) * (2.0f32).powi(-9);
+        }
+        if exp == 0x0F && mant == 0x07 {
+            return f32::NAN.copysign(sign);
+        }
+        // Normal: (1 + mant/8) * 2^(exp-bias), bias 7.
+        sign * (1.0 + (mant as f32) / 8.0) * (2.0f32).powi(exp as i32 - 7)
+    }
+
+    /// Unit-Gaussian codec MSE for a fixed reconstruction codebook: nearest
+    /// level under mid-point Voronoi cells, integrated against N(0,1) exactly.
+    /// Offline figures on `GL_CB4` (0.009501), int8-grid GL (~0.009514), and
+    /// E4M3-GL (0.009819) all come from this integral — independent of FWHT /
+    /// per-block scale.
+    #[cfg(test)]
+    fn gaussian_codebook_mse(cb: &[f32]) -> f64 {
+        fn phi(x: f64) -> f64 {
+            (-0.5 * x * x).exp() / (std::f64::consts::TAU).sqrt()
+        }
+        // Abramowitz–Stegun 7.1.26 erf (max |err| < 1.5e-7) — enough for the
+        // 1e-6 MSE pins below; avoids a libm dependency in this bin crate.
+        fn erf_approx(x: f64) -> f64 {
+            let sign = if x < 0.0 { -1.0 } else { 1.0 };
+            let ax = x.abs();
+            let t = 1.0 / (1.0 + 0.3275911 * ax);
+            let poly = t
+                * (0.254829592
+                    + t * (-0.284496736
+                        + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
+            sign * (1.0 - poly * (-ax * ax).exp())
+        }
+        fn cdf(x: f64) -> f64 {
+            0.5 * (1.0 + erf_approx(x / std::f64::consts::SQRT_2))
+        }
+        // Moments of N(0,1) on (a,b): P, E[X], E[X^2].
+        fn interval(a: f64, b: f64) -> (f64, f64, f64) {
+            let pa = if a.is_infinite() && a.is_sign_negative() {
+                0.0
+            } else {
+                cdf(a)
+            };
+            let pb = if b.is_infinite() && b.is_sign_positive() {
+                1.0
+            } else {
+                cdf(b)
+            };
+            let p = pb - pa;
+            let pha = if a.is_infinite() { 0.0 } else { phi(a) };
+            let phb = if b.is_infinite() { 0.0 } else { phi(b) };
+            let ex = pha - phb;
+            let ex2 = (if a.is_infinite() { 0.0 } else { a * pha })
+                - (if b.is_infinite() { 0.0 } else { b * phb })
+                + p;
+            (p, ex, ex2)
+        }
+
+        let mut levels: Vec<f64> = cb.iter().map(|&x| x as f64).collect();
+        levels.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let mut bounds = vec![f64::NEG_INFINITY];
+        for w in levels.windows(2) {
+            bounds.push(0.5 * (w[0] + w[1]));
+        }
+        bounds.push(f64::INFINITY);
+
+        let mut mse = 0.0f64;
+        for (i, &c) in levels.iter().enumerate() {
+            let (p, ex, ex2) = interval(bounds[i], bounds[i + 1]);
+            mse += ex2 - 2.0 * c * ex + c * c * p;
+        }
+        mse
+    }
+
+    /// Map a GL level onto signed int8 by scaling so `max|GL_CB4| → 127`, then
+    /// rounding to nearest. Dequant is `i8 as f32 / GL_I8_SCALE`. Recorded scale:
+    /// `127 / 2.7326 ≈ 46.4759`. This is the PRIMARY packed carrier for qt=40
+    /// prefill (see `gl_cb4_is_not_affine_so_iu4_cannot_apply`); E4M3 is fallback.
+    #[cfg(test)]
+    const GL_I8_SCALE: f32 = 127.0 / 2.7326;
+
+    #[cfg(test)]
+    fn gl_i8_encode(x: f32) -> i8 {
+        let y = (x * GL_I8_SCALE).round();
+        y.clamp(-127.0, 127.0) as i8
+    }
+
+    #[cfg(test)]
+    fn gl_i8_decode(q: i8) -> f32 {
+        (q as f32) / GL_I8_SCALE
+    }
+
+    /// Precision ladder for carrying `GL_CB4` through a packed low-precision MMA.
+    ///
+    /// 1. **`iu4` cannot apply.** An integer MMA over stored *indices* computes
+    ///    `sum(q_i * x_i)`, linear in the code `q`. Uniform affine `w(q)=a+b*q`
+    ///    decomposes as `a*sum(x_i)+b*sum(q_i*x_i)` and is therefore iu4-compatible.
+    ///    But 16 levels on a 4-bit grid **is** the uniform grid: a non-uniform
+    ///    Lloyd–Max codebook has no constants `a,b` with `GL_CB4[q]=a+b*q`, at any
+    ///    scaling. Separately, the verified gfx1201 builtins
+    ///    `__builtin_amdgcn_wmma_i32_16x16x16_iu4_w32_gfx12` → `v_wmma_i32_16x16x16_iu4`
+    ///    and
+    ///    `__builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12` → `v_wmma_i32_16x16x32_iu4`
+    ///    take **both** operands as packed nibbles, so iu4 also implies W4A4.
+    ///    iu4 belongs to uniform-affine (HFQ4G256 / MQ4G256) research only.
+    ///
+    /// 2. **`iu8` is the primary carrier.** Feed the LEVEL (not the index) as an
+    ///    int8 operand: the MMA never needs to be linear in the wire index, and
+    ///    GL's 16 levels span only a ~21× dynamic range so they fit int8 near-
+    ///    exactly (max→127 scale, worst level error ~1.555%, MSE uplift ~0.14%).
+    ///    This is exactly what ROCmFPX does with its integer-by-construction
+    ///    codebook. hipfire already has `iu8` WMMA in 16 kernel files
+    ///    (`__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32[_gfx12]`), versus zero fp8
+    ///    WMMA kernels — so int8 reuses infrastructure fp8 would have to build.
+    ///
+    /// 3. **E4M3 is the fallback.** It also carries arbitrary levels (all 16
+    ///    distinct) but spends 4 exponent bits on range we do not need and keeps
+    ///    only 3 mantissa bits, so worst level error is 4.674% and MSE uplift is
+    ///    ~3.35% — roughly 25× less faithful than int8. Keep the host/device
+    ///    `cvt_pk_fp8_f32` agreement check so a later fp8 path is not built on
+    ///    sand; do not prefer it over iu8 for qt=40.
+    ///
+    /// Structural reason: for a bounded-range codebook the requirement is
+    /// PRECISION, not RANGE. Integer beats floating point here.
+    #[test]
+    fn gl_cb4_is_not_affine_so_iu4_cannot_apply() {
+        let cb = rdna_compute::GL_CB4;
+        let mut min_gap = f32::INFINITY;
+        let mut max_gap = f32::NEG_INFINITY;
+        for w in cb.windows(2) {
+            let gap = w[1] - w[0];
+            min_gap = min_gap.min(gap);
+            max_gap = max_gap.max(gap);
+        }
+        // Adjacent gaps span ~0.257..0.664 — far beyond float noise. A 1e-3
+        // tolerance is tight enough to catch any accidental affine table and
+        // loose enough that f32 rounding of the published levels cannot flake.
+        assert!(
+            (max_gap - min_gap) > 1e-3,
+            "GL_CB4 adjacent gaps must be non-constant for iu4 exclusion \
+             (min_gap={min_gap}, max_gap={max_gap}, span={})",
+            max_gap - min_gap
+        );
+    }
+
+    /// Canonical int8 + E4M3 encodings of `rdna_compute::GL_CB4`.
+    ///
+    /// int8 (max→127) is the primary packed carrier; E4M3 is retained as a
+    /// checked fallback. Every later prefill slice must derive bytes from
+    /// `GL_CB4` via these encoders — never from a hardcoded copy (same drift
+    /// hazard `gl_codebooks_match_runtime` already guards).
+    #[test]
+    fn gl_cb4_e4m3_encoding_is_exact_and_distinct() {
+        let cb = rdna_compute::GL_CB4;
+        // ---- int8 primary (max |GL| → 127) ----
+        // Positives: {6, 18, 31, 44, 58, 75, 96, 127}; scale 127/2.7326.
+        assert!(
+            (GL_I8_SCALE - 46.4759).abs() < 1e-3,
+            "GL_I8_SCALE={GL_I8_SCALE}, expected 127/2.7326 ≈ 46.4759"
+        );
+        let expect_i8_pos: [i8; 8] = [6, 18, 31, 44, 58, 75, 96, 127];
+        let mut i8_codes = [0i8; 16];
+        let mut worst_i8_rel = 0.0f64;
+        for i in 0..16 {
+            let q = gl_i8_encode(cb[i]);
+            i8_codes[i] = q;
+            if i >= 8 {
+                assert_eq!(
+                    q, expect_i8_pos[i - 8],
+                    "GL_CB4[{i}]={} → i8 {q}, expected {}",
+                    cb[i],
+                    expect_i8_pos[i - 8]
+                );
+            } else {
+                assert_eq!(
+                    q, -expect_i8_pos[7 - i],
+                    "GL_CB4[{i}]={} → i8 {q}, expected {}",
+                    cb[i],
+                    -expect_i8_pos[7 - i]
+                );
+            }
+            let recon = gl_i8_decode(q) as f64;
+            let rel = (recon - cb[i] as f64).abs() / (cb[i] as f64).abs();
+            worst_i8_rel = worst_i8_rel.max(rel);
+        }
+        for i in 0..16 {
+            for j in (i + 1)..16 {
+                assert!(
+                    i8_codes[i] != i8_codes[j],
+                    "int8(GL_CB4) collided: idx {i} and {j} both {}",
+                    i8_codes[i]
+                );
+            }
+        }
+        assert!(
+            (worst_i8_rel - 0.01555).abs() < 5e-4,
+            "int8 worst rel error {worst_i8_rel:.6}, expected ~1.555%"
+        );
+
+        // ---- E4M3 fallback ----
+        // Positives in descending-magnitude table order from the FP8 design brief.
+        let expect_pos: [u8; 8] = [0x43, 0x40, 0x3d, 0x3a, 0x37, 0x33, 0x2c, 0x20];
+        let pos = &cb[8..];
+        let mut encoded = [0u8; 16];
+        for i in 0..8 {
+            let p = e4m3_rne(pos[i]);
+            let n = e4m3_rne(cb[i]);
+            encoded[8 + i] = p;
+            encoded[i] = n;
+            // pos ascending ↔ expect_pos descending. Negatives: cb[i] = -pos[7-i]
+            // so the signed byte is expect_pos[i] | 0x80 (same magnitude order).
+            let expect_p = expect_pos[7 - i];
+            let expect_n = expect_pos[i] | 0x80;
+            assert_eq!(
+                p, expect_p,
+                "GL_CB4[{}]={} encoded 0x{p:02x}, expected 0x{expect_p:02x}",
+                8 + i,
+                pos[i]
+            );
+            assert_eq!(
+                n, expect_n,
+                "negative GL_CB4[{i}]={} encoded 0x{n:02x}, expected 0x{expect_n:02x}",
+                cb[i]
+            );
+        }
+
+        // All 16 decoded E4 values must remain distinct — the property that makes
+        // FP8 viable as a carrier for the GL lookup at all.
+        let decoded: Vec<f32> = encoded.iter().copied().map(e4m3_decode).collect();
+        for i in 0..16 {
+            for j in (i + 1)..16 {
+                assert!(
+                    decoded[i] != decoded[j],
+                    "E4M3(GL_CB4) collided: idx {i} and {j} both decode to {}",
+                    decoded[i]
+                );
+            }
+        }
+
+        // Worst-case relative level error is at |0.6568| → 0.6875 (4.674%).
+        // Minimum adjacent relative gap on the original positive GL levels is
+        // 27.9%. The ~6× margin is the actual safety argument that rounding
+        // cannot collapse neighbouring codes.
+        let mut worst_rel = 0.0f64;
+        let mut worst_at = 0.0f32;
+        for &v in cb.iter() {
+            let d = e4m3_decode(e4m3_rne(v)) as f64;
+            let rel = (d - v as f64).abs() / (v as f64).abs();
+            if rel > worst_rel {
+                worst_rel = rel;
+                worst_at = v;
+            }
+        }
+        assert!(
+            (worst_rel - 0.04674).abs() < 5e-4,
+            "worst-case rel error {worst_rel:.6} at {worst_at}, expected ~4.674%"
+        );
+        assert!(
+            (worst_at.abs() - 0.6568).abs() < 1e-4,
+            "worst-case level should be ±0.6568, got {worst_at}"
+        );
+
+        let mut min_adj_rel = f64::INFINITY;
+        for w in pos.windows(2) {
+            let rel = (w[1] as f64 / w[0] as f64) - 1.0;
+            min_adj_rel = min_adj_rel.min(rel);
+        }
+        assert!(
+            (min_adj_rel - 0.279).abs() < 5e-3,
+            "min adjacent relative gap {min_adj_rel:.6}, expected ~27.9%"
+        );
+        let margin = min_adj_rel / worst_rel;
+        assert!(
+            margin > 5.5,
+            "safety margin min_adj_gap/worst_err = {margin:.3} (want ≳6×); \
+             gap={min_adj_rel:.4} err={worst_rel:.4}"
+        );
+
+        // Codec MSE on a unit Gaussian (exact mid-point Voronoi integral).
+        // Ladder vs uniform affine control 0.011867:
+        //   exact GL_CB4                 0.009501   +19.94%
+        //   GL on int8 (max→127)         0.009514   +19.82%   worst level 1.555%
+        //   GL on int8 (best s≈38.15)    0.009506   +19.89%   worst level 2.073%
+        //   GL through E4M3              0.009819   +17.26%   worst level 4.674%
+        //   uniform affine control       0.011867    0.00%
+        // int8 loses 0.055–0.14% of MSE where E4M3 loses ~3.35% — primary vs fallback.
+        // Canonical production scale remains max→127 (GL_I8_SCALE); best-s is
+        // recorded so a later optimizer can pick it without re-deriving.
+        let i8_cb: Vec<f32> = i8_codes.iter().copied().map(gl_i8_decode).collect();
+        const GL_I8_BEST_S: f32 = 38.15;
+        let i8_best_cb: Vec<f32> = cb
+            .iter()
+            .map(|&v| {
+                let q = (v * GL_I8_BEST_S).round().clamp(-127.0, 127.0) as i8;
+                (q as f32) / GL_I8_BEST_S
+            })
+            .collect();
+        let e4_cb: Vec<f32> = cb
+            .iter()
+            .map(|&v| e4m3_decode(e4m3_rne(v)))
+            .collect();
+        let mse_exact = gaussian_codebook_mse(&cb);
+        let mse_i8 = gaussian_codebook_mse(&i8_cb);
+        let mse_i8_best = gaussian_codebook_mse(&i8_best_cb);
+        let mse_e4 = gaussian_codebook_mse(&e4_cb);
+        let mse_uni = 0.011867f64;
+
+        assert!(
+            (mse_exact - 0.009501).abs() < 1e-6,
+            "exact GL_CB4 Gaussian MSE {mse_exact:.6}, expected 0.009501"
+        );
+        assert!(
+            (mse_i8 - 0.009514).abs() < 2e-6,
+            "int8 GL_CB4 Gaussian MSE {mse_i8:.6}, expected 0.009514"
+        );
+        assert!(
+            (mse_i8_best - 0.009506).abs() < 2e-6,
+            "int8-best GL_CB4 Gaussian MSE {mse_i8_best:.6}, expected 0.009506"
+        );
+        assert!(
+            (mse_e4 - 0.009819).abs() < 1e-6,
+            "E4M3 GL_CB4 Gaussian MSE {mse_e4:.6}, expected 0.009819"
+        );
+
+        let mut worst_i8_best_rel = 0.0f64;
+        for (&v, &r) in cb.iter().zip(i8_best_cb.iter()) {
+            let rel = (r as f64 - v as f64).abs() / (v as f64).abs();
+            worst_i8_best_rel = worst_i8_best_rel.max(rel);
+        }
+        assert!(
+            (worst_i8_best_rel - 0.02073).abs() < 1e-3,
+            "int8-best worst rel {worst_i8_best_rel:.6}, expected ~2.073%"
+        );
+
+        let adv = |m: f64| 1.0 - m / mse_uni;
+        assert!(
+            (adv(mse_exact) - 0.1994).abs() < 5e-3,
+            "exact vs uni advantage {:.4}, expected ~19.94%",
+            adv(mse_exact)
+        );
+        assert!(
+            (adv(mse_i8) - 0.1982).abs() < 5e-3,
+            "int8 vs uni advantage {:.4}, expected ~19.82%",
+            adv(mse_i8)
+        );
+        assert!(
+            (adv(mse_i8_best) - 0.1989).abs() < 5e-3,
+            "int8-best vs uni advantage {:.4}, expected ~19.89%",
+            adv(mse_i8_best)
+        );
+        assert!(
+            (adv(mse_e4) - 0.1726).abs() < 5e-3,
+            "E4M3 vs uni advantage {:.4}, expected ~17.26%",
+            adv(mse_e4)
+        );
+
+        let i8_uplift = mse_i8 / mse_exact - 1.0;
+        let i8_best_uplift = mse_i8_best / mse_exact - 1.0;
+        let e4_uplift = mse_e4 / mse_exact - 1.0;
+        assert!(
+            i8_uplift < 0.002,
+            "int8 MSE uplift {i8_uplift:.5}, expected ≲0.14%"
+        );
+        assert!(
+            i8_best_uplift < 0.001,
+            "int8-best MSE uplift {i8_best_uplift:.5}, expected ≲0.055%"
+        );
+        assert!(
+            (e4_uplift - 0.03347).abs() < 1e-3,
+            "E4M3 MSE uplift {e4_uplift:.5}, expected ~3.347%"
+        );
+        // Machine-check the ordering that makes int8 primary: far more faithful.
+        assert!(
+            e4_uplift > 20.0 * i8_uplift,
+            "E4M3 uplift ({e4_uplift:.5}) should be ≳20× int8 uplift ({i8_uplift:.5})"
+        );
+        assert!(
+            mse_i8_best <= mse_i8 && mse_i8 < mse_e4,
+            "expected mse_i8_best ({mse_i8_best:.6}) ≤ mse_i8 ({mse_i8:.6}) < mse_e4 ({mse_e4:.6})"
+        );
+
+
+        // Also exercise the existing round-trip MSE machinery so a regression
+        // in either codec still fails this oracle (identity FWHT, same LCG).
+        {
+            let mut state = 0x2545F4914F6CDD1Du64;
+            let mut next = || {
+                state ^= state >> 12;
+                state ^= state << 25;
+                state ^= state >> 27;
+                let x = state.wrapping_mul(0x2545F4914F6CDD1D);
+                ((x >> 11) as f64) / ((1u64 << 53) as f64)
+            };
+            let n_blocks = 64usize;
+            let mut w = Vec::with_capacity(n_blocks * 256);
+            while w.len() < n_blocks * 256 {
+                let u1: f64 = next().max(1e-12);
+                let u2: f64 = next();
+                let r = (-2.0 * u1.ln()).sqrt();
+                w.push((r * (std::f64::consts::TAU * u2).cos()) as f32);
+                w.push((r * (std::f64::consts::TAU * u2).sin()) as f32);
+            }
+            w.truncate(n_blocks * 256);
+            let signs = vec![1.0f32; 256];
+            let gl = mq4g256gl_roundtrip_f32(&w, &signs, &signs);
+            let uni = mq4g256_roundtrip_f32(&w, &signs, &signs);
+            let mse = |a: &[f32]| -> f64 {
+                a.iter()
+                    .zip(w.iter())
+                    .map(|(x, y)| {
+                        let d = (*x - *y) as f64;
+                        d * d
+                    })
+                    .sum::<f64>()
+                    / w.len() as f64
+            };
+            let (m_gl, m_uni) = (mse(&gl), mse(&uni));
+            assert!(
+                m_gl < 0.92 * m_uni,
+                "round-trip machinery: GL ({m_gl:.6}) must still beat uniform ({m_uni:.6})"
+            );
+        }
+
+        // Emit the tables so `cargo test -- --nocapture` records the oracle.
+        eprintln!("GL_CB4 int8 oracle (scale={GL_I8_SCALE:.6} = 127/2.7326):");
+        for i in 0..16 {
+            let v = cb[i];
+            let q = i8_codes[i];
+            let d = gl_i8_decode(q);
+            let rel = (d as f64 - v as f64).abs() / (v as f64).abs() * 100.0;
+            eprintln!("  [{i:2}] {v:+.4} -> i8 {q:+4} = {d:+.6}  rel={rel:.3}%");
+        }
+        eprintln!("GL_CB4 E4M3 oracle (host RNE, fallback):");
+        for i in 0..16 {
+            let v = cb[i];
+            let b = encoded[i];
+            let d = decoded[i];
+            let rel = (d as f64 - v as f64).abs() / (v as f64).abs() * 100.0;
+            eprintln!("  [{i:2}] {v:+.4} -> 0x{b:02x} = {d:+.4}  rel={rel:.3}%");
+        }
+        eprintln!(
+            "  MSE ladder vs uni={mse_uni:.6}:\n\
+             \x20   exact     {mse_exact:.6}  adv={:.2}%\n\
+             \x20   int8max   {mse_i8:.6}  adv={:.2}%  worst_rel={:.3}%  uplift={:.3}%\n\
+             \x20   int8best  {mse_i8_best:.6}  adv={:.2}%  worst_rel={:.3}%  uplift={:.3}%  s={GL_I8_BEST_S}\n\
+             \x20   E4M3      {mse_e4:.6}  adv={:.2}%  worst_rel={:.3}%  uplift={:.3}%\n\
+             \x20   E4 margin min_adj_gap={:.1}% / worst={:.3}% = {margin:.2}x",
+            adv(mse_exact) * 100.0,
+            adv(mse_i8) * 100.0,
+            worst_i8_rel * 100.0,
+            i8_uplift * 100.0,
+            adv(mse_i8_best) * 100.0,
+            worst_i8_best_rel * 100.0,
+            i8_best_uplift * 100.0,
+            adv(mse_e4) * 100.0,
+            worst_rel * 100.0,
+            e4_uplift * 100.0,
+            min_adj_rel * 100.0,
+            worst_rel * 100.0,
+        );
+
+    }
+
+
+
     #[test]
     fn e2m1_lookup_matches_ocp_spec() {
         // OCP MX FP4 (E2M1) spec values for the 8 magnitude codes.
