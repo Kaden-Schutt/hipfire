@@ -107,16 +107,6 @@ fn main() {
     eprintln!(
         "bandwidth m={m} k={k}: gl bytes={gl_bytes} gbps={gl_gbps:.2}  lloyd bytes={lloyd_bytes} gbps={lloyd_gbps:.2}  uniform bytes={uniform_bytes} gbps={uni_gbps:.2}"
     );
-    for rows in [2usize, 4, 8] {
-        let med = time_gemv_gl_multirow(&mut gpu, m, k, rows);
-        let gbps = (gl_bytes as f64) / med / 1e9;
-        eprintln!(
-            "timing multirow R={rows} m={m} k={k}: median={:.3} us  gbps={:.2}  bytes={gl_bytes}  (n=30 after 5 warmup, gemv_mq4g256gl_multirow_r{rows})",
-            med * 1e6,
-            gbps
-        );
-    }
-
     // Device-side truth. Median per kernel over every timed launch above, with
     // the byte count the wrapper recorded, so GB/s is not re-derived from a
     // host-side assumption. Host medians above are retained for comparison;
@@ -151,6 +141,31 @@ fn main() {
             );
         }
     }
+    // The r2/r4/r8 entry points share one profiler kernel name, so a single
+    // window would only yield a blended median. Give each R its own window.
+    let mut multirow_device: Vec<(usize, f64)> = Vec::new();
+    // The r2/r4/r8 entry points share one profiler kernel name, so a single
+    // window yields only a blended median. Give each R its own window.
+    eprintln!("\nmultirow per-R (device-side):");
+    for rows in [2usize, 4, 8] {
+        rdna_compute::profile::start();
+        let host = time_gemv_gl_multirow(&mut gpu, m, k, rows);
+        let mut dev: Vec<f64> = rdna_compute::profile::stop()
+            .unwrap_or_default()
+            .iter()
+            .filter(|e| e.kernel.contains("multirow"))
+            .map(|e| e.time_us)
+            .collect();
+        dev.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let dev_med = if dev.is_empty() { f64::NAN } else { dev[dev.len() / 2] };
+        eprintln!(
+            "  R={rows}  host={:>7.3} us  device={:>7.3} us  device_gbps={:>6.1}  bytes={gl_bytes}",
+            host * 1e6,
+            dev_med,
+            (gl_bytes as f64) / (dev_med * 1e-6) / 1e9
+        );
+    }
+
 
     if any_fail {
         eprintln!("\n[FAIL] one or more mq4gl parity checks failed");

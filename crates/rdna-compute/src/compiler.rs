@@ -535,19 +535,32 @@ impl KernelCompiler {
     /// Select the scheduler profile for a kernel. The per-kernel table is the
     /// primary source; `HIPFIRE_SCHED_PROFILE` overrides everything when set.
     ///
-    /// Measured justification for `gemv_mq4g256gl_multirow` -> `MemoryClause`
-    /// (gfx1201, wave32):
-    ///   r4 VGPR 120 -> 109, max consecutive VMEM 10 -> 16, zero spills.
-    /// All ILP profiles are strictly worse; `IterativeIlp` spills 138 VGPRs on
-    /// this kernel and must not be used.
+    /// **The table is deliberately empty.** `gemv_mq4g256gl_multirow` was
+    /// briefly mapped to `MemoryClause` on the strength of static counters
+    /// (r4 VGPR 120 -> 109, max consecutive VMEM 10 -> 16, zero spills, and
+    /// strictly better than every ILP profile). Measured device-side with HIP
+    /// events on gfx1201 that produced **no benefit** — multirow medians over
+    /// three runs were 22.32 / 22.88 / 23.56 us under `memory-clause` against
+    /// 22.32 / 22.56 / 22.56 us under `default`, overlapping at the fast end
+    /// and differing by less than the run-to-run spread.
+    ///
+    /// Better static counters are not a performance result. A non-default
+    /// compile policy with no measured win is carried complexity, so the
+    /// selection was withdrawn and the boring baseline kept. The mechanism
+    /// stays, and is worth keeping: the manifest now reports the real profile
+    /// instead of a hardcoded `Default`, the profile participates in the cache
+    /// hash so changing it cannot silently reuse a stale object, and
+    /// `HIPFIRE_SCHED_PROFILE` makes a sweep cheap.
+    ///
+    /// If you add an entry here, gate it on a device-side measurement, not on
+    /// VGPR or clause counts. Note also that `IterativeIlp` spills 138 VGPRs on
+    /// the GL multirow kernel and must never be selected for it.
     fn scheduler_profile_for(&self, name: &str) -> SchedulerProfile {
         if let Some(profile) = self.sched_profile_override {
             return profile;
         }
-        match name {
-            "gemv_mq4g256gl_multirow" => SchedulerProfile::MemoryClause,
-            _ => SchedulerProfile::Default,
-        }
+        let _ = name;
+        SchedulerProfile::Default
     }
 
     /// Single hashing sequence for all kernel cache keys. Every caller must
