@@ -6186,7 +6186,17 @@ fn run_hfq_requant_pipeline(
     // the importance weighting, though it preserves channel ORDERING for any
     // α > 0, so the failure mode is "less effective", not "wrong".
     if let Some(alpha) = awq_imatrix_alpha {
-        if !metadata_json.contains("\"awq_alpha\"") {
+        // `awq_scales` is only collected for unrotated targets, so on a rotated
+        // one the flag would silently do nothing. Say that rather than letting
+        // a run look imatrix-weighted when it isn't.
+        if awq_aware_target {
+            eprintln!(
+                "hfq requant: --awq-imatrix has NO EFFECT for --format {} — it feeds the \
+                 low-bit packers' column weighting, and this target keeps the AWQ scale \
+                 baked into the weights instead.",
+                format.label()
+            );
+        } else if !metadata_json.contains("\"awq_alpha\"") {
             eprintln!(
                 "hfq requant: --awq-imatrix using ASSUMED alpha={alpha} — the source \
                  records no AWQ alpha. If it was built with a different --awq alpha, \
