@@ -236,3 +236,42 @@ checking before committing: it flips the difficulty estimate.
 
 The 15 that did convert are strictly better and are kept. No behaviour changed; workspace
 builds and 1,997 lib tests pass.
+
+
+## Step 6: generate converted to downcasts — 124 -> 43 code sites
+
+The borrow question raised by the accessor attempt is settled, and the conversion it was
+blocking has largely landed.
+
+`ArchModel` gained an `Any` supertrait and `as_any_mut()` across all 16 impls. Every
+converted site uses:
+
+    m.state.as_mut()
+        .and_then(|s| s.as_arch_model_mut().as_any_mut().downcast_mut::<T>())
+
+which borrows the `state` FIELD. That is the whole difference: the accessor borrowed all of
+`m` and converted 15 of 154; this converted 64 across the same files, including
+`ar.rs:2581`, which binds the bundle alongside `m.prefill_checkpoints` and defeated the
+accessor outright.
+
+### The 43 that remain, and what each means for the swap
+
+| kind | count | disposition |
+|---|---:|---|
+| construction — `Some(ModelState::X(..))` | ~10 | must name the variant; the type change replaces these directly |
+| multi-arm dispatch across 2+ arches in ONE expression | 6 | `map_or` with a default arm, `and_then` returning `Option`. An if-let chain changes control flow. **These are the real design work left.** |
+| remainder | ~27 | mostly `redline.rs` fixtures; same pattern, not yet swept |
+
+The six multi-arm dispatches are the honest residue. They are not volume, they are a
+question: what replaces a match that returns different things per architecture when there is
+no enum to match on? Options are a trait method covering the shared concern (both `ar.rs`
+cases read a KV `compact_offset`, which `ArchModel` could expose), or an explicit downcast
+chain that accepts the control-flow change. The `ar.rs` pair in particular looks like it
+wants `ArchModel::kv_compact_offset()`.
+
+### Verification at this step
+
+- dots-ocr VL output **byte-identical**, 8,286 bytes, against the pre-descent baseline
+- three architectures generating coherent text on hiptrx at `029f2facd`
+- pp=2 VRAM **+0.0 MiB/cycle** over three cycles
+- workspace builds, 1,997 lib tests pass
