@@ -145,6 +145,35 @@ report `dim=0, n_layers=0, vocab=0` to clients until it was found.
 Six are compile-enforced (all of Tier B plus Tier C items 5–7: the
 without its arms does not build); the rest fail closed or silently skip.
 
+## Measured, not counted — 2026-08-16
+
+The number above is derived from reading this checklist. It was also **measured**
+by building a scratch arch (`hipfire-arch-scratch`, a copy of this crate),
+registering it, running every gate, and then reverting. What that exercise found:
+
+**Six out-of-crate edits get a new arch registered, compiling, and past every gate:**
+
+| # | file | why |
+|---|---|---|
+| 1 | `Cargo.toml` | workspace members — cargo will not see the crate otherwise |
+| 2 | `crates/hipfire-loader/Cargo.toml` | plain dep; the six newest arches are non-optional, only the five oldest are feature-gated |
+| 3 | `crates/hipfire-loader/src/lib.rs` | one `REGISTRY` line |
+| 4 | `crates/hipfire-loader/src/carriers.rs` | the `Carrier` impl — it cannot live in the arch crate, `Carrier::load` returns `LoadedModel` |
+| 5 | `scripts/layering.txt` | **new**, added by the 3A.2 layering gate |
+| 6 | `crates/*/map.md` | **new-ish**, the crate-map drift check flags the unlisted crate |
+
+**Two of those six are gates added during Phase 3.** `check-layering.py` fails with
+`layer_unlisted_crates 1` and `check-crate-maps.py --check` reports a missing reverse
+dependency. Both are cheap and both are correct to demand — an unlisted crate is exempt
+from every layering rule, which is exactly the silent gap the gate exists to close — but
+they are honestly part of the tax and the number should say so rather than quietly grow.
+
+**Nine is still the right figure for a LOADING arch.** The scratch carrier returned `Err`
+from `load`, so it never reached `hipfire-generate`, `arch_mapping.rs` or the quantize
+pipeline. Six is the floor to be *registered*; nine is the cost to actually *run*. Both
+are real and they measure different things; quoting one for the other is how a metric
+starts lying.
+
 ## What this crate is not
 
 - Not a real model. `load_toy_bundle` never returns `Ok`. There is no
