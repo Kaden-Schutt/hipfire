@@ -9091,6 +9091,7 @@ fn main() {
     let use_mq1 = format == "mq1" || format == "mq1g1024" || format == "mq1g1024gl" || format == "mq1gl";
     let use_mq2gl = format == "mq2gl" || format == "mq2g256gl";
     let use_mq3gl = format == "mq3gl" || format == "mq3g256gl";
+    let use_mq4gl = format == "mq4gl" || format == "mq4g256gl";
     let use_mq35gl = format == "mq35gl" || format == "mq3.5gl" || format == "mq35g256gl" || format == "mq3p5g256gl" || format == "mq35g256" || format == "mq3p5gl";
     let use_hfq6 = format == "hfq6" || format == "hfq6g256" || format == "hf6";
     // HFP4G32 — RDNA-optimal FP4 (E2M1 + UE8M0 g32 + FP16 row scale). Spec at docs/quant-formats/hfp4.md.
@@ -12109,6 +12110,9 @@ fn main() {
                     } else if use_mq35gl && supports_g256 {
                         let q = quantize_mq35g256gl(&f32_slice, inner_m, inner_k_e, &signs1, &signs2);
                         (q, QuantType::MQ35G256GL, 256u32)
+                    } else if use_mq4gl && supports_g256 {
+                        let q = quantize_mq4g256gl(&f32_slice, inner_m, inner_k_e, &signs1, &signs2);
+                        (q, QuantType::MQ4G256GL, 256u32)
                     } else if supports_g256 {
                         let q = quantize_mq4g256(&f32_slice, &signs1, &signs2);
                         (q, QuantType::MQ4G256, 256u32)
@@ -12809,7 +12813,8 @@ fn main() {
                                 (q, QuantType::Q8F16, 32u32, "Q8_F16")
                             }
                         }
-                    } else if (use_mq4g256
+                    } else if (use_mq4gl
+                        || use_mq4g256
                         || use_mq4_mq6exp
                         || use_mq4_mq2lloydexp
                         || use_mq4_mq2glexp
@@ -12825,6 +12830,26 @@ fn main() {
                     {
                         let q = quantize_q8f16(&f32_data);
                         (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                    } else if use_mq4gl {
+                        let k_dim = if meta.shape.len() == 2 {
+                            meta.shape[1]
+                        } else {
+                            n_elements
+                        };
+                        if k_dim % 256 == 0 {
+                            let m_dim = if meta.shape.len() == 2 {
+                                meta.shape[0]
+                            } else {
+                                1
+                            };
+                            let signs1 = gen_fwht_signs(42, 256);
+                            let signs2 = gen_fwht_signs(1042, 256);
+                            let q = quantize_mq4g256gl(&f32_data, m_dim, k_dim, &signs1, &signs2);
+                            (q, QuantType::MQ4G256GL, 256u32, "MQ4G256GL")
+                        } else {
+                            let q = quantize_q8f16(&f32_data);
+                            (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                        }
                     } else if use_mq4g256
                         || use_mq4_mq6exp
                         || use_mq4_mq2lloydexp
@@ -13465,6 +13490,18 @@ fn main() {
                             let signs2 = gen_fwht_signs(1042, 256);
                             let q = quantize_mq35g256gl(&f32_data, m, k_dim, &signs1, &signs2);
                             (q, QuantType::MQ35G256GL, 256u32, "MQ35G256GL")
+                        } else {
+                            let q = quantize_hfq4g128(&f32_data);
+                            (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                        }
+                    } else if use_mq4gl {
+                        let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
+                        if k_dim % 256 == 0 {
+                            let m = meta.shape[0];
+                            let signs1 = gen_fwht_signs(42, 256);
+                            let signs2 = gen_fwht_signs(1042, 256);
+                            let q = quantize_mq4g256gl(&f32_data, m, k_dim, &signs1, &signs2);
+                            (q, QuantType::MQ4G256GL, 256u32, "MQ4G256GL")
                         } else {
                             let q = quantize_hfq4g128(&f32_data);
                             (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
