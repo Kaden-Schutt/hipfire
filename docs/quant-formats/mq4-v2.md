@@ -95,6 +95,67 @@ identical in rule to qt=1/6/13. See § 8 for why the codebook line (qt=40, qt=43
 
 ---
 
+## 1d · Name and qt allocation
+
+`MQ` already denotes FWHT-rotated (qt=6 `HFQ4G256` is unrotated; qt=13 `MQ4G256` is rotated),
+so no variant needs to restate the rotation.
+
+| `--format` | qt | layout | status |
+|---|---|---|---|
+| `mq4` *(alias)*, `mq4v2` *(canonical)* | **44** | v2 — 136 B, per-128 asym, fp16 scale+zero | **being wired** |
+| `mq4c` | 45 | v1.5 — 132 B, per-256 asym, fp16 scale+zero | specified, § 1b |
+| `mq4_k` | 46 | hierarchical — per-32 @144 B or per-16 @156 B, 6-bit s+z | specified, § 1c |
+| `mq4v1`, `mq4g256`, `magnum` | 13 | unchanged — 136 B, per-256 asym, f32 scale+zero | shipping |
+| — | 43 | MQ4-G256-SEL, **retired** | burned, never reuse |
+
+Three naming decisions, each deliberate:
+
+- **`--format mq4` becomes an alias for qt=44, and qt=13 is NOT redefined.** Artifacts
+  self-describe by qt, so no file is ever ambiguous; redefining qt=13 would make the scored
+  baseline (`WT2 0.043776`) ambiguous by date, which is the same silent-reinterpretation hazard
+  that produced the qt=43 / GLW mess. qt=13 stays reachable as `mq4v1`.
+- **Not `mq4r`.** `.mq4r` is a live file extension in `crates/hipfire-cli/src/main.rs:63` that
+  selects the Redline replay backend, and denotes "MQ4 gate + graded experts"
+  (`qwen35.rs:6011`). `mq4c` (compact) is used instead.
+- **`mq4_k` names its provenance.** Hierarchical sub-scale quantization is GGML's k-quant
+  design; what is ours is the FWHT rotation beneath it and the per-16 granularity. Per
+  [`AGENTS.md`](../../AGENTS.md) and [`PRIOR-ART.md`](../../PRIOR-ART.md) that should be cited
+  in the name rather than absorbed silently.
+
+## 1e · How v1 and v2 coexist in one kernel source
+
+v1 and v2 are compiled from the **same** `.hip` source, twice, with a define injected — the
+mechanism already used for attention kernels (`attention.rs:2657` prepends
+`#define BR {br}\n…` before `ensure_kernel`). Each header site becomes:
+
+```c
+#ifdef HIPFIRE_MQ4_V2_HEADER
+    const unsigned int hA = <HEADER_LOAD>(gp,     ...);   // address UNCHANGED
+    const unsigned int hB = <HEADER_LOAD>(gp + 4, ...);   // address UNCHANGED
+    const unsigned int hs = (<lane> < <HALF>) ? hA : hB;
+    float sc = __half2float(__ushort_as_half((unsigned short)(hs & 0xFFFFu)));
+    float zp = __half2float(__ushort_as_half((unsigned short)(hs >> 16)));
+#else
+    <the two original lines, verbatim>
+#endif
+```
+
+The Rust side registers two modules from one constant:
+
+```rust
+self.ensure_kernel("gemm_…",        SRC, func)?;                                   // v1
+self.ensure_kernel("gemm_…_mq4v2",  &format!("#define HIPFIRE_MQ4_V2_HEADER 1\n{SRC}"), func)?;  // v2
+```
+
+Two properties this buys, both load-bearing:
+
+1. **v1 cannot regress.** With the macro undefined the `#else` branch is the original text, so
+   the v1 module is byte-identical by construction. A `git diff` confirming the `#else` body
+   matches the original is a complete check.
+2. **Bit-identity is testable.** Setting `scale_half0 == scale_half1` and
+   `zero_half0 == zero_half1` makes v2 numerically identical to v1 on the same nibbles, so
+   every port validates against a known-good reference with no quality metric and no judgement.
+
 ## 2 · Byte layout
 
 136 B per 256-weight group. Little-endian throughout.
