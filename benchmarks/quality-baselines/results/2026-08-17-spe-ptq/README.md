@@ -35,10 +35,15 @@ at a fixed ~2 bpw:
 | spe-mq2-uniform | 2.25 | uniform 4-level | yes | 3.9225 | 472.05 |
 | spe-tq2-awqim | 2.125 | uniform 3-level + imatrix | no | 2.2418 | 86.57 |
 | **spe-mq2-lloyd** | **2.25** | **Lloyd-Max non-uniform** | **yes** | **0.6125** | **17.04** |
+
+`spe-mq2-lloyd` also **generates coherently** (clean reasoning trace -> "Paris"),
+unlike either ternary arm — checked because KLD alone is not sufficient (the
+2.24 ternary arm looked respectable and still collapsed to an immediate EOS).
 | bonsai-ternary (PrismML) | 2.125 | uniform 3-level + *their transform* | no | 0.5363 | 16.69 |
 
 **A plain PTQ with a non-uniform per-block codebook lands within noise of
-PrismML's proprietary transform** (0.61 vs 0.54). No transform, no calibration
+PrismML's proprietary transform** (0.61 vs 0.54 — Bonsai's CI is 0.4223-0.6715,
+so at n=8 these are not distinguishable), and it generates. No transform, no calibration
 corpus, no GPU pass — just Lloyd-Max centroids plus the FWHT rotation that
 hipfire's MQ formats already carry.
 
@@ -76,6 +81,13 @@ available by plain PTQ (0.28 at 3.25 bpw), and MQ2-Lloyd is the floor that
 still works (0.61 at 2.25 bpw).** PrismML's transformed ternary sits between
 them at 2.125 bpw — better than our 2.25 bpw Lloyd by 0.08 nats, and worse than
 plain MQ3. It is a real but modest edge, not a different league.
+
+**Practical consequence for SP-E: reproducing PrismML's transform is not
+required to ship a working ~2 bpw 27B.** `--format mq2lloyd` already gets
+there. The remaining honest gap is artifact SIZE, not quality: 8.58 GB vs
+Bonsai's 7.16 GB (+20%), because our requant keeps `embed_tokens` at 4-bit and
+retains the AWQ sidecars, while Bonsai quantizes embeddings too. Closing that
+is a per-tensor precision-policy change, not a codebook problem.
 
 ## Findings
 
