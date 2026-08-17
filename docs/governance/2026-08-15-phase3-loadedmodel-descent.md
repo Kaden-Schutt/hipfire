@@ -275,3 +275,42 @@ wants `ArchModel::kv_compact_offset()`.
 - three architectures generating coherent text on hiptrx at `029f2facd`
 - pp=2 VRAM **+0.0 MiB/cycle** over three cycles
 - workspace builds, 1,997 lib tests pass
+
+
+## Step 7 and the final tally: generate 124 -> 36, and the 36 are characterised
+
+Two more gaps closed. `ArchModel` gained `as_any()` for shared reads — the mutable-only
+hatch forced read-only sites to take `as_mut()` purely to downcast, and was simply
+impossible where a caller holds `&LoadedModel`. And variant PREDICATES (`matches!`, "is this
+architecture X" with no binding) convert via the `arch_key()` the trait already had, no
+downcast needed.
+
+### What did NOT convert is the useful part
+
+**`arch_key` is not injective.** `Deepseek4Bundle` and `Deepseek4HeterogeneousBundle` both
+return `"deepseek4"`, so an `arch_key` predicate would WIDEN
+`matches!(.., Some(ModelState::Deepseek4(_)))` from the single-GPU variant to both. All six
+deepseek4 predicates were correctly left alone.
+
+That generalises: `arch_key` exists to match `reset_core`'s inventory, not to identify a
+variant. Any future code reaching for it as an identity test must check that first.
+
+### The 36 remaining, by kind
+
+| kind | count | what the storage swap does with it |
+|---|---:|---|
+| construction — `m.state = Some(ModelState::X(..))` | 10 | becomes `Some(Box::new(bundle))`; mechanical, and the type change IS this edit |
+| `Deepseek4` predicates (`matches!`) | 5 | need a variant-identity mechanism `arch_key` cannot give — a `TypeId` check via `as_any().is::<T>()` would work |
+| multi-arm dispatch, 2+ arches in one expression | 6 | the genuine design question: 4 in `redline.rs` fan out Qwen35/Deepseek4/Lfm2Moe; the 2 in `ar.rs` both read a KV `compact_offset` |
+| remaining single-variant extractions | ~15 | same proven downcast; unswept only |
+
+**On the `ar.rs` pair specifically**: `kv_cache_mut()` looks like the answer and is not.
+Five bundles return `Some` from it — cohere2moe, lfm2moe, llama, minimax, qwen35 — while the
+dispatches handle only llama and qwen35 and default the rest. Substituting would silently
+widen the guard to three more architectures. Whether that exclusion is deliberate or a latent
+bug is a maintainer question, not something a refactor should decide.
+
+### Verification at this step
+dots-ocr VL output **byte-identical**, 8,286 bytes. Workspace builds, 1,997 lib tests. The
+`--all-targets` gate caught the trait's own test impl missing `as_any`, which a plain
+`cargo build` did not — keep it in the loop for trait changes.
