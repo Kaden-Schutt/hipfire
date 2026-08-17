@@ -6138,7 +6138,13 @@ fn run_hfq_requant_pipeline(
     let awq_aware_target = match format {
         // FWHT-rotated targets: the GEMV rotate pre-pass carries the AWQ hook,
         // so the scale stays baked into the weights and the sidecar rides along.
-        GgufFormat::Mq2 | GgufFormat::Mq3 | GgufFormat::Mq4 | GgufFormat::Mq6 => true,
+        GgufFormat::Mq2
+        | GgufFormat::Mq3
+        | GgufFormat::Mq4
+        | GgufFormat::Mq6
+        | GgufFormat::Mq2Lloyd
+        | GgufFormat::Mq3Lloyd
+        | GgufFormat::Mq4Lloyd => true,
         // No rotation plan => no AWQ hook anywhere in the forward => fold here.
         GgufFormat::Ternary | GgufFormat::Binary => false,
         // Everything else falls through the per-tensor match below without
@@ -6318,6 +6324,26 @@ fn run_hfq_requant_pipeline(
                     GgufFormat::Mq2 => (
                         quantize_mq2g256(&f32_data, &signs1, &signs2),
                         QuantType::MQ2G256,
+                        256u32,
+                    ),
+                    // Lloyd-Max (non-uniform per-block codebook) targets. The
+                    // uniform sub-4-bit codebooks are a known-collapse regime on
+                    // this family — `--format mq2` is reserved in-tree with the
+                    // verdict "collapse on every model" — so at 2-3 bits these
+                    // are the targets worth reaching for.
+                    GgufFormat::Mq2Lloyd => (
+                        quantize_mq2g256_lloyd(&f32_data, &signs1, &signs2),
+                        QuantType::MQ2G256Lloyd,
+                        256u32,
+                    ),
+                    GgufFormat::Mq3Lloyd => (
+                        quantize_mq3g256_lloyd(&f32_data, &signs1, &signs2),
+                        QuantType::MQ3G256Lloyd,
+                        256u32,
+                    ),
+                    GgufFormat::Mq4Lloyd => (
+                        quantize_mq4g256_lloyd(&f32_data, &signs1, &signs2),
+                        QuantType::MQ4G256Lloyd,
                         256u32,
                     ),
                     other => {
@@ -6605,6 +6631,63 @@ mod hfq_requant_pipeline_tests {
 
         let _ = std::fs::remove_file(&inp);
         let _ = std::fs::remove_file(&outp);
+    }
+
+    /// The Lloyd-Max targets must actually requantize, not silently fall
+    /// through to "keep MQ4G256".
+    ///
+    /// They matter because the uniform low-bit codebooks are a known-collapse
+    /// regime on this model family — `--format mq2` is reserved in-tree with
+    /// the verdict "collapse on every model ... multilingual mojibake", which
+    /// our uniform ternary reproduced at 27B. Non-uniform (Lloyd) codebooks are
+    /// the in-tree remedy, so the requant path has to be able to emit them.
+    #[test]
+    fn requant_routes_lloyd_targets_instead_of_keeping_mq4() {
+        let signs1 = gen_fwht_signs(42, 256);
+        let signs2 = gen_fwht_signs(1042, 256);
+        let w: Vec<f32> = (0..512).map(|i| ((i % 71) as f32 - 35.0) * 0.02).collect();
+        let mq4 = quantize_mq4g256(&w, &signs1, &signs2);
+
+        for (fmt, want) in [
+            (GgufFormat::Mq2Lloyd, QuantType::MQ2G256Lloyd),
+            (GgufFormat::Mq3Lloyd, QuantType::MQ3G256Lloyd),
+            (GgufFormat::Mq4Lloyd, QuantType::MQ4G256Lloyd),
+        ] {
+            let in_tensors = vec![HfqTensor {
+                name: "model.layers.0.mlp.gate_proj.weight".to_string(),
+                quant_type: QuantType::MQ4G256,
+                shape: vec![2, 256],
+                group_size: 256,
+                data: mq4.clone(),
+                spilled_len: 0,
+            }];
+            let meta = r#"{"architecture":"qwen3.6","num_hidden_layers":1}"#;
+            let dir = std::env::temp_dir();
+            let inp = dir.join(format!(
+                "hfq_lloyd_in_{}_{:?}.hfq",
+                std::process::id(),
+                want
+            ));
+            let outp = dir.join(format!(
+                "hfq_lloyd_out_{}_{:?}.hfq",
+                std::process::id(),
+                want
+            ));
+
+            write_hfq(&inp, 7, meta, &in_tensors, None).unwrap();
+            run_hfq_requant_pipeline(&inp, &outp, fmt, None, 0.0);
+            let (_a, _m, tensors) = read_hfq_back(&outp);
+
+            assert_eq!(tensors[0].1, want as u8, "{want:?} emitted");
+            assert_eq!(tensors[0].3, 256, "{want:?} group size");
+            assert_ne!(
+                tensors[0].4, mq4,
+                "{want:?} must be requantized, not the source MQ4 bytes"
+            );
+
+            let _ = std::fs::remove_file(&inp);
+            let _ = std::fs::remove_file(&outp);
+        }
     }
 
     /// Tensor order and contents must not depend on how the requant loop is
