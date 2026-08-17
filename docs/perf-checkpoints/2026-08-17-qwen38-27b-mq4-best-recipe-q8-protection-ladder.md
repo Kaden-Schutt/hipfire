@@ -222,3 +222,91 @@ transfer to spec-decode `tau`, where a tight spread remains a red flag.
 
 Open gaps 2–4 from the original record (imatrix GGUF unhashed; prose-only
 scoring for the ladder; `ssm_out`/`ssm_in` naming) remain open.
+
+---
+
+## Amendment 2 — the full 9-arm matrix, decode measured for every arm
+
+The first decode amendment covered only 3 of the ladder's arms. This is all of
+them. hiptrx `gfx1201`, `hipfire bench --runs 5`, `max_tokens` 128, batch 1,
+bench binary md5 prefix `8cca7887e33c`; sizes asserted before benching. KLD/PPL
+are per-arm from each arm's own `sc_<tag>.log`, not inferred from co-occurrence.
+
+| arm | Q8 scope / imatrix | size GB | KLD | PPL | decode tok/s | prefill | ttft ms |
+|---|---|---|---|---|---|---|---|
+| `a05` | none, barto a05 | 14.987 | 0.059824 | 6.5483 | **36.00** | 413.4 | 58.0 |
+| `a55` | none, barto a55 | 14.987 | 0.052140 | 6.4665 | **35.90** | 410.5 | 58.5 |
+| `q8head` | head, **no imatrix** | 15.656 | 0.058256 | 6.5103 | **35.50** | 405.5 | 59.2 |
+| `ctl` | head, barto a55 | 15.663 | 0.043776 | 6.4088 | **34.60** | 401.3 | 59.8 |
+| `native_v6` | head+embed, **native HFQM** | 15.663 | 0.086790 | 6.6727 | **34.70** | 400.3 | 60.0 |
+| `ssm_only` | ssm only | 15.789 | 0.045249 | 6.4368 | **34.40** | 399.9 | 60.0 |
+| `ctl2` | head+`ssm_out` | 16.464 | 0.036746 | 6.3773 | **33.20** | 396.3 | 60.6 |
+| `attnfull` | head+`ssm_out`+`attn_full` | 17.355 | 0.033862 | **6.3285** | **31.70** | 383.0 | 62.7 |
+| `ssmin` | head+`ssm_out`+`ssm_in` | 18.614 | **0.030479** | 6.3682 | **29.70** | 355.7 | 67.5 |
+
+Decode is monotonic in size across all nine arms, confirming the path is
+bandwidth-bound. Full span: **36.00 → 29.70 tok/s (−17.5%) buys 1.96× better
+KLD**.
+
+### 1. Same bytes, same speed, half the divergence
+
+| | size | decode | KLD |
+|---|---|---|---|
+| `ctl` (off-the-shelf imatrix) | 15,662,615,552 | 34.60 | **0.043776** |
+| `native_v6` (native HFQM calib) | 15,662,615,552 | 34.70 | 0.086790 |
+
+Byte-identical size, decode within **0.29%**, KLD **1.98× better** for
+off-the-shelf. The imatrix source is a pure quality lever with no size or speed
+consequence whatsoever — which is the cleanest possible form of this result.
+
+### 2. The imatrix is strictly better than buying Q8 head protection
+
+| | size | decode | KLD |
+|---|---|---|---|
+| `a55` (imatrix, no Q8 head) | 14.987 GB | 35.90 | 0.052140 |
+| `q8head` (Q8 head, no imatrix) | 15.656 GB | 35.50 | 0.058256 |
+
+The imatrix delivers **10.5% better KLD while being 0.669 GB smaller and 0.40
+tok/s faster**. Consuming an off-the-shelf imatrix is not a tradeoff at all; it
+dominates a Q8-protection class that costs 0.67 GB.
+
+### 3. `head` protection dominates `ssm only`
+
+`ctl` beats `ssm_only` on KLD (0.043776 vs 0.045249), size (15.663 vs 15.789 GB)
+**and** decode (34.60 vs 34.40). If only one class is affordable, protect the
+head.
+
+### Pareto frontier (minimise KLD, maximise decode)
+
+`a05` → `a55` → `ctl` → `ctl2` → `attnfull` → `ssmin`. Six of nine arms are
+non-dominated; the ladder is a genuine frontier and the choice of rung is a
+product decision.
+
+### Dominated arms
+
+| arm | dominated by |
+|---|---|
+| `ssm_only` | `ctl` |
+| `q8head` | `a55` |
+| **`native_v6`** | **`a55`, `q8head`, `a05`** |
+
+The native-calibration arm is dominated by **three** arms, including `a05` —
+which is simultaneously **smaller (14.987 vs 15.663 GB), faster (36.00 vs 34.70
+tok/s) and better (KLD 0.059824 vs 0.086790)**. Native calibration is beaten on
+all three axes by the *worst* off-the-shelf arm measured. That is the strongest
+form of the earlier "worse than no calibration" finding and it closes the
+question.
+
+### Metric disagreement at the top of the ladder
+
+`ssmin` has the best KLD (0.030479) but `attnfull` has the best PPL (**6.3285**
+vs 6.3682) *and* the best NLL (1.845059 vs 1.851313). **The two metrics disagree
+about which arm is best**, and they disagree between adjacent rungs whose KLD gap
+is only 0.0034.
+
+Both were scored on WikiText-2, i.e. prose. Per
+`2026-08-16-qwen38-27b-v6-chat-template-calibration-2x2.md` and its amendments,
+prose compresses chat-model arm margins ~3× relative and is the metric pair that
+inverted there too. **The `attnfull`-vs-`ssmin` ranking is therefore unresolved**
+and needs the v6 conversation selector before either is called "best". Open gap 3
+of this record is the blocker for the top of its own ladder.
