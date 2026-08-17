@@ -122,8 +122,14 @@ pub fn dtype_rotation_plan(dtype: DType) -> RotationPlan {
         // MQ*-G256 dtype (`quantize_mq{2,3,4}g256gl` calls `cpu_fwht_256` per
         // group), so x MUST be FwhtG256-rotated before their kernels see it.
         MQ4G256 | MQ3G256 | MQ2G256 | MQ5G256 | MQ6G256 | MQ2G256Lloyd | MQ3G256Lloyd
-        | MQ4G256Lloyd | MQ2G256GL | MQ3G256GL | MQ4G256GL | MQ4G256GLW | MQ4G256SEL | MQ35G256GL | MQ1G1024GL | MFP4G32 | MFP4G32Lloyd
-        | MFP4G32P | MFP4G32E8 | MFP4G32E8SOA | MFP3G32E8 | MFP2G32E8 => RotationPlan::FwhtG256,
+        | MQ4G256Lloyd | MQ2G256GL | MQ3G256GL | MQ4G256GL | MQ4G256SEL | MQ35G256GL
+        | MQ1G1024GL | MFP4G32 | MFP4G32Lloyd | MFP4G32P | MFP4G32E8 | MFP4G32E8SOA
+        | MFP3G32E8 | MFP2G32E8 => RotationPlan::FwhtG256,
+        // MQ4G128 and MQ8G256 carry their OWN plans and MUST NOT reach the `_` arm:
+        // falling through to RotationPlan::None leaves x unrotated against weights
+        // that were encoded post-rotation, which is silent garbage, not an error.
+        MQ4G128 => RotationPlan::FwhtG128,
+        MQ8G256 => RotationPlan::Mq8Internal,
         ParoQ4G128 => RotationPlan::Givens,
         _ => RotationPlan::None,
     }
@@ -138,7 +144,7 @@ pub fn dtype_post_rotation_variant(dtype: DType) -> GemvVariant {
         ParoQ4G128 => GemvVariant::Plain,
         MQ4G256 | MQ3G256 | MQ2G256 | MQ5G256 | MQ6G256 | MQ8G256 | MQ2G256Lloyd | MQ3G256Lloyd
         | MQ4G256Lloyd | MFP4G32 | MFP4G32Lloyd | MFP4G32P | MFP4G32E8 | MFP4G32E8SOA | MQ4G128
-        | MQ4G256GL | MQ4G256GLW | MQ4G256SEL | MQ3G256GL | MQ2G256GL | MQ35G256GL | MQ1G1024GL => {
+        | MQ4G256GL | MQ4G256SEL | MQ3G256GL | MQ2G256GL | MQ35G256GL | MQ1G1024GL => {
             GemvVariant::Prerotated
         }
         _ => GemvVariant::Plain,
@@ -227,9 +233,9 @@ pub enum KernelKey {
     // GEMV prerotated
     GemvMq4G256Prerotated,
     GemvMq4G256GlPrerotated,
-    GemvMq4G256GlWPrerotated,
     GemvMq4G256SelPrerotated,
     GemvMq2G256Prerotated,
+    GemvMq3G256Prerotated,
     GemvMq5G256Prerotated,
     GemvMq6G256Prerotated,
     GemvMq8G256Prerotated,
@@ -639,9 +645,9 @@ impl KernelKey {
         match dtype {
             MQ4G256 => Ok(Self::GemvMq4G256Prerotated),
             MQ4G256GL => Ok(Self::GemvMq4G256GlPrerotated),
-            MQ4G256GLW => Ok(Self::GemvMq4G256GlWPrerotated),
             MQ4G256SEL => Ok(Self::GemvMq4G256SelPrerotated),
             MQ2G256 => Ok(Self::GemvMq2G256Prerotated),
+            MQ3G256 => Ok(Self::GemvMq3G256Prerotated),
             MQ5G256 => Ok(Self::GemvMq5G256Prerotated),
             MQ6G256 => Ok(Self::GemvMq6G256Prerotated),
             MQ8G256 => Ok(Self::GemvMq8G256Prerotated),

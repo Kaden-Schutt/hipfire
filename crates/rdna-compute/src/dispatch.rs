@@ -157,16 +157,6 @@ pub const GL_CB4: [f32; 16] = [
     -2.7326, -2.0690, -1.6180, -1.2562, -0.9423, -0.6568, -0.3880, -0.1284,
     0.1284, 0.3880, 0.6568, 0.9423, 1.2562, 1.6180, 2.0690, 2.7326,
 ];
-/// **MUST STAY BIT-IDENTICAL TO `hipfire-quantize::main::GL_CB4W`.**
-///
-/// Range-widened twin of [`GL_CB4`]; same 16-entry symmetric structure
-/// (`cb[15-q] = -cb[q]`) but levels fitted with outermost pinned at 4.0
-/// to eliminate clipping (see `GL_CB4W`/`GL_CB4R` in `hipfire_quantize::main`).
-/// Same SoA 130 B/group layout as qt=40.
-pub const GL_CB4W: [f32; 16] = [
-    -4.0000, -2.4997, -1.8743, -1.4274, -1.0594, -0.7340, -0.4321, -0.1429,
-    0.1429, 0.4321, 0.7340, 1.0594, 1.4274, 1.8743, 2.4997, 4.0000,
-];
 pub const GL_CB4R: [f32; 16] = [
     -4.0000, -2.4997, -1.8743, -1.4274, -1.0594, -0.7340, -0.4321, -0.1429,
     0.1429, 0.4321, 0.7340, 1.0594, 1.4274, 1.8743, 2.4997, 4.0000,
@@ -242,6 +232,10 @@ pub const GL_CB4S64: [[f32; 16]; 64] = [
     [-1.00000000, -0.86423633, -0.73022191, -0.59690408, -0.46396313, -0.33125724, -0.19870022, -0.06622861, 0.06621889, 0.19869857, 0.33125519, 0.46395623, 0.59689913, 0.73022385, 0.86424740, 1.00000000], // 62
     [-1.00000000, -0.86666667, -0.73333333, -0.60000000, -0.46666667, -0.33333333, -0.20000000, -0.06666667, 0.06666667, 0.20000000, 0.33333333, 0.46666667, 0.60000000, 0.73333333, 0.86666667, 1.00000000], // 63
 ];
+///
+/// **MUST STAY BIT-IDENTICAL TO `hipfire-quantize::main::GL_CB1`.**
+// Alignment: 1024*1/32 =32 bits =4 B =1 u32/lane (the ONLY 1-bit group size that aligns).
+// Encode-only: no kernel consumes this yet, same drift guard as GL_CB4.
 ///
 /// 1-bit sibling of [`GL_CB2`]/[`GL_CB3`]/[`GL_CB4`]; for a symmetric 2-level
 /// MSE-optimal quantizer of a unit Gaussian the levels are `±E|x|` =
@@ -563,7 +557,6 @@ pub enum DType {
     /// passed as sixteen scalar kernel args, not stored in the file. Nibble
     /// packing matches MQ4G256 (`lo | hi << 4`).
     MQ4G256GL,
-    MQ4G256GLW,
     /// MQ4-G256-SEL (qt=43): MagnumQuant 4-bit selector family, max-normalised.
     /// 64 profiles × 16 levels (`GL_CB4S64`), 6-bit selector 0..63.
     /// AoS per-group, 4-byte aligned:
@@ -648,7 +641,6 @@ impl DType {
             | DType::MQ2G256GL
             | DType::MQ3G256GL
             | DType::MQ4G256GL
-            | DType::MQ4G256GLW
             | DType::MQ4G256SEL
             | DType::MQ35G256GL
             | DType::MQ1G1024GL
@@ -762,8 +754,7 @@ impl DType {
                 | DType::MQ2G256GL
                 | DType::MQ3G256GL
                 | DType::MQ4G256GL
-                | DType::MQ4G256GLW
-                | DType::MQ4G256SEL
+                    | DType::MQ4G256SEL
                 | DType::MQ35G256GL
                 | DType::MQ1G1024GL
         )

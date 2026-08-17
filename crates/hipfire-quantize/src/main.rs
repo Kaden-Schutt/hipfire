@@ -4538,39 +4538,6 @@ pub(crate) const GL_CB4: [f32; 16] = [
     -2.7326, -2.0690, -1.6180, -1.2562, -0.9423, -0.6568, -0.3880, -0.1284,
     0.1284, 0.3880, 0.6568, 0.9423, 1.2562, 1.6180, 2.0690, 2.7326,
 ];
-/// Activation-weighted GL 4-bit codebook (GL_CB4W) — per-group importance weighted.
-///
-/// Objective: minimise `sum_j a_j * (w_j - w_hat_j)^2` where `a_j` is the per-input-channel
-/// activation importance (`in_sum2[j] = Σ_t act[t,j]^2`) from the imatrix at
-/// `/home/kaden/qcal/imatrix/Qwen3.8-27B-imatrix.gguf` (13,642,688 B, md5 10f0d067a9cf).
-/// The imatrix is per input channel (length K), while the codebook is fitted over
-/// post-FWHT values. The FWHT-256 mixes 256 channels within each group via
-/// `cpu_fwht_256` (signs1· butterfly ·0.0625·signs2). For an orthogonal FWHT with
-/// entries `±1/16`, `Q = H diag(a) H^T` has diagonal `Q_ii = (1/256) Σ_j a_j = mean(a)`
-/// uniform within the group — per-element diagonal weighting therefore carries no signal.
-/// A principled per-element Hadamard-domain weighting would require the dense `Q` (off-diagonal
-/// coupling) which scalar Lloyd cannot represent. The defensible fallback is per-group
-/// scalar weighting: each 256-group's contribution to the Lloyd update is weighted by
-/// its aggregate importance `w_g = mean_{j in group} a_j`. This shifts the fit toward
-/// high-importance groups while keeping the 8-magnitude symmetric structure.
-///
-/// Fitting: weighted Lloyd/k-means on 12,288 post-FWHT groups from qwen3.8-27b
-/// (`layers.0.linear_attn.out_proj`, `layers.20.mlp.down_proj`, `layers.40.mlp.gate_proj`,
-/// 4096 groups each, 3,145,728 samples total), normalized per-group by LS-optimal fp16
-/// scale (2 refinement passes) as in `gl_encode_block`. Per-channel importance proxied
-/// by `Σ_i w[i,j]^2` (weight L2 per input channel) because the imatrix file was not
-/// present on this host at fit time; the proxy preserves the per-group aggregation
-/// structure and the FWHT propagation argument above. Deterministic seed 42, 100
-/// iterations, symmetric constraint `cb[15-q] = -cb[q]` enforced by averaging mirror
-/// pairs each iteration. Result is 4-decimal rounded, symmetric antisymmetric.
-///
-/// Unweighted codec MSE is expected to be WORSE (this codebook is not MSE-optimal for a
-/// unit Gaussian) — that is the clean confirmation the objective changed. Weighted MSE
-/// on the training set improves by ~0.3%.
-pub(crate) const GL_CB4W: [f32; 16] = [
-    -4.0000, -2.4997, -1.8743, -1.4274, -1.0594, -0.7340, -0.4321, -0.1429,
-    0.1429, 0.4321, 0.7340, 1.0594, 1.4274, 1.8743, 2.4997, 4.0000,
-];
 /// Range-widened GL 4-bit codebook (GL_CB4R, R for range) — fixes the clipping
 /// pathology that explains the KLD gap.
 ///
@@ -5340,45 +5307,6 @@ pub(crate) fn quantize_mq4g256gl(
                 cpu_fwht_256(&mut group, signs1, signs2);
                 let mut codes = [0u8; 256];
                 let sbits = gl_encode_block(&group, &GL_CB4, &mut codes);
-                let base = g * 128;
-                for b in 0..128 {
-                    row_idx[base + b] = (codes[2 * b] & 0x0F) | ((codes[2 * b + 1] & 0x0F) << 4);
-                }
-                row_scale[g * 2] = (sbits & 0xFF) as u8;
-                row_scale[g * 2 + 1] = (sbits >> 8) as u8;
-            }
-        });
-    out
-}
-/// MQ4-G256-GLW: activation-weighted twin of `quantize_mq4g256gl`. Same SoA layout
-/// (128 B indices + 2 B scale = 130 B/256 = 4.0625 bpw) but the codebook is
-/// `GL_CB4W` fitted to minimise activation-weighted error (per-group scalar
-/// weighting, see `GL_CB4W` docs). Nibble packing identical to MQ4GL.
-pub(crate) fn quantize_mq4g256glw(
-    f32_data: &[f32],
-    m: usize,
-    k: usize,
-    signs1: &[f32],
-    signs2: &[f32],
-) -> Vec<u8> {
-    assert_eq!(k % 256, 0, "MQ4GLW: K must be a multiple of 256 (got {k})");
-    let gpr = k / 256;
-    let idx_bytes = m * gpr * 128;
-    let mut out = vec![0u8; idx_bytes + m * gpr * 2];
-    let (idx_region, scale_region) = out.split_at_mut(idx_bytes);
-    use rayon::prelude::*;
-    idx_region
-        .par_chunks_mut(gpr * 128)
-        .zip(scale_region.par_chunks_mut(gpr * 2))
-        .enumerate()
-        .for_each(|(row, (row_idx, row_scale))| {
-            for g in 0..gpr {
-                let start = row * k + g * 256;
-                let mut group = [0.0f32; 256];
-                group.copy_from_slice(&f32_data[start..start + 256]);
-                cpu_fwht_256(&mut group, signs1, signs2);
-                let mut codes = [0u8; 256];
-                let sbits = gl_encode_block(&group, &GL_CB4W, &mut codes);
                 let base = g * 128;
                 for b in 0..128 {
                     row_idx[base + b] = (codes[2 * b] & 0x0F) | ((codes[2 * b + 1] & 0x0F) << 4);
@@ -6256,10 +6184,10 @@ pub(crate) enum QuantType {
     MQ1G1024GL = 41, // 1-bit + global codebook: 128 B idx/group + 2 B scale = 1.015625 bpw, group 1024, GL_CB1
     MQ35G256GL = 42, // 3.5-bit 2D VQ: 112 B idx/group (7 bits per pair, 128-entry 2D codebook GL_CB35) +2 B scale →3.5625 bpw. LESS aligned than MQ4GL (3.5 B/lane vs 4 B/lane).
     /// MQ4-G256-SEL (qt=43): 4-bit selector family, max-normalised. 132 B/group = 128 B
-    /// indices + 2 B fp16 scale (max|coeff|) + 1 B selector (0..15) + 1 B pad = 4.125 bpw.
+    /// indices + 2 B fp16 scale (max|coeff|) + 1 B selector (0..63) + 1 B pad = 4.125 bpw.
     /// AoS per-group (132 B, 4-byte aligned). Reconstruction `w = cb[sel][nibble] * scale`
-    /// where `cb` is the 16x16 family (`GL_CB4S_DESIGNED` vs `LINEAR` behind
-    /// `HIPFIRE_GL_SEL_FAMILY=linear`). The pad byte at [131] MUST be 0.
+    /// where `cb` is the 64-profile family selected via `HIPFIRE_MQ4SEL_P` (float,
+    /// default 2.0, the |z|^p selection weight). The pad byte at [131] MUST be 0.
     MQ4G256SEL = 43,
     MFP4G32E8SOA = 35, // mfp4-E8 SoA: same E8 data as qt=34 but in structure-of-arrays layout.
     MFP3G32E8 = 36, // mfp3-E8: MFP4G32E8 frame, 3-bit lattice (center 3), 13 B/blk, 3.25 bpw.
@@ -9666,7 +9594,6 @@ fn main() {
     let use_mq2gl = format == "mq2gl" || format == "mq2g256gl";
     let use_mq3gl = format == "mq3gl" || format == "mq3g256gl";
     let use_mq4gl = format == "mq4gl" || format == "mq4g256gl";
-    let use_mq4glw = format == "mq4glw" || format == "mq4g256glw" || format == "mq4gl-w" || format == "mq4glr" || format == "mq4g256glr" || format == "mq4gl-r";
     let use_mq4sel = format == "mq4sel" || format == "mq4g256sel" || format == "mq4-sel" || format == "mq4g256-sel";
     let use_mq35gl = format == "mq35gl" || format == "mq3.5gl" || format == "mq35g256gl" || format == "mq3p5g256gl" || format == "mq35g256" || format == "mq3p5gl";
     let use_hfq6 = format == "hfq6" || format == "hfq6g256" || format == "hf6";
@@ -12688,7 +12615,7 @@ fn main() {
                     } else if use_mq4gl && supports_g256 {
                         let q = quantize_mq4g256gl(&f32_slice, inner_m, inner_k_e, &signs1, &signs2);
                         (q, QuantType::MQ4G256GL, 256u32)
-                    } else if (use_mq4glw || use_mq4sel) && supports_g256 {
+                    } else if use_mq4sel && supports_g256 {
                         let q = quantize_mq4g256sel(&f32_slice, inner_m, inner_k_e, &signs1, &signs2);
                         (q, QuantType::MQ4G256SEL, 256u32)
                     } else if supports_g256 {
@@ -13392,7 +13319,6 @@ fn main() {
                             }
                         }
                     } else if (use_mq4gl
-                        || use_mq4glw
                         || use_mq4sel
                         || use_mq4g256
                         || use_mq4_mq6exp
@@ -13430,7 +13356,7 @@ fn main() {
                             let q = quantize_q8f16(&f32_data);
                             (q, QuantType::Q8F16, 32u32, "Q8_F16")
                         }
-                    } else if use_mq4glw || use_mq4sel {
+                    } else if use_mq4sel {
                         let k_dim = if meta.shape.len() == 2 {
                             meta.shape[1]
                         } else {
@@ -14106,7 +14032,7 @@ fn main() {
                             let q = quantize_hfq4g128(&f32_data);
                             (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                         }
-                    } else if use_mq4glw || use_mq4sel {
+                    } else if use_mq4sel {
                         let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
                         if k_dim % 256 == 0 {
                             let m = meta.shape[0];
@@ -16719,12 +16645,6 @@ mod tests {
             rdna_compute::GL_CB4,
             "hipfire-quantize GL_CB4 has drifted from rdna_compute::GL_CB4 — \
              qt=40 weights would decode against the wrong 4-bit levels"
-        );
-        assert_eq!(
-            GL_CB4W,
-            rdna_compute::GL_CB4W,
-            "hipfire-quantize GL_CB4W has drifted from rdna_compute::GL_CB4W — \
-             qt=43 weights would decode against the wrong 4-bit weighted levels"
         );
         assert_eq!(
             GL_CB35,

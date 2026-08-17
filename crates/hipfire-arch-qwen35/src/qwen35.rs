@@ -855,6 +855,12 @@ fn dtype_from_quant_type(qt: u8) -> HipResult<DType> {
         39 => Ok(DType::MQ3G256GL),
         40 => Ok(DType::MQ4G256GL),
         43 => Ok(DType::MQ4G256SEL),
+        // qt=6 (HFQ4G256) and qt=37 (MFP2G32E8) are shipped formats and MUST stay
+        // mapped here. Dropping an arm from this match is not a compile error — it
+        // degrades to "graded EP: unsupported quant_type", so the loss stays
+        // invisible until a model of that format fails to load.
+        6 => Ok(DType::HFQ4G256),
+        37 => Ok(DType::MFP2G32E8),
         3 => Ok(DType::Q8_0),
         1 => Ok(DType::F16),
         2 => Ok(DType::F32),

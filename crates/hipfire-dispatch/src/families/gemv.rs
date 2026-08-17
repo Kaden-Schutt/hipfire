@@ -498,8 +498,9 @@ fn launch(gpu: &mut Gpu, key: KernelKey, p: &GemvParams) -> Result<(), DispatchE
         // prerotated
         K::GemvMq4G256Prerotated => hip!(gpu.gemv_mq4g256_prerotated(w.buf, x, y, m, k)),
         K::GemvMq4G256GlPrerotated => hip!(gpu.gemv_mq4g256gl_multirow(w.buf, x, y, m, k)),
-        K::GemvMq4G256GlWPrerotated => hip!(gpu.gemv_mq4g256glw_multirow(w.buf, x, y, m, k)),
         K::GemvMq4G256SelPrerotated => hip!(gpu.gemv_mq4g256sel_multirow(w.buf, x, y, m, k)),
+        K::GemvMq2G256Prerotated => hip!(gpu.gemv_mq2g256_prerotated(w.buf, x, y, m, k)),
+        K::GemvMq3G256Prerotated => hip!(gpu.gemv_mq3g256_prerotated(w.buf, x, y, m, k)),
         K::GemvMq5G256Prerotated => hip!(gpu.gemv_mq5g256_prerotated(w.buf, x, y, m, k)),
         K::GemvMq6G256Prerotated => hip!(gpu.gemv_mq6g256_prerotated(w.buf, x, y, m, k)),
         K::GemvMq4G128 => hip!(gpu.gemv_mq4g128_prerotated(w.buf, x, y, m, k)),
