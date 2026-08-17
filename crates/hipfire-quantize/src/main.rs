@@ -4736,17 +4736,6 @@ mod tq2g128_gptq_tests {
         assert_eq!(codes[1], 0, "large negative must saturate to -d (code 0)");
     }
 
-    fn nonzero_fraction(packed: &[u8], n: usize) -> f64 {
-        let info = gguf_input::TensorInfo {
-            name: "nz".to_string(),
-            shape: vec![n],
-            dtype: gguf_input::GgmlType::Q2_0,
-            offset: 0,
-        };
-        let deq = gguf_input::tensor_to_f32(&info, packed);
-        deq.iter().filter(|v| **v != 0.0).count() as f64 / deq.len() as f64
-    }
-
     /// The ternary level set is `{-d, 0, +d}` with nearest-neighbour coding, so
     /// a weight survives only when `|w| >= d/2`. With `d = max|w|` over a
     /// 128-sample Gaussian block (`amax ~ 2.9 sigma`) the threshold lands at
@@ -4765,7 +4754,7 @@ mod tq2g128_gptq_tests {
         let plain = quantize_tq2g128(&g);
         let gptq = quantize_tq2g128_gptq(&g, &w, 0.0);
 
-        let nz = nonzero_fraction(&gptq, 128);
+        let nz = tq2_pack_stats(&gptq).nonzero_fraction();
         assert!(
             (0.45..=0.80).contains(&nz),
             "swept-scale ternary should keep roughly half the weights alive on \
