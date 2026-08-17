@@ -253,3 +253,70 @@ to produce shippable artifacts. Note that LDLQ was already recorded elsewhere in
 this campaign as "never completed", i.e. it appears never to have been validated
 end-to-end at any point; this run is the first evidence of what it actually
 produces, and the answer is garbage.
+
+---
+
+## Amendment 2 — the likely cause is the COLLECTION HOST, not GPTQ
+
+The previous amendment's leading reading ("GPTQ is broken") is **withdrawn as the
+primary hypothesis**. A simpler explanation covers every datapoint.
+
+Scoring host is confirmed correct — `GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.14)`
+in the score logs, so 8.367924 is a valid gfx1201 measurement of the artifact and
+is not itself a gfx942 artefact.
+
+But the **artifact was produced from Hessians collected on gfx942**, and gfx942 has
+a documented faulty forward path — see
+`2026-08-16-amendment-qwen38-mq4-collapse-is-a-gfx942-execution-bug` and the
+degenerate uncalibrated-MQ4 behaviour on that arch. Calibration statistics are
+gathered *by running forward passes*. If the forward path is wrong, the statistics
+are wrong.
+
+Sort every arm by how much of the gfx942-collected statistic it consumes:
+
+| arm | statistics source | what it consumes | WT2 KLD |
+|---|---|---|---|
+| uncalibrated MQ4 | none | nothing | 0.066668 |
+| off-the-shelf imatrix + AWQ | llama.cpp, **never gfx942** | per-channel scale | **0.043776** |
+| native imatrix + AWQ (v6) | gfx942 forward | diagonal only | 0.086790 |
+| native full Hessian + GPTQ | gfx942 forward | full off-diagonal structure | **8.367924** |
+
+The ordering is monotone in *dependence on gfx942-derived data*, and the only arm
+that beats doing nothing is the only one whose statistics never touched that host.
+AWQ reads just the diagonal and lands mildly worse than nothing; GPTQ reads the
+entire off-diagonal structure and lands catastrophically worse. That is exactly the
+dose-response curve a corrupt collection host would produce, and it requires no
+defect in GPTQ at all.
+
+This also retro-explains the earlier finding that **native calibration is
+Pareto-dominated by three arms including one that is smaller, faster and better**.
+That was recorded as a fact about AWQ. It is more likely a fact about **where the
+calibration was collected**.
+
+### Consequences
+
+1. **Do not conclude GPTQ is broken.** The evidence is equally consistent with GPTQ
+   faithfully propagating corrupt second-order statistics. The `lfm2.5` isolation
+   arms cannot settle this either, since their Hessians came from the same host.
+2. **The 179.5 GB of calibration on `hipfire-models/hipfire-calib-data` is
+   suspect**, not merely lossy. Its README documents the bf16 PSD issue; it should
+   additionally warn that every artifact was collected on gfx942, whose forward path
+   is known-faulty, and that no artifact derived from it has ever beaten
+   uncalibrated on this model.
+3. **The correct next experiment is to re-collect calibration on gfx1201** — the
+   host that scores correctly — and re-run both AWQ and GPTQ against it. Until then
+   native calibration has never been tested on trustworthy input, and neither has
+   GPTQ.
+4. **The PSD projection remains validated as a mechanism** and unaffected by this:
+   it converts hard Cholesky failures into default-damping successes on GPU at
+   scale. What it was fed is the open question.
+
+### On the spend
+
+The campaign bought ~12 h of gfx942 time to collect ~180 GB of second-order
+statistics, and the arm that wins is the one that ignored all of it in favour of a
+13.6 MB off-the-shelf GGUF imatrix. Producer-only discipline correctly kept gfx942
+out of the *scoring* path; what was missed is that a faulty forward path
+contaminates the *collection* path just as surely, and collection is the more
+expensive half. That is the transferable lesson: a host disqualified from measuring
+is thereby disqualified from calibrating, because calibration is measurement.
