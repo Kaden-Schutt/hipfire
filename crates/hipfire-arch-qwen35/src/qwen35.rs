@@ -14820,7 +14820,7 @@ fn forward_batch_chunk_impl(
                 } else {
                     run_fused_qkvza_key(
                         gpu,
-                        hipfire_dispatch::types::KernelKey::FusedQkvzaHfq4G256,
+                        crate::forward_slots::fused_qkvza_key_for(layer.wqkv.gpu_dtype),
                         &layer.wqkv.buf,
                         &layer.wz.buf,
                         &layer.w_beta.buf,
@@ -15301,7 +15301,7 @@ fn forward_batch_chunk_impl(
                 } else {
                     run_residual_gemm_key(
                         gpu,
-                        hipfire_dispatch::types::KernelKey::GemmHfq4G256Residual,
+                        crate::forward_slots::residual_gemm_key_for(layer.wo.gpu_dtype),
                         &layer.wo.buf,
                         layer.wo.gpu_dtype,
                         wo_input,
@@ -15499,7 +15499,7 @@ fn forward_batch_chunk_impl(
                 } else {
                     run_fused_gate_up_key(
                         gpu,
-                        hipfire_dispatch::types::KernelKey::FusedGateUpHfq4G256,
+                        crate::forward_slots::fused_gate_up_key_for(layer.w_gate.gpu_dtype),
                         &layer.w_gate.buf,
                         &layer.w_up.buf,
                         &pbs.x_rot_batch,
@@ -15642,7 +15642,7 @@ fn forward_batch_chunk_impl(
                 } else {
                     run_residual_gemm_key(
                         gpu,
-                        hipfire_dispatch::types::KernelKey::GemmHfq4G256Residual,
+                        crate::forward_slots::residual_gemm_key_for(layer.w_down.gpu_dtype),
                         &layer.w_down.buf,
                         layer.w_down.gpu_dtype,
                         &pbs.ffn_hidden_batch,
@@ -15908,7 +15908,7 @@ fn forward_batch_chunk_impl(
                 } else if qkv_same_dtype {
                     run_fused_qkv_key(
                         gpu,
-                        hipfire_dispatch::types::KernelKey::FusedQkvHfq4G256,
+                        crate::forward_slots::fused_qkv_key_for(layer.wq.gpu_dtype),
                         &layer.wq.buf,
                         &layer.wk.buf,
                         &layer.wv.buf,
@@ -16236,7 +16236,7 @@ fn forward_batch_chunk_impl(
                 } else {
                     run_residual_gemm_key(
                         gpu,
-                        hipfire_dispatch::types::KernelKey::GemmHfq4G256Residual,
+                        crate::forward_slots::residual_gemm_key_for(layer.wo.gpu_dtype),
                         &layer.wo.buf,
                         layer.wo.gpu_dtype,
                         fa_wo_input,
@@ -16431,7 +16431,7 @@ fn forward_batch_chunk_impl(
                 } else {
                     run_fused_gate_up_key(
                         gpu,
-                        hipfire_dispatch::types::KernelKey::FusedGateUpHfq4G256,
+                        crate::forward_slots::fused_gate_up_key_for(layer.w_gate.gpu_dtype),
                         &layer.w_gate.buf,
                         &layer.w_up.buf,
                         &pbs.x_rot_batch,
@@ -16565,7 +16565,7 @@ fn forward_batch_chunk_impl(
                 } else {
                     run_residual_gemm_key(
                         gpu,
-                        hipfire_dispatch::types::KernelKey::GemmHfq4G256Residual,
+                        crate::forward_slots::residual_gemm_key_for(layer.w_down.gpu_dtype),
                         &layer.w_down.buf,
                         layer.w_down.gpu_dtype,
                         &pbs.ffn_hidden_batch,
@@ -16879,7 +16879,7 @@ fn forward_batch_chunk_impl(
                 } else {
                     run_fused_qkvza_key(
                         gpu,
-                        hipfire_dispatch::types::KernelKey::FusedQkvzaHfq4G256,
+                        crate::forward_slots::fused_qkvza_key_for(layer.wqkv.gpu_dtype),
                         &layer.wqkv.buf,
                         &layer.wz.buf,
                         &layer.w_beta.buf,
@@ -17336,7 +17336,7 @@ fn forward_batch_chunk_impl(
                 } else {
                     run_residual_gemm_key(
                         gpu,
-                        hipfire_dispatch::types::KernelKey::GemmHfq4G256Residual,
+                        crate::forward_slots::residual_gemm_key_for(layer.wo.gpu_dtype),
                         &layer.wo.buf,
                         layer.wo.gpu_dtype,
                         dn_wo_input,
@@ -17594,7 +17594,7 @@ fn forward_batch_chunk_impl(
                 } else if qkv_same_dtype {
                     run_fused_qkv_key(
                         gpu,
-                        hipfire_dispatch::types::KernelKey::FusedQkvHfq4G256,
+                        crate::forward_slots::fused_qkv_key_for(layer.wq.gpu_dtype),
                         &layer.wq.buf,
                         &layer.wk.buf,
                         &layer.wv.buf,
@@ -17888,7 +17888,7 @@ fn forward_batch_chunk_impl(
                 } else {
                     run_residual_gemm_key(
                         gpu,
-                        hipfire_dispatch::types::KernelKey::GemmHfq4G256Residual,
+                        crate::forward_slots::residual_gemm_key_for(layer.wo.gpu_dtype),
                         &layer.wo.buf,
                         layer.wo.gpu_dtype,
                         fa_wo_input,

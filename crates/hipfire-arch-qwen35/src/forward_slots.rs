@@ -279,28 +279,28 @@ enum AttnProjDtype {
 // against a 0.043776 baseline, bit-identical across both runs) before it was
 // found. Select on the container; never hardcode.
 
-fn residual_gemm_key_for(dt: DType) -> KernelKey {
+pub(crate) fn residual_gemm_key_for(dt: DType) -> KernelKey {
     match dt {
         DType::MQ4G256V2 => KernelKey::GemmMq4G256V2Residual,
         _ => KernelKey::GemmHfq4G256Residual,
     }
 }
 
-fn fused_qkvza_key_for(dt: DType) -> KernelKey {
+pub(crate) fn fused_qkvza_key_for(dt: DType) -> KernelKey {
     match dt {
         DType::MQ4G256V2 => KernelKey::FusedQkvzaMq4G256V2,
         _ => KernelKey::FusedQkvzaHfq4G256,
     }
 }
 
-fn fused_qkv_key_for(dt: DType) -> KernelKey {
+pub(crate) fn fused_qkv_key_for(dt: DType) -> KernelKey {
     match dt {
         DType::MQ4G256V2 => KernelKey::FusedQkvMq4G256V2,
         _ => KernelKey::FusedQkvHfq4G256,
     }
 }
 
-fn fused_gate_up_key_for(dt: DType) -> KernelKey {
+pub(crate) fn fused_gate_up_key_for(dt: DType) -> KernelKey {
     match dt {
         DType::MQ4G256V2 => KernelKey::FusedGateUpMq4G256V2,
         _ => KernelKey::FusedGateUpHfq4G256,
