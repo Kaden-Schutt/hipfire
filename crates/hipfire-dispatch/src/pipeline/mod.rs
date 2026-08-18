@@ -1064,7 +1064,8 @@ pub fn run_moe_decode(
     // experts read zeroed weights (load-time dummy-fill) → contribute 0, so the
     // all-reduced sum of partials equals the full single-GPU combine.
     // The four CODEBOOK down kernels — MQ2/MQ3-Lloyd and MQ2/MQ3-G256-GL —
-    // self-combine via their atomic `_residual_scaled_indexed` GEMV above
+    // plus native HFP4G32 self-combine via their atomic
+    // `_residual_scaled_indexed` GEMV above
     // (weighted accumulate straight into out_target; nothing is written to
     // down_expanded). Running the expanded combine here would double-count the
     // routed contribution (atomic residual + combine of stale down_expanded),
@@ -1087,7 +1088,11 @@ pub fn run_moe_decode(
         || (p.expert_dtype_tags.is_none()
             && matches!(
                 p.dtypes.routed_down,
-                DType::MQ2G256Lloyd | DType::MQ3G256Lloyd | DType::MQ2G256GL | DType::MQ3G256GL
+                DType::MQ2G256Lloyd
+                    | DType::MQ3G256Lloyd
+                    | DType::MQ2G256GL
+                    | DType::MQ3G256GL
+                    | DType::HFP4G32
             ));
     if !ninepath_d4 && !routed_down_self_combines && !p.defer_routed_combine {
         hip!(gpu.moe_down_combine_k8_batched(
