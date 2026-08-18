@@ -3,6 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 #include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
 
 #ifndef HIPFIRE_RESIDUAL_KERNEL
 #define HIPFIRE_RESIDUAL_KERNEL gemv_hfq4g256_residual
@@ -88,11 +89,22 @@ extern "C" __global__ void HIPFIRE_RESIDUAL_KERNEL(
     #define HIPFIRE_RESIDUAL_LOAD_ZP(weight_rsrc, gp, weight_offset) HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc, (gp) + 4, (weight_offset) + 4)
     #endif
 
+#ifdef HIPFIRE_MQ4_V2_HEADER
+    #define LOAD_W(gp, weight_offset, sc, zp, pk) do { \
+        const unsigned int hA = HIPFIRE_RESIDUAL_LOAD_SC(weight_rsrc, gp, weight_offset); \
+        const unsigned int hB = HIPFIRE_RESIDUAL_LOAD_ZP(weight_rsrc, gp, weight_offset); \
+        const unsigned int hs = (tid < 16) ? hA : hB; \
+        (sc) = __half2float(__ushort_as_half((unsigned short)(hs & 0xFFFFu))); \
+        (zp) = __half2float(__ushort_as_half((unsigned short)(hs >> 16))); \
+        (pk) = HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc, (gp) + 8 + boff, (weight_offset) + 8 + boff); \
+    } while (0)
+#else
     #define LOAD_W(gp, weight_offset, sc, zp, pk) do { \
         (sc) = __builtin_bit_cast(float, HIPFIRE_RESIDUAL_LOAD_SC(weight_rsrc, gp, weight_offset)); \
         (zp) = __builtin_bit_cast(float, HIPFIRE_RESIDUAL_LOAD_ZP(weight_rsrc, gp, weight_offset)); \
         (pk) = HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc, (gp) + 8 + boff, (weight_offset) + 8 + boff); \
     } while (0)
+#endif
 
 #if defined(HIPFIRE_GFX1151_RESIDUAL_K4096)
     // Keep the fixed four-quad bound without expanding the body. Full unroll

@@ -79,6 +79,7 @@ impl GemmFamily {
                 }
             }
             DType::HFQ4G128 => KernelKey::GemmHfq4G128,
+            DType::MQ4G256V2 => KernelKey::GemmMq4G256V2,
             _ => {
                 return Err(DispatchError::UnsupportedVariant {
                     family: "gemm", variant: "plain",
@@ -238,6 +239,9 @@ impl GemmFamily {
             K::GemmHfq4G256BatchedLmhead => hip!(gpu.gemm_hfq4g256_batched_lmhead(w.buf, x, y, m, k, batch_size)),
             K::GemmHfq3G256BatchedLmhead => hip!(gpu.gemm_hfq3g256_batched_lmhead(w.buf, x, y, m, k, batch_size)),
             K::GemmHfq6G256BatchedLmhead => hip!(gpu.gemm_hfq6g256_batched_lmhead(w.buf, x, y, m, k, batch_size)),
+            K::GemmMq4G256V2 => hip!(gpu.gemm_hfq4g256(w.buf, x, y, m, k, batch_size)),
+            K::GemmMq4G256V2Residual => hip!(gpu.gemm_hfq4g256_residual(w.buf, x, y, m, k, batch_size)),
+            K::GemmMq4G256V2BatchedLmhead => hip!(gpu.gemm_hfq4g256_batched_lmhead(w.buf, x, y, m, k, batch_size)),
             other => Err(DispatchError::MissingImpl { key: other }),
         }
     }

@@ -17,6 +17,27 @@ typedef float    __attribute__((ext_vector_type(8))) float8_t;
     a[4]=sc*(_Float16)(float)(((pk)>>16)&0xFu)+zp; a[5]=sc*(_Float16)(float)(((pk)>>20)&0xFu)+zp; \
     a[6]=sc*(_Float16)(float)(((pk)>>24)&0xFu)+zp; a[7]=sc*(_Float16)(float)(((pk)>>28)&0xFu)+zp
 
+// Nested #ifdef inside GEN_* is invalid after expansion; hoist header decode
+// into helpers so GEN_QKVZA_BT stays a pure token stream.
+#ifdef HIPFIRE_MQ4_V2_HEADER
+#define HFQ4_MQ4_HDR_LOAD(gp) \
+    const unsigned int hA = *(const unsigned int*)(gp); \
+    const unsigned int hB = *(const unsigned int*)(gp + 4); \
+    const _Float16 sc0 = (_Float16)__half2float(__ushort_as_half((unsigned short)(hA & 0xFFFFu))); \
+    const _Float16 zp0 = (_Float16)__half2float(__ushort_as_half((unsigned short)(hA >> 16))); \
+    const _Float16 sc1 = (_Float16)__half2float(__ushort_as_half((unsigned short)(hB & 0xFFFFu))); \
+    const _Float16 zp1 = (_Float16)__half2float(__ushort_as_half((unsigned short)(hB >> 16)))
+// WMMA packs t=kt*2+k_grp; half splits at pack>=16 i.e. kt>=8 (not tid).
+#define HFQ4_MQ4_HDR_SEL \
+    _Float16 sc = (kt < 8) ? sc0 : sc1; \
+    _Float16 zp = (kt < 8) ? zp0 : zp1;
+#else
+#define HFQ4_MQ4_HDR_LOAD(gp) \
+    _Float16 sc = (_Float16)__builtin_bit_cast(float, *(const unsigned int*)(gp)); \
+    _Float16 zp = (_Float16)__builtin_bit_cast(float, *(const unsigned int*)(gp + 4))
+#define HFQ4_MQ4_HDR_SEL
+#endif
+
 #define GEN_QKVZA_BT(BV) \
 extern "C" __launch_bounds__(32, 2) __global__ void gemm_qkvza_hfq4g256_wmma_gfx12_bt##BV( \
     const char* __restrict__ A_qkv, const char* __restrict__ A_z, const char* __restrict__ A_beta, \
@@ -37,14 +58,13 @@ extern "C" __launch_bounds__(32, 2) __global__ void gemm_qkvza_hfq4g256_wmma_gfx
     float8_t acc[BV]; for (int b = 0; b < BV; b++) acc[b] = float8_t{0,0,0,0,0,0,0,0}; \
     for (int g = 0; g < gpr; g++) { \
         const char* gp = rb + g * 136; \
-        _Float16 sc = (_Float16)__builtin_bit_cast(float, *(const unsigned int*)(gp)); \
-        _Float16 zp = (_Float16)__builtin_bit_cast(float, *(const unsigned int*)(gp + 4)); \
+        HFQ4_MQ4_HDR_LOAD(gp); \
         const _Float16* xg[BV]; for (int b = 0; b < BV; b++) xg[b] = X + (long long)sb[b] * K + g * 256; \
         for (int kt = 0; kt < 16; kt += 4) { \
             unsigned int p[4] = { *(const unsigned int*)(gp+8+(kt+0)*8+kg*4), *(const unsigned int*)(gp+8+(kt+1)*8+kg*4), \
                                   *(const unsigned int*)(gp+8+(kt+2)*8+kg*4), *(const unsigned int*)(gp+8+(kt+3)*8+kg*4) }; \
             _Pragma("unroll") \
-            for (int ki = 0; ki < 4; ki++) { half8_t a; HFQ4_DQ8(p[ki], sc, zp); \
+            for (int ki = 0; ki < 4; ki++) { half8_t a; HFQ4_MQ4_HDR_SEL HFQ4_DQ8(p[ki], sc, zp); \
                 _Pragma("unroll") \
                 for (int b = 0; b < BV; b++) { half8_t bb = *(const half8_t*)(xg[b] + (kt+ki)*16 + kg*8); \
                     acc[b] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, bb, acc[b]); } } } \

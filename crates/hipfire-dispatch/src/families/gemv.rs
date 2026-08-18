@@ -497,6 +497,7 @@ fn launch(gpu: &mut Gpu, key: KernelKey, p: &GemvParams) -> Result<(), DispatchE
         K::GemvQ8HFQ => hip!(gpu.gemv_q8hfq(w.buf, x, y, m, k, w.row_stride)),
         // prerotated
         K::GemvMq4G256Prerotated => hip!(gpu.gemv_mq4g256_prerotated(w.buf, x, y, m, k)),
+        K::GemvMq4G256V2Prerotated => hip!(gpu.gemv_hfq4g256(w.buf, x, y, m, k)),
         K::GemvMq4G256GlPrerotated => hip!(gpu.gemv_mq4g256gl_multirow(w.buf, x, y, m, k)),
         K::GemvMq4G256SelPrerotated => hip!(gpu.gemv_mq4g256sel_multirow(w.buf, x, y, m, k)),
         K::GemvMq2G256Prerotated => hip!(gpu.gemv_mq2g256_prerotated(w.buf, x, y, m, k)),
@@ -552,6 +553,7 @@ fn dispatch_residual(gpu: &mut Gpu, params: &GemvParams) -> Result<(), DispatchE
         // MQ-family WithResidual requires caller-supplied pre-rotated x
         // (same contract as Prerotated) — dispatch through HFQ residual kernel.
         MQ4G256 => hip!(gpu.gemv_hfq4g256_residual(w.buf, x, y, m, k)),
+        MQ4G256V2 => hip!(gpu.gemv_hfq4g256_residual(w.buf, x, y, m, k)),
         MQ3G256 => hip!(gpu.gemv_hfq3g256_residual(w.buf, x, y, m, k)),
         MQ5G256 => hip!(gpu.gemv_hfq5g256_residual(w.buf, x, y, m, k)),
         MQ6G256 => hip!(gpu.gemv_hfq6g256_residual(w.buf, x, y, m, k)),
@@ -595,6 +597,7 @@ fn dispatch_swiglu_residual(gpu: &mut Gpu, params: &GemvParams) -> Result<(), Di
         HFQ3G256 => hip!(gpu.gemv_hfq3g256_residual(w.buf, x_in, residual, m, k)),
         HFQ6G256 => hip!(gpu.gemv_hfq6g256_residual(w.buf, x_in, residual, m, k)),
         MQ4G256 => hip!(gpu.gemv_hfq4g256_residual(w.buf, x_in, residual, m, k)),
+        MQ4G256V2 => hip!(gpu.gemv_hfq4g256_residual(w.buf, x_in, residual, m, k)),
         MQ3G256 => hip!(gpu.gemv_hfq3g256_residual(w.buf, x_in, residual, m, k)),
         MQ5G256 => hip!(gpu.gemv_hfq5g256_residual(w.buf, x_in, residual, m, k)),
         MQ6G256 => hip!(gpu.gemv_hfq6g256_residual(w.buf, x_in, residual, m, k)),

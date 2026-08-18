@@ -95,8 +95,17 @@ extern "C" __global__ void gemm_gate_up_hfq4g256_wmma_gfx12(
 
     for (int g = 0; g < groups_per_row; g++) {
         const char* gp = row_base + g * 136;
+        #ifdef HIPFIRE_MQ4_V2_HEADER
+        const unsigned int hA = *(const unsigned int*)(gp);
+        const unsigned int hB = *(const unsigned int*)(gp + 4);
+        const _Float16 sc0 = (_Float16)__half2float(__ushort_as_half((unsigned short)(hA & 0xFFFFu)));
+        const _Float16 zp0 = (_Float16)__half2float(__ushort_as_half((unsigned short)(hA >> 16)));
+        const _Float16 sc1 = (_Float16)__half2float(__ushort_as_half((unsigned short)(hB & 0xFFFFu)));
+        const _Float16 zp1 = (_Float16)__half2float(__ushort_as_half((unsigned short)(hB >> 16)));
+        #else
         _Float16 sc_h = (_Float16)__builtin_bit_cast(float, *(const unsigned int*)(gp));
         _Float16 zp_h = (_Float16)__builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
+        #endif
 
         const _Float16* x_base = X + (long long)safe_batch * K + g * 256;
 
@@ -114,6 +123,11 @@ extern "C" __global__ void gemm_gate_up_hfq4g256_wmma_gfx12(
             a_reg[7] = sc_h * (_Float16)(float)(((pk) >> 28) & 0xFu) + zp_h
 
         for (int kt = 0; kt < 16; kt += 4) {
+            #ifdef HIPFIRE_MQ4_V2_HEADER
+            // pack t = kt*2+k_grp; half splits at pack 16 ⇒ kt>=8 (both k_grp).
+            const _Float16 sc_h = (kt < 8) ? sc0 : sc1;
+            const _Float16 zp_h = (kt < 8) ? zp0 : zp1;
+            #endif
             const int k_off_a = (kt + 0) * 16;
             const int k_off_b = (kt + 1) * 16;
             const int k_off_c = (kt + 2) * 16;
@@ -245,8 +259,17 @@ extern "C" __global__ void gemm_gate_up_hfq4g256_wmma_gfx12_ldsstage(
         const int group_in_slab = wave >> 2;
         const int quarter_in_group = wave & 3;
         const unsigned char* gp = staged_weights[m_lane] + group_in_slab * 136;
+        #ifdef HIPFIRE_MQ4_V2_HEADER
+        // quarter 0..1 → packs 0..15 (half0); quarter 2..3 → packs 16..31 (half1).
+        const unsigned int hA = *(const unsigned int*)(gp);
+        const unsigned int hB = *(const unsigned int*)(gp + 4);
+        const unsigned int hs = (quarter_in_group < 2) ? hA : hB;
+        _Float16 sc_h = (_Float16)__half2float(__ushort_as_half((unsigned short)(hs & 0xFFFFu)));
+        _Float16 zp_h = (_Float16)__half2float(__ushort_as_half((unsigned short)(hs >> 16)));
+        #else
         _Float16 sc_h = (_Float16)__builtin_bit_cast(float, *(const unsigned int*)(gp));
         _Float16 zp_h = (_Float16)__builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
+        #endif
         const _Float16* xg = x_base + slab * 512 + wave * 64;
         const int packed_base = quarter_in_group * 32;
 

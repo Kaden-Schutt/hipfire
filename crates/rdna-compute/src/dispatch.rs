@@ -99,6 +99,16 @@ pub const GL_MQ35_GROUP_IDX_BYTES: usize = 112;
 /// Group size for MQ3.5-GL: 256 weights per group (128 pairs). See alignment note above.
 pub const GL_MQ35_GROUP_SIZE: usize = 256;
 
+/// Per-group bytes for MQ4-G256 v2 (qt=44): 136 B/group, byte-identical to
+/// MQ4G256 (qt=13) except the 8 header bytes. Payload unchanged: 128 B of
+/// 4-bit nibbles at offset 8, lane `t` reading the u32 at `8 + 4*t`,
+/// covering weights `8t..8t+7`. Header layout:
+/// `[0..2)` fp16 scale half0 (weights 0-127), `[2..4)` fp16 zero half0,
+/// `[4..6)` fp16 scale half1 (weights 128-255), `[6..8)` fp16 zero half1.
+/// Little-endian, low 16 bits scale, high 16 zero within each dword,
+/// half-wave uniform, lane-invariant scalar loads. `K % 256 == 0`.
+pub const MQ4V2_GROUP_BYTES: usize = 136;
+
 /// Per-group bytes for MQ4-G256-SEL (4-bit selector family, AoS).
 /// 128 B nibble indices + 2 B fp16 scale + 1 B selector + 1 B pad = 132 B/256 weights
 /// → 4.125 bpw. 132 % 4 == 0 so the group is 4-byte aligned (AoS-B layout measured
@@ -527,6 +537,13 @@ pub enum DType {
     HFQ3G256,     // 104 bytes per 256 elements (flat 3-bit, f32 scale+zero)
     HFQ3G128,     // 56 bytes per 128 elements (flat 3-bit, f32 scale+zero)
     MQ4G256,      // MagnumQuant: FWHT-rotated HFQ4-G256 (136 bytes/group, same as HFQ4G256)
+    /// MQ4-G256 v2 (qt=44): FWHT-rotated, 136 B/group, byte-identical payload to
+    /// MQ4G256 except the 8 header bytes: `[0..2)` fp16 scale half0 (w 0-127),
+    /// `[2..4)` fp16 zero half0, `[4..6)` fp16 scale half1 (w 128-255),
+    /// `[6..8)` fp16 zero half1, `[8..136)` 128 B nibbles, identical to qt=13.
+    /// Little-endian, low 16 scale / high 16 zero per dword, half-wave uniform,
+    /// lane-invariant scalar loads. `K % 256 == 0`, 4.25 bpw.
+    MQ4G256V2,
     MQ4G128,      // MagnumQuant: FWHT-128-rotated INT4 (72 bytes/group, same layout as HFQ4G128)
     MQ8G256,      // MagnumQuant: FWHT-rotated symmetric INT8, dp4a target (258 bytes/group)
     MQ6G256,      // MagnumQuant: FWHT-rotated HFQ6-G256 (200 bytes/group, same as HFQ6G256)
@@ -625,6 +642,7 @@ impl DType {
             | DType::HFQ2G128
             | DType::HFQ6G256
             | DType::MQ4G256
+            | DType::MQ4G256V2
             | DType::MQ4G128
             | DType::MQ6G256
             | DType::MQ5G256
@@ -750,7 +768,8 @@ impl DType {
                 | DType::MQ2G256GL
                 | DType::MQ3G256GL
                 | DType::MQ4G256GL
-                    | DType::MQ4G256SEL
+                | DType::MQ4G256SEL
+                | DType::MQ4G256V2
                 | DType::MQ35G256GL
                 | DType::MQ1G1024GL
         )

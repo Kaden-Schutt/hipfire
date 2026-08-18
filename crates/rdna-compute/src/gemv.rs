@@ -7029,6 +7029,72 @@ impl Gpu {
         }
         result
     }
+    /// MQ4 v2 (qt 44) — same as `gemv_hfq4g256_residual` with `HIPFIRE_MQ4_V2_HEADER`.
+    /// Module = v1 + `_mq4v2`, func unchanged. Threads define through the
+    /// `gemv_hfq4g256_residual_for_arch` helper so the `gfx12_weight_cache_policy.inc`
+    /// preamble is preserved (same concat as `GEMV_HFQ4G256_RESIDUAL_*_SRC`).
+    /// Rows forced to 1 on non-RDNA3 (gfx1201 uses 1), matching v1.
+    pub fn gemv_hfq4g256_residual_mq4v2(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        // Preserve arch-dependent row selection identical to v1.
+        let rdna3 = self.arch_caps.is_rdna3_dgpu();
+        let rows = if rdna3 {
+            self.flags.gemv_rows.unwrap_or(1)
+        } else {
+            1
+        };
+        // For gfx1201 minimal dense set, rows=1 and no multirow/wave64 path is taken.
+        // Still thread define through the helper rather than bypassing it.
+        let (src, module) = kernels::gemv_hfq4g256_residual_for_arch(&self.arch_caps);
+        let v2_src = format!("#define HIPFIRE_MQ4_V2_HEADER 1\n{}", src);
+        let module_v2 = format!("{}_mq4v2", module);
+        let func_name = "gemv_hfq4g256_residual";
+        self.ensure_kernel(&module_v2, &v2_src, func_name)?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        // Keep same grid/block as v1 generic: rows=1 → grid m, block 32.
+        // For non-multirow, cdna3, tight_grid cases the v1 also uses m (or m/2) but
+        // gfx1201 hits this else.
+        let grid = if rows > 1 {
+            ((m as u32) + rows as u32 - 1) / rows as u32
+        } else {
+            m as u32
+        };
+        let bytes = crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_hfq4g256_residual_mq4v2", bytes);
+        // gfx1201 is wave32 (not wave64) and not multirow, so take the generic launch.
+        let result = self.launch_maybe_blob(func_name, [grid, 1, 1], [32, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(a_ptr);
+            b.push_ptr(x_ptr);
+            b.push_ptr(y_ptr);
+            b.push_i32(m_val);
+            b.push_i32(k_val);
+            b
+        });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
 
     /// HFQ4-G256 GEMV with fused SCALED residual add, CPU-scalar variant:
     ///   y[row] += scale * (A[row] · x)
