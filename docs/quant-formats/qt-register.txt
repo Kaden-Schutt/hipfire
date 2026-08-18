@@ -76,3 +76,5 @@
 39  MQ3G256GL     passthrough
 40  TQ2G128       passthrough  PR #597 Bonsai ternary
 41  BQ1G128       passthrough  PR #597 Bonsai 1-bit; won the qt=41 adjudication 2026-08-18
+44  MQ4G256V2     passthrough
+45  MQ4CG256      passthrough

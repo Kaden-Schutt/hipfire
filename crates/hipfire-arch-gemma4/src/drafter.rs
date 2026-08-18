@@ -48,7 +48,7 @@
 
 use crate::config::{Gemma4Config, LayerType, RopeType};
 use crate::gemma4::{Gemma4State, Gemma4Weights};
-use hipfire_runtime::hfq::{HfqFile, load_awq_scale};
+use hipfire_runtime::hfq::{load_awq_scale, HfqFile};
 use hipfire_runtime::llama::{f16_to_f32, weight_gemv, WeightTensor};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -62,8 +62,8 @@ pub const DRAFTER_ARCH_ID: u32 = 22;
 /// `centroid_intermediate_top_k`.
 #[derive(Debug, Clone)]
 pub struct Gemma4DrafterConfig {
-    pub hidden: usize,    // text_config.hidden_size  (1024 on the 12B drafter)
-    pub n_layers: usize,  // text_config.num_hidden_layers (4)
+    pub hidden: usize,   // text_config.hidden_size  (1024 on the 12B drafter)
+    pub n_layers: usize, // text_config.num_hidden_layers (4)
     pub vocab_size: usize,
     pub norm_eps: f32,
 
@@ -73,10 +73,10 @@ pub struct Gemma4DrafterConfig {
     pub sliding_rope_theta: f32,   // 1e4
     pub sliding_window: usize,     // 1024
 
-    pub full_head_dim: usize,     // global_head_dim (512)
-    pub full_n_kv_heads: usize,   // num_global_key_value_heads (1, MQA)
-    pub full_rope_theta: f32,     // 1e6
-    pub full_rope_type: RopeType, // Proportional
+    pub full_head_dim: usize,            // global_head_dim (512)
+    pub full_n_kv_heads: usize,          // num_global_key_value_heads (1, MQA)
+    pub full_rope_theta: f32,            // 1e6
+    pub full_rope_type: RopeType,        // Proportional
     pub full_partial_rotary_factor: f32, // 0.25
 
     pub hidden_dim: usize, // intermediate_size (8192)
@@ -124,8 +124,7 @@ impl Gemma4DrafterConfig {
         let sliding_head_dim = getu(tc, "head_dim")
             .map(|v| v as usize)
             .unwrap_or(hidden / n_heads);
-        let sliding_n_kv_heads =
-            getu(tc, "num_key_value_heads").unwrap_or(n_heads as u64) as usize;
+        let sliding_n_kv_heads = getu(tc, "num_key_value_heads").unwrap_or(n_heads as u64) as usize;
         let sliding_window = getu(tc, "sliding_window").unwrap_or(1024) as usize;
 
         let full_head_dim = getu(tc, "global_head_dim")
@@ -188,8 +187,10 @@ impl Gemma4DrafterConfig {
                 v
             });
 
-        let norm_plus_one =
-            std::env::var("HIPFIRE_GEMMA4_NORM_PLUS_ONE").ok().as_deref() == Some("1");
+        let norm_plus_one = std::env::var("HIPFIRE_GEMMA4_NORM_PLUS_ONE")
+            .ok()
+            .as_deref()
+            == Some("1");
 
         Ok(Gemma4DrafterConfig {
             hidden,
@@ -254,7 +255,15 @@ fn load_f32_vec(hfq: &HfqFile, name: &str, expected_n: usize) -> Result<Vec<f32>
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
-        qt => return Err(format!("gemma4-drafter: expected F16/F32 for {name}, got qt={qt}")),
+        16 => data
+            .chunks_exact(2)
+            .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+            .collect(),
+        qt => {
+            return Err(format!(
+                "gemma4-drafter: expected F16/F32 for {name}, got qt={qt}"
+            ))
+        }
     };
     Ok(f32_data)
 }
@@ -294,11 +303,31 @@ fn load_wt(
     let (info, data) = hfq
         .tensor_data(name)
         .ok_or_else(|| format!("gemma4-drafter: tensor not found: {name}"))?;
-    if info.quant_type == 1 {
-        let f32_data: Vec<f32> = data
-            .chunks_exact(2)
-            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-            .collect();
+    if info.quant_type == 1 || info.quant_type == 16 {
+        if info.quant_type == 16 && rdna_compute::calib_force_bf16() {
+            // Native BF16 teacher — keep raw BF16 for consistency (drafter decode is GEMV, not batched MFMA).
+            let buf = gpu
+                .upload_raw(data, &[m, k])
+                .map_err(|e| format!("gemma4-drafter: upload BF16 {name}: {e:?}"))?;
+            return Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::BF16,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            });
+        }
+        let f32_data: Vec<f32> = if info.quant_type == 16 {
+            data.chunks_exact(2)
+                .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+                .collect()
+        } else {
+            data.chunks_exact(2)
+                .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .collect()
+        };
         let bytes: &[u8] = unsafe {
             std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
         };
@@ -340,7 +369,11 @@ fn load_wt(
         13 => DType::MQ4G256,
         15 => DType::MQ6G256,
         19 => DType::MQ4G256,
-        qt => return Err(format!("gemma4-drafter: unsupported quant_type {qt} for {name}")),
+        qt => {
+            return Err(format!(
+                "gemma4-drafter: unsupported quant_type {qt} for {name}"
+            ))
+        }
     };
     let buf = gpu
         .upload_raw(data, &[data.len()])
@@ -397,11 +430,7 @@ pub struct Gemma4DrafterWeights {
 impl Gemma4DrafterWeights {
     /// Load the 48 drafter tensors (FLAT `model.*` names + two top-level
     /// projections). embd format follows the quant_type of `model.embed_tokens`.
-    pub fn load(
-        hfq: &HfqFile,
-        cfg: &Gemma4DrafterConfig,
-        gpu: &mut Gpu,
-    ) -> Result<Self, String> {
+    pub fn load(hfq: &HfqFile, cfg: &Gemma4DrafterConfig, gpu: &mut Gpu) -> Result<Self, String> {
         let hidden = cfg.hidden;
         let plus_one = cfg.norm_plus_one;
 
@@ -421,6 +450,18 @@ impl Gemma4DrafterWeights {
                 let f32_data: Vec<f32> = embed_data
                     .chunks_exact(2)
                     .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                    .collect();
+                (
+                    gpu.upload_f32(&f32_data, &[cfg.vocab_size, hidden])
+                        .map_err(|e| format!("gemma4-drafter: upload embed f32: {e:?}"))?,
+                    DType::F32,
+                    false,
+                )
+            }
+            16 => {
+                let f32_data: Vec<f32> = embed_data
+                    .chunks_exact(2)
+                    .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
                     .collect();
                 (
                     gpu.upload_f32(&f32_data, &[cfg.vocab_size, hidden])
@@ -452,15 +493,14 @@ impl Gemma4DrafterWeights {
         let final_norm = load_norm(hfq, gpu, "model.norm.weight", hidden, plus_one)?;
 
         // Two top-level projections (no bias).
-        let pre_projection = load_wt(
+        let pre_projection = load_wt(hfq, gpu, "pre_projection.weight", hidden, cfg.pre_proj_in())?;
+        let post_projection = load_wt(
             hfq,
             gpu,
-            "pre_projection.weight",
+            "post_projection.weight",
+            cfg.backbone_hidden,
             hidden,
-            cfg.pre_proj_in(),
         )?;
-        let post_projection =
-            load_wt(hfq, gpu, "post_projection.weight", cfg.backbone_hidden, hidden)?;
 
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
@@ -500,8 +540,20 @@ impl Gemma4DrafterWeights {
                     plus_one,
                 )?,
                 layer_scalar_host: load_layer_scalar(hfq, &format!("{p}.layer_scalar")),
-                q_proj: load_wt(hfq, gpu, &format!("{p}.self_attn.q_proj.weight"), q_dim, hidden)?,
-                o_proj: load_wt(hfq, gpu, &format!("{p}.self_attn.o_proj.weight"), hidden, q_dim)?,
+                q_proj: load_wt(
+                    hfq,
+                    gpu,
+                    &format!("{p}.self_attn.q_proj.weight"),
+                    q_dim,
+                    hidden,
+                )?,
+                o_proj: load_wt(
+                    hfq,
+                    gpu,
+                    &format!("{p}.self_attn.o_proj.weight"),
+                    hidden,
+                    q_dim,
+                )?,
                 q_norm: load_norm(
                     hfq,
                     gpu,
@@ -689,8 +741,7 @@ pub fn drafter_step(
     // Set the device position scalar = query_pos (drives RoPE + attention range).
     {
         let pos_host = [query_pos as i32];
-        let pos_bytes =
-            unsafe { std::slice::from_raw_parts(pos_host.as_ptr() as *const u8, 4) };
+        let pos_bytes = unsafe { std::slice::from_raw_parts(pos_host.as_ptr() as *const u8, 4) };
         gpu.memcpy_htod_auto(&ds.pos_buf, pos_bytes)
             .map_err(|e| format!("gemma4-drafter: htod pos: {e:?}"))?;
     }
@@ -748,8 +799,7 @@ pub fn drafter_step_from_concat(
 ) -> Result<DrafterStepOut, String> {
     {
         let pos_host = [query_pos as i32];
-        let pos_bytes =
-            unsafe { std::slice::from_raw_parts(pos_host.as_ptr() as *const u8, 4) };
+        let pos_bytes = unsafe { std::slice::from_raw_parts(pos_host.as_ptr() as *const u8, 4) };
         gpu.memcpy_htod_auto(&ds.pos_buf, pos_bytes)
             .map_err(|e| format!("gemma4-drafter: htod pos: {e:?}"))?;
     }
@@ -873,9 +923,10 @@ fn drafter_layer(
     // per-type cache (the target's last sliding / last full layer).
     let (kv_cache, kv_slot) = match lt {
         LayerType::Sliding => {
-            let slot = target_cfg.n_sliding_layers().checked_sub(1).ok_or(
-                "gemma4-drafter: target has no sliding layers to share KV from",
-            )?;
+            let slot = target_cfg
+                .n_sliding_layers()
+                .checked_sub(1)
+                .ok_or("gemma4-drafter: target has no sliding layers to share KV from")?;
             (&target_state.kv_sliding, slot)
         }
         LayerType::Full => {
@@ -934,14 +985,31 @@ fn drafter_layer(
     let v_cache = &kv_cache.v_gpu[kv_slot];
     if window > 0 {
         gpu.attention_q8_0_kv_swa(
-            &ds.q, k_cache, v_cache, &ds.attn_out, &ds.pos_buf, max_seq, n_heads, n_kv,
-            head_dim, phys_cap, window,
+            &ds.q,
+            k_cache,
+            v_cache,
+            &ds.attn_out,
+            &ds.pos_buf,
+            max_seq,
+            n_heads,
+            n_kv,
+            head_dim,
+            phys_cap,
+            window,
         )
         .map_err(|e| format!("gemma4-drafter: attention swa: {e:?}"))?;
     } else {
         gpu.attention_q8_0_kv(
-            &ds.q, k_cache, v_cache, &ds.attn_out, &ds.pos_buf, max_seq, n_heads, n_kv,
-            head_dim, phys_cap,
+            &ds.q,
+            k_cache,
+            v_cache,
+            &ds.attn_out,
+            &ds.pos_buf,
+            max_seq,
+            n_heads,
+            n_kv,
+            head_dim,
+            phys_cap,
         )
         .map_err(|e| format!("gemma4-drafter: attention full: {e:?}"))?;
     }

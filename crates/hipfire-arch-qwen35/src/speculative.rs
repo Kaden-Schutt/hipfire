@@ -2333,8 +2333,13 @@ fn verify_dflash_block_inner(
     // hidden_rb staging dest) are read from device buffers whose *contents*
     // change between replays — the captured graph reads the current bytes.
     //
-    // Eligibility is narrow: HFQ4G256 embedding (uploads via pbs.tokens),
-    // no tree_verify (its attn_bias+positions are per-cycle), pbs is Some.
+    // Eligibility is narrow: HFQ4G256/Q8_0 embedding (uploads via pbs.tokens),
+    // tree_ok_for_graph, pbs is Some, and `qwen35::prefill_batch_pbs_eligible`
+    // (shared with the forward / spec_step tape gate). When that shared
+    // predicate is false — e.g. qt44/qt45 on non-gfx12 — skip capture entirely
+    // and take the direct `forward_prefill_batch_with_pbs_opts` route, which
+    // performs the correct per-token fallback instead of erroring inside
+    // `forward_prefill_batch_single_chunk_captured_opts`.
     // `gdn_tape` is safe because verify is single-chunk → tape_offset=0 always
     // → captured node's dst offset is correct across cycles.
     //
@@ -2385,6 +2390,19 @@ fn verify_dflash_block_inner(
     // the tiled crossover landed 2026-06-09) is intentionally NOT reinstated: it
     // would skip a verify-graph that now replays fine and forfeit the long-context
     // spec speedup.
+    let moe_router_logits_present = verify_scratch
+        .prefill_batch
+        .as_ref()
+        .map(|pbs| pbs.moe_router_logits_batch.is_some())
+        .unwrap_or(true);
+    let pbs_eligible = qwen35::prefill_batch_pbs_eligible(
+        &target.weights,
+        &target.config,
+        &target.dn_state,
+        b,
+        gpu.arch.as_str(),
+        moe_router_logits_present,
+    );
     let verify_graph_ok = hipfire_config::developer_var("HIPFIRE_VERIFY_GRAPH")
         .ok()
         .as_deref()
@@ -2395,7 +2413,8 @@ fn verify_dflash_block_inner(
             hipfire_runtime::llama::EmbeddingFormat::HFQ4G256
                 | hipfire_runtime::llama::EmbeddingFormat::Q8_0,
         )
-        && verify_scratch.prefill_batch.is_some();
+        && verify_scratch.prefill_batch.is_some()
+        && pbs_eligible;
 
     // Per-cycle timing for verify-graph A/B diagnostic
     // (HIPFIRE_VERIFY_GRAPH_TIMING=1). Two device-sync points bracket the

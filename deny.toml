@@ -13,6 +13,9 @@ unsound = "workspace"
 confidence-threshold = 0.8
 allow = [
     "Apache-2.0",
+    # atomic-wait 1.1.0, reached via faer 0.24 -> spindle. Permissive,
+    # OSI-approved; notice-retention only, no source obligation.
+    "BSD-2-Clause",
     # subtle 2.6.1, reached via rustls 0.23. Permissive, OSI-approved,
     # Apache-2.0-compatible; notice-retention only, no source obligation.
     "BSD-3-Clause",

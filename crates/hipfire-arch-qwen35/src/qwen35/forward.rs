@@ -212,7 +212,7 @@ pub(crate) fn ffn_all_mq4_for_moe(ffn: &MoeFfnWeights) -> bool {
         && ffn
             .experts
             .iter()
-            .all(|e| e.gate_up.gpu_dtype == DType::MQ4G256)
+            .all(|e| matches!(e.gate_up.gpu_dtype, DType::MQ4G256 | DType::MQ4G256V2))
 }
 
 /// GATE-SIDE only MQ4 (router + shared expert), independent of the routed
@@ -224,10 +224,19 @@ pub(crate) fn ffn_all_mq4_for_moe(ffn: &MoeFfnWeights) -> bool {
 /// The redline mq4r (MQ4 gate + graded experts) hits this; uniform MQ4 is a
 /// superset (ffn_all_mq4_for_moe). Q8-router files (mq4p) correctly stay false.
 pub(crate) fn ffn_gate_side_mq4_for_moe(ffn: &MoeFfnWeights) -> bool {
-    ffn.router.gpu_dtype == DType::MQ4G256
-        && ffn.shared_expert_gate.gpu_dtype == DType::MQ4G256
-        && ffn.shared_expert.gate.gpu_dtype == DType::MQ4G256
-        && ffn.shared_expert.up.gpu_dtype == DType::MQ4G256
+    matches!(ffn.router.gpu_dtype, DType::MQ4G256 | DType::MQ4G256V2)
+        && matches!(
+            ffn.shared_expert_gate.gpu_dtype,
+            DType::MQ4G256 | DType::MQ4G256V2
+        )
+        && matches!(
+            ffn.shared_expert.gate.gpu_dtype,
+            DType::MQ4G256 | DType::MQ4G256V2
+        )
+        && matches!(
+            ffn.shared_expert.up.gpu_dtype,
+            DType::MQ4G256 | DType::MQ4G256V2
+        )
 }
 
 /// Detect any MQ3G256 / MQ3G256Lloyd weight inside a MoE FFN block (router,
@@ -517,11 +526,13 @@ fn moe_ffn_decode_impl(
         shared_expert_up: ffn.shared_expert.up.gpu_dtype,
         shared_expert_down: ffn.shared_expert.down.gpu_dtype,
         experts_all_gate_up_mq4: if let Some(global) = ffn.global_expert_dtypes.as_ref() {
-            global.iter().all(|(g, _)| *g == DType::MQ4G256)
+            global
+                .iter()
+                .all(|(g, _)| matches!(*g, DType::MQ4G256 | DType::MQ4G256V2))
         } else {
             ffn.experts
                 .iter()
-                .all(|e| e.gate_up.gpu_dtype == DType::MQ4G256)
+                .all(|e| matches!(e.gate_up.gpu_dtype, DType::MQ4G256 | DType::MQ4G256V2))
         },
         routed_gate_up: if let Some(global) = ffn.global_expert_dtypes.as_ref() {
             global.first().map(|(g, _)| *g).unwrap_or(DType::F32)
@@ -4243,7 +4254,10 @@ fn gated_norm_mq_rotate_enabled(
         && admitted_arch_shape
         && config.linear_value_head_dim == 128
         && wo.k == n_v_heads * config.linear_value_head_dim
-        && wo.gpu_dtype == DType::MQ4G256
+        && matches!(
+            wo.gpu_dtype,
+            DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ4CG256
+        )
         && wo.awq_scale.is_none()
 }
 
@@ -4302,7 +4316,10 @@ fn qwen35_fa_epilogue_enabled(gpu: &Gpu, config: &Qwen35Config, wo: &WeightTenso
     enabled
         && admitted_arch_shape
         && config.head_dim == 256
-        && wo.gpu_dtype == DType::MQ4G256
+        && matches!(
+            wo.gpu_dtype,
+            DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ4CG256
+        )
         && wo.awq_scale.is_none()
 }
 
@@ -4344,7 +4361,10 @@ fn qkvza_scalar_prep_enabled(
         && wz.gpu_dtype == dtype
         && w_beta.gpu_dtype == dtype
         && w_alpha.gpu_dtype == dtype
-        && matches!(dtype, DType::MQ4G256 | DType::HFQ4G256)
+        && matches!(
+            dtype,
+            DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ4CG256 | DType::HFQ4G256
+        )
 }
 
 /// Schedule the independent beta/alpha transforms as one extra workgroup of
@@ -4414,8 +4434,13 @@ fn moe_combine_next_rms_enabled(gpu: &Gpu, weights: &Qwen35Weights, config: &Qwe
         return false;
     }
 
-    let mq4 =
-        |w: &WeightTensor| w.gpu_dtype == DType::MQ4G256 && w.k == 2_048 && w.awq_scale.is_none();
+    let mq4 = |w: &WeightTensor| {
+        matches!(
+            w.gpu_dtype,
+            DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ4CG256
+        ) && w.k == 2_048
+            && w.awq_scale.is_none()
+    };
     // MUST stay in lockstep with `routed_down_self_combines` in
     // hipfire-dispatch/src/pipeline/mod.rs — this asks the same question ("does
     // this layer's down GEMV write `down_expanded`?") and is the admission gate

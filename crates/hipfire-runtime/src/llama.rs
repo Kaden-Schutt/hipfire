@@ -731,10 +731,10 @@ impl MmqScreenable for LlamaWeights {
 /// y = W * x where W is the weight tensor, x is F32 input, y is F32 output.
 
 pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor) -> HipResult<()> {
-    use hipfire_dispatch::context::DispatchCtx;
+    // Calibration tap: PRE-rotation input x (n=1, k=w.k). No-op when unarmed.
+    gpu.maybe_capture_activation(&w.buf, x, 1, w.k);
     use hipfire_dispatch::families::gemv::{GemvParams, WeightRef};
     use hipfire_dispatch::types::{dtype_needs_rotation, GemvVariant};
-
     let gemv = crate::llama::gemv_family();
     let ctx = DispatchCtx::new(gpu);
     let wr = WeightRef {
@@ -964,6 +964,8 @@ pub fn fused_rmsnorm_rotate_for_mq<'a>(
 ) -> HipResult<Option<&'a GpuTensor>> {
     match sample_weight.gpu_dtype {
         DType::MQ4G256
+        | DType::MQ4G256V2
+        | DType::MQ4CG256
         | DType::MQ6G256
         | DType::MQ3G256
         | DType::MQ2G256
@@ -1023,6 +1025,8 @@ pub fn rotate_x_for_mq<'a>(
 ) -> HipResult<Option<&'a GpuTensor>> {
     match sample_weight.gpu_dtype {
         DType::MQ4G256
+        | DType::MQ4G256V2
+        | DType::MQ4CG256
         | DType::MQ6G256
         | DType::MQ3G256
         | DType::MQ2G256
@@ -1191,6 +1195,8 @@ pub fn weight_gemv_prerotated(
     x_rot: Option<&GpuTensor>,
     y: &GpuTensor,
 ) -> HipResult<()> {
+    // Calibration tap: PRE-rotation input x (n=1, k=w.k). Must fire before any rotation.
+    gpu.maybe_capture_activation(&w.buf, x, 1, w.k);
     use hipfire_dispatch::context::DispatchCtx;
     use hipfire_dispatch::families::gemv::WeightRef;
     use hipfire_dispatch::types::dtype_needs_rotation;
@@ -1297,7 +1303,8 @@ pub fn weight_gemv_residual(
     x: &GpuTensor,
     y: &GpuTensor,
 ) -> HipResult<()> {
-    use hipfire_dispatch::context::DispatchCtx;
+    // Calibration tap: o_proj/out_proj input (residual path). PRE-rotation x.
+    gpu.maybe_capture_activation(&w.buf, x, 1, w.k);
     use hipfire_dispatch::families::gemv::{GemvParams, WeightRef};
     use hipfire_dispatch::types::GemvVariant;
 
@@ -1331,6 +1338,8 @@ pub fn weight_gemv_residual(
             .map_err(|e| hip_bridge::HipError::new(0, &e.to_string())),
         DType::MQ6G256
         | DType::MQ4G256
+        | DType::MQ4G256V2
+        | DType::MQ4CG256
         | DType::MQ3G256
         | DType::MQ3G256Lloyd
         | DType::MQ4G256Lloyd => {
@@ -1376,10 +1385,6 @@ pub fn weight_gemv_residual(
 ///   gemv_hfq4g256_residual(w_down, mq_x_rot, x)    // fused residual add
 /// so the entire w_down epilogue is two launches instead of four
 /// (silu_mul + rotate + gemv + add_inplace → fused_silu_rotate + gemv_residual).
-///
-/// Non-MQ path falls back to the pre-Phase-3.8 sequence (silu_mul_f32 +
-/// weight_gemv_residual). Byte-equivalent modulo FP reordering on the
-/// FWHT butterfly, which is the same butterfly as the standalone path.
 pub fn weight_gemv_swiglu_residual(
     gpu: &mut Gpu,
     w_down: &WeightTensor,
@@ -1388,6 +1393,9 @@ pub fn weight_gemv_swiglu_residual(
     ffn_hidden_scratch: &GpuTensor,
     x: &GpuTensor,
 ) -> HipResult<()> {
+    // Calibration tap: down_proj input is ffn_hidden_scratch (post-SiLU), K = w_down.k.
+    // For MQ4 this will be rotated inside; we capture PRE-rotation.
+    gpu.maybe_capture_activation(&w_down.buf, ffn_hidden_scratch, 1, w_down.k);
     use hipfire_dispatch::context::DispatchCtx;
     use hipfire_dispatch::families::gemv::{GemvParams, WeightRef};
     use hipfire_dispatch::types::GemvVariant;
@@ -1406,6 +1414,8 @@ pub fn weight_gemv_swiglu_residual(
 
     match w_down.gpu_dtype {
         DType::MQ4G256
+        | DType::MQ4G256V2
+        | DType::MQ4CG256
         | DType::MQ3G256
         | DType::MQ6G256
         | DType::MQ3G256Lloyd
@@ -1448,6 +1458,14 @@ pub fn weight_gemm(
     y: &GpuTensor,
     batch_size: usize,
 ) -> HipResult<()> {
+    // Calibration tap, batched twin of the four in `weight_gemv*`. Those pass
+    // n=1 because they are the decode path; here the real row count goes in, so
+    // one prefill call contributes `batch_size` rows to H and Σx² at once.
+    // This is what lets calibration run as batched MFMA instead of per-token
+    // GEMV — the difference between re-reading all weights per token
+    // (bandwidth-bound) and once per batch. Zero cost when no collector is
+    // armed (`active_capture.is_none()` early-returns).
+    gpu.maybe_capture_activation(&w.buf, x, batch_size, w.k);
     match w.gpu_dtype {
         DType::HFQ4G256 => gpu.gemm_hfq4g256(&w.buf, x, y, w.m, w.k, batch_size),
         DType::HFQ4G128 => gpu.gemm_hfq4g128(&w.buf, x, y, w.m, w.k, batch_size),
@@ -1471,6 +1489,33 @@ pub fn weight_gemm(
             // (its own dispatch comment). It also invalidates the FP16-x cache for
             // the freshly-pooled x_rot pointer, so no manual reset is needed here.
             let r = gpu.gemm_hfq4g256_batched_lmhead(&w.buf, &x_rot, y, w.m, w.k, batch_size);
+            gpu.free_tensor(x_rot)?;
+            r
+        }
+        // qt=44 twin. Same offline-FWHT contract as qt=13 above — identical
+        // rotation plan (FwhtG256, seeds 42/1042), so `rotate_x_mq_batched_for`
+        // is reused verbatim. Only the weight DECODE differs: v2 carries fp16
+        // scale/zero per 128 weights where v1 carries f32 scale/zero per 256, so
+        // this MUST land on the v2 batched-lmhead launcher. Routing it to the v1
+        // launcher bit_casts an fp16 pair to f32 and decodes every weight to
+        // ~1e-14 — no error, full speed, pure noise.
+        DType::MQ4G256V2 => {
+            gpu.ensure_mq_signs()?;
+            let x_rot = gpu.alloc_tensor(&[batch_size, w.k], DType::F32)?;
+            rotate_x_mq_batched_for(gpu, w, x, &x_rot, w.k, batch_size)?;
+            let r = gpu.gemm_mq4g256v2_batched_lmhead(&w.buf, &x_rot, y, w.m, w.k, batch_size);
+            gpu.free_tensor(x_rot)?;
+            r
+        }
+        // qt=45 twin. Same offline-FWHT contract as qt=13/44 — identical
+        // rotation plan (FwhtG256), so `rotate_x_mq_batched_for` is reused.
+        // Container-aware: MQ4C uses the padded 136B group layout; must land on
+        // the mq4c batched-lmhead launcher, not v1/v2 (wrong group stride).
+        DType::MQ4CG256 => {
+            gpu.ensure_mq_signs()?;
+            let x_rot = gpu.alloc_tensor(&[batch_size, w.k], DType::F32)?;
+            rotate_x_mq_batched_for(gpu, w, x, &x_rot, w.k, batch_size)?;
+            let r = gpu.gemm_mq4cg256_batched_lmhead(&w.buf, &x_rot, y, w.m, w.k, batch_size);
             gpu.free_tensor(x_rot)?;
             r
         }
@@ -1791,7 +1836,13 @@ pub fn is_batchable_la(dt: DType, arch: &str) -> bool {
             arch,
             "gfx1010" | "gfx1011" | "gfx1012" | "gfx1013" | "gfx1030" | "gfx1031" | "gfx1032"
         );
-    wmma_only || mq3_gfx10_scalar
+    // MQ4G256V2 / MQ4CG256 batched prefill + batched lm_head GEMM exist only
+    // on gfx12 (gfx1200/gfx1201). Outside gfx12, fall back to per-token decode
+    // rather than dispatching a gfx12 WMMA kernel. Lockstep with
+    // qwen35::is_batchable_la (qt44/qt45).
+    let mq4_v2_gfx12 =
+        matches!(dt, DType::MQ4G256V2 | DType::MQ4CG256) && matches!(arch, "gfx1200" | "gfx1201");
+    wmma_only || mq3_gfx10_scalar || mq4_v2_gfx12
 }
 
 /// Per-call scratch for `forward_prefill_batch`. Holds [N × ...] working
@@ -8146,6 +8197,32 @@ mod tests {
             assert!(is_batchable_la(DType::MQ4G256, arch));
             assert!(is_batchable_la(DType::HFQ6G256, arch));
             assert!(is_batchable_la(DType::MQ6G256, arch));
+        }
+    }
+
+    #[test]
+    fn is_batchable_la_mq4_v2_gfx12_only() {
+        // MQ4G256V2 / MQ4CG256 batched prefill is gfx12-only; other arches
+        // fall back to per-token decode.
+        for arch in ["gfx1200", "gfx1201"] {
+            assert!(
+                is_batchable_la(DType::MQ4G256V2, arch),
+                "MQ4G256V2 should batch on {arch}"
+            );
+            assert!(
+                is_batchable_la(DType::MQ4CG256, arch),
+                "MQ4CG256 should batch on {arch}"
+            );
+        }
+        for arch in ["gfx1010", "gfx1100", "gfx942"] {
+            assert!(
+                !is_batchable_la(DType::MQ4G256V2, arch),
+                "MQ4G256V2 must fall back on {arch}"
+            );
+            assert!(
+                !is_batchable_la(DType::MQ4CG256, arch),
+                "MQ4CG256 must fall back on {arch}"
+            );
         }
     }
 

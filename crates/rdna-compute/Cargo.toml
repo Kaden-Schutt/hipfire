@@ -150,6 +150,10 @@ name = "bench_gemv_mfp4g32_rotate"
 required-features = ["lab"]
 
 [[example]]
+name = "bench_gemv_paired_throughput"
+required-features = ["lab"]
+
+[[example]]
 name = "bench_glimmer_prefill_shapes"
 required-features = ["lab"]
 
@@ -230,6 +234,10 @@ name = "bench_mq4_gate_up"
 required-features = ["lab"]
 
 [[example]]
+name = "bench_mq4c_slab_alignment"
+required-features = ["lab"]
+
+[[example]]
 name = "bench_q8_0_batched"
 required-features = ["lab"]
 
@@ -255,6 +263,10 @@ required-features = ["lab"]
 
 [[example]]
 name = "bench_stream_overlap"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_vgpr_cap_sweep"
 required-features = ["lab"]
 
 [[example]]
@@ -303,6 +315,10 @@ required-features = ["lab"]
 
 [[example]]
 name = "hip_graph_poc"
+required-features = ["lab"]
+
+[[example]]
+name = "mq4c_parity"
 required-features = ["lab"]
 
 [[example]]

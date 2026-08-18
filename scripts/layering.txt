@@ -48,6 +48,7 @@
  7 hipfire-arch-minimax
  7 hipfire-arch-qwen35
  7 hipfire-quantize
+ 7 saddle-quant
  8 hipfire-cli
  8 hipfire-loader
  8 hipfire-pflash

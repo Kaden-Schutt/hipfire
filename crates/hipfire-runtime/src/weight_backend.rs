@@ -10,7 +10,7 @@
 use crate::hfq::HfqFile;
 use crate::llama::{f16_to_f32, EmbeddingFormat, KvCache, WeightTensor};
 use hip_bridge::HipResult;
-use rdna_compute::{DType, Gpu, GpuTensor};
+use rdna_compute::{DType, Gpu, GpuTensor, MQ4C_GROUP_BYTES};
 
 /// Widen a little-endian BF16 byte stream to F32 (lossless: bf16 is the high
 /// 16 bits of an f32). Used by the qt=16 paths in dequant_weight_raw/dequant_f32.
@@ -426,8 +426,15 @@ pub(crate) const RAW_CODECS: &[RawCodec] = &[
         quant_type: 41,
         dtype: DType::BQ1G128,
     },
+    RawCodec {
+        quant_type: 44,
+        dtype: DType::MQ4G256V2,
+    },
+    RawCodec {
+        quant_type: 45,
+        dtype: DType::MQ4CG256,
+    },
 ];
-
 /// Look up the passthrough codec for `quant_type`, or `None` if it is host-decode
 /// (1/2/16) or genuinely unsupported.
 pub(crate) fn raw_codec(quant_type: u8) -> Option<&'static RawCodec> {
@@ -460,6 +467,34 @@ pub(crate) fn decode_raw_codec(
                 codec.dtype
             ),
         ));
+    }
+    if codec.dtype == DType::MQ4G256V2 {
+        let gpr = k / 256;
+        let expected = m * gpr * 136;
+        if data.len() != expected {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "MQ4G256V2 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name})",
+                    data.len()
+                ),
+            ));
+        }
+    }
+    if codec.dtype == DType::MQ4CG256 {
+        let gpr = k / 256;
+        // Pad layout: 136 B/group (fp16 scale+zero @+0, 4 B zero pad @+4,
+        // 128 B nibbles @+8). Compact 132 B groups are not a production path.
+        let expected = m * gpr * MQ4C_GROUP_BYTES;
+        if data.len() != expected {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "MQ4CG256 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name})",
+                    data.len()
+                ),
+            ));
+        }
     }
     let buf = gpu.upload_raw(data, &[data.len()])?;
     Ok(WeightTensor {
@@ -1537,6 +1572,9 @@ mod tests {
             // Bonsai ternary/binary — renumbered off 38/39 (taken by GL above).
             (40, DType::TQ2G128), // ternary Bonsai-27B, 34 B/group-128
             (41, DType::BQ1G128), // binary Bonsai-27B, 18 B/group-128
+            // qt=44/45: 136 B/group pad layouts (PR599). MQ4C is NOT 132.
+            (44, DType::MQ4G256V2),
+            (45, DType::MQ4CG256),
         ];
         for &(qt, dt) in expected {
             let c = raw_codec(qt).unwrap_or_else(|| panic!("no RAW_CODECS row for qt={qt}"));
@@ -1808,5 +1846,25 @@ mod tests {
             lowbit_expected_bytes(DType::BQ1G128, 0, 128, "zero", 18).unwrap(),
             0
         );
+    }
+
+    /// MQ4C (qt=45) ships as 136 B/group pad layout — same total as MQ4 v1/v2.
+    /// Compact 132 B groups are rejected at load; do not reintroduce them.
+    #[test]
+    fn mq4c_group_bytes_is_136_not_compact_132() {
+        assert_eq!(MQ4C_GROUP_BYTES, 136, "MQ4C pad layout is 136 B/group");
+        assert_ne!(
+            MQ4C_GROUP_BYTES, 132,
+            "compact 132 B MQ4C is not production"
+        );
+        // decode_raw_codec expected length: m * (k/256) * MQ4C_GROUP_BYTES
+        let m = 4usize;
+        let k = 512usize;
+        let gpr = k / 256;
+        let expected = m * gpr * MQ4C_GROUP_BYTES;
+        assert_eq!(expected, m * gpr * 136);
+        assert_ne!(expected, m * gpr * 132);
+        let codec = raw_codec(45).expect("qt=45 MQ4CG256 codec");
+        assert_eq!(codec.dtype, DType::MQ4CG256);
     }
 }

@@ -16,7 +16,35 @@ use crate::tables::KernelRegistry;
 use crate::traits::KernelFamily;
 use crate::types::*;
 
-// ── Dispatch parameters ────────────────────────────────
+fn is_gemm_hfq4_key(key: KernelKey) -> bool {
+    matches!(
+        key,
+        KernelKey::GemmHfq4G256
+            | KernelKey::GemmHfq4G256Wmma
+            | KernelKey::GemmHfq4G256Dp4a
+            | KernelKey::GemmHfq4G256MmqSet
+            | KernelKey::GemmHfq4G256Residual
+            | KernelKey::GemmHfq4G256BatchedLmhead
+    )
+}
+
+fn is_gemm_mq4v2_key(key: KernelKey) -> bool {
+    matches!(
+        key,
+        KernelKey::GemmMq4G256V2
+            | KernelKey::GemmMq4G256V2Residual
+            | KernelKey::GemmMq4G256V2BatchedLmhead
+    )
+}
+
+fn is_gemm_mq4c_key(key: KernelKey) -> bool {
+    matches!(
+        key,
+        KernelKey::GemmMq4CG256
+            | KernelKey::GemmMq4CG256Residual
+            | KernelKey::GemmMq4CG256BatchedLmhead
+    )
+}
 
 pub struct GemmParams<'a> {
     pub w: &'a WeightRef<'a>,
@@ -59,6 +87,11 @@ impl GemmFamily {
         let key = match dtype {
             DType::F32 => KernelKey::GemmF32RegisterTiled,
             DType::F16 => KernelKey::GemmF16XF16Wmma,
+            // Native BF16 stays BF16: on gfx942 this is the MFMA GEMM. On any
+            // other arch the registry rejects IsGfx942 and resolve() returns
+            // UnsupportedVariant, so a caller must fall back explicitly rather
+            // than silently landing on a scalar kernel.
+            DType::BF16 => KernelKey::GemmBf16Mfma,
             DType::Q8_0 => {
                 let preferred = KernelKey::GemmQ8_0Wmma;
                 if self.registry.resolve(preferred, ctx, shape).is_ok() {
@@ -78,6 +111,8 @@ impl GemmFamily {
             DType::HFQ4G128 => KernelKey::GemmHfq4G128,
             DType::TQ2G128 => KernelKey::GemmTQ2G128Prefill,
             DType::BQ1G128 => KernelKey::GemmBQ1G128Prefill,
+            DType::MQ4G256V2 => KernelKey::GemmMq4G256V2,
+            DType::MQ4CG256 => KernelKey::GemmMq4CG256,
             _ => {
                 return Err(DispatchError::UnsupportedVariant {
                     family: "gemm",
@@ -141,6 +176,71 @@ impl GemmFamily {
         let m = w.m;
         let k = w.k;
 
+        // Calibration tap. This is the batched chokepoint for every arch that
+        // migrated off `llama::weight_gemm` onto dispatcher-entry keys —
+        // gemma4 (`lowered.rs:173`), muse-glimmer (`forward.rs:80`) and
+        // qwen35's migrated prefill sites. Without it those arches capture
+        // NOTHING on the batched path, because `weight_gemm`'s tap never runs
+        // for them. `batch_size` is the real row count, so one prefill call
+        // contributes that many rows to H and Σx².
+        // Zero cost when unarmed (`active_capture.is_none()` early-returns).
+        //
+        // A BF16 `x` is a STAGED copy of an F32 activation, produced by an arch
+        // for GemmBf16Mfma. Do not capture it: the collector copies `n*k` F32
+        // elements, so a 2-byte-per-element buffer overruns (assert in
+        // `memcpy_dtod_at`), and even sized correctly it would record the
+        // bf16-rounded activation rather than the true one. Arches that stage
+        // MUST capture the original F32 source before converting.
+        if x.dtype != DType::BF16 {
+            gpu.maybe_capture_activation(w.buf, x, batch_size, k);
+        }
+
+        // Guard: V2/v1.5 bytes through wrong-header kernels is silent noise.
+        // qt=44 = 136 B/group (two fp16 half-grids); qt=45 = 136 B/group (one
+        // packed fp16 scale/zero dword at [0..4), 4 B pad at [4..8), 128 B
+        // nibbles at [8..136)); v1 = 136 B/group (f32 scale/zero). Equal stride
+        // does not make the layouts interchangeable — a mis-route decodes every
+        // group with the wrong header and returns noise at full speed with no
+        // HIP error.
+        if w.dtype == DType::MQ4G256V2 && is_gemm_hfq4_key(key) {
+            return Err(DispatchError::Hip(format!(
+                "qt=44 (MQ4G256V2) weight (dtype {:?}) routed to v1 kernel key {:?}: \
+                 v2 stores fp16 scale/zero per 128 weights (s0/z0 for 0..127, s1/z1 for 128..255) \
+                 where v1 stores f32 scale/zero per 256, so the v1 kernel decodes every weight \
+                 to ~1e-14. This is a missing v2 routing arm at the callsite, not a valid configuration.",
+                w.dtype, key
+            )));
+        }
+        if w.dtype == DType::MQ4CG256 && (is_gemm_hfq4_key(key) || is_gemm_mq4v2_key(key)) {
+            return Err(DispatchError::Hip(format!(
+                "qt=45 (MQ4CG256) weight (dtype {:?}) routed to incompatible kernel key {:?}: \
+                 mq4c stores one packed fp16 scale/zero dword at [0..4), 4 B pad at [4..8), and \
+                 128 B nibbles at [8..136) (136 B/group). v1/v2 also use 136 B groups but with \
+                 different headers (f32 scale/zero or two fp16 half-grids), so equal stride is \
+                 not interchangeable — a mis-route decodes every group wrong and returns noise \
+                 at full speed with no error.",
+                w.dtype, key
+            )));
+        }
+        if (w.dtype == DType::HFQ4G256 || w.dtype == DType::MQ4G256) && is_gemm_mq4v2_key(key) {
+            return Err(DispatchError::Hip(format!(
+                "v1 weight (dtype {:?}) routed to v2 kernel key {:?}: \
+                 v2 expects fp16 s0/z0/s1/z1 per 128 weights while v1 stores f32 scale/zero per 256. \
+                 Routing a v1 payload through a v2 kernel is equally wrong and silent.",
+                w.dtype, key
+            )));
+        }
+        if (w.dtype == DType::HFQ4G256 || w.dtype == DType::MQ4G256 || w.dtype == DType::MQ4G256V2)
+            && is_gemm_mq4c_key(key)
+        {
+            return Err(DispatchError::Hip(format!(
+                "non-mq4c weight (dtype {:?}) routed to mq4c (qt=45) kernel key {:?}: \
+                 mq4c expects a 136 B group (packed fp16 scale/zero dword + 4 B pad + 128 B \
+                 nibbles) while v1/v2 use different 136 B headers. Equal stride does not make \
+                 the layouts interchangeable — reverse mis-route is equally silent and wrong.",
+                w.dtype, key
+            )));
+        }
         macro_rules! hip {
             ($e:expr) => {
                 $e.map_err(|e| DispatchError::Hip(e.to_string()))
@@ -174,6 +274,25 @@ impl GemmFamily {
             K::GemmF16WmmaMb4 => hip!(gpu.gemm_f16_wmma_mb4(w.buf, x, y, m, k, batch_size)),
             K::GemmF16WmmaMb8 => hip!(gpu.gemm_f16_wmma_mb8(w.buf, x, y, m, k, batch_size)),
             K::GemmF32Batched => hip!(gpu.gemm_f32_batched(w.buf, x, y, m, k, batch_size)),
+            // Pure BF16 x BF16 -> F32. Takes `&DeviceBuffer` rather than the
+            // family's `&GpuTensor` convention, so reach through to the buffers.
+            //
+            // The activation MUST already be BF16. The wrapper only checks that
+            // `B` is large enough (batch*k*2), and an F32 activation buffer is
+            // batch*k*4 bytes — it passes that check and the kernel then reads
+            // F32 bytes as BF16, producing garbage with no diagnostic. Refuse
+            // instead: callers stage to BF16 before dispatching here.
+            K::GemmBf16Mfma => {
+                if x.dtype != DType::BF16 {
+                    return Err(DispatchError::UnsupportedVariant {
+                        family: "gemm",
+                        variant: "bf16_mfma_needs_bf16_activation",
+                        arch: "gfx942",
+                        quant: "",
+                    });
+                }
+                hip!(gpu.gemm_bf16_mfma_gfx942(&w.buf.buf, &x.buf, &y.buf, m, k, batch_size))
+            }
             K::GemmQ8_0WmmaX64 => hip!(gpu.gemm_q8_0_wmma_x64(w.buf, x, y, m, k, batch_size)),
             K::GemmQ8_0ResidualWmma => {
                 hip!(gpu.gemm_q8_0_residual_wmma(w.buf, x, y, m, k, batch_size))
@@ -231,6 +350,20 @@ impl GemmFamily {
             }
             K::GemmQ8_0BatchedWideExact => {
                 hip!(gpu.gemm_q8_0_batched_wide_exact(w.buf, x, y, m, k, batch_size))
+            }
+            K::GemmMq4G256V2 => hip!(gpu.gemm_mq4g256v2(w.buf, x, y, m, k, batch_size)),
+            K::GemmMq4G256V2Residual => {
+                hip!(gpu.gemm_hfq4g256_residual_mq4v2(w.buf, x, y, m, k, batch_size))
+            }
+            K::GemmMq4G256V2BatchedLmhead => {
+                hip!(gpu.gemm_mq4g256v2_batched_lmhead(w.buf, x, y, m, k, batch_size))
+            }
+            K::GemmMq4CG256 => hip!(gpu.gemm_mq4cg256(w.buf, x, y, m, k, batch_size)),
+            K::GemmMq4CG256Residual => {
+                hip!(gpu.gemm_mq4cg256_residual(w.buf, x, y, m, k, batch_size))
+            }
+            K::GemmMq4CG256BatchedLmhead => {
+                hip!(gpu.gemm_mq4cg256_batched_lmhead(w.buf, x, y, m, k, batch_size))
             }
             other => Err(DispatchError::MissingImpl { key: other }),
         }

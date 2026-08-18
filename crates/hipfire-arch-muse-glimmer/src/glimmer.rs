@@ -996,6 +996,10 @@ fn load_f32_vec(hfq: &HfqFile, name: &str, expected_n: usize) -> Result<Vec<f32>
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
+        16 => data
+            .chunks_exact(2)
+            .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+            .collect(),
         qt => {
             return Err(format!(
                 "glimmer: unexpected quant_type {qt} for f32 vec {name}"
@@ -1083,6 +1087,41 @@ fn load_wt(
         let f32_data: Vec<f32> = data
             .chunks_exact(2)
             .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .collect();
+        let buf = gpu
+            .upload_f32(&f32_data, &[m, k])
+            .map_err(|e| format!("glimmer: upload F32 {name}: {e:?}"))?;
+        return Ok(WeightTensor {
+            buf,
+            gpu_dtype: DType::F32,
+            m,
+            k,
+            row_stride: 0,
+            paro: None,
+            awq_scale: None,
+        });
+    }
+    if info.quant_type == 16 {
+        // BF16 teacher: when calibration override is set, keep raw BF16 and tag
+        // DType::BF16 so GemmBf16Mfma can be used; otherwise widen to F32
+        // (byte-identical to today when OFF).
+        if rdna_compute::calib_force_bf16() {
+            let buf = gpu
+                .upload_raw(data, &[data.len()])
+                .map_err(|e| format!("glimmer: upload BF16 {name}: {e:?}"))?;
+            return Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::BF16,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            });
+        }
+        let f32_data: Vec<f32> = data
+            .chunks_exact(2)
+            .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
             .collect();
         let buf = gpu
             .upload_f32(&f32_data, &[m, k])
@@ -1336,6 +1375,21 @@ impl GlimmerWeights {
                 let f32_data: Vec<f32> = embed_data
                     .chunks_exact(4)
                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                let t = match gpu.upload_f32(&f32_data, &[cfg.vocab_size, dim]) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        guard.cleanup(gpu);
+                        return Err(format!("glimmer: upload embed f32: {e:?}"));
+                    }
+                };
+                guard.embed = Some(t);
+                embd_format = EmbeddingFormat::F32;
+            }
+            16 => {
+                let f32_data: Vec<f32> = embed_data
+                    .chunks_exact(2)
+                    .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
                     .collect();
                 let t = match gpu.upload_f32(&f32_data, &[cfg.vocab_size, dim]) {
                     Ok(v) => v,
@@ -1708,6 +1762,10 @@ pub struct GlimmerState {
     /// is a raw DeviceBuffer, but the batched flash kernel takes a GpuTensor of
     /// positions; at batch_size=1 it holds the same value. Lazily allocated.
     pub decode_pos: Option<GpuTensor>,
+    /// BF16 activation staging scratch for calibration GEMMs (HIPFIRE_CALIB_BF16=1).
+    /// Persistent, sized once to 512*hidden_dim (max prefill chunk) BF16, reused
+    /// across all prefill chunks and layers. Lazily allocated; never per-GEMM alloc.
+    pub prefill_bf16_scratch: Option<GpuTensor>,
     /// Optional device-resident DFlash target-hidden ring. `None` keeps the
     /// host-capture path unchanged. Owned here so free/reset stay with target KV.
     pub(crate) target_hidden_log: Option<GlimmerHiddenLog>,
@@ -2118,6 +2176,7 @@ impl GlimmerState {
             argmax_batch,
             prefill_flash_partials: None,
             decode_pos: None,
+            prefill_bf16_scratch: None,
             target_hidden_log: None,
         })
     }

@@ -1,0 +1,42 @@
+[package]
+name = "saddle-quant"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Quantization-quality toolkit: artifact formats, calibration corpora,
+# activation statistics, KLD reference construction/scoring, and reduction.
+#
+# The format layer is deliberately GPU-free and dependency-light so that CI,
+# Python bindings, and any tool can link it. Anything needing a forward pass
+# (teacher oracle, candidate scoring) sits behind the `eval` feature, which is
+# the only thing that pulls hipfire-runtime.
+
+[features]
+default = []
+# Forward-pass-dependent surface: teacher oracle construction + candidate
+# scoring. Pulls the runtime and therefore a GPU toolchain.
+eval = ["dep:hipfire-runtime", "dep:hipfire-config"]
+
+[dependencies]
+half.workspace = true
+memmap2 = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+rayon = "1"
+
+# Chat-template rendering for calibration corpora. Matching the workspace
+# pin in hipfire-runtime so a template renders identically in both.
+minijinja = { version = "2", features = ["loop_controls", "json", "preserve_order"] }
+minijinja-contrib = { version = "2", features = ["pycompat"] }
+
+# CLI only. The library never parses arguments.
+clap = { version = "4.6", features = ["derive"] }
+
+hipfire-runtime = { path = "../hipfire-runtime", default-features = false, optional = true }
+hipfire-config = { path = "../hipfire-config", optional = true }
+
+[dev-dependencies]
+tempfile = "3"

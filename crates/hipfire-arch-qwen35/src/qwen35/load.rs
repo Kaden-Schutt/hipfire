@@ -425,6 +425,76 @@ fn load_weight_tensor_raw(
                 awq_scale: None,
             })
         }
+        44 => {
+            // MQ4-G256 v2 (qt=44): 136 B/group, byte-identical payload to MQ4G256
+            // but per-128 fp16 scale+zero. Validate K%256 and blob length.
+            if k % 256 != 0 {
+                return Err(HipError::new(
+                    0,
+                    &format!("MQ4G256V2 has K={k} but requires K%256==0"),
+                ));
+            }
+            let gpr = k / 256;
+            let expected = m * gpr * 136;
+            if data.len() != expected {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "MQ4G256V2 blob length mismatch: expected {expected}, got {}",
+                        data.len()
+                    ),
+                ));
+            }
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MQ4G256V2,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        45 => {
+            // MQ4C (qt=45), pad layout: 136 B/group — ONE fp16 scale+zero dword at
+            // +0 governing all 256 weights, 4 B of zero padding at +4, and the
+            // 128 B nibble payload at +8, which is byte-for-byte where qt=13 puts
+            // it. Same total size as qt=13; the padding is the deliberate price of
+            // keeping the payload 8-byte aligned.
+            //
+            // Derive the stride from rdna_compute::MQ4C_GROUP_BYTES rather than a
+            // literal. This site previously hardcoded 132 and rejected every valid
+            // file the moment the format moved to 136 — the check was right, the
+            // duplicated constant was not.
+            if k % 256 != 0 {
+                return Err(HipError::new(
+                    0,
+                    &format!("MQ4CG256 has K={k} but requires K%256==0"),
+                ));
+            }
+            let gpr = k / 256;
+            let expected = m * gpr * rdna_compute::MQ4C_GROUP_BYTES;
+            if data.len() != expected {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "MQ4CG256 blob length mismatch: expected {expected}, got {}",
+                        data.len()
+                    ),
+                ));
+            }
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MQ4CG256,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
         38 => {
             // MQ2-G256-GL — 2-bit codes vs the TENSOR-GLOBAL codebook GL_CB2 +
             // per-block fp16 scale. 2.0625 bpw. SoA, TWO regions, no per-group

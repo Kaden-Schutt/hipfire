@@ -406,6 +406,10 @@ fn load_f32_vec(hfq: &HfqFile, name: &str, expected: usize) -> Result<Vec<f32>, 
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect()),
+        16 => Ok(data
+            .chunks_exact(2)
+            .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+            .collect()),
         qt => Err(format!(
             "glimmer drafter: unsupported quant_type {qt} for F32 tensor '{name}'"
         )),
@@ -493,6 +497,24 @@ fn load_wt(
             let buf = gpu
                 .upload_f32(&f32_data, &[m * k])
                 .map_err(|e| format!("glimmer drafter: upload F32 '{name}': {e:?}"))?;
+            WeightTensor {
+                buf,
+                gpu_dtype: DType::F32,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            }
+        }
+        16 => {
+            let f32_data: Vec<f32> = data
+                .chunks_exact(2)
+                .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+                .collect();
+            let buf = gpu
+                .upload_f32(&f32_data, &[m * k])
+                .map_err(|e| format!("glimmer drafter: upload BF16->F32 '{name}': {e:?}"))?;
             WeightTensor {
                 buf,
                 gpu_dtype: DType::F32,

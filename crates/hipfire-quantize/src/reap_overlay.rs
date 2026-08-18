@@ -889,13 +889,6 @@ mod integ {
     use crate::quant_fwht::quantize_hfq4g256;
     use hipfire_reap::plan::ReapPlan;
     use hipfire_runtime::hfq::HfqFile;
-    use std::sync::Mutex;
-
-    // `HfqFile::open` READS the process-global `HIPFIRE_REAP_PLAN` env var on
-    // every call. The end-to-end test below sets it before `open`, so it must
-    // serialize against any other test in this module that calls `open` (none
-    // today, but keep the guard to mirror SP3 T2's hipfire-runtime test).
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     fn plan_layer0_expert0_hfq4(dir: &std::path::Path) -> ReapPlan {
         std::fs::write(
@@ -916,12 +909,6 @@ mod integ {
 
     #[test]
     fn build_overlay_selects_and_byte_matches_then_round_trips() {
-        // This test calls `HfqFile::open`, which reads the process-global
-        // `HIPFIRE_REAP_PLAN`. Serialize against `sp4_overlay_to_sp3_load_end_to_end`
-        // (which sets/removes that env var) so a concurrent set can't leak a stray
-        // overlay into this `open` (was a latent flake before SP4b T2 added tests
-        // that perturbed scheduling).
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let arch = ReapArch::Deepseek4;
         let d = tempfile::tempdir().unwrap();
         let plan = plan_layer0_expert0_hfq4(d.path());
@@ -991,16 +978,13 @@ mod integ {
         );
     }
 
-    /// SP3 Task 3: full SP4-overlay → SP3-load round trip on REAL HFQ
-    /// containers. Build a base (expert + attention tensors, both Q8F16),
-    /// build an overlay that re-quantizes ONLY the expert tensor to HFQ4G256,
-    /// point `HIPFIRE_REAP_PLAN` at the overlay dir, then `HfqFile::open` the
-    /// base and assert: overlay attached, expert resolves to the overlay's
-    /// HFQ4G256 bytes, attention falls through to base Q8F16.
+    /// Full SP4-overlay → SP3-load round trip on real HFQ containers.
+    /// Build a base (expert + attention tensors, both Q8F16), build an overlay
+    /// that re-quantizes only the expert tensor to HFQ4G256, attach it through
+    /// the runtime's production splice API, and assert overlay-first lookup plus
+    /// base fallback. Runtime separately tests process-policy auto-discovery.
     #[test]
     fn sp4_overlay_to_sp3_load_end_to_end() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-
         let exp_name = "layers.0.ffn.experts.0.w1.weight";
         let attn_name = "layers.0.self_attn.q_proj.weight";
         // [2, 256] = 512 f32 (multiple of the 256 group for the HFQ4G256 tier).

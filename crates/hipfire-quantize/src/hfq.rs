@@ -80,6 +80,8 @@ impl QuantType {
             39 => Some(Self::MQ3G256GL),
             40 => Some(Self::TQ2G128),
             41 => Some(Self::BQ1G128),
+            44 => Some(Self::MQ4G256V2),
+            45 => Some(Self::MQ4CG256),
             _ => None,
         }
     }
@@ -176,8 +178,25 @@ pub(crate) enum QuantType {
     // dequant w=(code-1)*d. Byte-identical to GGUF ggml_type Q2_0=42.
     // See findings/prismml-q2_0-layout.md.
     BQ1G128 = 41, // BQ1G128: PrismML Q1_0-compatible scale-only binary, g128, 18 B/blk
-                  // (1.14 bpw). [FP16 d][16B sign bits], bit set for +d.
-                  // Byte-identical to GGUF ggml_type Q1_0=41.
+    // (1.14 bpw). [FP16 d][16B sign bits], bit set for +d.
+    // Byte-identical to GGUF ggml_type Q1_0=41.
+    /// MQ4-G256 v2 (qt=44): FWHT-rotated 4-bit, per-128 asymmetric. 136 B/group,
+    /// byte-identical to qt=13 (MQ4G256) except the 8 header bytes. Payload is
+    /// unchanged: 128 B of 4-bit nibbles at offset 8, lane `t` reading the u32 at
+    /// `8 + 4*t`, covering weights `8t..8t+7`.
+    ///
+    /// Header layout (little-endian, low 16 bits = scale, high 16 bits = zero):
+    ///   [0..2) fp16 scale for half 0 (weights 0-127)
+    ///   [2..4) fp16 zero  for half 0
+    ///   [4..6) fp16 scale for half 1 (weights 128-255)
+    ///   [6..8) fp16 zero  for half 1
+    ///   [8..136) 128 B nibbles, packed exactly as qt=13 (low nibble = even index)
+    MQ4G256V2 = 44,
+    /// MQ4CG256 (qt=45): FWHT-rotated 4-bit, single affine grid per 256, fp16 header, 136 B/group (pad layout).
+    /// Per-group, 136 B stride: `[0..4)` fp16 header, `[4..8)` zero padding, `[8..136)` 128 B nibbles.
+    /// Header is ONE packed dword, low 16 bits fp16 scale, high 16 bits fp16 zero, governing
+    /// all 256 weights (`w = q * f32(scale) + f32(zero)` with scale/zero round-tripped through fp16).
+    MQ4CG256 = 45,
 }
 
 /// Per-tensor precision level assigned by the K-map pre-pass.
@@ -210,6 +229,8 @@ pub(crate) fn default_promote_target(base: GgufFormat) -> GgufFormat {
         GgufFormat::Mq2
         | GgufFormat::Mq3
         | GgufFormat::Mq4
+        | GgufFormat::Mq4V2
+        | GgufFormat::Mq4C
         | GgufFormat::Mq5
         | GgufFormat::Mq6
         | GgufFormat::Mq2Lloyd
@@ -249,11 +270,10 @@ pub(crate) fn is_promote_pair_supported(base: GgufFormat, promote: GgufFormat) -
         (_, Mq2Lloyd | Mq3Lloyd) => false,
 
         // MQ-family upward bit-width (non-Lloyd)
-        (Mq2, Mq3 | Mq4 | Mq5 | Mq6) => true,
-        (Mq3, Mq4 | Mq5 | Mq6) => true,
-        (Mq4, Mq5 | Mq6) => true,
+        (Mq2, Mq3 | Mq4 | Mq4V2 | Mq4C | Mq5 | Mq6) => true,
+        (Mq3, Mq4 | Mq4V2 | Mq4C | Mq5 | Mq6) => true,
+        (Mq4 | Mq4V2 | Mq4C, Mq5 | Mq6) => true,
         (Mq5, Mq6) => true,
-
         // HFQ-family upward bit-width
         (Hfq4, Hfq6) => true,
 

@@ -146,14 +146,27 @@ pub fn mixed_expert_tag(gate_dtype: DType, down_dtype: DType) -> HipResult<u8> {
         ));
     }
     match (gate_dtype, down_dtype) {
-        // Mixed MQ4 gate family (7 pairs)
+        // Mixed MQ4 gate family (7 pairs) — MQ4G256V2 is the same container family
+        // as MQ4G256 for the grouped dispatch, so every gate pair that admits
+        // MQ4 also admits V2 (including the cross V2↔MQ4 uniform gate which
+        // keeps mixed-shard models loadable). The kernel selection is container-aware
+        // via forward_slots::fused_*_key_for, so admitting here never misroutes.
         (DType::MQ4G256, DType::MQ6G256) => Ok(0),
+        (DType::MQ4G256V2, DType::MQ6G256) => Ok(0),
         (DType::MQ4G256, DType::MQ2G256Lloyd) => Ok(1),
+        (DType::MQ4G256V2, DType::MQ2G256Lloyd) => Ok(1),
         (DType::MQ4G256, DType::MQ4G256) => Ok(2),
+        (DType::MQ4G256V2, DType::MQ4G256V2) => Ok(2),
+        (DType::MQ4G256V2, DType::MQ4G256) => Ok(2),
+        (DType::MQ4G256, DType::MQ4G256V2) => Ok(2),
         (DType::MQ4G256, DType::MQ3G256Lloyd) => Ok(3),
+        (DType::MQ4G256V2, DType::MQ3G256Lloyd) => Ok(3),
         (DType::MQ4G256, DType::MFP4G32E8) => Ok(4),
+        (DType::MQ4G256V2, DType::MFP4G32E8) => Ok(4),
         (DType::MQ4G256, DType::MFP3G32E8) => Ok(5),
+        (DType::MQ4G256V2, DType::MFP3G32E8) => Ok(5),
         (DType::MQ4G256, DType::MFP2G32E8) => Ok(6),
+        (DType::MQ4G256V2, DType::MFP2G32E8) => Ok(6),
         // Matching non-MQ4 pairs (6 pairs)
         (DType::MQ6G256, DType::MQ6G256) => Ok(0),
         (DType::MQ2G256Lloyd, DType::MQ2G256Lloyd) => Ok(1),
@@ -177,12 +190,18 @@ pub(crate) fn dtype_from_quant_type(qt: u8) -> HipResult<DType> {
         30 => Ok(DType::MQ4G256Lloyd),
         34 => Ok(DType::MFP4G32E8),
         36 => Ok(DType::MFP3G32E8),
-        37 => Ok(DType::MFP2G32E8),
         38 => Ok(DType::MQ2G256GL),
         39 => Ok(DType::MQ3G256GL),
         40 => Ok(DType::TQ2G128),
         41 => Ok(DType::BQ1G128),
+        44 => Ok(DType::MQ4G256V2),
+        45 => Ok(DType::MQ4CG256),
+        // qt=6 (HFQ4G256) and qt=37 (MFP2G32E8) are shipped formats and MUST stay
+        // mapped here. Dropping an arm from this match is not a compile error — it
+        // degrades to "graded EP: unsupported quant_type", so the loss stays
+        // invisible until a model of that format fails to load.
         6 => Ok(DType::HFQ4G256),
+        37 => Ok(DType::MFP2G32E8),
         3 => Ok(DType::Q8_0),
         1 => Ok(DType::F16),
         2 => Ok(DType::F32),

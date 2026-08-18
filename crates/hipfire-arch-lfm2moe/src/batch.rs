@@ -42,6 +42,12 @@ pub struct Lfm2DecodeBatchState {
     pub logits: GpuTensor,
     pub lm_rot: GpuTensor,
     pub proj_rot: GpuTensor,
+    /// Persistent BF16 staging scratch for MFMA GEMM. Sized once as
+    /// max_batch * max(hidden, intermediate_size) BF16 elements (reused
+    /// for every layer, never per-call allocated). Hoisted where one F32 x
+    /// feeds multiple BF16 projections (attn q/k/v share tmp; FFN w1/w3 share
+    /// ffn_tmp) — staged once per layer then reused.
+    pub bf16_scratch: GpuTensor,
     pub sample_out: GpuTensor,
     pub sample_repeat_tokens: GpuTensor,
     pub sample_repeat_lengths: GpuTensor,
@@ -239,6 +245,28 @@ impl Lfm2DecodeBatchState {
             .checked_mul(max_proj_k)
             .ok_or_else(|| HipError::new(0, "proj_rot size overflow"))?;
         let proj_rot = alloc_zeros!(&[proj_rot_len]);
+        // Persistent BF16 scratch sized identically to proj_rot (max K), BF16 dtype.
+        // Zero-initialised, reused for every BF16 GEMM; never per-call allocated.
+        let bf16_scratch = match gpu.zeros(&[proj_rot_len], DType::BF16) {
+            Ok(t) => {
+                ledger.push(GpuTensor {
+                    buf: unsafe { t.buf.alias() },
+                    shape: t.shape.clone(),
+                    dtype: t.dtype,
+                });
+                t
+            }
+            Err(e) => {
+                for prev in ledger.drain(..) {
+                    let _ = gpu.free_tensor(prev);
+                }
+                for cs in conv_states.drain(..) {
+                    let _ = gpu.free_tensor(cs);
+                }
+                let _ = kv.free_gpu(gpu);
+                return Err(e);
+            }
+        };
         let sample_out = alloc_zeros!(&[max_batch * 2]);
         let sample_repeat_tokens = alloc_zeros!(&[repeat_tokens_len]);
         let sample_repeat_lengths = alloc_zeros!(&[max_batch]);
@@ -268,6 +296,7 @@ impl Lfm2DecodeBatchState {
             logits,
             lm_rot,
             proj_rot,
+            bf16_scratch,
             sample_out,
             sample_repeat_tokens,
             sample_repeat_lengths,
@@ -300,6 +329,7 @@ impl Lfm2DecodeBatchState {
             &self.logits,
             &self.lm_rot,
             &self.proj_rot,
+            &self.bf16_scratch,
             &self.sample_out,
             &self.sample_repeat_tokens,
             &self.sample_repeat_lengths,
@@ -349,6 +379,8 @@ impl Lfm2DecodeBatchState {
         let max_proj_k = hidden.max(cfg.intermediate_size);
         let lane_proj = self.proj_rot.sub_offset(lane * max_proj_k, max_proj_k);
         gpu.hip.memset(&lane_proj.buf, 0, lane_proj.buf.size())?;
+        let lane_bf16 = self.bf16_scratch.sub_offset(lane * max_proj_k, max_proj_k);
+        gpu.hip.memset(&lane_bf16.buf, 0, lane_bf16.buf.size())?;
 
         // also clear x/tmp and attention scratch lane rows to avoid stale residues
         let lane_x = self.x_batch.sub_offset(lane * hidden, hidden);
@@ -392,6 +424,7 @@ impl Lfm2DecodeBatchState {
         let _ = gpu.free_tensor(self.logits);
         let _ = gpu.free_tensor(self.lm_rot);
         let _ = gpu.free_tensor(self.proj_rot);
+        let _ = gpu.free_tensor(self.bf16_scratch);
         let _ = gpu.free_tensor(self.sample_out);
         let _ = gpu.free_tensor(self.sample_repeat_tokens);
         let _ = gpu.free_tensor(self.sample_repeat_lengths);
@@ -484,6 +517,9 @@ impl Lfm2DecodeBatchState {
 
             // embedding into h_lane (reuse same buffer as residual stream)
             match weights.embd_format {
+                hipfire_runtime::llama::EmbeddingFormat::F32 => {
+                    gpu.embedding_lookup(&weights.embed, &h_lane, tok, hidden)?
+                }
                 hipfire_runtime::llama::EmbeddingFormat::Q8_0 => {
                     gpu.embedding_lookup_q8(&weights.embed, &h_lane, tok, hidden)?
                 }

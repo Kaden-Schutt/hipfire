@@ -60,6 +60,8 @@ pub(crate) enum GgufFormat {
     Hfq4,
     Hfq6,
     Mq4,
+    Mq4V2,
+    Mq4C,
     Mq5,
     Mq6,
     Mq3,
@@ -92,13 +94,14 @@ pub(crate) enum GgufFormat {
     /// format — binary weights always take the byte-verbatim passthrough.
     Binary,
 }
-
 impl GgufFormat {
     pub(crate) fn from_flag(flag: &str) -> Option<Self> {
         match flag {
             "hfq4" | "hfq4g256" | "hf4" => Some(Self::Hfq4),
             "hfq6" | "hfq6g256" | "hf6" => Some(Self::Hfq6),
-            "mq4" | "mq4g256" | "magnum" => Some(Self::Mq4),
+            "mq4v1" | "mq4g256" | "magnum" => Some(Self::Mq4),
+            "mq4v2" | "mq4" | "mq4g256v2" => Some(Self::Mq4V2),
+            "mq4c" | "mq4cg256" | "mq4g256c" => Some(Self::Mq4C),
             "mq5" | "mq5g256" => Some(Self::Mq5),
             "mq6" | "mq6g256" => Some(Self::Mq6),
             "mq3" | "mq3g256" => Some(Self::Mq3),
@@ -125,6 +128,8 @@ impl GgufFormat {
             Self::Hfq4 => "HFQ4G256",
             Self::Hfq6 => "HFQ6G256",
             Self::Mq4 => "MQ4G256",
+            Self::Mq4V2 => "MQ4G256V2",
+            Self::Mq4C => "MQ4CG256",
             Self::Mq5 => "MQ5G256",
             Self::Mq6 => "MQ6G256",
             Self::Mq3 => "MQ3G256",
@@ -413,10 +418,14 @@ pub(crate) fn run_gguf_pipeline(
             quant_params += n_elements as u64;
             match format {
                 GgufFormat::Mq4
+                | GgufFormat::Mq4V2
+                | GgufFormat::Mq4C
                 | GgufFormat::Mq3
                 | GgufFormat::Mq2
                 | GgufFormat::Mq2Lloyd
                 | GgufFormat::Mq3Lloyd
+                | GgufFormat::Mq4Lloyd
+                | GgufFormat::Mq5
                 | GgufFormat::Mq6 => {
                     let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
                     (q, QuantType::MQ6G256, 256u32, "MQ6G256")
@@ -476,45 +485,6 @@ pub(crate) fn run_gguf_pipeline(
                     let q = quantize_mfp2g32_e8_2d(&f32_data, m, k, &signs1, &signs2);
                     (q, QuantType::MFP2G32E8, 32u32, "MFP2G32E8")
                 }
-                // Sub-6-bit promote targets: available for `--kmap-promote mq{2,3,4}`
-                // pairings (e.g. MQ2 base + MQ3 promote alternating). Same kernels
-                // as the Base arm below; just dispatched via the promote target.
-                GgufFormat::Mq4 => {
-                    let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ4G256, 256u32, "MQ4G256")
-                }
-                GgufFormat::Mq5 => {
-                    let q = quantize_mq5g256(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ5G256, 256u32, "MQ5G256")
-                }
-                GgufFormat::Mq3 => {
-                    let q = quantize_mq3g256(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ3G256, 256u32, "MQ3G256")
-                }
-                GgufFormat::Mq2 => {
-                    let q = quantize_mq2g256(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ2G256, 256u32, "MQ2G256")
-                }
-                GgufFormat::Mq2Lloyd => {
-                    let q = quantize_mq2g256_lloyd(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ2G256Lloyd, 256u32, "MQ2G256Lloyd")
-                }
-                GgufFormat::Mq3Lloyd => {
-                    let q = quantize_mq3g256_lloyd(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ3G256Lloyd, 256u32, "MQ3G256Lloyd")
-                }
-                GgufFormat::Mq4Lloyd => {
-                    // Promote6 → MQ6, consistent with default_promote_target
-                    // (Mq4Lloyd→Mq6) and its Lloyd siblings Mq2Lloyd/Mq3Lloyd
-                    // (in the first arm). Previously this stayed at MQ4G256Lloyd
-                    // (4-bit) — no actual promotion under --kmap-promote 6.
-                    let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ6G256, 256u32, "MQ6G256")
-                }
-                GgufFormat::Hfq4 => {
-                    let q = quantize_hfq4g256(&f32_data);
-                    (q, QuantType::HFQ4G256, 256u32, "HFQ4G256")
-                }
                 GgufFormat::Ternary => {
                     // Terminal low-bit format — promotion is a no-op.
                     // Direct TQ2G128 semantics: scale-only ternary g128, 34 B/blk (2.125 bpw).
@@ -546,6 +516,18 @@ pub(crate) fn run_gguf_pipeline(
                 GgufFormat::Mq4 => {
                     let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
                     (q, QuantType::MQ4G256, 256u32, "MQ4G256")
+                }
+                GgufFormat::Mq4V2 => {
+                    let m = info.shape[0] as usize;
+                    let k = info.shape[1] as usize;
+                    let q = quantize_mq4g256v2(&f32_data, m, k, &signs1, &signs2);
+                    (q, QuantType::MQ4G256V2, 256u32, "MQ4G256V2")
+                }
+                GgufFormat::Mq4C => {
+                    let m = info.shape[0] as usize;
+                    let k = info.shape[1] as usize;
+                    let q = quantize_mq4cg256(&f32_data, m, k, &signs1, &signs2);
+                    (q, QuantType::MQ4CG256, 256u32, "MQ4CG256")
                 }
                 GgufFormat::Mq5 => {
                     let q = quantize_mq5g256(&f32_data, &signs1, &signs2);
@@ -642,6 +624,18 @@ pub(crate) fn run_gguf_pipeline(
                 GgufFormat::Mq4 => {
                     let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
                     (q, QuantType::MQ4G256, 256u32, "MQ4G256")
+                }
+                GgufFormat::Mq4V2 => {
+                    let m = info.shape[0] as usize;
+                    let k = info.shape[1] as usize;
+                    let q = quantize_mq4g256v2(&f32_data, m, k, &signs1, &signs2);
+                    (q, QuantType::MQ4G256V2, 256u32, "MQ4G256V2")
+                }
+                GgufFormat::Mq4C => {
+                    let m = info.shape[0] as usize;
+                    let k = info.shape[1] as usize;
+                    let q = quantize_mq4cg256(&f32_data, m, k, &signs1, &signs2);
+                    (q, QuantType::MQ4CG256, 256u32, "MQ4CG256")
                 }
                 GgufFormat::Mq5 => {
                     let q = quantize_mq5g256(&f32_data, &signs1, &signs2);

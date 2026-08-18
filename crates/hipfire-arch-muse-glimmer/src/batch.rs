@@ -5,34 +5,41 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Fail-closed gate for batch decode. Only admits weight formats that have
 /// batched GEMM kernels, identical rotation plans within each projection
-/// family, and a Q8_0 lm_head. `max_batch<=64`, `n_heads % n_kv_heads==0`,
+/// family, and a Q8_0/F32/BF16 lm_head. `max_batch<=64`, `n_heads % n_kv_heads==0`,
 /// `head_dim %32==0` are also enforced here so daemon attestation and forward
 /// cannot diverge.
 ///
-/// Batch embedding: HFQ4G256 / HFQ4G128 / Q8_0 only.
-/// Batch projections: Q8_0 / MQ4G256 / HFQ4G256 / MQ6G256 only.
-/// lm_head: Q8_0 only.
+/// Batch embedding: HFQ4G256 / HFQ4G128 / Q8_0 / F32 (F32 via per-token gather loop).
+/// Batch projections: Q8_0 / MQ4G256 / HFQ4G256 / MQ6G256 / F32 / BF16 (BF16 via GemmBf16Mfma on gfx942, F32 via GemmF32Batched).
+/// lm_head: Q8_0 / F32 / BF16 (BF16 via GemmBf16Mfma, F32 via GemmF32Batched).
 pub fn batch_weight_formats_supported(weights: &GlimmerWeights) -> Result<(), String> {
-    // embedding must have a batched lookup kernel
+    // embedding must have a batched lookup kernel or F32 gather loop
     match weights.embd_format {
-        EmbeddingFormat::HFQ4G256 | EmbeddingFormat::HFQ4G128 | EmbeddingFormat::Q8_0 => {}
-        EmbeddingFormat::F32 => {
-            return Err("glimmer batch: F32 embed has no batched lookup kernel".to_string())
-        }
+        EmbeddingFormat::HFQ4G256
+        | EmbeddingFormat::HFQ4G128
+        | EmbeddingFormat::Q8_0
+        | EmbeddingFormat::F32 => {}
         EmbeddingFormat::Q4K => return Err("glimmer batch: Q4K embed unsupported".to_string()),
     }
-    // lm_head must be Q8_0 (the only batched lm_head route that is byte-identical
-    // at width 202048; MQ4 batched path faults at that width, see forward.rs)
-    if weights.lm_head.gpu_dtype != DType::Q8_0 {
+    // lm_head: Q8_0 batched chunked or F32/BF16 batched (GemmF32Batched / GemmBf16Mfma)
+    if weights.lm_head.gpu_dtype != DType::Q8_0
+        && weights.lm_head.gpu_dtype != DType::F32
+        && weights.lm_head.gpu_dtype != DType::BF16
+    {
         return Err(format!(
-            "glimmer batch: lm_head must be Q8_0 for batched decode (got {:?})",
+            "glimmer batch: lm_head must be Q8_0 or F32 or BF16 for batched decode (got {:?})",
             weights.lm_head.gpu_dtype
         ));
     }
     let allowed = |dt: DType| {
         matches!(
             dt,
-            DType::Q8_0 | DType::MQ4G256 | DType::HFQ4G256 | DType::MQ6G256
+            DType::Q8_0
+                | DType::MQ4G256
+                | DType::HFQ4G256
+                | DType::MQ6G256
+                | DType::F32
+                | DType::BF16
         )
     };
     for (i, lw) in weights.layers.iter().enumerate() {
@@ -134,6 +141,10 @@ pub struct GlimmerDecodeBatchState {
     pub sample_rng_states: GpuTensor, // [max_batch] u32-as-f32
     pub positions: GpuTensor,         // [max_batch] i32
     pub tokens: GpuTensor,            // [max_batch] i32
+    // BF16 activation staging for calibration GEMMs (HIPFIRE_CALIB_BF16=1).
+    // Persistent scratch sized once to max_batch*hidden_dim (max K), BF16.
+    // Never per-call alloc; staged via gpu.convert_f32_to_bf16 then GemmBf16Mfma.
+    pub bf16_scratch: GpuTensor, // [max_batch * hidden_dim] BF16
 
     // small neutral buffers for sampling
     pub repeat_dummy: GpuTensor,    // [1] zero
@@ -273,6 +284,21 @@ impl GlimmerDecodeBatchState {
                 }
             };
         }
+        macro_rules! try_alloc_dtype {
+            ($shape:expr, $dtype:expr, $label:expr) => {
+                match gpu.zeros($shape, $dtype) {
+                    Ok(t) => ledger.push(t),
+                    Err(e) => {
+                        for prev in ledger.drain(..) {
+                            let _ = gpu.release_tensor_immediate(prev);
+                        }
+                        let _ = kv_full.free_gpu(gpu);
+                        let _ = kv_sliding.free_gpu(gpu);
+                        return Err(format!("glimmer batch: alloc {}: {e:?}", $label));
+                    }
+                }
+            };
+        }
         try_alloc!(&[max_batch * dim], "x_batch");
         try_alloc!(&[max_batch * dim], "residual_batch");
         try_alloc!(&[max_batch * dim], "tmp_batch");
@@ -296,6 +322,7 @@ impl GlimmerDecodeBatchState {
         try_alloc!(&[max_batch], "sample_rng_states");
         try_alloc!(&[max_batch], "positions");
         try_alloc!(&[max_batch], "tokens");
+        try_alloc_dtype!(&[max_batch * hidden_dim], DType::BF16, "bf16_scratch");
         try_alloc!(&[1], "repeat_dummy");
         try_alloc!(&[cfg.head_dim], "qk_norm_ones");
         try_alloc!(&[dim], "embed_norm_ones");
@@ -324,10 +351,10 @@ impl GlimmerDecodeBatchState {
         let sample_rng_states = it.next().unwrap();
         let positions = it.next().unwrap();
         let tokens = it.next().unwrap();
+        let bf16_scratch = it.next().unwrap();
         let repeat_dummy = it.next().unwrap();
         let qk_norm_ones = it.next().unwrap();
         let embed_norm_ones = it.next().unwrap();
-
         // upload ones
         {
             let ones_hd: Vec<f32> = vec![1.0; cfg.head_dim];
@@ -382,6 +409,7 @@ impl GlimmerDecodeBatchState {
             sample_rng_states,
             positions,
             tokens,
+            bf16_scratch,
             repeat_dummy,
             qk_norm_ones,
             embed_norm_ones,
@@ -420,6 +448,7 @@ impl GlimmerDecodeBatchState {
             &self.sample_rng_states,
             &self.positions,
             &self.tokens,
+            &self.bf16_scratch,
             &self.repeat_dummy,
         ] {
             gpu.hip
@@ -491,6 +520,8 @@ impl GlimmerDecodeBatchState {
         zero_row(gpu, &self.down_rot_batch, self.hidden_dim)?;
         zero_row(gpu, &self.final_hidden, self.dim)?;
         zero_row(gpu, &self.logits, self.vocab_size)?;
+        // bf16_scratch holds BF16 activations — zero the lane's slice (bytes still zero)
+        zero_row(gpu, &self.bf16_scratch, self.hidden_dim)?;
         {
             let v = self.sample_out.sub_offset(lane * 2, 2);
             gpu.hip
@@ -521,6 +552,7 @@ impl GlimmerDecodeBatchState {
     }
 
     /// Consumes self and returns all GPU resources.
+    /// Consumes self and returns all GPU resources.
     pub fn free_gpu(self, gpu: &mut Gpu) {
         let ptrs: Vec<*mut std::ffi::c_void> = [
             &self.x_batch,
@@ -546,6 +578,7 @@ impl GlimmerDecodeBatchState {
             &self.sample_rng_states,
             &self.positions,
             &self.tokens,
+            &self.bf16_scratch,
             &self.repeat_dummy,
             &self.qk_norm_ones,
             &self.embed_norm_ones,
@@ -579,6 +612,7 @@ impl GlimmerDecodeBatchState {
             self.sample_rng_states,
             self.positions,
             self.tokens,
+            self.bf16_scratch,
             self.repeat_dummy,
             self.qk_norm_ones,
             self.embed_norm_ones,
@@ -694,7 +728,12 @@ impl GlimmerDecodeBatchState {
                 EmbeddingFormat::HFQ4G128 => gpu
                     .embedding_lookup_hfq4g128(&weights.embed_tokens, &x_lane, tok, dim)
                     .map_err(|e| format!("glimmer prefill embed hfq4g128: {e:?}"))?,
-                _ => return Err("glimmer prefill: unsupported embed format".to_string()),
+                EmbeddingFormat::F32 => gpu
+                    .embedding_lookup(&weights.embed_tokens, &x_lane, tok, dim)
+                    .map_err(|e| format!("glimmer prefill embed f32: {e:?}"))?,
+                EmbeddingFormat::Q4K => {
+                    return Err("glimmer prefill: unsupported embed format Q4K".to_string())
+                }
             }
             // scale-less embed_norm (treat ABI env as off for prefill parity)
             gpu.rmsnorm_f32(&x_lane, &self.embed_norm_ones, &x_lane, rms_eps)

@@ -32,7 +32,7 @@
 #
 # Format:  <crate>  <status>  <bypass>  <registry>  [note]
 
-hipfire-arch-qwen35        partial   118   189   migrate last; dual system, highest reconciliation cost
+hipfire-arch-qwen35        partial   117   189   migrate last; dual system, highest reconciliation cost
 hipfire-arch-deepseek4     debt       19     0   cheapest full conversion; no registry use to reconcile
 hipfire-arch-gemma4        partial    17     4
 hipfire-arch-lfm2moe       debt       17     0   cheapest full conversion; no registry use to reconcile

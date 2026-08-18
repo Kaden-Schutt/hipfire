@@ -86,6 +86,8 @@ struct MainQuantFlags {
     use_mq4_mqlloyd_antirez_gptq: bool,
     use_mq4_mqlloyd_tiered: bool,
     use_mq4g256: bool,
+    use_mq4v2: bool,
+    use_mq4c: bool,
     use_mq4g256_lloyd: bool,
     use_mq5g256: bool,
     use_mq6g256: bool,
@@ -234,7 +236,9 @@ pub(crate) fn run() {
     // not 8-bit. Routed experts stay MQ2-Lloyd (no precision-upgrade option
     // available without a new MoE GEMV kernel).
     let use_mtp_precise = format == "deepseek4-mtp-precise";
-    let use_mq4g256 = format == "mq4" || format == "mq4g256" || format == "magnum";
+    let use_mq4g256 = format == "mq4v1" || format == "mq4g256" || format == "magnum";
+    let use_mq4v2 = format == "mq4v2" || format == "mq4" || format == "mq4g256v2";
+    let use_mq4c = format == "mq4c" || format == "mq4cg256" || format == "mq4g256c";
     let use_hfq4g256 = format == "hfq4g256" || format == "hfq4" || format == "hf4";
     let use_hfq3g256 = format == "hfq3g256";
     let use_hfq3g128 = format == "hfq3g128" || format == "hfq3" || format == "hf3"; // default HF3 = G128
@@ -1899,6 +1903,8 @@ pub(crate) fn run() {
         if try_handle_lfm2moe(
             is_lfm2moe,
             use_mq4g256,
+            use_mq4v2,
+            use_mq4c,
             name,
             meta,
             raw_data,
@@ -2540,6 +2546,8 @@ pub(crate) fn run() {
                 use_mq4_mqlloyd_antirez_gptq: use_mq4_mqlloyd_antirez_gptq,
                 use_mq4_mqlloyd_tiered: use_mq4_mqlloyd_tiered,
                 use_mq4g256: use_mq4g256,
+                use_mq4v2: use_mq4v2,
+                use_mq4c: use_mq4c,
                 use_mq4g256_lloyd: use_mq4g256_lloyd,
                 use_mq5g256: use_mq5g256,
                 use_mq6g256: use_mq6g256,
@@ -3092,6 +3100,8 @@ fn run_qwen3_dspark(args: &QuantizeArgs) {
 fn try_handle_lfm2moe(
     is_lfm2moe: bool,
     use_mq4g256: bool,
+    use_mq4v2: bool,
+    use_mq4c: bool,
     name: &str,
     meta: &TensorMeta,
     raw_data: &[u8],
@@ -3186,7 +3196,7 @@ fn try_handle_lfm2moe(
         // (model.embed_tokens.weight), the router gate, norms, and the depthwise
         // conv filter at Q8/F32 (small + precision-sensitive). Default (no mq4
         // format) keeps the full-precision Q8 bring-up recipe.
-        if use_mq4g256
+        if (use_mq4g256 || use_mq4v2 || use_mq4c)
             && meta.shape.len() == 2
             && meta.shape[1] % 256 == 0
             && !name.ends_with("embed_tokens.weight")
@@ -3204,10 +3214,23 @@ fn try_handle_lfm2moe(
             );
             let signs1 = gen_fwht_signs(42, 256);
             let signs2 = gen_fwht_signs(1042, 256);
-            let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
+            let (q, qt, label) = if use_mq4c {
+                let m = meta.shape[0];
+                let k = meta.shape[1];
+                let qq = quantize_mq4cg256(&f32_data, m, k, &signs1, &signs2);
+                (qq, QuantType::MQ4CG256, "MQ4C-LFM")
+            } else if use_mq4v2 {
+                let m = meta.shape[0];
+                let k = meta.shape[1];
+                let qq = quantize_mq4g256v2(&f32_data, m, k, &signs1, &signs2);
+                (qq, QuantType::MQ4G256V2, "MQ4V2-LFM")
+            } else {
+                let qq = quantize_mq4g256(&f32_data, &signs1, &signs2);
+                (qq, QuantType::MQ4G256, "MQ4-LFM")
+            };
             eprintln!(
                 "  {:>8}: {} {:?} ({:.1} KB → {:.1} KB)",
-                "MQ4-LFM",
+                label,
                 name,
                 meta.shape,
                 raw_data.len() as f64 / 1024.0,
@@ -3215,7 +3238,7 @@ fn try_handle_lfm2moe(
             );
             hfq_tensors.push(HfqTensor {
                 name: name.to_string(),
-                quant_type: QuantType::MQ4G256,
+                quant_type: qt,
                 shape,
                 group_size: 256,
                 data: q,
@@ -4485,9 +4508,7 @@ fn handle_moe_expert_3d(
     if let Some(s) = spill.as_mut() {
         maybe_spill(hfq_tensors, s, 2 * 1024 * 1024 * 1024); // 2 GB threshold
     }
-    return true;
-
-    false
+    true
 }
 
 fn handle_main_quant(
@@ -4597,6 +4618,8 @@ fn handle_main_quant(
                     n_elements
                 };
                 if (flags.use_mq4g256
+                    || flags.use_mq4v2
+                    || flags.use_mq4c
                     || flags.use_mq4_mq6exp
                     || flags.use_mq4_mq2lloydexp
                     || flags.use_mq4_mq2glexp
@@ -4694,6 +4717,52 @@ fn handle_main_quant(
                                 quantize_mq4g256(&f32_data, &signs1, &signs2)
                             };
                             (q, QuantType::MQ4G256, 256u32, "MQ4G256")
+                        }
+                        GgufFormat::Mq4V2 => {
+                            let q = if let (Some(alpha), Some(im_weights)) =
+                                (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
+                            {
+                                if awq_eligible(name) {
+                                    let scales = compute_awq_scales(im_weights, alpha);
+                                    awq_sidecar_scales = Some(scales.clone());
+                                    let m_dim = meta.shape[0];
+                                    let mut scaled = f32_data.clone();
+                                    awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
+                                    quantize_mq4g256v2(&scaled, m_dim, k_dim, &signs1, &signs2)
+                                } else {
+                                    let m = meta.shape[0];
+                                    let k = k_dim;
+                                    quantize_mq4g256v2(&f32_data, m, k, &signs1, &signs2)
+                                }
+                            } else {
+                                let m = meta.shape[0];
+                                let k = k_dim;
+                                quantize_mq4g256v2(&f32_data, m, k, &signs1, &signs2)
+                            };
+                            (q, QuantType::MQ4G256V2, 256u32, "MQ4G256V2")
+                        }
+                        GgufFormat::Mq4C => {
+                            let q = if let (Some(alpha), Some(im_weights)) =
+                                (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
+                            {
+                                if awq_eligible(name) {
+                                    let scales = compute_awq_scales(im_weights, alpha);
+                                    awq_sidecar_scales = Some(scales.clone());
+                                    let m_dim = meta.shape[0];
+                                    let mut scaled = f32_data.clone();
+                                    awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
+                                    quantize_mq4cg256(&scaled, m_dim, k_dim, &signs1, &signs2)
+                                } else {
+                                    let m = meta.shape[0];
+                                    let k = k_dim;
+                                    quantize_mq4cg256(&f32_data, m, k, &signs1, &signs2)
+                                }
+                            } else {
+                                let m = meta.shape[0];
+                                let k = k_dim;
+                                quantize_mq4cg256(&f32_data, m, k, &signs1, &signs2)
+                            };
+                            (q, QuantType::MQ4CG256, 256u32, "MQ4CG256")
                         }
                         GgufFormat::Mq5 => {
                             // MQ5 + AWQ on lm_head: MQ5G256 is in
@@ -4997,6 +5066,8 @@ fn handle_main_quant(
                         }
                     }
                 } else if (flags.use_mq4g256
+                    || flags.use_mq4v2
+                    || flags.use_mq4c
                     || flags.use_mq4_mq6exp
                     || flags.use_mq4_mq2lloydexp
                     || flags.use_mq4_mq2glexp
@@ -5084,8 +5155,75 @@ fn handle_main_quant(
                         let q = quantize_hfq4g128(&f32_data);
                         (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                     }
+                } else if flags.use_mq4v2 {
+                    let k_dim = if meta.shape.len() == 2 {
+                        meta.shape[1]
+                    } else {
+                        n_elements
+                    };
+                    if k_dim % 256 == 0 {
+                        let signs1 = gen_fwht_signs(42, 256);
+                        let signs2 = gen_fwht_signs(1042, 256);
+                        let q = if let (Some(alpha), Some(im_weights)) =
+                            (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
+                        {
+                            if awq_eligible(name) {
+                                let scales = compute_awq_scales(im_weights, alpha);
+                                awq_sidecar_scales = Some(scales.clone());
+                                let m_dim = meta.shape[0];
+                                let mut scaled = f32_data.clone();
+                                awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
+                                quantize_mq4g256v2(&scaled, m_dim, k_dim, &signs1, &signs2)
+                            } else {
+                                let m_dim = meta.shape[0];
+                                let k = k_dim;
+                                quantize_mq4g256v2(&f32_data, m_dim, k, &signs1, &signs2)
+                            }
+                        } else {
+                            let m_dim = meta.shape[0];
+                            let k = k_dim;
+                            quantize_mq4g256v2(&f32_data, m_dim, k, &signs1, &signs2)
+                        };
+                        (q, QuantType::MQ4G256V2, 256u32, "MQ4G256V2")
+                    } else {
+                        let q = quantize_hfq4g128(&f32_data);
+                        (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                    }
+                } else if flags.use_mq4c {
+                    let k_dim = if meta.shape.len() == 2 {
+                        meta.shape[1]
+                    } else {
+                        n_elements
+                    };
+                    if k_dim % 256 == 0 {
+                        let signs1 = gen_fwht_signs(42, 256);
+                        let signs2 = gen_fwht_signs(1042, 256);
+                        let q = if let (Some(alpha), Some(im_weights)) =
+                            (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
+                        {
+                            if awq_eligible(name) {
+                                let scales = compute_awq_scales(im_weights, alpha);
+                                awq_sidecar_scales = Some(scales.clone());
+                                let m_dim = meta.shape[0];
+                                let mut scaled = f32_data.clone();
+                                awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
+                                quantize_mq4cg256(&scaled, m_dim, k_dim, &signs1, &signs2)
+                            } else {
+                                let m_dim = meta.shape[0];
+                                let k = k_dim;
+                                quantize_mq4cg256(&f32_data, m_dim, k, &signs1, &signs2)
+                            }
+                        } else {
+                            let m_dim = meta.shape[0];
+                            let k = k_dim;
+                            quantize_mq4cg256(&f32_data, m_dim, k, &signs1, &signs2)
+                        };
+                        (q, QuantType::MQ4CG256, 256u32, "MQ4CG256")
+                    } else {
+                        let q = quantize_hfq4g128(&f32_data);
+                        (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                    }
                 } else if flags.use_hfp4 && is_embed {
-                    // HFP4 embeddings stay Q8F16 (matches MQ4 / HFQ4 pattern — embedding lookup is
                     // accuracy-sensitive, FP4 codes too lossy for vocab-sized tables).
                     let q = quantize_q8f16(&f32_data);
                     (q, QuantType::Q8F16, 32u32, "Q8_F16")
@@ -5609,6 +5747,38 @@ fn handle_main_quant(
                     (q, QuantType::Q4F16G64, 64u32, "Q4_F16")
                 }
             }; // end K-map outer if-else
+               // Regression guard: Q4F16G64 is legacy fallback — fail loudly unless explicitly requested.
+            if qt == QuantType::Q4F16G64 {
+                let is_q4_opt_in = flags.use_q4k_all || flags.use_q4k_q8embed || flags.use_mixed;
+                if !is_q4_opt_in
+                    && (flags.use_mq4g256
+                        || flags.use_mq4v2
+                        || flags.use_mq4c
+                        || flags.use_mq5g256
+                        || flags.use_mq6g256)
+                {
+                    let k_dim_dbg = if meta.shape.len() == 2 {
+                        meta.shape[1]
+                    } else {
+                        n_elements
+                    };
+                    eprintln!(
+                            "error: tensor '{}' fell through to QuantType::Q4F16G64 (qt=0, G64 \
+                             legacy fallback) with mq4 family flags: use_mq4v2={} use_mq4g256={} use_mq4c={}.\n  \
+                             shape={:?} k_dim={} k%256={} kmap_level={:?} is_embed={}",
+                            name,
+                            flags.use_mq4v2,
+                            flags.use_mq4g256,
+                            flags.use_mq4c,
+                            meta.shape,
+                            k_dim_dbg,
+                            k_dim_dbg % 256,
+                            kmap_level,
+                            name.contains("embed_tokens"),
+                        );
+                    std::process::exit(1);
+                }
+            }
 
             // Compute quantization error (skip for Q8 embeddings — always negligible)
             let block_size = gs as usize;
