@@ -93,3 +93,54 @@ cannot merge with the nibble load, and the resulting schedule needs 4 more regis
   in a fresh process.
 - Says nothing about whether v1.5 is worth shipping: that still needs the other 12
   translation units, and v1.5 remains unscoreable for KLD until they exist.
+
+---
+
+## Amendment — `__launch_bounds__` is advisory; the 540-file worry is NOT supported
+
+The original record implied that kernels shipping an aggressive `__launch_bounds__`
+second argument (155 at `(32, 16)`, 57 at `(32, 20)`, out of 540 files carrying one)
+might be silently pessimized the same way the explicit VGPR cap pessimized v1.5.
+**Measured, that does not hold**, and the distinction matters:
+
+v1's own shipping residual GEMV, second argument varied, same harness:
+
+| v1 arm | VGPR | occ | µs (med) | GB/s |
+|---|---|---|---|---|
+| `(32, 32)` — shipped | 93 | 16 | 15.61 | 891.9 |
+| `(32, 20)` | 93 | 16 | 15.71 | 886.2 |
+| `(32, 16)` | 96 | 16 | **16.34** | 852.4 |
+| `(32, 8)` | 93 | 16 | 15.46 | 900.6 |
+| `(32, 4)` | 93 | 16 | 15.61 | 891.9 |
+| `(32, 2)` | 93 | 16 | **15.37** | 906.2 |
+| `(32, 1)` | 93 | 16 | 15.48 | 899.5 |
+
+Best-to-worst spread is 6.3%, the shipped value is within 1.5% of the best, and the
+apparent optimum `(32, 2)` is inside run-to-run noise. So the shipped setting is
+already fine and there is no broad win waiting in those 540 files.
+
+**Two different levers, conflated in the original record:**
+
+| lever | nature | observed |
+|---|---|---|
+| `__launch_bounds__(32, N)` | **advisory.** The compiler emitted 93 VGPR / occupancy 16 for every N tried; it perturbs the schedule but does not force a register budget. When it cannot meet the request it warns and proceeds. | ≤6% spread |
+| `__attribute__((amdgpu_num_vgpr(N)))` | **hard cap.** Forces either spilling (96, 88) or a scheduler re-plan (84 and below). | up to **1.28×** slower |
+
+Only the hard cap is dangerous, and the tree contains exactly one — the sweepable one
+added with this kernel, defaulting to 0/off.
+
+Worth keeping from the original finding: all seven `__launch_bounds__` variants
+produce **distinct code objects** even though VGPR count and occupancy are identical
+across them. Static resource metrics do not uniquely determine the schedule, so
+"same VGPR, same occupancy" is not evidence of "same kernel" — but here the resulting
+throughput differences are small.
+
+The load-bearing conclusions are unchanged:
+
+1. The fastest configuration of the v1.5 kernel is the one with occupancy **12**, not 16.
+2. At **fixed** occupancy 16, throughput still varies 1.04×–1.28× with register count
+   alone (cap 76 vs cap 64), which isolates memory-level parallelism rather than wave
+   count as the operative variable.
+3. v1.5 uncapped beats v1 by 6.6% here (14.46 vs 15.61 µs), reproducing the 8.1%
+   measured in the first sweep — both well past the 2.9% floor implied by weight
+   traffic alone.

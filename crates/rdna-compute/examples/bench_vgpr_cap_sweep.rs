@@ -88,7 +88,7 @@ const CAPS: &[u32] = &[0, 96, 84, 80, 76, 72, 64];
 
 const WARMUP: usize = 64;
 const ITERS: usize = 200;
-const RUNS: usize = 7;
+const RUNS: usize = 3;
 
 fn prng(i: usize, salt: u32) -> f32 {
     let x = (i as u32)
@@ -158,11 +158,9 @@ fn main() {
     // ── build one module per arm, each with a DISTINCT entry symbol ──
     // `launch_kernel_blob` resolves by function name against a flat map, so two
     // modules exporting the same symbol would collide.
-    let mut arms: Vec<(String, &'static rdna_compute::GpuTensor)> = Vec::new();
-    let _ = &arms;
     let mut names: Vec<String> = Vec::new();
 
-    // v1 control.
+    // v1 control, shipped as-is.
     let v1_sym = "bench_v1_residual".to_string();
     let v1_src = format!(
         "#define HIPFIRE_RESIDUAL_KERNEL {v1_sym}\n{}",
@@ -171,6 +169,26 @@ fn main() {
     match gpu.ensure_kernel_public(&format!("bench_{v1_sym}"), &v1_src, &v1_sym) {
         Ok(()) => names.push(v1_sym.clone()),
         Err(e) => eprintln!("v1 control failed to compile: {e}"),
+    }
+
+    // v1 with its occupancy REQUEST varied. On gfx12 the active line is
+    // `__launch_bounds__(32, 32)`. Every value below yields the same 93 VGPR and
+    // the same occupancy 16, yet all seven produce DISTINCT code objects — the
+    // scheduler reorders even when the register count is unchanged. Static metrics
+    // therefore cannot tell us whether the second argument matters; only this can.
+    // 155 kernels in this tree ship `(32, 16)` and 57 ship `(32, 20)`, so if the
+    // second argument moves throughput at fixed registers, that is a broad lever.
+    for lb in [20u32, 16, 8, 4, 2, 1] {
+        let sym = format!("bench_v1_lb{lb}");
+        let patched = V1_RESIDUAL.replace(
+            "__launch_bounds__(32, 32)",
+            &format!("__launch_bounds__(32, {lb})"),
+        );
+        let src = format!("#define HIPFIRE_RESIDUAL_KERNEL {sym}\n{CACHE_POLICY}{patched}");
+        match gpu.ensure_kernel_public(&format!("bench_{sym}"), &src, &sym) {
+            Ok(()) => names.push(sym),
+            Err(e) => eprintln!("v1 lb{lb} failed to compile: {e}"),
+        }
     }
 
     // v1.5 at each cap.
