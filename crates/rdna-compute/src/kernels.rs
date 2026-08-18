@@ -1637,6 +1637,16 @@ pub const GEMV_MQ4G256V2_RESIDUAL_SRC: &str = concat!(
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/gemv_mq4g256v2_residual.hip")
 );
+/// MQ4C / v1.5 (qt=45) residual GEMV: per-256 affine like qt=13, but the header is
+/// one fp16 pair instead of two f32s, so the group is 132 B and the payload starts
+/// at +4. Mirrors the v1 constant's concat exactly so both compile under the same
+/// gfx12 weight-cache policy — otherwise a v1-vs-v1.5 comparison measures the
+/// policy difference rather than the header change.
+pub const GEMV_MQ4CG256_RESIDUAL_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_mq4cg256_residual.hip")
+);
 /// Radiowave gfx1151 probe: preserve the generic dual-row arithmetic while
 /// lowering the weight stream to temporal raw-buffer loads. gfx1151 is not in
 /// the gfx1100 dGPU admission set, so this remains inert unless the exact-arch
