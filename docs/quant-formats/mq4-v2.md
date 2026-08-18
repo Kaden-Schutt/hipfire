@@ -236,6 +236,28 @@ Requires `#include <hip/hip_fp16.h>`. Both offsets must stay as written — chan
 lane-dependent address (`gp + (tid<16 ? 0 : 4)`) converts two scalar loads into a vector load
 and loses the whole point.
 
+### The half select is layout-derived, NOT a lane test
+
+**Do not assume `(tid < 16)`.** The correct predicate is: *is this weight's byte offset within
+the 128 B payload below 64?* Half 0 is weights 0–127 = payload bytes 0–63. Derive it from the
+kernel's own nibble address expression, never from the lane id.
+
+Measured across the 11 ported kernels, three distinct forms occur:
+
+| predicate | sites | where | derivation |
+|---|---|---|---|
+| `tid < 16` | 34 | decode: `fused_qkv/qkvza/gate_up`, `gemv_hfq4g256_residual` | nibbles at `gp + 8 + tid*4`, so lane `t` owns bytes `4t..4t+3`; `4t < 64` ⇔ `t < 16` |
+| `kt < 8` | 8 | WMMA GEMM main + BT bodies | nibbles at `gp + 8 + kt*8 + k_grp*4` with `k_grp = tid>>4 ∈ {0,1}`; `kt*8 + 4 < 64` ⇔ `kt < 8` for both `k_grp` |
+| `quarter_in_group < 2` | 2 | WMMA `ldsstage` bodies | nibbles at `gp + 8 + quarter*32 + {0,8,16,24} + k_grp*4`; max offset at `quarter=1` is 60 < 64 |
+
+In the WMMA main path the loop steps `kt += 4` over tiles `kt..kt+3`, so all four tiles in one
+body share a half (kt=0,4 → half 0; kt=8,12 → half 1) and one select per body suffices.
+
+A wrong predicate here **compiles, runs, and silently applies the wrong scale to half of every
+tensor**. It is the single highest-risk detail in the port. For any kernel not in the 11, redo
+this derivation from its own addressing rather than copying a form from this table. `<HALF>`
+being "16 on wave32, 32 on wave64" is only true for the `tid`-indexed decode form.
+
 **Net cost:** one `v_cndmask` plus two `v_cvt_f32_f16` per group per row.
 
 For wave64 kernels the split is lanes 0–31 / 32–63 by the same contiguity argument, but this
