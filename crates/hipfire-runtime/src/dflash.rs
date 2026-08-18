@@ -749,15 +749,15 @@ pub struct DflashScratch {
     pub max_ctx_len: usize,
 
     // Block-sized activations (B rows).
-    pub x: GpuTensor,             // [B, hidden] — hidden state rolled across layers
-    pub x_norm: GpuTensor,        // [B, hidden]
-    pub q: GpuTensor,             // [B, q_dim]
-    pub k_noise: GpuTensor,       // [B, kv_dim]
-    pub v_noise: GpuTensor,       // [B, kv_dim]
-    pub gate: GpuTensor,          // [B, intermediate]
-    pub up: GpuTensor,            // [B, intermediate]
-    pub gate_up: GpuTensor,       // [B, intermediate]
-    pub attn_out: GpuTensor,      // [B, q_dim]
+    pub x: GpuTensor,        // [B, hidden] — hidden state rolled across layers
+    pub x_norm: GpuTensor,   // [B, hidden]
+    pub q: GpuTensor,        // [B, q_dim]
+    pub k_noise: GpuTensor,  // [B, kv_dim]
+    pub v_noise: GpuTensor,  // [B, kv_dim]
+    pub gate: GpuTensor,     // [B, intermediate]
+    pub up: GpuTensor,       // [B, intermediate]
+    pub gate_up: GpuTensor,  // [B, intermediate]
+    pub attn_out: GpuTensor, // [B, q_dim]
     /// Shared residual plane. Attention and FFN consume it sequentially,
     /// including under the per-layer FFN graph, so separate planes only pin
     /// another B×hidden allocation without enabling overlap.
@@ -788,9 +788,9 @@ pub struct DflashScratch {
     // rebuild_after_eviction / reset); raw poking is no longer possible.
     pub thlog: TargetHiddenLog,
 
-    /// Per-layer cache of `k_ctx` and `v_ctx` (post-GEMM-of-target_hidden_proj,
-    /// K additionally post-RMSNorm-via-k_norm, both pre-RoPE). Filled
-    /// incrementally as draft_forward sees new target_hidden rows.
+    /// Per-layer cache of `k_ctx` and `v_ctx` (post-GEMM-of-target_hidden_proj;
+    /// K additionally post-RMSNorm and post-RoPE). Filled incrementally as
+    /// draft_forward sees new target_hidden rows.
     ///
     /// The win: without this cache, each `draft_forward` call re-ran 2
     /// big GEMMs per layer over ALL L context rows, even though only the
@@ -804,9 +804,11 @@ pub struct DflashScratch {
     ///
     /// Shapes: each entry is `[max_ctx, kv_dim]` f32.
     /// The valid extent of these caches (rows `[0..thlog.proj_cached_rows())`
-    /// have finished fc + hidden_norm projection, per-layer wk/wv GEMMs, and
-    /// k_norm; still pre-RoPE). Tracked by `thlog` so it stays consistent with
-    /// the upload watermark.
+    /// have finished fc + hidden_norm projection, per-layer wk/wv GEMMs,
+    /// k_norm, and K RoPE). Tracked by `thlog` so it stays consistent with the
+    /// upload watermark. Caching post-RoPE is important: absolute positions of
+    /// committed rows do not change, so re-rotating the full historical K span
+    /// every speculative cycle is redundant O(context × layers) work.
     pub k_ctx_cached: Vec<GpuTensor>,
     pub v_ctx_cached: Vec<GpuTensor>,
 
@@ -1399,7 +1401,7 @@ pub const SEED_BACKFILL_CHUNK: usize = 512;
 ///
 /// No-op in Legacy mode or when `prompt_len <= swa_w`. Sets the thlog
 /// full-layer watermark to `prompt_len` so the forward's lazy fill resumes
-/// from the window edge. All GEMMs/norms are row-local: chunked ==
+/// from the window edge. GEMMs, norms, and RoPE are row-local: chunked ==
 /// monolithic bit-exactly.
 pub fn draft_seed_backfill(
     gpu: &mut Gpu,
@@ -1494,6 +1496,23 @@ pub fn draft_seed_backfill(
                     hd,
                     eps,
                 )?;
+                // The steady-state cache stores post-RoPE K, so cold-seed
+                // backfill must establish the same invariant. Prompt rows are
+                // contiguous absolute positions here; upload just this chunk's
+                // position vector into the reusable device buffer.
+                let positions: Vec<i32> = (r2..r2 + step).map(|p| p as i32).collect();
+                upload_slice_i32(gpu, &scratch.positions_k, &positions)?;
+                let positions_view = scratch.positions_k.sub_offset(0, step);
+                gpu.rope_batched_f32(
+                    &scratch.q, // ignored because n_heads_q = 0
+                    &k_slot,
+                    &positions_view,
+                    0,
+                    cfg.n_kv_heads,
+                    hd,
+                    cfg.rope_theta,
+                    step,
+                )?;
                 r2 += step;
             }
         }
@@ -1578,7 +1597,6 @@ pub fn draft_forward_opts(
     let tot = l + b;
     let h = cfg.hidden;
     let ne = cfg.num_extract();
-    let qd = cfg.q_dim();
     let kvd = cfg.kv_dim();
     let hd = cfg.head_dim;
     let eps = cfg.norm_eps;
@@ -1747,7 +1765,7 @@ pub fn draft_forward_opts(
     let fc_start = cached_rows.max(l.saturating_sub(swa_w));
     let delta = l.saturating_sub(fc_start);
     if delta > 0 {
-        for (row0, slot0, len) in ring_segments(fc_start, l, swa_w) {
+        for (_row0, slot0, len) in ring_segments(fc_start, l, swa_w) {
             let th_slice = scratch
                 .target_hidden
                 .sub_offset(slot0 * ne * h, len * ne * h);
@@ -1840,7 +1858,7 @@ pub fn draft_forward_opts(
         // accepted-context rows of target_hidden_proj. INCREMENTAL PATH:
         // only rows past the layer's fill watermark need projection; earlier
         // rows were projected in a prior call and stored in the per-layer
-        // k_ctx_cached / v_ctx_cached buffers (post-k_norm for K).
+        // k_ctx_cached / v_ctx_cached buffers (post-k_norm + post-RoPE for K).
         //
         // Windowed spans: SWA layers read the last `swa_w` context rows, the
         // last (full-attention) layer the last `full_w`. Each cache is a ring
@@ -1935,6 +1953,22 @@ pub fn draft_forward_opts(
                     hd,
                     eps,
                 )?;
+                // Cache K in its final, absolute-position RoPE domain. The
+                // positions buffer holds the live context suffix starting at
+                // pos_base in windowed mode and the full sequence in Legacy.
+                // RoPE is elementwise, so rotating this delta now is bitwise
+                // equivalent to rotating the same rows after concatenation.
+                let fill_positions = scratch.positions_k.sub_offset(row - pos_base, step);
+                gpu.rope_batched_f32(
+                    &scratch.q, // ignored because n_heads_q = 0
+                    &k_slot,
+                    &fill_positions,
+                    0,
+                    cfg.n_kv_heads,
+                    hd,
+                    theta,
+                    step,
+                )?;
                 row += step;
             }
         }
@@ -1949,10 +1983,41 @@ pub fn draft_forward_opts(
             None
         };
 
-        // Concat K = [K_ctx ring span | K_noise] → k_cat [span + B, kv_dim].
-        // The cached K prefix is already post-k_norm (applied incrementally
-        // above); the noise tail still needs k_norm applied below. Ring
-        // segments assemble in absolute-row order; Legacy = one segment.
+        // Per-head RMSNorm on Q: each of B*n_heads rows, size head_dim,
+        // weight [head_dim].
+        gpu.rmsnorm_batched(
+            &scratch.q,
+            &layer.q_norm,
+            &scratch.q,
+            b * cfg.n_heads,
+            hd,
+            eps,
+        )?;
+        // Normalize and rotate the B-row noise K before concatenation. Q and
+        // noise K share the same absolute block positions, so one RoPE launch
+        // handles both. Historical context K is already post-RoPE in its cache.
+        gpu.rmsnorm_batched(
+            &scratch.k_noise,
+            &layer.k_norm,
+            &scratch.k_noise,
+            b * cfg.n_kv_heads,
+            hd,
+            eps,
+        )?;
+        gpu.rope_batched_f32(
+            &scratch.q,
+            &scratch.k_noise,
+            &scratch.positions_q, // [B]
+            cfg.n_heads,
+            cfg.n_kv_heads,
+            hd,
+            theta,
+            b,
+        )?;
+
+        // Concat finalized K = [post-RoPE context ring | post-RoPE noise]
+        // and V = [context ring | noise]. Ring segments assemble in absolute
+        // row order; Legacy is one segment.
         let noise_bytes = (b * kvd) * 4;
         let mut cat_off = 0usize;
         for (_row0, slot0, len) in ring_segments(span_start, l, layer_w) {
@@ -1977,66 +2042,6 @@ pub fn draft_forward_opts(
             .memcpy_dtod_at(&k_cat_l.buf, cat_off, &scratch.k_noise.buf, 0, noise_bytes)?;
         gpu.hip
             .memcpy_dtod_at(&v_cat_l.buf, cat_off, &scratch.v_noise.buf, 0, noise_bytes)?;
-
-        // Per-head RMSNorm on Q: each of B*n_heads rows, size head_dim,
-        // weight [head_dim].
-        gpu.rmsnorm_batched(
-            &scratch.q,
-            &layer.q_norm,
-            &scratch.q,
-            b * cfg.n_heads,
-            hd,
-            eps,
-        )?;
-        // Per-head RMSNorm on the NOISE tail of K_cat only — the cached
-        // prefix was already normed when it was inserted into the layer's
-        // k_ctx_cached. batch = B × n_kv_heads, applied to the last B rows
-        // of k_cat.
-        {
-            let noise_slot = k_cat_l.sub_offset(span * kvd, b * kvd);
-            gpu.rmsnorm_batched(
-                &noise_slot,
-                &layer.k_norm,
-                &noise_slot,
-                b * cfg.n_kv_heads,
-                hd,
-                eps,
-            )?;
-        }
-
-        // RoPE. rope_batched_f32 expects q and k at the SAME batch size,
-        // rotating at per-row positions. We call it twice with a zero
-        // "head count" on the inactive tensor so its loop doesn't execute.
-        // Call 1: rotate Q with positions_q. Pass k as a valid buffer
-        // (scratch.k_noise is shape-compatible; n_heads_k=0 skips its loop).
-        gpu.rope_batched_f32(
-            &scratch.q,
-            &scratch.k_noise,     // ignored because n_heads_k = 0
-            &scratch.positions_q, // [B]
-            cfg.n_heads,
-            0,
-            hd,
-            theta,
-            b,
-        )?;
-        // Call 2: rotate K_cat with positions_k. n_heads_q = 0 skips Q.
-        // Windowed: the layer's context rows are the suffix [span_start..l),
-        // so its positions slice is the device buffer's contiguous
-        // sub-range [span_start−pos_base..tot−pos_base) — zero extra upload,
-        // absolute RoPE phases preserved. Legacy: both bases 0 ⇒ full buffer.
-        let positions_k_span = scratch
-            .positions_k
-            .sub_offset(span_start - pos_base, span + b);
-        gpu.rope_batched_f32(
-            &scratch.q, // ignored because n_heads_q = 0
-            k_cat_l,
-            &positions_k_span,
-            0,
-            cfg.n_kv_heads,
-            hd,
-            theta,
-            span + b,
-        )?;
 
         if let Some(t) = t1 {
             gpu.hip.device_synchronize()?;
