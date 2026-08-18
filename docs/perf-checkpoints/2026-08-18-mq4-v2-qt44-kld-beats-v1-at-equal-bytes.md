@@ -145,3 +145,97 @@ different bug class.
 - The unrotated HFQ4-v2 sibling (qt=6 line) is implied by the container split but
   untested.
 - N=1 on each reference. No repeat runs.
+
+---
+
+## Amendment — v2 against the Q8-protection ladder; the floor drops 16.5%
+
+Same fixture, same host, same references, same day. Scoring parallelised across
+hiptrx's four gfx1201 GPUs (both references concurrently per arm).
+
+| arm | Q8 scope | size | qt=13 KLD | **qt=44 KLD** | Δ |
+|---|---|---|---|---|---|
+| `ctl` | head+embed | 15.663 GB | 0.043776 | **0.039033** | −10.83% |
+| `ctl2` | +`ssm_out` | 16.464 GB | 0.036746 | **0.032495** | −11.57% |
+| `attn` | +`ssm_out`+`attn` | 19.504 GB | — | **0.025437** | new arm |
+
+**Prior best measured KLD on this model was 0.030479** (`ssm_in`, 18.614 GB, qt=13).
+The `attn` arm reaches **0.025437 — 16.5% below that floor.**
+
+v6 conversation selector, which the original ladder never scored for any rung
+above `ctl` (its open gap 3):
+
+| arm | v6sel KLD |
+|---|---|
+| `ctl` | 0.544517 |
+| `ctl2` | 0.484145 |
+| `attn` | **0.368886** |
+
+### Composition is multiplicative to within a percent
+
+Predicted from `ctl`'s ratio `r = 0.039033 / 0.043776 = 0.891656` applied to the
+qt=13 ladder:
+
+| arm | predicted | measured | error |
+|---|---|---|---|
+| `ctl2` | 0.032765 | 0.032495 | **0.8%** |
+| `attn` | 0.024603 | 0.025437 | 3.4% |
+
+So the header change and Q8 class protection are effectively independent levers —
+unsurprising, since they act on disjoint tensor sets, but now measured rather than
+assumed. A qt=44 arm's KLD can be estimated from its qt=13 twin before building it.
+
+### A strict Pareto win
+
+**qt=44 `ctl2` (0.032495 @ 16.464 GB) beats qt=13 `attn_full` (0.033862 @ 17.355
+GB)** — better quality, 0.891 GB smaller, and one Q8 class cheaper. On the qt=13
+ladder `attn_full` cost 31.70 tok/s against `ctl2`'s 33.20, so the qt=44 arm should
+also be faster; unmeasured pending the GEMV port below.
+
+### The ladder's top two rungs are NOT reproducible as documented
+
+`HIPFIRE_Q8_CLASSES` accepts exactly `{lm_head, embed, router, ssm_out, attn}`
+(`q8_class_of`, main.rs:7000). **`attn_full` and `ssm_in` are not valid values** —
+they were labels in the earlier record, produced by quantize binary
+`c644fc7f9272`. Passing either is silently ignored.
+
+Proof: arms requested as `…,ssm_out,attn_full` and `…,ssm_out,ssm_in` both emitted
+**md5 `a30ac345a3b0`, byte-identical to each other** at 16,464,182,272 B — i.e. the
+plain `ctl2` scope, twice. A size assertion against the qt=13 ladder caught both and
+refused to score them, so no false comparison entered this record. Without that
+assertion the campaign would have logged two "new" arms that were the same artifact.
+
+Note also that current `attn` spans full attention **and** `linear_attn`
+(main.rs:7036), so it is a superset of the old `attn_full` and `ssm_in` rungs
+combined — which is why the `attn` arm here is 19.504 GB, larger than either.
+
+### Census of the new arm
+
+```
+q38.v2-attn.mq4   19,504,421,888 B   md5 2b0b4f2a4d3f
+  attn(full)      {F16: 32,  Q8F16: 64}     full attention promoted
+  linear_attn(dn) {F16: 144, Q8F16: 288}    all DeltaNet projections promoted
+  mlp             {qt44: 192, F16: 192}     only MLP remains 4-bit
+  lm_head/embed   {Q8F16: 1 each}
+```
+
+### Open: qt=44 cannot generate yet, only score
+
+`hipfire bench` fails on every qt=44 arm at decode:
+
+```
+forward_scratch decode: qt=44 gemv_mq4g256v2: no GEMV_MQ4G256V2 plain source exists
+```
+
+`eval_hipfire --scoring-mode prefill` never touches the plain/multirow decode GEMV,
+so the KLD numbers above are unaffected and valid. But autoregressive decode does,
+and `gemv_hfq4g256.hip` (18 header sites) and `gemv_hfq4g256_multirow.hip` are not
+among the 11 ported kernels. Until they are, **qt=44 is score-only and not
+shippable**, and no shipped-path decode throughput number exists for it. The
+refusal is a deliberate stub — it errors rather than decoding v2 bytes with a v1
+kernel, which is the failure this whole record is about.
+
+An earlier claim in this campaign that the plain/multirow GEMVs were "not on the
+dense path" was drawn from a **cumulative** kernel cache whose entries predated the
+run by two days. It is correct for prefill scoring and wrong for decode. Kernel-cache
+evidence is only admissible after clearing the cache.
