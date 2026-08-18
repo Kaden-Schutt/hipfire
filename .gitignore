@@ -178,3 +178,9 @@ crates/hipfire-arch-deepseek4/reference_oracle/__pycache__/
 # MI300X calibration deployment bundles (regenerable)
 dist/
 dist_test/
+
+# hipcc ICE reproducer dumps (emitted into CWD on an internal compiler error)
+*.hipi
+*.hipfb
+/*-hip-amdgcn-amd-amdhsa-*.s
+/*-host-x86_64-unknown-linux-gnu.s
