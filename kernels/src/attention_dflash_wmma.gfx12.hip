@@ -139,11 +139,23 @@ __global__ void attention_dflash_wmma_f32_gfx12(
 
         // Stage V tile into LDS in natural [k, d] layout.
         const int v_writer_row = half;     // K-tile row
-        for (int d = my_col_base; d < my_col_base + cols_per_half; ++d) {
-            float vv = (k_valid && v_writer_row < kt_size)
-                ? my_v_row[d]
-                : 0.0f;
-            V_lds[v_writer_row * head_dim + d] = vv;
+        int d = my_col_base;
+        const int d_end = my_col_base + cols_per_half;
+        for (; d + 16 <= d_end; d += 16) {
+            #pragma unroll
+            for (int j = 0; j < 16; ++j) {
+                float vv = (k_valid && v_writer_row < kt_size)
+                    ? my_v_row[d + j]
+                    : 0.0f;
+                V_lds[v_writer_row * head_dim + d + j] = vv;
+            }
+        }
+        // head_dim is only required to be a multiple of 16, so a half-row
+        // can have an 8-element tail (e.g. head_dim=80). Keep that tail
+        // scalar; the common 128/160/256 shapes stay entirely vectorized.
+        for (; d < d_end; ++d) {
+            V_lds[v_writer_row * head_dim + d] =
+                (k_valid && v_writer_row < kt_size) ? my_v_row[d] : 0.0f;
         }
         __syncthreads();
 

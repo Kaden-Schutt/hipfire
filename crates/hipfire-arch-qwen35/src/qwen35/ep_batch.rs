@@ -3036,6 +3036,7 @@ fn forward_scratch_layers_multi(
                                 config.head_dim,
                                 kv_cache.physical_cap,
                                 &s.flash_partials,
+                                None,
                             )?;
                         }
                     } else if kv_cache.quant_asym2 {
@@ -3660,6 +3661,7 @@ fn forward_scratch_layers_multi(
                                 config.head_dim,
                                 kv_cache.physical_cap,
                                 &s.flash_partials,
+                                None,
                             )?;
                         }
                     } else if kv_cache.quant_asym2 {

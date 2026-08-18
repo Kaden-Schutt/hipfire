@@ -74,6 +74,8 @@ extern "C" __global__ void HIPFIRE_RESIDUAL_KERNEL(
         // header/packed-weight stream, then give LLVM a load-free VALU burst.
         // This preserves one output row per wave (unlike the gfx12 dual-row
         // kernel) so gfx1100 keeps enough blocks to occupy all 96 CUs.
+        // Next-quad packed-only prefetch lowered VGPR 72->60 but cut graph-on
+        // Qwen3.6-27B decode 36.643->36.452 tok/s (-0.52%, 2026-08-18).
         const float4 x0a = *reinterpret_cast<const float4*>(x + base);
         const float4 x0b = *reinterpret_cast<const float4*>(x + base + 4);
         const float4 x1a = *reinterpret_cast<const float4*>(x + base + 256);

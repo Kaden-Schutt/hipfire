@@ -914,6 +914,7 @@ fn dispatch_attend(
                     io.head_dim,
                     io.physical_cap,
                     fp,
+                    io.output_gate,
                 ))
             }
             KernelKey::AttnFlashAsym3Fwht => {

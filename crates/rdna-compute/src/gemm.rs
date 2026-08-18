@@ -2549,6 +2549,9 @@ impl Gpu {
         bias: Option<(*mut c_void, *mut c_void, *mut c_void)>,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // Qwen3.6-27B MQ4 on gfx1100: staging each 32-value activation quad
+        // before the K=5120 FullAttention QKV weight stream reduced graph-on
+        // ABBA decode 36.668->36.452 tok/s (-0.59%). Keep weight-first order.
         if self.arch_caps.gemv_dp4a_enabled() {
             debug_assert!(bias.is_none(), "Qwen2 bias fold is disabled on dp4a");
             return self.fused_qkv_hfq4g256_dp4a(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k);
@@ -2931,6 +2934,9 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // Qwen3.6-27B MQ4 on gfx1100: the existing hoist-X32 schedule for
+        // K=5120 QKVZA reduced graph-on ABBA decode 36.562->36.460 tok/s
+        // (-0.28%). Keep the scalar activation schedule as the default.
         if self.arch_caps.gemv_dp4a_enabled() {
             return self.fused_qkvza_hfq4g256_dp4a(
                 a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m,
@@ -22481,6 +22487,15 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // Qwen3.6-27B MQ4 on gfx1100: direct u16->f16 nibble conversion plus
+        // v_dot2 cut VGPRs 80->71, but narrowed max consecutive VMEM 16->6.
+        // Fresh-process graph-on ABBA measured 36.817->36.523 tok/s (-0.80%).
+        // Pairing independent gate/up waves in one 64-thread workgroup stayed
+        // bit-exact with the same 80 VGPR and VMEM16 issue window, but reduced
+        // graph-on decode 36.727->36.476 tok/s (-0.68%). Keep 32-thread WGs.
+        // Reusing the batched WMMA kernel at B=1 stayed coherent but repeated
+        // its 16-column work plus per-layer F32->F16 casts: graph-on ABBA fell
+        // 35.844->29.848 tok/s (-16.73%). Keep WMMA for real batches only.
         // gfx906 dp4a opt-in: pre-quantize x to Q8_1 and use the
         // v_dot4_i32_i8 path. PMC at 2026-05-05 showed this kernel
         // was memory-bound; dp4a's 75% x-traffic reduction lands on
@@ -22497,7 +22512,176 @@ impl Gpu {
             && gate_m == 19_968
             && up_m == 19_968
             && k == 6_656;
-        let (func_name, block, grid_x) = if glimmer_gate_up_k6656_gfx1100 {
+        static GFX1100_DENSE_GATE_UP_STAGE_X32: OnceLock<bool> = OnceLock::new();
+        let dense_gate_up_stage_x32_gfx1100 = self.arch_caps.is_gfx1100()
+            && gate_m == 17_408
+            && up_m == 17_408
+            && k == 5_120
+            && *GFX1100_DENSE_GATE_UP_STAGE_X32.get_or_init(|| {
+                hipfire_config::developer_var("HIPFIRE_GFX1100_DENSE_GATE_UP_STAGE_X32")
+                    .map_or(true, |value| value != "0")
+            });
+        static GFX1100_DENSE_GATE_UP_PAIR: OnceLock<bool> = OnceLock::new();
+        let dense_gate_up_pair_gfx1100 = self.arch_caps.is_gfx1100()
+            && gate_m == 17_408
+            && up_m == 17_408
+            && k == 5_120
+            && *GFX1100_DENSE_GATE_UP_PAIR.get_or_init(|| {
+                hipfire_config::developer_var("HIPFIRE_GFX1100_DENSE_GATE_UP_PAIR").as_deref()
+                    == Ok("1")
+            });
+        static GFX1100_DENSE_GATE_UP_PAIR2: OnceLock<bool> = OnceLock::new();
+        let dense_gate_up_pair2_gfx1100 = self.arch_caps.is_gfx1100()
+            && gate_m == 17_408
+            && up_m == 17_408
+            && k == 5_120
+            && *GFX1100_DENSE_GATE_UP_PAIR2.get_or_init(|| {
+                hipfire_config::developer_var("HIPFIRE_GFX1100_DENSE_GATE_UP_PAIR2").as_deref()
+                    == Ok("1")
+            });
+        static GFX1100_DENSE_GATE_UP_DOT_REFORM: OnceLock<bool> = OnceLock::new();
+        // Qwen3.6-27B MQ4, W7900/gfx1100: two fresh-process alternating
+        // campaigns measured +0.42% and +0.49% decode throughput. Keep this
+        // explicit because the algebraic rewrite changes FP association even
+        // though the screened 65-token greedy trace remained byte-exact.
+        let dense_gate_up_dot_reform_gfx1100 = self.arch_caps.is_gfx1100()
+            && gate_m == 17_408
+            && up_m == 17_408
+            && k == 5_120
+            && *GFX1100_DENSE_GATE_UP_DOT_REFORM.get_or_init(|| {
+                hipfire_config::developer_var("HIPFIRE_GFX1100_DENSE_GATE_UP_DOT_REFORM")
+                    .as_deref()
+                    == Ok("1")
+            });
+        static GFX1100_DENSE_GATE_UP_QUAD_PREFETCH: OnceLock<bool> = OnceLock::new();
+        // Qwen3.6-27B MQ4, W7900/gfx1100: a fresh-process 128-token
+        // A/B/B/A measured +0.42% throughput and -0.42% p50 latency. Keep
+        // opt-in: 92 VGPR remains spill-free, but the gain is too small to
+        // promote without broader hardware evidence.
+        let dense_gate_up_quad_prefetch_gfx1100 = self.arch_caps.is_gfx1100()
+            && gate_m == 17_408
+            && up_m == 17_408
+            && k == 5_120
+            && *GFX1100_DENSE_GATE_UP_QUAD_PREFETCH.get_or_init(|| {
+                hipfire_config::developer_var(
+                    "HIPFIRE_GFX1100_DENSE_GATE_UP_QUAD_PREFETCH",
+                )
+                .as_deref()
+                    == Ok("1")
+            });
+        static GFX1100_DENSE_GATE_UP_SETPRIO: OnceLock<bool> = OnceLock::new();
+        let dense_gate_up_setprio_gfx1100 = self.arch_caps.is_gfx1100()
+            && gate_m == 17_408
+            && up_m == 17_408
+            && k == 5_120
+            && *GFX1100_DENSE_GATE_UP_SETPRIO.get_or_init(|| {
+                hipfire_config::developer_var("HIPFIRE_GFX1100_DENSE_GATE_UP_SETPRIO")
+                    .as_deref()
+                    == Ok("1")
+            });
+        static GFX1100_DENSE_GATE_UP_LANE0_HEADERS: OnceLock<bool> = OnceLock::new();
+        let dense_gate_up_lane0_headers_gfx1100 = self.arch_caps.is_gfx1100()
+            && gate_m == 17_408
+            && up_m == 17_408
+            && k == 5_120
+            && *GFX1100_DENSE_GATE_UP_LANE0_HEADERS.get_or_init(|| {
+                hipfire_config::developer_var(
+                    "HIPFIRE_GFX1100_DENSE_GATE_UP_LANE0_HEADERS",
+                )
+                .as_deref()
+                    == Ok("1")
+            });
+        let dense_gate_up_dot_prefetch_gfx1100 = dense_gate_up_dot_reform_gfx1100
+            && dense_gate_up_quad_prefetch_gfx1100;
+        let (func_name, block, grid_x) = if dense_gate_up_pair2_gfx1100 {
+            self.ensure_kernel(
+                "fused_gate_up_hfq4g256_pair2_gfx1100",
+                kernels::FUSED_GATE_UP_HFQ4G256_PAIR2_GFX1100_SRC,
+                "fused_gate_up_hfq4g256_pair2_gfx1100",
+            )?;
+            (
+                "fused_gate_up_hfq4g256_pair2_gfx1100",
+                [32u32, 1, 1],
+                gate_m as u32,
+            )
+        } else if dense_gate_up_pair_gfx1100 {
+            self.ensure_kernel(
+                "fused_gate_up_hfq4g256_pair_gfx1100",
+                kernels::FUSED_GATE_UP_HFQ4G256_PAIR_GFX1100_SRC,
+                "fused_gate_up_hfq4g256_pair_gfx1100",
+            )?;
+            (
+                "fused_gate_up_hfq4g256_pair_gfx1100",
+                [32u32, 1, 1],
+                gate_m as u32,
+            )
+        } else if dense_gate_up_dot_prefetch_gfx1100 {
+            self.ensure_kernel(
+                "fused_gate_up_hfq4g256_dot_prefetch_gfx1100",
+                kernels::FUSED_GATE_UP_HFQ4G256_DOT_PREFETCH_GFX1100_SRC,
+                "fused_gate_up_hfq4g256_dot_prefetch_gfx1100",
+            )?;
+            (
+                "fused_gate_up_hfq4g256_dot_prefetch_gfx1100",
+                [32u32, 1, 1],
+                (gate_m + up_m) as u32,
+            )
+        } else if dense_gate_up_dot_reform_gfx1100 {
+            self.ensure_kernel(
+                "fused_gate_up_hfq4g256_dot_reform_gfx1100",
+                kernels::FUSED_GATE_UP_HFQ4G256_DOT_REFORM_GFX1100_SRC,
+                "fused_gate_up_hfq4g256_dot_reform_gfx1100",
+            )?;
+            (
+                "fused_gate_up_hfq4g256_dot_reform_gfx1100",
+                [32u32, 1, 1],
+                (gate_m + up_m) as u32,
+            )
+        } else if dense_gate_up_quad_prefetch_gfx1100 {
+            self.ensure_kernel(
+                "fused_gate_up_hfq4g256_quad_prefetch_gfx1100",
+                kernels::FUSED_GATE_UP_HFQ4G256_QUAD_PREFETCH_GFX1100_SRC,
+                "fused_gate_up_hfq4g256_quad_prefetch_gfx1100",
+            )?;
+            (
+                "fused_gate_up_hfq4g256_quad_prefetch_gfx1100",
+                [32u32, 1, 1],
+                (gate_m + up_m) as u32,
+            )
+        } else if dense_gate_up_setprio_gfx1100 {
+            self.ensure_kernel(
+                "fused_gate_up_hfq4g256_setprio_gfx1100",
+                kernels::FUSED_GATE_UP_HFQ4G256_SETPRIO_GFX1100_SRC,
+                "fused_gate_up_hfq4g256_setprio_gfx1100",
+            )?;
+            (
+                "fused_gate_up_hfq4g256_setprio_gfx1100",
+                [32u32, 1, 1],
+                (gate_m + up_m) as u32,
+            )
+        } else if dense_gate_up_lane0_headers_gfx1100 {
+            self.ensure_kernel(
+                "fused_gate_up_hfq4g256_lane0_headers_gfx1100",
+                kernels::FUSED_GATE_UP_HFQ4G256_LANE0_HEADERS_GFX1100_SRC,
+                "fused_gate_up_hfq4g256_lane0_headers_gfx1100",
+            )?;
+            (
+                "fused_gate_up_hfq4g256_lane0_headers_gfx1100",
+                [32u32, 1, 1],
+                (gate_m + up_m) as u32,
+            )
+        } else if dense_gate_up_stage_x32_gfx1100 {
+            self.ensure_kernel(
+                "fused_gate_up_hfq4g256_stage_x32_gfx1100",
+                kernels::FUSED_GATE_UP_HFQ4G256_STAGE_X32_GFX1100_SRC,
+                "fused_gate_up_hfq4g256_stage_x32_gfx1100",
+            )?;
+            (
+                "fused_gate_up_hfq4g256_stage_x32_gfx1100",
+                [32u32, 1, 1],
+                (gate_m + up_m) as u32,
+            )
+        } else if glimmer_gate_up_k6656_gfx1100 {
             self.ensure_kernel(
                 "fused_glimmer_gate_up_hfq4g256_k6656_gfx1100",
                 kernels::FUSED_GLIMMER_GATE_UP_HFQ4G256_K6656_GFX1100_SRC,

@@ -83,6 +83,41 @@ fn e8_ldsx_enabled() -> bool {
     })
 }
 
+fn gfx1100_awq_norm_direct_enabled(gpu: &Gpu, k: usize) -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    if !gpu.arch_caps.is_gfx1100() {
+        return false;
+    }
+    // Keep one symbol implementation for the process lifetime: ensure_kernel
+    // caches functions by symbol, while prefill and decode share this route.
+    // Qwen3.6-27B K=5120 measured +2.44% over a 512-token A/B/B/A; rocprof
+    // measured 14.859 -> 9.116 us/launch, and a 1025-token replay was exact.
+    *FLAG.get_or_init(|| {
+        k == 5_120
+            && hipfire_config::developer_var("HIPFIRE_GFX1100_AWQ_NORM_DIRECT")
+                .ok()
+                .as_deref()
+                != Some("0")
+    })
+}
+
+fn awq_norm_kernel(gpu: &Gpu, k: usize) -> (&'static str, &'static str, u32) {
+    if gfx1100_awq_norm_direct_enabled(gpu, k) {
+        (
+            "fused_rmsnorm_mq_rotate_awq_direct_gfx1100",
+            kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_DIRECT_GFX1100_SRC,
+            (256 * 4) as u32,
+        )
+    } else {
+        (
+            "fused_rmsnorm_mq_rotate_awq",
+            kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_SRC,
+            ((k + 256) * 4) as u32,
+        )
+    }
+}
+
 /// HIPFIRE_E8_DGPU_TWIN: on RDNA3 dGPU (gfx1100/1101/1102), route E8 MoE
 /// GEMVs to the 4-way-unroll gfx11_dgpu twin rather than the gfx1151 kernel.
 ///
@@ -2540,11 +2575,8 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_mq_signs()?;
-        self.ensure_kernel(
-            "fused_rmsnorm_mq_rotate_awq",
-            kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_SRC,
-            "fused_rmsnorm_mq_rotate_awq",
-        )?;
+        let (module, source, shared_mem) = awq_norm_kernel(self, k);
+        self.ensure_kernel(module, source, "fused_rmsnorm_mq_rotate_awq")?;
         let s1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let s2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
 
@@ -2566,9 +2598,7 @@ impl Gpu {
             &kv as *const _ as *mut c_void,
             &eps_v as *const _ as *mut c_void,
         ];
-
         let block_size = 256u32;
-        let shared_mem = ((k + 256) * 4) as u32;
         // Bandwidth: read x + weight + awq_scale + signs + write x_rot.
         let bytes = k * 4 * 4 + 2 * 256 * 4;
         let timer =
@@ -2620,11 +2650,8 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_mq_signs()?;
-        self.ensure_kernel(
-            "fused_rmsnorm_mq_rotate_awq",
-            kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_SRC,
-            "fused_rmsnorm_mq_rotate_awq",
-        )?;
+        let (module, source, shared_mem) = awq_norm_kernel(self, k);
+        self.ensure_kernel(module, source, "fused_rmsnorm_mq_rotate_awq")?;
         let s1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let s2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
 
@@ -2647,7 +2674,6 @@ impl Gpu {
             &mut eps_v as *mut _ as *mut c_void,
         ];
         let block_size = 256u32;
-        let shared_mem = ((k + 256) * 4) as u32;
         let bytes = (k * 4 * 4 + 2 * 256 * 4) * batch_size;
         let timer = crate::profile::begin_timer(
             &self.hip,
@@ -3258,10 +3284,10 @@ impl Gpu {
         let k = n_heads.checked_mul(head_dim).ok_or_else(|| {
             hip_bridge::HipError::new(1, "gated_norm_rotate_mq_gfx1100: size overflow")
         })?;
-        if n_heads != 32 || head_dim != 128 {
+        if !matches!(n_heads, 32 | 48) || head_dim != 128 {
             return Err(hip_bridge::HipError::new(
                 1,
-                "gated_norm_rotate_mq_gfx1100: expected 32 heads with head_dim=128",
+                "gated_norm_rotate_mq_gfx1100: expected 32 or 48 heads with head_dim=128",
             ));
         }
         if x.numel() < k || z.numel() < k || weight.numel() < head_dim || x_rot.numel() < k {
@@ -3279,7 +3305,19 @@ impl Gpu {
             ));
         }
         self.ensure_mq_signs()?;
-        let (module, src, kernel) = if self.arch_caps.is_gfx1151() {
+        let (module, src, kernel) = if n_heads == 48 {
+            if !self.arch_caps.is_gfx1100() {
+                return Err(hip_bridge::HipError::new(
+                    1,
+                    "48-head gated norm/MQ rotation is certified only on gfx1100",
+                ));
+            }
+            (
+                "gated_norm_mq_rotate_k6144_gfx1100",
+                kernels::gated_norm_mq_rotate_k6144_gfx1100_src(),
+                "gated_norm_mq_rotate_k6144_gfx1100",
+            )
+        } else if self.arch_caps.is_gfx1151() {
             (
                 "gated_norm_mq_rotate_gfx1151",
                 kernels::GATED_NORM_MQ_ROTATE_GFX1151_SRC,
@@ -6452,6 +6490,9 @@ impl Gpu {
             && self.flags.rdna3_hfq4_lm_head_k2048
             && m == 248_320
             && k == 2_048;
+        // Qwen3.6-27B's K=5120 LM head did not benefit from baking in its 20
+        // groups: graph-on ABBA decode fell 36.633->36.589 tok/s (-0.12%).
+        // Keep the generic loop despite its larger static instruction count.
         let func_name = if gfx1151_lm_head_dot2 {
             self.ensure_kernel(
                 "gemv_hfq4g256_lm_head_dot2_gfx1151",

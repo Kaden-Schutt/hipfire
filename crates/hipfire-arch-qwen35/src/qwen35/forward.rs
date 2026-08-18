@@ -3179,9 +3179,11 @@ pub(crate) fn kv_cache_attention_dispatch(
         ..kv_cache.tier_inputs()
     })
     .map_err(|e| HipError::new(0, &e.to_string()))?;
-    let fused_epilogue = qwen35_fa_epilogue_enabled(gpu, config, wo)
-        && plan.write_key == hipfire_dispatch::types::KernelKey::KvWriteQ8_0
+    let q8_route = plan.write_key == hipfire_dispatch::types::KernelKey::KvWriteQ8_0
         && plan.attend_key == hipfire_dispatch::types::KernelKey::AttnFlashQ8_0;
+    let asym3_route = plan.write_key == hipfire_dispatch::types::KernelKey::KvWriteAsym3
+        && plan.attend_key == hipfire_dispatch::types::KernelKey::AttnFlashAsym3;
+    let fused_epilogue = qwen35_fa_epilogue_enabled(gpu, config, wo) && (q8_route || asym3_route);
     let io = AttnParams {
         q: &s.fa_q,
         k: &s.fa_k,
@@ -3797,6 +3799,8 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                         &s.pos_buf,
                         config.norm_eps,
                         config.rope_theta,
+                        config.n_heads,
+                        config.n_kv_heads,
                     )?;
                 } else {
                     gpu.rope_partial_interleaved_f32(
@@ -3930,10 +3934,10 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                         config.norm_eps,
                     )?;
                 }
-                if gdn_compact2_enabled(gpu, config, self.n_v_heads, self.dn_state.quant) {
-                    // The compact Q8 recurrence maps state head h to Q/K head
-                    // h/2 directly. Leave the normalized tensors compact and
-                    // remove this materialization dispatch from the replay tape.
+                if gdn_compact_qk_div(gpu, config, self.n_v_heads, self.dn_state.quant).is_some() {
+                    // The compact Q8 recurrence maps each state head directly
+                    // to its shared Q/K head. Leave the normalized tensors
+                    // compact and remove this materialization dispatch.
                 } else if config.linear_num_key_heads < self.n_v_heads {
                     let ratio = self.n_v_heads / config.linear_num_key_heads;
                     gpu.repeat_interleave_qk_f32(
@@ -4050,8 +4054,9 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                 config.linear_value_head_dim,
             ),
             StateQuant::Q8 => {
-                if gdn_compact2_enabled(gpu, config, self.n_v_heads, dn.quant) {
-                    gpu.gated_delta_net_q8_compact2(
+                if let Some(qk_head_div) = gdn_compact_qk_div(gpu, config, self.n_v_heads, dn.quant)
+                {
+                    gpu.gated_delta_net_q8_compact(
                         &s.dn_q_raw,
                         &s.dn_k_raw,
                         &s.dn_v,
@@ -4063,6 +4068,7 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                         1,
                         self.n_v_heads,
                         config.linear_value_head_dim,
+                        qk_head_div,
                         dn.ef_residual(i),
                     )
                 } else {
@@ -4164,12 +4170,52 @@ fn gdn_compact2_enabled(
     arch_enabled && quant == StateQuant::Q8 && config.linear_num_key_heads * 2 == n_v_heads
 }
 
-/// Certified gfx1100 Radiowave schedule: keep DeltaNet's normalized output on
-/// chip and feed the exact MQ rotation directly from LDS. The fixed A3B shape
-/// lets two independent 128-value heads form one 256-value MQ group without
-/// changing either operation's arithmetic order. Enabled by default for the
-/// admitted shape; set `HIPFIRE_GATED_NORM_MQ_ROTATE=0` to restore the two-
-/// dispatch schedule.
+/// 3:1 compact-QK route for Qwen3.6-27B dense. A 512-token graph-on A/B/B/A
+/// measured +0.45%, while profiling confirmed 853 -> 805 dispatches/token and
+/// a net 64.35 us/token reduction in GPU compute. Set
+/// `HIPFIRE_GDN_COMPACT3=0` to restore explicit Q/K materialization.
+fn gdn_compact3_enabled(
+    gpu: &Gpu,
+    config: &Qwen35Config,
+    n_v_heads: usize,
+    quant: StateQuant,
+) -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let enabled = *ENABLED.get_or_init(|| {
+        hipfire_config::developer_var("HIPFIRE_GDN_COMPACT3")
+            .ok()
+            .as_deref()
+            != Some("0")
+    });
+    enabled
+        && gpu.arch_caps.is_gfx1100()
+        && quant == StateQuant::Q8
+        && config.linear_num_key_heads * 3 == n_v_heads
+        && super::config::qwen36_27b_dense_shape(config, n_v_heads)
+}
+
+fn gdn_compact_qk_div(
+    gpu: &Gpu,
+    config: &Qwen35Config,
+    n_v_heads: usize,
+    quant: StateQuant,
+) -> Option<usize> {
+    if gdn_compact2_enabled(gpu, config, n_v_heads, quant) {
+        Some(2)
+    } else if gdn_compact3_enabled(gpu, config, n_v_heads, quant) {
+        Some(3)
+    } else {
+        None
+    }
+}
+
+/// Keep DeltaNet's normalized output on chip and feed the exact MQ rotation
+/// directly from LDS. Each pair of 128-value heads forms one 256-value MQ
+/// group without changing either operation's arithmetic order. The 32-head
+/// A3B route remains isolated from the gfx1100-only 48-head Qwen3.6-27B route;
+/// the latter measured +0.45% over a 512-token A/B/B/A and removes 48
+/// dispatches/token. Set `HIPFIRE_GATED_NORM_MQ_ROTATE=0` to restore both
+/// explicit operations.
 fn gated_norm_mq_rotate_enabled(
     gpu: &Gpu,
     config: &Qwen35Config,
@@ -4183,10 +4229,13 @@ fn gated_norm_mq_rotate_enabled(
             .as_deref()
             != Some("0")
     });
-    enabled
-        && (gpu.arch_caps.is_gfx1100() || gfx1151_radiowave_fusions_enabled(gpu))
+    let admitted_arch_shape = ((gpu.arch_caps.is_gfx1100()
+        || gfx1151_radiowave_fusions_enabled(gpu))
         && config.dim == 2_048
-        && n_v_heads == 32
+        && n_v_heads == 32)
+        || (gpu.arch_caps.is_gfx1100() && super::config::qwen36_27b_dense_shape(config, n_v_heads));
+    enabled
+        && admitted_arch_shape
         && config.linear_value_head_dim == 128
         && wo.k == n_v_heads * config.linear_value_head_dim
         && wo.gpu_dtype == DType::MQ4G256
@@ -4195,7 +4244,9 @@ fn gated_norm_mq_rotate_enabled(
 
 /// Collapse full-attention Q/gate deinterleave, Q/K RMS normalization, and
 /// partial half-split RoPE into one head-local launch on the certified gfx1100
-/// shape. Set `HIPFIRE_QWEN35_FA_PREP_FUSE=0` to retain the legacy path.
+/// shapes. The Qwen3.6-27B q24k4 route measured +0.64% over a 512-token
+/// A/B/B/A and reduced 757 -> 709 dispatches/token. Set
+/// `HIPFIRE_QWEN35_FA_PREP_FUSE=0` to retain the legacy path.
 /// The legacy interleaved-RoPE compatibility mode and diagnostic tap retain
 /// the established multi-dispatch path.
 fn qwen35_fa_prep_enabled(gpu: &Gpu, config: &Qwen35Config) -> bool {
@@ -4207,17 +4258,25 @@ fn qwen35_fa_prep_enabled(gpu: &Gpu, config: &Qwen35Config) -> bool {
             != Some("0")
     });
     let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
-    enabled
-        && (gpu.arch_caps.is_gfx1100() || gfx1151_radiowave_fusions_enabled(gpu))
-        && !gpu.flags.rope_interleaved_legacy
+    let admitted_arch_shape = ((gpu.arch_caps.is_gfx1100()
+        || gfx1151_radiowave_fusions_enabled(gpu))
         && config.n_heads == 16
-        && config.n_kv_heads == 2
+        && config.n_kv_heads == 2)
+        || (gpu.arch_caps.is_gfx1100()
+            && super::config::qwen36_27b_dense_shape(config, config.linear_num_value_heads)
+            && config.n_heads == 24
+            && config.n_kv_heads == 4);
+    enabled
+        && admitted_arch_shape
+        && !gpu.flags.rope_interleaved_legacy
         && config.head_dim == 256
         && n_rot == 64
 }
 
-/// Pair Q8 K/V cache writes and fold the Qwen output gate plus MQ rotation into
-/// the flash-attention reduce epilogue on the certified gfx1100/MQ4 shape. Set
+/// Fold the Qwen output gate plus MQ rotation into the flash-attention reduce
+/// epilogue on certified gfx1100/MQ4 shapes. Extending the existing Q8 reducer
+/// to Qwen3.6-27B's asym3 route measured +0.37% over a 512-token A/B/B/A and
+/// reduced 709 -> 677 dispatches/token; a 1025-token replay remained exact. Set
 /// `HIPFIRE_QWEN35_FA_EPILOGUE_FUSE=0` to retain the legacy path.
 fn qwen35_fa_epilogue_enabled(gpu: &Gpu, config: &Qwen35Config, wo: &WeightTensor) -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -4227,13 +4286,26 @@ fn qwen35_fa_epilogue_enabled(gpu: &Gpu, config: &Qwen35Config, wo: &WeightTenso
             .as_deref()
             != Some("0")
     });
-    enabled
-        && (gpu.arch_caps.is_gfx1100() || gfx1151_radiowave_fusions_enabled(gpu))
+    let admitted_arch_shape = ((gpu.arch_caps.is_gfx1100()
+        || gfx1151_radiowave_fusions_enabled(gpu))
         && config.n_heads == 16
-        && config.n_kv_heads == 2
+        && config.n_kv_heads == 2)
+        || (gpu.arch_caps.is_gfx1100()
+            && super::config::qwen36_27b_dense_shape(config, config.linear_num_value_heads)
+            && config.n_heads == 24
+            && config.n_kv_heads == 4);
+    enabled
+        && admitted_arch_shape
         && config.head_dim == 256
         && wo.gpu_dtype == DType::MQ4G256
         && wo.awq_scale.is_none()
+}
+
+/// Exact dense Qwen3.6-27B shape shared by its gfx1100 decode selectors.
+/// Defined in `super::config` as single source; this wrapper preserves
+/// the PR's local symbol for selectors that historically lived in the same file.
+fn qwen36_27b_dense_shape(config: &Qwen35Config, n_v_heads: usize) -> bool {
+    super::config::qwen36_27b_dense_shape(config, n_v_heads)
 }
 
 /// Radiowave experiment: fold the DeltaNet beta/alpha scalar preparation into
@@ -4270,22 +4342,28 @@ fn qkvza_scalar_prep_enabled(
         && matches!(dtype, DType::MQ4G256 | DType::HFQ4G256)
 }
 
-/// Radiowave experiment: schedule the independent beta/alpha transforms as
-/// one extra workgroup of the following conv/QK-normalization dispatch. This
-/// keeps the hot QKVZA projection unchanged while deleting the same boundary.
+/// Schedule the independent beta/alpha transforms as one extra workgroup of
+/// the following conv/QK-normalization dispatch. This keeps the hot QKVZA
+/// projection unchanged while deleting the same boundary.
 fn conv_scalar_prep_enabled(
     gpu: &Gpu,
     config: &Qwen35Config,
     n_v_heads: usize,
     quant: StateQuant,
 ) -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let enabled = *ENABLED.get_or_init(|| {
-        hipfire_config::developer_var("HIPFIRE_CONV_SCALAR_PREP")
-            .ok()
-            .as_deref()
-            == Some("1")
-    });
+    static MODE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let mode = MODE.get_or_init(|| hipfire_config::developer_var("HIPFIRE_CONV_SCALAR_PREP").ok());
+    let enabled = match mode.as_deref() {
+        Some("0") => false,
+        Some("1") => true,
+        _ => {
+            // Qwen3.6-27B dense on W7900/gfx1100: 512-token graph-on
+            // A/B/B/A measured 35.376->35.657 tok/s (+0.79%) and
+            // 28.105->27.891 ms p50 (-0.76%). The fused route deletes
+            // 48 dispatches/token and stayed exact for 1,025 greedy tokens.
+            super::config::qwen36_27b_dense_shape(config, n_v_heads)
+        }
+    };
     let shape = hipfire_config::developer_var("HIPFIRE_CONV_QKNORM_SHAPE").ok();
     enabled
         && gpu.arch_caps.is_gfx1100()

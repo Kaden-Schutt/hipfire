@@ -662,6 +662,20 @@ pub fn config_from_hfq(hfq: &HfqFile) -> Result<Qwen35Config, String> {
 pub fn config_from_safetensors(source: &dyn ModelSource) -> Result<Qwen35Config, String> {
     config_from_metadata_json(source.metadata_json())
 }
+
+/// Exact dense Qwen3.6-27B shape shared by its gfx1100 decode selectors.
+pub(crate) fn qwen36_27b_dense_shape(config: &Qwen35Config, n_v_heads: usize) -> bool {
+    config.dim == 5_120
+        && config.n_layers == 64
+        && config.n_heads == 24
+        && config.n_kv_heads == 4
+        && config.head_dim == 256
+        && config.linear_num_key_heads == 16
+        && config.linear_key_head_dim == 128
+        && n_v_heads == 48
+        && config.linear_value_head_dim == 128
+        && config.num_experts == 0
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -948,5 +962,29 @@ mod tests {
             parse_f16_lm_head_mode(Some("surprise")),
             F16LmHeadMode::Native
         );
+    }
+
+    #[test]
+    fn qwen36_27b_dense_shape_is_exact() {
+        let inner = serde_json::json!({
+            "hidden_size": 5120,
+            "num_hidden_layers": 64,
+            "num_attention_heads": 24,
+            "num_key_value_heads": 4,
+            "head_dim": 256,
+            "vocab_size": 248320,
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 48,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128
+        });
+        let mut cfg = from_config_value(&inner).expect("Qwen3.6-27B shape parse");
+        assert!(qwen36_27b_dense_shape(&cfg, 48));
+        assert!(!qwen36_27b_dense_shape(&cfg, 47));
+        cfg.num_experts = 8;
+        assert!(!qwen36_27b_dense_shape(&cfg, 48));
+        cfg.num_experts = 0;
+        cfg.dim = 2_048;
+        assert!(!qwen36_27b_dense_shape(&cfg, 48));
     }
 }
