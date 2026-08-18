@@ -2870,10 +2870,16 @@ fn load_weight_tensor_raw(
             })
         }
         45 => {
-            // MQ4C / v1.5 (qt=45): 132 B/group — ONE fp16 scale+zero over all 256,
-            // payload at +4. Note the stride is 132, NOT 136: qt=45 is the only
-            // 4-bit G256 format in this match that is not 136 B, so a copied
-            // expected-length formula would silently accept a truncated blob.
+            // MQ4C (qt=45), pad layout: 136 B/group — ONE fp16 scale+zero dword at
+            // +0 governing all 256 weights, 4 B of zero padding at +4, and the
+            // 128 B nibble payload at +8, which is byte-for-byte where qt=13 puts
+            // it. Same total size as qt=13; the padding is the deliberate price of
+            // keeping the payload 8-byte aligned.
+            //
+            // Derive the stride from rdna_compute::MQ4C_GROUP_BYTES rather than a
+            // literal. This site previously hardcoded 132 and rejected every valid
+            // file the moment the format moved to 136 — the check was right, the
+            // duplicated constant was not.
             if k % 256 != 0 {
                 return Err(HipError::new(
                     0,
@@ -2881,7 +2887,7 @@ fn load_weight_tensor_raw(
                 ));
             }
             let gpr = k / 256;
-            let expected = m * gpr * 132;
+            let expected = m * gpr * rdna_compute::MQ4C_GROUP_BYTES;
             if data.len() != expected {
                 return Err(HipError::new(
                     0,
