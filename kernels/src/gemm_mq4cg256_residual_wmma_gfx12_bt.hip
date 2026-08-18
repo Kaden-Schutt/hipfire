@@ -25,19 +25,18 @@ extern "C" __launch_bounds__(32, 2) __global__ void gemm_mq4cg256_residual_wmma_
     if (rs >= M || bs >= batch_size) return; \
     const int ml = tid & 15, kg = tid >> 4; \
     const int sr = (rs + ml < M) ? (rs + ml) : (M - 1); \
-    const int gpr = K / 256; const char* rb = A + (long long)sr * gpr * 128; \
-    const char* hb = A + (long long)M * gpr * 128 + (long long)sr * gpr * 4; \
+    const int gpr = K / 256; const char* rb = A + (long long)sr * gpr * 136; \
     int sb[BV]; for (int b = 0; b < BV; b++) { int t = bs + b * 16 + ml; sb[b] = (t < batch_size) ? t : 0; } \
     float8_t acc[BV]; for (int b = 0; b < BV; b++) acc[b] = float8_t{0,0,0,0,0,0,0,0}; \
     for (int g = 0; g < gpr; g++) { \
-        const char* gp = rb + g * 128; \
-        const unsigned int hdr__ = *(const unsigned int*)(hb + g * 4); \
+        const char* gp = rb + g * 136; \
+        const unsigned int hdr__ = *(const unsigned int*)(gp); \
         _Float16 sc = (_Float16)__half2float(__ushort_as_half((unsigned short)(hdr__ & 0xFFFFu))); \
         _Float16 zp = (_Float16)__half2float(__ushort_as_half((unsigned short)(hdr__ >> 16))); \
         const _Float16* xg[BV]; for (int b = 0; b < BV; b++) xg[b] = X + (long long)sb[b] * K + g * 256; \
         for (int kt = 0; kt < 16; kt += 4) { \
-            unsigned int p[4] = { *(const unsigned int*)(gp+(kt+0)*8+kg*4), *(const unsigned int*)(gp+(kt+1)*8+kg*4), \
-                                  *(const unsigned int*)(gp+(kt+2)*8+kg*4), *(const unsigned int*)(gp+(kt+3)*8+kg*4) }; \
+            unsigned int p[4] = { *(const unsigned int*)(gp+8+(kt+0)*8+kg*4), *(const unsigned int*)(gp+8+(kt+1)*8+kg*4), \
+                                  *(const unsigned int*)(gp+8+(kt+2)*8+kg*4), *(const unsigned int*)(gp+8+(kt+3)*8+kg*4) }; \
             _Pragma("unroll") \
             for (int ki = 0; ki < 4; ki++) { half8_t a; MQ4C_DQ8(p[ki], sc, zp); \
                 _Pragma("unroll") \

@@ -78,21 +78,18 @@ __device__ __forceinline__ void gemv_mq4cg256_multirow_body(
     const int tid = threadIdx.x;
 
     const int groups_per_row = K / 256;
-    const long long row_stride = (long long)groups_per_row * 128;
-    const char* hplane = A + (long long)M * groups_per_row * 128;
+    const long long row_stride = (long long)groups_per_row * 136;
     const int boff = tid * 4;
 
     // Row pointers. For partial final workgroups (row_base + r >= M) we
     // clamp the pointer to row_base so reads stay in-bounds; the write is
     // masked separately by the row_valid check.
     const char* row_ptrs[R];
-    const char* row_hptrs[R];
     #pragma unroll
     for (int r = 0; r < R; r++) {
         int row = row_base + r;
         int safe_row = (row < M) ? row : row_base;
         row_ptrs[r] = A + (long long)safe_row * row_stride;
-        row_hptrs[r] = hplane + (long long)safe_row * groups_per_row * 4;
     }
 
     float acc[R][4];
@@ -133,28 +130,28 @@ __device__ __forceinline__ void gemv_mq4cg256_multirow_body(
 
         #pragma unroll
         for (int r = 0; r < R; r++) {
-            const char* gp0 = row_ptrs[r] + g * 128;
-            const char* gp1 = gp0 + 128;
-            const char* gp2 = gp1 + 128;
-            const char* gp3 = gp2 + 128;
+            const char* gp0 = row_ptrs[r] + g * 136;
+            const char* gp1 = gp0 + 136;
+            const char* gp2 = gp1 + 136;
+            const char* gp3 = gp2 + 136;
 
-            const unsigned int hdr0__ = *(const unsigned int*)(row_hptrs[r] + g * 4);
+            const unsigned int hdr0__ = *(const unsigned int*)(row_ptrs[r] + g * 136);
             float sc0 = __half2float(__ushort_as_half((unsigned short)(hdr0__ & 0xFFFFu)));
             float zp0 = __half2float(__ushort_as_half((unsigned short)(hdr0__ >> 16)));
-            const unsigned int hdr1__ = *(const unsigned int*)(row_hptrs[r] + (g + 1) * 4);
+            const unsigned int hdr1__ = *(const unsigned int*)(row_ptrs[r] + (g + 1) * 136);
             float sc1 = __half2float(__ushort_as_half((unsigned short)(hdr1__ & 0xFFFFu)));
             float zp1 = __half2float(__ushort_as_half((unsigned short)(hdr1__ >> 16)));
-            const unsigned int hdr2__ = *(const unsigned int*)(row_hptrs[r] + (g + 2) * 4);
+            const unsigned int hdr2__ = *(const unsigned int*)(row_ptrs[r] + (g + 2) * 136);
             float sc2 = __half2float(__ushort_as_half((unsigned short)(hdr2__ & 0xFFFFu)));
             float zp2 = __half2float(__ushort_as_half((unsigned short)(hdr2__ >> 16)));
-            const unsigned int hdr3__ = *(const unsigned int*)(row_hptrs[r] + (g + 3) * 4);
+            const unsigned int hdr3__ = *(const unsigned int*)(row_ptrs[r] + (g + 3) * 136);
             float sc3 = __half2float(__ushort_as_half((unsigned short)(hdr3__ & 0xFFFFu)));
             float zp3 = __half2float(__ushort_as_half((unsigned short)(hdr3__ >> 16)));
 
-            unsigned int pk0 = *(const unsigned int*)(gp0 + boff);
-            unsigned int pk1 = *(const unsigned int*)(gp1 + boff);
-            unsigned int pk2 = *(const unsigned int*)(gp2 + boff);
-            unsigned int pk3 = *(const unsigned int*)(gp3 + boff);
+            unsigned int pk0 = *(const unsigned int*)(gp0 + 8 + boff);
+            unsigned int pk1 = *(const unsigned int*)(gp1 + 8 + boff);
+            unsigned int pk2 = *(const unsigned int*)(gp2 + 8 + boff);
+            unsigned int pk3 = *(const unsigned int*)(gp3 + 8 + boff);
 
             acc[r][0] += (sc0 * (float)((pk0 >>  0) & 0xFu) + zp0) * x00
                        + (sc0 * (float)((pk0 >>  4) & 0xFu) + zp0) * x01
@@ -214,11 +211,11 @@ __device__ __forceinline__ void gemv_mq4cg256_multirow_body(
         TAIL_LOAD_X(base);
         #pragma unroll
         for (int r = 0; r < R; r++) {
-            const char* gp = row_ptrs[r] + g * 128;
-            const unsigned int hdr__ = *(const unsigned int*)(row_hptrs[r] + g * 4);
+            const char* gp = row_ptrs[r] + g * 136;
+            const unsigned int hdr__ = *(const unsigned int*)(row_ptrs[r] + g * 136);
             float sc = __half2float(__ushort_as_half((unsigned short)(hdr__ & 0xFFFFu)));
             float zp = __half2float(__ushort_as_half((unsigned short)(hdr__ >> 16)));
-            unsigned int pk = *(const unsigned int*)(gp + boff);
+            unsigned int pk = *(const unsigned int*)(gp + 8 + boff);
             TAIL_DOG(pk, sc, zp, acc[r][0]);
         }
     }
@@ -228,11 +225,11 @@ __device__ __forceinline__ void gemv_mq4cg256_multirow_body(
         TAIL_LOAD_X(base);
         #pragma unroll
         for (int r = 0; r < R; r++) {
-            const char* gp = row_ptrs[r] + g * 128;
-            const unsigned int hdr__ = *(const unsigned int*)(row_hptrs[r] + g * 4);
+            const char* gp = row_ptrs[r] + g * 136;
+            const unsigned int hdr__ = *(const unsigned int*)(row_ptrs[r] + g * 136);
             float sc = __half2float(__ushort_as_half((unsigned short)(hdr__ & 0xFFFFu)));
             float zp = __half2float(__ushort_as_half((unsigned short)(hdr__ >> 16)));
-            unsigned int pk = *(const unsigned int*)(gp + boff);
+            unsigned int pk = *(const unsigned int*)(gp + 8 + boff);
             TAIL_DOG(pk, sc, zp, acc[r][1]);
         }
     }
@@ -242,11 +239,11 @@ __device__ __forceinline__ void gemv_mq4cg256_multirow_body(
         TAIL_LOAD_X(base);
         #pragma unroll
         for (int r = 0; r < R; r++) {
-            const char* gp = row_ptrs[r] + g * 128;
-            const unsigned int hdr__ = *(const unsigned int*)(row_hptrs[r] + g * 4);
+            const char* gp = row_ptrs[r] + g * 136;
+            const unsigned int hdr__ = *(const unsigned int*)(row_ptrs[r] + g * 136);
             float sc = __half2float(__ushort_as_half((unsigned short)(hdr__ & 0xFFFFu)));
             float zp = __half2float(__ushort_as_half((unsigned short)(hdr__ >> 16)));
-            unsigned int pk = *(const unsigned int*)(gp + boff);
+            unsigned int pk = *(const unsigned int*)(gp + 8 + boff);
             TAIL_DOG(pk, sc, zp, acc[r][2]);
         }
     }
@@ -295,12 +292,10 @@ extern "C" __global__ void gemv_mq4cg256_multirow_r2(
 #else
     const int groups_per_row = K / 256;
 #endif
-    const long long row_stride = (long long)groups_per_row * 128;
+    const long long row_stride = (long long)groups_per_row * 136;
     // Clamp OOB row1 to row0 so weight reads stay in-bounds; store is masked.
     const char* row_ptr0 = A + (long long)row0 * row_stride;
     const char* row_ptr1 = A + (long long)(have_row1 ? row1 : row0) * row_stride;
-    const char* hplane = A + (long long)M * groups_per_row * 128;
-    const unsigned int hplane_off = (unsigned int)((long long)M * groups_per_row * 128);
     const int boff = tid * 4;
     const unsigned int row_weight_offset0 = (unsigned int)((long long)row0 * row_stride);
     const unsigned int row_weight_offset1 =
@@ -341,10 +336,9 @@ extern "C" __global__ void gemv_mq4cg256_multirow_r2(
 #if defined(HIPFIRE_GFX1151_LM_HEAD_HYBRID_BUFFER)
     // Uniform per-group headers are cheaper on the scalar/global path. Only
     // the lane-divergent packed dword uses temporal buffer VMEM.
-    #define LOAD_LM_HEADER(gp, weight_offset) (*(const unsigned int*)(hplane + (((gp) - A) >> 5)))
+    #define LOAD_LM_HEADER(gp, weight_offset) (*(const unsigned int*)(gp))
 #else
-    #define LOAD_LM_HEADER(gp, weight_offset) \
-        HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc, hplane + (((gp) - A) >> 5), hplane_off + ((weight_offset) >> 5))
+    #define LOAD_LM_HEADER(gp, weight_offset) HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc, gp, weight_offset)
 #endif
     #define LOAD_LM_PACKED(gp, weight_offset) \
         HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc, gp, weight_offset)
@@ -353,7 +347,7 @@ extern "C" __global__ void gemv_mq4cg256_multirow_r2(
         const unsigned int hdr__ = LOAD_LM_HEADER(gp, weight_offset); \
         float sc = __half2float(__ushort_as_half((unsigned short)(hdr__ & 0xFFFFu))); \
         float zp = __half2float(__ushort_as_half((unsigned short)(hdr__ >> 16))); \
-        unsigned int pk = LOAD_LM_PACKED((gp) + boff, (weight_offset) + boff); \
+        unsigned int pk = LOAD_LM_PACKED((gp) + 8 + boff, (weight_offset) + 8 + boff); \
         (a) += (sc * (float)((pk) & 0xFu)         + zp) * pfx##0 \
              + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * pfx##1 \
              + (sc * (float)(((pk) >> 8) & 0xFu)  + zp) * pfx##2 \
@@ -380,14 +374,14 @@ extern "C" __global__ void gemv_mq4cg256_multirow_r2(
 #endif
 
         // Branchless dual-row DOG with all x resident (no mid-quad x reload).
-        DOG_X8(row_ptr0 + g * 128, row_weight_offset0 + g * 128, a0, xa);
-        DOG_X8(row_ptr1 + g * 128, row_weight_offset1 + g * 128, b0, xa);
-        DOG_X8(row_ptr0 + (g + 1) * 128, row_weight_offset0 + (g + 1) * 128, a1, xb);
-        DOG_X8(row_ptr1 + (g + 1) * 128, row_weight_offset1 + (g + 1) * 128, b1, xb);
-        DOG_X8(row_ptr0 + (g + 2) * 128, row_weight_offset0 + (g + 2) * 128, a2, xc);
-        DOG_X8(row_ptr1 + (g + 2) * 128, row_weight_offset1 + (g + 2) * 128, b2, xc);
-        DOG_X8(row_ptr0 + (g + 3) * 128, row_weight_offset0 + (g + 3) * 128, a3, xd);
-        DOG_X8(row_ptr1 + (g + 3) * 128, row_weight_offset1 + (g + 3) * 128, b3, xd);
+        DOG_X8(row_ptr0 + g * 136, row_weight_offset0 + g * 136, a0, xa);
+        DOG_X8(row_ptr1 + g * 136, row_weight_offset1 + g * 136, b0, xa);
+        DOG_X8(row_ptr0 + (g + 1) * 136, row_weight_offset0 + (g + 1) * 136, a1, xb);
+        DOG_X8(row_ptr1 + (g + 1) * 136, row_weight_offset1 + (g + 1) * 136, b1, xb);
+        DOG_X8(row_ptr0 + (g + 2) * 136, row_weight_offset0 + (g + 2) * 136, a2, xc);
+        DOG_X8(row_ptr1 + (g + 2) * 136, row_weight_offset1 + (g + 2) * 136, b2, xc);
+        DOG_X8(row_ptr0 + (g + 3) * 136, row_weight_offset0 + (g + 3) * 136, a3, xd);
+        DOG_X8(row_ptr1 + (g + 3) * 136, row_weight_offset1 + (g + 3) * 136, b3, xd);
     }
 
     // Tail uses sequential x (at most 3 groups; hoist buys little).
@@ -401,7 +395,7 @@ extern "C" __global__ void gemv_mq4cg256_multirow_r2(
         const unsigned int hdr__ = LOAD_LM_HEADER(gp, weight_offset); \
         float sc = __half2float(__ushort_as_half((unsigned short)(hdr__ & 0xFFFFu))); \
         float zp = __half2float(__ushort_as_half((unsigned short)(hdr__ >> 16))); \
-        unsigned int pk = LOAD_LM_PACKED((gp) + boff, (weight_offset) + boff); \
+        unsigned int pk = LOAD_LM_PACKED((gp) + 8 + boff, (weight_offset) + 8 + boff); \
         (a) += (sc * (float)((pk) & 0xFu)         + zp) * x0 \
              + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * x1 \
              + (sc * (float)(((pk) >> 8) & 0xFu)  + zp) * x2 \
@@ -416,22 +410,22 @@ extern "C" __global__ void gemv_mq4cg256_multirow_r2(
         const int g = quads << 2;
         const int base = g * 256 + tid * 8;
         LOAD_X8(base);
-        DOG_X8_TAIL(row_ptr0 + g * 128, row_weight_offset0 + g * 128, a0);
-        DOG_X8_TAIL(row_ptr1 + g * 128, row_weight_offset1 + g * 128, b0);
+        DOG_X8_TAIL(row_ptr0 + g * 136, row_weight_offset0 + g * 136, a0);
+        DOG_X8_TAIL(row_ptr1 + g * 136, row_weight_offset1 + g * 136, b0);
     }
     if (tail >= 2) {
         const int g = (quads << 2) + 1;
         const int base = g * 256 + tid * 8;
         LOAD_X8(base);
-        DOG_X8_TAIL(row_ptr0 + g * 128, row_weight_offset0 + g * 128, a1);
-        DOG_X8_TAIL(row_ptr1 + g * 128, row_weight_offset1 + g * 128, b1);
+        DOG_X8_TAIL(row_ptr0 + g * 136, row_weight_offset0 + g * 136, a1);
+        DOG_X8_TAIL(row_ptr1 + g * 136, row_weight_offset1 + g * 136, b1);
     }
     if (tail >= 3) {
         const int g = (quads << 2) + 2;
         const int base = g * 256 + tid * 8;
         LOAD_X8(base);
-        DOG_X8_TAIL(row_ptr0 + g * 128, row_weight_offset0 + g * 128, a2);
-        DOG_X8_TAIL(row_ptr1 + g * 128, row_weight_offset1 + g * 128, b2);
+        DOG_X8_TAIL(row_ptr0 + g * 136, row_weight_offset0 + g * 136, a2);
+        DOG_X8_TAIL(row_ptr1 + g * 136, row_weight_offset1 + g * 136, b2);
     }
     #undef DOG_X8_TAIL
     #undef LOAD_X8

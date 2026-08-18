@@ -11,7 +11,7 @@
 // **gfx12 (RDNA4) variant — K4 unroll**, issue #65 lever 2. Port of
 // gemm_gate_up_hfq4g256_wmma.gfx12.hip to qt=45 (MQ4C / v1.5).
 //
-// Planar mq4c (qt=45) — payload plane 128 B/group, header plane 4 B/group:
+// Pad mq4c (qt=45) — 136 B/group (4 B header + 4 B pad + 128 B payload):
 //   header (fp16 scale + fp16 zero) in header plane, payload nibbles in
 //   payload plane (16-byte aligned). w = q * scale + zero — ONE affine grid
 //   per 256; no half-select.
@@ -86,16 +86,14 @@ extern "C" __global__ void gemm_gate_up_mq4cg256_wmma_gfx12(
     // Route to the correct weight matrix — each with OWN header-plane base.
     const char* A;
     int local_row;
-    int tensor_m;
     if (safe_row < gate_m) {
-        A = A_gate;  local_row = safe_row;            tensor_m = gate_m;
+        A = A_gate;  local_row = safe_row;            
     } else {
-        A = A_up;    local_row = safe_row - gate_m;   tensor_m = up_m;
+        A = A_up;    local_row = safe_row - gate_m;   
     }
 
     const int gpr = K / 256;
-    const char* row_base = A + (long long)local_row * gpr * 128;
-    const char* header_base = A + (long long)tensor_m * gpr * 128 + (long long)local_row * gpr * 4;
+    const char* row_base = A + (long long)local_row * gpr * 136;
 
     // B operand indexes BATCH (N) dimension by m_lane (CK kBNLane=16).
     // Each lane holds the 8-K slice of its batch row corresponding to k_grp.
@@ -104,9 +102,8 @@ extern "C" __global__ void gemm_gate_up_mq4cg256_wmma_gfx12(
     float8_t acc = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
 
     for (int g = 0; g < gpr; g++) {
-        const char* gp = row_base + g * 128;
-        // planar header in header plane
-        const unsigned int hdr__ = *(const unsigned int*)(header_base + g * 4);
+        const char* gp = row_base + g * 136;
+        const unsigned int hdr__ = *(const unsigned int*)(gp);
         _Float16 sc_h = __ushort_as_half((unsigned short)(hdr__ & 0xFFFFu));
         _Float16 zp_h = __ushort_as_half((unsigned short)(hdr__ >> 16));
 
@@ -133,10 +130,10 @@ extern "C" __global__ void gemm_gate_up_mq4cg256_wmma_gfx12(
             const int k_off_d = (kt + 3) * 16;
 
             // 4 weight reads, all up-front. Planar: no +4 (payload aligned).
-            unsigned int pka = *(const unsigned int*)(gp + k_off_a / 2 + k_grp * 4);
-            unsigned int pkb = *(const unsigned int*)(gp + k_off_b / 2 + k_grp * 4);
-            unsigned int pkc = *(const unsigned int*)(gp + k_off_c / 2 + k_grp * 4);
-            unsigned int pkd = *(const unsigned int*)(gp + k_off_d / 2 + k_grp * 4);
+            unsigned int pka = *(const unsigned int*)(gp + 8 + k_off_a / 2 + k_grp * 4);
+            unsigned int pkb = *(const unsigned int*)(gp + 8 + k_off_b / 2 + k_grp * 4);
+            unsigned int pkc = *(const unsigned int*)(gp + 8 + k_off_c / 2 + k_grp * 4);
+            unsigned int pkd = *(const unsigned int*)(gp + 8 + k_off_d / 2 + k_grp * 4);
 
 
             // 4 X reads, all up-front. ~64 bytes/lane = 16 VGPR live across
@@ -185,7 +182,7 @@ extern "C" __global__ void gemm_gate_up_mq4cg256_wmma_gfx12(
 // Experimental cold-weight LDS staging variant for fused gate+up.
 // Same slab/wave structure as residual_ldsstage; routes rows across A_gate/A_up
 // and overwrites Y_gate/Y_up. Opt-in via HIPFIRE_MQ4CG256_LDSSTAGE=1; K%512==0.
-// Planar: slab is two groups' payload = 256 B/row.
+// Pad: 136 B/group, slab = 272 B/row (2×136).
 typedef unsigned int __attribute__((ext_vector_type(4))) uint4v_t;
 
 __launch_bounds__(256, 4)
@@ -199,7 +196,7 @@ extern "C" __global__ void gemm_gate_up_mq4cg256_wmma_gfx12_ldsstage(
     int K, int N
 ) {
     const int tid = threadIdx.x;
-    const int wave = tid >> 5;
+    const int wave = tid>>5;
     const int lane = tid & 31;
     const int total_m = gate_m + up_m;
     const int row_start = blockIdx.x * 16;
@@ -215,20 +212,16 @@ extern "C" __global__ void gemm_gate_up_mq4cg256_wmma_gfx12_ldsstage(
     const int gpr = K / 256;
     const int slabs = K / 512;
     // Header planes for each tensor (planar layout)
-    const char* hplane_gate = A_gate + (long long)gate_m * gpr * 128;
-    const char* hplane_up   = A_up   + (long long)up_m   * gpr * 128;
 
-    // Two packed G256 groups per row, 16 rows: 16 * 256 = 4096 B.
-    // Planar: payload 128 B/group (16-byte aligned), slab=256 B/row contiguous
-    // in payload plane. 16 dwordx4 loads cover 256 B; no ragged tail. Headers
-    // (4 B/group) are read directly from the respective header plane — not
-    // staged — small and not helped by LDS coalescing.
-    __shared__ __align__(16) unsigned char staged_weights[16][256];
+    // Two packed G256 groups per row, 16 rows: 16 * 272 = 4352 B.
+    // Pad: 136 B/group (header inline + 4 B pad + 128 B payload), slab = 272 B/row.
+    // Fill uses 16 dwordx4 loads covering 0..255, plus a 16 B tail at 256.
+    __shared__ __align__(16) unsigned char staged_weights[16][272];
     __shared__ float partials[8 * 32 * 8];
 
 
     const int load_row = tid >> 4;          // 0..15
-    const int load_vec = tid & 15;          // 0..15  (16 B * 16 = 256 B bulk)
+    const int load_vec = tid & 15;          // 0..15  (16 B * 16 = 256 B bulk, plus 16 B tail)
     const int safe_load_row = (row_start + load_row < total_m)
         ? (row_start + load_row) : (total_m - 1);
     const char* A_load;
@@ -242,26 +235,30 @@ extern "C" __global__ void gemm_gate_up_mq4cg256_wmma_gfx12_ldsstage(
     float8_t acc = {0, 0, 0, 0, 0, 0, 0, 0};
 
     for (int slab = 0; slab < slabs; ++slab) {
-        const char* src0 = A_load + (long long)local_load_row * gpr * 128
-            + (long long)slab * 256 + load_vec * 16;
+        const char* src0 = A_load + (long long)local_load_row * gpr * 136
+            + (long long)slab * 272 + load_vec * 16;
         unsigned char* dst0 = staged_weights[load_row] + load_vec * 16;
         *(uint4v_t*)dst0 = *(const uint4v_t*)src0;
+        if (tid < 16) {
+            const int safe_tail_row = (row_start + tid < total_m)
+                ? (row_start + tid) : (total_m - 1);
+            const char* A_tail;
+            int local_tail_row;
+            if (safe_tail_row < gate_m) {
+                A_tail = A_gate;  local_tail_row = safe_tail_row;
+            } else {
+                A_tail = A_up;    local_tail_row = safe_tail_row - gate_m;
+            }
+            const char* src1 = A_tail + (long long)local_tail_row * gpr * 136 + (long long)slab * 272 + 256;
+            unsigned char* dst1 = staged_weights[tid] + 256;
+            *(uint4v_t*)dst1 = *(const uint4v_t*)src1;
+        }
         __syncthreads();
 
         const int group_in_slab = wave >> 2;
         const int quarter_in_group = wave & 3;
-        const unsigned char* gp = staged_weights[m_lane] + group_in_slab * 128;
-        // planar header from correct tensor's header plane (not staged)
-        const int safe_consume_row = (row_start + m_lane < total_m) ? (row_start + m_lane) : (total_m - 1);
-        const char* header_ptr;
-        if (safe_consume_row < gate_m) {
-            header_ptr = hplane_gate + (long long)safe_consume_row * gpr * 4
-                         + (slab * 2 + group_in_slab) * 4;
-        } else {
-            header_ptr = hplane_up + (long long)(safe_consume_row - gate_m) * gpr * 4
-                         + (slab * 2 + group_in_slab) * 4;
-        }
-        const unsigned int hdr__ = *(const unsigned int*)(header_ptr);
+        const unsigned char* gp = staged_weights[m_lane] + group_in_slab * 136;
+        const unsigned int hdr__ = *(const unsigned int*)(gp);
         _Float16 sc_h = __ushort_as_half((unsigned short)(hdr__ & 0xFFFFu));
         _Float16 zp_h = __ushort_as_half((unsigned short)(hdr__ >> 16));
         const _Float16* xg = x_base + slab * 512 + wave * 64;
@@ -277,11 +274,11 @@ extern "C" __global__ void gemm_gate_up_mq4cg256_wmma_gfx12_ldsstage(
             a_reg[6] = sc_h * (_Float16)(float)(((pk) >> 24) & 0xFu) + zp_h; \
             a_reg[7] = sc_h * (_Float16)(float)(((pk) >> 28) & 0xFu) + zp_h
 
-        // Planar: payload directly, no +4 header offset in LDS.
-        const unsigned int pka = *(const unsigned int*)(gp + packed_base + 0 + k_grp * 4);
-        const unsigned int pkb = *(const unsigned int*)(gp + packed_base + 8 + k_grp * 4);
-        const unsigned int pkc = *(const unsigned int*)(gp + packed_base + 16 + k_grp * 4);
-        const unsigned int pkd = *(const unsigned int*)(gp + packed_base + 24 + k_grp * 4);
+        // Pad: header at gp[0..4), payload at gp+8.
+        const unsigned int pka = *(const unsigned int*)(gp + 8 + packed_base + 0 + k_grp * 4);
+        const unsigned int pkb = *(const unsigned int*)(gp + 8 + packed_base + 8 + k_grp * 4);
+        const unsigned int pkc = *(const unsigned int*)(gp + 8 + packed_base + 16 + k_grp * 4);
+        const unsigned int pkd = *(const unsigned int*)(gp + 8 + packed_base + 24 + k_grp * 4);
 
 
         const half8_t b_a = *(const half8_t*)(xg + 0 + k_grp * 8);

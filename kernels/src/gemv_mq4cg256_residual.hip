@@ -4,14 +4,12 @@
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
-
 #ifndef HIPFIRE_WEIGHT_RSRC
 #define HIPFIRE_WEIGHT_RSRC(base) 0
 #endif
 #ifndef HIPFIRE_WEIGHT_LOAD_PTR_U32
 #define HIPFIRE_WEIGHT_LOAD_PTR_U32(rsrc, ptr, off) (*(const unsigned int*)(ptr))
 #endif
-
 #ifndef HIPFIRE_MQ4C_RESIDUAL_KERNEL
 #define HIPFIRE_MQ4C_RESIDUAL_KERNEL gemv_mq4cg256_residual
 #endif
@@ -61,7 +59,7 @@
 // VGPRs) while 84, 80, 76, 72 and 64 do not — a small cap violation gets patched
 // by spilling, a large one makes the scheduler re-plan.
 //
-// Bisected separately: the 136->128 stride change alone is free (93 VGPR / occ
+// Bisected separately: the 136->132 stride change alone is free (93 VGPR / occ
 // 16), and REMOVING the fp16 conversion makes it worse (99 VGPR), so the +4 is
 // the loss of v1's adjacent `dwordx2` header merge — not the conversion, not
 // alignment.
@@ -96,14 +94,9 @@ extern "C" __global__ void HIPFIRE_MQ4C_RESIDUAL_KERNEL(
 #else
     const int groups_per_row = K / 256;
 #endif
-    const long long row_stride = (long long)groups_per_row * 128;
+    const long long row_stride = (long long)groups_per_row * 136;
     const char* row_ptr0 = A + (long long)row0 * row_stride;
     const char* row_ptr1 = A + (long long)(have_row1 ? row1 : row0) * row_stride;
-    // Planar: payloads occupy [0, M*gpr*128); the 4 B/group headers follow.
-    // header(row,g) sits at hplane + (row*gpr + g)*4, and (row*gpr+g)*128 is
-    // exactly (gp - A), so the header address is hplane + ((gp - A) >> 5).
-    const char* hplane = A + (long long)M * groups_per_row * 128;
-    const unsigned int hplane_off = (unsigned int)((long long)M * groups_per_row * 128);
     const int boff = tid * 4;
     const unsigned int row_weight_offset0 = (unsigned int)((long long)row0 * row_stride);
     const unsigned int row_weight_offset1 =
@@ -132,22 +125,22 @@ extern "C" __global__ void HIPFIRE_MQ4C_RESIDUAL_KERNEL(
     // v1.5 / mq4c header: ONE dword at the group base holds both fields as fp16 --
     // low half the scale, high half the zero -- over all 256 weights. v1 spent two
     // f32 dwords on the same information, so this halves the header load count and
-    // shortens the group from 136 B to 128 B. Payload therefore starts at +4, not +8.
+    // shortens the group from 136 B to 132 B. Payload therefore starts at +4, not +8.
     //
     // Unlike v2 there is NO half select and NO cndmask: the grid is still per-256, so
     // one (scale, zero) governs the whole group. That is precisely why v1.5 is
     // expected to be faster than v1 rather than slightly slower.
     #if HIPFIRE_GFX1151_RESIDUAL_HYBRID_BUFFER
-    #define HIPFIRE_MQ4C_LOAD_HDR(weight_rsrc, gp, weight_offset) (*(const unsigned int*)(hplane + (((gp) - A) >> 5)))
+    #define HIPFIRE_MQ4C_LOAD_HDR(weight_rsrc, gp, weight_offset) (*(const unsigned int*)(gp))
     #else
-    #define HIPFIRE_MQ4C_LOAD_HDR(weight_rsrc, gp, weight_offset) HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc, hplane + (((gp) - A) >> 5), hplane_off + ((weight_offset) >> 5))
+    #define HIPFIRE_MQ4C_LOAD_HDR(weight_rsrc, gp, weight_offset) HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc, gp, weight_offset)
     #endif
 
     #define LOAD_W(gp, weight_offset, sc, zp, pk) do { \
         const unsigned int hdr__ = HIPFIRE_MQ4C_LOAD_HDR(weight_rsrc, gp, weight_offset); \
         (sc) = __half2float(__ushort_as_half((unsigned short)(hdr__ & 0xFFFFu))); \
         (zp) = __half2float(__ushort_as_half((unsigned short)(hdr__ >> 16))); \
-        (pk) = HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc, (gp) + boff, (weight_offset) + boff); \
+        (pk) = HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc, (gp) + 8 + boff, (weight_offset) + 8 + boff); \
     } while (0)
 
 #if defined(HIPFIRE_GFX1151_RESIDUAL_K4096)
@@ -174,14 +167,14 @@ extern "C" __global__ void HIPFIRE_MQ4C_RESIDUAL_KERNEL(
         float sc0a, zp0a, sc1a, zp1a, sc2a, zp2a, sc3a, zp3a;
         float sc0b, zp0b, sc1b, zp1b, sc2b, zp2b, sc3b, zp3b;
         unsigned int pk0a, pk1a, pk2a, pk3a, pk0b, pk1b, pk2b, pk3b;
-        LOAD_W(row_ptr0 + g * 128, row_weight_offset0 + g * 128, sc0a, zp0a, pk0a);
-        LOAD_W(row_ptr0 + (g + 1) * 128, row_weight_offset0 + (g + 1) * 128, sc1a, zp1a, pk1a);
-        LOAD_W(row_ptr0 + (g + 2) * 128, row_weight_offset0 + (g + 2) * 128, sc2a, zp2a, pk2a);
-        LOAD_W(row_ptr0 + (g + 3) * 128, row_weight_offset0 + (g + 3) * 128, sc3a, zp3a, pk3a);
-        LOAD_W(row_ptr1 + g * 128, row_weight_offset1 + g * 128, sc0b, zp0b, pk0b);
-        LOAD_W(row_ptr1 + (g + 1) * 128, row_weight_offset1 + (g + 1) * 128, sc1b, zp1b, pk1b);
-        LOAD_W(row_ptr1 + (g + 2) * 128, row_weight_offset1 + (g + 2) * 128, sc2b, zp2b, pk2b);
-        LOAD_W(row_ptr1 + (g + 3) * 128, row_weight_offset1 + (g + 3) * 128, sc3b, zp3b, pk3b);
+        LOAD_W(row_ptr0 + g * 136, row_weight_offset0 + g * 136, sc0a, zp0a, pk0a);
+        LOAD_W(row_ptr0 + (g + 1) * 136, row_weight_offset0 + (g + 1) * 136, sc1a, zp1a, pk1a);
+        LOAD_W(row_ptr0 + (g + 2) * 136, row_weight_offset0 + (g + 2) * 136, sc2a, zp2a, pk2a);
+        LOAD_W(row_ptr0 + (g + 3) * 136, row_weight_offset0 + (g + 3) * 136, sc3a, zp3a, pk3a);
+        LOAD_W(row_ptr1 + g * 136, row_weight_offset1 + g * 136, sc0b, zp0b, pk0b);
+        LOAD_W(row_ptr1 + (g + 1) * 136, row_weight_offset1 + (g + 1) * 136, sc1b, zp1b, pk1b);
+        LOAD_W(row_ptr1 + (g + 2) * 136, row_weight_offset1 + (g + 2) * 136, sc2b, zp2b, pk2b);
+        LOAD_W(row_ptr1 + (g + 3) * 136, row_weight_offset1 + (g + 3) * 136, sc3b, zp3b, pk3b);
 
         // Pure FMA phase: same dual-row DOG order and acc slots as baseline.
         DOG_X8(sc0a, zp0a, pk0a, acc0,
@@ -212,8 +205,8 @@ extern "C" __global__ void HIPFIRE_MQ4C_RESIDUAL_KERNEL(
         const float4 xb = *reinterpret_cast<const float4*>(x + base + 4);
         float sc0, zp0, sc1, zp1;
         unsigned int pk0, pk1;
-        LOAD_W(row_ptr0 + g * 128, row_weight_offset0 + g * 128, sc0, zp0, pk0);
-        LOAD_W(row_ptr1 + g * 128, row_weight_offset1 + g * 128, sc1, zp1, pk1);
+        LOAD_W(row_ptr0 + g * 136, row_weight_offset0 + g * 136, sc0, zp0, pk0);
+        LOAD_W(row_ptr1 + g * 136, row_weight_offset1 + g * 136, sc1, zp1, pk1);
         DOG_X8(sc0, zp0, pk0, acc0,
                xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w);
         DOG_X8(sc1, zp1, pk1, bcc0,
@@ -226,8 +219,8 @@ extern "C" __global__ void HIPFIRE_MQ4C_RESIDUAL_KERNEL(
         const float4 xb = *reinterpret_cast<const float4*>(x + base + 4);
         float sc0, zp0, sc1, zp1;
         unsigned int pk0, pk1;
-        LOAD_W(row_ptr0 + g * 128, row_weight_offset0 + g * 128, sc0, zp0, pk0);
-        LOAD_W(row_ptr1 + g * 128, row_weight_offset1 + g * 128, sc1, zp1, pk1);
+        LOAD_W(row_ptr0 + g * 136, row_weight_offset0 + g * 136, sc0, zp0, pk0);
+        LOAD_W(row_ptr1 + g * 136, row_weight_offset1 + g * 136, sc1, zp1, pk1);
         DOG_X8(sc0, zp0, pk0, acc1,
                xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w);
         DOG_X8(sc1, zp1, pk1, bcc1,
@@ -240,8 +233,8 @@ extern "C" __global__ void HIPFIRE_MQ4C_RESIDUAL_KERNEL(
         const float4 xb = *reinterpret_cast<const float4*>(x + base + 4);
         float sc0, zp0, sc1, zp1;
         unsigned int pk0, pk1;
-        LOAD_W(row_ptr0 + g * 128, row_weight_offset0 + g * 128, sc0, zp0, pk0);
-        LOAD_W(row_ptr1 + g * 128, row_weight_offset1 + g * 128, sc1, zp1, pk1);
+        LOAD_W(row_ptr0 + g * 136, row_weight_offset0 + g * 136, sc0, zp0, pk0);
+        LOAD_W(row_ptr1 + g * 136, row_weight_offset1 + g * 136, sc1, zp1, pk1);
         DOG_X8(sc0, zp0, pk0, acc2,
                xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w);
         DOG_X8(sc1, zp1, pk1, bcc2,

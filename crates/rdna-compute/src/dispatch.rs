@@ -97,13 +97,19 @@ pub const GL_MQ35_GROUP_SIZE: usize = 256;
 /// half-wave uniform, lane-invariant scalar loads. `K % 256 == 0`.
 pub const MQ4V2_GROUP_BYTES: usize = 136;
 
-/// Per-group bytes for MQ4-G256-C (qt=45): 132 B/group, 4.125 bpw, byte-identical
-/// payload to MQ4G256 (qt=13) except header is ONE fp16 scale/zero per 256:
-/// `[0..2)` fp16 scale, `[2..4)` fp16 zero, `[4..132)` 128 B nibbles.
-/// ONE affine grid per 256 (`w = q * scale + zero`), unlike qt=44's dual half-grids.
-/// `K % 256 == 0`, little-endian, low 16 scale / high 16 zero in header dword,
-/// half-wave uniform, lane-invariant scalar loads. See `kernels/src/gemv_mq4cg256_residual.hip`.
-pub const MQ4C_GROUP_BYTES: usize = 132;
+/// Per-group bytes for MQ4-G256-C (qt=45): 136 B/group, 4.25 bpw, byte-identical
+/// payload to MQ4G256 (qt=13) at the same offset. Pad layout (NOT the earlier
+/// 132 B planar layout):
+/// per group, 136 B stride: `[0..4)` fp16 header, `[4..8)` zero padding, `[8..136)` 128 B nibbles.
+/// Header is ONE packed dword, low 16 bits fp16 scale, high 16 bits fp16 zero,
+/// governing all 256 weights (`w = q * scale + zero`), unlike qt=44's dual half-grids.
+/// The 4 padding bytes are the deliberate price of putting the payload at +8 where
+/// v1 has it: a 132 B stride left the payload 4-byte aligned half the time and cost
+/// 7-11% prefill on `global_load_b128`. The pad layout is the same size as v1
+/// (136 B/group, `m*gpr*136` per tensor), so the 2.43% size win is deliberately given up.
+/// Little-endian, lane-invariant scalar loads. See `kernels/src/gemv_mq4cpad_residual.hip`
+/// and `kernels/src/gemm_mq4cpad_residual_wmma_gfx12_bt.hip`.
+pub const MQ4C_GROUP_BYTES: usize = 136;
 
 /// Bytes per group in the trailing fp16 scale region (both GL dtypes).
 pub const GL_GROUP_SCALE_BYTES: usize = 2;
@@ -458,9 +464,9 @@ pub enum DType {
     /// Little-endian, low 16 scale / high 16 zero per dword, half-wave uniform,
     /// lane-invariant scalar loads. `K % 256 == 0`, 4.25 bpw.
     MQ4G256V2,
-    /// MQ4-G256-C (qt=45): FWHT-rotated, 132 B/group, 4.125 bpw, byte-identical payload
-    /// to MQ4G256 except header is ONE fp16 scale/zero per 256: `[0..2)` fp16 scale,
-    /// `[2..4)` fp16 zero, `[4..132)` 128 B nibbles. ONE affine grid per 256
+    /// MQ4-G256-C (qt=45): FWHT-rotated, 136 B/group, 4.25 bpw, pad layout:
+    /// per group 136 B: `[0..4)` fp16 header (low scale, high zero), `[4..8)` zero padding,
+    /// `[8..136)` 128 B nibbles at same offset as v1 (MQ4G256). ONE affine grid per 256
     /// (`w = q * scale + zero`), half-wave uniform, lane-invariant scalar loads.
     /// `K % 256 == 0`.
     MQ4CG256,

@@ -9,7 +9,7 @@
 // Qwen3.5 FullAttention preamble (Q + K + V projections).
 //
 // **gfx12 (RDNA4) variant** — sister of gemm_qkv_hfq4g256_wmma.gfx12.hip with
-// the planar mq4c layout (payload plane 128 B/group, header plane 4 B/group).
+// the pad mq4c layout (136 B/group, header inline).
 // Compile this file with hipcc --offload-arch=gfx1200 (or gfx1201, ...).
 
 //
@@ -99,8 +99,7 @@ extern "C" __global__ void gemm_qkv_mq4cg256_wmma_gfx12(
     }
 
     const int gpr = K / 256;
-    const char* row_base = A + (long long)local_row * gpr * 128;
-    const char* header_base = A + (long long)tensor_m * gpr * 128 + (long long)local_row * gpr * 4;
+    const char* row_base = A + (long long)local_row * gpr * 136;
 
     // B operand indexes BATCH (N) dimension by m_lane (CK kBNLane=16).
     // In gfx11 each lane held the FULL 16-K of its batch row; in gfx12 each
@@ -110,9 +109,8 @@ extern "C" __global__ void gemm_qkv_mq4cg256_wmma_gfx12(
     float8_t acc = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
 
     for (int g = 0; g < gpr; g++) {
-        const char* gp = row_base + g * 128;
-        // planar header: packed dword in header plane.
-        const unsigned int hdr__ = *(const unsigned int*)(header_base + g * 4);
+        const char* gp = row_base + g * 136;
+        const unsigned int hdr__ = *(const unsigned int*)(gp);
         const _Float16 sc_h = (_Float16)__half2float(__ushort_as_half((unsigned short)(hdr__ & 0xFFFFu)));
         const _Float16 zp_h = (_Float16)__half2float(__ushort_as_half((unsigned short)(hdr__ >> 16)));
 
@@ -137,10 +135,10 @@ extern "C" __global__ void gemm_qkv_mq4cg256_wmma_gfx12(
             const int k_off_c = (kt + 2) * 16;
             const int k_off_d = (kt + 3) * 16;
 
-            unsigned int pka = *(const unsigned int*)(gp + k_off_a / 2 + k_grp * 4);
-            unsigned int pkb = *(const unsigned int*)(gp + k_off_b / 2 + k_grp * 4);
-            unsigned int pkc = *(const unsigned int*)(gp + k_off_c / 2 + k_grp * 4);
-            unsigned int pkd = *(const unsigned int*)(gp + k_off_d / 2 + k_grp * 4);
+            unsigned int pka = *(const unsigned int*)(gp + 8 + k_off_a / 2 + k_grp * 4);
+            unsigned int pkb = *(const unsigned int*)(gp + 8 + k_off_b / 2 + k_grp * 4);
+            unsigned int pkc = *(const unsigned int*)(gp + 8 + k_off_c / 2 + k_grp * 4);
+            unsigned int pkd = *(const unsigned int*)(gp + 8 + k_off_d / 2 + k_grp * 4);
 
 
             half8_t b_a = *(const half8_t*)(x_base + k_off_a + k_grp * 8);

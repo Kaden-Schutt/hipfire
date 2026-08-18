@@ -7,7 +7,7 @@
 // weights+dequant loaded once per K-tile, reused across the B N-tiles. The
 // per-row weight/output routing (A_qkv/A_z/A_beta/A_alpha) is unchanged.
 // Byte-exact vs the 1-acc kernel. Grid: [ceil(total_m/16), ceil(N/(16*B))].
-// Port of gemm_qkvza_hfq4g256_wmma_gfx12_bt.hip to qt=45 (planar: 128 B payload plane + 4 B header plane per group).
+// Port of gemm_qkvza_hfq4g256_wmma_gfx12_bt.hip to qt=45 (pad: 136 B/group (header inline)).
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 typedef _Float16 __attribute__((ext_vector_type(8))) half8_t;
@@ -28,23 +28,23 @@ extern "C" __launch_bounds__(32, 2) __global__ void gemm_qkvza_mq4cg256_wmma_gfx
     if (rs >= total_m || bs >= N) return; \
     const int ml = tid & 15, kg = tid >> 4; \
     const int sr = (rs + ml < total_m) ? (rs + ml) : (total_m - 1); \
-    const int gpr = K / 256; const char* A; int lrow; const char* hb; \
-    if (sr < qkv_m) { A = A_qkv; lrow = sr; hb = A_qkv + (long long)qkv_m * gpr * 128 + (long long)lrow * gpr * 4; } \
-    else if (sr < qkv_m + z_m) { A = A_z; lrow = sr - qkv_m; hb = A_z + (long long)z_m * gpr * 128 + (long long)lrow * gpr * 4; } \
-    else if (sr < qkv_m + z_m + beta_m) { A = A_beta; lrow = sr - (qkv_m + z_m); hb = A_beta + (long long)beta_m * gpr * 128 + (long long)lrow * gpr * 4; } \
-    else { A = A_alpha; lrow = sr - (qkv_m + z_m + beta_m); hb = A_alpha + (long long)alpha_m * gpr * 128 + (long long)lrow * gpr * 4; } \
-    const char* rb = A + (long long)lrow * gpr * 128; \
+    const int gpr = K / 256; const char* A; int lrow; \
+    if (sr < qkv_m) { A = A_qkv; lrow = sr; } \
+    else if (sr < qkv_m + z_m) { A = A_z; lrow = sr - qkv_m; } \
+    else if (sr < qkv_m + z_m + beta_m) { A = A_beta; lrow = sr - (qkv_m + z_m); } \
+    else { A = A_alpha; lrow = sr - (qkv_m + z_m + beta_m); } \
+    const char* rb = A + (long long)lrow * gpr * 136; \
     int sb[BV]; for (int b = 0; b < BV; b++) { int t = bs + b * 16 + ml; sb[b] = (t < N) ? t : 0; } \
     float8_t acc[BV]; for (int b = 0; b < BV; b++) acc[b] = float8_t{0,0,0,0,0,0,0,0}; \
     for (int g = 0; g < gpr; g++) { \
-        const char* gp = rb + g * 128; \
-        const unsigned int hdr__ = *(const unsigned int*)(hb + g * 4); \
+        const char* gp = rb + g * 136; \
+        const unsigned int hdr__ = *(const unsigned int*)(gp); \
         _Float16 sc = __ushort_as_half((unsigned short)(hdr__ & 0xFFFFu)); \
         _Float16 zp = __ushort_as_half((unsigned short)(hdr__ >> 16)); \
         const _Float16* xg[BV]; for (int b = 0; b < BV; b++) xg[b] = X + (long long)sb[b] * K + g * 256; \
         for (int kt = 0; kt < 16; kt += 4) { \
-            unsigned int p[4] = { *(const unsigned int*)(gp+(kt+0)*8+kg*4), *(const unsigned int*)(gp+(kt+1)*8+kg*4), \
-                                  *(const unsigned int*)(gp+(kt+2)*8+kg*4), *(const unsigned int*)(gp+(kt+3)*8+kg*4) }; \
+            unsigned int p[4] = { *(const unsigned int*)(gp+8+(kt+0)*8+kg*4), *(const unsigned int*)(gp+8+(kt+1)*8+kg*4), \
+                                  *(const unsigned int*)(gp+8+(kt+2)*8+kg*4), *(const unsigned int*)(gp+8+(kt+3)*8+kg*4) }; \
             _Pragma("unroll") \
             for (int ki = 0; ki < 4; ki++) { half8_t a; MQ4C_DQ8(p[ki], sc, zp); \
                 _Pragma("unroll") \
