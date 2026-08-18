@@ -14332,9 +14332,33 @@ fn main() {
                         || format == "q4"
                         || format == "q4f16_g64";
                     if !is_q4_opt_in {
+                        // Print the decision state, not just the symptom. The chain that
+                        // lands here is ~1000 lines and 50+ arms across five K-map levels,
+                        // so "which arm should have caught this" is not answerable by
+                        // reading it — every past fall-through cost a full model load to
+                        // diagnose. These are the inputs every mq4-family arm branches on.
                         eprintln!(
-                            "error: tensor '{}' fell through to QuantType::Q4F16G64 (qt=0, G64 fallback) with --format '{}'; this indicates a missing classification arm (likely is_embed). Add the format to the appropriate is_embed guard or explicitly request --format q4f16g64.",
-                            name, format
+                            "error: tensor '{}' fell through to QuantType::Q4F16G64 (qt=0, G64 \
+                             legacy fallback) with --format '{}'. This is a missing \
+                             classification arm, not a valid result.\n  \
+                             decision state: shape={:?} k_dim={} k%256={} kmap_level={:?} \
+                             is_embed={} q8_router={}\n  \
+                             mq4 family flags: use_mq4v2={} use_mq4g256={} use_mq4gl={} \
+                             use_mq4sel={}\n  \
+                             Fix the arm for the flag that is true; do not add a q4f16g64 \
+                             opt-in to silence this.",
+                            name,
+                            format,
+                            meta.shape,
+                            if meta.shape.len() == 2 { meta.shape[1] } else { n_elements },
+                            if meta.shape.len() == 2 { meta.shape[1] % 256 } else { n_elements % 256 },
+                            kmap_level,
+                            is_embed,
+                            q8_router,
+                            use_mq4v2,
+                            use_mq4g256,
+                            use_mq4gl,
+                            use_mq4sel,
                         );
                         std::process::exit(1);
                     }
