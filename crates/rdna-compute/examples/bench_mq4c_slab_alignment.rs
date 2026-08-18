@@ -47,6 +47,10 @@ const MQ4C_BT_SRC: &str = include_str!("../../../kernels/src/gemm_mq4cg256_resid
 // tells us which variable owns the delta. NOT a shipping candidate: the 4 B pad
 // gives back the entire 2.43% size win.
 const MQ4CPAD_BT_SRC: &str = include_str!("../../../kernels/src/gemm_mq4cpad_residual_wmma_gfx12_bt.hip");
+// Arm D: planar split. Payload plane at 128 B stride (perfectly 16 B aligned,
+// better than v1's 136) followed by a contiguous 4 B/group header plane.
+// Still 132 B/group total, so unlike arm C the 2.43% size win SURVIVES.
+const MQ4CPLANAR_BT_SRC: &str = include_str!("../../../kernels/src/gemm_mq4cplanar_residual_wmma_gfx12_bt.hip");
 
 fn f16_bits(x: f32) -> u16 {
     let b = x.to_bits();
@@ -251,6 +255,12 @@ fn main() {
             Ok(()) => eprintln!("compiled {sym_pad}"),
             Err(e) => eprintln!("compile {sym_pad} failed: {e}"),
         }
+        let sym_pl = format!("gemm_mq4cplanar_residual_wmma_gfx12_bt{bv}");
+        let mod_pl = format!("bench_mq4cplanar_bt{bv}");
+        match gpu.ensure_kernel_public(&mod_pl, MQ4CPLANAR_BT_SRC, &sym_pl) {
+            Ok(()) => eprintln!("compiled {sym_pl}"),
+            Err(e) => eprintln!("compile {sym_pl} failed: {e}"),
+        }
     }
     // also ensure bt4 present as sanity (not benched unless BVS includes 4)
     // quick check that at least one bt compiled
@@ -275,6 +285,18 @@ fn main() {
         v
     };
     let d_pad = gpu.upload_raw(&b_pad, &[b_pad.len()]).unwrap();
+    // arm D: [payload plane: M*gpr*128][header plane: M*gpr*4] = 132 B/group total.
+    let b_planar: Vec<u8> = {
+        let mut v = vec![0u8; M * gpr * MQ4C_BYTES];
+        let hbase = M * gpr * 128;
+        for g in 0..(M * gpr) {
+            let src = &b_mq4c[g * MQ4C_BYTES..(g + 1) * MQ4C_BYTES];
+            v[g * 128..(g + 1) * 128].copy_from_slice(&src[4..MQ4C_BYTES]);
+            v[hbase + g * 4..hbase + g * 4 + 4].copy_from_slice(&src[0..4]);
+        }
+        v
+    };
+    let d_planar = gpu.upload_raw(&b_planar, &[b_planar.len()]).unwrap();
 
     // correctness gate first, then timing
     println!("\ncorrectness gate: M={M} K={K} gpr={gpr} batches {:?}  BVs {:?}", BATCHES, BVS);
@@ -303,14 +325,16 @@ fn main() {
                 (format!("v1_bt{bv}"), 0u8, &y_host_v1),
                 (format!("mq4c_bt{bv}"), 1u8, &y_host_mq),
                 (format!("mq4cpad_bt{bv}"), 2u8, &y_host_mq),
+                (format!("mq4cplanar_bt{bv}"), 3u8, &y_host_mq),
             ] {
                 let sym = match kind {
                     0 => format!("gemm_hfq4g256_residual_wmma_gfx12_bt{bv}"),
                     1 => format!("gemm_mq4cg256_residual_wmma_gfx12_bt{bv}"),
-                    _ => format!("gemm_mq4cpad_residual_wmma_gfx12_bt{bv}"),
+                    2 => format!("gemm_mq4cpad_residual_wmma_gfx12_bt{bv}"),
+                    _ => format!("gemm_mq4cplanar_residual_wmma_gfx12_bt{bv}"),
                 };
                 let d_y = gpu.zeros(&[batch*M], DType::F32).unwrap();
-                let a_ptr = match kind { 0 => &d_v1, 1 => &d_mq4c, _ => &d_pad };
+                let a_ptr = match kind { 0 => &d_v1, 1 => &d_mq4c, 2 => &d_pad, _ => &d_planar };
                 let grid = [ ((M+15)/16) as u32, ((batch + 16*bv -1)/(16*bv)) as u32, 1];
                 let block = [32u32,1,1];
                 let mut kb = KernargBlob::new();
@@ -373,11 +397,12 @@ fn main() {
             arms.push(Arm{ label: format!("v1_bt{bv}"), sym: format!("gemm_hfq4g256_residual_wmma_gfx12_bt{bv}"), kind: 0, bv, samples: Vec::new() });
             arms.push(Arm{ label: format!("mq4c_bt{bv}"), sym: format!("gemm_mq4cg256_residual_wmma_gfx12_bt{bv}"), kind: 1, bv, samples: Vec::new() });
             arms.push(Arm{ label: format!("mq4cpad_bt{bv}"), sym: format!("gemm_mq4cpad_residual_wmma_gfx12_bt{bv}"), kind: 2, bv, samples: Vec::new() });
+            arms.push(Arm{ label: format!("mq4cplanar_bt{bv}"), sym: format!("gemm_mq4cplanar_residual_wmma_gfx12_bt{bv}"), kind: 3, bv, samples: Vec::new() });
         }
         // warmups
         for arm in &arms {
             let d_y = gpu.zeros(&[batch*M], DType::F32).unwrap();
-            let a_ptr = match arm.kind { 0 => &d_v1, 1 => &d_mq4c, _ => &d_pad };
+            let a_ptr = match arm.kind { 0 => &d_v1, 1 => &d_mq4c, 2 => &d_pad, _ => &d_planar };
             let grid = [ ((M+15)/16) as u32, ((batch + 16*arm.bv -1)/(16*arm.bv)) as u32, 1];
             let block = [32u32,1,1];
             for _ in 0..WARMUP {
@@ -396,7 +421,7 @@ fn main() {
         for _run in 0..RUNS {
             for arm in &mut arms {
                 let d_y = gpu.zeros(&[batch*M], DType::F32).unwrap();
-                let a_ptr = match arm.kind { 0 => &d_v1, 1 => &d_mq4c, _ => &d_pad };
+                let a_ptr = match arm.kind { 0 => &d_v1, 1 => &d_mq4c, 2 => &d_pad, _ => &d_planar };
                 let grid = [ ((M+15)/16) as u32, ((batch + 16*arm.bv -1)/(16*arm.bv)) as u32, 1];
                 let block = [32u32,1,1];
                 // pre-sync to flush
@@ -426,7 +451,7 @@ fn main() {
         // report
         let bytes_for = |kind: u8| -> f64 {
             // arm C streams v1's byte count (padded), arm B streams 2.43% less
-            let w = if kind == 1 { weight_bytes_mq } else { weight_bytes_v1 };
+            let w = if kind == 1 || kind == 3 { weight_bytes_mq } else { weight_bytes_v1 };
             // bytes = weight (read once) + X fp16 (batch*K*2) + Y F32 read+write (batch*M*4*2 for residual +=)
             w + (batch*K*2) as f64 + (batch*M*4*2) as f64
         };
@@ -453,7 +478,7 @@ fn main() {
         // per-batch summary sentence
         for &bv in BVS {
             let v1 = arms.iter().find(|a| a.kind==0 && a.bv==bv).unwrap();
-            for (kind, name) in [(1u8, "mq4c   "), (2u8, "mq4cpad")] {
+            for (kind, name) in [(1u8, "mq4c      "), (2u8, "mq4cpad   "), (3u8, "mq4cplanar")] {
                 let Some(mq) = arms.iter().find(|a| a.kind==kind && a.bv==bv) else { continue };
                 if mq.samples.is_empty() { continue; }
                 let r = minv(&mq.samples)/minv(&v1.samples);
