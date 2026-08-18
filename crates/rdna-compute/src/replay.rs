@@ -601,7 +601,16 @@ const fn write(offset: usize) -> PointerEffect {
 fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
     if matches!(
         kernel,
-        "fused_gate_up_hfq4g256" | "fused_gate_up_hfq4g256_k1024_gfx1201"
+        "fused_gate_up_hfq4g256"
+            | "fused_gate_up_hfq4g256_k1024_gfx1201"
+            | "fused_gate_up_hfq4g256_dot_reform_gfx1100"
+            | "fused_gate_up_hfq4g256_dot_prefetch_gfx1100"
+            | "fused_gate_up_hfq4g256_pair_gfx1100"
+            | "fused_gate_up_hfq4g256_pair2_gfx1100"
+            | "fused_gate_up_hfq4g256_quad_prefetch_gfx1100"
+            | "fused_gate_up_hfq4g256_setprio_gfx1100"
+            | "fused_gate_up_hfq4g256_lane0_headers_gfx1100"
+            | "fused_gate_up_hfq4g256_stage_x32_gfx1100"
     ) {
         return Some(vec![read(0), read(8), read(16), write(24), write(32)]);
     }
@@ -715,7 +724,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
     {
         return Some(vec![read(0), write(8), write(16)]);
     }
-    if kernel.starts_with("gated_delta_net_q8_compact2_") {
+    if kernel.starts_with("gated_delta_net_q8_compact") {
         return Some(vec![
             read(0),
             read(8),
@@ -925,7 +934,9 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             write(80),
         ]),
         "gated_norm_f32" => Some(vec![read(0), read(8), read(16), write(24)]),
-        "gated_norm_mq_rotate_gfx1100" | "gated_norm_mq_rotate_gfx1151" => Some(vec![
+        "gated_norm_mq_rotate_gfx1100"
+        | "gated_norm_mq_rotate_k6144_gfx1100"
+        | "gated_norm_mq_rotate_gfx1151" => Some(vec![
             read(0),
             read(8),
             read(16),
@@ -933,7 +944,9 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             read(32),
             write(40),
         ]),
-        "qwen35_fa_prep_gfx1100" | "qwen35_fa_prep_gfx1151" => Some(vec![
+        "qwen35_fa_prep_gfx1100"
+        | "qwen36_27b_fa_prep_gfx1100"
+        | "qwen35_fa_prep_gfx1151" => Some(vec![
             read(0),
             write(8),
             write(16),
@@ -1130,7 +1143,16 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
     }
     if matches!(
         kernel,
-        "fused_gate_up_hfq4g256" | "fused_gate_up_hfq4g256_k1024_gfx1201"
+        "fused_gate_up_hfq4g256"
+            | "fused_gate_up_hfq4g256_k1024_gfx1201"
+            | "fused_gate_up_hfq4g256_dot_reform_gfx1100"
+            | "fused_gate_up_hfq4g256_dot_prefetch_gfx1100"
+            | "fused_gate_up_hfq4g256_pair_gfx1100"
+            | "fused_gate_up_hfq4g256_pair2_gfx1100"
+            | "fused_gate_up_hfq4g256_quad_prefetch_gfx1100"
+            | "fused_gate_up_hfq4g256_setprio_gfx1100"
+            | "fused_gate_up_hfq4g256_lane0_headers_gfx1100"
+            | "fused_gate_up_hfq4g256_stage_x32_gfx1100"
     ) {
         return Some(64);
     }
@@ -1224,7 +1246,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         return Some(80);
     }
 
-    if kernel.starts_with("gated_delta_net_q8_compact2_") {
+    if kernel.starts_with("gated_delta_net_q8_compact") {
         return Some(96);
     }
     if kernel == "conv1d_silu_split_qknorm_b256_scalar_prep" {
@@ -1300,8 +1322,10 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "conv1d_gated_decode_f32" => Some(48),
         "conv1d_silu_split_f32"
         | "gated_norm_mq_rotate_gfx1100"
+        | "gated_norm_mq_rotate_k6144_gfx1100"
         | "gated_norm_mq_rotate_gfx1151"
         | "qwen35_fa_prep_gfx1100"
+        | "qwen36_27b_fa_prep_gfx1100"
         | "qwen35_fa_prep_gfx1151"
         | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100"
         | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151"
@@ -2348,8 +2372,8 @@ impl Pm4MidAcquirePolicy {
 }
 
 fn required_mid_acquire(previous: &str, current: &str) -> bool {
-    if previous.starts_with("gated_delta_net_q8_compact2_")
-        || current.starts_with("gated_delta_net_q8_compact2_")
+    if previous.starts_with("gated_delta_net_q8_compact")
+        || current.starts_with("gated_delta_net_q8_compact")
     {
         return true;
     }
@@ -2377,8 +2401,8 @@ fn required_mid_acquire(previous: &str, current: &str) -> bool {
 }
 
 fn conservative_mid_acquire_except(previous: &str, current: &str, excluded: Option<&str>) -> bool {
-    if previous.starts_with("gated_delta_net_q8_compact2_")
-        || current.starts_with("gated_delta_net_q8_compact2_")
+    if previous.starts_with("gated_delta_net_q8_compact")
+        || current.starts_with("gated_delta_net_q8_compact")
     {
         return true;
     }
@@ -3394,7 +3418,7 @@ impl ReplayController {
                 .with_dynamic_group_bytes(launch.shared_mem)
                 .map_err(|error| format!("{symbol}: {error}"))?;
             if launch.kernel == "gated_delta_net_q8_fast"
-                || launch.kernel.starts_with("gated_delta_net_q8_compact2_")
+                || launch.kernel.starts_with("gated_delta_net_q8_compact")
             {
                 if metadata.kernarg_segment_size < 80 {
                     return Err(format!(
@@ -3595,7 +3619,7 @@ impl ReplayController {
                 .validate_geometry(geometry)
                 .map_err(|error| format!("{symbol}: {error}"))?;
             if launch.kernel == "gated_delta_net_q8_fast"
-                || launch.kernel.starts_with("gated_delta_net_q8_compact2_")
+                || launch.kernel.starts_with("gated_delta_net_q8_compact")
             {
                 if metadata.kernarg_segment_size < 80 {
                     return Err(format!(
@@ -4547,8 +4571,10 @@ mod tests {
         "gated_delta_net_q8_fast",
         "gated_norm_f32",
         "gated_norm_mq_rotate_gfx1100",
+        "gated_norm_mq_rotate_k6144_gfx1100",
         "gated_norm_mq_rotate_gfx1151",
         "qwen35_fa_prep_gfx1100",
+        "qwen36_27b_fa_prep_gfx1100",
         "qwen35_fa_prep_gfx1151",
         "mq_rotate_x",
         "gemv_hfq4g256_residual",
@@ -5396,6 +5422,10 @@ mod tests {
             "fused_qk_l2_norm_scale_f32",
             "gated_delta_net_q8_compact2_b2"
         ));
+        assert!(Pm4MidAcquirePolicy::RequiredOnly.acquire_between(
+            "fused_qk_l2_norm_scale_f32",
+            "gated_delta_net_q8_compact3_b2"
+        ));
         assert_eq!(Pm4MidAcquirePolicy::from_value("invalid"), None);
     }
 
@@ -5554,6 +5584,18 @@ mod tests {
         );
         assert!(pointer_effects("gated_delta_net_q8_compact2_b2").is_some());
         assert_eq!(
+            expected_kernarg_bytes("gated_delta_net_q8_compact3_b2"),
+            Some(96)
+        );
+        assert!(pointer_effects("gated_delta_net_q8_compact3_b2").is_some());
+        assert_eq!(
+            expected_kernarg_bytes("gated_norm_mq_rotate_k6144_gfx1100"),
+            Some(64)
+        );
+        assert!(pointer_effects("gated_norm_mq_rotate_k6144_gfx1100").is_some());
+        assert_eq!(expected_kernarg_bytes("qwen36_27b_fa_prep_gfx1100"), Some(64));
+        assert!(pointer_effects("qwen36_27b_fa_prep_gfx1100").is_some());
+        assert_eq!(
             expected_kernarg_bytes("conv1d_silu_split_qknorm_b256"),
             Some(80)
         );
@@ -5583,6 +5625,14 @@ mod tests {
         for kernel in [
             "fused_gate_up_hfq4g256",
             "fused_gate_up_hfq4g256_k1024_gfx1201",
+            "fused_gate_up_hfq4g256_dot_reform_gfx1100",
+            "fused_gate_up_hfq4g256_dot_prefetch_gfx1100",
+            "fused_gate_up_hfq4g256_pair_gfx1100",
+            "fused_gate_up_hfq4g256_pair2_gfx1100",
+            "fused_gate_up_hfq4g256_quad_prefetch_gfx1100",
+            "fused_gate_up_hfq4g256_setprio_gfx1100",
+            "fused_gate_up_hfq4g256_lane0_headers_gfx1100",
+            "fused_gate_up_hfq4g256_stage_x32_gfx1100",
         ] {
             assert_eq!(expected_kernarg_bytes(kernel), Some(64));
             assert_eq!(

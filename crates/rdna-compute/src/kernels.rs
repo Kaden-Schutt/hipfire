@@ -1080,7 +1080,16 @@ pub const FUSED_RMSNORM_MQ_ROTATE_VECSUM_SIGN_CONST_GFX1100_SRC: &str = concat!(
     include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate_vecsum.gfx1100.hip")
 );
 pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_SRC: &str =
+    // gfx1100 K=5120: preserving the reduction tree while replacing its
+    // wave-local tail with shuffles was token-exact but reduced graph-on ABBA
+    // decode 36.922->36.773 tok/s (-0.40%); retain the LDS barrier tree.
+    // Native/refined reciprocal gained 0.3-0.5% but diverged by token 190/286;
+    // a 1025-token-exact FMA quotient correction retained only +0.12% ABBA.
+    // Keep the IEEE divide: its special-case work is not the decode bottleneck.
     include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate_awq.hip");
+pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_DIRECT_GFX1100_SRC: &str =
+    // K=5120 direct float4 path: certified default for Qwen3.6-27B on gfx1100.
+    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate_awq_direct.gfx1100.hip");
 
 pub const RMSNORM_REDUCE_GFX942_SRC: &str =
     include_str!("../../../kernels/src/rmsnorm_reduce.gfx942.hip");
@@ -1098,6 +1107,18 @@ pub const FUSED_SILU_MUL_MQ_ROTATE_SRC: &str =
     include_str!("../../../kernels/src/fused_silu_mul_mq_rotate.hip");
 pub const GATED_NORM_MQ_ROTATE_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/gated_norm_mq_rotate.gfx1100.hip");
+pub fn gated_norm_mq_rotate_k6144_gfx1100_src() -> &'static str {
+    static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SRC.get_or_init(|| {
+        format!(
+            "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_k6144_gfx1100\n{}",
+            GATED_NORM_MQ_ROTATE_GFX1100_SRC.replace(
+                "if (n_heads != 32 || head_dim != 128) return;",
+                "if (n_heads != 48 || head_dim != 128) return;",
+            )
+        )
+    })
+}
 pub const GATED_NORM_MQ_ROTATE_GFX1151_SRC: &str = concat!(
     "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_gfx1151\n",
     include_str!("../../../kernels/src/gated_norm_mq_rotate.gfx1100.hip")
@@ -2925,12 +2946,6 @@ pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_RM_PK_SRC: &str =
 pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_RM_PIPE_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_gfx1100_muse_rm_pipe.hip");
 
-
-
-
-
-
-
 pub const GEMM_HFQ4G256_LMHEAD_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_lmhead_wmma.gfx12.hip");
 // Q8_1 MMQ prefill variant — opt-in via HIPFIRE_MMQ=1, gated to RDNA3/3.5.
@@ -4168,7 +4183,106 @@ pub const ATTENTION_GQA_WARP_DV_SRC: &str =
 
 /// Fused Gate+Up HFQ4-G256: two GEMVs in one launch (saves 1 launch per layer).
 /// Grid: [gate_m + up_m, 1, 1]. Each block processes one row from gate or up weight.
+/// A gfx1100 dense-only SLC-bit A/B was flat: 36.698 -> 36.688 tok/s
+/// (-0.03%, graph-on Qwen3.6-27B, 2026-08-18); retain temporal CPOL zero.
 pub const FUSED_GATE_UP_HFQ4G256_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_gate_up_hfq4g256.hip")
+);
+/// gfx1100 Qwen3.6-27B dense decode: stage the full 32-value activation quad
+/// before the independent weight stream. The production-shape oracle is
+/// bit-exact; isolated ABBA improved 92.645->90.302 us (-2.53%), while three
+/// graph-on model campaigns improved decode by +0.22%, +0.50%, and +0.73%.
+/// Baking in the admitted K=5120 shape keeps 80 VGPR with no spills, reduces
+/// static instructions 575->374, and improved 512-token decode by +0.92%.
+/// Also baking gate_m=up_m=17408 retained 80 VGPR/374 instructions but reduced
+/// graph-on ABBA decode 36.950->36.825 tok/s (-0.34%); keep M runtime-bound.
+/// Relaxing launch bounds from 16 to 8 blocks/CU retained 80 VGPR but grew
+/// static instructions 457->470 and waits 75->78, so the tighter bound stays.
+/// Combining staging with algebraic dequant cut 374->355 instructions but
+/// raised VGPR 80->90, diverged at token 76, and reduced ABBA decode by 0.11%.
+/// A 16-entry subwave nibble LUT kept 80 VGPR but grew 374->391 instructions
+/// and 15->24 waits through 32 extra bpermutes, so it was rejected pre-runtime.
+/// Interleaving gate/up blocks was token-exact with the same 80 VGPR, but its
+/// graph-on ABBA gain was only 0.13%; sequential projection rows remain simpler.
+/// Assigning one HFQ group to each 8-lane subwave cut VMEM issues 16->10 and
+/// VGPR 80->78, but changed the reduction at token 76 and reduced graph-on
+/// ABBA decode 35.706->35.662 tok/s (-0.12%); strided scalar loads stay.
+pub const FUSED_GATE_UP_HFQ4G256_STAGE_X32_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_FUSED_GATE_UP_KERNEL fused_gate_up_hfq4g256_stage_x32_gfx1100\n",
+    "#define HIPFIRE_FUSED_GATE_UP_K5120 1\n",
+    "#define HIPFIRE_HFQ4_STAGE_X32 1\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_gate_up_hfq4g256.hip")
+);
+/// gfx1100 dense decode experiment: pair corresponding gate/up rows in one
+/// wave and reuse each activation slice while preserving per-output math.
+pub const FUSED_GATE_UP_HFQ4G256_PAIR_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_gate_up_hfq4g256_pair.gfx1100.hip")
+);
+/// gfx1100 dense decode experiment: pair gate/up rows while retaining two
+/// adjacent HFQ groups to recover VMEM concurrency lost by the pair1 screen.
+/// A fresh-process 128-token A/B/B/A recovered pair1's regression but measured
+/// only +0.28%, showing activation reuse is not a material dense-decode lever.
+pub const FUSED_GATE_UP_HFQ4G256_PAIR2_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_FUSED_GATE_UP_PAIR_KERNEL fused_gate_up_hfq4g256_pair2_gfx1100\n",
+    "#define HIPFIRE_GATE_UP_PAIR2 1\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_gate_up_hfq4g256_pair.gfx1100.hip")
+);
+/// gfx1100 dense decode experiment: factor each group's dequantized dot into
+/// `scale * dot(nibble, x) + zero * sum(x)` to shorten the FP dependency chain.
+pub const FUSED_GATE_UP_HFQ4G256_DOT_REFORM_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_FUSED_GATE_UP_KERNEL fused_gate_up_hfq4g256_dot_reform_gfx1100\n",
+    "#define HIPFIRE_HFQ4_DOT_REFORM 1\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_gate_up_hfq4g256.hip")
+);
+/// gfx1100 dense decode experiment: issue the next four HFQ groups before
+/// computing the current four so streamed weight fetch overlaps the FMA chain.
+pub const FUSED_GATE_UP_HFQ4G256_QUAD_PREFETCH_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_FUSED_GATE_UP_KERNEL fused_gate_up_hfq4g256_quad_prefetch_gfx1100\n",
+    "#define HIPFIRE_HFQ4_QUAD_PREFETCH 1\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_gate_up_hfq4g256.hip")
+);
+/// Combined gfx1100 dense decode screen for the independently positive
+/// dequantization and across-quad prefetch schedules. A fresh-process
+/// 128-token A/C/C/A measured only +0.24%, below either arm alone; retaining
+/// the explicit combination records that the two levers are not additive.
+pub const FUSED_GATE_UP_HFQ4G256_DOT_PREFETCH_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_FUSED_GATE_UP_KERNEL fused_gate_up_hfq4g256_dot_prefetch_gfx1100\n",
+    "#define HIPFIRE_HFQ4_DOT_REFORM 1\n",
+    "#define HIPFIRE_HFQ4_QUAD_PREFETCH 1\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_gate_up_hfq4g256.hip")
+);
+/// gfx1100 dense decode experiment: raise wave priority only while issuing
+/// each quad's VMEM loads, then restore normal priority for dequant/FMA work.
+/// A fresh-process 128-token A/B/B/A measured +0.08%, inside noise; retain as
+/// a negative oracle rather than applying FeatherOps' WMMA heuristic to GEMV.
+pub const FUSED_GATE_UP_HFQ4G256_SETPRIO_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_FUSED_GATE_UP_KERNEL fused_gate_up_hfq4g256_setprio_gfx1100\n",
+    "#define HIPFIRE_HFQ4_SETPRIO 1\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_gate_up_hfq4g256.hip")
+);
+/// gfx1100 dense decode experiment: load each wave-uniform scale/zero header
+/// on lane 0 and broadcast it through scalar readlane instructions. A
+/// fresh-process 128-token A/B/B/A measured -0.27%; coalescing already absorbs
+/// the redundant addresses, while readlane/wait serialization adds cost.
+pub const FUSED_GATE_UP_HFQ4G256_LANE0_HEADERS_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_FUSED_GATE_UP_KERNEL fused_gate_up_hfq4g256_lane0_headers_gfx1100\n",
+    "#define HIPFIRE_HFQ4_LANE0_HEADERS 1\n",
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/fused_gate_up_hfq4g256.hip")
@@ -4226,7 +4340,8 @@ pub const FUSED_GATE_UP_HFQ4G256_WAVE64_SRC: &str =
 // VALUBusy) so dp4a's 75 % x-traffic reduction lands on the right
 // bottleneck. Activations must be pre-quantized to block_q8_1_mmq
 // (use ensure_q8_1_mmq_x). Skip on gemv_residual — it was ILP-bound
-// and got its win from the prefetch variant instead.
+// and got its win from the prefetch variant instead. This remains gfx906-only:
+// hipcc rejects `__builtin_amdgcn_sdot4` on gfx1100 (no `dot1-insts`).
 pub const FUSED_GATE_UP_HFQ4G256_WAVE64_DP4A_SRC: &str =
     include_str!("../../../kernels/src/fused_gate_up_hfq4g256_wave64_dp4a.hip");
 
@@ -4438,6 +4553,8 @@ pub const KV_CACHE_WRITE_ASYM_K_GIVENS4_SRC: &str =
     include_str!("../../../kernels/src/kv_cache_write_asym_k_givens4.hip");
 pub const KV_CACHE_WRITE_ASYM_K_GIVENS3_SRC: &str =
     include_str!("../../../kernels/src/kv_cache_write_asym_k_givens3.hip");
+pub const KV_CACHE_WRITE_ASYM3_Q8_PAIR_GFX1100_SRC: &str =
+    include_str!("../../../kernels/src/kv_cache_write_asym3_q8_pair.gfx1100.hip");
 pub const KV_CACHE_WRITE_ASYM_K_GIVENS2_SRC: &str =
     include_str!("../../../kernels/src/kv_cache_write_asym_k_givens2.hip");
 pub const ATTENTION_FLASH_ASYM4_TILE_SRC: &str =
@@ -4663,6 +4780,16 @@ pub const ROPE_PARTIAL_HALVED_BATCHED_SRC: &str =
 #[cfg(feature = "deltanet")]
 pub const QWEN35_FA_PREP_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/qwen35_fa_prep.gfx1100.hip");
+#[cfg(feature = "deltanet")]
+pub fn qwen36_27b_fa_prep_gfx1100_src() -> &'static str {
+    static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SRC.get_or_init(|| {
+        format!(
+            "#define HIPFIRE_QWEN35_FA_PREP_KERNEL qwen36_27b_fa_prep_gfx1100\n{}",
+            QWEN35_FA_PREP_GFX1100_SRC.replace("constexpr int NQ = 16;", "constexpr int NQ = 24;",)
+        )
+    })
+}
 #[cfg(feature = "deltanet")]
 pub const QWEN35_FA_PREP_GFX1151_SRC: &str = concat!(
     "#define HIPFIRE_QWEN35_FA_PREP_KERNEL qwen35_fa_prep_gfx1151\n",
@@ -4923,6 +5050,10 @@ pub const GATED_DELTA_NET_Q8_FAST_SRC: &str =
 /// head directly, eliminating the materializing repeat-interleave launch.
 pub const GATED_DELTA_NET_Q8_COMPACT2_B2_SRC: &str = concat!(
     "#define HIPFIRE_GDN_QK_HEAD_DIV 2\n#define HIPFIRE_GDN_MIN_BLOCKS 2\n#define HIPFIRE_GDN_KERNEL gated_delta_net_q8_compact2_b2\n",
+    include_str!("../../../kernels/src/gated_delta_net_q8_fast.hip")
+);
+pub const GATED_DELTA_NET_Q8_COMPACT3_B2_SRC: &str = concat!(
+    "#define HIPFIRE_GDN_QK_HEAD_DIV 3\n#define HIPFIRE_GDN_MIN_BLOCKS 2\n#define HIPFIRE_GDN_KERNEL gated_delta_net_q8_compact3_b2\n",
     include_str!("../../../kernels/src/gated_delta_net_q8_fast.hip")
 );
 pub const GATED_DELTA_NET_Q8_COMPACT2_B4_SRC: &str = concat!(
@@ -6344,6 +6475,9 @@ mod dispatch_tests {
     fn gfx1100_q8_decode_fusions_are_translation_unit_isolated() {
         assert!(!KV_CACHE_WRITE_Q8_0_SRC.contains("kv_cache_write_q8_0_pair"));
         assert!(KV_CACHE_WRITE_Q8_0_PAIR_GFX1100_SRC.contains("kv_cache_write_q8_0_pair"));
+        assert!(!KV_CACHE_WRITE_ASYM_K_GIVENS3_SRC.contains("kv_cache_write_asym3_q8_pair_gfx1100"));
+        assert!(KV_CACHE_WRITE_ASYM3_Q8_PAIR_GFX1100_SRC
+            .contains("kv_cache_write_asym3_q8_pair_gfx1100"));
         assert!(!ATTENTION_FLASH_Q8_0_REDUCE_SRC
             .contains("attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100"));
         assert!(ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1100_SRC
@@ -6354,12 +6488,34 @@ mod dispatch_tests {
         assert!(GATED_NORM_MQ_ROTATE_GFX1151_SRC.starts_with(
             "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_gfx1151"
         ));
+        let k6144 = gated_norm_mq_rotate_k6144_gfx1100_src();
+        assert!(k6144.starts_with(
+            "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_k6144_gfx1100"
+        ));
+        assert!(k6144.contains("if (n_heads != 48 || head_dim != 128) return;"));
         assert!(MOE_DOWN_COMBINE_RMSNORM_MQ_ROTATE_VECSUM_GFX1151_SRC.starts_with(
             "#define HIPFIRE_MOE_COMBINE_RMSNORM_MQ_KERNEL moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1151"
         ));
         #[cfg(feature = "deltanet")]
         assert!(QWEN35_FA_PREP_GFX1151_SRC
             .starts_with("#define HIPFIRE_QWEN35_FA_PREP_KERNEL qwen35_fa_prep_gfx1151"));
+        #[cfg(feature = "deltanet")]
+        {
+            let q24k4 = qwen36_27b_fa_prep_gfx1100_src();
+            assert!(q24k4
+                .starts_with("#define HIPFIRE_QWEN35_FA_PREP_KERNEL qwen36_27b_fa_prep_gfx1100"));
+            assert!(q24k4.contains("constexpr int NQ = 24;"));
+        }
+    }
+
+    #[test]
+    fn gfx1100_awq_direct_keeps_abi_and_drops_full_lds_stage() {
+        assert!(FUSED_RMSNORM_MQ_ROTATE_AWQ_DIRECT_GFX1100_SRC
+            .contains("void fused_rmsnorm_mq_rotate_awq("));
+        assert!(FUSED_RMSNORM_MQ_ROTATE_AWQ_DIRECT_GFX1100_SRC
+            .contains("extern __shared__ float reduce[];"));
+        assert!(!FUSED_RMSNORM_MQ_ROTATE_AWQ_DIRECT_GFX1100_SRC.contains("x_shared"));
+        assert!(FUSED_RMSNORM_MQ_ROTATE_AWQ_SRC.contains("float* x_shared"));
     }
 
     #[test]

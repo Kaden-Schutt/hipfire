@@ -553,6 +553,15 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_GEMV_ROWS` | crates/rdna-compute/src/dispatch.rs, crates/rdna-compute/src/feature_flags.rs |
 | `HIPFIRE_GEN` | crates/hipfire-runtime/examples/a3b_multiturn_oneshot.rs |
 | `HIPFIRE_GEN_STEPS` | crates/hipfire-runtime/examples/oracle_xcheck.rs |
+| `HIPFIRE_GFX1100_AWQ_NORM_DIRECT` | crates/rdna-compute/src/gemv.rs |
+| `HIPFIRE_GFX1100_ASYM3_Q8_PAIR` | crates/rdna-compute/src/attention.rs |
+| `HIPFIRE_GFX1100_DENSE_GATE_UP_DOT_REFORM` | crates/rdna-compute/src/gemm.rs |
+| `HIPFIRE_GFX1100_DENSE_GATE_UP_LANE0_HEADERS` | crates/rdna-compute/src/gemm.rs |
+| `HIPFIRE_GFX1100_DENSE_GATE_UP_PAIR` | crates/rdna-compute/src/gemm.rs |
+| `HIPFIRE_GFX1100_DENSE_GATE_UP_PAIR2` | crates/rdna-compute/src/gemm.rs |
+| `HIPFIRE_GFX1100_DENSE_GATE_UP_QUAD_PREFETCH` | crates/rdna-compute/src/gemm.rs |
+| `HIPFIRE_GFX1100_DENSE_GATE_UP_SETPRIO` | crates/rdna-compute/src/gemm.rs |
+| `HIPFIRE_GFX1100_DENSE_GATE_UP_STAGE_X32` | crates/rdna-compute/src/gemm.rs |
 | `HIPFIRE_GFX1100_ROUTER_W64` | crates/hipfire-dispatch/src/pipeline/mod.rs |
 | `HIPFIRE_GFX1151_ATTENTION_TILE_DPP` | crates/rdna-compute/src/attention.rs |
 | `HIPFIRE_GFX1151_ATTENTION_TILE_DPP_REDUCE` | crates/rdna-compute/src/kernels.rs |

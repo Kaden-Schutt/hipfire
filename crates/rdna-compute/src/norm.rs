@@ -965,11 +965,11 @@ impl Gpu {
         result
     }
 
-    /// Exact gfx1100 Qwen3.6-35B full-attention preparation. Replaces the
+    /// Exact gfx1100 Qwen3.6 full-attention preparation. Replaces the
     /// dependent deinterleave, Q RMS, K RMS, and partial half-split RoPE
     /// dispatches with one head-local launch. Admission is enforced by the
-    /// architecture layer; this launcher intentionally exposes only the fixed
-    /// 16Q/2K, head_dim=256, n_rot=64 shape.
+    /// architecture layer; this launcher exposes only the fixed 16Q/2K and
+    /// 24Q/4K, head_dim=256, n_rot=64 shapes.
     #[cfg(feature = "deltanet")]
     #[allow(clippy::too_many_arguments)]
     pub fn qwen35_fa_prep_gfx1100(
@@ -983,9 +983,29 @@ impl Gpu {
         pos_buf: &hip_bridge::DeviceBuffer,
         eps: f32,
         freq_base: f32,
+        n_heads: usize,
+        n_kv_heads: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (module, src, kernel) = if self.arch_caps.is_gfx1151() {
+        if !matches!((n_heads, n_kv_heads), (16, 2) | (24, 4)) {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "fused FA prep requires 16Q/2K or 24Q/4K heads",
+            ));
+        }
+        let (module, src, kernel) = if n_heads == 24 {
+            if !self.arch_caps.is_gfx1100() {
+                return Err(hip_bridge::HipError::new(
+                    1,
+                    "24Q/4K fused FA prep is certified only on gfx1100",
+                ));
+            }
+            (
+                "qwen36_27b_fa_prep_gfx1100",
+                kernels::qwen36_27b_fa_prep_gfx1100_src(),
+                "qwen36_27b_fa_prep_gfx1100",
+            )
+        } else if self.arch_caps.is_gfx1151() {
             (
                 "qwen35_fa_prep_gfx1151",
                 kernels::QWEN35_FA_PREP_GFX1151_SRC,
@@ -1020,10 +1040,18 @@ impl Gpu {
             &ep as *const _ as *mut c_void,
             &fb as *const _ as *mut c_void,
         ];
-        let bytes = (16 * 256 * 3 + 2 * 256 * 2 + 18 * 256) * 4;
+        let bytes = (n_heads * 256 * 3
+            + n_kv_heads * 256 * 2
+            + (n_heads + n_kv_heads) * 256)
+            * 4;
         let timer = crate::profile::begin_timer(&self.hip, "fused", kernel, bytes);
-        let result =
-            self.launch_maybe_blob(kernel, [18, 1, 1], [256, 1, 1], 0, &mut params, || {
+        let result = self.launch_maybe_blob(
+            kernel,
+            [(n_heads + n_kv_heads) as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(qip);
                 b.push_ptr(qp);
@@ -1035,7 +1063,8 @@ impl Gpu {
                 b.push_f32(ep);
                 b.push_f32(fb);
                 b
-            });
+            },
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -2659,14 +2688,14 @@ impl Gpu {
         result
     }
 
-    /// Decode-only Q8 GDN path for a 2:1 value-head:QK-head layout.
+    /// Decode-only Q8 GDN path for a compact value-head:QK-head layout.
     ///
-    /// `q` and `k` remain compact (`n_heads / 2` heads). The kernel maps state
-    /// head `h` to Q/K head `h / 2`, avoiding a separate repeat-interleave
-    /// materialization. The launch ABI intentionally matches the regular fast
-    /// kernel so replay's dynamic stochastic-rounding frame patch is shared.
+    /// `q` and `k` remain compact (`n_heads / qk_head_div` heads). The kernel
+    /// maps state head `h` to Q/K head `h / qk_head_div`, avoiding a separate
+    /// repeat-interleave materialization. The launch ABI intentionally matches
+    /// the regular fast kernel so replay's dynamic frame patch is shared.
     #[cfg(feature = "deltanet")]
-    pub fn gated_delta_net_q8_compact2(
+    pub fn gated_delta_net_q8_compact(
         &mut self,
         q: &GpuTensor,
         k: &GpuTensor,
@@ -2679,16 +2708,30 @@ impl Gpu {
         n_tokens: usize,
         n_heads: usize,
         head_dim: usize,
+        qk_head_div: usize,
         ef_residual: Option<&GpuTensor>,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        if !matches!(qk_head_div, 2 | 3) || n_heads % qk_head_div != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "compact GDN requires a divisible 2:1 or 3:1 value-head:QK-head ratio",
+            ));
+        }
         let gfx1151_r8 = self.arch_caps.is_gfx1151()
             && hipfire_config::developer_var("HIPFIRE_GFX1151_GDN_R8").as_deref() == Ok("1");
         let gfx1151_r4x2 = self.arch_caps.is_gfx1151()
             && hipfire_config::developer_var("HIPFIRE_GFX1151_GDN_R4X2").as_deref() == Ok("1");
         let gfx1151_dpp = self.arch_caps.is_gfx1151()
             && hipfire_config::developer_var("HIPFIRE_GFX1151_GDN_DPP").as_deref() == Ok("1");
-        let (kernel_name, kernel_src, n_tiles, block_size) = if gfx1151_dpp {
+        let (kernel_name, kernel_src, n_tiles, block_size) = if qk_head_div == 3 {
+            (
+                "gated_delta_net_q8_compact3_b2",
+                kernels::GATED_DELTA_NET_Q8_COMPACT3_B2_SRC,
+                128 / 4,
+                32,
+            )
+        } else if gfx1151_dpp {
             (
                 "gated_delta_net_q8_compact2_dpp_gfx1151",
                 kernels::GATED_DELTA_NET_Q8_COMPACT2_DPP_GFX1151_SRC,
@@ -2834,7 +2877,7 @@ impl Gpu {
     /// cannot serve both `s_q8` ([n_heads x HD x HD] per slot) and `s_scales`
     /// ([n_heads x HD] per slot), and `s_ef_residual` was never strided at all.
     /// It was also actively harmful — `gated_delta_net_q8_fast.hip` is the
-    /// shared source for the `gated_delta_net_q8_compact2_*` variants too, so
+    /// shared source for the compact Q/K variants too, so
     /// two extra params changed the ABI of kernels whose launch sites still
     /// packed the old 13, and the single-sequence decode path segfaulted inside
     /// hipModuleLaunchKernel. The params are gone; the ABI is single again.
