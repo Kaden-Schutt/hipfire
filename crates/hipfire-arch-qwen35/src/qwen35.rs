@@ -10777,10 +10777,24 @@ fn lm_head_batched(
             output.k,
             batch_size,
         ),
-        DType::MQ4G256 | DType::MQ4G256V2 => {
+        DType::MQ4G256 => {
             llama::rotate_x_mq_batched_for(gpu, output, hidden, rot, output.k, batch_size)?;
             gpu.gemm_hfq4g256_batched_lmhead(
                 &output.buf,
+                rot,
+                logits,
+                output.m,
+                output.k,
+                batch_size,
+            )
+        }
+        DType::MQ4G256V2 => {
+            llama::rotate_x_mq_batched_for(gpu, output, hidden, rot, output.k, batch_size)?;
+            run_plain_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmMq4G256V2BatchedLmhead,
+                &output.buf,
+                output.gpu_dtype,
                 rot,
                 logits,
                 output.m,
@@ -13364,8 +13378,12 @@ pub(crate) fn prefill_moe_ffn_body_batched(
                     hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
                     &pbs.x_norm_batch,
                 ),
-                DType::MQ4G256 | DType::MQ4G256V2 => (
+                DType::MQ4G256 => (
                     hipfire_dispatch::types::KernelKey::GemmHfq4G256,
+                    &pbs.x_rot_batch,
+                ),
+                DType::MQ4G256V2 => (
+                    hipfire_dispatch::types::KernelKey::GemmMq4G256V2,
                     &pbs.x_rot_batch,
                 ),
                 DType::F32 => (
@@ -13405,9 +13423,8 @@ pub(crate) fn prefill_moe_ffn_body_batched(
     {
         use hipfire_dispatch::types::KernelKey;
         let (key, x_in): (KernelKey, &GpuTensor) = match ffn.shared_expert_gate.gpu_dtype {
-            DType::Q8_0 => (KernelKey::GemmQ8_0BatchedChunked, &pbs.x_norm_batch),
-            DType::MQ4G256 | DType::MQ4G256V2 => (KernelKey::GemmHfq4G256, &pbs.x_rot_batch),
-            DType::F32 => (KernelKey::GemmF32Batched, &pbs.x_norm_batch),
+            DType::MQ4G256 => (KernelKey::GemmHfq4G256, &pbs.x_rot_batch),
+            DType::MQ4G256V2 => (KernelKey::GemmMq4G256V2, &pbs.x_rot_batch),
             other => panic!(
                 "prefill_moe_ffn_body_batched: unexpected shared_expert_gate dtype {other:?} \
                          — moe_ffn_batched_admissible admits MQ4G256, Q8_0, F32"
@@ -13432,10 +13449,20 @@ pub(crate) fn prefill_moe_ffn_body_batched(
     // enforces). MQ4 → HFQ4-layout fused kernel; MQ6 → HFQ6-layout.
     match ffn.shared_expert.gate.gpu_dtype {
         // #397 Ship 5.2 slice 2: shared-expert fused gate+up → FusedQkvFamily
-        // (batched-prefill gate+up variant). Same batched kernel, behavior-preserving.
-        DType::MQ4G256 | DType::MQ4G256V2 => run_fused_gate_up_key(
+        DType::MQ4G256 => run_fused_gate_up_key(
             gpu,
             hipfire_dispatch::types::KernelKey::FusedGateUpHfq4G256,
+            &ffn.shared_expert.gate.buf,
+            &ffn.shared_expert.up.buf,
+            &pbs.x_rot_batch,
+            shared_gate,
+            shared_up,
+            ffn.shared_expert.gate.m,
+            ffn.shared_expert.up.m,
+            ffn.shared_expert.gate.k,
+            n,
+        )?,
+        DType::MQ4G256V2 => gpu.gemm_gate_up_hfq4g256_mq4v2(
             &ffn.shared_expert.gate.buf,
             &ffn.shared_expert.up.buf,
             &pbs.x_rot_batch,
@@ -18012,19 +18039,35 @@ fn run_fa_layer_body(
             Some(xr) => xr,
             None => &s.tmp,
         };
-        gpu.fused_qkv_hfq4g256(
-            &layer.wq.buf,
-            &layer.wk.buf,
-            &layer.wv.buf,
-            eff_x,
-            &s.fa_q_full,
-            &s.fa_k,
-            &s.fa_v,
-            layer.wq.m,
-            layer.wk.m,
-            layer.wv.m,
-            layer.wq.k,
-        )?;
+        if dt == DType::MQ4G256V2 {
+            gpu.fused_qkv_hfq4g256_mq4v2(
+                &layer.wq.buf,
+                &layer.wk.buf,
+                &layer.wv.buf,
+                eff_x,
+                &s.fa_q_full,
+                &s.fa_k,
+                &s.fa_v,
+                layer.wq.m,
+                layer.wk.m,
+                layer.wv.m,
+                layer.wq.k,
+            )?;
+        } else {
+            gpu.fused_qkv_hfq4g256(
+                &layer.wq.buf,
+                &layer.wk.buf,
+                &layer.wv.buf,
+                eff_x,
+                &s.fa_q_full,
+                &s.fa_k,
+                &s.fa_v,
+                layer.wq.m,
+                layer.wk.m,
+                layer.wv.m,
+                layer.wq.k,
+            )?;
+        }
     } else if fused_fa3_lloyd_mq3 {
         let eff_x = match x_rot {
             Some(xr) => xr,
@@ -18215,16 +18258,29 @@ fn run_fa_layer_body(
             Some(xr) => xr,
             None => &s.tmp,
         };
-        gpu.fused_gate_up_hfq4g256(
-            &layer.w_gate.buf,
-            &layer.w_up.buf,
-            eff_x,
-            &s.gate_ffn,
-            &s.up,
-            layer.w_gate.m,
-            layer.w_up.m,
-            layer.w_gate.k,
-        )?;
+        if dt_g == DType::MQ4G256V2 {
+            gpu.fused_gate_up_hfq4g256_mq4v2(
+                &layer.w_gate.buf,
+                &layer.w_up.buf,
+                eff_x,
+                &s.gate_ffn,
+                &s.up,
+                layer.w_gate.m,
+                layer.w_up.m,
+                layer.w_gate.k,
+            )?;
+        } else {
+            gpu.fused_gate_up_hfq4g256(
+                &layer.w_gate.buf,
+                &layer.w_up.buf,
+                eff_x,
+                &s.gate_ffn,
+                &s.up,
+                layer.w_gate.m,
+                layer.w_up.m,
+                layer.w_gate.k,
+            )?;
+        }
     } else if fused_gu_lloyd_mq3 {
         let eff_x = match x_rot {
             Some(xr) => xr,
@@ -18523,7 +18579,29 @@ fn batched_gemm_single_weight(
     n: usize,
 ) -> HipResult<()> {
     match w.gpu_dtype {
-        DType::MQ4G256 | DType::MQ4G256V2 | DType::HFQ4G256 => run_plain_gemm_key(
+        DType::MQ4G256 => run_plain_gemm_key(
+            gpu,
+            hipfire_dispatch::types::KernelKey::GemmHfq4G256,
+            &w.buf,
+            w.gpu_dtype,
+            x,
+            y,
+            w.m,
+            w.k,
+            n,
+        ),
+        DType::MQ4G256V2 => run_plain_gemm_key(
+            gpu,
+            hipfire_dispatch::types::KernelKey::GemmMq4G256V2,
+            &w.buf,
+            w.gpu_dtype,
+            x,
+            y,
+            w.m,
+            w.k,
+            n,
+        ),
+        DType::HFQ4G256 => run_plain_gemm_key(
             gpu,
             hipfire_dispatch::types::KernelKey::GemmHfq4G256,
             &w.buf,
@@ -20178,9 +20256,15 @@ fn qkv_from_prerotated_mq(
     k: &GpuTensor,
     v: &GpuTensor,
 ) -> HipResult<()> {
-    gpu.fused_qkv_hfq4g256(
-        &wq.buf, &wk.buf, &wv.buf, x_rot, q, k, v, wq.m, wk.m, wv.m, wq.k,
-    )
+    if wq.gpu_dtype == DType::MQ4G256V2 {
+        gpu.fused_qkv_hfq4g256_mq4v2(
+            &wq.buf, &wk.buf, &wv.buf, x_rot, q, k, v, wq.m, wk.m, wv.m, wq.k,
+        )
+    } else {
+        gpu.fused_qkv_hfq4g256(
+            &wq.buf, &wk.buf, &wv.buf, x_rot, q, k, v, wq.m, wk.m, wv.m, wq.k,
+        )
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -20196,22 +20280,41 @@ fn qkvza_from_prerotated_mq(
     beta: &GpuTensor,
     alpha: &GpuTensor,
 ) -> HipResult<()> {
-    gpu.fused_qkvza_hfq4g256(
-        &wqkv.buf,
-        &wz.buf,
-        &w_beta.buf,
-        &w_alpha.buf,
-        x_rot,
-        qkv,
-        z,
-        beta,
-        alpha,
-        wqkv.m,
-        wz.m,
-        w_beta.m,
-        w_alpha.m,
-        wqkv.k,
-    )
+    if wqkv.gpu_dtype == DType::MQ4G256V2 {
+        gpu.fused_qkvza_hfq4g256_mq4v2(
+            &wqkv.buf,
+            &wz.buf,
+            &w_beta.buf,
+            &w_alpha.buf,
+            x_rot,
+            qkv,
+            z,
+            beta,
+            alpha,
+            wqkv.m,
+            wz.m,
+            w_beta.m,
+            w_alpha.m,
+            wqkv.k,
+        )
+    } else {
+        gpu.fused_qkvza_hfq4g256(
+            &wqkv.buf,
+            &wz.buf,
+            &w_beta.buf,
+            &w_alpha.buf,
+            x_rot,
+            qkv,
+            z,
+            beta,
+            alpha,
+            wqkv.m,
+            wz.m,
+            w_beta.m,
+            w_alpha.m,
+            wqkv.k,
+        )
+    }
 }
 
 /// Per-layer execution context for the lowered decode path. Holds the current
@@ -21817,22 +21920,41 @@ fn forward_scratch_layers_multi(
                             Some(xr) => xr,
                             None => &s.tmp,
                         };
-                        gpu.fused_qkvza_hfq4g256(
-                            &layer.wqkv.buf,
-                            &layer.wz.buf,
-                            &layer.w_beta.buf,
-                            &layer.w_alpha.buf,
-                            eff_x,
-                            &s.dn_qkv,
-                            &s.dn_z,
-                            &s.dn_beta,
-                            &s.dn_alpha,
-                            layer.wqkv.m,
-                            layer.wz.m,
-                            layer.w_beta.m,
-                            layer.w_alpha.m,
-                            layer.wqkv.k,
-                        )?;
+                        if dt == DType::MQ4G256V2 {
+                            gpu.fused_qkvza_hfq4g256_mq4v2(
+                                &layer.wqkv.buf,
+                                &layer.wz.buf,
+                                &layer.w_beta.buf,
+                                &layer.w_alpha.buf,
+                                eff_x,
+                                &s.dn_qkv,
+                                &s.dn_z,
+                                &s.dn_beta,
+                                &s.dn_alpha,
+                                layer.wqkv.m,
+                                layer.wz.m,
+                                layer.w_beta.m,
+                                layer.w_alpha.m,
+                                layer.wqkv.k,
+                            )?;
+                        } else {
+                            gpu.fused_qkvza_hfq4g256(
+                                &layer.wqkv.buf,
+                                &layer.wz.buf,
+                                &layer.w_beta.buf,
+                                &layer.w_alpha.buf,
+                                eff_x,
+                                &s.dn_qkv,
+                                &s.dn_z,
+                                &s.dn_beta,
+                                &s.dn_alpha,
+                                layer.wqkv.m,
+                                layer.wz.m,
+                                layer.w_beta.m,
+                                layer.w_alpha.m,
+                                layer.wqkv.k,
+                            )?;
+                        }
                     } else if fused_la4_lloyd_mq3 {
                         let eff_x = match x_rot {
                             Some(xr) => xr,
@@ -21986,16 +22108,29 @@ fn forward_scratch_layers_multi(
                             Some(xr) => xr,
                             None => &s.tmp,
                         };
-                        gpu.fused_gate_up_hfq4g256(
-                            &layer.w_gate.buf,
-                            &layer.w_up.buf,
-                            eff_x,
-                            &s.gate_ffn,
-                            &s.up,
-                            layer.w_gate.m,
-                            layer.w_up.m,
-                            layer.w_gate.k,
-                        )?;
+                        if dt_g == DType::MQ4G256V2 {
+                            gpu.fused_gate_up_hfq4g256_mq4v2(
+                                &layer.w_gate.buf,
+                                &layer.w_up.buf,
+                                eff_x,
+                                &s.gate_ffn,
+                                &s.up,
+                                layer.w_gate.m,
+                                layer.w_up.m,
+                                layer.w_gate.k,
+                            )?;
+                        } else {
+                            gpu.fused_gate_up_hfq4g256(
+                                &layer.w_gate.buf,
+                                &layer.w_up.buf,
+                                eff_x,
+                                &s.gate_ffn,
+                                &s.up,
+                                layer.w_gate.m,
+                                layer.w_up.m,
+                                layer.w_gate.k,
+                            )?;
+                        }
                     } else if fused_gu_lloyd_mq3 {
                         let eff_x = match x_rot {
                             Some(xr) => xr,
@@ -22048,19 +22183,35 @@ fn forward_scratch_layers_multi(
                             Some(xr) => xr,
                             None => &s.tmp,
                         };
-                        gpu.fused_qkv_hfq4g256(
-                            &layer.wq.buf,
-                            &layer.wk.buf,
-                            &layer.wv.buf,
-                            eff_x,
-                            &s.fa_q_full,
-                            &s.fa_k,
-                            &s.fa_v,
-                            layer.wq.m,
-                            layer.wk.m,
-                            layer.wv.m,
-                            layer.wq.k,
-                        )?;
+                        if dt == DType::MQ4G256V2 {
+                            gpu.fused_qkv_hfq4g256_mq4v2(
+                                &layer.wq.buf,
+                                &layer.wk.buf,
+                                &layer.wv.buf,
+                                eff_x,
+                                &s.fa_q_full,
+                                &s.fa_k,
+                                &s.fa_v,
+                                layer.wq.m,
+                                layer.wk.m,
+                                layer.wv.m,
+                                layer.wq.k,
+                            )?;
+                        } else {
+                            gpu.fused_qkv_hfq4g256(
+                                &layer.wq.buf,
+                                &layer.wk.buf,
+                                &layer.wv.buf,
+                                eff_x,
+                                &s.fa_q_full,
+                                &s.fa_k,
+                                &s.fa_v,
+                                layer.wq.m,
+                                layer.wk.m,
+                                layer.wv.m,
+                                layer.wq.k,
+                            )?;
+                        }
                     } else if fused_fa3_lloyd_mq3 {
                         let eff_x = match x_rot {
                             Some(xr) => xr,
@@ -22421,7 +22572,35 @@ fn forward_scratch_layers_multi(
                             Some(xr) => xr,
                             None => &s.tmp,
                         };
-                        gpu.fused_gate_up_hfq4g256(
+                        if dt_g == DType::MQ4G256V2 {
+                            gpu.fused_gate_up_hfq4g256_mq4v2(
+                                &layer.w_gate.buf,
+                                &layer.w_up.buf,
+                                eff_x,
+                                &s.gate_ffn,
+                                &s.up,
+                                layer.w_gate.m,
+                                layer.w_up.m,
+                                layer.w_gate.k,
+                            )?;
+                        } else {
+                            gpu.fused_gate_up_hfq4g256(
+                                &layer.w_gate.buf,
+                                &layer.w_up.buf,
+                                eff_x,
+                                &s.gate_ffn,
+                                &s.up,
+                                layer.w_gate.m,
+                                layer.w_up.m,
+                                layer.w_gate.k,
+                            )?;
+                        }
+                    } else if fused_gu_lloyd_mq3 {
+                        let eff_x = match x_rot {
+                            Some(xr) => xr,
+                            None => &s.tmp,
+                        };
+                        gpu.fused_gate_up_mq3g256_lloyd(
                             &layer.w_gate.buf,
                             &layer.w_up.buf,
                             eff_x,
@@ -22431,12 +22610,12 @@ fn forward_scratch_layers_multi(
                             layer.w_up.m,
                             layer.w_gate.k,
                         )?;
-                    } else if fused_gu_lloyd_mq3 {
+                    } else if fused_gu_lloyd_mq4 {
                         let eff_x = match x_rot {
                             Some(xr) => xr,
                             None => &s.tmp,
                         };
-                        gpu.fused_gate_up_mq3g256_lloyd(
+                        gpu.fused_gate_up_mq4g256_lloyd(
                             &layer.w_gate.buf,
                             &layer.w_up.buf,
                             eff_x,

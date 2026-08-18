@@ -25,8 +25,21 @@ typedef float    __attribute__((ext_vector_type(8))) float8_t;
     a[4]=sc*(_Float16)(float)(((pk)>>16)&0xFu)+zp; a[5]=sc*(_Float16)(float)(((pk)>>20)&0xFu)+zp; \
     a[6]=sc*(_Float16)(float)(((pk)>>24)&0xFu)+zp; a[7]=sc*(_Float16)(float)(((pk)>>28)&0xFu)+zp
 
+// #ifdef cannot appear inside a function-like macro body, so the v2 coexistence
+// block lives here and expands at the GEN_GATE_UP_BT header site.
+#define HFQ4_MQ4_HDR_LOAD(gp) \
+    const unsigned int hA = *(const unsigned int*)(gp); \
+    const unsigned int hB = *(const unsigned int*)(gp + 4); \
+    const _Float16 sc0 = (_Float16)__half2float(__ushort_as_half((unsigned short)(hA & 0xFFFFu))); \
+    const _Float16 zp0 = (_Float16)__half2float(__ushort_as_half((unsigned short)(hA >> 16))); \
+    const _Float16 sc1 = (_Float16)__half2float(__ushort_as_half((unsigned short)(hB & 0xFFFFu))); \
+    const _Float16 zp1 = (_Float16)__half2float(__ushort_as_half((unsigned short)(hB >> 16)))
+#define HFQ4_MQ4_HDR_SEL \
+    _Float16 sc = (kt < 8) ? sc0 : sc1; \
+    _Float16 zp = (kt < 8) ? zp0 : zp1;
+
 #define GEN_GATE_UP_BT(BV) \
-extern "C" __launch_bounds__(32, 2) __global__ void gemm_gate_up_hfq4g256_wmma_gfx12_bt##BV( \
+extern "C" __launch_bounds__(32, 2) __global__ void gemm_gate_up_mq4g256v2_wmma_gfx12_bt##BV( \
     const char* __restrict__ A_gate, const char* __restrict__ A_up, const _Float16* __restrict__ X, \
     float* __restrict__ Y_gate, float* __restrict__ Y_up, int gate_m, int up_m, int K, int N) { \
     const int tm = gate_m + up_m, rs = blockIdx.x * 16, bs = blockIdx.y * (16 * BV), tid = threadIdx.x; \
@@ -39,14 +52,13 @@ extern "C" __launch_bounds__(32, 2) __global__ void gemm_gate_up_hfq4g256_wmma_g
     float8_t acc[BV]; for (int b = 0; b < BV; b++) acc[b] = float8_t{0,0,0,0,0,0,0,0}; \
     for (int g = 0; g < gpr; g++) { \
         const char* gp = rb + g * 136; \
-        _Float16 sc = (_Float16)__builtin_bit_cast(float, *(const unsigned int*)(gp)); \
-        _Float16 zp = (_Float16)__builtin_bit_cast(float, *(const unsigned int*)(gp + 4)); \
+        HFQ4_MQ4_HDR_LOAD(gp); \
         const _Float16* xb[BV]; for (int b = 0; b < BV; b++) xb[b] = X + (long long)sb[b] * K + g * 256; \
         for (int kt = 0; kt < 16; kt += 4) { \
             unsigned int p[4] = { *(const unsigned int*)(gp+8+(kt+0)*8+kg*4), *(const unsigned int*)(gp+8+(kt+1)*8+kg*4), \
                                   *(const unsigned int*)(gp+8+(kt+2)*8+kg*4), *(const unsigned int*)(gp+8+(kt+3)*8+kg*4) }; \
             _Pragma("unroll") \
-            for (int ki = 0; ki < 4; ki++) { half8_t a; HFQ4_DQ8(p[ki], sc, zp); \
+            for (int ki = 0; ki < 4; ki++) { half8_t a; HFQ4_MQ4_HDR_SEL HFQ4_DQ8(p[ki], sc, zp); \
                 _Pragma("unroll") \
                 for (int b = 0; b < BV; b++) { half8_t bb = *(const half8_t*)(xb[b] + (kt+ki)*16 + kg*8); \
                     acc[b] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, bb, acc[b]); } } } \

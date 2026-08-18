@@ -8982,9 +8982,8 @@ impl Gpu {
         }
         result
     }
-    /// MQ4 v2 (qt 44) — same as `gemm_qkvza_hfq4g256_wmma_gfx12` but with
-    /// `HIPFIRE_MQ4_V2_HEADER` defined. Module = v1 + `_mq4v2`, func unchanged.
-    /// Until the `.hip` #ifdef lands this compiles to v1 behaviour (define harmless).
+    /// MQ4 v2 (qt 44) — dedicated v2 source `GEMM_QKVZA_MQ4G256V2_*_SRC`.
+    /// Module = v1 + `_mq4v2`, func = v2 symbol `gemm_qkvza_mq4g256v2_*`.
     pub fn gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2(
         &mut self,
         a_qkv: &GpuTensor,
@@ -9026,27 +9025,30 @@ impl Gpu {
         } else {
             1
         };
-        let (kname, ksrc): (&str, &str) = match bt_b {
+        let (kname, ksrc, func_name): (&str, &str, &str) = match bt_b {
             12 => (
                 "gemm_qkvza_hfq4g256_wmma_gfx12_bt12",
-                kernels::GEMM_QKVZA_HFQ4G256_WMMA_GFX12_BT_SRC,
+                kernels::GEMM_QKVZA_MQ4G256V2_WMMA_GFX12_BT_SRC,
+                "gemm_qkvza_mq4g256v2_wmma_gfx12_bt12",
             ),
             8 => (
                 "gemm_qkvza_hfq4g256_wmma_gfx12_bt8",
-                kernels::GEMM_QKVZA_HFQ4G256_WMMA_GFX12_BT_SRC,
+                kernels::GEMM_QKVZA_MQ4G256V2_WMMA_GFX12_BT_SRC,
+                "gemm_qkvza_mq4g256v2_wmma_gfx12_bt8",
             ),
             4 => (
                 "gemm_qkvza_hfq4g256_wmma_gfx12_bt4",
-                kernels::GEMM_QKVZA_HFQ4G256_WMMA_GFX12_BT_SRC,
+                kernels::GEMM_QKVZA_MQ4G256V2_WMMA_GFX12_BT_SRC,
+                "gemm_qkvza_mq4g256v2_wmma_gfx12_bt4",
             ),
             _ => (
                 "gemm_qkvza_hfq4g256_wmma_gfx12",
-                kernels::GEMM_QKVZA_HFQ4G256_WMMA_GFX12_SRC,
+                kernels::GEMM_QKVZA_MQ4G256V2_WMMA_GFX12_SRC,
+                "gemm_qkvza_mq4g256v2_wmma_gfx12",
             ),
         };
-        let v2_src = format!("#define HIPFIRE_MQ4_V2_HEADER 1\n{}", ksrc);
         let module_v2 = format!("{}_mq4v2", kname);
-        self.ensure_kernel(&module_v2, &v2_src, kname)?;
+        self.ensure_kernel(&module_v2, ksrc, func_name)?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
         let mut aq = a_qkv.buf.as_ptr();
         let mut az = a_z.buf.as_ptr();
@@ -9089,9 +9091,9 @@ impl Gpu {
             + crate::profile::gemv_hfq4g256_bytes(alpha_m, k)
             + batch_size * k * 2
             + batch_size * total_m * 4 * 2;
-        let timer = crate::profile::begin_timer(&self.hip, "gemm", kname, bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", func_name, bytes);
         let result = self.launch_maybe_blob(
-            kname,
+            func_name,
             [row_tiles as u32, batch_tiles as u32, 1],
             [32, 1, 1],
             0,
@@ -25357,8 +25359,8 @@ impl Gpu {
     pub fn gemv_hfq4g128_moe_down_residual_scaled_bucketed(&mut self, expert_ptrs: &GpuTensor, expert_offsets: &GpuTensor, expert_token_list: &GpuTensor, topk_weights: &GpuTensor, per_expert_scale: &GpuTensor, hidden_batch: &GpuTensor, x_residual: &GpuTensor, m: usize, k: usize, k_top: usize, n_exp: usize) -> HipResult<()> { Err(hip_bridge::HipError::new(0, "MoE kernel not yet ported (Phase 4)")) }
     #[allow(unused_variables)]
     pub fn moe_bucket_build(&mut self, topk_indices: &GpuTensor, expert_offsets: &GpuTensor, expert_token_list: &GpuTensor, n_batch: usize, k_top: usize, n_exp: usize) -> HipResult<()> { Err(hip_bridge::HipError::new(0, "MoE kernel not yet ported (Phase 4)")) }
-
-    /// MQ4 v2 (qt 44) — same as `gemm_qkv_hfq4g256_wmma_gfx12` with `HIPFIRE_MQ4_V2_HEADER`.
+    #[allow(unused_variables)]
+    /// MQ4 v2 (qt 44) — dedicated v2 source `GEMM_QKV_MQ4G256V2_WMMA_GFX12_SRC`.
     pub fn gemm_qkv_hfq4g256_wmma_gfx12_mq4v2(
         &mut self,
         a_q: &GpuTensor,
@@ -25375,13 +25377,9 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let v2_src = format!(
-            "#define HIPFIRE_MQ4_V2_HEADER 1\n{}",
-            kernels::GEMM_QKV_HFQ4G256_WMMA_GFX12_SRC
-        );
         let module_v2 = "gemm_qkv_hfq4g256_wmma_gfx12_mq4v2";
-        let func_name = "gemm_qkv_hfq4g256_wmma_gfx12";
-        self.ensure_kernel(module_v2, &v2_src, func_name)?;
+        let func_name = "gemm_qkv_mq4g256v2_wmma_gfx12";
+        self.ensure_kernel(module_v2, kernels::GEMM_QKV_MQ4G256V2_WMMA_GFX12_SRC, func_name)?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
         let mut aq = a_q.buf.as_ptr();
         let mut ak = a_k.buf.as_ptr();
@@ -25418,7 +25416,7 @@ impl Gpu {
             + batch_size * k * 2
             + batch_size * total_m * 4 * 2;
         let timer =
-            crate::profile::begin_timer(&self.hip, "gemm", module_v2, bytes);
+            crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkv_mq4g256v2_wmma_gfx12", bytes);
         let result = self.launch_maybe_blob(
             func_name,
             [row_tiles as u32, batch_tiles as u32, 1],
@@ -25449,8 +25447,8 @@ impl Gpu {
     }
 
 
-    /// MQ4 v2 (qt 44) — same as `gemm_gate_up_hfq4g256_wmma_gfx12` with `HIPFIRE_MQ4_V2_HEADER`.
-    /// Module = v1 + `_mq4v2`, ldsstage included (same source, different symbol).
+    /// MQ4 v2 (qt 44) — dedicated v2 source `GEMM_GATE_UP_MQ4G256V2_WMMA_GFX12_SRC`.
+    /// Module = v1 + `_mq4v2`, func = v2 symbol `gemm_gate_up_mq4g256v2_*`.
     pub fn gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2(
         &mut self,
         a_gate: &GpuTensor,
@@ -25466,10 +25464,10 @@ impl Gpu {
         self.bind_thread()?;
         if self.flags.hfq4g256_ldsstage_wmma && k % 512 == 0 && batch_size <= LDSSTAGE_MAX_BATCH {
             let kname = "gemm_gate_up_hfq4g256_wmma_gfx12_ldsstage";
-            let ksrc = kernels::GEMM_GATE_UP_HFQ4G256_WMMA_GFX12_SRC;
-            let v2_src = format!("#define HIPFIRE_MQ4_V2_HEADER 1\n{}", ksrc);
+            let ksrc = kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_GFX12_SRC;
+            let func_name = "gemm_gate_up_mq4g256v2_wmma_gfx12_ldsstage";
             let module_v2 = format!("{}_mq4v2", kname);
-            self.ensure_kernel(&module_v2, &v2_src, kname)?;
+            self.ensure_kernel(&module_v2, ksrc, func_name)?;
             let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
             let mut ag = a_gate.buf.as_ptr();
             let mut au = a_up.buf.as_ptr();
@@ -25498,9 +25496,9 @@ impl Gpu {
                 + crate::profile::gemv_hfq4g256_bytes(up_m, k)
                 + batch_size * k * 2
                 + batch_size * total_m * 4 * 2;
-            let timer = crate::profile::begin_timer(&self.hip, "gemm", kname, bytes);
+            let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_gate_up_mq4g256v2_wmma_gfx12_ldsstage", bytes);
             let result = self.launch_maybe_blob(
-                kname,
+                func_name,
                 [row_tiles as u32, batch_tiles as u32, 1],
                 [256, 1, 1],
                 0,
@@ -25546,27 +25544,30 @@ impl Gpu {
         } else {
             1
         };
-        let (kname, ksrc): (&str, &str) = match bt_b {
+        let (kname, ksrc, func_name): (&str, &str, &str) = match bt_b {
             12 => (
                 "gemm_gate_up_hfq4g256_wmma_gfx12_bt12",
-                kernels::GEMM_GATE_UP_HFQ4G256_WMMA_GFX12_BT_SRC,
+                kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_GFX12_BT_SRC,
+                "gemm_gate_up_mq4g256v2_wmma_gfx12_bt12",
             ),
             8 => (
                 "gemm_gate_up_hfq4g256_wmma_gfx12_bt8",
-                kernels::GEMM_GATE_UP_HFQ4G256_WMMA_GFX12_BT_SRC,
+                kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_GFX12_BT_SRC,
+                "gemm_gate_up_mq4g256v2_wmma_gfx12_bt8",
             ),
             4 => (
                 "gemm_gate_up_hfq4g256_wmma_gfx12_bt4",
-                kernels::GEMM_GATE_UP_HFQ4G256_WMMA_GFX12_BT_SRC,
+                kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_GFX12_BT_SRC,
+                "gemm_gate_up_mq4g256v2_wmma_gfx12_bt4",
             ),
             _ => (
                 "gemm_gate_up_hfq4g256_wmma_gfx12",
-                kernels::GEMM_GATE_UP_HFQ4G256_WMMA_GFX12_SRC,
+                kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_GFX12_SRC,
+                "gemm_gate_up_mq4g256v2_wmma_gfx12",
             ),
         };
-        let v2_src = format!("#define HIPFIRE_MQ4_V2_HEADER 1\n{}", ksrc);
         let module_v2 = format!("{}_mq4v2", kname);
-        self.ensure_kernel(&module_v2, &v2_src, kname)?;
+        self.ensure_kernel(&module_v2, ksrc, func_name)?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
         let mut ag = a_gate.buf.as_ptr();
         let mut au = a_up.buf.as_ptr();
@@ -25595,9 +25596,9 @@ impl Gpu {
             + crate::profile::gemv_hfq4g256_bytes(up_m, k)
             + batch_size * k * 2
             + batch_size * total_m * 4 * 2;
-        let timer = crate::profile::begin_timer(&self.hip, "gemm", kname, bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", func_name, bytes);
         let result = self.launch_maybe_blob(
-            kname,
+            func_name,
             [row_tiles as u32, batch_tiles as u32, 1],
             [32, 1, 1],
             0,
@@ -25621,9 +25622,7 @@ impl Gpu {
         }
         result
     }
-
-
-    /// MQ4 v2 (qt 44) — same as `gemm_hfq4g256_residual_wmma_gfx12` with `HIPFIRE_MQ4_V2_HEADER`.
+    /// MQ4 v2 (qt 44) — dedicated v2 source `GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX12_SRC`.
     pub fn gemm_hfq4g256_residual_wmma_gfx12_mq4v2(
         &mut self,
         a_raw: &GpuTensor,
@@ -25636,10 +25635,10 @@ impl Gpu {
         self.bind_thread()?;
         if self.flags.hfq4g256_ldsstage_wmma && k % 512 == 0 && batch_size <= LDSSTAGE_MAX_BATCH {
             let kname = "gemm_hfq4g256_residual_wmma_gfx12_ldsstage";
-            let ksrc = kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_SRC;
-            let v2_src = format!("#define HIPFIRE_MQ4_V2_HEADER 1\n{}", ksrc);
+            let ksrc = kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX12_SRC;
+            let func_name = "gemm_mq4g256v2_residual_wmma_gfx12_ldsstage";
             let module_v2 = format!("{}_mq4v2", kname);
-            self.ensure_kernel(&module_v2, &v2_src, kname)?;
+            self.ensure_kernel(&module_v2, ksrc, func_name)?;
             let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
             let mut a_ptr = a_raw.buf.as_ptr();
             let mut x_ptr = x_f16_ptr;
@@ -25660,9 +25659,9 @@ impl Gpu {
             let bytes = crate::profile::gemv_hfq4g256_bytes(m, k)
                 + batch_size * k * 2
                 + batch_size * m * 4 * 2;
-            let timer = crate::profile::begin_timer(&self.hip, "gemm", kname, bytes);
+            let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_mq4g256v2_residual_wmma_gfx12_ldsstage", bytes);
             let result = self.launch_maybe_blob(
-                kname,
+                func_name,
                 [row_tiles as u32, batch_tiles as u32, 1],
                 [256, 1, 1],
                 0,
@@ -25705,27 +25704,30 @@ impl Gpu {
         } else {
             1
         };
-        let (kname, ksrc): (&str, &str) = match bt_b {
+        let (kname, ksrc, func_name): (&str, &str, &str) = match bt_b {
             12 => (
                 "gemm_hfq4g256_residual_wmma_gfx12_bt12",
-                kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_BT_SRC,
+                kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX12_BT_SRC,
+                "gemm_mq4g256v2_residual_wmma_gfx12_bt12",
             ),
             8 => (
                 "gemm_hfq4g256_residual_wmma_gfx12_bt8",
-                kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_BT_SRC,
+                kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX12_BT_SRC,
+                "gemm_mq4g256v2_residual_wmma_gfx12_bt8",
             ),
             4 => (
                 "gemm_hfq4g256_residual_wmma_gfx12_bt4",
-                kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_BT_SRC,
+                kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX12_BT_SRC,
+                "gemm_mq4g256v2_residual_wmma_gfx12_bt4",
             ),
             _ => (
                 "gemm_hfq4g256_residual_wmma_gfx12",
-                kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_SRC,
+                kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX12_SRC,
+                "gemm_mq4g256v2_residual_wmma_gfx12",
             ),
         };
-        let v2_src = format!("#define HIPFIRE_MQ4_V2_HEADER 1\n{}", ksrc);
         let module_v2 = format!("{}_mq4v2", kname);
-        self.ensure_kernel(&module_v2, &v2_src, kname)?;
+        self.ensure_kernel(&module_v2, ksrc, func_name)?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut x_ptr = x_f16_ptr;
@@ -25745,9 +25747,9 @@ impl Gpu {
         let batch_tiles = (batch_size + 16 * bt_b - 1) / (16 * bt_b);
         let bytes =
             crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * k * 2 + batch_size * m * 4 * 2;
-        let timer = crate::profile::begin_timer(&self.hip, "gemm", kname, bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", func_name, bytes);
         let result = self.launch_maybe_blob(
-            kname,
+            func_name,
             [row_tiles as u32, batch_tiles as u32, 1],
             [32, 1, 1],
             0,
@@ -25769,10 +25771,8 @@ impl Gpu {
         result
     }
 
-
-    /// MQ4 v2 (qt 44) — same as `fused_qkvza_hfq4g256` with `HIPFIRE_MQ4_V2_HEADER`.
-    /// Minimal gfx1201 dense path (generic `FUSED_QKVZA_HFQ4G256_SRC`); other arch
-    /// branches are omitted for the dense set. Module = v1 + `_mq4v2`.
+    /// MQ4 v2 (qt 44) — dedicated v2 source `FUSED_QKVZA_MQ4G256V2_SRC`.
+    /// Module = v1 + `_mq4v2`, func = v2 symbol `fused_qkvza_mq4g256v2`.
     pub fn fused_qkvza_hfq4g256_mq4v2(
         &mut self,
         a_qkv: &GpuTensor,
@@ -25791,13 +25791,9 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let v2_src = format!(
-            "#define HIPFIRE_MQ4_V2_HEADER 1\n{}",
-            kernels::FUSED_QKVZA_HFQ4G256_SRC
-        );
         let module_v2 = "fused_qkvza_hfq4g256_mq4v2";
-        let func_name = "fused_qkvza_hfq4g256";
-        self.ensure_kernel(module_v2, &v2_src, func_name)?;
+        let func_name = "fused_qkvza_mq4g256v2";
+        self.ensure_kernel(module_v2, kernels::FUSED_QKVZA_MQ4G256V2_SRC, func_name)?;
         let aq = a_qkv.buf.as_ptr();
         let az = a_z.buf.as_ptr();
         let ab = a_beta.buf.as_ptr();
@@ -25833,7 +25829,7 @@ impl Gpu {
             + crate::profile::gemv_hfq4g256_bytes(z_m, k)
             + crate::profile::gemv_hfq4g256_bytes(beta_m, k)
             + crate::profile::gemv_hfq4g256_bytes(alpha_m, k);
-        let timer = crate::profile::begin_timer(&self.hip, "fused", func_name, bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "fused", "fused_qkvza_mq4g256v2", bytes);
         let result = self.launch_maybe_blob(func_name, [total, 1, 1], [32, 1, 1], 0, &mut params, || {
             let mut b = hip_bridge::KernargBlob::new();
             b.push_ptr(aq);
@@ -25858,8 +25854,7 @@ impl Gpu {
         result
     }
 
-
-    /// MQ4 v2 — same as `fused_qkv_hfq4g256` with `HIPFIRE_MQ4_V2_HEADER`.
+    /// MQ4 v2 — dedicated v2 source `FUSED_QKV_MQ4G256V2_SRC`.
     pub fn fused_qkv_hfq4g256_mq4v2(
         &mut self,
         a_q: &GpuTensor,
@@ -25930,31 +25925,23 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         let (module_v2, src_v2, func_name, block, grid_x) = if bias.is_some() {
-            let v2_src = format!(
-                "#define HIPFIRE_MQ4_V2_HEADER 1\n{}",
-                kernels::FUSED_QKV_HFQ4G256_QWEN2_BIAS_SRC
-            );
             (
                 "fused_qkv_hfq4g256_qwen2_bias_mq4v2",
-                v2_src,
-                "fused_qkv_hfq4g256_qwen2_bias",
+                kernels::FUSED_QKV_MQ4G256V2_QWEN2_BIAS_SRC,
+                "fused_qkv_mq4g256v2_qwen2_bias",
                 [32u32, 1, 1],
                 (q_m + k_m + v_m) as u32,
             )
         } else {
-            let v2_src = format!(
-                "#define HIPFIRE_MQ4_V2_HEADER 1\n{}",
-                kernels::FUSED_QKV_HFQ4G256_SRC
-            );
             (
                 "fused_qkv_hfq4g256_mq4v2",
-                v2_src,
-                "fused_qkv_hfq4g256",
+                kernels::FUSED_QKV_MQ4G256V2_SRC,
+                "fused_qkv_mq4g256v2",
                 [32u32, 1, 1],
                 (q_m + k_m + v_m) as u32,
             )
         };
-        self.ensure_kernel(&module_v2, &src_v2, func_name)?;
+        self.ensure_kernel(&module_v2, src_v2, func_name)?;
         let aq = a_q.buf.as_ptr();
         let ak = a_k.buf.as_ptr();
         let av = a_v.buf.as_ptr();
@@ -26042,7 +26029,7 @@ impl Gpu {
     }
 
 
-    /// MQ4 v2 — same as `fused_gate_up_hfq4g256` with `HIPFIRE_MQ4_V2_HEADER`.
+    /// MQ4 v2 — dedicated v2 source `FUSED_GATE_UP_MQ4G256V2_SRC`.
     pub fn fused_gate_up_hfq4g256_mq4v2(
         &mut self,
         a_gate: &GpuTensor,
@@ -26055,13 +26042,9 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let v2_src = format!(
-            "#define HIPFIRE_MQ4_V2_HEADER 1\n{}",
-            kernels::FUSED_GATE_UP_HFQ4G256_SRC
-        );
         let module_v2 = "fused_gate_up_hfq4g256_mq4v2";
-        let func_name = "fused_gate_up_hfq4g256";
-        self.ensure_kernel(module_v2, &v2_src, func_name)?;
+        let func_name = "fused_gate_up_mq4g256v2";
+        self.ensure_kernel(module_v2, kernels::FUSED_GATE_UP_MQ4G256V2_SRC, func_name)?;
         let ag = a_gate.buf.as_ptr();
         let au = a_up.buf.as_ptr();
         let xp = x.buf.as_ptr();
@@ -26083,7 +26066,7 @@ impl Gpu {
         let grid_x = (gate_m + up_m) as u32;
         let bytes = crate::profile::gemv_hfq4g256_bytes(gate_m, k)
             + crate::profile::gemv_hfq4g256_bytes(up_m, k);
-        let timer = crate::profile::begin_timer(&self.hip, "fused", func_name, bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "fused", "fused_gate_up_mq4g256v2", bytes);
         let result = self.launch_maybe_blob(func_name, [grid_x, 1, 1], [32, 1, 1], 0, &mut params, || {
             let mut b = hip_bridge::KernargBlob::new();
             b.push_ptr(ag);

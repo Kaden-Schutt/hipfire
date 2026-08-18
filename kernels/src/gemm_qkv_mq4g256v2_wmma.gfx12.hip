@@ -56,7 +56,7 @@ typedef _Float16 __attribute__((ext_vector_type(8))) half8_t;
 typedef float    __attribute__((ext_vector_type(8))) float8_t;
 
 __launch_bounds__(32, 2)
-extern "C" __global__ void gemm_qkv_hfq4g256_wmma_gfx12(
+extern "C" __global__ void gemm_qkv_mq4g256v2_wmma_gfx12(
     const char*    __restrict__ A_q,
     const char*    __restrict__ A_k,
     const char*    __restrict__ A_v,
@@ -108,8 +108,13 @@ extern "C" __global__ void gemm_qkv_hfq4g256_wmma_gfx12(
 
     for (int g = 0; g < groups_per_row; g++) {
         const char* gp = row_base + g * 136;
-        _Float16 sc_h = (_Float16)__builtin_bit_cast(float, *(const unsigned int*)(gp));
-        _Float16 zp_h = (_Float16)__builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
+        // WMMA packs t=kt*2+k_grp; half splits at pack>=16 i.e. kt>=8 (not tid).
+        const unsigned int hA = *(const unsigned int*)(gp);
+        const unsigned int hB = *(const unsigned int*)(gp + 4);
+        const _Float16 sc0 = (_Float16)__half2float(__ushort_as_half((unsigned short)(hA & 0xFFFFu)));
+        const _Float16 zp0 = (_Float16)__half2float(__ushort_as_half((unsigned short)(hA >> 16)));
+        const _Float16 sc1 = (_Float16)__half2float(__ushort_as_half((unsigned short)(hB & 0xFFFFu)));
+        const _Float16 zp1 = (_Float16)__half2float(__ushort_as_half((unsigned short)(hB >> 16)));
 
         const _Float16* x_base = X + (long long)safe_batch * K + g * 256;
 
@@ -128,6 +133,9 @@ extern "C" __global__ void gemm_qkv_hfq4g256_wmma_gfx12(
             a_reg[7] = sc_h * (_Float16)(float)(((pk) >> 28) & 0xFu) + zp_h
 
         for (int kt = 0; kt < 16; kt += 4) {
+            // kt steps by 4; all four tiles in a body share the same half.
+            const _Float16 sc_h = (kt < 8) ? sc0 : sc1;
+            const _Float16 zp_h = (kt < 8) ? zp0 : zp1;
             const int k_off_a = (kt + 0) * 16;
             const int k_off_b = (kt + 1) * 16;
             const int k_off_c = (kt + 2) * 16;

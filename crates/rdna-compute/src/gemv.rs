@@ -7029,10 +7029,10 @@ impl Gpu {
         }
         result
     }
-    /// MQ4 v2 (qt 44) — same as `gemv_hfq4g256_residual` with `HIPFIRE_MQ4_V2_HEADER`.
-    /// Module = v1 + `_mq4v2`, func unchanged. Threads define through the
-    /// `gemv_hfq4g256_residual_for_arch` helper so the `gfx12_weight_cache_policy.inc`
-    /// preamble is preserved (same concat as `GEMV_HFQ4G256_RESIDUAL_*_SRC`).
+    /// MQ4 v2 (qt 44) — dedicated v2 source `GEMV_MQ4G256V2_RESIDUAL_SRC`.
+    /// Module = v1 + `_mq4v2`, func = v2 symbol `gemv_mq4g256v2_residual`.
+    /// Threads define through the `gemv_mq4g256v2_residual_for_arch` helper
+    /// so the `gfx12_weight_cache_policy.inc` preamble is preserved.
     /// Rows forced to 1 on non-RDNA3 (gfx1201 uses 1), matching v1.
     pub fn gemv_hfq4g256_residual_mq4v2(
         &mut self,
@@ -7052,11 +7052,11 @@ impl Gpu {
         };
         // For gfx1201 minimal dense set, rows=1 and no multirow/wave64 path is taken.
         // Still thread define through the helper rather than bypassing it.
-        let (src, module) = kernels::gemv_hfq4g256_residual_for_arch(&self.arch_caps);
-        let v2_src = format!("#define HIPFIRE_MQ4_V2_HEADER 1\n{}", src);
+        let (v2_src, _) = kernels::gemv_mq4g256v2_residual_for_arch(&self.arch_caps);
+        let (_, module) = kernels::gemv_hfq4g256_residual_for_arch(&self.arch_caps);
         let module_v2 = format!("{}_mq4v2", module);
-        let func_name = "gemv_hfq4g256_residual";
-        self.ensure_kernel(&module_v2, &v2_src, func_name)?;
+        let func_name = "gemv_mq4g256v2_residual";
+        self.ensure_kernel(&module_v2, v2_src, func_name)?;
         let a_ptr = a_raw.buf.as_ptr();
         let x_ptr = x.buf.as_ptr();
         let y_ptr = y.buf.as_ptr();
@@ -7078,7 +7078,7 @@ impl Gpu {
             m as u32
         };
         let bytes = crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4;
-        let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_hfq4g256_residual_mq4v2", bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_mq4g256v2_residual", bytes);
         // gfx1201 is wave32 (not wave64) and not multirow, so take the generic launch.
         let result = self.launch_maybe_blob(func_name, [grid, 1, 1], [32, 1, 1], 0, &mut params, || {
             let mut b = hip_bridge::KernargBlob::new();

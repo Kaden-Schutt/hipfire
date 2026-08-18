@@ -987,23 +987,6 @@ pub(crate) fn quantize_mq4g256v2(
     // m,k are the logical 2D shape; w.len() == m*k for dense tensors. Keep them for
     // API parity with the 2D-aware formats, but the encoding is linear over w.
     let _ = (m, k);
-    // Bit-identity gate. With HIPFIRE_MQ4V2_EQUAL_HALVES=1 the min/max is taken
-    // over all 256 weights and written to BOTH halves, so the artifact carries
-    // exactly v1's information content -- one affine grid over 256 -- differing
-    // from qt=13 only by the fp16 rounding of the header. Its KLD MUST therefore
-    // land on v1's (0.043776 on WT2 for qwen3.8-27b), because the encoder is
-    // emitting v1's quantization through v2's header layout and v2's kernels.
-    //
-    // That makes it the discriminator this format shipped without: if an
-    // equal-halves artifact scores ~0.044 the v2 decode path is correct and any
-    // delta on a real per-128 artifact is genuine quality; if it explodes, the
-    // runtime is feeding v2 bytes to a v1 kernel that reads the 8 header bytes
-    // as one f32 scale + one f32 zero. Byte count, census, tensor count, and a
-    // clean compile are all blind to that -- the first per-128 artifact scored
-    // 12.14 vs 0.0438 at full 163 tok/s and passed every one of them.
-    let equal_halves = std::env::var("HIPFIRE_MQ4V2_EQUAL_HALVES")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
     let group_size = 256;
     let block_bytes = MQ4V2_GROUP_BYTES;
     let n = w.len();
@@ -1024,11 +1007,7 @@ pub(crate) fn quantize_mq4g256v2(
         let mut degenerate = [false; 2];
         for h in 0..2 {
             let off = h * 128;
-            let slice: &[f32] = if equal_halves {
-                &group[..]
-            } else {
-                &group[off..off + 128]
-            };
+            let slice = &group[off..off + 128];
             let lo = slice.iter().cloned().fold(f32::INFINITY, f32::min);
             let hi = slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
             let step_f32 = if hi > lo { (hi - lo) / 15.0 } else { 0.0 };
