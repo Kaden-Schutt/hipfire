@@ -104,7 +104,7 @@ extern "C" __global__ void HIPFIRE_MQ4CG256_KERNEL(
         float zp3 = __half2float(__ushort_as_half((unsigned short)(hdr3__ >> 16)));
 
         unsigned int pk0 = LOAD_WEIGHT_PACKED(gp0 + 4 + boff, goff + 4u + boff);
-        unsigned int pk1 = LOAD_WEIGHT_PACKED(gp1 + 4 + boff, goff + 136u + boff);
+        unsigned int pk1 = LOAD_WEIGHT_PACKED(gp1 + 4 + boff, goff + 132u + 4u + boff);
         unsigned int pk2 = LOAD_WEIGHT_PACKED(gp2 + 4 + boff, goff + 268u + boff);
         unsigned int pk3 = LOAD_WEIGHT_PACKED(gp3 + 4 + boff, goff + 400u + boff);
 

@@ -1546,6 +1546,7 @@ pub const GEMV_HFQ4G1024_SRC: &str = include_str!("../../../kernels/src/gemv_hfq
 /// Block: [f32 scale][f32 zero][128B nibbles] = 136 bytes per 256 weights.
 /// Same coalesced width as Q4_K, 14 VGPRs instead of 39.
 pub const GEMV_HFQ4G256_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256.hip");
+pub const GEMV_MQ4CG256_SRC: &str = include_str!("../../../kernels/src/gemv_mq4cg256.hip");
 /// MQ4G256V2: dual-scale HFQ4-G256 (qt=44). Same 136 B stride and nibble payload as
 /// HFQ4-G256, but header holds two fp16 scales/zeros (s0/z0 for w0..127,
 /// s1/z1 for w128..255) instead of one f32 pair. Decode selects s/z by
@@ -3474,6 +3475,11 @@ pub const GEMV_MQ4G256V2_MULTIROW_SRC: &str = concat!(
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/gemv_mq4g256v2_multirow.hip")
 );
+pub const GEMV_MQ4CG256_MULTIROW_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_mq4cg256_multirow.hip")
+);
 /// Exact gfx1151 LM-head shape specialization with the established global
 /// load path unchanged. This isolates compile-time K=2048 loop/tail/address
 /// simplification from the independently rejected buffer-load experiments.
@@ -3569,6 +3575,11 @@ pub const FUSED_QKVZA_MQ4G256V2_SRC: &str = concat!(
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/fused_qkvza_mq4g256v2.hip")
+);
+pub const FUSED_QKVZA_MQ4CG256_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkvza_mq4cg256.hip")
 );
 
 /// Exact gfx1151 A3B candidate: preserve the generic one-row schedule while
@@ -3878,6 +3889,18 @@ pub const FUSED_QKV_MQ4G256V2_QWEN2_BIAS_SRC: &str = concat!(
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/fused_qkv_mq4g256v2.hip")
+);
+pub const FUSED_QKV_MQ4CG256_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkv_mq4cg256.hip")
+);
+pub const FUSED_QKV_MQ4CG256_QWEN2_BIAS_SRC: &str = concat!(
+    "#define HIPFIRE_QKV_WITH_BIAS 1\n",
+    "#define HIPFIRE_QKV_KERNEL_NAME fused_qkv_mq4cg256_qwen2_bias\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkv_mq4cg256.hip")
 );
 
 /// gfx1151 fixed-K FullAttention projection with Radiowave temporal buffer
@@ -4268,7 +4291,11 @@ pub const FUSED_GATE_UP_MQ4G256V2_SRC: &str = concat!(
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/fused_gate_up_mq4g256v2.hip")
 );
-/// gfx1201 dense decode specialization. The host admits this artifact only
+pub const FUSED_GATE_UP_MQ4CG256_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_gate_up_mq4cg256.hip")
+);
 /// for K=1024, allowing LLVM to remove the generic quad loop and dead tail
 /// bodies while retaining the base kernel's exact load/FMA/reduction order.
 pub const FUSED_GATE_UP_HFQ4G256_K1024_GFX1201_SRC: &str = concat!(

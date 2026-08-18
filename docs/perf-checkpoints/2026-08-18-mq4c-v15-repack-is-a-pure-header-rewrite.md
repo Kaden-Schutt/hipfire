@@ -153,3 +153,65 @@ artifact** at 0.5 rather than silently producing a lossy one. It also reports th
 minimum scale and the flip count so both invariants are visible per run. Running it
 is therefore the check, not a formality — the 0.25 note fired on the very first real
 artifact, against a sampled expectation of 0.011.
+
+---
+
+## Amendment 2 — direct quantization is strictly better than repacking, and mq4c is FREE
+
+The record so far compares the repack against v1 and concludes the fp16 header costs
+~0.007–0.008%. That framing is wrong in an important way: **0.007% is the cost of
+REPACKING, not the cost of the format.** Quantizing to mq4c directly from the parent
+costs nothing at all.
+
+Measured on 400,000 synthetic post-FWHT groups (102,400,000 weights, sigma 0.011 to
+match the qwen3.8 parent). Note the header is IDENTICAL on both paths — it derives
+from the per-256 min/max of the original weights either way — so the only difference
+is which grid the nibbles were fitted to:
+
+| path | MSE vs ORIGINAL weights | vs v1 |
+|---|---|---|
+| v1 (qt=13, f32 header) | 1.435672e-06 | — |
+| repack v1 → mq4c (keep nibbles) | 1.435776e-06 | **+0.007%** |
+| direct parent → mq4c (re-fit nibbles) | 1.435672e-06 | **+0.000%** |
+
+- **repack penalty vs direct: +0.007%**
+- **0.1901%** of nibbles differ between the two paths (194,630 of 102,400,000)
+
+So mq4c quantized from the parent has **identical quality to qt=13 at 132 B instead of
+136 B** — strictly free, exactly as § 1b of the spec claims ("identical quality to v1
+… smaller and faster"), and the spec's mandatory fp16 round-trip before quantizing
+(§ 3) is what buys that.
+
+### Why the earlier probe did not see this
+
+`mq4c_repack_probe.py` measured the drift of v1's **reconstruction** `ŵ = z32 + q·s32`
+on the v1.5 grid, and correctly found 0 flips: `ŵ` sits exactly on a v1 grid point, so
+re-fitting `ŵ` returns the same code. That proves the repack is equivalent to
+re-fitting *its own reconstruction*.
+
+It does **not** prove the repack equals direct quantization, because the **original**
+weight `w` sits up to 0.5 steps off a grid point and therefore can cross a boundary
+when the grid shifts by up to the measured 0.26 steps. That is a different question,
+and the answer is 0.19% of nibbles.
+
+Both statements are true and neither is the other:
+
+| claim | true? |
+|---|---|
+| repack preserves every nibble of the v1 artifact | **yes** — 0 flips in 95,119,360 real groups |
+| repack is as good as quantizing from the parent | **no** — +0.007% MSE, 0.19% of nibbles differ |
+
+### Consequence for how mq4c should be produced
+
+Two distinct products, and the better one is the cheaper one to reason about:
+
+- **`--format mq4c` from the parent** — quality identical to qt=13, 2.43% smaller,
+  ~7% faster decode (measured). Free on every axis. This is the one to ship.
+- **repack of a legacy `.mq4`** — costs +0.007% MSE, but needs no parent, no imatrix
+  and no re-quantization. For artifacts already distributed, where re-quantizing is
+  not an option.
+
+Whether +0.007% MSE is detectable in KLD is unmeasured; on this campaign's evidence
+weight-space MSE is a poor predictor of KLD, so it should not be assumed either way.
+Both artifacts can now be scored against the same references once the mq4c kernel set
+lands, which settles it directly.
