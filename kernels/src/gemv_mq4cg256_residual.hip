@@ -155,13 +155,7 @@ extern "C" __global__ void HIPFIRE_MQ4C_RESIDUAL_KERNEL(
         const unsigned int hdr__ = HIPFIRE_MQ4C_LOAD_HDR(weight_rsrc, gp, weight_offset); \
         { typedef _Float16 hipfire_h2v __attribute__((ext_vector_type(2))); \
           const hipfire_h2v hv__ = __builtin_bit_cast(hipfire_h2v, hdr__); \
-          (sc) = (float)hv__[0]; (zp) = (float)hv__[1]; \
-          /* Force sc/zp to materialise as opaque f32 in a VGPR. Without this the
-             backend folds the f16->f32 widening INTO the dequant FMA as
-             v_fma_mix_f32 (VOP3, not VOPD-dual-issueable), replacing 98
-             v_fma_f32 with 112 mix-FMAs. One explicit convert per group is far
-             cheaper than losing the packable FMA form across 256 weights. */ \
-          asm("" : "+v"(sc)); asm("" : "+v"(zp)); } \
+          (sc) = (float)hv__[0]; (zp) = (float)hv__[1]; } \
         (pk) = HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc, (gp) + 8 + boff, (weight_offset) + 8 + boff); \
     } while (0)
 

@@ -141,3 +141,56 @@ The packed-half unpack is KEPT: at model scale it is neutral-to-marginally
 better, it is correct (oracle 6.966e-8), spill-free, and 16 waves is the more
 robust operating point under concurrency. It is simply not a fix for the decode
 deficit, and the deficit appears not to be fixable.
+
+## 7 · Three mechanisms proposed for the decode deficit, three falsified
+
+The ~2% model-scale decode gap between qt=45 and v1 was chased through three
+independent hypotheses. Every one was implemented, measured at model scale with
+the v1 control bracketed, and refuted.
+
+|build|VGPR/waves|FMA form|isolated decode|**model decode**|
+|---|---|---|---|---|
+|v1|93 / 16|98 `v_fma_f32`|15.4 us|**34.65**|
+|qt=45 mask/shift|97 / 12|112 `v_fma_mix_f32`|14.5 us|33.90|
+|qt=45 packed-half|94 / **16**|112 mix|16.0 us|**34.00**|
+|qt=45 + FMA barrier|102 / 12|**98 plain**, dual 68->70|14.9 us|33.90|
+
+**(a) Occupancy cliff.** qt=45 sat at 97 VGPR / 12 waves against v1's 93 / 16.
+Unpacking through a native `ext_vector_type(2)` of `_Float16` reaches 94 / 16 —
+v1's occupancy exactly, spill-free. Model decode moved 33.90 -> 34.00, one 0.1
+tok/s quantum on a 0.75 tok/s gap.
+
+**(b) FMA form / dual-issue.** The decode histogram showed the backend folding
+the f16->f32 widening into the dequant FMA as `v_fma_mix_f32` (VOP3, not
+VOPD-eligible): 98 packable `v_fma_f32` became 112 that issue one at a time,
+with 4 fewer dual-issue slots. Forcing `sc`/`zp` to materialise as opaque f32
+(empty asm, `"+v"` constraint, zero instructions) restored v1's form exactly —
+98 `v_fma_f32`, zero mix, dual-issue 68 -> 70. Model decode: **33.90.** No
+change at all.
+
+**(c) Earlier, in § 5 and prior files:** 16-byte load misalignment, a redundant
+f16->f32->f16 round trip, and lost `dwordx2` merging. All three refuted.
+
+**What this actually establishes.** Perturbing the residual GEMV in three
+independent directions — register pressure, unpack form, FMA form — moved model
+decode by at most 0.1 tok/s. That bounds this kernel's contribution to the gap
+at essentially zero. The deficit is **not in the kernel we spent three
+experiments on**; it is distributed across the remaining decode kernels, which
+are all still on the mask/shift unpack: `gemv_mq4cg256`, `gemv_mq4cg256_multirow`,
+`fused_qkv_mq4cg256`, `fused_qkvza_mq4cg256`, `fused_gate_up_mq4cg256`.
+
+**Fourth consecutive decode-microbench inversion.** The isolated bench ranked
+these builds 14.5 / 16.0 / 14.9 us; model scale ranked them 33.90 / 34.00 /
+33.90. It got the ordering wrong every time, including preferring the build that
+model scale liked least. The isolated decode bench in this repo has now
+mispredicted four out of four times and should be treated as a mechanism probe
+only — never as a verdict.
+
+**Kept:** the packed-half unpack (94 VGPR / 16 waves), because it measured
+marginally best at model scale, has the lowest register pressure, and 16 waves
+is the more robust operating point under concurrency. The FMA barrier is
+reverted: it cost 8 VGPRs and 4 waves for zero model-scale gain.
+
+**Recommendation: stop here.** The whole remaining deficit is 2% of decode,
+three experiments have each bought under 0.3%, and the format that matters
+(qt=44) carries the same signature with a -10.8% KLD payoff that dwarfs it.
