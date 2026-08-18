@@ -64,16 +64,18 @@ extern "C" __global__ void gemm_mq4cg256_residual_wmma_gfx12(
     const int safe_row   = (row_start   + m_lane < M)          ? (row_start   + m_lane) : (M - 1);
     const int safe_batch = (batch_start + m_lane < batch_size) ? (batch_start + m_lane) : 0;
 
-    const int groups_per_row = K / 256;
-    const char* row_base = A + (long long)safe_row * groups_per_row * 132;
+    const int gpr = K / 256;
+    // Planar mq4c (qt=45): payload plane [m*gpr*128], header plane [m*gpr*4] at + m*gpr*128.
+    const char* row_base = A + (long long)safe_row * gpr * 128;
+    const char* header_base = A + (long long)M * gpr * 128 + (long long)safe_row * gpr * 4;
     const _Float16* x_base = X + (long long)safe_batch * K;
 
     float8_t acc = {0, 0, 0, 0, 0, 0, 0, 0};
 
-    for (int g = 0; g < groups_per_row; g++) {
-        const char* gp = row_base + g * 132;
-        // mq4c header: one dword, fp16 scale (lo) + fp16 zero (hi); nibbles at +4.
-        const unsigned int hdr__ = *(const unsigned int*)(gp);
+    for (int g = 0; g < gpr; g++) {
+        const char* gp = row_base + g * 128;
+        // planar header: packed dword (scale lo, zero hi) in header plane.
+        const unsigned int hdr__ = *(const unsigned int*)(header_base + g * 4);
         _Float16 sc_h = (_Float16)__half2float(__ushort_as_half((unsigned short)(hdr__ & 0xFFFFu)));
         _Float16 zp_h = (_Float16)__half2float(__ushort_as_half((unsigned short)(hdr__ >> 16)));
         const _Float16* xg = x_base + g * 256;
@@ -96,10 +98,11 @@ extern "C" __global__ void gemm_mq4cg256_residual_wmma_gfx12(
             const int k_off_c = (kt + 2) * 16;
             const int k_off_d = (kt + 3) * 16;
 
-            unsigned int pka = *(const unsigned int*)(gp + 4 + k_off_a / 2 + k_grp * 4);
-            unsigned int pkb = *(const unsigned int*)(gp + 4 + k_off_b / 2 + k_grp * 4);
-            unsigned int pkc = *(const unsigned int*)(gp + 4 + k_off_c / 2 + k_grp * 4);
-            unsigned int pkd = *(const unsigned int*)(gp + 4 + k_off_d / 2 + k_grp * 4);
+            unsigned int pka = *(const unsigned int*)(gp + k_off_a / 2 + k_grp * 4);
+            unsigned int pkb = *(const unsigned int*)(gp + k_off_b / 2 + k_grp * 4);
+            unsigned int pkc = *(const unsigned int*)(gp + k_off_c / 2 + k_grp * 4);
+            unsigned int pkd = *(const unsigned int*)(gp + k_off_d / 2 + k_grp * 4);
+
 
             half8_t b_a = *(const half8_t*)(xg + k_off_a + k_grp * 8);
             half8_t b_b = *(const half8_t*)(xg + k_off_b + k_grp * 8);
@@ -162,16 +165,18 @@ extern "C" __global__ void gemm_mq4cg256_residual_wmma_gfx12_ldsstage(
     const int safe_batch = (batch_start + m_lane < batch_size)
         ? (batch_start + m_lane) : 0;
     const _Float16* x_base = X + (long long)safe_batch * K;
-    const int groups_per_row = K / 256;
-    const int row_bytes = groups_per_row * 132;
+    const int gpr = K / 256;
     const int slabs = K / 512;
+    const char* hplane = A + (long long)M * gpr * 128;
 
-    // Two packed G256 groups per row, 16 rows: 16 * 264 = 4224 B.
-    // mq4c group is 132 B (fp16 sc|zp header + 128 B nibbles), so a 512-K
-    // slab is 264 B/row. Fill uses 16 dwordx4 loads covering bytes 0..255,
-    // then one dwordx2 tail for bytes 256..263. Within each row, consecutive
-    // threads access consecutive 16-byte addresses for the bulk fill.
-    __shared__ __align__(16) unsigned char staged_weights[16][264];
+    // Two packed G256 groups per row, 16 rows: 16 * 256 = 4096 B.
+    // Planar: payload per group 128 B (16-byte aligned), slab = 256 B/row
+    // contiguous in payload plane. Fill uses 16 dwordx4 loads covering bytes
+    // 0..255 (256 is 16*16, so no ragged tail). Headers (4 B/group, 8 B/slab)
+    // are read directly from the header plane (hplane) — not staged — because
+    // they are only 2 dwords per row/slab and do not benefit from LDS coalescing;
+    // staging them would waste LDS and add extra copies.
+    __shared__ __align__(16) unsigned char staged_weights[16][256];
     __shared__ float partials[8 * 32 * 8];
 
     const int load_row = tid >> 4;          // 0..15
@@ -182,28 +187,18 @@ extern "C" __global__ void gemm_mq4cg256_residual_wmma_gfx12_ldsstage(
     float8_t acc = {0, 0, 0, 0, 0, 0, 0, 0};
 
     for (int slab = 0; slab < slabs; ++slab) {
-        const char* src0 = A + (long long)safe_load_row * row_bytes
-            + slab * 264 + load_vec * 16;
+        const char* src0 = A + (long long)safe_load_row * gpr * 128
+            + (long long)slab * 256 + load_vec * 16;
         unsigned char* dst0 = staged_weights[load_row] + load_vec * 16;
         *(uint4v_t*)dst0 = *(const uint4v_t*)src0;
-
-        // 8-byte tail at offset 256 (bytes 256..263) — one dwordx2 per row.
-        if (tid < 16) {
-            const int safe_tail_row = (row_start + tid < M)
-                ? (row_start + tid) : (M - 1);
-            const char* src1 = A + (long long)safe_tail_row * row_bytes
-                + slab * 264 + 256;
-            unsigned char* dst1 = staged_weights[tid] + 256;
-            *reinterpret_cast<unsigned long long*>(dst1) =
-                *reinterpret_cast<const unsigned long long*>(src1);
-        }
         __syncthreads();
 
         const int group_in_slab = wave >> 2;
         const int quarter_in_group = wave & 3;
-        const unsigned char* gp = staged_weights[m_lane] + group_in_slab * 132;
-        // mq4c: single fp16|fp16 header dword; no half-select (per-256 affine).
-        const unsigned int hdr__ = *(const unsigned int*)(gp);
+        const unsigned char* gp = staged_weights[m_lane] + group_in_slab * 128;
+        // planar header from global header plane (not staged)
+        const int safe_consume_row = (row_start + m_lane < M) ? (row_start + m_lane) : (M - 1);
+        const unsigned int hdr__ = *(const unsigned int*)(hplane + (long long)safe_consume_row * gpr * 4 + (slab * 2 + group_in_slab) * 4);
         _Float16 sc_h = (_Float16)__half2float(__ushort_as_half((unsigned short)(hdr__ & 0xFFFFu)));
         _Float16 zp_h = (_Float16)__half2float(__ushort_as_half((unsigned short)(hdr__ >> 16)));
         const _Float16* xg = x_base + slab * 512 + wave * 64;
@@ -219,15 +214,16 @@ extern "C" __global__ void gemm_mq4cg256_residual_wmma_gfx12_ldsstage(
             a_reg[6] = sc_h * (_Float16)(float)(((pk) >> 24) & 0xFu) + zp_h; \
             a_reg[7] = sc_h * (_Float16)(float)(((pk) >> 28) & 0xFu) + zp_h
 
-        const unsigned int pka = *(const unsigned int*)(gp + 4 + packed_base + 0 + k_grp * 4);
-        const unsigned int pkb = *(const unsigned int*)(gp + 4 + packed_base + 8 + k_grp * 4);
-        const unsigned int pkc = *(const unsigned int*)(gp + 4 + packed_base + 16 + k_grp * 4);
-        const unsigned int pkd = *(const unsigned int*)(gp + 4 + packed_base + 24 + k_grp * 4);
+        const unsigned int pka = *(const unsigned int*)(gp + packed_base + 0 + k_grp * 4);
+        const unsigned int pkb = *(const unsigned int*)(gp + packed_base + 8 + k_grp * 4);
+        const unsigned int pkc = *(const unsigned int*)(gp + packed_base + 16 + k_grp * 4);
+        const unsigned int pkd = *(const unsigned int*)(gp + packed_base + 24 + k_grp * 4);
 
         const half8_t b_a = *(const half8_t*)(xg + 0 + k_grp * 8);
         const half8_t b_b = *(const half8_t*)(xg + 16 + k_grp * 8);
         const half8_t b_c = *(const half8_t*)(xg + 32 + k_grp * 8);
         const half8_t b_d = *(const half8_t*)(xg + 48 + k_grp * 8);
+
 
         half8_t a_reg;
         DQ8_LDS(pka);

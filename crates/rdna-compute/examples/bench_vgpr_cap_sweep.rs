@@ -55,7 +55,6 @@ const V15_RESIDUAL: &str = include_str!("../../../kernels/src/gemv_mq4cg256_resi
 const V15PAD_RESIDUAL: &str = include_str!("../../../kernels/src/gemv_mq4cpad_residual.hip");
 // Planar: 128 B payload plane + contiguous 4 B/group header plane = 132 B/group.
 // Keeps mq4c's size AND gets 16 B-aligned payloads.
-const V15PLANAR_RESIDUAL: &str = include_str!("../../../kernels/src/gemv_mq4cplanar_residual.hip");
 
 /// f32 -> IEEE fp16 bits. Round-to-nearest-even, with flush of anything below the
 /// fp16 denormal floor; sufficient for a synthetic blob whose contents only need to
@@ -154,24 +153,23 @@ fn main() {
     let gpr = k / GROUP;
 
     let b_v1 = blob(m, k, V1_BYTES, false, 8);
-    let b_v15 = blob(m, k, V15_BYTES, true, 4);
-    let b_v15pad = blob(m, k, V1_BYTES, true, 8);
-    let b_v15planar: Vec<u8> = {
-        let mut v = vec![0u8; m * gpr * V15_BYTES];
-        let hbase = m * gpr * 128;
-        for gi in 0..(m * gpr) {
-            let src = &b_v15[gi * V15_BYTES..(gi + 1) * V15_BYTES];
-            v[gi * 128..(gi + 1) * 128].copy_from_slice(&src[4..V15_BYTES]);
-            v[hbase + gi * 4..hbase + gi * 4 + 4].copy_from_slice(&src[0..4]);
+    // qt=45 is PLANAR now: payload plane at 128 B stride, then the 4 B/group header plane.
+    let b_v15: Vec<u8> = {
+        let il = blob(m, k, V15_BYTES, true, 4);
+        let n = m * gpr; let hbase = n * 128;
+        let mut v = vec![0u8; n * V15_BYTES];
+        for g in 0..n {
+            v[g*128..(g+1)*128].copy_from_slice(&il[g*V15_BYTES+4..(g+1)*V15_BYTES]);
+            v[hbase+g*4..hbase+g*4+4].copy_from_slice(&il[g*V15_BYTES..g*V15_BYTES+4]);
         }
         v
     };
+    let b_v15pad = blob(m, k, V1_BYTES, true, 8);
     let x: Vec<f32> = (0..k).map(|i| prng(i, 0xC0FF_EE) * 2.0 - 1.0).collect();
 
     let d_v1 = gpu.upload_raw(&b_v1, &[b_v1.len()]).unwrap();
     let d_v15 = gpu.upload_raw(&b_v15, &[b_v15.len()]).unwrap();
     let d_v15pad = gpu.upload_raw(&b_v15pad, &[b_v15pad.len()]).unwrap();
-    let d_v15planar = gpu.upload_raw(&b_v15planar, &[b_v15planar.len()]).unwrap();
     let d_x = gpu.upload_f32(&x, &[k]).unwrap();
     let d_y = gpu.zeros(&[m], DType::F32).unwrap();
 
@@ -235,17 +233,6 @@ fn main() {
             Err(e) => eprintln!("v15pad failed to compile: {e}"),
         }
     }
-    let plsym = "bench_v15planar".to_string();
-    {
-        let src = format!(
-            "#define HIPFIRE_MQ4CPLANAR_RESIDUAL_KERNEL {plsym}\n{}",
-            format!("{CACHE_POLICY}{V15PLANAR_RESIDUAL}")
-        );
-        match gpu.ensure_kernel_public(&format!("bench_{plsym}"), &src, &plsym) {
-            Ok(()) => {}
-            Err(e) => eprintln!("v15planar failed to compile: {e}"),
-        }
-    }
     if v15_syms.is_empty() {
         eprintln!("no v1.5 arm compiled; nothing to measure");
         return;
@@ -274,11 +261,10 @@ fn main() {
         .map(|n| (n.clone(), 0u8))
         .chain(v15_syms.iter().map(|(_, s)| (s.clone(), 1u8)))
         .chain(std::iter::once((padsym.clone(), 2u8)))
-        .chain(std::iter::once((plsym.clone(), 3u8)))
         .collect();
 
     for (sym, kind) in &all {
-        let a = match kind { 0 => &d_v1, 1 => &d_v15, 2 => &d_v15pad, _ => &d_v15planar };
+        let a = match kind { 0 => &d_v1, 1 => &d_v15, _ => &d_v15pad };
         for _ in 0..WARMUP {
             launch(&gpu, sym, a);
         }
@@ -289,7 +275,7 @@ fn main() {
 
     for _run in 0..RUNS {
         for (idx, (sym, kind)) in all.iter().enumerate() {
-            let a = match kind { 0 => &d_v1, 1 => &d_v15, 2 => &d_v15pad, _ => &d_v15planar };
+            let a = match kind { 0 => &d_v1, 1 => &d_v15, _ => &d_v15pad };
             for _ in 0..8 {
                 launch(&gpu, sym, a);
             }
@@ -322,7 +308,7 @@ fn main() {
     for (i, (sym, samples)) in results.iter_mut().enumerate() {
         let m_us = med(samples);
         let kind = all[i].1;
-        let gbs = (if kind == 1 || kind == 3 { bytes_v15 } else { bytes_v1 }) / (m_us * 1e-6) / 1e9;
+        let gbs = (if kind == 1 { bytes_v15 } else { bytes_v1 }) / (m_us * 1e-6) / 1e9;
         if kind == 0 && base.is_nan() {
             base = m_us;
         }

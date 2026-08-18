@@ -9,8 +9,7 @@
 // (max_rel 0). B is the host's adaptive pick = clamp(N/16, 1, 12); B=16 spills VGPR so
 // 12 is the cap. Measured (gfx1201, N=192): 32.3 -> 59.7 TFLOPS (+85%).
 //
-// Port of gemm_gate_up_hfq4g256_wmma_gfx12_bt.hip to qt=45 (132 B group, single
-// fp16 dword header, nibble payload at +4; no half-select).
+// Port of gemm_gate_up_hfq4g256_wmma_gfx12_bt.hip to qt=45 (planar: 128 B payload plane + 4 B header plane per group).
 //
 // Grid: [ceil((gate_m+up_m)/16), ceil(N/(16*B))]. Block: [32]. LDS: 0.
 // Same lane decomposition / C-mapping as the 1-acc gfx12 kernel; only the batch
@@ -36,19 +35,19 @@ extern "C" __launch_bounds__(32, 2) __global__ void gemm_gate_up_mq4cg256_wmma_g
     if (rs >= tm || bs >= N) return; \
     const int ml = tid & 15, kg = tid >> 4; \
     const int mr = rs + ml, sr = (mr < tm) ? mr : (tm - 1); \
-    const char* A; int lr; if (sr < gate_m) { A = A_gate; lr = sr; } else { A = A_up; lr = sr - gate_m; } \
-    const int gpr = K / 256; const char* rb = A + (long long)lr * gpr * 132; \
+    const int gpr = K / 256; const char* A; int lr; const char* hb; if (sr < gate_m) { A = A_gate; lr = sr; hb = A_gate + (long long)gate_m * gpr * 128 + (long long)lr * gpr * 4; } else { A = A_up; lr = sr - gate_m; hb = A_up + (long long)up_m * gpr * 128 + (long long)lr * gpr * 4; } \
+    const char* rb = A + (long long)lr * gpr * 128; \
     int sb[BV]; for (int b = 0; b < BV; b++) { int t = bs + b * 16 + ml; sb[b] = (t < N) ? t : 0; } \
     float8_t acc[BV]; for (int b = 0; b < BV; b++) acc[b] = float8_t{0,0,0,0,0,0,0,0}; \
     for (int g = 0; g < gpr; g++) { \
-        const char* gp = rb + g * 132; \
-        const unsigned int hdr__ = *(const unsigned int*)(gp); \
+        const char* gp = rb + g * 128; \
+        const unsigned int hdr__ = *(const unsigned int*)(hb + g * 4); \
         _Float16 sc = __ushort_as_half((unsigned short)(hdr__ & 0xFFFFu)); \
         _Float16 zp = __ushort_as_half((unsigned short)(hdr__ >> 16)); \
         const _Float16* xb[BV]; for (int b = 0; b < BV; b++) xb[b] = X + (long long)sb[b] * K + g * 256; \
         for (int kt = 0; kt < 16; kt += 4) { \
-            unsigned int p[4] = { *(const unsigned int*)(gp+4+(kt+0)*8+kg*4), *(const unsigned int*)(gp+4+(kt+1)*8+kg*4), \
-                                  *(const unsigned int*)(gp+4+(kt+2)*8+kg*4), *(const unsigned int*)(gp+4+(kt+3)*8+kg*4) }; \
+            unsigned int p[4] = { *(const unsigned int*)(gp+(kt+0)*8+kg*4), *(const unsigned int*)(gp+(kt+1)*8+kg*4), \
+                                  *(const unsigned int*)(gp+(kt+2)*8+kg*4), *(const unsigned int*)(gp+(kt+3)*8+kg*4) }; \
             _Pragma("unroll") \
             for (int ki = 0; ki < 4; ki++) { half8_t a; MQ4C_DQ8(p[ki], sc, zp); \
                 _Pragma("unroll") \

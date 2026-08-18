@@ -976,7 +976,20 @@ pub(crate) const MQ4C_GROUP_BYTES: usize = 132;
 ///   st=f32(scale); z=f32(zero); // round-tripped
 ///   for i in 0..256: q[i]=clamp(rint((w[i]-z)/st),0,15)
 /// Degenerate group (hi==lo): scale=0, zero=f16(lo), all q=0.
-/// Header: [0..2) fp16 scale, [2..4) fp16 zero, [4..132) 128 B nibbles.
+///
+/// Planar layout (per weight tensor with `m` rows, `gpr = K/256` groups/row):
+///   [ payload plane : m*gpr*128 bytes ][ header plane : m*gpr*4 bytes ]
+///   total `m*gpr*132` bytes — so `MQ4C_GROUP_BYTES` (132) and every on-disk
+///   size check is UNCHANGED. Payload for group `(row*gpr+g)` starts at
+///   `(row*gpr+g)*128` (128 B nibbles, 16-byte aligned for every group);
+///   header at `m*gpr*128 + (row*gpr+g)*4` is the same packed dword as before
+///   (low 16 bits fp16 scale, high 16 bits fp16 zero) governing all 256 weights.
+///   Interleaved `[4 B header][128 B payload]` at a 132 B stride left the payload
+///   4-byte aligned half the time and cost 7-11% prefill on 96 `global_load_b128`
+///   kernels; the planar 128 B payload stride restores 16-byte alignment for
+///   every group while keeping the 2.43% size win. Nibble order, FWHT rotation,
+///   AWQ sidecar handling, and the header's meaning are unchanged — pure
+///   relocation of bytes.
 /// See spec header in task — single affine grid per 256, no half-select.
 pub(crate) fn quantize_mq4cg256(
     w: &[f32],
@@ -985,13 +998,25 @@ pub(crate) fn quantize_mq4cg256(
     signs1: &[f32],
     signs2: &[f32],
 ) -> Vec<u8> {
-    let _ = (m, k);
     let group_size = 256;
-    let block_bytes = MQ4C_GROUP_BYTES;
     let n = w.len();
-    let n_blocks = (n + group_size - 1) / group_size;
-    let mut output = vec![0u8; n_blocks * block_bytes];
-    for b in 0..n_blocks {
+    // Planar layout: derive gpr from the 2D shape. K must be a multiple of 256
+    // for all real weight tensors; the assert makes a shape bug fail loud rather
+    // than silently emitting a mis-aligned blob that decodes as garbage at full
+    // speed with no error (the qt=44 failure mode that cost ~5 hours).
+    assert!(k % 256 == 0, "MQ4CG256 requires K % 256 == 0, got K={k}");
+    let gpr = k / 256;
+    let total_groups = m * gpr;
+    // w is row-major [m, k]; require exact coverage so the planar offsets are
+    // well-defined. A half-converted tensor would decode garbage with no error.
+    assert_eq!(n, m * k, "w.len() {} != m*k {}*{}={}", n, m, k, m * k);
+    let expected_len = total_groups * MQ4C_GROUP_BYTES;
+    assert_eq!(expected_len, m * gpr * 132, "total bytes must be m*gpr*132");
+    let payload_bytes = total_groups * 128;
+    let header_bytes = total_groups * 4;
+    assert_eq!(payload_bytes + header_bytes, expected_len);
+    let mut output = vec![0u8; expected_len];
+    for b in 0..total_groups {
         let start = b * group_size;
         let end = (start + group_size).min(n);
         let mut group = [0.0f32; 256];
@@ -1006,14 +1031,12 @@ pub(crate) fn quantize_mq4cg256(
         let st = f16_to_f32(sc_bits);
         let z = f16_to_f32(z_bits);
         let degenerate = hi == lo || step_f32 == 0.0 || st == 0.0;
-        let out_off = b * block_bytes;
-        output[out_off..out_off + 2].copy_from_slice(&sc_bits.to_le_bytes());
-        output[out_off + 2..out_off + 4].copy_from_slice(&z_bits.to_le_bytes());
+        let payload_off = b * 128;
+        let header_off = payload_bytes + b * 4;
+        output[header_off..header_off + 2].copy_from_slice(&sc_bits.to_le_bytes());
+        output[header_off + 2..header_off + 4].copy_from_slice(&z_bits.to_le_bytes());
         if degenerate {
-            // all q = 0, nibbles already zeroed
-            for i in 0..128 {
-                output[out_off + 4 + i] = 0;
-            }
+            // all q = 0, payload already zeroed (128 B per group)
         } else {
             let inv = 1.0 / st;
             let mut q = [0u8; 256];
@@ -1024,10 +1047,11 @@ pub(crate) fn quantize_mq4cg256(
             for i in 0..128 {
                 let lo_q = q[2 * i];
                 let hi_q = q[2 * i + 1];
-                output[out_off + 4 + i] = (lo_q & 0xF) | ((hi_q & 0xF) << 4);
+                output[payload_off + i] = (lo_q & 0xF) | ((hi_q & 0xF) << 4);
             }
         }
     }
+    assert_eq!(output.len(), m * gpr * 132);
     output
 }
 
@@ -5966,7 +5990,6 @@ pub(crate) enum QuantType {
     // vs the per-block Lloyd formats (qt 19/20), which interleave a fitted
     // 2^N-entry fp16 codebook into every group.
     //
-    // Rationale (measured 2026-08-04, docs/investigations/2026-08-04-a3b-lowbit-quality.md):
     // post-FWHT blocks are Gaussian by CLT, so the optimal LEVEL SHAPE is the
     // same in every block — a per-block fit re-derives it ~4000x per tensor and
     // differs only by scale. Fitting a global codebook on 28.3M real a3b expert
@@ -5994,8 +6017,18 @@ pub(crate) enum QuantType {
     /// lane-invariant addresses and stay scalar loads.
     MQ4G256V2 = 44,
     /// MQ4CG256 (qt=45): FWHT-rotated 4-bit, single affine grid per 256, fp16 header, 132 B/group.
-    /// Header: [0..2) fp16 scale, [2..4) fp16 zero, [4..132) 128 B nibbles (low nibble = even index).
-    /// `w = q * f32(scale) + f32(zero)` with scale/zero round-tripped through fp16 before quantizing.
+    /// Planar layout per weight tensor with `m` rows, `gpr = K/256`:
+    ///   [ payload plane : m*gpr*128 bytes ][ header plane : m*gpr*4 bytes ]
+    /// total `m*gpr*132` bytes (`MQ4C_GROUP_BYTES` unchanged). Payload for
+    /// `(row*gpr+g)` at `(row*gpr+g)*128` is 128 B nibbles, 16-byte aligned for
+    /// every group; header at `m*gpr*128 + (row*gpr+g)*4` is the packed dword
+    /// (low 16 bits fp16 scale, high 16 bits fp16 zero) governing all 256
+    /// weights. The split exists because interleaved `[4 B hdr][128 B payload]`
+    /// at a 132 B stride left the payload 4-byte aligned half the time and cost
+    /// 7-11% prefill on 96 `global_load_b128` kernels; planar keeps the 2.43%
+    /// size win while fixing alignment. Nibble order, FWHT, AWQ, and header
+    /// meaning are unchanged.
+    /// `w = q * f32(scale) + f32(zero)` with scale/zero round-tripped through fp16.
     MQ4CG256 = 45,
     MFP4G32E8SOA = 35, // mfp4-E8 SoA: same E8 data as qt=34 but in structure-of-arrays layout.
     MFP3G32E8 = 36, // mfp3-E8: MFP4G32E8 frame, 3-bit lattice (center 3), 13 B/blk, 3.25 bpw.
@@ -18330,17 +18363,20 @@ mod tests {
         assert_eq!(MQ4C_GROUP_BYTES, 132);
         let mut sse: f64 = 0.0;
         let mut sig: f64 = 0.0;
+        // Planar layout: [payload plane : n_blocks*128][header plane : n_blocks*4]
+        let payload_bytes = n_blocks * 128;
         for b in 0..n_blocks {
             let start = b * 256;
             let mut group = [0.0f32; 256];
             group.copy_from_slice(&w[start..start + 256]);
             cpu_fwht_256(&mut group, &s1, &s2);
-            let off = b * 132;
-            let sc = f16_to_f32(u16::from_le_bytes([blob[off], blob[off + 1]]));
-            let zp = f16_to_f32(u16::from_le_bytes([blob[off + 2], blob[off + 3]]));
+            let payload_off = b * 128;
+            let header_off = payload_bytes + b * 4;
+            let sc = f16_to_f32(u16::from_le_bytes([blob[header_off], blob[header_off + 1]]));
+            let zp = f16_to_f32(u16::from_le_bytes([blob[header_off + 2], blob[header_off + 3]]));
             let mut q = [0u8; 256];
             for i in 0..128 {
-                let byte = blob[off + 4 + i];
+                let byte = blob[payload_off + i];
                 q[2 * i] = byte & 0xF;
                 q[2 * i + 1] = (byte >> 4) & 0xF;
             }

@@ -1,22 +1,24 @@
-//! Correctness gate for MQ4C / v1.5 (qt=45, 132 B/group) decode.
+//! Correctness gate for MQ4C / v1.5 (qt=45, 132 B/group) PLANAR decode.
 //!
 //! v1 and mq4c encode the SAME per-256 affine grid; mq4c just narrows the header to
-//! one fp16 pair, which moves the payload from +8 to +4 and the stride from 136 to
-//! 132. A repack keeps every nibble (measured: 0 flips in 95,119,360 real groups), so
-//! the two containers must decode to the same numbers within fp16 header rounding —
-//! measured at 0.0909% weight RMS on a real artifact.
+//! one fp16 pair. PLANAR layout (the only one that beats v1 on all three axes):
+//!   Per weight tensor with m rows, gpr=K/256, n=m*gpr:
+//!     [ payload plane : n*128 bytes ][ header plane : n*4 bytes ]
+//!   total still n*132, so MQ4C_GROUP_BYTES=132 unchanged.
+//!   payload for (row,g) at A + (row*gpr+g)*128  (128 B, 16-B aligned)
+//!   header  for (row,g) at A + n*128 + (row*gpr+g)*4  (packed dword low fp16 scale, high fp16 zero)
 //!
-//! That gives a cross-check needing no host model of the kernel: pack one weight set
-//! both ways, run each through its own GEMV, and require agreement at the header
-//! rounding scale. The failure modes this catches are exactly the ones that are
-//! otherwise silent:
-//!   * wrong stride (136 vs 132) — every group after the first reads misaligned
-//!     bytes, and the result is noise rather than an error;
-//!   * wrong payload offset (+8 vs +4) — nibbles read from the header, or the header
-//!     read from nibbles;
-//!   * f32 header read where an fp16 pair lives — bit_casts a small fp16 pair to
-//!     ~1e-14 and zeroes the tensor at full speed. This is the qt=44 failure that
-//!     cost four measurement cycles this week.
+//! A repack keeps every nibble (0 flips in 95M groups), so the two containers must
+//! decode to the same numbers within fp16 rounding.  This gate packs one weight set
+//! both ways, runs each through its own GEMV, and requires agreement.  Failure modes
+//! it catches (otherwise silent, full-speed noise):
+//!   * wrong stride (136 vs 132) — misaligned groups after first
+//!   * wrong plane reading header from payload or vice versa — payload bytes as fp16 gives ~1e-14
+//!   * f32 header read where fp16 pair lives — the qt=44 bug that cost 4 cycles
+//!
+//! The fixture is intentionally DISCRIMINATING: per-group scale and zero vary widely
+//! so a header read from the wrong group or wrong plane produces large error and the
+//! gate FAILS.  An assertion checks that before checking the GPU result.
 //!
 //! Run: `cargo run --release -p rdna-compute --example mq4c_parity`
 
@@ -97,17 +99,22 @@ fn prng(i: usize, salt: u32) -> f32 {
 }
 
 /// Pack the same weights into both containers, sharing one set of nibbles exactly as
-/// the repack does.
+/// the repack does.  v1 is interleaved 136 B/group, mq4c is PLANAR 132 B/group.
 fn pack_both(w: &[f32], m: usize, k: usize) -> (Vec<u8>, Vec<u8>, Vec<f64>) {
     let gpr = k / GROUP;
-    let mut b1 = vec![0u8; m * gpr * V1_BYTES];
-    let mut bc = vec![0u8; m * gpr * MQ4C_BYTES];
+    let n = m * gpr;
+    let mut b1 = vec![0u8; n * V1_BYTES];
+    let mut bc = vec![0u8; n * MQ4C_BYTES];
     let mut deq_c = vec![0.0f64; m * k];
+    let payload_plane = n * 128;
+    assert_eq!(bc.len(), payload_plane + n * 4, "planar size");
     for r in 0..m {
         for g in 0..gpr {
+            let idx = r * gpr + g;
             let src = r * k + g * GROUP;
-            let d1 = (r * gpr + g) * V1_BYTES;
-            let dc = (r * gpr + g) * MQ4C_BYTES;
+            let d1 = idx * V1_BYTES;
+            let pay_off = idx * 128;
+            let hdr_off = payload_plane + idx * 4;
             let s = &w[src..src + GROUP];
             let lo = s.iter().cloned().fold(f32::INFINITY, f32::min);
             let hi = s.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
@@ -116,8 +123,8 @@ fn pack_both(w: &[f32], m: usize, k: usize) -> (Vec<u8>, Vec<u8>, Vec<f64>) {
             b1[d1 + 4..d1 + 8].copy_from_slice(&lo.to_le_bytes());
             let sb = f16_bits(step);
             let zb = f16_bits(lo);
-            bc[dc..dc + 2].copy_from_slice(&sb.to_le_bytes());
-            bc[dc + 2..dc + 4].copy_from_slice(&zb.to_le_bytes());
+            bc[hdr_off..hdr_off + 2].copy_from_slice(&sb.to_le_bytes());
+            bc[hdr_off + 2..hdr_off + 4].copy_from_slice(&zb.to_le_bytes());
             let inv = if step > 0.0 { 1.0 / step } else { 0.0 };
             let (sc, zc) = (f16_to_f32(sb), f16_to_f32(zb));
             let mut q = [0u8; GROUP];
@@ -128,11 +135,46 @@ fn pack_both(w: &[f32], m: usize, k: usize) -> (Vec<u8>, Vec<u8>, Vec<f64>) {
             for i in 0..128 {
                 let byte = (q[2 * i] & 0xF) | ((q[2 * i + 1] & 0xF) << 4);
                 b1[d1 + 8 + i] = byte;
-                bc[dc + 4 + i] = byte; // identical nibbles — this IS the repack
+                bc[pay_off + i] = byte; // identical nibbles — planar pays at +0, not +4
             }
         }
     }
+    // Total per tensor still m*gpr*132; assert so a half-converted tree cannot silently pass.
+    assert_eq!(b1.len(), n * V1_BYTES);
+    assert_eq!(bc.len(), n * MQ4C_BYTES);
+    assert_eq!(bc.len(), payload_plane + n * 4);
     (b1, bc, deq_c)
+}
+
+/// Host dequant reading the PLANAR mq4c blob — mirrors the kernel's
+/// `hplane + ((gp - A) >> 5)` trick without changing signatures.
+fn host_dequant_planar(blob: &[u8], m: usize, k: usize) -> Vec<f64> {
+    let gpr = k / GROUP;
+    let n = m * gpr;
+    let payload_plane = n * 128;
+    let mut out = vec![0.0f64; m * k];
+    for r in 0..m {
+        for g in 0..gpr {
+            let idx = r * gpr + g;
+            let hdr_off = payload_plane + idx * 4;
+            let hdr = u32::from_le_bytes([
+                blob[hdr_off],
+                blob[hdr_off + 1],
+                blob[hdr_off + 2],
+                blob[hdr_off + 3],
+            ]);
+            let sc = f16_to_f32((hdr & 0xFFFF) as u16);
+            let zp = f16_to_f32(((hdr >> 16) & 0xFFFF) as u16);
+            let pay_off = idx * 128;
+            let base = r * k + g * GROUP;
+            for i in 0..GROUP {
+                let byte = blob[pay_off + i / 2];
+                let q = if i % 2 == 0 { byte & 0xF } else { (byte >> 4) & 0xF };
+                out[base + i] = (zp + sc * q as f32) as f64;
+            }
+        }
+    }
+    out
 }
 
 fn main() {
@@ -146,26 +188,108 @@ fn main() {
     eprintln!("mq4c_parity: arch={}", gpu.arch);
 
     let (m, k) = (512usize, 1024usize);
+    let gpr = k / GROUP;
+    // Discriminating fixture: per-group range and offset vary widely so that
+    // a header read from the wrong group or wrong plane produces large error.
+    // Old Gaussian (sigma 0.011) gave all groups ~same lo/hi/step and could not
+    // catch an off-by-one header stride bug.
     let w: Vec<f32> = (0..m * k)
         .map(|i| {
-            let u1 = prng(i, 0x1234_5678).max(1e-7);
-            let u2 = prng(i, 0x9ABC_DEF0);
-            (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos() * 0.011
+            let r = i / k;
+            let c = i % k;
+            let g = c / GROUP;
+            let idx = r * gpr + g;
+            // Per-group distinct range: 0.015 .. 0.365, offset -2 .. 2
+            let group_range = 0.015 + prng(idx, 0xA002) * 0.35;
+            let group_lo = prng(idx, 0xA001) * 4.0 - 2.0 - group_range * 0.0;
+            // Uniform inside the group's interval
+            let u = prng(i, 0x1234_5678);
+            group_lo + u * group_range
         })
         .collect();
+
     let (b1, bc, deq_c) = pack_both(&w, m, k);
     assert_eq!(bc.len() * 136, b1.len() * 132, "container size ratio");
+    // Verify planar host dequant matches the pack-time dequant (proves host reads planar correctly)
+    let deq_blob = host_dequant_planar(&bc, m, k);
+    let max_blob_err = deq_c
+        .iter()
+        .zip(deq_blob.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f64, f64::max);
+    assert!(
+        max_blob_err < 1e-12,
+        "host planar dequant diverged from pack-time dequant: {max_blob_err:.3e}"
+    );
+
+    // --- Discriminating-fixture assertions (must hold BEFORE checking GPU) ---
+    let n = m * gpr;
+    let payload_plane = n * 128;
+    let mut scales = Vec::with_capacity(n);
+    let mut zeros = Vec::with_capacity(n);
+    for idx in 0..n {
+        let hdr_off = payload_plane + idx * 4;
+        let hdr = u32::from_le_bytes([
+            bc[hdr_off],
+            bc[hdr_off + 1],
+            bc[hdr_off + 2],
+            bc[hdr_off + 3],
+        ]);
+        scales.push(f16_to_f32((hdr & 0xFFFF) as u16));
+        zeros.push(f16_to_f32(((hdr >> 16) & 0xFFFF) as u16));
+    }
+    let sc_min = scales.iter().cloned().fold(f32::INFINITY, f32::min);
+    let sc_max = scales.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let zp_min = zeros.iter().cloned().fold(f32::INFINITY, f32::min);
+    let zp_max = zeros.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let sc_range = sc_max - sc_min;
+    let zp_range = zp_max - zp_min;
+    eprintln!(
+        "fixture header range: scale [{sc_min:.4e} .. {sc_max:.4e}] range {sc_range:.4e}, zero [{zp_min:.4e} .. {zp_max:.4e}] range {zp_range:.4e}"
+    );
+    assert!(
+        sc_range > 0.018,
+        "fixture NOT discriminating: scales too similar (range {sc_range:.3e}); a wrong-plane or off-by-one header read would not be caught. Need per-group varied weights."
+    );
+    assert!(
+        zp_range > 0.8,
+        "fixture NOT discriminating: zeros too similar (range {zp_range:.3e}); need per-group varied offset."
+    );
+    // Payload-as-header test: first 4 payload bytes reinterpreted as header must differ sharply
+    let fake_hdr = u32::from_le_bytes([bc[0], bc[1], bc[2], bc[3]]);
+    let fake_sc = f16_to_f32((fake_hdr & 0xFFFF) as u16);
+    let fake_zp = f16_to_f32(((fake_hdr >> 16) & 0xFFFF) as u16);
+    eprintln!(
+        "payload bytes as header would decode scale {fake_sc:.4e} zero {fake_zp:.4e} vs true scale {sc_min:.4e}..{sc_max:.4e}"
+    );
+    // The fake decode is typically garbage (nibbles 0..15 map to tiny fp16 values); require it differs
+    let payload_mimics_header = (fake_sc - scales[0]).abs() < 1e-4 && (fake_zp - zeros[0]).abs() < 0.02;
+    assert!(
+        !payload_mimics_header,
+        "fixture NOT discriminating: payload bytes mimic header values — wrong-plane read would not be caught"
+    );
+    // Adjacent-header distinctness: off-by-one stride must be detectable
+    if n > 1 {
+        let hdr1 = {
+            let off = payload_plane + 4;
+            u32::from_le_bytes([bc[off], bc[off + 1], bc[off + 2], bc[off + 3]])
+        };
+        let sc1 = f16_to_f32((hdr1 & 0xFFFF) as u16);
+        let sc0 = scales[0];
+        assert!(
+            (sc1 - sc0).abs() > 5e-5,
+            "fixture NOT discriminating: adjacent headers too similar to catch off-by-one"
+        );
+    }
+    eprintln!("fixture discriminating: OK — wrong-plane / wrong-stride would be caught");
 
     let x: Vec<f32> = (0..k).map(|i| prng(i, 0xC0FF_EE) * 2.0 - 1.0).collect();
-
-    // Host reference for the mq4c container, from its own exact dequant.
-    let gpr = k / GROUP;
-    let _ = gpr;
+    // Host reference for the mq4c container, from its own exact dequant (now verified planar).
     let mut want = vec![0.0f64; m];
     for r in 0..m {
         let mut acc = 0.0f64;
         for c in 0..k {
-            acc += deq_c[r * k + c] * x[c] as f64;
+            acc += deq_blob[r * k + c] * x[c] as f64;
         }
         want[r] = acc;
     }
@@ -223,5 +347,5 @@ fn main() {
         "v1 and mq4c disagree far beyond header rounding ({e_v1:.3e}); the two \
          containers are supposed to encode the same grid."
     );
-    eprintln!("mq4c_parity: PASS — 132 B stride, +4 payload, fp16 header all decode correctly");
+    eprintln!("mq4c_parity: PASS — planar 128+4, header in header plane, fp16 pair all decode correctly");
 }

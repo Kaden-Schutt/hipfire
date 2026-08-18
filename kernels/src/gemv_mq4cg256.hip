@@ -59,22 +59,24 @@ extern "C" __global__ void HIPFIRE_MQ4CG256_KERNEL(
 #else
     const int groups_per_row = K / 256;
 #endif
-    const char* row_ptr = A + (long long)row * groups_per_row * 132;
+    const char* row_ptr = A + (long long)row * groups_per_row * 128;
     const unsigned int row_weight_offset =
-        (unsigned int)((long long)row * groups_per_row * 132);
+        (unsigned int)((long long)row * groups_per_row * 128);
+    const char* hplane = A + (long long)M * groups_per_row * 128;
+    const unsigned int hplane_off = (unsigned int)((long long)M * groups_per_row * 128);
     const int boff = tid * 4;
 #if HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS
     const auto weight_rsrc = HIPFIRE_WEIGHT_RSRC(A);
     #if defined(HIPFIRE_GFX1151_LM_HEAD_HYBRID_BUFFER)
-        #define LOAD_WEIGHT_HEADER(ptr, offset) (*(const unsigned int*)(ptr))
+        #define LOAD_WEIGHT_HEADER(ptr, offset) (*(const unsigned int*)(hplane + (((ptr) - A) >> 5)))
     #else
         #define LOAD_WEIGHT_HEADER(ptr, offset) \
-            HIPFIRE_WEIGHT_LOAD_U32(weight_rsrc, (offset))
+            HIPFIRE_WEIGHT_LOAD_U32(weight_rsrc, hplane_off + ((offset) >> 5))
     #endif
     #define LOAD_WEIGHT_PACKED(ptr, offset) \
         HIPFIRE_WEIGHT_LOAD_U32(weight_rsrc, (offset))
 #else
-    #define LOAD_WEIGHT_HEADER(ptr, offset) (*(const unsigned int*)(ptr))
+    #define LOAD_WEIGHT_HEADER(ptr, offset) (*(const unsigned int*)(hplane + (((ptr) - A) >> 5)))
     #define LOAD_WEIGHT_PACKED(ptr, offset) (*(const unsigned int*)(ptr))
 #endif
 
@@ -84,29 +86,29 @@ extern "C" __global__ void HIPFIRE_MQ4CG256_KERNEL(
 
     for (int q = 0; q < quads; q++) {
         const int g = q << 2;
-        const char* gp0 = row_ptr + g * 132;
-        const char* gp1 = gp0 + 132;
-        const char* gp2 = gp1 + 132;
-        const char* gp3 = gp2 + 132;
+        const char* gp0 = row_ptr + g * 128;
+        const char* gp1 = gp0 + 128;
+        const char* gp2 = gp1 + 128;
+        const char* gp3 = gp2 + 128;
 
-        const unsigned int goff = row_weight_offset + (unsigned int)g * 132u;
+        const unsigned int goff = row_weight_offset + (unsigned int)g * 128u;
         const unsigned int hdr0__ = LOAD_WEIGHT_HEADER(gp0, goff);
         float sc0 = __half2float(__ushort_as_half((unsigned short)(hdr0__ & 0xFFFFu)));
         float zp0 = __half2float(__ushort_as_half((unsigned short)(hdr0__ >> 16)));
-        const unsigned int hdr1__ = LOAD_WEIGHT_HEADER(gp1, goff + 132u);
+        const unsigned int hdr1__ = LOAD_WEIGHT_HEADER(gp1, goff + 128u);
         float sc1 = __half2float(__ushort_as_half((unsigned short)(hdr1__ & 0xFFFFu)));
         float zp1 = __half2float(__ushort_as_half((unsigned short)(hdr1__ >> 16)));
-        const unsigned int hdr2__ = LOAD_WEIGHT_HEADER(gp2, goff + 264u);
+        const unsigned int hdr2__ = LOAD_WEIGHT_HEADER(gp2, goff + 256u);
         float sc2 = __half2float(__ushort_as_half((unsigned short)(hdr2__ & 0xFFFFu)));
         float zp2 = __half2float(__ushort_as_half((unsigned short)(hdr2__ >> 16)));
-        const unsigned int hdr3__ = LOAD_WEIGHT_HEADER(gp3, goff + 396u);
+        const unsigned int hdr3__ = LOAD_WEIGHT_HEADER(gp3, goff + 384u);
         float sc3 = __half2float(__ushort_as_half((unsigned short)(hdr3__ & 0xFFFFu)));
         float zp3 = __half2float(__ushort_as_half((unsigned short)(hdr3__ >> 16)));
 
-        unsigned int pk0 = LOAD_WEIGHT_PACKED(gp0 + 4 + boff, goff + 4u + boff);
-        unsigned int pk1 = LOAD_WEIGHT_PACKED(gp1 + 4 + boff, goff + 132u + 4u + boff);
-        unsigned int pk2 = LOAD_WEIGHT_PACKED(gp2 + 4 + boff, goff + 268u + boff);
-        unsigned int pk3 = LOAD_WEIGHT_PACKED(gp3 + 4 + boff, goff + 400u + boff);
+        unsigned int pk0 = LOAD_WEIGHT_PACKED(gp0 + boff, goff + boff);
+        unsigned int pk1 = LOAD_WEIGHT_PACKED(gp1 + boff, goff + 128u + boff);
+        unsigned int pk2 = LOAD_WEIGHT_PACKED(gp2 + boff, goff + 256u + boff);
+        unsigned int pk3 = LOAD_WEIGHT_PACKED(gp3 + boff, goff + 384u + boff);
 
         int base = g * 256 + tid * 8;
 
@@ -143,34 +145,34 @@ extern "C" __global__ void HIPFIRE_MQ4CG256_KERNEL(
 
     if (tail >= 1) {
         const int g = quads << 2;
-        const char* gp = row_ptr + g * 132;
-        const unsigned int goff = row_weight_offset + (unsigned int)g * 132u;
+        const char* gp = row_ptr + g * 128;
+        const unsigned int goff = row_weight_offset + (unsigned int)g * 128u;
         const unsigned int hdr__ = LOAD_WEIGHT_HEADER(gp, goff);
         float sc = __half2float(__ushort_as_half((unsigned short)(hdr__ & 0xFFFFu)));
         float zp = __half2float(__ushort_as_half((unsigned short)(hdr__ >> 16)));
-        unsigned int pk = LOAD_WEIGHT_PACKED(gp + 4 + boff, goff + 4u + boff);
+        unsigned int pk = LOAD_WEIGHT_PACKED(gp + boff, goff + boff);
         int base = g * 256 + tid * 8;
         TAIL_DOG(pk, sc, zp, base, acc0);
     }
     if (tail >= 2) {
         const int g = (quads << 2) + 1;
-        const char* gp = row_ptr + g * 132;
-        const unsigned int goff = row_weight_offset + (unsigned int)g * 132u;
+        const char* gp = row_ptr + g * 128;
+        const unsigned int goff = row_weight_offset + (unsigned int)g * 128u;
         const unsigned int hdr__ = LOAD_WEIGHT_HEADER(gp, goff);
         float sc = __half2float(__ushort_as_half((unsigned short)(hdr__ & 0xFFFFu)));
         float zp = __half2float(__ushort_as_half((unsigned short)(hdr__ >> 16)));
-        unsigned int pk = LOAD_WEIGHT_PACKED(gp + 4 + boff, goff + 4u + boff);
+        unsigned int pk = LOAD_WEIGHT_PACKED(gp + boff, goff + boff);
         int base = g * 256 + tid * 8;
         TAIL_DOG(pk, sc, zp, base, acc1);
     }
     if (tail >= 3) {
         const int g = (quads << 2) + 2;
-        const char* gp = row_ptr + g * 132;
-        const unsigned int goff = row_weight_offset + (unsigned int)g * 132u;
+        const char* gp = row_ptr + g * 128;
+        const unsigned int goff = row_weight_offset + (unsigned int)g * 128u;
         const unsigned int hdr__ = LOAD_WEIGHT_HEADER(gp, goff);
         float sc = __half2float(__ushort_as_half((unsigned short)(hdr__ & 0xFFFFu)));
         float zp = __half2float(__ushort_as_half((unsigned short)(hdr__ >> 16)));
-        unsigned int pk = LOAD_WEIGHT_PACKED(gp + 4 + boff, goff + 4u + boff);
+        unsigned int pk = LOAD_WEIGHT_PACKED(gp + boff, goff + boff);
         int base = g * 256 + tid * 8;
         TAIL_DOG(pk, sc, zp, base, acc2);
     }
@@ -235,9 +237,9 @@ extern "C" __global__ void HIPFIRE_MQ4CG256_XBATCH_KERNEL(
 #else
     const int groups_per_row = K / 256;
 #endif
-    const char* row_ptr = A + (long long)row * groups_per_row * 132;
+    const char* row_ptr = A + (long long)row * groups_per_row * 128;
+    const char* hplane = A + (long long)M * groups_per_row * 128;
     const int boff = tid * 4;
-
     float acc0[HIPFIRE_MQ4CG256_XBATCH_MAX];
     float acc1[HIPFIRE_MQ4CG256_XBATCH_MAX];
     float acc2[HIPFIRE_MQ4CG256_XBATCH_MAX];
@@ -252,32 +254,32 @@ extern "C" __global__ void HIPFIRE_MQ4CG256_XBATCH_KERNEL(
 
     for (int q = 0; q < quads; q++) {
         const int g = q << 2;
-        const char* gp0 = row_ptr + g * 132;
-        const char* gp1 = gp0 + 132;
-        const char* gp2 = gp1 + 132;
-        const char* gp3 = gp2 + 132;
+        const char* gp0 = row_ptr + g * 128;
+        const char* gp1 = gp0 + 128;
+        const char* gp2 = gp1 + 128;
+        const char* gp3 = gp2 + 128;
 
         // Plain pointer loads: the buffer-load / cache-policy paths the
         // scalar kernel selects between are tuned for one x vector per pass,
         // and this kernel's whole point is that the weight pass is amortised
         // over B. Kept simple and identical across arches on purpose.
-        const unsigned int hdr0__ = *(const unsigned int*)(gp0);
+        const unsigned int hdr0__ = *(const unsigned int*)(hplane + ((gp0 - A) >> 5));
         float sc0 = __half2float(__ushort_as_half((unsigned short)(hdr0__ & 0xFFFFu)));
         float zp0 = __half2float(__ushort_as_half((unsigned short)(hdr0__ >> 16)));
-        const unsigned int hdr1__ = *(const unsigned int*)(gp1);
+        const unsigned int hdr1__ = *(const unsigned int*)(hplane + ((gp1 - A) >> 5));
         float sc1 = __half2float(__ushort_as_half((unsigned short)(hdr1__ & 0xFFFFu)));
         float zp1 = __half2float(__ushort_as_half((unsigned short)(hdr1__ >> 16)));
-        const unsigned int hdr2__ = *(const unsigned int*)(gp2);
+        const unsigned int hdr2__ = *(const unsigned int*)(hplane + ((gp2 - A) >> 5));
         float sc2 = __half2float(__ushort_as_half((unsigned short)(hdr2__ & 0xFFFFu)));
         float zp2 = __half2float(__ushort_as_half((unsigned short)(hdr2__ >> 16)));
-        const unsigned int hdr3__ = *(const unsigned int*)(gp3);
+        const unsigned int hdr3__ = *(const unsigned int*)(hplane + ((gp3 - A) >> 5));
         float sc3 = __half2float(__ushort_as_half((unsigned short)(hdr3__ & 0xFFFFu)));
         float zp3 = __half2float(__ushort_as_half((unsigned short)(hdr3__ >> 16)));
 
-        unsigned int pk0 = *(const unsigned int*)(gp0 + 4 + boff);
-        unsigned int pk1 = *(const unsigned int*)(gp1 + 4 + boff);
-        unsigned int pk2 = *(const unsigned int*)(gp2 + 4 + boff);
-        unsigned int pk3 = *(const unsigned int*)(gp3 + 4 + boff);
+        unsigned int pk0 = *(const unsigned int*)(gp0 + boff);
+        unsigned int pk1 = *(const unsigned int*)(gp1 + boff);
+        unsigned int pk2 = *(const unsigned int*)(gp2 + boff);
+        unsigned int pk3 = *(const unsigned int*)(gp3 + boff);
 
         const int base = g * 256 + tid * 8;
 
@@ -317,12 +319,11 @@ extern "C" __global__ void HIPFIRE_MQ4CG256_XBATCH_KERNEL(
 
     for (int t = 0; t < tail; t++) {
         const int g = (quads << 2) + t;
-        const char* gp = row_ptr + g * 132;
-        const unsigned int hdr__ = *(const unsigned int*)(gp);
+        const char* gp = row_ptr + g * 128;
+        const unsigned int hdr__ = *(const unsigned int*)(hplane + ((gp - A) >> 5));
         float sc = __half2float(__ushort_as_half((unsigned short)(hdr__ & 0xFFFFu)));
         float zp = __half2float(__ushort_as_half((unsigned short)(hdr__ >> 16)));
-        unsigned int pk = *(const unsigned int*)(gp + 4 + boff);
-        const int base = g * 256 + tid * 8;
+        unsigned int pk = *(const unsigned int*)(gp + boff);
         #pragma unroll
         for (int b = 0; b < HIPFIRE_MQ4CG256_XBATCH_MAX; b++) {
             if (b >= B) break;

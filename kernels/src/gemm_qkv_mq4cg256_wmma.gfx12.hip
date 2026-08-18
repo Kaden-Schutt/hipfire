@@ -9,8 +9,9 @@
 // Qwen3.5 FullAttention preamble (Q + K + V projections).
 //
 // **gfx12 (RDNA4) variant** — sister of gemm_qkv_hfq4g256_wmma.gfx12.hip with
-// the mq4c 132 B group layout (single fp16 scale+zero dword, payload at +4).
+// the planar mq4c layout (payload plane 128 B/group, header plane 4 B/group).
 // Compile this file with hipcc --offload-arch=gfx1200 (or gfx1201, ...).
+
 //
 // SCAFFOLD STATUS (2026-04-26):
 //   This file is NOT yet wired into dispatch.rs. It compiles for gfx12
@@ -84,20 +85,22 @@ extern "C" __global__ void gemm_qkv_mq4cg256_wmma_gfx12(
     const int my_row = row_start + m_lane;
     const int safe_row = (my_row < total_m) ? my_row : (total_m - 1);
 
-    // Route to the correct weight matrix for this thread's row.
+    // Route to the correct weight matrix for this thread's row. Each tensor
+    // has its OWN header-plane base derived from its OWN row count.
     const char* A;
     int local_row;
+    int tensor_m;
     if (safe_row < q_m) {
-        A = A_q;  local_row = safe_row;
+        A = A_q;  local_row = safe_row;             tensor_m = q_m;
     } else if (safe_row < q_m + k_m) {
-        A = A_k;  local_row = safe_row - q_m;
+        A = A_k;  local_row = safe_row - q_m;       tensor_m = k_m;
     } else {
-        A = A_v;  local_row = safe_row - q_m - k_m;
+        A = A_v;  local_row = safe_row - q_m - k_m; tensor_m = v_m;
     }
 
-    const int groups_per_row = K / 256;
-    const long long row_stride = (long long)groups_per_row * 132;
-    const char* row_base = A + local_row * row_stride;
+    const int gpr = K / 256;
+    const char* row_base = A + (long long)local_row * gpr * 128;
+    const char* header_base = A + (long long)tensor_m * gpr * 128 + (long long)local_row * gpr * 4;
 
     // B operand indexes BATCH (N) dimension by m_lane (CK kBNLane=16).
     // In gfx11 each lane held the FULL 16-K of its batch row; in gfx12 each
@@ -106,11 +109,10 @@ extern "C" __global__ void gemm_qkv_mq4cg256_wmma_gfx12(
 
     float8_t acc = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
 
-    for (int g = 0; g < groups_per_row; g++) {
-        const char* gp = row_base + g * 132;
-        // mq4c: one dword header — lo fp16 scale, hi fp16 zero — over all 256.
-        // No half-select / cndmask (unlike qt=44 v2). Payload starts at +4.
-        const unsigned int hdr__ = *(const unsigned int*)(gp);
+    for (int g = 0; g < gpr; g++) {
+        const char* gp = row_base + g * 128;
+        // planar header: packed dword in header plane.
+        const unsigned int hdr__ = *(const unsigned int*)(header_base + g * 4);
         const _Float16 sc_h = (_Float16)__half2float(__ushort_as_half((unsigned short)(hdr__ & 0xFFFFu)));
         const _Float16 zp_h = (_Float16)__half2float(__ushort_as_half((unsigned short)(hdr__ >> 16)));
 
@@ -129,17 +131,17 @@ extern "C" __global__ void gemm_qkv_mq4cg256_wmma_gfx12(
             a_reg[5] = sc_h * (_Float16)(float)(((pk) >> 20) & 0xFu) + zp_h; \
             a_reg[6] = sc_h * (_Float16)(float)(((pk) >> 24) & 0xFu) + zp_h; \
             a_reg[7] = sc_h * (_Float16)(float)(((pk) >> 28) & 0xFu) + zp_h
-
         for (int kt = 0; kt < 16; kt += 4) {
             const int k_off_a = (kt + 0) * 16;
             const int k_off_b = (kt + 1) * 16;
             const int k_off_c = (kt + 2) * 16;
             const int k_off_d = (kt + 3) * 16;
 
-            unsigned int pka = *(const unsigned int*)(gp + 4 + k_off_a / 2 + k_grp * 4);
-            unsigned int pkb = *(const unsigned int*)(gp + 4 + k_off_b / 2 + k_grp * 4);
-            unsigned int pkc = *(const unsigned int*)(gp + 4 + k_off_c / 2 + k_grp * 4);
-            unsigned int pkd = *(const unsigned int*)(gp + 4 + k_off_d / 2 + k_grp * 4);
+            unsigned int pka = *(const unsigned int*)(gp + k_off_a / 2 + k_grp * 4);
+            unsigned int pkb = *(const unsigned int*)(gp + k_off_b / 2 + k_grp * 4);
+            unsigned int pkc = *(const unsigned int*)(gp + k_off_c / 2 + k_grp * 4);
+            unsigned int pkd = *(const unsigned int*)(gp + k_off_d / 2 + k_grp * 4);
+
 
             half8_t b_a = *(const half8_t*)(x_base + k_off_a + k_grp * 8);
             half8_t b_b = *(const half8_t*)(x_base + k_off_b + k_grp * 8);

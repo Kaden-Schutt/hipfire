@@ -5,6 +5,15 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 
+#ifndef HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS
+#define HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS 0
+#endif
+#ifndef HIPFIRE_WEIGHT_RSRC
+#define HIPFIRE_WEIGHT_RSRC(base) 0
+#define HIPFIRE_WEIGHT_LOAD_PTR_U32(rsrc, ptr, byte_offset) (*(const unsigned int*)(ptr))
+#endif
+
+
 #ifndef HIPFIRE_FUSED_GATE_UP_KERNEL
 #define HIPFIRE_FUSED_GATE_UP_KERNEL fused_gate_up_mq4cg256
 #endif
@@ -34,15 +43,6 @@ extern "C" __global__ void HIPFIRE_FUSED_GATE_UP_KERNEL(
     const int gid = blockIdx.x;
     const int tid = threadIdx.x;
 
-    const char* A;
-    float* y;
-    int local_row;
-    if (gid < gate_m) {
-        A = A_gate; y = y_gate; local_row = gid;
-    } else {
-        A = A_up; y = y_up; local_row = gid - gate_m;
-    }
-
 #if defined(HIPFIRE_FUSED_GATE_UP_K1024)
     const int groups_per_row = 4;
 #elif defined(HIPFIRE_GLIMMER_GATE_UP_K6656)
@@ -54,10 +54,29 @@ extern "C" __global__ void HIPFIRE_FUSED_GATE_UP_KERNEL(
 #else
     const int groups_per_row = K / 256;
 #endif
-    const char* row_ptr = A + (long long)local_row * groups_per_row * 132;
+    // Planar MQ4C: each weight tensor is its own blob [payload m*gpr*128][header m*gpr*4].
+    // Header for (row,g) lives at hplane + (row*gpr+g)*4, and (row*gpr+g)*4 == (gp - A_tensor)/32.
+    const char* A;
+    float* y;
+    int local_row;
+    const char* hplane;
+    unsigned int hplane_off;
+    unsigned int row_weight_offset;
+    if (gid < gate_m) {
+        A = A_gate; y = y_gate; local_row = gid;
+        hplane = A_gate + (long long)gate_m * groups_per_row * 128;
+        hplane_off = (unsigned int)((long long)gate_m * groups_per_row * 128);
+        row_weight_offset = (unsigned int)((long long)local_row * groups_per_row * 128);
+    } else {
+        A = A_up; y = y_up; local_row = gid - gate_m;
+        hplane = A_up + (long long)up_m * groups_per_row * 128;
+        hplane_off = (unsigned int)((long long)up_m * groups_per_row * 128);
+        row_weight_offset = (unsigned int)((long long)local_row * groups_per_row * 128);
+    }
+    const char* row_ptr = A + (long long)local_row * groups_per_row * 128;
     const int boff = tid * 4;
 #if HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS
-    const auto row_rsrc = HIPFIRE_WEIGHT_RSRC(row_ptr);
+    const auto weight_rsrc = HIPFIRE_WEIGHT_RSRC(A);
 #endif
 
     float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
@@ -66,28 +85,50 @@ extern "C" __global__ void HIPFIRE_FUSED_GATE_UP_KERNEL(
 
     for (int q = 0; q < quads; q++) {
         const int g = q << 2;
-        const char* gp0 = row_ptr + g * 132;
-        const char* gp1 = gp0 + 132;
-        const char* gp2 = gp1 + 132;
-        const char* gp3 = gp2 + 132;
+        const char* gp0 = row_ptr + g * 128;
+        const char* gp1 = gp0 + 128;
+        const char* gp2 = gp1 + 128;
+        const char* gp3 = gp2 + 128;
 
-        const unsigned int hdr0__ = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp0, (g + 0) * 132);
+#if HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS
+        const unsigned int hdr0__ = HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc, hplane + ((gp0 - A) >> 5), hplane_off + ((row_weight_offset + (g + 0) * 128) >> 5));
         float sc0 = __half2float(__ushort_as_half((unsigned short)(hdr0__ & 0xFFFFu)));
         float zp0 = __half2float(__ushort_as_half((unsigned short)(hdr0__ >> 16)));
-        const unsigned int hdr1__ = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp1, (g + 1) * 132);
+        const unsigned int hdr1__ = HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc, hplane + ((gp1 - A) >> 5), hplane_off + ((row_weight_offset + (g + 1) * 128) >> 5));
         float sc1 = __half2float(__ushort_as_half((unsigned short)(hdr1__ & 0xFFFFu)));
         float zp1 = __half2float(__ushort_as_half((unsigned short)(hdr1__ >> 16)));
-        const unsigned int hdr2__ = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp2, (g + 2) * 132);
+        const unsigned int hdr2__ = HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc, hplane + ((gp2 - A) >> 5), hplane_off + ((row_weight_offset + (g + 2) * 128) >> 5));
         float sc2 = __half2float(__ushort_as_half((unsigned short)(hdr2__ & 0xFFFFu)));
         float zp2 = __half2float(__ushort_as_half((unsigned short)(hdr2__ >> 16)));
-        const unsigned int hdr3__ = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp3, (g + 3) * 132);
+        const unsigned int hdr3__ = HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc, hplane + ((gp3 - A) >> 5), hplane_off + ((row_weight_offset + (g + 3) * 128) >> 5));
         float sc3 = __half2float(__ushort_as_half((unsigned short)(hdr3__ & 0xFFFFu)));
         float zp3 = __half2float(__ushort_as_half((unsigned short)(hdr3__ >> 16)));
+#else
+        const unsigned int hdr0__ = *(const unsigned int*)(hplane + ((gp0 - A) >> 5));
+        float sc0 = __half2float(__ushort_as_half((unsigned short)(hdr0__ & 0xFFFFu)));
+        float zp0 = __half2float(__ushort_as_half((unsigned short)(hdr0__ >> 16)));
+        const unsigned int hdr1__ = *(const unsigned int*)(hplane + ((gp1 - A) >> 5));
+        float sc1 = __half2float(__ushort_as_half((unsigned short)(hdr1__ & 0xFFFFu)));
+        float zp1 = __half2float(__ushort_as_half((unsigned short)(hdr1__ >> 16)));
+        const unsigned int hdr2__ = *(const unsigned int*)(hplane + ((gp2 - A) >> 5));
+        float sc2 = __half2float(__ushort_as_half((unsigned short)(hdr2__ & 0xFFFFu)));
+        float zp2 = __half2float(__ushort_as_half((unsigned short)(hdr2__ >> 16)));
+        const unsigned int hdr3__ = *(const unsigned int*)(hplane + ((gp3 - A) >> 5));
+        float sc3 = __half2float(__ushort_as_half((unsigned short)(hdr3__ & 0xFFFFu)));
+        float zp3 = __half2float(__ushort_as_half((unsigned short)(hdr3__ >> 16)));
+#endif
 
-        unsigned int pk0 = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp0 + 4 + boff, (g + 0) * 132 + 4 + boff);
-        unsigned int pk1 = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp1 + 4 + boff, (g + 1) * 132 + 4 + boff);
-        unsigned int pk2 = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp2 + 4 + boff, (g + 2) * 132 + 4 + boff);
-        unsigned int pk3 = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp3 + 4 + boff, (g + 3) * 132 + 4 + boff);
+#if HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS
+        unsigned int pk0 = HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc, gp0 + boff, row_weight_offset + (g + 0) * 128 + boff);
+        unsigned int pk1 = HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc, gp1 + boff, row_weight_offset + (g + 1) * 128 + boff);
+        unsigned int pk2 = HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc, gp2 + boff, row_weight_offset + (g + 2) * 128 + boff);
+        unsigned int pk3 = HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc, gp3 + boff, row_weight_offset + (g + 3) * 128 + boff);
+#else
+        unsigned int pk0 = *(const unsigned int*)(gp0 + boff);
+        unsigned int pk1 = *(const unsigned int*)(gp1 + boff);
+        unsigned int pk2 = *(const unsigned int*)(gp2 + boff);
+        unsigned int pk3 = *(const unsigned int*)(gp3 + boff);
+#endif
 
         int base = g * 256 + tid * 8;
 
@@ -122,31 +163,55 @@ extern "C" __global__ void HIPFIRE_FUSED_GATE_UP_KERNEL(
 
     if (tail >= 1) {
         const int g = quads << 2;
-        const char* gp = row_ptr + g * 132;
-        const unsigned int hdr__ = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp, g * 132);
+        const char* gp = row_ptr + g * 128;
+#if HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS
+        const unsigned int hdr__ = HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc, hplane + ((gp - A) >> 5), hplane_off + ((row_weight_offset + g * 128) >> 5));
+#else
+        const unsigned int hdr__ = *(const unsigned int*)(hplane + ((gp - A) >> 5));
+#endif
         float sc = __half2float(__ushort_as_half((unsigned short)(hdr__ & 0xFFFFu)));
         float zp = __half2float(__ushort_as_half((unsigned short)(hdr__ >> 16)));
-        unsigned int pk = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp + 4 + boff, g * 132 + 4 + boff);
+#if HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS
+        unsigned int pk = HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc, gp + boff, row_weight_offset + g * 128 + boff);
+#else
+        unsigned int pk = *(const unsigned int*)(gp + boff);
+#endif
         int base = g * 256 + tid * 8;
         TAIL_DOG(pk, sc, zp, base, acc0);
     }
     if (tail >= 2) {
         const int g = (quads << 2) + 1;
-        const char* gp = row_ptr + g * 132;
-        const unsigned int hdr__ = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp, g * 132);
+        const char* gp = row_ptr + g * 128;
+#if HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS
+        const unsigned int hdr__ = HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc, hplane + ((gp - A) >> 5), hplane_off + ((row_weight_offset + g * 128) >> 5));
+#else
+        const unsigned int hdr__ = *(const unsigned int*)(hplane + ((gp - A) >> 5));
+#endif
         float sc = __half2float(__ushort_as_half((unsigned short)(hdr__ & 0xFFFFu)));
         float zp = __half2float(__ushort_as_half((unsigned short)(hdr__ >> 16)));
-        unsigned int pk = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp + 4 + boff, g * 132 + 4 + boff);
+#if HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS
+        unsigned int pk = HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc, gp + boff, row_weight_offset + g * 128 + boff);
+#else
+        unsigned int pk = *(const unsigned int*)(gp + boff);
+#endif
         int base = g * 256 + tid * 8;
         TAIL_DOG(pk, sc, zp, base, acc1);
     }
     if (tail >= 3) {
         const int g = (quads << 2) + 2;
-        const char* gp = row_ptr + g * 132;
-        const unsigned int hdr__ = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp, g * 132);
+        const char* gp = row_ptr + g * 128;
+#if HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS
+        const unsigned int hdr__ = HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc, hplane + ((gp - A) >> 5), hplane_off + ((row_weight_offset + g * 128) >> 5));
+#else
+        const unsigned int hdr__ = *(const unsigned int*)(hplane + ((gp - A) >> 5));
+#endif
         float sc = __half2float(__ushort_as_half((unsigned short)(hdr__ & 0xFFFFu)));
         float zp = __half2float(__ushort_as_half((unsigned short)(hdr__ >> 16)));
-        unsigned int pk = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp + 4 + boff, g * 132 + 4 + boff);
+#if HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS
+        unsigned int pk = HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc, gp + boff, row_weight_offset + g * 128 + boff);
+#else
+        unsigned int pk = *(const unsigned int*)(gp + boff);
+#endif
         int base = g * 256 + tid * 8;
         TAIL_DOG(pk, sc, zp, base, acc2);
     }

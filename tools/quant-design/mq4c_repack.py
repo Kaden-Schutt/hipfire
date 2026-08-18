@@ -4,10 +4,15 @@
 This is a PURE HEADER REWRITE. It needs no parent model, no imatrix, no
 re-quantization, and it changes not one nibble:
 
-    read  136 B: [f32 scale][f32 zero][128 B nibbles]
-    write 132 B: [fp16 scale][fp16 zero][128 B nibbles verbatim]
+    read  136 B interleaved: [f32 scale][f32 zero][128 B nibbles]  (per group)
+    write 132 B planar: [payload plane : n*128][header plane : n*4]
+      where for weight tensor with m rows, gpr=K/256, n=m*gpr groups,
+      linear idx i = row*gpr+g:
+        payload at A + i*128          : 128 B nibbles verbatim
+        header  at A + n*128 + i*4    : packed dword low fp16 scale, high fp16 zero
+    total per tensor is still n*132 = m*gpr*132, so every on-disk size and
+    MQ4C_GROUP_BYTES=132 check is UNCHANGED -- this is a pure relocation of bytes.
 
-Proven safe rather than assumed. `mq4c_repack_probe.py` measured 236,503,040 real
 weights from q38.ctl.mq4 and found the v1 reconstruction sits at most **0.011076
 quantization steps** from an integer on the v1.5 grid — a nibble flips at 0.5, so
 `round()` returns the same code for every weight and a "re-fit" is provably a no-op.
@@ -140,14 +145,21 @@ def repack(src, dst, limit=None):
                           f"artifact.")
                     return 2
 
-            out = np.empty((n, V15_BYTES), dtype=np.uint8)
-            out[:, 0:2] = s16.view(np.uint16).astype(np.uint16).reshape(n, 1).view(np.uint8)[:, 0:2] \
-                if False else np.frombuffer(s16.tobytes(), dtype=np.uint8).reshape(n, 2)
-            out[:, 2:4] = np.frombuffer(z16.tobytes(), dtype=np.uint8).reshape(n, 2)
-            out[:, 4:V15_BYTES] = nib
-            fo.write(out.tobytes())
+            # Planar layout: [payload plane : n*128][header plane : n*4]
+            # payload for linear group i=row*gpr+g at A + i*128 (128 B, 16-B aligned)
+            # header  for same i               at A + n*128 + i*4 (packed dword)
+            # total per tensor still n*132, so size checks unchanged.
+            assert n * V15_BYTES == n * 128 + n * 4, "planar size invariant"
+            hdr = np.empty((n, 4), dtype=np.uint8)
+            hdr[:, 0:2] = np.frombuffer(s16.tobytes(), dtype=np.uint8).reshape(n, 2)
+            hdr[:, 2:4] = np.frombuffer(z16.tobytes(), dtype=np.uint8).reshape(n, 2)
+            payload = nib  # (n, 128) verbatim
+            assert payload.nbytes == n * 128
+            assert hdr.nbytes == n * 4
+            assert payload.nbytes + hdr.nbytes == n * V15_BYTES
+            fo.write(payload.tobytes())
+            fo.write(hdr.tobytes())
             groups_done += n
-
         # patch the index: qt 13 -> 45 and the shrunken data sizes
         for e in entries:
             header[e["qt_pos"]] = QT_V15 if e["qt"] == QT_V1 else e["qt"]
