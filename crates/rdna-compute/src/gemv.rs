@@ -7544,6 +7544,554 @@ impl Gpu {
         self.gemv_hfq4g256_residual_mq4v2(a_raw, x, y, m, k)
     }
 
+    /// MQ4C / v1.5 (qt=45) residual GEMV. Mirrors `gemv_hfq4g256_residual`
+    /// arch gating and grid/block geometry; uses `GEMV_MQ4CG256_RESIDUAL_SRC`
+    /// and symbol `gemv_mq4cg256_residual`. Specialized v1 residual variants
+    /// (wave64 / CDNA3 / multirow residual) that have no mq4c source return a
+    /// clear HipError — never fall back to a v1 symbol.
+    pub fn gemv_mq4cg256_residual(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        use std::sync::OnceLock;
+        static GFX1151_RESIDUAL_WAVE64: OnceLock<bool> = OnceLock::new();
+        let gfx1151_wave64 = self.arch_caps.is_gfx1151()
+            && *GFX1151_RESIDUAL_WAVE64.get_or_init(|| {
+                hipfire_config::developer_var("HIPFIRE_GFX1151_RESIDUAL_WAVE64").as_deref()
+                    == Ok("1")
+            });
+        static GFX1151_RESIDUAL_TIGHT_GRID: OnceLock<bool> = OnceLock::new();
+        let gfx1151_tight_grid = self.arch_caps.is_gfx1151()
+            && *GFX1151_RESIDUAL_TIGHT_GRID.get_or_init(|| {
+                hipfire_config::developer_var("HIPFIRE_GFX1151_RESIDUAL_TIGHT_GRID").as_deref()
+                    == Ok("1")
+            });
+        static GFX1151_RESIDUAL_MULTIROW_R2: OnceLock<bool> = OnceLock::new();
+        let gfx1151_multirow_r2 = self.arch_caps.is_gfx1151()
+            && m == 2_048
+            && k == 2_048
+            && *GFX1151_RESIDUAL_MULTIROW_R2.get_or_init(|| {
+                hipfire_config::developer_var("HIPFIRE_GFX1151_RESIDUAL_MULTIROW_R2").as_deref()
+                    == Ok("1")
+            });
+        let cdna3 = self.arch_caps.is_wave64_native() || gfx1151_wave64;
+
+        let rdna3 = self.arch_caps.is_rdna3_dgpu();
+        let rows = if gfx1151_multirow_r2 {
+            2
+        } else if rdna3 {
+            self.flags.gemv_rows.unwrap_or(1)
+        } else {
+            1
+        };
+        let use_multirow = (rdna3 && rows > 1) || gfx1151_multirow_r2;
+
+        if cdna3 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "gemv_mq4cg256_residual: missing mq4c residual wave64/CDNA3 kernel source \
+                 (gemv_mq4cg256_residual_wave64 / gfx942 variants not ported)",
+            ));
+        }
+        if use_multirow {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "gemv_mq4cg256_residual: missing mq4c residual multirow kernel source \
+                 (gemv_mq4cg256_residual_multirow not ported)",
+            ));
+        }
+
+        // Base dual-row residual: same generic path as v1 else-branch.
+        // Specialized gfx1151/rdna3 residual probes collapse onto the single
+        // mq4c residual source (only one C symbol is exported).
+        let (_, v1_module) = kernels::gemv_hfq4g256_residual_for_arch(&self.arch_caps);
+        let module = format!("{}_mq4c", v1_module.replace("hfq4g256", "mq4cg256"));
+        // Prefer stable mq4c module names when the v1 helper returns the baseline.
+        let module = if v1_module == "gemv_hfq4g256_residual" {
+            "gemv_mq4cg256_residual".to_string()
+        } else if v1_module == "gemv_hfq4g256_residual_rdna3" {
+            "gemv_mq4cg256_residual_rdna3".to_string()
+        } else {
+            module
+        };
+        let func_name = "gemv_mq4cg256_residual";
+        self.ensure_kernel(&module, kernels::GEMV_MQ4CG256_RESIDUAL_SRC, func_name)?;
+
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+
+        let bytes = crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_mq4cg256_residual", bytes);
+        // Generic residual owns row0/row1 in one wave32 block. Legacy M-sized
+        // launch leaves the upper half to exit at the row0 guard; tight_grid
+        // contracts to ceil(M/2) on gfx1151 when env-enabled (same as v1).
+        let grid = if gfx1151_tight_grid {
+            (m as u32).div_ceil(2)
+        } else {
+            m as u32
+        };
+        let result = self.launch_maybe_blob(func_name, [grid, 1, 1], [32, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(a_ptr);
+            b.push_ptr(x_ptr);
+            b.push_ptr(y_ptr);
+            b.push_i32(m_val);
+            b.push_i32(k_val);
+            b
+        });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// MQ4C / v1.5 (qt=45) plain GEMV. Faithful port of `gemv_hfq4g256` for the
+    /// single fp16 scale/zero 132 B group format. Same arch gating, rows/R
+    /// selection, multirow vs wide branching, grid/block geometry and kernarg
+    /// order; only SRC, module and kernel symbol change. Wide path returns
+    /// HipError (no mq4c wide source) rather than falling back to v1.
+    pub fn gemv_mq4cg256(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        use std::sync::OnceLock;
+        static GFX1151_LM_HEAD_DOT2: OnceLock<bool> = OnceLock::new();
+        let gfx1151_lm_head_dot2 = self.arch_caps.is_gfx1151()
+            && m == 248_320
+            && k == 2_048
+            && *GFX1151_LM_HEAD_DOT2.get_or_init(|| {
+                hipfire_config::developer_var("HIPFIRE_GFX1151_LM_HEAD_DOT2").as_deref() == Ok("1")
+            });
+        let gfx1151_lm_head_r1_hybrid_buffer =
+            self.arch_caps.is_gfx1151() && m == 248_320 && k == 2_048;
+        let use_lm_head_k2048 = self.arch_caps.is_gfx1100()
+            && self.flags.rdna3_hfq4_lm_head_k2048
+            && m == 248_320
+            && k == 2_048;
+        // Specialized lm_head/k2048 paths still route to the generic mq4c
+        // source; arch gating is preserved so occupancy/VGPR comparisons stay
+        // apples-to-apples. Module = v1 module with hfq4g256→mq4cg256; C
+        // symbol is always `gemv_mq4cg256`.
+        let func_name = if gfx1151_lm_head_dot2 {
+            self.ensure_kernel(
+                "gemv_mq4cg256_lm_head_dot2_gfx1151",
+                kernels::GEMV_MQ4CG256_SRC,
+                "gemv_mq4cg256",
+            )?;
+            "gemv_mq4cg256"
+        } else if gfx1151_lm_head_r1_hybrid_buffer {
+            self.ensure_kernel(
+                "gemv_mq4cg256_lm_head_r1_hybrid_buffer_gfx1151",
+                kernels::GEMV_MQ4CG256_SRC,
+                "gemv_mq4cg256",
+            )?;
+            "gemv_mq4cg256"
+        } else if use_lm_head_k2048 {
+            self.ensure_kernel(
+                "gemv_mq4cg256_k2048_gfx1100",
+                kernels::GEMV_MQ4CG256_SRC,
+                "gemv_mq4cg256",
+            )?;
+            "gemv_mq4cg256"
+        } else {
+            let (_, v1_module) =
+                kernels::gemv_hfq4g256_for_arch(&self.arch_caps, self.flags.rdna2_variant);
+            let module = match v1_module {
+                "gemv_hfq4g256" => "gemv_mq4cg256",
+                "gemv_hfq4g256_rdna3" => "gemv_mq4cg256_rdna3",
+                "gemv_hfq4g256_rdna2v1" => "gemv_mq4cg256_rdna2v1",
+                "gemv_hfq4g256_rdna2v2" => "gemv_mq4cg256_rdna2v2",
+                "gemv_hfq4g256_rdna2v3" => "gemv_mq4cg256_rdna2v3",
+                "gemv_hfq4g256_rdna2v4" => "gemv_mq4cg256_rdna2v4",
+                "gemv_hfq4g256_rdna2v5" => "gemv_mq4cg256_rdna2v5",
+                other => {
+                    // Unknown v1 module — still launch baseline mq4c under a
+                    // distinct cache key rather than falling back to v1 SRC.
+                    let _ = other;
+                    "gemv_mq4cg256"
+                }
+            };
+            // RDNA2 arch-specific HFQ4 sources are not ported for mq4c; use the
+            // baseline mq4c source under an arch-tagged module name.
+            self.ensure_kernel(module, kernels::GEMV_MQ4CG256_SRC, "gemv_mq4cg256")?;
+            "gemv_mq4cg256"
+        };
+
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        let blob_builder = || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(a_ptr);
+            b.push_ptr(x_ptr);
+            b.push_ptr(y_ptr);
+            b.push_i32(m_val);
+            b.push_i32(k_val);
+            b
+        };
+
+        let rdna3 = self.arch_caps.is_rdna3_dgpu();
+        let rows = self.arch_caps.gemv_rows_default();
+        let use_multirow = rows > 1 && !gfx1151_lm_head_dot2 && !gfx1151_lm_head_r1_hybrid_buffer;
+        static GFX1151_LM_HEAD_BUFFER: OnceLock<bool> = OnceLock::new();
+        let gfx1151_lm_head_buffer = self.arch_caps.is_gfx1151()
+            && rows == 2
+            && m == 248_320
+            && k == 2_048
+            && *GFX1151_LM_HEAD_BUFFER.get_or_init(|| {
+                hipfire_config::developer_var("HIPFIRE_GFX1151_LM_HEAD_BUFFER").as_deref()
+                    == Ok("1")
+            });
+        static GFX1151_LM_HEAD_HYBRID_BUFFER: OnceLock<bool> = OnceLock::new();
+        let gfx1151_lm_head_hybrid_buffer = self.arch_caps.is_gfx1151()
+            && rows == 2
+            && m == 248_320
+            && k == 2_048
+            && *GFX1151_LM_HEAD_HYBRID_BUFFER.get_or_init(|| {
+                hipfire_config::developer_var("HIPFIRE_GFX1151_LM_HEAD_HYBRID_BUFFER").as_deref()
+                    == Ok("1")
+            });
+        static GFX1151_LM_HEAD_ALL_BUFFER: OnceLock<bool> = OnceLock::new();
+        let gfx1151_lm_head_all_buffer = self.arch_caps.is_gfx1151()
+            && rows == 2
+            && m == 248_320
+            && k == 2_048
+            && *GFX1151_LM_HEAD_ALL_BUFFER.get_or_init(|| {
+                hipfire_config::developer_var("HIPFIRE_GFX1151_LM_HEAD_ALL_BUFFER").as_deref()
+                    == Ok("1")
+            });
+        static GFX1151_LM_HEAD_CPOL: OnceLock<Option<String>> = OnceLock::new();
+        let gfx1151_lm_head_cpol =
+            if self.arch_caps.is_gfx1151() && rows == 2 && m == 248_320 && k == 2_048 {
+                GFX1151_LM_HEAD_CPOL
+                    .get_or_init(|| {
+                        hipfire_config::developer_var("HIPFIRE_GFX1151_LM_HEAD_CPOL").ok()
+                    })
+                    .as_deref()
+            } else {
+                None
+            };
+        static GFX1151_LM_HEAD_K2048: OnceLock<bool> = OnceLock::new();
+        let gfx1151_lm_head_k2048 = self.arch_caps.is_gfx1151()
+            && rows == 2
+            && m == 248_320
+            && k == 2_048
+            && *GFX1151_LM_HEAD_K2048.get_or_init(|| {
+                hipfire_config::developer_var("HIPFIRE_GFX1151_LM_HEAD_K2048").as_deref() == Ok("1")
+            });
+
+        let use_wide = !gfx1151_lm_head_dot2
+            && !gfx1151_lm_head_r1_hybrid_buffer
+            && !use_multirow
+            && m >= 64
+            && !(self.arch_caps.is_rdna2() || self.arch_caps.is_rdna3_dgpu());
+
+        let bytes = crate::profile::gemv_hfq4g256_bytes(m, k);
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_mq4cg256", bytes);
+        let result = if use_multirow {
+            let (func_name, grid_div) = match rows {
+                2 => ("gemv_mq4cg256_multirow_r2", 2u32),
+                4 => ("gemv_mq4cg256_multirow_r4", 4u32),
+                8 => ("gemv_mq4cg256_multirow_r8", 8u32),
+                _ => unreachable!(),
+            };
+            let (mr_name, mr_src) = if gfx1151_lm_head_cpol == Some("glc") {
+                (
+                    "gemv_mq4cg256_multirow_gfx1151_hybrid_glc",
+                    kernels::GEMV_MQ4CG256_MULTIROW_SRC,
+                )
+            } else if gfx1151_lm_head_cpol == Some("slc") {
+                (
+                    "gemv_mq4cg256_multirow_gfx1151_hybrid_slc",
+                    kernels::GEMV_MQ4CG256_MULTIROW_SRC,
+                )
+            } else if gfx1151_lm_head_cpol == Some("dlc") {
+                (
+                    "gemv_mq4cg256_multirow_gfx1151_hybrid_dlc",
+                    kernels::GEMV_MQ4CG256_MULTIROW_SRC,
+                )
+            } else if gfx1151_lm_head_k2048 {
+                (
+                    "gemv_mq4cg256_multirow_gfx1151_k2048",
+                    kernels::GEMV_MQ4CG256_MULTIROW_SRC,
+                )
+            } else if gfx1151_lm_head_all_buffer {
+                (
+                    "gemv_mq4cg256_multirow_gfx1151_all_buffer",
+                    kernels::GEMV_MQ4CG256_MULTIROW_SRC,
+                )
+            } else if gfx1151_lm_head_hybrid_buffer {
+                (
+                    "gemv_mq4cg256_multirow_gfx1151_hybrid_buffer",
+                    kernels::GEMV_MQ4CG256_MULTIROW_SRC,
+                )
+            } else if gfx1151_lm_head_buffer {
+                (
+                    "gemv_mq4cg256_multirow_gfx1151_buffer",
+                    kernels::GEMV_MQ4CG256_MULTIROW_SRC,
+                )
+            } else if rdna3 {
+                (
+                    "gemv_mq4cg256_multirow_rdna3",
+                    kernels::GEMV_MQ4CG256_MULTIROW_SRC,
+                )
+            } else {
+                (
+                    "gemv_mq4cg256_multirow_default",
+                    kernels::GEMV_MQ4CG256_MULTIROW_SRC,
+                )
+            };
+            self.ensure_kernel(mr_name, mr_src, func_name)?;
+            let grid = ((m as u32) + grid_div - 1) / grid_div;
+            self.launch_maybe_blob(
+                func_name,
+                [grid, 1, 1],
+                [32, 1, 1],
+                0,
+                &mut params,
+                blob_builder,
+            )
+        } else if use_wide {
+            Err(hip_bridge::HipError::new(
+                0,
+                "gemv_mq4cg256: missing mq4c wide kernel source (gemv_mq4cg256_wide not ported)",
+            ))
+        } else {
+            self.launch_maybe_blob(
+                func_name,
+                [m as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                &mut params,
+                blob_builder,
+            )
+        };
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// MQ4C multirow launcher. Mirrors the multirow branch of `gemv_hfq4g256`
+    /// exactly: same rows/R selection, same arch gating for gfx1151/rdna3,
+    /// same grid (`ceil(M/R)`) and block (`32`) geometry, same kernarg order.
+    /// Only SRC (`GEMV_MQ4CG256_MULTIROW_SRC`), module and kernel symbol
+    /// (`gemv_mq4cg256_multirow_r*`) change. When rows==1, falls through to
+    /// the single-row mq4c kernel (same as v1's use_multirow else branch).
+    pub fn gemv_mq4cg256_multirow(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        use std::sync::OnceLock;
+        let rdna3 = self.arch_caps.is_rdna3_dgpu();
+        let rows = self.arch_caps.gemv_rows_default();
+        let gfx1151_lm_head_buffer = {
+            static GFX1151_LM_HEAD_BUFFER: OnceLock<bool> = OnceLock::new();
+            self.arch_caps.is_gfx1151()
+                && rows == 2
+                && m == 248_320
+                && k == 2_048
+                && *GFX1151_LM_HEAD_BUFFER.get_or_init(|| {
+                    hipfire_config::developer_var("HIPFIRE_GFX1151_LM_HEAD_BUFFER").as_deref()
+                        == Ok("1")
+                })
+        };
+        let gfx1151_lm_head_hybrid_buffer = {
+            static GFX1151_LM_HEAD_HYBRID_BUFFER: OnceLock<bool> = OnceLock::new();
+            self.arch_caps.is_gfx1151()
+                && rows == 2
+                && m == 248_320
+                && k == 2_048
+                && *GFX1151_LM_HEAD_HYBRID_BUFFER.get_or_init(|| {
+                    hipfire_config::developer_var("HIPFIRE_GFX1151_LM_HEAD_HYBRID_BUFFER").as_deref()
+                        == Ok("1")
+                })
+        };
+        let gfx1151_lm_head_all_buffer = {
+            static GFX1151_LM_HEAD_ALL_BUFFER: OnceLock<bool> = OnceLock::new();
+            self.arch_caps.is_gfx1151()
+                && rows == 2
+                && m == 248_320
+                && k == 2_048
+                && *GFX1151_LM_HEAD_ALL_BUFFER.get_or_init(|| {
+                    hipfire_config::developer_var("HIPFIRE_GFX1151_LM_HEAD_ALL_BUFFER").as_deref()
+                        == Ok("1")
+                })
+        };
+        let gfx1151_lm_head_cpol = {
+            static GFX1151_LM_HEAD_CPOL: OnceLock<Option<String>> = OnceLock::new();
+            if self.arch_caps.is_gfx1151() && rows == 2 && m == 248_320 && k == 2_048 {
+                GFX1151_LM_HEAD_CPOL
+                    .get_or_init(|| {
+                        hipfire_config::developer_var("HIPFIRE_GFX1151_LM_HEAD_CPOL").ok()
+                    })
+                    .as_deref()
+            } else {
+                None
+            }
+        };
+        let gfx1151_lm_head_k2048 = {
+            static GFX1151_LM_HEAD_K2048: OnceLock<bool> = OnceLock::new();
+            self.arch_caps.is_gfx1151()
+                && rows == 2
+                && m == 248_320
+                && k == 2_048
+                && *GFX1151_LM_HEAD_K2048.get_or_init(|| {
+                    hipfire_config::developer_var("HIPFIRE_GFX1151_LM_HEAD_K2048").as_deref() == Ok("1")
+                })
+        };
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        let blob_builder = || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(a_ptr);
+            b.push_ptr(x_ptr);
+            b.push_ptr(y_ptr);
+            b.push_i32(m_val);
+            b.push_i32(k_val);
+            b
+        };
+        let bytes = crate::profile::gemv_hfq4g256_bytes(m, k);
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_mq4cg256_multirow", bytes);
+        let use_multirow = rows > 1;
+        let result = if use_multirow {
+            let (func_name, grid_div) = match rows {
+                2 => ("gemv_mq4cg256_multirow_r2", 2u32),
+                4 => ("gemv_mq4cg256_multirow_r4", 4u32),
+                8 => ("gemv_mq4cg256_multirow_r8", 8u32),
+                _ => unreachable!(),
+            };
+            let (mr_name, mr_src) = if gfx1151_lm_head_cpol == Some("glc") {
+                (
+                    "gemv_mq4cg256_multirow_gfx1151_hybrid_glc",
+                    kernels::GEMV_MQ4CG256_MULTIROW_SRC,
+                )
+            } else if gfx1151_lm_head_cpol == Some("slc") {
+                (
+                    "gemv_mq4cg256_multirow_gfx1151_hybrid_slc",
+                    kernels::GEMV_MQ4CG256_MULTIROW_SRC,
+                )
+            } else if gfx1151_lm_head_cpol == Some("dlc") {
+                (
+                    "gemv_mq4cg256_multirow_gfx1151_hybrid_dlc",
+                    kernels::GEMV_MQ4CG256_MULTIROW_SRC,
+                )
+            } else if gfx1151_lm_head_k2048 {
+                (
+                    "gemv_mq4cg256_multirow_gfx1151_k2048",
+                    kernels::GEMV_MQ4CG256_MULTIROW_SRC,
+                )
+            } else if gfx1151_lm_head_all_buffer {
+                (
+                    "gemv_mq4cg256_multirow_gfx1151_all_buffer",
+                    kernels::GEMV_MQ4CG256_MULTIROW_SRC,
+                )
+            } else if gfx1151_lm_head_hybrid_buffer {
+                (
+                    "gemv_mq4cg256_multirow_gfx1151_hybrid_buffer",
+                    kernels::GEMV_MQ4CG256_MULTIROW_SRC,
+                )
+            } else if gfx1151_lm_head_buffer {
+                (
+                    "gemv_mq4cg256_multirow_gfx1151_buffer",
+                    kernels::GEMV_MQ4CG256_MULTIROW_SRC,
+                )
+            } else if rdna3 {
+                (
+                    "gemv_mq4cg256_multirow_rdna3",
+                    kernels::GEMV_MQ4CG256_MULTIROW_SRC,
+                )
+            } else {
+                (
+                    "gemv_mq4cg256_multirow_default",
+                    kernels::GEMV_MQ4CG256_MULTIROW_SRC,
+                )
+            };
+            self.ensure_kernel(mr_name, mr_src, func_name)?;
+            let grid = ((m as u32) + grid_div - 1) / grid_div;
+            self.launch_maybe_blob(
+                func_name,
+                [grid, 1, 1],
+                [32, 1, 1],
+                0,
+                &mut params,
+                blob_builder,
+            )
+        } else {
+            let (_, v1_module) =
+                kernels::gemv_hfq4g256_for_arch(&self.arch_caps, self.flags.rdna2_variant);
+            let module = match v1_module {
+                "gemv_hfq4g256" => "gemv_mq4cg256",
+                "gemv_hfq4g256_rdna3" => "gemv_mq4cg256_rdna3",
+                "gemv_hfq4g256_rdna2v1" => "gemv_mq4cg256_rdna2v1",
+                "gemv_hfq4g256_rdna2v2" => "gemv_mq4cg256_rdna2v2",
+                "gemv_hfq4g256_rdna2v3" => "gemv_mq4cg256_rdna2v3",
+                "gemv_hfq4g256_rdna2v4" => "gemv_mq4cg256_rdna2v4",
+                "gemv_hfq4g256_rdna2v5" => "gemv_mq4cg256_rdna2v5",
+                _ => "gemv_mq4cg256",
+            };
+            self.ensure_kernel(module, kernels::GEMV_MQ4CG256_SRC, "gemv_mq4cg256")?;
+            self.launch_maybe_blob(
+                "gemv_mq4cg256",
+                [m as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                &mut params,
+                blob_builder,
+            )
+        };
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+
 
 
 

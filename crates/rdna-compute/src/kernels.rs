@@ -2879,10 +2879,14 @@ pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma.gfx12.hip");
 pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_wmma.gfx12.hip");
+pub const GEMM_MQ4CG256_RESIDUAL_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq4cg256_residual_wmma.gfx12.hip");
 pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_BT_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_gfx12_bt.hip");
 pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX12_BT_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_wmma_gfx12_bt.hip");
+pub const GEMM_MQ4CG256_RESIDUAL_WMMA_GFX12_BT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq4cg256_residual_wmma_gfx12_bt.hip");
 /// Muse Glimmer-owned batch-tiled gfx12 residual GEMM. Sibling of
 /// `GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_BT_SRC`; same math, register-lean
 /// full-tile variants only. Used exclusively by hipfire-arch-muse-glimmer.
@@ -3092,10 +3096,14 @@ pub const GEMM_GATE_UP_HFQ4G256_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma.gfx12.hip");
 pub const GEMM_GATE_UP_MQ4G256V2_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma.gfx12.hip");
+pub const GEMM_GATE_UP_MQ4CG256_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_gate_up_mq4cg256_wmma.gfx12.hip");
 pub const GEMM_GATE_UP_HFQ4G256_WMMA_GFX12_BT_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma_gfx12_bt.hip");
 pub const GEMM_GATE_UP_MQ4G256V2_WMMA_GFX12_BT_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_gfx12_bt.hip");
+pub const GEMM_GATE_UP_MQ4CG256_WMMA_GFX12_BT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_gate_up_mq4cg256_wmma_gfx12_bt.hip");
 pub const GEMM_QKVZA_HFQ4G256_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_qkvza_hfq4g256_wmma.hip");
 // gfx12 (RDNA4) sister: gfx12 hfq4 recipe + 4-output qkv/z/beta/alpha
@@ -3104,10 +3112,14 @@ pub const GEMM_QKVZA_HFQ4G256_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_qkvza_hfq4g256_wmma.gfx12.hip");
 pub const GEMM_QKVZA_MQ4G256V2_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_qkvza_mq4g256v2_wmma.gfx12.hip");
+pub const GEMM_QKVZA_MQ4CG256_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkvza_mq4cg256_wmma.gfx12.hip");
 pub const GEMM_QKVZA_HFQ4G256_WMMA_GFX12_BT_SRC: &str =
     include_str!("../../../kernels/src/gemm_qkvza_hfq4g256_wmma_gfx12_bt.hip");
 pub const GEMM_QKVZA_MQ4G256V2_WMMA_GFX12_BT_SRC: &str =
     include_str!("../../../kernels/src/gemm_qkvza_mq4g256v2_wmma_gfx12_bt.hip");
+pub const GEMM_QKVZA_MQ4CG256_WMMA_GFX12_BT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkvza_mq4cg256_wmma_gfx12_bt.hip");
 // HFQ3-G256 sister of GEMM_QKVZA_HFQ4G256_WMMA_SRC. Same WMMA shape +
 // lane decomposition; only the inner K-tile unpack differs (3-bit
 // cross-byte vs 4-bit nibble). Used for MQ3 prefill via dispatch
@@ -3151,6 +3163,8 @@ pub const GEMM_QKV_HFQ4G256_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_qkv_hfq4g256_wmma.gfx12.hip");
 pub const GEMM_QKV_MQ4G256V2_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_qkv_mq4g256v2_wmma.gfx12.hip");
+pub const GEMM_QKV_MQ4CG256_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkv_mq4cg256_wmma.gfx12.hip");
 
 // Batched 3-way fused HFP4-G32 GEMM (FA preamble: Q + K + V). Sister of
 // GEMM_QKV_HFQ4G256_WMMA_SRC for the FP4 (E2M1 + UE8M0 g32 + FP16 row

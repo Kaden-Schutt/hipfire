@@ -350,4 +350,28 @@ pub fn populate(registry: &mut KernelRegistry) {
         has_awq: false,
         tile: TileImpl::None,
     });
+    registry.register(KernelVariant {
+        key: KernelKey::GemmMq4CG256,
+        arch_required: ArchPredicate::HasWave32,
+        shape_gate: None,
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
+        tile: TileImpl::None,
+    });
+    registry.register(KernelVariant {
+        key: KernelKey::GemmMq4CG256Residual,
+        arch_required: ArchPredicate::Always,
+        shape_gate: None,
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
+        tile: TileImpl::None,
+    });
+    registry.register(KernelVariant {
+        key: KernelKey::GemmMq4CG256BatchedLmhead,
+        arch_required: ArchPredicate::Always,
+        shape_gate: None,
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
+        tile: TileImpl::None,
+    });
 }

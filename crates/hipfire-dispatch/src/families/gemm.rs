@@ -35,6 +35,13 @@ fn is_gemm_mq4v2_key(key: KernelKey) -> bool {
     )
 }
 
+fn is_gemm_mq4c_key(key: KernelKey) -> bool {
+    matches!(
+        key,
+        KernelKey::GemmMq4CG256 | KernelKey::GemmMq4CG256Residual | KernelKey::GemmMq4CG256BatchedLmhead
+    )
+}
+
 
 pub struct GemmParams<'a> {
     pub w: &'a WeightRef<'a>,
@@ -98,6 +105,7 @@ impl GemmFamily {
             }
             DType::HFQ4G128 => KernelKey::GemmHfq4G128,
             DType::MQ4G256V2 => KernelKey::GemmMq4G256V2,
+            DType::MQ4CG256 => KernelKey::GemmMq4CG256,
             _ => {
                 return Err(DispatchError::UnsupportedVariant {
                     family: "gemm", variant: "plain",
@@ -178,8 +186,11 @@ impl GemmFamily {
             gpu.maybe_capture_activation(w.buf, x, batch_size, k);
         }
 
-        // Guard: V2 bytes through v1 kernel or vice-versa is silent noise.
-        // See fused_qkv.rs guard for full header-layout explanation.
+        // Guard: V2/v1.5 bytes through wrong-stride kernels is silent noise.
+        // qt=44 = 136 B/group (two fp16 half-grids); qt=45 = 132 B/group (one
+        // fp16 scale/zero); v1 = 136 B/group (f32 scale/zero). A mis-route
+        // decodes every group at the wrong stride and returns noise at full
+        // speed with no HIP error.
         if w.dtype == DType::MQ4G256V2 && is_gemm_hfq4_key(key) {
             return Err(DispatchError::Hip(format!(
                 "qt=44 (MQ4G256V2) weight (dtype {:?}) routed to v1 kernel key {:?}: \
@@ -189,11 +200,30 @@ impl GemmFamily {
                 w.dtype, key
             )));
         }
+        if w.dtype == DType::MQ4CG256 && (is_gemm_hfq4_key(key) || is_gemm_mq4v2_key(key)) {
+            return Err(DispatchError::Hip(format!(
+                "qt=45 (MQ4CG256) weight (dtype {:?}) routed to incompatible kernel key {:?}: \
+                 mq4c stores one fp16 scale/zero per 256 weights in a 132 B group, while v1/v2 \
+                 use 136 B groups (f32 scale/zero or two fp16 half-grids). A mis-route reads \
+                 every group at the wrong stride and returns noise at full speed with no error.",
+                w.dtype, key
+            )));
+        }
         if (w.dtype == DType::HFQ4G256 || w.dtype == DType::MQ4G256) && is_gemm_mq4v2_key(key) {
             return Err(DispatchError::Hip(format!(
                 "v1 weight (dtype {:?}) routed to v2 kernel key {:?}: \
                  v2 expects fp16 s0/z0/s1/z1 per 128 weights while v1 stores f32 scale/zero per 256. \
                  Routing a v1 payload through a v2 kernel is equally wrong and silent.",
+                w.dtype, key
+            )));
+        }
+        if (w.dtype == DType::HFQ4G256 || w.dtype == DType::MQ4G256 || w.dtype == DType::MQ4G256V2)
+            && is_gemm_mq4c_key(key)
+        {
+            return Err(DispatchError::Hip(format!(
+                "non-mq4c weight (dtype {:?}) routed to mq4c (qt=45) kernel key {:?}: \
+                 mq4c expects a 132 B group (fp16 scale/zero + 128 B nibbles) while v1/v2 use \
+                 136 B groups. Reverse mis-route is equally silent and wrong.",
                 w.dtype, key
             )));
         }
@@ -279,6 +309,9 @@ impl GemmFamily {
             K::GemmMq4G256V2 => hip!(gpu.gemm_mq4g256v2(w.buf, x, y, m, k, batch_size)),
             K::GemmMq4G256V2Residual => hip!(gpu.gemm_hfq4g256_residual_mq4v2(w.buf, x, y, m, k, batch_size)),
             K::GemmMq4G256V2BatchedLmhead => hip!(gpu.gemm_mq4g256v2_batched_lmhead(w.buf, x, y, m, k, batch_size)),
+            K::GemmMq4CG256 => hip!(gpu.gemm_mq4cg256(w.buf, x, y, m, k, batch_size)),
+            K::GemmMq4CG256Residual => hip!(gpu.gemm_mq4cg256_residual(w.buf, x, y, m, k, batch_size)),
+            K::GemmMq4CG256BatchedLmhead => hip!(gpu.gemm_mq4cg256_batched_lmhead(w.buf, x, y, m, k, batch_size)),
             other => Err(DispatchError::MissingImpl { key: other }),
         }
     }

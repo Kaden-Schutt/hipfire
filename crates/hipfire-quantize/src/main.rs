@@ -966,6 +966,70 @@ pub(crate) fn quantize_mq4g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32])
 }
 
 pub(crate) const MQ4V2_GROUP_BYTES: usize = 136;
+pub(crate) const MQ4C_GROUP_BYTES: usize = 132;
+
+/// MQ4CG256 encoder — single-scale per-256 asymmetric, fp16 header, 132 B/group.
+///
+/// For each 256-weight group after FWHT:
+///   lo = min(group); hi = max(group)
+///   step_f32 = (hi - lo) / 15; scale=f16(step); zero=f16(lo)
+///   st=f32(scale); z=f32(zero); // round-tripped
+///   for i in 0..256: q[i]=clamp(rint((w[i]-z)/st),0,15)
+/// Degenerate group (hi==lo): scale=0, zero=f16(lo), all q=0.
+/// Header: [0..2) fp16 scale, [2..4) fp16 zero, [4..132) 128 B nibbles.
+/// See spec header in task — single affine grid per 256, no half-select.
+pub(crate) fn quantize_mq4cg256(
+    w: &[f32],
+    m: usize,
+    k: usize,
+    signs1: &[f32],
+    signs2: &[f32],
+) -> Vec<u8> {
+    let _ = (m, k);
+    let group_size = 256;
+    let block_bytes = MQ4C_GROUP_BYTES;
+    let n = w.len();
+    let n_blocks = (n + group_size - 1) / group_size;
+    let mut output = vec![0u8; n_blocks * block_bytes];
+    for b in 0..n_blocks {
+        let start = b * group_size;
+        let end = (start + group_size).min(n);
+        let mut group = [0.0f32; 256];
+        let actual_len = end - start;
+        group[..actual_len].copy_from_slice(&w[start..end]);
+        cpu_fwht_256(&mut group, signs1, signs2);
+        let lo = group.iter().cloned().fold(f32::INFINITY, f32::min);
+        let hi = group.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let step_f32 = if hi > lo { (hi - lo) / 15.0 } else { 0.0 };
+        let sc_bits = if hi == lo { 0u16 } else { f32_to_f16(step_f32) };
+        let z_bits = f32_to_f16(lo);
+        let st = f16_to_f32(sc_bits);
+        let z = f16_to_f32(z_bits);
+        let degenerate = hi == lo || step_f32 == 0.0 || st == 0.0;
+        let out_off = b * block_bytes;
+        output[out_off..out_off + 2].copy_from_slice(&sc_bits.to_le_bytes());
+        output[out_off + 2..out_off + 4].copy_from_slice(&z_bits.to_le_bytes());
+        if degenerate {
+            // all q = 0, nibbles already zeroed
+            for i in 0..128 {
+                output[out_off + 4 + i] = 0;
+            }
+        } else {
+            let inv = 1.0 / st;
+            let mut q = [0u8; 256];
+            for i in 0..256 {
+                let qq = ((group[i] - z) * inv + 0.5).floor().clamp(0.0, 15.0) as u8;
+                q[i] = qq;
+            }
+            for i in 0..128 {
+                let lo_q = q[2 * i];
+                let hi_q = q[2 * i + 1];
+                output[out_off + 4 + i] = (lo_q & 0xF) | ((hi_q & 0xF) << 4);
+            }
+        }
+    }
+    output
+}
 
 /// MQ4G256 v2 encoder — per-128 asymmetric, fp16 header, byte-identical nibble payload to v1.
 ///
@@ -6154,6 +6218,7 @@ impl QuantType {
             42 => Some(Self::MQ35G256GL),
             43 => Some(Self::MQ4G256SEL),
             44 => Some(Self::MQ4G256V2),
+            45 => Some(Self::MQ4CG256),
             _ => None,
         }
     }
@@ -6267,6 +6332,10 @@ pub(crate) enum QuantType {
     /// 0-15 and the header is uniform per half-wave; both dwords are read from
     /// lane-invariant addresses and stay scalar loads.
     MQ4G256V2 = 44,
+    /// MQ4CG256 (qt=45): FWHT-rotated 4-bit, single affine grid per 256, fp16 header, 132 B/group.
+    /// Header: [0..2) fp16 scale, [2..4) fp16 zero, [4..132) 128 B nibbles (low nibble = even index).
+    /// `w = q * f32(scale) + f32(zero)` with scale/zero round-tripped through fp16 before quantizing.
+    MQ4CG256 = 45,
     MFP4G32E8SOA = 35, // mfp4-E8 SoA: same E8 data as qt=34 but in structure-of-arrays layout.
     MFP3G32E8 = 36, // mfp3-E8: MFP4G32E8 frame, 3-bit lattice (center 3), 13 B/blk, 3.25 bpw.
     // Drop-in cold tier for MQ3G256Lloyd (tag 3 → tag 5).
@@ -6305,6 +6374,7 @@ fn default_promote_target(base: GgufFormat) -> GgufFormat {
         | GgufFormat::Mq3
         | GgufFormat::Mq4
         | GgufFormat::Mq4V2
+        | GgufFormat::Mq4C
         | GgufFormat::Mq5
         | GgufFormat::Mq6
         | GgufFormat::Mq2Lloyd
@@ -6341,10 +6411,11 @@ fn is_promote_pair_supported(base: GgufFormat, promote: GgufFormat) -> bool {
         (Mq2Lloyd | Mq3Lloyd, _) => false,
         (_, Mq2Lloyd | Mq3Lloyd) => false,
         // MQ-family upward bit-width (non-Lloyd)
-        (Mq2, Mq3 | Mq4 | Mq4V2 | Mq5 | Mq6) => true,
-        (Mq3, Mq4 | Mq4V2 | Mq5 | Mq6) => true,
+        (Mq2, Mq3 | Mq4 | Mq4V2 | Mq4C | Mq5 | Mq6) => true,
+        (Mq3, Mq4 | Mq4V2 | Mq4C | Mq5 | Mq6) => true,
         (Mq4, Mq5 | Mq6) => true,
         (Mq4V2, Mq5 | Mq6) => true,
+        (Mq4C, Mq5 | Mq6) => true,
         (Mq5, Mq6) => true,
 
         // HFQ-family upward bit-width
@@ -7891,6 +7962,7 @@ enum GgufFormat {
     Hfq6,
     Mq4,
     Mq4V2,
+    Mq4C,
     Mq5,
     Mq6,
     Mq3,
@@ -7912,9 +7984,9 @@ impl GgufFormat {
     fn from_flag(flag: &str) -> Option<Self> {
         match flag {
             "hfq4" | "hfq4g256" | "hf4" => Some(Self::Hfq4),
-            "hfq6" | "hfq6g256" | "hf6" => Some(Self::Hfq6),
             "mq4v1" | "mq4g256" | "magnum" => Some(Self::Mq4),
             "mq4v2" | "mq4" | "mq4g256v2" => Some(Self::Mq4V2),
+            "mq4c" | "mq4cg256" | "mq4g256c" => Some(Self::Mq4C),
             "mq5" | "mq5g256" => Some(Self::Mq5),
             "mq6" | "mq6g256" => Some(Self::Mq6),
             "mq3" | "mq3g256" => Some(Self::Mq3),
@@ -7939,6 +8011,7 @@ impl GgufFormat {
             Self::Hfq6 => "HFQ6G256",
             Self::Mq4 => "MQ4G256",
             Self::Mq4V2 => "MQ4G256V2",
+            Self::Mq4C => "MQ4CG256",
             Self::Mq5 => "MQ5G256",
             Self::Mq6 => "MQ6G256",
             Self::Mq3 => "MQ3G256",
@@ -8254,6 +8327,12 @@ fn run_gguf_pipeline(
                     let q = quantize_mq4g256v2(&f32_data, m, k, &signs1, &signs2);
                     (q, QuantType::MQ4G256V2, 256u32, "MQ4G256V2")
                 }
+                GgufFormat::Mq4C => {
+                    let m = info.shape[0] as usize;
+                    let k = info.shape[1] as usize;
+                    let q = quantize_mq4cg256(&f32_data, m, k, &signs1, &signs2);
+                    (q, QuantType::MQ4CG256, 256u32, "MQ4CG256")
+                }
                 GgufFormat::Mq5 => {
                     let q = quantize_mq5g256(&f32_data, &signs1, &signs2);
                     (q, QuantType::MQ5G256, 256u32, "MQ5G256")
@@ -8311,6 +8390,12 @@ fn run_gguf_pipeline(
                     let k = info.shape[1] as usize;
                     let q = quantize_mq4g256v2(&f32_data, m, k, &signs1, &signs2);
                     (q, QuantType::MQ4G256V2, 256u32, "MQ4G256V2")
+                }
+                GgufFormat::Mq4C => {
+                    let m = info.shape[0] as usize;
+                    let k = info.shape[1] as usize;
+                    let q = quantize_mq4cg256(&f32_data, m, k, &signs1, &signs2);
+                    (q, QuantType::MQ4CG256, 256u32, "MQ4CG256")
                 }
                 GgufFormat::Mq5 => {
                     let q = quantize_mq5g256(&f32_data, &signs1, &signs2);
@@ -8403,6 +8488,12 @@ fn run_gguf_pipeline(
                     let k = info.shape[1] as usize;
                     let q = quantize_mq4g256v2(&f32_data, m, k, &signs1, &signs2);
                     (q, QuantType::MQ4G256V2, 256u32, "MQ4G256V2")
+                }
+                GgufFormat::Mq4C => {
+                    let m = info.shape[0] as usize;
+                    let k = info.shape[1] as usize;
+                    let q = quantize_mq4cg256(&f32_data, m, k, &signs1, &signs2);
+                    (q, QuantType::MQ4CG256, 256u32, "MQ4CG256")
                 }
                 GgufFormat::Mq5 => {
                     let q = quantize_mq5g256(&f32_data, &signs1, &signs2);
@@ -9307,6 +9398,7 @@ fn main() {
     let use_mtp_precise = format == "deepseek4-mtp-precise";
     let use_mq4g256 = format == "mq4v1" || format == "mq4g256" || format == "magnum";
     let use_mq4v2 = format == "mq4v2" || format == "mq4" || format == "mq4g256v2";
+    let use_mq4c = format == "mq4c" || format == "mq4cg256" || format == "mq4g256c";
     let use_hfq4g256 = format == "hfq4g256" || format == "hfq4" || format == "hf4";
     let use_hfq3g256 = format == "hfq3g256";
     let use_hfq3g128 = format == "hfq3g128" || format == "hfq3" || format == "hf3"; // default HF3 = G128
@@ -11428,7 +11520,7 @@ fn main() {
             // (model.embed_tokens.weight), the router gate, norms, and the depthwise
             // conv filter at Q8/F32 (small + precision-sensitive). Default (no mq4
             // format) keeps the full-precision Q8 bring-up recipe.
-            if (use_mq4g256 || use_mq4v2)
+            if (use_mq4g256 || use_mq4v2 || use_mq4c)
                 && meta.shape.len() == 2
                 && meta.shape[1] % 256 == 0
                 && !name.ends_with("embed_tokens.weight")
@@ -11446,7 +11538,12 @@ fn main() {
                 );
                 let signs1 = gen_fwht_signs(42, 256);
                 let signs2 = gen_fwht_signs(1042, 256);
-                let (q, qt, label) = if use_mq4v2 {
+                let (q, qt, label) = if use_mq4c {
+                    let m = meta.shape[0] as usize;
+                    let k = meta.shape[1] as usize;
+                    let qq = quantize_mq4cg256(&f32_data, m, k, &signs1, &signs2);
+                    (qq, QuantType::MQ4CG256, "MQ4C-LFM")
+                } else if use_mq4v2 {
                     let m = meta.shape[0] as usize;
                     let k = meta.shape[1] as usize;
                     let qq = quantize_mq4g256v2(&f32_data, m, k, &signs1, &signs2);
@@ -11599,6 +11696,8 @@ fn main() {
                         QuantType::MQ4G256
                     } else if use_mq4v2 {
                         QuantType::MQ4G256V2
+                    } else if use_mq4c {
+                        QuantType::MQ4CG256
                     } else {
                         QuantType::Q8F16
                     }
@@ -11637,6 +11736,13 @@ fn main() {
                         let m = meta.shape[0] as usize;
                         let k = meta.shape[1] as usize;
                         (quantize_mq4g256v2(&f32_data, m, k, &s1, &s2), 256, "MQ4V2-COH")
+                    }
+                    QuantType::MQ4CG256 => {
+                        let s1 = gen_fwht_signs(42, 256);
+                        let s2 = gen_fwht_signs(1042, 256);
+                        let m = meta.shape[0] as usize;
+                        let k = meta.shape[1] as usize;
+                        (quantize_mq4cg256(&f32_data, m, k, &s1, &s2), 256, "MQ4C-COH")
                     }
                     _ => (quantize_q8f16(&f32_data), 32, "Q8-COH"),
                 };
@@ -13052,6 +13158,7 @@ fn main() {
                     };
                     if (use_mq4g256
                         || use_mq4v2
+                        || use_mq4c
                         || use_mq4_mq6exp
                         || use_mq4_mq2lloydexp
                         || use_mq4_mq2glexp
@@ -13151,7 +13258,6 @@ fn main() {
                                 (q, QuantType::MQ4G256, 256u32, "MQ4G256")
                             }
                             GgufFormat::Mq4V2 => {
-                                // MQ4V2 (qt=44) + AWQ on lm_head: same AWQ dance as Mq4, but per-128 fp16 header.
                                 let q = if let (Some(alpha), Some(im_weights)) =
                                     (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
                                 {
@@ -13173,6 +13279,30 @@ fn main() {
                                     quantize_mq4g256v2(&f32_data, m_dim, k_dim2, &signs1, &signs2)
                                 };
                                 (q, QuantType::MQ4G256V2, 256u32, "MQ4G256V2")
+                            }
+                            GgufFormat::Mq4C => {
+                                // MQ4C (qt=45) + AWQ on lm_head: same AWQ contract as Mq4 (single fp16 scale/zero per 256).
+                                let q = if let (Some(alpha), Some(im_weights)) =
+                                    (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
+                                {
+                                    if awq_eligible(name) {
+                                        let scales = compute_awq_scales(im_weights, alpha);
+                                        awq_sidecar_scales = Some(scales.clone());
+                                        let m_dim = meta.shape[0];
+                                        let mut scaled = f32_data.clone();
+                                        awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
+                                        quantize_mq4cg256(&scaled, m_dim, k_dim, &signs1, &signs2)
+                                    } else {
+                                        let m_dim = meta.shape[0] as usize;
+                                        let k_dim2 = k_dim as usize;
+                                        quantize_mq4cg256(&f32_data, m_dim, k_dim2, &signs1, &signs2)
+                                    }
+                                } else {
+                                    let m_dim = meta.shape[0] as usize;
+                                    let k_dim2 = k_dim as usize;
+                                    quantize_mq4cg256(&f32_data, m_dim, k_dim2, &signs1, &signs2)
+                                };
+                                (q, QuantType::MQ4CG256, 256u32, "MQ4CG256")
                             }
                             GgufFormat::Mq5 => {
                                 // MQ5 + AWQ on lm_head: MQ5G256 is in
@@ -13475,6 +13605,7 @@ fn main() {
                         || use_mq4sel
                         || use_mq4g256
                         || use_mq4v2
+                        || use_mq4c
                         || use_mq4_mq6exp
                         || use_mq4_mq2lloydexp
                         || use_mq4_mq2glexp
@@ -13572,6 +13703,51 @@ fn main() {
                                 quantize_mq4g256v2(&f32_data, m_dim, k_dim, &signs1, &signs2)
                             };
                             (q, QuantType::MQ4G256V2, 256u32, "MQ4G256V2")
+                        } else {
+                            let q = quantize_hfq4g128(&f32_data);
+                            (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                        }
+                    } else if use_mq4c {
+                        let k_dim = if meta.shape.len() == 2 {
+                            meta.shape[1]
+                        } else {
+                            n_elements
+                        };
+                        if k_dim % 256 == 0 {
+                            let signs1 = gen_fwht_signs(42, 256);
+                            let signs2 = gen_fwht_signs(1042, 256);
+                            // AWQ sidecar for mq4c — same contract as mq4 (single fp16 scale/zero per 256).
+                            let q = if let (Some(alpha), Some(im_weights)) =
+                                (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
+                            {
+                                if awq_eligible(name) {
+                                    let scales = compute_awq_scales(im_weights, alpha);
+                                    awq_sidecar_scales = Some(scales.clone());
+                                    let m_dim = if meta.shape.len() == 2 {
+                                        meta.shape[0]
+                                    } else {
+                                        1
+                                    };
+                                    let mut scaled = f32_data.clone();
+                                    awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
+                                    quantize_mq4cg256(&scaled, m_dim, k_dim, &signs1, &signs2)
+                                } else {
+                                    let m_dim = if meta.shape.len() == 2 {
+                                        meta.shape[0]
+                                    } else {
+                                        1
+                                    };
+                                    quantize_mq4cg256(&f32_data, m_dim, k_dim, &signs1, &signs2)
+                                }
+                            } else {
+                                let m_dim = if meta.shape.len() == 2 {
+                                    meta.shape[0]
+                                } else {
+                                    1
+                                };
+                                quantize_mq4cg256(&f32_data, m_dim, k_dim, &signs1, &signs2)
+                            };
+                            (q, QuantType::MQ4CG256, 256u32, "MQ4CG256")
                         } else {
                             let q = quantize_hfq4g128(&f32_data);
                             (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
@@ -14344,7 +14520,7 @@ fn main() {
                              decision state: shape={:?} k_dim={} k%256={} kmap_level={:?} \
                              is_embed={} q8_router={}\n  \
                              mq4 family flags: use_mq4v2={} use_mq4g256={} use_mq4gl={} \
-                             use_mq4sel={}\n  \
+                             use_mq4sel={} use_mq4c={}\n  \
                              Fix the arm for the flag that is true; do not add a q4f16g64 \
                              opt-in to silence this.",
                             name,
@@ -14359,6 +14535,7 @@ fn main() {
                             use_mq4g256,
                             use_mq4gl,
                             use_mq4sel,
+                            use_mq4c,
                         );
                         std::process::exit(1);
                     }
@@ -19029,6 +19206,103 @@ mod tests {
     }
 
     #[test]
+    fn mq4cg256_roundtrip() {
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        let mut state = 0x9E3779B97F4A7C15u64;
+        let mut next_u01 = || {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            let x = state.wrapping_mul(0x2545F4914F6CDD1D);
+            ((x >> 11) as f64) / ((1u64 << 53) as f64)
+        };
+        let n_blocks = 8usize;
+        let n = n_blocks * 256;
+        let mut w = Vec::with_capacity(n);
+        while w.len() < n {
+            let u1: f64 = next_u01().max(1e-12);
+            let u2: f64 = next_u01();
+            let r = (-2.0 * u1.ln()).sqrt();
+            w.push((r * (std::f64::consts::TAU * u2).cos()) as f32);
+            w.push((r * (std::f64::consts::TAU * u2).sin()) as f32);
+        }
+        w.truncate(n);
+        let m = n_blocks as usize;
+        let k = 256usize;
+        let blob = quantize_mq4cg256(&w, m, k, &s1, &s2);
+        assert_eq!(blob.len(), n_blocks * 132, "group stride must be 132");
+        assert_eq!(blob.len(), n_blocks * MQ4C_GROUP_BYTES);
+        assert_eq!(MQ4C_GROUP_BYTES, 132);
+        let mut sse: f64 = 0.0;
+        let mut sig: f64 = 0.0;
+        for b in 0..n_blocks {
+            let start = b * 256;
+            let mut group = [0.0f32; 256];
+            group.copy_from_slice(&w[start..start + 256]);
+            cpu_fwht_256(&mut group, &s1, &s2);
+            let off = b * 132;
+            let sc = f16_to_f32(u16::from_le_bytes([blob[off], blob[off + 1]]));
+            let zp = f16_to_f32(u16::from_le_bytes([blob[off + 2], blob[off + 3]]));
+            let mut q = [0u8; 256];
+            for i in 0..128 {
+                let byte = blob[off + 4 + i];
+                q[2 * i] = byte & 0xF;
+                q[2 * i + 1] = (byte >> 4) & 0xF;
+            }
+            let mut recon = [0.0f32; 256];
+            for i in 0..256 {
+                recon[i] = q[i] as f32 * sc + zp;
+            }
+            let lo = group.iter().cloned().fold(f32::INFINITY, f32::min);
+            let hi = group.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            if hi == lo {
+                assert_eq!(sc, 0.0, "degenerate group scale must be 0");
+                let expected_zp = f16_to_f32(f32_to_f16(lo));
+                assert!((zp - expected_zp).abs() <= 1e-7, "degenerate zp mismatch");
+                for i in 0..256 {
+                    assert_eq!(recon[i], zp, "degenerate q must be 0");
+                }
+                continue;
+            }
+            let expected_min = zp;
+            let expected_max = zp + 15.0 * sc;
+            let tol_lo = (lo.abs() * 0.001).max(1e-4).max(sc * 0.01);
+            let tol_hi = (hi.abs() * 0.001).max(1e-4).max(sc * 0.01);
+            assert!(
+                (expected_min - lo).abs() <= tol_lo,
+                "block {b} min recon error: lo {lo} expected_min {expected_min} diff {} tol {tol_lo} sc {sc}",
+                (expected_min - lo).abs()
+            );
+            assert!(
+                (expected_max - hi).abs() <= tol_hi,
+                "block {b} max recon error: hi {hi} expected_max {expected_max} diff {} tol {tol_hi} sc {sc}",
+                (expected_max - hi).abs()
+            );
+            let dec_min = recon.iter().cloned().fold(f32::INFINITY, f32::min);
+            let dec_max = recon.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            assert!(
+                (dec_min - expected_min).abs() <= 1e-7,
+                "decoded min {dec_min} != expected {expected_min}"
+            );
+            assert!(
+                (dec_max - expected_max).abs() <= 1e-7,
+                "decoded max {dec_max} != expected {expected_max}"
+            );
+            for i in 0..256 {
+                let d = (recon[i] - group[i]) as f64;
+                sse += d * d;
+                sig += (group[i] as f64) * (group[i] as f64);
+            }
+        }
+        let rel_rms = (sse / sig).sqrt();
+        assert!(
+            rel_rms < 0.12,
+            "overall relative RMS {rel_rms} >= 0.12 (sse {sse} sig {sig})"
+        );
+    }
+
+    #[test]
     fn format_mq4_routing() {
         // --format mq4v1 still yields qt=13, --format mq4 now yields qt=44
         assert_eq!(GgufFormat::from_flag("mq4v1"), Some(GgufFormat::Mq4));
@@ -19037,13 +19311,20 @@ mod tests {
         assert_eq!(GgufFormat::from_flag("mq4"), Some(GgufFormat::Mq4V2));
         assert_eq!(GgufFormat::from_flag("mq4v2"), Some(GgufFormat::Mq4V2));
         assert_eq!(GgufFormat::from_flag("mq4g256v2"), Some(GgufFormat::Mq4V2));
+        assert_eq!(GgufFormat::from_flag("mq4c"), Some(GgufFormat::Mq4C));
+        assert_eq!(GgufFormat::from_flag("mq4cg256"), Some(GgufFormat::Mq4C));
+        assert_eq!(GgufFormat::from_flag("mq4g256c"), Some(GgufFormat::Mq4C));
         assert_eq!(QuantType::from_u8(13), Some(QuantType::MQ4G256));
         assert_eq!(QuantType::from_u8(44), Some(QuantType::MQ4G256V2));
+        assert_eq!(QuantType::from_u8(45), Some(QuantType::MQ4CG256));
         assert_eq!(QuantType::MQ4G256 as u8, 13);
         assert_eq!(QuantType::MQ4G256V2 as u8, 44);
+        assert_eq!(QuantType::MQ4CG256 as u8, 45);
         // Ensure 43 is still SEL, not reused.
         assert_eq!(QuantType::from_u8(43), Some(QuantType::MQ4G256SEL));
         assert_ne!(QuantType::MQ4G256V2 as u8, 43);
+        assert_ne!(QuantType::MQ4CG256 as u8, 43);
+        assert_ne!(QuantType::MQ4CG256 as u8, 44);
     }
 
 }

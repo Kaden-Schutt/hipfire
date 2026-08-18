@@ -21,12 +21,20 @@ fn is_fused_mq4v2_key(key: KernelKey) -> bool {
     )
 }
 
+fn is_fused_mq4cg256_key(key: KernelKey) -> bool {
+    matches!(
+        key,
+        KernelKey::FusedQkvMq4CG256 | KernelKey::FusedQkvzaMq4CG256 | KernelKey::FusedGateUpMq4CG256
+    )
+}
+
 fn guard_fused_qkv_dtype_key(
     weights: &[&GpuTensor],
     key: KernelKey,
 ) -> Result<(), DispatchError> {
     let is_v1 = is_fused_hfq4_key(key);
     let is_v2 = is_fused_mq4v2_key(key);
+    let is_mq4c = is_fused_mq4cg256_key(key);
     for (idx, w) in weights.iter().enumerate() {
         if w.dtype == DType::MQ4G256V2 && is_v1 {
             return Err(DispatchError::Hip(format!(
@@ -42,6 +50,27 @@ fn guard_fused_qkv_dtype_key(
                 "v1 weight[{}] (dtype {:?}) routed to v2 kernel key {:?}: \
                  v2 expects fp16 s0/z0/s1/z1 per 128 weights while v1 stores f32 scale/zero per 256. \
                  Routing a v1 payload through a v2 kernel is equally wrong and silent.",
+                idx, w.dtype, key
+            )));
+        }
+        // qt=45 (MQ4CG256) is 132 B/group; v1/v2 are 136 B/group. Mis-route is silent noise.
+        if w.dtype == DType::MQ4CG256 && (is_v1 || is_v2) {
+            return Err(DispatchError::Hip(format!(
+                "qt=45 (MQ4CG256) weight[{}] (dtype {:?}) routed to non-mq4c kernel key {:?}: \
+                 mq4c stores one fp16 scale/zero pair + 128 B nibbles (132 B/group) while v1/v2 \
+                 use 136 B/group. A non-mq4c kernel reads every group at the wrong stride.",
+                idx, w.dtype, key
+            )));
+        }
+        if (w.dtype == DType::HFQ4G256
+            || w.dtype == DType::MQ4G256
+            || w.dtype == DType::MQ4G256V2)
+            && is_mq4c
+        {
+            return Err(DispatchError::Hip(format!(
+                "non-mq4c weight[{}] (dtype {:?}) routed to mq4c kernel key {:?}: \
+                 mq4c expects 132 B groups (fp16 scale/zero + 128 B nibbles); v1/v2 payloads \
+                 are 136 B/group and would be read at the wrong stride.",
                 idx, w.dtype, key
             )));
         }
@@ -196,6 +225,24 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
             match params.batch_size {
                 Some(n) => hip!(gpu.gemm_qkv_hfq4g256_mq4v2(wq, wk, wv, x, q, kout, v, mq, mk, mv, k, n)),
                 None => hip!(gpu.fused_qkv_hfq4g256_mq4v2(wq, wk, wv, x, q, kout, v, mq, mk, mv, k)),
+            }
+        }
+        KernelKey::FusedQkvMq4CG256 => {
+            let [wq, wk, wv] = <[&GpuTensor; 3]>::try_from(params.weights)
+                .map_err(|_| err_wrong_arity(params.kind, 3))?;
+            let [q, kout, v] = <[&GpuTensor; 3]>::try_from(params.outputs)
+                .map_err(|_| err_wrong_arity(params.kind, 3))?;
+            let [mq, mk, mv] =
+                <[usize; 3]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 3))?;
+            // Calibration taps: one per constituent weight, shared input x.
+            let __cap_n = params.batch_size.unwrap_or(1);
+            gpu.maybe_capture_activation(wq, x, __cap_n, k);
+            gpu.maybe_capture_activation(wk, x, __cap_n, k);
+            gpu.maybe_capture_activation(wv, x, __cap_n, k);
+
+            match params.batch_size {
+                Some(n) => hip!(gpu.gemm_qkv_mq4cg256(wq, wk, wv, x, q, kout, v, mq, mk, mv, k, n)),
+                None => hip!(gpu.fused_qkv_mq4cg256(wq, wk, wv, x, q, kout, v, mq, mk, mv, k)),
             }
         }
         KernelKey::FusedQkvMq3G256Lloyd => {
@@ -405,6 +452,30 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
                     n
                 )),
                 None => hip!(gpu.fused_qkvza_hfq4g256_mq4v2(
+                    wqkv, wz, w_beta, w_alpha, x, qkv, z, beta, alpha, mqkv, mz, mbeta, malpha, k
+                )),
+            }
+        }
+        KernelKey::FusedQkvzaMq4CG256 => {
+            let [wqkv, wz, w_beta, w_alpha] = <[&GpuTensor; 4]>::try_from(params.weights)
+                .map_err(|_| err_wrong_arity(params.kind, 4))?;
+            let [qkv, z, beta, alpha] = <[&GpuTensor; 4]>::try_from(params.outputs)
+                .map_err(|_| err_wrong_arity(params.kind, 4))?;
+            let [mqkv, mz, mbeta, malpha] =
+                <[usize; 4]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 4))?;
+            // Calibration taps: one per constituent weight, shared input x.
+            let __cap_n = params.batch_size.unwrap_or(1);
+            gpu.maybe_capture_activation(wqkv, x, __cap_n, k);
+            gpu.maybe_capture_activation(wz, x, __cap_n, k);
+            gpu.maybe_capture_activation(w_beta, x, __cap_n, k);
+            gpu.maybe_capture_activation(w_alpha, x, __cap_n, k);
+
+            match params.batch_size {
+                Some(n) => hip!(gpu.gemm_qkvza_mq4cg256(
+                    wqkv, wz, w_beta, w_alpha, x, qkv, z, beta, alpha, mqkv, mz, mbeta, malpha, k,
+                    n
+                )),
+                None => hip!(gpu.fused_qkvza_mq4cg256(
                     wqkv, wz, w_beta, w_alpha, x, qkv, z, beta, alpha, mqkv, mz, mbeta, malpha, k
                 )),
             }
@@ -647,6 +718,23 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
             match params.batch_size {
                 Some(n) => hip!(gpu.gemm_gate_up_hfq4g256_mq4v2(w_gate, w_up, x, gate, up, mg, mu, k, n)),
                 None => hip!(gpu.fused_gate_up_hfq4g256_mq4v2(w_gate, w_up, x, gate, up, mg, mu, k)),
+            }
+        }
+        KernelKey::FusedGateUpMq4CG256 => {
+            let [w_gate, w_up] = <[&GpuTensor; 2]>::try_from(params.weights)
+                .map_err(|_| err_wrong_arity(params.kind, 2))?;
+            let [gate, up] = <[&GpuTensor; 2]>::try_from(params.outputs)
+                .map_err(|_| err_wrong_arity(params.kind, 2))?;
+            let [mg, mu] =
+                <[usize; 2]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 2))?;
+            // Calibration taps: one per constituent weight, shared input x.
+            let __cap_n = params.batch_size.unwrap_or(1);
+            gpu.maybe_capture_activation(w_gate, x, __cap_n, k);
+            gpu.maybe_capture_activation(w_up, x, __cap_n, k);
+
+            match params.batch_size {
+                Some(n) => hip!(gpu.gemm_gate_up_mq4cg256(w_gate, w_up, x, gate, up, mg, mu, k, n)),
+                None => hip!(gpu.fused_gate_up_mq4cg256(w_gate, w_up, x, gate, up, mg, mu, k)),
             }
         }
         // MFP4G32E8 fused gate+up — DECODE-ONLY (gfx1151 launch-fusion). Same
@@ -971,6 +1059,28 @@ fn dispatch_fused_qkv_with_qwen2_bias(
             gpu.maybe_capture_activation(wk, x, 1, k);
             gpu.maybe_capture_activation(wv, x, 1, k);
             hip!(gpu.fused_qkv_hfq4g256_with_bias_mq4v2(
+                wq,
+                wk,
+                wv,
+                x,
+                q,
+                kout,
+                v,
+                mq,
+                mk,
+                mv,
+                k,
+                bq.buf.as_ptr(),
+                bk.buf.as_ptr(),
+                bv.buf.as_ptr()
+            ))
+        },
+        KernelKey::FusedQkvMq4CG256 => {
+            // Calibration taps: one per constituent weight, shared input x (qwen2 bias, decode n=1).
+            gpu.maybe_capture_activation(wq, x, 1, k);
+            gpu.maybe_capture_activation(wk, x, 1, k);
+            gpu.maybe_capture_activation(wv, x, 1, k);
+            hip!(gpu.fused_qkv_mq4cg256_with_bias(
                 wq,
                 wk,
                 wv,
