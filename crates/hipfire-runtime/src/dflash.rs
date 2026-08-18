@@ -758,15 +758,14 @@ pub struct DflashScratch {
     pub up: GpuTensor,            // [B, intermediate]
     pub gate_up: GpuTensor,       // [B, intermediate]
     pub attn_out: GpuTensor,      // [B, q_dim]
-    pub attn_proj: GpuTensor,     // [B, hidden]
-    pub residual_attn: GpuTensor, // [B, hidden]
-    pub residual_ffn: GpuTensor,  // [B, hidden]
+    /// Shared residual plane. Attention and FFN consume it sequentially,
+    /// including under the per-layer FFN graph, so separate planes only pin
+    /// another B×hidden allocation without enabling overlap.
+    pub residual: GpuTensor, // [B, hidden]
 
     // Context activations (L rows), where L ≤ max_ctx_len.
     pub target_hidden: GpuTensor,      // [L, num_extract × hidden]
     pub target_hidden_proj: GpuTensor, // [L, hidden]
-    pub k_ctx: GpuTensor,              // [L, kv_dim]
-    pub v_ctx: GpuTensor,              // [L, kv_dim]
 
     // Concatenated K/V (L + B rows).
     pub k_cat: GpuTensor, // [L + B, kv_dim]
@@ -960,14 +959,10 @@ impl DflashScratch {
             up: gpu.alloc_tensor(&[b * inter], DType::F32)?,
             gate_up: gpu.alloc_tensor(&[b * inter], DType::F32)?,
             attn_out: gpu.alloc_tensor(&[b * qd], DType::F32)?,
-            attn_proj: gpu.alloc_tensor(&[b * h], DType::F32)?,
-            residual_attn: gpu.alloc_tensor(&[b * h], DType::F32)?,
-            residual_ffn: gpu.alloc_tensor(&[b * h], DType::F32)?,
+            residual: gpu.alloc_tensor(&[b * h], DType::F32)?,
 
             target_hidden: gpu.alloc_tensor(&[l * ne * h], DType::F32)?,
             target_hidden_proj: gpu.alloc_tensor(&[l * h], DType::F32)?,
-            k_ctx: gpu.alloc_tensor(&[l * kvd], DType::F32)?,
-            v_ctx: gpu.alloc_tensor(&[l * kvd], DType::F32)?,
 
             k_cat: gpu.alloc_tensor(&[tot * kvd], DType::F32)?,
             v_cat: gpu.alloc_tensor(&[tot * kvd], DType::F32)?,
@@ -1036,13 +1031,9 @@ impl DflashScratch {
         let _ = gpu.free_tensor(self.up);
         let _ = gpu.free_tensor(self.gate_up);
         let _ = gpu.free_tensor(self.attn_out);
-        let _ = gpu.free_tensor(self.attn_proj);
-        let _ = gpu.free_tensor(self.residual_attn);
-        let _ = gpu.free_tensor(self.residual_ffn);
+        let _ = gpu.free_tensor(self.residual);
         let _ = gpu.free_tensor(self.target_hidden);
         let _ = gpu.free_tensor(self.target_hidden_proj);
-        let _ = gpu.free_tensor(self.k_ctx);
-        let _ = gpu.free_tensor(self.v_ctx);
         let _ = gpu.free_tensor(self.k_cat);
         let _ = gpu.free_tensor(self.v_cat);
         let _ = gpu.free_tensor(self.positions_q);
@@ -1292,10 +1283,10 @@ fn draft_ffn_layer(
     graph_safe: bool,
 ) -> HipResult<()> {
     if graph_safe {
-        gpu.memcpy_dtod_auto(&scratch.residual_ffn.buf, &scratch.x.buf, (b * h) * 4)?;
+        gpu.memcpy_dtod_auto(&scratch.residual.buf, &scratch.x.buf, (b * h) * 4)?;
     } else {
         gpu.hip
-            .memcpy_dtod(&scratch.residual_ffn.buf, &scratch.x.buf, (b * h) * 4)?;
+            .memcpy_dtod(&scratch.residual.buf, &scratch.x.buf, (b * h) * 4)?;
     }
 
     gpu.rmsnorm_batched(&scratch.x, &layer.ffn_norm, &scratch.x_norm, b, h, eps)?;
@@ -1325,9 +1316,9 @@ fn draft_ffn_layer(
         scratch.mq_x_rot.as_ref(),
     )?;
     if graph_safe {
-        gpu.add_f32_graph_safe(&scratch.residual_ffn, &scratch.x, &scratch.x)
+        gpu.add_f32_graph_safe(&scratch.residual, &scratch.x, &scratch.x)
     } else {
-        gpu.add_f32(&scratch.residual_ffn, &scratch.x, &scratch.x)
+        gpu.add_f32(&scratch.residual, &scratch.x, &scratch.x)
     }
 }
 
@@ -1804,7 +1795,7 @@ pub fn draft_forward_opts(
 
         // Residual.
         gpu.hip
-            .memcpy_dtod(&scratch.residual_attn.buf, &scratch.x.buf, (b * h) * 4)?;
+            .memcpy_dtod(&scratch.residual.buf, &scratch.x.buf, (b * h) * 4)?;
 
         // attn_norm.
         gpu.rmsnorm_batched(&scratch.x, &layer.attn_norm, &scratch.x_norm, b, h, eps)?;
@@ -2096,18 +2087,20 @@ pub fn draft_forward_opts(
             None
         };
 
-        // attn_proj = attn_out @ wo^T → [B, hidden]
+        // Write the projection directly into x. The pre-attention x is already
+        // preserved in the shared residual plane, so a dedicated attn_proj
+        // allocation has no lifetime that must overlap this output.
         gemm_dispatch(
             gpu,
             &scratch.attn_out,
             &layer.wo,
-            &scratch.attn_proj,
+            &scratch.x,
             b,
             scratch.mq_x_rot.as_ref(),
         )?;
 
-        // x = residual_attn + attn_proj
-        gpu.add_f32(&scratch.residual_attn, &scratch.attn_proj, &scratch.x)?;
+        // x = residual + projected attention
+        gpu.add_f32(&scratch.residual, &scratch.x, &scratch.x)?;
 
         // Fixed-shape FFN tail. MoE DFlash can optionally capture this as a
         // per-layer/per-B hipGraph; the attention/context work above is left
