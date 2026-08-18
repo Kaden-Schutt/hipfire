@@ -1546,6 +1546,11 @@ pub const GEMV_HFQ4G1024_SRC: &str = include_str!("../../../kernels/src/gemv_hfq
 /// Block: [f32 scale][f32 zero][128B nibbles] = 136 bytes per 256 weights.
 /// Same coalesced width as Q4_K, 14 VGPRs instead of 39.
 pub const GEMV_HFQ4G256_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256.hip");
+/// MQ4G256V2: dual-scale HFQ4-G256 (qt=44). Same 136 B stride and nibble payload as
+/// HFQ4-G256, but header holds two fp16 scales/zeros (s0/z0 for w0..127,
+/// s1/z1 for w128..255) instead of one f32 pair. Decode selects s/z by
+/// `tid < 16` (payload `gp+8+tid*4 < gp+8+64`).
+pub const GEMV_MQ4G256V2_SRC: &str = include_str!("../../../kernels/src/gemv_mq4g256v2.hip");
 /// gfx1151 LM-head one-row candidate. Keep wave-uniform HFQ headers on scalar
 /// loads, lower lane-divergent packed weights to temporal VMEM, and specialize
 /// the hot 248320x2048 shape so the compiler removes dynamic tail control.
@@ -3454,6 +3459,11 @@ pub const GEMV_HFQ4G256_MULTIROW_SRC: &str = concat!(
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/gemv_hfq4g256_multirow.hip")
 );
+pub const GEMV_MQ4G256V2_MULTIROW_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_mq4g256v2_multirow.hip")
+);
 /// Exact gfx1151 LM-head shape specialization with the established global
 /// load path unchanged. This isolates compile-time K=2048 loop/tail/address
 /// simplification from the independently rejected buffer-load experiments.
@@ -3956,6 +3966,22 @@ pub fn gemv_hfq4g256_for_arch(
         // RDNA4 variants (existing)
         // "gfx1200" | "gfx1201" => ...,
         _ => (GEMV_HFQ4G256_SRC, "gemv_hfq4g256"), // gfx1010 baseline
+    }
+}
+
+/// MQ4G256V2 (qt=44) arch dispatch — mirrors `gemv_hfq4g256_for_arch`.
+/// gfx1100/1101/1102 get the rdna3 module (same dual-scale source, distinct
+/// hsaco cache key); all other archs use the baseline module.
+/// The C symbol is `gemv_mq4g256v2` (and `gemv_mq4g256v2_multirow_r*` for
+/// the multirow file).
+pub fn gemv_mq4g256v2_for_arch(
+    caps: &ArchCaps,
+    _rdna2_variant: Option<u32>,
+) -> (&'static str, &'static str) {
+    let arch = caps.arch();
+    match arch {
+        "gfx1100" | "gfx1101" | "gfx1102" => (GEMV_MQ4G256V2_SRC, "gemv_mq4g256v2_rdna3"),
+        _ => (GEMV_MQ4G256V2_SRC, "gemv_mq4g256v2"),
     }
 }
 
