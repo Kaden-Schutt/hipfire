@@ -208,7 +208,7 @@ fn require_batchable_deltanet_layer(layer: &DeltaNetLayerWeights) -> HipResult<A
     // them: the fused kernels serve all projections of a layer in a single launch,
     // so a mixed qt=13/qt=44 layer would decode half its weights with the wrong
     // header interpretation.
-    if all(DType::MQ4G256) || all(DType::MQ4G256V2) {
+    if all(DType::MQ4G256) || all(DType::MQ4G256V2) || all(DType::MQ4CG256) {
         return Ok(AttnProjDtype::Mq4G256);
     }
     Err(HipError::new(
@@ -233,7 +233,7 @@ fn require_batchable_fullattn_layer(layer: &FullAttnLayerWeights) -> HipResult<A
     if all(DType::Q8_0) {
         return Ok(AttnProjDtype::Q8_0);
     }
-    if all(DType::MQ4G256) || all(DType::MQ4G256V2) {
+    if all(DType::MQ4G256) || all(DType::MQ4G256V2) || all(DType::MQ4CG256) {
         return Ok(AttnProjDtype::Mq4G256);
     }
     Err(HipError::new(
@@ -282,6 +282,7 @@ enum AttnProjDtype {
 pub(crate) fn residual_gemm_key_for(dt: DType) -> KernelKey {
     match dt {
         DType::MQ4G256V2 => KernelKey::GemmMq4G256V2Residual,
+        DType::MQ4CG256 => KernelKey::GemmMq4CG256Residual,
         _ => KernelKey::GemmHfq4G256Residual,
     }
 }
@@ -289,6 +290,7 @@ pub(crate) fn residual_gemm_key_for(dt: DType) -> KernelKey {
 pub(crate) fn fused_qkvza_key_for(dt: DType) -> KernelKey {
     match dt {
         DType::MQ4G256V2 => KernelKey::FusedQkvzaMq4G256V2,
+        DType::MQ4CG256 => KernelKey::FusedQkvzaMq4CG256,
         _ => KernelKey::FusedQkvzaHfq4G256,
     }
 }
@@ -296,6 +298,7 @@ pub(crate) fn fused_qkvza_key_for(dt: DType) -> KernelKey {
 pub(crate) fn fused_qkv_key_for(dt: DType) -> KernelKey {
     match dt {
         DType::MQ4G256V2 => KernelKey::FusedQkvMq4G256V2,
+        DType::MQ4CG256 => KernelKey::FusedQkvMq4CG256,
         _ => KernelKey::FusedQkvHfq4G256,
     }
 }
@@ -303,6 +306,7 @@ pub(crate) fn fused_qkv_key_for(dt: DType) -> KernelKey {
 pub(crate) fn fused_gate_up_key_for(dt: DType) -> KernelKey {
     match dt {
         DType::MQ4G256V2 => KernelKey::FusedGateUpMq4G256V2,
+        DType::MQ4CG256 => KernelKey::FusedGateUpMq4CG256,
         _ => KernelKey::FusedGateUpHfq4G256,
     }
 }
@@ -326,8 +330,11 @@ fn require_batchable_deltanet_moe_layer(
     if all_q8 {
         return Ok(AttnProjDtype::Q8_0);
     }
-    let mq4c = |d: DType| matches!(d, DType::MQ4G256 | DType::MQ4G256V2);
-    let all_mq4 = mq4c(layer.wqkv.gpu_dtype)
+    // Renamed from `mq4c` now that MQ4C/qt=45 is a real format name — this predicate
+    // is the whole MQ4 FAMILY, not that one container.
+    let mq4_family =
+        |d: DType| matches!(d, DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ4CG256);
+    let all_mq4 = mq4_family(layer.wqkv.gpu_dtype)
         && layer.wz.gpu_dtype == layer.wqkv.gpu_dtype
         && layer.w_beta.gpu_dtype == layer.wqkv.gpu_dtype
         && layer.w_alpha.gpu_dtype == layer.wqkv.gpu_dtype
@@ -356,8 +363,9 @@ fn require_batchable_fullattn_moe_layer(
     if all_q8 {
         return Ok(AttnProjDtype::Q8_0);
     }
-    let mq4c = |d: DType| matches!(d, DType::MQ4G256 | DType::MQ4G256V2);
-    let all_mq4 = mq4c(layer.wq.gpu_dtype)
+    let mq4_family =
+        |d: DType| matches!(d, DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ4CG256);
+    let all_mq4 = mq4_family(layer.wq.gpu_dtype)
         && layer.wk.gpu_dtype == layer.wq.gpu_dtype
         && layer.wv.gpu_dtype == layer.wq.gpu_dtype
         && layer.wo.gpu_dtype == layer.wq.gpu_dtype;

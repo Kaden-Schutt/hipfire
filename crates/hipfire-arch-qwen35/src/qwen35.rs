@@ -865,6 +865,7 @@ fn dtype_from_quant_type(qt: u8) -> HipResult<DType> {
         40 => Ok(DType::MQ4G256GL),
         43 => Ok(DType::MQ4G256SEL),
         44 => Ok(DType::MQ4G256V2),
+        45 => Ok(DType::MQ4CG256),
         // qt=6 (HFQ4G256) and qt=37 (MFP2G32E8) are shipped formats and MUST stay
         // mapped here. Dropping an arm from this match is not a compile error — it
         // degrades to "graded EP: unsupported quant_type", so the loss stays
@@ -2958,6 +2959,39 @@ fn load_weight_tensor_raw(
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ4G256V2,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        45 => {
+            // MQ4C / v1.5 (qt=45): 132 B/group — ONE fp16 scale+zero over all 256,
+            // payload at +4. Note the stride is 132, NOT 136: qt=45 is the only
+            // 4-bit G256 format in this match that is not 136 B, so a copied
+            // expected-length formula would silently accept a truncated blob.
+            if k % 256 != 0 {
+                return Err(HipError::new(
+                    0,
+                    &format!("MQ4CG256 has K={k} but requires K%256==0"),
+                ));
+            }
+            let gpr = k / 256;
+            let expected = m * gpr * 132;
+            if data.len() != expected {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "MQ4CG256 blob length mismatch: expected {expected}, got {}",
+                        data.len()
+                    ),
+                ));
+            }
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MQ4CG256,
                 m,
                 k,
                 row_stride: 0,

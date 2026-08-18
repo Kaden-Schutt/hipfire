@@ -965,6 +965,7 @@ pub fn fused_rmsnorm_rotate_for_mq<'a>(
     match sample_weight.gpu_dtype {
         DType::MQ4G256
         | DType::MQ4G256V2
+        | DType::MQ4CG256
         | DType::MQ6G256
         | DType::MQ3G256
         | DType::MQ2G256
@@ -1025,6 +1026,7 @@ pub fn rotate_x_for_mq<'a>(
     match sample_weight.gpu_dtype {
         DType::MQ4G256
         | DType::MQ4G256V2
+        | DType::MQ4CG256
         | DType::MQ6G256
         | DType::MQ3G256
         | DType::MQ2G256
@@ -1337,6 +1339,7 @@ pub fn weight_gemv_residual(
         DType::MQ6G256
         | DType::MQ4G256
         | DType::MQ4G256V2
+        | DType::MQ4CG256
         | DType::MQ3G256
         | DType::MQ3G256Lloyd
         | DType::MQ4G256Lloyd => {
@@ -1412,6 +1415,7 @@ pub fn weight_gemv_swiglu_residual(
     match w_down.gpu_dtype {
         DType::MQ4G256
         | DType::MQ4G256V2
+        | DType::MQ4CG256
         | DType::MQ3G256
         | DType::MQ6G256
         | DType::MQ3G256Lloyd
@@ -1793,6 +1797,7 @@ pub fn is_batchable_la(dt: DType, arch: &str) -> bool {
         dt,
         DType::MQ4G256
             | DType::MQ4G256V2
+            | DType::MQ4CG256
             | DType::HFQ4G256
             | DType::HFQ4G128
             | DType::MQ6G256
