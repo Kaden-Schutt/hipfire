@@ -404,7 +404,10 @@ impl MropeCtx {
             "MropeCtx::pos3 called below base ({pos} < {})",
             self.base
         );
-        match pos.checked_sub(self.base).and_then(|i| self.positions.get(i)) {
+        match pos
+            .checked_sub(self.base)
+            .and_then(|i| self.positions.get(i))
+        {
             Some(p) => *p,
             None => [pos as i32 + self.rope_delta; 3],
         }

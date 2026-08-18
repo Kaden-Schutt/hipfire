@@ -11656,22 +11656,10 @@ impl Gpu {
         rm: usize,
     ) -> HipResult<bool> {
         let (kname, bv) = match rm {
-            2 => (
-                "gemm_hfq4g256_residual_wmma_gfx1100_muse_rm2_bv6",
-                6usize,
-            ),
-            3 => (
-                "gemm_hfq4g256_residual_wmma_gfx1100_muse_rm3_bv4",
-                4usize,
-            ),
-            4 => (
-                "gemm_hfq4g256_residual_wmma_gfx1100_muse_rm4_bv3",
-                3usize,
-            ),
-            6 => (
-                "gemm_hfq4g256_residual_wmma_gfx1100_muse_rm6_bv2",
-                2usize,
-            ),
+            2 => ("gemm_hfq4g256_residual_wmma_gfx1100_muse_rm2_bv6", 6usize),
+            3 => ("gemm_hfq4g256_residual_wmma_gfx1100_muse_rm3_bv4", 4usize),
+            4 => ("gemm_hfq4g256_residual_wmma_gfx1100_muse_rm4_bv3", 3usize),
+            6 => ("gemm_hfq4g256_residual_wmma_gfx1100_muse_rm6_bv2", 2usize),
             _ => return Ok(false),
         };
         if !self.arch_caps.is_gfx1100()
@@ -11969,11 +11957,7 @@ impl Gpu {
         } else {
             "gemm_hfq4g256_residual_wmma_gfx1100_muse_rm2_bv6_pipe_scalar"
         };
-        if !self.arch_caps.is_gfx1100()
-            || m != 19_968
-            || k != 6_656
-            || batch_size != 192
-        {
+        if !self.arch_caps.is_gfx1100() || m != 19_968 || k != 6_656 || batch_size != 192 {
             return Ok(false);
         }
         self.bind_thread()?;
@@ -12005,34 +11989,22 @@ impl Gpu {
         let bytes =
             crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * k * 2 + batch_size * m * 4 * 2;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", kname, bytes);
-        let result = self.launch_maybe_blob(
-            kname,
-            [624, 2, 1],
-            [32, 1, 1],
-            0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(a_ptr);
-                b.push_ptr(x_ptr);
-                b.push_ptr(y_ptr);
-                b.push_i32(m_val);
-                b.push_i32(k_val);
-                b.push_i32(bs_val);
-                b
-            },
-        );
+        let result = self.launch_maybe_blob(kname, [624, 2, 1], [32, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(a_ptr);
+            b.push_ptr(x_ptr);
+            b.push_ptr(y_ptr);
+            b.push_i32(m_val);
+            b.push_i32(k_val);
+            b.push_i32(bs_val);
+            b
+        });
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
         result?;
         Ok(true)
     }
-
-
-
-
-
 
     /// HFQ4-G256 GEMV with fused residual add: y[row] += A[row] · x.
     /// Same math as `gemv_hfq4g256` but the final write accumulates into `y`
@@ -22508,10 +22480,8 @@ impl Gpu {
         let cdna_wave64 = self.arch_caps.is_wave64_native();
         // Muse Glimmer exact FFN gate+up shape on gfx1100: gate_m=up_m=19968, K=6656.
         // Host-gated identity; reuses fused_gate_up_hfq4g256 arithmetic template.
-        let glimmer_gate_up_k6656_gfx1100 = self.arch_caps.is_gfx1100()
-            && gate_m == 19_968
-            && up_m == 19_968
-            && k == 6_656;
+        let glimmer_gate_up_k6656_gfx1100 =
+            self.arch_caps.is_gfx1100() && gate_m == 19_968 && up_m == 19_968 && k == 6_656;
         static GFX1100_DENSE_GATE_UP_STAGE_X32: OnceLock<bool> = OnceLock::new();
         let dense_gate_up_stage_x32_gfx1100 = self.arch_caps.is_gfx1100()
             && gate_m == 17_408
@@ -22549,8 +22519,7 @@ impl Gpu {
             && up_m == 17_408
             && k == 5_120
             && *GFX1100_DENSE_GATE_UP_DOT_REFORM.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_GFX1100_DENSE_GATE_UP_DOT_REFORM")
-                    .as_deref()
+                hipfire_config::developer_var("HIPFIRE_GFX1100_DENSE_GATE_UP_DOT_REFORM").as_deref()
                     == Ok("1")
             });
         static GFX1100_DENSE_GATE_UP_QUAD_PREFETCH: OnceLock<bool> = OnceLock::new();
@@ -22563,10 +22532,8 @@ impl Gpu {
             && up_m == 17_408
             && k == 5_120
             && *GFX1100_DENSE_GATE_UP_QUAD_PREFETCH.get_or_init(|| {
-                hipfire_config::developer_var(
-                    "HIPFIRE_GFX1100_DENSE_GATE_UP_QUAD_PREFETCH",
-                )
-                .as_deref()
+                hipfire_config::developer_var("HIPFIRE_GFX1100_DENSE_GATE_UP_QUAD_PREFETCH")
+                    .as_deref()
                     == Ok("1")
             });
         static GFX1100_DENSE_GATE_UP_SETPRIO: OnceLock<bool> = OnceLock::new();
@@ -22575,8 +22542,7 @@ impl Gpu {
             && up_m == 17_408
             && k == 5_120
             && *GFX1100_DENSE_GATE_UP_SETPRIO.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_GFX1100_DENSE_GATE_UP_SETPRIO")
-                    .as_deref()
+                hipfire_config::developer_var("HIPFIRE_GFX1100_DENSE_GATE_UP_SETPRIO").as_deref()
                     == Ok("1")
             });
         static GFX1100_DENSE_GATE_UP_LANE0_HEADERS: OnceLock<bool> = OnceLock::new();
@@ -22585,14 +22551,12 @@ impl Gpu {
             && up_m == 17_408
             && k == 5_120
             && *GFX1100_DENSE_GATE_UP_LANE0_HEADERS.get_or_init(|| {
-                hipfire_config::developer_var(
-                    "HIPFIRE_GFX1100_DENSE_GATE_UP_LANE0_HEADERS",
-                )
-                .as_deref()
+                hipfire_config::developer_var("HIPFIRE_GFX1100_DENSE_GATE_UP_LANE0_HEADERS")
+                    .as_deref()
                     == Ok("1")
             });
-        let dense_gate_up_dot_prefetch_gfx1100 = dense_gate_up_dot_reform_gfx1100
-            && dense_gate_up_quad_prefetch_gfx1100;
+        let dense_gate_up_dot_prefetch_gfx1100 =
+            dense_gate_up_dot_reform_gfx1100 && dense_gate_up_quad_prefetch_gfx1100;
         let (func_name, block, grid_x) = if dense_gate_up_pair2_gfx1100 {
             self.ensure_kernel(
                 "fused_gate_up_hfq4g256_pair2_gfx1100",

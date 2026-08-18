@@ -5,6 +5,21 @@
 //! Qwen3.5 decode forward: MoE decode, `Qwen35Scratch`, the per-token layer
 //! loop, the #397 Ship-6 lowered super-op pipeline, and GPU-logits entry points.
 
+use super::batch::PrefillBatchScratch;
+use super::config::LayerType;
+use super::config::MropeCtx;
+use super::config::Qwen35Config;
+use super::prefill::dump_hidden_localize;
+use super::prefill::routed_codebook_pair_batched_supported;
+use super::prefill::trace_finite_if_enabled;
+use super::prefill::PREFILL_MAX_BATCH;
+use super::weights::per_expert_tier_tables;
+use super::weights::DeltaNetState;
+use super::weights::ExpertWeights;
+use super::weights::LayerWeights;
+use super::weights::MoeFfnWeights;
+use super::weights::Qwen35Weights;
+use super::weights::StateQuant;
 use crate::speculative::HiddenStateRingBuffer;
 use hip_bridge::HipError;
 use hip_bridge::HipResult;
@@ -14,9 +29,8 @@ use hipfire_dispatch::families::gemv::GivensRef;
 use hipfire_dispatch::families::gemv::WeightRef;
 use hipfire_dispatch::families::kv_tier::KvTierInputs;
 use hipfire_dispatch::families::kv_tier::KvTierPlan;
-use hipfire_dispatch::pipeline::GemvInput;
-use hipfire_dispatch::pipeline::Step;
 use hipfire_dispatch::pipeline::execute_steps;
+use hipfire_dispatch::pipeline::superop;
 use hipfire_dispatch::pipeline::superop::ForwardBindings;
 use hipfire_dispatch::pipeline::superop::LayerProgram;
 use hipfire_dispatch::pipeline::superop::OpBinding;
@@ -24,36 +38,22 @@ use hipfire_dispatch::pipeline::superop::OpFlavor;
 use hipfire_dispatch::pipeline::superop::SuperOp;
 use hipfire_dispatch::pipeline::superop::SuperOpKind;
 use hipfire_dispatch::pipeline::superop::WeightSlot;
-use hipfire_dispatch::pipeline::superop;
+use hipfire_dispatch::pipeline::GemvInput;
+use hipfire_dispatch::pipeline::Step;
+use hipfire_dispatch::types::dtype_rotation_plan;
 use hipfire_dispatch::types::DispatchError;
 use hipfire_dispatch::types::RotationPlan;
-use hipfire_dispatch::types::dtype_rotation_plan;
-use hipfire_runtime::llama::EmbeddingFormat;
-use hipfire_runtime::llama::ParoRotation;
-use hipfire_runtime::llama::KvCacheExt;
-use hipfire_runtime::llama::WeightTensor;
-use hipfire_runtime::llama::fused_rmsnorm_rotate_for_mq;
 use hipfire_runtime::llama;
+use hipfire_runtime::llama::fused_rmsnorm_rotate_for_mq;
+use hipfire_runtime::llama::EmbeddingFormat;
+use hipfire_runtime::llama::KvCacheExt;
+use hipfire_runtime::llama::ParoRotation;
+use hipfire_runtime::llama::WeightTensor;
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::tp_shard::ShardConfig;
 use rdna_compute::DType;
 use rdna_compute::Gpu;
 use rdna_compute::GpuTensor;
-use super::batch::PrefillBatchScratch;
-use super::config::LayerType;
-use super::config::MropeCtx;
-use super::config::Qwen35Config;
-use super::prefill::PREFILL_MAX_BATCH;
-use super::prefill::dump_hidden_localize;
-use super::prefill::routed_codebook_pair_batched_supported;
-use super::prefill::trace_finite_if_enabled;
-use super::weights::DeltaNetState;
-use super::weights::ExpertWeights;
-use super::weights::LayerWeights;
-use super::weights::MoeFfnWeights;
-use super::weights::Qwen35Weights;
-use super::weights::StateQuant;
-use super::weights::per_expert_tier_tables;
 
 // ─── MoE FFN (decode, batch=1) ──────────────────────────────────────────
 
@@ -289,7 +289,10 @@ pub(crate) fn moe_ffn_has_mq3_experts_uniform(ffn: &MoeFfnWeights) -> bool {
 /// a hipGraph-captured prefill that has never been validated (both the kernel
 /// JIT and the `ensure_fp16_x` staging inside the grouped launchers happen on
 /// the first call, i.e. mid-capture). Correct-and-slow beats fast-and-corrupt.
-pub(crate) fn moe_ffn_has_unsupported_mq3_experts_uniform(ffn: &MoeFfnWeights, admit_codebook: bool) -> bool {
+pub(crate) fn moe_ffn_has_unsupported_mq3_experts_uniform(
+    ffn: &MoeFfnWeights,
+    admit_codebook: bool,
+) -> bool {
     unsupported_mq3_experts_uniform_from_dtypes(
         ffn.expert_dtype_tags.is_some(),
         ffn.experts
@@ -1704,7 +1707,9 @@ pub fn forward_scratch_mrope(
     mrope: Option<&MropeCtx>,
 ) -> HipResult<()> {
     let Some(mc) = mrope else {
-        return forward_scratch(gpu, weights, config, token, pos, kv_cache, dn_state, scratch);
+        return forward_scratch(
+            gpu, weights, config, token, pos, kv_cache, dn_state, scratch,
+        );
     };
     mark_mrope_forward_ineligible(gpu);
     // Embedding lookup into scratch.x + the 1D pos scalar (still consumed by

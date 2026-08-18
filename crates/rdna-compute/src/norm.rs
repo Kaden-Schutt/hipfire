@@ -1054,10 +1054,7 @@ impl Gpu {
             &ep as *const _ as *mut c_void,
             &fb as *const _ as *mut c_void,
         ];
-        let bytes = (n_heads * 256 * 3
-            + n_kv_heads * 256 * 2
-            + (n_heads + n_kv_heads) * 256)
-            * 4;
+        let bytes = (n_heads * 256 * 3 + n_kv_heads * 256 * 2 + (n_heads + n_kv_heads) * 256) * 4;
         let timer = crate::profile::begin_timer(&self.hip, "fused", kernel, bytes);
         let result = self.launch_maybe_blob(
             kernel,

@@ -964,17 +964,17 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             read(32),
             write(40),
         ]),
-        "qwen35_fa_prep_gfx1100"
-        | "qwen36_27b_fa_prep_gfx1100"
-        | "qwen35_fa_prep_gfx1151" => Some(vec![
-            read(0),
-            write(8),
-            write(16),
-            write(24),
-            read(32),
-            read(40),
-            read(48),
-        ]),
+        "qwen35_fa_prep_gfx1100" | "qwen36_27b_fa_prep_gfx1100" | "qwen35_fa_prep_gfx1151" => {
+            Some(vec![
+                read(0),
+                write(8),
+                write(16),
+                write(24),
+                read(32),
+                read(40),
+                read(48),
+            ])
+        }
         "kv_cache_write_q8_0_pair" => Some(vec![write(0), write(8), read(16), read(24), read(32)]),
         "mq_rotate_x" => Some(vec![read(0), write(8), read(16), read(24)]),
         "gemv_hfq4g256"
@@ -5256,7 +5256,6 @@ mod tests {
         assert_eq!(blob.len(), 48, "recorded launches are padded to 16 bytes");
         assert_eq!(expected_kernarg_bytes(kernel), Some(blob.len()));
     }
-    }
 
     #[test]
     fn gfx1151_radiowave_symbols_keep_resource_contracts() {
@@ -5751,7 +5750,10 @@ mod tests {
             Some(64)
         );
         assert!(pointer_effects("gated_norm_mq_rotate_k6144_gfx1100").is_some());
-        assert_eq!(expected_kernarg_bytes("qwen36_27b_fa_prep_gfx1100"), Some(64));
+        assert_eq!(
+            expected_kernarg_bytes("qwen36_27b_fa_prep_gfx1100"),
+            Some(64)
+        );
         assert!(pointer_effects("qwen36_27b_fa_prep_gfx1100").is_some());
         assert_eq!(
             expected_kernarg_bytes("conv1d_silu_split_qknorm_b256"),

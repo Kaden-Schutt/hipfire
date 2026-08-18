@@ -343,6 +343,32 @@ fn registry_resolve_falls_through_to_second_variant() {
 }
 
 #[test]
+fn gemm_q8_0_batched_wide_exact_resolves_on_wmma_only() {
+    use crate::families::gemm::GemmFamily;
+    let fam = GemmFamily::new();
+    let key = KernelKey::GemmQ8_0BatchedWideExact;
+    assert!(
+        fam.registry().all_keys().contains(&key),
+        "GemmQ8_0BatchedWideExact must be registered in gemm_table"
+    );
+    assert_eq!(
+        fam.registry().resolve(key, &ctx_rdna3(), None).unwrap().key,
+        key,
+        "HasWmma admits gfx1100"
+    );
+    assert_eq!(
+        fam.registry().resolve(key, &ctx_rdna4(), None).unwrap().key,
+        key,
+        "HasWmma admits gfx1200"
+    );
+    let err = fam.registry().resolve(key, &ctx_rdna1(), None).unwrap_err();
+    assert!(
+        matches!(err, DispatchError::MissingImpl { .. }),
+        "non-WMMA arch must reject GemmQ8_0BatchedWideExact, got {err:?}"
+    );
+}
+
+#[test]
 fn registry_resolve_shape_gate_passes_when_shape_matches() {
     let mut reg = KernelRegistry::new();
     reg.register(KernelVariant {
@@ -1825,4 +1851,3 @@ fn codebook_grouped_gemm_kernarg_contract_is_the_uniform_nine() {
         }
     }
 }
-

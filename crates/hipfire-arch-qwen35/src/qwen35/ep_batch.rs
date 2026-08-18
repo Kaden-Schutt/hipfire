@@ -5,29 +5,14 @@
 //! Qwen3.5 expert-parallel / multi-GPU: EP batch compatibility attestation,
 //! `Qwen35DecodeBatchEpState`, EP decode/prefill, and the pp>1 band forwards.
 
-use hip_bridge::HipError;
-use hip_bridge::HipResult;
-use hipfire_dispatch::context::DispatchCtx;
-use hipfire_dispatch::pipeline::GemvInput;
-use hipfire_dispatch::pipeline::Step;
-use hipfire_dispatch::pipeline::execute_steps;
-use hipfire_runtime::llama::EmbeddingFormat;
-use hipfire_runtime::llama::WeightTensor;
-use hipfire_runtime::llama::fused_rmsnorm_rotate_for_mq;
-use hipfire_runtime::llama::weight_gemv_prerotated;
-use hipfire_runtime::llama::weight_gemv_swiglu_residual;
-use hipfire_runtime::llama;
-use hipfire_runtime::multi_gpu::Gpus;
-use rdna_compute::DType;
-use rdna_compute::GpuTensor;
-use super::batch::BatchSemantics;
-use super::batch::PrefillBatchScratch;
-use super::batch::Qwen35DecodeBatchState;
 use super::batch::ep_tick_inputs_prepared;
 use super::batch::for_each_active_span;
 use super::batch::lane_bit;
 use super::batch::lm_head_batched;
 use super::batch::valid_lane_mask;
+use super::batch::BatchSemantics;
+use super::batch::PrefillBatchScratch;
+use super::batch::Qwen35DecodeBatchState;
 use super::config::LayerType;
 use super::config::Qwen35BatchCompatibility;
 use super::config::Qwen35BatchLoadConfig;
@@ -35,20 +20,21 @@ use super::config::Qwen35Config;
 use super::config::Qwen35EpBatchReceipt;
 use super::config::Qwen35EpReduce;
 use super::config::Qwen35EpTopology;
-use super::forward::Qwen35Bindings;
-use super::forward::Qwen35Scratch;
-use super::forward::Qwen35ScratchSet;
 use super::forward::ffn_all_mq4_for_moe;
 use super::forward::lower_variant;
 use super::forward::moe_ffn_decode_with_scratch;
 use super::forward::moe_ffn_decode_with_scratch_prerotated;
 use super::forward::variant_of;
-use super::prefill::PREFILL_MAX_BATCH;
-use super::prefill::PrefillBandCtx;
+use super::forward::Qwen35Bindings;
+use super::forward::Qwen35Scratch;
+use super::forward::Qwen35ScratchSet;
 use super::prefill::forward_batch_chunk_impl;
 use super::prefill::forward_prefill_chunk;
 use super::prefill::is_batchable_la;
 use super::prefill::qwen35_layer_batch_admissible;
+use super::prefill::PrefillBandCtx;
+use super::prefill::PREFILL_MAX_BATCH;
+use super::weights::mixed_expert_tag;
 use super::weights::DeltaNetState;
 use super::weights::GpuTensorDescriptor;
 use super::weights::LayerWeights;
@@ -58,7 +44,21 @@ use super::weights::Qwen35HfqSourceIdentity;
 use super::weights::Qwen35Weights;
 use super::weights::StateQuant;
 use super::weights::WeightTensorDescriptor;
-use super::weights::mixed_expert_tag;
+use hip_bridge::HipError;
+use hip_bridge::HipResult;
+use hipfire_dispatch::context::DispatchCtx;
+use hipfire_dispatch::pipeline::execute_steps;
+use hipfire_dispatch::pipeline::GemvInput;
+use hipfire_dispatch::pipeline::Step;
+use hipfire_runtime::llama;
+use hipfire_runtime::llama::fused_rmsnorm_rotate_for_mq;
+use hipfire_runtime::llama::weight_gemv_prerotated;
+use hipfire_runtime::llama::weight_gemv_swiglu_residual;
+use hipfire_runtime::llama::EmbeddingFormat;
+use hipfire_runtime::llama::WeightTensor;
+use hipfire_runtime::multi_gpu::Gpus;
+use rdna_compute::DType;
+use rdna_compute::GpuTensor;
 
 fn layer_moe_ffn(layer: &LayerWeights) -> Option<&MoeFfnWeights> {
     match layer {
@@ -4205,15 +4205,15 @@ pub fn forward_prefill_batch_multi(
 }
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::config::Qwen35BatchParallelism;
     use super::super::config::Qwen35EpBatchReceipt;
     use super::super::config::Qwen35EpReduce;
-    
+    use super::*;
+
     use super::super::batch::for_each_active_span;
     use super::super::batch::lane_bit;
-    use super::super::weights::mixed_expert_tag;
     use super::super::batch::valid_lane_mask;
+    use super::super::weights::mixed_expert_tag;
     use hip_bridge::HipError;
     use hip_bridge::HipResult;
     use rdna_compute::DType;

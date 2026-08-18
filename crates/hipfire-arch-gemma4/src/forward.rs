@@ -463,9 +463,7 @@ fn embedding_lookup_batched_to(
         EmbeddingFormat::HFQ4G128 => {
             gpu.embedding_lookup_hfq4g128_batched(table, dst, token_ids, batch, dim)
         }
-        EmbeddingFormat::Q8_0 => {
-            gpu.embedding_lookup_q8_batched(table, dst, token_ids, batch, dim)
-        }
+        EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8_batched(table, dst, token_ids, batch, dim),
         EmbeddingFormat::F32 | EmbeddingFormat::Q4K => return Ok(false),
     };
     result
@@ -1416,6 +1414,96 @@ fn proj_gemm_batched(
     }
 }
 
+/// Route a plain GEMM through `GemmFamily::run_key` (explicit catalog key).
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn run_plain_gemm_key(
+    gpu: &mut Gpu,
+    key: hipfire_dispatch::types::KernelKey,
+    w: &WeightTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    batch_size: usize,
+) -> Result<(), String> {
+    use hipfire_dispatch::context::DispatchCtx;
+    use hipfire_dispatch::families::gemm::GemmParams;
+    let ctx = DispatchCtx::new(gpu);
+    let wr = w.dispatch_ref();
+    let params = GemmParams {
+        w: &wr,
+        x,
+        y,
+        batch_size,
+    };
+    hipfire_runtime::llama::gemm_family()
+        .run_key(key, &ctx, gpu, &params)
+        .map_err(|e| format!("{e:?}"))
+}
+
+/// Route a 2-way fused gate+up (or Q/K) GEMM through `FusedQkvFamily`.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn run_fused_gate_up_key(
+    gpu: &mut Gpu,
+    key: hipfire_dispatch::types::KernelKey,
+    w_gate: &WeightTensor,
+    w_up: &WeightTensor,
+    x: &GpuTensor,
+    y_gate: &GpuTensor,
+    y_up: &GpuTensor,
+    batch_size: usize,
+) -> Result<(), String> {
+    use hipfire_dispatch::context::DispatchCtx;
+    use hipfire_dispatch::families::fused_qkv::FusedQkvParams;
+    let ctx = DispatchCtx::new(gpu);
+    let params = FusedQkvParams {
+        kind: key,
+        weights: &[&w_gate.buf, &w_up.buf],
+        x,
+        outputs: &[y_gate, y_up],
+        m: &[w_gate.m, w_up.m],
+        k: w_gate.k,
+        rot_scratch: &[],
+        batch_size: Some(batch_size),
+    };
+    hipfire_runtime::llama::fused_qkv_family()
+        .run(&ctx, gpu, &params)
+        .map_err(|e| format!("{e:?}"))
+}
+
+/// Route a 3-way fused QKV GEMM through `FusedQkvFamily`.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn run_fused_qkv_key(
+    gpu: &mut Gpu,
+    key: hipfire_dispatch::types::KernelKey,
+    wq: &WeightTensor,
+    wk: &WeightTensor,
+    wv: &WeightTensor,
+    x: &GpuTensor,
+    y_q: &GpuTensor,
+    y_k: &GpuTensor,
+    y_v: &GpuTensor,
+    batch_size: usize,
+) -> Result<(), String> {
+    use hipfire_dispatch::context::DispatchCtx;
+    use hipfire_dispatch::families::fused_qkv::FusedQkvParams;
+    let ctx = DispatchCtx::new(gpu);
+    let params = FusedQkvParams {
+        kind: key,
+        weights: &[&wq.buf, &wk.buf, &wv.buf],
+        x,
+        outputs: &[y_q, y_k, y_v],
+        m: &[wq.m, wk.m, wv.m],
+        k: wq.k,
+        rot_scratch: &[],
+        batch_size: Some(batch_size),
+    };
+    hipfire_runtime::llama::fused_qkv_family()
+        .run(&ctx, gpu, &params)
+        .map_err(|e| format!("{e:?}"))
+}
+
 fn supports_batched_projection_dtype(dtype: DType) -> bool {
     matches!(
         dtype,
@@ -2116,35 +2204,32 @@ fn batch_attn_block(
         && a.q_proj.k % 32 == 0;
     match (fuse_q8, a.v_proj) {
         (true, Some(vw)) if vw.gpu_dtype == DType::Q8_0 && vw.k == a.q_proj.k => {
-            gpu.gemm_qkv_q8_0_wmma(
-                &a.q_proj.buf,
-                &a.k_proj.buf,
-                &vw.buf,
+            run_fused_qkv_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::FusedQkvQ8_0,
+                a.q_proj,
+                a.k_proj,
+                vw,
                 nrm,
                 q,
                 k,
                 v,
-                a.q_proj.m,
-                a.k_proj.m,
-                vw.m,
-                a.q_proj.k,
                 b,
             )
-            .map_err(|e| format!("gemma4 batch fused qkv (q8): {e:?}"))?;
+            .map_err(|e| format!("gemma4 batch fused qkv (q8): {e}"))?;
         }
         (true, None) => {
-            gpu.gemm_gate_up_q8_0_wmma(
-                &a.q_proj.buf,
-                &a.k_proj.buf,
+            run_fused_gate_up_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::FusedGateUpQ8_0,
+                a.q_proj,
+                a.k_proj,
                 nrm,
                 q,
                 k,
-                a.q_proj.m,
-                a.k_proj.m,
-                a.q_proj.k,
                 b,
             )
-            .map_err(|e| format!("gemma4 batch fused qk (q8): {e:?}"))?;
+            .map_err(|e| format!("gemma4 batch fused qk (q8): {e}"))?;
             gpu.hip
                 .memcpy_dtod_at(&v.buf, 0, &k.buf, 0, b * kv_dim * 4)
                 .map_err(|e| format!("gemma4 batch attn k→v copy: {e:?}"))?;
@@ -2339,18 +2424,17 @@ fn batch_ffn_block(
         && tail.gate_proj.k == tail.up_proj.k
         && tail.gate_proj.k % 32 == 0
     {
-        gpu.gemm_gate_up_q8_0_wmma(
-            &tail.gate_proj.buf,
-            &tail.up_proj.buf,
+        run_fused_gate_up_key(
+            gpu,
+            hipfire_dispatch::types::KernelKey::FusedGateUpQ8_0,
+            tail.gate_proj,
+            tail.up_proj,
             nrm,
             gate_ffn,
             up_ffn,
-            tail.gate_proj.m,
-            tail.up_proj.m,
-            tail.gate_proj.k,
             b,
         )
-        .map_err(|e| format!("gemma4 batch fused gate+up (q8): {e:?}"))?;
+        .map_err(|e| format!("gemma4 batch fused gate+up (q8): {e}"))?;
     } else {
         proj_gemm_batched(gpu, tail.gate_proj, nrm, gate_ffn, ffn_rot, b, "gate_proj")?;
         proj_gemm_batched(gpu, tail.up_proj, nrm, up_ffn, ffn_rot, b, "up_proj")?;
@@ -2438,15 +2522,15 @@ fn apply_per_layer_input_branch_batched(
             ple_weights.projection.k,
         );
     if batch_input_gate {
-        gpu.gemm_q8_0_batched_wide_exact(
-            &ple_weights.input_gate.buf,
+        run_plain_gemm_key(
+            gpu,
+            hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedWideExact,
+            &ple_weights.input_gate,
             x,
             ple.gate,
-            ple_weights.input_gate.m,
-            ple_weights.input_gate.k,
             b,
         )
-        .map_err(|e| format!("gemma4 batch ple input_gate (q8 wide-exact): {e:?}"))?;
+        .map_err(|e| format!("gemma4 batch ple input_gate (q8 wide-exact): {e}"))?;
     } else {
         for row in 0..b {
             let x_row = x.sub_offset(row * dim, dim);
@@ -2482,15 +2566,15 @@ fn apply_per_layer_input_branch_batched(
         }
     }
     if batch_projection {
-        gpu.gemm_q8_0_batched_wide_exact(
-            &ple_weights.projection.buf,
+        run_plain_gemm_key(
+            gpu,
+            hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedWideExact,
+            &ple_weights.projection,
             ple.hidden,
             ple.out,
-            ple_weights.projection.m,
-            ple_weights.projection.k,
             b,
         )
-        .map_err(|e| format!("gemma4 batch ple projection (q8 wide-exact): {e:?}"))?;
+        .map_err(|e| format!("gemma4 batch ple projection (q8 wide-exact): {e}"))?;
     } else {
         for row in 0..b {
             let hidden_row = ple.hidden.sub_offset(row * ple_dim, ple_dim);

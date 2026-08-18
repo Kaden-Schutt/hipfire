@@ -6,9 +6,6 @@
 //! from `crates/hipfire-daemon/src/main.rs` (wave 5 / D3).
 //! See `lib.rs` for the layering rationale.
 
-use std::any::Any;
-use std::path::PathBuf;
-use std::sync::OnceLock;
 use hipfire_arch_cohere2moe as cohere2moe;
 use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_gemma4 as gemma4;
@@ -16,6 +13,9 @@ use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_minimax as minimax;
 use hipfire_arch_muse_glimmer as glimmer;
 use hipfire_arch_qwen2::qwen2;
+use std::any::Any;
+use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use hipfire_loader::{AsstTurnCache, LoadedModel};
 use hipfire_runtime::prompt_frame::ThinkMode;
@@ -28,19 +28,22 @@ use hipfire_engine::redline::*;
 use hipfire_engine::scheduler::*;
 use hipfire_engine::terminal::*;
 
+use crate::common::*;
 use hipfire_arch_qwen35::qwen35;
 use hipfire_arch_qwen35::speculative;
-use hipfire_runtime::spec::{accept_greedy_prefix, ClientEvent, FinishSummary, SpecTarget, Speculator, StopReason, EvictRetain};
+use hipfire_runtime::emit_text::{
+    ThinkOutputRouter, ThinkRouteEvent, ToolOutputRouter, ToolRouteError, ToolRouteEvent,
+};
 use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig};
-use hipfire_runtime::emit_text::{ThinkOutputRouter, ToolOutputRouter, ThinkRouteEvent, ToolRouteEvent, ToolRouteError};
-use crate::common::*;
+use hipfire_runtime::spec::{
+    accept_greedy_prefix, ClientEvent, EvictRetain, FinishSummary, SpecTarget, Speculator,
+    StopReason,
+};
 
 pub fn glimmer_turn_key(fp: u64, ordinal: usize) -> u64 {
     fp.wrapping_add((ordinal as u64).wrapping_mul(0x9E3779B97F4A7C15))
         .wrapping_mul(0x9E3779B97F4A7C15)
 }
-
-
 
 /// Post-parse generation / active-request errors.
 ///
@@ -64,18 +67,6 @@ pub fn emit_active_attempt_error(
         active_attempt_id(),
     );
 }
-
-
-
-
-
-
-
-
-
-
-
-
 
 /// Speculative wire terminal after `Deepseek4Emit::finish` + length known.
 /// Length always suppresses call release and cache; malformed is error XOR done.
@@ -121,8 +112,6 @@ pub fn ds4_spec_wire_terminal(
     }
 }
 
-
-
 /// Derive cache action from the speculative wire terminal + finish payload.
 /// Length/malformed never store; safe stop/tool_calls store when authorized.
 pub fn ds4_cache_action(
@@ -154,10 +143,6 @@ pub fn ds4_cache_action(
         }
     }
 }
-
-
-
-
 
 /// Full single-GPU DS4 AR abort reset while the decode `state` borrow is live
 /// (disjoint host fields on `m` + explicit `state`). Attests via device sync,
@@ -196,15 +181,6 @@ pub fn ds4_ar_client_abort(
     emit_spec_cancel_after_rollback(stdout, id, completion_tokens, &epilogue);
 }
 
-
-
-
-
-
-
-
-
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GlimmerSpecMode {
     Off,
@@ -240,7 +216,6 @@ pub fn glimmer_spec_admission(
     GlimmerSpecMode::Off
 }
 
-
 #[cfg(test)]
 mod deepseek4_reasoning_prefix_tests {
     use super::{
@@ -268,11 +243,6 @@ mod deepseek4_reasoning_prefix_tests {
         assert!(DEEPSEEK4_REASONING_MAX_PREFIX.ends_with("\n\n"));
     }
 }
-
-
-
-
-
 
 /// Typed daemon error envelope (Increment B / Task 13).
 ///
@@ -306,14 +276,6 @@ pub fn write_error_envelope(
     let _ = writeln!(stdout, "{}", envelope);
     let _ = stdout.flush();
 }
-
-
-
-
-
-
-
-
 
 /// deepseek4 MTP spec-decode through the unified `generate_spec` (Phase 4 T4c-2).
 ///
@@ -750,11 +712,9 @@ pub fn generate_deepseek4(
     };
     // The single-GPU ds4 bundle (config/weights/state/eos/pbs) lives in `Deepseek4Bundle`.
     // `pbs` is now inside the bundle so we downcast once and split fields disjointly.
-    let Some(b) = m
-        .state
-        .as_mut()
-        .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_deepseek4::Deepseek4Bundle>())
-    else {
+    let Some(b) = m.state.as_mut().and_then(|s| {
+        (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_deepseek4::Deepseek4Bundle>()
+    }) else {
         let _ = writeln!(
             stdout,
             r#"{{"type":"error","id":"{}","message":"deepseek4_config missing on arch_id=9 generate"}}"#,
@@ -772,7 +732,9 @@ pub fn generate_deepseek4(
         eos_tok,
         ..
     } = &mut *b;
-    let pbs = pbs.as_mut().expect("deepseek4_pbs missing on arch_id=9 generate");
+    let pbs = pbs
+        .as_mut()
+        .expect("deepseek4_pbs missing on arch_id=9 generate");
     let cfg = &*cfg;
     let weights = &*weights;
     let eos_tok = *eos_tok;
@@ -1540,11 +1502,9 @@ pub fn generate_deepseek4_heterogeneous(
         emit_error_with_id(stdout, id, "tokenizer not loaded");
         return;
     };
-    let eos_tok = match m
-        .state
-        .as_mut()
-        .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_loader::Deepseek4HeterogeneousBundle>())
-    {
+    let eos_tok = match m.state.as_mut().and_then(|s| {
+        (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_loader::Deepseek4HeterogeneousBundle>()
+    }) {
         Some(bundle) => bundle.eos_tok,
         _ => {
             emit_error_with_id(stdout, id, "deepseek4 heterogeneous state missing");
@@ -1582,11 +1542,10 @@ pub fn generate_deepseek4_heterogeneous(
     let total_t0 = Instant::now();
     let prefill_t0 = Instant::now();
     let (mut logits, prefill_ms) = {
-        let Some(bundle) = m
-            .state
-            .as_mut()
-            .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_loader::Deepseek4HeterogeneousBundle>())
-        else {
+        let Some(bundle) = m.state.as_mut().and_then(|s| {
+            (s.as_mut() as &mut dyn Any)
+                .downcast_mut::<hipfire_loader::Deepseek4HeterogeneousBundle>()
+        }) else {
             emit_error_with_id(stdout, id, "deepseek4 heterogeneous state missing");
             return;
         };
@@ -1683,11 +1642,10 @@ pub fn generate_deepseek4_heterogeneous(
         if generated >= max_tokens {
             break;
         }
-        let Some(bundle) = m
-            .state
-            .as_mut()
-            .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_loader::Deepseek4HeterogeneousBundle>())
-        else {
+        let Some(bundle) = m.state.as_mut().and_then(|s| {
+            (s.as_mut() as &mut dyn Any)
+                .downcast_mut::<hipfire_loader::Deepseek4HeterogeneousBundle>()
+        }) else {
             emit_error_with_id(stdout, id, "deepseek4 heterogeneous state disappeared");
             return;
         };
@@ -1764,11 +1722,10 @@ pub fn generate_deepseek4_heterogeneous(
     let decision = await_client_terminal_commit(stdout, id, &pending_done);
     let effects = ds4_client_commit_effects(decision, !wire_tool_calls.is_empty(), true);
     if !effects.emit_done {
-        let Some(bundle) = m
-            .state
-            .as_mut()
-            .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_loader::Deepseek4HeterogeneousBundle>())
-        else {
+        let Some(bundle) = m.state.as_mut().and_then(|s| {
+            (s.as_mut() as &mut dyn Any)
+                .downcast_mut::<hipfire_loader::Deepseek4HeterogeneousBundle>()
+        }) else {
             emit_error_with_id(
                 stdout,
                 id,
@@ -4007,11 +3964,9 @@ pub fn generate_muse_glimmer(
     // Contract: MuseGlimmerBundle(bundle) — see cross-agent contract.
     // If the loader has not yet published this variant, this match will fail
     // to compile, which is intentional (loud Err rather than silent drop).
-    let Some(bundle) = m
-        .state
-        .as_mut()
-        .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_loader::MuseGlimmerBundle>())
-    else {
+    let Some(bundle) = m.state.as_mut().and_then(|s| {
+        (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_loader::MuseGlimmerBundle>()
+    }) else {
         emit_error_with_id(
             stdout,
             id,
@@ -7271,11 +7226,9 @@ pub fn generate_qwen2(
             return;
         }
     };
-    let state_ref = match m
-        .state
-        .as_mut()
-        .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen2::Qwen2Bundle>())
-    {
+    let state_ref = match m.state.as_mut().and_then(|s| {
+        (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen2::Qwen2Bundle>()
+    }) {
         Some(b) => b,
         _ => {
             emit_active_attempt_error(

@@ -35,7 +35,9 @@ impl GemmFamily {
     pub fn new() -> Self {
         let mut registry = KernelRegistry::new();
         gemm_table::populate(&mut registry);
-        registry.validate().expect("gemm kernel table has empty entries");
+        registry
+            .validate()
+            .expect("gemm kernel table has empty entries");
         Self { registry }
     }
 
@@ -76,8 +78,10 @@ impl GemmFamily {
             DType::HFQ4G128 => KernelKey::GemmHfq4G128,
             _ => {
                 return Err(DispatchError::UnsupportedVariant {
-                    family: "gemm", variant: "plain",
-                    arch: "", quant: "",
+                    family: "gemm",
+                    variant: "plain",
+                    arch: "",
+                    quant: "",
                 })
             }
         };
@@ -143,10 +147,14 @@ impl GemmFamily {
 
         use KernelKey as K;
         match key {
-            K::GemmF32RegisterTiled => hip!(gpu.gemm_f32_register_tiled(w.buf, x, y, m, k, batch_size)),
+            K::GemmF32RegisterTiled => {
+                hip!(gpu.gemm_f32_register_tiled(w.buf, x, y, m, k, batch_size))
+            }
             K::GemmF16XF16Wmma => hip!(gpu.gemm_f16_x_f16_wmma(w.buf, x, y, m, k, batch_size)),
             K::GemmQ8_0Wmma => hip!(gpu.gemm_q8_0_wmma(w.buf, x, y, m, k, batch_size)),
-            K::GemmQ8_0BatchedChunked => hip!(gpu.gemm_q8_0_batched_chunked(w.buf, x, y, m, k, batch_size)),
+            K::GemmQ8_0BatchedChunked => {
+                hip!(gpu.gemm_q8_0_batched_chunked(w.buf, x, y, m, k, batch_size))
+            }
             K::GemmHfq4G256Wmma => hip!(gpu.gemm_hfq4g256_wmma(w.buf, x, y, m, k, batch_size)),
             K::GemmHfq4G256 => hip!(gpu.gemm_hfq4g256(w.buf, x, y, m, k, batch_size)),
             K::GemmHfq4G128 => hip!(gpu.gemm_hfq4g128(w.buf, x, y, m, k, batch_size)),
@@ -159,8 +167,12 @@ impl GemmFamily {
             K::GemmF16WmmaMb8 => hip!(gpu.gemm_f16_wmma_mb8(w.buf, x, y, m, k, batch_size)),
             K::GemmF32Batched => hip!(gpu.gemm_f32_batched(w.buf, x, y, m, k, batch_size)),
             K::GemmQ8_0WmmaX64 => hip!(gpu.gemm_q8_0_wmma_x64(w.buf, x, y, m, k, batch_size)),
-            K::GemmQ8_0ResidualWmma => hip!(gpu.gemm_q8_0_residual_wmma(w.buf, x, y, m, k, batch_size)),
-            K::GemmQ8_0ResidualWmmaGfx12 => hip!(gpu.gemm_q8_0_residual_wmma_gfx12(w.buf, x, y, m, k, batch_size)),
+            K::GemmQ8_0ResidualWmma => {
+                hip!(gpu.gemm_q8_0_residual_wmma(w.buf, x, y, m, k, batch_size))
+            }
+            K::GemmQ8_0ResidualWmmaGfx12 => {
+                hip!(gpu.gemm_q8_0_residual_wmma_gfx12(w.buf, x, y, m, k, batch_size))
+            }
             K::GemmHfq4G256Dp4a => hip!(gpu.gemm_hfq4g256_dp4a(w.buf, x, y, m, k, batch_size)),
             K::GemmHfq4G256MmqSet => hip!(gpu.gemm_hfq4g256_mmq_set(w.buf, x, y, m, k, batch_size)),
             // #397 Ship 5.2 FINAL: residual-fused GEMM catalog. Each arm computes
@@ -169,8 +181,12 @@ impl GemmFamily {
             // operand order `(w.buf, x, y, m, k, batch_size)` is byte-identical to
             // the prior direct `gpu.gemm_*_residual(&w.buf, x, y, m, k, n)` call,
             // so each kernel's internal arch routing is preserved exactly.
-            K::GemmHfq6G256Residual => hip!(gpu.gemm_hfq6g256_residual(w.buf, x, y, m, k, batch_size)),
-            K::GemmHfq4G256Residual => hip!(gpu.gemm_hfq4g256_residual(w.buf, x, y, m, k, batch_size)),
+            K::GemmHfq6G256Residual => {
+                hip!(gpu.gemm_hfq6g256_residual(w.buf, x, y, m, k, batch_size))
+            }
+            K::GemmHfq4G256Residual => {
+                hip!(gpu.gemm_hfq4g256_residual(w.buf, x, y, m, k, batch_size))
+            }
             // HFQ3 residual mirrors the qwen35 call site's WMMA-vs-base arch split
             // (`if arch_has_wmma { _wmma } else { base }`); has_wmma() includes
             // gfx12, and the _wmma method routes the gfx12 sibling internally.
@@ -183,8 +199,12 @@ impl GemmFamily {
             }
             // HFP4 / MQ3-Lloyd residual are WMMA-only dispatcher entries; each
             // routes its own gfx12-vs-gfx11 WMMA sibling internally.
-            K::GemmHfp4G32Residual => hip!(gpu.gemm_hfp4g32_residual(w.buf, x, y, m, k, batch_size)),
-            K::GemmMq3G256LloydResidual => hip!(gpu.gemm_mq3g256_lloyd_residual_wmma(w.buf, x, y, m, k, batch_size)),
+            K::GemmHfp4G32Residual => {
+                hip!(gpu.gemm_hfp4g32_residual(w.buf, x, y, m, k, batch_size))
+            }
+            K::GemmMq3G256LloydResidual => {
+                hip!(gpu.gemm_mq3g256_lloyd_residual_wmma(w.buf, x, y, m, k, batch_size))
+            }
             // #397 Ship 5.3: spec-decode (DFlash) batched lm_head catalog. Each
             // arm maps the explicit key to the exact rdna-compute method the prior
             // direct spec-decode call used. The operand order
@@ -192,9 +212,18 @@ impl GemmFamily {
             // keeps its own internal arch routing (WMMA for batch>1 on gfx11/12,
             // dp4a on gfx906, fp16/scalar fallback) so output is preserved exactly.
             K::GemmQ8_0Batched => hip!(gpu.gemm_q8_0_batched(w.buf, x, y, m, k, batch_size)),
-            K::GemmHfq4G256BatchedLmhead => hip!(gpu.gemm_hfq4g256_batched_lmhead(w.buf, x, y, m, k, batch_size)),
-            K::GemmHfq3G256BatchedLmhead => hip!(gpu.gemm_hfq3g256_batched_lmhead(w.buf, x, y, m, k, batch_size)),
-            K::GemmHfq6G256BatchedLmhead => hip!(gpu.gemm_hfq6g256_batched_lmhead(w.buf, x, y, m, k, batch_size)),
+            K::GemmHfq4G256BatchedLmhead => {
+                hip!(gpu.gemm_hfq4g256_batched_lmhead(w.buf, x, y, m, k, batch_size))
+            }
+            K::GemmHfq3G256BatchedLmhead => {
+                hip!(gpu.gemm_hfq3g256_batched_lmhead(w.buf, x, y, m, k, batch_size))
+            }
+            K::GemmHfq6G256BatchedLmhead => {
+                hip!(gpu.gemm_hfq6g256_batched_lmhead(w.buf, x, y, m, k, batch_size))
+            }
+            K::GemmQ8_0BatchedWideExact => {
+                hip!(gpu.gemm_q8_0_batched_wide_exact(w.buf, x, y, m, k, batch_size))
+            }
             other => Err(DispatchError::MissingImpl { key: other }),
         }
     }
