@@ -189,6 +189,26 @@ while read -r _k _v; do
   case "$_k" in [a-z]*) p "$_k" "$_v" ;; esac
 done < <(python3 scripts/check-arch-dispatch.py 2>/dev/null | grep -E '^[a-z_]+[[:space:]]+[0-9]+$')
 
+# --- quant-type registry parity ----------------------------------------------
+# The wire qt space is declared in hipfire-quantize::QuantType and consumed via
+# hipfire-runtime::RAW_CODECS, with rdna-compute::DType as the execution twin.
+# Nothing binds them, and every consumer arm is fail-open (`_ => None/Err`), so a
+# half-registered format compiles green -- cf. cf061b7ed, where the encoder,
+# GEMV and is_mq arms all landed and the model simply would not load.
+while read -r _k _v; do
+  case "$_k" in [a-z]*) p "$_k" "$_v" ;; esac
+done < <(python3 scripts/check-quant-registry.py 2>/dev/null | grep -E '^[a-z_]+[[:space:]]+[0-9]+$')
+
+# --- dispatch-bypass debt ledger ---------------------------------------------
+# 222 arch-crate call sites reach Gpu::gemv_*/gemm_*/fused_* directly instead of
+# resolving through hipfire_dispatch::KernelRegistry, which has existed since
+# e822b319e. This is a debt TABLE, not a purity check: the rows record what is
+# owed per crate, growth fails, and paying down is a one-line edit. The holster
+# objective draws this ledger to zero over many commits, not one.
+while read -r _k _v; do
+  case "$_k" in [a-z]*) p "$_k" "$_v" ;; esac
+done < <(python3 scripts/check-dispatch-bypass.py 2>/dev/null | grep -E '^[a-z_]+[[:space:]]+[0-9]+$')
+
 # --- assertion -------------------------------------------------------------
 # The point of the file. A metric named in scripts/leanup-thresholds.txt must
 # satisfy its threshold or this exits non-zero.
