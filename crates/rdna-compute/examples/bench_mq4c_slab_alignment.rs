@@ -28,7 +28,7 @@ use rdna_compute::{DType, Gpu};
 
 const GROUP: usize = 256;
 const V1_BYTES: usize = 136;
-const MQ4C_BYTES: usize = 132;
+const MQ4C_BYTES: usize = 136;
 
 const WARMUP: usize = 64;
 const ITERS: usize = 200;
@@ -46,7 +46,6 @@ const MQ4C_BT_SRC: &str = include_str!("../../../kernels/src/gemm_mq4cg256_resid
 // the 136 B stride and gained prefill; qt=45 changed it to 132 and lost. This arm
 // tells us which variable owns the delta. NOT a shipping candidate: the 4 B pad
 // gives back the entire 2.43% size win.
-const MQ4CPAD_BT_SRC: &str = include_str!("../../../kernels/src/gemm_mq4cpad_residual_wmma_gfx12_bt.hip");
 // Arm D: planar split. Payload plane at 128 B stride (perfectly 16 B aligned,
 // better than v1's 136) followed by a contiguous 4 B/group header plane.
 // Still 132 B/group total, so unlike arm C the 2.43% size win SURVIVES.
@@ -142,7 +141,9 @@ fn pack_both(w: &[f32], m: usize, k: usize) -> (Vec<u8>, Vec<u8>) {
             for i in 0..128 {
                 let byte = (q[2 * i] & 0xF) | ((q[2 * i + 1] & 0xF) << 4);
                 b1[d1 + 8 + i] = byte;
-                bc[dc + 4 + i] = byte;
+                // qt=45 pad: payload at +8, exactly where v1 puts it. Bytes
+                // [dc+4, dc+8) stay zero -- that padding is the whole point.
+                bc[dc + 8 + i] = byte;
             }
         }
     }
@@ -170,7 +171,7 @@ fn host_gemm(
                     let hdr = u32::from_le_bytes(blob[off..off + 4].try_into().unwrap());
                     let sc = f16_to_f32((hdr & 0xFFFF) as u16);
                     let zp = f16_to_f32((hdr >> 16) as u16);
-                    (sc, zp, off + 4)
+                    (sc, zp, off + 8)
                 } else {
                     let sc = f32::from_le_bytes(blob[off..off + 4].try_into().unwrap());
                     let zp = f32::from_le_bytes(blob[off + 4..off + 8].try_into().unwrap());
@@ -229,19 +230,7 @@ fn main() {
         let u2 = prng(i, 0x9ABC_DEF0);
         (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos() * 0.011
     }).collect();
-    let (b_v1, b_mq4c_il) = pack_both(&w, M, K);
-    // qt=45 is PLANAR as of the conversion; the shipped arm must be packed that way.
-    // The interleaved form survives only as the source for arm C's 136 B relayout.
-    let b_mq4c: Vec<u8> = {
-        let mut v = vec![0u8; M * gpr * MQ4C_BYTES];
-        let hbase = M * gpr * 128;
-        for g in 0..(M * gpr) {
-            let src = &b_mq4c_il[g * MQ4C_BYTES..(g + 1) * MQ4C_BYTES];
-            v[g * 128..(g + 1) * 128].copy_from_slice(&src[4..MQ4C_BYTES]);
-            v[hbase + g * 4..hbase + g * 4 + 4].copy_from_slice(&src[0..4]);
-        }
-        v
-    };
+    let (b_v1, b_mq4c) = pack_both(&w, M, K);
     // X for max batch, shared across batches (prefix used)
     let max_batch = *BATCHES.iter().max().unwrap();
     let x_all_f32: Vec<f32> = (0..max_batch * K).map(|i| prng(i, 0xC0FF_EE) * 2.0 - 1.0).collect();
@@ -260,36 +249,12 @@ fn main() {
             Ok(()) => eprintln!("compiled {sym_mq}"),
             Err(e) => eprintln!("compile {sym_mq} failed: {e}"),
         }
-        let sym_pad = format!("gemm_mq4cpad_residual_wmma_gfx12_bt{bv}");
-        let mod_pad = format!("bench_mq4cpad_bt{bv}");
-        match gpu.ensure_kernel_public(&mod_pad, MQ4CPAD_BT_SRC, &sym_pad) {
-            Ok(()) => eprintln!("compiled {sym_pad}"),
-            Err(e) => eprintln!("compile {sym_pad} failed: {e}"),
-        }
     }
     // also ensure bt4 present as sanity (not benched unless BVS includes 4)
     // quick check that at least one bt compiled
     // upload weights once
     let d_v1 = gpu.upload_raw(&b_v1, &[b_v1.len()]).unwrap();
     let d_mq4c = gpu.upload_raw(&b_mq4c, &[b_mq4c.len()]).unwrap();
-    // arm C buffer: mq4c's 4 B fp16 header laid out at EXACTLY v1's geometry --
-    // header at +0, 4 B pad at +4, 128 B payload at +8, 136 B stride. This makes
-    // the payload address sequence identical to v1's (136g+8), isolating header
-    // SEMANTICS (one fp16 pair vs two f32) from payload ALIGNMENT.
-    // Note: an earlier version of this arm left the payload at +4 and only changed
-    // the stride. That is NOT an isolation -- 136g+4 keeps mq4c's 4-mod-8 payload
-    // alignment, so it varied two things at once and answered nothing.
-    let b_pad: Vec<u8> = {
-        let mut v = vec![0u8; M * gpr * V1_BYTES];
-        for g in 0..(M * gpr) {
-            let src = &b_mq4c_il[g * MQ4C_BYTES..(g + 1) * MQ4C_BYTES];
-            let dst = g * V1_BYTES;
-            v[dst..dst + 4].copy_from_slice(&src[0..4]);
-            v[dst + 8..dst + V1_BYTES].copy_from_slice(&src[4..MQ4C_BYTES]);
-        }
-        v
-    };
-    let d_pad = gpu.upload_raw(&b_pad, &[b_pad.len()]).unwrap();
 
     // correctness gate first, then timing
     println!("\ncorrectness gate: M={M} K={K} gpr={gpr} batches {:?}  BVs {:?}", BATCHES, BVS);
@@ -308,7 +273,7 @@ fn main() {
         };
         let d_x = gpu.upload_raw(&x_f16_bytes, &[x_f16_bytes.len()]).unwrap();
         let y_host_v1 = host_gemm(&b_v1, M, K, batch, x_f32, false);
-        let y_host_mq = host_gemm(&b_mq4c_il, M, K, batch, x_f32, true);
+        let y_host_mq = host_gemm(&b_mq4c, M, K, batch, x_f32, true);
 
         for &bv in BVS {
             // arm C shares arm B's host reference on purpose: identical header
@@ -317,15 +282,13 @@ fn main() {
             for (label, kind, host_ref) in [
                 (format!("v1_bt{bv}"), 0u8, &y_host_v1),
                 (format!("mq4c_bt{bv}"), 1u8, &y_host_mq),
-                (format!("mq4cpad_bt{bv}"), 2u8, &y_host_mq),
             ] {
                 let sym = match kind {
                     0 => format!("gemm_hfq4g256_residual_wmma_gfx12_bt{bv}"),
-                    1 => format!("gemm_mq4cg256_residual_wmma_gfx12_bt{bv}"),
-                    _ => format!("gemm_mq4cpad_residual_wmma_gfx12_bt{bv}"),
+                    _ => format!("gemm_mq4cg256_residual_wmma_gfx12_bt{bv}"),
                 };
                 let d_y = gpu.zeros(&[batch*M], DType::F32).unwrap();
-                let a_ptr = match kind { 0 => &d_v1, 1 => &d_mq4c, _ => &d_pad };
+                let a_ptr = match kind { 0 => &d_v1, _ => &d_mq4c };
                 let grid = [ ((M+15)/16) as u32, ((batch + 16*bv -1)/(16*bv)) as u32, 1];
                 let block = [32u32,1,1];
                 let mut kb = KernargBlob::new();
@@ -387,12 +350,11 @@ fn main() {
         for &bv in BVS {
             arms.push(Arm{ label: format!("v1_bt{bv}"), sym: format!("gemm_hfq4g256_residual_wmma_gfx12_bt{bv}"), kind: 0, bv, samples: Vec::new() });
             arms.push(Arm{ label: format!("mq4c_bt{bv}"), sym: format!("gemm_mq4cg256_residual_wmma_gfx12_bt{bv}"), kind: 1, bv, samples: Vec::new() });
-            arms.push(Arm{ label: format!("mq4cpad_bt{bv}"), sym: format!("gemm_mq4cpad_residual_wmma_gfx12_bt{bv}"), kind: 2, bv, samples: Vec::new() });
         }
         // warmups
         for arm in &arms {
             let d_y = gpu.zeros(&[batch*M], DType::F32).unwrap();
-            let a_ptr = match arm.kind { 0 => &d_v1, 1 => &d_mq4c, _ => &d_pad };
+            let a_ptr = match arm.kind { 0 => &d_v1, _ => &d_mq4c };
             let grid = [ ((M+15)/16) as u32, ((batch + 16*arm.bv -1)/(16*arm.bv)) as u32, 1];
             let block = [32u32,1,1];
             for _ in 0..WARMUP {
@@ -411,7 +373,7 @@ fn main() {
         for _run in 0..RUNS {
             for arm in &mut arms {
                 let d_y = gpu.zeros(&[batch*M], DType::F32).unwrap();
-                let a_ptr = match arm.kind { 0 => &d_v1, 1 => &d_mq4c, _ => &d_pad };
+                let a_ptr = match arm.kind { 0 => &d_v1, _ => &d_mq4c };
                 let grid = [ ((M+15)/16) as u32, ((batch + 16*arm.bv -1)/(16*arm.bv)) as u32, 1];
                 let block = [32u32,1,1];
                 // pre-sync to flush
@@ -468,7 +430,7 @@ fn main() {
         // per-batch summary sentence
         for &bv in BVS {
             let v1 = arms.iter().find(|a| a.kind==0 && a.bv==bv).unwrap();
-            for (kind, name) in [(1u8, "mq4c(planar)"), (2u8, "mq4cpad     ")] {
+            for (kind, name) in [(1u8, "mq4c(pad)")] {
                 let Some(mq) = arms.iter().find(|a| a.kind==kind && a.bv==bv) else { continue };
                 if mq.samples.is_empty() { continue; }
                 let r = minv(&mq.samples)/minv(&v1.samples);
@@ -478,7 +440,7 @@ fn main() {
             }
         }
     }
-    println!("\narm C (mq4cpad) = mq4c's 4 B fp16 header at v1's 136 B stride, 4 B pad.");
-    println!("If C ~= v1 while B is slower, the 132 B GEOMETRY owns the gap, not the fp16 header.");
-    println!("If C is also slower, the header/decode path owns it and the stride is innocent.");
+    println!("\nqt=45 is the pad layout: fp16 header at +0, 4 B zero pad, 128 B payload at +8 —");
+    println!("byte-for-byte v1 geometry, same file size. This bench isolates the residual GEMM only;");
+    println!("a win here has repeatedly NOT survived to model scale, so confirm with hipfire bench.");
 }

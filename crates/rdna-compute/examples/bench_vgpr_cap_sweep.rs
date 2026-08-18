@@ -52,7 +52,6 @@ const V15_RESIDUAL: &str = include_str!("../../../kernels/src/gemv_mq4cg256_resi
 // fp16 header at v1's 136 B geometry (header +0, pad +4, payload +8). This is the
 // "upgrade hfq4g256 in place" candidate: same size, same nibbles, header rewritten
 // f32 -> fp16. No requantization, no repack of the payload.
-const V15PAD_RESIDUAL: &str = include_str!("../../../kernels/src/gemv_mq4cpad_residual.hip");
 // Planar: 128 B payload plane + contiguous 4 B/group header plane = 132 B/group.
 // Keeps mq4c's size AND gets 16 B-aligned payloads.
 
@@ -87,7 +86,7 @@ use std::time::Instant;
 
 const GROUP: usize = 256;
 const V1_BYTES: usize = 136;
-const V15_BYTES: usize = 132;
+const V15_BYTES: usize = 136;
 
 /// Caps to sweep. 0 = no attribute at all (the 97-VGPR / occ-12 baseline).
 const CAPS: &[u32] = &[0, 96, 84, 80, 76, 72, 64];
@@ -153,23 +152,12 @@ fn main() {
     let gpr = k / GROUP;
 
     let b_v1 = blob(m, k, V1_BYTES, false, 8);
-    // qt=45 is PLANAR now: payload plane at 128 B stride, then the 4 B/group header plane.
-    let b_v15: Vec<u8> = {
-        let il = blob(m, k, V15_BYTES, true, 4);
-        let n = m * gpr; let hbase = n * 128;
-        let mut v = vec![0u8; n * V15_BYTES];
-        for g in 0..n {
-            v[g*128..(g+1)*128].copy_from_slice(&il[g*V15_BYTES+4..(g+1)*V15_BYTES]);
-            v[hbase+g*4..hbase+g*4+4].copy_from_slice(&il[g*V15_BYTES..g*V15_BYTES+4]);
-        }
-        v
-    };
-    let b_v15pad = blob(m, k, V1_BYTES, true, 8);
+    // qt=45 pad: header dword at +0, 4 B zero pad, 128 B payload at +8.
+    let b_v15 = blob(m, k, V15_BYTES, true, 8);
     let x: Vec<f32> = (0..k).map(|i| prng(i, 0xC0FF_EE) * 2.0 - 1.0).collect();
 
     let d_v1 = gpu.upload_raw(&b_v1, &[b_v1.len()]).unwrap();
     let d_v15 = gpu.upload_raw(&b_v15, &[b_v15.len()]).unwrap();
-    let d_v15pad = gpu.upload_raw(&b_v15pad, &[b_v15pad.len()]).unwrap();
     let d_x = gpu.upload_f32(&x, &[k]).unwrap();
     let d_y = gpu.zeros(&[m], DType::F32).unwrap();
 
@@ -222,17 +210,6 @@ fn main() {
             Err(e) => eprintln!("cap {cap} failed to compile: {e}"),
         }
     }
-    let padsym = "bench_v15pad".to_string();
-    {
-        let src = format!(
-            "#define HIPFIRE_MQ4CPAD_RESIDUAL_KERNEL {padsym}\n{}",
-            format!("{CACHE_POLICY}{V15PAD_RESIDUAL}")
-        );
-        match gpu.ensure_kernel_public(&format!("bench_{padsym}"), &src, &padsym) {
-            Ok(()) => {}
-            Err(e) => eprintln!("v15pad failed to compile: {e}"),
-        }
-    }
     if v15_syms.is_empty() {
         eprintln!("no v1.5 arm compiled; nothing to measure");
         return;
@@ -260,11 +237,10 @@ fn main() {
         .iter()
         .map(|n| (n.clone(), 0u8))
         .chain(v15_syms.iter().map(|(_, s)| (s.clone(), 1u8)))
-        .chain(std::iter::once((padsym.clone(), 2u8)))
         .collect();
 
     for (sym, kind) in &all {
-        let a = match kind { 0 => &d_v1, 1 => &d_v15, _ => &d_v15pad };
+        let a = match kind { 0 => &d_v1, _ => &d_v15 };
         for _ in 0..WARMUP {
             launch(&gpu, sym, a);
         }
@@ -275,7 +251,7 @@ fn main() {
 
     for _run in 0..RUNS {
         for (idx, (sym, kind)) in all.iter().enumerate() {
-            let a = match kind { 0 => &d_v1, 1 => &d_v15, _ => &d_v15pad };
+            let a = match kind { 0 => &d_v1, _ => &d_v15 };
             for _ in 0..8 {
                 launch(&gpu, sym, a);
             }
