@@ -136,10 +136,26 @@ extern "C" __global__ void HIPFIRE_MQ4C_RESIDUAL_KERNEL(
     #define HIPFIRE_MQ4C_LOAD_HDR(weight_rsrc, gp, weight_offset) HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc, gp, weight_offset)
     #endif
 
+    // Unpack the packed fp16 header through a NATIVE 2-lane _Float16 vector, not
+    // via mask/shift into two ushorts. Both compute the same values; the vector
+    // form is what keeps the kernel under the occupancy cliff.
+    //
+    // Measured on gfx1201: mask/shift costs 97 VGPR -> 12 waves/SIMD, because the
+    // raw header dword stays live while both halves are extracted and there are 8
+    // headers in flight (4 groups x 2 rows). The vector form is 94 VGPR -> 16
+    // waves, matching v1's 93/16. Decode is bandwidth-bound near peak, where
+    // bytes-in-flight = waves x outstanding-loads-per-wave, so losing 4 of 16
+    // waves cost real throughput that the cheaper header could not offset --
+    // v1 and this format move IDENTICAL bytes (136 B/group, same load mix).
+    //
+    // __half22float2 and a plain per-half __builtin_bit_cast both still measure
+    // 97/12; only the native vector type gets the allocator under 96. Do not
+    // "simplify" this back to mask/shift.
     #define LOAD_W(gp, weight_offset, sc, zp, pk) do { \
         const unsigned int hdr__ = HIPFIRE_MQ4C_LOAD_HDR(weight_rsrc, gp, weight_offset); \
-        (sc) = __half2float(__ushort_as_half((unsigned short)(hdr__ & 0xFFFFu))); \
-        (zp) = __half2float(__ushort_as_half((unsigned short)(hdr__ >> 16))); \
+        { typedef _Float16 hipfire_h2v __attribute__((ext_vector_type(2))); \
+          const hipfire_h2v hv__ = __builtin_bit_cast(hipfire_h2v, hdr__); \
+          (sc) = (float)hv__[0]; (zp) = (float)hv__[1]; } \
         (pk) = HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc, (gp) + 8 + boff, (weight_offset) + 8 + boff); \
     } while (0)
 
