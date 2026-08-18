@@ -98,3 +98,46 @@ infrastructure shared between an arm and its control must stay shared.
 
 Both were caught by a loud failure rather than a silent one, which is the only
 reason each cost one cycle instead of a debugging session.
+
+## 6 · CORRECTION (same day): the occupancy explanation is falsified
+
+An earlier draft of this file attributed the decode penalty to an occupancy
+cliff — the qt=45 decode GEMV at 97 VGPR / 12 waves against v1's 93 / 16, with
+decode being bandwidth-bound so a 4-of-16 wave loss should cost real
+memory-level parallelism. That mechanism was tested and is **wrong**.
+
+Unpacking the header through a native `ext_vector_type(2)` of `_Float16`
+instead of mask/shift removes the integer temp and brings the kernel to
+**94 VGPR / 16 waves, zero spills** — v1's occupancy exactly. Model scale, v1
+bracketed:
+
+|build|VGPR/waves|isolated bench|model decode|model prefill|
+|---|---|---|---|---|
+|v1|93 / 16|15.0-15.6 us|34.65|403-407|
+|qt=45 mask/shift|97 / 12|**14.5 us**|33.90|415.4|
+|qt=45 packed-half|94 / 16|16.0 us|**34.00**|415.9|
+
+Restoring occupancy moved model decode **33.90 -> 34.00**: one 0.1 tok/s
+reporting quantum against a 0.75 tok/s deficit. The cliff explains essentially
+none of the gap.
+
+Two things follow.
+
+**The real cause is inherent unpack ALU.** v1 loads two dwords that ARE the
+scale and zero; qt=45 loads one dword and must take it apart. Prefill is
+latency-bound at ~1/5 of peak bandwidth and profits from the cheaper load;
+decode is bandwidth-bound near peak and simply pays the extra ALU. No register
+trick recovers it, because nothing about the register allocation is the problem.
+
+**Third consecutive inversion from the isolated decode microbench, and the
+sharpest.** It called the packed-half change a 10% REGRESSION (14.5 -> 16.0 us,
+slower than v1) while model scale measured +0.3%. It also reproduces this
+campaign's earlier "the occupancy-12 build is the fastest" result exactly — a
+finding that is now shown to be an artifact of measuring one kernel in
+isolation. Two separate conclusions in this repo rested on that microbench and
+both were wrong at model scale.
+
+The packed-half unpack is KEPT: at model scale it is neutral-to-marginally
+better, it is correct (oracle 6.966e-8), spill-free, and 16 waves is the more
+robust operating point under concurrency. It is simply not a fix for the decode
+deficit, and the deficit appears not to be fixable.
