@@ -30,13 +30,15 @@ use rdna_compute::replay::{ReplayCaptureSummary, ReplayController, ReplayState};
 use rdna_compute::{Gpu, GpuTensor};
 
 /// Owned deepseek4 model state — the future `ModelState::Deepseek4` payload and
-/// the spec-decode target. Bundles config + weights + recurrent state + eos so
-/// the daemon can borrow it as `&mut dyn SpecTarget`.
+/// the spec-decode target. Bundles config + weights + recurrent state + eos + prefill scratch
+/// so the daemon can borrow it as `&mut dyn SpecTarget`. `pbs` lives here rather than on
+/// `LoadedModel` so `LoadedModel` can move into `hipfire-runtime` without arch dependencies.
 pub struct Deepseek4Bundle {
     pub config: DeepseekV4Config,
     pub weights: DeepseekV4Weights,
     pub state: DeepseekV4State,
     pub eos_tok: u32,
+    pub pbs: Option<PrefillBatchScratch>,
 }
 
 /// Thin verify scratch for the DSpark `DsparkDrafter` path. DeepSeek V4's SWA

@@ -403,8 +403,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--daemon",
-        default=str(REPO / "target/release/examples/daemon"),
-        help="Daemon binary path (default: target/release/examples/daemon)",
+        default=str(REPO / "target/release/daemon"),
+        help="Daemon binary path (default: target/release/daemon)",
     )
     p.add_argument(
         "--cli",

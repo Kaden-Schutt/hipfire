@@ -46,7 +46,7 @@ KV_MODE="${HIPFIRE_KV_MODE:-asym3}"
 OUT="${HIPFIRE_A_OUT:-/tmp/hipfire-ab-$(date +%Y%m%d-%H%M%S)}"
 MODELS_DIR="${HIPFIRE_MODELS_DIR:-${HIPFIRE_DIR:-$HOME/.hipfire}/models}"
 BENCH_EXE="target/release/examples/bench_qwen35_mq4"
-DAEMON_EXE="target/release/examples/daemon"
+DAEMON_EXE="target/release/daemon"
 GRAPH="${HIPFIRE_GRAPH:-0}"
 
 # GPU selection
@@ -162,10 +162,8 @@ build_ref() {
         return 1
     }
 
-    cargo build --release --features deltanet \
-        --example bench_qwen35_mq4 \
-        --example daemon \
-        -p hipfire-runtime 2>&1 | tail -3
+    cargo build --release -p hipfire-daemon 2>&1 | tail -3
+    cargo build --release --features deltanet --example bench_qwen35_mq4 -p hipfire-runtime 2>&1 | tail -3
 
     if [ ! -x "$BENCH_EXE" ] || [ ! -x "$DAEMON_EXE" ]; then
         echo "[build] FAIL: binaries not found after build" >&2

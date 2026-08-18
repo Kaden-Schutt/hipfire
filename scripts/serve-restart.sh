@@ -9,7 +9,7 @@ while [ $# -gt 0 ]; do case "$1" in
   *) PORT="$1"; shift;; esac; done
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 echo "[serve-restart] killing serve/daemon, freeing :$PORT"
-for pat in "hipfire serve" "examples/daemon"; do
+for pat in "hipfire serve" "target/release/daemon"; do
   for p in $(pgrep -f "$pat"); do kill -9 "$p" 2>/dev/null; done; done
 fuser -k "$PORT/tcp" 2>/dev/null
 rm -f ~/.hipfire/daemon.pid ~/.hipfire/serve.pid

@@ -94,9 +94,9 @@ benchmarks/quality-baselines/
 
 The producer / candidate-side binaries are Rust examples in
 `crates/hipfire-runtime/examples/` — `build_kld_ref.rs`,
-`eval_hipfire.rs`, `eval_gguf.rs`, `tokenize_slice.rs`. The harness
-reaches into them via plain `cargo run --release --example <name>`
-invocations; nothing in this directory needs to know their paths.
+`eval_hipfire.rs`, `eval_gguf.rs` — and `crates/saddle-lab/examples/`
+— `tokenize_slice.rs` (CPU-only helper). The harness reaches into them via
+plain `cargo run --release -p <crate> --example <name>` invocations.
 
 ## Workflow (overview)
 

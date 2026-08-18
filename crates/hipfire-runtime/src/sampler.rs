@@ -12,7 +12,7 @@
 //! Sampling primitives (top-p kernel call, repeat-penalty window upload,
 //! attractor `-INF` writes, RNG threading) used to live across
 //! `hipfire_runtime::llama` (CPU primitives + GPU launch wrappers) and
-//! `examples/daemon.rs` (call-site glue). New arch ports either
+//! `hipfire-daemon/src/main.rs` (call-site glue). New arch ports either
 //! reached into llama.rs internals or duplicated the host-side prep.
 //! This module gives every caller one entry point: [`sample`], with
 //! [`SamplerConfig`] holding the policy knobs.

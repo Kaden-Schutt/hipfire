@@ -166,10 +166,11 @@ works, what to measure, what counts as pass/fail.
   still needs `hipfire config set dflash_mode auto` or
   `HIPFIRE_DFLASH_DRAFT=<path>` first.
 - **PFlash is retained legacy research, not mainline or production functionality.**
-  Prefix caching supersedes it for supported serving workloads. Its remaining
-  code and artifacts exist only for historical reference and reproduction;
-  agents must not treat PFlash as a production element, recommendation,
-  acceptance route, or basis for a current performance claim.
+  It lives in `crates/hipfire-pflash` outside `crates/hipfire-arch-*` and exists
+  only for historical reference and reproduction; prefix caching supersedes it
+  for supported serving workloads. Agents must not treat PFlash as a production
+  element, recommendation, acceptance route, or basis for a current
+  performance claim.
 
 ---
 
@@ -269,13 +270,13 @@ current `204c4c4c…`.)
 ### Build from source (if you're on a dev branch)
 
 ```bash
-cargo build --release --features deltanet \
-  --example daemon \
-  --example dflash_spec_demo \
-  --example encode_prompt \
-  --example run \
-  -p hipfire-runtime
+cargo build --release
 ```
+
+That is the whole command. The daemon is a crate (`hipfire-daemon`, binary
+`target/release/daemon`), not a `--example`, and the product no longer needs a
+feature incantation. If you find yourself typing `--example daemon`, you are
+following a pre-saddle instruction.
 
 ---
 
@@ -320,7 +321,7 @@ token 1358 `\n\n\n` for the HOT token 271 `\n\n` on Qwen3.5/3.6 vocab).
 
 `HIPFIRE_PROMPT_TOKEN_HEAT=1` triggers `Tokenizer::dump_prompt_heat()` at every
 encode site (stderr pretty, or stdout JSON with `HIPFIRE_PROMPT_HEAT_JSON=1`).
-Standalone: `./target/release/examples/encode_prompt MODEL.hfq PROMPT.txt --heat`.
+Standalone: `cargo run --release -p hipfire-runtime --example encode_prompt -- MODEL.hfq PROMPT.txt --heat`. (An example, so it is not in `target/release/` after a plain `cargo build --release`.)
 
 ### E. DFlash draft endpoints (HuggingFace)
 
@@ -335,52 +336,59 @@ Pullable via `hipfire pull qwen3.{5,6}:{9b,27b}-draft` and `hipfire pull qwen3.6
 
 ## 3 · Smoke tests (run these to validate)
 
-### 3.1 — Fresh-process bench harness
+### 3.1 — `hipfire bench` is the benchmark tool
 
-Always run benches in a fresh process. Within-session A/B is noisy on
-gfx1100 (±10–15 % drift from DPM/thermal state). For tight measurements:
+**Use `hipfire bench`. Do not bench through `examples/dflash_spec_demo`.**
 
-```bash
-# Use HIPFIRE_VERIFY_GRAPH=0 if you want deterministic measurements
-# (graph capture adds 1.5-3% jitter; OFF gives 0.1% spread).
-```
-
-### 3.2 — Prompt-shape A/B test (Phase 1)
+It drives the model through the native daemon protocol — the same path a user's
+request takes — and owns warmup, repetition and reporting:
 
 ```bash
-# A: PEP-8 prompt, normalize OFF (un-fixed)
-./target/release/examples/dflash_spec_demo \
-  --target ~/.hipfire/models/qwen3.5-27b.mq4 \
-  --draft ~/.hipfire/models/qwen35-27b-dflash-mq4.hfq \
-  --prompt "$(cat benchmarks/prompts/lru_cache_pep8_strict.txt)" \
-  --max 256 --ctx 2048 --kv-mode q8 --no-adaptive-b --no-chatml
-
-# B: same prompt, normalize ON
-HIPFIRE_NORMALIZE_PROMPT=1 ./target/release/examples/dflash_spec_demo ...
+hipfire bench <model> --runs 5 --warmups 3 --max-tokens 128 --json
 ```
 
-Run each ≥3 times in fresh processes. Record prompt md5, binary md5,
-tok/s, and τ, then compare against the current q8/max256 speed-gate
-baseline. Older pre-q8 DFlash perf numbers are not authoritative for
-current perf triage.
+| flag | why it matters |
+|---|---|
+| `--runs` | measurement runs (default 5) |
+| `--warmups` | discarded warmup runs (default 10) — DPM/thermal state settles here |
+| `--json` | machine-readable; keep the whole object, the `samples` array is the evidence |
+| `--spec` | `off`/`dflash`/`mtp`/`ngram`/`dspark`/`auto` |
+| `--backend` | `noslots` (sequential daemon) / `slots` / `batch` / `both` |
+| `--workload` | `stateless` / `multiturn` / `both` |
+| `--kv-mode`, `--kv-backend` | KV format and allocator |
+| `--reasoning-on` | off by default: a reasoning model cannot close `<think>` inside the token budget, and the daemon fails that turn closed |
 
-### 3.3 — HumanEval/53 single-prompt peak
+Pin `--backend` and `--workload` explicitly for any A/B. The default is `both`,
+which measures two things at once and is not a comparison.
 
-The `def add(x, y)` prompt is the canonical peak case (we beat 207
-tok/s here, vs. Lucebox's RTX 3090 demo peak):
+**Do not use `--concurrency` for a perf comparison.** It sweeps concurrent
+stream counts and leaves the single-stream path; it answers a different
+question.
+
+Still true regardless of tool: run in a fresh process, and record the model md5
+and both binary md5s with any number you report. Within-session A/B is noisy on
+gfx1100 (±10–15 % from DPM/thermal state). `HIPFIRE_VERIFY_GRAPH=0` gives ~0.1 %
+spread versus 1.5–3 % with graph capture on.
+
+### 3.2 — Prompt-shape A/B
+
+Prompt structure moves tau by up to 17 %, so an A/B must differ in exactly one
+thing. Use a committed prompt file and record its md5:
 
 ```bash
-PROMPT=$(python3 -c "import json; print([json.loads(l) for l in open('~/.hipfire/datasets/HumanEval.jsonl')][53]['prompt'])")
-HIPFIRE_NORMALIZE_PROMPT=1 ./target/release/examples/dflash_spec_demo \
-  --target ~/.hipfire/models/qwen3.5-27b.mq4 \
-  --draft ~/.hipfire/models/qwen35-27b-dflash-mq4.hfq \
-  --prompt "$PROMPT" \
-  --max 256 --ctx 2048 --kv-mode q8 --no-adaptive-b --no-chatml
+HIPFIRE_NORMALIZE_PROMPT=0 hipfire bench <model> --runs 5 --json   # A
+HIPFIRE_NORMALIZE_PROMPT=1 hipfire bench <model> --runs 5 --json   # B
 ```
 
-Use this as a peak-case smoke under the same q8/max256 methodology as
-the rest of DFlash perf testing. Report 5-run median tok/s and τ with:
-GPU model, ROCm version, full bench output, binary md5, and prompt md5.
+### 3.3 — Speculation comparison
+
+```bash
+hipfire bench <model> --spec off    --runs 5 --backend noslots --json
+hipfire bench <model> --spec dflash --runs 5 --backend noslots --json
+```
+
+Report the 5-run median with GPU model, ROCm version, model md5 and binary md5.
+Older pre-q8 DFlash numbers are not authoritative for current perf triage.
 
 ### 3.4 — DFlash-by-genre matrix (full sweep)
 
@@ -445,10 +453,11 @@ makes our tree path slower than our linear path. Lucebox's DDTree
 works on RTX 3090; ours doesn't (yet) on gfx1100.
 
 If you're running DDTree benches and seeing regressions vs. linear
-DFlash: **expected**, not a bug. Path C (trained custom draft) and
-Path D (stale-context overlap) are the roadmap fixes. Don't open
-issues for "DDTree slower than linear on gfx1100" unless you have
-new data not already documented.
+DFlash: **expected**, not a bug. Path D (stale-context overlap) is the
+remaining roadmap lever; Path C (trained custom draft, branch
+`feat/mtp-dflash-training`) was a failed month-1 experiment and is dead
+(out of scope, do not pursue). Don't open issues for "DDTree slower
+than linear on gfx1100" unless you have new data not already documented.
 
 For dataclass benches:
 - DDTree b12-k2 wins τ on prose / instruct (per memory) but loses
@@ -484,12 +493,11 @@ For dataclass benches:
   commit message of the fix (or the bisect commit). For longer
   writeups, the PR description. Local-only scratch goes to
   `.codeinsight+research/` (gitignored).
-- **Coherence-gate failures:** include the gate's report path
-  (`/tmp/coherence-dflash-*.md`) verbatim in the commit/PR.
-  Investigate as numerical bug, NOT sampling variance.
-- **Regression vs. last-shipped baseline:** include the binary md5
-  (md5sum target/release/examples/dflash_spec_demo) and prompt md5.
-  Without these, the result is unreproducible.
+- **Regression vs. last-shipped baseline:** include the model md5, the
+  `hipfire` binary md5, and the daemon binary md5 (`target/release/daemon`).
+  Without these the result is unreproducible. `hipfire bench --json` output
+  should be pasted whole rather than summarised — its `samples` array is what
+  lets a reader judge whether a delta cleared the noise.
 
 ### Don't claim a perf win without
 
@@ -539,12 +547,9 @@ following command shape and do not substitute other prompts unless the
 user explicitly updates this fixture section:
 
 ```bash
-./target/release/examples/dflash_spec_demo \
-  --target ~/.hipfire/models/qwen3.6-35b-a3b.mq4-awq-mi300x \
-  --draft ~/.hipfire/models/qwen36-35b-a3b-dflash-mq4.hfq \
-  --prompt-file <allowed-prompt> \
-  --max 256 --temp 0.0 --no-chatml --kv-mode q8 --ctx 4096 \
-  --block-size 6 --no-adaptive-b
+hipfire bench ~/.hipfire/models/qwen3.6-35b-a3b.mq4-awq-mi300x \
+  --spec dflash --runs 5 --warmups 3 --max-tokens 256 \
+  --kv-mode q8 --backend noslots --workload stateless --json
 ```
 
 Pinned artifacts:
@@ -575,8 +580,8 @@ against the A3B MoE DFlash perfmaxx line.
 | "DFlash got slower overnight" | Prompt structure changed (one newline added/removed) | Use byte-identical prompts via `benchmarks/prompts/*.txt` |
 | `τ=9.42` on first run, `τ=8.07` on next | Different prompt — see above | Same fix |
 | "0 evictions even though sidecar loaded" | `cask_beta` too high (default 128) means trigger is at budget+128 | Lower beta to 16 to actually exercise the eviction policy |
-| "DFlash 102 tok/s on prose vs 124 AR" | Draft-target argmax disagreement on prose tokens, τ collapses to ~1.2 | This is expected with z-lab drafts; fix is Path C (train custom draft) |
-| 3.6-A3B DFlash 68.6 tok/s vs AR 135 tok/s (50% loss) | 3.6 draft trained on 3.5 traces; target distribution mismatch on code. τ=1.22 on hard code. | Use AR mode for 3.6-A3B until Path C (custom 3.6 draft training) completes. 3.5-A3B DFlash works (τ=4.91) |
+| "DFlash 102 tok/s on prose vs 124 AR" | Draft-target argmax disagreement on prose tokens, τ collapses to ~1.2 | Expected with z-lab drafts; no retraining fix is planned — Path C (custom draft training, `feat/mtp-dflash-training`) was a failed month-1 experiment and is dead. Use AR or accept the genre-conditional behaviour. |
+| 3.6-A3B DFlash 68.6 tok/s vs AR 135 tok/s (50% loss) | 3.6 draft trained on 3.5 traces; target distribution mismatch on code. τ=1.22 on hard code. | Use AR mode for 3.6-A3B. Draft mismatch is expected and no 3.6 retrain is planned — Path C (`feat/mtp-dflash-training`) is dead/out-of-scope, not a forthcoming fix. 3.5-A3B DFlash works (τ=4.91). |
 | `hipMalloc out of memory` at hidden_rb | Long ctx (≥16K real tokens) + 27B + asym3 = tight on 24 GB | Reduce ctx, use a smaller target, or wait for the bounded-rolling-buffer trick (roadmap) |
 | `tok/s` below expected on long-ctx | KV cache growth — prefill is fine but decode slows past ~2K | Test at small ctx first, then scale |
 | daemon doesn't auto-find draft | Filename doesn't match `qwen3{ver}-{size}-dflash-{quant}.hfq` | Don't rename the file after pull |
@@ -606,7 +611,7 @@ against the A3B MoE DFlash perfmaxx line.
 | `HIPFIRE_VERIFY_GRAPH` | Verify-forward graph capture (0 = off) | ON |
 | `HIPFIRE_DDTREE_*` | Various DDTree diagnostics | various |
 
-| dflash_spec_demo flag | Purpose |
+| `hipfire bench` flag | Purpose |
 |---|---|
 | `--ar-baseline` | Skip DFlash, greedy-decode via target only |
 | `--no-chatml` | Bare prompts (raw-text drafts) |
@@ -627,8 +632,7 @@ If you want to actively contribute findings, these are open:
 1. **Phase 3 prompt-shape rules** — what other rare BPE tokens depress
    τ? Run `encode_prompt --heat` on a wide variety of prompts and look
    for patterns.
-2. **Path C training**: a target-aligned custom DFlash draft. Recipe at
-   an out-of-repo recipe (ask the maintainer).
+2. **Path C training — DEAD**: target-aligned custom DFlash draft (`feat/mtp-dflash-training`) was a failed month-1 experiment and is out of scope. Do not pursue; no recipe is forthcoming. (Historical note: prior revisions listed this as an open investigation.)
 3. **Path D engineering**: stale-context overlap pipelining — the only
    structural lever still on the table for 27B-3.5 code beyond +8.2%.
 4. **DDTree gfx1100 fix**: linearization-slot RoPE phase delta skew

@@ -69,7 +69,7 @@ HIPFIRE_MODEL="$HFQ_PATH" hipfire serve 8080 -d 2>&1 | tail -2
 # authoritative "right model is loaded" gate. Replaces the legacy
 # `tail -1 serve.log | grep "warm-up complete"` check, which broke when
 # serve.log had a stale "warm-up complete" line from the previous session
-# (the file is opened O_APPEND), and the `pgrep -af "examples/daemon"`
+# (the file is opened O_APPEND), and the `pgrep -af "release/daemon"`
 # fallback that fired falsely because the CLI no longer spawns a process
 # named "examples/daemon" (the native `hipfire serve` owns it now).
 want=$(basename "$HFQ_PATH")

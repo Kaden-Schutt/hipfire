@@ -5,6 +5,91 @@ edition.workspace = true
 license.workspace = true
 description = "Direct-KMD GPU compute — bypass HIP, talk to amdgpu driver"
 
+[features]
+# Archived research probes; see the note by the [[example]] blocks.
+lab = []
+
 [dependencies]
 libc = "0.2"
 libloading.workspace = true
+
+# ---------------------------------------------------------------------------
+# Archived research probes.
+#
+# One-question GPU experiments -- "is GPU argmax faster than downloading logits
+# at vocab 129,280 on gfx1201" -- written at roughly eleven a month since
+# 2026-03. They are the working method for kernel decisions and worth keeping:
+# a HIP kernel cannot be measured by a unit test.
+#
+# Gated because an answer obtained in April should not be type-checked on every
+# build in August. Ungated, they all compile under `cargo build --all-targets`,
+# so every refactor drags every probe with it -- several build breaks during the
+# ModelState removal were in probes nobody had run since the day they were
+# written.
+#
+# Run on demand:  cargo build -p <crate> --examples --features lab
+# The UNGATED example count is ratcheted; see scripts/leanup-ratchets.sh.
+# ---------------------------------------------------------------------------
+[[example]]
+name = "bench_dispatch"
+required-features = ["lab"]
+
+[[example]]
+name = "chain_debug"
+required-features = ["lab"]
+
+[[example]]
+name = "poc_chain"
+required-features = ["lab"]
+
+[[example]]
+name = "poc_device"
+required-features = ["lab"]
+
+[[example]]
+name = "poc_dispatch_noop"
+required-features = ["lab"]
+
+[[example]]
+name = "poc_dispatch_raw"
+required-features = ["lab"]
+
+[[example]]
+name = "poc_gemm"
+required-features = ["lab"]
+
+[[example]]
+name = "poc_hsaco"
+required-features = ["lab"]
+
+[[example]]
+name = "poc_rmsnorm"
+required-features = ["lab"]
+
+[[example]]
+name = "poc_silu"
+required-features = ["lab"]
+
+[[example]]
+name = "poc_submit"
+required-features = ["lab"]
+
+[[example]]
+name = "poc_vector_add"
+required-features = ["lab"]
+
+[[example]]
+name = "poc_write_data"
+required-features = ["lab"]
+
+[[example]]
+name = "test_aql_dispatch"
+required-features = ["lab"]
+
+[[example]]
+name = "test_chain_dispatch"
+required-features = ["lab"]
+
+[[example]]
+name = "test_dispatch_api"
+required-features = ["lab"]

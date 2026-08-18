@@ -14,13 +14,14 @@ deltanet = ["hipfire-runtime/deltanet", "rdna-compute/deltanet"]
 [dependencies]
 hipfire-config = { path = "../hipfire-config" }
 hipfire-runtime = { path = "../hipfire-runtime" }
+hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl" }
 hipfire-dispatch = { path = "../hipfire-dispatch", features = ["from-hip-error"] }
 hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
 hipfire-reap = { path = "../hipfire-reap" }
+saddle-core = { path = "../saddle-core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-
 [[example]]
 name = "test_qwen35_load_multi"
 path = "examples/test_qwen35_load_multi.rs"

@@ -40,18 +40,18 @@
 //! Must run prod/parent modes on gfx942 (mi300x).
 
 use hipfire_arch_deepseek4::forward::{decode_step, take_layer_norm_trace};
-use hipfire_arch_deepseek4::parent::forward::{
+use hipfire_ds4_parent::forward::{
     parent_layer_forward, parent_layer_forward_traced, ParentForwardScratch, ParentLayerTrace,
     PARENT_HC_DIM,
 };
-use hipfire_arch_deepseek4::parent::head::{parent_embed, PARENT_VOCAB};
-use hipfire_arch_deepseek4::parent::inventory::ParentInventory;
-use hipfire_arch_deepseek4::parent::manifest::sha256_file;
-use hipfire_arch_deepseek4::parent::model::{
+use hipfire_ds4_parent::head::{parent_embed, PARENT_VOCAB};
+use hipfire_ds4_parent::inventory::ParentInventory;
+use hipfire_ds4_parent::manifest::sha256_file;
+use hipfire_ds4_parent::model::{
     parent_model_forward_traced, LayerHcNormStats, ParentModelScratch,
 };
-use hipfire_arch_deepseek4::parent::weights::{ParentLoadPlan, ParentWeights};
-use hipfire_arch_deepseek4::parent::Ds4ParentBackend;
+use hipfire_ds4_parent::weights::{ParentLoadPlan, ParentWeights};
+use hipfire_ds4_parent::Ds4ParentBackend;
 use hipfire_arch_deepseek4::DeepseekV4;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::arch::Architecture;
@@ -324,7 +324,7 @@ fn dump_parent_stages(
     gpu: &mut Gpu,
     backend: Ds4ParentBackend,
     weights: &ParentWeights,
-    cfg: &hipfire_arch_deepseek4::parent::ParentQuantConfig,
+    cfg: &hipfire_ds4_parent::ParentQuantConfig,
     token_ids: &[u32],
     n: usize,
     stage_layers: &[usize],
@@ -342,7 +342,7 @@ fn dump_parent_stages(
     let max_l = *stage_layers.iter().max().unwrap_or(&0);
     let end = (max_l + 1).min(cfg.num_hidden_layers);
     // SWA ring shape from parent attention constants.
-    use hipfire_arch_deepseek4::parent::attention::{
+    use hipfire_ds4_parent::attention::{
         PARENT_HEAD_DIM, PARENT_N_KV_HEADS, PARENT_SWA_WINDOW,
     };
     let mut rings: Vec<GpuTensor> = Vec::with_capacity(end);
@@ -411,7 +411,7 @@ fn dump_parent_stages(
                 dump_parent_indexer(gpu, &layer_scratch, layer_idx, n)?;
             }
         } else {
-            hipfire_arch_deepseek4::parent::forward::parent_layer_forward(
+            hipfire_ds4_parent::forward::parent_layer_forward(
                 gpu,
                 backend,
                 weights,
@@ -437,10 +437,10 @@ fn dump_parent_indexer(
     layer_idx: usize,
     rows: usize,
 ) -> Result<(), String> {
-    use hipfire_arch_deepseek4::parent::attention::{
+    use hipfire_ds4_parent::attention::{
         PARENT_ATTN_INDEX_TOPK, PARENT_HEAD_DIM,
     };
-    use hipfire_arch_deepseek4::parent::indexer::PARENT_INDEX_HEAD_DIM;
+    use hipfire_ds4_parent::indexer::PARENT_INDEX_HEAD_DIM;
     let attn = layer_scratch.attn_scratch();
     let n_comp = attn.last_compress_events();
     // topk_idx is I32 in Raw buffer.

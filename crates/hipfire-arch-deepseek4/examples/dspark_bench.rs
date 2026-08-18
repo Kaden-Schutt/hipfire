@@ -215,6 +215,7 @@ fn main() -> Result<(), String> {
         weights,
         state,
         eos_tok,
+        pbs: None,
     };
 
     let ctx_cap = cfg.max_position_embeddings;

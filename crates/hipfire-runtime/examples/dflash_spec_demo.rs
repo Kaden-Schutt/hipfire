@@ -1795,7 +1795,7 @@ fn main() {
         let mut pflash_kept_tokens: usize = prompt_tokens.len();
         let pflash_source_tokens = prompt_tokens.len();
         if let Some(pflash_drafter_path) = pflash_path.as_ref() {
-            use hipfire_arch_qwen35::pflash::{
+            use hipfire_pflash::pflash::{
                 self, BypassReason, PflashConfig, PflashDecision, PflashMode, PflashState,
                 RequestKind,
             };

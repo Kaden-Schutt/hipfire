@@ -103,9 +103,8 @@ mkdir -p "$MODEL_STORE" "$OUT/logits" "$OUT/prompts"
 
 if [ "$SKIP_BUILD" -eq 0 ]; then
     cargo build --release -p hipfire-quantize --bin hipfire-quantize
-    cargo build --release --features deltanet -p hipfire-runtime \
-        --example greedy_dump_top5 \
-        --example decode_tokens
+    cargo build --release -p saddle-lab --features arch-qwen35 --example greedy_dump_top5
+    cargo build --release --features deltanet -p hipfire-runtime --example decode_tokens
 fi
 
 {

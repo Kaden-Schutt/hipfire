@@ -1,0 +1,147 @@
+[package]
+name = "hipfire-ds4-parent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "DeepSeek V4 Flash parent-checkpoint calibration oracle (Hessian collection, reference GEMM, codec, compressor, indexer)"
+
+[features]
+# Archived research probes; see the note by the [[example]] blocks.
+lab = []
+
+[dependencies]
+hipfire-config = { path = "../hipfire-config" }
+hipfire-runtime = { path = "../hipfire-runtime" }
+rdna-compute = { path = "../rdna-compute" }
+hip-bridge = { path = "../hip-bridge" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+memmap2 = "0.9"
+
+[dev-dependencies]
+libloading.workspace = true
+
+# ---------------------------------------------------------------------------
+# Archived research probes.
+#
+# One-question GPU experiments -- "is GPU argmax faster than downloading logits
+# at vocab 129,280 on gfx1201" -- written at roughly eleven a month since
+# 2026-03. They are the working method for kernel decisions and worth keeping:
+# a HIP kernel cannot be measured by a unit test.
+#
+# Gated because an answer obtained in April should not be type-checked on every
+# build in August. Ungated, they all compile under `cargo build --all-targets`,
+# so every refactor drags every probe with it -- several build breaks during the
+# ModelState removal were in probes nobody had run since the day they were
+# written.
+#
+# Run on demand:  cargo build -p <crate> --examples --features lab
+# The UNGATED example count is ratcheted; see scripts/leanup-ratchets.sh.
+# ---------------------------------------------------------------------------
+[[example]]
+name = "ds4_parent_attn_mixed_smoke"
+required-features = ["lab"]
+
+[[example]]
+name = "ds4_parent_attn_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "ds4_parent_attn_smoke"
+required-features = ["lab"]
+
+[[example]]
+name = "ds4_parent_codec_gate"
+required-features = ["lab"]
+
+[[example]]
+name = "ds4_parent_compressor_smoke"
+required-features = ["lab"]
+
+[[example]]
+name = "ds4_parent_forward_gate"
+required-features = ["lab"]
+
+[[example]]
+name = "ds4_parent_gpu_linear_smoke"
+required-features = ["lab"]
+
+[[example]]
+name = "ds4_parent_hc_smoke"
+required-features = ["lab"]
+
+[[example]]
+name = "ds4_parent_head_residual_compare"
+required-features = ["lab"]
+
+[[example]]
+name = "ds4_parent_head_smoke"
+required-features = ["lab"]
+
+[[example]]
+name = "ds4_parent_indexer_causality"
+required-features = ["lab"]
+
+[[example]]
+name = "ds4_parent_indexer_smoke"
+required-features = ["lab"]
+
+[[example]]
+name = "ds4_parent_inventory_gate"
+required-features = ["lab"]
+
+[[example]]
+name = "ds4_parent_kld"
+required-features = ["lab"]
+
+[[example]]
+name = "ds4_parent_layer_bisect"
+required-features = ["lab"]
+
+[[example]]
+name = "ds4_parent_layer_gate"
+required-features = ["lab"]
+
+[[example]]
+name = "ds4_parent_layer_smoke"
+required-features = ["lab"]
+
+[[example]]
+name = "ds4_parent_linear_gate"
+required-features = ["lab"]
+
+[[example]]
+name = "ds4_parent_loader_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "ds4_parent_moe_floor"
+required-features = ["lab"]
+
+[[example]]
+name = "ds4_parent_moe_smoke"
+required-features = ["lab"]
+
+[[example]]
+name = "ds4_parent_plumbing_probe"
+required-features = ["lab"]
+
+[[example]]
+name = "ds4_parent_residency_gate"
+required-features = ["lab"]
+
+[[example]]
+name = "ds4_parent_residual_content"
+required-features = ["lab"]
+
+[[example]]
+name = "ds4_parent_residual_stage_content"
+required-features = ["lab"]
+
+[[example]]
+name = "ds4_parent_seq_plog"
+required-features = ["lab"]
+
+[[example]]
+name = "ds4_tokenize_corpus"
+required-features = ["lab"]

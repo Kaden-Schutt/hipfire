@@ -133,7 +133,10 @@ impl<'a> Qwen35Emit<'a> {
             router_malformed: false,
             filter_stopped: false,
             grammar_active,
-            grammar_matcher: grammar::Matcher::new(tool_schemas),
+            grammar_matcher: grammar::Matcher::with_config(
+                tool_schemas,
+                crate::grammar_config::resolve_qwen35_grammar_config(),
+            ),
             grammar_violated: false,
             eos_token: ctx.eos,
             im_end_token: ctx.im_end,

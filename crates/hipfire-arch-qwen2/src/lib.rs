@@ -73,6 +73,7 @@
 //!   `+= 1.0` offset (see `load_norm_weight_raw`).
 
 pub mod arch;
+pub mod arch_model;
 pub mod carrier;
 pub mod qwen2;
 /// Qwen2 impl of the arch-generic `hipfire_runtime::spec` seam

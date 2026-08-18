@@ -2,6 +2,25 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
+//! ## Status: intra-crate helper, NOT the architecture contract
+//!
+//! This trait once competed with `hipfire_loader::Carrier` to be "the" arch
+//! contract. It no longer does, and the distinction matters when adding a model:
+//!
+//! - **The contract** is `Carrier` (registration + load, in the loader because
+//!   `Carrier::load` returns `LoadedModel`) plus
+//!   [`crate::arch_model::ArchModel`] (the arch-agnostic view of a loaded model,
+//!   implemented in the arch crate).
+//! - **This trait** is a typed bring-up convenience — associated
+//!   `Config`/`Weights`/`State` plus `config_from_hfq` / `load_weights` /
+//!   `new_state`. It is used only *within* arch crates, by their own
+//!   `load_<arch>_bundle` functions. Measured: zero consumers in
+//!   `hipfire-loader`, `hipfire-generate` or `hipfire-daemon`.
+//!
+//! It is therefore optional. `hipfire-arch-muse-glimmer` implements it not at
+//! all and loads fine. Adopt it if the typed shape helps your crate; skip it if
+//! it does not. Its four override hooks were deleted as dead in an earlier pass.
+//!
 //! The bring-up contract for a hipfire architecture. Implement this
 //! trait in your arch crate (e.g. `hipfire-arch-qwen35`) to plug a
 //! model into the runtime. Generation, sampling, eviction, spec
@@ -53,7 +72,7 @@ use rdna_compute::{DType, Gpu};
 ///
 /// Implementors live in their own arch crate (`hipfire-arch-<name>`)
 /// and provide the three required types (Config / Weights / State)
-/// plus five required methods. The four optional override hooks let
+/// plus five required methods. The optional override hook lets
 /// an arch deviate from Qwen3.5 family defaults without growing a
 /// per-`arch_id` `match` ladder in the daemon.
 ///
@@ -72,12 +91,10 @@ use rdna_compute::{DType, Gpu};
 ///
 /// See per-method docs below.
 ///
-/// # Optional: override hooks
+/// # Optional: override hook
 ///
-/// `loop_guard_overrides`, `sampler_overrides`, `prompt_frame_overrides`,
-/// `eos_filter_overrides`. Default impls match Qwen3.5 conventions.
-/// Override per-arch when the arch's prompt format / sampling
-/// requirements / end-of-turn markers diverge.
+/// `eos_filter_overrides`. Default impl matches Qwen3.5 conventions.
+/// Override per-arch when the arch's end-of-turn markers diverge.
 pub trait Architecture: Send + 'static {
     type Weights;
     type State;
@@ -165,34 +182,6 @@ pub trait Architecture: Send + 'static {
     // the trait is intentionally minimal — just enough scaffolding for
     // a canary arch crate to implement and the runtime to type-check.
 
-    /// Override loop-guard config for this arch. Default is None on
-    /// every field, falling back to runtime/env defaults.
-    ///
-    /// Override when a base or instruct-tuned model legitimately
-    /// emits short repeating sequences (e.g. structured output, code
-    /// boilerplate) that the default n-gram threshold would falsely
-    /// flag. See `LoopGuardOverrides` for fields.
-    fn loop_guard_overrides(_cfg: &Self::Config) -> LoopGuardOverrides {
-        LoopGuardOverrides::default()
-    }
-
-    /// Override sampler config for this arch. Default is empty on
-    /// `blocked_tokens`, None on `repeat_penalty`.
-    ///
-    /// Override to add arch-specific blocked tokens (e.g. a special
-    /// `<tool_call>` opener that the model emits in attractor loops)
-    /// or to set a per-arch default `repeat_penalty`.
-    fn sampler_overrides(_cfg: &Self::Config) -> SamplerOverrides {
-        SamplerOverrides::default()
-    }
-
-    /// Override prompt framing for this arch. Default assumes ChatML
-    /// (`<|im_start|>` / `<|im_end|>` markers).
-    ///
-    /// Override `raw: Some(true)` for a non-ChatML completion model.
-    fn prompt_frame_overrides(_cfg: &Self::Config) -> PromptFrameOverrides {
-        PromptFrameOverrides::default()
-    }
 
     /// Override EOS handling for this arch. Default uses ChatML
     /// `<|im_end|>` plus the `<think>` strip policy from runtime.
@@ -205,53 +194,6 @@ pub trait Architecture: Send + 'static {
     }
 }
 
-/// Per-arch overrides for the loop-guard n-gram blocker.
-///
-/// The runtime's loop guard (`hipfire_runtime::loop_guard`) detects
-/// repeated n-grams in the recent decode window and blocks the
-/// repeating token before sampler draws it. Defaults come from env
-/// (`HIPFIRE_NGRAM_THRESHOLD`, `HIPFIRE_NGRAM_WINDOW`); per-arch
-/// overrides take precedence.
-#[derive(Debug, Clone, Default)]
-pub struct LoopGuardOverrides {
-    /// If `Some`, replace the env-derived n-gram threshold (count of
-    /// repeats before block fires). Lower = more aggressive blocking.
-    pub ngram_threshold: Option<usize>,
-    /// If `Some`, replace the env-derived window length (recent-token
-    /// span the n-gram detector scans).
-    pub ngram_window: Option<usize>,
-}
-
-/// Per-arch overrides for the sampler.
-///
-/// `hipfire_runtime::sampler` owns top-p / top-k / temperature / repeat-
-/// penalty / blocked-token mechanics. Per-arch overrides add to (don't
-/// replace) the runtime config.
-#[derive(Debug, Clone, Default)]
-pub struct SamplerOverrides {
-    /// Tokens to add to `SamplerConfig::blocked_tokens` for this arch
-    /// (e.g. arch-specific `<tool_call>` opener IDs that the model
-    /// emits in attractor loops). Appended to the runtime list, not
-    /// replacing it.
-    pub blocked_tokens: Vec<u32>,
-    /// If `Some`, override the repeat penalty for this arch. Use
-    /// sparingly — `1.05` is the user-validated default floor; values
-    /// >1.3 cause MQ4/MQ6 gibberish at low temperature.
-    pub repeat_penalty: Option<f32>,
-}
-
-/// Per-arch overrides for prompt framing.
-///
-/// `hipfire_runtime::prompt_frame` owns the `<|im_start|>` / `<|im_end|>`
-/// scaffolding plus `<think>` injection for thinking-mode models.
-#[derive(Debug, Clone, Default)]
-pub struct PromptFrameOverrides {
-    /// If `Some`, override the assistant prefix scheme. `Some(true)`
-    /// disables ChatML framing entirely (raw completion, no
-    /// `<|im_start|>assistant`); `Some(false)` forces ChatML even if
-    /// the runtime would otherwise auto-detect raw.
-    pub raw: Option<bool>,
-}
 
 /// Per-arch overrides for EOS / end-of-turn filtering.
 ///

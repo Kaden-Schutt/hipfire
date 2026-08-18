@@ -22,7 +22,7 @@
 # 27B target + draft are present).
 set -u
 
-EXE="./target/release/examples/daemon"
+EXE="./target/release/daemon"
 MODELS_DIR="${HIPFIRE_MODELS_DIR:-${HIPFIRE_DIR:-$HOME/.hipfire}/models}"
 OUT="${HIPFIRE_SERVE_GATE_OUT:-/tmp/serve-multiturn-$(date +%Y%m%d-%H%M%S).md}"
 LOCK_SCRIPT="./scripts/gpu-lock.sh"
@@ -39,10 +39,10 @@ MAX_TOKENS=80
 
 # ── Build daemon if stale ─────────────────────────────────────────────────
 if [ ! -x "$EXE" ] || \
-   [ crates/hipfire-runtime/examples/daemon.rs -nt "$EXE" ] || \
+   [ crates/hipfire-daemon/src/main.rs -nt "$EXE" ] || \
    [ crates/hipfire-loader/src/lib.rs -nt "$EXE" ]; then
     echo "serve-multiturn-gate: building daemon..." >&2
-    cargo build --release --example daemon --features deltanet >&2 || { echo "build failed" >&2; exit 2; }
+ cargo build --release -p hipfire-daemon >&2 || { echo "build failed" >&2; exit 2; }
 fi
 
 # ── GPU lock ──────────────────────────────────────────────────────────────

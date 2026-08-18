@@ -1,0 +1,257 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+#
+# Ratchets for docs/governance/2026-08-15-hipfire-leanup-map.md § 4.
+#
+# Run from the repository root.
+#
+# Metrics listed in scripts/leanup-thresholds.txt are ASSERTED: a violation
+# exits non-zero. Everything else is reported and never fails the run.
+# `--report` prints without asserting.
+#
+# Until 2026-08-16 this script emitted 22 metrics and contained exactly one
+# `exit 1`, on the `cd` guard. Its header said "every number is measured, never
+# asserted", and it was believed to be a gate anyway.
+#
+# On the compute:arch ratio — read this before quoting it
+# -------------------------------------------------------
+# The original ratchet counted `.rs` files in eight compute crates and
+# compared the result against llama.cpp's `ggml/`. That is not a like-for-like
+# comparison: `ggml/` is almost entirely kernel source (.c/.cpp/.cu/.metal/
+# .cl/.comp), while hipfire's equivalent — `kernels/`, ~120k lines of HIP —
+# was excluded from its own compute side. The leanup map's § 6 explicitly
+# names "the kernel family" as part of the compute layer, so excluding it
+# contradicted the very definition being measured.
+#
+# This script reports the ratio three ways so the rule is visible rather than
+# buried:
+#
+#   crates-only   what the original ratchet measured. Kept for continuity
+#                 with the historical figure; not a fair comparison.
+#   all-kernels   every kernel line on the compute side, which is the rule
+#                 `ggml/` is measured under.
+#   strict        arch-named kernels (deepseek4_*, fused_gemma4_*, …) moved
+#                 to the arch side. llama.cpp has zero model-named files in
+#                 `ggml/` — verified.
+#   +substrate    strict, plus the engine substrate. SECOND measurement defect:
+#                 the compute list below was written before the saddle layering
+#                 existed and was never updated, so `saddle-core`,
+#                 `hipfire-engine` and `hipfire-dispatch` — which carry ZERO
+#                 `hipfire_arch_*` references and ZERO arch Cargo deps, and so
+#                 cannot be arch code under any reading — were counted on
+#                 NEITHER side. llama.cpp's analogue (`src/` minus
+#                 `src/models/`: llama-context, llama-kv-cache, llama-batch,
+#                 llama-sampling) is 53,974 lines and is likewise not arch.
+#                 Quote THIS one; it is the conservative figure.
+#   +dispatchers  also counts hipfire-runtime/loader/generate, which reference
+#                 arch only to dispatch into it, exactly as llama.cpp's
+#                 `llama-model.cpp` switches over `LLM_ARCH_*`. Upper bound.
+#
+# Measured llama.cpp for calibration (see docs/governance): ggml:src/models is
+# 16.20 : 1 and (ggml+substrate):src/models is 19.19 : 1. The 9.7 : 1 figure
+# quoted in the original grounding doc could not be reproduced from the tree.
+set -uo pipefail
+REPORT_ONLY=0
+if [ "${1:-}" = "--report" ]; then REPORT_ONLY=1; shift; fi
+cd "${1:-.}" || exit 1
+
+lines() { find $1 -type f \( ${2} \) 2>/dev/null | xargs wc -l 2>/dev/null | tail -1 | awk '{print $1+0}'; }
+RS='-name *.rs'
+KS='-name *.hip -o -name *.h -o -name *.hpp -o -name *.cpp -o -name *.cl'
+declare -A METRIC
+p() { printf '%-26s %s\n' "$1" "$2"; METRIC["$1"]="$2"; }
+
+DAEMON=crates/hipfire-daemon/src/main.rs
+p HEAD "$(git rev-parse --short HEAD 2>/dev/null)"
+p daemon_lines "$(wc -l < $DAEMON)"
+p daemon_arch_id "$(grep -cE 'arch_id *==' $DAEMON)"
+p daemon_arch_refs "$(grep -coE 'hipfire_arch_[a-z0-9_]+' $DAEMON)"
+# Scoped to the daemon manifest on purpose: the product must build without a
+# feature incantation. Tree-wide `required-features` is a different thing
+# entirely and is a GOOD signal -- it is how archived probes stay out of the
+# default build. See `ungated_examples`.
+p required_features_daemon "$(grep -c 'required-features' crates/hipfire-daemon/Cargo.toml)"
+# `daemon_arch_refs` greps `hipfire_arch_*`, which `ModelState::Qwen35` does NOT match:
+# ModelState is a LOADER-owned enum wrapping arch bundles. The daemon therefore reported
+# 0 arch refs while still doing a 7-way architecture dispatch (main.rs:1732-1751). Count
+# the laundered form too, or the gate certifies a decoupling that has not happened.
+p daemon_modelstate "$(grep -co 'ModelState::' $DAEMON)"
+# Split code from prose. ModelState is deleted; the remaining mentions are
+# history in comments, and a gate that cannot tell those apart would either fail
+# on a comment or pass on a reintroduction.
+p loader_modelstate_all "$(grep -rho 'ModelState::' crates/hipfire-loader/src | wc -l)"
+p loader_modelstate_code "$(grep -rhn 'ModelState::' crates/hipfire-loader/src 2>/dev/null | grep -vE '^[0-9]+:[[:space:]]*(//|///|\*)' | grep -c 'ModelState::')"
+# `runtime_examples` used to count [[example]] declarations in hipfire-runtime.
+# Gating an archived probe ADDS a declaration, so the number rose while the
+# thing it meant to track improved. Direction inverted; removed. `ungated_examples`
+# below measures the intent -- how many examples the default build still pays for.
+p grammar_copies "$(find crates/hipfire-arch-*/src -name grammar.rs 2>/dev/null | wc -l)"
+p glossary "$([ -f docs/GLOSSARY.md ] && echo present || echo MISSING)"
+
+# The 10,000-line arch-crate gate is VOID (maintainer ruling, Phase 2): crates are
+# admissible at any size iff well-defined and legible, and no crate may be split
+# to satisfy a line budget. Reporting a count against a retired rule invites
+# someone to act on it, so it is gone. Legibility is tracked by module structure,
+# not line count.
+
+c=0
+for x in rdna-compute redline redline-dispatch redline-rocr radiowave \
+         hip-bridge hsa-bridge hipfire-detect; do
+  c=$((c + $(lines "crates/$x/src" "$RS")))
+done
+a=0
+for d in crates/hipfire-arch-*/; do a=$((a + $(lines "$d/src" "$RS"))); done
+
+k_all=$(lines kernels "$KS")
+k_arch=$(find kernels -type f \( $KS \) 2>/dev/null \
+         | grep -iE '/[^/]*(qwen|deepseek|llama|gemma|cohere|minimax|glimmer|lfm)[^/]*$' \
+         | xargs wc -l 2>/dev/null | tail -1 | awk '{print $1+0}')
+k_gen=$((k_all - k_arch))
+
+r() { awk -v c=$1 -v a=$2 'BEGIN{printf "%.3f : 1", c/a}'; }
+p compute_crates_rs "$c"
+p kernels_total "$k_all"
+p kernels_arch_named "$k_arch"
+p arch_crates_rs "$a"
+# Engine substrate: the layers the saddle work created. Split by whether the
+# crate names an architecture at all, so the conservative figure stands without
+# argument.
+sub_clean=0
+for x in saddle-core hipfire-engine hipfire-dispatch; do
+  sub_clean=$((sub_clean + $(lines "crates/$x/src" "$RS")))
+done
+sub_disp=0
+for x in hipfire-runtime hipfire-loader hipfire-generate; do
+  sub_disp=$((sub_disp + $(lines "crates/$x/src" "$RS")))
+done
+# Guard the conservative bucket: if any of those three ever gains an arch
+# reference it stops being unambiguous substrate and this must be revisited.
+leak=$(grep -roE 'hipfire_arch_[a-z0-9_]+' crates/saddle-core/src crates/hipfire-engine/src \
+        crates/hipfire-dispatch/src 2>/dev/null | wc -l)
+p substrate_clean "$sub_clean"
+p substrate_dispatching "$sub_disp"
+p substrate_clean_arch_refs "$leak$([ "$leak" -eq 0 ] && echo '' || echo '  <- NOT clean; conservative ratio invalid')"
+p 'ratio (crates-only)' "$(r $c $a)   <- original ratchet; not like-for-like"
+p 'ratio (all-kernels)' "$(r $((c+k_all)) $a)"
+p 'ratio (strict)' "$(r $((c+k_gen)) $((a+k_arch)))   <- kernels fixed, substrate still omitted"
+p 'ratio (+substrate)' "$(r $((c+k_gen+sub_clean)) $((a+k_arch)))   <- quote this one"
+p 'ratio (+dispatchers)' "$(r $((c+k_gen+sub_clean+sub_disp)) $((a+k_arch)))   <- upper bound"
+
+# --- ungated research probes -------------------------------------------------
+# Examples compile on every `cargo build --all-targets`. Archived one-question
+# GPU probes are gated behind `--features lab` so an answer obtained in April is
+# not type-checked in August. This counts the ones still UNGATED so the number
+# cannot silently drift back up -- which is exactly how the dead golden CASES
+# table accumulated five models, four of which do not exist.
+#
+# Counts example NAMES that have a required-features line inside their own
+# [[example]] block. An earlier version counted required-features LINES per
+# manifest and reported 16 where the answer was 32; a metric that is wrong is
+# worse than no metric, because it is believed.
+ungated_examples() {
+  python3 - <<'PYEOF'
+import glob, os, re
+total = {(p.split("/")[1], os.path.basename(p)[:-3]) for p in glob.glob("crates/*/examples/*.rs")}
+gated = set()
+for tm in glob.glob("crates/*/Cargo.toml"):
+    crate = tm.split("/")[1]
+    for blk in re.split(r'(?=\[\[example\]\])', open(tm, encoding='utf8').read()):
+        if not blk.startswith("[[example]]"):
+            continue
+        blk = re.split(r'\n\[(?!\[example)', blk)[0]
+        nm = re.search(r'name\s*=\s*"([^"]+)"', blk)
+        rf = re.search(r'required-features\s*=\s*\[([^\]]*)\]', blk)
+        if nm and rf and rf.group(1).strip():
+            gated.add((crate, nm.group(1)))
+print(len(total - gated))
+PYEOF
+}
+p ungated_examples "$(ungated_examples)"
+
+# --- layering, derived from the Cargo graph -------------------------------
+# scripts/check-layering.py computes the arch band from the real dependency
+# graph rather than from a declared rule. The Phase 3 scope asserted that arch
+# crates must not depend on saddle-core or hipfire-dispatch; measuring showed 11
+# such edges already exist and are correct -- those crates sit at layers 4-5,
+# BELOW the arch band at 6-7. A hardcoded rule would have failed on legitimate
+# structure.
+while read -r _k _v; do
+  case "$_k" in [a-z]*) p "$_k" "$_v" ;; esac
+done < <(python3 scripts/check-layering.py 2>/dev/null | grep -E '^[a-z_]+[[:space:]]+[0-9]+$')
+
+# --- arch-key dispatch (string form of arch_id ==) ---------------------------
+# arch_id == is asserted at 0, but the same coupling written as a string match
+# is invisible to it. `match arch { "gemma4" => .. }` was written into
+# hipfire-runtime during Phase 3B and reverted; nothing here would have objected.
+while read -r _k _v; do
+  case "$_k" in [a-z]*) p "$_k" "$_v" ;; esac
+done < <(python3 scripts/check-arch-dispatch.py 2>/dev/null | grep -E '^[a-z_]+[[:space:]]+[0-9]+$')
+
+# --- quant-type registry parity ----------------------------------------------
+# The wire qt space is declared in hipfire-quantize::QuantType and consumed via
+# hipfire-runtime::RAW_CODECS, with rdna-compute::DType as the execution twin.
+# Nothing binds them, and every consumer arm is fail-open (`_ => None/Err`), so a
+# half-registered format compiles green -- cf. cf061b7ed, where the encoder,
+# GEMV and is_mq arms all landed and the model simply would not load.
+while read -r _k _v; do
+  case "$_k" in [a-z]*) p "$_k" "$_v" ;; esac
+done < <(python3 scripts/check-quant-registry.py 2>/dev/null | grep -E '^[a-z_]+[[:space:]]+[0-9]+$')
+
+# --- dispatch-bypass debt ledger ---------------------------------------------
+# 222 arch-crate call sites reach Gpu::gemv_*/gemm_*/fused_* directly instead of
+# resolving through hipfire_dispatch::KernelRegistry, which has existed since
+# e822b319e. This is a debt TABLE, not a purity check: the rows record what is
+# owed per crate, growth fails, and paying down is a one-line edit. The holster
+# objective draws this ledger to zero over many commits, not one.
+while read -r _k _v; do
+  case "$_k" in [a-z]*) p "$_k" "$_v" ;; esac
+done < <(python3 scripts/check-dispatch-bypass.py 2>/dev/null | grep -E '^[a-z_]+[[:space:]]+[0-9]+$')
+
+# --- assertion -------------------------------------------------------------
+# The point of the file. A metric named in scripts/leanup-thresholds.txt must
+# satisfy its threshold or this exits non-zero.
+THRESH="scripts/leanup-thresholds.txt"
+if [ "$REPORT_ONLY" -eq 1 ]; then
+  echo
+  echo "(--report: thresholds not asserted)"
+  exit 0
+fi
+if [ ! -f "$THRESH" ]; then
+  echo
+  echo "leanup-ratchets: FAIL — $THRESH is missing."
+  echo "  Without it nothing is asserted, which is the state this gate exists to end."
+  exit 1
+fi
+
+fails=0
+checked=0
+while read -r metric op want; do
+  case "$metric" in ''|'#'*) continue ;; esac
+  got="${METRIC[$metric]:-}"
+  if [ -z "$got" ]; then
+    echo "leanup-ratchets: FAIL — threshold names unknown metric '$metric'."
+    echo "  A threshold on a metric that is not emitted silently protects nothing."
+    fails=$((fails+1)); continue
+  fi
+  got="${got%% *}"          # strip trailing annotation
+  checked=$((checked+1))
+  case "$op" in
+    "==") [ "$got" = "$want" ] || { echo "leanup-ratchets: FAIL $metric = $got, must be $want"; fails=$((fails+1)); } ;;
+    "<=") if [ "$got" -gt "$want" ] 2>/dev/null; then
+            echo "leanup-ratchets: FAIL $metric = $got, ceiling $want"; fails=$((fails+1))
+          fi ;;
+    *) echo "leanup-ratchets: FAIL — unknown operator '$op' for $metric"; fails=$((fails+1)) ;;
+  esac
+done < "$THRESH"
+
+echo
+if [ "$fails" -gt 0 ]; then
+  echo "leanup-ratchets: $fails violation(s) across $checked asserted metric(s)."
+  echo "  Lowering a ceiling after an improvement is expected. Raising one needs a"
+  echo "  sentence in the commit saying what was traded for it."
+  exit 1
+fi
+echo "leanup-ratchets: OK — $checked metric(s) asserted, 0 violations."
+

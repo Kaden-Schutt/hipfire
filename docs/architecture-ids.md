@@ -70,7 +70,7 @@ for `0xFF`).
 | Load (single arch-dispatch) | `hipfire_loader::load_model` → `REGISTRY` probe |
 | EP load | `hipfire_loader::load_model_ep` (9, 10) |
 | Spec target / emitter by id | `hipfire_loader::carrier_for` |
-| Generate short-circuits | `crates/hipfire-runtime/examples/daemon.rs` `generate` (EP first; then 7, 9, 11, 12, 10, 8; else qwen35/llama body) |
+| Generate short-circuits | `crates/hipfire-daemon/src/main.rs` `generate` (EP first; then 7, 9, 11, 12, 10, 8; else qwen35/llama body) |
 | Trait contract | `crates/hipfire-runtime/src/arch.rs` |
 
 Vision-capable loads: Qwen3.5-VL rides ids **5/6** with optional vision

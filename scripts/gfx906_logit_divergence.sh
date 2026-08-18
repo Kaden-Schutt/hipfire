@@ -39,7 +39,7 @@ if [ ! -f "$MODEL" ]; then
 fi
 
 # Build once.
-cargo build --release --features deltanet -p hipfire-runtime --example dump_logits_qwen35 \
+cargo build --release -p saddle-lab --features arch-qwen35 --example dump_logits_qwen35 \
     >/tmp/divergence_build.log 2>&1 || {
     echo "BUILD FAILED — see /tmp/divergence_build.log" >&2
     exit 1

@@ -6,22 +6,7 @@
 //! dispatcher [`crate::llama::KvCache::from_mode`] turns the resolved mode into
 //! the actual allocating constructor call.
 
-/// The resolved, validated KV-cache mode (plus one resolver-internal sentinel).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum KvMode {
-    Q8,
-    Asym2,
-    Asym3,
-    Asym4,
-    Fwht2,
-    Fwht3,
-    Fwht4,
-    /// SENTINEL — not an allocatable mode. Emitted only by site 3's
-    /// `normalize_dir` for its `auto`-set (`"" | "auto" | "turbo" | "turbo3"`).
-    /// `resolve` collapses it to `Asym3` (head_dim == 256) or `Q8` (else)
-    /// *before returning*, so [`crate::llama::KvCache::from_mode`] never sees it.
-    Asym3Auto,
-}
+pub use saddle_core::kv::KvMode;
 
 /// Per-site alias table + accepted set + default. One const per load site.
 pub struct KvModePolicy {

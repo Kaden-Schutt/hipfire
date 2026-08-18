@@ -5,14 +5,11 @@
 //!   * `quantize_to_format` — tier-name → existing `quantize_*` encoder dispatch.
 //!   * `reap_override_for`   — arch-aware tensor-name → override-tier resolver.
 
-use crate::{
-    gen_fwht_signs, load_ds4_head_importance, load_hessian_blocks, quantize_hfq4g256,
-    quantize_hfq6g256, quantize_mfp4g32_e8_2d, quantize_mfp4g32_e8_soa_2d,
-    quantize_mfp4g32_e8_soa_awls_2d, quantize_mfp4g32_e8_soa_gptq_2d,
-    quantize_mfp4g32_e8_soa_lsq_2d, quantize_mq2g256_lloyd, quantize_mq3g256_lloyd,
-    quantize_mq4g256, quantize_mq4g256_lloyd, quantize_mq6g256, quantize_q8f16, HfqTensor,
-    QuantType,
-};
+use crate::quant_fwht::{gen_fwht_signs, quantize_hfq4g256, quantize_mq4g256, quantize_mq6g256};
+use crate::quant_mq::{quantize_hfq6g256, quantize_mq2g256_lloyd, quantize_mq3g256_lloyd, quantize_mq4g256_lloyd};
+use crate::quant_e8::{load_ds4_head_importance, load_hessian_blocks, quantize_mfp4g32_e8_2d, quantize_mfp4g32_e8_soa_2d, quantize_mfp4g32_e8_soa_awls_2d, quantize_mfp4g32_e8_soa_gptq_2d, quantize_mfp4g32_e8_soa_lsq_2d};
+use crate::quant_q4::quantize_q8f16;
+use crate::hfq::{HfqTensor, QuantType};
 use hipfire_reap::plan::{QuantOverride, ReapPlan, Role};
 
 /// Quantize one tensor's f32 data to the named tier, returning the HFQ tensor.
@@ -746,7 +743,7 @@ mod prune_tests {
 #[cfg(test)]
 mod bake_finalize_tests {
     use super::*;
-    use crate::patch_expert_count_metadata;
+    use crate::hfq::patch_expert_count_metadata;
     use hipfire_reap::gather::gather_rows;
 
     #[test]
@@ -882,7 +879,8 @@ mod bake_finalize_tests {
 #[cfg(test)]
 mod integ {
     use super::*;
-    use crate::{quantize_hfq4g256, write_hfq};
+    use crate::hfq::write_hfq;
+    use crate::quant_fwht::quantize_hfq4g256;
     use hipfire_reap::plan::ReapPlan;
     use hipfire_runtime::hfq::HfqFile;
     use std::sync::Mutex;

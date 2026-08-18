@@ -107,7 +107,7 @@ def main():
     parser.add_argument("--model", required=True)
     parser.add_argument(
         "--daemon",
-        default=str(REPO / "target/release/examples/daemon"),
+        default=str(REPO / "target/release/daemon"),
     )
     parser.add_argument("--out", default=str(REPO / ".redline-work/redline-daemon-phases.json"))
     parser.add_argument("--log", default=str(REPO / ".redline-work/redline-daemon-phases.log"))

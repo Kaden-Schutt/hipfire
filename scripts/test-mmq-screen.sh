@@ -12,12 +12,12 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/rocm-env.sh"
 
 MODEL="${1:-$HOME/.hipfire/models/qwen3.5-9b.mq4}"
-EXE="target/release/examples/daemon"
+EXE="target/release/daemon"
 SYSTEM_FILE="benchmarks/prompts/tool_call_system.txt"
 
 if [ ! -f "$EXE" ]; then
     echo "Building daemon..."
-    cargo build --release --features deltanet --example daemon 2>/dev/null
+ cargo build --release -p hipfire-daemon 2>/dev/null
 fi
 
 if [ ! -f "$MODEL" ]; then

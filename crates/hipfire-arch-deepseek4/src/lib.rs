@@ -52,21 +52,29 @@
 //!   and the raw SWA + compressed-KV KV-cache layout).
 
 pub mod arch;
+pub mod arch_model;
 mod backend;
+pub mod carrier;
+pub mod config_cache;
 pub mod deepseek4;
 pub mod dsml;
 pub mod dspark_speculator;
+pub mod ep;
+pub mod mtp;
 pub mod forward;
-pub mod grammar;
+pub use saddle_core::grammar::dsml as grammar;
 pub mod heterogeneous;
 pub mod mtp_speculator;
-pub mod parent;
 pub mod sampling;
 pub mod spec_decode;
 pub mod spec_emit;
 pub mod spec_impl;
 
 pub use arch::{DeepseekV4, DeepseekV4HeterogeneousFault, DeepseekV4HeterogeneousProjection};
+pub use carrier::{
+    load_bundle as load_deepseek4_bundle,
+    load_heterogeneous_model as load_deepseek4_heterogeneous_model, Deepseek4LoadParts,
+};
 pub use deepseek4::{
     config_from_safetensors, CompressorCachePlacement, CompressorCacheShard, DeepseekV4Config,
     DeepseekV4DenseWeights, DeepseekV4HeterogeneousWeights, DeepseekV4OwnershipAudit,

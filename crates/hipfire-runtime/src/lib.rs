@@ -15,6 +15,7 @@
 
 pub mod admission;
 pub mod arch;
+pub mod arch_model;
 pub mod arch_spec;
 pub mod augmentor;
 pub mod bf16_loader;
@@ -49,6 +50,7 @@ pub mod multi_gpu;
 pub mod paro;
 pub mod prefix;
 pub mod reset_core;
+pub mod arch_mapping;
 pub mod safetensors_source;
 pub mod sampler;
 pub mod serve;

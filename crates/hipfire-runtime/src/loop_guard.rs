@@ -14,7 +14,7 @@
 //! overhead.
 //!
 //! Behavior is byte-identical to the inline detector previously in
-//! `crates/hipfire-runtime/examples/daemon.rs`. The defaults are read from
+//! `crates/hipfire-daemon/src/main.rs`. The defaults are read from
 //! `HIPFIRE_NGRAM_LOOP_THRESHOLD` (default 0 = disabled) and
 //! `HIPFIRE_NGRAM_WINDOW` (default 256). The threshold is `>=`, not `>`.
 

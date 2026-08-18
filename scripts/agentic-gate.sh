@@ -155,7 +155,7 @@ PY
 fi
 
 # ---- Setup -----------------------------------------------------------------
-EXE="./target/release/examples/daemon"
+EXE="./target/release/daemon"
 MODELS_DIR="${HIPFIRE_MODELS_DIR:-${HIPFIRE_DIR:-$HOME/.hipfire}/models}"
 OUT="${HIPFIRE_AGENTIC_GATE_OUT:-/tmp/agentic-gate-$(date +%Y%m%d-%H%M%S).md}"
 LOCK_SCRIPT="./scripts/gpu-lock.sh"
@@ -265,7 +265,7 @@ if [ ! -x "$EXE" ]; then
     rebuild=1
 else
     for src in crates/hipfire-arch-qwen35/src/qwen35.rs crates/hipfire-runtime/src/llama.rs \
-               crates/hipfire-runtime/src/hfq.rs crates/hipfire-runtime/examples/daemon.rs \
+               crates/hipfire-runtime/src/hfq.rs crates/hipfire-daemon/src/main.rs \
                crates/rdna-compute/src/dispatch.rs; do
         if [ -f "$src" ] && [ "$src" -nt "$EXE" ]; then
             rebuild=1; break
@@ -274,7 +274,7 @@ else
 fi
 if [ "$rebuild" -eq 1 ]; then
     echo "agentic-gate: rebuilding daemon..."
-    if ! cargo build --release --example daemon --features deltanet >&2; then
+ if ! cargo build --release -p hipfire-daemon >&2; then
         echo "agentic-gate: build failed" >&2
         exit 2
     fi

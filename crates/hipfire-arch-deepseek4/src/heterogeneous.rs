@@ -51,7 +51,7 @@ impl DeepseekV4VerifiedArtifact {
         let modified = metadata
             .modified()
             .map_err(|error| format!("deepseek4 mtime {}: {error}", path.display()))?;
-        let sha256 = crate::parent::manifest::sha256_file(&path)?;
+        let sha256 = hipfire_ds4_parent::manifest::sha256_file(&path)?;
         if sha256 != MQ2R_0731_SHA256 {
             return Err(format!(
                 "deepseek4 heterogeneous artifact SHA mismatch: got {sha256}, expected {MQ2R_0731_SHA256}"
@@ -604,7 +604,7 @@ impl DeepseekV4HeterogeneousModel {
         let model_sha256 = if let Some(verified) = verified {
             verified.validate(path)?
         } else {
-            let sha256 = crate::parent::manifest::sha256_file(path)?;
+            let sha256 = hipfire_ds4_parent::manifest::sha256_file(path)?;
             if sha256 != MQ2R_0731_SHA256 {
                 return Err(format!(
                     "deepseek4 heterogeneous artifact SHA mismatch: got {sha256}, expected {MQ2R_0731_SHA256}"
