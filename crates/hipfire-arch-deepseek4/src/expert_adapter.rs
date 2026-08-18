@@ -64,6 +64,16 @@ pub struct ExpertAdapter {
 }
 
 impl ExpertAdapter {
+    /// Release all device allocations owned by the optional adapter.
+    pub fn free_gpu(mut self, gpu: &mut Gpu) {
+        for layer in self.layers.drain(..) {
+            let _ = gpu.free_tensor(layer.a);
+            let _ = gpu.free_tensor(layer.b);
+        }
+        let _ = gpu.free_tensor(self.hidden);
+        let _ = gpu.free_tensor(self.scores);
+    }
+
     /// Parse and upload an adapter produced by `export_adapter.py`.
     pub fn load(path: &str, gpu: &mut Gpu) -> Result<Self, String> {
         let raw = std::fs::read(path).map_err(|e| format!("adapter read {path}: {e}"))?;

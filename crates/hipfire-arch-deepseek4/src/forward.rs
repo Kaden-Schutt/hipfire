@@ -16251,6 +16251,7 @@ pub fn forward_ep_prefill_batch_chunked(
                     layer_idx < cfg.num_hash_layers,
                     batch_size,
                     chunk,
+                    weights.expert_paging.as_ref(),
                 )?;
             }
             let ffn_buffers: Vec<_> = pbs_per_rank

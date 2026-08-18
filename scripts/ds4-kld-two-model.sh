@@ -9,17 +9,18 @@
 # Without pass 2's forcing the models diverge at token ~0 and the "KL" compares
 # unrelated continuations (measured ~30 nats — that was a bug in the method,
 # not a property of the quant).
-set -u
+set -euo pipefail
 
-OUT=/tmp/claude-1000/-tmp/ac2132a4-a2b1-4dc8-af3f-a222009177ec/scratchpad
-REPO=/home/nick/claude/wt/ds4-paging-beta
-EXE=$REPO/target/release/examples/daemon
-FP4=/data/hipfire-models/deepseek-v4-flash-0731.fp4
-MQ2=/data/hipfire-models/deepseek-v4-flash-0731.mq2lloyd
+REPO=${REPO:-$(cd "$(dirname "$0")/.." && pwd)}
+OUT=${OUT:-/tmp/hipfire-ds4-kld}
+EXE=${EXE:-$REPO/target/release/examples/daemon}
+FP4=${FP4:?set FP4 to the native-FP4 model path}
+MQ2=${MQ2:?set MQ2 to the MQ2-Lloyd model path}
 N=${N:-64}
-PROMPT="Explain how a hash table works, step by step, and describe what happens on a collision."
+PROMPT=${PROMPT:-"Explain how a hash table works, step by step, and describe what happens on a collision."}
 
-cd "$REPO" || exit 1
+mkdir -p "$OUT"
+cd "$REPO"
 rm -f "$OUT/kld2.done" "$OUT/kld2-fp4.bin" "$OUT/kld2-mq2.bin"
 
 run() {  # $1=model $2=tag $3=dump $4=forced-or-empty
@@ -41,6 +42,10 @@ t0=$(date +%s)
 run "$FP4" fp4 "$OUT/kld2-fp4.bin" ""
 REF=$(grep -a '"type":"committed"' "$OUT/kld2-fp4.jsonl" \
       | sed 's/.*"tok_id":[[:space:]]*\([0-9]*\).*/\1/' | paste -sd, -)
+if [[ -z "$REF" ]]; then
+  echo "reference run committed no tokens" >&2
+  exit 1
+fi
 echo "reference sequence: $(echo "$REF" | tr ',' '\n' | wc -l) tokens" > "$OUT/kld2.seq"
 run "$MQ2" mq2 "$OUT/kld2-mq2.bin" "$REF"
 t1=$(date +%s)
@@ -73,7 +78,12 @@ agree=sum(1 for i in range(m) if tp[i]==tq[i])
 print(f"positions: fp4={len(P)} mq2={len(Q)} -> comparing {n}")
 print(f"forced-sequence check: {agree}/{m} committed tokens identical "
       f"({'OK - teacher forcing held' if agree==m else 'MISMATCH - forcing failed, results invalid'})")
-if n==0: print("NO LOGITS"); raise SystemExit
+if n == 0:
+    raise SystemExit("NO LOGITS")
+if len(P) != len(Q):
+    raise SystemExit("logit record counts differ; comparison is incomplete")
+if not tp or tp != tq:
+    raise SystemExit("teacher forcing failed; committed sequences differ")
 def ls(v):
     mx=max(v); s=sum(math.exp(x-mx) for x in v); z=mx+math.log(s)
     return [x-z for x in v]

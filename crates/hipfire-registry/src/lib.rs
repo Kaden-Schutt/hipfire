@@ -377,7 +377,12 @@ impl RegistryV1 {
                 return Err(fail(format!("model '{tag}' has invalid size metadata")));
             }
             validate_digest(entry.sha256.as_deref(), tag).map_err(fail)?;
-            for sidecar in [&entry.triattn, &entry.mtp, &entry.dspark]
+            for sidecar in [
+                &entry.triattn,
+                &entry.mtp,
+                &entry.dspark,
+                &entry.expert_adapter,
+            ]
                 .into_iter()
                 .flatten()
             {

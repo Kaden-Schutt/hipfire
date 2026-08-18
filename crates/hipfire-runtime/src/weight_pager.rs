@@ -389,6 +389,49 @@ impl PreadH2DTransport {
         self.ns_prefetch_wait
     }
 
+    /// Release the optional async-prefetch resources. Every cleanup operation
+    /// is attempted even if an earlier one fails, so pinned memory and HIP
+    /// handles cannot leak merely because a pending transfer reported an error.
+    fn release_prefetch(&mut self, gpu: &Gpu) -> HipResult<()> {
+        let bind_result = gpu.bind_thread();
+        let wait_result = self.wait_prefetch(gpu);
+        self.pending_dst = None;
+        let Some(mut prefetch) = self.prefetch.take() else {
+            return wait_result;
+        };
+        let reader_result = match prefetch.reader.take() {
+            Some(reader) => reader
+                .join()
+                .map(|_| ())
+                .map_err(|_| hip_bridge::HipError::new(0, "prefetch reader panicked during cleanup")),
+            None => Ok(()),
+        };
+        let sync_result = if prefetch.in_flight {
+            gpu.hip.event_synchronize(&prefetch.event)
+        } else {
+            Ok(())
+        };
+        let event_result = gpu.hip.event_destroy(prefetch.event);
+        let stream_result = gpu.hip.stream_destroy(prefetch.stream);
+        let pinned_result = unsafe { gpu.hip.host_free(prefetch.pinned.0) };
+        bind_result
+            .and(wait_result)
+            .and(reader_result)
+            .and(sync_result)
+            .and(event_result)
+            .and(stream_result)
+            .and(pinned_result)
+    }
+
+    /// Explicit model-unload hook for the HIP resources owned by this
+    /// transport. `PreadH2DTransport` cannot clean these up in `Drop` because
+    /// HIP handle destruction requires the owning runtime.
+    pub fn free_gpu(&mut self, gpu: &Gpu) {
+        if let Err(error) = self.release_prefetch(gpu) {
+            eprintln!("weight_pager: async-prefetch cleanup failed: {error}");
+        }
+    }
+
     /// Lazily set up the async side: page-locked staging, a dedicated copy
     /// stream, and an event.
     ///
@@ -407,13 +450,10 @@ impl PreadH2DTransport {
                 "prefetch needs hipHostMalloc; runtime does not export it",
             ));
         }
-        // Drain and release any smaller buffer before replacing it.
-        if let Some(mut old) = self.prefetch.take() {
-            if old.in_flight {
-                gpu.hip.event_synchronize(&old.event)?;
-                old.in_flight = false;
-            }
-            unsafe { gpu.hip.host_free(old.pinned.0)? };
+        // Drain and release every resource owned by the smaller async side
+        // before replacing it.
+        if self.prefetch.is_some() {
+            self.release_prefetch(gpu)?;
         }
         let ptr = unsafe { gpu.hip.host_malloc(need)? };
         self.prefetch = Some(AsyncPrefetch {

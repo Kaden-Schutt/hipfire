@@ -956,6 +956,12 @@ impl Ds4ExpertPaging {
         self.rt.slots_per_blob()
     }
 
+    /// Release transport-owned pinned memory, stream, and event handles during
+    /// model unload.
+    pub fn free_gpu(&mut self, gpu: &rdna_compute::Gpu) {
+        self.transport.free_gpu(gpu);
+    }
+
     /// Read `count` i32 top-k indices from a device buffer into a host Vec of
     /// expert ids, clamped to the routed-expert range. Reuses scratch.
     pub fn read_topk(

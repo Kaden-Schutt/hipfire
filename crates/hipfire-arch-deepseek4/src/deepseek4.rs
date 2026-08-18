@@ -1299,6 +1299,18 @@ impl DeepseekV4Weights {
         free_opt(gpu, &mut self.head);
         free_opt(gpu, &mut self.hc_head_fn);
         free_opt(gpu, &mut self.hc_head_base);
+        if let Some(paging) = self.expert_paging.take() {
+            paging
+                .into_inner()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .free_gpu(gpu);
+        }
+        if let Some(adapter) = self.expert_adapter.take() {
+            adapter
+                .into_inner()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .free_gpu(gpu);
+        }
         for l in self.layers.drain(..) {
             l.free_gpu(gpu);
         }

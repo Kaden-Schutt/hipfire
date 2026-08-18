@@ -28218,12 +28218,15 @@ fn generate_deepseek4_spec(
 /// yielded ~30 nats, which is "different text", not quantization error.
 /// Forcing both models along one sequence makes position i genuinely
 /// comparable.
+static DS4_FORCED_TOKENS: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+static DS4_FORCE_NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn ds4_reset_force_tokens() {
+    DS4_FORCE_NEXT.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn ds4_force_token(_pos: u32) -> Option<u32> {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::OnceLock;
-    static FORCED: OnceLock<Vec<u32>> = OnceLock::new();
-    static NEXT: AtomicUsize = AtomicUsize::new(0);
-    let forced = FORCED.get_or_init(|| {
+    let forced = DS4_FORCED_TOKENS.get_or_init(|| {
         std::env::var("HIPFIRE_DS4_FORCE_TOKENS")
             .ok()
             .map(|v| {
@@ -28240,7 +28243,7 @@ fn ds4_force_token(_pos: u32) -> Option<u32> {
     // iteration share the same `pos`, so a pos-keyed lookup would hand out
     // forced[0] twice and shift everything after it. Each site is called exactly
     // once per committed token, so the counter tracks the emitted sequence.
-    let i = NEXT.fetch_add(1, Ordering::Relaxed);
+    let i = DS4_FORCE_NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     forced.get(i).copied()
 }
 
@@ -28300,6 +28303,9 @@ fn generate_deepseek4(
         );
         return;
     }
+    // Teacher forcing is request-scoped even though the parsed token list is
+    // process-global. Reset the cursor before each ordinary DS4 generation.
+    ds4_reset_force_tokens();
     let tokenizer = match m.tokenizer.as_ref() {
         Some(t) => t,
         None => {
