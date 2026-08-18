@@ -41,6 +41,12 @@ const BVS: &[usize] = &[8, 12]; // bt tiles; also test 4 if needed but 8/12 are 
 
 const HFQ4_BT_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_gfx12_bt.hip");
 const MQ4C_BT_SRC: &str = include_str!("../../../kernels/src/gemm_mq4cg256_residual_wmma_gfx12_bt.hip");
+// Arm C diagnostic: mq4c's 4 B per-256 fp16 header carried at v1's 136 B stride
+// (128 B payload + 4 B pad). Isolates HEADER SEMANTICS from GEOMETRY. qt=44 kept
+// the 136 B stride and gained prefill; qt=45 changed it to 132 and lost. This arm
+// tells us which variable owns the delta. NOT a shipping candidate: the 4 B pad
+// gives back the entire 2.43% size win.
+const MQ4CPAD_BT_SRC: &str = include_str!("../../../kernels/src/gemm_mq4cpad_residual_wmma_gfx12_bt.hip");
 
 fn f16_bits(x: f32) -> u16 {
     let b = x.to_bits();
@@ -239,12 +245,36 @@ fn main() {
             Ok(()) => eprintln!("compiled {sym_mq}"),
             Err(e) => eprintln!("compile {sym_mq} failed: {e}"),
         }
+        let sym_pad = format!("gemm_mq4cpad_residual_wmma_gfx12_bt{bv}");
+        let mod_pad = format!("bench_mq4cpad_bt{bv}");
+        match gpu.ensure_kernel_public(&mod_pad, MQ4CPAD_BT_SRC, &sym_pad) {
+            Ok(()) => eprintln!("compiled {sym_pad}"),
+            Err(e) => eprintln!("compile {sym_pad} failed: {e}"),
+        }
     }
     // also ensure bt4 present as sanity (not benched unless BVS includes 4)
     // quick check that at least one bt compiled
     // upload weights once
     let d_v1 = gpu.upload_raw(&b_v1, &[b_v1.len()]).unwrap();
     let d_mq4c = gpu.upload_raw(&b_mq4c, &[b_mq4c.len()]).unwrap();
+    // arm C buffer: mq4c's 4 B fp16 header laid out at EXACTLY v1's geometry --
+    // header at +0, 4 B pad at +4, 128 B payload at +8, 136 B stride. This makes
+    // the payload address sequence identical to v1's (136g+8), isolating header
+    // SEMANTICS (one fp16 pair vs two f32) from payload ALIGNMENT.
+    // Note: an earlier version of this arm left the payload at +4 and only changed
+    // the stride. That is NOT an isolation -- 136g+4 keeps mq4c's 4-mod-8 payload
+    // alignment, so it varied two things at once and answered nothing.
+    let b_pad: Vec<u8> = {
+        let mut v = vec![0u8; M * gpr * V1_BYTES];
+        for g in 0..(M * gpr) {
+            let src = &b_mq4c[g * MQ4C_BYTES..(g + 1) * MQ4C_BYTES];
+            let dst = g * V1_BYTES;
+            v[dst..dst + 4].copy_from_slice(&src[0..4]);
+            v[dst + 8..dst + V1_BYTES].copy_from_slice(&src[4..MQ4C_BYTES]);
+        }
+        v
+    };
+    let d_pad = gpu.upload_raw(&b_pad, &[b_pad.len()]).unwrap();
 
     // correctness gate first, then timing
     println!("\ncorrectness gate: M={M} K={K} gpr={gpr} batches {:?}  BVs {:?}", BATCHES, BVS);
@@ -266,17 +296,21 @@ fn main() {
         let y_host_mq = host_gemm(&b_mq4c, M, K, batch, x_f32, true);
 
         for &bv in BVS {
-            for (label, is_mq, host_ref) in [
-                (format!("v1_bt{bv}"), false, &y_host_v1),
-                (format!("mq4c_bt{bv}"), true, &y_host_mq),
+            // arm C shares arm B's host reference on purpose: identical header
+            // values and identical nibbles, only relocated to +8 at a 136 B
+            // stride. If the relocation is wrong, rel_l2 blows up here.
+            for (label, kind, host_ref) in [
+                (format!("v1_bt{bv}"), 0u8, &y_host_v1),
+                (format!("mq4c_bt{bv}"), 1u8, &y_host_mq),
+                (format!("mq4cpad_bt{bv}"), 2u8, &y_host_mq),
             ] {
-                let sym = if is_mq {
-                    format!("gemm_mq4cg256_residual_wmma_gfx12_bt{bv}")
-                } else {
-                    format!("gemm_hfq4g256_residual_wmma_gfx12_bt{bv}")
+                let sym = match kind {
+                    0 => format!("gemm_hfq4g256_residual_wmma_gfx12_bt{bv}"),
+                    1 => format!("gemm_mq4cg256_residual_wmma_gfx12_bt{bv}"),
+                    _ => format!("gemm_mq4cpad_residual_wmma_gfx12_bt{bv}"),
                 };
                 let d_y = gpu.zeros(&[batch*M], DType::F32).unwrap();
-                let a_ptr = if is_mq { &d_mq4c } else { &d_v1 };
+                let a_ptr = match kind { 0 => &d_v1, 1 => &d_mq4c, _ => &d_pad };
                 let grid = [ ((M+15)/16) as u32, ((batch + 16*bv -1)/(16*bv)) as u32, 1];
                 let block = [32u32,1,1];
                 let mut kb = KernargBlob::new();
@@ -332,16 +366,18 @@ fn main() {
         let weight_bytes_v1 = (M * gpr * V1_BYTES) as f64;
         let weight_bytes_mq = (M * gpr * MQ4C_BYTES) as f64;
         // per-arm samples map: key = label -> Vec<us per launch>
-        struct Arm { label: String, sym: String, is_mq: bool, bv: usize, samples: Vec<f64> }
+        // kind: 0 = v1 (136 B, f32 hdr), 1 = mq4c (132 B, fp16 hdr), 2 = mq4c hdr @ 136 B
+        struct Arm { label: String, sym: String, kind: u8, bv: usize, samples: Vec<f64> }
         let mut arms: Vec<Arm> = Vec::new();
         for &bv in BVS {
-            arms.push(Arm{ label: format!("v1_bt{bv}"), sym: format!("gemm_hfq4g256_residual_wmma_gfx12_bt{bv}"), is_mq: false, bv, samples: Vec::new() });
-            arms.push(Arm{ label: format!("mq4c_bt{bv}"), sym: format!("gemm_mq4cg256_residual_wmma_gfx12_bt{bv}"), is_mq: true, bv, samples: Vec::new() });
+            arms.push(Arm{ label: format!("v1_bt{bv}"), sym: format!("gemm_hfq4g256_residual_wmma_gfx12_bt{bv}"), kind: 0, bv, samples: Vec::new() });
+            arms.push(Arm{ label: format!("mq4c_bt{bv}"), sym: format!("gemm_mq4cg256_residual_wmma_gfx12_bt{bv}"), kind: 1, bv, samples: Vec::new() });
+            arms.push(Arm{ label: format!("mq4cpad_bt{bv}"), sym: format!("gemm_mq4cpad_residual_wmma_gfx12_bt{bv}"), kind: 2, bv, samples: Vec::new() });
         }
         // warmups
         for arm in &arms {
             let d_y = gpu.zeros(&[batch*M], DType::F32).unwrap();
-            let a_ptr = if arm.is_mq { &d_mq4c } else { &d_v1 };
+            let a_ptr = match arm.kind { 0 => &d_v1, 1 => &d_mq4c, _ => &d_pad };
             let grid = [ ((M+15)/16) as u32, ((batch + 16*arm.bv -1)/(16*arm.bv)) as u32, 1];
             let block = [32u32,1,1];
             for _ in 0..WARMUP {
@@ -360,7 +396,7 @@ fn main() {
         for _run in 0..RUNS {
             for arm in &mut arms {
                 let d_y = gpu.zeros(&[batch*M], DType::F32).unwrap();
-                let a_ptr = if arm.is_mq { &d_mq4c } else { &d_v1 };
+                let a_ptr = match arm.kind { 0 => &d_v1, 1 => &d_mq4c, _ => &d_pad };
                 let grid = [ ((M+15)/16) as u32, ((batch + 16*arm.bv -1)/(16*arm.bv)) as u32, 1];
                 let block = [32u32,1,1];
                 // pre-sync to flush
@@ -388,8 +424,9 @@ fn main() {
             }
         }
         // report
-        let bytes_for = |is_mq: bool| -> f64 {
-            let w = if is_mq { weight_bytes_mq } else { weight_bytes_v1 };
+        let bytes_for = |kind: u8| -> f64 {
+            // arm C streams v1's byte count (padded), arm B streams 2.43% less
+            let w = if kind == 1 { weight_bytes_mq } else { weight_bytes_v1 };
             // bytes = weight (read once) + X fp16 (batch*K*2) + Y F32 read+write (batch*M*4*2 for residual +=)
             w + (batch*K*2) as f64 + (batch*M*4*2) as f64
         };
@@ -398,7 +435,7 @@ fn main() {
         // need vs_v1 per BV: ratio = mq_min / v1_min same BV
         let mut v1_min_by_bv: std::collections::HashMap<usize,f64> = std::collections::HashMap::new();
         for arm in &arms {
-            if !arm.is_mq {
+            if arm.kind == 0 {
                 v1_min_by_bv.insert(arm.bv, minv(&arm.samples));
             }
         }
@@ -406,23 +443,27 @@ fn main() {
             let mn = minv(&arm.samples);
             let md = median(arm.samples.clone());
             let mx = maxv(&arm.samples);
-            let gbs = bytes_for(arm.is_mq) / (mn * 1e-6) / 1e9;
+            let gbs = bytes_for(arm.kind) / (mn * 1e-6) / 1e9;
             let base = v1_min_by_bv.get(&arm.bv).cloned().unwrap_or(f64::NAN);
-            let ratio = if arm.is_mq && base.is_finite() { format!("{:.4}", mn/base) } else { "-".to_string() };
+            let ratio = if arm.kind != 0 && base.is_finite() { format!("{:.4}", mn/base) } else { "-".to_string() };
             let ss: Vec<String> = arm.samples.iter().map(|v| format!("{:.1}", v)).collect();
             println!("{:<12} {:>9.1} {:>9.1} {:>9.1} {:>9.1} {:>9} {:>10}", arm.label, mn, md, mx, gbs, ratio, ss.join(","));
         }
         println!("GB/s = (weight + X_fp16 + Y_residual*2) / min_us. vs_v1 = mq_min / v1_min same BV ( <1 means mq faster).");
         // per-batch summary sentence
         for &bv in BVS {
-            let v1 = arms.iter().find(|a| !a.is_mq && a.bv==bv).unwrap();
-            let mq = arms.iter().find(|a| a.is_mq && a.bv==bv).unwrap();
-            let r = minv(&mq.samples)/minv(&v1.samples);
-            let delta = (r-1.0)*100.0;
-            let verdict = if r < 0.99 { "mq faster" } else if r > 1.01 { "mq slower" } else { "within noise (±1%)" };
-            println!("  bv={bv}: mq vs v1 = {r:.4} ({delta:+.2}%) — {verdict}");
+            let v1 = arms.iter().find(|a| a.kind==0 && a.bv==bv).unwrap();
+            for (kind, name) in [(1u8, "mq4c   "), (2u8, "mq4cpad")] {
+                let Some(mq) = arms.iter().find(|a| a.kind==kind && a.bv==bv) else { continue };
+                if mq.samples.is_empty() { continue; }
+                let r = minv(&mq.samples)/minv(&v1.samples);
+                let delta = (r-1.0)*100.0;
+                let verdict = if r < 0.99 { "faster than v1" } else if r > 1.01 { "slower than v1" } else { "within noise (±1%)" };
+                println!("  bv={bv}: {name} vs v1 = {r:.4} ({delta:+.2}%) — {verdict}");
+            }
         }
     }
-    println!("\nnote: arm C (a16, 528 B slab) DROPPED — ldsstage kernels are not on the dispatch path, so there is no misalignment to fix. This bench isolates the _bt kernels that actually ran.");
-    println!("If mq vs v1 is within noise, the 2.9% model-level prefill gap reproduces elsewhere (not this kernel).");
+    println!("\narm C (mq4cpad) = mq4c's 4 B fp16 header at v1's 136 B stride, 4 B pad.");
+    println!("If C ~= v1 while B is slower, the 132 B GEOMETRY owns the gap, not the fp16 header.");
+    println!("If C is also slower, the header/decode path owns it and the stride is innocent.");
 }
