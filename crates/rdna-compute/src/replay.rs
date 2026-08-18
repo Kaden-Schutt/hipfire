@@ -104,14 +104,9 @@ fn gfx1010_dependency_policy_from_config(
     device_name: &str,
 ) -> Result<Gfx1010DependencyPolicy, String> {
     let raw = hipfire_config::process_value("HIPFIRE_REPLAY_PM4_GFX1010_DEPENDENCY");
-    let policy =
-        gfx1010_dependency_policy_from_value(architecture, device_name, raw.as_deref())?;
+    let policy = gfx1010_dependency_policy_from_value(architecture, device_name, raw.as_deref())?;
     if gfx1010_release_wait_required(architecture, device_name) {
-        let source = if raw.is_none() {
-            "default"
-        } else {
-            "explicit"
-        };
+        let source = if raw.is_none() { "default" } else { "explicit" };
         eprintln!("[redline] gfx1010 PM4 dependency mode={policy:?} ({source})");
     }
     Ok(policy)
@@ -127,17 +122,21 @@ enum Gfx11EntryAcquirePolicy {
 
 impl Pm4Architecture {
     fn from_device(device: &GpuDevice) -> Result<Self, String> {
-        let name = device.name().to_ascii_lowercase();
+        Self::from_name(device.name())
+    }
+
+    fn from_name(device_name: &str) -> Result<Self, String> {
+        let name = device_name.to_ascii_lowercase();
         if name.starts_with("gfx10") {
             Ok(Self::Gfx10)
         } else if name.starts_with("gfx11") {
             Ok(Self::Gfx11)
-        } else if name.starts_with("gfx12") {
+        } else if matches!(name.as_str(), "gfx1200" | "gfx1201") {
             Ok(Self::Gfx12)
         } else {
             Err(format!(
                 "retained PM4 has no certified register map for HSA agent {:?}",
-                device.name()
+                device_name
             ))
         }
     }
@@ -354,6 +353,18 @@ impl Pm4Commands {
             Self::Gfx12(commands) => {
                 commands.wait_compute_idle();
                 Ok(())
+            }
+        }
+    }
+
+    fn gfx12_system_acquire(&mut self) -> Result<(), String> {
+        match self {
+            Self::Gfx12(commands) => {
+                commands.acquire_system_gfx12();
+                Ok(())
+            }
+            Self::Legacy { .. } => {
+                Err("gfx12 system acquire requested for a legacy PM4 stream".to_owned())
             }
         }
     }
@@ -924,6 +935,15 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             write(56),
             write(80),
         ]),
+        "gated_delta_net_f32" => Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            read(32),
+            write(40),
+            write(48),
+        ]),
         "gated_norm_f32" => Some(vec![read(0), read(8), read(16), write(24)]),
         "gated_norm_mq_rotate_gfx1100" | "gated_norm_mq_rotate_gfx1151" => Some(vec![
             read(0),
@@ -1323,7 +1343,31 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "fused_qkvza_hfq4g256_ldsx8"
         | "fused_qkvza_hfq4g256_reduce_chain"
         | "gated_delta_net_q8_fast" => Some(96),
+        "gated_delta_net_f32" => Some(80),
         _ => None,
+    }
+}
+
+fn apply_qwen_q8_full_attention_visibility(
+    launches: &[RecordedHipLaunch],
+    headers: &mut [HeaderPolicy],
+) {
+    // The Q8 full-attention body carries intermediate Q/K/V, tile reductions,
+    // and the gated attention result through separate global-memory buffers.
+    // Same-queue barriers alone reproduced stale intermediates on gfx1201;
+    // restoring the captured HIP dispatches' system scopes for this narrow
+    // body makes the multi-position AQL state/logit/KV shadow bit-exact.
+    debug_assert_eq!(launches.len(), headers.len());
+    let mut full_attention_body = false;
+    for (launch, header) in launches.iter().zip(headers) {
+        let kernel = launch.kernel.as_str();
+        full_attention_body |= kernel == "fused_qkv_hfq4g256";
+        if full_attention_body {
+            *header = HeaderPolicy::RECORDED_DISPATCH;
+        }
+        if full_attention_body && kernel == "gemv_hfq4g256_residual" {
+            full_attention_body = false;
+        }
     }
 }
 
@@ -2376,6 +2420,12 @@ fn required_mid_acquire(previous: &str, current: &str) -> bool {
     )
 }
 
+/// Reused rotate destinations need their stale GC12 vector-cache line
+/// invalidated before the writer executes in a retained IB.
+fn requires_gfx12_pre_dispatch_vmem_acquire(current: &str) -> bool {
+    current == "mq_rotate_x" || current == "fused_silu_mul_mq_rotate"
+}
+
 fn conservative_mid_acquire_except(previous: &str, current: &str, excluded: Option<&str>) -> bool {
     if previous.starts_with("gated_delta_net_q8_compact2_")
         || current.starts_with("gated_delta_net_q8_compact2_")
@@ -3260,6 +3310,13 @@ impl ReplayController {
         self.request != ReplayBackendRequest::Hip && self.state != ReplayState::Fallback
     }
 
+    /// Whether this controller owns the production one-shot capture lifecycle.
+    /// Manual shadow/profiling controllers deliberately remain available for
+    /// diagnosing routes which are not yet safe for automatic serving.
+    pub fn automatic_lifecycle_enabled(&self) -> bool {
+        self.auto_lifecycle
+    }
+
     pub fn should_auto_finalize_capture(&self) -> bool {
         self.auto_lifecycle && self.is_recording()
     }
@@ -3467,6 +3524,7 @@ impl ReplayController {
                 _ => {}
             }
         }
+        apply_qwen_q8_full_attention_visibility(&self.recorded[..prefix], &mut headers);
         let graph = if self.request == ReplayBackendRequest::Auto {
             SingleQueueBatchGraph::create_unprofiled_with_dispatch_headers(
                 &device,
@@ -3803,7 +3861,13 @@ impl ReplayController {
                         }
                         Pm4WaitPolicy::Resource => resources_independent,
                     };
-                    if !independent {
+                    // GC12 can retain a vector-cache line for the reused
+                    // rotated-output allocation across dispatches in one IB.
+                    // Invalidate it before the writer starts; a consumer-side
+                    // acquire after the writer is too late for this hazard.
+                    let gfx12_pre_dispatch_acquire = pm4_architecture == Pm4Architecture::Gfx12
+                        && requires_gfx12_pre_dispatch_vmem_acquire(current);
+                    if gfx12_pre_dispatch_acquire || !independent {
                         dependency_waits += 1;
                         boundary.wait_compute_idle = true;
                         commands.wait_compute_idle()?;
@@ -3813,7 +3877,11 @@ impl ReplayController {
                         || self
                             .pm4_mid_acquire_policy
                             .acquire_between(previous, current);
-                    if acquire {
+                    if gfx12_pre_dispatch_acquire {
+                        dependency_acquires += 1;
+                        boundary.acquire_vmem = true;
+                        commands.gfx12_system_acquire()?;
+                    } else if acquire {
                         dependency_acquires += 1;
                         boundary.acquire_vmem = pm4_vmem_acquire_enabled(
                             pm4_architecture,
@@ -4523,6 +4591,20 @@ fn put_u32(bytes: &mut [u8], offset: usize, value: u32) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn pm4_architecture_fails_closed_for_unknown_gfx12_devices() {
+        assert_eq!(
+            Pm4Architecture::from_name("gfx1200"),
+            Ok(Pm4Architecture::Gfx12)
+        );
+        assert_eq!(
+            Pm4Architecture::from_name("GFX1201"),
+            Ok(Pm4Architecture::Gfx12)
+        );
+        assert!(Pm4Architecture::from_name("gfx1202").is_err());
+        assert!(Pm4Architecture::from_name("gfx12-future").is_err());
+    }
+
     const A3B_REPLAY_KERNELS: &[&str] = &[
         "fused_rmsnorm_mq_rotate",
         "fused_rmsnorm_mq_rotate_vecsum",
@@ -4783,8 +4865,7 @@ mod tests {
     #[test]
     fn gfx1010_dependency_policy_defaults_to_release_wait() {
         assert_eq!(
-            gfx1010_dependency_policy_from_value(Pm4Architecture::Gfx10, "gfx1010", None)
-                .unwrap(),
+            gfx1010_dependency_policy_from_value(Pm4Architecture::Gfx10, "gfx1010", None).unwrap(),
             Gfx1010DependencyPolicy::ReleaseWait
         );
         assert_eq!(
@@ -4825,12 +4906,9 @@ mod tests {
             "true",
             "falsé",
         ] {
-            let err = gfx1010_dependency_policy_from_value(
-                Pm4Architecture::Gfx10,
-                "gfx1010",
-                Some(raw),
-            )
-            .unwrap_err();
+            let err =
+                gfx1010_dependency_policy_from_value(Pm4Architecture::Gfx10, "gfx1010", Some(raw))
+                    .unwrap_err();
             assert!(
                 err.contains("HIPFIRE_REPLAY_PM4_GFX1010_DEPENDENCY"),
                 "missing key in error for {raw:?}: {err}"
@@ -5082,6 +5160,48 @@ mod tests {
 
         assert!(expected_kernarg_bytes("unknown_kernel_xyz").is_none());
         assert!(pointer_effects("unknown_kernel_xyz").is_none());
+    }
+
+    #[test]
+    fn deltanet_f32_retained_effect_contract_covers_recurrent_state() {
+        assert_eq!(expected_kernarg_bytes("gated_delta_net_f32"), Some(80));
+        let effects = pointer_effects("gated_delta_net_f32").expect("GDN FP32 contract");
+        assert_eq!(effects.len(), 7);
+        assert_eq!(effects[5].offset, 40);
+        assert_eq!(effects[5].mode, RecordedAccessMode::Write);
+        assert_eq!(effects[6].offset, 48);
+        assert_eq!(effects[6].mode, RecordedAccessMode::Write);
+    }
+
+    #[test]
+    fn qwen_q8_full_attention_aql_body_uses_system_visibility() {
+        let launch = |kernel: &str| RecordedHipLaunch {
+            kernel: kernel.to_owned(),
+            artifact: None,
+            grid: [1; 3],
+            block: [32, 1, 1],
+            shared_mem: 0,
+            grid_binding: None,
+            kernarg: Vec::new(),
+            accesses: None,
+        };
+        let launches = vec![
+            launch("before"),
+            launch("fused_qkv_hfq4g256"),
+            launch("attention_flash_q8_0_tile"),
+            launch("attention_flash_q8_0_reduce"),
+            launch("gemv_hfq4g256_residual"),
+            launch("after"),
+        ];
+        let mut headers = vec![HeaderPolicy::BATCH_BOUNDARY_INTERNAL_SERIAL; launches.len()];
+
+        apply_qwen_q8_full_attention_visibility(&launches, &mut headers);
+
+        assert_eq!(headers[0], HeaderPolicy::BATCH_BOUNDARY_INTERNAL_SERIAL);
+        assert!(headers[1..=4]
+            .iter()
+            .all(|header| *header == HeaderPolicy::RECORDED_DISPATCH));
+        assert_eq!(headers[5], HeaderPolicy::BATCH_BOUNDARY_INTERNAL_SERIAL);
     }
 
     #[test]
@@ -5351,6 +5471,16 @@ mod tests {
         assert!(!independent_sibling(
             "gemv_hfq4g256_moe_gate_up_k8_indexed",
             "fused_silu_mul_mq_rotate",
+        ));
+    }
+
+    #[test]
+    fn gfx12_rotated_vmem_writers_require_a_pre_dispatch_acquire() {
+        for producer in ["mq_rotate_x", "fused_silu_mul_mq_rotate"] {
+            assert!(requires_gfx12_pre_dispatch_vmem_acquire(producer));
+        }
+        assert!(!requires_gfx12_pre_dispatch_vmem_acquire(
+            "gemv_hfq4g256_residual"
         ));
     }
 

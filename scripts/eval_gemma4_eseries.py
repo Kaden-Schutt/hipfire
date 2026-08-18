@@ -355,6 +355,11 @@ def main() -> int:
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--prefill-batch", type=int, default=8)
     parser.add_argument("--runtime-home", type=Path)
+    parser.add_argument(
+        "--closed-think",
+        action="store_true",
+        help="start generation after a closed thinking span (Qwen no-think validation)",
+    )
     args = parser.parse_args()
     if args.suite == "longbench" and (not args.dataset or not args.manifest):
         parser.error("longbench requires --dataset and --manifest")
@@ -404,6 +409,7 @@ def main() -> int:
         "temperature": 0.0,
         "kv_mode": "q8",
         "prefill_batch": args.prefill_batch,
+        "closed_think": args.closed_think,
         "repeats": args.repeats,
         "manifest": manifest_data,
     }
@@ -440,11 +446,14 @@ def main() -> int:
         if loaded.get("type") != "loaded":
             raise RuntimeError(f"load failed: {loaded}")
         daemon.request({"type": "reset", "attempt_id": 1}, {"reset", "error"}, 60)
-        warm, _ = daemon.request(
-            {
+        warm_request = {
                 "type": "generate", "id": "warmup", "attempt_id": 1,
                 "prompt": "Reply with exactly: ready", "temperature": 0.0, "max_tokens": 8,
-            },
+            }
+        if args.closed_think:
+            warm_request.update(assistant_prefix="closed_think", max_think_tokens=1)
+        warm, _ = daemon.request(
+            warm_request,
             {"done", "error", "aborted"}, args.timeout,
         )
         if warm.get("type") != "done":
@@ -467,6 +476,8 @@ def main() -> int:
                 "repeat_penalty": 1.0,
                 "max_tokens": max_tokens,
             }
+            if args.closed_think:
+                request.update(assistant_prefix="closed_think", max_think_tokens=1)
             started = time.monotonic()
             try:
                 done, events = daemon.request(request, {"done", "error", "aborted"}, args.timeout)
