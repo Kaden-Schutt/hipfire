@@ -3991,6 +3991,77 @@ pub fn gemv_hfq3g256_residual_for_arch(caps: &ArchCaps) -> (&'static str, &'stat
 /// 32 threads × 4 elements = 128 per group. Each thread reads 1 byte.
 pub const GEMV_HFQ2G128_SRC: &str = include_str!("../../../kernels/src/gemv_hfq2g128.hip");
 
+/// TQ2-G128: PrismML Q2_0-layout ternary dequant-to-f16 correctness oracle.
+/// [FP16 d (2B)][2-bit × 128 (32B)] = 34 bytes per 128-weight group.
+/// 32 threads × 4 elements = 128 per group. Each thread reads 1 byte.
+/// code -> (code - 1) * d, i.e. {0,1,2,3} -> {-d, 0, +d, +2d}.
+pub const DEQUANT_TQ2G128_TO_F16_SRC: &str =
+    include_str!("../../../kernels/src/dequant_tq2g128_to_f16.hip");
+
+/// BQ1-G128: PrismML Q1_0-layout binary dequant-to-f16 correctness oracle.
+/// [FP16 d (2B)][1-bit × 128 (16B)] = 18 bytes per 128-weight group.
+/// 32 threads × 4 elements = 128 per group. Each thread reads 4 bits (half a byte).
+/// bit -> {0,1} -> {-d, +d}.
+pub const DEQUANT_BQ1G128_TO_F16_SRC: &str =
+    include_str!("../../../kernels/src/dequant_bq1g128_to_f16.hip");
+
+/// TQ2-G128 GEMV: correctness-first FP decode GEMV for PrismML Q2_0 ternary.
+/// Mirrors GEMV_HFQ2G128_SRC's layout/reduction, swapping the affine
+/// [f32 scale][f32 zero][32B codes] (40B) block for the ternary
+/// [FP16 d (2B)][32B codes] (34B) block and the `scale*code+zero` map for
+/// `(code - 1) * d`.
+pub const GEMV_TQ2G128_SRC: &str = include_str!("../../../kernels/src/gemv_tq2g128.hip");
+
+/// BQ1-G128 GEMV: correctness-first FP decode GEMV for PrismML Q1_0 binary.
+/// Mirrors GEMV_TQ2G128_SRC's layout/reduction, swapping the ternary
+/// [FP16 d (2B)][32B codes] (34B) block for the binary
+/// [FP16 d (2B)][16B codes] (18B) block and the `(code - 1) * d` map for
+/// the 1-bit sign decode `bit ? +d : -d`.
+pub const GEMV_BQ1G128_SRC: &str = include_str!("../../../kernels/src/gemv_bq1g128.hip");
+
+/// x-batched TQ2-G128 GEMV: `y[b] = A . x[b]` for b in 0..B, reading each
+/// weight row ONCE instead of once per b. This is the prefill / multi-stream
+/// path: without it these formats fall back to per-token GEMV, so prefill
+/// runs at decode speed and the batched backend rejects the model outright.
+pub const GEMV_TQ2G128_XBATCH_SRC: &str = concat!(
+    "#define HIPFIRE_TQ2G128_XBATCH 1\n",
+    "#define HIPFIRE_TQ2G128_XBATCH_MAX 4\n",
+    "#define HIPFIRE_TQ2G128_XBATCH_KERNEL gemv_tq2g128_xbatch\n",
+    include_str!("../../../kernels/src/gemv_tq2g128.hip")
+);
+
+/// Binary sibling of [`GEMV_TQ2G128_XBATCH_SRC`].
+pub const GEMV_BQ1G128_XBATCH_SRC: &str = concat!(
+    "#define HIPFIRE_BQ1G128_XBATCH 1\n",
+    "#define HIPFIRE_BQ1G128_XBATCH_MAX 4\n",
+    "#define HIPFIRE_BQ1G128_XBATCH_KERNEL gemv_bq1g128_xbatch\n",
+    include_str!("../../../kernels/src/gemv_bq1g128.hip")
+);
+
+/// Batched 4-way FUSED TQ2-G128 GEMM for the DeltaNet LA preamble: one
+/// launch covering qkv+z+beta+alpha, mirroring GEMM_QKVZA_HFQ4G256_SRC.
+/// The unfused path issues four launches; closing that gap is what remains
+/// between low-bit prefill and the same-size mq4 model.
+pub const GEMM_QKVZA_TQ2G128_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkvza_tq2g128.hip");
+
+/// WMMA prefill GEMM over PACKED TQ2-G128 blocks + F16 activations.
+/// Dequantises each 16-element A fragment straight into registers and feeds
+/// the matrix cores, mirroring GEMM_HFQ4G256_WMMA_SRC. gfx1100+ only.
+pub const GEMM_TQ2G128_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_tq2g128_wmma.hip");
+
+/// Binary sibling of [`GEMM_TQ2G128_WMMA_SRC`].
+pub const GEMM_BQ1G128_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_bq1g128_wmma.hip");
+
+/// Tiled prefill GEMM over PACKED TQ2-G128 blocks — no dequant, no F16 copy.
+/// Decodes each code byte once and reuses it across a tile of TILE_N tokens.
+pub const GEMM_TQ2G128_PREFILL_SRC: &str =
+    include_str!("../../../kernels/src/gemm_tq2g128_prefill.hip");
+
+/// Binary sibling of [`GEMM_TQ2G128_PREFILL_SRC`].
+pub const GEMM_BQ1G128_PREFILL_SRC: &str =
+    include_str!("../../../kernels/src/gemm_bq1g128_prefill.hip");
+
 /// HFQ4-G256 wide GEMV: 2 rows per block (64 threads = 2 warps).
 /// Each warp processes one row independently. Halves grid size.
 pub const GEMV_HFQ4G256_WIDE_SRC: &str =

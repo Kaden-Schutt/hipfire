@@ -10,6 +10,26 @@ use crate::types::*;
 /// Each entry pairs a KernelKey with the arch predicate that must
 /// be satisfied.
 pub fn populate(registry: &mut KernelRegistry) {
+    // Low-bit prefill GEMMs. BatchGe(32): below that the 64x64 tile is
+    // underfilled and the scalar GEMV loop still wins (measured 0.3x at N=8,
+    // 1.2x at N=32, 2.6x at N=128), so the gate keeps short chunks on the
+    // per-token path rather than making them slower.
+    registry.register(KernelVariant {
+        key: KernelKey::GemmTQ2G128Prefill,
+        arch_required: ArchPredicate::Always,
+        shape_gate: Some(ShapePredicate::BatchGe(32)),
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
+        tile: TileImpl::None,
+    });
+    registry.register(KernelVariant {
+        key: KernelKey::GemmBQ1G128Prefill,
+        arch_required: ArchPredicate::Always,
+        shape_gate: Some(ShapePredicate::BatchGe(32)),
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
+        tile: TileImpl::None,
+    });
     registry.register(KernelVariant {
         key: KernelKey::GemmF32RegisterTiled,
         arch_required: ArchPredicate::Always,

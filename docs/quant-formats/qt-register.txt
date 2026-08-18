@@ -74,5 +74,5 @@
 37  MFP2G32E8     arch-loaded  qwen35 load.rs owns the MFP2-E8 upload path
 38  MQ2G256GL     passthrough
 39  MQ3G256GL     passthrough
-40  TQ2G128       reserved     PR #597 Bonsai ternary; convert to passthrough when it lands
-41  BQ1G128       reserved     PR #597 Bonsai 1-bit; won the qt=41 adjudication 2026-08-18
+40  TQ2G128       passthrough  PR #597 Bonsai ternary
+41  BQ1G128       passthrough  PR #597 Bonsai 1-bit; won the qt=41 adjudication 2026-08-18

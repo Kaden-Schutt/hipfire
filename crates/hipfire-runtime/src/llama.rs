@@ -1768,6 +1768,10 @@ pub fn is_batchable_la(dt: DType, arch: &str) -> bool {
             | DType::MQ6G256
             | DType::HFQ6G256
             | DType::Q8_0
+            // TQ2G128/BQ1G128 (PrismML Bonsai ternary/binary). Unrotated plain
+            // tiled prefill GEMMs; lockstep with qwen35::is_batchable_la.
+            | DType::TQ2G128
+            | DType::BQ1G128
     );
     if always_ok {
         return true;
@@ -5796,7 +5800,6 @@ impl KvCacheExt for KvCache {
         }
     }
 
-
     fn from_mode(mode: KvMode, target: KvTarget, dims: &KvDims) -> HipResult<Self>
     where
         Self: Sized,
@@ -8480,7 +8483,6 @@ mod tests {
             KvTierPlan::derive(legacy).unwrap().write_key,
         );
     }
-
 
     #[test]
     fn free_gpu_empty_cache_is_ok() {

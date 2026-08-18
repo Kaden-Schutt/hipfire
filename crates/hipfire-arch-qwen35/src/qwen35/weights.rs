@@ -5,19 +5,19 @@
 //! Qwen3.5 weight structs (dense / MoE layers), EP shard provenance and seals,
 //! `Qwen35Weights`, and the persistent DeltaNet state (`DeltaNetState`).
 
+use super::config::LayerType;
+use super::config::Qwen35Config;
 use hip_bridge::HipError;
 use hip_bridge::HipResult;
-use hipfire_runtime::MmqScreenable;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::EmbeddingFormat;
 use hipfire_runtime::llama::WeightTensor;
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::screen_weight_tensor;
+use hipfire_runtime::MmqScreenable;
 use rdna_compute::DType;
 use rdna_compute::Gpu;
 use rdna_compute::GpuTensor;
-use super::config::LayerType;
-use super::config::Qwen35Config;
 
 // ─── Weight structs ─────────────────────────────────────────────────────
 
@@ -103,7 +103,9 @@ pub(crate) struct PackedExpertOwners {
 /// `None`, which `MoeResolution::resolve` collapses to the unchanged uniform
 /// fast path. We pre-filter to `None` for the uniform/empty cases here so the
 /// common path allocates nothing and is byte-identical to before SP2.
-pub(crate) fn per_expert_tier_tables(ffn: &MoeFfnWeights) -> (Option<Vec<DType>>, Option<Vec<DType>>) {
+pub(crate) fn per_expert_tier_tables(
+    ffn: &MoeFfnWeights,
+) -> (Option<Vec<DType>>, Option<Vec<DType>>) {
     if let Some(global) = ffn.global_expert_dtypes.as_ref() {
         let gu: Vec<DType> = global.iter().map(|(g, _)| *g).collect();
         let dn: Vec<DType> = global.iter().map(|(_, d)| *d).collect();
@@ -178,6 +180,8 @@ pub(crate) fn dtype_from_quant_type(qt: u8) -> HipResult<DType> {
         37 => Ok(DType::MFP2G32E8),
         38 => Ok(DType::MQ2G256GL),
         39 => Ok(DType::MQ3G256GL),
+        40 => Ok(DType::TQ2G128),
+        41 => Ok(DType::BQ1G128),
         6 => Ok(DType::HFQ4G256),
         3 => Ok(DType::Q8_0),
         1 => Ok(DType::F16),
@@ -1410,7 +1414,12 @@ impl DeltaNetState {
     /// Non-owning single-lane view into state allocated by
     /// [`Self::new_batched_with_quant`]. Used only to seed prompts through the
     /// existing sequential prefill path. The returned view must not be freed.
-    pub(crate) fn q8_lane_view(&self, config: &Qwen35Config, lane: usize, batch: usize) -> HipResult<Self> {
+    pub(crate) fn q8_lane_view(
+        &self,
+        config: &Qwen35Config,
+        lane: usize,
+        batch: usize,
+    ) -> HipResult<Self> {
         if self.quant != StateQuant::Q8 || lane >= batch {
             return Err(HipError::new(
                 0,

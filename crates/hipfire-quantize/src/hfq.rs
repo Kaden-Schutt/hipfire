@@ -3,25 +3,30 @@
 // Copyright (c) 2026 Nick Woolmer
 // hipfire — see LICENSE and NOTICE in the project root.
 
-
-#![allow(dead_code, unused_imports, unused_variables, non_snake_case, clippy::all)]
+#![allow(
+    dead_code,
+    unused_imports,
+    unused_variables,
+    non_snake_case,
+    clippy::all
+)]
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::fs::File;
 use std::io::Write;
-use std::sync::OnceLock;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
-use clap::Parser;
-use hipfire_quantize::float16::{bf16_to_f32, f16_to_f32, f32_to_f16};
-use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
-use hipfire_quantize::hessian_io;
 use crate::e8;
 use crate::e8_gptq;
 use crate::gguf_input;
 use crate::pipeline_gguf::GgufFormat;
 use crate::reap_overlay;
+use clap::Parser;
+use hipfire_quantize::float16::{bf16_to_f32, f16_to_f32, f32_to_f16};
+use hipfire_quantize::hessian_io;
+use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
 
 // ─── HFQ File Format ────────────────────────────────────────────────────────
 
@@ -73,6 +78,8 @@ impl QuantType {
             37 => Some(Self::MFP2G32E8),
             38 => Some(Self::MQ2G256GL),
             39 => Some(Self::MQ3G256GL),
+            40 => Some(Self::TQ2G128),
+            41 => Some(Self::BQ1G128),
             _ => None,
         }
     }
@@ -163,7 +170,14 @@ pub(crate) enum QuantType {
     MFP3G32E8 = 36, // mfp3-E8: MFP4G32E8 frame, 3-bit lattice (center 3), 13 B/blk, 3.25 bpw.
     // Drop-in cold tier for MQ3G256Lloyd (tag 3 → tag 5).
     MFP2G32E8 = 37, // mfp2-E8: MFP4G32E8 frame, 2-bit lattice (center 1), 9 B/blk, 2.25 bpw.
-                    // Drop-in cold tier for MQ2G256Lloyd (tag 1 → tag 6).
+    // Drop-in cold tier for MQ2G256Lloyd (tag 1 → tag 6).
+    TQ2G128 = 40, // TQ2G128: PrismML Q2_0-compatible scale-only ternary, g128, 34 B/blk
+    // (2.125 bpw). [FP16 d][32B 2-bit codes], code=(w/d)+1 clamped 0..2,
+    // dequant w=(code-1)*d. Byte-identical to GGUF ggml_type Q2_0=42.
+    // See findings/prismml-q2_0-layout.md.
+    BQ1G128 = 41, // BQ1G128: PrismML Q1_0-compatible scale-only binary, g128, 18 B/blk
+                  // (1.14 bpw). [FP16 d][16B sign bits], bit set for +d.
+                  // Byte-identical to GGUF ggml_type Q1_0=41.
 }
 
 /// Per-tensor precision level assigned by the K-map pre-pass.
@@ -210,6 +224,8 @@ pub(crate) fn default_promote_target(base: GgufFormat) -> GgufFormat {
         GgufFormat::Mfp4E8Soa => GgufFormat::Mfp4E8Soa,
         GgufFormat::Mfp3E8 => GgufFormat::Mfp3E8,
         GgufFormat::Mfp2E8 => GgufFormat::Mfp2E8,
+        GgufFormat::Ternary => GgufFormat::Ternary,
+        GgufFormat::Binary => GgufFormat::Binary,
     }
 }
 
@@ -317,7 +333,12 @@ pub(crate) fn kmap_resolve(name: &str, n_layers: usize, is_moe: bool) -> QuantLe
     kmap_resolve_mode(name, n_layers, is_moe, 0)
 }
 
-pub(crate) fn kmap_resolve_mode(name: &str, n_layers: usize, is_moe: bool, kmap_mode: u8) -> QuantLevel {
+pub(crate) fn kmap_resolve_mode(
+    name: &str,
+    n_layers: usize,
+    is_moe: bool,
+    kmap_mode: u8,
+) -> QuantLevel {
     // Vision tensors (809 on Glimmer) stay F16 and must not be mis-classified
     // as text. This also prevents `vision_tower.layers.N` from being parsed
     // as a text layer index for edge-layer Promote6. Additive: text tensors

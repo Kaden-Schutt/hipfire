@@ -3,29 +3,35 @@
 // Copyright (c) 2026 Nick Woolmer
 // hipfire — see LICENSE and NOTICE in the project root.
 
-
-
-#![allow(dead_code, unused_imports, unused_variables, non_snake_case, clippy::all)]
+#![allow(
+    dead_code,
+    unused_imports,
+    unused_variables,
+    non_snake_case,
+    clippy::all
+)]
 
 use crate::dequant::{e2m1_to_f32, e4m3_to_f32, ue8m0_to_scale};
-use crate::quant_hfp4::{e4m3_scale_decode, e4m3_scale_encode_roundup, E2M1_LUT, e2m1_round};
 use crate::quant_fwht::{cpu_fwht_256, gen_fwht_signs};
+use crate::quant_hfp4::{e2m1_round, e4m3_scale_decode, e4m3_scale_encode_roundup, E2M1_LUT};
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::fs::File;
 use std::io::Write;
-use std::sync::OnceLock;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
-use clap::Parser;
-use hipfire_quantize::float16::{bf16_to_f32, f16_to_f32, f32_to_f16};
-use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
-use hipfire_quantize::hessian_io;
 use crate::e8;
 use crate::e8_gptq;
 use crate::gguf_input;
+use crate::hfq::QuantType;
+use crate::pipeline_gguf::GgufFormat;
 use crate::reap_overlay;
+use clap::Parser;
+use hipfire_quantize::float16::{bf16_to_f32, f16_to_f32, f32_to_f16};
+use hipfire_quantize::hessian_io;
+use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
 
 /// MagnumQuant MQ3-G256: FWHT-rotated 3-bit quantization.
 /// Same binary format as HFQ3-G256 (104 bytes/group). Rotation is baked into
@@ -1158,7 +1164,11 @@ pub(crate) fn quantize_mq2g256_lloyd(f32_data: &[f32], signs1: &[f32], signs2: &
 /// 72 B/group (true 1.58-bpw packing — 5 ternary/byte — is a mechanical
 /// follow-up once coherence is established). Gated by HIPFIRE_LLOYD_K3=1 on the
 /// `--format mq2lloyd` path. Output DType = MQ2G256Lloyd (kernel-agnostic to K).
-pub(crate) fn quantize_mq2g256_lloyd_k3(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+pub(crate) fn quantize_mq2g256_lloyd_k3(
+    f32_data: &[f32],
+    signs1: &[f32],
+    signs2: &[f32],
+) -> Vec<u8> {
     use rayon::prelude::*;
     let group_size = 256;
     let block_bytes = 72;
@@ -1341,7 +1351,11 @@ pub(crate) fn dequantize_mq2g256_lloyd_to_f32(
 /// the GL codec's noise and re-packs as HFQ4G256 so the file loads on today's
 /// runtime with no engine, loader, or kernel changes. Both probes land in the
 /// same HFQ4 container, so a KLD delta between them isolates the codec.
-pub(crate) fn mq2g256gl_roundtrip_f32(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<f32> {
+pub(crate) fn mq2g256gl_roundtrip_f32(
+    f32_data: &[f32],
+    signs1: &[f32],
+    signs2: &[f32],
+) -> Vec<f32> {
     /// Lloyd–Max levels for a unit Gaussian at 2 bit.
     pub(crate) const CB: [f32; 4] = [-1.5104, -0.4528, 0.4528, 1.5104];
     let group_size = 256;
@@ -1836,4 +1850,733 @@ pub(crate) fn quantize_hfq4g128(f32_data: &[f32]) -> Vec<u8> {
     }
 
     output
+}
+// ---- TQ2G128 / BQ1G128 low-bit packers (ported from pr-597 main.rs) ----
+
+pub(crate) fn quantize_tq2g128(f32_data: &[f32]) -> Vec<u8> {
+    const GROUP: usize = 128;
+    const BLOCK_BYTES: usize = 34;
+    let n = f32_data.len();
+    let n_blocks = (n + GROUP - 1) / GROUP;
+    let mut output = vec![0u8; n_blocks * BLOCK_BYTES];
+
+    for b in 0..n_blocks {
+        let start = b * GROUP;
+        let end = (start + GROUP).min(n);
+        let group = &f32_data[start..end];
+
+        let mut amax = 0.0f32;
+        for &w in group {
+            amax = amax.max(w.abs());
+        }
+        let d = amax;
+        let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+
+        let out_off = b * BLOCK_BYTES;
+        output[out_off..out_off + 2].copy_from_slice(&f32_to_f16(d).to_le_bytes());
+
+        let actual_len = end - start;
+        for i in 0..32 {
+            let mut byte_val = 0u8;
+            for j in 0..4 {
+                let idx = 4 * i + j;
+                let w = if idx < actual_len { group[idx] } else { 0.0 };
+                let mut q = (w * id).round() as i32 + 1;
+                // Clamp to the TERNARY set {0,1,2} == {-d, 0, +d}. NOT 3: both
+                // decoders compute `(code-1)*d`, so code 3 decodes to +2d and
+                // makes this an asymmetric 4-level quantizer (negatives
+                // saturating at -d while positives reach +2d). Only reachable
+                // once d < max|w|, i.e. under the scale sweep.
+                if q < 0 {
+                    q = 0;
+                }
+                if q > 2 {
+                    q = 2;
+                }
+                byte_val |= (q as u8) << (j * 2);
+            }
+            output[out_off + 2 + i] = byte_val;
+        }
+    }
+
+    output
+}
+
+#[cfg(test)]
+mod tq2g128_tests {
+    use super::*;
+
+    /// Byte-exactness of `quantize_tq2g128` against a hand-derived expected
+    /// block. Group of 128: idx0=-2.0, idx1=0.0, idx2=2.0, idx3..127=0.0.
+    /// d = max(|w|) = 2.0, id = 0.5.
+    ///
+    /// Per-element codes (q = clamp(round(w*id)+1, 0, 3)):
+    ///   idx0: round(-2.0*0.5)+1 = round(-1.0)+1 = 0
+    ///   idx1: round( 0.0*0.5)+1 = round( 0.0)+1 = 1
+    ///   idx2: round( 2.0*0.5)+1 = round( 1.0)+1 = 2
+    ///   idx3..127 (all 0.0): round(0.0)+1 = 1
+    ///
+    /// NOTE: the zero-valued tail encodes to code 1 (not code 0) because
+    /// id=0.5 != 0 here (d != 0) — only an all-zero *group* (d==0, id==0)
+    /// would encode zeros as code 0. This matters for the packed bytes:
+    /// byte0 packs elements 0..3 LSB-first (`code << ((j%4)*2)`):
+    ///   byte0 = code0 | code1<<2 | code2<<4 | code3<<6
+    ///         =    0  |   1<<2   |   2<<4   |   1<<6
+    ///         = 0b01_10_01_00 = 0x64
+    /// bytes[1..32] cover elements 4..127, all code=1:
+    ///   byte = 1 | 1<<2 | 1<<4 | 1<<6 = 0b01_01_01_01 = 0x55
+    ///
+    /// FP16(2.0) = 0x4000 (sign=0, exp=16, frac=0), little-endian [0x00,0x40] —
+    /// cross-checked against the existing `dequant_q2_0` CPU-oracle test in
+    /// gguf_input.rs, which uses the identical byte pair for scale 2.0.
+    #[test]
+    fn quantize_tq2g128_byte_exact() {
+        let mut group = vec![0.0f32; 128];
+        group[0] = -2.0;
+        group[1] = 0.0;
+        group[2] = 2.0;
+        // group[3..128] stay 0.0
+
+        let out = quantize_tq2g128(&group);
+        assert_eq!(out.len(), 34, "one 128-group -> one 34-byte block");
+
+        // FP16 scale d=2.0, little-endian.
+        assert_eq!(&out[0..2], &[0x00, 0x40]);
+
+        // qs[0] (elements 0..3): codes 0,1,2,1 -> 0x64.
+        assert_eq!(out[2], 0x64);
+
+        // qs[1..32] (elements 4..127): all code=1 -> 0x55, repeated 31 times.
+        assert_eq!(&out[3..34], &[0x55u8; 31][..]);
+    }
+
+    /// Round-trip losslessness for an already-ternary input: values drawn
+    /// from {-d, 0, +d} with d a power of two (4.0) so the FP16 scale is
+    /// exact and every code round-trips without rounding error. Decodes via
+    /// the crate's public `tensor_to_f32` dispatcher (which routes
+    /// `GgmlType::Q2_0` to the private `dequant_q2_0` CPU oracle added in
+    /// Task 5) — this exercises the *real* decode path rather than a
+    /// second hand-rolled decoder, so it also proves TQ2G128's block
+    /// layout is byte-compatible with GGUF `Q2_0` end-to-end.
+    #[test]
+    fn quantize_tq2g128_round_trips_ternary_input() {
+        let d = 4.0f32;
+        let f32_data: Vec<f32> = (0..128)
+            .map(|i| match i % 3 {
+                0 => -d,
+                1 => 0.0,
+                _ => d,
+            })
+            .collect();
+
+        let packed = quantize_tq2g128(&f32_data);
+        assert_eq!(packed.len(), 34);
+
+        let info = gguf_input::TensorInfo {
+            name: "round_trip".to_string(),
+            shape: vec![128],
+            dtype: gguf_input::GgmlType::Q2_0,
+            offset: 0,
+        };
+        let decoded = gguf_input::tensor_to_f32(&info, &packed);
+
+        assert_eq!(decoded, f32_data);
+    }
+
+    /// Multi-block input (2 groups of 128) — checks block offsets/lengths
+    /// are computed correctly, not just the single-block case above.
+    #[test]
+    fn quantize_tq2g128_multi_block_length() {
+        let f32_data = vec![1.0f32; 256];
+        let out = quantize_tq2g128(&f32_data);
+        assert_eq!(out.len(), 2 * 34);
+    }
+}
+
+pub(crate) fn quantize_tq2g128_gptq(
+    f32_data: &[f32],
+    col_weights: &[f32],
+    damping: f32,
+) -> Vec<u8> {
+    const GROUP: usize = 128;
+    const BLOCK_BYTES: usize = 34;
+    let n = f32_data.len();
+    let n_blocks = (n + GROUP - 1) / GROUP;
+    let blocks_per_row = (col_weights.len() / GROUP).max(1);
+    let mut output = vec![0u8; n_blocks * BLOCK_BYTES];
+
+    for b in 0..n_blocks {
+        let start = b * GROUP;
+        let end = (start + GROUP).min(n);
+        let group = &f32_data[start..end];
+        let actual = end - start;
+
+        let col_off = (b % blocks_per_row) * GROUP;
+        let block_w = &col_weights[col_off..col_off + GROUP];
+
+        let mut amax = 0.0f32;
+        for &w in group {
+            amax = amax.max(w.abs());
+        }
+
+        // Sweep candidate scales, pick the least imatrix-weighted *decoded*
+        // error. factor=1.0 reproduces `quantize_tq2g128` exactly (same codes,
+        // same f16 header, same decode), so the winner is always ≤ plain.
+        //
+        // The sweep MUST reach well below 0.6·amax. Levels are {-d, 0, +d} with
+        // nearest-neighbour coding, so a weight survives only when |w| ≥ d/2;
+        // at d = amax over a 128-sample Gaussian block (amax ≈ 2.9σ) that
+        // threshold is ~1.45σ and ~85% of the block is zeroed. The MSE-optimal
+        // 3-level scale for a Gaussian is d ≈ 1.22σ ≈ 0.42·amax (~54% non-zero;
+        // PrismML's own Bonsai ternary runs ~69% non-zero). A sweep floored at
+        // 0.6 bottoms out at ~38% non-zero and never reaches the optimum.
+        let mut best_d = amax;
+        let mut best_err = f64::INFINITY;
+        for &factor in &[
+            0.20f32, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.70, 0.80, 0.90, 1.0,
+        ] {
+            let d = amax * factor;
+            let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+            let dd = f16_to_f32(f32_to_f16(d)) as f64; // decode uses the f16 scale
+            let mut err = 0.0f64;
+            for i in 0..GROUP {
+                let w = if i < actual { group[i] } else { 0.0 };
+                let mut q = (w * id).round() as i32 + 1;
+                // Clamp to the TERNARY set {0,1,2} == {-d, 0, +d}. NOT 3: both
+                // decoders compute `(code-1)*d`, so code 3 decodes to +2d and
+                // makes this an asymmetric 4-level quantizer (negatives
+                // saturating at -d while positives reach +2d). Only reachable
+                // once d < max|w|, i.e. under the scale sweep.
+                if q < 0 {
+                    q = 0;
+                }
+                if q > 2 {
+                    q = 2;
+                }
+                let recon = (q - 1) as f64 * dd;
+                let diff = w as f64 - recon;
+                err += block_w[i] as f64 * diff * diff;
+            }
+            if err < best_err {
+                best_err = err;
+                best_d = d;
+            }
+        }
+
+        let d = best_d;
+        let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+        let dd = f16_to_f32(f32_to_f16(d));
+
+        // Damped residual feed-forward across columns → codes.
+        let mut codes = [0u8; GROUP];
+        let mut residual = 0.0f32;
+        for i in 0..GROUP {
+            let w = if i < actual { group[i] } else { 0.0 };
+            let target = w + residual;
+            let mut q = (target * id).round() as i32 + 1;
+            // Ternary set {0,1,2}; see the note above — 3 would decode to +2d.
+            if q < 0 {
+                q = 0;
+            }
+            if q > 2 {
+                q = 2;
+            }
+            let recon = (q - 1) as f32 * dd;
+            residual = (target - recon) * damping;
+            codes[i] = q as u8;
+        }
+
+        let out_off = b * BLOCK_BYTES;
+        output[out_off..out_off + 2].copy_from_slice(&f32_to_f16(d).to_le_bytes());
+        for i in 0..32 {
+            let mut byte_val = 0u8;
+            for j in 0..4 {
+                byte_val |= (codes[4 * i + j] & 0x3) << (j * 2);
+            }
+            output[out_off + 2 + i] = byte_val;
+        }
+    }
+    output
+}
+
+#[cfg(test)]
+mod tq2g128_gptq_tests {
+    use super::*;
+
+    fn weighted_mse(orig: &[f32], packed: &[u8], w: &[f32]) -> f64 {
+        let info = gguf_input::TensorInfo {
+            name: "wmse".to_string(),
+            shape: vec![orig.len()],
+            dtype: gguf_input::GgmlType::Q2_0,
+            offset: 0,
+        };
+        let deq = gguf_input::tensor_to_f32(&info, packed);
+        orig.iter()
+            .zip(&deq)
+            .zip(w)
+            .map(|((o, q), wi)| (*wi as f64) * ((o - q) as f64).powi(2))
+            .sum()
+    }
+
+    #[test]
+    fn gptq_ternary_not_worse_than_plain() {
+        // skewed importance: first 32 columns matter 10×.
+        let g: Vec<f32> = (0..128).map(|i| ((i as f32) - 64.0) * 0.03).collect();
+        let mut w = vec![1.0f32; 128];
+        for k in 0..32 {
+            w[k] = 10.0;
+        }
+        let plain = quantize_tq2g128(&g);
+        let gptq = quantize_tq2g128_gptq(&g, &w, 0.0);
+        assert!(
+            weighted_mse(&g, &gptq, &w) <= weighted_mse(&g, &plain, &w) + 1e-9,
+            "imatrix-weighted GPTQ error must be ≤ plain packer error"
+        );
+    }
+
+    /// Deterministic standard-normal block (Box–Muller over an LCG) — real
+    /// weights are Gaussian-ish, and the scale sweep must work on THOSE, not
+    /// just on the uniform ramp above (a ramp's `max|w|` is ~1 sigma-equivalent
+    /// so it hides a mis-ranged sweep entirely).
+    fn gaussian_block(n: usize, seed: u32) -> Vec<f32> {
+        let mut state = seed;
+        let mut next = || {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            ((state >> 8) as f32 + 0.5) / ((1u32 << 24) as f32)
+        };
+        (0..n)
+            .map(|_| {
+                let u1: f32 = next();
+                let u2: f32 = next();
+                (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos()
+            })
+            .collect()
+    }
+
+    /// `tq2_pack_stats` is the shipping guard's eye: it must count the two
+    /// things that silently broke real requants — how much of the model got
+    /// zeroed, and whether any out-of-set code was emitted.
+    #[test]
+    fn tq2_pack_stats_counts_zeros_and_out_of_set_codes() {
+        // One block, 128 codes. Byte 0 = codes [0,1,2,3] (LSB-first, 2 b each)
+        // = 0b11_10_01_00 = 0xE4. Remaining 31 bytes = 0x55 = codes [1,1,1,1],
+        // i.e. all zero-level.
+        let mut blk = vec![0u8; 34];
+        blk[0..2].copy_from_slice(&f32_to_f16(0.5).to_le_bytes());
+        blk[2] = 0xE4;
+        for b in blk.iter_mut().skip(3) {
+            *b = 0x55;
+        }
+
+        let st = tq2_pack_stats(&blk);
+        assert_eq!(st.n_codes, 128);
+        // Non-zero = code != 1 → the 0, 2 and 3 in byte 0.
+        assert_eq!(st.nonzero, 3);
+        assert_eq!(st.out_of_set, 1, "exactly one code 3");
+    }
+
+    /// Raw 2-bit codes out of a TQ2G128 buffer (34 B/block: [f16 d][32 B qs]).
+    fn tq2_codes(packed: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for blk in packed.chunks_exact(34) {
+            for &byte in &blk[2..] {
+                for j in 0..4 {
+                    out.push((byte >> (j * 2)) & 0x3);
+                }
+            }
+        }
+        out
+    }
+
+    /// The ternary level set is {-d, 0, +d} == codes {0, 1, 2}. Code 3 decodes
+    /// to `(3-1)*d = +2d` in BOTH decoders (gguf_input::dequant_q2_0 and
+    /// kernels/src/gemv_tq2g128.hip), so emitting it silently turns the
+    /// quantizer into an ASYMMETRIC 4-level one: negatives saturate at -d while
+    /// positives reach +2d. PrismML's own Bonsai ternary never emits code 3
+    /// (measured 0.0000 across 4 tensors).
+    ///
+    /// The `q > 3 => 3` clamp was unreachable while d = max|w| (|w/d| <= 1, so
+    /// round() is at most 1). Widening the scale sweep to 0.20*amax makes
+    /// |w/d| >> 1 reachable — which is how this surfaced: 5.9% of codes on a
+    /// real 27B requant.
+    #[test]
+    fn ternary_packers_never_emit_the_out_of_set_code() {
+        let g = gaussian_block(128, 4242);
+        let w = vec![1.0f32; 128];
+        for (label, packed) in [
+            ("plain", quantize_tq2g128(&g)),
+            ("gptq", quantize_tq2g128_gptq(&g, &w, 0.0)),
+        ] {
+            let codes = tq2_codes(&packed);
+            let bad = codes.iter().filter(|&&c| c == 3).count();
+            assert_eq!(
+                bad,
+                0,
+                "{label}: emitted out-of-set code 3 ({bad} of {} codes) — decodes to +2d",
+                codes.len()
+            );
+        }
+    }
+
+    /// Saturation must be symmetric: with a scale below max|w|, mirrored
+    /// out-of-range weights must land on mirrored levels.
+    #[test]
+    fn ternary_saturation_is_symmetric() {
+        let mut g = gaussian_block(128, 99);
+        g[0] = 6.0; // far above any swept d
+        g[1] = -6.0;
+        let w = vec![1.0f32; 128];
+        let codes = tq2_codes(&quantize_tq2g128_gptq(&g, &w, 0.0));
+        assert_eq!(codes[0], 2, "large positive must saturate to +d (code 2)");
+        assert_eq!(codes[1], 0, "large negative must saturate to -d (code 0)");
+    }
+
+    /// The ternary level set is `{-d, 0, +d}` with nearest-neighbour coding, so
+    /// a weight survives only when `|w| >= d/2`. With `d = max|w|` over a
+    /// 128-sample Gaussian block (`amax ~ 2.9 sigma`) the threshold lands at
+    /// ~1.45 sigma and ~85% of weights are zeroed — which is exactly what the
+    /// plain packer shipped for qwen3.6-27b (16.3% non-zero measured, vs 69.4%
+    /// for PrismML's own Bonsai ternary).
+    ///
+    /// The MSE-optimal 3-level scale for a Gaussian is `d ~ 1.22 sigma`
+    /// (thresholds at +/-0.61 sigma, ~54% non-zero) = ~0.42 * amax. The sweep
+    /// must therefore reach well below 0.6 * amax.
+    #[test]
+    fn gptq_ternary_scale_sweep_reaches_mse_optimum_on_gaussian() {
+        let g = gaussian_block(128, 12345);
+        let w = vec![1.0f32; 128];
+
+        let plain = quantize_tq2g128(&g);
+        let gptq = quantize_tq2g128_gptq(&g, &w, 0.0);
+
+        let nz = tq2_pack_stats(&gptq).nonzero_fraction();
+        assert!(
+            (0.45..=0.80).contains(&nz),
+            "swept-scale ternary should keep roughly half the weights alive on \
+             Gaussian input (MSE-optimal ~0.54); got non-zero fraction {nz:.3}"
+        );
+
+        let (e_gptq, e_plain) = (weighted_mse(&g, &gptq, &w), weighted_mse(&g, &plain, &w));
+        assert!(
+            e_gptq <= 0.6 * e_plain,
+            "swept scale must substantially beat d=max|w| on Gaussian input; \
+             got gptq={e_gptq:.5} vs plain={e_plain:.5}"
+        );
+    }
+}
+
+pub(crate) fn quantize_bq1g128(f32_data: &[f32]) -> Vec<u8> {
+    const GROUP: usize = 128;
+    const BLOCK_BYTES: usize = 18;
+    let n = f32_data.len();
+    let n_blocks = (n + GROUP - 1) / GROUP;
+    let mut output = vec![0u8; n_blocks * BLOCK_BYTES];
+    for b in 0..n_blocks {
+        let start = b * GROUP;
+        let end = (start + GROUP).min(n);
+        let group = &f32_data[start..end];
+        let actual = end - start;
+
+        let mut sum = 0.0f32;
+        for &w in group {
+            sum += w.abs();
+        }
+        let d = if actual > 0 { sum / actual as f32 } else { 0.0 };
+
+        let out_off = b * BLOCK_BYTES;
+        output[out_off..out_off + 2].copy_from_slice(&f32_to_f16(d).to_le_bytes());
+        for j in 0..GROUP {
+            let w = if j < actual { group[j] } else { 0.0 };
+            if w >= 0.0 {
+                output[out_off + 2 + (j >> 3)] |= 1u8 << (j & 7);
+            }
+        }
+    }
+    output
+}
+
+#[cfg(test)]
+mod bq1g128_tests {
+    use super::*;
+
+    #[test]
+    fn quantize_bq1g128_byte_exact() {
+        // group of 128: [0]=+2, [1]=-2, rest 0 (0 → sign bit set → +d)
+        let mut g = vec![0.0f32; 128];
+        g[0] = 2.0;
+        g[1] = -2.0;
+        // d = mean|w| = (2+2)/128 = 0.03125
+        let out = quantize_bq1g128(&g);
+        assert_eq!(out.len(), 18);
+        assert_eq!(&out[0..2], &f32_to_f16(0.03125).to_le_bytes());
+        // byte 2 = elements 0..7: bit0 (e0,+)=1, bit1 (e1,-)=0,
+        // bits2..7 (0.0≥0)=1 → 0b1111_1101 = 0xFD
+        assert_eq!(out[2], 0xFD);
+        // bytes 3..18 = elements 8..127 all 0.0 ≥ 0 → all bits set → 0xFF
+        assert_eq!(&out[3..18], &[0xFFu8; 15]);
+    }
+
+    #[test]
+    fn quantize_bq1g128_round_trips() {
+        let g: Vec<f32> = (0..256).map(|i| ((i as f32) - 128.0) * 0.01).collect();
+        let packed = quantize_bq1g128(&g);
+        let info = gguf_input::TensorInfo {
+            name: "rt".to_string(),
+            shape: vec![256],
+            dtype: gguf_input::GgmlType::Q1_0,
+            offset: 0,
+        };
+        let deq = gguf_input::tensor_to_f32(&info, &packed);
+        // every element recovers sign; magnitude == block mean|w|
+        for i in 0..256 {
+            assert_eq!(deq[i] >= 0.0, g[i] >= 0.0);
+        }
+    }
+}
+
+pub(crate) fn quantize_bq1g128_gptq(
+    f32_data: &[f32],
+    col_weights: &[f32],
+    damping: f32,
+) -> Vec<u8> {
+    const GROUP: usize = 128;
+    const BLOCK_BYTES: usize = 18;
+    let n = f32_data.len();
+    let n_blocks = (n + GROUP - 1) / GROUP;
+    let blocks_per_row = (col_weights.len() / GROUP).max(1);
+    let mut output = vec![0u8; n_blocks * BLOCK_BYTES];
+
+    for b in 0..n_blocks {
+        let start = b * GROUP;
+        let end = (start + GROUP).min(n);
+        let group = &f32_data[start..end];
+        let actual = end - start;
+
+        let col_off = (b % blocks_per_row) * GROUP;
+        let block_w = &col_weights[col_off..col_off + GROUP];
+
+        // Importance-weighted optimal magnitude d = Σ w|x| / Σ w.
+        let mut wsum = 0.0f64;
+        let mut wabs = 0.0f64;
+        for i in 0..actual {
+            let wi = block_w[i] as f64;
+            wsum += wi;
+            wabs += wi * (group[i].abs() as f64);
+        }
+        let d = if wsum > 0.0 {
+            (wabs / wsum) as f32
+        } else {
+            // fallback: plain unweighted mean-abs (matches quantize_bq1g128)
+            let mut s = 0.0f32;
+            for &w in group {
+                s += w.abs();
+            }
+            if actual > 0 {
+                s / actual as f32
+            } else {
+                0.0
+            }
+        };
+        let dd = f16_to_f32(f32_to_f16(d));
+
+        let out_off = b * BLOCK_BYTES;
+        output[out_off..out_off + 2].copy_from_slice(&f32_to_f16(d).to_le_bytes());
+
+        let mut residual = 0.0f32;
+        for j in 0..GROUP {
+            let w = if j < actual { group[j] } else { 0.0 };
+            let target = w + residual;
+            let bit = target >= 0.0;
+            let recon = if bit { dd } else { -dd };
+            residual = (target - recon) * damping;
+            if bit {
+                output[out_off + 2 + (j >> 3)] |= 1u8 << (j & 7);
+            }
+        }
+    }
+    output
+}
+
+#[cfg(test)]
+mod bq1g128_gptq_tests {
+    use super::*;
+
+    fn wmse_bq1(orig: &[f32], packed: &[u8], w: &[f32]) -> f64 {
+        let info = gguf_input::TensorInfo {
+            name: "wmse".to_string(),
+            shape: vec![orig.len()],
+            dtype: gguf_input::GgmlType::Q1_0,
+            offset: 0,
+        };
+        let deq = gguf_input::tensor_to_f32(&info, packed);
+        orig.iter()
+            .zip(&deq)
+            .zip(w)
+            .map(|((o, q), wi)| (*wi as f64) * ((o - q) as f64).powi(2))
+            .sum()
+    }
+
+    #[test]
+    fn gptq_binary_not_worse_than_plain() {
+        let g: Vec<f32> = (0..128).map(|i| ((i as f32) - 64.0) * 0.05).collect();
+        let mut w = vec![1.0f32; 128];
+        for k in 96..128 {
+            w[k] = 8.0;
+        } // tail columns important
+        let plain = quantize_bq1g128(&g);
+        let gptq = quantize_bq1g128_gptq(&g, &w, 0.0);
+        assert!(wmse_bq1(&g, &gptq, &w) <= wmse_bq1(&g, &plain, &w) + 1e-9);
+    }
+}
+
+/// Code-level statistics of a packed TQ2G128 buffer.
+#[derive(Default, Debug, Clone, Copy)]
+struct Tq2PackStats {
+    /// Codes decoding to a non-zero level (i.e. code != 1).
+    nonzero: u64,
+    /// Codes equal to 3 — outside the ternary set, decoding to +2d.
+    out_of_set: u64,
+    n_codes: u64,
+}
+
+impl Tq2PackStats {
+    fn add(&mut self, o: Tq2PackStats) {
+        self.nonzero += o.nonzero;
+        self.out_of_set += o.out_of_set;
+        self.n_codes += o.n_codes;
+    }
+    fn nonzero_fraction(&self) -> f64 {
+        if self.n_codes == 0 {
+            return 0.0;
+        }
+        self.nonzero as f64 / self.n_codes as f64
+    }
+}
+
+/// Count zero / non-zero / out-of-set codes in a TQ2G128 buffer
+/// (34 B per 128-weight block: `[f16 d][32 B codes]`, 4 codes per byte).
+fn tq2_pack_stats(data: &[u8]) -> Tq2PackStats {
+    let mut st = Tq2PackStats::default();
+    for blk in data.chunks_exact(34) {
+        for &byte in &blk[2..] {
+            for j in 0..4 {
+                let code = (byte >> (j * 2)) & 0x3;
+                st.n_codes += 1;
+                if code != 1 {
+                    st.nonzero += 1;
+                }
+                if code == 3 {
+                    st.out_of_set += 1;
+                }
+            }
+        }
+    }
+    st
+}
+
+/// Refuse to write a ternary model that the code histogram says is broken.
+///
+/// This is the cheap observable that would have caught both shipped defects
+/// immediately, without a GPU or an eval:
+///
+///   * `d = max|w|` as an ENCODER zeroed 83.7% of a real 27B requant (16.3%
+///     non-zero). Healthy is ~54% (Gaussian MSE optimum) to ~69% (PrismML's
+///     own Bonsai ternary). A model below `MIN_NONZERO` is not "lossy", it is
+///     mostly deleted.
+///   * code 3 decodes to `+2d` in both decoders, turning the quantizer into an
+///     asymmetric 4-level one. PrismML never emits it; neither should we.
+///
+/// `--allow-degenerate-ternary` (env HIPFIRE_ALLOW_DEGENERATE_TERNARY) downgrades
+/// this to a warning. Read at the CLI boundary, never inside the pipeline:
+/// a getenv racing another test's setenv in a threaded test binary is unsound.
+fn check_ternary_pack_health(st: Tq2PackStats, allow_degenerate: bool) {
+    const MIN_NONZERO: f64 = 0.25;
+    if st.n_codes == 0 {
+        return;
+    }
+    let nz = st.nonzero_fraction();
+    eprintln!(
+        "ternary pack health: {:.1}% non-zero codes ({} of {}), {} out-of-set",
+        nz * 100.0,
+        st.nonzero,
+        st.n_codes,
+        st.out_of_set
+    );
+    let degenerate = nz < MIN_NONZERO;
+    if !degenerate && st.out_of_set == 0 {
+        return;
+    }
+    let mut why = Vec::new();
+    if degenerate {
+        why.push(format!(
+            "only {:.1}% of codes are non-zero (expected >={:.0}%; healthy 54-69%) \
+             — {:.1}% of the model is zeroed",
+            nz * 100.0,
+            MIN_NONZERO * 100.0,
+            (1.0 - nz) * 100.0
+        ));
+    }
+    if st.out_of_set > 0 {
+        why.push(format!(
+            "{} codes are 3, which decodes to +2d (outside the ternary set)",
+            st.out_of_set
+        ));
+    }
+    let msg = why.join("; ");
+    if allow_degenerate {
+        eprintln!(
+            "WARNING: degenerate ternary pack ({msg}) — allowed by --allow-degenerate-ternary"
+        );
+        return;
+    }
+    eprintln!("error: refusing to write a degenerate ternary model: {msg}.");
+    eprintln!(
+        "       Set HIPFIRE_ALLOW_DEGENERATE_TERNARY=1 to write it anyway (it will \
+         not serve coherently)."
+    );
+    std::process::exit(3);
+}
+
+/// Per-input-column importance weights for a requantized tensor.
+///
+/// Returns the `--imatrix` row for `name` when one was supplied and its length
+/// is a usable multiple of the 128 group, else all-ones (a pure unweighted-MSE
+/// scale search). The GPTQ packers slice this as
+/// `col_weights[(b % blocks_per_row) * 128 ..][..128]`, so the length must be a
+/// multiple of 128 — an all-ones length-128 vector makes every block reuse the
+/// same (uniform) weights, which is exactly the no-imatrix behaviour.
+
+fn lowbit_ptq_gate(format: GgufFormat, allowed: bool) -> Result<(), String> {
+    if allowed || !matches!(format, GgufFormat::Ternary | GgufFormat::Binary) {
+        return Ok(());
+    }
+    let bpw = if matches!(format, GgufFormat::Binary) {
+        "1.14"
+    } else {
+        "2.125"
+    };
+    Err(format!(
+        "error: --input <.hfq> --format {} re-quantizes an ordinary checkpoint into a \
+         UNIFORM {bpw}-bpw level set, which is a measured collapse — not a supported \
+         build.\n\
+         \n\
+         Measured on qwen3.6-27b (KLD vs the mq4 teacher, 8 chunks):\n\
+         \x20 ternary uniform            2.125 bpw  KLD 5.10  PPL 1436   (token soup)\n\
+         \x20 ternary + AWQ imatrix      2.125 bpw  KLD 2.24  PPL   86.6 (immediate EOS)\n\
+         \x20 mq2lloyd (non-uniform)     2.25  bpw  KLD 0.61  PPL   17.0 (usable)\n\
+         \x20 PrismML Bonsai ternary     2.125 bpw  KLD 0.54  PPL   16.7\n\
+         \n\
+         The bit budget is NOT the problem — the fixed uniform level set is. Q2_0/Q1_0 \
+         leave the encoder only the block scale to choose, and no scale search or \
+         importance weighting recovers it.\n\
+         \n\
+         For ~2 bpw from an ordinary checkpoint use --format mq2lloyd instead. \
+         Ternary/binary ship coherently as byte-verbatim passthrough of an \
+         already-transformed source (PrismML Bonsai Q2_0/Q1_0) — convert that GGUF \
+         directly.\n\
+         \n\
+         To do it anyway for research, pass --allow-lowbit-ptq or set \
+         HIPFIRE_ALLOW_LOWBIT_PTQ=1.",
+        format.label(),
+    ))
 }

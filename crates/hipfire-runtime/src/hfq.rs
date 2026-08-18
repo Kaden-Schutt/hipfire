@@ -134,7 +134,14 @@ impl HfqFile {
         Self::open_with_reap_plan(path, reap_plan.as_deref())
     }
 
-    fn open_with_reap_plan(path: &Path, reap_plan: Option<&Path>) -> std::io::Result<Self> {
+    /// `open` with the REAP plan injected instead of taken from process config.
+    ///
+    /// Public because the process config is a START-TIME SNAPSHOT
+    /// (`hipfire_config::active_or_local_process_config` is a `OnceLock`), so a
+    /// test that does `set_var("HIPFIRE_REAP_PLAN")` then `open()` only works if
+    /// it happens to be the first thing in the process to read config — an
+    /// order-dependent coin flip. Inject the plan here instead.
+    pub fn open_with_reap_plan(path: &Path, reap_plan: Option<&Path>) -> std::io::Result<Self> {
         let mut f = Self::open_at_offset(path, 0)?;
         // REAP load-time overlay splice (SP3): when the process policy points
         // at a dir containing `overlay.hfq`, attach it so its re-quantized

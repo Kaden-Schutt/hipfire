@@ -76,6 +76,8 @@ impl GemmFamily {
                 }
             }
             DType::HFQ4G128 => KernelKey::GemmHfq4G128,
+            DType::TQ2G128 => KernelKey::GemmTQ2G128Prefill,
+            DType::BQ1G128 => KernelKey::GemmBQ1G128Prefill,
             _ => {
                 return Err(DispatchError::UnsupportedVariant {
                     family: "gemm",
@@ -156,6 +158,12 @@ impl GemmFamily {
                 hip!(gpu.gemm_q8_0_batched_chunked(w.buf, x, y, m, k, batch_size))
             }
             K::GemmHfq4G256Wmma => hip!(gpu.gemm_hfq4g256_wmma(w.buf, x, y, m, k, batch_size)),
+            K::GemmTQ2G128Prefill => {
+                hip!(gpu.gemm_tq2g128_prefill(w.buf, x, y, m, k, batch_size))
+            }
+            K::GemmBQ1G128Prefill => {
+                hip!(gpu.gemm_bq1g128_prefill(w.buf, x, y, m, k, batch_size))
+            }
             K::GemmHfq4G256 => hip!(gpu.gemm_hfq4g256(w.buf, x, y, m, k, batch_size)),
             K::GemmHfq4G128 => hip!(gpu.gemm_hfq4g128(w.buf, x, y, m, k, batch_size)),
             // #397 Ship 5.1: plain-GEMM catalog. Each arm maps the registered

@@ -3,34 +3,39 @@
 // Copyright (c) 2026 Nick Woolmer
 // hipfire — see LICENSE and NOTICE in the project root.
 
-
-#![allow(dead_code, unused_imports, unused_variables, non_snake_case, clippy::all)]
+#![allow(
+    dead_code,
+    unused_imports,
+    unused_variables,
+    non_snake_case,
+    clippy::all
+)]
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::fs::File;
 use std::io::Write;
-use std::sync::OnceLock;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
-use clap::Parser;
-use hipfire_quantize::float16::{bf16_to_f32, f16_to_f32, f32_to_f16};
-use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
-use hipfire_quantize::hessian_io;
+use crate::calibration::*;
+use crate::cli::{guard_qwen3_arch_override, QuantizeArgs};
+use crate::dequant::*;
 use crate::e8;
 use crate::e8_gptq;
 use crate::gguf_input;
-use crate::reap_overlay;
-use crate::calibration::*;
-use crate::cli::{guard_qwen3_arch_override, QuantizeArgs};
-use crate::quant_q4::*;
-use crate::quant_fwht::*;
-use crate::quant_hfp4::*;
-use crate::quant_e8::*;
-use crate::quant_mq::*;
 use crate::hfq::*;
 use crate::model_filter::*;
-use crate::dequant::*;
+use crate::quant_e8::*;
+use crate::quant_fwht::*;
+use crate::quant_hfp4::*;
+use crate::quant_mq::*;
+use crate::quant_q4::*;
+use crate::reap_overlay;
+use clap::Parser;
+use hipfire_quantize::float16::{bf16_to_f32, f16_to_f32, f32_to_f16};
+use hipfire_quantize::hessian_io;
+use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
 
 /// 2D-weight quantization target chosen at the per-tensor level. The choice
 /// per format flag:
@@ -70,6 +75,22 @@ pub(crate) enum GgufFormat {
     Mfp4E8Soa, // mfp4-E8 SoA — same E8 data in structure-of-arrays layout for coalesced GEMV
     Mfp3E8, // mfp3-E8 — mfp4-E8 frame with 3-bit lattice (13 B/blk, 3.25 bpw; drop-in for MQ3-Lloyd cold)
     Mfp2E8, // mfp2-E8 — mfp4-E8 frame with 2-bit lattice (9 B/blk, 2.25 bpw; drop-in for MQ2-Lloyd cold)
+    /// Ternary — PrismML Bonsai family. Source GGUF is already mixed-precision
+    /// (Q2_0 ternary matmuls + Q8_0/F16 embeddings + F32/F16 norms); the
+    /// per-tensor precision PrismML chose is authoritative, so 2D matmul
+    /// tensors already in Q2_0 pass through byte-verbatim to TQ2G128
+    /// (see the dedicated arm in `run_gguf_pipeline`) rather than going
+    /// through the kmap/Q8 rules. `quantize_tq2g128` is only the re-quant
+    /// fallback for the rare non-Q2_0 matmul tensor under this format.
+    Ternary,
+    /// Binary — PrismML Bonsai family, 1-bit variant. Source GGUF is already
+    /// mixed-precision (Q1_0 binary matmuls + Q8_0/F16 embeddings + F32/F16
+    /// norms); the per-tensor precision PrismML chose is authoritative, so 2D
+    /// matmul tensors already in Q1_0 pass through byte-verbatim to BQ1G128
+    /// (see the dedicated arm in `run_gguf_pipeline`) rather than going
+    /// through the kmap/Q8 rules. There is no re-quant fallback for this
+    /// format — binary weights always take the byte-verbatim passthrough.
+    Binary,
 }
 
 impl GgufFormat {
@@ -93,6 +114,8 @@ impl GgufFormat {
             "mfp4e8soa" | "mfp4-e8-soa" | "mfp4e8-soa" => Some(Self::Mfp4E8Soa),
             "mfp3e8" | "mfp3-e8" => Some(Self::Mfp3E8),
             "mfp2e8" | "mfp2-e8" => Some(Self::Mfp2E8),
+            "ternary" | "tq2" | "tq2g128" => Some(Self::Ternary),
+            "binary" | "bq1" | "bq1g128" => Some(Self::Binary),
             _ => None,
         }
     }
@@ -117,8 +140,19 @@ impl GgufFormat {
             Self::Mfp4E8Soa => "MFP4G32E8SOA",
             Self::Mfp3E8 => "MFP3G32E8",
             Self::Mfp2E8 => "MFP2G32E8",
+            Self::Ternary => "TQ2G128",
+            Self::Binary => "BQ1G128",
         }
     }
+}
+
+/// Q1_0 on-disk layout == hipfire BQ1G128 layout: copy verbatim.
+pub(crate) fn convert_binary_tensor(
+    src: &[u8],
+    dtype: gguf_input::GgmlType,
+) -> (Vec<u8>, crate::hfq::QuantType, u32) {
+    debug_assert_eq!(dtype, gguf_input::GgmlType::Q1_0);
+    (src.to_vec(), crate::hfq::QuantType::BQ1G128, 128)
 }
 
 /// Convert a GGUF file to a hipfire `.hfq`. Per-format quantization target
@@ -153,7 +187,9 @@ pub(crate) fn run_gguf_pipeline(
     // --arch-id override is supplied. The old qwen3* pillar guard is subsumed
     // by this uniform check — any unknown qwen3* now fails with the same clear
     // error instead of a bespoke branch.
-    let auto_arch_id: u32 = match hipfire_runtime::arch_mapping::lookup_model_type(arch_str.as_str()) {
+    let auto_arch_id: u32 = match hipfire_runtime::arch_mapping::lookup_model_type(
+        arch_str.as_str(),
+    ) {
         Some(id) => id,
         None => {
             if let Some(ov) = arch_id_override {
@@ -328,6 +364,49 @@ pub(crate) fn run_gguf_pipeline(
             let q = quantize_q8f16(&f32_data);
             quant_params += n_elements as u64;
             (q, QuantType::Q8F16, 32u32, "Q8_F16")
+        } else if matches!(format, GgufFormat::Ternary) && info.dtype == gguf_input::GgmlType::Q2_0
+        {
+            // TQ2G128 byte-verbatim passthrough wins over the kmap/Q8 rules
+            // when the source is already Q2_0 — PrismML's per-tensor format
+            // layout is byte-identical between the GGUF Q2_0 block and hipfire TQ2G128
+            let expected = (n_elements.div_ceil(128)) * 34;
+            // Use exact check: n_elements already includes padding? For Q2_0 n_elements is logical count (raw.len()/34*128)
+            // but info.numel() is logical; raw.len() should be n_blocks*34.
+            if raw.len() != (n_elements.div_ceil(128) * 34) && raw.len() != (n_elements / 128 * 34)
+            {
+                // Fallback permissive check - just record
+            }
+            if raw.len() != expected && raw.len() != (n_elements / 128 * 34) {
+                eprintln!(
+                    "Q2_0 size mismatch for {}: got {} bytes, expected {}",
+                    info.name,
+                    raw.len(),
+                    expected
+                );
+                std::process::exit(1);
+            }
+            (
+                raw.to_vec(),
+                QuantType::TQ2G128,
+                128u32,
+                "TQ2G128 (passthrough)",
+            )
+        } else if matches!(format, GgufFormat::Binary) && info.dtype == gguf_input::GgmlType::Q1_0 {
+            // BQ1G128 byte-verbatim passthrough — mirrors the TQ2G128/Q2_0 arm
+            // Q1_0 on-disk layout == hipfire BQ1G128 layout: copy verbatim.
+            let expected = (n_elements.div_ceil(128)) * 18;
+            if raw.len() != expected && raw.len() != (n_elements / 128 * 18) {
+                eprintln!(
+                    "Q1_0 size mismatch for {}: got {} bytes, expected {}",
+                    info.name,
+                    raw.len(),
+                    expected
+                );
+                std::process::exit(1);
+            }
+            let (bytes, quant_type, group_size) =
+                convert_binary_tensor(raw, gguf_input::GgmlType::Q1_0);
+            (bytes, quant_type, group_size, "BQ1G128 (passthrough)")
         } else if kmap_level == QuantLevel::Promote6 && k_dim % 256 == 0 {
             // K-map promote to 6-bit
             let f32_data = gguf_input::tensor_to_f32(info, raw);
@@ -436,6 +515,18 @@ pub(crate) fn run_gguf_pipeline(
                     let q = quantize_hfq4g256(&f32_data);
                     (q, QuantType::HFQ4G256, 256u32, "HFQ4G256")
                 }
+                GgufFormat::Ternary => {
+                    // Terminal low-bit format — promotion is a no-op.
+                    // Direct TQ2G128 semantics: scale-only ternary g128, 34 B/blk (2.125 bpw).
+                    let q = quantize_tq2g128(&f32_data);
+                    (q, QuantType::TQ2G128, 128u32, "TQ2G128")
+                }
+                GgufFormat::Binary => {
+                    // Terminal low-bit format — promotion is a no-op.
+                    // Direct BQ1G128 semantics: scale-only binary g128, 18 B/blk (1.14 bpw).
+                    let q = quantize_bq1g128(&f32_data);
+                    (q, QuantType::BQ1G128, 128u32, "BQ1G128")
+                }
             }
         } else if let (QuantLevel::Override(override_fmt), true) = (kmap_level, k_dim % 256 == 0) {
             // K-map says override (lm_head when --lm-head-format set).
@@ -523,6 +614,16 @@ pub(crate) fn run_gguf_pipeline(
                     let m = info.shape[0] as usize;
                     let q = quantize_mfp2g32_e8_2d(&f32_data, m, k_dim, &signs1, &signs2);
                     (q, QuantType::MFP2G32E8, 32u32, "MFP2G32E8")
+                }
+                GgufFormat::Ternary => {
+                    // Terminal low-bit: direct TQ2G128 semantics (plain, no rotation).
+                    let q = quantize_tq2g128(&f32_data);
+                    (q, QuantType::TQ2G128, 128u32, "TQ2G128")
+                }
+                GgufFormat::Binary => {
+                    // Terminal low-bit: direct BQ1G128 semantics (plain, no rotation).
+                    let q = quantize_bq1g128(&f32_data);
+                    (q, QuantType::BQ1G128, 128u32, "BQ1G128")
                 }
             }
         } else if k_dim % 256 == 0 {
@@ -617,6 +718,16 @@ pub(crate) fn run_gguf_pipeline(
                     let k = info.shape[1] as usize;
                     let q = quantize_mfp2g32_e8_2d(&f32_data, m, k, &signs1, &signs2);
                     (q, QuantType::MFP2G32E8, 32u32, "MFP2G32E8")
+                }
+                GgufFormat::Ternary => {
+                    // Direct low-bit: scale-only ternary g128, 34 B per 128 (2.125 bpw).
+                    let q = quantize_tq2g128(&f32_data);
+                    (q, QuantType::TQ2G128, 128u32, "TQ2G128")
+                }
+                GgufFormat::Binary => {
+                    // Direct low-bit: scale-only binary g128, 18 B per 128 (1.14 bpw).
+                    let q = quantize_bq1g128(&f32_data);
+                    (q, QuantType::BQ1G128, 128u32, "BQ1G128")
                 }
             }
         } else {

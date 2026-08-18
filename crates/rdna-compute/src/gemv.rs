@@ -5678,6 +5678,317 @@ impl Gpu {
         }
     }
 
+    /// Output-tile geometry of the low-bit prefill GEMMs. Must stay in step
+    /// with `HIPFIRE_{TQ2G128,BQ1G128}_PREFILL_T{M,N}`: the kernels size their
+    /// LDS staging from these and the block is TM*TN threads.
+    pub const LOWBIT_PREFILL_TILE_M: usize = 64;
+    pub const LOWBIT_PREFILL_TILE_N: usize = 64;
+    /// Threads per block for the prefill GEMMs: each of the 256 threads owns a
+    /// 4x4 slice of the 64x64 output tile.
+    pub const LOWBIT_PREFILL_THREADS: usize = 256;
+
+    /// Tiled prefill GEMM over PACKED TQ2-G128 weights: `y[n] = A . x[n]` for
+    /// n in 0..n_tokens, decoding each code byte once and reusing it across a
+    /// tile of tokens. No dequant and no F16 weight copy.
+    ///
+    /// `x` is `[n_tokens x k]` and `y` is `[n_tokens x m]`, both row-major f32.
+    /// Any `n_tokens >= 1` is accepted; the kernel tiles internally.
+    pub fn gemm_tq2g128_prefill(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n_tokens: usize,
+    ) -> HipResult<()> {
+        self.gemm_lowbit_prefill(
+            "gemm_tq2g128_prefill",
+            kernels::GEMM_TQ2G128_PREFILL_SRC,
+            a_raw,
+            x,
+            y,
+            m,
+            k,
+            n_tokens,
+        )
+    }
+
+    /// Binary sibling of [`Self::gemm_tq2g128_prefill`].
+    pub fn gemm_bq1g128_prefill(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n_tokens: usize,
+    ) -> HipResult<()> {
+        self.gemm_lowbit_prefill(
+            "gemm_bq1g128_prefill",
+            kernels::GEMM_BQ1G128_PREFILL_SRC,
+            a_raw,
+            x,
+            y,
+            m,
+            k,
+            n_tokens,
+        )
+    }
+
+    /// Shared body for the two low-bit prefill GEMMs: identical launch
+    /// geometry and kernargs, differing only in kernel name and source.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_lowbit_prefill(
+        &mut self,
+        name: &'static str,
+        src: &'static str,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n_tokens: usize,
+    ) -> HipResult<()> {
+        assert!(n_tokens >= 1, "{name}: n_tokens must be >= 1");
+        // Same floor-vs-ceil block-count hazard as the scalar kernels.
+        assert_eq!(k % 128, 0, "{name}: k must be a multiple of 128, got {k}");
+        // Internal arch dispatch, same idiom as gemm_hfq4g256 routing to
+        // dp4a/rocBLAS/WMMA: where wave32 WMMA exists the matrix-core kernel
+        // is 2-3x the register-blocked vector one (measured 6.6x vs scalar at
+        // M=17408 N=128, against the tiled kernel's 2.5x), so prefer it and
+        // keep the tiled kernel as the portable fallback.
+        if self.arch_caps.has_wmma() {
+            return if name == "gemm_tq2g128_prefill" {
+                self.gemm_tq2g128_wmma(a_raw, x, y, m, k, n_tokens)
+            } else {
+                self.gemm_bq1g128_wmma(a_raw, x, y, m, k, n_tokens)
+            };
+        }
+        self.bind_thread()?;
+        self.ensure_kernel(name, src, name)?;
+        let func = &self.functions[name];
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let n_val = n_tokens as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &n_val as *const _ as *mut c_void,
+        ];
+        let tm = Self::LOWBIT_PREFILL_TILE_M as u32;
+        let tn = Self::LOWBIT_PREFILL_TILE_N as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [(m as u32).div_ceil(tm), (n_tokens as u32).div_ceil(tn), 1],
+                [Self::LOWBIT_PREFILL_THREADS as u32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Largest `batch` the low-bit x-batch GEMVs accept. Must stay in step
+    /// with `HIPFIRE_{TQ2G128,BQ1G128}_XBATCH_MAX` in their sources, which
+    /// size the kernels' accumulator arrays.
+    pub const LOWBIT_XBATCH_MAX: usize = 4;
+
+    /// x-batched TQ2-G128 GEMV: `y[b][row] = A[row] . x[b]` for b in 0..batch,
+    /// reading each weight row ONCE instead of once per b.
+    ///
+    /// `x` is `[batch x k]` and `y` is `[batch x m]`, both row-major f32.
+    /// `batch` must not exceed [`Self::LOWBIT_XBATCH_MAX`]; callers with more
+    /// rows should chunk.
+    pub fn gemv_tq2g128_xbatch(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch: usize,
+    ) -> HipResult<()> {
+        self.gemv_lowbit_xbatch(
+            "gemv_tq2g128_xbatch",
+            kernels::GEMV_TQ2G128_XBATCH_SRC,
+            a_raw,
+            x,
+            y,
+            m,
+            k,
+            batch,
+        )
+    }
+
+    /// Binary sibling of [`Self::gemv_tq2g128_xbatch`].
+    pub fn gemv_bq1g128_xbatch(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch: usize,
+    ) -> HipResult<()> {
+        self.gemv_lowbit_xbatch(
+            "gemv_bq1g128_xbatch",
+            kernels::GEMV_BQ1G128_XBATCH_SRC,
+            a_raw,
+            x,
+            y,
+            m,
+            k,
+            batch,
+        )
+    }
+
+    /// Shared launcher for the two low-bit x-batch GEMVs. They differ only in
+    /// kernel name and source; the launch geometry and kernarg layout are
+    /// identical, so keeping one body avoids the two drifting apart.
+    #[allow(clippy::too_many_arguments)]
+    fn gemv_lowbit_xbatch(
+        &mut self,
+        name: &'static str,
+        src: &'static str,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch: usize,
+    ) -> HipResult<()> {
+        assert!(
+            batch >= 1 && batch <= Self::LOWBIT_XBATCH_MAX,
+            "{name}: batch {batch} outside 1..={}",
+            Self::LOWBIT_XBATCH_MAX
+        );
+        // Same floor-vs-ceil block-count hazard as the scalar kernels.
+        assert_eq!(k % 128, 0, "{name}: k must be a multiple of 128, got {k}");
+        self.bind_thread()?;
+        self.ensure_kernel(name, src, name)?;
+        let func = &self.functions[name];
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let b_val = batch as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &b_val as *const _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [m as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// TQ2-G128 GEMV. K must be multiple of 128. Finer granularity than G256.
+    pub fn gemv_tq2g128(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        // The packer emits ceil(K/128) blocks with a partial tail; the kernel
+        // derives row_bytes from floor(K/128). A non-multiple K would leave
+        // row_bytes one block short, so every row past the first reads at the
+        // wrong offset -- silent corruption, not merely a wrong last element.
+        assert_eq!(
+            k % 128,
+            0,
+            "TQ2G128 GEMV requires K multiple of 128, got {k}"
+        );
+        self.bind_thread()?;
+        self.ensure_kernel("gemv_tq2g128", kernels::GEMV_TQ2G128_SRC, "gemv_tq2g128")?;
+        let func = &self.functions["gemv_tq2g128"];
+        let mut ap = a_raw.buf.as_ptr();
+        let mut xp = x.buf.as_ptr();
+        let mut yp = y.buf.as_ptr();
+        let mut mv = m as i32;
+        let mut kv = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ap as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut mv as *mut _ as *mut c_void,
+            &mut kv as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [m as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// BQ1-G128 GEMV. K must be multiple of 128. Binary sibling of TQ2-G128.
+    pub fn gemv_bq1g128(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        // See gemv_tq2g128: floor-vs-ceil block count would silently misalign
+        // every row past the first, so refuse a non-multiple K outright.
+        assert_eq!(
+            k % 128,
+            0,
+            "BQ1G128 GEMV requires K multiple of 128, got {k}"
+        );
+        self.bind_thread()?;
+        self.ensure_kernel("gemv_bq1g128", kernels::GEMV_BQ1G128_SRC, "gemv_bq1g128")?;
+        let func = &self.functions["gemv_bq1g128"];
+        let mut ap = a_raw.buf.as_ptr();
+        let mut xp = x.buf.as_ptr();
+        let mut yp = y.buf.as_ptr();
+        let mut mv = m as i32;
+        let mut kv = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ap as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut mv as *mut _ as *mut c_void,
+            &mut kv as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [m as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// MagnumQuant MQ3: rotate x once, then HFQ3-G256 GEMV against rotated x.
     /// MQ3 weights are stored in HFQ3-G256 format (104 B/group) with FWHT pre-applied,
     /// so the GEMV inner loop is identical to standard HFQ3.

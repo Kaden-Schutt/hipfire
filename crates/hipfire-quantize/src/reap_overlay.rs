@@ -5,11 +5,17 @@
 //!   * `quantize_to_format` — tier-name → existing `quantize_*` encoder dispatch.
 //!   * `reap_override_for`   — arch-aware tensor-name → override-tier resolver.
 
-use crate::quant_fwht::{gen_fwht_signs, quantize_hfq4g256, quantize_mq4g256, quantize_mq6g256};
-use crate::quant_mq::{quantize_hfq6g256, quantize_mq2g256_lloyd, quantize_mq3g256_lloyd, quantize_mq4g256_lloyd};
-use crate::quant_e8::{load_ds4_head_importance, load_hessian_blocks, quantize_mfp4g32_e8_2d, quantize_mfp4g32_e8_soa_2d, quantize_mfp4g32_e8_soa_awls_2d, quantize_mfp4g32_e8_soa_gptq_2d, quantize_mfp4g32_e8_soa_lsq_2d};
-use crate::quant_q4::quantize_q8f16;
 use crate::hfq::{HfqTensor, QuantType};
+use crate::quant_e8::{
+    load_ds4_head_importance, load_hessian_blocks, quantize_mfp4g32_e8_2d,
+    quantize_mfp4g32_e8_soa_2d, quantize_mfp4g32_e8_soa_awls_2d, quantize_mfp4g32_e8_soa_gptq_2d,
+    quantize_mfp4g32_e8_soa_lsq_2d,
+};
+use crate::quant_fwht::{gen_fwht_signs, quantize_hfq4g256, quantize_mq4g256, quantize_mq6g256};
+use crate::quant_mq::{
+    quantize_hfq6g256, quantize_mq2g256_lloyd, quantize_mq3g256_lloyd, quantize_mq4g256_lloyd,
+};
+use crate::quant_q4::quantize_q8f16;
 use hipfire_reap::plan::{QuantOverride, ReapPlan, Role};
 
 /// Quantize one tensor's f32 data to the named tier, returning the HFQ tensor.
@@ -1030,9 +1036,13 @@ mod integ {
         // Capture everything we need while the guard is held; remove the env var
         // immediately after `open` (before any assert can unwind) so a failure
         // can't leak the var to a concurrent `open`.
-        std::env::set_var("HIPFIRE_REAP_PLAN", plan_dir.path());
-        let f = HfqFile::open(&base_path).unwrap();
-        std::env::remove_var("HIPFIRE_REAP_PLAN");
+        // Inject the plan rather than set_var + open: process config is a
+        // start-time OnceLock snapshot, so a set_var here is invisible unless
+        // this test happens to be the first in the process to read config.
+        // That made this an order-dependent failure (reproducible on master
+        // with `cargo test -p hipfire-quantize --bin hipfire-quantize
+        // reap_overlay`).
+        let f = HfqFile::open_with_reap_plan(&base_path, Some(plan_dir.path())).unwrap();
 
         // Overlay auto-attached (arch_id 9 matches; expert name is a base subset).
         assert!(

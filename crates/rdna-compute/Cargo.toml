@@ -118,6 +118,10 @@ name = "bench_e8_verify_tiles"
 required-features = ["lab"]
 
 [[example]]
+name = "bench_fused_qkvza_lowbit"
+required-features = ["lab"]
+
+[[example]]
 name = "bench_gate_up_hfq4_variants"
 required-features = ["lab"]
 
@@ -134,6 +138,14 @@ name = "bench_gemv_hfp4g32_bw"
 required-features = ["lab"]
 
 [[example]]
+name = "bench_gemv_lowbit"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_gemv_lowbit_xbatch"
+required-features = ["lab"]
+
+[[example]]
 name = "bench_gemv_mfp4g32_rotate"
 required-features = ["lab"]
 
@@ -147,6 +159,10 @@ required-features = ["lab"]
 
 [[example]]
 name = "bench_indexed_moe_keystone"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_lowbit_prefill_route"
 required-features = ["lab"]
 
 [[example]]
@@ -227,6 +243,10 @@ required-features = ["lab"]
 
 [[example]]
 name = "bench_qkvza_q8_vs_mq4"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_qkvza_ternary_vs_mq4"
 required-features = ["lab"]
 
 [[example]]
@@ -323,6 +343,14 @@ required-features = ["lab"]
 
 [[example]]
 name = "test_conv1d_tree"
+required-features = ["lab"]
+
+[[example]]
+name = "test_dequant_bq1g128"
+required-features = ["lab"]
+
+[[example]]
+name = "test_dequant_tq2g128"
 required-features = ["lab"]
 
 [[example]]
@@ -442,6 +470,10 @@ name = "test_gemvQA"
 required-features = ["lab"]
 
 [[example]]
+name = "test_gemv_bq1g128"
+required-features = ["lab"]
+
+[[example]]
 name = "test_gemv_hfp4g32"
 required-features = ["lab"]
 
@@ -455,6 +487,10 @@ required-features = ["lab"]
 
 [[example]]
 name = "test_gemv_hfq4g256_xbatch"
+required-features = ["lab"]
+
+[[example]]
+name = "test_gemv_lowbit_xbatch"
 required-features = ["lab"]
 
 [[example]]
@@ -479,6 +515,10 @@ required-features = ["lab"]
 
 [[example]]
 name = "test_gemv_mq4g256_lloyd_tail"
+required-features = ["lab"]
+
+[[example]]
+name = "test_gemv_tq2g128"
 required-features = ["lab"]
 
 [[example]]

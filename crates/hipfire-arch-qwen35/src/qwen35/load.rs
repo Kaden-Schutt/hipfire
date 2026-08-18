@@ -5,38 +5,12 @@
 //! Qwen3.5 weight loading: HFQ / ParoQuant sources, AWQ repack, packed-MQ4
 //! experts, `load_weights`, and the EP sharded loader.
 
-use hip_bridge::HipError;
-use hip_bridge::HipResult;
-use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::hfq::HfqTensorInfo;
-use hipfire_runtime::hfq_parallel::HfqReadJob;
-use hipfire_runtime::hfq_parallel::read_hfq_jobs_ordered;
-use hipfire_runtime::llama::EmbeddingFormat;
-use hipfire_runtime::llama::ParoRotation;
-use hipfire_runtime::llama::WeightTensor;
-use hipfire_runtime::llama::f16_to_f32;
-use hipfire_runtime::model_load::LoadedWeights;
-use hipfire_runtime::model_load::WeightSource;
-use hipfire_runtime::model_load::load_weights as rt_load_weights;
-use hipfire_runtime::model_source::ModelSource;
-use hipfire_runtime::paro::paro_load_norm;
-use hipfire_runtime::paro::paro_text_prefix;
-use hipfire_runtime::tp_shard::ShardConfig;
-use hipfire_runtime::weight_backend::HfqBackend;
-use hipfire_runtime::weight_backend::ParoBackend;
-use hipfire_runtime::weight_backend::dequant_norm;
-use hipfire_runtime::weight_backend::dequant_weight_raw;
-use hipfire_runtime::weight_backend::load_awq_scale_for;
-use hipfire_runtime::weight_backend::load_embedding;
-use hipfire_runtime::weight_backend::resolve_lm_head;
-use hipfire_runtime::weight_backend::reupload_f16_as_f32;
-use rdna_compute::DType;
-use rdna_compute::Gpu;
-use rdna_compute::GpuTensor;
+use super::config::f16_lm_head_mode_from_config;
 use super::config::F16LmHeadMode;
 use super::config::Qwen35Config;
-use super::config::f16_lm_head_mode_from_config;
 use super::forward::layers_have_mq6_moe;
+use super::weights::dtype_from_quant_type;
+use super::weights::mixed_expert_tag;
 use super::weights::ExpertWeights;
 use super::weights::LayerWeights;
 use super::weights::MoeFfnWeights;
@@ -49,8 +23,34 @@ use super::weights::Qwen35HfqSourceIdentity;
 use super::weights::Qwen35RankSeal;
 use super::weights::Qwen35Weights;
 use super::weights::SharedExpertWeights;
-use super::weights::dtype_from_quant_type;
-use super::weights::mixed_expert_tag;
+use hip_bridge::HipError;
+use hip_bridge::HipResult;
+use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::hfq::HfqTensorInfo;
+use hipfire_runtime::hfq_parallel::read_hfq_jobs_ordered;
+use hipfire_runtime::hfq_parallel::HfqReadJob;
+use hipfire_runtime::llama::f16_to_f32;
+use hipfire_runtime::llama::EmbeddingFormat;
+use hipfire_runtime::llama::ParoRotation;
+use hipfire_runtime::llama::WeightTensor;
+use hipfire_runtime::model_load::load_weights as rt_load_weights;
+use hipfire_runtime::model_load::LoadedWeights;
+use hipfire_runtime::model_load::WeightSource;
+use hipfire_runtime::model_source::ModelSource;
+use hipfire_runtime::paro::paro_load_norm;
+use hipfire_runtime::paro::paro_text_prefix;
+use hipfire_runtime::tp_shard::ShardConfig;
+use hipfire_runtime::weight_backend::dequant_norm;
+use hipfire_runtime::weight_backend::dequant_weight_raw;
+use hipfire_runtime::weight_backend::load_awq_scale_for;
+use hipfire_runtime::weight_backend::load_embedding;
+use hipfire_runtime::weight_backend::resolve_lm_head;
+use hipfire_runtime::weight_backend::reupload_f16_as_f32;
+use hipfire_runtime::weight_backend::HfqBackend;
+use hipfire_runtime::weight_backend::ParoBackend;
+use rdna_compute::DType;
+use rdna_compute::Gpu;
+use rdna_compute::GpuTensor;
 
 /// RMSNorm weight bias for qwen3.5/gemma-style norms: dequant computes `w + norm_bias`.
 /// qwen2/llama use `0.0`. Single source of truth — referenced by the backend constructors
@@ -465,6 +465,30 @@ fn load_weight_tensor_raw(
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ3G256GL,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        40 => {
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::TQ2G128,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        41 => {
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::BQ1G128,
                 m,
                 k,
                 row_stride: 0,

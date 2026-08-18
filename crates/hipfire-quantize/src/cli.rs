@@ -3,24 +3,29 @@
 // Copyright (c) 2026 Nick Woolmer
 // hipfire — see LICENSE and NOTICE in the project root.
 
-
-#![allow(dead_code, unused_imports, unused_variables, non_snake_case, clippy::all)]
+#![allow(
+    dead_code,
+    unused_imports,
+    unused_variables,
+    non_snake_case,
+    clippy::all
+)]
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::fs::File;
 use std::io::Write;
-use std::sync::OnceLock;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
-use clap::Parser;
-use hipfire_quantize::float16::{bf16_to_f32, f16_to_f32, f32_to_f16};
-use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
-use hipfire_quantize::hessian_io;
 use crate::e8;
 use crate::e8_gptq;
 use crate::gguf_input;
 use crate::reap_overlay;
+use clap::Parser;
+use hipfire_quantize::float16::{bf16_to_f32, f16_to_f32, f32_to_f16};
+use hipfire_quantize::hessian_io;
+use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -52,6 +57,31 @@ pub(crate) struct QuantizeArgs {
     /// Allow an architecture override to move Qwen3 off its pillar IDs.
     #[arg(long)]
     pub force_arch_id: bool,
+
+    /// Reuse the source checkpoint's AWQ sidecars as an imatrix for the
+    /// low-bit packers' column weighting. Value is the alpha the source was
+    /// AWQ-built with (see `awq_col_weights`); defaults to the CLI's own
+    /// --awq default. Off entirely when the flag is absent.
+    #[arg(long, value_name = "ALPHA", num_args = 0..=1, default_missing_value = "0.55")]
+    pub awq_imatrix: Option<f32>,
+
+    /// Requantize an ordinary checkpoint down to ternary/binary anyway.
+    /// See `lowbit_ptq_gate` — this is a measured collapse regime.
+    #[arg(long, env = "HIPFIRE_ALLOW_LOWBIT_PTQ")]
+    pub allow_lowbit_ptq: bool,
+
+    /// Upstream URL recorded in the output's `hipfire_provenance`.
+    #[arg(long, value_name = "URL")]
+    pub source_url: Option<String>,
+
+    /// SPDX license recorded in the output's `hipfire_provenance`.
+    #[arg(long, value_name = "SPDX")]
+    pub license: Option<String>,
+
+    /// Write a ternary model even if the pack-health check says it is
+    /// degenerate (see `check_ternary_pack_health`). Research escape hatch.
+    #[arg(long, env = "HIPFIRE_ALLOW_DEGENERATE_TERNARY")]
+    pub allow_degenerate_ternary: bool,
 
     /// Emit only tensors selected by a REAP plan.
     #[arg(long, value_name = "PLAN_DIR", conflicts_with = "reap_bake")]

@@ -286,7 +286,11 @@ pub enum DType {
     MFP2G32E8, // mfp2-E8: MFP4G32E8 frame, 2-bit lattice (center 2),  9 B/blk,  72 B/grp, 2.25 bpw. Drop-in for MQ2G256Lloyd.
     HFQ2G256,  // 72 bytes per 256 elements (flat 2-bit, f32 scale+zero, ~19 VGPRs)
     HFQ2G128,  // 40 bytes per 128 elements (flat 2-bit, f32 scale+zero)
-    HFQ6G256,  // 200 bytes per 256 elements (6-bit, f32 scale+zero)
+    TQ2G128,   // ternary Bonsai-27B: 34 bytes per 128 elements (flat 2-bit ternary, group 128)
+    // Phase 4: ternary kernels wire GPU decode/dispatch; this Task 7 slice is
+    // CPU-foundation only (variant + byte-size + RawCodec load mapping).
+    BQ1G128,    // binary Bonsai-27B: 18 bytes per 128 elements (flat 1-bit sign, group 128)
+    HFQ6G256,   // 200 bytes per 256 elements (6-bit, f32 scale+zero)
     ParoQ4G128, // ParoQuant: AWQ-packed INT4 G128 repacked to HFQ4G128 layout at load.
     // Weights are standard HFQ4G128 (72 bytes/group); the ParoQuant distinction
     // is that weight_gemv applies Givens rotation to activations before GEMV.
@@ -311,6 +315,8 @@ impl DType {
             | DType::HFQ3G128
             | DType::HFQ2G256
             | DType::HFQ2G128
+            | DType::TQ2G128
+            | DType::BQ1G128
             | DType::HFQ6G256
             | DType::MQ4G256
             | DType::MQ4G128
@@ -1087,6 +1093,89 @@ impl Gpu {
                     e
                 );
             }
+        }
+    }
+
+    /// Dequantize a TQ2-G128 (ternary) weight [M × K] into an FP16 buffer
+    /// [M × K] row-major. The FP16 buffer must be pre-allocated to M*K*2 bytes.
+    ///
+    /// This is the prefill route for the low-bit formats: they have no tiled
+    /// GEMM of their own, so a chunk of N tokens would otherwise re-read every
+    /// weight row N times through the scalar GEMV. Dequantising once into a
+    /// scratch and handing the chunk to the F16 GEMM amortises that read.
+    pub fn dequantize_tq2g128_to_f16(
+        &mut self,
+        w_packed: &DeviceBuffer,
+        w_fp16: &DeviceBuffer,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        // bind_thread: skip — thin delegator; dequantize_lowbit_to_f16 binds.
+        self.dequantize_lowbit_to_f16(
+            "dequant_tq2g128_to_f16",
+            kernels::DEQUANT_TQ2G128_TO_F16_SRC,
+            w_packed,
+            w_fp16,
+            m,
+            k,
+        )
+    }
+
+    /// Binary sibling of [`Self::dequantize_tq2g128_to_f16`].
+    pub fn dequantize_bq1g128_to_f16(
+        &mut self,
+        w_packed: &DeviceBuffer,
+        w_fp16: &DeviceBuffer,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        // bind_thread: skip — thin delegator; dequantize_lowbit_to_f16 binds.
+        self.dequantize_lowbit_to_f16(
+            "dequant_bq1g128_to_f16",
+            kernels::DEQUANT_BQ1G128_TO_F16_SRC,
+            w_packed,
+            w_fp16,
+            m,
+            k,
+        )
+    }
+
+    /// Shared body for the two low-bit dequants. Both kernels take the same
+    /// (A, W_f16, M, K) kernargs and the same [M, groups] × [32] geometry, so
+    /// one body keeps them from drifting.
+    fn dequantize_lowbit_to_f16(
+        &mut self,
+        name: &'static str,
+        src: &'static str,
+        w_packed: &DeviceBuffer,
+        w_fp16: &DeviceBuffer,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(k % 128, 0, "{name}: K must be a multiple of 128 (got {k})");
+        self.ensure_kernel(name, src, name)?;
+        let func = &self.functions[name];
+        let mut w_in = w_packed.as_ptr();
+        let mut w_out = w_fp16.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut w_in as *mut _ as *mut c_void,
+            &mut w_out as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+        ];
+        let groups = (k / 128) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [m as u32, groups, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
         }
     }
 
@@ -2477,6 +2566,7 @@ impl Gpu {
     // ── Tensor allocation ───────────────────────────────────────
 
     pub fn ensure_gemv_residual_tmp(&mut self, min_elems: usize) -> HipResult<&GpuTensor> {
+        // bind_thread: skip — delegated to scratch.rs (takes device_id explicitly).
         self.scratch
             .ensure_gemv_residual_tmp(&self.hip, self.device_id, min_elems)
     }
@@ -2587,6 +2677,7 @@ impl Gpu {
     }
 
     pub fn vmm_mapped_bytes(&self, tensor: &GpuTensor) -> Option<usize> {
+        // bind_thread: skip — pure map lookup, touches no device state.
         self.vmm_arenas
             .get(&(tensor.buf.as_ptr() as usize))
             .map(VmmArena::mapped_bytes)
@@ -2594,6 +2685,7 @@ impl Gpu {
 
     /// Return the physical allocation granularity for a registered VMM tensor.
     pub fn vmm_granularity(&self, tensor: &GpuTensor) -> Option<usize> {
+        // bind_thread: skip — pure map lookup, touches no device state.
         self.vmm_arenas
             .get(&(tensor.buf.as_ptr() as usize))
             .map(VmmArena::granularity)
@@ -2603,12 +2695,14 @@ impl Gpu {
     /// reserving an address range. Model-owned VMM planners use this for a
     /// dry-run admission check before mapping any cache pages.
     pub fn vmm_recommended_granularity(&self) -> HipResult<usize> {
+        self.bind_thread()?;
         let prop = HipMemAllocationProp::device_pinned(self.device_id);
         self.hip
             .mem_get_allocation_granularity(&prop, HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED)
     }
 
     pub fn vmm_allocation_count(&self) -> usize {
+        // bind_thread: skip — pure length read, touches no device state.
         self.vmm_arenas.len() + self.orphan_vmm_arenas.len()
     }
 
@@ -2624,6 +2718,7 @@ impl Gpu {
     /// Success means `vmm_allocation_count() == 0`. Any remaining registration
     /// is an error so unload/load cannot claim a clean handoff.
     pub fn ensure_vmm_cleaned(&mut self) -> HipResult<()> {
+        self.bind_thread()?;
         let live = self.vmm_arenas.len();
         if live != 0 {
             return Err(HipError::new(
@@ -2892,6 +2987,7 @@ impl Gpu {
     /// conversion, silently serving stale F16 data from the previous
     /// layer.
     pub fn invalidate_fp16_cache(&mut self) {
+        // bind_thread: skip — nulls a CPU-side cache pointer, no device call.
         self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
     }
 
@@ -3035,6 +3131,7 @@ impl Gpu {
     /// bucket grows. The allocation change is intentional and recoverable, so
     /// retained replay is re-armed rather than placed in sticky fallback.
     pub fn invalidate_for_layout_growth(&mut self) {
+        // bind_thread: skip — invalidate_graph_state binds; rearm is CPU.
         self.invalidate_graph_state();
         self.replay.rearm_after_layout_growth();
     }

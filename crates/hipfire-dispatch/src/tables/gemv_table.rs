@@ -31,6 +31,8 @@ fn register_plain(registry: &mut KernelRegistry) {
         DType::HFQ3G128,
         DType::HFQ2G256,
         DType::HFQ2G128,
+        DType::TQ2G128,
+        DType::BQ1G128,
         DType::HFQ6G256,
         DType::MQ4G256,
         DType::MQ4G128,
