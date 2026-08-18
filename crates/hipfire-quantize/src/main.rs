@@ -14353,7 +14353,7 @@ fn main() {
                             if meta.shape.len() == 2 { meta.shape[1] } else { n_elements },
                             if meta.shape.len() == 2 { meta.shape[1] % 256 } else { n_elements % 256 },
                             kmap_level,
-                            is_embed,
+                            name.contains("embed_tokens"),
                             q8_router,
                             use_mq4v2,
                             use_mq4g256,
