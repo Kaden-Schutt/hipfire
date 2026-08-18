@@ -71,6 +71,8 @@ impl QuantType {
             35 => Some(Self::MFP4G32E8SOA),
             36 => Some(Self::MFP3G32E8),
             37 => Some(Self::MFP2G32E8),
+            38 => Some(Self::MQ2G256GL),
+            39 => Some(Self::MQ3G256GL),
             _ => None,
         }
     }
