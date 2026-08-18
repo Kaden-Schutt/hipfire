@@ -8102,7 +8102,7 @@ impl Qwen35DecodeBatchState {
             weights.output.gpu_dtype,
             DType::Q8_0
                 | DType::HFQ4G256
-                | DType::MQ4G256 | DType::MQ4G256V2
+                | DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ4CG256
                 | DType::HFQ6G256
                 | DType::MQ6G256
                 | DType::MQ3G256
@@ -8985,7 +8985,7 @@ pub fn validate_ep_batch_compatibility(
             w.output.gpu_dtype,
             DType::Q8_0
                 | DType::HFQ4G256
-                | DType::MQ4G256 | DType::MQ4G256V2
+                | DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ4CG256
                 | DType::HFQ6G256
                 | DType::MQ6G256
                 | DType::MQ3G256
@@ -10836,6 +10836,20 @@ fn lm_head_batched(
                 batch_size,
             )
         }
+        DType::MQ4CG256 => {
+            llama::rotate_x_mq_batched_for(gpu, output, hidden, rot, output.k, batch_size)?;
+            run_plain_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmMq4CG256BatchedLmhead,
+                &output.buf,
+                output.gpu_dtype,
+                rot,
+                logits,
+                output.m,
+                output.k,
+                batch_size,
+            )
+        }
         DType::HFQ6G256 => gpu.gemm_hfq6g256_batched_lmhead(
             &output.buf,
             hidden,
@@ -11897,7 +11911,7 @@ pub fn forward_prefill_batch_with_pbs_opts(
 fn is_batchable_la(dt: DType, arch: &str) -> bool {
     let always_ok = matches!(
         dt,
-        DType::MQ4G256 | DType::MQ4G256V2 | DType::HFQ4G256
+        DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ4CG256 | DType::HFQ4G256
         | DType::MQ6G256 | DType::HFQ6G256
         | DType::Q8_0
         // Phase 1.5 (PARO): wqkv/wz/wo are ParoQ4G128, w_alpha/w_beta are F32
@@ -14570,7 +14584,7 @@ fn forward_batch_chunk_impl(
                 let is_bf16 = matches!(layer.wqkv.gpu_dtype, DType::BF16) && rdna_compute::calib_force_bf16();
                 let is_mq = matches!(
                     layer.wqkv.gpu_dtype,
-                    DType::MQ4G256 | DType::MQ4G256V2
+                    DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ4CG256
                         | DType::MQ6G256
                         | DType::MQ3G256
                         | DType::MQ3G256Lloyd
@@ -15214,7 +15228,7 @@ fn forward_batch_chunk_impl(
                 // feeds gemm_hfq{4,6}g256_residual directly.
                 let wo_is_mq = matches!(
                     layer.wo.gpu_dtype,
-                    DType::MQ4G256 | DType::MQ4G256V2
+                    DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ4CG256
                         | DType::MQ6G256
                         | DType::MQ3G256
                         | DType::MQ3G256Lloyd
@@ -15350,7 +15364,7 @@ fn forward_batch_chunk_impl(
                 let ffn_is_bf16 = matches!(layer.w_gate.gpu_dtype, DType::BF16) && rdna_compute::calib_force_bf16();
                 let ffn_is_mq = matches!(
                     layer.w_gate.gpu_dtype,
-                    DType::MQ4G256 | DType::MQ4G256V2
+                    DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ4CG256
                         | DType::MQ6G256
                         | DType::MQ3G256
                         | DType::MQ3G256Lloyd
@@ -15554,7 +15568,7 @@ fn forward_batch_chunk_impl(
                 // launch with no batch offset needed.
                 let w_down_is_mq = matches!(
                     layer.w_down.gpu_dtype,
-                    DType::MQ4G256 | DType::MQ4G256V2
+                    DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ4CG256
                         | DType::MQ6G256
                         | DType::MQ3G256
                         | DType::MQ3G256Lloyd
@@ -15707,7 +15721,7 @@ fn forward_batch_chunk_impl(
                 let qkv_is_bf16 = matches!(layer.wq.gpu_dtype, DType::BF16) && rdna_compute::calib_force_bf16();
                 let qkv_is_mq = matches!(
                     layer.wq.gpu_dtype,
-                    DType::MQ4G256 | DType::MQ4G256V2
+                    DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ4CG256
                         | DType::MQ6G256
                         | DType::MQ3G256
                         | DType::MQ3G256Lloyd
@@ -16152,7 +16166,7 @@ fn forward_batch_chunk_impl(
                 // Same MQ rotation requirement as the LA wo path.
                 let fa_wo_is_mq = matches!(
                     layer.wo.gpu_dtype,
-                    DType::MQ4G256 | DType::MQ4G256V2
+                    DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ4CG256
                         | DType::MQ6G256
                         | DType::MQ3G256
                         | DType::MQ3G256Lloyd
@@ -16286,7 +16300,7 @@ fn forward_batch_chunk_impl(
                 let fa_ffn_is_bf16 = matches!(layer.w_gate.gpu_dtype, DType::BF16) && rdna_compute::calib_force_bf16();
                 let fa_ffn_is_mq = matches!(
                     layer.w_gate.gpu_dtype,
-                    DType::MQ4G256 | DType::MQ4G256V2
+                    DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ4CG256
                         | DType::MQ6G256
                         | DType::MQ3G256
                         | DType::MQ3G256Lloyd
@@ -16479,7 +16493,7 @@ fn forward_batch_chunk_impl(
                 }
                 let fa_w_down_is_mq = matches!(
                     layer.w_down.gpu_dtype,
-                    DType::MQ4G256 | DType::MQ4G256V2
+                    DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ4CG256
                         | DType::MQ6G256
                         | DType::MQ3G256
                         | DType::MQ3G256Lloyd
@@ -16684,7 +16698,7 @@ fn forward_batch_chunk_impl(
                 // alongside the moe_ffn router/gate Q8 unlock (A3B's LA
                 // attention weights are Q8 — engine quantizer keeps q/k/v/o
                 // at Q8 alongside the Q8 router + shared_expert_gate).
-                let is_mq = matches!(layer.wqkv.gpu_dtype, DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ6G256);
+                let is_mq = matches!(layer.wqkv.gpu_dtype, DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ4CG256 | DType::MQ6G256);
                 let is_6bit = matches!(layer.wqkv.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
                 let is_q8 = matches!(layer.wqkv.gpu_dtype, DType::Q8_0);
                 // Phase 1.5: PARO mode for DeltaNetMoe — wqkv/wz are
@@ -17425,7 +17439,7 @@ fn forward_batch_chunk_impl(
                 // the QKV dispatch is insufficient — the wo path below
                 // (line 5320) is hardcoded MQ4 too — so the all-or-nothing
                 // wiring lives in a separate PR (see followup issue).
-                let qkv_is_mq = matches!(layer.wq.gpu_dtype, DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ6G256);
+                let qkv_is_mq = matches!(layer.wq.gpu_dtype, DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ4CG256 | DType::MQ6G256);
                 let qkv_is_6bit = matches!(layer.wq.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
                 let qkv_is_q8 = matches!(layer.wq.gpu_dtype, DType::Q8_0);
                 // Phase 1.6 (PARO FullAttnMoe): wq/wk/wv are ParoQ4G128
@@ -18060,7 +18074,7 @@ fn run_fa_layer_body(
     // Cross-arch fast path: fused 3-way projection for wq+wk+wv.
     let dt = layer.wq.gpu_dtype;
     let fa3_same_dtype = layer.wk.gpu_dtype == dt && layer.wv.gpu_dtype == dt;
-    let fused_fa3_mq4 = fa3_same_dtype && (matches!(dt, DType::MQ4G256 | DType::MQ4G256V2 | DType::HFQ4G256));
+    let fused_fa3_mq4 = fa3_same_dtype && (matches!(dt, DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ4CG256 | DType::HFQ4G256));
     let fused_fa3_lloyd_mq3 = fa3_same_dtype && dt == DType::MQ3G256Lloyd;
     let fused_fa3_lloyd_mq4 = fa3_same_dtype && dt == DType::MQ4G256Lloyd;
     let fused_fa3_lloyd_mq4 = fa3_same_dtype && dt == DType::MQ4G256Lloyd;
@@ -18073,7 +18087,21 @@ fn run_fa_layer_body(
             Some(xr) => xr,
             None => &s.tmp,
         };
-        if dt == DType::MQ4G256V2 {
+        if dt == DType::MQ4CG256 {
+            gpu.fused_qkv_mq4cg256(
+                &layer.wq.buf,
+                &layer.wk.buf,
+                &layer.wv.buf,
+                eff_x,
+                &s.fa_q_full,
+                &s.fa_k,
+                &s.fa_v,
+                layer.wq.m,
+                layer.wk.m,
+                layer.wv.m,
+                layer.wq.k,
+            )?;
+        } else if dt == DType::MQ4G256V2 {
             gpu.fused_qkv_hfq4g256_mq4v2(
                 &layer.wq.buf,
                 &layer.wk.buf,
@@ -18280,7 +18308,7 @@ fn run_fa_layer_body(
     )?;
     let dt_g = layer.w_gate.gpu_dtype;
     let same_dtype = layer.w_up.gpu_dtype == dt_g;
-    let fused_gu_mq4 = same_dtype && (matches!(dt_g, DType::MQ4G256 | DType::MQ4G256V2 | DType::HFQ4G256));
+    let fused_gu_mq4 = same_dtype && (matches!(dt_g, DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ4CG256 | DType::HFQ4G256));
     let fused_gu_lloyd_mq3 = same_dtype && dt_g == DType::MQ3G256Lloyd;
     let fused_gu_lloyd_mq4 = same_dtype && dt_g == DType::MQ4G256Lloyd;
     // Phase A.1c (gfx906): fused dp4a path for HFQ6/MQ6 weights.
@@ -18292,7 +18320,18 @@ fn run_fa_layer_body(
             Some(xr) => xr,
             None => &s.tmp,
         };
-        if dt_g == DType::MQ4G256V2 {
+        if dt_g == DType::MQ4CG256 {
+            gpu.fused_gate_up_mq4cg256(
+                &layer.w_gate.buf,
+                &layer.w_up.buf,
+                eff_x,
+                &s.gate_ffn,
+                &s.up,
+                layer.w_gate.m,
+                layer.w_up.m,
+                layer.w_gate.k,
+            )?;
+        } else if dt_g == DType::MQ4G256V2 {
             gpu.fused_gate_up_hfq4g256_mq4v2(
                 &layer.w_gate.buf,
                 &layer.w_up.buf,
@@ -18627,6 +18666,17 @@ fn batched_gemm_single_weight(
         DType::MQ4G256V2 => run_plain_gemm_key(
             gpu,
             hipfire_dispatch::types::KernelKey::GemmMq4G256V2,
+            &w.buf,
+            w.gpu_dtype,
+            x,
+            y,
+            w.m,
+            w.k,
+            n,
+        ),
+        DType::MQ4CG256 => run_plain_gemm_key(
+            gpu,
+            hipfire_dispatch::types::KernelKey::GemmMq4CG256,
             &w.buf,
             w.gpu_dtype,
             x,
@@ -20290,7 +20340,11 @@ fn qkv_from_prerotated_mq(
     k: &GpuTensor,
     v: &GpuTensor,
 ) -> HipResult<()> {
-    if wq.gpu_dtype == DType::MQ4G256V2 {
+    if wq.gpu_dtype == DType::MQ4CG256 {
+        gpu.fused_qkv_mq4cg256(
+            &wq.buf, &wk.buf, &wv.buf, x_rot, q, k, v, wq.m, wk.m, wv.m, wq.k,
+        )
+    } else if wq.gpu_dtype == DType::MQ4G256V2 {
         gpu.fused_qkv_hfq4g256_mq4v2(
             &wq.buf, &wk.buf, &wv.buf, x_rot, q, k, v, wq.m, wk.m, wv.m, wq.k,
         )
@@ -20314,7 +20368,24 @@ fn qkvza_from_prerotated_mq(
     beta: &GpuTensor,
     alpha: &GpuTensor,
 ) -> HipResult<()> {
-    if wqkv.gpu_dtype == DType::MQ4G256V2 {
+    if wqkv.gpu_dtype == DType::MQ4CG256 {
+        gpu.fused_qkvza_mq4cg256(
+            &wqkv.buf,
+            &wz.buf,
+            &w_beta.buf,
+            &w_alpha.buf,
+            x_rot,
+            qkv,
+            z,
+            beta,
+            alpha,
+            wqkv.m,
+            wz.m,
+            w_beta.m,
+            w_alpha.m,
+            wqkv.k,
+        )
+    } else if wqkv.gpu_dtype == DType::MQ4G256V2 {
         gpu.fused_qkvza_hfq4g256_mq4v2(
             &wqkv.buf,
             &wz.buf,
@@ -21166,7 +21237,7 @@ fn gated_norm_mq_rotate_enabled(
         && n_v_heads == 32
         && config.linear_value_head_dim == 128
         && wo.k == n_v_heads * config.linear_value_head_dim
-        && matches!(wo.gpu_dtype, DType::MQ4G256 | DType::MQ4G256V2)
+        && matches!(wo.gpu_dtype, DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ4CG256)
         && wo.awq_scale.is_none()
 }
 
@@ -21209,7 +21280,7 @@ fn qwen35_fa_epilogue_enabled(gpu: &Gpu, config: &Qwen35Config, wo: &WeightTenso
         && config.n_heads == 16
         && config.n_kv_heads == 2
         && config.head_dim == 256
-        && matches!(wo.gpu_dtype, DType::MQ4G256 | DType::MQ4G256V2)
+        && matches!(wo.gpu_dtype, DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ4CG256)
         && wo.awq_scale.is_none()
 }
 
@@ -21244,7 +21315,7 @@ fn qkvza_scalar_prep_enabled(
         && wz.gpu_dtype == dtype
         && w_beta.gpu_dtype == dtype
         && w_alpha.gpu_dtype == dtype
-        && matches!(dtype, DType::MQ4G256 | DType::MQ4G256V2 | DType::HFQ4G256)
+        && matches!(dtype, DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ4CG256 | DType::HFQ4G256)
 }
 
 /// Radiowave experiment: schedule the independent beta/alpha transforms as
@@ -21309,7 +21380,7 @@ fn moe_combine_next_rms_enabled(gpu: &Gpu, weights: &Qwen35Weights, config: &Qwe
     }
 
     let mq4 =
-        |w: &WeightTensor| matches!(w.gpu_dtype, DType::MQ4G256 | DType::MQ4G256V2) && w.k == 2_048 && w.awq_scale.is_none();
+        |w: &WeightTensor| matches!(w.gpu_dtype, DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ4CG256) && w.k == 2_048 && w.awq_scale.is_none();
     // MUST stay in lockstep with `routed_down_self_combines` in
     // hipfire-dispatch/src/pipeline/mod.rs — this asks the same question ("does
     // this layer's down GEMV write `down_expanded`?") and is the admission gate
@@ -21946,7 +22017,7 @@ fn forward_scratch_layers_multi(
                         && layer.w_beta.gpu_dtype == dt
                         && layer.w_alpha.gpu_dtype == dt;
                     let fused_la4_mq4 =
-                        la4_same_dtype && (matches!(dt, DType::MQ4G256 | DType::MQ4G256V2 | DType::HFQ4G256));
+                        la4_same_dtype && (matches!(dt, DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ4CG256 | DType::HFQ4G256));
                     let fused_la4_lloyd_mq3 = la4_same_dtype && dt == DType::MQ3G256Lloyd;
                     let fused_la4_lloyd_mq4 = la4_same_dtype && dt == DType::MQ4G256Lloyd;
                     if fused_la4_mq4 {
@@ -21954,7 +22025,24 @@ fn forward_scratch_layers_multi(
                             Some(xr) => xr,
                             None => &s.tmp,
                         };
-                        if dt == DType::MQ4G256V2 {
+                        if dt == DType::MQ4CG256 {
+                            gpu.fused_qkvza_mq4cg256(
+                                &layer.wqkv.buf,
+                                &layer.wz.buf,
+                                &layer.w_beta.buf,
+                                &layer.w_alpha.buf,
+                                eff_x,
+                                &s.dn_qkv,
+                                &s.dn_z,
+                                &s.dn_beta,
+                                &s.dn_alpha,
+                                layer.wqkv.m,
+                                layer.wz.m,
+                                layer.w_beta.m,
+                                layer.w_alpha.m,
+                                layer.wqkv.k,
+                            )?;
+                        } else if dt == DType::MQ4G256V2 {
                             gpu.fused_qkvza_hfq4g256_mq4v2(
                                 &layer.wqkv.buf,
                                 &layer.wz.buf,
@@ -22134,7 +22222,7 @@ fn forward_scratch_layers_multi(
                     let dt_g = layer.w_gate.gpu_dtype;
                     let same_dtype = layer.w_up.gpu_dtype == dt_g;
                     let fused_gu_mq4 =
-                        same_dtype && (matches!(dt_g, DType::MQ4G256 | DType::MQ4G256V2 | DType::HFQ4G256));
+                        same_dtype && (matches!(dt_g, DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ4CG256 | DType::HFQ4G256));
                     let fused_gu_lloyd_mq3 = same_dtype && dt_g == DType::MQ3G256Lloyd;
                     let fused_gu_lloyd_mq4 = same_dtype && dt_g == DType::MQ4G256Lloyd;
                     if fused_gu_mq4 {
@@ -22142,7 +22230,18 @@ fn forward_scratch_layers_multi(
                             Some(xr) => xr,
                             None => &s.tmp,
                         };
-                        if dt_g == DType::MQ4G256V2 {
+                        if dt_g == DType::MQ4CG256 {
+                            gpu.fused_gate_up_mq4cg256(
+                                &layer.w_gate.buf,
+                                &layer.w_up.buf,
+                                eff_x,
+                                &s.gate_ffn,
+                                &s.up,
+                                layer.w_gate.m,
+                                layer.w_up.m,
+                                layer.w_gate.k,
+                            )?;
+                        } else if dt_g == DType::MQ4G256V2 {
                             gpu.fused_gate_up_hfq4g256_mq4v2(
                                 &layer.w_gate.buf,
                                 &layer.w_up.buf,
@@ -22209,7 +22308,7 @@ fn forward_scratch_layers_multi(
                     let dt = layer.wq.gpu_dtype;
                     let fa3_same_dtype = layer.wk.gpu_dtype == dt && layer.wv.gpu_dtype == dt;
                     let fused_fa3_mq4 =
-                        fa3_same_dtype && (matches!(dt, DType::MQ4G256 | DType::MQ4G256V2 | DType::HFQ4G256));
+                        fa3_same_dtype && (matches!(dt, DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ4CG256 | DType::HFQ4G256));
                     let fused_fa3_lloyd_mq3 = fa3_same_dtype && dt == DType::MQ3G256Lloyd;
                     let fused_fa3_lloyd_mq4 = fa3_same_dtype && dt == DType::MQ4G256Lloyd;
                     if fused_fa3_mq4 {
@@ -22217,7 +22316,21 @@ fn forward_scratch_layers_multi(
                             Some(xr) => xr,
                             None => &s.tmp,
                         };
-                        if dt == DType::MQ4G256V2 {
+                        if dt == DType::MQ4CG256 {
+                            gpu.fused_qkv_mq4cg256(
+                                &layer.wq.buf,
+                                &layer.wk.buf,
+                                &layer.wv.buf,
+                                eff_x,
+                                &s.fa_q_full,
+                                &s.fa_k,
+                                &s.fa_v,
+                                layer.wq.m,
+                                layer.wk.m,
+                                layer.wv.m,
+                                layer.wq.k,
+                            )?;
+                        } else if dt == DType::MQ4G256V2 {
                             gpu.fused_qkv_hfq4g256_mq4v2(
                                 &layer.wq.buf,
                                 &layer.wk.buf,
@@ -22598,7 +22711,7 @@ fn forward_scratch_layers_multi(
                     let dt_g = layer.w_gate.gpu_dtype;
                     let same_dtype = layer.w_up.gpu_dtype == dt_g;
                     let fused_gu_mq4 =
-                        same_dtype && (matches!(dt_g, DType::MQ4G256 | DType::MQ4G256V2 | DType::HFQ4G256));
+                        same_dtype && (matches!(dt_g, DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ4CG256 | DType::HFQ4G256));
                     let fused_gu_lloyd_mq3 = same_dtype && dt_g == DType::MQ3G256Lloyd;
                     let fused_gu_lloyd_mq4 = same_dtype && dt_g == DType::MQ4G256Lloyd;
                     if fused_gu_mq4 {
@@ -22606,7 +22719,18 @@ fn forward_scratch_layers_multi(
                             Some(xr) => xr,
                             None => &s.tmp,
                         };
-                        if dt_g == DType::MQ4G256V2 {
+                        if dt_g == DType::MQ4CG256 {
+                            gpu.fused_gate_up_mq4cg256(
+                                &layer.w_gate.buf,
+                                &layer.w_up.buf,
+                                eff_x,
+                                &s.gate_ffn,
+                                &s.up,
+                                layer.w_gate.m,
+                                layer.w_up.m,
+                                layer.w_gate.k,
+                            )?;
+                        } else if dt_g == DType::MQ4G256V2 {
                             gpu.fused_gate_up_hfq4g256_mq4v2(
                                 &layer.w_gate.buf,
                                 &layer.w_up.buf,
@@ -22689,7 +22813,7 @@ fn forward_scratch_layers_multi(
                         && layer.w_beta.gpu_dtype == dt
                         && layer.w_alpha.gpu_dtype == dt;
                     let fused_la4_mq4 =
-                        la4_same_dtype && (matches!(dt, DType::MQ4G256 | DType::MQ4G256V2 | DType::HFQ4G256));
+                        la4_same_dtype && (matches!(dt, DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ4CG256 | DType::HFQ4G256));
                     let fused_la4_lloyd_mq3 = la4_same_dtype && dt == DType::MQ3G256Lloyd;
                     let fused_la4_lloyd_mq4 = la4_same_dtype && dt == DType::MQ4G256Lloyd;
                     if fused_la4_mq4 {
@@ -22877,7 +23001,7 @@ fn forward_scratch_layers_multi(
                     let dt = layer.wq.gpu_dtype;
                     let fa3_same_dtype = layer.wk.gpu_dtype == dt && layer.wv.gpu_dtype == dt;
                     let fused_fa3_mq4 =
-                        fa3_same_dtype && (matches!(dt, DType::MQ4G256 | DType::MQ4G256V2 | DType::HFQ4G256));
+                        fa3_same_dtype && (matches!(dt, DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ4CG256 | DType::HFQ4G256));
                     let fused_fa3_lloyd_mq3 = fa3_same_dtype && dt == DType::MQ3G256Lloyd;
                     let fused_fa3_lloyd_mq4 = fa3_same_dtype && dt == DType::MQ4G256Lloyd;
                     if fused_fa3_mq4 {
