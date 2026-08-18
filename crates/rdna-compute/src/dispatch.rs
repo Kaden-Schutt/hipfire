@@ -731,6 +731,14 @@ impl DType {
         matches!(
             self,
             DType::MQ4G256
+                // qt=44 shares qt=13's AWQ contract exactly: the quantizer
+                // pre-scales weights by `s` and emits the sidecar, and the forward
+                // path divides x by `s` in the rotate step, so `(W·s)·(x/s) = W·x`.
+                // Omitting it here does not fail — it silently drops the sidecar and
+                // computes `(W·s)·x`, a per-channel scale error on every projection.
+                // That is the May 2026 regression this predicate was centralised to
+                // prevent; qt=44's artifact carries 496 sidecars.
+                | DType::MQ4G256V2
                 | DType::MQ3G256
                 | DType::MQ2G256
                 | DType::MQ3G256Lloyd
