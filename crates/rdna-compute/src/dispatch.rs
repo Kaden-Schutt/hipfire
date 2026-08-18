@@ -51,8 +51,6 @@ pub const LLOYD_MQ4_GROUP_BYTES: usize = 160;
 //                       [M*gpr*64 .. +M*gpr*2)  fp16 per-block scales  → 2.0625 bpw
 //   MQ3G256GL  (qt 39): [0 .. M*gpr*96)   3-bit indices, 96 B/group
 //                       [M*gpr*96 .. +M*gpr*2)  fp16 per-block scales  → 3.0625 bpw
-//   MQ4G256GL  (qt 40): [0 .. M*gpr*128)  4-bit indices, 128 B/group
-//                       [M*gpr*128 .. +M*gpr*2) fp16 per-block scales  → 4.0625 bpw
 //   MQ35G256GL (qt 42): [0 .. M*gpr*112)  3.5-bit indices (7 bits per weight pair, 128-entry 2D VQ), 112 B/group
 //                       [M*gpr*112 .. +M*gpr*2) fp16 per-block scales  → 3.5625 bpw
 //   MQ1G1024GL (qt 41): [0 .. M*gpr*128)  1-bit indices, 128 B/group (gpr=K/1024)
@@ -71,14 +69,6 @@ pub const GL_MQ2_GROUP_IDX_BYTES: usize = 64;
 /// split as MQ2-GL — the scale is in the trailing region, not inline.
 pub const GL_MQ3_GROUP_IDX_BYTES: usize = 96;
 
-/// Per-group INDEX bytes for MQ4-G256-GL (4 bits × 256 weights). Same SoA split
-/// as its 2- and 3-bit siblings: `[M*gpr*128 B indices][M*gpr*2 B fp16 scales]`
-/// → 130 B/group → **4.0625 bpw**, i.e. 6 B/group CHEAPER than MQ4G256's 136 B
-/// (4.25 bpw) while using Gaussian-optimal levels instead of a uniform affine
-/// grid. Nibble packing matches MQ4G256 (`lo | hi << 4`, weight 2i in the low
-/// nibble) so a decode path can share the unpack.
-pub const GL_MQ4_GROUP_IDX_BYTES: usize = 128;
-
 /// Per-group INDEX bytes for MQ1-G1024-GL (1 bit × 1024 weights). The fp16
 /// per-block scale lives in a SEPARATE trailing region, NOT in the group.
 /// 1024*1/8 = 128 B indices + 2 B scale = 130 B per 1024 weights = 1.015625 bpw.
@@ -91,9 +81,7 @@ pub const GL_MQ1_GROUP_SIZE: usize = 1024;
 /// Per-group INDEX bytes for MQ3.5-G256-GL (7 bits per weight PAIR, 128-entry 2D VQ).
 /// 256 weights = 128 pairs × 7 bits = 896 bits = 112 B. +2 B scale = 114 B/group → 3.5625 bpw.
 /// Alignment: 256*3.5=896 bits → 112 B → 3.5 B/lane = 0.875 u32/lane (NOT aligned).
-/// The smallest aligned group is 2048 weights: 2048*3.5=7168 bits=896 B →28 B/lane=7 u32/lane,
-/// but that costs 8× coarser scale granularity. MQ35 therefore is LESS aligned than MQ4GL
-/// (which at G256 gives exactly 4 B/lane=1 u32/lane). Implemented at G256 for quality parity.
+/// but that costs 8× coarser scale granularity. Implemented at G256 for quality parity.
 pub const GL_MQ35_GROUP_IDX_BYTES: usize = 112;
 
 /// Group size for MQ3.5-GL: 256 weights per group (128 pairs). See alignment note above.
@@ -117,16 +105,9 @@ pub const MQ4V2_GROUP_BYTES: usize = 136;
 /// half-wave uniform, lane-invariant scalar loads. See `kernels/src/gemv_mq4cg256_residual.hip`.
 pub const MQ4C_GROUP_BYTES: usize = 132;
 
-/// Per-group bytes for MQ4-G256-SEL (4-bit selector family, AoS).
-/// 128 B nibble indices + 2 B fp16 scale + 1 B selector + 1 B pad = 132 B/256 weights
-/// → 4.125 bpw. 132 % 4 == 0 so the group is 4-byte aligned (AoS-B layout measured
-/// 505.1 GB/s vs SoA 130 B's 492.0 GB/s). Nibble packing identical to MQ4G256/GL.
-pub const GL_MQ4SEL_GROUP_BYTES: usize = 132;
-
 /// Bytes per group in the trailing fp16 scale region (both GL dtypes).
 pub const GL_GROUP_SCALE_BYTES: usize = 2;
 
-/// Bytes per group in the trailing fp16 scale region (both GL dtypes).
 
 /// **MUST STAY BIT-IDENTICAL TO `hipfire-quantize::main::GL_CB2`.**
 ///
@@ -167,10 +148,6 @@ pub const GL_CB3: [f32; 8] = [
 /// Derived by running Lloyd iterations to convergence against the exact
 /// Gaussian moments; the same solver reproduces [`GL_CB2`] and [`GL_CB3`] to
 /// four decimals and their documented MSEs, which is what validates it.
-///
-/// Consumed by `gemv_mq4g256gl` / `gemv_mq4g256gl_multirow` (qt=40 decode,
-/// SoA 130 B/group = 4.0625 bpw). `GL_CB4` is passed as sixteen scalar kernel
-/// args (`cb0..cb15`); the quantized file carries only indices+scales.
 pub const GL_CB4: [f32; 16] = [
     -2.7326, -2.0690, -1.6180, -1.2562, -0.9423, -0.6568, -0.3880, -0.1284,
     0.1284, 0.3880, 0.6568, 0.9423, 1.2562, 1.6180, 2.0690, 2.7326,
@@ -576,32 +553,13 @@ pub enum DType {
     MQ3G256GL, // MagnumQuant 3-bit + TENSOR-GLOBAL 8-entry codebook (GL_CB3), SoA:
     // [M*gpr*96 B indices][M*gpr*2 B fp16 per-block scales] = 3.0625 bpw. Same
     // MoE-only scope + scalar-arg codebook as MQ2G256GL.
-    /// MQ4-G256-GL (qt 40): MagnumQuant 4-bit + TENSOR-GLOBAL 16-entry codebook
-    /// ([`GL_CB4`]), SoA two-region layout with **no** inline per-group header:
-    ///   `[0 .. M*gpr*128)`            4-bit indices, 128 B/group
-    ///   `[M*gpr*128 .. +M*gpr*2)`     fp16 per-block scales, 2 B/group
-    /// → **130 B/group = 4.0625 bpw**. Codebook is a compile-time constant
-    /// passed as sixteen scalar kernel args, not stored in the file. Nibble
-    /// packing matches MQ4G256 (`lo | hi << 4`).
-    MQ4G256GL,
-    /// MQ4-G256-SEL (qt=43): MagnumQuant 4-bit selector family, max-normalised.
-    /// 64 profiles × 16 levels (`GL_CB4S64`), 6-bit selector 0..63.
-    /// AoS per-group, 4-byte aligned:
-    ///   `[0..128)` 4-bit nibble indices (weight 2i low nibble, 2i+1 high)
-    ///   `[128..130)` fp16 scale = f16(max|coeff|), round-tripped
-    ///   `[130]` u8 selector 0..63 (6-bit)
-    ///   `[131]` u8 pad, MUST be 0
-    /// → **132 B/group = 4.125 bpw**. Reconstruction `w = cb[sel][nibble] * scale`.
-    /// Nibble packing identical to MQ4G256/GL. gpr = K/256, requires K%256==0.
-    MQ4G256SEL,
     /// MQ3.5-G256-GL (qt 42): 7 bits per weight PAIR (128-entry 2D VQ) + per-block fp16 scale, SoA:
     /// `[0 .. M*gpr*112)` 7-bit indices (8 pairs → 7 bytes, 16 chunks →112 B/group)
     /// `[M*gpr*112 .. +M*gpr*2)` fp16 per-block scales → 114 B/group → 3.5625 bpw.
     /// 256*3.5=896 bits →3.5 B/lane (NOT aligned). Smallest aligned group is 2048→28 B/lane=7 u32.
-    /// Therefore LESS aligned than MQ4GL (4 B/lane=1 u32). Encode-only.
+    /// Encode-only.
     MQ35G256GL,
     MQ1G1024GL, // MagnumQuant 1-bit + TENSOR-GLOBAL 2-entry codebook (GL_CB1), SoA:
-    // [M*gpr*128 B indices][M*gpr*2 B fp16 scales] where gpr=K/1024.
     // 128 B idx +2 B scale per 1024 weights =1.015625 bpw. (128-entry 2D VQ) + per-block fp16 scale, SoA:
     // [M*gpr*128 B indices][M*gpr*2 B fp16 scales] where gpr=K/1024.
     // 128 B idx +2 B scale per 1024 weights =1.015625 bpw.
@@ -669,8 +627,6 @@ impl DType {
             | DType::MQ4G256Lloyd
             | DType::MQ2G256GL
             | DType::MQ3G256GL
-            | DType::MQ4G256GL
-            | DType::MQ4G256SEL
             | DType::MQ35G256GL
             | DType::MQ1G1024GL
             | DType::HFP4G32
@@ -793,8 +749,6 @@ impl DType {
                 | DType::MFP4G32
                 | DType::MQ2G256GL
                 | DType::MQ3G256GL
-                | DType::MQ4G256GL
-                | DType::MQ4G256SEL
                 | DType::MQ4G256V2
                 | DType::MQ4CG256
                 | DType::MQ35G256GL

@@ -535,7 +535,7 @@ impl KernelCompiler {
     /// Select the scheduler profile for a kernel. The per-kernel table is the
     /// primary source; `HIPFIRE_SCHED_PROFILE` overrides everything when set.
     ///
-    /// **The table is deliberately empty.** `gemv_mq4g256gl_multirow` was
+    /// **The table is deliberately empty.** A kernel was
     /// briefly mapped to `MemoryClause` on the strength of static counters
     /// (r4 VGPR 120 -> 109, max consecutive VMEM 10 -> 16, zero spills, and
     /// strictly better than every ILP profile). Measured device-side with HIP
@@ -639,10 +639,7 @@ impl KernelCompiler {
         let sched_profile_override = hipfire_config::developer_var("HIPFIRE_SCHED_PROFILE")
             .ok()
             .and_then(|value| SchedulerProfile::parse(&value));
-        let scheduler_profile = sched_profile_override.unwrap_or(match name {
-            "gemv_mq4g256gl_multirow" => SchedulerProfile::MemoryClause,
-            _ => SchedulerProfile::Default,
-        });
+        let scheduler_profile = sched_profile_override.unwrap_or(SchedulerProfile::Default);
         Self::hash_parts(
             source,
             arch,

@@ -117,12 +117,12 @@ pub enum RotationPlan {
 pub fn dtype_rotation_plan(dtype: DType) -> RotationPlan {
     use DType::*;
     match dtype {
-        // MQ2G256GL / MQ3G256GL / MQ4G256GL: the GL ("global Lloyd") formats are
+        // MQ2G256GL / MQ3G256GL: the GL ("global Lloyd") formats are
         // encoded against FWHT-256-rotated blocks exactly like every other
         // MQ*-G256 dtype (`quantize_mq{2,3,4}g256gl` calls `cpu_fwht_256` per
         // group), so x MUST be FwhtG256-rotated before their kernels see it.
         MQ4G256 | MQ4G256V2 | MQ4CG256 | MQ3G256 | MQ2G256 | MQ5G256 | MQ6G256 | MQ2G256Lloyd | MQ3G256Lloyd
-        | MQ4G256Lloyd | MQ2G256GL | MQ3G256GL | MQ4G256GL | MQ4G256SEL | MQ35G256GL
+        | MQ4G256Lloyd | MQ2G256GL | MQ3G256GL | MQ35G256GL
         | MQ1G1024GL | MFP4G32 | MFP4G32Lloyd | MFP4G32P | MFP4G32E8 | MFP4G32E8SOA
         | MFP3G32E8 | MFP2G32E8 => RotationPlan::FwhtG256,
         // MQ4G128 and MQ8G256 carry their OWN plans and MUST NOT reach the `_` arm:
@@ -143,7 +143,7 @@ pub fn dtype_post_rotation_variant(dtype: DType) -> GemvVariant {
     match dtype {
         ParoQ4G128 => GemvVariant::Plain,
         MQ4G256 | MQ4G256V2 | MQ4CG256 | MQ3G256 | MQ2G256 | MQ5G256 | MQ6G256 | MQ8G256 | MQ2G256Lloyd | MQ3G256Lloyd
-        | MQ4G256GL | MQ4G256SEL | MQ3G256GL | MQ2G256GL | MQ35G256GL | MQ1G1024GL => {
+        | MQ3G256GL | MQ2G256GL | MQ35G256GL | MQ1G1024GL => {
             GemvVariant::Prerotated
         }
         _ => GemvVariant::Plain,
@@ -236,8 +236,6 @@ pub enum KernelKey {
     GemvMq4G256Prerotated,
     GemvMq4G256V2Prerotated,
     GemvMq4CG256Prerotated,
-    GemvMq4G256GlPrerotated,
-    GemvMq4G256SelPrerotated,
     GemvMq2G256Prerotated,
     GemvMq3G256Prerotated,
     GemvMq5G256Prerotated,
@@ -663,8 +661,6 @@ impl KernelKey {
             MQ4G256 => Ok(Self::GemvMq4G256Prerotated),
             MQ4G256V2 => Ok(Self::GemvMq4G256V2Prerotated),
             MQ4CG256 => Ok(Self::GemvMq4CG256Prerotated),
-            MQ4G256GL => Ok(Self::GemvMq4G256GlPrerotated),
-            MQ4G256SEL => Ok(Self::GemvMq4G256SelPrerotated),
             MQ2G256 => Ok(Self::GemvMq2G256Prerotated),
             MQ3G256 => Ok(Self::GemvMq3G256Prerotated),
             MQ5G256 => Ok(Self::GemvMq5G256Prerotated),
@@ -786,7 +782,7 @@ impl KernelKey {
             MQ5G256 => ArchPredicate::HasMmq,
             MQ6G256 | HFQ6G256 => ArchPredicate::HasMmq,
             MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd => ArchPredicate::HasWave32,
-            MQ2G256GL | MQ3G256GL | MQ4G256GL | MQ4G256SEL | MQ4G256V2 | MQ4CG256 | MQ35G256GL | MQ1G1024GL => ArchPredicate::HasWave32,
+            MQ2G256GL | MQ3G256GL | MQ4G256V2 | MQ4CG256 | MQ35G256GL | MQ1G1024GL => ArchPredicate::HasWave32,
             Q8HFQ | Raw => ArchPredicate::Always,
         }
     }
@@ -849,8 +845,6 @@ pub fn dtype_needs_rotation(dtype: DType) -> bool {
             | MQ4G256Lloyd
             | MQ2G256GL
             | MQ3G256GL
-            | MQ4G256GL
-            | MQ4G256SEL
             | MQ35G256GL
             | MQ1G1024GL
             | MFP4G32

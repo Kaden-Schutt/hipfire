@@ -413,19 +413,6 @@ pub(crate) const RAW_CODECS: &[RawCodec] = &[
         quant_type: 39,
         dtype: DType::MQ3G256GL,
     },
-    // qt 40 (MQ4-G256-GL). Its 2-bit and 3-bit siblings above were registered but
-    // qt 40 was not, so `dequant_weight_raw` rejected the format with
-    // "unsupported quant_type 40" at load time even though the GEMV dispatch,
-    // the encoder and `DType::{row_stride, requires_k_mod_256}` all handled it.
-    // A qt=40 artifact was therefore unloadable and unscoreable.
-    RawCodec {
-        quant_type: 40,
-        dtype: DType::MQ4G256GL,
-    },
-    RawCodec {
-        quant_type: 43,
-        dtype: DType::MQ4G256SEL,
-    },
     RawCodec {
         quant_type: 44,
         dtype: DType::MQ4G256V2,
@@ -461,42 +448,6 @@ pub(crate) fn decode_raw_codec(
                 codec.dtype
             ),
         ));
-    }
-    if codec.dtype == DType::MQ4G256SEL {
-        // AoS 132 B/group = 128 idx + 2 scale + 1 selector + 1 pad.
-        // Selector 0..63 valid, 64..255 invalid — reject rather than mask.
-        // Pad byte MUST be 0.
-        let gpr = k / 256;
-        let expected = m * gpr * 132;
-        if data.len() != expected {
-            return Err(hip_bridge::HipError::new(
-                0,
-                &format!(
-                    "MQ4G256SEL blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name})",
-                    data.len()
-                ),
-            ));
-        }
-        for (gi, chunk) in data.chunks_exact(132).enumerate() {
-            let sel = chunk[130];
-            if sel >= 64 {
-                return Err(hip_bridge::HipError::new(
-                    0,
-                    &format!(
-                        "MQ4G256SEL invalid selector {sel} at group {gi} (must be 0..63) in {name}"
-                    ),
-                ));
-            }
-            if chunk[131] != 0 {
-                return Err(hip_bridge::HipError::new(
-                    0,
-                    &format!(
-                        "MQ4G256SEL pad byte non-zero {} at group {gi} in {name}",
-                        chunk[131]
-                    ),
-                ));
-            }
-        }
     }
     if codec.dtype == DType::MQ4G256V2 {
         let gpr = k / 256;

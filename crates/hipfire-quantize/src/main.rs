@@ -4913,17 +4913,6 @@ pub(crate) const GL_CB35: [[f32; 2]; 128] = [
     [2.944135, 0.598941],
 ];
 
-/// MQ4-G256-GL codec round-trip in f32. 4-bit sibling of
-/// `mq2g256gl_roundtrip_f32`: FWHT, per-block fp16 RMS scale, nearest level in
-/// the tensor-global `GL_CB4`, inverse FWHT. Injects exactly the noise a native
-/// MQ4-GL block would, with no packing and no kernel.
-/// Only the codec-quality test consumes the round-trips today. A native MQ4-GL
-/// arm packs via `quantize_mq4g256gl` instead, so gate these rather than carry
-/// them as dead weight in the shipped binary.
-#[cfg(test)]
-fn mq4g256gl_roundtrip_f32(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<f32> {
-    gl_roundtrip_f32(f32_data, signs1, signs2, &GL_CB4)
-}
 #[cfg(test)]
 
 /// Shared body for the GL round-trip probes — the 2-, 3- and 4-bit variants
@@ -5013,7 +5002,6 @@ fn gl_roundtrip_f32(f32_data: &[f32], signs1: &[f32], signs2: &[f32], cb: &[f32]
 #[cfg(test)]
 
 /// MQ4G256 codec round-trip in f32 — the matched CONTROL for
-/// `mq4g256gl_roundtrip_f32`.
 ///
 /// Mirrors `quantize_mq4g256`'s arithmetic exactly (FWHT, per-block affine
 /// min-max over 16 uniform levels, unsigned 0..15 codes) so that a delta
@@ -5155,147 +5143,7 @@ fn gl_encode_block(group: &[f32; 256], cb: &[f32], idx: &mut [u8; 256]) -> u16 {
 /// For each profile quantize `z` to nearest level and accumulate SSE; pick the
 /// least-SSE profile. Ties → lowest profile index. Writes nibble indices into `idx`.
 /// Returns `(fp16 scale bits, selector)`. Zero block → (0, 0) and zero indices.
-#[inline]
-fn sel_selection_p() -> f32 {
-    use std::sync::LazyLock;
-    static P: LazyLock<f32> = LazyLock::new(|| {
-        std::env::var("HIPFIRE_MQ4SEL_P")
-            .ok()
-            .and_then(|s| s.parse::<f32>().ok())
-            .unwrap_or(2.0)
-    });
-    *P
-}
 
-#[inline]
-fn sel_encode_block(
-    group: &[f32; 256],
-    cb_family: &[[f32; 16]; 64],
-    idx: &mut [u8; 256],
-) -> (u16, u8) {
-    let mut m: f32 = 0.0;
-    for &v in group.iter() {
-        let av = v.abs();
-        if av > m {
-            m = av;
-        }
-    }
-    if m == 0.0 || !m.is_finite() {
-        for v in idx.iter_mut() {
-            *v = 0;
-        }
-        return (0, 0);
-    }
-    let sbits = f32_to_fp16_bits(m);
-    let scale = f16_to_f32(sbits);
-    if scale == 0.0 || !scale.is_finite() {
-        for v in idx.iter_mut() {
-            *v = 0;
-        }
-        return (sbits, 0);
-    }
-    let inv = 1.0 / scale;
-    let p = sel_selection_p();
-    // Find best profile by weighted SSE: sum |z|^p * (z - zhat)^2
-    // p=0 reproduces plain SSE exactly.
-    let mut best_profile: u8 = 0;
-    let mut best_sse = f64::INFINITY;
-    for (prof, cb) in cb_family.iter().enumerate() {
-        let mut sse: f64 = 0.0;
-        for &w in group.iter() {
-            let z = w * inv;
-            let mut best = 0usize;
-            let mut best_d = (z - cb[0]).abs();
-            for (k, &c) in cb.iter().enumerate().skip(1) {
-                let d = (z - c).abs();
-                if d < best_d {
-                    best_d = d;
-                    best = k;
-                }
-            }
-            let diff = (z - cb[best]) as f64;
-            let wgt: f64 = if p == 0.0 {
-                1.0
-            } else if p == 2.0 {
-                let az = z.abs() as f64;
-                az * az
-            } else {
-                (z.abs() as f64).powf(p as f64)
-            };
-            sse += wgt * diff * diff;
-        }
-        if sse < best_sse {
-            best_sse = sse;
-            best_profile = prof as u8;
-        }
-    }
-    // Final quantize to best profile.
-    let cb = &cb_family[best_profile as usize];
-    for (i, &w) in group.iter().enumerate() {
-        let z = w * inv;
-        let mut best = 0usize;
-        let mut best_d = (z - cb[0]).abs();
-        for (k, &c) in cb.iter().enumerate().skip(1) {
-            let d = (z - c).abs();
-            if d < best_d {
-                best_d = d;
-                best = k;
-            }
-        }
-        idx[i] = best as u8;
-    }
-    (sbits, best_profile)
-}
-
-/// MQ4-G256-SEL: 4-bit selector family, max-normalised, AoS per-group.
-/// **4.125 bpw** — 128 B indices + 2 B fp16 scale + 1 B selector (6-bit index 0..63) + 1 B pad = 132 B/256.
-///
-/// Layout per group, contiguous AoS (132 B, 4-byte aligned):
-///   `[0..128)` 4-bit nibble indices (weight 2i low nibble, 2i+1 high)
-///   `[128..130)` fp16 scale = f16(max|coeff|), round-tripped
-///   `[130]` u8 selector 0..63 (6-bit), picks 64-profile codebook
-///   `[131]` u8 pad, MUST be 0
-///
-/// Row-major: `row_bytes = gpr * 132`, `gpr = K/256`. Reconstruction:
-///   `w = cb[sel][nibble] * scale` where `cb` is `GL_CB4S64[sel][nibble]` (64 profiles).
-///
-/// `k` must be a multiple of 256.
-pub(crate) fn quantize_mq4g256sel(
-    f32_data: &[f32],
-    m: usize,
-    k: usize,
-    signs1: &[f32],
-    signs2: &[f32],
-) -> Vec<u8> {
-    assert_eq!(k % 256, 0, "MQ4SEL: K must be a multiple of 256 (got {k})");
-    let gpr = k / 256;
-    let group_bytes = 132;
-    let row_bytes = gpr * group_bytes;
-    let mut out = vec![0u8; m * row_bytes];
-    let family = &GL_CB4S64;
-    use rayon::prelude::*;
-    out.par_chunks_mut(row_bytes)
-        .enumerate()
-        .for_each(|(row, row_out)| {
-            for g in 0..gpr {
-                let start = row * k + g * 256;
-                let mut group = [0.0f32; 256];
-                group.copy_from_slice(&f32_data[start..start + 256]);
-                cpu_fwht_256(&mut group, signs1, signs2);
-                let mut codes = [0u8; 256];
-                let (sbits, sel) = sel_encode_block(&group, family, &mut codes);
-                let base = g * group_bytes;
-                for b in 0..128 {
-                    row_out[base + b] = (codes[2 * b] & 0x0F) | ((codes[2 * b + 1] & 0x0F) << 4);
-                }
-                row_out[base + 128] = (sbits & 0xFF) as u8;
-                row_out[base + 129] = (sbits >> 8) as u8;
-                row_out[base + 130] = sel;
-                row_out[base + 131] = 0;
-            }
-        });
-    out
-}
 
 /// MQ2-G256-GL: 2-bit codes vs one tensor-global codebook + per-block fp16
 /// scale, structure-of-arrays. 2.0625 bpw.
@@ -5388,60 +5236,10 @@ pub(crate) fn quantize_mq3g256gl(
         });
     out
 }
+// mq2g256gl sibling retained
+// mq3g256gl sibling retained
 
-/// MQ4-G256-GL: 4-bit sibling of `quantize_mq2g256gl` / `quantize_mq3g256gl`.
-/// **4.0625 bpw** — 128 B of indices per group + 2 B fp16 scale = 130 B/256.
-///
-/// Layout: `[m*gpr*128 B packed indices][m*gpr*2 B fp16 scales]`, both regions
-/// row-major in (row, group), no inline per-group header — identical SoA split
-/// to the 2- and 3-bit variants.
-///
-/// Nibble packing deliberately matches `quantize_mq4g256`: weight `2i` occupies
-/// the LOW nibble of byte `i` and weight `2i+1` the high nibble, so an existing
-/// MQ4 unpack can be reused and only the level lookup differs (uniform affine
-/// `min + q*scale` becomes `scale * GL_CB4[q]`).
-///
-/// Versus MQ4G256 this is 6 B/group cheaper AND 20.9% lower codec MSE, because
-/// after the FWHT each block is Gaussian by CLT and `GL_CB4` is that
-/// distribution's Lloyd–Max optimum, whereas MQ4G256 spends its 8 B on an
-/// affine min-max fit of a uniform grid. See `gl_cb4_beats_uniform_affine`.
-///
-/// `k` must be a multiple of 256. ENCODE-ONLY: no kernel decodes qt=40 yet.
-pub(crate) fn quantize_mq4g256gl(
-    f32_data: &[f32],
-    m: usize,
-    k: usize,
-    signs1: &[f32],
-    signs2: &[f32],
-) -> Vec<u8> {
-    assert_eq!(k % 256, 0, "MQ4GL: K must be a multiple of 256 (got {k})");
-    let gpr = k / 256;
-    let idx_bytes = m * gpr * 128;
-    let mut out = vec![0u8; idx_bytes + m * gpr * 2];
-    let (idx_region, scale_region) = out.split_at_mut(idx_bytes);
-    use rayon::prelude::*;
-    idx_region
-        .par_chunks_mut(gpr * 128)
-        .zip(scale_region.par_chunks_mut(gpr * 2))
-        .enumerate()
-        .for_each(|(row, (row_idx, row_scale))| {
-            for g in 0..gpr {
-                let start = row * k + g * 256;
-                let mut group = [0.0f32; 256];
-                group.copy_from_slice(&f32_data[start..start + 256]);
-                cpu_fwht_256(&mut group, signs1, signs2);
-                let mut codes = [0u8; 256];
-                let sbits = gl_encode_block(&group, &GL_CB4, &mut codes);
-                let base = g * 128;
-                for b in 0..128 {
-                    row_idx[base + b] = (codes[2 * b] & 0x0F) | ((codes[2 * b + 1] & 0x0F) << 4);
-                }
-                row_scale[g * 2] = (sbits & 0xFF) as u8;
-                row_scale[g * 2 + 1] = (sbits >> 8) as u8;
-            }
-        });
-    out
-}
+
 /// MQ3.5-G256-GL: 7 bits per weight PAIR (128-entry 2D VQ) + per-block fp16 scale.
 /// **3.5625 bpw** — 112 B of 7-bit pair indices per group + 2 B fp16 scale = 114 B/256.
 ///
@@ -5450,11 +5248,12 @@ pub(crate) fn quantize_mq4g256gl(
 /// where code for pair `8*c + j` contributes `code << (7*j)` to the 56-bit accumulator
 /// of chunk `c`, stored as 7 LE bytes.
 ///
-/// Versus MQ4GL this is 0.5 bpw cheaper but 61% higher codec MSE (0.01515 vs 0.00940 per dim
-/// normalized), i.e. the 0.17 dB 2D-VQ granular gain does NOT offset the 3 dB rate loss.
+/// At 0.5 bpw cheaper than a 4-bit codebook this carries 61% higher codec MSE
+/// (0.01515 vs 0.00940 per dim normalized), i.e. the 0.17 dB 2D-VQ granular gain
+/// does NOT offset the 3 dB rate loss.
 /// Alignment: 256*3.5=896 bits →112 B →3.5 B/lane=0.875 u32 (NOT aligned); smallest aligned
-/// group is 2048→28 B/lane=7 u32 at 8× coarser scale granularity, so MQ35 is LESS aligned than
-/// MQ4GL (4 B/lane=1 u32). Implemented at G256 for quality parity; encode-only.
+/// group is 2048→28 B/lane=7 u32 at 8× coarser scale granularity, so MQ35 is poorly aligned
+/// against any 4 B/lane format. Implemented at G256 for quality parity; encode-only.
 ///
 /// `k` must be a multiple of 256. ENCODE-ONLY: no kernel decodes qt=42 yet.
 pub(crate) fn quantize_mq35g256gl(
@@ -5631,7 +5430,6 @@ fn mq35g256gl_unpack_blob(blob: &[u8], m: usize, k: usize) -> Vec<f32> {
     out
 }
 
-
 /// CPU FWHT for 1024 elements (orthogonal, same LCG signs as 256 variant).
 /// Matches GPU `fwht_forward_1024` pattern: signs1 → butterfly → scale → signs2.
 fn cpu_fwht_1024(x: &mut [f32; 1024], signs1: &[f32], signs2: &[f32]) {
@@ -5801,45 +5599,6 @@ fn mq1g1024gl_unpack_blob(blob: &[u8], m: usize, k: usize) -> Vec<f32> {
     out
 }
 
- /// CPU packed-dequant oracle for MQ4-G256-GL blobs.
-///
-/// Parses the frozen two-region layout produced by [`quantize_mq4g256gl`]:
-/// index region base 0 with group stride 128, scale region base `m*gpr*128`
-/// indexed `[row*gpr + g]`. Reconstructs each weight in the **rotated** domain
-/// as `scale * GL_CB4[code]` — deliberately does NOT inverse-FWHT, so a kernel
-/// (or future GPU parity test) can compare against the same numbers.
-#[cfg(test)]
-fn mq4g256gl_unpack_blob(blob: &[u8], m: usize, k: usize) -> Vec<f32> {
-    assert_eq!(k % 256, 0, "MQ4GL unpack: K must be a multiple of 256 (got {k})");
-    let gpr = k / 256;
-    let idx_bytes = m * gpr * rdna_compute::GL_MQ4_GROUP_IDX_BYTES;
-    let scale_bytes = m * gpr * rdna_compute::GL_GROUP_SCALE_BYTES;
-    assert_eq!(
-        blob.len(),
-        idx_bytes + scale_bytes,
-        "MQ4GL unpack: blob length {} != m*gpr*130 = {}",
-        blob.len(),
-        idx_bytes + scale_bytes
-    );
-    let mut out = vec![0.0f32; m * k];
-    for row in 0..m {
-        for g in 0..gpr {
-            let idx_base = (row * gpr + g) * rdna_compute::GL_MQ4_GROUP_IDX_BYTES;
-            let scale_base = idx_bytes + (row * gpr + g) * rdna_compute::GL_GROUP_SCALE_BYTES;
-            let sbits = u16::from_le_bytes([blob[scale_base], blob[scale_base + 1]]);
-            let scale = f16_to_f32(sbits);
-            let dst = row * k + g * 256;
-            for b in 0..128 {
-                let packed = blob[idx_base + b];
-                let c0 = (packed & 0x0F) as usize;
-                let c1 = (packed >> 4) as usize;
-                out[dst + 2 * b] = scale * GL_CB4[c0];
-                out[dst + 2 * b + 1] = scale * GL_CB4[c1];
-            }
-        }
-    }
-    out
-}
 
 /// Quantize F32 weights to HFQ3-G256: 3-bit with 256-weight groups.
 /// Block: [f32 scale][f32 zero][96B packed 3-bit] = 104 bytes per 256 weights (0.406 B/w).
@@ -6212,12 +5971,8 @@ impl QuantType {
             36 => Some(Self::MFP3G32E8),
             37 => Some(Self::MFP2G32E8),
             38 => Some(Self::MQ2G256GL),
-            39 => Some(Self::MQ3G256GL),
-            40 => Some(Self::MQ4G256GL),
-            41 => Some(Self::MQ1G1024GL),
-            42 => Some(Self::MQ35G256GL),
-            43 => Some(Self::MQ4G256SEL),
-            44 => Some(Self::MQ4G256V2),
+            39 => Some(Self::MQ3G256GL),            41 => Some(Self::MQ1G1024GL),
+            42 => Some(Self::MQ35G256GL),            44 => Some(Self::MQ4G256V2),
             45 => Some(Self::MQ4CG256),
             _ => None,
         }
@@ -6303,19 +6058,8 @@ pub(crate) enum QuantType {
     // (MQ2) — and the group base becomes naturally aligned (64 B vs 72 B stride).
     MQ2G256GL = 38, // 2-bit + global codebook: 64 B idx/group + 2 B scale = 2.0625 bpw
     MQ3G256GL = 39, // 3-bit + global codebook: 96 B idx/group + 2 B scale = 3.0625 bpw
-    // 4-bit + global codebook: 128 B idx/group + 2 B scale = 4.0625 bpw. Six
-    // bytes per group CHEAPER than MQ4G256 (136 B, 4.25 bpw) and 20.9% lower
-    // codec MSE, because the 16 levels are the Lloyd-Max optimum for the
-    // post-FWHT Gaussian instead of a uniform affine min-max grid.
-    MQ4G256GL = 40,
     MQ1G1024GL = 41, // 1-bit + global codebook: 128 B idx/group + 2 B scale = 1.015625 bpw, group 1024, GL_CB1
-    MQ35G256GL = 42, // 3.5-bit 2D VQ: 112 B idx/group (7 bits per pair, 128-entry 2D codebook GL_CB35) +2 B scale →3.5625 bpw. LESS aligned than MQ4GL (3.5 B/lane vs 4 B/lane).
-    /// MQ4-G256-SEL (qt=43): 4-bit selector family, max-normalised. 132 B/group = 128 B
-    /// indices + 2 B fp16 scale (max|coeff|) + 1 B selector (0..63) + 1 B pad = 4.125 bpw.
-    /// AoS per-group (132 B, 4-byte aligned). Reconstruction `w = cb[sel][nibble] * scale`
-    /// where `cb` is the 64-profile family selected via `HIPFIRE_MQ4SEL_P` (float,
-    /// default 2.0, the |z|^p selection weight). The pad byte at [131] MUST be 0.
-    MQ4G256SEL = 43,
+    MQ35G256GL = 42, // 3.5-bit 2D VQ: 112 B idx/group (7 bits per pair, 128-entry 2D codebook GL_CB35) +2 B scale →3.5625 bpw.
     /// MQ4-G256 v2 (qt=44): FWHT-rotated 4-bit, per-128 asymmetric. 136 B/group,
     /// byte-identical to qt=13 (MQ4G256) except the 8 header bytes. Payload is
     /// unchanged: 128 B of 4-bit nibbles at offset 8, lane `t` reading the u32 at
@@ -7142,7 +6886,7 @@ fn is_q8_tensor(name: &str) -> bool {
                 // lm_head and embed (the 48 conv1d are Q8 via q8_conv1d_default, not via
                 // is_q8_tensor). ssm_out/attn/router stay at --format to keep the
                 // baseline census of 50 Q8 (lm_head+embed+48 conv1d). This matches the
-                // mq4gl baseline (qt40 496, Q8 50, F16 305) and the required mq4sel
+                // baseline census (qt 496, Q8 50, F16 305)
                 // census (qt43 496, Q8 50, F16 305).
                 return class == "lm_head" || class == "embed";
             }
@@ -9488,13 +9232,12 @@ fn main() {
                 // or batched GL kernels exist, so a GL model prefills per-token.
                 "MQ2GL" => QuantType::MQ2G256GL,
                 "MQ3GL" => QuantType::MQ3G256GL,
-                "MQ4GL" => QuantType::MQ4G256GL,
                 "E8" | "MFP4E8" | "MFP4G32E8" => QuantType::MFP4G32E8,
                 "MFP3E8" | "MFP3G32E8" => QuantType::MFP3G32E8,
                 "MFP2E8" | "MFP2G32E8" => QuantType::MFP2G32E8,
                 other => {
                     eprintln!(
-                        "error: {path}:{}: unknown dtype '{}' (expected MQ6/MQ4/MQ3L/MQ2L/MQ2GL/MQ3GL/MQ4GL/E8/MFP3E8/MFP2E8)",
+                        "error: {path}:{}: unknown dtype '{}' (expected MQ6/MQ4/MQ3L/MQ2L/MQ2GL/MQ3GL/E8/MFP3E8/MFP2E8)",
                         lineno + 1,
                         other
                     );
@@ -9796,10 +9539,7 @@ fn main() {
         format == "mq4-lloyd" || format == "mq4g256-lloyd" || format == "mq4lloyd";
     let use_mq1 = format == "mq1" || format == "mq1g1024" || format == "mq1g1024gl" || format == "mq1gl";
     let use_mq2gl = format == "mq2gl" || format == "mq2g256gl";
-    let use_mq3gl = format == "mq3gl" || format == "mq3g256gl";
-    let use_mq4gl = format == "mq4gl" || format == "mq4g256gl";
-    let use_mq4sel = format == "mq4sel" || format == "mq4g256sel" || format == "mq4-sel" || format == "mq4g256-sel";
-    let use_mq35gl = format == "mq35gl" || format == "mq3.5gl" || format == "mq35g256gl" || format == "mq3p5g256gl" || format == "mq35g256" || format == "mq3p5gl";
+    let use_mq3gl = format == "mq3gl" || format == "mq3g256gl";    let use_mq35gl = format == "mq35gl" || format == "mq3.5gl" || format == "mq35g256gl" || format == "mq3p5g256gl" || format == "mq35g256" || format == "mq3p5gl";
     let use_hfq6 = format == "hfq6" || format == "hfq6g256" || format == "hf6";
     let use_hfp4 = format == "hfp4" || format == "hfp4g32" || format == "hf4p" || format == "fp4";
     // MFP4G32 — HFP4G32 + offline FWHT (drop-in MQ4 replacement). Same per-row layout
@@ -12580,11 +12320,6 @@ fn main() {
                                 QuantType::MQ3G256GL,
                                 256u32,
                             ),
-                            QuantType::MQ4G256GL => (
-                                quantize_mq4g256gl(&f32_slice, inner_m, inner_k_e, &signs1, &signs2),
-                                QuantType::MQ4G256GL,
-                                256u32,
-                            ),
                             // T3-3L-E8 experiment: mfp4-E8 mid tier (4.25 bpw,
                             // MQ6-class quality) in place of MQ4. group_size 32.
                             QuantType::MFP4G32E8 => (
@@ -12846,12 +12581,6 @@ fn main() {
                     } else if use_mq35gl && supports_g256 {
                         let q = quantize_mq35g256gl(&f32_slice, inner_m, inner_k_e, &signs1, &signs2);
                         (q, QuantType::MQ35G256GL, 256u32)
-                    } else if use_mq4gl && supports_g256 {
-                        let q = quantize_mq4g256gl(&f32_slice, inner_m, inner_k_e, &signs1, &signs2);
-                        (q, QuantType::MQ4G256GL, 256u32)
-                    } else if use_mq4sel && supports_g256 {
-                        let q = quantize_mq4g256sel(&f32_slice, inner_m, inner_k_e, &signs1, &signs2);
-                        (q, QuantType::MQ4G256SEL, 256u32)
                     } else if supports_g256 {
                         let q = quantize_mq4g256(&f32_slice, &signs1, &signs2);
                         (q, QuantType::MQ4G256, 256u32)
@@ -13601,9 +13330,7 @@ fn main() {
                                 (q, QuantType::Q8F16, 32u32, "Q8_F16")
                             }
                         }
-                    } else if (use_mq4gl
-                        || use_mq4sel
-                        || use_mq4g256
+                    } else if (use_mq4g256
                         || use_mq4v2
                         || use_mq4c
                         || use_mq4_mq6exp
@@ -13621,46 +13348,6 @@ fn main() {
                     {
                         let q = quantize_q8f16(&f32_data);
                         (q, QuantType::Q8F16, 32u32, "Q8_F16")
-                    } else if use_mq4gl {
-                        let k_dim = if meta.shape.len() == 2 {
-                            meta.shape[1]
-                        } else {
-                            n_elements
-                        };
-                        if k_dim % 256 == 0 {
-                            let m_dim = if meta.shape.len() == 2 {
-                                meta.shape[0]
-                            } else {
-                                1
-                            };
-                            let signs1 = gen_fwht_signs(42, 256);
-                            let signs2 = gen_fwht_signs(1042, 256);
-                            let q = quantize_mq4g256gl(&f32_data, m_dim, k_dim, &signs1, &signs2);
-                            (q, QuantType::MQ4G256GL, 256u32, "MQ4G256GL")
-                        } else {
-                            let q = quantize_q8f16(&f32_data);
-                            (q, QuantType::Q8F16, 32u32, "Q8_F16")
-                        }
-                    } else if use_mq4sel {
-                        let k_dim = if meta.shape.len() == 2 {
-                            meta.shape[1]
-                        } else {
-                            n_elements
-                        };
-                        if k_dim % 256 == 0 {
-                            let m_dim = if meta.shape.len() == 2 {
-                                meta.shape[0]
-                            } else {
-                                1
-                            };
-                            let signs1 = gen_fwht_signs(42, 256);
-                            let signs2 = gen_fwht_signs(1042, 256);
-                            let q = quantize_mq4g256sel(&f32_data, m_dim, k_dim, &signs1, &signs2);
-                            (q, QuantType::MQ4G256SEL, 256u32, "MQ4G256SEL")
-                        } else {
-                            let q = quantize_q8f16(&f32_data);
-                            (q, QuantType::Q8F16, 32u32, "Q8_F16")
-                        }
                     } else if use_mq4v2 {
                         let k_dim = if meta.shape.len() == 2 {
                             meta.shape[1]
@@ -14360,7 +14047,7 @@ fn main() {
                             let q = quantize_hfq4g128(&f32_data);
                             (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                         }
-                    } else if (use_mq2gl || use_mq3gl || use_mq35gl || use_mq4gl || use_mq4sel) && is_embed {
+                    } else if (use_mq2gl || use_mq3gl || use_mq35gl) && is_embed {
                         let q = quantize_q8f16(&f32_data);
                         (q, QuantType::Q8F16, 32u32, "Q8_F16")
                     } else if use_mq2gl {
@@ -14395,30 +14082,6 @@ fn main() {
                             let signs2 = gen_fwht_signs(1042, 256);
                             let q = quantize_mq35g256gl(&f32_data, m, k_dim, &signs1, &signs2);
                             (q, QuantType::MQ35G256GL, 256u32, "MQ35G256GL")
-                        } else {
-                            let q = quantize_hfq4g128(&f32_data);
-                            (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
-                        }
-                    } else if use_mq4gl {
-                        let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
-                        if k_dim % 256 == 0 {
-                            let m = meta.shape[0];
-                            let signs1 = gen_fwht_signs(42, 256);
-                            let signs2 = gen_fwht_signs(1042, 256);
-                            let q = quantize_mq4g256gl(&f32_data, m, k_dim, &signs1, &signs2);
-                            (q, QuantType::MQ4G256GL, 256u32, "MQ4G256GL")
-                        } else {
-                            let q = quantize_hfq4g128(&f32_data);
-                            (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
-                        }
-                    } else if use_mq4sel {
-                        let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
-                        if k_dim % 256 == 0 {
-                            let m = meta.shape[0];
-                            let signs1 = gen_fwht_signs(42, 256);
-                            let signs2 = gen_fwht_signs(1042, 256);
-                            let q = quantize_mq4g256sel(&f32_data, m, k_dim, &signs1, &signs2);
-                            (q, QuantType::MQ4G256SEL, 256u32, "MQ4G256SEL")
                         } else {
                             let q = quantize_hfq4g128(&f32_data);
                             (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
@@ -14501,7 +14164,7 @@ fn main() {
                     }
                 }; // end K-map outer if-else
                 // Regression guard: Q4F16G64 is legacy fallback — fail loudly unless explicitly requested.
-                // This catches silent fall-throughs like the mq4sel embed bug (qt=0 instead of Q8).
+                // This catches silent fall-throughs like the embed bug (qt=0 instead of Q8).
                 if qt == QuantType::Q4F16G64 {
                     let is_q4_opt_in = format == "q4f16"
                         || format == "q4f16g64"
@@ -14519,8 +14182,7 @@ fn main() {
                              classification arm, not a valid result.\n  \
                              decision state: shape={:?} k_dim={} k%256={} kmap_level={:?} \
                              is_embed={} q8_router={}\n  \
-                             mq4 family flags: use_mq4v2={} use_mq4g256={} use_mq4gl={} \
-                             use_mq4sel={} use_mq4c={}\n  \
+                             mq4 family flags: use_mq4v2={} use_mq4g256={} use_mq4c={}\n  \
                              Fix the arm for the flag that is true; do not add a q4f16g64 \
                              opt-in to silence this.",
                             name,
@@ -14533,8 +14195,6 @@ fn main() {
                             q8_router,
                             use_mq4v2,
                             use_mq4g256,
-                            use_mq4gl,
-                            use_mq4sel,
                             use_mq4c,
                         );
                         std::process::exit(1);
@@ -16962,71 +16622,6 @@ mod tests {
     /// property (130 B vs 136 B per group) would just be losing precision cheaply.
     ///
     /// Covered by `gl_codebooks_match_runtime` once `rdna_compute::GL_CB4` landed.
-    #[test]
-    fn gl_cb4_beats_uniform_affine() {
-        // Symmetric, strictly increasing, and centred — the structural
-        // properties a Lloyd–Max solution for a symmetric density must have.
-        assert_eq!(GL_CB4.len(), 16);
-        for i in 0..8 {
-            assert!(
-                (GL_CB4[i] + GL_CB4[15 - i]).abs() < 1e-6,
-                "GL_CB4 must be symmetric about 0 at index {i}"
-            );
-        }
-        for w in GL_CB4.windows(2) {
-            assert!(w[1] > w[0], "GL_CB4 must be strictly increasing");
-        }
-
-        // Deterministic pseudo-Gaussian blocks (Box–Muller on a fixed LCG) so
-        // the comparison is reproducible without a dependency on `rand`.
-        let mut state = 0x2545F4914F6CDD1Du64;
-        let mut next = || {
-            state ^= state >> 12;
-            state ^= state << 25;
-            state ^= state >> 27;
-            let x = state.wrapping_mul(0x2545F4914F6CDD1D);
-            ((x >> 11) as f64) / ((1u64 << 53) as f64)
-        };
-        let n_blocks = 64usize;
-        let mut w = Vec::with_capacity(n_blocks * 256);
-        while w.len() < n_blocks * 256 {
-            let u1: f64 = next().max(1e-12);
-            let u2: f64 = next();
-            let r = (-2.0 * u1.ln()).sqrt();
-            w.push((r * (std::f64::consts::TAU * u2).cos()) as f32);
-            w.push((r * (std::f64::consts::TAU * u2).sin()) as f32);
-        }
-        w.truncate(n_blocks * 256);
-
-        // Identity FWHT signs: isolate the CODEC. A real rotation is what makes
-        // the blocks Gaussian in the first place; these inputs already are.
-        let signs = vec![1.0f32; 256];
-        let gl = mq4g256gl_roundtrip_f32(&w, &signs, &signs);
-        let uni = mq4g256_roundtrip_f32(&w, &signs, &signs);
-
-        let mse = |a: &[f32]| -> f64 {
-            a.iter()
-                .zip(w.iter())
-                .map(|(x, y)| {
-                    let d = (*x - *y) as f64;
-                    d * d
-                })
-                .sum::<f64>()
-                / w.len() as f64
-        };
-        let (m_gl, m_uni) = (mse(&gl), mse(&uni));
-        assert!(
-            m_gl < m_uni,
-            "MQ4-GL ({m_gl:.6}) must beat MQ4G256 uniform affine ({m_uni:.6})"
-        );
-        // Offline prediction was -20.9%; require a clear margin without pinning
-        // the exact figure, which moves with the sample.
-        assert!(
-            m_gl < 0.92 * m_uni,
-            "expected >=8% MSE reduction, got {:.2}% ({m_gl:.6} vs {m_uni:.6})",
-            100.0 * (1.0 - m_gl / m_uni)
-        );
-    }
 
     /// The MQ*-G256-GL codebooks are NOT stored in the `.hfq` file: the encoder
     /// bakes them in via `gl_encode_block(&GL_CB2 | &GL_CB3, ..)` and the runtime
@@ -17074,10 +16669,10 @@ mod tests {
     }
 
     /// Pins the GL on-disk geometry the runtime loader + kernels assume:
-    /// 96 (MQ3-GL) / 128 (MQ4-GL). The kernels derive the scale-region base as
+    /// 96 (MQ3-GL) / 64 (MQ2-GL). The kernels derive the scale-region base as
     /// `M*gpr*IDX`, so a size change here is a silent read past/short of the scales.
     ///
-    /// Also pins NIBBLE ORDER and SCALE PLACEMENT for MQ4-GL: a test that only
+    /// Also pins NIBBLE ORDER and SCALE PLACEMENT for MQ2/3-GL: a test that only
     /// checks `len()` would pass with nibbles swapped or the two regions
     /// transposed — the exact bug class the wire oracle must exclude.
     #[test]
@@ -17096,14 +16691,6 @@ mod tests {
         );
 
         let b3 = quantize_mq3g256gl(&w, m, k, &signs1, &signs2);
-        let b4 = quantize_mq4g256gl(&w, m, k, &signs1, &signs2);
-        assert_eq!(
-            b4.len(),
-            m * gpr * (rdna_compute::GL_MQ4_GROUP_IDX_BYTES + rdna_compute::GL_GROUP_SCALE_BYTES),
-            "MQ4G256GL blob size disagrees with GL_MQ4_GROUP_IDX_BYTES/GL_GROUP_SCALE_BYTES"
-        );
-        // 130 B per 256 weights == 4.0625 bpw, the whole reason the format exists.
-        assert_eq!(b4.len() * 8, m * k * 65 / 16, "MQ4-GL must be exactly 4.0625 bpw");
 
         let b35 = quantize_mq35g256gl(&w, m, k, &signs1, &signs2);
         assert_eq!(
@@ -17114,139 +16701,10 @@ mod tests {
         // 114 B per 256 weights == 3.5625 bpw = 3.5 + 0.0625 scale overhead.
         assert_eq!(b35.len() * 8, m * k * 57 / 16, "MQ35-GL must be exactly 3.5625 bpw");
 
-        // Hand-construct a single group whose 256 codes are known and distinct
-        // enough to distinguish low-from-high nibble, then assert packing + scale
-        // placement without going through the encoder's FWHT path.
-        {
-            let m1 = 2usize;
-            let k1 = 256usize;
-            let gpr1 = 1usize;
-            let idx_bytes = m1 * gpr1 * rdna_compute::GL_MQ4_GROUP_IDX_BYTES;
-            let n_groups = m1 * gpr1;
-            let mut blob = vec![0u8; idx_bytes + n_groups * rdna_compute::GL_GROUP_SCALE_BYTES];
-            // Group (row=0,g=0): codes[i] = i % 16 — byte b holds lo=b%16? wait:
-            // weight 2b → low nibble = (2b)%16, weight 2b+1 → high = (2b+1)%16.
-            for b in 0..128 {
-                let lo = ((2 * b) % 16) as u8;
-                let hi = ((2 * b + 1) % 16) as u8;
-                blob[b] = lo | (hi << 4);
-            }
-            // Distinct non-zero scales at first and last group slots.
-            let s_first: u16 = 0x3C00; // fp16 1.0
-            let s_last: u16 = 0x4000; // fp16 2.0
-            blob[idx_bytes] = (s_first & 0xFF) as u8;
-            blob[idx_bytes + 1] = (s_first >> 8) as u8;
-            let last_off = idx_bytes + (n_groups - 1) * 2;
-            blob[last_off] = (s_last & 0xFF) as u8;
-            blob[last_off + 1] = (s_last >> 8) as u8;
-
-            // Nibble order: byte 0 low = weight 0, high = weight 1.
-            assert_eq!(blob[0] & 0x0F, 0, "byte0 low nibble must be weight 0 code");
-            assert_eq!(blob[0] >> 4, 1, "byte0 high nibble must be weight 1 code");
-            assert_eq!(blob[1] & 0x0F, 2, "byte1 low nibble must be weight 2 code");
-            assert_eq!(blob[1] >> 4, 3, "byte1 high nibble must be weight 3 code");
-
-            // Scale placement: first scale at m*gpr*128, last at + (n_groups-1)*2.
-            assert_eq!(
-                idx_bytes,
-                m1 * gpr1 * rdna_compute::GL_MQ4_GROUP_IDX_BYTES,
-                "scale region base"
-            );
-            assert_eq!(
-                last_off,
-                m1 * gpr1 * rdna_compute::GL_MQ4_GROUP_IDX_BYTES + (n_groups - 1) * 2,
-                "last scale offset"
-            );
-            let got_first = u16::from_le_bytes([blob[idx_bytes], blob[idx_bytes + 1]]);
-            let got_last = u16::from_le_bytes([blob[last_off], blob[last_off + 1]]);
-            assert_eq!(got_first, s_first);
-            assert_eq!(got_last, s_last);
-
-            // Oracle must honour the same nibble order + scale base.
-            let unpacked = mq4g256gl_unpack_blob(&blob, m1, k1);
-            assert!(
-                (unpacked[0] - f16_to_f32(s_first) * GL_CB4[0]).abs() < 1e-6,
-                "unpack w0"
-            );
-            assert!(
-                (unpacked[1] - f16_to_f32(s_first) * GL_CB4[1]).abs() < 1e-6,
-                "unpack w1"
-            );
-            // Last row's first weight uses s_last and code 0.
-            assert!(
-                (unpacked[k1] - f16_to_f32(s_last) * GL_CB4[0]).abs() < 1e-6,
-                "unpack last-row w0"
-            );
-        }
     }
 
     /// Wire oracle: encoder bytes parse back to the encoder's rotated-domain
     /// intent (`scale * GL_CB4[code]`), independent of any GPU path.
-    #[test]
-    fn mq4gl_blob_parses_to_encoder_intent() {
-        let (m, k) = (3usize, 512usize);
-        let gpr = k / 256;
-        // Deterministic LCG — not random — so the oracle is bit-stable.
-        let mut state = 0xC0FFEE_u64;
-        let mut next_u01 = || {
-            state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1);
-            ((state >> 33) as f32) * (1.0 / (1u32 << 31) as f32)
-        };
-        let w: Vec<f32> = (0..m * k)
-            .map(|_| (next_u01() * 2.0 - 1.0) * 0.5)
-            .collect();
-        let signs1 = gen_fwht_signs(0xA11CE, 256);
-        let signs2 = gen_fwht_signs(0xB0B, 256);
-
-        let blob = quantize_mq4g256gl(&w, m, k, &signs1, &signs2);
-        let got = mq4g256gl_unpack_blob(&blob, m, k);
-
-        // Independently recompute encoder intent: FWHT → snap to GL_CB4 under
-        // the fp16 block scale. Stay in the rotated domain (no inv-FWHT).
-        let mut expect = vec![0.0f32; m * k];
-        for row in 0..m {
-            for g in 0..gpr {
-                let start = row * k + g * 256;
-                let mut group = [0.0f32; 256];
-                group.copy_from_slice(&w[start..start + 256]);
-                cpu_fwht_256(&mut group, &signs1, &signs2);
-                let mut codes = [0u8; 256];
-                let sbits = gl_encode_block(&group, &GL_CB4, &mut codes);
-                let scale = f16_to_f32(sbits);
-                for i in 0..256 {
-                    expect[start + i] = if scale == 0.0 {
-                        0.0
-                    } else {
-                        scale * GL_CB4[codes[i] as usize]
-                    };
-                }
-            }
-        }
-
-        assert_eq!(got.len(), expect.len());
-        for i in 0..got.len() {
-            if expect[i] == 0.0 {
-                assert_eq!(
-                    got[i], 0.0,
-                    "exact zero required where block scale is fp16 zero (i={i})"
-                );
-            } else {
-                let ulp = {
-                    let a = got[i].to_bits() as i32;
-                    let b = expect[i].to_bits() as i32;
-                    (a - b).abs()
-                };
-                assert!(
-                    ulp <= 2,
-                    "i={i}: got={} expect={} ulp={ulp}",
-                    got[i],
-                    expect[i]
-                );
-            }
-        }
-    }
 
     #[test]
     fn mq1_blob_layout_matches_runtime_constants() {
@@ -17533,7 +16991,6 @@ mod tests {
             assert!(ulp <= 1, "mq35 roundtrip i={i} got={} expect={} ulp={ulp}", got[i], expect[i]);
         }
     }
-
 
     /// OCP E4M3 (1 sign / 4 exp / 3 mantissa, bias 7) round-to-nearest-even.
     /// Max finite 448 (`0x7E`); NaNs encode as `0x7F`/`0xFF`. Min normal 2^-6;
@@ -17953,7 +17410,6 @@ mod tests {
             "expected mse_i8_best ({mse_i8_best:.6}) ≤ mse_i8 ({mse_i8:.6}) < mse_e4 ({mse_e4:.6})"
         );
 
-
         // Also exercise the existing round-trip MSE machinery so a regression
         // in either codec still fails this oracle (identity FWHT, same LCG).
         {
@@ -17976,7 +17432,7 @@ mod tests {
             }
             w.truncate(n_blocks * 256);
             let signs = vec![1.0f32; 256];
-            let gl = mq4g256gl_roundtrip_f32(&w, &signs, &signs);
+            let gl = gl_roundtrip_f32(&w, &signs, &signs, &GL_CB4);
             let uni = mq4g256_roundtrip_f32(&w, &signs, &signs);
             let mse = |a: &[f32]| -> f64 {
                 a.iter()
@@ -18034,7 +17490,6 @@ mod tests {
         );
 
     }
-
 
 
     #[test]
@@ -18815,275 +18270,17 @@ mod tests {
         }
         cb
     }
-    #[test]
-    fn gl_poly_codebook_retains_quality() {
-        // Verify fitted mags match coefficients to drift-guard precision.
-        let qm = poly_mags_quad(POLY_QUAD_A, POLY_QUAD_B, POLY_QUAD_C);
-        for i in 0..8 {
-            assert!(
-                (qm[i] - POLY_QUAD_MAGS[i] as f64).abs() < 1e-6,
-                "quad mag {i} drift: coeff -> {} vs const {}",
-                qm[i],
-                POLY_QUAD_MAGS[i]
-            );
-        }
-        let cm = poly_mags_cubic(POLY_CUBIC_A, POLY_CUBIC_B, POLY_CUBIC_C, POLY_CUBIC_D);
-        for i in 0..8 {
-            assert!(
-                (cm[i] - POLY_CUBIC_MAGS[i] as f64).abs() < 1e-5,
-                "cubic mag {i} drift: {} vs {}",
-                cm[i],
-                POLY_CUBIC_MAGS[i]
-            );
-        }
-        // int8 mags must be round(GL_mags * scale)/scale
-        let gl_mags = [0.1284, 0.3880, 0.6568, 0.9423, 1.2562, 1.6180, 2.0690, 2.7326];
-        for i in 0..8 {
-            let code = (gl_mags[i] * GL_CB4_INT8_SCALE as f64).round() as i32;
-            let recon = code as f64 / GL_CB4_INT8_SCALE as f64;
-            assert!(
-                (recon - GL_CB4_INT8_MAGS[i] as f64).abs() < 1e-6,
-                "int8 mag {i}: {} vs {}",
-                recon,
-                GL_CB4_INT8_MAGS[i]
-            );
-        }
-
-        // Synthetic Gaussian codec probe — same generator as gl_cb4_beats_uniform_affine,
-        // but now checks the full ordering: GL ≈ int8 < cubic ≤ quad < affine is
-        // violated if polynomial collapses. The real-weight ordering (see doc above)
-        // is reproduced here on synthetic data so CI can lock it without the 52 GB model.
-        let mut state = 0x2545F4914F6CDD1Du64;
-        let mut next = || {
-            state ^= state >> 12;
-            state ^= state << 25;
-            state ^= state >> 27;
-            let x = state.wrapping_mul(0x2545F4914F6CDD1D);
-            ((x >> 11) as f64) / ((1u64 << 53) as f64)
-        };
-        let n_blocks = 64usize;
-        let mut w = Vec::with_capacity(n_blocks * 256);
-        while w.len() < n_blocks * 256 {
-            let u1: f64 = next().max(1e-12);
-            let u2: f64 = next();
-            let r = (-2.0 * u1.ln()).sqrt();
-            w.push((r * (std::f64::consts::TAU * u2).cos()) as f32);
-            w.push((r * (std::f64::consts::TAU * u2).sin()) as f32);
-        }
-        w.truncate(n_blocks * 256);
-        let signs = vec![1.0f32; 256];
-        let cb_gl = GL_CB4;
-        let cb_quad = mags_to_cb(&POLY_QUAD_MAGS);
-        let cb_cubic = mags_to_cb(&POLY_CUBIC_MAGS);
-        let cb_int8 = mags_to_cb(&GL_CB4_INT8_MAGS);
-        let gl = mq4g256gl_roundtrip_f32(&w, &signs, &signs);
-        // helper to round-trip with arbitrary cb (reuse gl path with custom cb)
-        let roundtrip_with_cb = |cb: &[f32; 16]| -> Vec<f32> {
-            gl_roundtrip_f32(&w, &signs, &signs, cb)
-        };
-        let quad = roundtrip_with_cb(&cb_quad);
-        let cubic = roundtrip_with_cb(&cb_cubic);
-        let int8 = roundtrip_with_cb(&cb_int8);
-        let uni = mq4g256_roundtrip_f32(&w, &signs, &signs);
-        let mse = |a: &[f32]| -> f64 {
-            a.iter()
-                .zip(w.iter())
-                .map(|(x, y)| {
-                    let d = (*x - *y) as f64;
-                    d * d
-                })
-                .sum::<f64>()
-                / w.len() as f64
-        };
-        let (m_gl, m_quad, m_cubic, m_int8, m_uni) =
-            (mse(&gl), mse(&quad), mse(&cubic), mse(&int8), mse(&uni));
-        // GL must beat uniform by the documented >=8% (real 20.5%).
-        assert!(
-            m_gl < 0.92 * m_uni,
-            "GL {m_gl:.6} must beat uniform {m_uni:.6} by >=8%"
-        );
-        // int8 must be essentially GL: overhead <1% (real 0.14%, ideal 0.142%).
-        assert!(
-            m_int8 < 1.01 * m_gl,
-            "int8 {m_int8:.6} overhead vs GL {m_gl:.6} must be <1% (real 0.14%)"
-        );
-        // quad must beat uniform and be within 8% of GL (real 4.3% overhead, 83% share).
-        assert!(
-            m_quad < m_uni,
-            "quad {m_quad:.6} must beat uniform {m_uni:.6}"
-        );
-        assert!(
-            m_quad < 1.08 * m_gl,
-            "quad {m_quad:.6} must be within 8% of GL {m_gl:.6} (real 4.3%)"
-        );
-        // cubic must be between quad and GL, recovering more.
-        assert!(
-            m_cubic <= m_quad + 1e-12,
-            "cubic {m_cubic:.6} must not be worse than quad {m_quad:.6}"
-        );
-        assert!(
-            m_cubic < 1.05 * m_gl,
-            "cubic {m_cubic:.6} must be within 5% of GL {m_gl:.6}"
-        );
-        // Ordering lock: GL ≈ int8 < cubic ≤ quad < uniform
-        assert!(m_gl <= m_int8 + 1e-12 || m_int8 <= m_gl * 1.01);
-        assert!(m_cubic <= m_quad + 1e-12);
-        assert!(m_quad < m_uni);
-    }
     /// MQ4-G256-SEL codebook drift guard — same hazard as `gl_codebooks_match_runtime`
     /// but for the 64-profile family. The 64x16 = 1024 levels are constant data;
     /// a drifted level is silent wrong decode.
-    #[test]
-    fn sel_codebooks_match_runtime() {
-        assert_eq!(
-            GL_CB4S64,
-            rdna_compute::GL_CB4S64,
-            "hipfire-quantize GL_CB4S64 has drifted from rdna_compute::GL_CB4S64 — \
-             qt=43 weights would decode against the wrong selector levels"
-        );
-    }
 
     /// SEL on-disk geometry: 132 B/group = 128 idx + 2 scale +1 sel +1 pad,
     /// 4.125 bpw, 4-byte aligned, nibble order identical to MQ4G256/GL.
-    #[test]
-    fn sel_blob_layout_matches_runtime_constants() {
-        assert_eq!(132 % 4, 0, "SEL group must be 4-byte aligned");
-        assert_eq!(
-            rdna_compute::GL_MQ4SEL_GROUP_BYTES, 132,
-            "runtime constant disagrees"
-        );
-        let (m, k) = (4usize, 512usize);
-        let gpr = k / 256;
-        let signs1 = vec![1.0f32; 256];
-        let signs2 = vec![1.0f32; 256];
-        let w: Vec<f32> = (0..m * k).map(|i| (i % 17) as f32 * 0.01 - 0.08).collect();
-        let b = quantize_mq4g256sel(&w, m, k, &signs1, &signs2);
-        assert_eq!(
-            b.len(),
-            m * gpr * rdna_compute::GL_MQ4SEL_GROUP_BYTES,
-            "SEL blob size must be m*gpr*132"
-        );
-        assert_eq!(b.len() * 8, m * k * 33 / 8, "SEL must be exactly 4.125 bpw (33/8)");
-        for (gi, chunk) in b.chunks_exact(132).enumerate() {
-            assert_eq!(chunk[131], 0, "pad byte 131 must be 0 at group {gi}");
-            assert!(
-                chunk[130] < 64,
-                "selector byte {} out of 0..63 at group {gi}",
-                chunk[130]
-            );
-            // Nibble order smoke: weight 2b low, 2b+1 high
-            // No need to check values, just that unpack does not panic.
-        }
-        // Hand-construct single group with known codes to pin nibble order & scale placement.
-        {
-            let m1 = 1usize;
-            let k1 = 256usize;
-            let w1: Vec<f32> = (0..m1 * k1).map(|_| 0.01).collect();
-            let b1 = quantize_mq4g256sel(&w1, m1, k1, &signs1, &signs2);
-            assert_eq!(b1.len(), 132);
-            assert_eq!(b1[131], 0);
-            assert!(b1[130] < 64);
-            // Nibble order: byte 0 low = code for weight 0, high = weight1
-            // We can verify by re-encoding a crafted group where w[0] maps to distinct level.
-            // Simpler: ensure the blob length is exactly one group.
-        }
-    }
 
-    #[test]
-    fn sel_group_stride_is_132_and_pad_zero() {
-        let (m, k) = (2usize, 1024usize);
-        let gpr = k / 256;
-        let s1 = gen_fwht_signs(42, 256);
-        let s2 = gen_fwht_signs(1042, 256);
-        let w: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.001).sin()).collect();
-        let blob = quantize_mq4g256sel(&w, m, k, &s1, &s2);
-        assert_eq!(blob.len(), m * gpr * 132);
-        for chunk in blob.chunks_exact(132) {
-            assert_eq!(chunk[131], 0, "pad must be 0");
-            assert!(chunk[130] < 64, "selector must be 0..63");
-        }
-        assert_eq!(132 % 4, 0);
-    }
 
     /// SEL round-trip in FWHT domain: max-coefficient error must be within fp16 round-off,
     /// and overall relative RMS error < 0.05. This is the structural guarantee that
     /// max-normalisation buys: level 15 == 1.0 maps exactly onto the block maximum.
-    #[test]
-    fn sel_roundtrip_max_coeff_and_rms() {
-        let s1 = gen_fwht_signs(42, 256);
-        let s2 = gen_fwht_signs(1042, 256);
-        // Random Gaussian blocks via Box-Muller, deterministic seed.
-        let mut state = 0x9E3779B97F4A7C15u64;
-        let mut next_u01 = || {
-            state ^= state >> 12;
-            state ^= state << 25;
-            state ^= state >> 27;
-            let x = state.wrapping_mul(0x2545F4914F6CDD1D);
-            ((x >> 11) as f64) / ((1u64 << 53) as f64)
-        };
-        let n_blocks = 32usize;
-        let mut w = Vec::with_capacity(n_blocks * 256);
-        while w.len() < n_blocks * 256 {
-            let u1: f64 = next_u01().max(1e-12);
-            let u2: f64 = next_u01();
-            let r = (-2.0 * u1.ln()).sqrt();
-            w.push((r * (std::f64::consts::TAU * u2).cos()) as f32);
-            w.push((r * (std::f64::consts::TAU * u2).sin()) as f32);
-        }
-        w.truncate(n_blocks * 256);
-        // Encode each block and decode in the rotated domain to check the codec alone.
-        for b in 0..n_blocks {
-            let start = b * 256;
-            let mut group = [0.0f32; 256];
-            group.copy_from_slice(&w[start..start + 256]);
-            cpu_fwht_256(&mut group, &s1, &s2);
-            let orig_max = group.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
-            let mut codes = [0u8; 256];
-            let (sbits, sel) = sel_encode_block(&group, &GL_CB4S64, &mut codes);
-            let scale = f16_to_f32(sbits);
-            let cb = &GL_CB4S64[sel as usize];
-            // Reconstruct max-magnitude element
-            let mut max_idx = 0usize;
-            let mut max_abs: f32 = 0.0;
-            for (i, &v) in group.iter().enumerate() {
-                let av = v.abs();
-                if av > max_abs {
-                    max_abs = av;
-                    max_idx = i;
-                }
-            }
-            let code = codes[max_idx] as usize;
-            let recon = cb[code] * scale;
-            let orig = group[max_idx];
-            // Tight: within fp16 round-off of the original max.
-            // The original max equals scale_before_roundtrip? We divide by round-tripped scale,
-            // so the normalized value is orig / scale, and nearest level for that should be 1.0 if orig is max.
-            // Due to the codebook design, the max should map to level 15 == 1.0, so recon == scale * 1.0 == f16(orig_max).
-            // So error should be <= half ulp of fp16 at that magnitude.
-            // We assert within 1e-3 * |orig| or within 0.5 * fp16 step (approx scale * 2^-10).
-            // For the test we use a tight absolute bound derived from fp16 epsilon.
-            let diff = (recon - orig).abs();
-            let tol = (orig.abs() * 0.002).max(1e-6);
-            assert!(
-                diff <= tol,
-                "block {b} max coeff recon error {diff} > tol {tol}: orig {orig} recon {recon} sel {sel} code {code} scale {scale}"
-            );
-            // Overall RMS for this block: dequantize all and compute relative error.
-            let mut sse: f64 = 0.0;
-            let mut sig: f64 = 0.0;
-            for i in 0..256 {
-                let r = cb[codes[i] as usize] * scale;
-                let d = (r - group[i]) as f64;
-                sse += d * d;
-                sig += (group[i] as f64) * (group[i] as f64);
-            }
-            let rel_rms = (sse / sig).sqrt();
-            assert!(
-                rel_rms < 0.12,
-                "block {b} relative RMS {rel_rms} >= 0.05 sel {sel}"
-            );
-        }
-    }
 
     #[test]
     fn mq4g256v2_roundtrip() {
@@ -19320,8 +18517,6 @@ mod tests {
         assert_eq!(QuantType::MQ4G256 as u8, 13);
         assert_eq!(QuantType::MQ4G256V2 as u8, 44);
         assert_eq!(QuantType::MQ4CG256 as u8, 45);
-        // Ensure 43 is still SEL, not reused.
-        assert_eq!(QuantType::from_u8(43), Some(QuantType::MQ4G256SEL));
         assert_ne!(QuantType::MQ4G256V2 as u8, 43);
         assert_ne!(QuantType::MQ4CG256 as u8, 43);
         assert_ne!(QuantType::MQ4CG256 as u8, 44);

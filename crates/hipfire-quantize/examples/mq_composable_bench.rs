@@ -12,7 +12,6 @@
 //!   affine_8x32_fp16hdr   160 B
 //!   affine_1x256_fp16hdr  132 B  isolates header precision
 //!   gl_1x256              130 B  qt=40 tensor-global Lloyd (GL_CB4) RMS scale
-//!   sel_1x256             132 B  qt=43 64-profile family max scale |z|^p selection
 //!
 //! Metrics per variant: bytes/group, bpw, m0, m0_rel (HIGGS t^2), m1, m2,
 //! c, c/m1, tail_0.99, tail_0.999, max_rel.  Tail thresholds printed absolute.
@@ -22,7 +21,6 @@
 //!   cargo run -p hipfire-quantize --example mq_composable_bench --release
 //! Full 278,528-block reproduction (first 4096 rows of layers.20.mlp.down_proj):
 //!   cargo run -p hipfire-quantize --example mq_composable_bench --release -- --full
-//! Selector p override: HIPFIRE_MQ4SEL_P=2.0  or  --p 2.0
 //! If /home/kaden/qcal/qwen3.8-27b.calib.hfq missing, degrades to m0/m1/tail/max_rel with note.
 //! Every m2 number carries gfx942-provenance caveat inline.
 
@@ -156,46 +154,6 @@ struct BlockSet {
     w_norm_sq: f64,
 }
 
-// ── Family loader for SEL ──
-fn load_family64() -> Vec<Vec<f32>> {
-    // try sweep_fam.bin (4096 bytes LE f32 64x16)
-    for p in ["/home/kaden/sweep_fam.bin", "/home/kaden/gl_family64.npy"] {
-        if Path::new(p).exists() {
-            if p.ends_with(".bin") {
-                let bytes = std::fs::read(p).unwrap();
-                if bytes.len()==64*16*4 {
-                    let mut fam = vec![vec![0f32;16];64];
-                    for j in 0..64 { for l in 0..16 {
-                        let off=(j*16+l)*4;
-                        fam[j][l]=f32::from_le_bytes([bytes[off],bytes[off+1],bytes[off+2],bytes[off+3]]);
-                    }}
-                    eprintln!("Loaded family 64x16 from {p}");
-                    return fam;
-                }
-            } else if p.ends_with(".npy") {
-                // npy header then f64 LE
-                let bytes=std::fs::read(p).unwrap();
-                // find header end: header_len at bytes 8..10, then header bytes
-                if bytes.len()>=10 {
-                    let hl = u16::from_le_bytes([bytes[8],bytes[9]]) as usize;
-                    let offset = 10+hl;
-                    if bytes.len()>= offset+64*16*8 {
-                        let mut fam=vec![vec![0f32;16];64];
-                        for j in 0..64 { for l in 0..16 {
-                            let off=offset+(j*16+l)*8;
-                            let v=f64::from_le_bytes([bytes[off],bytes[off+1],bytes[off+2],bytes[off+3],bytes[off+4],bytes[off+5],bytes[off+6],bytes[off+7]]) as f32;
-                            fam[j][l]=v;
-                        }}
-                        eprintln!("Loaded family 64x16 from {p} (f64 npy)");
-                        return fam;
-                    }
-                }
-            }
-        }
-    }
-    // fallback: try /home/kaden/qcal etc? If not found, panic with guidance
-    panic!("SEL family not found: tried /home/kaden/sweep_fam.bin and /home/kaden/gl_family64.npy. Generate via python: np.load('gl_family64.npy') -> sweep_fam.bin");
-}
 
 // ── Variant definition ──
 #[derive(Clone, Copy, Debug)]
@@ -204,7 +162,6 @@ enum HeaderKind { F32, Fp16 }
 enum QuantKind {
     Affine { header: HeaderKind },
     GlRms,
-    Sel { p: f32 },
 }
 struct Variant {
     name: &'static str,
@@ -260,52 +217,11 @@ fn quant_gl_block(block: &[f32], nsub: usize, cb: &[f32]) -> Vec<f32> {
     }
     out
 }
-fn quant_sel_block(block: &[f32], nsub: usize, family: &[Vec<f32>], p: f32) -> Vec<f32> {
-    assert_eq!(block.len(),256);
-    let sub_sz = 256 / nsub;
-    let mut out = Vec::with_capacity(256);
-    for s in 0..nsub {
-        let sl = &block[s*sub_sz .. (s+1)*sub_sz];
-        // max scale per sub-block
-        let maxabs = sl.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
-        let mut scale = if maxabs>0.0 { maxabs } else { 1.0 };
-        scale = f16_to_f32(f32_to_fp16_bits(scale));
-        if scale==0.0 || !scale.is_finite() { scale = 1.0; }
-        let inv = 1.0/scale;
-        // z per lane
-        let mut z = Vec::with_capacity(sub_sz);
-        for &v in sl { z.push(v*inv); }
-        // select profile minimizing sum |z|^p (z - zhat)^2
-        let mut best_cost = f32::INFINITY;
-        let mut best_j = 0usize;
-        for (j, cb) in family.iter().enumerate() {
-            let mut cost = 0.0f32;
-            for &zv in &z {
-                let mut bd = (zv - cb[0]).abs();
-                let mut bv = cb[0];
-                for &c in cb.iter().skip(1) { let d=(zv - c).abs(); if d<bd { bd=d; bv=c; } }
-                let wz = if p==0.0 { 1.0 } else { (zv.abs()+1e-30).powf(p) };
-                let e = zv - bv;
-                cost += wz * e * e;
-            }
-            if cost < best_cost { best_cost=cost; best_j=j; }
-        }
-        let cb = &family[best_j];
-        for &zv in &z {
-            let mut bd = (zv - cb[0]).abs();
-            let mut bv = cb[0];
-            for &c in cb.iter().skip(1) { let d=(zv - c).abs(); if d<bd { bd=d; bv=c; } }
-            out.push(scale * bv);
-        }
-    }
-    out
-}
 
-fn quantize_block(block: &[f32], variant: &Variant, family: &[Vec<f32>]) -> Vec<f32> {
+fn quantize_block(block: &[f32], variant: &Variant) -> Vec<f32> {
     match &variant.quant {
         QuantKind::Affine{header} => quant_affine_block(block, variant.nsub, *header),
         QuantKind::GlRms => quant_gl_block(block, variant.nsub, &GL_CB4),
-        QuantKind::Sel{p} => quant_sel_block(block, variant.nsub, family, *p),
     }
 }
 
@@ -313,13 +229,8 @@ fn main(){
     let t0 = Instant::now();
     let args: Vec<String> = std::env::args().collect();
     let use_full = args.iter().any(|a| a=="--full" || a=="--sweep" || a=="--278k" || a=="--full-278k");
-    let mut p_override: Option<f32> = None;
-    for i in 0..args.len() { if args[i]=="--p" && i+1<args.len() { p_override=Some(args[i+1].parse().unwrap()); }}
-    let p_env = std::env::var("HIPFIRE_MQ4SEL_P").ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(2.0);
-    let p_sel = p_override.unwrap_or(p_env);
 
     println!("=== mq_composable_bench: composable quality half (all metrics per variant) ===");
-    println!("HIPFIRE_MQ4SEL_P={} (SEL p override via --p or env)", p_sel);
     println!("Dataset mode: {} (use --full for 278,528-block reproduction)", if use_full {"FULL 278,528 blocks (first 4096 rows of layers.20.mlp.down_proj)"} else {"CHEAP 3-tensor sample (3x4096 blocks =12,288)"});
     let dir_candidates = ["/home/kaden/models/Qwen3.8-27B","/home/kaden/qcal/parents/qwen3.8-27b","/scratch/parents/qwen3.8-27b"];
     let dir = dir_candidates.iter().find(|p| Path::new(p).exists()).map(|p| Path::new(p)).unwrap_or(Path::new("/home/kaden/models/Qwen3.8-27B"));
@@ -356,9 +267,6 @@ fn main(){
         eprintln!("NOTE: Hessians are gfx942-sourced (MI300X gfx942 host that produced degenerate artifacts; GPTQ using them scored KLD 8.37 vs 0.044 for imatrix). For relative comparison contamination may cancel, but m2 is flagged gfx942-sourced when present.");
     }
 
-    // Load SEL family if needed
-    let family = load_family64();
-    println!("SEL family: {} profiles x {} levels, p={}", family.len(), family[0].len(), p_sel);
 
     // ── BlockSets ──
     let mut blocksets: Vec<BlockSet> = Vec::new();
@@ -436,7 +344,6 @@ fn main(){
         Variant{name:"affine_8x32_fp16hdr", bytes_per_group:160, bpw:5.0,    nsub:8, quant:QuantKind::Affine{header:HeaderKind::Fp16}},
         Variant{name:"affine_1x256_fp16hdr",bytes_per_group:132, bpw:4.125,  nsub:1, quant:QuantKind::Affine{header:HeaderKind::Fp16}},
         Variant{name:"gl_1x256",            bytes_per_group:130, bpw:4.0625, nsub:1, quant:QuantKind::GlRms},
-        Variant{name:"sel_1x256",           bytes_per_group:132, bpw:4.125,  nsub:1, quant:QuantKind::Sel{p:p_sel}},
     ];
 
     // KLD anchors (real measured)
@@ -475,7 +382,7 @@ fn main(){
             let hess_ref = hfq_pkg.as_ref().and_then(|pkg| pkg.get(bs.name));
             for (idx, (orig, rot)) in bs.orig_blks.iter().zip(bs.rot_blks.iter()).enumerate() {
                 let col_off = bs.col_offsets[idx];
-                let recon_rot = quantize_block(rot, var, &family);
+                let recon_rot = quantize_block(rot, var);
                 let mut recon_orig = recon_rot.clone();
                 cpu_ifwht_256(&mut recon_orig, &s1, &s2);
                 // legacy + m0 accum

@@ -10,12 +10,11 @@
 //! ~2.13 us/dispatch and retained PM4 at 0.176-0.211 us/dispatch on RDNA
 //! (ROCm 7.2-era hosts). Any single-kernel A/B run through `launch_maybe_blob`
 //! therefore carries a constant additive term of roughly that size. At a 34 us
-//! kernel that is ~6%, and the MQ4-GL-vs-uniform gap under investigation is
-//! only ~2.9 us — comparable to ONE dispatch. Reporting such a gap without
+//! kernel that is ~6%. Reporting such a gap without
 //! bounding the floor is reporting the instrument.
 //!
-//! Method: launch the real qt=40 GEMV at a shape whose arithmetic is
-//! negligible (m=1, k=256 reads 130 B of weights and 1 KiB of x), through the
+//! Method: launch a GEMV at a shape whose arithmetic is negligible
+//! (m=1, k=256 reads header + 1 KiB of x), through the
 //! exact same wrapper and `launch_maybe_blob` path the benchmarks use. The
 //! measured time is dominated by submission + fence, not by the kernel. Then
 //! scale m upward on the same k to separate the constant term from the
@@ -26,8 +25,7 @@
 //!   cargo build --release -p hipfire-runtime --example dispatch_floor_probe
 //!   ./target/release/examples/dispatch_floor_probe
 
-use half::f16;
-use rdna_compute::{Gpu, GL_CB4};
+use rdna_compute::Gpu;
 use std::time::Instant;
 
 const WARMUP: usize = 10;
@@ -60,7 +58,7 @@ fn main() {
     for &m in &rows {
         let (blob, x) = build(m, k);
         let (hmed, gmed) = time_gemv(&mut gpu, &blob, &x, m, k);
-        let bytes = (m * (k / 256) * 130) as f64;
+        let bytes = (m * (k / 256) * 136) as f64;
         samples.push((bytes, gmed));
         println!(
             "{:>7}  {:>11}  {:>10.3}  {:>10.3}  {:>10.3}  {:>9.1}",
@@ -98,9 +96,7 @@ fn main() {
     let floor_us = a * 1e6;
     for (label, measured_us) in [
         ("uniform HFQ4G256 multirow", 34.32f64),
-        ("MQ4-GL multirow r4", 37.21),
-        ("MQ4-GL single-row", 48.20),
-        ("MQ4-Lloyd (branch-fixed)", 48.57),
+        ("HFQ4G256 fallback single-row", 48.20),
     ] {
         let corrected = measured_us - floor_us;
         println!(
@@ -109,34 +105,17 @@ fn main() {
             100.0 * floor_us / measured_us
         );
     }
-    let g = 37.21 - floor_us;
-    let u = 34.32 - floor_us;
-    println!(
-        "\n  GL-vs-uniform gap: {:.2} us absolute, {:.1}% of measured vs {:.1}% of kernel time",
-        37.21 - 34.32,
-        100.0 * (37.21 - 34.32) / 34.32,
-        100.0 * (g - u) / u
-    );
-    println!(
-        "  gap expressed in dispatches: {:.2}x one HIP dispatch (2.13 us)",
-        (37.21 - 34.32) / 2.13
-    );
 }
 
-/// Pack a qt=40 blob and a matching x. Values are irrelevant here — only the
+/// Pack an HFQ4 blob and a matching x. Values are irrelevant here — only the
 /// byte count and the executed code path matter — so this uses a cheap
 /// deterministic fill rather than the parity harness's Gaussian construction.
 fn build(m: usize, k: usize) -> (Vec<u8>, Vec<f32>) {
     let gpr = k / 256;
-    let idx_bytes = m * gpr * 128;
-    let mut blob = vec![0u8; idx_bytes + m * gpr * 2];
-    for (i, b) in blob[..idx_bytes].iter_mut().enumerate() {
+    let bytes = m * gpr * 136;
+    let mut blob = vec![0u8; bytes];
+    for (i, b) in blob.iter_mut().enumerate() {
         *b = ((i * 37) & 0xFF) as u8;
-    }
-    let scale = f16::from_f32(0.05).to_bits();
-    for g in 0..(m * gpr) {
-        blob[idx_bytes + g * 2] = (scale & 0xFF) as u8;
-        blob[idx_bytes + g * 2 + 1] = (scale >> 8) as u8;
     }
     let x = (0..k).map(|i| ((i % 17) as f32 - 8.0) * 0.01).collect();
     (blob, x)
@@ -154,7 +133,7 @@ fn time_gemv(gpu: &mut Gpu, blob: &[u8], x: &[f32], m: usize, k: usize) -> (f64,
     let d_y = gpu.zeros(&[m], rdna_compute::DType::F32).expect("alloc y");
 
     for _ in 0..WARMUP {
-        gpu.gemv_mq4g256gl(&d_a, &d_x, &d_y, m, k).expect("gemv");
+        gpu.gemv_hfq4g256(&d_a, &d_x, &d_y, m, k).expect("gemv");
     }
     gpu.hip.device_synchronize().expect("sync");
 
@@ -163,7 +142,7 @@ fn time_gemv(gpu: &mut Gpu, blob: &[u8], x: &[f32], m: usize, k: usize) -> (f64,
     for _ in 0..ITERS {
         gpu.hip.device_synchronize().expect("sync");
         let t0 = Instant::now();
-        gpu.gemv_mq4g256gl(&d_a, &d_x, &d_y, m, k).expect("gemv");
+        gpu.gemv_hfq4g256(&d_a, &d_x, &d_y, m, k).expect("gemv");
         gpu.hip.device_synchronize().expect("sync");
         host.push(t0.elapsed().as_secs_f64());
     }
@@ -171,7 +150,7 @@ fn time_gemv(gpu: &mut Gpu, blob: &[u8], x: &[f32], m: usize, k: usize) -> (f64,
 
     let mut gpu_us: Vec<f64> = entries
         .iter()
-        .filter(|e| e.kernel.contains("mq4g256gl"))
+        .filter(|e| e.kernel.contains("hfq4g256"))
         .map(|e| e.time_us)
         .collect();
 
@@ -184,9 +163,4 @@ fn time_gemv(gpu: &mut Gpu, blob: &[u8], x: &[f32], m: usize, k: usize) -> (f64,
         gpu_us[gpu_us.len() / 2] / 1e6
     };
     (hmed, gmed)
-}
-
-#[allow(dead_code)]
-fn cb() -> [f32; 16] {
-    GL_CB4
 }

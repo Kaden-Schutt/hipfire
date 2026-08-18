@@ -680,7 +680,6 @@ fn main() {
         ("mq2gl", 256, 66, 2.0625, mse_cb2_rms),
         ("mq3gl", 256, 98, 3.0625, mse_cb3_rms),
         ("mq35gl", 256, 114, 3.5625, m_cb35_rms.mse),
-        ("mq4gl", 256, 130, 4.0625, mse_cb4_rms),
         ("affine", 256, 136, 4.25, mse_aff),
     ];
     for (fmt, grp, bytes, bpw, mse) in rows {
@@ -692,7 +691,7 @@ fn main() {
     println!("Expected baselines (poly_fit): affine 1.85588400e-06  GL_CB4 1.47499897e-06");
     // Flag ordering check
     println!("\n=== Ordering check (lower bpw should NOT beat higher bpw if codebook is correct) ===");
-    let ordered = vec![("mq1", m_cb1_rms.mse), ("mq2gl", m_cb2_rms.mse), ("mq3gl", m_cb3_rms.mse), ("mq35gl", m_cb35_rms.mse), ("mq4gl", m_cb4_rms.mse)];
+    let ordered = vec![("mq1", m_cb1_rms.mse), ("mq2gl", m_cb2_rms.mse), ("mq3gl", m_cb3_rms.mse), ("mq35gl", m_cb35_rms.mse)];
     for w in ordered.windows(2) {
         let (low_fmt, low_mse) = w[0];
         let (high_fmt, high_mse) = w[1];
@@ -708,15 +707,14 @@ fn main() {
     println!(" mq2gl  :  66 B / 256   = 2.0625  bpw  (64 idx +2 scale)");
     println!(" mq3gl  :  98 B / 256   = 3.0625  bpw  (96 idx +2 scale)");
     println!(" mq35gl : 114 B / 256   = 3.5625  bpw  (112 idx +2 scale)");
-    println!(" mq4gl  : 130 B / 256   = 4.0625  bpw  (128 idx +2 scale)");
+    println!(" affine : 136 B / 256   = 4.25    bpw  (128 nibbles +8 hdr)");
     println!(" Layout SoA: [m*gpr*IDX][m*gpr*2 scale] — same bytes per group, only VALUE in scale field changes.");
     // Lane alignment report
     println!("\n=== Lane alignment (group * bits / 32) ===");
     println!(" mq1     : 1024*1/32 = 32 bits = 4 B = 1 u32/lane  => exactly aligned, no unroll");
     println!(" mq2gl   : 256*2/32 = 16 bits = 2 B = 0.5 register => needs K2 unroll to fill register");
     println!(" mq3gl   : 256*3/32 = 24 bits = 3 B => needs K4 unroll (existing MQ3 kernels are K4-unrolled)");
-    println!(" mq4gl   : 256*4/32 = 32 bits = 4 B = 1 u32/lane => exactly aligned, no unroll");
-    println!(" affine  : same as mq4gl (4 bits, G256, 32 bits/lane)");
+    println!(" affine  : 256*4/32 = 32 bits = 4 B = 1 u32/lane => exactly aligned, no unroll");
     // LS exposure note
     println!("\n=== LS scale exposure ===");
     println!(" RMS path kept reachable via gl_encode_block_rms / gl_encode_block_vq35_rms in src/main.rs (and via use_ls=false in this harness).");

@@ -181,13 +181,11 @@ fn main(){
         Arm{name:"mq3 (uniform 3b)", bpw:3.25, quant:QuantKind::Affine{bits:3}},
         Arm{name:"mq3lloyd (GL_CB3 RMS≈per-block Lloyd)", bpw:3.5, quant:QuantKind::GlRms{cb:&GL_CB3}},
         Arm{name:"mq4 (uniform 4b affine)", bpw:4.25, quant:QuantKind::Affine{bits:4}},
-        Arm{name:"mq4gl (GL_CB4 RMS tensor-global)", bpw:4.0625, quant:QuantKind::GlRms{cb:&GL_CB4}},
-        Arm{name:"mq4gl-LS (GL_CB4 LS, post-fix)", bpw:4.0625, quant:QuantKind::GlLs{cb:&GL_CB4}},
         Arm{name:"mq6 (uniform 6b)", bpw:6.25, quant:QuantKind::Affine{bits:6}},
         Arm{name:"mq2 (uniform 2b)", bpw:2.0, quant:QuantKind::Affine{bits:2}},
     ];
-    let wt2_kld:HashMap<&str,f64>=[("mq3 (uniform 3b)",0.182275),("mq3lloyd (GL_CB3 RMS≈per-block Lloyd)",0.128106),("mq4 (uniform 4b affine)",0.043776),("mq4gl (GL_CB4 RMS tensor-global)",0.048713),("mq6 (uniform 6b)",0.004560)].into_iter().collect();
-    let v6sel_kld:HashMap<&str,f64>=[("mq3 (uniform 3b)",1.150402),("mq3lloyd (GL_CB3 RMS≈per-block Lloyd)",0.966137),("mq4 (uniform 4b affine)",0.587566),("mq4gl (GL_CB4 RMS tensor-global)",0.749238),("mq6 (uniform 6b)",0.232997)].into_iter().collect();
+    let wt2_kld:HashMap<&str,f64>=[("mq3 (uniform 3b)",0.182275),("mq3lloyd (GL_CB3 RMS≈per-block Lloyd)",0.128106),("mq4 (uniform 4b affine)",0.043776),("mq6 (uniform 6b)",0.004560)].into_iter().collect();
+    let v6sel_kld:HashMap<&str,f64>=[("mq3 (uniform 3b)",1.150402),("mq3lloyd (GL_CB3 RMS≈per-block Lloyd)",0.966137),("mq4 (uniform 4b affine)",0.587566),("mq6 (uniform 6b)",0.232997)].into_iter().collect();
 
     // global tail thresholds in rotated domain
     let all_rot:Vec<f32>=blocksets.iter().flat_map(|bs|bs.rot_blks.iter().flat_map(|b|b.iter().cloned())).collect();
@@ -305,8 +303,6 @@ fn main(){
     println!("| mq3lloyd|13379750912|d448425d2939|v6sel|0.966137|2.52338|12.4707|slice-mean KLD = 0.966137 in /home/kaden/family_mq3lloyd_v6sel.log|");
     println!("| mq4 affine|15662615552|da5b877ea9a8|WT2|0.043776|1.857666|6.4088|slice-mean KLD = 0.043776 in /home/kaden/family_mq4_wt2.log|");
     println!("| mq4 affine|15662615552|da5b877ea9a8|v6sel|0.587566|2.49926|12.1735|slice-mean KLD = 0.587566 in /home/kaden/family_mq4_v6sel.log|");
-    println!("| mq4gl qt40 GL_CB4 RMS|15085075456|9630c21ed568|WT2|0.048713|1.844915|6.3276|slice-mean KLD = 0.048713 in /home/kaden/gl_rescore.log (scored 24552t 1553.8s) |");
-    println!("| mq4gl|15085075456|9630c21ed568|v6sel|0.749238|2.24736|9.4627|slice-mean KLD = 0.749238 in /home/kaden/gl_rescore.log (1546.7s)|");
     println!("| mq6|21743430656|2516a4a22f6e|WT2|0.004560|1.834963|6.2649|slice-mean KLD = 0.004560 in /home/kaden/family_mq6_wt2.log|");
     println!("| mq6|21743430656|2516a4a22f6e|v6sel|0.232997|2.533272|12.5946|slice-mean KLD = 0.232997 in /home/kaden/family_mq6_v6sel.log|");
     println!("| others: mq1 SCORE_FAILED qt41, mq2 NO_FAST_KERNEL, mq2lloyd NO_FAST_KERNEL, mq2gl SCORE_FAILED, mq3gl SCORE_FAILED, mq35gl qt42, mq4lloyd NaN KLD 0.0, mq5 NO_FAST_KERNEL, mq8 SCORE_FAILED — all in /home/kaden/family_scores.txt with explicit log provenance |");
@@ -330,82 +326,28 @@ fn main(){
             println!("  -> {}: m0 {:.3e} m1 {:.3e} m2 {}", lab, t0, t1, t2s);
         }
     }
-    // decision
-    let aff = results.iter().find(|r| r.name=="mq4 (uniform 4b affine)").unwrap();
-    let gl = results.iter().find(|r| r.name=="mq4gl (GL_CB4 RMS tensor-global)").unwrap();
-    let dKLD=11.3; // gl worse
-    let dM0 = (gl.m0 - aff.m0)/aff.m0*100.0;
-    let dM0rel = (gl.m0_rel - aff.m0_rel)/aff.m0_rel*100.0;
-    let dM1 = (gl.m1 - aff.m1)/aff.m1*100.0;
-    let dM2 = if let (Some(gm2), Some(am2))=(gl.m2, aff.m2){ (gm2-am2)/am2*100.0 } else { f64::NAN };
-    let dc_over_m1 = if let (Some(gm2),Some(am2))=(gl.m2, aff.m2){ ((gm2-gl.m1)-(am2-aff.m1))/ ((gl.m1+aff.m1)/2.0) *100.0 } else {f64::NAN};
-    println!("\n========== Decision — delta (gl minus affine) %  (dKLD=+11.3% gl worse is ground truth) ==========");
-    println!("  dM0 (Frobenius absolute)   {:+.2}%  (predicted -20.6% gl wins)  -> {}", dM0, if dM0<0.0{"gl wins (FAILS KLD, predicts PPL)"} else {"gl loses (would predict KLD)"});
-    println!("  dM0_rel (HIGGS relative)   {:+.2}%                  -> {}", dM0rel, if dM0rel<0.0{"gl wins"} else {"gl loses"});
-    println!("  dM1 (diag-weighted)        {:+.2}%  (predicted -10 to -15% gl wins) -> {}", dM1, if dM1<0.0{"gl wins (FAILS)"} else {"gl loses (would predict KLD)"});
-    if aff.m2.is_some(){
-        println!("  dM2 (full Tr)              {:+.2}%  (predicted +8 to +15% FLIPS to gl worse) -> {}", dM2, if dM2>0.0{"gl loses ✓ FLIPS — matches KLD"} else {"gl wins ✗"});
-        println!("  dc/mean(m1)                {:+.2}%  threshold >=8% for branch 2, |c|/m1<3% for branch1", dc_over_m1);
-        println!("  rho_affine={:.3} rho_gl={:.3}  (predicted rho_gl > rho_affine)", aff.rho.unwrap(), gl.rho.unwrap());
-    } else {
-        println!("  dM2: N/A — HFQM not found locally (hiptrx-only 30GB). Delivering m0/m1 only per spec fallback.");
-    }
-
-    // branch logic
-    println!("\n========== Branch firing (per spec decision rule) ==========");
-    if let (Some(am2), Some(gm2))=(aff.m2, gl.m2){
-        let sign_dM1 = dM1.signum(); let sign_dM2=dM2.signum(); let sign_dKLD=1.0; // +11.3% => positive means gl worse
-        let c_aff = aff.c; let c_gl = gl.c;
-        let mean_m1=(aff.m1+gl.m1)/2.0;
-        let cond1 = sign_dM1==sign_dKLD && (c_aff.abs()/aff.m1 <0.03) && (c_gl.abs()/gl.m1 <0.03);
-        let cond2 = sign_dM1!=sign_dKLD && sign_dM2==sign_dKLD && ( ((gm2-gl.m1)-(am2-aff.m1)).abs()/mean_m1 >=0.08 ) && (gl.rho.unwrap() > aff.rho.unwrap());
-        // per-layer weight branch: check if only globally aggregated m2 matches? Simplified.
-        println!("  Branch1 (diag non-uniformity alone): sign(dM1)==sign(dKLD) && |c|/m1<0.03  -> {} (dM1={:+.2}% need >0, |c|/m1 aff {:.3} gl {:.3})", if cond1{"FIRES"}else{"no"}, dM1, c_aff.abs()/aff.m1, c_gl.abs()/gl.m1);
-        println!("  Branch2 (off-diag + within-block err corr, PREDICTED): sign(dM1)!=sign(dKLD) && sign(dM2)==sign(dKLD) && |dc|/mean(m1)>=0.08 && rho_gl>rho_aff -> {} ", if cond2{"FIRES ✓ — theory predicts this"} else {"no"});
-        if cond1 { println!("  → Diagonal non-uniformity alone explains it"); }
-        else if cond2 { println!("  → Off-diagonal + within-block error correlation (PREDICTED) — 256x amplification of ρ_e·ρ_a restores KLD ordering"); }
-        else {
-            // check depth accumulation heuristic: per-tensor m2 signs?
-            let aff_layers:Vec<f64>=aff.per_tensor.iter().filter_map(|(_,_,_,m2)| *m2).collect();
-            let gl_layers:Vec<f64>=gl.per_tensor.iter().filter_map(|(_,_,_,m2)| *m2).collect();
-            let _ = (aff_layers, gl_layers);
-            println!("  → None of first two; check depth accumulation or beyond second-order");
-            if !cond1 && !cond2 {
-                // we have full m2, if dM2 matches but dc small, it's beyond
-                if sign_dM2==sign_dKLD { println!("    dM2 matches but dc/mean <8% or rho condition fails — beyond second-order or Hessian contamination"); }
-                else { println!("    No metric reproduces KLD ordering — beyond second-order"); }
-            }
-        }
-    } else {
-        println!("  Cannot evaluate branches without m2 (HFQM gfx942). Reporting m0/m1 only; per spec this is acceptable fallback.");
-        println!("  Observed: dM0={:+.2}% (gl wins, as predicted), dM1={:+.2}%", dM0, dM1);
-        if dM1<0.0 { println!("  m1 still predicts GL wins — so even diagonal weighting alone does NOT explain the inversion (branch1 fails), implying cross-term is required (branch2 predicted, but m2 unavailable to confirm)."); }
-    }
+    // decision (GL arms removed: original compared GL vs affine to explain KLD inversion; with GL retired this delta is no longer computed)
+    println!("\n========== Decision — GL arms retired ==========");
+    println!("  The retired 4-bit G256 GL format has been removed from this harness. The original GL-vs-affine delta and off-diagonal branch analysis are elided.");
+    println!("  Remaining arms (mq3, mq3lloyd, mq4 affine, mq6, mq2) continue to report m0/m1/m2 and correlation below.");
 
     println!("\n========== Correlation (legacy) ==========");
     // legacy Pearson etc quickly
     fn pearson(xs:&[f64], ys:&[f64])->f64{let n=xs.len() as f64; let mx=xs.iter().sum::<f64>()/n; let my=ys.iter().sum::<f64>()/n; let mut num=0.0; let mut dx2=0.0; let mut dy2=0.0; for (x,y) in xs.iter().zip(ys.iter()){let dx=x-mx; let dy=y-my; num+=dx*dy; dx2+=dx*dx; dy2+=dy*dy;} if dx2==0.0||dy2==0.0{f64::NAN}else{num/(dx2*dy2).sqrt()}}
     fn spearman(xs:&[f64], ys:&[f64])->f64{let rank=|v:&[f64]|{let mut idx:Vec<usize>=(0..v.len()).collect(); idx.sort_by(|&a,&b| v[a].partial_cmp(&v[b]).unwrap()); let mut r=vec![0.0;v.len()]; for (pos,&i) in idx.iter().enumerate(){r[i]=(pos+1) as f64;} r}; let rx=rank(xs); let ry=rank(ys); pearson(&rx,&ry)}
-    let kld_order=["mq3 (uniform 3b)","mq3lloyd (GL_CB3 RMS≈per-block Lloyd)","mq4 (uniform 4b affine)","mq4gl (GL_CB4 RMS tensor-global)","mq6 (uniform 6b)"];
+    let kld_order=["mq3 (uniform 3b)","mq3lloyd (GL_CB3 RMS≈per-block Lloyd)","mq4 (uniform 4b affine)","mq6 (uniform 6b)"];
     for (ref_name, map) in [("WT2",&wt2_kld),("v6sel",&v6sel_kld)]{
-        println!("\n--- {} --- Pearson/Spearman over 5 arms ---", ref_name);
+        println!("\n--- {} --- Pearson/Spearman over 4 arms ---", ref_name);
         let klds:Vec<f64>=kld_order.iter().map(|n| map[*n]).collect();
         let mk = |f: fn(&Res)->f64|->Vec<f64>{kld_order.iter().map(|n| {let r=results.iter().find(|x| x.name==*n).unwrap(); f(r)}).collect()};
         for (mname, vals) in vec![("mse_rot", mk(|r| r.mse_rot)),("m0", mk(|r| r.m0)),("m0_rel", mk(|r| r.m0_rel)),("m1", mk(|r| r.m1)),("m2", mk(|r| r.m2.unwrap_or(f64::NAN))),("tail99", mk(|r| r.tail99))]{
             if vals.iter().any(|v| v.is_nan()){ println!("  {:10}  N/A (missing m2)", mname); continue; }
             println!("  {:10} Pearson {:.3} Spearman {:.3}", mname, pearson(&vals,&klds), spearman(&vals,&klds));
         }
-        // within-4b check
-        let aff=results.iter().find(|r| r.name=="mq4 (uniform 4b affine)").unwrap();
-        let gl=results.iter().find(|r| r.name=="mq4gl (GL_CB4 RMS tensor-global)").unwrap();
-        for (mname, av, gv) in [("mse_rot",aff.mse_rot,gl.mse_rot),("m0",aff.m0,gl.m0),("m1",aff.m1,gl.m1),("m2",aff.m2.unwrap_or(f64::NAN), gl.m2.unwrap_or(f64::NAN))]{
-            if av.is_nan()||gv.is_nan(){ continue;}
-            println!("  within-4b {:10} affine {:.3e} gl {:.3e} -> {}", mname, av, gv, if av<gv{"affine better ✓"}else{"gl better ✗"});
-        }
     }
 
     println!("\n========== Caveat (MUST state) ==========");
     println!("  Hessians are gfx942-sourced: collected on MI300X (gfx942) host that produced degenerate artifacts — GPTQ run using them scored KLD 8.37 vs 0.044 for off-the-shelf imatrix (see docs/perf-checkpoints/2026-08-16-qwen38-27b-mq4-best-recipe-q8-protection-ladder.md). For RELATIVE codebook comparison the contamination may cancel, but every m2/c/rho number above is gfx942-sourced and must not be presented as clean. If m2 fires the predicted branch, that is evidence the MECHANISM is real; it is not evidence the Hessians are trustworthy in absolute terms.");
-    println!("  HIGGS linearity theorem (arXiv:2411.17525) proves sum alpha_l * t_l^2 predicts PPL, with t_l^2=||What-W||^2/||W||^2 per layer. Our data AGREES: mq4gl wins absolute mse_rot (1.475e-6 vs 1.856e-6) and wins PPL (6.3276 vs 6.4088) while losing KLD (0.0487 vs 0.0438). So m0 is expected to predict PPL and fail on KLD — the theory's quantity is relative, we report both m0 and m0_rel.");
-    println!("  With N≈5 arms, r values are weak; the within-4b ordering (affine beats GL) is the load-bearing test. No commits.");
+    println!("  HIGGS linearity theorem (arXiv:2411.17525) proves sum alpha_l * t_l^2 predicts PPL, with t_l^2=||What-W||^2/||W||^2 per layer. The theory's quantity is relative, we report both m0 and m0_rel.");
+    println!("  With N≈4 arms, r values are weak. No commits.");
 }

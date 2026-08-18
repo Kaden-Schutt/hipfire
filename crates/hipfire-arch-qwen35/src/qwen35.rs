@@ -34,7 +34,7 @@ use hipfire_runtime::weight_backend::{
     reupload_f16_as_f32, HfqBackend, ParoBackend,
 };
 use hipfire_runtime::{screen_weight_tensor, MmqScreenable};
-use rdna_compute::{DType, Gpu, GpuTensor, GL_GROUP_SCALE_BYTES, GL_MQ4_GROUP_IDX_BYTES};
+use rdna_compute::{DType, Gpu, GpuTensor};
 use serde::Deserialize;
 
 /// RMSNorm weight bias for qwen3.5/gemma-style norms: dequant computes `w + norm_bias`.
@@ -862,8 +862,6 @@ fn dtype_from_quant_type(qt: u8) -> HipResult<DType> {
         36 => Ok(DType::MFP3G32E8),
         38 => Ok(DType::MQ2G256GL),
         39 => Ok(DType::MQ3G256GL),
-        40 => Ok(DType::MQ4G256GL),
-        43 => Ok(DType::MQ4G256SEL),
         44 => Ok(DType::MQ4G256V2),
         45 => Ok(DType::MQ4CG256),
         // qt=6 (HFQ4G256) and qt=37 (MFP2G32E8) are shipped formats and MUST stay
@@ -2833,101 +2831,6 @@ fn load_weight_tensor_raw(
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ3G256GL,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
-        }
-        40 => {
-            // MQ4-G256-GL — 4-bit codes vs TENSOR-GLOBAL codebook GL_CB4 +
-            // per-block fp16 scale. 4.0625 bpw. SoA, TWO regions, no per-group
-            // header:
-            //   [0 .. m*gpr*128)                 packed 4-bit indices, 128 B/group
-            //   [m*gpr*128 .. + m*gpr*2)         fp16 per-block scales
-            // with gpr = k/256. Opaque raw upload — codebook is scalar kernel
-            // args from rdna_compute::GL_CB4, not attached here.
-            //
-            // K%256 is a HARD requirement: gpr = k/256 truncates otherwise and
-            // the scale-region base M*gpr*128 shifts, which decodes to plausible
-            // garbage with no error. Fail at load. Blob length is also exact:
-            // a short/long buffer would silently mis-align the scale region.
-            if k % 256 != 0 {
-                return Err(HipError::new(
-                    0,
-                    &format!(
-                        "MQ4G256GL has K={k} but the SoA region split requires K%256==0"
-                    ),
-                ));
-            }
-            let gpr = k / 256;
-            let expected = m * gpr * (GL_MQ4_GROUP_IDX_BYTES + GL_GROUP_SCALE_BYTES);
-            if data.len() != expected {
-                return Err(HipError::new(
-                    0,
-                    &format!(
-                        "MQ4G256GL blob length mismatch: expected {expected}, got {}",
-                        data.len()
-                    ),
-                ));
-            }
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::MQ4G256GL,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
-        }
-        43 => {
-            // MQ4G256SEL: AoS 132 B/group, 6-bit selector 0..63, pad 0
-            if k % 256 != 0 {
-                return Err(HipError::new(
-                    0,
-                    &format!(
-                        "MQ4G256SEL has K={k} but requires K%256==0"
-                    ),
-                ));
-            }
-            let gpr = k / 256;
-            let expected = m * gpr * 132;
-            if data.len() != expected {
-                return Err(HipError::new(
-                    0,
-                    &format!(
-                        "MQ4G256SEL blob length mismatch: expected {expected}, got {}",
-                        data.len()
-                    ),
-                ));
-            }
-            for (gi, chunk) in data.chunks_exact(132).enumerate() {
-                let sel = chunk[130];
-                if sel >= 64 {
-                    return Err(HipError::new(
-                        0,
-                        &format!(
-                            "MQ4G256SEL invalid selector {sel} at group {gi} (must be 0..63)"
-                        ),
-                    ));
-                }
-                if chunk[131] != 0 {
-                    return Err(HipError::new(
-                        0,
-                        &format!(
-                            "MQ4G256SEL pad byte non-zero {} at group {gi}",
-                            chunk[131]
-                        ),
-                    ));
-                }
-            }
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::MQ4G256SEL,
                 m,
                 k,
                 row_stride: 0,

@@ -258,14 +258,14 @@ fn main(){
     println!("Solve group*3.5 =1024*m →7*group=2048*m →group multiple of 2048/gcd(7,2048)=2048");
     println!("Smallest aligned group for 3.5 bpw: 2048 weights →2048*3.5=7168=7×1024 →896 B idx →28 B/lane=7 u32/lane");
     println!("Cost: group 2048 →per-block scale covers 8× more weights (2048 vs 256), coarser granularity → higher error");
-    println!("Verdict: mq3.5gl is LESS aligned than mq4gl; perfect 1-u32 alignment at G256 requires 4 bpw (MQ4). 3.5 cannot match without 8× coarser grouping.");
+    println!("Verdict: mq3.5gl is LESS aligned than the 4-bit G256 format; perfect 1-u32 alignment at G256 requires 4 bpw. 3.5 cannot match without 8× coarser grouping.");
     println!("Implemented choice: G256 (112 B idx +2 B scale =114 B →3.5625 bpw) for quality parity with other GL family, despite misalignment.\n");
 
     println!("=== Codebook ===");
     println!("GL_CB35: 128-entry 2D VQ, 7 bits per pair (3.5 bpw). Fitted with Lloyd/k-means on real post-FWHT pairs.");
     println!("Seed: 42 (k-means++), iterations: 100, samples: 1_572_864 pairs (1_572_864*2=3_145_728 values)");
     println!("Source: Qwen3.8-27B layers 0 linear_attn.out_proj, 20 mlp.down_proj, 40 mlp.gate_proj, 4096 groups each (12_288 groups total).");
-    println!("qt number allocated: 42 (qt=40 is MQ4G256GL, 41 is MQ1G1024GL, so 42 is next free).");
+    println!("qt number allocated: 42 (qt=41 is MQ1G1024GL, so 42 is next free).");
     println!("bpw: indices 112 B per 256 weights (3.5) + scale 2 B per 256 (0.0625) = 3.5625 bpw.");
     println!("Packed layout: 8 pairs ×7 bits=56 bits=7 bytes, 16 chunks →112 B/group, LE bitstream.\n");
 

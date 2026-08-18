@@ -4,12 +4,10 @@
 
 //! Paired GEMV throughput bench for the 4-bit family.
 //!
-//! Measures four kernels that ALREADY exist (no new kernels):
+//! Measures two kernels that ALREADY exist (no new kernels):
 //!   - gemv_hfq4g256            affine G256, 136 B/group (qt=1/6/13)  — baseline
 //!   - gemv_mq4g128_prerotated   affine G128, 72 B per 128 = 144 B per 256 (qt=7)
 //!                              — the empirical answer to "does G128 hurt perf"
-//!   - gemv_mq4g256gl_multirow   GL codebook, 130 B (qt=40, SoA 128+2)
-//!   - gemv_mq4g256sel_multirow  SEL 64-profile codebook, 132 B (qt=43, AoS 132)
 //!
 //! Conventions (non-negotiable, from CLAUDE.md / project history):
 //!   - All timing device-side via rdna_compute::profile::start/stop (hip events).
@@ -26,8 +24,7 @@
 //!   cargo run --release -p rdna-compute --example bench_gemv_paired_throughput
 //!
 //! The bench itself sweeps R by re-initializing Gpu with HIPFIRE_GEMV_ROWS={1,2,4}
-//! set explicitly before each phase, and for GL/SEL uses the explicit
-//! `*_multirow_with_rows` entry points so the R is unambiguous even without the env var.
+//! set explicitly before each phase.
 //! Wrapping `HIPFIRE_GEMV_ROWS=$R cargo run ...` also works (see stdout).
 
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -69,14 +66,10 @@ const RUNS: usize = 3;
 /// which is 144 B per 256-equivalent (2×72). Stating the stride we allocate and why:
 /// - hfq4g256: 136 B /256 (8 B hdr + 128 B nibbles)
 /// - mq4g128 : 72 B /128  (8 B hdr + 64 B nibbles) = 144 B /256 equivalent — we allocate 72*B per 128
-/// - mq4g256gl: 130 B /256 (128 B idx SoA + 2 B scale SoA)
-/// - mq4g256sel:132 B /256 (128 B idx + 2 B scale +1 B sel +1 B pad, AoS)
 fn bytes_per_weight_row(format: &str) -> usize {
     match format {
         "hfq4g256" => (K / 256) * 136,
         "mq4g128" => (K / 128) * 72, // 72 per 128, i.e. 144 per 256
-        "gl" => (K / 256) * 130,
-        "sel" => (K / 256) * 132,
         _ => panic!("unknown format"),
     }
 }
@@ -114,10 +107,6 @@ fn print_vgpr_report(arch: &str) {
     let wanted = [
         ("gemv_hfq4g256", "gemv_hfq4g256.radiowave.json"),
         ("gemv_hfq4g128", "gemv_hfq4g128.radiowave.json"),
-        ("gemv_mq4g256gl", "gemv_mq4g256gl.radiowave.json"),
-        ("gemv_mq4g256gl_multirow", "gemv_mq4g256gl_multirow.radiowave.json"),
-        ("gemv_mq4g256sel", "gemv_mq4g256sel.radiowave.json"),
-        ("gemv_mq4g256sel_multirow", "gemv_mq4g256sel_multirow.radiowave.json"),
         ("gemv_hfq4g256_multirow_default", "gemv_hfq4g256_multirow_default.radiowave.json"),
         ("gemv_hfq4g256_wide", "gemv_hfq4g256_wide.radiowave.json"),
     ];
@@ -163,8 +152,6 @@ fn main() {
     eprintln!("  formats:");
     eprintln!("    hfq4g256: 136 B/256  (8 hdr +128 nibbles)  total weight {} B", weight_bytes("hfq4g256"));
     eprintln!("    mq4g128 : 72 B/128 =144 B/256 equiv (8 hdr +64 nibbles per 128) total weight {} B  [stride 72 per 128]", weight_bytes("mq4g128"));
-    eprintln!("    gl      : 130 B/256  (128 idx SoA +2 scale SoA) total weight {} B", weight_bytes("gl"));
-    eprintln!("    sel     : 132 B/256  (128 idx +2 scale +1 sel +1 pad AoS) total weight {} B", weight_bytes("sel"));
     eprintln!("  R sweep: 1,2,4  (R=2 is gemv_rows_default on gfx1201, headline)");
 
     let rs = [1usize, 2, 4];
@@ -208,51 +195,11 @@ fn main() {
         gpu.hip.memcpy_htod(&gb, &g128_blob).expect("copy g128");
         let d_g128 = GpuTensor { buf: gb, shape: vec![M, K], dtype: DType::Raw };
 
-        // gl: SoA 128+2
-        let gl_idx = M * gpr * 128;
-        let gl_sc = M * gpr * 2;
-        let gl_bytes = gl_idx + gl_sc;
-        let mut gl_blob = vec![0u8; gl_bytes];
-        for i in 0..gl_idx { gl_blob[i] = ((i*37)&0xFF) as u8; }
-        let scale_half = f32_to_f16_bits(0.05);
-        for g in 0..(M*gpr) {
-            gl_blob[gl_idx + g*2] = (scale_half & 0xFF) as u8;
-            gl_blob[gl_idx + g*2+1] = (scale_half>>8) as u8;
-        }
-        let glb = gpu.hip.malloc(gl_bytes).expect("malloc gl");
-        gpu.hip.memcpy_htod(&glb, &gl_blob).expect("copy gl");
-        let d_gl = GpuTensor { buf: glb, shape: vec![M, K], dtype: DType::Raw };
-
-        // sel: AoS 132 B per 256 (128 idx +2 scale +1 sel +1 pad)
-        let sel_bytes = M * gpr * 132;
-        let mut sel_blob = vec![0u8; sel_bytes];
-        for row in 0..M {
-            for g in 0..gpr {
-                let base = (row * gpr + g) * 132;
-                for i in 0..128 { sel_blob[base + i] = ((i*41)&0xFF) as u8; }
-                sel_blob[base+128] = (scale_half & 0xFF) as u8;
-                sel_blob[base+129] = (scale_half>>8) as u8;
-                sel_blob[base+130] = 0; // sel
-                sel_blob[base+131] = 0; // pad
-            }
-        }
-        let selb = gpu.hip.malloc(sel_bytes).expect("malloc sel");
-        gpu.hip.memcpy_htod(&selb, &sel_blob).expect("copy sel");
-        let d_sel = GpuTensor { buf: selb, shape: vec![M, K], dtype: DType::Raw };
-
         // Warmup already done per run below, but also do a one-time JIT warmup to force compilation before timing.
         // Trigger each kernel once so first-run JIT doesn't pollute run 1.
         eprintln!("[R={}] JIT warmup (one launch per format)...", r);
         gemv_hfq4g256_explicit(&mut gpu, &d_hf, &d_x, &d_y, M, K, r).expect("jit hf");
         gpu.gemv_mq4g128_prerotated(&d_g128, &d_x, &d_y, M, K).expect("jit g128");
-        // GL/SEL: need to call multirow variant so correct R kernel is JIT'd
-        if r == 1 {
-            gpu.gemv_mq4g256gl(&d_gl, &d_x, &d_y, M, K).expect("jit gl r1");
-            gpu.gemv_mq4g256sel(&d_sel, &d_x, &d_y, M, K).expect("jit sel r1");
-        } else {
-            gpu.gemv_mq4g256gl_multirow_with_rows(&d_gl, &d_x, &d_y, M, K, r).expect("jit gl");
-            gpu.gemv_mq4g256sel_multirow_with_rows(&d_sel, &d_x, &d_y, M, K, r).expect("jit sel");
-        }
         gpu.hip.device_synchronize().expect("jit sync");
         eprintln!("[R={}] JIT done", r);
 
@@ -266,13 +213,6 @@ fn main() {
             for _ in 0..WARMUP {
                 gemv_hfq4g256_explicit(&mut gpu, &d_hf, &d_x, &d_y, M, K, r).expect("warm hf");
                 gpu.gemv_mq4g128_prerotated(&d_g128, &d_x, &d_y, M, K).expect("warm g128");
-                if r == 1 {
-                    gpu.gemv_mq4g256gl(&d_gl, &d_x, &d_y, M, K).expect("warm gl");
-                    gpu.gemv_mq4g256sel(&d_sel, &d_x, &d_y, M, K).expect("warm sel");
-                } else {
-                    gpu.gemv_mq4g256gl_multirow_with_rows(&d_gl, &d_x, &d_y, M, K, r).expect("warm gl");
-                    gpu.gemv_mq4g256sel_multirow_with_rows(&d_sel, &d_x, &d_y, M, K, r).expect("warm sel");
-                }
             }
             gpu.hip.device_synchronize().expect("warm sync");
 
@@ -281,52 +221,36 @@ fn main() {
             for _ in 0..ITERS {
                 gemv_hfq4g256_explicit(&mut gpu, &d_hf, &d_x, &d_y, M, K, r).expect("hf");
                 gpu.gemv_mq4g128_prerotated(&d_g128, &d_x, &d_y, M, K).expect("g128");
-                if r == 1 {
-                    gpu.gemv_mq4g256gl(&d_gl, &d_x, &d_y, M, K).expect("gl");
-                    gpu.gemv_mq4g256sel(&d_sel, &d_x, &d_y, M, K).expect("sel");
-                } else {
-                    gpu.gemv_mq4g256gl_multirow_with_rows(&d_gl, &d_x, &d_y, M, K, r).expect("gl");
-                    gpu.gemv_mq4g256sel_multirow_with_rows(&d_sel, &d_x, &d_y, M, K, r).expect("sel");
-                }
             }
             let entries = rdna_compute::profile::stop().expect("profile stop");
-            // entries should be ITERS*4 (each launch produces one entry)
-            if entries.len() != ITERS*4 {
-                eprintln!("WARN run {} R={}: expected {} entries got {} — kernels may have been coalesced or profiling missed", run+1, r, ITERS*4, entries.len());
+            // entries should be ITERS*2 (each launch produces one entry)
+            if entries.len() != ITERS*2 {
+                eprintln!("WARN run {} R={}: expected {} entries got {} — kernels may have been coalesced or profiling missed", run+1, r, ITERS*2, entries.len());
                 for e in &entries { eprintln!("  {} {} us", e.kernel, e.time_us); }
             }
-            // Split by position mod 4: order we launched: hf, g128, gl, sel repeating
+            // Split by position mod 2: order we launched: hf, g128 repeating
             let mut hf_us = Vec::with_capacity(ITERS);
             let mut g128_us = Vec::with_capacity(ITERS);
-            let mut gl_us = Vec::with_capacity(ITERS);
-            let mut sel_us = Vec::with_capacity(ITERS);
             for (idx, e) in entries.iter().enumerate() {
-                match idx % 4 {
+                match idx % 2 {
                     0 => hf_us.push(e.time_us),
                     1 => g128_us.push(e.time_us),
-                    2 => gl_us.push(e.time_us),
-                    3 => sel_us.push(e.time_us),
                     _ => unreachable!(),
                 }
             }
             // Compute medians for this run
             let hf_med = median(hf_us.clone());
             let g128_med = median(g128_us.clone());
-            let gl_med = median(gl_us.clone());
-            let sel_med = median(sel_us.clone());
 
             println!("\n  -- run {}/{}  R={}  ({} samples/format, {} warmup, interleaved) --", run+1, RUNS, r, ITERS, WARMUP);
             for (name, vals, med) in [
                 ("hfq4g256", &hf_us, hf_med),
                 ("mq4g128 (G128)", &g128_us, g128_med),
-                ("mq4g256gl (130B)", &gl_us, gl_med),
-                ("mq4g256sel (132B)", &sel_us, sel_med),
             ] {
                 let bytes = total_bytes(match name {
                     "hfq4g256" => "hfq4g256",
                     n if n.contains("G128") => "mq4g128",
-                    n if n.contains("gl") => "gl",
-                    _ => "sel",
+                    _ => unreachable!(),
                 });
                 let gb = gbps(bytes, med);
                 // also show p50-ish spread: min/median/max
@@ -335,16 +259,13 @@ fn main() {
                 println!("    {:20}  median {:7.2} us  (min {:6.2} max {:6.2})  {:6.1} GB/s  bytes={}", name, med, mn, mx, gb, bytes);
             }
             // store medians for outer aggregation
-            for (k, v) in [("hfq4g256", hf_med), ("mq4g128", g128_med), ("gl", gl_med), ("sel", sel_med)] {
+            for (k, v) in [("hfq4g256", hf_med), ("mq4g128", g128_med)] {
                 medians_per_format.entry(k.to_string()).or_default().push(v);
                 all_results.entry((r, k.to_string())).or_default().push(v);
             }
             // also report ratios vs hfq for this run inline
             println!("    ratios vs hfq4g256 (same R, same run):");
-            for (name, med) in [("mq4g128", g128_med), ("gl", gl_med), ("sel", sel_med)] {
-                let ratio = hf_med / med; // >1 means hfq faster? Actually we want format / hfq: time_format / time_hfq. But spec says ratio vs hfq — define as hfq_time / fmt_time? Let's report both: time ratio and GB/s ratio.
-                // Primary asked: ratio vs hfq4g256 at same R. Define as (fmt_us / hfq_us) and (fmt_GBs / hfq_GBs). More intuitive: ratio = fmt_time / hfq_time; <1 means fmt faster.
-                // We'll report fmt/hfq time ratio.
+            for (name, med) in [("mq4g128", g128_med)] {
                 let time_ratio = med / hf_med;
                 let hf_gb = gbps(total_bytes("hfq4g256"), hf_med);
                 let fmt_gb = gbps(total_bytes(name), med);
@@ -356,7 +277,7 @@ fn main() {
         // After all runs for this R, print summary table for this R (medians across runs already shown per run, but also show aggregate)
         println!("\n  === Summary R={} ({} runs, median per run shown above) ===", r, RUNS);
         // free tensors for this R before next R's Gpu re-init (drop)
-        drop(d_hf); drop(d_g128); drop(d_gl); drop(d_sel); drop(d_x); drop(d_y);
+        drop(d_hf); drop(d_g128); drop(d_x); drop(d_y);
         // gpu will be dropped here; next iteration creates new Gpu with new R
     }
 
@@ -365,8 +286,8 @@ fn main() {
     println!("# FINAL TABLE: format x R -> {{us, GB/s, ratio vs hfq4g256}} (3 runs each)");
     println!("########################################################################");
     println!("m={} k={}  warmup={} iters={} runs={}  device-side hip events, interleaved sample-by-sample", M, K, WARMUP, ITERS, RUNS);
-    println!("bytes/row: hfq4g256=136*{}={}  mq4g128=72*{}={} (144/256 equiv)  gl=130*{}={}  sel=132*{}={}", K/256, bytes_per_weight_row("hfq4g256"), K/128, bytes_per_weight_row("mq4g128"), K/256, bytes_per_weight_row("gl"), K/256, bytes_per_weight_row("sel"));
-    println!("total bytes (weight + x + y): hfq={} g128={} gl={} sel={}", total_bytes("hfq4g256"), total_bytes("mq4g128"), total_bytes("gl"), total_bytes("sel"));
+    println!("bytes/row: hfq4g256=136*{}={}  mq4g128=72*{}={} (144/256 equiv)", K/256, bytes_per_weight_row("hfq4g256"), K/128, bytes_per_weight_row("mq4g128"));
+    println!("total bytes (weight + x + y): hfq={} g128={}", total_bytes("hfq4g256"), total_bytes("mq4g128"));
     println!();
     println!("| format            | R | run1 us | run2 us | run3 us | median_of_medians_us | GB/s (from med) | time_ratio vs hfq (same R) | gbps_ratio |");
     println!("|-------------------|--:|---------|---------|---------|----------------------|-----------------|----------------------------:|-----------:|");
@@ -375,7 +296,7 @@ fn main() {
         let hf_meds = all_results.get(&(r, "hfq4g256".to_string())).cloned().unwrap_or_default();
         let hf_mom = if hf_meds.is_empty() { f64::NAN } else { median(hf_meds.clone()) };
         let hf_gb_mom = gbps(total_bytes("hfq4g256"), hf_mom);
-        for fmt in ["hfq4g256", "mq4g128", "gl", "sel"] {
+        for fmt in ["hfq4g256", "mq4g128"] {
             let meds = all_results.get(&(r, fmt.to_string())).cloned().unwrap_or_default();
             if meds.is_empty() { continue; }
             let mom = median(meds.clone());
@@ -386,8 +307,6 @@ fn main() {
             let label = match fmt {
                 "hfq4g256" => "hfq4g256 (136B)",
                 "mq4g128" => "mq4g128 G128 (144B/256-equiv)",
-                "gl" => "mq4g256gl (130B)",
-                "sel" => "mq4g256sel (132B)",
                 _ => fmt,
             };
             println!("| {:17} | {:1} | {:7.2} | {:7.2} | {:7.2} | {:20.2} | {:15.1} | {:27.4} | {:10.4} |", label, r, r1, r2, r3, mom, gb, time_ratio, gbps_ratio);
