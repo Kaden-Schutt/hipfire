@@ -239,3 +239,81 @@ An earlier claim in this campaign that the plain/multirow GEMVs were "not on the
 dense path" was drawn from a **cumulative** kernel cache whose entries predated the
 run by two days. It is correct for prefill scoring and wrong for decode. Kernel-cache
 evidence is only admissible after clearing the cache.
+
+---
+
+## Amendment 2 — shipped-path throughput measured; qt=44 generates
+
+`hipfire bench --runs 5`, `max_tokens` 128, batch 1, hiptrx gfx1201, daemon
+rebuilt at this commit. qt=13 rows from this record's ladder amendment 2.
+
+| arm | size GB | KLD | decode tok/s | prefill tok/s | ttft ms |
+|---|---|---|---|---|---|
+| qt=13 `ctl` | 15.663 | 0.043776 | 34.60 | 401.3 | 59.8 |
+| **qt=44 `ctl`** | 15.663 | **0.039033** | **33.40** | **420.40** | **57.10** |
+| qt=13 `ctl2` | 16.464 | 0.036746 | 33.20 | 396.3 | 60.6 |
+| **qt=44 `ctl2`** | 16.464 | **0.032495** | **32.00** | **414.20** | **57.90** |
+| qt=13 `attn_full` | 17.355 | 0.033862 | 31.70 | 383.0 | 62.7 |
+| qt=13 `ssm_in` | 18.614 | 0.030479 | 29.70 | 355.7 | 67.5 |
+| **qt=44 `attn`** | 19.504 | **0.025437** | **28.20** | **357.70** | **67.10** |
+
+### v2 costs decode and buys prefill
+
+At byte-identical size, measured twice independently:
+
+| | decode | prefill | ttft |
+|---|---|---|---|
+| `ctl` (15.663 GB) | **−3.47%** | **+4.76%** | **−4.52%** |
+| `ctl2` (16.464 GB) | **−3.61%** | **+4.52%** | **−4.46%** |
+
+The agreement across two sizes makes this a real effect, not noise. Decode at
+batch 1 is bandwidth-bound but VALU-exposed enough that v2's extra `v_cndmask` +
+two `v_cvt_f32_f16` per group per row cost ~3.5%. Prefill goes the other way:
+the WMMA bodies load BOTH half headers unconditionally into `sc0/zp0/sc1/zp1`
+and select per K-tile, which schedules better than v1's two `bit_cast`s.
+
+**This corrects § 6 of [`docs/quant-formats/mq4-v2.md`](../quant-formats/mq4-v2.md).**
+That section reported v2 as throughput-neutral on gfx1201 (ratio 0.9645 at R=2),
+measured on `gemv_hfq4g256_multirow` — which the live-kernel trace established is
+not on the dense projection path. The shipping path costs 3.5% decode. The spec
+already flagged its own numbers as a proxy needing re-measurement; this is that
+measurement.
+
+### The Pareto win, now with measured decode
+
+**qt=44 `ctl2` dominates qt=13 `attn_full` on all three axes:**
+
+| | KLD | decode | size |
+|---|---|---|---|
+| qt=13 `attn_full` | 0.033862 | 31.70 | 17.355 GB |
+| **qt=44 `ctl2`** | **0.032495** | **32.00** | **16.464 GB** |
+
+Better quality, faster, smaller, and one Q8 protection class cheaper. Not a
+tradeoff — strict dominance.
+
+Against the old floor: qt=44 `attn` gives **−16.5% KLD for −5.1% decode and +4.8%
+size** versus qt=13 `ssm_in`. Its 28.20 tok/s also lands within 0.5% of the 28.34
+predicted by byte-scaling from `ssm_in`, so the bandwidth-bound model from the
+original ladder still holds across the container change.
+
+### qt=44 generates — eyeballed, not inferred
+
+Decode required two more kernels (`gemv_mq4g256v2.hip`, 18 header sites, and
+`gemv_mq4g256v2_multirow.hip`), since the daemon's autoregressive path uses the
+plain and multirow GEMVs that prefill scoring never touches. With those ported,
+`hipfire run` on the qt=44 `ctl` arm produced a correct vertical-scan
+`longest_common_prefix`, accurate O(S) complexity analysis, and a valid
+sort-based alternative — coherent prose and correct code, not token soup. Per this
+project's standing rule, that eyeball is the correctness evidence for the decode
+half-select; a wrong predicate silently applies the wrong scale to half of every
+tensor and no throughput number would reveal it.
+
+### Operational note — `hipfire bench` cannot be parallelised
+
+KLD scoring parallelises across hiptrx's four GPUs (`eval_hipfire` takes no global
+lock), and doing so cut the ladder sweep from ~26 min to ~6. `hipfire bench` does
+NOT: the daemon enforces a single-instance guard and the second invocation dies
+with `FATAL: hipfire daemon already running (PID …)` regardless of
+`HIP_VISIBLE_DEVICES`. Bench arms must be run serially, killing the daemon between
+them — and by PID or `/proc/*/comm`, never `pkill -f`, which self-matches the ssh
+command and drops the connection.
