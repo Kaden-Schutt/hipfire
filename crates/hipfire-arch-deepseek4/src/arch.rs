@@ -785,6 +785,10 @@ impl DeepseekV4 {
             layer.expert_gate_up_blob = Some(combined_tensor);
             layer.expert_gate_up_ptrs = Some(ptr_tensor);
             layer.expert_gate_up_stride = combined_stride;
+            layer.expert_quant_type = hfq
+                .find_tensor_info(&format!("{prefix}.ffn.experts.{}.w1.weight", src(0)))
+                .map(|i| i.quant_type)
+                .unwrap_or(0);
             // Store the owning handle (None on single-GPU / fully-owned shards).
             // Its device pointer is already baked into `ptr_tensor` above.
             layer.expert_gate_up_dummy = dummy_gate_up;
@@ -859,6 +863,10 @@ impl DeepseekV4 {
         layer.expert_w2_stride = w2_stride;
         layer.expert_gate_up_blob = Some(gate_up_blob);
         layer.expert_gate_up_stride = gate_up_stride;
+        layer.expert_quant_type = hfq
+            .find_tensor_info(&format!("{prefix}.ffn.experts.{}.w1.weight", src(0)))
+            .map(|i| i.quant_type)
+            .unwrap_or(0);
         Ok((gate_up_stride, w2_stride))
     }
 
@@ -3457,6 +3465,10 @@ impl DeepseekV4 {
             layer.expert_gate_up_blob = Some(combined_tensor);
             layer.expert_gate_up_ptrs = Some(ptr_tensor);
             layer.expert_gate_up_stride = combined_stride;
+            layer.expert_quant_type = source
+                .tensor_info(&format!("{prefix}.ffn.experts.0.w1.weight"))
+                .map(|i| i.quant_type)
+                .unwrap_or(0);
         }
         Ok(())
     }
