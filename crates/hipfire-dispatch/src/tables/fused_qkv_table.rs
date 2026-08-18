@@ -14,6 +14,7 @@ pub fn populate(registry: &mut KernelRegistry) {
         // though the kernel runs there. `Always` matches the kernel's true
         // cross-arch availability (mirrors the FusedQkvQ4K row).
         (KernelKey::FusedQkvHfq4G256,     ArchPredicate::Always),
+        (KernelKey::FusedQkvMq4G256V2,    ArchPredicate::Always),
         // MQ3/MQ4-Lloyd fused QKV: the merged Lloyd kernels are WMMA-free [32,1,1]
         // wave32 scalar (direct-LUT decode), so they run on every wave32 arch incl.
         // RDNA1/2 — NOT just WMMA archs. The old HasWmma gate was a dead-gate (it
@@ -64,7 +65,6 @@ pub fn populate(registry: &mut KernelRegistry) {
             tile: TileImpl::None,
         });
     }
-
     // ── Fused QKVZA (Q, K, V + linear attention Z in one launch) ─
     let qkvza_variants: &[(KernelKey, ArchPredicate)] = &[
         // HFQ4G256 fused QKVZA: `gpu.fused_qkvza_hfq4g256` is cross-arch
@@ -74,6 +74,7 @@ pub fn populate(registry: &mut KernelRegistry) {
         // matches the true cross-arch availability (mirrors FusedQkvHfq4G256
         // and FusedGateUpHfq4G256 rows above).
         (KernelKey::FusedQkvzaHfq4G256,     ArchPredicate::Always),
+        (KernelKey::FusedQkvzaMq4G256V2,    ArchPredicate::Always),
         // MQ3/MQ4-Lloyd fused QKVZA: WMMA-free [32,1,1] wave32 scalar Lloyd kernels,
         // run on every wave32 arch incl. RDNA1/2. HasWmma was a dead-gate (qwen35
         // direct-dispatches); HasWave32 matches true availability, byte-identical
@@ -125,7 +126,6 @@ pub fn populate(registry: &mut KernelRegistry) {
             tile: TileImpl::None,
         });
     }
-
     // ── Fused Gate+Up (FFN gate & up projections in one launch) ──
     let gate_up_variants: &[(KernelKey, ArchPredicate)] = &[
         // HFQ4G256 fused gate+up: `gpu.fused_gate_up_hfq4g256` (+ _dp4a sibling)
@@ -135,6 +135,7 @@ pub fn populate(registry: &mut KernelRegistry) {
         // the kernel's true cross-arch availability (mirrors FusedQkvHfq4G256
         // and FusedGateUpQ4K rows).
         (KernelKey::FusedGateUpHfq4G256,     ArchPredicate::Always),
+        (KernelKey::FusedGateUpMq4G256V2,    ArchPredicate::Always),
         // MQ3/MQ4-Lloyd fused gate+up: WMMA-free [32,1,1] wave32 scalar Lloyd
         // kernels, run on every wave32 arch incl. RDNA1/2. HasWmma was a dead-gate
         // (qwen35 direct-dispatches); HasWave32 matches true availability,

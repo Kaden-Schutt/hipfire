@@ -16,7 +16,25 @@ use crate::tables::KernelRegistry;
 use crate::traits::KernelFamily;
 use crate::types::*;
 
-// ── Dispatch parameters ────────────────────────────────
+fn is_gemm_hfq4_key(key: KernelKey) -> bool {
+    matches!(
+        key,
+        KernelKey::GemmHfq4G256
+            | KernelKey::GemmHfq4G256Wmma
+            | KernelKey::GemmHfq4G256Dp4a
+            | KernelKey::GemmHfq4G256MmqSet
+            | KernelKey::GemmHfq4G256Residual
+            | KernelKey::GemmHfq4G256BatchedLmhead
+    )
+}
+
+fn is_gemm_mq4v2_key(key: KernelKey) -> bool {
+    matches!(
+        key,
+        KernelKey::GemmMq4G256V2 | KernelKey::GemmMq4G256V2Residual | KernelKey::GemmMq4G256V2BatchedLmhead
+    )
+}
+
 
 pub struct GemmParams<'a> {
     pub w: &'a WeightRef<'a>,
@@ -160,6 +178,25 @@ impl GemmFamily {
             gpu.maybe_capture_activation(w.buf, x, batch_size, k);
         }
 
+        // Guard: V2 bytes through v1 kernel or vice-versa is silent noise.
+        // See fused_qkv.rs guard for full header-layout explanation.
+        if w.dtype == DType::MQ4G256V2 && is_gemm_hfq4_key(key) {
+            return Err(DispatchError::Hip(format!(
+                "qt=44 (MQ4G256V2) weight (dtype {:?}) routed to v1 kernel key {:?}: \
+                 v2 stores fp16 scale/zero per 128 weights (s0/z0 for 0..127, s1/z1 for 128..255) \
+                 where v1 stores f32 scale/zero per 256, so the v1 kernel decodes every weight \
+                 to ~1e-14. This is a missing v2 routing arm at the callsite, not a valid configuration.",
+                w.dtype, key
+            )));
+        }
+        if (w.dtype == DType::HFQ4G256 || w.dtype == DType::MQ4G256) && is_gemm_mq4v2_key(key) {
+            return Err(DispatchError::Hip(format!(
+                "v1 weight (dtype {:?}) routed to v2 kernel key {:?}: \
+                 v2 expects fp16 s0/z0/s1/z1 per 128 weights while v1 stores f32 scale/zero per 256. \
+                 Routing a v1 payload through a v2 kernel is equally wrong and silent.",
+                w.dtype, key
+            )));
+        }
         macro_rules! hip {
             ($e:expr) => {
                 $e.map_err(|e| DispatchError::Hip(e.to_string()))
@@ -239,9 +276,9 @@ impl GemmFamily {
             K::GemmHfq4G256BatchedLmhead => hip!(gpu.gemm_hfq4g256_batched_lmhead(w.buf, x, y, m, k, batch_size)),
             K::GemmHfq3G256BatchedLmhead => hip!(gpu.gemm_hfq3g256_batched_lmhead(w.buf, x, y, m, k, batch_size)),
             K::GemmHfq6G256BatchedLmhead => hip!(gpu.gemm_hfq6g256_batched_lmhead(w.buf, x, y, m, k, batch_size)),
-            K::GemmMq4G256V2 => hip!(gpu.gemm_hfq4g256(w.buf, x, y, m, k, batch_size)),
-            K::GemmMq4G256V2Residual => hip!(gpu.gemm_hfq4g256_residual(w.buf, x, y, m, k, batch_size)),
-            K::GemmMq4G256V2BatchedLmhead => hip!(gpu.gemm_hfq4g256_batched_lmhead(w.buf, x, y, m, k, batch_size)),
+            K::GemmMq4G256V2 => hip!(gpu.gemm_mq4g256v2(w.buf, x, y, m, k, batch_size)),
+            K::GemmMq4G256V2Residual => hip!(gpu.gemm_hfq4g256_residual_mq4v2(w.buf, x, y, m, k, batch_size)),
+            K::GemmMq4G256V2BatchedLmhead => hip!(gpu.gemm_mq4g256v2_batched_lmhead(w.buf, x, y, m, k, batch_size)),
             other => Err(DispatchError::MissingImpl { key: other }),
         }
     }

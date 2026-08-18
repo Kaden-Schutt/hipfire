@@ -7094,6 +7094,86 @@ impl Gpu {
         }
         result
     }
+    /// MQ4 v2 (qt=44) — plain GEMV sibling `gemv_mq4g256v2`.
+    /// Mirrors `gemv_hfq4g256` exactly; v2 plain/multirow/wide sources do NOT
+    /// exist (only `GEMV_MQ4G256V2_RESIDUAL_SRC` ships). Returning HipError
+    /// prevents v2 bytes (fp16 s0/z0/s1/z1) being decoded as v1 f32 scale/zero.
+    /// Missing: GEMV_MQ4G256V2_SRC, GEMV_MQ4G256V2_MULTIROW_SRC,
+    /// GEMV_MQ4G256V2_WIDE_SRC, GEMV_MQ4G256V2_GFX1100_SRC, etc.
+    pub fn gemv_mq4g256v2(
+        &mut self,
+        _a_raw: &GpuTensor,
+        _x: &GpuTensor,
+        _y: &GpuTensor,
+        _m: usize,
+        _k: usize,
+    ) -> HipResult<()> {
+        Err(hip_bridge::HipError::new(
+            0,
+            "qt=44 gemv_mq4g256v2: no GEMV_MQ4G256V2 plain source exists \
+             (would need GEMV_MQ4G256V2_SRC / GEMV_MQ4G256V2_MULTIROW_SRC / \
+             GEMV_MQ4G256V2_WIDE_SRC). V2 bytes cannot be decoded by v1 kernel.",
+        ))
+    }
+
+    /// MQ4 v2 multirow sibling. Separate entry point for the multirow path
+    /// that `gemv_hfq4g256` reaches via `gemv_rows_default()>1`. No v2
+    /// multirow source ships, so this also errors rather than falling back to
+    /// the v1 multirow kernel (which would mis-decode headers).
+    pub fn gemv_mq4g256v2_multirow(
+        &mut self,
+        _a_raw: &GpuTensor,
+        _x: &GpuTensor,
+        _y: &GpuTensor,
+        _m: usize,
+        _k: usize,
+    ) -> HipResult<()> {
+        Err(hip_bridge::HipError::new(
+            0,
+            "qt=44 gemv_mq4g256v2_multirow: no GEMV_MQ4G256V2_MULTIROW_SRC exists \
+             (only GEMV_MQ4G256V2_RESIDUAL_SRC ships).",
+        ))
+    }
+    /// Alias with correct HFQ container naming (`hfq4g256v2` container, `MQ4G256V2` rotated format).
+    pub fn gemv_hfq4g256v2(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.gemv_mq4g256v2(a_raw, x, y, m, k)
+    }
+
+    /// Alias for `gemv_mq4g256v2_multirow` with correct container naming.
+    pub fn gemv_hfq4g256v2_multirow(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.gemv_mq4g256v2_multirow(a_raw, x, y, m, k)
+    }
+
+    /// Alias for the residual v2 with correct container naming. The underlying
+    /// launcher is currently `gemv_hfq4g256_residual_mq4v2`; parent will rename it
+    /// to `gemv_hfq4g256v2_residual` via `lsp rename`. This wrapper makes the
+    /// new name available now.
+    pub fn gemv_hfq4g256v2_residual(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.gemv_hfq4g256_residual_mq4v2(a_raw, x, y, m, k)
+    }
+
+
 
 
     /// HFQ4-G256 GEMV with fused SCALED residual add, CPU-scalar variant:

@@ -26178,4 +26178,122 @@ impl Gpu {
         Err(hip_bridge::HipError::new(0, "gemm_hfq4g256_residual_mq4v2: gfx1201 required"))
     }
 
+    /// MQ4 v2 (qt=44) — plain batched GEMM `gemm_hfq4g256` sibling.
+    /// Mirrors `gemm_hfq4g256` exactly; v2 scalar sources do NOT exist (only WMMA
+    /// residual/gate_up/qkvza have dedicated v2 hip files). Returning a clear
+    /// HipError is the bug fix — feeding v2 bytes (fp16 s0/z0/s1/z1) to the v1
+    /// scalar kernel reinterprets four fp16 fields as two f32s => noise (WT2 KLD
+    /// 12.1). No silent fallback.
+    /// Missing v2 sources: GEMM_MQ4G256V2_SRC, GEMM_MQ4G256V2_WAVE64_SRC,
+    /// GEMM_MQ4G256V2_WAVE64_DP4A_SRC, plus the rocBLAS FP16-shadow dequant path
+    /// (which would need a v2-aware hfq4g256_dequantize_to_f16).
+    pub fn gemm_mq4g256v2(
+        &mut self,
+        a_raw: &GpuTensor,
+        _x: &GpuTensor,
+        _y: &GpuTensor,
+        _m: usize,
+        _k: usize,
+        _batch_size: usize,
+    ) -> HipResult<()> {
+        let _ = a_raw;
+        Err(hip_bridge::HipError::new(
+            0,
+            "qt=44 gemm_mq4g256v2: no GEMM_MQ4G256V2 scalar source exists \
+             (would need GEMM_MQ4G256V2_SRC / GEMM_MQ4G256V2_WAVE64_SRC / \
+             GEMM_MQ4G256V2_WAVE64_DP4A_SRC). V2 bytes cannot be decoded by the v1 \
+             scalar kernel (fp16 s0/z0/s1/z1 vs f32 scale/zero).",
+        ))
+    }
+
+    /// MQ4 v2 (qt=44) — batched lm_head sibling of `gemm_hfq4g256_batched_lmhead`.
+    /// Mirrors the v1 variant-selection logic exactly: wmma eligibility gate,
+    /// fp16 cache stomp, memset zero, gfx12 vs gfx11 dispatch, and the
+    /// gfx1100 rm muse gate. Only the v2 SRC constant, `gemm_mq4g256v2` module
+    /// name, and `gemm_mq4g256v2` kernel symbol change where a v2 source exists.
+    /// The v2 WMMA residual source exists for gfx12; the generic scalar fallback
+    /// and the gfx11 wmma/muse paths have no v2 source and return HipError.
+    pub fn gemm_mq4g256v2_batched_lmhead(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let wmma_eligible = batch_size > 1
+            && (self.arch_caps.has_wmma_w32() || self.arch_caps.has_wmma_w32_gfx12())
+            && !self.flags.fp16_disabled
+            && !self.flags.lm_head_wmma_disabled;
+        if wmma_eligible {
+            self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
+            match self.active_stream.as_ref() {
+                Some(stream) => self.hip.memset_async(&y.buf, 0, batch_size * m * 4, stream)?,
+                None => self.hip.memset(&y.buf, 0, batch_size * m * 4)?,
+            }
+            // gfx12 has a dedicated v2 WMMA residual source
+            if self.arch.starts_with("gfx12") {
+                return self.gemm_hfq4g256_residual_wmma_gfx12_mq4v2(a_raw, x, y, m, k, batch_size);
+            } else {
+                // gfx11 wmma and muse paths: no v2 source (only GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX12_SRC exists)
+                // Check muse gate exactly as v1 does, but with v2 error
+                if self.arch_caps.is_gfx1100()
+                    && m == 19_968
+                    && k == 6_656
+                    && batch_size == 192
+                {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        "qt=44 gemm_mq4g256v2_batched_lmhead: gfx1100 muse rm path has no v2 source \
+                         (only GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX12_SRC for gfx12 exists)",
+                    ));
+                }
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    "qt=44 gemm_mq4g256v2_batched_lmhead: gfx11 wmma path has no v2 source \
+                     (only GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX12_SRC for gfx12 exists)",
+                ));
+            }
+        }
+        Err(hip_bridge::HipError::new(
+            0,
+            "qt=44 gemm_mq4g256v2_batched_lmhead: scalar fallback has no v2 source \
+             (GEMM_MQ4G256V2_SRC missing) — would mis-decode v2 bytes as v1",
+        ))
+    }
+    /// Alias with correct HFQ container naming: `hfq4g256v2` is the versioned
+    /// container, `MQ4G256V2` is the rotated format that consumes it. See
+    /// dispatch.rs:539, llama.rs:1464, forward_slots.rs:41. This wrapper exists
+    /// so the upcoming `mq4g256v2` -> `hfq4g256v2` rename (parent `lsp rename`)
+    /// is a pure rename with no logic change. New code should call the `hfq`
+    /// name.
+    pub fn gemm_hfq4g256v2(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.gemm_mq4g256v2(a_raw, x, y, m, k, batch_size)
+    }
+
+    /// Alias for `gemm_mq4g256v2_batched_lmhead` with correct `hfq4g256v2` container naming.
+    pub fn gemm_hfq4g256v2_batched_lmhead(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.gemm_mq4g256v2_batched_lmhead(a_raw, x, y, m, k, batch_size)
+    }
+
+
+
 }

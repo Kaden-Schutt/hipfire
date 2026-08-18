@@ -964,6 +964,7 @@ pub fn fused_rmsnorm_rotate_for_mq<'a>(
 ) -> HipResult<Option<&'a GpuTensor>> {
     match sample_weight.gpu_dtype {
         DType::MQ4G256
+        | DType::MQ4G256V2
         | DType::MQ6G256
         | DType::MQ3G256
         | DType::MQ2G256
@@ -1023,6 +1024,7 @@ pub fn rotate_x_for_mq<'a>(
 ) -> HipResult<Option<&'a GpuTensor>> {
     match sample_weight.gpu_dtype {
         DType::MQ4G256
+        | DType::MQ4G256V2
         | DType::MQ6G256
         | DType::MQ3G256
         | DType::MQ2G256
@@ -1334,6 +1336,7 @@ pub fn weight_gemv_residual(
             .map_err(|e| hip_bridge::HipError::new(0, &e.to_string())),
         DType::MQ6G256
         | DType::MQ4G256
+        | DType::MQ4G256V2
         | DType::MQ3G256
         | DType::MQ3G256Lloyd
         | DType::MQ4G256Lloyd => {
@@ -1408,6 +1411,7 @@ pub fn weight_gemv_swiglu_residual(
 
     match w_down.gpu_dtype {
         DType::MQ4G256
+        | DType::MQ4G256V2
         | DType::MQ3G256
         | DType::MQ6G256
         | DType::MQ3G256Lloyd
@@ -1481,6 +1485,21 @@ pub fn weight_gemm(
             // (its own dispatch comment). It also invalidates the FP16-x cache for
             // the freshly-pooled x_rot pointer, so no manual reset is needed here.
             let r = gpu.gemm_hfq4g256_batched_lmhead(&w.buf, &x_rot, y, w.m, w.k, batch_size);
+            gpu.free_tensor(x_rot)?;
+            r
+        }
+        // qt=44 twin. Same offline-FWHT contract as qt=13 above — identical
+        // rotation plan (FwhtG256, seeds 42/1042), so `rotate_x_mq_batched_for`
+        // is reused verbatim. Only the weight DECODE differs: v2 carries fp16
+        // scale/zero per 128 weights where v1 carries f32 scale/zero per 256, so
+        // this MUST land on the v2 batched-lmhead launcher. Routing it to the v1
+        // launcher bit_casts an fp16 pair to f32 and decodes every weight to
+        // ~1e-14 — no error, full speed, pure noise.
+        DType::MQ4G256V2 => {
+            gpu.ensure_mq_signs()?;
+            let x_rot = gpu.alloc_tensor(&[batch_size, w.k], DType::F32)?;
+            rotate_x_mq_batched_for(gpu, w, x, &x_rot, w.k, batch_size)?;
+            let r = gpu.gemm_mq4g256v2_batched_lmhead(&w.buf, &x_rot, y, w.m, w.k, batch_size);
             gpu.free_tensor(x_rot)?;
             r
         }
@@ -1773,6 +1792,7 @@ pub fn is_batchable_la(dt: DType, arch: &str) -> bool {
     let always_ok = matches!(
         dt,
         DType::MQ4G256
+            | DType::MQ4G256V2
             | DType::HFQ4G256
             | DType::HFQ4G128
             | DType::MQ6G256
