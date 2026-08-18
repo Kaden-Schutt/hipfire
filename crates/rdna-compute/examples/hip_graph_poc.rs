@@ -27,9 +27,9 @@
 //! `hip_bridge::KernargBlob` helper, dispatch paths can build correctly
 //! aligned kernarg buffers without resorting to stack-local addresses.
 //!
-//! This POC proves the fix: it captures a `mul_f32` launch via the blob
-//! path, replays it, and confirms every element of the output matches the
-//! sequential reference.
+//! This POC proves the fix through the production `Gpu::mul_f32` helper:
+//! capture routes it through the blob path, replay is bit-exact with the
+//! sequential reference, and the graph owns the retained kernarg blob.
 //!
 //! Run:
 //!   cargo run --release -p rdna-compute --example hip_graph_poc
@@ -112,39 +112,26 @@ fn main() {
     eprintln!("  blob-direct vs reference: {}/{} match", dim - bad, dim);
     assert_eq!(bad, 0, "blob-path launch outside capture already differs");
 
-    // ─── Graph capture via the blob path ────────────────────────────────
-    eprintln!("\n--- hipGraph capture + replay (blob path) ---");
+    // ─── Graph capture via the production dispatch helper ──────────────
+    eprintln!("\n--- hipGraph capture + replay (Gpu::mul_f32) ---");
     gpu.hip.memcpy_htod(&scratch.buf, as_bytes(&zero)).unwrap();
 
-    gpu.hip
-        .stream_begin_capture(gpu.active_stream.as_ref().unwrap(), 0)
-        .expect("stream_begin_capture");
-
-    // Rebuild the blob — we'll hand this one to the graph and keep it
-    // alive until graph destruction so the captured node's kernarg
-    // pointer stays valid.
-    let mut graph_blob = KernargBlob::new();
-    graph_blob.push_ptr(a.buf.as_ptr());
-    graph_blob.push_ptr(b.buf.as_ptr());
-    graph_blob.push_ptr(scratch.buf.as_ptr());
-    graph_blob.push_i32(n);
-
-    gpu.launch_kernel_blob("mul_f32", grid, block, 0, graph_blob.as_mut_slice())
-        .expect("launch during capture");
-
-    let graph = gpu
-        .hip
-        .stream_end_capture(gpu.active_stream.as_ref().unwrap())
-        .expect("stream_end_capture");
+    gpu.graphs
+        .begin_graph_capture(&gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap())
+        .expect("begin_graph_capture");
+    gpu.mul_f32(&a, &b, &scratch)
+        .expect("mul_f32 during capture");
+    gpu.graphs
+        .end_graph_capture(&gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap())
+        .expect("end_graph_capture");
     eprintln!("  capture succeeded");
-
-    let exec = gpu.hip.graph_instantiate(&graph).expect("graph_instantiate");
+    assert_eq!(gpu.graphs.ar_forward_blobs.len(), 1);
     eprintln!("  instantiated");
 
     // First replay
     gpu.hip.memcpy_htod(&scratch.buf, as_bytes(&zero)).unwrap();
-    gpu.hip
-        .graph_launch(&exec, gpu.active_stream.as_ref().unwrap())
+    gpu.graphs
+        .graph_launch(&gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap())
         .unwrap();
     gpu.hip
         .stream_synchronize(gpu.active_stream.as_ref().unwrap())
@@ -158,7 +145,10 @@ fn main() {
 
     if bad > 0 {
         eprintln!("  FIRST 8 MISMATCHES:");
-        for i in (0..dim).filter(|&i| (graph_out[i] - reference[i]).abs() > 1e-6).take(8) {
+        for i in (0..dim)
+            .filter(|&i| (graph_out[i] - reference[i]).abs() > 1e-6)
+            .take(8)
+        {
             eprintln!(
                 "    [{i}] graph={} ref={} delta={}",
                 graph_out[i],
@@ -172,8 +162,8 @@ fn main() {
 
     // ─── Second replay to prove it's repeatable ─────────────────────────
     gpu.hip.memcpy_htod(&scratch.buf, as_bytes(&zero)).unwrap();
-    gpu.hip
-        .graph_launch(&exec, gpu.active_stream.as_ref().unwrap())
+    gpu.graphs
+        .graph_launch(&gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap())
         .unwrap();
     gpu.hip
         .stream_synchronize(gpu.active_stream.as_ref().unwrap())
@@ -191,8 +181,8 @@ fn main() {
     for _ in 0..50 {
         let t = Instant::now();
         for _ in 0..burst {
-            gpu.hip
-                .graph_launch(&exec, gpu.active_stream.as_ref().unwrap())
+            gpu.graphs
+                .graph_launch(&gpu.hip, gpu.device_id, gpu.active_stream.as_ref().unwrap())
                 .unwrap();
         }
         gpu.hip
@@ -232,8 +222,7 @@ fn main() {
     eprintln!("  graph-replay speedup: {:.2}x", speedup);
 
     // Cleanup the single-node graph
-    gpu.hip.graph_exec_destroy(exec).unwrap();
-    gpu.hip.graph_destroy(graph).unwrap();
+    gpu.graphs.drop_captured_graph(&gpu.hip, gpu.device_id);
 
     // ─── Multi-node graph test ───────────────────────────────────────────
     //
@@ -315,9 +304,8 @@ fn main() {
     let stream = gpu.active_stream.take().unwrap();
     gpu.hip.stream_destroy(stream).unwrap();
 
-    // Keep blob alive until the graph that captured it is destroyed.
+    // Keep the direct-launch blob alive until all work has completed.
     drop(blob);
-    drop(graph_blob);
 
     eprintln!("\n=== POC PASSED — hipGraph capture + blob-path kernargs work bit-exact ===");
 }

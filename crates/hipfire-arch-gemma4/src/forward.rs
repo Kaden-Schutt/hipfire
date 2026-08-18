@@ -317,25 +317,9 @@ pub fn decode_step_with_graph(
                 _ => None,
             },
         );
-    // DEFAULT OFF pending a fix to the captured decode path.
-    //
-    // Measured on gfx1201 / 12B-it MQ4, prompt "Hello world", greedy:
-    //   graph ON : 49.75 tok/s, output collapses after the first token
-    //              ("Hello!s율 bawass율율 bawaky interracial율jal…")
-    //   graph OFF: 49.72 tok/s, "Hello! How can I help you today?" — byte-
-    //              identical to this PR's own Phase-2 Gate 2 expected output,
-    //              and it stops cleanly on <turn|>.
-    //
-    // This is the failure mode AGENTS.md documents: a captured graph replays
-    // dangling stack-pointer kernargs, so throughput looks right and the tokens
-    // are garbage. All six Gemma4 dispatch helpers added during this port go
-    // through `launch_maybe_blob` and are capture-safe, so the offending raw
-    // launch is elsewhere in the decode body and still needs to be found.
-    //
-    // The graph is worth 0.03 tok/s here (0.06%), so correctness costs nothing.
-    // Re-enable with HIPFIRE_GEMMA4_GRAPH=1 once the capture path is fixed and
-    // a coherence check passes with it on.
-    let graph_on = env_override.unwrap_or(false);
+    // The captured path is the default. Set HIPFIRE_GEMMA4_GRAPH=0 to retain
+    // the eager fallback for diagnostics.
+    let graph_on = env_override.unwrap_or(true);
     if !graph_on {
         return decode_step(cfg, weights, state, gpu, token_id, position);
     }
@@ -382,7 +366,7 @@ pub fn decode_step_with_graph(
             .map_err(|e| format!("gemma4 graph_launch (capture): {e:?}"))?;
         eprintln!(
             "[gemma4 hipGraph] captured decode forward — {} kernarg blobs retained",
-            gpu.graphs.capture_blobs.len()
+            gpu.graphs.ar_forward_blobs.len()
         );
     } else {
         // ── Replay phase ───────────────────────────────────────────────
