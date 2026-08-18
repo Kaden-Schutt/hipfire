@@ -44,6 +44,7 @@ use std::{
 };
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
+mod bench_concurrency;
 mod setup;
 use setup::setup_command;
 
@@ -53,6 +54,8 @@ const MODEL_SUFFIXES: &[&str] = &[
     ".hfq",
     ".mq2",
     ".mq2lloyd",
+    ".mq2r",
+    ".mq2rxt",
     ".mq3",
     ".mq3p",
     ".mq4",
@@ -213,6 +216,14 @@ struct SetupArgs {
     source: PathBuf,
     #[arg(long, value_name = "PATH")]
     rocm_root: Option<PathBuf>,
+    /// Explicit device compiler (hipcc/amdclang++) when it lives in a different
+    /// prefix than the runtime. Also set via HIPFIRE_HIPCC.
+    #[arg(long, value_name = "PATH")]
+    hipcc: Option<PathBuf>,
+    /// Disable cross-root compiler fallback; require the compiler under the
+    /// selected root. Also set via HIPFIRE_ROCM_STRICT=1.
+    #[arg(long)]
+    strict_rocm: bool,
     #[arg(long, value_name = "ARCH")]
     gpu_arch: Option<String>,
     /// auto (default) leaves replay.backend=auto so .mq4r models select Redline.
@@ -405,7 +416,7 @@ struct ChatArgs {
     no_color: bool,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Clone)]
 struct BenchArgs {
     model: String,
     #[arg(long, default_value_t = 5)]
@@ -432,6 +443,9 @@ struct BenchArgs {
     ctx: Vec<usize>,
     #[arg(long, default_value_t = 128)]
     tg: usize,
+    /// Generated tokens per standard-bench measurement run.
+    #[arg(long, default_value_t = 128)]
+    max_tokens: usize,
     #[arg(long)]
     sustained_tg: Option<usize>,
     #[arg(long, value_delimiter = ',', default_value = "128,8192")]
@@ -444,6 +458,26 @@ struct BenchArgs {
     kv_backend: Option<String>,
     #[arg(long)]
     redline: bool,
+    /// Speculation mode to benchmark (off, dflash, mtp, ngram, dspark, or auto).
+    #[arg(long = "spec")]
+    speculation: Option<String>,
+    /// Let the model think during the benchmark. Off by default: a reasoning
+    /// model cannot close its `<think>` span inside the benchmark's token
+    /// budget, and the daemon fails such a turn closed as a validation error.
+    /// Pair this with `--max-tokens` large enough for the span to close.
+    #[arg(long = "reasoning-on")]
+    reasoning_on: bool,
+    /// Sweep concurrent stream counts, e.g. `1,2,3,4`. Absent leaves bench
+    /// on its single-stream path, unchanged.
+    #[arg(long)]
+    concurrency: Option<String>,
+    /// Which backend to drive: slots (multi-slot engine), noslots (sequential
+    /// daemon baseline), batch (beta continuous batching), or both.
+    #[arg(long, value_parser = ["slots", "noslots", "batch", "both"], default_value = "both")]
+    backend: String,
+    /// Which workload arm to run: stateless, multiturn, or both.
+    #[arg(long, value_parser = ["stateless", "multiturn", "both"], default_value = "both")]
+    workload: String,
     /// Prompt words for the standard benchmark.
     #[arg(num_args = 0..)]
     prompt: Vec<String>,
@@ -536,6 +570,9 @@ struct ServeArgs {
     /// Expert-parallel degree.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..=64))]
     tp: Option<u64>,
+    /// Maximum concurrent eligible batched lanes; 1 preserves sequential behavior.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=256))]
+    continuous_batch_size: Option<u64>,
     /// Internal marker used by the detached child.
     #[arg(long, hide = true)]
     foreground_child: bool,
@@ -582,7 +619,6 @@ fn main() {
         std::process::exit(1);
     }
 }
-
 fn run() -> Result<()> {
     let cli = Cli::parse_from(env::args_os().map(|argument| {
         if argument == "-md" {
@@ -1830,8 +1866,8 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
     let resolved = resolved_for_model(paths, &args.model, canonical.as_deref(), entry)?;
     let configured_max_tokens = config_u64(&resolved, "generation.max_tokens")?;
     let max_tokens = args.max_tokens.unwrap_or(configured_max_tokens);
-    if max_tokens == 0 || max_tokens > 131_072 {
-        bail!("--max-tokens must be between 1 and 131072");
+    if max_tokens == 0 || max_tokens > 393_216 {
+        bail!("--max-tokens must be between 1 and 393216");
     }
     let temperature = request_f64(&resolved, "generation.temperature", args.temp)?;
     let top_p = request_f64(&resolved, "generation.top_p", args.top_p)?;
@@ -1961,8 +1997,16 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
     let mut request = serde_json::json!({
         "type": "generate",
         "id": "run",
+        "attempt_id": next_attempt_id(),
         "prompt": prompt,
         "max_tokens": max_tokens,
+        // `Engine::generate` rejects a request without `attempt_id`
+        // (hipfire-client lib.rs:557 -> "generate request missing attempt_id"),
+        // and `hipfire run` never set one, so EVERY `hipfire run` failed with a
+        // daemon protocol error. `run` is a one-shot, non-retrying caller, so a
+        // literal 1 is correct — same as `bench_generate_request` (main.rs:6407).
+        // The retrying serve path threads a real counter instead (main.rs:4234).
+        "attempt_id": 1,
     });
     insert_optional_f64(&mut request, "temperature", temperature);
     insert_optional_f64(&mut request, "top_p", top_p);
@@ -2111,8 +2155,8 @@ fn chat_command(paths: &Paths, args: ChatArgs) -> Result<()> {
     let max_tokens = args
         .max_tokens
         .unwrap_or(config_u64(&resolved, "generation.max_tokens")?);
-    if max_tokens == 0 || max_tokens > 131_072 {
-        bail!("--max-tokens must be between 1 and 131072");
+    if max_tokens == 0 || max_tokens > 393_216 {
+        bail!("--max-tokens must be between 1 and 393216");
     }
     if let Some(value) = args.temp {
         if !(0.0..=2.0).contains(&value) {
@@ -2135,6 +2179,7 @@ fn chat_command(paths: &Paths, args: ChatArgs) -> Result<()> {
             kv_backend: None,
             idle_timeout: None,
             tp: None,
+            continuous_batch_size: None,
             foreground_child: false,
         };
         detach_serve(paths, &serve_args, &host, port)?;
@@ -2181,7 +2226,8 @@ fn chat_command(paths: &Paths, args: ChatArgs) -> Result<()> {
         }
         print!("assistant> ");
         std::io::stdout().flush()?;
-        let mut assistant = String::new();
+        let mut assistant_reasoning = String::new();
+        let mut assistant_content = String::new();
         let result = stream_openai_chat(
             client_host,
             port,
@@ -2189,8 +2235,13 @@ fn chat_command(paths: &Paths, args: ChatArgs) -> Result<()> {
             Duration::from_secs(60 * 60),
             |event| {
                 match event {
-                    OpenAiSseEvent::Reasoning { text } | OpenAiSseEvent::Content { text } => {
-                        assistant.push_str(&text);
+                    OpenAiSseEvent::Reasoning { text } => {
+                        assistant_reasoning.push_str(&text);
+                        print!("{text}");
+                        std::io::stdout().flush()?;
+                    }
+                    OpenAiSseEvent::Content { text } => {
+                        assistant_content.push_str(&text);
                         print!("{text}");
                         std::io::stdout().flush()?;
                     }
@@ -2209,7 +2260,12 @@ fn chat_command(paths: &Paths, args: ChatArgs) -> Result<()> {
             messages.pop();
             return Err(error.into());
         }
-        messages.push(serde_json::json!({ "role": "assistant", "content": assistant }));
+        let mut assistant_msg =
+            serde_json::json!({ "role": "assistant", "content": assistant_content });
+        if !assistant_reasoning.is_empty() {
+            assistant_msg["reasoning_content"] = serde_json::Value::String(assistant_reasoning);
+        }
+        messages.push(assistant_msg);
     }
     let _ = args.no_color;
     Ok(())
@@ -2226,6 +2282,19 @@ struct ServeMeta {
     recent_tok_s: Option<f64>,
     started: Instant,
     last_activity: Instant,
+}
+
+fn finish_prewarm(meta: &mut ServeMeta, succeeded: bool) {
+    meta.loading_model = None;
+    if succeeded {
+        meta.last_activity = Instant::now();
+    }
+}
+
+fn idle_model_expired(meta: &ServeMeta, idle_timeout: Duration) -> bool {
+    meta.loading_model.is_none()
+        && meta.current_model.is_some()
+        && meta.last_activity.elapsed() >= idle_timeout
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -2246,11 +2315,14 @@ struct ServeRuntime {
     paths: Paths,
     registry: RegistryV1,
     current_path: Option<PathBuf>,
+    current_arch: Option<String>,
+    continuous_batch_capable: bool,
     current_max_seq: u64,
     cache_capable: bool,
     kv_override: Option<String>,
     kv_backend_override: Option<String>,
     tp: Option<u64>,
+    continuous_batch_size: u64,
 }
 
 struct ServeShared {
@@ -2263,6 +2335,19 @@ struct ServeShared {
     retry_backoff: Duration,
     /// Test seam: when set, invoked instead of `thread::sleep` during retry backoff.
     backoff_hook: Mutex<Option<Arc<dyn Fn(Duration) + Send + Sync>>>,
+    /// Concurrent multi-slot backend (`serve.multi_slot`). Deliberately NOT
+    /// inside `runtime`: that mutex is exactly what serialises requests today,
+    /// so an engine behind it would serve one caller at a time and change
+    /// nothing.
+    slot_engine: Option<Arc<SlotBackend>>,
+}
+
+/// The multi-slot backend plus what the HTTP layer needs to talk to it: a
+/// tokenizer to render chat messages into ids and to turn generated ids back
+/// into text for the SSE deltas.
+struct SlotBackend {
+    engine: hipfire_arch_qwen35::serve_engine::SlotEngine,
+    tokenizer: hipfire_runtime::tokenizer::Tokenizer,
 }
 
 #[derive(Debug)]
@@ -2452,8 +2537,13 @@ fn longest_control_prefix_suffix(text: &str) -> usize {
 
 #[derive(Debug, Default)]
 struct AdmissionState {
-    busy: bool,
+    /// Batch-eligible requests currently admitted. The single-daemon backend
+    /// caps this at one; the multi-slot engine admits `capacity` at once.
+    eligible: usize,
+    /// A batch-ineligible request holds the backend exclusively.
+    ineligible_busy: bool,
     queued: usize,
+    batch_model: Option<String>,
 }
 
 #[derive(Debug)]
@@ -2462,6 +2552,11 @@ struct Admission {
     available: Condvar,
     max_queue: usize,
     timeout: Duration,
+    /// How many batch-eligible requests may be in flight at once. One for the
+    /// single-daemon backend -- this gate is what protects it -- and the slot
+    /// count when the multi-slot engine is active, which has its own admission
+    /// behind it.
+    capacity: usize,
 }
 
 #[derive(Debug)]
@@ -2481,24 +2576,71 @@ impl std::error::Error for AdmissionError {}
 #[derive(Debug)]
 struct AdmissionGuard {
     admission: Arc<Admission>,
+    is_eligible: bool,
+    model: Option<String>,
 }
 
 impl Admission {
     fn new(max_queue: usize, timeout: Duration) -> Self {
+        Self::new_with_capacity(max_queue, timeout, 1)
+    }
+
+    fn new_with_capacity(max_queue: usize, timeout: Duration, capacity: usize) -> Self {
         Self {
             state: Mutex::new(AdmissionState::default()),
             available: Condvar::new(),
             max_queue,
             timeout,
+            capacity: capacity.max(1),
         }
     }
 
+    fn is_model_compatible(current: &Option<String>, requested: Option<&str>) -> bool {
+        match (current, requested) {
+            (None, _) => true,
+            (Some(cur), Some(req)) => cur == req,
+            (Some(_), None) => true,
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        self.capacity
+    }
+
     fn acquire(self: &Arc<Self>) -> std::result::Result<AdmissionGuard, AdmissionError> {
+        self.acquire_for(false, None)
+    }
+
+    fn acquire_for(
+        self: &Arc<Self>,
+        is_eligible: bool,
+        model: Option<&str>,
+    ) -> std::result::Result<AdmissionGuard, AdmissionError> {
+        let model_owned = model.map(|s| s.to_owned());
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        if !state.busy {
-            state.busy = true;
+        // Fast path when no queued waiters and resource is available.
+        if is_eligible {
+            if !state.ineligible_busy
+                && state.eligible < self.capacity
+                && state.queued == 0
+                && Self::is_model_compatible(&state.batch_model, model_owned.as_deref())
+            {
+                state.eligible += 1;
+                if state.batch_model.is_none() {
+                    state.batch_model = model_owned.clone();
+                }
+                return Ok(AdmissionGuard {
+                    admission: Arc::clone(self),
+                    is_eligible: true,
+                    model: model_owned,
+                });
+            }
+        } else if state.eligible == 0 && !state.ineligible_busy && state.queued == 0 {
+            state.ineligible_busy = true;
             return Ok(AdmissionGuard {
                 admission: Arc::clone(self),
+                is_eligible: false,
+                model: None,
             });
         }
         if self.max_queue != 0 && state.queued >= self.max_queue {
@@ -2535,30 +2677,60 @@ impl Admission {
                     .wait_timeout(state, remaining)
                     .unwrap_or_else(|error| error.into_inner());
                 state = next;
-                if wait.timed_out() && state.busy {
-                    state.queued = state.queued.saturating_sub(1);
-                    return Err(AdmissionError {
-                        message: format!(
-                            "serve queue wait exceeded {}ms",
-                            self.timeout.as_millis()
-                        ),
-                        retry_after_seconds: self.retry_after_seconds(),
-                    });
+                if wait.timed_out() {
+                    let can_acquire = if is_eligible {
+                        !state.ineligible_busy
+                            && state.eligible < self.capacity
+                            && Self::is_model_compatible(&state.batch_model, model_owned.as_deref())
+                    } else {
+                        state.eligible == 0 && !state.ineligible_busy
+                    };
+                    if !can_acquire {
+                        state.queued = state.queued.saturating_sub(1);
+                        return Err(AdmissionError {
+                            message: format!(
+                                "serve queue wait exceeded {}ms",
+                                self.timeout.as_millis()
+                            ),
+                            retry_after_seconds: self.retry_after_seconds(),
+                        });
+                    }
                 }
             }
-            if !state.busy {
+            let can_acquire = if is_eligible {
+                !state.ineligible_busy
+                    && state.eligible < self.capacity
+                    && Self::is_model_compatible(&state.batch_model, model_owned.as_deref())
+            } else {
+                state.eligible == 0 && !state.ineligible_busy
+            };
+            if can_acquire {
                 state.queued = state.queued.saturating_sub(1);
-                state.busy = true;
-                return Ok(AdmissionGuard {
-                    admission: Arc::clone(self),
-                });
+                if is_eligible {
+                    state.eligible += 1;
+                    if state.batch_model.is_none() {
+                        state.batch_model = model_owned.clone();
+                    }
+                    return Ok(AdmissionGuard {
+                        admission: Arc::clone(self),
+                        is_eligible: true,
+                        model: model_owned.clone(),
+                    });
+                } else {
+                    state.ineligible_busy = true;
+                    return Ok(AdmissionGuard {
+                        admission: Arc::clone(self),
+                        is_eligible: false,
+                        model: None,
+                    });
+                }
             }
         }
     }
 
     fn inflight(&self) -> usize {
         let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        usize::from(state.busy) + state.queued
+        state.eligible + usize::from(state.ineligible_busy) + state.queued
     }
 
     fn retry_after_seconds(&self) -> u64 {
@@ -2577,8 +2749,137 @@ impl Drop for AdmissionGuard {
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        state.busy = false;
-        self.admission.available.notify_one();
+        if self.is_eligible {
+            state.eligible = state.eligible.saturating_sub(1);
+            if state.eligible == 0 {
+                state.batch_model = None;
+            }
+        } else {
+            state.ineligible_busy = false;
+        }
+        self.admission.available.notify_all();
+    }
+}
+
+/// Conservative batch eligibility for independent continuous-batch decode.
+///
+/// Eligible only for Qwen (arch 5/6) or dense LFM2 (`lfm` arch identity),
+/// stateless text with no tools/images/stops/spec/adaptive/prefix behavior.
+/// TP policy: Qwen admits ordinary tp=1 or pure expert-parallel tp=4 when the
+/// daemon advertises batch capability; dense LFM remains tp=1 only. All other
+/// tp/arch combinations fall back to sequential. Check is intentionally strict
+/// and synchronous; model arch is taken from `current_arch` when available,
+/// otherwise inferred from the requested model name containing `qwen` or `lfm`.
+///
+/// Message-shape gate matches daemon admission: absent/empty `messages` are
+/// eligible; otherwise only exactly one `user` message with plain string
+/// content (no tool_calls, no multipart/array content).
+fn is_batch_eligible_request(
+    body: &serde_json::Value,
+    tp: Option<u64>,
+    current_arch: Option<&str>,
+    daemon_batch_capable: bool,
+) -> bool {
+    if !daemon_batch_capable {
+        return false;
+    }
+    // Qwen or LFM2 only. Prefer runtime arch when known.
+    let (is_qwen, is_lfm) = if let Some(arch) = current_arch {
+        let arch_l = arch.to_ascii_lowercase();
+        (arch_l.contains("qwen"), arch_l.contains("lfm"))
+    } else if let Some(model) = body.get("model").and_then(|v| v.as_str()) {
+        let model_l = model.to_ascii_lowercase();
+        (model_l.contains("qwen"), model_l.contains("lfm"))
+    } else {
+        (false, false)
+    };
+    if !is_qwen && !is_lfm {
+        return false;
+    }
+    // TP policy: Qwen tp=1 ordinary or tp=4 pure EP; dense LFM tp=1 only.
+    let tp_degree = tp.unwrap_or(1);
+    let tp_ok = if is_qwen {
+        tp_degree == 1 || tp_degree == 4
+    } else {
+        tp_degree == 1
+    };
+    if !tp_ok {
+        return false;
+    }
+    // Stateless text: no tools, no images, no stops, no spec, no adaptive, no prefix.
+    if body
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .is_some_and(|a| !a.is_empty())
+    {
+        return false;
+    }
+    if body.get("tool_choice").is_some() {
+        return false;
+    }
+    // Images via explicit image_base64.
+    if body.get("image_base64").is_some() {
+        return false;
+    }
+    // Message history must match daemon single-user plain-string shape.
+    if !batch_messages_are_single_user(body) {
+        return false;
+    }
+    if body.get("stop").is_some() {
+        return false;
+    }
+    // Speculation / adaptive / prefix behavior disqualifies.
+    for key in [
+        "speculation",
+        "dflash_mode",
+        "mtp_mode",
+        "ngram_draft",
+        "prefill_sparse_threshold",
+        "kv_adaptive",
+        "prefix",
+    ] {
+        if body.get(key).is_some() {
+            return false;
+        }
+    }
+    true
+}
+
+/// HTTP/OpenAI `messages` are batch-eligible only when absent/empty (prompt
+/// path) or exactly one user turn with plain string content. Multi-turn,
+/// system/assistant/tool roles, tool_call payloads, and multipart/image
+/// content stay on the sequential route — same contract as the daemon.
+fn batch_messages_are_single_user(body: &serde_json::Value) -> bool {
+    let Some(messages) = body.get("messages") else {
+        return true;
+    };
+    let Some(arr) = messages.as_array() else {
+        return false;
+    };
+    if arr.is_empty() {
+        return true;
+    }
+    if arr.len() != 1 {
+        return false;
+    }
+    let m0 = &arr[0];
+    if m0.get("role").and_then(|v| v.as_str()) != Some("user") {
+        return false;
+    }
+    // Tool-call payloads on the sole message force sequential (batch v1 has
+    // no tools path). Empty / missing tool_calls is fine.
+    if let Some(tc) = m0.get("tool_calls") {
+        if tc.as_array().is_some_and(|a| !a.is_empty()) || tc.is_object() {
+            return false;
+        }
+    }
+    // Content must be a plain string (reject multipart/array/image parts).
+    match m0.get("content") {
+        Some(serde_json::Value::String(_)) => true,
+        // Missing content is not a plain user string turn.
+        None => false,
+        // Arrays (multipart/text+image), objects, numbers, bool, null.
+        Some(_) => false,
     }
 }
 
@@ -2728,6 +3029,11 @@ fn detach_serve(paths: &Paths, args: &ServeArgs, host: &str, port: u16) -> Resul
     if let Some(tp) = args.tp {
         command.arg("--tp").arg(tp.to_string());
     }
+    if let Some(batch) = args.continuous_batch_size {
+        command
+            .arg("--continuous-batch-size")
+            .arg(batch.to_string());
+    }
     let mut child = command.spawn().context("failed to detach native serve")?;
     let probe_host = match host {
         "0.0.0.0" => "127.0.0.1",
@@ -2792,6 +3098,12 @@ fn serve_foreground(
     let max_request_bytes = config_u64(&global, "serve.max_request_bytes")?;
     let max_queue = config_u64(&global, "serve.max_queue")? as usize;
     let queue_timeout = Duration::from_millis(config_u64(&global, "serve.queue_timeout_ms")?);
+    let continuous_batch_size = args
+        .continuous_batch_size
+        .unwrap_or(config_u64(&global, "serve.continuous_batch_size")?);
+    if continuous_batch_size == 0 || continuous_batch_size > 256 {
+        bail!("--continuous-batch-size must be between 1 and 256");
+    }
     let retry_enabled = config_bool(&global, "serve.retry_enabled")?;
     let retry_backoff = Duration::from_millis(config_u64(&global, "serve.retry_backoff_ms")?);
     let idle_timeout = Duration::from_secs(
@@ -2803,17 +3115,58 @@ fn serve_foreground(
         .clone()
         .unwrap_or(config_string(&global, "serve.default_model")?);
     let instance_token = serve_instance_token();
+    // Opt-in concurrent backend. Built before ServeShared so a failure here is
+    // a clean startup error rather than a half-configured server.
+    let slot_engine = match config_bool(&global, "serve.multi_slot") {
+        Ok(true) => {
+            let model_path = find_model_path(paths, &registry, &default_model)
+                .ok_or_else(|| anyhow!("multi_slot: cannot resolve model {default_model}"))?;
+            let n_slots = config_u64(&global, "serve.multi_slot_slots").unwrap_or(4) as usize;
+            let cap_tokens = config_u64(&global, "serve.multi_slot_ctx").unwrap_or(8192) as usize;
+            let mut hfq = hipfire_runtime::hfq::HfqFile::open(&model_path)
+                .with_context(|| format!("multi_slot: open {}", model_path.display()))?;
+            let tokenizer =
+                hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
+                    .map_err(|e| anyhow!("multi_slot: tokenizer: {e}"))?;
+            drop(hfq);
+            let engine = hipfire_arch_qwen35::serve_engine::SlotEngine::spawn(
+                hipfire_arch_qwen35::serve_engine::EngineConfig {
+                    model_path: model_path.clone(),
+                    n_slots,
+                    cap_tokens,
+                    host_budget_bytes: 16 * 1024 * 1024 * 1024,
+                    swap_dir: std::env::temp_dir().join("hipfire-serve-swap"),
+                },
+            )
+            .map_err(|e| anyhow!("multi_slot: {e}"))?;
+            eprintln!(
+                "serve: multi-slot backend up ({} slots, {} ctx) - requests run concurrently",
+                n_slots, cap_tokens
+            );
+            Some(Arc::new(SlotBackend { engine, tokenizer }))
+        }
+        _ => None,
+    };
+    let slot_concurrency = if slot_engine.is_some() {
+        config_u64(&global, "serve.multi_slot_slots").unwrap_or(4) as usize
+    } else {
+        1
+    };
     let shared = Arc::new(ServeShared {
+        slot_engine,
         runtime: Mutex::new(ServeRuntime {
             engine,
             paths: paths.clone(),
             registry: registry.clone(),
             current_path: None,
+            current_arch: None,
+            continuous_batch_capable: false,
             current_max_seq: 0,
             cache_capable: false,
             kv_override: args.kv_mode.clone(),
             kv_backend_override: args.kv_backend.clone(),
             tp: args.tp,
+            continuous_batch_size,
         }),
         meta: Mutex::new(ServeMeta {
             current_model: None,
@@ -2827,13 +3180,22 @@ fn serve_foreground(
             last_activity: Instant::now(),
         }),
         max_request_bytes,
-        admission: Arc::new(Admission::new(max_queue, queue_timeout)),
+        // The HTTP gate must admit as many requests as the live backend can
+        // actually run, or they queue here and never reach it -- the exact
+        // serialisation both batching paths exist to remove. Two independent
+        // mechanisms feed this: the multi-slot engine's slot count (1 when it
+        // is off) and the single-daemon continuous batch width. Take the
+        // larger; each has its own admission behind this gate.
+        admission: Arc::new(Admission::new_with_capacity(
+            max_queue,
+            queue_timeout,
+            slot_concurrency.max(continuous_batch_size as usize),
+        )),
         idle_timeout,
         retry_enabled,
         retry_backoff,
         backoff_hook: Mutex::new(None),
     });
-
     let bind = format_bind(host, port);
     let server = Server::http(&bind).map_err(|error| anyhow!("failed to bind {bind}: {error}"))?;
     fs::create_dir_all(&paths.root)?;
@@ -2869,11 +3231,13 @@ fn serve_foreground(
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .ensure_model(&default_model, &shared.meta, None);
-            shared
-                .meta
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .loading_model = None;
+            {
+                let mut meta = shared
+                    .meta
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                finish_prewarm(&mut meta, result.is_ok());
+            }
             match result {
                 Ok(_) => eprintln!("[hipfire] pre-warmed {default_model}"),
                 Err(error) => eprintln!("[hipfire] pre-warm failed: {error:#}; serving lazily"),
@@ -2892,7 +3256,7 @@ fn serve_foreground(
                     .meta
                     .lock()
                     .unwrap_or_else(|error| error.into_inner());
-                meta.current_model.is_some() && meta.last_activity.elapsed() >= shared.idle_timeout
+                idle_model_expired(&meta, shared.idle_timeout)
             };
             if !expired {
                 continue;
@@ -2906,6 +3270,7 @@ fn serve_foreground(
                     let result = runtime.engine.unload();
                     if result.is_ok() {
                         runtime.current_path = None;
+                        runtime.current_arch = None;
                         runtime.current_max_seq = 0;
                         runtime.cache_capable = false;
                     }
@@ -3032,11 +3397,42 @@ fn handle_http(mut request: Request, shared: Arc<ServeShared>) -> Result<()> {
                     return Ok(());
                 }
             };
-            let guard = match shared.admission.acquire() {
-                Ok(guard) => guard,
-                Err(error) => {
-                    request.respond(admission_error_response(&error))?;
-                    return Ok(());
+            // Class-aware admission: eligible requests share capacity up to
+            // continuous_batch_size, ineligible are exclusive single-flight.
+            let (is_eligible, model_for_lease) = {
+                let runtime = shared
+                    .runtime
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                let tp = runtime.tp;
+                let arch = runtime.current_arch.clone();
+                let batch_capable = runtime.continuous_batch_capable;
+                drop(runtime);
+                let eligible = is_batch_eligible_request(&body, tp, arch.as_deref(), batch_capable);
+                let model = body
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_owned());
+                (eligible, model)
+            };
+            let guard = if is_eligible {
+                match shared
+                    .admission
+                    .acquire_for(true, model_for_lease.as_deref())
+                {
+                    Ok(g) => g,
+                    Err(e) => {
+                        request.respond(admission_error_response(&e))?;
+                        return Ok(());
+                    }
+                }
+            } else {
+                match shared.admission.acquire() {
+                    Ok(g) => g,
+                    Err(e) => {
+                        request.respond(admission_error_response(&e))?;
+                        return Ok(());
+                    }
                 }
             };
             // Tools require a lossless endpoint adapter before any generation.
@@ -3134,18 +3530,71 @@ fn respond_streaming(
         );
         finish_sse_stream(sender, result);
     });
-    request.respond(Response::new(
-        StatusCode(200),
-        vec![
-            header("Content-Type", "text/event-stream"),
-            header("Cache-Control", "no-cache"),
-            header("Connection", "keep-alive"),
-            header("Access-Control-Allow-Origin", "*"),
-        ],
-        ChannelReader::new(receiver),
-        None,
-        None,
-    ))?;
+    let mut writer = request.into_writer();
+    // Write status line + headers manually. We own the socket, so use
+    // Connection: close and close after the terminal chunk; do not emit
+    // keep-alive which we would then violate.
+    let header_bytes = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+    if writer.write_all(header_bytes).is_err() || writer.flush().is_err() {
+        // Client disconnected before headers — fail any queued ack and stop.
+        // Receiver will be dropped; sender's ack waiters see channel close as Cancelled.
+        return Ok(());
+    }
+    // Any write failure here means the client is gone; the shape of the error
+    // does not change what we do, so it is not inspected.
+    loop {
+        let chunk = match receiver.recv() {
+            Ok(c) => c,
+            Err(_) => break,
+        };
+        if chunk.fail {
+            if let Some(ack) = chunk.ack {
+                let _ = ack.send(Err(()));
+            }
+            // Unclean failure — abort; HTTP terminator still sent below
+            // so the client sees a clean HTTP EOF with incomplete SSE.
+            break;
+        }
+        if chunk.bytes.is_empty() {
+            // Empty chunks carry no wire bytes. Per contract never fire an ack for
+            // an empty chunk — drop it without sending.
+            drop(chunk.ack);
+            continue;
+        }
+        // Framed chunk: "{len:x}\r\n" + payload + "\r\n", then flush.
+        let len_hex = format!("{:x}\r\n", chunk.bytes.len());
+        let write_res = (|| -> std::io::Result<()> {
+            writer.write_all(len_hex.as_bytes())?;
+            writer.write_all(&chunk.bytes)?;
+            writer.write_all(b"\r\n")?;
+            writer.flush()?;
+            Ok(())
+        })();
+        match write_res {
+            Ok(()) => {
+                if let Some(ack) = chunk.ack {
+                    let _ = ack.send(Ok(()));
+                }
+            }
+            Err(_) => {
+                if let Some(ack) = chunk.ack {
+                    let _ = ack.send(Err(()));
+                }
+                break;
+            }
+        }
+    }
+    // Always send the HTTP chunked terminator so the HTTP body is
+    // considered complete. For clean close this is the normal end;
+    // for fail (premature EOF) the terminator makes the HTTP layer
+    // succeed, letting `read_openai_sse` see an SSE EOF without
+    // finish/DONE and return `PrematureEof` (the expected test shape)
+    // rather than a lower-level `Io(UnexpectedEof)`.
+    let _ = writer.write_all(b"0\r\n\r\n");
+    let _ = writer.flush();
+    // Dropping the writer closes the socket, which is what `Connection: close`
+    // promised; the client then sees EOF.
+    drop(writer);
     Ok(())
 }
 
@@ -3258,7 +3707,12 @@ fn tool_call_from_canonical_value(value: &serde_json::Value) -> Result<ToolCall,
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
-    Ok(ToolCall { name, arguments })
+    Ok(ToolCall {
+        id: None,
+        name,
+        arguments,
+        rendered_body: None,
+    })
 }
 
 /// Convert a retained legacy completion-boundary tool-call JSON value into
@@ -4171,7 +4625,7 @@ fn fold_complete_request_stream(
 fn complete_request_attempt(
     shared: &ServeShared,
     body: &serde_json::Value,
-    _guard: AdmissionGuard,
+    guard: AdmissionGuard,
     identity: &(String, u64),
     attempt_id: u64,
     force_reset: bool,
@@ -4190,100 +4644,118 @@ fn complete_request_attempt(
         .ok_or_else(|| anyhow!("model is required"))?
         .to_owned();
     let image_base64 = request_image_base64(body.get("messages"))?;
-    let mut runtime = shared
-        .runtime
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    // Attempt id is allocated by the retry driver before any cold reset /
-    // generate so reset ack, generate request, and the semantic fold share one
-    // wire id.
-    let resolved = runtime.ensure_model(&model, &shared.meta, None)?;
-    if force_reset || !runtime.cache_capable {
-        if let Err(error) = runtime.engine.reset(attempt_id) {
-            if force_reset {
-                // Rollback could not be attested: model state is unknown, so
-                // the next request must full-reload rather than trust it.
-                runtime.current_path = None;
-                runtime.current_max_seq = 0;
-                runtime.cache_capable = false;
+    // Acquire runtime, ensure model, and build the generate request while
+    // holding the lock. Clone the engine handle before dropping the lock so
+    // concurrent eligible requests can share the multiplexed transport.
+    let (generate, resolved, engine_clone) = {
+        let mut runtime = shared
+            .runtime
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        // Attempt id is allocated by the retry driver before any cold reset /
+        // generate so reset ack, generate request, and the semantic fold share one
+        // wire id.
+        let resolved = runtime.ensure_model(&model, &shared.meta, None)?;
+        if force_reset || (!runtime.cache_capable && !runtime.continuous_batch_capable) {
+            if let Err(error) = runtime.engine.reset(attempt_id) {
+                if force_reset {
+                    // Rollback could not be attested: model state is unknown, so
+                    // the next request must full-reload rather than trust it.
+                    runtime.current_path = None;
+                    runtime.current_arch = None;
+                    runtime.continuous_batch_capable = false;
+                    runtime.current_max_seq = 0;
+                    runtime.cache_capable = false;
+                }
+                return Err(error.into());
             }
-            return Err(error.into());
         }
-    }
-    let max_tokens = body
-        .get("max_tokens")
-        .or_else(|| body.get("max_completion_tokens"))
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(config_u64(&resolved, "generation.max_tokens")?);
-    let required_max_seq = max_tokens.saturating_add(1024);
-    if runtime.current_max_seq < required_max_seq {
-        runtime.ensure_model(&model, &shared.meta, Some(required_max_seq))?;
-    }
-    let mut normalized_messages = normalize_openai_messages(body.get("messages"));
-    let default_system = request_string(&resolved, "prompt.system", None)?;
-    inject_default_system_message(&mut normalized_messages, default_system.as_deref());
-    let mut generate = serde_json::json!({
-        "type": "generate",
-        "id": request_id(),
-        "prompt": last_user_prompt(&normalized_messages).unwrap_or_else(|| "Hello".into()),
-        "messages": normalized_messages,
-        "max_tokens": max_tokens,
-        "attempt_id": attempt_id,
-    });
-    if let Some(image) = image_base64 {
-        generate["image_base64"] = serde_json::Value::String(image);
-    }
-    for (key, config_key) in [
-        ("temperature", "generation.temperature"),
-        ("top_p", "generation.top_p"),
-        ("repeat_penalty", "generation.repeat_penalty"),
-    ] {
-        let explicit = body.get(key).and_then(serde_json::Value::as_f64);
-        insert_optional_f64(
-            &mut generate,
-            key,
-            request_f64(&resolved, config_key, explicit)?,
-        );
-    }
-    for name in [
-        "tools",
-        "tool_choice",
-        "frequency_penalty",
-        "stop",
-        "reasoning_effort",
-    ] {
-        if let Some(value) = body.get(name) {
-            generate[name] = value.clone();
+        let max_tokens = body
+            .get("max_tokens")
+            .or_else(|| body.get("max_completion_tokens"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(config_u64(&resolved, "generation.max_tokens")?);
+        if max_tokens == 0 || max_tokens > 393_216 {
+            bail!("max_tokens must be between 1 and 393216");
         }
-    }
-    if let Some(value) = body.get("top_k") {
-        generate["top_k"] = value.clone();
-    } else {
-        insert_optional_u64(
-            &mut generate,
-            "top_k",
-            request_u64(&resolved, "generation.top_k", None)?,
-        );
-    }
-    for (key, config_key) in [
-        ("min_p", "generation.min_p"),
-        ("presence_penalty", "generation.presence_penalty"),
-    ] {
-        if let Some(value) = body.get(key) {
-            generate[key] = value.clone();
-        } else {
+        let required_max_seq = max_tokens.saturating_add(1024);
+        if runtime.current_max_seq < required_max_seq {
+            runtime.ensure_model(&model, &shared.meta, Some(required_max_seq))?;
+        }
+        let include_reasoning_content = runtime.current_arch.as_deref() == Some("muse_glimmer");
+        let mut normalized_messages =
+            normalize_openai_messages(body.get("messages"), include_reasoning_content);
+        let default_system = request_string(&resolved, "prompt.system", None)?;
+        inject_default_system_message(&mut normalized_messages, default_system.as_deref());
+        let mut generate = serde_json::json!({
+            "type": "generate",
+            "id": request_id(),
+            "prompt": last_user_prompt(&normalized_messages).unwrap_or_else(|| "Hello".into()),
+            "messages": normalized_messages,
+            "max_tokens": max_tokens,
+            "attempt_id": attempt_id,
+        });
+        if let Some(image) = image_base64 {
+            generate["image_base64"] = serde_json::Value::String(image);
+        }
+        for (key, config_key) in [
+            ("temperature", "generation.temperature"),
+            ("top_p", "generation.top_p"),
+            ("repeat_penalty", "generation.repeat_penalty"),
+        ] {
+            let explicit = body.get(key).and_then(serde_json::Value::as_f64);
             insert_optional_f64(
                 &mut generate,
                 key,
-                request_f64(&resolved, config_key, None)?,
+                request_f64(&resolved, config_key, explicit)?,
             );
         }
-    }
-    apply_http_reasoning_request(body, &resolved, &mut generate)?;
+        for name in [
+            "tools",
+            "tool_choice",
+            "frequency_penalty",
+            "stop",
+            "reasoning_effort",
+        ] {
+            if let Some(value) = body.get(name) {
+                generate[name] = value.clone();
+            }
+        }
+        if let Some(value) = body.get("top_k") {
+            generate["top_k"] = value.clone();
+        } else {
+            insert_optional_u64(
+                &mut generate,
+                "top_k",
+                request_u64(&resolved, "generation.top_k", None)?,
+            );
+        }
+        for (key, config_key) in [
+            ("min_p", "generation.min_p"),
+            ("presence_penalty", "generation.presence_penalty"),
+        ] {
+            if let Some(value) = body.get(key) {
+                generate[key] = value.clone();
+            } else {
+                insert_optional_f64(
+                    &mut generate,
+                    key,
+                    request_f64(&resolved, config_key, None)?,
+                );
+            }
+        }
+        let deepseek4_effort_contract = runtime.current_arch.as_deref() == Some("deepseek4");
+        apply_http_reasoning_request(body, &resolved, &mut generate, deepseek4_effort_contract)?;
+        let (id, created) = identity.clone();
+        generate["id"] = serde_json::Value::String(id.clone());
+        generate["attempt_id"] = serde_json::json!(attempt_id);
+        if guard.is_eligible {
+            generate["serve_continuous_batch"] = serde_json::Value::Bool(true);
+        }
+        let engine_clone = runtime.engine.clone();
+        (generate, resolved, engine_clone)
+    };
     let (id, created) = identity.clone();
-    generate["id"] = serde_json::Value::String(id.clone());
-    generate["attempt_id"] = serde_json::json!(attempt_id);
-
     // Dual route gated by StreamContractGate:
     // - first event must be gen_start with matching request id + attempt_id
     // - contract_version is read only after correlation succeeds
@@ -4303,8 +4775,13 @@ fn complete_request_attempt(
         .pointer("/chat_template_kwargs/preserve_thinking")
         .and_then(serde_json::Value::as_bool)
         == Some(true);
+    let model_for_fold = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_owned();
 
-    let done = runtime.engine.generate(&generate, |event| {
+    let gen_result = engine_clone.generate(&generate, |event| {
         let event_type = event.get("type").and_then(serde_json::Value::as_str);
 
         // Staged terminal: commit_ready carries done fields with type != done.
@@ -4475,7 +4952,8 @@ fn complete_request_attempt(
             }
         }
         Ok(())
-    })?;
+    });
+    let done = gen_result?;
     let mut meta = shared
         .meta
         .lock()
@@ -4531,6 +5009,223 @@ fn complete_request_attempt(
 /// dropped with it); admission is re-acquired after the backoff, and a
 /// re-acquire failure surfaces the original error. The public completion id is
 /// allocated once and reused; attempt ids are distinct and monotonic.
+/// Serve one chat completion through the multi-slot engine.
+///
+/// Renders the chat messages with the model's frame, submits, and turns the
+/// engine's `Event`s into the same `{"type":"token","text":...}` events the
+/// SSE writer already consumes -- so streaming, terminal acks and the HTTP
+/// layer are all unchanged.
+fn complete_request_slots(
+    backend: &SlotBackend,
+    body: &serde_json::Value,
+    identity: &(String, u64),
+    event_callback: &mut dyn FnMut(&serde_json::Value) -> Result<(), hipfire_client::ClientError>,
+    terminal_callback: &mut dyn FnMut(&Completion) -> Result<(), hipfire_client::ClientError>,
+) -> Result<Completion> {
+    use hipfire_runtime::emit_text::{ThinkOutputRouter, ThinkRouteEvent};
+    use hipfire_runtime::prompt_frame::{AssistantPrefix, ChatFrame, Role};
+    use hipfire_runtime::serve::{Event, SubmitRequest};
+
+    let model = body
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .to_owned();
+    let max_tokens = body
+        .get("max_tokens")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(512) as usize;
+
+    // Messages -> the shape ChatFrame actually wants. This is not a free
+    // mapping: `build_multi_turn` PANICS on a System or Tool role inside the
+    // history, because system text belongs in `ChatFrame.system` and the final
+    // user turn in `ChatFrame.user`. History carries only the prior
+    // User/Assistant exchange.
+    let mut system: Option<String> = None;
+    let mut turns: Vec<(Role, String)> = Vec::new();
+    let Some(msgs) = body.get("messages").and_then(serde_json::Value::as_array) else {
+        bail!("messages is required");
+    };
+    for m in msgs {
+        let text = m
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        match m.get("role").and_then(serde_json::Value::as_str) {
+            Some("system") => {
+                // Multiple system messages concatenate, matching how the
+                // single-session path folds them.
+                match system.as_mut() {
+                    Some(existing) => {
+                        existing.push('\n');
+                        existing.push_str(&text);
+                    }
+                    None => system = Some(text),
+                }
+            }
+            Some("assistant") => turns.push((Role::Assistant, text)),
+            // A tool result reads as user-side context to the model.
+            Some("tool") => turns.push((Role::User, text)),
+            _ => turns.push((Role::User, text)),
+        }
+    }
+    // The final user turn is the prompt; everything before it is history.
+    let last_user = match turns.iter().rposition(|(r, _)| *r == Role::User) {
+        Some(i) => turns.remove(i).1,
+        None => bail!("messages must contain at least one user message"),
+    };
+    let history: Vec<(Role, &str)> = turns.iter().map(|(r, t)| (*r, t.as_str())).collect();
+    // A thinking model must be handed an OPEN <think> block, as the daemon's
+    // spec_assistant_prefix does. With Plain, the model has to emit `<think>`
+    // itself and instead loops on `</think>` and re-opens user turns.
+    let prefix = if backend.tokenizer.special_token_id("<think>").is_some() {
+        AssistantPrefix::OpenThink
+    } else {
+        AssistantPrefix::Plain
+    };
+    let frame = ChatFrame {
+        tokenizer: &backend.tokenizer,
+        system: system.as_deref(),
+        user: &last_user,
+        assistant_prefix: prefix,
+        raw: false,
+    };
+    let prompt_tokens = frame.build_multi_turn(&history);
+
+    // Conversation identity is the USER turns. The assistant side is whatever
+    // we generated, and the client's echo of it may differ (reasoning split to
+    // its own channel, whitespace, an edited message), so it cannot be part of
+    // the key.
+    fn turn_hash(s: &str) -> u64 {
+        let mut h = 0xcbf29ce484222325_u64;
+        for b in s.as_bytes() {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h
+    }
+    let mut convo: Vec<u64> = turns
+        .iter()
+        .filter(|(r, _)| *r == Role::User)
+        .map(|(_, t)| turn_hash(t))
+        .collect();
+    convo.push(turn_hash(&last_user));
+
+    // Tokens that continue the previous assistant turn into this user turn.
+    // The engine appends these to the session's exact stored tokens instead of
+    // re-rendering the history, which is what makes the result a strict
+    // extension of the KV. Only meaningful from turn 2 onwards.
+    let continuation = if convo.len() >= 2 {
+        hipfire_runtime::prompt_frame::continuation_suffix(&backend.tokenizer, &last_user, prefix)
+    } else {
+        Vec::new()
+    };
+
+    let (tx, rx) = mpsc::channel::<Event>();
+    backend
+        .engine
+        .submit(SubmitRequest {
+            session: None,
+            prompt_tokens,
+            convo,
+            continuation,
+            max_tokens,
+            reply: tx,
+        })
+        .map_err(|e| anyhow!("multi_slot submit: {e}"))?;
+
+    let mut content = String::new();
+    let mut reasoning_content = String::new();
+    let mut finish = "stop";
+
+    // Split <think> spans out of the visible answer. Without this the whole
+    // reasoning preamble lands in `content` -- a 4B answer arrives as ~2 KB of
+    // "Thinking Process: 1. **Analyze the Request**..." with reasoning_content
+    // empty. `started_in_think` is true because the prompt itself opened the
+    // block (AssistantPrefix::OpenThink above), so generation begins inside it
+    // and there is no opening marker in the generated stream to detect.
+    let mut think = ThinkOutputRouter::new(matches!(prefix, AssistantPrefix::OpenThink));
+    let mut routed: Vec<ThinkRouteEvent> = Vec::new();
+
+    let mut drain_routed = |routed: &mut Vec<ThinkRouteEvent>,
+                            content: &mut String,
+                            reasoning_content: &mut String,
+                            cb: &mut dyn FnMut(
+        &serde_json::Value,
+    ) -> Result<(), hipfire_client::ClientError>| {
+        for ev in routed.drain(..) {
+            match ev {
+                ThinkRouteEvent::Content(text) => {
+                    content.push_str(&text);
+                    let _ = cb(&serde_json::json!({ "type": "token", "text": text }));
+                }
+                ThinkRouteEvent::Reasoning(text) => {
+                    reasoning_content.push_str(&text);
+                    let _ = cb(&serde_json::json!({ "type": "reasoning", "text": text }));
+                }
+            }
+        }
+    };
+
+    while let Ok(ev) = rx.recv() {
+        match ev {
+            Event::Accepted { .. } => {}
+            Event::Token { id } => {
+                let text = backend.tokenizer.decode(&[id]);
+                if !text.is_empty() {
+                    think.push_into(&text, &mut routed);
+                    drain_routed(
+                        &mut routed,
+                        &mut content,
+                        &mut reasoning_content,
+                        event_callback,
+                    );
+                }
+            }
+            Event::Done { reason } => {
+                finish = match reason {
+                    hipfire_runtime::serve::DoneReason::MaxTokens => "length",
+                    _ => "stop",
+                };
+                break;
+            }
+            Event::Rejected { reason } => {
+                // Saturation is a real, expected answer here, not a crash: all
+                // slots busy means the caller should retry, not that anything
+                // failed.
+                bail!("multi_slot rejected: {reason}");
+            }
+        }
+    }
+
+    // Flush any trailing partial marker as ordinary text in its channel.
+    think.finish_into(&mut routed);
+    drain_routed(
+        &mut routed,
+        &mut content,
+        &mut reasoning_content,
+        event_callback,
+    );
+
+    let completion = Completion {
+        id: identity.0.clone(),
+        created: identity.1,
+        model,
+        content,
+        reasoning_content,
+        preserve_thinking: false,
+        tool_calls: Vec::new(),
+        done: serde_json::json!({ "finish_reason": finish }),
+    };
+    // The terminal callback is what stages the response body and signals the
+    // HTTP handler that the request succeeded. Skipping it leaves the handler
+    // waiting on a status that never arrives, which surfaces to the client as
+    // "generation worker disconnected".
+    terminal_callback(&completion).map_err(|e| anyhow!("terminal callback: {e}"))?;
+    Ok(completion)
+}
+
 fn complete_request(
     shared: &ServeShared,
     body: &serde_json::Value,
@@ -4540,6 +5235,22 @@ fn complete_request(
     mut terminal_callback: impl FnMut(&Completion) -> Result<(), hipfire_client::ClientError>,
 ) -> Result<Completion> {
     let identity = request_identity.unwrap_or_else(|| (request_id(), unix_timestamp()));
+
+    // Concurrent path. Takes no `shared.runtime` lock, which is the entire
+    // point: that mutex is what makes concurrent callers queue today. The
+    // retry/attempt machinery below is for the daemon Engine's cold-reset
+    // semantics and has no analogue here -- the engine either admits a request
+    // or rejects it with a reason.
+    if let Some(backend) = shared.slot_engine.clone() {
+        return complete_request_slots(
+            &backend,
+            body,
+            &identity,
+            &mut event_callback,
+            &mut terminal_callback,
+        );
+    }
+
     let mut attempt_index = 1u32;
     let mut guard = guard;
     loop {
@@ -4643,6 +5354,51 @@ fn forward_think_fragments(
     Ok(())
 }
 
+fn should_prewarm_qwen_mq4r_decode(
+    path: &Path,
+    loaded: &serde_json::Value,
+    tp: Option<u64>,
+) -> bool {
+    let qwen = loaded
+        .get("arch")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|arch| arch.starts_with("qwen3_5"));
+    let mq4r = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("mq4r"));
+    qwen && mq4r && tp.unwrap_or(1) == 1
+}
+
+fn prewarm_qwen_mq4r_decode(engine: &mut Engine) -> Result<()> {
+    let response = engine.request(&serde_json::json!({
+        "type": "bench_decode",
+        "context_tokens": 64,
+        "iterations": 32,
+    }))?;
+    match response.get("type").and_then(serde_json::Value::as_str) {
+        Some("decode_result") => {
+            let tok_s = response
+                .get("tok_s")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.0);
+            eprintln!("[hipfire] pre-warmed Qwen MQ4R decode route ({tok_s:.1} tok/s)");
+            Ok(())
+        }
+        Some("error") => bail!(
+            "Qwen MQ4R decode pre-warm failed: {}",
+            response
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("daemon returned an unspecified error")
+        ),
+        other => bail!(
+            "Qwen MQ4R decode pre-warm expected decode_result, received {}",
+            other.unwrap_or("missing type")
+        ),
+    }
+}
+
 impl ServeRuntime {
     fn ensure_model(
         &mut self,
@@ -4685,16 +5441,28 @@ impl ServeRuntime {
             if let Some(tp) = self.tp {
                 params["tp"] = serde_json::json!(tp);
             }
+            params["continuous_batch_size"] = serde_json::json!(self.continuous_batch_size);
             let loaded_max_seq = params["max_seq"].as_u64().unwrap_or(0);
             if minimum_max_seq.is_some() {
                 eprintln!("[hipfire] bumping load max_seq to {loaded_max_seq} for request budget");
             }
             let loaded = self.engine.load(&path, params)?;
+            if should_prewarm_qwen_mq4r_decode(&path, &loaded, self.tp) {
+                prewarm_qwen_mq4r_decode(&mut self.engine)?;
+            }
             self.cache_capable = loaded
                 .get("cache_capable")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
             self.current_path = Some(path);
+            self.current_arch = loaded
+                .get("arch")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            self.continuous_batch_capable = loaded
+                .get("continuous_batch_capable")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
             self.current_max_seq = loaded_max_seq;
             meta.lock()
                 .unwrap_or_else(|error| error.into_inner())
@@ -4780,23 +5548,56 @@ fn inline_thinking(text: &str) -> Option<String> {
     (!reasoning.is_empty()).then(|| reasoning.to_owned())
 }
 
-fn normalize_openai_tool_call(call: &serde_json::Value) -> serde_json::Value {
+fn normalize_openai_tool_call(
+    call: &serde_json::Value,
+    include_reasoning_content: bool,
+) -> serde_json::Value {
     let function = call.get("function").unwrap_or(call);
     let name = function
         .get("name")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("unknown");
+    let id = call
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty());
     let arguments = match function.get("arguments") {
         Some(serde_json::Value::String(raw)) => {
-            serde_json::from_str(raw).unwrap_or_else(|_| serde_json::json!({ "_raw": raw }))
+            match serde_json::from_str::<serde_json::Value>(raw) {
+                // Muse Glimmer's Onyx template requires a MAPPING and calls `raise_exception`
+                // otherwise, which would take the whole render down to a bare unframed prompt.
+                // Surface a parsed-but-not-object payload as the raw string so the daemon's
+                // `normalize_glimmer_tool_arguments` can refuse the request loudly instead.
+                Ok(parsed) if include_reasoning_content && !parsed.is_object() => {
+                    serde_json::Value::String(raw.clone())
+                }
+                // Every other architecture keeps whatever parsed — an array or scalar argument
+                // payload is legal for them, and `_raw`-wrapping it here would invent a tool
+                // parameter the model never saw. This arm is load-bearing for no-clobber.
+                Ok(parsed) => parsed,
+                Err(_) => {
+                    if include_reasoning_content {
+                        serde_json::Value::String(raw.clone())
+                    } else {
+                        serde_json::json!({ "_raw": raw })
+                    }
+                }
+            }
         }
         Some(value) => value.clone(),
         None => serde_json::json!({}),
     };
-    serde_json::json!({ "name": name, "arguments": arguments })
+    let mut obj = serde_json::json!({ "name": name, "arguments": arguments });
+    if let Some(id_str) = id {
+        obj["id"] = serde_json::Value::String(id_str.to_owned());
+    }
+    obj
 }
 
-fn normalize_openai_messages(messages: Option<&serde_json::Value>) -> serde_json::Value {
+fn normalize_openai_messages(
+    messages: Option<&serde_json::Value>,
+    include_reasoning_content: bool,
+) -> serde_json::Value {
     let Some(messages) = messages.and_then(serde_json::Value::as_array) else {
         return serde_json::json!([]);
     };
@@ -4832,6 +5633,9 @@ fn normalize_openai_messages(messages: Option<&serde_json::Value>) -> serde_json
                     .map(str::to_owned)
                     .or_else(|| inline_thinking(&raw_content));
                 if let Some(reasoning) = reasoning {
+                    if include_reasoning_content {
+                        entry["reasoning_content"] = serde_json::Value::String(reasoning.clone());
+                    }
                     entry["tool_plan"] = serde_json::Value::String(reasoning);
                 }
                 if let Some(calls) = message
@@ -4840,7 +5644,10 @@ fn normalize_openai_messages(messages: Option<&serde_json::Value>) -> serde_json
                     .filter(|calls| !calls.is_empty())
                 {
                     entry["tool_calls"] = serde_json::Value::Array(
-                        calls.iter().map(normalize_openai_tool_call).collect(),
+                        calls
+                            .iter()
+                            .map(|c| normalize_openai_tool_call(c, include_reasoning_content))
+                            .collect(),
                     );
                 }
             } else if role == "tool" {
@@ -4850,6 +5657,13 @@ fn normalize_openai_messages(messages: Option<&serde_json::Value>) -> serde_json
                     .filter(|id| !id.is_empty())
                 {
                     entry["tool_call_id"] = serde_json::Value::String(tool_call_id.to_owned());
+                }
+                if let Some(name) = message
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|n| !n.is_empty())
+                {
+                    entry["name"] = serde_json::Value::String(name.to_owned());
                 }
             }
             Some(entry)
@@ -4948,11 +5762,7 @@ fn completion_json(completion: &Completion) -> serde_json::Value {
         }],
         "usage": completion_usage(completion),
         "timings": completion_timings(completion),
-        "hipfire": {
-            "tok_s": completion.done.get("tok_s"),
-            "prefill_tok_s": completion.done.get("prefill_tok_s"),
-            "decode_tok_s": completion.done.get("decode_tok_s"),
-        }
+        "hipfire": completion_hipfire(completion),
     })
 }
 
@@ -4995,10 +5805,32 @@ fn completion_timings(completion: &Completion) -> serde_json::Value {
         "prefill_ms": done.get("prefill_ms"),
         "prefill_tok_s": done.get("prefill_tok_s"),
         "decode_tok_s": done.get("decode_tok_s").or_else(|| done.get("tok_s")),
+        "latency_ms": done.get("latency_ms"),
         "tau": done.get("tau"),
         "cycles": done.get("cycles"),
         "dflash": done.get("dflash"),
         "mtp": done.get("mtp"),
+        "mtp_ngram": done.get("mtp_ngram"),
+        "ngram_mod_windows": done.get("ngram_mod_windows"),
+        "ngram_mod_drafts": done.get("ngram_mod_drafts"),
+        "ngram_mod_accepted": done.get("ngram_mod_accepted"),
+        "ngram_mod_accept_rate": done.get("ngram_mod_accept_rate"),
+        "mtp_windows": done.get("mtp_windows"),
+        "ar_windows": done.get("ar_windows"),
+        "mtp_retired": done.get("mtp_retired"),
+        "mtp_window_timings": done.get("mtp_window_timings"),
+    })
+}
+
+/// Shared hipfire evidence projection for normal and streaming terminals.
+fn completion_hipfire(completion: &Completion) -> serde_json::Value {
+    let done = &completion.done;
+    serde_json::json!({
+        "tok_s": done.get("tok_s"),
+        "prefill_tok_s": done.get("prefill_tok_s"),
+        "decode_tok_s": done.get("decode_tok_s"),
+        "execution_mode": done.get("execution_mode"),
+        "continuous_batch": done.get("continuous_batch"),
     })
 }
 
@@ -5126,6 +5958,7 @@ fn openai_stream_terminal_chunks(
         "model": completion.model,
         "choices": [{ "index": 0, "delta": {}, "finish_reason": finish_reason }],
         "timings": completion_timings(completion),
+        "hipfire": completion_hipfire(completion),
     }));
 
     if include_usage {
@@ -5236,6 +6069,7 @@ fn finish_sse_stream(sender: mpsc::Sender<ResponseChunk>, result: Result<Complet
                 drop(sender);
                 return;
             }
+            eprintln!("[hipfire] streaming completion failed: {error:#}");
             // Unclean failure: poison the reader instead of framing success/error.
             let _ = sender.send(ResponseChunk {
                 bytes: Vec::new(),
@@ -5613,18 +6447,14 @@ fn resolved_for_model(
 ) -> Result<hipfire_config::ResolvedConfig> {
     let loaded = load_global(&paths.config)?;
     let mut layers = Vec::new();
-    if let (Some(tag), Some(settings)) = (
-        tag,
-        entry.and_then(|entry| entry.recommended_settings.as_ref()),
-    ) {
+    if let (Some(tag), Some(entry)) = (tag, entry) {
         layers.push(NamedLayer {
             source: ConfigSource::RegistryModel {
                 tag: tag.to_owned(),
                 revision: "v1".into(),
             },
-            layer: settings
-                .config_layer()
-                .map_err(|error| anyhow!("invalid registry recommendations: {error}"))?,
+            layer: hipfire_registry::config_layer_for_tag(tag, entry)
+                .map_err(|error| anyhow!("invalid registry model defaults: {error}"))?,
         });
     }
     layers.push(NamedLayer {
@@ -5734,10 +6564,11 @@ fn load_params(
     field("memory.kv_cache")
         .expect("schema field")
         .parse_cli(&kv_mode)?;
+    let configured_backend = config_string(resolved, "memory.kv_backend")?;
     let kv_backend = kv_backend_override
         .map(str::to_owned)
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "contiguous".into())
+        .unwrap_or(configured_backend)
         .to_ascii_lowercase();
     if !matches!(kv_backend.as_str(), "contiguous" | "vmm") {
         bail!("--kv-backend must be contiguous or vmm");
@@ -5756,6 +6587,10 @@ fn load_params(
     }
     let mut params = serde_json::json!({
         "max_seq": max_seq,
+        "deepseek4_compute_placement": config_string(
+            resolved,
+            "hardware.deepseek4_compute_placement",
+        )?,
         "kv_mode": kv_mode,
         "kv_backend": kv_backend,
         "kv_adaptive": config_string(resolved, "memory.kv_adaptive")?,
@@ -5772,6 +6607,7 @@ fn load_params(
         "cask": config_bool(resolved, "memory.cask.enabled")?,
         "cask_budget": config_u64(resolved, "memory.cask.budget")?,
         "cask_beta": config_u64(resolved, "memory.cask.beta")?,
+        "cask_handoff_tokens": config_u64(resolved, "memory.cask.handoff_tokens")?,
         "cask_core_frac": config_f64(resolved, "memory.cask.core_fraction")?,
         "cask_fold_m": config_u64(resolved, "memory.cask.fold")?,
         "prefill_compression": config_string(resolved, "speculation.prefill.mode")?,
@@ -5786,7 +6622,13 @@ fn load_params(
         "prefill_drafter_device": config_i64(resolved, "speculation.prefill.drafter_device")?,
         "prefill_sparse_threshold": config_u64(resolved, "speculation.prefill.sparse_threshold")?,
         "speculation": config_string(resolved, "speculation.mode")?,
+        "continuous_batch_size": config_u64(resolved, "serve.continuous_batch_size")?,
     });
+    if let Some(experts_per_token) =
+        config_optional_u64(resolved, "model.deepseek4_experts_per_token")?
+    {
+        params["deepseek4_experts_per_token"] = serde_json::json!(experts_per_token);
+    }
     let selector = config_string(resolved, "speculation.mode")?;
     apply_speculation_selector(&mut params, &selector)?;
     project_dflash_draft(&mut params, developer_dflash_draft(resolved));
@@ -5903,6 +6745,18 @@ fn apply_reasoning_request(
         }
     };
     request["max_think_tokens"] = serde_json::json!(max_think);
+    match config_string(resolved, "reasoning.effort")?.as_str() {
+        "auto" => {}
+        "none" => {
+            request["max_think_tokens"] = serde_json::json!(1);
+            request["assistant_prefix"] = serde_json::json!("closed_think");
+            request["reasoning_effort"] = serde_json::json!("none");
+        }
+        effort @ ("low" | "medium" | "high" | "max" | "xhigh") => {
+            request["reasoning_effort"] = serde_json::json!(effort);
+        }
+        effort => bail!("unknown reasoning effort '{effort}'"),
+    }
     Ok(())
 }
 
@@ -5910,6 +6764,7 @@ fn apply_http_reasoning_request(
     body: &serde_json::Value,
     resolved: &hipfire_config::ResolvedConfig,
     request: &mut serde_json::Value,
+    deepseek4_effort_contract: bool,
 ) -> Result<()> {
     let thinking_disabled = body
         .pointer("/chat_template_kwargs/enable_thinking")
@@ -5928,20 +6783,76 @@ fn apply_http_reasoning_request(
         request["reasoning_effort"] = serde_json::json!("none");
         return Ok(());
     }
+    // Thinking is ON from here down (config default, or explicit
+    // enable_thinking=true / reasoning effort >= minimal). OPEN the <think>
+    // block so the model actually reasons instead of emitting an empty
+    // <think></think> and answering directly.
+    //
+    // Only the thinking-OFF cases above used to set assistant_prefix; the ON
+    // path set none, so the daemon fell back to plain framing and generic
+    // OpenAI clients -- which never send assistant_prefix -- silently got
+    // no-think behaviour. On Qwen3.6 that reasons in plain prose and derails
+    // (LiveBench reasoning ~0).
+    //
+    // This was fixed in the TypeScript CLI in June 2026 (98c65020) and lost
+    // when the CLI was rewritten in Rust: that commit edits cli/index.ts,
+    // which no longer exists, so the fix cannot be cherry-picked -- only
+    // re-applied here.
+    //
+    // Safe for non-thinking models: the daemon's prompt frame falls back to
+    // Plain when the tokenizer has no `<think>` special token.
+    request["assistant_prefix"] = serde_json::json!("open_think");
     if let Some(effort) = effort {
-        let max_think = match effort {
-            "minimal" => 64,
-            "low" => 256,
-            "medium" | "med" => 1024,
-            "high" => 4096,
-            "xhigh" | "max" | "uncapped" => 0,
+        if !deepseek4_effort_contract {
+            let max_think = match effort {
+                "minimal" => 64,
+                "low" => 256,
+                "medium" | "med" => 1024,
+                "high" => 4096,
+                "xhigh" | "max" | "uncapped" => 0,
+                other => bail!("unknown reasoning effort '{other}'"),
+            };
+            request["max_think_tokens"] = serde_json::json!(max_think);
+            request["reasoning_effort"] = serde_json::json!(effort);
+            return Ok(());
+        }
+        let normalized = match effort {
+            "minimal" | "medium" | "med" | "low" => "low",
+            "high" => "high",
+            "xhigh" | "max" | "uncapped" => "max",
             other => bail!("unknown reasoning effort '{other}'"),
         };
-        request["max_think_tokens"] = serde_json::json!(max_think);
-        request["reasoning_effort"] = serde_json::json!(effort);
+        let explicit_cap = body
+            .get("max_think_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        if explicit_cap > 393_216 {
+            bail!("max_think_tokens must be between 0 and 393216");
+        }
+        // Effort selects the parent model's prompt semantics. It never invents
+        // a hipfire token cap; absent an explicit cap, 0 means uncapped.
+        request["max_think_tokens"] = serde_json::json!(explicit_cap);
+        request["reasoning_effort"] = serde_json::json!(normalized);
         return Ok(());
     }
-    apply_reasoning_request(resolved, request)
+    apply_reasoning_request(resolved, request)?;
+    if deepseek4_effort_contract
+        && request
+            .get("reasoning_effort")
+            .and_then(serde_json::Value::as_str)
+            != Some("none")
+    {
+        if let Some(explicit_cap) = body
+            .get("max_think_tokens")
+            .and_then(serde_json::Value::as_u64)
+        {
+            if explicit_cap > 393_216 {
+                bail!("max_think_tokens must be between 0 and 393216");
+            }
+            request["max_think_tokens"] = serde_json::json!(explicit_cap);
+        }
+    }
+    Ok(())
 }
 
 fn config_value<'a>(
@@ -5978,6 +6889,22 @@ fn config_i64(resolved: &hipfire_config::ResolvedConfig, key: &str) -> Result<i6
 fn config_u64(resolved: &hipfire_config::ResolvedConfig, key: &str) -> Result<u64> {
     let value = config_i64(resolved, key)?;
     u64::try_from(value).map_err(|_| anyhow!("{key} cannot be negative"))
+}
+
+fn config_optional_u64(
+    resolved: &hipfire_config::ResolvedConfig,
+    key: &str,
+) -> Result<Option<u64>> {
+    match config_value(resolved, key)? {
+        hipfire_config::ConfigValue::Null => Ok(None),
+        hipfire_config::ConfigValue::Integer(value) => u64::try_from(*value)
+            .map(Some)
+            .map_err(|_| anyhow!("{key} cannot be negative")),
+        value => bail!(
+            "{key} resolved as {}, expected integer or null",
+            value.kind()
+        ),
+    }
 }
 
 fn config_f64(resolved: &hipfire_config::ResolvedConfig, key: &str) -> Result<f64> {
@@ -6214,6 +7141,16 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
     if args.exp && args.json {
         bail!("--json is not supported with --exp");
     }
+    // --exp runs a fixed 128-token protocol across five RDNA2 variants and
+    // ignores --max-tokens, so it can never give a think span room to close.
+    // Reject the combination rather than silently drop the flag and abort
+    // later on an open-think terminal.
+    if args.exp && args.reasoning_on {
+        bail!("--reasoning-on is not supported with --exp (its token budget is fixed at 128)");
+    }
+    if let Some(spec) = args.concurrency.clone() {
+        return bench_concurrency_command(paths, &args, &spec);
+    }
     for (name, values) in [
         ("--pp", &args.pp),
         ("--ctx", &args.ctx),
@@ -6227,9 +7164,17 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
         bail!("decode lengths must be positive");
     }
     if let Some(mode) = args.kv_mode.as_deref() {
-        if !matches!(mode, "q8" | "fwht2" | "fwht3" | "fwht4") {
-            bail!("--kv-mode must be q8, fwht2, fwht3, or fwht4");
-        }
+        // Validate against the canonical `memory.kv_cache` schema instead of a
+        // local subset. The old hardcoded list accepted only q8/fwht{2,3,4} and
+        // so rejected `f32`/`f16` — the only KV formats DeepSeek V4 implements,
+        // and precisely what the loader tells you to pass when it falls back
+        // ("Pass --kv f32 for the golden configuration"). That made the advised
+        // configuration unreachable through `bench`.
+        let field = hipfire_config::field("memory.kv_cache")
+            .ok_or_else(|| anyhow!("missing memory.kv_cache configuration field"))?;
+        field
+            .validate(&hipfire_config::ConfigValue::String(mode.to_owned()))
+            .map_err(|err| anyhow!("--kv-mode {mode}: {err}"))?;
     }
 
     if args.exp {
@@ -6258,16 +7203,26 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
             .unwrap_or("unknown")
     );
     eprintln!("  runs:   {}", args.runs);
+    eprintln!("  max_tokens: {}", args.max_tokens);
     if args.matrix || args.redline {
         bench_matrix(&mut engine, &args, &loaded, &post_diag)
     } else {
+        // The warmup exists to populate kernel caches and its output is
+        // discarded, so it stays in answer mode even under --reasoning-on: a
+        // 16-token budget cannot close a think span, and letting the warmup
+        // think would abort the run before a single measured sample.
         let _ = bench_generate(&mut engine, "Hello", 16)?;
         let mut decode = Vec::new();
         let mut prefill = Vec::new();
         let mut wall = Vec::new();
         let mut ttft = Vec::new();
         for _ in 0..args.runs {
-            let done = bench_generate(&mut engine, &prompt, 128)?;
+            let done = bench_generate_with_reasoning(
+                &mut engine,
+                &prompt,
+                args.max_tokens as u64,
+                args.reasoning_on,
+            )?;
             if let Some(value) = done.get("decode_tok_s").and_then(serde_json::Value::as_f64) {
                 decode.push(value);
             }
@@ -6293,6 +7248,9 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
             "loaded": loaded,
             "gpu": post_diag,
             "vram_free_before_mb": pre_diag.get("vram_free_mb"),
+            "max_tokens": args.max_tokens,
+            "runs": args.runs,
+            "batch": 1,
             "decode_tok_s": sample_stats(&decode),
             "prefill_tok_s": sample_stats(&prefill),
             "wall_tok_s": sample_stats(&wall),
@@ -6309,6 +7267,182 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
         }
         Ok(())
     }
+}
+
+/// Concurrency sweep across both concurrent backends. Only reached when
+/// `--concurrency` is given; the single-stream path above is untouched.
+fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Result<()> {
+    use crate::bench_concurrency::{
+        parse_concurrency, render_table, sweep_backend, BackendSel, ConcurrencyBackend,
+        DaemonDriver, Point, SequentialDriver, SlotDriver, WorkloadSel,
+    };
+
+    let points = parse_concurrency(spec)?;
+    let max_k = *points.iter().max().expect("non-empty");
+    let backend_sel = match args.backend.as_str() {
+        "slots" => BackendSel::Slots,
+        "noslots" => BackendSel::Sequential,
+        "batch" => BackendSel::Batch,
+        _ => BackendSel::Both,
+    };
+    let arms: Vec<WorkloadSel> = match args.workload.as_str() {
+        "stateless" => vec![WorkloadSel::Stateless],
+        "multiturn" => vec![WorkloadSel::Multiturn],
+        _ => vec![WorkloadSel::Stateless, WorkloadSel::Multiturn],
+    };
+
+    eprintln!("hipfire bench — concurrency sweep");
+    eprintln!("  model:       {}", args.model);
+    eprintln!("  concurrency: {points:?}");
+    eprintln!("  runs/point:  {}", args.runs);
+    eprintln!("  max_tokens:  {}", args.max_tokens);
+
+    let mut out: Vec<Point> = Vec::new();
+
+    // The two backends run STRICTLY SEQUENTIALLY, and the scope below is what
+    // enforces it. Each holds a full copy of the model's weights -- 18.7 GB for
+    // a 35B-A3B mq4r -- so overlapping them doubles resident footprint. On a
+    // box with no swap that is not "slower", it is an OOM kill. `SlotEngine`'s
+    // Drop closes its channel and joins the worker thread that owns the Gpu,
+    // weights and KV arenas, so leaving this scope is what actually frees the
+    // first model before the daemon loads the second.
+    if matches!(backend_sel, BackendSel::Slots | BackendSel::Both) {
+        let registry = load_registry(&paths.registry).registry;
+        let model_path = find_model_path(paths, &registry, &args.model)
+            .ok_or_else(|| anyhow!("model not found: {}", args.model))?;
+        // 2048-token slots, not the serve default of 8192: the sweep's prompts
+        // are one short turn and --max-tokens is small, so a larger arena buys
+        // nothing and multiplies per-slot KV by four.
+        match SlotDriver::start(&model_path, max_k, 2048) {
+            Ok(mut d) => {
+                eprintln!("  slots backend up ({max_k} slots)");
+                let r = sweep_backend(
+                    &mut d as &mut dyn ConcurrencyBackend,
+                    &arms,
+                    &points,
+                    args.runs,
+                    args.max_tokens as u64,
+                    &mut out,
+                );
+                // Free the weights before the batch backend loads its own copy,
+                // even on the error path.
+                drop(d);
+                r?;
+            }
+            // A backend that cannot run this model is a RESULT, not a crash.
+            Err(e) => eprintln!("  slots backend unavailable: {e}"),
+        }
+    }
+
+    // No-slots baseline: k requests one after another through the ordinary
+    // daemon path. Runs after the slots engine has been dropped, so only one
+    // copy of the weights is ever resident.
+    if matches!(backend_sel, BackendSel::Sequential | BackendSel::Both) {
+        preflight_headroom_for_model(paths, &args.model)?;
+        let mut seq_args = args.clone();
+        seq_args.concurrency = None;
+        let (engine, _, _, _) = open_bench_engine(paths, &seq_args, None)?;
+        let mut d = SequentialDriver::start(engine, max_k)?;
+        eprintln!("  noslots backend up (sequential daemon path)");
+        let r = sweep_backend(
+            &mut d as &mut dyn ConcurrencyBackend,
+            &arms,
+            &points,
+            args.runs,
+            args.max_tokens as u64,
+            &mut out,
+        );
+        drop(d);
+        r?;
+    }
+
+    if matches!(backend_sel, BackendSel::Batch | BackendSel::Both) {
+        preflight_headroom_for_model(paths, &args.model)?;
+        let mut batch_args = args.clone();
+        batch_args.concurrency = None;
+        let (engine, loaded, _, _) = open_bench_engine_batched(paths, &batch_args, max_k)?;
+        let capable = loaded
+            .get("continuous_batch_capable")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        match DaemonDriver::start(engine, max_k, capable) {
+            Ok(mut d) => {
+                eprintln!("  batch backend up (continuous_batch_size={max_k})");
+                sweep_backend(
+                    &mut d as &mut dyn ConcurrencyBackend,
+                    &arms,
+                    &points,
+                    args.runs,
+                    args.max_tokens as u64,
+                    &mut out,
+                )?;
+            }
+            Err(e) => eprintln!("  batch backend unavailable: {e}"),
+        }
+    }
+
+    println!("{}", render_table(&out));
+    Ok(())
+}
+
+/// Refuse to load a model that will not fit in available host memory.
+///
+/// The GPU allocates from system RAM on this class of box and there is no
+/// swap, so an overcommit is an OOM kill of the whole machine rather than a
+/// slow run. Checked between the two backends because that is precisely where
+/// a leaked first model would show up: if the slots engine did not actually
+/// release its weights, `MemAvailable` is still depressed here and this stops
+/// the sweep instead of taking the box down.
+fn preflight_headroom_for_model(paths: &Paths, model: &str) -> Result<()> {
+    let registry = load_registry(&paths.registry).registry;
+    let Some(path) = find_model_path(paths, &registry, model) else {
+        return Ok(());
+    };
+    let Ok(meta) = std::fs::metadata(&path) else {
+        return Ok(());
+    };
+    let need = meta.len();
+    let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") else {
+        return Ok(());
+    };
+    let avail_kb = meminfo
+        .lines()
+        .find_map(|l| l.strip_prefix("MemAvailable:"))
+        .and_then(|v| v.split_whitespace().next())
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    let avail = avail_kb * 1024;
+    // 20% headroom over the raw weight bytes for KV arenas and scratch.
+    let want = need + need / 5;
+    if avail < want {
+        bail!(
+            "refusing to load {}: needs ~{:.1} GB with headroom, only {:.1} GB available. \
+             A previous backend may not have released its weights.",
+            path.display(),
+            want as f64 / 1e9,
+            avail as f64 / 1e9
+        );
+    }
+    Ok(())
+}
+
+/// `open_bench_engine`, but loading with `continuous_batch_size` set so the
+/// daemon allocates batch lanes and advertises `continuous_batch_capable`.
+/// The value is fixed per load, which is why the sweep holds it at max.
+fn open_bench_engine_batched(
+    paths: &Paths,
+    args: &BenchArgs,
+    batch_size: usize,
+) -> Result<(
+    Engine,
+    serde_json::Value,
+    serde_json::Value,
+    serde_json::Value,
+)> {
+    std::env::set_var("HIPFIRE_BENCH_CONTINUOUS_BATCH", batch_size.to_string());
+    let r = open_bench_engine(paths, args, None);
+    std::env::remove_var("HIPFIRE_BENCH_CONTINUOUS_BATCH");
+    r
 }
 
 fn open_bench_engine(
@@ -6378,18 +7512,51 @@ fn open_bench_engine(
         args.kv_mode.as_deref(),
         args.kv_backend.as_deref(),
     )?;
+    if let Some(selector) = args.speculation.as_deref() {
+        apply_speculation_selector(&mut params, selector)?;
+    }
     if args.matrix || args.redline {
         let requested = longest_prefill.max(longest_decode).saturating_add(32);
         let configured = params["max_seq"].as_u64().unwrap_or(0);
         params["max_seq"] = serde_json::json!(configured.max(requested));
+    }
+    if let Ok(n) = std::env::var("HIPFIRE_BENCH_CONTINUOUS_BATCH") {
+        if let Ok(n) = n.parse::<u64>() {
+            params["continuous_batch_size"] = serde_json::json!(n);
+        }
     }
     let loaded = engine.load(&path, params)?;
     let post_diag = engine.request(&serde_json::json!({ "type": "diag" }))?;
     Ok((engine, loaded, pre_diag, post_diag))
 }
 
+/// The standard benchmark generate: greedy, fixed budget, and **answer mode**.
+///
+/// Answer mode is the default rather than an opt-in because a benchmark that
+/// lets the model think cannot complete. A reasoning model (any Qwen3.6 SKU,
+/// for one) opens `<think>` within its first tokens and has no chance of
+/// closing it inside the benchmark's budget — 16 tokens for the warmup, 128
+/// for a measured run. The daemon ranks an unclosed think span at finish above
+/// the length cap in both terminal classifiers (`QwenArTerminalCause::resolve`
+/// and `qwen_dflash_wire_terminal`), so it reports the truncation as a
+/// non-retryable validation error rather than `finish_reason=length`. The
+/// benchmark then aborts on the warmup generate, before recording a sample.
+///
+/// Benchmarks measure tokens per second and never read the text, so asking for
+/// answer mode costs nothing and removes the dependency on the model finishing
+/// a thought inside an arbitrary budget. `--reasoning-on` restores the
+/// thinking turn for anyone who wants to measure that path — with a budget
+/// large enough to close the span.
 fn bench_generate_request(prompt: &str, max_tokens: u64) -> serde_json::Value {
-    serde_json::json!({
+    bench_generate_request_reasoning(prompt, max_tokens, false)
+}
+
+fn bench_generate_request_reasoning(
+    prompt: &str,
+    max_tokens: u64,
+    reasoning_on: bool,
+) -> serde_json::Value {
+    let mut request = serde_json::json!({
         "type": "generate",
         "id": request_id(),
         "prompt": prompt,
@@ -6398,14 +7565,27 @@ fn bench_generate_request(prompt: &str, max_tokens: u64) -> serde_json::Value {
         "repeat_penalty": 1.1,
         "max_tokens": max_tokens,
         "attempt_id": 1,
-    })
+    });
+    if !reasoning_on {
+        request["max_think_tokens"] = serde_json::json!(1);
+        request["assistant_prefix"] = serde_json::json!("closed_think");
+        request["reasoning_effort"] = serde_json::json!("none");
+    }
+    request
 }
 
 fn bench_generate(engine: &mut Engine, prompt: &str, max_tokens: u64) -> Result<serde_json::Value> {
-    Ok(engine.generate(
-        &bench_generate_request(prompt, max_tokens),
-        |_| Ok(()),
-    )?)
+    Ok(engine.generate(&bench_generate_request(prompt, max_tokens), |_| Ok(()))?)
+}
+
+fn bench_generate_with_reasoning(
+    engine: &mut Engine,
+    prompt: &str,
+    max_tokens: u64,
+    reasoning_on: bool,
+) -> Result<serde_json::Value> {
+    let request = bench_generate_request_reasoning(prompt, max_tokens, reasoning_on);
+    Ok(engine.generate(&request, |_| Ok(()))?)
 }
 
 fn bench_probe(
@@ -6608,12 +7788,18 @@ fn profile_command(paths: &Paths, args: ProfileArgs) -> Result<()> {
             pp: vec![128],
             ctx: vec![128],
             tg: 1,
+            max_tokens: 128,
             sustained_tg: None,
             sustained_ctx: vec![128],
             warmups: 1,
             kv_mode: None,
             kv_backend: None,
             redline: false,
+            speculation: None,
+            reasoning_on: false,
+            concurrency: None,
+            backend: "both".to_owned(),
+            workload: "both".to_owned(),
             prompt: Vec::new(),
         };
         let (mut engine, _, _, _) = open_bench_engine(paths, &bench, None)?;
@@ -6855,7 +8041,9 @@ fn ensure_update_not_interrupted() -> Result<()> {
 
 fn update_command(paths: &Paths, args: UpdateArgs) -> Result<()> {
     if !cfg!(target_os = "linux") {
-        bail!("hipfire update is Linux-only; re-run the platform installer with a revision selector on this OS");
+        bail!(
+            "hipfire update is Linux-only; re-run the platform installer with a revision selector on this OS"
+        );
     }
     // Install before any fetch/mutation so SIGINT cannot race past the guard.
     install_update_interrupt_handler();
@@ -7052,6 +8240,8 @@ fn run_update_installer(repo: &Path, paths: &Paths, resolved: &ResolvedRevision)
         &resolved.selector,
         recorded.rocm_root.as_deref(),
         recorded.gpu_arch.as_deref(),
+        recorded.hipcc.as_deref(),
+        recorded.strict_rocm,
     ) {
         installer_cmd.arg(arg);
     }
@@ -7128,6 +8318,8 @@ fn installer_handoff_args(
     selector: &RevisionSelector,
     rocm_root: Option<&Path>,
     gpu_arch: Option<&str>,
+    hipcc: Option<&Path>,
+    strict_rocm: bool,
 ) -> Vec<String> {
     let mut args = vec!["--yes".to_owned()];
     match selector.kind {
@@ -7156,6 +8348,17 @@ fn installer_handoff_args(
         args.push("--gpu-arch".to_owned());
         args.push(arch.to_owned());
     }
+    if let Some(hipcc) = hipcc
+        .map(|p| p.to_string_lossy().into_owned())
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+    {
+        args.push("--hipcc".to_owned());
+        args.push(hipcc);
+    }
+    if strict_rocm {
+        args.push("--strict-rocm".to_owned());
+    }
     args
 }
 
@@ -7163,8 +8366,9 @@ fn installer_handoff_args(
 struct RecordedInstallMetadata {
     rocm_root: Option<PathBuf>,
     gpu_arch: Option<String>,
+    hipcc: Option<PathBuf>,
+    strict_rocm: bool,
 }
-
 fn recorded_install_metadata(install_home: &Path) -> RecordedInstallMetadata {
     let text = match fs::read_to_string(install_home.join("install.json")) {
         Ok(text) => text,
@@ -7186,9 +8390,26 @@ fn recorded_install_metadata(install_home: &Path) -> RecordedInstallMetadata {
         .map(str::trim)
         .filter(|arch| !arch.is_empty())
         .map(str::to_owned);
+    let hipcc = value
+        .get("hipcc")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from);
+    let strict_rocm = match value.get("strict_rocm") {
+        Some(serde_json::Value::Bool(b)) => *b,
+        Some(serde_json::Value::String(s)) => {
+            let s = s.trim();
+            s == "1" || s.eq_ignore_ascii_case("true")
+        }
+        Some(serde_json::Value::Number(n)) => n.as_u64().is_some_and(|v| v != 0),
+        _ => false,
+    };
     RecordedInstallMetadata {
         rocm_root,
         gpu_arch,
+        hipcc,
+        strict_rocm,
     }
 }
 
@@ -8242,6 +9463,10 @@ fn config_rule_json(rule: ValueRule) -> serde_json::Value {
             "type": "string",
             "format": "kv-adaptive-policy",
         }),
+        ValueRule::Deepseek4Placement => serde_json::json!({
+            "type": "string",
+            "format": "deepseek4-compute-placement",
+        }),
     }
 }
 
@@ -8261,6 +9486,7 @@ fn config_rule_label(rule: ValueRule) -> &'static str {
         ValueRule::NullableInteger { .. } => "integer|null",
         ValueRule::NullableFloat { .. } => "number|null",
         ValueRule::KvAdaptive => "kv-adaptive",
+        ValueRule::Deepseek4Placement => "deepseek4-placement",
     }
 }
 
@@ -8313,10 +9539,41 @@ mod tests {
         }
     }
 
+    fn idle_test_meta() -> ServeMeta {
+        ServeMeta {
+            current_model: Some("model.hfq".to_owned()),
+            loading_model: Some("model.hfq".to_owned()),
+            instance_token: "test".to_owned(),
+            requests_served: 0,
+            retries_attempted: 0,
+            retries_succeeded: 0,
+            recent_tok_s: None,
+            started: Instant::now(),
+            last_activity: Instant::now() - Duration::from_secs(600),
+        }
+    }
+
+    #[test]
+    fn idle_timeout_does_not_evict_a_loading_model() {
+        let meta = idle_test_meta();
+        assert!(!idle_model_expired(&meta, Duration::from_secs(300)));
+    }
+
+    #[test]
+    fn successful_prewarm_starts_a_fresh_idle_window() {
+        let mut meta = idle_test_meta();
+        finish_prewarm(&mut meta, true);
+        assert!(meta.loading_model.is_none());
+        assert!(!idle_model_expired(&meta, Duration::from_secs(300)));
+        assert!(meta.last_activity.elapsed() < Duration::from_secs(1));
+    }
+
     #[test]
     fn model_suffix_filter_covers_current_formats() {
         assert!(is_model_file("qwen3.6-35b-a3b.mq4r"));
         assert!(is_model_file("deepseek.mq2lloyd"));
+        assert!(is_model_file("deepseek-v4-flash-0731.mq2r"));
+        assert!(is_model_file("deepseek-v4-flash-0731.mq2rxt"));
         assert!(is_model_file("draft.hfq"));
         assert!(!is_model_file("model.triattn.bin"));
         assert!(!is_model_file("README.md"));
@@ -8360,6 +9617,7 @@ mod tests {
         let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
         let params = load_params(&defaults, Some(entry), &model_path, 64, None, None).unwrap();
         assert_eq!(params["cask"], false);
+        assert_eq!(params["cask_handoff_tokens"], 0);
         assert_eq!(params["cask_sidecar"], "");
         assert_eq!(params["prefill_compression"], "off");
 
@@ -8386,6 +9644,456 @@ mod tests {
         let params =
             load_params(&defaults, None, &model_path, 64, Some("q8"), Some("vmm")).unwrap();
         assert_eq!(params["kv_backend"], "vmm");
+    }
+
+    #[test]
+    fn load_params_defaults_to_schema_contiguous_backend() {
+        let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let model_path = PathBuf::from("/tmp/test-model.mq4");
+        let params = load_params(&defaults, None, &model_path, 64, Some("q8"), None).unwrap();
+        assert_eq!(params["kv_backend"], "contiguous");
+        assert_eq!(params["max_seq"], 32768);
+    }
+
+    #[test]
+    fn resolved_for_model_applies_qwen_tag_policy_and_excludes_original_and_sidecars() {
+        let paths = test_paths("registry-qwen-tag-policy");
+        fs::create_dir_all(&paths.root).unwrap();
+        let raw = r#"{
+            "schema_version":1,
+            "generated_at":"now",
+            "models":{
+                "qwen3.5:4b":{"repo":"x","file":"qwen3.5-4b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x","default_kv_mode":"q8"},
+                "qwen3.6:35b-a3b":{"repo":"x","file":"qwen3.6-35b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"},
+                "qwen3.8:27b":{"repo":"x","file":"qwen3.8-27b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x","default_kv_mode":"q8"},
+                "qwen3.8:27b-fast":{"repo":"x","file":"qwen3.8-27b.mq4r","size_gb":1,"min_vram_gb":1,"desc":"x","default_kv_mode":"q8"},
+                "qwen3:8b":{"repo":"x","file":"qwen3-8b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x","default_kv_mode":"q8"},
+                "qwen3.5:9b-draft":{"repo":"x","file":"qwen35-9b-dflash.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"},
+                "qwen3.6:27b-dflash":{"repo":"x","file":"qwen36-27b-dflash.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"}
+            },
+            "aliases":{}
+        }"#;
+        let registry = RegistryV1::parse(raw, "test").unwrap();
+
+        // Exact Qwen families get VMM + 262144 + 81920
+        for tag in ["qwen3.5:4b", "qwen3.6:35b-a3b", "qwen3.8:27b", "qwen3.8:27b-fast"] {
+            let (_, entry) = registry.model(tag).unwrap();
+            let resolved = resolved_for_model(&paths, tag, Some(tag), Some(entry)).unwrap();
+            assert_eq!(
+                config_string(&resolved, "memory.kv_backend").unwrap(),
+                "vmm",
+                "{tag}"
+            );
+            assert_eq!(
+                config_u64(&resolved, "memory.max_seq").unwrap(),
+                262144,
+                "{tag}"
+            );
+            assert_eq!(
+                config_u64(&resolved, "generation.max_tokens").unwrap(),
+                81920,
+                "{tag}"
+            );
+        }
+
+        // Original qwen3:* stays contiguous (no automatic policy) — original Qwen3 uses default schema.
+        let (_, entry) = registry.model("qwen3:8b").unwrap();
+        let resolved =
+            resolved_for_model(&paths, "qwen3:8b", Some("qwen3:8b"), Some(entry)).unwrap();
+        assert_eq!(
+            config_string(&resolved, "memory.kv_backend").unwrap(),
+            "contiguous",
+            "original qwen3 must keep the built-in contiguous backend"
+        );
+        assert_eq!(config_u64(&resolved, "memory.max_seq").unwrap(), 32768);
+        assert_eq!(
+            config_u64(&resolved, "generation.max_tokens").unwrap(),
+            4096
+        );
+        // More directly, check the helper layer itself has no policy.
+        let direct = hipfire_registry::config_layer_for_tag("qwen3:8b", entry).unwrap();
+        assert!(direct.get("memory.kv_backend").is_none());
+        assert!(direct.get("memory.max_seq").is_none());
+        assert!(direct.get("generation.max_tokens").is_none());
+
+        // Draft/dflash sidecars do not get the Qwen policy even though family matches.
+        for tag in ["qwen3.5:9b-draft", "qwen3.6:27b-dflash"] {
+            let (_, entry) = registry.model(tag).unwrap();
+            let direct = hipfire_registry::config_layer_for_tag(tag, entry).unwrap();
+            assert!(
+                direct.get("memory.kv_backend").is_none(),
+                "{tag} sidecar must not get vmm"
+            );
+            assert!(direct.get("memory.max_seq").is_none());
+            assert!(direct.get("generation.max_tokens").is_none());
+        }
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn resolved_for_model_applies_glimmer_and_deepseek_targets() {
+        let paths = test_paths("registry-glimmer-deepseek-tag-policy");
+        fs::create_dir_all(&paths.root).unwrap();
+        let raw = r#"{
+            "schema_version":1,
+            "generated_at":"now",
+            "models":{
+                "muse-glimmer":{"repo":"x","file":"muse-glimmer-30b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"},
+                "muse-glimmer:fast":{"repo":"x","file":"muse-glimmer-30b.mq4r","size_gb":1,"min_vram_gb":1,"desc":"x"},
+                "muse-glimmer:draft":{"repo":"x","file":"muse-glimmer-draft.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"},
+                "deepseek-v4-flash":{"repo":"x","file":"deepseek-v4-flash-0731.mq2r","size_gb":1,"min_vram_gb":1,"desc":"x"},
+                "deepseek-v4-flash:mq2lloyd":{"repo":"x","file":"deepseek-v4-flash-0731.mq2lloyd","size_gb":1,"min_vram_gb":1,"desc":"x"},
+                "deepseek-v4-flash-preview":{"repo":"x","file":"deepseek-v4-flash-preview.mq2r","size_gb":1,"min_vram_gb":1,"desc":"x"},
+                "deepseek-v4-flash:draft":{"repo":"x","file":"deepseek-v4-flash-draft.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"},
+                "other:model":{"repo":"x","file":"other.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"}
+            },
+            "aliases":{
+                "deepseek4":"deepseek-v4-flash",
+                "ds4":"deepseek-v4-flash",
+                "deepseek4:preview":"deepseek-v4-flash-preview",
+                "muse-glimmer:quality":"muse-glimmer"
+            }
+        }"#;
+        let registry = RegistryV1::parse(raw, "test").unwrap();
+
+        // Muse Glimmer quality and fast targets get VMM + native 131072, no invented max_tokens.
+        for tag in ["muse-glimmer", "muse-glimmer:fast"] {
+            let (_, entry) = registry.model(tag).unwrap();
+            let resolved = resolved_for_model(&paths, tag, Some(tag), Some(entry)).unwrap();
+            assert_eq!(
+                config_string(&resolved, "memory.kv_backend").unwrap(),
+                "vmm",
+                "{tag}"
+            );
+            assert_eq!(
+                config_u64(&resolved, "memory.max_seq").unwrap(),
+                131072,
+                "{tag}"
+            );
+            let direct = hipfire_registry::config_layer_for_tag(tag, entry).unwrap();
+            assert_eq!(
+                direct.get("memory.kv_backend"),
+                Some(&hipfire_config::ConfigValue::String("vmm".into()))
+            );
+            assert_eq!(
+                direct.get("memory.max_seq"),
+                Some(&hipfire_config::ConfigValue::Integer(131072)),
+                "{tag} should get 131072"
+            );
+            assert!(
+                direct.get("generation.max_tokens").is_none(),
+                "{tag} must not get max_tokens"
+            );
+        }
+        // quality alias lands on trunk policy.
+        let (resolved_tag, entry) = registry.model("muse-glimmer:quality").unwrap();
+        assert_eq!(resolved_tag, "muse-glimmer");
+        let direct = hipfire_registry::config_layer_for_tag(resolved_tag, entry).unwrap();
+        assert_eq!(
+            direct.get("memory.max_seq"),
+            Some(&hipfire_config::ConfigValue::Integer(131072))
+        );
+
+        // Muse Glimmer draft receives none.
+        let (_, entry) = registry.model("muse-glimmer:draft").unwrap();
+        let direct = hipfire_registry::config_layer_for_tag("muse-glimmer:draft", entry).unwrap();
+        assert!(direct.get("memory.kv_backend").is_none());
+        assert!(direct.get("memory.max_seq").is_none());
+        assert!(direct.get("generation.max_tokens").is_none());
+        let resolved = resolved_for_model(
+            &paths,
+            "muse-glimmer:draft",
+            Some("muse-glimmer:draft"),
+            Some(entry),
+        )
+        .unwrap();
+        assert!(
+            resolved.get("memory.kv_backend").is_none()
+                || config_string(&resolved, "memory.kv_backend").unwrap() != "vmm"
+        );
+
+        // DeepSeek official / MQ2Lloyd / preview targets get VMM + 1M + 384Ki.
+        for tag in [
+            "deepseek-v4-flash",
+            "deepseek-v4-flash:mq2lloyd",
+            "deepseek-v4-flash-preview",
+        ] {
+            let (resolved_tag, entry) = registry.model(tag).unwrap();
+            let resolved =
+                resolved_for_model(&paths, resolved_tag, Some(resolved_tag), Some(entry)).unwrap();
+            assert_eq!(
+                config_string(&resolved, "memory.kv_backend").unwrap(),
+                "vmm",
+                "{tag}"
+            );
+            assert_eq!(
+                config_u64(&resolved, "memory.max_seq").unwrap(),
+                1048576,
+                "{tag}"
+            );
+            assert_eq!(
+                config_u64(&resolved, "generation.max_tokens").unwrap(),
+                393216,
+                "{tag}"
+            );
+            let direct = hipfire_registry::config_layer_for_tag(resolved_tag, entry).unwrap();
+            assert_eq!(
+                direct.get("memory.kv_backend"),
+                Some(&hipfire_config::ConfigValue::String("vmm".into()))
+            );
+            assert_eq!(
+                direct.get("memory.max_seq"),
+                Some(&hipfire_config::ConfigValue::Integer(1048576))
+            );
+            assert_eq!(
+                direct.get("generation.max_tokens"),
+                Some(&hipfire_config::ConfigValue::Integer(393216))
+            );
+        }
+        for alias in ["deepseek4", "ds4", "deepseek4:preview"] {
+            let (resolved_tag, entry) = registry.model(alias).unwrap();
+            let direct = hipfire_registry::config_layer_for_tag(resolved_tag, entry).unwrap();
+            assert_eq!(
+                direct.get("memory.max_seq"),
+                Some(&hipfire_config::ConfigValue::Integer(1048576)),
+                "{alias}->{resolved_tag}"
+            );
+            assert_eq!(
+                direct.get("generation.max_tokens"),
+                Some(&hipfire_config::ConfigValue::Integer(393216)),
+                "{alias}->{resolved_tag}"
+            );
+        }
+        // DeepSeek draft sidecar receives none.
+        let (_, entry) = registry.model("deepseek-v4-flash:draft").unwrap();
+        let direct =
+            hipfire_registry::config_layer_for_tag("deepseek-v4-flash:draft", entry).unwrap();
+        assert!(direct.get("memory.kv_backend").is_none());
+        assert!(direct.get("memory.max_seq").is_none());
+        assert!(direct.get("generation.max_tokens").is_none());
+
+        // Absent policy: unrelated model gets no automatic policy.
+        let (_, entry) = registry.model("other:model").unwrap();
+        let direct = hipfire_registry::config_layer_for_tag("other:model", entry).unwrap();
+        assert!(direct.get("memory.kv_backend").is_none());
+        assert!(direct.get("memory.max_seq").is_none());
+        assert!(direct.get("generation.max_tokens").is_none());
+
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn resolved_for_model_tag_policy_is_overridable_by_user() {
+        let paths = test_paths("registry-tag-policy-override");
+        fs::create_dir_all(&paths.root).unwrap();
+        let raw = r#"{
+            "schema_version":1,
+            "generated_at":"now",
+            "models":{"qwen3.8:27b":{"repo":"x","file":"qwen3.8-27b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"}},
+            "aliases":{}
+        }"#;
+        let registry = RegistryV1::parse(raw, "test").unwrap();
+        let (tag, entry) = registry.model("qwen3.8:27b").unwrap();
+        let resolved = resolved_for_model(&paths, tag, Some(tag), Some(entry)).unwrap();
+        assert_eq!(
+            config_string(&resolved, "memory.kv_backend").unwrap(),
+            "vmm"
+        );
+        assert_eq!(config_u64(&resolved, "memory.max_seq").unwrap(), 262144);
+        assert_eq!(
+            config_u64(&resolved, "generation.max_tokens").unwrap(),
+            81920
+        );
+
+        // Global user override wins over registry tag policy (registry below global).
+        let mut user_layer = ConfigLayer::default();
+        user_layer
+            .set_cli("memory.kv_backend", "contiguous")
+            .unwrap();
+        user_layer.set_cli("memory.max_seq", "32768").unwrap();
+        user_layer.set_cli("generation.max_tokens", "1024").unwrap();
+        let overridden = hipfire_config::resolve(vec![
+            hipfire_config::NamedLayer {
+                source: hipfire_config::ConfigSource::RegistryModel {
+                    tag: tag.to_owned(),
+                    revision: "v1".into(),
+                },
+                layer: hipfire_registry::config_layer_for_tag(tag, entry).unwrap(),
+            },
+            hipfire_config::NamedLayer {
+                source: hipfire_config::ConfigSource::GlobalUser {
+                    path: std::path::PathBuf::from("/tmp/test.toml"),
+                },
+                layer: user_layer,
+            },
+        ])
+        .unwrap();
+        assert_eq!(
+            config_string(&overridden, "memory.kv_backend").unwrap(),
+            "contiguous"
+        );
+        assert_eq!(config_u64(&overridden, "memory.max_seq").unwrap(), 32768);
+        assert_eq!(
+            config_u64(&overridden, "generation.max_tokens").unwrap(),
+            1024
+        );
+
+        // Also verify load_params respects explicit kv_backend override over configured vmm.
+        let model_path = PathBuf::from("/tmp/test-model.mq4");
+        let params = load_params(
+            &resolved,
+            Some(entry),
+            &model_path,
+            64,
+            Some("q8"),
+            Some("contiguous"),
+        )
+        .unwrap();
+        assert_eq!(params["kv_backend"], "contiguous");
+        // Without explicit override, load_params uses the resolved vmm.
+        let params2 =
+            load_params(&resolved, Some(entry), &model_path, 64, Some("q8"), None).unwrap();
+        assert_eq!(params2["kv_backend"], "vmm");
+        assert_eq!(params2["max_seq"], 262144);
+
+        // Glimmer target likewise overridable (backend + max_seq).
+        let raw2 = r#"{
+            "schema_version":1,
+            "generated_at":"now",
+            "models":{"muse-glimmer":{"repo":"x","file":"muse-glimmer-30b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"}},
+            "aliases":{}
+        }"#;
+        let registry2 = RegistryV1::parse(raw2, "test").unwrap();
+        let (g_tag, g_entry) = registry2.model("muse-glimmer").unwrap();
+        let g_layer = hipfire_registry::config_layer_for_tag(g_tag, g_entry).unwrap();
+        assert_eq!(
+            g_layer.get("memory.kv_backend"),
+            Some(&hipfire_config::ConfigValue::String("vmm".into()))
+        );
+        assert_eq!(
+            g_layer.get("memory.max_seq"),
+            Some(&hipfire_config::ConfigValue::Integer(131072))
+        );
+        assert!(g_layer.get("generation.max_tokens").is_none());
+        let mut g_user = ConfigLayer::default();
+        g_user.set_cli("memory.kv_backend", "contiguous").unwrap();
+        g_user.set_cli("memory.max_seq", "8192").unwrap();
+        let g_resolved = hipfire_config::resolve(vec![
+            hipfire_config::NamedLayer {
+                source: hipfire_config::ConfigSource::RegistryModel {
+                    tag: g_tag.to_owned(),
+                    revision: "v1".into(),
+                },
+                layer: g_layer,
+            },
+            hipfire_config::NamedLayer {
+                source: hipfire_config::ConfigSource::GlobalUser {
+                    path: std::path::PathBuf::from("/tmp/test2.toml"),
+                },
+                layer: g_user,
+            },
+        ])
+        .unwrap();
+        assert_eq!(
+            config_string(&g_resolved, "memory.kv_backend").unwrap(),
+            "contiguous"
+        );
+        assert_eq!(config_u64(&g_resolved, "memory.max_seq").unwrap(), 8192);
+
+        // DeepSeek target override wins over 1M/384Ki policy.
+        let raw3 = r#"{
+            "schema_version":1,
+            "generated_at":"now",
+            "models":{"deepseek-v4-flash":{"repo":"x","file":"ds4.mq2r","size_gb":1,"min_vram_gb":1,"desc":"x"}},
+            "aliases":{}
+        }"#;
+        let registry3 = RegistryV1::parse(raw3, "test").unwrap();
+        let (d_tag, d_entry) = registry3.model("deepseek-v4-flash").unwrap();
+        let d_resolved = resolved_for_model(&paths, d_tag, Some(d_tag), Some(d_entry)).unwrap();
+        assert_eq!(
+            config_string(&d_resolved, "memory.kv_backend").unwrap(),
+            "vmm"
+        );
+        assert_eq!(config_u64(&d_resolved, "memory.max_seq").unwrap(), 1048576);
+        assert_eq!(
+            config_u64(&d_resolved, "generation.max_tokens").unwrap(),
+            393216
+        );
+        let mut d_user = ConfigLayer::default();
+        d_user.set_cli("memory.max_seq", "65536").unwrap();
+        d_user.set_cli("generation.max_tokens", "2048").unwrap();
+        let d_overridden = hipfire_config::resolve(vec![
+            hipfire_config::NamedLayer {
+                source: hipfire_config::ConfigSource::RegistryModel {
+                    tag: d_tag.to_owned(),
+                    revision: "v1".into(),
+                },
+                layer: hipfire_registry::config_layer_for_tag(d_tag, d_entry).unwrap(),
+            },
+            hipfire_config::NamedLayer {
+                source: hipfire_config::ConfigSource::GlobalUser {
+                    path: std::path::PathBuf::from("/tmp/test3.toml"),
+                },
+                layer: d_user,
+            },
+        ])
+        .unwrap();
+        assert_eq!(config_u64(&d_overridden, "memory.max_seq").unwrap(), 65536);
+        assert_eq!(
+            config_u64(&d_overridden, "generation.max_tokens").unwrap(),
+            2048
+        );
+
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn load_params_only_forwards_explicit_deepseek4_expert_fanout() {
+        let model_path = PathBuf::from("/tmp/test-model.mq2r");
+        let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let params = load_params(&defaults, None, &model_path, 64, Some("q8"), None).unwrap();
+        assert_eq!(params["deepseek4_compute_placement"], "single");
+        assert!(params.get("deepseek4_experts_per_token").is_none());
+
+        let mut explicit = ConfigLayer::default();
+        explicit
+            .set_cli("model.deepseek4_experts_per_token", "4")
+            .unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::OneShot {
+                argument: "model.deepseek4_experts_per_token=4".into(),
+            },
+            layer: explicit,
+        }])
+        .unwrap();
+        let params = load_params(&resolved, None, &model_path, 64, Some("q8"), None).unwrap();
+        assert_eq!(params["deepseek4_experts_per_token"], 4);
+    }
+
+    #[test]
+    fn load_params_forwards_typed_deepseek4_compute_placement() {
+        let raw = "dense-expert-split(dense=arch:gfx1100,experts=arch:gfx1151)";
+        let mut explicit = ConfigLayer::default();
+        explicit
+            .set_cli("hardware.deepseek4_compute_placement", raw)
+            .unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::OneShot {
+                argument: format!("hardware.deepseek4_compute_placement={raw}"),
+            },
+            layer: explicit,
+        }])
+        .unwrap();
+        let params = load_params(
+            &resolved,
+            None,
+            Path::new("/tmp/test-model.mq2r"),
+            64,
+            Some("q8"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(params["deepseek4_compute_placement"], raw);
     }
 
     #[test]
@@ -8472,13 +10180,147 @@ mod tests {
         assert_eq!(dflash["dflash"], true);
         assert!(dflash["mtp"].is_null());
 
+        let mtp_window_timings = serde_json::json!([{
+            "kind": "mtp",
+            "wall_us": 1234,
+            "draft_lookup_us": 12,
+            "launch_us": 34,
+            "h2d_us": 56,
+            "d2h_us": 78,
+            "d2d_us": 90,
+            "memset_us": 11,
+            "stream_sync_us": 22,
+            "event_sync_us": 33,
+            "device_sync_us": 44,
+            "graph_launch_us": 55,
+        }]);
         let mtp = completion_timings(&completion(serde_json::json!({
             "mtp": true,
             "tau": 2.0,
             "cycles": 6,
+            "mtp_window_timings": mtp_window_timings,
         })));
         assert!(mtp["dflash"].is_null());
         assert_eq!(mtp["mtp"], true);
+        assert_eq!(mtp["mtp_window_timings"], mtp_window_timings);
+        assert_eq!(mtp["mtp_window_timings"][0]["kind"], "mtp");
+        assert_eq!(mtp["mtp_window_timings"][0]["wall_us"], 1234);
+    }
+
+    #[test]
+    fn completion_timings_projects_latency_ms() {
+        let completion = Completion {
+            id: "req-lat".into(),
+            created: 0,
+            model: "test-model".into(),
+            content: String::new(),
+            reasoning_content: String::new(),
+            preserve_thinking: false,
+            tool_calls: Vec::new(),
+            done: serde_json::json!({
+                "ttft_ms": 12.5,
+                "prefill_ms": 10.0,
+                "prefill_tok_s": 100.0,
+                "decode_tok_s": 40.0,
+                "latency_ms": 250.5,
+                "tok_s": 20.0,
+            }),
+        };
+        let timings = completion_timings(&completion);
+        assert_eq!(timings["latency_ms"], 250.5);
+        assert_eq!(timings["ttft_ms"], 12.5);
+        // Absent latency stays null-like (serde_json::Value::Null via .get).
+        let no_lat = completion_timings(&Completion {
+            id: "req-lat".into(),
+            created: 0,
+            model: "test-model".into(),
+            content: String::new(),
+            reasoning_content: String::new(),
+            preserve_thinking: false,
+            tool_calls: Vec::new(),
+            done: serde_json::json!({"ttft_ms": 1.0}),
+        });
+        assert!(no_lat["latency_ms"].is_null());
+    }
+
+    #[test]
+    fn completion_hipfire_projects_batch_route_evidence() {
+        let batch = serde_json::json!({
+            "executed": true,
+            "slots": 4,
+            "lane": 1,
+            "lane_capacity": 4096,
+            "max_active_lanes": 2,
+            "refill": "continuous",
+        });
+        let completion = Completion {
+            id: "req-batch".into(),
+            created: 0,
+            model: "test-model".into(),
+            content: "hi".into(),
+            reasoning_content: String::new(),
+            preserve_thinking: false,
+            tool_calls: Vec::new(),
+            done: serde_json::json!({
+                "tok_s": 18.5,
+                "prefill_tok_s": 200.0,
+                "decode_tok_s": 22.0,
+                "latency_ms": 300.0,
+                "execution_mode": "continuous_batch_independent",
+                "continuous_batch": batch,
+                "finish_reason": "stop",
+                "tokens": 3,
+                "prefill_tokens": 8,
+            }),
+        };
+        let hip = completion_hipfire(&completion);
+        assert_eq!(hip["execution_mode"], "continuous_batch_independent");
+        assert_eq!(hip["continuous_batch"]["max_active_lanes"], 2);
+        assert_eq!(hip["continuous_batch"]["slots"], 4);
+        assert_eq!(hip["continuous_batch"]["lane"], 1);
+        assert_eq!(hip["tok_s"], 18.5);
+
+        let json = completion_json(&completion);
+        assert_eq!(json["timings"]["latency_ms"], 300.0);
+        assert_eq!(
+            json["hipfire"]["execution_mode"],
+            "continuous_batch_independent"
+        );
+        assert_eq!(json["hipfire"]["continuous_batch"]["refill"], "continuous");
+
+        let chunks = openai_stream_terminal_chunks(&completion, false);
+        let terminal = chunks.last().unwrap();
+        assert_eq!(terminal["timings"]["latency_ms"], 300.0);
+        assert_eq!(
+            terminal["hipfire"]["execution_mode"],
+            "continuous_batch_independent"
+        );
+        assert_eq!(
+            terminal["hipfire"]["continuous_batch"]["max_active_lanes"],
+            2
+        );
+
+        // Sequential done without route evidence stays null (unchanged fields).
+        let sequential = Completion {
+            id: "req-seq".into(),
+            created: 0,
+            model: "test-model".into(),
+            content: String::new(),
+            reasoning_content: String::new(),
+            preserve_thinking: false,
+            tool_calls: Vec::new(),
+            done: serde_json::json!({
+                "tok_s": 10.0,
+                "prefill_tok_s": 50.0,
+                "decode_tok_s": 12.0,
+                "finish_reason": "stop",
+                "tokens": 2,
+            }),
+        };
+        let seq_hip = completion_hipfire(&sequential);
+        assert!(seq_hip["execution_mode"].is_null());
+        assert!(seq_hip["continuous_batch"].is_null());
+        assert_eq!(seq_hip["tok_s"], 10.0);
     }
 
     #[test]
@@ -8498,7 +10340,7 @@ mod tests {
         let _hf_endpoint = EnvRestore("HF_ENDPOINT", env::var_os("HF_ENDPOINT"));
         let registry = hipfire_registry::bundled().unwrap();
         let (_, entry) = registry.model("qwen3.6:35b-a3b-mq4r").unwrap();
-        let suffix = "schuttdev/hipfire-qwen3.6-35b-a3b/resolve/main/qwen3.6-35b-a3b.mq4r";
+        let suffix = "hipfire-models/qwen3.6-35b-a3b/resolve/main/qwen3.6-35b-a3b.mq4r";
 
         env::remove_var("HIPFIRE_HF_BASE");
         env::remove_var("HF_ENDPOINT");
@@ -8878,6 +10720,8 @@ mod tests {
             },
             recorded.rocm_root.as_deref(),
             recorded.gpu_arch.as_deref(),
+            recorded.hipcc.as_deref(),
+            recorded.strict_rocm,
         );
         assert_eq!(
             args,
@@ -8900,6 +10744,8 @@ mod tests {
         let empty = recorded_install_metadata(&home);
         assert!(empty.rocm_root.is_none());
         assert!(empty.gpu_arch.is_none());
+        assert!(empty.hipcc.is_none());
+        assert!(!empty.strict_rocm);
         let bare = installer_handoff_args(
             &RevisionSelector {
                 value: "deadbeef".into(),
@@ -8907,6 +10753,8 @@ mod tests {
             },
             None,
             None,
+            None,
+            false,
         );
         assert_eq!(
             bare,
@@ -8925,6 +10773,8 @@ mod tests {
             },
             None,
             Some("gfx1100"),
+            None,
+            false,
         );
         assert_eq!(
             arch_only,
@@ -8936,6 +10786,76 @@ mod tests {
                 "gfx1100".to_owned(),
             ]
         );
+        fs::remove_dir_all(home).unwrap();
+    }
+    #[test]
+    fn update_handoff_forwards_hipcc_and_strict_with_backward_compat() {
+        let home = env::temp_dir().join(format!(
+            "hipfire-update-hipcc-{}-{}",
+            std::process::id(),
+            unix_timestamp()
+        ));
+        fs::create_dir_all(&home).unwrap();
+        // New format with hipcc and strict_rocm.
+        fs::write(
+            home.join("install.json"),
+            r#"{"rocm_root":"/opt/rocm","hipcc":"/usr/bin/hipcc","strict_rocm":true,"gpu_arch":"gfx1201"}"#,
+        )
+        .unwrap();
+        let recorded = recorded_install_metadata(&home);
+        assert_eq!(recorded.hipcc.as_deref(), Some(Path::new("/usr/bin/hipcc")));
+        assert!(recorded.strict_rocm);
+        assert_eq!(recorded.rocm_root.as_deref(), Some(Path::new("/opt/rocm")));
+        let args = installer_handoff_args(
+            &RevisionSelector {
+                value: "master".into(),
+                kind: RevisionKind::Auto,
+            },
+            recorded.rocm_root.as_deref(),
+            recorded.gpu_arch.as_deref(),
+            recorded.hipcc.as_deref(),
+            recorded.strict_rocm,
+        );
+        assert!(args.contains(&"--hipcc".to_owned()));
+        assert!(args.contains(&"/usr/bin/hipcc".to_owned()));
+        assert!(args.contains(&"--strict-rocm".to_owned()));
+        assert!(args.contains(&"--rocm-root".to_owned()));
+        // Empty/whitespace hipcc is treated as None, like rocm_root.
+        fs::write(
+            home.join("install.json"),
+            r#"{"hipcc":"  ","strict_rocm":false}"#,
+        )
+        .unwrap();
+        let empty = recorded_install_metadata(&home);
+        assert!(empty.hipcc.is_none());
+        assert!(!empty.strict_rocm);
+        let bare = installer_handoff_args(
+            &RevisionSelector {
+                value: "beta".into(),
+                kind: RevisionKind::Branch,
+            },
+            None,
+            None,
+            empty.hipcc.as_deref(),
+            empty.strict_rocm,
+        );
+        assert!(!bare.contains(&"--hipcc".to_owned()));
+        assert!(!bare.contains(&"--strict-rocm".to_owned()));
+        // Older file without hipcc key loads without error (backward compat).
+        fs::write(
+            home.join("install.json"),
+            r#"{"rocm_root":"/opt/rocm","gpu_arch":"gfx1100"}"#,
+        )
+        .unwrap();
+        let old = recorded_install_metadata(&home);
+        assert_eq!(old.rocm_root.as_deref(), Some(Path::new("/opt/rocm")));
+        assert!(old.hipcc.is_none());
+        assert!(!old.strict_rocm);
+        // Strict can be stored as string \"1\" or number 1 for compat.
+        fs::write(home.join("install.json"), r#"{"strict_rocm":"1"}"#).unwrap();
+        assert!(recorded_install_metadata(&home).strict_rocm);
+        fs::write(home.join("install.json"), r#"{"strict_rocm":1}"#).unwrap();
+        assert!(recorded_install_metadata(&home).strict_rocm);
         fs::remove_dir_all(home).unwrap();
     }
 
@@ -9289,7 +11209,7 @@ mod tests {
                 ] }
             ]
         });
-        let messages = normalize_openai_messages(body.get("messages"));
+        let messages = normalize_openai_messages(body.get("messages"), false);
         assert_eq!(last_user_prompt(&messages).as_deref(), Some("onetwo"));
     }
 
@@ -9343,34 +11263,53 @@ mod tests {
                 { "role": "unsupported", "content": "drop me" }
             ]
         });
-        let normalized = normalize_openai_messages(body.get("messages"));
+        // Flag OFF — today's exact shape unchanged, no reasoning_content key
+        let normalized = normalize_openai_messages(body.get("messages"), false);
         assert_eq!(normalized.as_array().unwrap().len(), 4);
         assert_eq!(normalized[0]["role"], "system");
         assert_eq!(normalized[1]["content"], "first second");
         assert_eq!(normalized[2]["content"], "");
         assert_eq!(normalized[2]["tool_plan"], "tool reasoning");
+        assert!(normalized[2].get("reasoning_content").is_none());
         assert_eq!(normalized[2]["tool_calls"][0]["name"], "read_file");
+        assert_eq!(normalized[2]["tool_calls"][0]["id"], "call_1");
         assert_eq!(
             normalized[2]["tool_calls"][0]["arguments"],
             serde_json::json!({ "path": "README.md" })
         );
         assert_eq!(normalized[3]["role"], "tool");
         assert_eq!(normalized[3]["tool_call_id"], "call_1");
+        // Flag ON — reasoning dual-written, content still visible-only
+        let normalized_on = normalize_openai_messages(body.get("messages"), true);
+        assert_eq!(normalized_on[2]["content"], "");
+        assert_eq!(normalized_on[2]["tool_plan"], "tool reasoning");
+        assert_eq!(normalized_on[2]["reasoning_content"], "tool reasoning");
+        assert_eq!(
+            normalized_on[2]["reasoning_content"],
+            normalized_on[2]["tool_plan"]
+        );
+        assert_eq!(normalized_on[2]["tool_calls"][0]["id"], "call_1");
     }
 
     #[test]
     fn registry_system_prompt_is_injected_only_when_client_omits_one() {
-        let mut messages = normalize_openai_messages(Some(&serde_json::json!([
-            { "role": "user", "content": "hello" }
-        ])));
+        let mut messages = normalize_openai_messages(
+            Some(&serde_json::json!([
+                { "role": "user", "content": "hello" }
+            ])),
+            false,
+        );
         inject_default_system_message(&mut messages, Some("registry identity"));
         assert_eq!(messages[0]["role"], "system");
         assert_eq!(messages[0]["content"], "registry identity");
 
-        let mut messages = normalize_openai_messages(Some(&serde_json::json!([
-            { "role": "developer", "content": "client policy" },
-            { "role": "user", "content": "hello" }
-        ])));
+        let mut messages = normalize_openai_messages(
+            Some(&serde_json::json!([
+                { "role": "developer", "content": "client policy" },
+                { "role": "user", "content": "hello" }
+            ])),
+            false,
+        );
         inject_default_system_message(&mut messages, Some("registry identity"));
         assert_eq!(messages.as_array().unwrap().len(), 2);
         assert_eq!(messages[0]["role"], "system");
@@ -9388,12 +11327,152 @@ mod tests {
                 }]
             }]
         });
-        let normalized = normalize_openai_messages(body.get("messages"));
+        // Flag OFF — repair into _raw
+        let normalized = normalize_openai_messages(body.get("messages"), false);
         assert_eq!(normalized[0]["content"], "visible answer");
         assert_eq!(normalized[0]["tool_plan"], "private plan");
         assert_eq!(
             normalized[0]["tool_calls"][0]["arguments"],
             serde_json::json!({ "_raw": "not-json" })
+        );
+        // Flag ON — string that does not parse to object is retained as string for daemon to reject
+        let normalized_on = normalize_openai_messages(body.get("messages"), true);
+        assert_eq!(normalized_on[0]["content"], "visible answer");
+        assert_eq!(normalized_on[0]["tool_plan"], "private plan");
+        assert_eq!(normalized_on[0]["reasoning_content"], "private plan");
+        assert_eq!(
+            normalized_on[0]["tool_calls"][0]["arguments"],
+            serde_json::Value::String("not-json".into())
+        );
+    }
+
+    #[test]
+    fn normalize_reasoning_sources_with_flag_on_and_off() {
+        // reasoning field takes precedence over reasoning_content and inline think
+        let body = serde_json::json!({
+            "messages": [{
+                "role": "assistant",
+                "content": "<think>inline</think>\nvisible",
+                "reasoning": "explicit reasoning",
+                "reasoning_content": "secondary"
+            }]
+        });
+        let off = normalize_openai_messages(body.get("messages"), false);
+        assert_eq!(off[0]["content"], "visible");
+        assert_eq!(off[0]["tool_plan"], "explicit reasoning");
+        assert!(off[0].get("reasoning_content").is_none());
+        let on = normalize_openai_messages(body.get("messages"), true);
+        assert_eq!(on[0]["content"], "visible");
+        assert_eq!(on[0]["tool_plan"], "explicit reasoning");
+        assert_eq!(on[0]["reasoning_content"], "explicit reasoning");
+        assert_eq!(on[0]["reasoning_content"], on[0]["tool_plan"]);
+
+        // reasoning_content when reasoning absent
+        let body2 = serde_json::json!({
+            "messages": [{
+                "role": "assistant",
+                "content": "visible only",
+                "reasoning_content": "from content field"
+            }]
+        });
+        let off2 = normalize_openai_messages(body2.get("messages"), false);
+        assert_eq!(off2[0]["tool_plan"], "from content field");
+        assert!(off2[0].get("reasoning_content").is_none());
+        let on2 = normalize_openai_messages(body2.get("messages"), true);
+        assert_eq!(on2[0]["reasoning_content"], "from content field");
+        assert_eq!(on2[0]["tool_plan"], "from content field");
+        assert_eq!(on2[0]["content"], "visible only");
+
+        // inline <think> when neither reasoning field present
+        let body3 = serde_json::json!({
+            "messages": [{
+                "role": "assistant",
+                "content": "<think>inline think</think>\n\nvisible answer"
+            }]
+        });
+        let off3 = normalize_openai_messages(body3.get("messages"), false);
+        assert_eq!(off3[0]["content"], "visible answer");
+        assert_eq!(off3[0]["tool_plan"], "inline think");
+        assert!(off3[0].get("reasoning_content").is_none());
+        let on3 = normalize_openai_messages(body3.get("messages"), true);
+        assert_eq!(on3[0]["content"], "visible answer");
+        assert_eq!(on3[0]["tool_plan"], "inline think");
+        assert_eq!(on3[0]["reasoning_content"], "inline think");
+        assert_eq!(on3[0]["reasoning_content"], on3[0]["tool_plan"]);
+    }
+
+    #[test]
+    fn normalize_tool_call_id_and_tool_result_name_survive() {
+        let body = serde_json::json!({
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": "calling",
+                    "tool_calls": [{
+                        "id": "call_42",
+                        "type": "function",
+                        "function": { "name": "my_tool", "arguments": "{}" }
+                    }]
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_42",
+                    "name": "my_tool",
+                    "content": "result"
+                }
+            ]
+        });
+        for flag in [false, true] {
+            let normalized = normalize_openai_messages(body.get("messages"), flag);
+            assert_eq!(normalized[0]["tool_calls"][0]["id"], "call_42");
+            assert_eq!(normalized[0]["tool_calls"][0]["name"], "my_tool");
+            assert_eq!(normalized[1]["tool_call_id"], "call_42");
+            assert_eq!(normalized[1]["name"], "my_tool");
+            assert_eq!(normalized[1]["content"], "result");
+        }
+    }
+
+    #[test]
+    fn normalize_glimmer_flag_rejects_non_object_arguments_string() {
+        let body = serde_json::json!({
+            "messages": [{
+                "role": "assistant",
+                "content": "x",
+                "tool_calls": [{
+                    "function": { "name": "t", "arguments": "not-json" }
+                }]
+            }]
+        });
+        let off = normalize_openai_messages(body.get("messages"), false);
+        assert_eq!(
+            off[0]["tool_calls"][0]["arguments"],
+            serde_json::json!({ "_raw": "not-json" })
+        );
+        let on = normalize_openai_messages(body.get("messages"), true);
+        assert_eq!(
+            on[0]["tool_calls"][0]["arguments"],
+            serde_json::Value::String("not-json".into())
+        );
+        // JSON string that parses to non-object (array) also surfaces as string under glimmer
+        let body_arr = serde_json::json!({
+            "messages": [{
+                "role": "assistant",
+                "content": "x",
+                "tool_calls": [{
+                    "function": { "name": "t", "arguments": "[1,2]" }
+                }]
+            }]
+        });
+        let on_arr = normalize_openai_messages(body_arr.get("messages"), true);
+        assert_eq!(
+            on_arr[0]["tool_calls"][0]["arguments"],
+            serde_json::Value::String("[1,2]".into())
+        );
+        let off_arr = normalize_openai_messages(body_arr.get("messages"), false);
+        // non-glimmer keeps parsed array (today's behaviour is to keep whatever parsed)
+        assert_eq!(
+            off_arr[0]["tool_calls"][0]["arguments"],
+            serde_json::json!([1, 2])
         );
     }
 
@@ -9760,9 +11839,36 @@ mod tests {
             &serde_json::json!({ "reasoning_effort": "high" }),
             &resolved,
             &mut request,
+            false,
         )
         .unwrap();
+        assert_eq!(request["reasoning_effort"], "high");
         assert_eq!(request["max_think_tokens"], 4096);
+
+        let mut deepseek_uncapped = serde_json::json!({});
+        apply_http_reasoning_request(
+            &serde_json::json!({ "reasoning_effort": "max" }),
+            &resolved,
+            &mut deepseek_uncapped,
+            true,
+        )
+        .unwrap();
+        assert_eq!(deepseek_uncapped["reasoning_effort"], "max");
+        assert_eq!(deepseek_uncapped["max_think_tokens"], 0);
+
+        let mut deepseek_explicitly_capped = serde_json::json!({});
+        apply_http_reasoning_request(
+            &serde_json::json!({
+                "reasoning_effort": "max",
+                "max_think_tokens": 1234
+            }),
+            &resolved,
+            &mut deepseek_explicitly_capped,
+            true,
+        )
+        .unwrap();
+        assert_eq!(deepseek_explicitly_capped["reasoning_effort"], "max");
+        assert_eq!(deepseek_explicitly_capped["max_think_tokens"], 1234);
 
         let mut disabled = serde_json::json!({});
         apply_http_reasoning_request(
@@ -9771,6 +11877,7 @@ mod tests {
             }),
             &resolved,
             &mut disabled,
+            false,
         )
         .unwrap();
         assert_eq!(disabled["reasoning_effort"], "none");
@@ -9789,13 +11896,29 @@ mod tests {
                 "cached_tokens": 4,
                 "ttft_ms": 8.5,
                 "decode_tok_s": 115.0,
-                "finish_reason": "stop"
+                "finish_reason": "stop",
+                "mtp_ngram": 3,
+                "ngram_mod_windows": 5,
+                "ngram_mod_drafts": 12,
+                "ngram_mod_accepted": 9,
+                "ngram_mod_accept_rate": 0.75,
+                "mtp_windows": 4,
+                "ar_windows": 2,
+                "mtp_retired": true
             }),
         };
         let json = completion_json(&completion);
         assert_eq!(json["usage"]["total_tokens"], 19);
         assert_eq!(json["usage"]["prompt_tokens_details"]["cached_tokens"], 4);
         assert_eq!(json["timings"]["decode_tok_s"], 115.0);
+        assert_eq!(json["timings"]["mtp_ngram"], 3);
+        assert_eq!(json["timings"]["ngram_mod_windows"], 5);
+        assert_eq!(json["timings"]["ngram_mod_drafts"], 12);
+        assert_eq!(json["timings"]["ngram_mod_accepted"], 9);
+        assert_eq!(json["timings"]["ngram_mod_accept_rate"], 0.75);
+        assert_eq!(json["timings"]["mtp_windows"], 4);
+        assert_eq!(json["timings"]["ar_windows"], 2);
+        assert_eq!(json["timings"]["mtp_retired"], true);
         assert_eq!(json["created"], 7);
 
         let qwen_cached = Completion {
@@ -9834,6 +11957,62 @@ mod tests {
             .get("reasoning_content")
             .is_none());
     }
+    #[test]
+    fn apply_reasoning_request_accepts_medium_and_xhigh() {
+        use hipfire_config::{resolve, ConfigLayer, ConfigSource, NamedLayer};
+        use std::path::PathBuf;
+        for effort in ["low", "medium", "xhigh", "high", "max"] {
+            let mut layer = ConfigLayer::default();
+            layer.set_cli("reasoning.effort", effort).unwrap();
+            layer.set_cli("reasoning.max_tokens", "0").unwrap();
+            let resolved = resolve([NamedLayer {
+                source: ConfigSource::GlobalUser {
+                    path: PathBuf::from("config.toml"),
+                },
+                layer,
+            }])
+            .unwrap();
+            let mut req = serde_json::json!({});
+            super::apply_reasoning_request(&resolved, &mut req).unwrap();
+            assert_eq!(
+                req["reasoning_effort"], effort,
+                "effort {effort} must pass through unchanged"
+            );
+        }
+        // auto stays unset (no key), none disables
+        let mut auto_layer = ConfigLayer::default();
+        auto_layer.set_cli("reasoning.effort", "auto").unwrap();
+        auto_layer.set_cli("reasoning.max_tokens", "0").unwrap();
+        let auto_resolved = resolve([NamedLayer {
+            source: ConfigSource::GlobalUser {
+                path: PathBuf::from("config.toml"),
+            },
+            layer: auto_layer,
+        }])
+        .unwrap();
+        let mut auto_req = serde_json::json!({});
+        super::apply_reasoning_request(&auto_resolved, &mut auto_req).unwrap();
+        assert!(
+            auto_req.get("reasoning_effort").is_none(),
+            "auto must stay undefined"
+        );
+
+        let mut none_layer = ConfigLayer::default();
+        none_layer.set_cli("reasoning.effort", "none").unwrap();
+        none_layer.set_cli("reasoning.max_tokens", "0").unwrap();
+        let none_resolved = resolve([NamedLayer {
+            source: ConfigSource::GlobalUser {
+                path: PathBuf::from("config.toml"),
+            },
+            layer: none_layer,
+        }])
+        .unwrap();
+        let mut none_req = serde_json::json!({});
+        super::apply_reasoning_request(&none_resolved, &mut none_req).unwrap();
+        assert_eq!(none_req["reasoning_effort"], "none");
+        assert_eq!(none_req["max_think_tokens"], 1);
+        assert_eq!(none_req["assistant_prefix"], "closed_think");
+    }
 
     #[test]
     fn admission_queue_is_bounded_and_times_out() {
@@ -9866,15 +12045,339 @@ mod tests {
     }
 
     #[test]
+    fn admission_eligible_concurrent_up_to_capacity() {
+        let admission = Arc::new(Admission::new_with_capacity(8, Duration::from_secs(1), 2));
+        let g1 = admission.acquire_for(true, Some("qwen3.5:7b")).unwrap();
+        let g2 = admission.acquire_for(true, Some("qwen3.5:7b")).unwrap();
+        assert_eq!(admission.inflight(), 2);
+        // Third eligible same model should queue, then timeout quickly.
+        let admission2 = Arc::clone(&admission);
+        let handle =
+            thread::spawn(move || admission2.acquire_for(true, Some("qwen3.5:7b")).unwrap());
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(admission.inflight(), 3); // 2 held + 1 queued
+        drop(g1);
+        let g3 = handle.join().unwrap();
+        assert_eq!(admission.inflight(), 2);
+        drop(g2);
+        drop(g3);
+        assert_eq!(admission.inflight(), 0);
+    }
+
+    #[test]
+    fn admission_ineligible_is_exclusive() {
+        let admission = Arc::new(Admission::new_with_capacity(8, Duration::from_secs(1), 2));
+        let g1 = admission.acquire_for(true, Some("qwen3.5:7b")).unwrap();
+        // Ineligible must wait for eligible to finish, even though capacity not full.
+        let admission2 = Arc::clone(&admission);
+        let handle = thread::spawn(move || admission2.acquire().unwrap());
+        thread::sleep(Duration::from_millis(50));
+        assert!(admission.inflight() == 2); // 1 eligible + 1 queued ineligible
+        drop(g1);
+        let g_inelig = handle.join().unwrap();
+        assert_eq!(admission.inflight(), 1);
+        // While ineligible holds, eligible must wait.
+        let admission3 = Arc::clone(&admission);
+        let handle2 =
+            thread::spawn(move || admission3.acquire_for(true, Some("qwen3.5:7b")).unwrap());
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(admission.inflight(), 2);
+        drop(g_inelig);
+        let g2 = handle2.join().unwrap();
+        assert_eq!(admission.inflight(), 1);
+        drop(g2);
+    }
+
+    #[test]
+    fn admission_model_lease_prevents_cross_model_batch() {
+        let admission = Arc::new(Admission::new_with_capacity(8, Duration::from_secs(1), 2));
+        let g1 = admission.acquire_for(true, Some("qwen3.5:7b")).unwrap();
+        // Different model cannot share batch lanes, must wait for exclusive.
+        let admission2 = Arc::clone(&admission);
+        let handle =
+            thread::spawn(move || admission2.acquire_for(true, Some("qwen3.5:14b")).unwrap());
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(admission.inflight(), 2); // 1 held + 1 queued due to model mismatch
+        drop(g1);
+        let g2 = handle.join().unwrap();
+        assert_eq!(admission.inflight(), 1);
+        drop(g2);
+    }
+
+    #[test]
+    fn batch_eligibility_conservative_checks() {
+        // Eligible: tp=1 qwen with one plain user string.
+        let body =
+            serde_json::json!({"model":"qwen3.5:7b","messages":[{"role":"user","content":"hi"}]});
+        assert!(is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("qwen35"),
+            true
+        ));
+        // Eligible: absent messages (prompt path) for Qwen.
+        let body = serde_json::json!({"model":"qwen3.5:7b","prompt":"hi"});
+        assert!(is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("qwen35"),
+            true
+        ));
+        // Eligible: empty messages array for Qwen.
+        let body = serde_json::json!({"model":"qwen3.5:7b","messages":[]});
+        assert!(is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("qwen35"),
+            true
+        ));
+        // Tools disqualify.
+        let body = serde_json::json!({"model":"qwen3.5:7b","tools":[{"type":"function","function":{"name":"x"}}]});
+        assert!(!is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("qwen35"),
+            true
+        ));
+        // Image / multipart content disqualifies.
+        let body = serde_json::json!({"model":"qwen3.5:7b","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:"}}]}]});
+        assert!(!is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("qwen35"),
+            true
+        ));
+        // Multipart text-only array content also disqualifies (must be plain string).
+        let body = serde_json::json!({"model":"qwen3.5:7b","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]});
+        assert!(!is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("qwen35"),
+            true
+        ));
+        // system+user history disqualifies.
+        let body = serde_json::json!({"model":"qwen3.5:7b","messages":[
+            {"role":"system","content":"be brief"},
+            {"role":"user","content":"hi"}
+        ]});
+        assert!(!is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("qwen35"),
+            true
+        ));
+        // user+assistant multi-turn disqualifies.
+        let body = serde_json::json!({"model":"qwen3.5:7b","messages":[
+            {"role":"user","content":"hi"},
+            {"role":"assistant","content":"hello"}
+        ]});
+        assert!(!is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("qwen35"),
+            true
+        ));
+        // Tool-call content on the sole message disqualifies.
+        let body = serde_json::json!({"model":"qwen3.5:7b","messages":[{
+            "role":"user",
+            "content":"hi",
+            "tool_calls":[{"id":"c0","type":"function","function":{"name":"x","arguments":"{}"}}]
+        }]});
+        assert!(!is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("qwen35"),
+            true
+        ));
+        // Qwen tp=4 pure EP is eligible when daemon admits batch.
+        let body =
+            serde_json::json!({"model":"qwen3.5:7b","messages":[{"role":"user","content":"hi"}]});
+        assert!(is_batch_eligible_request(
+            &body,
+            Some(4),
+            Some("qwen35"),
+            true
+        ));
+        // Qwen tp=2 (and any non-1/non-4) disqualifies.
+        let body = serde_json::json!({"model":"qwen3.5:7b"});
+        assert!(!is_batch_eligible_request(
+            &body,
+            Some(2),
+            Some("qwen35"),
+            true
+        ));
+        // Non-qwen disqualifies.
+        let body = serde_json::json!({"model":"deepseek4:671b"});
+        assert!(!is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("deepseek4"),
+            true
+        ));
+        // Daemon load says batch incapable: HTTP admission must not invent it.
+        let body =
+            serde_json::json!({"model":"qwen3.5:7b","messages":[{"role":"user","content":"hi"}]});
+        assert!(!is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("qwen35"),
+            false
+        ));
+        // Eligible: tp=1 LFM2 dense with one plain user string when daemon admits batch.
+        let body =
+            serde_json::json!({"model":"lfm2.5:1.2b","messages":[{"role":"user","content":"hi"}]});
+        assert!(is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("lfm2"),
+            true
+        ));
+        // Eligible: absent messages for LFM.
+        let body = serde_json::json!({"model":"lfm2.5:1.2b","prompt":"hi"});
+        assert!(is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("lfm2"),
+            true
+        ));
+        // Eligible: empty messages for LFM.
+        let body = serde_json::json!({"model":"lfm2.5:1.2b","messages":[]});
+        assert!(is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("lfm2"),
+            true
+        ));
+        // LFM rejects system+user the same way.
+        let body = serde_json::json!({"model":"lfm2.5:1.2b","messages":[
+            {"role":"system","content":"be brief"},
+            {"role":"user","content":"hi"}
+        ]});
+        assert!(!is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("lfm2"),
+            true
+        ));
+        // LFM rejects user+assistant.
+        let body = serde_json::json!({"model":"lfm2.5:1.2b","messages":[
+            {"role":"user","content":"hi"},
+            {"role":"assistant","content":"hello"}
+        ]});
+        assert!(!is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("lfm2"),
+            true
+        ));
+        // LFM rejects tool-call content.
+        let body = serde_json::json!({"model":"lfm2.5:1.2b","messages":[{
+            "role":"user",
+            "content":"hi",
+            "tool_calls":[{"id":"c0","type":"function","function":{"name":"x","arguments":"{}"}}]
+        }]});
+        assert!(!is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("lfm2"),
+            true
+        ));
+        // LFM rejects image/multipart content.
+        let body = serde_json::json!({"model":"lfm2.5:1.2b","messages":[{"role":"user","content":[
+            {"type":"text","text":"describe"},
+            {"type":"image_url","image_url":{"url":"data:image/png;base64,YWJj"}}
+        ]}]});
+        assert!(!is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("lfm2"),
+            true
+        ));
+        // LFM tp=4 disqualifies (dense remains tp=1 only).
+        let body =
+            serde_json::json!({"model":"lfm2.5:1.2b","messages":[{"role":"user","content":"hi"}]});
+        assert!(!is_batch_eligible_request(
+            &body,
+            Some(4),
+            Some("lfm2"),
+            true
+        ));
+        // Daemon load says batch incapable: LFM HTTP admission must not invent it.
+        let body =
+            serde_json::json!({"model":"lfm2.5:1.2b","messages":[{"role":"user","content":"hi"}]});
+        assert!(!is_batch_eligible_request(
+            &body,
+            Some(1),
+            Some("lfm2"),
+            false
+        ));
+    }
+
+    #[test]
+    fn batch_messages_shape_matches_daemon_contract() {
+        // Absent / empty → eligible shape.
+        assert!(batch_messages_are_single_user(&serde_json::json!({})));
+        assert!(batch_messages_are_single_user(
+            &serde_json::json!({"messages":[]})
+        ));
+        // Exactly one plain user string → eligible.
+        assert!(batch_messages_are_single_user(&serde_json::json!({
+            "messages":[{"role":"user","content":"hi"}]
+        })));
+        // system+user, user+assistant → reject.
+        assert!(!batch_messages_are_single_user(&serde_json::json!({
+            "messages":[
+                {"role":"system","content":"sys"},
+                {"role":"user","content":"hi"}
+            ]
+        })));
+        assert!(!batch_messages_are_single_user(&serde_json::json!({
+            "messages":[
+                {"role":"user","content":"hi"},
+                {"role":"assistant","content":"yo"}
+            ]
+        })));
+        // Non-user sole role → reject.
+        assert!(!batch_messages_are_single_user(&serde_json::json!({
+            "messages":[{"role":"system","content":"sys"}]
+        })));
+        // tool_calls payload → reject.
+        assert!(!batch_messages_are_single_user(&serde_json::json!({
+            "messages":[{
+                "role":"user",
+                "content":"hi",
+                "tool_calls":[{"id":"c0"}]
+            }]
+        })));
+        // Multipart / image array content → reject.
+        assert!(!batch_messages_are_single_user(&serde_json::json!({
+            "messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]
+        })));
+        assert!(!batch_messages_are_single_user(&serde_json::json!({
+            "messages":[{"role":"user","content":[
+                {"type":"image_url","image_url":{"url":"data:"}}
+            ]}]
+        })));
+        // Non-array messages → reject.
+        assert!(!batch_messages_are_single_user(&serde_json::json!({
+            "messages":"not-an-array"
+        })));
+    }
+
+    #[test]
     fn daemon_tool_calls_map_to_openai_shape() {
         let calls = vec![
             ToolCall {
+                id: None,
                 name: "read_file".into(),
                 arguments: serde_json::json!({ "path": "README.md" }),
+                rendered_body: None,
             },
             ToolCall {
+                id: None,
                 name: "write_file".into(),
                 arguments: serde_json::json!({ "path": "out.txt", "text": "hi" }),
+                rendered_body: None,
             },
         ];
         let mapped = openai_tool_calls(&calls);
@@ -9915,8 +12418,10 @@ mod tests {
 
     fn sample_tc(name: &str, arguments: serde_json::Value) -> ToolCall {
         ToolCall {
+            id: None,
             name: name.into(),
             arguments,
+            rendered_body: None,
         }
     }
 
@@ -12521,16 +15026,21 @@ for line in sys.stdin:
 
             let registry = hipfire_registry::bundled().unwrap();
             let shared = Arc::new(ServeShared {
+                // Test harness drives the single-daemon path.
+                slot_engine: None,
                 runtime: Mutex::new(ServeRuntime {
                     engine,
                     paths: paths.clone(),
                     registry,
                     current_path: None,
+                    current_arch: None,
+                    continuous_batch_capable: false,
                     current_max_seq: 0,
                     cache_capable: false,
                     kv_override: None,
                     kv_backend_override: None,
                     tp: None,
+                    continuous_batch_size: 1,
                 }),
                 meta: Mutex::new(ServeMeta {
                     current_model: None,
@@ -13390,26 +15900,88 @@ for line in sys.stdin:
     #[test]
     fn bench_generate_request_includes_numeric_first_attempt() {
         let req = bench_generate_request("bench prompt", 37);
-        assert_eq!(
-            req.get("type").and_then(|v| v.as_str()),
-            Some("generate")
-        );
-        assert_eq!(
-            req.get("attempt_id").and_then(|v| v.as_u64()),
-            Some(1)
-        );
-        let id = req
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        assert_eq!(req.get("type").and_then(|v| v.as_str()), Some("generate"));
+        assert_eq!(req.get("attempt_id").and_then(|v| v.as_u64()), Some(1));
+        let id = req.get("id").and_then(|v| v.as_str()).unwrap_or("");
         assert!(!id.is_empty(), "id must be a non-empty string");
         assert_eq!(
             req.get("prompt").and_then(|v| v.as_str()),
             Some("bench prompt")
         );
+        assert_eq!(req.get("max_tokens").and_then(|v| v.as_u64()), Some(37));
+    }
+
+    /// Every benchmark generate must ask for answer mode.
+    ///
+    /// A reasoning model opens `<think>` in its first tokens and cannot close
+    /// it inside a benchmark's fixed budget (16 tokens for the warmup, 128 for
+    /// the measured runs). The daemon classifies an unclosed think span at
+    /// finish as a non-retryable validation terminal *ahead of* the length cap
+    /// — `QwenArTerminalCause::resolve` and `qwen_dflash_wire_terminal` in the
+    /// daemon both order it that way — so a thinking benchmark aborts on the
+    /// warmup, before it records a single sample.
+    #[test]
+    fn bench_generate_request_is_answer_mode_by_default() {
+        let req = bench_generate_request("bench prompt", 128);
         assert_eq!(
-            req.get("max_tokens").and_then(|v| v.as_u64()),
-            Some(37)
+            req.get("max_think_tokens").and_then(|v| v.as_u64()),
+            Some(1),
+            "benchmark generates must cap thinking"
         );
+        assert_eq!(
+            req.get("assistant_prefix").and_then(|v| v.as_str()),
+            Some("closed_think"),
+            "benchmark generates must start in answer mode"
+        );
+        assert_eq!(
+            req.get("reasoning_effort").and_then(|v| v.as_str()),
+            Some("none")
+        );
+    }
+
+    /// `--reasoning-on` restores the thinking turn for anyone who wants to
+    /// benchmark that path, and must produce a request carrying none of the
+    /// answer-mode fields.
+    #[test]
+    fn bench_reasoning_on_opts_back_into_thinking() {
+        let req = bench_generate_request_reasoning("bench prompt", 128, true);
+        assert!(req.get("max_think_tokens").is_none());
+        assert!(req.get("assistant_prefix").is_none());
+        assert!(req.get("reasoning_effort").is_none());
+        // Still an ordinary benchmark generate otherwise.
+        assert_eq!(req.get("max_tokens").and_then(|v| v.as_u64()), Some(128));
+    }
+
+    #[test]
+    fn qwen_mq4r_decode_prewarm_is_fail_closed_to_the_exact_route() {
+        let qwen = serde_json::json!({ "arch": "qwen3_5_moe" });
+        let qwen_dense = serde_json::json!({ "arch": "qwen3_5" });
+        let deepseek = serde_json::json!({ "arch": "deepseek4" });
+
+        assert!(should_prewarm_qwen_mq4r_decode(
+            Path::new("qwen3.6-35b-a3b.mq4r"),
+            &qwen,
+            None,
+        ));
+        assert!(should_prewarm_qwen_mq4r_decode(
+            Path::new("QWEN3.6-9B.MQ4R"),
+            &qwen_dense,
+            Some(1),
+        ));
+        assert!(!should_prewarm_qwen_mq4r_decode(
+            Path::new("qwen3.6-35b-a3b.mq4"),
+            &qwen,
+            None,
+        ));
+        assert!(!should_prewarm_qwen_mq4r_decode(
+            Path::new("deepseek-v4-flash.mq4r"),
+            &deepseek,
+            None,
+        ));
+        assert!(!should_prewarm_qwen_mq4r_decode(
+            Path::new("qwen3.6-35b-a3b.mq4r"),
+            &qwen,
+            Some(2),
+        ));
     }
 }

@@ -330,6 +330,17 @@ impl ArchCaps {
     pub fn is_rdna3p5(&self) -> bool {
         self.is_rdna3p5
     }
+    /// Discrete RDNA3 (gfx1100 / gfx1101 / gfx1102) — 96-CU class dGPU at
+    /// ~960 GB/s. Distinct from the RDNA3.5 APU for tuning purposes.
+    pub fn is_rdna3_discrete(&self) -> bool {
+        self.is_rdna3_dgpu
+    }
+    /// RDNA3.5 APU (gfx1150 / gfx1151 / gfx1152) — unified-memory APU with
+    /// far fewer CUs. Shares `has_wmma_w32` with discrete RDNA3 but needs
+    /// independent tuning (prefetch, LDS pressure, compile-time head_dim).
+    pub fn is_rdna35_apu(&self) -> bool {
+        self.is_rdna3p5
+    }
     /// MQ4-Lloyd `_mb4` batch-fanout kernel admission. The MQ4-Lloyd mb4
     /// `*_mb4_for_arch` source selectors in `kernels.rs` ship a real kernel
     /// only for gfx1100/1101/1102 (RDNA3 dGPU) and gfx1151 (the Strix-Halo K4
@@ -349,6 +360,23 @@ impl ArchCaps {
     /// bandwidth tuning knob — kept as the exclusion form to mirror the select.
     pub fn supports_mq3_lloyd_mb4(&self) -> bool {
         self.is_rdna3 && !self.is_gfx1152 && !self.is_gfx1103
+    }
+    /// DeepSeek V4 F16 compressor-cache admission. The route is carried by two
+    /// kernel sources — `deepseek4_compressor_cache_f16.hip` and
+    /// `compressor_commit_staged_f16.hip`. Neither is arch-suffixed: the only
+    /// generation-specific construct is the indexer score kernel's WMMA, whose
+    /// fragment layout and D row mapping are selected in-source (gfx12 takes
+    /// 8-wide fragments with D row `8*k_half + j`, gfx11 takes 16-wide with
+    /// `2*j + k_half`).
+    ///
+    /// This predicate MUST stay in lock-step with those two `#if` arms. gfx11
+    /// uses `has_wmma_w32` and the standard wave32 F16 WMMA intrinsic; gfx12
+    /// uses `has_wmma_w32_gfx12` and its distinct intrinsic and fragment layout.
+    /// CAPABILITY gate (can this chip run the kernels), not a capacity or
+    /// bandwidth policy — whether F16 storage is *worth* selecting is decided
+    /// by the loader, not here.
+    pub fn supports_ds4_f16_compressor_cache(&self) -> bool {
+        self.has_wmma_w32 || self.has_wmma_w32_gfx12
     }
     pub fn is_rdna4(&self) -> bool {
         self.is_rdna4
@@ -485,6 +513,9 @@ mod tests {
         assert!(!caps.is_rdna3_dgpu());
         assert!(caps.is_rdna3p5());
         assert!(caps.is_gfx1151());
+        assert!(caps.has_wmma_w32());
+        assert!(!caps.has_wmma_w32_gfx12());
+        assert!(caps.supports_ds4_f16_compressor_cache());
     }
 
     #[test]
@@ -522,6 +553,7 @@ mod tests {
         assert!(caps.has_wmma());
         assert!(!caps.has_wmma_w32());
         assert!(!caps.is_rdna3());
+        assert!(caps.supports_ds4_f16_compressor_cache());
     }
 
     #[test]

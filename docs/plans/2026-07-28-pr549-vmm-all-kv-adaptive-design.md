@@ -425,7 +425,7 @@ No gate is optional for the claim it covers. Vocabulary follows
 | **Existing Q8 / FWHT3 DFlash** | Static VMM+DFlash request-level route proof on both already-supported encodings; adaptive DFlash remains rejected |
 | **MQ4R retained-PM4 + VRAM** | Canonical Q8 TG128 route proof; matched contiguous/VMM throughput; max-context load VRAM; exact post-unload idle baseline |
 | **CLI and serve regressions** | Config-off + `run --spec dflash` retains inherited draft; DFlash requires per-request evidence; all serve assertions use the current-attempt log slice |
-| **Final repository gates** | Changed-file rustfmt, workspace clippy, workspace unit suite, GitNexus change-scope report, and independent adversarial rereview |
+| **Final repository gates** | Changed-file rustfmt, workspace clippy, workspace unit suite, CodeGraph change-scope review, and independent adversarial rereview |
 
 Claims from hardware evidence are **gfx1201-scoped** unless a future record
 adds another arch with its own table.

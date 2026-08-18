@@ -21,6 +21,41 @@ pub fn mq4r_redline_default(gpu_arch: &str, model_path: &str, pp: usize, tp: usi
             .is_some_and(|extension| extension.eq_ignore_ascii_case("mq4r"))
 }
 
+/// Automatic retained-Redline admission for a loaded model.
+///
+/// MQ4R keeps its existing cross-model policy with one temporary carve-out:
+/// Muse Glimmer (arch 14) IS an MQ4R Redline SKU, but it is not lowered to
+/// Redline PM4 yet, so automatic admission is withheld until that lowering
+/// lands — the extension-only policy would otherwise route Glimmer onto a
+/// dispatch path that cannot yet execute it. Delete this carve-out together
+/// with the lowering. DeepSeek4 MQ2R is narrower still: only the certified
+/// gfx1151 single-GPU AR route is admitted, and an installed drafter keeps the
+/// model on its speculative execution path.
+pub fn retained_redline_default(
+    gpu_arch: &str,
+    model_arch: &str,
+    model_path: &str,
+    pp: usize,
+    tp: usize,
+    has_drafter: bool,
+) -> bool {
+    if model_arch.eq_ignore_ascii_case("muse_glimmer") {
+        return false;
+    }
+    if mq4r_redline_default(gpu_arch, model_path, pp, tp) {
+        return true;
+    }
+    gpu_arch.eq_ignore_ascii_case("gfx1151")
+        && model_arch.eq_ignore_ascii_case("deepseek4")
+        && pp == 1
+        && tp == 1
+        && !has_drafter
+        && std::path::Path::new(model_path)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("mq2r"))
+}
+
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     pub normalize_prompt: bool,
@@ -171,7 +206,7 @@ impl RuntimeConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{mq4r_redline_default, RuntimeConfig};
+    use super::{mq4r_redline_default, retained_redline_default, RuntimeConfig};
     use hipfire_config::{resolve, ConfigLayer, ConfigSource, NamedLayer, ProcessConfig};
 
     #[test]
@@ -264,6 +299,105 @@ mod tests {
             "/models/qwen3.6-35b-a3b.mq4r",
             1,
             2,
+        ));
+    }
+
+    #[test]
+    fn muse_glimmer_mq4r_defers_redline_until_pm4_lowering() {
+        // Glimmer's trunk is a genuine MQ4R Redline SKU, but it is not lowered
+        // to Redline PM4 yet, so the extension-only policy must not admit it.
+        // Retire this test with the carve-out when the lowering lands.
+        for gpu_arch in ["gfx1100", "gfx1151", "gfx1201"] {
+            assert!(
+                mq4r_redline_default(gpu_arch, "/models/muse-glimmer-30b.mq4r", 1, 1),
+                "extension-only policy still matches the Glimmer trunk"
+            );
+            assert!(
+                !retained_redline_default(
+                    gpu_arch,
+                    "muse_glimmer",
+                    "/models/muse-glimmer-30b.mq4r",
+                    1,
+                    1,
+                    false,
+                ),
+                "glimmer must stay on HIP by default on {gpu_arch}"
+            );
+            assert!(
+                !retained_redline_default(
+                    gpu_arch,
+                    "muse_glimmer",
+                    "/models/muse-glimmer-30b.mq4r",
+                    1,
+                    1,
+                    true,
+                ),
+                "a loaded drafter does not re-admit glimmer on {gpu_arch}"
+            );
+            // The carve-out is glimmer-scoped, not a global MQ4R retreat.
+            assert!(
+                retained_redline_default(
+                    gpu_arch,
+                    "qwen3_6_moe",
+                    "/models/qwen3.6-35b-a3b.mq4r",
+                    1,
+                    1,
+                    false,
+                ),
+                "qwen MQ4R keeps auto-Redline on {gpu_arch}"
+            );
+        }
+    }
+
+    #[test]
+    fn deepseek4_mq2r_redline_default_requires_gfx1151_ar() {
+        assert!(retained_redline_default(
+            "gfx1151",
+            "deepseek4",
+            "/models/deepseek-v4-flash-0731.mq2r",
+            1,
+            1,
+            false,
+        ));
+        assert!(!retained_redline_default(
+            "gfx1151",
+            "deepseek4",
+            "/models/deepseek-v4-flash-0731.mq2r",
+            1,
+            1,
+            true,
+        ));
+        assert!(!retained_redline_default(
+            "gfx1100",
+            "deepseek4",
+            "/models/deepseek-v4-flash-0731.mq2r",
+            1,
+            1,
+            false,
+        ));
+        assert!(!retained_redline_default(
+            "gfx1151",
+            "qwen3_5_moe",
+            "/models/deepseek-v4-flash-0731.mq2r",
+            1,
+            1,
+            false,
+        ));
+        assert!(!retained_redline_default(
+            "gfx1151",
+            "deepseek4",
+            "/models/deepseek-v4-flash-0731.mq2r",
+            2,
+            1,
+            false,
+        ));
+        assert!(!retained_redline_default(
+            "gfx1151",
+            "deepseek4",
+            "/models/deepseek-v4-flash-0731.mq2",
+            1,
+            1,
+            false,
         ));
     }
 }

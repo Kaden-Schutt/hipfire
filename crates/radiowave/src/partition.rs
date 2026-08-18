@@ -56,13 +56,8 @@ pub enum PartitionError {
         device_cu_count: u32,
     },
     /// Equal-parts layout: `parts` does not divide the device CU resource.
-    #[error(
-        "equal partition count {parts} does not divide device CU count {device_cu_count}"
-    )]
-    NonDividing {
-        device_cu_count: u32,
-        parts: u32,
-    },
+    #[error("equal partition count {parts} does not divide device CU count {device_cu_count}")]
+    NonDividing { device_cu_count: u32, parts: u32 },
     /// Multi-slice coverage check failed (gaps, overlap, or sum mismatch).
     #[error(
         "partition set covers {covered} CUs but device has {device_cu_count} \
@@ -125,14 +120,15 @@ pub fn validate_partition_context(
         return Err(PartitionError::ZeroCount);
     }
 
-    let end = partition
-        .cu_offset
-        .checked_add(partition.cu_count)
-        .ok_or(PartitionError::OutOfBounds {
-            cu_offset: partition.cu_offset,
-            cu_count: partition.cu_count,
-            device_cu_count,
-        })?;
+    let end =
+        partition
+            .cu_offset
+            .checked_add(partition.cu_count)
+            .ok_or(PartitionError::OutOfBounds {
+                cu_offset: partition.cu_offset,
+                cu_count: partition.cu_count,
+                device_cu_count,
+            })?;
     if end > device_cu_count {
         return Err(PartitionError::OutOfBounds {
             cu_offset: partition.cu_offset,
@@ -236,7 +232,7 @@ pub fn equal_partitions(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::{from_str, to_string, to_value, Value};
+    use serde_json::{Value, from_str, to_string, to_value};
 
     #[test]
     fn partition_context_serde_round_trip() {
@@ -349,10 +345,7 @@ mod tests {
             validate_partition_context(&ctx, 0),
             Err(PartitionError::ZeroDevice)
         );
-        assert_eq!(
-            validate_equal_parts(0, 4),
-            Err(PartitionError::ZeroDevice)
-        );
+        assert_eq!(validate_equal_parts(0, 4), Err(PartitionError::ZeroDevice));
         assert_eq!(
             equal_partitions(0, 4, false),
             Err(PartitionError::ZeroDevice)

@@ -705,6 +705,7 @@ impl App {
         self.chat.messages.push(ChatMessage {
             role: "user".into(),
             content: prompt,
+            reasoning_content: None,
         });
         self.spawn_stream();
     }
@@ -717,6 +718,7 @@ impl App {
         self.chat.messages.push(ChatMessage {
             role: "assistant".into(),
             content: String::new(),
+            reasoning_content: None,
         });
         self.chat.sending = true;
         self.chat.status = "streaming from hipfire serve".into();
@@ -737,7 +739,11 @@ impl App {
         let top_p = self.chat.top_p;
         let mut messages = self.chat.messages.clone();
         if let Some(last) = messages.last_mut() {
-            if last.role == "assistant" && last.content.is_empty() {
+            let reasoning_empty = last
+                .reasoning_content
+                .as_deref()
+                .map_or(true, |s| s.is_empty());
+            if last.role == "assistant" && last.content.is_empty() && reasoning_empty {
                 messages.pop();
             }
         }
@@ -747,6 +753,7 @@ impl App {
                 ChatMessage {
                     role: "system".into(),
                     content: self.chat.system_prompt.clone(),
+                    reasoning_content: None,
                 },
             );
         }
@@ -1498,13 +1505,26 @@ impl App {
         if let Some(rx) = self.chat.rx.take() {
             while let Ok(event) = rx.try_recv() {
                 match event {
-                    ChatEvent::Delta(text) => {
+                    ChatEvent::Reasoning(text) => {
+                        if let Some(last) = self.chat.messages.last_mut() {
+                            let rc = last.reasoning_content.get_or_insert_with(String::new);
+                            rc.push_str(&text);
+                        }
+                        self.chat.gen_tokens += 1;
+                    }
+                    ChatEvent::Content(text) => {
                         if let Some(last) = self.chat.messages.last_mut() {
                             last.content.push_str(&text);
                         }
                         self.chat.gen_tokens += 1;
                     }
                     ChatEvent::Done => {
+                        // Normalize empty reasoning to None so serialization omits it.
+                        if let Some(last) = self.chat.messages.last_mut() {
+                            if last.reasoning_content.as_deref().is_some_and(|s| s.is_empty()) {
+                                last.reasoning_content = None;
+                            }
+                        }
                         // Record throughput + drop a zero-delta empty assistant.
                         if let Some((stats, secs)) = self.chat.finalize_generation() {
                             self.log_request(stats, secs);
@@ -1514,6 +1534,12 @@ impl App {
                         finished = true;
                     }
                     ChatEvent::Error(err) => {
+                        // Normalize empty reasoning as with Done.
+                        if let Some(last) = self.chat.messages.last_mut() {
+                            if last.reasoning_content.as_deref().is_some_and(|s| s.is_empty()) {
+                                last.reasoning_content = None;
+                            }
+                        }
                         // finalize drops the trailing empty assistant so a failed
                         // request doesn't read as a blank reply; surface the cause.
                         // An errored partial is NOT logged to the inspector
@@ -1642,7 +1668,11 @@ impl ChatState {
             }
         }
         if let Some(last) = self.messages.last() {
-            if last.role == "assistant" && last.content.is_empty() {
+            let reasoning_empty = last
+                .reasoning_content
+                .as_deref()
+                .map_or(true, |s| s.is_empty());
+            if last.role == "assistant" && last.content.is_empty() && reasoning_empty {
                 self.messages.pop();
             }
         }
@@ -2308,6 +2338,7 @@ mod tests {
         app.chat.messages.push(ChatMessage {
             role: "user".into(),
             content: "hi".into(),
+            reasoning_content: None,
         });
         app.handle_chat_command("clear");
         assert!(app.chat.messages.is_empty());
@@ -2335,10 +2366,12 @@ mod tests {
             ChatMessage {
                 role: "user".into(),
                 content: "hi".into(),
+                reasoning_content: None,
             },
             ChatMessage {
                 role: "assistant".into(),
                 content: "hello".into(),
+                reasoning_content: None,
             },
         ];
         app.handle_chat_command("save debug");
@@ -2366,10 +2399,12 @@ mod tests {
             ChatMessage {
                 role: "user".into(),
                 content: "first".into(),
+                reasoning_content: None,
             },
             ChatMessage {
                 role: "assistant".into(),
                 content: "reply".into(),
+                reasoning_content: None,
             },
         ];
         app.handle_chat_command("edit");
@@ -2389,10 +2424,12 @@ mod tests {
             ChatMessage {
                 role: "user".into(),
                 content: "q".into(),
+                reasoning_content: None,
             },
             ChatMessage {
                 role: "assistant".into(),
                 content: "the answer".into(),
+                reasoning_content: None,
             },
         ];
         app.handle_chat_command("copy");
@@ -2421,10 +2458,12 @@ mod tests {
             ChatMessage {
                 role: "user".into(),
                 content: "q".into(),
+                reasoning_content: None,
             },
             ChatMessage {
                 role: "assistant".into(),
                 content: "a".into(),
+                reasoning_content: None,
             },
         ];
         app.regenerate();
@@ -2447,10 +2486,12 @@ mod tests {
             ChatMessage {
                 role: "user".into(),
                 content: "hi".into(),
+                reasoning_content: None,
             },
             ChatMessage {
                 role: "assistant".into(),
-                content: String::new(), // empty slot, no deltas streamed
+                content: String::new(),
+            reasoning_content: None, // empty slot, no deltas streamed
             },
         ];
         let (tx, rx) = std::sync::mpsc::channel();
@@ -2492,10 +2533,12 @@ mod tests {
             ChatMessage {
                 role: "user".into(),
                 content: "hi".into(),
+                reasoning_content: None,
             },
             ChatMessage {
                 role: "assistant".into(),
                 content: String::new(),
+                reasoning_content: None,
             },
         ];
         let (tx, rx) = std::sync::mpsc::channel();
@@ -2503,8 +2546,8 @@ mod tests {
         app.chat.sending = true;
         app.chat.gen_start = Some(Instant::now());
         app.chat.gen_model = "qwen3.5:9b".into();
-        tx.send(ChatEvent::Delta("hello".into())).unwrap();
-        tx.send(ChatEvent::Delta(" world".into())).unwrap();
+        tx.send(ChatEvent::Content("hello".into())).unwrap();
+        tx.send(ChatEvent::Content(" world".into())).unwrap();
         tx.send(ChatEvent::Done).unwrap();
         app.drain_chat_events();
         assert_eq!(app.request_log.len(), 1, "completed request is logged");
@@ -2521,10 +2564,12 @@ mod tests {
             ChatMessage {
                 role: "user".into(),
                 content: "hi".into(),
+                reasoning_content: None,
             },
             ChatMessage {
                 role: "assistant".into(),
                 content: String::new(),
+                reasoning_content: None,
             },
         ];
         let (tx, rx) = std::sync::mpsc::channel();
@@ -2532,7 +2577,7 @@ mod tests {
         app.chat.sending = true;
         app.chat.gen_start = Some(Instant::now());
         app.chat.gen_model = "qwen3.5:9b".into();
-        tx.send(ChatEvent::Delta("partial".into())).unwrap();
+        tx.send(ChatEvent::Content("partial".into())).unwrap();
         tx.send(ChatEvent::Error("boom".into())).unwrap();
         app.drain_chat_events();
         assert!(
@@ -2553,6 +2598,92 @@ mod tests {
             app.registry.expanded_groups.contains("qwen"),
             "reload must carry expanded groups across the registry reload"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn drain_chat_events_separates_reasoning_and_content() {
+        // SSE fold now routes Reasoning and Content to separate accumulators;
+        // rendering keeps visual order but history must keep them distinct.
+        let (mut app, dir) = test_app();
+        app.tab = Tab::Chat;
+        app.chat.messages = vec![
+            ChatMessage {
+                role: "user".into(),
+                content: "hi".into(),
+                reasoning_content: None,
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: String::new(),
+                reasoning_content: None,
+            },
+        ];
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.chat.rx = Some(rx);
+        app.chat.sending = true;
+        app.chat.gen_start = Some(Instant::now());
+        app.chat.gen_model = "test".into();
+        tx.send(ChatEvent::Reasoning("think ".into())).unwrap();
+        tx.send(ChatEvent::Reasoning("step".into())).unwrap();
+        tx.send(ChatEvent::Content("answer".into())).unwrap();
+        tx.send(ChatEvent::Done).unwrap();
+        app.drain_chat_events();
+        let last = app.chat.messages.last().unwrap();
+        assert_eq!(
+            last.reasoning_content.as_deref(),
+            Some("think step"),
+            "reasoning deltas accumulated separately"
+        );
+        assert_eq!(last.content, "answer", "content deltas accumulated separately");
+        // Serialized request keeps them as distinct keys for prefix-cache.
+        let v = serde_json::to_value(&*app.chat.messages).unwrap();
+        let asst = &v[1];
+        assert_eq!(asst["content"], "answer");
+        assert_eq!(asst["reasoning_content"], "think step");
+        assert_eq!(app.chat.gen_tokens, 3);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn chat_message_legacy_json_without_reasoning_deserializes() {
+        // Old chat_history.json files lack the field; they must load as None.
+        let msg: ChatMessage = serde_json::from_value(serde_json::json!({
+            "role": "assistant",
+            "content": "old"
+        }))
+        .unwrap();
+        assert!(msg.reasoning_content.is_none());
+        let v = serde_json::to_value(&msg).unwrap();
+        assert!(v.get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn reasoning_empty_normalizes_to_none_on_done() {
+        let (mut app, dir) = test_app();
+        app.tab = Tab::Chat;
+        app.chat.messages = vec![
+            ChatMessage {
+                role: "user".into(),
+                content: "hi".into(),
+                reasoning_content: None,
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: String::new(),
+                reasoning_content: None,
+            },
+        ];
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.chat.rx = Some(rx);
+        app.chat.sending = true;
+        app.chat.gen_start = Some(Instant::now());
+        // No reasoning deltas, but an empty Some("") was somehow set.
+        app.chat.messages.last_mut().unwrap().reasoning_content = Some(String::new());
+        tx.send(ChatEvent::Content("hi".into())).unwrap();
+        tx.send(ChatEvent::Done).unwrap();
+        app.drain_chat_events();
+        assert!(app.chat.messages.last().unwrap().reasoning_content.is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

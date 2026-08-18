@@ -1,0 +1,30 @@
+{"type":"pong"}
+{"type":"loaded","arch":"deepseek4","dim":0,"layers":0,"vocab":0,"vl":false,"cache_capable":true,"retry_reset_eligible":false}
+{"type":"reasoning","id":"g0-streamfix-on-1-32","text":"I need","attempt_id":1}
+{"type":"reasoning","id":"g0-streamfix-on-1-32","text":" to comp","attempt_id":1}
+{"type":"reasoning","id":"g0-streamfix-on-1-32","text":"let","attempt_id":1}
+{"type":"reasoning","id":"g0-streamfix-on-1-32","text":"e th","attempt_id":1}
+{"type":"reasoning","id":"g0-streamfix-on-1-32","text":"e final s","attempt_id":1}
+{"type":"reasoning","id":"g0-streamfix-on-1-32","text":"e","attempt_id":1}
+{"type":"reasoning","id":"g0-streamfix-on-1-32","text":"ction ","attempt_id":1}
+{"type":"reasoning","id":"g0-streamfix-on-1-32","text":"of ","attempt_id":1}
+{"type":"reasoning","id":"g0-streamfix-on-1-32","text":"the ","attempt_id":1}
+{"type":"reasoning","id":"g0-streamfix-on-1-32","text":"respon","attempt_id":1}
+{"type":"reasoning","id":"g0-streamfix-on-1-32","text":"se, which ","attempt_id":1}
+{"type":"reasoning","id":"g0-streamfix-on-1-32","text":"is the","attempt_id":1}
+{"type":"reasoning","id":"g0-streamfix-on-1-32","text":" f","attempt_id":1}
+{"type":"reasoning","id":"g0-streamfix-on-1-32","text":"inal","attempt_id":1}
+{"type":"reasoning","id":"g0-streamfix-on-1-32","text":" pa","attempt_id":1}
+{"type":"reasoning","id":"g0-streamfix-on-1-32","text":"ragr","attempt_id":1}
+{"type":"reasoning","id":"g0-streamfix-on-1-32","text":"aph abo","attempt_id":1}
+{"type":"reasoning","id":"g0-streamfix-on-1-32","text":"ut \"fail-","attempt_id":1}
+{"type":"reasoning","id":"g0-streamfix-on-1-32","text":"c","attempt_id":1}
+{"type":"reasoning","id":"g0-streamfix-on-1-32","text":"lose","attempt_id":1}
+{"type":"reasoning","id":"g0-streamfix-on-1-32","text":"d de","attempt_id":1}
+{"type":"reasoning","id":"g0-streamfix-on-1-32","text":"vice dis","attempt_id":1}
+{"type":"reasoning","id":"g0-streamfix-on-1-32","text":"patch","attempt_id":1}
+{"type":"reasoning","id":"g0-streamfix-on-1-32","text":"\" and ","attempt_id":1}
+{"type":"reasoning","id":"g0-streamfix-on-1-32","text":"the closing note about","attempt_id":1}
+{"type":"commit_ready","id":"g0-streamfix-on-1-32","tokens":32,"tok_s":27.420736932305054,"prompt_tokens":2052,"prefill_tokens":2052,"cached_tokens":0,"prefill_ms":13936,"total_ms":15104,"finish_reason":"length","drafter":"ar","attempt_id":1}
+{"type":"aborted","id":"g0-streamfix-on-1-32","reason":"client_cancelled","attempt_id":1}
+{"type":"done","id":"g0-streamfix-on-1-32","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":32,"prefill_ms":0,"decode_ms":0,"attempt_id":1}

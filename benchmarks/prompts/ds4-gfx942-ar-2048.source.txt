@@ -1,0 +1,94 @@
+User: I need a production-grade explanation of ordinary batch-1 autoregressive decode on a DeepSeek V4 Flash style mixture-of-experts model running on AMD Instinct MI300X (gfx942). Please treat this as a measurement contract discussion rather than marketing. Cover the end-to-end path from a frozen prompt fixture through tokenizer identity, prefill, KV write, and token-by-token decode under Q8 KV with speculation fully disabled. I will use your answer as background for a benchmark fixture that must re-tokenize to exactly 2048 prompt tokens and request 510 greedy generations at temperature zero.
+
+Assistant: Understood. This response is framed as a technical briefing for operators and implementers who must keep the product path honest. The measurement fixture is ordinary batch-1 AR, temperature 0, Q8 KV, a 2048-token prompt, 510 generated tokens, and no speculation of any kind. Nothing below invents alternate routes, draft models, tree verification, or retained PM4 shortcuts as substitutes for the ordinary HIP path.
+
+User: Start with why prompt bytes matter more than prompt "text" in this setting.
+
+Assistant: Benchmarks collapse when two runs believe they share a prompt but do not share bytes. Command substitution that strips a trailing newline, an editor that rewrites line endings, a chat template applied in one arm and omitted in the other, or a Python tokenizer substituted for the embedded HFQ tokenizer will each change token identities even when the glyphs look identical to a human. The contract therefore freezes three artifacts: a deterministic source corpus, a derived exact-N token prefix written with no final LF, and a little-endian u32 token dump produced by the same runtime tokenizer that the daemon will use at load time. MD5 and SHA-256 of the prompt bytes are ledger fields, not optional commentary.
+
+The source corpus must be revisioned prose or chat, not a random word salad, not a hostname, not a timestamp, and not a single paragraph repeated until the byte budget is met. Degenerate repetition distorts attention patterns and decode timing; a realistic technical discussion exercises a broader mixture of short function words, domain nouns, punctuation, and paragraph structure. The derived fixture is a strict prefix of that corpus at a verified token boundary. If decode-then-re-encode does not reproduce the same ID sequence and the same count, the fixture generator must refuse to write. Fail closed beats a convenient wrong file.
+
+User: Walk the product path for a single generate request under HIPFIRE_SPECULATION=off and --kv-mode q8.
+
+Assistant: Load resolves the model artifact and its embedded metadata. The metadata carries tokenizer configuration, special tokens, and the chat template digest when present. For a raw prompt fixture measurement, the operator passes the exact fixture bytes as one argument so the client does not rejoin words or append a newline. The daemon builds a generate request with temperature fixed at zero for the bench path, top-p left at a non-sampling setting consistent with greedy selection, and speculation selectors projected to off for dflash, mtp, ngram draft, and dspark. The affirmative AR log marker must appear for every timed request; its absence is a failed run, not a soft warning.
+
+Prefill consumes the full prompt token IDs in production-forward chunks. For DeepSeek V4 Flash class models the forward path includes dense attention regions, mixture-of-experts routed MLPs, and any recurrent or compressor state the architecture defines. Q8 KV encoding stores keys and values at the control precision for gate A and gate B work. The first generated token is conditioned on the entire prompt; each subsequent decode step reads the growing KV cache, runs one token through the stack, samples greedily, and appends the new KV rows. Ordinary AR means tau equals 1.0 with drafter equal to ar: one new token per step, no draft window, no tree, no sidecar head.
+
+User: What must remain frozen while optimizing prefill or decode on gfx942?
+
+Assistant: Model bytes, tensor formats, expert count, sampling contract, KV mode, and model arithmetic are frozen in gate A. You may not retune scales, change rotation convention, widen experts, or swap MQ4R tensors for a different bit budget to manufacture speed. Device dispatch must fail closed outside the intended architecture: DeepSeek or gfx942 behavior must not bleed into Qwen routes or consumer RDNA defaults. A fast incoherent result is a failure. Locate the first numerical divergence at projection, rotate, logits, KV encode, or recurrent state before chasing downstream symptoms in sampler code or host overhead.
+
+Performance claims require the product load and forward path, not a kernel microbenchmark alone. Record the exact model identity, prompt path and MD5, token counts, route, binary and code-object hashes, correctness evidence, raw samples, and median with dispersion. ABBA ordering is an ordering layer on top of fresh processes and proper warmup; it is not a substitute for invalid-sample discipline. Cold cells, first JIT for a shape, thermal faults, wrong prompt counts, missing AR markers, non-finite logits, and output mismatches do not count.
+
+User: Explain Q8 KV as the control and why long-context KV experiments are out of scope for the first gates.
+
+Assistant: Q8 KV is the A and B control because it is the known-good serving precision for this campaign. Long-context experiments such as FWHT3-K with Q8-V are gate C only and begin as opt-in after A and B are frozen. Changing the default KV mode without long-context correctness, quality, memory, and performance proof would invalidate every earlier number. Operators comparing a candidate kernel must keep --kv-mode q8, speculation off, batch 1, and the same 2048/510 fixture so that decode_tok_s and prefill_tok_s measure the intended lever.
+
+Q8 groups quantize blocks of elements with shared scales. Encode and decode kernels must agree on endianness, group size, scale layout, and the handling of edge shapes. Channel smokes at tiny synthetic shapes are necessary but insufficient: DS4 needs deterministic host or scalar comparisons at real model head dimensions, sequence tails, and scale extremes. User-facing serve success does not prove numerical parity. Greedy 510-token byte-identical output between baseline and candidate is a strong product check once the fixture exists, and it still does not replace a first-divergence oracle for layer-local state.
+
+User: Describe mixture-of-experts routing concerns that show up in AR decode timing.
+
+Assistant: In a decode step the model projects the current residual to router logits, selects a small set of experts, and gathers their outputs. Expert count and the routing algorithm are part of the artifact contract. If a candidate build silently drops experts, changes top-k, or alters renormalization, both quality and tok/s move for reasons unrelated to the kernel under test. Batch-1 AR keeps router decisions serial and exposes per-token expert load imbalance more clearly than large prefill batches where work can be amortized across tokens.
+
+Load imbalance is not automatically a bug. Some prompts activate heavier experts more often. That is why the fixture must be fixed prose rather than random tokens: the expert trace should be stable across machines when weights and numerics match. When numerics diverge, the router can flip ties and amplify tiny projection errors into large decode divergence. This is another reason the first-divergence oracle should capture projection and post-route tensors at fixed positions, including the end of prefill and early AR steps.
+
+User: Cover tokenizer round-trip rules for the 2048 fixture generator.
+
+Assistant: The generator loads Tokenizer::from_hfq_metadata from the real model file. It encodes the full source corpus and errors if the corpus yields fewer than the requested count. It takes the first N IDs, decodes them with the runtime decode API, re-encodes the decoded text, and requires exact ID equality and exact length N. On mismatch it exits nonzero and names the first differing index. It then considers stripping trailing newlines from the decoded text and re-checks the round-trip; if stripping changes the token count or breaks equality, it must not strip and must report the conflict. The written fixture contains no final LF so that PROMPT_ARG=$(<file) preserves bytes. Optional --tokens-out writes contiguous u32 little-endian IDs in the same format as tokenize_slice.
+
+Never substitute a Hugging Face Python tokenizer. Even when vocabularies look related, pre-tokenization regexes, byte fallbacks, BOS policies, and special-token splitting differ enough to poison the MD5 and the token dump. The ledger records tokenizer identity from model metadata separately from the prompt MD5.
+
+User: Give a concrete prefill versus decode accounting sketch for operators reading bench JSON.
+
+Assistant: Prefill_tok_s is prompt tokens divided by prefill time on the product path. Decode_tok_s is generated tokens divided by decode time after prefill. TTFT includes queueing, upload, prefill, and first-token sample. Wall throughput mixes phases and can hide a decode regression behind a prefill win. Promotion decisions for a decode kernel must use the predeclared decode metric while still reporting prefill and TTFT. Five valid ABBA pairs with bootstrap CI lower bound at or above plus 0.5 percent may promote; upper bound below plus 0.5 percent kills; fewer than five pairs continues; fifteen pairs is the cap.
+
+Warm every cell in an unrecorded fresh process before pairing. Pair i runs fresh A, B, B, A with one recorded runs=1 process per arm. Invalid members void the whole pair. Do not reuse an unmatched arm. Exploratory pairs before the formal five do not promote.
+
+User: What does fail-closed device dispatch mean for this campaign?
+
+Assistant: Architecture capabilities and kernel tables must select gfx942 code objects only when the runtime device is gfx942. Unknown devices error rather than silently executing a near-miss ISA. Feature flags that enable DeepSeek-specific paths stay off for other arch crates. Build firewalls exist so that a consumer GPU build does not link MI300X-only intrinsics by accident. When a kernel is missing, the system should refuse the route rather than fall back to a slow generic path without marking fallback in the ledger. Fallback true with a reason is acceptable as a recorded failure mode; silent fallback is not.
+
+User: Summarize the correctness ladder before any A lever can claim a win.
+
+Assistant: First, compile and run generic channel screens such as test_kernels. Treat passes as necessary smoke only; they are not DS4 coverage. Second, run a DS4 first-divergence oracle on frozen token IDs comparing baseline and candidate at projection, rotate, norms, logits, Q8 KV bytes and scales, and recurrent state; stop at the first boundary failure. Third, run byte-identical greedy 510 output under identical prompt bytes, Q8 KV, and speculation off, checking finish_reason length, token count 510, AR log markers, and content MD5 equality. Fourth, run fresh serve battery and session processes with the same controls and zero runaway, empty, or attractor counts. Only then may ABBA product timing be interpreted as a lever result.
+
+User: Expand on MI300X operational constraints that affect measurement honesty.
+
+Assistant: HBM capacity is large relative to consumer cards but not infinite for multi-replica or full BF16 reference dumps. Layerwise or streamed Hessian collection and streamed reference logits are preferred over assuming the whole reference fits. Competing processes on the same GPU invalidate timing. DPM warmup seconds must be applied so clocks reach the steady state used in production. Fresh processes avoid cross-run cache and JIT contamination. Code-object hashes and kernel bundle identities belong in the ledger because two binaries with the same git commit can still differ if build flags or embedded HSACO changed.
+
+Thermal throttling and clock jitter create false wins. Tight standard deviation on a short run is suspicious. Prefer medians over single shots, record raw samples, and look at decoded text even for greedy runs so an attractor loop cannot hide inside a beautiful tok/s number. Prompt MD5 agent-to-agent claims without prompt MD5 are unverifiable and should be rejected in review.
+
+User: Provide an operator checklist for the canonical 2048/510 command once --max-tokens exists on bench.
+
+Assistant: Build release hipfire CLI and daemon with the required features. Record sha256 and md5 of model, CLI, and daemon. Materialize benchmarks/prompts/ds4-gfx942-ar-2048.txt via the fixture generator against the real model tokenizer; verify token count 2048, no final LF, and store prompt MD5 plus tokens u32le SHA-256. Export HIP_VISIBLE_DEVICES, HIPFIRE_LOCAL=1, HIPFIRE_SPECULATION=off, and DPM warmup. Run hipfire bench with --kv-mode q8 --runs 1 --max-tokens 510 --json and the prompt bytes as one argument. Confirm logs contain drafter=ar tau=1.00 for the request. Archive JSON and stderr under the evidence root, never under tmp for canonical retention. Append a ledger JSON line with every required identity field filled or explicitly skipped with reason.
+
+User: Discuss attention and recurrent state at a level useful for debugging first divergence.
+
+Assistant: Attention reads Q from the current token or prefill block and K/V from cache. Rotary or other position encodings must match training convention exactly; a sign error in rotary multiplies into every head and often first appears as logits drift rather than an immediate NaN. Q8 scales that flush small channels to zero can erase rare-token identity and look like sampler bugs. Recurrent or compressor modules carry state across tokens; lazy allocation bugs that skip zeros on the first use will pass short smokes and fail long prefills. State census tools should report allocation sizes, dtypes, and whether reset paths zero the full footprint.
+
+During prefill, chunked batch forward must produce the same end state as a monolithic prefill for the same token IDs. Boundary tokens at chunk edges are classic divergence points. When comparing baseline and candidate, pin the same chunk size and the same prompt IDs. If only decode kernels changed, prefill end state should still match before the first AR step; a mismatch means the candidate touched shared code or memory layout.
+
+User: How should assistants phrase uncertainty in campaign notes?
+
+Assistant: Mark inference explicitly. Unknown is unmeasured. Do not treat a missing oracle as a pass. Do not infer recipe identity from a filename suffix. Do not claim product wins from synthetic decode matrices that never ran the production prefill path. When blocked, state the cheapest determination that would unblock the gate and the abandon criterion if that determination fails. Preserve evidence under the conductor-selected durable directory with identities that another operator can rehash months later.
+
+User: Close with a short restatement of the fixture philosophy.
+
+Assistant: The fixture is boring on purpose. It is fixed ASCII technical chat long enough that a 2048-token prefix exists comfortably, short enough to read and review, free of timestamps and hostnames, free of repeated filler blocks, and strict about tokenizer round-trip. The generator is small, fail-closed, and tied to the embedded runtime tokenizer. The bench command that consumes the fixture must express 510 output tokens on the product path without pretending that a synthetic matrix flag is equivalent. Correctness before speed. Identity before narrative. Prefix before padding.
+
+
+User: Add a deeper note on why batch size one is part of the A acceptance fixture rather than an implementation detail.
+
+Assistant: Batch size one is the interactive serving shape. Many kernels have good utilization only when dozens of tokens share a GEMM. Optimizing only the wide shape can regress the interactive path that users actually feel as latency per token. The A fixture therefore freezes batch 1 so that decode_tok_s reflects the memory-bound AR loop: weight loads, expert gathers, attention over a growing cache, and a single logits vector. If a candidate improves batched prefill but slows batch-1 decode, the predeclared metric for a decode lever will not promote it. Explicit batch fields in JSON help reviewers see that the run was not accidentally widened.
+
+Host overhead also differs at batch 1. Launch latency, small-copy paths, and sampler setup are a larger fraction of the step. That is desirable for a product metric and undesirable for a pure kernel microbench. Keep both kinds of evidence, but do not substitute one for the other in the ledger's measurement.metric field.
+
+User: Describe a minimal mental model of MQ4R weights without inventing a new recipe.
+
+Assistant: MQ4R in this campaign is whatever the preview artifact's metadata and tensor dtypes actually specify. Operators must inspect the tensor map rather than trust the letters in the filename. Gate B may clone that tensor-class policy for a new checkpoint only after inspection. Hessian or GPTQ work may change weight values inside the frozen format; it may not widen bits, change group structure, or introduce MQ2 or MFP3 under the same serving label. Scale tensors, zero points if any, and packing endianness are correctness boundaries equal in rank to the kernel ISA.
+
+When packing is wrong, channel tests at friendly shapes may still pass while real layer shapes misread tails. Always include odd dimensions and last-group remainders in scalar comparisons. Record the recipe tensor map identity in the ledger beside the artifact SHA-256.
+
+User: Talk about logging markers and why grepping logs is part of the scientific record.
+
+Assistant: The AR marker is affirmative evidence that speculation did not engage. Filename conventions and intended flags are not evidence. Because the engine inherits daemon stderr, a bench log is a primary artifact. Grep for the marker across every warmup and timed request. If a single request shows another drafter, invalidate the sample. Similarly, fallback lines, CUDA-style migration messages if any appear on ROCm builds, and OOM retries belong in invalid_samples with paths. A clean JSON throughput number beside a dirty log is not a clean result.

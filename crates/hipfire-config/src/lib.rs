@@ -56,6 +56,153 @@ pub enum ConfigValue {
     Null,
 }
 
+/// Stable device identity used by model-specific placement policies. Logical
+/// HIP ordinals are deliberately absent: they are re-numbered by visibility
+/// masks and across reboot/hotplug.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "kebab-case")]
+pub enum DeviceSelector {
+    PciBdf(String),
+    Uuid(String),
+    /// Permitted only when exactly one visible device matches at resolution.
+    ExactArch(String),
+}
+
+impl fmt::Display for DeviceSelector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PciBdf(value) => write!(f, "pci:{value}"),
+            Self::Uuid(value) => write!(f, "uuid:{value}"),
+            Self::ExactArch(value) => write!(f, "arch:{value}"),
+        }
+    }
+}
+
+impl std::str::FromStr for DeviceSelector {
+    type Err = String;
+
+    fn from_str(raw: &str) -> std::result::Result<Self, Self::Err> {
+        let (kind, value) = raw.split_once(':').ok_or_else(|| {
+            format!("device selector '{raw}' must start with pci:, uuid:, or arch:")
+        })?;
+        if value.is_empty() || value.chars().any(char::is_whitespace) {
+            return Err(format!(
+                "device selector '{raw}' has an empty or whitespace value"
+            ));
+        }
+        match kind {
+            "pci" if valid_pci_bdf(value) => Ok(Self::PciBdf(value.to_ascii_lowercase())),
+            "pci" => Err(format!(
+                "PCI selector '{raw}' must use domain:bus:device.function (for example 0000:03:00.0)"
+            )),
+            "uuid" => Ok(Self::Uuid(value.to_owned())),
+            "arch" if value.starts_with("gfx") => Ok(Self::ExactArch(value.to_ascii_lowercase())),
+            "arch" => Err(format!(
+                "architecture selector '{raw}' must name an exact gfx target"
+            )),
+            _ => Err(format!("unknown device selector kind '{kind}'")),
+        }
+    }
+}
+
+fn valid_pci_bdf(value: &str) -> bool {
+    let Some((domain, rest)) = value.split_once(':') else {
+        return false;
+    };
+    let Some((bus, rest)) = rest.split_once(':') else {
+        return false;
+    };
+    let Some((device, function)) = rest.split_once('.') else {
+        return false;
+    };
+    let hex = |part: &str, width: usize| {
+        part.len() == width && part.bytes().all(|byte| byte.is_ascii_hexdigit())
+    };
+    hex(domain, 4) && hex(bus, 2) && hex(device, 2) && hex(function, 1)
+}
+
+/// User-facing DeepSeek placement. This is intentionally model-specific so a
+/// DS4 split can never alter Qwen or the process-wide mixed-arch policy.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "kebab-case")]
+pub enum Deepseek4ComputePlacement {
+    #[default]
+    Single,
+    DenseExpertSplit {
+        dense: DeviceSelector,
+        experts: DeviceSelector,
+    },
+}
+
+/// Storage policy for DeepSeek V4's long-lived compressor caches. This is
+/// deliberately separate from the ordinary KV-cache mode: it affects only
+/// the model's compressed main/indexer memory and never Qwen or other models.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Deepseek4CompressorCache {
+    #[default]
+    F32,
+    F16,
+}
+
+impl fmt::Display for Deepseek4CompressorCache {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::F32 => "f32",
+            Self::F16 => "f16",
+        })
+    }
+}
+
+impl std::str::FromStr for Deepseek4CompressorCache {
+    type Err = String;
+
+    fn from_str(raw: &str) -> std::result::Result<Self, Self::Err> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "f32" => Ok(Self::F32),
+            "f16" => Ok(Self::F16),
+            _ => Err("DeepSeek V4 compressor cache must be f32 or f16".to_string()),
+        }
+    }
+}
+
+impl fmt::Display for Deepseek4ComputePlacement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Single => f.write_str("single"),
+            Self::DenseExpertSplit { dense, experts } => {
+                write!(f, "dense-expert-split(dense={dense},experts={experts})")
+            }
+        }
+    }
+}
+
+impl std::str::FromStr for Deepseek4ComputePlacement {
+    type Err = String;
+
+    fn from_str(raw: &str) -> std::result::Result<Self, Self::Err> {
+        if raw == "single" {
+            return Ok(Self::Single);
+        }
+        let body = raw
+            .strip_prefix("dense-expert-split(dense=")
+            .and_then(|value| value.strip_suffix(')'))
+            .ok_or_else(|| {
+                "expected single or dense-expert-split(dense=<selector>,experts=<selector>)"
+                    .to_string()
+            })?;
+        let (dense, experts) = body
+            .split_once(",experts=")
+            .ok_or_else(|| "dense-expert-split requires dense and experts selectors".to_string())?;
+        let dense = dense.parse()?;
+        let experts = experts.parse()?;
+        if dense == experts {
+            return Err("dense and experts selectors must identify distinct devices".into());
+        }
+        Ok(Self::DenseExpertSplit { dense, experts })
+    }
+}
+
 impl ConfigValue {
     pub fn kind(&self) -> &'static str {
         match self {
@@ -186,6 +333,7 @@ pub enum ValueRule {
         max: f64,
     },
     KvAdaptive,
+    Deepseek4Placement,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -256,6 +404,8 @@ impl ConfigField {
                 matches!(v.as_str(), "off" | "conservative" | "balanced" | "aggressive")
                     || valid_advanced_kv(v)
             }),
+            ValueRule::Deepseek4Placement => matches!(value, ConfigValue::String(v)
+                if v.parse::<Deepseek4ComputePlacement>().is_ok()),
         };
 
         if valid {
@@ -327,23 +477,8 @@ fn expand_tilde(value: &str) -> PathBuf {
     PathBuf::from(value)
 }
 
-// Two vocabularies reach this field, so the policy has to accept both. The
-// arch-level resolver (`hipfire_runtime::kv_mode::resolve`) owns the asym/fwht/
-// turbo family; the loader's `StateQuant` parser owns "q8"/"int8", "f32"/"fp32"
-// and "q4"/"int4". Only "auto" and "q8" were common to the two, so every legacy
-// spelling started panicking at startup once validated config replaced the raw
-// env reads — `build_kld_ref_native` sets HIPFIRE_KV_MODE=f32 and died before
-// processing a single token.
-//
-// "f32"/"fp32" is UNQUANTIZED KV, which is exactly what a KLD reference needs:
-// an oracle whose own attention error would otherwise be folded into every
-// quant scored against it.
-//
-// "q4"/"int4"/"int8" are also loader-accepted and still absent here; they are
-// left out until something actually needs them, so this list stays a statement
-// of what is supported rather than a union of every string ever parsed.
 const KV_MODES: &[&str] = &[
-    "auto", "q8", "f32", "fp32", "asym4", "asym3", "asym2", "fwht4", "fwht3", "fwht2", "turbo",
+    "auto", "f32", "f16", "q8", "asym4", "asym3", "asym2", "fwht4", "fwht3", "fwht2", "turbo",
     "turbo4", "turbo3", "turbo2",
 ];
 const AUTO_ON_OFF: &[&str] = &["auto", "on", "off"];
@@ -353,6 +488,11 @@ const AUTO_ON_OFF: &[&str] = &["auto", "on", "off"];
 // `enable_thinking=false` / `reasoning_effort="none"` paths already send. It is
 // NOT 0 — 0 means `uncapped` (think until the model closes the block itself).
 const THINKING_BUDGETS: &[&str] = &["off", "low", "med", "high", "xhigh", "max", "uncapped"];
+// Qwen3.8's published effort ladder is `low|medium|xhigh` (default xhigh).
+// Keep generic OpenAI-style values (`auto|none|high|max`) alongside it so
+// non-Qwen3.8 parents still validate. Values pass through as request strings;
+// model-specific mapping lives downstream of config validation.
+const REASONING_EFFORTS: &[&str] = &["auto", "none", "low", "medium", "high", "xhigh", "max"];
 const SPECULATION_MODES: &[&str] = &["off", "auto", "ngram", "dflash", "mtp", "dspark"];
 
 macro_rules! field {
@@ -479,7 +619,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         false,
         Some("HIPFIRE_KV_MODE"),
-        "KV cache format; auto inherits the registry recommendation, then q8."
+        "KV cache format; auto inherits the registry recommendation, then q8. DeepSeek V4 currently supports f32 and f16."
     ),
     field!(
         "memory.kv_adaptive",
@@ -492,6 +632,30 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         Some("HIPFIRE_KV_ADAPTIVE"),
         "Runtime VRAM-fit KV precision policy."
+    ),
+    field!(
+        "model.deepseek4_experts_per_token",
+        "deepseek4_experts_per_token",
+        Experimental,
+        ModelLoad,
+        DefaultValue::Null,
+        ValueRule::NullableInteger { min: 1, max: 6 },
+        true,
+        false,
+        None,
+        "DeepSeek V4 routed experts per token; null preserves the checkpoint default."
+    ),
+    field!(
+        "hardware.deepseek4_compute_placement",
+        "deepseek4_compute_placement",
+        Hardware,
+        ModelLoad,
+        DefaultValue::String("single"),
+        ValueRule::Deepseek4Placement,
+        false,
+        false,
+        None,
+        "DeepSeek V4 compute placement; single or a typed dense/expert device split."
     ),
     field!(
         "attention.flash",
@@ -525,6 +689,15 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         "HIPFIRE_LOCAL",
         "Force the current command to use a locally spawned daemon."
+    ),
+    process_bool_field!(
+        "serve.multi_slot",
+        "multi_slot",
+        Serve,
+        false,
+        false,
+        "HIPFIRE_SERVE_MULTI_SLOT",
+        "Serve requests concurrently on the multi-slot engine instead of one at a time."
     ),
     field!(
         "generation.temperature",
@@ -629,7 +802,7 @@ pub static FIELDS: &[ConfigField] = &[
         DefaultValue::Integer(4096),
         ValueRule::Integer {
             min: 1,
-            max: 131072
+            max: 393216
         },
         true,
         false,
@@ -644,12 +817,24 @@ pub static FIELDS: &[ConfigField] = &[
         DefaultValue::Integer(32768),
         ValueRule::Integer {
             min: 512,
-            max: 524288
+            max: 1048576
         },
         true,
         false,
         None,
         "Logical KV context capacity."
+    ),
+    field!(
+        "memory.kv_backend",
+        "kv_backend",
+        Memory,
+        ModelLoad,
+        DefaultValue::String("contiguous"),
+        ValueRule::Enum(&["contiguous", "vmm"]),
+        true,
+        false,
+        None,
+        "KV storage backend. VMM reserves the logical context window and commits physical pages on demand."
     ),
     field!(
         "reasoning.mode",
@@ -662,6 +847,18 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         None,
         "Visible reasoning mode."
+    ),
+    field!(
+        "reasoning.effort",
+        "reasoning_effort",
+        Reasoning,
+        Request,
+        DefaultValue::String("auto"),
+        ValueRule::Enum(REASONING_EFFORTS),
+        true,
+        false,
+        None,
+        "Model-specific reasoning effort; auto preserves the carrier fallback."
     ),
     field!(
         "reasoning.budget",
@@ -681,7 +878,10 @@ pub static FIELDS: &[ConfigField] = &[
         Reasoning,
         Request,
         DefaultValue::Null,
-        ValueRule::NullableInteger { min: 0, max: 32768 },
+        ValueRule::NullableInteger {
+            min: 0,
+            max: 393216
+        },
         true,
         false,
         None,
@@ -769,6 +969,18 @@ pub static FIELDS: &[ConfigField] = &[
         "Maximum queued serve requests; zero is uncapped."
     ),
     field!(
+        "serve.continuous_batch_size",
+        "continuous_batch_size",
+        Serve,
+        Process,
+        DefaultValue::Integer(1),
+        ValueRule::Integer { min: 1, max: 128 },
+        false,
+        false,
+        Some("HIPFIRE_CONTINUOUS_BATCH_SIZE"),
+        "Maximum coexisting eligible batch lanes for serve; 1 preserves sequential behavior."
+    ),
+    field!(
         "serve.queue_timeout_ms",
         "serve_queue_timeout_ms",
         Serve,
@@ -797,10 +1009,7 @@ pub static FIELDS: &[ConfigField] = &[
         "retry_backoff_ms",
         Serve,
         DefaultValue::Integer(50),
-        ValueRule::Integer {
-            min: 0,
-            max: 60000
-        },
+        ValueRule::Integer { min: 0, max: 60000 },
         true,
         "HIPFIRE_SERVE_RETRY_BACKOFF_MS",
         "Backoff before the single serve retry; slept outside runtime and admission locks."
@@ -903,6 +1112,18 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         None,
         "Eviction hysteresis."
+    ),
+    field!(
+        "memory.cask.handoff_tokens",
+        "cask_handoff_tokens",
+        Memory,
+        ModelLoad,
+        DefaultValue::Integer(0),
+        ValueRule::Integer { min: 0, max: 1048576 },
+        true,
+        false,
+        None,
+        "One-way kv_adaptive to plain TriAttention handoff position; zero disables it."
     ),
     field!(
         "memory.cask.core_fraction",
@@ -1038,7 +1259,7 @@ pub static FIELDS: &[ConfigField] = &[
         DefaultValue::Integer(32768),
         ValueRule::Integer {
             min: 0,
-            max: 524288
+            max: 1048576
         },
         true,
         true,
@@ -1085,7 +1306,7 @@ pub static FIELDS: &[ConfigField] = &[
         DefaultValue::Integer(2048),
         ValueRule::Integer {
             min: 0,
-            max: 524288
+            max: 1048576
         },
         true,
         true,
@@ -1172,7 +1393,7 @@ pub static FIELDS: &[ConfigField] = &[
         DefaultValue::Integer(32768),
         ValueRule::Integer {
             min: 0,
-            max: 524288
+            max: 1048576
         },
         true,
         true,
@@ -3998,6 +4219,10 @@ fn config_profile_bundle(name: &str) -> Option<Vec<(&'static str, ConfigValue)>>
             ("reasoning.max_total_tokens", ConfigValue::Integer(0)),
             ("memory.kv_cache", ConfigValue::String("q8".to_owned())),
             ("memory.max_seq", ConfigValue::Integer(32768)),
+            (
+                "memory.kv_backend",
+                ConfigValue::String("contiguous".to_owned()),
+            ),
             ("memory.prompt_cache_capacity", ConfigValue::Integer(32)),
             ("memory.prompt_cache_unbounded", ConfigValue::Bool(false)),
             ("attention.flash", ConfigValue::String("auto".to_owned())),
@@ -4012,6 +4237,7 @@ fn config_profile_bundle(name: &str) -> Option<Vec<(&'static str, ConfigValue)>>
             ("serve.port", ConfigValue::Integer(11435)),
             ("serve.idle_timeout_seconds", ConfigValue::Integer(300)),
             ("serve.local", ConfigValue::Bool(false)),
+            ("serve.multi_slot", ConfigValue::Bool(false)),
         ],
         "dev" => vec![
             ("hardware.devices", ConfigValue::String("0".to_owned())),
@@ -4173,6 +4399,51 @@ mod tests {
                 .to_value(),
             ConfigValue::String("off".into())
         );
+    }
+
+    #[test]
+    fn deepseek4_expert_fanout_is_optional_and_bounded() {
+        let field = field("model.deepseek4_experts_per_token").unwrap();
+        assert_eq!(field.default.to_value(), ConfigValue::Null);
+        assert_eq!(field.parse_cli("4").unwrap(), ConfigValue::Integer(4));
+        assert!(field.parse_cli("0").is_err());
+        assert!(field.parse_cli("7").is_err());
+    }
+
+    #[test]
+    fn million_context_and_parent_output_limits_validate_without_coupling_effort() {
+        let mut layer = ConfigLayer::default();
+        layer
+            .set_cli("memory.max_seq", "1048576")
+            .expect("one-million-token context must validate");
+        layer
+            .set_cli("generation.max_tokens", "393216")
+            .expect("384-Ki-token output must validate");
+        layer
+            .set_cli("reasoning.max_tokens", "393216")
+            .expect("an explicit 384-Ki reasoning cap must validate");
+        layer
+            .set_cli("reasoning.effort", "max")
+            .expect("parent max effort must validate independently");
+        assert_eq!(
+            layer.get("reasoning.effort"),
+            Some(&ConfigValue::String("max".into()))
+        );
+        for effort in ["low", "medium", "xhigh"] {
+            layer
+                .set_cli("reasoning.effort", effort)
+                .unwrap_or_else(|_| panic!("Qwen3.8 effort {effort} must validate"));
+            assert_eq!(
+                layer.get("reasoning.effort"),
+                Some(&ConfigValue::String(effort.into()))
+            );
+        }
+        assert_eq!(
+            layer.get("reasoning.max_tokens"),
+            Some(&ConfigValue::Integer(393216))
+        );
+        assert!(layer.set_cli("memory.max_seq", "1048577").is_err());
+        assert!(layer.set_cli("generation.max_tokens", "393217").is_err());
     }
 
     #[test]
@@ -4709,5 +4980,60 @@ mod tests {
             );
         }
         let _ = fs::remove_dir_all(paths.root);
+    }
+
+    #[test]
+    fn deepseek4_placement_round_trips_typed_exact_arch_selectors() {
+        let raw = "dense-expert-split(dense=arch:gfx1100,experts=arch:gfx1151)";
+        let placement: Deepseek4ComputePlacement = raw.parse().unwrap();
+        assert_eq!(placement.to_string(), raw);
+        assert_eq!(
+            placement,
+            Deepseek4ComputePlacement::DenseExpertSplit {
+                dense: DeviceSelector::ExactArch("gfx1100".into()),
+                experts: DeviceSelector::ExactArch("gfx1151".into()),
+            }
+        );
+        let mut layer = ConfigLayer::default();
+        layer
+            .set_cli("hardware.deepseek4_compute_placement", raw)
+            .unwrap();
+        assert_eq!(
+            layer.get("hardware.deepseek4_compute_placement"),
+            Some(&ConfigValue::String(raw.into()))
+        );
+    }
+
+    #[test]
+    fn deepseek4_compressor_cache_dtype_is_selected_through_kv_cache() {
+        let field = field("memory.kv_cache").unwrap();
+        assert_eq!(
+            field.parse_cli("f32").unwrap(),
+            ConfigValue::String("f32".into())
+        );
+        assert_eq!(
+            field.parse_cli("f16").unwrap(),
+            ConfigValue::String("f16".into())
+        );
+        assert_eq!(
+            "f16".parse::<Deepseek4CompressorCache>().unwrap(),
+            Deepseek4CompressorCache::F16
+        );
+        assert_eq!(Deepseek4CompressorCache::F32.to_string(), "f32");
+        assert!("auto".parse::<Deepseek4CompressorCache>().is_err());
+    }
+
+    #[test]
+    fn deepseek4_placement_rejects_logical_ordinals_and_aliasing() {
+        for raw in [
+            "dense-expert-split(dense=device:0,experts=arch:gfx1151)",
+            "dense-expert-split(dense=arch:gfx1151,experts=arch:gfx1151)",
+            "dense-expert-split(dense=pci:03:00.0,experts=arch:gfx1151)",
+        ] {
+            assert!(
+                raw.parse::<Deepseek4ComputePlacement>().is_err(),
+                "expected rejection for {raw}"
+            );
+        }
     }
 }

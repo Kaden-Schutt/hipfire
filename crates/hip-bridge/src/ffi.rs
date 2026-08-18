@@ -118,6 +118,10 @@ pub const HIP_MEM_ALLOCATION_TYPE_PINNED: u32 = 1;
 pub const HIP_MEM_ACCESS_FLAGS_PROT_READ_WRITE: u32 = 3;
 pub const HIP_MEM_ALLOCATION_GRANULARITY_MINIMUM: u32 = 0;
 pub const HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED: u32 = 1;
+/// Dependency event: omit profiling state and retain the default system fence.
+pub const HIP_EVENT_DISABLE_TIMING: u32 = 0x2;
+/// Request an explicit system-scope release when recording an event.
+pub const HIP_EVENT_RELEASE_TO_SYSTEM: u32 = 0x8000_0000;
 
 /// `hipPointerAttribute_t` per ROCm 6.4.3 layout. ROCm 5.x not supported.
 #[repr(C)]
@@ -236,6 +240,7 @@ pub struct HipRuntime {
 
     // Memory
     fn_malloc: unsafe extern "C" fn(*mut *mut c_void, usize) -> u32,
+    fn_ext_malloc_with_flags: Option<unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> u32>,
     fn_free: unsafe extern "C" fn(*mut c_void) -> u32,
     fn_mem_get_address_range:
         unsafe extern "C" fn(*mut *mut c_void, *mut usize, *mut c_void) -> u32,
@@ -244,16 +249,6 @@ pub struct HipRuntime {
         unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_uint, HipStream) -> u32,
     fn_memset: unsafe extern "C" fn(*mut c_void, c_int, usize) -> u32,
     fn_memset_async: unsafe extern "C" fn(*mut c_void, c_int, usize, HipStream) -> u32,
-    // Pinned (page-locked) host memory. Optional so a runtime without them
-    // degrades to the pageable staging path rather than failing to init.
-    //
-    // Only worth using on a DISCRETE GPU: a pageable H2D copy is staged through
-    // a driver bounce buffer (roughly half bandwidth) and cannot overlap with
-    // compute, whereas a pinned copy DMAs straight off the host buffer. On an
-    // APU (gfx1151 and friends) the GPU allocates out of system RAM, so there
-    // is no bus hop to optimise and pinning buys nothing.
-    fn_host_malloc: Option<unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> u32>,
-    fn_host_free: Option<unsafe extern "C" fn(*mut c_void) -> u32>,
     fn_mem_address_reserve:
         Option<unsafe extern "C" fn(*mut *mut c_void, usize, usize, *mut c_void, u64) -> u32>,
     fn_mem_address_free: Option<unsafe extern "C" fn(*mut c_void, usize) -> u32>,
@@ -300,6 +295,7 @@ pub struct HipRuntime {
 
     // Events
     fn_event_create: unsafe extern "C" fn(*mut HipEvent) -> u32,
+    fn_event_create_with_flags: unsafe extern "C" fn(*mut HipEvent, c_uint) -> u32,
     fn_event_record: unsafe extern "C" fn(HipEvent, HipStream) -> u32,
     fn_event_synchronize: unsafe extern "C" fn(HipEvent) -> u32,
     fn_event_elapsed_time: unsafe extern "C" fn(*mut f32, HipEvent, HipEvent) -> u32,
@@ -320,6 +316,8 @@ pub struct HipRuntime {
     fn_graph_destroy: unsafe extern "C" fn(HipGraph) -> u32,
     // Stream memory ops (HIP 7.2+)
     fn_stream_write_value32: unsafe extern "C" fn(HipStream, *mut c_void, u32, c_uint) -> u32,
+    fn_stream_wait_value32:
+        Option<unsafe extern "C" fn(HipStream, *mut c_void, u32, c_uint, u32) -> u32>,
     fn_device_synchronize: unsafe extern "C" fn() -> u32,
     fn_get_device_properties: unsafe extern "C" fn(*mut u8, c_int) -> u32,
     fn_get_device_attribute: unsafe extern "C" fn(*mut c_int, c_int, c_int) -> u32,
@@ -458,6 +456,11 @@ impl HipRuntime {
                     "hipMalloc",
                     unsafe extern "C" fn(*mut *mut c_void, usize) -> u32
                 ),
+                fn_ext_malloc_with_flags: load_optional_fn!(
+                    lib,
+                    "hipExtMallocWithFlags",
+                    unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> u32
+                ),
                 fn_free: load_fn!(lib, "hipFree", unsafe extern "C" fn(*mut c_void) -> u32),
                 fn_mem_get_address_range: load_fn!(
                     lib,
@@ -489,16 +492,6 @@ impl HipRuntime {
                     lib,
                     "hipMemsetAsync",
                     unsafe extern "C" fn(*mut c_void, c_int, usize, HipStream) -> u32
-                ),
-                fn_host_malloc: load_optional_fn!(
-                    lib,
-                    "hipHostMalloc",
-                    unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> u32
-                ),
-                fn_host_free: load_optional_fn!(
-                    lib,
-                    "hipHostFree",
-                    unsafe extern "C" fn(*mut c_void) -> u32
                 ),
                 fn_mem_address_reserve: load_optional_fn!(
                     lib,
@@ -603,6 +596,11 @@ impl HipRuntime {
                     "hipEventCreate",
                     unsafe extern "C" fn(*mut HipEvent) -> u32
                 ),
+                fn_event_create_with_flags: load_fn!(
+                    lib,
+                    "hipEventCreateWithFlags",
+                    unsafe extern "C" fn(*mut HipEvent, c_uint) -> u32
+                ),
                 fn_event_record: load_fn!(
                     lib,
                     "hipEventRecord",
@@ -674,6 +672,11 @@ impl HipRuntime {
                     lib,
                     "hipStreamWriteValue32",
                     unsafe extern "C" fn(HipStream, *mut c_void, u32, c_uint) -> u32
+                ),
+                fn_stream_wait_value32: load_optional_fn!(
+                    lib,
+                    "hipStreamWaitValue32",
+                    unsafe extern "C" fn(HipStream, *mut c_void, u32, c_uint, u32) -> u32
                 ),
                 fn_device_synchronize: load_fn!(
                     lib,
@@ -880,6 +883,29 @@ impl HipRuntime {
         })
     }
 
+    /// Allocate system-visible signal memory for stream wait/write operations.
+    ///
+    /// This is an optional ROCm capability. Loading `HipRuntime` remains
+    /// compatible with runtimes that do not export `hipExtMallocWithFlags`;
+    /// callers receive a scoped error only when they request signal memory.
+    pub fn malloc_signal(&self, size: usize) -> HipResult<DeviceBuffer> {
+        const HIP_MALLOC_SIGNAL_MEMORY: c_uint = 0x2;
+        let Some(ext_malloc) = self.fn_ext_malloc_with_flags else {
+            return Err(HipError::new(
+                0,
+                "hipExtMallocWithFlags unavailable; signal memory is unsupported",
+            ));
+        };
+        let mut ptr: *mut c_void = ptr::null_mut();
+        let code = unsafe { ext_malloc(&mut ptr, size, HIP_MALLOC_SIGNAL_MEMORY) };
+        self.check(code, "hipExtMallocWithFlags(hipMallocSignalMemory)")?;
+        Ok(DeviceBuffer {
+            ptr,
+            size,
+            ownership: crate::DeviceBufferOwnership::HipMalloc,
+        })
+    }
+
     /// # Safety
     /// Caller must ensure the buffer is not in use by any pending GPU operations.
     pub fn free(&self, buf: DeviceBuffer) -> HipResult<()> {
@@ -891,54 +917,6 @@ impl HipRuntime {
         }
         let code = unsafe { (self.fn_free)(buf.ptr) };
         self.check(code, "hipFree")
-    }
-
-    /// Is page-locked host allocation available on this runtime?
-    ///
-    /// Callers use this to pick a staging strategy at construction time rather
-    /// than discovering the gap on the first copy.
-    pub fn has_pinned_host_alloc(&self) -> bool {
-        self.fn_host_malloc.is_some() && self.fn_host_free.is_some()
-    }
-
-    /// Allocate `size` bytes of page-locked host memory.
-    ///
-    /// Pinned memory is what makes `hipMemcpyAsync` genuinely asynchronous: a
-    /// pageable source forces the driver to stage through an internal bounce
-    /// buffer, which both halves effective bandwidth and serialises the copy
-    /// against compute. Returns the raw host pointer; pair with
-    /// [`Self::host_free`].
-    ///
-    /// Pinned pages are unswappable, so callers are responsible for keeping the
-    /// total bounded — on a swapless box an unbounded pinned pool is an OOM.
-    ///
-    /// # Safety
-    /// The returned pointer is uninitialised. Caller owns it until `host_free`.
-    pub unsafe fn host_malloc(&self, size: usize) -> HipResult<*mut c_void> {
-        let f = self
-            .fn_host_malloc
-            .ok_or_else(|| HipError::new(0, "hipHostMalloc unavailable on this runtime"))?;
-        let mut ptr: *mut c_void = ptr::null_mut();
-        // flags=0 → hipHostMallocDefault (page-locked, mapped, not write-combined).
-        let code = unsafe { f(&mut ptr, size, 0) };
-        self.check(code, "hipHostMalloc")?;
-        if ptr.is_null() {
-            return Err(HipError::new(0, "hipHostMalloc returned a null pointer"));
-        }
-        Ok(ptr)
-    }
-
-    /// Release a pointer obtained from [`Self::host_malloc`].
-    ///
-    /// # Safety
-    /// `ptr` must have come from `host_malloc` and must not be referenced by
-    /// any in-flight async copy.
-    pub unsafe fn host_free(&self, p: *mut c_void) -> HipResult<()> {
-        let f = self
-            .fn_host_free
-            .ok_or_else(|| HipError::new(0, "hipHostFree unavailable on this runtime"))?;
-        let code = unsafe { f(p) };
-        self.check(code, "hipHostFree")
     }
 
     pub fn mem_get_allocation_granularity(
@@ -1083,47 +1061,6 @@ impl HipRuntime {
             )
         };
         self.check(code, "hipMemcpy H2D offset")
-    }
-
-    /// Offset H2D copy issued on `stream` instead of the null stream.
-    ///
-    /// This is the piece the expert pager needs to overlap a fetch with
-    /// compute: the pager writes into a slot at `offset` inside a pooled blob,
-    /// and it must be able to do so without blocking the caller.
-    ///
-    /// `src` MUST be page-locked (see [`Self::host_malloc`]). `hipMemcpyAsync`
-    /// from pageable memory silently degrades to a synchronous copy through a
-    /// driver bounce buffer, which would make this look like it works while
-    /// delivering none of the overlap.
-    ///
-    /// # Safety contract
-    /// `src` must stay alive and unmodified until the copy completes — record
-    /// an event on `stream` and wait on it before reusing the buffer.
-    pub fn memcpy_htod_offset_async(
-        &self,
-        dst: &DeviceBuffer,
-        offset: usize,
-        src: &[u8],
-        stream: &Stream,
-    ) -> HipResult<()> {
-        assert!(
-            offset + src.len() <= dst.size,
-            "offset ({}) + source ({}) exceeds device buffer ({})",
-            offset,
-            src.len(),
-            dst.size
-        );
-        let dst_ptr = unsafe { (dst.ptr as *mut u8).add(offset) as *mut c_void };
-        let code = unsafe {
-            (self.fn_memcpy_async)(
-                dst_ptr,
-                src.as_ptr() as *const c_void,
-                src.len(),
-                MemcpyKind::HostToDevice as c_uint,
-                stream.0,
-            )
-        };
-        self.check(code, "hipMemcpyAsync H2D offset")
     }
 
     /// Copy bytes between GPU buffers with offsets on both sides.
@@ -1513,6 +1450,18 @@ impl HipRuntime {
         Ok(Event(event))
     }
 
+    /// Create an event with HIP runtime flags.
+    ///
+    /// Dependency events should normally use [`HIP_EVENT_DISABLE_TIMING`]
+    /// without `hipEventDisableSystemFence`. Cross-device producers may add
+    /// [`HIP_EVENT_RELEASE_TO_SYSTEM`] to make the release scope explicit.
+    pub fn event_create_with_flags(&self, flags: u32) -> HipResult<Event> {
+        let mut event: HipEvent = ptr::null_mut();
+        let code = unsafe { (self.fn_event_create_with_flags)(&mut event, flags) };
+        self.check(code, "hipEventCreateWithFlags")?;
+        Ok(Event(event))
+    }
+
     pub fn event_record(&self, event: &Event, stream: Option<&Stream>) -> HipResult<()> {
         let stream_raw = stream.map_or(ptr::null_mut(), |s| s.0);
         let code = unsafe { (self.fn_event_record)(event.0, stream_raw) };
@@ -1618,6 +1567,35 @@ impl HipRuntime {
         self.check(code, "hipMemcpyAsync D2D offset")
     }
 
+    /// Async D→D copy with offsets on the legacy/default stream
+    /// (`hipStream_t` null). Host-asynchronous and ordered on that stream;
+    /// intended for non-capture hot paths where a sync `memcpy_dtod_at`
+    /// would stall the host. Not suitable for hipGraph capture (use
+    /// `memcpy_dtod_async_at` with an explicit stream instead).
+    pub fn memcpy_dtod_async_default_at(
+        &self,
+        dst: &DeviceBuffer,
+        dst_offset: usize,
+        src: &DeviceBuffer,
+        src_offset: usize,
+        size: usize,
+    ) -> HipResult<()> {
+        assert!(dst_offset + size <= dst.size);
+        assert!(src_offset + size <= src.size);
+        let dst_ptr = unsafe { (dst.ptr as *mut u8).add(dst_offset) as *mut c_void };
+        let src_ptr = unsafe { (src.ptr as *const u8).add(src_offset) as *const c_void };
+        let code = unsafe {
+            (self.fn_memcpy_async)(
+                dst_ptr,
+                src_ptr,
+                size,
+                MemcpyKind::DeviceToDevice as c_uint,
+                ptr::null_mut(),
+            )
+        };
+        self.check(code, "hipMemcpyAsync D2D offset default stream")
+    }
+
     // ── Graph capture & replay ──────────────────────────────────
 
     /// Begin capturing all operations on `stream` into a graph.
@@ -1676,6 +1654,26 @@ impl HipRuntime {
     ) -> HipResult<()> {
         let code = unsafe { (self.fn_stream_write_value32)(stream.0, ptr.as_ptr(), value, flags) };
         self.check(code, "hipStreamWriteValue32")
+    }
+
+    /// Wait until a 32-bit signal-memory value satisfies the requested condition.
+    /// Operations submitted later to `stream` remain blocked until it does.
+    pub fn stream_wait_value32(
+        &self,
+        stream: &Stream,
+        ptr: &DeviceBuffer,
+        value: u32,
+        flags: u32,
+        mask: u32,
+    ) -> HipResult<()> {
+        let Some(wait_value32) = self.fn_stream_wait_value32 else {
+            return Err(HipError::new(
+                0,
+                "hipStreamWaitValue32 unavailable; stream signal waits are unsupported",
+            ));
+        };
+        let code = unsafe { wait_value32(stream.0, ptr.as_ptr(), value, flags, mask) };
+        self.check(code, "hipStreamWaitValue32")
     }
 
     pub fn device_synchronize(&self) -> HipResult<()> {

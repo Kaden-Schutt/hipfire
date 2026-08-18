@@ -146,10 +146,14 @@ pub struct GenericDflashSpeculator {
     rng_state: u64,
     /// Per-request temperature from [`Speculator::set_sampling`]. Used only for
     /// the post-prefill first-token draw (`step` receives `temp` as an argument).
-    /// Default 0 → historical greedy argmax. top_p/top_k/cactus are accepted by
-    /// `set_sampling` for API parity with qwen35 but the shipped chain path is
-    /// temperature-only via [`naive_sample_chain`] (same as later verify/bonus).
+    /// Default 0 → historical greedy argmax.
     sample_temp: f32,
+    /// Per-request nucleus/top-k truncation from [`Speculator::set_sampling`].
+    /// Defaults `1.0` / `0` (disabled) so a speculator whose `set_sampling` is
+    /// never called behaves exactly as today — byte-identical draws via the
+    /// `top_k == 0 && top_p >= 0.999` fast path in [`crate::ddtree::naive_sample_chain`].
+    sample_top_p: f32,
+    sample_top_k: usize,
 }
 
 impl GenericDflashSpeculator {
@@ -204,8 +208,15 @@ impl GenericDflashSpeculator {
             )?;
             debug_assert_eq!(logits.len(), vocab);
             // Empty drafts → single bonus draw at row 0 (distribution-exact).
-            let (accepted, bonus) =
-                naive_sample_chain(&logits, &[], vocab, temp, &mut self.rng_state);
+            let (accepted, bonus) = naive_sample_chain(
+                &logits,
+                &[],
+                vocab,
+                temp,
+                self.sample_top_p,
+                self.sample_top_k,
+                &mut self.rng_state,
+            );
             debug_assert_eq!(
                 accepted, 0,
                 "empty-draft naive_sample_chain accepts nothing"
@@ -615,6 +626,8 @@ impl Speculator for GenericDflashSpeculator {
                         &[],
                         vocab,
                         self.sample_temp,
+                        self.sample_top_p,
+                        self.sample_top_k,
                         &mut self.rng_state,
                     );
                     debug_assert_eq!(
@@ -780,8 +793,15 @@ impl Speculator for GenericDflashSpeculator {
             // token per row, accepts the matching draft prefix, and returns the
             // bonus at the divergence position. All emitted tokens are genuine
             // target draws → distribution-exact.
-            let (accepted, bonus) =
-                naive_sample_chain(&logits_per_pos, &drafts, vocab, temp, &mut self.rng_state);
+            let (accepted, bonus) = naive_sample_chain(
+                &logits_per_pos,
+                &drafts,
+                vocab,
+                temp,
+                self.sample_top_p,
+                self.sample_top_k,
+                &mut self.rng_state,
+            );
             // Pre-commit budget: emit = accepted + 1 ≤ max_emit. With b ≤ max_emit
             // this is defensive; if it binds, keep the walk's own boundary draw
             // (drafts[max_accept] — matched, since accepted > max_accept), never argmax.
@@ -969,13 +989,22 @@ impl Speculator for GenericDflashSpeculator {
         false
     }
 
-    fn set_sampling(&mut self, temp: f32, _top_p: f32, _top_k: usize, _cactus_delta: f32) {
-        // Store temp for the post-prefill first-token draw. Re-seed RNG to the
-        // same fixed value qwen35 uses per request so sampled runs are
-        // deterministic given seed; greedy does not consume it. top_p/top_k are
-        // accepted for Speculator API parity — chain verify remains temperature-
-        // only via `naive_sample_chain` (identical to later step/bonus draws).
+    fn set_sampling(&mut self, temp: f32, top_p: f32, top_k: usize, _cactus_delta: f32) {
+        // Store temp + truncation policy for the post-prefill first-token draw and
+        // every subsequent chain verify / bonus draw. The chain verify now applies
+        // the same temp -> top-k -> nucleus truncation as the AR sampler
+        // (`sample_host_nucleus`), via `naive_sample_chain`'s `top_p`/`top_k`
+        // arguments. Previously `top_p`/`top_k` were discarded here, so a caller
+        // requesting top_p/top_k with generic DFlash on was silently sampling the
+        // UNTRUNCATED softmax while believing truncation was applied.
+        // Blast radius: generic-DFlash targets loaded via LlamaCarrier (arch ids
+        // 0/1). Qwen35's own `DflashSpeculator` (`hipfire-arch-qwen35`) stores and
+        // plumbs all three correctly and is not affected.
+        // Re-seed RNG to the same fixed value qwen35 uses per request so sampled
+        // runs are deterministic given seed; greedy does not consume it.
         self.sample_temp = temp;
+        self.sample_top_p = top_p;
+        self.sample_top_k = top_k;
         self.rng_state = 0x13579BDF;
     }
 
@@ -1042,8 +1071,12 @@ pub fn build_generic_dflash_speculator(
         tree: TreeMode::from_flags(&gpu.flags),
         // Fixed deterministic seed (matches the qwen35 dflash_spec default).
         rng_state: 0x13579BDF,
-        // Greedy until a request calls `set_sampling`.
+        // Greedy until a request calls `set_sampling`. Truncation defaults
+        // disabled (top_p=1.0, top_k=0) so behaviour is byte-identical until
+        // the caller opts in — matches the `1.0, 0` callers pass in tests.
         sample_temp: 0.0,
+        sample_top_p: 1.0,
+        sample_top_k: 0,
     }))
 }
 
@@ -1251,7 +1284,7 @@ mod tests {
 
         let mut rng = 0xDEAD_BEEF_u64;
         let (accepted, bonus) =
-            crate::ddtree::naive_sample_chain(&logits, &[], vocab, 0.0, &mut rng);
+            crate::ddtree::naive_sample_chain(&logits, &[], vocab, 0.0, 1.0, 0, &mut rng);
         assert_eq!(accepted, 0, "empty-draft chain accepts nothing");
         assert_eq!(
             bonus, last_argmax,
@@ -1266,7 +1299,7 @@ mod tests {
         assert_eq!(crate::llama::argmax(&tied), 1);
         let mut rng_tie = 1u64;
         let (_, tbonus) =
-            crate::ddtree::naive_sample_chain(&tied, &[], tied.len(), 0.0, &mut rng_tie);
+            crate::ddtree::naive_sample_chain(&tied, &[], tied.len(), 0.0, 1.0, 0, &mut rng_tie);
         assert_eq!(tbonus, 1);
         assert_eq!(rng_tie, 1);
 
@@ -1295,7 +1328,7 @@ mod tests {
 
         let mut rng_a = seed;
         let (acc_a, tok_a) =
-            crate::ddtree::naive_sample_chain(&logits, &[], vocab, temp, &mut rng_a);
+            crate::ddtree::naive_sample_chain(&logits, &[], vocab, temp, 1.0, 0, &mut rng_a);
         assert_eq!(acc_a, 0, "first-token empty-draft never accepts drafts");
         assert!(
             (tok_a as usize) < vocab,
@@ -1307,7 +1340,7 @@ mod tests {
         // Same seed → identical draw and identical post-state (deterministic).
         let mut rng_b = seed;
         let (acc_b, tok_b) =
-            crate::ddtree::naive_sample_chain(&logits, &[], vocab, temp, &mut rng_b);
+            crate::ddtree::naive_sample_chain(&logits, &[], vocab, temp, 1.0, 0, &mut rng_b);
         assert_eq!(acc_b, 0);
         assert_eq!(tok_b, tok_a);
         assert_eq!(rng_b, rng_a);
@@ -1316,14 +1349,14 @@ mod tests {
         // Later step_one_token / chain verify continue from this rng_state.
         let mut rng_c = rng_a;
         let (_acc_c, _tok_c) =
-            crate::ddtree::naive_sample_chain(&logits, &[], vocab, temp, &mut rng_c);
+            crate::ddtree::naive_sample_chain(&logits, &[], vocab, temp, 1.0, 0, &mut rng_c);
         assert_ne!(rng_c, rng_a, "second draw continues the RNG stream");
 
         // temp≈0 branch remains last_argmax / llama::argmax (byte-identical).
         let last_argmax = crate::llama::argmax(&logits);
         assert_eq!(last_argmax, 1);
         let mut rng_g = seed;
-        let (_, gbonus) = crate::ddtree::naive_sample_chain(&logits, &[], vocab, 0.0, &mut rng_g);
+        let (_, gbonus) = crate::ddtree::naive_sample_chain(&logits, &[], vocab, 0.0, 1.0, 0, &mut rng_g);
         assert_eq!(gbonus, last_argmax);
         assert_eq!(rng_g, seed, "greedy first token must not advance rng");
     }

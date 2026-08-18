@@ -22,9 +22,11 @@ use crate::deepseek4::{DeepseekV4Config, DeepseekV4State, DeepseekV4Weights};
 use crate::forward::{
     self, dspark_assemble_main_hidden, final_norm_and_argmax_all_batched,
     final_norm_and_argmax_all_batched_lazy, final_norm_and_sample_all_batched_lazy,
-    forward_prefill_batch_chunk, PrefillBatchScratch,
+    forward_prefill_batch_chunk, forward_prefill_batch_chunk_preuploaded,
+    upload_prefill_batch_inputs, PrefillBatchScratch,
 };
 use hipfire_runtime::spec::{SpecAdvance, SpecScratch, SpecTarget};
+use rdna_compute::replay::{ReplayCaptureSummary, ReplayController, ReplayState};
 use rdna_compute::{Gpu, GpuTensor};
 
 /// Owned deepseek4 model state — the future `ModelState::Deepseek4` payload and
@@ -42,6 +44,17 @@ pub struct Deepseek4Bundle {
 /// commit_prefix), so the scratch carries no GPU buffers — the PBS lives in
 /// `state.dspark_verify_pbs` and is reused across windows.
 pub struct Deepseek4DsparkScratch;
+
+/// Capture identity returned by the diagnostic DSpark retained-verify oracle.
+///
+/// This is deliberately separate from the production per-B controller stored
+/// in [`PrefillBatchScratch`].  A shadow run must not install, replace, or
+/// certify the route that serving may later use.
+#[derive(Clone, Copy, Debug)]
+pub struct DsparkVerifyCaptureInfo {
+    pub capture: ReplayCaptureSummary,
+    pub aql_contracts: usize,
+}
 
 impl SpecScratch for Deepseek4DsparkScratch {
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
@@ -61,7 +74,232 @@ fn dspark_verify_pbs_max_batch() -> usize {
         .unwrap_or(1024)
 }
 
+/// DSpark's adaptive controller settles at two draft tokens on the gfx1151
+/// MoE route, so the hot verify shape is B=3 (drafts plus the target bonus
+/// token). Capturing every transient startup shape pays graph construction for
+/// little or no reuse. `0` remains a diagnostic opt-in for the old all-B mode.
+fn dspark_verify_graph_batch_from_value(value: Option<&str>) -> usize {
+    value.and_then(|s| s.parse().ok()).unwrap_or(3)
+}
+
+fn dspark_verify_graph_batch() -> usize {
+    dspark_verify_graph_batch_from_value(
+        hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_DSPARK_VERIFY_GRAPH_BATCH")
+            .ok()
+            .as_deref(),
+    )
+}
+
 impl Deepseek4Bundle {
+    /// Materialize the DSpark verify scratch without entering speculation.
+    /// Used only by the Redline shadow adapter, which has no `SpecScratch`
+    /// object but must exercise the exact production PBS allocations.
+    pub fn redline_ensure_dspark_verify_pbs(
+        &mut self,
+        gpu: &mut Gpu,
+        min_batch: usize,
+    ) -> Result<(), String> {
+        let needs_alloc = self
+            .state
+            .dspark_verify_pbs
+            .as_ref()
+            .is_none_or(|pbs| pbs.max_batch < min_batch);
+        if needs_alloc {
+            self.state.dspark_verify_pbs = Some(
+                PrefillBatchScratch::new(
+                    gpu,
+                    &self.config,
+                    dspark_verify_pbs_max_batch().max(min_batch),
+                )
+                .map_err(|e| format!("Deepseek4Bundle: alloc redline dspark PBS: {e}"))?,
+            );
+        }
+        Ok(())
+    }
+
+    fn redline_take_dspark_verify_pbs(
+        &mut self,
+        gpu: &mut Gpu,
+        n_verify: usize,
+    ) -> Result<PrefillBatchScratch, String> {
+        self.redline_ensure_dspark_verify_pbs(gpu, n_verify)?;
+        if let Some(ref dspark) = self.weights.dspark {
+            self.state.dspark_target_layers = dspark.cfg.target_layer_ids.clone();
+        }
+        self.state.dspark_capture_active = true;
+        self.state
+            .dspark_verify_pbs
+            .take()
+            .ok_or_else(|| "Deepseek4Bundle: redline dspark PBS disappeared".to_string())
+    }
+
+    fn redline_finish_dspark_verify(
+        &mut self,
+        gpu: &mut Gpu,
+        pbs: PrefillBatchScratch,
+        n_verify: usize,
+        forward_result: Result<(), String>,
+    ) -> Result<Vec<u32>, String> {
+        self.state.dspark_verify_pbs = Some(pbs);
+        forward_result?;
+        // Materialise every head row for the oracle. Production may use the
+        // lazy prefix head, but the retained body ends before this call and the
+        // all-row result gives the shadow a stronger logits/output comparison.
+        self.dspark_verify_argmax(gpu, n_verify)
+    }
+
+    /// Run one explicit HIP verify arm for the DSpark Redline oracle.
+    ///
+    /// `capture_safe=false` is the shipping ordinary-HIP body.
+    /// `capture_safe=true` is the fixed-node body used by graph/PM4 replay.
+    pub fn redline_dspark_verify_direct(
+        &mut self,
+        gpu: &mut Gpu,
+        block: &[u32],
+        position: usize,
+        capture_safe: bool,
+    ) -> Result<Vec<u32>, String> {
+        let n_verify = block.len();
+        let mut pbs = self.redline_take_dspark_verify_pbs(gpu, n_verify)?;
+        let forward_result = if capture_safe {
+            upload_prefill_batch_inputs(&self.config, gpu, &pbs, block, position as u32).and_then(
+                |()| {
+                    forward_prefill_batch_chunk_preuploaded(
+                        &self.config,
+                        &self.weights,
+                        &mut self.state,
+                        gpu,
+                        &pbs,
+                        block,
+                        position as u32,
+                    )
+                },
+            )
+        } else {
+            forward_prefill_batch_chunk(
+                &self.config,
+                &self.weights,
+                &mut self.state,
+                gpu,
+                &mut pbs,
+                block,
+                position as u32,
+            )
+        };
+        self.redline_finish_dspark_verify(gpu, pbs, n_verify, forward_result)
+    }
+
+    /// Capture and prepare one isolated B-shaped PM4 verify route while also
+    /// executing its fixed-node HIP body for the current window.
+    pub fn redline_dspark_verify_capture_pm4(
+        &mut self,
+        gpu: &mut Gpu,
+        controller: &mut ReplayController,
+        block: &[u32],
+        position: usize,
+    ) -> Result<(Vec<u32>, DsparkVerifyCaptureInfo), String> {
+        let n_verify = block.len();
+        let pbs = self.redline_take_dspark_verify_pbs(gpu, n_verify)?;
+        let upload_result =
+            upload_prefill_batch_inputs(&self.config, gpu, &pbs, block, position as u32);
+        std::mem::swap(&mut gpu.replay, controller);
+        let capture_result = (|| -> Result<DsparkVerifyCaptureInfo, String> {
+            upload_result?;
+            gpu.replay
+                .begin_capture()
+                .map_err(|reason| format!("DSpark shadow begin capture: {reason}"))?;
+            forward_prefill_batch_chunk_preuploaded(
+                &self.config,
+                &self.weights,
+                &mut self.state,
+                gpu,
+                &pbs,
+                block,
+                position as u32,
+            )?;
+            gpu.hip
+                .device_synchronize()
+                .map_err(|e| format!("DSpark shadow capture sync: {e:?}"))?;
+            let capture = gpu
+                .replay
+                .finish_capture()
+                .map_err(|reason| format!("DSpark shadow finish capture: {reason}"))?;
+            let launches = gpu.replay.recorded_launches().len();
+            let contracts = gpu
+                .replay
+                .probe_aql_contracts(gpu.device_id as usize)
+                .map_err(|reason| format!("DSpark shadow AQL contracts: {reason}"))?;
+            gpu.replay
+                .prepare_pm4_prefix(gpu.device_id as usize, launches)
+                .map_err(|reason| format!("DSpark shadow PM4 prepare: {reason}"))?;
+            Ok(DsparkVerifyCaptureInfo {
+                capture,
+                aql_contracts: contracts.len(),
+            })
+        })();
+        std::mem::swap(&mut gpu.replay, controller);
+        let capture_info = match capture_result {
+            Ok(info) => info,
+            Err(error) => {
+                self.state.dspark_verify_pbs = Some(pbs);
+                return Err(error);
+            }
+        };
+        let picks = self.redline_finish_dspark_verify(gpu, pbs, n_verify, Ok(()))?;
+        Ok((picks, capture_info))
+    }
+
+    /// Replay the exact captured HIP blobs from a prior shadow capture.
+    pub fn redline_dspark_verify_captured_hip(
+        &mut self,
+        gpu: &mut Gpu,
+        controller: &mut ReplayController,
+        block: &[u32],
+        position: usize,
+    ) -> Result<Vec<u32>, String> {
+        let n_verify = block.len();
+        let pbs = self.redline_take_dspark_verify_pbs(gpu, n_verify)?;
+        let upload_result =
+            upload_prefill_batch_inputs(&self.config, gpu, &pbs, block, position as u32);
+        std::mem::swap(&mut gpu.replay, controller);
+        let replay_result = upload_result.and_then(|()| {
+            let launches = gpu.replay.recorded_launches().len();
+            gpu.replay_recorded_hip_prefix(launches)
+                .map_err(|e| format!("DSpark shadow captured HIP replay: {e:?}"))
+        });
+        std::mem::swap(&mut gpu.replay, controller);
+        self.redline_finish_dspark_verify(gpu, pbs, n_verify, replay_result)
+    }
+
+    /// Replay one previously prepared PM4 verify body with freshly uploaded
+    /// token/position/count inputs.
+    pub fn redline_dspark_verify_pm4(
+        &mut self,
+        gpu: &mut Gpu,
+        controller: &mut ReplayController,
+        block: &[u32],
+        position: usize,
+    ) -> Result<Vec<u32>, String> {
+        let n_verify = block.len();
+        let pbs = self.redline_take_dspark_verify_pbs(gpu, n_verify)?;
+        let upload_result =
+            upload_prefill_batch_inputs(&self.config, gpu, &pbs, block, position as u32);
+        std::mem::swap(&mut gpu.replay, controller);
+        let replay_result = upload_result.and_then(|()| {
+            if !gpu.replay.should_route_pm4() {
+                return Err(format!(
+                    "DSpark shadow PM4 controller is not ready: {:?}",
+                    gpu.replay.state()
+                ));
+            }
+            unsafe { gpu.replay.replay_pm4(position) }
+                .map(|_| ())
+                .map_err(|reason| format!("DSpark shadow PM4 replay: {reason}"))
+        });
+        std::mem::swap(&mut gpu.replay, controller);
+        self.redline_finish_dspark_verify(gpu, pbs, n_verify, replay_result)
+    }
+
     /// Shared verify forward for `verify_block` / `verify_block_capture_gpu`:
     /// arms hidden capture into `state.dspark_caps`, runs one batched trunk
     /// forward over `block` at `position`, and leaves the head unapplied. When
@@ -93,16 +331,287 @@ impl Deepseek4Bundle {
         }
         self.state.dspark_capture_active = true;
         // Take the PBS out of state to avoid immutable + mutable borrow collision.
-        let pbs = self.state.dspark_verify_pbs.take().unwrap();
-        let fwd_result = forward_prefill_batch_chunk(
+        let mut pbs = self.state.dspark_verify_pbs.take().unwrap();
+        if let Err(error) = forward::ensure_request_capacity(
             &self.config,
-            &self.weights,
             &mut self.state,
             gpu,
-            &pbs,
-            block,
-            position as u32,
-        );
+            &mut pbs,
+            position.saturating_add(n_verify),
+        ) {
+            self.state.dspark_verify_pbs = Some(pbs);
+            return Err(format!("Deepseek4Bundle::verify_block capacity: {error}"));
+        }
+        let graph_batch = dspark_verify_graph_batch();
+        let pm4_enabled = gpu.arch == "gfx1151"
+            && hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_DSPARK_VERIFY_PM4")
+                .ok()
+                .as_deref()
+                == Some("1");
+        let aql_enabled = !pm4_enabled
+            && gpu.arch == "gfx1151"
+            && hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_DSPARK_VERIFY_AQL")
+                .ok()
+                .as_deref()
+                == Some("1");
+        let retained_enabled = pm4_enabled || aql_enabled;
+        let graph_enabled = !retained_enabled
+            && gpu.arch == "gfx1151"
+            && hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_DSPARK_VERIFY_GRAPH")
+                .ok()
+                .as_deref()
+                == Some("1")
+            && (graph_batch == 0 || graph_batch == n_verify);
+        let fwd_result = if graph_enabled {
+            (|| -> Result<(), String> {
+                upload_prefill_batch_inputs(&self.config, gpu, &pbs, block, position as u32)?;
+                if gpu.active_stream.is_none() {
+                    return Err(
+                        "DSpark verify graph: upload did not create an active stream".into(),
+                    );
+                }
+                if gpu.graphs.verify_has_graph(n_verify) {
+                    gpu.graphs
+                        .verify_graph_launch(
+                            &gpu.hip,
+                            gpu.device_id,
+                            gpu.active_stream.as_ref().unwrap(),
+                            n_verify,
+                        )
+                        .map_err(|e| format!("DSpark verify graph replay B={n_verify}: {e:?}"))
+                } else if gpu.graphs.verify_needs_warmup(n_verify) {
+                    gpu.graphs.verify_mark_warmup_done(n_verify);
+                    let result = forward_prefill_batch_chunk_preuploaded(
+                        &self.config,
+                        &self.weights,
+                        &mut self.state,
+                        gpu,
+                        &pbs,
+                        block,
+                        position as u32,
+                    );
+                    if result.is_ok() {
+                        eprintln!("[ds4-dspark-verify-graph] warmup B={n_verify} complete");
+                    }
+                    result
+                } else {
+                    gpu.graphs
+                        .begin_verify_graph_capture(
+                            &gpu.hip,
+                            gpu.device_id,
+                            gpu.active_stream.as_ref().unwrap(),
+                            n_verify,
+                        )
+                        .map_err(|e| format!("DSpark verify graph begin B={n_verify}: {e:?}"))?;
+                    let result = forward_prefill_batch_chunk_preuploaded(
+                        &self.config,
+                        &self.weights,
+                        &mut self.state,
+                        gpu,
+                        &pbs,
+                        block,
+                        position as u32,
+                    );
+                    if let Err(error) = result {
+                        let _ = gpu.hip.stream_end_capture(
+                            gpu.active_stream
+                                .as_ref()
+                                .expect("DSpark verify graph stream disappeared"),
+                        );
+                        gpu.graphs.capture_mode = false;
+                        gpu.graphs.capture_blobs.clear();
+                        Err(error)
+                    } else {
+                        let stream = gpu
+                            .active_stream
+                            .as_ref()
+                            .expect("DSpark verify graph stream disappeared");
+                        gpu.graphs
+                            .end_verify_graph_capture(&gpu.hip, gpu.device_id, stream)
+                            .map_err(|e| format!("DSpark verify graph end B={n_verify}: {e:?}"))?;
+                        // Stream capture records but does not execute the forward.
+                        // Launch once so this verify window observes current inputs.
+                        gpu.graphs
+                            .verify_graph_launch(&gpu.hip, gpu.device_id, stream, n_verify)
+                            .map_err(|e| {
+                                format!("DSpark verify graph first launch B={n_verify}: {e:?}")
+                            })?;
+                        eprintln!(
+                            "[ds4-dspark-verify-graph] captured B={n_verify} entries={}",
+                            gpu.graphs.verify_graph_count()
+                        );
+                        Ok(())
+                    }
+                }
+            })()
+        } else if retained_enabled {
+            (|| -> Result<(), String> {
+                upload_prefill_batch_inputs(&self.config, gpu, &pbs, block, position as u32)?;
+
+                let mut controller = pbs.dspark_verify_pm4.remove(&n_verify).unwrap_or_else(|| {
+                    if aql_enabled {
+                        rdna_compute::replay::ReplayController::new_manual_aql()
+                    } else {
+                        rdna_compute::replay::ReplayController::new_manual_pm4()
+                    }
+                });
+                std::mem::swap(&mut gpu.replay, &mut controller);
+                let result = (|| -> Result<(), String> {
+                    if gpu.replay.should_route_pm4() {
+                        // Outside graph capture, `upload_prefill_batch_inputs`
+                        // uses synchronous H2D copies for every dynamic input
+                        // consumed by this retained body. The preceding DSpark
+                        // proposal and the prior verify result are likewise
+                        // materialized before the controller reaches this
+                        // call. A host stream synchronization here therefore
+                        // adds one full GPU pipeline bubble per verify window
+                        // without establishing any additional dependency.
+                        let first_observed = gpu.replay.replay_observation().count == 0;
+                        unsafe { gpu.replay.replay_pm4(position) }.map_err(|reason| {
+                            format!("DSpark verify PM4 replay B={n_verify}: {reason}")
+                        })?;
+                        if first_observed {
+                            eprintln!(
+                                "[ds4-dspark-verify-pm4] observed replay B={n_verify} position={position} identity={:?}",
+                                gpu.replay.prepared_route_identity()
+                            );
+                        }
+                        return Ok(());
+                    }
+                    if gpu.replay.should_route_aql() {
+                        let first_observed = gpu.replay.replay_observation().count == 0;
+                        unsafe { gpu.replay.replay_linear_aql(position) }.map_err(|reason| {
+                            format!("DSpark verify AQL replay B={n_verify}: {reason}")
+                        })?;
+                        if first_observed {
+                            eprintln!(
+                                "[ds4-dspark-verify-aql] observed replay B={n_verify} position={position} identity={:?}",
+                                gpu.replay.prepared_route_identity()
+                            );
+                        }
+                        return Ok(());
+                    }
+
+                    if matches!(gpu.replay.state(), ReplayState::Fallback | ReplayState::Hip) {
+                        return forward_prefill_batch_chunk_preuploaded(
+                            &self.config,
+                            &self.weights,
+                            &mut self.state,
+                            gpu,
+                            &pbs,
+                            block,
+                            position as u32,
+                        );
+                    }
+
+                    gpu.replay.begin_capture().map_err(|reason| {
+                        format!("DSpark verify PM4 begin capture B={n_verify}: {reason}")
+                    })?;
+                    let direct = forward_prefill_batch_chunk_preuploaded(
+                        &self.config,
+                        &self.weights,
+                        &mut self.state,
+                        gpu,
+                        &pbs,
+                        block,
+                        position as u32,
+                    );
+                    if let Err(error) = direct {
+                        gpu.replay.poison(format!(
+                            "DSpark verify PM4 capture body B={n_verify}: {error}"
+                        ));
+                        return Err(error);
+                    }
+                    gpu.hip.device_synchronize().map_err(|e| {
+                        format!("DSpark verify PM4 capture sync B={n_verify}: {e:?}")
+                    })?;
+                    let capture = gpu.replay.finish_capture().map_err(|reason| {
+                        format!("DSpark verify PM4 finish capture B={n_verify}: {reason}")
+                    })?;
+                    let launches = gpu.replay.recorded_launches().len();
+                    if hipfire_config::developer_var("HIPFIRE_DS4_REPLAY_INVENTORY")
+                        .ok()
+                        .as_deref()
+                        == Some("1")
+                    {
+                        let mut inventory = std::collections::BTreeMap::<String, usize>::new();
+                        for launch in gpu.replay.recorded_launches() {
+                            *inventory.entry(launch.kernel.clone()).or_default() += 1;
+                        }
+                        for (kernel, count) in inventory {
+                            eprintln!(
+                                "DS4_DSPARK_PM4_INVENTORY B={n_verify} kernel={kernel} count={count}"
+                            );
+                        }
+                    }
+                    if hipfire_config::developer_var("HIPFIRE_DS4_REPLAY_SEQUENCE")
+                        .ok()
+                        .as_deref()
+                        == Some("1")
+                    {
+                        for (index, launch) in gpu.replay.recorded_launches().iter().enumerate() {
+                            eprintln!(
+                                "DS4_DSPARK_PM4_SEQUENCE B={n_verify} index={index} kernel={}",
+                                launch.kernel
+                            );
+                        }
+                    }
+                    let contracts = match gpu.replay.probe_aql_contracts(gpu.device_id as usize) {
+                        Ok(contracts) => contracts,
+                        Err(reason) => {
+                            gpu.replay.poison(format!(
+                                "DSpark verify PM4 AQL contracts B={n_verify}: {reason}"
+                            ));
+                            eprintln!(
+                                "[ds4-dspark-verify-pm4] rejected B={n_verify}: contract probe: {reason}"
+                            );
+                            return Ok(());
+                        }
+                    };
+                    let prepared = if aql_enabled {
+                        gpu.replay
+                            .prepare_linear_aql_prefix(gpu.device_id as usize, launches)
+                            .map(|_| ())
+                    } else {
+                        gpu.replay
+                            .prepare_pm4_prefix(gpu.device_id as usize, launches)
+                            .map(|_| ())
+                    };
+                    match prepared {
+                        Ok(_) => eprintln!(
+                            "[ds4-dspark-verify-{}] ready B={n_verify} capture={capture:?} contracts={}/{} identity={:?}",
+                            if aql_enabled { "aql" } else { "pm4" },
+                            contracts.len(),
+                            capture.unique_kernel_count,
+                            gpu.replay.prepared_route_identity()
+                        ),
+                        Err(reason) => {
+                            gpu.replay.poison(format!(
+                                "DSpark verify retained prepare B={n_verify}: {reason}"
+                            ));
+                            eprintln!(
+                                "[ds4-dspark-verify-{}] rejected B={n_verify}: prepare: {reason}",
+                                if aql_enabled { "aql" } else { "pm4" },
+                            );
+                        }
+                    }
+                    Ok(())
+                })();
+                std::mem::swap(&mut gpu.replay, &mut controller);
+                pbs.dspark_verify_pm4.insert(n_verify, controller);
+                result
+            })()
+        } else {
+            forward_prefill_batch_chunk(
+                &self.config,
+                &self.weights,
+                &mut self.state,
+                gpu,
+                &mut pbs,
+                block,
+                position as u32,
+            )
+        };
         // Restore the PBS before propagating any error so state stays consistent.
         self.state.dspark_verify_pbs = Some(pbs);
         fwd_result.map_err(|e| format!("Deepseek4Bundle::verify_block forward: {e}"))
@@ -111,12 +620,12 @@ impl Deepseek4Bundle {
     /// Apply the trunk final-norm + lm_head + per-position argmax over the
     /// `n_verify` hidden rows left in the verify PBS by `dspark_verify_forward`.
     fn dspark_verify_argmax(&mut self, gpu: &mut Gpu, n_verify: usize) -> Result<Vec<u32>, String> {
-        let pbs = self.state.dspark_verify_pbs.take().unwrap();
+        let mut pbs = self.state.dspark_verify_pbs.take().unwrap();
         let argmax_result = final_norm_and_argmax_all_batched(
             &self.config,
             &self.weights,
             &mut self.state,
-            &pbs,
+            &mut pbs,
             gpu,
             n_verify,
         );
@@ -132,12 +641,12 @@ impl Deepseek4Bundle {
         gpu: &mut Gpu,
         block: &[u32],
     ) -> Result<Vec<u32>, String> {
-        let pbs = self.state.dspark_verify_pbs.take().unwrap();
+        let mut pbs = self.state.dspark_verify_pbs.take().unwrap();
         let res = final_norm_and_argmax_all_batched_lazy(
             &self.config,
             &self.weights,
             &mut self.state,
-            &pbs,
+            &mut pbs,
             gpu,
             block,
         );
@@ -165,12 +674,12 @@ impl Deepseek4Bundle {
             .alloc_tensor(&[1], rdna_compute::DType::F32)
             .map_err(|e| format!("dspark_verify_sample_lazy repeat_buf: {e:?}"))?;
         let mut rng32 = *rng_state as u32;
-        let pbs = self.state.dspark_verify_pbs.take().unwrap();
+        let mut pbs = self.state.dspark_verify_pbs.take().unwrap();
         let res = final_norm_and_sample_all_batched_lazy(
             &self.config,
             &self.weights,
             &mut self.state,
-            &pbs,
+            &mut pbs,
             gpu,
             block,
             temp,
@@ -249,7 +758,7 @@ impl SpecTarget for Deepseek4Bundle {
         // Take the PBS out of state to avoid a simultaneous immutable + mutable
         // borrow of self.state (forward_prefill_batch_chunked takes &mut state).
         // Restore it afterward (it is always Some after the lazy alloc above).
-        let pbs = self.state.dspark_verify_pbs.take().unwrap();
+        let mut pbs = self.state.dspark_verify_pbs.take().unwrap();
         let result = forward::forward_prefill_batch_chunked(
             &self.config,
             &self.weights,
@@ -257,7 +766,7 @@ impl SpecTarget for Deepseek4Bundle {
             gpu,
             tokens,
             start_pos as u32,
-            &pbs,
+            &mut pbs,
         );
         self.state.dspark_verify_pbs = Some(pbs);
         let last_logits =
@@ -468,13 +977,13 @@ impl SpecTarget for Deepseek4Bundle {
         self.state.dspark_target_layers = layers.to_vec();
         self.state.dspark_capture_active = true;
         // Take the PBS out of state to avoid immutable+mutable borrow conflict.
-        let pbs = self.state.dspark_verify_pbs.take().unwrap();
+        let mut pbs = self.state.dspark_verify_pbs.take().unwrap();
         let fwd_result = forward_prefill_batch_chunk(
             &self.config,
             &self.weights,
             &mut self.state,
             gpu,
-            &pbs,
+            &mut pbs,
             &[seed],
             position as u32,
         );
@@ -500,5 +1009,18 @@ impl SpecTarget for Deepseek4Bundle {
                 .map_err(|e| format!("Deepseek4Bundle::capture_seed_main_hidden d2h: {e:?}"))?;
         }
         Ok(host)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dspark_verify_graph_batch_from_value;
+
+    #[test]
+    fn dspark_verify_graph_defaults_to_settled_b3() {
+        assert_eq!(dspark_verify_graph_batch_from_value(None), 3);
+        assert_eq!(dspark_verify_graph_batch_from_value(Some("5")), 5);
+        assert_eq!(dspark_verify_graph_batch_from_value(Some("0")), 0);
+        assert_eq!(dspark_verify_graph_batch_from_value(Some("bad")), 3);
     }
 }

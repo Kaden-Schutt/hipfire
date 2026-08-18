@@ -934,6 +934,93 @@ class GoldenReportTests(unittest.TestCase):
             any("coherence is missing" in error for error in result["errors"])
         )
 
+class GoldenSampledParityTests(unittest.TestCase):
+    """Golden must reject archived reports with divergent sampled outputs; byte-identical passes."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.registry = golden_redline.load_registry(golden_redline.DEFAULT_REGISTRY)
+        cls.fixture = cls.registry["fixtures"][0]
+
+    @staticmethod
+    def _paris_row(content: str = "Paris is the capital of France.", ctx: int = 128, gen: int = 8) -> dict:
+        return {"assistant_content": content, "ctx": ctx, "gen": gen}
+
+    def _base_report(self):
+        # Use the canonical valid report helper from GoldenReportTests
+        helper = GoldenReportTests()
+        helper.registry = self.registry  # type: ignore
+        helper.fixture = self.fixture  # type: ignore
+        return helper.report()
+
+    def test_exact_paris_rows_pass(self):
+        report = self._base_report()
+        report["coherence"]["hip"]["rows"] = [self._paris_row()]
+        report["coherence"]["auto"]["rows"] = [self._paris_row()]
+        result = golden_redline.validate_report(report, self.fixture, self.registry, strict_binary=False)
+        self.assertTrue(result["valid"], result["errors"])
+
+    def test_paris_county_long_wrong_fails_despite_shared_substring(self):
+        report = self._base_report()
+        report["coherence"]["hip"]["rows"] = [self._paris_row("Paris is the capital of France.")]
+        report["coherence"]["auto"]["rows"] = [
+            self._paris_row("Paris is the capital of France. Paris County is a fictional county with many parishes and a long deterministically wrong suffix that contains Paris as substring.")
+        ]
+        result = golden_redline.validate_report(report, self.fixture, self.registry, strict_binary=False)
+        self.assertFalse(result["valid"])
+        self.assertTrue(any("assistant_content" in e or "sampled output" in e for e in result["errors"]))
+        # Substring health hint would have passed, but exact parity must fail
+        hip_content = report["coherence"]["hip"]["rows"][0]["assistant_content"]
+        auto_content = report["coherence"]["auto"]["rows"][0]["assistant_content"]
+        self.assertIn("Paris", hip_content)
+        self.assertIn("Paris", auto_content)
+        self.assertNotEqual(hip_content, auto_content)
+
+    def test_count_type_field_mismatches_fail(self):
+        # count mismatch
+        report = self._base_report()
+        report["coherence"]["hip"]["rows"] = [self._paris_row(), self._paris_row()]
+        report["coherence"]["auto"]["rows"] = [self._paris_row()]
+        result = golden_redline.validate_report(report, self.fixture, self.registry, strict_binary=False)
+        self.assertFalse(result["valid"])
+        self.assertTrue(any("row count" in e for e in result["errors"]))
+        # type mismatch: hip_rows not a list
+        report2 = self._base_report()
+        report2["coherence"]["hip"]["rows"] = "not-a-list"  # type: ignore
+        report2["coherence"]["auto"]["rows"] = [self._paris_row()]
+        result2 = golden_redline.validate_report(report2, self.fixture, self.registry, strict_binary=False)
+        self.assertFalse(result2["valid"])
+        self.assertTrue(any("must be a list" in e for e in result2["errors"]))
+        # row not a dict
+        report3 = self._base_report()
+        report3["coherence"]["hip"]["rows"] = [self._paris_row()]
+        report3["coherence"]["auto"]["rows"] = ["not-a-dict"]  # type: ignore
+        result3 = golden_redline.validate_report(report3, self.fixture, self.registry, strict_binary=False)
+        self.assertFalse(result3["valid"])
+        self.assertTrue(any("must be an object" in e for e in result3["errors"]))
+        # missing field
+        report4 = self._base_report()
+        report4["coherence"]["hip"]["rows"] = [self._paris_row()]
+        report4["coherence"]["auto"]["rows"] = [{"assistant_content": "Paris is the capital of France.", "ctx": 128}]  # missing gen
+        result4 = golden_redline.validate_report(report4, self.fixture, self.registry, strict_binary=False)
+        self.assertFalse(result4["valid"])
+        self.assertTrue(any("gen" in e for e in result4["errors"]))
+        # ctx mismatch
+        report5 = self._base_report()
+        report5["coherence"]["hip"]["rows"] = [self._paris_row(ctx=128, gen=8)]
+        report5["coherence"]["auto"]["rows"] = [self._paris_row(ctx=129, gen=8)]
+        result5 = golden_redline.validate_report(report5, self.fixture, self.registry, strict_binary=False)
+        self.assertFalse(result5["valid"])
+        self.assertTrue(any("ctx" in e for e in result5["errors"]))
+
+    def test_no_normalization_case_sensitivity(self):
+        report = self._base_report()
+        report["coherence"]["hip"]["rows"] = [self._paris_row("Paris is the capital of France.")]
+        report["coherence"]["auto"]["rows"] = [self._paris_row("paris is the capital of france.")]
+        result = golden_redline.validate_report(report, self.fixture, self.registry, strict_binary=False)
+        self.assertFalse(result["valid"])
+
+
 
 
 class GoldenCliLifecycleTests(unittest.TestCase):

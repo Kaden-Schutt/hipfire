@@ -1,0 +1,1 @@
+I understand you want a rigorous, production-grade technical breakdown for a benchmark fixture targeting a DeepSeek V4 Flash-style MoT model on AMD's MI300

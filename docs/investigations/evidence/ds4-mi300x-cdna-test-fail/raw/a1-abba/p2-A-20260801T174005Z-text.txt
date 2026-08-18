@@ -1,0 +1,26 @@
+# Technical Specification: DeepSeek V4 Flash MoE Inference on AMD MI300X (gfx942) – Measurement Contract
+
+This document establishes the precise measurement framework for a production-grade inference benchmark on a DeepSeek V4 Flash-style Mixture-of-Experts (MoE) model running on AMD Instinct MI300X (gGPU architecture identifier: gfx942). The focus is on **ordinary batch-1 autoregressive (AR) inference** with **Q8 KV quantization**, **no speculation**, and a fixed prompt-to-generation pipeline. This is not a marketing document; it is a technical contract for reproducible, verifiable, and deterministic benchmarking.
+
+---
+
+## 1. Core Measurement Parameters (The "Frozen" Contract)
+
+| Parameter | Value / Specification | Notes |
+|-----------|----------------------|-------|
+| **Model** | DeepSe V4 Flash (MoE) | Exact model artifact must be versioned and checksummed (SHA-256). |
+| **Hardware** | AMD Instinct MI300X (gfx942) | Single GPU, no multi-GP. |
+| **Prompt Length** | **2048 tokens** | Exact token count, no padding, no truncation. |
+| **Generated Length** | **510 tokens** | Greedy generation (temperature=0). |
+| **KV Cache Mode** | **Q8 (8-bit quantized)** | Keys and Values stored in 8-bit quantized format. |
+| **Speculation** | **Disabled** | No draft model, no tree verification, no speculative decoding. |
+| **Batch Size** | **1** | Single sequence inference. |
+| **Sampling** | **Greedy** | `temperature=0`, no top-k/top-p randomness. |
+| **Tokenizer** | **Embedded HFQ tokenizer** | Tokenizer identity is part of the model artifact. No external Python tokenizer. |
+| **Prompt Source** | **Fixed, deterministic corpus** | A specific, non-degenerate text (e.g., a technical document). No random words, no repeated paragraphs. |
+| **Prompt Format** | **No trailing newline** | The final token sequence must not end with a newline token. |
+| **Output Format** | **Little-endian u32 token dump** | The generated token IDs are output as a binary file of 32-bit unsigned integers in little-endian order. |
+
+---
+
+## 2. The "Why" of the

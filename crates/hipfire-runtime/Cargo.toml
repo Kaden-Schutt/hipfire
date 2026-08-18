@@ -40,7 +40,7 @@ description = "Inference orchestrator for RDNA GPUs"
 # block below) which serves both as documentation of which features
 # each example needs and as the gate for downstream library consumers
 # who attempt to build examples through their own build script.
-default = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-cohere2moe", "arch-dots-ocr", "deltanet"]
+default = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-cohere2moe", "arch-dots-ocr", "arch-gemma4", "arch-muse-glimmer", "deltanet"]
 deltanet = ["rdna-compute/deltanet", "hipfire-dispatch/deltanet"]
 arch-qwen35 = []
 arch-qwen35-vl = []
@@ -49,6 +49,8 @@ arch-qwen2 = []
 arch-deepseek4 = []
 arch-cohere2moe = []
 arch-dots-ocr = []
+arch-gemma4 = []
+arch-muse-glimmer = []
 # ep-fault-inject: enables the EP partial-load fault-injection knob
 # (HIPFIRE_EP_FAIL_RANK) in the daemon example, which makes a chosen EP rank
 # return a synthetic Err after uploading its weights so the staging-guard VRAM
@@ -128,6 +130,8 @@ hipfire-arch-minimax = { path = "../hipfire-arch-minimax" }
 hipfire-arch-cohere2moe = { path = "../hipfire-arch-cohere2moe" }
 hipfire-arch-deepseek4 = { path = "../hipfire-arch-deepseek4" }
 hipfire-arch-dots-ocr = { path = "../hipfire-arch-dots-ocr" }
+hipfire-arch-gemma4 = { path = "../hipfire-arch-gemma4" }
+hipfire-arch-muse-glimmer = { path = "../hipfire-arch-muse-glimmer" }
 hipfire-loader = { path = "../hipfire-loader" }
 hipfire-detect = { path = "../hipfire-detect" }
 hipfire-atlas = { path = "../hipfire-atlas" }
@@ -146,7 +150,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 
 [[example]]
 name = "daemon"
-required-features = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-cohere2moe", "arch-dots-ocr"]
+required-features = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-cohere2moe", "arch-dots-ocr", "arch-gemma4", "arch-muse-glimmer"]
 
 [[example]]
 name = "hfq_split"
@@ -193,6 +197,10 @@ name = "a3b_multiturn_oneshot"
 required-features = ["arch-qwen35"]
 
 [[example]]
+name = "qwen35_batch_generate"
+required-features = ["arch-qwen35", "deltanet"]
+
+[[example]]
 name = "a3b_smoke_forward"
 required-features = ["arch-qwen35"]
 
@@ -234,6 +242,10 @@ required-features = ["arch-qwen35"]
 
 [[example]]
 name = "greedy_dump_top5"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "kv_mode_kld"
 required-features = ["arch-qwen35"]
 
 [[example]]
@@ -303,6 +315,18 @@ required-features = ["arch-qwen35"]
 [[example]]
 name = "test_qwen35_loadQA"
 required-features = ["arch-qwen35"]
+
+[[example]]
+name = "test_forward_slots_golden"
+required-features = ["arch-qwen35", "deltanet"]
+
+[[example]]
+name = "demo_multislot_generate"
+required-features = ["arch-qwen35", "deltanet"]
+
+[[example]]
+name = "demo_concurrent_serve"
+required-features = ["arch-qwen35", "deltanet"]
 
 [[example]]
 name = "triattn_accuracy_sweep"

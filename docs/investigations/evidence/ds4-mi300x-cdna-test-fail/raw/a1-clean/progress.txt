@@ -1,0 +1,12 @@
+--- warm tok=16 ---
+{"type":"commit_ready","id":"g0-warm","tokens":16,"tok_s":2.2988505747126435,"prompt_tokens":2052,"prefill_tokens":2052,"cached_tokens":0,"prefill_ms":20836,"total_ms":27796,"finish_reason":"length","drafter":"ar","attempt_id":1}
+--- AA1 tok=64 ---
+{"type":"commit_ready","id":"g0-AA1","tokens":64,"tok_s":2.2732116217944163,"prompt_tokens":2052,"prefill_tokens":2052,"cached_tokens":0,"prefill_ms":20826,"total_ms":48981,"finish_reason":"length","drafter":"ar","attempt_id":1}
+--- AA2 tok=64 ---
+{"type":"commit_ready","id":"g0-AA2","tokens":64,"tok_s":2.2739385325990407,"prompt_tokens":2052,"prefill_tokens":2052,"cached_tokens":0,"prefill_ms":20838,"total_ms":48983,"finish_reason":"length","drafter":"ar","attempt_id":1}
+=== lever line ===
+deepseek4 gfx942 A2 levers: L1 compressor_gate=OFF (HIPFIRE_DEEPSEEK4_GFX942_COMPRESSOR_GATE default OFF, =1 enables) ; L3 e8_wo_grouped=OFF (HIPFIRE_DEEPSEEK4_GFX942_E8_WO_GROUPED default OFF, =1 enables) ; F1 indexer_topk_parallel=OFF (HIPFIRE_DEEPSEEK4_GFX942_INDEXER_TOPK_PARALLEL default OFF, =1 enables)
+3c7252219912d72f7a0bfd54a9334b55  /mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/a1-clean/AA1-text.txt
+40d8b0f85ca4b790f139b6c2cd29fa50  /mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/a1-clean/AA2-text.txt
+CLEAN_AA_64=NO
+CLEANDONE

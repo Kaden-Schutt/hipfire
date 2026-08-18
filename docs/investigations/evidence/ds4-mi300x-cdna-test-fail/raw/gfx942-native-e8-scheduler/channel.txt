@@ -1,0 +1,6 @@
+GPU dev 0: gfx942 (205.8 GB VRAM, HIP 7.14)
+  pre-compiled kernels: /mnt/scratch/hipfire-kernels/rocm714/gfx942
+[rocblas] loaded for gfx942
+CHANNEL w1 values=2048 raw_bit_mismatches=1705 max_abs=2.343750000e-2 max_rel=9.850107133e-3 numerical_violations=0 first_bad=None
+CHANNEL w3 values=2048 raw_bit_mismatches=1739 max_abs=1.757812500e-2 max_rel=1.780785387e-4 numerical_violations=0 first_bad=None
+MICRO shape=two_job_shared_x M=2048 K=4096 trials=7 repeats=24 reference_two_launch_ms=0.017557 candidate_one_launch_ms=0.012754 speedup=1.3766x reference_effective_GBps=513.27 candidate_effective_GBps=706.54 grid=512 block=512 waves_per_block=8 x_global_load_reduction=8x launches_saved_per_token=43 weight_bytes_per_token=386072576

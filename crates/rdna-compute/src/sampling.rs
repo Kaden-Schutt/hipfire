@@ -7,9 +7,9 @@
 
 use std::ffi::c_void;
 
-use crate::dispatch::{Gpu, GpuTensor};
+use crate::dispatch::{DType, Gpu, GpuTensor};
 use crate::kernels;
-use hip_bridge::HipResult;
+use hip_bridge::{HipError, HipResult};
 
 /// Whether the multi-workgroup parallel sampler is enabled (default ON).
 /// `HIPFIRE_SAMPLE_PARALLEL=0` forces the legacy single-block kernel (for
@@ -36,6 +36,60 @@ fn sample_fast_stable_enabled() -> bool {
             .map(|v| v != "0")
             .unwrap_or(true)
     })
+}
+
+/// HIP source for the default parallel sampler module (`sample_top_p_parallel`,
+/// TOP_K 20). Shared by runtime ensure_kernel and `precompile_qwen35` so the
+/// cache hash is identical.
+pub(crate) fn sample_top_p_parallel_src() -> String {
+    kernels::SAMPLE_TOP_P_PARALLEL_SRC.replace("#define TOP_K 64", "#define TOP_K 20")
+}
+
+/// HIP source for the wide parallel sampler (`sample_top_p_parallel_w64`).
+/// Renames the three entry points; leaves TOP_K at the on-disk default 64.
+pub(crate) fn sample_top_p_parallel_w64_src() -> String {
+    kernels::SAMPLE_TOP_P_PARALLEL_SRC
+        .replace(
+            "sample_apply_repeat_penalty",
+            "sample_apply_repeat_penalty_w64",
+        )
+        .replace("sample_topk_partial", "sample_topk_partial_w64")
+        .replace("sample_topk_finalize", "sample_topk_finalize_w64")
+}
+
+/// HIP source for a fast-stable parallel sampler module.
+/// `top_k_width` is 21 (fast21) or 65 (fast65); `suffix` is the symbol suffix
+/// (`fast21` / `fast65`). Must stay byte-identical to the runtime rewrite.
+pub(crate) fn sample_top_p_parallel_fast_src(top_k_width: usize, suffix: &str) -> String {
+    let top_k_define = format!(
+        "#define TOP_K {}\n#define SAMPLE_FAST_STABLE 1",
+        top_k_width
+    );
+    let fn_penalty = format!("sample_apply_repeat_penalty_{suffix}");
+    let fn_partial = format!("sample_topk_partial_{suffix}");
+    let fn_finalize = format!("sample_topk_finalize_{suffix}");
+    kernels::SAMPLE_TOP_P_PARALLEL_SRC
+        .replace("#define TOP_K 64", &top_k_define)
+        .replace("sample_apply_repeat_penalty", &fn_penalty)
+        .replace("sample_topk_partial", &fn_partial)
+        .replace("sample_topk_finalize", &fn_finalize)
+}
+
+/// All exact parallel-sampler module identities used by `sample_top_p_pf`,
+/// for admission into `precompile_qwen35`'s compile_batch.
+pub(crate) fn sample_top_p_parallel_precompile_specs() -> [(&'static str, String); 4] {
+    [
+        ("sample_top_p_parallel", sample_top_p_parallel_src()),
+        ("sample_top_p_parallel_w64", sample_top_p_parallel_w64_src()),
+        (
+            "sample_top_p_parallel_fast21",
+            sample_top_p_parallel_fast_src(21, "fast21"),
+        ),
+        (
+            "sample_top_p_parallel_fast65",
+            sample_top_p_parallel_fast_src(65, "fast65"),
+        ),
+    ]
 }
 
 impl Gpu {
@@ -364,15 +418,9 @@ impl Gpu {
             || !self.functions.contains_key(fn_finalize)
         {
             let src: String = if wide {
-                kernels::SAMPLE_TOP_P_PARALLEL_SRC
-                    .replace(
-                        "sample_apply_repeat_penalty",
-                        "sample_apply_repeat_penalty_w64",
-                    )
-                    .replace("sample_topk_partial", "sample_topk_partial_w64")
-                    .replace("sample_topk_finalize", "sample_topk_finalize_w64")
+                sample_top_p_parallel_w64_src()
             } else {
-                kernels::SAMPLE_TOP_P_PARALLEL_SRC.replace("#define TOP_K 64", "#define TOP_K 20")
+                sample_top_p_parallel_src()
             };
             self.ensure_kernel(m, &src, fn_penalty)?;
             self.ensure_kernel(m, &src, fn_partial)?;
@@ -416,13 +464,14 @@ impl Gpu {
             }
         }
 
-        // The top-21 reducer uses a different internal order but accepts its
-        // result only when the ordering is provably unambiguous. A sentinel
-        // falls through to the exact reducer below. The penalty prepass has
-        // already run exactly once for both outcomes.
+        // Fast-stable reducer: TOP_K is request_cap+1 so the last slot is the
+        // tie-boundary sentinel. Different internal order is accepted only when
+        // ordering is provably unambiguous; token_id==u32::MAX falls through to
+        // the exact reducer below. Penalty already ran exactly once for both.
+        // width 21 covers top_k<=20; width 65 covers 21..=64 (vocab-guarded).
         if sample_fast_stable_enabled()
             && top_k_req > 0
-            && top_k_req <= 20
+            && top_k_req <= 64
             && vocab_size <= N_BLOCKS as usize * 256 * 16
         {
             if let Some(result) = self.sample_top_p_fast_stable_impl(
@@ -512,10 +561,12 @@ impl Gpu {
         Ok((token_id, new_rng))
     }
 
-    /// Fast top-21 reducer for the common top_k<=20 path. Any requested penalty
-    /// is applied by the caller before entry. Returns `None` when the kernel
-    /// detects a probability tie whose stable ordering could differ from the
-    /// legacy reduction; the caller then runs legacy on the same adjusted logits.
+    /// Fast-stable top-k+1 reducer. Selects width 21 for top_k_req<=20 and
+    /// width 65 for 21..=64; the extra candidate is the tie-boundary sentinel.
+    /// Any requested penalty is applied by the caller before entry. Returns
+    /// `None` when the kernel detects a probability tie whose stable ordering
+    /// could differ from the legacy reduction; the caller then runs legacy on
+    /// the same adjusted logits.
     #[allow(clippy::too_many_arguments)]
     fn sample_top_p_fast_stable_impl(
         &mut self,
@@ -529,29 +580,39 @@ impl Gpu {
         min_p_val: f32,
     ) -> HipResult<Option<(u32, u32)>> {
         const N_BLOCKS: u32 = 128;
-        const TOP_K: usize = 21;
         const PARTIAL_BLOCK: u32 = 256;
         const FINALIZE_BLOCK: u32 = 128;
-        const FN_PARTIAL: &str = "sample_topk_partial_fast21";
-        const FN_FINALIZE: &str = "sample_topk_finalize_fast21";
+        // TOP_K = request_cap + 1 (boundary sentinel). Narrow path stays at 21
+        // so top_k<=20 remains byte-identical; wide path uses 65 for 21..=64.
+        let top_k_width: usize = if top_k_req <= 20 { 21 } else { 65 };
+        let (module, _fn_penalty, fn_partial, fn_finalize) = if top_k_width == 21 {
+            (
+                "sample_top_p_parallel_fast21",
+                "sample_apply_repeat_penalty_fast21",
+                "sample_topk_partial_fast21",
+                "sample_topk_finalize_fast21",
+            )
+        } else {
+            (
+                "sample_top_p_parallel_fast65",
+                "sample_apply_repeat_penalty_fast65",
+                "sample_topk_partial_fast65",
+                "sample_topk_finalize_fast65",
+            )
+        };
 
-        if !self.functions.contains_key(FN_PARTIAL) || !self.functions.contains_key(FN_FINALIZE) {
-            let src = kernels::SAMPLE_TOP_P_PARALLEL_SRC
-                .replace(
-                    "#define TOP_K 64",
-                    "#define TOP_K 21\n#define SAMPLE_FAST_STABLE 1",
-                )
-                .replace(
-                    "sample_apply_repeat_penalty",
-                    "sample_apply_repeat_penalty_fast21",
-                )
-                .replace("sample_topk_partial", FN_PARTIAL)
-                .replace("sample_topk_finalize", FN_FINALIZE);
-            self.ensure_kernel("sample_top_p_parallel_fast21", &src, FN_PARTIAL)?;
-            self.ensure_kernel("sample_top_p_parallel_fast21", &src, FN_FINALIZE)?;
+        if !self.functions.contains_key(fn_partial) || !self.functions.contains_key(fn_finalize) {
+            let suffix = if top_k_width == 21 {
+                "fast21"
+            } else {
+                "fast65"
+            };
+            let src = sample_top_p_parallel_fast_src(top_k_width, suffix);
+            self.ensure_kernel(module, &src, fn_partial)?;
+            self.ensure_kernel(module, &src, fn_finalize)?;
         }
 
-        let n_cand = N_BLOCKS as usize * TOP_K;
+        let n_cand = N_BLOCKS as usize * top_k_width;
         let val_bytes = n_cand * 4;
         let partial_base = self
             .scratch
@@ -581,12 +642,13 @@ impl Gpu {
                 &mut pval as *mut _ as *mut c_void,
                 &mut pidx as *mut _ as *mut c_void,
             ];
-            let func = &self.functions[FN_PARTIAL];
+            let func = &self.functions[fn_partial];
             unsafe {
                 self.hip.launch_kernel(
                     func,
                     [N_BLOCKS, 1, 1],
                     [PARTIAL_BLOCK, 1, 1],
+                    // 2048B LDS: PARTIAL_BLOCK * 4 * 2
                     PARTIAL_BLOCK * 4 * 2,
                     self.stream_ref(),
                     &mut params,
@@ -605,12 +667,13 @@ impl Gpu {
                 &mut tk as *mut _ as *mut c_void,
                 &mut mp as *mut _ as *mut c_void,
             ];
-            let func = &self.functions[FN_FINALIZE];
+            let func = &self.functions[fn_finalize];
             unsafe {
                 self.hip.launch_kernel(
                     func,
                     [1, 1, 1],
                     [FINALIZE_BLOCK, 1, 1],
+                    // 1536B LDS: FINALIZE_BLOCK * 4 * 3
                     FINALIZE_BLOCK * 4 * 3,
                     self.stream_ref(),
                     &mut params,
@@ -1008,6 +1071,105 @@ impl Gpu {
         Ok((host, new_rng))
     }
 
+    /// Product-semantics sampling for independent continuous-batch lanes.
+    ///
+    /// Each row owns one workgroup and one RNG state. Repeat histories are
+    /// lane-major with a fixed `repeat_stride`; `repeat_lengths` selects the
+    /// chronological suffix populated for each lane. The compact readback is
+    /// `[token, advanced_rng]` per row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sample_rows_pf_f32(
+        &mut self,
+        logits_batch: &GpuTensor,
+        repeat_tokens: &GpuTensor,
+        repeat_lengths: &GpuTensor,
+        rng_states: &GpuTensor,
+        out_buf: &GpuTensor,
+        batch_size: usize,
+        vocab_size: usize,
+        repeat_stride: usize,
+        temperature: f32,
+        top_p: f32,
+        repeat_penalty: f32,
+        presence_penalty: f32,
+        frequency_penalty: f32,
+        top_k: Option<u32>,
+        min_p: Option<f32>,
+    ) -> HipResult<Vec<(u32, u32)>> {
+        if batch_size == 0
+            || repeat_stride == 0
+            || logits_batch.numel() < batch_size * vocab_size
+            || repeat_tokens.numel() < batch_size * repeat_stride
+            || repeat_lengths.numel() < batch_size
+            || rng_states.numel() < batch_size
+            || out_buf.numel() < batch_size * 2
+        {
+            return Err(HipError::new(
+                0,
+                "sample_rows_pf_f32 buffers do not cover the requested batch shape",
+            ));
+        }
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "sample_rows_pf",
+            kernels::SAMPLE_ROWS_PF_SRC,
+            "sample_rows_pf_f32",
+        )?;
+        let func = &self.functions["sample_rows_pf_f32"];
+        let mut logits_ptr = logits_batch.buf.as_ptr();
+        let mut repeat_ptr = repeat_tokens.buf.as_ptr();
+        let mut lengths_ptr = repeat_lengths.buf.as_ptr();
+        let mut rng_ptr = rng_states.buf.as_ptr();
+        let mut out_ptr = out_buf.buf.as_ptr();
+        let mut batch = batch_size as i32;
+        let mut vocab = vocab_size as i32;
+        let mut stride = repeat_stride as i32;
+        let mut temp = temperature;
+        let mut nucleus = top_p;
+        let mut repeat = repeat_penalty;
+        let mut presence = presence_penalty;
+        let mut frequency = frequency_penalty;
+        let mut topk = top_k.map(|value| value as i32).unwrap_or(20);
+        let mut minp = min_p.unwrap_or(0.0);
+        let mut params: Vec<*mut c_void> = vec![
+            &mut logits_ptr as *mut _ as *mut c_void,
+            &mut repeat_ptr as *mut _ as *mut c_void,
+            &mut lengths_ptr as *mut _ as *mut c_void,
+            &mut rng_ptr as *mut _ as *mut c_void,
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut batch as *mut _ as *mut c_void,
+            &mut vocab as *mut _ as *mut c_void,
+            &mut stride as *mut _ as *mut c_void,
+            &mut temp as *mut _ as *mut c_void,
+            &mut nucleus as *mut _ as *mut c_void,
+            &mut repeat as *mut _ as *mut c_void,
+            &mut presence as *mut _ as *mut c_void,
+            &mut frequency as *mut _ as *mut c_void,
+            &mut topk as *mut _ as *mut c_void,
+            &mut minp as *mut _ as *mut c_void,
+        ];
+        const BLOCK: u32 = 64;
+        const TOP_K: u32 = 64;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [batch_size as u32, 1, 1],
+                [BLOCK, 1, 1],
+                BLOCK * TOP_K * 8,
+                self.stream_ref(),
+                &mut params,
+            )?;
+        }
+        let mut words = vec![0u32; batch_size * 2];
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(words.as_mut_ptr() as *mut u8, words.len() * 4)
+        };
+        self.hip.memcpy_dtoh(bytes, &out_buf.buf)?;
+        Ok(words
+            .chunks_exact(2)
+            .map(|pair| (pair[0], pair[1]))
+            .collect())
+    }
     /// Per-row Gumbel-top-k SWOR sampler: draws `k` tokens WITHOUT replacement
     /// from `softmax(logits/temp)` per row of `[batch × vocab]`, returning the
     /// draw-ordered token ids (`top_idx`) and their true log-probs (`top_logp`),
@@ -1373,5 +1535,165 @@ impl Gpu {
                 bl
             },
         )
+    }
+
+    /// Sample one token per slot from `[n_slots x vocab]` logits.
+    ///
+    /// Takes the existing `argmax_f32_batched` fast path when every slot is
+    /// greedy; otherwise samples each slot with its own parameters. Per-slot
+    /// dispatch is correct but not optimal — a fused kernel is a later
+    /// optimisation, and SP2 is explicitly components-not-performance.
+    pub fn sample_per_slot(
+        &mut self,
+        logits: &GpuTensor,
+        params: &[SlotSampleParams],
+        n_slots: usize,
+        vocab: usize,
+        out_tokens: &GpuTensor,
+    ) -> HipResult<()> {
+        assert_eq!(
+            params.len(),
+            n_slots,
+            "sample_per_slot: one SlotSampleParams per slot required"
+        );
+        if all_greedy(params) {
+            // NOTE: argmax_f32_batched's real signature is
+            // (data, result, n=reduction_dim, batch_size), i.e. vocab comes
+            // before n_slots — the brief's illustrative call had these
+            // swapped; confirmed against call sites in
+            // crates/hipfire-arch-deepseek4/src/forward.rs and others.
+            return self.argmax_f32_batched(logits, out_tokens, vocab, n_slots);
+        }
+        for (i, p) in params.iter().enumerate() {
+            self.sample_slot_row(logits, i, vocab, p, out_tokens)?;
+        }
+        Ok(())
+    }
+
+    /// Sample a single slot's row `i` from `[n_slots x vocab]` logits, writing
+    /// the resulting token id into `out_tokens[i]`.
+    ///
+    /// A greedy row (`temperature == 0.0`) within an otherwise-mixed batch
+    /// takes the exact single-row argmax rather than routing through
+    /// `sample_top_p_pf` with temperature 0 — this keeps a greedy slot's
+    /// result identical to what it would get on the all-greedy fast path,
+    /// regardless of which other slots in the batch are sampling.
+    fn sample_slot_row(
+        &mut self,
+        logits: &GpuTensor,
+        i: usize,
+        vocab: usize,
+        p: &SlotSampleParams,
+        out_tokens: &GpuTensor,
+    ) -> HipResult<()> {
+        let row = logits.sub_offset(i * vocab, vocab);
+        let out_row = out_tokens.sub_offset(i, 1);
+
+        let token_id: u32 = if p.temperature == 0.0 {
+            self.argmax_f32(&row, vocab)?
+        } else {
+            // Existing sample_top_p kernel, dispatched per row. `sample_top_p`
+            // itself is a fixed-top_k=20 shim over `sample_top_p_pf`; calling
+            // `_pf` directly lets each slot's own top_k through rather than
+            // silently discarding it, without introducing a new kernel.
+            let result_buf = self.alloc_tensor(&[2], DType::F32)?;
+            let repeat_buf = self.alloc_tensor(&[1], DType::F32)?;
+            let top_k = if p.top_k > 0 {
+                Some(p.top_k as u32)
+            } else {
+                None
+            };
+            let sample_result = self.sample_top_p_pf(
+                &row,
+                &result_buf,
+                &repeat_buf,
+                vocab,
+                p.temperature,
+                p.top_p,
+                p.seed,
+                0,   // repeat_window: no cross-slot repetition history here
+                1.0, // repeat_penalty: 1.0 == disabled (kernel checks `> 1.0`)
+                0.0, // presence_penalty: disabled
+                0.0, // frequency_penalty: disabled
+                top_k,
+                None, // min_p: disabled
+            );
+            self.free_tensor(result_buf)?;
+            self.free_tensor(repeat_buf)?;
+            sample_result?.0
+        };
+
+        self.hip.memcpy_htod(&out_row.buf, &token_id.to_ne_bytes())
+    }
+}
+
+/// Per-slot sampling parameters, uploaded as a table like `KvSlotDesc`.
+///
+/// A single scalar temperature across a batch is wrong as soon as two agents
+/// differ, and a uniform-parameter test cannot see that bug — hence a table
+/// rather than scalars.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SlotSampleParams {
+    /// 0.0 means greedy/argmax for this slot.
+    pub temperature: f32,
+    pub top_p: f32,
+    /// 0 disables top-k for this slot.
+    pub top_k: i32,
+    pub seed: u32,
+}
+
+/// True when every slot is greedy, so the batch can take the argmax fast path.
+/// One sampling slot disables it for the whole batch.
+pub fn all_greedy(params: &[SlotSampleParams]) -> bool {
+    params.iter().all(|p| p.temperature == 0.0)
+}
+
+#[cfg(test)]
+mod slot_sample_tests {
+    use super::*;
+
+    #[test]
+    fn params_struct_is_16_bytes_repr_c() {
+        // Uploaded straight to the GPU as a table, like KvSlotDesc.
+        assert_eq!(std::mem::size_of::<SlotSampleParams>(), 16);
+        assert_eq!(std::mem::align_of::<SlotSampleParams>(), 4);
+    }
+
+    #[test]
+    fn all_greedy_is_detectable_as_a_fast_path() {
+        let greedy = vec![
+            SlotSampleParams {
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: 0,
+                seed: 1,
+            },
+            SlotSampleParams {
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: 0,
+                seed: 2,
+            },
+        ];
+        assert!(all_greedy(&greedy));
+        let mixed = vec![
+            SlotSampleParams {
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: 0,
+                seed: 1,
+            },
+            SlotSampleParams {
+                temperature: 0.7,
+                top_p: 0.95,
+                top_k: 20,
+                seed: 2,
+            },
+        ];
+        assert!(
+            !all_greedy(&mixed),
+            "one sampling slot must disable the greedy fast path"
+        );
     }
 }

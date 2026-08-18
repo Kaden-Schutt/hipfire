@@ -1,0 +1,18 @@
+The quick brown fox jumps over the lazy dog while the maintainer reviews a kernel dispatch table for the fourth time this week, checking that every arch gate resolves to a wave32 path and that no shared bound was widened in the process of adding a new architecture to the runtime. def merge_sorted(a, b):
+    out, i, j = [], 0, 0
+    while i < len(a) and j < len(b):
+        if a[i] <= b[j]:
+            out.append(a[i]); i += 1
+        else:
+            out.append(b[j]); j += 1
+    return out + a[i:] + b[j:]
+
+The quick brown fox jumps over the lazy dog while the maintainer reviews a kernel dispatch table for the fourth time this week, checking that every arch gate resolves to a wave32 path and that no shared bound was widened in the process of adding a new architecture to the runtime. def merge_sorted(a, b):
+    out, i, j = [], 0, 0
+    while i < len(a) and j < len(b):
+        if a[i] <= b[j]:
+            out.append(a[i]); i += 1
+        else:
+            out.append(b[j]); j += 1
+    return out + a[i:] + b[j:]
+

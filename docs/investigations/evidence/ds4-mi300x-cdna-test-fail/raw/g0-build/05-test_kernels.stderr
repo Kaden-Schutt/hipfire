@@ -1,0 +1,34 @@
+GPU dev 0: gfx942 (205.8 GB VRAM, HIP 7.0)
+[rocblas] loaded for gfx942
+GPU: gfx942 (205.8 GB VRAM)
+
+--- Basic ops ---
+  alloc + free                                       OK (0.0ms)
+  upload + download f32                              OK (131.7ms)
+  add_inplace_f32                                    OK (533.4ms)
+  rmsnorm_f32                                        OK (582.8ms)
+  softmax_f32                                        OK (548.6ms)
+
+--- Attention kernels ---
+  attention_f32 hd=128 h=8 kv=2                      OK (559.5ms)
+  attention_f32 hd=256 h=16 kv=4                     OK (15.8ms)
+  attention_f32 hd=256 h=10 kv=2                     OK (0.1ms)
+
+--- Q8 KV kernels ---
+  q8 write+attn hd=128 kv=8                          OK (1214.8ms)
+  q8 write+attn hd=256 kv=4                          OK (0.2ms)
+  q8 write+attn hd=256 kv=2                          OK (0.2ms)
+
+--- GDN (tiled LDS) ---
+  gdn_q8 h=32 hd=128 (9B DeltaNet)                   OK (633.0ms)
+  gdn_q8 h=16 hd=128 (4B DeltaNet)                   OK (0.2ms)
+
+--- Vision encoder kernels ---
+  gemm_f16 (vision GEMM)                             OK (536.6ms)
+  layernorm_batched                                  OK (545.3ms)
+  transpose_f32                                      OK (530.9ms)
+
+--- Summary ---
+  Passed:  16
+  Failed:  0
+  Skipped: 0

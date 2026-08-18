@@ -1,0 +1,61 @@
+=== hipcc --version ===
+HIP version: 7.14.60850-0000000
+AMD clang version 23.0.0git (https://github.com/ROCm/llvm-project.git 46fcb339fb61119b337f973c7ca9e710a319fdd0+PATCHED:440716f8b87be9d8e20ed910e10e5b6d14d57cf6)
+Target: x86_64-unknown-linux-gnu
+Thread model: posix
+InstalledDir: /opt/rocm-7.0.2/core-7.14/lib/llvm/bin
+
+=== clang --version ===
+bash: line 69: clang: command not found
+FAILED
+
+=== ls -d /opt/rocm* ===
+/opt/rocm
+/opt/rocm-7.0.2
+
+=== cat /opt/rocm/.info/version* ===
+7.0.2
+7.0.2-56
+7.0.2-56
+7.0.2-56
+7.0.2-56
+7.0.2-56
+7.0.2-56
+7.0.2-56
+7.0.2-56
+total 44
+drwxr-xr-x 2 root root 4096 Jul  8 19:20 .
+drwxr-xr-x 9 root root 4096 Jul 16 13:26 ..
+-rw-r--r-- 1 root root    6 Sep 30  2025 version
+-rw-r--r-- 1 root root    9 Sep 30  2025 version-hiprt
+-rw-r--r-- 1 root root    9 Sep 30  2025 version-hiprt-devel
+-rw-r--r-- 1 root root    9 Sep 30  2025 version-lrt
+-rw-r--r-- 1 root root    9 Sep 30  2025 version-ocl-sdk
+-rw-r--r-- 1 root root    9 Sep 30  2025 version-openmp
+-rw-r--r-- 1 root root    9 Sep 30  2025 version-rocm
+-rw-r--r-- 1 root root    9 Sep 30  2025 version-rocm-developer-tools
+-rw-r--r-- 1 root root    9 Sep 30  2025 version-rocm-hip
+
+=== python3 --version ===
+Python 3.12.3
+
+=== cargo --version ===
+bash: line 82: cargo: command not found
+
+=== rustc --version ===
+bash: line 85: rustc: command not found
+
+=== nproc ===
+20
+
+=== free -h ===
+               total        used        free      shared  buff/cache   available
+Mem:           235Gi       6.6Gi        19Gi       4.5Mi       212Gi       229Gi
+Swap:             0B          0B          0B
+
+=== cat /proc/meminfo | head -5 ===
+MemTotal:       247409216 kB
+MemFree:        19978436 kB
+MemAvailable:   240497516 kB
+Buffers:          265280 kB
+Cached:         217401636 kB

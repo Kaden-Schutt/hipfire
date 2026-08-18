@@ -142,10 +142,7 @@ pub struct TerminalOutcome {
 impl TerminalOutcome {
     /// Build a terminal outcome (callers must enforce single-shot admission).
     pub fn new(attempt_id: AttemptId, reason: TerminalReason) -> Self {
-        Self {
-            attempt_id,
-            reason,
-        }
+        Self { attempt_id, reason }
     }
 
     /// Attempt this terminal belongs to.
@@ -184,10 +181,7 @@ pub enum SemanticEvent {
         attempt_id: AttemptId,
     },
     /// Think/reasoning channel text (also marker-free).
-    Reasoning {
-        text: String,
-        attempt_id: AttemptId,
-    },
+    Reasoning { text: String, attempt_id: AttemptId },
     /// Authoritative structured tool call (still subject to terminal gating).
     ToolCall {
         call: ToolCall,
@@ -204,9 +198,7 @@ pub enum SemanticEvent {
         attempt_id: AttemptId,
     },
     /// Exactly-one terminal carrier for the attempt.
-    Terminal {
-        outcome: TerminalOutcome,
-    },
+    Terminal { outcome: TerminalOutcome },
 }
 
 impl SemanticEvent {
@@ -411,7 +403,6 @@ impl SemanticAttempt {
     }
 }
 
-
 // --- Minimal correlated JSONL wire value constructors ----------------------
 //
 // Production daemon writers and hipfire-cli SemanticEventFold tests must use
@@ -450,11 +441,7 @@ pub fn wire_aborted(id: &str, reason: &str, attempt_id: u64) -> serde_json::Valu
 ///
 /// Field set matches the Qwen AR cancellation writer (prompt/decode timings
 /// zeroed; completion_tokens carries tokens generated before cancel).
-pub fn wire_aborted_done(
-    id: &str,
-    completion_tokens: usize,
-    attempt_id: u64,
-) -> serde_json::Value {
+pub fn wire_aborted_done(id: &str, completion_tokens: usize, attempt_id: u64) -> serde_json::Value {
     serde_json::json!({
         "type": "done",
         "id": id,
@@ -467,8 +454,6 @@ pub fn wire_aborted_done(
     })
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -477,8 +462,10 @@ mod tests {
 
     fn sample_call(name: &str) -> ToolCall {
         ToolCall {
+            id: None,
             name: name.to_string(),
             arguments: json!({"path": "/tmp/x"}),
+            rendered_body: None,
         }
     }
 
@@ -601,10 +588,7 @@ mod tests {
                 .buffer_tool_call(sample_call("read"))
                 .expect("buffer");
             attempt.terminate(reason).expect("terminal");
-            assert!(
-                !reason.is_tool_safe(),
-                "{reason:?} must not be tool-safe"
-            );
+            assert!(!reason.is_tool_safe(), "{reason:?} must not be tool-safe");
             assert!(attempt.executable_tool_calls().is_empty());
         }
     }
@@ -762,10 +746,7 @@ mod tests {
         // Public surface is read-only accessors + Serialize emit, not minting
         // and not public Deserialize.
         assert_eq!(v.clone().into_string(), "authorized");
-        assert_eq!(
-            serde_json::to_value(&v).unwrap(),
-            json!("authorized")
-        );
+        assert_eq!(serde_json::to_value(&v).unwrap(), json!("authorized"));
     }
 
     #[test]

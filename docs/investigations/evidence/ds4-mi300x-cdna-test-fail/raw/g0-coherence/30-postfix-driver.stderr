@@ -1,0 +1,68 @@
+[driver] label=postfix
+[driver] daemon=/mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/target/release/examples/daemon
+[driver] model=/mnt/scratch/models/deepseek-v4-flash-mq2r/deepseek-v4-flash.mq2r
+[driver] prompt_bytes=46 sha256=9a151396bc7ae69dcc2c8a5607ec464391419ae94772e1a63cf096c4885342b1
+[driver] max_tokens=64 temp=0.0
+[driver] >> {"type":"ping"}
+GPU dev 0: gfx942 (205.8 GB VRAM, HIP 7.0)
+[rocblas] loaded for gfx942
+[driver] << {"type":"pong"}
+[driver] >> {"type":"load","model":"/mnt/scratch/models/deepseek-v4-flash-mq2r/deepseek-v4-flash.mq2r","params":{"max_seq":4096,"kv_mode":"q8","kv_backend":"contiguous","speculation":"off","dflash_mode":"off","mtp_mode":"off","ngram_draft":false,"dspark_mode":"off"}}
+deepseek4: MQ2R P3 tensor recipe verified; gfx1151 route v2 is ineligible on gfx942, using portable dispatch
+[driver] << {"type":"loaded","arch":"deepseek4","dim":0,"layers":0,"vocab":0,"vl":false,"cache_capable":true,"retry_reset_eligible":false}
+[driver] LOADED in 73.6s
+[driver] >> {"type":"generate","id":"g0-postfix","attempt_id":1,"prompt":"Explain what a GPU kernel is in two sentences.","max_tokens":64,"temperature":0.0}
+[driver] << {"type":"token","id":"g0-postfix","text":"A GP","attempt_id":1}
+[driver] << {"type":"token","id":"g0-postfix","text":"U k","attempt_id":1}
+[driver] << {"type":"token","id":"g0-postfix","text":"ernel ","attempt_id":1}
+[driver] << {"type":"token","id":"g0-postfix","text":"is a fun","attempt_id":1}
+[driver] << {"type":"token","id":"g0-postfix","text":"ction or","attempt_id":1}
+[driver] << {"type":"token","id":"g0-postfix","text":" sm","attempt_id":1}
+[driver] << {"type":"token","id":"g0-postfix","text":"al","attempt_id":1}
+[driver] << {"type":"token","id":"g0-postfix","text":"l pro","attempt_id":1}
+[driver] << {"type":"token","id":"g0-postfix","text":"gram ","attempt_id":1}
+[driver] << {"type":"token","id":"g0-postfix","text":"wri","attempt_id":1}
+[driver] << {"type":"token","id":"g0-postfix","text":"tten by a","attempt_id":1}
+[driver] << {"type":"token","id":"g0-postfix","text":" us","attempt_id":1}
+[driver] << {"type":"token","id":"g0-postfix","text":"er that i","attempt_id":1}
+[driver] << {"type":"token","id":"g0-postfix","text":"s execu","attempt_id":1}
+[driver] << {"type":"token","id":"g0-postfix","text":"ted i","attempt_id":1}
+[driver] << {"type":"token","id":"g0-postfix","text":"n parall","attempt_id":1}
+[driver] << {"type":"token","id":"g0-postfix","text":"el ","attempt_id":1}
+[driver] << {"type":"token","id":"g0-postfix","text":"acro","attempt_id":1}
+[driver] << {"type":"token","id":"g0-postfix","text":"ss m","attempt_id":1}
+[driver] << {"type":"token","id":"g0-postfix","text":"an","attempt_id":1}
+[driver] << {"type":"token","id":"g0-postfix","text":"y thre","attempt_id":1}
+[driver] << {"type":"token","id":"g0-postfix","text":"a","attempt_id":1}
+[driver] << {"type":"token","id":"g0-postfix","text":"ds ","attempt_id":1}
+[driver] << {"type":"token","id":"g0-postfix","text":"on the G","attempt_id":1}
+[driver] << {"type":"token","id":"g0-postfix","text":"PU's","attempt_id":1}
+[driver] << {"type":"token","id":"g0-postfix","text":" cores. It d","attempt_id":1}
+[driver] << {"type":"token","id":"g0-postfix","text":"efi","attempt_id":1}
+[driver] << {"type":"token","id":"g0-postfix","text":"nes","attempt_id":1}
+[driver] << {"type":"token","id":"g0-postfix","text":" the compu","attempt_id":1}
+[driver] << {"type":"token","id":"g0-postfix","text":"tat","attempt_id":1}
+[driver] << {"type":"token","id":"g0-postfix","text":"ion t","attempt_id":1}
+[driver] << {"type":"token","id":"g0-postfix","text":"o be perfor","attempt_id":1}
+[driver] << {"type":"token","id":"g0-postfix","text":"med by ","attempt_id":1}
+[driver] << {"type":"token","id":"g0-postfix","text":"e","attempt_id":1}
+[driver] << {"type":"token","id":"g0-postfix","text":"ach indivi","attempt_id":1}
+[driver] << {"type":"token","id":"g0-postfix","text":"dual threa","attempt_id":1}
+[driver] << {"type":"token","id":"g0-postfix","text":"d, ","attempt_id":1}
+[driver] << {"type":"token","id":"g0-postfix","text":"ty","attempt_id":1}
+[driver] << {"type":"token","id":"g0-postfix","text":"pically","attempt_id":1}
+[driver] << {"type":"token","id":"g0-postfix","text":" operati","attempt_id":1}
+[driver] << {"type":"token","id":"g0-postfix","text":"ng ","attempt_id":1}
+[driver] << {"type":"token","id":"g0-postfix","text":"on","attempt_id":1}
+[driver] << {"type":"token","id":"g0-postfix","text":" a sin","attempt_id":1}
+[driver] << {"type":"token","id":"g0-postfix","text":"gle e","attempt_id":1}
+[driver] << {"type":"token","id":"g0-postfix","text":"lement","attempt_id":1}
+[driver] << {"type":"token","id":"g0-postfix","text":" ","attempt_id":1}
+[driver] << {"type":"token","id":"g0-postfix","text":"of a large data array.","attempt_id":1}
+[driver] << {"type":"commit_ready","id":"g0-postfix","tokens":51,"tok_s":3.041144901610018,"prompt_tokens":14,"prefill_tokens":14,"cached_tokens":0,"prefill_ms":18937,"total_ms":35707,"finish_reason":"stop","drafter":"ar","attempt_id":1}
+[driver] >> {"type":"commit","id":"g0-postfix","attempt_id":1}
+[daemon-control] received commit for id=g0-postfix attempt_id=1
+[driver] << {"type":"done","id":"g0-postfix","tokens":51,"tok_s":3.041144901610018,"prompt_tokens":14,"prefill_tokens":14,"cached_tokens":0,"prefill_ms":18937,"total_ms":35707,"finish_reason":"stop","drafter":"ar","attempt_id":1}
+[driver] >> {"type":"unload"}
+[req g0-postfix] drafter=ar tau=1.00 tok/s=3.0 decode (51 tok, autoregressive)
+[driver] << {"type":"unloaded"}

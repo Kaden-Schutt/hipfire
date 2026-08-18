@@ -31,6 +31,10 @@ pub struct FeatureFlags {
     pub gfx942_lds_gemv_default_on: bool,
     pub gemv_rows_default: u32,
     pub gemv_dp4a: Option<bool>,
+    /// Override the gfx1151 temporal raw-buffer E8 U4 route. `None` selects
+    /// the accepted DeepSeek4 MQ2R route default while retaining portable
+    /// behavior for other models and architectures.
+    pub gfx1151_e8_buffer: Option<bool>,
 
     // ── Quant / format toggles ────────────────────────────────────
     pub hfq3_dp4a: Option<bool>,
@@ -190,6 +194,21 @@ pub struct FeatureFlags {
     pub rocblas_all_archs: bool,
     pub rocblas_off: bool,
     pub rocblas_min_batch: Option<usize>,
+    /// Batched-attention tile size (`HIPFIRE_ATTN_TILE_SIZE`). `None` = use the
+    /// 128 default. gfx1151 is the dev box, gfx1201 the deployment target, so
+    /// this must never be a baked-in `const` (spec §11).
+    pub attn_tile_size: Option<usize>,
+    /// Multi-slot attention flash-vs-scalar crossover in tokens
+    /// (`HIPFIRE_SLOTS_ATTN_CROSSOVER`). `None` = the per-arch default. Same
+    /// reasoning as `attn_tile_size`: gfx1151 is the dev box and gfx1201 the
+    /// deployment target, so this must be overridable rather than baked in.
+    pub slots_attn_crossover: Option<usize>,
+    /// Capture a pure-decode multi-slot step into a hipGraph and replay it
+    /// (`HIPFIRE_SLOTS_DECODE_GRAPH`). Off by default.
+    pub slots_decode_graph: bool,
+    /// Trace multi-slot session continuation matching (`HIPFIRE_SLOT_TRACE`).
+    /// Diagnostic only.
+    pub slot_trace: bool,
 
     // ── Kernels.rs env reads ───────────────────────────────────────
     pub lloyd_force_baseline: bool,
@@ -344,6 +363,7 @@ impl FeatureFlags {
                 }),
             gemv_dp4a_default_on: is_gfx906,
             gemv_dp4a: parse_bool("HIPFIRE_GEMV_DP4A"),
+            gfx1151_e8_buffer: parse_bool("HIPFIRE_GFX1151_E8_BUFFER"),
             gemv_prefetch: parse_bool("HIPFIRE_GEMV_PREFETCH"),
             gemv_prefetch_default_on: is_gfx906,
             gfx942_lds_gemv: parse_bool("HIPFIRE_GFX942_LDS_GEMV"),
@@ -473,6 +493,10 @@ impl FeatureFlags {
             rocblas_all_archs: value("HIPFIRE_ROCBLAS_ALL_ARCHS").ok().as_deref() == Some("1"),
             rocblas_off: value("HIPFIRE_ROCBLAS_OFF").ok().as_deref() == Some("1"),
             rocblas_min_batch: parse_usize("HIPFIRE_ROCBLAS_MIN_BATCH"),
+            attn_tile_size: parse_usize("HIPFIRE_ATTN_TILE_SIZE"),
+            slots_attn_crossover: parse_usize("HIPFIRE_SLOTS_ATTN_CROSSOVER"),
+            slots_decode_graph: value("HIPFIRE_SLOTS_DECODE_GRAPH").ok().as_deref() == Some("1"),
+            slot_trace: value("HIPFIRE_SLOT_TRACE").ok().as_deref() == Some("1"),
 
             // Kernels.rs
             lloyd_force_baseline: value("HIPFIRE_LLOYD_FORCE_BASELINE").ok().as_deref()
@@ -602,6 +626,7 @@ impl FeatureFlags {
             gemv_rows: None,
             gemv_dp4a_default_on: is_gfx906,
             gemv_dp4a: None,
+            gfx1151_e8_buffer: None,
             gemv_prefetch: None,
             gemv_prefetch_default_on: is_gfx906,
             gfx942_lds_gemv: None,
@@ -685,6 +710,10 @@ impl FeatureFlags {
             rocblas_all_archs: false,
             rocblas_off: false,
             rocblas_min_batch: None,
+            attn_tile_size: None,
+            slots_attn_crossover: None,
+            slots_decode_graph: false,
+            slot_trace: false,
             lloyd_force_baseline: false,
             rdna2_variant: None,
             hipcc_extra_flags: String::new(),
@@ -706,7 +735,7 @@ impl FeatureFlags {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hipfire_config::{ConfigLayer, ConfigSource, NamedLayer, ProcessConfig, resolve};
+    use hipfire_config::{resolve, ConfigLayer, ConfigSource, NamedLayer, ProcessConfig};
 
     #[test]
     fn force_unfused_defaults_false_in_test_ctor() {

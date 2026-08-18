@@ -1,0 +1,33 @@
+a3b/ctx32_n16 :: kernel=scalar nh=16 nkv=2 hd=256 n=16 ctx=32 br=16 bc=32 pos=tail
+a3b/ctx32_n16 :: max_abs=2.384e-6 worst_tol_ratio=0.070 (at 41508: ref=-5.383001e-3 new=-5.383740e-3) min_cos=1.000000000 rel_l2=3.736e-7
+a3b/ctx32_n16 :: PASS
+a3b/ctx512_n16 :: kernel=scalar nh=16 nkv=2 hd=256 n=16 ctx=512 br=16 bc=32 pos=tail
+a3b/ctx512_n16 :: max_abs=3.576e-6 worst_tol_ratio=0.018 (at 35976: ref=1.841073e0 new=1.841069e0) min_cos=1.000000000 rel_l2=6.036e-7
+a3b/ctx512_n16 :: PASS
+a3b/ctx4096_n64 :: kernel=scalar nh=16 nkv=2 hd=256 n=64 ctx=4096 br=16 bc=32 pos=tail
+a3b/ctx4096_n64 :: max_abs=9.537e-6 worst_tol_ratio=0.055 (at 177695: ref=-1.478973e0 new=-1.478965e0) min_cos=1.000000000 rel_l2=1.623e-6
+a3b/ctx4096_n64 :: PASS
+a3b/ctx8192_n256 :: kernel=scalar nh=16 nkv=2 hd=256 n=256 ctx=8192 br=16 bc=32 pos=tail
+a3b/ctx8192_n256 :: max_abs=1.621e-5 worst_tol_ratio=0.076 (at 914941: ref=1.316500e0 new=1.316511e0) min_cos=1.000000000 rel_l2=2.192e-6
+a3b/ctx8192_n256 :: PASS
+27b/ctx32_n16 :: kernel=scalar nh=24 nkv=4 hd=256 n=16 ctx=32 br=16 bc=32 pos=tail
+27b/ctx32_n16 :: max_abs=2.146e-6 worst_tol_ratio=0.053 (at 34665: ref=-2.252271e-2 new=-2.252206e-2) min_cos=1.000000000 rel_l2=2.993e-7
+27b/ctx32_n16 :: PASS
+27b/ctx512_n16 :: kernel=scalar nh=24 nkv=4 hd=256 n=16 ctx=512 br=16 bc=32 pos=tail
+27b/ctx512_n16 :: max_abs=3.576e-6 worst_tol_ratio=0.029 (at 65917: ref=-1.563103e-2 new=-1.563136e-2) min_cos=1.000000000 rel_l2=5.888e-7
+27b/ctx512_n16 :: PASS
+27b/ctx4096_n64 :: kernel=scalar nh=24 nkv=4 hd=256 n=64 ctx=4096 br=16 bc=32 pos=tail
+27b/ctx4096_n64 :: max_abs=1.287e-5 worst_tol_ratio=0.062 (at 230100: ref=1.172782e0 new=1.172774e0) min_cos=1.000000000 rel_l2=1.627e-6
+27b/ctx4096_n64 :: PASS
+27b/ctx8192_n256 :: kernel=scalar nh=24 nkv=4 hd=256 n=256 ctx=8192 br=16 bc=32 pos=tail
+27b/ctx8192_n256 :: max_abs=1.526e-5 worst_tol_ratio=0.084 (at 450499: ref=1.097317e0 new=1.097327e0) min_cos=1.000000000 rel_l2=2.212e-6
+27b/ctx8192_n256 :: PASS
+odd/ctx7_n1 :: kernel=scalar nh=16 nkv=2 hd=256 n=1 ctx=7 br=16 bc=32 pos=tail
+odd/ctx7_n1 :: max_abs=1.431e-6 worst_tol_ratio=0.018 (at 332: ref=-1.293113e-2 new=-1.293092e-2) min_cos=1.000000000 rel_l2=1.547e-7
+odd/ctx7_n1 :: PASS
+odd/ctx129_n5 :: kernel=scalar nh=16 nkv=2 hd=256 n=5 ctx=129 br=16 bc=32 pos=tail
+odd/ctx129_n5 :: max_abs=1.550e-6 worst_tol_ratio=0.034 (at 12475: ref=-9.726170e-3 new=-9.726537e-3) min_cos=1.000000000 rel_l2=3.854e-7
+odd/ctx129_n5 :: PASS
+odd/ctx131_n17 :: kernel=scalar nh=24 nkv=4 hd=256 n=17 ctx=131 br=16 bc=32 pos=tail
+odd/ctx131_n17 :: max_abs=1.907e-6 worst_tol_ratio=0.032 (at 71270: ref=-5.484453e-2 new=-5.484404e-2) min_cos=1.000000000 rel_l2=3.331e-7
+odd/ctx131_n17 :: PASS

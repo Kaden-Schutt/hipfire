@@ -51,7 +51,7 @@ __global__ void attention_flash_asym_reduce_batched(
     const float* my_partials = partials + ((long long)local_bid * n_heads + h) * max_tiles * stride;
 
     // Per-thread assignment: dims-per-thread = head_dim/32 (4 for hd=128, 8 for
-    // hd=256), matching the tile kernel's d0 = tid*dpt layout exactly. Partials
+    // hd=256, 16 for hd=512), matching the tile kernel's d0 = tid*dpt layout exactly. Partials
     // are dim-indexed, so reduce MUST use the identical split or it reads the
     // wrong slots / writes past `out` (head_dim).
     const int dpt = head_dim / 32;
@@ -67,7 +67,7 @@ __global__ void attention_flash_asym_reduce_batched(
 
     // Pass 2: accumulate 8 dims per thread
     float global_sum = 0.0f;
-    float g[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+    float g[16] = { 0.0f };
 
     for (int tile = 0; tile < n_tiles; tile++) {
         const float* p = my_partials + tile * stride;

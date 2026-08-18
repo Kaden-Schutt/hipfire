@@ -108,7 +108,7 @@ impl<'a> Deepseek4Emit<'a> {
     /// built from `ctx.tools` + `ctx.decoded_vocab`.
     pub fn from_ctx(ctx: SpecEmitCtx<'a>) -> Box<dyn SpecEmit + 'a> {
         let parser = match ctx.think_mode {
-            ThinkMode::High | ThinkMode::Max => dsml::StreamParser::new_in_think(),
+            ThinkMode::Low | ThinkMode::High | ThinkMode::Max => dsml::StreamParser::new_in_think(),
             ThinkMode::NonThink => dsml::StreamParser::new(),
         };
         let grammar = build_grammar(ctx.tools, ctx.decoded_vocab);
@@ -233,8 +233,10 @@ impl<'a> SpecEmit for Deepseek4Emit<'a> {
                 let held: Vec<ToolCall> = calls
                     .into_iter()
                     .map(|c| ToolCall {
+                        id: None,
                         name: c.name,
                         arguments: c.arguments,
+                        rendered_body: None,
                     })
                     .collect();
                 events.push(ClientEvent::ToolCalls(held));

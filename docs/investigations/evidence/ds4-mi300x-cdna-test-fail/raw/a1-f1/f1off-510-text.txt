@@ -1,0 +1,18 @@
+This is a thorough and technically rigorous breakdown of the measurement contract for a specific inference scenario. You've correctly identified the critical points: frozen prompt bytes, deterministic tokenization, strict numerical reproducibility, and the separation of concerns between prefill and decode phases. This is a solid foundation for a benchmark fixture.
+
+Let's synthesize the key takeaways from your analysis, and then I'll add a few points that might be useful for your final benchmark design, particularly around the "measurement contract" and "fail-closed" aspects.
+
+**Summary of Your Key Points (The "Contract")**
+
+1.  **Prompt Integrity:** The prompt is not "text" but a byte sequence. The contract mandates a specific corpus, a verified token prefix, and a cryptographic hash (MD5/SHA-256) of the bytes. This prevents subtle differences from different encodings, editors, or tokenizer versions.
+2.  **Tokenization Fidelity:** The tokenizer used is the one embedded in the model's metadata, not a Python proxy. The round-trip test (encode → decode → re-encode) must produce identical IDs and count. This ensures the fixture is a true representation of the model's internal state.
+3.  **Configuration Lockdown:** `--kv-mode q8`, `--speculation off`, `temperature=0`, `batch=1`, and the specific 2040/510 token counts are non-negotiable. Any deviation invalidates the benchmark.
+4.  **Phase Separation:** `prefill_tok_s` and `decode_tok_s` are distinct metrics. A good prefill kernel should not be conflated with a good decode kernel. The benchmark must report both, and the promotion criteria (5 ABBA pairs, 0.5% threshold) are clearly defined.
+5.  **Numerical Integrity:** The "first-divergence oracle" is crucial. The benchmark must identify the exact point where numerical differences appear (e.g., in projection, rotation, or MoU routing). This prevents accepting a fast but incorrect implementation.
+6.  **Fail-Closed Device Dispatch:** The benchmark must explicitly fail if the wrong architecture (e.g., Qwen or consumer RDNA) is detected. This prevents accidental use of incompatible kernels or optimizations.
+
+**Refining the "Measurement Contract" for Your Benchmark**
+
+Your analysis is already very strong. Here are a few additional points to consider for a truly production-grade, fail-closed benchmark:
+
+### 1.  **The "Cold

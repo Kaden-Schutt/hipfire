@@ -12,6 +12,8 @@ use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::model_source::ModelSource;
 use serde::{Deserialize, Serialize};
 
+use crate::backend::Mq2rBackend;
+
 /// Per-layer compression mode for the indexer / KV path.
 ///
 /// `compress_ratios` in `config.json` is a per-layer array. The
@@ -22,6 +24,214 @@ use serde::{Deserialize, Serialize};
 /// than collapsing to an enum so future fine-tunes that pick
 /// different ratios still round-trip cleanly.
 pub type CompressRatio = u32;
+
+/// The historical DS4 product route was certified with 2,048 compressed
+/// rows (8,192 ratio-4 tokens). Keep that as the first capacity bucket so
+/// short-context launch geometry and scratch sizing remain unchanged, then
+/// grow geometrically up to the checkpoint's advertised context horizon.
+pub const INITIAL_COMPRESSED_ROWS: usize = 2_048;
+
+/// Stable block-cyclic ownership for a tensor-parallel compressor cache.
+///
+/// Ownership is derived solely from the global compressed-row index, so VMM
+/// growth never moves an existing row between ranks. Contiguous blocks retain
+/// the compressor and gather kernels' coalesced row layout, while cycling
+/// blocks across ranks avoids concentrating every short-context row on rank 0.
+/// The 256-row block matches the exact gfx1201 B=1024 ratio-4 prefill quantum
+/// (and two B=512 quanta), keeping ordinary chunk commits owner-contiguous.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompressorCacheShard {
+    rank: usize,
+    world: usize,
+    block_rows: usize,
+}
+
+impl CompressorCacheShard {
+    pub const GFX1201_BLOCK_ROWS: usize = 256;
+
+    pub fn new(rank: usize, world: usize, block_rows: usize) -> Result<Self, String> {
+        if world < 2 {
+            return Err("DeepSeek V4 compressor sharding requires at least two ranks".to_string());
+        }
+        if rank >= world {
+            return Err(format!(
+                "DeepSeek V4 compressor shard rank {rank} is outside world {world}"
+            ));
+        }
+        if block_rows == 0 || !block_rows.is_power_of_two() {
+            return Err(format!(
+                "DeepSeek V4 compressor shard block_rows must be a nonzero power of two (got {block_rows})"
+            ));
+        }
+        Ok(Self {
+            rank,
+            world,
+            block_rows,
+        })
+    }
+
+    pub const fn rank(self) -> usize {
+        self.rank
+    }
+
+    pub const fn world(self) -> usize {
+        self.world
+    }
+
+    pub const fn block_rows(self) -> usize {
+        self.block_rows
+    }
+
+    pub fn owner(self, global_row: usize) -> usize {
+        (global_row / self.block_rows) % self.world
+    }
+
+    pub fn global_to_local(self, global_row: usize) -> Option<usize> {
+        let global_block = global_row / self.block_rows;
+        if global_block % self.world != self.rank {
+            return None;
+        }
+        Some((global_block / self.world) * self.block_rows + global_row % self.block_rows)
+    }
+
+    pub fn local_to_global(self, local_row: usize) -> usize {
+        let local_block = local_row / self.block_rows;
+        (local_block * self.world + self.rank) * self.block_rows + local_row % self.block_rows
+    }
+
+    /// Number of rows owned by this rank in the global prefix `[0, rows)`.
+    pub fn local_rows_for_prefix(self, rows: usize) -> usize {
+        let full_blocks = rows / self.block_rows;
+        let tail_rows = rows % self.block_rows;
+        let full_cycles = full_blocks / self.world;
+        let tail_owner = full_blocks % self.world;
+        let rank_full_blocks = full_cycles + usize::from(self.rank < tail_owner);
+        rank_full_blocks * self.block_rows
+            + if self.rank == tail_owner {
+                tail_rows
+            } else {
+                0
+            }
+    }
+}
+
+/// Physical placement of the long-lived compressor caches. Single-GPU and
+/// existing routes remain replicated. The sharded variant is admitted only by
+/// the exact gfx1201 TP orchestration after its cross-rank raw-bit identity
+/// gate has passed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CompressorCachePlacement {
+    #[default]
+    Replicated,
+    BlockCyclic(CompressorCacheShard),
+}
+
+impl CompressorCachePlacement {
+    pub fn local_rows(self, global_rows: usize) -> usize {
+        match self {
+            Self::Replicated => global_rows,
+            Self::BlockCyclic(shard) => shard.local_rows_for_prefix(global_rows),
+        }
+    }
+
+    pub fn global_to_local(self, global_row: usize) -> Option<usize> {
+        match self {
+            Self::Replicated => Some(global_row),
+            Self::BlockCyclic(shard) => shard.global_to_local(global_row),
+        }
+    }
+}
+
+/// State-owned compressed-cache sizing. This replaces the former
+/// process-global `HIPFIRE_DEEPSEEK4_MAX_COMPRESS_POS` value: capacity is a
+/// property of the loaded checkpoint/session, not ambient process state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompressorCapacityPlan {
+    max_tokens: usize,
+    max_rows: usize,
+    active_rows: usize,
+    prepared_tokens: usize,
+}
+
+impl CompressorCapacityPlan {
+    pub fn new(max_tokens: usize) -> Result<Self, String> {
+        if max_tokens == 0 {
+            return Err("DeepSeek V4 max_position_embeddings must be > 0".to_string());
+        }
+        // Ratio 4 is the densest compressed tier and therefore owns the
+        // common score/cache stride. Round up so a non-multiple checkpoint
+        // horizon can still admit its last partial block safely.
+        let max_rows = max_tokens.div_ceil(4);
+        Ok(Self {
+            max_tokens,
+            max_rows,
+            active_rows: INITIAL_COMPRESSED_ROWS.min(max_rows).max(1),
+            prepared_tokens: 0,
+        })
+    }
+
+    pub const fn max_tokens(self) -> usize {
+        self.max_tokens
+    }
+
+    pub const fn max_rows(self) -> usize {
+        self.max_rows
+    }
+
+    pub const fn active_rows(self) -> usize {
+        self.active_rows
+    }
+
+    /// Highest request endpoint whose cache pages have been mapped. Decode
+    /// steps at or below this position need no allocation-side work.
+    pub const fn prepared_tokens(self) -> usize {
+        self.prepared_tokens
+    }
+
+    /// Capacity bucket needed for a request ending at `required_tokens`.
+    /// Buckets double only at request boundaries; no allocation or launch
+    /// geometry changes inside a decode/verify capture.
+    pub fn rows_for_tokens(self, required_tokens: usize) -> Result<usize, String> {
+        if required_tokens > self.max_tokens {
+            return Err(format!(
+                "DeepSeek V4 context requires {required_tokens} tokens but the checkpoint advertises {}",
+                self.max_tokens
+            ));
+        }
+        let required_rows = required_tokens.div_ceil(4).max(1);
+        let bucket = required_rows
+            .max(INITIAL_COMPRESSED_ROWS.min(self.max_rows))
+            .checked_next_power_of_two()
+            .ok_or_else(|| "DeepSeek V4 compressed capacity overflow".to_string())?;
+        Ok(bucket.min(self.max_rows))
+    }
+
+    /// Map at least one historical 8K-token quantum ahead so direct decode
+    /// callers do not enter the allocation path every token. Above the final
+    /// power-of-two boundary this remains incremental, allowing F32 to use
+    /// the physical horizon instead of jumping immediately to a full 1M map.
+    pub fn prepared_target_for_tokens(self, required_tokens: usize) -> Result<usize, String> {
+        let rows = self.rows_for_tokens(required_tokens)?;
+        let bucket_tokens = rows.saturating_mul(4).min(self.max_tokens);
+        Ok(required_tokens
+            .saturating_add(INITIAL_COMPRESSED_ROWS * 4 - 1)
+            .min(bucket_tokens)
+            .max(required_tokens))
+    }
+
+    pub fn activate_for_tokens(&mut self, required_tokens: usize) -> Result<bool, String> {
+        let target = self.rows_for_tokens(required_tokens)?;
+        if target <= self.active_rows {
+            return Ok(false);
+        }
+        self.active_rows = target;
+        Ok(true)
+    }
+
+    pub fn mark_prepared(&mut self, required_tokens: usize) {
+        self.prepared_tokens = self.prepared_tokens.max(required_tokens);
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeepseekV4Config {
@@ -116,6 +326,23 @@ pub struct DeepseekV4Config {
     /// directly-driven daemon (no CLI selector). Not (de)serialized.
     #[serde(skip)]
     pub load_dspark: bool,
+
+    /// DeepSeek V4 routed-MQ2 product-family selector. This is derived from an
+    /// exact `.mq2r`/`.mq2rxt` artifact identity and is never inferred from a
+    /// tensor dtype, so MQ2-Lloyd keeps its established runtime defaults. The
+    /// family shares routed-expert, route-scale, HC, and indexer policy; dense
+    /// dtype validation remains SKU-specific. Not serialized upstream.
+    #[serde(skip)]
+    pub mq2r: bool,
+
+    /// Exact DeepSeek V4 MQ2RXT SKU selector. MQ2RXT preserves MQ2R's routed
+    /// MQ2-Lloyd tier and replaces only the frozen P3 dense tensor map with
+    /// MQ4G256. It deliberately remains a distinct artifact identity so the
+    /// established MQ2R validator, DSpark sidecar, and retained tape cannot be
+    /// reused accidentally. `mq2r` is also true for this SKU because the
+    /// shared route-scale and MQ2 expert policy still apply.
+    #[serde(skip)]
+    pub mq2rxt: bool,
 }
 
 /// Raw upstream JSON shape — only the fields we read. Used to drive
@@ -190,6 +417,25 @@ impl DeepseekV4Config {
             .ok_or_else(|| "deepseek4: metadata_json missing `config` wrapper".to_string())?;
         let raw: RawDeepseekV4Config = serde_json::from_value(inner.clone())
             .map_err(|e| format!("deepseek4: parsing inner config failed: {e}"))?;
+        let mq2rxt = hfq
+            .path()
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("mq2rxt"))
+            || wrapper
+                .get("hipfire_quant_recipe")
+                .and_then(|value| value.as_str())
+                .is_some_and(|recipe| recipe == "deepseek4-mq2rxt-mq4-p3-v1");
+        let mq2r = mq2rxt
+            || hfq
+                .path()
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("mq2r"))
+            || wrapper
+                .get("hipfire_quant_recipe")
+                .and_then(|value| value.as_str())
+                .is_some_and(|recipe| recipe == "deepseek4-mq2r-e8-p3-v1");
         let mut config = DeepseekV4Config {
             vocab_size: raw.vocab_size,
             hidden_size: raw.hidden_size,
@@ -232,6 +478,8 @@ impl DeepseekV4Config {
             num_hash_layers: raw.num_hash_layers,
             reap_keep: None,
             load_dspark: true,
+            mq2r,
+            mq2rxt,
         };
         // Optional REAP plan: emulate a pruned expert pool (e.g. 162B
         // 256→144) by partial-loading this full quant. Read BEFORE the
@@ -245,8 +493,19 @@ impl DeepseekV4Config {
             config.num_hidden_layers,
             config.n_routed_experts,
         )? {
-            config.n_routed_experts = plan.kept_per_layer();
-            config.reap_keep = Some(std::sync::Arc::new(plan));
+            // An overlay-only plan has no expert keep-map. HfqFile already
+            // attached its overlay by this point, so do not route that plan
+            // through the pruning path: doing so would make hash layers look
+            // for remapped tid2eid sidecars and disable MTP unnecessarily.
+            if plan.keep.is_some() {
+                config.n_routed_experts = plan.kept_per_layer();
+                config.reap_keep = Some(std::sync::Arc::new(plan));
+            } else {
+                eprintln!(
+                    "deepseek4: REAP overlay-only plan ACTIVE — no expert pruning; dir {}",
+                    plan.dir.display()
+                );
+            }
         }
         Ok(config)
     }
@@ -314,7 +573,9 @@ impl DsparkConfig {
 ///
 /// The DSpark-specific globals (`main_proj`/`main_norm` from stage 0,
 /// `markov_w1`/`markov_w2`/`confidence_proj` from the last stage) live
-/// directly on this struct.
+/// directly on this struct. A target-recipe-specific sidecar may additionally
+/// carry `draft_head.weight`; it is used only for draft logits and never
+/// replaces the trunk's verification/output head.
 pub struct DsparkWeights {
     pub cfg: DsparkConfig,
     pub stages: Vec<DeepseekV4LayerWeights>,
@@ -323,6 +584,7 @@ pub struct DsparkWeights {
     pub markov_w1: Option<rdna_compute::GpuTensor>,
     pub markov_w2: Option<rdna_compute::GpuTensor>,
     pub confidence_proj: Option<rdna_compute::GpuTensor>,
+    pub draft_head: Option<rdna_compute::GpuTensor>,
 }
 
 impl DsparkWeights {
@@ -340,6 +602,7 @@ impl DsparkWeights {
         free_opt(gpu, &mut self.markov_w1);
         free_opt(gpu, &mut self.markov_w2);
         free_opt(gpu, &mut self.confidence_proj);
+        free_opt(gpu, &mut self.draft_head);
         for stage in self.stages.drain(..) {
             stage.free_gpu(gpu);
         }
@@ -395,6 +658,8 @@ pub fn config_from_safetensors(source: &dyn ModelSource) -> Option<DeepseekV4Con
         num_hash_layers: raw.num_hash_layers,
         reap_keep: None,
         load_dspark: true,
+        mq2r: false,
+        mq2rxt: false,
     })
 }
 
@@ -426,6 +691,14 @@ pub struct DeepseekV4LayerWeights {
     pub wkv: Option<rdna_compute::GpuTensor>,
     pub wo_a: Option<rdna_compute::GpuTensor>,
     pub wo_b: Option<rdna_compute::GpuTensor>,
+    /// Exact gfx1201 three/four-rank dense-TP contract for main attention.
+    /// The explicit local ranges permit uneven whole-O-group TP3 sharding.
+    pub attn_tp_size: usize,
+    pub attn_tp_rank: usize,
+    pub attn_head_start: usize,
+    pub attn_head_count: usize,
+    pub attn_group_start: usize,
+    pub attn_group_count: usize,
 
     // Main-attention compressor (compress_ratio > 0). Stores compressed
     // KV at slot pos//ratio for later main-attention gather. Distinct
@@ -510,6 +783,13 @@ pub struct DeepseekV4LayerWeights {
     pub tid2eid_dev: Option<rdna_compute::GpuTensor>,
 
     // Shared expert (one per layer, w1/w2/w3, MQ-family quantized).
+    /// Exact gfx1201 three/four-rank dense-TP contract for the shared expert.
+    /// The local interval is expressed in channels and always aligns to a
+    /// whole 256-wide FWHT group.
+    pub shared_tp_size: usize,
+    pub shared_tp_rank: usize,
+    pub shared_intermediate_start: usize,
+    pub shared_intermediate_count: usize,
     pub shared_w1: Option<rdna_compute::GpuTensor>,
     pub shared_w2: Option<rdna_compute::GpuTensor>,
     pub shared_w3: Option<rdna_compute::GpuTensor>,
@@ -545,14 +825,6 @@ pub struct DeepseekV4LayerWeights {
     pub expert_gate_up_ptrs: Option<rdna_compute::GpuTensor>,
     pub expert_gate_up_stride: usize,
 
-    /// Serialized HFQ quant type of the routed-expert weights (`HfqTensorInfo::
-    /// quant_type`). The MoE GEMV dispatch was hardcoded to the MQ2-Lloyd
-    /// kernel, so a checkpoint whose experts are stored in any other format was
-    /// decoded through the wrong dequant with no error — DeepSeek V4's native
-    /// FP4 (qt 21, HFP4G32) produced pure garbage from the first token. Record
-    /// what the file actually holds so dispatch can pick the matching kernel.
-    pub expert_quant_type: u8,
-
     /// EP-shard only: the shared zeroed gate_up buffer that non-owned experts'
     /// pointers index into (→ SwiGLU(0,0)=0 ⇒ 0 routed contribution). Owned
     /// here so it is reclaimed by `free_gpu` on unload and by the staging guard
@@ -586,6 +858,12 @@ impl DeepseekV4LayerWeights {
             wkv: sc(&self.wkv),
             wo_a: sc(&self.wo_a),
             wo_b: sc(&self.wo_b),
+            attn_tp_size: self.attn_tp_size,
+            attn_tp_rank: self.attn_tp_rank,
+            attn_head_start: self.attn_head_start,
+            attn_head_count: self.attn_head_count,
+            attn_group_start: self.attn_group_start,
+            attn_group_count: self.attn_group_count,
             compressor_wkv: sc(&self.compressor_wkv),
             compressor_wgate: sc(&self.compressor_wgate),
             compressor_norm: sc(&self.compressor_norm),
@@ -619,6 +897,10 @@ impl DeepseekV4LayerWeights {
             gate_bias_host: self.gate_bias_host.clone(),
             tid2eid_host: self.tid2eid_host.clone(),
             tid2eid_dev: sc(&self.tid2eid_dev),
+            shared_tp_size: self.shared_tp_size,
+            shared_tp_rank: self.shared_tp_rank,
+            shared_intermediate_start: self.shared_intermediate_start,
+            shared_intermediate_count: self.shared_intermediate_count,
             shared_w1: sc(&self.shared_w1),
             shared_w2: sc(&self.shared_w2),
             shared_w3: sc(&self.shared_w3),
@@ -634,7 +916,6 @@ impl DeepseekV4LayerWeights {
             expert_gate_up_blob: sc(&self.expert_gate_up_blob),
             expert_gate_up_ptrs: sc(&self.expert_gate_up_ptrs),
             expert_gate_up_stride: self.expert_gate_up_stride,
-            expert_quant_type: self.expert_quant_type,
             expert_gate_up_dummy: sc(&self.expert_gate_up_dummy),
         }
     }
@@ -652,6 +933,12 @@ impl DeepseekV4LayerWeights {
             wkv: None,
             wo_a: None,
             wo_b: None,
+            attn_tp_size: 1,
+            attn_tp_rank: 0,
+            attn_head_start: 0,
+            attn_head_count: 0,
+            attn_group_start: 0,
+            attn_group_count: 0,
             compressor_wkv: None,
             compressor_wgate: None,
             compressor_norm: None,
@@ -685,6 +972,10 @@ impl DeepseekV4LayerWeights {
             gate_bias_host: Vec::new(),
             tid2eid_host: Vec::new(),
             tid2eid_dev: None,
+            shared_tp_size: 1,
+            shared_tp_rank: 0,
+            shared_intermediate_start: 0,
+            shared_intermediate_count: 0,
             shared_w1: None,
             shared_w2: None,
             shared_w3: None,
@@ -700,8 +991,6 @@ impl DeepseekV4LayerWeights {
             expert_gate_up_blob: None,
             expert_gate_up_ptrs: None,
             expert_gate_up_stride: 0,
-            // 0 is not a valid quant type; the loader always overwrites it.
-            expert_quant_type: 0,
             expert_gate_up_dummy: None,
         }
     }
@@ -710,6 +999,11 @@ impl DeepseekV4LayerWeights {
     /// Used by `DeepseekV4Weights::free_gpu` to walk all 43 main layers
     /// plus the optional MTP layer.
     pub fn free_gpu(mut self, gpu: &mut rdna_compute::Gpu) {
+        self.free_dense_gpu(gpu);
+        self.free_routed_gpu(gpu);
+    }
+
+    fn free_dense_gpu(&mut self, gpu: &mut rdna_compute::Gpu) {
         fn free_opt(gpu: &mut rdna_compute::Gpu, t: &mut Option<rdna_compute::GpuTensor>) {
             if let Some(t) = t.take() {
                 let _ = gpu.free_tensor(t);
@@ -758,19 +1052,159 @@ impl DeepseekV4LayerWeights {
         free_opt(gpu, &mut self.shared_w1);
         free_opt(gpu, &mut self.shared_w2);
         free_opt(gpu, &mut self.shared_w3);
-        free_opt(gpu, &mut self.expert_w1_blob);
-        free_opt(gpu, &mut self.expert_w2_blob);
-        free_opt(gpu, &mut self.expert_w3_blob);
+    }
+
+    fn free_routed_gpu(&mut self, gpu: &mut rdna_compute::Gpu) {
+        fn free_opt(gpu: &mut rdna_compute::Gpu, t: &mut Option<rdna_compute::GpuTensor>) {
+            if let Some(t) = t.take() {
+                let _ = gpu.free_tensor(t);
+            }
+        }
+        // Pointer tables stop being live before their backing blobs return to
+        // the pool. There are no active kernels during unload, but preserving
+        // that ownership order also makes fault-injection teardown auditable.
         free_opt(gpu, &mut self.expert_w1_ptrs);
         free_opt(gpu, &mut self.expert_w2_ptrs);
         free_opt(gpu, &mut self.expert_w3_ptrs);
-        free_opt(gpu, &mut self.expert_gate_up_blob);
         free_opt(gpu, &mut self.expert_gate_up_ptrs);
+        free_opt(gpu, &mut self.expert_w1_blob);
+        free_opt(gpu, &mut self.expert_w2_blob);
+        free_opt(gpu, &mut self.expert_w3_blob);
+        free_opt(gpu, &mut self.expert_gate_up_blob);
         // EP-shard dummy gate_up buffer (was previously mem::forget-leaked).
         // Freed last so the pointer table that baked its address is already
         // gone — no live aliasing into a returned buffer. No double-free: this
         // is the sole owner.
         free_opt(gpu, &mut self.expert_gate_up_dummy);
+    }
+
+    /// Failure-path teardown for large split-owner expert blobs. Bypass the
+    /// reuse pool so a partially loaded 73 GiB tier is returned to HIP before
+    /// the transactional constructor reports failure. Normal model unload
+    /// keeps the pooled path above and drains it once at the end.
+    fn free_routed_gpu_now(&mut self, gpu: &mut rdna_compute::Gpu, errors: &mut Vec<String>) {
+        if let Err(error) = gpu.bind_thread() {
+            errors.push(format!("bind routed failure cleanup: {error}"));
+            self.free_routed_gpu(gpu);
+            return;
+        }
+        fn free_opt(
+            gpu: &mut rdna_compute::Gpu,
+            label: &str,
+            tensor: &mut Option<rdna_compute::GpuTensor>,
+            errors: &mut Vec<String>,
+        ) {
+            let Some(tensor) = tensor.take() else {
+                return;
+            };
+            if let Err(error) = gpu.hip.free(tensor.buf) {
+                errors.push(format!("free {label}: {error}"));
+            }
+        }
+        free_opt(gpu, "expert_w1_ptrs", &mut self.expert_w1_ptrs, errors);
+        free_opt(gpu, "expert_w2_ptrs", &mut self.expert_w2_ptrs, errors);
+        free_opt(gpu, "expert_w3_ptrs", &mut self.expert_w3_ptrs, errors);
+        free_opt(
+            gpu,
+            "expert_gate_up_ptrs",
+            &mut self.expert_gate_up_ptrs,
+            errors,
+        );
+        free_opt(gpu, "expert_w1_blob", &mut self.expert_w1_blob, errors);
+        free_opt(gpu, "expert_w2_blob", &mut self.expert_w2_blob, errors);
+        free_opt(gpu, "expert_w3_blob", &mut self.expert_w3_blob, errors);
+        free_opt(
+            gpu,
+            "expert_gate_up_blob",
+            &mut self.expert_gate_up_blob,
+            errors,
+        );
+        free_opt(
+            gpu,
+            "expert_gate_up_dummy",
+            &mut self.expert_gate_up_dummy,
+            errors,
+        );
+    }
+
+    fn visit_dense_tensors(
+        &self,
+        prefix: &str,
+        visit: &mut impl FnMut(&str, &rdna_compute::GpuTensor),
+    ) {
+        macro_rules! visit_opt {
+            ($field:ident) => {
+                if let Some(tensor) = self.$field.as_ref() {
+                    visit(&format!("{prefix}.{}", stringify!($field)), tensor);
+                }
+            };
+        }
+        visit_opt!(attn_norm);
+        visit_opt!(ffn_norm);
+        visit_opt!(q_norm);
+        visit_opt!(kv_norm);
+        visit_opt!(attn_sink);
+        visit_opt!(wq_a);
+        visit_opt!(wq_b);
+        visit_opt!(wkv);
+        visit_opt!(wo_a);
+        visit_opt!(wo_b);
+        visit_opt!(compressor_wkv);
+        visit_opt!(compressor_wgate);
+        visit_opt!(compressor_norm);
+        visit_opt!(compressor_ape);
+        visit_opt!(compressor_wkv_f16);
+        visit_opt!(compressor_wgate_f16);
+        visit_opt!(indexer_wq_b);
+        visit_opt!(indexer_weights_proj);
+        visit_opt!(indexer_compressor_wkv);
+        visit_opt!(indexer_compressor_wgate);
+        visit_opt!(indexer_compressor_wkv_f16);
+        visit_opt!(indexer_compressor_wgate_f16);
+        visit_opt!(indexer_compressor_norm);
+        visit_opt!(indexer_compressor_ape);
+        visit_opt!(mtp_enorm);
+        visit_opt!(mtp_hnorm);
+        visit_opt!(mtp_e_proj);
+        visit_opt!(mtp_h_proj);
+        visit_opt!(mtp_final_norm);
+        visit_opt!(mtp_hc_head_fn);
+        visit_opt!(mtp_hc_head_base);
+        visit_opt!(hc_attn_base);
+        visit_opt!(hc_attn_fn);
+        visit_opt!(hc_attn_scale);
+        visit_opt!(hc_ffn_base);
+        visit_opt!(hc_ffn_fn);
+        visit_opt!(hc_ffn_scale);
+        visit_opt!(gate_weight);
+        visit_opt!(gate_bias);
+        visit_opt!(tid2eid_dev);
+        visit_opt!(shared_w1);
+        visit_opt!(shared_w2);
+        visit_opt!(shared_w3);
+    }
+
+    fn visit_routed_tensors(
+        &self,
+        prefix: &str,
+        visit: &mut impl FnMut(&str, &rdna_compute::GpuTensor),
+    ) {
+        macro_rules! visit_opt {
+            ($field:ident) => {
+                if let Some(tensor) = self.$field.as_ref() {
+                    visit(&format!("{prefix}.{}", stringify!($field)), tensor);
+                }
+            };
+        }
+        visit_opt!(expert_w1_blob);
+        visit_opt!(expert_w2_blob);
+        visit_opt!(expert_w3_blob);
+        visit_opt!(expert_w1_ptrs);
+        visit_opt!(expert_w2_ptrs);
+        visit_opt!(expert_w3_ptrs);
+        visit_opt!(expert_gate_up_blob);
+        visit_opt!(expert_gate_up_ptrs);
+        visit_opt!(expert_gate_up_dummy);
     }
 }
 
@@ -783,6 +1217,10 @@ impl DeepseekV4LayerWeights {
 /// `mtp.` prefix-skip in `hipfire-quantize` is lifted and MTP
 /// tensors are quantized alongside main layers).
 pub struct DeepseekV4Weights {
+    /// Model-owned execution backend for the frozen MQ2R recipe. This is kept
+    /// off the process-wide Gpu so unrelated architectures and model swaps
+    /// cannot inherit DeepSeek4 dispatch policy.
+    pub(crate) mq2r_backend: Mq2rBackend,
     /// Token embedding table. Stored as raw Q8F16 bytes on GPU
     /// (matches the `embed.weight` quant_type from Phase 1 ingest).
     pub token_embd: Option<rdna_compute::GpuTensor>,
@@ -808,20 +1246,6 @@ pub struct DeepseekV4Weights {
     /// `<stem>-dspark.<ext>` sidecar. Additive to `mtp_layer` — both can be
     /// present. `None` when no DSpark sidecar exists (silent no-op).
     pub dspark: Option<DsparkWeights>,
-    /// Routed-expert pager. `None` (the default) means every expert is
-    /// resident and the forward path is unchanged. `Some` means the per-layer
-    /// expert blobs are BOUNDED slot pools that the forward path must fill on
-    /// demand before each MoE dispatch — see `crate::expert_pager`.
-    ///
-    /// Behind a `Mutex` because the slot pools are shared model state while
-    /// the forward path only holds `&DeepseekV4Weights`: concurrent sequences
-    /// must not race on the same slots, and serialising is required anyway.
-    pub expert_paging: Option<std::sync::Mutex<crate::expert_pager::Ds4ExpertPaging>>,
-    /// Trained predictor for the NEXT layer's routing, enabling speculative
-    /// expert prefetch. `None` unless HIPFIRE_DEEPSEEK4_EXPERT_ADAPTER points
-    /// at an exported adapter. Mutex for the same reason as `expert_paging`:
-    /// it owns device scratch that concurrent sequences must not race on.
-    pub expert_adapter: Option<std::sync::Mutex<crate::expert_adapter::ExpertAdapter>>,
     pub _scaffold: (),
 }
 
@@ -861,6 +1285,52 @@ impl DeepseekV4Weights {
         }
     }
 
+    fn visit_dense_tensors(&self, visit: &mut impl FnMut(&str, &rdna_compute::GpuTensor)) {
+        macro_rules! visit_opt {
+            ($name:expr, $tensor:expr) => {
+                if let Some(tensor) = $tensor.as_ref() {
+                    visit($name, tensor);
+                }
+            };
+        }
+        visit_opt!("embed.weight", self.token_embd);
+        visit_opt!("norm.weight", self.output_norm);
+        visit_opt!("head.weight", self.head);
+        visit_opt!("hc_head_fn", self.hc_head_fn);
+        visit_opt!("hc_head_base", self.hc_head_base);
+        for (index, layer) in self.layers.iter().enumerate() {
+            layer.visit_dense_tensors(&format!("layers.{index}"), visit);
+        }
+        if let Some(layer) = self.mtp_layer.as_ref() {
+            layer.visit_dense_tensors("mtp.0", visit);
+        }
+        if let Some(dspark) = self.dspark.as_ref() {
+            visit_opt!("dspark.main_proj", dspark.main_proj);
+            visit_opt!("dspark.main_norm", dspark.main_norm);
+            visit_opt!("dspark.markov_w1", dspark.markov_w1);
+            visit_opt!("dspark.markov_w2", dspark.markov_w2);
+            visit_opt!("dspark.confidence_proj", dspark.confidence_proj);
+            visit_opt!("dspark.draft_head", dspark.draft_head);
+            for (index, layer) in dspark.stages.iter().enumerate() {
+                layer.visit_dense_tensors(&format!("dspark.mtp.{index}"), visit);
+            }
+        }
+    }
+
+    fn visit_routed_tensors(&self, visit: &mut impl FnMut(&str, &rdna_compute::GpuTensor)) {
+        for (index, layer) in self.layers.iter().enumerate() {
+            layer.visit_routed_tensors(&format!("layers.{index}"), visit);
+        }
+        if let Some(layer) = self.mtp_layer.as_ref() {
+            layer.visit_routed_tensors("mtp.0", visit);
+        }
+        if let Some(dspark) = self.dspark.as_ref() {
+            for (index, layer) in dspark.stages.iter().enumerate() {
+                layer.visit_routed_tensors(&format!("dspark.mtp.{index}"), visit);
+            }
+        }
+    }
+
     pub fn resolve_layer(&self, idx: usize) -> &DeepseekV4LayerWeights {
         if idx < self.layers.len() {
             &self.layers[idx]
@@ -884,6 +1354,164 @@ impl DeepseekV4Weights {
     }
 }
 
+/// gfx1100-owned portion of a heterogeneous DS4 load. The wrapped ordinary
+/// weight type is admitted only after proving that every routed allocation is
+/// absent, so its single-owner teardown contract remains true.
+pub struct DeepseekV4DenseWeights {
+    pub(crate) inner: DeepseekV4Weights,
+}
+
+impl DeepseekV4DenseWeights {
+    pub(crate) fn validate_loaded(inner: &DeepseekV4Weights) -> Result<(), String> {
+        let mut routed = Vec::new();
+        inner.visit_routed_tensors(&mut |name, _| routed.push(name.to_owned()));
+        if !routed.is_empty() {
+            return Err(format!(
+                "deepseek4: dense-owner weights contain routed allocations: {}",
+                routed.join(", ")
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn from_loaded(inner: DeepseekV4Weights) -> Self {
+        Self { inner }
+    }
+
+    pub fn free_gpu(self, gpu: &mut rdna_compute::Gpu) {
+        self.inner.free_gpu(gpu);
+    }
+}
+
+/// gfx1151-owned routed-expert portion of a heterogeneous DS4 load. No global,
+/// attention, shared-expert, state, or scratch allocation can enter this type.
+pub struct DeepseekV4RoutedWeights {
+    pub(crate) mq2r_backend: Mq2rBackend,
+    pub(crate) layers: Vec<DeepseekV4LayerWeights>,
+}
+
+impl DeepseekV4RoutedWeights {
+    pub(crate) fn new(cfg: &DeepseekV4Config, mq2r_backend: Mq2rBackend) -> Self {
+        let layers = (0..cfg.num_hidden_layers)
+            .map(|layer| {
+                DeepseekV4LayerWeights::new_empty(
+                    cfg.compress_ratios.get(layer).copied().unwrap_or(0),
+                )
+            })
+            .collect();
+        Self {
+            mq2r_backend,
+            layers,
+        }
+    }
+
+    pub(crate) fn layer_mut(&mut self, index: usize) -> Option<&mut DeepseekV4LayerWeights> {
+        self.layers.get_mut(index)
+    }
+
+    pub fn resolve_layer(&self, index: usize) -> &DeepseekV4LayerWeights {
+        &self.layers[index]
+    }
+
+    pub fn free_gpu(mut self, gpu: &mut rdna_compute::Gpu) {
+        for mut layer in self.layers.drain(..) {
+            layer.free_routed_gpu(gpu);
+        }
+    }
+
+    pub(crate) fn free_gpu_now(mut self, gpu: &mut rdna_compute::Gpu) -> Vec<String> {
+        let mut errors = Vec::new();
+        for mut layer in self.layers.drain(..) {
+            layer.free_routed_gpu_now(gpu, &mut errors);
+        }
+        errors
+    }
+
+    fn visit_tensors(&self, visit: &mut impl FnMut(&str, &rdna_compute::GpuTensor)) {
+        for (index, layer) in self.layers.iter().enumerate() {
+            layer.visit_routed_tensors(&format!("layers.{index}"), visit);
+        }
+    }
+}
+
+/// Split-owner weights for the heterogeneous route. The type boundary makes
+/// it impossible to call the ordinary one-GPU destructor on a mixed-owner
+/// object: each half exposes only its own owner-correct teardown.
+pub struct DeepseekV4HeterogeneousWeights {
+    pub dense: DeepseekV4DenseWeights,
+    pub routed: DeepseekV4RoutedWeights,
+}
+
+impl DeepseekV4HeterogeneousWeights {
+    pub fn free_gpu(self, dense_gpu: &mut rdna_compute::Gpu, routed_gpu: &mut rdna_compute::Gpu) {
+        self.routed.free_gpu(routed_gpu);
+        self.dense.free_gpu(dense_gpu);
+    }
+
+    /// Query HIP pointer metadata for every resident weight and prove that the
+    /// two typed owners match their exact devices. Counts include packed expert
+    /// blobs, pointer tables, and dense duplicate representations.
+    pub fn audit_owners(
+        &self,
+        dense_gpu: &mut rdna_compute::Gpu,
+        routed_gpu: &mut rdna_compute::Gpu,
+    ) -> Result<DeepseekV4OwnershipAudit, String> {
+        let mut audit = DeepseekV4OwnershipAudit::default();
+        dense_gpu
+            .bind_thread()
+            .map_err(|error| format!("deepseek4: bind dense owner for audit: {error}"))?;
+        self.dense.inner.visit_dense_tensors(&mut |name, tensor| {
+            audit.dense_tensor_count += 1;
+            audit.dense_bytes += tensor.buf.size();
+            match dense_gpu.hip.pointer_get_attributes(&tensor.buf) {
+                Ok(attr) if attr.device == dense_gpu.device_id => {}
+                Ok(attr) => audit.violations.push(format!(
+                    "{name}: dense owner device {} != expected {}",
+                    attr.device, dense_gpu.device_id
+                )),
+                Err(error) => audit
+                    .violations
+                    .push(format!("{name}: dense pointer audit failed: {error}")),
+            }
+        });
+
+        routed_gpu
+            .bind_thread()
+            .map_err(|error| format!("deepseek4: bind routed owner for audit: {error}"))?;
+        self.routed.visit_tensors(&mut |name, tensor| {
+            audit.routed_tensor_count += 1;
+            audit.routed_bytes += tensor.buf.size();
+            match routed_gpu.hip.pointer_get_attributes(&tensor.buf) {
+                Ok(attr) if attr.device == routed_gpu.device_id => {}
+                Ok(attr) => audit.violations.push(format!(
+                    "{name}: routed owner device {} != expected {}",
+                    attr.device, routed_gpu.device_id
+                )),
+                Err(error) => audit
+                    .violations
+                    .push(format!("{name}: routed pointer audit failed: {error}")),
+            }
+        });
+        if audit.violations.is_empty() {
+            Ok(audit)
+        } else {
+            Err(format!(
+                "deepseek4: heterogeneous pointer-owner audit failed: {}",
+                audit.violations.join("; ")
+            ))
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DeepseekV4OwnershipAudit {
+    pub dense_tensor_count: usize,
+    pub dense_bytes: usize,
+    pub routed_tensor_count: usize,
+    pub routed_bytes: usize,
+    pub violations: Vec<String>,
+}
+
 /// Per-layer state for the compressed-KV indexer (Phase 2, Lever 3).
 ///
 /// Active only on layers with `compress_ratios[l] > 0`. Each layer
@@ -899,7 +1527,8 @@ pub struct IndexerLayerState {
     pub compress_ratio: u32,
 
     // ── Main-attention compressor state (ratio > 0) ────────────────
-    /// Compressed KV cache `[max_compressed_pos, head_dim]` F32. Holds
+    /// Compressed KV cache `[max_compressed_pos, head_dim]`. F32 on existing
+    /// routes; F16 on the exact gfx1201 MQ2R TP3/TP4 long-context route. Holds
     /// gated-pooled compressed values at slot pos//ratio. Used by main
     /// attention's gather step to extend SWA window.
     pub main_kv_cache: Option<rdna_compute::GpuTensor>,
@@ -913,9 +1542,14 @@ pub struct IndexerLayerState {
 
     // ── Indexer state (ratio == 4 only) ────────────────────────────
     /// Indexer-specific compressed KV cache `[max_compressed_pos, idx_head_dim]`
-    /// F32. Built by indexer's separate compressor. Used by Q · K_idx
-    /// scoring step.
+    /// Built by indexer's separate compressor. Uses the same storage dtype as
+    /// `main_kv_cache` and is converted to F32 by scoring kernels.
     pub indexer_kv_cache: Option<rdna_compute::GpuTensor>,
+    /// Exact gfx1201 TP peer table for block-cyclic compressor storage.
+    /// Entries are stable VMM reservation bases, not owning buffers.
+    pub main_kv_cache_shards: [usize; 4],
+    pub indexer_kv_cache_shards: [usize; 4],
+    pub cache_shard_count: usize,
     pub indexer_kv_state: Option<rdna_compute::GpuTensor>,
     pub indexer_score_state: Option<rdna_compute::GpuTensor>,
     /// Per-step indexer scratch:
@@ -927,6 +1561,12 @@ pub struct IndexerLayerState {
     pub idx_weights: Option<rdna_compute::GpuTensor>,
     pub index_score: Option<rdna_compute::GpuTensor>,
     pub topk_idx_indices: Option<rdna_compute::GpuTensor>,
+    /// Two-stage merge-tree top-K workspace (F3/G1), `[max_compressed]` each,
+    /// run j at element offset j*512. `topk_ws_indices` is an F32 tensor
+    /// holding an i32 payload (same convention as `topk_idx_indices`).
+    /// Lazy-alloc by indexer_forward ONLY when the two-stage path is selected.
+    pub topk_ws_scores: Option<rdna_compute::GpuTensor>,
+    pub topk_ws_indices: Option<rdna_compute::GpuTensor>,
 
     // Compressor per-step scratch (re-used main and indexer; sized for
     // the LARGER of the two — main has coff*head_dim = 1024 for ratio=4,
@@ -938,6 +1578,9 @@ pub struct IndexerLayerState {
     /// Concat scratch for overlap-pool   [2*ratio, head_dim] F32.
     pub comp_concat_kv: Option<rdna_compute::GpuTensor>,
     pub comp_concat_score: Option<rdna_compute::GpuTensor>,
+    /// One-row F32 commit stage. F16 cache routes perform pool, RMSNorm, and
+    /// RoPE here, then round once at the final cache store.
+    pub comp_cache_row_f32: Option<rdna_compute::GpuTensor>,
 }
 
 /// Per-layer scratch for the main attention path's gathered K/V rows.
@@ -1006,6 +1649,25 @@ impl HashTopkHostScratch {
 /// DeepSeek V4 per-decode state. Held on the daemon's per-session struct,
 /// reused across decode steps. Allocated once via `new_state`.
 pub struct DeepseekV4State {
+    /// Logical and currently-active compressed-cache capacity. The logical
+    /// horizon follows `max_position_embeddings`; the active launch/scratch
+    /// bucket grows automatically at request boundaries.
+    pub compressor_capacity: CompressorCapacityPlan,
+
+    /// Rank-local physical ownership for the long-lived main/indexer
+    /// compressor caches. Small recurrent rings remain replicated.
+    pub compressor_cache_placement: CompressorCachePlacement,
+
+    /// Storage dtype for the two long-lived compressor caches only. All
+    /// compressor arithmetic, score reductions, recurrent rings, and scratch
+    /// remain F32.
+    pub compressor_cache_dtype: rdna_compute::DType,
+
+    /// Physical device ids granted read/write access to every sharded VMM
+    /// cache reservation. Empty on replicated and single-GPU routes.
+    pub compressor_cache_access_devices: [i32; 4],
+    pub compressor_cache_access_count: usize,
+
     /// Per-layer (43 + 1 MTP = 44). Layers with `compress_ratio == 0`
     /// skip the indexer.
     pub _indexer: Vec<IndexerLayerState>,
@@ -1017,6 +1679,14 @@ pub struct DeepseekV4State {
     /// kernels handle the f32 input directly.
     /// `None` until `decode_step` allocates on first call.
     pub residual_streams: Option<rdna_compute::GpuTensor>,
+
+    /// Alternate `[hc_mult, hidden]` output for the decode HC mixers.
+    ///
+    /// The attention and FFN mixers each swap this with `residual_streams`,
+    /// eliminating two device copies per layer. There are exactly two swaps
+    /// per layer, so the externally visible buffer identity is restored at
+    /// every decode boundary (important for graph and retained replay).
+    pub residual_streams_next: Option<rdna_compute::GpuTensor>,
 
     /// Single-row embedding scratch `[hidden]` for the current decode
     /// step's token lookup. F32 to match residual_streams convention.
@@ -1133,8 +1803,8 @@ pub struct DeepseekV4State {
     /// Layout (all i32 stored as F32 bits):
     ///   [0] swa_slot          = pos % sliding_window
     ///   [1] n_valid_swa       = min(pos + 1, sliding_window)
-    ///   [2] n_compressed_4    = (pos + 1) / 4    (ratio=4 layers)
-    ///   [3] n_compressed_128  = (pos + 1) / 128  (ratio=128 layers)
+    ///   [2] n_compressed_4    = min((pos + 1) / 4, max_compressed)
+    ///   [3] n_compressed_128  = min((pos + 1) / 128, max_compressed)
     ///   [4] k_active_4        = min(index_topk, n_compressed_4)
     ///   [5] k_active_128      = min(topk_window, n_compressed_128)
     ///   [6] ring_slot_4       = ring write slot for ratio=4 state
@@ -1154,7 +1824,7 @@ pub struct DeepseekV4State {
     /// as `pos_array_host`: captured memcpy nodes re-read this pointer
     /// on each graph replay and find the values written for the current
     /// position.
-    pub attn_state_host: Option<Box<[i32; 10]>>,
+    pub attn_state_host: Option<Box<[i32; 12]>>,
 
     /// Per-token attention output `[hidden]` F32, fed to HC attn mix
     /// as the `transform_out` arg. Currently a stub: holds a sliced
@@ -1165,6 +1835,19 @@ pub struct DeepseekV4State {
     /// `transform_out`. Currently = shared expert output (real),
     /// routed experts pending.
     pub ffn_out: Option<rdna_compute::GpuTensor>,
+
+    /// Routed-only FFN partial used by the gfx1151 dual-stream decode path.
+    /// The main stream writes this while the side stream evaluates the shared
+    /// expert into `ffn_out`; after the streams join, the partial is added to
+    /// `ffn_out` before the HC mix.
+    pub ffn_routed_overlap: Option<rdna_compute::GpuTensor>,
+    /// Persistent side-stream resources for shared-vs-routed MoE overlap.
+    /// Constructed before AR graph capture and explicitly destroyed by
+    /// `free_gpu`; leaving them in the per-session state avoids global stream
+    /// ownership and keeps the optimization model/session scoped.
+    pub ffn_overlap_stream: Option<hip_bridge::Stream>,
+    pub ffn_overlap_fork_event: Option<hip_bridge::Event>,
+    pub ffn_overlap_join_event: Option<hip_bridge::Event>,
 
     /// FFN normalised input `[hidden]` F32. RMSNorm(stream0, ffn_norm)
     /// then FWHT-rotated for the shared-expert MQ4 GEMVs.
@@ -1333,16 +2016,22 @@ impl DeepseekV4State {
                 main_kv_state: None,
                 main_score_state: None,
                 indexer_kv_cache: None,
+                main_kv_cache_shards: [0; 4],
+                indexer_kv_cache_shards: [0; 4],
+                cache_shard_count: 0,
                 indexer_kv_state: None,
                 indexer_score_state: None,
                 q_idx: None,
                 idx_weights: None,
                 index_score: None,
                 topk_idx_indices: None,
+                topk_ws_scores: None,
+                topk_ws_indices: None,
                 comp_kv_buf: None,
                 comp_score_buf: None,
                 comp_concat_kv: None,
                 comp_concat_score: None,
+                comp_cache_row_f32: None,
             });
             attention.push(MainAttentionLayerState {
                 swa_k: None,
@@ -1354,9 +2043,15 @@ impl DeepseekV4State {
             });
         }
         Ok(DeepseekV4State {
+            compressor_capacity: CompressorCapacityPlan::new(cfg.max_position_embeddings)?,
+            compressor_cache_placement: CompressorCachePlacement::Replicated,
+            compressor_cache_dtype: rdna_compute::DType::F32,
+            compressor_cache_access_devices: [0; 4],
+            compressor_cache_access_count: 0,
             _indexer: indexer,
             _attention: attention,
             residual_streams: None, // allocated on first `decode_step` (needs Gpu).
+            residual_streams_next: None,
             embed_scratch: None,
             tmp: None,
             tmp_plain: None,
@@ -1378,6 +2073,10 @@ impl DeepseekV4State {
             attn_state_host: None,
             attn_out: None,
             ffn_out: None,
+            ffn_routed_overlap: None,
+            ffn_overlap_stream: None,
+            ffn_overlap_fork_event: None,
+            ffn_overlap_join_event: None,
             ffn_x_rot: None,
             ffn_x_plain: None,
             ffn_gate: None,
@@ -1503,7 +2202,11 @@ impl DeepseekV4State {
     pub fn zero_decode_caches(&mut self, gpu: &mut rdna_compute::Gpu) {
         fn z(gpu: &mut rdna_compute::Gpu, t: &Option<rdna_compute::GpuTensor>) {
             if let Some(t) = t {
-                let _ = gpu.hip.memset(&t.buf, 0, t.byte_size());
+                // VMM owners describe the full logical shape but expose only
+                // their mapped prefix through `buf.size()`. Never zero the
+                // reserved-but-unmapped tail.
+                let bytes = gpu.vmm_mapped_bytes(t).unwrap_or_else(|| t.byte_size());
+                let _ = gpu.hip.memset(&t.buf, 0, bytes.min(t.buf.size()));
             }
         }
         // The compressor `score_state` ring must reset to -inf, NOT 0 (matches
@@ -1527,6 +2230,7 @@ impl DeepseekV4State {
             z(gpu, &l.comp_score_buf);
             z(gpu, &l.comp_concat_kv);
             z(gpu, &l.comp_concat_score);
+            z(gpu, &l.comp_cache_row_f32);
         }
         for l in &self._attention {
             z(gpu, &l.swa_k);
@@ -1553,6 +2257,18 @@ impl DeepseekV4State {
                 let _ = gpu.free_tensor(t);
             }
         }
+        if let Some(stream) = self.ffn_overlap_stream.as_ref() {
+            let _ = gpu.hip.stream_synchronize(stream);
+        }
+        if let Some(event) = self.ffn_overlap_fork_event.take() {
+            let _ = gpu.hip.event_destroy(event);
+        }
+        if let Some(event) = self.ffn_overlap_join_event.take() {
+            let _ = gpu.hip.event_destroy(event);
+        }
+        if let Some(stream) = self.ffn_overlap_stream.take() {
+            let _ = gpu.hip.stream_destroy(stream);
+        }
         // Per-layer indexer + main-attention caches.
         for mut l in self._indexer.drain(..) {
             free_opt(gpu, &mut l.main_kv_cache);
@@ -1565,10 +2281,13 @@ impl DeepseekV4State {
             free_opt(gpu, &mut l.idx_weights);
             free_opt(gpu, &mut l.index_score);
             free_opt(gpu, &mut l.topk_idx_indices);
+            free_opt(gpu, &mut l.topk_ws_scores);
+            free_opt(gpu, &mut l.topk_ws_indices);
             free_opt(gpu, &mut l.comp_kv_buf);
             free_opt(gpu, &mut l.comp_score_buf);
             free_opt(gpu, &mut l.comp_concat_kv);
             free_opt(gpu, &mut l.comp_concat_score);
+            free_opt(gpu, &mut l.comp_cache_row_f32);
         }
         for mut l in self._attention.drain(..) {
             free_opt(gpu, &mut l.swa_k);
@@ -1580,6 +2299,7 @@ impl DeepseekV4State {
         }
         // Top-level scratch.
         free_opt(gpu, &mut self.residual_streams);
+        free_opt(gpu, &mut self.residual_streams_next);
         free_opt(gpu, &mut self.embed_scratch);
         free_opt(gpu, &mut self.tmp);
         free_opt(gpu, &mut self.tmp_plain);
@@ -1597,6 +2317,7 @@ impl DeepseekV4State {
         free_opt(gpu, &mut self.attn_state_buf);
         free_opt(gpu, &mut self.attn_out);
         free_opt(gpu, &mut self.ffn_out);
+        free_opt(gpu, &mut self.ffn_routed_overlap);
         free_opt(gpu, &mut self.ffn_x_rot);
         free_opt(gpu, &mut self.ffn_x_plain);
         free_opt(gpu, &mut self.ffn_gate);
@@ -1646,6 +2367,85 @@ impl DeepseekV4State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compressor_capacity_grows_at_request_boundaries_to_model_horizon() {
+        let plan = CompressorCapacityPlan::new(1_048_576).unwrap();
+        assert_eq!(plan.max_rows(), 262_144);
+        assert_eq!(plan.active_rows(), 2_048);
+        assert_eq!(plan.prepared_tokens(), 0);
+        assert_eq!(plan.rows_for_tokens(8_192).unwrap(), 2_048);
+        assert_eq!(plan.rows_for_tokens(8_193).unwrap(), 4_096);
+        assert_eq!(plan.prepared_target_for_tokens(1).unwrap(), 8_192);
+        assert_eq!(plan.prepared_target_for_tokens(8_193).unwrap(), 16_384);
+        assert_eq!(plan.prepared_target_for_tokens(524_289).unwrap(), 532_480);
+        assert_eq!(plan.rows_for_tokens(32_768).unwrap(), 8_192);
+        assert_eq!(plan.rows_for_tokens(1_048_576).unwrap(), 262_144);
+        assert!(plan.rows_for_tokens(1_048_577).is_err());
+    }
+
+    #[test]
+    fn compressor_capacity_handles_small_and_partial_model_horizons() {
+        let mut plan = CompressorCapacityPlan::new(101).unwrap();
+        assert_eq!(plan.max_rows(), 26);
+        assert_eq!(plan.active_rows(), 26);
+        assert_eq!(plan.rows_for_tokens(101).unwrap(), 26);
+        assert!(!plan.activate_for_tokens(101).unwrap());
+        plan.mark_prepared(73);
+        plan.mark_prepared(12);
+        assert_eq!(plan.prepared_tokens(), 73);
+        assert!(CompressorCapacityPlan::new(0).is_err());
+    }
+
+    #[test]
+    fn compressor_cache_shards_are_stable_complete_and_balanced() {
+        const WORLD: usize = 3;
+        const BLOCK: usize = CompressorCacheShard::GFX1201_BLOCK_ROWS;
+        let shards: Vec<_> = (0..WORLD)
+            .map(|rank| CompressorCacheShard::new(rank, WORLD, BLOCK).unwrap())
+            .collect();
+
+        for rows in [1, 255, 256, 257, 2_048, 32_768, 262_144] {
+            let local_rows: Vec<_> = shards
+                .iter()
+                .map(|shard| shard.local_rows_for_prefix(rows))
+                .collect();
+            assert_eq!(local_rows.iter().sum::<usize>(), rows);
+            assert!(
+                local_rows.iter().max().unwrap() - local_rows.iter().min().unwrap() <= BLOCK,
+                "rows={rows}, local_rows={local_rows:?}"
+            );
+
+            for global_row in 0..rows {
+                let owner = shards[0].owner(global_row);
+                let local_row = shards[owner]
+                    .global_to_local(global_row)
+                    .expect("owner must map its global row");
+                assert!(local_row < local_rows[owner]);
+                assert_eq!(shards[owner].local_to_global(local_row), global_row);
+                for (rank, shard) in shards.iter().enumerate() {
+                    assert_eq!(shard.global_to_local(global_row).is_some(), rank == owner);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compressor_cache_shard_ownership_does_not_move_when_prefix_grows() {
+        let shard =
+            CompressorCacheShard::new(1, 3, CompressorCacheShard::GFX1201_BLOCK_ROWS).unwrap();
+        let before: Vec<_> = (0..8_192)
+            .filter_map(|global| shard.global_to_local(global).map(|local| (global, local)))
+            .collect();
+        assert!(shard.local_rows_for_prefix(262_144) > shard.local_rows_for_prefix(8_192));
+        for (global, local) in before {
+            assert_eq!(shard.global_to_local(global), Some(local));
+        }
+        assert!(CompressorCacheShard::new(0, 1, 256).is_err());
+        assert!(CompressorCacheShard::new(3, 3, 256).is_err());
+        assert!(CompressorCacheShard::new(0, 3, 0).is_err());
+        assert!(CompressorCacheShard::new(0, 3, 192).is_err());
+    }
 
     const DEEPSEEK4_CONFIG_JSON: &str = r#"{
         "vocab_size": 129280, "hidden_size": 4096, "num_hidden_layers": 43,

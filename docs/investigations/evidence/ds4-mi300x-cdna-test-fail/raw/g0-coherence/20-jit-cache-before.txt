@@ -1,0 +1,37 @@
+=== JIT cache discovery ===
+cwd_default=/mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/.hipfire_kernels
+total 24
+drwxr-xr-x  3 root root  4096 Aug  1 12:45 .
+drwxr-xr-x 26 root root  4096 Aug  1 12:45 ..
+drwxr-xr-x  2 root root 16384 Aug  1 12:52 gfx942
+total 1636
+drwxr-xr-x 2 root root 16384 Aug  1 12:52 .
+drwxr-xr-x 3 root root  4096 Aug  1 12:45 ..
+-rw-r--r-- 1 root root    16 Aug  1 12:45 add_inplace.hash
+-rw-r--r-- 1 root root   364 Aug  1 12:45 add_inplace.hip
+-rw-r--r-- 1 root root  9776 Aug  1 12:45 add_inplace.hsaco
+-rw-r--r-- 1 root root    16 Aug  1 12:45 attention.hash
+-rw-r--r-- 1 root root  3113 Aug  1 12:45 attention.hip
+-rw-r--r-- 1 root root 13336 Aug  1 12:45 attention.hsaco
+-rw-r--r-- 1 root root    16 Aug  1 12:45 attention_q8_0_kv.hash
+-rw-r--r-- 1 root root  6158 Aug  1 12:45 attention_q8_0_kv.hip
+-rw-r--r-- 1 root root 14592 Aug  1 12:45 attention_q8_0_kv.hsaco
+-rw-r--r-- 1 root root    16 Aug  1 12:51 compressor_add_ape_batched.hash
+-rw-r--r-- 1 root root  1838 Aug  1 12:51 compressor_add_ape_batched.hip
+-rw-r--r-- 1 root root 11760 Aug  1 12:51 compressor_add_ape_batched.hsaco
+-rw-r--r-- 1 root root    16 Aug  1 12:52 compressor_add_ape_buf.hash
+-rw-r--r-- 1 root root  1838 Aug  1 12:52 compressor_add_ape_buf.hip
+-rw-r--r-- 1 root root 11760 Aug  1 12:52 compressor_add_ape_buf.hsaco
+-rw-r--r-- 1 root root    16 Aug  1 12:51 compressor_compress_aligned_batched_f32.hash
+-rw-r--r-- 1 root root  4700 Aug  1 12:51 compressor_compress_aligned_batched_f32.hip
+count_cwd=210
+root_home=/root/.hipfire_kernels
+total 28
+drwxr-xr-x  3 root root  4096 Aug  1 09:10 .
+drwx------ 11 root root  4096 Aug  1 12:16 ..
+drwxr-xr-x  2 root root 20480 Aug  1 13:48 gfx942
+count_root=282
+HIPFIRE_KERNEL_CACHE env unset (default CWD .hipfire_kernels)
+moved /mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/.hipfire_kernels -> /mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/20-jit-cache-cwd-20260801T135117Z.aside
+moved /root/.hipfire_kernels -> /mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/20-jit-cache-root-20260801T135117Z.aside
+ls: cannot access '/mnt/scratch/hipfire-work/ds4-mi300x-agentmaxx/.hipfire_kernels': No such file or directory

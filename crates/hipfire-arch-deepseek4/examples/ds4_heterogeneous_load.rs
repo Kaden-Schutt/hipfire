@@ -1,0 +1,999 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use hip_bridge::HipRuntime;
+use hipfire_arch_deepseek4::{
+    forward, DeepseekV4, DeepseekV4HeterogeneousFault, DeepseekV4HeterogeneousLoadPlan,
+    DeepseekV4HeterogeneousModel, DeepseekV4State, DeepseekV4VerifiedArtifact,
+};
+use hipfire_runtime::arch::Architecture;
+use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::tokenizer::Tokenizer;
+use rdna_compute::{Gpu, GpuTensor};
+use serde_json::json;
+
+type RocprofControlFn = unsafe extern "C" fn(u64) -> i32;
+
+struct RocprofSelectedRegion {
+    _library: libloading::Library,
+    resume: RocprofControlFn,
+    pause: RocprofControlFn,
+}
+
+impl RocprofSelectedRegion {
+    fn load() -> Result<Self, String> {
+        let library = unsafe { libloading::Library::new("librocprofiler-sdk-roctx.so") }
+            .map_err(|error| format!("load librocprofiler-sdk-roctx.so: {error}"))?;
+        let resume = unsafe {
+            *library
+                .get::<RocprofControlFn>(b"roctxProfilerResume\0")
+                .map_err(|error| format!("resolve roctxProfilerResume: {error}"))?
+        };
+        let pause = unsafe {
+            *library
+                .get::<RocprofControlFn>(b"roctxProfilerPause\0")
+                .map_err(|error| format!("resolve roctxProfilerPause: {error}"))?
+        };
+        Ok(Self {
+            _library: library,
+            resume,
+            pause,
+        })
+    }
+
+    fn set(&self, active: bool) -> Result<(), String> {
+        let status = unsafe {
+            if active {
+                (self.resume)(0)
+            } else {
+                (self.pause)(0)
+            }
+        };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "{} returned {status}",
+                if active {
+                    "roctxProfilerResume"
+                } else {
+                    "roctxProfilerPause"
+                }
+            ))
+        }
+    }
+}
+
+fn main() -> Result<(), String> {
+    let mut args = std::env::args().skip(1);
+    let model = args
+        .next()
+        .ok_or(
+            "usage: ds4_heterogeneous_load MODEL [--cycles N] [--replacement-probe] [--fault-matrix] [--fault dense|layer:N|audit|state|scratch] [--decode-token ID] [--position N] [--prompt PATH --generate N --output PATH] [--compare-single] [--performance] [--decode-attach-pause-ms N] [--rocprof-selected-decode]",
+        )?;
+    let mut cycles = 1usize;
+    let mut fault = None;
+    let mut replacement_probe = false;
+    let mut fault_matrix = false;
+    let mut decode_token = None;
+    let mut position = 0u32;
+    let mut compare_single = false;
+    let mut prompt = None;
+    let mut generate = 0usize;
+    let mut output = None;
+    let mut performance = false;
+    let mut decode_attach_pause = Duration::ZERO;
+    let mut rocprof_selected_decode = false;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--cycles" => {
+                cycles = args
+                    .next()
+                    .ok_or("--cycles requires a value")?
+                    .parse()
+                    .map_err(|error| format!("invalid --cycles: {error}"))?;
+            }
+            "--fault" => {
+                let value = args
+                    .next()
+                    .ok_or("--fault requires dense, layer:N, audit, state, or scratch")?;
+                fault = Some(if value == "dense" {
+                    DeepseekV4HeterogeneousFault::AfterDenseWeights
+                } else if value == "audit" {
+                    DeepseekV4HeterogeneousFault::AfterOwnershipAudit
+                } else if value == "state" {
+                    DeepseekV4HeterogeneousFault::AfterState
+                } else if value == "scratch" {
+                    DeepseekV4HeterogeneousFault::AfterScratch
+                } else if let Some(layer) = value.strip_prefix("layer:") {
+                    DeepseekV4HeterogeneousFault::AfterRoutedLayer(
+                        layer
+                            .parse()
+                            .map_err(|error| format!("invalid routed layer: {error}"))?,
+                    )
+                } else {
+                    return Err(format!("unknown fault point '{value}'"));
+                });
+            }
+            "--replacement-probe" => replacement_probe = true,
+            "--fault-matrix" => fault_matrix = true,
+            "--decode-token" => {
+                decode_token = Some(
+                    args.next()
+                        .ok_or("--decode-token requires a token id")?
+                        .parse::<u32>()
+                        .map_err(|error| format!("invalid --decode-token: {error}"))?,
+                );
+            }
+            "--position" => {
+                position = args
+                    .next()
+                    .ok_or("--position requires a value")?
+                    .parse::<u32>()
+                    .map_err(|error| format!("invalid --position: {error}"))?;
+            }
+            "--compare-single" => compare_single = true,
+            "--prompt" => {
+                prompt = Some(PathBuf::from(
+                    args.next().ok_or("--prompt requires a path")?,
+                ));
+            }
+            "--generate" => {
+                generate = args
+                    .next()
+                    .ok_or("--generate requires a value")?
+                    .parse::<usize>()
+                    .map_err(|error| format!("invalid --generate: {error}"))?;
+            }
+            "--output" => {
+                output = Some(PathBuf::from(
+                    args.next().ok_or("--output requires a path")?,
+                ));
+            }
+            "--performance" => performance = true,
+            "--decode-attach-pause-ms" => {
+                decode_attach_pause = Duration::from_millis(
+                    args.next()
+                        .ok_or("--decode-attach-pause-ms requires a value")?
+                        .parse::<u64>()
+                        .map_err(|error| format!("invalid --decode-attach-pause-ms: {error}"))?,
+                );
+            }
+            "--rocprof-selected-decode" => rocprof_selected_decode = true,
+            other => return Err(format!("unknown argument '{other}'")),
+        }
+    }
+    if cycles == 0 {
+        return Err("--cycles must be nonzero".into());
+    }
+    if prompt.is_some() && decode_token.is_some() {
+        return Err("--prompt and --decode-token are mutually exclusive".into());
+    }
+    if prompt.is_some() != (generate != 0) {
+        return Err("--prompt and a nonzero --generate must be supplied together".into());
+    }
+    if output.is_some() && prompt.is_none() {
+        return Err("--output requires --prompt".into());
+    }
+    if prompt.is_some() && cycles != 1 {
+        return Err("canonical generation accepts exactly one load cycle".into());
+    }
+    if performance && compare_single {
+        return Err("--performance cannot be combined with --compare-single".into());
+    }
+    if rocprof_selected_decode && !performance {
+        return Err("--rocprof-selected-decode requires --performance".into());
+    }
+
+    let rocprof_region = if rocprof_selected_decode {
+        let region = RocprofSelectedRegion::load()?;
+        region.set(false)?;
+        Some(region)
+    } else {
+        None
+    };
+
+    let plan = DeepseekV4HeterogeneousLoadPlan::default();
+    let artifact = DeepseekV4VerifiedArtifact::verify(Path::new(&model))?;
+    let generation = if let Some(prompt_path) = prompt.as_deref() {
+        let hfq = HfqFile::open(artifact.path())
+            .map_err(|error| format!("generation tokenizer open: {error:?}"))?;
+        let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json)
+            .map_err(|error| format!("generation tokenizer: {error:?}"))?;
+        let prompt_text = std::fs::read_to_string(prompt_path)
+            .map_err(|error| format!("read prompt {}: {error}", prompt_path.display()))?;
+        let prompt_tokens = tokenizer.encode(&prompt_text);
+        if prompt_tokens.len() != 2048 {
+            return Err(format!(
+                "canonical heterogeneous prompt must encode to 2048 tokens, got {}",
+                prompt_tokens.len()
+            ));
+        }
+        Some((tokenizer, prompt_tokens))
+    } else {
+        None
+    };
+    if fault_matrix {
+        if fault.is_some() || cycles != 1 {
+            return Err("--fault-matrix cannot be combined with --fault or --cycles".into());
+        }
+        let faults = [
+            DeepseekV4HeterogeneousFault::AfterDenseWeights,
+            DeepseekV4HeterogeneousFault::AfterRoutedLayer(0),
+            DeepseekV4HeterogeneousFault::AfterRoutedLayer(42),
+            DeepseekV4HeterogeneousFault::AfterOwnershipAudit,
+            DeepseekV4HeterogeneousFault::AfterState,
+            DeepseekV4HeterogeneousFault::AfterScratch,
+        ];
+        for (index, fault) in faults.into_iter().enumerate() {
+            run_expected_failure(&artifact, &plan, index, fault)?;
+            println!(
+                "{}",
+                serde_json::to_string(&json!({
+                    "cycle": index,
+                    "status": "post_failure_vram",
+                    "fault": format!("{fault:?}"),
+                    "devices": vram_snapshot()?,
+                }))
+                .map_err(|error| error.to_string())?
+            );
+        }
+        replacement_probe = true;
+    }
+    for cycle in 0..cycles {
+        if let Some(fault) = fault {
+            run_expected_failure(&artifact, &plan, cycle, fault)?;
+            continue;
+        }
+
+        let mut loaded = Some(DeepseekV4HeterogeneousModel::load_verified(
+            &artifact,
+            plan.clone(),
+        )?);
+        if replacement_probe {
+            let before_sha = loaded
+                .as_ref()
+                .expect("loaded model missing")
+                .report
+                .model_sha256
+                .clone();
+            let replacement_error = DeepseekV4HeterogeneousModel::replace_transactionally_verified(
+                &mut loaded,
+                &artifact,
+                plan.clone(),
+            )
+            .expect_err("replacement unexpectedly fit beside the resident 73 GiB expert tier");
+            let after = loaded
+                .as_mut()
+                .ok_or("failed replacement removed the previously published model")?;
+            if after.report.model_sha256 != before_sha {
+                return Err("failed replacement changed the published model identity".into());
+            }
+            let audit = after.audit_owners()?;
+            println!(
+                "{}",
+                serde_json::to_string(&json!({
+                    "cycle": cycle,
+                    "status": "replacement_preserved",
+                    "replacement_error": replacement_error,
+                    "model_sha256": after.report.model_sha256,
+                    "ownership_violations": audit.violations,
+                }))
+                .map_err(|error| error.to_string())?
+            );
+        }
+        let mut loaded = loaded.expect("loaded model missing after replacement probe");
+        let report = &loaded.report;
+        println!(
+            "{}",
+            serde_json::to_string(&json!({
+                "cycle": cycle,
+                "status": "loaded",
+                "model_sha256": report.model_sha256,
+                "dense_arch": loaded.dense_gpu.arch,
+                "dense_device_id": loaded.dense_gpu.device_id,
+                "routed_arch": loaded.routed_gpu.arch,
+                "routed_device_id": loaded.routed_gpu.device_id,
+                "projection": {
+                    "dense_record_count": report.projection.dense_record_count,
+                    "dense_allocation_count": report.projection.dense_allocation_count,
+                    "dense_bytes": report.projection.dense_bytes,
+                    "f16_expansion_bytes": report.projection.f16_expansion_bytes,
+                    "routed_record_count": report.projection.routed_record_count,
+                    "routed_allocation_count": report.projection.routed_allocation_count,
+                    "routed_bytes": report.projection.routed_bytes,
+                    "pointer_table_bytes": report.projection.pointer_table_bytes,
+                    "host_only_record_count": report.projection.host_only_record_count,
+                    "dense_state_scratch_bytes": report.dense_state_scratch_projected_bytes,
+                },
+                "ownership": {
+                    "dense_tensor_count": report.ownership.dense_tensor_count,
+                    "dense_bytes": report.ownership.dense_bytes,
+                    "routed_tensor_count": report.ownership.routed_tensor_count,
+                    "routed_bytes": report.ownership.routed_bytes,
+                    "violations": report.ownership.violations,
+                },
+                "actual": {
+                    "dense_bytes": report.dense_actual_bytes,
+                    "routed_bytes": report.routed_actual_bytes,
+                    "dense_state_scratch_pool_bytes": report.dense_state_scratch_pool_bytes,
+                    "dense_free_before": report.dense_free_before,
+                    "dense_free_after": report.dense_free_after,
+                    "routed_free_before": report.routed_free_before,
+                    "routed_free_after": report.routed_free_after,
+                },
+            }))
+            .map_err(|error| error.to_string())?
+        );
+        let mut heterogeneous_logits = None;
+        let mut heterogeneous_generation = None;
+        if let Some((tokenizer, prompt_tokens)) = generation.as_ref() {
+            let generated = generate_heterogeneous(
+                &mut loaded,
+                prompt_tokens,
+                generate,
+                !performance,
+                decode_attach_pause,
+                rocprof_region.as_ref(),
+            )?;
+            let decoded = tokenizer.decode_bytes(&generated.tokens);
+            if let Some(output_path) = output.as_deref() {
+                std::fs::write(output_path, &decoded).map_err(|error| {
+                    format!("write generated output {}: {error}", output_path.display())
+                })?;
+            }
+            println!(
+                "{}",
+                serde_json::to_string(&json!({
+                    "cycle": cycle,
+                    "status": "generated",
+                    "prompt_tokens": prompt_tokens.len(),
+                    "generated_tokens": generated.tokens.len(),
+                    "generated_bytes": decoded.len(),
+                    "prefill_seconds": generated.prefill.as_secs_f64(),
+                    "decode_seconds": generated.decode.as_secs_f64(),
+                    "prefill_tok_s": prompt_tokens.len() as f64 / generated.prefill.as_secs_f64(),
+                    "decode_tok_s": generated.tokens.len() as f64 / generated.decode.as_secs_f64(),
+                    "certification_snapshots": !performance,
+                    "output_path": output,
+                }))
+                .map_err(|error| error.to_string())?
+            );
+            heterogeneous_generation = Some(generated);
+        } else if let Some(token_id) = decode_token {
+            let logits = loaded.decode_step(token_id, position)?;
+            let (argmax, max_logit) = logits
+                .iter()
+                .enumerate()
+                .max_by(|left, right| left.1.total_cmp(right.1))
+                .map(|(index, value)| (index, *value))
+                .ok_or("heterogeneous decode returned no logits")?;
+            let non_finite = logits.iter().filter(|value| !value.is_finite()).count();
+            println!(
+                "{}",
+                serde_json::to_string(&json!({
+                    "cycle": cycle,
+                    "status": "decoded",
+                    "token_id": token_id,
+                    "position": position,
+                    "logits": logits.len(),
+                    "argmax": argmax,
+                    "max_logit": max_logit,
+                    "non_finite": non_finite,
+                }))
+                .map_err(|error| error.to_string())?
+            );
+            heterogeneous_logits = Some(logits);
+        }
+        loaded.unload();
+        if compare_single {
+            if let Some((tokenizer, prompt_tokens)) = generation.as_ref() {
+                compare_single_generation(
+                    artifact.path(),
+                    tokenizer,
+                    prompt_tokens,
+                    generate,
+                    &heterogeneous_generation
+                        .as_ref()
+                        .ok_or("heterogeneous generation missing for single-device comparison")?
+                        .tokens,
+                    &heterogeneous_generation
+                        .as_ref()
+                        .ok_or("heterogeneous generation missing for single-device comparison")?
+                        .snapshots,
+                )?;
+            } else {
+                let token_id = decode_token
+                    .ok_or("--compare-single requires --decode-token or --prompt/--generate")?;
+                let heterogeneous_logits = heterogeneous_logits
+                    .as_deref()
+                    .ok_or("heterogeneous logits missing for single-device comparison")?;
+                compare_single_device(artifact.path(), token_id, position, heterogeneous_logits)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+struct GenerationResult {
+    tokens: Vec<u32>,
+    prefill: Duration,
+    decode: Duration,
+    snapshots: Vec<StateSnapshot>,
+}
+
+struct StateSnapshot {
+    position: usize,
+    tensors: Vec<SnapshotTensor>,
+}
+
+struct SnapshotTensor {
+    name: String,
+    exact_bits: bool,
+    values: Vec<f32>,
+}
+
+const CERTIFICATION_POSITIONS: [usize; 7] = [127, 511, 1023, 2047, 2175, 2303, 2555];
+
+fn greedy(logits: &[f32]) -> Result<u32, String> {
+    if let Some((index, _)) = logits
+        .iter()
+        .enumerate()
+        .filter(|(_, value)| value.is_finite())
+        .max_by(|left, right| left.1.total_cmp(right.1))
+    {
+        Ok(index as u32)
+    } else {
+        Err("decode returned no finite logits".into())
+    }
+}
+
+fn generate_heterogeneous(
+    model: &mut DeepseekV4HeterogeneousModel,
+    prompt: &[u32],
+    n_generate: usize,
+    certification_snapshots: bool,
+    decode_attach_pause: Duration,
+    rocprof_region: Option<&RocprofSelectedRegion>,
+) -> Result<GenerationResult, String> {
+    let prefill_start = Instant::now();
+    let mut logits = Vec::new();
+    let mut snapshots = Vec::with_capacity(CERTIFICATION_POSITIONS.len());
+    for (position, &token) in prompt.iter().enumerate() {
+        logits = model.decode_step(token, position as u32)?;
+        if certification_snapshots {
+            capture_heterogeneous_if_selected(model, position, &mut snapshots)?;
+        }
+    }
+    let prefill = prefill_start.elapsed();
+
+    if !decode_attach_pause.is_zero() {
+        eprintln!(
+            "decode_attach_ready pid={} pause_ms={}",
+            std::process::id(),
+            decode_attach_pause.as_millis()
+        );
+        std::thread::sleep(decode_attach_pause);
+    }
+
+    if let Some(region) = rocprof_region {
+        region.set(true)?;
+    }
+    let decode_start = Instant::now();
+    let mut tokens = Vec::with_capacity(n_generate);
+    tokens.push(greedy(&logits)?);
+    while tokens.len() < n_generate {
+        let position = prompt.len() + tokens.len() - 1;
+        logits = model.decode_step(tokens[tokens.len() - 1], position as u32)?;
+        if certification_snapshots {
+            capture_heterogeneous_if_selected(model, position, &mut snapshots)?;
+        }
+        tokens.push(greedy(&logits)?);
+    }
+    let decode = decode_start.elapsed();
+    if let Some(region) = rocprof_region {
+        region.set(false)?;
+    }
+    Ok(GenerationResult {
+        tokens,
+        prefill,
+        decode,
+        snapshots,
+    })
+}
+
+fn capture_heterogeneous_if_selected(
+    model: &DeepseekV4HeterogeneousModel,
+    position: usize,
+    snapshots: &mut Vec<StateSnapshot>,
+) -> Result<(), String> {
+    if CERTIFICATION_POSITIONS.contains(&position) {
+        snapshots.push(capture_state(
+            &model.dense_gpu,
+            model
+                .state
+                .as_ref()
+                .ok_or("heterogeneous state missing during certification")?,
+            position,
+        )?);
+    }
+    Ok(())
+}
+
+fn capture_single_if_selected(
+    gpu: &Gpu,
+    state: &DeepseekV4State,
+    position: usize,
+    snapshots: &mut Vec<StateSnapshot>,
+) -> Result<(), String> {
+    if CERTIFICATION_POSITIONS.contains(&position) {
+        snapshots.push(capture_state(gpu, state, position)?);
+    }
+    Ok(())
+}
+
+fn download_snapshot(
+    gpu: &Gpu,
+    tensors: &mut Vec<SnapshotTensor>,
+    name: impl Into<String>,
+    tensor: &GpuTensor,
+    exact_bits: bool,
+) -> Result<(), String> {
+    let name = name.into();
+    let values = gpu
+        .download_f32(tensor)
+        .map_err(|error| format!("certification download {name}: {error:?}"))?;
+    tensors.push(SnapshotTensor {
+        name,
+        exact_bits,
+        values,
+    });
+    Ok(())
+}
+
+fn capture_state(
+    gpu: &Gpu,
+    state: &DeepseekV4State,
+    position: usize,
+) -> Result<StateSnapshot, String> {
+    let mut tensors = Vec::new();
+    download_snapshot(
+        gpu,
+        &mut tensors,
+        "residual_streams",
+        state
+            .residual_streams
+            .as_ref()
+            .ok_or("certification residual_streams missing")?,
+        false,
+    )?;
+    download_snapshot(
+        gpu,
+        &mut tensors,
+        "kv",
+        state.kv.as_ref().ok_or("certification kv missing")?,
+        false,
+    )?;
+    download_snapshot(
+        gpu,
+        &mut tensors,
+        "final_norm",
+        state
+            .final_norm
+            .as_ref()
+            .ok_or("certification final_norm missing")?,
+        false,
+    )?;
+    download_snapshot(
+        gpu,
+        &mut tensors,
+        "attn_state_buf",
+        state
+            .attn_state_buf
+            .as_ref()
+            .ok_or("certification attn_state_buf missing")?,
+        true,
+    )?;
+    download_snapshot(
+        gpu,
+        &mut tensors,
+        "last_layer_route_ids",
+        state
+            .moe_topk_indices
+            .as_ref()
+            .ok_or("certification route ids missing")?,
+        true,
+    )?;
+    download_snapshot(
+        gpu,
+        &mut tensors,
+        "last_layer_route_weights",
+        state
+            .moe_topk_weights
+            .as_ref()
+            .ok_or("certification route weights missing")?,
+        false,
+    )?;
+
+    for layer in [0usize, 21, 42] {
+        let attention = state
+            ._attention
+            .get(layer)
+            .ok_or_else(|| format!("certification attention layer {layer} missing"))?;
+        download_snapshot(
+            gpu,
+            &mut tensors,
+            format!("layer_{layer}.swa_k"),
+            attention
+                .swa_k
+                .as_ref()
+                .ok_or_else(|| format!("certification layer {layer} swa_k missing"))?,
+            false,
+        )?;
+
+        let indexer = state
+            ._indexer
+            .get(layer)
+            .ok_or_else(|| format!("certification indexer layer {layer} missing"))?;
+        if indexer.compress_ratio > 0 {
+            let slot = position / indexer.compress_ratio as usize;
+            if let Some(cache) = indexer.main_kv_cache.as_ref() {
+                let width = *cache
+                    .shape
+                    .last()
+                    .ok_or("certification main cache has no shape")?;
+                let row = cache.sub_offset(slot * width, width);
+                download_snapshot(
+                    gpu,
+                    &mut tensors,
+                    format!("layer_{layer}.main_kv_cache[{slot}]"),
+                    &row,
+                    false,
+                )?;
+            }
+            if let Some(cache) = indexer.indexer_kv_cache.as_ref() {
+                let width = *cache
+                    .shape
+                    .last()
+                    .ok_or("certification indexer cache has no shape")?;
+                let row = cache.sub_offset(slot * width, width);
+                download_snapshot(
+                    gpu,
+                    &mut tensors,
+                    format!("layer_{layer}.indexer_kv_cache[{slot}]"),
+                    &row,
+                    false,
+                )?;
+            }
+        }
+    }
+    Ok(StateSnapshot { position, tensors })
+}
+
+fn compare_state_snapshots(
+    single: &[StateSnapshot],
+    heterogeneous: &[StateSnapshot],
+) -> Result<(), String> {
+    if single.len() != heterogeneous.len() {
+        return Err(format!(
+            "state snapshot count mismatch: single {} heterogeneous {}",
+            single.len(),
+            heterogeneous.len()
+        ));
+    }
+    for (single, heterogeneous) in single.iter().zip(heterogeneous) {
+        if single.position != heterogeneous.position
+            || single.tensors.len() != heterogeneous.tensors.len()
+        {
+            return Err(format!(
+                "state snapshot structure mismatch at {} vs {}",
+                single.position, heterogeneous.position
+            ));
+        }
+        let mut compared_values = 0usize;
+        let mut bit_mismatches = 0usize;
+        let mut max_abs = 0.0f32;
+        let mut max_rel = 0.0f32;
+        let mut worst_tensor = None;
+        let mut exact_bits_equal = true;
+        for (single_tensor, heterogeneous_tensor) in
+            single.tensors.iter().zip(&heterogeneous.tensors)
+        {
+            if single_tensor.name != heterogeneous_tensor.name
+                || single_tensor.values.len() != heterogeneous_tensor.values.len()
+                || single_tensor.exact_bits != heterogeneous_tensor.exact_bits
+            {
+                return Err(format!(
+                    "state tensor structure mismatch at position {}: {} vs {}",
+                    single.position, single_tensor.name, heterogeneous_tensor.name
+                ));
+            }
+            for (&expected, &actual) in single_tensor
+                .values
+                .iter()
+                .zip(&heterogeneous_tensor.values)
+            {
+                compared_values += 1;
+                if expected.to_bits() != actual.to_bits() {
+                    bit_mismatches += 1;
+                    if single_tensor.exact_bits {
+                        exact_bits_equal = false;
+                    }
+                }
+                if !expected.is_finite() || !actual.is_finite() {
+                    if expected.to_bits() != actual.to_bits() {
+                        return Err(format!(
+                            "non-finite state mismatch at position {} tensor {}",
+                            single.position, single_tensor.name
+                        ));
+                    }
+                    continue;
+                }
+                let abs = (expected - actual).abs();
+                let rel = abs / expected.abs().max(1.0e-12);
+                if abs > max_abs {
+                    max_abs = abs;
+                    worst_tensor = Some(single_tensor.name.as_str());
+                }
+                max_rel = max_rel.max(rel);
+            }
+        }
+        println!(
+            "{}",
+            serde_json::to_string(&json!({
+                "status": "state_oracle",
+                "position": single.position,
+                "tensors": single.tensors.len(),
+                "values": compared_values,
+                "bit_mismatches": bit_mismatches,
+                "exact_bits_equal": exact_bits_equal,
+                "max_abs": max_abs,
+                "max_rel": max_rel,
+                "worst_tensor": worst_tensor,
+            }))
+            .map_err(|error| error.to_string())?
+        );
+        if !exact_bits_equal {
+            return Err(format!(
+                "exact state/routing bits differ at position {}",
+                single.position
+            ));
+        }
+        if max_abs > 1.0e-3 {
+            return Err(format!(
+                "state numerical delta {} exceeds 1e-3 at position {} ({:?})",
+                max_abs, single.position, worst_tensor
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn compare_single_generation(
+    model: &Path,
+    tokenizer: &Tokenizer,
+    prompt: &[u32],
+    n_generate: usize,
+    heterogeneous: &[u32],
+    heterogeneous_snapshots: &[StateSnapshot],
+) -> Result<(), String> {
+    let mut hfq = HfqFile::open(model).map_err(|error| format!("single oracle open: {error:?}"))?;
+    let mut cfg = DeepseekV4::config_from_hfq(&hfq)?;
+    cfg.load_dspark = false;
+    let mut gpu = Gpu::init_with_device(1)
+        .map_err(|error| format!("single oracle gfx1151 init: {error:?}"))?;
+    if gpu.arch != "gfx1151" {
+        return Err(format!(
+            "single oracle device 1 resolved to {}, expected gfx1151",
+            gpu.arch
+        ));
+    }
+    let weights = DeepseekV4::load_weights(&mut hfq, &cfg, &mut gpu)?;
+    let mut state = DeepseekV4State::new(&cfg)?;
+
+    let prefill_start = Instant::now();
+    let mut logits = Vec::new();
+    let mut single_snapshots = Vec::with_capacity(CERTIFICATION_POSITIONS.len());
+    for (position, &token) in prompt.iter().enumerate() {
+        logits =
+            forward::decode_step(&cfg, &weights, &mut state, &mut gpu, token, position as u32)?;
+        capture_single_if_selected(&gpu, &state, position, &mut single_snapshots)?;
+    }
+    let prefill = prefill_start.elapsed();
+    let decode_start = Instant::now();
+    let mut single = Vec::with_capacity(n_generate);
+    single.push(greedy(&logits)?);
+    while single.len() < n_generate {
+        let position = prompt.len() + single.len() - 1;
+        logits = forward::decode_step(
+            &cfg,
+            &weights,
+            &mut state,
+            &mut gpu,
+            single[single.len() - 1],
+            position as u32,
+        )?;
+        capture_single_if_selected(&gpu, &state, position, &mut single_snapshots)?;
+        single.push(greedy(&logits)?);
+    }
+    let decode = decode_start.elapsed();
+
+    let first_mismatch = single
+        .iter()
+        .zip(heterogeneous)
+        .position(|(expected, actual)| expected != actual);
+    let single_bytes = tokenizer.decode_bytes(&single);
+    let heterogeneous_bytes = tokenizer.decode_bytes(heterogeneous);
+    println!(
+        "{}",
+        serde_json::to_string(&json!({
+            "status": "single_generation_oracle",
+            "single_device_id": gpu.device_id,
+            "single_arch": gpu.arch,
+            "prompt_tokens": prompt.len(),
+            "generated_tokens": single.len(),
+            "generated_bytes": single_bytes.len(),
+            "prefill_seconds": prefill.as_secs_f64(),
+            "decode_seconds": decode.as_secs_f64(),
+            "prefill_tok_s": prompt.len() as f64 / prefill.as_secs_f64(),
+            "decode_tok_s": single.len() as f64 / decode.as_secs_f64(),
+            "first_token_mismatch": first_mismatch,
+            "tokens_equal": single == heterogeneous,
+            "bytes_equal": single_bytes == heterogeneous_bytes,
+        }))
+        .map_err(|error| error.to_string())?
+    );
+    compare_state_snapshots(&single_snapshots, heterogeneous_snapshots)?;
+
+    state.free_gpu(&mut gpu);
+    weights.free_gpu(&mut gpu);
+    gpu.invalidate_weight_caches();
+    gpu.invalidate_graph_state();
+    gpu.drain_pool();
+    if single != heterogeneous || single_bytes != heterogeneous_bytes {
+        return Err(format!(
+            "heterogeneous generation differs from single gfx1151 at token {:?}",
+            first_mismatch
+        ));
+    }
+    Ok(())
+}
+
+fn compare_single_device(
+    model: &Path,
+    token_id: u32,
+    position: u32,
+    heterogeneous: &[f32],
+) -> Result<(), String> {
+    let mut hfq = HfqFile::open(model).map_err(|error| format!("single oracle open: {error:?}"))?;
+    let mut cfg = DeepseekV4::config_from_hfq(&hfq)?;
+    cfg.load_dspark = false;
+    let mut gpu = Gpu::init_with_device(1)
+        .map_err(|error| format!("single oracle gfx1151 init: {error:?}"))?;
+    if gpu.arch != "gfx1151" {
+        return Err(format!(
+            "single oracle device 1 resolved to {}, expected gfx1151",
+            gpu.arch
+        ));
+    }
+    let weights = DeepseekV4::load_weights(&mut hfq, &cfg, &mut gpu)?;
+    let mut state = DeepseekV4State::new(&cfg)?;
+    let single = forward::decode_step(&cfg, &weights, &mut state, &mut gpu, token_id, position)?;
+
+    if single.len() != heterogeneous.len() {
+        return Err(format!(
+            "single oracle logits length {} != heterogeneous {}",
+            single.len(),
+            heterogeneous.len()
+        ));
+    }
+    let mut bit_mismatches = 0usize;
+    let mut first_mismatch = None;
+    let mut max_abs = 0.0f32;
+    let mut max_rel = 0.0f32;
+    for (index, (&expected, &actual)) in single.iter().zip(heterogeneous).enumerate() {
+        if expected.to_bits() != actual.to_bits() {
+            bit_mismatches += 1;
+            first_mismatch.get_or_insert(index);
+        }
+        let abs = (expected - actual).abs();
+        max_abs = max_abs.max(abs);
+        max_rel = max_rel.max(abs / expected.abs().max(1.0e-12));
+    }
+    let single_argmax = single
+        .iter()
+        .enumerate()
+        .max_by(|left, right| left.1.total_cmp(right.1))
+        .map(|(index, _)| index)
+        .ok_or("single oracle returned no logits")?;
+    let heterogeneous_argmax = heterogeneous
+        .iter()
+        .enumerate()
+        .max_by(|left, right| left.1.total_cmp(right.1))
+        .map(|(index, _)| index)
+        .ok_or("heterogeneous route returned no logits")?;
+    println!(
+        "{}",
+        serde_json::to_string(&json!({
+            "status": "single_oracle",
+            "token_id": token_id,
+            "position": position,
+            "single_device_id": gpu.device_id,
+            "single_arch": gpu.arch,
+            "logits": single.len(),
+            "bit_mismatches": bit_mismatches,
+            "first_mismatch": first_mismatch,
+            "max_abs": max_abs,
+            "max_rel": max_rel,
+            "single_argmax": single_argmax,
+            "heterogeneous_argmax": heterogeneous_argmax,
+            "argmax_equal": single_argmax == heterogeneous_argmax,
+        }))
+        .map_err(|error| error.to_string())?
+    );
+
+    state.free_gpu(&mut gpu);
+    weights.free_gpu(&mut gpu);
+    gpu.invalidate_weight_caches();
+    gpu.invalidate_graph_state();
+    gpu.drain_pool();
+    if single_argmax != heterogeneous_argmax {
+        return Err("heterogeneous route argmax differs from the single-gfx1151 oracle".into());
+    }
+    Ok(())
+}
+
+fn run_expected_failure(
+    artifact: &DeepseekV4VerifiedArtifact,
+    plan: &DeepseekV4HeterogeneousLoadPlan,
+    cycle: usize,
+    fault: DeepseekV4HeterogeneousFault,
+) -> Result<(), String> {
+    let error =
+        match DeepseekV4HeterogeneousModel::load_verified_with_fault(artifact, plan.clone(), fault)
+        {
+            Ok(_) => return Err(format!("fault injection {fault:?} unexpectedly succeeded")),
+            Err(error) => error,
+        };
+    println!(
+        "{}",
+        serde_json::to_string(&json!({
+            "cycle": cycle,
+            "status": "expected_failure",
+            "fault": format!("{fault:?}"),
+            "error": error,
+        }))
+        .map_err(|error| error.to_string())?
+    );
+    Ok(())
+}
+
+fn vram_snapshot() -> Result<Vec<serde_json::Value>, String> {
+    let hip = HipRuntime::load().map_err(|error| format!("load HIP for VRAM snapshot: {error}"))?;
+    let count = hip
+        .device_count()
+        .map_err(|error| format!("device count for VRAM snapshot: {error}"))?;
+    let mut rows = Vec::new();
+    for device_id in 0..count {
+        hip.set_device(device_id)
+            .map_err(|error| format!("bind device {device_id} for VRAM snapshot: {error}"))?;
+        let arch = hip
+            .get_arch(device_id)
+            .map_err(|error| format!("device {device_id} architecture: {error}"))?;
+        let (free, total) = hip
+            .get_vram_info()
+            .map_err(|error| format!("device {device_id} VRAM snapshot: {error}"))?;
+        rows.push(json!({
+            "device_id": device_id,
+            "arch": arch,
+            "used_bytes": total.saturating_sub(free),
+            "free_bytes": free,
+            "total_bytes": total,
+        }));
+    }
+    Ok(rows)
+}

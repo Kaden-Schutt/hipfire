@@ -1,0 +1,1 @@
+Reply with exactly READY. Do not call any tool.

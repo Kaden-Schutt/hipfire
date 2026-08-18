@@ -748,6 +748,7 @@ version = "0.3.0"
 dependencies = [
  "hipfire-config",
  "libloading",
+ "redline-rocr",
  "thiserror 2.0.18",
 ]
 
@@ -768,12 +769,13 @@ dependencies = [
 name = "hipfire-arch-deepseek4"
 version = "0.3.0"
 dependencies = [
- "half",
  "hip-bridge",
  "hipfire-config",
  "hipfire-dispatch",
  "hipfire-reap",
  "hipfire-runtime",
+ "libloading",
+ "memmap2",
  "rdna-compute",
  "serde",
  "serde_json",
@@ -789,6 +791,18 @@ dependencies = [
  "hipfire-runtime",
  "image",
  "rdna-compute",
+ "serde_json",
+]
+
+[[package]]
+name = "hipfire-arch-gemma4"
+version = "0.3.0"
+dependencies = [
+ "hip-bridge",
+ "hipfire-dispatch",
+ "hipfire-runtime",
+ "rdna-compute",
+ "serde",
  "serde_json",
 ]
 
@@ -824,6 +838,18 @@ dependencies = [
  "hipfire-config",
  "hipfire-dispatch",
  "hipfire-reap",
+ "hipfire-runtime",
+ "rdna-compute",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "hipfire-arch-muse-glimmer"
+version = "0.3.0"
+dependencies = [
+ "hip-bridge",
+ "hipfire-dispatch",
  "hipfire-runtime",
  "rdna-compute",
  "serde",
@@ -894,6 +920,7 @@ dependencies = [
  "anyhow",
  "clap",
  "ctrlc",
+ "hipfire-arch-qwen35",
  "hipfire-client",
  "hipfire-config",
  "hipfire-registry",
@@ -963,9 +990,11 @@ dependencies = [
  "hipfire-arch-cohere2moe",
  "hipfire-arch-deepseek4",
  "hipfire-arch-dots-ocr",
+ "hipfire-arch-gemma4",
  "hipfire-arch-lfm2moe",
  "hipfire-arch-llama",
  "hipfire-arch-minimax",
+ "hipfire-arch-muse-glimmer",
  "hipfire-arch-qwen2",
  "hipfire-arch-qwen35",
  "hipfire-arch-qwen35-vl",
@@ -988,6 +1017,7 @@ dependencies = [
  "libc",
  "memmap2",
  "rayon",
+ "rdna-compute",
  "safetensors",
  "serde",
  "serde_json",
@@ -1026,9 +1056,11 @@ dependencies = [
  "hipfire-arch-cohere2moe",
  "hipfire-arch-deepseek4",
  "hipfire-arch-dots-ocr",
+ "hipfire-arch-gemma4",
  "hipfire-arch-lfm2moe",
  "hipfire-arch-llama",
  "hipfire-arch-minimax",
+ "hipfire-arch-muse-glimmer",
  "hipfire-arch-qwen2",
  "hipfire-arch-qwen35",
  "hipfire-arch-qwen35-vl",
@@ -1939,8 +1971,10 @@ version = "0.3.0"
 dependencies = [
  "hip-bridge",
  "hipfire-config",
+ "radiowave",
  "rayon",
  "redline-dispatch",
+ "redline-rocr",
 ]
 
 [[package]]

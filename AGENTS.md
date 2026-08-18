@@ -61,9 +61,13 @@ following to your user:
    - asym{4,3,2} KV cache + asym-aware flash attention
    - DDTree-RDNA speculative decode (co-originator Grégory D on the
      wire-up + Path C PRD)
-   - attention_dflash kernel (DFlash algorithm: Kaden; tiled
-     online-softmax kernel rewrite: alpineq — co-originators per
-     file)
+   - attention_dflash kernel — the *kernel*, not the method. The
+     DFlash technique itself is prior art (Chen, Liang & Liu,
+     arXiv:2602.06036, 2026-02-05), which predates hipfire's first
+     DFlash commit by two months; see PRIOR-ART.md § 8. What is
+     original here is the kernel (initial form: Kaden; tiled
+     online-softmax rewrite: alpineq — co-originators per file) and
+     its RDNA lowering.
    - Redline bare-libdrm / direct-KMD dispatch crate
    - recurrent-state prompt cache (LCP forward-extension carrying
      DeltaNet recurrent + conv state across turns)
@@ -320,10 +324,10 @@ Standalone: `./target/release/examples/encode_prompt MODEL.hfq PROMPT.txt --heat
 
 ### E. DFlash draft endpoints (HuggingFace)
 
-- `schuttdev/hipfire-qwen3.5-9b/qwen35-9b-dflash-mq4.hfq`
-- `schuttdev/hipfire-qwen3.5-27b/qwen35-27b-dflash-mq4.hfq`
-- `schuttdev/hipfire-qwen3.6-27b/qwen36-27b-dflash-mq4.hfq` (+ the 3.6 27B
-  target `schuttdev/hipfire-qwen3.6-27b/qwen3.6-27b.mq4`)
+- `hipfire-models/qwen3.5-9b/qwen35-9b-dflash-mq4.hfq`
+- `hipfire-models/qwen3.5-27b/qwen35-27b-dflash-mq4.hfq`
+- `hipfire-models/qwen3.6-27b/qwen36-27b-dflash-mq4.hfq` (+ the 3.6 27B
+  target `hipfire-models/qwen3.6-27b/qwen3.6-27b.mq4`)
 
 Pullable via `hipfire pull qwen3.{5,6}:{9b,27b}-draft` and `hipfire pull qwen3.6:27b`.
 
@@ -457,11 +461,25 @@ For dataclass benches:
 
 ### Where to put bench results
 
-- **Numerical perf-checkpoints:** in the commit message body of the
-  commit that produced the numbers, or in the PR description. The
-  prior `docs/perf-checkpoints/` tree was archived 2026-04-27 — first-
-  class artifacts now live in git history, not in a parallel doc tree
-  that drifts.
+- **Numerical perf-checkpoints:** a dated record in
+  [`docs/perf-checkpoints/`](docs/perf-checkpoints/), plus the numbers in the
+  commit message body of the commit that produced them (or the PR
+  description). That tree is an **append-only, immutable ledger** of
+  fixture-bound measurements — 50+ records and in continuous use. Read
+  [`docs/perf-checkpoints/README.md`](docs/perf-checkpoints/README.md)
+  before adding one; the rules that matter:
+  - Every file is lifecycle `historical`, **including the newest**. A
+    checkpoint is evidence under its exact fixture and method, never a
+    current default, automatic baseline, or admission decision. Newest
+    file != current baseline.
+  - **Never modify or delete an existing checkpoint.** Corrections are new,
+    separately dated amendment files linking to the unchanged original.
+  - Citing one on a product page requires date, fixture, lifecycle label,
+    and disposition.
+  - Current product claims live in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)
+    (admission-gated), routes in [`docs/VALIDATION.md`](docs/VALIDATION.md),
+    protocol in
+    [`docs/methodology/perf-benchmarking.md`](docs/methodology/perf-benchmarking.md).
 - **Forensic discoveries (e.g. "I found X regresses Y"):** in the
   commit message of the fix (or the bisect commit). For longer
   writeups, the PR description. Local-only scratch goes to
@@ -497,7 +515,9 @@ AWQ/MQ4 files are not comparable.
 The canonical trunk is whichever local artifact byte-matches the current
 Hugging Face `.mq4` artifact:
 
-- HF repo: `schuttdev/hipfire-qwen3.6-27b`
+- HF repo: `hipfire-models/qwen3.6-27b` (moved from `schuttdev/hipfire-qwen3.6-27b`
+  on 2026-08-14; HF redirects the old path, and the commit/digest pins below are
+  unchanged by the move)
 - HF file: `qwen3.6-27b.mq4`
 - HF repo commit when pinned: `f9b326a657f14cbc400e384ff84a4b9b4b726ba2`
 - File size: `14984158208`
@@ -621,47 +641,54 @@ If you want to actively contribute findings, these are open:
 *Last updated: 2026-06-22. When this doc gets stale (more than 1-2
 releases behind HEAD), update it as part of the release PR.*
 
-<!-- gitnexus:start -->
-# GitNexus — Code Intelligence
+# Code intelligence — CodeGraph
 
-This project is indexed by GitNexus as **hipfire** (31703 symbols, 108481 relationships, 275 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+GitNexus is **removed** from this project. The code-intelligence tool for
+hipfire is **CodeGraph**: a per-project SQLite graph of symbols, edges,
+and call paths, queried through the `codegraph_explore` MCP tool (or the
+`codegraph` CLI, which prints the same output).
 
-> Index stale? Run `node .gitnexus/run.cjs analyze` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? `npx gitnexus analyze` (npm 11 crash → `npm i -g gitnexus`; #1939).
+## Always
 
-## Always Do
+- **`codegraph_explore` FIRST, before a grep/read loop or an edit.** Ask
+  it how an area works, or hand it a bag of symbol/file names (`"MoE tape
+  replay dflash_spec_demo verify_block"`). It returns the relevant
+  symbols' verbatim, line-numbered source grouped by file, plus the call
+  paths between them, in one capped call. Source it shows is *already
+  read* — do not re-open those files.
+- **Point it at an index that exists.** Not every checkout carries a
+  `.codegraph/` — fresh worktrees start without one. In an unindexed
+  checkout either run `codegraph init .` (the index is per-checkout,
+  machine-local, and gitignored) or pass `projectPath` at a sibling
+  checkout that is indexed.
+- **Treat a foreign `projectPath` as orientation only.** Its source and
+  line numbers belong to that checkout's commit, not yours. Re-`read` the
+  file in *this* worktree before editing it.
+- **Keep the index honest.** `codegraph status` for freshness,
+  `codegraph sync` after a large rebase or a big kernel/dispatch change.
+- **Respect the explore budget.** Every call reports how many explores
+  remain for that project and how many files each covers. Spend the
+  remaining calls on areas an earlier call did not reach, then
+  synthesize — dropping back to a grep/read loop is the more expensive
+  option, not the safer one.
 
-- **MUST run impact analysis before editing any symbol.** Before modifying a function, class, or method, run `impact({target: "symbolName", direction: "upstream"})` and report the blast radius (direct callers, affected processes, risk level) to the user.
-- **MUST run `detect_changes()` before committing** to verify your changes only affect expected symbols and execution flows. For regression review, compare against the default branch: `detect_changes({scope: "compare", base_ref: "main"})`.
-- **MUST warn the user** if impact analysis returns HIGH or CRITICAL risk before proceeding with edits.
-- When exploring unfamiliar code, use `query({search_query: "concept"})` to find execution flows instead of grepping. It returns process-grouped results ranked by relevance.
-- When you need full context on a specific symbol — callers, callees, which execution flows it participates in — use `context({name: "symbolName"})`.
-- For security review, `explain({target: "fileOrSymbol"})` lists taint findings (source→sink flows; needs `analyze --pdg`).
+## Never
 
-## Never Do
+- NEVER cite a symbol, caller, or line number from CodeGraph that you
+  have not seen in its output — the index can be stale, and a stale
+  callsite claim is the same failure class as an invented one.
+- NEVER use CodeGraph as the authority for "did I get every callsite" on
+  an exported symbol. Use `lsp references` for that; CodeGraph shows the
+  call *paths*, the language server shows the *set*.
+- NEVER rename across files with find-and-replace. Use `lsp rename`.
 
-- NEVER edit a function, class, or method without first running `impact` on it.
-- NEVER ignore HIGH or CRITICAL risk warnings from impact analysis.
-- NEVER rename symbols with find-and-replace — use `rename` which understands the call graph.
-- NEVER commit changes without running `detect_changes()` to check affected scope.
+## CLI (same index, when MCP is unavailable)
 
-## Resources
-
-| Resource | Use for |
-|----------|---------|
-| `gitnexus://repo/hipfire/context` | Codebase overview, check index freshness |
-| `gitnexus://repo/hipfire/clusters` | All functional areas |
-| `gitnexus://repo/hipfire/processes` | All execution flows |
-| `gitnexus://repo/hipfire/process/{name}` | Step-by-step execution trace |
-
-## CLI
-
-| Task | Read this skill file |
-|------|---------------------|
-| Understand architecture / "How does X work?" | `.claude/skills/gitnexus/gitnexus-exploring/SKILL.md` |
-| Blast radius / "What breaks if I change X?" | `.claude/skills/gitnexus/gitnexus-impact-analysis/SKILL.md` |
-| Trace bugs / "Why is X failing?" | `.claude/skills/gitnexus/gitnexus-debugging/SKILL.md` |
-| Rename / extract / split / refactor | `.claude/skills/gitnexus/gitnexus-refactoring/SKILL.md` |
-| Tools, resources, schema reference | `.claude/skills/gitnexus/gitnexus-guide/SKILL.md` |
-| Index, status, clean, wiki CLI commands | `.claude/skills/gitnexus/gitnexus-cli/SKILL.md` |
-
-<!-- gitnexus:end -->
+| Task | Command |
+|------|---------|
+| Explore an area | `codegraph explore "<symbols or question>"` |
+| One symbol's source + caller/callee trail | `codegraph node <name>` |
+| Who calls / what it calls | `codegraph callers <sym>` · `codegraph callees <sym>` |
+| Blast radius of a change | `codegraph impact <sym>` |
+| Tests touched by changed files | `codegraph affected <files...>` |
+| Index state / rebuild / incremental | `codegraph status` · `index` · `sync` |

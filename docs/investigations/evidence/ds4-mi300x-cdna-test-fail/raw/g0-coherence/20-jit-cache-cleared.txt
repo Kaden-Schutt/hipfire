@@ -1,0 +1,13 @@
+JIT caches cleared (moved aside, not deleted)
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/20-jit-cache-cwd-20260801T135117Z.aside:
+total 24
+drwxr-xr-x 3 root root  4096 Aug  1 12:45 .
+drwxr-xr-x 4 root root  4096 Aug  1 13:51 ..
+drwxr-xr-x 2 root root 16384 Aug  1 12:52 gfx942
+
+/mnt/scratch/hipfire-evidence/ds4-mi300x-agentmaxx/g0-coherence/20-jit-cache-root-20260801T135117Z.aside:
+total 28
+drwxr-xr-x 3 root root  4096 Aug  1 09:10 .
+drwxr-xr-x 4 root root  4096 Aug  1 13:51 ..
+drwxr-xr-x 2 root root 20480 Aug  1 13:48 gfx942
+JIT still clear

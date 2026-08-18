@@ -238,20 +238,14 @@ impl Gfx10Pm4CommandBuffer {
 
     /// Select the resource-distribution bits used by subsequently encoded
     /// dispatches. Occupancy limits remain unlimited for every policy.
-    pub fn with_resource_limits_policy(
-        mut self,
-        policy: Gfx11ComputeResourceLimitsPolicy,
-    ) -> Self {
+    pub fn with_resource_limits_policy(mut self, policy: Gfx11ComputeResourceLimitsPolicy) -> Self {
         self.resource_limits_policy = policy;
         self
     }
 
     /// Program a GFX11 dispatch-interleave queue preamble when requested.
     /// `None` preserves the queue/firmware value byte-for-byte.
-    pub fn with_dispatch_interleave(
-        mut self,
-        interleave: Option<Gfx11DispatchInterleave>,
-    ) -> Self {
+    pub fn with_dispatch_interleave(mut self, interleave: Option<Gfx11DispatchInterleave>) -> Self {
         if let Some(interleave) = interleave {
             self.set_sh_regs(COMPUTE_DISPATCH_INTERLEAVE, &[interleave.threads()]);
         }
@@ -432,6 +426,18 @@ impl Gfx10Pm4CommandBuffer {
         ]);
     }
 
+    /// Publish `value` at `address` after prior compute completes, then stall
+    /// this queue until the word equals `value`.
+    ///
+    /// Emits Mesa's RELEASE_MEM fence shape followed by WAIT_REG_MEM on the
+    /// same word. Does not emit EVENT_WRITE / CS_PARTIAL_FLUSH.
+    pub fn dependency_fence(&mut self, address: u64, value: u32) {
+        debug_assert_ne!(address, 0);
+        debug_assert_eq!(address & 3, 0);
+        self.release_memory_value(address, value);
+        self.wait_memory_value(address, value);
+    }
+
     /// Append one HSA-ABI dispatch, explicitly materializing gfx10's enabled
     /// implicit user SGPRs.
     pub fn dispatch(
@@ -548,6 +554,31 @@ impl Gfx10Pm4CommandBuffer {
 
     pub fn dwords(&self) -> &[u32] {
         &self.dwords
+    }
+
+    /// Count retained type-3 packets by `(opcode, packet_dwords)`.
+    ///
+    /// This is diagnostic-only: it parses the already-built stream and never
+    /// changes packet selection or register state.
+    pub fn packet_census(&self) -> Result<BTreeMap<(u32, u32), usize>, usize> {
+        let mut census = BTreeMap::new();
+        let mut cursor = 0usize;
+        while cursor < self.dwords.len() {
+            let header = self.dwords[cursor];
+            if header >> 30 != 3 {
+                return Err(cursor);
+            }
+            let body_dwords = ((header >> 16) & 0x3fff) + 1;
+            let packet_dwords = body_dwords + 1;
+            let next = cursor.checked_add(packet_dwords as usize).ok_or(cursor)?;
+            if next > self.dwords.len() {
+                return Err(cursor);
+            }
+            let opcode = (header >> 8) & 0xff;
+            *census.entry((opcode, packet_dwords)).or_default() += 1;
+            cursor = next;
+        }
+        Ok(census)
     }
 
     fn set_sh_regs(&mut self, first: u32, values: &[u32]) {
@@ -765,8 +796,7 @@ mod tests {
             (Gfx11DispatchInterleave::Threads256, 256),
             (Gfx11DispatchInterleave::Threads512, 512),
         ] {
-            let commands =
-                Gfx10Pm4CommandBuffer::new().with_dispatch_interleave(Some(policy));
+            let commands = Gfx10Pm4CommandBuffer::new().with_dispatch_interleave(Some(policy));
             assert_eq!(
                 commands.dwords(),
                 &[
@@ -898,6 +928,39 @@ mod tests {
     }
 
     #[test]
+    fn dependency_fence_is_release_then_wait_without_event_write() {
+        let address = 0x1234_5678_9abc_def0;
+        let mut commands = Gfx10Pm4CommandBuffer::new();
+        commands.dependency_fence(address, 7);
+        assert_eq!(
+            commands.dwords(),
+            &[
+                0xc006_4900,
+                0x528,
+                0x2300_0000,
+                0x9abc_def0,
+                0x1234_5678,
+                7,
+                0,
+                0,
+                0xc005_3c00,
+                0x13,
+                0x9abc_def0,
+                0x1234_5678,
+                7,
+                u32::MAX,
+                4,
+            ]
+        );
+        assert!(
+            !commands
+                .dwords()
+                .contains(&packet3(PACKET3_EVENT_WRITE, 1, false))
+        );
+        assert!(!commands.ends_with_compute_idle());
+    }
+
+    #[test]
     fn confirmed_write_reuses_an_explicit_compute_idle_boundary() {
         let address = 0x1234_5678_9abc_def0;
         let mut commands = Gfx10Pm4CommandBuffer::new();
@@ -906,13 +969,7 @@ mod tests {
         commands.write_memory_value_after_idle(address, 9);
         assert_eq!(
             &commands.dwords()[2..],
-            &[
-                0xc003_3700,
-                0x0010_0500,
-                0x9abc_def0,
-                0x1234_5678,
-                9,
-            ]
+            &[0xc003_3700, 0x0010_0500, 0x9abc_def0, 0x1234_5678, 9,]
         );
         assert!(!commands.ends_with_compute_idle());
     }
@@ -931,5 +988,25 @@ mod tests {
             .dispatch_image(&image, geometry, 0, &[0, 0, 0, 0, 4, 5])
             .unwrap();
         assert_eq!(commands.len_dwords(), first * 2);
+    }
+
+    #[test]
+    fn packet_census_accounts_for_every_type3_dword() {
+        let geometry = LaunchGeometry::new([1, 1, 1], [1, 1, 1]).unwrap();
+        let image = image(0x409);
+        let mut commands = Gfx10Pm4CommandBuffer::new_stateful();
+        commands
+            .dispatch_image(&image, geometry, 0, &[0, 0, 0, 0, 4, 5])
+            .unwrap();
+        commands.wait_compute_idle();
+
+        let census = commands.packet_census().unwrap();
+        let accounted = census
+            .iter()
+            .map(|((_, packet_dwords), count)| *packet_dwords as usize * count)
+            .sum::<usize>();
+        assert_eq!(accounted, commands.dwords().len());
+        assert_eq!(census.get(&(PACKET3_DISPATCH_DIRECT, 5)), Some(&1));
+        assert_eq!(census.get(&(PACKET3_EVENT_WRITE, 2)), Some(&1));
     }
 }

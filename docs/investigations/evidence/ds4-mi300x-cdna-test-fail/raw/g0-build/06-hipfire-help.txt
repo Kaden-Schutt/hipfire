@@ -1,0 +1,33 @@
+Native Rust control plane for hipfire. Configuration, registry, model lifecycle, serving, chat, and diagnostics are implemented without a JavaScript runtime.
+
+Usage: hipfire [COMMAND]
+
+Commands:
+  config       Read and edit typed TOML configuration
+  registry     Inspect or refresh the signed-model-registry migration surface
+  list         List local models and optionally the remote registry
+  pull         Download and verify a registered model and its sidecars
+  rm           Remove a local model and registered sidecars
+  tui          Launch the Rust terminal UI
+  diag         Report local GPU/runtime/model/control-plane readiness
+  ps           Show the native service process and loaded model
+  bench        Benchmark a model through the native daemon protocol
+  profile      Report compiled kernel inventory for the detected architecture
+  version      Print build, source-checkout, and installed-daemon identity
+  update       Update to a branch, tag, or commit and rebuild the native control plane
+  setup        Install or repair this machine's hipfire runtime
+  quantize     Quantize a Hugging Face or local model with the Rust quantizer
+  sidecar-gen  Generate a TriAttention calibration sidecar
+  run          Generate text through a fresh native daemon process
+  chat         Start an interactive conversation through the native HTTP service
+  serve        Start the native OpenAI-compatible HTTP service
+  stop         Stop a detached native serve process
+  restart      Stop and start the native HTTP service
+  help         Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version

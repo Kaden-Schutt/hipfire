@@ -1,0 +1,1 @@
+A GPU kernel is a function or small program written by a user that is executed in parallel across many threads on the GPU's cores. It defines the computation to be performed by each individual thread, typically operating on a single element of a large data array.

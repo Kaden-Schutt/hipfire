@@ -123,6 +123,7 @@ impl DsparkBody for Deepseek4DsparkBody {
             markov_w1: weights.markov_w1.as_ref().map(|t| t.shallow_clone()),
             markov_w2: weights.markov_w2.as_ref().map(|t| t.shallow_clone()),
             confidence_proj: weights.confidence_proj.as_ref().map(|t| t.shallow_clone()),
+            draft_head: None,
         };
 
         forward::dspark_run_body_and_hc_gate(
@@ -152,6 +153,10 @@ impl DsparkBody for Deepseek4DsparkBody {
         // only advisory (DsparkDrafter uses its own stored block). Return the
         // V4-Flash default (5) as a safe fallback.
         5
+    }
+
+    fn persistent_verify_context_scratch(&self) -> bool {
+        true
     }
 
     fn reset_for_retry(&mut self, gpu: &mut Gpu) {
@@ -315,6 +320,7 @@ pub fn build_deepseek4_dspark_speculator(
         ctx_capacity,
         conf_threshold,
         supports_temp,
+        0.45,
     ))
 }
 
@@ -364,6 +370,8 @@ mod tests {
             num_hash_layers: 0,
             reap_keep: None,
             load_dspark: true,
+            mq2r: false,
+            mq2rxt: false,
         }
     }
 
@@ -474,8 +482,17 @@ mod tests {
             d2t: None,
         };
 
-        let mut spec =
-            build_dspark_speculator(body, core_weights, stage_norm, lm_head, 2, 8, 0.3, false);
+        let mut spec = build_dspark_speculator(
+            body,
+            core_weights,
+            stage_norm,
+            lm_head,
+            2,
+            8,
+            0.3,
+            false,
+            0.45,
+        );
         // Dirtied rings are inside the body; reset must free them (no panic).
         let _ = spec.reset(&mut gpu);
         spec.free(&mut gpu);

@@ -1,0 +1,9 @@
+=== warm exit=4 ===
+{"type":"commit_ready","id":"g0-base-warm","tokens":16,"tok_s":2.304479331700994,"prompt_tokens":2052,"prefill_tokens":2052,"cached_tokens":0,"prefill_ms":24318,"total_ms":31262,"finish_reason":"length","drafter":"ar","attempt_id":1}
+=== m1 exit=0 ===
+{"type":"commit_ready","id":"g0-base-m1","tokens":510,"tok_s":2.0288494434587507,"prompt_tokens":2052,"prefill_tokens":2052,"cached_tokens":0,"prefill_ms":20825,"total_ms":272200,"finish_reason":"length","drafter":"ar","attempt_id":1}
+=== m2 exit=0 ===
+{"type":"commit_ready","id":"g0-base-m2","tokens":510,"tok_s":2.028809089064719,"prompt_tokens":2052,"prefill_tokens":2052,"cached_tokens":0,"prefill_ms":20832,"total_ms":272211,"finish_reason":"length","drafter":"ar","attempt_id":1}
+=== m3 exit=0 ===
+{"type":"commit_ready","id":"g0-base-m3","tokens":510,"tok_s":2.0293741967060472,"prompt_tokens":2052,"prefill_tokens":2052,"cached_tokens":0,"prefill_ms":20836,"total_ms":272145,"finish_reason":"length","drafter":"ar","attempt_id":1}
+ALLDONE

@@ -467,7 +467,18 @@ fn launch(gpu: &mut Gpu, key: KernelKey, p: &GemvParams) -> Result<(), DispatchE
         };
     }
     match key {
-        K::GemvF32 => hip!(gpu.gemv_f32(w.buf, x, y)),
+        K::GemvF32 => {
+            // WeightRef is the source of truth for matrix shape. Some valid
+            // buffers are aliases of a 1-D allocation (notably a tied F32
+            // embedding/lm_head), so asking gemv_f32 to infer M/K from the
+            // allocation's incidental GpuTensor shape panics at shape[1].
+            let matrix = GpuTensor {
+                buf: unsafe { w.buf.buf.alias() },
+                shape: vec![m, k],
+                dtype: DType::F32,
+            };
+            hip!(gpu.gemv_f32(&matrix, x, y))
+        }
         K::GemvF16 => hip!(gpu.gemm_f16_batched_lmhead(w.buf, x, y, m, k, 1)),
         K::GemvBf16 => hip!(gpu.gemv_bf16_xf32(w.buf, x, y, m, k)),
         K::GemvQ8_0 => hip!(gpu.gemv_q8_0(w.buf, x, y, m, k)),
