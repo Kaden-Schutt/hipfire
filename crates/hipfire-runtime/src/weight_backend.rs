@@ -430,6 +430,10 @@ pub(crate) const RAW_CODECS: &[RawCodec] = &[
         quant_type: 44,
         dtype: DType::MQ4G256V2,
     },
+    RawCodec {
+        quant_type: 45,
+        dtype: DType::MQ4CG256,
+    },
 ];
 /// Look up the passthrough codec for `quant_type`, or `None` if it is host-decode
 /// (1/2/16) or genuinely unsupported.
@@ -502,6 +506,19 @@ pub(crate) fn decode_raw_codec(
                 0,
                 &format!(
                     "MQ4G256V2 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name})",
+                    data.len()
+                ),
+            ));
+        }
+    }
+    if codec.dtype == DType::MQ4CG256 {
+        let gpr = k / 256;
+        let expected = m * gpr * 132;
+        if data.len() != expected {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "MQ4CG256 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name})",
                     data.len()
                 ),
             ));

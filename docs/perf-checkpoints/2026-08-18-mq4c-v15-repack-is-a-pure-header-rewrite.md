@@ -106,3 +106,50 @@ GEMV — at 132 B and measure it against its v1 twin with
 `crates/rdna-compute/examples/bench_gemv_paired_throughput.rs`. That is one file of
 work and it replaces the discredited proxy with a real number on the shipping kernel
 shape. If v1.5 does not actually beat v1 there, the third layout is not worth it.
+
+---
+
+## Amendment — full-file repack: conclusion holds, but the margin is 1.9×, not 45×
+
+The original record measured six tensors and reported max drift **0.011076** steps
+with a minimum f32 scale of 7.609e-04, "an order of magnitude above the fp16 denormal
+threshold." Repacking the **entire** artifact with `tools/quant-design/mq4c_repack.py`
+shows that sample was not representative:
+
+| | probe, 6 tensors | **full file, 496 tensors** |
+|---|---|---|
+| groups | 923,840 | **95,119,360** |
+| max drift | 0.011076 steps | **0.261080** |
+| nibble flips | 0 | **0** |
+| min f32 scale | 7.609e-04 | **1.370e-06** |
+
+`q38.ctl.mq4` → `q38.ctl.mq4c`: 15,662,615,552 → 15,282,138,112 B, **saved
+380,477,440 B (2.43%)**, exactly the predicted figure. Census confirms the output is
+well-formed: `qt45 n=496` at 12,555,755,520 B = 95,119,360 × 132, with the Q8F16 and
+F16 classes byte-identical to the source.
+
+**The conclusion survives: zero nibble flips across all 95 million groups, so the
+repack really is a pure header rewrite on this artifact.** Two claims in the original
+record do not survive and are retracted:
+
+1. **"~45× below the rounding boundary"** — the true margin is **1.9×**
+   (0.261 against 0.5). The worst tensor is
+   `model.language_model.layers.10.linear_attn.in_proj_qkv.weight`.
+2. **"min scale sits an order of magnitude above the fp16 denormal floor"** — false
+   for the file. The real minimum, 1.370e-06, is **45× BELOW** the fp16 min normal
+   (6.104e-05), so some groups store their scale as an fp16 *subnormal*, where the
+   significand is truncated and relative precision collapses. That is where the
+   0.261 drift comes from, and it is why the analytic bound
+   `|delta| <= |z|/(s·2^11) + 15/2^11` under-predicts: it assumes a normal fp16.
+
+Neither breaks the result, but they change its character from "provably safe by a
+wide margin" to **"safe on this artifact, verified, with margin that must be
+re-checked per model."** A model with tighter per-group ranges could plausibly cross
+0.5.
+
+The tool enforces this rather than trusting it: it computes the drift for every group
+as it writes, prints a note for any tensor above 0.25, and **refuses to emit the
+artifact** at 0.5 rather than silently producing a lossy one. It also reports the
+minimum scale and the flip count so both invariants are visible per run. Running it
+is therefore the check, not a formality — the 0.25 note fired on the very first real
+artifact, against a sampled expectation of 0.011.

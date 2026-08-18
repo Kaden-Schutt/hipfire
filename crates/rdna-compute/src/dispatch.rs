@@ -109,6 +109,14 @@ pub const GL_MQ35_GROUP_SIZE: usize = 256;
 /// half-wave uniform, lane-invariant scalar loads. `K % 256 == 0`.
 pub const MQ4V2_GROUP_BYTES: usize = 136;
 
+/// Per-group bytes for MQ4-G256-C (qt=45): 132 B/group, 4.125 bpw, byte-identical
+/// payload to MQ4G256 (qt=13) except header is ONE fp16 scale/zero per 256:
+/// `[0..2)` fp16 scale, `[2..4)` fp16 zero, `[4..132)` 128 B nibbles.
+/// ONE affine grid per 256 (`w = q * scale + zero`), unlike qt=44's dual half-grids.
+/// `K % 256 == 0`, little-endian, low 16 scale / high 16 zero in header dword,
+/// half-wave uniform, lane-invariant scalar loads. See `kernels/src/gemv_mq4cg256_residual.hip`.
+pub const MQ4C_GROUP_BYTES: usize = 132;
+
 /// Per-group bytes for MQ4-G256-SEL (4-bit selector family, AoS).
 /// 128 B nibble indices + 2 B fp16 scale + 1 B selector + 1 B pad = 132 B/256 weights
 /// → 4.125 bpw. 132 % 4 == 0 so the group is 4-byte aligned (AoS-B layout measured
@@ -544,6 +552,12 @@ pub enum DType {
     /// Little-endian, low 16 scale / high 16 zero per dword, half-wave uniform,
     /// lane-invariant scalar loads. `K % 256 == 0`, 4.25 bpw.
     MQ4G256V2,
+    /// MQ4-G256-C (qt=45): FWHT-rotated, 132 B/group, 4.125 bpw, byte-identical payload
+    /// to MQ4G256 except header is ONE fp16 scale/zero per 256: `[0..2)` fp16 scale,
+    /// `[2..4)` fp16 zero, `[4..132)` 128 B nibbles. ONE affine grid per 256
+    /// (`w = q * scale + zero`), half-wave uniform, lane-invariant scalar loads.
+    /// `K % 256 == 0`.
+    MQ4CG256,
     MQ4G128,      // MagnumQuant: FWHT-128-rotated INT4 (72 bytes/group, same layout as HFQ4G128)
     MQ8G256,      // MagnumQuant: FWHT-rotated symmetric INT8, dp4a target (258 bytes/group)
     MQ6G256,      // MagnumQuant: FWHT-rotated HFQ6-G256 (200 bytes/group, same as HFQ6G256)
@@ -643,6 +657,7 @@ impl DType {
             | DType::HFQ6G256
             | DType::MQ4G256
             | DType::MQ4G256V2
+            | DType::MQ4CG256
             | DType::MQ4G128
             | DType::MQ6G256
             | DType::MQ5G256
@@ -739,6 +754,9 @@ impl DType {
                 // That is the May 2026 regression this predicate was centralised to
                 // prevent; qt=44's artifact carries 496 sidecars.
                 | DType::MQ4G256V2
+                // qt=45 shares qt=13/qt=44's AWQ contract exactly — same failure mode
+                // if omitted: silent sidecar drop → (W·s)·x. Include it.
+                | DType::MQ4CG256
                 | DType::MQ3G256
                 | DType::MQ2G256
                 | DType::MQ3G256Lloyd
@@ -778,6 +796,7 @@ impl DType {
                 | DType::MQ4G256GL
                 | DType::MQ4G256SEL
                 | DType::MQ4G256V2
+                | DType::MQ4CG256
                 | DType::MQ35G256GL
                 | DType::MQ1G1024GL
         )
