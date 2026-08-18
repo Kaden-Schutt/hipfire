@@ -4105,6 +4105,8 @@ pub const ADD_SRC: &str = include_str!("../../../kernels/src/add.hip");
 
 /// Element-wise in-place add: a[i] += b[i]
 pub const ADD_INPLACE_SRC: &str = include_str!("../../../kernels/src/add_inplace.hip");
+pub const ADD_ROW_INPLACE_BUF_SRC: &str =
+    include_str!("../../../kernels/src/add_row_inplace_buf.hip");
 
 /// Scaled in-place add: y[i] += c * x[i] — one kernel for both
 /// CPU-scalar (c via kernarg) and GPU-scalar (c via device buffer)

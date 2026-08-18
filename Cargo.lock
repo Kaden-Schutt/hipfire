@@ -769,6 +769,7 @@ dependencies = [
 name = "hipfire-arch-deepseek4"
 version = "0.3.0"
 dependencies = [
+ "half",
  "hip-bridge",
  "hipfire-config",
  "hipfire-dispatch",
