@@ -12,6 +12,7 @@ mod dispatch;
 pub mod embedding;
 pub mod feature_flags;
 pub mod gemm;
+mod gemma4_ops;
 pub mod gemv;
 pub mod graph;
 mod kernels;

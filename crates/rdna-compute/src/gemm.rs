@@ -21402,6 +21402,70 @@ impl Gpu {
         result
     }
 
+    /// Batched Q8_0 GEMM with the same four-way FP32 summation contract as
+    /// `gemv_q8_0_wide`. Sub-batching bounds VGPR use while sharing weights.
+    pub fn gemm_q8_0_batched_wide_exact(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        debug_assert!(
+            k > 0 && k % 32 == 0,
+            "gemm_q8_0_batched_wide_exact: K must be a positive multiple of 32"
+        );
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_q8_0_batched_wide_exact",
+            kernels::GEMM_Q8_0_BATCHED_WIDE_EXACT_SRC,
+            "gemm_q8_0_batched_wide_exact",
+        )?;
+
+        const MAX_BATCH: usize = 8;
+        let mut off = 0;
+        while off < batch_size {
+            let take = (batch_size - off).min(MAX_BATCH);
+            let x_sub = x.sub_offset(off * k, take * k);
+            let y_sub = y.sub_offset(off * m, take * m);
+            let mut a_ptr = a_raw.buf.as_ptr();
+            let mut x_ptr = x_sub.buf.as_ptr();
+            let mut y_ptr = y_sub.buf.as_ptr();
+            let mut m_val = m as i32;
+            let mut k_val = k as i32;
+            let mut bs_val = take as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &mut a_ptr as *mut _ as *mut c_void,
+                &mut x_ptr as *mut _ as *mut c_void,
+                &mut y_ptr as *mut _ as *mut c_void,
+                &mut m_val as *mut _ as *mut c_void,
+                &mut k_val as *mut _ as *mut c_void,
+                &mut bs_val as *mut _ as *mut c_void,
+            ];
+            self.launch_maybe_blob(
+                "gemm_q8_0_batched_wide_exact",
+                [m as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(a_ptr);
+                    b.push_ptr(x_ptr);
+                    b.push_ptr(y_ptr);
+                    b.push_i32(m_val);
+                    b.push_i32(k_val);
+                    b.push_i32(bs_val);
+                    b
+                },
+            )?;
+            off += take;
+        }
+        Ok(())
+    }
+
     /// Q8_0 batched GEMM driver that handles `n` rows by sub-batching at the
     /// kernel's MAX_BATCH=64. Y[n, m] = X[n, k] @ A_q8[m, k]^T.
     ///
@@ -21770,7 +21834,14 @@ impl Gpu {
             kernels::GEMM_GATE_UP_Q8_0_WMMA_SRC,
             "gemm_gate_up_q8_0_wmma",
         )?;
-        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+        // Batched transformer forwards commonly reuse one scratch allocation
+        // with new contents at every layer, so pointer-keyed staging is not a
+        // valid cache key for this fused entry point.
+        let x_f16_ptr = if matches!(x.dtype, DType::F16) {
+            x.buf.as_ptr()
+        } else {
+            self.convert_fp16_x_uncached(x, batch_size * k)?
+        };
 
         let mut a_g = a_gate.buf.as_ptr();
         let mut a_u = a_up.buf.as_ptr();
@@ -21901,8 +21972,7 @@ impl Gpu {
 
     /// WMMA-accelerated batched 3-way fused Q8_0 GEMM (Q + K + V projections).
     /// Auto-routes to the gfx12 sibling on RDNA4 archs; gfx11 path is the
-    /// canonical implementation (X is converted from F32 to FP16 via
-    /// `ensure_fp16_x`). Mirrors `gemm_qkv_hfq4g256_wmma`.
+    /// canonical implementation. Mirrors `gemm_qkv_hfq4g256_wmma`.
     pub fn gemm_qkv_q8_0_wmma(
         &mut self,
         a_q: &GpuTensor,
@@ -21934,7 +22004,13 @@ impl Gpu {
             kernels::GEMM_QKV_Q8_0_WMMA_SRC,
             "gemm_qkv_q8_0_wmma",
         )?;
-        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+        // A stable source pointer does not imply stable activation contents
+        // across transformer layers; always refresh F32 staging.
+        let x_f16_ptr = if matches!(x.dtype, DType::F16) {
+            x.buf.as_ptr()
+        } else {
+            self.convert_fp16_x_uncached(x, batch_size * k)?
+        };
 
         let mut aq = a_q.buf.as_ptr();
         let mut ak = a_k.buf.as_ptr();
@@ -25066,7 +25142,10 @@ impl Gpu {
         ];
         let bytes = 8 * (crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4);
         let timer = crate::profile::begin_timer(
-            &self.hip, "gemv", "gemv_mq4g256_moe_gate_up_k8_indexed", bytes,
+            &self.hip,
+            "gemv",
+            "gemv_mq4g256_moe_gate_up_k8_indexed",
+            bytes,
         );
         let result =
             self.launch_maybe_blob(func_name, [grid_x, 8, 1], block, 0, &mut params, || {
@@ -25122,25 +25201,24 @@ impl Gpu {
             &mut m_val as *mut _ as *mut std::ffi::c_void,
             &mut k_val as *mut _ as *mut std::ffi::c_void,
         ];
-        let result =
-            self.launch_maybe_blob(
-                "gemv_q8_0_moe_gate_up_k8_indexed",
-                [m as u32, 8, 1],
-                [32u32, 1, 1],
-                0,
-                &mut params,
-                || {
-                    let mut b = hip_bridge::KernargBlob::new();
-                    b.push_ptr(pp);
-                    b.push_ptr(ip);
-                    b.push_ptr(xp);
-                    b.push_ptr(ygp);
-                    b.push_ptr(yup);
-                    b.push_i32(m_val);
-                    b.push_i32(k_val);
-                    b
-                },
-            );
+        let result = self.launch_maybe_blob(
+            "gemv_q8_0_moe_gate_up_k8_indexed",
+            [m as u32, 8, 1],
+            [32u32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(xp);
+                b.push_ptr(ygp);
+                b.push_ptr(yup);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        );
         result
     }
 
@@ -25182,39 +25260,135 @@ impl Gpu {
             &mut m_val as *mut _ as *mut std::ffi::c_void,
             &mut k_val as *mut _ as *mut std::ffi::c_void,
         ];
-        let result =
-            self.launch_maybe_blob(
-                "gemv_q8_0_moe_down_residual_scaled_k8_indexed",
-                [m as u32, 8, 1],
-                [32u32, 1, 1],
-                0,
-                &mut params,
-                || {
-                    let mut b = hip_bridge::KernargBlob::new();
-                    b.push_ptr(pp);
-                    b.push_ptr(ip);
-                    b.push_ptr(wp);
-                    b.push_ptr(sp);
-                    b.push_ptr(hbp);
-                    b.push_ptr(xrp);
-                    b.push_i32(m_val);
-                    b.push_i32(k_val);
-                    b
-                },
-            );
+        let result = self.launch_maybe_blob(
+            "gemv_q8_0_moe_down_residual_scaled_k8_indexed",
+            [m as u32, 8, 1],
+            [32u32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_ptr(sp);
+                b.push_ptr(hbp);
+                b.push_ptr(xrp);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        );
         result
     }
 
     #[allow(unused_variables)]
-    pub fn gemv_hfq4g128_moe_down_residual_scaled_k8_indexed(&mut self, expert_ptrs: &GpuTensor, topk_indices: &GpuTensor, topk_weights: &GpuTensor, per_expert_scale: &GpuTensor, hidden_batch: &GpuTensor, x_residual: &GpuTensor, m: usize, k: usize) -> HipResult<()> { Err(hip_bridge::HipError::new(0, "MoE kernel not yet ported (Phase 4)")) }
+    pub fn gemv_hfq4g128_moe_down_residual_scaled_k8_indexed(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        topk_weights: &GpuTensor,
+        per_expert_scale: &GpuTensor,
+        hidden_batch: &GpuTensor,
+        x_residual: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        Err(hip_bridge::HipError::new(
+            0,
+            "MoE kernel not yet ported (Phase 4)",
+        ))
+    }
     #[allow(unused_variables)]
-    pub fn gemv_hfq4g128_moe_down_residual_scaled_k8_indexed_batched(&mut self, expert_ptrs: &GpuTensor, topk_indices: &GpuTensor, topk_weights: &GpuTensor, per_expert_scale: &GpuTensor, hidden_batch: &GpuTensor, x_residual: &GpuTensor, m: usize, k: usize, k_top: usize, batch_size: usize) -> HipResult<()> { Err(hip_bridge::HipError::new(0, "MoE kernel not yet ported (Phase 4)")) }
+    pub fn gemv_hfq4g128_moe_down_residual_scaled_k8_indexed_batched(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        topk_weights: &GpuTensor,
+        per_expert_scale: &GpuTensor,
+        hidden_batch: &GpuTensor,
+        x_residual: &GpuTensor,
+        m: usize,
+        k: usize,
+        k_top: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        Err(hip_bridge::HipError::new(
+            0,
+            "MoE kernel not yet ported (Phase 4)",
+        ))
+    }
     #[allow(unused_variables)]
-    pub fn gemv_mq4g256_moe_gate_up_bucketed(&mut self, expert_ptrs: &GpuTensor, expert_offsets: &GpuTensor, expert_token_list: &GpuTensor, x_rot: &GpuTensor, y_gate: &GpuTensor, y_up: &GpuTensor, m: usize, k: usize, k_top: usize, n_exp: usize) -> HipResult<()> { Err(hip_bridge::HipError::new(0, "MoE kernel not yet ported (Phase 4)")) }
+    pub fn gemv_mq4g256_moe_gate_up_bucketed(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        expert_offsets: &GpuTensor,
+        expert_token_list: &GpuTensor,
+        x_rot: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        m: usize,
+        k: usize,
+        k_top: usize,
+        n_exp: usize,
+    ) -> HipResult<()> {
+        Err(hip_bridge::HipError::new(
+            0,
+            "MoE kernel not yet ported (Phase 4)",
+        ))
+    }
     #[allow(unused_variables)]
-    pub fn gemv_hfq4g256_moe_gate_up_bucketed(&mut self, expert_ptrs: &GpuTensor, expert_offsets: &GpuTensor, expert_token_list: &GpuTensor, x: &GpuTensor, y_gate: &GpuTensor, y_up: &GpuTensor, m: usize, k: usize, k_top: usize, n_exp: usize) -> HipResult<()> { Err(hip_bridge::HipError::new(0, "MoE kernel not yet ported (Phase 4)")) }
+    pub fn gemv_hfq4g256_moe_gate_up_bucketed(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        expert_offsets: &GpuTensor,
+        expert_token_list: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        m: usize,
+        k: usize,
+        k_top: usize,
+        n_exp: usize,
+    ) -> HipResult<()> {
+        Err(hip_bridge::HipError::new(
+            0,
+            "MoE kernel not yet ported (Phase 4)",
+        ))
+    }
     #[allow(unused_variables)]
-    pub fn gemv_hfq4g128_moe_down_residual_scaled_bucketed(&mut self, expert_ptrs: &GpuTensor, expert_offsets: &GpuTensor, expert_token_list: &GpuTensor, topk_weights: &GpuTensor, per_expert_scale: &GpuTensor, hidden_batch: &GpuTensor, x_residual: &GpuTensor, m: usize, k: usize, k_top: usize, n_exp: usize) -> HipResult<()> { Err(hip_bridge::HipError::new(0, "MoE kernel not yet ported (Phase 4)")) }
+    pub fn gemv_hfq4g128_moe_down_residual_scaled_bucketed(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        expert_offsets: &GpuTensor,
+        expert_token_list: &GpuTensor,
+        topk_weights: &GpuTensor,
+        per_expert_scale: &GpuTensor,
+        hidden_batch: &GpuTensor,
+        x_residual: &GpuTensor,
+        m: usize,
+        k: usize,
+        k_top: usize,
+        n_exp: usize,
+    ) -> HipResult<()> {
+        Err(hip_bridge::HipError::new(
+            0,
+            "MoE kernel not yet ported (Phase 4)",
+        ))
+    }
     #[allow(unused_variables)]
-    pub fn moe_bucket_build(&mut self, topk_indices: &GpuTensor, expert_offsets: &GpuTensor, expert_token_list: &GpuTensor, n_batch: usize, k_top: usize, n_exp: usize) -> HipResult<()> { Err(hip_bridge::HipError::new(0, "MoE kernel not yet ported (Phase 4)")) }
+    pub fn moe_bucket_build(
+        &mut self,
+        topk_indices: &GpuTensor,
+        expert_offsets: &GpuTensor,
+        expert_token_list: &GpuTensor,
+        n_batch: usize,
+        k_top: usize,
+        n_exp: usize,
+    ) -> HipResult<()> {
+        Err(hip_bridge::HipError::new(
+            0,
+            "MoE kernel not yet ported (Phase 4)",
+        ))
+    }
 }

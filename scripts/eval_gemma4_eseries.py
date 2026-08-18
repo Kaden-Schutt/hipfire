@@ -51,9 +51,7 @@ def metric_stats(rows: list[dict], key: str) -> dict:
 def extract_choice(text: str) -> str | None:
     patterns = (
         r"the\s+correct\s+answer\s+is\s*\(?\s*([ABCD])(?![A-Za-z])\s*\)?",
-        r"(?:答案|选项)\s*(?:是|为|：|:)\s*\(?\s*([ABCD])(?![A-Za-z])\s*\)?",
-        r"\(([ABCD])\)",
-        r"\b([ABCD])\b",
+        r"(?:答案|选项)\s*(?:是|为)\s*(?:：|:)?\s*\(?\s*([ABCD])(?![A-Za-z])\s*\)?",
     )
     for pattern in patterns:
         matches = re.findall(pattern, text, flags=re.IGNORECASE)
@@ -157,17 +155,40 @@ class Daemon:
         stderr_path: Path,
         physical_gpu: str,
         prefill_batch: int,
+        q8_fused_prefill: bool | None,
+        batched_embedding_prefill: bool | None,
+        ple_batched_prefill: bool | None,
+        ple_branch_batched_prefill: bool | None,
+        ple_activation_fused_prefill: bool | None,
         runtime_home: Path | None,
     ):
         env = os.environ.copy()
         if runtime_home is not None:
             runtime_home.mkdir(parents=True, exist_ok=True)
-            (runtime_home / ".hipfire").mkdir(exist_ok=True)
+            hipfire_home = runtime_home / ".hipfire"
+            hipfire_home.mkdir(exist_ok=True)
             env["HOME"] = str(runtime_home.resolve())
+            env["HIPFIRE_HOME"] = str(hipfire_home.resolve())
+            env.pop("HIPFIRE_MODELS_DIR", None)
         env["HIP_VISIBLE_DEVICES"] = physical_gpu
         env["HIPFIRE_GEMMA4_GRAPH"] = "0"
         env["HIPFIRE_GEMMA4_EAGLE"] = "0"
+        env["HIPFIRE_Q8_BATCHED_LEGACY"] = "0"
         env["HIPFIRE_GEMMA4_PREFILL_BATCH"] = str(prefill_batch)
+        for name, enabled in (
+            ("HIPFIRE_GEMMA4_Q8_FUSED_PREFILL", q8_fused_prefill),
+            ("HIPFIRE_GEMMA4_BATCHED_EMBEDDING_PREFILL", batched_embedding_prefill),
+            ("HIPFIRE_GEMMA4_PLE_BATCHED_PREFILL", ple_batched_prefill),
+            ("HIPFIRE_GEMMA4_PLE_BRANCH_BATCHED_PREFILL", ple_branch_batched_prefill),
+            (
+                "HIPFIRE_GEMMA4_PLE_ACTIVATION_FUSED_PREFILL",
+                ple_activation_fused_prefill,
+            ),
+        ):
+            if enabled is None:
+                env.pop(name, None)
+            else:
+                env[name] = "1" if enabled else "0"
         self.stderr_stream = stderr_path.open("w", buffering=1)
         self.proc = subprocess.Popen(
             [str(binary)],
@@ -316,11 +337,14 @@ def load_tasks(args: argparse.Namespace) -> tuple[list[dict], dict | None]:
 
 def summarize(rows: list[dict], config: dict) -> dict:
     valid = [row for row in rows if not row.get("error")]
-    scored = [row for row in valid if row.get("gold")]
+    labelled = [row for row in valid if row.get("gold")]
+    scored = [row for row in labelled if row.get("pred") is not None]
     return {
         "completed": len(rows),
         "valid": len(valid),
         "errors": len(rows) - len(valid),
+        "scored": len(scored),
+        "unscored": len(labelled) - len(scored),
         "accuracy": (
             sum(bool(row.get("correct")) for row in scored) / len(scored) if scored else None
         ),
@@ -346,6 +370,7 @@ def main() -> int:
     parser.add_argument("--tasks", type=Path)
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--physical-gpu", default="1")
+    parser.add_argument("--expected-arch")
     parser.add_argument("--max-seq", type=int, default=32768)
     parser.add_argument("--max-tokens", type=int, default=96)
     parser.add_argument("--timeout", type=float, default=1800)
@@ -354,6 +379,27 @@ def main() -> int:
     parser.add_argument("--task-id")
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--prefill-batch", type=int, default=8)
+    parser.add_argument(
+        "--q8-fused-prefill", action=argparse.BooleanOptionalAction, default=None
+    )
+    parser.add_argument(
+        "--batched-embedding-prefill",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument(
+        "--ple-batched-prefill", action=argparse.BooleanOptionalAction, default=None
+    )
+    parser.add_argument(
+        "--ple-branch-batched-prefill",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument(
+        "--ple-activation-fused-prefill",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
     parser.add_argument("--runtime-home", type=Path)
     parser.add_argument(
         "--closed-think",
@@ -404,26 +450,49 @@ def main() -> int:
         "daemon": str(args.daemon.resolve()),
         "daemon_sha256": file_hash(args.daemon),
         "physical_gpu": args.physical_gpu,
+        "expected_arch": args.expected_arch,
         "max_seq": args.max_seq,
         "default_max_tokens": args.max_tokens,
         "temperature": 0.0,
         "kv_mode": "q8",
+        "q8_batched_legacy": False,
         "prefill_batch": args.prefill_batch,
         "closed_think": args.closed_think,
+        "q8_fused_prefill": args.q8_fused_prefill,
+        "batched_embedding_prefill": args.batched_embedding_prefill,
+        "ple_batched_prefill": args.ple_batched_prefill,
+        "ple_branch_batched_prefill": args.ple_branch_batched_prefill,
+        "ple_activation_fused_prefill": args.ple_activation_fused_prefill,
         "repeats": args.repeats,
         "manifest": manifest_data,
     }
-    (args.out_dir / "config.json").write_text(json.dumps(config, indent=2, ensure_ascii=False) + "\n")
-
     daemon = Daemon(
         args.daemon.resolve(),
         args.out_dir / "daemon.stderr.log",
         args.physical_gpu,
         args.prefill_batch,
+        args.q8_fused_prefill,
+        args.batched_embedding_prefill,
+        args.ple_batched_prefill,
+        args.ple_branch_batched_prefill,
+        args.ple_activation_fused_prefill,
         args.runtime_home,
     )
     rows = list(existing)
     try:
+        diag, diag_events = daemon.request({"type": "diag"}, {"diag"}, args.timeout)
+        if args.expected_arch and diag.get("arch") != args.expected_arch:
+            raise RuntimeError(
+                f"GPU architecture mismatch: expected {args.expected_arch}, "
+                f"daemon reported {diag.get('arch')!r}"
+            )
+        config["daemon_diag"] = diag
+        (args.out_dir / "diag.jsonl").write_text(
+            "".join(json.dumps(event, ensure_ascii=False) + "\n" for event in diag_events)
+        )
+        (args.out_dir / "config.json").write_text(
+            json.dumps(config, indent=2, ensure_ascii=False) + "\n"
+        )
         loaded, load_events = daemon.request(
             {
                 "type": "load",
@@ -503,7 +572,11 @@ def main() -> int:
                     "gold": task.get("gold"),
                     "pred": pred,
                     "pred_source": pred_source,
-                    "correct": pred == task.get("gold") if task.get("gold") else None,
+                    "correct": (
+                        pred == task.get("gold")
+                        if task.get("gold") and pred is not None
+                        else None
+                    ),
                     "wall_s": wall_s,
                     **{key: done.get(key) for key in (
                         "type", "finish_reason", "tokens", "tok_s", "prefill_tokens",

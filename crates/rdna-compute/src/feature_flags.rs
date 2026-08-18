@@ -179,6 +179,21 @@ pub struct FeatureFlags {
     pub deterministic: bool,
     pub mw16: bool,
     pub q8_batched_legacy: bool,
+    /// Fuse Gemma 4 Q8 prefill projections on exact gfx1100. This remains an
+    /// opt-in while the E-series path is validated across QKV-sharing shapes.
+    pub gemma4_q8_fused_prefill: bool,
+    /// Batch Gemma 4 main and PLE embedding lookup on validated gfx1100 and
+    /// gfx1201 paths. The `auto` policy remains independently disableable.
+    pub gemma4_batched_embedding_prefill: bool,
+    /// Batch the E-series per-layer-input model projection on exact gfx1100
+    /// instead of re-streaming the same matrix through one GEMV per row.
+    pub gemma4_ple_batched_prefill: bool,
+    /// Exact-arithmetic batched E-series PLE branch projections on validated
+    /// gfx1100/gfx1201 paths. Remains independently disableable.
+    pub gemma4_ple_branch_batched_prefill: bool,
+    /// Fuse the E-series PLE GELU and strided per-layer multiply on validated
+    /// gfx1100 and gfx1201 paths.
+    pub gemma4_ple_activation_fused_prefill: bool,
     /// `HIPFIRE_DEEPSEEK4_Q8_WMMA=0` disables the Q8_0 dense WMMA prefill path
     /// (forces the scalar chunked fallback). Consumed by
     /// `gemm_q8_0_wmma_prefill_auto`.
@@ -483,6 +498,21 @@ impl FeatureFlags {
             deterministic: value("HIPFIRE_DETERMINISTIC").ok().as_deref() == Some("1"),
             mw16: value("HIPFIRE_MW16").map_or(false, |v| v == "1"),
             q8_batched_legacy: value("HIPFIRE_Q8_BATCHED_LEGACY").as_deref() == Ok("1"),
+            gemma4_q8_fused_prefill: parse_bool("HIPFIRE_GEMMA4_Q8_FUSED_PREFILL").unwrap_or(false),
+            gemma4_batched_embedding_prefill: parse_bool(
+                "HIPFIRE_GEMMA4_BATCHED_EMBEDDING_PREFILL",
+            )
+            .unwrap_or(matches!(arch, "gfx1100" | "gfx1201")),
+            gemma4_ple_batched_prefill: parse_bool("HIPFIRE_GEMMA4_PLE_BATCHED_PREFILL")
+                .unwrap_or(false),
+            gemma4_ple_branch_batched_prefill: parse_bool(
+                "HIPFIRE_GEMMA4_PLE_BRANCH_BATCHED_PREFILL",
+            )
+            .unwrap_or(matches!(arch, "gfx1100" | "gfx1201")),
+            gemma4_ple_activation_fused_prefill: parse_bool(
+                "HIPFIRE_GEMMA4_PLE_ACTIVATION_FUSED_PREFILL",
+            )
+            .unwrap_or(matches!(arch, "gfx1100" | "gfx1201")),
             deepseek4_q8_wmma_off: value("HIPFIRE_DEEPSEEK4_Q8_WMMA").as_deref() == Ok("0"),
             deepseek4_q8_4w_off: value("HIPFIRE_DEEPSEEK4_Q8_4W").as_deref() == Ok("0"),
             rope_interleaved_legacy: value("HIPFIRE_ROPE_INTERLEAVED_LEGACY").ok().as_deref()
@@ -703,6 +733,11 @@ impl FeatureFlags {
             deterministic: false,
             mw16: false,
             q8_batched_legacy: false,
+            gemma4_q8_fused_prefill: false,
+            gemma4_batched_embedding_prefill: false,
+            gemma4_ple_batched_prefill: false,
+            gemma4_ple_branch_batched_prefill: false,
+            gemma4_ple_activation_fused_prefill: false,
             deepseek4_q8_wmma_off: false,
             deepseek4_q8_4w_off: false,
             rope_interleaved_legacy: false,
@@ -753,12 +788,87 @@ mod tests {
     fn qkvza_split_tail_defaults_false_in_test_ctor() {
         let f = FeatureFlags::for_test("gfx1100");
         assert!(!f.qkvza_split_tail);
+        assert!(!f.gemma4_q8_fused_prefill);
+        assert!(!f.gemma4_batched_embedding_prefill);
+        assert!(!f.gemma4_ple_batched_prefill);
+        assert!(!f.gemma4_ple_branch_batched_prefill);
+        assert!(!f.gemma4_ple_activation_fused_prefill);
+    }
+
+    #[test]
+    fn gemma4_prefill_auto_defaults_on_validated_arches() {
+        let resolved = resolve([]).unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+
+        let gfx1100 = FeatureFlags::from_process_config("gfx1100", &process);
+        assert!(gfx1100.gemma4_batched_embedding_prefill);
+        assert!(gfx1100.gemma4_ple_branch_batched_prefill);
+        assert!(gfx1100.gemma4_ple_activation_fused_prefill);
+        assert!(!gfx1100.gemma4_q8_fused_prefill);
+        assert!(!gfx1100.gemma4_ple_batched_prefill);
+
+        let gfx1201 = FeatureFlags::from_process_config("gfx1201", &process);
+        assert!(gfx1201.gemma4_batched_embedding_prefill);
+        assert!(gfx1201.gemma4_ple_branch_batched_prefill);
+        assert!(gfx1201.gemma4_ple_activation_fused_prefill);
+        assert!(!gfx1201.gemma4_q8_fused_prefill);
+        assert!(!gfx1201.gemma4_ple_batched_prefill);
+
+        for arch in ["gfx1101", "gfx1102", "gfx1151", "gfx1200"] {
+            let flags = FeatureFlags::from_process_config(arch, &process);
+            assert!(!flags.gemma4_batched_embedding_prefill, "arch={arch}");
+            assert!(!flags.gemma4_ple_branch_batched_prefill, "arch={arch}");
+            assert!(!flags.gemma4_ple_activation_fused_prefill, "arch={arch}");
+        }
+    }
+
+    #[test]
+    fn gemma4_prefill_auto_accepts_explicit_opt_out_on_validated_arches() {
+        let mut layer = ConfigLayer::default();
+        layer
+            .set_cli("kernel.gemma4_batched_embedding_prefill", "false")
+            .unwrap();
+        layer
+            .set_cli("kernel.gemma4_ple_branch_batched_prefill", "false")
+            .unwrap();
+        layer
+            .set_cli("kernel.gemma4_ple_activation_fused_prefill", "false")
+            .unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::GlobalUser {
+                path: "config.toml".into(),
+            },
+            layer,
+        }])
+        .unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        for arch in ["gfx1100", "gfx1201"] {
+            let flags = FeatureFlags::from_process_config(arch, &process);
+            assert!(!flags.gemma4_batched_embedding_prefill, "arch={arch}");
+            assert!(!flags.gemma4_ple_branch_batched_prefill, "arch={arch}");
+            assert!(!flags.gemma4_ple_activation_fused_prefill, "arch={arch}");
+        }
     }
 
     #[test]
     fn process_config_preserves_explicit_and_arch_default_flags() {
         let mut layer = ConfigLayer::default();
         layer.set_cli("kernel.qkvza_split_tail", "true").unwrap();
+        layer
+            .set_cli("kernel.gemma4_q8_fused_prefill", "true")
+            .unwrap();
+        layer
+            .set_cli("kernel.gemma4_batched_embedding_prefill", "true")
+            .unwrap();
+        layer
+            .set_cli("kernel.gemma4_ple_batched_prefill", "true")
+            .unwrap();
+        layer
+            .set_cli("kernel.gemma4_ple_branch_batched_prefill", "true")
+            .unwrap();
+        layer
+            .set_cli("kernel.gemma4_ple_activation_fused_prefill", "true")
+            .unwrap();
         layer.set_cli("diagnostic.kernel.gemv_rows", "4").unwrap();
         let resolved = resolve([NamedLayer {
             source: ConfigSource::GlobalUser {
@@ -771,6 +881,11 @@ mod tests {
         let flags = FeatureFlags::from_process_config("gfx1100", &process);
 
         assert!(flags.qkvza_split_tail);
+        assert!(flags.gemma4_q8_fused_prefill);
+        assert!(flags.gemma4_batched_embedding_prefill);
+        assert!(flags.gemma4_ple_batched_prefill);
+        assert!(flags.gemma4_ple_branch_batched_prefill);
+        assert!(flags.gemma4_ple_activation_fused_prefill);
         assert_eq!(flags.gemv_rows, Some(4));
         assert!(flags.rdna3_hfq4_qkvza_k2048);
         assert!(flags.rdna3_hfq4_residual_stage_x32);

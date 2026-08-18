@@ -1060,6 +1060,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             read(48),
         ]),
         "sigmoid_mul_f32" => Some(vec![write(0), read(8)]),
+        "gemma4_ple_gelu_mul_strided_f32" => Some(vec![read(0), read(8), write(16)]),
         _ => None,
     }
 }
@@ -1291,6 +1292,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "rmsnorm_reduce_gfx1100"
         | "hc_input_map_4stream"
         | "sigmoid_mul_f32" => Some(32),
+        "gemma4_ple_gelu_mul_strided_f32" => Some(48),
         "attention_flash_q8_0_reduce"
         | "fused_rmsnorm_mq_rotate"
         | "fused_rmsnorm_mq_rotate_vecsum"
@@ -5202,6 +5204,32 @@ mod tests {
             .iter()
             .all(|header| *header == HeaderPolicy::RECORDED_DISPATCH));
         assert_eq!(headers[5], HeaderPolicy::BATCH_BOUNDARY_INTERNAL_SERIAL);
+    }
+
+    #[test]
+    fn gemma4_ple_activation_keeps_padded_replay_contract() {
+        let kernel = "gemma4_ple_gelu_mul_strided_f32";
+        let effects = pointer_effects(kernel).expect("Gemma 4 PLE activation contract");
+        assert_eq!(effects.len(), 3);
+        assert_eq!(effects[0].offset, 0);
+        assert_eq!(effects[0].mode, RecordedAccessMode::Read);
+        assert_eq!(effects[1].offset, 8);
+        assert_eq!(effects[1].mode, RecordedAccessMode::Read);
+        assert_eq!(effects[2].offset, 16);
+        assert_eq!(effects[2].mode, RecordedAccessMode::Write);
+
+        let mut blob = hip_bridge::KernargBlob::new();
+        for _ in 0..3 {
+            blob.push_ptr(std::ptr::null());
+        }
+        for _ in 0..4 {
+            blob.push_i32(0);
+        }
+        assert_eq!(blob.len(), 40, "explicit kernel arguments occupy 40 bytes");
+        blob.pad_to(16);
+        assert_eq!(blob.len(), 48, "recorded launches are padded to 16 bytes");
+        assert_eq!(expected_kernarg_bytes(kernel), Some(blob.len()));
+    }
     }
 
     #[test]
