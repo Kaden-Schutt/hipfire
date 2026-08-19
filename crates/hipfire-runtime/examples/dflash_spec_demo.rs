@@ -1393,7 +1393,16 @@ fn main() {
     if let Some(b) = block_size_override {
         let orig = draft_cfg.block_size;
         draft_cfg.block_size = b;
-        eprintln!("block_size override: {orig} -> {b} (draft was trained at {orig}; smaller B lowers per-iter cost but may reduce τ)");
+        eprintln!("block_size override: {orig} -> {b} (checkpoint declares {orig})");
+    } else {
+        let runtime_b = draft_cfg.runtime_block_size();
+        if runtime_b != draft_cfg.block_size {
+            eprintln!(
+                "DFlash2 runtime block: {} -> {} (selector/conv path is length-generic)",
+                draft_cfg.block_size, runtime_b
+            );
+            draft_cfg.block_size = runtime_b;
+        }
     }
     eprintln!(
         "draft: layers={} hidden={} heads={} kv_heads={} block={} target_layers={:?}",
@@ -1453,21 +1462,14 @@ fn main() {
     eprintln!("draft loaded in {:.2}s", t0.elapsed().as_secs_f64());
     vram_report(&gpu.hip, "after draft load");
 
-    // Adaptive-B scratch sizing: the draft was trained at a specific
-    // block_size; going past it is out-of-distribution for its positional
-    // encoding. Measured on 27B MQ4 (2026-04-24, 3-run median) with range
-    // 8:20:
-    //   code: 161.5 → 113.7 tok/s (-30 %) as B grew to 17+, τ only
-    //         dropped 8 % so the loss is dominated by verify cost × B
-    //         at OOD positions, not by τ collapse.
-    //   prose/instr: unchanged (B never grew past 10 on low-τ workloads).
-    // → clamp adaptive_b_max to draft_cfg.block_size with a warning when
-    // the user explicitly widens. Opt out via HIPFIRE_ADAPTIVE_B_UNSAFE=1
-    // for experiments on a refit draft.
+    // Adaptive-B may shrink below the effective runtime width, but it must not
+    // grow past the scratch/model policy unless the diagnostic UNSAFE override
+    // is explicit. For legacy drafts the runtime width is the artifact width;
+    // DFlash2 uses the selector-aware B=16 runtime policy above.
     let unsafe_adaptive = std::env::var("HIPFIRE_ADAPTIVE_B_UNSAFE").ok().as_deref() == Some("1");
     if adaptive_b && adaptive_b_max > draft_cfg.block_size && !unsafe_adaptive {
         eprintln!(
-            "adaptive-b: WARN requested MAX={} > draft trained block_size={}; clamping to {} (past-trained B regresses code by ~30 %; set HIPFIRE_ADAPTIVE_B_UNSAFE=1 to override)",
+            "adaptive-b: WARN requested MAX={} > runtime block_size={}; clamping to {} (set HIPFIRE_ADAPTIVE_B_UNSAFE=1 to override)",
             adaptive_b_max, draft_cfg.block_size, draft_cfg.block_size,
         );
         adaptive_b_max = draft_cfg.block_size;
@@ -1482,7 +1484,7 @@ fn main() {
     };
     if draft_scratch_b > draft_cfg.block_size {
         eprintln!(
-            "adaptive-b: pre-sizing draft scratch for B_MAX={} (trained at {}) [UNSAFE=on]",
+            "adaptive-b: pre-sizing draft scratch for B_MAX={} (runtime width {}) [UNSAFE=on]",
             draft_scratch_b, draft_cfg.block_size,
         );
     }

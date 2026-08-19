@@ -226,7 +226,13 @@ pub fn load_dflash_state(
         };
     }
     let draft_weights = or_free!(DflashWeights::load(gpu, &draft_hfq, &draft_config), "");
-    let block_size = draft_config.block_size;
+    let block_size = draft_config.runtime_block_size();
+    if block_size != draft_config.block_size {
+        eprintln!(
+            "  DFlash2 runtime block: {} -> {} (selector/conv path is length-generic)",
+            draft_config.block_size, block_size
+        );
+    }
     // DDTree verify batches up to `budget + 1` slots (seed + budget nodes), which
     // can exceed the chain block_size+1. Size verify_scratch / GdnTape / hidden
     // staging for the larger of the two so ddtree-mode serve doesn't overflow
@@ -723,7 +729,7 @@ impl Speculator for DflashSpeculator {
             let cfg_b = self.df.block_size.max(2);
             let want = max_emit.max(2);
             let b = cfg_b.min(want);
-            if b < cfg_b {
+            if b < cfg_b || b != self.df.draft_config.block_size {
                 Some(b)
             } else {
                 None

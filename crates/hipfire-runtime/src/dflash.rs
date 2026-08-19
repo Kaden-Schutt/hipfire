@@ -103,6 +103,19 @@ impl DflashConfig {
         self.n_heads * self.head_dim
     }
 
+    /// Runtime proposal width. DFlash2's selector and dynamic convolutions are
+    /// length-generic even though the published checkpoint declares B=8.
+    /// B=16 removes the B=8 acceptance ceiling and wins on both the canonical
+    /// merge-sort and prose fixtures on gfx1201; legacy DFlash retains its
+    /// artifact-declared width.
+    pub fn runtime_block_size(&self) -> usize {
+        if self.selector_rank.is_some() && self.block_size == 8 {
+            16
+        } else {
+            self.block_size
+        }
+    }
+
     /// Parse from an HFQ file's metadata JSON. Expects the top-level
     /// `dflash` object written by `dflash_convert`.
     pub fn from_hfq(hfq: &HfqFile) -> Option<Self> {
