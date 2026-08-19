@@ -1486,13 +1486,13 @@ fn main() {
             draft_scratch_b, draft_cfg.block_size,
         );
     }
-    // Windowed draft context (SWA W on layers 0..n-2 + FULL-reach last
-    // layer spanning the entire supported context, `w_full = ctx_capacity`).
+    // Windowed draft context. Legacy split drafts use SWA W on layers 0..n-2
+    // plus a full-reach final layer. DFlash2 all-sliding drafts use W on every
+    // layer and allocate no long-reach final-layer ring.
     // DEFAULTS to the window the draft artifact declares it was trained with
     // (`DflashConfig::declared_window` <- `config.sliding_window`, gated on
-    // `use_sliding_window` and matching `layer_types`); that is the only width
-    // correct by construction. Mirrors `dflash_spec.rs::load_dflash_state` —
-    // keep the two in sync, they are the serve and bench halves of one policy.
+    // `use_sliding_window` and matching `layer_types`). Mirrors
+    // `dflash_spec.rs::load_dflash_state`; keep serve and bench in sync.
     //   HIPFIRE_DFLASH_WINDOW=<rows>  explicit override (warns on mismatch)
     //   HIPFIRE_DFLASH_WINDOW=0       explicit Legacy
     //   unset                         draft-declared window, else Legacy
@@ -1528,24 +1528,30 @@ fn main() {
     };
     let mut draft_scratch = match dflash_window {
         Some(w) => {
-            eprintln!(
-                "draft: windowed mode W={} (last layer reach: full {}){}",
-                w,
-                ctx_capacity,
-                if draft_cfg.declared_window == Some(w) {
-                    " [from draft metadata]"
-                } else {
-                    ""
-                }
-            );
+            let from_meta = if draft_cfg.declared_window == Some(w) {
+                " [from draft metadata]"
+            } else {
+                ""
+            };
+            let w_full = if draft_cfg.all_layers_sliding {
+                eprintln!(
+                    "draft: DFlash2 windowed, all {} layers sliding at W={}{}",
+                    draft_cfg.n_layers, w, from_meta
+                );
+                w
+            } else {
+                eprintln!(
+                    "draft: windowed mode W={} (last layer reach: full {}){}",
+                    w, ctx_capacity, from_meta
+                );
+                ctx_capacity
+            };
             DflashScratch::new_windowed(
                 &mut gpu,
                 &draft_cfg,
                 draft_scratch_b,
                 w,
-                // w_full UNBOUNDED: last (full-attention) layer spans the
-                // whole supported context (mirrors dflash_spec.rs).
-                ctx_capacity,
+                w_full,
                 ctx_capacity,
                 draft_weights.has_mq,
             )
