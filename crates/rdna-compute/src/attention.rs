@@ -8192,6 +8192,187 @@ impl Gpu {
         }
     }
 
+    /// Faithful non-causal sliding-window DFlash attention (scalar, tiled
+    /// online-softmax). Reuses the `attention_dflash_f32` algorithm and
+    /// launch conventions, adding visibility masking per the shared
+    /// contract.
+    ///
+    /// Contract (mirrors upstream DFlash2 `is_causal=false`):
+    /// - Q: [B * n_heads    * head_dim]  (block queries at positions base .. base+B-1)
+    /// - K: [L * n_kv_heads * head_dim]  where L = ctx_span + B
+    /// - V: [L * n_kv_heads * head_dim]
+    /// - out: [B * n_heads  * head_dim]
+    /// - Context keys are the contiguous suffix at absolute positions
+    ///   base-ctx_span .. base-1 (size ctx_span); block keys are
+    ///   base .. base+B-1; query qi is base+qi.
+    /// - A key kj (0 <= kj < L) at absolute pos base-ctx_span+kj is
+    ///   visible to query qi iff `abs((ctx_span + qi) - kj) < sliding_window`.
+    ///   This retains bidirectional within-block attention and matches
+    ///   DFlash2's non-causal window. Current callers refuse CASK with
+    ///   windowed draft mode, so context positions are contiguous.
+    /// - GQA: n_heads must be divisible by n_kv_heads.
+    /// - Numerical structure: dot-product unroll, cooperative
+    ///   V-accumulation, and tiled online-softmax are preserved verbatim
+    ///   for visible scores; invisible scores are forced to -INF and
+    ///   contribute zero weight. Fully masked rows cannot occur for
+    ///   valid B/window but the kernel emits zeros instead of NaN
+    ///   defensively.
+    ///
+    /// Grid: [n_heads, B, 1], block: next_pow2(max(L, head_dim)).min(256)
+    /// LDS: (tile_size + block_size + head_dim) * 4 bytes, same 56 KB
+    /// budget as `attention_dflash_f32`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_dflash_sliding_f32(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        v: &GpuTensor,
+        out: &GpuTensor,
+        b: usize,
+        l: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        ctx_span: usize,
+        sliding_window: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        // ── Validation: dimensions and window ─────────────────────────
+        assert!(b > 0, "attention_dflash_sliding_f32: B must be > 0");
+        assert!(l > 0, "attention_dflash_sliding_f32: L must be > 0");
+        assert!(
+            n_heads > 0 && n_kv_heads > 0,
+            "attention_dflash_sliding_f32: n_heads/n_kv_heads must be > 0"
+        );
+        assert!(head_dim > 0, "attention_dflash_sliding_f32: head_dim must be > 0");
+        assert!(
+            sliding_window > 0,
+            "attention_dflash_sliding_f32: sliding_window must be > 0"
+        );
+        assert!(
+            n_heads % n_kv_heads == 0,
+            "attention_dflash_sliding_f32: n_heads={n_heads} must be divisible by n_kv_heads={n_kv_heads}"
+        );
+        assert!(
+            ctx_span <= l,
+            "attention_dflash_sliding_f32: ctx_span={ctx_span} exceeds L={l}"
+        );
+        assert!(
+            l == ctx_span + b,
+            "attention_dflash_sliding_f32: L={l} must equal ctx_span({ctx_span}) + B({b})"
+        );
+        assert_eq!(
+            q.dtype,
+            DType::F32,
+            "attention_dflash_sliding_f32: q must be F32"
+        );
+        assert_eq!(
+            k.dtype,
+            DType::F32,
+            "attention_dflash_sliding_f32: k must be F32"
+        );
+        assert_eq!(
+            v.dtype,
+            DType::F32,
+            "attention_dflash_sliding_f32: v must be F32"
+        );
+        assert_eq!(
+            out.dtype,
+            DType::F32,
+            "attention_dflash_sliding_f32: out must be F32"
+        );
+        self.ensure_kernel(
+            "attention_dflash_sliding_f32",
+            kernels::ATTENTION_DFLASH_SLIDING_SRC,
+            "attention_dflash_sliding_f32",
+        )?;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        // Same LDS budget and tiling as attention_dflash_f32.
+        let block_size = std::cmp::min(256, std::cmp::max(l, head_dim)) as u32;
+        let block_size = block_size.next_power_of_two();
+        const LDS_BUDGET_F32: usize = 14_336; // 56 KB / 4 bytes
+        let fixed = block_size as usize + head_dim;
+        let max_tile_room = LDS_BUDGET_F32.saturating_sub(fixed);
+        let tile_size = std::cmp::min(l.max(1), max_tile_room.max(1));
+        let shared_mem = ((tile_size + block_size as usize + head_dim) * 4) as u32;
+        let q_ptr = q.buf.as_ptr();
+        let k_ptr = k.buf.as_ptr();
+        let v_ptr = v.buf.as_ptr();
+        let out_ptr = out.buf.as_ptr();
+        let b_i = b as i32;
+        let l_i = l as i32;
+        let nh = n_heads as i32;
+        let nkv = n_kv_heads as i32;
+        let hd = head_dim as i32;
+        let sc = scale;
+        let ts = tile_size as i32;
+        let cs = ctx_span as i32;
+        let sw = sliding_window as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &q_ptr as *const _ as *mut c_void,
+            &k_ptr as *const _ as *mut c_void,
+            &v_ptr as *const _ as *mut c_void,
+            &out_ptr as *const _ as *mut c_void,
+            &b_i as *const _ as *mut c_void,
+            &l_i as *const _ as *mut c_void,
+            &nh as *const _ as *mut c_void,
+            &nkv as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+            &sc as *const _ as *mut c_void,
+            &ts as *const _ as *mut c_void,
+            &cs as *const _ as *mut c_void,
+            &sw as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "attention_dflash_sliding_f32",
+            [n_heads as u32, b as u32, 1],
+            [block_size, 1, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(q_ptr);
+                blob.push_ptr(k_ptr);
+                blob.push_ptr(v_ptr);
+                blob.push_ptr(out_ptr);
+                blob.push_i32(b_i);
+                blob.push_i32(l_i);
+                blob.push_i32(nh);
+                blob.push_i32(nkv);
+                blob.push_i32(hd);
+                blob.push_f32(sc);
+                blob.push_i32(ts);
+                blob.push_i32(cs);
+                blob.push_i32(sw);
+                blob
+            },
+        )
+    }
+
+    /// Alias for SWA draft layers — forwards to
+    /// [`Self::attention_dflash_sliding_f32`] with identical contract.
+    /// Exists so windowed-speculator call sites can name the windowed
+    /// variant explicitly without caring about the DFlash2 prefix.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_dflash_swa_f32(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        v: &GpuTensor,
+        out: &GpuTensor,
+        b: usize,
+        l: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        ctx_span: usize,
+        sliding_window: usize,
+    ) -> HipResult<()> {
+        self.attention_dflash_sliding_f32(
+            q, k, v, out, b, l, n_heads, n_kv_heads, head_dim, ctx_span, sliding_window,
+        )
+    }
+
     /// WMMA-accelerated FlashAttention-style non-causal attention for
     /// the **large-B / large-L** case. Same Q/K/V layout and contract as
     /// [`Self::attention_dflash_f32`] — drop-in replacement.

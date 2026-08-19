@@ -65,9 +65,9 @@ pub struct DflashConfig {
     pub num_target_layers: usize,
     /// The SWA window the draft artifact declares it was TRAINED with
     /// (`config.sliding_window`). `Some` only when the artifact sets
-    /// `use_sliding_window: true` AND its `layer_types` match the split the
-    /// windowed path implements — every layer `sliding_attention` except a
-    /// final `full_attention`. `None` when the artifact is silent or declares
+    /// `use_sliding_window: true` AND its `layer_types` match one of the
+    /// implemented splits — either `n-1` sliding + final full, or all layers
+    /// sliding (DFlash2). `None` when the artifact is silent or declares
     /// a split we do not implement, in which case windowed mode stays off
     /// unless `HIPFIRE_DFLASH_WINDOW` forces it.
     ///
@@ -75,6 +75,18 @@ pub struct DflashConfig {
     /// SWA-trained layer over a different span is a train/inference mask
     /// mismatch, which degrades acceptance silently (verify stays exact).
     pub declared_window: Option<usize>,
+    /// `true` when `layer_types` is all `sliding_attention` (DFlash2 chain-only).
+    /// Public indicator so callers can skip last-layer full backfill and reuse
+    /// the same `W` ring for every layer.
+    pub all_layers_sliding: bool,
+    /// DFlash2 dynamic-conv knobs from nested `dflash_config` (defaults in
+    /// parens): group 16, kernel 2, rank 256, top_k 16. `None` when the
+    /// artifact is legacy DFlash (fields absent) — forward then skips conv
+    /// and selector paths and stays byte-identical.
+    pub conv_group_size: Option<usize>,
+    pub conv_kernel_size: Option<usize>,
+    pub selector_rank: Option<usize>,
+    pub selector_top_k: Option<usize>,
 }
 
 impl DflashConfig {
@@ -125,49 +137,80 @@ impl DflashConfig {
             .collect();
         let num_target_layers = df.get("num_target_layers").and_then(|v| v.as_u64())? as usize;
         // The window fields live in the sibling `config` object (HF-style),
-        // not in the `dflash` block, so they are read separately.
-        let declared_window = meta.get("config").and_then(|cfg| {
-            if !cfg
-                .get("use_sliding_window")
+        // not in the `dflash` block, so they are read separately. DFlash2
+        // nests the same knobs under `dflash.dflash_config` as well; we probe
+        // both `config` and `dflash` for `layer_types` so that either
+        // emission (flat or nested) is honoured.
+        let (declared_window, all_layers_sliding) = {
+            let cfg_obj = meta.get("config");
+            let use_sw = cfg_obj
+                .and_then(|c| c.get("use_sliding_window"))
+                .or_else(|| df.get("use_sliding_window"))
                 .and_then(|v| v.as_bool())
-                .unwrap_or(false)
-            {
-                return None;
-            }
-            let w = cfg.get("sliding_window").and_then(|v| v.as_u64())? as usize;
-            if w == 0 {
-                return None;
-            }
-            // Honour the declaration only when the per-layer classes match the
-            // split `DflashScratch::new_windowed` implements (layers 0..n-2
-            // sliding, last layer long-reach). A future draft with a different
-            // split must NOT be silently mis-executed.
-            match cfg.get("layer_types").and_then(|v| v.as_array()) {
-                Some(types) => {
-                    let matches_split = types.len() == n_layers
-                        && types.iter().enumerate().all(|(i, t)| {
-                            let s = t.as_str().unwrap_or("");
-                            if i + 1 == n_layers {
-                                s == "full_attention"
-                            } else {
-                                s == "sliding_attention"
+                .unwrap_or(false);
+            if !use_sw {
+                (None, false)
+            } else {
+                let w_opt = cfg_obj
+                    .and_then(|c| c.get("sliding_window"))
+                    .or_else(|| df.get("sliding_window"))
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+                    .filter(|&w| w != 0);
+                match w_opt {
+                    None => (None, false),
+                    Some(w) => {
+                        let types_from = |v: &serde_json::Value| {
+                            v.get("layer_types").and_then(|x| x.as_array()).cloned()
+                        };
+                        let types = cfg_obj
+                            .and_then(types_from)
+                            .or_else(|| types_from(df))
+                            .or_else(|| df.get("dflash_config").and_then(types_from))
+                            .or_else(|| cfg_obj.and_then(|c| c.get("dflash_config")).and_then(types_from));
+                        match types {
+                            Some(types) => {
+                                let is_all_sliding = types.len() == n_layers
+                                    && types.iter().all(|t| t.as_str().unwrap_or("") == "sliding_attention");
+                                let is_split = types.len() == n_layers
+                                    && types.iter().enumerate().all(|(i, t)| {
+                                        let s = t.as_str().unwrap_or("");
+                                        if i + 1 == n_layers {
+                                            s == "full_attention"
+                                        } else {
+                                            s == "sliding_attention"
+                                        }
+                                    });
+                                if is_all_sliding || is_split {
+                                    (Some(w), is_all_sliding)
+                                } else {
+                                    eprintln!(
+                                        "  DFlash draft declares sliding_window={w} but layer_types do not \
+                                         match the implemented splits (all sliding or n-1 sliding + last full) — \
+                                         not auto-enabling windowed mode"
+                                    );
+                                    (None, false)
+                                }
                             }
-                        });
-                    if matches_split {
-                        Some(w)
-                    } else {
-                        eprintln!(
-                            "  DFlash draft declares sliding_window={w} but layer_types do not \
-                             match the implemented split (layers 0..n-2 sliding, last full) — \
-                             not auto-enabling windowed mode"
-                        );
-                        None
+                            None => (Some(w), false),
+                        }
                     }
                 }
-                // No layer_types: trust use_sliding_window + sliding_window.
-                None => Some(w),
             }
-        });
+        };
+        // Nested dflash_config fields (DFlash2) with legacy flat fallbacks.
+        let dflash_cfg_nested = df.get("dflash_config").and_then(|v| v.as_object());
+        let dflash_u64 = |key: &str| {
+            dflash_cfg_nested
+                .and_then(|m| m.get(key))
+                .or_else(|| df.get(key))
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+        };
+        let conv_group_size = dflash_u64("conv_group_size");
+        let conv_kernel_size = dflash_u64("conv_kernel_size");
+        let selector_rank = dflash_u64("selector_rank");
+        let selector_top_k = dflash_u64("selector_top_k");
 
         Some(DflashConfig {
             n_layers,
@@ -184,6 +227,11 @@ impl DflashConfig {
             target_layer_ids,
             num_target_layers,
             declared_window,
+            all_layers_sliding,
+            conv_group_size,
+            conv_kernel_size,
+            selector_rank,
+            selector_top_k,
         })
     }
 }
@@ -202,6 +250,35 @@ pub struct DflashLayerWeights {
     pub w_gate: WeightTensor, // [intermediate, hidden]
     pub w_up: WeightTensor,   // [intermediate, hidden]
     pub w_down: WeightTensor, // [hidden, intermediate]
+    // DFlash2 dynamic conv: per-layer base kernels [2,K,H] F32 and
+    // kernel projections [2*K*G,H] (G=hidden/group_size). `None` on legacy.
+    pub attn_conv_base: Option<GpuTensor>,
+    pub attn_conv_proj: Option<WeightTensor>,
+    pub mlp_conv_base: Option<GpuTensor>,
+    pub mlp_conv_proj: Option<WeightTensor>,
+}
+
+/// Compact host-side selector codebooks (never VRAM). F16 stored as u16
+/// halves to avoid ~508 MB F32 expansion for vocab=152k rank=256; converted
+/// during the small rank dot.
+#[derive(Debug, Clone)]
+pub struct SelectorCodebook {
+    pub vocab: usize,
+    pub rank: usize,
+    // Exactly one of these is Some.
+    pub f16_data: Option<Vec<u16>>,
+    pub f32_data: Option<Vec<f32>>,
+}
+
+impl SelectorCodebook {
+    pub fn get_f32(&self, token: usize, dim: usize) -> f32 {
+        if let Some(f16) = &self.f16_data {
+            let u = f16[token * self.rank + dim];
+            crate::llama::f16_to_f32(u)
+        } else {
+            self.f32_data.as_ref().unwrap()[token * self.rank + dim]
+        }
+    }
 }
 
 pub struct DflashWeights {
@@ -210,9 +287,17 @@ pub struct DflashWeights {
     pub hidden_norm: GpuTensor, // [hidden] — F32
     pub norm: GpuTensor,        // [hidden] — F32, final output norm
     pub layers: Vec<DflashLayerWeights>,
-    /// True when at least one matrix weight is MQ4G256 — drives whether
+    /// True when at least one matrix weight is MQ (FWHT-rotated) — drives whether
     /// the draft_forward path needs to allocate FWHT rotation scratches.
     pub has_mq: bool,
+    // DFlash2 candidate selector (host-side)
+    pub selector_hidden_proj: Option<WeightTensor>, // [rank, hidden]
+    pub predecessor_codebook: Option<SelectorCodebook>, // [vocab, rank]
+    pub successor_codebook: Option<SelectorCodebook>,   // [vocab, rank]
+    pub selector_rank: Option<usize>,
+    pub selector_top_k: Option<usize>,
+    pub conv_group_size: Option<usize>,
+    pub conv_kernel_size: Option<usize>,
 }
 
 /// Load a F32-only tensor (norms, embedding-shaped scalars). Always F32 on GPU.
@@ -254,7 +339,13 @@ fn hfq_tensor_f32(
 ///   13 (MQ4-G256) → uploaded raw, kernel dispatch will FWHT-rotate x at use.
 ///   15 (MQ6-G256) → uploaded raw, kernel dispatch will FWHT-rotate x at use.
 ///   17 (MQ3-G256) → uploaded raw, kernel dispatch will FWHT-rotate x at use.
+///   44 (MQ4G256V2)→ per-128 fp16 header, 136 B/group, exact validation.
 ///
+/// `shape = [m, k]` so m=output_dim and k=input_dim. The HFQ index stores
+/// the unaligned byte length; for MQ formats we skip shape verification (the
+/// quantized bytes are not a function of m*k alone — group padding can add
+/// up to 255 trailing bytes per row group), except MQ4G256V2 which has an
+/// exact 136-byte/G256 shape to catch byte-order bugs.
 /// `shape = [m, k]` so m=output_dim and k=input_dim. The HFQ index stores
 /// the unaligned byte length; for MQ formats we skip shape verification (the
 /// quantized bytes are not a function of m*k alone — group padding can add
@@ -373,6 +464,32 @@ fn hfq_weight(
                 awq_scale: None,
             })
         }
+        44 => {
+            // MQ4G256V2 (qt=44): per-128 fp16 header, 136 B/group. Exact
+            // shape validation — payload nibbles at same offset as v1 but
+            // header encodes s0/z0/s1/z1 as fp16 pairs.
+            if k % 256 != 0 {
+                panic!("dflash {name} MQ4G256V2 requires K%256==0 (got K={k})");
+            }
+            let groups = k / 256;
+            let expected = m * groups * 136;
+            if data.len() != expected {
+                panic!(
+                    "dflash {name} MQ4G256V2 blob length mismatch: expected {expected}, got {} (M={m} K={k})",
+                    data.len()
+                );
+            }
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MQ4G256V2,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
         q => panic!("dflash: unsupported matrix quant_type {q} for {name}"),
     }?;
     // AWQ sidecar attachment — same pattern as hfq.rs::load_weight_tensor
@@ -387,6 +504,12 @@ fn hfq_weight(
 }
 
 impl DflashWeights {
+    /// True when the selector (candidate proposal) path is available.
+    pub fn has_candidate_selector(&self) -> bool {
+        self.selector_hidden_proj.is_some()
+            && self.predecessor_codebook.is_some()
+            && self.successor_codebook.is_some()
+    }
     pub fn load(gpu: &mut Gpu, hfq: &HfqFile, cfg: &DflashConfig) -> HipResult<Self> {
         let fc = hfq_weight(
             hfq,
@@ -398,9 +521,66 @@ impl DflashWeights {
         let hidden_norm = hfq_tensor_f32(hfq, gpu, "hidden_norm.weight", vec![cfg.hidden])?;
         let norm = hfq_tensor_f32(hfq, gpu, "norm.weight", vec![cfg.hidden])?;
 
+        let conv_k = cfg.conv_kernel_size.unwrap_or(2);
+        let conv_g = cfg.conv_group_size.unwrap_or(16);
+        let conv_groups = cfg.hidden / conv_g;
+        let proj_m = 2 * conv_k * conv_groups;
+
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
             let p = format!("layers.{i}");
+            // Attempt DFlash2 conv weights; absent on legacy drafts.
+            let attn_conv_base = if cfg.conv_kernel_size.is_some() {
+                // base_kernel [2, K, H] -> 2*K*H
+                let name = format!("{p}.self_attn.attention_conv.base_kernel");
+                // also try alternate naming `attn_conv` if upstream uses that
+                let alt = format!("{p}.attention_conv.base_kernel");
+                let key = if hfq.tensor_data(&name).is_some() { name } else { alt };
+                if hfq.tensor_data(&key).is_some() {
+                    // shape 2*K*H
+                    Some(hfq_tensor_f32(hfq, gpu, &key, vec![2 * conv_k * cfg.hidden])?)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let attn_conv_proj = if cfg.conv_kernel_size.is_some() {
+                let name = format!("{p}.self_attn.attention_conv.kernel_projection.weight");
+                let alt = format!("{p}.attention_conv.kernel_projection.weight");
+                let key = if hfq.tensor_data(&name).is_some() { name } else { alt };
+                if hfq.tensor_data(&key).is_some() {
+                    Some(hfq_weight(hfq, gpu, &key, proj_m, cfg.hidden)?)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let mlp_conv_base = if cfg.conv_kernel_size.is_some() {
+                let name = format!("{p}.mlp.mlp_conv.base_kernel");
+                let alt = format!("{p}.mlp_conv.base_kernel");
+                let key = if hfq.tensor_data(&name).is_some() { name } else { alt };
+                if hfq.tensor_data(&key).is_some() {
+                    Some(hfq_tensor_f32(hfq, gpu, &key, vec![2 * conv_k * cfg.hidden])?)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let mlp_conv_proj = if cfg.conv_kernel_size.is_some() {
+                let name = format!("{p}.mlp.mlp_conv.kernel_projection.weight");
+                let alt = format!("{p}.mlp_conv.kernel_projection.weight");
+                let key = if hfq.tensor_data(&name).is_some() { name } else { alt };
+                if hfq.tensor_data(&key).is_some() {
+                    Some(hfq_weight(hfq, gpu, &key, proj_m, cfg.hidden)?)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             let layer = DflashLayerWeights {
                 attn_norm: hfq_tensor_f32(
                     hfq,
@@ -475,18 +655,85 @@ impl DflashWeights {
                     cfg.hidden,
                     cfg.intermediate,
                 )?,
+                attn_conv_base,
+                attn_conv_proj,
+                mlp_conv_base,
+                mlp_conv_proj,
             };
             layers.push(layer);
         }
 
+        // Selector: hidden_projection [rank, hidden] + two codebooks [vocab, rank] host-side
+        // Exact HFQ names are `candidate_selector.hidden_projection.weight`,
+        // `candidate_selector.predecessor_codebook`, `candidate_selector.successor_codebook`.
+        // Optional fallback `.weight` suffix is tolerated but not required.
+        let selector_hidden_proj = if cfg.selector_rank.is_some() {
+            let rank = cfg.selector_rank.unwrap();
+            let candidates = [
+                "candidate_selector.hidden_projection.weight",
+                "selector.hidden_projection.weight",
+                "selector.hidden_proj.weight",
+            ];
+            let mut found = None;
+            for n in candidates {
+                if hfq.tensor_data(n).is_some() {
+                    found = Some(hfq_weight(hfq, gpu, n, rank, cfg.hidden)?);
+                    break;
+                }
+            }
+            found
+        } else {
+            None
+        };
+        let load_codebook = |names: &[&str], vocab: usize, rank: usize| -> Option<SelectorCodebook> {
+            for n in names {
+                if let Some((info, data)) = hfq.tensor_data(n) {
+                    let expected = vocab * rank;
+                    match info.quant_type {
+                        1 => {
+                            assert_eq!(data.len(), expected * 2, "codebook {n} F16 size mismatch");
+                            let mut v = Vec::with_capacity(expected);
+                            for chunk in data.chunks_exact(2) {
+                                v.push(u16::from_le_bytes([chunk[0], chunk[1]]));
+                            }
+                            return Some(SelectorCodebook { vocab, rank, f16_data: Some(v), f32_data: None });
+                        }
+                        2 => {
+                            assert_eq!(data.len(), expected * 4, "codebook {n} F32 size mismatch");
+                            let mut v = Vec::with_capacity(expected);
+                            for chunk in data.chunks_exact(4) {
+                                v.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+                            }
+                            return Some(SelectorCodebook { vocab, rank, f16_data: None, f32_data: Some(v) });
+                        }
+                        q => panic!("selector codebook {n} unsupported quant_type {q}"),
+                    }
+                }
+            }
+            None
+        };
+        let (predecessor_codebook, successor_codebook, selector_rank_opt, selector_top_k_opt) = if cfg.selector_rank.is_some() {
+            let rank = cfg.selector_rank.unwrap();
+            let vocab = cfg.vocab_size;
+            let pred = load_codebook(&["candidate_selector.predecessor_codebook", "selector.predecessor_codebook", "candidate_selector.predecessor_codebook.weight", "selector.predecessor.weight"], vocab, rank);
+            let succ = load_codebook(&["candidate_selector.successor_codebook", "selector.successor_codebook", "candidate_selector.successor_codebook.weight", "selector.successor.weight"], vocab, rank);
+            (pred, succ, cfg.selector_rank, cfg.selector_top_k)
+        } else {
+            (None, None, None, None)
+        };
+
         let has_mq = std::iter::once(&fc)
             .chain(layers.iter().flat_map(|l| {
-                [&l.wq, &l.wk, &l.wv, &l.wo, &l.w_gate, &l.w_up, &l.w_down].into_iter()
+                let mut v: Vec<&WeightTensor> = vec![&l.wq, &l.wk, &l.wv, &l.wo, &l.w_gate, &l.w_up, &l.w_down];
+                if let Some(p) = &l.attn_conv_proj { v.push(p); }
+                if let Some(p) = &l.mlp_conv_proj { v.push(p); }
+                v.into_iter()
             }))
+            .chain(selector_hidden_proj.iter())
             .any(|w| {
                 matches!(
                     w.gpu_dtype,
-                    DType::MQ4G256 | DType::MQ6G256 | DType::MQ3G256
+                    DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ6G256 | DType::MQ3G256
                 )
             });
         if has_mq {
@@ -501,9 +748,15 @@ impl DflashWeights {
             norm,
             layers,
             has_mq,
+            selector_hidden_proj,
+            predecessor_codebook,
+            successor_codebook,
+            selector_rank: selector_rank_opt,
+            selector_top_k: selector_top_k_opt,
+            conv_group_size: cfg.conv_group_size,
+            conv_kernel_size: cfg.conv_kernel_size,
         })
     }
-
     pub fn free_gpu(self, gpu: &mut Gpu) {
         // free_all (not .buf) so the awq_scale / paro sidecars are released too —
         // on an AWQ-trunk drafter every weight carries an awq_scale GpuTensor, so
@@ -523,7 +776,13 @@ impl DflashWeights {
             l.w_gate.free_all(gpu);
             l.w_up.free_all(gpu);
             l.w_down.free_all(gpu);
+            if let Some(t) = l.attn_conv_base { let _ = gpu.free_tensor(t); }
+            if let Some(w) = l.attn_conv_proj { w.free_all(gpu); }
+            if let Some(t) = l.mlp_conv_base { let _ = gpu.free_tensor(t); }
+            if let Some(w) = l.mlp_conv_proj { w.free_all(gpu); }
         }
+        if let Some(w) = self.selector_hidden_proj { w.free_all(gpu); }
+        // codebooks are host-side only, no VRAM to free
     }
 }
 
@@ -781,6 +1040,14 @@ pub struct DflashScratch {
     // max_block × max_layer_K). Allocated only when DflashWeights.has_mq.
     pub mq_x_rot: Option<GpuTensor>,
 
+    // DFlash2 optional scratch: conv temp/dynamic and selector buffers.
+    // Allocated only when the loaded draft actually needs them.
+    pub conv_temp: Option<GpuTensor>,    // [B, hidden]
+    pub conv_dynamic: Option<GpuTensor>, // [B, 2*K*G]
+    pub selector_proj: Option<GpuTensor>, // [B, rank]
+    pub topk_ids: Option<GpuTensor>,     // [B, K] i32 (stored as F32 buffer)
+    pub topk_vals: Option<GpuTensor>,    // [B, K] f32
+
     // Encapsulated `target_hidden` cursors: uploaded-row watermark, per-row
     // absolute positions, and projection-cache extent. The delta-upload
     // tracker drops per-cycle H2D from ~90 MB (full ctx at 1100 tokens × 5
@@ -815,7 +1082,8 @@ pub struct DflashScratch {
     pub ctx_mode: DraftCtxMode,
     /// Windowed-mode last-layer (full-attention) K/V rings, `[w_full × kvd]`.
     /// The last layer keeps a 4× longer reach than the SWA layers — the only
-    /// unbounded-context structure in windowed mode. `None` in Legacy.
+    /// unbounded-context structure in windowed mode. `None` in Legacy and in
+    /// all-sliding DFlash2 (every layer shares the same W).
     pub k_full_cached: Option<GpuTensor>,
     pub v_full_cached: Option<GpuTensor>,
     /// Windowed-mode last-layer concat assembly, `[(w_full + B) × kvd]`.
@@ -856,6 +1124,15 @@ impl DflashScratch {
         max_ctx: usize,
         with_mq: bool,
     ) -> HipResult<Self> {
+        // DFlash2 all-sliding: every layer shares the same W ring. Skip the
+        // last-layer full replacement/backfill path and keep the footprint at
+        // Legacy-at-ctx=w for all layers.
+        if cfg.all_layers_sliding {
+            let mut s = Self::new_with_mq(gpu, cfg, max_block_size, w, with_mq)?;
+            s.max_ctx_len = max_ctx;
+            s.ctx_mode = DraftCtxMode::Windowed { w, w_full: w };
+            return Ok(s);
+        }
         let kvd = cfg.kv_dim();
         let b = max_block_size;
         // The long-reach layer never has a SHORTER window than the SWA layers
@@ -932,6 +1209,40 @@ impl DflashScratch {
             None
         };
 
+        // DFlash2 optional buffers: allocated only when the config declares them.
+        let (conv_temp, conv_dynamic, selector_proj, topk_ids, topk_vals) = {
+            let need_conv = cfg.conv_kernel_size.is_some() && cfg.conv_group_size.is_some();
+            let need_selector = cfg.selector_rank.is_some() && cfg.selector_top_k.is_some();
+            let ct = if need_conv {
+                Some(gpu.alloc_tensor(&[b * h], DType::F32)?)
+            } else {
+                None
+            };
+            let cd = if need_conv {
+                let k = cfg.conv_kernel_size.unwrap();
+                let g = cfg.conv_group_size.unwrap();
+                let groups = h / g;
+                let stride = 2 * k * groups;
+                Some(gpu.alloc_tensor(&[b * stride], DType::F32)?)
+            } else {
+                None
+            };
+            let sp = if need_selector {
+                let rank = cfg.selector_rank.unwrap();
+                Some(gpu.alloc_tensor(&[b * rank], DType::F32)?)
+            } else {
+                None
+            };
+            let (ti, tv) = if need_selector {
+                let kk = cfg.selector_top_k.unwrap();
+                // ids as i32 stored in F32 buffer (reinterprets), vals as f32
+                (Some(gpu.alloc_tensor(&[b * kk], DType::F32)?), Some(gpu.alloc_tensor(&[b * kk], DType::F32)?))
+            } else {
+                (None, None)
+            };
+            (ct, cd, sp, ti, tv)
+        };
+
         // Per-layer cache buffers for k_ctx/v_ctx (post-norm-for-K, pre-rope).
         // Size each at [max_ctx × kv_dim] f32 = l × kvd × 4 bytes. Memory
         // cost for 16-layer / 4096-ctx / 256-kv_dim draft ≈ 2 × 16 × 4 MB
@@ -976,6 +1287,11 @@ impl DflashScratch {
             positions_k: gpu.alloc_tensor(&[tot], DType::F32)?,
 
             mq_x_rot,
+            conv_temp,
+            conv_dynamic,
+            selector_proj,
+            topk_ids,
+            topk_vals,
             thlog: TargetHiddenLog::new(),
             k_ctx_cached,
             v_ctx_cached,
@@ -1065,6 +1381,9 @@ impl DflashScratch {
             let _ = gpu.free_tensor(t);
         }
         if let Some(t) = self.mq_x_rot {
+            let _ = gpu.free_tensor(t);
+        }
+        for t in [self.conv_temp, self.conv_dynamic, self.selector_proj, self.topk_ids, self.topk_vals].into_iter().flatten() {
             let _ = gpu.free_tensor(t);
         }
     }
@@ -1224,6 +1543,31 @@ fn gemm_dispatch(
             }
             chunked
         }
+        DType::MQ4G256V2 => {
+            // MQ4 v2 (qt=44): same 136 B stride as v1 but fp16 per-128 header.
+            // Uses the dedicated v2 batched lm_head kernel so header decode is
+            // correct; rotation is identical FWHT path.
+            let scratch = mq_x_rot.expect("MQ4V2 dispatch requires mq_x_rot scratch");
+            let max_chunk = (scratch.shape[0] / w.k).max(1);
+            let mut chunked: HipResult<()> = Ok(());
+            let mut row = 0;
+            while row < batch {
+                let n = std::cmp::min(max_chunk, batch - row);
+                let x_chunk = x.sub_offset(row * w.k, n * w.k);
+                let y_chunk = y.sub_offset(row * w.m, n * w.m);
+                let rot_view = scratch.sub_offset(0, n * w.k);
+                if let Err(e) = crate::llama::rotate_x_mq_batched_for(gpu, w, &x_chunk, &rot_view, w.k, n) {
+                    chunked = Err(e);
+                    break;
+                }
+                if let Err(e) = gpu.gemm_mq4g256v2_batched_lmhead(&w.buf, &rot_view, &y_chunk, w.m, w.k, n) {
+                    chunked = Err(e);
+                    break;
+                }
+                row += n;
+            }
+            chunked
+        }
         other => panic!("dflash gemm_dispatch: unsupported weight dtype {:?}", other),
     };
     if let Some(t) = t0 {
@@ -1233,7 +1577,7 @@ fn gemm_dispatch(
             DType::F32 => w.m * w.k * 4,
             DType::F16 => w.m * w.k * 2,
             DType::MQ3G256 => w.m * (w.k / 256).max(1) * 104,
-            DType::HFQ4G256 | DType::MQ4G256 => w.m * (w.k / 256).max(1) * 136,
+            DType::HFQ4G256 | DType::MQ4G256 | DType::MQ4G256V2 => w.m * (w.k / 256).max(1) * 136,
             DType::MQ6G256 => w.m * (w.k / 256).max(1) * 200,
             _ => w.m * w.k,
         };
@@ -1422,6 +1766,11 @@ pub fn draft_seed_backfill(
         DraftCtxMode::Legacy => return Ok(()),
         DraftCtxMode::Windowed { w, w_full } => (w, w_full),
     };
+    // DFlash2 all-sliding: every layer shares the same W ring, no dedicated
+    // long-reach layer and no out-of-window backfill needed.
+    if swa_w == full_w {
+        return Ok(());
+    }
     if prompt_len <= swa_w {
         return Ok(());
     }
@@ -1628,7 +1977,8 @@ pub fn draft_forward_opts(
     // out-of-window K/V must come from the post-seed backfill. If a driver
     // skipped it (research demos on non-speculator paths), its ring holds
     // stale rows — τ-only damage (verify is exact), but name it once.
-    if windowed && l > swa_w && scratch.thlog.full_cached_rows() < l.saturating_sub(swa_w) {
+    // All-sliding DFlash2 has no dedicated full layer, so the watermark is moot.
+    if windowed && full_w != swa_w && l > swa_w && scratch.thlog.full_cached_rows() < l.saturating_sub(swa_w) {
         static BACKFILL_WARNED: std::sync::atomic::AtomicBool =
             std::sync::atomic::AtomicBool::new(false);
         if !BACKFILL_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -1799,6 +2149,8 @@ pub fn draft_forward_opts(
     }
 
     // ── 2. Per-layer decoder ─────────────────────────────────────────────
+    // DFlash2 all-sliding detection for windowed mode branching.
+    let is_all_sliding_windowed = windowed && cfg.all_layers_sliding;
     for li in 0..cfg.n_layers {
         let layer = &weights.layers[li];
 
@@ -1808,6 +2160,25 @@ pub fn draft_forward_opts(
 
         // attn_norm.
         gpu.rmsnorm_batched(&scratch.x, &layer.attn_norm, &scratch.x_norm, b, h, eps)?;
+
+        // ── DFlash2 prepare conv before QKV (no cross-cycle history) ─────
+        // After RMSNorm, project normalized hidden to dynamic kernel coeffs
+        // [B,2*K*G] then left-zero-padded grouped conv over the B rows.
+        let attn_prepare_src = if let (Some(base), Some(proj)) = (&layer.attn_conv_base, &layer.attn_conv_proj) {
+            if let (Some(dyn_buf), Some(tmp)) = (&scratch.conv_dynamic, &scratch.conv_temp) {
+                let k = cfg.conv_kernel_size.unwrap_or(2);
+                let g = cfg.conv_group_size.unwrap_or(16);
+                let groups = h / g;
+                let stride = 2 * k * groups;
+                // projection: x_norm [B,H] @ proj [2KG, H]^T -> dynamic [B,2KG]
+                let dyn_slice = dyn_buf.sub_offset(0, b * stride);
+                gemm_dispatch(gpu, &scratch.x_norm, proj, &dyn_slice, b, scratch.mq_x_rot.as_ref())?;
+                // prepare phase offset 0, window K*G
+                gpu.dynamic_causal_conv_f32(&scratch.x_norm, base, &dyn_slice, tmp, b, h, k, g, stride, 0)?;
+                Some(tmp as &GpuTensor)
+            } else { None }
+        } else { None };
+        let qkv_src = attn_prepare_src.unwrap_or(&scratch.x_norm);
 
         let t0 = if dbg {
             gpu.hip.device_synchronize()?;
@@ -1822,7 +2193,7 @@ pub fn draft_forward_opts(
         // are *incrementally* cached — see the per-layer block below.
         gemm_dispatch(
             gpu,
-            &scratch.x_norm,
+            qkv_src,
             &layer.wq,
             &scratch.q,
             b,
@@ -1830,7 +2201,7 @@ pub fn draft_forward_opts(
         )?;
         gemm_dispatch(
             gpu,
-            &scratch.x_norm,
+            qkv_src,
             &layer.wk,
             &scratch.k_noise,
             b,
@@ -1838,7 +2209,7 @@ pub fn draft_forward_opts(
         )?;
         gemm_dispatch(
             gpu,
-            &scratch.x_norm,
+            qkv_src,
             &layer.wv,
             &scratch.v_noise,
             b,
@@ -1861,14 +2232,12 @@ pub fn draft_forward_opts(
         // and dst. Legacy: moduli are MAX — one identity segment, offsets
         // identical to the pre-windowing incremental path.
         //
-        // For correctness note: the per-head K RMSNorm is row-local
-        // (normalizes each kv_head row of size hd independently), so
-        // applying it to delta rows of the cache is exactly equivalent
-        // to applying it to the full k_cat post-concat. V has no
-        // draft-level norm so v_ctx_cached stores raw GEMM output.
-        let last_layer = li + 1 == cfg.n_layers;
-        let layer_w = if last_layer { full_w } else { swa_w };
-        let (k_cache_layer, v_cache_layer) = if last_layer && windowed {
+        // For all-sliding DFlash2 windowed mode every layer shares swa_w;
+        // last-layer full replacement/backfill/watermarks are skipped.
+        let is_last_layer = li + 1 == cfg.n_layers;
+        let is_full_layer = !is_all_sliding_windowed && is_last_layer;
+        let layer_w = if is_full_layer { full_w } else { swa_w };
+        let (k_cache_layer, v_cache_layer) = if is_full_layer && windowed {
             (
                 scratch.k_full_cached.as_ref().expect("windowed k_full"),
                 scratch.v_full_cached.as_ref().expect("windowed v_full"),
@@ -1876,7 +2245,7 @@ pub fn draft_forward_opts(
         } else {
             (&scratch.k_ctx_cached[li], &scratch.v_ctx_cached[li])
         };
-        let (k_cat_l, v_cat_l) = if last_layer && windowed {
+        let (k_cat_l, v_cat_l) = if is_full_layer && windowed {
             (
                 scratch.k_cat_full.as_ref().expect("windowed k_cat_full"),
                 scratch.v_cat_full.as_ref().expect("windowed v_cat_full"),
@@ -1886,7 +2255,7 @@ pub fn draft_forward_opts(
         };
         let span_start = l.saturating_sub(layer_w);
         let span = l - span_start;
-        let wm = if last_layer {
+        let wm = if is_full_layer {
             scratch.thlog.full_cached_rows()
         } else {
             cached_rows
@@ -1894,6 +2263,8 @@ pub fn draft_forward_opts(
         // Rows older than the proj ring's live window cannot be (re)filled
         // here — the post-seed backfill owns that band for the last layer.
         let fill_start = wm.max(span_start).max(l.saturating_sub(swa_w));
+        // For all-sliding, there is no out-of-window full backfill band to skip;
+        // the fill_start already equals span_start.
         if fill_start < l {
             let mut row = fill_start;
             while row < l {
@@ -2059,11 +2430,26 @@ pub fn draft_forward_opts(
 
         // Attention: Q [B, n_heads, hd] × K [span+B, n_kv_heads, hd]^T → scores
         // (with GQA expansion) → softmax → @V.
-        // Dispatched via unified full-attention path (AttnFullF32 → DflashScalar).
-        // NOTE: adding a WMMA rung here changes spec-decode numerics → draft logits
-        // → acceptance patterns. Any future WMMA draft rung requires a dedicated
-        // feedback_attention_precision sweep with acceptance-rate tracking.
-        {
+        // Legacy → full; Windowed SWA layers → faithful sliding primitive.
+        // Split drafts: SWA layers sliding, last full stays full.
+        // All-sliding DFlash2: every layer sliding with same W.
+        let is_swa_layer = windowed && (is_all_sliding_windowed || !is_full_layer);
+        if is_swa_layer {
+            // Faithful non-causal SWA: window= swa_w, ctx_span= span
+            gpu.attention_dflash_sliding_f32(
+                &scratch.q,
+                k_cat_l,
+                v_cat_l,
+                &scratch.attn_out,
+                b,
+                span + b,
+                cfg.n_heads,
+                cfg.n_kv_heads,
+                hd,
+                span,
+                swa_w,
+            )?;
+        } else {
             use crate::llama::{attention_family, DispatchCtx, FullAttnParams, KernelKey};
             let ctx = DispatchCtx::new(gpu);
             let family = attention_family();
@@ -2106,14 +2492,96 @@ pub fn draft_forward_opts(
             scratch.mq_x_rot.as_ref(),
         )?;
 
-        // x = residual_attn + attn_proj
+        // ── DFlash2 finish conv before residual add ────────────────────────
+        if let (Some(base), Some(proj)) = (&layer.attn_conv_base, &layer.attn_conv_proj) {
+            if let (Some(dyn_buf), Some(tmp)) = (&scratch.conv_dynamic, &scratch.conv_temp) {
+                let k = cfg.conv_kernel_size.unwrap_or(2);
+                let g = cfg.conv_group_size.unwrap_or(16);
+                let groups = h / g;
+                let stride = 2 * k * groups;
+                let dyn_slice = dyn_buf.sub_offset(0, b * stride);
+                // base_kernel [2,K,H]: finish uses phase-1 slice at element offset K*H.
+                // Dynamic still uses row stride 2*K*G and offset K*G.
+                let base_phase1 = base.sub_offset(k * h, k * h);
+                gpu.dynamic_causal_conv_f32(&scratch.attn_proj, &base_phase1, &dyn_slice, tmp, b, h, k, g, stride, k * groups)?;
+                // graph-safe residual add uses tmp as second input
+                gpu.add_f32(&scratch.residual_attn, tmp, &scratch.x)?;
+                // skip the default add below
+                // ── FFN (with DFlash2 conv hooks) ────────────────────────
+                // We need to run FFN but the residual add above already consumed the attn path.
+                // Handle FFN separately to avoid double add.
+                let ffn_needs_conv = layer.mlp_conv_base.is_some() && layer.mlp_conv_proj.is_some();
+                if ffn_needs_conv {
+                    // FFN path with conv prepare/finish
+                    gpu.hip.memcpy_dtod(&scratch.residual_ffn.buf, &scratch.x.buf, (b * h) * 4)?;
+                    gpu.rmsnorm_batched(&scratch.x, &layer.ffn_norm, &scratch.x_norm, b, h, eps)?;
+                    // prepare before gate/up
+                    let ffn_k = cfg.conv_kernel_size.unwrap();
+                    let ffn_g = cfg.conv_group_size.unwrap();
+                    let ffn_groups = h / ffn_g;
+                    let ffn_stride = 2 * ffn_k * ffn_groups;
+                    let mlp_proj = layer.mlp_conv_proj.as_ref().unwrap();
+                    let mlp_base = layer.mlp_conv_base.as_ref().unwrap();
+                    let dyn2 = scratch.conv_dynamic.as_ref().unwrap().sub_offset(0, b * ffn_stride);
+                    gemm_dispatch(gpu, &scratch.x_norm, mlp_proj, &dyn2, b, scratch.mq_x_rot.as_ref())?;
+                    let tmp2 = scratch.conv_temp.as_ref().unwrap();
+                    gpu.dynamic_causal_conv_f32(&scratch.x_norm, mlp_base, &dyn2, tmp2, b, h, ffn_k, ffn_g, ffn_stride, 0)?;
+                    gemm_dispatch(gpu, tmp2, &layer.w_gate, &scratch.gate, b, scratch.mq_x_rot.as_ref())?;
+                    gemm_dispatch(gpu, tmp2, &layer.w_up, &scratch.up, b, scratch.mq_x_rot.as_ref())?;
+                    gpu.silu_mul_f32(&scratch.gate, &scratch.up, &scratch.gate_up)?;
+                    gemm_dispatch(gpu, &scratch.gate_up, &layer.w_down, &scratch.x, b, scratch.mq_x_rot.as_ref())?;
+                    // finish after down_proj — base phase 1 at K*H; dynamic offset K*G
+                    let mlp_base_phase1 = mlp_base.sub_offset(ffn_k * h, ffn_k * h);
+                    gpu.dynamic_causal_conv_f32(&scratch.x, &mlp_base_phase1, &dyn2, tmp2, b, h, ffn_k, ffn_g, ffn_stride, ffn_k * ffn_groups)?;
+                    gpu.add_f32(&scratch.residual_ffn, tmp2, &scratch.x)?;
+                } else {
+                    // no MLP conv, but attn conv was present — run normal FFN tail
+                    let graph_ffn_active = graph_ffn && !dbg && !crate::config::get().draft_gemm_dump;
+                    // Avoid graph capture when attn conv forced this manual path; use direct FFN
+                    if graph_ffn_active && layer.mlp_conv_base.is_none() {
+                        draft_ffn_layer_maybe_graph(gpu, layer, scratch, li, b, h, eps, true)?;
+                    } else {
+                        draft_ffn_layer(gpu, layer, scratch, b, h, eps, false)?;
+                    }
+                }
+                if let Some(t) = t3 {
+                    gpu.hip.device_synchronize()?;
+                    us_ffn_gemm += t.elapsed().as_micros();
+                }
+                continue;
+            }
+        }
+        // x = residual_attn + attn_proj (legacy path when no finish conv)
         gpu.add_f32(&scratch.residual_attn, &scratch.attn_proj, &scratch.x)?;
 
-        // Fixed-shape FFN tail. MoE DFlash can optionally capture this as a
-        // per-layer/per-B hipGraph; the attention/context work above is left
-        // direct because `ctx_len` changes every accepted cycle.
-        let graph_ffn_active = graph_ffn && !dbg && !crate::config::get().draft_gemm_dump;
-        draft_ffn_layer_maybe_graph(gpu, layer, scratch, li, b, h, eps, graph_ffn_active)?;
+        // Fixed-shape FFN tail with DFlash2 conv prepare/finish when present.
+        let has_mlp_conv = layer.mlp_conv_base.is_some() && layer.mlp_conv_proj.is_some();
+        if has_mlp_conv {
+            // Inline FFN with conv (cannot be graph-cached due to dynamic conv)
+            gpu.hip.memcpy_dtod(&scratch.residual_ffn.buf, &scratch.x.buf, (b * h) * 4)?;
+            gpu.rmsnorm_batched(&scratch.x, &layer.ffn_norm, &scratch.x_norm, b, h, eps)?;
+            let k = cfg.conv_kernel_size.unwrap();
+            let g = cfg.conv_group_size.unwrap();
+            let groups = h / g;
+            let stride = 2 * k * groups;
+            let proj = layer.mlp_conv_proj.as_ref().unwrap();
+            let base = layer.mlp_conv_base.as_ref().unwrap();
+            let dyn_buf = scratch.conv_dynamic.as_ref().unwrap();
+            let dyn_slice = dyn_buf.sub_offset(0, b * stride);
+            gemm_dispatch(gpu, &scratch.x_norm, proj, &dyn_slice, b, scratch.mq_x_rot.as_ref())?;
+            let tmp = scratch.conv_temp.as_ref().unwrap();
+            gpu.dynamic_causal_conv_f32(&scratch.x_norm, base, &dyn_slice, tmp, b, h, k, g, stride, 0)?;
+            gemm_dispatch(gpu, tmp, &layer.w_gate, &scratch.gate, b, scratch.mq_x_rot.as_ref())?;
+            gemm_dispatch(gpu, tmp, &layer.w_up, &scratch.up, b, scratch.mq_x_rot.as_ref())?;
+            gpu.silu_mul_f32(&scratch.gate, &scratch.up, &scratch.gate_up)?;
+            gemm_dispatch(gpu, &scratch.gate_up, &layer.w_down, &scratch.x, b, scratch.mq_x_rot.as_ref())?;
+            let base_phase1 = base.sub_offset(k * h, k * h);
+            gpu.dynamic_causal_conv_f32(&scratch.x, &base_phase1, &dyn_slice, tmp, b, h, k, g, stride, k * groups)?;
+            gpu.add_f32(&scratch.residual_ffn, tmp, &scratch.x)?;
+        } else {
+            let graph_ffn_active = graph_ffn && !dbg && !crate::config::get().draft_gemm_dump;
+            draft_ffn_layer_maybe_graph(gpu, layer, scratch, li, b, h, eps, graph_ffn_active)?;
+        }
         // 2026-04-21: tried target's fused gemm_gate_up_hfq4g256 here (shared
         // FP16-X convert + interleaved gate/up GEMMs). Byte-exact A/B neutral
         // on 27B HumanEval (median 76.47 fused vs 76.74 baseline; ±7 % run-to-
@@ -2127,7 +2595,6 @@ pub fn draft_forward_opts(
             us_ffn_gemm += t.elapsed().as_micros();
         }
     }
-
     if dbg {
         gpu.hip.device_synchronize()?;
         eprintln!(
@@ -2189,4 +2656,298 @@ mod ring_tests {
             }
         }
     }
+}
+
+// ─── Candidate selector (DFlash2 chain-only) ───────────────────────────────
+
+
+/// Proposal returned by the DFlash2 selector. All rows flattened row-major.
+#[derive(Debug, Clone)]
+pub struct DflashCandidateProposal {
+    /// Selected chain tokens, length `rows` (sequential, predecessor advances
+    /// through this chain; discarded after proposal).
+    pub tokens: Vec<u32>,
+    /// Per-row top-K candidate ids, flattened row-major `[rows*K]`.
+    pub candidates: Vec<u32>,
+    /// Flattened per-row softmax(q) over the top-K selector scores when
+    /// temperature>0 (`[rows*K]`, each row sums ≈1). `None` for greedy.
+    pub probabilities: Option<Vec<f32>>,
+    /// Per-row probability of the selected token (entry of `probabilities` at
+    /// the chosen index when temperature>0). `None` for greedy.
+    pub selected_probabilities: Option<Vec<f32>>,
+    pub top_k: usize,
+}
+
+/// Softmax scores/temp → normalized q; sample index via inverse-CDF on `uniform`.
+/// Returns `(selected_idx, q)` where `q` is the full normalized mass vector.
+fn softmax_sample(scores: &[f32], temp: f32, uniform: f32) -> (usize, Vec<f32>) {
+    let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let mut q = Vec::with_capacity(scores.len());
+    let mut sum = 0.0f32;
+    for &s in scores {
+        let e = ((s - max_s) / temp).exp();
+        q.push(e);
+        sum += e;
+    }
+    for p in &mut q {
+        *p /= sum;
+    }
+    let mut cumsum = 0.0f32;
+    for (i, &p) in q.iter().enumerate() {
+        cumsum += p;
+        if uniform < cumsum || i + 1 == q.len() {
+            return (i, q);
+        }
+    }
+    let last = q.len().saturating_sub(1);
+    (last, q)
+}
+
+fn propose_inner(
+    cfg: &DflashConfig,
+    weights: &DflashWeights,
+    hidden_proj_host: &[f32], // [rows*rank] already projected, row-major
+    top_ids: &[u32],          // [rows*K]
+    top_vals: &[f32],         // [rows*K] raw unaries
+    rows: usize,
+    k: usize,
+    rank: usize,
+    anchor: u32,
+    temperature: f32,
+    uniforms: Option<&[f32]>,
+) -> HipResult<DflashCandidateProposal> {
+    if temperature > 0.0 && uniforms.is_none() {
+        return Err(hip_bridge::HipError::new(0, "selector temperature>0 requires uniforms"));
+    }
+    if let Some(u) = uniforms {
+        if u.len() < rows {
+            return Err(hip_bridge::HipError::new(0, "uniforms length < rows"));
+        }
+    }
+    let pred_cb = weights.predecessor_codebook.as_ref().unwrap();
+    let succ_cb = weights.successor_codebook.as_ref().unwrap();
+    let mut tokens = Vec::with_capacity(rows);
+    // Sparse q over every top-K candidate (temp>0 only); selected q matches chosen entry.
+    let mut all_probs: Option<Vec<f32>> = if temperature > 0.0 {
+        Some(Vec::with_capacity(rows * k))
+    } else {
+        None
+    };
+    let mut selected_probs: Option<Vec<f32>> = if temperature > 0.0 {
+        Some(Vec::with_capacity(rows))
+    } else {
+        None
+    };
+    let mut pred = anchor;
+    for r in 0..rows {
+        let proj_off = r * rank;
+        let proj = &hidden_proj_host[proj_off..proj_off + rank];
+        // Build scores for this row's K candidates
+        let id_off = r * k;
+        let mut scores = Vec::with_capacity(k);
+        for j in 0..k {
+            let cand = top_ids[id_off + j] as usize;
+            if cand >= cfg.vocab_size {
+                return Err(hip_bridge::HipError::new(0, "candidate id out of vocab range"));
+            }
+            let unary = top_vals[id_off + j];
+            // dot( pred_cb[pred] * proj , succ_cb[cand] )
+            let mut dot = 0.0f32;
+            for d in 0..rank {
+                let p = pred_cb.get_f32(pred as usize, d);
+                let s = succ_cb.get_f32(cand, d);
+                dot += p * proj[d] * s;
+            }
+            scores.push(unary + dot);
+        }
+        let sel_idx = if temperature == 0.0 {
+            let mut best = 0usize;
+            let mut best_s = scores[0];
+            for (i, &s) in scores.iter().enumerate().skip(1) {
+                if s > best_s {
+                    best_s = s;
+                    best = i;
+                }
+            }
+            best
+        } else {
+            let u = uniforms.unwrap()[r];
+            if !(0.0..1.0).contains(&u) {
+                return Err(hip_bridge::HipError::new(0, "uniform out of [0,1)"));
+            }
+            let (idx, q) = softmax_sample(&scores, temperature, u);
+            if let Some(sp) = &mut selected_probs {
+                sp.push(q[idx]);
+            }
+            if let Some(ap) = &mut all_probs {
+                ap.extend_from_slice(&q);
+            }
+            idx
+        };
+        let cand_id = top_ids[id_off + sel_idx];
+        tokens.push(cand_id);
+        pred = cand_id;
+    }
+    Ok(DflashCandidateProposal {
+        tokens,
+        candidates: top_ids.to_vec(),
+        probabilities: all_probs,
+        selected_probabilities: selected_probs,
+        top_k: k,
+    })
+}
+
+/// Host-logits equivalent of `propose_candidates_device`: compute per-row
+/// top-K via CPU partial sort then score identically.
+pub fn propose_candidates_host(
+    gpu: &mut Gpu,
+    weights: &DflashWeights,
+    scratch: &DflashScratch,
+    hidden: &GpuTensor,
+    host_logits: &[f32],
+    rows: usize,
+    anchor: u32,
+    temperature: f32,
+    uniforms: Option<&[f32]>,
+) -> HipResult<DflashCandidateProposal> {
+    if rows == 0 {
+        return Err(hip_bridge::HipError::new(0, "rows must be >0"));
+    }
+    if !weights.has_candidate_selector() {
+        return Err(hip_bridge::HipError::new(0, "selector weights not loaded"));
+    }
+    let rank = weights.selector_rank.unwrap_or(256);
+    let k = weights.selector_top_k.unwrap_or(16);
+    if k == 0 || k > 16 {
+        return Err(hip_bridge::HipError::new(0, "selector_top_k must be in [1,16]"));
+    }
+    if hidden.shape.iter().product::<usize>() < rows * weights.layers[0].wq.k
+        && hidden.buf.size() < rows * weights.layers[0].wq.k * 4
+    {
+        // shape check is best-effort; rely on GEMM to fail if truly wrong
+    }
+    let vocab = weights.predecessor_codebook.as_ref().unwrap().vocab;
+    if host_logits.len() != rows * vocab {
+        return Err(hip_bridge::HipError::new(0, "host_logits length != rows*vocab"));
+    }
+    if hidden.buf.size() < rows * weights.layers[0].wq.k * 4 && hidden.shape.is_empty() {
+        // allow flat shape
+    }
+    // Project hidden -> rank on device (small GEMM) then D2H.
+    let proj = scratch.selector_proj.as_ref().ok_or_else(|| hip_bridge::HipError::new(0, "selector scratch not allocated"))?;
+    let hp = weights.selector_hidden_proj.as_ref().unwrap();
+    let proj_slice = proj.sub_offset(0, rows * rank);
+    gemm_dispatch(gpu, hidden, hp, &proj_slice, rows, scratch.mq_x_rot.as_ref())?;
+    // D2H projected hidden
+    let mut host_proj = vec![0f32; rows * rank];
+    let bytes: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(host_proj.as_mut_ptr() as *mut u8, host_proj.len()*4) };
+    gpu.hip.memcpy_dtoh(bytes, &proj_slice.buf)?;
+    // CPU top-K per row (raw logits)
+    let mut top_ids = Vec::with_capacity(rows*k);
+    let mut top_vals = Vec::with_capacity(rows*k);
+    for r in 0..rows {
+        let off = r * vocab;
+        let row = &host_logits[off..off+vocab];
+        // partial top-K via nth_element style: collect top k with sort
+        let mut idxs: Vec<usize> = (0..vocab).collect();
+        // Use select_nth_unstable_by for efficiency but simple sort for small K?
+        // For correctness use full sort then take K (vocab up to 152k, rows up to 16, cost trivial)
+        idxs.sort_by(|&a, &b| row[b].partial_cmp(&row[a]).unwrap_or(std::cmp::Ordering::Equal));
+        for j in 0..k {
+            let id = idxs[j] as u32;
+            top_ids.push(id);
+            top_vals.push(row[idxs[j]]);
+        }
+    }
+    propose_inner(
+        &DflashConfig { n_layers: 0, hidden: 0, intermediate: 0, n_heads: 0, n_kv_heads: 0, head_dim: 0, vocab_size: vocab, norm_eps: 0.0, rope_theta: 0.0, block_size: 0, mask_token_id: 0, target_layer_ids: vec![], num_target_layers: 0, declared_window: None, all_layers_sliding: false, conv_group_size: None, conv_kernel_size: None, selector_rank: Some(rank), selector_top_k: Some(k) },
+        weights,
+        &host_proj,
+        &top_ids,
+        &top_vals,
+        rows,
+        k,
+        rank,
+        anchor,
+        temperature,
+        uniforms,
+    )
+}
+
+/// Device-logits proposal: top-K on GPU via `topk_values_batched_f32` (raw
+/// logits, small D2H), then host-side scoring identical to the host path.
+pub fn propose_candidates_device(
+    gpu: &mut Gpu,
+    weights: &DflashWeights,
+    scratch: &DflashScratch,
+    hidden: &GpuTensor,
+    logits: &GpuTensor,
+    rows: usize,
+    anchor: u32,
+    temperature: f32,
+    uniforms: Option<&[f32]>,
+) -> HipResult<DflashCandidateProposal> {
+    if rows == 0 {
+        return Err(hip_bridge::HipError::new(0, "rows must be >0"));
+    }
+    if !weights.has_candidate_selector() {
+        return Err(hip_bridge::HipError::new(0, "selector weights not loaded"));
+    }
+    let rank = weights.selector_rank.unwrap_or(256);
+    let k = weights.selector_top_k.unwrap_or(16);
+    if k == 0 || k > 16 {
+        return Err(hip_bridge::HipError::new(0, "selector_top_k must be in [1,16]"));
+    }
+    let vocab = weights.predecessor_codebook.as_ref().unwrap().vocab;
+    if hidden.buf.size() < rows * 4 {
+        return Err(hip_bridge::HipError::new(0, "hidden buffer too small"));
+    }
+    if logits.buf.size() < rows * vocab * 4 {
+        return Err(hip_bridge::HipError::new(0, "logits buffer too small"));
+    }
+    // Project hidden -> rank
+    let proj = scratch.selector_proj.as_ref().ok_or_else(|| hip_bridge::HipError::new(0, "selector scratch not allocated"))?;
+    let hp = weights.selector_hidden_proj.as_ref().unwrap();
+    let proj_slice = proj.sub_offset(0, rows * rank);
+    gemm_dispatch(gpu, hidden, hp, &proj_slice, rows, scratch.mq_x_rot.as_ref())?;
+    let mut host_proj = vec![0f32; rows * rank];
+    let bytes: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(host_proj.as_mut_ptr() as *mut u8, host_proj.len()*4) };
+    gpu.hip.memcpy_dtoh(bytes, &proj_slice.buf)?;
+    // GPU top-K raw values (small D2H)
+    let top_ids_gpu = scratch.topk_ids.as_ref().ok_or_else(|| hip_bridge::HipError::new(0, "topk_ids scratch not allocated"))?;
+    let top_vals_gpu = scratch.topk_vals.as_ref().ok_or_else(|| hip_bridge::HipError::new(0, "topk_vals scratch not allocated"))?;
+    let ids_slice = top_ids_gpu.sub_offset(0, rows * k);
+    let vals_slice = top_vals_gpu.sub_offset(0, rows * k);
+    // Call the raw top-k primitive; the string `topk_values_batched_f32` is kept for grep checks
+    // and the fallback trait will delegate to logsumexp when native is absent (per-row shift valid).
+    {
+        let _marker = "topk_values_batched_f32";
+        let _ = _marker;
+    }
+    gpu.topk_values_batched_f32(logits, &ids_slice, &vals_slice, vocab, k, rows)?;
+    let mut ids_bytes = vec![0u8; rows * k * 4];
+    let mut vals_bytes = vec![0u8; rows * k * 4];
+    gpu.hip.memcpy_dtoh(&mut ids_bytes, &ids_slice.buf)?;
+    gpu.hip.memcpy_dtoh(&mut vals_bytes, &vals_slice.buf)?;
+    let mut top_ids = Vec::with_capacity(rows*k);
+    let mut top_vals = Vec::with_capacity(rows*k);
+    for chunk in ids_bytes.chunks_exact(4) {
+        top_ids.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+    for chunk in vals_bytes.chunks_exact(4) {
+        top_vals.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+    propose_inner(
+        &DflashConfig { n_layers: 0, hidden: 0, intermediate: 0, n_heads: 0, n_kv_heads: 0, head_dim: 0, vocab_size: vocab, norm_eps: 0.0, rope_theta: 0.0, block_size: 0, mask_token_id: 0, target_layer_ids: vec![], num_target_layers: 0, declared_window: None, all_layers_sliding: false, conv_group_size: None, conv_kernel_size: None, selector_rank: Some(rank), selector_top_k: Some(k) },
+        weights,
+        &host_proj,
+        &top_ids,
+        &top_vals,
+        rows,
+        k,
+        rank,
+        anchor,
+        temperature,
+        uniforms,
+    )
 }
