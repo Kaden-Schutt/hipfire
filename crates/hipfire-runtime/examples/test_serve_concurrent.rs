@@ -65,6 +65,7 @@ fn main() {
         model_path: PathBuf::from(&model_path),
         n_slots: N_SLOTS,
         cap_tokens,
+        prefill_chunk: 1024,
         host_budget_bytes: 4 * 1024 * 1024 * 1024,
         swap_dir: std::env::temp_dir().join("hipfire-sp7-swap"),
     })

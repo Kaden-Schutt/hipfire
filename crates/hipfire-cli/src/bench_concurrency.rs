@@ -267,6 +267,7 @@ impl SlotDriver {
                 model_path: model.to_path_buf(),
                 n_slots: max_concurrency,
                 cap_tokens,
+                prefill_chunk: 1024,
                 host_budget_bytes: 2 * 1024 * 1024 * 1024,
                 swap_dir: std::env::temp_dir().join("hipfire-bench-swap"),
             },
@@ -413,8 +414,12 @@ impl ConcurrencyBackend for SlotDriver {
 
 #[cfg(not(feature = "multi-slot"))]
 impl ConcurrencyBackend for SlotDriver {
-    fn label(&self) -> &'static str { "slots" }
-    fn max_concurrency(&self) -> usize { self.max_concurrency }
+    fn label(&self) -> &'static str {
+        "slots"
+    }
+    fn max_concurrency(&self) -> usize {
+        self.max_concurrency
+    }
     fn run(&mut self, _workload: WorkloadSel, _k: usize, _max_tokens: u64) -> Result<ArmResult> {
         bail!("multi-slot feature disabled")
     }
@@ -806,7 +811,10 @@ mod tests {
         }];
         let table = render_table(&points);
         // median of {200, 100} tok/s = 150; per-stream = 75
-        assert!(table.contains("150.00"), "aggregate median missing: {table}");
+        assert!(
+            table.contains("150.00"),
+            "aggregate median missing: {table}"
+        );
         assert!(table.contains("75.00"), "per-stream missing: {table}");
         assert!(table.contains("slots"), "backend label missing: {table}");
     }

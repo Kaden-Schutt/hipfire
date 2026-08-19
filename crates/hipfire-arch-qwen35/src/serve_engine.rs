@@ -38,6 +38,12 @@ pub struct EngineConfig {
     pub model_path: PathBuf,
     pub n_slots: usize,
     pub cap_tokens: usize,
+    /// Prefill tokens taken from one slot per step. Bounds the batch scratch
+    /// (`n_slots × prefill_chunk` rows, NOT `cap_tokens`) and keeps a long
+    /// prompt from blocking other slots for its whole prefill — the property
+    /// the scheduler was built around. Sizing scratch by `cap_tokens` put a
+    /// 16k-ctx A3B out of reach of a 24 GB card.
+    pub prefill_chunk: usize,
     pub host_budget_bytes: u64,
     pub swap_dir: PathBuf,
 }
@@ -127,6 +133,7 @@ struct Rig {
     stamp: SnapshotStamp,
     n_slots: usize,
     cap_tokens: usize,
+    prefill_chunk: usize,
 }
 
 fn dn_buffers(dn: &DeltaNetState) -> Vec<&GpuTensor> {
@@ -154,7 +161,8 @@ impl Rig {
             .filter(|t| **t == LayerType::FullAttention)
             .count();
         let per_pos_bytes = config.n_kv_heads * (config.head_dim / 32) * 34;
-        let max_batch = cfg.cap_tokens.max(cfg.n_slots);
+        let prefill_chunk = cfg.prefill_chunk.max(1).min(cfg.cap_tokens.max(1));
+        let max_batch = (prefill_chunk * cfg.n_slots).max(cfg.n_slots);
 
         let weight_bytes = std::fs::metadata(&cfg.model_path)
             .map_err(|e| format!("stat model: {e}"))?
@@ -198,7 +206,9 @@ impl Rig {
         }
         let desc_staging = SlotDescStaging::new(&mut gpu, cfg.n_slots, max_batch)
             .map_err(|e| format!("staging: {e}"))?;
-        let pbs = PrefillBatchScratch::new(&mut gpu, &config, max_batch)
+        // Slots do plain prefill only — never tree-verify — so skip the GDN
+        // S-tape: at max_batch=cap_tokens it is tens of GB (16k → ~21 GB).
+        let pbs = PrefillBatchScratch::new_opt(&mut gpu, &config, max_batch, false)
             .map_err(|e| format!("pbs: {e}"))?;
         let scratch = Qwen35Scratch::new_with_kv_max(&mut gpu, &config, 64, cfg.cap_tokens)
             .map_err(|e| format!("scratch: {e}"))?;
@@ -263,6 +273,7 @@ impl Rig {
             stamp,
             n_slots: cfg.n_slots,
             cap_tokens: cfg.cap_tokens,
+            prefill_chunk,
         })
     }
 }
@@ -287,7 +298,7 @@ fn run_loop(mut rig: Rig, rx: Receiver<SubmitRequest>, stats: Arc<Mutex<EngineSt
         })
         .collect();
     let mut sched = Scheduler {
-        chunk_size: rig.cap_tokens.max(1),
+        chunk_size: rig.prefill_chunk,
     };
     let mut graph = SlotDecodeGraph::new();
 
