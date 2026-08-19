@@ -4321,6 +4321,17 @@ pub const SCALED_ADD_INPLACE_SRC: &str =
 
 /// Element-wise multiply
 pub const MUL_SRC: &str = include_str!("../../../kernels/src/mul.hip");
+/// Dynamic causal convolution (DFlash2): left-zero-padded grouped per-position kernel.
+/// output[row,c] = sum_{off} (base[off,c] + dynamic[row,off,c/group_size]) * input[row-off,c]
+/// Layouts are row-major F32: input/output [rows,hidden], base [kernel_size,hidden],
+/// dynamic strided [rows, dynamic_row_stride] with window [dynamic_offset, dynamic_offset+kernel_size*groups).
+/// Compact: stride=kernel_size*groups, offset=0. 2-phase (DFlash2 kernel_projection [B,2,kernel_size,groups]):
+/// stride=2*kernel_size*groups, phase 0 offset 0, phase 1 offset kernel_size*groups. See
+/// `crates/rdna-compute/src/norm.rs::dynamic_causal_conv_f32` and `kernels/src/dynamic_conv_f32.hip`.
+pub const DYNAMIC_CONV_F32_SRC: &str = include_str!("../../../kernels/src/dynamic_conv_f32.hip");
+/// Backwards-compatible alias for the compact launch name; same source as DYNAMIC_CONV_F32_SRC.
+pub const DYNAMIC_CAUSAL_CONV_F32_SRC: &str = DYNAMIC_CONV_F32_SRC;
+
 
 /// SiLU (Sigmoid Linear Unit): silu(x) = x * sigmoid(x)
 pub const SILU_SRC: &str = include_str!("../../../kernels/src/silu.hip");
@@ -5676,6 +5687,18 @@ pub const APPLY_ROPE_2D_VISION_SRC: &str =
 /// keys/values with no causal mask. Grid=[n_heads, B]. See
 /// `kernels/src/attention_dflash.hip` for the full contract.
 pub const ATTENTION_DFLASH_SRC: &str = include_str!("../../../kernels/src/attention_dflash.hip");
+
+/// Faithful non-causal sliding-window DFlash attention (scalar, tiled
+/// online-softmax). Same GQA/tiling/numerical structure as
+/// `ATTENTION_DFLASH_SRC` but applies the DFlash2 is_causal=false mask:
+/// key kj is visible iff abs(ctx_span + qi - kj) < sliding_window,
+/// where ctx_span = L - B, qi is the query's block index, and window
+/// is the training-time `sliding_window`. Context keys are the
+/// contiguous suffix base-ctx_span..base-1; block keys are base..base+B-1.
+/// Grid=[n_heads, B], block = next_pow2(max(L, head_dim)).min(256).
+/// See `kernels/src/attention_dflash_sliding.hip`.
+pub const ATTENTION_DFLASH_SLIDING_SRC: &str =
+    include_str!("../../../kernels/src/attention_dflash_sliding.hip");
 
 /// Bias-add: X[batch, n] += bias[n] (broadcast over batch dim)
 pub const BIAS_ADD_SRC: &str = include_str!("../../../kernels/src/bias_add.hip");

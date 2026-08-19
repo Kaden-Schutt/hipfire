@@ -10,10 +10,9 @@
 //! [`Speculator`] trait, and [`build_dflash_speculator`] (its env-resolving
 //! constructor). All types here are qwen35 + runtime types — no loader types —
 //! so the loader only calls in; it never owns the DFlash mechanics.
-
-use crate::qwen35::{self, DeltaNetState, LayerType, Qwen35Config};
+use crate::qwen35::{self, DeltaNetState, Qwen35Config};
 use crate::speculative::{
-    apply_eviction_retain_to_draft, apply_host_nucleus, sample_categorical,
+    apply_eviction_retain_to_draft, apply_host_nucleus, apply_host_topk, sample_categorical,
     scatter_hidden_block_to_interleaved, seed_target_hidden_from_prompt_abortable,
     seed_target_hidden_suffix_abortable, softmax_temp_into, spec_step_ddtree_batched,
     spec_step_dflash, xorshift_next_unit, DdtreeScratch, DeltaNetSnapshot, GdnTape,
@@ -123,24 +122,20 @@ pub fn load_dflash_state(
     let draft_config = DflashConfig::from_hfq(&draft_hfq)
         .ok_or_else(|| "draft: failed to parse DflashConfig from HFQ metadata".to_string())?;
 
-    // Windowed draft context (NInfer 1-full + (n−1)-SWA pattern): layers
-    // 0..n−2 attend over the last `window` rows, the last (full-attention)
-    // layer over the ENTIRE supported context (`w_full = requested_ctx`,
-    // unbounded — the NInfer reference keeps one layer genuinely full). Draft-side VRAM pins at the window size
-    // regardless of max_seq, and requests past the window degrade τ
-    // gracefully instead of hitting the Legacy AR fallback.
+    // Windowed draft context:
+    //   - Legacy DFlash (n−1 sliding + last full): layers 0..n−2 attend over
+    //     the last `window` rows, the last layer over the entire supported
+    //     context (`w_full = requested_ctx`). Draft VRAM pins at W.
+    //   - DFlash2 (all layers sliding): every extract layer shares the same
+    //     W ring; there is no full-attention last layer. `new_windowed`
+    //     already skips the long-reach ring when `all_layers_sliding`.
+    // Requests past the window degrade τ instead of hitting Legacy AR fallback.
     //
     // The window DEFAULTS to what the draft artifact declares it was trained
     // with (`config.sliding_window`, honoured only when `use_sliding_window`
-    // is true and `layer_types` match the split we implement — see
-    // `DflashConfig::declared_window`). That is the only width correct by
-    // construction: `qwen36-27b-dflash-mq4` declares `sliding_window: 2048`
-    // with `layer_types: [sliding ×4, full]`, so Legacy — which gives all five
-    // layers full attention — is itself a train/inference mask mismatch on the
-    // four SWA-trained layers. [INFERENCE] faithful masking should therefore be
-    // at least as good as Legacy below the cap, not merely cheaper; the
-    // measured evidence is a 6-turn chain holding τ 4.4–6.1 out to ctx 20695.
-    //
+    // is true and `layer_types` match a split we implement — see
+    // `DflashConfig::declared_window` / `all_layers_sliding`). That is the
+    // only width correct by construction.
     //   HIPFIRE_DFLASH_WINDOW=<rows>  explicit override (warns on mismatch)
     //   HIPFIRE_DFLASH_WINDOW=0       explicit Legacy (cap + AR fallback)
     //   unset                         draft-declared window, else Legacy
@@ -185,16 +180,25 @@ pub fn load_dflash_state(
         },
     };
     if let Some(w) = window {
-        eprintln!(
-            "  DFlash draft windowed: SWA W={w} rows on layers 0..n-2, full-attention \
-             last layer over all {} rows (draft VRAM pinned at W; HIPFIRE_DFLASH_WINDOW=0 for Legacy){}",
-            requested_ctx,
-            if draft_config.declared_window == Some(w) {
-                " [from draft metadata]"
-            } else {
-                ""
-            }
-        );
+        let from_meta = if draft_config.declared_window == Some(w) {
+            " [from draft metadata]"
+        } else {
+            ""
+        };
+        if draft_config.all_layers_sliding {
+            eprintln!(
+                "  DFlash2 draft windowed: all {} layers sliding at W={w} \
+                 (no full-attention layer; draft VRAM pinned at W; \
+                 HIPFIRE_DFLASH_WINDOW=0 for Legacy){from_meta}",
+                draft_config.n_layers
+            );
+        } else {
+            eprintln!(
+                "  DFlash draft windowed: SWA W={w} rows on layers 0..n-2, full-attention \
+                 last layer over all {} rows (draft VRAM pinned at W; HIPFIRE_DFLASH_WINDOW=0 for Legacy){from_meta}",
+                requested_ctx
+            );
+        }
     } else if ctx_capacity < requested_ctx {
         eprintln!(
             "  DFlash draft ctx capped: {} -> {} rows (draft-side VRAM scales with this; \
@@ -231,7 +235,18 @@ pub fn load_dflash_state(
     // single parser shared with the dense path — env wins, else the CLI param,
     // else 0 (chain-only). An explicit `HIPFIRE_DDTREE_BUDGET=0` reads as None
     // (unset) here and falls through to the param, matching the dense semantics.
-    let ddtree_budget: usize = gpu.flags.ddtree_budget.or(ddtree_budget_param).unwrap_or(0);
+    let mut ddtree_budget: usize = gpu.flags.ddtree_budget.or(ddtree_budget_param).unwrap_or(0);
+    // DFlash2 is chain-only: never construct DDTree (independent-marginal
+    // tree would bypass the candidate selector).
+    if draft_weights.has_candidate_selector() {
+        if ddtree_budget > 0 {
+            eprintln!(
+                "  DFlash2 candidate selector: DDTree disabled (chain-only; \
+                 independent-marginal tree would bypass the selector)"
+            );
+        }
+        ddtree_budget = 0;
+    }
     let max_n = (block_size + 1).max(ddtree_budget + 1);
     // `with_mq` allocates the FWHT rotation scratch (mq_x_rot) that
     // `gemm_dispatch` requires for MQ4/MQ3/MQ6 draft weights. The carrier
@@ -244,14 +259,9 @@ pub fn load_dflash_state(
                 &draft_config,
                 block_size,
                 w,
-                // w_full UNBOUNDED: the last (full-attention) layer's ring spans
-                // the whole supported context, matching the artifact's
-                // `layer_types: [sliding x(n-1), full_attention]` semantics — the
-                // NInfer reference keeps one layer genuinely unbounded. The prior
-                // `requested_ctx.min(4 * w)` made the "full" layer a 4W-window
-                // (8192 rows at W=2048), so past 8K NO layer had full reach.
-                // Ring VRAM scales with requested_ctx (~270 MB at 32K rows,
-                // kvd=1024, f32 — see DflashScratch::new_windowed docs).
+                // Split drafts: last (full-attention) layer's ring spans the
+                // whole supported context. All-sliding DFlash2: `new_windowed`
+                // ignores w_full and pins every layer at W.
                 requested_ctx,
                 requested_ctx,
                 draft_weights.has_mq,
@@ -277,16 +287,30 @@ pub fn load_dflash_state(
     // copy on any prompt longer than block_size+1 tokens. Size it to the
     // larger of the two so both paths fit.
     let staging_max_batch = max_n.max(qwen35::PREFILL_MAX_BATCH);
+    // Hidden extraction must use checkpoint target_layer_ids exactly — validate
+    // against target layer range and allocate by the explicit list (not the
+    // evenly-spaced fallback). Checkpoint [5,19,33,47,61] is thus captured verbatim.
+    for &lid in &draft_config.target_layer_ids {
+        if lid >= target_config.n_layers {
+            // Free owned GPU state before returning; or_free! would have done
+            // this for the ring allocation failure path — do it manually here.
+            draft_scratch.free_gpu(gpu);
+            draft_weights.free_gpu(gpu);
+            return Err(format!(
+                "draft target_layer_ids contains {} >= num_target_layers {}",
+                lid, target_config.n_layers
+            ));
+        }
+    }
     let hidden_rb = or_free!(
-        HiddenStateRingBuffer::new(
+        HiddenStateRingBuffer::new_for_layers(
             gpu,
-            target_config.n_layers,
-            draft_config.num_extract(),
+            &draft_config.target_layer_ids,
             target_config.dim,
             ctx_capacity,
             staging_max_batch,
         ),
-        "HiddenStateRingBuffer::new",
+        "HiddenStateRingBuffer::new_for_layers",
         draft_scratch,
         draft_weights,
     );
@@ -542,11 +566,10 @@ impl Speculator for DflashSpeculator {
         ) {
             eprintln!("[dflash] scatter failed: {e} — falling back to per-cycle upload");
         }
-        // Windowed mode, cold prefill longer than the SWA window: the last
-        // (full-attention) draft layer still needs K/V for every prompt row,
-        // but hidden_rb and the draft ring only retain the last W. Backfill
-        // the last layer's long-reach ring from the host shadow (cumulative
-        // on the cold path) before the first spec step.
+        // Windowed cold prefill longer than W: the 4+1 split's last (full)
+        // layer still needs K/V for every prompt row. `draft_seed_backfill`
+        // is a no-op for all-sliding DFlash2 (every layer shares the W ring)
+        // and for prompt_len <= W. Keep the call — it is safe on both splits.
         if !cache_hit {
             hipfire_runtime::dflash::draft_seed_backfill(
                 gpu,
@@ -594,27 +617,7 @@ impl Speculator for DflashSpeculator {
             // `spec_step_dflash` so the seed is AR-at-(top_k,top_p).
             if self.df.ddtree.is_none() {
                 if self.sample_top_k > 0 && self.sample_top_k < probs.len() {
-                    let mut order: Vec<usize> = (0..probs.len()).collect();
-                    order.sort_by(|&a, &b| {
-                        probs[b]
-                            .partial_cmp(&probs[a])
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    });
-                    let keep = self.sample_top_k;
-                    let mut kept_mass = 0.0f32;
-                    for (rank, &idx) in order.iter().enumerate() {
-                        if rank < keep {
-                            kept_mass += probs[idx];
-                        } else {
-                            probs[idx] = 0.0;
-                        }
-                    }
-                    if kept_mass > 0.0 {
-                        let inv = 1.0 / kept_mass;
-                        for p in probs.iter_mut() {
-                            *p *= inv;
-                        }
-                    }
+                    apply_host_topk(&mut probs, self.sample_top_k);
                 }
                 if self.sample_top_p < 0.999 {
                     apply_host_nucleus(&mut probs, self.sample_top_p);
@@ -685,11 +688,11 @@ impl Speculator for DflashSpeculator {
         Ok(true)
     }
 
-    /// Temp>0 verify is distribution-correct only on the ddtree-batched arm
-    /// (SWOR); chain mode is greedy, so a non-ddtree drafter must NOT receive
-    /// temp>0 routing.
+    /// Temp>0 verify is distribution-correct on the ddtree-batched arm (SWOR)
+    /// and on DFlash2 selector-chain rejection sampling. Legacy chain without
+    /// a selector stays greedy-only at this gate.
     fn supports_temp_verify(&self) -> bool {
-        self.df.ddtree.is_some()
+        self.df.ddtree.is_some() || self.df.draft_weights.has_candidate_selector()
     }
 
     fn step(
@@ -729,8 +732,9 @@ impl Speculator for DflashSpeculator {
         // accepted drafts + bonus = emit; max accepted drafts = max_emit - 1.
         let max_accept = Some(max_emit.saturating_sub(1));
 
-        // Two-way dispatch from the daemon's old generate_dflash loop: DDTree-
-        // batched (SWOR) verify when a tree is configured, else chain-mode DFlash.
+        // Two-way dispatch: DDTree-batched (SWOR) when a tree is configured
+        // (never for DFlash2 selector — load refused construction), else
+        // chain-mode DFlash. Selector chain uses sparse-q rejection at temp>0.
         // The grammar arg is ignored — qwen35 enforces tool-call grammar post-hoc
         // in the daemon.
         let result = if let Some(dd) = self.df.ddtree.as_mut() {
@@ -765,6 +769,15 @@ impl Speculator for DflashSpeculator {
                 max_accept,
             )
         } else {
+            // Selector chain must error on invalid rewrites rather than silently
+            // substituting 0/None — keep the CACTUS guard here (the other
+            // rewrites are hard-wired to off/None in this path, but the direct
+            // `spec_step_dflash` caller covers them).
+            if self.df.draft_weights.has_candidate_selector() && self.sample_cactus != 0.0 {
+                return Err(
+                    "selector mode: CACTUS is not supported with DFlash2 candidate selector".into(),
+                );
+            }
             spec_step_dflash(
                 gpu,
                 slot,
@@ -793,7 +806,7 @@ impl Speculator for DflashSpeculator {
                 block_override, // remaining-output budget
                 None,           // ngram_cache
                 emitted,
-                self.sample_cactus, // 0.0 = lossless; >0 = deliberately lossy
+                self.sample_cactus, // selector already checked — safe to pass through
                 None,               // pld_spine
                 1.0_f32,            // repeat_penalty (off)
                 0,                  // repeat_window

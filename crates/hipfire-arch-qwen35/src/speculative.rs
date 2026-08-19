@@ -203,6 +203,7 @@ fn dflash_batched_lm_head_supported(dtype: rdna_compute::DType) -> bool {
         rdna_compute::DType::Q8_0
             | rdna_compute::DType::HFQ4G256
             | rdna_compute::DType::MQ4G256
+            | rdna_compute::DType::MQ4G256V2
             | rdna_compute::DType::MQ3G256
             | rdna_compute::DType::HFQ6G256
             | rdna_compute::DType::MQ6G256
@@ -249,6 +250,24 @@ fn dflash_enqueue_verify_lm_head(
                 hipfire_dispatch::types::KernelKey::GemmHfq4G256BatchedLmhead,
                 &w_out.buf,
                 w_out.gpu_dtype,
+                &rot,
+                &logits_batch,
+                w_out.m,
+                w_out.k,
+                b,
+            )?;
+        }
+        rdna_compute::DType::MQ4G256V2 => {
+            assert!(
+                b * w_out.k <= verify_scratch.max_n * verify_scratch.hidden_k,
+                "verify_scratch.rot undersized for MQ4 v2 lm_head: b*k={} > max_n*hidden_k={}",
+                b * w_out.k,
+                verify_scratch.max_n * verify_scratch.hidden_k
+            );
+            let rot = verify_scratch.rot.sub_offset(0, b * w_out.k);
+            llama::rotate_x_mq_batched_for(gpu, w_out, final_hidden, &rot, w_out.k, b)?;
+            gpu.gemm_mq4g256v2_batched_lmhead(
+                &w_out.buf,
                 &rot,
                 &logits_batch,
                 w_out.m,
@@ -349,6 +368,125 @@ fn dflash_download_verify_argmax(
         gpu.hip.memcpy_dtoh(bytes, &argmax_buf.buf)?;
     }
     Ok(host_idx.into_iter().map(|idx| idx as u32).collect())
+}
+
+/// Fold a DFlash2 candidate-selector proposal into the chain draft buffers.
+///
+/// Greedy: tokens only — no full-vocab D2H. Temperature: each sparse q row
+/// is materialized into a dense `draft_softmaxes` vector (zeros outside the
+/// candidate set) and `draft_probs_at_drafted` is taken from
+/// `selected_probabilities`, so the existing host rejection/residual path
+/// stays mathematically exact. Request top_p/top_k is NOT applied to this q.
+/// `proposal.probabilities` is the flattened normalized selector q over every
+/// top-K candidate row when temperature>0 (not raw unary logits); greedy may
+/// return `None` probabilities.
+fn apply_dflash2_selector_proposal(
+    proposal: dflash::DflashCandidateProposal,
+    vocab: usize,
+    use_temp_sampling: bool,
+    drafted: &mut Vec<u32>,
+    draft_softmaxes: &mut Vec<Vec<f32>>,
+    draft_probs_at_drafted: &mut Vec<f32>,
+) -> HipResult<()> {
+    let rows = proposal.tokens.len();
+    let top_k = proposal.top_k;
+    // Flattened length guards — silently dropping tail masses would make the
+    // sparse residual subtract an incomplete q and corrupt the bonus distribution.
+    if proposal.candidates.len() != rows * top_k {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "selector proposal candidates len {} != rows {} * top_k {}",
+                proposal.candidates.len(),
+                rows,
+                top_k
+            ),
+        ));
+    }
+    if use_temp_sampling {
+        let probs = proposal.probabilities.as_ref().ok_or_else(|| {
+            hip_bridge::HipError::new(0, "selector proposal missing probabilities for temp>0")
+        })?;
+        if probs.len() != rows * top_k {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "selector proposal probabilities len {} != rows {} * top_k {}",
+                    probs.len(),
+                    rows,
+                    top_k
+                ),
+            ));
+        }
+        let sel = proposal.selected_probabilities.as_ref().ok_or_else(|| {
+            hip_bridge::HipError::new(0, "selector proposal missing selected_probabilities for temp>0")
+        })?;
+        if sel.len() != rows {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "selector proposal selected_probabilities len {} != rows {}",
+                    sel.len(),
+                    rows
+                ),
+            ));
+        }
+        drafted.extend_from_slice(&proposal.tokens);
+        draft_softmaxes.reserve(rows);
+        draft_probs_at_drafted.reserve(rows);
+        for i in 0..rows {
+            let mut row = vec![0f32; vocab];
+            let off = i * top_k;
+            for j in 0..top_k {
+                let cand = proposal.candidates[off + j] as usize;
+                let q = probs[off + j];
+                if cand < vocab {
+                    row[cand] = q;
+                } else {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        &format!("selector candidate id {} out of vocab {}", cand, vocab),
+                    ));
+                }
+            }
+            draft_softmaxes.push(row);
+            draft_probs_at_drafted.push(sel[i]);
+        }
+        Ok(())
+    } else {
+        // Greedy: no q materialization, but still validate candidate shape and
+        // that probabilities is None (or absent); selected may be present as 1.0.
+        if proposal.probabilities.is_some() {
+            // Greedy may return None probabilities per contract; if Some, still
+            // require correct shape but do not materialize.
+            let probs = proposal.probabilities.as_ref().unwrap();
+            if probs.len() != rows * top_k {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!(
+                        "selector proposal greedy probabilities len {} != rows {} * top_k {}",
+                        probs.len(),
+                        rows,
+                        top_k
+                    ),
+                ));
+            }
+        }
+        if let Some(sel) = &proposal.selected_probabilities {
+            if sel.len() != rows {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!(
+                        "selector proposal greedy selected_probabilities len {} != rows {}",
+                        sel.len(),
+                        rows
+                    ),
+                ));
+            }
+        }
+        drafted.extend_from_slice(&proposal.tokens);
+        Ok(())
+    }
 }
 
 /// Task #93 Phase B seed-prediction oracle counters.
@@ -1592,6 +1730,39 @@ impl HiddenStateRingBuffer {
         (start_slot + r.saturating_sub(r_skip)) % self.max_positions
     }
 
+    /// Allocate GPU ring buffer for explicit extraction layer list.
+    ///
+    /// `extract_layers` must be in ascending order; validation of range is the
+    /// caller's responsibility ( `load_dflash_state` checks against
+    /// `num_target_layers` ).
+    pub fn new_for_layers(
+        gpu: &mut Gpu,
+        extract_layers: &[usize],
+        hidden_dim: usize,
+        max_positions: usize,
+        max_batch: usize,
+    ) -> HipResult<Self> {
+        let num_extract = extract_layers.len();
+        let mut layer_bufs = Vec::with_capacity(num_extract);
+        let mut staging_bufs = Vec::with_capacity(num_extract);
+        for _ in 0..num_extract {
+            layer_bufs
+                .push(gpu.alloc_tensor(&[max_positions * hidden_dim], rdna_compute::DType::F32)?);
+            staging_bufs
+                .push(gpu.alloc_tensor(&[max_batch * hidden_dim], rdna_compute::DType::F32)?);
+        }
+        Ok(Self {
+            layer_bufs,
+            extract_layers: extract_layers.to_vec(),
+            max_positions,
+            hidden_dim,
+            head: 0,
+            written: 0,
+            staging_bufs,
+            max_batch,
+        })
+    }
+
     /// Allocate GPU ring buffer for `num_extract` target layers.
     ///
     /// `max_batch` sizes the staging buffers used by the graph-capture path.
@@ -1605,24 +1776,7 @@ impl HiddenStateRingBuffer {
         max_batch: usize,
     ) -> HipResult<Self> {
         let extract_layers = dflash_extract_layer_ids(num_target_layers, num_extract);
-        let mut layer_bufs = Vec::with_capacity(num_extract);
-        let mut staging_bufs = Vec::with_capacity(num_extract);
-        for _ in 0..num_extract {
-            layer_bufs
-                .push(gpu.alloc_tensor(&[max_positions * hidden_dim], rdna_compute::DType::F32)?);
-            staging_bufs
-                .push(gpu.alloc_tensor(&[max_batch * hidden_dim], rdna_compute::DType::F32)?);
-        }
-        Ok(Self {
-            layer_bufs,
-            extract_layers,
-            max_positions,
-            hidden_dim,
-            head: 0,
-            written: 0,
-            staging_bufs,
-            max_batch,
-        })
+        Self::new_for_layers(gpu, &extract_layers, hidden_dim, max_positions, max_batch)
     }
 
     pub fn free_gpu(self, gpu: &mut Gpu) {
@@ -1939,6 +2093,37 @@ pub(crate) fn apply_host_nucleus(row: &mut [f32], top_p: f32) {
     // Zero out the dropped tail, renorm the kept head.
     for (rank, &idx) in order.iter().enumerate() {
         if rank < cutoff {
+            row[idx] = (row[idx] as f64 * inv) as f32;
+        } else {
+            row[idx] = 0.0;
+        }
+    }
+}
+
+/// Host-side top-k truncation of an ALREADY-normalized softmax row, IN PLACE.
+/// Keeps the `k` highest-probability tokens, zeros the rest, and renormalizes
+/// the kept mass to 1. `k == 0` or `k >= row.len()` is a no-op (identity).
+#[inline]
+pub(crate) fn apply_host_topk(row: &mut [f32], k: usize) {
+    if k == 0 || k >= row.len() {
+        return;
+    }
+    let mut order: Vec<usize> = (0..row.len()).collect();
+    order.sort_by(|&a, &b| {
+        row[b]
+            .partial_cmp(&row[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut kept_mass = 0.0f64;
+    for &idx in order.iter().take(k) {
+        kept_mass += row[idx] as f64;
+    }
+    if kept_mass <= 0.0 {
+        return;
+    }
+    let inv = 1.0f64 / kept_mass;
+    for (rank, &idx) in order.iter().enumerate() {
+        if rank < k {
             row[idx] = (row[idx] as f64 * inv) as f32;
         } else {
             row[idx] = 0.0;
@@ -2976,9 +3161,42 @@ pub fn spec_step_dflash(
     // DeltaNet/drafter commit so post-hoc `cap_emit` is defense only.
     max_accept: Option<usize>,
 ) -> HipResult<SpecStepResult> {
-    // The batched target verify is tagged `DispatchWorkload::SpeculativeVerify`
-    // where its attention parameters are built. That explicitly keeps the
-    // gfx12 wide-query prefill kernel out of DFlash without global route state.
+    let selector_mode = draft_weights.has_candidate_selector();
+    if selector_mode {
+        if pld_spine.is_some() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "selector mode: PLD spine rewrite is not supported with DFlash2 candidate selector",
+            ));
+        }
+        if ngram_cache.is_some() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "selector mode: ngram-cache rewrite is not supported with DFlash2 candidate selector",
+            ));
+        }
+        if cactus_delta != 0.0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "selector mode: CACTUS is not supported with DFlash2 candidate selector",
+            ));
+        }
+        if repeat_penalty != 1.0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "selector mode: repeat penalty is not supported with DFlash2 candidate selector",
+            ));
+        }
+        if hipfire_runtime::config::get()
+            .dflash_ngram_block
+            .unwrap_or(false)
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "selector mode: ngram-block rewriting is not supported with DFlash2 candidate selector",
+            ));
+        }
+    }
     // Effective block size for THIS step. Usually `draft_cfg.block_size`
     // (what the draft was trained at, 16 for Qwen3.5-*-DFlash) but a caller
     // doing adaptive-B based on rolling τ can shrink to save per-iter cost.
@@ -3050,11 +3268,10 @@ pub fn spec_step_dflash(
     let mut draft_probs_at_drafted: Vec<f32> = Vec::new();
     let mut draft_softmaxes: Vec<Vec<f32>> = Vec::new();
     let use_temp_sampling = temp > 0.0;
-    // Nucleus active only when a non-default top_p was requested. Mirrors the
-    // AR/MTP convention (top_p >= 0.999 ≈ disabled). When inactive the GPU
-    // kernel writes tau_cut=0/Z=1 and the host helpers are identity, so the
-    // sampled path is byte-equivalent to the prior pure-temp behavior.
-    let topp_active = use_temp_sampling && top_p < 0.999;
+    // Truncation active when either top_p non-default OR top_k enabled (vocab-gated).
+    // Host applies top-k before nucleus; GPU uses combined softmax_temp_topp whenever active.
+    let trunc_active = use_temp_sampling && (top_p < 0.999 || (top_k > 0 && top_k < vocab));
+    let topp_active = trunc_active;
     let rp_active = repeat_penalty > 1.0 && !use_temp_sampling;
     // HIPFIRE_DFLASH_NGRAM_BLOCK=1: apply llama::apply_ngram_block to every
     // host-path row in BOTH draft and target argmax paths. Bans the next
@@ -3250,6 +3467,7 @@ pub fn spec_step_dflash(
             w_out.gpu_dtype,
             rdna_compute::DType::HFQ4G256
                 | rdna_compute::DType::MQ4G256
+                | rdna_compute::DType::MQ4G256V2
                 | rdna_compute::DType::MQ3G256
                 | rdna_compute::DType::HFQ6G256
                 | rdna_compute::DType::MQ6G256,
@@ -3311,6 +3529,22 @@ pub fn spec_step_dflash(
                         batch,
                     )?;
                 }
+                rdna_compute::DType::MQ4G256V2 => {
+                    assert!(
+                        batch * h <= verify_scratch.max_n * verify_scratch.hidden_k,
+                        "verify_scratch.rot undersized for MQ4 v2 draft lm_head"
+                    );
+                    let rotated = verify_scratch.rot.sub_offset(0, batch * h);
+                    llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
+                    gpu.gemm_mq4g256v2_batched_lmhead(
+                        &w_out.buf,
+                        &rotated,
+                        &logits_batch,
+                        w_out.m,
+                        w_out.k,
+                        batch,
+                    )?;
+                }
                 rdna_compute::DType::MQ3G256 => {
                     assert!(
                         batch * h <= verify_scratch.max_n * verify_scratch.hidden_k,
@@ -3365,7 +3599,38 @@ pub fn spec_step_dflash(
                 _ => unreachable!(),
             }
 
-            if use_temp_sampling && fast_sample_active {
+            if selector_mode {
+                // Selector q is proposal-local: seed anchor this cycle, then
+                // sequential tokens. Greedy stays on-device (small top-K D2H
+                // inside propose_candidates_device). Temperature materializes
+                // sparse q into draft_softmaxes and does NOT take the GPU
+                // full-vocab fast-accept path. Request top_p/top_k is not
+                // applied to selector q; target p still uses them at verify.
+                let uniforms = if use_temp_sampling {
+                    Some((0..batch).map(|_| xorshift_next_unit(rng_state)).collect::<Vec<f32>>())
+                } else {
+                    None
+                };
+                let proposal = dflash::propose_candidates_device(
+                    gpu,
+                    draft_weights,
+                    draft_scratch,
+                    &hidden_rows,
+                    &logits_batch,
+                    batch,
+                    seed_token,
+                    temp,
+                    uniforms.as_deref(),
+                )?;
+                apply_dflash2_selector_proposal(
+                    proposal,
+                    vocab,
+                    use_temp_sampling,
+                    &mut drafted,
+                    &mut draft_softmaxes,
+                    &mut draft_probs_at_drafted,
+                )?;
+            } else if use_temp_sampling && fast_sample_active {
                 // C8 GPU-sample path: softmax stays device-resident; only
                 // draft_tokens + draft_p_at_token (batch×8 bytes) come back.
                 // draft_probs_dev is kept alive in c8_draft_probs_dev until
@@ -3446,9 +3711,11 @@ pub fn spec_step_dflash(
                     let row = &host_logits[i * vocab..(i + 1) * vocab];
                     let mut probs = Vec::with_capacity(vocab);
                     softmax_temp_into(row, temp, &mut probs);
-                    // Host nucleus on the non-fast temp arm so top_p is honored
-                    // on the whole DFlash temp path (not only under FAST_SAMPLE).
-                    if topp_active {
+                    // Host truncation: top-k before nucleus, matching GPU combined cut.
+                    if top_k > 0 && top_k < vocab {
+                        apply_host_topk(&mut probs, top_k);
+                    }
+                    if top_p < 0.999 {
                         apply_host_nucleus(&mut probs, top_p);
                     }
                     let u = xorshift_next_unit(rng_state);
@@ -3495,6 +3762,43 @@ pub fn spec_step_dflash(
                     drafted.push(idx as u32);
                 }
             }
+        } else if selector_mode {
+            // lm-head fallback: still go through propose_candidates_host so
+            // greedy is not an independent argmax and sampled q stays sparse.
+            let batch = b - 1;
+            let mut host_logits = Vec::with_capacity(batch * vocab);
+            for i in 1..b {
+                let hidden_row = draft_scratch.x.sub_offset(i * h, h);
+                llama::weight_gemv(gpu, w_out, &hidden_row, &target.scratch.logits)?;
+                let logits = gpu.download_f32(&target.scratch.logits)?;
+                debug_assert_eq!(logits.len(), vocab);
+                host_logits.extend_from_slice(&logits);
+            }
+            let hidden_rows = draft_scratch.x.sub_offset(h, batch * h);
+            let uniforms = if use_temp_sampling {
+                Some((0..batch).map(|_| xorshift_next_unit(rng_state)).collect::<Vec<f32>>())
+            } else {
+                None
+            };
+            let proposal = dflash::propose_candidates_host(
+                gpu,
+                draft_weights,
+                draft_scratch,
+                &hidden_rows,
+                &host_logits,
+                batch,
+                seed_token,
+                temp,
+                uniforms.as_deref(),
+            )?;
+            apply_dflash2_selector_proposal(
+                proposal,
+                vocab,
+                use_temp_sampling,
+                &mut drafted,
+                &mut draft_softmaxes,
+                &mut draft_probs_at_drafted,
+            )?;
         } else {
             // Fallback: per-row weight_gemv loop.
             for i in 1..b {
@@ -3505,7 +3809,10 @@ pub fn spec_step_dflash(
                 if use_temp_sampling {
                     let mut probs = Vec::with_capacity(vocab);
                     softmax_temp_into(&logits, temp, &mut probs);
-                    if topp_active {
+                    if top_k > 0 && top_k < vocab {
+                        apply_host_topk(&mut probs, top_k);
+                    }
+                    if top_p < 0.999 {
                         apply_host_nucleus(&mut probs, top_p);
                     }
                     let u = xorshift_next_unit(rng_state);
@@ -3657,7 +3964,8 @@ pub fn spec_step_dflash(
         // remaining budget can bind mid-window, force the host path so we can
         // clamp accept_len and re-draw the boundary sample from the target row.
         let budget_binds = matches!(max_accept, Some(m) if m < b - 1);
-        let gpu_accept = fast_sample_active
+        let gpu_accept = !selector_mode
+            && fast_sample_active
             && !budget_binds
             && c8_draft_probs_dev.is_some()
             && c8_draft_tokens_dev.is_some()
@@ -3808,7 +4116,10 @@ pub fn spec_step_dflash(
                         temp,
                         &mut target_probs,
                     );
-                    if topp_active {
+                    if top_k > 0 && top_k < vocab {
+                        apply_host_topk(&mut target_probs, top_k);
+                    }
+                    if top_p < 0.999 {
                         apply_host_nucleus(&mut target_probs, top_p);
                     }
                 }
@@ -3854,16 +4165,16 @@ pub fn spec_step_dflash(
                 if let Some(fast) = &fast_tgt_probs {
                     target_probs.clear();
                     target_probs.extend_from_slice(&fast[i * vocab..(i + 1) * vocab]);
-                    if let (Some(tau), Some(z)) = (&fast_tgt_tau, &fast_tgt_z) {
-                        apply_topp_trunc(&mut target_probs, tau[i], z[i]);
-                    }
                 } else {
                     softmax_temp_into(
                         &tgt_logits[i * vocab..(i + 1) * vocab],
                         temp,
                         &mut target_probs,
                     );
-                    if topp_active {
+                    if top_k > 0 && top_k < vocab {
+                        apply_host_topk(&mut target_probs, top_k);
+                    }
+                    if top_p < 0.999 {
                         apply_host_nucleus(&mut target_probs, top_p);
                     }
                 }
@@ -4340,6 +4651,25 @@ fn run_dflash_draft_for_logits(
             let _ = gpu.free_tensor(rotated);
             r2
         }
+        rdna_compute::DType::MQ4G256V2 => {
+            let rotated = gpu.alloc_tensor(&[batch * h], rdna_compute::DType::F32)?;
+            let r1 = llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch);
+            if let Err(e) = r1 {
+                let _ = gpu.free_tensor(rotated);
+                let _ = gpu.free_tensor(logits_batch);
+                return Err(e);
+            }
+            let r2 = gpu.gemm_mq4g256v2_batched_lmhead(
+                &w_out.buf,
+                &rotated,
+                &logits_batch,
+                w_out.m,
+                w_out.k,
+                batch,
+            );
+            let _ = gpu.free_tensor(rotated);
+            r2
+        }
         rdna_compute::DType::MQ3G256 => {
             let rotated = gpu.alloc_tensor(&[batch * h], rdna_compute::DType::F32)?;
             let r1 = llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch);
@@ -4406,7 +4736,7 @@ fn run_dflash_draft_for_logits(
         }
         _ => Err(hip_bridge::HipError::new(
             0,
-            "ddtree: unsupported target.output dtype (need Q8/HFQ4G256/MQ4G256/MQ3G256/HFQ6G256/MQ6G256)",
+            "ddtree: unsupported target.output dtype (need Q8/HFQ4G256/MQ4G256/MQ4G256V2/MQ3G256/HFQ6G256/MQ6G256)",
         )),
     };
     if let Err(e) = gemm_result {
@@ -4672,6 +5002,25 @@ fn run_dflash_draft_for_topk_gpu(
             let _ = gpu.free_tensor(rotated);
             r2
         }
+        rdna_compute::DType::MQ4G256V2 => {
+            let rotated = gpu.alloc_tensor(&[batch * h], rdna_compute::DType::F32)?;
+            let r1 = llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch);
+            if let Err(e) = r1 {
+                let _ = gpu.free_tensor(rotated);
+                let _ = gpu.free_tensor(logits_batch);
+                return Err(e);
+            }
+            let r2 = gpu.gemm_mq4g256v2_batched_lmhead(
+                &w_out.buf,
+                &rotated,
+                &logits_batch,
+                w_out.m,
+                w_out.k,
+                batch,
+            );
+            let _ = gpu.free_tensor(rotated);
+            r2
+        }
         rdna_compute::DType::MQ3G256 => {
             let rotated = gpu.alloc_tensor(&[batch * h], rdna_compute::DType::F32)?;
             let r1 = llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch);
@@ -4732,7 +5081,7 @@ fn run_dflash_draft_for_topk_gpu(
         }
         _ => Err(hip_bridge::HipError::new(
             0,
-            "ddtree: unsupported target.output dtype (need Q8/HFQ4G256/MQ4G256/MQ3G256/HFQ6G256/MQ6G256)",
+            "ddtree: unsupported target.output dtype (need Q8/HFQ4G256/MQ4G256/MQ4G256V2/MQ3G256/HFQ6G256/MQ6G256)",
         )),
     };
     if let Err(e) = gemm_result {
@@ -4894,6 +5243,12 @@ pub fn spec_step_ddtree(
         tree_topk >= 1 && tree_topk <= vocab,
         "tree_topk must be in [1, vocab]"
     );
+    if draft_weights.has_candidate_selector() {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "DFlash2 candidate selector is chain-only; DDTree independent-marginal verify is disabled",
+        ));
+    }
 
     // ── 1. Run DFlash draft, download raw logits ─────────────────────────
     let draft_logits = run_dflash_draft_for_logits(
@@ -5350,6 +5705,12 @@ pub fn spec_step_ddtree_batched(
         tree_topk >= 1 && tree_topk <= vocab,
         "tree_topk must be in [1, vocab]"
     );
+    if draft_weights.has_candidate_selector() {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "DFlash2 candidate selector is chain-only; DDTree independent-marginal verify is disabled",
+        ));
+    }
 
     // D16: ensure active_stream is set before any work so memset_async and
     // the stream-scoped sync in verify_dflash_block_inner have a non-null
