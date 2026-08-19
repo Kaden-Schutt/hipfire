@@ -1,0 +1,20 @@
+{
+  "seed": 20260819,
+  "model_dir": "/home/kaden/qcal/parents/qwen3.8-27b",
+  "imatrix": "/home/kaden/qcal/imatrix/Qwen3.8-27B-imatrix.gguf",
+  "output_dir": "/home/kaden/rotation-qkv-layer-full",
+  "fixtures": [
+    {
+      "name": "train_qkv_l45",
+      "split": "train",
+      "tensor": "model.language_model.layers.45.linear_attn.in_proj_qkv.weight",
+      "blocks": 204800
+    },
+    {
+      "name": "held_qkv_l40",
+      "split": "heldout",
+      "tensor": "model.language_model.layers.40.linear_attn.in_proj_qkv.weight",
+      "blocks": 16384
+    }
+  ]
+}

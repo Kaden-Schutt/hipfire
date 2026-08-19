@@ -1,0 +1,126 @@
+{
+  "seed": 20260819,
+  "output_dir": "/home/kaden/rotation-corpus",
+  "fixtures": [
+    {
+      "name": "train_q35_l0_down",
+      "split": "train",
+      "model": "qwen3.5-27b",
+      "snapshot": "/home/kaden/.cache/huggingface/hub/models--Qwen--Qwen3.5-27B/snapshots/fc05daec18b0a78c049392ed2e771dde82bdf654",
+      "tensor": "model.language_model.layers.0.mlp.down_proj.weight",
+      "blocks": 4096
+    },
+    {
+      "name": "train_q35_l20_gate",
+      "split": "train",
+      "model": "qwen3.5-27b",
+      "snapshot": "/home/kaden/.cache/huggingface/hub/models--Qwen--Qwen3.5-27B/snapshots/fc05daec18b0a78c049392ed2e771dde82bdf654",
+      "tensor": "model.language_model.layers.20.mlp.gate_proj.weight",
+      "blocks": 4096
+    },
+    {
+      "name": "train_q35_l11_q",
+      "split": "train",
+      "model": "qwen3.5-27b",
+      "snapshot": "/home/kaden/.cache/huggingface/hub/models--Qwen--Qwen3.5-27B/snapshots/fc05daec18b0a78c049392ed2e771dde82bdf654",
+      "tensor": "model.language_model.layers.11.self_attn.q_proj.weight",
+      "blocks": 4096
+    },
+    {
+      "name": "train_q36_l20_out",
+      "split": "train",
+      "model": "qwen3.6-27b",
+      "snapshot": "/home/kaden/.cache/huggingface/hub/models--Qwen--Qwen3.6-27B/snapshots/6a9e13bd6fc8f0983b9b99948120bc37f49c13e9",
+      "tensor": "model.language_model.layers.20.linear_attn.out_proj.weight",
+      "blocks": 4096
+    },
+    {
+      "name": "train_gemma_l0_gate",
+      "split": "train",
+      "model": "gemma4-12b-it",
+      "snapshot": "/home/kaden/.cache/huggingface/hub/models--google--gemma-4-12B-it/snapshots/707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7",
+      "tensor": "model.language_model.layers.0.mlp.gate_proj.weight",
+      "blocks": 4096
+    },
+    {
+      "name": "train_gemma_l0_q",
+      "split": "train",
+      "model": "gemma4-12b-it",
+      "snapshot": "/home/kaden/.cache/huggingface/hub/models--google--gemma-4-12B-it/snapshots/707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7",
+      "tensor": "model.language_model.layers.0.self_attn.q_proj.weight",
+      "blocks": 4096
+    },
+    {
+      "name": "heldout_q35_l40_down",
+      "split": "heldout",
+      "model": "qwen3.5-27b",
+      "snapshot": "/home/kaden/.cache/huggingface/hub/models--Qwen--Qwen3.5-27B/snapshots/fc05daec18b0a78c049392ed2e771dde82bdf654",
+      "tensor": "model.language_model.layers.40.mlp.down_proj.weight",
+      "blocks": 16384
+    },
+    {
+      "name": "heldout_q35_l30_gate",
+      "split": "heldout",
+      "model": "qwen3.5-27b",
+      "snapshot": "/home/kaden/.cache/huggingface/hub/models--Qwen--Qwen3.5-27B/snapshots/fc05daec18b0a78c049392ed2e771dde82bdf654",
+      "tensor": "model.language_model.layers.30.mlp.gate_proj.weight",
+      "blocks": 16384
+    },
+    {
+      "name": "heldout_q35_l43_q",
+      "split": "heldout",
+      "model": "qwen3.5-27b",
+      "snapshot": "/home/kaden/.cache/huggingface/hub/models--Qwen--Qwen3.5-27B/snapshots/fc05daec18b0a78c049392ed2e771dde82bdf654",
+      "tensor": "model.language_model.layers.43.self_attn.q_proj.weight",
+      "blocks": 16384
+    },
+    {
+      "name": "heldout_q36_l20_down",
+      "split": "heldout",
+      "model": "qwen3.6-27b",
+      "snapshot": "/home/kaden/.cache/huggingface/hub/models--Qwen--Qwen3.6-27B/snapshots/6a9e13bd6fc8f0983b9b99948120bc37f49c13e9",
+      "tensor": "model.language_model.layers.20.mlp.down_proj.weight",
+      "blocks": 16384
+    },
+    {
+      "name": "heldout_q36_l20_gate",
+      "split": "heldout",
+      "model": "qwen3.6-27b",
+      "snapshot": "/home/kaden/.cache/huggingface/hub/models--Qwen--Qwen3.6-27B/snapshots/6a9e13bd6fc8f0983b9b99948120bc37f49c13e9",
+      "tensor": "model.language_model.layers.20.mlp.gate_proj.weight",
+      "blocks": 16384
+    },
+    {
+      "name": "heldout_q36_l23_q",
+      "split": "heldout",
+      "model": "qwen3.6-27b",
+      "snapshot": "/home/kaden/.cache/huggingface/hub/models--Qwen--Qwen3.6-27B/snapshots/6a9e13bd6fc8f0983b9b99948120bc37f49c13e9",
+      "tensor": "model.language_model.layers.23.self_attn.q_proj.weight",
+      "blocks": 16384
+    },
+    {
+      "name": "heldout_gemma_l23_down",
+      "split": "heldout",
+      "model": "gemma4-12b-it",
+      "snapshot": "/home/kaden/.cache/huggingface/hub/models--google--gemma-4-12B-it/snapshots/707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7",
+      "tensor": "model.language_model.layers.23.mlp.down_proj.weight",
+      "blocks": 16384
+    },
+    {
+      "name": "heldout_gemma_l47_gate",
+      "split": "heldout",
+      "model": "gemma4-12b-it",
+      "snapshot": "/home/kaden/.cache/huggingface/hub/models--google--gemma-4-12B-it/snapshots/707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7",
+      "tensor": "model.language_model.layers.47.mlp.gate_proj.weight",
+      "blocks": 16384
+    },
+    {
+      "name": "heldout_gemma_l23_q",
+      "split": "heldout",
+      "model": "gemma4-12b-it",
+      "snapshot": "/home/kaden/.cache/huggingface/hub/models--google--gemma-4-12B-it/snapshots/707f0a3b8a3c7ad586ed01e27eafbad8a27dd0f7",
+      "tensor": "model.language_model.layers.23.self_attn.q_proj.weight",
+      "blocks": 16384
+    }
+  ]
+}

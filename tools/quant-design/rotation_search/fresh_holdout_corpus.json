@@ -1,0 +1,15 @@
+{
+  "seed": 20260819,
+  "model_dir": "/home/kaden/qcal/parents/qwen3.8-27b",
+  "imatrix": "/home/kaden/qcal/imatrix/Qwen3.8-27B-imatrix.gguf",
+  "output_dir": "/home/kaden/rotation-fresh-holdout",
+  "fixtures": [
+    {"name":"train_placeholder","split":"train","tensor":"model.language_model.layers.4.mlp.up_proj.weight","blocks":1},
+    {"name":"fresh_l6_out","split":"heldout","tensor":"model.language_model.layers.6.linear_attn.out_proj.weight","blocks":16384},
+    {"name":"fresh_l16_down","split":"heldout","tensor":"model.language_model.layers.16.mlp.down_proj.weight","blocks":16384},
+    {"name":"fresh_l26_gate","split":"heldout","tensor":"model.language_model.layers.26.mlp.gate_proj.weight","blocks":16384},
+    {"name":"fresh_l36_up","split":"heldout","tensor":"model.language_model.layers.36.mlp.up_proj.weight","blocks":16384},
+    {"name":"fresh_l46_qkv","split":"heldout","tensor":"model.language_model.layers.46.linear_attn.in_proj_qkv.weight","blocks":16384},
+    {"name":"fresh_l56_down","split":"heldout","tensor":"model.language_model.layers.56.mlp.down_proj.weight","blocks":16384}
+  ]
+}

@@ -1,0 +1,169 @@
+{
+  "research_start_utc": "2026-08-19T04:05:40Z",
+  "research_deadline_utc": "2026-08-19T06:05:40Z",
+  "research_end_utc": "2026-08-19T06:05:53Z",
+  "strict_goal_status": "rejected_global_transform",
+  "strict_goal_reason": "No single global D1/D2 table or fixed grouping candidate achieved >=5% held-out activation-weighted improvement or >=10% p99.9 improvement without material per-role/per-bit regressions.",
+  "codec_scope": "Four-bit measurements reproduce production MQ4V2. Two/three-bit measurements are hypothetical matched-header V2 research layouts; production MQ2/MQ3 remain single-G256 formats.",
+  "environment": {
+    "local": "gfx1201 search, exact codec evaluation, and runtime microbenchmarks",
+    "hiptrx": "Qwen3.8-27B raw weights plus GGUF imatrix extraction and independent Rust proxy",
+    "hipx": "unseen Qwen3-8B raw-weight heldout corpus"
+  },
+  "runtime_contract": {
+    "transform": "D2 * H256 * D1 / 16",
+    "d1_canonical_seed": 42,
+    "d2_canonical_seed": 1042,
+    "sign_values": 256,
+    "fwht_stages": 8,
+    "runtime_rotation": true,
+    "shared_domains": ["attention QKV", "MLP gate/up", "MLP down after SwiGLU"],
+    "candidate_runtime_benchmark": {
+      "gpu": "gfx1201",
+      "k": 8192,
+      "batch": 1,
+      "iterations": 20000,
+      "canonical_median_us": 7.8,
+      "candidate_median_us": 7.8,
+      "median_ratio": 1.0,
+      "same_kernel_binary": true,
+      "same_launch_and_memory_traffic": true
+    }
+  },
+  "corpora": {
+    "weight_train": {"fixtures": 6, "blocks_per_fixture": 4096, "sha256_prefix": "716c88d522481982"},
+    "weight_heldout": {"fixtures": 9, "blocks_per_fixture": 16384, "sha256_prefix": "0c2408a4290e8d9d"},
+    "activation_train": {"model": "Qwen3.8-27B", "fixtures": 6, "blocks_per_fixture": 4096, "raw_sha256_prefix": "0db69ecce612024e", "importance_sha256_prefix": "2b079642749b3f0b"},
+    "activation_large_train": {"model": "Qwen3.8-27B", "fixtures": 6, "blocks_per_fixture": 16384, "raw_sha256_prefix": "624a5aeaf601c605", "importance_sha256_prefix": "a1474deacfea994a"},
+    "activation_heldout": {"model": "Qwen3.8-27B", "fixtures": 6, "blocks_per_fixture": 16384, "raw_sha256_prefix": "4719abde500ded32", "importance_sha256_prefix": "d3e60845c3d410b1"},
+    "unseen_model": {"model": "Qwen3-8B", "fixtures": 3, "blocks_per_fixture": 16384},
+    "fresh_activation_holdout": {"model": "Qwen3.8-27B", "fixtures": 6, "blocks_per_fixture": 16384, "raw_sha256_prefix": "7c7bd1510cc8e384", "importance_sha256_prefix": "a9a414bafe14a547"}
+  },
+  "strict_global_experiments": [
+    {
+      "name": "D2 tail-objective coordinate descent",
+      "train": {"tail_ratio": 0.9408029, "block_ratio": 0.9998201},
+      "heldout": {"tail_ratio": 0.9977844, "block_ratio": 0.9996432, "worst_fixture_bit_tail_ratio": 1.034324},
+      "unseen_qwen3_8b": {"tail_ratio": 0.98931, "worst_fixture_bit_ratio": 1.025626},
+      "verdict": "overfit; reject"
+    },
+    {
+      "name": "D2 activation-objective coordinate descent",
+      "train": {"activation_ratio": 0.8212359},
+      "heldout": {"activation_ratio": 0.9784381, "tail_ratio": 1.005349, "block_ratio": 0.9999511},
+      "verdict": "2.16% held-out activation improvement, below bar and tail guard regressed"
+    },
+    {
+      "name": "D2 alternate activation basin",
+      "train": {"activation_ratio": 0.8110234},
+      "heldout": {"activation_ratio": 0.9801935, "aggregate_activation_block_p999_ratio": 0.8964, "worst_fixture_bit_p999_ratio": 1.173843},
+      "verdict": "aggregate p99.9 improved about 10.4%, but large per-role regressions violate the goal"
+    },
+    {
+      "name": "D2 larger-training activation fit",
+      "train": {"activation_ratio": 0.8909706},
+      "heldout": {"activation_ratio": 0.9905489, "bit_ratios": [0.9857, 0.9841, 1.0019]},
+      "verdict": "gain collapsed as training coverage increased; reject"
+    },
+    {
+      "name": "D1 activation search",
+      "train": {"activation_ratio": 0.9150346},
+      "heldout": {"activation_ratio": 0.9909155, "bit_ratios": [0.977, 0.9896, 1.0062]},
+      "verdict": "4-bit regression and <1% macro gain; reject"
+    },
+    {
+      "name": "alternating D1/D2 activation search",
+      "train": {"activation_ratio": 0.7941395},
+      "heldout": {"activation_ratio": 0.9812109, "bit_ratios": [0.9635, 0.9918, 0.9883]},
+      "verdict": "1.88% macro gain, below bar; reject"
+    },
+    {
+      "name": "production MQ4V2-only robust-state D2",
+      "train": {"macro_activation_ratio": 0.8563795, "worst_fixture_activation_ratio": 1.001412},
+      "heldout": {"activation_ratio": 0.9636668, "activation_block_p999_ratio": 0.8436532, "raw_mse_ratio": 1.0001406, "block_nmse_ratio": 0.9998796},
+      "heldout_worst_role": {"activation_ratio": 1.004722, "activation_block_p999_ratio": 1.109345},
+      "fresh_unopened_layer_holdout": {"activation_ratio": 0.9934603, "activation_block_p999_ratio": 0.98342, "tail_ratio": 1.006091, "raw_mse_ratio": 1.0001381},
+      "verdict": "the original heldout aggregate p99.9 improved 15.6% but one role regressed 10.9%; on six fresh unopened layers the MQ4V2 activation gain collapsed to 0.65% and p99.9 to 1.66%; reject global adoption"
+    },
+    {
+      "name": "GF(2)^8 output-group partitions",
+      "best_heldout_activation_ratio_observed": 0.9683064,
+      "selection_stability": "failed: full training selected a different mask with heldout ratio 0.99397",
+      "verdict": "sample-sensitive; no precommitted stable winner"
+    },
+    {
+      "name": "signed butterfly offline control",
+      "best_macro_selected_heldout_activation_ratio": 0.9711004,
+      "runtime_trace_established": false,
+      "train_worst_cell_ratio": 1.04584,
+      "verdict": "below bar, regressions, and not exact-trace deployable"
+    }
+  ],
+  "headroom": {
+    "per_block_adaptive_D2_oracle": {"mq4v2_mse_improvement": 0.70346, "tail_improvement": 0.66113},
+    "interpretation": "Affine grids have substantial sign-orientation headroom, but the useful orientation is block-specific and cannot be represented by one runtime-shared activation rotation."
+  },
+  "non_global_upside": {
+    "candidate": "per-layer QKV D2 table optimized on every one of 204800 G256 groups in Qwen3.8 layer 45 in_proj_qkv",
+    "best_screened_lcg_seed": 2719704,
+    "best_screened_lcg_activation_ratio": 0.9832627,
+    "hamming_distance_from_canonical_d2": 125,
+    "full_raw_sha256_prefix": "9c2a11aafb377e1d",
+    "full_importance_sha256_prefix": "394e403695615751",
+    "d2_signs_sha256": "d1191a5be3c9773349eff648f511b90d746c4c34b31a0666ef28138f336c345b",
+    "d2_u32_le": ["eb9e1b5d", "02722d2c", "aa435a62", "b2c43578", "c76d65f7", "857e74dd", "ba8d64ab", "2f8c0de0"],
+    "activation_ratio": 0.9441725,
+    "activation_improvement": 0.0558275,
+    "per_bit_activation_ratios": [0.9438146, 0.9514311, 0.9372719],
+    "production_mq4v2_activation_improvement": 0.0627281,
+    "activation_block_p99_ratios": [0.882792, 0.883265, 0.846434],
+    "activation_block_p999_ratios": [0.874336, 0.88956, 0.897591],
+    "raw_mse_ratios": [0.9995764, 0.9998487, 0.9996305],
+    "tail_ratio": 1.003652,
+    "block_nmse_ratio": 0.9995902,
+    "cross_layer_activation_ratio": 1.00928,
+    "runtime_cost": "same mq_rotate_x instructions and traffic; requires a stable per-layer/domain signs2 pointer and artifact metadata",
+    "verdict": "Production MQ4V2 improves 6.27% on this complete layer and the cross-bit research macro improves 5.58%, but the table regresses 0.93% across other QKV layers and therefore does not satisfy the one-global-transform goal"
+  },
+  "exhausted_exact_trace_classes": [
+    "global D2 random seeds and exact coordinate descent",
+    "global D1 random seeds and exact coordinate descent",
+    "alternating global D1/D2 descent"
+  ],
+  "offline_topology_controls": [
+    "255 GF(2)^8 balanced output partitions",
+    "random arbitrary balanced output partitions",
+    "discrete signed butterfly controls"
+  ],
+  "independent_metric_oracle": {
+    "blocks": 3072,
+    "python_candidate_over_canonical_activation_ratios": [0.77029857, 0.839546, 0.80321696],
+    "hip_candidate_over_canonical_activation_ratios": [0.7703, 0.8395, 0.8032],
+    "verdict": "Forward rotation, exact affine codec, matching-D2 inverse, and imatrix-weighted m1 agree independently."
+  },
+  "corrected_rust_heldout_proxy": {
+    "candidate": "alternate activation D2 basin",
+    "targets": ["layer5 linear_attn.out_proj", "layer15 mlp.down_proj", "layer25 mlp.gate_proj"],
+    "blocks_per_tensor": 16384,
+    "activation_ratio": 0.996526,
+    "tail_ratio": 1.012305,
+    "worst_tail_ratio": 1.052282,
+    "verdict": "Independent disjoint-layer proxy confirms the global candidate does not clear the quality bar."
+  },
+  "verification": {
+    "hip_harnesses": "all five standalone gfx1201 sources compiled with hipcc -O3",
+    "runtime_benchmark": "production mq_rotate_x, 20000 paired launches, 7.8 us median canonical and candidate",
+    "rust_proxy": "release build passed and corrected disjoint-layer proxy ran on hiptrx",
+    "quantizer_tests": "154 passed, 4 ignored",
+    "production_codec_test": "mq4g256v2_roundtrip passed",
+    "fp16_tests": "2 passed"
+  },
+  "next_research": {
+    "recommended": "Per-layer rotation-domain D2 tables, starting with fused in_proj_qkv, optimized on the complete deployed weight matrix and validated with teacher-student KLD.",
+    "global_kill_result": "A production-MQ4V2-only robust D2 was frozen before six fresh layers were opened. Fresh activation m1 improved only 0.65%, activation-block p99.9 only 1.66%, and tail MSE regressed 0.61%; the global-table path is closed for this campaign.",
+    "runtime_design": "Keep D1 global. Store one packed 256-bit D2 table per rotation domain, expand to the existing 256-f32 device buffer shape at model load, and pass stable domain pointers through existing fused/standalone rotation kernargs before graph capture. QKV shares one table; gate/up shares one; down/SwiGLU owns one.",
+    "cost": "No new kernel arithmetic, launch, or sign-table traffic; about 32 bytes artifact metadata and 1 KiB expanded device memory per D2 domain. Existing MQ artifacts require versioned rotation metadata and requantization.",
+    "gfx1100_constraint": "The opt-in fused_rmsnorm_mq_rotate_vecsum_sign_const kernel bakes canonical D1/D2 words. Custom domain tables must select the pointer/LDS path or compile domain-specific variants; gfx1201 and the standard pointer path retain the measured identical kernel cost.",
+    "kill_gate": "Require >=5% held-out teacher-student KLD or activation m1 improvement per domain, every bit-width non-regressing, and byte-identical runtime launch/ISA contracts."
+  }
+}

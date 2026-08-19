@@ -1,0 +1,20 @@
+{
+  "seed": 20260819,
+  "model_dir": "/home/kaden/qcal/parents/qwen3.8-27b",
+  "imatrix": "/home/kaden/qcal/imatrix/Qwen3.8-27B-imatrix.gguf",
+  "output_dir": "/home/kaden/rotation-activation",
+  "fixtures": [
+    {"name":"train_l0_out","split":"train","tensor":"model.language_model.layers.0.linear_attn.out_proj.weight","blocks":4096},
+    {"name":"train_l10_down","split":"train","tensor":"model.language_model.layers.10.mlp.down_proj.weight","blocks":4096},
+    {"name":"train_l20_gate","split":"train","tensor":"model.language_model.layers.20.mlp.gate_proj.weight","blocks":4096},
+    {"name":"train_l30_up","split":"train","tensor":"model.language_model.layers.30.mlp.up_proj.weight","blocks":4096},
+    {"name":"train_l40_qkv","split":"train","tensor":"model.language_model.layers.40.linear_attn.in_proj_qkv.weight","blocks":4096},
+    {"name":"train_l50_down","split":"train","tensor":"model.language_model.layers.50.mlp.down_proj.weight","blocks":4096},
+    {"name":"held_l5_out","split":"heldout","tensor":"model.language_model.layers.5.linear_attn.out_proj.weight","blocks":16384},
+    {"name":"held_l15_down","split":"heldout","tensor":"model.language_model.layers.15.mlp.down_proj.weight","blocks":16384},
+    {"name":"held_l25_gate","split":"heldout","tensor":"model.language_model.layers.25.mlp.gate_proj.weight","blocks":16384},
+    {"name":"held_l35_up","split":"heldout","tensor":"model.language_model.layers.35.mlp.up_proj.weight","blocks":16384},
+    {"name":"held_l45_qkv","split":"heldout","tensor":"model.language_model.layers.45.linear_attn.in_proj_qkv.weight","blocks":16384},
+    {"name":"held_l55_down","split":"heldout","tensor":"model.language_model.layers.55.mlp.down_proj.weight","blocks":16384}
+  ]
+}
