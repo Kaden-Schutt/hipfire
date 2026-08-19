@@ -1548,14 +1548,29 @@ fn gemm_dispatch(
                 let n = std::cmp::min(max_chunk, batch - row);
                 let x_chunk = x.sub_offset(row * w.k, n * w.k);
                 let y_chunk = y.sub_offset(row * w.m, n * w.m);
-                let rot_view = scratch.sub_offset(0, n * w.k);
-                if let Err(e) = crate::llama::rotate_x_mq_batched_for(gpu, w, &x_chunk, &rot_view, w.k, n) {
-                    chunked = Err(e);
-                    break;
-                }
-                if let Err(e) = gpu.gemm_mq4g256v2_batched_lmhead(&w.buf, &rot_view, &y_chunk, w.m, w.k, n) {
-                    chunked = Err(e);
-                    break;
+                if n == 1 {
+                    // The qt44 batched launcher intentionally has no scalar
+                    // fallback. Incremental context fills can be one row after
+                    // a zero-accept cycle, so use the ordinary qt44 GEMV on the
+                    // original (unrotated) activation for that tail.
+                    if let Err(e) = crate::llama::weight_gemv(gpu, w, &x_chunk, &y_chunk) {
+                        chunked = Err(e);
+                        break;
+                    }
+                } else {
+                    let rot_view = scratch.sub_offset(0, n * w.k);
+                    if let Err(e) = crate::llama::rotate_x_mq_batched_for(
+                        gpu, w, &x_chunk, &rot_view, w.k, n,
+                    ) {
+                        chunked = Err(e);
+                        break;
+                    }
+                    if let Err(e) = gpu.gemm_mq4g256v2_batched_lmhead(
+                        &w.buf, &rot_view, &y_chunk, w.m, w.k, n,
+                    ) {
+                        chunked = Err(e);
+                        break;
+                    }
                 }
                 row += n;
             }
