@@ -1,81 +1,14 @@
 // SPDX-License-Identifier: MIT
-// Copyright (c) 2026 Robin Van Cauter
-// hipfire — see LICENSE and NOTICE in the project root.
-
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
-
 typedef _Float16 __attribute__((ext_vector_type(8))) half8_t;
 typedef float __attribute__((ext_vector_type(8))) float8_t;
-
-__launch_bounds__(32, 2)
-extern "C" __global__ void gemm_gate_up_mq5g256v2_wmma_gfx12_bt(
-    const char* __restrict__ A_gate,
-    const char* __restrict__ A_up,
-    const _Float16* __restrict__ X,
-    float* __restrict__ Y_gate,
-    float* __restrict__ Y_up,
-    int gate_m, int up_m, int K, int N
-){
-    const int total_m = gate_m + up_m;
-    const int row_start = blockIdx.x * 16;
-    const int batch_start = blockIdx.y * 16;
-    const int tid = threadIdx.x;
-    if(row_start >= total_m) return;
-    if(batch_start >= N) return;
-    const int m_lane = tid &15;
-    const int k_grp = tid >>4;
-    const int my_row = row_start + m_lane;
-    const int safe_row = (my_row < total_m) ? my_row : (total_m-1);
-    const char* A; int local_row;
-    if(safe_row < gate_m){ A=A_gate; local_row=safe_row; } else { A=A_up; local_row=safe_row-gate_m; }
-    const int groups_per_row = K/256;
-    const long long row_stride=(long long)groups_per_row*168;
-    const char* row_base = A + local_row*row_stride;
-    const int safe_batch = (batch_start + m_lane < N) ? (batch_start+m_lane):0;
-    float8_t acc={0};
-    for(int g=0; g<groups_per_row; g++){
-        const char* gp=row_base+g*168;
-        const unsigned int hA=*(const unsigned int*)(gp);
-        const unsigned int hB=*(const unsigned int*)(gp+4);
-        const _Float16 sc0=(_Float16)__half2float(__ushort_as_half((unsigned short)(hA&0xFFFFu)));
-        const _Float16 zp0=(_Float16)__half2float(__ushort_as_half((unsigned short)(hA>>16)));
-        const _Float16 sc1=(_Float16)__half2float(__ushort_as_half((unsigned short)(hB&0xFFFFu)));
-        const _Float16 zp1=(_Float16)__half2float(__ushort_as_half((unsigned short)(hB>>16)));
-        const _Float16* x_base=X+(long long)safe_batch*K+g*256;
-        #define DQ5(dp, sc_h, zp_h, a_reg) { uint32_t _d0=*(const uint32_t*)(dp); uint8_t _d4=*((const unsigned char*)(dp)+4); uint64_t _bits=((uint64_t)_d0)|((uint64_t)_d4<<32); a_reg[0]=sc_h*(_Float16)(float)((_bits>>0)&31u)+zp_h; a_reg[1]=sc_h*(_Float16)(float)((_bits>>5)&31u)+zp_h; a_reg[2]=sc_h*(_Float16)(float)((_bits>>10)&31u)+zp_h; a_reg[3]=sc_h*(_Float16)(float)((_bits>>15)&31u)+zp_h; a_reg[4]=sc_h*(_Float16)(float)((_bits>>20)&31u)+zp_h; a_reg[5]=sc_h*(_Float16)(float)((_bits>>25)&31u)+zp_h; a_reg[6]=sc_h*(_Float16)(float)((_bits>>30)&31u)+zp_h; a_reg[7]=sc_h*(_Float16)(float)((_bits>>35)&31u)+zp_h; }
-        for(int kt=0; kt<16; kt+=4){
-            const _Float16 sc_h0=(kt<8)?sc0:sc1; const _Float16 zp_h0=(kt<8)?zp0:zp1;
-            const _Float16 sc_h1=(kt+1<8)?sc0:sc1; const _Float16 zp_h1=(kt+1<8)?zp0:zp1;
-            const _Float16 sc_h2=(kt+2<8)?sc0:sc1; const _Float16 zp_h2=(kt+2<8)?zp0:zp1;
-            const _Float16 sc_h3=(kt+3<8)?sc0:sc1; const _Float16 zp_h3=(kt+3<8)?zp0:zp1;
-            int off_a=(kt+0)*10+k_grp*5, off_b=(kt+1)*10+k_grp*5, off_c=(kt+2)*10+k_grp*5, off_d=(kt+3)*10+k_grp*5;
-            const unsigned char* dp_a=(const unsigned char*)(gp+8+off_a);
-            const unsigned char* dp_b=(const unsigned char*)(gp+8+off_b);
-            const unsigned char* dp_c=(const unsigned char*)(gp+8+off_c);
-            const unsigned char* dp_d=(const unsigned char*)(gp+8+off_d);
-            half8_t b_a=*(const half8_t*)(x_base+(kt+0)*16+k_grp*8);
-            half8_t b_b=*(const half8_t*)(x_base+(kt+1)*16+k_grp*8);
-            half8_t b_c=*(const half8_t*)(x_base+(kt+2)*16+k_grp*8);
-            half8_t b_d=*(const half8_t*)(x_base+(kt+3)*16+k_grp*8);
-            half8_t a_reg;
-            DQ5(dp_a,sc_h0,zp_h0,a_reg); acc=__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a_reg,b_a,acc);
-            DQ5(dp_b,sc_h1,zp_h1,a_reg); acc=__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a_reg,b_b,acc);
-            DQ5(dp_c,sc_h2,zp_h2,a_reg); acc=__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a_reg,b_c,acc);
-            DQ5(dp_d,sc_h3,zp_h3,a_reg); acc=__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a_reg,b_d,acc);
-        }
-        #undef DQ5
-    }
-    const int out_col=batch_start+m_lane;
-    if(out_col<N){
-        #pragma unroll
-        for(int j=0;j<8;j++){
-            int out_row=row_start+8*k_grp+j;
-            if(out_row<total_m){
-                float* Y; int proj_row, out_stride;
-                if(out_row<gate_m){ Y=Y_gate; proj_row=out_row; out_stride=gate_m; } else { Y=Y_up; proj_row=out_row-gate_m; out_stride=up_m; }
-                Y[(long long)out_col*out_stride+proj_row]=acc[j];
-            }
-        }
-    }
+#define MQ5_HDR_LOAD(gp) const unsigned int hA=*(const unsigned int*)(gp); const unsigned int hB=*(const unsigned int*)(gp+4); const _Float16 sc0=(_Float16)__half2float(__ushort_as_half((unsigned short)(hA&0xFFFFu))); const _Float16 zp0=(_Float16)__half2float(__ushort_as_half((unsigned short)(hA>>16))); const _Float16 sc1=(_Float16)__half2float(__ushort_as_half((unsigned short)(hB&0xFFFFu))); const _Float16 zp1=(_Float16)__half2float(__ushort_as_half((unsigned short)(hB>>16)))
+#define MQ5_HDR_SEL _Float16 sc=(kt<8)?sc0:sc1; _Float16 zp=(kt<8)?zp0:zp1;
+#define GEN_GATE_BT(BV) \
+extern "C" __launch_bounds__(32, 2) __global__ void gemm_gate_up_mq5g256v2_wmma_gfx12_bt##BV(const char* __restrict__ A_gate, const char* __restrict__ A_up, const _Float16* __restrict__ X, float* __restrict__ Y_gate, float* __restrict__ Y_up, int gate_m,int up_m,int K,int N){ \
+    const int total_m=gate_m+up_m, rs=blockIdx.x*16, bs=blockIdx.y*(16*BV), tid=threadIdx.x; if(rs>=total_m||bs>=N) return; const int ml=tid&15, kg=tid>>4; const int sr=(rs+ml<total_m)?(rs+ml):(total_m-1); const char* A; int lrow; if(sr<gate_m){A=A_gate;lrow=sr;} else {A=A_up;lrow=sr-gate_m;} const int gpr=K/256; const char* rb=A+(long long)lrow*gpr*168; int sb[BV]; for(int b=0;b<BV;b++){int t=bs+b*16+ml; sb[b]=(t<N)?t:0;} float8_t acc[BV]; for(int b=0;b<BV;b++) acc[b]=float8_t{0,0,0,0,0,0,0,0}; for(int g=0;g<gpr;g++){const char* gp=rb+g*168; MQ5_HDR_LOAD(gp); const _Float16* xg[BV]; for(int b=0;b<BV;b++) xg[b]=X+(long long)sb[b]*K+g*256; for(int kt=0;kt<16;kt+=4){ MQ5_HDR_SEL _Pragma("unroll") for(int ki=0;ki<4;ki++){ int koff=(kt+ki)*10+kg*5; const unsigned char* dp=(const unsigned char*)(gp+8+koff); uint32_t _d0=*(const uint32_t*)dp; uint8_t _d4=*(dp+4); uint64_t _bits=((uint64_t)_d0)|((uint64_t)_d4<<32); half8_t a; a[0]=sc*(_Float16)(float)((_bits>>0)&31u)+zp; a[1]=sc*(_Float16)(float)((_bits>>5)&31u)+zp; a[2]=sc*(_Float16)(float)((_bits>>10)&31u)+zp; a[3]=sc*(_Float16)(float)((_bits>>15)&31u)+zp; a[4]=sc*(_Float16)(float)((_bits>>20)&31u)+zp; a[5]=sc*(_Float16)(float)((_bits>>25)&31u)+zp; a[6]=sc*(_Float16)(float)((_bits>>30)&31u)+zp; a[7]=sc*(_Float16)(float)((_bits>>35)&31u)+zp; _Pragma("unroll") for(int b=0;b<BV;b++){ half8_t bb=*(const half8_t*)(xg[b]+(kt+ki)*16+kg*8); acc[b]=__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a,bb,acc[b]); } } } } for(int b=0;b<BV;b++){ const int oc=bs+b*16+ml; if(oc<N) for(int j=0;j<8;j++){ int orow=rs+8*kg+j; if(orow<total_m){ float* Y; int pr,os; if(orow<gate_m){Y=Y_gate;pr=orow;os=gate_m;} else {Y=Y_up;pr=orow-gate_m;os=up_m;} Y[(long long)oc*os+pr]=acc[b][j]; } } } \
 }
+GEN_GATE_BT(4)
+GEN_GATE_BT(8)
+GEN_GATE_BT(12)
