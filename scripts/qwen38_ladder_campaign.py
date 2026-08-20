@@ -312,6 +312,37 @@ def detect_gpus() -> int:
         pass
     return 1
 
+def parse_device_list(value: Optional[str]) -> Optional[List[int]]:
+    if value is None:
+        return None
+    devices: List[int] = []
+    for raw in value.split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            device = int(raw)
+        except ValueError:
+            raise SystemExit(f"invalid --devices entry '{raw}' (expected comma-separated non-negative GPU indices)")
+        if device < 0:
+            raise SystemExit(f"invalid --devices entry '{raw}' (GPU index must be non-negative)")
+        if device in devices:
+            raise SystemExit(f"duplicate --devices entry '{raw}'")
+        devices.append(device)
+    if not devices:
+        raise SystemExit("--devices must name at least one GPU")
+    return devices
+
+
+def kld_devices(args: argparse.Namespace) -> List[int]:
+    selected = parse_device_list(getattr(args, "devices", None))
+    return selected if selected is not None else list(range(detect_gpus()))
+
+
+def bench_device(args: argparse.Namespace) -> int:
+    selected = parse_device_list(getattr(args, "devices", None))
+    return selected[0] if selected is not None else 0
+
 def run_subprocess(argv: List[str], env: Dict[str, str], cwd: Optional[str] = None, dry_run: bool = False) -> Tuple[int, str, str]:
     """
     Never use shell=True. Returns (returncode, stdout, stderr).
@@ -423,6 +454,7 @@ def build_manifest(args: argparse.Namespace) -> Dict[str, Any]:
         "prompt_digest": pd,
         "params": args.params,
         "draft_source": args.draft_source,
+        "devices": kld_devices(args),
         "binaries": {
             "hipfire_quantize": binary_digest(quant_bin),
             "dflash_convert": binary_digest(dflash_bin),
@@ -566,7 +598,7 @@ def bench_argv(cell: Dict[str, Any], prompt_text: str, spec: str, draft_path: Op
             "--json",
             "--spec", spec,
             prompt_text]
-    env: Dict[str, str] = {}
+    env: Dict[str, str] = {"HIP_VISIBLE_DEVICES": str(bench_device(args))}
     if spec == "dflash" and draft_path:
         env["HIPFIRE_DFLASH_DRAFT"] = draft_path
     return argv, env
@@ -890,8 +922,9 @@ def do_kld(args: argparse.Namespace) -> int:
         for kind, ref_path in refs.items():
             out = Path(args.qcal_dir) / "kld" / f"{cell['cell_id']}.{kind}.kldseq"
             tasks.append((cell, kind, ref_path, str(out)))
-    num_gpus = detect_gpus() if not args.dry_run else 1
-    eprint(f"kld phase: {len(tasks)} jobs, {len(cells)} cells × 2 refs, gpus={num_gpus} (one process/GPU; private HOME+cache)")
+    devices = kld_devices(args)
+    num_gpus = len(devices)
+    eprint(f"kld phase: {len(tasks)} jobs, {len(cells)} cells × 2 refs, devices={devices} (one process/GPU; private HOME+cache)")
     # Load prior state
     phases = state.get("phases", {})
     kstate = phases.get("kld", {})
@@ -899,7 +932,7 @@ def do_kld(args: argparse.Namespace) -> int:
     # For dry-run, just print every command/environment/path
     if args.dry_run:
         for idx, (cell, kind, ref_path, out) in enumerate(tasks):
-            gpu = idx % max(1, num_gpus)
+            gpu = devices[idx % num_gpus]
             argv, env_base = kld_argv(cell, kind, ref_path, out, args)
             # private HOME/cache per GPU
             home = str(Path(args.qcal_dir) / f"tmp_home_gpu{gpu}")
@@ -939,7 +972,7 @@ def do_kld(args: argparse.Namespace) -> int:
         # Assign GPU round-robin based on hash
         # Use thread-local gpu index via tasks index
         idx = tasks.index(task) if task in tasks else 0
-        gpu = idx % max(1, num_gpus)
+        gpu = devices[idx % num_gpus]
         home = str(Path(args.qcal_dir) / f"tmp_home_gpu{gpu}")
         cache = str(Path(args.qcal_dir) / f"kernel_cache_gpu{gpu}")
         Path(home).mkdir(parents=True, exist_ok=True)
@@ -1114,7 +1147,7 @@ def do_bench_ar(args: argparse.Namespace) -> int:
                 argv, env = bench_argv(cell, prompt_text, spec="off", draft_path=None, args=args)
                 env_str = " ".join(f"{k}={shlex.quote(v)}" for k,v in sorted(env.items()))
                 eprint(f"[dry-run] bench-ar {cell_id} rep={rep+1}/3: {env_str + ' ' if env_str else ''}{' '.join(shlex.quote(a) for a in argv)}")
-                eprint(f"[dry-run]   artifact={cell['artifact']} prompt_bytes={prompt_info.get('bytes')} commit={git_commit(args.checkout)} gpu=0")
+                eprint(f"[dry-run]   artifact={cell['artifact']} prompt_bytes={prompt_info.get('bytes')} commit={git_commit(args.checkout)} gpu={bench_device(args)}")
             continue
         # Non-dry-run: 3 fresh processes per arm, serial
         rep_outputs: List[Dict[str, Any]] = []
@@ -1181,7 +1214,7 @@ def do_bench_ar(args: argparse.Namespace) -> int:
             "reps": rep_outputs,
             "fresh_processes": 3,
             "commit": git_commit(args.checkout),
-            "gpu": 0,
+            "gpu": bench_device(args),
             # τ / acceptance fields: retain every sample, do not summarize away
             "tau_samples": [o.get("tau") for o in [x for r in rep_outputs for x in r["parsed_json"]] if isinstance(o, dict) and "tau" in o],
             "acceptance_samples": [o.get("acceptance_rate") or o.get("acceptance") for o in [x for r in rep_outputs for x in r["parsed_json"]] if isinstance(o, dict)],
@@ -1390,7 +1423,7 @@ def do_bench_dflash(args: argparse.Namespace) -> int:
             "reps": rep_outputs,
             "fresh_processes": 3,
             "commit": git_commit(args.checkout),
-            "gpu": 0,
+            "gpu": bench_device(args),
             "tau_samples": [o.get("tau") for o in [x for r in rep_outputs for x in r["parsed_json"]] if isinstance(o, dict) and "tau" in o],
             "acceptance_samples": [o.get("acceptance_rate") or o.get("acceptance") for o in [x for r in rep_outputs for x in r["parsed_json"]] if isinstance(o, dict)],
             "control_mq4v2_included": desired_draft_codec == "mq4v2",
@@ -1468,6 +1501,7 @@ def add_global_args(parser: argparse.ArgumentParser):
     parser.add_argument("--bench-bin", dest="bench_bin", default=None, help="override hipfire bench binary")
     parser.add_argument("--eval-bin", dest="eval_bin", default=None, help="override eval_hipfire binary")
     parser.add_argument("--draft-map", dest="draft_map", default=None, help="optional per-bit draft mapping k=v pairs, e.g. mq2v2=mq2v2,mq3v2=mq3v2 (defaults same-bit)")
+    parser.add_argument("--devices", default=None, help="comma-separated physical HIP GPU indices; KLD uses all listed devices, serial bench phases use the first (default: auto-detect KLD, GPU 0 bench)")
 def build_parser() -> argparse.ArgumentParser:
     # Top-level dry-run must also be accepted after subcommand (e.g. `manifest --dry-run`)
     # so we create a shared parent to avoid duplication.
