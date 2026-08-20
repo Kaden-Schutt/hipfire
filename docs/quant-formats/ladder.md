@@ -130,6 +130,66 @@ Rows are filled from the routes in [`../VALIDATION.md`](../VALIDATION.md). A run
 without a measured KLD on a given model is not publishable for that model. Do
 not infer a KLD from a sibling model or a sibling codec.
 
+
+### Worked example — Qwen3.6-35B-A3B as billed today
+
+Nine product labels in `registry/v1.json`, 34,660,610,688 parameters. Measured:
+
+| billed | bytes | model bpw | class | recodified |
+|---|---:|---:|---:|---|
+| `mq2` | 11.61 GB | 2.680 | 2 | `mq2` |
+| `mq2r` | 12.33 GB | 2.845 | 2 | **needs adjudication** (see below) |
+| `mq3p` | 17.24 GB | 3.980 | 3 | `mq3 pro` |
+| `mq4r` | 18.70 GB | 4.316 | 4 | `mq4-xt` |
+| `mq4p` | 19.76 GB | 4.561 | 4 | `mq4` |
+| `mfp4` | 20.18 GB | 4.659 | 4 | `mq4`, codec MFP4G32 |
+| `mq5` | 23.69 GB | 5.469 | 5 | `mq5` |
+| `mq6` | 27.72 GB | 6.399 | 6 | `mq6` |
+
+Every label already lands inside its own bpw class — the A3B ladder is honest on
+§ 1 today. The defect is legibility: nine labels where `p`, `r`, and `mfp` are
+opaque, and where `mq4p` and `mfp4` are the same rung differing only by codec.
+
+**The `mq2r` adjudication.** Its ladder is five precisions deep:
+
+| qt | format | elems | share |
+|---|---|---:|---:|
+| 19 | MQ2G256Lloyd | 21,474,836,480 | 62.0% |
+| 20 | MQ3G256Lloyd | 10,737,418,240 | 31.0% |
+| 13 | MQ4G256 | 1,938,636,800 | 5.6% |
+| 3 | Q8F16 | 509,542,400 | 1.5% |
+| 1 | F16 | 176,768 | ~0% |
+
+A third of the experts are lifted to 3-bit Lloyd, and the artifact is 0.165 bpw
+*heavier* than `mq2`. By content and by bytes that is a `pro`. The `r` suffix was
+specified to mean the lighter, Redline-oriented variant. Artifact and spec
+disagree about which direction the label points, and the file cannot tell us
+which one drifted.
+
+That is the case for this table. With the rung declared at build time and bpw
+measured at publish, the disagreement is a build failure on the day it appears
+rather than something reconstructed from expert-tensor counts months later.
+
+### Hybrid lifts — what the roles are lifted *to*
+
+A rung says which roles sit above base width. The precision they are lifted *to*
+is an encoder decision and may legitimately differ per architecture. Q8F16 costs
+about 8.5 bpw per weight against MQ4G256's 4.25, measured as the 0.201 bpw step
+between `qwen3.8-27b.mq4` and `.mq4r`, which differ only in the lm_head.
+
+Lifting to MQ6 or MQ5 instead of Q8 therefore buys a rung back, and the size of
+that rebate depends entirely on how much of the model the lifted roles are:
+
+| model | embed + lm_head share | Q8 → MQ6 rebate |
+|---|---:|---:|
+| Qwen3.8-27B dense | 2.54B / 26.9B = 9.5% | ~0.19 bpw |
+| Qwen3.6-35B-A3B | 0.51B / 34.7B = 1.5% | ~0.04 bpw |
+
+On the dense model that is nearly a whole rung — the `pro` state-lift costs
+0.24 bpw — so an MQ6 lift can fund `pro` where only the base rung fit before. On
+the MoE it is noise, because the experts dominate the budget. Same product name
+either way, which is the reason codec is kept out of it.
+
 ---
 
 ## 4 · Orientation for people arriving from llama.cpp
