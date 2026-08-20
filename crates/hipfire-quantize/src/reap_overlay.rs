@@ -16,8 +16,8 @@ use crate::quant_fwht::{
     quantize_mq6g256v2,
 };
 use crate::quant_mq::{
-    quantize_hfq6g256, quantize_mq2g256_lloyd, quantize_mq2g256v2, quantize_mq3g256_lloyd,
-    quantize_mq3g256v2, quantize_mq4g256_lloyd,
+    quantize_hfq6g256, quantize_mq2g256_lloyd, quantize_mq2g256_lloyd_anchored,
+    quantize_mq2g256v2, quantize_mq3g256_lloyd, quantize_mq3g256v2, quantize_mq4g256_lloyd,
 };
 use crate::quant_q4::quantize_q8f16;
 use hipfire_reap::plan::{QuantOverride, ReapPlan, Role};
@@ -128,6 +128,19 @@ pub fn quantize_to_format(
                 QuantType::MQ2G256Lloyd,
                 256,
                 quantize_mq2g256_lloyd(f32_data, &s1, &s2),
+            )
+        }
+        "mq2lloyd-anchored"
+        | "mq2lloyd_anchored"
+        | "mq2-lloyd-anchored"
+        | "mq2-lloyd_anchored"
+        | "mq2g256-lloyd-anchored"
+        | "mq2g256-lloyd_anchored" => {
+            let (s1, s2) = signs();
+            (
+                QuantType::MQ2G256Lloyd,
+                256,
+                quantize_mq2g256_lloyd_anchored(f32_data, &s1, &s2),
             )
         }
         "mq3lloyd" | "mq3g256lloyd" => {

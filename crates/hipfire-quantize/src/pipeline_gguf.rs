@@ -67,6 +67,7 @@ pub(crate) enum GgufFormat {
     Mq3,
     Mq2,
     Mq2Lloyd,
+    Mq2LloydAnchored,
     Mq3Lloyd,
     Mq4Lloyd,
     Mq6V2,
@@ -115,6 +116,12 @@ impl GgufFormat {
             "mq3v2" | "mq3g256v2" => Some(Self::Mq3V2),
             "mq2v2" | "mq2g256v2" => Some(Self::Mq2V2),
             "mq2-lloyd" | "mq2g256-lloyd" | "mq2lloyd" => Some(Self::Mq2Lloyd),
+            "mq2lloyd-anchored"
+            | "mq2lloyd_anchored"
+            | "mq2-lloyd-anchored"
+            | "mq2-lloyd_anchored"
+            | "mq2g256-lloyd-anchored"
+            | "mq2g256-lloyd_anchored" => Some(Self::Mq2LloydAnchored),
             "mq3-lloyd" | "mq3g256-lloyd" | "mq3lloyd" => Some(Self::Mq3Lloyd),
             "mq4-lloyd" | "mq4g256-lloyd" | "mq4lloyd" => Some(Self::Mq4Lloyd),
             "hfp4" | "hfp4g32" | "hf4p" | "fp4" => Some(Self::Hfp4),
@@ -147,6 +154,7 @@ impl GgufFormat {
             Self::Mq3V2 => "MQ3G256V2",
             Self::Mq2V2 => "MQ2G256V2",
             Self::Mq2Lloyd => "MQ2G256Lloyd",
+            Self::Mq2LloydAnchored => "MQ2G256Lloyd",
             Self::Mq3Lloyd => "MQ3G256Lloyd",
             Self::Mq4Lloyd => "MQ4G256Lloyd",
             Self::Hfp4 => "HFP4G32",
@@ -162,7 +170,6 @@ impl GgufFormat {
         }
     }
 }
-
 /// True for MQ{2,3,5,6}V2 — dense-only formats (gfx1201 Qwen3.8).
 /// MoE GGUFs must not select these: expert packs are often non-2D and would
 /// silently fall through the GGUF `!is_2d` arm to F16.
@@ -287,6 +294,7 @@ pub(crate) fn run_gguf_pipeline(
             | GgufFormat::Mq2
             | GgufFormat::Mq2V2
             | GgufFormat::Mq2Lloyd
+            | GgufFormat::Mq2LloydAnchored
             | GgufFormat::Mq3Lloyd
             | GgufFormat::Mq4Lloyd
             | GgufFormat::Mfp4
@@ -313,6 +321,12 @@ pub(crate) fn run_gguf_pipeline(
     if gguf_format_is_dense_only_mq_v2(format) && gguf_arch_is_moe_like(arch_id) {
         eprintln!(
             "error: --format mq{{2,3,5,6}}v2 is dense-only (gfx1201 Qwen3.8); MoE model (arch_id={arch_id}) is not supported with this format. Use legacy mq{{2,3,5,6}} or mq4/mq4v2/mq4c for MoE, or run on a dense checkpoint."
+        );
+        std::process::exit(2);
+    }
+    if format == GgufFormat::Mq2LloydAnchored && gguf_arch_is_moe_like(arch_id) {
+        eprintln!(
+            "error: --format mq2lloyd-anchored is dense-only (Qwen 3.8 Lloyd rescue); MoE model (arch_id={arch_id}) is not supported with this format. Use --format mq2lloyd for MoE routed experts or a dense checkpoint."
         );
         std::process::exit(2);
     }
@@ -517,6 +531,7 @@ pub(crate) fn run_gguf_pipeline(
                 | GgufFormat::Mq3
                 | GgufFormat::Mq2
                 | GgufFormat::Mq2Lloyd
+                | GgufFormat::Mq2LloydAnchored
                 | GgufFormat::Mq3Lloyd
                 | GgufFormat::Mq4Lloyd
                 | GgufFormat::Mq5
@@ -673,6 +688,10 @@ pub(crate) fn run_gguf_pipeline(
                     let q = quantize_mq2g256_lloyd(&f32_data, &signs1, &signs2);
                     (q, QuantType::MQ2G256Lloyd, 256u32, "MQ2G256Lloyd")
                 }
+                GgufFormat::Mq2LloydAnchored => {
+                    let q = quantize_mq2g256_lloyd_anchored(&f32_data, &signs1, &signs2);
+                    (q, QuantType::MQ2G256Lloyd, 256u32, "MQ2G256Lloyd")
+                }
                 GgufFormat::Mq3Lloyd => {
                     let q = quantize_mq3g256_lloyd(&f32_data, &signs1, &signs2);
                     (q, QuantType::MQ3G256Lloyd, 256u32, "MQ3G256Lloyd")
@@ -803,6 +822,10 @@ pub(crate) fn run_gguf_pipeline(
                 }
                 GgufFormat::Mq2Lloyd => {
                     let q = quantize_mq2g256_lloyd(&f32_data, &signs1, &signs2);
+                    (q, QuantType::MQ2G256Lloyd, 256u32, "MQ2G256Lloyd")
+                }
+                GgufFormat::Mq2LloydAnchored => {
+                    let q = quantize_mq2g256_lloyd_anchored(&f32_data, &signs1, &signs2);
                     (q, QuantType::MQ2G256Lloyd, 256u32, "MQ2G256Lloyd")
                 }
                 GgufFormat::Mq3Lloyd => {

@@ -32,6 +32,8 @@
 // Production-faithful affine for MQ5/MQ6 v1 and the MQ4V2-style dual-G128 header.
 // Degenerate half (hi==lo or f16 scale underflows to 0): store scale 0, all q=0.
 #define MODE_AFFINE_PROD 5
+#define MODE_LLOYD_ANCHORED 6
+
 
 #define CK(x) do { \
     hipError_t e_ = (x); \
@@ -254,64 +256,150 @@ __global__ __launch_bounds__(256) void eval_candidate(
                           (float)(nlev - 1));
             }
             reconstructed = q * step + zero;
-        } else if (mode == MODE_LLOYD) {
-            // Percentile init, 8 Lloyd iters; keep final assignment indices; RNE
-            // fp16 centroid store; no reassignment after rounding (production).
+        } else if (mode == MODE_LLOYD || mode == MODE_LLOYD_ANCHORED) {
+            // MODE_LLOYD: percentile init, 8 Lloyd iters; keep final assignment
+            // indices; RNE fp16 centroid store; no reassignment after rounding
+            // (production unconstrained mq2lloyd).
+            // MODE_LLOYD_ANCHORED: endpoints fixed to block min/max; Lloyd
+            // updates only interior codepoints; RNE-round all levels then
+            // final nearest assignment so encoder matches GPU decode.
             // `nsub=2` composes the Lloyd fit with V2's two G128 containers.
-            sh_sort[tid] = w;
-            __syncthreads();
-            for (int width = 2; width <= sub_size; width <<= 1) {
-                for (int stride = width >> 1; stride > 0; stride >>= 1) {
-                    const int peer_lane = lane ^ stride;
-                    const int peer = sub * sub_size + peer_lane;
-                    if (peer_lane > lane) {
-                        const bool ascending = (lane & width) == 0;
-                        const float a = sh_sort[tid];
-                        const float b = sh_sort[peer];
-                        if ((ascending && a > b) || (!ascending && a < b)) {
-                            sh_sort[tid] = b;
-                            sh_sort[peer] = a;
+            const int anchored = (mode == MODE_LLOYD_ANCHORED);
+            if (anchored) {
+                sh_red[tid] = w;
+                __syncthreads();
+                for (int stride = sub_size >> 1; stride > 0; stride >>= 1) {
+                    if (lane < stride)
+                        sh_red[tid] = fminf(sh_red[tid], sh_red[tid + stride]);
+                    __syncthreads();
+                }
+                const float lo = sh_red[sub * sub_size];
+                sh_red[tid] = w;
+                __syncthreads();
+                for (int stride = sub_size >> 1; stride > 0; stride >>= 1) {
+                    if (lane < stride)
+                        sh_red[tid] = fmaxf(sh_red[tid], sh_red[tid + stride]);
+                    __syncthreads();
+                }
+                const float hi = sh_red[sub * sub_size];
+                if (lane < nlev) {
+                    if (lane == 0)
+                        sh_cb[sub][lane] = lo;
+                    else if (lane == nlev - 1)
+                        sh_cb[sub][lane] = hi;
+                    else {
+                        const float t = (float)lane / (float)(nlev - 1);
+                        sh_cb[sub][lane] = lo + t * (hi - lo);
+                    }
+                }
+                __syncthreads();
+                // Always take the same control flow (nsub may split hi/lo).
+                // Degenerate hi==lo: endpoints already equal; interiors stay at lo.
+                for (int iteration = 0; iteration < 8; ++iteration) {
+                    if (lane < nlev) {
+                        sh_sum[sub][lane] = 0.0;
+                        sh_count[sub][lane] = 0;
+                    }
+                    __syncthreads();
+                    int nearest = 0;
+                    float best_distance = fabsf(w - sh_cb[sub][0]);
+                    for (int level = 1; level < nlev; ++level) {
+                        const float distance = fabsf(w - sh_cb[sub][level]);
+                        if (distance < best_distance) {
+                            best_distance = distance;
+                            nearest = level;
                         }
+                    }
+                    sh_assignment[tid] = nearest;
+                    atomicAdd(&sh_sum[sub][nearest], (double)w);
+                    atomicAdd(&sh_count[sub][nearest], 1);
+                    __syncthreads();
+                    // Update interiors only when the block has range; re-pin
+                    // endpoints every iter so cp0/cp{n-1} stay exact extrema.
+                    if (lane == 0)
+                        sh_cb[sub][0] = lo;
+                    else if (lane == nlev - 1)
+                        sh_cb[sub][lane] = hi;
+                    else if (lane > 0 && lane < nlev - 1 && hi > lo &&
+                             sh_count[sub][lane] != 0) {
+                        sh_cb[sub][lane] =
+                            (float)(sh_sum[sub][lane] /
+                                    (double)sh_count[sub][lane]);
                     }
                     __syncthreads();
                 }
-            }
-            if (lane < nlev) {
-                const float fraction = ((float)lane + 0.5f) / (float)nlev;
-                const int rank = sub * sub_size +
-                    (int)rintf(fraction * (float)(sub_size - 1));
-                sh_cb[sub][lane] = sh_sort[rank];
-            }
-            __syncthreads();
-            for (int iteration = 0; iteration < 8; ++iteration) {
-                if (lane < nlev) {
-                    sh_sum[sub][lane] = 0.0;
-                    sh_count[sub][lane] = 0;
-                }
+                // Round all four before final nearest-codepoint assignment.
+                if (lane < nlev)
+                    sh_cb[sub][lane] = f16_rne_rt(sh_cb[sub][lane]);
                 __syncthreads();
-                int nearest = 0;
-                float best_distance = fabsf(w - sh_cb[sub][0]);
-                for (int level = 1; level < nlev; ++level) {
-                    const float distance = fabsf(w - sh_cb[sub][level]);
-                    if (distance < best_distance) {
-                        best_distance = distance;
-                        nearest = level;
+                {
+                    int nearest = 0;
+                    float best_distance = fabsf(w - sh_cb[sub][0]);
+                    for (int level = 1; level < nlev; ++level) {
+                        const float distance = fabsf(w - sh_cb[sub][level]);
+                        if (distance < best_distance) {
+                            best_distance = distance;
+                            nearest = level;
+                        }
+                    }
+                    reconstructed = sh_cb[sub][nearest];
+                }
+            } else {
+                sh_sort[tid] = w;
+                __syncthreads();
+                for (int width = 2; width <= sub_size; width <<= 1) {
+                    for (int stride = width >> 1; stride > 0; stride >>= 1) {
+                        const int peer_lane = lane ^ stride;
+                        const int peer = sub * sub_size + peer_lane;
+                        if (peer_lane > lane) {
+                            const bool ascending = (lane & width) == 0;
+                            const float a = sh_sort[tid];
+                            const float b = sh_sort[peer];
+                            if ((ascending && a > b) || (!ascending && a < b)) {
+                                sh_sort[tid] = b;
+                                sh_sort[peer] = a;
+                            }
+                        }
+                        __syncthreads();
                     }
                 }
-                sh_assignment[tid] = nearest;
-                atomicAdd(&sh_sum[sub][nearest], (double)w);
-                atomicAdd(&sh_count[sub][nearest], 1);
-                __syncthreads();
-                if (lane < nlev && sh_count[sub][lane] != 0) {
-                    sh_cb[sub][lane] =
-                        (float)(sh_sum[sub][lane] / (double)sh_count[sub][lane]);
+                if (lane < nlev) {
+                    const float fraction = ((float)lane + 0.5f) / (float)nlev;
+                    const int rank = sub * sub_size +
+                        (int)rintf(fraction * (float)(sub_size - 1));
+                    sh_cb[sub][lane] = sh_sort[rank];
                 }
                 __syncthreads();
+                for (int iteration = 0; iteration < 8; ++iteration) {
+                    if (lane < nlev) {
+                        sh_sum[sub][lane] = 0.0;
+                        sh_count[sub][lane] = 0;
+                    }
+                    __syncthreads();
+                    int nearest = 0;
+                    float best_distance = fabsf(w - sh_cb[sub][0]);
+                    for (int level = 1; level < nlev; ++level) {
+                        const float distance = fabsf(w - sh_cb[sub][level]);
+                        if (distance < best_distance) {
+                            best_distance = distance;
+                            nearest = level;
+                        }
+                    }
+                    sh_assignment[tid] = nearest;
+                    atomicAdd(&sh_sum[sub][nearest], (double)w);
+                    atomicAdd(&sh_count[sub][nearest], 1);
+                    __syncthreads();
+                    if (lane < nlev && sh_count[sub][lane] != 0) {
+                        sh_cb[sub][lane] =
+                            (float)(sh_sum[sub][lane] / (double)sh_count[sub][lane]);
+                    }
+                    __syncthreads();
+                }
+                if (lane < nlev)
+                    sh_cb[sub][lane] = f16_rne_rt(sh_cb[sub][lane]);
+                __syncthreads();
+                reconstructed = sh_cb[sub][sh_assignment[tid]];
             }
-            if (lane < nlev)
-                sh_cb[sub][lane] = f16_rne_rt(sh_cb[sub][lane]);
-            __syncthreads();
-            reconstructed = sh_cb[sub][sh_assignment[tid]];
         } else {
             sh_red[tid] = mode == MODE_GL_RMS ? w * w : fabsf(w);
             __syncthreads();
@@ -819,8 +907,15 @@ static std::vector<Config> configs_for(int bits) {
         {"per-block Lloyd G256 fp16", MODE_LLOYD, 1, 2 * nlev, false, 0.0f},
         {"per-half Lloyd G128x2 fp16", MODE_LLOYD, 2, 4 * nlev, false, 0.0f},
     };
+    // MQ2 72-B ceiling only: endpoint-anchored Lloyd (4×fp16 header = 8 B).
+    // Same wire budget as unconstrained per-block Lloyd / MQ2V2 affine header.
+    if (bits == 2) {
+        configs.push_back(
+            {"anchored Lloyd G256 fp16", MODE_LLOYD_ANCHORED, 1, 8, false, 0.0f});
+    }
     return configs;
 }
+
 
 // Neutral-size 5/6-bit arms only: legacy G256 f32 header vs MQ4V2 dual-G128 fp16.
 static std::vector<Config> configs_highbit(int bits) {

@@ -252,6 +252,7 @@ pub(crate) fn default_promote_target(base: GgufFormat) -> GgufFormat {
         | GgufFormat::Mq5
         | GgufFormat::Mq6
         | GgufFormat::Mq2Lloyd
+        | GgufFormat::Mq2LloydAnchored
         | GgufFormat::Mq3Lloyd
         | GgufFormat::Mq4Lloyd => GgufFormat::Mq6,
         GgufFormat::Mq2V2 | GgufFormat::Mq3V2 | GgufFormat::Mq5V2 | GgufFormat::Mq6V2 => {
@@ -284,10 +285,10 @@ pub(crate) fn is_promote_pair_supported(base: GgufFormat, promote: GgufFormat) -
         // different runtime kernel families from standard MQ. Lloyd→non-Lloyd
         // mixed-format dispatch has no runtime support today; the plan's
         // "Future expansion" section targets the MQ2-Lloyd + MQ3-Lloyd pair
-        // specifically. Tightened per combined-review finding G2.
-        (GgufFormat::Mq2Lloyd, GgufFormat::Mq3Lloyd) => true,
-        (GgufFormat::Mq2Lloyd | GgufFormat::Mq3Lloyd, _) => false,
-        (_, GgufFormat::Mq2Lloyd | GgufFormat::Mq3Lloyd) => false,
+        (GgufFormat::Mq2Lloyd | GgufFormat::Mq2LloydAnchored, GgufFormat::Mq3Lloyd) => true,
+        (GgufFormat::Mq2LloydAnchored, GgufFormat::Mq2LloydAnchored) => true,
+        (GgufFormat::Mq2Lloyd | GgufFormat::Mq2LloydAnchored | GgufFormat::Mq3Lloyd, _) => false,
+        (_, GgufFormat::Mq2Lloyd | GgufFormat::Mq2LloydAnchored | GgufFormat::Mq3Lloyd) => false,
         // MQ-family upward bit-width (non-Lloyd)
         (
             GgufFormat::Mq2,

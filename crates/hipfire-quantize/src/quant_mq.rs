@@ -1326,7 +1326,133 @@ pub(crate) fn quantize_mq2g256_lloyd(f32_data: &[f32], signs1: &[f32], signs2: &
 
     output
 }
-
+/// MagnumQuant MQ2-G256-Lloyd-ANCHORED: endpoint-anchored per-block 4-entry
+/// fp16 codebook, same 72 B wire format as plain MQ2G256Lloyd (qt=19).
+///
+/// Layout per 256-weight group: `[0..8) 4×fp16 codepoints ascending`
+/// + `[8..72) 64 B packed 2-bit indices`. Bandwidth-identical to uniform
+/// MQ2 (`72 B/G256 = 2.25 bpw`). Kernel-decode identical: the existing
+/// `gemv_mq2g256_lloyd` kernel consumes the same header + index layout, so
+/// an anchored artifact is loadable by the unchanged qt19 runtime.
+///
+/// Fit after FWHT (rotation baked into weights, as with all MagnumQuant).
+/// Codepoint 0 is FIXED to the post-FWHT block minimum, codepoint 3 fixed to
+/// the block maximum; Lloyd refines ONLY the interior codepoints 1 and 2 for
+/// `LLOYD_MAX_ITER` iterations (shared cap). All four centroids are rounded
+/// to fp16 before the final nearest-codepoint assignment so encoder choice
+/// matches the GPU's fp16 decode. Degenerate groups (range == 0) remain
+/// deterministic: header collapses to four copies of the single value,
+/// indices all-zero. Ascending invariant holds because fp16 rounding is
+/// monotonic and interior centroids are constrained to the [min,max] interval.
+pub(crate) fn quantize_mq2g256_lloyd_anchored(
+    f32_data: &[f32],
+    signs1: &[f32],
+    signs2: &[f32],
+) -> Vec<u8> {
+    use rayon::prelude::*;
+    let group_size = 256;
+    let block_bytes = 72;
+    let n = f32_data.len();
+    let n_blocks = (n + group_size - 1) / group_size;
+    let mut output = vec![0u8; n_blocks * block_bytes];
+    output
+        .par_chunks_mut(block_bytes)
+        .enumerate()
+        .for_each(|(b, out_chunk)| {
+            let start = b * group_size;
+            let end = (start + group_size).min(n);
+            let actual_len = end - start;
+            let mut group = [0.0f32; 256];
+            group[..actual_len].copy_from_slice(&f32_data[start..end]);
+            cpu_fwht_256(&mut group, signs1, signs2);
+            let mut sorted: [f32; 256] = group;
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let percentile = |frac: f32| -> f32 {
+                let idx = ((frac * 255.0).round() as usize).min(255);
+                sorted[idx]
+            };
+            let min_v = sorted[0];
+            let max_v = sorted[255];
+            let range = max_v - min_v;
+            // Interior init at 37.5 / 62.5 percentiles, mirroring the plain Lloyd
+            // interior seeds; endpoints anchored.
+            let mut cb: [f32; 4] = [min_v, percentile(0.375), percentile(0.625), max_v];
+            let mut indices = [0u8; 256];
+            if range > 0.0 {
+                let max_iter = LLOYD_MAX_ITER;
+                let mut prev_assign = [0u8; 256];
+                for it in 0..max_iter {
+                    let mut sums = [0.0f64; 4];
+                    let mut counts = [0u32; 4];
+                    let mut changed = 0u32;
+                    for i in 0..256 {
+                        let w = group[i];
+                        let mut best = 0usize;
+                        let mut best_d = (w - cb[0]).abs();
+                        for k in 1..4 {
+                            let d = (w - cb[k]).abs();
+                            if d < best_d {
+                                best_d = d;
+                                best = k;
+                            }
+                        }
+                        if it == 0 || prev_assign[i] != best as u8 {
+                            changed += 1;
+                        }
+                        prev_assign[i] = best as u8;
+                        indices[i] = best as u8;
+                        sums[best] += w as f64;
+                        counts[best] += 1;
+                    }
+                    if it > 0 && changed == 0 {
+                        break;
+                    }
+                    for k in 1..3 {
+                        if counts[k] > 0 {
+                            cb[k] = (sums[k] / counts[k] as f64) as f32;
+                        }
+                    }
+                }
+            } else {
+                // Degenerate block: all rotated weights identical.
+                // Header will collapse after rounding; indices already zeroed.
+            }
+            // Round all four centroids to fp16 before final assignment so the
+            // encoder's nearest selection matches the kernel's fp16 decode.
+            let mut bits = [0u16; 4];
+            let mut cb_rounded = [0.0f32; 4];
+            for k in 0..4 {
+                bits[k] = if cb[k] == 0.0 { 0 } else { f32_to_fp16_bits(cb[k]) };
+                cb_rounded[k] = f16_to_f32(bits[k]);
+            }
+            // Final nearest-codepoint assignment against the fp16-rounded book.
+            for i in 0..256 {
+                let w = group[i];
+                let mut best = 0usize;
+                let mut best_d = (w - cb_rounded[0]).abs();
+                for k in 1..4 {
+                    let d = (w - cb_rounded[k]).abs();
+                    if d < best_d {
+                        best_d = d;
+                        best = k;
+                    }
+                }
+                indices[i] = best as u8;
+            }
+            for k in 0..4 {
+                out_chunk[2 * k] = (bits[k] & 0xFF) as u8;
+                out_chunk[2 * k + 1] = (bits[k] >> 8) as u8;
+            }
+            for i in 0..64 {
+                let mut byte_val = 0u8;
+                for j in 0..4 {
+                    byte_val |= (indices[4 * i + j] & 0x3) << (j * 2);
+                }
+                out_chunk[8 + i] = byte_val;
+            }
+        });
+    output
+}
 /// Ternary "MQ1.58" probe: K=3 Lloyd-placed codebook packed into the MQ2-Lloyd
 /// container (slot 3 = duplicate of slot 2, never indexed) so it runs on the
 /// existing MQ2G256Lloyd kernel with NO new kernel. Measures sub-2-bit
@@ -2695,6 +2821,217 @@ mod mqv2_lowbit_tests {
             let zt = f16_to_f32(z0);
             assert!(st >= 0.0);
             let _ = (st, zt, bbytes);
+        }
+    }
+}
+#[cfg(test)]
+mod mq2_lloyd_anchored_tests {
+    use super::*;
+
+    #[test]
+    fn anchored_72b_layout() {
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        for n in [256usize, 512, 1024, 256 * 3 + 10] {
+            let w = vec![0.1f32; n];
+            let out = quantize_mq2g256_lloyd_anchored(&w, &s1, &s2);
+            let n_blocks = (n + 255) / 256;
+            assert_eq!(out.len(), n_blocks * 72, "n={n} blocks={n_blocks}");
+            // Same size as plain Lloyd
+            let plain = quantize_mq2g256_lloyd(&w, &s1, &s2);
+            assert_eq!(out.len(), plain.len());
+        }
+    }
+
+    #[test]
+    fn anchored_codebook_ascending_fp16() {
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        let mut rng = 0x9e3779b97f4a7c15u64;
+        let mut next_f32 = || {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let bits = ((rng >> 32) as u32) & 0x7fffffff;
+            let v = (bits as f32 / (1u32 << 31) as f32) * 4.0 - 2.0;
+            v
+        };
+        for _ in 0..16 {
+            let w: Vec<f32> = (0..256 * 4).map(|_| next_f32()).collect();
+            let out = quantize_mq2g256_lloyd_anchored(&w, &s1, &s2);
+            for blk in out.chunks_exact(72) {
+                let c0 = u16::from_le_bytes([blk[0], blk[1]]);
+                let c1 = u16::from_le_bytes([blk[2], blk[3]]);
+                let c2 = u16::from_le_bytes([blk[4], blk[5]]);
+                let c3 = u16::from_le_bytes([blk[6], blk[7]]);
+                let f0 = f16_to_f32(c0);
+                let f1 = f16_to_f32(c1);
+                let f2 = f16_to_f32(c2);
+                let f3 = f16_to_f32(c3);
+                // Ascending (allow equal for degenerate)
+                assert!(f0 <= f1, "c0 {f0} > c1 {f1} bits {c0:04x} {c1:04x}");
+                assert!(f1 <= f2, "c1 {f1} > c2 {f2}");
+                assert!(f2 <= f3, "c2 {f2} > c3 {f3}");
+                // Index range 0..4
+                for &b in &blk[8..] {
+                    for j in 0..4 {
+                        let idx = (b >> (j * 2)) & 0x3;
+                        assert!(idx <= 3);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn anchored_endpoints_are_block_extremes_after_fp16() {
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        // Construct deterministic 256 block, verify endpoints.
+        let w: Vec<f32> = (0..256).map(|i| (i as f32 - 128.0) * 0.07).collect();
+        let out = quantize_mq2g256_lloyd_anchored(&w, &s1, &s2);
+        assert_eq!(out.len(), 72);
+        let mut group = [0.0f32; 256];
+        group.copy_from_slice(&w[0..256]);
+        cpu_fwht_256(&mut group, &s1, &s2);
+        let mut sorted: Vec<f32> = group.to_vec();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let min_f32 = sorted[0];
+        let max_f32 = sorted[255];
+        let min_fp16_bits = f32_to_fp16_bits(min_f32);
+        let max_fp16_bits = f32_to_fp16_bits(max_f32);
+        let min_fp16 = f16_to_f32(min_fp16_bits);
+        let max_fp16 = f16_to_f32(max_fp16_bits);
+        let blk = &out[0..72];
+        let c0 = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+        let c3 = f16_to_f32(u16::from_le_bytes([blk[6], blk[7]]));
+        // Endpoints must equal fp16-rounded block extremes.
+        assert_eq!(c0.to_bits(), min_fp16.to_bits(), "c0 should be fp16(min) {min_fp16} vs {c0}");
+        assert_eq!(c3.to_bits(), max_fp16.to_bits(), "c3 should be fp16(max) {max_fp16} vs {c3}");
+        // Also verify interior codepoints are between endpoints.
+        let c1 = f16_to_f32(u16::from_le_bytes([blk[2], blk[3]]));
+        let c2 = f16_to_f32(u16::from_le_bytes([blk[4], blk[5]]));
+        assert!(c0 <= c1 && c1 <= c3);
+        assert!(c0 <= c2 && c2 <= c3);
+    }
+
+    #[test]
+    fn anchored_roundtrip_matches_gpu_decode() {
+        // Encode must match GPU decode: nearest selection uses fp16-rounded centroids.
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        let w: Vec<f32> = (0..256).map(|i| (i as f32 * 0.013).sin() * 1.3).collect();
+        let out = quantize_mq2g256_lloyd_anchored(&w, &s1, &s2);
+        let blk = &out[0..72];
+        let cb = [
+            f16_to_f32(u16::from_le_bytes([blk[0], blk[1]])),
+            f16_to_f32(u16::from_le_bytes([blk[2], blk[3]])),
+            f16_to_f32(u16::from_le_bytes([blk[4], blk[5]])),
+            f16_to_f32(u16::from_le_bytes([blk[6], blk[7]])),
+        ];
+        // Reconstruct group after FWHT to verify each index is nearest rounded centroid.
+        let mut group = [0.0f32; 256];
+        group.copy_from_slice(&w[0..256]);
+        cpu_fwht_256(&mut group, &s1, &s2);
+        for (i, &val) in group.iter().enumerate() {
+            let byte = blk[8 + i / 4];
+            let idx = ((byte >> ((i % 4) * 2)) & 0x3) as usize;
+            // Verify idx is the nearest (tie -> lowest)
+            let mut best = 0usize;
+            let mut best_d = (val - cb[0]).abs();
+            for k in 1..4 {
+                let d = (val - cb[k]).abs();
+                if d < best_d {
+                    best_d = d;
+                    best = k;
+                }
+            }
+            assert_eq!(idx, best, "i={i} val={val} cb={cb:?} idx {idx} != best {best}");
+        }
+    }
+
+    #[test]
+    fn anchored_deterministic_degenerates() {
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        // Constant input 1.7 is NOT degenerate after FWHT (FWHT sum vs zeros),
+        // but must still be deterministic.
+        let w_const = vec![1.7f32; 256];
+        let a1 = quantize_mq2g256_lloyd_anchored(&w_const, &s1, &s2);
+        let a2 = quantize_mq2g256_lloyd_anchored(&w_const, &s1, &s2);
+        assert_eq!(a1, a2, "constant input must be deterministic");
+        // True degenerate: all-zero weights -> rotated still zero -> range 0.
+        let w_zero = vec![0.0f32; 256];
+        let z1 = quantize_mq2g256_lloyd_anchored(&w_zero, &s1, &s2);
+        let z2 = quantize_mq2g256_lloyd_anchored(&w_zero, &s1, &s2);
+        assert_eq!(z1, z2, "zero block must be deterministic");
+        // Header should be four copies of zero (fp16 0x0000).
+        let c0 = u16::from_le_bytes([z1[0], z1[1]]);
+        let c1 = u16::from_le_bytes([z1[2], z1[3]]);
+        let c2 = u16::from_le_bytes([z1[4], z1[5]]);
+        let c3 = u16::from_le_bytes([z1[6], z1[7]]);
+        assert_eq!(c0, 0);
+        assert_eq!(c1, 0);
+        assert_eq!(c2, 0);
+        assert_eq!(c3, 0);
+        for b in &z1[8..] {
+            assert_eq!(*b, 0, "all indices zero for degenerate");
+        }
+        // Also check a second degenerate: single-block with identical rotated
+        // values constructed by inverse FWHT of a constant rotated block.
+        // Build a rotated-constant group by taking a vector that is zero except
+        // first element, then applying inverse FWHT? Simpler: directly test
+        // that two runs with same data are identical (we already did).
+    }
+
+    #[test]
+    fn anchored_qt19_identity_and_unconstrained_unchanged() {
+        // Contract: anchored reuses qt19 layout, decodable by existing qt19 runtime,
+        // and plain Lloyd bytes/behavior unchanged.
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        let w: Vec<f32> = (0..256).map(|i| (i as f32 - 128.0) * 0.02).collect();
+        let plain = quantize_mq2g256_lloyd(&w, &s1, &s2);
+        let anchored = quantize_mq2g256_lloyd_anchored(&w, &s1, &s2);
+        assert_eq!(plain.len(), anchored.len());
+        assert_eq!(plain.len(), 72);
+        // Both decode via the same dequant path (qt19).
+        let dec_plain = dequantize_mq2g256_lloyd_to_f32(&plain, 256, &s1, &s2);
+        let dec_anch = dequantize_mq2g256_lloyd_to_f32(&anchored, 256, &s1, &s2);
+        assert_eq!(dec_plain.len(), 256);
+        assert_eq!(dec_anch.len(), 256);
+        // Plain must be byte-identical across calls (determinism)
+        let plain2 = quantize_mq2g256_lloyd(&w, &s1, &s2);
+        assert_eq!(plain, plain2, "plain Lloyd must remain deterministic");
+        // Anchored must differ from plain for non-trivial data (endpoints anchored changes book)
+        // Not guaranteed for all distributions, but for this ramp it should differ in at least header.
+        let header_plain = &plain[0..8];
+        let header_anch = &anchored[0..8];
+        assert_ne!(header_plain, header_anch, "anchored header should differ from unconstrained for ramp");
+        // Both use QuantType::MQ2G256Lloyd identity
+        assert_eq!(QuantType::MQ2G256Lloyd as u8, 19);
+        assert_eq!(QuantType::from_u8(19), Some(QuantType::MQ2G256Lloyd));
+    }
+
+    #[test]
+    fn anchored_index_range_and_no_affine_alias() {
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        let w: Vec<f32> = (0..512).map(|i| ((i * 17) % 255) as f32 * 0.01 - 1.0).collect();
+        let out = quantize_mq2g256_lloyd_anchored(&w, &s1, &s2);
+        for blk in out.chunks_exact(72) {
+            for &b in &blk[8..] {
+                for j in 0..4 {
+                    assert!(((b >> (j * 2)) & 0x3) <= 3);
+                }
+            }
+        }
+        // Verify the affine MQ2V2 format string does not alias anchored.
+        assert_ne!(GgufFormat::from_flag("mq2lloyd-anchored"), GgufFormat::from_flag("mq2v2"));
+        assert_ne!(GgufFormat::from_flag("mq2lloyd_anchored"), GgufFormat::from_flag("mq2v2"));
+        // Affordance: if pipeline_gguf adds the variant, anchored maps distinctly.
+        // If not yet added, from_flag returns None, not mq2v2 — still passes.
+        let af = GgufFormat::from_flag("mq2lloyd-anchored");
+        if let Some(fmt) = af {
+            assert_ne!(fmt, GgufFormat::Mq2V2);
         }
     }
 }

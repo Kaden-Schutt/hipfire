@@ -72,6 +72,7 @@ struct MainQuantFlags {
     use_mixed: bool,
     use_mq2g256: bool,
     use_mq2g256_lloyd: bool,
+    use_mq2g256_lloyd_anchored: bool,
     use_mq3g256: bool,
     use_mq3g256_lloyd: bool,
     use_mq4_mq2glexp: bool,
@@ -673,6 +674,12 @@ pub(crate) fn run() {
     let use_mq2g256 = format == "mq2" || format == "mq2g256";
     let use_mq2g256_lloyd =
         format == "mq2-lloyd" || format == "mq2g256-lloyd" || format == "mq2lloyd";
+    let use_mq2g256_lloyd_anchored = format == "mq2lloyd-anchored"
+        || format == "mq2lloyd_anchored"
+        || format == "mq2-lloyd-anchored"
+        || format == "mq2-lloyd_anchored"
+        || format == "mq2g256-lloyd-anchored"
+        || format == "mq2g256-lloyd_anchored";
     let use_mq3g256_lloyd =
         format == "mq3-lloyd" || format == "mq3g256-lloyd" || format == "mq3lloyd";
     let use_mq4g256_lloyd =
@@ -874,6 +881,7 @@ pub(crate) fn run() {
             .as_deref()
             == Some("1");
     if (use_mq2g256_lloyd
+        || use_mq2g256_lloyd_anchored
         || use_mq4_mq2lloydexp
         || use_mq4_mq2glexp
         || use_mq4_mq2lloyd_native
@@ -1064,6 +1072,12 @@ pub(crate) fn run() {
     if (use_mq6g256v2 || use_mq5g256v2 || use_mq3g256v2 || use_mq2g256v2) && is_moe_like {
         eprintln!(
             "error: --format mq{{2,3,5,6}}v2 is dense-only (gfx1201 Qwen3.8); MoE model (arch_id={arch_id}) is not supported with this format. Use legacy mq{{2,3,5,6}} or mq4/mq4v2/mq4c for MoE, or run on a dense checkpoint."
+        );
+        std::process::exit(2);
+    }
+    if use_mq2g256_lloyd_anchored && is_moe_like {
+        eprintln!(
+            "error: --format mq2lloyd-anchored is dense-only (Qwen 3.8 Lloyd rescue); MoE model (arch_id={arch_id}) is not supported with this format. Use --format mq2lloyd for MoE routed experts or a dense checkpoint."
         );
         std::process::exit(2);
     }
@@ -2582,6 +2596,7 @@ pub(crate) fn run() {
                 use_mixed: use_mixed,
                 use_mq2g256: use_mq2g256,
                 use_mq2g256_lloyd: use_mq2g256_lloyd,
+                use_mq2g256_lloyd_anchored: use_mq2g256_lloyd_anchored,
                 use_mq3g256: use_mq3g256,
                 use_mq3g256_lloyd: use_mq3g256_lloyd,
                 use_mq4_mq2glexp: use_mq4_mq2glexp,
@@ -4734,6 +4749,7 @@ fn handle_main_quant(
                     || flags.use_mq3g256
                     || flags.use_mq2g256
                     || flags.use_mq2g256_lloyd
+                    || flags.use_mq2g256_lloyd_anchored
                     || flags.use_mq3g256_lloyd)
                     && k_dim % 256 == 0
                 {
@@ -4953,6 +4969,10 @@ fn handle_main_quant(
                         }
                         GgufFormat::Mq2Lloyd => {
                             let q = quantize_mq2g256_lloyd(&f32_data, &signs1, &signs2);
+                            (q, QuantType::MQ2G256Lloyd, 256u32, "MQ2G256Lloyd")
+                        }
+                        GgufFormat::Mq2LloydAnchored => {
+                            let q = quantize_mq2g256_lloyd_anchored(&f32_data, &signs1, &signs2);
                             (q, QuantType::MQ2G256Lloyd, 256u32, "MQ2G256Lloyd")
                         }
                         GgufFormat::Mq3Lloyd => {
@@ -5856,6 +5876,7 @@ fn handle_main_quant(
                 } else if (flags.use_mq3g256
                     || flags.use_mq2g256
                     || flags.use_mq2g256_lloyd
+                    || flags.use_mq2g256_lloyd_anchored
                     || flags.use_mq3g256_lloyd
                     || flags.use_mq4g256_lloyd)
                     && is_embed
@@ -5909,6 +5930,45 @@ fn handle_main_quant(
                     } else {
                         let q = quantize_hfq3g128(&f32_data);
                         (q, QuantType::HFQ3G128, 128u32, "HFQ3G128")
+                    }
+                } else if flags.use_mq2g256_lloyd_anchored {
+                    let k_dim = if meta.shape.len() == 2 {
+                        meta.shape[1]
+                    } else {
+                        n_elements
+                    };
+                    if k_dim % 256 == 0 {
+                        let signs1 = gen_fwht_signs(42, 256);
+                        let signs2 = gen_fwht_signs(1042, 256);
+                        // AWQ × anchored MQ2-Lloyd: same sidecar dance as the
+                        // plain MQ2-Lloyd arm — AWQ is supported because
+                        // MQ2G256Lloyd is in DType::supports_awq_sidecar and the
+                        // runtime's rotate_x_mq path handles the inverse divide.
+                        // Interior codepoints 1,2 are Lloyd-refined; endpoints
+                        // are fixed to block min/max (fp16-rounded) so the
+                        // artifact remains 72 B/qt19 and decode-identical.
+                        let awq_scaled: Option<Vec<f32>> = if let (Some(alpha), Some(im_weights)) =
+                            (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
+                        {
+                            if awq_eligible(name) {
+                                let scales = compute_awq_scales(im_weights, alpha);
+                                awq_sidecar_scales = Some(scales.clone());
+                                let m_dim = meta.shape[0];
+                                let mut scaled = f32_data.clone();
+                                awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
+                                Some(scaled)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        let data: &[f32] = awq_scaled.as_deref().unwrap_or(&f32_data);
+                        let q = quantize_mq2g256_lloyd_anchored(data, &signs1, &signs2);
+                        (q, QuantType::MQ2G256Lloyd, 256u32, "MQ2G256Lloyd")
+                    } else {
+                        let q = quantize_hfq2g128(&f32_data);
+                        (q, QuantType::HFQ2G128, 128u32, "HFQ2G128")
                     }
                 } else if flags.use_mq2g256_lloyd {
                     let k_dim = if meta.shape.len() == 2 {
@@ -6339,6 +6399,7 @@ mod handle_main_quant_f16_fallback_tests {
             use_mixed: false,
             use_mq2g256: false,
             use_mq2g256_lloyd: false,
+            use_mq2g256_lloyd_anchored: false,
             use_mq3g256: false,
             use_mq3g256_lloyd: false,
             use_mq4_mq2glexp: false,
