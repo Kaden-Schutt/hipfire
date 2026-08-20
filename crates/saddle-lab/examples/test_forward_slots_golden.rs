@@ -236,6 +236,7 @@ fn main() {
                 .expect("reference: download logits"),
         );
 
+        #[allow(clippy::reversed_empty_ranges)]
         for k in 0..DECODE_STEPS {
             // `forward_scratch`, NOT forward_prefill_batch with a 1-token slice.
             //
