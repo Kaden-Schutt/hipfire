@@ -904,7 +904,7 @@ def do_kld(args: argparse.Namespace) -> int:
             # private HOME/cache per GPU
             home = str(Path(args.qcal_dir) / f"tmp_home_gpu{gpu}")
             cache = str(Path(args.qcal_dir) / f"kernel_cache_gpu{gpu}")
-            env = {**env_base, "HOME": home, "HIPFIRE_KERNEL_CACHE": cache, "ROCR_VISIBLE_DEVICES": str(gpu), "HIP_VISIBLE_DEVICES": str(gpu)}
+            env = {**env_base, "HOME": home, "HIPFIRE_KERNEL_CACHE": cache, "HIP_VISIBLE_DEVICES": str(gpu)}
             task_id = f"{cell['cell_id']}:{kind}"
             eprint(f"[dry-run] kld {task_id} gpu={gpu} HOME={home} cache={cache}")
             eprint(f"[dry-run]   ref={ref_path} output={out}")
@@ -945,7 +945,7 @@ def do_kld(args: argparse.Namespace) -> int:
         Path(home).mkdir(parents=True, exist_ok=True)
         Path(cache).mkdir(parents=True, exist_ok=True)
         argv, env_base = kld_argv(cell, kind, ref_path, out, args)
-        env = {**env_base, "HOME": home, "HIPFIRE_KERNEL_CACHE": cache, "ROCR_VISIBLE_DEVICES": str(gpu), "HIP_VISIBLE_DEVICES": str(gpu)}
+        env = {**env_base, "HOME": home, "HIPFIRE_KERNEL_CACHE": cache, "HIP_VISIBLE_DEVICES": str(gpu)}
         # Pre-create output parent
         Path(out).parent.mkdir(parents=True, exist_ok=True)
         rc, sout, serr = run_subprocess(argv, env, dry_run=False)
