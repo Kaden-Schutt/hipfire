@@ -26753,6 +26753,9 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        if batch_size == 1 {
+            return self.gemv_mq4g256v2(a_raw, x, y, m, k);
+        }
         let wmma_eligible = batch_size > 1
             && (self.arch_caps.has_wmma_w32() || self.arch_caps.has_wmma_w32_gfx12())
             && !self.flags.fp16_disabled
@@ -27275,6 +27278,9 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        if batch_size == 1 {
+            return self.gemv_mq5g256v2(a_raw, x, y, m, k);
+        }
         let wmma_eligible = batch_size > 1
             && (self.arch_caps.has_wmma_w32() || self.arch_caps.has_wmma_w32_gfx12())
             && !self.flags.fp16_disabled
@@ -28017,6 +28023,9 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        if batch_size == 1 {
+            return self.gemv_mq6g256v2(a_raw, x, y, m, k);
+        }
         let wmma_eligible = batch_size > 1
             && (self.arch_caps.has_wmma_w32() || self.arch_caps.has_wmma_w32_gfx12())
             && !self.flags.fp16_disabled
@@ -28759,6 +28768,9 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        if batch_size == 1 {
+            return self.gemv_mq3g256v2(a_raw, x, y, m, k);
+        }
         let wmma_eligible = batch_size > 1
             && (self.arch_caps.has_wmma_w32() || self.arch_caps.has_wmma_w32_gfx12())
             && !self.flags.fp16_disabled
@@ -29501,6 +29513,9 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        if batch_size == 1 {
+            return self.gemv_mq2g256v2(a_raw, x, y, m, k);
+        }
         let wmma_eligible = batch_size > 1
             && (self.arch_caps.has_wmma_w32() || self.arch_caps.has_wmma_w32_gfx12())
             && !self.flags.fp16_disabled
