@@ -2128,7 +2128,9 @@ pub fn load_model_with_gemma4_drafter(
                 gpu.arch.as_str(),
                 "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" | "gfx1200" | "gfx1201"
             );
+            let arch_is_gfx12 = matches!(gpu.arch.as_str(), "gfx1200" | "gfx1201");
             let supported = match lm_qt {
+                Some(44 | 47 | 48 | 49 | 50) => arch_is_gfx12,
                 Some(3 | 6 | 13) => true,
                 Some(17) => arch_is_gfx11,
                 _ => false,
