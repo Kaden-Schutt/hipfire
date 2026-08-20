@@ -8144,11 +8144,26 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "gemm_qkvza_hfq4g256_wmma",
-            kernels::GEMM_QKVZA_HFQ4G256_WMMA_SRC,
-            "gemm_qkvza_hfq4g256_wmma",
-        )?;
+        // Batch-tiled B=2 variant for prefill (batch_size >= 32) on RDNA3 dGPU:
+        // 2 independent acc chains reuse weights across 2 N-tiles, halving the
+        // N-grid. +22% per-kernel on gate_up (same structure); qkvza is smaller
+        // (13.8% of prefill) so end-to-end impact is proportionally less.
+        // For decode (batch_size < 32), the plain 1-acc WMMA is better.
+        let use_bt2 = batch_size >= 32 && self.arch_caps.is_rdna3_dgpu();
+        let (kname, ksrc, n_tile) = if use_bt2 {
+            (
+                "gemm_qkvza_hfq4g256_wmma_bt2",
+                kernels::GEMM_QKVZA_HFQ4G256_WMMA_BT_SRC,
+                32,
+            )
+        } else {
+            (
+                "gemm_qkvza_hfq4g256_wmma",
+                kernels::GEMM_QKVZA_HFQ4G256_WMMA_SRC,
+                16,
+            )
+        };
+        self.ensure_kernel(kname, ksrc, kname)?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
         let mut aq = a_qkv.buf.as_ptr();
@@ -8187,7 +8202,7 @@ impl Gpu {
 
         let total_m = qkv_m + z_m + beta_m + alpha_m;
         let row_tiles = (total_m + 15) / 16;
-        let batch_tiles = (batch_size + 15) / 16;
+        let batch_tiles = (batch_size + n_tile - 1) / n_tile;
 
         let bytes = crate::profile::gemv_hfq4g256_bytes(qkv_m, k)
             + crate::profile::gemv_hfq4g256_bytes(z_m, k)
@@ -8196,9 +8211,9 @@ impl Gpu {
             + batch_size * k * 2
             + batch_size * total_m * 4 * 2;
         let timer =
-            crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkvza_hfq4g256_wmma", bytes);
+            crate::profile::begin_timer(&self.hip, "gemm", kname, bytes);
         let result = self.launch_maybe_blob(
-            "gemm_qkvza_hfq4g256_wmma",
+            kname,
             [row_tiles as u32, batch_tiles as u32, 1],
             [32, 1, 1],
             0,

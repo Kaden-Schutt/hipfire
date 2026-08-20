@@ -3081,6 +3081,10 @@ pub const GEMM_GATE_UP_HFQ4G256_WMMA_GFX12_BT_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma_gfx12_bt.hip");
 pub const GEMM_QKVZA_HFQ4G256_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_qkvza_hfq4g256_wmma.hip");
+// Batch-tiled gfx11 variant: B independent acc chains reuse weights
+// across B batch tiles per block. Opt-in via batch_size >= 32 dispatch.
+pub const GEMM_QKVZA_HFQ4G256_WMMA_BT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkvza_hfq4g256_wmma_bt.hip");
 // gfx12 (RDNA4) sister: gfx12 hfq4 recipe + 4-output qkv/z/beta/alpha
 // routing for the DeltaNet LinearAttention preamble.
 pub const GEMM_QKVZA_HFQ4G256_WMMA_GFX12_SRC: &str =
