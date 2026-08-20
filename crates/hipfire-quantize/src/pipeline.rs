@@ -6267,7 +6267,11 @@ fn handle_main_quant(
             raw_data.to_vec()
         } else {
             let f32_data = tensor_to_f32_with_optional_fp8_scale(
-                name, raw_data, meta, fp8_scale_for, st_files,
+                name,
+                raw_data,
+                meta,
+                fp8_scale_for,
+                st_files,
             );
             f32_data
                 .iter()
@@ -6373,7 +6377,9 @@ mod handle_main_quant_f16_fallback_tests {
     }
 
     fn f16_bytes_of(vals: &[f32]) -> Vec<u8> {
-        vals.iter().flat_map(|&v| f32_to_f16(v).to_le_bytes()).collect()
+        vals.iter()
+            .flat_map(|&v| f32_to_f16(v).to_le_bytes())
+            .collect()
     }
 
     fn bf16_bytes_of(vals: &[f32]) -> Vec<u8> {
@@ -6429,7 +6435,16 @@ mod handle_main_quant_f16_fallback_tests {
                 dtype: "F16",
                 is_vision: false,
             };
-            handle_main_quant(&ctx, &m, &raw, &flags, &outer, &mut state, &fp8_scale_for, &st_files);
+            handle_main_quant(
+                &ctx,
+                &m,
+                &raw,
+                &flags,
+                &outer,
+                &mut state,
+                &fp8_scale_for,
+                &st_files,
+            );
         }
         assert_eq!(hfq_tensors.len(), 1);
         assert_eq!(hfq_tensors[0].name, "model.norm.weight");
@@ -6464,7 +6479,16 @@ mod handle_main_quant_f16_fallback_tests {
                 dtype: "BF16",
                 is_vision: false,
             };
-            handle_main_quant(&ctx, &m, &raw, &flags, &outer, &mut state, &fp8_scale_for, &st_files);
+            handle_main_quant(
+                &ctx,
+                &m,
+                &raw,
+                &flags,
+                &outer,
+                &mut state,
+                &fp8_scale_for,
+                &st_files,
+            );
         }
         assert_eq!(hfq_tensors.len(), 2);
         assert_eq!(hfq_tensors[1].quant_type, QuantType::F16);
@@ -6496,7 +6520,9 @@ mod handle_main_quant_f16_fallback_tests {
             let n_elements = m_dim * k_dim;
             let shape = vec![m_dim, k_dim];
             let m = meta("F16", shape.clone());
-            let vals: Vec<f32> = (0..n_elements).map(|i| ((i as f32) * 0.0007).sin()).collect();
+            let vals: Vec<f32> = (0..n_elements)
+                .map(|i| ((i as f32) * 0.0007).sin())
+                .collect();
             let raw = f16_bytes_of(&vals);
             let mut state = MainQuantState {
                 hfq_tensors: &mut hfq_tensors,
@@ -6515,7 +6541,16 @@ mod handle_main_quant_f16_fallback_tests {
                 dtype: "F16",
                 is_vision: false,
             };
-            handle_main_quant(&ctx, &m, &raw, &flags, &outer, &mut state, &fp8_scale_for, &st_files);
+            handle_main_quant(
+                &ctx,
+                &m,
+                &raw,
+                &flags,
+                &outer,
+                &mut state,
+                &fp8_scale_for,
+                &st_files,
+            );
         }
         assert_eq!(hfq_tensors.len(), 3);
         assert_eq!(hfq_tensors[2].quant_type, QuantType::MQ4G256);
@@ -6565,7 +6600,16 @@ mod handle_main_quant_f16_fallback_tests {
             dtype: "F32",
             is_vision: false,
         };
-        handle_main_quant(&ctx, &m, &raw, &flags, &outer, &mut state, &fp8_scale_for, &st_files);
+        handle_main_quant(
+            &ctx,
+            &m,
+            &raw,
+            &flags,
+            &outer,
+            &mut state,
+            &fp8_scale_for,
+            &st_files,
+        );
         assert_eq!(hfq_tensors.len(), 1);
         assert_eq!(hfq_tensors[0].quant_type, QuantType::F16);
         assert_eq!(hfq_tensors[0].group_size, 0);
