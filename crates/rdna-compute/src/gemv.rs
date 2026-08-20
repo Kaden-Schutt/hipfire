@@ -3516,13 +3516,17 @@ impl Gpu {
     pub fn rotate_x_mq_128(&mut self, x: &GpuTensor, x_rot: &GpuTensor, k: usize) -> HipResult<()> {
         // bind_thread: skip — delegated to scratch.rs
         self.ensure_kernel("gemv_mq4g128", kernels::GEMV_MQ4G128_SRC, "mq_rotate_x_128")?;
+        let capture_mode = self.graphs.capture_mode;
+        let force_blob = self.flags.force_blob_path;
         self.scratch.rotate_x_mq_128(
             &self.hip,
+            &self.compiler,
             &self.functions,
             self.active_stream.as_ref(),
             &mut self.graphs.capture_blobs,
-            self.graphs.capture_mode,
-            self.flags.force_blob_path,
+            capture_mode,
+            force_blob,
+            &mut self.replay,
             &mut self.pool,
             self.device_id,
             x,
@@ -3532,10 +3536,6 @@ impl Gpu {
     }
 
     /// Phase A Stage A — F2 AWQ-aware variant of `rotate_x_mq`.
-    ///
-    /// Divides each input element by `awq_scale[i]` BEFORE the FWHT.
-    ///
-    /// awq_scale: 1D FP32 GpuTensor of length K.
     pub fn rotate_x_mq_awq(
         &mut self,
         x: &GpuTensor,
@@ -3549,13 +3549,17 @@ impl Gpu {
             kernels::ROTATE_X_MQ_AWQ_SRC,
             "rotate_x_mq_awq",
         )?;
+        let capture_mode = self.graphs.capture_mode;
+        let force_blob = self.flags.force_blob_path;
         self.scratch.rotate_x_mq_awq(
             &self.hip,
+            &self.compiler,
             &self.functions,
             self.active_stream.as_ref(),
             &mut self.graphs.capture_blobs,
-            self.graphs.capture_mode,
-            self.flags.force_blob_path,
+            capture_mode,
+            force_blob,
+            &mut self.replay,
             &mut self.pool,
             self.device_id,
             x,
@@ -3581,13 +3585,17 @@ impl Gpu {
             kernels::ROTATE_X_MQ_AWQ_SRC,
             "rotate_x_mq_awq",
         )?;
+        let capture_mode = self.graphs.capture_mode;
+        let force_blob = self.flags.force_blob_path;
         self.scratch.rotate_x_mq_awq_batched(
             &self.hip,
+            &self.compiler,
             &self.functions,
             self.active_stream.as_ref(),
             &mut self.graphs.capture_blobs,
-            self.graphs.capture_mode,
-            self.flags.force_blob_path,
+            capture_mode,
+            force_blob,
+            &mut self.replay,
             &mut self.pool,
             self.device_id,
             x,
@@ -5562,15 +5570,18 @@ impl Gpu {
             kernels::MQ_ROTATE_X_DUAL_FP8_GFX12_SRC,
             "mq_rotate_x_dual_fp8_gfx12",
         )?;
+        let capture_mode = self.graphs.capture_mode;
+        let force_blob = self.flags.force_blob_path;
         self.scratch.rotate_x_mq_dual_fp8(
             &self.hip,
             &mut self.functions,
             self.active_stream.as_ref(),
             &mut self.graphs.capture_blobs,
-            self.graphs.capture_mode,
-            self.flags.force_blob_path,
+            capture_mode,
+            force_blob,
             &mut self.compiler,
             &mut self.modules,
+            &mut self.replay,
             &mut self.pool,
             self.device_id,
             x,
@@ -6113,10 +6124,17 @@ impl Gpu {
             kernels::GEMV_MQ8G256_SRC,
             "mq8_rotate_quantize_x",
         )?;
+        let capture_mode = self.graphs.capture_mode;
+        let force_blob = self.flags.force_blob_path;
         self.scratch.rotate_quantize_x_mq8(
             &self.hip,
+            &self.compiler,
             &self.functions,
             self.active_stream.as_ref(),
+            &mut self.graphs.capture_blobs,
+            capture_mode,
+            force_blob,
+            &mut self.replay,
             &mut self.pool,
             self.device_id,
             x,

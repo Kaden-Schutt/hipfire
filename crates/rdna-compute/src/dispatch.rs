@@ -4963,6 +4963,63 @@ mod tests {
     }
 
     #[test]
+    fn rotate_helpers_share_recording_gate_with_conversions() {
+        // The 7 rotation helpers (`rotate_x_mq`, `rotate_x_mq_batched`,
+        // `rotate_x_mq_128`, `rotate_x_mq_awq`, `rotate_x_mq_awq_batched`,
+        // `rotate_x_mq_dual_fp8`, `rotate_quantize_x_mq8`) have no
+        // cached-pointer elision — they always launch via `launch_maybe_blob`,
+        // whose gating is `use_blob_path(is_recording, capture_mode, force)`.
+        // That is the same gate `Gpu::launch_maybe_blob_bound` uses, and the
+        // same gate the conversion helpers couple to via `scratch_must_convert`
+        // (with force_blob=false). If a future rotate helper adds a pointer-cache
+        // skip, it must reuse `scratch_must_convert`; otherwise a divergence
+        // reintroduces exactly the 64-launch gap.
+        //
+        // Full helper invocation (allocation, kernel compile, HIP launch)
+        // cannot be exercised without a device; this GPU-free test covers the
+        // only driftable logic — the predicate — which is the invariant that
+        // keeps `capture_blobs.len() == recorded_launches.len()`.
+        use crate::scratch::{scratch_must_convert, use_blob_path};
+        let ptr_a: *mut std::ffi::c_void = 0x1000 as *mut _;
+        let ptr_b: *mut std::ffi::c_void = 0x2000 as *mut _;
+        for capture in [false, true] {
+            for recording in [false, true] {
+                for force in [false, true] {
+                    // Rotate helpers with no cache: must run iff blob path is taken.
+                    let rotate_must_run = use_blob_path(recording, capture, force);
+                    let dispatch_gate = recording || capture || force;
+                    assert_eq!(
+                        rotate_must_run, dispatch_gate,
+                        "rotate gate mismatch recording={recording} capture={capture} force={force}"
+                    );
+                    // If a rotate helper ever gains a cache, it must match the
+                    // conversion helper's `scratch_must_convert`.
+                    assert_eq!(
+                        scratch_must_convert(capture, recording, ptr_a, ptr_a),
+                        recording || capture,
+                        "scratch_must_convert cached==src capture={capture} recording={recording}"
+                    );
+                    assert_eq!(
+                        scratch_must_convert(capture, recording, ptr_a, ptr_b),
+                        true,
+                        "scratch_must_convert cached!=src capture={capture} recording={recording}"
+                    );
+                    // The two predicates coincide when cached==src and force==false:
+                    // both reduce to `recording || capture`. With force==true or
+                    // cached!=src they are trivially true, so they cannot diverge.
+                    if !force {
+                        assert_eq!(
+                            scratch_must_convert(capture, recording, ptr_a, ptr_a),
+                            use_blob_path(recording, capture, force),
+                            "conversion vs rotate gate drift capture={capture} recording={recording} force={force}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn tape_parity_accessors_agree_on_empty() {
         // GPU-free sanity: the invariant doc says the two counts must agree.
         // This test just proves the accessors exist and are consistent on a
@@ -4986,5 +5043,5 @@ mod tests {
         assert_eq!(graph.capture_blobs.len(), 0);
         assert_eq!(ctrl.recorded_launches().len(), graph.capture_blobs.len());
     }
-
 }
+

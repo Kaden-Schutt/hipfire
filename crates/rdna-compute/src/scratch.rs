@@ -893,11 +893,13 @@ impl ScratchState {
     pub fn rotate_x_mq(
         &mut self,
         hip: &HipRuntime,
+        compiler: &crate::compiler::KernelCompiler,
         functions: &HashMap<String, Function>,
         stream: Option<&Stream>,
         capture_blobs: &mut Vec<Vec<u8>>,
         capture_mode: bool,
         force_blob_path: bool,
+        replay: &mut crate::replay::ReplayController,
         pool: &mut crate::pool::GpuPool,
         device_id: i32,
         x: &GpuTensor,
@@ -923,13 +925,13 @@ impl ScratchState {
         let timer = crate::profile::begin_timer(hip, "fwht", "mq_rotate_x", bytes);
         let result = launch_maybe_blob(
                 hip,
-                None,
+                Some(compiler),
                 functions,
                 stream,
                 capture_blobs,
                 capture_mode,
                 force_blob_path,
-                None,
+                Some(replay),
             "mq_rotate_x",
             [n_groups, 1, 1],
             [32, 1, 1],
@@ -956,11 +958,13 @@ impl ScratchState {
     pub fn rotate_x_mq_batched(
         &mut self,
         hip: &HipRuntime,
+        compiler: &crate::compiler::KernelCompiler,
         functions: &HashMap<String, Function>,
         stream: Option<&Stream>,
         capture_blobs: &mut Vec<Vec<u8>>,
         capture_mode: bool,
         force_blob_path: bool,
+        replay: &mut crate::replay::ReplayController,
         pool: &mut crate::pool::GpuPool,
         device_id: i32,
         x: &GpuTensor,
@@ -989,13 +993,13 @@ impl ScratchState {
         let timer = crate::profile::begin_timer(hip, "fwht", "mq_rotate_x_batched", bytes);
         let result = launch_maybe_blob(
                 hip,
-                None,
+                Some(compiler),
                 functions,
                 stream,
                 capture_blobs,
                 capture_mode,
                 force_blob_path,
-                None,
+                Some(replay),
             "mq_rotate_x",
             [n_groups * batch_size as u32, 1, 1],
             [32, 1, 1],
@@ -1022,11 +1026,13 @@ impl ScratchState {
     pub fn rotate_x_mq_128(
         &mut self,
         hip: &HipRuntime,
+        compiler: &crate::compiler::KernelCompiler,
         functions: &HashMap<String, Function>,
         stream: Option<&Stream>,
         capture_blobs: &mut Vec<Vec<u8>>,
         capture_mode: bool,
         force_blob_path: bool,
+        replay: &mut crate::replay::ReplayController,
         pool: &mut crate::pool::GpuPool,
         device_id: i32,
         x: &GpuTensor,
@@ -1052,13 +1058,13 @@ impl ScratchState {
         let timer = crate::profile::begin_timer(hip, "fwht", "mq_rotate_x_128", bytes);
         let result = launch_maybe_blob(
                 hip,
-                None,
+                Some(compiler),
                 functions,
                 stream,
                 capture_blobs,
                 capture_mode,
                 force_blob_path,
-                None,
+                Some(replay),
             "mq_rotate_x_128",
             [n_groups, 1, 1],
             [32, 1, 1],
@@ -1081,16 +1087,16 @@ impl ScratchState {
         result
     }
 
-    /// Phase A Stage A — F2 AWQ-aware variant of `rotate_x_mq`.
-    /// Divides each input element by `awq_scale[i]` BEFORE the FWHT.
     pub fn rotate_x_mq_awq(
         &mut self,
         hip: &HipRuntime,
+        compiler: &crate::compiler::KernelCompiler,
         functions: &HashMap<String, Function>,
         stream: Option<&Stream>,
         capture_blobs: &mut Vec<Vec<u8>>,
         capture_mode: bool,
         force_blob_path: bool,
+        replay: &mut crate::replay::ReplayController,
         pool: &mut crate::pool::GpuPool,
         device_id: i32,
         x: &GpuTensor,
@@ -1119,13 +1125,13 @@ impl ScratchState {
         let timer = crate::profile::begin_timer(hip, "fwht", "rotate_x_mq_awq", bytes);
         let result = launch_maybe_blob(
                 hip,
-                None,
+                Some(compiler),
                 functions,
                 stream,
                 capture_blobs,
                 capture_mode,
                 force_blob_path,
-                None,
+                Some(replay),
             "rotate_x_mq_awq",
             [n_groups, 1, 1],
             [32, 1, 1],
@@ -1154,11 +1160,13 @@ impl ScratchState {
     pub fn rotate_x_mq_awq_batched(
         &mut self,
         hip: &HipRuntime,
+        compiler: &crate::compiler::KernelCompiler,
         functions: &HashMap<String, Function>,
         stream: Option<&Stream>,
         capture_blobs: &mut Vec<Vec<u8>>,
         capture_mode: bool,
         force_blob_path: bool,
+        replay: &mut crate::replay::ReplayController,
         pool: &mut crate::pool::GpuPool,
         device_id: i32,
         x: &GpuTensor,
@@ -1190,13 +1198,13 @@ impl ScratchState {
         let timer = crate::profile::begin_timer(hip, "fwht", "rotate_x_mq_awq_batched", bytes);
         let result = launch_maybe_blob(
                 hip,
-                None,
+                Some(compiler),
                 functions,
                 stream,
                 capture_blobs,
                 capture_mode,
                 force_blob_path,
-                None,
+                Some(replay),
             "rotate_x_mq_awq",
             [n_groups, batch_size as u32, 1],
             [32, 1, 1],
@@ -1235,6 +1243,7 @@ impl ScratchState {
         force_blob_path: bool,
         compiler: &mut crate::compiler::KernelCompiler,
         modules: &mut HashMap<String, Module>,
+        replay: &mut crate::replay::ReplayController,
         pool: &mut crate::pool::GpuPool,
         device_id: i32,
         x: &GpuTensor,
@@ -1272,13 +1281,13 @@ impl ScratchState {
         let timer = crate::profile::begin_timer(hip, "fwht", "mq_rotate_x_dual_fp8", bytes);
         let result = launch_maybe_blob(
                 hip,
-                None,
+                Some(compiler),
                 functions,
                 stream,
                 capture_blobs,
                 capture_mode,
                 force_blob_path,
-                None,
+                Some(replay),
             "mq_rotate_x_dual_fp8_gfx12",
             [n_groups, 1, 1],
             [32, 1, 1],
@@ -1308,8 +1317,13 @@ impl ScratchState {
     pub fn rotate_quantize_x_mq8(
         &mut self,
         hip: &HipRuntime,
+        compiler: &crate::compiler::KernelCompiler,
         functions: &HashMap<String, Function>,
         stream: Option<&Stream>,
+        capture_blobs: &mut Vec<Vec<u8>>,
+        capture_mode: bool,
+        force_blob_path: bool,
+        replay: &mut crate::replay::ReplayController,
         pool: &mut crate::pool::GpuPool,
         device_id: i32,
         x: &GpuTensor,
@@ -1324,31 +1338,54 @@ impl ScratchState {
         let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
         let n_groups = (k / 256) as u32;
 
-        let rot_func = &functions["mq8_rotate_quantize_x"];
-        let mut xp = x.buf.as_ptr();
-        let mut xq = xq_ptr;
-        let mut xs = xs_ptr;
-        let mut s1 = s1_ptr;
-        let mut s2 = s2_ptr;
-        let mut kv = k as i32;
+        let xp = x.buf.as_ptr();
+        let xq = xq_ptr;
+        let xs = xs_ptr;
+        let s1 = s1_ptr;
+        let s2 = s2_ptr;
+        let kv = k as i32;
         let mut params: Vec<*mut c_void> = vec![
-            &mut xp as *mut _ as *mut c_void,
-            &mut xq as *mut _ as *mut c_void,
-            &mut xs as *mut _ as *mut c_void,
-            &mut s1 as *mut _ as *mut c_void,
-            &mut s2 as *mut _ as *mut c_void,
-            &mut kv as *mut _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &xq as *const _ as *mut c_void,
+            &xs as *const _ as *mut c_void,
+            &s1 as *const _ as *mut c_void,
+            &s2 as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
         ];
-        unsafe {
-            hip.launch_kernel(
-                rot_func,
-                [n_groups, 1, 1],
-                [32, 1, 1],
-                0,
-                stream,
-                &mut params,
-            )
+        let bytes = crate::profile::mq_rotate_bytes(k) + (k / 256) * 4 + k;
+        let timer = crate::profile::begin_timer(hip, "fwht", "mq8_rotate_quantize_x", bytes);
+        let result = launch_maybe_blob(
+            hip,
+            Some(compiler),
+            functions,
+            stream,
+            capture_blobs,
+            capture_mode,
+            force_blob_path,
+            Some(replay),
+            "mq8_rotate_quantize_x",
+            [n_groups, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = KernargBlob::new();
+                b.push_ptr(xp);
+                b.push_ptr(xq);
+                b.push_ptr(xs);
+                b.push_ptr(s1);
+                b.push_ptr(s2);
+                b.push_i32(kv);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(hip);
         }
+        // Invalidate caches for the internal q8 buffers' output? The output
+        // is internal scratch, not x_rot, so no fp16/fp8 cache invalidation needed.
+        // But keep symmetric: if any future caller aliases, this remains safe.
+        result
     }
 }
 
