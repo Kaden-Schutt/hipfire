@@ -6254,6 +6254,325 @@ fn handle_main_quant(
                 });
             }
         } // end else (non-Q8HFQ path)
+    } else {
+        // ── F16 fallback for non-quantizable tensors ───────────────────────
+        // Every included tensor not handled by `should_quantize(name) && n_elements >= 32`
+        // must still be emitted so the dense artifact is loadable. Historical
+        // source stored these as F16 verbatim when source already F16, otherwise
+        // numerically converting BF16/F32 → F16 (using the truncating encoder).
+        // No model-specific name list; general predicate above controls routing.
+        let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
+        let f16_bytes: Vec<u8> = if meta.dtype == "F16" {
+            // Preserve exact F16 bits when source already F16.
+            raw_data.to_vec()
+        } else {
+            let f32_data = tensor_to_f32_with_optional_fp8_scale(
+                name, raw_data, meta, fp8_scale_for, st_files,
+            );
+            f32_data
+                .iter()
+                .flat_map(|&v| f32_to_f16(v).to_le_bytes())
+                .collect()
+        };
+        *state.quantized_params += n_elements as u64;
+        eprintln!(
+            "  {:>8}: {} {:?} ({} elements, {:.1} KB → {:.1} KB) [F16 fallback]",
+            "F16",
+            name,
+            meta.shape,
+            n_elements,
+            raw_data.len() as f64 / 1024.0,
+            f16_bytes.len() as f64 / 1024.0
+        );
+        state.hfq_tensors.push(HfqTensor {
+            name: name.to_string(),
+            quant_type: QuantType::F16,
+            shape,
+            group_size: 0,
+            data: f16_bytes,
+            spilled_len: 0,
+        });
+        if let Some(sp) = state.spill.as_mut() {
+            maybe_spill(state.hfq_tensors, sp, 2 * 1024 * 1024 * 1024);
+        }
+    }
+}
+
+#[cfg(test)]
+mod handle_main_quant_f16_fallback_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn meta(dtype: &str, shape: Vec<usize>) -> TensorMeta {
+        TensorMeta {
+            dtype: dtype.to_string(),
+            shape,
+            data_offsets: [0, 0],
+        }
+    }
+
+    fn flags_for_mq4() -> MainQuantFlags {
+        MainQuantFlags {
+            use_fast: false,
+            use_gptq_e8: false,
+            use_gptq_mfp2e8: false,
+            use_gptq_mfp3e8: false,
+            use_hfp4: false,
+            use_hfq2g128: false,
+            use_hfq2g256: false,
+            use_hfq3g128: false,
+            use_hfq3g256: false,
+            use_hfq4g256: false,
+            use_hfq6: false,
+            use_hfq_mixed: false,
+            use_mfp2e8_gptq_fmt: false,
+            use_mfp3e8_gptq_fmt: false,
+            use_mfp4: false,
+            use_mfp4e8: false,
+            use_mfp4e8soa: false,
+            use_mfp4l: false,
+            use_mfp4p: false,
+            use_mixed: false,
+            use_mq2g256: false,
+            use_mq2g256_lloyd: false,
+            use_mq3g256: false,
+            use_mq3g256_lloyd: false,
+            use_mq4_mq2glexp: false,
+            use_mq4_mq2lloyd_gptq_all: false,
+            use_mq4_mq2lloyd_imatrix: false,
+            use_mq4_mq2lloyd_kmap: false,
+            use_mq4_mq2lloyd_native: false,
+            use_mq4_mq2lloydexp: false,
+            use_mq4_mq3lloyd_kmap: false,
+            use_mq4_mq6exp: false,
+            use_mq4_mqlloyd_antirez: false,
+            use_mq4_mqlloyd_antirez_gptq: false,
+            use_mq4_mqlloyd_tiered: false,
+            use_mq4g256: true,
+            use_mq4v2: false,
+            use_mq4c: false,
+            use_mq4g256_lloyd: false,
+            use_mq5g256: false,
+            use_mq6g256: false,
+            use_mq5g256v2: false,
+            use_mq6g256v2: false,
+            use_mq3g256v2: false,
+            use_mq2g256v2: false,
+            use_mq8g256: false,
+            use_q4k_all: false,
+            use_q4k_q8embed: false,
+            use_q8: false,
+            use_q8hfq: false,
+            is_gemma4_family: false,
+            q8_conv1d_default: false,
+            q8_router: false,
+            arch_id: 6,
+            vision_quant: String::new(),
+            product_tier: None,
+        }
+    }
+
+    fn f16_bytes_of(vals: &[f32]) -> Vec<u8> {
+        vals.iter().flat_map(|&v| f32_to_f16(v).to_le_bytes()).collect()
+    }
+
+    fn bf16_bytes_of(vals: &[f32]) -> Vec<u8> {
+        vals.iter()
+            .flat_map(|&v| {
+                let bits = v.to_bits();
+                let rounded = bits.wrapping_add(0x7fff + ((bits >> 16) & 1));
+                ((rounded >> 16) as u16).to_le_bytes()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn norm_and_bias_retained_while_weight_quantized() {
+        let flags = flags_for_mq4();
+        let kmap: HashMap<String, QuantLevel> = HashMap::new();
+        let outer = MainQuantOuter {
+            kmap: &kmap,
+            imatrix_gguf: &None,
+            hessian_dir: &None,
+        };
+        let mut hfq_tensors: Vec<HfqTensor> = Vec::new();
+        let mut quantized_params: u64 = 0;
+        let mut total_quant_error: f64 = 0.0;
+        let mut max_quant_error: f32 = 0.0;
+        let mut n_quant_groups: u64 = 0;
+        let mut spill: Option<TensorSpill> = None;
+        let fp8_scale_for: HashMap<String, (usize, String)> = HashMap::new();
+        let st_files: Vec<SafetensorsFile> = Vec::new();
+
+        // 1D norm: should_quantize == false -> F16 fallback, raw F16 preserved
+        {
+            let name = "model.norm.weight";
+            let shape = vec![4096usize];
+            let n_elements = 4096;
+            let m = meta("F16", shape.clone());
+            let vals: Vec<f32> = (0..n_elements).map(|i| (i as f32) * 0.001).collect();
+            let raw = f16_bytes_of(&vals);
+            let mut state = MainQuantState {
+                hfq_tensors: &mut hfq_tensors,
+                quantized_params: &mut quantized_params,
+                total_quant_error: &mut total_quant_error,
+                max_quant_error: &mut max_quant_error,
+                _n_quant_groups: &mut n_quant_groups,
+                spill: &mut spill,
+            };
+            let ctx = PerTensorCtx {
+                name,
+                file_idx: 0,
+                shape: &shape,
+                n_elements,
+                arch_id: 6,
+                dtype: "F16",
+                is_vision: false,
+            };
+            handle_main_quant(&ctx, &m, &raw, &flags, &outer, &mut state, &fp8_scale_for, &st_files);
+        }
+        assert_eq!(hfq_tensors.len(), 1);
+        assert_eq!(hfq_tensors[0].name, "model.norm.weight");
+        assert_eq!(hfq_tensors[0].quant_type, QuantType::F16);
+        assert_eq!(hfq_tensors[0].group_size, 0);
+        assert_eq!(hfq_tensors[0].shape, vec![4096]);
+        assert_eq!(hfq_tensors[0].data.len(), 4096 * 2);
+        assert_eq!(quantized_params, 4096);
+
+        // bias-class small tensor (contains "bias", BF16 source) -> F16 fallback via conversion
+        {
+            let name = "model.layers.0.mamba.dt_bias";
+            let shape = vec![32usize];
+            let n_elements = 32;
+            let m = meta("BF16", shape.clone());
+            let vals: Vec<f32> = (0..n_elements).map(|i| (i as f32) * 0.1 + 0.5).collect();
+            let raw = bf16_bytes_of(&vals);
+            let mut state = MainQuantState {
+                hfq_tensors: &mut hfq_tensors,
+                quantized_params: &mut quantized_params,
+                total_quant_error: &mut total_quant_error,
+                max_quant_error: &mut max_quant_error,
+                _n_quant_groups: &mut n_quant_groups,
+                spill: &mut spill,
+            };
+            let ctx = PerTensorCtx {
+                name,
+                file_idx: 0,
+                shape: &shape,
+                n_elements,
+                arch_id: 6,
+                dtype: "BF16",
+                is_vision: false,
+            };
+            handle_main_quant(&ctx, &m, &raw, &flags, &outer, &mut state, &fp8_scale_for, &st_files);
+        }
+        assert_eq!(hfq_tensors.len(), 2);
+        assert_eq!(hfq_tensors[1].quant_type, QuantType::F16);
+        assert_eq!(hfq_tensors[1].group_size, 0);
+        assert_eq!(hfq_tensors[1].shape, vec![32]);
+        assert_eq!(hfq_tensors[1].data.len(), 32 * 2);
+        // BF16 -> F16 numeric conversion check
+        let expected: Vec<u8> = {
+            let vals: Vec<f32> = (0..32).map(|i| (i as f32) * 0.1 + 0.5).collect();
+            vals.iter()
+                .map(|&v| {
+                    let bits = v.to_bits();
+                    let rounded = bits.wrapping_add(0x7fff + ((bits >> 16) & 1));
+                    let bf16_bits = (rounded >> 16) as u16;
+                    let f = bf16_to_f32(bf16_bits);
+                    f32_to_f16(f).to_le_bytes()
+                })
+                .flat_map(|b| b)
+                .collect()
+        };
+        assert_eq!(hfq_tensors[1].data, expected);
+        assert_eq!(quantized_params, 4096 + 32);
+
+        // regular 2D weight: should_quantize==true && n>=32 -> quantized (MQ4G256)
+        {
+            let name = "model.layers.0.self_attn.q_proj.weight";
+            let m_dim = 32usize;
+            let k_dim = 256usize;
+            let n_elements = m_dim * k_dim;
+            let shape = vec![m_dim, k_dim];
+            let m = meta("F16", shape.clone());
+            let vals: Vec<f32> = (0..n_elements).map(|i| ((i as f32) * 0.0007).sin()).collect();
+            let raw = f16_bytes_of(&vals);
+            let mut state = MainQuantState {
+                hfq_tensors: &mut hfq_tensors,
+                quantized_params: &mut quantized_params,
+                total_quant_error: &mut total_quant_error,
+                max_quant_error: &mut max_quant_error,
+                _n_quant_groups: &mut n_quant_groups,
+                spill: &mut spill,
+            };
+            let ctx = PerTensorCtx {
+                name,
+                file_idx: 0,
+                shape: &shape,
+                n_elements,
+                arch_id: 6,
+                dtype: "F16",
+                is_vision: false,
+            };
+            handle_main_quant(&ctx, &m, &raw, &flags, &outer, &mut state, &fp8_scale_for, &st_files);
+        }
+        assert_eq!(hfq_tensors.len(), 3);
+        assert_eq!(hfq_tensors[2].quant_type, QuantType::MQ4G256);
+        assert_eq!(hfq_tensors[2].group_size, 256);
+        assert_eq!(quantized_params, 4096 + 32 + (32 * 256) as u64);
+    }
+
+    #[test]
+    fn f32_small_tensor_fallback_preserves_shape_and_bytes() {
+        let flags = flags_for_mq4();
+        let kmap: HashMap<String, QuantLevel> = HashMap::new();
+        let outer = MainQuantOuter {
+            kmap: &kmap,
+            imatrix_gguf: &None,
+            hessian_dir: &None,
+        };
+        let mut hfq_tensors: Vec<HfqTensor> = Vec::new();
+        let mut quantized_params: u64 = 0;
+        let mut total_quant_error: f64 = 0.0;
+        let mut max_quant_error: f32 = 0.0;
+        let mut n_quant_groups: u64 = 0;
+        let mut spill: Option<TensorSpill> = None;
+        let fp8_scale_for: HashMap<String, (usize, String)> = HashMap::new();
+        let st_files: Vec<SafetensorsFile> = Vec::new();
+
+        // n_elements < 32 forces fallback even though name looks quantizable
+        let name = "model.layers.0.mamba.A_log";
+        let shape = vec![16usize];
+        let n_elements = 16;
+        let m = meta("F32", shape.clone());
+        let vals: Vec<f32> = (0..n_elements).map(|i| (i as f32) * 0.25).collect();
+        let raw: Vec<u8> = vals.iter().flat_map(|&v| v.to_le_bytes()).collect();
+        let mut state = MainQuantState {
+            hfq_tensors: &mut hfq_tensors,
+            quantized_params: &mut quantized_params,
+            total_quant_error: &mut total_quant_error,
+            max_quant_error: &mut max_quant_error,
+            _n_quant_groups: &mut n_quant_groups,
+            spill: &mut spill,
+        };
+        let ctx = PerTensorCtx {
+            name,
+            file_idx: 0,
+            shape: &shape,
+            n_elements,
+            arch_id: 6,
+            dtype: "F32",
+            is_vision: false,
+        };
+        handle_main_quant(&ctx, &m, &raw, &flags, &outer, &mut state, &fp8_scale_for, &st_files);
+        assert_eq!(hfq_tensors.len(), 1);
+        assert_eq!(hfq_tensors[0].quant_type, QuantType::F16);
+        assert_eq!(hfq_tensors[0].group_size, 0);
+        assert_eq!(hfq_tensors[0].shape, vec![16]);
+        assert_eq!(hfq_tensors[0].data.len(), 16 * 2);
+        let expected = f16_bytes_of(&vals);
+        assert_eq!(hfq_tensors[0].data, expected);
     }
 }
 
