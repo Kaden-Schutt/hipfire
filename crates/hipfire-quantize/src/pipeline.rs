@@ -2384,7 +2384,7 @@ pub(crate) fn run() {
         let is_moe_expert_3d = (is_moe || is_gemma4)
             && (name.ends_with("experts.gate_up_proj") || name.ends_with("experts.down_proj"))
             && meta.shape.len() == 3;
-        {
+        if is_moe_expert_3d {
             let __ctx = PerTensorCtx {
                 name,
                 file_idx: *file_idx,
