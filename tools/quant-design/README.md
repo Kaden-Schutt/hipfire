@@ -14,14 +14,53 @@ seeing the whole tradeoff surface.
 
 ## Usage
 
+Generated fixtures and sweep executables live under the worktree-local
+`.codeinsight+research/quant-design/` tree (not `$HOME`). Canonical HIP sources
+stay in this directory (`tools/quant-design`).
+
 ```bash
 # 1. dump real post-FWHT blocks + the codebook family (f32 binaries)
-#    sweep_G.bin   : nblk × 256 f32, post-FWHT, engine sign seeds 42/1042
-#    sweep_fam.bin : 64 × 16 f32 profile family
-# 2. build and run; argv[1] is the tail threshold (99th pct of |G|)
+#    fixtures/sweep_G.bin   : nblk × 256 f32, post-FWHT, engine sign seeds 42/1042
+#    fixtures/sweep_fam.bin : 64 × 16 f32 profile family
+#    (large generated artifacts; not tracked)
+# 2. build and run from the repo/worktree root; argv[1] is the tail threshold
+#    (99th pct of |G|). Optional argv[2]/argv[3] override G/family fixture paths;
+#    defaults are the project-local fixtures above.
 /opt/rocm/core-7.14/bin/hipcc --offload-arch=gfx1201 -O3 \
-    sweep_mq4_header_allocation.hip -o sweep_mq4
-./sweep_mq4 2.869166e-02
+    tools/quant-design/sweep_mq4_header_allocation.hip \
+    -o .codeinsight+research/quant-design/sweep_mq4
+.codeinsight+research/quant-design/sweep_mq4 2.869166e-02
+```
+
+### Matched low-bit ladder
+
+`optimize_mq_lowbit_ladder.hip` compares affine V2, Lloyd, fixed-codebook,
+selector, and production MFP-E8 reconstruction for 2/3/4-bit payloads on the
+same post-FWHT fixture. MQ2V2 and MQ3V2 are research layouts; MQ4V2 is
+production. The final argument is the original tensor K so MFP row headers and
+row-scale encoding are charged exactly.
+
+```bash
+/opt/rocm/core/bin/hipcc --offload-arch=gfx1201 -O3 \
+    tools/quant-design/optimize_mq_lowbit_ladder.hip \
+    -o .codeinsight+research/quant-design/optimize_mq_lowbit_ladder
+.codeinsight+research/quant-design/optimize_mq_lowbit_ladder \
+    .codeinsight+research/quant-design/fixtures/sweep_G.bin \
+    2.869847e-02 17408
+```
+
+### Matched HIP decoder microbench
+
+`bench_mq_lowbit_kernels.hip` times V2, Lloyd, and MFP-E8 at B=1 and at
+B=16 with each decoded weight reused across sixteen activation rows. B=16 is a
+format/decode microbench, **not production WMMA throughput**. Use a DRAM-resident
+shape and at least three fresh processes for a performance claim.
+
+```bash
+/opt/rocm/core/bin/hipcc --offload-arch=gfx1201 -O3 \
+    tools/quant-design/bench_mq_lowbit_kernels.hip \
+    -o .codeinsight+research/quant-design/bench_mq_lowbit_kernels
+.codeinsight+research/quant-design/bench_mq_lowbit_kernels 5120 17408
 ```
 
 One 256-thread workgroup per 256-weight group. Errors accumulate in **raw weight

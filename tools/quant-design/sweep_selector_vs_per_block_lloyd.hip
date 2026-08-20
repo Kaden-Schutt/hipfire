@@ -171,14 +171,18 @@ __global__ __launch_bounds__(256) void eval_cb(
 
 int main(int argc, char** argv) {
     const float tailthr = argc > 1 ? atof(argv[1]) : 2.869166e-02f;
-    FILE* f = fopen("/home/kaden/sweep_G.bin", "rb");
+    const char* gpath = argc > 2 ? argv[2] : ".codeinsight+research/quant-design/fixtures/sweep_G.bin";
+    const char* fpath = argc > 3 ? argv[3] : ".codeinsight+research/quant-design/fixtures/sweep_fam.bin";
+    FILE* f = fopen(gpath, "rb");
+    if (!f) { printf("cannot open %s\n", gpath); return 1; }
     fseek(f, 0, SEEK_END); long bytes = ftell(f); fseek(f, 0, SEEK_SET);
     const int nblk = (int)(bytes / (256 * sizeof(float)));
     std::vector<float> hG((size_t)nblk * 256);
     if (fread(hG.data(), 1, bytes, f) != (size_t)bytes) { printf("short read\n"); return 1; }
     fclose(f);
     std::vector<float> hF(NPROF * NLEV);
-    f = fopen("/home/kaden/sweep_fam.bin", "rb");
+    f = fopen(fpath, "rb");
+    if (!f) { printf("cannot open %s\n", fpath); return 1; }
     if (fread(hF.data(), sizeof(float), NPROF*NLEV, f) != NPROF*NLEV) { printf("fam short\n"); return 1; }
     fclose(f);
 
