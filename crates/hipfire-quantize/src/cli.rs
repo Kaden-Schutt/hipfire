@@ -179,6 +179,16 @@ pub(crate) struct QuantizeArgs {
     /// Ingest only tensors whose names start with this prefix.
     #[arg(long, value_name = "PREFIX")]
     pub include_prefix: Option<String>,
+
+    /// Product tier for Qwen3.8 ladder: xt keeps lm_head at base codec, base lifts lm_head, pro also lifts ssm_out (linear_attn.out_proj).
+    /// embed_tokens and linear_attn.conv1d.weight remain Q8 at every rung; structural tensors remain F16.
+    #[arg(long, value_name = "TIER")]
+    pub tier: Option<String>,
+
+    /// Per-class fixed-tier codec overrides, e.g. lm_head:mq6v2,ssm_out:mq5v2.
+    /// Accepted classes: lm_head,embed,router,attn,ssm_out; accepted dtypes: q8,mq2v2,mq3v2,mq4v2,mq5v2,mq6v2.
+    #[arg(long, value_name = "SPEC")]
+    pub fixed_tier: Option<String>,
 }
 
 /// Refuse an `--arch-id` override that strips a qwen3* model (auto-detected

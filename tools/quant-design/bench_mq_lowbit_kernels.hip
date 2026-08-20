@@ -4,16 +4,21 @@
 // gfx1201 HIP microbenchmark: matched decode-GEMV cost for low-bit MQ formats.
 //
 // Arms (bits × format × regime):
-//   bits     : 2, 3, 4
-//   formats  : V2 (dual-G128 fp16 s/z), Lloyd (2^bits fp16 centroids), MFP-E8 (G32)
-//   regimes  : B=1 decode GEMV; B=16 shared-weight format/decode proxy
+//   bits 2/3/4 : V2, Lloyd, MFP-E8  (unchanged production/hypothesis set)
+//   bits 5/6   : V1 (legacy f32 s/z per G256) and V2 (dual-G128 fp16 s/z)
+//   regimes    : B=1 decode GEMV; B=16 shared-weight format/decode proxy
 //
 // Labels:
 //   MQ4V2 is production. MQ2V2 / MQ3V2 are HYPOTHETICAL (production MQ2/MQ3 are Lloyd).
+//   MQ5-v1 / MQ6-v1 = production HFQ5/HFQ6-style f32 header + legacy pack.
+//   MQ5V2 / MQ6V2 = same payload at +8 with dual-G128 fp16 header (neutral size).
 //   B=16 is a shared-weight format microbench (decode each weight once, reuse across
 //   16 activation rows). It is NOT a production WMMA throughput measurement.
 //
 // Layouts (exact):
+//   V1   : per G256 group = bits*32 + 8 bytes
+//          [f32 scale|f32 zero] + packed payload (production HFQ5=168, HFQ6=200)
+//          w = q * s + z  (one s/z for whole G256)
 //   V2   : per G256 group = bits*32 + 8 bytes
 //          dual-G128 headers: [fp16 s0|fp16 z0|fp16 s1|fp16 z1] + packed payload
 //          w = q * s + z  (tid<16 → half0, tid>=16 → half1)
@@ -23,6 +28,8 @@
 //          G32 block = [E4M3 scale][4 × n-byte E8 codewords]
 //          w = row_scale * e4m3(scale) * QUANT_STEP * e8_coord
 //          QUANT_STEP = {2:3.8, 3:1.8, 4:0.88}; E8 centers/bias = {2:2, 3:4, 4:7}
+//   Pack : 2b 4vals/1B; 3b 8vals/3B; 4b 2vals/1B; 5b 8vals/5B; 6b 4vals/3B
+//          (legacy production byte layout; payload starts at +8 for V1 and V2)
 //
 // Build (parent validates; this file is source-only in this pass):
 //   hipcc -O3 --offload-arch=gfx1201 tools/quant-design/bench_mq_lowbit_kernels.hip \
@@ -65,11 +72,13 @@ static constexpr int kSentinelK = 256;
         }                                                                     \
     } while (0)
 
-enum class Fmt : int { V2 = 0, Lloyd = 1, MfpE8 = 2 };
+enum class Fmt : int { V2 = 0, Lloyd = 1, MfpE8 = 2, V1 = 3 };
 
 static inline const char* fmt_name(Fmt f, int bits) {
     switch (f) {
     case Fmt::V2:
+        if (bits == 6) return "MQ6V2";
+        if (bits == 5) return "MQ5V2";
         if (bits == 4) return "MQ4V2";
         if (bits == 3) return "MQ3V2(hyp)";
         return "MQ2V2(hyp)";
@@ -81,11 +90,16 @@ static inline const char* fmt_name(Fmt f, int bits) {
         if (bits == 4) return "MFP4G32E8";
         if (bits == 3) return "MFP3G32E8";
         return "MFP2G32E8";
+    case Fmt::V1:
+        if (bits == 6) return "MQ6-v1";
+        if (bits == 5) return "MQ5-v1";
+        return "MQv1";
     }
     return "?";
 }
 
 static inline int v2_group_bytes(int bits) { return bits * 32 + 8; }
+static inline int v1_group_bytes(int bits) { return bits * 32 + 8; } // same size, f32 s/z
 static inline int lloyd_cb_bytes(int bits) { return (1 << bits) * 2; }
 static inline int lloyd_group_bytes(int bits) {
     return lloyd_cb_bytes(bits) + bits * 32;
@@ -99,6 +113,8 @@ static inline size_t weight_bytes(Fmt f, int bits, int M, int K) {
     switch (f) {
     case Fmt::V2:
         return (size_t)M * (size_t)gpr * (size_t)v2_group_bytes(bits);
+    case Fmt::V1:
+        return (size_t)M * (size_t)gpr * (size_t)v1_group_bytes(bits);
     case Fmt::Lloyd:
         return (size_t)M * (size_t)gpr * (size_t)lloyd_group_bytes(bits);
     case Fmt::MfpE8:
@@ -249,10 +265,52 @@ static inline float lcg_finite(uint64_t* s, float lo, float hi) {
 // Pack random valid weight tensors
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Legacy production pack for one thread's 8 q-values into the payload plane.
+// Layouts match kernels/src/gemv_hfq{2,3,4,5,6}g256.hip byte-for-byte.
+static void pack_thread_qs(uint8_t* data, int bits, int tid, const uint8_t q[8]) {
+    if (bits == 4) {
+        for (int b = 0; b < 4; b++)
+            data[tid * 4 + b] = (uint8_t)(q[2 * b] | (q[2 * b + 1] << 4));
+    } else if (bits == 3) {
+        uint32_t pk = 0;
+        for (int i = 0; i < 8; i++) pk |= ((uint32_t)q[i] & 7u) << (3 * i);
+        data[tid * 3 + 0] = (uint8_t)(pk & 0xFFu);
+        data[tid * 3 + 1] = (uint8_t)((pk >> 8) & 0xFFu);
+        data[tid * 3 + 2] = (uint8_t)((pk >> 16) & 0xFFu);
+    } else if (bits == 2) {
+        for (int b = 0; b < 2; b++) {
+            uint8_t v = 0;
+            for (int i = 0; i < 4; i++) v |= (uint8_t)((q[4 * b + i] & 3u) << (2 * i));
+            data[tid * 2 + b] = v;
+        }
+    } else if (bits == 5) {
+        // 8 values / 5 bytes (production HFQ5/MQ5).
+        const uint8_t q0 = q[0] & 31u, q1 = q[1] & 31u, q2 = q[2] & 31u, q3 = q[3] & 31u;
+        const uint8_t q4 = q[4] & 31u, q5 = q[5] & 31u, q6 = q[6] & 31u, q7 = q[7] & 31u;
+        uint8_t* d = data + tid * 5;
+        d[0] = (uint8_t)(q0 | (q1 << 5));
+        d[1] = (uint8_t)((q1 >> 3) | (q2 << 2) | (q3 << 7));
+        d[2] = (uint8_t)((q3 >> 1) | (q4 << 4));
+        d[3] = (uint8_t)((q4 >> 4) | (q5 << 1) | (q6 << 6));
+        d[4] = (uint8_t)((q6 >> 2) | (q7 << 3));
+    } else { // bits == 6
+        // 4 values / 3 bytes × 2 (production HFQ6/MQ6).
+        uint8_t* d = data + tid * 6;
+        for (int h = 0; h < 2; h++) {
+            const uint8_t q0 = q[4 * h + 0] & 63u;
+            const uint8_t q1 = q[4 * h + 1] & 63u;
+            const uint8_t q2 = q[4 * h + 2] & 63u;
+            const uint8_t q3 = q[4 * h + 3] & 63u;
+            d[h * 3 + 0] = (uint8_t)(q0 | (q1 << 6));
+            d[h * 3 + 1] = (uint8_t)((q1 >> 2) | (q2 << 4));
+            d[h * 3 + 2] = (uint8_t)((q2 >> 4) | (q3 << 2));
+        }
+    }
+}
+
 static void pack_v2(std::vector<uint8_t>& out, int bits, int M, int K, uint64_t seed) {
     const int gpr = K / 256;
     const int gb = v2_group_bytes(bits);
-    const int payload = bits * 32;
     out.assign((size_t)M * (size_t)gpr * (size_t)gb, 0);
     uint64_t rng = seed;
     const int nlev = 1 << bits;
@@ -269,40 +327,38 @@ static void pack_v2(std::vector<uint8_t>& out, int bits, int M, int K, uint64_t 
                 f32_to_f16_bits(s1), f32_to_f16_bits(z1),
             };
             std::memcpy(gp, h, 8);
-            // Packed indices: 32 threads × 8 weights.
             uint8_t* data = gp + 8;
-            if (bits == 4) {
-                for (int t = 0; t < 32; t++) {
-                    for (int b = 0; b < 4; b++) {
-                        uint8_t lo = (uint8_t)(lcg_u64(&rng) % (unsigned)nlev);
-                        uint8_t hi = (uint8_t)(lcg_u64(&rng) % (unsigned)nlev);
-                        data[t * 4 + b] = (uint8_t)(lo | (hi << 4));
-                    }
-                }
-            } else if (bits == 3) {
-                for (int t = 0; t < 32; t++) {
-                    uint32_t pk = 0;
-                    for (int i = 0; i < 8; i++) {
-                        uint32_t q = (uint32_t)(lcg_u64(&rng) % (unsigned)nlev);
-                        pk |= q << (3 * i);
-                    }
-                    data[t * 3 + 0] = (uint8_t)(pk & 0xFFu);
-                    data[t * 3 + 1] = (uint8_t)((pk >> 8) & 0xFFu);
-                    data[t * 3 + 2] = (uint8_t)((pk >> 16) & 0xFFu);
-                }
-            } else { // bits == 2
-                for (int t = 0; t < 32; t++) {
-                    for (int b = 0; b < 2; b++) {
-                        uint8_t v = 0;
-                        for (int i = 0; i < 4; i++) {
-                            uint8_t q = (uint8_t)(lcg_u64(&rng) % (unsigned)nlev);
-                            v |= (uint8_t)(q << (2 * i));
-                        }
-                        data[t * 2 + b] = v;
-                    }
-                }
+            for (int t = 0; t < 32; t++) {
+                uint8_t q[8];
+                for (int i = 0; i < 8; i++)
+                    q[i] = (uint8_t)(lcg_u64(&rng) % (unsigned)nlev);
+                pack_thread_qs(data, bits, t, q);
             }
-            (void)payload;
+        }
+    }
+}
+
+// V1 = production HFQ5/HFQ6 header: [f32 scale][f32 zero] + same payload as V2 at +8.
+static void pack_v1(std::vector<uint8_t>& out, int bits, int M, int K, uint64_t seed) {
+    const int gpr = K / 256;
+    const int gb = v1_group_bytes(bits);
+    out.assign((size_t)M * (size_t)gpr * (size_t)gb, 0);
+    uint64_t rng = seed;
+    const int nlev = 1 << bits;
+    for (int r = 0; r < M; r++) {
+        for (int g = 0; g < gpr; g++) {
+            uint8_t* gp = out.data() + ((size_t)r * gpr + g) * gb;
+            float s = lcg_finite(&rng, 0.01f, 2.0f);
+            float z = lcg_finite(&rng, -1.0f, 1.0f);
+            std::memcpy(gp + 0, &s, 4);
+            std::memcpy(gp + 4, &z, 4);
+            uint8_t* data = gp + 8;
+            for (int t = 0; t < 32; t++) {
+                uint8_t q[8];
+                for (int i = 0; i < 8; i++)
+                    q[i] = (uint8_t)(lcg_u64(&rng) % (unsigned)nlev);
+                pack_thread_qs(data, bits, t, q);
+            }
         }
     }
 }
@@ -390,6 +446,49 @@ static void pack_mfp(std::vector<uint8_t>& out, int bits, int M, int K, uint64_t
 // Host reference decode → GEMV (sentinel correctness)
 // ─────────────────────────────────────────────────────────────────────────────
 
+static void host_unpack8(const uint8_t* data, int bits, int tid, uint32_t q[8]) {
+    if (bits == 4) {
+        for (int i = 0; i < 4; i++) {
+            uint8_t by = data[tid * 4 + i];
+            q[2 * i] = by & 0xF;
+            q[2 * i + 1] = (by >> 4) & 0xF;
+        }
+    } else if (bits == 3) {
+        uint32_t pk = (uint32_t)data[tid * 3]
+                    | ((uint32_t)data[tid * 3 + 1] << 8)
+                    | ((uint32_t)data[tid * 3 + 2] << 16);
+        for (int i = 0; i < 8; i++) q[i] = (pk >> (3 * i)) & 7u;
+    } else if (bits == 2) {
+        for (int i = 0; i < 2; i++) {
+            uint8_t by = data[tid * 2 + i];
+            q[4 * i + 0] = by & 3u;
+            q[4 * i + 1] = (by >> 2) & 3u;
+            q[4 * i + 2] = (by >> 4) & 3u;
+            q[4 * i + 3] = (by >> 6) & 3u;
+        }
+    } else if (bits == 5) {
+        const uint8_t* d = data + tid * 5;
+        const uint8_t b0 = d[0], b1 = d[1], b2 = d[2], b3 = d[3], b4 = d[4];
+        q[0] = b0 & 0x1fu;
+        q[1] = ((b0 >> 5) & 0x07u) | ((b1 & 0x03u) << 3);
+        q[2] = (b1 >> 2) & 0x1fu;
+        q[3] = ((b1 >> 7) & 0x01u) | ((b2 & 0x0fu) << 1);
+        q[4] = ((b2 >> 4) & 0x0fu) | ((b3 & 0x01u) << 4);
+        q[5] = (b3 >> 1) & 0x1fu;
+        q[6] = ((b3 >> 6) & 0x03u) | ((b4 & 0x07u) << 2);
+        q[7] = (b4 >> 3) & 0x1fu;
+    } else { // bits == 6
+        const uint8_t* d = data + tid * 6;
+        for (int h = 0; h < 2; h++) {
+            const uint8_t b0 = d[h * 3 + 0], b1 = d[h * 3 + 1], b2 = d[h * 3 + 2];
+            q[4 * h + 0] = b0 & 63u;
+            q[4 * h + 1] = (b0 >> 6) | ((b1 & 0xFu) << 2);
+            q[4 * h + 2] = (b1 >> 4) | ((b2 & 3u) << 4);
+            q[4 * h + 3] = b2 >> 2;
+        }
+    }
+}
+
 static void host_gemv_v2(const uint8_t* A, const float* x, float* y,
                          int bits, int M, int K, int B) {
     const int gpr = K / 256;
@@ -411,26 +510,35 @@ static void host_gemv_v2(const uint8_t* A, const float* x, float* y,
                     const float z = (t < 16) ? z0 : z1;
                     const int base = g * 256 + t * 8;
                     uint32_t q[8];
-                    if (bits == 4) {
-                        for (int i = 0; i < 4; i++) {
-                            uint8_t by = data[t * 4 + i];
-                            q[2 * i] = by & 0xF;
-                            q[2 * i + 1] = (by >> 4) & 0xF;
-                        }
-                    } else if (bits == 3) {
-                        uint32_t pk = (uint32_t)data[t * 3]
-                                    | ((uint32_t)data[t * 3 + 1] << 8)
-                                    | ((uint32_t)data[t * 3 + 2] << 16);
-                        for (int i = 0; i < 8; i++) q[i] = (pk >> (3 * i)) & 7u;
-                    } else {
-                        for (int i = 0; i < 2; i++) {
-                            uint8_t by = data[t * 2 + i];
-                            q[4 * i + 0] = by & 3u;
-                            q[4 * i + 1] = (by >> 2) & 3u;
-                            q[4 * i + 2] = (by >> 4) & 3u;
-                            q[4 * i + 3] = (by >> 6) & 3u;
-                        }
-                    }
+                    host_unpack8(data, bits, t, q);
+                    for (int i = 0; i < 8; i++)
+                        acc += (double)(s * (float)q[i] + z) * (double)xb[base + i];
+                }
+            }
+            y[(size_t)bat * M + r] = (float)acc;
+        }
+    }
+}
+
+static void host_gemv_v1(const uint8_t* A, const float* x, float* y,
+                         int bits, int M, int K, int B) {
+    const int gpr = K / 256;
+    const int gb = v1_group_bytes(bits);
+    for (int r = 0; r < M; r++) {
+        for (int bat = 0; bat < B; bat++) {
+            double acc = 0.0;
+            const uint8_t* row = A + (size_t)r * gpr * gb;
+            const float* xb = x + (size_t)bat * K;
+            for (int g = 0; g < gpr; g++) {
+                const uint8_t* gp = row + g * gb;
+                float s, z;
+                std::memcpy(&s, gp + 0, 4);
+                std::memcpy(&z, gp + 4, 4);
+                const uint8_t* data = gp + 8;
+                for (int t = 0; t < 32; t++) {
+                    const int base = g * 256 + t * 8;
+                    uint32_t q[8];
+                    host_unpack8(data, bits, t, q);
                     for (int i = 0; i < 8; i++)
                         acc += (double)(s * (float)q[i] + z) * (double)xb[base + i];
                 }
@@ -574,7 +682,7 @@ __device__ __forceinline__ void unpack8(const unsigned char* data, int tid,
                     | ((unsigned)data[boff + 2] << 16);
 #pragma unroll
         for (int i = 0; i < 8; i++) q[i] = (pk >> (3 * i)) & 7u;
-    } else {
+    } else if constexpr (BITS == 2) {
         const int boff = tid * 2;
 #pragma unroll
         for (int i = 0; i < 2; i++) {
@@ -583,6 +691,33 @@ __device__ __forceinline__ void unpack8(const unsigned char* data, int tid,
             q[4 * i + 1] = (by >> 2) & 3u;
             q[4 * i + 2] = (by >> 4) & 3u;
             q[4 * i + 3] = (by >> 6) & 3u;
+        }
+    } else if constexpr (BITS == 5) {
+        const int boff = tid * 5;
+        const unsigned b0 = data[boff];
+        const unsigned b1 = data[boff + 1];
+        const unsigned b2 = data[boff + 2];
+        const unsigned b3 = data[boff + 3];
+        const unsigned b4 = data[boff + 4];
+        q[0] = b0 & 0x1fu;
+        q[1] = ((b0 >> 5) & 0x07u) | ((b1 & 0x03u) << 3);
+        q[2] = (b1 >> 2) & 0x1fu;
+        q[3] = ((b1 >> 7) & 0x01u) | ((b2 & 0x0fu) << 1);
+        q[4] = ((b2 >> 4) & 0x0fu) | ((b3 & 0x01u) << 4);
+        q[5] = (b3 >> 1) & 0x1fu;
+        q[6] = ((b3 >> 6) & 0x03u) | ((b4 & 0x07u) << 2);
+        q[7] = (b4 >> 3) & 0x1fu;
+    } else { // BITS == 6
+        const int boff = tid * 6;
+#pragma unroll
+        for (int h = 0; h < 2; h++) {
+            const unsigned b0 = data[boff + h * 3 + 0];
+            const unsigned b1 = data[boff + h * 3 + 1];
+            const unsigned b2 = data[boff + h * 3 + 2];
+            q[4 * h + 0] = b0 & 63u;
+            q[4 * h + 1] = (b0 >> 6) | ((b1 & 0xFu) << 2);
+            q[4 * h + 2] = (b1 >> 4) | ((b2 & 3u) << 4);
+            q[4 * h + 3] = b2 >> 2;
         }
     }
 }
@@ -643,6 +778,79 @@ __global__ void gemv_v2_b16(const char* __restrict__ A,
         const unsigned hs = (tid < 16) ? hA : hB;
         const float sc = __half2float(__ushort_as_half((unsigned short)(hs & 0xFFFFu)));
         const float zp = __half2float(__ushort_as_half((unsigned short)(hs >> 16)));
+        unsigned q[8];
+        unpack8<BITS>((const unsigned char*)(gp + 8), tid, q);
+        float w[8];
+#pragma unroll
+        for (int i = 0; i < 8; i++) w[i] = sc * (float)q[i] + zp;
+        const int base = g * 256 + tid * 8;
+#pragma unroll
+        for (int b = 0; b < BATCH_B; b++) {
+            const float* xb = x + (size_t)b * K;
+#pragma unroll
+            for (int i = 0; i < 8; i++)
+                acc[b] += w[i] * xb[base + i];
+        }
+    }
+#pragma unroll
+    for (int b = 0; b < BATCH_B; b++) {
+        float a = acc[b];
+        for (int off = 16; off > 0; off >>= 1)
+            a += __shfl_down(a, off);
+        if (tid == 0) y[(size_t)b * M + row] = a;
+    }
+}
+
+// ─── V1 B=1 (legacy f32 s/z per G256; same payload as V2 at +8) ──────────────
+template <int BITS>
+__launch_bounds__(32, 16)
+__global__ void gemv_v1_b1(const char* __restrict__ A,
+                           const float* __restrict__ x,
+                           float* __restrict__ y,
+                           int M, int K) {
+    const int row = (int)blockIdx.x;
+    if (row >= M) return;
+    const int tid = (int)threadIdx.x;
+    const int gpr = K / 256;
+    constexpr int gb = BITS * 32 + 8;
+    const char* row_ptr = A + (long long)row * gpr * gb;
+    float acc = 0.0f;
+    for (int g = 0; g < gpr; g++) {
+        const char* gp = row_ptr + g * gb;
+        const float sc = __builtin_bit_cast(float, *(const unsigned int*)(gp));
+        const float zp = __builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
+        unsigned q[8];
+        unpack8<BITS>((const unsigned char*)(gp + 8), tid, q);
+        const int base = g * 256 + tid * 8;
+#pragma unroll
+        for (int i = 0; i < 8; i++)
+            acc += (sc * (float)q[i] + zp) * x[base + i];
+    }
+    for (int off = 16; off > 0; off >>= 1)
+        acc += __shfl_down(acc, off);
+    if (tid == 0) y[row] = acc;
+}
+
+// ─── V1 B=16 shared-weight ───────────────────────────────────────────────────
+template <int BITS>
+__launch_bounds__(32, 8)
+__global__ void gemv_v1_b16(const char* __restrict__ A,
+                            const float* __restrict__ x,
+                            float* __restrict__ y,
+                            int M, int K) {
+    const int row = (int)blockIdx.x;
+    if (row >= M) return;
+    const int tid = (int)threadIdx.x;
+    const int gpr = K / 256;
+    constexpr int gb = BITS * 32 + 8;
+    const char* row_ptr = A + (long long)row * gpr * gb;
+    float acc[BATCH_B];
+#pragma unroll
+    for (int b = 0; b < BATCH_B; b++) acc[b] = 0.0f;
+    for (int g = 0; g < gpr; g++) {
+        const char* gp = row_ptr + g * gb;
+        const float sc = __builtin_bit_cast(float, *(const unsigned int*)(gp));
+        const float zp = __builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
         unsigned q[8];
         unpack8<BITS>((const unsigned char*)(gp + 8), tid, q);
         float w[8];
@@ -856,7 +1064,13 @@ static KernelB1 pick_b1(Fmt f, int bits) {
     if (f == Fmt::V2) {
         if (bits == 2) return gemv_v2_b1<2>;
         if (bits == 3) return gemv_v2_b1<3>;
-        return gemv_v2_b1<4>;
+        if (bits == 4) return gemv_v2_b1<4>;
+        if (bits == 5) return gemv_v2_b1<5>;
+        return gemv_v2_b1<6>;
+    }
+    if (f == Fmt::V1) {
+        if (bits == 5) return gemv_v1_b1<5>;
+        return gemv_v1_b1<6>;
     }
     if (f == Fmt::Lloyd) {
         if (bits == 2) return gemv_lloyd_b1<2>;
@@ -871,7 +1085,13 @@ static KernelB16 pick_b16(Fmt f, int bits) {
     if (f == Fmt::V2) {
         if (bits == 2) return gemv_v2_b16<2>;
         if (bits == 3) return gemv_v2_b16<3>;
-        return gemv_v2_b16<4>;
+        if (bits == 4) return gemv_v2_b16<4>;
+        if (bits == 5) return gemv_v2_b16<5>;
+        return gemv_v2_b16<6>;
+    }
+    if (f == Fmt::V1) {
+        if (bits == 5) return gemv_v1_b16<5>;
+        return gemv_v1_b16<6>;
     }
     if (f == Fmt::Lloyd) {
         if (bits == 2) return gemv_lloyd_b16<2>;
@@ -931,14 +1151,17 @@ static void print_help(const char* argv0) {
         "Usage: %s [--help] [M] [K]\n"
         "\n"
         "Matched gfx1201 HIP microbenchmark for MQ low-bit decode kernels.\n"
-        "Reports 3 bits × 3 formats × 2 regimes (B=1 decode GEMV, B=16 shared-weight).\n"
+        "Reports 2/3/4-bit × {V2,Lloyd,MFP} + 5/6-bit × {V1,V2}, each at B=1 and B=16.\n"
         "\n"
         "Formats:\n"
         "  V2     dual-G128 fp16 s/z + packed payload (bits*32+8 B/G256)\n"
-        "         MQ4V2 = production; MQ2V2/MQ3V2 = HYPOTHETICAL\n"
+        "         MQ4V2 = production; MQ2V2/MQ3V2 = HYPOTHETICAL; MQ5V2/MQ6V2 = hyp\n"
+        "  V1     f32 scale+zero per G256 + same payload at +8 (prod HFQ5/HFQ6)\n"
+        "         MQ5-v1=168 B/G256, MQ6-v1=200 B/G256 (neutral size vs V2)\n"
         "  Lloyd  2^bits fp16 centroids + packed payload (production MQ2/3/4L)\n"
         "  MFP-E8 row hdr16 + G32 blocks of 1+4*bits B, E4M3 scale, E8 lattice\n"
         "         centers {2,4,7}, QUANT_STEP {3.8,1.8,0.88} for bits {2,3,4}\n"
+        "  Pack   5b=8vals/5B, 6b=4vals/3B (legacy production byte layout)\n"
         "\n"
         "Regimes:\n"
         "  B=1    decode GEMV (one activation row)\n"
@@ -976,11 +1199,12 @@ int main(int argc, char** argv) {
     std::printf("GPU: %s  arch-target: gfx1201  M=%d K=%d\n", prop.name, M, K);
     std::printf("Warmup=%d  Samples=%d (HIP events, interleaved)\n", kWarmup, kSamples);
     std::printf("B=16 = shared-weight format/decode microbench (NOT production WMMA)\n");
-    std::printf("MQ2V2/MQ3V2 = HYPOTHETICAL; MQ4V2 and MQ2/3/4 Lloyd + MFP*E8 = production layouts\n\n");
+    std::printf("MQ2V2/MQ3V2 = HYPOTHETICAL; MQ4V2 and MQ2/3/4 Lloyd + MFP*E8 = production layouts\n");
+    std::printf("MQ5-v1/MQ6-v1 = production HFQ5/HFQ6 f32 header; MQ5V2/MQ6V2 = dual-G128 fp16 hyp\n\n");
 
     // ── Build arms ──────────────────────────────────────────────────────────
     std::vector<Arm> arms;
-    arms.reserve(18);
+    arms.reserve(26); // 18 (2/3/4×3×2) + 8 (5/6×V1/V2×2)
     const Fmt fmts[3] = {Fmt::V2, Fmt::Lloyd, Fmt::MfpE8};
     const int bits_list[3] = {2, 3, 4};
     const int B_list[2] = {1, 16};
@@ -1032,107 +1256,154 @@ int main(int argc, char** argv) {
         }
     }
 
+    // 5/6-bit V1 (legacy f32 header) vs V2 (dual-G128 fp16) — neutral-size pair.
+    const int hi_bits[2] = {5, 6};
+    const Fmt hi_fmts[2] = {Fmt::V1, Fmt::V2};
+    for (int bits : hi_bits) {
+        std::vector<uint8_t> p1, p2;
+        pack_v1(p1, bits, M, K, 0x51B00000ull + (uint64_t)bits * 29);
+        pack_v2(p2, bits, M, K, 0xBEEF0000ull + (uint64_t)bits * 17);
+        const std::vector<uint8_t>* packs[2] = {&p1, &p2};
+        for (int fi = 0; fi < 2; fi++) {
+            const Fmt fmt = hi_fmts[fi];
+            char* dA = nullptr;
+            const size_t nbytes = packs[fi]->size();
+            CK(hipMalloc(&dA, nbytes));
+            CK(hipMemcpy(dA, packs[fi]->data(), nbytes, hipMemcpyHostToDevice));
+            for (int B : B_list) {
+                Arm a;
+                a.fmt = fmt;
+                a.bits = bits;
+                a.B = B;
+                a.regime = (B == 1) ? "B1-decode" : "B16-shared-wt";
+                a.wbytes = weight_bytes(fmt, bits, M, K);
+                a.dA = dA;
+                a.dX = (B == 1) ? dX1 : dX16;
+                const size_t ybytes = (size_t)B * (size_t)M * sizeof(float);
+                CK(hipMalloc(&a.dY, ybytes));
+                CK(hipMemset(a.dY, 0, ybytes));
+                a.k1 = pick_b1(fmt, bits);
+                a.k16 = pick_b16(fmt, bits);
+                a.samples_us.reserve(kSamples);
+                arms.push_back(a);
+            }
+        }
+    }
+
 
     // ── Correctness: sentinel host vs device ────────────────────────────────
     bool pass = true;
     std::printf("--- correctness (sentinel M=%d K=%d) ---\n", kSentinelM, kSentinelK);
-    for (int bits : bits_list) {
-        for (int fi = 0; fi < 3; fi++) {
-            const Fmt fmt = fmts[fi];
-            std::vector<uint8_t> pk;
-            if (fmt == Fmt::V2) pack_v2(pk, bits, kSentinelM, kSentinelK, 0x51ull + bits);
+
+    auto run_sentinel = [&](Fmt fmt, int bits) {
+        std::vector<uint8_t> pk;
+        if (fmt == Fmt::V2)
+            pack_v2(pk, bits, kSentinelM, kSentinelK, 0x51ull + (unsigned)bits);
+        else if (fmt == Fmt::V1)
+            pack_v1(pk, bits, kSentinelM, kSentinelK, 0x54ull + (unsigned)bits);
+        else if (fmt == Fmt::Lloyd)
+            pack_lloyd(pk, bits, kSentinelM, kSentinelK, 0x52ull + (unsigned)bits);
+        else
+            pack_mfp(pk, bits, kSentinelM, kSentinelK, 0x53ull + (unsigned)bits);
+
+        std::vector<float> hXsent((size_t)kBatchB * kSentinelK);
+        {
+            uint64_t rng = 0xC0FFEEull + (unsigned)bits + 17u * (unsigned)fmt;
+            for (auto& v : hXsent) v = lcg_finite(&rng, -0.5f, 0.5f);
+        }
+        for (int B : B_list) {
+            std::vector<float> href((size_t)B * kSentinelM, 0.f);
+            if (fmt == Fmt::V2)
+                host_gemv_v2(pk.data(), hXsent.data(), href.data(), bits,
+                             kSentinelM, kSentinelK, B);
+            else if (fmt == Fmt::V1)
+                host_gemv_v1(pk.data(), hXsent.data(), href.data(), bits,
+                             kSentinelM, kSentinelK, B);
             else if (fmt == Fmt::Lloyd)
-                pack_lloyd(pk, bits, kSentinelM, kSentinelK, 0x52ull + bits);
+                host_gemv_lloyd(pk.data(), hXsent.data(), href.data(), bits,
+                                kSentinelM, kSentinelK, B);
             else
-                pack_mfp(pk, bits, kSentinelM, kSentinelK, 0x53ull + bits);
+                host_gemv_mfp(pk.data(), hXsent.data(), href.data(), bits,
+                              kSentinelM, kSentinelK, B);
 
-            std::vector<float> hXsent((size_t)kBatchB * kSentinelK);
-            {
-                uint64_t rng = 0xC0FFEEull + (unsigned)bits;
-                for (auto& v : hXsent) v = lcg_finite(&rng, -0.5f, 0.5f);
+            if (!all_finite(href.data(), href.size())) {
+                std::printf("FAIL %s B=%d host non-finite\n", fmt_name(fmt, bits), B);
+                pass = false;
+                continue;
             }
-            for (int B : B_list) {
-                std::vector<float> href((size_t)B * kSentinelM, 0.f);
-                if (fmt == Fmt::V2)
-                    host_gemv_v2(pk.data(), hXsent.data(), href.data(), bits,
-                                 kSentinelM, kSentinelK, B);
-                else if (fmt == Fmt::Lloyd)
-                    host_gemv_lloyd(pk.data(), hXsent.data(), href.data(), bits,
-                                    kSentinelM, kSentinelK, B);
-                else
-                    host_gemv_mfp(pk.data(), hXsent.data(), href.data(), bits,
-                                  kSentinelM, kSentinelK, B);
 
-                if (!all_finite(href.data(), href.size())) {
-                    std::printf("FAIL %s B=%d host non-finite\n", fmt_name(fmt, bits), B);
-                    pass = false;
-                    continue;
+            char* dA = nullptr;
+            float *dXs = nullptr, *dYs = nullptr;
+            CK(hipMalloc(&dA, pk.size()));
+            CK(hipMemcpy(dA, pk.data(), pk.size(), hipMemcpyHostToDevice));
+            CK(hipMalloc(&dXs, (size_t)B * kSentinelK * sizeof(float)));
+            CK(hipMemcpy(dXs, hXsent.data(),
+                         (size_t)B * kSentinelK * sizeof(float),
+                         hipMemcpyHostToDevice));
+            CK(hipMalloc(&dYs, (size_t)B * kSentinelM * sizeof(float)));
+            CK(hipMemset(dYs, 0, (size_t)B * kSentinelM * sizeof(float)));
+
+            if (B == 1)
+                pick_b1(fmt, bits)<<<kSentinelM, 32>>>(dA, dXs, dYs,
+                                                       kSentinelM, kSentinelK);
+            else
+                pick_b16(fmt, bits)<<<kSentinelM, 32>>>(dA, dXs, dYs,
+                                                        kSentinelM, kSentinelK);
+            CK(hipGetLastError());
+            CK(hipDeviceSynchronize());
+
+            std::vector<float> hdev(href.size());
+            CK(hipMemcpy(hdev.data(), dYs, hdev.size() * sizeof(float),
+                         hipMemcpyDeviceToHost));
+
+            if (!all_finite(hdev.data(), hdev.size())) {
+                std::printf("FAIL %s B=%d device non-finite\n",
+                            fmt_name(fmt, bits), B);
+                pass = false;
+            } else {
+                double max_abs = 0.0, max_rel = 0.0;
+                for (size_t i = 0; i < href.size(); i++) {
+                    const double d = std::fabs((double)hdev[i] - (double)href[i]);
+                    max_abs = std::max(max_abs, d);
+                    const double denom =
+                        std::max(1e-6, std::fabs((double)href[i]));
+                    max_rel = std::max(max_rel, d / denom);
                 }
-
-                char* dA = nullptr;
-                float *dXs = nullptr, *dYs = nullptr;
-                CK(hipMalloc(&dA, pk.size()));
-                CK(hipMemcpy(dA, pk.data(), pk.size(), hipMemcpyHostToDevice));
-                CK(hipMalloc(&dXs, (size_t)B * kSentinelK * sizeof(float)));
-                CK(hipMemcpy(dXs, hXsent.data(),
-                             (size_t)B * kSentinelK * sizeof(float),
-                             hipMemcpyHostToDevice));
-                CK(hipMalloc(&dYs, (size_t)B * kSentinelM * sizeof(float)));
-                CK(hipMemset(dYs, 0, (size_t)B * kSentinelM * sizeof(float)));
-
-                if (B == 1)
-                    pick_b1(fmt, bits)<<<kSentinelM, 32>>>(dA, dXs, dYs,
-                                                           kSentinelM, kSentinelK);
-                else
-                    pick_b16(fmt, bits)<<<kSentinelM, 32>>>(dA, dXs, dYs,
-                                                            kSentinelM, kSentinelK);
-                CK(hipGetLastError());
-                CK(hipDeviceSynchronize());
-
-                std::vector<float> hdev(href.size());
-                CK(hipMemcpy(hdev.data(), dYs, hdev.size() * sizeof(float),
-                             hipMemcpyDeviceToHost));
-
-                if (!all_finite(hdev.data(), hdev.size())) {
-                    std::printf("FAIL %s B=%d device non-finite\n",
-                                fmt_name(fmt, bits), B);
+                // FP reduction order can differ slightly; tight but tolerant.
+                const bool ok = max_abs < 1e-3 || max_rel < 1e-4;
+                if (!ok) {
+                    std::printf(
+                        "FAIL %s B=%d mismatch max_abs=%.3e max_rel=%.3e\n",
+                        fmt_name(fmt, bits), B, max_abs, max_rel);
                     pass = false;
                 } else {
-                    double max_abs = 0.0, max_rel = 0.0;
-                    for (size_t i = 0; i < href.size(); i++) {
-                        const double d = std::fabs((double)hdev[i] - (double)href[i]);
-                        max_abs = std::max(max_abs, d);
-                        const double denom =
-                            std::max(1e-6, std::fabs((double)href[i]));
-                        max_rel = std::max(max_rel, d / denom);
-                    }
-                    // FP reduction order can differ slightly; tight but tolerant.
-                    const bool ok = max_abs < 1e-3 || max_rel < 1e-4;
-                    if (!ok) {
-                        std::printf(
-                            "FAIL %s B=%d mismatch max_abs=%.3e max_rel=%.3e\n",
-                            fmt_name(fmt, bits), B, max_abs, max_rel);
+                    const uint64_t cs = checksum_finite(hdev.data(), hdev.size());
+                    if (cs == 0) {
+                        std::printf("FAIL %s B=%d checksum\n",
+                                    fmt_name(fmt, bits), B);
                         pass = false;
                     } else {
-                        const uint64_t cs = checksum_finite(hdev.data(), hdev.size());
-                        if (cs == 0) {
-                            std::printf("FAIL %s B=%d checksum\n",
-                                        fmt_name(fmt, bits), B);
-                            pass = false;
-                        } else {
-                            std::printf(
-                                "PASS %s B=%d  max_abs=%.3e  csum=0x%016llx\n",
-                                fmt_name(fmt, bits), B, max_abs,
-                                (unsigned long long)cs);
-                        }
+                        std::printf(
+                            "PASS %s B=%d  max_abs=%.3e  csum=0x%016llx\n",
+                            fmt_name(fmt, bits), B, max_abs,
+                            (unsigned long long)cs);
                     }
                 }
-                hipFree(dA);
-                hipFree(dXs);
-                hipFree(dYs);
             }
+            hipFree(dA);
+            hipFree(dXs);
+            hipFree(dYs);
         }
-    }
+    };
+
+    // Existing 2/3/4 arms (labels unchanged).
+    for (int bits : bits_list)
+        for (int fi = 0; fi < 3; fi++)
+            run_sentinel(fmts[fi], bits);
+    // New 5/6-bit V1/V2 arms.
+    for (int bits : hi_bits)
+        for (int fi = 0; fi < 2; fi++)
+            run_sentinel(hi_fmts[fi], bits);
     if (!pass) {
         std::printf("\nCORRECTNESS: FAIL\n");
         return 1;
@@ -1232,7 +1503,7 @@ int main(int argc, char** argv) {
     }
     std::printf("\nchecksum_sink=0x%016llx  (anti-DCE)\n",
                 (unsigned long long)sink);
-    std::printf("arms=%zu  (expect 18 = 3 bits × 3 formats × 2 regimes)\n",
+    std::printf("arms=%zu  (expect 26 = 18 base + 8 from 5/6×{V1,V2}×{B1,B16})\n",
                 arms.size());
     std::printf("CORRECTNESS: PASS\n");
 

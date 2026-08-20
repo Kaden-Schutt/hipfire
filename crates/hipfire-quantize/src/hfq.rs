@@ -82,6 +82,10 @@ impl QuantType {
             41 => Some(Self::BQ1G128),
             44 => Some(Self::MQ4G256V2),
             45 => Some(Self::MQ4CG256),
+            47 => Some(Self::MQ6G256V2),
+            48 => Some(Self::MQ5G256V2),
+            49 => Some(Self::MQ3G256V2),
+            50 => Some(Self::MQ2G256V2),
             _ => None,
         }
     }
@@ -197,6 +201,20 @@ pub(crate) enum QuantType {
     /// Header is ONE packed dword, low 16 bits fp16 scale, high 16 bits fp16 zero, governing
     /// all 256 weights (`w = q * f32(scale) + f32(zero)` with scale/zero round-tripped through fp16).
     MQ4CG256 = 45,
+    /// MQ6G256V2 (qt=47): FWHT-rotated 6-bit, per-128 asymmetric fp16 header. 200 B/group (6b 4/3B payload).
+    /// Layout: [0..2) fp16 s0, [2..4) fp16 z0, [4..6) fp16 s1, [6..8) fp16 z1, [8..200) 192 B packed 6-bit.
+    /// Half 0 covers q[0..128), half 1 q[128..256); reconstruction q*f32(s[h])+f32(z[h]).
+    MQ6G256V2 = 47,
+    /// MQ5G256V2 (qt=48): FWHT-rotated 5-bit, per-128 asymmetric fp16 header. 168 B/group (5b 8/5B payload).
+    /// Layout: [0..2) fp16 s0, [2..4) fp16 z0, [4..6) fp16 s1, [6..8) fp16 z1, [8..168) 160 B packed 5-bit.
+    MQ5G256V2 = 48,
+    /// MQ3G256V2 (qt=49): FWHT-rotated 3-bit, per-128 asymmetric fp16 header. 104 B/group (3b 8/3B payload).
+    /// Layout: [0..2) fp16 s0, [2..4) fp16 z0, [4..6) fp16 s1, [6..8) fp16 z1, [8..104) 96 B packed 3-bit.
+    MQ3G256V2 = 49,
+    /// MQ2G256V2 (qt=50): FWHT-rotated 2-bit, per-128 asymmetric fp16 header. 72 B/group (2b 4/B payload).
+    /// Layout: [0..2) fp16 s0, [2..4) fp16 z0, [4..6) fp16 s1, [6..8) fp16 z1, [8..72) 64 B packed 2-bit.
+    /// Half 0 covers q[0..128), half 1 q[128..256); degenerate half uses scale=0, zero=f16(lo), q=0.
+    MQ2G256V2 = 50,
 }
 
 /// Per-tensor precision level assigned by the K-map pre-pass.
@@ -236,6 +254,9 @@ pub(crate) fn default_promote_target(base: GgufFormat) -> GgufFormat {
         | GgufFormat::Mq2Lloyd
         | GgufFormat::Mq3Lloyd
         | GgufFormat::Mq4Lloyd => GgufFormat::Mq6,
+        GgufFormat::Mq2V2 | GgufFormat::Mq3V2 | GgufFormat::Mq5V2 | GgufFormat::Mq6V2 => {
+            GgufFormat::Mq6V2
+        }
         GgufFormat::Hfq4 | GgufFormat::Hfq6 => GgufFormat::Hfq6,
         GgufFormat::Hfp4 => GgufFormat::Hfp4,
         GgufFormat::Mfp4 => GgufFormat::Mfp4,
@@ -255,7 +276,6 @@ pub(crate) fn default_promote_target(base: GgufFormat) -> GgufFormat {
 /// upward-in-bit-width pairings. Cross-family (MQ↔HFQ, MQ↔HFP) and
 /// downward-in-bits promotions are rejected at parse time.
 pub(crate) fn is_promote_pair_supported(base: GgufFormat, promote: GgufFormat) -> bool {
-    use crate::pipeline_gguf::GgufFormat::*;
     if base == promote {
         return true; // no-op promotion is always safe
     }
@@ -265,17 +285,37 @@ pub(crate) fn is_promote_pair_supported(base: GgufFormat, promote: GgufFormat) -
         // mixed-format dispatch has no runtime support today; the plan's
         // "Future expansion" section targets the MQ2-Lloyd + MQ3-Lloyd pair
         // specifically. Tightened per combined-review finding G2.
-        (Mq2Lloyd, Mq3Lloyd) => true,
-        (Mq2Lloyd | Mq3Lloyd, _) => false,
-        (_, Mq2Lloyd | Mq3Lloyd) => false,
-
+        (GgufFormat::Mq2Lloyd, GgufFormat::Mq3Lloyd) => true,
+        (GgufFormat::Mq2Lloyd | GgufFormat::Mq3Lloyd, _) => false,
+        (_, GgufFormat::Mq2Lloyd | GgufFormat::Mq3Lloyd) => false,
         // MQ-family upward bit-width (non-Lloyd)
-        (Mq2, Mq3 | Mq4 | Mq4V2 | Mq4C | Mq5 | Mq6) => true,
-        (Mq3, Mq4 | Mq4V2 | Mq4C | Mq5 | Mq6) => true,
-        (Mq4 | Mq4V2 | Mq4C, Mq5 | Mq6) => true,
-        (Mq5, Mq6) => true,
+        (
+            GgufFormat::Mq2,
+            GgufFormat::Mq3
+            | GgufFormat::Mq4
+            | GgufFormat::Mq4V2
+            | GgufFormat::Mq4C
+            | GgufFormat::Mq5
+            | GgufFormat::Mq6,
+        ) => true,
+        (
+            GgufFormat::Mq3,
+            GgufFormat::Mq4
+            | GgufFormat::Mq4V2
+            | GgufFormat::Mq4C
+            | GgufFormat::Mq5
+            | GgufFormat::Mq6,
+        ) => true,
+        (
+            GgufFormat::Mq4 | GgufFormat::Mq4V2 | GgufFormat::Mq4C,
+            GgufFormat::Mq5 | GgufFormat::Mq6,
+        ) => true,
+        (GgufFormat::Mq5, GgufFormat::Mq6) => true,
+        (GgufFormat::Mq2V2, GgufFormat::Mq3V2 | GgufFormat::Mq5V2 | GgufFormat::Mq6V2) => true,
+        (GgufFormat::Mq3V2, GgufFormat::Mq5V2 | GgufFormat::Mq6V2) => true,
+        (GgufFormat::Mq5V2, GgufFormat::Mq6V2) => true,
         // HFQ-family upward bit-width
-        (Hfq4, Hfq6) => true,
+        (GgufFormat::Hfq4, GgufFormat::Hfq6) => true,
 
         // Everything else: explicitly not in the supported matrix.
         // Cross-family (MQ↔HFQ↔FP4) rejected — runtime mixed-format dispatch

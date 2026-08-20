@@ -1337,13 +1337,16 @@ pub fn weight_gemv_residual(
             )
             .map_err(|e| hip_bridge::HipError::new(0, &e.to_string())),
         DType::MQ6G256
+        | DType::MQ6G256V2
+        | DType::MQ5G256V2
         | DType::MQ4G256
         | DType::MQ4G256V2
         | DType::MQ4CG256
         | DType::MQ3G256
+        | DType::MQ3G256V2
+        | DType::MQ2G256V2
         | DType::MQ3G256Lloyd
         | DType::MQ4G256Lloyd => {
-            gpu.ensure_mq_signs()?;
             let xr = GpuTensor {
                 buf: unsafe { gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias() },
                 shape: vec![gpu.scratch.mq_x_rot.as_ref().unwrap().buf.size() / 4],
@@ -1411,13 +1414,16 @@ pub fn weight_gemv_swiglu_residual(
         rotation: None,
         awq_scale: None,
     };
-
     match w_down.gpu_dtype {
         DType::MQ4G256
         | DType::MQ4G256V2
         | DType::MQ4CG256
-        | DType::MQ3G256
         | DType::MQ6G256
+        | DType::MQ6G256V2
+        | DType::MQ5G256V2
+        | DType::MQ3G256
+        | DType::MQ3G256V2
+        | DType::MQ2G256V2
         | DType::MQ3G256Lloyd
         | DType::MQ4G256Lloyd => {
             gpu.ensure_mq_signs()?;
@@ -1516,6 +1522,38 @@ pub fn weight_gemm(
             let x_rot = gpu.alloc_tensor(&[batch_size, w.k], DType::F32)?;
             rotate_x_mq_batched_for(gpu, w, x, &x_rot, w.k, batch_size)?;
             let r = gpu.gemm_mq4cg256_batched_lmhead(&w.buf, &x_rot, y, w.m, w.k, batch_size);
+            gpu.free_tensor(x_rot)?;
+            r
+        }
+        DType::MQ6G256V2 => {
+            gpu.ensure_mq_signs()?;
+            let x_rot = gpu.alloc_tensor(&[batch_size, w.k], DType::F32)?;
+            rotate_x_mq_batched_for(gpu, w, x, &x_rot, w.k, batch_size)?;
+            let r = gpu.gemm_mq6g256v2_batched_lmhead(&w.buf, &x_rot, y, w.m, w.k, batch_size);
+            gpu.free_tensor(x_rot)?;
+            r
+        }
+        DType::MQ5G256V2 => {
+            gpu.ensure_mq_signs()?;
+            let x_rot = gpu.alloc_tensor(&[batch_size, w.k], DType::F32)?;
+            rotate_x_mq_batched_for(gpu, w, x, &x_rot, w.k, batch_size)?;
+            let r = gpu.gemm_mq5g256v2_batched_lmhead(&w.buf, &x_rot, y, w.m, w.k, batch_size);
+            gpu.free_tensor(x_rot)?;
+            r
+        }
+        DType::MQ3G256V2 => {
+            gpu.ensure_mq_signs()?;
+            let x_rot = gpu.alloc_tensor(&[batch_size, w.k], DType::F32)?;
+            rotate_x_mq_batched_for(gpu, w, x, &x_rot, w.k, batch_size)?;
+            let r = gpu.gemm_mq3g256v2_batched_lmhead(&w.buf, &x_rot, y, w.m, w.k, batch_size);
+            gpu.free_tensor(x_rot)?;
+            r
+        }
+        DType::MQ2G256V2 => {
+            gpu.ensure_mq_signs()?;
+            let x_rot = gpu.alloc_tensor(&[batch_size, w.k], DType::F32)?;
+            rotate_x_mq_batched_for(gpu, w, x, &x_rot, w.k, batch_size)?;
+            let r = gpu.gemm_mq2g256v2_batched_lmhead(&w.buf, &x_rot, y, w.m, w.k, batch_size);
             gpu.free_tensor(x_rot)?;
             r
         }
@@ -1840,8 +1878,16 @@ pub fn is_batchable_la(dt: DType, arch: &str) -> bool {
     // on gfx12 (gfx1200/gfx1201). Outside gfx12, fall back to per-token decode
     // rather than dispatching a gfx12 WMMA kernel. Lockstep with
     // qwen35::is_batchable_la (qt44/qt45).
-    let mq4_v2_gfx12 =
-        matches!(dt, DType::MQ4G256V2 | DType::MQ4CG256) && matches!(arch, "gfx1200" | "gfx1201");
+    // Extended to neutral V2 family qt47-50.
+    let mq4_v2_gfx12 = matches!(
+        dt,
+        DType::MQ4G256V2
+            | DType::MQ4CG256
+            | DType::MQ6G256V2
+            | DType::MQ5G256V2
+            | DType::MQ3G256V2
+            | DType::MQ2G256V2
+    ) && matches!(arch, "gfx1200" | "gfx1201");
     wmma_only || mq3_gfx10_scalar || mq4_v2_gfx12
 }
 
@@ -8226,6 +8272,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn is_batchable_la_v2_family_gfx12_only() {
+        for arch in ["gfx1200", "gfx1201"] {
+            assert!(is_batchable_la(DType::MQ6G256V2, arch), "MQ6V2 gfx12");
+            assert!(is_batchable_la(DType::MQ5G256V2, arch), "MQ5V2 gfx12");
+            assert!(is_batchable_la(DType::MQ3G256V2, arch), "MQ3V2 gfx12");
+            assert!(is_batchable_la(DType::MQ2G256V2, arch), "MQ2V2 gfx12");
+        }
+        for arch in ["gfx1010", "gfx1100", "gfx942"] {
+            assert!(!is_batchable_la(DType::MQ6G256V2, arch), "MQ6V2 fallback");
+            assert!(!is_batchable_la(DType::MQ5G256V2, arch), "MQ5V2 fallback");
+            assert!(!is_batchable_la(DType::MQ3G256V2, arch), "MQ3V2 fallback");
+            assert!(!is_batchable_la(DType::MQ2G256V2, arch), "MQ2V2 fallback");
+        }
+        assert_ne!(DType::MQ6G256, DType::MQ6G256V2);
+        assert_ne!(DType::MQ3G256, DType::MQ3G256V2);
+        assert_eq!(rdna_compute::MQ6G256V2_GROUP_BYTES, 200);
+        assert_eq!(rdna_compute::MQ5G256V2_GROUP_BYTES, 168);
+        assert_eq!(rdna_compute::MQ3G256V2_GROUP_BYTES, 104);
+        assert_eq!(rdna_compute::MQ2G256V2_GROUP_BYTES, 72);
+    }
     #[test]
     fn is_batchable_la_mq3_wmma_only() {
         // MQ3 batchable on WMMA archs (gfx11/gfx12) via the WMMA path, and on

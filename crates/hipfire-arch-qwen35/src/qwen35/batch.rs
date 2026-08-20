@@ -698,6 +698,10 @@ impl Qwen35DecodeBatchState {
                 | DType::MQ4G256
                 | DType::MQ4G256V2
                 | DType::MQ4CG256
+                | DType::MQ6G256V2
+                | DType::MQ5G256V2
+                | DType::MQ3G256V2
+                | DType::MQ2G256V2
                 | DType::HFQ6G256
                 | DType::MQ6G256
                 | DType::MQ3G256
@@ -1395,6 +1399,62 @@ pub(crate) fn lm_head_batched(
             run_plain_gemm_key(
                 gpu,
                 hipfire_dispatch::types::KernelKey::GemmMq4CG256BatchedLmhead,
+                &output.buf,
+                output.gpu_dtype,
+                rot,
+                logits,
+                output.m,
+                output.k,
+                batch_size,
+            )
+        }
+        DType::MQ6G256V2 => {
+            llama::rotate_x_mq_batched_for(gpu, output, hidden, rot, output.k, batch_size)?;
+            run_plain_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmMq6G256V2BatchedLmhead,
+                &output.buf,
+                output.gpu_dtype,
+                rot,
+                logits,
+                output.m,
+                output.k,
+                batch_size,
+            )
+        }
+        DType::MQ5G256V2 => {
+            llama::rotate_x_mq_batched_for(gpu, output, hidden, rot, output.k, batch_size)?;
+            run_plain_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmMq5G256V2BatchedLmhead,
+                &output.buf,
+                output.gpu_dtype,
+                rot,
+                logits,
+                output.m,
+                output.k,
+                batch_size,
+            )
+        }
+        DType::MQ3G256V2 => {
+            llama::rotate_x_mq_batched_for(gpu, output, hidden, rot, output.k, batch_size)?;
+            run_plain_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmMq3G256V2BatchedLmhead,
+                &output.buf,
+                output.gpu_dtype,
+                rot,
+                logits,
+                output.m,
+                output.k,
+                batch_size,
+            )
+        }
+        DType::MQ2G256V2 => {
+            llama::rotate_x_mq_batched_for(gpu, output, hidden, rot, output.k, batch_size)?;
+            run_plain_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmMq2G256V2BatchedLmhead,
                 &output.buf,
                 output.gpu_dtype,
                 rot,

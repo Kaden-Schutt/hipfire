@@ -358,10 +358,58 @@ pub fn populate(registry: &mut KernelRegistry) {
         has_awq: false,
         tile: TileImpl::None,
     });
-    // Explicit MQ4G256V2/MQ4CG256 GEMM keys are gfx12-only (WMMA sources).
+    // Explicit MQ4G256V2/MQ3G256V2/MQ2G256V2/MQ4CG256 GEMM keys are gfx12-only (WMMA sources).
     // Cross-RDNA scalar decode lives in fused/GEMV families, not here.
     registry.register(KernelVariant {
+        key: KernelKey::GemmMq6G256V2,
+        arch_required: ArchPredicate::HasWmmaGfx12,
+        shape_gate: None,
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
+        tile: TileImpl::None,
+    });
+    registry.register(KernelVariant {
+        key: KernelKey::GemmMq5G256V2,
+        arch_required: ArchPredicate::HasWmmaGfx12,
+        shape_gate: None,
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
+        tile: TileImpl::None,
+    });
+    registry.register(KernelVariant {
         key: KernelKey::GemmMq4G256V2,
+        arch_required: ArchPredicate::HasWmmaGfx12,
+        shape_gate: None,
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
+        tile: TileImpl::None,
+    });
+    registry.register(KernelVariant {
+        key: KernelKey::GemmMq3G256V2,
+        arch_required: ArchPredicate::HasWmmaGfx12,
+        shape_gate: None,
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
+        tile: TileImpl::None,
+    });
+    registry.register(KernelVariant {
+        key: KernelKey::GemmMq2G256V2,
+        arch_required: ArchPredicate::HasWmmaGfx12,
+        shape_gate: None,
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
+        tile: TileImpl::None,
+    });
+    registry.register(KernelVariant {
+        key: KernelKey::GemmMq6G256V2Residual,
+        arch_required: ArchPredicate::HasWmmaGfx12,
+        shape_gate: None,
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
+        tile: TileImpl::None,
+    });
+    registry.register(KernelVariant {
+        key: KernelKey::GemmMq5G256V2Residual,
         arch_required: ArchPredicate::HasWmmaGfx12,
         shape_gate: None,
         steps: &[PipelineOp::Gemv],
@@ -377,7 +425,55 @@ pub fn populate(registry: &mut KernelRegistry) {
         tile: TileImpl::None,
     });
     registry.register(KernelVariant {
+        key: KernelKey::GemmMq3G256V2Residual,
+        arch_required: ArchPredicate::HasWmmaGfx12,
+        shape_gate: None,
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
+        tile: TileImpl::None,
+    });
+    registry.register(KernelVariant {
+        key: KernelKey::GemmMq2G256V2Residual,
+        arch_required: ArchPredicate::HasWmmaGfx12,
+        shape_gate: None,
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
+        tile: TileImpl::None,
+    });
+    registry.register(KernelVariant {
+        key: KernelKey::GemmMq6G256V2BatchedLmhead,
+        arch_required: ArchPredicate::HasWmmaGfx12,
+        shape_gate: None,
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
+        tile: TileImpl::None,
+    });
+    registry.register(KernelVariant {
+        key: KernelKey::GemmMq5G256V2BatchedLmhead,
+        arch_required: ArchPredicate::HasWmmaGfx12,
+        shape_gate: None,
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
+        tile: TileImpl::None,
+    });
+    registry.register(KernelVariant {
         key: KernelKey::GemmMq4G256V2BatchedLmhead,
+        arch_required: ArchPredicate::HasWmmaGfx12,
+        shape_gate: None,
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
+        tile: TileImpl::None,
+    });
+    registry.register(KernelVariant {
+        key: KernelKey::GemmMq3G256V2BatchedLmhead,
+        arch_required: ArchPredicate::HasWmmaGfx12,
+        shape_gate: None,
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
+        tile: TileImpl::None,
+    });
+    registry.register(KernelVariant {
+        key: KernelKey::GemmMq2G256V2BatchedLmhead,
         arch_required: ArchPredicate::HasWmmaGfx12,
         shape_gate: None,
         steps: &[PipelineOp::Gemv],

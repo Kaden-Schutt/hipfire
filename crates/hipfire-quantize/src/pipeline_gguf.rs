@@ -69,6 +69,10 @@ pub(crate) enum GgufFormat {
     Mq2Lloyd,
     Mq3Lloyd,
     Mq4Lloyd,
+    Mq6V2,
+    Mq5V2,
+    Mq3V2,
+    Mq2V2,
     Hfp4,      // HFP4G32 — RDNA-optimal FP4 (E2M1 + UE8M0 g32 + FP16 row scale)
     Mfp4,      // MFP4G32 — HFP4G32 + offline FWHT rotation (drop-in MQ4 replacement)
     Mfp4Lloyd, // mfp4 + per-tensor 16-entry Lloyd codebook
@@ -106,6 +110,10 @@ impl GgufFormat {
             "mq6" | "mq6g256" => Some(Self::Mq6),
             "mq3" | "mq3g256" => Some(Self::Mq3),
             "mq2" | "mq2g256" => Some(Self::Mq2),
+            "mq6v2" | "mq6g256v2" => Some(Self::Mq6V2),
+            "mq5v2" | "mq5g256v2" => Some(Self::Mq5V2),
+            "mq3v2" | "mq3g256v2" => Some(Self::Mq3V2),
+            "mq2v2" | "mq2g256v2" => Some(Self::Mq2V2),
             "mq2-lloyd" | "mq2g256-lloyd" | "mq2lloyd" => Some(Self::Mq2Lloyd),
             "mq3-lloyd" | "mq3g256-lloyd" | "mq3lloyd" => Some(Self::Mq3Lloyd),
             "mq4-lloyd" | "mq4g256-lloyd" | "mq4lloyd" => Some(Self::Mq4Lloyd),
@@ -134,6 +142,10 @@ impl GgufFormat {
             Self::Mq6 => "MQ6G256",
             Self::Mq3 => "MQ3G256",
             Self::Mq2 => "MQ2G256",
+            Self::Mq6V2 => "MQ6G256V2",
+            Self::Mq5V2 => "MQ5G256V2",
+            Self::Mq3V2 => "MQ3G256V2",
+            Self::Mq2V2 => "MQ2G256V2",
             Self::Mq2Lloyd => "MQ2G256Lloyd",
             Self::Mq3Lloyd => "MQ3G256Lloyd",
             Self::Mq4Lloyd => "MQ4G256Lloyd",
@@ -149,6 +161,23 @@ impl GgufFormat {
             Self::Binary => "BQ1G128",
         }
     }
+}
+
+/// True for MQ{2,3,5,6}V2 — dense-only formats (gfx1201 Qwen3.8).
+/// MoE GGUFs must not select these: expert packs are often non-2D and would
+/// silently fall through the GGUF `!is_2d` arm to F16.
+pub(crate) fn gguf_format_is_dense_only_mq_v2(format: GgufFormat) -> bool {
+    matches!(
+        format,
+        GgufFormat::Mq6V2 | GgufFormat::Mq5V2 | GgufFormat::Mq3V2 | GgufFormat::Mq2V2
+    )
+}
+
+/// MoE / MoE-like arch ids that reject dense-only MQ V2 formats on the GGUF path.
+/// Mirrors `is_moe_like` in `pipeline.rs` (qwen MoE, deepseek4, minimax, lfm2,
+/// cohere2moe, gemma4).
+pub(crate) fn gguf_arch_is_moe_like(arch_id: u32) -> bool {
+    matches!(arch_id, 6 | 9 | 10 | 11 | 12 | 13)
 }
 
 /// Q1_0 on-disk layout == hipfire BQ1G128 layout: copy verbatim.
@@ -233,6 +262,8 @@ pub(crate) fn run_gguf_pipeline(
     // can reconstruct LlamaConfig at load time. Also keep the raw GGUF
     // metadata tree under `gguf_meta` for any consumer that wants original
     // values (chat template, vocab, scores, merges, etc.).
+    // Strict validation before worker threads — same parser as CLI.
+    crate::model_filter::validate_env_fixed_tier_or_exit();
     let config_json = config_json_from_gguf(&gguf, &arch_str);
     let metadata = serde_json::json!({
         "architecture": arch_str,
@@ -241,15 +272,20 @@ pub(crate) fn run_gguf_pipeline(
         "gguf_meta": gguf_meta_to_json(&gguf.metadata),
     });
     let metadata_json = serde_json::to_string(&metadata)?;
-
-    // FWHT signs — only used when --format is mq4/mq6. Same seed pair as the
     // safetensors path so the engine's runtime FWHT inverse stays identical.
     let needs_signs = matches!(
         format,
         GgufFormat::Mq4
+            | GgufFormat::Mq4V2
+            | GgufFormat::Mq4C
             | GgufFormat::Mq6
+            | GgufFormat::Mq6V2
+            | GgufFormat::Mq5
+            | GgufFormat::Mq5V2
             | GgufFormat::Mq3
+            | GgufFormat::Mq3V2
             | GgufFormat::Mq2
+            | GgufFormat::Mq2V2
             | GgufFormat::Mq2Lloyd
             | GgufFormat::Mq3Lloyd
             | GgufFormat::Mq4Lloyd
@@ -272,6 +308,15 @@ pub(crate) fn run_gguf_pipeline(
 
     // K-map setup for GGUF path
     let is_moe = arch_id == 6;
+    // MQ{2,3,5,6}V2 are dense-only. Reject every MoE GGUF before any tensor
+    // work or output write so non-2D expert packs cannot silently become F16.
+    if gguf_format_is_dense_only_mq_v2(format) && gguf_arch_is_moe_like(arch_id) {
+        eprintln!(
+            "error: --format mq{{2,3,5,6}}v2 is dense-only (gfx1201 Qwen3.8); MoE model (arch_id={arch_id}) is not supported with this format. Use legacy mq{{2,3,5,6}} or mq4/mq4v2/mq4c for MoE, or run on a dense checkpoint."
+        );
+        std::process::exit(2);
+    }
+
     let is_gemma4 = arch_id == 13;
     let n_layers: usize = config_json
         .get("num_hidden_layers")
@@ -369,6 +414,55 @@ pub(crate) fn run_gguf_pipeline(
             let q = quantize_q8f16(&f32_data);
             quant_params += n_elements as u64;
             (q, QuantType::Q8F16, 32u32, "Q8_F16")
+        } else if crate::model_filter::product_tier_cli().is_some_and(|t| {
+            crate::model_filter::q8_class_of(&out_name).is_some_and(|cls| t.lifts(cls))
+        }) {
+            // Product tier lift — respects per-class codec overrides (e.g. lm_head:mq6v2) and uses real encoder.
+            let f32_data = gguf_input::tensor_to_f32(info, raw);
+            quant_params += n_elements as u64;
+            if let Some(dt) = crate::model_filter::fixed_tier_dtype_for(&out_name) {
+                let m = info.shape[0] as usize;
+                let k = info.shape[1] as usize;
+                if k % 256 != 0 && matches!(dt, "mq2v2" | "mq3v2" | "mq4v2" | "mq5v2" | "mq6v2") {
+                    eprintln!(
+                        "error: fixed-tier dtype {dt} requires K%256==0 for {out_name} (K={k})"
+                    );
+                    std::process::exit(2);
+                }
+                match dt {
+                    "mq6v2" => {
+                        let q = quantize_mq6g256v2(&f32_data, m, k, &signs1, &signs2);
+                        (q, QuantType::MQ6G256V2, 256u32, "MQ6G256V2")
+                    }
+                    "mq5v2" => {
+                        let q = quantize_mq5g256v2(&f32_data, m, k, &signs1, &signs2);
+                        (q, QuantType::MQ5G256V2, 256u32, "MQ5G256V2")
+                    }
+                    "mq4v2" => {
+                        let q = quantize_mq4g256v2(&f32_data, m, k, &signs1, &signs2);
+                        (q, QuantType::MQ4G256V2, 256u32, "MQ4G256V2")
+                    }
+                    "mq3v2" => {
+                        let q = quantize_mq3g256v2(&f32_data, m, k, &signs1, &signs2);
+                        (q, QuantType::MQ3G256V2, 256u32, "MQ3G256V2")
+                    }
+                    "mq2v2" => {
+                        let q = quantize_mq2g256v2(&f32_data, m, k, &signs1, &signs2);
+                        (q, QuantType::MQ2G256V2, 256u32, "MQ2G256V2")
+                    }
+                    "mq4" => {
+                        let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
+                        (q, QuantType::MQ4G256, 256u32, "MQ4G256")
+                    }
+                    _ => {
+                        let q = quantize_q8f16(&f32_data);
+                        (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                    }
+                }
+            } else {
+                let q = quantize_q8f16(&f32_data);
+                (q, QuantType::Q8F16, 32u32, "Q8_F16")
+            }
         } else if matches!(format, GgufFormat::Ternary) && info.dtype == gguf_input::GgmlType::Q2_0
         {
             // TQ2G128 byte-verbatim passthrough wins over the kmap/Q8 rules
@@ -429,6 +523,12 @@ pub(crate) fn run_gguf_pipeline(
                 | GgufFormat::Mq6 => {
                     let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
                     (q, QuantType::MQ6G256, 256u32, "MQ6G256")
+                }
+                GgufFormat::Mq6V2 | GgufFormat::Mq5V2 | GgufFormat::Mq3V2 | GgufFormat::Mq2V2 => {
+                    let m = info.shape[0] as usize;
+                    let k = info.shape[1] as usize;
+                    let q = quantize_mq6g256v2(&f32_data, m, k, &signs1, &signs2);
+                    (q, QuantType::MQ6G256V2, 256u32, "MQ6G256V2")
                 }
                 GgufFormat::Hfq4 | GgufFormat::Hfq6 => {
                     let q = quantize_hfq6g256(&f32_data);
@@ -532,6 +632,30 @@ pub(crate) fn run_gguf_pipeline(
                 GgufFormat::Mq5 => {
                     let q = quantize_mq5g256(&f32_data, &signs1, &signs2);
                     (q, QuantType::MQ5G256, 256u32, "MQ5G256")
+                }
+                GgufFormat::Mq6V2 => {
+                    let m = info.shape[0] as usize;
+                    let k = info.shape[1] as usize;
+                    let q = quantize_mq6g256v2(&f32_data, m, k, &signs1, &signs2);
+                    (q, QuantType::MQ6G256V2, 256u32, "MQ6G256V2")
+                }
+                GgufFormat::Mq5V2 => {
+                    let m = info.shape[0] as usize;
+                    let k = info.shape[1] as usize;
+                    let q = quantize_mq5g256v2(&f32_data, m, k, &signs1, &signs2);
+                    (q, QuantType::MQ5G256V2, 256u32, "MQ5G256V2")
+                }
+                GgufFormat::Mq3V2 => {
+                    let m = info.shape[0] as usize;
+                    let k = info.shape[1] as usize;
+                    let q = quantize_mq3g256v2(&f32_data, m, k, &signs1, &signs2);
+                    (q, QuantType::MQ3G256V2, 256u32, "MQ3G256V2")
+                }
+                GgufFormat::Mq2V2 => {
+                    let m = info.shape[0] as usize;
+                    let k = info.shape[1] as usize;
+                    let q = quantize_mq2g256v2(&f32_data, m, k, &signs1, &signs2);
+                    (q, QuantType::MQ2G256V2, 256u32, "MQ2G256V2")
                 }
                 GgufFormat::Hfq4 => {
                     let q = quantize_hfq4g256(&f32_data);
@@ -644,6 +768,30 @@ pub(crate) fn run_gguf_pipeline(
                 GgufFormat::Mq6 => {
                     let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
                     (q, QuantType::MQ6G256, 256u32, "MQ6G256")
+                }
+                GgufFormat::Mq6V2 => {
+                    let m = info.shape[0] as usize;
+                    let k = info.shape[1] as usize;
+                    let q = quantize_mq6g256v2(&f32_data, m, k, &signs1, &signs2);
+                    (q, QuantType::MQ6G256V2, 256u32, "MQ6G256V2")
+                }
+                GgufFormat::Mq5V2 => {
+                    let m = info.shape[0] as usize;
+                    let k = info.shape[1] as usize;
+                    let q = quantize_mq5g256v2(&f32_data, m, k, &signs1, &signs2);
+                    (q, QuantType::MQ5G256V2, 256u32, "MQ5G256V2")
+                }
+                GgufFormat::Mq3V2 => {
+                    let m = info.shape[0] as usize;
+                    let k = info.shape[1] as usize;
+                    let q = quantize_mq3g256v2(&f32_data, m, k, &signs1, &signs2);
+                    (q, QuantType::MQ3G256V2, 256u32, "MQ3G256V2")
+                }
+                GgufFormat::Mq2V2 => {
+                    let m = info.shape[0] as usize;
+                    let k = info.shape[1] as usize;
+                    let q = quantize_mq2g256v2(&f32_data, m, k, &signs1, &signs2);
+                    (q, QuantType::MQ2G256V2, 256u32, "MQ2G256V2")
                 }
                 GgufFormat::Mq3 => {
                     let q = quantize_mq3g256(&f32_data, &signs1, &signs2);
@@ -795,4 +943,52 @@ pub(crate) fn dequantize_hfq_q8f16(data: &[u8], n_elements: usize) -> Result<Vec
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{gguf_arch_is_moe_like, gguf_format_is_dense_only_mq_v2, GgufFormat};
+
+    #[test]
+    fn dense_only_mq_v2_predicate_covers_four_formats() {
+        assert!(gguf_format_is_dense_only_mq_v2(GgufFormat::Mq6V2));
+        assert!(gguf_format_is_dense_only_mq_v2(GgufFormat::Mq5V2));
+        assert!(gguf_format_is_dense_only_mq_v2(GgufFormat::Mq3V2));
+        assert!(gguf_format_is_dense_only_mq_v2(GgufFormat::Mq2V2));
+        // siblings stay admitted for MoE
+        assert!(!gguf_format_is_dense_only_mq_v2(GgufFormat::Mq6));
+        assert!(!gguf_format_is_dense_only_mq_v2(GgufFormat::Mq5));
+        assert!(!gguf_format_is_dense_only_mq_v2(GgufFormat::Mq3));
+        assert!(!gguf_format_is_dense_only_mq_v2(GgufFormat::Mq2));
+        assert!(!gguf_format_is_dense_only_mq_v2(GgufFormat::Mq4V2));
+        assert!(!gguf_format_is_dense_only_mq_v2(GgufFormat::Mq4C));
+        assert!(!gguf_format_is_dense_only_mq_v2(GgufFormat::Hfq4));
+    }
+
+    #[test]
+    fn moe_like_archs_reject_mq_v2_dense_accepted() {
+        // Qwen MoE + other MoE-class arches
+        for arch in [6u32, 9, 10, 11, 12, 13] {
+            assert!(gguf_arch_is_moe_like(arch), "arch {arch}");
+            for fmt in [
+                GgufFormat::Mq6V2,
+                GgufFormat::Mq5V2,
+                GgufFormat::Mq3V2,
+                GgufFormat::Mq2V2,
+            ] {
+                assert!(
+                    gguf_format_is_dense_only_mq_v2(fmt) && gguf_arch_is_moe_like(arch),
+                    "must reject {fmt:?} on arch {arch}"
+                );
+            }
+        }
+        // dense GGUF arches unchanged (qwen3.5/3.8 dense=5, llama=1)
+        for arch in [1u32, 5, 7, 8, 14] {
+            assert!(!gguf_arch_is_moe_like(arch), "arch {arch} is dense");
+            assert!(
+                !(gguf_format_is_dense_only_mq_v2(GgufFormat::Mq6V2)
+                    && gguf_arch_is_moe_like(arch))
+            );
+        }
+    }
 }

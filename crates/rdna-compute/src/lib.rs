@@ -33,8 +33,9 @@ pub use compiler::KernelCompiler;
 pub use dispatch::{
     gen_fwht_signs, ActivationCapture, BlockHessianAcc, DType, Gpu, GpuTensor, HessianCapture,
     GL_CB2, GL_CB3, GL_GROUP_SCALE_BYTES, GL_MQ2_GROUP_IDX_BYTES, GL_MQ3_GROUP_IDX_BYTES,
-    LLOYD_MQ3_GROUP_BYTES, LLOYD_MQ4_GROUP_BYTES, MMQ_CURRENT_LAYER, MQ4C_GROUP_BYTES,
-    MQ4V2_GROUP_BYTES,
+    LLOYD_MQ3_GROUP_BYTES, LLOYD_MQ4_GROUP_BYTES, MMQ_CURRENT_LAYER, MQ2G256V2_GROUP_BYTES,
+    MQ3G256V2_GROUP_BYTES, MQ4C_GROUP_BYTES, MQ4V2_GROUP_BYTES, MQ5G256V2_GROUP_BYTES,
+    MQ6G256V2_GROUP_BYTES,
 };
 pub use feature_flags::FeatureFlags;
 pub use hip_bridge::{HipError, HipResult};

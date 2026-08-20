@@ -10,7 +10,10 @@
 use crate::hfq::HfqFile;
 use crate::llama::{f16_to_f32, EmbeddingFormat, KvCache, WeightTensor};
 use hip_bridge::HipResult;
-use rdna_compute::{DType, Gpu, GpuTensor, MQ4C_GROUP_BYTES};
+use rdna_compute::{
+    DType, Gpu, GpuTensor, MQ2G256V2_GROUP_BYTES, MQ3G256V2_GROUP_BYTES, MQ4C_GROUP_BYTES,
+    MQ5G256V2_GROUP_BYTES, MQ6G256V2_GROUP_BYTES,
+};
 
 /// Widen a little-endian BF16 byte stream to F32 (lossless: bf16 is the high
 /// 16 bits of an f32). Used by the qt=16 paths in dequant_weight_raw/dequant_f32.
@@ -434,6 +437,26 @@ pub(crate) const RAW_CODECS: &[RawCodec] = &[
         quant_type: 45,
         dtype: DType::MQ4CG256,
     },
+    // Neutral-size Magnum V2 family (qt47-50): same neutral header as qt44
+    // (LE `[0..2)` fp16 s0, `[2..4)` fp16 z0, `[4..6)` fp16 s1, `[6..8)` fp16 z1,
+    // `[8..B)` legacy payload). Half 0 covers q[0..128), half 1 q[128..256);
+    // `w = q*f32(s[h])+f32(z[h])`; `K%256==0`; B=200/168/104/72.
+    RawCodec {
+        quant_type: 47,
+        dtype: DType::MQ6G256V2,
+    },
+    RawCodec {
+        quant_type: 48,
+        dtype: DType::MQ5G256V2,
+    },
+    RawCodec {
+        quant_type: 49,
+        dtype: DType::MQ3G256V2,
+    },
+    RawCodec {
+        quant_type: 50,
+        dtype: DType::MQ2G256V2,
+    },
 ];
 /// Look up the passthrough codec for `quant_type`, or `None` if it is host-decode
 /// (1/2/16) or genuinely unsupported.
@@ -491,6 +514,58 @@ pub(crate) fn decode_raw_codec(
                 0,
                 &format!(
                     "MQ4CG256 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name})",
+                    data.len()
+                ),
+            ));
+        }
+    }
+    if codec.dtype == DType::MQ6G256V2 {
+        let gpr = k / 256;
+        let expected = m * gpr * MQ6G256V2_GROUP_BYTES;
+        if data.len() != expected {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "MQ6G256V2 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name})",
+                    data.len()
+                ),
+            ));
+        }
+    }
+    if codec.dtype == DType::MQ5G256V2 {
+        let gpr = k / 256;
+        let expected = m * gpr * MQ5G256V2_GROUP_BYTES;
+        if data.len() != expected {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "MQ5G256V2 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name})",
+                    data.len()
+                ),
+            ));
+        }
+    }
+    if codec.dtype == DType::MQ3G256V2 {
+        let gpr = k / 256;
+        let expected = m * gpr * MQ3G256V2_GROUP_BYTES;
+        if data.len() != expected {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "MQ3G256V2 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name})",
+                    data.len()
+                ),
+            ));
+        }
+    }
+    if codec.dtype == DType::MQ2G256V2 {
+        let gpr = k / 256;
+        let expected = m * gpr * MQ2G256V2_GROUP_BYTES;
+        if data.len() != expected {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "MQ2G256V2 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name})",
                     data.len()
                 ),
             ));
@@ -1575,6 +1650,12 @@ mod tests {
             // qt=44/45: 136 B/group pad layouts (PR599). MQ4C is NOT 132.
             (44, DType::MQ4G256V2),
             (45, DType::MQ4CG256),
+            // Neutral-size Magnum V2 family (qt47-50): preserve qtype distinction;
+            // do not alias to legacy MQ2/3/5/6. Each maps one-to-one to its V2 DType.
+            (47, DType::MQ6G256V2), // 200 B/G256 6.25bpw
+            (48, DType::MQ5G256V2), // 168 B/G256 5.25bpw
+            (49, DType::MQ3G256V2), // 104 B/G256 3.25bpw
+            (50, DType::MQ2G256V2), // 72 B/G256 2.25bpw
         ];
         for &(qt, dt) in expected {
             let c = raw_codec(qt).unwrap_or_else(|| panic!("no RAW_CODECS row for qt={qt}"));
@@ -1866,5 +1947,42 @@ mod tests {
         assert_ne!(expected, m * gpr * 132);
         let codec = raw_codec(45).expect("qt=45 MQ4CG256 codec");
         assert_eq!(codec.dtype, DType::MQ4CG256);
+    }
+
+    #[test]
+    fn mq_v2_group_bytes_match_spec() {
+        assert_eq!(MQ6G256V2_GROUP_BYTES, 200, "qt47 MQ6G256V2 is 200 B/group");
+        assert_eq!(MQ5G256V2_GROUP_BYTES, 168, "qt48 MQ5G256V2 is 168 B/group");
+        assert_eq!(MQ3G256V2_GROUP_BYTES, 104, "qt49 MQ3G256V2 is 104 B/group");
+        assert_eq!(MQ2G256V2_GROUP_BYTES, 72, "qt50 MQ2G256V2 is 72 B/group");
+        // Each qt maps one-to-one to its DType and exact block bytes.
+        assert_eq!(raw_codec(47).unwrap().dtype, DType::MQ6G256V2);
+        assert_eq!(raw_codec(48).unwrap().dtype, DType::MQ5G256V2);
+        assert_eq!(raw_codec(49).unwrap().dtype, DType::MQ3G256V2);
+        assert_eq!(raw_codec(50).unwrap().dtype, DType::MQ2G256V2);
+        // Existing qts unchanged.
+        assert_eq!(raw_codec(44).unwrap().dtype, DType::MQ4G256V2);
+        assert_eq!(raw_codec(45).unwrap().dtype, DType::MQ4CG256);
+        assert_eq!(raw_codec(15).unwrap().dtype, DType::MQ6G256);
+        assert_eq!(raw_codec(17).unwrap().dtype, DType::MQ3G256);
+        assert_eq!(raw_codec(18).unwrap().dtype, DType::MQ2G256);
+    }
+
+    #[test]
+    fn mq_v2_require_k_mod_256_and_awq() {
+        for dt in [
+            DType::MQ6G256V2,
+            DType::MQ5G256V2,
+            DType::MQ3G256V2,
+            DType::MQ2G256V2,
+        ] {
+            assert!(dt.requires_k_mod_256(), "{dt:?} must require K%256==0");
+            assert!(dt.supports_awq_sidecar(), "{dt:?} must support AWQ sidecar");
+        }
+        // Legacy counterparts remain distinct DTypes (no alias).
+        assert_ne!(DType::MQ6G256V2, DType::MQ6G256);
+        assert_ne!(DType::MQ5G256V2, DType::MQ5G256);
+        assert_ne!(DType::MQ3G256V2, DType::MQ3G256);
+        assert_ne!(DType::MQ2G256V2, DType::MQ2G256);
     }
 }

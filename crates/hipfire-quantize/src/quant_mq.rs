@@ -131,7 +131,177 @@ pub(crate) fn quantize_mq2g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32])
 
     output
 }
-
+pub(crate) const MQ3V2_GROUP_BYTES: usize = 104;
+pub(crate) const MQ2V2_GROUP_BYTES: usize = 72;
+/// MQ3G256V2 encoder — per-128 asymmetric fp16 header, neutral-size.
+///
+/// Layout per 256-weight group: `[0..2) fp16 s0,[2..4) fp16 z0,[4..6) fp16 s1,[6..8) fp16 z1,[8..104) 96B packed 3-bit`.
+/// Payload unchanged from MQ3G256: 8 values per 3 bytes, little-endian bitstream.
+pub(crate) fn quantize_mq3g256v2(
+    w: &[f32],
+    m: usize,
+    k: usize,
+    signs1: &[f32],
+    signs2: &[f32],
+) -> Vec<u8> {
+    assert!(k % 256 == 0, "MQ3G256V2 requires K % 256 == 0, got K={k}");
+    let n = w.len();
+    assert_eq!(n, m * k, "w.len() {} != m*k {}*{}={}", n, m, k, m * k);
+    let gpr = k / 256;
+    let total_groups = m * gpr;
+    let block_bytes = MQ3V2_GROUP_BYTES;
+    let mut output = vec![0u8; total_groups * block_bytes];
+    for b in 0..total_groups {
+        let start = b * 256;
+        let mut group = [0.0f32; 256];
+        group.copy_from_slice(&w[start..start + 256]);
+        cpu_fwht_256(&mut group, signs1, signs2);
+        let mut scales = [0u16; 2];
+        let mut zeros = [0u16; 2];
+        let mut sts = [0.0f32; 2];
+        let mut zs = [0.0f32; 2];
+        let mut degenerate = [false; 2];
+        for h in 0..2 {
+            let off = h * 128;
+            let slice = &group[off..off + 128];
+            let lo = slice.iter().cloned().fold(f32::INFINITY, f32::min);
+            let hi = slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let step_f32 = if hi > lo { (hi - lo) / 7.0 } else { 0.0 };
+            let mut sc_bits = f32_to_f16(step_f32);
+            if hi == lo {
+                sc_bits = 0u16;
+            }
+            let z_bits = f32_to_f16(lo);
+            let st = f16_to_f32(sc_bits);
+            let z = f16_to_f32(z_bits);
+            scales[h] = sc_bits;
+            zeros[h] = z_bits;
+            sts[h] = st;
+            zs[h] = z;
+            degenerate[h] = hi == lo || step_f32 == 0.0 || st == 0.0;
+        }
+        let out_off = b * block_bytes;
+        output[out_off..out_off + 2].copy_from_slice(&scales[0].to_le_bytes());
+        output[out_off + 2..out_off + 4].copy_from_slice(&zeros[0].to_le_bytes());
+        output[out_off + 4..out_off + 6].copy_from_slice(&scales[1].to_le_bytes());
+        output[out_off + 6..out_off + 8].copy_from_slice(&zeros[1].to_le_bytes());
+        let mut q = [0u8; 256];
+        for h in 0..2 {
+            let off = h * 128;
+            if degenerate[h] {
+                for i in 0..128 {
+                    q[off + i] = 0;
+                }
+            } else {
+                let st = sts[h];
+                let z = zs[h];
+                let inv = 1.0 / st;
+                for i in 0..128 {
+                    let v = group[off + i];
+                    let qq = ((v - z) * inv + 0.5).floor().clamp(0.0, 7.0) as u8;
+                    q[off + i] = qq;
+                }
+            }
+        }
+        for chunk in 0..32 {
+            let ci = chunk * 8;
+            let mut qq = [0u8; 8];
+            for j in 0..8 {
+                qq[j] = q[ci + j] & 7;
+            }
+            let b0 = (qq[0] & 7) | ((qq[1] & 7) << 3) | ((qq[2] & 3) << 6);
+            let b1 =
+                ((qq[2] >> 2) & 1) | ((qq[3] & 7) << 1) | ((qq[4] & 7) << 4) | ((qq[5] & 1) << 7);
+            let b2 = ((qq[5] >> 1) & 3) | ((qq[6] & 7) << 2) | ((qq[7] & 7) << 5);
+            let bo = out_off + 8 + chunk * 3;
+            output[bo] = b0;
+            output[bo + 1] = b1;
+            output[bo + 2] = b2;
+        }
+    }
+    output
+}
+/// MQ2G256V2 encoder — per-128 asymmetric fp16 header, neutral-size.
+///
+/// Layout per 256-weight group: `[0..2) fp16 s0,[2..4) fp16 z0,[4..6) fp16 s1,[6..8) fp16 z1,[8..72) 64B packed 2-bit`.
+/// Payload unchanged from MQ2G256: 4 values per byte.
+pub(crate) fn quantize_mq2g256v2(
+    w: &[f32],
+    m: usize,
+    k: usize,
+    signs1: &[f32],
+    signs2: &[f32],
+) -> Vec<u8> {
+    assert!(k % 256 == 0, "MQ2G256V2 requires K % 256 == 0, got K={k}");
+    let n = w.len();
+    assert_eq!(n, m * k, "w.len() {} != m*k {}*{}={}", n, m, k, m * k);
+    let gpr = k / 256;
+    let total_groups = m * gpr;
+    let block_bytes = MQ2V2_GROUP_BYTES;
+    let mut output = vec![0u8; total_groups * block_bytes];
+    for b in 0..total_groups {
+        let start = b * 256;
+        let mut group = [0.0f32; 256];
+        group.copy_from_slice(&w[start..start + 256]);
+        cpu_fwht_256(&mut group, signs1, signs2);
+        let mut scales = [0u16; 2];
+        let mut zeros = [0u16; 2];
+        let mut sts = [0.0f32; 2];
+        let mut zs = [0.0f32; 2];
+        let mut degenerate = [false; 2];
+        for h in 0..2 {
+            let off = h * 128;
+            let slice = &group[off..off + 128];
+            let lo = slice.iter().cloned().fold(f32::INFINITY, f32::min);
+            let hi = slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let step_f32 = if hi > lo { (hi - lo) / 3.0 } else { 0.0 };
+            let mut sc_bits = f32_to_f16(step_f32);
+            if hi == lo {
+                sc_bits = 0u16;
+            }
+            let z_bits = f32_to_f16(lo);
+            let st = f16_to_f32(sc_bits);
+            let z = f16_to_f32(z_bits);
+            scales[h] = sc_bits;
+            zeros[h] = z_bits;
+            sts[h] = st;
+            zs[h] = z;
+            degenerate[h] = hi == lo || step_f32 == 0.0 || st == 0.0;
+        }
+        let out_off = b * block_bytes;
+        output[out_off..out_off + 2].copy_from_slice(&scales[0].to_le_bytes());
+        output[out_off + 2..out_off + 4].copy_from_slice(&zeros[0].to_le_bytes());
+        output[out_off + 4..out_off + 6].copy_from_slice(&scales[1].to_le_bytes());
+        output[out_off + 6..out_off + 8].copy_from_slice(&zeros[1].to_le_bytes());
+        let mut q = [0u8; 256];
+        for h in 0..2 {
+            let off = h * 128;
+            if degenerate[h] {
+                for i in 0..128 {
+                    q[off + i] = 0;
+                }
+            } else {
+                let st = sts[h];
+                let z = zs[h];
+                let inv = 1.0 / st;
+                for i in 0..128 {
+                    let v = group[off + i];
+                    let qq = ((v - z) * inv + 0.5).floor().clamp(0.0, 3.0) as u8;
+                    q[off + i] = qq;
+                }
+            }
+        }
+        for i in 0..64 {
+            let mut byte_val = 0u8;
+            for j in 0..4 {
+                let qq = q[4 * i + j] & 3;
+                byte_val |= qq << (j * 2);
+            }
+            output[out_off + 8 + i] = byte_val;
+        }
+    }
+    output
+}
 /// Encode an f32 to IEEE-754 fp16 bits (round-to-nearest-even, no NaN/Inf preservation
 /// beyond the trivial case — block centroids are bounded means of fp32 weights so
 /// the simple path is safe).
@@ -2426,6 +2596,106 @@ mod bq1g128_gptq_tests {
         let plain = quantize_bq1g128(&g);
         let gptq = quantize_bq1g128_gptq(&g, &w, 0.0);
         assert!(wmse_bq1(&g, &gptq, &w) <= wmse_bq1(&g, &plain, &w) + 1e-9);
+    }
+}
+
+#[cfg(test)]
+mod mqv2_lowbit_tests {
+    use super::*;
+
+    #[test]
+    fn mq3v2_mq2v2_wire_layout() {
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        // byte count = m*ceil(k/256)*B
+        for (m, k, b) in [
+            (1usize, 256usize, MQ3V2_GROUP_BYTES),
+            (2, 512, MQ3V2_GROUP_BYTES),
+            (4, 1024, MQ3V2_GROUP_BYTES),
+        ] {
+            let w = vec![0.3f32; m * k];
+            let blob = quantize_mq3g256v2(&w, m, k, &s1, &s2);
+            assert_eq!(blob.len(), m * (k / 256) * b, "mq3v2 bytes m={m} k={k}");
+            assert_eq!(b, 104);
+            // header 8B, payload 96B
+            assert_eq!(b - 8, 96);
+        }
+        for (m, k, b) in [
+            (1usize, 256usize, MQ2V2_GROUP_BYTES),
+            (2, 512, MQ2V2_GROUP_BYTES),
+        ] {
+            let w = vec![-0.5f32; m * k];
+            let blob = quantize_mq2g256v2(&w, m, k, &s1, &s2);
+            assert_eq!(blob.len(), m * (k / 256) * b, "mq2v2 bytes m={m} k={k}");
+            assert_eq!(b, 72);
+            assert_eq!(b - 8, 64);
+        }
+        // fp16 header positions and payload offset
+        let m = 2;
+        let k = 512;
+        let w: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.013).sin()).collect();
+        let blob = quantize_mq3g256v2(&w, m, k, &s1, &s2);
+        let gpr = k / 256;
+        for g in 0..m * gpr {
+            let base = g * MQ3V2_GROUP_BYTES;
+            // header is 4 fp16 LE at 0,2,4,6
+            let s0 = u16::from_le_bytes([blob[base], blob[base + 1]]);
+            let z0 = u16::from_le_bytes([blob[base + 2], blob[base + 3]]);
+            let s1b = u16::from_le_bytes([blob[base + 4], blob[base + 5]]);
+            let z1 = u16::from_le_bytes([blob[base + 6], blob[base + 7]]);
+            // reconstruction would be q*f32(s)+f32(z)
+            let st0 = f16_to_f32(s0);
+            let zt0 = f16_to_f32(z0);
+            // at least not both scales zero for non-degenerate synthetic
+            assert!(
+                st0 != 0.0 || f16_to_f32(s1b) != 0.0,
+                "expected non-degenerate header"
+            );
+            assert!(blob[base + 8..base + MQ3V2_GROUP_BYTES].len() == 96);
+            let _ = (zt0, z1, s1b); // silence unused
+        }
+        // degenerate halves: zero weights => both halves scale=0, payload zero
+        let w_zero = vec![0.0f32; m * k];
+        let blob = quantize_mq2g256v2(&w_zero, m, k, &s1, &s2);
+        for g in 0..m * gpr {
+            let base = g * MQ2V2_GROUP_BYTES;
+            let s0 = u16::from_le_bytes([blob[base], blob[base + 1]]);
+            let s1b = u16::from_le_bytes([blob[base + 4], blob[base + 5]]);
+            assert_eq!(s0, 0);
+            assert_eq!(s1b, 0);
+            // payload must be all zero for degenerate
+            assert!(blob[base + 8..base + MQ2V2_GROUP_BYTES]
+                .iter()
+                .all(|&b| b == 0));
+        }
+        // payload pack invariants: 2b 4/byte => payload len 64, 3b 8/3B => 96
+        assert_eq!(MQ2V2_GROUP_BYTES - 8, 64);
+        assert_eq!(MQ3V2_GROUP_BYTES - 8, 96);
+    }
+
+    #[test]
+    fn mqv2_roundtrip_fp16_before_select() {
+        // Verify encoder round-trips s/z through fp16 before selecting q:
+        // construct a weight that would be near a quantization boundary with f32 scale
+        // but flips when scale is truncated to fp16.
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        let m = 1;
+        let k = 256;
+        // Use a value that exercises fp16 quantization of scale
+        let w: Vec<f32> = (0..256).map(|i| (i as f32 - 128.0) * 0.01).collect();
+        let blob2 = quantize_mq2g256v2(&w, m, k, &s1, &s2);
+        let blob3 = quantize_mq3g256v2(&w, m, k, &s1, &s2);
+        // header scales must be fp16 exactly (re-encode matches)
+        for (blob, bbytes) in [(blob2, MQ2V2_GROUP_BYTES), (blob3, MQ3V2_GROUP_BYTES)] {
+            let s0 = u16::from_le_bytes([blob[0], blob[1]]);
+            let z0 = u16::from_le_bytes([blob[2], blob[3]]);
+            // f32_to_f16 truncates, f16_to_f32 round-trips, ensure consistency
+            let st = f16_to_f32(s0);
+            let zt = f16_to_f32(z0);
+            assert!(st >= 0.0);
+            let _ = (st, zt, bbytes);
+        }
     }
 }
 

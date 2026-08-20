@@ -2,7 +2,8 @@
 // Copyright (c) 2026 Kaden Schutt
 //
 // GPU format-design optimizer for the matched MagnumQuant/HFQ G256 ladder.
-// Evaluates 2/3/4-bit payloads while holding the genesis 8-byte header budget.
+// Evaluates 2/3/4-bit matched-header candidates, then measures the neutral-size
+// 5/6-bit legacy-affine and dual-G128 fp16-header (V2) hypotheses on the same fixture.
 // Candidate codecs are reconstructed only from the bytes charged in `header_b`.
 //
 // Usage:
@@ -28,6 +29,9 @@
 #define MODE_ANCHORED_MAX 2
 #define MODE_SELECTOR_MAX 3
 #define MODE_LLOYD 4
+// Production-faithful affine for MQ5/MQ6 v1 and the MQ4V2-style dual-G128 header.
+// Degenerate half (hi==lo or f16 scale underflows to 0): store scale 0, all q=0.
+#define MODE_AFFINE_PROD 5
 
 #define CK(x) do { \
     hipError_t e_ = (x); \
@@ -193,7 +197,7 @@ __global__ __launch_bounds__(256) void eval_candidate(
         const float w = weights[(size_t)blk * 256 + tid];
         float reconstructed = 0.0f;
 
-        if (mode == MODE_AFFINE) {
+        if (mode == MODE_AFFINE || mode == MODE_AFFINE_PROD) {
             sh_red[tid] = w;
             __syncthreads();
             for (int stride = sub_size >> 1; stride > 0; stride >>= 1) {
@@ -211,11 +215,26 @@ __global__ __launch_bounds__(256) void eval_candidate(
             }
             const float hi = sh_red[sub * sub_size];
             if (lane == 0) {
-                float step = hi > lo ? (hi - lo) / (float)(nlev - 1) : 1.0f;
+                float step;
                 float zero = lo;
-                if (fp16_affine_header) {
-                    step = f16_trunc_rt(step);
-                    zero = f16_trunc_rt(zero);
+                if (mode == MODE_AFFINE_PROD && fp16_affine_header) {
+                    // MQ4V2 contract: [s0,z0,s1,z1] f16; hi==lo → scale bits 0.
+                    const float step_f32 =
+                        hi > lo ? (hi - lo) / (float)(nlev - 1) : 0.0f;
+                    step = f16_trunc_rt(step_f32);
+                    zero = f16_trunc_rt(lo);
+                    if (hi == lo)
+                        step = 0.0f;
+                } else if (mode == MODE_AFFINE_PROD) {
+                    // Legacy MQ5/MQ6 v1: one f32 scale+zero per G256.
+                    step = hi > lo ? (hi - lo) / (float)(nlev - 1) : 1.0f;
+                } else {
+                    // Original 2/3/4 research affine (unchanged semantics).
+                    step = hi > lo ? (hi - lo) / (float)(nlev - 1) : 1.0f;
+                    if (fp16_affine_header) {
+                        step = f16_trunc_rt(step);
+                        zero = f16_trunc_rt(zero);
+                    }
                 }
                 sh_scale[sub] = step;
                 sh_zero[sub] = zero;
@@ -223,9 +242,17 @@ __global__ __launch_bounds__(256) void eval_candidate(
             __syncthreads();
             const float step = sh_scale[sub];
             const float zero = sh_zero[sub];
-            const float q = step > 0.0f
-                ? fminf(fmaxf(rintf((w - zero) / step), 0.0f), (float)(nlev - 1))
-                : 0.0f;
+            float q;
+            if (!(step > 0.0f)) {
+                q = 0.0f;
+            } else if (mode == MODE_AFFINE_PROD) {
+                // Production cast: floor(x + 0.5) then clamp (matches MQ4V2/MQ5/MQ6).
+                q = floorf((w - zero) / step + 0.5f);
+                q = fminf(fmaxf(q, 0.0f), (float)(nlev - 1));
+            } else {
+                q = fminf(fmaxf(rintf((w - zero) / step), 0.0f),
+                          (float)(nlev - 1));
+            }
             reconstructed = q * step + zero;
         } else if (mode == MODE_LLOYD) {
             // Percentile init, 8 Lloyd iters; keep final assignment indices; RNE
@@ -761,6 +788,17 @@ static std::vector<float> build_table(int bits) {
     return table;
 }
 
+// Legacy payload packing: 2/3/4 = bits*32 B; 5-bit = 8 vals/5 B → 160;
+// 6-bit = 4 vals/3 B → 192. V2 keeps the same payload; only the header encoding
+// changes (still 8 B: dual G128 fp16 s/z). MQ5V2=168, MQ6V2=200 B/G256.
+static int legacy_payload_bytes(int bits) {
+    if (bits == 5)
+        return 160; // 32 chunks × 5 B
+    if (bits == 6)
+        return 192; // 64 chunks × 3 B
+    return bits * 32;
+}
+
 static std::vector<Config> configs_for(int bits) {
     const int nlev = 1 << bits;
     std::vector<Config> configs = {
@@ -782,6 +820,17 @@ static std::vector<Config> configs_for(int bits) {
         {"per-half Lloyd G128x2 fp16", MODE_LLOYD, 2, 4 * nlev, false, 0.0f},
     };
     return configs;
+}
+
+// Neutral-size 5/6-bit arms only: legacy G256 f32 header vs MQ4V2 dual-G128 fp16.
+static std::vector<Config> configs_highbit(int bits) {
+    char v1[32], v2[32];
+    std::snprintf(v1, sizeof(v1), "MQ%d-v1", bits);
+    std::snprintf(v2, sizeof(v2), "MQ%dV2", bits);
+    return {
+        {v1, MODE_AFFINE_PROD, 1, 8, false, 0.0f},
+        {v2, MODE_AFFINE_PROD, 2, 8, true, 0.0f},
+    };
 }
 
 static bool dominates(const Result& a, const Result& b) {
@@ -841,8 +890,11 @@ int main(int argc, char** argv) {
     std::printf("Every matched genesis budget is payload + 8 header bytes.\n");
     std::printf("MFP{2,3,4}G32E8 production: 16 B/row hdr + (1+4n) B/G32; "
                 "centers n2=2/n3=4/n4=7; steps 3.8/1.8/0.88; E4M3 roundup + closest E8.\n");
+    std::printf("MQ5/MQ6 hypothesis: legacy affine G256 f32 (v1) vs dual-G128 fp16 "
+                "header (V2, MQ4V2 contract); payload 5b=8vals/5B, 6b=4vals/3B; "
+                "MQ5V2=168 B/G256, MQ6V2=200 B/G256.\n");
     for (int bits = 2; bits <= 4; ++bits) {
-        const int payload_b = bits * 32;
+        const int payload_b = legacy_payload_bytes(bits);
         const int matched_b = payload_b + 8;
         const std::vector<float> table = build_table(bits);
         CK(hipMemcpy(device_table, table.data(), table.size() * sizeof(float), hipMemcpyHostToDevice));
@@ -943,6 +995,45 @@ int main(int argc, char** argv) {
                         candidate->name.c_str(), candidate->total_b,
                         candidate->mse, candidate->tail_mse, candidate->max_relative);
         }
+    }
+
+    // ── 5/6-bit neutral-size affine hypothesis (v1 f32 G256 vs V2 fp16 G128×2) ──
+    for (int bits = 5; bits <= 6; ++bits) {
+        const int payload_b = legacy_payload_bytes(bits);
+        const int matched_b = payload_b + 8; // MQ5=168, MQ6=200
+        const std::vector<Config> configs = configs_highbit(bits);
+        std::printf("\n=== MQ%d hypothesis: %d B/group (%.4f bpw) — v1 f32 vs V2 fp16 ===\n",
+                    bits, matched_b, matched_b * 8.0 / 256.0);
+        std::printf("  %-34s %4s %5s %7s   %-13s %-13s %-12s\n",
+                    "candidate", "hdr", "total", "bpw", "overall MSE",
+                    "tail-1% MSE", "max-rel mean");
+        std::printf("  --------------------------------------------------------------------------------------------------------------\n");
+        // Affine path does not read the codebook table; pass the bits-4 table as a dummy.
+        const std::vector<float> table = build_table(4);
+        CK(hipMemcpy(device_table, table.data(), table.size() * sizeof(float),
+                     hipMemcpyHostToDevice));
+        for (const Config& config : configs) {
+            const DeviceResult zero{};
+            CK(hipMemcpy(device_result, &zero, sizeof(zero), hipMemcpyHostToDevice));
+            hipLaunchKernelGGL(eval_candidate, dim3(std::min(nblk, 2048)), dim3(256), 0, 0,
+                               device_weights, nblk, device_table, tail_threshold,
+                               bits, config.mode, config.nsub,
+                               config.fp16_affine ? 1 : 0, config.selector_p,
+                               device_result);
+            CK(hipDeviceSynchronize());
+            DeviceResult result{};
+            CK(hipMemcpy(&result, device_result, sizeof(result), hipMemcpyDeviceToHost));
+            const int total_b = payload_b + config.header_b;
+            const double mse = result.sse / (double)result.n;
+            const double tail_mse = result.tail_sse / (double)result.tail_n;
+            const double max_relative =
+                result.max_relative_sum / (double)result.blocks;
+            std::printf("  %-34s %4d %5d %7.4f   %.4e    %.4e    %10.4e\n",
+                        config.name.c_str(), config.header_b, total_b,
+                        total_b * 8.0 / 256.0, mse, tail_mse, max_relative);
+        }
+        std::printf("  (V2 header: [0..2) s0 [2..4) z0 [4..6) s1 [6..8) z1 f16; "
+                    "payload +8; degenerate half → scale=0, q=0 like MQ4V2)\n");
     }
 
     CK(hipFree(device_result));

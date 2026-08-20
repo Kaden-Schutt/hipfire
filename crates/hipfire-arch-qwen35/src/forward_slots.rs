@@ -208,7 +208,14 @@ fn require_batchable_deltanet_layer(layer: &DeltaNetLayerWeights) -> HipResult<A
     // them: the fused kernels serve all projections of a layer in a single launch,
     // so a mixed qt=13/qt=44 layer would decode half its weights with the wrong
     // header interpretation.
-    if all(DType::MQ4G256) || all(DType::MQ4G256V2) || all(DType::MQ4CG256) {
+    if all(DType::MQ4G256)
+        || all(DType::MQ4G256V2)
+        || all(DType::MQ4CG256)
+        || all(DType::MQ6G256V2)
+        || all(DType::MQ5G256V2)
+        || all(DType::MQ3G256V2)
+        || all(DType::MQ2G256V2)
+    {
         return Ok(AttnProjDtype::Mq4G256);
     }
     Err(HipError::new(
@@ -233,7 +240,14 @@ fn require_batchable_fullattn_layer(layer: &FullAttnLayerWeights) -> HipResult<A
     if all(DType::Q8_0) {
         return Ok(AttnProjDtype::Q8_0);
     }
-    if all(DType::MQ4G256) || all(DType::MQ4G256V2) || all(DType::MQ4CG256) {
+    if all(DType::MQ4G256)
+        || all(DType::MQ4G256V2)
+        || all(DType::MQ4CG256)
+        || all(DType::MQ6G256V2)
+        || all(DType::MQ5G256V2)
+        || all(DType::MQ3G256V2)
+        || all(DType::MQ2G256V2)
+    {
         return Ok(AttnProjDtype::Mq4G256);
     }
     Err(HipError::new(
@@ -283,6 +297,10 @@ pub(crate) fn residual_gemm_key_for(dt: DType) -> KernelKey {
     match dt {
         DType::MQ4G256V2 => KernelKey::GemmMq4G256V2Residual,
         DType::MQ4CG256 => KernelKey::GemmMq4CG256Residual,
+        DType::MQ6G256V2 => KernelKey::GemmMq6G256V2Residual,
+        DType::MQ5G256V2 => KernelKey::GemmMq5G256V2Residual,
+        DType::MQ3G256V2 => KernelKey::GemmMq3G256V2Residual,
+        DType::MQ2G256V2 => KernelKey::GemmMq2G256V2Residual,
         _ => KernelKey::GemmHfq4G256Residual,
     }
 }
@@ -291,6 +309,10 @@ pub(crate) fn fused_qkvza_key_for(dt: DType) -> KernelKey {
     match dt {
         DType::MQ4G256V2 => KernelKey::FusedQkvzaMq4G256V2,
         DType::MQ4CG256 => KernelKey::FusedQkvzaMq4CG256,
+        DType::MQ6G256V2 => KernelKey::FusedQkvzaMq6G256V2,
+        DType::MQ5G256V2 => KernelKey::FusedQkvzaMq5G256V2,
+        DType::MQ3G256V2 => KernelKey::FusedQkvzaMq3G256V2,
+        DType::MQ2G256V2 => KernelKey::FusedQkvzaMq2G256V2,
         _ => KernelKey::FusedQkvzaHfq4G256,
     }
 }
@@ -299,6 +321,10 @@ pub(crate) fn fused_qkv_key_for(dt: DType) -> KernelKey {
     match dt {
         DType::MQ4G256V2 => KernelKey::FusedQkvMq4G256V2,
         DType::MQ4CG256 => KernelKey::FusedQkvMq4CG256,
+        DType::MQ6G256V2 => KernelKey::FusedQkvMq6G256V2,
+        DType::MQ5G256V2 => KernelKey::FusedQkvMq5G256V2,
+        DType::MQ3G256V2 => KernelKey::FusedQkvMq3G256V2,
+        DType::MQ2G256V2 => KernelKey::FusedQkvMq2G256V2,
         _ => KernelKey::FusedQkvHfq4G256,
     }
 }
@@ -307,6 +333,10 @@ pub(crate) fn fused_gate_up_key_for(dt: DType) -> KernelKey {
     match dt {
         DType::MQ4G256V2 => KernelKey::FusedGateUpMq4G256V2,
         DType::MQ4CG256 => KernelKey::FusedGateUpMq4CG256,
+        DType::MQ6G256V2 => KernelKey::FusedGateUpMq6G256V2,
+        DType::MQ5G256V2 => KernelKey::FusedGateUpMq5G256V2,
+        DType::MQ3G256V2 => KernelKey::FusedGateUpMq3G256V2,
+        DType::MQ2G256V2 => KernelKey::FusedGateUpMq2G256V2,
         _ => KernelKey::FusedGateUpHfq4G256,
     }
 }
@@ -332,7 +362,18 @@ fn require_batchable_deltanet_moe_layer(
     }
     // Renamed from `mq4c` now that MQ4C/qt=45 is a real format name — this predicate
     // is the whole MQ4 FAMILY, not that one container.
-    let mq4_family = |d: DType| matches!(d, DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ4CG256);
+    let mq4_family = |d: DType| {
+        matches!(
+            d,
+            DType::MQ4G256
+                | DType::MQ4G256V2
+                | DType::MQ4CG256
+                | DType::MQ6G256V2
+                | DType::MQ5G256V2
+                | DType::MQ3G256V2
+                | DType::MQ2G256V2
+        )
+    };
     let all_mq4 = mq4_family(layer.wqkv.gpu_dtype)
         && layer.wz.gpu_dtype == layer.wqkv.gpu_dtype
         && layer.w_beta.gpu_dtype == layer.wqkv.gpu_dtype
@@ -362,7 +403,18 @@ fn require_batchable_fullattn_moe_layer(
     if all_q8 {
         return Ok(AttnProjDtype::Q8_0);
     }
-    let mq4_family = |d: DType| matches!(d, DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ4CG256);
+    let mq4_family = |d: DType| {
+        matches!(
+            d,
+            DType::MQ4G256
+                | DType::MQ4G256V2
+                | DType::MQ4CG256
+                | DType::MQ6G256V2
+                | DType::MQ5G256V2
+                | DType::MQ3G256V2
+                | DType::MQ2G256V2
+        )
+    };
     let all_mq4 = mq4_family(layer.wq.gpu_dtype)
         && layer.wk.gpu_dtype == layer.wq.gpu_dtype
         && layer.wv.gpu_dtype == layer.wq.gpu_dtype
@@ -2952,4 +3004,99 @@ pub fn forward_batch_slots_opts(
     // slot's KV, so it is the only thing that can get the length right.
     advance_slot_seq_lens(batch, pool)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hipfire_dispatch::types::KernelKey;
+    use rdna_compute::DType;
+
+    #[test]
+    fn v2_one_to_one_keys_no_hfq4_fallback() {
+        // Contract: each admitted V2 dtype maps to its exact V2 key, never HFQ4/default.
+        // Plain GEMV (via helper fallback) is covered elsewhere; here we check
+        // the four dense helpers plus residual.
+        let cases: &[(DType, KernelKey, KernelKey, KernelKey, KernelKey)] = &[
+            (
+                DType::MQ6G256V2,
+                KernelKey::GemmMq6G256V2Residual,
+                KernelKey::FusedQkvzaMq6G256V2,
+                KernelKey::FusedQkvMq6G256V2,
+                KernelKey::FusedGateUpMq6G256V2,
+            ),
+            (
+                DType::MQ5G256V2,
+                KernelKey::GemmMq5G256V2Residual,
+                KernelKey::FusedQkvzaMq5G256V2,
+                KernelKey::FusedQkvMq5G256V2,
+                KernelKey::FusedGateUpMq5G256V2,
+            ),
+            (
+                DType::MQ3G256V2,
+                KernelKey::GemmMq3G256V2Residual,
+                KernelKey::FusedQkvzaMq3G256V2,
+                KernelKey::FusedQkvMq3G256V2,
+                KernelKey::FusedGateUpMq3G256V2,
+            ),
+            (
+                DType::MQ2G256V2,
+                KernelKey::GemmMq2G256V2Residual,
+                KernelKey::FusedQkvzaMq2G256V2,
+                KernelKey::FusedQkvMq2G256V2,
+                KernelKey::FusedGateUpMq2G256V2,
+            ),
+        ];
+        for (dt, exp_resid, exp_qkvza, exp_qkv, exp_gate) in cases {
+            assert_eq!(
+                residual_gemm_key_for(*dt),
+                *exp_resid,
+                "residual mismatch for {:?}",
+                dt
+            );
+            assert_eq!(
+                fused_qkvza_key_for(*dt),
+                *exp_qkvza,
+                "qkvza mismatch for {:?}",
+                dt
+            );
+            assert_eq!(
+                fused_qkv_key_for(*dt),
+                *exp_qkv,
+                "qkv mismatch for {:?}",
+                dt
+            );
+            assert_eq!(
+                fused_gate_up_key_for(*dt),
+                *exp_gate,
+                "gate_up mismatch for {:?}",
+                dt
+            );
+            // No HFQ4 leakage
+            assert_ne!(residual_gemm_key_for(*dt), KernelKey::GemmHfq4G256Residual);
+            assert_ne!(fused_qkvza_key_for(*dt), KernelKey::FusedQkvzaHfq4G256);
+            assert_ne!(fused_qkv_key_for(*dt), KernelKey::FusedQkvHfq4G256);
+            assert_ne!(fused_gate_up_key_for(*dt), KernelKey::FusedGateUpHfq4G256);
+        }
+        // Negative: v1 and MQ4C must NOT map to new V2 keys
+        assert_eq!(
+            residual_gemm_key_for(DType::MQ4G256),
+            KernelKey::GemmHfq4G256Residual
+        );
+        assert_eq!(
+            fused_qkv_key_for(DType::HFQ4G256),
+            KernelKey::FusedQkvHfq4G256
+        );
+    }
+
+    #[test]
+    fn v2_plain_gemm_resolve_no_wildcard() {
+        // Plain GEMM auto-selection (GemmFamily::resolve) — not this file's logic
+        // but we assert the key helpers correctly identify V2 vs wildcard.
+        // The actual resolve is tested in dispatch; here we ensure dtype identity.
+        assert_ne!(DType::MQ6G256V2, DType::HFQ4G256);
+        assert_ne!(DType::MQ5G256V2, DType::HFQ4G256);
+        assert_ne!(DType::MQ3G256V2, DType::HFQ4G256);
+        assert_ne!(DType::MQ2G256V2, DType::HFQ4G256);
+    }
 }

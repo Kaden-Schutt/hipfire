@@ -119,9 +119,10 @@ pub fn dtype_rotation_plan(dtype: DType) -> RotationPlan {
     match dtype {
         // MQ2G256GL / MQ3G256GL are encoded against FWHT-256-rotated
         // blocks exactly like the other MQ*-G256 dtypes.
-        MQ4G256 | MQ4G256V2 | MQ4CG256 | MQ3G256 | MQ2G256 | MQ5G256 | MQ6G256 | MQ2G256Lloyd
-        | MQ3G256Lloyd | MQ4G256Lloyd | MQ2G256GL | MQ3G256GL | MFP4G32 | MFP4G32Lloyd
-        | MFP4G32P | MFP4G32E8 | MFP4G32E8SOA | MFP3G32E8 | MFP2G32E8 => RotationPlan::FwhtG256,
+        MQ4G256 | MQ4G256V2 | MQ5G256V2 | MQ6G256V2 | MQ3G256V2 | MQ2G256V2 | MQ4CG256
+        | MQ3G256 | MQ2G256 | MQ5G256 | MQ6G256 | MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd
+        | MQ2G256GL | MQ3G256GL | MFP4G32 | MFP4G32Lloyd | MFP4G32P | MFP4G32E8 | MFP4G32E8SOA
+        | MFP3G32E8 | MFP2G32E8 => RotationPlan::FwhtG256,
         // MQ4G128 and MQ8G256 carry their OWN plans and MUST NOT reach the `_` arm:
         // falling through to RotationPlan::None leaves x unrotated against weights
         // that were encoded post-rotation, which is silent garbage, not an error.
@@ -141,9 +142,11 @@ pub fn dtype_post_rotation_variant(dtype: DType) -> GemvVariant {
         ParoQ4G128 => GemvVariant::Plain,
         // GL formats are MoE-indexed-only and intentionally have no dense
         // prerotated GEMV route.
-        MQ4G256 | MQ4G256V2 | MQ4CG256 | MQ3G256 | MQ2G256 | MQ5G256 | MQ6G256 | MQ8G256
-        | MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd | MFP4G32 | MFP4G32Lloyd | MFP4G32P
-        | MFP4G32E8 | MFP4G32E8SOA | MQ4G128 => GemvVariant::Prerotated,
+        MQ4G256 | MQ4G256V2 | MQ5G256V2 | MQ6G256V2 | MQ3G256V2 | MQ2G256V2 | MQ4CG256
+        | MQ3G256 | MQ2G256 | MQ5G256 | MQ6G256 | MQ8G256 | MQ2G256Lloyd | MQ3G256Lloyd
+        | MQ4G256Lloyd | MFP4G32 | MFP4G32Lloyd | MFP4G32P | MFP4G32E8 | MFP4G32E8SOA | MQ4G128 => {
+            GemvVariant::Prerotated
+        }
         _ => GemvVariant::Plain,
     }
 }
@@ -159,12 +162,17 @@ pub fn fused_qkv_variant_for_key(key: KernelKey) -> Option<FusedQkvVariant> {
     use KernelKey::*;
     match key {
         // 3-way Fused QKV (incl. Q4K, Q8_0/HFQ3/HFP4 prefill, and the Paro 4G128T QKV synthesis)
-        FusedQkvHfq4G256 | FusedQkvMq4G256V2 | FusedQkvMq4CG256 | FusedQkvMq3G256Lloyd
+        FusedQkvHfq4G256 | FusedQkvMq4G256V2 | FusedQkvMq6G256V2 | FusedQkvMq5G256V2
+        | FusedQkvMq3G256V2 | FusedQkvMq2G256V2 | FusedQkvMq4CG256 | FusedQkvMq3G256Lloyd
         | FusedQkvMq4G256Lloyd | FusedQkvHfq6G256 | FusedQkvQ4K | FusedQkvQ8_0
         | FusedQkvHfq3G256 | FusedQkvHfp4G32 | FusedQkvParo4G128T => Some(FusedQkvVariant::Qkv),
         // 4-way Fused QKVZA (DeltaNet linear attention, incl. Q8_0/HFQ3/HFP4 prefill and Paro 4G128T)
         FusedQkvzaHfq4G256
         | FusedQkvzaMq4G256V2
+        | FusedQkvzaMq6G256V2
+        | FusedQkvzaMq5G256V2
+        | FusedQkvzaMq3G256V2
+        | FusedQkvzaMq2G256V2
         | FusedQkvzaMq4CG256
         | FusedQkvzaMq3G256Lloyd
         | FusedQkvzaMq4G256Lloyd
@@ -176,6 +184,10 @@ pub fn fused_qkv_variant_for_key(key: KernelKey) -> Option<FusedQkvVariant> {
         | FusedQkvzaParo4G128T => Some(FusedQkvVariant::Qkvza),
         FusedGateUpHfq4G256
         | FusedGateUpMq4G256V2
+        | FusedGateUpMq6G256V2
+        | FusedGateUpMq5G256V2
+        | FusedGateUpMq3G256V2
+        | FusedGateUpMq2G256V2
         | FusedGateUpMq4CG256
         | FusedGateUpMq3G256Lloyd
         | FusedGateUpMq4G256Lloyd
@@ -235,6 +247,10 @@ pub enum KernelKey {
     GemvMq4G256Prerotated,
     GemvMq4G256V2Prerotated,
     GemvMq4CG256Prerotated,
+    GemvMq5G256V2Prerotated,
+    GemvMq6G256V2Prerotated,
+    GemvMq3G256V2Prerotated,
+    GemvMq2G256V2Prerotated,
     GemvMq2G256Prerotated,
     GemvMq3G256Prerotated,
     GemvMq5G256Prerotated,
@@ -255,6 +271,10 @@ pub enum KernelKey {
     GemvMq4G256Residual,
     GemvMq4G256V2Residual,
     GemvMq4CG256Residual,
+    GemvMq5G256V2Residual,
+    GemvMq6G256V2Residual,
+    GemvMq3G256V2Residual,
+    GemvMq2G256V2Residual,
     GemvMq3G256Residual,
     GemvMq5G256Residual,
     GemvMq6G256Residual,
@@ -267,6 +287,10 @@ pub enum KernelKey {
     GemvMq4G256SwiGLUResidual,
     GemvMq4G256V2SwiGLUResidual,
     GemvMq4CG256SwiGLUResidual,
+    GemvMq5G256V2SwiGLUResidual,
+    GemvMq6G256V2SwiGLUResidual,
+    GemvMq3G256V2SwiGLUResidual,
+    GemvMq2G256V2SwiGLUResidual,
     GemvMq3G256SwiGLUResidual,
     GemvMq5G256SwiGLUResidual,
     GemvMq6G256SwiGLUResidual,
@@ -282,10 +306,22 @@ pub enum KernelKey {
     GemmHfq4G128,
     GemmMq4G256V2,
     GemmMq4CG256,
+    GemmMq5G256V2,
+    GemmMq6G256V2,
+    GemmMq3G256V2,
+    GemmMq2G256V2,
     GemmMq4G256V2Residual,
     GemmMq4CG256Residual,
+    GemmMq5G256V2Residual,
+    GemmMq6G256V2Residual,
+    GemmMq3G256V2Residual,
+    GemmMq2G256V2Residual,
     GemmMq4G256V2BatchedLmhead,
     GemmMq4CG256BatchedLmhead,
+    GemmMq5G256V2BatchedLmhead,
+    GemmMq6G256V2BatchedLmhead,
+    GemmMq3G256V2BatchedLmhead,
+    GemmMq2G256V2BatchedLmhead,
     GemmQ8_0BatchedChunked,
     GemmQ8_0Wmma,
     GemmQ8_0Wmma4W,
@@ -346,6 +382,10 @@ pub enum KernelKey {
     FusedQkvHfq4G256,
     FusedQkvMq4G256V2,
     FusedQkvMq4CG256,
+    FusedQkvMq5G256V2,
+    FusedQkvMq6G256V2,
+    FusedQkvMq3G256V2,
+    FusedQkvMq2G256V2,
     FusedQkvMq3G256Lloyd,
     FusedQkvMq4G256Lloyd,
     FusedQkvHfq6G256,
@@ -357,6 +397,10 @@ pub enum KernelKey {
     FusedQkvzaHfq4G256,
     FusedQkvzaMq4G256V2,
     FusedQkvzaMq4CG256,
+    FusedQkvzaMq5G256V2,
+    FusedQkvzaMq6G256V2,
+    FusedQkvzaMq3G256V2,
+    FusedQkvzaMq2G256V2,
     FusedQkvzaMq3G256Lloyd,
     FusedQkvzaMq4G256Lloyd,
     FusedQkvzaHfq6G256,
@@ -369,6 +413,10 @@ pub enum KernelKey {
     FusedGateUpHfq4G256,
     FusedGateUpMq4G256V2,
     FusedGateUpMq4CG256,
+    FusedGateUpMq5G256V2,
+    FusedGateUpMq6G256V2,
+    FusedGateUpMq3G256V2,
+    FusedGateUpMq2G256V2,
     FusedGateUpMq3G256Lloyd,
     FusedGateUpMq4G256Lloyd,
     FusedGateUpHfq6G256,
@@ -673,6 +721,10 @@ impl KernelKey {
             MQ4G256 => Ok(Self::GemvMq4G256Prerotated),
             MQ4G256V2 => Ok(Self::GemvMq4G256V2Prerotated),
             MQ4CG256 => Ok(Self::GemvMq4CG256Prerotated),
+            MQ5G256V2 => Ok(Self::GemvMq5G256V2Prerotated),
+            MQ6G256V2 => Ok(Self::GemvMq6G256V2Prerotated),
+            MQ3G256V2 => Ok(Self::GemvMq3G256V2Prerotated),
+            MQ2G256V2 => Ok(Self::GemvMq2G256V2Prerotated),
             MQ2G256 => Ok(Self::GemvMq2G256Prerotated),
             MQ3G256 => Ok(Self::GemvMq3G256Prerotated),
             MQ5G256 => Ok(Self::GemvMq5G256Prerotated),
@@ -723,6 +775,10 @@ impl KernelKey {
             MQ4G256 => Ok(Self::GemvMq4G256Residual),
             MQ4G256V2 => Ok(Self::GemvMq4G256V2Residual),
             MQ4CG256 => Ok(Self::GemvMq4CG256Residual),
+            MQ5G256V2 => Ok(Self::GemvMq5G256V2Residual),
+            MQ6G256V2 => Ok(Self::GemvMq6G256V2Residual),
+            MQ3G256V2 => Ok(Self::GemvMq3G256V2Residual),
+            MQ2G256V2 => Ok(Self::GemvMq2G256V2Residual),
             MQ3G256 => Ok(Self::GemvMq3G256Residual),
             MQ5G256 => Ok(Self::GemvMq5G256Residual),
             MQ6G256 => Ok(Self::GemvMq6G256Residual),
@@ -746,6 +802,10 @@ impl KernelKey {
             MQ4G256 => Ok(Self::GemvMq4G256SwiGLUResidual),
             MQ4G256V2 => Ok(Self::GemvMq4G256V2SwiGLUResidual),
             MQ4CG256 => Ok(Self::GemvMq4CG256SwiGLUResidual),
+            MQ5G256V2 => Ok(Self::GemvMq5G256V2SwiGLUResidual),
+            MQ6G256V2 => Ok(Self::GemvMq6G256V2SwiGLUResidual),
+            MQ3G256V2 => Ok(Self::GemvMq3G256V2SwiGLUResidual),
+            MQ2G256V2 => Ok(Self::GemvMq2G256V2SwiGLUResidual),
             MQ3G256 => Ok(Self::GemvMq3G256SwiGLUResidual),
             MQ5G256 => Ok(Self::GemvMq5G256SwiGLUResidual),
             MQ6G256 => Ok(Self::GemvMq6G256SwiGLUResidual),
@@ -806,7 +866,7 @@ impl KernelKey {
             MQ5G256 => ArchPredicate::HasMmq,
             MQ6G256 | HFQ6G256 => ArchPredicate::HasMmq,
             MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd => ArchPredicate::HasWave32,
-            MQ2G256GL | MQ3G256GL | MQ4G256V2 | MQ4CG256 => ArchPredicate::HasWave32,
+            MQ2G256GL | MQ3G256GL | MQ4G256V2 | MQ2G256V2 | MQ3G256V2 | MQ5G256V2 | MQ6G256V2 | MQ4CG256 => ArchPredicate::HasWave32,
             Q8HFQ | Raw => ArchPredicate::Always,
         }
     }
@@ -824,8 +884,8 @@ impl KernelKey {
             Prerotated => &[PipelineOp::Gemv],
             WithResidual => {
                 let steps: &[PipelineOp] = match dtype {
-                    MQ4G256 | MQ4G256V2 | MQ4CG256 | MQ3G256 | MQ5G256 | MQ6G256 | MQ3G256Lloyd
-                    | MQ4G256Lloyd => &[
+                    MQ4G256 | MQ4G256V2 | MQ2G256V2 | MQ3G256V2 | MQ5G256V2 | MQ6G256V2
+                    | MQ4CG256 | MQ3G256 | MQ5G256 | MQ6G256 | MQ3G256Lloyd | MQ4G256Lloyd => &[
                         PipelineOp::RotateFwht,
                         PipelineOp::Gemv,
                         PipelineOp::ResidualAdd,
@@ -836,8 +896,10 @@ impl KernelKey {
             }
             WithSwiGLUResidual => {
                 let steps: &[PipelineOp] = match dtype {
-                    MQ4G256 | MQ4G256V2 | MQ4CG256 | MQ3G256 | MQ5G256 | MQ6G256 | MQ3G256Lloyd
-                    | MQ4G256Lloyd => &[PipelineOp::SiluMulRotate, PipelineOp::GemvResidual],
+                    MQ4G256 | MQ4G256V2 | MQ2G256V2 | MQ3G256V2 | MQ5G256V2 | MQ6G256V2
+                    | MQ4CG256 | MQ3G256 | MQ5G256 | MQ6G256 | MQ3G256Lloyd | MQ4G256Lloyd => {
+                        &[PipelineOp::SiluMulRotate, PipelineOp::GemvResidual]
+                    }
                     _ => &[
                         PipelineOp::SiluMul,
                         PipelineOp::Gemv,
@@ -858,6 +920,10 @@ pub fn dtype_needs_rotation(dtype: DType) -> bool {
         dtype,
         MQ4G256
             | MQ4G256V2
+            | MQ5G256V2
+            | MQ6G256V2
+            | MQ3G256V2
+            | MQ2G256V2
             | MQ4CG256
             | MQ4G128
             | MQ3G256

@@ -3,24 +3,29 @@
 // Copyright (c) 2026 Nick Woolmer
 // hipfire — see LICENSE and NOTICE in the project root.
 
-
-#![allow(dead_code, unused_imports, unused_variables, non_snake_case, clippy::all)]
+#![allow(
+    dead_code,
+    unused_imports,
+    unused_variables,
+    non_snake_case,
+    clippy::all
+)]
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::fs::File;
 use std::io::Write;
-use std::sync::OnceLock;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
-use clap::Parser;
-use hipfire_quantize::float16::{bf16_to_f32, f16_to_f32, f32_to_f16};
-use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
-use hipfire_quantize::hessian_io;
 use crate::e8;
 use crate::e8_gptq;
 use crate::gguf_input;
 use crate::reap_overlay;
+use clap::Parser;
+use hipfire_quantize::float16::{bf16_to_f32, f16_to_f32, f32_to_f16};
+use hipfire_quantize::hessian_io;
+use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
 
 // ─── Model Discovery ────────────────────────────────────────────────────────
 
@@ -37,14 +42,6 @@ pub(crate) fn find_safetensors(dir: &Path) -> Vec<PathBuf> {
 
 /// Determine which tensors to quantize (weight matrices) vs keep as F16 (norms, embeddings)
 pub(crate) fn should_quantize(name: &str) -> bool {
-    // Vision encoder weights stay FP16 (only ~500M params, run once per image).
-    // Qwen3.5-VL uses `model.visual.*` / `visual.*`; dots.ocr uses
-    // `vision_tower.*`. Glimmer uses `model.vision_tower.*`,
-    // `model.vision_adapter.*`, `model.vision_projection.*`. All vision stays
-    // F16 during bring-up so the per-stage diff against the HF reference
-    // activations (`benchmarks/references/<image>_activations/`) doesn't have
-    // to absorb both forward-pass implementation noise AND quant noise — clean
-    // attribution. See memory `feedback_dots_ocr_vision_f16_during_bringup`.
     if name.starts_with("model.visual.")
         || name.starts_with("visual.")
         || name.starts_with("vision_tower.")
@@ -57,24 +54,9 @@ pub(crate) fn should_quantize(name: &str) -> bool {
     if name.contains("norm") || name.contains("bias") {
         return false;
     }
-    // Quantize everything including embeddings (Q8 embedding saves ~2.3GB for 8B models)
     name.contains("weight")
 }
 
-/// antirez ds4 reference keeps three classes at F16 because Q8 measurably
-/// regresses PPL on DeepSeek V4: (1) attn compressor wkv + wgate, (2) indexer wq_b +
-/// weights_proj, (3) indexer compressor wkv + wgate. All small (≤32 MiB
-/// combined across 43 layers).
-///
-/// Router gate.weight (.ffn.gate.weight) is NOT kept at F16: antirez
-/// actually ships it as MQ4G256, and the known-good DeepSeek V4 quant
-/// matches. Falling back to the format's default (Q8F16 in deepseek4-q8-mtp)
-/// is fine — the router is dispatched via `gemv_auto`.
-///
-/// `attn.indexer.compressor.*` is a substring of `attn.compressor.*` only
-/// in the literal-prefix sense, so order doesn't matter — the substring
-/// `.compressor.wkv.weight` matches both `.attn.compressor.wkv.weight` and
-/// `.attn.indexer.compressor.wkv.weight` deliberately.
 pub(crate) fn is_deepseek4_keep_f16(name: &str) -> bool {
     name.ends_with(".compressor.wkv.weight")
         || name.ends_with(".compressor.wgate.weight")
@@ -82,14 +64,6 @@ pub(crate) fn is_deepseek4_keep_f16(name: &str) -> bool {
         || name.ends_with(".indexer.weights_proj.weight")
 }
 
-/// Frozen MQ2RXT P3 replacement map.
-///
-/// This selects only tensors that are MFP4G32E8SOA in the released 0731
-/// MQ2R artifact (554 trunk tensors, 24 DSpark tensors). The overlay builder
-/// reads the original 0731 checkpoint and encodes these directly as MQ4G256;
-/// it never dequantizes the E8 artifact. Routed experts and protected Q8/F16
-/// tensors are deliberately absent from the overlay and remain byte-identical
-/// to the 0731 MQ2R bases when baked.
 pub(crate) fn is_deepseek4_mq2rxt_dense(name: &str) -> bool {
     if name == "head.weight" {
         return true;
@@ -128,7 +102,10 @@ pub(crate) fn is_deepseek4_mq2rxt_dense(name: &str) -> bool {
         .any(|suffix| name.ends_with(suffix))
 }
 
-pub(crate) fn stamp_deepseek4_mq2rxt_metadata(metadata_json: &str, sidecar: bool) -> Result<String, String> {
+pub(crate) fn stamp_deepseek4_mq2rxt_metadata(
+    metadata_json: &str,
+    sidecar: bool,
+) -> Result<String, String> {
     let mut metadata: serde_json::Value = serde_json::from_str(metadata_json)
         .map_err(|error| format!("MQ2RXT metadata is not valid JSON: {error}"))?;
     let object = metadata
@@ -210,6 +187,9 @@ mod mq2rxt_recipe_tests {
 /// Ordered cheapest-to-keep first by measured per-token bytes on a3b:
 /// router+gate 11.1 MB, lm_head 270 MB, attention 682 MB (of a 1031 MB fixed
 /// tier at MQ4). Attention is 66% of the fixed tier, lm_head 26%.
+/// `ssm_out` is the architecture-neutral name for `linear_attn.out_proj.weight`
+/// — the Qwen3.8 DeltaNet recurrent SSM state — checked most-specifically before
+/// the broad `linear_attn` -> `attn` bucket.
 pub(crate) fn q8_class_of(name: &str) -> Option<&'static str> {
     if name.contains("lm_head") {
         Some("lm_head")
@@ -220,6 +200,8 @@ pub(crate) fn q8_class_of(name: &str) -> Option<&'static str> {
         || name.ends_with("router.proj.weight")
     {
         Some("router")
+    } else if name.contains("linear_attn.out_proj") || name.contains("ssm_out") {
+        Some("ssm_out")
     } else if name.contains("self_attn")
         || name.contains("attn_q")
         || name.contains("attn_k")
@@ -229,7 +211,7 @@ pub(crate) fn q8_class_of(name: &str) -> Option<&'static str> {
         || name.contains("k_proj")
         || name.contains("v_proj")
         || name.contains("o_proj")
-        // Qwen3.5 DeltaNet attention
+        // Qwen3.5 DeltaNet attention — broad bucket, after ssm_out specificity
         || name.contains("linear_attn")
     {
         Some("attn")
@@ -238,10 +220,151 @@ pub(crate) fn q8_class_of(name: &str) -> Option<&'static str> {
     }
 }
 
+// ── Strict validation for env/CLI tokens ────────────────────────────────
+
+pub(crate) const VALID_Q8_CLASSES: &[&str] = &["lm_head", "embed", "router", "attn", "ssm_out"];
+pub(crate) const VALID_FIXED_DTYPES: &[&str] = &[
+    "q8",
+    "mq2v2",
+    "mq3v2",
+    "mq4v2",
+    "mq5v2",
+    "mq6v2",
+    // legacy compat — still accepted but not advertised for new products
+    "mq4",
+    "mq3l",
+    "mfp4e8",
+    "mfp4e8soa",
+];
+
+pub(crate) fn validate_q8_classes_spec(spec: &str) -> Result<(), String> {
+    for raw in spec.split(',') {
+        let c = raw.trim();
+        if c.is_empty() {
+            continue;
+        }
+        if !VALID_Q8_CLASSES.contains(&c) {
+            return Err(format!(
+                "unknown HIPFIRE_Q8_CLASSES class '{c}' (expected one of lm_head,embed,router,attn,ssm_out)"
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_fixed_tier_spec(spec: &str) -> Result<(), String> {
+    for entry in spec.split(',') {
+        let e = entry.trim();
+        if e.is_empty() {
+            continue;
+        }
+        let Some((c, d)) = e.split_once(':') else {
+            return Err(format!(
+                "malformed HIPFIRE_FIXED_TIER entry '{e}' (expected <class>:<dtype>, e.g. lm_head:mq6v2)"
+            ));
+        };
+        let class = c.trim();
+        let dtype = d.trim();
+        if !VALID_Q8_CLASSES.contains(&class) {
+            return Err(format!(
+                "unknown HIPFIRE_FIXED_TIER class '{class}' (expected one of lm_head,embed,router,attn,ssm_out)"
+            ));
+        }
+        if !VALID_FIXED_DTYPES.contains(&dtype) {
+            return Err(format!(
+                "unknown HIPFIRE_FIXED_TIER dtype '{dtype}' (expected q8|mq2v2|mq3v2|mq4v2|mq5v2|mq6v2)"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Fail before worker threads if any unknown class/dtype token appears in the
+/// two fixed-tier env strings. Called at CLI boundary before rayon spawn.
+pub(crate) fn validate_env_fixed_tier_or_exit() {
+    if let Ok(spec) = std::env::var("HIPFIRE_Q8_CLASSES") {
+        if let Err(e) = validate_q8_classes_spec(&spec) {
+            eprintln!("error: HIPFIRE_Q8_CLASSES: {e}");
+            std::process::exit(2);
+        }
+    }
+    if let Ok(spec) = std::env::var("HIPFIRE_FIXED_TIER") {
+        if let Err(e) = validate_fixed_tier_spec(&spec) {
+            eprintln!("error: HIPFIRE_FIXED_TIER: {e}");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// Strict parser for HIPFIRE_Q8_CLASSES / --q8-classes. Returns trimmed list.
+pub(crate) fn parse_q8_classes(spec: &str) -> Result<Vec<String>, String> {
+    validate_q8_classes_spec(spec)?;
+    Ok(spec
+        .split(',')
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty())
+        .collect())
+}
+
+/// Strict parser for HIPFIRE_FIXED_TIER / --fixed-tier. Returns class->dtype map.
+pub(crate) fn parse_fixed_tier(spec: &str) -> Result<HashMap<String, String>, String> {
+    validate_fixed_tier_spec(spec)?;
+    let mut map = HashMap::new();
+    for entry in spec.split(',') {
+        let e = entry.trim();
+        if e.is_empty() {
+            continue;
+        }
+        let (c, d) = e.split_once(':').unwrap();
+        map.insert(c.trim().to_string(), d.trim().to_string());
+    }
+    Ok(map)
+}
+
+/// Product tier for Qwen3.8 ladder. XT keeps lm_head at base codec, base lifts
+/// lm_head, pro also lifts ssm_out (linear_attn.out_proj). Embed and conv1d stay
+/// Q8 at every rung; structural norms stay F16.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProductTier {
+    Xt,
+    Base,
+    Pro,
+}
+
+impl ProductTier {
+    pub(crate) fn from_flag(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "xt" => Some(Self::Xt),
+            "base" => Some(Self::Base),
+            "pro" => Some(Self::Pro),
+            _ => None,
+        }
+    }
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            Self::Xt => "xt",
+            Self::Base => "base",
+            Self::Pro => "pro",
+        }
+    }
+    /// Which classes are held above base codec at this rung? Includes embed
+    /// and ssm_out; conv1d is covered separately via is_conv1d_tensor.
+    pub(crate) fn lifted_classes(&self) -> &'static [&'static str] {
+        match self {
+            Self::Xt => &["embed"],
+            Self::Base => &["embed", "lm_head"],
+            Self::Pro => &["embed", "lm_head", "ssm_out"],
+        }
+    }
+    pub(crate) fn lifts(&self, class: &str) -> bool {
+        self.lifted_classes().contains(&class)
+    }
+}
+
 /// Fixed-tier tensors held at Q8F16 regardless of `--format`.
 ///
 /// `HIPFIRE_Q8_CLASSES=<comma list>` narrows this to a subset of
-/// {`lm_head`, `embed`, `router`, `attn`} — the lever for attributing which
+/// {`lm_head`, `embed`, `router`, `attn`, `ssm_out`} — the lever for attributing which
 /// fixed class actually carries the quality. Measured 2026-08-04: dropping the
 /// WHOLE fixed tier Q8 -> MQ4 costs **+35.2% KLD** (0.1742 -> 0.2356) while
 /// buying 1.75x decode speed, so the tier is emphatically not free — but the
@@ -255,34 +378,56 @@ pub(crate) fn is_q8_tensor(name: &str) -> bool {
     let Some(class) = q8_class_of(name) else {
         return false;
     };
-    // A class named in HIPFIRE_FIXED_TIER is held above --format even if it is
-    // not in HIPFIRE_Q8_CLASSES — it just lands on the named dtype instead of Q8.
     if fixed_tier_dtype_for(name).is_some() {
         return true;
     }
     match std::env::var("HIPFIRE_Q8_CLASSES") {
-        Ok(list) => list.split(',').any(|c| c.trim() == class),
+        Ok(list) => {
+            // validated at startup; still handle empty list as no lift
+            list.split(',').any(|c| c.trim() == class)
+        }
         Err(_) => true,
     }
 }
 
-/// `HIPFIRE_FIXED_TIER=lm_head:mfp4e8soa,attn:mq4` — per-class dtype for the
+/// `HIPFIRE_FIXED_TIER=lm_head:mq6v2,ssm_out:mq5v2` — per-class dtype for the
 /// fixed tier. Returns the dtype token for `name`'s class, or `None` to fall
 /// back to Q8F16 (the historic behaviour).
 ///
-/// Accepted dtypes: `q8`, `mq4`, `mq3l`, `mfp4e8`, `mfp4e8soa`. Accepted
-/// classes: `lm_head`, `embed`, `router`, `attn` (see `q8_class_of`).
+/// Accepted dtypes: `q8`, `mq2v2`, `mq3v2`, `mq4v2`, `mq5v2`, `mq6v2` (plus legacy
+/// `mq4`, `mq3l`, `mfp4e8`, `mfp4e8soa`). Accepted
+/// classes: `lm_head`, `embed`, `router`, `attn`, `ssm_out` (see `q8_class_of`).
 pub(crate) fn fixed_tier_dtype_for(name: &str) -> Option<&'static str> {
     let class = q8_class_of(name)?;
+    // Prefer CLI map if set (populated from --fixed-tier), else env.
+    if let Some(map) = fixed_tier_map_cli() {
+        if let Some(dtype) = map.get(class) {
+            return match dtype.as_str() {
+                "q8" => None,
+                "mfp4e8soa" => Some("mfp4e8soa"),
+                "mfp4e8" => Some("mfp4e8"),
+                "mq4" => Some("mq4"),
+                "mq3l" => Some("mq3l"),
+                "mq2v2" => Some("mq2v2"),
+                "mq3v2" => Some("mq3v2"),
+                "mq4v2" => Some("mq4v2"),
+                "mq5v2" => Some("mq5v2"),
+                "mq6v2" => Some("mq6v2"),
+                _ => None,
+            };
+        }
+        return None;
+    }
     let spec = std::env::var("HIPFIRE_FIXED_TIER").ok()?;
     for entry in spec.split(',') {
-        // NOT `?` — a `?` here aborts the whole lookup on the FIRST malformed
-        // entry and silently returns None, i.e. every class quietly falls back
-        // to Q8 and the encode looks like it worked. Fail loudly instead.
-        let Some((c, d)) = entry.split_once(':') else {
+        let e = entry.trim();
+        if e.is_empty() {
+            continue;
+        }
+        let Some((c, d)) = e.split_once(':') else {
             eprintln!(
-                "error: HIPFIRE_FIXED_TIER: malformed entry '{entry}' \
-                 (expected <class>:<dtype>, e.g. attn:mfp4e8soa)"
+                "error: HIPFIRE_FIXED_TIER: malformed entry '{e}' \
+                 (expected <class>:<dtype>, e.g. lm_head:mq6v2)"
             );
             std::process::exit(2);
         };
@@ -292,11 +437,16 @@ pub(crate) fn fixed_tier_dtype_for(name: &str) -> Option<&'static str> {
                 "mfp4e8" => Some("mfp4e8"),
                 "mq4" => Some("mq4"),
                 "mq3l" => Some("mq3l"),
-                "q8" => None, // explicit q8 == default
+                "mq2v2" => Some("mq2v2"),
+                "mq3v2" => Some("mq3v2"),
+                "mq4v2" => Some("mq4v2"),
+                "mq5v2" => Some("mq5v2"),
+                "mq6v2" => Some("mq6v2"),
+                "q8" => None,
                 other => {
                     eprintln!(
                         "error: HIPFIRE_FIXED_TIER: unknown dtype '{other}' \
-                         (expected q8|mq4|mq3l|mfp4e8|mfp4e8soa)"
+                         (expected q8|mq2v2|mq3v2|mq4v2|mq5v2|mq6v2)"
                     );
                     std::process::exit(2);
                 }
@@ -306,10 +456,174 @@ pub(crate) fn fixed_tier_dtype_for(name: &str) -> Option<&'static str> {
     None
 }
 
+// CLI-provided fixed-tier map, set once at startup before threads.
+static FIXED_TIER_CLI: OnceLock<Option<HashMap<String, String>>> = OnceLock::new();
+
+pub(crate) fn set_fixed_tier_cli(spec: Option<String>) {
+    let parsed = match spec {
+        Some(s) => {
+            if s.trim().is_empty() {
+                Some(HashMap::new())
+            } else {
+                match parse_fixed_tier(&s) {
+                    Ok(m) => Some(m),
+                    Err(e) => {
+                        eprintln!("error: --fixed-tier: {e}");
+                        std::process::exit(2);
+                    }
+                }
+            }
+        }
+        None => None,
+    };
+    let _ = FIXED_TIER_CLI.set(parsed);
+}
+
+pub(crate) fn fixed_tier_map_cli() -> Option<HashMap<String, String>> {
+    FIXED_TIER_CLI.get().cloned().flatten()
+}
+
+pub(crate) fn is_fixed_tier_cli_set() -> bool {
+    FIXED_TIER_CLI.get().is_some()
+}
+
+static PRODUCT_TIER_CLI: OnceLock<Option<ProductTier>> = OnceLock::new();
+
+pub(crate) fn set_product_tier_cli(tier: Option<ProductTier>) {
+    let _ = PRODUCT_TIER_CLI.set(tier);
+}
+
+pub(crate) fn product_tier_cli() -> Option<ProductTier> {
+    PRODUCT_TIER_CLI.get().copied().flatten()
+}
+
 /// Qwen3.5 DeltaNet conv1d weight: `{prefix}.linear_attn.conv1d.weight`,
 /// shape [conv_channels, 1, 4]. Small (~32K elem) and runs every token —
 /// Q8 is the safe default; lossy 4-bit FWHT formats (mq4/mq3) measurably
 /// hurt the gated-delta path.
 pub(crate) fn is_conv1d_tensor(name: &str) -> bool {
     name.ends_with("conv1d.weight")
+}
+
+#[cfg(test)]
+mod product_tier_tests {
+    use super::*;
+
+    #[test]
+    fn q8_class_of_exact_roles() {
+        // lm_head
+        assert_eq!(q8_class_of("model.lm_head.weight"), Some("lm_head"));
+        assert_eq!(q8_class_of("lm_head.weight"), Some("lm_head"));
+        // embed
+        assert_eq!(q8_class_of("model.embed_tokens.weight"), Some("embed"));
+        assert_eq!(q8_class_of("embed.weight"), Some("embed"));
+        // router
+        assert_eq!(q8_class_of("layers.0.mlp.gate.weight"), Some("router"));
+        // ssm_out most-specific before attn
+        assert_eq!(
+            q8_class_of("model.layers.0.linear_attn.out_proj.weight"),
+            Some("ssm_out")
+        );
+        assert_eq!(q8_class_of("blk.0.ssm_out.weight"), Some("ssm_out"));
+        // linear_attn other tensors should be attn, not ssm_out
+        assert_eq!(
+            q8_class_of("model.layers.0.linear_attn.in_proj.weight"),
+            Some("attn")
+        );
+        assert_eq!(
+            q8_class_of("model.layers.0.linear_attn.conv1d.weight"),
+            Some("attn")
+        );
+        // self_attn should be attn
+        assert_eq!(
+            q8_class_of("model.layers.0.self_attn.q_proj.weight"),
+            Some("attn")
+        );
+        assert_eq!(
+            q8_class_of("model.layers.0.self_attn.o_proj.weight"),
+            Some("attn")
+        );
+        // unrelated
+        assert_eq!(q8_class_of("model.layers.0.mlp.down_proj.weight"), None);
+        assert_eq!(q8_class_of("model.norm.weight"), None);
+    }
+
+    #[test]
+    fn unknown_token_refusal() {
+        assert!(validate_q8_classes_spec("lm_head,embed,attn").is_ok());
+        assert!(validate_q8_classes_spec("lm_head,ssm_out").is_ok());
+        assert!(validate_q8_classes_spec("attn,unknown").is_err());
+        assert!(validate_q8_classes_spec("bogus").is_err());
+        assert!(validate_fixed_tier_spec("lm_head:q8").is_ok());
+        assert!(validate_fixed_tier_spec("lm_head:mq6v2,ssm_out:mq5v2").is_ok());
+        assert!(validate_fixed_tier_spec("lm_head:mq6v2").is_ok());
+        assert!(validate_fixed_tier_spec("lm_head:unknown").is_err());
+        assert!(validate_fixed_tier_spec("unknown:q8").is_err());
+        assert!(validate_fixed_tier_spec("lm_head-q8").is_err());
+        assert!(validate_fixed_tier_spec("lm_head:mq4v2,embed:q8").is_ok());
+    }
+
+    #[test]
+    fn xt_base_pro_class_sets() {
+        let xt = ProductTier::Xt;
+        assert!(xt.lifts("embed"));
+        assert!(!xt.lifts("lm_head"));
+        assert!(!xt.lifts("ssm_out"));
+        assert!(!xt.lifts("attn"));
+        let base = ProductTier::Base;
+        assert!(base.lifts("embed"));
+        assert!(base.lifts("lm_head"));
+        assert!(!base.lifts("ssm_out"));
+        let pro = ProductTier::Pro;
+        assert!(pro.lifts("embed"));
+        assert!(pro.lifts("lm_head"));
+        assert!(pro.lifts("ssm_out"));
+        assert!(!pro.lifts("attn"));
+        assert!(!pro.lifts("router"));
+    }
+
+    #[test]
+    fn independent_lm_head_ssm_out_lifts() {
+        // lm_head:mq6v2 and ssm_out:mq5v2 should parse independently
+        let m = parse_fixed_tier("lm_head:mq6v2,ssm_out:mq5v2").unwrap();
+        assert_eq!(m.get("lm_head").map(|s| s.as_str()), Some("mq6v2"));
+        assert_eq!(m.get("ssm_out").map(|s| s.as_str()), Some("mq5v2"));
+        // single lifts
+        let m2 = parse_fixed_tier("ssm_out:mq6v2").unwrap();
+        assert_eq!(m2.get("ssm_out").unwrap(), "mq6v2");
+        assert!(m2.get("lm_head").is_none());
+        // q8 explicit
+        let m3 = parse_fixed_tier("lm_head:q8").unwrap();
+        assert_eq!(m3.get("lm_head").unwrap(), "q8");
+    }
+
+    #[test]
+    fn no_accidental_promotion_of_self_attn_or_in_proj() {
+        // self_attn and linear_attn.in_proj must be attn, not ssm_out, and Pro should not lift them
+        assert_eq!(
+            q8_class_of("model.layers.5.self_attn.q_proj.weight"),
+            Some("attn")
+        );
+        assert_eq!(
+            q8_class_of("model.layers.5.linear_attn.in_proj.weight"),
+            Some("attn")
+        );
+        let pro = ProductTier::Pro;
+        assert!(!pro.lifts("attn"), "Pro must not lift attn");
+        // ssm_out is the only DeltaNet tensor Pro lifts
+        assert_eq!(
+            q8_class_of("model.layers.5.linear_attn.out_proj.weight"),
+            Some("ssm_out")
+        );
+        assert!(pro.lifts("ssm_out"));
+    }
+
+    #[test]
+    fn product_tier_from_flag() {
+        assert_eq!(ProductTier::from_flag("xt"), Some(ProductTier::Xt));
+        assert_eq!(ProductTier::from_flag("XT"), Some(ProductTier::Xt));
+        assert_eq!(ProductTier::from_flag("base"), Some(ProductTier::Base));
+        assert_eq!(ProductTier::from_flag("pro"), Some(ProductTier::Pro));
+        assert_eq!(ProductTier::from_flag("unknown"), None);
+    }
 }

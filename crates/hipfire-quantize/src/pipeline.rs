@@ -91,6 +91,10 @@ struct MainQuantFlags {
     use_mq4g256_lloyd: bool,
     use_mq5g256: bool,
     use_mq6g256: bool,
+    use_mq5g256v2: bool,
+    use_mq6g256v2: bool,
+    use_mq3g256v2: bool,
+    use_mq2g256v2: bool,
     use_mq8g256: bool,
     use_q4k_all: bool,
     use_q4k_q8embed: bool,
@@ -101,6 +105,7 @@ struct MainQuantFlags {
     q8_router: bool,
     arch_id: u32,
     vision_quant: String,
+    product_tier: Option<crate::model_filter::ProductTier>,
 }
 
 struct MainQuantOuter<'a> {
@@ -129,6 +134,41 @@ struct FormatFlags {
 
 pub(crate) fn run() {
     let args = QuantizeArgs::parse();
+
+    // ── Strict validation before worker threads ──────────────────────────
+    // Unknown class/dtype tokens must fail before rayon spawn, and CLI/env
+    // parsers must share the same strict set.
+    crate::model_filter::validate_env_fixed_tier_or_exit();
+    let product_tier: Option<crate::model_filter::ProductTier> = match args.tier.as_deref() {
+        Some(s) => match crate::model_filter::ProductTier::from_flag(s) {
+            Some(t) => Some(t),
+            None => {
+                eprintln!("error: --tier unknown tier '{s}' (expected xt|base|pro)");
+                std::process::exit(2);
+            }
+        },
+        None => None,
+    };
+    // CLI --fixed-tier overrides env; parsed and validated via the same strict parser.
+    crate::model_filter::set_fixed_tier_cli(args.fixed_tier.clone());
+    crate::model_filter::set_product_tier_cli(product_tier);
+    if let Some(t) = product_tier {
+        eprintln!(
+            "product tier: {} (lifted classes: {})",
+            t.label(),
+            t.lifted_classes().join(",")
+        );
+        if let Some(map) = crate::model_filter::fixed_tier_map_cli() {
+            let mut entries: Vec<String> = map.iter().map(|(k, v)| format!("{k}:{v}")).collect();
+            entries.sort();
+            eprintln!("fixed-tier overrides: {}", entries.join(","));
+        }
+    } else if crate::model_filter::fixed_tier_map_cli().is_some() {
+        let map = crate::model_filter::fixed_tier_map_cli().unwrap();
+        let mut entries: Vec<String> = map.iter().map(|(k, v)| format!("{k}:{v}")).collect();
+        entries.sort();
+        eprintln!("fixed-tier overrides (CLI): {}", entries.join(","));
+    }
 
     setup_thread_pool(&args);
 
@@ -247,6 +287,10 @@ pub(crate) fn run() {
     let use_hfq_mixed = format == "hfq-mixed"; // Q8 attn + HFQ4 FFN
     let use_mq6g256 = format == "mq6" || format == "mq6g256";
     let use_mq5g256 = format == "mq5" || format == "mq5g256";
+    let use_mq6g256v2 = format == "mq6v2" || format == "mq6g256v2";
+    let use_mq5g256v2 = format == "mq5v2" || format == "mq5g256v2";
+    let use_mq3g256v2 = format == "mq3v2" || format == "mq3g256v2";
+    let use_mq2g256v2 = format == "mq2v2" || format == "mq2g256v2";
     // Native-bf16 reference. Cohere2MoE and Qwen3.5 store matmul weights as
     // the exact downloaded BF16 bytes; `f16` is a lossy-reconvert alternative
     // tier, while the all-F32 `oracle` doubles storage.
@@ -1017,6 +1061,12 @@ pub(crate) fn run() {
     let is_gemma4_family = arch_id == 13 || arch_id == 22;
     let is_moe_like =
         is_moe || is_deepseek4 || is_lfm2moe || is_minimax || is_cohere2moe || is_gemma4;
+    if (use_mq6g256v2 || use_mq5g256v2 || use_mq3g256v2 || use_mq2g256v2) && is_moe_like {
+        eprintln!(
+            "error: --format mq{{2,3,5,6}}v2 is dense-only (gfx1201 Qwen3.8); MoE model (arch_id={arch_id}) is not supported with this format. Use legacy mq{{2,3,5,6}} or mq4/mq4v2/mq4c for MoE, or run on a dense checkpoint."
+        );
+        std::process::exit(2);
+    }
     // Gemma4 (arch_id 13) defaults to kmap_mode=3 (typed-gemma4): promote down_proj,
     // v_proj, and edge-layer non-attn-qko tensors. Attn q/k/o are excluded even
     // in edge layers (dense attn promotion regresses PPL +3.1% on 27B).
@@ -2551,6 +2601,10 @@ pub(crate) fn run() {
                 use_mq4g256_lloyd: use_mq4g256_lloyd,
                 use_mq5g256: use_mq5g256,
                 use_mq6g256: use_mq6g256,
+                use_mq5g256v2: use_mq5g256v2,
+                use_mq6g256v2: use_mq6g256v2,
+                use_mq3g256v2: use_mq3g256v2,
+                use_mq2g256v2: use_mq2g256v2,
                 use_mq8g256: use_mq8g256,
                 use_q4k_all: use_q4k_all,
                 use_q4k_q8embed: use_q4k_q8embed,
@@ -2561,6 +2615,7 @@ pub(crate) fn run() {
                 q8_router,
                 arch_id,
                 vision_quant: vision_quant.to_string(),
+                product_tier,
             };
             let outer = MainQuantOuter {
                 kmap: &kmap,
@@ -2671,8 +2726,53 @@ pub(crate) fn run() {
     eprintln!("  Max quant error:  {max_quant_error:.8}");
     eprintln!("  Output size:      {:.1} MB", total_bytes as f64 / 1e6);
 
+    // ── Deterministic recipe census/metadata ─────────────────────────────
+    {
+        use std::collections::BTreeMap;
+        let mut census: BTreeMap<String, usize> = BTreeMap::new();
+        for t in &hfq_tensors {
+            let label = format!("{:?}", t.quant_type);
+            *census.entry(label).or_insert(0) += 1;
+        }
+        eprintln!("  Recipe census (deterministic):");
+        for (k, v) in &census {
+            eprintln!("    {k}: {v}");
+        }
+        if let Some(tier) = product_tier {
+            eprintln!("  Product tier: {}", tier.label());
+        }
+        if let Some(map) = crate::model_filter::fixed_tier_map_cli() {
+            let mut entries: Vec<String> = map.iter().map(|(k, v)| format!("{k}:{v}")).collect();
+            entries.sort();
+            eprintln!("  Fixed-tier: {}", entries.join(","));
+        }
+        // Inject into metadata_json deterministically sorted
+        let mut meta_val: serde_json::Value =
+            serde_json::from_str(&metadata_json).unwrap_or(serde_json::json!({}));
+        if let Some(obj) = meta_val.as_object_mut() {
+            obj.insert(
+                "hipfire_recipe_census".to_string(),
+                serde_json::to_value(&census).unwrap_or(serde_json::json!({})),
+            );
+            if let Some(tier) = product_tier {
+                obj.insert("hipfire_product_tier".to_string(), tier.label().into());
+            }
+            if let Some(map) = crate::model_filter::fixed_tier_map_cli() {
+                let mut sorted: BTreeMap<String, String> = BTreeMap::new();
+                for (k, v) in map {
+                    sorted.insert(k, v);
+                }
+                obj.insert(
+                    "hipfire_fixed_tier".to_string(),
+                    serde_json::to_value(sorted).unwrap(),
+                );
+            }
+            obj.insert("hipfire_base_format".to_string(), format.to_string().into());
+            metadata_json = serde_json::to_string(&meta_val).unwrap_or(metadata_json);
+        }
+    }
+
     // ── SP4b: bake prune finalize (rename kept per-expert tensors + patch count) ──
-    // Applied only when a bake keep-map is active. Renames the per-expert-named
     // kept tensors (ds4 score layers / lfm2 / minimax) recorded during the loop to
     // their compact slots, then patches the output metadata's routed-expert count
     // to `kept_per_layer` so the baked model loads standalone (no env var, no
@@ -4790,8 +4890,31 @@ fn handle_main_quant(
                             let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
                             (q, QuantType::MQ6G256, 256u32, "MQ6G256")
                         }
+                        GgufFormat::Mq6V2 => {
+                            let m = meta.shape[0];
+                            let k = k_dim;
+                            let q = quantize_mq6g256v2(&f32_data, m, k, &signs1, &signs2);
+                            (q, QuantType::MQ6G256V2, 256u32, "MQ6G256V2")
+                        }
+                        GgufFormat::Mq5V2 => {
+                            let m = meta.shape[0];
+                            let k = k_dim;
+                            let q = quantize_mq5g256v2(&f32_data, m, k, &signs1, &signs2);
+                            (q, QuantType::MQ5G256V2, 256u32, "MQ5G256V2")
+                        }
+                        GgufFormat::Mq3V2 => {
+                            let m = meta.shape[0];
+                            let k = k_dim;
+                            let q = quantize_mq3g256v2(&f32_data, m, k, &signs1, &signs2);
+                            (q, QuantType::MQ3G256V2, 256u32, "MQ3G256V2")
+                        }
+                        GgufFormat::Mq2V2 => {
+                            let m = meta.shape[0];
+                            let k = k_dim;
+                            let q = quantize_mq2g256v2(&f32_data, m, k, &signs1, &signs2);
+                            (q, QuantType::MQ2G256V2, 256u32, "MQ2G256V2")
+                        }
                         GgufFormat::Mq3 => {
-                            // MQ3 + AWQ on lm_head: runtime supports the sidecar via
                             // DType::supports_awq_sidecar(MQ3G256)=true (per the
                             // fix/lm-head-awq-runtime branch). Wire the same AWQ
                             // inline-quantize dance as the MQ4 arm.
@@ -4932,8 +5055,11 @@ fn handle_main_quant(
                     (q, QuantType::Q8F16, 32u32, "Q8_F16")
                 }
             } else {
-                // QuantLevel::Base — existing format-specific logic below
-
+                // QuantLevel::Base — product-tier lift takes precedence over base format.
+                // XT: embed only, Base: +lm_head, Pro: +ssm_out. Embed/conv1d are already
+                // handled above via is_embed / q8_conv1d_default, but tier also declares them.
+                // Fixed-tier per-class dtype overrides (e.g. lm_head:mq6v2) route through real encoder.
+                // Lifted tensors have AWQ sidecars removed.
                 // Choose quant format per tensor
                 let this_q8 = if flags.use_q4k_all {
                     false // everything Q4_K
@@ -4951,7 +5077,75 @@ fn handle_main_quant(
                 // large-dim models (9B: dim=4096, values ~0.016, Q4 step ~0.007)
                 let is_embed = name.contains("embed_tokens");
 
-                if flags.use_hfq_mixed {
+                let tier_lift = flags
+                    .product_tier
+                    .is_some_and(|t| q8_class_of(name).is_some_and(|cls| t.lifts(cls)));
+                if tier_lift {
+                    awq_sidecar_scales = None;
+                    if let Some(dt) = fixed_tier_dtype_for(name) {
+                        let m = meta.shape[0];
+                        let k = meta.shape[1];
+                        if k % 256 != 0
+                            && matches!(dt, "mq2v2" | "mq3v2" | "mq4v2" | "mq5v2" | "mq6v2")
+                        {
+                            eprintln!(
+                                "error: fixed-tier dtype {dt} requires K%256==0 for {name} (K={k})"
+                            );
+                            std::process::exit(2);
+                        }
+                        let s1 = gen_fwht_signs(42, 256);
+                        let s2 = gen_fwht_signs(1042, 256);
+                        match dt {
+                            "mq6v2" => {
+                                let q = quantize_mq6g256v2(&f32_data, m, k, &s1, &s2);
+                                (q, QuantType::MQ6G256V2, 256u32, "MQ6G256V2")
+                            }
+                            "mq5v2" => {
+                                let q = quantize_mq5g256v2(&f32_data, m, k, &s1, &s2);
+                                (q, QuantType::MQ5G256V2, 256u32, "MQ5G256V2")
+                            }
+                            "mq4v2" => {
+                                let q = quantize_mq4g256v2(&f32_data, m, k, &s1, &s2);
+                                (q, QuantType::MQ4G256V2, 256u32, "MQ4G256V2")
+                            }
+                            "mq3v2" => {
+                                let q = quantize_mq3g256v2(&f32_data, m, k, &s1, &s2);
+                                (q, QuantType::MQ3G256V2, 256u32, "MQ3G256V2")
+                            }
+                            "mq2v2" => {
+                                let q = quantize_mq2g256v2(&f32_data, m, k, &s1, &s2);
+                                (q, QuantType::MQ2G256V2, 256u32, "MQ2G256V2")
+                            }
+                            "mq4" => {
+                                let q = quantize_mq4g256(&f32_data, &s1, &s2);
+                                (q, QuantType::MQ4G256, 256u32, "MQ4G256")
+                            }
+                            "mq3l" => {
+                                let q = quantize_mq3g256_lloyd(&f32_data, &s1, &s2);
+                                (q, QuantType::MQ3G256Lloyd, 256u32, "MQ3G256Lloyd")
+                            }
+                            "mfp4e8" => {
+                                let q = quantize_mfp4g32_e8_2d(&f32_data, m, k, &s1, &s2);
+                                (q, QuantType::MFP4G32E8, 32u32, "MFP4G32E8")
+                            }
+                            "mfp4e8soa" => {
+                                let q = quantize_mfp4g32_e8_soa_2d(&f32_data, m, k, &s1, &s2);
+                                (q, QuantType::MFP4G32E8SOA, 32u32, "MFP4G32E8SOA")
+                            }
+                            "q8" => {
+                                let q = quantize_q8f16(&f32_data);
+                                (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                            }
+                            _ => {
+                                let q = quantize_mq4g256(&f32_data, &s1, &s2);
+                                (q, QuantType::MQ4G256, 256u32, "MQ4G256")
+                            }
+                        }
+                    } else {
+                        let q = quantize_q8f16(&f32_data);
+                        (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                    }
+                } else if flags.use_hfq_mixed {
                     // hfq-mixed: Q8 for attention, HFQ4 for FFN (fits 9B in 8GB VRAM)
                     let is_ffn = name.contains("mlp.") || name.contains("ffn");
                     if !is_ffn {
@@ -5035,12 +5229,16 @@ fn handle_main_quant(
                     // there is no E8 residual GEMV for o_proj.
                     match fixed_tier_dtype_for(name) {
                         Some(dt) => {
-                            // Canonical FWHT sign seeds — identical to every other
-                            // rotated encoder, so bytes match `--format <tier>`.
                             let s1 = gen_fwht_signs(42, 256);
                             let s2 = gen_fwht_signs(1042, 256);
                             let m = meta.shape[0];
                             let k = meta.shape[1];
+                            if k % 256 != 0
+                                && matches!(dt, "mq2v2" | "mq3v2" | "mq4v2" | "mq5v2" | "mq6v2")
+                            {
+                                eprintln!("error: fixed-tier dtype {dt} requires K%256==0 for {name} (K={k})");
+                                std::process::exit(2);
+                            }
                             match dt {
                                 "mfp4e8soa" => {
                                     let q = quantize_mfp4g32_e8_soa_2d(&f32_data, m, k, &s1, &s2);
@@ -5053,6 +5251,30 @@ fn handle_main_quant(
                                 "mq3l" => {
                                     let q = quantize_mq3g256_lloyd(&f32_data, &s1, &s2);
                                     (q, QuantType::MQ3G256Lloyd, 256u32, "MQ3G256L")
+                                }
+                                "mq6v2" => {
+                                    let q = quantize_mq6g256v2(&f32_data, m, k, &s1, &s2);
+                                    (q, QuantType::MQ6G256V2, 256u32, "MQ6G256V2")
+                                }
+                                "mq5v2" => {
+                                    let q = quantize_mq5g256v2(&f32_data, m, k, &s1, &s2);
+                                    (q, QuantType::MQ5G256V2, 256u32, "MQ5G256V2")
+                                }
+                                "mq4v2" => {
+                                    let q = quantize_mq4g256v2(&f32_data, m, k, &s1, &s2);
+                                    (q, QuantType::MQ4G256V2, 256u32, "MQ4G256V2")
+                                }
+                                "mq3v2" => {
+                                    let q = quantize_mq3g256v2(&f32_data, m, k, &s1, &s2);
+                                    (q, QuantType::MQ3G256V2, 256u32, "MQ3G256V2")
+                                }
+                                "mq2v2" => {
+                                    let q = quantize_mq2g256v2(&f32_data, m, k, &s1, &s2);
+                                    (q, QuantType::MQ2G256V2, 256u32, "MQ2G256V2")
+                                }
+                                "q8" => {
+                                    let q = quantize_q8f16(&f32_data);
+                                    (q, QuantType::Q8F16, 32u32, "Q8_F16")
                                 }
                                 _ => {
                                     let q = quantize_mq4g256(&f32_data, &s1, &s2);
@@ -5498,6 +5720,138 @@ fn handle_main_quant(
                         // Fallback to HFQ6-G256 for non-256-aligned (no rotation)
                         let q = quantize_hfq6g256(&f32_data);
                         (q, QuantType::HFQ6G256, 256u32, "HFQ6G256")
+                    }
+                } else if flags.use_mq6g256v2 && is_embed {
+                    let q = quantize_q8f16(&f32_data);
+                    (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                } else if flags.use_mq6g256v2 {
+                    let k_dim = if meta.shape.len() == 2 {
+                        meta.shape[1]
+                    } else {
+                        n_elements
+                    };
+                    if k_dim % 256 == 0 {
+                        let signs1 = gen_fwht_signs(42, 256);
+                        let signs2 = gen_fwht_signs(1042, 256);
+                        let m_dim = meta.shape[0];
+                        let q = if let (Some(alpha), Some(im_weights)) =
+                            (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
+                        {
+                            if awq_eligible(name) {
+                                let scales = compute_awq_scales(im_weights, alpha);
+                                awq_sidecar_scales = Some(scales.clone());
+                                let mut scaled = f32_data.clone();
+                                awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
+                                quantize_mq6g256v2(&scaled, m_dim, k_dim, &signs1, &signs2)
+                            } else {
+                                quantize_mq6g256v2(&f32_data, m_dim, k_dim, &signs1, &signs2)
+                            }
+                        } else {
+                            quantize_mq6g256v2(&f32_data, m_dim, k_dim, &signs1, &signs2)
+                        };
+                        (q, QuantType::MQ6G256V2, 256u32, "MQ6G256V2")
+                    } else {
+                        let q = quantize_hfq6g256(&f32_data);
+                        (q, QuantType::HFQ6G256, 256u32, "HFQ6G256")
+                    }
+                } else if flags.use_mq5g256v2 && is_embed {
+                    let q = quantize_q8f16(&f32_data);
+                    (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                } else if flags.use_mq5g256v2 {
+                    let k_dim = if meta.shape.len() == 2 {
+                        meta.shape[1]
+                    } else {
+                        n_elements
+                    };
+                    if k_dim % 256 == 0 {
+                        let signs1 = gen_fwht_signs(42, 256);
+                        let signs2 = gen_fwht_signs(1042, 256);
+                        let m_dim = meta.shape[0];
+                        let q = if let (Some(alpha), Some(im_weights)) =
+                            (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
+                        {
+                            if awq_eligible(name) {
+                                let scales = compute_awq_scales(im_weights, alpha);
+                                awq_sidecar_scales = Some(scales.clone());
+                                let mut scaled = f32_data.clone();
+                                awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
+                                quantize_mq5g256v2(&scaled, m_dim, k_dim, &signs1, &signs2)
+                            } else {
+                                quantize_mq5g256v2(&f32_data, m_dim, k_dim, &signs1, &signs2)
+                            }
+                        } else {
+                            quantize_mq5g256v2(&f32_data, m_dim, k_dim, &signs1, &signs2)
+                        };
+                        (q, QuantType::MQ5G256V2, 256u32, "MQ5G256V2")
+                    } else {
+                        let q = quantize_hfq4g128(&f32_data);
+                        (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                    }
+                } else if flags.use_mq3g256v2 && is_embed {
+                    let q = quantize_q8f16(&f32_data);
+                    (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                } else if flags.use_mq3g256v2 {
+                    let k_dim = if meta.shape.len() == 2 {
+                        meta.shape[1]
+                    } else {
+                        n_elements
+                    };
+                    if k_dim % 256 == 0 {
+                        let signs1 = gen_fwht_signs(42, 256);
+                        let signs2 = gen_fwht_signs(1042, 256);
+                        let m_dim = meta.shape[0];
+                        let q = if let (Some(alpha), Some(im_weights)) =
+                            (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
+                        {
+                            if awq_eligible(name) {
+                                let scales = compute_awq_scales(im_weights, alpha);
+                                awq_sidecar_scales = Some(scales.clone());
+                                let mut scaled = f32_data.clone();
+                                awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
+                                quantize_mq3g256v2(&scaled, m_dim, k_dim, &signs1, &signs2)
+                            } else {
+                                quantize_mq3g256v2(&f32_data, m_dim, k_dim, &signs1, &signs2)
+                            }
+                        } else {
+                            quantize_mq3g256v2(&f32_data, m_dim, k_dim, &signs1, &signs2)
+                        };
+                        (q, QuantType::MQ3G256V2, 256u32, "MQ3G256V2")
+                    } else {
+                        let q = quantize_hfq3g128(&f32_data);
+                        (q, QuantType::HFQ3G128, 128u32, "HFQ3G128")
+                    }
+                } else if flags.use_mq2g256v2 && is_embed {
+                    let q = quantize_q8f16(&f32_data);
+                    (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                } else if flags.use_mq2g256v2 {
+                    let k_dim = if meta.shape.len() == 2 {
+                        meta.shape[1]
+                    } else {
+                        n_elements
+                    };
+                    if k_dim % 256 == 0 {
+                        let signs1 = gen_fwht_signs(42, 256);
+                        let signs2 = gen_fwht_signs(1042, 256);
+                        let m_dim = meta.shape[0];
+                        let q = if let (Some(alpha), Some(im_weights)) =
+                            (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
+                        {
+                            if awq_eligible(name) {
+                                let scales = compute_awq_scales(im_weights, alpha);
+                                awq_sidecar_scales = Some(scales.clone());
+                                let mut scaled = f32_data.clone();
+                                awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
+                                quantize_mq2g256v2(&scaled, m_dim, k_dim, &signs1, &signs2)
+                            } else {
+                                quantize_mq2g256v2(&f32_data, m_dim, k_dim, &signs1, &signs2)
+                            }
+                        } else {
+                            quantize_mq2g256v2(&f32_data, m_dim, k_dim, &signs1, &signs2)
+                        };
+                        (q, QuantType::MQ2G256V2, 256u32, "MQ2G256V2")
+                    } else {
+                        let q = quantize_hfq2g128(&f32_data);
+                        (q, QuantType::HFQ2G128, 128u32, "HFQ2G128")
                     }
                 } else if (flags.use_mq3g256
                     || flags.use_mq2g256

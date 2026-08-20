@@ -1096,8 +1096,17 @@ pub(crate) fn is_batchable_la(dt: DType, arch: &str) -> bool {
     // scalar fused decode path is correct and is used via per-token fallback
     // rather than dispatching a gfx12 WMMA kernel. Lockstep with
     // hipfire_runtime::llama::is_batchable_la.
-    let mq4_v2_gfx12 =
-        matches!(dt, DType::MQ4G256V2 | DType::MQ4CG256) && matches!(arch, "gfx1200" | "gfx1201");
+    // Extended to neutral V2 family qt47-50 (MQ6/5/3/2V2) — same gfx12-only contract,
+    // same 72-200 B/group layouts, dedicated WMMA sources on gfx12.
+    let mq4_v2_gfx12 = matches!(
+        dt,
+        DType::MQ4G256V2
+            | DType::MQ4CG256
+            | DType::MQ6G256V2
+            | DType::MQ5G256V2
+            | DType::MQ3G256V2
+            | DType::MQ2G256V2
+    ) && matches!(arch, "gfx1200" | "gfx1201");
 
     // BF16 calibration teacher (qt=16) — native BF16 GEMM on gfx942 (CDNA3
     // MFMA v_mfma_f32_16x16x16bf16_1k). Gated on arch == gfx942 so the
@@ -3538,7 +3547,11 @@ fn batch_chunk_delta_net_attn(
             | DType::MQ4G256V2
             | DType::MQ4CG256
             | DType::MQ6G256
+            | DType::MQ6G256V2
+            | DType::MQ5G256V2
             | DType::MQ3G256
+            | DType::MQ3G256V2
+            | DType::MQ2G256V2
             | DType::MQ3G256Lloyd
             | DType::MFP4G32
     );
@@ -4109,7 +4122,11 @@ fn batch_chunk_delta_net_attn(
             | DType::MQ4G256V2
             | DType::MQ4CG256
             | DType::MQ6G256
+            | DType::MQ6G256V2
+            | DType::MQ5G256V2
             | DType::MQ3G256
+            | DType::MQ3G256V2
+            | DType::MQ2G256V2
             | DType::MQ3G256Lloyd
             | DType::MFP4G32
     );
@@ -4266,7 +4283,11 @@ fn batch_chunk_delta_net_ffn(
             | DType::MQ4G256V2
             | DType::MQ4CG256
             | DType::MQ6G256
+            | DType::MQ6G256V2
+            | DType::MQ5G256V2
             | DType::MQ3G256
+            | DType::MQ3G256V2
+            | DType::MQ2G256V2
             | DType::MQ3G256Lloyd
             | DType::MFP4G32
     );
@@ -4435,7 +4456,11 @@ fn batch_chunk_delta_net_ffn(
             | DType::MQ4G256V2
             | DType::MQ4CG256
             | DType::MQ6G256
+            | DType::MQ6G256V2
+            | DType::MQ5G256V2
             | DType::MQ3G256
+            | DType::MQ3G256V2
+            | DType::MQ2G256V2
             | DType::MQ3G256Lloyd
             | DType::MFP4G32
     );
@@ -4603,7 +4628,11 @@ fn batch_chunk_full_attn_attn(
             | DType::MQ4G256V2
             | DType::MQ4CG256
             | DType::MQ6G256
+            | DType::MQ6G256V2
+            | DType::MQ5G256V2
             | DType::MQ3G256
+            | DType::MQ3G256V2
+            | DType::MQ2G256V2
             | DType::MQ3G256Lloyd
             | DType::MFP4G32
     );
@@ -4983,7 +5012,11 @@ fn batch_chunk_full_attn_attn(
             | DType::MQ4G256V2
             | DType::MQ4CG256
             | DType::MQ6G256
+            | DType::MQ6G256V2
+            | DType::MQ5G256V2
             | DType::MQ3G256
+            | DType::MQ3G256V2
+            | DType::MQ2G256V2
             | DType::MQ3G256Lloyd
             | DType::MFP4G32
     );
@@ -5138,7 +5171,11 @@ fn batch_chunk_full_attn_ffn(
             | DType::MQ4G256V2
             | DType::MQ4CG256
             | DType::MQ6G256
+            | DType::MQ6G256V2
+            | DType::MQ5G256V2
             | DType::MQ3G256
+            | DType::MQ3G256V2
+            | DType::MQ2G256V2
             | DType::MQ3G256Lloyd
             | DType::MFP4G32
     );
@@ -5296,7 +5333,11 @@ fn batch_chunk_full_attn_ffn(
             | DType::MQ4G256V2
             | DType::MQ4CG256
             | DType::MQ6G256
+            | DType::MQ6G256V2
+            | DType::MQ5G256V2
             | DType::MQ3G256
+            | DType::MQ3G256V2
+            | DType::MQ2G256V2
             | DType::MQ3G256Lloyd
             | DType::MFP4G32
     );
@@ -5524,7 +5565,14 @@ fn batch_chunk_delta_net_moe(
     // at Q8 alongside the Q8 router + shared_expert_gate).
     let is_mq = matches!(
         layer.wqkv.gpu_dtype,
-        DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ4CG256 | DType::MQ6G256
+        DType::MQ4G256
+            | DType::MQ4G256V2
+            | DType::MQ4CG256
+            | DType::MQ6G256
+            | DType::MQ6G256V2
+            | DType::MQ5G256V2
+            | DType::MQ3G256V2
+            | DType::MQ2G256V2
     );
     let is_6bit = matches!(layer.wqkv.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
     let is_q8 = matches!(layer.wqkv.gpu_dtype, DType::Q8_0);
@@ -6284,7 +6332,14 @@ fn batch_chunk_full_attn_moe(
     // wiring lives in a separate PR (see followup issue).
     let qkv_is_mq = matches!(
         layer.wq.gpu_dtype,
-        DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ4CG256 | DType::MQ6G256
+        DType::MQ4G256
+            | DType::MQ4G256V2
+            | DType::MQ4CG256
+            | DType::MQ6G256
+            | DType::MQ6G256V2
+            | DType::MQ5G256V2
+            | DType::MQ3G256V2
+            | DType::MQ2G256V2
     );
     let qkv_is_6bit = matches!(layer.wq.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
     let qkv_is_q8 = matches!(layer.wq.gpu_dtype, DType::Q8_0);
@@ -7667,6 +7722,82 @@ fn batched_gemm_single_weight(
                 n,
             )
         }
+        DType::MQ6G256V2 => {
+            let bytes = w.m * n * 4;
+            if let Some(stream) = gpu.active_stream.as_ref() {
+                gpu.hip.memset_async(&y.buf, 0, bytes, stream)?;
+            } else {
+                gpu.hip.memset(&y.buf, 0, bytes)?;
+            }
+            run_residual_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmMq6G256V2Residual,
+                &w.buf,
+                w.gpu_dtype,
+                x,
+                y,
+                w.m,
+                w.k,
+                n,
+            )
+        }
+        DType::MQ5G256V2 => {
+            let bytes = w.m * n * 4;
+            if let Some(stream) = gpu.active_stream.as_ref() {
+                gpu.hip.memset_async(&y.buf, 0, bytes, stream)?;
+            } else {
+                gpu.hip.memset(&y.buf, 0, bytes)?;
+            }
+            run_residual_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmMq5G256V2Residual,
+                &w.buf,
+                w.gpu_dtype,
+                x,
+                y,
+                w.m,
+                w.k,
+                n,
+            )
+        }
+        DType::MQ3G256V2 => {
+            let bytes = w.m * n * 4;
+            if let Some(stream) = gpu.active_stream.as_ref() {
+                gpu.hip.memset_async(&y.buf, 0, bytes, stream)?;
+            } else {
+                gpu.hip.memset(&y.buf, 0, bytes)?;
+            }
+            run_residual_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmMq3G256V2Residual,
+                &w.buf,
+                w.gpu_dtype,
+                x,
+                y,
+                w.m,
+                w.k,
+                n,
+            )
+        }
+        DType::MQ2G256V2 => {
+            let bytes = w.m * n * 4;
+            if let Some(stream) = gpu.active_stream.as_ref() {
+                gpu.hip.memset_async(&y.buf, 0, bytes, stream)?;
+            } else {
+                gpu.hip.memset(&y.buf, 0, bytes)?;
+            }
+            run_residual_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmMq2G256V2Residual,
+                &w.buf,
+                w.gpu_dtype,
+                x,
+                y,
+                w.m,
+                w.k,
+                n,
+            )
+        }
         DType::MQ3G256 => {
             // Same pattern as MQ6: no non-residual batched HFQ3 GEMM
             // exists in the scalar gfx10 family — `gemm_hfq3g256_residual`
@@ -7714,8 +7845,8 @@ fn batched_gemm_single_weight(
             0,
             &format!(
                 "mixed-format batched prefill: weight dtype {other:?} has no \
-             single-weight batched dispatch yet. Currently MQ3/HFQ3, \
-             MQ4/MQ4V2/MQ4C/HFQ4, MQ6/HFQ6, and Q8_0 mixes are wired. Re-quantize with \
+             single-weight batched dispatch yet. Currently MQ3/HFQ3, MQ6/5/3/2V2, \
+             MQ4/MQ4V2/MQ4C/HFQ4, MQ6/HFQ6, MQ6/5/3/2V2, and Q8_0 mixes are wired. Re-quantize with \
              uniform format or extend `batched_gemm_single_weight` to cover this format."
             ),
         )),
@@ -7820,6 +7951,141 @@ mod tests {
                 "MQ4CG256 must fall back on {arch}"
             );
         }
+    }
+
+    #[test]
+    fn qwen35_is_batchable_la_v2_family_gfx12_only() {
+        for arch in ["gfx1200", "gfx1201"] {
+            assert!(is_batchable_la(DType::MQ6G256V2, arch), "MQ6V2 gfx12");
+            assert!(is_batchable_la(DType::MQ5G256V2, arch), "MQ5V2 gfx12");
+            assert!(is_batchable_la(DType::MQ3G256V2, arch), "MQ3V2 gfx12");
+            assert!(is_batchable_la(DType::MQ2G256V2, arch), "MQ2V2 gfx12");
+        }
+        for arch in ["gfx1100", "gfx942", "gfx1010"] {
+            assert!(
+                !is_batchable_la(DType::MQ6G256V2, arch),
+                "MQ6V2 not on {arch}"
+            );
+            assert!(
+                !is_batchable_la(DType::MQ5G256V2, arch),
+                "MQ5V2 not on {arch}"
+            );
+            assert!(
+                !is_batchable_la(DType::MQ3G256V2, arch),
+                "MQ3V2 not on {arch}"
+            );
+            assert!(
+                !is_batchable_la(DType::MQ2G256V2, arch),
+                "MQ2V2 not on {arch}"
+            );
+        }
+        // Distinguish V2 from legacy: same group bytes but different DType
+        assert_ne!(DType::MQ6G256, DType::MQ6G256V2);
+        assert_ne!(DType::MQ3G256, DType::MQ3G256V2);
+        assert_ne!(DType::MQ4G256, DType::MQ4G256V2);
+        assert_ne!(DType::MQ4G256, DType::MQ6G256V2);
+        // Byte counts per contract
+        assert_eq!(rdna_compute::MQ6G256V2_GROUP_BYTES, 200);
+        assert_eq!(rdna_compute::MQ5G256V2_GROUP_BYTES, 168);
+        assert_eq!(rdna_compute::MQ3G256V2_GROUP_BYTES, 104);
+        assert_eq!(rdna_compute::MQ2G256V2_GROUP_BYTES, 72);
+        assert_eq!(rdna_compute::MQ4V2_GROUP_BYTES, 136);
+    }
+
+    #[test]
+    fn qwen35_v2_dense_keys_are_exact_no_hfq4_default() {
+        // Contract: every admitted V2 dtype maps 1:1 to its exact V2 kernel
+        // in every dense operation (plain, residual, QKV, QKVZA, gate_up).
+        // No qt47-50 falls into HFQ4/default/wildcard.
+        use crate::forward_slots::{
+            fused_gate_up_key_for, fused_qkv_key_for, fused_qkvza_key_for, residual_gemm_key_for,
+        };
+        use hipfire_dispatch::types::KernelKey;
+        use rdna_compute::DType;
+        let cases: &[(DType, KernelKey, KernelKey, KernelKey, KernelKey, &str)] = &[
+            (
+                DType::MQ6G256V2,
+                KernelKey::GemmMq6G256V2,
+                KernelKey::GemmMq6G256V2Residual,
+                KernelKey::FusedQkvMq6G256V2,
+                KernelKey::FusedQkvzaMq6G256V2,
+                "qt47",
+            ),
+            (
+                DType::MQ5G256V2,
+                KernelKey::GemmMq5G256V2,
+                KernelKey::GemmMq5G256V2Residual,
+                KernelKey::FusedQkvMq5G256V2,
+                KernelKey::FusedQkvzaMq5G256V2,
+                "qt48",
+            ),
+            (
+                DType::MQ3G256V2,
+                KernelKey::GemmMq3G256V2,
+                KernelKey::GemmMq3G256V2Residual,
+                KernelKey::FusedQkvMq3G256V2,
+                KernelKey::FusedQkvzaMq3G256V2,
+                "qt49",
+            ),
+            (
+                DType::MQ2G256V2,
+                KernelKey::GemmMq2G256V2,
+                KernelKey::GemmMq2G256V2Residual,
+                KernelKey::FusedQkvMq2G256V2,
+                KernelKey::FusedQkvzaMq2G256V2,
+                "qt50",
+            ),
+        ];
+        for (dt, exp_plain, exp_resid, exp_qkv, exp_qkvza, qt) in cases {
+            // plain GEMM via GemmFamily::resolve through direct key
+            // (plain keys are gfx12-only, but must be exact, not HFQ4)
+            assert_ne!(
+                *exp_plain,
+                KernelKey::GemmHfq4G256,
+                "{} plain must not be HFQ4",
+                qt
+            );
+            assert_ne!(
+                *exp_resid,
+                KernelKey::GemmHfq4G256Residual,
+                "{} residual must not be HFQ4",
+                qt
+            );
+            // fused helpers
+            assert_eq!(fused_qkv_key_for(*dt), *exp_qkv, "{} qkv", qt);
+            assert_eq!(fused_qkvza_key_for(*dt), *exp_qkvza, "{} qkvza", qt);
+            assert_eq!(
+                fused_gate_up_key_for(*dt),
+                match dt {
+                    DType::MQ6G256V2 => KernelKey::FusedGateUpMq6G256V2,
+                    DType::MQ5G256V2 => KernelKey::FusedGateUpMq5G256V2,
+                    DType::MQ3G256V2 => KernelKey::FusedGateUpMq3G256V2,
+                    DType::MQ2G256V2 => KernelKey::FusedGateUpMq2G256V2,
+                    _ => unreachable!(),
+                },
+                "{} gate_up",
+                qt
+            );
+            assert_eq!(
+                residual_gemm_key_for(*dt),
+                *exp_resid,
+                "{} resid helper",
+                qt
+            );
+            // Ensure helpers never return HFQ4 for V2
+            assert_ne!(fused_qkv_key_for(*dt), KernelKey::FusedQkvHfq4G256);
+            assert_ne!(fused_qkvza_key_for(*dt), KernelKey::FusedQkvzaHfq4G256);
+            assert_ne!(fused_gate_up_key_for(*dt), KernelKey::FusedGateUpHfq4G256);
+            assert_ne!(residual_gemm_key_for(*dt), KernelKey::GemmHfq4G256Residual);
+            // batchable only on gfx12
+            assert!(is_batchable_la(*dt, "gfx1201"));
+            assert!(!is_batchable_la(*dt, "gfx1100"));
+        }
+        // Legacy must stay on HFQ4 path
+        assert_eq!(
+            crate::forward_slots::fused_qkv_key_for(DType::HFQ4G256),
+            KernelKey::FusedQkvHfq4G256
+        );
     }
 
     #[test]

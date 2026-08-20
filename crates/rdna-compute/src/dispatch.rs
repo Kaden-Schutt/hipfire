@@ -83,6 +83,31 @@ pub const MQ4V2_GROUP_BYTES: usize = 136;
 /// and `kernels/src/gemm_mq4cpad_residual_wmma_gfx12_bt.hip`.
 pub const MQ4C_GROUP_BYTES: usize = 136;
 
+/// Per-group bytes for MQ6-G256 v2 (qt=47): 200 B/group, 6.25 bpw.
+/// Neutral-size Magnum V2 layout: LE `[0..2)` fp16 s0, `[2..4)` fp16 z0,
+/// `[4..6)` fp16 s1, `[6..8)` fp16 z1, `[8..200)` 192 B legacy 6-bit payload
+/// (4 weights per 3 bytes, `4/3 B`). Half 0 governs q[0..128), half 1
+/// q[128..256); reconstruction `q * f32(s[h]) + f32(z[h])`. `K % 256 == 0`.
+pub const MQ6G256V2_GROUP_BYTES: usize = 200;
+
+/// Per-group bytes for MQ5-G256 v2 (qt=48): 168 B/group, 5.25 bpw.
+/// Neutral-size Magnum V2 layout: LE `[0..2)` fp16 s0, `[2..4)` fp16 z0,
+/// `[4..6)` fp16 s1, `[6..8)` fp16 z1, `[8..168)` 160 B legacy 5-bit payload
+/// (8 weights per 5 bytes, `8/5 B`). Half semantics as MQ6G256V2.
+pub const MQ5G256V2_GROUP_BYTES: usize = 168;
+
+/// Per-group bytes for MQ3-G256 v2 (qt=49): 104 B/group, 3.25 bpw.
+/// Neutral-size Magnum V2 layout: LE `[0..2)` fp16 s0, `[2..4)` fp16 z0,
+/// `[4..6)` fp16 s1, `[6..8)` fp16 z1, `[8..104)` 96 B legacy 3-bit payload
+/// (8 weights per 3 bytes, `8/3 B`). Half semantics as MQ6G256V2.
+pub const MQ3G256V2_GROUP_BYTES: usize = 104;
+
+/// Per-group bytes for MQ2-G256 v2 (qt=50): 72 B/group, 2.25 bpw.
+/// Neutral-size Magnum V2 layout: LE `[0..2)` fp16 s0, `[2..4)` fp16 z0,
+/// `[4..6)` fp16 s1, `[6..8)` fp16 z1, `[8..72)` 64 B legacy 2-bit payload
+/// (4 weights per byte). Half semantics as MQ6G256V2.
+pub const MQ2G256V2_GROUP_BYTES: usize = 72;
+
 /// Bytes per group in the trailing fp16 scale region (both GL dtypes).
 pub const GL_GROUP_SCALE_BYTES: usize = 2;
 
@@ -275,6 +300,27 @@ pub enum DType {
     /// (`w = q * scale + zero`), half-wave uniform, lane-invariant scalar loads.
     /// `K % 256 == 0`.
     MQ4CG256,
+    /// MQ6-G256 v2 (qt=47): FWHT-rotated, 200 B/group, neutral Magnum V2.
+    /// Per-group 200 B: `[0..2)` fp16 s0, `[2..4)` fp16 z0, `[4..6)` fp16 s1,
+    /// `[6..8)` fp16 z1, `[8..200)` 192 B 6-bit payload (4/3 B). Half 0
+    /// q[0..128), half 1 q[128..256); `w = q*f32(s[h])+f32(z[h])`.
+    /// `K % 256 == 0`, 6.25 bpw.
+    MQ6G256V2,
+    /// MQ5-G256 v2 (qt=48): FWHT-rotated, 168 B/group, neutral Magnum V2.
+    /// Per-group 168 B: `[0..2)` fp16 s0, `[2..4)` fp16 z0, `[4..6)` fp16 s1,
+    /// `[6..8)` fp16 z1, `[8..168)` 160 B 5-bit payload (8/5 B). Same half
+    /// semantics as MQ6G256V2. `K % 256 == 0`, 5.25 bpw.
+    MQ5G256V2,
+    /// MQ3-G256 v2 (qt=49): FWHT-rotated, 104 B/group, neutral Magnum V2.
+    /// Per-group 104 B: `[0..2)` fp16 s0, `[2..4)` fp16 z0, `[4..6)` fp16 s1,
+    /// `[6..8)` fp16 z1, `[8..104)` 96 B 3-bit payload (8/3 B). Same half
+    /// semantics as MQ6G256V2. `K % 256 == 0`, 3.25 bpw.
+    MQ3G256V2,
+    /// MQ2-G256 v2 (qt=50): FWHT-rotated, 72 B/group, neutral Magnum V2.
+    /// Per-group 72 B: `[0..2)` fp16 s0, `[2..4)` fp16 z0, `[4..6)` fp16 s1,
+    /// `[6..8)` fp16 z1, `[8..72)` 64 B 2-bit payload (4/B). Same half
+    /// semantics as MQ6G256V2. `K % 256 == 0`, 2.25 bpw.
+    MQ2G256V2,
     MQ4G128, // MagnumQuant: FWHT-128-rotated INT4 (72 bytes/group, same layout as HFQ4G128)
     MQ8G256, // MagnumQuant: FWHT-rotated symmetric INT8, dp4a target (258 bytes/group)
     MQ6G256, // MagnumQuant: FWHT-rotated HFQ6-G256 (200 bytes/group, same as HFQ6G256)
@@ -352,6 +398,10 @@ impl DType {
             | DType::MQ4G256
             | DType::MQ4G256V2
             | DType::MQ4CG256
+            | DType::MQ6G256V2
+            | DType::MQ5G256V2
+            | DType::MQ3G256V2
+            | DType::MQ2G256V2
             | DType::MQ4G128
             | DType::MQ6G256
             | DType::MQ5G256
@@ -447,6 +497,13 @@ impl DType {
                 // qt=45 shares qt=13/qt=44's AWQ contract exactly — same failure mode
                 // if omitted: silent sidecar drop → (W·s)·x. Include it.
                 | DType::MQ4CG256
+                // Neutral V2 family (qt47-50): same per-half fp16 scale+zero header,
+                // same AWQ pre-scale contract as qt44. All four must be listed or
+                // their sidecars are silently dropped → same May-2026 regression.
+                | DType::MQ6G256V2
+                | DType::MQ5G256V2
+                | DType::MQ3G256V2
+                | DType::MQ2G256V2
                 | DType::MQ3G256
                 | DType::MQ2G256
                 | DType::MQ3G256Lloyd
@@ -469,13 +526,6 @@ impl DType {
     }
 
     /// Whether this format's GEMV kernel requires K%256==0 (HFP4 family: the
-    /// gemv_hfp4g32 kernel + FWHT both need it). Refuse at load, not first
-    /// dispatch. Centralizes the guard inlined at the weight-decode qt 21/24 arms.
-    ///
-    /// MQ*-G256-GL are included because their SoA region split is derived
-    /// from `gpr = K/256` on BOTH sides (encoder and kernel). A K that is not a
-    /// multiple of 256 truncates `gpr`, which silently shifts the scale-region
-    /// base — garbage weights with no error. Fail at load instead.
     pub fn requires_k_mod_256(self) -> bool {
         matches!(
             self,
@@ -485,6 +535,10 @@ impl DType {
                 | DType::MQ3G256GL
                 | DType::MQ4G256V2
                 | DType::MQ4CG256
+                | DType::MQ6G256V2
+                | DType::MQ5G256V2
+                | DType::MQ3G256V2
+                | DType::MQ2G256V2
         )
     }
 }
@@ -2258,11 +2312,9 @@ impl Gpu {
                 .cloned()
                 .collect();
             if crate::replay::is_gdn_kernel(&launch.kernel) {
-                let frames = crate::replay::gdn_requant_frames_for_dispatch(
-                    &launch.kernarg,
-                    launch.grid[2],
-                )
-                .map_err(|reason| hip_bridge::HipError::new(0, &reason))?;
+                let frames =
+                    crate::replay::gdn_requant_frames_for_dispatch(&launch.kernarg, launch.grid[2])
+                        .map_err(|reason| hip_bridge::HipError::new(0, &reason))?;
                 bindings.push((
                     index,
                     crate::replay::ReplayKernargBinding::GdnFrameU32 { offset: 76, frames },
@@ -2489,8 +2541,6 @@ impl Gpu {
             replay_len, graph_len
         );
     }
-
-
 
     /// Screen a weight matrix for MMQ safety (#87). Runs a small synthetic
     /// comparison (batch=16): f16 WMMA vs MMQ on random activations. If any
@@ -4576,6 +4626,10 @@ mod tests {
     use super::gen_fwht_signs;
     use super::DType;
     use super::HessianCapture;
+    use super::MQ2G256V2_GROUP_BYTES;
+    use super::MQ3G256V2_GROUP_BYTES;
+    use super::MQ5G256V2_GROUP_BYTES;
+    use super::MQ6G256V2_GROUP_BYTES;
 
     #[test]
     fn q8hfq_row_stride_matches_legacy_formula() {
@@ -4617,6 +4671,31 @@ mod tests {
         ] {
             assert!(!dt.requires_k_mod_256(), "{dt:?} must NOT require k%256");
         }
+    }
+
+    #[test]
+    fn neutral_v2_requires_k_mod_256_and_awq() {
+        for dt in [
+            DType::MQ4G256V2,
+            DType::MQ4CG256,
+            DType::MQ6G256V2,
+            DType::MQ5G256V2,
+            DType::MQ3G256V2,
+            DType::MQ2G256V2,
+        ] {
+            assert!(dt.requires_k_mod_256(), "{dt:?} must require K%256==0");
+            assert!(dt.supports_awq_sidecar(), "{dt:?} must support AWQ sidecar");
+        }
+        // Legacy counterparts must NOT be confused with V2 at type level.
+        assert_ne!(DType::MQ6G256V2, DType::MQ6G256);
+        assert_ne!(DType::MQ5G256V2, DType::MQ5G256);
+        assert_ne!(DType::MQ3G256V2, DType::MQ3G256);
+        assert_ne!(DType::MQ2G256V2, DType::MQ2G256);
+        // Group bytes match spec one-to-one.
+        assert_eq!(MQ6G256V2_GROUP_BYTES, 200);
+        assert_eq!(MQ5G256V2_GROUP_BYTES, 168);
+        assert_eq!(MQ3G256V2_GROUP_BYTES, 104);
+        assert_eq!(MQ2G256V2_GROUP_BYTES, 72);
     }
 
     /// Deterministic pseudo-random rows (no RNG crate): mix in exact zeros,
@@ -5032,4 +5111,3 @@ mod tests {
         assert_eq!(ctrl.recorded_launches().len(), 0);
     }
 }
-
