@@ -23,7 +23,8 @@ Contract recap (see task description):
             xt:   --tier xt                         (no imatrix/AWQ)
             base: --tier base --imatrix <p> --awq-alpha 0.55
             pro:  --tier pro  --imatrix <p> --awq-alpha 0.55
-                  + mq2/mq3 pro: --fixed-tier ssm_out:mq6v2
+                  + mq2 pro: lm_head + ssm_out lifted to MQ6V2
+                  + mq3 pro: ssm_out lifted to MQ6V2
                   + mq4/5/6 pro: Q8 default (no fixed-tier)
             every artifact must satisfy model bpw ∈ [N, N+1)
   drafts    dflash_convert --mqNv2 same-bit from incoai/Qwen3.8-27B-DFlash2
@@ -342,9 +343,11 @@ def build_cells(qcal_dir: str) -> List[Dict[str, Any]]:
             cell_id = f"mq{n}-{tier}"
             artifact = qcal / "artifacts" / f"qwen3.8-27b.{codec}.{tier}.hfq"
             fixed_tier = None
-            if tier == "pro" and n in (2, 3):
+            if tier == "pro" and n == 2:
+                fixed_tier = "lm_head:mq6v2,ssm_out:mq6v2"
+            elif tier == "pro" and n == 3:
                 fixed_tier = "ssm_out:mq6v2"
-            # Q8 default for mq4/5/6 pro is implicit (no fixed_tier)
+            # Q8 default for mq4/5/6 pro is implicit (no fixed_tier).
             cells.append({
                 "cell_id": cell_id,
                 "n": n,
