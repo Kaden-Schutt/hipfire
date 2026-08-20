@@ -882,7 +882,8 @@ def main(argv=None) -> int:
             "draft_id": did,
             "draft_path": draft_path,
             "draft_bytes": draft_bytes,
-            "draft_sha256": sha256_file(Path(draft_path)) if draft_path and Path(draft_path).is_file() else None,
+            "draft_sha256": row.get("draft_sha256")
+            or (sha256_file(Path(draft_path)) if draft_path and Path(draft_path).is_file() else None),
             "decode_tok_s": {"median": decode_median, "rep_medians": rep_medians_decode},
             "prefill_tok_s": {"median": prefill_median, "rep_medians": rep_medians_prefill},
             "tau": {"median": tau_median, "rep_medians": rep_taus, "rep_arrays": taus_all_reps},
@@ -954,8 +955,12 @@ def main(argv=None) -> int:
         quant_row = next((r for r in rows if r.get("phase") == "quantize" and r.get("cell_id") == cid), None)
         if art_bytes is None and quant_row:
             art_bytes = quant_row.get("bytes") or quant_row.get("artifact_bytes")
-        art_sha = sha256_file(artifact_path) if artifact_path.is_file() else (quant_row.get("sha256") if quant_row else None)
-        art_md5 = md5_file(artifact_path) if artifact_path.is_file() else (quant_row.get("md5") if quant_row else None)
+        art_sha = (quant_row.get("sha256") if quant_row else None) or (
+            sha256_file(artifact_path) if artifact_path.is_file() else None
+        )
+        art_md5 = (quant_row.get("md5") if quant_row else None) or (
+            md5_file(artifact_path) if artifact_path.is_file() else None
+        )
         bpw = compute_bpw(art_bytes, params) if art_bytes else cell.get("bpw")
         # digests
         codec = cell.get("codec")
