@@ -457,6 +457,18 @@ pub(crate) fn run_gguf_pipeline(
                         let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
                         (q, QuantType::MQ4G256, 256u32, "MQ4G256")
                     }
+                    "mq3l" => {
+                        let q = quantize_mq3g256_lloyd(&f32_data, &signs1, &signs2);
+                        (q, QuantType::MQ3G256Lloyd, 256u32, "MQ3G256Lloyd")
+                    }
+                    "mfp4e8" => {
+                        let q = quantize_mfp4g32_e8_2d(&f32_data, m, k, &signs1, &signs2);
+                        (q, QuantType::MFP4G32E8, 32u32, "MFP4G32E8")
+                    }
+                    "mfp4e8soa" => {
+                        let q = quantize_mfp4g32_e8_soa_2d(&f32_data, m, k, &signs1, &signs2);
+                        (q, QuantType::MFP4G32E8SOA, 32u32, "MFP4G32E8SOA")
+                    }
                     _ => {
                         let q = quantize_q8f16(&f32_data);
                         (q, QuantType::Q8F16, 32u32, "Q8_F16")
