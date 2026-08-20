@@ -3843,22 +3843,15 @@ impl ReplayController {
     /// Lower a captured prefix to one retained architecture-native PM4
     /// indirect buffer. Unsupported HSA agents fail closed before commands are
     /// constructed; gfx10/11 and gfx12 never share register encodings.
+    /// Lower a captured prefix to a single retained PM4 IB.
     ///
-    /// Fail-closed: requires differential calibration via `synthesize_position_bindings`
-    /// unless the caller explicitly opts out for a single-position route via
-    /// `prepare_pm4_prefix_allow_uncalibrated`.
+    /// Permissive by construction: this is the entry point every certified
+    /// route already uses, and its tape identity is sealed evidence, so it
+    /// must keep its historical semantics. A route that replays across
+    /// advancing decode positions must instead call
+    /// [`Self::prepare_pm4_prefix_calibrated`], which refuses to prepare
+    /// until two recordings have been differenced.
     pub fn prepare_pm4_prefix(
-        &mut self,
-        device_ordinal: usize,
-        prefix: usize,
-    ) -> Result<(usize, u32, u64), String> {
-        self.prepare_pm4_prefix_inner(device_ordinal, prefix, false, false)
-    }
-
-    /// Opt-out variant for single-position / legacy routes that do not need
-    /// position-aware replay. Identical to `prepare_pm4_prefix` except it
-    /// allows uncalibrated preparation.
-    pub fn prepare_pm4_prefix_allow_uncalibrated(
         &mut self,
         device_ordinal: usize,
         prefix: usize,
@@ -3866,17 +3859,20 @@ impl ReplayController {
         self.prepare_pm4_prefix_inner(device_ordinal, prefix, false, true)
     }
 
-    /// Lower a captured prefix to a single GFX12 IB with per-dispatch timestamps.
-    pub fn prepare_pm4_dispatch_profile(
+    /// Position-aware variant: refuses to prepare unless
+    /// [`Self::synthesize_position_bindings`] has differenced two recordings
+    /// of this tape, so a position-tracking kernarg scalar cannot be retained
+    /// unproven.
+    pub fn prepare_pm4_prefix_calibrated(
         &mut self,
         device_ordinal: usize,
         prefix: usize,
     ) -> Result<(usize, u32, u64), String> {
-        self.prepare_pm4_prefix_inner(device_ordinal, prefix, true, false)
+        self.prepare_pm4_prefix_inner(device_ordinal, prefix, false, false)
     }
 
-    /// Opt-out variant of `prepare_pm4_dispatch_profile` allowing uncalibrated preparation.
-    pub fn prepare_pm4_dispatch_profile_allow_uncalibrated(
+    /// Lower a captured prefix to a single GFX12 IB with per-dispatch timestamps.
+    pub fn prepare_pm4_dispatch_profile(
         &mut self,
         device_ordinal: usize,
         prefix: usize,

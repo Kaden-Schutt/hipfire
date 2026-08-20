@@ -3227,7 +3227,7 @@ fn run_retained_verify_forward(
                     })?;
                 gpu.replay.set_prepared_max_position(max_position);
                 gpu.replay
-                    .prepare_pm4_prefix(gpu.device_id as usize, launches)
+                    .prepare_pm4_prefix_calibrated(gpu.device_id as usize, launches)
                     .map_err(|reason| CaptureFailure::Prepare(format!("PM4 prepare: {reason}")))?;
                 gpu.replay
                     .prepared_route_identity()
