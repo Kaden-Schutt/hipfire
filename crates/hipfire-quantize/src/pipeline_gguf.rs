@@ -430,8 +430,11 @@ pub(crate) fn run_gguf_pipeline(
             (q, QuantType::Q8F16, 32u32, "Q8_F16")
         } else if crate::model_filter::product_tier_cli().is_some_and(|t| {
             crate::model_filter::q8_class_of(&out_name).is_some_and(|cls| t.lifts(cls))
-        }) {
-            // Product tier lift — respects per-class codec overrides (e.g. lm_head:mq6v2) and uses real encoder.
+        }) || crate::model_filter::fixed_tier_override_applies(&out_name)
+        {
+            // Product tier lift and/or explicit --fixed-tier / HIPFIRE_FIXED_TIER
+            // entry. Codec overrides (e.g. attn_full:mq6v2) apply even when the
+            // ProductTier does not lift that class; missing override => Q8.
             let f32_data = gguf_input::tensor_to_f32(info, raw);
             quant_params += n_elements as u64;
             if let Some(dt) = crate::model_filter::fixed_tier_dtype_for(&out_name) {
@@ -467,6 +470,18 @@ pub(crate) fn run_gguf_pipeline(
                     "mq4" => {
                         let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
                         (q, QuantType::MQ4G256, 256u32, "MQ4G256")
+                    }
+                    "mq3l" => {
+                        let q = quantize_mq3g256_lloyd(&f32_data, &signs1, &signs2);
+                        (q, QuantType::MQ3G256Lloyd, 256u32, "MQ3G256Lloyd")
+                    }
+                    "mfp4e8" => {
+                        let q = quantize_mfp4g32_e8_2d(&f32_data, m, k, &signs1, &signs2);
+                        (q, QuantType::MFP4G32E8, 32u32, "MFP4G32E8")
+                    }
+                    "mfp4e8soa" => {
+                        let q = quantize_mfp4g32_e8_soa_2d(&f32_data, m, k, &signs1, &signs2);
+                        (q, QuantType::MFP4G32E8SOA, 32u32, "MFP4G32E8SOA")
                     }
                     _ => {
                         let q = quantize_q8f16(&f32_data);

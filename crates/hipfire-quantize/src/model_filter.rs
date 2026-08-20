@@ -190,6 +190,11 @@ mod mq2rxt_recipe_tests {
 /// `ssm_out` is the architecture-neutral name for `linear_attn.out_proj.weight`
 /// — the Qwen3.8 DeltaNet recurrent SSM state — checked most-specifically before
 /// the broad `linear_attn` -> `attn` bucket.
+///
+/// `attn_full` is a more-specific override class (not returned here) for names
+/// containing `self_attn` only; see [`is_attn_full_tensor`]. `q8_class_of` still
+/// returns `attn` for both full-attention and DeltaNet linear-attention tensors
+/// so existing callers keep a single attention bucket.
 pub(crate) fn q8_class_of(name: &str) -> Option<&'static str> {
     if name.contains("lm_head") {
         Some("lm_head")
@@ -220,9 +225,16 @@ pub(crate) fn q8_class_of(name: &str) -> Option<&'static str> {
     }
 }
 
+/// Full-attention tensors only (`self_attn`). Rejects DeltaNet `linear_attn`
+/// and other generic attention name shapes that still map to class `attn`.
+pub(crate) fn is_attn_full_tensor(name: &str) -> bool {
+    name.contains("self_attn")
+}
+
 // ── Strict validation for env/CLI tokens ────────────────────────────────
 
-pub(crate) const VALID_Q8_CLASSES: &[&str] = &["lm_head", "embed", "router", "attn", "ssm_out"];
+pub(crate) const VALID_Q8_CLASSES: &[&str] =
+    &["lm_head", "embed", "router", "attn", "attn_full", "ssm_out"];
 pub(crate) const VALID_FIXED_DTYPES: &[&str] = &[
     "q8",
     "mq2v2",
@@ -245,7 +257,7 @@ pub(crate) fn validate_q8_classes_spec(spec: &str) -> Result<(), String> {
         }
         if !VALID_Q8_CLASSES.contains(&c) {
             return Err(format!(
-                "unknown HIPFIRE_Q8_CLASSES class '{c}' (expected one of lm_head,embed,router,attn,ssm_out)"
+                "unknown HIPFIRE_Q8_CLASSES class '{c}' (expected one of lm_head,embed,router,attn,attn_full,ssm_out)"
             ));
         }
     }
@@ -267,7 +279,7 @@ pub(crate) fn validate_fixed_tier_spec(spec: &str) -> Result<(), String> {
         let dtype = d.trim();
         if !VALID_Q8_CLASSES.contains(&class) {
             return Err(format!(
-                "unknown HIPFIRE_FIXED_TIER class '{class}' (expected one of lm_head,embed,router,attn,ssm_out)"
+                "unknown HIPFIRE_FIXED_TIER class '{class}' (expected one of lm_head,embed,router,attn,attn_full,ssm_out)"
             ));
         }
         if !VALID_FIXED_DTYPES.contains(&dtype) {
@@ -364,10 +376,12 @@ impl ProductTier {
 /// Fixed-tier tensors held at Q8F16 regardless of `--format`.
 ///
 /// `HIPFIRE_Q8_CLASSES=<comma list>` narrows this to a subset of
-/// {`lm_head`, `embed`, `router`, `attn`, `ssm_out`} — the lever for attributing which
-/// fixed class actually carries the quality. Measured 2026-08-04: dropping the
-/// WHOLE fixed tier Q8 -> MQ4 costs **+35.2% KLD** (0.1742 -> 0.2356) while
-/// buying 1.75x decode speed, so the tier is emphatically not free — but the
+/// {`lm_head`, `embed`, `router`, `attn`, `attn_full`, `ssm_out`} — the lever for
+/// attributing which fixed class actually carries the quality. `attn_full`
+/// retains only `self_attn` tensors at Q8; generic `attn` still covers both
+/// full-attention and DeltaNet linear-attention when listed. Measured 2026-08-04:
+/// dropping the WHOLE fixed tier Q8 -> MQ4 costs **+35.2% KLD** (0.1742 -> 0.2356)
+/// while buying 1.75x decode speed, so the tier is emphatically not free — but the
 /// +35% is unattributed across classes whose byte costs differ by 25x.
 /// `--no-q8-router` (all classes off) still wins if both are set.
 ///
@@ -378,13 +392,19 @@ pub(crate) fn is_q8_tensor(name: &str) -> bool {
     let Some(class) = q8_class_of(name) else {
         return false;
     };
-    if fixed_tier_dtype_for(name).is_some() {
+    // A class named in HIPFIRE_FIXED_TIER / --fixed-tier is held above --format
+    // even if it is not in HIPFIRE_Q8_CLASSES — including explicit q8.
+    if fixed_tier_override_applies(name) {
         return true;
     }
     match std::env::var("HIPFIRE_Q8_CLASSES") {
         Ok(list) => {
-            // validated at startup; still handle empty list as no lift
-            list.split(',').any(|c| c.trim() == class)
+            // validated at startup; still handle empty list as no lift.
+            // `attn_full` independently retains self-attention without linear_attn.
+            list.split(',').any(|c| {
+                let c = c.trim();
+                c == class || (c == "attn_full" && is_attn_full_tensor(name))
+            })
         }
         Err(_) => true,
     }
@@ -396,64 +416,73 @@ pub(crate) fn is_q8_tensor(name: &str) -> bool {
 ///
 /// Accepted dtypes: `q8`, `mq2v2`, `mq3v2`, `mq4v2`, `mq5v2`, `mq6v2` (plus legacy
 /// `mq4`, `mq3l`, `mfp4e8`, `mfp4e8soa`). Accepted
-/// classes: `lm_head`, `embed`, `router`, `attn`, `ssm_out` (see `q8_class_of`).
+/// classes: `lm_head`, `embed`, `router`, `attn`, `attn_full`, `ssm_out`
+/// (see `q8_class_of` / `is_attn_full_tensor`).
+///
+/// For full-attention names, an `attn_full` map entry wins over generic `attn`.
+/// Explicit `q8` still means no codec override (fall back to Q8F16).
 pub(crate) fn fixed_tier_dtype_for(name: &str) -> Option<&'static str> {
+    fixed_tier_map_entry_for(name, &active_fixed_tier_map()?).and_then(intern_fixed_dtype)
+}
+
+/// True when an explicit CLI/env fixed-tier entry names a class that matches
+/// `name`. Includes explicit `q8` (which [`fixed_tier_dtype_for`] maps to
+/// `None` meaning Q8 storage). Uses the same attn_full-before-attn precedence
+/// as dtype lookup. Does not imply ProductTier lift — callers OR this with
+/// `tier.lifts(class)` when routing into the fixed-tier encoder branch.
+pub(crate) fn fixed_tier_override_applies(name: &str) -> bool {
+    match active_fixed_tier_map() {
+        Some(map) => fixed_tier_map_entry_for(name, &map).is_some(),
+        None => false,
+    }
+}
+
+/// Class-match against a fixed-tier map: `attn_full` precedes generic `attn`
+/// for `self_attn` tensors; otherwise the `q8_class_of` key. Pure — no env.
+pub(crate) fn fixed_tier_map_entry_for<'a>(
+    name: &str,
+    map: &'a HashMap<String, String>,
+) -> Option<&'a str> {
     let class = q8_class_of(name)?;
-    // Prefer CLI map if set (populated from --fixed-tier), else env.
-    if let Some(map) = fixed_tier_map_cli() {
-        if let Some(dtype) = map.get(class) {
-            return match dtype.as_str() {
-                "q8" => None,
-                "mfp4e8soa" => Some("mfp4e8soa"),
-                "mfp4e8" => Some("mfp4e8"),
-                "mq4" => Some("mq4"),
-                "mq3l" => Some("mq3l"),
-                "mq2v2" => Some("mq2v2"),
-                "mq3v2" => Some("mq3v2"),
-                "mq4v2" => Some("mq4v2"),
-                "mq5v2" => Some("mq5v2"),
-                "mq6v2" => Some("mq6v2"),
-                _ => None,
-            };
+    if is_attn_full_tensor(name) {
+        if let Some(dtype) = map.get("attn_full") {
+            return Some(dtype.as_str());
         }
-        return None;
+    }
+    map.get(class).map(|s| s.as_str())
+}
+
+/// CLI map if `--fixed-tier` provided a map (including empty), else env.
+fn active_fixed_tier_map() -> Option<HashMap<String, String>> {
+    if let Some(map) = fixed_tier_map_cli() {
+        return Some(map);
     }
     let spec = std::env::var("HIPFIRE_FIXED_TIER").ok()?;
-    for entry in spec.split(',') {
-        let e = entry.trim();
-        if e.is_empty() {
-            continue;
-        }
-        let Some((c, d)) = e.split_once(':') else {
-            eprintln!(
-                "error: HIPFIRE_FIXED_TIER: malformed entry '{e}' \
-                 (expected <class>:<dtype>, e.g. lm_head:mq6v2)"
-            );
+    match parse_fixed_tier(&spec) {
+        Ok(map) => Some(map),
+        Err(e) => {
+            // validate_env_fixed_tier_or_exit runs at CLI boundary; a late
+            // failure here is still a hard error rather than silent miss.
+            eprintln!("error: HIPFIRE_FIXED_TIER: {e}");
             std::process::exit(2);
-        };
-        if c.trim() == class {
-            return match d.trim() {
-                "mfp4e8soa" => Some("mfp4e8soa"),
-                "mfp4e8" => Some("mfp4e8"),
-                "mq4" => Some("mq4"),
-                "mq3l" => Some("mq3l"),
-                "mq2v2" => Some("mq2v2"),
-                "mq3v2" => Some("mq3v2"),
-                "mq4v2" => Some("mq4v2"),
-                "mq5v2" => Some("mq5v2"),
-                "mq6v2" => Some("mq6v2"),
-                "q8" => None,
-                other => {
-                    eprintln!(
-                        "error: HIPFIRE_FIXED_TIER: unknown dtype '{other}' \
-                         (expected q8|mq2v2|mq3v2|mq4v2|mq5v2|mq6v2)"
-                    );
-                    std::process::exit(2);
-                }
-            };
         }
     }
-    None
+}
+
+fn intern_fixed_dtype(dtype: &str) -> Option<&'static str> {
+    match dtype {
+        "q8" => None,
+        "mfp4e8soa" => Some("mfp4e8soa"),
+        "mfp4e8" => Some("mfp4e8"),
+        "mq4" => Some("mq4"),
+        "mq3l" => Some("mq3l"),
+        "mq2v2" => Some("mq2v2"),
+        "mq3v2" => Some("mq3v2"),
+        "mq4v2" => Some("mq4v2"),
+        "mq5v2" => Some("mq5v2"),
+        "mq6v2" => Some("mq6v2"),
+        _ => None,
+    }
 }
 
 // CLI-provided fixed-tier map, set once at startup before threads.
@@ -561,6 +590,10 @@ mod product_tier_tests {
         assert!(validate_fixed_tier_spec("unknown:q8").is_err());
         assert!(validate_fixed_tier_spec("lm_head-q8").is_err());
         assert!(validate_fixed_tier_spec("lm_head:mq4v2,embed:q8").is_ok());
+        assert!(validate_q8_classes_spec("attn_full").is_ok());
+        assert!(validate_q8_classes_spec("attn,attn_full,ssm_out").is_ok());
+        assert!(validate_fixed_tier_spec("ssm_out:mq6v2,attn_full:mq6v2").is_ok());
+        assert!(validate_fixed_tier_spec("attn_full:mq6v2").is_ok());
     }
 
     #[test]
@@ -580,6 +613,7 @@ mod product_tier_tests {
         assert!(pro.lifts("ssm_out"));
         assert!(!pro.lifts("attn"));
         assert!(!pro.lifts("router"));
+        assert!(!pro.lifts("attn_full"), "Pro must not lift attn_full");
     }
 
     #[test]
@@ -616,6 +650,156 @@ mod product_tier_tests {
             Some("ssm_out")
         );
         assert!(pro.lifts("ssm_out"));
+    }
+
+    #[test]
+    fn attn_full_predicate_separates_self_attn_from_linear() {
+        assert!(is_attn_full_tensor(
+            "model.layers.0.self_attn.q_proj.weight"
+        ));
+        assert!(is_attn_full_tensor(
+            "model.layers.0.self_attn.o_proj.weight"
+        ));
+        assert!(!is_attn_full_tensor(
+            "model.layers.0.linear_attn.in_proj.weight"
+        ));
+        assert!(!is_attn_full_tensor(
+            "model.layers.0.linear_attn.out_proj.weight"
+        ));
+        assert!(!is_attn_full_tensor(
+            "model.layers.0.linear_attn.conv1d.weight"
+        ));
+        // generic attn shapes without self_attn are not attn_full
+        assert!(!is_attn_full_tensor("blk.0.attn_q.weight"));
+        assert!(!is_attn_full_tensor("layers.0.q_proj.weight"));
+        // q8_class_of still returns attn for self-attention
+        assert_eq!(
+            q8_class_of("model.layers.0.self_attn.q_proj.weight"),
+            Some("attn")
+        );
+        assert_eq!(
+            q8_class_of("model.layers.0.linear_attn.in_proj.weight"),
+            Some("attn")
+        );
+    }
+
+    #[test]
+    fn attn_full_lookup_precedes_generic_attn() {
+        let m = parse_fixed_tier("ssm_out:mq6v2,attn_full:mq6v2,attn:mq4v2").unwrap();
+        assert_eq!(m.get("attn_full").map(|s| s.as_str()), Some("mq6v2"));
+        assert_eq!(m.get("attn").map(|s| s.as_str()), Some("mq4v2"));
+        assert_eq!(m.get("ssm_out").map(|s| s.as_str()), Some("mq6v2"));
+
+        // Resolve via the shared map helper (no OnceLock / env).
+        let self_attn = "model.layers.0.self_attn.q_proj.weight";
+        let linear_attn = "model.layers.0.linear_attn.in_proj.weight";
+        let ssm = "model.layers.0.linear_attn.out_proj.weight";
+
+        // Prefer attn_full over attn for self_attn names.
+        assert_eq!(
+            fixed_tier_map_entry_for(self_attn, &m).and_then(intern_fixed_dtype),
+            Some("mq6v2")
+        );
+        // linear_attn stays on generic attn — not selected by attn_full.
+        assert_eq!(
+            fixed_tier_map_entry_for(linear_attn, &m).and_then(intern_fixed_dtype),
+            Some("mq4v2")
+        );
+        assert_eq!(
+            fixed_tier_map_entry_for(ssm, &m).and_then(intern_fixed_dtype),
+            Some("mq6v2")
+        );
+
+        // Generic attn alone still covers self_attn when attn_full is absent.
+        let attn_only = parse_fixed_tier("attn:mq5v2").unwrap();
+        assert_eq!(
+            fixed_tier_map_entry_for(self_attn, &attn_only).and_then(intern_fixed_dtype),
+            Some("mq5v2")
+        );
+        assert_eq!(
+            fixed_tier_map_entry_for(linear_attn, &attn_only).and_then(intern_fixed_dtype),
+            Some("mq5v2")
+        );
+
+        // attn_full alone does not select linear_attn.
+        let full_only = parse_fixed_tier("attn_full:mq6v2").unwrap();
+        assert_eq!(
+            fixed_tier_map_entry_for(self_attn, &full_only).and_then(intern_fixed_dtype),
+            Some("mq6v2")
+        );
+        assert_eq!(fixed_tier_map_entry_for(linear_attn, &full_only), None);
+
+        // explicit q8 means no codec override from dtype_for, but entry applies
+        let q8_full = parse_fixed_tier("attn_full:q8,attn:mq4v2").unwrap();
+        assert_eq!(fixed_tier_map_entry_for(self_attn, &q8_full), Some("q8"));
+        assert_eq!(
+            fixed_tier_map_entry_for(self_attn, &q8_full).and_then(intern_fixed_dtype),
+            None
+        );
+        assert_eq!(
+            fixed_tier_map_entry_for(linear_attn, &q8_full).and_then(intern_fixed_dtype),
+            Some("mq4v2")
+        );
+    }
+
+    #[test]
+    fn fixed_tier_override_applies_map_semantics() {
+        let m = parse_fixed_tier("ssm_out:mq6v2,attn_full:mq6v2").unwrap();
+        let self_attn = "model.layers.0.self_attn.q_proj.weight";
+        let linear_attn = "model.layers.0.linear_attn.in_proj.weight";
+        let ssm = "model.layers.0.linear_attn.out_proj.weight";
+        let mlp = "model.layers.0.mlp.down_proj.weight";
+
+        // attn_full applies only to self_attn
+        assert!(fixed_tier_map_entry_for(self_attn, &m).is_some());
+        assert!(fixed_tier_map_entry_for(linear_attn, &m).is_none());
+        assert!(fixed_tier_map_entry_for(ssm, &m).is_some());
+        assert!(fixed_tier_map_entry_for(mlp, &m).is_none());
+
+        // generic attn still applies to both self_attn and linear_attn
+        let attn = parse_fixed_tier("attn:mq4v2").unwrap();
+        assert!(fixed_tier_map_entry_for(self_attn, &attn).is_some());
+        assert!(fixed_tier_map_entry_for(linear_attn, &attn).is_some());
+        assert!(fixed_tier_map_entry_for(ssm, &attn).is_none()); // ssm_out class
+
+        // explicit q8 still counts as an applicable override
+        let q8 = parse_fixed_tier("attn_full:q8").unwrap();
+        assert_eq!(fixed_tier_map_entry_for(self_attn, &q8), Some("q8"));
+        assert!(fixed_tier_map_entry_for(linear_attn, &q8).is_none());
+
+        // Pro still does not lift attn_full; override is independent of ProductTier
+        let pro = ProductTier::Pro;
+        assert!(!pro.lifts("attn_full"));
+        assert!(!pro.lifts("attn"));
+        assert!(pro.lifts("ssm_out"));
+        // routing condition: product_tier_lifts || override
+        let product_lifts = |name: &str| q8_class_of(name).is_some_and(|c| pro.lifts(c));
+        assert!(product_lifts(ssm) || fixed_tier_map_entry_for(ssm, &m).is_some());
+        assert!(!product_lifts(self_attn));
+        assert!(fixed_tier_map_entry_for(self_attn, &m).is_some());
+        assert!(
+            product_lifts(self_attn) || fixed_tier_map_entry_for(self_attn, &m).is_some(),
+            "balanced Pro needs override path for attn_full"
+        );
+        assert!(
+            !(product_lifts(linear_attn) || fixed_tier_map_entry_for(linear_attn, &m).is_some()),
+            "linear_attn must stay on base codec under attn_full override"
+        );
+    }
+
+    #[test]
+    fn pro_still_does_not_lift_attention() {
+        let pro = ProductTier::Pro;
+        assert_eq!(pro.lifted_classes(), &["embed", "lm_head", "ssm_out"]);
+        assert!(!pro.lifts("attn"));
+        assert!(!pro.lifts("attn_full"));
+        assert!(is_attn_full_tensor(
+            "model.layers.0.self_attn.q_proj.weight"
+        ));
+        assert_eq!(
+            q8_class_of("model.layers.0.self_attn.q_proj.weight"),
+            Some("attn")
+        );
     }
 
     #[test]
