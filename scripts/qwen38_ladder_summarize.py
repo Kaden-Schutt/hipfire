@@ -882,7 +882,7 @@ def main(argv=None) -> int:
             "draft_id": did,
             "draft_path": draft_path,
             "draft_bytes": draft_bytes,
-            "draft_sha256": row.get("draft_sha256")
+            "draft_sha256": r.get("draft_sha256")
             or (sha256_file(Path(draft_path)) if draft_path and Path(draft_path).is_file() else None),
             "decode_tok_s": {"median": decode_median, "rep_medians": rep_medians_decode},
             "prefill_tok_s": {"median": prefill_median, "rep_medians": rep_medians_prefill},
