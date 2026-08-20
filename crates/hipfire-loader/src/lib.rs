@@ -1658,6 +1658,24 @@ fn finish_qwen35_load(
             ctx.spec.ddtree_budget,
             ctx.spec.ddtree_topk,
             eviction.is_some(),
+            &bundle.weights,
+            // Exact plain Q8 KV (not asym/fwht variants). Matches design:
+            // flags on the already-built cache — never re-resolve the string.
+            {
+                let kv = &bundle.kv_cache;
+                kv.quant_q8
+                    && !kv.quant_fwht
+                    && !kv.quant_asym2
+                    && !kv.quant_asym3
+                    && !kv.quant_asym4
+                    && matches!(kv.v_mode, llama::VMode::Q8)
+            },
+            // finish_qwen35_load is the single-GPU carrier path.
+            true,
+            // Fail-closed: adaptive KV starts FWHT4 and tier-switches at runtime.
+            // Upstream also suppresses DFlash when adaptive is Some; this keeps
+            // admission honest if a future path reaches load_dflash_state.
+            bundle.kv_adaptive.is_some(),
         ) {
             Ok(s) => {
                 eprintln!(
@@ -3189,7 +3207,9 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
         if let Some(state) = m.state.take() {
             // multi-GPU resources. Otherwise just drop the box (original match did
             // the same — non-qwen35 pp>1 is unreachable and had an empty arm).
-            if let Ok(mut b) = (state as Box<dyn Any>).downcast::<hipfire_arch_qwen35::Qwen35Bundle>() {
+            if let Ok(mut b) =
+                (state as Box<dyn Any>).downcast::<hipfire_arch_qwen35::Qwen35Bundle>()
+            {
                 if let Some(scratch_set) = b.pp_scratch_set.take() {
                     scratch_set.free_gpu_multi(&mut gpus);
                 }
@@ -3208,7 +3228,21 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
         let _ = gpu;
         return Ok(());
     }
-    if let Some(spec) = m.speculator {
+    // Quiesce retained-PM4 (if any) before freeing any captured owner. Unknown
+    // quiescence → keep model quarantined; daemon restart is containment.
+    if let Some(spec) = &mut m.speculator {
+        if let Err(reason) = spec.quiesce(gpu) {
+            eprintln!(
+                "dflash verify PM4: unload refused — unknown quiescence: {reason}"
+            );
+            std::mem::forget(m);
+            return Err(format!(
+                "dflash verify PM4: unload refused after unknown quiescence ({reason}); \
+                 model remains quarantined until process restart"
+            ));
+        }
+    }
+    if let Some(spec) = m.speculator.take() {
         // Frees the drafter's GPU buffers (draft weights + scratch) AND its
         // checkpoint ring — a drafter that forgets is a compile error, not a
         // silent VRAM leak. The vestigial `m.dflash_checkpoints` (now always

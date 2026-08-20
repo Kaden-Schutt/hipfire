@@ -18,6 +18,10 @@
 
 use crate::carrier::Qwen35Bundle;
 use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weights};
+use crate::dflash_verify_pm4::{
+    fingerprint_u64, DflashVerifyBinding, DflashVerifyPm4, DflashVerifyPm4Phase,
+    DflashVerifyRoute, DflashVerifyWindow,
+};
 use hip_bridge::{DeviceBuffer, HipResult, Stream};
 use hipfire_dispatch::families::kv_tier::KTier;
 use hipfire_runtime::dflash::{self, DflashConfig, DflashScratch, DflashWeights};
@@ -2413,6 +2417,7 @@ pub fn verify_dflash_block(
         None,
         verify_scratch,
         false, // chain path always needs argmax
+        None,  // no retained-PM4 route on the generic wrapper
     )
 }
 
@@ -2455,6 +2460,7 @@ pub fn verify_dflash_block_tree(
         Some(tree_verify),
         verify_scratch,
         skip_argmax_d2h,
+        None, // tree verify never takes the retained-PM4 route
     )
 }
 
@@ -2471,6 +2477,10 @@ fn verify_dflash_block_inner(
     // D9: skip the big_n × 4 argmax D2H when the caller will use SWOR walk
     // (which gets accepted indices from the 68-byte walk-result D2H instead).
     skip_argmax_d2h: bool,
+    // Retained-PM4 route for this window, or `None` for the shipping path.
+    // Only `verify_dflash_block_retained` ever passes `Some`, and only for the
+    // fixed B=16 chain verify.
+    mut retained: Option<&mut RetainedCtx<'_>>,
 ) -> HipResult<DflashVerifyOutput> {
     let b = draft_tokens.len();
     let vocab = target.config.vocab_size;
@@ -2618,7 +2628,31 @@ fn verify_dflash_block_inner(
     };
     let mut graph_includes_lmhead_argmax = false;
 
-    let batch_result = if verify_graph_ok {
+    // Retained-PM4 route. When the caller handed us a live route for this
+    // window it owns the forward outright, and the HipGraph selection below is
+    // skipped so the tape never records a graph launch.
+    let retained_selected = retained
+        .as_ref()
+        .map(|ctx| ctx.selected)
+        .unwrap_or(DflashVerifyRoute::HipAuto);
+    let retained_active = !matches!(retained_selected, DflashVerifyRoute::HipAuto);
+    let batch_result = if retained_active {
+        vg_mode = "retained";
+        let ctx = retained
+            .as_mut()
+            .expect("retained_active implies a retained context");
+        run_retained_verify_forward(
+            gpu,
+            target,
+            draft_tokens,
+            start_pos,
+            hidden_rb,
+            &final_hidden,
+            gdn_tape,
+            verify_scratch,
+            ctx,
+        )
+    } else if verify_graph_ok {
         let pbs = verify_scratch.prefill_batch.as_ref().unwrap();
         debug_assert!(b <= pbs.max_batch);
         // Pre-capture: pre-upload inputs and ensure a stream exists. memcpy_htod
@@ -2788,7 +2822,9 @@ fn verify_dflash_block_inner(
     // those rows at the current head and advances head by b. Under the
     // graph path we manually drive this because the non-graph chunk loop
     // (forward_prefill_batch_with_pbs) that usually calls it was bypassed.
-    if verify_graph_ok && batch_result.is_ok() {
+    // The retained route runs the same capture-safe single-chunk body as the
+    // graph path, so it owes the same one external staging commit.
+    if (retained_active || verify_graph_ok) && batch_result.is_ok() {
         hidden_rb.commit_staging_to_ring(gpu, b)?;
     }
     // Tree mode at topk>1 REQUIRES this sync. Without it τ degrades badly
@@ -2903,6 +2939,437 @@ fn verify_dflash_block_inner(
         argmax_per_pos,
         logits_per_pos,
     })
+}
+
+/// Retained-PM4 execution context for one DFlash verify window.
+///
+/// Built by [`verify_dflash_block_retained`] and threaded into
+/// [`verify_dflash_block_inner`], which owns the forward. `selected` is the
+/// route [`DflashVerifyPm4::plan_route`] chose for this window;
+/// [`DflashVerifyRoute::HipAuto`] means the retained machinery stands down and
+/// the shipping path runs unchanged.
+struct RetainedCtx<'a> {
+    state: &'a mut DflashVerifyPm4,
+    binding: DflashVerifyBinding,
+    selected: DflashVerifyRoute,
+}
+
+/// Why a recording capture stopped short.
+///
+/// The distinction is the whole safety argument: `Forward` means the model body
+/// itself failed and there is no valid result for this cycle, while the other
+/// three happen after a synchronized successful body and therefore only cost us
+/// the route.
+enum CaptureFailure {
+    Forward(hip_bridge::HipError),
+    Record(String),
+    Contract(String),
+    Prepare(String),
+}
+
+/// How far a successful recording window got.
+///
+/// The first recording only calibrates: a prepared route may retain a scalar
+/// kernarg solely when a second recording at a different position proves the
+/// scalar tracks the position.
+enum CaptureStep {
+    Calibrated(rdna_compute::replay::RecordedKernargSnapshot),
+    Ready {
+        identity: rdna_compute::replay::PreparedReplayIdentity,
+        position_bindings: usize,
+    },
+}
+
+fn retained_hip_error(reason: &str) -> hip_bridge::HipError {
+    hip_bridge::HipError::new(0, reason)
+}
+
+/// Fingerprint every shape, dtype, extraction id, and captured allocation base
+/// the retained tape depends on. Bases and shapes only — never buffer contents,
+/// which change every cycle by design.
+fn dflash_verify_fingerprint(
+    target: &ModelSlot,
+    hidden_rb: &HiddenStateRingBuffer,
+    verify_scratch: &VerifyScratch,
+    gdn_tape: Option<&GdnTape>,
+) -> u64 {
+    let mut values: Vec<u64> = Vec::new();
+    values.push(target.config.dim as u64);
+    values.push(target.config.n_layers as u64);
+    values.push(target.config.vocab_size as u64);
+    values.push(target.weights.output.gpu_dtype as u64);
+    values.push(verify_scratch.max_n as u64);
+    values.push(verify_scratch.dim as u64);
+    values.push(verify_scratch.vocab as u64);
+    values.push(verify_scratch.hidden_k as u64);
+    values.push(verify_scratch.final_hidden.buf.as_ptr() as u64);
+    values.push(verify_scratch.logits.buf.as_ptr() as u64);
+    values.push(verify_scratch.rot.buf.as_ptr() as u64);
+    values.push(verify_scratch.argmax.buf.as_ptr() as u64);
+    if let Some(pbs) = verify_scratch.prefill_batch.as_ref() {
+        values.push(pbs.max_batch as u64);
+        values.push(pbs.x_batch.buf.as_ptr() as u64);
+        values.push(pbs.rope_positions.buf.as_ptr() as u64);
+    }
+    values.push(hidden_rb.max_positions as u64);
+    values.push(hidden_rb.hidden_dim as u64);
+    values.push(hidden_rb.max_batch as u64);
+    for &layer_id in &hidden_rb.extract_layers {
+        values.push(layer_id as u64);
+    }
+    // Only the staging buffers are captured. `layer_bufs` are written by the
+    // head-dependent commit, which stays outside the tape.
+    for staging in &hidden_rb.staging_bufs {
+        values.push(staging.buf.as_ptr() as u64);
+    }
+    for s_matrix in &target.dn_state.s_matrices {
+        values.push(s_matrix.buf.as_ptr() as u64);
+    }
+    if let Some(tape) = gdn_tape {
+        values.push(tape.max_n as u64);
+        values.push(tape.qkv_dim as u64);
+        values.push(tape.v_dim as u64);
+        for buf in tape
+            .qkv_bufs
+            .iter()
+            .chain(tape.alpha_bufs.iter())
+            .chain(tape.beta_bufs.iter())
+        {
+            values.push(buf.buf.as_ptr() as u64);
+        }
+    }
+    fingerprint_u64(&values)
+}
+
+/// Build the admission binding for the current window.
+///
+/// `max_position` is the smaller of the hidden ring capacity and the KV
+/// physical capacity: a window past it re-primes rather than replaying dynamic
+/// geometry that was prepared too small.
+fn build_dflash_verify_binding(
+    b: usize,
+    arch: &str,
+    target: &ModelSlot,
+    hidden_rb: &HiddenStateRingBuffer,
+    verify_scratch: &VerifyScratch,
+    gdn_tape: Option<&GdnTape>,
+) -> DflashVerifyBinding {
+    let fingerprint = dflash_verify_fingerprint(target, hidden_rb, verify_scratch, gdn_tape);
+    // The layout generation moves whenever the KV slab is remapped or resized.
+    // Expected VMM growth may keep the same reserved base, so capacity is
+    // folded in alongside every per-layer allocation base.
+    let kv = &target.kv_cache;
+    let mut layout: Vec<u64> = Vec::with_capacity(2 + kv.k_gpu.len() * 2);
+    layout.push(kv.physical_cap as u64);
+    layout.push(kv.max_seq as u64);
+    for (k, v) in kv.k_gpu.iter().zip(kv.v_gpu.iter()) {
+        layout.push(k.buf.as_ptr() as u64);
+        layout.push(v.buf.as_ptr() as u64);
+    }
+    let layout_generation = fingerprint_u64(&layout);
+    DflashVerifyBinding::new(
+        b,
+        arch,
+        fingerprint,
+        layout_generation,
+        hidden_rb.max_positions.min(kv.physical_cap),
+    )
+}
+
+/// The capture-safe single-chunk body, run directly with no graph and no
+/// recording. Shared by every retained route so the recorded body and the
+/// fallback body are literally the same call.
+#[allow(clippy::too_many_arguments)]
+fn dflash_direct_verify_forward(
+    gpu: &mut Gpu,
+    target: &mut ModelSlot,
+    draft_tokens: &[u32],
+    start_pos: usize,
+    hidden_rb: &mut HiddenStateRingBuffer,
+    final_hidden: &GpuTensor,
+    gdn_tape: Option<&mut GdnTape>,
+    pbs: &qwen35::PrefillBatchScratch,
+) -> HipResult<()> {
+    qwen35::forward_prefill_batch_single_chunk_captured_opts(
+        gpu,
+        &target.weights,
+        &target.config,
+        draft_tokens,
+        start_pos,
+        &mut target.kv_cache,
+        &mut target.dn_state,
+        &target.scratch,
+        pbs,
+        Some(hidden_rb),
+        Some(final_hidden),
+        gdn_tape,
+        None,
+        false, // DFlash computes all verify logits from final_hidden
+    )
+}
+
+/// Execute one retained-route verify window and report the outcome to the
+/// route state machine.
+///
+/// Host token/position upload happens here, before any recording, and never
+/// enters the indirect buffer. lm-head, argmax, accept, and the staging commit
+/// all stay with the caller.
+#[allow(clippy::too_many_arguments)]
+fn run_retained_verify_forward(
+    gpu: &mut Gpu,
+    target: &mut ModelSlot,
+    draft_tokens: &[u32],
+    start_pos: usize,
+    hidden_rb: &mut HiddenStateRingBuffer,
+    final_hidden: &GpuTensor,
+    gdn_tape: Option<&mut GdnTape>,
+    verify_scratch: &VerifyScratch,
+    ctx: &mut RetainedCtx<'_>,
+) -> HipResult<()> {
+    let pbs = verify_scratch.prefill_batch.as_ref().ok_or_else(|| {
+        retained_hip_error("retained DFlash verify requires a persistent PrefillBatchScratch")
+    })?;
+    qwen35::upload_prefill_batch_inputs(gpu, pbs, draft_tokens, start_pos)?;
+    if gpu.active_stream.is_none() {
+        gpu.active_stream = Some(gpu.hip.stream_create()?);
+    }
+
+    match ctx.selected {
+        DflashVerifyRoute::HipAuto => Err(retained_hip_error(
+            "run_retained_verify_forward called for a HipAuto window",
+        )),
+        DflashVerifyRoute::PrimeDirect => {
+            let result = dflash_direct_verify_forward(
+                gpu,
+                target,
+                draft_tokens,
+                start_pos,
+                hidden_rb,
+                final_hidden,
+                gdn_tape,
+                pbs,
+            );
+            if result.is_ok() {
+                ctx.state.note_prime_success(ctx.binding.clone());
+            }
+            result
+        }
+        DflashVerifyRoute::CaptureRecord => {
+            let max_position = ctx.binding.max_position;
+            swap_retained_controller(gpu, ctx.state)?;
+            let began = gpu.replay.begin_capture();
+            if let Err(reason) = began {
+                // Nothing was recorded and nothing ran: restore the ordinary
+                // controller and produce this cycle's result on direct HIP.
+                swap_retained_controller(gpu, ctx.state)?;
+                ctx.state
+                    .poison(format!("DFlash retained begin capture: {reason}"));
+                return dflash_direct_verify_forward(
+                    gpu,
+                    target,
+                    draft_tokens,
+                    start_pos,
+                    hidden_rb,
+                    final_hidden,
+                    gdn_tape,
+                    pbs,
+                );
+            }
+            // A prepared route may only retain a kernarg scalar that provably
+            // tracks the decode position, and one recording cannot prove that.
+            // The first eligible window records a calibration tape; the next one
+            // at a different position differences against it.
+            let earlier = ctx
+                .state
+                .calibration()
+                .map(|(snapshot, at)| (snapshot.clone(), at));
+            let outcome = (|| -> Result<CaptureStep, CaptureFailure> {
+                dflash_direct_verify_forward(
+                    gpu,
+                    target,
+                    draft_tokens,
+                    start_pos,
+                    hidden_rb,
+                    final_hidden,
+                    gdn_tape,
+                    pbs,
+                )
+                .map_err(CaptureFailure::Forward)?;
+                gpu.hip
+                    .device_synchronize()
+                    .map_err(CaptureFailure::Forward)?;
+                gpu.replay
+                    .finish_capture()
+                    .map_err(|reason| CaptureFailure::Record(format!("finish capture: {reason}")))?;
+                let Some((earlier_snapshot, earlier_position)) = earlier else {
+                    return Ok(CaptureStep::Calibrated(
+                        gpu.replay.snapshot_recorded_kernargs(),
+                    ));
+                };
+                if start_pos <= earlier_position {
+                    // Differencing needs a strictly later position; keep the
+                    // fresher recording and wait for generation to advance.
+                    return Ok(CaptureStep::Calibrated(
+                        gpu.replay.snapshot_recorded_kernargs(),
+                    ));
+                }
+                let position_bindings = gpu
+                    .replay
+                    .synthesize_position_bindings(&earlier_snapshot, earlier_position, start_pos)
+                    .map_err(|reason| {
+                        CaptureFailure::Contract(format!("position binding synthesis: {reason}"))
+                    })?;
+                let launches = gpu.replay.recorded_launches().len();
+                gpu.replay
+                    .probe_aql_contracts(gpu.device_id as usize)
+                    .map_err(|reason| {
+                        CaptureFailure::Contract(format!("AQL contract probe: {reason}"))
+                    })?;
+                gpu.replay.set_prepared_max_position(max_position);
+                gpu.replay
+                    .prepare_pm4_prefix(gpu.device_id as usize, launches)
+                    .map_err(|reason| CaptureFailure::Prepare(format!("PM4 prepare: {reason}")))?;
+                gpu.replay
+                    .prepared_route_identity()
+                    .map(|identity| CaptureStep::Ready {
+                        identity,
+                        position_bindings,
+                    })
+                    .ok_or_else(|| {
+                        CaptureFailure::Prepare(
+                            "prepared PM4 route reported no identity".to_string(),
+                        )
+                    })
+            })();
+            swap_retained_controller(gpu, ctx.state)?;
+            match outcome {
+                Ok(CaptureStep::Calibrated(snapshot)) => {
+                    ctx.state.note_calibration_capture(snapshot, start_pos);
+                    Ok(())
+                }
+                Ok(CaptureStep::Ready {
+                    identity,
+                    position_bindings,
+                }) => {
+                    ctx.state.note_capture();
+                    ctx.state.note_position_bindings(position_bindings);
+                    ctx.state.note_ready(ctx.binding.clone(), identity);
+                    Ok(())
+                }
+                Err(CaptureFailure::Forward(error)) => {
+                    // The body failed mid-capture: KV/DeltaNet/staging may be
+                    // half-written, so there is nothing to salvage here.
+                    ctx.state
+                        .poison(format!("DFlash retained capture body failed: {error:?}"));
+                    Err(error)
+                }
+                Err(CaptureFailure::Record(reason)) => {
+                    ctx.state.poison(reason);
+                    Ok(())
+                }
+                Err(CaptureFailure::Contract(reason)) => {
+                    ctx.state.note_capture();
+                    ctx.state.note_contract_failure(reason);
+                    Ok(())
+                }
+                Err(CaptureFailure::Prepare(reason)) => {
+                    ctx.state.note_capture();
+                    ctx.state.note_prepare_failure(reason);
+                    Ok(())
+                }
+            }
+        }
+        DflashVerifyRoute::Pm4 => {
+            swap_retained_controller(gpu, ctx.state)?;
+            let replayed = unsafe { gpu.replay.replay_pm4_checked(start_pos) };
+            swap_retained_controller(gpu, ctx.state)?;
+            match replayed {
+                Ok(_) => {
+                    ctx.state.note_replay_success(start_pos);
+                    Ok(())
+                }
+                Err(failure) => {
+                    let quiescence = failure.quiescence;
+                    ctx.state
+                        .note_replay_failure(start_pos, quiescence, failure.error.clone());
+                    Err(retained_hip_error(&format!(
+                        "DFlash retained PM4 replay failed at position {start_pos} \
+                         (quiescence {quiescence:?}): {}",
+                        failure.error
+                    )))
+                }
+            }
+        }
+    }
+}
+
+/// Swap the dedicated retained controller in or out of `gpu.replay`.
+///
+/// The ordinary-AR controller must never record or replay the DFlash tape, and
+/// the DFlash controller must never own the AR route, so the swap is always
+/// paired around exactly the recorded or replayed body.
+fn swap_retained_controller(gpu: &mut Gpu, state: &mut DflashVerifyPm4) -> HipResult<()> {
+    let controller = state.controller_mut().ok_or_else(|| {
+        retained_hip_error("retained DFlash verify route has no dedicated controller")
+    })?;
+    std::mem::swap(&mut gpu.replay, controller);
+    Ok(())
+}
+
+/// Retained-route entry point for the fixed B=16 DFlash2 chain verify.
+///
+/// Plans the route for this window, then defers to the ordinary
+/// [`verify_dflash_block_inner`] so lm-head, argmax, and the staging commit run
+/// exactly once and in their existing order regardless of which forward ran.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_dflash_block_retained(
+    gpu: &mut Gpu,
+    target: &mut ModelSlot,
+    draft_tokens: &[u32],
+    start_pos: usize,
+    hidden_rb: &mut HiddenStateRingBuffer,
+    gdn_tape: Option<&mut GdnTape>,
+    want_full_logits: bool,
+    verify_scratch: &VerifyScratch,
+    route: &mut DflashVerifyPm4,
+) -> HipResult<DflashVerifyOutput> {
+    let b = draft_tokens.len();
+    let binding = build_dflash_verify_binding(
+        b,
+        gpu.arch.as_str(),
+        target,
+        hidden_rb,
+        verify_scratch,
+        gdn_tape.as_deref(),
+    );
+    let selected = {
+        let window = DflashVerifyWindow {
+            batch: b,
+            tree: false,
+            want_full_logits,
+            position: start_pos,
+            binding: &binding,
+        };
+        route.plan_route(&window)
+    };
+    let mut ctx = RetainedCtx {
+        state: route,
+        binding,
+        selected,
+    };
+    verify_dflash_block_inner(
+        gpu,
+        target,
+        draft_tokens,
+        start_pos,
+        hidden_rb,
+        gdn_tape,
+        want_full_logits,
+        None,
+        verify_scratch,
+        false,
+        Some(&mut ctx),
+    )
 }
 
 /// Download extracted target hidden states for the most recent B positions
@@ -3160,6 +3627,9 @@ pub fn spec_step_dflash(
     // bonus). `None` = uncapped (bench/demo). Clamped **before** hidden/KV/
     // DeltaNet/drafter commit so post-hoc `cap_emit` is defense only.
     max_accept: Option<usize>,
+    // Retained-PM4 verify route owned by the speculator. `None` keeps the
+    // shipping HIP/HipGraph path byte-for-byte.
+    verify_pm4: Option<&mut DflashVerifyPm4>,
 ) -> HipResult<SpecStepResult> {
     let selector_mode = draft_weights.has_candidate_selector();
     if selector_mode {
@@ -3918,21 +4388,71 @@ pub fn spec_step_dflash(
         gpu.hip.device_synchronize()?;
     }
     let t_verify_start = std::time::Instant::now();
-    let verify_out = verify_dflash_block(
-        gpu,
-        target,
-        &block,
-        position,
-        hidden_rb,
-        gdn_tape_opt.as_deref_mut(),
-        // Full target logits are D2H'd to the host for rejection sampling, RP,
-        // or n-gram block. Under FAST_SAMPLE the rejection sampler reads the
-        // GPU-softmaxed target probs directly from the resident
-        // `verify_scratch.logits` buffer, so the host full-logit download +
-        // host argmax are skipped — that's the target-side half of the cost cut.
-        (use_temp_sampling && !fast_sample_active) || host_path_active,
-        verify_scratch,
-    )?;
+    // Full target logits are D2H'd to the host for rejection sampling, RP, or
+    // n-gram block. Under FAST_SAMPLE the rejection sampler reads the
+    // GPU-softmaxed target probs directly from the resident
+    // `verify_scratch.logits` buffer, so the host full-logit download + host
+    // argmax are skipped — that's the target-side half of the cost cut.
+    let want_full_logits = (use_temp_sampling && !fast_sample_active) || host_path_active;
+    let verify_out = match verify_pm4 {
+        Some(route) => {
+            let replay_failures_before = route.counters().replay_failures;
+            match verify_dflash_block_retained(
+                gpu,
+                target,
+                &block,
+                position,
+                hidden_rb,
+                gdn_tape_opt.as_deref_mut(),
+                want_full_logits,
+                verify_scratch,
+                route,
+            ) {
+                Ok(out) => out,
+                Err(error) => {
+                    // Fail closed when quiescence was never proven: a PM4 body
+                    // may still be executing against KV, DeltaNet state, and
+                    // hidden staging, so restoring or re-running would race it.
+                    if matches!(route.phase(), DflashVerifyPm4Phase::Quarantined { .. }) {
+                        return Err(error);
+                    }
+                    // Not a retained-execution failure — an ordinary model
+                    // error propagates exactly as it does on the HIP path.
+                    if route.counters().replay_failures == replay_failures_before {
+                        return Err(error);
+                    }
+                    // Proven-quiescent replay failure. Rewind the recurrent
+                    // state to the pre-window snapshot and redo the window on
+                    // the ordinary route; KV slots, hidden staging,
+                    // final_hidden, and the GDN tape are all overwritten by the
+                    // retry, and the ring is committed exactly once because the
+                    // failed attempt never committed.
+                    target_snap.restore_to(&mut target.dn_state, gpu)?;
+                    route.note_safe_hip_retry();
+                    verify_dflash_block(
+                        gpu,
+                        target,
+                        &block,
+                        position,
+                        hidden_rb,
+                        gdn_tape_opt.as_deref_mut(),
+                        want_full_logits,
+                        verify_scratch,
+                    )?
+                }
+            }
+        }
+        None => verify_dflash_block(
+            gpu,
+            target,
+            &block,
+            position,
+            hidden_rb,
+            gdn_tape_opt.as_deref_mut(),
+            want_full_logits,
+            verify_scratch,
+        )?,
+    };
 
     if phase_on {
         gpu.hip.device_synchronize()?;

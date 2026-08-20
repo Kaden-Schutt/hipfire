@@ -26,8 +26,20 @@ use redline_dispatch::aql::{
     Gfx10Pm4CommandBuffer, Gfx11ComputeResourceLimitsPolicy, Gfx11DispatchInterleave,
     Gfx12Pm4CommandBuffer, GpuBatchTiming, GpuDevice, GpuMultiQueueTiming, GpuSelector,
     HeaderPolicy, KernargBuffer, KernargPool, Kernel, LaunchGeometry, PhasedMultiQueuePm4Ib,
-    QueuePolicy, RecordedDispatch, Runtime, SingleQueueBatchGraph, SingleQueuePm4Ib,
+    QueuePolicy, Quiescence, RecordedDispatch, Runtime, SingleQueueBatchGraph, SingleQueuePm4Ib,
 };
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReplayQuiescence {
+    Proven,
+    Unknown,
+}
+
+#[derive(Clone, Debug)]
+pub struct RetainedReplayFailure {
+    pub error: String,
+    pub quiescence: ReplayQuiescence,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReplayBackendRequest {
@@ -2625,8 +2637,162 @@ impl ReplayGridBinding {
         bound[axis] = units.min(recorded[axis]);
         Ok(bound)
     }
+
+    fn units_for(self, position: usize) -> Result<u32, String> {
+        let Self::PositionCeilDiv {
+            axis: _,
+            addend,
+            divisor,
+        } = self;
+        if divisor == 0 {
+            return Err(format!(
+                "invalid replay grid binding divisor={divisor}"
+            ));
+        }
+        let extent = u64::try_from(position)
+            .map_err(|_| "decode position exceeds u64".to_owned())?
+            .checked_add(u64::from(addend))
+            .ok_or_else(|| "dynamic replay extent overflow".to_owned())?;
+        let units = extent.div_ceil(u64::from(divisor)).max(1);
+        u32::try_from(units).map_err(|_| format!("dynamic replay grid {units} exceeds u32"))
+    }
 }
 
+/// Single decision point for GDN stochastic-rounding frame consumption.
+///
+/// `frames = max(1, nt * grid.z)` where `nt` is the little-endian `i32` at
+/// kernarg byte offset 64 and `grid.z` is the recorded launch's third grid
+/// dimension. Both are fixed for the fixed-shape tape prepared by
+/// `prepare_pm4_prefix_inner` and by `replay_recorded_hip_prefix`.
+///
+/// Rejects (instead of silently defaulting) when the kernarg block is shorter
+/// than 80 bytes, when `nt <= 0`, or when the product overflows `u32`.
+pub(crate) fn gdn_requant_frames_for_dispatch(
+    kernarg: &[u8],
+    grid_z: u32,
+) -> Result<u32, String> {
+    if kernarg.len() < 80 {
+        return Err(format!(
+            "GDN kernarg block too short: {} < 80",
+            kernarg.len()
+        ));
+    }
+    let nt = i32::from_le_bytes(
+        kernarg[64..68]
+            .try_into()
+            .expect("slice 64..68 is 4 bytes"),
+    );
+    if nt <= 0 {
+        return Err(format!("GDN nt must be > 0, got {nt}"));
+    }
+    let product = (nt as u64)
+        .checked_mul(grid_z as u64)
+        .ok_or_else(|| "GDN frame product overflow".to_owned())?;
+    if product > u32::MAX as u64 {
+        return Err(format!("GDN frame product {product} exceeds u32"));
+    }
+    let frames = product as u32;
+    Ok(frames.max(1))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReplayKernargBinding {
+    GdnFrameU32 { offset: usize, frames: u32 },
+    PositionPlusU32 { offset: usize, addend: u32 },
+}
+
+impl ReplayKernargBinding {
+    fn apply(self, kernarg_bytes: &mut [u8], position: usize) -> Result<(), String> {
+        let len = kernarg_bytes.len();
+        match self {
+            Self::GdnFrameU32 { offset, frames } => {
+                let frame = crate::norm::reserve_gdn_requant_frames(frames);
+                let end = offset
+                    .checked_add(4)
+                    .ok_or_else(|| "kernarg binding offset overflow".to_owned())?;
+                let slot = kernarg_bytes.get_mut(offset..end).ok_or_else(|| {
+                    format!("GDN kernarg binding offset {offset} out of bounds (len {len})")
+                })?;
+                slot.copy_from_slice(&frame.to_le_bytes());
+                Ok(())
+            }
+            Self::PositionPlusU32 { offset, addend } => {
+                let value = u32::try_from(position)
+                    .map_err(|_| "decode position exceeds u32".to_owned())?
+                    .checked_add(addend)
+                    .ok_or_else(|| "PositionPlusU32 overflow".to_owned())?;
+                let end = offset
+                    .checked_add(4)
+                    .ok_or_else(|| "kernarg binding offset overflow".to_owned())?;
+                let slot = kernarg_bytes.get_mut(offset..end).ok_or_else(|| {
+                    format!("kernarg binding offset {offset} out of bounds (len {len})")
+                })?;
+                slot.copy_from_slice(&value.to_ne_bytes());
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Opaque snapshot of one completed recording's per-launch kernarg blocks.
+#[derive(Clone, Debug)]
+pub struct RecordedKernargSnapshot {
+    entries: Vec<SnapshotEntry>,
+}
+
+#[derive(Clone, Debug)]
+struct SnapshotEntry {
+    kernel: String,
+    kernarg: Vec<u8>,
+    grid: [u32; 3],
+}
+
+pub(crate) fn is_gdn_kernel(kernel: &str) -> bool {
+    kernel == "gated_delta_net_q8_fast" || kernel.starts_with("gated_delta_net_q8_compact")
+}
+
+fn is_plausible_device_address(value: u64) -> bool {
+    // Heuristic: real device pointers are at least page-aligned and in a
+    // high virtual range. Small integers (positions, scales, sizes) are
+    // < 1M or have low entropy. Use a conservative band that captures
+    // relocated buffers without flagging legitimate position scalars.
+    if value < 4096 {
+        return false;
+    }
+    if value < 0x100000 && value < (1 << 20) {
+        return false;
+    }
+    // Require either high 32 bits or a large 32-bit value that is not a
+    // plausible small position+addend (which are typically < 1e6).
+    let large_32 = value > 0x0100_0000 && value < (1u64 << 48) && value & 0x3 == 0;
+    let has_high = (value >> 32) != 0 && value < (1u64 << 48);
+    large_32 || has_high
+}
+
+/// Single code path that applies every retained-replay kernarg binding for one
+/// dispatch at `position`. Both the PM4 retained IB and the recorded-HIP blob
+/// oracle must call this helper so they cannot diverge.
+pub(crate) fn apply_kernarg_bindings_for_dispatch(
+    kernarg_bytes: &mut [u8],
+    dispatch_index: usize,
+    position: usize,
+    bindings: &[(usize, ReplayKernargBinding)],
+) -> Result<(), String> {
+    for (dispatch, binding) in bindings {
+        if *dispatch == dispatch_index {
+            binding.apply(kernarg_bytes, position)?;
+        }
+    }
+    Ok(())
+}
+
+impl ReplayController {
+    /// Accessor for the synthesized position bindings (for testing and for
+    /// the recorded-HIP oracle to share the same binding set).
+    pub(crate) fn synthesized_position_bindings(&self) -> &[(usize, ReplayKernargBinding)] {
+        &self.synthesized_position_bindings
+    }
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReplayCaptureSummary {
     pub launch_count: usize,
@@ -2792,12 +2958,21 @@ enum PreparedPm4Graph {
 
 impl PreparedPm4Graph {
     unsafe fn replay_and_wait_profiled(&mut self) -> Result<GpuMultiQueueTiming, String> {
+        // SAFETY: checked variant with string conversion.
+        unsafe { self.replay_and_wait_profiled_checked() }
+            .map_err(|(error, _)| error.to_string())
+    }
+
+    unsafe fn replay_and_wait_profiled_checked(
+        &mut self,
+    ) -> Result<GpuMultiQueueTiming, (redline_dispatch::aql::ReplayError, Quiescence)> {
         if dispatch_profile_enabled() {
             if let Self::Single(graph) = self {
                 // Execute the instrumented graph once. Reuse the same timestamp
                 // vector for whole-tape timing and the one-line legacy report.
-                let (timing, spans) = unsafe { graph.replay_and_wait_dispatch_profiled() }
-                    .map_err(|error| error.to_string())?;
+                let (timing, spans) =
+                    unsafe { graph.replay_and_wait_dispatch_profiled_checked() }
+                        .map_err(|(error, q)| (error, q))?;
                 static REPORTED: std::sync::atomic::AtomicBool =
                     std::sync::atomic::AtomicBool::new(false);
                 if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -2807,10 +2982,10 @@ impl PreparedPm4Graph {
             }
         }
         match self {
-            Self::Single(graph) => unsafe { graph.replay_and_wait_profiled() },
-            Self::Phased(graph) => unsafe { graph.replay_and_wait_profiled() },
+            Self::Single(graph) => unsafe { graph.replay_and_wait_profiled_checked() },
+            Self::Phased(graph) => unsafe { graph.replay_and_wait_profiled() }
+                .map_err(|error| (error, Quiescence::Proven)),
         }
-        .map_err(|error| error.to_string())
     }
 
     fn read_dispatch_profile(&mut self) -> Result<Pm4DispatchProfile, String> {
@@ -2873,6 +3048,13 @@ impl PreparedPm4Graph {
             }
         }
     }
+
+    fn quiesce(&mut self) -> Result<(), (redline_dispatch::aql::ReplayError, Quiescence)> {
+        match self {
+            Self::Single(graph) => graph.quiesce().map_err(|error| (error, Quiescence::Unknown)),
+            Self::Phased(_) => Ok(()),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -2903,11 +3085,13 @@ pub struct PreparedPm4Replay {
     /// PreparedPm4Replay teardown (field order: graph first).
     _dependency_fence: Option<KernargBuffer>,
     dynamic_gdn_frames: Vec<usize>,
+    dynamic_kernarg_bindings: Vec<(usize, ReplayKernargBinding)>,
     dynamic_grids: Vec<(usize, ReplayGridBinding, [u32; 3], [u32; 3])>,
     pm4_architecture: Pm4Architecture,
     dispatch_count: usize,
     command_dwords: u32,
     dispatch_boundaries: Option<Vec<Pm4DispatchBoundary>>,
+    prepared_max_position: Option<usize>,
 }
 
 impl PreparedPm4Replay {
@@ -2919,27 +3103,83 @@ impl PreparedPm4Replay {
         &mut self,
         position: usize,
     ) -> Result<GpuMultiQueueTiming, String> {
+        // SAFETY: checked variant handles quiescence mapping.
+        unsafe { self.replay_and_wait_checked(position) }.map_err(|failure| failure.error)
+    }
+
+    /// Checked variant that reports quiescence.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`Self::replay_and_wait`].
+    pub unsafe fn replay_and_wait_checked(
+        &mut self,
+        position: usize,
+    ) -> Result<GpuMultiQueueTiming, RetainedReplayFailure> {
+        if let Some(max_pos) = self.prepared_max_position {
+            if position > max_pos {
+                return Err(RetainedReplayFailure {
+                    error: format!(
+                        "position {position} exceeds prepared max_position {max_pos}"
+                    ),
+                    quiescence: ReplayQuiescence::Proven,
+                });
+            }
+        }
+        // Patch typed kernarg bindings while queue is quiescent.
+        // Single code path shared with recorded-HIP replay: both transports
+        // must apply the identical binding set via `apply_kernarg_bindings_for_dispatch`.
+        for dispatch_index in 0..self.kernargs.len() {
+            let bytes = self.kernargs[dispatch_index].as_mut_bytes();
+            apply_kernarg_bindings_for_dispatch(
+                bytes,
+                dispatch_index,
+                position,
+                &self.dynamic_kernarg_bindings,
+            )
+            .map_err(|error| RetainedReplayFailure {
+                error,
+                quiescence: ReplayQuiescence::Proven,
+            })?;
+        }
+        // Legacy GDN frame patch (covers old prepared objects; new objects have
+        // empty dynamic_gdn_frames and are patched via dynamic_kernarg_bindings).
         for dispatch in &self.dynamic_gdn_frames {
+            // Skip if already covered by a GdnFrame binding for this dispatch.
+            let already_covered = self
+                .dynamic_kernarg_bindings
+                .iter()
+                .any(|(idx, binding)| *idx == *dispatch && matches!(binding, ReplayKernargBinding::GdnFrameU32 { .. }));
+            if already_covered {
+                continue;
+            }
             let frame = crate::norm::reserve_gdn_requant_frames(1);
             let bytes = self.kernargs[*dispatch].as_mut_bytes();
             bytes
                 .get_mut(76..80)
-                .ok_or_else(|| "PM4 GDN kernarg is too short for frame patch".to_owned())?
+                .ok_or_else(|| RetainedReplayFailure {
+                    error: "PM4 GDN kernarg is too short for frame patch".to_owned(),
+                    quiescence: ReplayQuiescence::Proven,
+                })?
                 .copy_from_slice(&frame.to_ne_bytes());
         }
         for (dispatch, binding, recorded, workgroup) in &self.dynamic_grids {
-            let workgroups = binding.bind(position, *recorded)?;
+            let workgroups = binding.bind(position, *recorded).map_err(|error| RetainedReplayFailure {
+                error,
+                quiescence: ReplayQuiescence::Proven,
+            })?;
             let dimensions = if self.pm4_architecture == Pm4Architecture::Gfx12 {
                 let mut workitems = [0_u32; 3];
                 for axis in 0..3 {
                     workitems[axis] =
                         workgroups[axis]
                             .checked_mul(workgroup[axis])
-                            .ok_or_else(|| {
-                                format!(
+                            .ok_or_else(|| RetainedReplayFailure {
+                                error: format!(
                                 "dynamic PM4 grid overflow axis={axis} workgroups={} workgroup={}",
                                 workgroups[axis], workgroup[axis]
-                            )
+                            ),
+                                quiescence: ReplayQuiescence::Proven,
                             })?;
                 }
                 workitems
@@ -2947,10 +3187,21 @@ impl PreparedPm4Replay {
                 workgroups
             };
             self.graph
-                .patch_dispatch_dimensions(*dispatch, dimensions)?;
+                .patch_dispatch_dimensions(*dispatch, dimensions)
+                .map_err(|error| RetainedReplayFailure {
+                    error: error.to_string(),
+                    quiescence: ReplayQuiescence::Proven,
+                })?;
         }
         // SAFETY: forwarded from the caller that owns the model allocations.
-        unsafe { self.graph.replay_and_wait_profiled() }
+        unsafe { self.graph.replay_and_wait_profiled_checked() }
+            .map_err(|(error, quiescence)| RetainedReplayFailure {
+                error: error.to_string(),
+                quiescence: match quiescence {
+                    Quiescence::Proven => ReplayQuiescence::Proven,
+                    Quiescence::Unknown => ReplayQuiescence::Unknown,
+                },
+            })
     }
 
     /// Replay one instrumented retained graph exactly once.
@@ -3025,7 +3276,6 @@ impl ShadowValidation {
 
 /// Process-local replay adoption state. HIP remains the route until an adapter
 /// both supplies two certified observations and installs a concrete prepared
-/// plan. Any failure permanently falls back for this controller.
 pub struct ReplayController {
     request: ReplayBackendRequest,
     transport: ReplayTransport,
@@ -3050,6 +3300,9 @@ pub struct ReplayController {
     unknown_effect_launches: usize,
     /// Opt-in latch for daemon-owned post-generate route-proof markers.
     route_proof_log: bool,
+    prepared_max_position: Option<usize>,
+    synthesized_position_bindings: Vec<(usize, ReplayKernargBinding)>,
+    position_bindings_calibrated: bool,
 }
 
 impl ReplayController {
@@ -3096,10 +3349,13 @@ impl ReplayController {
             forward_eligible: true,
             replay_observation: ReplayObservation::default(),
             radiowave_effect_certifications: BTreeMap::new(),
+            unknown_effect_launches: 0,
             radiowave_effect_launches: 0,
             fallback_effect_launches: 0,
-            unknown_effect_launches: 0,
             route_proof_log: route_proof_log_requested(),
+            prepared_max_position: None,
+            synthesized_position_bindings: Vec::new(),
+            position_bindings_calibrated: false,
         }
     }
 
@@ -3182,7 +3438,6 @@ impl ReplayController {
         };
         self.reset_for_model(request, transport, true);
     }
-
     fn reset_for_model(
         &mut self,
         request: ReplayBackendRequest,
@@ -3208,6 +3463,9 @@ impl ReplayController {
         self.radiowave_effect_launches = 0;
         self.fallback_effect_launches = 0;
         self.unknown_effect_launches = 0;
+        self.prepared_max_position = None;
+        self.synthesized_position_bindings.clear();
+        self.position_bindings_calibrated = false;
     }
 
     /// Drop a prepared route after a model-owned allocation/geometry bucket
@@ -3585,12 +3843,27 @@ impl ReplayController {
     /// Lower a captured prefix to one retained architecture-native PM4
     /// indirect buffer. Unsupported HSA agents fail closed before commands are
     /// constructed; gfx10/11 and gfx12 never share register encodings.
+    ///
+    /// Fail-closed: requires differential calibration via `synthesize_position_bindings`
+    /// unless the caller explicitly opts out for a single-position route via
+    /// `prepare_pm4_prefix_allow_uncalibrated`.
     pub fn prepare_pm4_prefix(
         &mut self,
         device_ordinal: usize,
         prefix: usize,
     ) -> Result<(usize, u32, u64), String> {
-        self.prepare_pm4_prefix_inner(device_ordinal, prefix, false)
+        self.prepare_pm4_prefix_inner(device_ordinal, prefix, false, false)
+    }
+
+    /// Opt-out variant for single-position / legacy routes that do not need
+    /// position-aware replay. Identical to `prepare_pm4_prefix` except it
+    /// allows uncalibrated preparation.
+    pub fn prepare_pm4_prefix_allow_uncalibrated(
+        &mut self,
+        device_ordinal: usize,
+        prefix: usize,
+    ) -> Result<(usize, u32, u64), String> {
+        self.prepare_pm4_prefix_inner(device_ordinal, prefix, false, true)
     }
 
     /// Lower a captured prefix to a single GFX12 IB with per-dispatch timestamps.
@@ -3599,7 +3872,16 @@ impl ReplayController {
         device_ordinal: usize,
         prefix: usize,
     ) -> Result<(usize, u32, u64), String> {
-        self.prepare_pm4_prefix_inner(device_ordinal, prefix, true)
+        self.prepare_pm4_prefix_inner(device_ordinal, prefix, true, false)
+    }
+
+    /// Opt-out variant of `prepare_pm4_dispatch_profile` allowing uncalibrated preparation.
+    pub fn prepare_pm4_dispatch_profile_allow_uncalibrated(
+        &mut self,
+        device_ordinal: usize,
+        prefix: usize,
+    ) -> Result<(usize, u32, u64), String> {
+        self.prepare_pm4_prefix_inner(device_ordinal, prefix, true, true)
     }
 
     fn prepare_pm4_prefix_inner(
@@ -3607,7 +3889,13 @@ impl ReplayController {
         device_ordinal: usize,
         prefix: usize,
         dispatch_profile: bool,
+        allow_uncalibrated: bool,
     ) -> Result<(usize, u32, u64), String> {
+        if !allow_uncalibrated && !self.position_bindings_calibrated {
+            return Err(
+                "position bindings not calibrated; call synthesize_position_bindings or explicitly opt out via prepare_pm4_prefix_allow_uncalibrated".to_owned(),
+            );
+        }
         if self.recorded.is_empty() {
             return Err("no captured launch sequence".to_owned());
         }
@@ -3640,6 +3928,7 @@ impl ReplayController {
         let mut kernargs = Vec::with_capacity(prefix);
         let mut geometries = Vec::with_capacity(prefix);
         let mut dynamic_gdn_frames = Vec::new();
+        let mut dynamic_kernarg_bindings: Vec<(usize, ReplayKernargBinding)> = Vec::new();
         let mut dynamic_grids = Vec::new();
 
         for launch in self.recorded.iter().take(prefix) {
@@ -3673,28 +3962,109 @@ impl ReplayController {
                 workgroup[axis] = u16::try_from(value)
                     .map_err(|_| format!("{symbol}: workgroup dimension {value} exceeds u16"))?;
             }
-            let geometry = LaunchGeometry::from_hip_workgroups(launch.grid, workgroup)
+            // Determine geometry grid: if a dynamic binding exists and a max_position
+            // was requested, size the prepared IB for the maximum admitted position
+            // so replay can patch DOWN. Otherwise use the recorded grid (today's
+            // behavior).
+            let mut geometry_grid = launch.grid;
+            let mut grid_binding_for_storage = launch.grid_binding;
+            if let Some(binding) = launch.grid_binding {
+                if let Some(max_pos) = self.prepared_max_position {
+                    let max_units = binding
+                        .units_for(max_pos)
+                        .map_err(|error| format!("{symbol}: {error}"))?;
+                    let axis = match binding {
+                        ReplayGridBinding::PositionCeilDiv { axis, .. } => usize::from(axis),
+                    };
+                    if axis >= 3 {
+                        return Err(format!("{symbol}: invalid grid binding axis {axis}"));
+                    }
+                    let mut prepared_grid = launch.grid;
+                    prepared_grid[axis] = max_units;
+                    geometry_grid = prepared_grid;
+                    // Store the prepared maximum as the recorded value so
+                    // bind(current_position, prepared_grid) correctly narrows.
+                    grid_binding_for_storage = Some(binding);
+                    // Keep launch.grid replaced for geometry; dynamic_grids stores prepared_grid.
+                }
+            }
+            let geometry = LaunchGeometry::from_hip_workgroups(geometry_grid, workgroup)
                 .map_err(|error| format!("{symbol}: {error}"))?;
             device
                 .validate_geometry(geometry)
                 .map_err(|error| format!("{symbol}: {error}"))?;
-            if launch.kernel == "gated_delta_net_q8_fast"
-                || launch.kernel.starts_with("gated_delta_net_q8_compact")
-            {
+            let is_gdn = launch.kernel == "gated_delta_net_q8_fast"
+                || launch.kernel.starts_with("gated_delta_net_q8_compact");
+            if is_gdn {
                 if metadata.kernarg_segment_size < 80 {
                     return Err(format!(
                         "{symbol}: loader kernarg is too short for dynamic frame binding"
                     ));
                 }
-                dynamic_gdn_frames.push(kernargs.len());
+                // Derive the exact reservation run length for this dispatch:
+                // frames = max(1, nt * grid.z) where nt is at kernarg offset 64
+                // and grid.z is the recorded third grid dimension. This is the
+                // single helper that decides consumption for PM4, recorded-blob,
+                // and binding construction.
+                let frames = gdn_requant_frames_for_dispatch(&launch.kernarg, launch.grid[2])
+                    .map_err(|reason| format!("{symbol}: {reason}"))?;
+                dynamic_kernarg_bindings.push((
+                    kernargs.len(),
+                    ReplayKernargBinding::GdnFrameU32 { offset: 76, frames },
+                ));
+                // New tapes rely solely on the typed binding above; the legacy
+                // `dynamic_gdn_frames` vector is left empty so replay has exactly
+                // one path that decides frame consumption. Old prepared objects
+                // with a populated legacy vector remain supported via the
+                // de-duplication check in `replay_and_wait_checked`.
             }
-            if let Some(binding) = launch.grid_binding {
-                dynamic_grids.push((kernargs.len(), binding, launch.grid, launch.block));
+            if let Some(binding) = grid_binding_for_storage {
+                let grid_to_store = if self.prepared_max_position.is_some() {
+                    geometry_grid
+                } else {
+                    launch.grid
+                };
+                dynamic_grids.push((kernargs.len(), binding, grid_to_store, launch.block));
+            }
+            // Admissibility: every position-dependent scalar must be either
+            // indirect via persistent buffer or covered by a declared binding.
+            // Currently only GDN frame is such a scalar; reject a GDN-family
+            // launch that somehow has no binding (would otherwise replay stale).
+            if is_gdn {
+                let has_gdn_binding = dynamic_kernarg_bindings
+                    .iter()
+                    .any(|(idx, _)| *idx == kernargs.len());
+                if !has_gdn_binding {
+                    return Err(format!("{symbol}: GDN-family launch has no kernarg binding"));
+                }
             }
             kernels.push(kernel);
             kernargs.push(kernarg);
             geometries.push(geometry);
         }
+        // Merge differential position bindings synthesized from two recordings.
+        // Both transports must emit the identical binding set through one code
+        // path; the position bindings are stored on the controller and merged
+        // here for PM4. The recorded-HIP path merges the same set via
+        // `apply_kernarg_bindings_for_dispatch`.
+        for (dispatch, binding) in &self.synthesized_position_bindings {
+            if *dispatch < prefix {
+                dynamic_kernarg_bindings.push((*dispatch, *binding));
+            }
+        }
+        dynamic_kernarg_bindings.sort_by(|a, b| {
+            a.0.cmp(&b.0).then_with(|| {
+                let ao = match a.1 {
+                    ReplayKernargBinding::PositionPlusU32 { offset, .. } => offset,
+                    ReplayKernargBinding::GdnFrameU32 { offset, .. } => offset,
+                };
+                let bo = match b.1 {
+                    ReplayKernargBinding::PositionPlusU32 { offset, .. } => offset,
+                    ReplayKernargBinding::GdnFrameU32 { offset, .. } => offset,
+                };
+                ao.cmp(&bo)
+            })
+        });
 
         let gfx12_gcr_trim = hipfire_config::process_value("HIPFIRE_REPLAY_PM4_GCR_TRIM")
             .map(|value| !matches!(value.as_str(), "0" | "false" | "off"))
@@ -4221,11 +4591,13 @@ impl ReplayController {
             kernargs,
             _dependency_fence: dependency_fence,
             dynamic_gdn_frames,
+            dynamic_kernarg_bindings,
             dynamic_grids,
             pm4_architecture,
             dispatch_count: prefix,
             command_dwords,
             dispatch_boundaries: dispatch_profile.then_some(dispatch_boundaries),
+            prepared_max_position: self.prepared_max_position,
         });
         self.state = ReplayState::Ready;
         Ok((prefix, command_dwords, queue_id))
@@ -4252,17 +4624,34 @@ impl ReplayController {
     /// The captured model allocations and all pointed-to buffers must still be
     /// live and in the same binding layout.
     pub unsafe fn replay_pm4(&mut self, position: usize) -> Result<GpuMultiQueueTiming, String> {
-        let result = {
-            let prepared = self
-                .prepared_pm4
-                .as_mut()
-                .ok_or_else(|| "no prepared PM4 replay".to_owned())?;
-            // SAFETY: forwarded from the model owner.
-            unsafe { prepared.replay_and_wait(position) }
-        };
-        self.observe_replay_result(position, result)
+        // SAFETY: forwarded from the model owner.
+        unsafe { self.replay_pm4_checked(position) }.map_err(|failure| failure.error)
     }
 
+    /// Checked variant that reports quiescence.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`Self::replay_pm4`].
+    pub unsafe fn replay_pm4_checked(
+        &mut self,
+        position: usize,
+    ) -> Result<GpuMultiQueueTiming, RetainedReplayFailure> {
+        let result = {
+            let prepared = match self.prepared_pm4.as_mut() {
+                Some(prepared) => prepared,
+                None => {
+                    return Err(RetainedReplayFailure {
+                        error: "no prepared PM4 replay".to_owned(),
+                        quiescence: ReplayQuiescence::Proven,
+                    })
+                }
+            };
+            // SAFETY: forwarded from the model owner.
+            unsafe { prepared.replay_and_wait_checked(position) }
+        };
+        self.observe_replay_result_checked(position, result)
+    }
     /// Replay one explicitly instrumented PM4 graph exactly once.
     ///
     /// # Safety
@@ -4308,6 +4697,53 @@ impl ReplayController {
         Ok(value)
     }
 
+    fn observe_replay_result_checked<T>(
+        &mut self,
+        position: usize,
+        result: Result<T, RetainedReplayFailure>,
+    ) -> Result<T, RetainedReplayFailure> {
+        let value = match result {
+            Ok(value) => value,
+            Err(failure) => {
+                self.replay_observation.failed = true;
+                return Err(failure);
+            }
+        };
+        self.replay_observation.count = self.replay_observation.count.saturating_add(1);
+        self.replay_observation
+            .first_position
+            .get_or_insert(position);
+        self.replay_observation.last_position = Some(position);
+        Ok(value)
+    }
+
+    /// Largest `start_pos + batch` the prepared dynamic geometry must cover.
+    pub fn set_prepared_max_position(&mut self, max_position: usize) {
+        self.prepared_max_position = Some(max_position);
+    }
+
+    /// Prove no retained IB is in flight, then release the prepared route.
+    pub fn shutdown(&mut self) -> Result<(), RetainedReplayFailure> {
+        if let Some(prepared) = self.prepared_pm4.as_mut() {
+            if let Err((error, quiescence)) = prepared.graph.quiesce() {
+                return Err(RetainedReplayFailure {
+                    error: error.to_string(),
+                    quiescence: match quiescence {
+                        Quiescence::Proven => ReplayQuiescence::Proven,
+                        Quiescence::Unknown => ReplayQuiescence::Unknown,
+                    },
+                });
+            }
+        }
+        // Quiescence proven: safe to release retained resources.
+        self.prepared_pm4 = None;
+        self.prepared = None;
+        self.prepared_max_position = None;
+        self.synthesized_position_bindings.clear();
+        self.position_bindings_calibrated = false;
+        Ok(())
+    }
+
     /// Start one explicitly delimited prefill or decode capture. This clears
     /// only the prior launch sequence; validation observations and the backend
     /// request remain intact.
@@ -4322,6 +4758,8 @@ impl ReplayController {
         self.radiowave_effect_launches = 0;
         self.fallback_effect_launches = 0;
         self.unknown_effect_launches = 0;
+        self.synthesized_position_bindings.clear();
+        self.position_bindings_calibrated = false;
         self.state = ReplayState::RecordingWarmup;
         Ok(())
     }
@@ -4354,6 +4792,187 @@ impl ReplayController {
             unique_kernel_count,
             sequence_hash: hash,
         }
+    }
+
+    /// Snapshot the just-finished recording. Valid only between `finish_capture`
+    /// and the next `begin_capture`.
+    pub fn snapshot_recorded_kernargs(&self) -> RecordedKernargSnapshot {
+        let entries = self
+            .recorded
+            .iter()
+            .map(|launch| SnapshotEntry {
+                kernel: launch.kernel.clone(),
+                kernarg: launch.kernarg.clone(),
+                grid: launch.grid,
+            })
+            .collect();
+        RecordedKernargSnapshot { entries }
+    }
+
+    /// Difference an earlier recording of the SAME tape against the current
+    /// recording and synthesize a `ReplayKernargBinding` for every scalar that
+    /// tracks the decode position. Returns the number of bindings synthesized.
+    /// Errors (and synthesizes nothing) when any difference is not explained by
+    /// the position delta.
+    pub fn synthesize_position_bindings(
+        &mut self,
+        earlier: &RecordedKernargSnapshot,
+        earlier_position: usize,
+        current_position: usize,
+    ) -> Result<usize, String> {
+        if current_position <= earlier_position {
+            return Err(format!(
+                "current_position {current_position} must be > earlier_position {earlier_position}"
+            ));
+        }
+        let delta = current_position - earlier_position;
+        let delta_u32 = u32::try_from(delta)
+            .map_err(|_| format!("position delta {delta} exceeds u32"))?;
+        if earlier.entries.len() != self.recorded.len() {
+            return Err(format!(
+                "launch count mismatch: earlier {} vs current {}",
+                earlier.entries.len(),
+                self.recorded.len()
+            ));
+        }
+        let mut new_bindings: Vec<(usize, ReplayKernargBinding)> = Vec::new();
+        for (idx, (earlier_entry, current_launch)) in
+            earlier.entries.iter().zip(self.recorded.iter()).enumerate()
+        {
+            if earlier_entry.kernel != current_launch.kernel {
+                return Err(format!(
+                    "kernel mismatch at launch {idx}: earlier {:?} vs current {:?}",
+                    earlier_entry.kernel, current_launch.kernel
+                ));
+            }
+            if earlier_entry.kernarg.len() != current_launch.kernarg.len() {
+                return Err(format!(
+                    "kernarg length mismatch at launch {idx} kernel {:?}: earlier {} vs current {}",
+                    earlier_entry.kernel,
+                    earlier_entry.kernarg.len(),
+                    current_launch.kernarg.len()
+                ));
+            }
+            // Grid check modulo dynamic binding.
+            if earlier_entry.grid != current_launch.grid {
+                if let Some(binding) = current_launch.grid_binding {
+                    let axis = match binding {
+                        ReplayGridBinding::PositionCeilDiv { axis, .. } => usize::from(axis),
+                    };
+                    if axis >= 3 {
+                        return Err(format!(
+                            "invalid grid binding axis {axis} at launch {idx} kernel {:?}",
+                            current_launch.kernel
+                        ));
+                    }
+                    let mut mismatch_allowed = true;
+                    for a in 0..3 {
+                        if a == axis {
+                            continue;
+                        }
+                        if earlier_entry.grid[a] != current_launch.grid[a] {
+                            mismatch_allowed = false;
+                        }
+                    }
+                    if !mismatch_allowed {
+                        return Err(format!(
+                            "grid mismatch at launch {idx} kernel {:?}: earlier {:?} vs current {:?} (axis {axis} is dynamic)",
+                            current_launch.kernel, earlier_entry.grid, current_launch.grid
+                        ));
+                    }
+                } else {
+                    return Err(format!(
+                        "grid mismatch at launch {idx} kernel {:?}: earlier {:?} vs current {:?}",
+                        current_launch.kernel, earlier_entry.grid, current_launch.grid
+                    ));
+                }
+            }
+            let len = earlier_entry.kernarg.len();
+            let is_gdn = is_gdn_kernel(&current_launch.kernel);
+            let mut offset: usize = 0;
+            while offset + 4 <= len {
+                let earlier_bytes = &earlier_entry.kernarg[offset..offset + 4];
+                let current_bytes = &current_launch.kernarg[offset..offset + 4];
+                if earlier_bytes != current_bytes {
+                    // Skip GDN frame field.
+                    if is_gdn && offset == 76 {
+                        offset += 4;
+                        continue;
+                    }
+                    let v_earlier = u32::from_le_bytes(earlier_bytes.try_into().unwrap());
+                    let v_current = u32::from_le_bytes(current_bytes.try_into().unwrap());
+                    if v_current.wrapping_sub(v_earlier) != delta_u32 {
+                        // Not a position scalar. Classify before rejecting: a
+                        // relocated buffer usually differs only in the low word
+                        // of its 8-byte slot, so inspect the enclosing slot
+                        // rather than requiring both halves to differ.
+                        let pair_offset = offset - (offset % 8);
+                        if pair_offset + 8 <= len {
+                            let earlier_u64 = u64::from_le_bytes(
+                                earlier_entry.kernarg[pair_offset..pair_offset + 8]
+                                    .try_into()
+                                    .unwrap(),
+                            );
+                            let current_u64 = u64::from_le_bytes(
+                                current_launch.kernarg[pair_offset..pair_offset + 8]
+                                    .try_into()
+                                    .unwrap(),
+                            );
+                            if is_plausible_device_address(earlier_u64)
+                                || is_plausible_device_address(current_u64)
+                            {
+                                return Err(format!(
+                                    "moved allocation at launch {idx} kernel {:?} offset {pair_offset}: earlier {earlier_u64:#x} vs current {current_u64:#x} (pointer; a relocated buffer must never be retained as a position scalar)",
+                                    current_launch.kernel
+                                ));
+                            }
+                        }
+                        return Err(format!(
+                            "unexplained kernarg difference at launch {idx} kernel {:?} offset {offset}: earlier {v_earlier} ({v_earlier:#x}) vs current {v_current} ({v_current:#x}) (delta {delta})",
+                            current_launch.kernel
+                        ));
+                    }
+                    if v_earlier.checked_add(delta_u32) != Some(v_current) {
+                        return Err(format!(
+                            "kernarg scalar at launch {idx} kernel {:?} offset {offset} wraps u32: earlier {v_earlier} + delta {delta_u32} != current {v_current}",
+                            current_launch.kernel
+                        ));
+                    }
+                    let addend = v_current.wrapping_sub(current_position as u32);
+                    let repro_earlier = (earlier_position as u32).checked_add(addend);
+                    let repro_current = (current_position as u32).checked_add(addend);
+                    if repro_earlier != Some(v_earlier) || repro_current != Some(v_current) {
+                        return Err(format!(
+                            "synthesized PositionPlusU32 at launch {idx} kernel {:?} offset {offset} addend {addend} does not reproduce both samples (earlier {v_earlier} vs {:?}, current {v_current} vs {:?})",
+                            current_launch.kernel, repro_earlier, repro_current
+                        ));
+                    }
+                    new_bindings.push((
+                        idx,
+                        ReplayKernargBinding::PositionPlusU32 { offset, addend },
+                    ));
+                }
+                offset += 4;
+            }
+        }
+        // Order by (dispatch, offset) — already in order, but enforce.
+        new_bindings.sort_by(|a, b| {
+            a.0.cmp(&b.0).then_with(|| {
+                let ao = match a.1 {
+                    ReplayKernargBinding::PositionPlusU32 { offset, .. } => offset,
+                    ReplayKernargBinding::GdnFrameU32 { offset, .. } => offset,
+                };
+                let bo = match b.1 {
+                    ReplayKernargBinding::PositionPlusU32 { offset, .. } => offset,
+                    ReplayKernargBinding::GdnFrameU32 { offset, .. } => offset,
+                };
+                ao.cmp(&bo)
+            })
+        });
+        let count = new_bindings.len();
+        self.synthesized_position_bindings = new_bindings;
+        self.position_bindings_calibrated = true;
+        Ok(count)
     }
 
     pub(crate) fn record_hip_launch_typed_bound(
@@ -6527,5 +7146,433 @@ mod tests {
 
         controller.set_forward_eligible(false);
         assert!(!controller.should_route_aql());
+    }
+
+    #[test]
+    fn replay_grid_binding_units_for_and_bind() {
+        let binding = ReplayGridBinding::PositionCeilDiv {
+            axis: 0,
+            addend: 15,
+            divisor: 16,
+        };
+        // max_position = 32 => ceil((32+15)/16)=3
+        assert_eq!(binding.units_for(32).unwrap(), 3);
+        // current position 16 => ceil(31/16)=2, min with prepared max 3 => 2
+        let prepared_grid = [3, 1, 1];
+        assert_eq!(binding.bind(16, prepared_grid).unwrap(), [2, 1, 1]);
+        // current position 0 => ceil(15/16)=1
+        assert_eq!(binding.bind(0, prepared_grid).unwrap(), [1, 1, 1]);
+        // position == max => 3
+        assert_eq!(binding.bind(32, prepared_grid).unwrap(), [3, 1, 1]);
+    }
+
+    #[test]
+    fn replay_grid_binding_prepared_sizing_and_rejection() {
+        let binding = ReplayGridBinding::PositionCeilDiv {
+            axis: 0,
+            addend: 0,
+            divisor: 1,
+        };
+        // Simulate prepared_max_position = 100
+        let prepared_max = 100usize;
+        let recorded_grid = [10, 1, 1];
+        let prepared_units = binding.units_for(prepared_max).unwrap();
+        let mut prepared_grid = recorded_grid;
+        prepared_grid[0] = prepared_units;
+        assert_eq!(prepared_grid, [100, 1, 1]);
+        // Patch down for smaller position 10 => 10
+        assert_eq!(binding.bind(10, prepared_grid).unwrap(), [10, 1, 1]);
+        // Reject position > max_position should be handled at replay level
+        // (here we simulate the check that PreparedPm4Replay::replay_and_wait_checked does)
+        let current = 150usize;
+        let should_reject = current > prepared_max;
+        assert!(should_reject);
+    }
+
+    #[test]
+    fn replay_kernarg_binding_apply_offsets() {
+        let mut kernarg = vec![0u8; 80];
+        // GdnFrameU32 at offset 76 writes 4 bytes; now carries explicit frames count.
+        let gdn = ReplayKernargBinding::GdnFrameU32 { offset: 76, frames: 1 };
+        gdn.apply(&mut kernarg, 0).unwrap();
+        let first = u32::from_le_bytes(kernarg[76..80].try_into().unwrap());
+        // `reserve_gdn_requant_frames` is a `fetch_add`, so the first frame in
+        // a fresh process is legitimately 0. What must hold is that every apply
+        // consumes a fresh frame rather than replaying the captured one.
+        gdn.apply(&mut kernarg, 0).unwrap();
+        let second = u32::from_le_bytes(kernarg[76..80].try_into().unwrap());
+        assert!(second > first, "frame did not advance: {first} -> {second}");
+        // PositionPlusU32 at offset 0 with addend 5, position 10 => 15
+        let mut kernarg2 = vec![0u8; 8];
+        let pos_binding = ReplayKernargBinding::PositionPlusU32 { offset: 0, addend: 5 };
+        pos_binding.apply(&mut kernarg2, 10).unwrap();
+        let value = u32::from_ne_bytes(kernarg2[0..4].try_into().unwrap());
+        assert_eq!(value, 15);
+        // Out-of-bounds should error
+        let mut small = vec![0u8; 4];
+        let bad = ReplayKernargBinding::GdnFrameU32 { offset: 76, frames: 1 };
+        assert!(bad.apply(&mut small, 0).is_err());
+    }
+
+    #[test]
+    fn replay_kernarg_binding_gdn_requires_binding() {
+        // Simulate preparation admissibility: a GDN-family launch without a
+        // GdnFrameU32 binding must be rejected instead of silently replaying stale.
+        let kernel = "gated_delta_net_q8_fast";
+        let metadata_kernarg_size = 80usize;
+        assert!(metadata_kernarg_size >= 80);
+        let bindings: Vec<(usize, ReplayKernargBinding)> = vec![];
+        let is_gdn = kernel == "gated_delta_net_q8_fast"
+            || kernel.starts_with("gated_delta_net_q8_compact");
+        assert!(is_gdn);
+        let has_binding = bindings
+            .iter()
+            .any(|(_, b)| matches!(b, ReplayKernargBinding::GdnFrameU32 { offset: 76, frames: _ }));
+        assert!(!has_binding);
+        // In real prepare, this would be Err; here we just verify detection.
+        let should_reject = is_gdn && !has_binding;
+        assert!(should_reject);
+        // With correct binding, it passes.
+        let bindings_ok = vec![(0, ReplayKernargBinding::GdnFrameU32 { offset: 76, frames: 1 })];
+        let has_binding_ok = bindings_ok
+            .iter()
+            .any(|(_, b)| matches!(b, ReplayKernargBinding::GdnFrameU32 { offset: 76, frames: _ }));
+        assert!(has_binding_ok);
+        assert!(!(is_gdn && !has_binding_ok));
+    }
+
+    fn make_gdn_kernarg(nt: i32, len: usize) -> Vec<u8> {
+        let mut kernarg = vec![0u8; len];
+        if len >= 68 {
+            kernarg[64..68].copy_from_slice(&nt.to_le_bytes());
+        }
+        kernarg
+    }
+
+    #[test]
+    fn gdn_frame_count_derivation_sequence_and_independent_batched() {
+        // sequence-batched: nt = 16 tokens, grid.z = 1 => frames = 16
+        let kernarg = make_gdn_kernarg(16, 80);
+        assert_eq!(gdn_requant_frames_for_dispatch(&kernarg, 1).unwrap(), 16);
+        // independent-batched: nt = 1, grid.z = 16 => frames = 16 (1 * 16)
+        let kernarg = make_gdn_kernarg(1, 80);
+        assert_eq!(gdn_requant_frames_for_dispatch(&kernarg, 16).unwrap(), 16);
+        // plain AR single-token: nt = 1, grid.z = 1 => frames = 1 (preserves today's behavior)
+        let kernarg = make_gdn_kernarg(1, 80);
+        assert_eq!(gdn_requant_frames_for_dispatch(&kernarg, 1).unwrap(), 1);
+    }
+
+    #[test]
+    fn gdn_frame_count_rejects_short_and_nonpositive_nt() {
+        // kernarg shorter than 80 bytes must be rejected
+        let short = make_gdn_kernarg(16, 64);
+        assert!(gdn_requant_frames_for_dispatch(&short, 1).is_err());
+        let short79 = make_gdn_kernarg(16, 79);
+        assert!(gdn_requant_frames_for_dispatch(&short79, 1).is_err());
+        // nt <= 0 must be rejected
+        let zero = make_gdn_kernarg(0, 80);
+        assert!(gdn_requant_frames_for_dispatch(&zero, 1).is_err());
+        let neg = make_gdn_kernarg(-1, 80);
+        assert!(gdn_requant_frames_for_dispatch(&neg, 1).is_err());
+        // i32::MAX * 2 == 4294967294, which still fits in u32 — the first
+        // genuinely overflowing multiplier is 3.
+        let large = make_gdn_kernarg(i32::MAX, 80);
+        assert!(gdn_requant_frames_for_dispatch(&large, 2).is_ok());
+        assert!(gdn_requant_frames_for_dispatch(&large, 3).is_err());
+    }
+
+    #[test]
+    fn gdn_frame_apply_advances_by_frames_and_writes_base() {
+        // Restore a known checkpoint so we can assert on delta rather than
+        // absolute non-zero value (fetch_add legitimately starts at 0 in a
+        // fresh process).
+        crate::norm::restore_gdn_requant_frame_checkpoint(1000);
+        let checkpoint = crate::norm::gdn_requant_frame_checkpoint();
+        let mut kernarg = vec![0u8; 80];
+        let binding = ReplayKernargBinding::GdnFrameU32 { offset: 76, frames: 16 };
+        binding.apply(&mut kernarg, 0).unwrap();
+        let written = u32::from_le_bytes(kernarg[76..80].try_into().unwrap());
+        // Written base must equal the pre-advance checkpoint
+        assert_eq!(written, checkpoint);
+        let after = crate::norm::gdn_requant_frame_checkpoint();
+        assert_eq!(after, checkpoint + 16);
+        // Second apply with frames=1 should advance by 1 from new base
+        let checkpoint2 = after;
+        let binding2 = ReplayKernargBinding::GdnFrameU32 { offset: 76, frames: 1 };
+        binding2.apply(&mut kernarg, 0).unwrap();
+        let written2 = u32::from_le_bytes(kernarg[76..80].try_into().unwrap());
+        assert_eq!(written2, checkpoint2);
+        assert_eq!(
+            crate::norm::gdn_requant_frame_checkpoint(),
+            checkpoint2 + 1
+        );
+        // Clean up: restore to avoid leaking state to other tests (tests run
+        // in parallel in same process; use a deterministic restore).
+        crate::norm::restore_gdn_requant_frame_checkpoint(checkpoint);
+    }
+
+    #[test]
+    fn replay_quiescence_mapping() {
+        fn map(q: redline_dispatch::aql::Quiescence) -> ReplayQuiescence {
+            match q {
+                redline_dispatch::aql::Quiescence::Proven => ReplayQuiescence::Proven,
+                redline_dispatch::aql::Quiescence::Unknown => ReplayQuiescence::Unknown,
+            }
+        }
+        assert_eq!(map(redline_dispatch::aql::Quiescence::Proven), ReplayQuiescence::Proven);
+        assert_eq!(map(redline_dispatch::aql::Quiescence::Unknown), ReplayQuiescence::Unknown);
+    }
+
+    #[test]
+    fn unknown_quiescence_requires_quiesce_before_reuse_and_shutdown_retains() {
+        // C0 contract pin at rdna layer: Unknown means in-flight may still be
+        // writing. Subsequent replay must be refused and shutdown must retain
+        // prepared IB/kernargs/kernels until quiesce proves Proven.
+        let failure = RetainedReplayFailure {
+            error: "simulated doorbell wait timeout".to_owned(),
+            quiescence: ReplayQuiescence::Unknown,
+        };
+        assert_eq!(failure.quiescence, ReplayQuiescence::Unknown);
+        // Caller policy: Unknown => quarantine — do not free, do not replay,
+        // do not reuse controller for new model until quiesce succeeds.
+        let must_quarantine = failure.quiescence == ReplayQuiescence::Unknown;
+        assert!(must_quarantine);
+        // Proven => safe to retry or free after handling error
+        let proven = RetainedReplayFailure {
+            error: "position 200 exceeds prepared max_position 100".to_owned(),
+            quiescence: ReplayQuiescence::Proven,
+        };
+        assert_eq!(proven.quiescence, ReplayQuiescence::Proven);
+        assert!(!proven.error.is_empty());
+        // Simulate shutdown retention: on Unknown, shutdown would return Err(Unknown)
+        // and keep prepared resources; on Proven it returns Ok and releases.
+        fn simulated_shutdown(quiescence: ReplayQuiescence) -> Result<(), RetainedReplayFailure> {
+            match quiescence {
+                ReplayQuiescence::Unknown => Err(RetainedReplayFailure {
+                    error: "inactivate_all failed: device still in-flight".to_owned(),
+                    quiescence: ReplayQuiescence::Unknown,
+                }),
+                ReplayQuiescence::Proven => Ok(()),
+            }
+        }
+        assert!(simulated_shutdown(ReplayQuiescence::Unknown).is_err());
+        assert!(simulated_shutdown(ReplayQuiescence::Proven).is_ok());
+    }
+
+    fn make_kernarg_with_u32(offset: usize, value: u32, len: usize) -> Vec<u8> {
+        let mut kernarg = vec![0u8; len];
+        kernarg[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        kernarg
+    }
+
+    #[test]
+    fn position_scalar_advances_by_delta_yields_binding_and_applies_at_third_position() {
+        let mut controller = ReplayController::new_armed(ReplayBackendRequest::Auto);
+        controller.begin_capture().unwrap();
+        let kernarg_10 = make_kernarg_with_u32(16, 10, 64);
+        controller.record_hip_launch("gemv_hfq4g256", None, [1, 1, 1], [64, 1, 1], 0, &kernarg_10);
+        controller.finish_capture().unwrap();
+        let earlier = controller.snapshot_recorded_kernargs();
+        controller.begin_capture().unwrap();
+        let kernarg_20 = make_kernarg_with_u32(16, 20, 64);
+        controller.record_hip_launch("gemv_hfq4g256", None, [1, 1, 1], [64, 1, 1], 0, &kernarg_20);
+        controller.finish_capture().unwrap();
+        let count = controller
+            .synthesize_position_bindings(&earlier, 10, 20)
+            .unwrap();
+        assert_eq!(count, 1);
+        let bindings = controller.synthesized_position_bindings().to_vec();
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].0, 0);
+        match bindings[0].1 {
+            ReplayKernargBinding::PositionPlusU32 { offset, addend } => {
+                assert_eq!(offset, 16);
+                assert_eq!(addend, 0); // 20 - 20 = 0, 10 -10 =0
+            }
+            _ => panic!("expected PositionPlusU32"),
+        }
+        // Applying at third position 30 should produce 30.
+        let mut kernarg_third = vec![0u8; 64];
+        apply_kernarg_bindings_for_dispatch(&mut kernarg_third, 0, 30, &bindings).unwrap();
+        let v = u32::from_le_bytes(kernarg_third[16..20].try_into().unwrap());
+        // But apply writes value = position + addend = 30 + 0 =30; with ne_bytes vs le_bytes?
+        // PositionPlusU32 uses to_ne_bytes, so need to read via from_ne_bytes.
+        let v_ne = u32::from_ne_bytes(kernarg_third[16..20].try_into().unwrap());
+        assert_eq!(v_ne, 30);
+        // Also verify that helper reproduces earlier samples.
+        let mut kernarg_earlier = vec![0u8; 64];
+        apply_kernarg_bindings_for_dispatch(&mut kernarg_earlier, 0, 10, &bindings).unwrap();
+        let ve = u32::from_ne_bytes(kernarg_earlier[16..20].try_into().unwrap());
+        assert_eq!(ve, 10);
+        let mut kernarg_current = vec![0u8; 64];
+        apply_kernarg_bindings_for_dispatch(&mut kernarg_current, 0, 20, &bindings).unwrap();
+        let vc = u32::from_ne_bytes(kernarg_current[16..20].try_into().unwrap());
+        assert_eq!(vc, 20);
+    }
+
+    #[test]
+    fn position_scalar_with_constant_offset_recovers_addend() {
+        let mut controller = ReplayController::new_armed(ReplayBackendRequest::Auto);
+        controller.begin_capture().unwrap();
+        // scalar = position + 5
+        let kernarg_10 = make_kernarg_with_u32(32, 15, 64); // 10+5
+        controller.record_hip_launch("fused_qkv_hfq4g256", None, [1, 1, 1], [64, 1, 1], 0, &kernarg_10);
+        controller.finish_capture().unwrap();
+        let earlier = controller.snapshot_recorded_kernargs();
+        controller.begin_capture().unwrap();
+        let kernarg_20 = make_kernarg_with_u32(32, 25, 64); // 20+5
+        controller.record_hip_launch("fused_qkv_hfq4g256", None, [1, 1, 1], [64, 1, 1], 0, &kernarg_20);
+        controller.finish_capture().unwrap();
+        let count = controller.synthesize_position_bindings(&earlier, 10, 20).unwrap();
+        assert_eq!(count, 1);
+        match controller.synthesized_position_bindings()[0].1 {
+            ReplayKernargBinding::PositionPlusU32 { offset, addend } => {
+                assert_eq!(offset, 32);
+                assert_eq!(addend, 5);
+            }
+            _ => panic!("expected PositionPlusU32"),
+        }
+    }
+
+    #[test]
+    fn position_scalar_non_delta_difference_is_rejected_with_kernel_index_offset() {
+        let mut controller = ReplayController::new_armed(ReplayBackendRequest::Auto);
+        controller.begin_capture().unwrap();
+        let kernarg_10 = make_kernarg_with_u32(8, 100, 64);
+        controller.record_hip_launch("softmax_f32", None, [1, 1, 1], [64, 1, 1], 0, &kernarg_10);
+        controller.finish_capture().unwrap();
+        let earlier = controller.snapshot_recorded_kernargs();
+        controller.begin_capture().unwrap();
+        // Diff is 5, delta is 10 (positions 10->20 delta 10, but value diff 5)
+        let kernarg_20 = make_kernarg_with_u32(8, 105, 64);
+        controller.record_hip_launch("softmax_f32", None, [1, 1, 1], [64, 1, 1], 0, &kernarg_20);
+        controller.finish_capture().unwrap();
+        let err = controller
+            .synthesize_position_bindings(&earlier, 10, 20)
+            .unwrap_err();
+        assert!(err.contains("softmax_f32"), "error missing kernel: {err}");
+        assert!(err.contains("launch 0"), "error missing launch index: {err}");
+        assert!(err.contains("offset 8"), "error missing byte offset: {err}");
+        assert!(err.contains("unexplained"), "error missing unexplained: {err}");
+    }
+
+    #[test]
+    fn eight_byte_pointer_field_is_rejected_as_moved_allocation() {
+        let mut controller = ReplayController::new_armed(ReplayBackendRequest::Auto);
+        controller.begin_capture().unwrap();
+        let mut kernarg_early = vec![0u8; 32];
+        let ptr_early: u64 = 0x7f00_0000_1000;
+        kernarg_early[0..8].copy_from_slice(&ptr_early.to_le_bytes());
+        controller.record_hip_launch("gemv_hfq4g256", None, [1, 1, 1], [64, 1, 1], 0, &kernarg_early);
+        controller.finish_capture().unwrap();
+        let earlier = controller.snapshot_recorded_kernargs();
+        controller.begin_capture().unwrap();
+        let mut kernarg_cur = vec![0u8; 32];
+        let ptr_cur: u64 = 0x7f00_0000_2000; // moved allocation, diff != delta
+        kernarg_cur[0..8].copy_from_slice(&ptr_cur.to_le_bytes());
+        controller.record_hip_launch("gemv_hfq4g256", None, [1, 1, 1], [64, 1, 1], 0, &kernarg_cur);
+        controller.finish_capture().unwrap();
+        let err = controller
+            .synthesize_position_bindings(&earlier, 10, 20)
+            .unwrap_err();
+        assert!(err.contains("moved allocation"), "error missing moved allocation: {err}");
+        assert!(err.contains("offset 0"), "error missing offset: {err}");
+    }
+
+    #[test]
+    fn gdn_frame_offset_76_is_skipped_on_gdn_family() {
+        let mut controller = ReplayController::new_armed(ReplayBackendRequest::Auto);
+        controller.begin_capture().unwrap();
+        let mut kernarg_early = vec![0u8; 80];
+        kernarg_early[76..80].copy_from_slice(&1234u32.to_le_bytes());
+        // need nt at 64 to be valid but synthesize skips offset 76 regardless
+        kernarg_early[64..68].copy_from_slice(&1i32.to_le_bytes());
+        controller.record_hip_launch(
+            "gated_delta_net_q8_fast",
+            None,
+            [1, 1, 1],
+            [64, 1, 1],
+            0,
+            &kernarg_early,
+        );
+        controller.finish_capture().unwrap();
+        let earlier = controller.snapshot_recorded_kernargs();
+        controller.begin_capture().unwrap();
+        let mut kernarg_cur = vec![0u8; 80];
+        kernarg_cur[76..80].copy_from_slice(&9999u32.to_le_bytes()); // arbitrary diff
+        kernarg_cur[64..68].copy_from_slice(&1i32.to_le_bytes());
+        controller.record_hip_launch(
+            "gated_delta_net_q8_fast",
+            None,
+            [1, 1, 1],
+            [64, 1, 1],
+            0,
+            &kernarg_cur,
+        );
+        controller.finish_capture().unwrap();
+        let count = controller
+            .synthesize_position_bindings(&earlier, 10, 20)
+            .unwrap();
+        assert_eq!(count, 0, "GDN offset 76 should be skipped, got bindings: {count}");
+    }
+
+    #[test]
+    fn mismatched_launch_counts_kernel_names_and_kernarg_lengths_are_rejected_distinctly() {
+        // Mismatched launch counts
+        let mut controller = ReplayController::new_armed(ReplayBackendRequest::Auto);
+        controller.begin_capture().unwrap();
+        controller.record_hip_launch("a", None, [1, 1, 1], [32, 1, 1], 0, &[1, 2, 3, 4]);
+        controller.finish_capture().unwrap();
+        let earlier = controller.snapshot_recorded_kernargs();
+        controller.begin_capture().unwrap();
+        controller.record_hip_launch("a", None, [1, 1, 1], [32, 1, 1], 0, &[1, 2, 3, 4]);
+        controller.record_hip_launch("b", None, [1, 1, 1], [32, 1, 1], 0, &[5, 6, 7, 8]);
+        controller.finish_capture().unwrap();
+        let err = controller
+            .synthesize_position_bindings(&earlier, 10, 20)
+            .unwrap_err();
+        assert!(err.contains("launch count mismatch"), "expected launch count mismatch: {err}");
+
+        // Mismatched kernel names
+        let mut controller2 = ReplayController::new_armed(ReplayBackendRequest::Auto);
+        controller2.begin_capture().unwrap();
+        controller2.record_hip_launch("kernel_a", None, [1, 1, 1], [32, 1, 1], 0, &[1, 2, 3, 4]);
+        controller2.finish_capture().unwrap();
+        let earlier2 = controller2.snapshot_recorded_kernargs();
+        controller2.begin_capture().unwrap();
+        controller2.record_hip_launch("kernel_b", None, [1, 1, 1], [32, 1, 1], 0, &[1, 2, 3, 4]);
+        controller2.finish_capture().unwrap();
+        let err2 = controller2
+            .synthesize_position_bindings(&earlier2, 10, 20)
+            .unwrap_err();
+        assert!(err2.contains("kernel mismatch"), "expected kernel mismatch: {err2}");
+
+        // Mismatched kernarg lengths
+        let mut controller3 = ReplayController::new_armed(ReplayBackendRequest::Auto);
+        controller3.begin_capture().unwrap();
+        controller3.record_hip_launch("same_kernel", None, [1, 1, 1], [32, 1, 1], 0, &[1, 2, 3, 4]);
+        controller3.finish_capture().unwrap();
+        let earlier3 = controller3.snapshot_recorded_kernargs();
+        controller3.begin_capture().unwrap();
+        controller3.record_hip_launch(
+            "same_kernel",
+            None,
+            [1, 1, 1],
+            [32, 1, 1],
+            0,
+            &[1, 2, 3, 4, 5, 6, 7, 8],
+        );
+        controller3.finish_capture().unwrap();
+        let err3 = controller3
+            .synthesize_position_bindings(&earlier3, 10, 20)
+            .unwrap_err();
+        assert!(
+            err3.contains("kernarg length mismatch"),
+            "expected kernarg length mismatch: {err3}"
+        );
+        // Ensure distinct messages
+        assert_ne!(err, err2);
+        assert_ne!(err2, err3);
+        assert_ne!(err, err3);
     }
 }

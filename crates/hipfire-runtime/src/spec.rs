@@ -832,6 +832,20 @@ pub trait Speculator {
     /// applies the IDENTICAL (top_k,top_p) nucleus truncation to draft + target
     /// inside `step` (lossless == AR-at-(top_k,top_p)). `temp <= 0` ⇒ greedy.
     fn set_sampling(&mut self, _temp: f32, _top_p: f32, _top_k: usize, _cactus_delta: f32) {}
+
+    /// Prove no retained speculative IB is in flight before model free.
+    /// Default no-op. Drafters that own a retained-PM4 route override this and
+    /// return `Err` when quiescence is unknown — the unload path must then
+    /// refuse to free any pointer the route may still name.
+    fn quiesce(&mut self, _gpu: &mut Gpu) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Route-proof JSON for a retained-PM4 verify path, when present.
+    /// Default `None` for drafters without a retained route.
+    fn verify_pm4_report(&self) -> Option<serde_json::Value> {
+        None
+    }
 }
 
 // ─── Multi-token-prediction (MTP) drafter core ──────────────────────────────

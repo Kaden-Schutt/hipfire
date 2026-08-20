@@ -2586,6 +2586,7 @@ fn main() {
                     runtime_repeat_penalty,
                     repeat_window,
                     None, // max_accept: uncapped demo
+                    None,
                 )
                 .expect("spec step")
             };

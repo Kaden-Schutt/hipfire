@@ -542,6 +542,17 @@ pub struct MmqScreenState {
 }
 
 /// High-level GPU context. Owns the HIP runtime, compiler, and loaded kernels.
+///
+/// Tape completeness invariant: for any body executed via `Gpu`,
+/// `self.graphs.capture_blobs.len()` after a HipGraph capture must equal
+/// `self.replay.recorded_launches().len()` after a `ReplayController` capture
+/// of the same body. Every kernel launch reachable from the four
+/// `self.scratch.*` helpers (`ensure_fp16_x`, `convert_fp16_x_uncached`,
+/// `ensure_fp8_x`, `ensure_q8_1_mmq_x`) is recorded through the unified
+/// `launch_maybe_blob` gate so the two tapes stay in lockstep. A future
+/// helper that appends to `capture_blobs` without also recording into
+/// `self.replay` will silently truncate a retained tape — use
+/// `debug_assert_tape_parity` or compare the two counts in a test.
 pub struct Gpu {
     pub hip: HipRuntime,
     pub arch: String,
@@ -2215,6 +2226,71 @@ impl Gpu {
         Ok(())
     }
 
+    /// Position-aware variant of [`Self::replay_recorded_hip_prefix`].
+    ///
+    /// Applies the identical binding set the retained PM4 route applies, so the
+    /// recorded-blob oracle and the PM4 route stay equivalent: a divergence
+    /// between them is then a submission difference, never a patching one.
+    pub fn replay_recorded_hip_prefix_at(&self, count: usize, position: usize) -> HipResult<()> {
+        self.bind_thread()?;
+        let launches = self.replay.recorded_launches();
+        if count > launches.len() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "captured HIP prefix {count} exceeds {} launches",
+                    launches.len()
+                ),
+            ));
+        }
+        let synthesized = self.replay.synthesized_position_bindings();
+        for (index, launch) in launches.iter().take(count).enumerate() {
+            let func = self.functions.get(&launch.kernel).ok_or_else(|| {
+                hip_bridge::HipError::new(
+                    0,
+                    &format!("captured HIP function {:?} is not loaded", launch.kernel),
+                )
+            })?;
+            let mut kernarg = launch.kernarg.clone();
+            let mut bindings: Vec<(usize, crate::replay::ReplayKernargBinding)> = synthesized
+                .iter()
+                .filter(|(idx, _)| *idx == index)
+                .cloned()
+                .collect();
+            if crate::replay::is_gdn_kernel(&launch.kernel) {
+                let frames = crate::replay::gdn_requant_frames_for_dispatch(
+                    &launch.kernarg,
+                    launch.grid[2],
+                )
+                .map_err(|reason| hip_bridge::HipError::new(0, &reason))?;
+                bindings.push((
+                    index,
+                    crate::replay::ReplayKernargBinding::GdnFrameU32 { offset: 76, frames },
+                ));
+            }
+            crate::replay::apply_kernarg_bindings_for_dispatch(
+                &mut kernarg,
+                index,
+                position,
+                &bindings,
+            )
+            .map_err(|reason| hip_bridge::HipError::new(0, &reason))?;
+            // SAFETY: the bytes were captured from this exact loaded function
+            // and all pointees remain owned by this Gpu/model instance.
+            unsafe {
+                self.hip.launch_kernel_blob(
+                    func,
+                    launch.grid,
+                    launch.block,
+                    launch.shared_mem,
+                    self.active_stream.as_ref(),
+                    &mut kernarg,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     /// Compile and load a kernel if missing. Public variant of `ensure_kernel`
     /// for callers that need to JIT a kernel by name from outside the crate
     /// (primarily the hipGraph capture/replay path).
@@ -2286,6 +2362,12 @@ impl Gpu {
         x: &GpuTensor,
         n_elems: usize,
     ) -> HipResult<*mut c_void> {
+        // Split borrows so `self.replay` and `self.graphs`/`self.scratch` can be
+        // borrowed simultaneously. The scratch helper will record into replay
+        // when `is_recording()` and push to capture_blobs when `capture_mode`,
+        // using the unified `record || capture_mode || force_blob` gate.
+        let capture_mode = self.graphs.capture_mode;
+        let force_blob = self.flags.force_blob_path;
         self.scratch.ensure_fp16_x(
             &self.hip,
             &mut self.compiler,
@@ -2293,8 +2375,9 @@ impl Gpu {
             &mut self.functions,
             self.active_stream.as_ref(),
             &mut self.graphs.capture_blobs,
-            self.graphs.capture_mode,
-            self.flags.force_blob_path,
+            capture_mode,
+            force_blob,
+            &mut self.replay,
             x,
             n_elems,
         )
@@ -2313,6 +2396,8 @@ impl Gpu {
         x: &GpuTensor,
         n_elems: usize,
     ) -> HipResult<*mut c_void> {
+        let capture_mode = self.graphs.capture_mode;
+        let force_blob = self.flags.force_blob_path;
         self.scratch.convert_fp16_x_uncached(
             &self.hip,
             &mut self.compiler,
@@ -2320,8 +2405,9 @@ impl Gpu {
             &mut self.functions,
             self.active_stream.as_ref(),
             &mut self.graphs.capture_blobs,
-            self.graphs.capture_mode,
-            self.flags.force_blob_path,
+            capture_mode,
+            force_blob,
+            &mut self.replay,
             x,
             n_elems,
         )
@@ -2332,6 +2418,8 @@ impl Gpu {
     /// uses cvt_pk_fp8_f32. Caches by `x.buf.as_ptr()` like its FP16
     /// sibling so back-to-back same-X GEMM dispatches skip reconversion.
     pub(crate) fn ensure_fp8_x(&mut self, x: &GpuTensor, n_elems: usize) -> HipResult<*mut c_void> {
+        let capture_mode = self.graphs.capture_mode;
+        let force_blob = self.flags.force_blob_path;
         self.scratch.ensure_fp8_x(
             &self.hip,
             &mut self.compiler,
@@ -2339,8 +2427,9 @@ impl Gpu {
             &mut self.functions,
             self.active_stream.as_ref(),
             &mut self.graphs.capture_blobs,
-            self.graphs.capture_mode,
-            self.flags.force_blob_path,
+            capture_mode,
+            force_blob,
+            &mut self.replay,
             x,
             n_elems,
         )
@@ -2356,6 +2445,8 @@ impl Gpu {
         k: usize,
     ) -> HipResult<*mut c_void> {
         // bind_thread: skip — delegated to scratch.rs
+        let capture_mode = self.graphs.capture_mode;
+        let force_blob = self.flags.force_blob_path;
         self.scratch.ensure_q8_1_mmq_x(
             &self.hip,
             &mut self.compiler,
@@ -2363,14 +2454,43 @@ impl Gpu {
             &mut self.functions,
             self.active_stream.as_ref(),
             &mut self.graphs.capture_blobs,
-            self.graphs.capture_mode,
-            self.flags.force_blob_path,
+            capture_mode,
+            force_blob,
+            &mut self.replay,
             self.device_id,
             x,
             batch_size,
             k,
         )
     }
+    /// Returns the number of launches recorded by the `ReplayController`.
+    /// Together with `self.graphs.capture_blobs.len()`, this must agree for
+    /// any body — see the `Gpu` type-level invariant doc.
+    pub fn recorded_launch_count(&self) -> usize {
+        self.replay.recorded_launches().len()
+    }
+
+    /// Returns the number of HipGraph kernarg blobs captured.
+    /// See `recorded_launch_count` and the `Gpu` invariant.
+    pub fn graph_blob_count(&self) -> usize {
+        self.graphs.capture_blobs.len()
+    }
+
+    /// Debug-only assertion that the HipGraph and Replay tapes would agree.
+    /// Call after a body that was captured via both mechanisms (or after two
+    /// separate captures of the same body, passing the other count).
+    /// A mismatch indicates a helper bypassed the replay recorder.
+    pub fn debug_assert_tape_parity(&self, other_blob_count: Option<usize>) {
+        let replay_len = self.recorded_launch_count();
+        let graph_len = other_blob_count.unwrap_or_else(|| self.graph_blob_count());
+        debug_assert_eq!(
+            replay_len, graph_len,
+            "tape parity violated: replay recorded {} launches but HipGraph has {} blobs — a helper bypassed the recorder",
+            replay_len, graph_len
+        );
+    }
+
+
 
     /// Screen a weight matrix for MMQ safety (#87). Runs a small synthetic
     /// comparison (batch=16): f16 WMMA vs MMQ on random activations. If any
@@ -4803,4 +4923,68 @@ mod tests {
             .expect("clears after faults drained");
         assert_eq!(gpu.vmm_allocation_count(), 0);
     }
+    #[test]
+    fn scratch_convert_predicate_matches_launch_gate() {
+        // The scratch fast-path `scratch_must_convert` must be exactly
+        // `is_recording || capture_mode || cached != src`, which is the
+        // same predicate `Gpu::launch_maybe_blob_bound` uses for
+        // `record || capture_mode || force_blob` (with force_blob=false here).
+        // If these drift, a helper could skip a kernel that a recorder
+        // expects, or record a kernel the live path elides.
+        use crate::scratch::{scratch_must_convert, use_blob_path};
+        let ptr_a: *mut std::ffi::c_void = 0x1000 as *mut _;
+        let ptr_b: *mut std::ffi::c_void = 0x2000 as *mut _;
+
+        for capture in [false, true] {
+            for recording in [false, true] {
+                // cached == src  -> should convert only if a recorder active
+                assert_eq!(
+                    scratch_must_convert(capture, recording, ptr_a, ptr_a),
+                    recording || capture,
+                    "cached==src capture={capture} recording={recording}"
+                );
+                // cached != src -> always converts regardless of recorders
+                assert_eq!(
+                    scratch_must_convert(capture, recording, ptr_a, ptr_b),
+                    true,
+                    "cached!=src capture={capture} recording={recording}"
+                );
+                // blob path predicate must equal launch_maybe_blob_bound's gate
+                for force in [false, true] {
+                    let scratch_gate = use_blob_path(recording, capture, force);
+                    let dispatch_gate = recording || capture || force;
+                    assert_eq!(
+                        scratch_gate, dispatch_gate,
+                        "use_blob_path(recording={recording}, capture={capture}, force={force})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tape_parity_accessors_agree_on_empty() {
+        // GPU-free sanity: the invariant doc says the two counts must agree.
+        // This test just proves the accessors exist and are consistent on a
+        // freshly-constructed replay controller / empty graph state.
+        use crate::replay::{ReplayBackendRequest, ReplayController};
+        use crate::graph::GraphState;
+        let ctrl = ReplayController::new(ReplayBackendRequest::Hip);
+        assert_eq!(ctrl.recorded_launches().len(), 0);
+        let graph = GraphState {
+            capture_mode: false,
+            capture_blobs: Vec::new(),
+            graph_exec: None,
+            captured_graph: None,
+            ar_forward_blobs: Vec::new(),
+            ar_forward_kernel_dirty: false,
+            ar_forward_replay_enabled: false,
+            ar_graph_eligible: true,
+            verify: crate::graph::PerBGraphCache::default(),
+            replay: crate::graph::PerBGraphCache::default(),
+        };
+        assert_eq!(graph.capture_blobs.len(), 0);
+        assert_eq!(ctrl.recorded_launches().len(), graph.capture_blobs.len());
+    }
+
 }

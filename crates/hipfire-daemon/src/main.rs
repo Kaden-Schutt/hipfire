@@ -53,6 +53,7 @@ use hipfire_generate::vision::{GenerateVLParams, ImageSource};
 use hipfire_generate::redline::{
     handle_redline_dispatch_profile,
     handle_redline_dspark_shadow_pm4,
+    handle_redline_dflash_verify_shadow_pm4,
     handle_redline_pm4_prefix_profile,
     handle_redline_prefix_shadow,
     handle_redline_probe_aql,
@@ -3698,6 +3699,10 @@ fn main() {
 
             "redline_dspark_shadow_pm4" => {
                 handle_redline_dspark_shadow_pm4(&msg, &mut model, &mut gpu, &mut stdout);
+            }
+
+            "redline_dflash_verify_shadow_pm4" => {
+                handle_redline_dflash_verify_shadow_pm4(&msg, &mut model, &mut gpu, &mut stdout);
             }
 
             "redline_shadow_aql" | "redline_shadow_pm4" => {

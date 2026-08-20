@@ -10,7 +10,8 @@
 //! [`Speculator`] trait, and [`build_dflash_speculator`] (its env-resolving
 //! constructor). All types here are qwen35 + runtime types — no loader types —
 //! so the loader only calls in; it never owns the DFlash mechanics.
-use crate::qwen35::{self, DeltaNetState, Qwen35Config};
+use crate::dflash_verify_pm4::{DflashVerifyPm4, DFLASH_VERIFY_PM4_BLOCK};
+use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Weights, StateQuant};
 use crate::speculative::{
     apply_eviction_retain_to_draft, apply_host_nucleus, apply_host_topk, sample_categorical,
     scatter_hidden_block_to_interleaved, seed_target_hidden_from_prompt_abortable,
@@ -25,6 +26,9 @@ use hipfire_runtime::spec::{
 };
 use rdna_compute::Gpu;
 use std::path::Path;
+
+/// Extract layers the retained B=16 DFlash2 verify route admits.
+const DFLASH_VERIFY_PM4_EXTRACT_LAYERS: [usize; 5] = [5, 19, 33, 47, 61];
 
 // ─── DDTree side state ────────────────────────────────────────────────
 
@@ -51,6 +55,9 @@ pub struct DflashState {
     pub ctx_capacity: usize,
     pub block_size: usize,
     pub ddtree: Option<DdtreeState>,
+    /// Retained-PM4 route for the fixed B=16 chain target-verify forward.
+    /// Always present; `Disabled` when admission fails (no controller held).
+    pub verify_pm4: DflashVerifyPm4,
 }
 
 impl DflashState {
@@ -69,7 +76,29 @@ impl DflashState {
             ctx_capacity: _,
             block_size: _,
             ddtree,
+            mut verify_pm4,
         } = self;
+        // Must prove no retained IB is in flight before any captured owner is
+        // freed. Unknown quiescence → intentional leak; daemon restart is the
+        // containment path.
+        if let Err(reason) = verify_pm4.shutdown() {
+            eprintln!(
+                "dflash verify PM4: refusing free after unknown quiescence: {reason}"
+            );
+            std::mem::forget((
+                verify_pm4,
+                draft_weights,
+                draft_scratch,
+                hidden_rb,
+                verify_scratch,
+                target_snap,
+                gdn_tape,
+                ddtree,
+            ));
+            let _ = gpu;
+            return;
+        }
+        drop(verify_pm4);
         draft_weights.free_gpu(gpu);
         draft_scratch.free_gpu(gpu);
         hidden_rb.free_gpu(gpu);
@@ -113,6 +142,13 @@ pub fn load_dflash_state(
     // already dropped) and falls back to Legacy — gather-compact over the
     // rings is a follow-up.
     eviction_active: bool,
+    // Retained-PM4 admission facts owned by the loader/target, not the draft.
+    target_weights: &Qwen35Weights,
+    kv_is_q8: bool,
+    single_gpu: bool,
+    // True when adaptive KV is engaged for this load (tier-switching cache).
+    // Must be false for retained-PM4 admission.
+    adaptive_kv: bool,
 ) -> Result<DflashState, String> {
     let requested_ctx = ctx_capacity;
     // Open the draft container up-front: its declared SWA window is the
@@ -386,6 +422,67 @@ pub fn load_dflash_state(
     } else {
         None
     };
+    // Retained-PM4 admission (default-off). Pure gates + env opt-in; Disabled
+    // holds no controller so HIP behavior stays byte-identical when not armed.
+    let env_opt_in = hipfire_config::developer_var("HIPFIRE_DFLASH_VERIFY_PM4")
+        .ok()
+        .as_deref()
+        == Some("1");
+    let moe_router_present = verify_scratch
+        .prefill_batch
+        .as_ref()
+        .map(|p| p.moe_router_logits_batch.is_some())
+        .unwrap_or(false);
+    let pbs_eligible_b16 = qwen35::prefill_batch_pbs_eligible(
+        target_weights,
+        target_config,
+        target_dn,
+        DFLASH_VERIFY_PM4_BLOCK,
+        &gpu.arch,
+        moe_router_present,
+    );
+    let pbs_max_batch = verify_scratch
+        .prefill_batch
+        .as_ref()
+        .map(|p| p.max_batch)
+        .unwrap_or(0);
+    // The draft's selector/dynamic-conv shape is deliberately NOT a gate: the
+    // draft forward is outside the tape, so DFlash2 and legacy DFlash yield an
+    // identical target verify body.
+    let verify_pm4 = match admit_dflash_verify_pm4(
+        env_opt_in,
+        &gpu.arch,
+        single_gpu,
+        target_config.num_experts,
+        kv_is_q8,
+        matches!(target_dn.quant, StateQuant::Q8),
+        // finish_qwen35_load suppresses generic DFlash under adaptive KV, but
+        // admit fail-closed so a future load path cannot arm a static-Q8 tape
+        // against a tier-switching cache.
+        !adaptive_kv,
+        &hidden_rb.extract_layers,
+        block_size,
+        &draft_config.target_layer_ids,
+        ddtree.is_some(),
+        verify_scratch.prefill_batch.is_some(),
+        pbs_eligible_b16,
+        verify_scratch.max_n,
+        pbs_max_batch,
+        hidden_rb.max_batch,
+        gdn_tape.max_n,
+    ) {
+        Ok(()) => {
+            eprintln!(
+                "  DFlash verify PM4: armed (B={}, exact {})",
+                DFLASH_VERIFY_PM4_BLOCK, gpu.arch
+            );
+            DflashVerifyPm4::armed()
+        }
+        Err(reason) => {
+            eprintln!("  DFlash verify PM4: disabled ({reason})");
+            DflashVerifyPm4::disabled(reason)
+        }
+    };
     Ok(DflashState {
         draft_config,
         draft_weights,
@@ -406,6 +503,7 @@ pub fn load_dflash_state(
         },
         block_size,
         ddtree,
+        verify_pm4,
     })
 }
 
@@ -478,6 +576,16 @@ impl DflashSpeculator {
             ck_interval,
             ck_cap,
         }
+    }
+
+    /// Borrow the retained-PM4 verify route (report / phase inspection).
+    pub fn verify_pm4(&self) -> &DflashVerifyPm4 {
+        &self.df.verify_pm4
+    }
+
+    /// Mutable borrow for the chain verify path (`Some(&mut self.df.verify_pm4)`).
+    pub fn verify_pm4_mut(&mut self) -> &mut DflashVerifyPm4 {
+        &mut self.df.verify_pm4
     }
 }
 
@@ -817,6 +925,7 @@ impl Speculator for DflashSpeculator {
                 1.0_f32,            // repeat_penalty (off)
                 0,                  // repeat_window
                 max_accept,
+                Some(&mut self.df.verify_pm4),
             )
         };
 
@@ -926,6 +1035,14 @@ impl Speculator for DflashSpeculator {
         false
     }
 
+    fn quiesce(&mut self, _gpu: &mut Gpu) -> Result<(), String> {
+        self.df.verify_pm4.shutdown()
+    }
+
+    fn verify_pm4_report(&self) -> Option<serde_json::Value> {
+        Some(self.df.verify_pm4.report_json())
+    }
+
     fn free(self: Box<Self>, gpu: &mut Gpu) {
         let DflashSpeculator {
             df, checkpoints, ..
@@ -964,4 +1081,366 @@ pub fn build_dflash_speculator(df: DflashState, eviction_is_none: bool) -> Box<d
         ck_interval,
         ck_cap,
     ))
+}
+
+// ─── Retained-PM4 admission (pure) ────────────────────────────────────
+
+/// Pure admission predicate for the fixed B=16 DFlash retained-PM4 verify route.
+///
+/// The gates constrain what the tape actually captures — the *target* forward's
+/// arch, shape, quantization, and scratch capacities. They deliberately say
+/// nothing about the draft's selector or dynamic-conv fields: the draft forward,
+/// candidate selection, and draft lm-head are all outside the tape boundary, so
+/// DFlash2 and legacy DFlash produce an identical target verify body.
+///
+/// Each failed condition returns a **distinct** reason string so harness
+/// evidence can name the gate. GPU-free: unit-tested without a device.
+pub fn admit_dflash_verify_pm4(
+    env_opt_in: bool,
+    arch: &str,
+    single_gpu: bool,
+    num_experts: usize,
+    kv_is_q8: bool,
+    dn_state_is_q8: bool,
+    adaptive_kv_absent: bool,
+    runtime_extract_layers: &[usize],
+    runtime_block_size: usize,
+    target_layer_ids: &[usize],
+    ddtree_present: bool,
+    prefill_batch_present: bool,
+    pbs_eligible_b16: bool,
+    verify_max_n: usize,
+    pbs_max_batch: usize,
+    hidden_rb_max_batch: usize,
+    gdn_tape_max_n: usize,
+) -> Result<(), String> {
+    if !env_opt_in {
+        return Err("HIPFIRE_DFLASH_VERIFY_PM4 is not set to 1".into());
+    }
+    if arch != "gfx1201" {
+        return Err(format!("arch is {arch}, not exact gfx1201"));
+    }
+    if !single_gpu {
+        return Err("multi-GPU load is not admitted".into());
+    }
+    if num_experts != 0 {
+        return Err(format!(
+            "MoE target (num_experts={num_experts}) is not admitted"
+        ));
+    }
+    if !kv_is_q8 {
+        return Err("KV mode is not Q8".into());
+    }
+    if !dn_state_is_q8 {
+        return Err("DeltaNet state quant is not Q8".into());
+    }
+    if !adaptive_kv_absent {
+        return Err("adaptive KV is engaged".into());
+    }
+    // Consistency, not identity: whatever layers the draft declares must be the
+    // layers the hidden ring actually extracts, or the captured staging writes
+    // do not correspond to what the draft will read back.
+    if runtime_extract_layers != target_layer_ids {
+        return Err(format!(
+            "hidden-ring extract layers {runtime_extract_layers:?} != draft target_layer_ids {target_layer_ids:?}"
+        ));
+    }
+    if target_layer_ids.is_empty() {
+        return Err("draft declares no target_layer_ids".into());
+    }
+    if runtime_block_size != DFLASH_VERIFY_PM4_BLOCK {
+        return Err(format!(
+            "runtime block size is {runtime_block_size}, not {DFLASH_VERIFY_PM4_BLOCK}"
+        ));
+    }
+    if ddtree_present {
+        return Err("DDTree is present".into());
+    }
+    if !prefill_batch_present {
+        return Err("verify_scratch.prefill_batch is absent".into());
+    }
+    if !pbs_eligible_b16 {
+        return Err("prefill_batch_pbs_eligible failed at B=16".into());
+    }
+    if verify_max_n < DFLASH_VERIFY_PM4_BLOCK {
+        return Err(format!(
+            "verify_scratch.max_n={verify_max_n} < {DFLASH_VERIFY_PM4_BLOCK}"
+        ));
+    }
+    if pbs_max_batch < DFLASH_VERIFY_PM4_BLOCK {
+        return Err(format!(
+            "prefill_batch.max_batch={pbs_max_batch} < {DFLASH_VERIFY_PM4_BLOCK}"
+        ));
+    }
+    if hidden_rb_max_batch < DFLASH_VERIFY_PM4_BLOCK {
+        return Err(format!(
+            "hidden_rb.max_batch={hidden_rb_max_batch} < {DFLASH_VERIFY_PM4_BLOCK}"
+        ));
+    }
+    if gdn_tape_max_n < DFLASH_VERIFY_PM4_BLOCK {
+        return Err(format!(
+            "gdn_tape.max_n={gdn_tape_max_n} < {DFLASH_VERIFY_PM4_BLOCK}"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod admit_dflash_verify_pm4_tests {
+    use super::*;
+
+    /// Baseline admitted args; override one field per negative case.
+    struct Args {
+        env_opt_in: bool,
+        arch: &'static str,
+        single_gpu: bool,
+        num_experts: usize,
+        kv_is_q8: bool,
+        dn_state_is_q8: bool,
+        adaptive_kv_absent: bool,
+        runtime_extract_layers: &'static [usize],
+        runtime_block_size: usize,
+        target_layer_ids: &'static [usize],
+        ddtree_present: bool,
+        prefill_batch_present: bool,
+        pbs_eligible_b16: bool,
+        verify_max_n: usize,
+        pbs_max_batch: usize,
+        hidden_rb_max_batch: usize,
+        gdn_tape_max_n: usize,
+    }
+
+    impl Default for Args {
+        fn default() -> Self {
+            Self {
+                env_opt_in: true,
+                arch: "gfx1201",
+                single_gpu: true,
+                num_experts: 0,
+                kv_is_q8: true,
+                dn_state_is_q8: true,
+                adaptive_kv_absent: true,
+        runtime_extract_layers: &DFLASH_VERIFY_PM4_EXTRACT_LAYERS,
+                runtime_block_size: DFLASH_VERIFY_PM4_BLOCK,
+                target_layer_ids: &DFLASH_VERIFY_PM4_EXTRACT_LAYERS,
+                ddtree_present: false,
+                prefill_batch_present: true,
+                pbs_eligible_b16: true,
+                verify_max_n: DFLASH_VERIFY_PM4_BLOCK,
+                pbs_max_batch: DFLASH_VERIFY_PM4_BLOCK,
+                hidden_rb_max_batch: DFLASH_VERIFY_PM4_BLOCK,
+                gdn_tape_max_n: DFLASH_VERIFY_PM4_BLOCK,
+            }
+        }
+    }
+
+    fn admit(a: Args) -> Result<(), String> {
+        admit_dflash_verify_pm4(
+            a.env_opt_in,
+            a.arch,
+            a.single_gpu,
+            a.num_experts,
+            a.kv_is_q8,
+            a.dn_state_is_q8,
+            a.adaptive_kv_absent,
+            a.runtime_extract_layers,
+            a.runtime_block_size,
+            a.target_layer_ids,
+            a.ddtree_present,
+            a.prefill_batch_present,
+            a.pbs_eligible_b16,
+            a.verify_max_n,
+            a.pbs_max_batch,
+            a.hidden_rb_max_batch,
+            a.gdn_tape_max_n,
+        )
+    }
+
+    #[test]
+    fn admits_full_conjunction() {
+        assert!(admit(Args::default()).is_ok());
+    }
+
+    #[test]
+    fn rejects_env_off() {
+        let err = admit(Args {
+            env_opt_in: false,
+            ..Args::default()
+        })
+        .unwrap_err();
+        assert_eq!(err, "HIPFIRE_DFLASH_VERIFY_PM4 is not set to 1");
+    }
+
+    #[test]
+    fn rejects_wrong_arch() {
+        let err = admit(Args {
+            arch: "gfx1100",
+            ..Args::default()
+        })
+        .unwrap_err();
+        assert_eq!(err, "arch is gfx1100, not exact gfx1201");
+    }
+
+    #[test]
+    fn rejects_multi_gpu() {
+        let err = admit(Args {
+            single_gpu: false,
+            ..Args::default()
+        })
+        .unwrap_err();
+        assert_eq!(err, "multi-GPU load is not admitted");
+    }
+
+    #[test]
+    fn rejects_moe() {
+        let err = admit(Args {
+            num_experts: 256,
+            ..Args::default()
+        })
+        .unwrap_err();
+        assert_eq!(err, "MoE target (num_experts=256) is not admitted");
+    }
+
+    #[test]
+    fn rejects_non_q8_kv() {
+        let err = admit(Args {
+            kv_is_q8: false,
+            ..Args::default()
+        })
+        .unwrap_err();
+        assert_eq!(err, "KV mode is not Q8");
+    }
+
+    #[test]
+    fn rejects_non_q8_dn_state() {
+        let err = admit(Args {
+            dn_state_is_q8: false,
+            ..Args::default()
+        })
+        .unwrap_err();
+        assert_eq!(err, "DeltaNet state quant is not Q8");
+    }
+
+    #[test]
+    fn rejects_adaptive_kv() {
+        let err = admit(Args {
+            adaptive_kv_absent: false,
+            ..Args::default()
+        })
+        .unwrap_err();
+        assert_eq!(err, "adaptive KV is engaged");
+    }
+
+    #[test]
+    fn admits_a_legacy_dflash_draft() {
+        // The draft forward is outside the tape, so a draft without the DFlash2
+        // selector or dynamic conv still yields an identical target verify body.
+        assert!(admit(Args {
+            runtime_extract_layers: &[3, 7, 11, 15, 19],
+            target_layer_ids: &[3, 7, 11, 15, 19],
+            ..Args::default()
+        })
+        .is_ok());
+    }
+
+    #[test]
+    fn rejects_empty_extract_layers() {
+        let err = admit(Args {
+            runtime_extract_layers: &[],
+            target_layer_ids: &[],
+            ..Args::default()
+        })
+        .unwrap_err();
+        assert_eq!(err, "draft declares no target_layer_ids");
+    }
+
+    #[test]
+    fn rejects_wrong_block_size() {
+        let err = admit(Args {
+            runtime_block_size: 8,
+            ..Args::default()
+        })
+        .unwrap_err();
+        assert_eq!(err, "runtime block size is 8, not 16");
+    }
+
+    #[test]
+    fn rejects_extract_layer_disagreement() {
+        let err = admit(Args {
+            target_layer_ids: &[5, 19, 33, 47, 60],
+            ..Args::default()
+        })
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "hidden-ring extract layers [5, 19, 33, 47, 61] != draft target_layer_ids [5, 19, 33, 47, 60]"
+        );
+    }
+
+    #[test]
+    fn rejects_ddtree() {
+        let err = admit(Args {
+            ddtree_present: true,
+            ..Args::default()
+        })
+        .unwrap_err();
+        assert_eq!(err, "DDTree is present");
+    }
+
+    #[test]
+    fn rejects_missing_prefill_batch() {
+        let err = admit(Args {
+            prefill_batch_present: false,
+            ..Args::default()
+        })
+        .unwrap_err();
+        assert_eq!(err, "verify_scratch.prefill_batch is absent");
+    }
+
+    #[test]
+    fn rejects_pbs_ineligible() {
+        let err = admit(Args {
+            pbs_eligible_b16: false,
+            ..Args::default()
+        })
+        .unwrap_err();
+        assert_eq!(err, "prefill_batch_pbs_eligible failed at B=16");
+    }
+
+    #[test]
+    fn rejects_capacity_shortfalls() {
+        let cases = [
+            (
+                Args {
+                    verify_max_n: 15,
+                    ..Args::default()
+                },
+                "verify_scratch.max_n=15 < 16",
+            ),
+            (
+                Args {
+                    pbs_max_batch: 15,
+                    ..Args::default()
+                },
+                "prefill_batch.max_batch=15 < 16",
+            ),
+            (
+                Args {
+                    hidden_rb_max_batch: 15,
+                    ..Args::default()
+                },
+                "hidden_rb.max_batch=15 < 16",
+            ),
+            (
+                Args {
+                    gdn_tape_max_n: 15,
+                    ..Args::default()
+                },
+                "gdn_tape.max_n=15 < 16",
+            ),
+        ];
+        for (args, expected) in cases {
+            assert_eq!(admit(args).unwrap_err(), expected);
+        }
+    }
 }
