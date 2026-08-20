@@ -1092,6 +1092,7 @@ def do_bench_ar(args: argparse.Namespace) -> int:
     prompt_path = resolve_prompt_path(args.prompt, args.checkout)
     prompt_info = prompt_digest(prompt_path)
     bench_bin = Path(args.bench_bin) if args.bench_bin else Path(args.checkout) / "target/release/hipfire"
+    daemon_bin = Path(args.checkout) / "target/release/daemon"
     # Serial fresh-process perf by default
     failed: List[str] = []
     completed: List[str] = []
@@ -1163,6 +1164,9 @@ def do_bench_ar(args: argparse.Namespace) -> int:
             "bench_bin": str(bench_bin),
             "bench_bin_sha256": sha256_file(bench_bin) if bench_bin.is_file() else None,
             "bench_bin_md5": md5_file(bench_bin) if bench_bin.is_file() else None,
+            "daemon_bin": str(daemon_bin),
+            "daemon_bin_sha256": sha256_file(daemon_bin) if daemon_bin.is_file() else None,
+            "daemon_bin_md5": md5_file(daemon_bin) if daemon_bin.is_file() else None,
             "prompt": str(prompt_path),
             "prompt_bytes": prompt_info.get("bytes"),
             "prompt_sha256": prompt_info.get("sha256"),
@@ -1275,6 +1279,7 @@ def do_bench_dflash(args: argparse.Namespace) -> int:
     prompt_path = resolve_prompt_path(args.prompt, args.checkout)
     prompt_info = prompt_digest(prompt_path)
     bench_bin = Path(args.bench_bin) if args.bench_bin else Path(args.checkout) / "target/release/hipfire"
+    daemon_bin = Path(args.checkout) / "target/release/daemon"
     failed: List[str] = []
     completed: List[str] = []
     if args.dry_run:
@@ -1367,6 +1372,10 @@ def do_bench_dflash(args: argparse.Namespace) -> int:
             "draft_md5": md5_file(dpath) if dpath.is_file() else None,
             "bench_bin": str(bench_bin),
             "bench_bin_sha256": sha256_file(bench_bin) if bench_bin.is_file() else None,
+            "bench_bin_md5": md5_file(bench_bin) if bench_bin.is_file() else None,
+            "daemon_bin": str(daemon_bin),
+            "daemon_bin_sha256": sha256_file(daemon_bin) if daemon_bin.is_file() else None,
+            "daemon_bin_md5": md5_file(daemon_bin) if daemon_bin.is_file() else None,
             "prompt": str(prompt_path),
             "prompt_bytes": prompt_info.get("bytes"),
             "prompt_sha256": prompt_info.get("sha256"),
