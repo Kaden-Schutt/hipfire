@@ -667,6 +667,8 @@ def do_quantize(args: argparse.Namespace) -> int:
             else:
                 eprint(f"stale quantize {cell_id}: bpw {bpw:.3f} out of band [{cell['n']},{cell['n']+1}) — re-quantizing")
                 prior_completed.discard(cell_id)
+        if not args.dry_run:
+            artifact.parent.mkdir(parents=True, exist_ok=True)
         argv, env = quantize_argv(cell, args)
         # Print every exact command/environment/path
         if args.dry_run:
@@ -781,6 +783,8 @@ def do_drafts(args: argparse.Namespace) -> int:
             eprint(f"skip drafts {draft_id}: exists and prior completed")
             completed.append(draft_id)
             continue
+        if not args.dry_run:
+            draft_path.parent.mkdir(parents=True, exist_ok=True)
         argv, env = draft_argv(d, args)
         if args.dry_run:
             env_str = " ".join(f"{k}={shlex.quote(v)}" for k, v in sorted(env.items()))
