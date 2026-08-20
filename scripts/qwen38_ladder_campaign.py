@@ -543,10 +543,12 @@ def kld_argv(cell: Dict[str, Any], ref_kind: str, ref_path: str, output_path: st
         argv = ["cargo", "run", "--quiet", "--manifest-path", str(Path(args.checkout) / "Cargo.toml"),
                 "--example", "eval_hipfire", "--",
                 "--model", cell["artifact"], "--ref", ref_path, "--output", output_path,
-                "--kv-mode", "q8", "--kv-v", "q8", "--scoring-mode", "prefill", "--max-chunks", str(DEFAULT_KLD_CHUNKS)]
+                "--kv-mode", "q8", "--kv-v", "q8", "--ctx", "2048",
+                "--scoring-mode", "prefill", "--max-chunks", str(DEFAULT_KLD_CHUNKS)]
     else:
         argv = [ebin, "--model", cell["artifact"], "--ref", ref_path, "--output", output_path,
-                "--kv-mode", "q8", "--kv-v", "q8", "--scoring-mode", "prefill", "--max-chunks", str(DEFAULT_KLD_CHUNKS)]
+                "--kv-mode", "q8", "--kv-v", "q8", "--ctx", "2048",
+                "--scoring-mode", "prefill", "--max-chunks", str(DEFAULT_KLD_CHUNKS)]
     env = {
         "HIPFIRE_NORMALIZE_PROMPT": "0",
         "HIPFIRE_GRAPH": "0",
