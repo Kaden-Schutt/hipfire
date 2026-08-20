@@ -1678,6 +1678,16 @@ pub const GEMV_HFQ4G256_RESIDUAL_GFX1100_SRC: &str = concat!(
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/gemv_hfq4g256_residual.gfx1100.hip")
 );
+/// Dual-row R36c1 residual GEMV for gfx1100: processes 2 rows per block,
+/// reusing the activation vector across both rows. Separates weight memory
+/// phase from FMA phase (8 headers loaded sequentially, then 8 DOG FMAs).
+/// Uses buffer loads with cache policy 0 (same as STAGE_X32 single-row).
+pub const GEMV_HFQ4G256_RESIDUAL_DUALROW_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    "#define HIPFIRE_RESIDUAL_KERNEL gemv_hfq4g256_residual_dualrow_gfx1100\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_residual.hip")
+);
 pub const GEMV_HFQ4G256_RESIDUAL_STAGE_X32_GFX1100_SRC: &str = concat!(
     "#define HIPFIRE_RDNA3_RESIDUAL_STAGE_X32 1\n",
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",

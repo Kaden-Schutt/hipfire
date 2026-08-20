@@ -94,7 +94,7 @@ fn gfx1100_awq_norm_direct_enabled(gpu: &Gpu, k: usize) -> bool {
     // Qwen3.6-27B K=5120 measured +2.44% over a 512-token A/B/B/A; rocprof
     // measured 14.859 -> 9.116 us/launch, and a 1025-token replay was exact.
     *FLAG.get_or_init(|| {
-        k == 5_120
+        (k == 5_120 || k == 2_560)
             && hipfire_config::developer_var("HIPFIRE_GFX1100_AWQ_NORM_DIRECT")
                 .ok()
                 .as_deref()
@@ -6765,7 +6765,17 @@ impl Gpu {
         } else {
             None
         };
-        let (src, module, func_name) = if gfx1151_k4096 {
+        static RESIDUAL_DUALROW: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            hipfire_config::developer_var("HIPFIRE_RESIDUAL_DUALROW").as_deref() == Ok("1")
+        });
+        let use_dualrow = self.arch_caps.is_gfx1100() && *RESIDUAL_DUALROW;
+        let (src, module, func_name) = if use_dualrow {
+            (
+                kernels::GEMV_HFQ4G256_RESIDUAL_DUALROW_GFX1100_SRC,
+                "gemv_hfq4g256_residual_dualrow_gfx1100",
+                "gemv_hfq4g256_residual_dualrow_gfx1100",
+            )
+        } else if gfx1151_k4096 {
             (
                 kernels::GEMV_HFQ4G256_RESIDUAL_K4096_GFX1151_SRC,
                 "gemv_hfq4g256_residual_k4096_gfx1151",
