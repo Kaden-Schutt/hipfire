@@ -57,19 +57,34 @@ architecture-neutral; each arch maps its own tensors into them. This is what
 makes a label portable — today `mq2r` on DeepSeek-V4 means lm_head *at* Q8
 while `mq4r` on Qwen3.8 means lm_head *not* at Q8, because the suffix fused a
 rung with a route and the fusion inverts per architecture.
-
 | product | roles above base width | Qwen3.8-27B bpw | current label |
 |---|---|---:|---|
-| `RX<N>-XT` | none | 4.456 | `.mq4r` |
-| `RX<N>` | lm_head | 4.657 | `.mq4` |
-| `RX<N> PRO` | lm_head + recurrent/SSM state | 4.897 | `ctl2`, `head_ssm` |
+| `RX<N>-XTX` | none — truly uniform | ~4.26 (projected) | none today |
+| `RX<N>-XT` | embeddings | 4.456 | `.mq4r` |
+| `RX<N>` | embeddings + lm_head | 4.657 | `.mq4` |
+| `RX<N> PRO` | + recurrent/SSM state | 4.897 | `ctl2`, `head_ssm` |
 
-`XT` denotes the **faster** variant, matching its GPU meaning: fewer bits, less
-memory traffic, and — because the lm_head GEMV becomes tape-eligible — the
-retained-Redline route. That is exactly what `r` already means today, so the
-suffix stops carrying a hidden quality claim. `PRO` takes the precision
-direction, borrowing AMD's own workstation idiom rather than `XTX`, which would
-promise speed while delivering the opposite.
+`XT` and `XTX` both point the **same** direction — faster, smaller, fewer
+guarantees — which is how AMD uses them. `XT` drops the lm_head to base width,
+which also makes its GEMV tape-eligible and so carries the retained-Redline
+route; that is exactly what `r` denotes today. `XTX` additionally drops the
+embedding table, leaving every weight matrix at base width. **`XTX` carries no
+quality guarantee**: it is published with measured KLD like every other rung,
+but no rung floor is asserted for it.
+
+`PRO` takes the precision direction, borrowing AMD's workstation idiom rather
+than reusing `XTX`, which would promise speed while delivering the opposite.
+
+There is deliberately **no rung above `PRO` within a bit width.** A product that
+lifts attention costs 5.162 bpw on this model and is therefore `RX5`, judged
+against 5-bit peers. The ceiling is what makes a rung mean anything: without it,
+`RX4` would enter 4-bit comparisons carrying 15% more bytes than honest 4-bit
+competitors, which is the distortion § 1 exists to prevent. Lineage ("4-bit
+base, attention lifted") belongs in the registry card, not the name.
+
+The structural F16 tensors — norms, `A_log`, `dt_bias`, AWQ scale vectors —
+are never quantized at any rung. On Qwen3.8-27B they total 679,424 elements,
+about 0.0025% of parameters, and are not a ladder axis.
 
 Rung availability is bounded by § 1. On a model where lifting attention would
 cross N+1, that rung does not exist at N bits.
