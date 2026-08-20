@@ -5020,28 +5020,16 @@ mod tests {
     }
 
     #[test]
-    fn tape_parity_accessors_agree_on_empty() {
-        // GPU-free sanity: the invariant doc says the two counts must agree.
-        // This test just proves the accessors exist and are consistent on a
-        // freshly-constructed replay controller / empty graph state.
+    fn tape_parity_accessor_starts_empty() {
+        // GPU-free sanity for the invariant documented on `Gpu`: a recording
+        // and a HipGraph capture of the same body must produce the same launch
+        // count. Only the replay side is constructible without a device, so
+        // this pins the accessor and its empty state; the real invariant is
+        // enforced on hardware by comparing `capture.launches` against the
+        // `[verify-graph] captured ... with N blobs` line.
         use crate::replay::{ReplayBackendRequest, ReplayController};
-        use crate::graph::GraphState;
         let ctrl = ReplayController::new(ReplayBackendRequest::Hip);
         assert_eq!(ctrl.recorded_launches().len(), 0);
-        let graph = GraphState {
-            capture_mode: false,
-            capture_blobs: Vec::new(),
-            graph_exec: None,
-            captured_graph: None,
-            ar_forward_blobs: Vec::new(),
-            ar_forward_kernel_dirty: false,
-            ar_forward_replay_enabled: false,
-            ar_graph_eligible: true,
-            verify: crate::graph::PerBGraphCache::default(),
-            replay: crate::graph::PerBGraphCache::default(),
-        };
-        assert_eq!(graph.capture_blobs.len(), 0);
-        assert_eq!(ctrl.recorded_launches().len(), graph.capture_blobs.len());
     }
 }
 
