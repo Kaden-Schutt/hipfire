@@ -5079,7 +5079,8 @@ fn handle_main_quant(
 
                 let tier_lift = flags
                     .product_tier
-                    .is_some_and(|t| q8_class_of(name).is_some_and(|cls| t.lifts(cls)));
+                    .is_some_and(|t| q8_class_of(name).is_some_and(|cls| t.lifts(cls)))
+                    || crate::model_filter::fixed_tier_override_applies(name);
                 if tier_lift {
                     awq_sidecar_scales = None;
                     if let Some(dt) = fixed_tier_dtype_for(name) {

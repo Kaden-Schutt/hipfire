@@ -416,8 +416,11 @@ pub(crate) fn run_gguf_pipeline(
             (q, QuantType::Q8F16, 32u32, "Q8_F16")
         } else if crate::model_filter::product_tier_cli().is_some_and(|t| {
             crate::model_filter::q8_class_of(&out_name).is_some_and(|cls| t.lifts(cls))
-        }) {
-            // Product tier lift — respects per-class codec overrides (e.g. lm_head:mq6v2) and uses real encoder.
+        }) || crate::model_filter::fixed_tier_override_applies(&out_name)
+        {
+            // Product tier lift and/or explicit --fixed-tier / HIPFIRE_FIXED_TIER
+            // entry. Codec overrides (e.g. attn_full:mq6v2) apply even when the
+            // ProductTier does not lift that class; missing override => Q8.
             let f32_data = gguf_input::tensor_to_f32(info, raw);
             quant_params += n_elements as u64;
             if let Some(dt) = crate::model_filter::fixed_tier_dtype_for(&out_name) {
