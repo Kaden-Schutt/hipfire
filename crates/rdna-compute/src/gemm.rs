@@ -26288,6 +26288,66 @@ impl Gpu {
         result
     }
 
+    /// MQ4 v2 (qt 44) — gfx11 (RDNA3/3.5) residual WMMA.
+    /// Sister of `gemm_hfq4g256_residual_wmma_gfx12_mq4v2` but with gfx11
+    /// WMMA contracts (half16, w32, interleaved C). Distinct source/symbol/module
+    /// so admitting gfx11 cannot alter the certified gfx12 code object.
+    pub fn gemm_mq4g256v2_residual_wmma(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let kname = "gemm_mq4g256v2_residual_wmma";
+        let ksrc = kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_SRC;
+        self.ensure_kernel(kname, ksrc, kname)?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x_f16_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+        let row_tiles = (m + 15) / 16;
+        let batch_tiles = (batch_size + 15) / 16;
+        let bytes =
+            crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * k * 2 + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kname, bytes);
+        let result = self.launch_maybe_blob(
+            kname,
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(bs_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// MQ4 v2 (qt 44) — dedicated v2 source `FUSED_QKVZA_MQ4G256V2_SRC`.
     /// Module = v1 + `_mq4v2`, func = v2 symbol `fused_qkvza_mq4g256v2`.
     pub fn fused_qkvza_hfq4g256_mq4v2(
@@ -26702,9 +26762,12 @@ impl Gpu {
         if self.arch_caps.has_wmma_w32_gfx12() {
             return self.gemm_hfq4g256_residual_wmma_gfx12_mq4v2(a_raw, x, y, m, k, batch_size);
         }
+        if self.arch_caps.has_wmma_w32() {
+            return self.gemm_mq4g256v2_residual_wmma(a_raw, x, y, m, k, batch_size);
+        }
         Err(hip_bridge::HipError::new(
             0,
-            "gemm_hfq4g256_residual_mq4v2: gfx1201 required",
+            "gemm_hfq4g256_residual_mq4v2: gfx1201 or gfx11 wmma required",
         ))
     }
 
@@ -26741,8 +26804,8 @@ impl Gpu {
     /// fp16 cache stomp, memset zero, gfx12 vs gfx11 dispatch, and the
     /// gfx1100 rm muse gate. Only the v2 SRC constant, `gemm_mq4g256v2` module
     /// name, and `gemm_mq4g256v2` kernel symbol change where a v2 source exists.
-    /// The v2 WMMA residual source exists for gfx12; the generic scalar fallback
-    /// and the gfx11 wmma/muse paths have no v2 source and return HipError.
+    /// Dedicated V2 WMMA residual sources exist for gfx12 and gfx11; the
+    /// generic scalar fallback remains intentionally unavailable.
     pub fn gemm_mq4g256v2_batched_lmhead(
         &mut self,
         a_raw: &GpuTensor,
@@ -26768,25 +26831,23 @@ impl Gpu {
                     .memset_async(&y.buf, 0, batch_size * m * 4, stream)?,
                 None => self.hip.memset(&y.buf, 0, batch_size * m * 4)?,
             }
-            // gfx12 has a dedicated v2 WMMA residual source
             if self.arch.starts_with("gfx12") {
                 return self.gemm_hfq4g256_residual_wmma_gfx12_mq4v2(a_raw, x, y, m, k, batch_size);
-            } else {
-                // gfx11 wmma and muse paths: no v2 source (only GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX12_SRC exists)
-                // Check muse gate exactly as v1 does, but with v2 error
-                if self.arch_caps.is_gfx1100() && m == 19_968 && k == 6_656 && batch_size == 192 {
-                    return Err(hip_bridge::HipError::new(
-                        0,
-                        "qt=44 gemm_mq4g256v2_batched_lmhead: gfx1100 muse rm path has no v2 source \
-                         (only GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX12_SRC for gfx12 exists)",
-                    ));
-                }
+            }
+            if self.arch_caps.has_wmma_w32() {
+                return self.gemm_mq4g256v2_residual_wmma(a_raw, x, y, m, k, batch_size);
+            }
+            if self.arch_caps.is_gfx1100() && m == 19_968 && k == 6_656 && batch_size == 192 {
                 return Err(hip_bridge::HipError::new(
                     0,
-                    "qt=44 gemm_mq4g256v2_batched_lmhead: gfx11 wmma path has no v2 source \
+                    "qt=44 gemm_mq4g256v2_batched_lmhead: gfx1100 muse rm path has no v2 source \
                      (only GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX12_SRC for gfx12 exists)",
                 ));
             }
+            return Err(hip_bridge::HipError::new(
+                0,
+                "qt=44 gemm_mq4g256v2_batched_lmhead: no WMMA source for this arch",
+            ));
         }
         Err(hip_bridge::HipError::new(
             0,

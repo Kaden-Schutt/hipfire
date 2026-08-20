@@ -2920,6 +2920,14 @@ pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma.gfx12.hip");
 pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_wmma.gfx12.hip");
+/// gfx11 (RDNA3 / RDNA3.5) MQ4V2 residual WMMA — sister of
+/// GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX12_SRC. Same dual-half header contract
+/// (136 B groups, [s0,z0,s1,z1] fp16 headers, payload +8, kt<8 half0) but
+/// gfx11 WMMA contracts (half16_t A/B, __builtin_amdgcn_wmma_f32_16x16x16_f16_w32,
+/// interleaved C mapping `acc[j]=C[2*j+(tid>>4)][tid&15]`). Distinct file so
+/// admitting RDNA3 cannot alter the certified gfx12 code object.
+pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_wmma.hip");
 pub const GEMM_MQ5G256V2_RESIDUAL_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq5g256v2_residual_wmma.gfx12.hip");
 pub const GEMM_MQ6G256V2_RESIDUAL_WMMA_GFX12_SRC: &str =
