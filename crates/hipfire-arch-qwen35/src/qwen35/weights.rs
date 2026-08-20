@@ -196,6 +196,12 @@ pub(crate) fn dtype_from_quant_type(qt: u8) -> HipResult<DType> {
         41 => Ok(DType::BQ1G128),
         44 => Ok(DType::MQ4G256V2),
         45 => Ok(DType::MQ4CG256),
+        // Neutral-size Magnum V2 family (qt47-50): preserve qtype distinction
+        // through WeightTensor/GpuTensor; do not map to legacy MQ2/3/5/6.
+        47 => Ok(DType::MQ6G256V2),
+        48 => Ok(DType::MQ5G256V2),
+        49 => Ok(DType::MQ3G256V2),
+        50 => Ok(DType::MQ2G256V2),
         // qt=6 (HFQ4G256) and qt=37 (MFP2G32E8) are shipped formats and MUST stay
         // mapped here. Dropping an arm from this match is not a compile error — it
         // degrades to "graded EP: unsupported quant_type", so the loss stays
@@ -1805,5 +1811,24 @@ mod tests {
         // here every later expert differs from expert[0].
         let tiers = vec![DType::MQ4G256, DType::MQ6G256, DType::MQ6G256];
         assert_eq!(mixed_tier_table(tiers.clone()), Some(tiers));
+    }
+
+    #[test]
+    fn dtype_from_quant_type_neutral_v2_one_to_one() {
+        // Each qt maps one-to-one to its V2 DType and exact block bytes;
+        // V2 DTypes are distinct from legacy MQ2/3/5/6.
+        assert_eq!(dtype_from_quant_type(47).unwrap(), DType::MQ6G256V2);
+        assert_eq!(dtype_from_quant_type(48).unwrap(), DType::MQ5G256V2);
+        assert_eq!(dtype_from_quant_type(49).unwrap(), DType::MQ3G256V2);
+        assert_eq!(dtype_from_quant_type(50).unwrap(), DType::MQ2G256V2);
+        // Legacy unchanged.
+        assert_eq!(dtype_from_quant_type(15).unwrap(), DType::MQ6G256);
+        assert_ne!(dtype_from_quant_type(47).unwrap(), DType::MQ6G256);
+        assert_ne!(dtype_from_quant_type(49).unwrap(), DType::MQ3G256);
+        // Bad qt fails closed.
+        assert!(dtype_from_quant_type(99).is_err());
+        // qt44/45 still map to their V2/C DTypes.
+        assert_eq!(dtype_from_quant_type(44).unwrap(), DType::MQ4G256V2);
+        assert_eq!(dtype_from_quant_type(45).unwrap(), DType::MQ4CG256);
     }
 }

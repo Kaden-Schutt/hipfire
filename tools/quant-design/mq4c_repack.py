@@ -1,396 +1,351 @@
 #!/usr/bin/env python3
-"""Repack qt=13 (MQ4G256, 136 B/group) tensors to qt=45 (MQ4C pad, 136 B/group).
+"""Repack a qt=13 (MQ4G256, 136 B/group) artifact to qt=45 (MQ4C pad, 136 B/group).
 
-Pure header rewrite on a canonical HFQM container — no re-quantization:
+This is a PURE HEADER REWRITE. It needs no parent model, no imatrix, no
+re-quantization, and it changes not one nibble:
 
-    read  136 B: [f32 scale][f32 zero][128 B nibbles]
-    write 136 B: [fp16 scale][fp16 zero][4 zero pad][128 B nibbles unchanged]
+    read  136 B interleaved: [f32 scale][f32 zero][128 B nibbles]  (per group, v1)
+    write 136 B interleaved pad: [0..4) fp16 header, [4..8) zero padding, [8..136) 128 B nibbles
+      where for linear group idx i = row*gpr+g (gpr=K/256):
+        header dword at A + i*136         : packed low fp16 scale, high fp16 zero
+        zero padding at A + i*136 + 4     : 4 zero bytes
+        payload at    A + i*136 + 8       : 128 B nibbles verbatim (same offset as v1)
+    total per tensor is n*136 = m*gpr*136, the SAME SIZE as v1 so MQ4C_GROUP_BYTES=136.
+    The 4 padding bytes are the deliberate price of putting the payload at +8 where v1
+    has it, because a 132 B stride left the payload 4-byte aligned half the time. The
+    2.43% size win of the earlier planar layout is deliberately given up — this repack
+    is a SAME-SIZE transform (136 -> 136) that trades size for alignment and speed.
 
-Canonical HFQM (32-byte header):
-    magic b"HFQM"; u32 version, arch, tensor_count;
-    u64 metadata_offset, data_offset.
-Metadata JSON ends at its matching top-level brace; the packed index follows:
-    u32 count; entries u16 name_len/name/u8 qt/u8 ndim/ndim*u32 shape/
-    u32 group_size/u64 data_len. Tensor payloads are contiguous from data_offset.
+Rounding the v1 f32 header to fp16 perturbs reconstructed weights relative to
+v1. A nibble re-fit changes a code only when that drift reaches 0.5
+quantization steps on the v1.5 grid. fp16 round-trip safety for scales is
+checked per artifact: a positive finite f32 scale that becomes non-positive or
+non-finite in fp16 is refused (subnormal-but-nonzero fp16 remains valid).
+
+This script checks those invariants for every converted group and refuses
+rather than silently emitting an invalid artifact.
+
+This is now SAME-SIZE: 136 -> 136, so it saves 0 bytes. The earlier 95M-group saving
+of 380,477,440 B (2.43% file) no longer applies — alignment is bought with those bytes.
 
 Usage: mq4c_repack.py IN.mq4 OUT.mq4c [--limit-tensors N]
 """
-from __future__ import annotations
+import struct, sys, numpy as np
 
-import argparse
-import os
-import struct
-import sys
-import tempfile
-from dataclasses import dataclass
-from pathlib import Path
-from typing import BinaryIO, Iterable, List, Optional, Sequence, Tuple
-
-import numpy as np
-
-GROUP_BYTES = 136
-NIBBLE_BYTES = 128
+V1_BYTES = 136
+V15_BYTES = 136
 QT_V1 = 13
 QT_V15 = 45
-HFQM_MAGIC = b"HFQM"
-HEADER_BYTES = 32
-# Refuse at the nibble re-fit boundary: drift >= 0.5 can flip a code.
+F16_MIN_NORMAL = 6.103515625e-05
+F16_MIN_SUBNORMAL = 5.960464477539063e-08  # 2**-24; smallest positive fp16
+# A nibble re-fit changes a code only when the v1 reconstruction drifts a full 0.5
+# steps on the v1.5 grid. Refuse AT that boundary -- below it the rewrite is exactly
+# equivalent to a re-fit, at or above it is not.
+#
+# The margin here is much thinner than a 6-tensor sample suggested. That sample found
+# a max drift of 0.011 steps; over the whole of q38.ctl.mq4 the real maximum is
+# ~0.26 (layers.10.linear_attn.in_proj_qkv). Still no flips, but a 1.9x margin rather
+# than 45x -- so this must be CHECKED per artifact, never assumed.
 DRIFT_REFUSE = 0.5
 DRIFT_WARN = 0.25
-# Stream groups in bounded chunks (bytes ≈ CHUNK_GROUPS * 136).
-CHUNK_GROUPS = 4096
 
 
-class HfqmError(Exception):
-    """Fatal HFQM parse / validation / I/O error."""
-
-
-@dataclass
-class TensorEntry:
-    name: str
-    qt: int
-    qt_pos: int
-    ndim: int
-    shape: Tuple[int, ...]
-    group_size: int
-    data_len: int
-    data_off: int
-
-
-@dataclass
-class HfqmIndex:
-    version: int
-    arch: int
-    tensor_count: int
-    metadata_offset: int
-    data_offset: int
-    entries: List[TensorEntry]
-    # Absolute end of the packed index (may be < data_offset due to alignment pad).
-    index_end: int
-
-
-def _require(cond: bool, msg: str) -> None:
-    if not cond:
-        raise HfqmError(msg)
-
-
-def _json_top_level_end(buf: bytes, start: int, limit: int) -> int:
-    """Return absolute offset one past the matching top-level '}' of JSON at start."""
-    _require(start < limit, "metadata_offset past readable prefix")
-    brace = 0
-    in_str = False
-    esc = False
-    i = start
-    while i < limit:
+def _json_end(buf, start, end):
+    """Return exclusive end offset of a balanced top-level JSON object in buf[start:end]."""
+    brace_depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, end):
         b = buf[i]
-        if esc:
-            esc = False
-            i += 1
+        if escape:
+            escape = False
             continue
-        if b == 0x5C and in_str:  # backslash
-            esc = True
-            i += 1
+        if b == 0x5C and in_string:  # backslash
+            escape = True
             continue
         if b == 0x22:  # quote
-            in_str = not in_str
-            i += 1
+            in_string = not in_string
             continue
-        if not in_str:
-            if b == 0x7B:  # {
-                brace += 1
-            elif b == 0x7D:  # }
-                brace -= 1
-                if brace == 0:
-                    return i + 1
-                _require(brace > 0, "metadata JSON brace underflow")
-        i += 1
-    raise HfqmError("metadata JSON missing matching top-level brace")
+        if in_string:
+            continue
+        if b == 0x7B:  # {
+            brace_depth += 1
+        elif b == 0x7D:  # }
+            brace_depth -= 1
+            if brace_depth == 0:
+                return i + 1
+    raise AssertionError("metadata JSON not brace-terminated")
 
 
-def parse_hfqm_index(path: Path) -> HfqmIndex:
-    """Parse and bounds-check the canonical 32-byte HFQM header + index."""
-    size = path.stat().st_size
-    _require(size >= HEADER_BYTES, f"file shorter than HFQM header ({size} < {HEADER_BYTES})")
+def read_index(path):
+    """Parse HFQM (or legacy HFQ\\0) header+metadata+index, bounded to [0:data_offset].
 
-    with path.open("rb") as f:
-        head = f.read(HEADER_BYTES)
-    _require(len(head) == HEADER_BYTES, "truncated HFQM header")
-    magic = head[0:4]
-    _require(magic == HFQM_MAGIC, f"bad magic {magic!r}, expected {HFQM_MAGIC!r}")
-
-    version, arch, tensor_count = struct.unpack_from("<III", head, 4)
-    metadata_offset, data_offset = struct.unpack_from("<QQ", head, 16)
-    _require(metadata_offset >= HEADER_BYTES, f"metadata_offset {metadata_offset} inside header")
-    _require(metadata_offset <= data_offset, "metadata_offset past data_offset")
-    _require(data_offset <= size, f"data_offset {data_offset} past EOF {size}")
-
-    # Prefix holds header + metadata + index + optional alignment padding.
-    with path.open("rb") as f:
-        prefix = f.read(data_offset)
-    _require(len(prefix) == data_offset, "truncated HFQM prefix")
-
-    json_end = _json_top_level_end(prefix, metadata_offset, data_offset)
-    pos = json_end
-    _require(pos + 4 <= data_offset, "index count past data_offset")
-    (idx_n,) = struct.unpack_from("<I", prefix, pos)
-    pos += 4
-    _require(
-        idx_n == tensor_count,
-        f"index count {idx_n} != header tensor_count {tensor_count}",
-    )
-
-    entries: List[TensorEntry] = []
-    data_cur = data_offset
-    for i in range(idx_n):
-        _require(pos + 2 <= data_offset, f"tensor {i}: name_len past data_offset")
-        (name_len,) = struct.unpack_from("<H", prefix, pos)
-        pos += 2
-        _require(pos + name_len <= data_offset, f"tensor {i}: name past data_offset")
-        name = prefix[pos : pos + name_len].decode("utf-8")
-        pos += name_len
-        _require(pos + 2 <= data_offset, f"tensor {i}: qt/ndim past data_offset")
-        qt_pos = pos
-        qt = prefix[pos]
-        pos += 1
-        ndim = prefix[pos]
-        pos += 1
-        need = 4 * ndim + 4 + 8
-        _require(pos + need <= data_offset, f"tensor {i}: shape/gs/data_len past data_offset")
-        shape = struct.unpack_from("<" + "I" * ndim, prefix, pos) if ndim else ()
-        pos += 4 * ndim
-        (group_size,) = struct.unpack_from("<I", prefix, pos)
-        pos += 4
-        (data_len,) = struct.unpack_from("<Q", prefix, pos)
-        pos += 8
-        _require(data_cur + data_len <= size, f"tensor {i} ({name!r}): data past EOF")
-        entries.append(
-            TensorEntry(
-                name=name,
-                qt=qt,
-                qt_pos=qt_pos,
-                ndim=ndim,
-                shape=tuple(shape),
-                group_size=group_size,
-                data_len=int(data_len),
-                data_off=data_cur,
+    Returns buf = bytearray of exactly bytes [0:data_offset] so the caller can
+    write it as the output placeholder and patch qt/ds in-place. Never loads
+    tensor payloads.
+    """
+    with open(path, "rb") as f:
+        magic = f.read(4)
+        assert len(magic) == 4, "truncated header"
+        if magic == b"HFQM":
+            rest = f.read(28)
+            assert len(rest) == 28, "truncated HFQM header"
+            header = magic + rest
+            version = struct.unpack_from("<I", header, 4)[0]
+            arch_id = struct.unpack_from("<I", header, 8)[0]
+            n_tensors = struct.unpack_from("<I", header, 12)[0]
+            metadata_offset = struct.unpack_from("<Q", header, 16)[0]
+            data_offset = struct.unpack_from("<Q", header, 24)[0]
+            assert metadata_offset >= 32, f"metadata_offset {metadata_offset} < 32"
+            assert metadata_offset <= data_offset, (
+                f"metadata_offset {metadata_offset} > data_offset {data_offset}"
             )
-        )
-        data_cur += int(data_len)
-    _require(
-        data_cur == size,
-        f"indexed tensor data ends at {data_cur}, but file size is {size}; "
-        "refusing to drop or reinterpret trailing bytes",
-    )
+            assert data_offset >= 32, f"data_offset {data_offset} too small"
+            f.seek(0)
+            buf = bytearray(f.read(data_offset))
+            assert len(buf) == data_offset, (
+                f"truncated HFQM prefix: need {data_offset}, got {len(buf)}"
+            )
 
-    return HfqmIndex(
-        version=version,
-        arch=arch,
-        tensor_count=tensor_count,
-        metadata_offset=metadata_offset,
-        data_offset=data_offset,
-        entries=entries,
-        index_end=pos,
-    )
+            json_end = _json_end(buf, metadata_offset, data_offset)
+            off = json_end
+            assert off + 4 <= data_offset, "index count crosses data_offset"
+            idx_n = struct.unpack_from("<I", buf, off)[0]
+            off += 4
+            assert idx_n == n_tensors, (
+                f"index count {idx_n} != header n_tensors {n_tensors}"
+            )
+
+            entries = []
+            for _ in range(n_tensors):
+                assert off + 2 <= data_offset, "name_len crosses data_offset"
+                name_len = struct.unpack_from("<H", buf, off)[0]
+                off += 2
+                assert off + name_len <= data_offset, "name crosses data_offset"
+                name = bytes(buf[off:off + name_len]).decode()
+                off += name_len
+                assert off + 2 <= data_offset, "qt/ndim crosses data_offset"
+                qt_pos = off
+                qt = buf[off]
+                off += 1
+                ndim = buf[off]
+                off += 1
+                assert off + ndim * 4 <= data_offset, "dims cross data_offset"
+                shape = []
+                for __ in range(ndim):
+                    shape.append(struct.unpack_from("<I", buf, off)[0])
+                    off += 4
+                assert off + 4 + 8 <= data_offset, "group_size/ds crosses data_offset"
+                off += 4  # group_size (unused by repack)
+                ds_pos = off
+                ds = struct.unpack_from("<Q", buf, off)[0]
+                off += 8
+                entries.append(dict(
+                    name=name, qt=qt, ds=ds, qt_pos=qt_pos, ds_pos=ds_pos, shape=shape,
+                ))
+            assert off <= data_offset, "index overrun past data_offset"
+
+            cur = data_offset
+            for e in entries:
+                e["off"] = cur
+                cur += e["ds"]
+            return buf, magic, version, arch_id, metadata_offset, data_offset, entries
+
+        if magic == b"HFQ\x00":
+            # Legacy layout: 4+4+4+8+8+8 = 36-byte fixed header, then dense index.
+            rest = f.read(32)
+            assert len(rest) == 32, "truncated legacy HFQ header"
+            header = magic + rest
+            version = struct.unpack_from("<I", header, 4)[0]
+            arch_id = struct.unpack_from("<I", header, 8)[0]
+            metadata_offset = struct.unpack_from("<Q", header, 12)[0]
+            data_offset = struct.unpack_from("<Q", header, 20)[0]
+            n_tensors = struct.unpack_from("<Q", header, 28)[0]
+            assert data_offset >= 36, f"legacy data_offset {data_offset} too small"
+            f.seek(0)
+            buf = bytearray(f.read(data_offset))
+            assert len(buf) == data_offset, (
+                f"truncated legacy HFQ prefix: need {data_offset}, got {len(buf)}"
+            )
+            off = 36
+            entries = []
+            for _ in range(n_tensors):
+                assert off + 8 <= data_offset, "legacy name_len crosses data_offset"
+                name_len = struct.unpack_from("<Q", buf, off)[0]
+                off += 8
+                assert off + name_len <= data_offset, "legacy name crosses data_offset"
+                name = bytes(buf[off:off + name_len]).decode()
+                off += name_len
+                assert off + 1 + 8 + 8 + 8 <= data_offset, "legacy entry crosses data_offset"
+                qt_pos = off
+                qt = buf[off]
+                off += 1
+                ds_pos = off
+                ds = struct.unpack_from("<Q", buf, off)[0]
+                off += 8
+                off += 8  # stored file offset (unused; recompute from data_offset)
+                ndim = struct.unpack_from("<Q", buf, off)[0]
+                off += 8
+                assert off + ndim * 8 <= data_offset, "legacy dims cross data_offset"
+                shape = []
+                for __ in range(ndim):
+                    shape.append(struct.unpack_from("<Q", buf, off)[0])
+                    off += 8
+                entries.append(dict(
+                    name=name, qt=qt, ds=ds, qt_pos=qt_pos, ds_pos=ds_pos, shape=shape,
+                ))
+            assert off <= data_offset, "legacy index overrun past data_offset"
+            cur = data_offset
+            for e in entries:
+                e["off"] = cur
+                cur += e["ds"]
+            return buf, magic, version, arch_id, metadata_offset, data_offset, entries
+
+        raise AssertionError(f"bad magic {magic!r}; expected HFQM or legacy HFQ\\0")
 
 
-def select_qt13(entries: Sequence[TensorEntry], limit: Optional[int]) -> List[TensorEntry]:
-    """All qt=13 tensors, or only the first N qt=13 tensors when limit is set."""
-    qt13 = [e for e in entries if e.qt == QT_V1]
-    if limit is None:
-        return list(qt13)
-    if limit < 0:
-        raise HfqmError(f"--limit-tensors must be >= 0, got {limit}")
-    return qt13[:limit]
 
+def repack(src, dst, limit=None):
+    import os
+    import tempfile
 
-def _validate_chunk(raw: np.ndarray, tensor_name: str) -> Tuple[float, float]:
-    """Validate one (n, 136) uint8 chunk. Returns (worst_drift, min_scale)."""
-    n = raw.shape[0]
-    if n == 0:
-        return 0.0, float("inf")
-    s32 = raw[:, 0:4].copy().view(np.float32).ravel()
-    z32 = raw[:, 4:8].copy().view(np.float32).ravel()
-    nib = raw[:, 8:GROUP_BYTES]
+    buf, magic, version, arch_id, meta_off, data_off, entries = read_index(src)
+    n_v1 = sum(1 for e in entries if e["qt"] == QT_V1)
+    print(f"{src}: {len(entries)} tensors, {n_v1} at qt={QT_V1}")
+    if n_v1 == 0:
+        print("nothing to repack"); return 1
 
-    if not np.isfinite(s32).all():
-        raise HfqmError(f"tensor {tensor_name!r}: non-finite f32 scale")
-    if not np.isfinite(z32).all():
-        raise HfqmError(f"tensor {tensor_name!r}: non-finite f32 zero")
-    if not (s32 > 0).all():
-        raise HfqmError(f"tensor {tensor_name!r}: non-positive f32 scale")
-
-    s16 = s32.astype(np.float16)
-    z16 = z32.astype(np.float16)
-    s16f = s16.astype(np.float32)
-    z16f = z16.astype(np.float32)
-
-    if not np.isfinite(s16f).all():
-        raise HfqmError(f"tensor {tensor_name!r}: non-finite f16 scale")
-    if not np.isfinite(z16f).all():
-        raise HfqmError(f"tensor {tensor_name!r}: non-finite f16 zero")
-    if not (s16f > 0).all():
-        raise HfqmError(f"tensor {tensor_name!r}: non-positive f16 scale")
-
-    # Drift of the v1 reconstruction onto the fp16 affine grid, in code steps.
-    q = np.empty((n, 256), dtype=np.float32)
-    q[:, 0::2] = (nib & 0x0F).astype(np.float32)
-    q[:, 1::2] = (nib >> 4).astype(np.float32)
-    d = (z32 - z16f)[:, None] + q * (s32 - s16f)[:, None]
-    ad = np.abs(d / s16f[:, None])
-    worst = float(ad.max()) if ad.size else 0.0
-    if worst >= DRIFT_REFUSE:
-        raise HfqmError(
-            f"tensor {tensor_name!r}: drift {worst:.4f} steps at/over {DRIFT_REFUSE} guard; "
-            f"pure header rewrite is not equivalent to a re-fit"
-        )
-    return worst, float(s32.min())
-
-
-def _transform_chunk(raw: np.ndarray) -> bytes:
-    """v1 group rows -> pad layout rows (same 136 B stride)."""
-    n = raw.shape[0]
-    s32 = raw[:, 0:4].copy().view(np.float32).ravel()
-    z32 = raw[:, 4:8].copy().view(np.float32).ravel()
-    nib = raw[:, 8:GROUP_BYTES]
-    s16 = s32.astype(np.float16)
-    z16 = z32.astype(np.float16)
-    hdr = np.empty((n, 4), dtype=np.uint8)
-    hdr[:, 0:2] = np.frombuffer(np.ascontiguousarray(s16).tobytes(), dtype=np.uint8).reshape(n, 2)
-    hdr[:, 2:4] = np.frombuffer(np.ascontiguousarray(z16).tobytes(), dtype=np.uint8).reshape(n, 2)
-    pad = np.zeros((n, 4), dtype=np.uint8)
-    interleaved = np.concatenate([hdr, pad, nib], axis=1)
-    return interleaved.tobytes()
-
-
-def _iter_group_chunks(fi: BinaryIO, data_off: int, data_len: int) -> Iterable[np.ndarray]:
-    _require(data_len % GROUP_BYTES == 0, f"data_len {data_len} not divisible by {GROUP_BYTES}")
-    n_groups = data_len // GROUP_BYTES
-    fi.seek(data_off)
-    remaining = n_groups
-    while remaining:
-        take = min(CHUNK_GROUPS, remaining)
-        blob = fi.read(take * GROUP_BYTES)
-        _require(len(blob) == take * GROUP_BYTES, "truncated tensor payload")
-        yield np.frombuffer(blob, dtype=np.uint8).reshape(take, GROUP_BYTES).copy()
-        remaining -= take
-
-
-def validate_selected(src: Path, selected: Sequence[TensorEntry]) -> Tuple[float, float, int]:
-    """Stream-validate every selected group before any destination write."""
+    header = bytearray(buf)  # index is rewritten in place below
     worst_drift = 0.0
-    min_scale = float("inf")
-    groups = 0
-    with src.open("rb") as fi:
-        for e in selected:
-            _require(
-                e.data_len % GROUP_BYTES == 0,
-                f"tensor {e.name!r}: data_len {e.data_len} not divisible by {GROUP_BYTES}",
-            )
-            for chunk in _iter_group_chunks(fi, e.data_off, e.data_len):
-                d, s = _validate_chunk(chunk, e.name)
-                worst_drift = max(worst_drift, d)
-                min_scale = min(min_scale, s)
-                groups += chunk.shape[0]
-                if DRIFT_WARN <= d < DRIFT_REFUSE:
-                    print(
-                        f"  note: {e.name!r} chunk drifts {d:.4f} steps "
-                        f"(no flip, boundary {DRIFT_REFUSE})"
-                    )
-    return worst_drift, min_scale, groups
+    min_scale = np.inf
+    groups_done = 0
+    flips = 0
+    # qt_pos of entries actually converted this run (limit / non-qt13 leave these alone)
+    converted_qt_pos = []
 
-
-def _copy_bytes(fi: BinaryIO, fo: BinaryIO, nbytes: int, bufsize: int = 8 * 1024 * 1024) -> None:
-    left = nbytes
-    while left:
-        chunk = fi.read(min(bufsize, left))
-        if not chunk:
-            raise HfqmError("unexpected EOF while copying")
-        fo.write(chunk)
-        left -= len(chunk)
-
-
-def repack(src: str | Path, dst: str | Path, limit: Optional[int] = None) -> int:
-    src_path = Path(src)
-    dst_path = Path(dst)
-    idx = parse_hfqm_index(src_path)
-    selected = select_qt13(idx.entries, limit)
-    selected_ids = {id(e) for e in selected}
-    n_v1 = sum(1 for e in idx.entries if e.qt == QT_V1)
-    print(f"{src_path}: {len(idx.entries)} tensors, {n_v1} at qt={QT_V1}, converting {len(selected)}")
-    if not selected:
-        print("nothing to repack")
-        return 1
-
-    # Full validation before creating/replacing the destination.
-    worst_drift, min_scale, groups_done = validate_selected(src_path, selected)
-
-    # Build patched prefix: header/metadata/index/alignment byte-identical except qt bytes.
-    with src_path.open("rb") as fi:
-        prefix = bytearray(fi.read(idx.data_offset))
-    _require(len(prefix) == idx.data_offset, "truncated prefix on write pass")
-    for e in selected:
-        prefix[e.qt_pos] = QT_V15
-
-    dst_path.parent.mkdir(parents=True, exist_ok=True)
-    # Temp lives in the destination directory so os.replace stays atomic on same FS.
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=f".{dst_path.name}.",
-        suffix=".tmp",
-        dir=str(dst_path.parent),
+    # Same-size 136→136: data sizes and offsets stay unchanged; do not rewrite ds.
+    dst_dir = os.path.dirname(os.path.abspath(dst)) or "."
+    tmp_fd, tmp_path = tempfile.mkstemp(
+        prefix=".mq4c_repack_", suffix=".tmp", dir=dst_dir
     )
-    tmp_path = Path(tmp_name)
     try:
-        with os.fdopen(fd, "wb") as fo, src_path.open("rb") as fi:
-            fo.write(prefix)
-            # Preserve any gap is already in prefix (alignment to data_offset).
-            for e in idx.entries:
-                if id(e) in selected_ids:
-                    for chunk in _iter_group_chunks(fi, e.data_off, e.data_len):
-                        fo.write(_transform_chunk(chunk))
-                else:
-                    fi.seek(e.data_off)
-                    _copy_bytes(fi, fo, e.data_len)
-            fo.flush()
-            os.fsync(fo.fileno())
-        os.replace(tmp_path, dst_path)
-    except Exception:
-        try:
-            if tmp_path.exists():
-                tmp_path.unlink()
-        except OSError:
-            pass
-        raise
+        with open(src, "rb") as fi, os.fdopen(tmp_fd, "wb") as fo:
+            tmp_fd = -1  # ownership transferred to fo
+            fo.write(bytes(header))  # placeholder; index patched after
+            n_converted = 0
+            for ei, e in enumerate(entries):
+                if e["qt"] != QT_V1:
+                    fi.seek(e["off"]); fo.write(fi.read(e["ds"])); continue
+                # Distinguish limit is None (unlimited) from limit == 0 (convert none).
+                if limit is not None and n_converted >= limit:
+                    fi.seek(e["off"]); fo.write(fi.read(e["ds"])); continue
 
-    a, b = src_path.stat().st_size, dst_path.stat().st_size
-    print(f"groups repacked : {groups_done:,}")
-    print(f"max drift       : {worst_drift:.6f} steps   (flip boundary {DRIFT_REFUSE})")
-    print(f"min f32 scale   : {min_scale:.3e}")
-    print(f"bytes           : {a:,} -> {b:,}")
-    print("OK: pure header rewrite, every nibble preserved (pad layout).")
-    return 0
+                n = e["ds"] // V1_BYTES
+                fi.seek(e["off"])
+                raw = np.frombuffer(fi.read(n * V1_BYTES), dtype=np.uint8).reshape(n, V1_BYTES)
+                s32 = raw[:, 0:4].copy().view(np.float32).ravel()
+                z32 = raw[:, 4:8].copy().view(np.float32).ravel()
+                nib = raw[:, 8:V1_BYTES]
 
+                s16 = np.float16(s32); z16 = np.float16(z32)
+                s16f = np.float32(s16); z16f = np.float32(z16)
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("src", type=Path, help="input HFQM (.mq4) path")
-    parser.add_argument("dst", type=Path, help="output HFQM (.mq4c) path")
-    parser.add_argument(
-        "--limit-tensors",
-        type=int,
-        default=None,
-        metavar="N",
-        help="convert only the first N qt=13 tensors (default: all)",
-    )
-    args = parser.parse_args(argv)
-    try:
-        return repack(args.src, args.dst, args.limit_tensors)
-    except HfqmError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
-    except OSError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
+                # Fail closed: positive finite f32 scale must stay positive finite in fp16.
+                # Subnormal-but-nonzero fp16 is valid; only underflow-to-zero / non-finite fails.
+                src_live = np.isfinite(s32) & (s32 > 0)
+                fp16_bad = src_live & (~np.isfinite(s16f) | (s16f <= 0))
+                if fp16_bad.any():
+                    n_bad = int(fp16_bad.sum())
+                    min_bad = float(s32[fp16_bad].min())
+                    print(f"REFUSING: tensor '{e['name']}' has {n_bad} positive finite "
+                          f"scale(s) that round to non-positive/non-finite fp16 "
+                          f"(min source scale {min_bad:.3e}).")
+                    return 4
+
+                live = s16f > 0
+                if live.any():
+                    q = np.empty((int(live.sum()), 256), dtype=np.float32)
+                    nl = nib[live]
+                    q[:, 0::2] = (nl & 0x0F); q[:, 1::2] = (nl >> 4)
+                    d = (z32[live] - z16f[live])[:, None] + q * (s32[live] - s16f[live])[:, None]
+                    ad = np.abs(d / s16f[live][:, None])
+                    worst_drift = max(worst_drift, float(ad.max()))
+                    flips += int((ad >= 0.5).sum())
+                    min_scale = min(min_scale, float(s32[live].min()))
+                    if ad.max() >= DRIFT_WARN and ad.max() < DRIFT_REFUSE:
+                        print(f"  note: '{e['name'][:60]}' drifts {ad.max():.4f} steps "
+                              f"(no flip, boundary 0.5)")
+                    if ad.max() >= DRIFT_REFUSE:
+                        print(f"REFUSING: tensor '{e['name']}' drifts {ad.max():.4f} steps, "
+                              f"at/over the {DRIFT_REFUSE} guard. A pure header rewrite is "
+                              f"NOT equivalent to a re-fit on this model; do not ship this "
+                              f"artifact.")
+                        return 2
+
+                # Pad layout: per group 136 B: [0..4) header dword, [4..8) zeros, [8..136) nibbles
+                # payload at +8 is exactly where v1 puts it; stride 136 same as v1.
+                assert n * V15_BYTES == n * 136, "pad size invariant"
+                hdr = np.empty((n, 4), dtype=np.uint8)
+                hdr[:, 0:2] = np.frombuffer(s16.tobytes(), dtype=np.uint8).reshape(n, 2)
+                hdr[:, 2:4] = np.frombuffer(z16.tobytes(), dtype=np.uint8).reshape(n, 2)
+                payload = nib  # (n, 128) verbatim
+                assert payload.nbytes == n * 128
+                assert hdr.nbytes == n * 4
+                # Interleaved write: header + 4 zero pad + payload per group
+                pad = np.zeros((n, 4), dtype=np.uint8)
+                # Build interleaved groups: 4+4+128 =136 per group
+                # Use numpy concatenation per group would be heavy; write in loop in chunks
+                # For speed, interleave via concatenation of (hdr, pad, payload) along axis 1
+                interleaved = np.concatenate([hdr, pad, payload], axis=1)  # (n, 136)
+                assert interleaved.nbytes == n * V15_BYTES
+                fo.write(interleaved.tobytes())
+                groups_done += n
+                n_converted += 1
+                converted_qt_pos.append(e["qt_pos"])
+
+            # Patch qt 13→45 only for tensors actually converted; leave skipped qt13 alone.
+            # Same-size transform: no ds rewrite.
+            for qt_pos in converted_qt_pos:
+                header[qt_pos] = QT_V15
+            fo.seek(0); fo.write(bytes(header))
+
+        a = os.path.getsize(src)
+        b = os.path.getsize(tmp_path)
+        print(f"groups repacked : {groups_done:,}")
+        print(f"max drift       : {worst_drift:.6f} steps   (flip boundary 0.5)")
+        print(f"nibble flips    : {flips:,}   <- must be 0")
+        print(f"min f32 scale   : {min_scale:.3e}   "
+              f"(fp16 min normal {F16_MIN_NORMAL:.3e}, min subnormal {F16_MIN_SUBNORMAL:.3e})")
+        if a == b:
+            print(f"bytes           : {a:,} -> {b:,}   saved {a-b:,} ({100*(a-b)/a:.2f}%)  (pad is same-size, expected)")
+        else:
+            print(f"bytes           : {a:,} -> {b:,}   saved {a-b:,} ({100*(a-b)/a:.2f}%)")
+            print(f"note: pad repack is SAME-SIZE (136->136), so 0 saved is expected; non-zero delta indicates input was not v1-stride")
+        # Atomically install only after full write + index patch succeeded.
+        os.replace(tmp_path, dst)
+        tmp_path = None
+        if flips:
+            print("FAIL: a re-fit would have changed nibbles; this artifact is lossy.")
+            return 3
+        print("OK: pure header rewrite, every nibble preserved (pad layout).")
+        return 0
+    finally:
+        if tmp_fd >= 0:
+            try:
+                os.close(tmp_fd)
+            except OSError:
+                pass
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    if len(sys.argv) < 3:
+        print(__doc__); sys.exit(1)
+    lim = int(sys.argv[3].split("=")[1]) if len(sys.argv) > 3 and "--limit" in sys.argv[3] else None
+    if len(sys.argv) > 3 and sys.argv[3].startswith("--limit"):
+        lim = int(sys.argv[3].split("=")[1]) if "=" in sys.argv[3] else int(sys.argv[4])
+    sys.exit(repack(sys.argv[1], sys.argv[2], lim))

@@ -14,8 +14,6 @@ pub use carriers::*;
 pub mod spec_build;
 
 use hipfire_arch_cohere2moe as cohere2moe;
-use hipfire_runtime::arch_model::ArchModel;
-use hipfire_runtime::llama::KvCacheExt;
 use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_dots_ocr::dots_ocr;
 use hipfire_arch_gemma4 as gemma4;
@@ -26,10 +24,12 @@ use hipfire_arch_qwen35::qwen35::{self};
 use hipfire_arch_qwen35::speculative::DeltaNetSnapshot;
 use hipfire_arch_qwen35::Qwen35Bundle;
 use hipfire_arch_qwen35_vl::qwen35_vl;
+use hipfire_runtime::arch_model::ArchModel;
 use hipfire_runtime::cask::CaskCtx;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::kv_backend::KvBackend;
 use hipfire_runtime::llama;
+use hipfire_runtime::llama::KvCacheExt;
 use hipfire_runtime::loader_api::{CaskConfig, LoadCtx, ModelSource, SpecLoadCfg};
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::ngram_mod::NgramModPool;
@@ -293,7 +293,6 @@ pub fn generation_early_route(arch_id: u32) -> Option<GenerationEarlyRoute> {
         _ => None,
     }
 }
-
 
 // ─── Registry ─────────────────────────────────────────────────────────
 
@@ -590,7 +589,6 @@ impl hipfire_runtime::arch_model::ArchModel for Deepseek4HeterogeneousBundle {
         drop(self);
     }
 }
-
 
 /// Self-owned gfx1100+dense / gfx1151+routed DeepSeek V4 state. The model
 /// owns both HIP devices and tears them down in its `Drop` implementation;
@@ -1115,9 +1113,9 @@ impl LoadedModel {
     }
 
     pub fn deepseek4_mut(&mut self) -> Option<&mut hipfire_arch_deepseek4::Deepseek4Bundle> {
-        self.state
-            .as_deref_mut()
-            .and_then(|s| (s as &mut dyn Any).downcast_mut::<hipfire_arch_deepseek4::Deepseek4Bundle>())
+        self.state.as_deref_mut().and_then(|s| {
+            (s as &mut dyn Any).downcast_mut::<hipfire_arch_deepseek4::Deepseek4Bundle>()
+        })
     }
 
     /// Qwen35-VL vision config if this model is arch_id=5|6 and was loaded
@@ -1147,13 +1145,15 @@ impl LoadedModel {
     }
 
     pub fn dots_ocr_mut(&mut self) -> Option<&mut hipfire_arch_dots_ocr::DotsOcrBundle> {
-        self.state
-            .as_deref_mut()
-            .and_then(|s| (s as &mut dyn Any).downcast_mut::<hipfire_arch_dots_ocr::DotsOcrBundle>())
+        self.state.as_deref_mut().and_then(|s| {
+            (s as &mut dyn Any).downcast_mut::<hipfire_arch_dots_ocr::DotsOcrBundle>()
+        })
     }
     /// Arch-agnostic view of the loaded model, when any is loaded.
     pub fn as_arch_model(&self) -> Option<&dyn hipfire_runtime::arch_model::ArchModel> {
-        self.state.as_deref().map(|b| b as &dyn hipfire_runtime::arch_model::ArchModel)
+        self.state
+            .as_deref()
+            .map(|b| b as &dyn hipfire_runtime::arch_model::ArchModel)
     }
     pub fn as_arch_model_mut(&mut self) -> Option<&mut dyn hipfire_runtime::arch_model::ArchModel> {
         self.state
@@ -1658,6 +1658,24 @@ fn finish_qwen35_load(
             ctx.spec.ddtree_budget,
             ctx.spec.ddtree_topk,
             eviction.is_some(),
+            &bundle.weights,
+            // Exact plain Q8 KV (not asym/fwht variants). Matches design:
+            // flags on the already-built cache — never re-resolve the string.
+            {
+                let kv = &bundle.kv_cache;
+                kv.quant_q8
+                    && !kv.quant_fwht
+                    && !kv.quant_asym2
+                    && !kv.quant_asym3
+                    && !kv.quant_asym4
+                    && matches!(kv.v_mode, llama::VMode::Q8)
+            },
+            // finish_qwen35_load is the single-GPU carrier path.
+            true,
+            // Fail-closed: adaptive KV starts FWHT4 and tier-switches at runtime.
+            // Upstream also suppresses DFlash when adaptive is Some; this keeps
+            // admission honest if a future path reaches load_dflash_state.
+            bundle.kv_adaptive.is_some(),
         ) {
             Ok(s) => {
                 eprintln!(
@@ -1837,12 +1855,9 @@ fn finish_qwen35_load(
     // The head lives on the bundle, not on LoadedModel: per-arch state must not
     // keep an arch type in the loader's struct, or LoadedModel can never move
     // into arch-free hipfire-runtime.
-    if let Some(bundle) = model
-        .state
-        .as_mut()
-        .and_then(|s| (s.as_mut() as &mut dyn std::any::Any)
-            .downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>())
-    {
+    if let Some(bundle) = model.state.as_mut().and_then(|s| {
+        (s.as_mut() as &mut dyn std::any::Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
+    }) {
         bundle.qwen35_mtp_head = qwen35_mtp_head;
     }
     Ok(model)
@@ -1933,9 +1948,11 @@ pub fn load_model_with_kv_backend(
                 gpu.arch.as_str(),
                 "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" | "gfx1200" | "gfx1201"
             );
+            let arch_is_gfx12 = matches!(gpu.arch.as_str(), "gfx1200" | "gfx1201");
             let supported = match lm_qt {
                 Some(3 | 6 | 13) => true,
                 Some(17) => arch_is_gfx11,
+                Some(44 | 47 | 48 | 49 | 50) => arch_is_gfx12,
                 _ => false,
             };
             if !supported {
@@ -1946,11 +1963,11 @@ pub fn load_model_with_kv_backend(
                 return Err(format!(
                     "DFlash draft requested but target lm_head {} is not \
                      supported by speculative.rs's batched GEMM paths on this arch \
-                     ({}). Supported: Q8_0 (qt=3), HFQ4G256 (qt=6), MQ4G256 (qt=13) \
-                     always; MQ3G256 (qt=17) on gfx11 only. Other dtypes \
-                     (MQ2 qt=18, MQ6/MQ8, HFQ3/HFQ2, HFQ4G128, HFQ6, F16, …) fall \
-                     through to a per-row GEMV that hangs verify. Reload without a \
-                     draft, or use an MQ4 / HFQ4 / Q8 target.",
+                     ({}). Supported: Q8_0 (qt=3), HFQ4G256 (qt=6), MQ4G256 \
+                     (qt=13) always; MQ3G256 (qt=17) on gfx11; MQ4/6/5/3/2G256V2 \
+                     (qt=44/47/48/49/50) on gfx12. Other dtypes fall through to \
+                     unsupported per-row verification. Reload without a draft or \
+                     use a supported target.",
                     qt_desc, gpu.arch
                 ));
             }
@@ -2108,7 +2125,9 @@ pub fn load_model_with_gemma4_drafter(
                 gpu.arch.as_str(),
                 "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" | "gfx1200" | "gfx1201"
             );
+            let arch_is_gfx12 = matches!(gpu.arch.as_str(), "gfx1200" | "gfx1201");
             let supported = match lm_qt {
+                Some(44 | 47 | 48 | 49 | 50) => arch_is_gfx12,
                 Some(3 | 6 | 13) => true,
                 Some(17) => arch_is_gfx11,
                 _ => false,
@@ -3189,7 +3208,9 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
         if let Some(state) = m.state.take() {
             // multi-GPU resources. Otherwise just drop the box (original match did
             // the same — non-qwen35 pp>1 is unreachable and had an empty arm).
-            if let Ok(mut b) = (state as Box<dyn Any>).downcast::<hipfire_arch_qwen35::Qwen35Bundle>() {
+            if let Ok(mut b) =
+                (state as Box<dyn Any>).downcast::<hipfire_arch_qwen35::Qwen35Bundle>()
+            {
                 if let Some(scratch_set) = b.pp_scratch_set.take() {
                     scratch_set.free_gpu_multi(&mut gpus);
                 }
@@ -3208,7 +3229,19 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
         let _ = gpu;
         return Ok(());
     }
-    if let Some(spec) = m.speculator {
+    // Quiesce retained-PM4 (if any) before freeing any captured owner. Unknown
+    // quiescence → keep model quarantined; daemon restart is containment.
+    if let Some(spec) = &mut m.speculator {
+        if let Err(reason) = spec.quiesce(gpu) {
+            eprintln!("dflash verify PM4: unload refused — unknown quiescence: {reason}");
+            std::mem::forget(m);
+            return Err(format!(
+                "dflash verify PM4: unload refused after unknown quiescence ({reason}); \
+                 model remains quarantined until process restart"
+            ));
+        }
+    }
+    if let Some(spec) = m.speculator.take() {
         // Frees the drafter's GPU buffers (draft weights + scratch) AND its
         // checkpoint ring — a drafter that forgets is a compile error, not a
         // silent VRAM leak. The vestigial `m.dflash_checkpoints` (now always
@@ -3232,7 +3265,9 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
     for (_, snap) in m.dflash_checkpoints {
         snap.free_gpu(gpu);
     }
-    if let Some(state) = m.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()) {
+    if let Some(state) = m.state.as_mut().and_then(|s| {
+        (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
+    }) {
         if let Some(batch_state) = state.qwen35_decode_batch.take() {
             let _ = batch_state.free_gpu(gpu);
         }
@@ -3468,7 +3503,16 @@ mod registry_tests {
         assert_eq!(super::vision_route(7), super::VisionRoute::None);
         assert_eq!(super::vision_route(9), super::VisionRoute::None);
         // Text-only carriers must stay false.
-        for name in ["qwen2", "llama", "deepseek4", "minimax", "lfm2moe", "cohere2moe", "gemma4", "muse_glimmer"] {
+        for name in [
+            "qwen2",
+            "llama",
+            "deepseek4",
+            "minimax",
+            "lfm2moe",
+            "cohere2moe",
+            "gemma4",
+            "muse_glimmer",
+        ] {
             let c = REGISTRY.iter().find(|c| c.name() == name).unwrap();
             assert!(
                 !c.caps().supports_images,
@@ -3486,12 +3530,12 @@ mod registry_tests {
     /// re-route an architecture, update this pin in the same commit.
     #[test]
     fn caps_and_route_tables_are_pinned() {
-        use saddle_core::caps::{ArchCaps, DflashKind};
         use super::{
             bench_decode_route, continuous_batch_route, ep_eos_route, ep_prompt_route,
             generation_early_route, vision_route, BenchDecodeRoute, ContinuousBatchRoute,
             EpEosRoute, EpPromptRoute, GenerationEarlyRoute, VisionRoute,
         };
+        use saddle_core::caps::{ArchCaps, DflashKind};
 
         let caps_of = |name: &str| -> ArchCaps {
             REGISTRY
@@ -3559,7 +3603,11 @@ mod registry_tests {
                 11 => Some(ContinuousBatchRoute::Lfm2Moe),
                 _ => None,
             };
-            assert_eq!(continuous_batch_route(id), want, "continuous_batch_route({id})");
+            assert_eq!(
+                continuous_batch_route(id),
+                want,
+                "continuous_batch_route({id})"
+            );
             // The capability half must stay consistent with the declared cap.
             let declared = super::carrier_for(id)
                 .map(|c| c.caps().supports_continuous_batch)
@@ -3595,13 +3643,21 @@ mod registry_tests {
 
         // ── ep_prompt_route: 9 -> Dsml, everything else Jinja ──
         for id in 0u32..=14 {
-            let want = if id == 9 { EpPromptRoute::Dsml } else { EpPromptRoute::Jinja };
+            let want = if id == 9 {
+                EpPromptRoute::Dsml
+            } else {
+                EpPromptRoute::Jinja
+            };
             assert_eq!(ep_prompt_route(id), want, "ep_prompt_route({id})");
         }
 
         // ── ep_eos_route: 10 -> Minimax, everything else Deepseek4 ──
         for id in 0u32..=14 {
-            let want = if id == 10 { EpEosRoute::Minimax } else { EpEosRoute::Deepseek4 };
+            let want = if id == 10 {
+                EpEosRoute::Minimax
+            } else {
+                EpEosRoute::Deepseek4
+            };
             assert_eq!(ep_eos_route(id), want, "ep_eos_route({id})");
         }
 
@@ -3614,7 +3670,11 @@ mod registry_tests {
                 14 => Some(GenerationEarlyRoute::MuseGlimmer),
                 _ => None,
             };
-            assert_eq!(generation_early_route(id), want, "generation_early_route({id})");
+            assert_eq!(
+                generation_early_route(id),
+                want,
+                "generation_early_route({id})"
+            );
         }
     }
 }

@@ -83,6 +83,31 @@ pub const MQ4V2_GROUP_BYTES: usize = 136;
 /// and `kernels/src/gemm_mq4cpad_residual_wmma_gfx12_bt.hip`.
 pub const MQ4C_GROUP_BYTES: usize = 136;
 
+/// Per-group bytes for MQ6-G256 v2 (qt=47): 200 B/group, 6.25 bpw.
+/// Neutral-size Magnum V2 layout: LE `[0..2)` fp16 s0, `[2..4)` fp16 z0,
+/// `[4..6)` fp16 s1, `[6..8)` fp16 z1, `[8..200)` 192 B legacy 6-bit payload
+/// (4 weights per 3 bytes, `4/3 B`). Half 0 governs q[0..128), half 1
+/// q[128..256); reconstruction `q * f32(s[h]) + f32(z[h])`. `K % 256 == 0`.
+pub const MQ6G256V2_GROUP_BYTES: usize = 200;
+
+/// Per-group bytes for MQ5-G256 v2 (qt=48): 168 B/group, 5.25 bpw.
+/// Neutral-size Magnum V2 layout: LE `[0..2)` fp16 s0, `[2..4)` fp16 z0,
+/// `[4..6)` fp16 s1, `[6..8)` fp16 z1, `[8..168)` 160 B legacy 5-bit payload
+/// (8 weights per 5 bytes, `8/5 B`). Half semantics as MQ6G256V2.
+pub const MQ5G256V2_GROUP_BYTES: usize = 168;
+
+/// Per-group bytes for MQ3-G256 v2 (qt=49): 104 B/group, 3.25 bpw.
+/// Neutral-size Magnum V2 layout: LE `[0..2)` fp16 s0, `[2..4)` fp16 z0,
+/// `[4..6)` fp16 s1, `[6..8)` fp16 z1, `[8..104)` 96 B legacy 3-bit payload
+/// (8 weights per 3 bytes, `8/3 B`). Half semantics as MQ6G256V2.
+pub const MQ3G256V2_GROUP_BYTES: usize = 104;
+
+/// Per-group bytes for MQ2-G256 v2 (qt=50): 72 B/group, 2.25 bpw.
+/// Neutral-size Magnum V2 layout: LE `[0..2)` fp16 s0, `[2..4)` fp16 z0,
+/// `[4..6)` fp16 s1, `[6..8)` fp16 z1, `[8..72)` 64 B legacy 2-bit payload
+/// (4 weights per byte). Half semantics as MQ6G256V2.
+pub const MQ2G256V2_GROUP_BYTES: usize = 72;
+
 /// Bytes per group in the trailing fp16 scale region (both GL dtypes).
 pub const GL_GROUP_SCALE_BYTES: usize = 2;
 
@@ -275,6 +300,27 @@ pub enum DType {
     /// (`w = q * scale + zero`), half-wave uniform, lane-invariant scalar loads.
     /// `K % 256 == 0`.
     MQ4CG256,
+    /// MQ6-G256 v2 (qt=47): FWHT-rotated, 200 B/group, neutral Magnum V2.
+    /// Per-group 200 B: `[0..2)` fp16 s0, `[2..4)` fp16 z0, `[4..6)` fp16 s1,
+    /// `[6..8)` fp16 z1, `[8..200)` 192 B 6-bit payload (4/3 B). Half 0
+    /// q[0..128), half 1 q[128..256); `w = q*f32(s[h])+f32(z[h])`.
+    /// `K % 256 == 0`, 6.25 bpw.
+    MQ6G256V2,
+    /// MQ5-G256 v2 (qt=48): FWHT-rotated, 168 B/group, neutral Magnum V2.
+    /// Per-group 168 B: `[0..2)` fp16 s0, `[2..4)` fp16 z0, `[4..6)` fp16 s1,
+    /// `[6..8)` fp16 z1, `[8..168)` 160 B 5-bit payload (8/5 B). Same half
+    /// semantics as MQ6G256V2. `K % 256 == 0`, 5.25 bpw.
+    MQ5G256V2,
+    /// MQ3-G256 v2 (qt=49): FWHT-rotated, 104 B/group, neutral Magnum V2.
+    /// Per-group 104 B: `[0..2)` fp16 s0, `[2..4)` fp16 z0, `[4..6)` fp16 s1,
+    /// `[6..8)` fp16 z1, `[8..104)` 96 B 3-bit payload (8/3 B). Same half
+    /// semantics as MQ6G256V2. `K % 256 == 0`, 3.25 bpw.
+    MQ3G256V2,
+    /// MQ2-G256 v2 (qt=50): FWHT-rotated, 72 B/group, neutral Magnum V2.
+    /// Per-group 72 B: `[0..2)` fp16 s0, `[2..4)` fp16 z0, `[4..6)` fp16 s1,
+    /// `[6..8)` fp16 z1, `[8..72)` 64 B 2-bit payload (4/B). Same half
+    /// semantics as MQ6G256V2. `K % 256 == 0`, 2.25 bpw.
+    MQ2G256V2,
     MQ4G128, // MagnumQuant: FWHT-128-rotated INT4 (72 bytes/group, same layout as HFQ4G128)
     MQ8G256, // MagnumQuant: FWHT-rotated symmetric INT8, dp4a target (258 bytes/group)
     MQ6G256, // MagnumQuant: FWHT-rotated HFQ6-G256 (200 bytes/group, same as HFQ6G256)
@@ -352,6 +398,10 @@ impl DType {
             | DType::MQ4G256
             | DType::MQ4G256V2
             | DType::MQ4CG256
+            | DType::MQ6G256V2
+            | DType::MQ5G256V2
+            | DType::MQ3G256V2
+            | DType::MQ2G256V2
             | DType::MQ4G128
             | DType::MQ6G256
             | DType::MQ5G256
@@ -447,6 +497,13 @@ impl DType {
                 // qt=45 shares qt=13/qt=44's AWQ contract exactly — same failure mode
                 // if omitted: silent sidecar drop → (W·s)·x. Include it.
                 | DType::MQ4CG256
+                // Neutral V2 family (qt47-50): same per-half fp16 scale+zero header,
+                // same AWQ pre-scale contract as qt44. All four must be listed or
+                // their sidecars are silently dropped → same May-2026 regression.
+                | DType::MQ6G256V2
+                | DType::MQ5G256V2
+                | DType::MQ3G256V2
+                | DType::MQ2G256V2
                 | DType::MQ3G256
                 | DType::MQ2G256
                 | DType::MQ3G256Lloyd
@@ -469,13 +526,6 @@ impl DType {
     }
 
     /// Whether this format's GEMV kernel requires K%256==0 (HFP4 family: the
-    /// gemv_hfp4g32 kernel + FWHT both need it). Refuse at load, not first
-    /// dispatch. Centralizes the guard inlined at the weight-decode qt 21/24 arms.
-    ///
-    /// MQ*-G256-GL are included because their SoA region split is derived
-    /// from `gpr = K/256` on BOTH sides (encoder and kernel). A K that is not a
-    /// multiple of 256 truncates `gpr`, which silently shifts the scale-region
-    /// base — garbage weights with no error. Fail at load instead.
     pub fn requires_k_mod_256(self) -> bool {
         matches!(
             self,
@@ -485,6 +535,10 @@ impl DType {
                 | DType::MQ3G256GL
                 | DType::MQ4G256V2
                 | DType::MQ4CG256
+                | DType::MQ6G256V2
+                | DType::MQ5G256V2
+                | DType::MQ3G256V2
+                | DType::MQ2G256V2
         )
     }
 }
@@ -542,6 +596,17 @@ pub struct MmqScreenState {
 }
 
 /// High-level GPU context. Owns the HIP runtime, compiler, and loaded kernels.
+///
+/// Tape completeness invariant: for any body executed via `Gpu`,
+/// `self.graphs.capture_blobs.len()` after a HipGraph capture must equal
+/// `self.replay.recorded_launches().len()` after a `ReplayController` capture
+/// of the same body. Every kernel launch reachable from the four
+/// `self.scratch.*` helpers (`ensure_fp16_x`, `convert_fp16_x_uncached`,
+/// `ensure_fp8_x`, `ensure_q8_1_mmq_x`) is recorded through the unified
+/// `launch_maybe_blob` gate so the two tapes stay in lockstep. A future
+/// helper that appends to `capture_blobs` without also recording into
+/// `self.replay` will silently truncate a retained tape — use
+/// `debug_assert_tape_parity` or compare the two counts in a test.
 pub struct Gpu {
     pub hip: HipRuntime,
     pub arch: String,
@@ -2215,6 +2280,69 @@ impl Gpu {
         Ok(())
     }
 
+    /// Position-aware variant of [`Self::replay_recorded_hip_prefix`].
+    ///
+    /// Applies the identical binding set the retained PM4 route applies, so the
+    /// recorded-blob oracle and the PM4 route stay equivalent: a divergence
+    /// between them is then a submission difference, never a patching one.
+    pub fn replay_recorded_hip_prefix_at(&self, count: usize, position: usize) -> HipResult<()> {
+        self.bind_thread()?;
+        let launches = self.replay.recorded_launches();
+        if count > launches.len() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "captured HIP prefix {count} exceeds {} launches",
+                    launches.len()
+                ),
+            ));
+        }
+        let synthesized = self.replay.synthesized_position_bindings();
+        for (index, launch) in launches.iter().take(count).enumerate() {
+            let func = self.functions.get(&launch.kernel).ok_or_else(|| {
+                hip_bridge::HipError::new(
+                    0,
+                    &format!("captured HIP function {:?} is not loaded", launch.kernel),
+                )
+            })?;
+            let mut kernarg = launch.kernarg.clone();
+            let mut bindings: Vec<(usize, crate::replay::ReplayKernargBinding)> = synthesized
+                .iter()
+                .filter(|(idx, _)| *idx == index)
+                .cloned()
+                .collect();
+            if crate::replay::is_gdn_kernel(&launch.kernel) {
+                let frames =
+                    crate::replay::gdn_requant_frames_for_dispatch(&launch.kernarg, launch.grid[2])
+                        .map_err(|reason| hip_bridge::HipError::new(0, &reason))?;
+                bindings.push((
+                    index,
+                    crate::replay::ReplayKernargBinding::GdnFrameU32 { offset: 76, frames },
+                ));
+            }
+            crate::replay::apply_kernarg_bindings_for_dispatch(
+                &mut kernarg,
+                index,
+                position,
+                &bindings,
+            )
+            .map_err(|reason| hip_bridge::HipError::new(0, &reason))?;
+            // SAFETY: the bytes were captured from this exact loaded function
+            // and all pointees remain owned by this Gpu/model instance.
+            unsafe {
+                self.hip.launch_kernel_blob(
+                    func,
+                    launch.grid,
+                    launch.block,
+                    launch.shared_mem,
+                    self.active_stream.as_ref(),
+                    &mut kernarg,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     /// Compile and load a kernel if missing. Public variant of `ensure_kernel`
     /// for callers that need to JIT a kernel by name from outside the crate
     /// (primarily the hipGraph capture/replay path).
@@ -2286,6 +2414,12 @@ impl Gpu {
         x: &GpuTensor,
         n_elems: usize,
     ) -> HipResult<*mut c_void> {
+        // Split borrows so `self.replay` and `self.graphs`/`self.scratch` can be
+        // borrowed simultaneously. The scratch helper will record into replay
+        // when `is_recording()` and push to capture_blobs when `capture_mode`,
+        // using the unified `record || capture_mode || force_blob` gate.
+        let capture_mode = self.graphs.capture_mode;
+        let force_blob = self.flags.force_blob_path;
         self.scratch.ensure_fp16_x(
             &self.hip,
             &mut self.compiler,
@@ -2293,8 +2427,9 @@ impl Gpu {
             &mut self.functions,
             self.active_stream.as_ref(),
             &mut self.graphs.capture_blobs,
-            self.graphs.capture_mode,
-            self.flags.force_blob_path,
+            capture_mode,
+            force_blob,
+            &mut self.replay,
             x,
             n_elems,
         )
@@ -2313,6 +2448,8 @@ impl Gpu {
         x: &GpuTensor,
         n_elems: usize,
     ) -> HipResult<*mut c_void> {
+        let capture_mode = self.graphs.capture_mode;
+        let force_blob = self.flags.force_blob_path;
         self.scratch.convert_fp16_x_uncached(
             &self.hip,
             &mut self.compiler,
@@ -2320,8 +2457,9 @@ impl Gpu {
             &mut self.functions,
             self.active_stream.as_ref(),
             &mut self.graphs.capture_blobs,
-            self.graphs.capture_mode,
-            self.flags.force_blob_path,
+            capture_mode,
+            force_blob,
+            &mut self.replay,
             x,
             n_elems,
         )
@@ -2332,6 +2470,8 @@ impl Gpu {
     /// uses cvt_pk_fp8_f32. Caches by `x.buf.as_ptr()` like its FP16
     /// sibling so back-to-back same-X GEMM dispatches skip reconversion.
     pub(crate) fn ensure_fp8_x(&mut self, x: &GpuTensor, n_elems: usize) -> HipResult<*mut c_void> {
+        let capture_mode = self.graphs.capture_mode;
+        let force_blob = self.flags.force_blob_path;
         self.scratch.ensure_fp8_x(
             &self.hip,
             &mut self.compiler,
@@ -2339,8 +2479,9 @@ impl Gpu {
             &mut self.functions,
             self.active_stream.as_ref(),
             &mut self.graphs.capture_blobs,
-            self.graphs.capture_mode,
-            self.flags.force_blob_path,
+            capture_mode,
+            force_blob,
+            &mut self.replay,
             x,
             n_elems,
         )
@@ -2356,6 +2497,8 @@ impl Gpu {
         k: usize,
     ) -> HipResult<*mut c_void> {
         // bind_thread: skip — delegated to scratch.rs
+        let capture_mode = self.graphs.capture_mode;
+        let force_blob = self.flags.force_blob_path;
         self.scratch.ensure_q8_1_mmq_x(
             &self.hip,
             &mut self.compiler,
@@ -2363,13 +2506,40 @@ impl Gpu {
             &mut self.functions,
             self.active_stream.as_ref(),
             &mut self.graphs.capture_blobs,
-            self.graphs.capture_mode,
-            self.flags.force_blob_path,
+            capture_mode,
+            force_blob,
+            &mut self.replay,
             self.device_id,
             x,
             batch_size,
             k,
         )
+    }
+    /// Returns the number of launches recorded by the `ReplayController`.
+    /// Together with `self.graphs.capture_blobs.len()`, this must agree for
+    /// any body — see the `Gpu` type-level invariant doc.
+    pub fn recorded_launch_count(&self) -> usize {
+        self.replay.recorded_launches().len()
+    }
+
+    /// Returns the number of HipGraph kernarg blobs captured.
+    /// See `recorded_launch_count` and the `Gpu` invariant.
+    pub fn graph_blob_count(&self) -> usize {
+        self.graphs.capture_blobs.len()
+    }
+
+    /// Debug-only assertion that the HipGraph and Replay tapes would agree.
+    /// Call after a body that was captured via both mechanisms (or after two
+    /// separate captures of the same body, passing the other count).
+    /// A mismatch indicates a helper bypassed the replay recorder.
+    pub fn debug_assert_tape_parity(&self, other_blob_count: Option<usize>) {
+        let replay_len = self.recorded_launch_count();
+        let graph_len = other_blob_count.unwrap_or_else(|| self.graph_blob_count());
+        debug_assert_eq!(
+            replay_len, graph_len,
+            "tape parity violated: replay recorded {} launches but HipGraph has {} blobs — a helper bypassed the recorder",
+            replay_len, graph_len
+        );
     }
 
     /// Screen a weight matrix for MMQ safety (#87). Runs a small synthetic
@@ -4456,6 +4626,10 @@ mod tests {
     use super::gen_fwht_signs;
     use super::DType;
     use super::HessianCapture;
+    use super::MQ2G256V2_GROUP_BYTES;
+    use super::MQ3G256V2_GROUP_BYTES;
+    use super::MQ5G256V2_GROUP_BYTES;
+    use super::MQ6G256V2_GROUP_BYTES;
 
     #[test]
     fn q8hfq_row_stride_matches_legacy_formula() {
@@ -4497,6 +4671,31 @@ mod tests {
         ] {
             assert!(!dt.requires_k_mod_256(), "{dt:?} must NOT require k%256");
         }
+    }
+
+    #[test]
+    fn neutral_v2_requires_k_mod_256_and_awq() {
+        for dt in [
+            DType::MQ4G256V2,
+            DType::MQ4CG256,
+            DType::MQ6G256V2,
+            DType::MQ5G256V2,
+            DType::MQ3G256V2,
+            DType::MQ2G256V2,
+        ] {
+            assert!(dt.requires_k_mod_256(), "{dt:?} must require K%256==0");
+            assert!(dt.supports_awq_sidecar(), "{dt:?} must support AWQ sidecar");
+        }
+        // Legacy counterparts must NOT be confused with V2 at type level.
+        assert_ne!(DType::MQ6G256V2, DType::MQ6G256);
+        assert_ne!(DType::MQ5G256V2, DType::MQ5G256);
+        assert_ne!(DType::MQ3G256V2, DType::MQ3G256);
+        assert_ne!(DType::MQ2G256V2, DType::MQ2G256);
+        // Group bytes match spec one-to-one.
+        assert_eq!(MQ6G256V2_GROUP_BYTES, 200);
+        assert_eq!(MQ5G256V2_GROUP_BYTES, 168);
+        assert_eq!(MQ3G256V2_GROUP_BYTES, 104);
+        assert_eq!(MQ2G256V2_GROUP_BYTES, 72);
     }
 
     /// Deterministic pseudo-random rows (no RNG crate): mix in exact zeros,
@@ -4802,5 +5001,113 @@ mod tests {
         gpu.ensure_vmm_cleaned()
             .expect("clears after faults drained");
         assert_eq!(gpu.vmm_allocation_count(), 0);
+    }
+    #[test]
+    fn scratch_convert_predicate_matches_launch_gate() {
+        // The scratch fast-path `scratch_must_convert` must be exactly
+        // `is_recording || capture_mode || cached != src`, which is the
+        // same predicate `Gpu::launch_maybe_blob_bound` uses for
+        // `record || capture_mode || force_blob` (with force_blob=false here).
+        // If these drift, a helper could skip a kernel that a recorder
+        // expects, or record a kernel the live path elides.
+        use crate::scratch::{scratch_must_convert, use_blob_path};
+        let ptr_a: *mut std::ffi::c_void = 0x1000 as *mut _;
+        let ptr_b: *mut std::ffi::c_void = 0x2000 as *mut _;
+
+        for capture in [false, true] {
+            for recording in [false, true] {
+                // cached == src  -> should convert only if a recorder active
+                assert_eq!(
+                    scratch_must_convert(capture, recording, ptr_a, ptr_a),
+                    recording || capture,
+                    "cached==src capture={capture} recording={recording}"
+                );
+                // cached != src -> always converts regardless of recorders
+                assert_eq!(
+                    scratch_must_convert(capture, recording, ptr_a, ptr_b),
+                    true,
+                    "cached!=src capture={capture} recording={recording}"
+                );
+                // blob path predicate must equal launch_maybe_blob_bound's gate
+                for force in [false, true] {
+                    let scratch_gate = use_blob_path(recording, capture, force);
+                    let dispatch_gate = recording || capture || force;
+                    assert_eq!(
+                        scratch_gate, dispatch_gate,
+                        "use_blob_path(recording={recording}, capture={capture}, force={force})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rotate_helpers_share_recording_gate_with_conversions() {
+        // The 7 rotation helpers (`rotate_x_mq`, `rotate_x_mq_batched`,
+        // `rotate_x_mq_128`, `rotate_x_mq_awq`, `rotate_x_mq_awq_batched`,
+        // `rotate_x_mq_dual_fp8`, `rotate_quantize_x_mq8`) have no
+        // cached-pointer elision — they always launch via `launch_maybe_blob`,
+        // whose gating is `use_blob_path(is_recording, capture_mode, force)`.
+        // That is the same gate `Gpu::launch_maybe_blob_bound` uses, and the
+        // same gate the conversion helpers couple to via `scratch_must_convert`
+        // (with force_blob=false). If a future rotate helper adds a pointer-cache
+        // skip, it must reuse `scratch_must_convert`; otherwise a divergence
+        // reintroduces exactly the 64-launch gap.
+        //
+        // Full helper invocation (allocation, kernel compile, HIP launch)
+        // cannot be exercised without a device; this GPU-free test covers the
+        // only driftable logic — the predicate — which is the invariant that
+        // keeps `capture_blobs.len() == recorded_launches.len()`.
+        use crate::scratch::{scratch_must_convert, use_blob_path};
+        let ptr_a: *mut std::ffi::c_void = 0x1000 as *mut _;
+        let ptr_b: *mut std::ffi::c_void = 0x2000 as *mut _;
+        for capture in [false, true] {
+            for recording in [false, true] {
+                for force in [false, true] {
+                    // Rotate helpers with no cache: must run iff blob path is taken.
+                    let rotate_must_run = use_blob_path(recording, capture, force);
+                    let dispatch_gate = recording || capture || force;
+                    assert_eq!(
+                        rotate_must_run, dispatch_gate,
+                        "rotate gate mismatch recording={recording} capture={capture} force={force}"
+                    );
+                    // If a rotate helper ever gains a cache, it must match the
+                    // conversion helper's `scratch_must_convert`.
+                    assert_eq!(
+                        scratch_must_convert(capture, recording, ptr_a, ptr_a),
+                        recording || capture,
+                        "scratch_must_convert cached==src capture={capture} recording={recording}"
+                    );
+                    assert_eq!(
+                        scratch_must_convert(capture, recording, ptr_a, ptr_b),
+                        true,
+                        "scratch_must_convert cached!=src capture={capture} recording={recording}"
+                    );
+                    // The two predicates coincide when cached==src and force==false:
+                    // both reduce to `recording || capture`. With force==true or
+                    // cached!=src they are trivially true, so they cannot diverge.
+                    if !force {
+                        assert_eq!(
+                            scratch_must_convert(capture, recording, ptr_a, ptr_a),
+                            use_blob_path(recording, capture, force),
+                            "conversion vs rotate gate drift capture={capture} recording={recording} force={force}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tape_parity_accessor_starts_empty() {
+        // GPU-free sanity for the invariant documented on `Gpu`: a recording
+        // and a HipGraph capture of the same body must produce the same launch
+        // count. Only the replay side is constructible without a device, so
+        // this pins the accessor and its empty state; the real invariant is
+        // enforced on hardware by comparing `capture.launches` against the
+        // `[verify-graph] captured ... with N blobs` line.
+        use crate::replay::{ReplayBackendRequest, ReplayController};
+        let ctrl = ReplayController::new(ReplayBackendRequest::Hip);
+        assert_eq!(ctrl.recorded_launches().len(), 0);
     }
 }

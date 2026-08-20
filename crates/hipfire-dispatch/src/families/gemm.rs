@@ -20,9 +20,6 @@ fn is_gemm_hfq4_key(key: KernelKey) -> bool {
     matches!(
         key,
         KernelKey::GemmHfq4G256
-            | KernelKey::GemmHfq4G256Wmma
-            | KernelKey::GemmHfq4G256Dp4a
-            | KernelKey::GemmHfq4G256MmqSet
             | KernelKey::GemmHfq4G256Residual
             | KernelKey::GemmHfq4G256BatchedLmhead
     )
@@ -34,6 +31,42 @@ fn is_gemm_mq4v2_key(key: KernelKey) -> bool {
         KernelKey::GemmMq4G256V2
             | KernelKey::GemmMq4G256V2Residual
             | KernelKey::GemmMq4G256V2BatchedLmhead
+    )
+}
+
+fn is_gemm_mq3v2_key(key: KernelKey) -> bool {
+    matches!(
+        key,
+        KernelKey::GemmMq3G256V2
+            | KernelKey::GemmMq3G256V2Residual
+            | KernelKey::GemmMq3G256V2BatchedLmhead
+    )
+}
+
+fn is_gemm_mq2v2_key(key: KernelKey) -> bool {
+    matches!(
+        key,
+        KernelKey::GemmMq2G256V2
+            | KernelKey::GemmMq2G256V2Residual
+            | KernelKey::GemmMq2G256V2BatchedLmhead
+    )
+}
+
+fn is_gemm_mq5v2_key(key: KernelKey) -> bool {
+    matches!(
+        key,
+        KernelKey::GemmMq5G256V2
+            | KernelKey::GemmMq5G256V2Residual
+            | KernelKey::GemmMq5G256V2BatchedLmhead
+    )
+}
+
+fn is_gemm_mq6v2_key(key: KernelKey) -> bool {
+    matches!(
+        key,
+        KernelKey::GemmMq6G256V2
+            | KernelKey::GemmMq6G256V2Residual
+            | KernelKey::GemmMq6G256V2BatchedLmhead
     )
 }
 
@@ -112,6 +145,10 @@ impl GemmFamily {
             DType::TQ2G128 => KernelKey::GemmTQ2G128Prefill,
             DType::BQ1G128 => KernelKey::GemmBQ1G128Prefill,
             DType::MQ4G256V2 => KernelKey::GemmMq4G256V2,
+            DType::MQ6G256V2 => KernelKey::GemmMq6G256V2,
+            DType::MQ5G256V2 => KernelKey::GemmMq5G256V2,
+            DType::MQ3G256V2 => KernelKey::GemmMq3G256V2,
+            DType::MQ2G256V2 => KernelKey::GemmMq2G256V2,
             DType::MQ4CG256 => KernelKey::GemmMq4CG256,
             _ => {
                 return Err(DispatchError::UnsupportedVariant {
@@ -211,7 +248,81 @@ impl GemmFamily {
                 w.dtype, key
             )));
         }
-        if w.dtype == DType::MQ4CG256 && (is_gemm_hfq4_key(key) || is_gemm_mq4v2_key(key)) {
+        if w.dtype == DType::MQ6G256V2 && is_gemm_hfq4_key(key) {
+            return Err(DispatchError::Hip(format!(
+                "qt=47 (MQ6G256V2) weight (dtype {:?}) routed to v1 kernel key {:?}: v2 stores fp16 scale/zero per 128 where v1 stores f32; mis-route is silent.",
+                w.dtype, key
+            )));
+        }
+        if w.dtype == DType::MQ5G256V2 && is_gemm_hfq4_key(key) {
+            return Err(DispatchError::Hip(format!(
+                "qt=48 (MQ5G256V2) weight (dtype {:?}) routed to v1 kernel key {:?}: v2 stores fp16 scale/zero per 128 where v1 stores f32; mis-route is silent.",
+                w.dtype, key
+            )));
+        }
+        if w.dtype == DType::MQ3G256V2 && is_gemm_hfq4_key(key) {
+            return Err(DispatchError::Hip(format!(
+                "qt=49 (MQ3G256V2) weight (dtype {:?}) routed to v1 kernel key {:?}: \
+                 v2 stores fp16 scale/zero per 128 weights (s0/z0 for 0..127, s1/z1 for 128..255) \
+                 where v1 stores f32 scale/zero per 256, so the v1 kernel decodes every weight \
+                 to ~1e-14. This is a missing v2 routing arm at the callsite, not a valid configuration.",
+                w.dtype, key
+            )));
+        }
+        if w.dtype == DType::MQ6G256V2
+            && (is_gemm_mq4v2_key(key)
+                || is_gemm_mq3v2_key(key)
+                || is_gemm_mq2v2_key(key)
+                || is_gemm_mq5v2_key(key)
+                || is_gemm_mq4c_key(key))
+        {
+            return Err(DispatchError::Hip(format!(
+                "qt=47 (MQ6G256V2) weight (dtype {:?}) routed to incompatible kernel key {:?}: mq6v2 is 200 B/group (dual fp16 per 128, 192 B 6-bit) while target differs; mis-route decodes every group wrong.",
+                w.dtype, key
+            )));
+        }
+        if w.dtype == DType::MQ5G256V2
+            && (is_gemm_mq4v2_key(key)
+                || is_gemm_mq3v2_key(key)
+                || is_gemm_mq2v2_key(key)
+                || is_gemm_mq6v2_key(key)
+                || is_gemm_mq4c_key(key))
+        {
+            return Err(DispatchError::Hip(format!(
+                "qt=48 (MQ5G256V2) weight (dtype {:?}) routed to incompatible kernel key {:?}: mq5v2 is 168 B/group; mis-route decodes every group wrong.",
+                w.dtype, key
+            )));
+        }
+        if w.dtype == DType::MQ3G256V2
+            && (is_gemm_mq4v2_key(key) || is_gemm_mq4c_key(key) || is_gemm_mq2v2_key(key))
+        {
+            return Err(DispatchError::Hip(format!(
+                "qt=49 (MQ3G256V2) weight (dtype {:?}) routed to incompatible kernel key {:?}: \
+                 mq3v2 is 104 B/group (dual fp16 per 128, 96 B 3-bit) while the target is 136/72 B; \
+                 equal stride is not interchangeable — a mis-route decodes every group wrong.",
+                w.dtype, key
+            )));
+        }
+        if w.dtype == DType::MQ2G256V2 && is_gemm_hfq4_key(key) {
+            return Err(DispatchError::Hip(format!(
+                "qt=50 (MQ2G256V2) weight (dtype {:?}) routed to v1 kernel key {:?}: \
+                 v2 stores fp16 scale/zero per 128 weights (s0/z0 for 0..127, s1/z1 for 128..255) \
+                 where v1 stores f32 scale/zero per 256, so the v1 kernel decodes every weight \
+                 to ~1e-14. This is a missing v2 routing arm at the callsite, not a valid configuration.",
+                w.dtype, key
+            )));
+        }
+        if (w.dtype == DType::HFQ2G256 || w.dtype == DType::MQ2G256) && is_gemm_mq2v2_key(key) {
+            return Err(DispatchError::Hip(format!(
+                "v1 weight (dtype {:?}) routed to v2 kernel key {:?}: \
+                 v2 expects fp16 s0/z0/s1/z1 per 128 weights while v1 stores f32 scale/zero per 256. \
+                 Routing a v1 payload through a v2 kernel is equally wrong and silent.",
+                w.dtype, key
+            )));
+        }
+        if w.dtype == DType::MQ4CG256
+            && (is_gemm_hfq4_key(key) || is_gemm_mq4v2_key(key) || is_gemm_mq3v2_key(key))
+        {
             return Err(DispatchError::Hip(format!(
                 "qt=45 (MQ4CG256) weight (dtype {:?}) routed to incompatible kernel key {:?}: \
                  mq4c stores one packed fp16 scale/zero dword at [0..4), 4 B pad at [4..8), and \
@@ -219,6 +330,34 @@ impl GemmFamily {
                  different headers (f32 scale/zero or two fp16 half-grids), so equal stride is \
                  not interchangeable — a mis-route decodes every group wrong and returns noise \
                  at full speed with no error.",
+                w.dtype, key
+            )));
+        }
+        if (w.dtype == DType::HFQ4G256
+            || w.dtype == DType::MQ4G256
+            || w.dtype == DType::MQ3G256
+            || w.dtype == DType::MQ2G256
+            || w.dtype == DType::MQ5G256
+            || w.dtype == DType::MQ6G256)
+            && is_gemm_mq6v2_key(key)
+        {
+            return Err(DispatchError::Hip(format!(
+                "v1 weight (dtype {:?}) routed to mq6v2 kernel key {:?}: \
+                 mq6v2 expects 200 B dual-half groups while v1 uses different stride; mis-route is silent.",
+                w.dtype, key
+            )));
+        }
+        if (w.dtype == DType::HFQ4G256
+            || w.dtype == DType::MQ4G256
+            || w.dtype == DType::MQ3G256
+            || w.dtype == DType::MQ2G256
+            || w.dtype == DType::MQ5G256
+            || w.dtype == DType::MQ6G256)
+            && is_gemm_mq3v2_key(key)
+        {
+            return Err(DispatchError::Hip(format!(
+                "v1 weight (dtype {:?}) routed to mq3v2 kernel key {:?}: \
+                 mq3v2 expects 104 B dual-half groups while v1 uses 136/104 B single-scale; mis-route is silent.",
                 w.dtype, key
             )));
         }
@@ -230,7 +369,10 @@ impl GemmFamily {
                 w.dtype, key
             )));
         }
-        if (w.dtype == DType::HFQ4G256 || w.dtype == DType::MQ4G256 || w.dtype == DType::MQ4G256V2)
+        if (w.dtype == DType::HFQ4G256
+            || w.dtype == DType::MQ4G256
+            || w.dtype == DType::MQ4G256V2
+            || w.dtype == DType::MQ2G256V2)
             && is_gemm_mq4c_key(key)
         {
             return Err(DispatchError::Hip(format!(
@@ -352,11 +494,39 @@ impl GemmFamily {
                 hip!(gpu.gemm_q8_0_batched_wide_exact(w.buf, x, y, m, k, batch_size))
             }
             K::GemmMq4G256V2 => hip!(gpu.gemm_mq4g256v2(w.buf, x, y, m, k, batch_size)),
+            K::GemmMq5G256V2 => hip!(gpu.gemm_mq5g256v2(w.buf, x, y, m, k, batch_size)),
+            K::GemmMq6G256V2 => hip!(gpu.gemm_mq6g256v2(w.buf, x, y, m, k, batch_size)),
+            K::GemmMq3G256V2 => hip!(gpu.gemm_mq3g256v2(w.buf, x, y, m, k, batch_size)),
+            K::GemmMq2G256V2 => hip!(gpu.gemm_mq2g256v2(w.buf, x, y, m, k, batch_size)),
             K::GemmMq4G256V2Residual => {
                 hip!(gpu.gemm_hfq4g256_residual_mq4v2(w.buf, x, y, m, k, batch_size))
             }
+            K::GemmMq5G256V2Residual => {
+                hip!(gpu.gemm_mq5g256v2_residual_wmma_gfx12(w.buf, x, y, m, k, batch_size))
+            }
+            K::GemmMq6G256V2Residual => {
+                hip!(gpu.gemm_mq6g256v2_residual_wmma_gfx12(w.buf, x, y, m, k, batch_size))
+            }
+            K::GemmMq3G256V2Residual => {
+                hip!(gpu.gemm_mq3g256v2_residual_wmma_gfx12(w.buf, x, y, m, k, batch_size))
+            }
+            K::GemmMq2G256V2Residual => {
+                hip!(gpu.gemm_mq2g256v2_residual_wmma_gfx12(w.buf, x, y, m, k, batch_size))
+            }
             K::GemmMq4G256V2BatchedLmhead => {
                 hip!(gpu.gemm_mq4g256v2_batched_lmhead(w.buf, x, y, m, k, batch_size))
+            }
+            K::GemmMq5G256V2BatchedLmhead => {
+                hip!(gpu.gemm_mq5g256v2_batched_lmhead(w.buf, x, y, m, k, batch_size))
+            }
+            K::GemmMq6G256V2BatchedLmhead => {
+                hip!(gpu.gemm_mq6g256v2_batched_lmhead(w.buf, x, y, m, k, batch_size))
+            }
+            K::GemmMq3G256V2BatchedLmhead => {
+                hip!(gpu.gemm_mq3g256v2_batched_lmhead(w.buf, x, y, m, k, batch_size))
+            }
+            K::GemmMq2G256V2BatchedLmhead => {
+                hip!(gpu.gemm_mq2g256v2_batched_lmhead(w.buf, x, y, m, k, batch_size))
             }
             K::GemmMq4CG256 => hip!(gpu.gemm_mq4cg256(w.buf, x, y, m, k, batch_size)),
             K::GemmMq4CG256Residual => {
@@ -373,5 +543,67 @@ impl GemmFamily {
 impl KernelFamily for GemmFamily {
     fn name(&self) -> &'static str {
         "gemm"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GemmFamily;
+    use crate::context::DispatchCtx;
+    use crate::types::{DispatchError, KernelKey};
+    use rdna_compute::DType;
+
+    #[test]
+    fn v2_plain_resolves_exact_not_hfq4() {
+        // Gfx12 admits all four V2 plain keys; non-gfx12 rejects via MissingImpl.
+        let cases: &[(DType, KernelKey)] = &[
+            (DType::MQ6G256V2, KernelKey::GemmMq6G256V2),
+            (DType::MQ5G256V2, KernelKey::GemmMq5G256V2),
+            (DType::MQ3G256V2, KernelKey::GemmMq3G256V2),
+            (DType::MQ2G256V2, KernelKey::GemmMq2G256V2),
+            (DType::MQ4G256V2, KernelKey::GemmMq4G256V2),
+            (DType::MQ4CG256, KernelKey::GemmMq4CG256),
+        ];
+        let gfx12_ctx = DispatchCtx::for_test("gfx1200");
+        let gfx11_ctx = DispatchCtx::for_test("gfx1100");
+        for (dt, exp_key) in cases {
+            let fam = GemmFamily::new();
+            let variant = fam
+                .resolve(*dt, &gfx12_ctx, None)
+                .expect("gfx12 must admit V2");
+            assert_eq!(variant.key, *exp_key, "plain resolve mismatch for {:?}", dt);
+            assert_ne!(
+                variant.key,
+                KernelKey::GemmHfq4G256,
+                "V2 must not resolve to HFQ4 for {:?}",
+                dt
+            );
+            let err = fam.resolve(*dt, &gfx11_ctx, None).unwrap_err();
+            assert!(
+                matches!(err, DispatchError::MissingImpl { .. }),
+                "gfx1100 should reject {:?}, got {:?}",
+                dt,
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn v2_residual_run_key_not_hfq4() {
+        let gfx12_ctx = DispatchCtx::for_test("gfx1200");
+        let fam = GemmFamily::new();
+        for key in [
+            KernelKey::GemmMq6G256V2Residual,
+            KernelKey::GemmMq5G256V2Residual,
+            KernelKey::GemmMq3G256V2Residual,
+            KernelKey::GemmMq2G256V2Residual,
+        ] {
+            assert!(
+                fam.registry().resolve(key, &gfx12_ctx, None).is_ok(),
+                "residual {:?} should be admitted on gfx1200",
+                key
+            );
+            assert_ne!(key, KernelKey::GemmHfq4G256Residual);
+        }
     }
 }

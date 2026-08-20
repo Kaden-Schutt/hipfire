@@ -1643,6 +1643,23 @@ fn main() {
     let mut target_hidden_host: Vec<f32> =
         Vec::with_capacity(ctx_capacity * draft_cfg.num_extract() * draft_cfg.hidden);
 
+    // Retained-PM4 verify route. Same env opt-in and same default-off posture
+    // as the daemon; the demo is the production-faithful parity instrument
+    // because it drives the real chain decode loop with no synthetic oracle,
+    // no fabricated rollback, and no per-window reset.
+    let mut verify_pm4 = if hipfire_config::developer_var("HIPFIRE_DFLASH_VERIFY_PM4")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
+        eprintln!("[dflash-demo] retained verify PM4: armed");
+        hipfire_arch_qwen35::dflash_verify_pm4::DflashVerifyPm4::armed()
+    } else {
+        hipfire_arch_qwen35::dflash_verify_pm4::DflashVerifyPm4::disabled(
+            "HIPFIRE_DFLASH_VERIFY_PM4 is not set to 1",
+        )
+    };
+
     // ── Build FlashCASK policy (opt-in via --cask-sidecar) ──────────
     // The policy evicts target.kv_cache between spec_step cycles.
     // compact_offset is maintained on kv_cache itself, so qwen35's
@@ -2586,6 +2603,7 @@ fn main() {
                     runtime_repeat_penalty,
                     repeat_window,
                     None, // max_accept: uncapped demo
+                    Some(&mut verify_pm4),
                 )
                 .expect("spec step")
             };
@@ -2906,6 +2924,11 @@ fn main() {
         eprintln!("vram_used_mb: {}", vram_used_mb);
         eprintln!("vram_total_mb: {}", vram_total_mb);
         eprintln!("=====================");
+        eprintln!(
+            "dflash_verify_pm4: {}",
+            serde_json::to_string(&verify_pm4.report_json())
+                .unwrap_or_else(|_| "<unserializable>".to_string())
+        );
         eprintln!("accept_rate (accepted / (cycles × (B-1))): {accept_rate:.3}");
         eprintln!(
             "histogram: {:?}",

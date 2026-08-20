@@ -495,6 +495,136 @@ fn load_weight_tensor_raw(
                 awq_scale: None,
             })
         }
+        47 => {
+            // MQ6-G256 v2 (qt=47): 200 B/group, neutral Magnum V2.
+            // Header LE `[0..2)` fp16 s0, `[2..4)` fp16 z0, `[4..6)` fp16 s1,
+            // `[6..8)` fp16 z1, `[8..200)` 192 B 6-bit payload (4/3 B).
+            // Half 0 covers q[0..128), half 1 q[128..256); `w = q*f32(s[h])+f32(z[h])`.
+            // Mirror every qt44 guard: K%256 and exact byte count fail closed.
+            if k % 256 != 0 {
+                return Err(HipError::new(
+                    0,
+                    &format!("MQ6G256V2 has K={k} but requires K%256==0"),
+                ));
+            }
+            let gpr = k / 256;
+            let expected = m * gpr * rdna_compute::MQ6G256V2_GROUP_BYTES;
+            if data.len() != expected {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "MQ6G256V2 blob length mismatch: expected {expected}, got {}",
+                        data.len()
+                    ),
+                ));
+            }
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MQ6G256V2,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        48 => {
+            // MQ5-G256 v2 (qt=48): 168 B/group, neutral Magnum V2.
+            // Header LE `[0..2)` fp16 s0, `[2..4)` fp16 z0, `[4..6)` fp16 s1,
+            // `[6..8)` fp16 z1, `[8..168)` 160 B 5-bit payload (8/5 B).
+            if k % 256 != 0 {
+                return Err(HipError::new(
+                    0,
+                    &format!("MQ5G256V2 has K={k} but requires K%256==0"),
+                ));
+            }
+            let gpr = k / 256;
+            let expected = m * gpr * rdna_compute::MQ5G256V2_GROUP_BYTES;
+            if data.len() != expected {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "MQ5G256V2 blob length mismatch: expected {expected}, got {}",
+                        data.len()
+                    ),
+                ));
+            }
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MQ5G256V2,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        49 => {
+            // MQ3-G256 v2 (qt=49): 104 B/group, neutral Magnum V2.
+            // Header LE `[0..2)` fp16 s0, `[2..4)` fp16 z0, `[4..6)` fp16 s1,
+            // `[6..8)` fp16 z1, `[8..104)` 96 B 3-bit payload (8/3 B).
+            if k % 256 != 0 {
+                return Err(HipError::new(
+                    0,
+                    &format!("MQ3G256V2 has K={k} but requires K%256==0"),
+                ));
+            }
+            let gpr = k / 256;
+            let expected = m * gpr * rdna_compute::MQ3G256V2_GROUP_BYTES;
+            if data.len() != expected {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "MQ3G256V2 blob length mismatch: expected {expected}, got {}",
+                        data.len()
+                    ),
+                ));
+            }
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MQ3G256V2,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        50 => {
+            // MQ2-G256 v2 (qt=50): 72 B/group, neutral Magnum V2.
+            // Header LE `[0..2)` fp16 s0, `[2..4)` fp16 z0, `[4..6)` fp16 s1,
+            // `[6..8)` fp16 z1, `[8..72)` 64 B 2-bit payload (4/B).
+            if k % 256 != 0 {
+                return Err(HipError::new(
+                    0,
+                    &format!("MQ2G256V2 has K={k} but requires K%256==0"),
+                ));
+            }
+            let gpr = k / 256;
+            let expected = m * gpr * rdna_compute::MQ2G256V2_GROUP_BYTES;
+            if data.len() != expected {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "MQ2G256V2 blob length mismatch: expected {expected}, got {}",
+                        data.len()
+                    ),
+                ));
+            }
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MQ2G256V2,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
         38 => {
             // MQ2-G256-GL — 2-bit codes vs the TENSOR-GLOBAL codebook GL_CB2 +
             // per-block fp16 scale. 2.0625 bpw. SoA, TWO regions, no per-group

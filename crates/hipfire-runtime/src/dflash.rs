@@ -180,11 +180,17 @@ impl DflashConfig {
                             .and_then(types_from)
                             .or_else(|| types_from(df))
                             .or_else(|| df.get("dflash_config").and_then(types_from))
-                            .or_else(|| cfg_obj.and_then(|c| c.get("dflash_config")).and_then(types_from));
+                            .or_else(|| {
+                                cfg_obj
+                                    .and_then(|c| c.get("dflash_config"))
+                                    .and_then(types_from)
+                            });
                         match types {
                             Some(types) => {
                                 let is_all_sliding = types.len() == n_layers
-                                    && types.iter().all(|t| t.as_str().unwrap_or("") == "sliding_attention");
+                                    && types
+                                        .iter()
+                                        .all(|t| t.as_str().unwrap_or("") == "sliding_attention");
                                 let is_split = types.len() == n_layers
                                     && types.iter().enumerate().all(|(i, t)| {
                                         let s = t.as_str().unwrap_or("");
@@ -306,7 +312,7 @@ pub struct DflashWeights {
     // DFlash2 candidate selector (host-side)
     pub selector_hidden_proj: Option<WeightTensor>, // [rank, hidden]
     pub predecessor_codebook: Option<SelectorCodebook>, // [vocab, rank]
-    pub successor_codebook: Option<SelectorCodebook>,   // [vocab, rank]
+    pub successor_codebook: Option<SelectorCodebook>, // [vocab, rank]
     pub selector_rank: Option<usize>,
     pub selector_top_k: Option<usize>,
     pub conv_group_size: Option<usize>,
@@ -503,10 +509,105 @@ fn hfq_weight(
                 awq_scale: None,
             })
         }
+        47 => {
+            // MQ6G256V2 (qt=47): 200 B/group, per-128 fp16 s0/z0/s1/z1 + 6-bit payload.
+            if k % 256 != 0 {
+                panic!("dflash {name} MQ6G256V2 requires K%256==0 (got K={k})");
+            }
+            let groups = k / 256;
+            let expected = m * groups * rdna_compute::MQ6G256V2_GROUP_BYTES;
+            if data.len() != expected {
+                panic!(
+                    "dflash {name} MQ6G256V2 blob length mismatch: expected {expected}, got {} (M={m} K={k})",
+                    data.len()
+                );
+            }
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MQ6G256V2,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        48 => {
+            // MQ5G256V2 (qt=48): 168 B/group, per-128 fp16 + 5-bit payload.
+            if k % 256 != 0 {
+                panic!("dflash {name} MQ5G256V2 requires K%256==0 (got K={k})");
+            }
+            let groups = k / 256;
+            let expected = m * groups * rdna_compute::MQ5G256V2_GROUP_BYTES;
+            if data.len() != expected {
+                panic!(
+                    "dflash {name} MQ5G256V2 blob length mismatch: expected {expected}, got {} (M={m} K={k})",
+                    data.len()
+                );
+            }
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MQ5G256V2,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        49 => {
+            // MQ3G256V2 (qt=49): 104 B/group, per-128 fp16 + 3-bit payload.
+            if k % 256 != 0 {
+                panic!("dflash {name} MQ3G256V2 requires K%256==0 (got K={k})");
+            }
+            let groups = k / 256;
+            let expected = m * groups * rdna_compute::MQ3G256V2_GROUP_BYTES;
+            if data.len() != expected {
+                panic!(
+                    "dflash {name} MQ3G256V2 blob length mismatch: expected {expected}, got {} (M={m} K={k})",
+                    data.len()
+                );
+            }
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MQ3G256V2,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        50 => {
+            // MQ2G256V2 (qt=50): 72 B/group, per-128 fp16 + 2-bit payload.
+            if k % 256 != 0 {
+                panic!("dflash {name} MQ2G256V2 requires K%256==0 (got K={k})");
+            }
+            let groups = k / 256;
+            let expected = m * groups * rdna_compute::MQ2G256V2_GROUP_BYTES;
+            if data.len() != expected {
+                panic!(
+                    "dflash {name} MQ2G256V2 blob length mismatch: expected {expected}, got {} (M={m} K={k})",
+                    data.len()
+                );
+            }
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MQ2G256V2,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
         q => panic!("dflash: unsupported matrix quant_type {q} for {name}"),
     }?;
     // AWQ sidecar attachment — same pattern as hfq.rs::load_weight_tensor
-    // and qwen35.rs::load_weight_tensor. Routed through the centralized
     // `DType::supports_awq_sidecar` allow-list so future widening (MQ6,
     // MQ2, MQ3-Lloyd, MFP4) is a single helper edit. Sidecar absent →
     // `awq_scale` stays None, dispatch path matches the pre-fix behavior.
@@ -548,10 +649,19 @@ impl DflashWeights {
                 let name = format!("{p}.self_attn.attention_conv.base_kernel");
                 // also try alternate naming `attn_conv` if upstream uses that
                 let alt = format!("{p}.attention_conv.base_kernel");
-                let key = if hfq.tensor_data(&name).is_some() { name } else { alt };
+                let key = if hfq.tensor_data(&name).is_some() {
+                    name
+                } else {
+                    alt
+                };
                 if hfq.tensor_data(&key).is_some() {
                     // shape 2*K*H
-                    Some(hfq_tensor_f32(hfq, gpu, &key, vec![2 * conv_k * cfg.hidden])?)
+                    Some(hfq_tensor_f32(
+                        hfq,
+                        gpu,
+                        &key,
+                        vec![2 * conv_k * cfg.hidden],
+                    )?)
                 } else {
                     None
                 }
@@ -561,7 +671,11 @@ impl DflashWeights {
             let attn_conv_proj = if cfg.conv_kernel_size.is_some() {
                 let name = format!("{p}.self_attn.attention_conv.kernel_projection.weight");
                 let alt = format!("{p}.attention_conv.kernel_projection.weight");
-                let key = if hfq.tensor_data(&name).is_some() { name } else { alt };
+                let key = if hfq.tensor_data(&name).is_some() {
+                    name
+                } else {
+                    alt
+                };
                 if hfq.tensor_data(&key).is_some() {
                     Some(hfq_weight(hfq, gpu, &key, proj_m, cfg.hidden)?)
                 } else {
@@ -573,9 +687,18 @@ impl DflashWeights {
             let mlp_conv_base = if cfg.conv_kernel_size.is_some() {
                 let name = format!("{p}.mlp.mlp_conv.base_kernel");
                 let alt = format!("{p}.mlp_conv.base_kernel");
-                let key = if hfq.tensor_data(&name).is_some() { name } else { alt };
+                let key = if hfq.tensor_data(&name).is_some() {
+                    name
+                } else {
+                    alt
+                };
                 if hfq.tensor_data(&key).is_some() {
-                    Some(hfq_tensor_f32(hfq, gpu, &key, vec![2 * conv_k * cfg.hidden])?)
+                    Some(hfq_tensor_f32(
+                        hfq,
+                        gpu,
+                        &key,
+                        vec![2 * conv_k * cfg.hidden],
+                    )?)
                 } else {
                     None
                 }
@@ -585,7 +708,11 @@ impl DflashWeights {
             let mlp_conv_proj = if cfg.conv_kernel_size.is_some() {
                 let name = format!("{p}.mlp.mlp_conv.kernel_projection.weight");
                 let alt = format!("{p}.mlp_conv.kernel_projection.weight");
-                let key = if hfq.tensor_data(&name).is_some() { name } else { alt };
+                let key = if hfq.tensor_data(&name).is_some() {
+                    name
+                } else {
+                    alt
+                };
                 if hfq.tensor_data(&key).is_some() {
                     Some(hfq_weight(hfq, gpu, &key, proj_m, cfg.hidden)?)
                 } else {
@@ -698,7 +825,10 @@ impl DflashWeights {
         } else {
             None
         };
-        let load_codebook = |names: &[&str], vocab: usize, rank: usize| -> Option<SelectorCodebook> {
+        let load_codebook = |names: &[&str],
+                             vocab: usize,
+                             rank: usize|
+         -> Option<SelectorCodebook> {
             for n in names {
                 if let Some((info, data)) = hfq.tensor_data(n) {
                     let expected = vocab * rank;
@@ -709,15 +839,27 @@ impl DflashWeights {
                             for chunk in data.chunks_exact(2) {
                                 v.push(u16::from_le_bytes([chunk[0], chunk[1]]));
                             }
-                            return Some(SelectorCodebook { vocab, rank, f16_data: Some(v), f32_data: None });
+                            return Some(SelectorCodebook {
+                                vocab,
+                                rank,
+                                f16_data: Some(v),
+                                f32_data: None,
+                            });
                         }
                         2 => {
                             assert_eq!(data.len(), expected * 4, "codebook {n} F32 size mismatch");
                             let mut v = Vec::with_capacity(expected);
                             for chunk in data.chunks_exact(4) {
-                                v.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+                                v.push(f32::from_le_bytes([
+                                    chunk[0], chunk[1], chunk[2], chunk[3],
+                                ]));
                             }
-                            return Some(SelectorCodebook { vocab, rank, f16_data: None, f32_data: Some(v) });
+                            return Some(SelectorCodebook {
+                                vocab,
+                                rank,
+                                f16_data: None,
+                                f32_data: Some(v),
+                            });
                         }
                         q => panic!("selector codebook {n} unsupported quant_type {q}"),
                     }
@@ -725,28 +867,59 @@ impl DflashWeights {
             }
             None
         };
-        let (predecessor_codebook, successor_codebook, selector_rank_opt, selector_top_k_opt) = if cfg.selector_rank.is_some() {
-            let rank = cfg.selector_rank.unwrap();
-            let vocab = cfg.vocab_size;
-            let pred = load_codebook(&["candidate_selector.predecessor_codebook", "selector.predecessor_codebook", "candidate_selector.predecessor_codebook.weight", "selector.predecessor.weight"], vocab, rank);
-            let succ = load_codebook(&["candidate_selector.successor_codebook", "selector.successor_codebook", "candidate_selector.successor_codebook.weight", "selector.successor.weight"], vocab, rank);
-            (pred, succ, cfg.selector_rank, cfg.selector_top_k)
-        } else {
-            (None, None, None, None)
-        };
+        let (predecessor_codebook, successor_codebook, selector_rank_opt, selector_top_k_opt) =
+            if cfg.selector_rank.is_some() {
+                let rank = cfg.selector_rank.unwrap();
+                let vocab = cfg.vocab_size;
+                let pred = load_codebook(
+                    &[
+                        "candidate_selector.predecessor_codebook",
+                        "selector.predecessor_codebook",
+                        "candidate_selector.predecessor_codebook.weight",
+                        "selector.predecessor.weight",
+                    ],
+                    vocab,
+                    rank,
+                );
+                let succ = load_codebook(
+                    &[
+                        "candidate_selector.successor_codebook",
+                        "selector.successor_codebook",
+                        "candidate_selector.successor_codebook.weight",
+                        "selector.successor.weight",
+                    ],
+                    vocab,
+                    rank,
+                );
+                (pred, succ, cfg.selector_rank, cfg.selector_top_k)
+            } else {
+                (None, None, None, None)
+            };
 
         let has_mq = std::iter::once(&fc)
             .chain(layers.iter().flat_map(|l| {
-                let mut v: Vec<&WeightTensor> = vec![&l.wq, &l.wk, &l.wv, &l.wo, &l.w_gate, &l.w_up, &l.w_down];
-                if let Some(p) = &l.attn_conv_proj { v.push(p); }
-                if let Some(p) = &l.mlp_conv_proj { v.push(p); }
+                let mut v: Vec<&WeightTensor> =
+                    vec![&l.wq, &l.wk, &l.wv, &l.wo, &l.w_gate, &l.w_up, &l.w_down];
+                if let Some(p) = &l.attn_conv_proj {
+                    v.push(p);
+                }
+                if let Some(p) = &l.mlp_conv_proj {
+                    v.push(p);
+                }
                 v.into_iter()
             }))
             .chain(selector_hidden_proj.iter())
             .any(|w| {
                 matches!(
                     w.gpu_dtype,
-                    DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ6G256 | DType::MQ3G256
+                    DType::MQ4G256
+                        | DType::MQ4G256V2
+                        | DType::MQ6G256
+                        | DType::MQ6G256V2
+                        | DType::MQ5G256V2
+                        | DType::MQ3G256
+                        | DType::MQ3G256V2
+                        | DType::MQ2G256V2
                 )
             });
         if has_mq {
@@ -789,12 +962,22 @@ impl DflashWeights {
             l.w_gate.free_all(gpu);
             l.w_up.free_all(gpu);
             l.w_down.free_all(gpu);
-            if let Some(t) = l.attn_conv_base { let _ = gpu.free_tensor(t); }
-            if let Some(w) = l.attn_conv_proj { w.free_all(gpu); }
-            if let Some(t) = l.mlp_conv_base { let _ = gpu.free_tensor(t); }
-            if let Some(w) = l.mlp_conv_proj { w.free_all(gpu); }
+            if let Some(t) = l.attn_conv_base {
+                let _ = gpu.free_tensor(t);
+            }
+            if let Some(w) = l.attn_conv_proj {
+                w.free_all(gpu);
+            }
+            if let Some(t) = l.mlp_conv_base {
+                let _ = gpu.free_tensor(t);
+            }
+            if let Some(w) = l.mlp_conv_proj {
+                w.free_all(gpu);
+            }
         }
-        if let Some(w) = self.selector_hidden_proj { w.free_all(gpu); }
+        if let Some(w) = self.selector_hidden_proj {
+            w.free_all(gpu);
+        }
         // codebooks are host-side only, no VRAM to free
     }
 }
@@ -1054,11 +1237,11 @@ pub struct DflashScratch {
 
     // DFlash2 optional scratch: conv temp/dynamic and selector buffers.
     // Allocated only when the loaded draft actually needs them.
-    pub conv_temp: Option<GpuTensor>,    // [B, hidden]
-    pub conv_dynamic: Option<GpuTensor>, // [B, 2*K*G]
+    pub conv_temp: Option<GpuTensor>,     // [B, hidden]
+    pub conv_dynamic: Option<GpuTensor>,  // [B, 2*K*G]
     pub selector_proj: Option<GpuTensor>, // [B, rank]
-    pub topk_ids: Option<GpuTensor>,     // [B, K] i32 (stored as F32 buffer)
-    pub topk_vals: Option<GpuTensor>,    // [B, K] f32
+    pub topk_ids: Option<GpuTensor>,      // [B, K] i32 (stored as F32 buffer)
+    pub topk_vals: Option<GpuTensor>,     // [B, K] f32
 
     // Encapsulated `target_hidden` cursors: uploaded-row watermark, per-row
     // absolute positions, and projection-cache extent. The delta-upload
@@ -1250,7 +1433,10 @@ impl DflashScratch {
             let (ti, tv) = if need_selector {
                 let kk = cfg.selector_top_k.unwrap();
                 // ids as i32 stored in F32 buffer (reinterprets), vals as f32
-                (Some(gpu.alloc_tensor(&[b * kk], DType::F32)?), Some(gpu.alloc_tensor(&[b * kk], DType::F32)?))
+                (
+                    Some(gpu.alloc_tensor(&[b * kk], DType::F32)?),
+                    Some(gpu.alloc_tensor(&[b * kk], DType::F32)?),
+                )
             } else {
                 (None, None)
             };
@@ -1389,7 +1575,16 @@ impl DflashScratch {
         if let Some(t) = self.mq_x_rot {
             let _ = gpu.free_tensor(t);
         }
-        for t in [self.conv_temp, self.conv_dynamic, self.selector_proj, self.topk_ids, self.topk_vals].into_iter().flatten() {
+        for t in [
+            self.conv_temp,
+            self.conv_dynamic,
+            self.selector_proj,
+            self.topk_ids,
+            self.topk_vals,
+        ]
+        .into_iter()
+        .flatten()
+        {
             let _ = gpu.free_tensor(t);
         }
     }
@@ -1572,15 +1767,151 @@ fn gemm_dispatch(
                     }
                 } else {
                     let rot_view = scratch.sub_offset(0, n * w.k);
-                    if let Err(e) = crate::llama::rotate_x_mq_batched_for(
-                        gpu, w, &x_chunk, &rot_view, w.k, n,
-                    ) {
+                    if let Err(e) =
+                        crate::llama::rotate_x_mq_batched_for(gpu, w, &x_chunk, &rot_view, w.k, n)
+                    {
                         chunked = Err(e);
                         break;
                     }
-                    if let Err(e) = gpu.gemm_mq4g256v2_batched_lmhead(
-                        &w.buf, &rot_view, &y_chunk, w.m, w.k, n,
-                    ) {
+                    if let Err(e) =
+                        gpu.gemm_mq4g256v2_batched_lmhead(&w.buf, &rot_view, &y_chunk, w.m, w.k, n)
+                    {
+                        chunked = Err(e);
+                        break;
+                    }
+                }
+                row += n;
+            }
+            chunked
+        }
+        DType::MQ6G256V2 => {
+            let scratch = mq_x_rot.expect("MQ6V2 dispatch requires mq_x_rot scratch");
+            let max_chunk = (scratch.shape[0] / w.k).max(1);
+            let mut chunked: HipResult<()> = Ok(());
+            let mut row = 0;
+            while row < batch {
+                let n = std::cmp::min(max_chunk, batch - row);
+                let x_chunk = x.sub_offset(row * w.k, n * w.k);
+                let y_chunk = y.sub_offset(row * w.m, n * w.m);
+                if n == 1 {
+                    if let Err(e) = crate::llama::weight_gemv(gpu, w, &x_chunk, &y_chunk) {
+                        chunked = Err(e);
+                        break;
+                    }
+                } else {
+                    let rot_view = scratch.sub_offset(0, n * w.k);
+                    if let Err(e) =
+                        crate::llama::rotate_x_mq_batched_for(gpu, w, &x_chunk, &rot_view, w.k, n)
+                    {
+                        chunked = Err(e);
+                        break;
+                    }
+                    if let Err(e) =
+                        gpu.gemm_mq6g256v2_batched_lmhead(&w.buf, &rot_view, &y_chunk, w.m, w.k, n)
+                    {
+                        chunked = Err(e);
+                        break;
+                    }
+                }
+                row += n;
+            }
+            chunked
+        }
+        DType::MQ5G256V2 => {
+            let scratch = mq_x_rot.expect("MQ5V2 dispatch requires mq_x_rot scratch");
+            let max_chunk = (scratch.shape[0] / w.k).max(1);
+            let mut chunked: HipResult<()> = Ok(());
+            let mut row = 0;
+            while row < batch {
+                let n = std::cmp::min(max_chunk, batch - row);
+                let x_chunk = x.sub_offset(row * w.k, n * w.k);
+                let y_chunk = y.sub_offset(row * w.m, n * w.m);
+                if n == 1 {
+                    if let Err(e) = crate::llama::weight_gemv(gpu, w, &x_chunk, &y_chunk) {
+                        chunked = Err(e);
+                        break;
+                    }
+                } else {
+                    let rot_view = scratch.sub_offset(0, n * w.k);
+                    if let Err(e) =
+                        crate::llama::rotate_x_mq_batched_for(gpu, w, &x_chunk, &rot_view, w.k, n)
+                    {
+                        chunked = Err(e);
+                        break;
+                    }
+                    if let Err(e) =
+                        gpu.gemm_mq5g256v2_batched_lmhead(&w.buf, &rot_view, &y_chunk, w.m, w.k, n)
+                    {
+                        chunked = Err(e);
+                        break;
+                    }
+                }
+                row += n;
+            }
+            chunked
+        }
+        DType::MQ3G256V2 => {
+            let scratch = mq_x_rot.expect("MQ3V2 dispatch requires mq_x_rot scratch");
+            let max_chunk = (scratch.shape[0] / w.k).max(1);
+            gpu.scratch.fp16_x_source_ptr = std::ptr::null_mut();
+            let mut chunked: HipResult<()> = Ok(());
+            let mut row = 0;
+            while row < batch {
+                let n = std::cmp::min(max_chunk, batch - row);
+                let x_chunk = x.sub_offset(row * w.k, n * w.k);
+                let y_chunk = y.sub_offset(row * w.m, n * w.m);
+                if n == 1 {
+                    if let Err(e) = crate::llama::weight_gemv(gpu, w, &x_chunk, &y_chunk) {
+                        chunked = Err(e);
+                        break;
+                    }
+                } else {
+                    let rot_view = scratch.sub_offset(0, n * w.k);
+                    if let Err(e) =
+                        crate::llama::rotate_x_mq_batched_for(gpu, w, &x_chunk, &rot_view, w.k, n)
+                    {
+                        chunked = Err(e);
+                        break;
+                    }
+                    if let Err(e) =
+                        gpu.gemm_mq3g256v2_batched_lmhead(&w.buf, &rot_view, &y_chunk, w.m, w.k, n)
+                    {
+                        chunked = Err(e);
+                        break;
+                    }
+                }
+                row += n;
+            }
+            chunked
+        }
+        DType::MQ2G256V2 => {
+            let scratch = mq_x_rot.expect("MQ2V2 dispatch requires mq_x_rot scratch");
+            let max_chunk = (scratch.shape[0] / w.k).max(1);
+            gpu.scratch.fp16_x_source_ptr = std::ptr::null_mut();
+            let mut chunked: HipResult<()> = Ok(());
+            let mut row = 0;
+            while row < batch {
+                let n = std::cmp::min(max_chunk, batch - row);
+                let x_chunk = x.sub_offset(row * w.k, n * w.k);
+                let y_chunk = y.sub_offset(row * w.m, n * w.m);
+                if n == 1 {
+                    if let Err(e) = crate::llama::weight_gemv(gpu, w, &x_chunk, &y_chunk) {
+                        chunked = Err(e);
+                        break;
+                    }
+                } else {
+                    let rot_view = scratch.sub_offset(0, n * w.k);
+                    if let Err(e) =
+                        crate::llama::rotate_x_mq_batched_for(gpu, w, &x_chunk, &rot_view, w.k, n)
+                    {
+                        chunked = Err(e);
+                        break;
+                    }
+                    // MQ2V2 batched lm_head — sibling kernel work provides the wrapper.
+                    // If absent, this arm fails closed rather than mapping to legacy.
+                    if let Err(e) =
+                        gpu.gemm_mq2g256v2_batched_lmhead(&w.buf, &rot_view, &y_chunk, w.m, w.k, n)
+                    {
                         chunked = Err(e);
                         break;
                     }
@@ -1592,14 +1923,17 @@ fn gemm_dispatch(
         other => panic!("dflash gemm_dispatch: unsupported weight dtype {:?}", other),
     };
     if let Some(t) = t0 {
-        gpu.hip.device_synchronize()?;
         let us = t.elapsed().as_micros();
         let weight_bytes = match w.gpu_dtype {
             DType::F32 => w.m * w.k * 4,
             DType::F16 => w.m * w.k * 2,
             DType::MQ3G256 => w.m * (w.k / 256).max(1) * 104,
+            DType::MQ3G256V2 => w.m * (w.k / 256).max(1) * rdna_compute::MQ3G256V2_GROUP_BYTES,
             DType::HFQ4G256 | DType::MQ4G256 | DType::MQ4G256V2 => w.m * (w.k / 256).max(1) * 136,
             DType::MQ6G256 => w.m * (w.k / 256).max(1) * 200,
+            DType::MQ6G256V2 => w.m * (w.k / 256).max(1) * rdna_compute::MQ6G256V2_GROUP_BYTES,
+            DType::MQ5G256V2 => w.m * (w.k / 256).max(1) * rdna_compute::MQ5G256V2_GROUP_BYTES,
+            DType::MQ2G256V2 => w.m * (w.k / 256).max(1) * rdna_compute::MQ2G256V2_GROUP_BYTES,
             _ => w.m * w.k,
         };
         let bytes = weight_bytes + batch * w.k * 4 + batch * w.m * 4 * 2;
@@ -2015,7 +2349,11 @@ pub fn draft_forward_opts(
     // skipped it (research demos on non-speculator paths), its ring holds
     // stale rows — τ-only damage (verify is exact), but name it once.
     // All-sliding DFlash2 has no dedicated full layer, so the watermark is moot.
-    if windowed && full_w != swa_w && l > swa_w && scratch.thlog.full_cached_rows() < l.saturating_sub(swa_w) {
+    if windowed
+        && full_w != swa_w
+        && l > swa_w
+        && scratch.thlog.full_cached_rows() < l.saturating_sub(swa_w)
+    {
         static BACKFILL_WARNED: std::sync::atomic::AtomicBool =
             std::sync::atomic::AtomicBool::new(false);
         if !BACKFILL_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -2201,20 +2539,43 @@ pub fn draft_forward_opts(
         // ── DFlash2 prepare conv before QKV (no cross-cycle history) ─────
         // After RMSNorm, project normalized hidden to dynamic kernel coeffs
         // [B,2*K*G] then left-zero-padded grouped conv over the B rows.
-        let attn_prepare_src = if let (Some(base), Some(proj)) = (&layer.attn_conv_base, &layer.attn_conv_proj) {
-            if let (Some(dyn_buf), Some(tmp)) = (&scratch.conv_dynamic, &scratch.conv_temp) {
-                let k = cfg.conv_kernel_size.unwrap_or(2);
-                let g = cfg.conv_group_size.unwrap_or(16);
-                let groups = h / g;
-                let stride = 2 * k * groups;
-                // projection: x_norm [B,H] @ proj [2KG, H]^T -> dynamic [B,2KG]
-                let dyn_slice = dyn_buf.sub_offset(0, b * stride);
-                gemm_dispatch(gpu, &scratch.x_norm, proj, &dyn_slice, b, scratch.mq_x_rot.as_ref())?;
-                // prepare phase offset 0, window K*G
-                gpu.dynamic_causal_conv_f32(&scratch.x_norm, base, &dyn_slice, tmp, b, h, k, g, stride, 0)?;
-                Some(tmp as &GpuTensor)
-            } else { None }
-        } else { None };
+        let attn_prepare_src =
+            if let (Some(base), Some(proj)) = (&layer.attn_conv_base, &layer.attn_conv_proj) {
+                if let (Some(dyn_buf), Some(tmp)) = (&scratch.conv_dynamic, &scratch.conv_temp) {
+                    let k = cfg.conv_kernel_size.unwrap_or(2);
+                    let g = cfg.conv_group_size.unwrap_or(16);
+                    let groups = h / g;
+                    let stride = 2 * k * groups;
+                    // projection: x_norm [B,H] @ proj [2KG, H]^T -> dynamic [B,2KG]
+                    let dyn_slice = dyn_buf.sub_offset(0, b * stride);
+                    gemm_dispatch(
+                        gpu,
+                        &scratch.x_norm,
+                        proj,
+                        &dyn_slice,
+                        b,
+                        scratch.mq_x_rot.as_ref(),
+                    )?;
+                    // prepare phase offset 0, window K*G
+                    gpu.dynamic_causal_conv_f32(
+                        &scratch.x_norm,
+                        base,
+                        &dyn_slice,
+                        tmp,
+                        b,
+                        h,
+                        k,
+                        g,
+                        stride,
+                        0,
+                    )?;
+                    Some(tmp as &GpuTensor)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
         let qkv_src = attn_prepare_src.unwrap_or(&scratch.x_norm);
 
         let t0 = if dbg {
@@ -2623,18 +2984,8 @@ pub fn draft_forward_opts(
             )?;
             gpu.add_f32(&scratch.residual, tmp, &scratch.x)?;
         } else {
-            let graph_ffn_active =
-                graph_ffn && !dbg && !crate::config::get().draft_gemm_dump;
-            draft_ffn_layer_maybe_graph(
-                gpu,
-                layer,
-                scratch,
-                li,
-                b,
-                h,
-                eps,
-                graph_ffn_active,
-            )?;
+            let graph_ffn_active = graph_ffn && !dbg && !crate::config::get().draft_gemm_dump;
+            draft_ffn_layer_maybe_graph(gpu, layer, scratch, li, b, h, eps, graph_ffn_active)?;
         }
         // 2026-04-21: tried target's fused gemm_gate_up_hfq4g256 here (shared
         // FP16-X convert + interleaved gate/up GEMMs). Byte-exact A/B neutral
@@ -2714,7 +3065,6 @@ mod ring_tests {
 
 // ─── Candidate selector (DFlash2 chain-only) ───────────────────────────────
 
-
 /// Proposal returned by the DFlash2 selector. All rows flattened row-major.
 #[derive(Debug, Clone)]
 pub struct DflashCandidateProposal {
@@ -2771,7 +3121,10 @@ fn propose_inner(
     uniforms: Option<&[f32]>,
 ) -> HipResult<DflashCandidateProposal> {
     if temperature > 0.0 && uniforms.is_none() {
-        return Err(hip_bridge::HipError::new(0, "selector temperature>0 requires uniforms"));
+        return Err(hip_bridge::HipError::new(
+            0,
+            "selector temperature>0 requires uniforms",
+        ));
     }
     if let Some(u) = uniforms {
         if u.len() < rows {
@@ -2802,7 +3155,10 @@ fn propose_inner(
         for j in 0..k {
             let cand = top_ids[id_off + j] as usize;
             if cand >= cfg.vocab_size {
-                return Err(hip_bridge::HipError::new(0, "candidate id out of vocab range"));
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    "candidate id out of vocab range",
+                ));
             }
             let unary = top_vals[id_off + j];
             // dot( pred_cb[pred] * proj , succ_cb[cand] )
@@ -2873,7 +3229,10 @@ pub fn propose_candidates_host(
     let rank = weights.selector_rank.unwrap_or(256);
     let k = weights.selector_top_k.unwrap_or(16);
     if k == 0 || k > 16 {
-        return Err(hip_bridge::HipError::new(0, "selector_top_k must be in [1,16]"));
+        return Err(hip_bridge::HipError::new(
+            0,
+            "selector_top_k must be in [1,16]",
+        ));
     }
     if hidden.shape.iter().product::<usize>() < rows * weights.layers[0].wq.k
         && hidden.buf.size() < rows * weights.layers[0].wq.k * 4
@@ -2882,31 +3241,50 @@ pub fn propose_candidates_host(
     }
     let vocab = weights.predecessor_codebook.as_ref().unwrap().vocab;
     if host_logits.len() != rows * vocab {
-        return Err(hip_bridge::HipError::new(0, "host_logits length != rows*vocab"));
+        return Err(hip_bridge::HipError::new(
+            0,
+            "host_logits length != rows*vocab",
+        ));
     }
     if hidden.buf.size() < rows * weights.layers[0].wq.k * 4 && hidden.shape.is_empty() {
         // allow flat shape
     }
     // Project hidden -> rank on device (small GEMM) then D2H.
-    let proj = scratch.selector_proj.as_ref().ok_or_else(|| hip_bridge::HipError::new(0, "selector scratch not allocated"))?;
+    let proj = scratch
+        .selector_proj
+        .as_ref()
+        .ok_or_else(|| hip_bridge::HipError::new(0, "selector scratch not allocated"))?;
     let hp = weights.selector_hidden_proj.as_ref().unwrap();
     let proj_slice = proj.sub_offset(0, rows * rank);
-    gemm_dispatch(gpu, hidden, hp, &proj_slice, rows, scratch.mq_x_rot.as_ref())?;
+    gemm_dispatch(
+        gpu,
+        hidden,
+        hp,
+        &proj_slice,
+        rows,
+        scratch.mq_x_rot.as_ref(),
+    )?;
     // D2H projected hidden
     let mut host_proj = vec![0f32; rows * rank];
-    let bytes: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(host_proj.as_mut_ptr() as *mut u8, host_proj.len()*4) };
+    let bytes: &mut [u8] = unsafe {
+        std::slice::from_raw_parts_mut(host_proj.as_mut_ptr() as *mut u8, host_proj.len() * 4)
+    };
     gpu.hip.memcpy_dtoh(bytes, &proj_slice.buf)?;
     // CPU top-K per row (raw logits)
-    let mut top_ids = Vec::with_capacity(rows*k);
-    let mut top_vals = Vec::with_capacity(rows*k);
+    let mut top_ids = Vec::with_capacity(rows * k);
+    let mut top_vals = Vec::with_capacity(rows * k);
     for r in 0..rows {
         let off = r * vocab;
-        let row = &host_logits[off..off+vocab];
+        let row = &host_logits[off..off + vocab];
         // partial top-K via nth_element style: collect top k with sort
         let mut idxs: Vec<usize> = (0..vocab).collect();
         // Use select_nth_unstable_by for efficiency but simple sort for small K?
         // For correctness use full sort then take K (vocab up to 152k, rows up to 16, cost trivial)
-        idxs.sort_by(|&a, &b| row[b].partial_cmp(&row[a]).unwrap_or(std::cmp::Ordering::Equal));
+        idxs.sort_by(|&a, &b| {
+            row[b]
+                .partial_cmp(&row[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         for j in 0..k {
             let id = idxs[j] as u32;
             top_ids.push(id);
@@ -2914,7 +3292,27 @@ pub fn propose_candidates_host(
         }
     }
     propose_inner(
-        &DflashConfig { n_layers: 0, hidden: 0, intermediate: 0, n_heads: 0, n_kv_heads: 0, head_dim: 0, vocab_size: vocab, norm_eps: 0.0, rope_theta: 0.0, block_size: 0, mask_token_id: 0, target_layer_ids: vec![], num_target_layers: 0, declared_window: None, all_layers_sliding: false, conv_group_size: None, conv_kernel_size: None, selector_rank: Some(rank), selector_top_k: Some(k) },
+        &DflashConfig {
+            n_layers: 0,
+            hidden: 0,
+            intermediate: 0,
+            n_heads: 0,
+            n_kv_heads: 0,
+            head_dim: 0,
+            vocab_size: vocab,
+            norm_eps: 0.0,
+            rope_theta: 0.0,
+            block_size: 0,
+            mask_token_id: 0,
+            target_layer_ids: vec![],
+            num_target_layers: 0,
+            declared_window: None,
+            all_layers_sliding: false,
+            conv_group_size: None,
+            conv_kernel_size: None,
+            selector_rank: Some(rank),
+            selector_top_k: Some(k),
+        },
         weights,
         &host_proj,
         &top_ids,
@@ -2950,7 +3348,10 @@ pub fn propose_candidates_device(
     let rank = weights.selector_rank.unwrap_or(256);
     let k = weights.selector_top_k.unwrap_or(16);
     if k == 0 || k > 16 {
-        return Err(hip_bridge::HipError::new(0, "selector_top_k must be in [1,16]"));
+        return Err(hip_bridge::HipError::new(
+            0,
+            "selector_top_k must be in [1,16]",
+        ));
     }
     let vocab = weights.predecessor_codebook.as_ref().unwrap().vocab;
     if hidden.buf.size() < rows * 4 {
@@ -2960,16 +3361,34 @@ pub fn propose_candidates_device(
         return Err(hip_bridge::HipError::new(0, "logits buffer too small"));
     }
     // Project hidden -> rank
-    let proj = scratch.selector_proj.as_ref().ok_or_else(|| hip_bridge::HipError::new(0, "selector scratch not allocated"))?;
+    let proj = scratch
+        .selector_proj
+        .as_ref()
+        .ok_or_else(|| hip_bridge::HipError::new(0, "selector scratch not allocated"))?;
     let hp = weights.selector_hidden_proj.as_ref().unwrap();
     let proj_slice = proj.sub_offset(0, rows * rank);
-    gemm_dispatch(gpu, hidden, hp, &proj_slice, rows, scratch.mq_x_rot.as_ref())?;
+    gemm_dispatch(
+        gpu,
+        hidden,
+        hp,
+        &proj_slice,
+        rows,
+        scratch.mq_x_rot.as_ref(),
+    )?;
     let mut host_proj = vec![0f32; rows * rank];
-    let bytes: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(host_proj.as_mut_ptr() as *mut u8, host_proj.len()*4) };
+    let bytes: &mut [u8] = unsafe {
+        std::slice::from_raw_parts_mut(host_proj.as_mut_ptr() as *mut u8, host_proj.len() * 4)
+    };
     gpu.hip.memcpy_dtoh(bytes, &proj_slice.buf)?;
     // GPU top-K raw values (small D2H)
-    let top_ids_gpu = scratch.topk_ids.as_ref().ok_or_else(|| hip_bridge::HipError::new(0, "topk_ids scratch not allocated"))?;
-    let top_vals_gpu = scratch.topk_vals.as_ref().ok_or_else(|| hip_bridge::HipError::new(0, "topk_vals scratch not allocated"))?;
+    let top_ids_gpu = scratch
+        .topk_ids
+        .as_ref()
+        .ok_or_else(|| hip_bridge::HipError::new(0, "topk_ids scratch not allocated"))?;
+    let top_vals_gpu = scratch
+        .topk_vals
+        .as_ref()
+        .ok_or_else(|| hip_bridge::HipError::new(0, "topk_vals scratch not allocated"))?;
     let ids_slice = top_ids_gpu.sub_offset(0, rows * k);
     let vals_slice = top_vals_gpu.sub_offset(0, rows * k);
     // Call the raw top-k primitive; the string `topk_values_batched_f32` is kept for grep checks
@@ -2983,8 +3402,8 @@ pub fn propose_candidates_device(
     let mut vals_bytes = vec![0u8; rows * k * 4];
     gpu.hip.memcpy_dtoh(&mut ids_bytes, &ids_slice.buf)?;
     gpu.hip.memcpy_dtoh(&mut vals_bytes, &vals_slice.buf)?;
-    let mut top_ids = Vec::with_capacity(rows*k);
-    let mut top_vals = Vec::with_capacity(rows*k);
+    let mut top_ids = Vec::with_capacity(rows * k);
+    let mut top_vals = Vec::with_capacity(rows * k);
     for chunk in ids_bytes.chunks_exact(4) {
         top_ids.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
     }
@@ -2992,7 +3411,27 @@ pub fn propose_candidates_device(
         top_vals.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
     }
     propose_inner(
-        &DflashConfig { n_layers: 0, hidden: 0, intermediate: 0, n_heads: 0, n_kv_heads: 0, head_dim: 0, vocab_size: vocab, norm_eps: 0.0, rope_theta: 0.0, block_size: 0, mask_token_id: 0, target_layer_ids: vec![], num_target_layers: 0, declared_window: None, all_layers_sliding: false, conv_group_size: None, conv_kernel_size: None, selector_rank: Some(rank), selector_top_k: Some(k) },
+        &DflashConfig {
+            n_layers: 0,
+            hidden: 0,
+            intermediate: 0,
+            n_heads: 0,
+            n_kv_heads: 0,
+            head_dim: 0,
+            vocab_size: vocab,
+            norm_eps: 0.0,
+            rope_theta: 0.0,
+            block_size: 0,
+            mask_token_id: 0,
+            target_layer_ids: vec![],
+            num_target_layers: 0,
+            declared_window: None,
+            all_layers_sliding: false,
+            conv_group_size: None,
+            conv_kernel_size: None,
+            selector_rank: Some(rank),
+            selector_top_k: Some(k),
+        },
         weights,
         &host_proj,
         &top_ids,

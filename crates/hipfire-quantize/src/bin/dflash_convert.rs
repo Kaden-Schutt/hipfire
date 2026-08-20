@@ -207,7 +207,6 @@ fn quantize_mq4g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8>
     }
     output
 }
-
 /// MagnumQuant MQ4G256 v2 (qt=44): per-128 asymmetric, fp16 header, G256 layout.
 ///
 /// Lifted from hipfire-quantize/main.rs `quantize_mq4g256v2`. 136 B/group:
@@ -215,13 +214,7 @@ fn quantize_mq4g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8>
 /// `[6..8)` fp16 zero h1, `[8..136)` packed nibbles (same order as MQ4-G256).
 const MQ4V2_GROUP_BYTES: usize = 136;
 
-fn quantize_mq4g256v2(
-    w: &[f32],
-    m: usize,
-    k: usize,
-    signs1: &[f32],
-    signs2: &[f32],
-) -> Vec<u8> {
+fn quantize_mq4g256v2(w: &[f32], m: usize, k: usize, signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
     // m,k are the logical 2D shape; encoding is linear over w (API parity with main).
     let _ = (m, k);
     let group_size = 256;
@@ -289,7 +282,6 @@ fn quantize_mq4g256v2(
     output
 }
 
-
 /// MagnumQuant MQ6-G256: FWHT-rotated 6-bit quantization.
 /// 200 bytes per 256 weights (0.781 B/w). Same binary layout as HFQ6-G256.
 fn quantize_mq6g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
@@ -334,6 +326,284 @@ fn quantize_mq6g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8>
     output
 }
 
+const MQ6V2_GROUP_BYTES: usize = 200;
+const MQ5V2_GROUP_BYTES: usize = 168;
+const MQ3V2_GROUP_BYTES: usize = 104;
+const MQ2V2_GROUP_BYTES: usize = 72;
+
+fn quantize_mq6g256v2(w: &[f32], m: usize, k: usize, signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+    assert!(k % 256 == 0, "MQ6G256V2 requires K%256==0");
+    assert_eq!(w.len(), m * k);
+    let gpr = k / 256;
+    let total_groups = m * gpr;
+    let block_bytes = MQ6V2_GROUP_BYTES;
+    let mut output = vec![0u8; total_groups * block_bytes];
+    for b in 0..total_groups {
+        let start = b * 256;
+        let mut group = [0.0f32; 256];
+        group.copy_from_slice(&w[start..start + 256]);
+        cpu_fwht_256(&mut group, signs1, signs2);
+        let mut scales = [0u16; 2];
+        let mut zeros = [0u16; 2];
+        let mut sts = [0.0f32; 2];
+        let mut zs = [0.0f32; 2];
+        let mut degenerate = [false; 2];
+        for h in 0..2 {
+            let off = h * 128;
+            let slice = &group[off..off + 128];
+            let lo = slice.iter().cloned().fold(f32::INFINITY, f32::min);
+            let hi = slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let step_f32 = if hi > lo { (hi - lo) / 63.0 } else { 0.0 };
+            let sc_bits = if hi == lo { 0u16 } else { f32_to_f16(step_f32) };
+            let z_bits = f32_to_f16(lo);
+            scales[h] = sc_bits;
+            zeros[h] = z_bits;
+            sts[h] = f16_to_f32(sc_bits);
+            zs[h] = f16_to_f32(z_bits);
+            degenerate[h] = hi == lo || step_f32 == 0.0 || sts[h] == 0.0;
+        }
+        let out_off = b * block_bytes;
+        output[out_off..out_off + 2].copy_from_slice(&scales[0].to_le_bytes());
+        output[out_off + 2..out_off + 4].copy_from_slice(&zeros[0].to_le_bytes());
+        output[out_off + 4..out_off + 6].copy_from_slice(&scales[1].to_le_bytes());
+        output[out_off + 6..out_off + 8].copy_from_slice(&zeros[1].to_le_bytes());
+        let mut q = [0u8; 256];
+        for h in 0..2 {
+            let off = h * 128;
+            if degenerate[h] {
+                for i in 0..128 {
+                    q[off + i] = 0;
+                }
+            } else {
+                let st = sts[h];
+                let z = zs[h];
+                let inv = 1.0 / st;
+                for i in 0..128 {
+                    q[off + i] = ((group[off + i] - z) * inv + 0.5).floor().clamp(0.0, 63.0) as u8;
+                }
+            }
+        }
+        for i in (0..256).step_by(4) {
+            let bo = out_off + 8 + (i / 4) * 3;
+            let q0 = q[i] & 63;
+            let q1 = q[i + 1] & 63;
+            let q2 = q[i + 2] & 63;
+            let q3 = q[i + 3] & 63;
+            output[bo] = q0 | (q1 << 6);
+            output[bo + 1] = (q1 >> 2) | (q2 << 4);
+            output[bo + 2] = (q2 >> 4) | (q3 << 2);
+        }
+    }
+    output
+}
+
+fn quantize_mq5g256v2(w: &[f32], m: usize, k: usize, signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+    assert!(k % 256 == 0, "MQ5G256V2 requires K%256==0");
+    assert_eq!(w.len(), m * k);
+    let gpr = k / 256;
+    let total_groups = m * gpr;
+    let block_bytes = MQ5V2_GROUP_BYTES;
+    let mut output = vec![0u8; total_groups * block_bytes];
+    for b in 0..total_groups {
+        let start = b * 256;
+        let mut group = [0.0f32; 256];
+        group.copy_from_slice(&w[start..start + 256]);
+        cpu_fwht_256(&mut group, signs1, signs2);
+        let mut scales = [0u16; 2];
+        let mut zeros = [0u16; 2];
+        let mut sts = [0.0f32; 2];
+        let mut zs = [0.0f32; 2];
+        let mut degenerate = [false; 2];
+        for h in 0..2 {
+            let off = h * 128;
+            let slice = &group[off..off + 128];
+            let lo = slice.iter().cloned().fold(f32::INFINITY, f32::min);
+            let hi = slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let step_f32 = if hi > lo { (hi - lo) / 31.0 } else { 0.0 };
+            let sc_bits = if hi == lo { 0u16 } else { f32_to_f16(step_f32) };
+            let z_bits = f32_to_f16(lo);
+            scales[h] = sc_bits;
+            zeros[h] = z_bits;
+            sts[h] = f16_to_f32(sc_bits);
+            zs[h] = f16_to_f32(z_bits);
+            degenerate[h] = hi == lo || step_f32 == 0.0 || sts[h] == 0.0;
+        }
+        let out_off = b * block_bytes;
+        output[out_off..out_off + 2].copy_from_slice(&scales[0].to_le_bytes());
+        output[out_off + 2..out_off + 4].copy_from_slice(&zeros[0].to_le_bytes());
+        output[out_off + 4..out_off + 6].copy_from_slice(&scales[1].to_le_bytes());
+        output[out_off + 6..out_off + 8].copy_from_slice(&zeros[1].to_le_bytes());
+        let mut q = [0u8; 256];
+        for h in 0..2 {
+            let off = h * 128;
+            if degenerate[h] {
+                for i in 0..128 {
+                    q[off + i] = 0;
+                }
+            } else {
+                let st = sts[h];
+                let z = zs[h];
+                let inv = 1.0 / st;
+                for i in 0..128 {
+                    q[off + i] = ((group[off + i] - z) * inv + 0.5).floor().clamp(0.0, 31.0) as u8;
+                }
+            }
+        }
+        for i in (0..256).step_by(8) {
+            let bo = out_off + 8 + (i / 8) * 5;
+            let q0 = q[i] & 31;
+            let q1 = q[i + 1] & 31;
+            let q2 = q[i + 2] & 31;
+            let q3 = q[i + 3] & 31;
+            let q4 = q[i + 4] & 31;
+            let q5 = q[i + 5] & 31;
+            let q6 = q[i + 6] & 31;
+            let q7 = q[i + 7] & 31;
+            output[bo] = q0 | (q1 << 5);
+            output[bo + 1] = (q1 >> 3) | (q2 << 2) | (q3 << 7);
+            output[bo + 2] = (q3 >> 1) | (q4 << 4);
+            output[bo + 3] = (q4 >> 4) | (q5 << 1) | (q6 << 6);
+            output[bo + 4] = (q6 >> 2) | (q7 << 3);
+        }
+    }
+    output
+}
+
+fn quantize_mq3g256v2(w: &[f32], m: usize, k: usize, signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+    assert!(k % 256 == 0, "MQ3G256V2 requires K%256==0");
+    assert_eq!(w.len(), m * k);
+    let gpr = k / 256;
+    let total_groups = m * gpr;
+    let block_bytes = MQ3V2_GROUP_BYTES;
+    let mut output = vec![0u8; total_groups * block_bytes];
+    for b in 0..total_groups {
+        let start = b * 256;
+        let mut group = [0.0f32; 256];
+        group.copy_from_slice(&w[start..start + 256]);
+        cpu_fwht_256(&mut group, signs1, signs2);
+        let mut scales = [0u16; 2];
+        let mut zeros = [0u16; 2];
+        let mut sts = [0.0f32; 2];
+        let mut zs = [0.0f32; 2];
+        let mut degenerate = [false; 2];
+        for h in 0..2 {
+            let off = h * 128;
+            let slice = &group[off..off + 128];
+            let lo = slice.iter().cloned().fold(f32::INFINITY, f32::min);
+            let hi = slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let step = if hi > lo { (hi - lo) / 7.0 } else { 0.0 };
+            let sc = if hi == lo { 0u16 } else { f32_to_f16(step) };
+            let zb = f32_to_f16(lo);
+            scales[h] = sc;
+            zeros[h] = zb;
+            sts[h] = f16_to_f32(sc);
+            zs[h] = f16_to_f32(zb);
+            degenerate[h] = hi == lo || step == 0.0 || sts[h] == 0.0;
+        }
+        let out_off = b * block_bytes;
+        output[out_off..out_off + 2].copy_from_slice(&scales[0].to_le_bytes());
+        output[out_off + 2..out_off + 4].copy_from_slice(&zeros[0].to_le_bytes());
+        output[out_off + 4..out_off + 6].copy_from_slice(&scales[1].to_le_bytes());
+        output[out_off + 6..out_off + 8].copy_from_slice(&zeros[1].to_le_bytes());
+        let mut q = [0u8; 256];
+        for h in 0..2 {
+            let off = h * 128;
+            if degenerate[h] {
+                for i in 0..128 {
+                    q[off + i] = 0;
+                }
+            } else {
+                let st = sts[h];
+                let z = zs[h];
+                let inv = 1.0 / st;
+                for i in 0..128 {
+                    q[off + i] = ((group[off + i] - z) * inv + 0.5).floor().clamp(0.0, 7.0) as u8;
+                }
+            }
+        }
+        for chunk in 0..32 {
+            let ci = chunk * 8;
+            let mut qq = [0u8; 8];
+            for j in 0..8 {
+                qq[j] = q[ci + j] & 7;
+            }
+            let b0 = (qq[0] & 7) | ((qq[1] & 7) << 3) | ((qq[2] & 3) << 6);
+            let b1 =
+                ((qq[2] >> 2) & 1) | ((qq[3] & 7) << 1) | ((qq[4] & 7) << 4) | ((qq[5] & 1) << 7);
+            let b2 = ((qq[5] >> 1) & 3) | ((qq[6] & 7) << 2) | ((qq[7] & 7) << 5);
+            let bo = out_off + 8 + chunk * 3;
+            output[bo] = b0;
+            output[bo + 1] = b1;
+            output[bo + 2] = b2;
+        }
+    }
+    output
+}
+
+fn quantize_mq2g256v2(w: &[f32], m: usize, k: usize, signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+    assert!(k % 256 == 0, "MQ2G256V2 requires K%256==0");
+    assert_eq!(w.len(), m * k);
+    let gpr = k / 256;
+    let total_groups = m * gpr;
+    let block_bytes = MQ2V2_GROUP_BYTES;
+    let mut output = vec![0u8; total_groups * block_bytes];
+    for b in 0..total_groups {
+        let start = b * 256;
+        let mut group = [0.0f32; 256];
+        group.copy_from_slice(&w[start..start + 256]);
+        cpu_fwht_256(&mut group, signs1, signs2);
+        let mut scales = [0u16; 2];
+        let mut zeros = [0u16; 2];
+        let mut sts = [0.0f32; 2];
+        let mut zs = [0.0f32; 2];
+        let mut degenerate = [false; 2];
+        for h in 0..2 {
+            let off = h * 128;
+            let slice = &group[off..off + 128];
+            let lo = slice.iter().cloned().fold(f32::INFINITY, f32::min);
+            let hi = slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let step = if hi > lo { (hi - lo) / 3.0 } else { 0.0 };
+            let sc = if hi == lo { 0u16 } else { f32_to_f16(step) };
+            let zb = f32_to_f16(lo);
+            scales[h] = sc;
+            zeros[h] = zb;
+            sts[h] = f16_to_f32(sc);
+            zs[h] = f16_to_f32(zb);
+            degenerate[h] = hi == lo || step == 0.0 || sts[h] == 0.0;
+        }
+        let out_off = b * block_bytes;
+        output[out_off..out_off + 2].copy_from_slice(&scales[0].to_le_bytes());
+        output[out_off + 2..out_off + 4].copy_from_slice(&zeros[0].to_le_bytes());
+        output[out_off + 4..out_off + 6].copy_from_slice(&scales[1].to_le_bytes());
+        output[out_off + 6..out_off + 8].copy_from_slice(&zeros[1].to_le_bytes());
+        let mut q = [0u8; 256];
+        for h in 0..2 {
+            let off = h * 128;
+            if degenerate[h] {
+                for i in 0..128 {
+                    q[off + i] = 0;
+                }
+            } else {
+                let st = sts[h];
+                let z = zs[h];
+                let inv = 1.0 / st;
+                for i in 0..128 {
+                    q[off + i] = ((group[off + i] - z) * inv + 0.5).floor().clamp(0.0, 3.0) as u8;
+                }
+            }
+        }
+        for i in 0..64 {
+            let mut bv = 0u8;
+            for j in 0..4 {
+                let qq = q[4 * i + j] & 3;
+                bv |= qq << (j * 2);
+            }
+            output[out_off + 8 + i] = bv;
+        }
+    }
+    output
+}
+
 // ─── HFQ File Format ──────────────────────────────────────────────────────
 
 const HFQ_MAGIC: &[u8; 4] = b"HFQM";
@@ -352,6 +622,14 @@ enum QuantType {
     MQ3G256 = 17,
     /// MQ4G256 v2 (qt=44): per-128 asymmetric fp16 header, 136 B/group G256 layout.
     MQ4G256V2 = 44,
+    /// MQ6G256 v2 (qt=47): 200 B/group, per-128 fp16 s0/z0/s1/z1 + 6-bit payload.
+    MQ6G256V2 = 47,
+    /// MQ5G256 v2 (qt=48): 168 B/group, per-128 fp16 + 5-bit payload.
+    MQ5G256V2 = 48,
+    /// MQ3G256 v2 (qt=49): 104 B/group, per-128 fp16 + 3-bit payload.
+    MQ3G256V2 = 49,
+    /// MQ2G256 v2 (qt=50): 72 B/group, per-128 fp16 + 2-bit payload.
+    MQ2G256V2 = 50,
 }
 
 struct HfqTensor {
@@ -483,7 +761,11 @@ fn json_u64(v: &serde_json::Value, key: &str) -> Option<u64> {
 }
 
 /// Prefer nested `dflash_config` field, then legacy top-level config key.
-fn dflash_u64(dflash_cfg: &serde_json::Value, config: &serde_json::Value, key: &str) -> Option<u64> {
+fn dflash_u64(
+    dflash_cfg: &serde_json::Value,
+    config: &serde_json::Value,
+    key: &str,
+) -> Option<u64> {
     json_u64(dflash_cfg, key).or_else(|| json_u64(config, key))
 }
 
@@ -504,6 +786,10 @@ fn main() {
     let mut use_mq4v2 = false;
     let mut use_mq6 = false;
     let mut use_mq3 = false;
+    let mut use_mq6v2 = false;
+    let mut use_mq5v2 = false;
+    let mut use_mq3v2 = false;
+    let mut use_mq2v2 = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -536,9 +822,25 @@ fn main() {
                 use_mq3 = true;
                 i += 1;
             }
+            "--mq6v2" => {
+                use_mq6v2 = true;
+                i += 1;
+            }
+            "--mq5v2" => {
+                use_mq5v2 = true;
+                i += 1;
+            }
+            "--mq3v2" => {
+                use_mq3v2 = true;
+                i += 1;
+            }
+            "--mq2v2" => {
+                use_mq2v2 = true;
+                i += 1;
+            }
             "-h" | "--help" => {
                 eprintln!(
-                    "Usage: dflash_convert --input <dir_or_hf_id> --output <file.hfq> [--keep-f32 | --mq3 | --mq4 | --mq4v2 | --mq6]"
+                    "Usage: dflash_convert --input <dir_or_hf_id> --output <file.hfq> [--keep-f32 | --mq3 | --mq4 | --mq4v2 | --mq6 | --mq6v2 | --mq5v2 | --mq3v2 | --mq2v2]"
                 );
                 std::process::exit(0);
             }
@@ -552,9 +854,13 @@ fn main() {
         + (use_mq3 as u8)
         + (use_mq4 as u8)
         + (use_mq4v2 as u8)
-        + (use_mq6 as u8);
+        + (use_mq6 as u8)
+        + (use_mq6v2 as u8)
+        + (use_mq5v2 as u8)
+        + (use_mq3v2 as u8)
+        + (use_mq2v2 as u8);
     if n_format_flags > 1 {
-        eprintln!("--keep-f32, --mq3, --mq4, --mq4v2, and --mq6 are mutually exclusive");
+        eprintln!("--keep-f32, --mq3, --mq4, --mq4v2, --mq6, --mq6v2, --mq5v2, --mq3v2, --mq2v2 are mutually exclusive");
         std::process::exit(1);
     }
 
@@ -577,6 +883,14 @@ fn main() {
         "MQ4V2-G256/qt44 (2D weights), F16/F32 (norms/base_kernel/codebooks)"
     } else if use_mq6 {
         "MQ6-G256 (weights), F32 (norms)"
+    } else if use_mq6v2 {
+        "MQ6V2-G256/qt47 (2D weights), F16/F32 (norms/base_kernel/codebooks)"
+    } else if use_mq5v2 {
+        "MQ5V2-G256/qt48 (2D weights), F16/F32 (norms/base_kernel/codebooks)"
+    } else if use_mq3v2 {
+        "MQ3V2-G256/qt49 (2D weights), F16/F32 (norms/base_kernel/codebooks)"
+    } else if use_mq2v2 {
+        "MQ2V2-G256/qt50 (2D weights), F16/F32 (norms/base_kernel/codebooks)"
     } else {
         "F16 (weights), F32 (norms)"
     };
@@ -615,7 +929,8 @@ fn main() {
         .expect("config.json missing block_size (nested dflash_config or top-level)")
         as u32;
     let mask_token_id = dflash_u64(&dflash_cfg, &config, "mask_token_id")
-        .expect("missing mask_token_id (dflash_config or top-level)") as u32;
+        .expect("missing mask_token_id (dflash_config or top-level)")
+        as u32;
     let target_layer_ids = {
         let arr = dflash_cfg
             .get("target_layer_ids")
@@ -672,13 +987,28 @@ fn main() {
         "mq4v2"
     } else if use_mq6 {
         "mq6"
+    } else if use_mq6v2 {
+        "mq6v2"
+    } else if use_mq5v2 {
+        "mq5v2"
+    } else if use_mq3v2 {
+        "mq3v2"
+    } else if use_mq2v2 {
+        "mq2v2"
     } else {
         "f16"
     };
     // FWHT sign tables for MQ rotation. Seeds 42/1042 match the engine's
     // `rdna_compute::Gpu::ensure_mq_signs()` so quantized weights here can
     // be dequantized/used correctly on GPU at inference.
-    let needs_fwht = use_mq3 || use_mq4 || use_mq4v2 || use_mq6;
+    let needs_fwht = use_mq3
+        || use_mq4
+        || use_mq4v2
+        || use_mq6
+        || use_mq6v2
+        || use_mq5v2
+        || use_mq3v2
+        || use_mq2v2;
     let signs1: Vec<f32> = if needs_fwht {
         gen_fwht_signs(42, 256)
     } else {
@@ -719,7 +1049,11 @@ fn main() {
     // layer_types / sliding_window stay available so runtime can pick Windowed
     // with last-layer window = W (all-sliding DFlash2).
     if let Some(obj) = dflash_meta.as_object_mut() {
-        if dflash_cfg.as_object().map(|o| !o.is_empty()).unwrap_or(false) {
+        if dflash_cfg
+            .as_object()
+            .map(|o| !o.is_empty())
+            .unwrap_or(false)
+        {
             obj.insert("dflash_config".into(), dflash_cfg.clone());
         }
         if let Some(v) = conv_group_size {
@@ -798,7 +1132,14 @@ fn main() {
         // at inference. We still require N ≥ 256 to ensure a full first group
         // (per-group scale/min carries meaning). MQ4V2 (qt=44) only applies to
         // eligible 2D matrix weights using the established MQ4V2 G256 layout.
-        let mq_mode = use_mq3 || use_mq4 || use_mq4v2 || use_mq6;
+        let mq_mode = use_mq3
+            || use_mq4
+            || use_mq4v2
+            || use_mq6
+            || use_mq6v2
+            || use_mq5v2
+            || use_mq3v2
+            || use_mq2v2;
         let (quant_type, group_size, bytes) = if is_norm_tensor(name) {
             (QuantType::F32, 0u32, f32_slice_to_f32_bytes(&f32_data))
         } else if keep_f32 {
@@ -817,9 +1158,29 @@ fn main() {
         } else if use_mq6 && n_elements >= 256 {
             let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
             (QuantType::MQ6G256, 256u32, q)
+        } else if use_mq6v2 && meta.shape.len() == 2 && n_elements >= 256 {
+            let m = meta.shape[0];
+            let k = meta.shape[1];
+            let q = quantize_mq6g256v2(&f32_data, m, k, &signs1, &signs2);
+            (QuantType::MQ6G256V2, 256u32, q)
+        } else if use_mq5v2 && meta.shape.len() == 2 && n_elements >= 256 {
+            let m = meta.shape[0];
+            let k = meta.shape[1];
+            let q = quantize_mq5g256v2(&f32_data, m, k, &signs1, &signs2);
+            (QuantType::MQ5G256V2, 256u32, q)
         } else if use_mq3 && n_elements >= 256 {
             let q = quantize_mq3g256(&f32_data, &signs1, &signs2);
             (QuantType::MQ3G256, 256u32, q)
+        } else if use_mq3v2 && meta.shape.len() == 2 && n_elements >= 256 {
+            let m = meta.shape[0];
+            let k = meta.shape[1];
+            let q = quantize_mq3g256v2(&f32_data, m, k, &signs1, &signs2);
+            (QuantType::MQ3G256V2, 256u32, q)
+        } else if use_mq2v2 && meta.shape.len() == 2 && n_elements >= 256 {
+            let m = meta.shape[0];
+            let k = meta.shape[1];
+            let q = quantize_mq2g256v2(&f32_data, m, k, &signs1, &signs2);
+            (QuantType::MQ2G256V2, 256u32, q)
         } else {
             (QuantType::F16, 0u32, f32_slice_to_f16_bytes(&f32_data))
         };

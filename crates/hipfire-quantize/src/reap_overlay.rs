@@ -11,9 +11,13 @@ use crate::quant_e8::{
     quantize_mfp4g32_e8_soa_2d, quantize_mfp4g32_e8_soa_awls_2d, quantize_mfp4g32_e8_soa_gptq_2d,
     quantize_mfp4g32_e8_soa_lsq_2d,
 };
-use crate::quant_fwht::{gen_fwht_signs, quantize_hfq4g256, quantize_mq4g256, quantize_mq6g256};
+use crate::quant_fwht::{
+    gen_fwht_signs, quantize_hfq4g256, quantize_mq4g256, quantize_mq5g256v2, quantize_mq6g256,
+    quantize_mq6g256v2,
+};
 use crate::quant_mq::{
-    quantize_hfq6g256, quantize_mq2g256_lloyd, quantize_mq3g256_lloyd, quantize_mq4g256_lloyd,
+    quantize_hfq6g256, quantize_mq2g256_lloyd, quantize_mq2g256v2, quantize_mq3g256_lloyd,
+    quantize_mq3g256v2, quantize_mq4g256_lloyd,
 };
 use crate::quant_q4::quantize_q8f16;
 use hipfire_reap::plan::{QuantOverride, ReapPlan, Role};
@@ -52,6 +56,70 @@ pub fn quantize_to_format(
                 QuantType::MQ6G256,
                 256,
                 quantize_mq6g256(f32_data, &s1, &s2),
+            )
+        }
+        "mq6v2" | "mq6g256v2" => {
+            let (s1, s2) = signs();
+            let &[m, k] = shape else {
+                return Err(format!("reap: mq6v2 requires rank-2 tensor {name}"));
+            };
+            if k % 256 != 0 {
+                return Err(format!(
+                    "reap: mq6v2 requires K%256==0 for {name}, got K={k}"
+                ));
+            }
+            (
+                QuantType::MQ6G256V2,
+                256,
+                quantize_mq6g256v2(f32_data, m, k, &s1, &s2),
+            )
+        }
+        "mq5v2" | "mq5g256v2" => {
+            let (s1, s2) = signs();
+            let &[m, k] = shape else {
+                return Err(format!("reap: mq5v2 requires rank-2 tensor {name}"));
+            };
+            if k % 256 != 0 {
+                return Err(format!(
+                    "reap: mq5v2 requires K%256==0 for {name}, got K={k}"
+                ));
+            }
+            (
+                QuantType::MQ5G256V2,
+                256,
+                quantize_mq5g256v2(f32_data, m, k, &s1, &s2),
+            )
+        }
+        "mq3v2" | "mq3g256v2" => {
+            let (s1, s2) = signs();
+            let &[m, k] = shape else {
+                return Err(format!("reap: mq3v2 requires rank-2 tensor {name}"));
+            };
+            if k % 256 != 0 {
+                return Err(format!(
+                    "reap: mq3v2 requires K%256==0 for {name}, got K={k}"
+                ));
+            }
+            (
+                QuantType::MQ3G256V2,
+                256,
+                quantize_mq3g256v2(f32_data, m, k, &s1, &s2),
+            )
+        }
+        "mq2v2" | "mq2g256v2" => {
+            let (s1, s2) = signs();
+            let &[m, k] = shape else {
+                return Err(format!("reap: mq2v2 requires rank-2 tensor {name}"));
+            };
+            if k % 256 != 0 {
+                return Err(format!(
+                    "reap: mq2v2 requires K%256==0 for {name}, got K={k}"
+                ));
+            }
+            (
+                QuantType::MQ2G256V2,
+                256,
+                quantize_mq2g256v2(f32_data, m, k, &s1, &s2),
             )
         }
         "mq2lloyd" | "mq2g256lloyd" => {
@@ -459,6 +527,17 @@ mod tests {
             err.contains("unsupported overlay tier 'bogus'"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn rejects_dense_only_anchored_lloyd_tier() {
+        for format in ["mq2lloyd-anchored", "mq2lloyd_anchored"] {
+            let err = quantize_to_format("x", format, &[0.0; 256], &[1, 256]).unwrap_err();
+            assert!(
+                err.contains(&format!("unsupported overlay tier '{format}'")),
+                "got: {err}"
+            );
+        }
     }
 }
 

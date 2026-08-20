@@ -44,6 +44,12 @@ enum QuiescenceTransition {
     Failed,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Quiescence {
+    Proven,
+    Unknown,
+}
+
 fn apply_quiescence_transition(
     in_flight: &mut bool,
     usable: &mut bool,
@@ -79,6 +85,7 @@ pub struct SingleQueuePm4Ib {
     timestamp_frequency_hz: Option<u64>,
     dispatch_workgroup_offsets: Vec<usize>,
     usable: bool,
+    in_flight: bool,
 }
 
 impl SingleQueuePm4Ib {
@@ -319,6 +326,7 @@ impl SingleQueuePm4Ib {
             timestamp_frequency_hz,
             dispatch_workgroup_offsets,
             usable: true,
+            in_flight: false,
         })
     }
 
@@ -381,6 +389,34 @@ impl SingleQueuePm4Ib {
         Ok(())
     }
 
+    pub fn in_flight(&self) -> bool {
+        self.in_flight
+    }
+
+    pub fn quiesce(&mut self) -> Result<(), ReplayError> {
+        if !self.in_flight {
+            return Ok(());
+        }
+        match self.queues.inactivate_all() {
+            Ok(()) => {
+                apply_quiescence_transition(
+                    &mut self.in_flight,
+                    &mut self.usable,
+                    QuiescenceTransition::Cancelled,
+                );
+                Ok(())
+            }
+            Err(error) => {
+                apply_quiescence_transition(
+                    &mut self.in_flight,
+                    &mut self.usable,
+                    QuiescenceTransition::Failed,
+                );
+                Err(error.into())
+            }
+        }
+    }
+
     /// Submit and synchronously prove completion with a finite timeout.
     ///
     /// # Safety
@@ -390,26 +426,49 @@ impl SingleQueuePm4Ib {
     /// error they must remain live through this object's destruction.
     pub unsafe fn replay_and_wait(&mut self) -> Result<(), ReplayError> {
         // SAFETY: forwarded from this method's caller.
-        unsafe { self.replay_and_wait_inner() }
+        unsafe { self.replay_and_wait_checked() }.map_err(|(error, _)| error)
+    }
+
+    /// Checked variant that reports quiescence.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`Self::replay_and_wait`].
+    pub unsafe fn replay_and_wait_checked(&mut self) -> Result<(), (ReplayError, Quiescence)> {
+        // SAFETY: forwarded from this method's caller.
+        unsafe { self.replay_and_wait_inner_checked() }
     }
 
     /// Replay once and return the GPU-clock span bracketed inside the retained
     /// indirect buffer, excluding host queue publication and signal polling.
     pub unsafe fn replay_and_wait_profiled(&mut self) -> Result<GpuMultiQueueTiming, ReplayError> {
-        let frequency_hz = self
-            .timestamp_frequency_hz
-            .ok_or(ReplayError::ProfilingUnavailable)?;
         // SAFETY: forwarded from this method's caller.
-        unsafe { self.replay_and_wait_inner()? };
-        let bytes = self
-            .timestamps
-            .as_mut()
-            .ok_or(ReplayError::ProfilingUnavailable)?
-            .as_mut_bytes();
+        unsafe { self.replay_and_wait_profiled_checked() }.map_err(|(error, _)| error)
+    }
+
+    /// Checked variant of [`Self::replay_and_wait_profiled`].
+    pub unsafe fn replay_and_wait_profiled_checked(
+        &mut self,
+    ) -> Result<GpuMultiQueueTiming, (ReplayError, Quiescence)> {
+        let frequency_hz = match self.timestamp_frequency_hz {
+            Some(frequency_hz) => frequency_hz,
+            None => {
+                return Err((ReplayError::ProfilingUnavailable, Quiescence::Proven));
+            }
+        };
+        // SAFETY: forwarded from this method's caller.
+        unsafe { self.replay_and_wait_inner_checked()? };
+        let bytes = match self.timestamps.as_mut() {
+            Some(timestamps) => timestamps.as_mut_bytes(),
+            None => return Err((ReplayError::ProfilingUnavailable, Quiescence::Proven)),
+        };
         let start = u64::from_le_bytes(bytes[..8].try_into().unwrap());
         let end = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
         if start == 0 || end < start {
-            return Err(ReplayError::InvalidGpuTimestamp { start, end });
+            return Err((
+                ReplayError::InvalidGpuTimestamp { start, end },
+                Quiescence::Proven,
+            ));
         }
         Ok(GpuMultiQueueTiming {
             first_start: start,
@@ -432,22 +491,29 @@ impl SingleQueuePm4Ib {
     /// the two bracketing timestamps yields a single span, which is what
     /// [`replay_and_wait_profiled`] already reports.
     pub unsafe fn replay_and_wait_dispatch_spans(&mut self) -> Result<Vec<u64>, ReplayError> {
-        let frequency_hz = self
-            .timestamp_frequency_hz
-            .ok_or(ReplayError::ProfilingUnavailable)?;
         // SAFETY: forwarded from this method's caller.
-        unsafe { self.replay_and_wait_inner()? };
-        let bytes = self
-            .timestamps
-            .as_mut()
-            .ok_or(ReplayError::ProfilingUnavailable)?
-            .as_mut_bytes();
+        unsafe { self.replay_and_wait_dispatch_spans_checked() }.map_err(|(error, _)| error)
+    }
+
+    pub unsafe fn replay_and_wait_dispatch_spans_checked(
+        &mut self,
+    ) -> Result<Vec<u64>, (ReplayError, Quiescence)> {
+        let frequency_hz = match self.timestamp_frequency_hz {
+            Some(frequency_hz) => frequency_hz,
+            None => return Err((ReplayError::ProfilingUnavailable, Quiescence::Proven)),
+        };
+        // SAFETY: forwarded from this method's caller.
+        unsafe { self.replay_and_wait_inner_checked()? };
+        let bytes = match self.timestamps.as_mut() {
+            Some(timestamps) => timestamps.as_mut_bytes(),
+            None => return Err((ReplayError::ProfilingUnavailable, Quiescence::Proven)),
+        };
         let ticks: Vec<u64> = bytes
             .chunks_exact(8)
             .map(|word| u64::from_le_bytes(word.try_into().unwrap()))
             .collect();
         if ticks.len() < 2 {
-            return Err(ReplayError::ProfilingUnavailable);
+            return Err((ReplayError::ProfilingUnavailable, Quiescence::Proven));
         }
         let mut spans = Vec::with_capacity(ticks.len() - 1);
         for pair in ticks.windows(2) {
@@ -455,7 +521,10 @@ impl SingleQueuePm4Ib {
             // A zero or non-monotonic pair means the write did not land; report
             // it rather than silently producing a plausible-looking number.
             if start == 0 || end < start {
-                return Err(ReplayError::InvalidGpuTimestamp { start, end });
+                return Err((
+                    ReplayError::InvalidGpuTimestamp { start, end },
+                    Quiescence::Proven,
+                ));
             }
             spans.push((end - start).saturating_mul(1_000_000_000) / frequency_hz);
         }
@@ -469,8 +538,16 @@ impl SingleQueuePm4Ib {
         &mut self,
     ) -> Result<(GpuMultiQueueTiming, Vec<u64>), ReplayError> {
         // SAFETY: forwarded from this method's caller.
-        unsafe { self.replay_and_wait_inner()? };
+        unsafe { self.replay_and_wait_dispatch_profiled_checked() }.map_err(|(error, _)| error)
+    }
+
+    pub unsafe fn replay_and_wait_dispatch_profiled_checked(
+        &mut self,
+    ) -> Result<(GpuMultiQueueTiming, Vec<u64>), (ReplayError, Quiescence)> {
+        // SAFETY: forwarded from this method's caller.
+        unsafe { self.replay_and_wait_inner_checked()? };
         self.read_dispatch_profile()
+            .map_err(|error| (error, Quiescence::Proven))
     }
 
     /// Decode the timestamps written by the most recent instrumented replay.
@@ -511,37 +588,78 @@ impl SingleQueuePm4Ib {
     }
 
     unsafe fn replay_and_wait_inner(&mut self) -> Result<(), ReplayError> {
+        // SAFETY: forwarded from this method's caller.
+        unsafe { self.replay_and_wait_inner_checked() }.map_err(|(error, _)| error)
+    }
+
+    unsafe fn replay_and_wait_inner_checked(
+        &mut self,
+    ) -> Result<(), (ReplayError, Quiescence)> {
         if !self.usable {
-            return Err(ReplayError::GraphInactive);
+            return Err((ReplayError::GraphInactive, Quiescence::Proven));
+        }
+        if self.in_flight {
+            return Err((ReplayError::AlreadyInFlight, Quiescence::Proven));
         }
         self.completion.reset();
         if let Err(error) = self
             .queues
             .prepare_batches(std::slice::from_ref(&self.batch))
         {
-            self.usable = false;
-            return Err(error.into());
+            apply_quiescence_transition(
+                &mut self.in_flight,
+                &mut self.usable,
+                QuiescenceTransition::Cancelled,
+            );
+            return Err((error.into(), Quiescence::Proven));
         }
+        // Mark in-flight before doorbell publication.
+        self.in_flight = true;
         if let Err(error) = self.queues.ring_prepared() {
-            self.usable = false;
-            return Err(error.into());
+            apply_quiescence_transition(
+                &mut self.in_flight,
+                &mut self.usable,
+                QuiescenceTransition::Cancelled,
+            );
+            return Err((error.into(), Quiescence::Proven));
         }
         match self
             .queues
             .wait_signal(&self.completion, DEFAULT_WAIT_TIMEOUT)
         {
-            Ok(()) => Ok(()),
-            Err(operation) => {
-                self.usable = false;
-                match self.queues.inactivate_all() {
-                    Ok(()) => Err(operation.into()),
-                    Err(teardown) => Err(RuntimeError::OperationAndTeardown {
-                        operation: Box::new(operation),
-                        teardown: Box::new(teardown),
-                    }
-                    .into()),
-                }
+            Ok(()) => {
+                apply_quiescence_transition(
+                    &mut self.in_flight,
+                    &mut self.usable,
+                    QuiescenceTransition::Completed,
+                );
+                Ok(())
             }
+            Err(operation) => match self.queues.inactivate_all() {
+                Ok(()) => {
+                    apply_quiescence_transition(
+                        &mut self.in_flight,
+                        &mut self.usable,
+                        QuiescenceTransition::Cancelled,
+                    );
+                    Err((operation.into(), Quiescence::Proven))
+                }
+                Err(teardown) => {
+                    apply_quiescence_transition(
+                        &mut self.in_flight,
+                        &mut self.usable,
+                        QuiescenceTransition::Failed,
+                    );
+                    Err((
+                        RuntimeError::OperationAndTeardown {
+                            operation: Box::new(operation),
+                            teardown: Box::new(teardown),
+                        }
+                        .into(),
+                        Quiescence::Unknown,
+                    ))
+                }
+            },
         }
     }
 }
@@ -584,7 +702,7 @@ fn pm4_dispatch_workgroup_offsets(bytes: &[u8]) -> Result<Vec<usize>, ReplayErro
 
 impl Drop for SingleQueuePm4Ib {
     fn drop(&mut self) {
-        if !self.usable {
+        if self.in_flight || !self.usable {
             let _ = self.queues.inactivate_all();
         }
     }
@@ -3378,6 +3496,59 @@ mod tests {
         in_flight = true;
         apply_quiescence_transition(&mut in_flight, &mut usable, QuiescenceTransition::Cancelled);
         assert!(!in_flight);
+        assert!(!usable);
+    }
+
+    #[test]
+    fn quiescence_enum_maps_transitions() {
+        fn quiescence_for(transition: QuiescenceTransition) -> Quiescence {
+            let mut in_flight = true;
+            let mut usable = true;
+            apply_quiescence_transition(&mut in_flight, &mut usable, transition);
+            if in_flight {
+                Quiescence::Unknown
+            } else {
+                Quiescence::Proven
+            }
+        }
+        assert_eq!(quiescence_for(QuiescenceTransition::Completed), Quiescence::Proven);
+        assert_eq!(quiescence_for(QuiescenceTransition::Cancelled), Quiescence::Proven);
+        assert_eq!(quiescence_for(QuiescenceTransition::Failed), Quiescence::Unknown);
+    }
+
+    #[test]
+    fn quiescence_proven_allows_free_and_unknown_retains_in_flight() {
+        // Proven => safe to free; Unknown => must retain and Drop retry.
+        let mut in_flight = false;
+        let mut usable = true;
+        apply_quiescence_transition(&mut in_flight, &mut usable, QuiescenceTransition::Cancelled);
+        assert_eq!(in_flight, false);
+        // Failed keeps in_flight true
+        in_flight = true;
+        usable = true;
+        apply_quiescence_transition(&mut in_flight, &mut usable, QuiescenceTransition::Failed);
+        assert_eq!(in_flight, true);
+        assert_eq!(usable, false);
+    }
+
+    #[test]
+    fn unknown_quiescence_blocks_subsequent_replay_until_quiesce() {
+        // After Failed (Unknown), controller must remain in-flight+unusable
+        // so any subsequent replay is refused until quiesce proves Proven.
+        let mut in_flight = true;
+        let mut usable = false; // state after Failed
+        // Simulate Failed transition already applied
+        apply_quiescence_transition(&mut in_flight, &mut usable, QuiescenceTransition::Failed);
+        assert!(in_flight);
+        assert!(!usable);
+        // Subsequent replay attempt should be refused: usable false => Proven refusal
+        // (no new doorbell), and in_flight true prevents reuse.
+        let would_allow_replay = usable && !in_flight;
+        assert!(!would_allow_replay);
+        // Quiesce success => Cancelled transition clears in_flight
+        apply_quiescence_transition(&mut in_flight, &mut usable, QuiescenceTransition::Cancelled);
+        assert!(!in_flight);
+        // Still unusable (needs re-prepare), but quiescence now Proven so safe to free/reprepare
         assert!(!usable);
     }
 }
