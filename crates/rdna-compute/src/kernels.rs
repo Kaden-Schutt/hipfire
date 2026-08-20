@@ -2860,6 +2860,8 @@ pub const GEMM_HFQ4G256_RESIDUAL_WMMA_KSPLIT_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_ksplit.hip");
 pub const GEMM_HFQ4G256_RESIDUAL_WMMA_KSPLIT_DET_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_ksplit_det.hip");
+pub const GEMM_HFQ4G256_RESIDUAL_WMMA_KSPLIT_DET_BT2_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_ksplit_det_bt2.hip");
 pub const GEMM_KSPLIT_DET_FINALIZE_SRC: &str =
     include_str!("../../../kernels/src/gemm_ksplit_det_finalize.hip");
 // gfx12 (RDNA4) sister of GEMM_HFQ4G256_RESIDUAL_WMMA_K2_SRC. Same recipe

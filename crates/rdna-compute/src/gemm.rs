@@ -17653,11 +17653,23 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         const K_SPLITS: u32 = 4;
-        self.ensure_kernel(
-            "gemm_hfq4g256_residual_wmma_ksplit_det",
-            kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_KSPLIT_DET_SRC,
-            "gemm_hfq4g256_residual_wmma_ksplit_det",
-        )?;
+        // Batch-tiled B=2 variant for prefill (batch_size >= 32) on RDNA3 dGPU.
+        // Same weight-reuse principle as gate_up/qkvza bt2.
+        let use_bt2 = batch_size >= 32 && self.arch_caps.is_rdna3_dgpu();
+        let (kname, ksrc, n_tile) = if use_bt2 {
+            (
+                "gemm_hfq4g256_residual_wmma_ksplit_det_bt2",
+                kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_KSPLIT_DET_BT2_SRC,
+                32,
+            )
+        } else {
+            (
+                "gemm_hfq4g256_residual_wmma_ksplit_det",
+                kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_KSPLIT_DET_SRC,
+                16,
+            )
+        };
+        self.ensure_kernel(kname, ksrc, kname)?;
         self.ensure_kernel(
             "gemm_ksplit_det_finalize",
             kernels::GEMM_KSPLIT_DET_FINALIZE_SRC,
@@ -17684,17 +17696,17 @@ impl Gpu {
             &mut bs_val as *mut _ as *mut c_void,
         ];
         let row_tiles = ((m + 15) / 16) as u32;
-        let batch_tiles = ((batch_size + 15) / 16) as u32;
+        let batch_tiles = ((batch_size + n_tile - 1) / n_tile) as u32;
         let bytes =
             crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * k * 2 + batch_size * m * 4 * 2;
         let timer = crate::profile::begin_timer(
             &self.hip,
             "gemm",
-            "gemm_hfq4g256_residual_wmma_ksplit_det",
+            kname,
             bytes,
         );
         self.launch_maybe_blob(
-            "gemm_hfq4g256_residual_wmma_ksplit_det",
+            kname,
             [row_tiles, batch_tiles, K_SPLITS],
             [32, 1, 1],
             0,
