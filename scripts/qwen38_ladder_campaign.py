@@ -1269,6 +1269,9 @@ def do_bench_dflash(args: argparse.Namespace) -> int:
     if not args.dry_run and state.get("manifest_sha256") != msha:
         state["manifest_sha256"] = msha
         atomic_write_json(sp, state)
+    prior_dflash_completed = set(
+        state.get("phases", {}).get("bench-dflash", {}).get("completed", [])
+    )
     prompt_path = resolve_prompt_path(args.prompt, args.checkout)
     prompt_info = prompt_digest(prompt_path)
     bench_bin = Path(args.bench_bin) if args.bench_bin else Path(args.checkout) / "target/release/hipfire"
@@ -1284,16 +1287,20 @@ def do_bench_dflash(args: argparse.Namespace) -> int:
         cell_id = cell["cell_id"]
         # Determine draft for this cell via map; default same-bit
         desired_draft_codec = draft_map.get(cell["codec"], cell["codec"])
+        task_id = f"{cell_id}:{desired_draft_codec}"
+        if not args.dry_run and task_id in prior_dflash_completed:
+            eprint(f"bench-dflash {task_id} skip (resumable)")
+            continue
         draft = draft_by_codec.get(desired_draft_codec)
         if draft is None and not args.dry_run:
             eprint(f"bench-dflash {cell_id} missing draft codec {desired_draft_codec} — marking failed")
-            failed.append(cell_id)
+            failed.append(task_id)
             continue
         draft_path = draft["draft_path"] if draft else str(Path(args.qcal_dir) / "drafts" / f"qwen3.8-27b-dflash.{desired_draft_codec}.hfq")
         # Validate draft exists for non-dry-run
         if not args.dry_run and not Path(draft_path).is_file():
             eprint(f"bench-dflash {cell_id} draft file missing {draft_path} — run drafts phase first")
-            failed.append(cell_id)
+            failed.append(task_id)
             continue
         if args.dry_run:
             for rep in range(3):
@@ -1337,7 +1344,7 @@ def do_bench_dflash(args: argparse.Namespace) -> int:
                 "raw_stderr": serr,
             })
         if any_fail:
-            failed.append(cell_id)
+            failed.append(task_id)
             continue
         art = Path(cell["artifact"])
         dpath = Path(draft_path)
@@ -1377,7 +1384,7 @@ def do_bench_dflash(args: argparse.Namespace) -> int:
             "gpu": 0,
             "tau_samples": [o.get("tau") for o in [x for r in rep_outputs for x in r["parsed_json"]] if isinstance(o, dict) and "tau" in o],
             "acceptance_samples": [o.get("acceptance_rate") or o.get("acceptance") for o in [x for r in rep_outputs for x in r["parsed_json"]] if isinstance(o, dict)],
-            "control_mq4v2_included": True,
+            "control_mq4v2_included": desired_draft_codec == "mq4v2",
         }
         rp = results_path(args)
         results = load_results_strict(rp)
@@ -1389,7 +1396,6 @@ def do_bench_dflash(args: argparse.Namespace) -> int:
         state = load_state_strict(sp, expected_manifest_sha=msha)
         phases = state.setdefault("phases", {})
         bs = phases.setdefault("bench-dflash", {"completed": [], "failed": []})
-        task_id = f"{cell_id}:{desired_draft_codec}"
         bs["completed"] = sorted(set(bs.get("completed", [])) | {task_id})
         bs["failed"] = sorted(set(bs.get("failed", [])) - {task_id})
         bs["updated_at"] = utc_now()
@@ -1403,7 +1409,6 @@ def do_bench_dflash(args: argparse.Namespace) -> int:
         phases = state.setdefault("phases", {})
         bs = phases.setdefault("bench-dflash", {"completed": [], "failed": []})
         bs["failed"] = sorted(set(bs.get("failed", [])) | set(failed))
-        bs["completed"] = sorted(set(bs.get("completed", [])) | {f"{c}:same" for c in completed})  # not used
         atomic_write_json(sp, state)
         if failed:
             eprint(f"bench-dflash phase completed with {len(failed)} failures: {', '.join(failed)}")
