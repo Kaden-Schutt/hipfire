@@ -1091,22 +1091,31 @@ pub(crate) fn is_batchable_la(dt: DType, arch: &str) -> bool {
             .ok()
             .as_deref()
             == Some("1");
-    // MQ4G256V2 / MQ4CG256 (qt44/qt45) batched prefill GEMM exists only on
-    // gfx12 (gfx1200/gfx1201). On gfx10/gfx11 there is no batched GEMM — the
-    // scalar fused decode path is correct and is used via per-token fallback
-    // rather than dispatching a gfx12 WMMA kernel. Lockstep with
-    // hipfire_runtime::llama::is_batchable_la.
-    // Extended to neutral V2 family qt47-50 (MQ6/5/3/2V2) — same gfx12-only contract,
-    // same 72-200 B/group layouts, dedicated WMMA sources on gfx12.
-    let mq4_v2_gfx12 = matches!(
+    // MQ4G256V2 (qt44) and MQ6/5/3/2G256V2 (qt47-50) batched prefill GEMM.
+    // Dedicated WMMA sources exist for BOTH gfx11
+    // (gfx1100/1101/1102/1150/1151, wave32 WMMA) and gfx12 (gfx1200/1201) —
+    // parity-proven on gfx1100/gfx1151 at rel-RMS 2.5e-4–4.0e-4 across
+    // residual/qkv/qkvza/gate_up K=256/512 N=16/64. Admit on HasWmma
+    // (gfx1100/1101/1102/1150/1151 + gfx1200/1201) but gate the gfx11 half
+    // behind HIPFIRE_MQV2_GFX11_WMMA != "0" — setting
+    // HIPFIRE_MQV2_GFX11_WMMA=0 restores the per-token fallback ONLY on
+    // gfx11, leaving gfx12 untouched. Lockstep with the HasWmma predicate
+    // on GemmMq*G256V2* keys and with gemm_mq*g256v2's has_wmma() guard.
+    // MQ4CG256 (qt45) remains gfx12-only until its gfx11 sibling lands.
+    let mqv2_with_wmma = matches!(
         dt,
         DType::MQ4G256V2
-            | DType::MQ4CG256
             | DType::MQ6G256V2
             | DType::MQ5G256V2
             | DType::MQ3G256V2
             | DType::MQ2G256V2
-    ) && matches!(arch, "gfx1200" | "gfx1201");
+    ) && mqv2_gfx11_wmma_enabled_from_env(
+        hipfire_config::developer_var("HIPFIRE_MQV2_GFX11_WMMA")
+            .ok()
+            .as_deref(),
+        arch,
+    );
+    let mq_other_gfx12 = matches!(dt, DType::MQ4CG256) && matches!(arch, "gfx1200" | "gfx1201");
 
     // BF16 calibration teacher (qt=16) — native BF16 GEMM on gfx942 (CDNA3
     // MFMA v_mfma_f32_16x16x16bf16_1k). Gated on arch == gfx942 so the
@@ -1124,8 +1133,28 @@ pub(crate) fn is_batchable_la(dt: DType, arch: &str) -> bool {
         || lloyd_mq4_with_gfx12_wmma
         || fp4_with_wmma
         || e8_with_wmma
-        || mq4_v2_gfx12
+        || mqv2_with_wmma
+        || mq_other_gfx12
         || bf16_with_gfx942
+}
+
+/// Helper for MQ2/3/4/5/6G256V2 (qt44,47-50) batched prefill admit: gfx12 always, gfx11
+/// gated by HIPFIRE_MQV2_GFX11_WMMA != "0". Public for testability, mirrors
+/// `mq6_batched_admit_enabled_from_env` / `q8_prefill_wmma_enabled_from_env`.
+/// `value` is the raw env var (None = unset → default ON); only Some("0")
+/// disables the gfx11 path. Gfx12 is unaffected by the env var.
+pub(crate) fn mqv2_gfx11_wmma_enabled_from_env(value: Option<&str>, arch: &str) -> bool {
+    let gfx11_enabled = value != Some("0");
+    if matches!(arch, "gfx1200" | "gfx1201") {
+        true
+    } else if matches!(
+        arch,
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151"
+    ) {
+        gfx11_enabled
+    } else {
+        false
+    }
 }
 /// Single source of truth for per-layer batchability and checked geometry.
 /// Called by `validate_ep_batch_compatibility`, `prefill_batch_pbs_eligible`,
@@ -7928,24 +7957,40 @@ mod tests {
     }
 
     #[test]
-    fn qwen35_is_batchable_la_mq4_v2_gfx12_only() {
-        // MQ4G256V2 / MQ4CG256 batched prefill is gfx12-only; other arches
-        // fall back to per-token scalar fused decode (no batched GEMM).
-        for arch in ["gfx1200", "gfx1201"] {
+    fn qwen35_is_batchable_la_mq4_v2_gfx11_and_gfx12() {
+        // MQ4G256V2 (qt44) now batches on gfx11 (gfx1100/1101/1102/1150/1151)
+        // and gfx12 via WMMA; MQ4CG256 remains gfx12-only. Proves the
+        // parity-proven WMMA kernels are admitted on HasWmma arches.
+        for arch in [
+            "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
+        ] {
             assert!(
                 is_batchable_la(DType::MQ4G256V2, arch),
                 "MQ4G256V2 should batch on {arch}"
             );
+        }
+        // non-WMMA must still fall back
+        for arch in ["gfx1010", "gfx1030", "gfx942", "gfx906"] {
+            assert!(
+                !is_batchable_la(DType::MQ4G256V2, arch),
+                "MQ4G256V2 must fall back on {arch}"
+            );
+        }
+        // gfx12 unchanged already proven above, but explicitly re-prove
+        // that the admit set includes both gfx12 variants
+        assert!(is_batchable_la(DType::MQ4G256V2, "gfx1200"));
+        assert!(is_batchable_la(DType::MQ4G256V2, "gfx1201"));
+        // gfx1100/gfx1151 true (the two parity-proven parts)
+        assert!(is_batchable_la(DType::MQ4G256V2, "gfx1100"));
+        assert!(is_batchable_la(DType::MQ4G256V2, "gfx1151"));
+        // MQ4CG256 remains gfx12-only (must NOT widen)
+        for arch in ["gfx1200", "gfx1201"] {
             assert!(
                 is_batchable_la(DType::MQ4CG256, arch),
                 "MQ4CG256 should batch on {arch}"
             );
         }
-        for arch in ["gfx1010", "gfx1100", "gfx942"] {
-            assert!(
-                !is_batchable_la(DType::MQ4G256V2, arch),
-                "MQ4G256V2 must fall back on {arch}"
-            );
+        for arch in ["gfx1010", "gfx1100", "gfx1151", "gfx942"] {
             assert!(
                 !is_batchable_la(DType::MQ4CG256, arch),
                 "MQ4CG256 must fall back on {arch}"
@@ -7954,14 +7999,67 @@ mod tests {
     }
 
     #[test]
-    fn qwen35_is_batchable_la_v2_family_gfx12_only() {
-        for arch in ["gfx1200", "gfx1201"] {
-            assert!(is_batchable_la(DType::MQ6G256V2, arch), "MQ6V2 gfx12");
-            assert!(is_batchable_la(DType::MQ5G256V2, arch), "MQ5V2 gfx12");
-            assert!(is_batchable_la(DType::MQ3G256V2, arch), "MQ3V2 gfx12");
-            assert!(is_batchable_la(DType::MQ2G256V2, arch), "MQ2V2 gfx12");
+    fn qwen35_is_batchable_la_mq4_v2_env_escape() {
+        // HIPFIRE_MQV2_GFX11_WMMA=0 restores fallback ONLY on gfx11; gfx12
+        // remains admitted. Use the helper directly to avoid global env
+        // mutation flakiness in parallel tests — is_batchable_la delegates
+        // to this helper verbatim.
+        for arch in ["gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151"] {
+            assert!(
+                !mqv2_gfx11_wmma_enabled_from_env(Some("0"), arch),
+                "env=0 should disable {arch}"
+            );
+            assert!(
+                mqv2_gfx11_wmma_enabled_from_env(None, arch),
+                "unset should enable {arch}"
+            );
+            assert!(
+                mqv2_gfx11_wmma_enabled_from_env(Some("1"), arch),
+                "env=1 should enable {arch}"
+            );
         }
-        for arch in ["gfx1100", "gfx942", "gfx1010"] {
+        for arch in ["gfx1200", "gfx1201"] {
+            assert!(
+                mqv2_gfx11_wmma_enabled_from_env(Some("0"), arch),
+                "gfx12 unaffected by env=0 on {arch}"
+            );
+            assert!(
+                mqv2_gfx11_wmma_enabled_from_env(None, arch),
+                "gfx12 enabled without env on {arch}"
+            );
+        }
+        for arch in ["gfx1010", "gfx942", "gfx1030", "gfx1103", "gfx1152"] {
+            assert!(
+                !mqv2_gfx11_wmma_enabled_from_env(None, arch),
+                "non-WMMA {arch} must never admit"
+            );
+            assert!(
+                !mqv2_gfx11_wmma_enabled_from_env(Some("0"), arch),
+                "non-WMMA {arch} with env=0"
+            );
+            assert!(
+                !mqv2_gfx11_wmma_enabled_from_env(Some("1"), arch),
+                "non-WMMA {arch} with env=1"
+            );
+        }
+        // Prove gfx12 unchanged via is_batchable_la even with env=0 — the
+        // helper above shows helper-level, but also confirm the public gate:
+        // We cannot set env globally here without serializing tests, but
+        // helper's gfx12=true with env=0 proves the delegate will keep gfx12
+        // true when is_batchable_la reads HIPFIRE_MQV2_GFX11_WMMA=0.
+    }
+
+    #[test]
+    fn qwen35_is_batchable_la_v2_family_gfx11_and_gfx12() {
+        for arch in [
+            "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
+        ] {
+            assert!(is_batchable_la(DType::MQ6G256V2, arch), "MQ6V2 on {arch}");
+            assert!(is_batchable_la(DType::MQ5G256V2, arch), "MQ5V2 on {arch}");
+            assert!(is_batchable_la(DType::MQ3G256V2, arch), "MQ3V2 on {arch}");
+            assert!(is_batchable_la(DType::MQ2G256V2, arch), "MQ2V2 on {arch}");
+        }
+        for arch in ["gfx942", "gfx1010", "gfx1030", "gfx1103", "gfx1152"] {
             assert!(
                 !is_batchable_la(DType::MQ6G256V2, arch),
                 "MQ6V2 not on {arch}"
@@ -7996,7 +8094,7 @@ mod tests {
     fn qwen35_v2_dense_keys_are_exact_no_hfq4_default() {
         // Contract: every admitted V2 dtype maps 1:1 to its exact V2 kernel
         // in every dense operation (plain, residual, QKV, QKVZA, gate_up).
-        // No qt47-50 falls into HFQ4/default/wildcard.
+        // All V2 widths admit on both gfx11 and gfx12 (HasWmma); no qt47-50 falls into HFQ4/default/wildcard.
         use crate::forward_slots::{
             fused_gate_up_key_for, fused_qkv_key_for, fused_qkvza_key_for, residual_gemm_key_for,
         };
@@ -8077,9 +8175,9 @@ mod tests {
             assert_ne!(fused_qkvza_key_for(*dt), KernelKey::FusedQkvzaHfq4G256);
             assert_ne!(fused_gate_up_key_for(*dt), KernelKey::FusedGateUpHfq4G256);
             assert_ne!(residual_gemm_key_for(*dt), KernelKey::GemmHfq4G256Residual);
-            // batchable only on gfx12
+            // batchable on both gfx11 and gfx12 (HasWmma)
             assert!(is_batchable_la(*dt, "gfx1201"));
-            assert!(!is_batchable_la(*dt, "gfx1100"));
+            assert!(is_batchable_la(*dt, "gfx1100"));
         }
         // Legacy must stay on HFQ4 path
         assert_eq!(

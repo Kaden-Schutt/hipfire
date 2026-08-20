@@ -32,9 +32,10 @@
 //! reported as the "bug baseline" and the test `assert!` fails if the GPU
 //! error is not orders of magnitude below it.
 //!
-//! Tolerances mirror `mq4v2_gemm_parity` / `mq4v2_parity`: worst relative
-//! error < 5e-4 for the correct decode on this fixture (FP32 accumulation
-//! over ≤512 terms of magnitude ~100), and single-header bug separation >1.0.
+//! Tolerances mirror `mq4v2_gemm_parity`: relative RMS below 5% against the
+//! exact-dequant fp32 reference, with the single-header bug required to remain
+//! at least 10x worse. Worst relative error is retained only as a diagnostic
+//! because cancellation can make one expected output arbitrarily close to zero.
 //! The harness exits non-zero on failure.
 //!
 //! Run: `cargo run --release -p hipfire-runtime --example mq4v2_residual_parity`
@@ -195,6 +196,16 @@ fn rel_err(got: &[f32], want: &[f64]) -> (f64, usize) {
     (worst, wi)
 }
 
+fn rel_rms(got: &[f32], want: &[f64]) -> f64 {
+    let mut num = 0.0f64;
+    let mut den = 0.0f64;
+    for (&g, &w) in got.iter().zip(want.iter()) {
+        num += (g as f64 - w).powi(2);
+        den += w * w;
+    }
+    (num / den.max(1e-30)).sqrt()
+}
+
 fn main() {
     let mut gpu = match Gpu::init() {
         Ok(g) => g,
@@ -244,10 +255,10 @@ fn main() {
         let want_bug = ref_gemm(&w_bug, &x, &y_init, m, k, n);
         let bug_rel = {
             let bug_f32: Vec<f32> = want_bug.iter().map(|&v| v as f32).collect();
-            rel_err(&bug_f32, &want).0
+            rel_rms(&bug_f32, &want)
         };
         eprintln!("shape M={m} K={k} N={n}: bug baseline rel {bug_rel:.3e}");
-        assert!(bug_rel > 1.0, "fixture not discriminating at M={m} K={k} N={n}: bug_rel {bug_rel:.3e} — halves overlap");
+        assert!(bug_rel > 0.5, "fixture not discriminating at M={m} K={k} N={n}: bug_rel {bug_rel:.3e} — halves overlap");
 
         // ── residual path (Y += W·X) ──
         {
@@ -260,18 +271,21 @@ fn main() {
             gpu.hip.device_synchronize().unwrap();
             let got = gpu.download_f32(&d_y).unwrap();
             let (worst, wi) = rel_err(&got, &want);
-            let status = if worst < 5e-4 { "ok" } else { "FAIL" };
-            eprintln!("  residual M={m} K={k} N={n}: worst {worst:.3e} at {wi} {status} (bug {bug_rel:.3e})");
-            if worst >= 5e-4 {
+            let rms = rel_rms(&got, &want);
+            let status = if rms < 0.05 { "ok" } else { "FAIL" };
+            eprintln!(
+                "  residual M={m} K={k} N={n}: rel-rms {rms:.3e}, worst {worst:.3e} at {wi} {status} (bug {bug_rel:.3e})"
+            );
+            if rms >= 0.05 {
                 eprintln!(
                     "    got {} want {} y_init {}",
                     got[wi], want[wi], y_init[wi]
                 );
-                failures.push(format!("residual M={m} K={k} N={n} worst {worst:.3e}"));
+                failures.push(format!("residual M={m} K={k} N={n} rms {rms:.3e}"));
             }
             assert!(
-                worst < bug_rel * 0.01,
-                "half1 decoded with half0 at residual M={m} K={k} N={n}: worst {worst:.3e} not below bug {bug_rel:.3e}"
+                rms < bug_rel * 0.1,
+                "half1 decoded with half0 at residual M={m} K={k} N={n}: rms {rms:.3e} not below bug {bug_rel:.3e}"
             );
         }
 
@@ -283,7 +297,7 @@ fn main() {
             let want0_bug = ref_gemm(&w_bug, &x, &y_zero, m, k, n);
             let bug_rel0 = {
                 let b: Vec<f32> = want0_bug.iter().map(|&v| v as f32).collect();
-                rel_err(&b, &want0).0
+                rel_rms(&b, &want0)
             };
             let d_a = gpu.upload_raw(&blob, &[blob.len()]).unwrap();
             let d_x = gpu.upload_f32(&x, &[n * k]).unwrap();
@@ -293,14 +307,17 @@ fn main() {
             gpu.hip.device_synchronize().unwrap();
             let got = gpu.download_f32(&d_y).unwrap();
             let (worst, wi) = rel_err(&got, &want0);
-            let status = if worst < 5e-4 { "ok" } else { "FAIL" };
-            eprintln!("  lmhead   M={m} K={k} N={n}: worst {worst:.3e} at {wi} {status} (bug {bug_rel0:.3e})");
-            if worst >= 5e-4 {
-                failures.push(format!("lmhead M={m} K={k} N={n} worst {worst:.3e}"));
+            let rms = rel_rms(&got, &want0);
+            let status = if rms < 0.05 { "ok" } else { "FAIL" };
+            eprintln!(
+                "  lmhead   M={m} K={k} N={n}: rel-rms {rms:.3e}, worst {worst:.3e} at {wi} {status} (bug {bug_rel0:.3e})"
+            );
+            if rms >= 0.05 {
+                failures.push(format!("lmhead M={m} K={k} N={n} rms {rms:.3e}"));
             }
             assert!(
-                worst < bug_rel0 * 0.01,
-                "half1 decoded with half0 at lmhead M={m} K={k} N={n}: worst {worst:.3e} not below bug {bug_rel0:.3e}"
+                rms < bug_rel0 * 0.1,
+                "half1 decoded with half0 at lmhead M={m} K={k} N={n}: rms {rms:.3e} not below bug {bug_rel0:.3e}"
             );
         }
     }

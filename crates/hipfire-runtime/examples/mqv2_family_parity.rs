@@ -3,7 +3,10 @@
 //! Exercises the real production wire layouts for all four new V2 formats
 //! before model-scale quantization. Each format is tested via:
 //!   * B=1 plain GEMV (`gemv_mq{n}g256v2` — production decode path)
-//!   * B=16 batched lm-head GEMM (gfx12 WMMA batched lm-head, the prefill/spec-decode path)
+//!   * B=16 batched lm-head GEMM (gfx11+gfx12 WMMA batched lm-head)
+//!   * K=512 N=16 fused prefill WMMA via arch-aware production wrappers
+//!     `gemm_qkv_mq{n}g256v2_wmma`, `gemm_qkvza_mq{n}g256v2_wmma`,
+//!     `gemm_gate_up_mq{n}g256v2_wmma` (gfx12-first, then gfx11 has_wmma_w32)
 //!
 //! ## Why this oracle exists
 //!
@@ -16,7 +19,9 @@
 //! checks because the dispatch alias is a single enum variant swap.
 //!
 //! The discriminating construction makes s0/z0 differ from s1/z1 so a
-//! legacy/single-half misroute fails.
+//! legacy/single-half misroute fails. Fused prefill checks use independently
+//! salted/disjoint weight blobs per output tensor so pointer swaps or
+//! repeated-A mistakes cannot pass.
 //!
 //! ### Discriminating fixture
 //!
@@ -42,13 +47,17 @@
 //!   5. B=16 batched GEMM (lm-head) vs CPU batched matmul — worst abs/rel error.
 //!   6. Single-half bug baseline: error must be orders of magnitude larger than
 //!      correct decode, otherwise fixture is not discriminating.
+//!   7. Fused prefill WMMA (qkv / qkvza / gate_up) at K=512 N=16 vs independent
+//!      f64 exact-dequant refs; pass iff every family output has rel-RMS <= 0.05.
+//!      Launch failure is `FAIL_UNSUPPORTED` (never skipped).
 //!
-//! Output is machine-parseable (`fmt qt group_bytes m k gpr status worst_abs worst_rel
-//! bug_rel canary_ok byte_ok`) to preserve evidence.
+//! Output is machine-parseable (`fmt qt group_bytes m k gpr status ... fused_*`)
+//! to preserve evidence.
 //!
 //! Run: `cargo run --release -p hipfire-runtime --example mqv2_family_parity`
 //!
-//! Style/helpers reused from `mq4v2_parity.rs` and `mq4v2_gemm_parity.rs`.
+//! Style/helpers reused from `mq4v2_parity.rs`, `mq4v2_gemm_parity.rs`, and
+//! `mq4v2_fused_parity.rs`.
 
 use half::f16;
 use rdna_compute::{DType, Gpu};
@@ -59,7 +68,11 @@ const GPR_K512: usize = 2; // K=512 => 2 groups per row
 const M: usize = 64;
 const K: usize = 512;
 const BATCH: usize = 16;
+/// Fused prefill WMMA shape: K=512, N=16 (one 16-batch tile).
+const FUSED_N: usize = 16;
+const FUSED_ROW: usize = 16; // per-output M for q/k/v/gate/up/...
 const CANARY_F32: f32 = 12345.6789;
+const FUSED_TOL_RMS: f64 = 0.05;
 
 // ── format descriptors ─────────────────────────────────────────────────────
 
@@ -120,16 +133,24 @@ fn prng(i: usize, salt: u32) -> f32 {
 }
 
 fn build_disjoint_halves(m: usize, k: usize) -> Vec<f32> {
+    build_disjoint_halves_salted(m, k, 0)
+}
+
+/// Independently salted half-discriminating weights. Distinct `salt` per fused
+/// output tensor so pointer swaps / repeated-A cannot pass parity.
+fn build_disjoint_halves_salted(m: usize, k: usize, salt: u32) -> Vec<f32> {
     let mut w = vec![0.0f32; m * k];
     for r in 0..m {
         for g in 0..(k / GROUP) {
             let base = r * k + g * GROUP;
-            let salt = (r * 7919 + g * 104729) as u32;
+            let s = salt
+                .wrapping_add((r as u32).wrapping_mul(7919))
+                .wrapping_add((g as u32).wrapping_mul(104729));
             for i in 0..HALF {
-                w[base + i] = prng(i, salt) * 2.0 - 1.0;
+                w[base + i] = prng(i, s) * 2.0 - 1.0;
             }
             for i in HALF..GROUP {
-                w[base + i] = 96.0 + prng(i, salt ^ 0xA5A5_A5A5) * 64.0;
+                w[base + i] = 96.0 + prng(i, s ^ 0xA5A5_A5A5) * 64.0;
             }
         }
     }
@@ -608,6 +629,317 @@ fn headers_differ(blob: &[u8], fmt: &Format, m: usize, k: usize) -> bool {
     false
 }
 
+/// One fused-family check outcome for machine-parseable stdout.
+struct FusedFamilyResult {
+    status: &'static str,
+    /// Worst (max) rel-RMS across the family's output tensors.
+    rel_rms: f64,
+    canary_ok: bool,
+}
+
+fn fused_fail_unsupported() -> FusedFamilyResult {
+    FusedFamilyResult {
+        status: "FAIL_UNSUPPORTED",
+        rel_rms: f64::INFINITY,
+        canary_ok: false,
+    }
+}
+
+fn upload_y_canary(
+    gpu: &mut Gpu,
+    n: usize,
+    m: usize,
+) -> Result<(rdna_compute::GpuTensor, usize), String> {
+    let y_len = n * m + 1;
+    let mut y_host = vec![0.0f32; y_len];
+    y_host[y_len - 1] = CANARY_F32;
+    let d_y = gpu
+        .upload_f32(&y_host, &[y_len])
+        .map_err(|e| format!("upload_f32 y canary: {e:?}"))?;
+    Ok((d_y, y_len))
+}
+
+fn download_y_canary(
+    gpu: &Gpu,
+    d_y: &rdna_compute::GpuTensor,
+    y_len: usize,
+    n: usize,
+    m: usize,
+) -> Result<(Vec<f32>, bool), String> {
+    let got_all = gpu
+        .download_f32(d_y)
+        .map_err(|e| format!("download y: {e:?}"))?;
+    if got_all.len() != y_len {
+        return Err(format!("download len {} != {}", got_all.len(), y_len));
+    }
+    let canary_ok = (got_all[y_len - 1] - CANARY_F32).abs() < 1e-6;
+    Ok((got_all[..n * m].to_vec(), canary_ok))
+}
+
+/// Judge a multi-output fused family: all outputs must pass rel-RMS and canary.
+fn judge_fused_outputs(
+    label: &str,
+    outs: &[(&str, Vec<f32>, Vec<f64>, bool)],
+) -> FusedFamilyResult {
+    let mut worst_rms = 0.0f64;
+    let mut all_canary = true;
+    let mut worst_name = "";
+    for (name, got, want, canary_ok) in outs {
+        let rms = rel_rms(got, want);
+        let (wabs, wrel, wi_a, wi_r) = worst_errors(got, want);
+        eprintln!(
+            "  FUSED {label}/{name}: rel_rms {:.3e} worst_abs {:.3e}@{wi_a} worst_rel {:.3e}@{wi_r} canary_ok={canary_ok}",
+            rms, wabs, wrel
+        );
+        if rms > worst_rms {
+            worst_rms = rms;
+            worst_name = name;
+        }
+        all_canary &= *canary_ok;
+    }
+    let pass = worst_rms <= FUSED_TOL_RMS && all_canary;
+    let status = if pass { "PASS" } else { "FAIL" };
+    if !pass {
+        eprintln!(
+            "  FUSED {label} FAIL: worst_rel_rms {:.3e} ({worst_name}) tol {:.2} canary_ok={all_canary}",
+            worst_rms, FUSED_TOL_RMS
+        );
+    } else {
+        eprintln!(
+            "  FUSED {label} PASS: worst_rel_rms {:.3e} <= {:.2}",
+            worst_rms, FUSED_TOL_RMS
+        );
+    }
+    FusedFamilyResult {
+        status,
+        rel_rms: worst_rms,
+        canary_ok: all_canary,
+    }
+}
+
+fn run_fused_gate_up(gpu: &mut Gpu, fmt: &Format, x: &[f32]) -> FusedFamilyResult {
+    let k = K;
+    let n = FUSED_N;
+    let gate_m = FUSED_ROW;
+    let up_m = FUSED_ROW;
+    let w_gate = build_disjoint_halves_salted(gate_m, k, 0x6A7E_0001);
+    let w_up = build_disjoint_halves_salted(up_m, k, 0x6A7E_0002);
+
+    let blob_gate = pack_blob(fmt, &w_gate, gate_m, k);
+    let blob_up = pack_blob(fmt, &w_up, up_m, k);
+    let want_gate = decode_and_gemm_batched(fmt, &blob_gate, x, gate_m, k, n);
+    let want_up = decode_and_gemm_batched(fmt, &blob_up, x, up_m, k, n);
+
+    let run = (|| -> Result<FusedFamilyResult, String> {
+        let d_a_gate = gpu
+            .upload_raw(&blob_gate, &[blob_gate.len()])
+            .map_err(|e| format!("upload gate: {e:?}"))?;
+        let d_a_up = gpu
+            .upload_raw(&blob_up, &[blob_up.len()])
+            .map_err(|e| format!("upload up: {e:?}"))?;
+        let d_x = gpu
+            .upload_f32(x, &[n * k])
+            .map_err(|e| format!("upload x: {e:?}"))?;
+        let (d_y_gate, y_gate_len) = upload_y_canary(gpu, n, gate_m)?;
+        let (d_y_up, y_up_len) = upload_y_canary(gpu, n, up_m)?;
+        let res = match fmt.qt {
+            47 => gpu.gemm_gate_up_mq6g256v2_wmma(
+                &d_a_gate, &d_a_up, &d_x, &d_y_gate, &d_y_up, gate_m, up_m, k, n,
+            ),
+            48 => gpu.gemm_gate_up_mq5g256v2_wmma(
+                &d_a_gate, &d_a_up, &d_x, &d_y_gate, &d_y_up, gate_m, up_m, k, n,
+            ),
+            49 => gpu.gemm_gate_up_mq3g256v2_wmma(
+                &d_a_gate, &d_a_up, &d_x, &d_y_gate, &d_y_up, gate_m, up_m, k, n,
+            ),
+            50 => gpu.gemm_gate_up_mq2g256v2_wmma(
+                &d_a_gate, &d_a_up, &d_x, &d_y_gate, &d_y_up, gate_m, up_m, k, n,
+            ),
+            _ => unreachable!(),
+        };
+        res.map_err(|e| format!("gate_up launch: {e:?}"))?;
+        gpu.hip
+            .device_synchronize()
+            .map_err(|e| format!("sync: {e:?}"))?;
+        let (got_gate, c_gate) = download_y_canary(gpu, &d_y_gate, y_gate_len, n, gate_m)?;
+        let (got_up, c_up) = download_y_canary(gpu, &d_y_up, y_up_len, n, up_m)?;
+        Ok(judge_fused_outputs(
+            "gate_up",
+            &[
+                ("gate", got_gate, want_gate, c_gate),
+                ("up", got_up, want_up, c_up),
+            ],
+        ))
+    })();
+    match run {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("  FUSED gate_up launch FAIL (unsupported route): {e}");
+            fused_fail_unsupported()
+        }
+    }
+}
+
+fn run_fused_qkv(gpu: &mut Gpu, fmt: &Format, x: &[f32]) -> FusedFamilyResult {
+    let k = K;
+    let n = FUSED_N;
+    let q_m = FUSED_ROW;
+    let k_m = FUSED_ROW;
+    let v_m = FUSED_ROW;
+    let w_q = build_disjoint_halves_salted(q_m, k, 0x9CB0_0001);
+    let w_k = build_disjoint_halves_salted(k_m, k, 0x9CB0_0002);
+    let w_v = build_disjoint_halves_salted(v_m, k, 0x9CB0_0003);
+
+    let blob_q = pack_blob(fmt, &w_q, q_m, k);
+    let blob_k = pack_blob(fmt, &w_k, k_m, k);
+    let blob_v = pack_blob(fmt, &w_v, v_m, k);
+    let want_q = decode_and_gemm_batched(fmt, &blob_q, x, q_m, k, n);
+    let want_k = decode_and_gemm_batched(fmt, &blob_k, x, k_m, k, n);
+    let want_v = decode_and_gemm_batched(fmt, &blob_v, x, v_m, k, n);
+
+    let run = (|| -> Result<FusedFamilyResult, String> {
+        let d_a_q = gpu
+            .upload_raw(&blob_q, &[blob_q.len()])
+            .map_err(|e| format!("upload q: {e:?}"))?;
+        let d_a_k = gpu
+            .upload_raw(&blob_k, &[blob_k.len()])
+            .map_err(|e| format!("upload k: {e:?}"))?;
+        let d_a_v = gpu
+            .upload_raw(&blob_v, &[blob_v.len()])
+            .map_err(|e| format!("upload v: {e:?}"))?;
+        let d_x = gpu
+            .upload_f32(x, &[n * k])
+            .map_err(|e| format!("upload x: {e:?}"))?;
+        let (d_y_q, y_q_len) = upload_y_canary(gpu, n, q_m)?;
+        let (d_y_k, y_k_len) = upload_y_canary(gpu, n, k_m)?;
+        let (d_y_v, y_v_len) = upload_y_canary(gpu, n, v_m)?;
+        let res = match fmt.qt {
+            47 => gpu.gemm_qkv_mq6g256v2_wmma(
+                &d_a_q, &d_a_k, &d_a_v, &d_x, &d_y_q, &d_y_k, &d_y_v, q_m, k_m, v_m, k, n,
+            ),
+            48 => gpu.gemm_qkv_mq5g256v2_wmma(
+                &d_a_q, &d_a_k, &d_a_v, &d_x, &d_y_q, &d_y_k, &d_y_v, q_m, k_m, v_m, k, n,
+            ),
+            49 => gpu.gemm_qkv_mq3g256v2_wmma(
+                &d_a_q, &d_a_k, &d_a_v, &d_x, &d_y_q, &d_y_k, &d_y_v, q_m, k_m, v_m, k, n,
+            ),
+            50 => gpu.gemm_qkv_mq2g256v2_wmma(
+                &d_a_q, &d_a_k, &d_a_v, &d_x, &d_y_q, &d_y_k, &d_y_v, q_m, k_m, v_m, k, n,
+            ),
+            _ => unreachable!(),
+        };
+        res.map_err(|e| format!("qkv launch: {e:?}"))?;
+        gpu.hip
+            .device_synchronize()
+            .map_err(|e| format!("sync: {e:?}"))?;
+        let (got_q, c_q) = download_y_canary(gpu, &d_y_q, y_q_len, n, q_m)?;
+        let (got_k, c_k) = download_y_canary(gpu, &d_y_k, y_k_len, n, k_m)?;
+        let (got_v, c_v) = download_y_canary(gpu, &d_y_v, y_v_len, n, v_m)?;
+        Ok(judge_fused_outputs(
+            "qkv",
+            &[
+                ("q", got_q, want_q, c_q),
+                ("k", got_k, want_k, c_k),
+                ("v", got_v, want_v, c_v),
+            ],
+        ))
+    })();
+    match run {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("  FUSED qkv launch FAIL (unsupported route): {e}");
+            fused_fail_unsupported()
+        }
+    }
+}
+
+fn run_fused_qkvza(gpu: &mut Gpu, fmt: &Format, x: &[f32]) -> FusedFamilyResult {
+    let k = K;
+    let n = FUSED_N;
+    let qkv_m = FUSED_ROW;
+    let z_m = FUSED_ROW;
+    let beta_m = FUSED_ROW;
+    let alpha_m = FUSED_ROW;
+    let w_qkv = build_disjoint_halves_salted(qkv_m, k, 0x2A1A_0001);
+    let w_z = build_disjoint_halves_salted(z_m, k, 0x2A1A_0002);
+    let w_beta = build_disjoint_halves_salted(beta_m, k, 0x2A1A_0003);
+    let w_alpha = build_disjoint_halves_salted(alpha_m, k, 0x2A1A_0004);
+
+    let blob_qkv = pack_blob(fmt, &w_qkv, qkv_m, k);
+    let blob_z = pack_blob(fmt, &w_z, z_m, k);
+    let blob_beta = pack_blob(fmt, &w_beta, beta_m, k);
+    let blob_alpha = pack_blob(fmt, &w_alpha, alpha_m, k);
+    let want_qkv = decode_and_gemm_batched(fmt, &blob_qkv, x, qkv_m, k, n);
+    let want_z = decode_and_gemm_batched(fmt, &blob_z, x, z_m, k, n);
+    let want_beta = decode_and_gemm_batched(fmt, &blob_beta, x, beta_m, k, n);
+    let want_alpha = decode_and_gemm_batched(fmt, &blob_alpha, x, alpha_m, k, n);
+
+    let run = (|| -> Result<FusedFamilyResult, String> {
+        let d_a_qkv = gpu
+            .upload_raw(&blob_qkv, &[blob_qkv.len()])
+            .map_err(|e| format!("upload qkv: {e:?}"))?;
+        let d_a_z = gpu
+            .upload_raw(&blob_z, &[blob_z.len()])
+            .map_err(|e| format!("upload z: {e:?}"))?;
+        let d_a_beta = gpu
+            .upload_raw(&blob_beta, &[blob_beta.len()])
+            .map_err(|e| format!("upload beta: {e:?}"))?;
+        let d_a_alpha = gpu
+            .upload_raw(&blob_alpha, &[blob_alpha.len()])
+            .map_err(|e| format!("upload alpha: {e:?}"))?;
+        let d_x = gpu
+            .upload_f32(x, &[n * k])
+            .map_err(|e| format!("upload x: {e:?}"))?;
+        let (d_y_qkv, y_qkv_len) = upload_y_canary(gpu, n, qkv_m)?;
+        let (d_y_z, y_z_len) = upload_y_canary(gpu, n, z_m)?;
+        let (d_y_beta, y_beta_len) = upload_y_canary(gpu, n, beta_m)?;
+        let (d_y_alpha, y_alpha_len) = upload_y_canary(gpu, n, alpha_m)?;
+        let res = match fmt.qt {
+            47 => gpu.gemm_qkvza_mq6g256v2_wmma(
+                &d_a_qkv, &d_a_z, &d_a_beta, &d_a_alpha, &d_x, &d_y_qkv, &d_y_z, &d_y_beta,
+                &d_y_alpha, qkv_m, z_m, beta_m, alpha_m, k, n,
+            ),
+            48 => gpu.gemm_qkvza_mq5g256v2_wmma(
+                &d_a_qkv, &d_a_z, &d_a_beta, &d_a_alpha, &d_x, &d_y_qkv, &d_y_z, &d_y_beta,
+                &d_y_alpha, qkv_m, z_m, beta_m, alpha_m, k, n,
+            ),
+            49 => gpu.gemm_qkvza_mq3g256v2_wmma(
+                &d_a_qkv, &d_a_z, &d_a_beta, &d_a_alpha, &d_x, &d_y_qkv, &d_y_z, &d_y_beta,
+                &d_y_alpha, qkv_m, z_m, beta_m, alpha_m, k, n,
+            ),
+            50 => gpu.gemm_qkvza_mq2g256v2_wmma(
+                &d_a_qkv, &d_a_z, &d_a_beta, &d_a_alpha, &d_x, &d_y_qkv, &d_y_z, &d_y_beta,
+                &d_y_alpha, qkv_m, z_m, beta_m, alpha_m, k, n,
+            ),
+            _ => unreachable!(),
+        };
+        res.map_err(|e| format!("qkvza launch: {e:?}"))?;
+        gpu.hip
+            .device_synchronize()
+            .map_err(|e| format!("sync: {e:?}"))?;
+        let (got_qkv, c_qkv) = download_y_canary(gpu, &d_y_qkv, y_qkv_len, n, qkv_m)?;
+        let (got_z, c_z) = download_y_canary(gpu, &d_y_z, y_z_len, n, z_m)?;
+        let (got_beta, c_beta) = download_y_canary(gpu, &d_y_beta, y_beta_len, n, beta_m)?;
+        let (got_alpha, c_alpha) = download_y_canary(gpu, &d_y_alpha, y_alpha_len, n, alpha_m)?;
+        Ok(judge_fused_outputs(
+            "qkvza",
+            &[
+                ("qkv", got_qkv, want_qkv, c_qkv),
+                ("z", got_z, want_z, c_z),
+                ("beta", got_beta, want_beta, c_beta),
+                ("alpha", got_alpha, want_alpha, c_alpha),
+            ],
+        ))
+    })();
+    match run {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("  FUSED qkvza launch FAIL (unsupported route): {e}");
+            fused_fail_unsupported()
+        }
+    }
+}
+
 fn main() {
     let mut gpu = match Gpu::init() {
         Ok(g) => g,
@@ -617,12 +949,19 @@ fn main() {
         }
     };
     eprintln!(
-        "mqv2_family_parity: arch={} m={} k={} gpr={} batch={}",
-        gpu.arch, M, K, GPR_K512, BATCH
+        "mqv2_family_parity: arch={} has_wmma_w32={} has_wmma_w32_gfx12={} m={} k={} gpr={} batch={} fused_n={}",
+        gpu.arch,
+        gpu.arch_caps.has_wmma_w32(),
+        gpu.arch_caps.has_wmma_w32_gfx12(),
+        M,
+        K,
+        GPR_K512,
+        BATCH,
+        FUSED_N
     );
-    if gpu.arch != "gfx1201" {
+    if !(gpu.arch_caps.has_wmma_w32() || gpu.arch_caps.has_wmma_w32_gfx12()) {
         eprintln!(
-            "warn: expected gfx1201 for batched lm-head WMMA path, got {}",
+            "warn: expected gfx11/gfx12 WMMA for fused prefill + batched lm-head, got {}",
             gpu.arch
         );
     }
@@ -630,6 +969,7 @@ fn main() {
     let w = build_disjoint_halves(M, K);
     let x_gemv = build_x(K, 0xC0FF_EE00);
     let x_batch = build_x_batched(K, BATCH, 0xBEEF_CAFE);
+    let x_fused = build_x_batched(K, FUSED_N, 0xF05E_D000);
 
     // group bytes set to ensure no alias
     {
@@ -778,7 +1118,8 @@ fn main() {
                 }
             };
 
-        // ── B=16 batched lm-head GEMM (gfx12 WMMA) ──────────────────────────
+        // ── B=16 batched lm-head GEMM (gfx11+gfx12 WMMA) ─────────────────────
+
         let want_batch = decode_and_gemm_batched(fmt, &blob, &x_batch, M, K, BATCH);
         let batch_result = (|| -> Result<(Vec<f32>, bool), String> {
             let y_len = BATCH * M + 1;
@@ -863,7 +1204,19 @@ fn main() {
                 }
             };
 
-        let fmt_status = if gemv_status == "PASS" && batch_status == "PASS" && hdr_ok && byte_ok {
+        // ── Fused prefill WMMA at K=512 N=16 (arch-aware gemm_*_mqNg256v2_wmma) ──
+        let fused_gate_up = run_fused_gate_up(&mut gpu, fmt, &x_fused);
+        let fused_qkv = run_fused_qkv(&mut gpu, fmt, &x_fused);
+        let fused_qkvza = run_fused_qkvza(&mut gpu, fmt, &x_fused);
+
+        let fmt_status = if gemv_status == "PASS"
+            && batch_status == "PASS"
+            && fused_gate_up.status == "PASS"
+            && fused_qkv.status == "PASS"
+            && fused_qkvza.status == "PASS"
+            && hdr_ok
+            && byte_ok
+        {
             "PASS"
         } else {
             "FAIL"
@@ -872,35 +1225,49 @@ fn main() {
             overall_fail = true;
         }
 
-        // machine-parseable per-format line (stdout for evidence) — retains worst abs/rel as diagnostics, judges batched by rel_rms
+        // machine-parseable per-format line (stdout for evidence)
         println!(
-            "fmt={} qt={} group_bytes={} m={} k={} gpr={} byte_ok={} hdr_ok={} canary_gemv={} canary_batch={} gemv_status={} batch_status={} status={} gemv_worst_abs={:.6e} gemv_worst_rel={:.6e} batch_worst_abs={:.6e} batch_worst_rel={:.6e} batch_rel_rms={:.6e} bug_rel={:.6e}",
+            "fmt={} qt={} group_bytes={} m={} k={} gpr={} fused_n={} byte_ok={} hdr_ok={} canary_gemv={} canary_batch={} canary_gate_up={} canary_qkv={} canary_qkvza={} gemv_status={} batch_status={} gate_up_status={} qkv_status={} qkvza_status={} status={} gemv_worst_abs={:.6e} gemv_worst_rel={:.6e} batch_worst_abs={:.6e} batch_worst_rel={:.6e} batch_rel_rms={:.6e} gate_up_rel_rms={:.6e} qkv_rel_rms={:.6e} qkvza_rel_rms={:.6e} bug_rel={:.6e}",
             fmt.name,
             fmt.qt,
             fmt.group_bytes,
             M,
             K,
             gpr,
+            FUSED_N,
             byte_ok,
             hdr_ok,
             gemv_canary_ok,
             batch_canary_ok,
+            fused_gate_up.canary_ok,
+            fused_qkv.canary_ok,
+            fused_qkvza.canary_ok,
             gemv_status,
             batch_status,
+            fused_gate_up.status,
+            fused_qkv.status,
+            fused_qkvza.status,
             fmt_status,
             gemv_worst_abs,
             gemv_worst_rel,
             batch_worst_abs,
             batch_worst_rel,
             batch_rel_rms,
+            fused_gate_up.rel_rms,
+            fused_qkv.rel_rms,
+            fused_qkvza.rel_rms,
             bug_rel
         );
-        // also surface worst_abs/rel to stderr in compact form (batched judged by rel_rms)
         eprintln!(
-            "  => {} : gemv rel {:.3e} batch rel_rms {:.3e} (worst_rel {:.3e}) {}",
-            fmt.name, gemv_worst_rel, batch_rel_rms, batch_worst_rel, fmt_status
+            "  => {} : gemv rel {:.3e} batch rel_rms {:.3e} gate_up {:.3e} qkv {:.3e} qkvza {:.3e} {}",
+            fmt.name,
+            gemv_worst_rel,
+            batch_rel_rms,
+            fused_gate_up.rel_rms,
+            fused_qkv.rel_rms,
+            fused_qkvza.rel_rms,
+            fmt_status
         );
-        // silence unused warnings for got when fail
         let _ = gemv_got;
     }
 
@@ -908,6 +1275,6 @@ fn main() {
         eprintln!("\nmqv2_family_parity: FAIL — one or more formats mismatched or unsupported");
         std::process::exit(1);
     } else {
-        eprintln!("\nmqv2_family_parity: PASS — all 4 V2 formats: byte count, header divergence, sentinel, plain GEMV B=1 and B=16 batched lm-head match CPU dequant");
+        eprintln!("\nmqv2_family_parity: PASS — all 4 V2 formats: byte count, header divergence, sentinel, plain GEMV B=1, B=16 batched lm-head, and fused prefill WMMA (qkv/qkvza/gate_up @ K=512 N=16) match CPU dequant");
     }
 }

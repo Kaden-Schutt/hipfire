@@ -2928,6 +2928,14 @@ pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX12_SRC: &str =
 /// admitting RDNA3 cannot alter the certified gfx12 code object.
 pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_wmma.hip");
+pub const GEMM_MQ5G256V2_RESIDUAL_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq5g256v2_residual_wmma.hip");
+pub const GEMM_MQ6G256V2_RESIDUAL_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq6g256v2_residual_wmma.hip");
+pub const GEMM_MQ3G256V2_RESIDUAL_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq3g256v2_residual_wmma.hip");
+pub const GEMM_MQ2G256V2_RESIDUAL_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq2g256v2_residual_wmma.hip");
 pub const GEMM_MQ5G256V2_RESIDUAL_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq5g256v2_residual_wmma.gfx12.hip");
 pub const GEMM_MQ6G256V2_RESIDUAL_WMMA_GFX12_SRC: &str =
@@ -3156,6 +3164,22 @@ pub const GEMM_GATE_UP_HFQ4G256_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma.gfx12.hip");
 pub const GEMM_GATE_UP_MQ4G256V2_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma.gfx12.hip");
+/// gfx11 (RDNA3 / RDNA3.5) MQ4V2 gate_up WMMA — sister of
+/// GEMM_GATE_UP_MQ4G256V2_WMMA_GFX12_SRC. Same dual-half header contract
+/// (136 B groups, [s0,z0,s1,z1] fp16 headers, payload +8, kt<8 half0) but
+/// gfx11 WMMA contracts (half16_t A/B, __builtin_amdgcn_wmma_f32_16x16x16_f16_w32,
+/// interleaved C mapping `acc[j]=C[2*j+(tid>>4)][tid&15]`). Distinct file so
+/// admitting RDNA3 cannot alter the certified gfx12 code object.
+pub const GEMM_GATE_UP_MQ4G256V2_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma.hip");
+pub const GEMM_GATE_UP_MQ5G256V2_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_gate_up_mq5g256v2_wmma.hip");
+pub const GEMM_GATE_UP_MQ6G256V2_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_gate_up_mq6g256v2_wmma.hip");
+pub const GEMM_GATE_UP_MQ3G256V2_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_gate_up_mq3g256v2_wmma.hip");
+pub const GEMM_GATE_UP_MQ2G256V2_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_gate_up_mq2g256v2_wmma.hip");
 pub const GEMM_GATE_UP_MQ5G256V2_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_mq5g256v2_wmma.gfx12.hip");
 pub const GEMM_GATE_UP_MQ6G256V2_WMMA_GFX12_SRC: &str =
@@ -3190,6 +3214,20 @@ pub const GEMM_QKVZA_HFQ4G256_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_qkvza_hfq4g256_wmma.gfx12.hip");
 pub const GEMM_QKVZA_MQ4G256V2_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_qkvza_mq4g256v2_wmma.gfx12.hip");
+/// gfx11 (RDNA3 / RDNA3.5) MQ4V2 qkvza WMMA — sister of
+/// GEMM_QKVZA_MQ4G256V2_WMMA_GFX12_SRC. Same dual-half header contract but
+/// gfx11 WMMA contracts (half16_t, w32, interleaved C). Distinct file so
+/// admitting RDNA3 cannot alter the certified gfx12 code object.
+pub const GEMM_QKVZA_MQ4G256V2_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkvza_mq4g256v2_wmma.hip");
+pub const GEMM_QKVZA_MQ5G256V2_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkvza_mq5g256v2_wmma.hip");
+pub const GEMM_QKVZA_MQ6G256V2_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkvza_mq6g256v2_wmma.hip");
+pub const GEMM_QKVZA_MQ3G256V2_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkvza_mq3g256v2_wmma.hip");
+pub const GEMM_QKVZA_MQ2G256V2_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkvza_mq2g256v2_wmma.hip");
 pub const GEMM_QKVZA_MQ5G256V2_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_qkvza_mq5g256v2_wmma.gfx12.hip");
 pub const GEMM_QKVZA_MQ6G256V2_WMMA_GFX12_SRC: &str =
@@ -3259,6 +3297,20 @@ pub const GEMM_QKV_HFQ4G256_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_qkv_hfq4g256_wmma.gfx12.hip");
 pub const GEMM_QKV_MQ4G256V2_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_qkv_mq4g256v2_wmma.gfx12.hip");
+/// gfx11 (RDNA3 / RDNA3.5) MQ4V2 qkv WMMA — sister of
+/// GEMM_QKV_MQ4G256V2_WMMA_GFX12_SRC. Same dual-half header contract but
+/// gfx11 WMMA contracts (half16_t, w32, interleaved C). Distinct file so
+/// admitting RDNA3 cannot alter the certified gfx12 code object.
+pub const GEMM_QKV_MQ4G256V2_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkv_mq4g256v2_wmma.hip");
+pub const GEMM_QKV_MQ5G256V2_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkv_mq5g256v2_wmma.hip");
+pub const GEMM_QKV_MQ6G256V2_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkv_mq6g256v2_wmma.hip");
+pub const GEMM_QKV_MQ3G256V2_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkv_mq3g256v2_wmma.hip");
+pub const GEMM_QKV_MQ2G256V2_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkv_mq2g256v2_wmma.hip");
 pub const GEMM_QKV_MQ5G256V2_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_qkv_mq5g256v2_wmma.gfx12.hip");
 pub const GEMM_QKV_MQ6G256V2_WMMA_GFX12_SRC: &str =

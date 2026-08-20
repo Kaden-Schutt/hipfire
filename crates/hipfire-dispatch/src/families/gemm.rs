@@ -502,16 +502,16 @@ impl GemmFamily {
                 hip!(gpu.gemm_hfq4g256_residual_mq4v2(w.buf, x, y, m, k, batch_size))
             }
             K::GemmMq5G256V2Residual => {
-                hip!(gpu.gemm_mq5g256v2_residual_wmma_gfx12(w.buf, x, y, m, k, batch_size))
+                hip!(gpu.gemm_mq5g256v2_residual_wmma(w.buf, x, y, m, k, batch_size))
             }
             K::GemmMq6G256V2Residual => {
-                hip!(gpu.gemm_mq6g256v2_residual_wmma_gfx12(w.buf, x, y, m, k, batch_size))
+                hip!(gpu.gemm_mq6g256v2_residual_wmma(w.buf, x, y, m, k, batch_size))
             }
             K::GemmMq3G256V2Residual => {
-                hip!(gpu.gemm_mq3g256v2_residual_wmma_gfx12(w.buf, x, y, m, k, batch_size))
+                hip!(gpu.gemm_mq3g256v2_residual_wmma(w.buf, x, y, m, k, batch_size))
             }
             K::GemmMq2G256V2Residual => {
-                hip!(gpu.gemm_mq2g256v2_residual_wmma_gfx12(w.buf, x, y, m, k, batch_size))
+                hip!(gpu.gemm_mq2g256v2_residual_wmma(w.buf, x, y, m, k, batch_size))
             }
             K::GemmMq4G256V2BatchedLmhead => {
                 hip!(gpu.gemm_mq4g256v2_batched_lmhead(w.buf, x, y, m, k, batch_size))
@@ -555,55 +555,95 @@ mod tests {
 
     #[test]
     fn v2_plain_resolves_exact_not_hfq4() {
-        // Gfx12 admits all four V2 plain keys; non-gfx12 rejects via MissingImpl.
-        let cases: &[(DType, KernelKey)] = &[
+        // All five V2 widths (MQ4V2 qt44 + MQ6/5/3/2V2 qt47-50) admit on both gfx11 (HasWmma) and gfx12 (HasWmma) via the shared WMMA dispatch;
+        // MQ4C (qt45) remains gfx12-only (HasWmmaGfx12).
+        let v2_cases: &[(DType, KernelKey)] = &[
             (DType::MQ6G256V2, KernelKey::GemmMq6G256V2),
             (DType::MQ5G256V2, KernelKey::GemmMq5G256V2),
             (DType::MQ3G256V2, KernelKey::GemmMq3G256V2),
             (DType::MQ2G256V2, KernelKey::GemmMq2G256V2),
             (DType::MQ4G256V2, KernelKey::GemmMq4G256V2),
-            (DType::MQ4CG256, KernelKey::GemmMq4CG256),
         ];
         let gfx12_ctx = DispatchCtx::for_test("gfx1200");
         let gfx11_ctx = DispatchCtx::for_test("gfx1100");
-        for (dt, exp_key) in cases {
+        let rdna1_ctx = DispatchCtx::for_test("gfx1010");
+        for (dt, exp_key) in v2_cases {
             let fam = GemmFamily::new();
-            let variant = fam
-                .resolve(*dt, &gfx12_ctx, None)
-                .expect("gfx12 must admit V2");
-            assert_eq!(variant.key, *exp_key, "plain resolve mismatch for {:?}", dt);
-            assert_ne!(
-                variant.key,
-                KernelKey::GemmHfq4G256,
-                "V2 must not resolve to HFQ4 for {:?}",
-                dt
-            );
-            let err = fam.resolve(*dt, &gfx11_ctx, None).unwrap_err();
+            for (label, ctx) in [("gfx1200", &gfx12_ctx), ("gfx1100", &gfx11_ctx)] {
+                let variant = fam
+                    .resolve(*dt, ctx, None)
+                    .unwrap_or_else(|e| panic!("{label} must admit V2 {dt:?}, got {e:?}"));
+                assert_eq!(
+                    variant.key, *exp_key,
+                    "plain resolve mismatch for {:?} on {label}",
+                    dt
+                );
+                assert_ne!(
+                    variant.key,
+                    KernelKey::GemmHfq4G256,
+                    "V2 must not resolve to HFQ4 for {:?}",
+                    dt
+                );
+            }
+            let err = fam.resolve(*dt, &rdna1_ctx, None).unwrap_err();
             assert!(
                 matches!(err, DispatchError::MissingImpl { .. }),
-                "gfx1100 should reject {:?}, got {:?}",
+                "gfx1010 should reject {:?}, got {:?}",
                 dt,
                 err
             );
         }
+        // MQ4C stays gfx12-only
+        let fam = GemmFamily::new();
+        let dt = DType::MQ4CG256;
+        let exp = KernelKey::GemmMq4CG256;
+        let v = fam
+            .resolve(dt, &gfx12_ctx, None)
+            .expect("gfx1200 must admit MQ4C");
+        assert_eq!(v.key, exp);
+        assert_ne!(v.key, KernelKey::GemmHfq4G256);
+        let err = fam.resolve(dt, &gfx11_ctx, None).unwrap_err();
+        assert!(
+            matches!(err, DispatchError::MissingImpl { .. }),
+            "gfx1100 should reject MQ4C, got {:?}",
+            err
+        );
     }
 
     #[test]
     fn v2_residual_run_key_not_hfq4() {
         let gfx12_ctx = DispatchCtx::for_test("gfx1200");
+        let gfx11_ctx = DispatchCtx::for_test("gfx1100");
         let fam = GemmFamily::new();
         for key in [
             KernelKey::GemmMq6G256V2Residual,
             KernelKey::GemmMq5G256V2Residual,
             KernelKey::GemmMq3G256V2Residual,
             KernelKey::GemmMq2G256V2Residual,
+            KernelKey::GemmMq4G256V2Residual,
         ] {
             assert!(
                 fam.registry().resolve(key, &gfx12_ctx, None).is_ok(),
                 "residual {:?} should be admitted on gfx1200",
                 key
             );
+            assert!(
+                fam.registry().resolve(key, &gfx11_ctx, None).is_ok(),
+                "residual {:?} should be admitted on gfx1100 (HasWmma)",
+                key
+            );
             assert_ne!(key, KernelKey::GemmHfq4G256Residual);
         }
+        // MQ4C remains gfx12-only
+        assert!(fam
+            .registry()
+            .resolve(KernelKey::GemmMq4CG256Residual, &gfx12_ctx, None)
+            .is_ok());
+        assert!(
+            fam.registry()
+                .resolve(KernelKey::GemmMq4CG256Residual, &gfx11_ctx, None)
+                .is_err(),
+            "MQ4C residual should be gfx12-only"
+        );
     }
 }

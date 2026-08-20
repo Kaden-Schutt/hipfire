@@ -308,8 +308,7 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
             gpu.maybe_capture_activation(wv, x, __cap_n, k);
             match params.batch_size {
                 Some(n) => {
-                    hip!(gpu
-                        .gemm_qkv_mq6g256v2_wmma_gfx12(wq, wk, wv, x, q, kout, v, mq, mk, mv, k, n))
+                    hip!(gpu.gemm_qkv_mq6g256v2_wmma(wq, wk, wv, x, q, kout, v, mq, mk, mv, k, n))
                 }
                 None => hip!(gpu.fused_qkv_mq6g256v2(wq, wk, wv, x, q, kout, v, mq, mk, mv, k)),
             }
@@ -327,8 +326,7 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
             gpu.maybe_capture_activation(wv, x, __cap_n, k);
             match params.batch_size {
                 Some(n) => {
-                    hip!(gpu
-                        .gemm_qkv_mq5g256v2_wmma_gfx12(wq, wk, wv, x, q, kout, v, mq, mk, mv, k, n))
+                    hip!(gpu.gemm_qkv_mq5g256v2_wmma(wq, wk, wv, x, q, kout, v, mq, mk, mv, k, n))
                 }
                 None => hip!(gpu.fused_qkv_mq5g256v2(wq, wk, wv, x, q, kout, v, mq, mk, mv, k)),
             }
@@ -346,8 +344,7 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
             gpu.maybe_capture_activation(wv, x, __cap_n, k);
             match params.batch_size {
                 Some(n) => {
-                    hip!(gpu
-                        .gemm_qkv_mq3g256v2_wmma_gfx12(wq, wk, wv, x, q, kout, v, mq, mk, mv, k, n))
+                    hip!(gpu.gemm_qkv_mq3g256v2_wmma(wq, wk, wv, x, q, kout, v, mq, mk, mv, k, n))
                 }
                 None => hip!(gpu.fused_qkv_mq3g256v2(wq, wk, wv, x, q, kout, v, mq, mk, mv, k)),
             }
@@ -365,8 +362,7 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
             gpu.maybe_capture_activation(wv, x, __cap_n, k);
             match params.batch_size {
                 Some(n) => {
-                    hip!(gpu
-                        .gemm_qkv_mq2g256v2_wmma_gfx12(wq, wk, wv, x, q, kout, v, mq, mk, mv, k, n))
+                    hip!(gpu.gemm_qkv_mq2g256v2_wmma(wq, wk, wv, x, q, kout, v, mq, mk, mv, k, n))
                 }
                 None => hip!(gpu.fused_qkv_mq2g256v2(wq, wk, wv, x, q, kout, v, mq, mk, mv, k)),
             }
@@ -613,7 +609,7 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
             gpu.maybe_capture_activation(wb, x, __cap_n, k);
             gpu.maybe_capture_activation(wa, x, __cap_n, k);
             match params.batch_size {
-                Some(n) => hip!(gpu.gemm_qkvza_mq5g256v2_wmma_gfx12(
+                Some(n) => hip!(gpu.gemm_qkvza_mq5g256v2_wmma(
                     wqkv, wz, wb, wa, x, qkv, z, beta, alpha, mqkv, mz, mb, ma, k, n
                 )),
                 None => hip!(gpu.fused_qkvza_mq5g256v2(
@@ -634,7 +630,7 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
             gpu.maybe_capture_activation(wb, x, __cap_n, k);
             gpu.maybe_capture_activation(wa, x, __cap_n, k);
             match params.batch_size {
-                Some(n) => hip!(gpu.gemm_qkvza_mq6g256v2_wmma_gfx12(
+                Some(n) => hip!(gpu.gemm_qkvza_mq6g256v2_wmma(
                     wqkv, wz, wb, wa, x, qkv, z, beta, alpha, mqkv, mz, mb, ma, k, n
                 )),
                 None => hip!(gpu.fused_qkvza_mq6g256v2(
@@ -655,7 +651,7 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
             gpu.maybe_capture_activation(wb, x, __cap_n, k);
             gpu.maybe_capture_activation(wa, x, __cap_n, k);
             match params.batch_size {
-                Some(n) => hip!(gpu.gemm_qkvza_mq3g256v2_wmma_gfx12(
+                Some(n) => hip!(gpu.gemm_qkvza_mq3g256v2_wmma(
                     wqkv, wz, wb, wa, x, qkv, z, beta, alpha, mqkv, mz, mb, ma, k, n
                 )),
                 None => hip!(gpu.fused_qkvza_mq3g256v2(
@@ -676,7 +672,7 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
             gpu.maybe_capture_activation(wb, x, __cap_n, k);
             gpu.maybe_capture_activation(wa, x, __cap_n, k);
             match params.batch_size {
-                Some(n) => hip!(gpu.gemm_qkvza_mq2g256v2_wmma_gfx12(
+                Some(n) => hip!(gpu.gemm_qkvza_mq2g256v2_wmma(
                     wqkv, wz, wb, wa, x, qkv, z, beta, alpha, mqkv, mz, mb, ma, k, n
                 )),
                 None => hip!(gpu.fused_qkvza_mq2g256v2(
@@ -964,7 +960,7 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
             gpu.maybe_capture_activation(wu, x, __cap_n, k);
             match params.batch_size {
                 Some(n) => {
-                    hip!(gpu.gemm_gate_up_mq5g256v2_wmma_gfx12(wg, wu, x, g, u, mg, mu, k, n))
+                    hip!(gpu.gemm_gate_up_mq5g256v2_wmma(wg, wu, x, g, u, mg, mu, k, n))
                 }
                 None => hip!(gpu.fused_gate_up_mq5g256v2(wg, wu, x, g, u, mg, mu, k)),
             }
@@ -981,7 +977,7 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
             gpu.maybe_capture_activation(wu, x, __cap_n, k);
             match params.batch_size {
                 Some(n) => {
-                    hip!(gpu.gemm_gate_up_mq6g256v2_wmma_gfx12(wg, wu, x, g, u, mg, mu, k, n))
+                    hip!(gpu.gemm_gate_up_mq6g256v2_wmma(wg, wu, x, g, u, mg, mu, k, n))
                 }
                 None => hip!(gpu.fused_gate_up_mq6g256v2(wg, wu, x, g, u, mg, mu, k)),
             }
@@ -998,7 +994,7 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
             gpu.maybe_capture_activation(wu, x, __cap_n, k);
             match params.batch_size {
                 Some(n) => {
-                    hip!(gpu.gemm_gate_up_mq3g256v2_wmma_gfx12(wg, wu, x, g, u, mg, mu, k, n))
+                    hip!(gpu.gemm_gate_up_mq3g256v2_wmma(wg, wu, x, g, u, mg, mu, k, n))
                 }
                 None => hip!(gpu.fused_gate_up_mq3g256v2(wg, wu, x, g, u, mg, mu, k)),
             }
@@ -1015,7 +1011,7 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
             gpu.maybe_capture_activation(wu, x, __cap_n, k);
             match params.batch_size {
                 Some(n) => {
-                    hip!(gpu.gemm_gate_up_mq2g256v2_wmma_gfx12(wg, wu, x, g, u, mg, mu, k, n))
+                    hip!(gpu.gemm_gate_up_mq2g256v2_wmma(wg, wu, x, g, u, mg, mu, k, n))
                 }
                 None => hip!(gpu.fused_gate_up_mq2g256v2(wg, wu, x, g, u, mg, mu, k)),
             }
