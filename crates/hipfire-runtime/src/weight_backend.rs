@@ -464,7 +464,7 @@ pub(crate) fn decode_raw_codec(
     }
     if codec.dtype == DType::MQ4CG256 {
         let gpr = k / 256;
-        let expected = m * gpr * 132;
+        let expected = m * gpr * 136;
         if data.len() != expected {
             return Err(hip_bridge::HipError::new(
                 0,

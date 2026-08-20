@@ -54,8 +54,8 @@ extern "C" __global__ void HIPFIRE_FUSED_GATE_UP_KERNEL(
 #else
     const int groups_per_row = K / 256;
 #endif
-    // Planar MQ4C: each weight tensor is its own blob [payload m*gpr*136][header interleaved].
-    // Header for (row,g) lives at group base gp (stride 136 B: 4 B header + 4 B pad + 128 B payload).
+    // MQ4C (qt=45) pad layout: 136 B/group — packed fp16 scale/zero at +0, 4-byte pad at +4, nibbles at +8.
+    // Each weight tensor is its own interleaved blob; header for (row,g) lives at group base gp.
     const char* A;
     float* y;
     int local_row;

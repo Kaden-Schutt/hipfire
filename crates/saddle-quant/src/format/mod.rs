@@ -21,7 +21,10 @@ pub mod kldseq;
 /// Quantization type tags as written into the HFQ tensor index.
 ///
 /// Values are wire constants — they are persisted in every `.hfq` on disk and
-/// must never be renumbered. Mirrors the encoder's `QuantType` discriminants.
+/// must never be renumbered. Mirrors the encoder's `QuantType` discriminants
+/// in `crates/hipfire-quantize/src/main.rs` (canonical table).
+/// Collisions at 17/18 are not allowed: 17 is MQ3G256, 18 is MQ2G256;
+/// MFP4 family lives at 24/32/33/34/35/36/37, and PR599 owns 44/45.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[repr(u8)]
 pub enum QuantType {
@@ -42,23 +45,58 @@ pub enum QuantType {
     Mq8G256 = 14,
     Mq6G256 = 15,
     Bf16 = 16,
-    Mfp4G32 = 17,
-    Mfp4E8 = 18,
+    Mq3G256 = 17,
+    Mq2G256 = 18,
     Mq2G256Lloyd = 19,
     Mq3G256Lloyd = 20,
+    Hfp4G32 = 21,
+    Mfp4G32 = 24,
+    Mfp4G32Lloyd = 32,
+    Mfp4G32P = 33,
+    Mfp4G32E8 = 34,
+    Mfp4G32E8Soa = 35,
+    Mfp3G32E8 = 36,
+    Mfp2G32E8 = 37,
+    Mq4G256V2 = 44,
+    Mq4CG256 = 45,
 }
-
 impl QuantType {
     /// Wire tag → enum. `None` for tags this build does not know, which is a
     /// forward-compatibility case (newer artifact, older reader), not a bug.
     pub fn from_tag(tag: u8) -> Option<Self> {
         use QuantType::*;
         Some(match tag {
-            0 => Q4F16G64, 1 => F16, 2 => F32, 3 => Q8F16, 4 => Q4K, 5 => Q8HFQ,
-            6 => Hfq4G256, 7 => Hfq4G128, 8 => Hfq6G256, 9 => Hfq2G256,
-            10 => Hfq2G128, 11 => Hfq3G256, 12 => Hfq3G128, 13 => Mq4G256,
-            14 => Mq8G256, 15 => Mq6G256, 16 => Bf16, 17 => Mfp4G32,
-            18 => Mfp4E8, 19 => Mq2G256Lloyd, 20 => Mq3G256Lloyd,
+            0 => Q4F16G64,
+            1 => F16,
+            2 => F32,
+            3 => Q8F16,
+            4 => Q4K,
+            5 => Q8HFQ,
+            6 => Hfq4G256,
+            7 => Hfq4G128,
+            8 => Hfq6G256,
+            9 => Hfq2G256,
+            10 => Hfq2G128,
+            11 => Hfq3G256,
+            12 => Hfq3G128,
+            13 => Mq4G256,
+            14 => Mq8G256,
+            15 => Mq6G256,
+            16 => Bf16,
+            17 => Mq3G256,
+            18 => Mq2G256,
+            19 => Mq2G256Lloyd,
+            20 => Mq3G256Lloyd,
+            21 => Hfp4G32,
+            24 => Mfp4G32,
+            32 => Mfp4G32Lloyd,
+            33 => Mfp4G32P,
+            34 => Mfp4G32E8,
+            35 => Mfp4G32E8Soa,
+            36 => Mfp3G32E8,
+            37 => Mfp2G32E8,
+            44 => Mq4G256V2,
+            45 => Mq4CG256,
             _ => return None,
         })
     }
@@ -148,5 +186,32 @@ mod tests {
     fn unknown_quant_tag_is_reported_not_dropped() {
         assert_eq!(QuantType::from_tag(13), Some(QuantType::Mq4G256));
         assert_eq!(QuantType::from_tag(200), None);
+    }
+
+    #[test]
+    fn canonical_wire_tags_match_hipfire_quantize() {
+        // 17/18 must not collide with MFP4; canonical is MQ3/MQ2
+        assert_eq!(QuantType::from_tag(17), Some(QuantType::Mq3G256));
+        assert_eq!(QuantType::from_tag(18), Some(QuantType::Mq2G256));
+        assert_eq!(QuantType::Mq3G256 as u8, 17);
+        assert_eq!(QuantType::Mq2G256 as u8, 18);
+        // MFP4 family at canonical 24/34/etc
+        assert_eq!(QuantType::from_tag(24), Some(QuantType::Mfp4G32));
+        assert_eq!(QuantType::from_tag(34), Some(QuantType::Mfp4G32E8));
+        assert_eq!(QuantType::Mfp4G32 as u8, 24);
+        assert_eq!(QuantType::Mfp4G32E8 as u8, 34);
+        assert_eq!(QuantType::from_tag(32), Some(QuantType::Mfp4G32Lloyd));
+        assert_eq!(QuantType::from_tag(33), Some(QuantType::Mfp4G32P));
+        assert_eq!(QuantType::from_tag(35), Some(QuantType::Mfp4G32E8Soa));
+        assert_eq!(QuantType::from_tag(36), Some(QuantType::Mfp3G32E8));
+        assert_eq!(QuantType::from_tag(37), Some(QuantType::Mfp2G32E8));
+        // PR599 owns qt44/45; ensure from_tag recognizes them and discriminants match
+        assert_eq!(QuantType::from_tag(44), Some(QuantType::Mq4G256V2));
+        assert_eq!(QuantType::from_tag(45), Some(QuantType::Mq4CG256));
+        assert_eq!(QuantType::Mq4G256V2 as u8, 44);
+        assert_eq!(QuantType::Mq4CG256 as u8, 45);
+        // PR597 owns qt40/41 — PR599 must not claim them
+        assert_eq!(QuantType::from_tag(40), None);
+        assert_eq!(QuantType::from_tag(41), None);
     }
 }

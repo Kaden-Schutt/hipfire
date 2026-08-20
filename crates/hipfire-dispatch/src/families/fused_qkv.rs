@@ -53,12 +53,15 @@ fn guard_fused_qkv_dtype_key(
                 idx, w.dtype, key
             )));
         }
-        // qt=45 (MQ4CG256) is 132 B/group; v1/v2 are 136 B/group. Mis-route is silent noise.
+        // qt=45 (MQ4CG256) is 136 B/group (packed fp16 scale/zero at +0, 4 B pad
+        // at +4, nibbles at +8). v1/v2 also use 136 B/group but with incompatible
+        // header semantics, so cross-routing is still silent corruption.
         if w.dtype == DType::MQ4CG256 && (is_v1 || is_v2) {
             return Err(DispatchError::Hip(format!(
                 "qt=45 (MQ4CG256) weight[{}] (dtype {:?}) routed to non-mq4c kernel key {:?}: \
-                 mq4c stores one fp16 scale/zero pair + 128 B nibbles (132 B/group) while v1/v2 \
-                 use 136 B/group. A non-mq4c kernel reads every group at the wrong stride.",
+                 mq4c stores packed fp16 scale/zero at +0, 4-byte pad at +4, and nibbles at +8 \
+                 (136 B/group). v1/v2 share that stride but have incompatible header semantics, \
+                 so a non-mq4c kernel silently corrupts every group.",
                 idx, w.dtype, key
             )));
         }
@@ -69,8 +72,9 @@ fn guard_fused_qkv_dtype_key(
         {
             return Err(DispatchError::Hip(format!(
                 "non-mq4c weight[{}] (dtype {:?}) routed to mq4c kernel key {:?}: \
-                 mq4c expects 132 B groups (fp16 scale/zero + 128 B nibbles); v1/v2 payloads \
-                 are 136 B/group and would be read at the wrong stride.",
+                 mq4c expects 136 B groups (packed fp16 scale/zero at +0, 4-byte pad at +4, \
+                 nibbles at +8); v1/v2 share the stride but have incompatible header semantics \
+                 and would be silently corrupted.",
                 idx, w.dtype, key
             )));
         }

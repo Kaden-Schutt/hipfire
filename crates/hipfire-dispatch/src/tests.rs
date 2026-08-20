@@ -1214,8 +1214,10 @@ fn match_prefix_guard_receives_correct_window() {
 
 use crate::pipeline::steps::{
     guard_gate_up_hfq4g256, guard_gate_up_hfq6g256, guard_gate_up_mq3g256lloyd,
-    guard_gate_up_mq4g256lloyd, guard_qkv_hfq4g256, guard_qkv_hfq6g256, guard_qkv_mq3g256lloyd,
-    guard_qkv_mq4g256lloyd,
+    guard_gate_up_mq4cg256, guard_gate_up_mq4g256lloyd, guard_gate_up_mq4g256v2,
+    guard_qkv_hfq4g256, guard_qkv_hfq6g256, guard_qkv_mq3g256lloyd, guard_qkv_mq4cg256,
+    guard_qkv_mq4g256lloyd, guard_qkv_mq4g256v2, guard_qkvza_mq4cg256, guard_qkvza_mq4g256v2,
+    match_fused_prefix,
 };
 
 fn make_qkv3_steps<'a>(
@@ -1279,6 +1281,57 @@ fn make_gate_up2_steps<'a>(
             out: dummy,
         },
     ]
+}
+
+fn make_qkvza4_steps<'a>(
+    dummy: &'a rdna_compute::GpuTensor,
+    wr: &'a WeightRef<'a>,
+    rotation: RotationPlan,
+) -> Vec<Step<'a>> {
+    vec![
+        Step::RmsnormAutomatic {
+            x: dummy,
+            norm_weight: dummy,
+            x_plain: dummy,
+            out: dummy,
+            awq_scale: None,
+            k: 4096,
+            eps: 1e-6,
+            rotation,
+        },
+        Step::Gemv {
+            w: wr,
+            input: GemvInput::Prerotated(dummy),
+            out: dummy,
+        },
+        Step::Gemv {
+            w: wr,
+            input: GemvInput::Prerotated(dummy),
+            out: dummy,
+        },
+        Step::Gemv {
+            w: wr,
+            input: GemvInput::Prerotated(dummy),
+            out: dummy,
+        },
+        Step::Gemv {
+            w: wr,
+            input: GemvInput::Prerotated(dummy),
+            out: dummy,
+        },
+    ]
+}
+
+fn dummy_weight<'a>(dummy: &'a rdna_compute::GpuTensor, dtype: DType) -> WeightRef<'a> {
+    WeightRef {
+        buf: dummy,
+        dtype,
+        m: 4096,
+        k: 4096,
+        row_stride: 0,
+        rotation: None,
+        awq_scale: None,
+    }
 }
 
 #[test]
@@ -1476,6 +1529,123 @@ fn guard_gate_up_mq4g256lloyd_fires() {
     };
     let steps = make_gate_up2_steps(&dummy, &wr, RotationPlan::FwhtG256);
     assert!(guard_gate_up_mq4g256lloyd(&steps, &ctx_rdna3()));
+}
+
+// ── MQ4G256V2 / MQ4CG256 fused routing (qt=44/45 fp16-header) ──────────────
+// Prove the canonical matcher returns the exact fused KernelKey for each
+// (window, dtype) pair — not merely that the individual guard returns true.
+
+#[test]
+fn match_fused_prefix_mq4_fp16_header_routes() {
+    #[derive(Clone, Copy)]
+    enum Win {
+        Qkv3,
+        Qkvza4,
+        GateUp2,
+    }
+    let cases: &[(DType, Win, KernelKey, usize)] = &[
+        (
+            DType::MQ4G256V2,
+            Win::Qkv3,
+            KernelKey::FusedQkvMq4G256V2,
+            4,
+        ),
+        (
+            DType::MQ4CG256,
+            Win::Qkv3,
+            KernelKey::FusedQkvMq4CG256,
+            4,
+        ),
+        (
+            DType::MQ4G256V2,
+            Win::Qkvza4,
+            KernelKey::FusedQkvzaMq4G256V2,
+            5,
+        ),
+        (
+            DType::MQ4CG256,
+            Win::Qkvza4,
+            KernelKey::FusedQkvzaMq4CG256,
+            5,
+        ),
+        (
+            DType::MQ4G256V2,
+            Win::GateUp2,
+            KernelKey::FusedGateUpMq4G256V2,
+            3,
+        ),
+        (
+            DType::MQ4CG256,
+            Win::GateUp2,
+            KernelKey::FusedGateUpMq4CG256,
+            3,
+        ),
+    ];
+
+    let dummy = rdna_compute::GpuTensor::null_for_test();
+    let ctx = ctx_rdna3();
+    for &(dtype, win, want_key, want_len) in cases {
+        let wr = dummy_weight(&dummy, dtype);
+        let steps = match win {
+            Win::Qkv3 => make_qkv3_steps(&dummy, &wr, RotationPlan::FwhtG256),
+            Win::Qkvza4 => make_qkvza4_steps(&dummy, &wr, RotationPlan::FwhtG256),
+            Win::GateUp2 => make_gate_up2_steps(&dummy, &wr, RotationPlan::FwhtG256),
+        };
+        assert_eq!(
+            match_fused_prefix(&steps, &ctx),
+            Some((want_key, want_len)),
+            "dtype={dtype:?} window={want_len} must map to {want_key:?}"
+        );
+    }
+}
+
+#[test]
+fn match_fused_prefix_mq4_fp16_header_rejects_force_unfused() {
+    // Representative case: QKV3 + MQ4G256V2 with force_unfused must not fuse.
+    let dummy = rdna_compute::GpuTensor::null_for_test();
+    let wr = dummy_weight(&dummy, DType::MQ4G256V2);
+    let steps = make_qkv3_steps(&dummy, &wr, RotationPlan::FwhtG256);
+    let mut ctx = ctx_rdna3();
+    std::sync::Arc::make_mut(&mut ctx.flags).force_unfused = true;
+    assert_eq!(
+        match_fused_prefix(&steps, &ctx),
+        None,
+        "force_unfused must reject MQ4G256V2 QKV3 fusion"
+    );
+    assert!(!guard_qkv_mq4g256v2(&steps, &ctx));
+    // Guards for the sibling fp16-header dtype / windows also reject.
+    assert!(!guard_qkv_mq4cg256(&steps, &ctx));
+    let wr_c = dummy_weight(&dummy, DType::MQ4CG256);
+    let steps_c = make_qkv3_steps(&dummy, &wr_c, RotationPlan::FwhtG256);
+    assert!(!guard_qkv_mq4cg256(&steps_c, &ctx));
+    assert_eq!(match_fused_prefix(&steps_c, &ctx), None);
+}
+
+#[test]
+fn guard_mq4_fp16_header_fires_on_correct_windows() {
+    // Spot-check the six guards independently of table order.
+    let dummy = rdna_compute::GpuTensor::null_for_test();
+    let ctx = ctx_rdna3();
+    let wr_v2 = dummy_weight(&dummy, DType::MQ4G256V2);
+    let wr_c = dummy_weight(&dummy, DType::MQ4CG256);
+
+    let qkv3_v2 = make_qkv3_steps(&dummy, &wr_v2, RotationPlan::FwhtG256);
+    let qkv3_c = make_qkv3_steps(&dummy, &wr_c, RotationPlan::FwhtG256);
+    let qkvza_v2 = make_qkvza4_steps(&dummy, &wr_v2, RotationPlan::FwhtG256);
+    let qkvza_c = make_qkvza4_steps(&dummy, &wr_c, RotationPlan::FwhtG256);
+    let gu_v2 = make_gate_up2_steps(&dummy, &wr_v2, RotationPlan::FwhtG256);
+    let gu_c = make_gate_up2_steps(&dummy, &wr_c, RotationPlan::FwhtG256);
+
+    assert!(guard_qkv_mq4g256v2(&qkv3_v2, &ctx));
+    assert!(guard_qkv_mq4cg256(&qkv3_c, &ctx));
+    assert!(guard_qkvza_mq4g256v2(&qkvza_v2, &ctx));
+    assert!(guard_qkvza_mq4cg256(&qkvza_c, &ctx));
+    assert!(guard_gate_up_mq4g256v2(&gu_v2, &ctx));
+    assert!(guard_gate_up_mq4cg256(&gu_c, &ctx));
+
+    // Cross-dtype: V2 guard must not accept CG256 weights and vice versa.
+    assert!(!guard_qkv_mq4g256v2(&qkv3_c, &ctx));
+    assert!(!guard_qkv_mq4cg256(&qkv3_v2, &ctx));
 }
 
 // ── MoePrefillResolution cells (Ship 4.2) ─────────────────────────

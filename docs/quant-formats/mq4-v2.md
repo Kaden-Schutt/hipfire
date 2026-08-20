@@ -38,26 +38,32 @@ parent (layers 0 / 20 / 40, engine sign seeds 42/1042):
 So the 8 header bytes are 2× over-precise, and the zero-point earns its keep by a modest
 margin. Halving the precision and spending the saving on **granularity** is what v2 does.
 
-## 1b · v1.5 — a strictly free intermediate, worth taking independently
+## 1b · v1.5 / MQ4C pad — same size as v1, fp16 header at +0
 
-Applying only the fp16-header half of the change, at per-256 granularity, gives a **132 B**
-format with **identical quality to v1** (MSE 1.4415e-06, tail 9.4643e-07) that is **smaller
-and faster**:
+Applying only the fp16-header half of the change, at per-256 granularity, gives
+**MQ4C (qt=45) pad: 136 B/group**, byte-for-byte v1's geometry — the **shipping**
+form of v1.5:
 
-| | header loads | added VALU | B | R=2 ratio | R=4 ratio |
-|---|---|---|---|---|---|
-| v1 | 2 scalar (f32 scale, f32 zero) | 0 (`bit_cast` is free) | 136 | 1.0000 | 1.0000 |
-| **v1.5** | **1 scalar** (packed fp16 pair) | 2 `cvt_f32_f16` | **132** | **0.9847** | **0.9773** |
-| v2 | 2 scalar | 1 `cndmask` + 2 `cvt` | 136 | 0.9766 | 1.0128 |
+| offset | size | field |
+|---|---|---|
+| `[0..4)` | 1 dword | packed fp16 header: low 16 bits fp16 `scale`, high 16 bits fp16 `zero` (per-256, `w = q·scale + zero`) |
+| `[4..8)` | 4 B | zero padding (must be `0x00000000`) |
+| `[8..136)` | 128 B | 4-bit nibbles, **byte-identical offset and stride to qt=1/6/13** |
 
-v1.5 both **halves the header load count** and cuts **2.9% of weight traffic**, so on a
-bandwidth-bound kernel it wins outright at quality parity. It also has no `cndmask`, which is
-why it avoids v2's R=4 regression. Layout: `[0..2)` fp16 scale, `[2..4)` fp16 zero,
-`[4..132)` nibbles — note the payload offset moves 8 → 4 and the stride 136 → 132, so unlike
-v2 the payload is **not** byte-identical to v1.
+Total `m·gpr·136` bytes per weight tensor, the same size as v1. The 4 pad bytes are the
+deliberate price of keeping the payload at **+8**: a 132 B stride (`[0..2)` fp16 scale,
+`[2..4)` fp16 zero, `[4..132)` nibbles, or planar `128 B payload plane + 4 B header plane`)
+left the payload 4-byte aligned half the time and cost 7–11% prefill on
+`global_load_b128`; that **132 B compact/planar layout is retired** — measured identical
+quality to v1 (MSE 1.4415e-06, tail 9.4643e-07, 0.008% header-rounding cost, 2.43% smaller)
+but not shipping. The pad and the retired compact share the same fp16 header precision, so
+quality is identical; the shipping choice is alignment, not bytes. Header loads still halve
+(1 scalar packed dword vs 2 scalar f32) with 2 `cvt_f32_f16` per group; unlike v2 there is
+no `cndmask`, which is why the header-only change avoids v2's R=4 behaviour.
 
-**v1.5 and v2 are independent decisions.** v1.5 is size + speed at fixed quality; v2 is
-quality at fixed size. They cannot be combined, because per-128 asymmetric needs the full 8 B.
+**v1.5 pad and v2 are independent decisions.** v1.5 pad is header-precision at fixed geometry;
+v2 is granularity (per-128) at fixed size. They cannot be combined, because per-128
+asymmetric needs both header halves' 8 B.
 
 ## 1c · Above 136 B, hierarchical sub-scales beat raw fp16 ones
 
@@ -69,7 +75,8 @@ for per-32. Measured, data-free, all asymmetric:
 | variant | B | bpw | overall MSE | tail-1% MSE |
 |---|---|---|---|---|
 | v1 asym 1×256 f32 hdr | 136 | 4.2500 | 1.4415e-06 | 9.4635e-07 |
-| **v1.5** asym 1×256 fp16 hdr | **132** | 4.1250 | 1.4415e-06 | 9.4643e-07 |
+| **v1.5 pad** asym 1×256 fp16 hdr (pad `[0..4)` hdr, `[4..8)` zero, `[8..136)` nibbles — shipping) | **136** | 4.2500 | 1.4415e-06 | 9.4643e-07 |
+| *v1.5 compact (retired)* asym 1×256 fp16 hdr (`[0..2)` scale, `[2..4)` zero, `[4..132)` nibbles — 2.43% smaller, alignment cost) | *132* | 4.1250 | 1.4415e-06 | 9.4643e-07 |
 | **v2** asym 2×128 fp16 hdr | **136** | 4.2500 | 1.2089e-06 | 5.6621e-07 |
 | asym 4×64 fp16 hdr | 144 | 4.5000 | 9.7617e-07 | 3.2450e-07 |
 | **hier 8×32, 6-bit s+z** | **144** | 4.5000 | **7.4647e-07** | **2.1632e-07** |
@@ -85,8 +92,7 @@ Two conclusions:
 2. **At equal 144 B, hierarchical per-32 strictly dominates raw-fp16 per-64** by 23.5% MSE and
    33% tail. So above 136 B the header encoding, not the granularity, is the binding choice.
 
-**This does not change v1.5 or v2**, which are the best options at 132 B and 136 B
-respectively — hierarchical encoding needs ≥3 sub-blocks before its 4 B super-header amortises.
+**This does not change v1.5 pad or v2**, which are the best options at **136 B** — v1.5 pad for size-neutral header precision and v2 for quality at the same size. The retired 132 B compact was best at 132 B before alignment retired it; hierarchical encoding needs ≥3 sub-blocks before its 4 B super-header amortises.
 It does mean that **if bytes are available, 144 B hierarchical is the next format to build**,
 not 4×64 fp16, and it is worth 38% MSE / 62% tail over v2 for 5.9% more bytes.
 
@@ -102,10 +108,10 @@ so no variant needs to restate the rotation.
 
 | `--format` | qt | layout | status |
 |---|---|---|---|
-| `mq4` *(alias)*, `mq4v2` *(canonical)* | **44** | v2 — 136 B, per-128 asym, fp16 scale+zero | **being wired** |
-| `mq4c` | 45 | v1.5 — 132 B, per-256 asym, fp16 scale+zero | specified, § 1b |
+| `mq4` *(alias)*, `mq4v2` *(canonical)* | **44** | v2 — 136 B, per-128 asym, fp16 scale+zero at +0/`+4`, nibbles at +8 | **being wired** |
+| `mq4c` | **45** | **v1.5 pad — 136 B, per-256 asym, fp16 scale+zero at +0, zero pad +4..8, 128 B nibbles at +8** | **shipping (pad)** |
 | `mq4_k` | 46 | hierarchical — per-32 @144 B or per-16 @156 B, 6-bit s+z | specified, § 1c |
-| `mq4v1`, `mq4g256`, `magnum` | 13 | unchanged — 136 B, per-256 asym, f32 scale+zero | shipping |
+| `mq4v1`, `mq4g256`, `magnum` | 13 | unchanged — 136 B, per-256 asym, f32 scale+zero at +0/+4, nibbles at +8 | shipping |
 | — | 43 | MQ4-G256-SEL, **retired** | burned, never reuse |
 
 Three naming decisions, each deliberate:
@@ -275,7 +281,8 @@ Reproduced independently by two harnesses agreeing within **0.11%**
 |---|---|---|---|---|---|
 | qt=1/6/13 affine 1×256 f32 hdr | 136 | 4.2500 | 1.4423e-06 | 9.4561e-07 | 0.000% |
 | **v2 affine 2×128 fp16 hdr** | **136** | **4.2500** | **1.2085e-06** (−16.2%) | **5.6684e-07** (−40.1%) | **0.000%** |
-| affine 1×256 fp16 hdr (§ 7) | 132 | 4.1250 | 1.4415e-06 | 9.4643e-07 | 0.000% |
+| affine 1×256 fp16 hdr — pad (shipping qt=45, `[0..4)` fp16 pair, `[4..8)` zero pad, `[8..136)` nibbles) | 136 | 4.2500 | 1.4415e-06 | 9.4643e-07 | 0.000% |
+| *affine 1×256 fp16 hdr — compact (retired, `[0..2)`/`[2..4)`/`[4..132)` — 2.43% smaller)* | *132* | 4.1250 | 1.4415e-06 | 9.4643e-07 | 0.000% |
 | affine 4×64 fp16 hdr | 144 | 4.5000 | 9.7617e-07 | 3.2450e-07 | 0.000% |
 | affine 8×32 fp16 hdr | 160 | 5.0000 | 7.4343e-07 | 1.8091e-07 | 0.000% |
 | GL codebook qt=40 | 130 | 4.0625 | 1.1441e-06 | 2.0147e-05 | 0.1076 |
@@ -363,14 +370,18 @@ existing `KernelKey` mechanism. No second memory layout, no second GEMM family, 
 pass, no re-download. Legacy artifacts keep working indefinitely; new quantizations emit v2
 when the parent is available.
 
-### Optional, independent: a 132 B repack of legacy artifacts
+### Optional, independent: a 136 B pad repack of legacy artifacts (same-size header rewrite)
 
-`affine 1×256 fp16 hdr` measures identically to qt=1 (§ 5), so a loader could repack legacy
-136 B → **132 B** on the way into VRAM: **≈440 MB saved on a 15 GB model** for **0.008%**
-quality, with no re-download. This is safe precisely because it only discards unused f32
-header precision — there is no grid realignment, so none of the lossy round-trip above
-applies. It does add a third layout to maintain; file it as a separate decision, not part of
-v2.
+`affine 1×256 fp16 hdr` (pad) measures identically to qt=1 (§ 5), so a loader can repack
+legacy 136 B (f32 header at +0/+4, nibbles at +8) → **136 B pad** (`[0..4)` fp16 header,
+`[4..8)` zero padding, `[8..136)` nibbles verbatim) as a **pure header rewrite**: rewrite 8
+header bytes as one packed fp16 dword, zero 4 pad bytes, keep all 128 nibble bytes, stride
+unchanged. No re-download, no re-fit (0 nibble flips in 95M groups, ≤0.26-step drift, 0.007%
+MSE / 0.09% RMS), no size change — the earlier 132 B compact (`136→132`, ~440 MB on 15 GB)
+is retired for the same alignment reason as § 1b. This is safe precisely because it only
+discards unused f32 header precision — there is no grid realignment, so none of the lossy
+round-trip above applies. It does add a second header encoding to maintain; file it as a
+separate decision, not part of v2.
 
 ---
 

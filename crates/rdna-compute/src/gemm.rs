@@ -26297,7 +26297,8 @@ impl Gpu {
     // ═══════════════════════════════════════════════════════════════════
     // MQ4C / v1.5 (qt=45) launchers — mirror v1 twins exactly.
     // Module/symbol: hfq4g256 -> mq4cg256. SRC: *_MQ4CG256_*.
-    // Never fall back to a v1 kernel: 132 B groups at 136 B stride = noise.
+    // Never fall back to a v1 kernel: shared 136 B stride but incompatible
+    // headers (mq4c: fp16 s/z at +0, pad at +4, nibbles at +8) = silent noise.
     // ═══════════════════════════════════════════════════════════════════
 
     /// MQ4C (qt=45) sister of `gemm_qkvza_hfq4g256_wmma_gfx12`.
@@ -26924,7 +26925,7 @@ impl Gpu {
 
     /// MQ4C (qt=45) fused QKVZA decode — base wave32 path only.
     /// Arch-specialized v1 siblings (wave64/dp4a/gfx1151/…) have no mq4c
-    /// source; do not fall back to those (132 B vs 136 B stride).
+    /// source; do not fall back to those (shared 136 B stride, incompatible headers).
     pub fn fused_qkvza_mq4cg256(
         &mut self,
         a_qkv: &GpuTensor,
@@ -27086,8 +27087,8 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         // Base wave32 mq4c sources only. Wave64/dp4a/gfx1151 specialized
-        // paths have no mq4c twin — refuse rather than feed 132 B groups
-        // to a 136 B-stride v1 kernel.
+        // paths have no mq4c twin — refuse rather than feed mq4c groups
+        // (fp16 s/z + pad + nibbles) to a v1 header kernel at the same stride.
         let (module, src, func_name, block, grid_x) = if bias.is_some() {
             (
                 "fused_qkv_mq4cg256_qwen2_bias",
@@ -27259,7 +27260,7 @@ impl Gpu {
 
     /// MQ4C (qt=45) plain batched GEMM. No scalar `GEMM_MQ4CG256_SRC` exists
     /// (only WMMA residual/gate_up/qkv/qkvza gfx12 hips). Refuse rather than
-    /// mis-decode 132 B groups with the v1 136 B scalar kernel.
+    /// mis-decode mq4c headers with the v1 scalar kernel (same 136 B stride).
     pub fn gemm_mq4cg256(
         &mut self,
         a_raw: &GpuTensor,
@@ -27274,7 +27275,8 @@ impl Gpu {
             0,
             "qt=45 gemm_mq4cg256: no GEMM_MQ4CG256 scalar source exists \
              (would need GEMM_MQ4CG256_SRC / GEMM_MQ4CG256_WAVE64_SRC). \
-             MQ4C bytes cannot be decoded by the v1 scalar kernel (132 B vs 136 B group).",
+             MQ4C bytes cannot be decoded by the v1 scalar kernel (shared 136 B \
+             stride; mq4c packs fp16 scale/zero at +0, pad at +4, nibbles at +8).",
         ))
     }
 
@@ -27333,7 +27335,8 @@ impl Gpu {
         Err(hip_bridge::HipError::new(
             0,
             "qt=45 gemm_mq4cg256_batched_lmhead: scalar fallback has no mq4c source \
-             (GEMM_MQ4CG256_SRC missing) — would mis-decode 132 B groups as v1 136 B",
+             (GEMM_MQ4CG256_SRC missing) — would mis-decode mq4c 136 B groups \
+             (fp16 s/z at +0, pad at +4, nibbles at +8) with the v1 header layout",
         ))
     }
 

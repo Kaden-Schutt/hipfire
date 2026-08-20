@@ -131,7 +131,36 @@ fn batched_proj(
                 .map_err(|e| HipError::new(0, &e.to_string()))?;
             Ok(())
         }
-        DType::F32 => gpu.gemm_f32_batched(&w.buf, x, y, w.m, w.k, batch),
+        DType::F32 => {
+            use hipfire_dispatch::context::DispatchCtx;
+            use hipfire_dispatch::families::gemm::GemmParams;
+            use hipfire_dispatch::families::gemv::WeightRef;
+            let ctx = DispatchCtx::new(gpu);
+            let w_ref = WeightRef {
+                buf: &w.buf,
+                dtype: w.gpu_dtype,
+                m: w.m,
+                k: w.k,
+                row_stride: w.k,
+                rotation: None,
+                awq_scale: None,
+            };
+            let params = GemmParams {
+                w: &w_ref,
+                x,
+                y,
+                batch_size: batch,
+            };
+            hipfire_runtime::llama::gemm_family()
+                .run_key(
+                    hipfire_dispatch::types::KernelKey::GemmF32Batched,
+                    &ctx,
+                    gpu,
+                    &params,
+                )
+                .map_err(|e| HipError::new(0, &e.to_string()))?;
+            Ok(())
+        }
         DType::Q8_0 => gpu.gemm_q8_0_batched_chunked(&w.buf, x, y, w.m, w.k, batch),
         DType::HFQ4G256 => gpu.gemm_hfq4g256(&w.buf, x, y, w.m, w.k, batch),
         DType::MQ4G256 => {
@@ -219,14 +248,36 @@ fn lm_head_batched_lfm(
         }
         // F32 has no dedicated *_batched_lmhead kernel — the generic batched GEMM
         // is the correct path (same grid as the other F32 projections).
-        DType::F32 => gpu.gemm_f32_batched(
-            &out_weight.buf,
-            hidden,
-            logits,
-            out_weight.m,
-            out_weight.k,
-            batch_size,
-        ),
+        DType::F32 => {
+            use hipfire_dispatch::context::DispatchCtx;
+            use hipfire_dispatch::families::gemm::GemmParams;
+            use hipfire_dispatch::families::gemv::WeightRef;
+            let ctx = DispatchCtx::new(gpu);
+            let w_ref = WeightRef {
+                buf: &out_weight.buf,
+                dtype: out_weight.gpu_dtype,
+                m: out_weight.m,
+                k: out_weight.k,
+                row_stride: out_weight.k,
+                rotation: None,
+                awq_scale: None,
+            };
+            let params = GemmParams {
+                w: &w_ref,
+                x: hidden,
+                y: logits,
+                batch_size,
+            };
+            hipfire_runtime::llama::gemm_family()
+                .run_key(
+                    hipfire_dispatch::types::KernelKey::GemmF32Batched,
+                    &ctx,
+                    gpu,
+                    &params,
+                )
+                .map_err(|e| HipError::new(0, &e.to_string()))?;
+            Ok(())
+        }
         DType::Q8_0 => gpu.gemm_q8_0_batched_chunked(
             &out_weight.buf,
             hidden,

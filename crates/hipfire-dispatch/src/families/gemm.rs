@@ -186,11 +186,11 @@ impl GemmFamily {
             gpu.maybe_capture_activation(w.buf, x, batch_size, k);
         }
 
-        // Guard: V2/v1.5 bytes through wrong-stride kernels is silent noise.
-        // qt=44 = 136 B/group (two fp16 half-grids); qt=45 = 132 B/group (one
-        // fp16 scale/zero); v1 = 136 B/group (f32 scale/zero). A mis-route
-        // decodes every group at the wrong stride and returns noise at full
-        // speed with no HIP error.
+        // Guard: V2/v1.5 bytes through wrong-header kernels is silent noise.
+        // qt=44 = 136 B/group (two fp16 half-grids); qt=45 = 136 B/group (packed
+        // fp16 scale/zero at +0, 4 B pad at +4, nibbles at +8); v1 = 136 B/group
+        // (f32 scale/zero). Shared stride, incompatible headers — mis-route
+        // returns noise at full speed with no HIP error.
         if w.dtype == DType::MQ4G256V2 && is_gemm_hfq4_key(key) {
             return Err(DispatchError::Hip(format!(
                 "qt=44 (MQ4G256V2) weight (dtype {:?}) routed to v1 kernel key {:?}: \
@@ -203,9 +203,10 @@ impl GemmFamily {
         if w.dtype == DType::MQ4CG256 && (is_gemm_hfq4_key(key) || is_gemm_mq4v2_key(key)) {
             return Err(DispatchError::Hip(format!(
                 "qt=45 (MQ4CG256) weight (dtype {:?}) routed to incompatible kernel key {:?}: \
-                 mq4c stores one fp16 scale/zero per 256 weights in a 132 B group, while v1/v2 \
-                 use 136 B groups (f32 scale/zero or two fp16 half-grids). A mis-route reads \
-                 every group at the wrong stride and returns noise at full speed with no error.",
+                 mq4c stores packed fp16 scale/zero at +0, 4-byte pad at +4, and nibbles at +8 \
+                 (136 B/group). v1/v2 share that stride (f32 scale/zero or two fp16 half-grids) \
+                 but have incompatible header semantics, so a mis-route silently corrupts every \
+                 group at full speed with no error.",
                 w.dtype, key
             )));
         }
@@ -222,8 +223,9 @@ impl GemmFamily {
         {
             return Err(DispatchError::Hip(format!(
                 "non-mq4c weight (dtype {:?}) routed to mq4c (qt=45) kernel key {:?}: \
-                 mq4c expects a 132 B group (fp16 scale/zero + 128 B nibbles) while v1/v2 use \
-                 136 B groups. Reverse mis-route is equally silent and wrong.",
+                 mq4c expects a 136 B group (packed fp16 scale/zero at +0, 4-byte pad at +4, \
+                 nibbles at +8). v1/v2 share the stride but have incompatible header semantics; \
+                 reverse mis-route is equally silent and wrong.",
                 w.dtype, key
             )));
         }

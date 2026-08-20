@@ -1,19 +1,15 @@
-// Is the 64-profile selector just a cheap re-derivation of MQ4-Lloyd (qt=30)?
+// MQ4 header-encoding feasibility ladder on the canonical 278,528-block
+// rotated-weight fixture. Compares equal-136-byte G256 layouts against the
+// established MQ4 v2 quality anchor, then shows the 140-160 byte ceiling.
 //
-// MQ4-Lloyd stores a FULL per-block 16-entry fp16 codebook: 32 B/group, 160 B total,
-// 5.0 bpw. The selector stores 6 bits naming one of 64 pre-fitted profiles.
-// Prior verdict (4a018afdf) on per-block codebooks: "costs 8x a per-channel scale
-// for 1.8%" -- measured at 2-bit under RMS normalisation.
-//
-// Hypothesis under test: normalisation decides whether a per-block codebook is worth
-// anything. Under RMS normalisation the FWHT + CLT make every block the same Gaussian
-// shape, so there is nothing to adapt to (hence 1.8%). Under MAX normalisation blocks
-// differ by their max/rms ratio (mean 3.046, p99 4.058), which creates real per-block
-// shape variance a codebook can exploit.
-//
-// Grid: {RMS, MAX} normalisation x {single global cb, 64-profile selector, per-block Lloyd}.
+// The FP8 arms use real OCP E4M3/E5M2 round trips. RAW stores one-byte scale
+// and zero per G64. ZP stores one-byte scale plus a signed integer zero-point.
+// The hierarchical arms store fp16 super-scale/super-zero plus fixed-width
+// integer scale/zero selectors. Every reported reconstruction uses only
+// values represented by the named header; there is no hidden f32 metadata.
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+#include <hip/hip_fp8.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -29,6 +25,10 @@
 #define CB_SYM    5
 #define CB_HIER   6
 #define CB_HIER2  7
+#define CB_FP8_E4_RAW 8
+#define CB_FP8_E5_RAW 9
+#define CB_FP8_E4_ZP 10
+#define CB_FP8_E5_ZP 11
 __device__ __constant__ float CLIP_MULT[64] = {
   0.50f,0.51f,0.52f,0.53f,0.54f,0.55f,0.56f,0.57f,0.58f,0.59f,0.60f,0.61f,0.62f,0.63f,
   0.64f,0.65f,0.66f,0.67f,0.68f,0.69f,0.70f,0.71f,0.72f,0.73f,0.74f,0.75f,0.76f,0.77f,
@@ -37,6 +37,18 @@ __device__ __constant__ float CLIP_MULT[64] = {
   0.975f,0.98f,0.9825f,0.985f,0.9875f,0.99f,0.9925f,0.995f,1.00f};
 #define NORM_MAX 0
 #define NORM_RMS 1
+
+__device__ __forceinline__ float round_e4m3(float x) {
+    const unsigned char bits =
+        __hip_cvt_float_to_fp8(x, __HIP_SATFINITE, __HIP_E4M3);
+    return __builtin_amdgcn_cvt_f32_fp8((int)bits, 0);
+}
+
+__device__ __forceinline__ float round_e5m2(float x) {
+    const unsigned char bits =
+        __hip_cvt_float_to_fp8(x, __HIP_SATFINITE, __HIP_E5M2);
+    return __builtin_amdgcn_cvt_f32_bf8((int)bits, 0);
+}
 
 // GL_CB4 -- the Lloyd-Max optimum for a unit Gaussian, i.e. the codebook that BELONGS
 // in RMS-normalised space. fam64 lives in MAX-normalised space (outermost +/-1.0), so
@@ -162,7 +174,10 @@ __global__ __launch_bounds__(256) void eval_cb(
             __syncthreads();
         }
 
-        if (cb_mode == CB_AFFINE || cb_mode == CB_UCLIP || cb_mode == CB_SYM || cb_mode == CB_HIER || cb_mode == CB_HIER2) {
+        if (cb_mode == CB_AFFINE || cb_mode == CB_UCLIP || cb_mode == CB_SYM ||
+            cb_mode == CB_HIER || cb_mode == CB_HIER2 ||
+            cb_mode == CB_FP8_E4_RAW || cb_mode == CB_FP8_E5_RAW ||
+            cb_mode == CB_FP8_E4_ZP || cb_mode == CB_FP8_E5_ZP) {
             // per-sub-block min/max for AFFINE; per-sub-block max for UCLIP
             sh_red[tid] = w;
             __syncthreads();
@@ -180,6 +195,29 @@ __global__ __launch_bounds__(256) void eval_cb(
             }
             const float hi = sh_red[sub * sub_sz];
             __syncthreads();
+            if (cb_mode == CB_FP8_E4_RAW || cb_mode == CB_FP8_E5_RAW ||
+                cb_mode == CB_FP8_E4_ZP || cb_mode == CB_FP8_E5_ZP) {
+                // Four G64 affine grids in the legacy 8-byte header slot.
+                // RAW stores both scale and zero as FP8. ZP spends the second
+                // byte on a signed integer zero-point relative to the FP8 scale.
+                const float st0 = (hi - lo) / 15.0f;
+                const bool e4 = cb_mode == CB_FP8_E4_RAW || cb_mode == CB_FP8_E4_ZP;
+                const bool zp = cb_mode == CB_FP8_E4_ZP || cb_mode == CB_FP8_E5_ZP;
+                const float st = e4 ? round_e4m3(st0) : round_e5m2(st0);
+                float z;
+                if (zp) {
+                    const int zi = st > 0.0f
+                        ? (int)fminf(fmaxf(rintf(lo / st), -128.0f), 127.0f)
+                        : 0;
+                    z = (float)zi * st;
+                } else {
+                    z = e4 ? round_e4m3(lo) : round_e5m2(lo);
+                }
+                const float q = st > 0.0f
+                    ? fminf(fmaxf(rintf((w - z) / st), 0.0f), 15.0f)
+                    : 0.0f;
+                sh_zh[tid] = (q * st + z) / scale;
+            } else
             if (cb_mode == CB_HIER || cb_mode == CB_HIER2) {
                 // Q4_K-style hierarchical header: per-sub-block scale and zero quantised to
                 // `hbits` each, against a per-256 fp16 super-scale (d) and super-zero (dmin).
@@ -209,13 +247,15 @@ __global__ __launch_bounds__(256) void eval_cb(
                 const float q  = (st > 0.0f) ? fminf(fmaxf(rintf((w - z) / st), 0.0f), 15.0f) : 0.0f;
                 sh_zh[tid] = (q * st + z) / scale;
             } else if (cb_mode == CB_SYM) {
-                // symmetric: 16 uniform levels over [-amax, +amax], q=0 -> -amax, q=15 -> +amax.
-                // Only an fp16 scale is stored; no zero-point. Costs 2 B per sub-block.
+                // Symmetric 16-level affine grid with an implicit midpoint:
+                // decode = (q - 7.5) * stored_fp16_step. No hidden amax/zero.
                 const float amax = fmaxf(fabsf(lo), fabsf(hi));
                 const float st0 = 2.0f * amax / 15.0f;
                 const float st  = fp16_hdr ? __half2float(__float2half(st0)) : st0;
-                const float q   = (st > 0.0f) ? fminf(fmaxf(rintf((w + amax) / st), 0.0f), 15.0f) : 0.0f;
-                sh_zh[tid] = (q * st - amax) / scale;
+                const float q   = st > 0.0f
+                    ? fminf(fmaxf(rintf(w / st + 7.5f), 0.0f), 15.0f)
+                    : 0.0f;
+                sh_zh[tid] = ((q - 7.5f) * st) / scale;
             } else if (cb_mode == CB_AFFINE) {
                 // store scale+zero as fp16, as a real 136 B format must
                 const float st0 = (hi - lo) / 15.0f;
@@ -271,14 +311,18 @@ __global__ __launch_bounds__(256) void eval_cb(
 
 int main(int argc, char** argv) {
     const float tailthr = argc > 1 ? atof(argv[1]) : 2.869166e-02f;
-    FILE* f = fopen("/home/kaden/sweep_G.bin", "rb");
+    const char* gpath = argc > 2 ? argv[2] : ".codeinsight+research/quant-design/fixtures/sweep_G.bin";
+    const char* fpath = argc > 3 ? argv[3] : ".codeinsight+research/quant-design/fixtures/sweep_fam.bin";
+    FILE* f = fopen(gpath, "rb");
+    if (!f) { printf("cannot open %s\n", gpath); return 1; }
     fseek(f, 0, SEEK_END); long bytes = ftell(f); fseek(f, 0, SEEK_SET);
     const int nblk = (int)(bytes / (256 * sizeof(float)));
     std::vector<float> hG((size_t)nblk * 256);
     if (fread(hG.data(), 1, bytes, f) != (size_t)bytes) { printf("short read\n"); return 1; }
     fclose(f);
     std::vector<float> hF(NPROF * NLEV);
-    f = fopen("/home/kaden/sweep_fam.bin", "rb");
+    f = fopen(fpath, "rb");
+    if (!f) { printf("cannot open %s\n", fpath); return 1; }
     if (fread(hF.data(), sizeof(float), NPROF*NLEV, f) != NPROF*NLEV) { printf("fam short\n"); return 1; }
     fclose(f);
 
@@ -290,12 +334,19 @@ int main(int argc, char** argv) {
     CK(hipMemcpy(dF,hF.data(),hF.size()*sizeof(float),hipMemcpyHostToDevice));
 
     printf("  %d blocks, tail threshold %.6e\n\n", nblk, tailthr);
-    printf("  %-40s %-6s %5s %7s   %-13s %-13s\n","codebook","norm","totB","bpw","overall MSE","tail-1% MSE");
+    printf("  %-40s %-6s %5s %7s   %-13s %-13s\n","format","norm","totB","bpw","overall MSE","tail-1% MSE");
     printf("  %s\n","---------------------------------------------------------------------------------------------------");
 
     struct Cfg { const char* name; int cb; int norm; int nsub; float p; int tot; int iters; int fp16; int hdr; };
     const Cfg cfgs[] = {
         {"v2        asym 2x128 fp16      136B", CB_AFFINE,NORM_MAX, 2,0.f,136,0,0,1},
+        {"symmetric fp16 scale-only 4x64   136B", CB_SYM, NORM_MAX,4,0.f,136,0,0,1},
+        {"FP8 E4M3 raw scale+zero 4x64    136B", CB_FP8_E4_RAW,NORM_MAX,4,0.f,136,0,0,0},
+        {"FP8 E5M2 raw scale+zero 4x64    136B", CB_FP8_E5_RAW,NORM_MAX,4,0.f,136,0,0,0},
+        {"E4M3 scale + i8 zero-point 4x64 136B", CB_FP8_E4_ZP, NORM_MAX,4,0.f,136,0,0,0},
+        {"E5M2 scale + i8 zero-point 4x64 136B", CB_FP8_E5_ZP, NORM_MAX,4,0.f,136,0,0,0},
+        {"Q4_K-rn   hier 4x64 4b          136B", CB_HIER, NORM_MAX,4,0.f,136,4,0,1},
+        {"Q4_K-rn   hier 4x64 8b          140B", CB_HIER, NORM_MAX,4,0.f,140,8,0,1},
         {"Q4_K-rn   hier 8x32 4b          140B", CB_HIER, NORM_MAX, 8,0.f,140,4,0,1},
         {"NEW-ceil  hier 8x32 4b          140B", CB_HIER2,NORM_MAX, 8,0.f,140,4,0,1},
         {"Q4_K-rn   hier 8x32 5b          142B", CB_HIER, NORM_MAX, 8,0.f,142,5,0,1},
