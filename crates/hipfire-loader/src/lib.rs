@@ -1951,9 +1951,11 @@ pub fn load_model_with_kv_backend(
                 gpu.arch.as_str(),
                 "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" | "gfx1200" | "gfx1201"
             );
+            let arch_is_gfx12 = matches!(gpu.arch.as_str(), "gfx1200" | "gfx1201");
             let supported = match lm_qt {
                 Some(3 | 6 | 13) => true,
                 Some(17) => arch_is_gfx11,
+                Some(44 | 47 | 48 | 49 | 50) => arch_is_gfx12,
                 _ => false,
             };
             if !supported {
@@ -1964,11 +1966,11 @@ pub fn load_model_with_kv_backend(
                 return Err(format!(
                     "DFlash draft requested but target lm_head {} is not \
                      supported by speculative.rs's batched GEMM paths on this arch \
-                     ({}). Supported: Q8_0 (qt=3), HFQ4G256 (qt=6), MQ4G256 (qt=13) \
-                     always; MQ3G256 (qt=17) on gfx11 only. Other dtypes \
-                     (MQ2 qt=18, MQ6/MQ8, HFQ3/HFQ2, HFQ4G128, HFQ6, F16, …) fall \
-                     through to a per-row GEMV that hangs verify. Reload without a \
-                     draft, or use an MQ4 / HFQ4 / Q8 target.",
+                     ({}). Supported: Q8_0 (qt=3), HFQ4G256 (qt=6), MQ4G256 \
+                     (qt=13) always; MQ3G256 (qt=17) on gfx11; MQ4/6/5/3/2G256V2 \
+                     (qt=44/47/48/49/50) on gfx12. Other dtypes fall through to \
+                     unsupported per-row verification. Reload without a draft or \
+                     use a supported target.",
                     qt_desc, gpu.arch
                 ));
             }
