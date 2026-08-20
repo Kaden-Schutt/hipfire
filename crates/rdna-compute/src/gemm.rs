@@ -9023,12 +9023,24 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        self.bind_thread()?;
-        self.ensure_kernel(
-            "gemm_qkv_hfq4g256_wmma",
-            kernels::GEMM_QKV_HFQ4G256_WMMA_SRC,
-            "gemm_qkv_hfq4g256_wmma",
-        )?;
+        let qkv_bt2_force = std::env::var("HIPFIRE_QKV_BT2_FORCE").as_deref() == Ok("1");
+        let qkv_bt2_disable = std::env::var("HIPFIRE_QKV_BT2_DISABLE").as_deref() == Ok("1");
+        let use_bt2 = !qkv_bt2_disable && (qkv_bt2_force
+            || (batch_size >= 32 && self.arch_caps.is_rdna3_dgpu() && !self.flags.bt2_disable));
+        let (kname, ksrc, n_tile) = if use_bt2 {
+            (
+                "gemm_qkv_hfq4g256_wmma_bt2",
+                kernels::GEMM_QKV_HFQ4G256_WMMA_BT2_SRC,
+                32,
+            )
+        } else {
+            (
+                "gemm_qkv_hfq4g256_wmma",
+                kernels::GEMM_QKV_HFQ4G256_WMMA_SRC,
+                16,
+            )
+        };
+        self.ensure_kernel(kname, ksrc, kname)?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
         let mut aq = a_q.buf.as_ptr();
@@ -9061,16 +9073,16 @@ impl Gpu {
 
         let total_m = q_m + k_m + v_m;
         let row_tiles = (total_m + 15) / 16;
-        let batch_tiles = (batch_size + 15) / 16;
+        let batch_tiles = (batch_size + n_tile - 1) / n_tile;
 
         let bytes = crate::profile::gemv_hfq4g256_bytes(q_m, k)
             + crate::profile::gemv_hfq4g256_bytes(k_m, k)
             + crate::profile::gemv_hfq4g256_bytes(v_m, k)
             + batch_size * k * 2
             + batch_size * total_m * 4 * 2;
-        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkv_hfq4g256_wmma", bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kname, bytes);
         let result = self.launch_maybe_blob(
-            "gemm_qkv_hfq4g256_wmma",
+            kname,
             [row_tiles as u32, batch_tiles as u32, 1],
             [32, 1, 1],
             0,
@@ -17654,33 +17666,44 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        const K_SPLITS: u32 = 4;
+        let ksplit_bt2_ks2 = std::env::var("HIPFIRE_KSPLIT_DET_BT2_KS2").as_deref() == Ok("1");
         let ksplit_bt2_force = std::env::var("HIPFIRE_KSPLIT_DET_BT2_FORCE").as_deref() == Ok("1");
         let use_bt2 = ksplit_bt2_force
             || (batch_size >= 32 && self.arch_caps.is_rdna3_dgpu() && !self.flags.bt2_disable);
-        let (kname, ksrc, n_tile) = if use_bt2 {
+        let (kname, ksrc, n_tile, k_splits, fin_name, fin_src) = if use_bt2 && ksplit_bt2_ks2 {
+            (
+                "gemm_hfq4g256_residual_wmma_ksplit_det_bt2_ks2",
+                kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_KSPLIT_DET_BT2_KS2_SRC,
+                32,
+                2u32,
+                "gemm_ksplit_det_finalize_ks2",
+                kernels::GEMM_KSPLIT_DET_FINALIZE_KS2_SRC,
+            )
+        } else if use_bt2 {
             (
                 "gemm_hfq4g256_residual_wmma_ksplit_det_bt2",
                 kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_KSPLIT_DET_BT2_SRC,
                 32,
+                4u32,
+                "gemm_ksplit_det_finalize",
+                kernels::GEMM_KSPLIT_DET_FINALIZE_SRC,
             )
         } else {
             (
                 "gemm_hfq4g256_residual_wmma_ksplit_det",
                 kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_KSPLIT_DET_SRC,
                 16,
+                4u32,
+                "gemm_ksplit_det_finalize",
+                kernels::GEMM_KSPLIT_DET_FINALIZE_SRC,
             )
         };
         self.ensure_kernel(kname, ksrc, kname)?;
-        self.ensure_kernel(
-            "gemm_ksplit_det_finalize",
-            kernels::GEMM_KSPLIT_DET_FINALIZE_SRC,
-            "gemm_ksplit_det_finalize",
-        )?;
+        self.ensure_kernel(fin_name, fin_src, fin_name)?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
-        // Partials scratch: [K_SPLITS][batch_size][M] fp32.
+        // Partials scratch: [k_splits][batch_size][M] fp32.
         let n_cells = batch_size * m;
-        let partials_ptr = self.ensure_ksplit_det_partials(K_SPLITS as usize * n_cells * 4)?;
+        let partials_ptr = self.ensure_ksplit_det_partials(k_splits as usize * n_cells * 4)?;
 
         // ── Phase 1: per-split partials (plain store, no atomic) ──
         let mut a_ptr = a_raw.buf.as_ptr();
@@ -17709,7 +17732,7 @@ impl Gpu {
         );
         self.launch_maybe_blob(
             kname,
-            [row_tiles, batch_tiles, K_SPLITS],
+            [row_tiles, batch_tiles, k_splits],
             [32, 1, 1],
             0,
             &mut params1,
@@ -17741,7 +17764,7 @@ impl Gpu {
         ];
         let fin_grid = ((n_cells + 255) / 256) as u32;
         let r = self.launch_maybe_blob(
-            "gemm_ksplit_det_finalize",
+            fin_name,
             [fin_grid, 1, 1],
             [256, 1, 1],
             0,

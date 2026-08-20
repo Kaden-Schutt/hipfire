@@ -2864,6 +2864,10 @@ pub const GEMM_HFQ4G256_RESIDUAL_WMMA_KSPLIT_DET_BT2_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_ksplit_det_bt2.hip");
 pub const GEMM_KSPLIT_DET_FINALIZE_SRC: &str =
     include_str!("../../../kernels/src/gemm_ksplit_det_finalize.hip");
+pub const GEMM_HFQ4G256_RESIDUAL_WMMA_KSPLIT_DET_BT2_KS2_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_ksplit_det_bt2_ks2.hip");
+pub const GEMM_KSPLIT_DET_FINALIZE_KS2_SRC: &str =
+    include_str!("../../../kernels/src/gemm_ksplit_det_finalize_ks2.hip");
 // gfx12 (RDNA4) sister of GEMM_HFQ4G256_RESIDUAL_WMMA_K2_SRC. Same recipe
 // as the qkv / qkvza / gate_up gfx12 ports (PR #56): `_w32_gfx12` builtin,
 // half8_t operands, K-split via tid>>4, contiguous C-row mapping. Closes
@@ -3126,6 +3130,8 @@ pub const GEMM_HFQ3G256_RESIDUAL_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq3g256_residual_wmma.gfx12.hip");
 pub const GEMM_QKV_HFQ4G256_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_qkv_hfq4g256_wmma.hip");
+pub const GEMM_QKV_HFQ4G256_WMMA_BT2_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkv_hfq4g256_wmma_bt2.hip");
 // gfx12 (RDNA4) sister of GEMM_QKV_HFQ4G256_WMMA_SRC. Uses
 // `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12` (vs the gfx11 `_w32`)
 // and half8_t operands (vs half16_t). C-output mapping
