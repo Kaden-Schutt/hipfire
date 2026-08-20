@@ -115,6 +115,10 @@ pub struct FeatureFlags {
     pub hfq3_mmq_layer_max: Option<usize>,
     pub hfq4_mmq_gfx906_y64: bool,
     pub gate_up_variant: Option<String>,
+    /// Kill switch for all batch-tiled B=2 WMMA variants (gate_up, qkvza,
+    /// ksplit_det). Set HIPFIRE_BT2_DISABLE=1 to force the plain 1-acc
+    /// kernel for A/B testing. Default OFF (bt2 active for batch_size >= 32).
+    pub bt2_disable: bool,
     pub gate_up_nosync: bool,
     /// gfx12 LDS-staged HFQ4-G256 residual/gate_up WMMA path. Reorders FP32
     /// K accumulation across 8 waves (not bit-exact). Default OFF; opt in with
@@ -452,6 +456,7 @@ impl FeatureFlags {
             hfq3_mmq_layer_max: parse_usize("HIPFIRE_HFQ3_MMQ_LAYER_MAX"),
             hfq4_mmq_gfx906_y64: value("HIPFIRE_HFQ4_MMQ_GFX906_Y64").map_or(false, |v| v == "1"),
             gate_up_variant: value("HIPFIRE_GATE_UP_VARIANT").ok(),
+            bt2_disable: value("HIPFIRE_BT2_DISABLE").as_deref() == Ok("1"),
             gate_up_nosync: value("HIPFIRE_GATE_UP_NOSYNC").as_deref() == Ok("1"),
             hfq4g256_ldsstage_wmma: value("HIPFIRE_HFQ4G256_LDSSTAGE").as_deref() == Ok("1"),
             qkvza_split_tail: parse_bool("HIPFIRE_QKVZA_SPLIT_TAIL").unwrap_or(false),
@@ -700,6 +705,7 @@ impl FeatureFlags {
             hfq3_mmq_layer_max: None,
             hfq4_mmq_gfx906_y64: false,
             gate_up_variant: None,
+            bt2_disable: false,
             gate_up_nosync: false,
             hfq4g256_ldsstage_wmma: false,
             qkvza_split_tail: false,

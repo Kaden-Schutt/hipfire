@@ -8149,7 +8149,9 @@ impl Gpu {
         // N-grid. +22% per-kernel on gate_up (same structure); qkvza is smaller
         // (13.8% of prefill) so end-to-end impact is proportionally less.
         // For decode (batch_size < 32), the plain 1-acc WMMA is better.
-        let use_bt2 = batch_size >= 32 && self.arch_caps.is_rdna3_dgpu();
+        let qkvza_bt2_force = std::env::var("HIPFIRE_QKVZA_BT2_FORCE").as_deref() == Ok("1");
+        let use_bt2 = qkvza_bt2_force
+            || (batch_size >= 32 && self.arch_caps.is_rdna3_dgpu() && !self.flags.bt2_disable);
         let (kname, ksrc, n_tile) = if use_bt2 {
             (
                 "gemm_qkvza_hfq4g256_wmma_bt2",
@@ -10227,7 +10229,7 @@ impl Gpu {
                     // For decode (batch_size < 32), the plain 1-acc WMMA is
                     // better — bt2 would waste VGPRs on a dormant 2nd chain.
                     // ldscoop was previously falsified here (303d69e9).
-                    if batch_size >= 32 {
+                    if batch_size >= 32 && !self.flags.bt2_disable {
                         (
                             "gemm_gate_up_hfq4g256_wmma_bt2",
                             kernels::GEMM_GATE_UP_HFQ4G256_WMMA_BT_SRC,
@@ -17653,9 +17655,9 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         const K_SPLITS: u32 = 4;
-        // Batch-tiled B=2 variant for prefill (batch_size >= 32) on RDNA3 dGPU.
-        // Same weight-reuse principle as gate_up/qkvza bt2.
-        let use_bt2 = batch_size >= 32 && self.arch_caps.is_rdna3_dgpu();
+        let ksplit_bt2_force = std::env::var("HIPFIRE_KSPLIT_DET_BT2_FORCE").as_deref() == Ok("1");
+        let use_bt2 = ksplit_bt2_force
+            || (batch_size >= 32 && self.arch_caps.is_rdna3_dgpu() && !self.flags.bt2_disable);
         let (kname, ksrc, n_tile) = if use_bt2 {
             (
                 "gemm_hfq4g256_residual_wmma_ksplit_det_bt2",
