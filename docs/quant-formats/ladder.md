@@ -69,32 +69,58 @@ A rung names which **tensor roles** are held above the base width. Roles are
 architecture-neutral; each arch maps its own tensors into them. This is what
 makes a label portable — today `mq2r` on DeepSeek-V4 means lm_head *at* Q8
 while `mq4r` on Qwen3.8 means lm_head *not* at Q8, because the suffix fused a
-rung with a route and the fusion inverts per architecture.
-
 | product | roles above base width | Qwen3.8-27B bpw | current label |
 |---|---|---:|---|
-| `mq<N>-xtx` | none — truly uniform | ~4.26 (projected) | none today |
 | `mq<N>-xt` | embeddings | 4.456 | `.mq4r` |
 | `mq<N>` | embeddings + lm_head | 4.657 | `.mq4` |
 | `mq<N> pro` | + recurrent/SSM state | 4.897 | `ctl2`, `head_ssm` |
 
-`xt` and `xtx` both point the **same** direction — faster, smaller, fewer
-guarantees — which is how AMD uses them. `xt` drops the lm_head to base width,
-which also makes its GEMV tape-eligible and so carries the retained-Redline
-route; that is exactly what `r` denotes today. `xtx` additionally drops the
-embedding table, leaving every weight matrix at base width. **`xtx` carries no
-quality floor**: it publishes measured KLD like every rung, but asserts no bound.
+**Three rungs per bit width. No more, no fourth.** Every rung carries a claim,
+which is why there is no "truly uniform, no guarantee" tier — a rung that
+promises nothing is not a product, and the base-width-everywhere point is what
+the codec bpw already describes.
 
-`pro` takes the precision direction. It deliberately does not reuse `xtx`, which
-would promise speed while delivering the opposite.
+`xt` denotes the **faster** variant, matching its GPU meaning: it drops the
+lm_head to base width, which also makes its GEMV tape-eligible and so carries
+the retained-Redline route. That is exactly what `r` denotes today. `pro` takes
+the precision direction; it deliberately does not use `xtx`, which would promise
+speed while delivering the opposite.
 
 The structural F16 tensors — norms, `A_log`, `dt_bias`, AWQ scale vectors — are
 never quantized at any rung. On Qwen3.8-27B they total 679,424 elements, about
 0.0025% of parameters, and are not a ladder axis.
 
+### Roles are per-architecture categories
+
+A dense model's roles are embeddings, lm_head, and recurrent/SSM state. A MoE's
+ladder is dominated by an **expert** role the dense model does not have — on
+Qwen3.6-35B-A3B the experts are 93% of parameters — so its three rungs order
+experts before embeddings. The rung names stay portable because they name a
+position on the ladder, not a tensor list.
+
+### The product grid
+
+| | `-xt` | base | ` pro` |
+|---|---|---|---|
+| `mq2` | ✓ | ✓ | ✓ |
+| `mq3` | ✓ | ✓ | ✓ |
+| `mq4` | ✓ | ✓ | ✓ |
+| `mq5` | ✓ | ✓ | ✓ |
+| `mq6` | ✓ | ✓ | ✓ |
+| `q8` | — | ✓ | — |
+
+Fifteen products plus the ceiling, and every cell has a defined meaning for any
+architecture. `q8` carries no rungs: lifting above Q8 means F16, which is a
+different product, and uniform Q8 already *is* `q8`.
+
+**Rungs lift into each other.** What a rung lifts *to* is drawn from the same
+published set, one or two classes up: `mq2 pro` lifts to MQ3/MQ4, `mq4 pro` to
+MQ6, `mq6 pro` to Q8. The ladder terminates at Q8 rather than at an unrelated
+format, so no codec sits outside the ladder and the § 1 budget governs each step.
+
 ### Why there is no rung above `pro`
 
-A product that lifts attention costs 5.162 bpw on this model, so it is an
+A product that lifts attention costs 5.162 bpw on the dense 27B, so it is an
 `mq5`-class product. There is no `XL`/`XXL`.
 
 The counter-argument is real and worth recording: an explicit oversize suffix
