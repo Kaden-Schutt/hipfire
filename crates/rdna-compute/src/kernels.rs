@@ -3067,6 +3067,11 @@ pub const GEMM_GATE_UP_HFQ4G256_WMMA_LDSCOOP_NOSYNC_SRC: &str =
 // Opt-in via HIPFIRE_GATE_UP_VARIANT=2tile.
 pub const GEMM_GATE_UP_HFQ4G256_WMMA_2TILE_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma_2tile.hip");
+// Batch-tiled variant: B independent acc chains reuse weights across B
+// batch tiles per block. Grid halves in N-dim. Opt-in via
+// HIPFIRE_GATE_UP_VARIANT=bt2 or bt4.
+pub const GEMM_GATE_UP_HFQ4G256_WMMA_BT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma_bt.hip");
 // gfx12 (RDNA4) sister of GEMM_GATE_UP_HFQ4G256_WMMA_SRC. Same recipe as
 // the QKV gfx12 scaffold (validated on R9700): _w32_gfx12 builtin,
 // half8_t operands, K-split via tid>>4, contiguous C-row mapping.

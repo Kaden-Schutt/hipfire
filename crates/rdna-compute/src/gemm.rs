@@ -10134,12 +10134,13 @@ impl Gpu {
         let variant_override = self.flags.gate_up_variant.clone();
         // (kernel_name, kernel_src, m_tile, block_threads). m_tile is the
         // per-block row count; block_threads is the wave/block size.
-        let (kernel_name, kernel_src, m_tile, block_threads) = match variant_override.as_deref() {
+        let (kernel_name, kernel_src, m_tile, block_threads, n_tile) = match variant_override.as_deref() {
             Some("ldsx") => (
                 "gemm_gate_up_hfq4g256_wmma_ldsx",
                 kernels::GEMM_GATE_UP_HFQ4G256_WMMA_LDSX_SRC,
                 16,
                 32,
+                16,
             ),
             // k4 = 4-tile pipeline (more in-flight B loads for better BW
             // utilization). Opt-in default-off; bench-measured 2026-05-21.
@@ -10148,6 +10149,7 @@ impl Gpu {
                 kernels::GEMM_GATE_UP_HFQ4G256_WMMA_K4_SRC,
                 16,
                 32,
+                16,
             ),
             // ldscoop = cooperative LDS weight staging for coalesced DRAM
             // loads. All 32 threads load one row's weights at a time
@@ -10158,6 +10160,7 @@ impl Gpu {
                 kernels::GEMM_GATE_UP_HFQ4G256_WMMA_LDSCOOP_SRC,
                 16,
                 32,
+                16,
             ),
             // 2tile = 32 rows × 16 cols per block, 2 wave32 waves.
             // Halves grid in M; both waves share the same X tile so
@@ -10165,6 +10168,23 @@ impl Gpu {
             Some("2tile") => (
                 "gemm_gate_up_hfq4g256_wmma_2tile",
                 kernels::GEMM_GATE_UP_HFQ4G256_WMMA_2TILE_SRC,
+                32,
+                64,
+                16,
+            ),
+            // bt2/bt4 = batch-tiled: B independent acc chains reuse weights
+            // across B batch tiles per block. Halves/quarters grid in N.
+            Some("bt2") => (
+                "gemm_gate_up_hfq4g256_wmma_bt2",
+                kernels::GEMM_GATE_UP_HFQ4G256_WMMA_BT_SRC,
+                16,
+                32,
+                32,
+            ),
+            Some("bt4") => (
+                "gemm_gate_up_hfq4g256_wmma_bt4",
+                kernels::GEMM_GATE_UP_HFQ4G256_WMMA_BT_SRC,
+                16,
                 32,
                 64,
             ),
@@ -10181,32 +10201,41 @@ impl Gpu {
                         kernels::GEMM_GATE_UP_HFQ4G256_WMMA_LDSCOOP_NOSYNC_SRC,
                         16,
                         32,
+                        16,
                     )
                 } else if self.arch_caps.is_rdna3_dgpu() {
-                    // gfx1100/1101/1102 (RDNA3 dGPU): ldscoop's LDS weight-staging
-                    // overhead exceeds its coalescing gain here. Falsified in
-                    // 303d69e9 ("ldscoop variant FALSIFIED — LDS overhead exceeds
-                    // coalescing gains") and re-confirmed by rocprofv3 2026-06-12:
-                    // on the 27B DFlash batched-verify gate_up the ldscoop variant
-                    // ran 0.343 ms/launch vs the plain WMMA 0.232 (+48%), the bulk
-                    // of a ~14% DFlash decode regression vs the ca30ca21 baseline.
-                    // e3232034 ("ldscoop on others") tuned the default for gfx1151
-                    // (nosync) but dumped RDNA3 dGPUs into the falsified ldscoop.
-                    // Restore the plain WMMA variant that ca30ca21 (dense-DFlash
-                    // perfmaxx) shipped. RDNA4 (else arm) is left on ldscoop pending
-                    // its own measurement on hiptrx/gfx1201.
-                    (
-                        "gemm_gate_up_hfq4g256_wmma",
-                        kernels::GEMM_GATE_UP_HFQ4G256_WMMA_SRC,
-                        16,
-                        32,
-                    )
+                    // gfx1100/1101/1102 (RDNA3 dGPU): batch-tiled B=2 variant
+                    // for prefill (batch_size >= 32): 2 independent acc chains
+                    // reuse weights across 2 N-tiles, halving the N-grid and
+                    // +22% per-kernel / +5.6% end-to-end prefill (2026-08-20,
+                    // 2 fresh-process A/B runs, qwen3.5-4b mq4 q8 KV).
+                    // For decode (batch_size < 32), the plain 1-acc WMMA is
+                    // better — bt2 would waste VGPRs on a dormant 2nd chain.
+                    // ldscoop was previously falsified here (303d69e9).
+                    if batch_size >= 32 {
+                        (
+                            "gemm_gate_up_hfq4g256_wmma_bt2",
+                            kernels::GEMM_GATE_UP_HFQ4G256_WMMA_BT_SRC,
+                            16,
+                            32,
+                            32,
+                        )
+                    } else {
+                        (
+                            "gemm_gate_up_hfq4g256_wmma",
+                            kernels::GEMM_GATE_UP_HFQ4G256_WMMA_SRC,
+                            16,
+                            32,
+                            16,
+                        )
+                    }
                 } else {
                     (
                         "gemm_gate_up_hfq4g256_wmma_ldscoop",
                         kernels::GEMM_GATE_UP_HFQ4G256_WMMA_LDSCOOP_SRC,
                         16,
                         32,
+                        16,
                     )
                 };
                 def
@@ -10239,7 +10268,7 @@ impl Gpu {
 
         let total_m = gate_m + up_m;
         let row_tiles = (total_m + m_tile - 1) / m_tile;
-        let batch_tiles = (batch_size + 15) / 16;
+        let batch_tiles = (batch_size + n_tile - 1) / n_tile;
 
         let bytes = crate::profile::gemv_hfq4g256_bytes(gate_m, k)
             + crate::profile::gemv_hfq4g256_bytes(up_m, k)

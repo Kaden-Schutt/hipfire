@@ -1737,7 +1737,7 @@ pub static FIELDS: &[ConfigField] = &[
         "diagnostic.kernel.gate_up_variant",
         "gate_up_variant",
         DefaultValue::Null,
-        ValueRule::NullableEnum(&["ldsx", "k4", "ldscoop", "2tile"]),
+        ValueRule::NullableEnum(&["ldsx", "k4", "ldscoop", "2tile", "bt2", "bt4"]),
         "HIPFIRE_GATE_UP_VARIANT",
         "Select a gate/up WMMA experiment variant."
     ),
