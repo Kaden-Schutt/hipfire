@@ -260,36 +260,49 @@ __global__ __launch_bounds__(256) void eval_candidate(
             // MODE_LLOYD: percentile init, 8 Lloyd iters; keep final assignment
             // indices; RNE fp16 centroid store; no reassignment after rounding
             // (production unconstrained mq2lloyd).
-            // MODE_LLOYD_ANCHORED: endpoints fixed to block min/max; Lloyd
-            // updates only interior codepoints; RNE-round all levels then
-            // final nearest assignment so encoder matches GPU decode.
+            // MODE_LLOYD_ANCHORED: production-faithful endpoint-anchored MQ2
+            // Lloyd. Sort the sub-block; pin endpoints to sorted min/max
+            // (rank 0 / sub_size-1); init interior k at percentile rank
+            // rintf(((k+0.5)/nlev)*(sub_size-1)) — for nlev=4 that is
+            // 37.5%/62.5%. Eight Lloyd iters with fixed endpoints; RNE-round
+            // all levels then final nearest assignment so encoder matches
+            // GPU decode.
             // `nsub=2` composes the Lloyd fit with V2's two G128 containers.
             const int anchored = (mode == MODE_LLOYD_ANCHORED);
             if (anchored) {
-                sh_red[tid] = w;
+                sh_sort[tid] = w;
                 __syncthreads();
-                for (int stride = sub_size >> 1; stride > 0; stride >>= 1) {
-                    if (lane < stride)
-                        sh_red[tid] = fminf(sh_red[tid], sh_red[tid + stride]);
-                    __syncthreads();
+                for (int width = 2; width <= sub_size; width <<= 1) {
+                    for (int stride = width >> 1; stride > 0; stride >>= 1) {
+                        const int peer_lane = lane ^ stride;
+                        const int peer = sub * sub_size + peer_lane;
+                        if (peer_lane > lane) {
+                            const bool ascending = (lane & width) == 0;
+                            const float a = sh_sort[tid];
+                            const float b = sh_sort[peer];
+                            if ((ascending && a > b) || (!ascending && a < b)) {
+                                sh_sort[tid] = b;
+                                sh_sort[peer] = a;
+                            }
+                        }
+                        __syncthreads();
+                    }
                 }
-                const float lo = sh_red[sub * sub_size];
-                sh_red[tid] = w;
-                __syncthreads();
-                for (int stride = sub_size >> 1; stride > 0; stride >>= 1) {
-                    if (lane < stride)
-                        sh_red[tid] = fmaxf(sh_red[tid], sh_red[tid + stride]);
-                    __syncthreads();
-                }
-                const float hi = sh_red[sub * sub_size];
+                const float lo = sh_sort[sub * sub_size];
+                const float hi = sh_sort[sub * sub_size + (sub_size - 1)];
                 if (lane < nlev) {
                     if (lane == 0)
                         sh_cb[sub][lane] = lo;
                     else if (lane == nlev - 1)
                         sh_cb[sub][lane] = hi;
                     else {
-                        const float t = (float)lane / (float)(nlev - 1);
-                        sh_cb[sub][lane] = lo + t * (hi - lo);
+                        // Interior percentiles match production mq2lloyd
+                        // anchored init (nlev=4 → ranks at 37.5% / 62.5%).
+                        const float fraction =
+                            ((float)lane + 0.5f) / (float)nlev;
+                        const int rank = sub * sub_size +
+                            (int)rintf(fraction * (float)(sub_size - 1));
+                        sh_cb[sub][lane] = sh_sort[rank];
                     }
                 }
                 __syncthreads();

@@ -1422,7 +1422,11 @@ pub(crate) fn quantize_mq2g256_lloyd_anchored(
             let mut bits = [0u16; 4];
             let mut cb_rounded = [0.0f32; 4];
             for k in 0..4 {
-                bits[k] = if cb[k] == 0.0 { 0 } else { f32_to_fp16_bits(cb[k]) };
+                bits[k] = if cb[k] == 0.0 {
+                    0
+                } else {
+                    f32_to_fp16_bits(cb[k])
+                };
                 cb_rounded[k] = f16_to_f32(bits[k]);
             }
             // Final nearest-codepoint assignment against the fp16-rounded book.
@@ -2904,8 +2908,16 @@ mod mq2_lloyd_anchored_tests {
         let c0 = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
         let c3 = f16_to_f32(u16::from_le_bytes([blk[6], blk[7]]));
         // Endpoints must equal fp16-rounded block extremes.
-        assert_eq!(c0.to_bits(), min_fp16.to_bits(), "c0 should be fp16(min) {min_fp16} vs {c0}");
-        assert_eq!(c3.to_bits(), max_fp16.to_bits(), "c3 should be fp16(max) {max_fp16} vs {c3}");
+        assert_eq!(
+            c0.to_bits(),
+            min_fp16.to_bits(),
+            "c0 should be fp16(min) {min_fp16} vs {c0}"
+        );
+        assert_eq!(
+            c3.to_bits(),
+            max_fp16.to_bits(),
+            "c3 should be fp16(max) {max_fp16} vs {c3}"
+        );
         // Also verify interior codepoints are between endpoints.
         let c1 = f16_to_f32(u16::from_le_bytes([blk[2], blk[3]]));
         let c2 = f16_to_f32(u16::from_le_bytes([blk[4], blk[5]]));
@@ -2944,7 +2956,10 @@ mod mq2_lloyd_anchored_tests {
                     best = k;
                 }
             }
-            assert_eq!(idx, best, "i={i} val={val} cb={cb:?} idx {idx} != best {best}");
+            assert_eq!(
+                idx, best,
+                "i={i} val={val} cb={cb:?} idx {idx} != best {best}"
+            );
         }
     }
 
@@ -3005,7 +3020,10 @@ mod mq2_lloyd_anchored_tests {
         // Not guaranteed for all distributions, but for this ramp it should differ in at least header.
         let header_plain = &plain[0..8];
         let header_anch = &anchored[0..8];
-        assert_ne!(header_plain, header_anch, "anchored header should differ from unconstrained for ramp");
+        assert_ne!(
+            header_plain, header_anch,
+            "anchored header should differ from unconstrained for ramp"
+        );
         // Both use QuantType::MQ2G256Lloyd identity
         assert_eq!(QuantType::MQ2G256Lloyd as u8, 19);
         assert_eq!(QuantType::from_u8(19), Some(QuantType::MQ2G256Lloyd));
@@ -3015,7 +3033,9 @@ mod mq2_lloyd_anchored_tests {
     fn anchored_index_range_and_no_affine_alias() {
         let s1 = gen_fwht_signs(42, 256);
         let s2 = gen_fwht_signs(1042, 256);
-        let w: Vec<f32> = (0..512).map(|i| ((i * 17) % 255) as f32 * 0.01 - 1.0).collect();
+        let w: Vec<f32> = (0..512)
+            .map(|i| ((i * 17) % 255) as f32 * 0.01 - 1.0)
+            .collect();
         let out = quantize_mq2g256_lloyd_anchored(&w, &s1, &s2);
         for blk in out.chunks_exact(72) {
             for &b in &blk[8..] {
@@ -3024,15 +3044,21 @@ mod mq2_lloyd_anchored_tests {
                 }
             }
         }
-        // Verify the affine MQ2V2 format string does not alias anchored.
-        assert_ne!(GgufFormat::from_flag("mq2lloyd-anchored"), GgufFormat::from_flag("mq2v2"));
-        assert_ne!(GgufFormat::from_flag("mq2lloyd_anchored"), GgufFormat::from_flag("mq2v2"));
-        // Affordance: if pipeline_gguf adds the variant, anchored maps distinctly.
-        // If not yet added, from_flag returns None, not mq2v2 — still passes.
-        let af = GgufFormat::from_flag("mq2lloyd-anchored");
-        if let Some(fmt) = af {
-            assert_ne!(fmt, GgufFormat::Mq2V2);
-        }
+        // Canonical hyphen and underscore aliases resolve to Mq2LloydAnchored,
+        // remaining distinct from the affine MQ2V2 path.
+        assert_eq!(
+            GgufFormat::from_flag("mq2lloyd-anchored"),
+            Some(GgufFormat::Mq2LloydAnchored)
+        );
+        assert_eq!(
+            GgufFormat::from_flag("mq2lloyd_anchored"),
+            Some(GgufFormat::Mq2LloydAnchored)
+        );
+        assert_ne!(
+            GgufFormat::from_flag("mq2lloyd-anchored"),
+            GgufFormat::from_flag("mq2v2")
+        );
+        assert_ne!(GgufFormat::Mq2LloydAnchored, GgufFormat::Mq2V2);
     }
 }
 
