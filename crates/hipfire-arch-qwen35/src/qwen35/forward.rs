@@ -4306,6 +4306,13 @@ fn qwen35_fa_epilogue_enabled(gpu: &Gpu, config: &Qwen35Config, wo: &WeightTenso
         || gfx1151_radiowave_fusions_enabled(gpu))
         && config.n_heads == 16
         && config.n_kv_heads == 2)
+        // Qwen3.5-4B (gfx1100): 16Q/4K. The reduce kernel is per-Q-head
+        // (grid = n_heads) and the tile pass is shared with the non-gated
+        // flash path 4B already runs, so 4 K heads need no kernel change.
+        // Certified 2026-08-21: greedy text parity + 3 fresh-process E2E pairs.
+        || (gpu.arch_caps.is_gfx1100()
+            && config.n_heads == 16
+            && config.n_kv_heads == 4)
         || (gpu.arch_caps.is_gfx1100()
             && super::config::qwen36_27b_dense_shape(config, config.linear_num_value_heads)
             && config.n_heads == 24
