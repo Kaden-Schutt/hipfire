@@ -4238,6 +4238,11 @@ fn gated_norm_mq_rotate_enabled(
         || gfx1151_radiowave_fusions_enabled(gpu))
         && config.dim == 2_048
         && n_v_heads == 32)
+        // Qwen3.5-4B (gfx1100): same DeltaNet head geometry (32 v-heads x
+        // 128), dim 2560. The kernel is grid-agnostic in n_heads (2 heads per
+        // 64-thread block); the dim term only scopes certification.
+        // Certified 2026-08-21: greedy text parity + 3 fresh-process E2E pairs.
+        || (gpu.arch_caps.is_gfx1100() && config.dim == 2_560 && n_v_heads == 32)
         || (gpu.arch_caps.is_gfx1100() && super::config::qwen36_27b_dense_shape(config, n_v_heads));
     enabled
         && admitted_arch_shape
