@@ -745,6 +745,9 @@ fn main() {
         .expect("gen forward failed");
         let logits = gpu.download_f32(&scratch.logits).unwrap();
         let t_ms = t.elapsed().as_secs_f64() * 1000.0;
+        if std::env::var("HIPFIRE_SLOW_TOKEN_LOG").ok().as_deref() == Some("1") && t_ms > 50.0 {
+            eprintln!("  [slow-token] step={step} pos={pos} t_ms={t_ms:.1}");
+        }
         per_token_ms.push(t_ms);
         next_token = llama::argmax(&logits);
     }

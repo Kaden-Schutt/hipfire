@@ -8212,8 +8212,7 @@ impl Gpu {
             + crate::profile::gemv_hfq4g256_bytes(alpha_m, k)
             + batch_size * k * 2
             + batch_size * total_m * 4 * 2;
-        let timer =
-            crate::profile::begin_timer(&self.hip, "gemm", kname, bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kname, bytes);
         let result = self.launch_maybe_blob(
             kname,
             [row_tiles as u32, batch_tiles as u32, 1],
@@ -9025,8 +9024,9 @@ impl Gpu {
     ) -> HipResult<()> {
         let qkv_bt2_force = std::env::var("HIPFIRE_QKV_BT2_FORCE").as_deref() == Ok("1");
         let qkv_bt2_disable = std::env::var("HIPFIRE_QKV_BT2_DISABLE").as_deref() == Ok("1");
-        let use_bt2 = !qkv_bt2_disable && (qkv_bt2_force
-            || (batch_size >= 32 && self.arch_caps.is_rdna3_dgpu() && !self.flags.bt2_disable));
+        let use_bt2 = !qkv_bt2_disable
+            && (qkv_bt2_force
+                || (batch_size >= 32 && self.arch_caps.is_rdna3_dgpu() && !self.flags.bt2_disable));
         let (kname, ksrc, n_tile) = if use_bt2 {
             (
                 "gemm_qkv_hfq4g256_wmma_bt2",
@@ -10163,113 +10163,114 @@ impl Gpu {
         let variant_override = self.flags.gate_up_variant.clone();
         // (kernel_name, kernel_src, m_tile, block_threads). m_tile is the
         // per-block row count; block_threads is the wave/block size.
-        let (kernel_name, kernel_src, m_tile, block_threads, n_tile) = match variant_override.as_deref() {
-            Some("ldsx") => (
-                "gemm_gate_up_hfq4g256_wmma_ldsx",
-                kernels::GEMM_GATE_UP_HFQ4G256_WMMA_LDSX_SRC,
-                16,
-                32,
-                16,
-            ),
-            // k4 = 4-tile pipeline (more in-flight B loads for better BW
-            // utilization). Opt-in default-off; bench-measured 2026-05-21.
-            Some("k4") => (
-                "gemm_gate_up_hfq4g256_wmma_k4",
-                kernels::GEMM_GATE_UP_HFQ4G256_WMMA_K4_SRC,
-                16,
-                32,
-                16,
-            ),
-            // ldscoop = cooperative LDS weight staging for coalesced DRAM
-            // loads. All 32 threads load one row's weights at a time
-            // (128-byte coalesced cache lines), staged in LDS for the
-            // WMMA loop. Targets the 32% peak BW seen in base kernel.
-            Some("ldscoop") => (
-                "gemm_gate_up_hfq4g256_wmma_ldscoop",
-                kernels::GEMM_GATE_UP_HFQ4G256_WMMA_LDSCOOP_SRC,
-                16,
-                32,
-                16,
-            ),
-            // 2tile = 32 rows × 16 cols per block, 2 wave32 waves.
-            // Halves grid in M; both waves share the same X tile so
-            // L0/L1 cache absorbs the second wave's loads cheaply.
-            Some("2tile") => (
-                "gemm_gate_up_hfq4g256_wmma_2tile",
-                kernels::GEMM_GATE_UP_HFQ4G256_WMMA_2TILE_SRC,
-                32,
-                64,
-                16,
-            ),
-            // bt2/bt4 = batch-tiled: B independent acc chains reuse weights
-            // across B batch tiles per block. Halves/quarters grid in N.
-            Some("bt2") => (
-                "gemm_gate_up_hfq4g256_wmma_bt2",
-                kernels::GEMM_GATE_UP_HFQ4G256_WMMA_BT_SRC,
-                16,
-                32,
-                32,
-            ),
-            Some("bt4") => (
-                "gemm_gate_up_hfq4g256_wmma_bt4",
-                kernels::GEMM_GATE_UP_HFQ4G256_WMMA_BT_SRC,
-                16,
-                32,
-                64,
-            ),
-            _ => {
-                let def = if self.arch_caps.is_rdna3p5() {
-                    // RDNA3.5 iGPU (gfx1150/1151/1152): narrow-BW LPDDR5; the
-                    // ldscoop_nosync variant wins here. gfx1152 previously fell
-                    // through to the RDNA4 `else` ldscoop arm because the old
-                    // string-prefix test ("gfx1151"/"gfx1150" starts_with) did
-                    // not match "gfx1152" — that was a misroute, now fixed by
-                    // gating on the is_rdna3p5 capability molecule.
-                    (
-                        "gemm_gate_up_hfq4g256_wmma_ldscoop_nosync",
-                        kernels::GEMM_GATE_UP_HFQ4G256_WMMA_LDSCOOP_NOSYNC_SRC,
-                        16,
-                        32,
-                        16,
-                    )
-                } else if self.arch_caps.is_rdna3_dgpu() {
-                    // gfx1100/1101/1102 (RDNA3 dGPU): batch-tiled B=2 variant
-                    // for prefill (batch_size >= 32): 2 independent acc chains
-                    // reuse weights across 2 N-tiles, halving the N-grid and
-                    // +22% per-kernel / +5.6% end-to-end prefill (2026-08-20,
-                    // 2 fresh-process A/B runs, qwen3.5-4b mq4 q8 KV).
-                    // For decode (batch_size < 32), the plain 1-acc WMMA is
-                    // better — bt2 would waste VGPRs on a dormant 2nd chain.
-                    // ldscoop was previously falsified here (303d69e9).
-                    if batch_size >= 32 && !self.flags.bt2_disable {
+        let (kernel_name, kernel_src, m_tile, block_threads, n_tile) =
+            match variant_override.as_deref() {
+                Some("ldsx") => (
+                    "gemm_gate_up_hfq4g256_wmma_ldsx",
+                    kernels::GEMM_GATE_UP_HFQ4G256_WMMA_LDSX_SRC,
+                    16,
+                    32,
+                    16,
+                ),
+                // k4 = 4-tile pipeline (more in-flight B loads for better BW
+                // utilization). Opt-in default-off; bench-measured 2026-05-21.
+                Some("k4") => (
+                    "gemm_gate_up_hfq4g256_wmma_k4",
+                    kernels::GEMM_GATE_UP_HFQ4G256_WMMA_K4_SRC,
+                    16,
+                    32,
+                    16,
+                ),
+                // ldscoop = cooperative LDS weight staging for coalesced DRAM
+                // loads. All 32 threads load one row's weights at a time
+                // (128-byte coalesced cache lines), staged in LDS for the
+                // WMMA loop. Targets the 32% peak BW seen in base kernel.
+                Some("ldscoop") => (
+                    "gemm_gate_up_hfq4g256_wmma_ldscoop",
+                    kernels::GEMM_GATE_UP_HFQ4G256_WMMA_LDSCOOP_SRC,
+                    16,
+                    32,
+                    16,
+                ),
+                // 2tile = 32 rows × 16 cols per block, 2 wave32 waves.
+                // Halves grid in M; both waves share the same X tile so
+                // L0/L1 cache absorbs the second wave's loads cheaply.
+                Some("2tile") => (
+                    "gemm_gate_up_hfq4g256_wmma_2tile",
+                    kernels::GEMM_GATE_UP_HFQ4G256_WMMA_2TILE_SRC,
+                    32,
+                    64,
+                    16,
+                ),
+                // bt2/bt4 = batch-tiled: B independent acc chains reuse weights
+                // across B batch tiles per block. Halves/quarters grid in N.
+                Some("bt2") => (
+                    "gemm_gate_up_hfq4g256_wmma_bt2",
+                    kernels::GEMM_GATE_UP_HFQ4G256_WMMA_BT_SRC,
+                    16,
+                    32,
+                    32,
+                ),
+                Some("bt4") => (
+                    "gemm_gate_up_hfq4g256_wmma_bt4",
+                    kernels::GEMM_GATE_UP_HFQ4G256_WMMA_BT_SRC,
+                    16,
+                    32,
+                    64,
+                ),
+                _ => {
+                    let def = if self.arch_caps.is_rdna3p5() {
+                        // RDNA3.5 iGPU (gfx1150/1151/1152): narrow-BW LPDDR5; the
+                        // ldscoop_nosync variant wins here. gfx1152 previously fell
+                        // through to the RDNA4 `else` ldscoop arm because the old
+                        // string-prefix test ("gfx1151"/"gfx1150" starts_with) did
+                        // not match "gfx1152" — that was a misroute, now fixed by
+                        // gating on the is_rdna3p5 capability molecule.
                         (
-                            "gemm_gate_up_hfq4g256_wmma_bt2",
-                            kernels::GEMM_GATE_UP_HFQ4G256_WMMA_BT_SRC,
+                            "gemm_gate_up_hfq4g256_wmma_ldscoop_nosync",
+                            kernels::GEMM_GATE_UP_HFQ4G256_WMMA_LDSCOOP_NOSYNC_SRC,
                             16,
                             32,
-                            32,
+                            16,
                         )
+                    } else if self.arch_caps.is_rdna3_dgpu() {
+                        // gfx1100/1101/1102 (RDNA3 dGPU): batch-tiled B=2 variant
+                        // for prefill (batch_size >= 32): 2 independent acc chains
+                        // reuse weights across 2 N-tiles, halving the N-grid and
+                        // +22% per-kernel / +5.6% end-to-end prefill (2026-08-20,
+                        // 2 fresh-process A/B runs, qwen3.5-4b mq4 q8 KV).
+                        // For decode (batch_size < 32), the plain 1-acc WMMA is
+                        // better — bt2 would waste VGPRs on a dormant 2nd chain.
+                        // ldscoop was previously falsified here (303d69e9).
+                        if batch_size >= 32 && !self.flags.bt2_disable {
+                            (
+                                "gemm_gate_up_hfq4g256_wmma_bt2",
+                                kernels::GEMM_GATE_UP_HFQ4G256_WMMA_BT_SRC,
+                                16,
+                                32,
+                                32,
+                            )
+                        } else {
+                            (
+                                "gemm_gate_up_hfq4g256_wmma",
+                                kernels::GEMM_GATE_UP_HFQ4G256_WMMA_SRC,
+                                16,
+                                32,
+                                16,
+                            )
+                        }
                     } else {
                         (
-                            "gemm_gate_up_hfq4g256_wmma",
-                            kernels::GEMM_GATE_UP_HFQ4G256_WMMA_SRC,
+                            "gemm_gate_up_hfq4g256_wmma_ldscoop",
+                            kernels::GEMM_GATE_UP_HFQ4G256_WMMA_LDSCOOP_SRC,
                             16,
                             32,
                             16,
                         )
-                    }
-                } else {
-                    (
-                        "gemm_gate_up_hfq4g256_wmma_ldscoop",
-                        kernels::GEMM_GATE_UP_HFQ4G256_WMMA_LDSCOOP_SRC,
-                        16,
-                        32,
-                        16,
-                    )
-                };
-                def
-            }
-        };
+                    };
+                    def
+                }
+            };
         self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
@@ -17724,12 +17725,7 @@ impl Gpu {
         let batch_tiles = ((batch_size + n_tile - 1) / n_tile) as u32;
         let bytes =
             crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * k * 2 + batch_size * m * 4 * 2;
-        let timer = crate::profile::begin_timer(
-            &self.hip,
-            "gemm",
-            kname,
-            bytes,
-        );
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kname, bytes);
         self.launch_maybe_blob(
             kname,
             [row_tiles, batch_tiles, k_splits],

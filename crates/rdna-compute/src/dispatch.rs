@@ -991,6 +991,7 @@ impl Gpu {
                 mq_x_q8: None,
                 mq_x_scales: None,
                 mq_rmsnorm_wavegrid_scratch: None,
+                mq_rmsnorm_awq_wavegrid_scratch: None,
                 gemv_residual_tmp: None,
                 paro_x_scratch: None,
                 paro_fused_scratch: None,
@@ -2477,6 +2478,7 @@ impl Gpu {
     // ── Tensor allocation ───────────────────────────────────────
 
     pub fn ensure_gemv_residual_tmp(&mut self, min_elems: usize) -> HipResult<&GpuTensor> {
+        self.bind_thread()?;
         self.scratch
             .ensure_gemv_residual_tmp(&self.hip, self.device_id, min_elems)
     }
@@ -2587,6 +2589,7 @@ impl Gpu {
     }
 
     pub fn vmm_mapped_bytes(&self, tensor: &GpuTensor) -> Option<usize> {
+        // bind_thread: skip — pure arena-table query, touches no device state.
         self.vmm_arenas
             .get(&(tensor.buf.as_ptr() as usize))
             .map(VmmArena::mapped_bytes)
@@ -2594,6 +2597,7 @@ impl Gpu {
 
     /// Return the physical allocation granularity for a registered VMM tensor.
     pub fn vmm_granularity(&self, tensor: &GpuTensor) -> Option<usize> {
+        // bind_thread: skip — pure arena-table query, touches no device state.
         self.vmm_arenas
             .get(&(tensor.buf.as_ptr() as usize))
             .map(VmmArena::granularity)
@@ -2603,12 +2607,14 @@ impl Gpu {
     /// reserving an address range. Model-owned VMM planners use this for a
     /// dry-run admission check before mapping any cache pages.
     pub fn vmm_recommended_granularity(&self) -> HipResult<usize> {
+        // bind_thread: skip — pure constant lookup, touches no device state.
         let prop = HipMemAllocationProp::device_pinned(self.device_id);
         self.hip
             .mem_get_allocation_granularity(&prop, HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED)
     }
 
     pub fn vmm_allocation_count(&self) -> usize {
+        // bind_thread: skip — pure arena-table count, touches no device state.
         self.vmm_arenas.len() + self.orphan_vmm_arenas.len()
     }
 
@@ -2624,6 +2630,7 @@ impl Gpu {
     /// Success means `vmm_allocation_count() == 0`. Any remaining registration
     /// is an error so unload/load cannot claim a clean handoff.
     pub fn ensure_vmm_cleaned(&mut self) -> HipResult<()> {
+        self.bind_thread()?;
         let live = self.vmm_arenas.len();
         if live != 0 {
             return Err(HipError::new(
@@ -2889,9 +2896,9 @@ impl Gpu {
     /// between layers in batched prefill when the same activation buffer
     /// (e.g. `pb_tmp`) is reused with different contents each layer —
     /// the cache sees the same GPU pointer and skips the F32→F16
-    /// conversion, silently serving stale F16 data from the previous
     /// layer.
     pub fn invalidate_fp16_cache(&mut self) {
+        // bind_thread: skip — pure host-side pointer reset, no device calls.
         self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
     }
 
@@ -3035,6 +3042,7 @@ impl Gpu {
     /// bucket grows. The allocation change is intentional and recoverable, so
     /// retained replay is re-armed rather than placed in sticky fallback.
     pub fn invalidate_for_layout_growth(&mut self) {
+        // bind_thread: skip — pure host-side graph/replay bookkeeping reset.
         self.invalidate_graph_state();
         self.replay.rearm_after_layout_growth();
     }

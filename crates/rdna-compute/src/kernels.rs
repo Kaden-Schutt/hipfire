@@ -1090,6 +1090,12 @@ pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_SRC: &str =
 pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_DIRECT_GFX1100_SRC: &str =
     // K=5120 direct float4 path: certified default for Qwen3.6-27B on gfx1100.
     include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate_awq_direct.gfx1100.hip");
+pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_WAVEGRID_GFX1100_SRC: &str =
+    // K/256 workgroups × wave32: spread the FWHT groups across CUs so the
+    // reduction and rotation overlap VRAM latency instead of serializing on
+    // one workgroup. Reduction order differs from the LDS tree; ship gate is
+    // exact greedy-token parity over a long replay.
+    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate_awq_wavegrid.gfx1100.hip");
 
 pub const RMSNORM_REDUCE_GFX942_SRC: &str =
     include_str!("../../../kernels/src/rmsnorm_reduce.gfx942.hip");

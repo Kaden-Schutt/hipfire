@@ -2575,6 +2575,18 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_mq_signs()?;
+        static AWQ_WAVEGRID: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            hipfire_config::developer_var("HIPFIRE_AWQ_NORM_WAVEGRID").as_deref() == Ok("1")
+        });
+        if self.arch_caps.is_gfx1100()
+            && *AWQ_WAVEGRID
+            && k >= 2_048
+            && k.is_multiple_of(256)
+            && k / 256 <= 32
+        {
+            return self
+                .fused_rmsnorm_rotate_mq_awq_wavegrid_gfx1100(x, weight, awq_scale, x_rot, k, eps);
+        }
         let (module, source, shared_mem) = awq_norm_kernel(self, k);
         self.ensure_kernel(module, source, "fused_rmsnorm_mq_rotate_awq")?;
         let s1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
@@ -2617,6 +2629,85 @@ impl Gpu {
                 b.push_ptr(s1);
                 b.push_ptr(s2);
                 b.push_ptr(xrp);
+                b.push_i32(kv);
+                b.push_f32(eps_v);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        self.invalidate_x_caches_for(xrp);
+        result
+    }
+
+    /// gfx1100 AWQ wavegrid: K/256 wave32 workgroups, one FWHT group each.
+    /// Spreads the reduction + rotation across CUs so VRAM latency overlaps
+    /// instead of serializing behind a single workgroup's load stream.
+    /// Reduction order differs from the LDS tree — ship gate is exact
+    /// greedy-token parity over a long replay, not bit-identical buffers.
+    fn fused_rmsnorm_rotate_mq_awq_wavegrid_gfx1100(
+        &mut self,
+        x: &GpuTensor,
+        weight: &GpuTensor,
+        awq_scale: &GpuTensor,
+        x_rot: &GpuTensor,
+        k: usize,
+        eps: f32,
+    ) -> HipResult<()> {
+        const KERNEL: &str = "fused_rmsnorm_mq_rotate_awq_wavegrid";
+        self.scratch
+            .ensure_mq_rmsnorm_awq_wavegrid_scratch(&self.hip, self.device_id)?;
+        self.ensure_kernel(
+            KERNEL,
+            kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_WAVEGRID_GFX1100_SRC,
+            KERNEL,
+        )?;
+
+        let xp = x.buf.as_ptr();
+        let wp = weight.buf.as_ptr();
+        let awp = awq_scale.buf.as_ptr();
+        let s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let xrp = x_rot.buf.as_ptr();
+        let scratch = self
+            .scratch
+            .mq_rmsnorm_awq_wavegrid_scratch
+            .as_ref()
+            .unwrap()
+            .as_ptr();
+        let kv = k as i32;
+        let eps_v = eps;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &awp as *const _ as *mut c_void,
+            &s1 as *const _ as *mut c_void,
+            &s2 as *const _ as *mut c_void,
+            &xrp as *const _ as *mut c_void,
+            &scratch as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+            &eps_v as *const _ as *mut c_void,
+        ];
+
+        let groups = (k / 256) as u32;
+        let bytes = k * 4 * 4 + 2 * 256 * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "fused", KERNEL, bytes);
+        let result = self.launch_maybe_blob(
+            KERNEL,
+            [groups, 1, 1],
+            [32u32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp);
+                b.push_ptr(wp);
+                b.push_ptr(awp);
+                b.push_ptr(s1);
+                b.push_ptr(s2);
+                b.push_ptr(xrp);
+                b.push_ptr(scratch);
                 b.push_i32(kv);
                 b.push_f32(eps_v);
                 b

@@ -133,6 +133,10 @@ name = "bench_qwen35_mq4"
 required-features = []
 
 [[example]]
+name = "probe_awq_wavegrid"
+required-features = ["deltanet"]
+
+[[example]]
 name = "dflash_spec_demo"
 required-features = []
 
