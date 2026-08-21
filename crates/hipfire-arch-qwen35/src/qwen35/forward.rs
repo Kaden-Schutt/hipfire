@@ -4272,6 +4272,12 @@ fn qwen35_fa_prep_enabled(gpu: &Gpu, config: &Qwen35Config) -> bool {
         || gfx1151_radiowave_fusions_enabled(gpu))
         && config.n_heads == 16
         && config.n_kv_heads == 2)
+        // Qwen3.5-4B (gfx1100): 16Q/4K, head_dim 256, n_rot 64. The kernel
+        // derives K workgroups from the grid (head_slot - NQ) and the host
+        // launches NQ + n_kv workgroups, so 4 K heads need no kernel change.
+        || (gpu.arch_caps.is_gfx1100()
+            && config.n_heads == 16
+            && config.n_kv_heads == 4)
         || (gpu.arch_caps.is_gfx1100()
             && super::config::qwen36_27b_dense_shape(config, config.linear_num_value_heads)
             && config.n_heads == 24

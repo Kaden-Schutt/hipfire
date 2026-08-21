@@ -137,6 +137,10 @@ name = "probe_awq_wavegrid"
 required-features = ["deltanet"]
 
 [[example]]
+name = "probe_fa_prep"
+required-features = ["deltanet"]
+
+[[example]]
 name = "dflash_spec_demo"
 required-features = []
 

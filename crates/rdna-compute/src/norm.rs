@@ -1001,7 +1001,7 @@ impl Gpu {
         n_kv_heads: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if !matches!((n_heads, n_kv_heads), (16, 2) | (24, 4)) {
+        if !matches!((n_heads, n_kv_heads), (16, 2) | (16, 4) | (24, 4)) {
             return Err(hip_bridge::HipError::new(
                 1,
                 "fused FA prep requires 16Q/2K or 24Q/4K heads",
