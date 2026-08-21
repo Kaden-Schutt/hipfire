@@ -20,7 +20,7 @@
 //! `get(tensor_name_without_dot_weight_suffix, 0)` per MQ4G256 tensor.
 
 use byteorder::{ByteOrder, LittleEndian};
-use memmap2::{Advice, Mmap};
+use memmap2::Mmap;
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
@@ -154,11 +154,12 @@ impl HessianSidecar {
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
         // Hint sequential access: the quantizer walks tensor-by-tensor.
+        // `memmap2::Advice` only exists on unix; on other platforms the hint
+        // is a no-op and the call is compiled out entirely.
         #[cfg(unix)]
         {
-            mmap.advise(Advice::Sequential).ok();
+            mmap.advise(memmap2::Advice::Sequential).ok();
         }
-        let _ = Advice::Sequential; // silence unused on non-unix
 
         if mmap.len() < HEADER_SIZE {
             return Err(HessianError::TruncatedFile {

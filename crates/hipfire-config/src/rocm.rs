@@ -946,7 +946,12 @@ fn path_tool(name: &str) -> Option<PathBuf> {
 
 /// Kept separate so tests can prove the strict selected-root behavior without
 /// mutating process-global environment variables.
-fn tool_from_selected_root(root: &Path, name: &str) -> Option<PathBuf> {
+///
+/// Public because diagnostics (`hipfire-cli diag`) need the same
+/// host-suffix-aware lookup: on Windows the HIP SDK installs `hipcc.bat` /
+/// `hipcc.exe`, and probing the bare name would report a coherent SDK as
+/// missing its compiler.
+pub fn tool_from_selected_root(root: &Path, name: &str) -> Option<PathBuf> {
     first_tool_in_dir(&root.join("bin"), name, cfg!(windows))
 }
 

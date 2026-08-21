@@ -4849,7 +4849,7 @@ fn diag_command(paths: &Paths, output: OutputArgs) -> Result<()> {
                 "path": root.display().to_string(),
                 "device_compiler": hipfire_config::rocm::DEVICE_COMPILERS
                     .iter()
-                    .find(|name| root.join("bin").join(name).is_file()),
+                    .find_map(|name| hipfire_config::rocm::tool_from_selected_root(root, name)),
                 "hip_headers": hipfire_config::rocm::is_complete_root(root),
                 "hip_runtime": hipfire_config::rocm::runtime_library(root)
                     .map(|p| p.display().to_string()),
@@ -5104,13 +5104,20 @@ pub(crate) fn find_daemon(paths: &Paths) -> Option<PathBuf> {
         }
     }
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target");
-    [
-        paths.root.join("bin/daemon"),
-        workspace.join("release/daemon"),
-        workspace.join("debug/daemon"),
-    ]
-    .into_iter()
-    .find(|path| path.is_file())
+    // Windows ships the daemon as `daemon.exe`; probe both spellings so a
+    // source-tree build (target/release/daemon.exe) and an install
+    // (~/.hipfire/bin/daemon.exe) are found without HIPFIRE_DAEMON_BIN.
+    #[cfg(windows)]
+    const DAEMON_NAMES: &[&str] = &["daemon.exe", "daemon"];
+    #[cfg(not(windows))]
+    const DAEMON_NAMES: &[&str] = &["daemon"];
+    let mut candidates = Vec::new();
+    for name in DAEMON_NAMES {
+        candidates.push(paths.root.join("bin").join(name));
+        candidates.push(workspace.join("release").join(name));
+        candidates.push(workspace.join("debug").join(name));
+    }
+    candidates.into_iter().find(|path| path.is_file())
 }
 
 pub(crate) fn request_f64(
