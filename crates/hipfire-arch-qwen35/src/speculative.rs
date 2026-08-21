@@ -201,6 +201,39 @@ fn dflash_moe_draft_ffn_graph_eligible(
         && dflash_moe_verify_graph_lmhead_enabled_from_env_value(env_value)
 }
 
+/// Whether `HIPFIRE_VERIFY_GRAPH` admits the HipGraph verify route for this
+/// (arch, target lm_head dtype) pair.
+///
+/// `dc105ea64` newly admitted MQ2/3/4/5/6G256V2 to gfx1100 batched WMMA, and
+/// `verify_graph_ok` shares that eligibility via `prefill_batch_pbs_eligible`.
+/// Graph-off direct and forced-blob direct full-model V2 fixtures pass on
+/// gfx1100, but two graph-on V2 campaigns lost the endpoint. This is a
+/// default-off graph capability quarantine for exact gfx1100 + V2 only;
+/// direct batched WMMA remains on. `HIPFIRE_VERIFY_GRAPH=1` opts back in
+/// diagnostically; `=0` force-offs everywhere; gfx1151/gfx12 and non-V2
+/// gfx1100 stay default-on.
+fn dflash_verify_graph_env_eligible(
+    arch: &str,
+    output_dtype: rdna_compute::DType,
+    env_value: Option<&str>,
+) -> bool {
+    if env_value == Some("0") {
+        return false;
+    }
+    let is_mq_v2 = matches!(
+        output_dtype,
+        rdna_compute::DType::MQ4G256V2
+            | rdna_compute::DType::MQ6G256V2
+            | rdna_compute::DType::MQ5G256V2
+            | rdna_compute::DType::MQ3G256V2
+            | rdna_compute::DType::MQ2G256V2
+    );
+    if arch == "gfx1100" && is_mq_v2 {
+        return env_value == Some("1");
+    }
+    true
+}
+
 fn dflash_batched_lm_head_supported(dtype: rdna_compute::DType) -> bool {
     matches!(
         dtype,
@@ -2677,11 +2710,14 @@ fn verify_dflash_block_inner(
         gpu.arch.as_str(),
         moe_router_logits_present,
     );
-    let verify_graph_ok = hipfire_config::developer_var("HIPFIRE_VERIFY_GRAPH")
-        .ok()
-        .as_deref()
-        != Some("0")
-        && tree_ok_for_graph
+    // See `dflash_verify_graph_env_eligible`: gfx1100 + MQ*V2 lm_head is
+    // default-off for HipGraph only (dc105ea64 newly made V2 graph-eligible).
+    let verify_graph_env = hipfire_config::developer_var("HIPFIRE_VERIFY_GRAPH").ok();
+    let verify_graph_ok = dflash_verify_graph_env_eligible(
+        gpu.arch.as_str(),
+        target.weights.output.gpu_dtype,
+        verify_graph_env.as_deref(),
+    ) && tree_ok_for_graph
         && matches!(
             target.weights.embd_format,
             hipfire_runtime::llama::EmbeddingFormat::HFQ4G256
@@ -2769,7 +2805,12 @@ fn verify_dflash_block_inner(
             // outside any captured region. Capturing a JIT + scratch-malloc
             // hits "hipMalloc not permitted under stream capture" the first
             // time any kernel is compiled inline. One warmup per distinct b.
-            gpu.graphs.verify_mark_warmup_done(b);
+            //
+            // A successful launch sequence is not yet a successful warmup:
+            // launches are asynchronous. Synchronize the active stream before
+            // admitting this B into the capture branch. Otherwise an async
+            // kernel fault can leave `warmed_up` set and make the next call
+            // capture a path whose warmup never completed.
             let r = qwen35::forward_prefill_batch_single_chunk_captured_opts(
                 gpu,
                 &target.weights,
@@ -2786,13 +2827,19 @@ fn verify_dflash_block_inner(
                 tree_verify,
                 false, // DFlash computes all verify logits from final_hidden below
             );
-            if r.is_ok() {
+            r.and_then(|_| {
+                gpu.hip.stream_synchronize(
+                    gpu.active_stream
+                        .as_ref()
+                        .expect("verify warmup requires an active stream"),
+                )?;
+                gpu.graphs.verify_mark_warmup_done(b);
                 eprintln!(
                     "[verify-graph] warmup for B={} complete — capture next cycle at this B",
                     b
                 );
-            }
-            r
+                Ok(())
+            })
         } else {
             vg_mode = "capture";
             // Capture path: first call at this B after warmup.
@@ -2840,10 +2887,6 @@ fn verify_dflash_block_inner(
                     gpu.device_id,
                     gpu.active_stream.as_ref().unwrap(),
                 )?;
-                if capture_lmhead_argmax {
-                    gpu.graphs.verify_mark_graph_lmhead_argmax(b);
-                    graph_includes_lmhead_argmax = true;
-                }
                 // Under `hipStreamBeginCapture`, kernels + memcpys on the
                 // captured stream are RECORDED, not executed. final_hidden
                 // and hidden_rb staging are left stale. Launching the graph
@@ -2852,12 +2895,33 @@ fn verify_dflash_block_inner(
                 // HIP version does execute during capture) is washed out by
                 // target_snap.restore_to after verify returns. KV cache
                 // double-write writes the same data to the same positions.
-                gpu.graphs.verify_graph_launch(
-                    &gpu.hip,
-                    gpu.device_id,
-                    gpu.active_stream.as_ref().unwrap(),
-                    b,
-                )?;
+                //
+                // The launch is asynchronous. Complete this one-time first
+                // execution before admitting the graph into the replay cache:
+                // if execution fails, destroy every per-B entry so a retry
+                // cannot enqueue the failed graph (or another graph recorded
+                // against the now-faulted stream state).
+                let first_launch = gpu
+                    .graphs
+                    .verify_graph_launch(
+                        &gpu.hip,
+                        gpu.device_id,
+                        gpu.active_stream.as_ref().unwrap(),
+                        b,
+                    )
+                    .and_then(|_| {
+                        gpu.hip
+                            .stream_synchronize(gpu.active_stream.as_ref().unwrap())
+                    });
+                if let Err(err) = first_launch {
+                    gpu.graphs
+                        .verify_graph_destroy_all(&gpu.hip, gpu.device_id);
+                    return Err(err);
+                }
+                if capture_lmhead_argmax {
+                    gpu.graphs.verify_mark_graph_lmhead_argmax(b);
+                    graph_includes_lmhead_argmax = true;
+                }
                 eprintln!(
                     "[verify-graph] captured for B={} with {} blobs (cache size: {})",
                     b,
@@ -7518,6 +7582,63 @@ mod tests {
             false,
             false,
             Some("0")
+        ));
+    }
+
+    #[test]
+    fn dflash_verify_graph_env_quarantines_gfx1100_mq_v2() {
+        use rdna_compute::DType;
+
+        // gfx1100 + every V2 width: default-off; =0 force-off; =1 diagnostic opt-in.
+        for dtype in [
+            DType::MQ2G256V2,
+            DType::MQ3G256V2,
+            DType::MQ4G256V2,
+            DType::MQ5G256V2,
+            DType::MQ6G256V2,
+        ] {
+            assert!(!dflash_verify_graph_env_eligible(
+                "gfx1100", dtype, None
+            ));
+            assert!(!dflash_verify_graph_env_eligible(
+                "gfx1100",
+                dtype,
+                Some("0")
+            ));
+            assert!(dflash_verify_graph_env_eligible(
+                "gfx1100",
+                dtype,
+                Some("1")
+            ));
+        }
+
+        // gfx1100 + legacy quant remains default-on.
+        assert!(dflash_verify_graph_env_eligible(
+            "gfx1100",
+            DType::MQ3G256,
+            None
+        ));
+
+        // Other arches keep default-on for V2; =0 still force-off.
+        assert!(dflash_verify_graph_env_eligible(
+            "gfx1151",
+            DType::MQ3G256V2,
+            None
+        ));
+        assert!(!dflash_verify_graph_env_eligible(
+            "gfx1151",
+            DType::MQ3G256V2,
+            Some("0")
+        ));
+        assert!(dflash_verify_graph_env_eligible(
+            "gfx1151",
+            DType::MQ3G256V2,
+            Some("1")
+        ));
+        assert!(dflash_verify_graph_env_eligible(
+            "gfx1201",
+            DType::MQ3G256V2,
+            None
         ));
     }
 
