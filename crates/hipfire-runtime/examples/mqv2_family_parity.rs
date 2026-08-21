@@ -3,10 +3,22 @@
 //! Exercises the real production wire layouts for all four new V2 formats
 //! before model-scale quantization. Each format is tested via:
 //!   * B=1 plain GEMV (`gemv_mq{n}g256v2` — production decode path)
-//!   * B=16 batched lm-head GEMM (gfx11+gfx12 WMMA batched lm-head)
-//!   * K=512 N=16 fused prefill WMMA via arch-aware production wrappers
-//!     `gemm_qkv_mq{n}g256v2_wmma`, `gemm_qkvza_mq{n}g256v2_wmma`,
+//!   * Batched lm-head GEMM at batch=14 and batch=16 (gfx11+gfx12 WMMA)
+//!   * Direct unsuffixed residual WMMA (`gemm_mq{n}g256v2_residual_wmma`) at
+//!     N=14 and N=16 (zero-init y + canary; separate from lm-head)
+//!   * K=512 fused prefill WMMA at N=14 and N=16 via arch-aware production
+//!     wrappers `gemm_qkv_mq{n}g256v2_wmma`, `gemm_qkvza_mq{n}g256v2_wmma`,
 //!     `gemm_gate_up_mq{n}g256v2_wmma` (gfx12-first, then gfx11 has_wmma_w32)
+//!
+//! ## Partial-tile regression coverage
+//!
+//! gfx1100 DFlash warmup at B=14 hit `sq_intr` + gfxhub page fault while the
+//! prior oracle only exercised full WMMA tiles (N=16 / B=16). This harness
+//! therefore runs exact active shapes 14 then 16 for every fused prefill
+//! family and the batched lm-head route. Each shape uses an exact-size active
+//! output plus one trailing f32 canary — no slack can hide row 14/15 OOB
+//! writes. References match N. First launch failure, canary clobber, or
+//! rel-RMS > 0.05 aborts before later formats/shapes (fleet rule).
 //!
 //! ## Why this oracle exists
 //!
@@ -44,15 +56,17 @@
 //!   2. Header divergence: at least one group's s0 != s1 or z0 != z1.
 //!   3. Sentinel/canary: y buffer has trailing sentinel that kernel must not clobber.
 //!   4. B=1 plain GEMV vs CPU dequant+matmul (f64) — worst abs/rel error.
-//!   5. B=16 batched GEMM (lm-head) vs CPU batched matmul — worst abs/rel error.
-//!   6. Single-half bug baseline: error must be orders of magnitude larger than
+//!   5. Batched GEMM (lm-head) at B∈{14,16} vs CPU batched matmul — rel-RMS.
+//!   6. Direct residual WMMA at N∈{14,16} via unsuffixed
+//!      `gemm_mq{n}g256v2_residual_wmma` (zero-init y) vs same f64 ref.
+//!   7. Single-half bug baseline: error must be orders of magnitude larger than
 //!      correct decode, otherwise fixture is not discriminating.
-//!   7. Fused prefill WMMA (qkv / qkvza / gate_up) at K=512 N=16 vs independent
-//!      f64 exact-dequant refs; pass iff every family output has rel-RMS <= 0.05.
-//!      Launch failure is `FAIL_UNSUPPORTED` (never skipped).
+//!   8. Fused prefill WMMA (qkv / qkvza / gate_up) at K=512 N∈{14,16} vs
+//!      independent f64 exact-dequant refs; pass iff every family output has
+//!      rel-RMS <= 0.05. Launch failure is `FAIL_UNSUPPORTED` (never skipped).
 //!
-//! Output is machine-parseable (`fmt qt group_bytes m k gpr status ... fused_*`)
-//! to preserve evidence.
+//! One machine-parseable stdout row per (format, N) with per-op statuses.
+//! First parity failure aborts after scope-owned GPU buffers drop.
 //!
 //! Run: `cargo run --release -p hipfire-runtime --example mqv2_family_parity`
 //!
@@ -67,9 +81,8 @@ const HALF: usize = 128;
 const GPR_K512: usize = 2; // K=512 => 2 groups per row
 const M: usize = 64;
 const K: usize = 512;
-const BATCH: usize = 16;
-/// Fused prefill WMMA shape: K=512, N=16 (one 16-batch tile).
-const FUSED_N: usize = 16;
+/// Partial-tile then full-tile batch/N shapes (gfx1100 B=14 page-fault oracle).
+const SHAPES_N: [usize; 2] = [14, 16];
 const FUSED_ROW: usize = 16; // per-output M for q/k/v/gate/up/...
 const CANARY_F32: f32 = 12345.6789;
 const FUSED_TOL_RMS: f64 = 0.05;
@@ -717,11 +730,11 @@ fn judge_fused_outputs(
     }
 }
 
-fn run_fused_gate_up(gpu: &mut Gpu, fmt: &Format, x: &[f32]) -> FusedFamilyResult {
+fn run_fused_gate_up(gpu: &mut Gpu, fmt: &Format, x: &[f32], n: usize) -> FusedFamilyResult {
     let k = K;
-    let n = FUSED_N;
     let gate_m = FUSED_ROW;
     let up_m = FUSED_ROW;
+    debug_assert_eq!(x.len(), n * k);
     let w_gate = build_disjoint_halves_salted(gate_m, k, 0x6A7E_0001);
     let w_up = build_disjoint_halves_salted(up_m, k, 0x6A7E_0002);
 
@@ -764,7 +777,7 @@ fn run_fused_gate_up(gpu: &mut Gpu, fmt: &Format, x: &[f32]) -> FusedFamilyResul
         let (got_gate, c_gate) = download_y_canary(gpu, &d_y_gate, y_gate_len, n, gate_m)?;
         let (got_up, c_up) = download_y_canary(gpu, &d_y_up, y_up_len, n, up_m)?;
         Ok(judge_fused_outputs(
-            "gate_up",
+            &format!("gate_up n={n}"),
             &[
                 ("gate", got_gate, want_gate, c_gate),
                 ("up", got_up, want_up, c_up),
@@ -774,18 +787,18 @@ fn run_fused_gate_up(gpu: &mut Gpu, fmt: &Format, x: &[f32]) -> FusedFamilyResul
     match run {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("  FUSED gate_up launch FAIL (unsupported route): {e}");
+            eprintln!("  FUSED gate_up n={n} launch FAIL (unsupported route): {e}");
             fused_fail_unsupported()
         }
     }
 }
 
-fn run_fused_qkv(gpu: &mut Gpu, fmt: &Format, x: &[f32]) -> FusedFamilyResult {
+fn run_fused_qkv(gpu: &mut Gpu, fmt: &Format, x: &[f32], n: usize) -> FusedFamilyResult {
     let k = K;
-    let n = FUSED_N;
     let q_m = FUSED_ROW;
     let k_m = FUSED_ROW;
     let v_m = FUSED_ROW;
+    debug_assert_eq!(x.len(), n * k);
     let w_q = build_disjoint_halves_salted(q_m, k, 0x9CB0_0001);
     let w_k = build_disjoint_halves_salted(k_m, k, 0x9CB0_0002);
     let w_v = build_disjoint_halves_salted(v_m, k, 0x9CB0_0003);
@@ -836,7 +849,7 @@ fn run_fused_qkv(gpu: &mut Gpu, fmt: &Format, x: &[f32]) -> FusedFamilyResult {
         let (got_k, c_k) = download_y_canary(gpu, &d_y_k, y_k_len, n, k_m)?;
         let (got_v, c_v) = download_y_canary(gpu, &d_y_v, y_v_len, n, v_m)?;
         Ok(judge_fused_outputs(
-            "qkv",
+            &format!("qkv n={n}"),
             &[
                 ("q", got_q, want_q, c_q),
                 ("k", got_k, want_k, c_k),
@@ -847,19 +860,19 @@ fn run_fused_qkv(gpu: &mut Gpu, fmt: &Format, x: &[f32]) -> FusedFamilyResult {
     match run {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("  FUSED qkv launch FAIL (unsupported route): {e}");
+            eprintln!("  FUSED qkv n={n} launch FAIL (unsupported route): {e}");
             fused_fail_unsupported()
         }
     }
 }
 
-fn run_fused_qkvza(gpu: &mut Gpu, fmt: &Format, x: &[f32]) -> FusedFamilyResult {
+fn run_fused_qkvza(gpu: &mut Gpu, fmt: &Format, x: &[f32], n: usize) -> FusedFamilyResult {
     let k = K;
-    let n = FUSED_N;
     let qkv_m = FUSED_ROW;
     let z_m = FUSED_ROW;
     let beta_m = FUSED_ROW;
     let alpha_m = FUSED_ROW;
+    debug_assert_eq!(x.len(), n * k);
     let w_qkv = build_disjoint_halves_salted(qkv_m, k, 0x2A1A_0001);
     let w_z = build_disjoint_halves_salted(z_m, k, 0x2A1A_0002);
     let w_beta = build_disjoint_halves_salted(beta_m, k, 0x2A1A_0003);
@@ -922,7 +935,7 @@ fn run_fused_qkvza(gpu: &mut Gpu, fmt: &Format, x: &[f32]) -> FusedFamilyResult 
         let (got_beta, c_beta) = download_y_canary(gpu, &d_y_beta, y_beta_len, n, beta_m)?;
         let (got_alpha, c_alpha) = download_y_canary(gpu, &d_y_alpha, y_alpha_len, n, alpha_m)?;
         Ok(judge_fused_outputs(
-            "qkvza",
+            &format!("qkvza n={n}"),
             &[
                 ("qkv", got_qkv, want_qkv, c_qkv),
                 ("z", got_z, want_z, c_z),
@@ -934,30 +947,224 @@ fn run_fused_qkvza(gpu: &mut Gpu, fmt: &Format, x: &[f32]) -> FusedFamilyResult 
     match run {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("  FUSED qkvza launch FAIL (unsupported route): {e}");
+            eprintln!("  FUSED qkvza n={n} launch FAIL (unsupported route): {e}");
             fused_fail_unsupported()
         }
     }
 }
 
+/// Batched lm-head route at exact `batch` (14 or 16). Y is batch*M
+/// active floats + one trailing canary — no slack.
+fn run_batched_lmhead(
+    gpu: &mut Gpu,
+    fmt: &Format,
+    blob: &[u8],
+    x_batch: &[f32],
+    batch: usize,
+) -> (f64, f64, f64, bool, &'static str) {
+    debug_assert_eq!(x_batch.len(), batch * K);
+    let want_batch = decode_and_gemm_batched(fmt, blob, x_batch, M, K, batch);
+    let batch_result = (|| -> Result<(Vec<f32>, bool), String> {
+        let y_len = batch * M + 1;
+        let mut y_host = vec![0.0f32; y_len];
+        y_host[y_len - 1] = CANARY_F32;
+        let d_a = gpu
+            .upload_raw(blob, &[blob.len()])
+            .map_err(|e| format!("upload_raw: {e:?}"))?;
+        let d_x = gpu
+            .upload_f32(x_batch, &[batch * K])
+            .map_err(|e| format!("upload_f32 x_batch: {e:?}"))?;
+        let d_y = gpu
+            .upload_f32(&y_host, &[y_len])
+            .map_err(|e| format!("upload_f32 y: {e:?}"))?;
+        let res: Result<(), _> = match fmt.qt {
+            47 => gpu.gemm_mq6g256v2_batched_lmhead(&d_a, &d_x, &d_y, M, K, batch),
+            48 => gpu.gemm_mq5g256v2_batched_lmhead(&d_a, &d_x, &d_y, M, K, batch),
+            49 => gpu.gemm_mq3g256v2_batched_lmhead(&d_a, &d_x, &d_y, M, K, batch),
+            50 => gpu.gemm_mq2g256v2_batched_lmhead(&d_a, &d_x, &d_y, M, K, batch),
+            _ => unreachable!(),
+        };
+        if let Err(e) = res {
+            return Err(format!("batched lmhead launch: {e:?}"));
+        }
+        gpu.hip
+            .device_synchronize()
+            .map_err(|e| format!("sync: {e:?}"))?;
+        let got_all = gpu
+            .download_f32(&d_y)
+            .map_err(|e| format!("download: {e:?}"))?;
+        if got_all.len() != y_len {
+            return Err(format!("download len {} != {}", got_all.len(), y_len));
+        }
+        let canary_ok = (got_all[y_len - 1] - CANARY_F32).abs() < 1e-6;
+        if !canary_ok {
+            eprintln!(
+                "  BATCH B={batch} canary FAIL: got {} want {}",
+                got_all[y_len - 1],
+                CANARY_F32
+            );
+        }
+        let got = got_all[..batch * M].to_vec();
+        Ok((got, canary_ok))
+    })();
+
+    match batch_result {
+        Ok((got, canary_ok)) => {
+            let (worst_abs, worst_rel, worst_abs_i, worst_rel_i) = worst_errors(&got, &want_batch);
+            let rms = rel_rms(&got, &want_batch);
+            eprintln!(
+                "  BATCH B={batch}: worst_abs {:.3e} at {} (got {:.6}, want {:.6}) worst_rel {:.3e} at {} rel_rms {:.3e} canary_ok={}",
+                worst_abs,
+                worst_abs_i,
+                got[worst_abs_i],
+                want_batch[worst_abs_i],
+                worst_rel,
+                worst_rel_i,
+                rms,
+                canary_ok
+            );
+            let tol_rms: f64 = FUSED_TOL_RMS;
+            let pass = rms <= tol_rms && canary_ok;
+            let status = if pass { "PASS" } else { "FAIL" };
+            if !pass {
+                eprintln!(
+                    "  BATCH B={batch} FAIL: rel_rms {:.3e} > {:.2}",
+                    rms, tol_rms
+                );
+            }
+            (worst_abs, worst_rel, rms, canary_ok, status)
+        }
+        Err(e) => {
+            eprintln!("  BATCH B={batch} launch FAIL (unsupported route): {e}");
+            (
+                f64::INFINITY,
+                f64::INFINITY,
+                f64::INFINITY,
+                false,
+                "FAIL_UNSUPPORTED",
+            )
+        }
+    }
+}
+
+/// Direct production unsuffixed residual WMMA at exact `n` (14 or 16).
+/// Y is zero-initialized n*M active + one trailing canary; residual adds into
+/// zeros so the f64 batched matmul reference still holds.
+fn run_residual_wmma(
+    gpu: &mut Gpu,
+    fmt: &Format,
+    blob: &[u8],
+    x_batch: &[f32],
+    n: usize,
+) -> (f64, bool, &'static str) {
+    debug_assert_eq!(x_batch.len(), n * K);
+    let want = decode_and_gemm_batched(fmt, blob, x_batch, M, K, n);
+    let result = (|| -> Result<(Vec<f32>, bool), String> {
+        let y_len = n * M + 1;
+        let mut y_host = vec![0.0f32; y_len];
+        y_host[y_len - 1] = CANARY_F32;
+        let d_a = gpu
+            .upload_raw(blob, &[blob.len()])
+            .map_err(|e| format!("upload_raw residual: {e:?}"))?;
+        let d_x = gpu
+            .upload_f32(x_batch, &[n * K])
+            .map_err(|e| format!("upload_f32 x residual: {e:?}"))?;
+        let d_y = gpu
+            .upload_f32(&y_host, &[y_len])
+            .map_err(|e| format!("upload_f32 y residual: {e:?}"))?;
+        // Production unsuffixed residual wrappers only (not gfx11/gfx12-suffixed).
+        let res: Result<(), _> = match fmt.qt {
+            47 => gpu.gemm_mq6g256v2_residual_wmma(&d_a, &d_x, &d_y, M, K, n),
+            48 => gpu.gemm_mq5g256v2_residual_wmma(&d_a, &d_x, &d_y, M, K, n),
+            49 => gpu.gemm_mq3g256v2_residual_wmma(&d_a, &d_x, &d_y, M, K, n),
+            50 => gpu.gemm_mq2g256v2_residual_wmma(&d_a, &d_x, &d_y, M, K, n),
+            _ => unreachable!(),
+        };
+        if let Err(e) = res {
+            return Err(format!("residual_wmma launch: {e:?}"));
+        }
+        gpu.hip
+            .device_synchronize()
+            .map_err(|e| format!("residual sync: {e:?}"))?;
+        let got_all = gpu
+            .download_f32(&d_y)
+            .map_err(|e| format!("residual download: {e:?}"))?;
+        if got_all.len() != y_len {
+            return Err(format!(
+                "residual download len {} != {}",
+                got_all.len(),
+                y_len
+            ));
+        }
+        let canary_ok = (got_all[y_len - 1] - CANARY_F32).abs() < 1e-6;
+        if !canary_ok {
+            eprintln!(
+                "  RESIDUAL N={n} canary FAIL: got {} want {}",
+                got_all[y_len - 1],
+                CANARY_F32
+            );
+        }
+        let got = got_all[..n * M].to_vec();
+        Ok((got, canary_ok))
+    })();
+
+    match result {
+        Ok((got, canary_ok)) => {
+            let (worst_abs, worst_rel, worst_abs_i, worst_rel_i) = worst_errors(&got, &want);
+            let rms = rel_rms(&got, &want);
+            eprintln!(
+                "  RESIDUAL N={n}: worst_abs {:.3e} at {} (got {:.6}, want {:.6}) worst_rel {:.3e} at {} rel_rms {:.3e} canary_ok={}",
+                worst_abs,
+                worst_abs_i,
+                got[worst_abs_i],
+                want[worst_abs_i],
+                worst_rel,
+                worst_rel_i,
+                rms,
+                canary_ok
+            );
+            let pass = rms <= FUSED_TOL_RMS && canary_ok;
+            let status = if pass { "PASS" } else { "FAIL" };
+            if !pass {
+                eprintln!(
+                    "  RESIDUAL N={n} FAIL: rel_rms {:.3e} > {:.2} canary_ok={canary_ok}",
+                    rms, FUSED_TOL_RMS
+                );
+            }
+            (rms, canary_ok, status)
+        }
+        Err(e) => {
+            eprintln!("  RESIDUAL N={n} launch FAIL (unsupported route): {e}");
+            (f64::INFINITY, false, "FAIL_UNSUPPORTED")
+        }
+    }
+}
+
 fn main() {
+    // Return code path (not process::exit mid-body) so GPU tensors Drop on abort.
+    let code = run_parity();
+    if code != 0 {
+        std::process::exit(code);
+    }
+}
+
+fn run_parity() -> i32 {
     let mut gpu = match Gpu::init() {
         Ok(g) => g,
         Err(e) => {
             eprintln!("mqv2_family_parity: no GPU ({e}) — skipping");
-            return;
+            return 0;
         }
     };
     eprintln!(
-        "mqv2_family_parity: arch={} has_wmma_w32={} has_wmma_w32_gfx12={} m={} k={} gpr={} batch={} fused_n={}",
+        "mqv2_family_parity: arch={} has_wmma_w32={} has_wmma_w32_gfx12={} m={} k={} gpr={} shapes_n={:?} (partial-tile regression)",
         gpu.arch,
         gpu.arch_caps.has_wmma_w32(),
         gpu.arch_caps.has_wmma_w32_gfx12(),
         M,
         K,
         GPR_K512,
-        BATCH,
-        FUSED_N
+        SHAPES_N
     );
     if !(gpu.arch_caps.has_wmma_w32() || gpu.arch_caps.has_wmma_w32_gfx12()) {
         eprintln!(
@@ -968,8 +1175,6 @@ fn main() {
 
     let w = build_disjoint_halves(M, K);
     let x_gemv = build_x(K, 0xC0FF_EE00);
-    let x_batch = build_x_batched(K, BATCH, 0xBEEF_CAFE);
-    let x_fused = build_x_batched(K, FUSED_N, 0xF05E_D000);
 
     // group bytes set to ensure no alias
     {
@@ -983,8 +1188,6 @@ fn main() {
             );
         }
     }
-
-    let mut overall_fail = false;
 
     for fmt in &FORMATS {
         eprintln!(
@@ -1002,20 +1205,25 @@ fn main() {
             byte_ok
         );
         if !byte_ok {
-            eprintln!("  FAIL byte_count mismatch");
-            overall_fail = true;
+            eprintln!("  FAIL byte_count mismatch — abort");
             println!(
-                "fmt={} qt={} group_bytes={} m={} k={} gpr={} byte_ok={} canary_ok=false status=FAIL worst_abs=0 worst_rel=0 bug_rel=0",
+                "fmt={} qt={} group_bytes={} m={} k={} gpr={} n=- batch=- byte_ok={} canary_ok=false status=FAIL worst_abs=0 worst_rel=0 bug_rel=0",
                 fmt.name, fmt.qt, fmt.group_bytes, M, K, gpr, byte_ok
             );
-            continue;
+            eprintln!("\nmqv2_family_parity: FAIL — abort on first parity failure");
+            return 1;
         }
         // header divergence check
         let hdr_ok = headers_differ(&blob, fmt, M, K);
         eprintln!("  header_divergence s0/z0 != s1/z1 : {}", hdr_ok);
         if !hdr_ok {
-            eprintln!("  FAIL headers do not differ — fixture not discriminating");
-            overall_fail = true;
+            eprintln!("  FAIL headers do not differ — fixture not discriminating — abort");
+            println!(
+                "fmt={} qt={} group_bytes={} m={} k={} gpr={} n=- batch=- byte_ok={} hdr_ok={} status=FAIL",
+                fmt.name, fmt.qt, fmt.group_bytes, M, K, gpr, byte_ok, hdr_ok
+            );
+            eprintln!("\nmqv2_family_parity: FAIL — abort on first parity failure");
+            return 1;
         }
 
         // want for gemv
@@ -1083,198 +1291,308 @@ fn main() {
             Ok((got, canary_ok))
         })();
 
-        let (gemv_got, gemv_canary_ok, gemv_worst_abs, gemv_worst_rel, gemv_status) =
-            match gemv_result {
-                Ok((got, canary_ok)) => {
-                    let (worst_abs, worst_rel, worst_abs_i, worst_rel_i) =
-                        worst_errors(&got, &want_gemv);
-                    eprintln!(
+        let (gemv_canary_ok, gemv_worst_abs, gemv_worst_rel, gemv_status) = match gemv_result {
+            Ok((got, canary_ok)) => {
+                let (worst_abs, worst_rel, worst_abs_i, worst_rel_i) =
+                    worst_errors(&got, &want_gemv);
+                eprintln!(
                     "  GEMV plain B=1: worst_abs {:.3e} at {} (got {:.6}, want {:.6}) worst_rel {:.3e} at {} canary_ok={}",
                     worst_abs, worst_abs_i, got[worst_abs_i], want_gemv[worst_abs_i], worst_rel, worst_rel_i, canary_ok
                 );
-                    let tol_rel: f64 = if fmt.bits <= 3 { 2e-3 } else { 1e-4 };
-                    let tol_abs: f64 = 1e-2;
-                    // WMMA fp16 may add small error, but GEMV is scalar — tighten
-                    let pass =
-                        worst_rel < tol_rel.max(tol_abs) && worst_rel < bug_rel * 0.01 && canary_ok;
-                    let status = if pass { "PASS" } else { "FAIL" };
-                    if !pass {
-                        eprintln!(
-                            "  GEMV FAIL: tol_rel {:.0e} bug_rel {:.3e}",
-                            tol_rel, bug_rel
-                        );
-                    }
-                    (Some(got), canary_ok, worst_abs, worst_rel, status)
-                }
-                Err(e) => {
-                    eprintln!("  GEMV plain B=1 launch FAIL (unsupported route): {e}");
-                    (
-                        None,
-                        false,
-                        f64::INFINITY,
-                        f64::INFINITY,
-                        "FAIL_UNSUPPORTED",
-                    )
-                }
-            };
-
-        // ── B=16 batched lm-head GEMM (gfx11+gfx12 WMMA) ─────────────────────
-
-        let want_batch = decode_and_gemm_batched(fmt, &blob, &x_batch, M, K, BATCH);
-        let batch_result = (|| -> Result<(Vec<f32>, bool), String> {
-            let y_len = BATCH * M + 1;
-            let mut y_host = vec![0.0f32; y_len];
-            y_host[y_len - 1] = CANARY_F32;
-            let d_a = gpu
-                .upload_raw(&blob, &[blob.len()])
-                .map_err(|e| format!("upload_raw: {e:?}"))?;
-            let d_x = gpu
-                .upload_f32(&x_batch, &[BATCH * K])
-                .map_err(|e| format!("upload_f32 x_batch: {e:?}"))?;
-            let d_y = gpu
-                .upload_f32(&y_host, &[y_len])
-                .map_err(|e| format!("upload_f32 y: {e:?}"))?;
-            let res: Result<(), _> = match fmt.qt {
-                47 => gpu.gemm_mq6g256v2_batched_lmhead(&d_a, &d_x, &d_y, M, K, BATCH),
-                48 => gpu.gemm_mq5g256v2_batched_lmhead(&d_a, &d_x, &d_y, M, K, BATCH),
-                49 => gpu.gemm_mq3g256v2_batched_lmhead(&d_a, &d_x, &d_y, M, K, BATCH),
-                50 => gpu.gemm_mq2g256v2_batched_lmhead(&d_a, &d_x, &d_y, M, K, BATCH),
-                _ => unreachable!(),
-            };
-            if let Err(e) = res {
-                return Err(format!("batched lmhead launch: {e:?}"));
-            }
-            gpu.hip
-                .device_synchronize()
-                .map_err(|e| format!("sync: {e:?}"))?;
-            let got_all = gpu
-                .download_f32(&d_y)
-                .map_err(|e| format!("download: {e:?}"))?;
-            if got_all.len() != y_len {
-                return Err(format!("download len {} != {}", got_all.len(), y_len));
-            }
-            let canary_ok = (got_all[y_len - 1] - CANARY_F32).abs() < 1e-6;
-            if !canary_ok {
-                eprintln!(
-                    "  BATCH canary FAIL: got {} want {}",
-                    got_all[y_len - 1],
-                    CANARY_F32
-                );
-            }
-            let got = got_all[..BATCH * M].to_vec();
-            Ok((got, canary_ok))
-        })();
-
-        let (batch_worst_abs, batch_worst_rel, batch_rel_rms, batch_canary_ok, batch_status) =
-            match batch_result {
-                Ok((got, canary_ok)) => {
-                    let (worst_abs, worst_rel, worst_abs_i, worst_rel_i) =
-                        worst_errors(&got, &want_batch);
-                    let rms = rel_rms(&got, &want_batch);
+                let tol_rel: f64 = if fmt.bits <= 3 { 2e-3 } else { 1e-4 };
+                let tol_abs: f64 = 1e-2;
+                // WMMA fp16 may add small error, but GEMV is scalar — tighten
+                let pass =
+                    worst_rel < tol_rel.max(tol_abs) && worst_rel < bug_rel * 0.01 && canary_ok;
+                let status = if pass { "PASS" } else { "FAIL" };
+                if !pass {
                     eprintln!(
-                    "  BATCH B=16: worst_abs {:.3e} at {} (got {:.6}, want {:.6}) worst_rel {:.3e} at {} rel_rms {:.3e} canary_ok={}",
-                    worst_abs,
-                    worst_abs_i,
-                    got[worst_abs_i],
-                    want_batch[worst_abs_i],
-                    worst_rel,
-                    worst_rel_i,
-                    rms,
-                    canary_ok
-                );
-                    // gfx12 WMMA batched lm-head does fp16 x conversion; judge by rel-RMS as in mq4v2_gemm_parity.rs (181-189,235-249)
-                    // 0.05 is the defensible WMMA fp16 floor — worst_abs/rel retained as diagnostics
-                    let tol_rms: f64 = 0.05;
-                    let pass = rms <= tol_rms && canary_ok;
-                    let status = if pass { "PASS" } else { "FAIL" };
-                    if !pass {
-                        eprintln!("  BATCH FAIL: rel_rms {:.3e} > {:.0e}", rms, tol_rms);
-                    }
-                    (worst_abs, worst_rel, rms, canary_ok, status)
+                        "  GEMV FAIL: tol_rel {:.0e} bug_rel {:.3e}",
+                        tol_rel, bug_rel
+                    );
                 }
-                Err(e) => {
-                    eprintln!("  BATCH B=16 launch FAIL (unsupported route): {e}");
-                    (
-                        f64::INFINITY,
-                        f64::INFINITY,
-                        f64::INFINITY,
-                        false,
-                        "FAIL_UNSUPPORTED",
-                    )
-                }
-            };
-
-        // ── Fused prefill WMMA at K=512 N=16 (arch-aware gemm_*_mqNg256v2_wmma) ──
-        let fused_gate_up = run_fused_gate_up(&mut gpu, fmt, &x_fused);
-        let fused_qkv = run_fused_qkv(&mut gpu, fmt, &x_fused);
-        let fused_qkvza = run_fused_qkvza(&mut gpu, fmt, &x_fused);
-
-        let fmt_status = if gemv_status == "PASS"
-            && batch_status == "PASS"
-            && fused_gate_up.status == "PASS"
-            && fused_qkv.status == "PASS"
-            && fused_qkvza.status == "PASS"
-            && hdr_ok
-            && byte_ok
-        {
-            "PASS"
-        } else {
-            "FAIL"
+                (canary_ok, worst_abs, worst_rel, status)
+            }
+            Err(e) => {
+                eprintln!("  GEMV plain B=1 launch FAIL (unsupported route): {e}");
+                (false, f64::INFINITY, f64::INFINITY, "FAIL_UNSUPPORTED")
+            }
         };
-        if fmt_status == "FAIL" {
-            overall_fail = true;
+
+        if gemv_status != "PASS" {
+            println!(
+                "fmt={} qt={} group_bytes={} m={} k={} gpr={} n=- batch=- byte_ok={} hdr_ok={} canary_gemv={} gemv_status={} status=FAIL gemv_worst_abs={:.6e} gemv_worst_rel={:.6e} bug_rel={:.6e}",
+                fmt.name,
+                fmt.qt,
+                fmt.group_bytes,
+                M,
+                K,
+                gpr,
+                byte_ok,
+                hdr_ok,
+                gemv_canary_ok,
+                gemv_status,
+                gemv_worst_abs,
+                gemv_worst_rel,
+                bug_rel
+            );
+            eprintln!("\nmqv2_family_parity: FAIL — abort on first parity failure (gemv)");
+            return 1;
         }
 
-        // machine-parseable per-format line (stdout for evidence)
-        println!(
-            "fmt={} qt={} group_bytes={} m={} k={} gpr={} fused_n={} byte_ok={} hdr_ok={} canary_gemv={} canary_batch={} canary_gate_up={} canary_qkv={} canary_qkvza={} gemv_status={} batch_status={} gate_up_status={} qkv_status={} qkvza_status={} status={} gemv_worst_abs={:.6e} gemv_worst_rel={:.6e} batch_worst_abs={:.6e} batch_worst_rel={:.6e} batch_rel_rms={:.6e} gate_up_rel_rms={:.6e} qkv_rel_rms={:.6e} qkvza_rel_rms={:.6e} bug_rel={:.6e}",
-            fmt.name,
-            fmt.qt,
-            fmt.group_bytes,
-            M,
-            K,
-            gpr,
-            FUSED_N,
-            byte_ok,
-            hdr_ok,
-            gemv_canary_ok,
-            batch_canary_ok,
-            fused_gate_up.canary_ok,
-            fused_qkv.canary_ok,
-            fused_qkvza.canary_ok,
-            gemv_status,
-            batch_status,
-            fused_gate_up.status,
-            fused_qkv.status,
-            fused_qkvza.status,
-            fmt_status,
-            gemv_worst_abs,
-            gemv_worst_rel,
-            batch_worst_abs,
-            batch_worst_rel,
-            batch_rel_rms,
-            fused_gate_up.rel_rms,
-            fused_qkv.rel_rms,
-            fused_qkvza.rel_rms,
-            bug_rel
-        );
-        eprintln!(
-            "  => {} : gemv rel {:.3e} batch rel_rms {:.3e} gate_up {:.3e} qkv {:.3e} qkvza {:.3e} {}",
-            fmt.name,
-            gemv_worst_rel,
-            batch_rel_rms,
-            fused_gate_up.rel_rms,
-            fused_qkv.rel_rms,
-            fused_qkvza.rel_rms,
-            fmt_status
-        );
-        let _ = gemv_got;
+        // ── Partial-tile then full-tile: batch/N ∈ {14, 16} ─────────────────
+        for &n in &SHAPES_N {
+            eprintln!("  -- shape n={n} batch={n} (exact active + 1-f32 canary) --");
+            let x_batch = build_x_batched(K, n, 0xBEEF_CAFE);
+            let x_fused = build_x_batched(K, n, 0xF05E_D000);
+
+            let (batch_worst_abs, batch_worst_rel, batch_rel_rms, batch_canary_ok, batch_status) =
+                run_batched_lmhead(&mut gpu, fmt, &blob, &x_batch, n);
+
+            // Fleet rule: abort first failure. Emit the (fmt,N) row with unrun
+            // ops marked `-` so the failing shape is never lost in an aggregate.
+            if batch_status != "PASS" {
+                println!(
+                    "fmt={} qt={} group_bytes={} m={} k={} gpr={} n={} batch={} byte_ok={} hdr_ok={} canary_gemv={} canary_batch={} canary_residual=false canary_gate_up=false canary_qkv=false canary_qkvza=false gemv_status={} batch_status={} residual_status=- gate_up_status=- qkv_status=- qkvza_status=- status=FAIL gemv_worst_abs={:.6e} gemv_worst_rel={:.6e} batch_worst_abs={:.6e} batch_worst_rel={:.6e} batch_rel_rms={:.6e} residual_rel_rms=inf gate_up_rel_rms=inf qkv_rel_rms=inf qkvza_rel_rms=inf bug_rel={:.6e}",
+                    fmt.name,
+                    fmt.qt,
+                    fmt.group_bytes,
+                    M,
+                    K,
+                    gpr,
+                    n,
+                    n,
+                    byte_ok,
+                    hdr_ok,
+                    gemv_canary_ok,
+                    batch_canary_ok,
+                    gemv_status,
+                    batch_status,
+                    gemv_worst_abs,
+                    gemv_worst_rel,
+                    batch_worst_abs,
+                    batch_worst_rel,
+                    batch_rel_rms,
+                    bug_rel
+                );
+                eprintln!(
+                    "\nmqv2_family_parity: FAIL — abort on first parity failure (fmt={} n={} batch)",
+                    fmt.name, n
+                );
+                return 1;
+            }
+
+            let (residual_rel_rms, residual_canary_ok, residual_status) =
+                run_residual_wmma(&mut gpu, fmt, &blob, &x_batch, n);
+            if residual_status != "PASS" {
+                println!(
+                    "fmt={} qt={} group_bytes={} m={} k={} gpr={} n={} batch={} byte_ok={} hdr_ok={} canary_gemv={} canary_batch={} canary_residual={} canary_gate_up=false canary_qkv=false canary_qkvza=false gemv_status={} batch_status={} residual_status={} gate_up_status=- qkv_status=- qkvza_status=- status=FAIL gemv_worst_abs={:.6e} gemv_worst_rel={:.6e} batch_worst_abs={:.6e} batch_worst_rel={:.6e} batch_rel_rms={:.6e} residual_rel_rms={:.6e} gate_up_rel_rms=inf qkv_rel_rms=inf qkvza_rel_rms=inf bug_rel={:.6e}",
+                    fmt.name,
+                    fmt.qt,
+                    fmt.group_bytes,
+                    M,
+                    K,
+                    gpr,
+                    n,
+                    n,
+                    byte_ok,
+                    hdr_ok,
+                    gemv_canary_ok,
+                    batch_canary_ok,
+                    residual_canary_ok,
+                    gemv_status,
+                    batch_status,
+                    residual_status,
+                    gemv_worst_abs,
+                    gemv_worst_rel,
+                    batch_worst_abs,
+                    batch_worst_rel,
+                    batch_rel_rms,
+                    residual_rel_rms,
+                    bug_rel
+                );
+                eprintln!(
+                    "\nmqv2_family_parity: FAIL — abort on first parity failure (fmt={} n={} residual)",
+                    fmt.name, n
+                );
+                return 1;
+            }
+
+            let fused_gate_up = run_fused_gate_up(&mut gpu, fmt, &x_fused, n);
+            if fused_gate_up.status != "PASS" {
+                println!(
+                    "fmt={} qt={} group_bytes={} m={} k={} gpr={} n={} batch={} byte_ok={} hdr_ok={} canary_gemv={} canary_batch={} canary_residual={} canary_gate_up={} canary_qkv=false canary_qkvza=false gemv_status={} batch_status={} residual_status={} gate_up_status={} qkv_status=- qkvza_status=- status=FAIL gemv_worst_abs={:.6e} gemv_worst_rel={:.6e} batch_worst_abs={:.6e} batch_worst_rel={:.6e} batch_rel_rms={:.6e} residual_rel_rms={:.6e} gate_up_rel_rms={:.6e} qkv_rel_rms=inf qkvza_rel_rms=inf bug_rel={:.6e}",
+                    fmt.name,
+                    fmt.qt,
+                    fmt.group_bytes,
+                    M,
+                    K,
+                    gpr,
+                    n,
+                    n,
+                    byte_ok,
+                    hdr_ok,
+                    gemv_canary_ok,
+                    batch_canary_ok,
+                    residual_canary_ok,
+                    fused_gate_up.canary_ok,
+                    gemv_status,
+                    batch_status,
+                    residual_status,
+                    fused_gate_up.status,
+                    gemv_worst_abs,
+                    gemv_worst_rel,
+                    batch_worst_abs,
+                    batch_worst_rel,
+                    batch_rel_rms,
+                    residual_rel_rms,
+                    fused_gate_up.rel_rms,
+                    bug_rel
+                );
+                eprintln!(
+                    "\nmqv2_family_parity: FAIL — abort on first parity failure (fmt={} n={} gate_up)",
+                    fmt.name, n
+                );
+                return 1;
+            }
+
+            let fused_qkv = run_fused_qkv(&mut gpu, fmt, &x_fused, n);
+            if fused_qkv.status != "PASS" {
+                println!(
+                    "fmt={} qt={} group_bytes={} m={} k={} gpr={} n={} batch={} byte_ok={} hdr_ok={} canary_gemv={} canary_batch={} canary_residual={} canary_gate_up={} canary_qkv={} canary_qkvza=false gemv_status={} batch_status={} residual_status={} gate_up_status={} qkv_status={} qkvza_status=- status=FAIL gemv_worst_abs={:.6e} gemv_worst_rel={:.6e} batch_worst_abs={:.6e} batch_worst_rel={:.6e} batch_rel_rms={:.6e} residual_rel_rms={:.6e} gate_up_rel_rms={:.6e} qkv_rel_rms={:.6e} qkvza_rel_rms=inf bug_rel={:.6e}",
+                    fmt.name,
+                    fmt.qt,
+                    fmt.group_bytes,
+                    M,
+                    K,
+                    gpr,
+                    n,
+                    n,
+                    byte_ok,
+                    hdr_ok,
+                    gemv_canary_ok,
+                    batch_canary_ok,
+                    residual_canary_ok,
+                    fused_gate_up.canary_ok,
+                    fused_qkv.canary_ok,
+                    gemv_status,
+                    batch_status,
+                    residual_status,
+                    fused_gate_up.status,
+                    fused_qkv.status,
+                    gemv_worst_abs,
+                    gemv_worst_rel,
+                    batch_worst_abs,
+                    batch_worst_rel,
+                    batch_rel_rms,
+                    residual_rel_rms,
+                    fused_gate_up.rel_rms,
+                    fused_qkv.rel_rms,
+                    bug_rel
+                );
+                eprintln!(
+                    "\nmqv2_family_parity: FAIL — abort on first parity failure (fmt={} n={} qkv)",
+                    fmt.name, n
+                );
+                return 1;
+            }
+
+            let fused_qkvza = run_fused_qkvza(&mut gpu, fmt, &x_fused, n);
+            if fused_qkvza.status != "PASS" {
+                println!(
+                    "fmt={} qt={} group_bytes={} m={} k={} gpr={} n={} batch={} byte_ok={} hdr_ok={} canary_gemv={} canary_batch={} canary_residual={} canary_gate_up={} canary_qkv={} canary_qkvza={} gemv_status={} batch_status={} residual_status={} gate_up_status={} qkv_status={} qkvza_status={} status=FAIL gemv_worst_abs={:.6e} gemv_worst_rel={:.6e} batch_worst_abs={:.6e} batch_worst_rel={:.6e} batch_rel_rms={:.6e} residual_rel_rms={:.6e} gate_up_rel_rms={:.6e} qkv_rel_rms={:.6e} qkvza_rel_rms={:.6e} bug_rel={:.6e}",
+                    fmt.name,
+                    fmt.qt,
+                    fmt.group_bytes,
+                    M,
+                    K,
+                    gpr,
+                    n,
+                    n,
+                    byte_ok,
+                    hdr_ok,
+                    gemv_canary_ok,
+                    batch_canary_ok,
+                    residual_canary_ok,
+                    fused_gate_up.canary_ok,
+                    fused_qkv.canary_ok,
+                    fused_qkvza.canary_ok,
+                    gemv_status,
+                    batch_status,
+                    residual_status,
+                    fused_gate_up.status,
+                    fused_qkv.status,
+                    fused_qkvza.status,
+                    gemv_worst_abs,
+                    gemv_worst_rel,
+                    batch_worst_abs,
+                    batch_worst_rel,
+                    batch_rel_rms,
+                    residual_rel_rms,
+                    fused_gate_up.rel_rms,
+                    fused_qkv.rel_rms,
+                    fused_qkvza.rel_rms,
+                    bug_rel
+                );
+                eprintln!(
+                    "\nmqv2_family_parity: FAIL — abort on first parity failure (fmt={} n={} qkvza)",
+                    fmt.name, n
+                );
+                return 1;
+            }
+
+            // All ops passed for this (fmt, N).
+            println!(
+                "fmt={} qt={} group_bytes={} m={} k={} gpr={} n={} batch={} byte_ok={} hdr_ok={} canary_gemv={} canary_batch={} canary_residual={} canary_gate_up={} canary_qkv={} canary_qkvza={} gemv_status={} batch_status={} residual_status={} gate_up_status={} qkv_status={} qkvza_status={} status=PASS gemv_worst_abs={:.6e} gemv_worst_rel={:.6e} batch_worst_abs={:.6e} batch_worst_rel={:.6e} batch_rel_rms={:.6e} residual_rel_rms={:.6e} gate_up_rel_rms={:.6e} qkv_rel_rms={:.6e} qkvza_rel_rms={:.6e} bug_rel={:.6e}",
+                fmt.name,
+                fmt.qt,
+                fmt.group_bytes,
+                M,
+                K,
+                gpr,
+                n,
+                n,
+                byte_ok,
+                hdr_ok,
+                gemv_canary_ok,
+                batch_canary_ok,
+                residual_canary_ok,
+                fused_gate_up.canary_ok,
+                fused_qkv.canary_ok,
+                fused_qkvza.canary_ok,
+                gemv_status,
+                batch_status,
+                residual_status,
+                fused_gate_up.status,
+                fused_qkv.status,
+                fused_qkvza.status,
+                gemv_worst_abs,
+                gemv_worst_rel,
+                batch_worst_abs,
+                batch_worst_rel,
+                batch_rel_rms,
+                residual_rel_rms,
+                fused_gate_up.rel_rms,
+                fused_qkv.rel_rms,
+                fused_qkvza.rel_rms,
+                bug_rel
+            );
+            eprintln!(
+                "  => {} n={}: gemv rel {:.3e} batch rel_rms {:.3e} residual {:.3e} gate_up {:.3e} qkv {:.3e} qkvza {:.3e} PASS",
+                fmt.name,
+                n,
+                gemv_worst_rel,
+                batch_rel_rms,
+                residual_rel_rms,
+                fused_gate_up.rel_rms,
+                fused_qkv.rel_rms,
+                fused_qkvza.rel_rms
+            );
+        }
     }
 
-    if overall_fail {
-        eprintln!("\nmqv2_family_parity: FAIL — one or more formats mismatched or unsupported");
-        std::process::exit(1);
-    } else {
-        eprintln!("\nmqv2_family_parity: PASS — all 4 V2 formats: byte count, header divergence, sentinel, plain GEMV B=1, B=16 batched lm-head, and fused prefill WMMA (qkv/qkvza/gate_up @ K=512 N=16) match CPU dequant");
-    }
+    eprintln!(
+        "\nmqv2_family_parity: PASS — all 4 V2 formats: byte count, header divergence, sentinel, plain GEMV B=1, batched lm-head B∈{{14,16}}, residual WMMA N∈{{14,16}}, and fused prefill WMMA (qkv/qkvza/gate_up @ K=512 N∈{{14,16}}) match CPU dequant"
+    );
+    0
 }
