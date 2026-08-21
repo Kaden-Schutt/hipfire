@@ -1865,6 +1865,25 @@ fn finish_qwen35_load(
 
 // ─── Main public API ──────────────────────────────────────────────────
 
+/// gfx11 + gfx12 targets with WMMA-backed DFlash batched lm_head GEMM paths.
+fn is_dflash_lm_head_wmma_arch(gpu_arch: &str) -> bool {
+    matches!(
+        gpu_arch,
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" | "gfx1200" | "gfx1201"
+    )
+}
+
+/// Pre-allocation predicate: whether a target lm_head quant_type is admitted
+/// for DFlash on `gpu_arch`. Always admits qt 3/6/13; admits legacy qt17 and
+/// V2 qt44/47/48/49/50 on the gfx11+gfx12 WMMA set only.
+fn dflash_lm_head_quant_supported(lm_qt: Option<u8>, gpu_arch: &str) -> bool {
+    match lm_qt {
+        Some(3 | 6 | 13) => true,
+        Some(17 | 44 | 47 | 48 | 49 | 50) => is_dflash_lm_head_wmma_arch(gpu_arch),
+        _ => false,
+    }
+}
+
 /// Load a model from an HFQ file (or safetensors directory). This is the
 /// single arch-dispatch point via the carrier registry.
 #[allow(clippy::too_many_arguments)]
@@ -1944,17 +1963,8 @@ pub fn load_model_with_kv_backend(
                 .or_else(|| hfq.tensor_data("model.language_model.embed_tokens.weight"))
                 .or_else(|| hfq.tensor_data("model.embed_tokens.weight"))
                 .map(|(info, _)| info.quant_type);
-            let arch_is_gfx11 = matches!(
-                gpu.arch.as_str(),
-                "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" | "gfx1200" | "gfx1201"
-            );
-            let arch_is_gfx12 = matches!(gpu.arch.as_str(), "gfx1200" | "gfx1201");
-            let supported = match lm_qt {
-                Some(3 | 6 | 13) => true,
-                Some(17) => arch_is_gfx11,
-                Some(44 | 47 | 48 | 49 | 50) => arch_is_gfx12,
-                _ => false,
-            };
+            let arch_is_gfx11 = is_dflash_lm_head_wmma_arch(gpu.arch.as_str());
+            let supported = dflash_lm_head_quant_supported(lm_qt, gpu.arch.as_str());
             if !supported {
                 let qt_desc = match lm_qt {
                     Some(qt) => format!("quant_type={qt}"),
@@ -1964,10 +1974,10 @@ pub fn load_model_with_kv_backend(
                     "DFlash draft requested but target lm_head {} is not \
                      supported by speculative.rs's batched GEMM paths on this arch \
                      ({}). Supported: Q8_0 (qt=3), HFQ4G256 (qt=6), MQ4G256 \
-                     (qt=13) always; MQ3G256 (qt=17) on gfx11; MQ4/6/5/3/2G256V2 \
-                     (qt=44/47/48/49/50) on gfx12. Other dtypes fall through to \
-                     unsupported per-row verification. Reload without a draft or \
-                     use a supported target.",
+                     (qt=13) always; MQ3G256 (qt=17) and MQ4/6/5/3/2G256V2 \
+                     (qt=44/47/48/49/50) on gfx11+gfx12 WMMA. Other dtypes fall \
+                     through to unsupported per-row verification. Reload without \
+                     a draft or use a supported target.",
                     qt_desc, gpu.arch
                 ));
             }
@@ -2121,24 +2131,15 @@ pub fn load_model_with_gemma4_drafter(
                 .or_else(|| hfq.tensor_data("model.language_model.embed_tokens.weight"))
                 .or_else(|| hfq.tensor_data("model.embed_tokens.weight"))
                 .map(|(info, _)| info.quant_type);
-            let arch_is_gfx11 = matches!(
-                gpu.arch.as_str(),
-                "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" | "gfx1200" | "gfx1201"
-            );
-            let arch_is_gfx12 = matches!(gpu.arch.as_str(), "gfx1200" | "gfx1201");
-            let supported = match lm_qt {
-                Some(44 | 47 | 48 | 49 | 50) => arch_is_gfx12,
-                Some(3 | 6 | 13) => true,
-                Some(17) => arch_is_gfx11,
-                _ => false,
-            };
+            let supported = dflash_lm_head_quant_supported(lm_qt, gpu.arch.as_str());
             if !supported {
                 let qt_desc = match lm_qt {
                     Some(qt) => format!("quant_type={qt}"),
                     None => "no lm_head/embed_tokens tensor found".to_string(),
                 };
                 return Err(format!(
-                    "DFlash draft requested but target lm_head {} is not supported ({}).",
+                    "DFlash draft requested but target lm_head {} is not supported \
+                     on gfx11+gfx12 WMMA ({}).",
                     qt_desc, gpu.arch
                 ));
             }
@@ -3675,6 +3676,103 @@ mod registry_tests {
                 want,
                 "generation_early_route({id})"
             );
+        }
+    }
+
+    #[test]
+    fn dflash_lm_head_always_admits_qt3_6_13() {
+        use super::dflash_lm_head_quant_supported;
+        for qt in [3u8, 6, 13] {
+            for arch in [
+                "gfx1030", "gfx1100", "gfx1151", "gfx1200", "gfx1201", "gfx942",
+            ] {
+                assert!(
+                    dflash_lm_head_quant_supported(Some(qt), arch),
+                    "qt={qt} must always be admitted on {arch}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dflash_lm_head_qt17_on_wmma_set_only() {
+        use super::dflash_lm_head_quant_supported;
+        for arch in [
+            "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
+        ] {
+            assert!(
+                dflash_lm_head_quant_supported(Some(17u8), arch),
+                "qt=17 must be admitted on WMMA arch {arch}"
+            );
+        }
+        for arch in ["gfx1030", "gfx942", "gfx1010"] {
+            assert!(
+                !dflash_lm_head_quant_supported(Some(17), arch),
+                "qt=17 must be rejected on non-WMMA arch {arch}"
+            );
+        }
+    }
+
+    #[test]
+    fn dflash_lm_head_v2_admitted_on_gfx11_gfx12_wmma() {
+        use super::dflash_lm_head_quant_supported;
+        let v2 = [44u8, 47, 48, 49, 50];
+        for arch in ["gfx1100", "gfx1151", "gfx1200", "gfx1201"] {
+            for qt in v2 {
+                assert!(
+                    dflash_lm_head_quant_supported(Some(qt), arch),
+                    "V2 qt={qt} must be admitted on {arch}"
+                );
+            }
+        }
+        // Full WMMA set beyond the focused four.
+        for arch in ["gfx1101", "gfx1102", "gfx1150"] {
+            for qt in v2 {
+                assert!(
+                    dflash_lm_head_quant_supported(Some(qt), arch),
+                    "V2 qt={qt} must be admitted on {arch}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dflash_lm_head_v2_rejected_on_gfx1030_and_gfx942() {
+        use super::dflash_lm_head_quant_supported;
+        for arch in ["gfx1030", "gfx942"] {
+            for qt in [44u8, 47, 48, 49, 50] {
+                assert!(
+                    !dflash_lm_head_quant_supported(Some(qt), arch),
+                    "V2 qt={qt} must be rejected on {arch}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dflash_lm_head_rejects_unknown_qt_and_missing() {
+        use super::dflash_lm_head_quant_supported;
+        // qt45 MQ4CG256, legacy MQ2 qt18, F16, missing tensor — all rejected.
+        for qt in [None, Some(18u8), Some(45), Some(16), Some(1)] {
+            for arch in ["gfx1100", "gfx1151", "gfx1200", "gfx1201"] {
+                assert!(
+                    !dflash_lm_head_quant_supported(qt, arch),
+                    "qt={qt:?} must be rejected on {arch}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dflash_lm_head_wmma_arch_set() {
+        use super::is_dflash_lm_head_wmma_arch;
+        for arch in [
+            "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
+        ] {
+            assert!(is_dflash_lm_head_wmma_arch(arch), "{arch}");
+        }
+        for arch in ["gfx1030", "gfx942", "gfx1010", "gfx908"] {
+            assert!(!is_dflash_lm_head_wmma_arch(arch), "{arch}");
         }
     }
 }
