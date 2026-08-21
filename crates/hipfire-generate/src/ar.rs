@@ -829,10 +829,18 @@ pub struct GenerationRouteInputs {
     pub temp: f32,
     pub user_explicit_sampling: bool,
     pub min_p: Option<f32>,
+    /// At least one repeat/presence/frequency penalty is non-neutral. Sampled
+    /// DFlash chain verify does not implement these controls and must use AR.
+    pub nonneutral_penalties: bool,
     pub force_ar_chat: bool,
     pub temp_spec_env_off: bool,
     pub fast_sample_on: bool,
     pub supports_temp_swor: bool,
+    /// Speculator applies faithful top_p/top_k on the sampled chain path
+    /// (DFlash2 candidate-selector). When set, chain routing may engage even
+    /// though [`Self::supports_temp_swor`] is also true; DDTree SWOR leaves
+    /// this false and still refuses user-explicit non-temperature controls.
+    pub supports_chain_nucleus_verify: bool,
     pub kv_adaptive: bool,
 }
 
@@ -912,7 +920,10 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
     // 4. Qwen / LLaMA DFlash/spec (same gates as production generate body).
     // MTP (speculator.name()=="mtp") shares the generic QwenDflash wrapper.
     // Sampled MTP honors temp>0 including user-explicit sampling and min_p
-    // when supports_temp_verify; DFlash keeps its existing SWOR/chain gates.
+    // when supports_temp_verify; DFlash keeps SWOR vs selector-chain gates.
+    // Selector-chain nucleus may share supports_temp_swor with DDTree SWOR but
+    // still takes the sampled chain route (user-explicit top_p/top_k allowed;
+    // min_p>0 still blocked — DFlash ignores min_p).
     let caps = hipfire_loader::carrier_for(i.arch_id)
         .map(|c| c.caps())
         .unwrap_or_default();
@@ -920,14 +931,16 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
     let ddtree_swor_route = !i.speculator_is_mtp
         && i.temp > 1e-6
         && i.supports_temp_swor
+        && !i.supports_chain_nucleus_verify
         && !i.user_explicit_sampling
         && !i.temp_spec_env_off;
     let chain_sample_route = !i.speculator_is_mtp
         && i.temp > 1e-6
-        && !i.supports_temp_swor
+        && (!i.supports_temp_swor || i.supports_chain_nucleus_verify)
         && i.ngram_can_sample
         && i.fast_sample_on
         && !dflash_min_p_present
+        && !i.nonneutral_penalties
         && !i.temp_spec_env_off;
     let mtp_sample_route = i.speculator_is_mtp && i.temp > 1e-6 && i.supports_temp_swor;
     let qwen_dflash_route = caps.is_qwen_dflash()
@@ -1044,6 +1057,10 @@ pub fn generate(
         .speculator
         .as_ref()
         .is_some_and(|s| s.supports_temp_verify());
+    let supports_chain_nucleus_verify = m
+        .speculator
+        .as_ref()
+        .is_some_and(|s| s.supports_chain_nucleus_verify());
     let route_inputs = GenerationRouteInputs {
         arch_id: m.arch_id,
         ep: m.ep.is_some(),
@@ -1055,10 +1072,14 @@ pub fn generate(
         temp,
         user_explicit_sampling,
         min_p,
+        nonneutral_penalties: repeat_penalty != 1.0
+            || presence_penalty != 0.0
+            || frequency_penalty != 0.0,
         force_ar_chat: std::env::var("HIPFIRE_DFLASH_CHAT").ok().as_deref() == Some("0"),
         temp_spec_env_off: std::env::var("HIPFIRE_DFLASH_TEMP_SPEC").ok().as_deref() == Some("0"),
         fast_sample_on: hipfire_runtime::config::get().dflash_fast_sample,
         supports_temp_swor,
+        supports_chain_nucleus_verify,
         kv_adaptive: m.kv_adaptive.is_some(),
     };
     let selected_route = select_generation_route(&route_inputs);
@@ -1754,12 +1775,21 @@ pub fn generate(
             {
                 let reason = if route_inputs.temp_spec_env_off {
                     "HIPFIRE_DFLASH_TEMP_SPEC=0"
-                } else if route_inputs.supports_temp_swor && user_explicit_sampling {
-                    "request set an explicit top_p/top_k/min_p/penalty (ddtree SWOR verify honors temperature only); AR applies them"
                 } else if min_p.map(|p| p > 0.0).unwrap_or(false) {
+                    // Prefer min_p over SWOR-only: selector-chain honors top_p/top_k
+                    // but still falls to AR when min_p>0 (DFlash ignores min_p).
                     "request set min_p (sampled DFlash honors top_p/top_k only); AR applies it"
+                } else if route_inputs.nonneutral_penalties {
+                    "request set a non-neutral repeat/presence/frequency penalty; AR applies it"
+                } else if route_inputs.supports_temp_swor
+                    && !route_inputs.supports_chain_nucleus_verify
+                    && user_explicit_sampling
+                {
+                    "request set an explicit top_p/top_k/min_p/penalty (ddtree SWOR verify honors temperature only); AR applies them"
                 } else if !ngram_can_sample {
                     "loaded drafter is greedy-only (MTP/n-gram); temp>0 runs AR"
+                } else if route_inputs.supports_chain_nucleus_verify {
+                    "sampled DFlash chain nucleus not engaged (check HIPFIRE_FAST_SAMPLE / temp-spec gates)"
                 } else {
                     "ddtree SWOR verify not active (needs ddtree_budget>0)"
                 };

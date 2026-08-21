@@ -809,6 +809,13 @@ impl Speculator for DflashSpeculator {
         self.df.ddtree.is_some() || self.df.draft_weights.has_candidate_selector()
     }
 
+    /// Faithful top_p/top_k nucleus only on the DFlash2 candidate-selector chain.
+    /// DDTree SWOR returns false so route selection still blocks user-explicit
+    /// non-temperature controls for the tree path.
+    fn supports_chain_nucleus_verify(&self) -> bool {
+        self.df.draft_weights.has_candidate_selector()
+    }
+
     fn step(
         &mut self,
         gpu: &mut Gpu,

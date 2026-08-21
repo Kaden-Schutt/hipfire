@@ -194,10 +194,12 @@ use hipfire_engine::terminal::*;
             temp: 0.1,
             user_explicit_sampling: false,
             min_p: None,
+            nonneutral_penalties: false,
             force_ar_chat: false,
             temp_spec_env_off: false,
             fast_sample_on: true,
             supports_temp_swor: false,
+            supports_chain_nucleus_verify: false,
             kv_adaptive: false,
         };
         assert_eq!(

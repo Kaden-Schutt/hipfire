@@ -672,8 +672,20 @@ pub trait Speculator {
     /// daemon may route temp>0 requests through it for the spec speedup). Default
     /// `false` — greedy-only drafters (n-gram, chain DFlash, MTP) keep temp>0 on
     /// the AR sampler. The qwen35 DFlash ddtree path overrides this to `true`
-    /// (its SWOR verify samples the target distribution exactly).
+    /// (its SWOR verify samples the target distribution exactly). DFlash2
+    /// selector-chain also returns `true` here, but route selection must consult
+    /// [`Self::supports_chain_nucleus_verify`] to allow user-explicit top_p/top_k
+    /// (SWOR is temperature-only; selector-chain nucleus is not).
     fn supports_temp_verify(&self) -> bool {
+        false
+    }
+
+    /// Whether chain-mode verify faithfully applies user-explicit top_p/top_k
+    /// nucleus sampling (DFlash2 candidate-selector rejection sampling).
+    /// Distinct from [`Self::supports_temp_verify`]: that flag is also true for
+    /// DDTree SWOR, which honors temperature only and must refuse non-temperature
+    /// controls at the route gate. Default `false`.
+    fn supports_chain_nucleus_verify(&self) -> bool {
         false
     }
 
