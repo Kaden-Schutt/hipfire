@@ -3,8 +3,8 @@
 //! [`DsparkBody`]. Everything else (main_proj ingest, markov head, confidence
 //! head, window orchestration) lives here.
 use crate::spec::{
-    accept_greedy_prefix, MtpDrafter, MtpSpeculator, MtpWindow, SpecGrammar, SpecScratch,
-    SpecTarget, Speculator,
+    accept_greedy_prefix, MtpDrafter, MtpSpeculator, MtpWindow, SpecGrammar, SpecRequestConfig,
+    SpecScratch, SpecTarget, Speculator,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -1143,9 +1143,11 @@ impl MtpDrafter for DsparkDrafter {
         &mut self,
         gpu: &mut Gpu,
         target: &mut dyn SpecTarget,
+        _prompt_tokens: &[u32],
         fill_tokens: &[u32],
         start_pos: usize,
         cache_hit: bool,
+        abort: &dyn Fn() -> bool,
     ) -> Result<u32, String> {
         if !cache_hit {
             target.reset_recurrent(gpu)?;
@@ -1176,7 +1178,6 @@ impl MtpDrafter for DsparkDrafter {
         // Run the full prefill through spec_advance (reset=false; recurrent was
         // already reset above on cache_miss). Returns argmax at the last position,
         // which is the seed for the first decode window.
-        let abort = &|| false;
         match target.spec_advance(gpu, fill_tokens, start_pos, false, abort, None)? {
             crate::spec::SpecAdvance::Ready { last_argmax, .. } => Ok(last_argmax),
             crate::spec::SpecAdvance::Aborted => {
@@ -1191,6 +1192,7 @@ impl MtpDrafter for DsparkDrafter {
         target: &mut dyn SpecTarget,
         position: usize,
         seed: u32,
+        _emitted: &[u32],
         k: usize,
         eos: u32,
         _grammar: Option<&mut dyn SpecGrammar>,
@@ -1700,11 +1702,13 @@ impl MtpDrafter for DsparkDrafter {
     // ==false; returning true here would mislabel DSpark as SWOR and drop the
     // nucleus controls.
 
-    fn set_sampling(&mut self, temp: f32, top_p: f32, top_k: usize, cactus_delta: f32) {
-        self.temp = temp;
-        self.top_p = top_p;
-        self.top_k = top_k;
-        self.cactus = cactus_delta;
+    fn configure_request(&mut self, cfg: SpecRequestConfig) {
+        // Store the same temp/top_p/top_k/cactus values as before. New
+        // SpecRequestConfig fields (min_p / rng_seed / ngram) are ignored.
+        self.temp = cfg.temp;
+        self.top_p = cfg.top_p;
+        self.top_k = cfg.top_k;
+        self.cactus = cfg.cactus_delta;
     }
 }
 

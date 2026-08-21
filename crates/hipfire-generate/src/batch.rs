@@ -126,9 +126,7 @@ pub fn is_batch_request_eligible(
         ep: m.ep.is_some(),
         pp: m.pp,
         has_speculator: has_spec,
-        qwen_mtp_head: m.state.as_ref().and_then(|s| (s.as_ref() as &dyn std::any::Any).downcast_ref::<hipfire_arch_qwen35::Qwen35Bundle>()).map_or(false, |b| b.qwen35_mtp_head.is_some()),
-        qwen_mtp_opt_in: std::env::var("HIPFIRE_QWEN_MTP").ok().as_deref() == Some("1"),
-        mtp_sampled_on: std::env::var("HIPFIRE_MTP_SAMPLED").ok().as_deref() == Some("1"),
+        speculator_is_mtp: m.speculator.as_ref().is_some_and(|s| s.name() == "mtp"),
         deepseek4_spec_requested: false,
         ngram_can_sample,
         temp: sampling.temp,
@@ -2444,9 +2442,7 @@ pub fn is_qwen_ep_batch_request_eligible(
         ep: false,
         pp: m.pp,
         has_speculator: m.speculator.is_some(),
-        qwen_mtp_head: m.state.as_ref().and_then(|s| (s.as_ref() as &dyn std::any::Any).downcast_ref::<hipfire_arch_qwen35::Qwen35Bundle>()).map_or(false, |b| b.qwen35_mtp_head.is_some()),
-        qwen_mtp_opt_in: std::env::var("HIPFIRE_QWEN_MTP").ok().as_deref() == Some("1"),
-        mtp_sampled_on: std::env::var("HIPFIRE_MTP_SAMPLED").ok().as_deref() == Some("1"),
+        speculator_is_mtp: m.speculator.as_ref().is_some_and(|s| s.name() == "mtp"),
         deepseek4_spec_requested: false,
         ngram_can_sample: m
             .speculator

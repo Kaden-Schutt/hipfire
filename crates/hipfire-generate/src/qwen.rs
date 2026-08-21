@@ -3,8 +3,8 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Qwen3.5/3.6 family generation — extracted from daemon.rs (D3, wave 5).
-//! Verbatim move of generate_multi, generate_ep, generate_spec, generate_qwen35_mtp, generate_dflash
-//! plus their exclusive EP/cache/MTP helpers. No logic changes.
+//! Verbatim move of generate_multi, generate_ep, generate_spec, generate_dflash
+//! plus their exclusive EP/cache helpers. No logic changes.
 
 use base64::Engine;
 use hipfire_arch_cohere2moe as cohere2moe;
@@ -22,9 +22,6 @@ use hipfire_arch_qwen2::qwen2;
 use hipfire_arch_qwen35::qwen35;
 use hipfire_arch_qwen35::speculative;
 use std::any::Any;
-// Used by generate_qwen35_mtp (native-MTP serve path, merged from spec-graph):
-// it manually re-packs the Qwen35 bundle on every exit + re-opens the HFQ mmap.
-use hipfire_arch_qwen35::Qwen35Bundle;
 use hipfire_arch_qwen35_vl::image;
 use hipfire_arch_qwen35_vl::qwen35_vl;
 use hipfire_runtime::emit_text::{
@@ -32,13 +29,10 @@ use hipfire_runtime::emit_text::{
     ToolOutputRouter, ToolRouteError, ToolRouteEvent,
 };
 use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
-use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama;
 use hipfire_runtime::prompt_frame::ThinkMode;
 use hipfire_runtime::sampler::{self, SamplerConfig};
-use hipfire_runtime::spec::accept_greedy_prefix;
 use std::io::{BufRead, Write};
-use std::path::Path;
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -50,7 +44,7 @@ use hipfire_engine::terminal::*;
 use hipfire_loader::{AsstTurnCache, EpArch, EpState, Eviction, LoadedModel};
 use hipfire_runtime::spec::{
     ClientEvent, EmitOutcome, EvictRetain, FinishSummary, PrefillOutcome, SpecAdvance, SpecEmit,
-    SpecTarget, Speculator, StopReason,
+    SpecRequestConfig, SpecTarget, Speculator, StopReason,
 };
 
 use crate::common::*;
@@ -1450,15 +1444,9 @@ pub fn generate_dflash(
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
     stop: &[String],
     // Request-resolved sampling temperature. 0.0 → greedy/argmax-accept (the
-    // historical DFlash posture). >0 → distribution-preserving spec decode via
-    // one of two verify mechanisms inside `DflashSpeculator::step`, picked by how
-    // the drafter loaded:
-    //   * ddtree mode — SWOR tree-verify, fed the `temp` arg directly; honors
-    //     temperature ONLY (the caller routes an explicit top_p/top_k/min_p to AR).
-    //   * chain mode — lossless rejection sampling (full-vocab softmax on BOTH
-    //     draft + target), fed the top_p/top_k/cactus args below via
-    //     `Speculator::set_sampling` (see the set_sampling call). Honors
-    //     temp+top_p+top_k; min_p is NOT plumbed (a min_p request routes to AR).
+    // historical DFlash posture). >0 → distribution-preserving spec decode.
+    // MTP (name=="mtp") honors temp>0 including user-explicit sampling and min_p
+    // via SpecRequestConfig; DFlash still ignores min_p (those requests stay AR).
     temp: f32,
     // Nucleus (top_p) cutoff for the chain rejection-sampling path, applied
     // IDENTICALLY to both draft + target softmaxes (lossless == AR at this top_p).
@@ -1468,6 +1456,9 @@ pub fn generate_dflash(
     // sampled path, applied to both draft + target softmax rows. 0 = disabled.
     // Ignored by the ddtree SWOR arm.
     top_k: usize,
+    // Min-p floor. 0.0 disables. Installed on SpecRequestConfig for MTP;
+    // DFlash route selection still sends min_p requests to AR.
+    min_p: f32,
     // Cactus-style acceptance bump. 0.0 → lossless (distribution-preserving).
     // >0 → deliberately lossy (KL-bounded τ-for-correctness tradeoff). The
     // daemon hardcodes 0.0; the param exists only so a future opt-in request
@@ -1481,7 +1472,7 @@ pub fn generate_dflash(
     // so the caller must fall through to the arch's AR path. Every other exit
     // (success, abort, error) has already written its envelope → true.
 ) -> bool {
-    // Zero-budget reject before Jinja/render, set_sampling, gen_start, or any
+    // Zero-budget reject before Jinja/render, configure_request, gen_start, or any
     // GPU/host mutation. Handled (true) so the caller does not fall through to AR.
     // Inner generate_spec keeps the same guard as defense-in-depth.
     if max_tokens == 0 {
@@ -1497,6 +1488,8 @@ pub fn generate_dflash(
         return true;
     }
 
+    let spec_name = m.speculator.as_ref().map(|s| s.name()).unwrap_or("");
+
     // Adaptive KV has no maybe_downshift on the generic spec path. Fail closed
     // rather than run DSpark/DFlash/ngram past floor-reserved capacity. The
     // error envelope is written here, so this counts as handled (true) — the
@@ -1505,7 +1498,7 @@ pub fn generate_dflash(
         emit_active_attempt_error(
             stdout,
             Some(id),
-            "kv_adaptive cannot use generic speculative decode (DFlash/DSpark/n-gram); use AR or native MTP",
+            "kv_adaptive cannot use generic speculative decode (DFlash/DSpark/MTP/n-gram); use AR",
             "validation",
             false,
             false
@@ -1661,9 +1654,10 @@ pub fn generate_dflash(
             stdout,
             id,
             &format!(
-                "prompt={} + max_tokens={} exceeds DFlash draft ctx capacity {} — falling back to AR (identical output, slower; raise HIPFIRE_DFLASH_CTX_CAP to re-enable spec)",
+                "prompt={} + max_tokens={} exceeds {} draft ctx capacity {} — falling back to AR (identical output, slower; raise HIPFIRE_DFLASH_CTX_CAP to re-enable spec)",
                 prompt_tokens.len(),
                 max_tokens,
+                if spec_name == "mtp" { "MTP" } else { "DFlash" },
                 spec_ctx_capacity
             ),
         );
@@ -1798,7 +1792,7 @@ pub fn generate_dflash(
                 cache_eligible,
                 &dflash_ckpt_positions,
                 dflash_resume_enabled,
-                "dflash-jinja",
+                if spec_name == "mtp" { "mtp-jinja" } else { "dflash-jinja" },
             ))
         } else {
             None
@@ -1869,14 +1863,22 @@ pub fn generate_dflash(
     // envelope). A future ds4 wrapper (Phase 4 T4c-2) builds its DSML render +
     // ds4 cache plan + `EmitSpec::Deepseek4` and writes its own ds4 `done`.
     //
-    // Thread the request's sampling into the speculator BEFORE the step loop so
-    // `DflashSpeculator::step` runs lossless rejection sampling at temp>0 instead
-    // of decoding greedy (the #477-merge re-wire of spec-graph's sampled-DFlash).
-    // Greedy (temp 0) is unchanged. No-op for a greedy-only Speculator impl; the
-    // deepseek4 spec wrapper (`generate_deepseek4_spec`) deliberately never calls
-    // this, so ds4 MTP stays greedy. cactus_delta is 0.0 (lossless) from here.
+    // Thread the request's sampling into the speculator BEFORE the step loop.
+    // SpecRequestConfig is installed once; greedy (temp 0) is unchanged.
+    // ngram-mod is greedy MTP only: env opt-in, thinking off (`max_think_tokens==1`).
     if let Some(spec) = m.speculator.as_mut() {
-        spec.set_sampling(temp, top_p, top_k, cactus_delta);
+        spec.configure_request(SpecRequestConfig {
+            temp,
+            top_p,
+            top_k,
+            min_p,
+            cactus_delta,
+            rng_seed: 0x13579BDF,
+            allow_ngram_modifier: spec_name == "mtp"
+                && std::env::var("HIPFIRE_MTP_NGRAM").ok().as_deref() == Some("1")
+                && temp <= 1e-6
+                && max_think_tokens == 1,
+        });
     }
     let prefill_tokens_full = prefill_tokens.len();
     // The Jinja prompt can open `<think>` without emitting that token during
@@ -2070,6 +2072,45 @@ pub fn generate_dflash(
                     finish_reason,
                     active_attempt_id(),
                 );
+                if spec_name == "mtp" {
+                    if let Some(obj) = pending_done.as_object_mut() {
+                        obj.remove("dflash");
+                        obj.insert("mtp".to_string(), serde_json::json!(true));
+                        if let Some(stats) = m.speculator.as_ref().map(|s| s.request_stats()) {
+                            if stats.mtp_ngram {
+                                obj.insert("mtp_ngram".into(), serde_json::json!(true));
+                                obj.insert(
+                                    "ngram_mod_windows".into(),
+                                    serde_json::json!(stats.ngram_mod_windows),
+                                );
+                                obj.insert(
+                                    "ngram_mod_drafts".into(),
+                                    serde_json::json!(stats.ngram_mod_drafts),
+                                );
+                                obj.insert(
+                                    "ngram_mod_accepted".into(),
+                                    serde_json::json!(stats.ngram_mod_accepted),
+                                );
+                                obj.insert(
+                                    "ngram_mod_accept_rate".into(),
+                                    serde_json::json!(stats.ngram_mod_accept_rate),
+                                );
+                                obj.insert(
+                                    "mtp_windows".into(),
+                                    serde_json::json!(stats.mtp_windows),
+                                );
+                                obj.insert(
+                                    "ar_windows".into(),
+                                    serde_json::json!(stats.ar_windows),
+                                );
+                                obj.insert(
+                                    "mtp_retired".into(),
+                                    serde_json::json!(stats.mtp_retired),
+                                );
+                            }
+                        }
+                    }
+                }
                 if let Some((reason, alpha)) = pflash {
                     pending_done["pflash"] = serde_json::json!({
                         "bypass_reason": reason,
@@ -2205,6 +2246,45 @@ pub fn generate_dflash(
             "finish_reason": finish_reason,
             "attempt_id": active_attempt_id(),
         });
+        if spec_name == "mtp" {
+            if let Some(obj) = pending_done.as_object_mut() {
+                obj.remove("dflash");
+                obj.insert("mtp".to_string(), serde_json::json!(true));
+                if let Some(stats) = m.speculator.as_ref().map(|s| s.request_stats()) {
+                    if stats.mtp_ngram {
+                        obj.insert("mtp_ngram".into(), serde_json::json!(true));
+                        obj.insert(
+                            "ngram_mod_windows".into(),
+                            serde_json::json!(stats.ngram_mod_windows),
+                        );
+                        obj.insert(
+                            "ngram_mod_drafts".into(),
+                            serde_json::json!(stats.ngram_mod_drafts),
+                        );
+                        obj.insert(
+                            "ngram_mod_accepted".into(),
+                            serde_json::json!(stats.ngram_mod_accepted),
+                        );
+                        obj.insert(
+                            "ngram_mod_accept_rate".into(),
+                            serde_json::json!(stats.ngram_mod_accept_rate),
+                        );
+                        obj.insert(
+                            "mtp_windows".into(),
+                            serde_json::json!(stats.mtp_windows),
+                        );
+                        obj.insert(
+                            "ar_windows".into(),
+                            serde_json::json!(stats.ar_windows),
+                        );
+                        obj.insert(
+                            "mtp_retired".into(),
+                            serde_json::json!(stats.mtp_retired),
+                        );
+                    }
+                }
+            }
+        }
         if !pflash_done_field.is_empty() {
             let padded = format!("{{{}}}", pflash_done_field.trim_start_matches(','));
             if let Ok(serde_json::Value::Object(map)) =
@@ -2311,7 +2391,7 @@ pub fn generate_spec(
         emit_active_attempt_error(
             stdout,
             Some(id),
-            "kv_adaptive cannot use generic speculative decode (DFlash/DSpark/n-gram); use AR or native MTP",
+            "kv_adaptive cannot use generic speculative decode (DFlash/DSpark/MTP/n-gram); use AR",
             "validation",
             false,
             false
@@ -3052,7 +3132,11 @@ pub fn generate_spec(
                 .reset_recurrent(gpu)
                 .err()
                 .map(|e| format!("reset_recurrent: {e}"))
-                .or_else(|| spec.reset(gpu).err().map(|e| format!("spec.reset: {e}")));
+                .or_else(|| {
+                    spec.reset_for_realign(gpu)
+                        .err()
+                        .map(|e| format!("spec.reset_for_realign: {e}"))
+                });
             if let Some(msg) = reset_error {
                 let ep = production_fail_closed_rollback_live(
                     &mut m.seq_pos,
@@ -3510,1266 +3594,6 @@ pub fn attach_mtp_window_timings(
     }
 }
 
-/// Qwen3.5/3.6 native-MTP (NextN) speculative decode serve path.
-///
-/// Analog of [`generate_deepseek4`]'s spec branch and [`generate_dflash`], but
-/// drafts via the Qwen MTP head ([`hipfire_arch_qwen35::mtp_spec`]) instead of
-/// the diffusion drafter. The proven-durable config (27B-3.6 genre sweep, all
-/// genres ≥1.15× AR, lossless): K=3, p_min=0.4, compressed-serial.
-///
-/// Call sequence (mirrors `mtp_only_demo`):
-///   1. cold-reset trunk DeltaNet/KV (v1 is single-turn — no LCP cache),
-///   2. `prefill_trunk_and_mtp_cache_with_boundary` (chunked ≤ PREFILL_MAX_BATCH
-///      trunk+MTP fill; adaptive `maybe_downshift` at each committed boundary),
-///   3. seed token = trunk argmax at the last prefill position,
-///   4. loop `spec_step_mtp_compressed_serial` (the production path), committing
-///      `result.committed` and advancing `cur_pos += result.advance` each cycle,
-///      then adaptive downshift at the new committed trunk position.
-///
-/// Fail-closed: prefill/spec HipResult and adaptive transition errors free MTP
-/// state, restore the Qwen35 bundle, emit a request error, and never emit a
-/// token after a failed KV commit. Adaptive poison stays sticky on `m.kv_adaptive`.
-///
-/// Per-request lifecycle (state-bleed guard, the serve-multiturn class): the
-/// `MtpSpecState` (which owns the trunk DN snapshot + the MTP-private KV cache)
-/// is allocated FRESH at the top of this function and freed at EVERY exit — so
-/// no recurrent MTP state survives between requests. The trunk's persistent DN
-/// state lives in the bundle and is cold-zeroed at the start of each request
-/// (mirrors `generate_dflash`'s `!cache_hit` reset). The MTP head itself is
-/// persistent (loaded once on `Qwen35Bundle.qwen35_mtp_head`).
-///
-/// Gated behind opt-in: this is only reached when `HIPFIRE_QWEN_MTP=1` AND the
-/// head is present (see the dispatch site in `generate`), so the DEFAULT serve
-/// path (DFlash/AR) is unchanged.
-#[allow(clippy::too_many_arguments)]
-pub fn generate_qwen35_mtp(
-    m: &mut LoadedModel,
-    gpu: &mut rdna_compute::Gpu,
-    stdout: &mut std::io::Stdout,
-    id: &str,
-    prompt: &str,
-    system_prompt: Option<&str>,
-    max_tokens: usize,
-    max_think_tokens: usize,
-    assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
-    tools: Option<&[serde_json::Value]>,
-    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
-    stop: &[String],
-    // Request-resolved temp. 0.0 → greedy/argmax-match (p_min confidence cutoff
-    // applies). >0 → lossless residual-acceptance sampling (set_sampling below;
-    // mutually exclusive with p_min). Reached with temp>0 only when the dispatch
-    // gate saw HIPFIRE_MTP_SAMPLED=1 and a temp+top_p-only request.
-    temp: f32,
-    // Nucleus (top_p) cutoff for the sampled MTP path. Applied to BOTH draft +
-    // target nuclei (independent per-side truncation → lossless == AR-at-top_p).
-    // Ignored on the greedy path. <= 0.0 is treated as disabled (1.0).
-    top_p: f32,
-    // Top-k cutoff for the sampled MTP path (request- or card-recommended; e.g.
-    // qwen3.6 A3B ships top_k=20). Applied to BOTH draft + target nuclei
-    // alongside top_p, so it stays lossless == AR-at-(top_k,top_p). None / 0 →
-    // disabled (top_p-only). Ignored on the greedy path.
-    top_k: Option<u32>,
-    // Nucleus min-prob floor for the sampled MTP path: keep tokens with prob >=
-    // min_p * max_prob, folded into the GPU kernel's tau alongside top_p/top_k and
-    // applied to BOTH draft + target nuclei → lossless == AR-at-(min_p,top_k,top_p).
-    // 0.0 = disabled. Ignored on the greedy path.
-    min_p: f32,
-    reasoning_effort: Option<&str>,
-    enable_thinking: bool,
-) {
-    use hipfire_arch_qwen35::mtp_head::MtpKvMode;
-    use hipfire_arch_qwen35::mtp_spec::{self, MtpSpecState};
-    use hipfire_arch_qwen35::speculative::{ModelSlot, ModelSlotConfig};
-    use hipfire_runtime::ngram_mod::{NgramModConfig, NgramModPool};
-
-    // Adaptive poison is sticky until unload. Fail at preflight — never
-    // reset_with_cache or clear poison on a poisoned controller.
-    if let Some(ad) = m.kv_adaptive.as_ref() {
-        if ad.is_poisoned() {
-            let reason = ad
-                .poison_reason()
-                .unwrap_or("adaptive KV is poisoned; unload/reload required");
-            emit_error_with_id(stdout, id, reason);
-            return;
-        }
-    }
-
-    // ── Resolve the proven-durable MTP config + ngram-mod env controls ─
-    // Ordinary MTP draft depth (proposal-buffer / with_k budget). Kept as
-    // `mtp_k` so a larger verify capacity never inflates native MTP depth.
-    // p_min defaults to 0.4. Both env-overridable so the GPU-validation thread
-    // can sweep. `set_p_min(0.4)` is applied below unconditionally (the
-    // MtpSpecState::new default p_min is arch-derived; we pin the proven value
-    // for the serve path and let HIPFIRE_MTP_P_MIN win).
-    let mtp_k: usize = Some(hipfire_runtime::config::get().mtp_k)
-        .filter(|k| (1..=8).contains(k))
-        .unwrap_or(3);
-    // Upstream-style long-gated ngram-mod: opt-in only for greedy non-thinking
-    // requests. The request contract uses `max_think_tokens == 1` as the
-    // explicit no-thinking sentinel; zero means uncapped thinking.
-    let mtp_ngram_raw = std::env::var("HIPFIRE_MTP_NGRAM").ok().as_deref() == Some("1");
-    let n_match: usize = std::env::var("HIPFIRE_NGRAM_MOD_N_MATCH")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(24);
-    let n_min: usize = std::env::var("HIPFIRE_NGRAM_MOD_N_MIN")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(48);
-    let n_max: usize = std::env::var("HIPFIRE_NGRAM_MOD_N_MAX")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(64);
-    // Validation: max<=64 and min<=max (plus non-zero). Invalid config leaves
-    // legacy path; valid config arms ngram-mod.
-    let ngram_mod_config_valid = n_max <= 64 && n_max >= 1 && n_match >= 1 && n_min <= n_max;
-    let ngram_mod_armed =
-        mtp_ngram_raw && temp <= 1e-6 && max_think_tokens == 1 && ngram_mod_config_valid;
-    let verify_capacity: usize = if ngram_mod_armed {
-        mtp_k.max(n_max)
-    } else {
-        mtp_k
-    };
-    // Lazily create or replace model-lifetime shared pool on config mismatch.
-    // Clone Arc for request-local use; lock is never held over GPU work.
-    let ngram_mod_pool: Option<Arc<Mutex<NgramModPool>>> = if ngram_mod_armed {
-        let cfg = NgramModConfig {
-            capacity: 1 << 22,
-            n_match,
-            n_min,
-            n_max,
-        };
-        let needs_new = match m.ngram_mod_pool.as_ref() {
-            None => true,
-            Some(existing) => {
-                let guard = existing.lock().unwrap();
-                guard.config() != &cfg
-            }
-        };
-        if needs_new {
-            match NgramModPool::new(cfg) {
-                Ok(pool) => {
-                    let arc = Arc::new(Mutex::new(pool));
-                    m.ngram_mod_pool = Some(arc.clone());
-                    Some(arc)
-                }
-                Err(_) => None,
-            }
-        } else {
-            Some(m.ngram_mod_pool.as_ref().unwrap().clone())
-        }
-    } else {
-        None
-    };
-    let mtp_ngram = ngram_mod_pool.is_some();
-    let p_min: f32 = std::env::var("HIPFIRE_MTP_P_MIN")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .filter(|p: &f32| (0.0..=1.0).contains(p))
-        .unwrap_or(0.4);
-
-    let tokenizer = match m.tokenizer.as_ref() {
-        Some(t) => t,
-        None => {
-            emit_error_with_id(stdout, id, "tokenizer not loaded");
-            return;
-        }
-    };
-
-    // ── Prompt build (ChatML / jinja, same two-path branch as DFlash) ───
-    let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
-    let try_jinja = jinja_enabled && m.chat_template.is_some();
-    // Request flag seeds Plain fallback only. Successful Jinja owns the
-    // generation suffix — derive initial think from the rendered tail.
-    let mut started_in_think = matches!(
-        assistant_prefix,
-        hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
-    );
-    let prompt_tokens: Vec<u32> = if try_jinja {
-        let template = m.chat_template.as_ref().unwrap();
-        let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
-            tokenizer,
-            template,
-            system: system_prompt,
-            user: prompt,
-            enable_thinking,
-            bos_token: None,
-            reasoning_strength: None,
-            reasoning_effort,
-        };
-        let render_result = if tools.is_some() || messages_history.is_some() {
-            let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
-            let messages_slice: &[hipfire_runtime::prompt_frame::Message] = match messages_history {
-                Some(h) => h,
-                None => {
-                    let mut v = Vec::new();
-                    if let Some(sys) = system_prompt {
-                        v.push(hipfire_runtime::prompt_frame::Message {
-                            role: hipfire_runtime::prompt_frame::Role::System,
-                            content: sys.to_string(),
-                            reasoning_content: None,
-                            name: None,
-                            rendered_name: None,
-                            tool_calls: Vec::new(),
-                            tool_call_id: None,
-                            tool_plan: String::new(),
-                        });
-                    }
-                    v.push(hipfire_runtime::prompt_frame::Message {
-                        role: hipfire_runtime::prompt_frame::Role::User,
-                        content: prompt.to_string(),
-                        reasoning_content: None,
-                        name: None,
-                        rendered_name: None,
-                        tool_calls: Vec::new(),
-                        tool_call_id: None,
-                        tool_plan: String::new(),
-                    });
-                    synthesized = v;
-                    &synthesized
-                }
-            };
-            frame.render_messages(messages_slice, tools, None)
-        } else {
-            frame.render()
-        };
-        match render_result {
-            Ok(rendered) => {
-                started_in_think = render_tail_opens_think(&rendered);
-                tokenizer.encode(&rendered)
-            }
-            Err(e) => {
-                if reasoning_effort.is_some() {
-                    emit_active_attempt_error(
-                        stdout,
-                        Some(id),
-                        &format!("MTP jinja render: {e}"),
-                        "validation",
-                        false,
-                        false,
-                    );
-                    let _ = stdout.flush();
-                    return;
-                }
-                eprintln!("[daemon] jinja render failed in mtp path ({e}) — falling back to Plain");
-                hipfire_runtime::prompt_frame::ChatFrame {
-                    tokenizer,
-                    system: system_prompt,
-                    user: prompt,
-                    assistant_prefix,
-                    raw: false,
-                }
-                .build()
-            }
-        }
-    } else {
-        hipfire_runtime::prompt_frame::ChatFrame {
-            tokenizer,
-            system: system_prompt,
-            user: prompt,
-            assistant_prefix,
-            raw: false,
-        }
-        .build()
-    };
-
-    if prompt_tokens.is_empty() {
-        emit_error_with_id(stdout, id, "empty prompt after tokenize");
-        return;
-    }
-
-    let im_end = tokenizer.encode("<|im_end|>");
-    let im_end_token = if im_end.len() == 1 {
-        Some(im_end[0])
-    } else {
-        None
-    };
-
-    // ── Cold-reset the trunk recurrent state (v1 = single-turn) ─────────
-    // Like generate_dflash's !cache_hit branch: zero the bundle's DeltaNet
-    // recurrent state + reset the KV write head so a fresh prompt prefills
-    // from position 0 over clean buffers. (No LCP prompt-cache in v1.)
-    m.seq_pos = 0;
-    m.conversation_tokens.clear();
-    if let Some(b) = m.state.as_mut().and_then(|s| {
-        (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
-    }) {
-        let dn = &b.dn_state;
-        for s in &dn.s_matrices {
-            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-        }
-        for s in &dn.s_scales {
-            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-        }
-        for s in &dn.conv_states {
-            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-        }
-        for s in &dn.s_ef_residual {
-            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-        }
-    }
-    if let Some(b) = m.state.as_mut().and_then(|s| {
-        (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
-    }) {
-        b.kv_cache.compact_offset = 0;
-    }
-    // Adaptive start-tier restore for single-turn MTP (no LCP): a prior AR
-    // request may have left the controller at a lower tier / next_step>0.
-    // reset_with_cache restores FWHT4/Q8 + next_step=0 and cache mode flags
-    // together. Poisoned controllers are never reset/cleared here (preflight
-    // already refused the request).
-    if let Some(ad) = m.kv_adaptive.as_mut() {
-        if !ad.is_poisoned() {
-            if let Some(b) = m.state.as_mut().and_then(|s| {
-                (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
-            }) {
-                ad.reset_with_cache(gpu, &mut b.kv_cache);
-            }
-        }
-    }
-
-    // ── Take the bundle → build a transient ModelSlot ───────────────────
-    // The mtp_spec helpers take `&mut ModelSlot`; the daemon owns the qwen35
-    // pieces in the bundle. Take them, build the slot, run, put them back at
-    // every exit (mirrors generate_dflash). The HfqFile is re-opened (mmap,
-    // few µs) because ModelSlot carries it; the MTP path doesn't read it.
-    let Qwen35Bundle {
-        config: orig_config,
-        weights,
-        scratch,
-        kv_cache,
-        dn_state,
-        kv_adaptive: _,
-        pp_scratch_set: _,
-        qwen35_mtp_head,
-        vision_config,
-        vision_weights,
-        qwen35_decode_batch,
-    } = match m
-        .state
-        .take()
-        .and_then(|s| {
-            (s as Box<dyn std::any::Any>)
-                .downcast::<Qwen35Bundle>()
-                .ok()
-        })
-        .map(|b| *b)
-    {
-        Some(b) => b,
-        None => {
-            emit_error_with_id(stdout, id, "qwen35 MTP serve: model state is not Qwen35");
-            return;
-        }
-    };
-    let target_config = orig_config.clone();
-    let hfq = match HfqFile::open(Path::new(&m.model_path)) {
-        Ok(h) => h,
-        Err(e) => {
-            emit_error_with_id(stdout, id, format!("reopen model: {e}"));
-            m.state = Some(Box::new(Qwen35Bundle {
-                qwen35_mtp_head,
-                config: orig_config,
-                weights,
-                scratch,
-                kv_cache,
-                dn_state,
-                kv_adaptive: None,
-                pp_scratch_set: None,
-                qwen35_decode_batch,
-                vision_config,
-                vision_weights,
-            }));
-            return;
-        }
-    };
-    let mut target = ModelSlot {
-        qwen35_mtp_head: None,
-        name: String::from("target"),
-        hfq,
-        config: target_config,
-        weights,
-        kv_cache,
-        dn_state,
-        scratch,
-        slot_config: ModelSlotConfig::default(),
-        dspark_extract_layers: Vec::new(),
-        vision_config,
-        vision_weights,
-    };
-
-    // Helper closure analog: every early return must put the bundle back. We
-    // do it inline (Rust closures can't move `target` piecewise + keep using
-    // `m`), so each exit re-packs Qwen35Bundle from target's fields.
-    let eos_token = target.config.eos_token;
-    let dim = target.config.dim;
-    let vocab = target.config.vocab_size;
-
-    // Context bound is prompt+max_tokens+verify_capacity+16 (slot reuse via
-    // rollback/replay, not max_tokens*(verify_capacity+1)).
-    let max_seq_total = m.physical_cap;
-    if prompt_tokens
-        .len()
-        .saturating_add(max_tokens)
-        .saturating_add(verify_capacity)
-        .saturating_add(16)
-        > max_seq_total
-    {
-        emit_error_with_id(
-            stdout,
-            id,
-            format!(
-                "prompt ({}) + max ({}) + verify_capacity ({}) +16 exceeds context capacity {} — reload with a larger max_seq",
-                prompt_tokens.len(),
-                max_tokens,
-                verify_capacity,
-                max_seq_total
-            ),
-        );
-        m.state = Some(Box::new(Qwen35Bundle {
-            qwen35_mtp_head,
-            config: orig_config,
-            weights: target.weights,
-            scratch: target.scratch,
-            kv_cache: target.kv_cache,
-            dn_state: target.dn_state,
-            kv_adaptive: None,
-            pp_scratch_set: None,
-            qwen35_decode_batch,
-            vision_config: target.vision_config,
-            vision_weights: target.vision_weights,
-        }));
-        return;
-    }
-
-    // ── Allocate a FRESH per-request MtpSpecState (no cross-request bleed) ─
-    // Head stays on the local owner for the request lifetime. target keeps
-    // qwen35_mtp_head: None so MTP calls can take &mut target + &head disjointly.
-    let head = qwen35_mtp_head
-        .as_ref()
-        .expect("generate_qwen35_mtp reached without a loaded MTP head — dispatch gate is wrong");
-    // Compressed (cvs) draft head? Copy the Option out now so we don't hold a
-    // borrow of `head`/`m` past the state setup — the compressed-logits scratch
-    // alloc below needs &mut state + &mut gpu.
-    let cvs_opt = head.weights.compressed_vocab_size;
-    let kv_mode = MtpKvMode::Q8;
-    let state_res = if ngram_mod_pool.is_some() {
-        MtpSpecState::new_for_slot_with_kv_mode_and_verify_capacity(
-            gpu,
-            &target,
-            head,
-            mtp_k,
-            verify_capacity,
-            kv_mode,
-        )
-    } else {
-        MtpSpecState::new_for_slot_with_kv_mode(gpu, &target, head, mtp_k, kv_mode)
-    };
-    let mut state = match state_res {
-        Ok(s) => s,
-        Err(e) => {
-            emit_error_with_id(stdout, id, format!("alloc MtpSpecState: {e:?}"));
-            m.state = Some(Box::new(Qwen35Bundle {
-                qwen35_mtp_head,
-                config: orig_config,
-                weights: target.weights,
-                scratch: target.scratch,
-                kv_cache: target.kv_cache,
-                dn_state: target.dn_state,
-                kv_adaptive: None,
-                pp_scratch_set: None,
-                qwen35_decode_batch,
-                vision_config: target.vision_config,
-                vision_weights: target.vision_weights,
-            }));
-            return;
-        }
-    };
-    // Compressed-serial (cvs) head needs its compressed-logits scratch allocated
-    // up front (mtp_only_demo does this; the daemon previously only set up the
-    // full-vocab path, so a cvs sidecar panicked inside spec_step). Full-vocab
-    // heads (cvs == None) skip this entirely.
-    if let Some(cvs) = cvs_opt {
-        if let Err(e) = state.mtp_scratch.ensure_compressed_logits(gpu, cvs) {
-            emit_error_with_id(stdout, id, format!("alloc logits_compressed: {e:?}"));
-            state.free_gpu(gpu);
-            m.state = Some(Box::new(Qwen35Bundle {
-                qwen35_mtp_head,
-                config: orig_config,
-                weights: target.weights,
-                scratch: target.scratch,
-                kv_cache: target.kv_cache,
-                dn_state: target.dn_state,
-                kv_adaptive: None,
-                pp_scratch_set: None,
-                qwen35_decode_batch,
-                vision_config: target.vision_config,
-                vision_weights: target.vision_weights,
-            }));
-            return;
-        }
-        if let Err(e) = state.ensure_compressed_lm_logits(gpu, cvs) {
-            emit_error_with_id(stdout, id, format!("alloc mtp_lm_logits_compressed: {e:?}"));
-            state.free_gpu(gpu);
-            m.state = Some(Box::new(Qwen35Bundle {
-                qwen35_mtp_head,
-                config: orig_config,
-                weights: target.weights,
-                scratch: target.scratch,
-                kv_cache: target.kv_cache,
-                dn_state: target.dn_state,
-                kv_adaptive: None,
-                pp_scratch_set: None,
-                qwen35_decode_batch,
-                vision_config: target.vision_config,
-                vision_weights: target.vision_weights,
-            }));
-            return;
-        }
-    }
-    if temp > 1e-6 {
-        // Sampled MTP. temp/top_p/top_k AND the sampling min_p are honored (folded
-        // into the GPU nucleus tau). The draft-chain p_min now ALSO composes with
-        // sampling via DraftMode::SampledPMin (sampled draft + early chain-cutoff
-        // on the head's raw top prob — lossless, the tau lever for sampled MTP), so
-        // we feed the resolved p_min through instead of clearing it. p_min<=0
-        // (HIPFIRE_MTP_P_MIN=0) → plain DraftMode::Sampled (no chain pruning).
-        state.set_p_min(p_min);
-        // set_sampling asserts top_p in (0,1]; a request top_p of 0.0 means
-        // "disabled", so clamp it to 1.0 (the no-nucleus sentinel).
-        let top_p_eff = if top_p > 0.0 { top_p.min(1.0) } else { 1.0 };
-        state.set_sampling(
-            mtp_spec::MtpSamplingConfig {
-                temp,
-                top_k: top_k.map(|k| k as usize).unwrap_or(0),
-                top_p: top_p_eff,
-                min_p,
-            },
-            42, // deterministic seed for v1 (reproducible for the coherence battery; a per-request seed is a follow-up)
-        );
-    } else {
-        state.set_p_min(p_min); // greedy MTP confidence cutoff
-    }
-
-    let _ = (dim, vocab); // dims sanity-checked inside MtpSpecState::new
-
-    let t0 = Instant::now();
-
-    // ── Prefill: chunked trunk + MTP private-KV fill (committed boundaries) ─
-    // Adaptive controllers live on `m.kv_adaptive` (not the transient slot).
-    // Boundary hook downshifts at exclusive committed pos before the next chunk
-    // can write past the current-tier capacity. Prefill/spec HipResult failures
-    // (incl. lazy VMM growth) are request errors — never unwrap/panic.
-    let head = qwen35_mtp_head
-        .as_ref()
-        .expect("qwen35 MTP head must be loaded on this path");
-    let prefill_res = {
-        let adaptive = &mut m.kv_adaptive;
-        mtp_spec::prefill_trunk_and_mtp_cache_with_boundary(
-            gpu,
-            &mut target,
-            head,
-            &mut state,
-            &prompt_tokens,
-            0,
-            |gpu, target, committed_pos| {
-                if let Some(ad) = adaptive.as_mut() {
-                    match ad.maybe_downshift(gpu, &mut target.kv_cache, committed_pos) {
-                        Ok(steps) => {
-                            for step in steps {
-                                eprintln!(
-                                    "[adaptive-kv] downshift @ pos {} (mtp prefill): {:?} (K={:?} V={:?})",
-                                    committed_pos, step, ad.cur_k, ad.cur_v
-                                );
-                            }
-                            Ok(())
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "[adaptive-kv] maybe_downshift error @ pos {} (mtp prefill): {:?} — poisoning model",
-                                committed_pos, e
-                            );
-                            Err(e)
-                        }
-                    }
-                } else {
-                    Ok(())
-                }
-            },
-        )
-    };
-    if let Err(e) = prefill_res {
-        emit_error_with_id(stdout, id, format!("mtp prefill: {e:?}"));
-        state.free_gpu(gpu);
-        m.state = Some(Box::new(Qwen35Bundle {
-            qwen35_mtp_head,
-            config: orig_config,
-            weights: target.weights,
-            scratch: target.scratch,
-            kv_cache: target.kv_cache,
-            dn_state: target.dn_state,
-            kv_adaptive: None,
-            pp_scratch_set: None,
-            qwen35_decode_batch,
-            vision_config: target.vision_config,
-            vision_weights: target.vision_weights,
-        }));
-        return;
-    }
-    let _ = gpu.hip.device_synchronize();
-    let prefill_ms = t0.elapsed().as_millis();
-
-    // Seed token = trunk argmax at the last prefill position. prefill left
-    // target.scratch.logits holding the post-prompt logits.
-    let seed_logits = match gpu.download_f32(&target.scratch.logits) {
-        Ok(v) => v,
-        Err(e) => {
-            emit_error_with_id(stdout, id, format!("download seed logits: {e:?}"));
-            state.free_gpu(gpu);
-            m.state = Some(Box::new(Qwen35Bundle {
-                qwen35_mtp_head,
-                config: orig_config,
-                weights: target.weights,
-                scratch: target.scratch,
-                kv_cache: target.kv_cache,
-                dn_state: target.dn_state,
-                kv_adaptive: None,
-                pp_scratch_set: None,
-                qwen35_decode_batch,
-                vision_config: target.vision_config,
-                vision_weights: target.vision_weights,
-            }));
-            return;
-        }
-    };
-    let seed_token = seed_logits
-        .iter()
-        .enumerate()
-        .fold((0u32, f32::NEG_INFINITY), |(best, bv), (i, &v)| {
-            if v > bv {
-                (i as u32, v)
-            } else {
-                (best, bv)
-            }
-        })
-        .0;
-
-    // ── Decode loop ─────────────────────────────────────────────────────
-    let t_prefill = Instant::now();
-    let mut emitted: Vec<u32> = vec![seed_token];
-    let mut last_committed = seed_token;
-    let mut cur_pos = prompt_tokens.len();
-    let mut generated = 0usize;
-    let mut cycles = 0usize;
-    let mut accepted_total = 0usize;
-    // Ngram-mod stats (only when ngram_mod is armed). ar_windows counts
-    // post-retirement misses (with_k 0).
-    let mut ngram_mod_windows = 0usize;
-    let mut ngram_mod_drafts = 0usize;
-    let mut ngram_mod_accepted = 0usize;
-    let mut mtp_windows = 0usize;
-    let mut ar_windows = 0usize;
-    let mut mtp_retired = false;
-    // Opt-in per-window HIP host/API timing (HIPFIRE_HOST_TIMING=1). Empty
-    // Vec + one env check when disabled — no launch-counter work on the hot path.
-    let host_timing = std::env::var("HIPFIRE_HOST_TIMING").ok().as_deref() == Some("1");
-    let mut mtp_window_timings: Vec<serde_json::Value> = Vec::new();
-    // Request context prompt+seed for the shared pool. Pushed incrementally
-    // with actually emitted committed tokens; insert_range learns them.
-    let mut ngram_context: Vec<u32> = Vec::with_capacity(prompt_tokens.len() + max_tokens + 1);
-    ngram_context.extend_from_slice(&prompt_tokens);
-    ngram_context.push(seed_token);
-    let mut ngram_indexed_until: usize = 0;
-    if let Some(pool_arc) = ngram_mod_pool.as_ref() {
-        let mut pool = pool_arc.lock().unwrap();
-        pool.insert_range(&ngram_context, n_match);
-        ngram_indexed_until = ngram_context.len();
-    }
-    let mut think_count: usize = 0;
-    let mut prev_in_think = false;
-    // MTP force-closes only at a committed block boundary so its target/head
-    // caches stay aligned. Keep that policy local; the shared emitter owns only
-    // byte filtering plus reasoning/content/tool routing for this path.
-    let mut think_closed = false;
-    let mut grammar_violated = false;
-    let emit_tools = hipfire_runtime::prompt_frame::qwen35_grammar_on(
-        std::env::var("HIPFIRE_QWEN35_GRAMMAR").ok().as_deref(),
-        &m.model_path,
-    )
-    .then_some(tools)
-    .flatten();
-    let mut emit =
-        hipfire_arch_qwen35::spec_emit::Qwen35Emit::from_ctx(hipfire_runtime::spec::SpecEmitCtx {
-            tokenizer,
-            eos: eos_token,
-            im_end: im_end_token,
-            tools: emit_tools,
-            stop: stop.to_vec(),
-            max_think: 0,
-            max_tokens,
-            assistant_prefix: spec_assistant_prefix(started_in_think),
-            think_mode: ThinkMode::NonThink,
-            decoded_vocab: None,
-        });
-
-    // Open the user-facing stream contract before the seed's committed/token
-    // events. MTP performs its own decode loop and therefore does not inherit
-    // the AR/DFlash gen_start emission.
-    emit_gen_start(
-        stdout,
-        id,
-        started_in_think,
-        gen_start_contract_version_for_arch(m.arch_id),
-    );
-
-    // Emit the seed token first (TTFT = prefill) through the shared semantic
-    // router so an open reasoning prefix never leaks into visible content.
-    let seed_begin = emit.begin(seed_token);
-    render_client_events(
-        stdout,
-        id,
-        &seed_begin.events,
-        t0.elapsed().as_millis() as u64,
-        false,
-    );
-    generated += 1;
-    let mut semantic_stop = if spec_stop_is_semantic(seed_begin.stop) {
-        seed_begin.stop
-    } else {
-        None
-    };
-    let seed_is_eos = seed_begin.stop.is_some();
-
-    let mut step_error: Option<String> = None;
-    while !seed_is_eos && generated < max_tokens {
-        if check_abort(id) {
-            break;
-        }
-        if cur_pos + verify_capacity + 1 >= max_seq_total {
-            break;
-        }
-
-        // Ngram-mod draft attempt: short-lock, clone Vec, drop lock before GPU.
-        // When host_timing is on, snapshot launch counters before lookup so
-        // draft_lookup_us is separable from the GPU step; wall spans both.
-        // Disabled path: no Instant::now and no launch-counter reads per window.
-        let remaining_emit = max_tokens.saturating_sub(generated);
-        let spine_budget = remaining_emit.saturating_sub(1); // room for bonus
-        let timing_snap = if host_timing {
-            Some(MtpWindowTimingSnap::take())
-        } else {
-            None
-        };
-        let (ngram_cands, draft_lookup_us) = if mtp_ngram && spine_budget > 0 {
-            let caller_max = spine_budget.min(verify_capacity);
-            let t_lookup = if host_timing {
-                Some(Instant::now())
-            } else {
-                None
-            };
-            let draft = {
-                let pool = ngram_mod_pool.as_ref().unwrap().lock().unwrap();
-                pool.draft(&ngram_context, caller_max)
-            };
-            let draft_lookup_us = t_lookup
-                .map(|t| t.elapsed().as_micros() as u64)
-                .unwrap_or(0);
-            (draft, draft_lookup_us)
-        } else {
-            (None, 0)
-        };
-        let used_ngram = ngram_cands.as_ref().is_some_and(|c| !c.is_empty());
-        // Classify planned route before the step (and before ngram acceptance
-        // can retire MTP) so timing kind matches the path actually taken.
-        let timing_kind = mtp_window_timing_kind(used_ngram, mtp_ngram, mtp_retired);
-        let result = if used_ngram {
-            let cands = ngram_cands.as_ref().unwrap();
-            match mtp_spec::spec_step_mtp_compressed_serial_with_takeover_candidates(
-                gpu,
-                &mut target,
-                head,
-                &mut state,
-                cur_pos,
-                last_committed,
-                eos_token,
-                cands,
-                mtp_retired,
-            ) {
-                Ok(r) => r,
-                Err(e) => {
-                    step_error = Some(format!("{e:?}"));
-                    break;
-                }
-            }
-        } else if mtp_ngram {
-            if mtp_retired {
-                // After retirement, miss verifies trunk only (k=0) – no MTP head.
-                match mtp_spec::spec_step_mtp_compressed_serial_with_k(
-                    gpu,
-                    &mut target,
-                    head,
-                    &mut state,
-                    cur_pos,
-                    last_committed,
-                    eos_token,
-                    0,
-                ) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        step_error = Some(format!("{e:?}"));
-                        break;
-                    }
-                }
-            } else {
-                // Before takeover, miss goes to native MTP K.
-                match mtp_spec::spec_step_mtp_compressed_serial_with_k(
-                    gpu,
-                    &mut target,
-                    head,
-                    &mut state,
-                    cur_pos,
-                    last_committed,
-                    eos_token,
-                    mtp_k,
-                ) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        step_error = Some(format!("{e:?}"));
-                        break;
-                    }
-                }
-            }
-        } else {
-            // Off-path: identical to pre-ngram (legacy entry).
-            match mtp_spec::spec_step_mtp_compressed_serial(
-                gpu,
-                &mut target,
-                head,
-                &mut state,
-                cur_pos,
-                last_committed,
-                eos_token,
-            ) {
-                Ok(r) => r,
-                Err(e) => {
-                    step_error = Some(format!("{e:?}"));
-                    break;
-                }
-            }
-        };
-        // Record only after a successful step; failed windows leave no row.
-        if let Some(snap) = timing_snap {
-            mtp_window_timings.push(snap.into_record(timing_kind, draft_lookup_us));
-        }
-        cycles += 1;
-        accepted_total += result.accept_count;
-        if used_ngram {
-            ngram_mod_windows += 1;
-            ngram_mod_drafts += result.drafts_generated;
-            ngram_mod_accepted += result.accept_count;
-            // Short-lock record_draft_result for every ngram attempt.
-            {
-                let mut pool = ngram_mod_pool.as_ref().unwrap().lock().unwrap();
-                let _ = pool.record_draft_result(
-                    result.drafts_generated as u32,
-                    result.accept_count as u32,
-                );
-            }
-            // Positive ngram acceptance latches retirement; zero-accept before
-            // takeover stays MTP-capable (single-row repair handled in core).
-            if result.accept_count > 0 && !mtp_retired {
-                mtp_retired = true;
-            }
-        } else if mtp_ngram {
-            if mtp_retired {
-                ar_windows += 1;
-            } else {
-                mtp_windows += 1;
-            }
-        } else {
-            mtp_windows += 1;
-        }
-
-        let mut hit_eos = false;
-        for &tok in &result.committed {
-            if generated >= max_tokens {
-                break;
-            }
-            emit.set_generated_hint(generated);
-            let outcome = emit.observe(tok);
-            if outcome.stop == Some(StopReason::GrammarViolation) {
-                grammar_violated = true;
-                hit_eos = true;
-                break;
-            }
-            emitted.push(tok);
-            if mtp_ngram {
-                ngram_context.push(tok);
-            }
-            render_client_events(
-                stdout,
-                id,
-                &outcome.events,
-                t0.elapsed().as_millis() as u64,
-                false,
-            );
-            generated += 1;
-            if semantic_stop.is_none() && spec_stop_is_semantic(outcome.stop) {
-                semantic_stop = outcome.stop;
-            }
-            if outcome.stop.is_some() {
-                hit_eos = true;
-                break;
-            }
-            if max_think_tokens > 0 && !think_closed {
-                let raw_so_far = tokenizer.decode_bytes(&emitted);
-                let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
-                let in_think = currently_in_think(raw_str, started_in_think);
-                if in_think && !prev_in_think {
-                    think_count = 0;
-                }
-                if in_think {
-                    think_count += 1;
-                }
-                prev_in_think = in_think;
-                // Apply the close after this committed block. `spec_step`
-                // already advanced the trunk across the whole block, so
-                // stopping midway here would desynchronize visible tokens and
-                // model state.
-            }
-        }
-        last_committed = match result.committed.last() {
-            Some(&t) => t,
-            None => break, // defensive: spec_step always commits ≥ 1
-        };
-        cur_pos += result.advance;
-        // Incrementally learn actually emitted committed tokens without
-        // holding lock over GPU work. Seed already covers prompt+seed.
-        if mtp_ngram {
-            let mut pool = ngram_mod_pool.as_ref().unwrap().lock().unwrap();
-            pool.insert_range(&ngram_context, ngram_indexed_until);
-            ngram_indexed_until = ngram_context.len();
-        }
-        // Adaptive KV: downshift ONLY the committed/live trunk prefix
-        // [0, cur_pos) at the block boundary. Spec verify may have written a
-        // rejected suffix beyond cur_pos; those slots stay at the prior tier
-        // and are overwritten in order by the next verify.
-        if let Some(ad) = m.kv_adaptive.as_mut() {
-            match ad.maybe_downshift(gpu, &mut target.kv_cache, cur_pos) {
-                Ok(steps) => {
-                    for step in steps {
-                        eprintln!(
-                            "[adaptive-kv] downshift @ pos {} (mtp decode): {:?} (K={:?} V={:?})",
-                            cur_pos, step, ad.cur_k, ad.cur_v
-                        );
-                    }
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[adaptive-kv] maybe_downshift error @ pos {} (mtp decode): {:?} — poisoning model",
-                        cur_pos, e
-                    );
-                    step_error = Some(format!(
-                        "adaptive KV transition failed during mtp decode: {e}"
-                    ));
-                    break;
-                }
-            }
-        }
-        if result.hit_eos || hit_eos {
-            break;
-        }
-
-        if max_think_tokens > 0 && !think_closed && prev_in_think && think_count >= max_think_tokens
-        {
-            let close_ids = tokenizer.encode(&think_continuation());
-            if !close_ids.is_empty() {
-                let mut forced_stop = false;
-                for &ct in &close_ids {
-                    if generated >= max_tokens {
-                        break;
-                    }
-                    emit.set_generated_hint(generated);
-                    let outcome = emit.observe(ct);
-                    if outcome.stop == Some(StopReason::GrammarViolation) {
-                        grammar_violated = true;
-                        forced_stop = true;
-                        break;
-                    }
-                    emitted.push(ct);
-                    if mtp_ngram {
-                        ngram_context.push(ct);
-                    }
-                    render_client_events(
-                        stdout,
-                        id,
-                        &outcome.events,
-                        t0.elapsed().as_millis() as u64,
-                        false,
-                    );
-                    generated += 1;
-                    if semantic_stop.is_none() && spec_stop_is_semantic(outcome.stop) {
-                        semantic_stop = outcome.stop;
-                    }
-                    if outcome.stop.is_some() {
-                        forced_stop = true;
-                        break;
-                    }
-                }
-
-                // Match the MTP loop's deferred-token invariant: advance the
-                // trunk and head cache over the prior deferred token plus every
-                // close token except the new deferred tail.
-                let mut advance_toks = Vec::with_capacity(close_ids.len());
-                advance_toks.push(last_committed);
-                advance_toks.extend_from_slice(&close_ids[..close_ids.len() - 1]);
-                let think_prefill = {
-                    let adaptive = &mut m.kv_adaptive;
-                    let start = cur_pos;
-                    mtp_spec::prefill_trunk_and_mtp_cache_with_boundary(
-                        gpu,
-                        &mut target,
-                        head,
-                        &mut state,
-                        &advance_toks,
-                        start,
-                        |gpu, target, committed_pos| {
-                            if let Some(ad) = adaptive.as_mut() {
-                                match ad.maybe_downshift(gpu, &mut target.kv_cache, committed_pos) {
-                                    Ok(steps) => {
-                                        for step in steps {
-                                            eprintln!(
-                                                "[adaptive-kv] downshift @ pos {} (mtp think-close): {:?} (K={:?} V={:?})",
-                                                committed_pos, step, ad.cur_k, ad.cur_v
-                                            );
-                                        }
-                                        Ok(())
-                                    }
-                                    Err(e) => {
-                                        eprintln!(
-                                            "[adaptive-kv] maybe_downshift error @ pos {} (mtp think-close): {:?} — poisoning model",
-                                            committed_pos, e
-                                        );
-                                        Err(e)
-                                    }
-                                }
-                            } else {
-                                Ok(())
-                            }
-                        },
-                    )
-                };
-                if let Err(e) = think_prefill {
-                    step_error = Some(format!("think force-close: {e:?}"));
-                    break;
-                }
-                cur_pos += advance_toks.len();
-                last_committed = *close_ids.last().unwrap();
-                // Learn think-force-close committed tokens (also without lock
-                // over GPU). No-op when ngram is off (thinking disables ngram).
-                if mtp_ngram {
-                    let mut pool = ngram_mod_pool.as_ref().unwrap().lock().unwrap();
-                    pool.insert_range(&ngram_context, ngram_indexed_until);
-                    ngram_indexed_until = ngram_context.len();
-                }
-                think_closed = true;
-                prev_in_think = false;
-                if forced_stop {
-                    break;
-                }
-            }
-        }
-    }
-
-    let t_end = Instant::now();
-    let aborted = check_abort(id);
-    let finish = if step_error.is_none() && !aborted {
-        Some(emit.finish())
-    } else {
-        drop(emit);
-        None
-    };
-
-    // ── Free the per-request MtpSpecState + put the bundle back ─────────
-    // CRITICAL (state-bleed guard): free_gpu releases the MTP-private KV cache
-    // + the trunk DN snapshot, so the NEXT request starts with no residue.
-    state.free_gpu(gpu);
-    // The trunk's mid-decode DN/KV is advanced past the (un-baked) prompt; the
-    // next request cold-resets at the top of this fn (and the DFlash/AR paths
-    // reset on their own !cache_hit branch), so we leave it as-is here. Bake an
-    // empty conversation tracker (v1 is single-turn / no LCP reuse).
-    m.seq_pos = 0;
-    m.conversation_tokens.clear();
-    m.state = Some(Box::new(Qwen35Bundle {
-        qwen35_mtp_head,
-        config: orig_config,
-        weights: target.weights,
-        scratch: target.scratch,
-        kv_cache: target.kv_cache,
-        dn_state: target.dn_state,
-        kv_adaptive: None,
-        pp_scratch_set: None,
-        qwen35_decode_batch,
-        vision_config: target.vision_config,
-        vision_weights: target.vision_weights,
-    }));
-
-    if let Some(e) = step_error {
-        emit_error_with_id(stdout, id, format!("mtp spec_step: {e}"));
-        return;
-    }
-
-    // Client abort: common production rollback + attested cancelled lifecycle
-    // (or unattested error-only). Never fall through to stop/length done.
-    if aborted {
-        let ep = production_fail_closed_rollback(m, gpu, None, None);
-        emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
-        return;
-    }
-    let finish = finish.expect("normal MTP exit must finalize its emitter");
-    render_client_events(stdout, id, &finish.events, 0, true);
-
-    // ── Done envelope ──────────────────────────────────────────────────
-    // Timing + pending done fixed before handshake so commit_ready carries
-    // the exact eventual done payload.
-    let total_s = t_end.duration_since(t0).as_secs_f64();
-    let prefill_s = t_prefill.duration_since(t0).as_secs_f64();
-    let decode_s = t_end.duration_since(t_prefill).as_secs_f64();
-    let tok_s = if total_s > 0.0 {
-        generated as f64 / total_s
-    } else {
-        0.0
-    };
-    let decode_tok_s = if decode_s > 0.0 {
-        generated as f64 / decode_s
-    } else {
-        0.0
-    };
-    let prefill_tok_s = if prefill_s > 0.0 {
-        prompt_tokens.len() as f64 / prefill_s
-    } else {
-        0.0
-    };
-    // τ = tokens committed per cycle (excludes the seed). > 1.0 = MTP speedup.
-    let tau = if cycles > 0 {
-        (emitted.len().saturating_sub(1)) as f64 / cycles as f64
-    } else {
-        0.0
-    };
-    let _ = accepted_total;
-    let ngram_mod_accept_rate = if ngram_mod_drafts > 0 {
-        ngram_mod_accepted as f64 / ngram_mod_drafts as f64
-    } else {
-        0.0
-    };
-    let hit_length_cap = qwen_dflash_hit_length_cap(
-        generated,
-        max_tokens,
-        finish.decoded_eot,
-        semantic_stop.is_some(),
-    );
-    let visible = if !finish.visible_text.is_empty() {
-        finish.visible_text.clone()
-    } else {
-        qwen_dflash_visible_from_finish(&finish)
-    };
-    let terminal =
-        qwen_dflash_wire_terminal(&finish, hit_length_cap, grammar_violated, &visible, false);
-    let (finish_reason, wire_tool_calls) = match &terminal {
-        QwenDflashWireTerminal::Malformed {
-            message,
-            class,
-            retryable,
-            ..
-        } => {
-            let ep = production_fail_closed_rollback(m, gpu, None, None);
-            emit_qwen_dflash_malformed_terminal(stdout, id, message, class, *retryable, &ep);
-            return;
-        }
-        QwenDflashWireTerminal::Done {
-            finish_reason,
-            wire_tool_calls,
-            ..
-        } => (*finish_reason, wire_tool_calls.as_slice()),
-    };
-    let mut pending_done = serde_json::json!({
-        "type": "done",
-        "id": id,
-        "tokens": generated,
-        "tok_s": (tok_s * 10.0).round() / 10.0,
-        "prefill_tokens": prompt_tokens.len(),
-        "prefill_ms": prefill_ms,
-        "prefill_tok_s": (prefill_tok_s * 10.0).round() / 10.0,
-        "decode_tok_s": (decode_tok_s * 10.0).round() / 10.0,
-        "ttft_ms": prefill_ms,
-        "mtp": true,
-        "tau": (tau * 100.0).round() / 100.0,
-        "cycles": cycles,
-        "cached_tokens": 0,
-        "finish_reason": finish_reason,
-        "attempt_id": active_attempt_id(),
-        "mtp_ngram": mtp_ngram,
-        "ngram_mod_windows": ngram_mod_windows,
-        "ngram_mod_drafts": ngram_mod_drafts,
-        "ngram_mod_accepted": ngram_mod_accepted,
-        "ngram_mod_accept_rate": (ngram_mod_accept_rate * 1000.0).round() / 1000.0,
-        "mtp_windows": mtp_windows,
-        "ar_windows": ar_windows,
-        "mtp_retired": mtp_retired,
-    });
-    // Build concise per-route wall summary before moving timings into pending_done.
-    let host_timing_summary = if host_timing && !mtp_window_timings.is_empty() {
-        let summarize = |kind: &str| {
-            let mut walls: Vec<u64> = mtp_window_timings
-                .iter()
-                .filter(|r| r.get("kind").and_then(|k| k.as_str()) == Some(kind))
-                .filter_map(|r| r.get("wall_us").and_then(|v| v.as_u64()))
-                .collect();
-            if walls.is_empty() {
-                return None;
-            }
-            let n = walls.len();
-            let sum: u64 = walls.iter().sum();
-            let mean = sum / n as u64;
-            walls.sort_unstable();
-            let median = if n % 2 == 1 {
-                walls[n / 2]
-            } else {
-                (walls[n / 2 - 1] + walls[n / 2]) / 2
-            };
-            Some((n, mean, median))
-        };
-        let mut parts: Vec<String> = Vec::new();
-        for kind in ["ngram", "mtp", "ar"] {
-            if let Some((n, mean, median)) = summarize(kind) {
-                parts.push(format!("{kind}:n={n} mean={mean} median={median}"));
-            }
-        }
-        if parts.is_empty() {
-            None
-        } else {
-            Some(parts.join(" "))
-        }
-    } else {
-        None
-    };
-    attach_mtp_window_timings(&mut pending_done, host_timing, mtp_window_timings);
-    stage_terminal_tool_calls(&mut pending_done, finish_reason, wire_tool_calls);
-    let decision = await_client_terminal_commit(stdout, id, &pending_done);
-    if decision != ClientTerminalDecision::Commit {
-        let ep = production_fail_closed_rollback(m, gpu, None, None);
-        emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
-        return;
-    }
-    emit_staged_terminal_done(stdout, &pending_done);
-    // Per-request debug summary (stderr → serve.log): active drafter, τ, tok/s.
-    let drafter = m.speculator.as_ref().map(|s| s.name()).unwrap_or("none");
-    eprintln!(
-        "[req {id}] drafter={drafter} tau={tau:.2} tok/s={decode_tok_s:.1} decode ({generated} tok, {cycles} windows) mtp_ngram={mtp_ngram} ngram_mod_windows={ngram_mod_windows} ngram_mod_drafts={ngram_mod_drafts} ngram_mod_accepted={ngram_mod_accepted} ngram_mod_accept_rate={ngram_mod_accept_rate:.3} mtp_windows={mtp_windows} ar_windows={ar_windows} mtp_retired={mtp_retired}"
-    );
-    if let Some(summary) = host_timing_summary {
-        eprintln!("[req {id}] mtp_window_timings wall_us {summary}");
-    }
-}
 
 /// Multi-GPU pipeline-parallel AR decode (Stage 7 of #58). Mirrors the pp=1
 /// `generate` Qwen3.5 branch feature-for-feature: ChatFrame ChatML wrap,

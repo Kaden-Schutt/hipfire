@@ -96,9 +96,11 @@ impl MtpDrafter for Deepseek4MtpDrafter {
         &mut self,
         gpu: &mut Gpu,
         target: &mut dyn SpecTarget,
+        _prompt_tokens: &[u32],
         fill_tokens: &[u32],
         start_pos: usize,
         cache_hit: bool,
+        _abort: &dyn Fn() -> bool,
     ) -> Result<u32, String> {
         // Cold start: reset recurrent state (n_tokens → 0, mtp_last_hidden → None).
         // DeepseekV4State::reset() does no GPU work.
@@ -148,6 +150,7 @@ impl MtpDrafter for Deepseek4MtpDrafter {
         target: &mut dyn SpecTarget,
         position: usize,
         seed: u32,
+        _emitted: &[u32],
         k: usize,
         _eos: u32,
         grammar: Option<&mut dyn SpecGrammar>,

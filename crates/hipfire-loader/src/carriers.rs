@@ -319,8 +319,6 @@ fn load_qwen35_pp(
     )
     .map_err(|e| format!("{e}"))?;
     let bundle = hipfire_arch_qwen35::Qwen35Bundle {
-        // Moved off LoadedModel: per-arch state belongs to the arch bundle.
-        qwen35_mtp_head: None,
         config,
         weights,
         scratch: single_scratch,
@@ -654,8 +652,6 @@ impl Carrier for Qwen35Carrier {
                     }
                 };
                 let bundle = hipfire_arch_qwen35::Qwen35Bundle {
-        // Moved off LoadedModel: per-arch state belongs to the arch bundle.
-        qwen35_mtp_head: None,
                     config,
                     weights,
                     scratch,

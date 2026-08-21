@@ -32,13 +32,11 @@ use hipfire_runtime::llama;
 use hipfire_runtime::llama::KvCacheExt;
 use hipfire_runtime::loader_api::{CaskConfig, LoadCtx, ModelSource, SpecLoadCfg};
 use hipfire_runtime::multi_gpu::Gpus;
-use hipfire_runtime::ngram_mod::NgramModPool;
 use hipfire_runtime::spec::{SpecEmit, SpecEmitCtx, SpecTargetGuard, Speculator};
 use hipfire_runtime::triattn::{EvictionCtx, TriAttnCenters};
 use rdna_compute::Gpu;
 use std::any::Any;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
 
 pub trait Carrier: Send + Sync {
     fn name(&self) -> &'static str;
@@ -912,12 +910,6 @@ pub struct LoadedModel {
     pub dflash_checkpoints: Vec<(usize, DeltaNetSnapshot)>,
     pub asst_turn_cache: AsstTurnCache,
     pub decoded_vocab: Option<std::sync::Arc<Vec<String>>>,
-    /// Model-lifetime shared n-gram-mod pool (`HIPFIRE_MTP_NGRAM`). Lazily created
-    /// (or replaced on config mismatch) by the serve path; starts `None` so every
-    /// `skeleton` construction site inherits the opt-in. Host-only — drops with
-    /// `LoadedModel` on unload. Future multi-slot serve must not share one pool
-    /// across concurrent slots without coordination beyond this `Mutex`.
-    pub ngram_mod_pool: Option<Arc<Mutex<NgramModPool>>>,
     pub model_path: String,
     /// The model's speculative-decode drafter+verifier, when a draft model is
     /// loaded (`Box<dyn Speculator>` so the daemon's decode loop is agnostic to
@@ -976,7 +968,6 @@ impl LoadedModel {
             prefill_checkpoints: Vec::new(),
             dflash_checkpoints: Vec::new(),
             decoded_vocab: None,
-            ngram_mod_pool: None,
             model_path,
             speculator: None,
             chat_template,
@@ -1533,9 +1524,8 @@ fn finish_qwen35_load(
     let config = &bundle.config;
     let dn_state = &bundle.dn_state;
 
-    // Adaptive KV cannot combine with generic (DSpark/DFlash/n-gram/bundled-MTP
-    // build_speculator) drafters. Suppress before any GPU drafter alloc; native
-    // qwen35_mtp_head load below is intentionally left alone.
+    // Adaptive KV cannot combine with generic (DSpark/DFlash/n-gram/MTP via
+    // build_speculator) drafters. Suppress before any GPU drafter alloc.
     let adaptive_blocks_generic_spec = bundle.kv_adaptive.is_some();
     if adaptive_blocks_generic_spec {
         eprintln!(
@@ -1695,63 +1685,96 @@ fn finish_qwen35_load(
     } else {
         None
     };
-    // ── qwen35 MTP head (opt-in, bundled .mq4-mtp only) ────────────
-    // Loaded ONLY when HIPFIRE_QWEN35_MTP=1, the trunk is a bundled `.mq4-mtp`
-    // file, no DFlash draft was requested (DFlash wins), eviction is None (the
-    // MTP head KV is not FlashCASK-compacted), and arch is qwen35 (5/6). Gated
-    // here — not in build_speculator — because this is the only site with a
-    // `&mut Gpu` to free on decline, and the head allocates GPU buffers.
-    let mtp = if !adaptive_blocks_generic_spec
-        && dflash.is_none()
-        && dspark_speculator.is_none()
-        && eviction.is_none()
-        && matches!(arch_id, 5 | 6)
-        && hipfire_config::developer_var("HIPFIRE_QWEN35_MTP")
-            .ok()
-            .as_deref()
-            == Some("1")
-        && ctx.path.ends_with(".mq4-mtp")
+    // ── qwen35 MTP head (single resolver: bundled .mq4-mtp trailer then sibling .mtp sidecar) ──
+    // Precedence: DSpark > DFlash > MTP > n-gram. Gate: only arch 5/6, no adaptive/eviction,
+    // and typed mtp != off. Bundled first then sidecar `.mtp`; physical_cap is the KV
+    // window. On missing/failure errors when forced on (mtp=on), auto logs/falls back.
+    let mtp: Option<hipfire_arch_qwen35::mtp_head::Qwen35MtpHead> = if adaptive_blocks_generic_spec
+        || eviction.is_some()
+        || !matches!(arch_id, 5 | 6)
+        || ctx.spec.mtp == Some(false)
+        || dflash.is_some()
+        || dspark_speculator.is_some()
     {
-        match hipfire_arch_qwen35::mtp_head::load_mtp_head_bundled(
-            std::path::Path::new(ctx.path),
-            ctx.gpu,
-            ctx.max_seq,
-        ) {
-            Ok(Some(head)) => {
+        None
+    } else {
+        let trunk_path = Path::new(ctx.path);
+        let mut head_opt: Option<hipfire_arch_qwen35::mtp_head::Qwen35MtpHead> = None;
+        let mut load_err: Option<String> = None;
+        match hipfire_arch_qwen35::mtp_head::load_mtp_head_bundled(trunk_path, ctx.gpu, physical_cap) {
+            Ok(Some(h)) => {
                 eprintln!(
-                    "  MTP head loaded from bundle: n_embd={} vocab={} (compressed_lm_head_draft={})",
-                    head.config.n_embd,
-                    head.config.vocab_size,
-                    head.weights.lm_head_draft.is_some(),
+                    "  MTP head loaded (bundled .mq4-mtp): n_embd={} vocab={}",
+                    h.config.n_embd, h.config.vocab_size
                 );
-                Some(head)
+                head_opt = Some(h);
             }
             Ok(None) => {
-                eprintln!(
-                    "  HIPFIRE_QWEN35_MTP=1 but {} has no bundled MTP trailer — AR/n-gram only",
-                    ctx.path
-                );
-                None
+                let sidecar = trunk_path.with_extension("mtp");
+                if sidecar.exists() {
+                    match hipfire_arch_qwen35::mtp_head::load_mtp_head(&sidecar, ctx.gpu, physical_cap) {
+                        Ok(h) => {
+                            eprintln!(
+                                "  MTP head loaded (sidecar {}): n_embd={} vocab={}",
+                                sidecar.display(),
+                                h.config.n_embd,
+                                h.config.vocab_size
+                            );
+                            head_opt = Some(h);
+                        }
+                        Err(e) => {
+                            load_err = Some(format!("sidecar {} load failed: {e}", sidecar.display()));
+                        }
+                    }
+                }
             }
             Err(e) => {
-                eprintln!(
-                    "  MTP head load failed ({}): {e} — AR/n-gram only",
-                    ctx.path
-                );
-                None
+                load_err = Some(format!("bundled trailer load failed: {e}"));
+                let sidecar = trunk_path.with_extension("mtp");
+                if sidecar.exists() {
+                    match hipfire_arch_qwen35::mtp_head::load_mtp_head(&sidecar, ctx.gpu, physical_cap) {
+                        Ok(h) => {
+                            eprintln!(
+                                "  MTP head loaded (sidecar {} after bundled error): n_embd={} vocab={}",
+                                sidecar.display(),
+                                h.config.n_embd,
+                                h.config.vocab_size
+                            );
+                            head_opt = Some(h);
+                            load_err = None;
+                        }
+                        Err(e2) => {
+                            load_err = Some(format!("bundled: {e}; sidecar {}: {e2}", sidecar.display()));
+                        }
+                    }
+                }
             }
         }
-    } else {
-        None
+        if head_opt.is_none() {
+            if ctx.spec.mtp == Some(true) {
+                return Err(rollback_unfinished_qwen35(
+                    format!(
+                        "MTP head required (mtp=on) but not found: {}",
+                        load_err.unwrap_or_else(|| "no bundled trailer or .mtp sidecar found".to_string())
+                    ),
+                    bundle,
+                    vision_weights,
+                    ctx.gpu,
+                ));
+            }
+            if let Some(err) = load_err {
+                eprintln!("  MTP head load failed: {err} — falling back to AR/n-gram");
+            }
+        }
+        head_opt
     };
+    let mtp_present = mtp.is_some();
     // Pick the arch-generic speculator: a loaded DFlash draft → DflashSpeculator,
-    // else a bundled MTP head → MtpSpeculator<Qwen35MtpDrafter>, else (opt-in)
-    // the model-free n-gram drafter. `eviction` is borrowed (not moved) here, so
-    // it is still available for the struct literal below; `config`/`dn_state` are
-    // borrowed only for the n-gram arm's scratch construction (snapshot copied to
-    // GPU), released before `bundle` moves into `state`. `None` ⇒ AR-only model.
+    // else an MTP head → MtpSpeculator<Qwen35MtpDrafter>, else (opt-in) the
+    // model-free n-gram drafter. `eviction` is borrowed (not moved) here so it is
+    // still available for the struct literal below; `config`/`dn_state` are
+    // borrowed only for the n-gram arm's scratch construction. `None` ⇒ AR-only.
     // DSpark wins over DFlash/MTP/n-gram when its sidecar loaded.
-    // When adaptive, upstream gates left dspark/dflash/mtp as None — no free needed.
     let speculator = if adaptive_blocks_generic_spec {
         None
     } else {
@@ -1765,65 +1788,6 @@ fn finish_qwen35_load(
                 ctx.spec,
             )
         })
-    };
-
-    // ── Qwen3.5/3.6 native MTP (NextN) head ────────────────────────
-    //
-    // Load the arch_id=21 MTP head when it is present either bundled in the
-    // trunk file (a `.mq4-mtp` trailer, magic HFBNDMTP) or as a sibling `.mtp`
-    // sidecar (`<trunk>.mtp` next to the model path). The head is OPTIONAL:
-    // `Ok(None)` / a missing sidecar just leaves MTP serving unavailable and
-    // the model serves via the unchanged DFlash/AR path. Failures here are
-    // non-fatal — log and continue with `qwen35_mtp_head = None`.
-    //
-    // max_seq mirrors the trunk's KV capacity (the MTP head's KV is a single
-    // F32 layer, so even a 100K window is only a few hundred MB at dim=5120).
-    let qwen35_mtp_head: Option<hipfire_arch_qwen35::mtp_head::Qwen35MtpHead> = {
-        use hipfire_arch_qwen35::mtp_head;
-        let trunk_path = Path::new(ctx.path);
-        // 1. Bundled trailer inside the trunk file?
-        let bundled = match mtp_head::load_mtp_head_bundled(trunk_path, ctx.gpu, physical_cap) {
-            Ok(h) => h,
-            Err(e) => {
-                eprintln!("  MTP head (bundled) load failed: {e} — MTP serving disabled");
-                None
-            }
-        };
-        match bundled {
-            Some(h) => {
-                eprintln!(
-                    "  MTP head loaded (bundled .mq4-mtp): n_embd={} vocab={} K-default=3",
-                    h.config.n_embd, h.config.vocab_size
-                );
-                Some(h)
-            }
-            None => {
-                // 2. Sidecar `<trunk>.mtp` next to the model path?
-                let sidecar = trunk_path.with_extension("mtp");
-                if sidecar.exists() {
-                    match mtp_head::load_mtp_head(&sidecar, ctx.gpu, physical_cap) {
-                        Ok(h) => {
-                            eprintln!(
-                                "  MTP head loaded (sidecar {}): n_embd={} vocab={} K-default=3",
-                                sidecar.display(),
-                                h.config.n_embd,
-                                h.config.vocab_size
-                            );
-                            Some(h)
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "  MTP head (sidecar {}) load failed: {e} — MTP serving disabled",
-                                sidecar.display()
-                            );
-                            None
-                        }
-                    }
-                } else {
-                    None
-                }
-            }
-        }
     };
 
     // Move adaptive controller out of the bundle before parking the rest in
@@ -1848,19 +1812,9 @@ fn finish_qwen35_load(
             chat_template,
         )
     };
-    // `mtp_weights_present` drives the mtp_mode=auto serve decision (mirrors the
-    // dspark probe set in the daemon's load handler). For qwen35 the presence of a
-    // loaded MTP head IS the signal.
-    model.mtp_weights_present = qwen35_mtp_head.is_some();
-    // The head lives on the bundle, not on LoadedModel: per-arch state must not
-    // keep an arch type in the loader's struct, or LoadedModel can never move
-    // into arch-free hipfire-runtime.
-    if let Some(bundle) = model.state.as_mut().and_then(|s| {
-        (s.as_mut() as &mut dyn std::any::Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
-    }) {
-        bundle.qwen35_mtp_head = qwen35_mtp_head;
-    }
+    model.mtp_weights_present = mtp_present;
     Ok(model)
+
 }
 
 // ─── Main public API ──────────────────────────────────────────────────

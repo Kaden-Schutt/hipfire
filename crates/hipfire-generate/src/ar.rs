@@ -721,12 +721,11 @@ pub fn truncate_checkpoints(
 /// Selected once at the top of [`generate`] and is the sole authority for
 /// dispatch branch choice and tools capability. Precedence matches production:
 /// EP → arch short-circuits (Qwen2, DeepSeek4, LFM, Cohere, MiniMax, dots) →
-/// pp>1 → Qwen native MTP → Qwen/LLaMA DFlash/spec → default AR/unknown.
+/// pp>1 → Qwen/LLaMA DFlash/spec (MTP uses the generic wrapper) → default AR/unknown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GenerationRoute {
     QwenAr,
     QwenDflash,
-    QwenMtp,
     Qwen2Ar,
     Qwen2Spec,
     Deepseek4Ar,
@@ -754,7 +753,6 @@ impl GenerationRoute {
     pub const ALL: &'static [Self] = &[
         Self::QwenAr,
         Self::QwenDflash,
-        Self::QwenMtp,
         Self::Qwen2Ar,
         Self::Qwen2Spec,
         Self::Deepseek4Ar,
@@ -795,7 +793,6 @@ impl GenerationRoute {
         match self {
             Self::QwenAr => "qwen_ar",
             Self::QwenDflash => "qwen_dflash",
-            Self::QwenMtp => "qwen_mtp",
             Self::Qwen2Ar => "qwen2_ar",
             Self::Qwen2Spec => "qwen2_spec",
             Self::Deepseek4Ar => "deepseek4_ar",
@@ -826,9 +823,7 @@ pub struct GenerationRouteInputs {
     pub ep: bool,
     pub pp: usize,
     pub has_speculator: bool,
-    pub qwen_mtp_head: bool,
-    pub qwen_mtp_opt_in: bool,
-    pub mtp_sampled_on: bool,
+    pub speculator_is_mtp: bool,
     pub deepseek4_spec_requested: bool,
     pub ngram_can_sample: bool,
     pub temp: f32,
@@ -914,30 +909,29 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
         return GenerationRoute::PipelineParallel;
     }
 
-    // 4. Qwen native MTP (before DFlash).
+    // 4. Qwen / LLaMA DFlash/spec (same gates as production generate body).
+    // MTP (speculator.name()=="mtp") shares the generic QwenDflash wrapper.
+    // Sampled MTP honors temp>0 including user-explicit sampling and min_p
+    // when supports_temp_verify; DFlash keeps its existing SWOR/chain gates.
     let caps = hipfire_loader::carrier_for(i.arch_id)
         .map(|c| c.caps())
         .unwrap_or_default();
-    if i.qwen_mtp_opt_in
-        && i.qwen_mtp_head
-        && (i.temp <= 1e-6 || i.mtp_sampled_on)
-        && caps.supports_mtp
-    {
-        return GenerationRoute::QwenMtp;
-    }
-
-    // 5. Qwen / LLaMA DFlash/spec (same gates as production generate body).
     let dflash_min_p_present = i.min_p.map(|p| p > 0.0).unwrap_or(false);
-    let ddtree_swor_route =
-        i.temp > 1e-6 && i.supports_temp_swor && !i.user_explicit_sampling && !i.temp_spec_env_off;
-    let chain_sample_route = i.temp > 1e-6
+    let ddtree_swor_route = !i.speculator_is_mtp
+        && i.temp > 1e-6
+        && i.supports_temp_swor
+        && !i.user_explicit_sampling
+        && !i.temp_spec_env_off;
+    let chain_sample_route = !i.speculator_is_mtp
+        && i.temp > 1e-6
         && !i.supports_temp_swor
         && i.ngram_can_sample
         && i.fast_sample_on
         && !dflash_min_p_present
         && !i.temp_spec_env_off;
+    let mtp_sample_route = i.speculator_is_mtp && i.temp > 1e-6 && i.supports_temp_swor;
     let qwen_dflash_route = caps.is_qwen_dflash()
-        && (i.temp <= 1e-6 || ddtree_swor_route || chain_sample_route);
+        && (i.temp <= 1e-6 || ddtree_swor_route || chain_sample_route || mtp_sample_route);
     let llama_dflash_route = caps.is_llama_dflash()
         && (i.temp <= 1e-6 || ddtree_swor_route || chain_sample_route);
     if i.has_speculator
@@ -952,7 +946,7 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
         };
     }
 
-    // 6. Default AR / unknown.
+    // 5. Default AR / unknown.
     if caps.is_qwen_dflash() {
         GenerationRoute::QwenAr
     } else if caps.is_llama_dflash() {
@@ -1055,9 +1049,7 @@ pub fn generate(
         ep: m.ep.is_some(),
         pp: m.pp,
         has_speculator: m.speculator.is_some(),
-        qwen_mtp_head: m.state.as_ref().and_then(|s| (s.as_ref() as &dyn std::any::Any).downcast_ref::<hipfire_arch_qwen35::Qwen35Bundle>()).map_or(false, |b| b.qwen35_mtp_head.is_some()),
-        qwen_mtp_opt_in: std::env::var("HIPFIRE_QWEN_MTP").ok().as_deref() == Some("1"),
-        mtp_sampled_on: std::env::var("HIPFIRE_MTP_SAMPLED").ok().as_deref() == Some("1"),
+        speculator_is_mtp: m.speculator.as_ref().is_some_and(|s| s.name() == "mtp"),
         deepseek4_spec_requested: deepseek4_spec_requested(m),
         ngram_can_sample,
         temp,
@@ -1276,6 +1268,7 @@ pub fn generate(
                 temp,
                 top_p,
                 top_k.map(|k| k as usize).unwrap_or(0),
+                min_p.unwrap_or(0.0),
                 cactus_delta,
                 reasoning_effort,
                 enable_thinking,
@@ -1411,6 +1404,7 @@ pub fn generate(
                 temp,
                 top_p,
                 top_k.map(|k| k as usize).unwrap_or(0),
+                min_p.unwrap_or(0.0),
                 cactus_delta,
                 reasoning_effort,
                 enable_thinking,
@@ -1487,6 +1481,7 @@ pub fn generate(
                 temp,
                 top_p,
                 top_k.map(|k| k as usize).unwrap_or(0),
+                min_p.unwrap_or(0.0),
                 cactus_delta,
                 reasoning_effort,
                 enable_thinking,
@@ -1563,6 +1558,7 @@ pub fn generate(
                 temp,
                 top_p,
                 top_k.map(|k| k as usize).unwrap_or(0),
+                min_p.unwrap_or(0.0),
                 cactus_delta,
                 reasoning_effort,
                 enable_thinking,
@@ -1678,46 +1674,13 @@ pub fn generate(
             );
             return;
         }
-        GenerationRoute::QwenMtp => {
-            crate::qwen::generate_qwen35_mtp(
-                m,
-                gpu,
-                stdout,
-                id,
-                prompt,
-                system_prompt,
-                max_tokens,
-                max_think_tokens,
-                assistant_prefix,
-                tools,
-                messages_history,
-                stop,
-                temp,
-                top_p,
-                top_k,
-                min_p.unwrap_or(0.0),
-                reasoning_effort,
-                enable_thinking,
-            );
-            let _ = (
-                repeat_penalty,
-                repeat_window,
-                presence_penalty,
-                frequency_penalty,
-                budget_alert_at_tok,
-                budget_alert_text,
-                pflash_state,
-                pflash_cfg,
-                think_mode,
-            );
-            return;
-        }
         GenerationRoute::QwenDflash | GenerationRoute::LlamaSpec | GenerationRoute::GlimmerSpec => {
             // Operator visibility: a temp>0 request on a DFlash-capable arch that
             // did NOT qualify is handled by the selector (falls to AR). When we
             // are on the DFlash arm, still warn once if min_p was requested.
             let minp_requested = min_p.map(|p| p > 0.0).unwrap_or(false);
-            if temp > 1e-6 && minp_requested {
+            let spec_is_mtp = m.speculator.as_ref().is_some_and(|s| s.name() == "mtp");
+            if temp > 1e-6 && minp_requested && !spec_is_mtp {
                 static SPEC_MINP_WARNED: std::sync::atomic::AtomicBool =
                     std::sync::atomic::AtomicBool::new(false);
                 if !SPEC_MINP_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -1760,6 +1723,7 @@ pub fn generate(
                 temp,
                 top_p,
                 top_k.map(|k| k as usize).unwrap_or(0),
+                min_p.unwrap_or(0.0),
                 cactus_delta,
                 reasoning_effort,
                 enable_thinking,

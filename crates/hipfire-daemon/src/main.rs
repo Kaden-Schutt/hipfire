@@ -22,14 +22,11 @@
 //!   ← {"type":"unloaded"}
 
 use base64::Engine;
-// Used by hipfire_generate::qwen::generate_qwen35_mtp (native-MTP serve path, merged from spec-graph):
-// it manually re-packs the Qwen35 bundle on every exit + re-opens the HFQ mmap.
 use hipfire_runtime::emit_text::{
     currently_in_think, extract_tool_calls_from_text, ThinkOutputRouter, ThinkRouteEvent,
     ToolOutputRouter, ToolRouteError, ToolRouteEvent,
 };
 use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
-use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama;
 use hipfire_runtime::prompt_frame::ThinkMode;
 use hipfire_runtime::sampler::{self, SamplerConfig};
@@ -1326,6 +1323,12 @@ fn main() {
                         .and_then(|p| p.get("dspark_conf_threshold"))
                         .and_then(|v| v.as_f64())
                         .map(|t| t as f32),
+                    mtp: match mtp_mode.as_str() {
+                        "on" => Some(true),
+                        "off" => Some(false),
+                        _ => None, // "auto" → loader default
+                    },
+                    mtp_k: Some(mtp_k),
                 };
 
                 // 0.1.7-alpha: DFlash tuning knobs forwarded from the CLI.

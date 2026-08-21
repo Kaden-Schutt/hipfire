@@ -788,10 +788,6 @@ pub struct ModelSlot {
     /// tower while the bundle is out of `ModelState`.
     pub vision_config: Option<hipfire_arch_qwen35_vl::qwen35_vl::VisionConfig>,
     pub vision_weights: Option<hipfire_arch_qwen35_vl::qwen35_vl::VisionWeights>,
-    /// Native MTP head parked through the slot guard so `Qwen35Bundle`
-    /// round-trips without loss. The slot never owns MTP serving; it just
-    /// carries the head while the bundle is out of `LoadedModel.state`.
-    pub qwen35_mtp_head: Option<crate::mtp_head::Qwen35MtpHead>,
 }
 
 impl ModelSlot {
@@ -821,7 +817,6 @@ impl ModelSlot {
             pp_scratch_set,
             vision_config,
             vision_weights,
-            qwen35_mtp_head,
             qwen35_decode_batch,
         } = bundle;
         debug_assert!(
@@ -846,7 +841,6 @@ impl ModelSlot {
             dspark_extract_layers: Vec::new(),
             vision_config,
             vision_weights,
-            qwen35_mtp_head,
         })
     }
 
@@ -866,7 +860,6 @@ impl ModelSlot {
             pp_scratch_set: None,
             vision_config: self.vision_config,
             vision_weights: self.vision_weights,
-            qwen35_mtp_head: self.qwen35_mtp_head,
             qwen35_decode_batch: None,
         }
     }
@@ -984,7 +977,6 @@ impl ModelSlot {
             dspark_extract_layers: Vec::new(),
             vision_config: None,
             vision_weights: None,
-            qwen35_mtp_head: None,
         })
     }
 

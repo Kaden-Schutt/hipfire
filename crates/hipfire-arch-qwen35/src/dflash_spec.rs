@@ -22,7 +22,7 @@ use crate::speculative::{
 use hipfire_runtime::dflash::{DflashConfig, DflashScratch, DflashWeights};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::spec::{
-    EvictRetain, PrefillOutcome, SpecGrammar, SpecStep, SpecTarget, Speculator,
+    EvictRetain, PrefillOutcome, SpecGrammar, SpecRequestConfig, SpecStep, SpecTarget, Speculator,
 };
 use rdna_compute::Gpu;
 use std::path::Path;
@@ -1011,17 +1011,19 @@ impl Speculator for DflashSpeculator {
         Ok(position)
     }
 
-    fn set_sampling(&mut self, temp: f32, top_p: f32, top_k: usize, cactus_delta: f32) {
+    fn configure_request(&mut self, cfg: SpecRequestConfig) {
         // Store the request's sampling config for the chain-mode branch of
         // `step`. Re-seed the RNG to the same fixed value spec-graph used per
         // `generate_dflash` call (a fresh `let mut rng_state = 0x13579BDF`), so a
         // sampled request is deterministic given its seed and two identical
         // requests in one session produce identical output — preserving
         // spec-graph's behavior rather than letting the seed drift across turns.
-        self.sample_temp = temp;
-        self.sample_top_p = top_p;
-        self.sample_top_k = top_k;
-        self.sample_cactus = cactus_delta;
+        // New SpecRequestConfig fields (min_p / rng_seed / ngram) are ignored —
+        // this path never supported them.
+        self.sample_temp = cfg.temp;
+        self.sample_top_p = cfg.top_p;
+        self.sample_top_k = cfg.top_k;
+        self.sample_cactus = cfg.cactus_delta;
         self.rng_state = 0x13579BDF;
     }
 
