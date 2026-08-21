@@ -4366,7 +4366,12 @@ fn conv_scalar_prep_enabled(
             // A/B/B/A measured 35.376->35.657 tok/s (+0.79%) and
             // 28.105->27.891 ms p50 (-0.76%). The fused route deletes
             // 48 dispatches/token and stayed exact for 1,025 greedy tokens.
-            super::config::qwen36_27b_dense_shape(config, n_v_heads)
+            // 2026-08-21: default extended to every gfx1100 shape passing
+            // the structural checks below — the kernel is fully
+            // shape-parameterized (runtime k_dim/v_dim/heads, adaptive
+            // grid). Qwen3.5-4B certified: greedy text parity (500/600 tok)
+            // + 3 fresh-process E2E pairs.
+            true
         }
     };
     let shape = hipfire_config::developer_var("HIPFIRE_CONV_QKNORM_SHAPE").ok();
