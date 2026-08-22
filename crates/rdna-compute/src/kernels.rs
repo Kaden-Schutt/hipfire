@@ -1095,6 +1095,16 @@ pub const FUSED_QKVZA_HFQ4G256_FUSEDNORM_GFX1100_SRC: &str =
     // rmsnorm+AWQ+FWHT prologue, bit-exact vs the direct producer.
     include_str!("../../../kernels/src/fused_qkvza_hfq4g256_fusednorm.gfx1100.hip");
 
+pub const FUSED_GATE_UP_HFQ4G256_FUSEDNORM_GFX1100_SRC: &str =
+    // Consumer-fold lever (HIPFIRE_QKVZA_FUSEDNORM=1): gate_up GEMV with
+    // inline rmsnorm+AWQ+FWHT prologue; see the qkvza fusednorm kernel.
+    include_str!("../../../kernels/src/fused_gate_up_hfq4g256_fusednorm.gfx1100.hip");
+
+pub const FUSED_QKV_HFQ4G256_FUSEDNORM_GFX1100_SRC: &str =
+    // Consumer-fold lever (HIPFIRE_QKVZA_FUSEDNORM=1): qkv GEMV with inline
+    // rmsnorm+AWQ+FWHT prologue; see the qkvza fusednorm kernel.
+    include_str!("../../../kernels/src/fused_qkv_hfq4g256_fusednorm.gfx1100.hip");
+
 pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_WAVEGRID_GFX1100_SRC: &str =
     // K/256 workgroups × wave32: spread the FWHT groups across CUs so the
     // reduction and rotation overlap VRAM latency instead of serializing on

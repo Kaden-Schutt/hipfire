@@ -141,6 +141,124 @@ fn main() {
         }
     }
 
+    // ── gate_up fold probe.
+    let gate_m_p = 384usize;
+    let up_m_p = 384usize;
+    let wgt = mk_weights(gate_m_p);
+    let wup = mk_weights(up_m_p);
+    let wgt_t = gpu.upload_raw(&wgt, &[wgt.len()]).expect("wgt");
+    let wup_t = gpu.upload_raw(&wup, &[wup.len()]).expect("wup");
+    let yg_a = gpu.alloc_tensor(&[gate_m_p], DType::F32).expect("yg a");
+    let yu_a = gpu.alloc_tensor(&[up_m_p], DType::F32).expect("yu a");
+    let yg_b = gpu.alloc_tensor(&[gate_m_p], DType::F32).expect("yg b");
+    let yu_b = gpu.alloc_tensor(&[up_m_p], DType::F32).expect("yu b");
+    // producer arm reuses x_rot scratch.
+    gpu.fused_rmsnorm_rotate_mq_awq(&xt, &gt, &at, &x_rot, k, eps)
+        .expect("producer gu");
+    gpu.fused_gate_up_hfq4g256(&wgt_t, &wup_t, &x_rot, &yg_a, &yu_a, gate_m_p, up_m_p, k)
+        .expect("consumer gu");
+    gpu.hip.device_synchronize().expect("sync gu");
+    gpu.fused_gate_up_hfq4g256_fusednorm(
+        &wgt_t, &wup_t, &xt, &gt, &at, &yg_b, &yu_b, gate_m_p, up_m_p, k, eps,
+    )
+    .expect("fusednorm gu");
+    gpu.hip.device_synchronize().expect("sync gu b");
+    {
+        let a = gpu.download_f32(&yg_a).unwrap();
+        let b = gpu.download_f32(&yg_b).unwrap();
+        let au_ = gpu.download_f32(&yu_a).unwrap();
+        let bu = gpu.download_f32(&yu_b).unwrap();
+        let mism_g = a
+            .iter()
+            .zip(b.iter())
+            .filter(|(p, q)| p.to_bits() != q.to_bits())
+            .count();
+        let mism_u = au_
+            .iter()
+            .zip(bu.iter())
+            .filter(|(p, q)| p.to_bits() != q.to_bits())
+            .count();
+        println!(
+            "gate_up: {} mism_g={mism_g}/{} mism_u={mism_u}/{}",
+            if mism_g + mism_u == 0 {
+                "BITEXACT"
+            } else {
+                "MISMATCH"
+            },
+            gate_m_p,
+            up_m_p
+        );
+        if mism_g + mism_u > 0 {
+            all_ok = false;
+        }
+    }
+
+    // ── qkv fold probe.
+    let q_m_p = 512usize;
+    let k_m_p = 128usize;
+    let v_m_p = 512usize;
+    let wqq = mk_weights(q_m_p);
+    let wkk = mk_weights(k_m_p);
+    let wvv = mk_weights(v_m_p);
+    let wqq_t = gpu.upload_raw(&wqq, &[wqq.len()]).expect("wqq");
+    let wkk_t = gpu.upload_raw(&wkk, &[wkk.len()]).expect("wkk");
+    let wvv_t = gpu.upload_raw(&wvv, &[wvv.len()]).expect("wvv");
+    let yq2_a = gpu.alloc_tensor(&[q_m_p], DType::F32).expect("yq2 a");
+    let yk2_a = gpu.alloc_tensor(&[k_m_p], DType::F32).expect("yk2 a");
+    let yv2_a = gpu.alloc_tensor(&[v_m_p], DType::F32).expect("yv2 a");
+    let yq2_b = gpu.alloc_tensor(&[q_m_p], DType::F32).expect("yq2 b");
+    let yk2_b = gpu.alloc_tensor(&[k_m_p], DType::F32).expect("yk2 b");
+    let yv2_b = gpu.alloc_tensor(&[v_m_p], DType::F32).expect("yv2 b");
+    gpu.fused_rmsnorm_rotate_mq_awq(&xt, &gt, &at, &x_rot, k, eps)
+        .expect("producer qkv");
+    gpu.fused_qkv_hfq4g256(
+        &wqq_t, &wkk_t, &wvv_t, &x_rot, &yq2_a, &yk2_a, &yv2_a, q_m_p, k_m_p, v_m_p, k,
+    )
+    .expect("consumer qkv");
+    gpu.hip.device_synchronize().expect("sync qkv");
+    gpu.fused_qkv_hfq4g256_fusednorm(
+        &wqq_t, &wkk_t, &wvv_t, &xt, &gt, &at, &yq2_b, &yk2_b, &yv2_b, q_m_p, k_m_p, v_m_p, k, eps,
+    )
+    .expect("fusednorm qkv");
+    gpu.hip.device_synchronize().expect("sync qkv b");
+    {
+        let aq = gpu.download_f32(&yq2_a).unwrap();
+        let bq = gpu.download_f32(&yq2_b).unwrap();
+        let ak = gpu.download_f32(&yk2_a).unwrap();
+        let bk = gpu.download_f32(&yk2_b).unwrap();
+        let av = gpu.download_f32(&yv2_a).unwrap();
+        let bv = gpu.download_f32(&yv2_b).unwrap();
+        let mq = aq
+            .iter()
+            .zip(bq.iter())
+            .filter(|(p, q)| p.to_bits() != q.to_bits())
+            .count();
+        let mk = ak
+            .iter()
+            .zip(bk.iter())
+            .filter(|(p, q)| p.to_bits() != q.to_bits())
+            .count();
+        let mv = av
+            .iter()
+            .zip(bv.iter())
+            .filter(|(p, q)| p.to_bits() != q.to_bits())
+            .count();
+        println!(
+            "qkv: {} mism_q={mq}/{} mism_k={mk}/{} mism_v={mv}/{}",
+            if mq + mk + mv == 0 {
+                "BITEXACT"
+            } else {
+                "MISMATCH"
+            },
+            q_m_p,
+            k_m_p,
+            v_m_p
+        );
+        if mq + mk + mv > 0 {
+            all_ok = false;
+        }
+    }
+
     // ── rms diagnostics via the eps<0 sentinel tap. Every matrix's row-0
     // block writes its own output's [0]; use throwaway buffers everywhere
     // except the one we read.
@@ -168,7 +286,10 @@ fn main() {
     gpu.hip.device_synchronize().expect("sync naive");
     let rms_n = gpu.download_f32(&y_rms).unwrap()[0];
     println!("rms(host)={rms_host:.6e}");
-    println!("rms(fold slot/tree)={rms_k:.6e} ratio={:.4}", rms_k / rms_host);
+    println!(
+        "rms(fold slot/tree)={rms_k:.6e} ratio={:.4}",
+        rms_k / rms_host
+    );
     println!(
         "rms(fold naive strided)={rms_n:.6e} ratio_vs_host={:.4}",
         rms_n / rms_host_n

@@ -3520,6 +3520,205 @@ impl Gpu {
         result
     }
 
+    /// Consumer-fold lever (HIPFIRE_QKVZA_FUSEDNORM=1): gate_up variant of
+    /// the fusednorm prologue; see fused_qkvza_hfq4g256_fusednorm.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fused_gate_up_hfq4g256_fusednorm(
+        &mut self,
+        a_gate: &GpuTensor,
+        a_up: &GpuTensor,
+        x_raw: &GpuTensor,
+        gamma: &GpuTensor,
+        awq_scale: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        gate_m: usize,
+        up_m: usize,
+        k: usize,
+        eps: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_mq_signs()?;
+        self.ensure_kernel(
+            "fused_gate_up_hfq4g256_fusednorm",
+            kernels::FUSED_GATE_UP_HFQ4G256_FUSEDNORM_GFX1100_SRC,
+            "fused_gate_up_hfq4g256_fusednorm",
+        )?;
+        let ag = a_gate.buf.as_ptr();
+        let au = a_up.buf.as_ptr();
+        let xp = x_raw.buf.as_ptr();
+        let gp = gamma.buf.as_ptr();
+        let ap = awq_scale.buf.as_ptr();
+        let s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let yg = y_gate.buf.as_ptr();
+        let yu = y_up.buf.as_ptr();
+        let g_m_i = gate_m as i32;
+        let u_m_i = up_m as i32;
+        let k_i = k as i32;
+
+        let total_m = (gate_m + up_m) as u32;
+        let grid = [total_m, 1, 1];
+        let block = [32u32, 1, 1];
+
+        let bytes = crate::profile::gemv_hfq4g256_bytes(gate_m, k)
+            + crate::profile::gemv_hfq4g256_bytes(up_m, k);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "fused",
+            "fused_gate_up_hfq4g256_fusednorm",
+            bytes,
+        );
+
+        let mut params: Vec<*mut c_void> = vec![
+            &ag as *const _ as *mut c_void,
+            &au as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &gp as *const _ as *mut c_void,
+            &ap as *const _ as *mut c_void,
+            &s1 as *const _ as *mut c_void,
+            &s2 as *const _ as *mut c_void,
+            &yg as *const _ as *mut c_void,
+            &yu as *const _ as *mut c_void,
+            &g_m_i as *const _ as *mut c_void,
+            &u_m_i as *const _ as *mut c_void,
+            &k_i as *const _ as *mut c_void,
+            &eps as *const _ as *mut c_void,
+        ];
+        let result = self.launch_maybe_blob(
+            "fused_gate_up_hfq4g256_fusednorm",
+            grid,
+            block,
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ag);
+                b.push_ptr(au);
+                b.push_ptr(xp);
+                b.push_ptr(gp);
+                b.push_ptr(ap);
+                b.push_ptr(s1);
+                b.push_ptr(s2);
+                b.push_ptr(yg);
+                b.push_ptr(yu);
+                b.push_i32(g_m_i);
+                b.push_i32(u_m_i);
+                b.push_i32(k_i);
+                b.push_f32(eps);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Consumer-fold lever (HIPFIRE_QKVZA_FUSEDNORM=1): qkv variant of the
+    /// fusednorm prologue; see fused_qkvza_hfq4g256_fusednorm.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fused_qkv_hfq4g256_fusednorm(
+        &mut self,
+        a_q: &GpuTensor,
+        a_k: &GpuTensor,
+        a_v: &GpuTensor,
+        x_raw: &GpuTensor,
+        gamma: &GpuTensor,
+        awq_scale: &GpuTensor,
+        y_q: &GpuTensor,
+        y_k: &GpuTensor,
+        y_v: &GpuTensor,
+        q_m: usize,
+        k_m: usize,
+        v_m: usize,
+        k: usize,
+        eps: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_mq_signs()?;
+        self.ensure_kernel(
+            "fused_qkv_hfq4g256_fusednorm",
+            kernels::FUSED_QKV_HFQ4G256_FUSEDNORM_GFX1100_SRC,
+            "fused_qkv_hfq4g256_fusednorm",
+        )?;
+        let aqp = a_q.buf.as_ptr();
+        let akp = a_k.buf.as_ptr();
+        let avp = a_v.buf.as_ptr();
+        let xp = x_raw.buf.as_ptr();
+        let gp = gamma.buf.as_ptr();
+        let ap = awq_scale.buf.as_ptr();
+        let s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let yqp = y_q.buf.as_ptr();
+        let ykp = y_k.buf.as_ptr();
+        let yvp = y_v.buf.as_ptr();
+        let q_m_i = q_m as i32;
+        let k_m_i = k_m as i32;
+        let v_m_i = v_m as i32;
+        let k_i = k as i32;
+
+        let total_m = (q_m + k_m + v_m) as u32;
+        let grid = [total_m, 1, 1];
+        let block = [32u32, 1, 1];
+
+        let bytes = crate::profile::gemv_hfq4g256_bytes(q_m, k)
+            + crate::profile::gemv_hfq4g256_bytes(k_m, k)
+            + crate::profile::gemv_hfq4g256_bytes(v_m, k);
+        let timer =
+            crate::profile::begin_timer(&self.hip, "fused", "fused_qkv_hfq4g256_fusednorm", bytes);
+
+        let mut params: Vec<*mut c_void> = vec![
+            &aqp as *const _ as *mut c_void,
+            &akp as *const _ as *mut c_void,
+            &avp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &gp as *const _ as *mut c_void,
+            &ap as *const _ as *mut c_void,
+            &s1 as *const _ as *mut c_void,
+            &s2 as *const _ as *mut c_void,
+            &yqp as *const _ as *mut c_void,
+            &ykp as *const _ as *mut c_void,
+            &yvp as *const _ as *mut c_void,
+            &q_m_i as *const _ as *mut c_void,
+            &k_m_i as *const _ as *mut c_void,
+            &v_m_i as *const _ as *mut c_void,
+            &k_i as *const _ as *mut c_void,
+            &eps as *const _ as *mut c_void,
+        ];
+        let result = self.launch_maybe_blob(
+            "fused_qkv_hfq4g256_fusednorm",
+            grid,
+            block,
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(aqp);
+                b.push_ptr(akp);
+                b.push_ptr(avp);
+                b.push_ptr(xp);
+                b.push_ptr(gp);
+                b.push_ptr(ap);
+                b.push_ptr(s1);
+                b.push_ptr(s2);
+                b.push_ptr(yqp);
+                b.push_ptr(ykp);
+                b.push_ptr(yvp);
+                b.push_i32(q_m_i);
+                b.push_i32(k_m_i);
+                b.push_i32(v_m_i);
+                b.push_i32(k_i);
+                b.push_f32(eps);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// gfx1100/K=2048 QKVZA experiment that also prepares the DeltaNet beta
     /// and alpha scalars. The projection FMAs and reduction are identical to
     /// `fused_qkvza_hfq4g256`; only the two tiny output tails absorb the

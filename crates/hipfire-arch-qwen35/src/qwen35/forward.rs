@@ -2671,6 +2671,27 @@ fn qkv_via_execute_steps(
     fa_v: &GpuTensor,
     eps: f32,
 ) -> HipResult<()> {
+    // Consumer-fold lever (HIPFIRE_QKVZA_FUSEDNORM=1): same bit-exact fold as
+    // qkvza_via_execute_steps, applied to the FA-layer qkv projection.
+    // NOTE: measured negative on Qwen3.5-4B (94us/call vs 39us producer+consumer
+    // pair) - kept behind its OWN opt-in flag, deliberately NOT covered by
+    // HIPFIRE_QKVZA_FUSEDNORM. See perf-checkpoints/2026-08-22 campaign doc.
+    static FUSEDNORM_QKV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let fusednorm_qkv = *FUSEDNORM_QKV.get_or_init(|| {
+        hipfire_config::developer_var("HIPFIRE_QKV_FUSEDNORM")
+            .ok()
+            .as_deref()
+            == Some("1")
+    });
+    if fusednorm_qkv && gpu.arch_caps.is_gfx1100() && wq.k % 256 == 0 {
+        if let Some(awq) = wq.awq_scale.as_ref() {
+            return gpu.fused_qkv_hfq4g256_fusednorm(
+                &wq.buf, &wk.buf, &wv.buf, x, attn_norm, awq, fa_q, fa_k, fa_v, wq.m, wk.m, wv.m,
+                wq.k, eps,
+            );
+        }
+    }
+
     let rotation = dtype_rotation_plan(wq.gpu_dtype);
     if rotation == RotationPlan::Givens {
         let wrq = WeightRef {
@@ -2803,6 +2824,36 @@ fn gate_up_via_execute_steps(
     up_out: &GpuTensor,
     eps: f32,
 ) -> HipResult<()> {
+    // Consumer-fold lever (HIPFIRE_QKVZA_FUSEDNORM=1): FFN gate_up variant.
+    // NOTE: measured strongly negative on Qwen3.5-4B (156us/call vs ~27us
+    // producer+consumer pair; 13824-row grid makes pass-A redundancy overwhelm
+    // L2) - kept behind its OWN opt-in flag, deliberately NOT covered by
+    // HIPFIRE_QKVZA_FUSEDNORM. See perf-checkpoints/2026-08-22 campaign doc.
+    static FUSEDNORM_GU: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let fusednorm_gu = *FUSEDNORM_GU.get_or_init(|| {
+        hipfire_config::developer_var("HIPFIRE_GATE_UP_FUSEDNORM")
+            .ok()
+            .as_deref()
+            == Some("1")
+    });
+    if fusednorm_gu && gpu.arch_caps.is_gfx1100() && w_gate.k % 256 == 0 {
+        if let Some(awq) = w_gate.awq_scale.as_ref() {
+            return gpu.fused_gate_up_hfq4g256_fusednorm(
+                &w_gate.buf,
+                &w_up.buf,
+                x,
+                ffn_norm,
+                awq,
+                gate_out,
+                up_out,
+                w_gate.m,
+                w_up.m,
+                w_gate.k,
+                eps,
+            );
+        }
+    }
+
     let rotation = dtype_rotation_plan(w_gate.gpu_dtype);
     if rotation == RotationPlan::Givens {
         let wrg = WeightRef {
