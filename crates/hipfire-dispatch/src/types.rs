@@ -484,6 +484,11 @@ pub enum ArchPredicate {
     /// (RDNA1.1+). The two are unrelated ISA features.
     HasDot2F32F16,
     HasSdot4,
+    /// HFQ3-G256 plain GEMV admission: CDNA/older archs via the sdot4 generic
+    /// kernel, plus gfx1100/1101/1102 where `gemv_hfq3g256_for_arch` selects
+    /// the RDNA3 wave32 scalar variant (`gemv_hfq3g256_rdna3`, the MQ3
+    /// production path). gfx110x has no sdot4 but does have the rdna3 kernel.
+    HasHfq3G256Gemv,
     HasMmq,
     HasCdna3LdsGemv,
     /// `gemv_dp4a_enabled()` — gfx906-only by default (env-overridable).
@@ -742,7 +747,8 @@ impl KernelKey {
             | MFP4G32E8 | MFP4G32E8SOA
             | MFP3G32E8 | MFP2G32E8  // mfpN-E8: same RDNA3/4 gating as MFP4G32E8 via e8_with_wmma
             | ParoQ4G128 => ArchPredicate::Always,
-            HFQ3G256 | HFQ3G128 => ArchPredicate::HasSdot4,
+            HFQ3G256 => ArchPredicate::HasHfq3G256Gemv,
+            HFQ3G128 => ArchPredicate::HasSdot4,
             // MQ3G256 + MQ2/MQ3/MQ4-Lloyd: their GEMV kernels are WMMA-free
             // [32,1,1] wave32 scalar (gemv.rs:1004; kernels.rs:420/750 baseline
             // `_=>` arms) and ALREADY run on RDNA1/2 via the qwen35 direct path.

@@ -1,16 +1,18 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 // Copyright (c) 2026 Björn Bösel
 // hipfire — see LICENSE and NOTICE in the project root.
+pub mod attention_table;
+pub mod fused_qkv_table;
 pub mod gemm_table;
 pub mod gemv_table;
 pub mod moe_table;
 pub mod rotation_table;
-pub mod attention_table;
-pub mod fused_qkv_table;
 
-use std::collections::HashMap;
 use crate::context::DispatchCtx;
-use crate::types::{ArchPredicate, DispatchError, KernelKey, KernelVariant, ShapeInfo, ShapePredicate};
+use crate::types::{
+    ArchPredicate, DispatchError, KernelKey, KernelVariant, ShapeInfo, ShapePredicate,
+};
+use std::collections::HashMap;
 
 /// Kernel registry. Built once via `register`, frozen, read-only thereafter.
 pub struct KernelRegistry {
@@ -19,7 +21,9 @@ pub struct KernelRegistry {
 
 impl KernelRegistry {
     pub fn new() -> Self {
-        Self { table: HashMap::new() }
+        Self {
+            table: HashMap::new(),
+        }
     }
 
     pub fn register(&mut self, entry: KernelVariant) {
@@ -37,7 +41,9 @@ impl KernelRegistry {
         ctx: &DispatchCtx,
         shape: Option<&ShapeInfo>,
     ) -> Result<&KernelVariant, DispatchError> {
-        let variants = self.table.get(&key)
+        let variants = self
+            .table
+            .get(&key)
             .ok_or(DispatchError::NotFound { key })?;
 
         for variant in variants {
@@ -102,6 +108,12 @@ impl ArchPredicate {
             Self::HasWmmaGfx12 => ctx.arch.has_wmma_w32_gfx12(),
             Self::HasDot2F32F16 => ctx.arch.has_dot2_f32_f16(),
             Self::HasSdot4 => ctx.arch.has_hfq3_sdot4(),
+            Self::HasHfq3G256Gemv => {
+                ctx.arch.has_hfq3_sdot4()
+                    || ctx.arch.is_gfx1100()
+                    || ctx.arch.is_gfx1101()
+                    || ctx.arch.is_gfx1102()
+            }
             // MQ6/HFQ6 GEMV ships on RDNA4 (gemv_mq6g256_prerotated has a gfx12 build);
             // has_mmq is gfx906||rdna3 only, so admit RDNA4 explicitly.
             Self::HasMmq => ctx.arch.has_mmq() || ctx.arch.is_rdna4(),
