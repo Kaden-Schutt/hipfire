@@ -63,3 +63,13 @@ tg128@2048 = 224.55 (stdev 0.32). Example-path pairs: HFQ3 217.1–218.5 vs
 HFQ4 212.4–213.5, all HFQ3 > all HFQ4 (+2.3 % over HFQ4, +11 % over the
 209.9 session start). Greedy temp-0 quality on planets / haiku / seasons /
 Romeo-and-Juliet prompts: coherent and factually correct in both arms.
+
+## Addendum 2 (same day): memory-clock state during decode — null
+
+Sampled `pp_dpm_mclk` / `pp_dpm_sclk` every 2 s while the decode bench ran
+(default DPM): MCLK reaches its top state (1249 MHz) within ~8 s of load and
+holds it for the whole gen phase; SCLK auto-boosts to ~3.16 GHz. Forcing
+performance level high + fixed clocks changed nothing material (forced sclk
+index actually settled lower than auto boost). Memory/Infinity Cache clocks
+are not a limiting factor — the bandwidth ceiling in the analysis above is
+architectural, not a power-management artifact.
