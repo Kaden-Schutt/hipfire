@@ -73,3 +73,17 @@ performance level high + fixed clocks changed nothing material (forced sclk
 index actually settled lower than auto boost). Memory/Infinity Cache clocks
 are not a limiting factor — the bandwidth ceiling in the analysis above is
 architectural, not a power-management artifact.
+
+## Addendum 3 (same day): qkvza consumer-fold lands — 231.0 tok/s
+
+Commit `3abbc05e`: `HIPFIRE_QKVZA_FUSEDNORM=1` folds rmsnorm+AWQ+FWHT into
+the fused_qkvza GEMV prologue, bit-exact (probe bitwise on all four outputs;
+greedy e2e text byte-identical). Root cause of the first attempt's corruption:
+`__shfl_down` semantics in the emulated reduction tree — explicit-source
+`__shfl` stages fix it. Net gain is small (+0.7 % example; launch saving
+mostly offset by inline prologue cost) but consistent.
+
+Product path with all levers (`HIPFIRE_LM_HEAD_HFQ3=1 HIPFIRE_QKVZA_FUSEDNORM=1`),
+5 runs: **tg128@64 = 231.00 tok/s** (stdev 0.16), tg128@2048 = 225.27
+(stdev 0.25); prefill 3857 / 4419 tok/s. Campaign total: 209.9 → 231.0
+(+10.1 % this session; 190.6 → 231.0 = +21 % across both sessions).
