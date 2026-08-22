@@ -5,38 +5,12 @@
 //! Qwen3.5 weight loading: HFQ / ParoQuant sources, AWQ repack, packed-MQ4
 //! experts, `load_weights`, and the EP sharded loader.
 
-use hip_bridge::HipError;
-use hip_bridge::HipResult;
-use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::hfq::HfqTensorInfo;
-use hipfire_runtime::hfq_parallel::HfqReadJob;
-use hipfire_runtime::hfq_parallel::read_hfq_jobs_ordered;
-use hipfire_runtime::llama::EmbeddingFormat;
-use hipfire_runtime::llama::ParoRotation;
-use hipfire_runtime::llama::WeightTensor;
-use hipfire_runtime::llama::f16_to_f32;
-use hipfire_runtime::model_load::LoadedWeights;
-use hipfire_runtime::model_load::WeightSource;
-use hipfire_runtime::model_load::load_weights as rt_load_weights;
-use hipfire_runtime::model_source::ModelSource;
-use hipfire_runtime::paro::paro_load_norm;
-use hipfire_runtime::paro::paro_text_prefix;
-use hipfire_runtime::tp_shard::ShardConfig;
-use hipfire_runtime::weight_backend::HfqBackend;
-use hipfire_runtime::weight_backend::ParoBackend;
-use hipfire_runtime::weight_backend::dequant_norm;
-use hipfire_runtime::weight_backend::dequant_weight_raw;
-use hipfire_runtime::weight_backend::load_awq_scale_for;
-use hipfire_runtime::weight_backend::load_embedding;
-use hipfire_runtime::weight_backend::resolve_lm_head;
-use hipfire_runtime::weight_backend::reupload_f16_as_f32;
-use rdna_compute::DType;
-use rdna_compute::Gpu;
-use rdna_compute::GpuTensor;
+use super::config::f16_lm_head_mode_from_config;
 use super::config::F16LmHeadMode;
 use super::config::Qwen35Config;
-use super::config::f16_lm_head_mode_from_config;
 use super::forward::layers_have_mq6_moe;
+use super::weights::dtype_from_quant_type;
+use super::weights::mixed_expert_tag;
 use super::weights::ExpertWeights;
 use super::weights::LayerWeights;
 use super::weights::MoeFfnWeights;
@@ -49,8 +23,34 @@ use super::weights::Qwen35HfqSourceIdentity;
 use super::weights::Qwen35RankSeal;
 use super::weights::Qwen35Weights;
 use super::weights::SharedExpertWeights;
-use super::weights::dtype_from_quant_type;
-use super::weights::mixed_expert_tag;
+use hip_bridge::HipError;
+use hip_bridge::HipResult;
+use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::hfq::HfqTensorInfo;
+use hipfire_runtime::hfq_parallel::read_hfq_jobs_ordered;
+use hipfire_runtime::hfq_parallel::HfqReadJob;
+use hipfire_runtime::llama::f16_to_f32;
+use hipfire_runtime::llama::EmbeddingFormat;
+use hipfire_runtime::llama::ParoRotation;
+use hipfire_runtime::llama::WeightTensor;
+use hipfire_runtime::model_load::load_weights as rt_load_weights;
+use hipfire_runtime::model_load::LoadedWeights;
+use hipfire_runtime::model_load::WeightSource;
+use hipfire_runtime::model_source::ModelSource;
+use hipfire_runtime::paro::paro_load_norm;
+use hipfire_runtime::paro::paro_text_prefix;
+use hipfire_runtime::tp_shard::ShardConfig;
+use hipfire_runtime::weight_backend::dequant_norm;
+use hipfire_runtime::weight_backend::dequant_weight_raw;
+use hipfire_runtime::weight_backend::load_awq_scale_for;
+use hipfire_runtime::weight_backend::load_embedding;
+use hipfire_runtime::weight_backend::resolve_lm_head;
+use hipfire_runtime::weight_backend::reupload_f16_as_f32;
+use hipfire_runtime::weight_backend::HfqBackend;
+use hipfire_runtime::weight_backend::ParoBackend;
+use rdna_compute::DType;
+use rdna_compute::Gpu;
+use rdna_compute::GpuTensor;
 
 /// RMSNorm weight bias for qwen3.5/gemma-style norms: dequant computes `w + norm_bias`.
 /// qwen2/llama use `0.0`. Single source of truth — referenced by the backend constructors
@@ -93,6 +93,28 @@ fn qwen35_tensor_data_vec<'a>(
     for candidate in qwen35_tensor_name_candidates(name) {
         if let Some(found) = hfq.tensor_data_vec(&candidate) {
             return Some(found);
+        }
+    }
+    None
+}
+
+/// Borrowed-first variant of [`qwen35_tensor_data_vec`]: returns the mmap
+/// slice directly when the mapping is alive (dGPU loads keep it, so weight
+/// uploads DMA straight out of page-cache pages with no heap staging copy);
+/// falls back to the owned pread Vec on UMA (mmap dropped there). Same
+/// candidate resolution.
+fn qwen35_tensor_data_cow<'a>(
+    hfq: &'a HfqFile,
+    name: &str,
+) -> Option<(&'a HfqTensorInfo, std::borrow::Cow<'a, [u8]>)> {
+    for candidate in qwen35_tensor_name_candidates(name) {
+        if let Some((info, data)) = hfq.tensor_data(&candidate) {
+            return Some((info, std::borrow::Cow::Borrowed(data)));
+        }
+    }
+    for candidate in qwen35_tensor_name_candidates(name) {
+        if let Some((info, data)) = hfq.tensor_data_vec(&candidate) {
+            return Some((info, std::borrow::Cow::Owned(data)));
         }
     }
     None
@@ -589,12 +611,20 @@ pub(crate) fn load_weight_tensor(
     k: usize,
     candidates: fn(&str) -> Vec<String>,
 ) -> HipResult<WeightTensor> {
-    // Use pread path to avoid page cache buildup on unified-memory APUs.
+    // Zero-copy first: when the mmap is alive (dGPU loads keep it), DMA
+    // straight from the page-cache-backed slice — no heap staging copy.
+    // Pread fallback preserves UMA behavior (mmap dropped there).
     #[cfg(unix)]
     {
         let mut wt: Option<WeightTensor> = None;
         let mut matched: Option<String> = None;
         for candidate in candidates(name) {
+            if let Some((info, data)) = hfq.tensor_data(&candidate) {
+                let qt = info.quant_type;
+                wt = Some(load_weight_tensor_raw(gpu, qt, data, m, k)?);
+                matched = Some(candidate);
+                break;
+            }
             if let Some((info, buf)) = hfq.tensor_data_pread(&candidate) {
                 let qt = info.quant_type;
                 wt = Some(load_weight_tensor_raw(gpu, qt, &buf, m, k)?);
@@ -2217,8 +2247,18 @@ impl WeightSource for HfqSource<'_> {
     }
 
     fn prepare(&mut self, n_devices: usize) -> HipResult<()> {
+        // Keep the mmap alive on discrete GPUs (the carrier cleared
+        // `evict_page_cache` there): weight uploads DMA straight out of
+        // page-cache pages with no heap staging copy — measured 11–16 GB/s
+        // end-to-end vs ~4 GB/s through a pread staging buffer.
+        // UMA keeps the drop — evict=true is exactly the carrier's UMA
+        // signal — so cached model pages can't starve hipMalloc of RAM.
+        //
+        // NOTE: do NOT madvise-populate the mapping here. A blocking
+        // MAP_POPULATE measured identical totals (it relocates the same
+        // soft-fault work out of the upload loop into one serial stall).
         #[cfg(unix)]
-        if n_devices == 1 {
+        if n_devices == 1 && self.hfq.evicts_page_cache() {
             self.hfq.drop_mmap();
         }
         let _ = n_devices;
@@ -2239,7 +2279,7 @@ impl WeightSource for HfqSource<'_> {
                 c.mrope_interleaved, c.mrope_section
             );
         }
-        let (embd_meta, embd_data) = qwen35_tensor_data_vec(self.hfq, "embed_tokens.weight")
+        let (embd_meta, embd_data) = qwen35_tensor_data_cow(self.hfq, "embed_tokens.weight")
             .expect("embed_tokens not found");
         let out = load_embedding(gpu, embd_meta.quant_type, &embd_data, c.vocab_size, c.dim)?;
         drop(embd_data);
@@ -2273,11 +2313,11 @@ impl WeightSource for HfqSource<'_> {
             c.dim,
             |gpu| {
                 let (lm_info, lm_data) =
-                    qwen35_tensor_data_vec(hfq, "lm_head.weight").expect("lm_head present");
+                    qwen35_tensor_data_cow(hfq, "lm_head.weight").expect("lm_head present");
                 load_weight_tensor_raw(gpu, lm_info.quant_type, &lm_data, c.vocab_size, c.dim)
             },
             |gpu| {
-                let (embd_meta, embd_data) = qwen35_tensor_data_vec(hfq, "embed_tokens.weight")
+                let (embd_meta, embd_data) = qwen35_tensor_data_cow(hfq, "embed_tokens.weight")
                     .expect("embed_tokens not found");
                 dequant_weight_raw(gpu, embd_meta.quant_type, &embd_data, c.vocab_size, c.dim)
             },
