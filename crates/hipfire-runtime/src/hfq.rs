@@ -41,6 +41,44 @@ fn fadvise_dontneed(fd: std::os::unix::io::RawFd, offset: usize, len: usize) {
 #[cfg(not(unix))]
 fn fadvise_dontneed(_fd: i32, _offset: usize, _len: usize) {}
 
+/// Whether this GPU architecture has unified memory (APU — GPU VRAM is system
+/// RAM). UMA loads must keep page-cache eviction ON: cached model pages and
+/// hipMalloc'd buffers share physical RAM, so keeping pages resident doubles
+/// consumption and can OOM mid-load. Discrete-GPU loads should disable it.
+pub fn arch_is_uma(arch: &str) -> bool {
+    matches!(arch, "gfx1103" | "gfx1150" | "gfx1151" | "gfx1152")
+}
+
+impl HfqFile {
+    /// Kick asynchronous kernel readahead over the whole data region
+    /// (`posix_fadvise(POSIX_FADV_WILLNEED)`). Non-blocking: the disk DMA
+    /// runs concurrently with whatever the caller does next (GPU init,
+    /// early tensor uploads), so later preads hit the page cache instead of
+    /// serializing behind per-tensor disk latency. No-op when page-cache
+    /// eviction is enabled (UMA — warming would double RAM pressure).
+    #[cfg(unix)]
+    pub fn warm_page_cache(&self) {
+        if !self.evict_page_cache {
+            use std::os::unix::io::AsRawFd;
+            let fd = self._file.as_raw_fd();
+            let end = self
+                .tensors
+                .last()
+                .map(|t| t.data_offset + t.data_size)
+                .unwrap_or(0);
+            if end > 0 {
+                unsafe {
+                    libc::posix_fadvise(fd, 0, end as libc::off_t, libc::POSIX_FADV_WILLNEED);
+                }
+            }
+        }
+    }
+
+    /// Non-unix fallback: no fadvise, nothing to warm into.
+    #[cfg(not(unix))]
+    pub fn warm_page_cache(&self) {}
+}
+
 #[derive(Clone)]
 pub struct HfqTensorInfo {
     pub name: String,
@@ -118,6 +156,15 @@ pub struct HfqFile {
     /// can't be evicted while the mapping exists (FADV_DONTNEED is ignored
     /// for mmap'd regions per Linux kernel docs).
     pread_buf: std::cell::RefCell<Vec<u8>>,
+    /// Whether tensor reads evict their pages after reading
+    /// (`posix_fadvise(DONTNEED)`). Defaults to `true` — the historical
+    /// behavior, required on unified-memory APUs where cached model pages
+    /// compete 1:1 with hipMalloc'd VRAM staging in system RAM. Discrete-GPU
+    /// loaders should disable this via [`Self::set_evict_page_cache`] so
+    /// repeat loads hit the page cache and kernel readahead works; measured
+    /// 2026-08-22 on gfx1100: fadvise-per-tensor forces a full disk re-read
+    /// of the model on every load (~1.3 GB/s effective vs multi-GB/s cache).
+    evict_page_cache: bool,
     /// Optional overlay HFQ whose tensors shadow this file's by name (the
     /// REAP load-time splice, SP3). When `Some`, every tensor read method
     /// consults the overlay first and falls back to the base. When `None`
@@ -403,7 +450,6 @@ impl HfqFile {
             });
             cumulative_offset += data_size;
         }
-
         let me = Self {
             _file: file,
             path: path.to_path_buf(),
@@ -413,6 +459,7 @@ impl HfqFile {
             tensors,
             tensor_map,
             pread_buf: std::cell::RefCell::new(Vec::new()),
+            evict_page_cache: true,
             overlay: None,
         };
 
@@ -450,6 +497,18 @@ impl HfqFile {
     /// so callers should only invoke this when UMA is detected.
     pub fn drop_mmap(&mut self) {
         self.mmap = None;
+    }
+
+    /// Enable/disable post-read page-cache eviction for this file. See the
+    /// `evict_page_cache` field docs. Discrete-GPU loaders call this with
+    /// `false` before loading; UMA paths keep the default (`true`).
+    pub fn set_evict_page_cache(&mut self, evict: bool) {
+        self.evict_page_cache = evict;
+    }
+
+    /// Whether reads on this file evict pages after reading.
+    pub fn evicts_page_cache(&self) -> bool {
+        self.evict_page_cache
     }
 
     /// Release the pread reuse buffer back to the allocator. After a
@@ -734,8 +793,12 @@ impl HfqFile {
                 }
                 total_read += n as usize;
             }
-            // Evict these pages from cache — works because pread doesn't hold a mapping.
-            fadvise_dontneed(fd, info.data_offset, info.data_size);
+            // Evict these pages from cache — works because pread doesn't hold a
+            // mapping. Skipped when the loader disabled eviction (discrete-GPU
+            // loads want the page cache warm for repeat loads).
+            if self.evict_page_cache {
+                fadvise_dontneed(fd, info.data_offset, info.data_size);
+            }
         }
         Some((info, self.pread_buf.borrow()))
     }
@@ -794,7 +857,9 @@ impl HfqFile {
                 }
                 total_read += n as usize;
             }
-            fadvise_dontneed(fd, info.data_offset, info.data_size);
+            if self.evict_page_cache {
+                fadvise_dontneed(fd, info.data_offset, info.data_size);
+            }
             return Some((info, buf));
         }
 
@@ -814,7 +879,9 @@ impl HfqFile {
         #[cfg(unix)]
         {
             use std::os::unix::io::AsRawFd;
-            fadvise_dontneed(self._file.as_raw_fd(), offset, len);
+            if self.evict_page_cache {
+                fadvise_dontneed(self._file.as_raw_fd(), offset, len);
+            }
         }
         #[cfg(not(unix))]
         {
