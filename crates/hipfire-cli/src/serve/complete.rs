@@ -1598,6 +1598,9 @@ pub(crate) fn complete_request(
     // semantics and has no analogue here -- the engine either admits a request
     // or rejects it with a reason.
     if let Some(backend) = shared.slot_engine.clone() {
+        // The multi-slot engine handles both text and vision: it loads the
+        // vision tower alongside the trunk when the checkpoint carries one,
+        // and its prefill splices visual embeddings + mrope positions.
         return crate::serve::slots::complete_request_slots(
             &backend,
             body,

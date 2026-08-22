@@ -335,6 +335,8 @@ impl ConcurrencyBackend for SlotDriver {
                     prompt_tokens,
                     convo,
                     continuation: Vec::new(),
+                    image_bytes: None,
+                    vis_span: None,
                     max_tokens: max_tokens as usize,
                     reply: tx,
                 })
@@ -380,6 +382,8 @@ impl ConcurrencyBackend for SlotDriver {
                         prompt_tokens: Vec::new(),
                         convo,
                         continuation,
+                        image_bytes: None,
+                        vis_span: None,
                         max_tokens: max_tokens as usize,
                         reply: tx,
                     })

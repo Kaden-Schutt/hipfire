@@ -103,14 +103,73 @@ pub(crate) fn complete_request_slots(
     } else {
         AssistantPrefix::Plain
     };
-    let frame = ChatFrame {
-        tokenizer: &backend.tokenizer,
-        system: system.as_deref(),
-        user: &last_user,
-        assistant_prefix: prefix,
-        raw: false,
+    // VL: extract the base64 image (if any). When present, CPU-preprocess it
+    // (cheap, no GPU) to learn the merged visual-token count, then render the
+    // final user turn with the exact pad span the engine will splice vision
+    // embeddings into: [vision_start, PAD×n_vis, vision_end, \n, question].
+    let image_bytes: Option<Vec<u8>> = match crate::serve::complete::request_image_base64(
+        body.get("messages"),
+    )? {
+        Some(b64) => {
+            use base64::Engine as _;
+            Some(
+                base64::engine::general_purpose::STANDARD
+                    .decode(&b64)
+                    .map_err(|e| anyhow::anyhow!("invalid base64 image payload: {e}"))?,
+            )
+        }
+        None => None,
     };
-    let prompt_tokens = frame.build_multi_turn(&history);
+    let image_bytes = image_bytes.filter(|b| !b.is_empty());
+
+    const PATCH_SIZE: usize = 16;
+    const SPATIAL_MERGE: usize = 2;
+    let n_vis = match &image_bytes {
+        Some(bytes) => {
+            let (chw, gh, gw) =
+                hipfire_arch_qwen35_vl::image::load_and_preprocess_from_bytes(
+                    bytes, PATCH_SIZE, SPATIAL_MERGE,
+                )
+                .map_err(|e| anyhow::anyhow!("vl preprocess: {e}"))?;
+            drop(chw);
+            ((gh / PATCH_SIZE) / SPATIAL_MERGE) * ((gw / PATCH_SIZE) / SPATIAL_MERGE)
+        }
+        None => 0,
+    };
+
+    let prompt_tokens = if n_vis > 0 {
+        let vs = backend.tokenizer.special_token_id("<|vision_start|>");
+        let ve = backend.tokenizer.special_token_id("<|vision_end|>");
+        let pad = backend.tokenizer.special_token_id("<|image_pad|>");
+        let (Some(vs), Some(ve), Some(pad)) = (vs, ve, pad) else {
+            bail!("model tokenizer lacks VL special tokens; cannot serve images");
+        };
+        let q_tokens = backend.tokenizer.encode(&last_user);
+        let nl = backend.tokenizer.encode("\n");
+        let mut user_body: Vec<u32> = Vec::with_capacity(n_vis + q_tokens.len() + 4);
+        user_body.push(vs);
+        user_body.resize(user_body.len() + n_vis, pad);
+        user_body.push(ve);
+        user_body.extend_from_slice(&nl);
+        user_body.extend_from_slice(&q_tokens);
+        ChatFrame {
+            tokenizer: &backend.tokenizer,
+            system: system.as_deref(),
+            user: "",
+            assistant_prefix: prefix,
+            raw: false,
+        }
+        .build_with_user_tokens(&user_body)
+    } else {
+        ChatFrame {
+            tokenizer: &backend.tokenizer,
+            system: system.as_deref(),
+            user: &last_user,
+            assistant_prefix: prefix,
+            raw: false,
+        }
+        .build_multi_turn(&history)
+    };
 
     // Conversation identity is the USER turns. The assistant side is whatever
     // we generated, and the client's echo of it may differ (reasoning split to
@@ -149,6 +208,8 @@ pub(crate) fn complete_request_slots(
             prompt_tokens,
             convo,
             continuation,
+            image_bytes: image_bytes.clone(),
+            vis_span: None, // computed engine-side from the rendered prompt
             max_tokens,
             reply: tx,
         })

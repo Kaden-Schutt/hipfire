@@ -36,6 +36,14 @@ pub struct SubmitRequest {
     /// these are APPENDED to its exact stored tokens, so the result is a
     /// strict extension of the KV rather than a re-render of it.
     pub continuation: Vec<u32>,
+    /// Visual input for a VL request: raw encoded image bytes (PNG/JPEG) that
+    /// the engine preprocesses and runs through the vision tower. When
+    /// `Some`, `vis_text` carries a placeholder marker inserted into the
+    /// rendered prompt so the engine knows where the image span sits.
+    pub image_bytes: Option<Vec<u8>>,
+    /// `(start_row_within_prompt, count)` of the placeholder span. Only
+    /// meaningful alongside `image_bytes`.
+    pub vis_span: Option<(usize, usize)>,
     pub max_tokens: usize,
     pub reply: Sender<Event>,
 }
