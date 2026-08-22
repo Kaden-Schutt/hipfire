@@ -1,0 +1,224 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+#include <hip/hip_runtime.h>
+
+// Consumer-fold lever (HIPFIRE_QKVZA_FUSEDNORM=1): fused_qkvza_hfq4g256 with
+// the RMSNorm + AWQ divide + FWHT rotation computed inline instead of reading
+// a producer-written x_rot buffer. Deletes one fused_rmsnorm_mq_rotate_awq
+// launch (and its x_rot write/read round trip) per DeltaNet layer per token.
+//
+// Bit-exactness contract vs producer->consumer:
+//   - rms reduction: baseline is a 256-slot descending-offset LDS tree where
+//     slot u = sum_g x[u + g*256]^2 accumulated with g ascending, then stages
+//     s=128..1: reduce[u] += reduce[u+s]. Here each lane t owns slots
+//     u=t*8+j (j<8) as 8 register partials accumulated over g ascending —
+//     same per-slot element order — and the tree is emulated with shuffle
+//     stages s=128,64,32,16,8 (cross-lane, same j slot) followed by register
+//     folds p0+=p4,p1+=p5,p2+=p6,p3+=p7 / p0+=p2,p1+=p3 / p0+=p1. The
+//     association matches the baseline tree exactly.
+//   - elementwise: v = ((x*w)*rms/a)*s1 (IEEE divide, same association as
+//     fused_rmsnorm_mq_rotate_awq_direct), FWHT-256 butterfly identical to
+//     the producer's Phase 2 (local strides 1,2,4 then ds_swizzle stages
+//     0x041F/0x081F/0x101F/0x201F/0x401F), output *0.0625*s2.
+//   - GEMV body: verbatim default-path quad/tail structure of
+//     fused_qkvza_hfq4g256.hip with x[] reads replaced by the in-register
+//     rotated values this lane just produced for group g.
+//
+// Grid = total_m workgroups x 32 threads. K must be a multiple of 256.
+
+__launch_bounds__(32, 12)
+extern "C" __global__ void fused_qkvza_hfq4g256_fusednorm(
+    const char*  __restrict__ A_qkv,
+    const char*  __restrict__ A_z,
+    const char*  __restrict__ A_beta,
+    const char*  __restrict__ A_alpha,
+    const float* __restrict__ x_raw,
+    const float* __restrict__ gamma,
+    const float* __restrict__ awq_scale,
+    const float* __restrict__ signs1,
+    const float* __restrict__ signs2,
+    float*       __restrict__ y_qkv,
+    float*       __restrict__ y_z,
+    float*       __restrict__ y_beta,
+    float*       __restrict__ y_alpha,
+    int qkv_m, int z_m, int beta_m, int alpha_m,
+    int K, float eps
+) {
+    const int tid = threadIdx.x;
+    const int gid = blockIdx.x;
+    const int total_m = qkv_m + z_m + beta_m + alpha_m;
+    if (gid >= total_m) return;
+
+    const char* A;
+    float* y;
+    int row;
+    if (gid < qkv_m) {
+        A = A_qkv;   y = y_qkv;   row = gid;
+    } else if (gid < qkv_m + z_m) {
+        A = A_z;     y = y_z;     row = gid - qkv_m;
+    } else if (gid < qkv_m + z_m + beta_m) {
+        A = A_beta;  y = y_beta;  row = gid - (qkv_m + z_m);
+    } else {
+        A = A_alpha; y = y_alpha; row = gid - (qkv_m + z_m + beta_m);
+    }
+
+    const int groups_per_row = K / 256;
+    const long long row_ptr_off = (long long)row * groups_per_row * 136;
+    const char* row_ptr = A + row_ptr_off;
+    const int boff = tid * 4;
+    const int d0 = tid * 8;
+
+    const float4 s10 = *reinterpret_cast<const float4*>(signs1 + d0);
+    const float4 s11 = *reinterpret_cast<const float4*>(signs1 + d0 + 4);
+    const float4 s20 = *reinterpret_cast<const float4*>(signs2 + d0);
+    const float4 s21 = *reinterpret_cast<const float4*>(signs2 + d0 + 4);
+
+    // Pass A: rms partials. Slot u=tid*8+j accumulates x[u + g*256]^2 over
+    // g ascending - identical order to the baseline's thread-u strided sum.
+    float p0 = 0.f, p1 = 0.f, p2 = 0.f, p3 = 0.f;
+    float p4 = 0.f, p5 = 0.f, p6 = 0.f, p7 = 0.f;
+    for (int g = 0; g < groups_per_row; g++) {
+        const float4 xa = *reinterpret_cast<const float4*>(x_raw + g * 256 + d0);
+        const float4 xb = *reinterpret_cast<const float4*>(x_raw + g * 256 + d0 + 4);
+        p0 += xa.x * xa.x; p1 += xa.y * xa.y; p2 += xa.z * xa.z; p3 += xa.w * xa.w;
+        p4 += xb.x * xb.x; p5 += xb.y * xb.y; p6 += xb.z * xb.z; p7 += xb.w * xb.w;
+    }
+    // Tree emulation: stages s=128,64,32,16,8 are cross-lane (partner lane
+    // t + s/8, same j); stages 4,2,1 fold within registers on every lane
+    // (only lane 0's result is meaningful).
+    // Cross-lane stages via explicit-source shuffles (all lanes execute the
+    // shuffle so the read is always defined; only lanes owning slots u < s
+    // apply the add). Stage s: slot u += slot u+s, partner lane t + s/8,
+    // same register j.
+#pragma unroll
+    for (int s = 128; s >= 8; s >>= 1) {
+        const int dl = s >> 3;
+        const float q0 = __shfl(p0, tid + dl);
+        const float q1 = __shfl(p1, tid + dl);
+        const float q2 = __shfl(p2, tid + dl);
+        const float q3 = __shfl(p3, tid + dl);
+        const float q4 = __shfl(p4, tid + dl);
+        const float q5 = __shfl(p5, tid + dl);
+        const float q6 = __shfl(p6, tid + dl);
+        const float q7 = __shfl(p7, tid + dl);
+        if (tid * 8 < (unsigned)s) { p0 += q0; p1 += q1; p2 += q2; p3 += q3; p4 += q4; p5 += q5; p6 += q6; p7 += q7; }
+    }
+    // Slots 0..7 now live in lane 0's p0..p7. Fold s=4,2,1 redundantly.
+    if (tid == 0) { p0 += p4; p1 += p5; p2 += p6; p3 += p7; }
+    if (tid == 0) { p0 += p2; p1 += p3; }
+    if (tid == 0) { p0 += p1; }
+    const float sum_sq = __shfl(p0, 0);
+    const float rms = rsqrtf(sum_sq / (float)K + eps);
+
+    // Debug tap (probe_qkvza_fusednorm): negative eps selects rms-emission
+    // mode - row 0 of y carries the kernel's computed rms.
+    //   eps < -1 additionally switches pass A to a naive strided sum (single
+    //   accumulator, i += 32) as a discriminator between slot-mapping bugs
+    //   and input problems.
+    if (eps <= -1.0e-4f) {
+        float ns = 0.f;
+        for (int i = tid; i < K; i += 32) ns += x_raw[i] * x_raw[i];
+        // wave reduce
+        for (int o = 16; o > 0; o >>= 1) ns += __shfl_down(ns, o);
+        if (row == 0 && tid == 0) {
+            y[0] = rsqrtf(ns / (float)K);
+        }
+        return;
+    }
+    if (eps < 0.0f) {
+        if (row == 0 && tid == 0) {
+            y[0] = rms;
+        }
+        return;
+    }
+
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+
+#define HBFLY(v, pat, str) do { \
+    float _p = __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(v), (pat))); \
+    if ((tid) & (str)) { (v) = _p - (v); } else { (v) = (v) + _p; } \
+} while (0)
+
+    for (int g = 0; g < groups_per_row; g++) {
+        const int base = g * 256 + d0;
+        const float4 xa = *reinterpret_cast<const float4*>(x_raw + base);
+        const float4 xb = *reinterpret_cast<const float4*>(x_raw + base + 4);
+        const float4 wa = *reinterpret_cast<const float4*>(gamma + base);
+        const float4 wb = *reinterpret_cast<const float4*>(gamma + base + 4);
+        const float4 aa = *reinterpret_cast<const float4*>(awq_scale + base);
+        const float4 ab = *reinterpret_cast<const float4*>(awq_scale + base + 4);
+
+        // Match the direct producer exactly: ((x*w)*rms/a)*s1.
+        float v0 = xa.x * wa.x * rms / aa.x * s10.x;
+        float v1 = xa.y * wa.y * rms / aa.y * s10.y;
+        float v2 = xa.z * wa.z * rms / aa.z * s10.z;
+        float v3 = xa.w * wa.w * rms / aa.w * s10.w;
+        float v4 = xb.x * wb.x * rms / ab.x * s11.x;
+        float v5 = xb.y * wb.y * rms / ab.y * s11.y;
+        float v6 = xb.z * wb.z * rms / ab.z * s11.z;
+        float v7 = xb.w * wb.w * rms / ab.w * s11.w;
+
+        float t;
+        t = v0; v0 = v0 + v1; v1 = t - v1;
+        t = v2; v2 = v2 + v3; v3 = t - v3;
+        t = v4; v4 = v4 + v5; v5 = t - v5;
+        t = v6; v6 = v6 + v7; v7 = t - v7;
+
+        t = v0; v0 = v0 + v2; v2 = t - v2;
+        t = v1; v1 = v1 + v3; v3 = t - v3;
+        t = v4; v4 = v4 + v6; v6 = t - v6;
+        t = v5; v5 = v5 + v7; v7 = t - v7;
+
+        t = v0; v0 = v0 + v4; v4 = t - v4;
+        t = v1; v1 = v1 + v5; v5 = t - v5;
+        t = v2; v2 = v2 + v6; v6 = t - v6;
+        t = v3; v3 = v3 + v7; v7 = t - v7;
+
+        HBFLY(v0, 0x041F, 1); HBFLY(v1, 0x041F, 1); HBFLY(v2, 0x041F, 1); HBFLY(v3, 0x041F, 1);
+        HBFLY(v4, 0x041F, 1); HBFLY(v5, 0x041F, 1); HBFLY(v6, 0x041F, 1); HBFLY(v7, 0x041F, 1);
+        HBFLY(v0, 0x081F, 2); HBFLY(v1, 0x081F, 2); HBFLY(v2, 0x081F, 2); HBFLY(v3, 0x081F, 2);
+        HBFLY(v4, 0x081F, 2); HBFLY(v5, 0x081F, 2); HBFLY(v6, 0x081F, 2); HBFLY(v7, 0x081F, 2);
+        HBFLY(v0, 0x101F, 4); HBFLY(v1, 0x101F, 4); HBFLY(v2, 0x101F, 4); HBFLY(v3, 0x101F, 4);
+        HBFLY(v4, 0x101F, 4); HBFLY(v5, 0x101F, 4); HBFLY(v6, 0x101F, 4); HBFLY(v7, 0x101F, 4);
+        HBFLY(v0, 0x201F, 8); HBFLY(v1, 0x201F, 8); HBFLY(v2, 0x201F, 8); HBFLY(v3, 0x201F, 8);
+        HBFLY(v4, 0x201F, 8); HBFLY(v5, 0x201F, 8); HBFLY(v6, 0x201F, 8); HBFLY(v7, 0x201F, 8);
+        HBFLY(v0, 0x401F, 16); HBFLY(v1, 0x401F, 16); HBFLY(v2, 0x401F, 16); HBFLY(v3, 0x401F, 16);
+        HBFLY(v4, 0x401F, 16); HBFLY(v5, 0x401F, 16); HBFLY(v6, 0x401F, 16); HBFLY(v7, 0x401F, 16);
+
+        const float xr0 = v0 * 0.0625f * s20.x;
+        const float xr1 = v1 * 0.0625f * s20.y;
+        const float xr2 = v2 * 0.0625f * s20.z;
+        const float xr3 = v3 * 0.0625f * s20.w;
+        const float xr4 = v4 * 0.0625f * s21.x;
+        const float xr5 = v5 * 0.0625f * s21.y;
+        const float xr6 = v6 * 0.0625f * s21.z;
+        const float xr7 = v7 * 0.0625f * s21.w;
+
+        // Weight group g: same loads/FMA chain as the base quad DOG.
+        const char* gp = row_ptr + g * 136;
+        const float sc = __builtin_bit_cast(float, *(const unsigned int*)(gp));
+        const float zp = __builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
+        const unsigned int pk = *(const unsigned int*)(gp + 8 + boff);
+        float& acc = (g & 3) == 0 ? acc0 : (g & 3) == 1 ? acc1 : (g & 3) == 2 ? acc2 : acc3;
+        acc += (sc * (float)((pk) & 0xFu)         + zp) * xr0 \
+             + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * xr1 \
+             + (sc * (float)(((pk) >> 8) & 0xFu)  + zp) * xr2 \
+             + (sc * (float)(((pk) >> 12) & 0xFu) + zp) * xr3 \
+             + (sc * (float)(((pk) >> 16) & 0xFu) + zp) * xr4 \
+             + (sc * (float)(((pk) >> 20) & 0xFu) + zp) * xr5 \
+             + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * xr6 \
+             + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * xr7;
+    }
+#undef HBFLY
+
+    float acc = (acc0 + acc1) + (acc2 + acc3);
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        acc += __shfl_down(acc, offset);
+
+    if (tid == 0) {
+        y[row] = acc;
+    }
+}
