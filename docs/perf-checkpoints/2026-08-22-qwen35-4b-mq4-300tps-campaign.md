@@ -50,3 +50,16 @@ speculative decoding.
   variable named `A` with value `1 B=2` (voided one measurement window).
 - The main checkout gets branch-switched by outside agents; builds must come
   from the dedicated worktree after verifying HEAD.
+
+## Addendum (same day): HFQ3 lm_head lever — 230.2 tok/s
+
+Commit `53753f80` added `HIPFIRE_LM_HEAD_HFQ3=1` (streaming Q8_0→HFQ3G256
+output-projection requantizer); commit `869dc424` admitted gfx110x to
+`GemvHfq3G256` via the new `HasHfq3G256Gemv` predicate (the table's old
+`HasSdot4` gate predated the RDNA3 wave32 kernel from the MQ3 production path).
+
+Product path, 5 runs: **tg128@64 = 230.22 tok/s** (stdev 0.25),
+tg128@2048 = 224.55 (stdev 0.32). Example-path pairs: HFQ3 217.1–218.5 vs
+HFQ4 212.4–213.5, all HFQ3 > all HFQ4 (+2.3 % over HFQ4, +11 % over the
+209.9 session start). Greedy temp-0 quality on planets / haiku / seasons /
+Romeo-and-Juliet prompts: coherent and factually correct in both arms.
