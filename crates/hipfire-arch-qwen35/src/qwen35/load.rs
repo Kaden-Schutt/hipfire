@@ -5,38 +5,12 @@
 //! Qwen3.5 weight loading: HFQ / ParoQuant sources, AWQ repack, packed-MQ4
 //! experts, `load_weights`, and the EP sharded loader.
 
-use hip_bridge::HipError;
-use hip_bridge::HipResult;
-use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::hfq::HfqTensorInfo;
-use hipfire_runtime::hfq_parallel::HfqReadJob;
-use hipfire_runtime::hfq_parallel::read_hfq_jobs_ordered;
-use hipfire_runtime::llama::EmbeddingFormat;
-use hipfire_runtime::llama::ParoRotation;
-use hipfire_runtime::llama::WeightTensor;
-use hipfire_runtime::llama::f16_to_f32;
-use hipfire_runtime::model_load::LoadedWeights;
-use hipfire_runtime::model_load::WeightSource;
-use hipfire_runtime::model_load::load_weights as rt_load_weights;
-use hipfire_runtime::model_source::ModelSource;
-use hipfire_runtime::paro::paro_load_norm;
-use hipfire_runtime::paro::paro_text_prefix;
-use hipfire_runtime::tp_shard::ShardConfig;
-use hipfire_runtime::weight_backend::HfqBackend;
-use hipfire_runtime::weight_backend::ParoBackend;
-use hipfire_runtime::weight_backend::dequant_norm;
-use hipfire_runtime::weight_backend::dequant_weight_raw;
-use hipfire_runtime::weight_backend::load_awq_scale_for;
-use hipfire_runtime::weight_backend::load_embedding;
-use hipfire_runtime::weight_backend::resolve_lm_head;
-use hipfire_runtime::weight_backend::reupload_f16_as_f32;
-use rdna_compute::DType;
-use rdna_compute::Gpu;
-use rdna_compute::GpuTensor;
+use super::config::f16_lm_head_mode_from_config;
 use super::config::F16LmHeadMode;
 use super::config::Qwen35Config;
-use super::config::f16_lm_head_mode_from_config;
 use super::forward::layers_have_mq6_moe;
+use super::weights::dtype_from_quant_type;
+use super::weights::mixed_expert_tag;
 use super::weights::ExpertWeights;
 use super::weights::LayerWeights;
 use super::weights::MoeFfnWeights;
@@ -49,8 +23,34 @@ use super::weights::Qwen35HfqSourceIdentity;
 use super::weights::Qwen35RankSeal;
 use super::weights::Qwen35Weights;
 use super::weights::SharedExpertWeights;
-use super::weights::dtype_from_quant_type;
-use super::weights::mixed_expert_tag;
+use hip_bridge::HipError;
+use hip_bridge::HipResult;
+use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::hfq::HfqTensorInfo;
+use hipfire_runtime::hfq_parallel::read_hfq_jobs_ordered;
+use hipfire_runtime::hfq_parallel::HfqReadJob;
+use hipfire_runtime::llama::f16_to_f32;
+use hipfire_runtime::llama::EmbeddingFormat;
+use hipfire_runtime::llama::ParoRotation;
+use hipfire_runtime::llama::WeightTensor;
+use hipfire_runtime::model_load::load_weights as rt_load_weights;
+use hipfire_runtime::model_load::LoadedWeights;
+use hipfire_runtime::model_load::WeightSource;
+use hipfire_runtime::model_source::ModelSource;
+use hipfire_runtime::paro::paro_load_norm;
+use hipfire_runtime::paro::paro_text_prefix;
+use hipfire_runtime::tp_shard::ShardConfig;
+use hipfire_runtime::weight_backend::dequant_norm;
+use hipfire_runtime::weight_backend::dequant_weight_raw;
+use hipfire_runtime::weight_backend::load_awq_scale_for;
+use hipfire_runtime::weight_backend::load_embedding;
+use hipfire_runtime::weight_backend::resolve_lm_head;
+use hipfire_runtime::weight_backend::reupload_f16_as_f32;
+use hipfire_runtime::weight_backend::HfqBackend;
+use hipfire_runtime::weight_backend::ParoBackend;
+use rdna_compute::DType;
+use rdna_compute::Gpu;
+use rdna_compute::GpuTensor;
 
 /// RMSNorm weight bias for qwen3.5/gemma-style norms: dequant computes `w + norm_bias`.
 /// qwen2/llama use `0.0`. Single source of truth — referenced by the backend constructors
@@ -2283,6 +2283,27 @@ impl WeightSource for HfqSource<'_> {
             },
         )?;
         attach_lm_head_awq_sidecar(self.hfq, gpu, &mut output, c.dim);
+        // Dev lever: requantize a Q8_0 (typically tied-embedding) output to
+        // HFQ4G256 so the logits GEMV reads ~half the bytes. The embedding
+        // table keeps its original buffer; only this projection switches.
+        static LM_HEAD_HFQ4: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let lm_head_hfq4 = *LM_HEAD_HFQ4.get_or_init(|| {
+            hipfire_config::developer_var("HIPFIRE_LM_HEAD_HFQ4")
+                .ok()
+                .as_deref()
+                == Some("1")
+        });
+        if lm_head_hfq4 && output.gpu_dtype == DType::Q8_0 {
+            eprintln!("  requantizing output Q8_0 -> HFQ4G256 (HIPFIRE_LM_HEAD_HFQ4=1)...");
+            let t0 = std::time::Instant::now();
+            let converted =
+                hipfire_runtime::weight_backend::requantize_weight_q8_0_to_hfq4g256(gpu, &output)?;
+            eprintln!(
+                "  output -> HFQ4G256 done in {:.2}s",
+                t0.elapsed().as_secs_f32()
+            );
+            return Ok((converted, false));
+        }
         Ok((output, aliases))
     }
 
