@@ -50,33 +50,156 @@ pub fn arch_is_uma(arch: &str) -> bool {
 }
 
 impl HfqFile {
-    /// Kick asynchronous kernel readahead over the whole data region
-    /// (`posix_fadvise(POSIX_FADV_WILLNEED)`). Non-blocking: the disk DMA
-    /// runs concurrently with whatever the caller does next (GPU init,
-    /// early tensor uploads), so later preads hit the page cache instead of
-    /// serializing behind per-tensor disk latency. No-op when page-cache
-    /// eviction is enabled (UMA — warming would double RAM pressure).
+    /// Start a background parallel cache warmer: N worker threads pread the
+    /// data region chunk-sequentially into the page cache while the loader
+    /// uploads tensors. Rationale (measured 2026-08-22, gfx1100 + btrfs md0):
+    /// a single `FADV_WILLNEED` does not saturate the array (~1.7 GB/s
+    /// effective serial reads), while 6 concurrent readers reach ~4.5 GB/s;
+    /// overlapping those reads with H2D uploads hides most of the disk time.
+    /// No-op when page-cache eviction is enabled (UMA — warming would double
+    /// RAM pressure). The returned guard stops the workers on drop.
     #[cfg(unix)]
-    pub fn warm_page_cache(&self) {
-        if !self.evict_page_cache {
-            use std::os::unix::io::AsRawFd;
-            let fd = self._file.as_raw_fd();
-            let end = self
-                .tensors
-                .last()
-                .map(|t| t.data_offset + t.data_size)
-                .unwrap_or(0);
-            if end > 0 {
-                unsafe {
-                    libc::posix_fadvise(fd, 0, end as libc::off_t, libc::POSIX_FADV_WILLNEED);
+    pub fn start_cache_warmup(&self) -> CacheWarmerGuard {
+        if self.evict_page_cache || self.mostly_page_cached() {
+            return CacheWarmerGuard::empty();
+        }
+        let end = self
+            .tensors
+            .last()
+            .map(|t| t.data_offset + t.data_size)
+            .unwrap_or(0);
+        if end == 0 {
+            return CacheWarmerGuard::empty();
+        }
+        const CHUNK: usize = 16 << 20;
+        const THREADS: usize = 4;
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let next = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let path = self.path.clone();
+        let mut handles = Vec::with_capacity(THREADS);
+        for _ in 0..THREADS {
+            let stop = stop.clone();
+            let next = next.clone();
+            let path = path.clone();
+            handles.push(std::thread::spawn(move || {
+                let Ok(file) = std::fs::File::open(&path) else {
+                    return;
+                };
+                use std::os::unix::io::AsRawFd;
+                let fd = file.as_raw_fd();
+                let mut buf = vec![0u8; CHUNK];
+                loop {
+                    if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        return;
+                    }
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let off = i * CHUNK;
+                    if off >= end {
+                        return;
+                    }
+                    let len = CHUNK.min(end - off);
+                    let mut got = 0usize;
+                    while got < len {
+                        let n = unsafe {
+                            libc::pread(
+                                fd,
+                                buf[got..].as_mut_ptr() as *mut libc::c_void,
+                                len - got,
+                                (off + got) as libc::off_t,
+                            )
+                        };
+                        if n <= 0 {
+                            return;
+                        }
+                        got += n as usize;
+                    }
                 }
-            }
+            }));
+        }
+        CacheWarmerGuard {
+            stop,
+            handles: Some(handles),
         }
     }
 
-    /// Non-unix fallback: no fadvise, nothing to warm into.
+    /// Fraction of data pages already resident in the page cache, via
+    /// `mincore` over an untouched shared mapping (mapping does not fault
+    /// pages in, so this is free). Used to skip the warmer when a repeat
+    /// load would only re-copy an already-resident file.
+    #[cfg(unix)]
+    fn mostly_page_cached(&self) -> bool {
+        let end = self
+            .tensors
+            .last()
+            .map(|t| t.data_offset + t.data_size)
+            .unwrap_or(0);
+        if end == 0 {
+            return false;
+        }
+        let Ok(file) = std::fs::File::open(&self.path) else {
+            return false;
+        };
+        let Ok(mmap) = (unsafe { memmap2::Mmap::map(&file) }) else {
+            return false;
+        };
+        let page = 4096usize;
+        let n_pages = mmap.len().div_ceil(page);
+        let mut vec = vec![0u8; n_pages];
+        let rc = unsafe {
+            libc::mincore(
+                mmap.as_ptr() as *mut libc::c_void,
+                mmap.len(),
+                vec.as_mut_ptr(),
+            )
+        };
+        if rc != 0 {
+            return false;
+        }
+        let resident = vec.iter().filter(|b| *b & 1 != 0).count();
+        resident * 100 >= n_pages * 90
+    }
+
+    /// Non-unix fallback: never pre-detected as cached.
     #[cfg(not(unix))]
-    pub fn warm_page_cache(&self) {}
+    fn mostly_page_cached(&self) -> bool {
+        false
+    }
+
+    /// Non-unix fallback: nothing to warm.
+    #[cfg(not(unix))]
+    pub fn start_cache_warmup(&self) -> CacheWarmerGuard {
+        CacheWarmerGuard::empty()
+    }
+}
+
+/// Stops the cache-warmup workers when dropped (load finished or abandoned).
+pub struct CacheWarmerGuard {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(unix)]
+    handles: Option<Vec<std::thread::JoinHandle<()>>>,
+    #[cfg(not(unix))]
+    handles: Option<()>,
+}
+
+impl CacheWarmerGuard {
+    fn empty() -> Self {
+        Self {
+            stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            handles: None,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for CacheWarmerGuard {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(handles) = self.handles.take() {
+            for h in handles {
+                let _ = h.join();
+            }
+        }
+    }
 }
 
 #[derive(Clone)]

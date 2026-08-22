@@ -280,6 +280,7 @@ fn load_qwen35_pp(
             .map(|v| v != "0")
             .unwrap_or_else(|| hipfire_runtime::hfq::arch_is_uma(gpus.devices[0].arch.as_str())),
     );
+    let _hfq_cache_warmer = hfq_file.start_cache_warmup();
     let layout = hipfire_arch_qwen35::qwen35::Layout::from_gpus(&gpus, config.n_layers);
     let mut hfq_source = hipfire_arch_qwen35::qwen35::HfqSource::new(&mut hfq_file, &config);
     let weights =
@@ -517,7 +518,7 @@ impl Carrier for Qwen35Carrier {
                             hipfire_runtime::hfq::arch_is_uma(ctx.gpu.arch.as_str())
                         }),
                 );
-                hfq_file.warm_page_cache();
+                let _hfq_cache_warmer = hfq_file.start_cache_warmup();
 
                 let physical_cap = ctx.cask.physical_cap(ctx.max_seq)?;
 
