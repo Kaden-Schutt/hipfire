@@ -2533,6 +2533,18 @@ fn main() {
                         max_think_tokens: vl_max_think_tokens,
                         assistant_prefix,
                     };
+                    // Emit gen_start BEFORE the VL route. The CLI serve layer's
+                    // stream-contract gate requires the first daemon event of a
+                    // transaction to be `gen_start` (PreStartEvent otherwise);
+                    // generate_vl emits `token` events directly, so without this
+                    // every serve-layer VL request was rejected and aborted.
+                    // qwen3.5-VL rides the same semantic contract v2 as Qwen AR.
+                    emit_gen_start(
+                        &mut stdout,
+                        id,
+                        false,
+                        Some(QWEN_AR_SEMANTIC_CONTRACT_VERSION),
+                    );
                     match vision_route {
                         hipfire_loader::VisionRoute::DotsOcr => hipfire_generate::vision::generate_vl_dots_ocr(m, &mut gpu, &mut stdout, &params),
                         _ => hipfire_generate::vision::generate_vl(m, &mut gpu, &mut stdout, &params),

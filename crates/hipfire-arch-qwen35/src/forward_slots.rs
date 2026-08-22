@@ -1437,6 +1437,7 @@ fn run_fullattn_layer_slots(
     max_ctx_len: usize,
     single_slot: Option<(u64, usize)>,
     n_tiles: Option<usize>,
+    mrope_pos3: Option<&GpuTensor>,
 ) -> HipResult<()> {
     let attn_dtype = require_batchable_fullattn_layer(layer)?;
 
@@ -1569,18 +1570,36 @@ fn run_fullattn_layer_slots(
     // global-row-indexed. No compaction in the slot path yet, so
     // pos_offset is always 0.
     let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
-    gpu.rope_partial_interleaved_f32_batched(
-        &pbs.fa_q_batch,
-        &pbs.fa_k_batch,
-        &pbs.positions,
-        config.n_heads,
-        config.n_kv_heads,
-        config.head_dim,
-        n_rot,
-        config.rope_theta,
-        n,
-        0,
-    )?;
+    if let Some(pos3) = mrope_pos3 {
+        // VL prefill: 3D mrope with per-row (t, h, w). Batched twin of the
+        // sequential path's rope_mrope_halfsplit_f32.
+        gpu.rope_mrope_halfsplit_f32_batched(
+            &pbs.fa_q_batch,
+            &pbs.fa_k_batch,
+            &pos3.buf,
+            config.n_heads,
+            config.n_kv_heads,
+            config.head_dim,
+            n_rot,
+            config.rope_theta,
+            n,
+            0,
+            config.mrope_section,
+        )?;
+    } else {
+        gpu.rope_partial_interleaved_f32_batched(
+            &pbs.fa_q_batch,
+            &pbs.fa_k_batch,
+            &pbs.positions,
+            config.n_heads,
+            config.n_kv_heads,
+            config.head_dim,
+            n_rot,
+            config.rope_theta,
+            n,
+            0,
+        )?;
+    }
 
     // 6. Batched KV write — slot-aware, one launch each for K and V across
     // every slot. Both arenas resolve through `k_base`/`v_base`; correct
@@ -1727,6 +1746,7 @@ fn run_fullattn_moe_layer_slots(
     single_slot: Option<(u64, usize)>,
     n_tiles: Option<usize>,
     weights_moe_has_mq6: bool,
+    mrope_pos3: Option<&GpuTensor>,
 ) -> HipResult<()> {
     let attn_dtype = require_batchable_fullattn_moe_layer(layer)?;
     require_batchable_moe_ffn(gpu, &layer.ffn)?;
@@ -1859,18 +1879,36 @@ fn run_fullattn_moe_layer_slots(
 
     // 5. RoPE — slot-agnostic (SP2 Task 2).
     let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
-    gpu.rope_partial_interleaved_f32_batched(
-        &pbs.fa_q_batch,
-        &pbs.fa_k_batch,
-        &pbs.positions,
-        config.n_heads,
-        config.n_kv_heads,
-        config.head_dim,
-        n_rot,
-        config.rope_theta,
-        n,
-        0,
-    )?;
+    if let Some(pos3) = mrope_pos3 {
+        // VL prefill: 3D mrope with per-row (t, h, w). Batched twin of the
+        // sequential path's rope_mrope_halfsplit_f32.
+        gpu.rope_mrope_halfsplit_f32_batched(
+            &pbs.fa_q_batch,
+            &pbs.fa_k_batch,
+            &pos3.buf,
+            config.n_heads,
+            config.n_kv_heads,
+            config.head_dim,
+            n_rot,
+            config.rope_theta,
+            n,
+            0,
+            config.mrope_section,
+        )?;
+    } else {
+        gpu.rope_partial_interleaved_f32_batched(
+            &pbs.fa_q_batch,
+            &pbs.fa_k_batch,
+            &pbs.positions,
+            config.n_heads,
+            config.n_kv_heads,
+            config.head_dim,
+            n_rot,
+            config.rope_theta,
+            n,
+            0,
+        )?;
+    }
 
     // 6. Batched KV write — slot-aware, Q8_0 KV-cache tier regardless of
     // this layer's projection weight dtype (see module doc).
@@ -2329,9 +2367,12 @@ pub fn forward_batch_slots_graphed(
     s: &Qwen35Scratch,
     logits_out: &GpuTensor,
     cache: &mut SlotDecodeGraph,
+    vl_active: bool,
 ) -> HipResult<()> {
     let pure_decode = !batch.is_empty() && batch.m_per_slot.iter().all(|&m| m == 1);
-    if !gpu.slots_decode_graph() || !pure_decode {
+    // VL prefill carries embedding overrides + mrope positions, which the
+    // captured-graph path cannot represent — always take the plain path.
+    if !gpu.slots_decode_graph() || !pure_decode || vl_active {
         return forward_batch_slots(
             gpu,
             weights,
@@ -2393,6 +2434,8 @@ pub fn forward_batch_slots_graphed(
             SlotStepOpts {
                 skip_uploads: true,
                 ctx_override: Some(ctx_bucket),
+                embed_override: None,
+                mrope_pos3: None,
             },
         )?;
         // The warm-up step above already advanced the slot lengths; re-running
@@ -2418,6 +2461,8 @@ pub fn forward_batch_slots_graphed(
             SlotStepOpts {
                 skip_uploads: true,
                 ctx_override: Some(ctx_bucket),
+                embed_override: None,
+                mrope_pos3: None,
             },
         );
         let graph = gpu.end_stream_capture()?;
@@ -2466,7 +2511,7 @@ fn rewind_slot_seq_lens(batch: &SlotBatch, pool: &mut SlotPool) -> HipResult<()>
 }
 
 /// Knobs the graph path needs and no other caller does.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub struct SlotStepOpts {
     /// The per-step H2D uploads (tokens, positions, row_slot, descriptors)
     /// were already done by the caller. Set when capturing into a hipGraph:
@@ -2481,6 +2526,15 @@ pub struct SlotStepOpts {
     /// `positions[]` is the authoritative causal bound (SP1's Critical
     /// defect), so the extra positions are masked out.
     pub ctx_override: Option<usize>,
+    /// VL prefill: visual embeddings to write over `x_batch` rows after the
+    /// token-embedding lookup. Host layout `[count × dim]`, written to rows
+    /// `row0..row0+count` of this step. Rows outside the span keep their
+    /// token embeddings.
+    pub embed_override: Option<(Vec<f32>, usize)>,
+    /// VL prefill: packed 3D mrope positions `[n_rows][3]` i32 for this
+    /// step's rows. When set, FA RoPE dispatches to the batched mrope kernel
+    /// instead of the 1D one; DeltaNet layers ignore rope entirely.
+    pub mrope_pos3: Option<Vec<i32>>,
 }
 
 /// The per-step H2D uploads, hoisted so the graph path can run them outside
@@ -2651,6 +2705,19 @@ pub fn forward_batch_slots_opts(
     }
     gpu.embedding_lookup_q8_batched(&weights.token_embd, &pbs.x_batch, &pbs.tokens, n, dim)?;
 
+    // ── 1b. VL embedding override ─────────────────────────────────────────
+    // Overwrite the image-pad rows with vision-tower embeddings before any
+    // layer sees them. Rows outside the span keep their token embeddings.
+    if let Some((embs, row0)) = &opts.embed_override {
+        eprintln!("[vl-slot] embedding override: row0={row0} elems={} sum={:.4}", embs.len(), embs.iter().sum::<f32>());
+        let dim_bytes = dim * 4;
+        gpu.hip.memcpy_htod_offset(
+            &pbs.x_batch.buf,
+            row0 * dim_bytes,
+            unsafe { std::slice::from_raw_parts(embs.as_ptr() as *const u8, embs.len() * 4) },
+        )?;
+    }
+
     // ── 2. Upload positions ──────────────────────────────────────────────
     // Per-row ABSOLUTE position within that row's own slot — authoritative
     // for the causal bound everywhere downstream (RoPE angle, KV write
@@ -2774,6 +2841,20 @@ pub fn forward_batch_slots_opts(
         None
     };
 
+    // ── 3b. VL mrope pos3 upload (layer-invariant, once per step) ────────
+    let mrope_pos3_dev = match &opts.mrope_pos3 {
+        Some(host) => {
+            let t = gpu.alloc_tensor(
+                &[host.len()],
+                DType::F32, // i32-in-f32 pattern used by `positions`
+            )?;
+            let bytes: Vec<u8> = host.iter().flat_map(|x| x.to_ne_bytes()).collect();
+            gpu.hip.memcpy_htod(&t.buf, &bytes)?;
+            Some(t)
+        }
+        None => None,
+    };
+
     // ── 4. Per-layer loop ─────────────────────────────────────────────────
     let layer_end = config.n_layers.min(max_layer.unwrap_or(usize::MAX));
     let mut delta_layer_idx = 0usize;
@@ -2810,6 +2891,7 @@ pub fn forward_batch_slots_opts(
                     max_ctx_len,
                     single_slot,
                     n_tiles,
+                    mrope_pos3_dev.as_ref(),
                 )?;
                 kv_layer_idx += 1;
             }
@@ -2845,6 +2927,7 @@ pub fn forward_batch_slots_opts(
                     single_slot,
                     n_tiles,
                     weights.moe_has_mq6,
+                    mrope_pos3_dev.as_ref(),
                 )?;
                 kv_layer_idx += 1;
             }

@@ -20,6 +20,10 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use hipfire_runtime::admission::{AdmissionController, ModelFootprint};
+use crate::forward_slots::{forward_batch_slots_opts, SlotStepOpts};
+use hipfire_arch_qwen35_vl::qwen35_vl::{load_vision_weights, vision_config_from_hfq, VisionConfig, VisionWeights};
+use hipfire_arch_qwen35_vl::image as vl_image;
+use hipfire_arch_qwen35_vl::mrope::ImageSpan;
 use hipfire_runtime::serve::{send_event, DoneReason, EngineStats, Event, SubmitRequest};
 use hipfire_runtime::session_table::{SessionId, SessionTable};
 use hipfire_runtime::swap::snapshot::{capture_slot, restore_slot, SnapshotStamp};
@@ -123,6 +127,11 @@ struct Rig {
     sample_params: Vec<SlotSampleParams>,
     sessions: SessionTable,
     adm: AdmissionController,
+    /// Vision tower for VL requests. `None` when the HFQ carries no visual
+    /// tensors (text-only checkpoint).
+    vision: Option<(VisionConfig, VisionWeights)>,
+    /// `<|image_pad|>` token id used to locate the visual span in a prompt.
+    image_pad_id: u32,
     swap: SwapManager,
     stamp: SnapshotStamp,
     n_slots: usize,
@@ -165,11 +174,26 @@ impl Rig {
             * (cfg.n_slots as u64)
             * (cap_rounded as u64)
             * (per_pos_bytes as u64);
-        let planned = weight_bytes + kv_bytes + 768 * 1024 * 1024;
+        // Vision tower adds ~0.6 GiB when present; charge a flat margin so the
+        // preflight never passes on an allocation that then OOMs mid-load.
+        let planned = weight_bytes + kv_bytes + 768 * 1024 * 1024 + 768 * 1024 * 1024;
         preflight_alloc(planned, R9700_VRAM_BYTES, "SlotEngine")
             .map_err(|e| format!("preflight refused: {e}"))?;
 
         let mut gpu = Gpu::init().map_err(|e| format!("gpu init: {e}"))?;
+        // Vision FIRST: the trunk loader drops the mmap and may reclaim tensor
+        // pages, so the ViT must read its tensors while the file is pristine
+        // (same order the daemon carrier uses).
+        let vision = {
+            let cfg = vision_config_from_hfq(&hfq);
+            match cfg {
+                Some(vc) => match load_vision_weights(&mut hfq, &vc, &mut gpu) {
+                    Ok(vw) => Some((vc, vw)),
+                    Err(e) => return Err(format!("load vision weights: {e}")),
+                },
+                None => None,
+            }
+        };
         let weights: Qwen35Weights = {
             let mut src = qwen35::HfqSource::new(&mut hfq, &config);
             let layout = qwen35::Layout::single(config.n_layers);
@@ -198,7 +222,11 @@ impl Rig {
         }
         let desc_staging = SlotDescStaging::new(&mut gpu, cfg.n_slots, max_batch)
             .map_err(|e| format!("staging: {e}"))?;
-        let pbs = PrefillBatchScratch::new(&mut gpu, &config, max_batch)
+        // cap_gdn_tape=false: the spec-decode DeltaNet S-tape scales with
+        // max_batch (= max(cap_tokens, n_slots)) and is only consumed by
+        // tree-verify GDN kernels, which the multi-slot forward never runs.
+        // At 2048 ctx on a dense-9B it wasted ~4 GiB of VRAM for nothing.
+        let pbs = PrefillBatchScratch::new_opt(&mut gpu, &config, max_batch, /*cap_gdn_tape=*/ false)
             .map_err(|e| format!("pbs: {e}"))?;
         let scratch = Qwen35Scratch::new_with_kv_max(&mut gpu, &config, 64, cfg.cap_tokens)
             .map_err(|e| format!("scratch: {e}"))?;
@@ -244,6 +272,8 @@ impl Rig {
 
         Ok(Rig {
             gpu,
+            vision,
+            image_pad_id: rig_image_pad_id(&tokenizer),
             weights,
             config,
             tokenizer,
@@ -280,6 +310,7 @@ fn run_loop(mut rig: Rig, rx: Receiver<SubmitRequest>, stats: Arc<Mutex<EngineSt
     let mut slots: Vec<Option<InFlight>> = (0..n).map(|_| None).collect();
     let mut work: Vec<PendingWork> = (0..n)
         .map(|s| PendingWork {
+            vl: None,
             slot: SlotId(s),
             remaining_prompt: Vec::new(),
             next_pos: 0,
@@ -320,21 +351,90 @@ fn run_loop(mut rig: Rig, rx: Receiver<SubmitRequest>, stats: Arc<Mutex<EngineSt
         if batch.is_empty() {
             continue;
         }
-        let fwd = forward_batch_slots_graphed(
-            &mut rig.gpu,
-            &rig.weights,
-            &rig.config,
-            &batch,
-            &mut rig.pool,
-            &mut rig.dn_states,
-            &rig.k_arenas,
-            &rig.v_arenas,
-            &mut rig.desc_staging,
-            &rig.pbs,
-            &rig.scratch,
-            &rig.logits_out,
-            &mut graph,
-        );
+        // VL prefill: gather embedding overrides + mrope pos3 for the visual
+        // rows this step carries. Any VL activity forces the plain (non-graph)
+        // forward, which honors SlotStepOpts.
+        let mut embed_override: Option<(Vec<f32>, usize)> = None;
+        let mut mrope_pos3: Option<Vec<i32>> = None;
+        for (slot_ix, &m) in batch.m_per_slot.iter().enumerate() {
+            if m == 0 {
+                continue;
+            }
+            // Take (and clear) this slot's VL state: it applies to THIS prefill
+            // step only. Later (decode) steps take the plain path. Note the
+            // scheduler has ALREADY drained remaining_prompt by the time we get
+            // here, so emptiness does not mean "no VL rows this step".
+            let Some(vl) = work[slot_ix].vl.take() else {
+                continue;
+            };
+            let vl = &vl;
+            // Rows of this slot in the batch, in order.
+            let rows: Vec<usize> = (0..batch.tokens.len())
+                .filter(|&r| batch.row_slot[r] == slot_ix as i32)
+                .collect();
+            let chunk_start = batch.positions[*rows.first().unwrap()] as usize
+                - vl.pos_base;
+            let span_end = vl.span_start + vl.span_len;
+            let ov_start = chunk_start.max(vl.span_start);
+            let ov_end = (chunk_start + rows.len()).min(span_end);
+            if ov_start < ov_end {
+                let dim = rig.config.dim;
+                let count = ov_end - ov_start;
+                let mut embs = Vec::with_capacity(count * dim);
+                let e0 = (ov_start - vl.span_start) * dim;
+                embs.extend_from_slice(&vl.embeds[e0..e0 + count * dim]);
+                embed_override = Some((embs, rows[ov_start - chunk_start]));
+            }
+            // mrope positions for ALL rows of a VL slot (text rows too).
+            let mut pos3 = Vec::with_capacity(rows.len() * 3);
+            for &r in &rows {
+                let p = batch.positions[r] as usize - vl.pos_base;
+                pos3.extend_from_slice(&vl.pos3[p * 3..p * 3 + 3]);
+            }
+            mrope_pos3 = Some(pos3);
+        }
+        let vl_active = embed_override.is_some() || mrope_pos3.is_some();
+        let fwd = if vl_active {
+            let (embeds, row0) = embed_override.unwrap();
+            forward_batch_slots_opts(
+                &mut rig.gpu,
+                &rig.weights,
+                &rig.config,
+                &batch,
+                &mut rig.pool,
+                &mut rig.dn_states,
+                &rig.k_arenas,
+                &rig.v_arenas,
+                &mut rig.desc_staging,
+                &rig.pbs,
+                &rig.scratch,
+                &rig.logits_out,
+                None,
+                SlotStepOpts {
+                    skip_uploads: false,
+                    ctx_override: None,
+                    embed_override: Some((embeds, row0)),
+                    mrope_pos3,
+                },
+            )
+        } else {
+            forward_batch_slots_graphed(
+                &mut rig.gpu,
+                &rig.weights,
+                &rig.config,
+                &batch,
+                &mut rig.pool,
+                &mut rig.dn_states,
+                &rig.k_arenas,
+                &rig.v_arenas,
+                &mut rig.desc_staging,
+                &rig.pbs,
+                &rig.scratch,
+                &rig.logits_out,
+                &mut graph,
+                false,
+            )
+        };
         if let Err(e) = fwd {
             // A forward failure is not recoverable per-request. Report it as a
             // REJECTION carrying the reason, not as a normal Done: an
@@ -400,12 +500,22 @@ fn run_loop(mut rig: Rig, rx: Receiver<SubmitRequest>, stats: Arc<Mutex<EngineSt
             };
             f.produced += 1;
             let hit_max = f.produced >= f.max_tokens;
+            // Context-cap guard: stop before the slot's KV length would pass
+            // its cap. Without this, a long multi-turn session overflows
+            // set_seq_len and kills the whole batched step.
+            let hit_ctx_cap = rig
+                .sessions
+                .get(session)
+                .map(|sess| sess.tokens.len() + 1 >= rig.cap_tokens)
+                .unwrap_or(false);
 
-            if gone || hit_eos || hit_max {
+            if gone || hit_eos || hit_max || hit_ctx_cap {
                 let reason = if gone {
                     DoneReason::ClientGone
                 } else if hit_eos {
                     DoneReason::Eos
+                } else if hit_ctx_cap {
+                    DoneReason::MaxTokens // context exhausted; same client semantics
                 } else {
                     DoneReason::MaxTokens
                 };
@@ -658,9 +768,77 @@ fn admit(
         return;
     }
 
+    // ── VL: preprocess the image and build the visual-embedding injection
+    // state for this slot's prefill. Runs on the engine thread; the vision
+    // tower is one-shot per request (~0.1-6 s depending on resolution).
+    let vl = match (&req.image_bytes, &rig.vision) {
+        (Some(bytes), Some((vc, vw))) => {
+            let r_vl = (|| -> Result<crate::scheduler::VlPrefill, String> {
+                let (chw, img_h, img_w) =
+                    vl_image::load_and_preprocess_from_bytes(bytes, vc.patch_size, vc.spatial_merge_size)?;
+                let patches = vl_image::extract_patches(
+                    &chw, 3, img_h, img_w, vc.patch_size, vc.temporal_patch_size, vc.spatial_merge_size,
+                );
+                let grid_h = img_h / vc.patch_size;
+                let grid_w = img_w / vc.patch_size;
+                let embs = hipfire_arch_qwen35_vl::qwen35_vl::vision_forward(
+                    &mut rig.gpu, vw, vc, &patches, grid_h, grid_w,
+                )
+                .map_err(|e| format!("vision forward failed: {e:?}"))?;
+                let n_vis = embs.len() / config_dim(&rig.config);
+                // Locate the image-pad run in the prompt.
+                let span_start = req
+                    .prompt_tokens
+                    .iter()
+                    .position(|&t| t == rig.image_pad_id)
+                    .ok_or("image request has no <|image_pad|> span in prompt")?;
+                let span_len = req.prompt_tokens[span_start..]
+                    .iter()
+                    .take_while(|&&t| t == rig.image_pad_id)
+                    .count();
+                let span_end = span_start + span_len;
+                if embs.len() != span_len * config_dim(&rig.config) {
+                    return Err(format!(
+                        "visual tokens {n_vis} mismatch pad-span {span_len}"
+                    ));
+                }
+                let spans = [ImageSpan { start: span_start, len: span_len, grid_h, grid_w }];
+                let built = hipfire_arch_qwen35_vl::mrope::build_mrope_positions(
+                    req.prompt_tokens.len(), &spans, vc.spatial_merge_size,
+                );
+                let base = plan.reused as i32;
+                let mut pos3: Vec<i32> = Vec::with_capacity(req.prompt_tokens.len() * 3);
+                for p in &built.positions {
+                    pos3.extend_from_slice(&[p[0] + base, p[1] + base, p[2] + base]);
+                }
+                Ok(crate::scheduler::VlPrefill {
+                    embeds: embs,
+                    span_start,
+                    span_len,
+                    pos_base: plan.reused,
+                    pos3,
+                })
+            })();
+            match r_vl {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    let _ = send_event(
+                        &req.reply,
+                        Event::Rejected { reason: format!("vl: {e}") },
+                    );
+                    rig.sessions.close(&mut rig.pool, &mut rig.adm, id);
+                    stats.lock().expect("stats").note_rejected();
+                    return;
+                }
+            }
+        }
+        _ => None,
+    };
+
     work[slot.0].remaining_prompt = req.prompt_tokens[plan.reused..].to_vec();
     work[slot.0].next_pos = plan.reused;
     work[slot.0].decoding = false;
+    work[slot.0].vl = vl;
     slots[slot.0] = Some(InFlight {
         session: id,
         reply: req.reply,
@@ -669,6 +847,13 @@ fn admit(
     });
     stats.lock().expect("stats").note_admitted();
 }
+
+/// Hidden dim of the trunk (`config.dim`) — helper so the VL closure above
+/// stays readable.
+fn config_dim(config: &qwen35::Qwen35Config) -> usize {
+    config.dim
+}
+
 
 /// Capture an idle session's state, park it, and free its slot.
 ///
@@ -745,4 +930,14 @@ fn restore(rig: &mut Rig, id: SessionId, slot: SlotId) -> bool {
             false
         }
     }
+}
+
+
+/// Resolve `<|image_pad|>` from the checkpoint tokenizer. Falls back to the
+/// Qwen3.5-VL constant when the special token is absent (text-only models
+/// never consult it — vision requests are rejected before this matters).
+fn rig_image_pad_id(tokenizer: &hipfire_runtime::tokenizer::Tokenizer) -> u32 {
+    tokenizer
+        .special_token_id("<|image_pad|>")
+        .unwrap_or(248056)
 }

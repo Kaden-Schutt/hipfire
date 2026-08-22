@@ -922,9 +922,11 @@ name = "hipfire-cli"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "base64",
  "clap",
  "ctrlc",
  "hipfire-arch-qwen35",
+ "hipfire-arch-qwen35-vl",
  "hipfire-client",
  "hipfire-config",
  "hipfire-registry",

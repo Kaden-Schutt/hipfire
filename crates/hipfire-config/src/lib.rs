@@ -700,6 +700,36 @@ pub static FIELDS: &[ConfigField] = &[
         "Serve requests concurrently on the multi-slot engine instead of one at a time."
     ),
     field!(
+        "serve.multi_slot_slots",
+        "multi_slot_slots",
+        Serve,
+        ModelLoad,
+        DefaultValue::Integer(4),
+        ValueRule::Integer {
+            min: 1,
+            max: 64
+        },
+        true,
+        false,
+        None,
+        "Number of concurrent GPU slots in the multi-slot engine."
+    ),
+    field!(
+        "serve.multi_slot_ctx",
+        "multi_slot_ctx",
+        Serve,
+        ModelLoad,
+        DefaultValue::Integer(8192),
+        ValueRule::Integer {
+            min: 512,
+            max: 131072
+        },
+        true,
+        false,
+        None,
+        "Per-slot KV context capacity (tokens) for the multi-slot engine."
+    ),
+    field!(
         "generation.temperature",
         "temperature",
         Generation,

@@ -3620,6 +3620,16 @@ fn handle_moe_expert_3d(
     let arch_id = ctx.arch_id;
     let is_vision = ctx.is_vision;
 
+    // Guard: this handler is only valid for stacked 3D MoE expert tensors
+    // ([n_experts, ..., ...] named *.experts.{gate_up,down}_proj). Anything
+    // else (e.g. dense rank-2 tensors like lm_head on multimodal qwen3_5
+    // checkpoints) must fall through to the standard quantization path.
+    if meta.shape.len() < 3
+        || !(name.ends_with("experts.gate_up_proj") || name.ends_with("experts.down_proj"))
+    {
+        return false;
+    }
+
             let n_experts = meta.shape[0];
             let inner_n: usize = meta.shape[1..].iter().product();
             let elem_size = match meta.dtype.as_str() {
@@ -5629,6 +5639,41 @@ fn handle_main_quant(
                     });
                 }
             } // end else (non-Q8HFQ path)
+        } else {
+            // F16 fallback for every tensor excluded from quantization:
+            // norms, biases, sub-32-element weights, and (under
+            // --include-vision) the FP16 vision tower. Without this branch
+            // these tensors are silently DROPPED from the HFQ and the
+            // loader fails with "tensor not found" at model open.
+            let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
+            let f32_data = tensor_to_f32_with_optional_fp8_scale(
+                name,
+                raw_data,
+                meta,
+                &fp8_scale_for,
+                &st_files,
+            );
+            let f16_bytes: Vec<u8> = f32_data
+                .iter()
+                .flat_map(|&v| f32_to_f16(v).to_le_bytes())
+                .collect();
+            eprintln!(
+                "  {:>8}: {} {:?} ({} elements, {:.1} KB → {:.1} KB)",
+                "F16",
+                name,
+                meta.shape,
+                n_elements,
+                raw_data.len() as f64 / 1024.0,
+                f16_bytes.len() as f64 / 1024.0
+            );
+            state.hfq_tensors.push(HfqTensor {
+                name: name.to_string(),
+                quant_type: QuantType::F16,
+                shape,
+                group_size: 0,
+                data: f16_bytes,
+                spilled_len: 0,
+            });
         }
 }
 

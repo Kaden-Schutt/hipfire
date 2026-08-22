@@ -24,6 +24,10 @@ pub struct SlotBatch {
     pub positions: Vec<i32>,
     /// Slot index for each flat row.
     pub row_slot: Vec<i32>,
+    /// VL prefill: per visual chunk `(batch_row0, n_rows, embed_row0)`. Rows
+    /// `batch_row0..+n_rows` get vision-tower embeddings starting at
+    /// `embed_row0` of the visual-embedding table.
+    pub vl_rows: Option<Vec<(usize, usize, usize)>>,
 }
 
 impl SlotBatch {
