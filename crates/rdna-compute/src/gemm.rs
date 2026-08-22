@@ -3397,6 +3397,129 @@ impl Gpu {
         result
     }
 
+    /// Consumer-fold lever (HIPFIRE_QKVZA_FUSEDNORM=1): fused_qkvza_hfq4g256
+    /// with the RMSNorm + AWQ divide + FWHT rotation computed inline in the
+    /// GEMV prologue, replacing a standalone fused_rmsnorm_mq_rotate_awq
+    /// launch. gfx1100 only, K % 256 == 0.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fused_qkvza_hfq4g256_fusednorm(
+        &mut self,
+        a_qkv: &GpuTensor,
+        a_z: &GpuTensor,
+        a_beta: &GpuTensor,
+        a_alpha: &GpuTensor,
+        x_raw: &GpuTensor,
+        gamma: &GpuTensor,
+        awq_scale: &GpuTensor,
+        y_qkv: &GpuTensor,
+        y_z: &GpuTensor,
+        y_beta: &GpuTensor,
+        y_alpha: &GpuTensor,
+        qkv_m: usize,
+        z_m: usize,
+        beta_m: usize,
+        alpha_m: usize,
+        k: usize,
+        eps: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_mq_signs()?;
+        self.ensure_kernel(
+            "fused_qkvza_hfq4g256_fusednorm",
+            kernels::FUSED_QKVZA_HFQ4G256_FUSEDNORM_GFX1100_SRC,
+            "fused_qkvza_hfq4g256_fusednorm",
+        )?;
+        let aq = a_qkv.buf.as_ptr();
+        let az = a_z.buf.as_ptr();
+        let ab = a_beta.buf.as_ptr();
+        let aa = a_alpha.buf.as_ptr();
+        let xp = x_raw.buf.as_ptr();
+        let gp = gamma.buf.as_ptr();
+        let ap = awq_scale.buf.as_ptr();
+        let s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let yq = y_qkv.buf.as_ptr();
+        let yz = y_z.buf.as_ptr();
+        let yb = y_beta.buf.as_ptr();
+        let ya = y_alpha.buf.as_ptr();
+        let q_m_i = qkv_m as i32;
+        let z_m_i = z_m as i32;
+        let b_m_i = beta_m as i32;
+        let a_m_i = alpha_m as i32;
+        let k_i = k as i32;
+
+        let total_m = (qkv_m + z_m + beta_m + alpha_m) as u32;
+        let grid = [total_m, 1, 1];
+        let block = [32u32, 1, 1];
+
+        let bytes = crate::profile::gemv_hfq4g256_bytes(qkv_m, k)
+            + crate::profile::gemv_hfq4g256_bytes(z_m, k)
+            + crate::profile::gemv_hfq4g256_bytes(beta_m, k)
+            + crate::profile::gemv_hfq4g256_bytes(alpha_m, k);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "fused",
+            "fused_qkvza_hfq4g256_fusednorm",
+            bytes,
+        );
+
+        let mut params: Vec<*mut c_void> = vec![
+            &aq as *const _ as *mut c_void,
+            &az as *const _ as *mut c_void,
+            &ab as *const _ as *mut c_void,
+            &aa as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &gp as *const _ as *mut c_void,
+            &ap as *const _ as *mut c_void,
+            &s1 as *const _ as *mut c_void,
+            &s2 as *const _ as *mut c_void,
+            &yq as *const _ as *mut c_void,
+            &yz as *const _ as *mut c_void,
+            &yb as *const _ as *mut c_void,
+            &ya as *const _ as *mut c_void,
+            &q_m_i as *const _ as *mut c_void,
+            &z_m_i as *const _ as *mut c_void,
+            &b_m_i as *const _ as *mut c_void,
+            &a_m_i as *const _ as *mut c_void,
+            &k_i as *const _ as *mut c_void,
+            &eps as *const _ as *mut c_void,
+        ];
+        let result = self.launch_maybe_blob(
+            "fused_qkvza_hfq4g256_fusednorm",
+            grid,
+            block,
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(aq);
+                b.push_ptr(az);
+                b.push_ptr(ab);
+                b.push_ptr(aa);
+                b.push_ptr(xp);
+                b.push_ptr(gp);
+                b.push_ptr(ap);
+                b.push_ptr(s1);
+                b.push_ptr(s2);
+                b.push_ptr(yq);
+                b.push_ptr(yz);
+                b.push_ptr(yb);
+                b.push_ptr(ya);
+                b.push_i32(q_m_i);
+                b.push_i32(z_m_i);
+                b.push_i32(b_m_i);
+                b.push_i32(a_m_i);
+                b.push_i32(k_i);
+                b.push_f32(eps);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// gfx1100/K=2048 QKVZA experiment that also prepares the DeltaNet beta
     /// and alpha scalars. The projection FMAs and reduction are identical to
     /// `fused_qkvza_hfq4g256`; only the two tiny output tails absorb the

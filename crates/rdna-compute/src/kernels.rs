@@ -1090,6 +1090,11 @@ pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_SRC: &str =
 pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_DIRECT_GFX1100_SRC: &str =
     // K=5120 direct float4 path: certified default for Qwen3.6-27B on gfx1100.
     include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate_awq_direct.gfx1100.hip");
+pub const FUSED_QKVZA_HFQ4G256_FUSEDNORM_GFX1100_SRC: &str =
+    // Consumer-fold lever (HIPFIRE_QKVZA_FUSEDNORM=1): qkvza GEMV with inline
+    // rmsnorm+AWQ+FWHT prologue, bit-exact vs the direct producer.
+    include_str!("../../../kernels/src/fused_qkvza_hfq4g256_fusednorm.gfx1100.hip");
+
 pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_WAVEGRID_GFX1100_SRC: &str =
     // K/256 workgroups × wave32: spread the FWHT groups across CUs so the
     // reduction and rotation overlap VRAM latency instead of serializing on
