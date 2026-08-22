@@ -881,6 +881,45 @@ impl Gpu {
     }
 
     pub fn init() -> HipResult<Self> {
+        // Windows HIP runtimes ignore HIP/ROCR_VISIBLE_DEVICES, so a
+        // `hardware.devices = arch:gfxXXXX` selection never reaches the
+        // runtime and device 0 stays the (often integrated) first adapter.
+        // Resolve exact-arch selectors here instead; hipfire-config unmasks
+        // only all-`arch:` lists, so anything else reaching this point is
+        // either plain ordinals (device 0 is correct) or selector kinds this
+        // build cannot probe yet (uuid:/pci: — warned about below).
+        let raw = hipfire_config::process_value("HIPFIRE_DEVICES")
+            .or_else(|| std::env::var("HIPFIRE_DEVICES").ok());
+        if let Some(raw) = raw {
+            if let Some(want_arch) = requested_arch(&raw) {
+                if let Ok(hip) = HipRuntime::load() {
+                    if let Ok(count) = hip.device_count() {
+                        let mut archs = Vec::with_capacity(count as usize);
+                        for id in 0..count {
+                            archs.push((id, hip.get_arch(id).ok()));
+                        }
+                        if let Some(id) = find_matching_arch(&want_arch, &archs) {
+                            if id != 0 {
+                                eprintln!(
+                                    "[hipfire] hardware.devices: using dev {id} ({want_arch})"
+                                );
+                            }
+                            return Self::init_with_device(id);
+                        }
+                        eprintln!(
+                            "[hipfire] no device matches arch:{want_arch} (count={count}); using dev 0"
+                        );
+                    }
+                }
+            } else if device_selector_kinds(&raw)
+                .iter()
+                .any(|k| k == "uuid" || k == "pci")
+            {
+                eprintln!(
+                    "[hipfire] hardware.devices: uuid:/pci: selectors are not resolvable by this build; using dev 0"
+                );
+            }
+        }
         Self::init_with_device(0)
     }
 
@@ -4305,5 +4344,87 @@ mod tests {
         gpu.ensure_vmm_cleaned()
             .expect("clears after faults drained");
         assert_eq!(gpu.vmm_allocation_count(), 0);
+    }
+}
+
+/// Selector kinds present in a comma-separated `hardware.devices` value:
+/// the token before the first `:` of each entry, lowercased. Plain ordinal
+/// entries keep their literal spelling ("1", "2").
+fn device_selector_kinds(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(|part| part.split(':').next().unwrap_or(part).trim().to_ascii_lowercase())
+        .collect()
+}
+
+/// First exact-architecture selector (`arch:gfxXXXX`) in the list.
+fn requested_arch(raw: &str) -> Option<String> {
+    raw.split(',')
+        .map(str::trim)
+        .find_map(|part| part.strip_prefix("arch:").map(|v| v.trim().to_string()))
+}
+
+/// First device id whose reported arch matches `want`, if any.
+fn find_matching_arch(want: &str, archs: &[(i32, Option<String>)]) -> Option<i32> {
+    archs.iter()
+        .find(|(_, a)| a.as_deref() == Some(want))
+        .map(|(id, _)| *id)
+}
+
+#[cfg(test)]
+mod device_selector_tests {
+    use super::{device_selector_kinds, find_matching_arch, requested_arch};
+
+    #[test]
+    fn kinds_parse_lowercase_and_trim() {
+        assert_eq!(device_selector_kinds("arch:gfx1100"), vec!["arch"]);
+        assert_eq!(device_selector_kinds(" Arch : gfx1100 "), vec!["arch"]);
+    }
+
+    #[test]
+    fn kinds_keep_ordinals_verbatim() {
+        assert_eq!(device_selector_kinds("1,2"), vec!["1", "2"]);
+    }
+
+    #[test]
+    fn pci_kind_uses_first_segment_only() {
+        assert_eq!(device_selector_kinds("pci:0000:03:00.0"), vec!["pci"]);
+    }
+
+    #[test]
+    fn mixed_list_yields_all_kinds() {
+        assert_eq!(
+            device_selector_kinds("arch:gfx1100, uuid:xyz"),
+            vec!["arch", "uuid"]
+        );
+    }
+
+    #[test]
+    fn empty_value_has_no_kinds() {
+        assert!(device_selector_kinds("").is_empty());
+        assert!(device_selector_kinds(" , ").is_empty());
+    }
+
+    #[test]
+    fn requested_arch_picks_first_arch_entry_and_trims_value() {
+        assert_eq!(requested_arch("arch:gfx1100"), Some("gfx1100".into()));
+        assert_eq!(
+            requested_arch("1, arch:gfx1201 , arch:gfx1100"),
+            Some("gfx1201".into())
+        );
+        assert_eq!(requested_arch("1,2"), None);
+        assert_eq!(requested_arch("uuid:x"), None);
+    }
+
+    #[test]
+    fn arch_match_returns_first_hit_or_none_for_no_match() {
+        let archs = vec![
+            (0, Some("gfx1036".to_string())),
+            (1, Some("gfx1100".to_string())),
+            (2, None),
+        ];
+        assert_eq!(find_matching_arch("gfx1100", &archs), Some(1));
+        assert_eq!(find_matching_arch("gfx9999", &archs), None);
     }
 }
