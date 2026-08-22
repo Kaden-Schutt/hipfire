@@ -87,3 +87,20 @@ Product path with all levers (`HIPFIRE_LM_HEAD_HFQ3=1 HIPFIRE_QKVZA_FUSEDNORM=1`
 5 runs: **tg128@64 = 231.00 tok/s** (stdev 0.16), tg128@2048 = 225.27
 (stdev 0.25); prefill 3857 / 4419 tok/s. Campaign total: 209.9 → 231.0
 (+10.1 % this session; 190.6 → 231.0 = +21 % across both sessions).
+
+## Addendum 4 (same day): post-restart re-confirmation + ops notes
+
+Re-confirmation after a session restart, same shipped config
+(HIPFIRE_LM_HEAD_HFQ3=1 HIPFIRE_QKVZA_FUSEDNORM=1, image
+hipfire-rocmfp4:bench-final): tg128@64 = 228.50 tok/s (stdev 0.25),
+tg128@2048 = 222.79 (stdev 0.27), prefill 3776.9 / 4349.2. Within ~1% of
+the earlier 231.00/225.27 reading; both runs confirm all levers hold.
+
+Ops notes for future sessions:
+- A stray `daemon` process left by a crashed bench holds its full VRAM
+  allocation until killed - check `/proc/*/fd` for /dev/kfd holders when
+  hipMalloc reports 0 MB free with no obvious GPU user.
+- docker `-e "A=1 B=2"` sets ONE variable named A with value "1 B=2" -
+  pass multiple env vars as separate `-e` flags.
+- The main hipfire checkout gets branch-switched by outside agents;
+  build only from the dedicated worktree after verifying HEAD.
