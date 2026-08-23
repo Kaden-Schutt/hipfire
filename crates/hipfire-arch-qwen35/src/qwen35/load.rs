@@ -2288,7 +2288,13 @@ impl WeightSource for HfqSource<'_> {
         // table keeps its original buffer; only this projection switches.
         static LM_HEAD_HFQ: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
         let lm_head_hfq_mode = *LM_HEAD_HFQ.get_or_init(|| {
-            if hipfire_config::developer_var("HIPFIRE_LM_HEAD_HFQ3")
+            if hipfire_config::developer_var("HIPFIRE_LM_HEAD_HFQ2")
+                .ok()
+                .as_deref()
+                == Some("1")
+            {
+                Some("hfq2")
+            } else if hipfire_config::developer_var("HIPFIRE_LM_HEAD_HFQ3")
                 .ok()
                 .as_deref()
                 == Some("1")
@@ -2306,6 +2312,19 @@ impl WeightSource for HfqSource<'_> {
         });
         if output.gpu_dtype == DType::Q8_0 {
             match lm_head_hfq_mode {
+                Some("hfq2") => {
+                    eprintln!("  requantizing output Q8_0 -> HFQ2G256 (HIPFIRE_LM_HEAD_HFQ2=1)...");
+                    let t0 = std::time::Instant::now();
+                    let converted =
+                        hipfire_runtime::weight_backend::requantize_weight_q8_0_to_hfq2g256(
+                            gpu, &output,
+                        )?;
+                    eprintln!(
+                        "  output -> HFQ2G256 done in {:.2}s",
+                        t0.elapsed().as_secs_f32()
+                    );
+                    return Ok((converted, false));
+                }
                 Some("hfq3") => {
                     eprintln!("  requantizing output Q8_0 -> HFQ3G256 (HIPFIRE_LM_HEAD_HFQ3=1)...");
                     let t0 = std::time::Instant::now();

@@ -394,6 +394,78 @@ pub fn requantize_weight_q8_0_to_hfq3g256(
     })
 }
 
+/// Requantize a Q8_0 `[m, k]` weight tensor to HFQ2G256 on the host
+/// (`HIPFIRE_LM_HEAD_HFQ2=1`). Same contract as the HFQ4/HFQ3 variants;
+/// 2-bit codec matches hipfire-quantize's `quantize_hfq2g256` (f32 scale =
+/// range/3, f32 min, 64 packed bytes per 256-group). QUALITY WARNING: 4
+/// levels per 256-group on a 248k vocab head - ship only if quality checks
+/// pass.
+pub fn requantize_weight_q8_0_to_hfq2g256(
+    gpu: &Gpu,
+    src: &WeightTensor,
+) -> HipResult<WeightTensor> {
+    let m = src.m;
+    let k = src.k;
+    assert!(src.gpu_dtype == DType::Q8_0, "source must be Q8_0");
+    assert!(k % 256 == 0, "k must be a multiple of 256");
+    let q8_row_bytes = (k / 32) * 34;
+    let mut raw = vec![0u8; m * q8_row_bytes];
+    gpu.hip.memcpy_dtoh(&mut raw, &src.buf.buf)?;
+
+    let groups_per_row = k / 256;
+    let out_row_bytes = groups_per_row * 72;
+    let mut out = vec![0u8; m * out_row_bytes];
+
+    let inv3 = 1.0f32 / 3.0;
+    let mut row_f32 = vec![0.0f32; k];
+    for row in 0..m {
+        let row_in = &raw[row * q8_row_bytes..(row + 1) * q8_row_bytes];
+        for b in 0..(k / 32) {
+            let off = b * 34;
+            let scale =
+                crate::llama::f16_to_f32(u16::from_le_bytes([row_in[off], row_in[off + 1]]));
+            for j in 0..32 {
+                row_f32[b * 32 + j] = row_in[off + 2 + j] as i8 as f32 * scale;
+            }
+        }
+        for g in 0..groups_per_row {
+            let group = &row_f32[g * 256..(g + 1) * 256];
+            let mut min_val = f32::INFINITY;
+            let mut max_val = f32::NEG_INFINITY;
+            for &v in group {
+                min_val = min_val.min(v);
+                max_val = max_val.max(v);
+            }
+            let range = max_val - min_val;
+            let scale = if range > 0.0 { range * inv3 } else { 1.0 };
+            let inv_scale = if range > 0.0 { 1.0 / scale } else { 0.0 };
+            let o = row * out_row_bytes + g * 72;
+            out[o..o + 4].copy_from_slice(&scale.to_le_bytes());
+            out[o + 4..o + 8].copy_from_slice(&min_val.to_le_bytes());
+            for i in 0..64 {
+                let mut byte_val = 0u8;
+                for j in 0..4 {
+                    let val = group[4 * i + j];
+                    let q = (((val - min_val) * inv_scale + 0.5) as u8).clamp(0, 3);
+                    byte_val |= q << (j * 2);
+                }
+                out[o + 8 + i] = byte_val;
+            }
+        }
+    }
+
+    let buf = gpu.upload_raw(&out, &[out.len()])?;
+    Ok(WeightTensor {
+        buf,
+        gpu_dtype: DType::HFQ2G256,
+        m,
+        k,
+        row_stride: 0,
+        paro: None,
+        awq_scale: None,
+    })
+}
+
 /// Resolve the output / lm_head weight, returning `(output, aliases_embd)`.
 /// `aliases_embd == true` iff `output.buf` is a view of the embedding buffer
 /// and must NOT be freed by the owning struct.
