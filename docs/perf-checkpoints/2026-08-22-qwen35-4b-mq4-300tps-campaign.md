@@ -175,8 +175,10 @@ CORRECTED CAMPAIGN ACCOUNTING (engine/kernel work only):
 - Session start: 209.9 tok/s @ctx64 (stock engine)
 - Engine-only levers shipped: qkvza consumer-fold (+0.7%, bit-exact),
   fa-kvwrite fold (+0.5-1%, bit-exact), both env-gated
-- Engine-only result: ~212-214 tok/s @ctx64 (final confirmation pending -
-  bench queued behind co-tenant VRAM usage)
+- Engine-only result: 208.49 tok/s @ctx64 median (stdev 0.19), 203.62 @ctx2048
+  (quiet-host confirmation, final-engine-only.json, image rebuilt from tip
+  595a156a after prune; cross-day absolute readings drift +-2-3% with DPM/thermal
+  state - the within-window fold A/Bs (+0.5-1%) remain the causal evidence)
 - With opt-in lm_head requant additionally enabled: 228.5-231.0 tok/s
 
 The gap analysis to 300 tok/s is unchanged and, under this stricter scoping,
