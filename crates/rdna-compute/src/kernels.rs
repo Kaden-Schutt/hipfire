@@ -2962,13 +2962,6 @@ pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX11_BT_SRC: &str =
 /// 136 B dual-half headers, static 8 KiB tile-major LDS, symbols mw{4,8}_lds.
 pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX1100_MW_LDS_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_wmma_gfx1100_mw_lds.hip");
-/// Exact-gfx1201 multi-wave same-row LDS residual candidate (MW4/MW8/MW12).
-/// Sister of GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX1100_MW_LDS_SRC / gfx12 base:
-/// half8 + gfx12 WMMA, 136 B dual-half headers, static 8 KiB tile-major LDS,
-/// symbols `…_mw_lds_mw{4,8,12}`. Default-off via
-/// HIPFIRE_MQ4V2_GFX1201_RESID_MW_LDS; production-neutral.
-pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX1201_MW_LDS_SRC: &str =
-    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_wmma_gfx1201_mw_lds.hip");
 
 pub const GEMM_MQ5G256V2_RESIDUAL_WMMA_GFX12_BT_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq5g256v2_residual_wmma_gfx12_bt.hip");
@@ -3205,13 +3198,6 @@ pub const GEMM_GATE_UP_MQ4G256V2_WMMA_GFX11_BT_SRC: &str =
 /// LDS spanning gate+up rows, symbols mw{4,8}_lds. Production N>=384.
 pub const GEMM_GATE_UP_MQ4G256V2_WMMA_GFX1100_MW_LDS_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_gfx1100_mw_lds.hip");
-/// Exact-gfx1201 multi-wave same-row LDS gate+up candidate (MW4/MW8/MW12).
-/// Sister of GEMM_GATE_UP_MQ4G256V2_WMMA_GFX1100_MW_LDS_SRC / gfx12 base:
-/// half8 + gfx12 WMMA, 136 B dual-half headers, static 8 KiB tile-major LDS
-/// spanning gate+up rows, symbols `…_mw_lds_mw{4,8,12}`. Default-off via
-/// HIPFIRE_MQ4V2_GFX1201_GATE_UP_MW_LDS; production-neutral.
-pub const GEMM_GATE_UP_MQ4G256V2_WMMA_GFX1201_MW_LDS_SRC: &str =
-    include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_gfx1201_mw_lds.hip");
 
 pub const GEMM_GATE_UP_MQ5G256V2_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_mq5g256v2_wmma.hip");
@@ -3357,10 +3343,9 @@ pub const GEMM_QKV_MQ4G256V2_WMMA_SRC: &str =
 /// leaves the base gfx11 and other-arch objects unchanged.
 pub const GEMM_QKV_MQ4G256V2_WMMA_GFX11_BT_SRC: &str =
     include_str!("../../../kernels/src/gemm_qkv_mq4g256v2_wmma_gfx11_bt.hip");
-/// Exact-gfx1201 MQ4V2 QKV batch-tiled candidate (BT4/BT8/BT12).
+/// Exact-gfx1201 MQ4V2 QKV batch-tiled production kernel (BT8).
 /// Sister of GEMM_QKV_MQ4G256V2_WMMA_GFX11_BT_SRC / gfx12 base: half8 +
-/// gfx12 WMMA, 136 B dual-half headers, symbols `…_gfx1201_bt{4,8,12}`.
-/// Default-off via HIPFIRE_MQ4V2_GFX1201_QKV_BT; production-neutral.
+/// gfx12 WMMA, 136 B dual-half headers, with the validated BT8 default.
 pub const GEMM_QKV_MQ4G256V2_WMMA_GFX1201_BT_SRC: &str =
     include_str!("../../../kernels/src/gemm_qkv_mq4g256v2_wmma_gfx1201_bt.hip");
 
