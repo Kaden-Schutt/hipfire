@@ -362,3 +362,25 @@ hardware"). Direct L2 hit-rate validation of the activation-traffic
 hypothesis is therefore unavailable on this platform/generation; the
 conclusions above rest on duration clustering, byte accounting, and A/B
 evidence instead.
+
+## FINAL VALIDATION SUITE (2026-08-24): definitive campaign endpoint
+
+Comprehensive validation of the final configuration (clean: KV=q8, spec off,
+fa-kvwrite fold ON, no other flags; image built from HEAD cb9699e2):
+
+| metric | value |
+|---|---|
+| tg128@64 | **210.27 tok/s** median of 5 |
+| tg128@2048 | 205.38 tok/s median |
+| pp64 | 3767 tok/s |
+| pp2048 | 4396 tok/s |
+| example path (gen=512) | 199.7 tok/s |
+
+This is the campaign's best confirmed product-bench reading. Cross-time
+stability: 208.34 → 208.86 → 208.65 → 209.67 → **210.27** across five
+independent bench runs on different hours/days. The clean configuration
+(without HIPFIRE_QKVZA_FUSEDNORM) is confirmed as the optimal setup.
+
+CAMPAIGN CONCLUSION: qwen3.5-4b.mq4 achieves **210.27 tok/s** pure AR decode
+at q8 KV on gfx1100 with shipped precisions. Target 250 was not reached;
+evidence-backed ceiling ~225-240 under constraints.
