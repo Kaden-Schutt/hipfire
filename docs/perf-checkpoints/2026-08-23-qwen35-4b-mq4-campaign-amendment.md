@@ -171,3 +171,21 @@ gate_up/qkv folds), structurally unsound (conv1d fold), hang-prone
 measured negative when finally engaged). The campaign's honest conclusion
 stands: standing 208.86 tok/s; realistic ceiling ~225-240; 250 requires
 mechanisms outside the objective's constraints.
+
+## Amendment 2h: gated_norm->GDN fold ruled out structurally
+
+The final fusion candidate also fails on geometry. The GDN kernel tiles each
+head's HD=128 output rows across TILE_ROWS=4-row blocks - grid [32 heads,
+32 tiles, 2 lanes] = 2048 blocks - because the delta-rule state update is
+itself tiled. The consumer gated_norm requires a FULL head row (128 values)
+for its RMS reduction, plus pairs of heads (256 values) for the FWHT rotate.
+No GDN block ever holds a complete head, so an epilogue fold would demand
+whole-head blocks (grid collapsing to ~32 blocks on 96 CUs, starving the
+delta-rule compute itself) or a global round trip + separate kernel - which
+is precisely the shipped gated_norm_mq_rotate_gfx1100 fusion already in the
+tree (3.4 us true, fully fused norm+silu-gate+rotate).
+
+CAMPAIGN CLOSED. All launch-reduction candidates are now closed by
+measurement or structure. Standing: tg128@64 = 208.65 tok/s (3-time
+confirmed). Open items reduced to: the wo-shape rate anomaly (~90 us,
+measured three ways, mechanism unexplained).
