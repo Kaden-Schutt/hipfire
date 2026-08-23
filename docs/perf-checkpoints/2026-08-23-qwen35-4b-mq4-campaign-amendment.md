@@ -244,3 +244,29 @@ across three campaigns is closed by measurement or structure. Standing:
 208.65 tok/s product bench (triple-confirmed). Realistic ceiling under the
 objective's constraints: ~225-240. Target 250 requires speculative decoding
 or weight-format change - both excluded.
+
+## Amendment 3 (2026-08-23 night): CRITICAL — engaging the qkvza fold costs -26%, not +0.7%
+
+After wiring the formerly-orphaned route (amendment 2d), controlled A/B on the
+product path (hipfire bench tg128@64, runs=2 interleaved):
+- HIPFIRE_QKVZA_FUSEDNORM=1 : 155.54 tok/s
+- flag absent               : 209.70 tok/s
+=> Engaging fused_qkvza_hfq4g256_fusednorm costs **-26% decode**, far worse
+than the standalone-probe estimate. Addendum 3's "+0.7% certified" was
+measured while the code was ORPHANED (flag inert) — i.e., the claim was
+fictional; only the bit-exact numerics certification was real.
+
+ACTIONS:
+- Default remains OFF (explicit opt-in required). The flag MUST NOT be set on
+  qwen3.5-4b or similar shapes.
+- All local wrapper scripts cleaned of the stale flag.
+- Lesson recorded: a "certified" e2e claim produced through an orphaned code
+  path validates nothing about product behavior.
+
+## Final clean standing (post-cleanup)
+
+tg128@64 = **209.67 tok/s** median of 5 (pp64 3769.9 / pp2048 4392.7),
+config: KV=q8, spec off, fa-kvwrite fold ON, NO residual/persist/LUT/XLDS/
+QKVZA_FUSEDNORM/GATE_UP_FUSEDNORM flags. Best confirmed number of the
+campaign (+40% over the 150-era baseline two days prior; +8% over the
+branch's committed speed floor).
