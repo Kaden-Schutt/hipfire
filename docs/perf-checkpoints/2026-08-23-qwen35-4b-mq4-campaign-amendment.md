@@ -290,3 +290,21 @@ flag affecting the 306-node decode graph has now been screened or verified:
   gate_up PAIR2/STAGE_X32(-26%/-hangs), GEMV_ROWS multirow
 
 Standing clean config confirmed: tg128@64 = 208.4-209.7 tok/s band.
+
+## Amendment 5: remaining engineering items requiring dedicated effort
+
+One hypothesis remains untested: MQ4 GEMVs may be bound by L2 bandwidth on
+ACTIVATION re-reads rather than DRAM weight streams. Traffic analysis shows
+activation reads (M x K x 4B per launch) exceed weight bytes on every shape
+(wo: 42MB acts vs 5.6MB weights). If binding, halving activation bytes via
+f16 staging recovers ~100-200 us/token (+4-8%).
+
+Why not attempted: proper f16 staging requires (a) producers emitting f16
+activations (numerics change - NOT bit-exact, full quality validation
+needed), or (b) per-layer f32->f16 conversion launches (+64 launches/token,
+self-defeating), plus (c) rocprofv3 PMC counters (L2/perfcounter metrics) to
+confirm the L2-bound hypothesis before implementation. Estimated effort:
+1-2 focused sessions; expected ceiling if successful: ~220-235 tok/s.
+
+This documents the boundary of what turn-scale work can reach. All other
+candidates are closed by measurement (amendments 2a-2k) or structure.
