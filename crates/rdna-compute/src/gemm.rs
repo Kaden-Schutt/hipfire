@@ -25868,6 +25868,11 @@ impl Gpu {
     /// Sister of `gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2` but with gfx11
     /// WMMA contracts (half16, w32, interleaved C). Distinct source/symbol/module
     /// so admitting gfx11 cannot alter the certified gfx12 code object.
+    /// Exact gfx1100 production batch-tile is selected by batch size outside
+    /// replay recording and graph capture: BT4 for 96..191, BT12 for >=192;
+    /// base below 96. Other arches and capture/replay retain the historical
+    /// base kernel byte-for-byte. Policy tiles route to
+    /// `gemm_qkvza_mq4g256v2_wmma_gfx1100_bt`.
     pub fn gemm_qkvza_mq4g256v2_wmma(
         &mut self,
         a_qkv: &GpuTensor,
@@ -25886,6 +25891,24 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        // Exact gfx1100 production batch-tile: BT4 for 96..191, BT12 for >=192.
+        // Outside replay recording and graph capture only; other arches and
+        // sizes <96 retain the historical base kernel.
+        if self.arch_caps.is_gfx1100() && !self.replay.is_recording() && !self.graphs.capture_mode {
+            let batch_tile = if batch_size >= 192 {
+                Some(12)
+            } else if batch_size >= 96 {
+                Some(4)
+            } else {
+                None
+            };
+            if let Some(batch_tile) = batch_tile {
+                return self.gemm_qkvza_mq4g256v2_wmma_gfx1100_bt(
+                    a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m,
+                    beta_m, alpha_m, k, batch_size, batch_tile,
+                );
+            }
+        }
         self.bind_thread()?;
         let kname = "gemm_qkvza_mq4g256v2_wmma";
         let ksrc = kernels::GEMM_QKVZA_MQ4G256V2_WMMA_SRC;
@@ -25936,6 +25959,127 @@ impl Gpu {
             crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkvza_mq4g256v2_wmma", bytes);
         let result = self.launch_maybe_blob(
             kname,
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(aq);
+                b.push_ptr(az);
+                b.push_ptr(ab);
+                b.push_ptr(aa);
+                b.push_ptr(xp);
+                b.push_ptr(yq);
+                b.push_ptr(yz);
+                b.push_ptr(yb);
+                b.push_ptr(ya);
+                b.push_i32(q_m);
+                b.push_i32(z_m_val);
+                b.push_i32(b_m);
+                b.push_i32(a_m);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// MQ4V2 gfx1100 qkvza batch-tile (BT4 / BT12).
+    ///
+    /// Direct harness entry and production selector target: reuses one
+    /// dequantized 16-row weight tile across `batch_tile` independent N-tiles.
+    /// One shared module (`gemm_qkvza_mq4g256v2_wmma_gfx11_bt`) with distinct
+    /// symbols so lookup cannot collide with the base
+    /// `gemm_qkvza_mq4g256v2_wmma` object. Grid: ceil((qkv_m+z_m+beta_m+alpha_m)/16) ×
+    /// ceil(N/(16*B)); block 32; FP16 X once; blob-safe ABI + profile timer.
+    /// [`Self::gemm_qkvza_mq4g256v2_wmma`] selects BT4 for batch 96..191 and
+    /// BT12 for batch >=192 on exact gfx1100 outside capture/replay.
+    pub fn gemm_qkvza_mq4g256v2_wmma_gfx1100_bt(
+        &mut self,
+        a_qkv: &GpuTensor,
+        a_z: &GpuTensor,
+        a_beta: &GpuTensor,
+        a_alpha: &GpuTensor,
+        x: &GpuTensor,
+        y_qkv: &GpuTensor,
+        y_z: &GpuTensor,
+        y_beta: &GpuTensor,
+        y_alpha: &GpuTensor,
+        qkv_m: usize,
+        z_m: usize,
+        beta_m: usize,
+        alpha_m: usize,
+        k: usize,
+        batch_size: usize,
+        batch_tile: usize,
+    ) -> HipResult<()> {
+        let func_name = match batch_tile {
+            4 => "gemm_qkvza_mq4g256v2_wmma_gfx11_bt4",
+            12 => "gemm_qkvza_mq4g256v2_wmma_gfx11_bt12",
+            _ => {
+                return Err(hip_bridge::HipError::new(
+                    1,
+                    "gemm_qkvza_mq4g256v2_wmma_gfx1100_bt: batch_tile must be 4 or 12",
+                ));
+            }
+        };
+        self.bind_thread()?;
+        const MODULE: &str = "gemm_qkvza_mq4g256v2_wmma_gfx11_bt";
+        self.ensure_kernel(
+            MODULE,
+            kernels::GEMM_QKVZA_MQ4G256V2_WMMA_GFX11_BT_SRC,
+            func_name,
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+        let mut aq = a_qkv.buf.as_ptr();
+        let mut az = a_z.buf.as_ptr();
+        let mut ab = a_beta.buf.as_ptr();
+        let mut aa = a_alpha.buf.as_ptr();
+        let mut xp = x_f16_ptr;
+        let mut yq = y_qkv.buf.as_ptr();
+        let mut yz = y_z.buf.as_ptr();
+        let mut yb = y_beta.buf.as_ptr();
+        let mut ya = y_alpha.buf.as_ptr();
+        let mut q_m = qkv_m as i32;
+        let mut z_m_val = z_m as i32;
+        let mut b_m = beta_m as i32;
+        let mut a_m = alpha_m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut aq as *mut _ as *mut c_void,
+            &mut az as *mut _ as *mut c_void,
+            &mut ab as *mut _ as *mut c_void,
+            &mut aa as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yq as *mut _ as *mut c_void,
+            &mut yz as *mut _ as *mut c_void,
+            &mut yb as *mut _ as *mut c_void,
+            &mut ya as *mut _ as *mut c_void,
+            &mut q_m as *mut _ as *mut c_void,
+            &mut z_m_val as *mut _ as *mut c_void,
+            &mut b_m as *mut _ as *mut c_void,
+            &mut a_m as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        let total_m = qkv_m + z_m + beta_m + alpha_m;
+        let row_tiles = (total_m + 15) / 16;
+        let batch_tiles = (batch_size + 16 * batch_tile - 1) / (16 * batch_tile);
+        let bytes = crate::profile::gemv_hfq4g256_bytes(qkv_m, k)
+            + crate::profile::gemv_hfq4g256_bytes(z_m, k)
+            + crate::profile::gemv_hfq4g256_bytes(beta_m, k)
+            + crate::profile::gemv_hfq4g256_bytes(alpha_m, k)
+            + batch_size * k * 2
+            + batch_size * total_m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", func_name, bytes);
+        let result = self.launch_maybe_blob(
+            func_name,
             [row_tiles as u32, batch_tiles as u32, 1],
             [32, 1, 1],
             0,
@@ -26060,6 +26204,9 @@ impl Gpu {
     /// Sister of `gemm_qkv_hfq4g256_wmma_gfx12_mq4v2` but with gfx11
     /// WMMA contracts (half16, w32, interleaved C). Distinct source/symbol/module
     /// so admitting gfx11 cannot alter the certified gfx12 code object.
+    /// Exact gfx1100 production batch-tile (outside replay/capture): BT4 for
+    /// batch 96..191, BT12 for batch >=192; sizes <96 and other arches retain
+    /// the historical base kernel.
     pub fn gemm_qkv_mq4g256v2_wmma(
         &mut self,
         a_q: &GpuTensor,
@@ -26075,6 +26222,23 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        // Exact gfx1100 production batch-tile: BT4 for 96..191, BT12 for >=192.
+        // Outside replay recording and graph capture only; other arches and
+        // sizes <96 retain the historical base kernel.
+        if self.arch_caps.is_gfx1100() && !self.replay.is_recording() && !self.graphs.capture_mode {
+            let batch_tile = if batch_size >= 192 {
+                Some(12)
+            } else if batch_size >= 96 {
+                Some(4)
+            } else {
+                None
+            };
+            if let Some(batch_tile) = batch_tile {
+                return self.gemm_qkv_mq4g256v2_wmma_gfx1100_bt(
+                    a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size, batch_tile,
+                );
+            }
+        }
         self.bind_thread()?;
         let kname = "gemm_qkv_mq4g256v2_wmma";
         let ksrc = kernels::GEMM_QKV_MQ4G256V2_WMMA_SRC;
@@ -26118,6 +26282,114 @@ impl Gpu {
             crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkv_mq4g256v2_wmma", bytes);
         let result = self.launch_maybe_blob(
             kname,
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(aq);
+                b.push_ptr(ak);
+                b.push_ptr(av);
+                b.push_ptr(xp);
+                b.push_ptr(yq);
+                b.push_ptr(yk);
+                b.push_ptr(yv);
+                b.push_i32(q_m_val);
+                b.push_i32(k_m_val);
+                b.push_i32(v_m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// MQ4V2 gfx1100 qkv batch-tile (BT4 / BT12).
+    ///
+    /// Direct harness entry and production selector target: reuses one
+    /// dequantized 16-row weight tile across `batch_tile` independent N-tiles.
+    /// One shared module (`gemm_qkv_mq4g256v2_wmma_gfx11_bt`) with distinct
+    /// symbols so lookup cannot collide with the base
+    /// `gemm_qkv_mq4g256v2_wmma` object. Grid: ceil((q_m+k_m+v_m)/16) ×
+    /// ceil(N/(16*B)); block 32; FP16 X once; blob-safe ABI + profile timer.
+    /// [`Self::gemm_qkv_mq4g256v2_wmma`] selects BT4 for batch 96..191 and
+    /// BT12 for batch >=192 on exact gfx1100 outside capture/replay.
+    pub fn gemm_qkv_mq4g256v2_wmma_gfx1100_bt(
+        &mut self,
+        a_q: &GpuTensor,
+        a_k: &GpuTensor,
+        a_v: &GpuTensor,
+        x: &GpuTensor,
+        y_q: &GpuTensor,
+        y_k: &GpuTensor,
+        y_v: &GpuTensor,
+        q_m: usize,
+        k_m: usize,
+        v_m: usize,
+        k: usize,
+        batch_size: usize,
+        batch_tile: usize,
+    ) -> HipResult<()> {
+        let func_name = match batch_tile {
+            4 => "gemm_qkv_mq4g256v2_wmma_gfx11_bt4",
+            12 => "gemm_qkv_mq4g256v2_wmma_gfx11_bt12",
+            _ => {
+                return Err(hip_bridge::HipError::new(
+                    1,
+                    "gemm_qkv_mq4g256v2_wmma_gfx1100_bt: batch_tile must be 4 or 12",
+                ));
+            }
+        };
+        self.bind_thread()?;
+        const MODULE: &str = "gemm_qkv_mq4g256v2_wmma_gfx11_bt";
+        self.ensure_kernel(
+            MODULE,
+            kernels::GEMM_QKV_MQ4G256V2_WMMA_GFX11_BT_SRC,
+            func_name,
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+        let mut aq = a_q.buf.as_ptr();
+        let mut ak = a_k.buf.as_ptr();
+        let mut av = a_v.buf.as_ptr();
+        let mut xp = x_f16_ptr;
+        let mut yq = y_q.buf.as_ptr();
+        let mut yk = y_k.buf.as_ptr();
+        let mut yv = y_v.buf.as_ptr();
+        let mut q_m_val = q_m as i32;
+        let mut k_m_val = k_m as i32;
+        let mut v_m_val = v_m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut aq as *mut _ as *mut c_void,
+            &mut ak as *mut _ as *mut c_void,
+            &mut av as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yq as *mut _ as *mut c_void,
+            &mut yk as *mut _ as *mut c_void,
+            &mut yv as *mut _ as *mut c_void,
+            &mut q_m_val as *mut _ as *mut c_void,
+            &mut k_m_val as *mut _ as *mut c_void,
+            &mut v_m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        let total_m = q_m + k_m + v_m;
+        let row_tiles = (total_m + 15) / 16;
+        let batch_tiles = (batch_size + 16 * batch_tile - 1) / (16 * batch_tile);
+        let bytes = crate::profile::gemv_hfq4g256_bytes(q_m, k)
+            + crate::profile::gemv_hfq4g256_bytes(k_m, k)
+            + crate::profile::gemv_hfq4g256_bytes(v_m, k)
+            + batch_size * k * 2
+            + batch_size * total_m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", func_name, bytes);
+        let result = self.launch_maybe_blob(
+            func_name,
             [row_tiles as u32, batch_tiles as u32, 1],
             [32, 1, 1],
             0,
@@ -26681,6 +26953,29 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        // Exact gfx1100 production batch-tile by measured midpoint ranges
+        // (N={192,256,320,384,448}): BT4 for 96..223, BT6 for 224..287,
+        // BT8 for 288..415; base below 96 and >=416. Outside replay recording
+        // and graph capture only; other arches keep the historical base.
+        if self.arch_caps.is_gfx1100()
+            && self.arch == "gfx1100"
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode
+        {
+            let bt = if (96..=223).contains(&batch_size) {
+                Some(4usize)
+            } else if (224..=287).contains(&batch_size) {
+                Some(6)
+            } else if (288..=415).contains(&batch_size) {
+                Some(8)
+            } else {
+                None
+            };
+            if let Some(bt) = bt {
+                return self
+                    .gemm_mq4g256v2_residual_wmma_gfx1100_bt(a_raw, x, y, m, k, batch_size, bt);
+            }
+        }
         self.bind_thread()?;
         let kname = "gemm_mq4g256v2_residual_wmma";
         let ksrc = kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_SRC;
@@ -26707,6 +27002,87 @@ impl Gpu {
         let timer = crate::profile::begin_timer(&self.hip, "gemm", kname, bytes);
         let result = self.launch_maybe_blob(
             kname,
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(bs_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// MQ4V2 gfx1100 residual batch-tile (BT4/6/8).
+    ///
+    /// Direct harness entry and production selector target: reuses one
+    /// dequantized 16-row weight tile across `batch_tile` independent N-tiles.
+    /// One shared module (`gemm_mq4g256v2_residual_wmma_gfx11_bt`) with distinct
+    /// symbols so lookup cannot collide with the base
+    /// `gemm_mq4g256v2_residual_wmma` object. Grid: ceil(M/16) ×
+    /// ceil(N/(16*B)); block 32; FP16 X once; blob-safe ABI + profile timer.
+    /// Preserves fused `Y += W@X` (residual add) — caller pre-inits Y.
+    /// `batch_tile` accepts only production variants 4/6/8.
+    pub fn gemm_mq4g256v2_residual_wmma_gfx1100_bt(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        batch_tile: usize,
+    ) -> HipResult<()> {
+        let func_name = match batch_tile {
+            4 => "gemm_mq4g256v2_residual_wmma_gfx11_bt4",
+            6 => "gemm_mq4g256v2_residual_wmma_gfx11_bt6",
+            8 => "gemm_mq4g256v2_residual_wmma_gfx11_bt8",
+            _ => {
+                return Err(hip_bridge::HipError::new(
+                    1,
+                    "gemm_mq4g256v2_residual_wmma_gfx1100_bt: batch_tile must be 4,6,8",
+                ));
+            }
+        };
+        self.bind_thread()?;
+        const MODULE: &str = "gemm_mq4g256v2_residual_wmma_gfx11_bt";
+        self.ensure_kernel(
+            MODULE,
+            kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX11_BT_SRC,
+            func_name,
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x_f16_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+        let row_tiles = (m + 15) / 16;
+        let batch_tiles = (batch_size + 16 * batch_tile - 1) / (16 * batch_tile);
+        let bytes =
+            crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * k * 2 + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", func_name, bytes);
+        let result = self.launch_maybe_blob(
+            func_name,
             [row_tiles as u32, batch_tiles as u32, 1],
             [32, 1, 1],
             0,

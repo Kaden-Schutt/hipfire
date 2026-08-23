@@ -2950,6 +2950,13 @@ pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_BT_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_gfx12_bt.hip");
 pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX12_BT_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_wmma_gfx12_bt.hip");
+/// Exact-gfx1100 production MQ4V2 residual batch-tiled WMMA.
+/// Sister of GEMM_MQ4G256V2_RESIDUAL_WMMA_SRC / GFX12_BT: half16 +
+/// interleaved-C contracts, 136 B dual-half headers, and BT∈{4,6,8} weight
+/// reuse. A distinct file/module leaves the base gfx11 and other-arch objects
+/// unchanged.
+pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX11_BT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_wmma_gfx11_bt.hip");
 pub const GEMM_MQ5G256V2_RESIDUAL_WMMA_GFX12_BT_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq5g256v2_residual_wmma_gfx12_bt.hip");
 pub const GEMM_MQ6G256V2_RESIDUAL_WMMA_GFX12_BT_SRC: &str =
@@ -3228,6 +3235,13 @@ pub const GEMM_QKVZA_MQ4G256V2_WMMA_GFX12_SRC: &str =
 /// admitting RDNA3 cannot alter the certified gfx12 code object.
 pub const GEMM_QKVZA_MQ4G256V2_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_qkvza_mq4g256v2_wmma.hip");
+/// Exact-gfx1100 production MQ4V2 QKVZA batch-tiled WMMA.
+/// Sister of GEMM_QKVZA_MQ4G256V2_WMMA_SRC / GFX12_BT: half16 +
+/// interleaved-C contracts, 136 B dual-half headers, and BT∈{4,12} weight
+/// reuse. A distinct file/module leaves the base gfx11 and other-arch objects
+/// unchanged.
+pub const GEMM_QKVZA_MQ4G256V2_WMMA_GFX11_BT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkvza_mq4g256v2_wmma_gfx11_bt.hip");
 pub const GEMM_QKVZA_MQ5G256V2_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_qkvza_mq5g256v2_wmma.hip");
 pub const GEMM_QKVZA_MQ6G256V2_WMMA_SRC: &str =
@@ -3311,6 +3325,12 @@ pub const GEMM_QKV_MQ4G256V2_WMMA_GFX12_SRC: &str =
 /// admitting RDNA3 cannot alter the certified gfx12 code object.
 pub const GEMM_QKV_MQ4G256V2_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_qkv_mq4g256v2_wmma.hip");
+/// Exact-gfx1100 production MQ4V2 QKV batch-tiled WMMA.
+/// Sister of GEMM_QKV_MQ4G256V2_WMMA_SRC: half16 + interleaved-C contracts,
+/// 136 B dual-half headers, and BT∈{4,12} weight reuse. A distinct file/module
+/// leaves the base gfx11 and other-arch objects unchanged.
+pub const GEMM_QKV_MQ4G256V2_WMMA_GFX11_BT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkv_mq4g256v2_wmma_gfx11_bt.hip");
 pub const GEMM_QKV_MQ5G256V2_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_qkv_mq5g256v2_wmma.hip");
 pub const GEMM_QKV_MQ6G256V2_WMMA_SRC: &str =
