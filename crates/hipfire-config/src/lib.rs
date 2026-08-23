@@ -730,6 +730,21 @@ pub static FIELDS: &[ConfigField] = &[
         "Per-slot KV context capacity (tokens) for the multi-slot engine."
     ),
     field!(
+        "serve.multi_slot_pool_total",
+        "multi_slot_pool_total",
+        Serve,
+        ModelLoad,
+        DefaultValue::Integer(0),
+        ValueRule::Integer {
+            min: 0,
+            max: 1048576
+        },
+        true,
+        false,
+        None,
+        "ELASTIC POOL: total KV tokens shared across all slots. When nonzero,          slot 0 becomes a big primary slab (pool_total minus reserves) and the          remaining slots get `serve.multi_slot_ctx` each; a solo request can use          nearly the whole budget while concurrent requests fall back to reserves."
+    ),
+    field!(
         "generation.temperature",
         "temperature",
         Generation,

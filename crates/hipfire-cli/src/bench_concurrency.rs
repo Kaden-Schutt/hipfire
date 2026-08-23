@@ -267,6 +267,8 @@ impl SlotDriver {
                 model_path: model.to_path_buf(),
                 n_slots: max_concurrency,
                 cap_tokens,
+                pool_total_tokens: None,
+                reserve_tokens: 8192,
                 host_budget_bytes: 2 * 1024 * 1024 * 1024,
                 swap_dir: std::env::temp_dir().join("hipfire-bench-swap"),
             },

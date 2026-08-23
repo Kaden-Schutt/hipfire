@@ -75,10 +75,108 @@ impl SlotPool {
         })
     }
 
+    /// Build an ELASTIC pool: a total token budget shared across slots with a
+    /// big primary slab.
+    ///
+    /// Layout (per K or V arena, `stride = per_pos_bytes`):
+    ///   slot 0        — `pool_total - (n_slots-1)*reserve` tokens at offset 0
+    ///   slot 1..n-1   — `reserve` tokens each, packed after the primary
+    ///
+    /// A solo request admitted to the primary can use nearly the whole pool
+    /// budget (e.g. ~96k of 100k with 2 slots and an 8k reserve); concurrent
+    /// requests fall back to the reserved slabs. Addressing is unchanged —
+    /// every kernel resolves `k_base + pos*stride` from the descriptor, and
+    /// attention masks on `desc.seq_len`, so variable caps need no kernel
+    /// changes. Sum of caps equals `pool_total` (rounded up per slab).
+    pub fn new_elastic(
+        n_slots: usize,
+        reserve_per_slot: usize,
+        pool_total: usize,
+        per_pos_bytes: usize,
+    ) -> Result<Self, String> {
+        assert!(n_slots > 0, "n_slots must be positive");
+        assert!(per_pos_bytes > 0, "per_pos_bytes must be positive");
+        assert!(reserve_per_slot > 0, "reserve_per_slot must be positive");
+        let reserve = reserve_per_slot.div_ceil(PAGE_TOKENS) * PAGE_TOKENS;
+        let primary_raw = pool_total
+            .checked_sub(reserve * (n_slots - 1))
+            .filter(|p| *p >= reserve)
+            .ok_or_else(|| {
+                format!(
+                    "SlotPool: pool_total {pool_total} too small for {n_slots} slots \
+                     with reserve {reserve}"
+                )
+            })?;
+        let primary = primary_raw.div_ceil(PAGE_TOKENS) * PAGE_TOKENS;
+
+        // One contiguous arena of pool_total (rounded) tokens per K or V.
+        let arena_tokens = primary + reserve * (n_slots - 1);
+        let arena_bytes = (arena_tokens * per_pos_bytes) as u64;
+        let total = arena_bytes
+            .checked_mul(2)
+            .ok_or_else(|| "SlotPool: arena size overflows u64".to_string())?;
+        preflight_alloc(total, R9700_VRAM_BYTES, "SlotPool arena")?;
+
+        let stride = per_pos_bytes as u64;
+        let mut descs = Vec::with_capacity(n_slots);
+        let mut base: u64 = 0;
+        for i in 0..n_slots {
+            let cap = if i == 0 { primary } else { reserve };
+            descs.push(KvSlotDesc {
+                k_base: base,
+                v_base: base,
+                seq_len: 0,
+                cap: cap as i32,
+            });
+            base += (cap as u64) * stride;
+        }
+        debug_assert_eq!(base as usize, arena_bytes as usize);
+
+        Ok(Self {
+            descs,
+            in_use: vec![false; n_slots],
+            cap_tokens: primary,
+            per_pos_bytes,
+            dirty: true,
+        })
+    }
+
+    /// Capacity of a specific slot (caps vary under `new_elastic`).
+    pub fn slot_cap(&self, id: SlotId) -> usize {
+        self.descs[id.0].cap as usize
+    }
+
+    /// Largest per-slot capacity in the pool.
+    pub fn max_cap(&self) -> usize {
+        self.cap_tokens
+    }
+
     /// Take a free slot, or `None` when the pool is full. Admission control
     /// lives in SP4; this only reports capacity.
     pub fn acquire(&mut self) -> Option<SlotId> {
         let i = self.in_use.iter().position(|&u| !u)?;
+        self.in_use[i] = true;
+        self.reset(SlotId(i));
+        Some(SlotId(i))
+    }
+
+    /// Take the SMALLEST free slot whose cap fits `needed_tokens`. Under an
+    /// elastic pool this preserves the big primary slab for requests that
+    /// actually need it; equal-slab pools behave identically to `acquire`.
+    pub fn acquire_fitting(&mut self, needed_tokens: usize) -> Option<SlotId> {
+        let mut best: Option<usize> = None;
+        let mut best_cap = usize::MAX;
+        for (i, (&u, d)) in self.in_use.iter().zip(self.descs.iter()).enumerate() {
+            if u {
+                continue;
+            }
+            let cap = d.cap as usize;
+            if cap >= needed_tokens && cap < best_cap {
+                best = Some(i);
+                best_cap = cap;
+            }
+        }
+        let i = best?;
         self.in_use[i] = true;
         self.reset(SlotId(i));
         Some(SlotId(i))
@@ -104,10 +202,14 @@ impl SlotPool {
     /// because SP1 removed the device asserts (they shipped in release and
     /// cost 64 B/lane of scratch).
     pub fn set_seq_len(&mut self, id: SlotId, seq_len: usize) -> Result<(), String> {
-        if seq_len > self.cap_tokens {
+        // Per-slot cap, not pool-wide max: under `new_elastic` reserved slots
+        // are much smaller than the primary and must be bounded by their own
+        // slab capacity.
+        let cap = self.descs[id.0].cap as usize;
+        if seq_len > cap {
             return Err(format!(
                 "SlotPool: slot {} seq_len {} exceeds cap {}",
-                id.0, seq_len, self.cap_tokens
+                id.0, seq_len, cap
             ));
         }
         if self.descs[id.0].seq_len != seq_len as i32 {
@@ -219,6 +321,43 @@ mod tests {
         );
         p.mark_uploaded();
         assert!(!p.descriptors_dirty());
+    }
+
+    #[test]
+    fn elastic_pool_gives_primary_the_budget_minus_reserves() {
+        let p = SlotPool::new_elastic(2, 8192, 100_000, PPB).unwrap();
+        let d = p.descriptors();
+        assert_eq!(d.len(), 2);
+        // primary = 100k - 8192 (rounded), reserve = 8192
+        let expect_primary: usize = ((100_000usize - 8_192).div_ceil(128)) * 128; // 91_904
+        assert_eq!(d[0].cap as usize, expect_primary);
+        assert_eq!(d[1].cap as usize, 8192);
+        // Non-overlapping: primary slab ends where reserve starts.
+        assert_eq!(
+            d[1].k_base as usize,
+            d[0].cap as usize * PPB
+        );
+        // Solo request can use the primary fully.
+        assert!(p.max_cap() >= 90_000);
+    }
+
+    #[test]
+    fn elastic_pool_refuses_budget_smaller_than_reserves() {
+        let e = SlotPool::new_elastic(4, 8192, 10_000, PPB).unwrap_err();
+        assert!(e.contains("too small"), "unexpected: {e}");
+    }
+
+    #[test]
+    fn elastic_pool_seq_len_respects_per_slot_cap() {
+        let mut p = SlotPool::new_elastic(2, 8192, 100_000, PPB).unwrap();
+        let primary = p.acquire().unwrap();
+        // Primary can hold ~92k.
+        let big = p.slot_cap(primary) - 1;
+        assert!(p.set_seq_len(primary, big).is_ok());
+        // Reserve slot cannot exceed 8192.
+        let res = p.acquire().unwrap();
+        assert!(p.set_seq_len(res, 8192).is_ok());
+        assert!(p.set_seq_len(res, 8193).is_err());
     }
 
     #[test]

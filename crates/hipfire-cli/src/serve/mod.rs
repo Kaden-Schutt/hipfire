@@ -688,17 +688,38 @@ pub(crate) fn serve_foreground(
                 .ok_or_else(|| anyhow!("multi_slot: cannot resolve model {default_model}"))?;
             let n_slots = config_u64(&global, "serve.multi_slot_slots").unwrap_or(4) as usize;
             let cap_tokens = config_u64(&global, "serve.multi_slot_ctx").unwrap_or(8192) as usize;
+            // ELASTIC POOL: the config's per-slot ctx becomes the RESERVE for
+            // concurrent requests; the pool TOTAL is slots*reserve + extra,
+            // controlled by `serve.multi_slot_pool_total` (tokens). Unset →
+            // legacy equal slabs of cap_tokens each.
+            let reserve_tokens = cap_tokens;
+            let pool_total_tokens = config_u64(&global, "serve.multi_slot_pool_total")
+                .ok()
+                .map(|t| t as usize);
             let mut hfq = hipfire_runtime::hfq::HfqFile::open(&model_path)
                 .with_context(|| format!("multi_slot: open {}", model_path.display()))?;
             let tokenizer =
                 hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
                     .map_err(|e| anyhow!("multi_slot: tokenizer: {e}"))?;
             drop(hfq);
+            let pool_total_tokens =
+                config_u64(&global, "serve.multi_slot_pool_total").unwrap_or(0) as usize;
+            let pool_total_tokens = if pool_total_tokens > 0 {
+                Some(pool_total_tokens)
+            } else {
+                None
+            };
             let engine = hipfire_arch_qwen35::serve_engine::SlotEngine::spawn(
                 hipfire_arch_qwen35::serve_engine::EngineConfig {
                     model_path: model_path.clone(),
                     n_slots,
-                    cap_tokens,
+                    cap_tokens: if pool_total_tokens.is_some() {
+                        reserve_tokens
+                    } else {
+                        cap_tokens
+                    },
+                    pool_total_tokens,
+                    reserve_tokens,
                     host_budget_bytes: 16 * 1024 * 1024 * 1024,
                     swap_dir: std::env::temp_dir().join("hipfire-serve-swap"),
                 },

@@ -41,7 +41,17 @@ use crate::scheduler::{PendingWork, Scheduler};
 pub struct EngineConfig {
     pub model_path: PathBuf,
     pub n_slots: usize,
+    /// Per-slot capacity in EQUAL-slab mode; the PRIMARY slab capacity in
+    /// elastic mode (reserved slots get `reserve_tokens` each).
     pub cap_tokens: usize,
+    /// Elastic slot-pool sharing: total tokens across all slots. When `Some`,
+    /// the pool is built with a big primary slab (`cap_tokens`) and
+    /// `(n_slots-1)` reserved slabs of `reserve_tokens`; a solo request can
+    /// use nearly the whole budget while concurrent requests fall back to
+    /// reserved slabs.
+    pub pool_total_tokens: Option<usize>,
+    /// Reserved-slots context for elastic mode (default 8192).
+    pub reserve_tokens: usize,
     pub host_budget_bytes: u64,
     pub swap_dir: PathBuf,
 }
@@ -136,6 +146,8 @@ struct Rig {
     stamp: SnapshotStamp,
     n_slots: usize,
     cap_tokens: usize,
+    /// Smallest per-slot capacity — bounds the prefill chunk width.
+    min_slot_cap: usize,
 }
 
 fn dn_buffers(dn: &DeltaNetState) -> Vec<&GpuTensor> {
@@ -163,12 +175,6 @@ impl Rig {
             .filter(|t| **t == LayerType::FullAttention)
             .count();
         let per_pos_bytes = config.n_kv_heads * (config.head_dim / 32) * 34;
-        // Prefill scratch is sized by the CHUNK width (one step's rows), not
-        // the full context — sizing it by cap_tokens allocated O(ctx) GiB of
-        // f32 scratch that a chunked prefill never fills. KV arenas (below)
-        // remain the only context-scaled allocations.
-        let max_batch = cfg.cap_tokens.min(2048).max(cfg.n_slots);
-
         let weight_bytes = std::fs::metadata(&cfg.model_path)
             .map_err(|e| format!("stat model: {e}"))?
             .len();
@@ -205,8 +211,29 @@ impl Rig {
         }
         .map_err(|e| format!("load weights: {e}"))?;
 
-        let pool = SlotPool::new(cfg.n_slots, cfg.cap_tokens, per_pos_bytes)
-            .map_err(|e| format!("SlotPool: {e}"))?;
+        let pool = match cfg.pool_total_tokens {
+            Some(pool_total) => SlotPool::new_elastic(
+                cfg.n_slots,
+                cfg.reserve_tokens,
+                pool_total,
+                per_pos_bytes,
+            )
+            .map_err(|e| format!("SlotPool: {e}"))?,
+            None => SlotPool::new(cfg.n_slots, cfg.cap_tokens, per_pos_bytes)
+                .map_err(|e| format!("SlotPool: {e}"))?,
+        };
+        let min_slot_cap = pool
+            .descriptors()
+            .iter()
+            .map(|d| d.cap as usize)
+            .min()
+            .unwrap_or(cfg.cap_tokens);
+        // Prefill scratch is sized by the CHUNK width (one step's rows), not
+        // the full context — sizing it by cap_tokens allocated O(ctx) GiB of
+        // f32 scratch that a chunked prefill never fills. Chunk width is
+        // bounded by the SMALLEST slab (a step's rows may land on any slot)
+        // and capped at 2048 to keep scratch constant.
+        let max_batch = min_slot_cap.min(2048).max(cfg.n_slots);
         let arena_bytes = pool.arena_bytes();
         let mut k_arenas = Vec::with_capacity(n_fa_layers);
         let mut v_arenas = Vec::with_capacity(n_fa_layers);
@@ -278,6 +305,7 @@ impl Rig {
             gpu,
             vision,
             image_pad_id: rig_image_pad_id(&tokenizer),
+            min_slot_cap,
             weights,
             config,
             tokenizer,
@@ -668,9 +696,17 @@ fn admit(
     }
 
     // Try to open; if the pool is full, evict the LRU idle session first.
+    // Needed context for THIS request: prompt + generation budget. Under an
+    // elastic pool this selects the smallest slab that fits; under equal
+    // slabs it is capped at the per-slot capacity.
+    let needed_ctx = req
+        .prompt_tokens
+        .len()
+        .saturating_add(req.max_tokens)
+        .min(rig.cap_tokens);
     let id = match rig
         .sessions
-        .open(&mut rig.pool, &mut rig.adm, rig.cap_tokens)
+        .open(&mut rig.pool, &mut rig.adm, needed_ctx)
     {
         Ok(id) => id,
         Err(_) => {
@@ -690,7 +726,7 @@ fn admit(
                     stats.lock().expect("stats").note_eviction();
                     match rig
                         .sessions
-                        .open(&mut rig.pool, &mut rig.adm, rig.cap_tokens)
+                        .open(&mut rig.pool, &mut rig.adm, needed_ctx)
                     {
                         Ok(id) => id,
                         Err(e) => {

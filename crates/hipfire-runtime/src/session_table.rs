@@ -77,7 +77,10 @@ impl SessionTable {
         requested_ctx: usize,
     ) -> Result<SessionId, AdmitError> {
         let granted_ctx = adm.admit(requested_ctx)?;
-        let slot = match pool.acquire() {
+        // Prefer the smallest slab that fits so an elastic pool's big primary
+        // stays free for requests that actually need it. Equal-slab pools
+        // behave exactly as before (any free slot).
+        let slot = match pool.acquire_fitting(requested_ctx).or_else(|| pool.acquire()) {
             Some(slot) => slot,
             None => {
                 adm.release(granted_ctx);
