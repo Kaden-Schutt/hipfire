@@ -161,3 +161,24 @@ MUST bracket calls with `gdn_requant_frame_checkpoint()` /
 counter otherwise differs between arms and fakes byte diffs. Reverted without a
 trace in the tree; measured +0.5-1% decode while it ran, so re-landing is
 worthwhile once the capture-path root cause is found.
+
+## Addendum 6: scope ruling - lm_head requant levers excluded from campaign results
+
+User ruling (2026-08-23): the objective's "mq4 model weights" means all model
+tensors stay at their shipped precisions. The lm_head requant levers
+(HFQ4/HFQ3/HFQ2 output-head conversion, commits 2b2b39fe / 53753f80+869dc424 /
+bc444998) are therefore OPT-IN RESEARCH, excluded from the campaign's headline
+results. Default OFF; disk file never modified; converters retained for future
+use if the fidelity tradeoff is ever wanted.
+
+CORRECTED CAMPAIGN ACCOUNTING (engine/kernel work only):
+- Session start: 209.9 tok/s @ctx64 (stock engine)
+- Engine-only levers shipped: qkvza consumer-fold (+0.7%, bit-exact),
+  fa-kvwrite fold (+0.5-1%, bit-exact), both env-gated
+- Engine-only result: ~212-214 tok/s @ctx64 (final confirmation pending -
+  bench queued behind co-tenant VRAM usage)
+- With opt-in lm_head requant additionally enabled: 228.5-231.0 tok/s
+
+The gap analysis to 300 tok/s is unchanged and, under this stricter scoping,
+conclusive: the engine-only ceiling (~215-220 even with perfect execution of
+remaining micro-levers) is far below the target.
