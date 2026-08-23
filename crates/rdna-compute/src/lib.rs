@@ -15,7 +15,7 @@ pub mod gemm;
 mod gemma4_ops;
 pub mod gemv;
 pub mod graph;
-mod kernels;
+pub mod kernels;
 pub mod kv_slots;
 pub mod moe;
 pub mod norm;

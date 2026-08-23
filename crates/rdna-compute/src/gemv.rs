@@ -6813,6 +6813,55 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // Persistent dual-row variant (gfx1100, opt-in): bit-identical per-row
+        // arithmetic, 2 rows per block. Wins on short-row shapes (K=4096
+        // wo-class: ~+50% DRAM-cold GB/s); neutral on long-K shapes.
+        static RESIDUAL_PERSIST_R2: OnceLock<bool> = OnceLock::new();
+        let persist_r2 = self.arch_caps.is_gfx1100()
+            && k % 256 == 0
+            && *RESIDUAL_PERSIST_R2.get_or_init(|| {
+                hipfire_config::developer_var("HIPFIRE_RESIDUAL_PERSIST_R2").as_deref() == Ok("1")
+            })
+            // shape gating: value "1" = K4096-only (wo-class); "all" = every shape
+            && match hipfire_config::developer_var("HIPFIRE_RESIDUAL_PERSIST_SCOPE").as_deref() {
+                Ok("all") => true,
+                _ => k == 4096,
+            };
+        if persist_r2 {
+            self.ensure_kernel(
+                "gemv_hfq4g256_residual_persist_r2",
+                kernels::GEMV_HFQ4G256_RESIDUAL_PERSIST_R2_GFX1100_SRC,
+                "gemv_hfq4g256_residual_persist_r2",
+            )?;
+            let ap = a_raw.buf.as_ptr();
+            let xp = x.buf.as_ptr();
+            let yp = y.buf.as_ptr();
+            let mut blob = hip_bridge::KernargBlob::new();
+            blob.push_ptr(ap);
+            blob.push_ptr(xp);
+            blob.push_ptr(yp);
+            blob.push_i32(m as i32);
+            blob.push_i32(k as i32);
+            let grid = ((m + 1) / 2) as u32;
+            let bytes = m * (k / 256) * 136 + k * 4;
+            let timer = crate::profile::begin_timer(
+                &self.hip,
+                "gemv",
+                "gemv_hfq4g256_residual_persist_r2",
+                bytes,
+            );
+            let r = self.launch_kernel_blob(
+                "gemv_hfq4g256_residual_persist_r2",
+                [grid, 1, 1],
+                [32, 1, 1],
+                0,
+                blob.as_mut_slice(),
+            );
+            if let Some(t) = timer {
+                t.finish(&self.hip);
+            }
+            return r;
+        }
         let use_k2048 = self.arch_caps.is_gfx1100()
             && self.flags.rdna3_hfq4_residual_stage_x32
             && self.flags.rdna3_hfq4_residual_k2048
