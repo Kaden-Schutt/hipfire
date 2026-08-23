@@ -98,11 +98,63 @@ use rdna_compute::GpuTensor;
 /// to replay GDN recurrence from a pre-verify S-state snapshot for
 /// `accept_len + 1` steps — no full-target re-run needed.
 #[allow(clippy::too_many_arguments)]
-/// Upper bound on `forward_prefill_batch`'s per-chunk size. Exposed so
-/// callers sizing `HiddenStateRingBuffer` staging can match the chunk
-/// upper bound (staging that's smaller than a chunk will assert-fail
-/// on prompt seeding of long prompts).
+/// Conservative cross-arch upper bound on `forward_prefill_batch`'s per-chunk
+/// size. Adaptive-KV outer boundaries and callers that need a fixed ceiling
+/// still use this constant. Production default chunking is arch-aware via
+/// [`prefill_max_batch`] (measured 384 on exact gfx1201; 256 elsewhere).
+/// Exposed so callers sizing `HiddenStateRingBuffer` staging can match a
+/// safe chunk ceiling (staging smaller than a chunk will assert-fail on
+/// prompt seeding of long prompts).
 pub const PREFILL_MAX_BATCH: usize = 256;
+
+/// gfx1201-measured default prefill chunk size (Qwen3.8 prefill sweet spot).
+/// Exact `gfx1201` only — not gfx1200 or other gfx12 variants.
+const PREFILL_DEFAULT_BATCH_GFX1201: usize = 384;
+
+/// Architecture default for prefill chunk size when
+/// `HIPFIRE_PREFILL_MAX_BATCH` is unset or invalid.
+#[inline]
+fn prefill_max_batch_for_arch(arch: &str) -> usize {
+    if arch == "gfx1201" {
+        PREFILL_DEFAULT_BATCH_GFX1201
+    } else {
+        PREFILL_MAX_BATCH
+    }
+}
+
+/// Resolve the prefill chunk upper bound for `gpu`.
+///
+/// Honors explicit `HIPFIRE_PREFILL_MAX_BATCH` when it parses as an integer
+/// `>= MIN_BATCH` (2); otherwise returns the arch default — 384 on exact
+/// gfx1201, [`PREFILL_MAX_BATCH`] (256) on every other arch string.
+/// Capped entry points further min with an explicit caller ceiling via
+/// `prefill_max_batch(gpu).min(max_batch_cap)`.
+pub fn prefill_max_batch(gpu: &Gpu) -> usize {
+    hipfire_config::developer_var("HIPFIRE_PREFILL_MAX_BATCH")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&v| v >= MIN_BATCH)
+        .unwrap_or_else(|| prefill_max_batch_for_arch(gpu.arch.as_str()))
+}
+
+/// Effective per-chunk capacity for one prefill call.
+///
+/// Never form a chunk larger than the configured/capped max, the PBS
+/// staging owner, or (when present) the hidden-ring staging owner. A
+/// `HiddenStateRingBuffer` sized to 256 therefore cannot receive a 384-row
+/// write even when gfx1201's arch default is 384.
+#[inline]
+fn prefill_effective_chunk_batch(
+    configured_max_batch: usize,
+    pbs_max_batch: usize,
+    hidden_rb_max_batch: Option<usize>,
+) -> usize {
+    let mut cap = configured_max_batch.min(pbs_max_batch);
+    if let Some(hb) = hidden_rb_max_batch {
+        cap = cap.min(hb);
+    }
+    cap
+}
 
 pub(crate) const MOE_GROUPED_BLOCK_M: usize = 16;
 
@@ -434,6 +486,12 @@ pub fn forward_prefill_batch_single_chunk_captured_opts(
     )
 }
 
+/// Batched prefill entry point. Chunk ceiling is arch-aware via
+/// [`prefill_max_batch`] (384 on exact gfx1201). Use
+/// [`forward_prefill_batch_capped`] when internal owned-PBS chunks must stay
+/// at a hard staging budget (e.g. eviction ≤ 256), and pass a hidden ring
+/// whose `max_batch` will also bound actual chunks.
+#[allow(clippy::too_many_arguments)]
 pub fn forward_prefill_batch(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
@@ -467,6 +525,53 @@ pub fn forward_prefill_batch(
     )
 }
 
+/// Like [`forward_prefill_batch`], but forces the configured chunk ceiling
+/// through `prefill_max_batch(gpu).min(max_batch_cap)` before owned-PBS
+/// planning and chunking.
+///
+/// Use when the caller keeps a larger outer window (eviction cadence,
+/// adaptive maybe_evict) but must not allocate or form internal chunks above
+/// a hard staging budget (typically [`PREFILL_MAX_BATCH`] = 256). Preserves
+/// ordinary defaults: `scratch.prefill_batch`, no mask override, full stack
+/// (`max_layer = None`), last-token logits enabled.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_prefill_batch_capped(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    tokens: &[u32],
+    start_pos: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+    scratch: &Qwen35Scratch,
+    hidden_rb: Option<&mut HiddenStateRingBuffer>,
+    per_token_hidden_out: Option<&GpuTensor>,
+    gdn_tape: Option<&mut crate::speculative::GdnTape>,
+    tree_verify: Option<TreeVerifyCtx<'_>>,
+    max_batch_cap: usize,
+) -> HipResult<()> {
+    forward_prefill_batch_with_pbs_opts_inner(
+        gpu,
+        weights,
+        config,
+        tokens,
+        start_pos,
+        kv_cache,
+        dn_state,
+        scratch,
+        hidden_rb,
+        per_token_hidden_out,
+        gdn_tape,
+        tree_verify,
+        scratch.prefill_batch.as_ref(),
+        None,
+        None,
+        true,
+        Some(max_batch_cap),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn forward_prefill_batch_with_pbs(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
@@ -508,17 +613,62 @@ pub fn forward_prefill_batch_with_pbs(
 /// so the ~25 per-cycle tensor allocations can be amortized across many calls.
 ///
 /// `pbs = None` allocates and frees a right-sized scratch per call;
-/// `pbs = Some(&pbs)` reuses the provided scratch. The provided scratch's
-/// `max_batch` determines the chunk size — `tokens` is processed in chunks of
-/// up to `pbs.max_batch`. Callers driving DFlash verify should size `pbs`
-/// to the maximum block size they'll ever request (e.g. `block_size` or
-/// `1 + tree_budget`) so everything fits in one chunk.
+/// `pbs = Some(&pbs)` reuses the provided scratch. Chunk size is the minimum of
+/// the configured/arch max ([`prefill_max_batch`]), `pbs.max_batch`, and
+/// `hidden_rb.max_batch` when a hidden ring is supplied — never larger than any
+/// staging owner. Callers driving DFlash verify should size `pbs` (and hidden
+/// staging) to the maximum block they will request so everything fits in one
+/// chunk, or accept multi-chunk commits.
 ///
 /// `needs_last_token_logits = false` is only for callers that pass
 /// `per_token_hidden_out` and compute their own logits from those hidden rows.
 /// The default wrapper keeps this true to protect existing callers that rely on
 /// `scratch.logits` being populated with the last token's logits.
+///
+/// For an explicit hard ceiling on owned-PBS planning (eviction path), use
+/// [`forward_prefill_batch_capped`] instead of threading a private cap here.
+#[allow(clippy::too_many_arguments)]
 pub fn forward_prefill_batch_with_pbs_opts(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    tokens: &[u32],
+    start_pos: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+    scratch: &Qwen35Scratch,
+    hidden_rb: Option<&mut HiddenStateRingBuffer>,
+    per_token_hidden_out: Option<&GpuTensor>,
+    gdn_tape: Option<&mut crate::speculative::GdnTape>,
+    tree_verify: Option<TreeVerifyCtx<'_>>,
+    pbs_in: Option<&PrefillBatchScratch>,
+    mask_override: Option<MaskEmbedOverride<'_>>,
+    max_layer: Option<usize>,
+    needs_last_token_logits: bool,
+) -> HipResult<()> {
+    forward_prefill_batch_with_pbs_opts_inner(
+        gpu,
+        weights,
+        config,
+        tokens,
+        start_pos,
+        kv_cache,
+        dn_state,
+        scratch,
+        hidden_rb,
+        per_token_hidden_out,
+        gdn_tape,
+        tree_verify,
+        pbs_in,
+        mask_override,
+        max_layer,
+        needs_last_token_logits,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn forward_prefill_batch_with_pbs_opts_inner(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
     config: &Qwen35Config,
@@ -535,6 +685,7 @@ pub fn forward_prefill_batch_with_pbs_opts(
     mask_override: Option<MaskEmbedOverride<'_>>,
     max_layer: Option<usize>,
     needs_last_token_logits: bool,
+    max_batch_cap: Option<usize>,
 ) -> HipResult<()> {
     // Plain single-token AR decode? Only then is the per-token `forward_scratch`
     // call below eligible for the AR-forward hipGraph (capture/replay). Any spec
@@ -552,19 +703,24 @@ pub fn forward_prefill_batch_with_pbs_opts(
     //
     // Tuning note: each extra chunk pays full dispatch-overhead for the LA
     // preamble (rmsnorm, rotate, 4-way fused GEMM) and FFN (gate_up + down).
-    // 256 costs ~80 MB of scratch on 9B vs 20 MB at 64 — trivial on modern
-    // cards — and drops chunk count for pp2048 from 32 → 8. The inner
-    // gated_delta_net_q8_batch_seq loop is still sequential per token, so
-    // the per-chunk DeltaNet cost is linear in N either way; raising the
-    // batch just amortizes the NON-DeltaNet kernels more.
-    //
-    // Exposed via PREFILL_MAX_BATCH so callers sizing `HiddenStateRingBuffer`
-    // staging can match the chunk upper bound.
-    let max_batch: usize = hipfire_config::developer_var("HIPFIRE_PREFILL_MAX_BATCH")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&v| v >= MIN_BATCH)
-        .unwrap_or(PREFILL_MAX_BATCH);
+    // The default is arch-aware via `prefill_max_batch`: measured 384 on
+    // exact gfx1201 (Qwen3.8 sweet spot), conservative
+    // `PREFILL_MAX_BATCH` (256) elsewhere. Override with
+    // `HIPFIRE_PREFILL_MAX_BATCH>=2`. An explicit `max_batch_cap` (from
+    // [`forward_prefill_batch_capped`]) mins on top. Actual chunks are further
+    // limited by PBS and hidden-ring staging so a 256-row ring can never
+    // receive a 384-row write. 256 costs ~80 MB of scratch on 9B vs 20 MB at
+    // 64 — trivial on modern cards — and drops chunk count for pp2048 from
+    // 32 → 8. The inner gated_delta_net_q8_batch_seq loop is still sequential
+    // per token, so the per-chunk DeltaNet cost is linear in N either way;
+    // raising the batch just amortizes the NON-DeltaNet kernels more.
+    let max_batch: usize = {
+        let configured = prefill_max_batch(gpu);
+        match max_batch_cap {
+            Some(cap) => configured.min(cap),
+            None => configured,
+        }
+    };
 
     let n = tokens.len();
     if n == 0 {
@@ -788,9 +944,9 @@ pub fn forward_prefill_batch_with_pbs_opts(
     // pairs on the hot verify path. When None, size the allocation to this
     // call's largest possible chunk and allocate the DeltaNet S-state tape only
     // for tree verify. Plain prefill never consumes that tape, and short
-    // prompts should not pay the full 256-row scratch footprint. The chunk size
-    // is `pbs.max_batch` so a caller-owned scratch sized to e.g. `block_size`
-    // or `1 + tree_budget` keeps DFlash verify in one chunk.
+    // prompts should not pay the full configured scratch footprint. Actual
+    // chunk length is min(configured/capped max, pbs.max_batch, hidden_rb
+    // staging) so no write exceeds a staging owner.
     let mut own_pbs: Option<PrefillBatchScratch> = None;
     let result = (|| -> HipResult<()> {
         let pbs: &PrefillBatchScratch = match pbs_in {
@@ -807,7 +963,11 @@ pub fn forward_prefill_batch_with_pbs_opts(
                 own_pbs.as_ref().unwrap()
             }
         };
-        let chunk_batch = pbs.max_batch;
+        let chunk_batch = prefill_effective_chunk_batch(
+            max_batch,
+            pbs.max_batch,
+            hidden_rb.as_ref().map(|rb| rb.max_batch),
+        );
         let mut chunk_start = 0usize;
         while chunk_start < n {
             let remaining = n - chunk_start;
@@ -7900,6 +8060,48 @@ mod tests {
         assert!(!paro_batched_admit_enabled_from_env(Some("0")));
     }
 
+    #[test]
+    fn prefill_max_batch_arch_defaults() {
+        // Exact gfx1201 alone gets the measured 384 default; every other
+        // string keeps the conservative PREFILL_MAX_BATCH=256 ceiling.
+        // Pure helper — no process env mutation.
+        assert_eq!(prefill_max_batch_for_arch("gfx1201"), 384);
+        assert_eq!(
+            prefill_max_batch_for_arch("gfx1201"),
+            PREFILL_DEFAULT_BATCH_GFX1201
+        );
+        for arch in ["gfx1200", "gfx1151", "gfx1100", "gfx942", "unknown"] {
+            assert_eq!(
+                prefill_max_batch_for_arch(arch),
+                PREFILL_MAX_BATCH,
+                "arch default must stay {PREFILL_MAX_BATCH} on {arch}"
+            );
+        }
+    }
+
+    #[test]
+    fn prefill_effective_chunk_hidden_ring_caps_over_configured_and_pbs() {
+        // DFlash / prompt-seed staging is commonly 256 while gfx1201 default is 384.
+        assert_eq!(
+            prefill_effective_chunk_batch(384, 384, Some(256)),
+            256,
+            "hidden_rb=256 must never receive a 384-row chunk"
+        );
+        assert_eq!(prefill_effective_chunk_batch(384, 512, Some(256)), 256);
+        assert_eq!(prefill_effective_chunk_batch(256, 384, Some(128)), 128);
+    }
+
+    #[test]
+    fn prefill_effective_chunk_explicit_cap_wins_over_larger_pbs() {
+        // Eviction capped path: configured/capped max is already min'd to 256.
+        assert_eq!(prefill_effective_chunk_batch(256, 384, None), 256);
+        assert_eq!(prefill_effective_chunk_batch(256, 256, None), 256);
+        // Ordinary no-hidden/no-cap gfx1201 keeps the 384 win when PBS matches.
+        assert_eq!(prefill_effective_chunk_batch(384, 384, None), 384);
+        // Caller-owned PBS smaller than configured still bounds the chunk.
+        assert_eq!(prefill_effective_chunk_batch(384, 128, None), 128);
+    }
+
     // ── Qwen3.5 dispatch: is_batchable_la ────────────────────────
 
     /// The Qwen3.5-specific copy admits more dtypes than the runtime copy
@@ -8823,6 +9025,11 @@ mod tests {
         assert_eq!(owned_prefill_scratch_plan(32, 256, false), (32, false));
         assert_eq!(owned_prefill_scratch_plan(256, 256, false), (256, false));
         assert_eq!(owned_prefill_scratch_plan(1024, 256, false), (256, false));
+        // Capped-256 path: internal owned PBS splits at 256 even if arch default is 384.
+        assert_eq!(owned_prefill_scratch_plan(1024, 256, false), (256, false));
+        // Ordinary gfx1201 owned path may plan 384-row scratch.
+        assert_eq!(owned_prefill_scratch_plan(1024, 384, false), (384, false));
+        assert_eq!(owned_prefill_scratch_plan(200, 384, false), (200, false));
     }
 
     #[test]
@@ -8843,6 +9050,10 @@ mod tests {
         assert_eq!(plan(258, 256), vec![256, 2]);
         assert_eq!(plan(513, 256), vec![256, 255, 2]);
         assert_eq!(plan(129, 128), vec![127, 2]);
+        // 384-row ceiling (gfx1201 ordinary path).
+        assert_eq!(plan(384, 384), vec![384]);
+        assert_eq!(plan(385, 384), vec![383, 2]);
+        assert_eq!(plan(768, 384), vec![384, 384]);
     }
 
     #[test]
@@ -8854,6 +9065,7 @@ mod tests {
     fn owned_prefill_scratch_preserves_tree_verify_tape() {
         assert_eq!(owned_prefill_scratch_plan(22, 256, true), (22, true));
         assert_eq!(owned_prefill_scratch_plan(64, 64, true), (64, true));
+        assert_eq!(owned_prefill_scratch_plan(22, 384, true), (22, true));
     }
 
     #[test]

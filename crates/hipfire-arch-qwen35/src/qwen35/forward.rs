@@ -1091,11 +1091,7 @@ impl Qwen35Scratch {
                 .as_deref()
                 == Some("1")
             {
-                let max_batch = hipfire_config::developer_var("HIPFIRE_PREFILL_MAX_BATCH")
-                    .ok()
-                    .and_then(|v| v.parse::<usize>().ok())
-                    .filter(|&v| v >= 2)
-                    .unwrap_or(PREFILL_MAX_BATCH);
+                let max_batch = super::prefill::prefill_max_batch(gpu);
                 s.prefill_batch = Some(PrefillBatchScratch::new(gpu, config, max_batch)?);
             }
             Ok(s)

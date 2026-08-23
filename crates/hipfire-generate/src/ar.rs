@@ -2883,8 +2883,8 @@ pub fn generate(
         // connection (curl `-m` timeout, Pi/opencode response timer
         // fired, etc.); the stdin reader thread sets the abort flag
         // and the chunk loop below picks it up. The no-eviction path
-        // is manually chunked at PREFILL_MAX_BATCH so abort latency
-        // is bounded to one chunk (~5 s on gfx1151 at 50 tps).
+        // is manually chunked at the ordinary prefill outer bound so abort
+        // latency is bounded to one chunk (~5 s on gfx1151 at 50 tps).
         //
         // On abort, DeltaNet's non-reversible state means we can't
         // rewind to the pre-prefill position — full reset (seq_pos=0,
@@ -2910,8 +2910,12 @@ pub fn generate(
                     qwen_ar_eviction_prefill_chunk_limit(m.seq_pos, window, adaptive_staging);
                 let chunk_len = remaining.len().min(chunk_limit);
                 let (chunk, rest) = remaining.split_at(chunk_len);
-                if let Err(e) = qwen35::forward_prefill_batch(
+                // Outer eviction-window / maybe_evict cadence is unchanged;
+                // only internal temporary PBS/chunks stay at the historical
+                // memory-safe ceiling (PREFILL_MAX_BATCH=256).
+                if let Err(e) = qwen35::forward_prefill_batch_capped(
                     gpu, weights, config, chunk, m.seq_pos, kv, dn, scratch, None, None, None, None,
+                    qwen35::PREFILL_MAX_BATCH,
                 ) {
                     let action = qwen_ar_forward_fail_action();
                     if action.reset_uncommitted_state {
@@ -2973,11 +2977,17 @@ pub fn generate(
                 remaining = rest;
             }
         } else {
-            // Manually chunk the no-eviction prefill so the abort
-            // check fires between batches. PREFILL_MAX_BATCH (256)
-            // is the same boundary the kernel uses internally so
-            // chunking here doesn't change the GPU-side work.
-            let chunk_max = qwen35::PREFILL_MAX_BATCH;
+            // Manually chunk the no-eviction prefill so the abort check fires
+            // between batches. Outer chunks must agree with internal chunk /
+            // PBS capacity via `prefill_max_batch` (gfx1201 defaults 384;
+            // gfx11/CDNA stay 256; HIPFIRE_PREFILL_MAX_BATCH>=2 overrides).
+            // Adaptive-KV keeps the hard `PREFILL_MAX_BATCH` (256) cap so the
+            // controller's margin and maybe_downshift boundaries stay exact.
+            let chunk_max = if m.kv_adaptive.is_some() {
+                qwen35::PREFILL_MAX_BATCH
+            } else {
+                qwen35::prefill_max_batch(gpu)
+            };
             let mut start = 0usize;
             while start < new_tokens.len() {
                 if check_abort(id) {
