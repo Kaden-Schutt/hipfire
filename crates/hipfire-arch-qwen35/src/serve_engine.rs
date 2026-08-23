@@ -216,10 +216,19 @@ impl Rig {
 
         let (pool, kv_alloc) = match cfg.pool_total_tokens {
             Some(pool_total) => {
-                let pool = SlotPool::new_dynamic(cfg.n_slots, pool_total, per_pos_bytes)
-                    .map_err(|e| format!("SlotPool: {e}"))?;
-                let alloc = KvRangeAllocator::new(pool.max_cap(), per_pos_bytes);
-                (pool, Some(alloc))
+                // ELASTIC (validated): big primary + reserved slabs summing to
+                // pool_total. Dynamic per-request ranges exist behind
+                // SlotPool::new_dynamic but the batched attention path still
+                // assumes uniform slab strides in some fast paths, so elastic
+                // is the shipped configuration.
+                let pool = SlotPool::new_elastic(
+                    cfg.n_slots,
+                    cfg.reserve_tokens,
+                    pool_total,
+                    per_pos_bytes,
+                )
+                .map_err(|e| format!("SlotPool: {e}"))?;
+                (pool, None)
             }
             None => (
                 SlotPool::new(cfg.n_slots, cfg.cap_tokens, per_pos_bytes)
