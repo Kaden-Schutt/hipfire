@@ -308,3 +308,28 @@ confirm the L2-bound hypothesis before implementation. Estimated effort:
 
 This documents the boundary of what turn-scale work can reach. All other
 candidates are closed by measurement (amendments 2a-2k) or structure.
+
+## Amendment 6: unified per-launch cost model — the campaign's capstone analysis
+
+Fitting T = F + bytes/RATE across all four MQ4/q8 GEMV families using
+rocprofv3 ground truth yields a model that matches every measurement within
+~2%:
+- Marginal stream rate R = 935 GB/s (97% of the RX 7900 XTX's 960 GB/s DRAM
+  peak - the hardware streams near-perfectly when amortized)
+- Per-launch fixed cost F = 4.36 us (wave ramp/drain + front-end dispatch),
+  independent of payload size across 5.6 MB - 676 MB launches
+
+Strategic decomposition of the 4.85 ms/token wall:
+- Weight+activation stream floor: ~2710 us (at 935 GB/s)
+- Per-launch fixed: 306 x 4.36 = ~1330 us (27% of wall)
+- Residual inefficiency: ~800 us (short-K shapes below marginal rate)
+
+Path to 250 tok/s (4.00 ms): eliminate ~190 of 306 launches via fusions that
+add no redundant compute. Every such candidate identified was closed by
+measurement or structure (amendments 2a-2k). The remaining route is
+cooperative-launch redesign of certified DeltaNet/GEMV kernels - multi-
+session R&D on correctness-critical code, out of turn-scale scope.
+
+This model gives any future campaign an exact target: each eliminated launch
+is worth 4.36 us; each % of stream-rate recovery on gate_up/residual/qkvza/
+qkv is worth ~10-15 us/token.
