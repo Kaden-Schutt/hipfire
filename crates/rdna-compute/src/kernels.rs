@@ -1704,6 +1704,8 @@ pub const GEMV_HFQ4G256_RESIDUAL_PERSIST_R2_GFX1100_SRC: &str = concat!(
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/gemv_hfq4g256_residual_persist.gfx1100.hip")
 );
+pub const GEMV_HFQ4G256_RESIDUAL_XLDS_PROBE_SRC: &str =
+    include_str!("../../../kernels/src/gemv_xlds_probe.hip");
 pub const GEMV_HFQ4G256_RESIDUAL_LUT_GFX1100_SRC: &str = concat!(
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),

@@ -218,3 +218,29 @@ recovery exists (wave-tail theory disproven; scheduler backfills blocks).
 The residual deficit vs other MQ4 streams scales inversely with K length,
 consistent with fixed per-launch ramp/drain amortized over fewer weight
 bytes. At best this pool is ~90 us/token and no tested schedule reaches it.
+
+## Amendment 2k: LDS-staged activation sharing — falsified, campaign search space closed
+
+Tested the last untried restructure: stage the full activation vector in
+shared memory once per block, share across ROWS_PER_BLOCK rows (r1/r2/r4/r8
+variants, idle-gated interleaved arms on qwen3.5-4b shapes):
+
+| variant | gen tok/s | delta vs OFF |
+|---|---|---|
+| OFF | 150.8 | — |
+| r1 (x staged per row) | 126.2 | -16% |
+| r2 | 119.8 | -20% |
+| r4 | 111.1 | -26% |
+| r8 | 94.8 | -37% |
+
+Monotonically worse with rows-per-block: the cooperative x-stage pass plus
+LDS round trip costs far more than the redundant global/L1 x re-reads it
+replaces. This also retroactively explains the earlier multirow/pair2
+negatives - activation "sharing" is counterproductive on this L1/L2 topology
+for GEMV-shaped work at these sizes.
+
+With this, EVERY launch-reduction and memory-schedule candidate identified
+across three campaigns is closed by measurement or structure. Standing:
+208.65 tok/s product bench (triple-confirmed). Realistic ceiling under the
+objective's constraints: ~225-240. Target 250 requires speculative decoding
+or weight-format change - both excluded.

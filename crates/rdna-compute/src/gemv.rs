@@ -6820,6 +6820,42 @@ impl Gpu {
         // 16 group values sc*i+zp to shared memory once per group; lanes then
         // look values up instead of running extract+cvt+MAD chains.
         // Bit-exact by construction (same expression, same summation order).
+        // LDS-staged activation probe (gfx1100, opt-in): HIPFIRE_XLDS_R selects
+        // rows-per-block (1/2/4/8). x staged once per block in shared memory,
+        // rows read from LDS. EXPERIMENTAL - measures the L2-activation-traffic
+        // hypothesis from campaign amendment 2j.
+        static XLDS_R: OnceLock<Option<u32>> = OnceLock::new();
+        let xlds_r_opt: Option<u32> = if self.arch_caps.is_gfx1100() && k % 256 == 0 {
+            *XLDS_R.get_or_init(|| {
+                hipfire_config::developer_var("HIPFIRE_XLDS_R")
+                    .ok()
+                    .and_then(|v| v.parse::<u32>().ok())
+            })
+        } else {
+            None
+        };
+        if let Some(rpb) = xlds_r_opt {
+            let kname = format!("gemv_xlds_r{rpb}");
+            self.ensure_kernel(
+                &kname,
+                kernels::GEMV_HFQ4G256_RESIDUAL_XLDS_PROBE_SRC,
+                &kname,
+            )?;
+            let mut blob = hip_bridge::KernargBlob::new();
+            blob.push_ptr(a_raw.buf.as_ptr());
+            blob.push_ptr(x.buf.as_ptr());
+            blob.push_ptr(y.buf.as_ptr());
+            blob.push_i32(m as i32);
+            blob.push_i32(k as i32);
+            let grid = ((m + rpb as usize - 1) / rpb as usize) as u32;
+            return self.launch_kernel_blob(
+                &kname,
+                [grid, 1, 1],
+                [32, 1, 1],
+                0,
+                blob.as_mut_slice(),
+            );
+        }
         static RESIDUAL_LUT: OnceLock<bool> = OnceLock::new();
         let residual_lut = self.arch_caps.is_gfx1100()
             && k % 256 == 0
