@@ -113,3 +113,51 @@ vs HFQ3 config, fold on: decode NEUTRAL (example p50 4.38-4.40 vs
 gemv_hfq2g256's lower achieved bandwidth eats the byte savings. Quality:
 coherent but a factual regression appeared on the planets prompt. The
 shipped recommendation stays HIPFIRE_LM_HEAD_HFQ3=1 (231.0 tok/s).
+
+## Addendum 6 (next day): fa_prep KV-write fold lever — +0.7-0.9% decode, shipped behind `HIPFIRE_FA_KVWRITE_FOLD=1`
+
+Commit (this branch): folds the single-token Q8_0 K/V cache write into the
+gfx1100 FA-prep epilogue (`qwen35_fa_prep_kvwrite_gfx1100`, own translation
+unit). Grid 16Q + 2x4KV workgroups; the K workgroups quantize their finished
+rope'd row after a trailing `__syncthreads()`, and NKV tail workgroups quantize
+`fa_v` directly. Q8_0 arithmetic is expression-identical to
+`kv_cache_write_q8_0_pair` (shfl_xor amax butterfly, f16 scale,
+`__float2int_rn`, +-127 clamp, same cache layout), so cache bytes are
+bit-identical. Removes one `kv_cache_write_q8_0_pair` launch per full-attention
+layer. Gated OFF by default; requires non-compact decode route (pos_buf must
+hold the physical position when the folded writer reads it).
+
+Certification: `probe_fa_kvwrite` bitwise on fa_q/fa_gate/fa_k AND both cache
+buffers; `test_kernels` 16/16; greedy temp-0 text byte-identical vs fold-off;
+fresh-process example-path pairs all-positive across two windows
+(OFF 198.6/199.4/199.2 vs FOLD 199.3/201.2/200.6; then order-alternating
+256-token pairs OFF 197.9/199.3/197.7 vs FOLD 199.8/199.2/199.3 — five wins,
+one tie, zero losses; +0.5-1.0%). Product `hipfire bench --kv-mode q8 --spec
+off` x5v5: decode median 204.3 (stdev 0.29) OFF vs 204.1 (stdev 0.24) FOLD —
+neutral within noise on the daemon sampling path today. Engagement proven by
+decode profile on the serve path: pair kernel absent under FOLD=1,
+launches 4496 -> 4368 per profiled segment, profiled wall 165.0 -> 161.0 ms.
+Dispatch plumbing adds an attend-only twin
+(`AttentionFamily::run_attend_only`) so `kv_cache_attention_dispatch` can skip
+the write when the fold pre-wrote it.
+
+## Addendum 7 (same): DN compact2 DPP-reduce port — REVERTED (graph-capture parity failure)
+
+Ported the gfx1151 DPP-reduce compact2 variant to gfx1100 behind
+`HIPFIRE_DN_COMPACT_FAST=1` (same source + defines, renamed kernel).
+Direct-execution result was bit-exact: greedy temp-0 output byte-identical to
+the shipping compact2_b2 over 300 tokens with `HIPFIRE_VERIFY_GRAPH=0`, and the
+ef-residual probe scenario matched bitwise across multi-step state evolution.
+BUT under the default graph-captured daemon path the output degenerated into
+attractor garbage after ~40 tokens (reproducible, deterministic). Root cause not
+isolated before time-box: something in the AR-forward capture/replay path
+treats the newly added compact-GDN kernel module differently (kernarg blob
+retention or frame patch are the suspects; note OFF itself differs graph-vs-
+nograph because capture changes the GDN stochastic frame trajectory — with
+production EF-residual state being deterministic, that alone should be inert).
+Probe methodology note for future attempts: the ef=None (stochastic) probe arm
+MUST bracket calls with `gdn_requant_frame_checkpoint()` /
+`restore_gdn_requant_frame_checkpoint()` — the global `GDN_REQUANT_FRAME`
+counter otherwise differs between arms and fakes byte diffs. Reverted without a
+trace in the tree; measured +0.5-1% decode while it ran, so re-landing is
+worthwhile once the capture-path root cause is found.

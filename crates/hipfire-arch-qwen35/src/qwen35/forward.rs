@@ -2081,7 +2081,7 @@ fn forward_scratch_layers(
                 }
 
                 let fused_epilogue = kv_cache_attention_dispatch(
-                    &ctx, gpu, kv_cache, s, config, &layer.wo, layer_idx, pos,
+                    &ctx, gpu, kv_cache, s, config, &layer.wo, layer_idx, pos, false,
                 )?;
 
                 if !fused_epilogue {
@@ -2406,7 +2406,7 @@ fn forward_scratch_layers(
                 }
 
                 let fused_epilogue = kv_cache_attention_dispatch(
-                    &ctx, gpu, kv_cache, s, config, &layer.wo, layer_idx, pos,
+                    &ctx, gpu, kv_cache, s, config, &layer.wo, layer_idx, pos, false,
                 )?;
 
                 if !fused_epilogue {
@@ -3218,6 +3218,7 @@ fn triattn_tap(
 }
 
 /// KV cache write + attention dispatch. Inline from original.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn kv_cache_attention_dispatch(
     ctx: &DispatchCtx,
     gpu: &mut Gpu,
@@ -3227,6 +3228,7 @@ pub(crate) fn kv_cache_attention_dispatch(
     wo: &WeightTensor,
     layer_idx: usize,
     pos: usize,
+    kv_write_prewritten: bool,
 ) -> HipResult<bool> {
     let plan = KvTierPlan::derive(KvTierInputs {
         pos,
@@ -3266,6 +3268,20 @@ pub(crate) fn kv_cache_attention_dispatch(
         output_gate: fused_epilogue.then_some(&s.fa_gate),
         output: &s.fa_attn_out,
     };
+    if kv_write_prewritten {
+        // The prep kernel's folded epilogue already wrote the Q8_0 K/V cache
+        // rows for this token; dispatch attention only. The fold gate
+        // guarantees the q8 write/attend route and a single decode token.
+        debug_assert!(q8_route && plan.batch_size == 1);
+        use hipfire_dispatch::families::attention::AttentionFamily;
+        static ATTENTION: std::sync::OnceLock<AttentionFamily> = std::sync::OnceLock::new();
+        let res = ATTENTION
+            .get_or_init(AttentionFamily::new)
+            .run_attend_only(ctx, gpu, &plan, &io);
+        return res
+            .map(|_| fused_epilogue)
+            .map_err(|e| HipError::new(0, &e.to_string()));
+    }
     execute_steps(gpu, ctx, &[Step::Attend { plan, io }])
         .map_err(|e| HipError::new(0, &e.to_string()))?;
     Ok(fused_epilogue)
@@ -3811,6 +3827,14 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                 };
                 let tap_enabled = hipfire_runtime::triattn::tap_enabled();
                 let fused_prep = qwen35_fa_prep_enabled(gpu, config) && !tap_enabled;
+                // Fold the Q8_0 KV write into the prep epilogue (default OFF,
+                // HIPFIRE_FA_KVWRITE_FOLD=1). Requires the non-compact decode
+                // route: pos_buf must hold the physical position when the
+                // folded writer reads it, and the pair-writer restore below
+                // would race nothing but change what the fold sees.
+                let kvwrite_fold = fused_prep
+                    && self.kv_cache.compact_offset == 0
+                    && qwen35_fa_kvwrite_fold_enabled(gpu, config);
                 if !fused_prep {
                     gpu.deinterleave_f32(
                         &s.fa_q_full,
@@ -3845,19 +3869,38 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                 }
                 let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
                 if fused_prep {
-                    gpu.qwen35_fa_prep_gfx1100(
-                        &s.fa_q_full,
-                        &s.fa_q,
-                        &s.fa_gate,
-                        &s.fa_k,
-                        q_norm,
-                        k_norm,
-                        &s.pos_buf,
-                        config.norm_eps,
-                        config.rope_theta,
-                        config.n_heads,
-                        config.n_kv_heads,
-                    )?;
+                    if kvwrite_fold {
+                        gpu.qwen35_fa_prep_kvwrite_gfx1100(
+                            &s.fa_q_full,
+                            &s.fa_q,
+                            &s.fa_gate,
+                            &s.fa_k,
+                            &s.fa_v,
+                            &self.kv_cache.k_gpu[self.layer_idx],
+                            &self.kv_cache.v_gpu[self.layer_idx],
+                            q_norm,
+                            k_norm,
+                            &s.pos_buf,
+                            config.norm_eps,
+                            config.rope_theta,
+                            config.n_heads,
+                            config.n_kv_heads,
+                        )?;
+                    } else {
+                        gpu.qwen35_fa_prep_gfx1100(
+                            &s.fa_q_full,
+                            &s.fa_q,
+                            &s.fa_gate,
+                            &s.fa_k,
+                            q_norm,
+                            k_norm,
+                            &s.pos_buf,
+                            config.norm_eps,
+                            config.rope_theta,
+                            config.n_heads,
+                            config.n_kv_heads,
+                        )?;
+                    }
                 } else {
                     gpu.rope_partial_interleaved_f32(
                         &s.fa_q,
@@ -3883,6 +3926,7 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                     wo,
                     self.layer_idx,
                     self.pos,
+                    kvwrite_fold,
                 )?;
                 if !fused_epilogue {
                     gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
@@ -4301,6 +4345,26 @@ fn gated_norm_mq_rotate_enabled(
         && wo.k == n_v_heads * config.linear_value_head_dim
         && wo.gpu_dtype == DType::MQ4G256
         && wo.awq_scale.is_none()
+}
+
+/// Fold the single-token Q8_0 KV-cache write into the FA-prep epilogue on the
+/// certified gfx1100 Qwen3.5-4B shape (16Q/4K, head_dim 256). Removes one
+/// `kv_cache_write_q8_0_pair` launch per full-attention layer; cache bytes are
+/// bit-identical to the pair writer. Default OFF — set
+/// `HIPFIRE_FA_KVWRITE_FOLD=1` to enable.
+fn qwen35_fa_kvwrite_fold_enabled(gpu: &Gpu, config: &Qwen35Config) -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let enabled = *ENABLED.get_or_init(|| {
+        hipfire_config::developer_var("HIPFIRE_FA_KVWRITE_FOLD")
+            .ok()
+            .as_deref()
+            == Some("1")
+    });
+    enabled
+        && gpu.arch_caps.is_gfx1100()
+        && config.n_heads == 16
+        && config.n_kv_heads == 4
+        && config.head_dim == 256
 }
 
 /// Collapse full-attention Q/gate deinterleave, Q/K RMS normalization, and

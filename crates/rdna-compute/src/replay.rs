@@ -975,6 +975,22 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
                 read(48),
             ])
         }
+        // FA prep with folded Q8_0 KV epilogue:
+        // [0]=q_interleaved(r) [8]=q(w) [16]=gate(w) [24]=k(w) [32]=v_src(r)
+        // [40]=k_cache(w) [48]=v_cache(w) [56]=q_weight(r) [64]=k_weight(r)
+        // [72]=pos_buf(r)
+        "qwen35_fa_prep_kvwrite_gfx1100" => Some(vec![
+            read(0),
+            write(8),
+            write(16),
+            write(24),
+            read(32),
+            write(40),
+            write(48),
+            read(56),
+            read(64),
+            read(72),
+        ]),
         "kv_cache_write_q8_0_pair" => Some(vec![write(0), write(8), read(16), read(24), read(32)]),
         "mq_rotate_x" => Some(vec![read(0), write(8), read(16), read(24)]),
         "gemv_hfq4g256"
@@ -1354,6 +1370,8 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "fused_rmsnorm_mq_rotate_wavegrid"
         | "rotate_with_rms_gfx1100"
         | "attention_q8_0_kv" => Some(64),
+        // 10 pointers + eps + freq_base.
+        "qwen35_fa_prep_kvwrite_gfx1100" => Some(88),
         "moe_down_combine_rmsnorm_mq_rotate_vecsum"
         | "moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1151" => Some(72),
         "gemv_hfq4g256_moe_down_k8_indexed_last_combine" => Some(64),
@@ -4660,6 +4678,7 @@ mod tests {
         "qwen35_fa_prep_gfx1100",
         "qwen36_27b_fa_prep_gfx1100",
         "qwen35_fa_prep_gfx1151",
+        "qwen35_fa_prep_kvwrite_gfx1100",
         "mq_rotate_x",
         "gemv_hfq4g256_residual",
         "gemv_hfq4g256_residual_cpol_rt",

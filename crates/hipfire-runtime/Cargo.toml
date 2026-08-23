@@ -141,6 +141,10 @@ name = "probe_fa_prep"
 required-features = ["deltanet"]
 
 [[example]]
+name = "probe_fa_kvwrite"
+required-features = ["deltanet"]
+
+[[example]]
 name = "probe_qkvza_fusednorm"
 required-features = ["deltanet"]
 

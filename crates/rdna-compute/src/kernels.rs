@@ -4846,6 +4846,13 @@ pub const QWEN35_FA_PREP_GFX1151_SRC: &str = concat!(
     include_str!("../../../kernels/src/qwen35_fa_prep.gfx1100.hip")
 );
 
+/// gfx1100 FA prep with a folded Q8_0 KV-cache epilogue (own translation unit,
+/// see the kernel header). Replaces one `kv_cache_write_q8_0_pair` launch per
+/// full-attention layer; cache bytes are bit-identical to the pair writer.
+#[cfg(feature = "deltanet")]
+pub const QWEN35_FA_KVWRITE_GFX1100_SRC: &str =
+    include_str!("../../../kernels/src/qwen35_fa_kvwrite.gfx1100.hip");
+
 /// 2-D spatial RoPE with precomputed per-patch cos/sin tables. Used by
 /// the dots.ocr (Qwen2-VL family) `DotsVisionTransformer` for vision
 /// attention. See `kernels/src/rope_2d_halfsplit.hip` for the layout
