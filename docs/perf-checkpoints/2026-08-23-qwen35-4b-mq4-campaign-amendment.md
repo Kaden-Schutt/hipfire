@@ -189,3 +189,20 @@ CAMPAIGN CLOSED. All launch-reduction candidates are now closed by
 measurement or structure. Standing: tg128@64 = 208.65 tok/s (3-time
 confirmed). Open items reduced to: the wo-shape rate anomaly (~90 us,
 measured three ways, mechanism unexplained).
+
+## Amendment 2i: per-group LDS dequant-LUT residual GEMV — bit-exact, slightly negative
+
+The last untried algorithmic restructure: publish each group's 16 possible
+dequantized values (sc*i+zp, i=0..15) to shared memory once per group, then
+replace per-element extract+cvt+MAD chains with LDS lookups. Same expression,
+same summation order -> BIT-EXACT (greedy text byte-identical x2 prompts).
+
+Result: 148.4-148.9 vs OFF 150.0-150.2 tok/s (idle-gated interleaved pairs)
+= ~-1%. The per-group __syncthreads pair plus LDS lookup latency exceeds the
+ALU savings, independently confirming the ledger's finding that these
+kernels are latency/occupancy-bound rather than VALU-throughput-bound.
+
+Kept default-OFF (HIPFIRE_RESIDUAL_LUT=1) as a wired negative oracle. This
+closes the last algorithmic restructure candidate on the residual family;
+with amendments 2d-2i the campaign's falsification set is complete across
+schedule, algorithmic, and dispatch dimensions.

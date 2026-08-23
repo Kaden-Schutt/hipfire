@@ -1704,6 +1704,11 @@ pub const GEMV_HFQ4G256_RESIDUAL_PERSIST_R2_GFX1100_SRC: &str = concat!(
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/gemv_hfq4g256_residual_persist.gfx1100.hip")
 );
+pub const GEMV_HFQ4G256_RESIDUAL_LUT_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_hfq4g256_residual_lut.gfx1100.hip")
+);
 /// Dual-row R36c1 residual GEMV for gfx1100: processes 2 rows per block,
 /// reusing the activation vector across both rows. Separates weight memory
 /// phase from FMA phase (8 headers loaded sequentially, then 8 DOG FMAs).

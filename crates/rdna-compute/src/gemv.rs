@@ -6816,6 +6816,43 @@ impl Gpu {
         // Persistent dual-row variant (gfx1100, opt-in): bit-identical per-row
         // arithmetic, 2 rows per block. Wins on short-row shapes (K=4096
         // wo-class: ~+50% DRAM-cold GB/s); neutral on long-K shapes.
+        // Per-group LDS dequant-LUT variant (gfx1100, opt-in): publishes the
+        // 16 group values sc*i+zp to shared memory once per group; lanes then
+        // look values up instead of running extract+cvt+MAD chains.
+        // Bit-exact by construction (same expression, same summation order).
+        static RESIDUAL_LUT: OnceLock<bool> = OnceLock::new();
+        let residual_lut = self.arch_caps.is_gfx1100()
+            && k % 256 == 0
+            && *RESIDUAL_LUT.get_or_init(|| {
+                hipfire_config::developer_var("HIPFIRE_RESIDUAL_LUT").as_deref() == Ok("1")
+            });
+        if residual_lut {
+            self.ensure_kernel(
+                "gemv_hfq4g256_residual_lut",
+                kernels::GEMV_HFQ4G256_RESIDUAL_LUT_GFX1100_SRC,
+                "gemv_hfq4g256_residual_lut",
+            )?;
+            let mut blob = hip_bridge::KernargBlob::new();
+            blob.push_ptr(a_raw.buf.as_ptr());
+            blob.push_ptr(x.buf.as_ptr());
+            blob.push_ptr(y.buf.as_ptr());
+            blob.push_i32(m as i32);
+            blob.push_i32(k as i32);
+            let bytes = m * (k / 256) * 136 + k * 4;
+            let timer =
+                crate::profile::begin_timer(&self.hip, "gemv", "gemv_hfq4g256_residual_lut", bytes);
+            let r = self.launch_kernel_blob(
+                "gemv_hfq4g256_residual_lut",
+                [m as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                blob.as_mut_slice(),
+            );
+            if let Some(t) = timer {
+                t.finish(&self.hip);
+            }
+            return r;
+        }
         static RESIDUAL_PERSIST_R2: OnceLock<bool> = OnceLock::new();
         let persist_r2 = self.arch_caps.is_gfx1100()
             && k % 256 == 0
