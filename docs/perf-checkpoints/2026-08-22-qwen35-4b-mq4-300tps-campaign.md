@@ -104,3 +104,12 @@ Ops notes for future sessions:
   pass multiple env vars as separate `-e` flags.
 - The main hipfire checkout gets branch-switched by outside agents;
   build only from the dedicated worktree after verifying HEAD.
+
+## Addendum 5 (same day): lm_head HFQ2 — perf-neutral, quality-degraded, not shipped
+
+`HIPFIRE_LM_HEAD_HFQ2=1` (commit bc444998) completes the quant curve.
+vs HFQ3 config, fold on: decode NEUTRAL (example p50 4.38-4.40 vs
+4.40-4.41 ms; product 229.6 @64 / 224.0 @2048 vs 230.2/225.3 for HFQ3) —
+gemv_hfq2g256's lower achieved bandwidth eats the byte savings. Quality:
+coherent but a factual regression appeared on the planets prompt. The
+shipped recommendation stays HIPFIRE_LM_HEAD_HFQ3=1 (231.0 tok/s).
