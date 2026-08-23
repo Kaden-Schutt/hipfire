@@ -3198,6 +3198,11 @@ pub const GEMM_GATE_UP_MQ4G256V2_WMMA_GFX11_BT_SRC: &str =
 /// LDS spanning gate+up rows, symbols mw{4,8}_lds. Production N>=384.
 pub const GEMM_GATE_UP_MQ4G256V2_WMMA_GFX1100_MW_LDS_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_gfx1100_mw_lds.hip");
+/// Exact-gfx1100 multi-wave same-row LDS gate+up hybrid: two 16-col N tiles
+/// per wave (acc[2]), MW4/8/12/16, static 8 KiB LDS. Default-off candidate
+/// via HIPFIRE_MQ4V2_GATE_UP_MW_LDS_2ACC; does not replace one-acc MW.
+pub const GEMM_GATE_UP_MQ4G256V2_WMMA_GFX1100_MW_LDS_2ACC_SRC: &str =
+    include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_gfx1100_mw_lds_2acc.hip");
 
 pub const GEMM_GATE_UP_MQ5G256V2_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_mq5g256v2_wmma.hip");
@@ -3254,6 +3259,12 @@ pub const GEMM_QKVZA_MQ4G256V2_WMMA_SRC: &str =
 /// unchanged.
 pub const GEMM_QKVZA_MQ4G256V2_WMMA_GFX11_BT_SRC: &str =
     include_str!("../../../kernels/src/gemm_qkvza_mq4g256v2_wmma_gfx11_bt.hip");
+/// Exact-gfx1100 multi-wave same-row LDS qkvza (MW4/8/12/16).
+/// Sister of GEMM_QKVZA_MQ4G256V2_WMMA_GFX11_BT_SRC and gate/residual MW_LDS:
+/// half16 + interleaved-C, 136 B dual-half headers, static 8 KiB tile-major
+/// LDS spanning qkv+z+beta+alpha rows, symbols mw{4,8,12,16}_lds.
+pub const GEMM_QKVZA_MQ4G256V2_WMMA_GFX1100_MW_LDS_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkvza_mq4g256v2_wmma_gfx1100_mw_lds.hip");
 pub const GEMM_QKVZA_MQ5G256V2_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_qkvza_mq5g256v2_wmma.hip");
 pub const GEMM_QKVZA_MQ6G256V2_WMMA_SRC: &str =
