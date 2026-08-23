@@ -206,3 +206,15 @@ Kept default-OFF (HIPFIRE_RESIDUAL_LUT=1) as a wired negative oracle. This
 closes the last algorithmic restructure candidate on the residual family;
 with amendments 2d-2i the campaign's falsification set is complete across
 schedule, algorithmic, and dispatch dimensions.
+
+## Amendment 2j: per-shape residual rates pinned (rocprof duration clustering)
+
+Both shapes share one GPU symbol, so the event-instrumented aggregate never
+separated them. rocprofv3 dispatch durations cluster bimodally:
+- wo   (m2560,k4096): ~10.3 us -> ~540 GB/s
+- w_down(m2560,k9216): ~17.7 us -> ~706 GB/s
+The persist-r2 arm shows identical cluster means - confirming no schedule
+recovery exists (wave-tail theory disproven; scheduler backfills blocks).
+The residual deficit vs other MQ4 streams scales inversely with K length,
+consistent with fixed per-launch ramp/drain amortized over fewer weight
+bytes. At best this pool is ~90 us/token and no tested schedule reaches it.
