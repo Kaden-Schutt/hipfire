@@ -62,3 +62,35 @@ are already L2-resident. Under the stated constraints (plain AR, q8 KV, shipped
 precisions) the honest engine-only ceiling remains ~210-220 tok/s on gfx1100;
 250 requires either speculative decoding or weight-format changes, both out of
 scope by ruling.
+
+## Amendment 2b (same day): rocprofv3 ground truth re-baselines the budget
+
+Event-instrumented DECODE PROFILES inflate tiny kernels 2-6x (per-launch event
+sync serialization): e.g. `fused_rmsnorm_mq_rotate_awq` reads 12-13 us
+instrumented but **4.6 us** under rocprofv3; `gated_delta_net_q8_compact2_b2`
+13-14 -> 5.8 us; silu_mul 10 -> 1.9 us. True steady-state decode per token
+(rocprofv3 dispatch records, uninstrumented durations):
+
+| kernel | /tok | true avg | true rate |
+|---|---|---|---|
+| fused_gate_up_hfq4g256 | 32 | 34.1 us | ~735 GiB/s |
+| gemv_hfq4g256_residual | 64 | 14.1 us (bimodal 10.4/17.9) | ~520/700 GiB/s |
+| gemv_q8_0 (lm_head) | 1 | 758.9 us | ~840 GiB/s |
+| fused_qkvza_hfq4g256 | 24 | 22.5 us | ~747 GiB/s |
+| fused_rmsnorm_mq_rotate_awq | 64 | 4.6 us | latency-bound |
+| fused_qkv_hfq4g256 | 8 | 18.6 us | ~745 GiB/s |
+| gdn compact2_b2 + all producers | ~90 | 2-13 us | latency-bound |
+
+Kernel-busy total ~4.18 ms/token; wall ~4.85 ms -> **~0.7 ms/token of
+graph-node overhead + inter-kernel gaps across ~306 replay nodes**
+(~2-5 us/node). Most weight-streaming GEMVs already run at 700-800 GiB/s;
+the only laggard is the wo shape (~576 GiB/s).
+
+CONSEQUENCE: the campaign pivot is launch-count reduction, not kernel
+bandwidth. Three sessions of BW grinding hit falsified local optima because
+the kernels were already fast; the recoverable pool is node overhead
+(~0.3-0.5 ms via merging producer-chain launches into neighbors where the
+redundant-compute tradeoff is favorable) plus the wo shape (~90 us if its
+deficit is ever explained). Realistic ceiling with both: ~225-240 tok/s;
+250 additionally requires the whole 2.53 GB stream at >750 GiB/s average,
+above every demonstrated rate except lm_head's 840.
