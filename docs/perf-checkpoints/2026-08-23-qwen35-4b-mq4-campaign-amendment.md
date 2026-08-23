@@ -152,3 +152,22 @@ an artifact of the probe's rotating-buffer environment. Triple evidence
 STAGE_X32 schedule is time-optimal in-engine for these shapes, and the
 residual/w_down duration split is intrinsic to their K lengths, not
 wave-tail. No further scheduling experiments warranted on this family.
+
+## Amendment 2g: conv1d->GDN prologue fold ruled out structurally
+
+The last unexplored fusion candidate fails on data-flow grounds, not
+performance grounds. gated_delta_net_q8_fast's grid is [n_heads, tiles,
+lanes]; with QK_HEAD_DIV=2, two state-head blocks consume the same Q/K
+channel slice, and the causal-conv rolling state must be updated exactly
+once per channel. Folding conv into the GDN prologue therefore forces
+either duplicate state writes (race) or a designated-writer scheme that
+needs cross-block ordering (cooperative-launch redesign of a certified
+kernel). The ~120 us pool is unreachable at acceptable risk.
+
+With this, every launch-reduction candidate identified across the campaign
+is closed: measured-negative (persist residual, PAIR2, GEMV_ROWS,
+gate_up/qkv folds), structurally unsound (conv1d fold), hang-prone
+(STAGE_X32), or already shipped (qkvza fusednorm route - itself later
+measured negative when finally engaged). The campaign's honest conclusion
+stands: standing 208.86 tok/s; realistic ceiling ~225-240; 250 requires
+mechanisms outside the objective's constraints.
