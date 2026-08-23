@@ -342,3 +342,12 @@ Screened the Redline PM4 launch backend against default hipGraph replay
 PM4 retained-replay bookkeeping costs more per node than hipGraph dispatch.
 Closes the last untested dispatch lever; hipGraph replay is optimal for this
 decode path.
+
+## Amendment 8 (2026-08-24): fa-kvwrite fold re-verified positive on final config
+
+Post-campaign re-verification of the shipped HIPFIRE_FA_KVWRITE_FOLD=1 lever
+under the final clean configuration (all other flags at defaults):
+idle-gated interleaved arms x3 pairs — OFF 207.18-208.74 (avg 208.21) vs
+FOLD 208.72-210.01 (avg 209.43) = +0.6%, FOLD wins 3/3. The +0.5-1% gain
+first certified under earlier conditions holds on the final configuration.
+Standing config confirmed optimal; campaign complete.
