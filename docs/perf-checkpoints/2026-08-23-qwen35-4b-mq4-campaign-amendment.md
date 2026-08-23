@@ -131,3 +131,11 @@ Status: wiring KEPT as a functional negative oracle behind explicit opt-in;
 comment updated with measured numbers. Lesson recorded: certify levers
 through the PRODUCT dispatch path, not through probe examples that call
 kernels directly.
+
+## Amendment 2e (same day): HIPFIRE_GEMV_ROWS falsified on qwen3.5-4b shapes
+
+Idle-gated interleaved screen (R1/R2/R4 x2, example path, 384-token gens):
+R1 = 199.85 tok/s avg, R2 = 193.85 (-2.9%), R4 = 193.90 (-2.9%). The
+existing opt-in multirow flag is negative on the 4B residual/w_down shapes
+just as it was on the sizes where it was originally rejected. No change
+shipped; default remains rows=1.
