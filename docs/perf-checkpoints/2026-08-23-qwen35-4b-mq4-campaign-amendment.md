@@ -139,3 +139,16 @@ R1 = 199.85 tok/s avg, R2 = 193.85 (-2.9%), R4 = 193.90 (-2.9%). The
 existing opt-in multirow flag is negative on the 4B residual/w_down shapes
 just as it was on the sizes where it was originally rejected. No change
 shipped; default remains rows=1.
+
+## Amendment 2f: rocprof ground-truth closes the persist-residual question
+
+rocprofv3 dispatch records for OFF vs HIPFIRE_RESIDUAL_PERSIST_R2=1 (same
+run shape as 2b): residual kernel durations are IDENTICAL under both
+schedules (lower-cluster mean 10.4 us / upper-cluster 17.5-17.9 us,
+n=6336 each arm); gate_up unchanged (31.4 vs 31.6 median). The standalone
+probe's "+50% GB/s" never existed as GPU-time on real workloads - it was
+an artifact of the probe's rotating-buffer environment. Triple evidence
+(probe, instrumented e2e, rocprof ground truth) now agrees: the single-row
+STAGE_X32 schedule is time-optimal in-engine for these shapes, and the
+residual/w_down duration split is intrinsic to their K lengths, not
+wave-tail. No further scheduling experiments warranted on this family.
