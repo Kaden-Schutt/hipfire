@@ -2957,6 +2957,11 @@ pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX12_BT_SRC: &str =
 /// unchanged.
 pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX11_BT_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_wmma_gfx11_bt.hip");
+/// Shared gfx1100/gfx1151 weight-reuse kernels for MQ{2,3,5,6}V2.
+/// The source compile-time specializes the bit decoder while preserving the
+/// format-specific base WMMA order and gfx11 interleaved-C contract.
+pub const GEMM_MQV2_WMMA_GFX11_BT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mqv2_wmma_gfx11_bt.hip");
 /// Exact-gfx1100 multi-wave same-row LDS residual (production MW4/MW8).
 /// Sister of GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX11_BT_SRC: half16 + interleaved-C,
 /// 136 B dual-half headers, static 8 KiB tile-major LDS, symbols mw{4,8}_lds.
@@ -3348,6 +3353,11 @@ pub const GEMM_QKV_MQ4G256V2_WMMA_GFX11_BT_SRC: &str =
 /// gfx12 WMMA, 136 B dual-half headers, with the validated BT8 default.
 pub const GEMM_QKV_MQ4G256V2_WMMA_GFX1201_BT_SRC: &str =
     include_str!("../../../kernels/src/gemm_qkv_mq4g256v2_wmma_gfx1201_bt.hip");
+/// Shared exact-gfx1201 QKV BT8 kernels for MQ{2,3,5,6}V2.
+/// The bit-specialized decoder reuses each half8 weight fragment across eight
+/// independent token tiles with the production gfx12 contiguous-C contract.
+pub const GEMM_QKV_MQV2_WMMA_GFX1201_BT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkv_mqv2_wmma_gfx1201_bt.hip");
 
 pub const GEMM_QKV_MQ5G256V2_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_qkv_mq5g256v2_wmma.hip");
