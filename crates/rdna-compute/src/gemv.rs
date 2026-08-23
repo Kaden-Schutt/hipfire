@@ -7038,7 +7038,14 @@ impl Gpu {
 
         // Bandwidth: weight + x + y_read (for residual) + y_write.
         let bytes = crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4;
-        let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_hfq4g256_residual", bytes);
+        let prof_name = if k == 4096 {
+            "gemv_hfq4g256_residual_k4096"
+        } else if k == 9216 {
+            "gemv_hfq4g256_residual_k9216"
+        } else {
+            "gemv_hfq4g256_residual"
+        };
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", prof_name, bytes);
         let result = if cdna3 {
             // gfx94x (CDNA3 / MI300X) takes the LDS-cached 8-rows-per-WG path
             // when enabled; gfx906/908 (or env override) keep wave64 base.

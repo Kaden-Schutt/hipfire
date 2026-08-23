@@ -14,9 +14,15 @@
 0.8b_mq4_gen_tok_s=365.6
 0.8b_mq4_pp128_prefill_tok_s=4672.5
 
-4b_mq4_pp32_prefill_tok_s=1014.0
-4b_mq4_gen_tok_s=178.0
-4b_mq4_pp128_prefill_tok_s=2004.3
+# 4B MQ4 rows re-captured 2026-08-23 against commit 0738fb3d
+# (tune/iter3-gate-up-bt2 campaign: qkvza fusednorm fold + fa-kvwrite fold +
+# decode GEMM/producer improvements). Decode 178.0 -> 192.4 (+8.1%), pp32
+# prefill 1014.0 -> 1843.5 (+81.8%, includes the loader/prefill WMMA work).
+# Captured via scripts/speed-gate.sh --fast --update-baselines on gfx1100,
+# best-of-2; product-path confirmation tg128@64 = 208.86 tok/s median of 5.
+4b_mq4_pp32_prefill_tok_s=1843.5
+4b_mq4_gen_tok_s=192.4
+4b_mq4_pp128_prefill_tok_s=2691.7
 
 # 9B AR baselines re-measured 2026-05-01 alongside the MMQ auto-dispatch
 # commit. pp32 went UP (1001 → 1240, +24%) and pp128 went UP (1515 → 1672,
