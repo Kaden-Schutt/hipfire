@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
 
-//! MQ4V2 gate+up BT + MW_LDS + hybrid MW_LDS_2ACC parity on exact gfx1100.
+//! MQ4V2 gate+up BT + MW_LDS parity on exact gfx1100 — batch-column reuse gate.
 //!
 //! Pack deterministic MQ4V2 gate/up weights with **distinct projection salts**
 //! and disjoint halves (half0 in [-1,1], half1 in [96,160]) so a wrong
@@ -19,8 +19,6 @@
 //!      launchers into separate outputs for N=128 and N=256,
 //!   3) run the direct `gemm_gate_up_mq4g256v2_wmma_gfx1100_mw_lds` MW4/MW8
 //!      launchers for N=383/384/511/512 across both gate and up outputs,
-//!   4) run the direct hybrid `gemm_gate_up_mq4g256v2_wmma_gfx1100_mw_lds_2acc`
-//!      MW4/8/12/16 launchers for the same N set (two N-tiles per wave),
 //!  and compare both projections (gate and up) for raw f32 bit equality
 //!  (`got.to_bits() == want.to_bits()` on every element) as a hard gate, plus
 //!  finite/nondegenerate, relL2<=1e-5, cosine>=1-1e-6, reporting max abs.
@@ -266,9 +264,7 @@ fn main() {
         eprintln!("SKIP: arch {arch} is not exact gfx1100 — harness requires gfx1100 only");
         return;
     }
-    eprintln!(
-        "arch {arch} confirmed exact gfx1100 — running gate+up BT + MW_LDS + MW_LDS_2ACC parity"
-    );
+    eprintln!("arch {arch} confirmed exact gfx1100 — running gate+up BT + MW_LDS parity");
 
     // Capture check: if a capture is armed, skip to avoid polluting.
     // The harness is no-capture by contract; we just note it.
@@ -338,11 +334,8 @@ fn main() {
     let bts = [6usize, 12];
     // N383/511 cover partial final-wave columns; N384/512 are full MW tiles
     // for MW4/MW8. Production uses padding-aware MW4/MW8 for N>=384.
-    // Hybrid 2acc also covers MW12/MW16; N511 places last invalid lane in
-    // the second accumulator tile.
     let ns_mw = [383usize, 384usize, 511usize, 512usize];
     let mws = [4usize, 8];
-    let mws_2acc = [4usize, 8, 12, 16];
 
     let mut all_ok = true;
 
@@ -607,138 +600,9 @@ fn main() {
         }
     }
 
-    for &n in &ns_mw {
-        eprintln!("\n=== MW_LDS_2ACC N={n} ===");
-        let x_host: Vec<f32> = (0..n * k)
-            .map(|i| prng(i, 0xC0FF_EE00) * 2.0 - 1.0)
-            .collect();
-        assert_eq!(x_host.len(), n * k);
-
-        let d_x = gpu
-            .alloc_tensor(&[n * k], DType::F32)
-            .expect("alloc x mw2acc");
-        let d_y_gate_ref = gpu
-            .alloc_tensor(&[n * gate_m], DType::F32)
-            .expect("alloc y_gate ref mw2acc");
-        let d_y_up_ref = gpu
-            .alloc_tensor(&[n * up_m], DType::F32)
-            .expect("alloc y_up ref mw2acc");
-
-        gpu.hip
-            .memcpy_htod(&d_x.buf, unsafe {
-                std::slice::from_raw_parts(x_host.as_ptr() as *const u8, x_host.len() * 4)
-            })
-            .expect("htod x mw2acc");
-        gpu.hip
-            .device_synchronize()
-            .expect("sync after htod x mw2acc");
-
-        // Capture-forced base oracle (skips production BT/MW/2acc routes).
-        fill_f32_quiet_nan(&mut gpu, &d_y_gate_ref, NAN_GATE_BITS);
-        fill_f32_quiet_nan(&mut gpu, &d_y_up_ref, NAN_UP_BITS);
-        let saved_capture = gpu.graphs.capture_mode;
-        gpu.graphs.capture_mode = true;
-        gpu.hip.device_synchronize().unwrap();
-        let t_ref = std::time::Instant::now();
-        let ref_res = gpu.gemm_gate_up_mq4g256v2_wmma(
-            &d_gate,
-            &d_up,
-            &d_x,
-            &d_y_gate_ref,
-            &d_y_up_ref,
-            gate_m,
-            up_m,
-            k,
-            n,
-        );
-        gpu.graphs.capture_mode = saved_capture;
-        ref_res.expect("base gemm_gate_up_mq4g256v2_wmma failed (mw2acc shapes)");
-        gpu.hip.device_synchronize().expect("sync ref mw2acc");
-        let ref_us = t_ref.elapsed().as_secs_f64() * 1e6;
-        eprintln!("  base ref N={n} done in {ref_us:.1} us");
-
-        let y_gate_ref = gpu
-            .download_f32(&d_y_gate_ref)
-            .expect("download gate ref mw2acc");
-        let y_up_ref = gpu
-            .download_f32(&d_y_up_ref)
-            .expect("download up ref mw2acc");
-        assert_eq!(y_gate_ref.len(), n * gate_m);
-        assert_eq!(y_up_ref.len(), n * up_m);
-        assert!(is_finite(&y_gate_ref), "ref gate not finite N={n}");
-        assert!(is_finite(&y_up_ref), "ref up not finite N={n}");
-        assert!(variance(&y_gate_ref) > 1e-12, "ref gate degenerate N={n}");
-        assert!(variance(&y_up_ref) > 1e-12, "ref up degenerate N={n}");
-
-        for &waves in &mws_2acc {
-            let d_y_gate_mw = gpu
-                .alloc_tensor(&[n * gate_m], DType::F32)
-                .expect("alloc y_gate mw2acc");
-            let d_y_up_mw = gpu
-                .alloc_tensor(&[n * up_m], DType::F32)
-                .expect("alloc y_up mw2acc");
-            fill_f32_quiet_nan(&mut gpu, &d_y_gate_mw, NAN_GATE_BITS);
-            fill_f32_quiet_nan(&mut gpu, &d_y_up_mw, NAN_UP_BITS);
-            let res = gpu.gemm_gate_up_mq4g256v2_wmma_gfx1100_mw_lds_2acc(
-                &d_gate,
-                &d_up,
-                &d_x,
-                &d_y_gate_mw,
-                &d_y_up_mw,
-                gate_m,
-                up_m,
-                k,
-                n,
-                waves,
-            );
-            if let Err(e) = res {
-                eprintln!("  MW{waves}_2acc wrapper launch failed N={n}: {e:?}");
-                all_ok = false;
-                continue;
-            }
-            gpu.hip.device_synchronize().expect("sync mw2acc");
-
-            let y_gate_mw = gpu
-                .download_f32(&d_y_gate_mw)
-                .expect("download gate mw2acc");
-            let y_up_mw = gpu.download_f32(&d_y_up_mw).expect("download up mw2acc");
-
-            let ok_gate = check_proj("gate-2acc", n, waves, &y_gate_mw, &y_gate_ref);
-            let ok_up = check_proj("up-2acc  ", n, waves, &y_up_mw, &y_up_ref);
-            if !ok_gate || !ok_up {
-                eprintln!("  MW{waves}_2acc N={n} FAILED");
-                all_ok = false;
-            } else {
-                eprintln!("  MW{waves}_2acc N={n} OK");
-            }
-
-            if n == 512 {
-                fill_f32_quiet_nan(&mut gpu, &d_y_gate_mw, NAN_GATE_BITS);
-                fill_f32_quiet_nan(&mut gpu, &d_y_up_mw, NAN_UP_BITS);
-                let t = std::time::Instant::now();
-                gpu.gemm_gate_up_mq4g256v2_wmma_gfx1100_mw_lds_2acc(
-                    &d_gate,
-                    &d_up,
-                    &d_x,
-                    &d_y_gate_mw,
-                    &d_y_up_mw,
-                    gate_m,
-                    up_m,
-                    k,
-                    n,
-                    waves,
-                )
-                .expect("re-launch mw2acc for timing");
-                gpu.hip.device_synchronize().unwrap();
-                let us = t.elapsed().as_secs_f64() * 1e6;
-                eprintln!("    timing N512 MW{waves}_2acc: {us:.1} us (host Instant+sync)");
-            }
-        }
-    }
-
     if all_ok {
         eprintln!(
-            "\nPASS: all N={{128,256}} x BT{{6,12}}, N={{383,384,511,512}} x MW{{4,8}}, and N={{383,384,511,512}} x MW_2ACC{{4,8,12,16}} x {{gate,up}} raw-bit equal (f32::to_bits) under distinct gate/up salts + quiet-NaN overwrite init (gate_m=40/up_m=53 boundary-in-tile32..47, final-tile 13); finite/nondegenerate proves full overwrite (no leftover NaN / no accidental +=); relL2<=1e-5 cosine>=1-1e-6; maxAbs reported per variant"
+            "\nPASS: all N={{128,256}} x BT{{6,12}} and N={{383,384,511,512}} x MW{{4,8}} x {{gate,up}} raw-bit equal (f32::to_bits) under distinct gate/up salts + quiet-NaN overwrite init (gate_m=40/up_m=53 boundary-in-tile32..47, final-tile 13); finite/nondegenerate proves full overwrite (no leftover NaN / no accidental +=); relL2<=1e-5 cosine>=1-1e-6; maxAbs reported per variant"
         );
     } else {
         eprintln!(

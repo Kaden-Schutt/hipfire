@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
 
-//! MQ4V2 qkvza BT + MW_LDS parity on exact gfx1100 — batch-column reuse gate.
+//! MQ4V2 qkvza BT parity on exact gfx1100 — batch-column reuse gate.
 //!
 //! Pack deterministic MQ4V2 qkv/z/beta/alpha weights with disjoint halves
 //! (half0 in [-1,1], half1 in [96,160]) so a wrong half-header or lane test is
@@ -11,16 +11,14 @@
 //! projection; total 120 has an 8-row tail) so straddling tiles and tail
 //! guards are exercised. On exact gfx1100:
 //!   1) run the historical base `gemm_qkvza_mq4g256v2_wmma` into reference
-//!      outputs (force base by arming capture_mode so production BT/MW policy is skipped),
+//!      outputs (force base by arming capture_mode so production BT policy is skipped),
 //!   2) run the direct `gemm_qkvza_mq4g256v2_wmma_gfx1100_bt` launchers into
 //!      separate outputs for N=128 and N=256 with production policy tiles
 //!      BT∈{4,12},
-//!   3) run the direct `gemm_qkvza_mq4g256v2_wmma_gfx1100_mw_lds` MW4/8/12/16
-//!      launchers for N=191/192/511/512 across all four outputs,
 //!  and compare all four projections (qkv,z,beta,alpha) for raw f32 bit equality
 //!  (`got.to_bits() == want.to_bits()` on every element) as a hard gate, plus
 //!  finite/nondegenerate, relL2<=1e-5, cosine>=1-1e-6, reporting max abs.
-//!  Every reference/BT/MW output buffer is initialized with four distinct
+//!  Every reference/BT output buffer is initialized with four distinct
 //!  quiet-NaN sentinels before launch so unwritten tails and accidental `+=`
 //!  remain non-finite; finite + raw-bit equality proves routing/full
 //!  overwrite/no accidental +=.
@@ -262,7 +260,7 @@ fn main() {
         eprintln!("SKIP: arch {arch} is not exact gfx1100 — harness requires gfx1100 only");
         return;
     }
-    eprintln!("arch {arch} confirmed exact gfx1100 — running qkvza BT + MW_LDS parity");
+    eprintln!("arch {arch} confirmed exact gfx1100 — running qkvza BT parity");
 
     if gpu.active_capture.is_some() {
         eprintln!("SKIP: active_capture is Some — BT harness requires no capture");
@@ -320,10 +318,6 @@ fn main() {
 
     let ns_bt = [128usize, 256usize];
     let bts = [4usize, 12];
-    // MW shapes: 191 is partial final tile (one less than 192), 192 full MW tiles for all waves,
-    // 511 partial, 512 full. Covers tails.
-    let ns_mw = [191usize, 192usize, 511usize, 512usize];
-    let mws = [4usize, 8, 12, 16];
 
     let mut all_ok = true;
 
@@ -355,7 +349,7 @@ fn main() {
             .expect("htod x");
         gpu.hip.device_synchronize().expect("sync after htod");
 
-        // Reference: historical base kernel. Production BT/MW auto-selects outside capture,
+        // Reference: historical base kernel. Production BT auto-selects outside capture,
         // so arm capture_mode for this launch only to retain the base object as oracle.
         // Initialize with distinct quiet-NaN per projection so unwritten tails / accidental += remain non-finite.
         fill_f32_quiet_nan(&mut gpu, &d_y_qkv_ref, NAN_QKV_BITS);
@@ -501,180 +495,8 @@ fn main() {
         }
     }
 
-    for &n in &ns_mw {
-        eprintln!("\n=== MW_LDS N={n} ===");
-        let x_host: Vec<f32> = (0..n * k)
-            .map(|i| prng(i, 0xC0FF_EE00) * 2.0 - 1.0)
-            .collect();
-        assert_eq!(x_host.len(), n * k);
-
-        let d_x = gpu.alloc_tensor(&[n * k], DType::F32).expect("alloc x mw");
-        gpu.hip
-            .memcpy_htod(&d_x.buf, unsafe {
-                std::slice::from_raw_parts(x_host.as_ptr() as *const u8, x_host.len() * 4)
-            })
-            .expect("htod x mw");
-        gpu.hip.device_synchronize().expect("sync after htod x mw");
-
-        let d_y_qkv_ref = gpu
-            .alloc_tensor(&[n * qkv_m], DType::F32)
-            .expect("alloc y_qkv ref mw");
-        let d_y_z_ref = gpu
-            .alloc_tensor(&[n * z_m], DType::F32)
-            .expect("alloc y_z ref mw");
-        let d_y_beta_ref = gpu
-            .alloc_tensor(&[n * beta_m], DType::F32)
-            .expect("alloc y_beta ref mw");
-        let d_y_alpha_ref = gpu
-            .alloc_tensor(&[n * alpha_m], DType::F32)
-            .expect("alloc y_alpha ref mw");
-
-        fill_f32_quiet_nan(&mut gpu, &d_y_qkv_ref, NAN_QKV_BITS);
-        fill_f32_quiet_nan(&mut gpu, &d_y_z_ref, NAN_Z_BITS);
-        fill_f32_quiet_nan(&mut gpu, &d_y_beta_ref, NAN_BETA_BITS);
-        fill_f32_quiet_nan(&mut gpu, &d_y_alpha_ref, NAN_ALPHA_BITS);
-        let saved_capture = gpu.graphs.capture_mode;
-        gpu.graphs.capture_mode = true;
-        gpu.hip.device_synchronize().unwrap();
-        let t_ref = std::time::Instant::now();
-        let ref_res = gpu.gemm_qkvza_mq4g256v2_wmma(
-            &d_qkv,
-            &d_z,
-            &d_beta,
-            &d_alpha,
-            &d_x,
-            &d_y_qkv_ref,
-            &d_y_z_ref,
-            &d_y_beta_ref,
-            &d_y_alpha_ref,
-            qkv_m,
-            z_m,
-            beta_m,
-            alpha_m,
-            k,
-            n,
-        );
-        gpu.graphs.capture_mode = saved_capture;
-        ref_res.expect("base gemm_qkvza_mq4g256v2_wmma failed (mw shapes)");
-        gpu.hip.device_synchronize().expect("sync ref mw");
-        let ref_us = t_ref.elapsed().as_secs_f64() * 1e6;
-        eprintln!("  base ref N={n} done in {ref_us:.1} us");
-
-        let y_qkv_ref = gpu.download_f32(&d_y_qkv_ref).expect("download qkv ref mw");
-        let y_z_ref = gpu.download_f32(&d_y_z_ref).expect("download z ref mw");
-        let y_beta_ref = gpu
-            .download_f32(&d_y_beta_ref)
-            .expect("download beta ref mw");
-        let y_alpha_ref = gpu
-            .download_f32(&d_y_alpha_ref)
-            .expect("download alpha ref mw");
-        assert_eq!(y_qkv_ref.len(), n * qkv_m);
-        assert_eq!(y_z_ref.len(), n * z_m);
-        assert_eq!(y_beta_ref.len(), n * beta_m);
-        assert_eq!(y_alpha_ref.len(), n * alpha_m);
-        assert!(is_finite(&y_qkv_ref), "ref qkv not finite N={n}");
-        assert!(is_finite(&y_z_ref), "ref z not finite N={n}");
-        assert!(is_finite(&y_beta_ref), "ref beta not finite N={n}");
-        assert!(is_finite(&y_alpha_ref), "ref alpha not finite N={n}");
-        assert!(variance(&y_qkv_ref) > 1e-12, "ref qkv degenerate N={n}");
-        assert!(variance(&y_z_ref) > 1e-12, "ref z degenerate N={n}");
-        assert!(variance(&y_beta_ref) > 1e-12, "ref beta degenerate N={n}");
-        assert!(variance(&y_alpha_ref) > 1e-12, "ref alpha degenerate N={n}");
-
-        for &waves in &mws {
-            let d_y_qkv_mw = gpu
-                .alloc_tensor(&[n * qkv_m], DType::F32)
-                .expect("alloc y_qkv mw");
-            let d_y_z_mw = gpu
-                .alloc_tensor(&[n * z_m], DType::F32)
-                .expect("alloc y_z mw");
-            let d_y_beta_mw = gpu
-                .alloc_tensor(&[n * beta_m], DType::F32)
-                .expect("alloc y_beta mw");
-            let d_y_alpha_mw = gpu
-                .alloc_tensor(&[n * alpha_m], DType::F32)
-                .expect("alloc y_alpha mw");
-
-            fill_f32_quiet_nan(&mut gpu, &d_y_qkv_mw, NAN_QKV_BITS);
-            fill_f32_quiet_nan(&mut gpu, &d_y_z_mw, NAN_Z_BITS);
-            fill_f32_quiet_nan(&mut gpu, &d_y_beta_mw, NAN_BETA_BITS);
-            fill_f32_quiet_nan(&mut gpu, &d_y_alpha_mw, NAN_ALPHA_BITS);
-
-            let res = gpu.gemm_qkvza_mq4g256v2_wmma_gfx1100_mw_lds(
-                &d_qkv,
-                &d_z,
-                &d_beta,
-                &d_alpha,
-                &d_x,
-                &d_y_qkv_mw,
-                &d_y_z_mw,
-                &d_y_beta_mw,
-                &d_y_alpha_mw,
-                qkv_m,
-                z_m,
-                beta_m,
-                alpha_m,
-                k,
-                n,
-                waves,
-            );
-            if let Err(e) = res {
-                eprintln!("  MW{waves} wrapper launch failed N={n}: {e:?}");
-                all_ok = false;
-                continue;
-            }
-            gpu.hip.device_synchronize().expect("sync mw");
-
-            let y_qkv_mw = gpu.download_f32(&d_y_qkv_mw).expect("download qkv mw");
-            let y_z_mw = gpu.download_f32(&d_y_z_mw).expect("download z mw");
-            let y_beta_mw = gpu.download_f32(&d_y_beta_mw).expect("download beta mw");
-            let y_alpha_mw = gpu.download_f32(&d_y_alpha_mw).expect("download alpha mw");
-
-            let ok_qkv = check_proj("qkv-mw ", n, waves, &y_qkv_mw, &y_qkv_ref);
-            let ok_z = check_proj("z-mw   ", n, waves, &y_z_mw, &y_z_ref);
-            let ok_beta = check_proj("beta-mw", n, waves, &y_beta_mw, &y_beta_ref);
-            let ok_alpha = check_proj("alpha-mw", n, waves, &y_alpha_mw, &y_alpha_ref);
-            if !ok_qkv || !ok_z || !ok_beta || !ok_alpha {
-                eprintln!("  MW{waves} N={n} FAILED");
-                all_ok = false;
-            } else {
-                eprintln!("  MW{waves} N={n} OK");
-            }
-
-            if n == 512 {
-                fill_f32_quiet_nan(&mut gpu, &d_y_qkv_mw, NAN_QKV_BITS);
-                fill_f32_quiet_nan(&mut gpu, &d_y_z_mw, NAN_Z_BITS);
-                fill_f32_quiet_nan(&mut gpu, &d_y_beta_mw, NAN_BETA_BITS);
-                fill_f32_quiet_nan(&mut gpu, &d_y_alpha_mw, NAN_ALPHA_BITS);
-                let t = std::time::Instant::now();
-                gpu.gemm_qkvza_mq4g256v2_wmma_gfx1100_mw_lds(
-                    &d_qkv,
-                    &d_z,
-                    &d_beta,
-                    &d_alpha,
-                    &d_x,
-                    &d_y_qkv_mw,
-                    &d_y_z_mw,
-                    &d_y_beta_mw,
-                    &d_y_alpha_mw,
-                    qkv_m,
-                    z_m,
-                    beta_m,
-                    alpha_m,
-                    k,
-                    n,
-                    waves,
-                )
-                .expect("re-launch mw for timing");
-                gpu.hip.device_synchronize().unwrap();
-                let us = t.elapsed().as_secs_f64() * 1e6;
-                eprintln!("    timing N512 MW{waves}: {us:.1} us (host Instant+sync)");
-            }
-        }
-    }
-
     if all_ok {
-        eprintln!("\nPASS: all N={{128,256}} x BT{{4,12}} and N={{191,192,511,512}} x MW{{4,8,12,16}} x {{qkv,z,beta,alpha}} raw-bit equal (f32::to_bits) under distinct salts + quiet-NaN overwrite init (qkv=40/z=28/beta=36/alpha=16, total 120 tail 8, N tails 191/511) — finite+to_bits proves routing/full overwrite/no accidental +=; relL2<=1e-5 cosine>=1-1e-6; maxAbs reported per variant");
+        eprintln!("\nPASS: all N={{128,256}} x BT{{4,12}} x {{qkv,z,beta,alpha}} raw-bit equal (f32::to_bits) under distinct salts + quiet-NaN overwrite init (qkv=40/z=28/beta=36/alpha=16, total 120 tail 8) — finite+to_bits proves routing/full overwrite/no accidental +=; relL2<=1e-5 cosine>=1-1e-6; maxAbs reported per variant");
     } else {
         eprintln!(
             "\nFAIL: one or more parity checks violated raw-bit equality, overwrite (finite), routing, or numeric thresholds"
