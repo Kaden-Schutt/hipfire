@@ -3172,6 +3172,14 @@ pub const GEMM_GATE_UP_MQ4G256V2_WMMA_GFX12_SRC: &str =
 /// admitting RDNA3 cannot alter the certified gfx12 code object.
 pub const GEMM_GATE_UP_MQ4G256V2_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma.hip");
+/// gfx11 (exact gfx1100 candidate) MQ4V2 gate_up batch-tiled WMMA.
+/// Sister of GEMM_GATE_UP_MQ4G256V2_WMMA_SRC / GFX12_BT: half16 + interleaved-C
+/// contracts, 136 B dual-half headers, reuses one dequantized 16-row weight tile
+/// across BT∈{4,8,12} independent N-tiles (64/128/192 batch columns). Distinct
+/// file/module so the opt-in path cannot alter the certified base gfx11 object.
+pub const GEMM_GATE_UP_MQ4G256V2_WMMA_GFX11_BT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_gfx11_bt.hip");
+
 pub const GEMM_GATE_UP_MQ5G256V2_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_mq5g256v2_wmma.hip");
 pub const GEMM_GATE_UP_MQ6G256V2_WMMA_SRC: &str =
