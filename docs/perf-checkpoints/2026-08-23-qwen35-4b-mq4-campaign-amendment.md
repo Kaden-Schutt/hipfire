@@ -94,3 +94,40 @@ redundant-compute tradeoff is favorable) plus the wo shape (~90 us if its
 deficit is ever explained). Realistic ceiling with both: ~225-240 tok/s;
 250 additionally requires the whole 2.53 GB stream at >750 GiB/s average,
 above every demonstrated rate except lm_head's 840.
+
+## Amendment 2c (same day): serve-path quality battery — PASS
+
+`scripts/serve_harness.py --mode battery` against the standing config
+(q8 KV, speculation off, thinking off, seed 42, max_tokens 256, image built
+from this branch): 5/5 genre turns (code/reason/factual/prose/instruct)
+coherent and on-topic; runaway=2 (length-cap at temp=1.0, not degeneracy),
+empty=0, attractor=0. Serve-path decode 204.4 tok/s average — consistent
+with the product bench (208.86 tg128@64) within cross-path variance.
+Daemon md5 11b76b1ea809233ff275a3af3e5ce72a.
+
+Evidence chain for the standing config is now complete: bit-exact parity
+certifications (parent doc) + product bench + serve battery + rocprofv3
+ground-truth budget.
+
+## Amendment 2d (same day): the certified qkvza fold was orphaned dead code — wired, then measured STRONGLY NEGATIVE
+
+Pickaxe over all branches proves `fused_qkvza_hfq4g256_fusednorm` (commit
+3abbc05e, checkpoint addendum 3's "+0.7%") was NEVER callable from any
+dispatch path: no qwen35-forward or dispatch code referenced it — only the
+probe example. `HIPFIRE_QKVZA_FUSEDNORM=1` has been a silent no-op in every
+run since, including this campaign's. Addendum 3's e2e claim could not have
+been produced by the product path.
+
+This session wires the route (opt-in arm in the low-level PROJ_QKVZA match,
+ahead of scalar_prep) and measures it properly:
+- Numerics: probe BITEXACT on all four outputs; greedy temp-0 text
+  byte-identical across three prompts.
+- Performance: FN arms 68.0 / 149.9 tok/s vs OFF 197.1 / 199.3 — strongly
+  negative (idle-gated arms, clean windows). Same prologue-redundancy
+  failure mode as the gate_up fold: per-row-block norm+rotate recompute
+  across the ~12k-row grid overwhelms the saved producer launch.
+
+Status: wiring KEPT as a functional negative oracle behind explicit opt-in;
+comment updated with measured numbers. Lesson recorded: certify levers
+through the PRODUCT dispatch path, not through probe examples that call
+kernels directly.

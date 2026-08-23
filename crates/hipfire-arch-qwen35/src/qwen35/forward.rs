@@ -2486,6 +2486,19 @@ fn paro_to_givens(p: &ParoRotation) -> GivensRef<'_> {
 /// dispatch (including ParoQ4G128 which does individual Givens-rotated GEMV calls).
 /// Replaces rmsnorm_rotate_dispatch + fused_qkvza_dispatch.
 #[allow(clippy::too_many_arguments)]
+/// Opt-in gate for the qkvza consumer-fold: gfx1100, G256 MQ/HFQ dtype with
+/// AWQ scales, K aligned to the 256-value rotation group.
+fn qkvza_fusednorm_fold_enabled(gpu: &Gpu, wqkv: &WeightTensor) -> bool {
+    static FUSEDNORM_QKVZA: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    gpu.arch_caps.is_gfx1100()
+        && wqkv.k % 256 == 0
+        && matches!(wqkv.gpu_dtype, DType::MQ4G256 | DType::HFQ4G256)
+        && wqkv.awq_scale.is_some()
+        && *FUSEDNORM_QKVZA.get_or_init(|| {
+            hipfire_config::developer_var("HIPFIRE_QKVZA_FUSEDNORM").as_deref() == Ok("1")
+        })
+}
+
 fn qkvza_via_execute_steps(
     gpu: &mut Gpu,
     ctx: &DispatchCtx,
@@ -3585,6 +3598,35 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                         &s.dn_z,
                         &s.dn_beta,
                         &s.dn_alpha,
+                    )
+                } else if qkvza_fusednorm_fold_enabled(gpu, wqkv) {
+                    // Consumer-fold lever (HIPFIRE_QKVZA_FUSEDNORM=1): fold
+                    // rmsnorm+AWQ+FWHT into the fused_qkvza GEMV prologue.
+                    // Bit-exact (descending-tree shuffle reduction; probe
+                    // BITEXACT + byte-identical greedy output). MEASURED
+                    // STRONGLY NEGATIVE e2e on qwen3.5-4b (gen 68-150 vs
+                    // OFF 197-199 tok/s): prologue redundancy across the
+                    // ~12k-row grid overwhelms the saved producer launch -
+                    // same failure mode as the gate_up fold. Default OFF;
+                    // kept as a wired negative oracle.
+                    gpu.fused_qkvza_hfq4g256_fusednorm(
+                        &wqkv.buf,
+                        &wz.buf,
+                        &w_beta.buf,
+                        &w_alpha.buf,
+                        &s.x,
+                        attn_norm,
+                        wqkv.awq_scale.as_ref().expect("awq checked by gate"),
+                        &s.dn_qkv,
+                        &s.dn_z,
+                        &s.dn_beta,
+                        &s.dn_alpha,
+                        wqkv.m,
+                        wz.m,
+                        w_beta.m,
+                        w_alpha.m,
+                        wqkv.k,
+                        config.norm_eps,
                     )
                 } else if qkvza_scalar_prep_enabled(
                     gpu,
