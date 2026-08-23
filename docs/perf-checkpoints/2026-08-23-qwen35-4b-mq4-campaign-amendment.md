@@ -333,3 +333,12 @@ session R&D on correctness-critical code, out of turn-scale scope.
 This model gives any future campaign an exact target: each eliminated launch
 is worth 4.36 us; each % of stream-rate recovery on gate_up/residual/qkvza/
 qkv is worth ~10-15 us/token.
+
+## Amendment 7: replay.backend=redline (PM4 direct-KMD) — falsified
+
+Screened the Redline PM4 launch backend against default hipGraph replay
+(idle-gated interleaved arms, product path): redline 191.95/192.55 vs auto
+207.43/209.14 tok/s = **-8%**. Byte-identical output (parity confirmed).
+PM4 retained-replay bookkeeping costs more per node than hipGraph dispatch.
+Closes the last untested dispatch lever; hipGraph replay is optimal for this
+decode path.
