@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
 
-//! MQ4V2 residual BT parity on exact gfx1100 — batch-column reuse gate.
+//! MQ4V2 residual BT + multi-wave LDS parity on exact gfx1100.
 //!
 //! Pack deterministic MQ4V2 residual weights with disjoint halves (half0 in
 //! [-1,1], half1 in [96,160]) so a wrong half-header or lane test is
 //! unmissable, and F32 X.  On exact gfx1100:
 //!   1) run the historical base `gemm_mq4g256v2_residual_wmma` into reference
-//!      outputs (force base by arming capture_mode so production BT is skipped),
+//!      outputs (force base by arming capture_mode so production BT/MW is skipped),
 //!   2) run the direct `gemm_mq4g256v2_residual_wmma_gfx1100_bt` BT4/6/8
 //!      launchers into separate outputs for N=128 and N=256,
+//!   3) run the direct `gemm_mq4g256v2_residual_wmma_gfx1100_mw_lds` MW4/MW8
+//!      launchers for N=511 and N=512 (partial final-wave columns / full tiles),
 //!  and compare for raw f32 bit equality (`got.to_bits() == want.to_bits()` on
 //!  every element) as a hard gate, plus finite/nondegenerate, relL2<=1e-5,
 //!  cosine>=1-1e-6, reporting max abs. Preserves fused Y += W@X exactly,
@@ -172,7 +174,7 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
         .fold(0.0f32, f32::max)
 }
 
-fn check_proj(label: &str, n: usize, bt: usize, got: &[f32], want: &[f32]) -> bool {
+fn check_proj(label: &str, n: usize, variant: usize, got: &[f32], want: &[f32]) -> bool {
     let finite = is_finite(got) && is_finite(want);
     let var_got = variance(got);
     let var_want = variance(want);
@@ -189,7 +191,7 @@ fn check_proj(label: &str, n: usize, bt: usize, got: &[f32], want: &[f32]) -> bo
     let ok = bit_eq && finite && nondeg && r <= 1e-5 && c >= 1.0 - 1e-6;
     let status = if ok { "PASS" } else { "FAIL" };
     eprintln!(
-        "  [{label} N={n} BT={bt}] bitEq={bit_eq} finite={finite} nondeg={nondeg} (var {var_got:.3e}/{var_want:.3e}) relL2={r:.3e} cosine={c:.9} maxAbs={m:.3e} [{status}]"
+        "  [{label} N={n} V={variant}] bitEq={bit_eq} finite={finite} nondeg={nondeg} (var {var_got:.3e}/{var_want:.3e}) relL2={r:.3e} cosine={c:.9} maxAbs={m:.3e} [{status}]"
     );
     if !ok {
         eprintln!(
@@ -238,7 +240,7 @@ fn main() {
         eprintln!("SKIP: arch {arch} is not exact gfx1100 — harness requires gfx1100 only");
         return;
     }
-    eprintln!("arch {arch} confirmed exact gfx1100 — running residual BT parity (Y+=W@X)");
+    eprintln!("arch {arch} confirmed exact gfx1100 — running residual BT + MW_LDS parity (Y+=W@X)");
 
     // Capture check: if a capture is armed, skip to avoid polluting.
     if gpu.active_capture.is_some() {
@@ -262,13 +264,17 @@ fn main() {
         .upload_raw(&blob, &[blob.len()])
         .expect("upload residual");
 
-    let ns = [128usize, 256usize];
+    let ns_bt = [128usize, 256usize];
     let bts = [4usize, 6, 8];
+    // N511 covers partial final wave columns; N512 is full tiles.
+    // Production MW variants only (MW4 N416..463, MW8 N>=464).
+    let ns_mw = [511usize, 512usize];
+    let mws = [4usize, 8];
 
     let mut all_ok = true;
 
-    for &n in &ns {
-        eprintln!("\n=== N={n} ===");
+    for &n in &ns_bt {
+        eprintln!("\n=== BT N={n} ===");
         // Deterministic F32 X in [-1,1], row-major [N, K] as expected by GEMM.
         let x_host: Vec<f32> = (0..n * k)
             .map(|i| prng(i, 0xC0FF_EE00) * 2.0 - 1.0)
@@ -298,9 +304,9 @@ fn main() {
             .expect("htod y_ref");
         gpu.hip.device_synchronize().expect("sync after htod y_ref");
 
-        // Reference: historical base kernel. Production BT auto-selects via env
-        // outside capture, so arm capture_mode for this launch only to retain
-        // the base object as the arithmetic oracle.
+        // Reference: historical base kernel. Production BT/MW auto-selects by
+        // exact batch-size thresholds outside capture, so arm capture_mode for
+        // this launch only to retain the base object as the arithmetic oracle.
         let saved_capture = gpu.graphs.capture_mode;
         gpu.graphs.capture_mode = true;
         gpu.hip.device_synchronize().unwrap();
@@ -343,7 +349,7 @@ fn main() {
 
             let y_bt = gpu.download_f32(&d_y_bt).expect("download bt");
 
-            let ok = check_proj("resid", n, bt, &y_bt, &y_ref);
+            let ok = check_proj("resid-bt", n, bt, &y_bt, &y_ref);
             if !ok {
                 eprintln!("  BT{bt} N={n} FAILED");
                 all_ok = false;
@@ -373,8 +379,111 @@ fn main() {
         }
     }
 
+    for &n in &ns_mw {
+        eprintln!("\n=== MW_LDS N={n} ===");
+        let x_host: Vec<f32> = (0..n * k)
+            .map(|i| prng(i, 0xC0FF_EE00) * 2.0 - 1.0)
+            .collect();
+        assert_eq!(x_host.len(), n * k);
+        let y_init_host: Vec<f32> = (0..n * m)
+            .map(|i| prng(i, 0xBEEF_1234) * 2.0 - 1.0 + 0.5)
+            .collect();
+        assert_eq!(y_init_host.len(), n * m);
+
+        let d_x = gpu.alloc_tensor(&[n * k], DType::F32).expect("alloc x mw");
+        gpu.hip
+            .memcpy_htod(&d_x.buf, unsafe {
+                std::slice::from_raw_parts(x_host.as_ptr() as *const u8, x_host.len() * 4)
+            })
+            .expect("htod x mw");
+        gpu.hip.device_synchronize().expect("sync after htod x mw");
+
+        let d_y_ref = gpu
+            .alloc_tensor(&[n * m], DType::F32)
+            .expect("alloc y ref mw");
+        gpu.hip
+            .memcpy_htod(&d_y_ref.buf, unsafe {
+                std::slice::from_raw_parts(y_init_host.as_ptr() as *const u8, y_init_host.len() * 4)
+            })
+            .expect("htod y_ref mw");
+        gpu.hip
+            .device_synchronize()
+            .expect("sync after htod y_ref mw");
+
+        // Capture-forced base oracle (skips production BT/MW routes).
+        let saved_capture = gpu.graphs.capture_mode;
+        gpu.graphs.capture_mode = true;
+        gpu.hip.device_synchronize().unwrap();
+        let t_ref = std::time::Instant::now();
+        let ref_res = gpu.gemm_mq4g256v2_residual_wmma(&d_a, &d_x, &d_y_ref, m, k, n);
+        gpu.graphs.capture_mode = saved_capture;
+        ref_res.expect("base gemm_mq4g256v2_residual_wmma failed (mw shapes)");
+        gpu.hip.device_synchronize().expect("sync ref mw");
+        let ref_us = t_ref.elapsed().as_secs_f64() * 1e6;
+        eprintln!("  base ref N={n} done in {ref_us:.1} us");
+
+        let y_ref = gpu.download_f32(&d_y_ref).expect("download ref mw");
+        assert_eq!(y_ref.len(), n * m);
+        assert!(is_finite(&y_ref), "ref not finite N={n}");
+        assert!(variance(&y_ref) > 1e-12, "ref degenerate N={n}");
+
+        for &waves in &mws {
+            let d_y_mw = gpu.alloc_tensor(&[n * m], DType::F32).expect("alloc y mw");
+            gpu.hip
+                .memcpy_htod(&d_y_mw.buf, unsafe {
+                    std::slice::from_raw_parts(
+                        y_init_host.as_ptr() as *const u8,
+                        y_init_host.len() * 4,
+                    )
+                })
+                .expect("htod y_mw");
+            gpu.hip.device_synchronize().expect("sync y_mw init");
+
+            let res = gpu
+                .gemm_mq4g256v2_residual_wmma_gfx1100_mw_lds(&d_a, &d_x, &d_y_mw, m, k, n, waves);
+            if let Err(e) = res {
+                eprintln!("  MW{waves} wrapper launch failed N={n}: {e:?}");
+                all_ok = false;
+                continue;
+            }
+            gpu.hip.device_synchronize().expect("sync mw");
+
+            let y_mw = gpu.download_f32(&d_y_mw).expect("download mw");
+
+            let ok = check_proj("resid-mw", n, waves, &y_mw, &y_ref);
+            if !ok {
+                eprintln!("  MW{waves} N={n} FAILED");
+                all_ok = false;
+            } else {
+                eprintln!("  MW{waves} N={n} OK");
+            }
+
+            if n == 512 {
+                gpu.hip
+                    .memcpy_htod(&d_y_mw.buf, unsafe {
+                        std::slice::from_raw_parts(
+                            y_init_host.as_ptr() as *const u8,
+                            y_init_host.len() * 4,
+                        )
+                    })
+                    .unwrap();
+                gpu.hip.device_synchronize().unwrap();
+                let t = std::time::Instant::now();
+                gpu.gemm_mq4g256v2_residual_wmma_gfx1100_mw_lds(
+                    &d_a, &d_x, &d_y_mw, m, k, n, waves,
+                )
+                .expect("re-launch mw for timing");
+                gpu.hip.device_synchronize().unwrap();
+                let us = t.elapsed().as_secs_f64() * 1e6;
+                eprintln!("    timing N512 MW{waves}: {us:.1} us (host Instant+sync)");
+            }
+        }
+    }
+
     if all_ok {
-        eprintln!("\nPASS: all N={{128,256}} x BT{{4,6,8}} raw-bit equal (f32::to_bits); finite/nondegenerate; relL2<=1e-5 cosine>=1-1e-6; maxAbs reported per variant; Y+=W@X preserved with nonzero init");
+        eprintln!(
+            "\nPASS: all N={{128,256}} x BT{{4,6,8}} and N={{511,512}} x MW{{4,8}} raw-bit equal (f32::to_bits on every element); finite/nondegenerate; relL2<=1e-5 cosine>=1-1e-6; maxAbs reported per variant; Y+=W@X preserved with nonzero init"
+        );
     } else {
         eprintln!(
             "\nFAIL: one or more parity checks violated raw-bit equality or numeric thresholds"

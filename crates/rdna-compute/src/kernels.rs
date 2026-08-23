@@ -2957,6 +2957,12 @@ pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX12_BT_SRC: &str =
 /// unchanged.
 pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX11_BT_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_wmma_gfx11_bt.hip");
+/// Exact-gfx1100 multi-wave same-row LDS residual (production MW4/MW8).
+/// Sister of GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX11_BT_SRC: half16 + interleaved-C,
+/// 136 B dual-half headers, static 8 KiB tile-major LDS, symbols mw{4,8}_lds.
+pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX1100_MW_LDS_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_wmma_gfx1100_mw_lds.hip");
+
 pub const GEMM_MQ5G256V2_RESIDUAL_WMMA_GFX12_BT_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq5g256v2_residual_wmma_gfx12_bt.hip");
 pub const GEMM_MQ6G256V2_RESIDUAL_WMMA_GFX12_BT_SRC: &str =
