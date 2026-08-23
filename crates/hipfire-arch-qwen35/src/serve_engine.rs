@@ -163,7 +163,11 @@ impl Rig {
             .filter(|t| **t == LayerType::FullAttention)
             .count();
         let per_pos_bytes = config.n_kv_heads * (config.head_dim / 32) * 34;
-        let max_batch = cfg.cap_tokens.max(cfg.n_slots);
+        // Prefill scratch is sized by the CHUNK width (one step's rows), not
+        // the full context — sizing it by cap_tokens allocated O(ctx) GiB of
+        // f32 scratch that a chunked prefill never fills. KV arenas (below)
+        // remain the only context-scaled allocations.
+        let max_batch = cfg.cap_tokens.min(2048).max(cfg.n_slots);
 
         let weight_bytes = std::fs::metadata(&cfg.model_path)
             .map_err(|e| format!("stat model: {e}"))?
@@ -317,8 +321,12 @@ fn run_loop(mut rig: Rig, rx: Receiver<SubmitRequest>, stats: Arc<Mutex<EngineSt
             decoding: false,
         })
         .collect();
+    // Prefill chunk size is bounded independently of per-slot context: pbs
+    // scratch scales with the chunk, not with cap_tokens, so a 100k-context
+    // slot must not allocate a 100k-row workspace. 2048 keeps the scratch
+    // ~0.9 GiB while KV arenas scale to the real context.
     let mut sched = Scheduler {
-        chunk_size: rig.cap_tokens.max(1),
+        chunk_size: rig.cap_tokens.min(2048).max(1),
     };
     let mut graph = SlotDecodeGraph::new();
 
