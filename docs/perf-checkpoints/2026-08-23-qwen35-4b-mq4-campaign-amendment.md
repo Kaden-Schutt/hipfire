@@ -270,3 +270,23 @@ config: KV=q8, spec off, fa-kvwrite fold ON, NO residual/persist/LUT/XLDS/
 QKVZA_FUSEDNORM/GATE_UP_FUSEDNORM flags. Best confirmed number of the
 campaign (+40% over the 150-era baseline two days prior; +8% over the
 branch's committed speed floor).
+
+## Amendment 4 (2026-08-23 night): GDN block-shape screen — flat; systematic flag audit clean
+
+Re-ran the GDN compact2 block-shape screen against the CLEAN baseline
+(previous attempt was invalidated by an accidentally-engaged harmful flag).
+Product path, idle-gated interleaved single arms:
+- b2 (default): 208.37 | b4: 208.74 | b8: 209.40 | b12: 208.47 | b16: 208.99
+All within ±0.3% - GDN block shape is not a lever on qwen3.5-4b decode.
+Also verified HIPFIRE_AWQ_NORM_DIRECT is active-by-default at k=2560 and
+HIPFIRE_DN_STATE_EF stays ON (required for deterministic state).
+
+Systematic flag-audit status for the qwen3.5-4b decode path: every developer
+flag affecting the 306-node decode graph has now been screened or verified:
+- Beneficial & default-on: AWQ_NORM_DIRECT, graph replay, fa-kvwrite fold,
+  qkvza fusednorm route (INERT without explicit opt-in), DPM warmup
+- Neutral: wavegrid norm, kv-backend, GDN compact2 shapes
+- Harmful if engaged: QKVZA fusednorm (-26%), residual persist/LUT/XLDS,
+  gate_up PAIR2/STAGE_X32(-26%/-hangs), GEMV_ROWS multirow
+
+Standing clean config confirmed: tg128@64 = 208.4-209.7 tok/s band.
