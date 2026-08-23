@@ -28,6 +28,7 @@ pub mod replay;
 pub mod sampling;
 pub mod scratch;
 pub mod slot_pool;
+pub mod kv_range;
 
 pub use compiler::KernelCompiler;
 pub use dispatch::{

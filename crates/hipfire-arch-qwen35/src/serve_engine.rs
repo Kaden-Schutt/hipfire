@@ -29,6 +29,7 @@ use hipfire_runtime::session_table::{SessionId, SessionTable};
 use hipfire_runtime::swap::snapshot::{capture_slot, restore_slot, SnapshotStamp};
 use hipfire_runtime::swap::SwapManager;
 use rdna_compute::sampling::SlotSampleParams;
+use rdna_compute::kv_range::KvRangeAllocator;
 use rdna_compute::slot_pool::{SlotId, SlotPool};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -126,6 +127,8 @@ struct Rig {
     config: qwen35::Qwen35Config,
     tokenizer: hipfire_runtime::tokenizer::Tokenizer,
     pool: SlotPool,
+    /// Dynamic KV-range allocator over the shared arena (elastic mode).
+    kv_alloc: Option<KvRangeAllocator>,
     k_arenas: Vec<GpuTensor>,
     v_arenas: Vec<GpuTensor>,
     dn_states: Vec<DeltaNetState>,
@@ -211,28 +214,32 @@ impl Rig {
         }
         .map_err(|e| format!("load weights: {e}"))?;
 
-        let pool = match cfg.pool_total_tokens {
-            Some(pool_total) => SlotPool::new_elastic(
-                cfg.n_slots,
-                cfg.reserve_tokens,
-                pool_total,
-                per_pos_bytes,
-            )
-            .map_err(|e| format!("SlotPool: {e}"))?,
-            None => SlotPool::new(cfg.n_slots, cfg.cap_tokens, per_pos_bytes)
-                .map_err(|e| format!("SlotPool: {e}"))?,
+        let (pool, kv_alloc) = match cfg.pool_total_tokens {
+            Some(pool_total) => {
+                let pool = SlotPool::new_dynamic(cfg.n_slots, pool_total, per_pos_bytes)
+                    .map_err(|e| format!("SlotPool: {e}"))?;
+                let alloc = KvRangeAllocator::new(pool.max_cap(), per_pos_bytes);
+                (pool, Some(alloc))
+            }
+            None => (
+                SlotPool::new(cfg.n_slots, cfg.cap_tokens, per_pos_bytes)
+                    .map_err(|e| format!("SlotPool: {e}"))?,
+                None,
+            ),
         };
-        let min_slot_cap = pool
-            .descriptors()
-            .iter()
-            .map(|d| d.cap as usize)
-            .min()
-            .unwrap_or(cfg.cap_tokens);
         // Prefill scratch is sized by the CHUNK width (one step's rows), not
-        // the full context — sizing it by cap_tokens allocated O(ctx) GiB of
-        // f32 scratch that a chunked prefill never fills. Chunk width is
-        // bounded by the SMALLEST slab (a step's rows may land on any slot)
-        // and capped at 2048 to keep scratch constant.
+        // the full context. Under dynamic-range mode descriptor caps are
+        // assigned at admission, so the chunk width is the fixed 2048-row
+        // budget; equal/elastic pools bound it by their smallest slab.
+        let min_slot_cap = if cfg.pool_total_tokens.is_some() {
+            2048usize
+        } else {
+            pool.descriptors()
+                .iter()
+                .map(|d| d.cap as usize)
+                .min()
+                .unwrap_or(cfg.cap_tokens)
+        };
         let max_batch = min_slot_cap.min(2048).max(cfg.n_slots);
         let arena_bytes = pool.arena_bytes();
         let mut k_arenas = Vec::with_capacity(n_fa_layers);
@@ -306,6 +313,7 @@ impl Rig {
             vision,
             image_pad_id: rig_image_pad_id(&tokenizer),
             min_slot_cap,
+            kv_alloc,
             weights,
             config,
             tokenizer,
@@ -335,6 +343,8 @@ struct InFlight {
     reply: Sender<Event>,
     produced: usize,
     max_tokens: usize,
+    /// Allocated KV range for this request (dynamic-range mode).
+    kv_range: Option<rdna_compute::kv_range::KvRange>,
 }
 
 fn run_loop(mut rig: Rig, rx: Receiver<SubmitRequest>, stats: Arc<Mutex<EngineStats>>) {
@@ -556,8 +566,17 @@ fn run_loop(mut rig: Rig, rx: Receiver<SubmitRequest>, stats: Arc<Mutex<EngineSt
                     DoneReason::MaxTokens
                 };
                 let _ = send_event(&f.reply, Event::Done { reason });
-                slots[s] = None;
+                // Take the InFlight out first so its KV range can be freed
+                // without holding the slot borrow.
+                let mut done = slots[s].take().unwrap();
                 work[s].remaining_prompt.clear();
+                if let Some(range) = done.kv_range.take() {
+                    if let Some(alloc) = rig.kv_alloc.as_mut() {
+                        alloc.free(&range);
+                    }
+                    rig.pool.release_lane(rdna_compute::slot_pool::SlotId(s));
+                }
+                drop(done);
                 if matches!(reason, DoneReason::ClientGone) {
                     // Nobody will follow up on a vanished client, so hand the
                     // slot back at once.
@@ -598,7 +617,21 @@ fn admit(
     // turn began after an OpenThink opener that history rendering does not
     // replay, and re-encoding the decoded reply is not guaranteed to round
     // trip. Reuse also keeps the DeltaNet state, which is the point.
-    if !req.continuation.is_empty() {
+    // Dynamic-range guard: if this continuation cannot fit its lane's KV
+    // window (long history + big generation budget), skip continuation
+    // matching so the request takes a cold prefill in a fitting allocation.
+    let continuation_fits = req
+        .prompt_tokens
+        .len()
+        .saturating_add(req.max_tokens)
+        <= rig.cap_tokens;
+    if !req.continuation.is_empty() && !continuation_fits {
+        if rig.gpu.slot_trace() {
+            eprintln!("[slot-trace] continuation skipped -- exceeds lane cap");
+        }
+    }
+    let use_continuation = !req.continuation.is_empty() && continuation_fits;
+    if use_continuation {
         if rig.gpu.slot_trace() {
             eprintln!(
                 "[slot-trace] continuation attempt: convo={:?} suffix={} tokens",
@@ -672,6 +705,9 @@ fn admit(
                             reply: req.reply,
                             produced: 0,
                             max_tokens: req.max_tokens.max(1),
+                            // Continuations extend the session's ORIGINAL
+                            // KV range; no new allocation here.
+                            kv_range: None,
                         });
                         rig.sessions.touch(existing);
                         if rig.gpu.slot_trace() {
@@ -769,6 +805,40 @@ fn admit(
             stats.lock().expect("stats").note_rejected();
             return;
         }
+    };
+
+    // ── Dynamic KV-range allocation (elastic mode) ────────────────────────
+    // The lane claims a contiguous KV window sized to its REAL need
+    // (prompt + generation budget), not a preset slab.
+    let kv_range = if let Some(alloc) = rig.kv_alloc.as_mut() {
+        let need = req.prompt_tokens.len().saturating_add(req.max_tokens.max(1));
+        match alloc.alloc(need) {
+            Some(range) => {
+                rig.pool.bind_range(
+                    slot,
+                    range.byte_off,
+                    range.cap_tokens,
+                );
+                Some(range)
+            }
+            None => {
+                let _ = send_event(
+                    &req.reply,
+                    Event::Rejected {
+                        reason: format!(
+                            "KV pool exhausted: need {need} tokens, {} free                              (largest contiguous {})",
+                            alloc.free_tokens(),
+                            alloc.max_contiguous_tokens(),
+                        ),
+                    },
+                );
+                rig.sessions.close(&mut rig.pool, &mut rig.adm, id);
+                stats.lock().expect("stats").note_rejected();
+                return;
+            }
+        }
+    } else {
+        None
     };
 
     // Reset the slot's recurrent state before reusing it. `seq_len = 0` clears
@@ -888,6 +958,7 @@ fn admit(
         reply: req.reply,
         produced: 0,
         max_tokens: req.max_tokens.max(1),
+        kv_range,
     });
     stats.lock().expect("stats").note_admitted();
 }

@@ -146,6 +146,48 @@ impl SlotPool {
         self.descs[id.0].cap as usize
     }
 
+    /// Build a DYNAMIC-RANGE pool: one arena of `total_tokens` with `n_slots`
+    /// descriptors whose bases/caps are assigned at admission time via
+    /// [`Self::set_desc_range`]. Arena bytes equal the whole budget; nothing
+    /// is reserved per-slot.
+    pub fn new_dynamic(n_slots: usize, total_tokens: usize, per_pos_bytes: usize)
+        -> Result<Self, String>
+    {
+        assert!(n_slots > 0);
+        let total_rounded = total_tokens.div_ceil(PAGE_TOKENS) * PAGE_TOKENS;
+        let arena_bytes = (total_rounded * per_pos_bytes) as u64;
+        preflight_alloc(arena_bytes.checked_mul(2).ok_or("overflow")?,
+                        R9700_VRAM_BYTES, "SlotPool arena")?;
+        // Descriptors start invalid (cap 0); admission assigns them.
+        let descs = (0..n_slots).map(|i| KvSlotDesc {
+            k_base: 0,
+            v_base: 0,
+            seq_len: 0,
+            cap: 0,
+        }).collect();
+        Ok(Self { descs, in_use: vec![false; n_slots],
+                  cap_tokens: total_rounded, per_pos_bytes, dirty: true })
+    }
+
+    /// Point a lane at an allocated KV range and mark it in-use.
+    /// `range.byte_off` is a byte offset into each arena.
+    pub fn bind_range(&mut self, id: SlotId, byte_off: u64, cap_tokens: usize) {
+        self.descs[id.0] = KvSlotDesc {
+            k_base: byte_off,
+            v_base: byte_off,
+            seq_len: 0,
+            cap: cap_tokens as i32,
+        };
+        self.in_use[id.0] = true;
+        self.dirty = true;
+    }
+
+    /// Release a lane and invalidate its descriptor.
+    pub fn release_lane(&mut self, id: SlotId) {
+        self.reset(id);
+        self.in_use[id.0] = false;
+    }
+
     /// Largest per-slot capacity in the pool.
     pub fn max_cap(&self) -> usize {
         self.cap_tokens
