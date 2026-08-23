@@ -351,3 +351,14 @@ idle-gated interleaved arms x3 pairs — OFF 207.18-208.74 (avg 208.21) vs
 FOLD 208.72-210.01 (avg 209.43) = +0.6%, FOLD wins 3/3. The +0.5-1% gain
 first certified under earlier conditions holds on the final configuration.
 Standing config confirmed optimal; campaign complete.
+
+## Measurement-tooling note
+
+rocprofv3's L2CacheHit/GL2C_* counters return zero data on gfx1100 (RDNA3):
+the derived L2CacheHit metric collects but reports 0.0% for every kernel
+including ones with certain cache hits, and multi-counter GL2C groups exceed
+gfx1100 collection capability ("Request exceeds the capabilities of the
+hardware"). Direct L2 hit-rate validation of the activation-traffic
+hypothesis is therefore unavailable on this platform/generation; the
+conclusions above rest on duration clustering, byte accounting, and A/B
+evidence instead.
