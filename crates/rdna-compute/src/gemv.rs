@@ -7813,9 +7813,9 @@ impl Gpu {
         result
     }
 
-    /// MQ4 v2 (qt=49) — plain GEMV. Faithful port of `gemv_hfq4g256` for the
+    /// MQ3 v2 (qt=49) — plain GEMV. Faithful port of `gemv_hfq4g256` for the
     /// dual-scale format. Same arch gating, rows/R selection, grid/block
-    /// geometry and kernarg order; only SRC, module (`_mq4v2` suffix) and
+    /// geometry and kernarg order; only SRC, module (`_mq3v2` suffix) and
     /// kernel symbol (`mq3g256v2`) change.
     pub fn gemv_mq3g256v2(
         &mut self,
@@ -7843,24 +7843,24 @@ impl Gpu {
         // For v2 plain, all specialized lm_head/k2048 paths still route to
         // the generic dual-scale source; the arch gating is preserved so
         // occupancy/VGPR comparisons remain apples-to-apples. The module is
-        // v1 module + `_mq4v2` and the C symbol is `gemv_mq3g256v2`.
+        // v1 module + `_mq3v2` and the C symbol is `gemv_mq3g256v2`.
         let func_name = if gfx1151_lm_head_dot2 {
             self.ensure_kernel(
-                "gemv_hfq4g256_lm_head_dot2_gfx1151_mq4v2",
+                "gemv_hfq4g256_lm_head_dot2_gfx1151_mq3v2",
                 kernels::GEMV_MQ3G256V2_SRC,
                 "gemv_mq3g256v2",
             )?;
             "gemv_mq3g256v2"
         } else if gfx1151_lm_head_r1_hybrid_buffer {
             self.ensure_kernel(
-                "gemv_hfq4g256_lm_head_r1_hybrid_buffer_gfx1151_mq4v2",
+                "gemv_hfq4g256_lm_head_r1_hybrid_buffer_gfx1151_mq3v2",
                 kernels::GEMV_MQ3G256V2_SRC,
                 "gemv_mq3g256v2",
             )?;
             "gemv_mq3g256v2"
         } else if use_lm_head_k2048 {
             self.ensure_kernel(
-                "gemv_hfq4g256_k2048_gfx1100_mq4v2",
+                "gemv_hfq4g256_k2048_gfx1100_mq3v2",
                 kernels::GEMV_MQ3G256V2_SRC,
                 "gemv_mq3g256v2",
             )?;
@@ -7868,7 +7868,7 @@ impl Gpu {
         } else {
             let (v2_src, v2_module) =
                 kernels::gemv_mq3g256v2_for_arch(&self.arch_caps, self.flags.rdna2_variant);
-            let module_v2 = format!("{}_mq4v2", v2_module);
+            let module_v2 = format!("{}_mq3v2", v2_module);
             self.ensure_kernel(&module_v2, v2_src, "gemv_mq3g256v2")?;
             "gemv_mq3g256v2"
         };
@@ -7958,47 +7958,47 @@ impl Gpu {
             };
             let (mr_name, mr_src) = if gfx1151_lm_head_cpol == Some("glc") {
                 (
-                    "gemv_hfq4g256_multirow_gfx1151_hybrid_glc_mq4v2",
+                    "gemv_hfq4g256_multirow_gfx1151_hybrid_glc_mq3v2",
                     kernels::GEMV_MQ3G256V2_MULTIROW_SRC,
                 )
             } else if gfx1151_lm_head_cpol == Some("slc") {
                 (
-                    "gemv_hfq4g256_multirow_gfx1151_hybrid_slc_mq4v2",
+                    "gemv_hfq4g256_multirow_gfx1151_hybrid_slc_mq3v2",
                     kernels::GEMV_MQ3G256V2_MULTIROW_SRC,
                 )
             } else if gfx1151_lm_head_cpol == Some("dlc") {
                 (
-                    "gemv_hfq4g256_multirow_gfx1151_hybrid_dlc_mq4v2",
+                    "gemv_hfq4g256_multirow_gfx1151_hybrid_dlc_mq3v2",
                     kernels::GEMV_MQ3G256V2_MULTIROW_SRC,
                 )
             } else if gfx1151_lm_head_k2048 {
                 (
-                    "gemv_hfq4g256_multirow_gfx1151_k2048_mq4v2",
+                    "gemv_hfq4g256_multirow_gfx1151_k2048_mq3v2",
                     kernels::GEMV_MQ3G256V2_MULTIROW_SRC,
                 )
             } else if gfx1151_lm_head_all_buffer {
                 (
-                    "gemv_hfq4g256_multirow_gfx1151_all_buffer_mq4v2",
+                    "gemv_hfq4g256_multirow_gfx1151_all_buffer_mq3v2",
                     kernels::GEMV_MQ3G256V2_MULTIROW_SRC,
                 )
             } else if gfx1151_lm_head_hybrid_buffer {
                 (
-                    "gemv_hfq4g256_multirow_gfx1151_hybrid_buffer_mq4v2",
+                    "gemv_hfq4g256_multirow_gfx1151_hybrid_buffer_mq3v2",
                     kernels::GEMV_MQ3G256V2_MULTIROW_SRC,
                 )
             } else if gfx1151_lm_head_buffer {
                 (
-                    "gemv_hfq4g256_multirow_gfx1151_buffer_mq4v2",
+                    "gemv_hfq4g256_multirow_gfx1151_buffer_mq3v2",
                     kernels::GEMV_MQ3G256V2_MULTIROW_SRC,
                 )
             } else if rdna3 {
                 (
-                    "gemv_hfq4g256_multirow_rdna3_mq4v2",
+                    "gemv_hfq4g256_multirow_rdna3_mq3v2",
                     kernels::GEMV_MQ3G256V2_MULTIROW_SRC,
                 )
             } else {
                 (
-                    "gemv_hfq4g256_multirow_default_mq4v2",
+                    "gemv_hfq4g256_multirow_default_mq3v2",
                     kernels::GEMV_MQ3G256V2_MULTIROW_SRC,
                 )
             };
@@ -8014,7 +8014,7 @@ impl Gpu {
             )
         } else if use_wide {
             self.ensure_kernel(
-                "gemv_hfq4g256_wide_mq4v2",
+                "gemv_hfq4g256_wide_mq3v2",
                 kernels::GEMV_MQ3G256V2_SRC,
                 "gemv_mq3g256v2_wide",
             )?;
@@ -8228,11 +8228,11 @@ impl Gpu {
         result
     }
 
-    /// MQ4 v2 multirow — dedicated multirow launcher. Mirrors the multirow
+    /// MQ3 v2 multirow — dedicated multirow launcher. Mirrors the multirow
     /// branch of `gemv_hfq4g256` exactly: same rows/R selection, same
     /// arch gating for gfx1151/rdna3, same grid (`ceil(M/R)`) and block
-    /// (`32`) geometry, same kernarg order. Only SRC (`GEMV_MQ3G256V2_MULTIROW_SRC`),
-    /// module (`_mq4v2` suffix) and kernel symbol (`gemv_mq3g256v2_multirow_r*`) change.
+    /// (`32`) geometry, same kernarg order. The `_mq3v2` module suffix is
+    /// format-owned so an MQ4V2 DFlash draft cannot alias the target module.
     pub fn gemv_mq3g256v2_multirow(
         &mut self,
         a_raw: &GpuTensor,
@@ -8339,47 +8339,47 @@ impl Gpu {
             };
             let (mr_name, mr_src) = if gfx1151_lm_head_cpol == Some("glc") {
                 (
-                    "gemv_hfq4g256_multirow_gfx1151_hybrid_glc_mq4v2",
+                    "gemv_hfq4g256_multirow_gfx1151_hybrid_glc_mq3v2",
                     kernels::GEMV_MQ3G256V2_MULTIROW_SRC,
                 )
             } else if gfx1151_lm_head_cpol == Some("slc") {
                 (
-                    "gemv_hfq4g256_multirow_gfx1151_hybrid_slc_mq4v2",
+                    "gemv_hfq4g256_multirow_gfx1151_hybrid_slc_mq3v2",
                     kernels::GEMV_MQ3G256V2_MULTIROW_SRC,
                 )
             } else if gfx1151_lm_head_cpol == Some("dlc") {
                 (
-                    "gemv_hfq4g256_multirow_gfx1151_hybrid_dlc_mq4v2",
+                    "gemv_hfq4g256_multirow_gfx1151_hybrid_dlc_mq3v2",
                     kernels::GEMV_MQ3G256V2_MULTIROW_SRC,
                 )
             } else if gfx1151_lm_head_k2048 {
                 (
-                    "gemv_hfq4g256_multirow_gfx1151_k2048_mq4v2",
+                    "gemv_hfq4g256_multirow_gfx1151_k2048_mq3v2",
                     kernels::GEMV_MQ3G256V2_MULTIROW_SRC,
                 )
             } else if gfx1151_lm_head_all_buffer {
                 (
-                    "gemv_hfq4g256_multirow_gfx1151_all_buffer_mq4v2",
+                    "gemv_hfq4g256_multirow_gfx1151_all_buffer_mq3v2",
                     kernels::GEMV_MQ3G256V2_MULTIROW_SRC,
                 )
             } else if gfx1151_lm_head_hybrid_buffer {
                 (
-                    "gemv_hfq4g256_multirow_gfx1151_hybrid_buffer_mq4v2",
+                    "gemv_hfq4g256_multirow_gfx1151_hybrid_buffer_mq3v2",
                     kernels::GEMV_MQ3G256V2_MULTIROW_SRC,
                 )
             } else if gfx1151_lm_head_buffer {
                 (
-                    "gemv_hfq4g256_multirow_gfx1151_buffer_mq4v2",
+                    "gemv_hfq4g256_multirow_gfx1151_buffer_mq3v2",
                     kernels::GEMV_MQ3G256V2_MULTIROW_SRC,
                 )
             } else if rdna3 {
                 (
-                    "gemv_hfq4g256_multirow_rdna3_mq4v2",
+                    "gemv_hfq4g256_multirow_rdna3_mq3v2",
                     kernels::GEMV_MQ3G256V2_MULTIROW_SRC,
                 )
             } else {
                 (
-                    "gemv_hfq4g256_multirow_default_mq4v2",
+                    "gemv_hfq4g256_multirow_default_mq3v2",
                     kernels::GEMV_MQ3G256V2_MULTIROW_SRC,
                 )
             };
@@ -8396,7 +8396,7 @@ impl Gpu {
         } else {
             let (v2_src, v2_module) =
                 kernels::gemv_mq3g256v2_for_arch(&self.arch_caps, self.flags.rdna2_variant);
-            let module_v2 = format!("{}_mq4v2", v2_module);
+            let module_v2 = format!("{}_mq3v2", v2_module);
             self.ensure_kernel(&module_v2, v2_src, "gemv_mq3g256v2")?;
             self.launch_maybe_blob(
                 "gemv_mq3g256v2",
