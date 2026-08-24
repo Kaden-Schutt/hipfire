@@ -452,11 +452,23 @@ pub struct QwenArSemanticProducer {
 
 impl QwenArSemanticProducer {
     pub fn new(id: impl Into<String>, started_in_think: bool) -> Self {
+        Self::new_with_tool_protocol(id, started_in_think, true)
+    }
+
+    pub fn new_with_tool_protocol(
+        id: impl Into<String>,
+        started_in_think: bool,
+        tool_protocol_enabled: bool,
+    ) -> Self {
         Self {
             id: id.into(),
             filter: EosFilter::new(qwen_ar_eos_filter_config()),
             think_router: ThinkOutputRouter::new(started_in_think),
-            router: ToolOutputRouter::new(),
+            router: if tool_protocol_enabled {
+                ToolOutputRouter::new()
+            } else {
+                ToolOutputRouter::disabled()
+            },
             visible_acc: String::new(),
             raw_committed: Vec::new(),
             raw_commit_positions: Vec::new(),
@@ -3315,7 +3327,11 @@ pub fn generate(
         // and structured tool_calls on this AR path. Raw token commit stays
         // upstream via `commit_and_observe` (conversation_tokens / streamed /
         // seq_pos advance before classify).
-        let mut semantic = QwenArSemanticProducer::new(id, started_in_think);
+        let mut semantic = QwenArSemanticProducer::new_with_tool_protocol(
+            id,
+            started_in_think,
+            tools_nonempty,
+        );
         let mut alert_fired = false;
         // max_think_tokens enforcement state. think_count increments only
         // while we observe ourselves to be inside a `<think>...</think>`

@@ -770,9 +770,10 @@ pub fn drive_qwen_continuous_batch(
                 lane.bytes_fed_to_filter = 0;
                 lane.prefill_done_at = Some(Instant::now());
             }
-            producers[lane_idx] = Some(QwenArSemanticProducer::new(
+            producers[lane_idx] = Some(QwenArSemanticProducer::new_with_tool_protocol(
                 key.id.clone(),
                 started_in_think,
+                false,
             ));
         }
         let running: Vec<usize> = sched
@@ -3014,9 +3015,10 @@ pub fn drive_qwen35_ep_continuous_batch(
                 lane.bytes_fed_to_filter = 0;
                 lane.prefill_done_at = Some(Instant::now());
             }
-            producers[lane_idx] = Some(QwenArSemanticProducer::new(
+            producers[lane_idx] = Some(QwenArSemanticProducer::new_with_tool_protocol(
                 key.id.clone(),
                 started_in_think,
+                false,
             ));
         }
         let running: Vec<usize> = sched

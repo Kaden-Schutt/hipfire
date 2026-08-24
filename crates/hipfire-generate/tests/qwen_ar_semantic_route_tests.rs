@@ -142,6 +142,36 @@ use hipfire_generate::common::*;
     }
 
     #[test]
+    fn tool_free_producer_keeps_tool_like_text_as_content() {
+        set_active_attempt_id(17);
+        let text = "<tool_call>\n<function=cat\n</function>\n</tool_call>";
+        let mut producer =
+            QwenArSemanticProducer::new_with_tool_protocol("tool-free", false, false);
+        let mut sink = Vec::new();
+        let mut conversation_tokens = Vec::new();
+        let mut streamed_tokens = Vec::new();
+        let mut seq_pos = 0usize;
+
+        let stopped = producer
+            .commit_and_observe(
+                &mut sink,
+                &mut conversation_tokens,
+                &mut streamed_tokens,
+                &mut seq_pos,
+                1000,
+                text.as_bytes(),
+            )
+            .expect("tool-free marker text must not fail");
+        assert!(!stopped);
+        assert_eq!(producer.visible(), text);
+
+        let (finish, visible) = producer.finish(&mut sink, false).expect("finish");
+        assert_eq!(finish.finish_reason, "stop");
+        assert!(finish.wire_tool_calls.is_empty());
+        assert_eq!(visible, text);
+    }
+
+    #[test]
     fn contract_version_constant_is_v2() {
         assert_eq!(QWEN_AR_SEMANTIC_CONTRACT_VERSION, 2);
     }

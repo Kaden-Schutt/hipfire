@@ -2101,7 +2101,7 @@ fn main() {
                 // request (rather than silently dropping the fields).
                 let tools_json: Option<Vec<serde_json::Value>> = match msg.get("tools") {
                     Some(v) => match serde_json::from_value::<Vec<serde_json::Value>>(v.clone()) {
-                        Ok(t) => Some(t),
+                        Ok(t) => (!t.is_empty()).then_some(t),
                         Err(e) => {
                             hipfire_generate::dense::emit_active_attempt_error(
                                 &mut stdout,

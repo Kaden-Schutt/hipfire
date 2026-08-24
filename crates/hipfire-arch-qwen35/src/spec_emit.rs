@@ -91,6 +91,7 @@ impl<'a> Qwen35Emit<'a> {
     /// drives. The JSON→schema extraction mirrors the daemon's old
     /// `tool_schemas_dflash` builder.
     pub fn from_ctx(ctx: SpecEmitCtx<'a>) -> Box<dyn SpecEmit + 'a> {
+        let tool_protocol_enabled = ctx.tools.is_some();
         let tool_schemas: Vec<grammar::ToolSchema> = ctx
             .tools
             .map(|arr| {
@@ -127,7 +128,11 @@ impl<'a> Qwen35Emit<'a> {
             filter: EosFilter::new(qwen_dflash_eos_filter_config()),
             bytes_fed_to_filter: 0,
             streamed_tokens: Vec::new(),
-            router: ToolOutputRouter::new(),
+            router: if tool_protocol_enabled {
+                ToolOutputRouter::new()
+            } else {
+                ToolOutputRouter::disabled()
+            },
             think_router: ThinkOutputRouter::new(open_think_prefix),
             visible_acc: String::new(),
             router_malformed: false,
@@ -607,7 +612,7 @@ mod tests {
             tokenizer: tok,
             eos: 9,
             im_end: Some(1),
-            tools: None,
+            tools: Some(&[]),
             stop: Vec::new(),
             max_think: 0,
             max_tokens: 256,

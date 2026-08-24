@@ -139,7 +139,7 @@ use hipfire_runtime::emit_text::extract_tool_calls_from_text;
             tokenizer: tok,
             eos: 9,
             im_end: Some(1),
-            tools: None,
+            tools: Some(&[]),
             stop: Vec::new(),
             max_think: 0,
             max_tokens: 256,

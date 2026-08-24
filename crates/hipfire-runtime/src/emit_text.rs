@@ -234,6 +234,9 @@ enum RouteState {
 /// ordered prose and complete calls, and latches fail-closed on malformed or
 /// truncated protocol.
 pub struct ToolOutputRouter {
+    /// Whether this request declared at least one executable tool. Tool-like
+    /// text is ordinary assistant content when no tool contract exists.
+    enabled: bool,
     state: RouteState,
     /// Unsettled text: Normal holdback tail, or InToolCall body accumulator
     /// (may include a trailing partial delimiter still being matched).
@@ -259,12 +262,22 @@ impl ToolOutputRouter {
     /// Fresh router with empty buffers.
     pub fn new() -> Self {
         Self {
+            enabled: true,
             state: RouteState::Normal,
             buf: String::new(),
             cursor: DelimCursor::new(),
             seen: 0,
             completed: Vec::new(),
             malformed: None,
+        }
+    }
+
+    /// Router for a tool-free request. Reserved-looking text remains visible
+    /// and can never become executable or fail the tool protocol.
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            ..Self::new()
         }
     }
 
@@ -283,6 +296,13 @@ impl ToolOutputRouter {
     /// Returns [`Err`] once malformed/truncated protocol is detected; the error
     /// stays latched for subsequent calls.
     pub fn push(&mut self, chunk: &str) -> Result<Vec<ToolRouteEvent>, ToolRouteError> {
+        if !self.enabled {
+            return if chunk.is_empty() {
+                Ok(Vec::new())
+            } else {
+                Ok(vec![visible_event(chunk.to_string())])
+            };
+        }
         if let Some(err) = self.malformed.clone() {
             return Err(err);
         }
@@ -295,6 +315,11 @@ impl ToolOutputRouter {
 
     /// End-of-stream: flush held prose, or fail closed on an open tool span.
     pub fn finish(mut self) -> Result<Vec<ToolRouteEvent>, ToolRouteError> {
+        if !self.enabled {
+            debug_assert!(self.buf.is_empty());
+            debug_assert!(self.completed.is_empty());
+            return Ok(Vec::new());
+        }
         if let Some(err) = self.malformed.clone() {
             return Err(err);
         }
@@ -1649,6 +1674,21 @@ mod tests {
         let r = ToolOutputRouter::new();
         assert!(r.tool_calls().is_empty());
         assert!(!r.is_malformed());
+    }
+
+    #[test]
+    fn disabled_router_keeps_tool_like_text_visible_and_non_executable() {
+        let text = "<tool_call>\n<function=cat\n</function>\n</tool_call>";
+        let mut router = ToolOutputRouter::disabled();
+        let events = router.push(text).expect("tool-free text must remain visible");
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            ToolRouteEvent::VisibleText(visible) => assert_eq!(visible.as_str(), text),
+            ToolRouteEvent::ToolCall(_) => panic!("tool-free text became executable"),
+        }
+        assert!(router.tool_calls().is_empty());
+        assert!(!router.is_malformed());
+        assert!(router.finish().expect("disabled finish").is_empty());
     }
 
     #[test]
