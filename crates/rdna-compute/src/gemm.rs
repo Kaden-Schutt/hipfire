@@ -64,49 +64,53 @@ const LDSSTAGE_MAX_BATCH: usize = 96;
 const LDSSTAGE_MAX_BATCH_GFX11: usize = 96;
 
 #[derive(Clone, Copy)]
-enum Mq4V2PrefillProjection {
+enum MqV2PrefillProjection {
     Qkvza,
     Qkv,
     GateUp,
     Residual,
 }
 
-/// Measured MQ4V2 weight-reuse policy for the exact RDNA architecture.
+/// Measured MQ V2 weight-reuse policy for the exact RDNA architecture.
 ///
 /// Returns the number of independent 16-token output tiles that share one
-/// dequantized weight tile. Capture and replay callers deliberately bypass
-/// this policy because those paths own a fixed launch contract.
-fn mq4v2_prefill_batch_tile(
+/// dequantized weight tile. `bits` is the MagnumQuant width (2/3/4/5/6).
+/// Capture and replay callers deliberately bypass this policy because those
+/// paths own a fixed launch contract.
+fn mqv2_prefill_batch_tile(
     arch: &str,
-    projection: Mq4V2PrefillProjection,
+    bits: u8,
+    projection: MqV2PrefillProjection,
     batch_size: usize,
 ) -> Option<usize> {
-    use Mq4V2PrefillProjection::{GateUp, Qkv, Qkvza, Residual};
+    use MqV2PrefillProjection::{GateUp, Qkv, Qkvza, Residual};
 
-    match (arch, projection, batch_size) {
-        ("gfx1100", Qkvza | Qkv, 192..) => Some(12),
-        ("gfx1100", Qkvza | Qkv, 96..) => Some(4),
-        ("gfx1100", GateUp, 384..) => Some(12),
-        ("gfx1100", GateUp, 96..) => Some(6),
-        ("gfx1100", Residual, 288..=415) => Some(8),
-        ("gfx1100", Residual, 224..=287) => Some(6),
-        ("gfx1100", Residual, 96..=223) => Some(4),
+    match (arch, bits, projection, batch_size) {
+        // MQ4V2 — measured production policy (unchanged).
+        ("gfx1100", 4, Qkvza | Qkv, 192..) => Some(12),
+        ("gfx1100", 4, Qkvza | Qkv, 96..) => Some(4),
+        ("gfx1100", 4, GateUp, 384..) => Some(12),
+        ("gfx1100", 4, GateUp, 96..) => Some(6),
+        ("gfx1100", 4, Residual, 288..=415) => Some(8),
+        ("gfx1100", 4, Residual, 224..=287) => Some(6),
+        ("gfx1100", 4, Residual, 96..=223) => Some(4),
 
-        ("gfx1151", GateUp, 96..) => Some(12),
-        ("gfx1151", Qkvza | Qkv | Residual, 96..) => Some(4),
+        ("gfx1151", 4, GateUp, 96..) => Some(12),
+        ("gfx1151", 4, Qkvza | Qkv | Residual, 96..) => Some(4),
 
-        ("gfx1201", Qkv, 96..) => Some(8),
+        ("gfx1201", 4, Qkv, 96..) => Some(8),
+
+        // MQ{2,3,5,6}V2 gfx1151 — promote QKVZA/QKV/residual BT4 and gate/up
+        // BT12 for N>=96 (raw-bit + full-model wins across all four ops).
+        ("gfx1151", 2 | 3 | 5 | 6, Qkvza | Qkv | Residual, 96..) => Some(4),
+        ("gfx1151", 2 | 3 | 5 | 6, GateUp, 96..) => Some(12),
+
+        // MQ{2,5,6}V2 gfx1201 — QKV BT8 only for N>=96. MQ3 stays base
+        // (neutral/noisy). Other projections remain historical base.
+        ("gfx1201", 2 | 5 | 6, Qkv, 96..) => Some(8),
+
         _ => None,
     }
-}
-
-/// Temporary MQ{2,3,5,6}V2 weight-reuse screen (`HIPFIRE_MQV2_PREFILL_REUSE=1`).
-/// Cached once; unset/other values leave the historical base path byte-for-byte.
-fn mqv2_prefill_reuse_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        hipfire_config::developer_var("HIPFIRE_MQV2_PREFILL_REUSE").as_deref() == Ok("1")
-    })
 }
 
 impl Gpu {
@@ -25915,7 +25919,7 @@ impl Gpu {
     /// WMMA contracts (half16, w32, interleaved C). Distinct source/symbol/module
     /// so admitting gfx11 cannot alter the certified gfx12 code object.
     /// Exact gfx1100/gfx1151 production batch-tiles come from
-    /// `mq4v2_prefill_batch_tile` outside replay recording and graph capture;
+    /// `mqv2_prefill_batch_tile` outside replay recording and graph capture;
     /// base below policy thresholds and capture/replay retain the historical
     /// base kernel byte-for-byte. Policy tiles route to the arch-specific
     /// `gemm_qkvza_mq4g256v2_wmma_gfx{1100,1151}_bt` launchers.
@@ -25940,9 +25944,10 @@ impl Gpu {
         // Production MQ4V2 weight-reuse tiles (gfx1100/gfx1151). Capture/replay
         // always keep the historical base launch contract.
         if !self.replay.is_recording() && !self.graphs.capture_mode {
-            if let Some(batch_tile) = mq4v2_prefill_batch_tile(
+            if let Some(batch_tile) = mqv2_prefill_batch_tile(
                 self.arch.as_str(),
-                Mq4V2PrefillProjection::Qkvza,
+                4,
+                MqV2PrefillProjection::Qkvza,
                 batch_size,
             ) {
                 match self.arch.as_str() {
@@ -26303,9 +26308,10 @@ impl Gpu {
         // Production MQ4V2 weight-reuse tile (gfx1201 QKV BT8 @ N>=96).
         // Capture/replay always keep the historical base launch contract.
         if !self.replay.is_recording() && !self.graphs.capture_mode {
-            if let Some(batch_tile) = mq4v2_prefill_batch_tile(
+            if let Some(batch_tile) = mqv2_prefill_batch_tile(
                 self.arch.as_str(),
-                Mq4V2PrefillProjection::Qkv,
+                4,
+                MqV2PrefillProjection::Qkv,
                 batch_size,
             ) {
                 if self.arch.as_str() == "gfx1201" {
@@ -26395,7 +26401,7 @@ impl Gpu {
     /// WMMA contracts (half16, w32, interleaved C). Distinct source/symbol/module
     /// so admitting gfx11 cannot alter the certified gfx12 code object.
     /// Exact gfx1100/gfx1151 production batch-tiles come from
-    /// `mq4v2_prefill_batch_tile` outside replay/capture; sizes below policy
+    /// `mqv2_prefill_batch_tile` outside replay/capture; sizes below policy
     /// thresholds and other arches retain the historical base kernel.
     pub fn gemm_qkv_mq4g256v2_wmma(
         &mut self,
@@ -26415,9 +26421,10 @@ impl Gpu {
         // Production MQ4V2 weight-reuse tiles (gfx1100/gfx1151). Capture/replay
         // always keep the historical base launch contract.
         if !self.replay.is_recording() && !self.graphs.capture_mode {
-            if let Some(batch_tile) = mq4v2_prefill_batch_tile(
+            if let Some(batch_tile) = mqv2_prefill_batch_tile(
                 self.arch.as_str(),
-                Mq4V2PrefillProjection::Qkv,
+                4,
+                MqV2PrefillProjection::Qkv,
                 batch_size,
             ) {
                 match self.arch.as_str() {
@@ -26723,7 +26730,7 @@ impl Gpu {
 
     /// MQ4V2 exact-gfx1201 QKV batch-tile (BT4/8/12).
     ///
-    /// Direct harness entry and production path via `mq4v2_prefill_batch_tile`
+    /// Direct harness entry and production path via `mqv2_prefill_batch_tile`
     /// (BT8 @ N>=96). Module `gemm_qkv_mq4g256v2_wmma_gfx1201_bt`; symbols
     /// `gemm_qkv_mq4g256v2_wmma_gfx1201_bt{4,8,12}`. Grid
     /// `[ceil((q+k+v)/16), ceil(N/(16*B))]`, block `[32]`, static LDS 0,
@@ -27021,7 +27028,7 @@ impl Gpu {
     /// WMMA contracts (half16, w32, interleaved C). Distinct source/symbol/module
     /// so admitting gfx11 cannot alter the certified gfx12 code object.
     /// Exact gfx1100/gfx1151 production batch-tiles come from
-    /// `mq4v2_prefill_batch_tile` outside replay/capture.
+    /// `mqv2_prefill_batch_tile` outside replay/capture.
     pub fn gemm_gate_up_mq4g256v2_wmma(
         &mut self,
         a_gate: &GpuTensor,
@@ -27037,9 +27044,10 @@ impl Gpu {
         // Production MQ4V2 weight-reuse tiles (gfx1100/gfx1151). Capture/replay
         // always keep the historical base launch contract.
         if !self.replay.is_recording() && !self.graphs.capture_mode {
-            if let Some(batch_tile) = mq4v2_prefill_batch_tile(
+            if let Some(batch_tile) = mqv2_prefill_batch_tile(
                 self.arch.as_str(),
-                Mq4V2PrefillProjection::GateUp,
+                4,
+                MqV2PrefillProjection::GateUp,
                 batch_size,
             ) {
                 match self.arch.as_str() {
@@ -27467,7 +27475,7 @@ impl Gpu {
     /// WMMA contracts (half16, w32, interleaved C). Distinct source/symbol/module
     /// so admitting gfx11 cannot alter the certified gfx12 code object.
     /// Exact gfx1100/gfx1151 production batch-tiles come from
-    /// `mq4v2_prefill_batch_tile` outside replay/capture.
+    /// `mqv2_prefill_batch_tile` outside replay/capture.
     pub fn gemm_mq4g256v2_residual_wmma(
         &mut self,
         a_raw: &GpuTensor,
@@ -27480,9 +27488,10 @@ impl Gpu {
         // Production MQ4V2 weight-reuse tiles (gfx1100/gfx1151). Capture/replay
         // always keep the historical base launch contract.
         if !self.replay.is_recording() && !self.graphs.capture_mode {
-            if let Some(batch_tile) = mq4v2_prefill_batch_tile(
+            if let Some(batch_tile) = mqv2_prefill_batch_tile(
                 self.arch.as_str(),
-                Mq4V2PrefillProjection::Residual,
+                4,
+                MqV2PrefillProjection::Residual,
                 batch_size,
             ) {
                 match self.arch.as_str() {
@@ -28277,14 +28286,14 @@ impl Gpu {
 
     // ── MQ5G256V2 (qt=48) launchers — mirror MQ4V2 exactly, 168 B stride, 5-bit payload ──
 
-
-    /// MQ{2,3,5,6}V2 gfx11 QKVZA BT4 weight-reuse screen launcher.
+    /// MQ{2,3,5,6}V2 gfx11 QKVZA BT4 weight-reuse production launcher.
     ///
     /// `bits` selects the exact HIP symbol (`2`/`3`/`5`/`6`). Shared source
     /// `GEMM_MQV2_WMMA_GFX11_BT_SRC`; module is arch-static
     /// (`gemm_mqv2_wmma_gfx{1100,1151}_bt`) so gfx1100 parity and gfx1151
-    /// production screening cannot share a code object. Grid batch divisor 64
+    /// production selection cannot share a code object. Grid batch divisor 64
     /// (BT4); block 32; FP16 X once; blob-safe; `K % 256 == 0`; zero-size no-op.
+    /// Selected by `mqv2_prefill_batch_tile` (BT4 @ N>=96 on gfx1151).
     pub fn gemm_qkvza_mqv2_wmma_gfx11_bt4(
         &mut self,
         bits: u8,
@@ -28410,9 +28419,10 @@ impl Gpu {
         result
     }
 
-    /// MQ{2,3,5,6}V2 gfx11 QKV BT4 weight-reuse screen launcher.
+    /// MQ{2,3,5,6}V2 gfx11 QKV BT4 weight-reuse production launcher.
     /// Shared `GEMM_MQV2_WMMA_GFX11_BT_SRC`; module gfx1100 vs gfx1151; grid
     /// batch divisor 64; block 32; blob-safe; `K % 256 == 0`; zero-size no-op.
+    /// Selected by `mqv2_prefill_batch_tile` (BT4 @ N>=96 on gfx1151).
     pub fn gemm_qkv_mqv2_wmma_gfx11_bt4(
         &mut self,
         bits: u8,
@@ -28526,9 +28536,10 @@ impl Gpu {
         result
     }
 
-    /// MQ{2,3,5,6}V2 gfx11 gate/up BT12 weight-reuse screen launcher.
+    /// MQ{2,3,5,6}V2 gfx11 gate/up BT12 weight-reuse production launcher.
     /// Shared `GEMM_MQV2_WMMA_GFX11_BT_SRC`; module gfx1100 vs gfx1151; grid
     /// batch divisor 192; block 32; blob-safe; `K % 256 == 0`; zero-size no-op.
+    /// Selected by `mqv2_prefill_batch_tile` (BT12 @ N>=96 on gfx1151).
     pub fn gemm_gate_up_mqv2_wmma_gfx11_bt12(
         &mut self,
         bits: u8,
@@ -28630,10 +28641,11 @@ impl Gpu {
         result
     }
 
-    /// MQ{2,3,5,6}V2 gfx11 residual BT4 weight-reuse screen launcher.
+    /// MQ{2,3,5,6}V2 gfx11 residual BT4 weight-reuse production launcher.
     /// Shared `GEMM_MQV2_WMMA_GFX11_BT_SRC`; module gfx1100 vs gfx1151; grid
     /// batch divisor 64; block 32; preserves `Y += W@X`; blob-safe;
     /// `K % 256 == 0`; zero-size no-op.
+    /// Selected by `mqv2_prefill_batch_tile` (BT4 @ N>=96 on gfx1151).
     pub fn gemm_mqv2_residual_wmma_gfx11_bt4(
         &mut self,
         bits: u8,
@@ -28722,10 +28734,12 @@ impl Gpu {
         result
     }
 
-    /// MQ{2,3,5,6}V2 exact-gfx1201 QKV BT8 weight-reuse screen launcher.
+    /// MQ{2,3,5,6}V2 exact-gfx1201 QKV BT8 weight-reuse production launcher.
     /// Shared `GEMM_QKV_MQV2_WMMA_GFX1201_BT_SRC`; module
     /// `gemm_qkv_mqv2_wmma_gfx1201_bt`; grid batch divisor 128; block 32;
     /// blob-safe; `K % 256 == 0`; zero-size no-op.
+    /// Selected by `mqv2_prefill_batch_tile` (BT8 @ N>=96 on gfx1201 for
+    /// bits 2/5/6; MQ3 stays base).
     pub fn gemm_qkv_mqv2_wmma_gfx1201_bt8(
         &mut self,
         bits: u8,
@@ -28993,16 +29007,21 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        if mqv2_prefill_reuse_enabled()
-            && self.arch_caps.is_gfx1151()
-            && batch_size >= 96
-            && !self.replay.is_recording()
-            && !self.graphs.capture_mode
-        {
-            return self.gemm_qkvza_mqv2_wmma_gfx11_bt4(
-                5, a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m,
-                beta_m, alpha_m, k, batch_size,
-            );
+        // Production MQ V2 weight-reuse tile via mqv2_prefill_batch_tile.
+        // Capture/replay always keep the historical base launch contract.
+        if !self.replay.is_recording() && !self.graphs.capture_mode {
+            if mqv2_prefill_batch_tile(
+                self.arch.as_str(),
+                5,
+                MqV2PrefillProjection::Qkvza,
+                batch_size,
+            ) == Some(4)
+            {
+                return self.gemm_qkvza_mqv2_wmma_gfx11_bt4(
+                    5, a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m,
+                    z_m, beta_m, alpha_m, k, batch_size,
+                );
+            }
         }
         self.bind_thread()?;
         let kname = "gemm_qkvza_mq5g256v2_wmma";
@@ -29134,15 +29153,20 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        if mqv2_prefill_reuse_enabled()
-            && self.arch_caps.is_gfx1201()
-            && batch_size >= 96
-            && !self.replay.is_recording()
-            && !self.graphs.capture_mode
-        {
-            return self.gemm_qkv_mqv2_wmma_gfx1201_bt8(
-                5, a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size,
-            );
+        // Production MQ V2 weight-reuse tile via mqv2_prefill_batch_tile.
+        // Capture/replay always keep the historical base launch contract.
+        if !self.replay.is_recording() && !self.graphs.capture_mode {
+            if mqv2_prefill_batch_tile(
+                self.arch.as_str(),
+                5,
+                MqV2PrefillProjection::Qkv,
+                batch_size,
+            ) == Some(8)
+            {
+                return self.gemm_qkv_mqv2_wmma_gfx1201_bt8(
+                    5, a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size,
+                );
+            }
         }
         self.bind_thread()?;
         let module_v2 = "gemm_qkv_hfq4g256_wmma_gfx12_mq5v2";
@@ -29230,15 +29254,20 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        if mqv2_prefill_reuse_enabled()
-            && self.arch_caps.is_gfx1151()
-            && batch_size >= 96
-            && !self.replay.is_recording()
-            && !self.graphs.capture_mode
-        {
-            return self.gemm_qkv_mqv2_wmma_gfx11_bt4(
-                5, a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size,
-            );
+        // Production MQ V2 weight-reuse tile via mqv2_prefill_batch_tile.
+        // Capture/replay always keep the historical base launch contract.
+        if !self.replay.is_recording() && !self.graphs.capture_mode {
+            if mqv2_prefill_batch_tile(
+                self.arch.as_str(),
+                5,
+                MqV2PrefillProjection::Qkv,
+                batch_size,
+            ) == Some(4)
+            {
+                return self.gemm_qkv_mqv2_wmma_gfx11_bt4(
+                    5, a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size,
+                );
+            }
         }
         self.bind_thread()?;
         let kname = "gemm_qkv_mq5g256v2_wmma";
@@ -29462,15 +29491,20 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        if mqv2_prefill_reuse_enabled()
-            && self.arch_caps.is_gfx1151()
-            && batch_size >= 96
-            && !self.replay.is_recording()
-            && !self.graphs.capture_mode
-        {
-            return self.gemm_gate_up_mqv2_wmma_gfx11_bt12(
-                5, a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
-            );
+        // Production MQ V2 weight-reuse tile via mqv2_prefill_batch_tile.
+        // Capture/replay always keep the historical base launch contract.
+        if !self.replay.is_recording() && !self.graphs.capture_mode {
+            if mqv2_prefill_batch_tile(
+                self.arch.as_str(),
+                5,
+                MqV2PrefillProjection::GateUp,
+                batch_size,
+            ) == Some(12)
+            {
+                return self.gemm_gate_up_mqv2_wmma_gfx11_bt12(
+                    5, a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
+                );
+            }
         }
         self.bind_thread()?;
         let kname = "gemm_gate_up_mq5g256v2_wmma";
@@ -29664,15 +29698,20 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        if mqv2_prefill_reuse_enabled()
-            && self.arch_caps.is_gfx1151()
-            && batch_size >= 96
-            && !self.replay.is_recording()
-            && !self.graphs.capture_mode
-        {
-            return self.gemm_mqv2_residual_wmma_gfx11_bt4(
-                5, a_raw, x, y, m, k, batch_size,
-            );
+        // Production MQ V2 weight-reuse tile via mqv2_prefill_batch_tile.
+        // Capture/replay always keep the historical base launch contract.
+        if !self.replay.is_recording() && !self.graphs.capture_mode {
+            if mqv2_prefill_batch_tile(
+                self.arch.as_str(),
+                5,
+                MqV2PrefillProjection::Residual,
+                batch_size,
+            ) == Some(4)
+            {
+                return self.gemm_mqv2_residual_wmma_gfx11_bt4(
+                    5, a_raw, x, y, m, k, batch_size,
+                );
+            }
         }
         self.bind_thread()?;
         let kname = "gemm_mq5g256v2_residual_wmma";
@@ -30228,16 +30267,21 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        if mqv2_prefill_reuse_enabled()
-            && self.arch_caps.is_gfx1151()
-            && batch_size >= 96
-            && !self.replay.is_recording()
-            && !self.graphs.capture_mode
-        {
-            return self.gemm_qkvza_mqv2_wmma_gfx11_bt4(
-                6, a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m,
-                beta_m, alpha_m, k, batch_size,
-            );
+        // Production MQ V2 weight-reuse tile via mqv2_prefill_batch_tile.
+        // Capture/replay always keep the historical base launch contract.
+        if !self.replay.is_recording() && !self.graphs.capture_mode {
+            if mqv2_prefill_batch_tile(
+                self.arch.as_str(),
+                6,
+                MqV2PrefillProjection::Qkvza,
+                batch_size,
+            ) == Some(4)
+            {
+                return self.gemm_qkvza_mqv2_wmma_gfx11_bt4(
+                    6, a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m,
+                    z_m, beta_m, alpha_m, k, batch_size,
+                );
+            }
         }
         self.bind_thread()?;
         let kname = "gemm_qkvza_mq6g256v2_wmma";
@@ -30369,15 +30413,20 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        if mqv2_prefill_reuse_enabled()
-            && self.arch_caps.is_gfx1201()
-            && batch_size >= 96
-            && !self.replay.is_recording()
-            && !self.graphs.capture_mode
-        {
-            return self.gemm_qkv_mqv2_wmma_gfx1201_bt8(
-                6, a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size,
-            );
+        // Production MQ V2 weight-reuse tile via mqv2_prefill_batch_tile.
+        // Capture/replay always keep the historical base launch contract.
+        if !self.replay.is_recording() && !self.graphs.capture_mode {
+            if mqv2_prefill_batch_tile(
+                self.arch.as_str(),
+                6,
+                MqV2PrefillProjection::Qkv,
+                batch_size,
+            ) == Some(8)
+            {
+                return self.gemm_qkv_mqv2_wmma_gfx1201_bt8(
+                    6, a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size,
+                );
+            }
         }
         self.bind_thread()?;
         let module_v2 = "gemm_qkv_hfq4g256_wmma_gfx12_mq6v2";
@@ -30465,15 +30514,20 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        if mqv2_prefill_reuse_enabled()
-            && self.arch_caps.is_gfx1151()
-            && batch_size >= 96
-            && !self.replay.is_recording()
-            && !self.graphs.capture_mode
-        {
-            return self.gemm_qkv_mqv2_wmma_gfx11_bt4(
-                6, a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size,
-            );
+        // Production MQ V2 weight-reuse tile via mqv2_prefill_batch_tile.
+        // Capture/replay always keep the historical base launch contract.
+        if !self.replay.is_recording() && !self.graphs.capture_mode {
+            if mqv2_prefill_batch_tile(
+                self.arch.as_str(),
+                6,
+                MqV2PrefillProjection::Qkv,
+                batch_size,
+            ) == Some(4)
+            {
+                return self.gemm_qkv_mqv2_wmma_gfx11_bt4(
+                    6, a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size,
+                );
+            }
         }
         self.bind_thread()?;
         let kname = "gemm_qkv_mq6g256v2_wmma";
@@ -30697,15 +30751,20 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        if mqv2_prefill_reuse_enabled()
-            && self.arch_caps.is_gfx1151()
-            && batch_size >= 96
-            && !self.replay.is_recording()
-            && !self.graphs.capture_mode
-        {
-            return self.gemm_gate_up_mqv2_wmma_gfx11_bt12(
-                6, a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
-            );
+        // Production MQ V2 weight-reuse tile via mqv2_prefill_batch_tile.
+        // Capture/replay always keep the historical base launch contract.
+        if !self.replay.is_recording() && !self.graphs.capture_mode {
+            if mqv2_prefill_batch_tile(
+                self.arch.as_str(),
+                6,
+                MqV2PrefillProjection::GateUp,
+                batch_size,
+            ) == Some(12)
+            {
+                return self.gemm_gate_up_mqv2_wmma_gfx11_bt12(
+                    6, a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
+                );
+            }
         }
         self.bind_thread()?;
         let kname = "gemm_gate_up_mq6g256v2_wmma";
@@ -30899,15 +30958,20 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        if mqv2_prefill_reuse_enabled()
-            && self.arch_caps.is_gfx1151()
-            && batch_size >= 96
-            && !self.replay.is_recording()
-            && !self.graphs.capture_mode
-        {
-            return self.gemm_mqv2_residual_wmma_gfx11_bt4(
-                6, a_raw, x, y, m, k, batch_size,
-            );
+        // Production MQ V2 weight-reuse tile via mqv2_prefill_batch_tile.
+        // Capture/replay always keep the historical base launch contract.
+        if !self.replay.is_recording() && !self.graphs.capture_mode {
+            if mqv2_prefill_batch_tile(
+                self.arch.as_str(),
+                6,
+                MqV2PrefillProjection::Residual,
+                batch_size,
+            ) == Some(4)
+            {
+                return self.gemm_mqv2_residual_wmma_gfx11_bt4(
+                    6, a_raw, x, y, m, k, batch_size,
+                );
+            }
         }
         self.bind_thread()?;
         let kname = "gemm_mq6g256v2_residual_wmma";
@@ -31463,16 +31527,21 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        if mqv2_prefill_reuse_enabled()
-            && self.arch_caps.is_gfx1151()
-            && batch_size >= 96
-            && !self.replay.is_recording()
-            && !self.graphs.capture_mode
-        {
-            return self.gemm_qkvza_mqv2_wmma_gfx11_bt4(
-                3, a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m,
-                beta_m, alpha_m, k, batch_size,
-            );
+        // Production MQ V2 weight-reuse tile via mqv2_prefill_batch_tile.
+        // Capture/replay always keep the historical base launch contract.
+        if !self.replay.is_recording() && !self.graphs.capture_mode {
+            if mqv2_prefill_batch_tile(
+                self.arch.as_str(),
+                3,
+                MqV2PrefillProjection::Qkvza,
+                batch_size,
+            ) == Some(4)
+            {
+                return self.gemm_qkvza_mqv2_wmma_gfx11_bt4(
+                    3, a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m,
+                    z_m, beta_m, alpha_m, k, batch_size,
+                );
+            }
         }
         self.bind_thread()?;
         let kname = "gemm_qkvza_mq3g256v2_wmma";
@@ -31604,16 +31673,6 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        if mqv2_prefill_reuse_enabled()
-            && self.arch_caps.is_gfx1201()
-            && batch_size >= 96
-            && !self.replay.is_recording()
-            && !self.graphs.capture_mode
-        {
-            return self.gemm_qkv_mqv2_wmma_gfx1201_bt8(
-                3, a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size,
-            );
-        }
         self.bind_thread()?;
         let module_v2 = "gemm_qkv_hfq4g256_wmma_gfx12_mq3v2";
         let func_name = "gemm_qkv_mq3g256v2_wmma_gfx12";
@@ -31700,15 +31759,20 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        if mqv2_prefill_reuse_enabled()
-            && self.arch_caps.is_gfx1151()
-            && batch_size >= 96
-            && !self.replay.is_recording()
-            && !self.graphs.capture_mode
-        {
-            return self.gemm_qkv_mqv2_wmma_gfx11_bt4(
-                3, a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size,
-            );
+        // Production MQ V2 weight-reuse tile via mqv2_prefill_batch_tile.
+        // Capture/replay always keep the historical base launch contract.
+        if !self.replay.is_recording() && !self.graphs.capture_mode {
+            if mqv2_prefill_batch_tile(
+                self.arch.as_str(),
+                3,
+                MqV2PrefillProjection::Qkv,
+                batch_size,
+            ) == Some(4)
+            {
+                return self.gemm_qkv_mqv2_wmma_gfx11_bt4(
+                    3, a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size,
+                );
+            }
         }
         self.bind_thread()?;
         let kname = "gemm_qkv_mq3g256v2_wmma";
@@ -31932,15 +31996,20 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        if mqv2_prefill_reuse_enabled()
-            && self.arch_caps.is_gfx1151()
-            && batch_size >= 96
-            && !self.replay.is_recording()
-            && !self.graphs.capture_mode
-        {
-            return self.gemm_gate_up_mqv2_wmma_gfx11_bt12(
-                3, a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
-            );
+        // Production MQ V2 weight-reuse tile via mqv2_prefill_batch_tile.
+        // Capture/replay always keep the historical base launch contract.
+        if !self.replay.is_recording() && !self.graphs.capture_mode {
+            if mqv2_prefill_batch_tile(
+                self.arch.as_str(),
+                3,
+                MqV2PrefillProjection::GateUp,
+                batch_size,
+            ) == Some(12)
+            {
+                return self.gemm_gate_up_mqv2_wmma_gfx11_bt12(
+                    3, a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
+                );
+            }
         }
         self.bind_thread()?;
         let kname = "gemm_gate_up_mq3g256v2_wmma";
@@ -32134,15 +32203,20 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        if mqv2_prefill_reuse_enabled()
-            && self.arch_caps.is_gfx1151()
-            && batch_size >= 96
-            && !self.replay.is_recording()
-            && !self.graphs.capture_mode
-        {
-            return self.gemm_mqv2_residual_wmma_gfx11_bt4(
-                3, a_raw, x, y, m, k, batch_size,
-            );
+        // Production MQ V2 weight-reuse tile via mqv2_prefill_batch_tile.
+        // Capture/replay always keep the historical base launch contract.
+        if !self.replay.is_recording() && !self.graphs.capture_mode {
+            if mqv2_prefill_batch_tile(
+                self.arch.as_str(),
+                3,
+                MqV2PrefillProjection::Residual,
+                batch_size,
+            ) == Some(4)
+            {
+                return self.gemm_mqv2_residual_wmma_gfx11_bt4(
+                    3, a_raw, x, y, m, k, batch_size,
+                );
+            }
         }
         self.bind_thread()?;
         let kname = "gemm_mq3g256v2_residual_wmma";
@@ -32698,16 +32772,21 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        if mqv2_prefill_reuse_enabled()
-            && self.arch_caps.is_gfx1151()
-            && batch_size >= 96
-            && !self.replay.is_recording()
-            && !self.graphs.capture_mode
-        {
-            return self.gemm_qkvza_mqv2_wmma_gfx11_bt4(
-                2, a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m,
-                beta_m, alpha_m, k, batch_size,
-            );
+        // Production MQ V2 weight-reuse tile via mqv2_prefill_batch_tile.
+        // Capture/replay always keep the historical base launch contract.
+        if !self.replay.is_recording() && !self.graphs.capture_mode {
+            if mqv2_prefill_batch_tile(
+                self.arch.as_str(),
+                2,
+                MqV2PrefillProjection::Qkvza,
+                batch_size,
+            ) == Some(4)
+            {
+                return self.gemm_qkvza_mqv2_wmma_gfx11_bt4(
+                    2, a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m,
+                    z_m, beta_m, alpha_m, k, batch_size,
+                );
+            }
         }
         self.bind_thread()?;
         let kname = "gemm_qkvza_mq2g256v2_wmma";
@@ -32839,15 +32918,20 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        if mqv2_prefill_reuse_enabled()
-            && self.arch_caps.is_gfx1201()
-            && batch_size >= 96
-            && !self.replay.is_recording()
-            && !self.graphs.capture_mode
-        {
-            return self.gemm_qkv_mqv2_wmma_gfx1201_bt8(
-                2, a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size,
-            );
+        // Production MQ V2 weight-reuse tile via mqv2_prefill_batch_tile.
+        // Capture/replay always keep the historical base launch contract.
+        if !self.replay.is_recording() && !self.graphs.capture_mode {
+            if mqv2_prefill_batch_tile(
+                self.arch.as_str(),
+                2,
+                MqV2PrefillProjection::Qkv,
+                batch_size,
+            ) == Some(8)
+            {
+                return self.gemm_qkv_mqv2_wmma_gfx1201_bt8(
+                    2, a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size,
+                );
+            }
         }
         self.bind_thread()?;
         let module_v2 = "gemm_qkv_hfq4g256_wmma_gfx12_mq2v2";
@@ -32935,15 +33019,20 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        if mqv2_prefill_reuse_enabled()
-            && self.arch_caps.is_gfx1151()
-            && batch_size >= 96
-            && !self.replay.is_recording()
-            && !self.graphs.capture_mode
-        {
-            return self.gemm_qkv_mqv2_wmma_gfx11_bt4(
-                2, a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size,
-            );
+        // Production MQ V2 weight-reuse tile via mqv2_prefill_batch_tile.
+        // Capture/replay always keep the historical base launch contract.
+        if !self.replay.is_recording() && !self.graphs.capture_mode {
+            if mqv2_prefill_batch_tile(
+                self.arch.as_str(),
+                2,
+                MqV2PrefillProjection::Qkv,
+                batch_size,
+            ) == Some(4)
+            {
+                return self.gemm_qkv_mqv2_wmma_gfx11_bt4(
+                    2, a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size,
+                );
+            }
         }
         self.bind_thread()?;
         let kname = "gemm_qkv_mq2g256v2_wmma";
@@ -33167,15 +33256,20 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        if mqv2_prefill_reuse_enabled()
-            && self.arch_caps.is_gfx1151()
-            && batch_size >= 96
-            && !self.replay.is_recording()
-            && !self.graphs.capture_mode
-        {
-            return self.gemm_gate_up_mqv2_wmma_gfx11_bt12(
-                2, a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
-            );
+        // Production MQ V2 weight-reuse tile via mqv2_prefill_batch_tile.
+        // Capture/replay always keep the historical base launch contract.
+        if !self.replay.is_recording() && !self.graphs.capture_mode {
+            if mqv2_prefill_batch_tile(
+                self.arch.as_str(),
+                2,
+                MqV2PrefillProjection::GateUp,
+                batch_size,
+            ) == Some(12)
+            {
+                return self.gemm_gate_up_mqv2_wmma_gfx11_bt12(
+                    2, a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
+                );
+            }
         }
         self.bind_thread()?;
         let kname = "gemm_gate_up_mq2g256v2_wmma";
@@ -33369,15 +33463,20 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        if mqv2_prefill_reuse_enabled()
-            && self.arch_caps.is_gfx1151()
-            && batch_size >= 96
-            && !self.replay.is_recording()
-            && !self.graphs.capture_mode
-        {
-            return self.gemm_mqv2_residual_wmma_gfx11_bt4(
-                2, a_raw, x, y, m, k, batch_size,
-            );
+        // Production MQ V2 weight-reuse tile via mqv2_prefill_batch_tile.
+        // Capture/replay always keep the historical base launch contract.
+        if !self.replay.is_recording() && !self.graphs.capture_mode {
+            if mqv2_prefill_batch_tile(
+                self.arch.as_str(),
+                2,
+                MqV2PrefillProjection::Residual,
+                batch_size,
+            ) == Some(4)
+            {
+                return self.gemm_mqv2_residual_wmma_gfx11_bt4(
+                    2, a_raw, x, y, m, k, batch_size,
+                );
+            }
         }
         self.bind_thread()?;
         let kname = "gemm_mq2g256v2_residual_wmma";
