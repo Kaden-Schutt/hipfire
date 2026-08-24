@@ -825,6 +825,14 @@ pub struct DeepseekV4LayerWeights {
     pub expert_gate_up_ptrs: Option<rdna_compute::GpuTensor>,
     pub expert_gate_up_stride: usize,
 
+    /// Serialized HFQ quant type of the routed-expert weights (`HfqTensorInfo::
+    /// quant_type`). The MoE GEMV dispatch was hardcoded to the MQ2-Lloyd
+    /// kernel, so a checkpoint whose experts are stored in any other format was
+    /// decoded through the wrong dequant with no error — DeepSeek V4's native
+    /// FP4 (qt 21, HFP4G32) produced pure garbage from the first token. Record
+    /// what the file actually holds so dispatch can pick the matching kernel.
+    pub expert_quant_type: u8,
+
     /// EP-shard only: the shared zeroed gate_up buffer that non-owned experts'
     /// pointers index into (→ SwiGLU(0,0)=0 ⇒ 0 routed contribution). Owned
     /// here so it is reclaimed by `free_gpu` on unload and by the staging guard
@@ -916,6 +924,7 @@ impl DeepseekV4LayerWeights {
             expert_gate_up_blob: sc(&self.expert_gate_up_blob),
             expert_gate_up_ptrs: sc(&self.expert_gate_up_ptrs),
             expert_gate_up_stride: self.expert_gate_up_stride,
+            expert_quant_type: self.expert_quant_type,
             expert_gate_up_dummy: sc(&self.expert_gate_up_dummy),
         }
     }
@@ -991,6 +1000,8 @@ impl DeepseekV4LayerWeights {
             expert_gate_up_blob: None,
             expert_gate_up_ptrs: None,
             expert_gate_up_stride: 0,
+            // 0 is not a valid quant type; the loader always overwrites it.
+            expert_quant_type: 0,
             expert_gate_up_dummy: None,
         }
     }
@@ -1246,6 +1257,20 @@ pub struct DeepseekV4Weights {
     /// `<stem>-dspark.<ext>` sidecar. Additive to `mtp_layer` — both can be
     /// present. `None` when no DSpark sidecar exists (silent no-op).
     pub dspark: Option<DsparkWeights>,
+    /// Routed-expert pager. `None` (the default) means every expert is
+    /// resident and the forward path is unchanged. `Some` means the per-layer
+    /// expert blobs are BOUNDED slot pools that the forward path must fill on
+    /// demand before each MoE dispatch — see `crate::expert_pager`.
+    ///
+    /// Behind a `Mutex` because the slot pools are shared model state while
+    /// the forward path only holds `&DeepseekV4Weights`: concurrent sequences
+    /// must not race on the same slots, and serialising is required anyway.
+    pub expert_paging: Option<std::sync::Mutex<crate::expert_pager::Ds4ExpertPaging>>,
+    /// Trained predictor for the NEXT layer's routing, enabling speculative
+    /// expert prefetch. `None` unless HIPFIRE_DEEPSEEK4_EXPERT_ADAPTER points
+    /// at an exported adapter. Mutex for the same reason as `expert_paging`:
+    /// it owns device scratch that concurrent sequences must not race on.
+    pub expert_adapter: Option<std::sync::Mutex<crate::expert_adapter::ExpertAdapter>>,
     pub _scaffold: (),
 }
 
@@ -1274,6 +1299,18 @@ impl DeepseekV4Weights {
         free_opt(gpu, &mut self.head);
         free_opt(gpu, &mut self.hc_head_fn);
         free_opt(gpu, &mut self.hc_head_base);
+        if let Some(paging) = self.expert_paging.take() {
+            paging
+                .into_inner()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .free_gpu(gpu);
+        }
+        if let Some(adapter) = self.expert_adapter.take() {
+            adapter
+                .into_inner()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .free_gpu(gpu);
+        }
         for l in self.layers.drain(..) {
             l.free_gpu(gpu);
         }

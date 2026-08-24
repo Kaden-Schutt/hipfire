@@ -477,9 +477,24 @@ fn expand_tilde(value: &str) -> PathBuf {
     PathBuf::from(value)
 }
 
+// Two vocabularies reach this field, so the policy has to accept both. The
+// arch-level resolver (`hipfire_runtime::kv_mode::resolve`) owns the asym/fwht/
+// turbo family; the loader's `StateQuant` parser owns "q8"/"int8", "f32"/"fp32"
+// and "q4"/"int4". Only "auto" and "q8" were common to the two, so every legacy
+// spelling started panicking at startup once validated config replaced the raw
+// env reads — `build_kld_ref_native` sets HIPFIRE_KV_MODE=f32 and died before
+// processing a single token.
+//
+// "f32"/"fp32" is UNQUANTIZED KV, which is exactly what a KLD reference needs:
+// an oracle whose own attention error would otherwise be folded into every
+// quant scored against it. "f16" selects DeepSeek V4's F16 compressor cache.
+//
+// "q4"/"int4"/"int8" are also loader-accepted and still absent here; they are
+// left out until something actually needs them, so this list stays a statement
+// of what is supported rather than a union of every string ever parsed.
 const KV_MODES: &[&str] = &[
-    "auto", "f32", "f16", "q8", "asym4", "asym3", "asym2", "fwht4", "fwht3", "fwht2", "turbo",
-    "turbo4", "turbo3", "turbo2",
+    "auto", "f32", "fp32", "f16", "q8", "asym4", "asym3", "asym2", "fwht4", "fwht3", "fwht2",
+    "turbo", "turbo4", "turbo3", "turbo2",
 ];
 const AUTO_ON_OFF: &[&str] = &["auto", "on", "off"];
 // `off` disables thinking outright. It resolves to a cap of 1, the engine's
@@ -5052,6 +5067,10 @@ mod tests {
         assert_eq!(
             field.parse_cli("f32").unwrap(),
             ConfigValue::String("f32".into())
+        );
+        assert_eq!(
+            field.parse_cli("fp32").unwrap(),
+            ConfigValue::String("fp32".into())
         );
         assert_eq!(
             field.parse_cli("f16").unwrap(),

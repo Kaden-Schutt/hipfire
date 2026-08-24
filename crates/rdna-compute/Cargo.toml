@@ -672,3 +672,11 @@ required-features = ["lab"]
 [[example]]
 name = "vmm_tensor_smoke"
 required-features = ["lab"]
+
+[[example]]
+name = "d2h_probe"
+required-features = ["lab"]
+
+[[example]]
+name = "hfp4_moe_indexed_parity"
+required-features = ["lab"]

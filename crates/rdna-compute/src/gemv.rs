@@ -11527,6 +11527,266 @@ impl Gpu {
         }
         result
     }
+    /// Batched (prefill) HFP4G32 MoE gate_up. `x_plain` is [N x K], UNROTATED.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deepseek4_gemv_hfp4g32_moe_gate_up_indexed_batched(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        x_plain: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        m: usize,
+        k: usize,
+        k_top: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_hfp4g32_moe_gate_up_indexed_batched",
+            kernels::GEMV_HFP4G32_MOE_GATE_UP_INDEXED_BATCHED_SRC,
+            "gemv_hfp4g32_moe_gate_up_indexed_batched",
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let xp = x_plain.buf.as_ptr();
+        let ygp = y_gate.buf.as_ptr();
+        let yup = y_up.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let kt_val = k_top as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &ygp as *const _ as *mut c_void,
+            &yup as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "gemv_hfp4g32_moe_gate_up_indexed_batched",
+            [m as u32, k_top as u32, n as u32],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(xp);
+                b.push_ptr(ygp);
+                b.push_ptr(yup);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(kt_val);
+                b
+            },
+        )
+    }
+
+    /// Batched (prefill) HFP4G32 MoE down, route-scaled residual accumulate.
+    /// `plain_batch` is [N x K_TOP x K], UNROTATED.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deepseek4_gemv_hfp4g32_moe_down_residual_scaled_indexed_batched(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        topk_weights: &GpuTensor,
+        plain_batch: &GpuTensor,
+        x_residual: &GpuTensor,
+        m: usize,
+        k: usize,
+        k_top: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_hfp4g32_moe_down_indexed_batched",
+            kernels::GEMV_HFP4G32_MOE_DOWN_INDEXED_BATCHED_SRC,
+            "gemv_hfp4g32_moe_down_residual_scaled_indexed_batched",
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let wp = topk_weights.buf.as_ptr();
+        let xp = plain_batch.buf.as_ptr();
+        let rp = x_residual.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let kt_val = k_top as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &rp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "gemv_hfp4g32_moe_down_residual_scaled_indexed_batched",
+            [m as u32, k_top as u32, n as u32],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_ptr(xp);
+                b.push_ptr(rp);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(kt_val);
+                b
+            },
+        )
+    }
+
+    /// DeepSeek V4 fused MoE gate_up GEMV for HFP4G32 experts (native FP4).
+    ///
+    /// `x_plain` must be the UNROTATED activation vector. The MQ-family
+    /// siblings take an FWHT-rotated x because their format bakes that
+    /// rotation in; HFP4G32 does not, and passing a rotated buffer here is
+    /// silently wrong rather than an error.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deepseek4_gemv_hfp4g32_moe_gate_up_indexed(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        x_plain: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        m: usize,
+        k: usize,
+        k_top: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_hfp4g32_moe_gate_up_indexed",
+            kernels::GEMV_HFP4G32_MOE_GATE_UP_INDEXED_SRC,
+            "gemv_hfp4g32_moe_gate_up_indexed",
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let xp = x_plain.buf.as_ptr();
+        let ygp = y_gate.buf.as_ptr();
+        let yup = y_up.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &ygp as *const _ as *mut c_void,
+            &yup as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        // HFP4G32: 16 B row header + 17 B per 32-weight block.
+        let hfp4_weight_bytes = m * (16 + (k / 32) * 17);
+        let bytes = (k_top) * (hfp4_weight_bytes + k * 4 + m * 4);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemv",
+            "deepseek4_gemv_hfp4g32_moe_gate_up_indexed",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemv_hfp4g32_moe_gate_up_indexed",
+            [m as u32, k_top as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(xp);
+                b.push_ptr(ygp);
+                b.push_ptr(yup);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// DeepSeek V4 MoE down GEMV for HFP4G32 experts, route-scaled residual
+    /// accumulate. `plain_batch` is the UNROTATED per-expert activation batch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deepseek4_gemv_hfp4g32_moe_down_residual_scaled_indexed(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        topk_weights: &GpuTensor,
+        plain_batch: &GpuTensor,
+        x_residual: &GpuTensor,
+        m: usize,
+        k: usize,
+        k_top: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_hfp4g32_moe_down_indexed",
+            kernels::GEMV_HFP4G32_MOE_DOWN_INDEXED_SRC,
+            "gemv_hfp4g32_moe_down_residual_scaled_indexed",
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let wp = topk_weights.buf.as_ptr();
+        let xp = plain_batch.buf.as_ptr();
+        let rp = x_residual.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &rp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        let hfp4_weight_bytes = m * (16 + (k / 32) * 17);
+        let bytes = (k_top) * (hfp4_weight_bytes + k * 4 + m * 4);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemv",
+            "deepseek4_gemv_hfp4g32_moe_down_residual_scaled_indexed",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemv_hfp4g32_moe_down_residual_scaled_indexed",
+            [m as u32, k_top as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_ptr(xp);
+                b.push_ptr(rp);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// MiniMax-M2 (arch_id=10) MoE gate_up GEMV for MQ3-Lloyd experts
     /// (3-bit + 8-entry codebook, 112 B/group). Sibling of
     /// `deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed` — only the

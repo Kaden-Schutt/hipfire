@@ -281,7 +281,10 @@
         "sha256": "fedf663e1bd2c6b8b62bc4819d54398c68e137e248863ad494e66111eb294c64",
         "size_bytes": 5996334814
       },
-      "desc": "Official DeepSeek V4 Flash 0731 MQ2-Lloyd package (arch_id=9). The cache defaults to the implemented F32 route; F16 is selectable on the certified gfx1201 MQ2R TP route. Parent-faithful profiles use low effort with temp=1/top_p=1 by default, max effort with temp=1/top_p=0.95 for agentic coding, and no hidden thinking cap. Includes the checkpoint-aligned DSpark sidecar. Was the default SKU until 2026-08-14, when MQ2R took over on the contributor's recommendation; retained and reachable as deepseek-v4-flash:mq2lloyd or deepseek-v4-flash-0731:mq2lloyd.",
+      "expert_adapter": {
+        "file": "deepseek-v4-flash-0731-adapter-r128.bin"
+      },
+      "desc": "Official DeepSeek V4 Flash 0731 MQ2-Lloyd package (arch_id=9). The cache defaults to the implemented F32 route; F16 is selectable on the certified gfx1201 MQ2R TP route. Parent-faithful profiles use low effort with temp=1/top_p=1 by default, max effort with temp=1/top_p=0.95 for agentic coding, and no hidden thinking cap. Includes the checkpoint-aligned DSpark sidecar. Routed experts may be paged when resident weights do not fit; the expert_adapter sidecar is experimental and remains off by default because its measured prefetch route regressed throughput. Was the default SKU until 2026-08-14, when MQ2R took over on the contributor's recommendation; retained and reachable as deepseek-v4-flash:mq2lloyd or deepseek-v4-flash-0731:mq2lloyd.",
       "arch_id": 9,
       "quant": "mq2lloyd"
     },

@@ -420,3 +420,109 @@ pub(crate) fn dequant_mfp4g32_p(packed: &[u8], m: usize, k: usize) -> Vec<f32> {
     }
     out
 }
+
+/// Repack DeepSeek V4's native FP4 experts into HFP4G32 with ZERO requantization.
+///
+/// The source and the container are the same format, so this is a byte move,
+/// not a quantization:
+///
+/// | property     | DS4 source            | HFP4G32               |
+/// |--------------|-----------------------|-----------------------|
+/// | element      | OCP E2M1 nibble       | OCP E2M1 nibble       |
+/// | block scale  | UE8M0, 32 logical el. | UE8M0, g=32           |
+/// | nibble order | even=low, odd=high    | even=low, odd=high    |
+/// | row scale    | (none)                | FP16, set to 1.0      |
+///
+/// HFP4G32 dequant is `row_scale_a * 2^(e-127) * E2M1_LUT[nibble]`, so with
+/// `row_scale_a = 1.0` it reduces exactly to the source's own dequant. The
+/// FWHT that distinguishes MFP4G32 is a format_flags bit applied to the
+/// ACTIVATIONS at runtime, not baked into stored weights, so leaving flags=0
+/// keeps the weights untouched.
+///
+/// Why bother: re-quantizing this checkpoint costs precision AND space —
+/// MQ4-Lloyd is 5.00 bits/param (~181 GB) versus the source's 4.26 (~156 GB),
+/// i.e. strictly worse on both axes. A passthrough is bit-exact, smaller, and
+/// needs no codebook fitting (hence no spill file).
+///
+/// `raw` is `[m, k/2]` packed nibbles; `scale` is `[m, k/32]` UE8M0 bytes.
+/// Returns `m * (16 + 17 * k/32)` bytes.
+pub(crate) fn repack_e2m1_ue8m0_to_hfp4g32(
+    raw: &[u8],
+    shape: &[usize],
+    scale: &[u8],
+    scale_shape: &[usize],
+) -> Vec<u8> {
+    let m = shape[0];
+    let k = shape[1] * 2; // each source byte packs two logical elements
+    assert!(k % 32 == 0, "HFP4G32 needs K%32==0, got K={k}");
+    let n_blocks = k / 32;
+    assert_eq!(
+        scale_shape[1], n_blocks,
+        "scale block count {} != expected {} for K={}",
+        scale_shape[1], n_blocks, k
+    );
+    let src_row_bytes = shape[1];
+    let out_row_bytes = 16 + n_blocks * 17;
+    let mut out = vec![0u8; m * out_row_bytes];
+    let one_f16 = f32_to_f16(1.0);
+    for r in 0..m {
+        let o = r * out_row_bytes;
+        // Header: row_scale_a = 1.0 makes the container's extra multiply a
+        // no-op, which is what makes this exact.
+        out[o..o + 2].copy_from_slice(&one_f16.to_le_bytes());
+        out[o + 2..o + 4].copy_from_slice(&0u16.to_le_bytes()); // row_scale_b reserved
+        out[o + 4..o + 6].copy_from_slice(&(n_blocks as u16).to_le_bytes());
+        out[o + 6] = 0u8; // format_flags: no rotation
+        out[o + 7] = 0u8;
+        for b in 0..n_blocks {
+            let po = o + 16 + b * 17;
+            out[po] = scale[r * n_blocks + b];
+            let so = r * src_row_bytes + b * 16;
+            out[po + 1..po + 17].copy_from_slice(&raw[so..so + 16]);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod fp4_passthrough_tests {
+    use super::*;
+    use crate::dequant::dequantize_e2m1_ue8m0_to_f32;
+    use crate::quant_e8::dequant_hfp4g32_row;
+
+    /// The repack must be BIT-EXACT: dequantizing the HFP4G32 output has to
+    /// reproduce the source dequant to the last bit, otherwise it is just
+    /// another lossy requantization wearing a passthrough label.
+    #[test]
+    fn repack_roundtrips_bit_exactly() {
+        let (m, k) = (4usize, 128usize); // k logical, 4 blocks of 32
+        let src_row = k / 2;
+        let n_blocks = k / 32;
+        // Deterministic pseudo-random nibbles + a spread of UE8M0 exponents.
+        let raw: Vec<u8> = (0..m * src_row)
+            .map(|i| ((i.wrapping_mul(37) ^ (i >> 3)) & 0xFF) as u8)
+            .collect();
+        let scale: Vec<u8> = (0..m * n_blocks)
+            .map(|i| (110 + (i * 7) % 30) as u8)
+            .collect();
+
+        let want = dequantize_e2m1_ue8m0_to_f32(&raw, &[m, src_row], &scale, &[m, n_blocks]).0;
+
+        let packed = repack_e2m1_ue8m0_to_hfp4g32(&raw, &[m, src_row], &scale, &[m, n_blocks]);
+        let row_bytes = 16 + n_blocks * 17;
+        let got: Vec<f32> = (0..m)
+            .flat_map(|r| dequant_hfp4g32_row(&packed[r * row_bytes..(r + 1) * row_bytes], k))
+            .collect();
+
+        assert_eq!(want.len(), got.len(), "element count");
+        for i in 0..want.len() {
+            assert_eq!(
+                want[i].to_bits(),
+                got[i].to_bits(),
+                "element {i}: source {} vs repacked {}",
+                want[i],
+                got[i]
+            );
+        }
+    }
+}

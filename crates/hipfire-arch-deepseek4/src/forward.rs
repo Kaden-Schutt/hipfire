@@ -3197,6 +3197,108 @@ fn two_stage_topk_capacity_eligible(arch: &str, max_compressed: usize) -> bool {
 /// Caller is responsible for sampler integration and KV-state
 /// advancement.
 #[allow(unused_variables, dead_code)]
+/// Per-step logit fingerprint for graph-replay bisection.
+///
+/// Comparing committed tokens is too blunt to debug a numerical divergence:
+/// greedy sampling hides any difference until it happens to flip an argmax,
+/// which on the full model was 41 tokens after the fact. This prints a
+/// checksum of every step's logits so the FIRST differing step is visible.
+///
+/// Enable with `HIPFIRE_DEEPSEEK4_LOGIT_TRACE=1`. Off by default and free
+/// when off (one `OnceLock` bool read).
+fn trace_logits(logits: &[f32], position: u32, path: &str) {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("HIPFIRE_DEEPSEEK4_LOGIT_TRACE").as_deref() == Ok("1")) {
+        return;
+    }
+    // Sum in f64 over the raw bits as well as the values: the bit sum catches
+    // a difference that cancels in the float sum.
+    let mut fsum = 0f64;
+    let mut bits: u64 = 0;
+    let mut best = (f32::NEG_INFINITY, 0usize);
+    for (i, &v) in logits.iter().enumerate() {
+        fsum += v as f64;
+        bits = bits
+            .wrapping_mul(1099511628211)
+            .wrapping_add(v.to_bits() as u64);
+        if v > best.0 {
+            best = (v, i);
+        }
+    }
+    eprintln!(
+        "[logit-trace] pos={position} path={path} argmax={} max={:.9e} sum={:.9e} fnv={bits:016x}",
+        best.1, best.0, fsum
+    );
+}
+
+/// Fingerprint the layer-0 compressor buffers after a decode step.
+///
+/// Companion to [`trace_logits`] for the graph-replay bug: the logits tell you
+/// WHEN the divergence starts, these tell you WHICH buffer carries it, and
+/// therefore which kernel. Runs OUTSIDE any captured region (after the step
+/// returns), so it observes what a graph replay actually wrote — `dump_buf`
+/// cannot, being host code inside the captured layer loop.
+///
+/// Enable with `HIPFIRE_DEEPSEEK4_STATE_TRACE=<layer>`.
+fn trace_compressor_state(state: &DeepseekV4State, gpu: &Gpu, position: u32, path: &str) {
+    use std::sync::OnceLock;
+    static L: OnceLock<Option<String>> = OnceLock::new();
+    let raw = match L.get_or_init(|| std::env::var("HIPFIRE_DEEPSEEK4_STATE_TRACE").ok()) {
+        Some(v) => v.clone(),
+        None => return,
+    };
+    // "auto" picks the first layer that actually has compressor state
+    // allocated — layer 0 does not, so a fixed index silently traces nothing.
+    let layer = if raw.trim() == "auto" {
+        match state
+            ._indexer
+            .iter()
+            .position(|ix| ix.main_kv_state.is_some())
+        {
+            Some(l) => l,
+            None => return,
+        }
+    } else {
+        match raw.trim().parse::<usize>() {
+            Ok(l) => l,
+            Err(_) => return,
+        }
+    };
+    if layer >= state._indexer.len() {
+        return;
+    }
+    let fp = |t: &Option<rdna_compute::GpuTensor>| -> String {
+        match t {
+            None => "-".to_string(),
+            Some(t) => match gpu.download_f32(t) {
+                Err(_) => "ERR".to_string(),
+                Ok(v) => {
+                    let mut h: u64 = 1469598103934665603;
+                    for x in &v {
+                        h ^= x.to_bits() as u64;
+                        h = h.wrapping_mul(1099511628211);
+                    }
+                    format!("{h:016x}")
+                }
+            },
+        }
+    };
+    let ix = &state._indexer[layer];
+    eprintln!(
+        "[state-trace] pos={position} path={path} l{layer} r={} \
+         main_kv_cache={} main_kv_state={} main_score_state={} \
+         idx_kv_cache={} idx_kv_state={} idx_score_state={}",
+        ix.compress_ratio,
+        fp(&ix.main_kv_cache),
+        fp(&ix.main_kv_state),
+        fp(&ix.main_score_state),
+        fp(&ix.indexer_kv_cache),
+        fp(&ix.indexer_kv_state),
+        fp(&ix.indexer_score_state),
+    );
+}
+
 pub fn decode_step(
     cfg: &DeepseekV4Config,
     weights: &DeepseekV4Weights,
@@ -3214,6 +3316,11 @@ pub fn decode_step(
     // Stage current token_id to device for the GPU hash-router
     // (consumed by `hash_router_normalize_f32_buf` on hash layers).
     precompute_token_id(state, gpu, token_id)?;
+    // Hash-layer experts are a pure function of token_id, so they are knowable
+    // here — before the embedding has even run. Stage them now rather than
+    // stalling at each of layers 0-2, which are the worst-cached in the model
+    // (see `prefetch_hash_experts`). No-op when paging is off.
+    prefetch_hash_experts(cfg, weights, gpu, &[token_id])?;
 
     // 1. Token embedding → initial residual streams.
     //    DeepSeek V4 uses `hc_mult = 4` parallel streams. Init pattern is
@@ -3223,8 +3330,12 @@ pub fn decode_step(
 
     let _ = decode_step_body(cfg, weights, state, gpu, token_id, position)?;
     let logits = state.logits.as_ref().unwrap();
-    gpu.download_f32(logits)
-        .map_err(|e| format!("download logits: {e:?}"))
+    let out = gpu
+        .download_f32(logits)
+        .map_err(|e| format!("download logits: {e:?}"))?;
+    trace_logits(&out, position, "direct");
+    trace_compressor_state(state, gpu, position, "direct");
+    Ok(out)
 }
 
 /// Direct-HIP heterogeneous token step for the frozen gfx1100+gfx1151 MQ2R
@@ -3470,7 +3581,7 @@ pub fn decode_step_with_graph(
     // outside Redline's typed-kernel tape. The two-stream FFN overlap is also
     // held off for the conservative single-queue tape; it can be reintroduced
     // only after the serial route passes multi-position parity.
-    if gpu.replay.is_enabled() {
+    if gpu.replay.is_enabled() && weights.expert_paging.is_none() {
         let retained_eligible = config_cache::hc_pingpong_on(&gpu.arch, cfg.mq2r)
             && !config_cache::ffn_overlap_on(&gpu.arch, cfg.mq2r);
         gpu.replay.set_forward_eligible(retained_eligible);
@@ -3687,6 +3798,15 @@ pub fn decode_step_with_graph(
                 .map_err(|e| format!("download logits (retained capture): {e:?}"));
         }
     }
+    // Routed-expert paging performs routing D2H, host file I/O, and pointer-
+    // table H2D updates inside each layer. Neither HipGraph nor retained
+    // replay may capture those token-dependent residency decisions.
+    if gpu.replay.is_enabled() && weights.expert_paging.is_some() {
+        gpu.replay.set_forward_eligible(false);
+        gpu.replay
+            .poison("DeepSeek V4 routed-expert paging is incompatible with retained replay");
+    }
+    let graph_on = graph_on && weights.expert_paging.is_none();
     // Note: prior to bc6353e the hash-routed MoE path did a d2h of
     // router scores inside the layer body — that broke HIP graph
     // capture. Replaced by `hash_router_normalize_f32_buf` which
@@ -3773,8 +3893,12 @@ pub fn decode_step_with_graph(
     // on the null stream — completes after the captured kernels finish
     // because the captured stream is observed by the device).
     let logits = state.logits.as_ref().unwrap();
-    gpu.download_f32(logits)
-        .map_err(|e| format!("download logits (graph path): {e:?}"))
+    let out = gpu
+        .download_f32(logits)
+        .map_err(|e| format!("download logits (graph path): {e:?}"))?;
+    trace_logits(&out, position, "graph");
+    trace_compressor_state(state, gpu, position, "graph");
+    Ok(out)
 }
 
 /// Update `state.attn_state_host = [slot, n_valid]` and copy to the
@@ -4088,6 +4212,11 @@ pub fn decode_step_body(
             } else {
                 ffn_routed(cfg, weights, state, gpu, layer_idx, None)?;
             }
+            // Diagnostic (default off): can this layer's hidden state predict
+            // the NEXT layer's routing? If so, prefetch is viable for the
+            // score-routed layers. Runs after the dispatch, so it cannot
+            // perturb it.
+            trace_route_lookahead(cfg, weights, state, gpu, layer_idx, token_id)?;
         } else {
             // Diagnostic: zero ffn_out to isolate attn contribution to growth.
             if state.ffn_out.is_none() {
@@ -4859,6 +4988,15 @@ fn decode_step_body_lowered(
         superop::run_layer_program(gpu, &ctx, &program, &mut bind)
             .map_err(|e| format!("ds4 L{layer_idx}: lowered run_layer_program: {e}"))?;
         dump_residual_layer_norm(gpu, state, layer_idx, position);
+        // Diagnostic (default off): can this layer's hidden state predict the
+        // NEXT layer's routing? Runs after the layer's program has completed,
+        // so it cannot perturb it.
+        if !skip_ffn {
+            trace_route_lookahead(cfg, weights, state, gpu, layer_idx, token_id)?;
+            // Speculatively stage the NEXT layer's experts so the transfer
+            // overlaps its attention block. No-op without an adapter.
+            prefetch_next_layer_experts(cfg, weights, state, gpu, layer_idx)?;
+        }
     }
     final_norm_and_head(cfg, weights, state, gpu)?;
     state.n_tokens += 1;
@@ -5431,6 +5569,483 @@ pub(crate) fn ffn_stub(
 ///     up_e   = w3[idx] @ x                  ← clamp to ±swiglu_limit (skipped)
 ///     e_out  = w2[idx] @ (silu(gate_e) * up_e * w)
 ///     ffn_out += e_out * routed_scaling_factor
+///
+/// Fill this layer's paged routed-expert slots before its MoE dispatch.
+///
+/// No-op — and no cost beyond an `Option` check — unless
+/// `HIPFIRE_DEEPSEEK4_EXPERT_CACHE_GB` engaged paging at load, and a no-op for
+/// layers left fully resident (the MTP head, DSpark stages).
+///
+/// `route` must leave the routed expert ids in `topk_indices`; it is called
+/// only when paging is on, because the resident path lets the MoE family do
+/// its own routing. `count` is how many ids to read: `k_top` for one token,
+/// `k_top * batch` for a prefill window.
+fn page_routed_experts<F>(
+    weights: &DeepseekV4Weights,
+    layer: &crate::deepseek4::DeepseekV4LayerWeights,
+    layer_idx: usize,
+    gpu: &mut Gpu,
+    count: usize,
+    n_exp: usize,
+    route: F,
+    topk_indices: &GpuTensor,
+) -> Result<(), String>
+where
+    F: FnOnce(&mut Gpu) -> Result<(), String>,
+{
+    let Some(paging) = weights.expert_paging.as_ref() else {
+        return Ok(());
+    };
+    let mut p = paging
+        .lock()
+        .map_err(|_| format!("ffn l{layer_idx}: expert pager mutex poisoned"))?;
+    if !p.pages_layer(layer_idx as u16) {
+        return Ok(());
+    }
+    // A speculative prefetch for THIS layer may still be in flight. Draining
+    // here is what converts the overlap into a win: everything between the
+    // issue and this point ran while the transfer was in progress.
+    let _ = p.wait_prefetch(gpu);
+    route(gpu)?;
+    let gate_up_blob = layer
+        .expert_gate_up_blob
+        .as_ref()
+        .ok_or_else(|| format!("ffn l{layer_idx}: paged gate_up pool missing"))?;
+    let gate_up_ptrs = layer
+        .expert_gate_up_ptrs
+        .as_ref()
+        .ok_or_else(|| format!("ffn l{layer_idx}: paged gate_up ptr table missing"))?;
+    let w2_blob = layer
+        .expert_w2_blob
+        .as_ref()
+        .ok_or_else(|| format!("ffn l{layer_idx}: paged w2 pool missing"))?;
+    let w2_ptrs = layer
+        .expert_w2_ptrs
+        .as_ref()
+        .ok_or_else(|| format!("ffn l{layer_idx}: paged w2 ptr table missing"))?;
+    p.page_dispatch(
+        layer_idx as u16,
+        topk_indices,
+        count,
+        n_exp,
+        gate_up_blob,
+        gate_up_ptrs,
+        layer.expert_gate_up_stride,
+        w2_blob,
+        w2_ptrs,
+        layer.expert_w2_stride,
+        gpu,
+    )
+    .map_err(|e| format!("ffn l{layer_idx}: {e}"))
+}
+
+/// Harvest `(hidden, router_scores)` pairs per layer for the expert-prefetch
+/// adapter study. `HIPFIRE_DEEPSEEK4_ADAPTER_DUMP=<dir>`; default off.
+///
+/// Writes `h_L<layer>.bin` (`[rows, hidden]` f16) and `s_L<layer>.bin`
+/// (`[rows, n_exp]` f16), appended in position order. Rows across layers stay
+/// aligned because every layer sees the same positions in the same order, so
+/// the offline step pairs layer L's hidden with layer L+1's scores by row index.
+///
+/// Why this and not the training-free predictor already measured: running the
+/// real `gate_{L+1}` on `h_L` scores only 27.6% recall on ds4, because mHC
+/// replaces the residual stream with 4 Sinkhorn-mixed streams — there is no
+/// slowly-evolving residual to read through. The literature (SpecPrefetch,
+/// ProMoE, ExpertFlow) instead TRAINS a small predictor; SpecPrefetch reports
+/// ~84% ExpertRecall@6 with a rank-r adapter, though on 64-expert DeepSeek-VL2
+/// rather than ds4's 256-choose-6. This dump exists to settle whether that
+/// transfers.
+///
+/// f16 halves the volume: hidden dominates at `4096 * 2 B` per position per
+/// layer, so 40 score-routed layers cost ~328 KB/position.
+fn dump_adapter_pairs(
+    layer: &crate::deepseek4::DeepseekV4LayerWeights,
+    pbs: &PrefillBatchScratch,
+    layer_idx: usize,
+    batch_size: usize,
+    hidden: usize,
+    n_exp: usize,
+    gpu: &mut Gpu,
+) -> Result<(), String> {
+    use std::io::Write;
+    static DIR: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let Some(dir) = DIR
+        .get_or_init(|| {
+            let d = std::env::var("HIPFIRE_DEEPSEEK4_ADAPTER_DUMP").ok()?;
+            let _ = std::fs::create_dir_all(&d);
+            eprintln!("deepseek4: adapter pair dump -> {d}");
+            Some(d)
+        })
+        .as_ref()
+    else {
+        return Ok(());
+    };
+    if batch_size == 0 {
+        return Ok(());
+    }
+
+    let h = gpu
+        .download_f32(&pbs.ffn_x_plain_batch)
+        .map_err(|e| format!("adapter dump hidden l{layer_idx}: {e:?}"))?;
+    let s = gpu
+        .download_f32(&pbs.moe_scores_batch)
+        .map_err(|e| format!("adapter dump scores l{layer_idx}: {e:?}"))?;
+
+    // Buffers are allocated at max_batch, so take only the live rows.
+    let write_f16 = |path: String, src: &[f32], rows: usize, cols: usize| -> Result<(), String> {
+        let mut out: Vec<u8> = Vec::with_capacity(rows * cols * 2);
+        for r in 0..rows {
+            let base = r * cols;
+            if base + cols > src.len() {
+                break;
+            }
+            for &v in &src[base..base + cols] {
+                out.extend_from_slice(&half::f16::from_f32(v).to_le_bytes());
+            }
+        }
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|e| format!("adapter dump open {path}: {e}"))?;
+        f.write_all(&out)
+            .map_err(|e| format!("adapter dump write {path}: {e}"))
+    };
+
+    // Optional: the PRE-MIX 4-stream residual [B, hc_mult, hidden]. The router
+    // (and therefore `h` above) sees only the post-mHC-mix projection, so the
+    // mixing may be discarding signal the next layer's routing depends on --
+    // which is exactly what defeated the training-free predictor. Striding
+    // layers keeps the 4x volume affordable while still fitting more rows per
+    // feature, which a 16384-wide fit needs.
+    let stride: usize = std::env::var("HIPFIRE_DEEPSEEK4_ADAPTER_STREAM_STRIDE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if stride > 0 && layer_idx % stride == 0 {
+        let st = gpu
+            .download_f32(&pbs.streams_batch)
+            .map_err(|e| format!("adapter dump streams l{layer_idx}: {e:?}"))?;
+        let per_row = st.len() / pbs.streams_batch.shape.first().copied().unwrap_or(1).max(1);
+        write_f16(
+            format!("{dir}/x_L{layer_idx}.bin"),
+            &st,
+            batch_size,
+            per_row.min(4 * hidden),
+        )?;
+    }
+
+    write_f16(format!("{dir}/h_L{layer_idx}.bin"), &h, batch_size, hidden)?;
+    write_f16(format!("{dir}/s_L{layer_idx}.bin"), &s, batch_size, n_exp)?;
+
+    // The live router selects bias-aware -- top-k over (scores + gate_bias) --
+    // so an offline study scoring against top-k of RAW scores measures the
+    // wrong target. gate_bias is a per-layer constant, so emit it once.
+    let bpath = format!("{dir}/b_L{layer_idx}.bin");
+    if !std::path::Path::new(&bpath).exists() {
+        if let Some(bias) = layer.gate_bias.as_ref() {
+            if let Ok(b) = gpu.download_f32(bias) {
+                let n = n_exp.min(b.len());
+                write_f16(bpath, &b, 1, n)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Speculatively stage layer `L+1`'s experts using the trained adapter.
+///
+/// Runs after layer L's program, while `ffn_x_plain` still holds layer L's FFN
+/// input, and issues an ASYNC fetch so the transfer overlaps layer L+1's
+/// attention block. `page_routed_experts` waits on it before reading.
+///
+/// Why bother: expert I/O is 41.9% of decode wall time at an 8 GiB budget, and
+/// no training-free predictor can name it in advance (recency 0.1% of misses,
+/// token-conditioned 13.0%, real gate on stale hidden 4.2%). The trained
+/// rank-128 adapter reaches 75.6% recall@6.
+///
+/// Best-effort throughout: a wrong prediction wastes a slot and some bandwidth,
+/// never correctness -- the frozen native router still makes the real selection
+/// at the next layer, and `ensure_resident` fetches whatever was missed.
+fn prefetch_next_layer_experts(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &DeepseekV4State,
+    gpu: &mut Gpu,
+    layer_idx: usize,
+) -> Result<(), String> {
+    let (Some(paging), Some(adapter)) = (
+        weights.expert_paging.as_ref(),
+        weights.expert_adapter.as_ref(),
+    ) else {
+        return Ok(());
+    };
+    let next = layer_idx + 1;
+    if next >= cfg.num_hidden_layers || next < cfg.num_hash_layers {
+        return Ok(()); // hash layers are staged exactly from the token id
+    }
+    let Some(h) = state.ffn_x_plain.as_ref() else {
+        return Ok(());
+    };
+    // Stage top-M rather than top-k: at 75.6% recall@6 a k-sized fetch still
+    // leaves ~1.5 experts to stall on, and slots are cheap next to a stall.
+    let top_m: usize = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_PREFETCH_TOPM")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(cfg.num_experts_per_tok + 2);
+
+    let next_layer = weights.resolve_layer(next);
+    let experts = {
+        let mut ad = adapter
+            .lock()
+            .map_err(|_| "prefetch: adapter mutex poisoned".to_string())?;
+        let Some(idx) = ad.entry_for(layer_idx) else {
+            return Ok(());
+        };
+        // The live router selects over (scores + gate_bias); ranking without
+        // the bias predicts a different top-k than the one actually taken.
+        // Cached host-side -- it is a per-layer constant and fetching it every
+        // token would add ~40 pipeline drains.
+        let bias = ad
+            .cached_bias(next, next_layer.gate_bias.as_ref(), gpu)
+            .map(|b| b.to_vec());
+        match ad.predict_topm(idx, h, bias.as_deref(), top_m, gpu) {
+            Ok(e) => e,
+            Err(_) => return Ok(()),
+        }
+    };
+
+    let (Some(gate_up_blob), Some(w2_blob)) = (
+        next_layer.expert_gate_up_blob.as_ref(),
+        next_layer.expert_w2_blob.as_ref(),
+    ) else {
+        return Ok(());
+    };
+    let mut p = paging
+        .lock()
+        .map_err(|_| "prefetch: pager mutex poisoned".to_string())?;
+    if !p.pages_layer(next as u16) {
+        return Ok(());
+    }
+    let _ = p.prefetch_experts(
+        next as u16,
+        crate::expert_pager::ExpertBlobRole::GateUp,
+        &experts,
+        gate_up_blob,
+        next_layer.expert_gate_up_ptrs.as_ref().unwrap(),
+        next_layer.expert_gate_up_stride,
+        gpu,
+    );
+    let _ = p.prefetch_experts(
+        next as u16,
+        crate::expert_pager::ExpertBlobRole::Down,
+        &experts,
+        w2_blob,
+        next_layer.expert_w2_ptrs.as_ref().unwrap(),
+        next_layer.expert_w2_stride,
+        gpu,
+    );
+    Ok(())
+}
+
+/// Diagnostic: how well does layer L's hidden state predict layer L+1's routing?
+///
+/// `HIPFIRE_DEEPSEEK4_ROUTE_LOOKAHEAD_TRACE=<path>` writes one
+/// `pred,<layer>,<expert>,<token>` row per predicted expert, to be joined
+/// offline against the actual selections in the expert access trace.
+///
+/// Why this and not the predictors already rejected: those were keyed on
+/// HISTORY (previous pass, token statistics) and both failed — recency is
+/// redundant with LRU (0.1% of misses), and routing at score layers is
+/// context- not token-determined (1.1% stability). This one is STRUCTURAL: it
+/// runs the real `gate_{L+1}` weights, which are always resident and cost a
+/// 4096x256 GEMV, against the residual stream one layer early. The residual
+/// stream changes slowly between adjacent layers, so `gate(h_L)` may select
+/// most of what `gate(h_{L+1})` will.
+///
+/// If it does, prefetch becomes possible for the 40 score-routed layers:
+/// predicting at the END of layer L's FFN leaves layer L+1's whole attention
+/// block (~1.7 ms) to stage into, against 0.85 ms of pread and 0.58 ms of copy.
+/// That is the overlap window the shared expert failed to provide (it costs
+/// 0 ms).
+///
+/// Diagnostic only, default off. Runs AFTER layer L's dispatch has completed,
+/// so clobbering the shared routing scratch is harmless — layer L+1 recomputes
+/// it regardless.
+fn trace_route_lookahead(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    layer_idx: usize,
+    token_id: u32,
+) -> Result<(), String> {
+    use std::io::Write;
+    static PATH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let Some(path) = PATH
+        .get_or_init(|| std::env::var("HIPFIRE_DEEPSEEK4_ROUTE_LOOKAHEAD_TRACE").ok())
+        .as_ref()
+    else {
+        return Ok(());
+    };
+    let next = layer_idx + 1;
+    // Only score-routed successors are interesting; hash layers are already
+    // exactly known from the token id.
+    if next >= cfg.num_hidden_layers || next < cfg.num_hash_layers {
+        return Ok(());
+    }
+
+    // Score layer `next` against the CURRENT layer's ffn_x_rot — that staleness
+    // is precisely the approximation under test.
+    moe_route(cfg, weights, state, gpu, next)?;
+    let k_top = cfg.num_experts_per_tok;
+    let next_layer = weights.resolve_layer(next);
+    let Some(bias_dev) = next_layer.gate_bias.as_ref() else {
+        return Ok(());
+    };
+    let scores_dev = state.router_scores.as_ref().unwrap();
+    let topk_idx_dev = state.moe_topk_indices.as_ref().unwrap();
+    let topk_w_dev = state.moe_topk_weights.as_ref().unwrap();
+    let route_scale: f32 = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_ROUTE_SCALE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2.2);
+    gpu.deepseek4_moe_topk_bias_aware_f32(
+        scores_dev,
+        bias_dev,
+        topk_idx_dev,
+        topk_w_dev,
+        cfg.n_routed_experts as i32,
+        k_top as i32,
+        route_scale,
+    )
+    .map_err(|e| format!("lookahead topk l{next}: {e:?}"))?;
+
+    // Indices are i32 on device; read them back the same way the pager does.
+    let mut raw = vec![0u8; k_top * 4];
+    gpu.bind_thread().map_err(|e| format!("{e:?}"))?;
+    gpu.hip
+        .memcpy_dtoh(&mut raw, &topk_idx_dev.buf)
+        .map_err(|e| format!("lookahead d2h l{next}: {e:?}"))?;
+    let ids: Vec<i32> = raw
+        .chunks_exact(4)
+        .map(|c| i32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    static SINK: std::sync::OnceLock<std::sync::Mutex<Option<std::fs::File>>> =
+        std::sync::OnceLock::new();
+    let sink = SINK.get_or_init(|| std::sync::Mutex::new(std::fs::File::create(path).ok()));
+    if let Ok(mut g) = sink.lock() {
+        if let Some(f) = g.as_mut() {
+            for e in ids.iter().take(k_top) {
+                let _ = writeln!(f, "pred,{next},{e},{token_id}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Stage the hash-routed layers' experts before the pass reaches them.
+///
+/// Hash layers (`0..num_hash_layers`) pick experts through a static
+/// `tid2eid[token_id]` table, so their access stream carries no temporal
+/// locality at all. Measured on a 300-token decode at 28 slots/blob: layers
+/// 0-2 hit 14.8-16.1% against a 59.4% model average, and account for 18.6% of
+/// every miss while being 7% of the layers.
+///
+/// No cache policy fixes that, and both obvious ones were measured and
+/// rejected: pinning the hottest experts is non-monotonic in N and worth under
+/// +2.4pp, and funding extra hash slots out of the score-routed layers is net
+/// NEGATIVE (+346 misses) because those layers outnumber these 40:3.
+///
+/// What does work is that the selection needs no hidden state — unlike the
+/// score-routed layers, whose routing depends on the activations at that layer
+/// and therefore cannot be known before the pass arrives. These misses can't be
+/// cached away, but they CAN be lifted off the critical path.
+///
+/// Best-effort and idempotent: the per-layer `page_routed_experts` still runs
+/// and simply finds the experts resident. Pools are keyed per (layer, role), so
+/// nothing dispatched between here and layer 0 can evict what we stage. A
+/// request larger than the pool is truncated rather than failed — the remainder
+/// is paged normally by the layer itself.
+fn prefetch_hash_experts(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    gpu: &mut Gpu,
+    token_ids: &[u32],
+) -> Result<(), String> {
+    let Some(paging) = weights.expert_paging.as_ref() else {
+        return Ok(());
+    };
+    if cfg.num_hash_layers == 0 || token_ids.is_empty() {
+        return Ok(());
+    }
+    // Opt-out. Staging is advisory, so disabling it must change timing only —
+    // that equivalence is what the neutrality check asserts, by diffing decoded
+    // output with the flag on and off.
+    if hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_HASH_PREFETCH")
+        .map(|v| v == "0")
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    let k = cfg.num_experts_per_tok;
+    let mut p = paging
+        .lock()
+        .map_err(|_| "prefetch_hash: expert pager mutex poisoned".to_string())?;
+    // Tag the access trace with the token being decoded (no-op unless tracing).
+    p.set_trace_token(token_ids[0]);
+    let slots = p.slots_per_blob();
+    let mut experts: Vec<u16> = Vec::with_capacity(token_ids.len() * k);
+    for layer_idx in 0..cfg.num_hash_layers {
+        if !p.pages_layer(layer_idx as u16) {
+            continue;
+        }
+        let layer = weights.resolve_layer(layer_idx);
+        if layer.tid2eid_host.is_empty() {
+            continue;
+        }
+        let (Some(gate_up_blob), Some(gate_up_ptrs), Some(w2_blob), Some(w2_ptrs)) = (
+            layer.expert_gate_up_blob.as_ref(),
+            layer.expert_gate_up_ptrs.as_ref(),
+            layer.expert_w2_blob.as_ref(),
+            layer.expert_w2_ptrs.as_ref(),
+        ) else {
+            continue;
+        };
+        experts.clear();
+        for &t in token_ids {
+            let row = (t as usize) * k;
+            // Out-of-range ids are the real path's error to report, not ours —
+            // staging is advisory, so skip and let it fail there with context.
+            if row + k > layer.tid2eid_host.len() {
+                continue;
+            }
+            for &e in &layer.tid2eid_host[row..row + k] {
+                let e = e as u16;
+                if experts.len() < slots && !experts.contains(&e) {
+                    experts.push(e);
+                }
+            }
+        }
+        if experts.is_empty() {
+            continue;
+        }
+        p.page_experts_both(
+            layer_idx as u16,
+            &experts,
+            gate_up_blob,
+            gate_up_ptrs,
+            layer.expert_gate_up_stride,
+            w2_blob,
+            w2_ptrs,
+            layer.expert_w2_stride,
+            gpu,
+        )
+        .map_err(|e| format!("prefetch_hash l{layer_idx}: {e}"))?;
+    }
+    Ok(())
+}
+
 pub(crate) fn ffn_routed(
     cfg: &DeepseekV4Config,
     weights: &DeepseekV4Weights,
@@ -5531,6 +6146,34 @@ pub(crate) fn ffn_routed(
         let rot_batch = state.moe_rot_batch.as_ref().unwrap();
         let down_expanded = state.moe_down_expert_outputs.as_ref().unwrap();
 
+        // Routed-expert paging: the family's first step is the bias-aware
+        // top-k, but a paged blob has to be FILLED before the expert GEMVs
+        // read it, so run that top-k here to learn the routing, page the
+        // experts in, and let the family re-run it. The kernel is tiny and
+        // deterministic — same scores and bias in, same indices out — so the
+        // duplicate launch costs a little time and changes nothing.
+        page_routed_experts(
+            weights,
+            layer,
+            layer_idx,
+            gpu,
+            k_top,
+            cfg.n_routed_experts,
+            |gpu| {
+                gpu.deepseek4_moe_topk_bias_aware_f32(
+                    scores_dev,
+                    bias_dev,
+                    topk_idx_dev,
+                    topk_w_dev,
+                    cfg.n_routed_experts as i32,
+                    k_top as i32,
+                    route_scale_override,
+                )
+                .map_err(|e| format!("paged topk l{layer_idx}: {e:?}"))
+            },
+            topk_idx_dev,
+        )?;
+
         // Bias-aware top-k select + the routed MQ2-Lloyd experts now run through
         // the centralized MoE family (Ship 4.3): bias-aware top-k -> indexed
         // gate_up -> batched silu*mul*clamp -> batched FWHT rotate -> indexed
@@ -5557,6 +6200,8 @@ pub(crate) fn ffn_routed(
             nonowned_gate_up_dummy: layer.expert_gate_up_dummy.as_ref(),
             batch_size: 1,
             x_rot: ffn_x_rot,
+            x_plain: state.ffn_x_plain.as_ref().unwrap(),
+            expert_quant_type: layer.expert_quant_type,
             ffn_out: out_target,
             scores: scores_dev,
             gate_bias: bias_dev,
@@ -5749,13 +6394,44 @@ fn ffn_hash_routed(
     }
     dump_moe_route_if_enabled(gpu, layer_idx, topk_idx_dev, topk_w_dev)?;
 
+    // Routed-expert paging. Routing already ran above and left the ids in
+    // `topk_idx_dev`, so unlike the score-routed path there is nothing to
+    // re-run here — just page what it selected.
+    page_routed_experts(
+        weights,
+        layer,
+        layer_idx,
+        gpu,
+        k_top,
+        n_exp,
+        |_gpu| Ok(()),
+        topk_idx_dev,
+    )?;
+
     let gate_up_ptrs = layer.expert_gate_up_ptrs.as_ref().unwrap();
     let w2_ptrs = layer.expert_w2_ptrs.as_ref().unwrap();
     let gate_batch = state.moe_gate_batch.as_ref().unwrap();
     let up_batch = state.moe_up_batch.as_ref().unwrap();
     let rot_batch = state.moe_rot_batch.as_ref().unwrap();
 
-    if let Some(native) = weights.mq2r_backend.bias_aware_native_backend() {
+    // Native FP4 experts consume plain activations; the Lloyd backends consume
+    // activations transformed to match their weight layout.
+    let fp4 = layer.expert_quant_type == 21;
+    let native = weights.mq2r_backend.bias_aware_native_backend();
+
+    if fp4 {
+        gpu.deepseek4_gemv_hfp4g32_moe_gate_up_indexed(
+            gate_up_ptrs,
+            topk_idx_dev,
+            state.ffn_x_plain.as_ref().unwrap(),
+            gate_batch,
+            up_batch,
+            2 * im,
+            cfg.hidden_size,
+            k_top,
+        )
+        .map_err(|e| format!("fused gate_up fp4 hash l{layer_idx}: {e:?}"))?;
+    } else if let Some(native) = native {
         native
             .gate_up(
                 gpu,
@@ -5793,21 +6469,33 @@ fn ffn_hash_routed(
         cfg.swiglu_limit,
     )
     .map_err(|e| format!("deepseek4_silu_mul_clamp batched hash l{layer_idx}: {e:?}"))?;
-    if let Some(native) = weights.mq2r_backend.bias_aware_native_backend() {
-        native
-            .rotate_x_batched(gpu, gate_batch, rot_batch, im, k_top)
-            .map_err(|e| format!("native rotate hash l{layer_idx}: {e}"))?;
-    } else {
-        gpu.rotate_x_mq_batched(gate_batch, rot_batch, im, k_top)
-            .map_err(|e| format!("rotate batched hash l{layer_idx}: {e:?}"))?;
+    if !fp4 {
+        if let Some(native) = native {
+            native
+                .rotate_x_batched(gpu, gate_batch, rot_batch, im, k_top)
+                .map_err(|e| format!("native rotate hash l{layer_idx}: {e}"))?;
+        } else {
+            gpu.rotate_x_mq_batched(gate_batch, rot_batch, im, k_top)
+                .map_err(|e| format!("rotate batched hash l{layer_idx}: {e:?}"))?;
+        }
     }
 
     // EP: redirect the route-scaled accumulation into the zeroed partial
-    // (routed-only) instead of state.ffn_out (shared+routed). The down kernel
-    // accumulates `out += w_k · down_k`, so a zeroed partial yields exactly
-    // this rank's owned routed contribution.
+    // (routed-only) instead of state.ffn_out (shared+routed).
     let out_target = routed_out.unwrap_or(ffn_out);
-    if let Some(native) = weights.mq2r_backend.bias_aware_native_backend() {
+    if fp4 {
+        gpu.deepseek4_gemv_hfp4g32_moe_down_residual_scaled_indexed(
+            w2_ptrs,
+            topk_idx_dev,
+            topk_w_dev,
+            gate_batch,
+            out_target,
+            cfg.hidden_size,
+            im,
+            k_top,
+        )
+        .map_err(|e| format!("fused down fp4 hash l{layer_idx}: {e:?}"))?;
+    } else if let Some(native) = native {
         native
             .down_residual_scaled(
                 gpu,
@@ -11009,6 +11697,7 @@ pub(crate) fn attention_block_batched_mixed(
 /// DeepSeek V4's hash routing uses static tid2eid lookup which is skipped at
 /// quant time per the load_weights logic; falls back to shared-only.
 #[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn ffn_batched(
     cfg: &DeepseekV4Config,
     layer: &crate::deepseek4::DeepseekV4LayerWeights,
@@ -11019,6 +11708,9 @@ pub(crate) fn ffn_batched(
     hash_routing: bool,
     batch_size: usize,
     tokens: &[u32],
+    // Routed-expert pager, or `None` for a fully-resident layer. The MTP head
+    // and DSpark stages are never paged, so they pass `None` unconditionally.
+    paging: Option<&std::sync::Mutex<crate::expert_pager::Ds4ExpertPaging>>,
 ) -> Result<(), String> {
     let ffn_norm = layer.ffn_norm.as_ref().unwrap();
     let shared_w1 = layer.shared_w1.as_ref().unwrap();
@@ -11215,6 +11907,16 @@ pub(crate) fn ffn_batched(
     gpu.sqrt_softplus_f32(&pbs.moe_scores_batch)
         .map_err(|e| format!("sqrt_softplus_f32 moe scores l{layer_idx}: {e:?}"))?;
 
+    // Harvest (hidden, router-scores) pairs for the expert-prefetch adapter
+    // study. Default off; harvested from PREFILL because it runs ~20x faster
+    // than paged decode (~150 vs ~7 tok/s), and one batched pass yields one
+    // example per position per layer.
+    //
+    // Pairing happens offline by shifting the layer index: layer L's hidden
+    // against layer L+1's scores. Dumping BOTH at every layer means one hook
+    // site supplies both sides.
+    dump_adapter_pairs(layer, pbs, layer_idx, batch_size, hidden, n_exp, gpu)?;
+
     // Routing + routed experts + combine now run through the centralized MoE
     // family (Ship 4.3 prefill). The router GEMV + sqrt_softplus (above) and the
     // shared expert stay model-owned; the family routes (hash or bias-aware),
@@ -11247,6 +11949,38 @@ pub(crate) fn ffn_batched(
         hipfire_dispatch::families::moe::MoePrefillRouting::BiasAware { gate_bias }
     };
 
+    // Routed-expert paging: a prefill chunk routes to far more experts than a
+    // bounded pool holds, so run the MoE over contiguous token windows whose
+    // expert union fits. Each window is a row range of the batch tensors, so
+    // it is a `sub_offset` view and its rows compute exactly what they would
+    // have computed inside the full batch.
+    if let Some(paging) = paging {
+        let paged = {
+            let p = paging
+                .lock()
+                .map_err(|_| format!("ffn_batched l{layer_idx}: expert pager mutex poisoned"))?;
+            p.pages_layer(layer_idx as u16)
+        };
+        if paged {
+            return ffn_batched_routed_paged(
+                paging,
+                layer,
+                pbs,
+                gpu,
+                mq2r_backend.uses_atomic_moe_down(),
+                layer_idx,
+                &routing,
+                hidden,
+                im,
+                n_exp,
+                k_top,
+                batch_size,
+                route_scale,
+                cfg.swiglu_limit,
+            );
+        }
+    }
+
     let moe_params = hipfire_dispatch::families::moe::MoeBiasAwarePrefillParams {
         hidden,
         mi: im,
@@ -11264,6 +11998,8 @@ pub(crate) fn ffn_batched(
         expert_gate_up_ptrs: gate_up_ptrs,
         expert_down_ptrs: w2_ptrs,
         x_rot: &pbs.ffn_x_rot_batch,
+        x_plain: &pbs.ffn_x_plain_batch,
+        expert_quant_type: layer.expert_quant_type,
         ffn_out: &pbs.ffn_out_batch,
         expert_token_counts: &pbs.moe_expert_token_counts,
         expert_offsets: &pbs.moe_expert_offsets,
@@ -11281,6 +12017,292 @@ pub(crate) fn ffn_batched(
         .run_bias_aware_prefill(gpu, &moe_params)
         .map_err(|e| format!("ffn_batched l{layer_idx} dispatch: {e}"))?;
 
+    Ok(())
+}
+
+/// Routed-expert MoE for one prefill chunk with paging on.
+///
+/// BAND-MAJOR. The scatter orders slots by expert, so a set of experts is a
+/// contiguous tile range. We scatter once, then walk expert bands sized to the
+/// slot pool: each expert is read exactly ONCE per chunk.
+///
+/// The previous token-window scheme read each expert once per WINDOW, and
+/// contiguous token windows have essentially uncorrelated expert unions, so
+/// its redundancy grew with prompt length — measured 1.07x at 11 tokens but
+/// 9.06x at 365. Band-major is 1.0x by construction at any length.
+///
+/// Two passes because gate_up and down live in SEPARATE pools, so a band's
+/// gate_up residency does not conflict with any band's down residency, and
+/// SwiGLU is not idempotent — it must run once, between the passes, over the
+/// whole chunk.
+#[allow(clippy::too_many_arguments)]
+fn ffn_batched_routed_paged(
+    paging: &std::sync::Mutex<crate::expert_pager::Ds4ExpertPaging>,
+    layer: &crate::deepseek4::DeepseekV4LayerWeights,
+    pbs: &PrefillBatchScratch,
+    gpu: &mut Gpu,
+    uses_atomic_moe_down: bool,
+    layer_idx: usize,
+    routing: &hipfire_dispatch::families::moe::MoePrefillRouting,
+    hidden: usize,
+    im: usize,
+    n_exp: usize,
+    k_top: usize,
+    batch_size: usize,
+    route_scale: f32,
+    swiglu_limit: f32,
+) -> Result<(), String> {
+    let params = hipfire_dispatch::families::moe::MoeBiasAwarePrefillParams {
+        hidden,
+        mi: im,
+        n_exp,
+        k_top,
+        batch_size,
+        route_scale,
+        swiglu_limit,
+        uses_atomic_moe_down,
+        layer_idx,
+        routing: match routing {
+            hipfire_dispatch::families::moe::MoePrefillRouting::Hash { tid2eid, tokens } => {
+                hipfire_dispatch::families::moe::MoePrefillRouting::Hash { tid2eid, tokens }
+            }
+            hipfire_dispatch::families::moe::MoePrefillRouting::BiasAware { gate_bias } => {
+                hipfire_dispatch::families::moe::MoePrefillRouting::BiasAware { gate_bias }
+            }
+        },
+        scores: &pbs.moe_scores_batch,
+        topk_indices: &pbs.moe_topk_indices_batch,
+        topk_weights: &pbs.moe_topk_weights_batch,
+        expert_gate_up_ptrs: layer
+            .expert_gate_up_ptrs
+            .as_ref()
+            .ok_or_else(|| format!("ffn_batched l{layer_idx}: paged gate_up ptr table missing"))?,
+        expert_down_ptrs: layer
+            .expert_w2_ptrs
+            .as_ref()
+            .ok_or_else(|| format!("ffn_batched l{layer_idx}: paged w2 ptr table missing"))?,
+        x_rot: &pbs.ffn_x_rot_batch,
+        x_plain: &pbs.ffn_x_plain_batch,
+        expert_quant_type: layer.expert_quant_type,
+        ffn_out: &pbs.ffn_out_batch,
+        expert_token_counts: &pbs.moe_expert_token_counts,
+        expert_offsets: &pbs.moe_expert_offsets,
+        sorted_slot_index: &pbs.moe_sorted_slot_index,
+        expert_tile_ids: &pbs.moe_expert_tile_ids,
+        inverse_perm: &pbs.moe_inverse_perm,
+        y_gate_up_grouped: &pbs.moe_y_gate_up_grouped,
+        y_down_grouped: &pbs.moe_y_down_grouped,
+        gate_batch: &pbs.moe_gate_batch,
+        up_batch: &pbs.moe_up_batch,
+        rot_batch: &pbs.moe_rot_batch,
+        down_expert_outputs: &pbs.moe_down_expert_outputs,
+    };
+    let family = hipfire_runtime::llama::moe_family();
+
+    // 1. Route + scatter once. After this, slots are ordered by expert.
+    family
+        .prefill_scatter(gpu, &params)
+        .map_err(|e| format!("ffn_batched l{layer_idx} paged scatter: {e}"))?;
+
+    // 2. Read the per-tile expert ids and cut them into bands that fit the pool.
+    let n_tiles = (batch_size * k_top + n_exp * hipfire_dispatch::pipeline::GROUPED_BLOCK_M)
+        / hipfire_dispatch::pipeline::GROUPED_BLOCK_M;
+    let mut p = paging
+        .lock()
+        .map_err(|_| format!("ffn_batched l{layer_idx}: expert pager mutex poisoned"))?;
+    let miss_before = p.stats().1;
+    let tile_experts: Vec<i32> = p
+        .read_tile_experts(&pbs.moe_expert_tile_ids, n_tiles, gpu)
+        .map_err(|e| format!("ffn_batched l{layer_idx}: {e}"))?
+        .to_vec();
+    let bands = crate::expert_pager::plan_expert_bands(&tile_experts, n_exp, p.slots_per_blob());
+
+    let gate_up_blob = layer
+        .expert_gate_up_blob
+        .as_ref()
+        .ok_or_else(|| format!("ffn_batched l{layer_idx}: paged gate_up pool missing"))?;
+    let w2_blob = layer
+        .expert_w2_blob
+        .as_ref()
+        .ok_or_else(|| format!("ffn_batched l{layer_idx}: paged w2 pool missing"))?;
+
+    // Native FP4 (qt 21) cannot use the band pipeline at all: the grouped GEMM
+    // behind `prefill_gate_up_band` / `prefill_down_band` has only MQ2-Lloyd
+    // arms (`dispatch_grouped_lloyd`), so FP4 bytes get decoded through a Lloyd
+    // codebook. That produced NaN in the FIRST prefill layer, which poisoned the
+    // residual stream for every token — the decode-side FP4 arms were correct
+    // but were handed NaN before they ever ran.
+    //
+    // Route FP4 through the indexed-batched kernels instead (parity-verified to
+    // ~1e-6). Those need every expert of the tokens they process resident at
+    // once, so walk the batch in TOKEN chunks whose distinct-expert set fits the
+    // pool, rather than in expert bands over the scattered buffer. The scatter
+    // above still ran (it also computes the routing we read here); only its
+    // grouped layout goes unused.
+    if layer.expert_quant_type == 21 {
+        let slots = p.slots_per_blob();
+        let idx_host: Vec<i32> = p
+            .read_tile_experts(params.topk_indices, batch_size * k_top, gpu)
+            .map_err(|e| format!("ffn_batched l{layer_idx} fp4 topk readback: {e}"))?
+            .to_vec();
+
+        let mut t0 = 0usize;
+        while t0 < batch_size {
+            // Grow the chunk while its expert union still fits the pool.
+            let mut experts: Vec<u16> = Vec::new();
+            let mut t1 = t0;
+            while t1 < batch_size {
+                let mut cand = experts.clone();
+                for r in 0..k_top {
+                    let e = idx_host[t1 * k_top + r];
+                    if e >= 0 && (e as usize) < n_exp && !cand.contains(&(e as u16)) {
+                        cand.push(e as u16);
+                    }
+                }
+                if cand.len() > slots && t1 > t0 {
+                    break; // committing this token would overflow the pool
+                }
+                experts = cand;
+                t1 += 1;
+            }
+            let n = t1 - t0;
+
+            let x_chunk = params.x_plain.sub_offset(t0 * hidden, n * hidden);
+            let idx_chunk = params.topk_indices.sub_offset(t0 * k_top, n * k_top);
+            let w_chunk = params.topk_weights.sub_offset(t0 * k_top, n * k_top);
+            let gate_chunk = params.gate_batch.sub_offset(0, n * k_top * im);
+            let up_chunk = params.up_batch.sub_offset(0, n * k_top * im);
+            let out_chunk = params.ffn_out.sub_offset(t0 * hidden, n * hidden);
+
+            p.ensure_resident(
+                layer_idx as u16,
+                crate::expert_pager::ExpertBlobRole::GateUp,
+                &experts,
+                gate_up_blob,
+                params.expert_gate_up_ptrs,
+                layer.expert_gate_up_stride,
+                gpu,
+            )
+            .map_err(|e| format!("ffn_batched l{layer_idx} fp4 gate_up resident: {e}"))?;
+            gpu.deepseek4_gemv_hfp4g32_moe_gate_up_indexed_batched(
+                params.expert_gate_up_ptrs,
+                &idx_chunk,
+                &x_chunk,
+                &gate_chunk,
+                &up_chunk,
+                2 * im,
+                hidden,
+                k_top,
+                n,
+            )
+            .map_err(|e| format!("ffn_batched l{layer_idx} fp4 gate_up: {e:?}"))?;
+
+            // In-place clamped SwiGLU, as the Lloyd path does — but NOT followed
+            // by the FWHT rotate, because HFP4G32 bakes none in.
+            gpu.deepseek4_silu_mul_clamp_f32_batched(
+                &gate_chunk,
+                &up_chunk,
+                &gate_chunk,
+                im,
+                n * k_top,
+                params.swiglu_limit,
+            )
+            .map_err(|e| format!("ffn_batched l{layer_idx} fp4 silu: {e:?}"))?;
+
+            p.ensure_resident(
+                layer_idx as u16,
+                crate::expert_pager::ExpertBlobRole::Down,
+                &experts,
+                w2_blob,
+                params.expert_down_ptrs,
+                layer.expert_w2_stride,
+                gpu,
+            )
+            .map_err(|e| format!("ffn_batched l{layer_idx} fp4 down resident: {e}"))?;
+            gpu.deepseek4_gemv_hfp4g32_moe_down_residual_scaled_indexed_batched(
+                params.expert_down_ptrs,
+                &idx_chunk,
+                &w_chunk,
+                &gate_chunk,
+                &out_chunk,
+                hidden,
+                im,
+                k_top,
+                n,
+            )
+            .map_err(|e| format!("ffn_batched l{layer_idx} fp4 down: {e:?}"))?;
+
+            t0 = t1;
+        }
+        return Ok(());
+    }
+
+    // 3. Pass A — gate_up per band.
+    for b in &bands {
+        p.ensure_resident(
+            layer_idx as u16,
+            crate::expert_pager::ExpertBlobRole::GateUp,
+            &b.experts,
+            gate_up_blob,
+            params.expert_gate_up_ptrs,
+            layer.expert_gate_up_stride,
+            gpu,
+        )
+        .map_err(|e| format!("ffn_batched l{layer_idx} gate_up band: {e}"))?;
+        family
+            .prefill_gate_up_band(gpu, &params, b.tile_begin, b.tile_count)
+            .map_err(|e| format!("ffn_batched l{layer_idx} gate_up band dispatch: {e}"))?;
+    }
+
+    // 4. Unscatter + SwiGLU + rotate once over the chunk.
+    family
+        .prefill_activate(gpu, &params)
+        .map_err(|e| format!("ffn_batched l{layer_idx} activate: {e}"))?;
+
+    // 5. Pass B — down per band.
+    for b in &bands {
+        p.ensure_resident(
+            layer_idx as u16,
+            crate::expert_pager::ExpertBlobRole::Down,
+            &b.experts,
+            w2_blob,
+            params.expert_down_ptrs,
+            layer.expert_w2_stride,
+            gpu,
+        )
+        .map_err(|e| format!("ffn_batched l{layer_idx} down band: {e}"))?;
+        family
+            .prefill_down_band(gpu, &params, b.tile_begin, b.tile_count)
+            .map_err(|e| format!("ffn_batched l{layer_idx} down band dispatch: {e}"))?;
+    }
+
+    // 6. Combine once.
+    family
+        .prefill_combine(gpu, &params)
+        .map_err(|e| format!("ffn_batched l{layer_idx} combine: {e}"))?;
+
+    if crate::expert_pager::prefill_work_trace() {
+        let loads = p.stats().1 - miss_before;
+        let mut distinct: Vec<i32> = tile_experts
+            .iter()
+            .copied()
+            .filter(|&e| e >= 0 && (e as usize) < n_exp)
+            .collect();
+        distinct.sort_unstable();
+        distinct.dedup();
+        let floor = 2 * distinct.len() as u64;
+        eprintln!(
+            "[prefill-work] l{layer_idx} batch={batch_size} windows={} \
+             distinct={} loads={loads} floor={floor} redundancy={:.2}x",
+            bands.len(),
+            distinct.len(),
+            if floor == 0 {
+                0.0
+            } else {
+                loads as f64 / floor as f64
+            },
+        );
+    }
     Ok(())
 }
 
@@ -12653,6 +13675,7 @@ fn forward_prefill_batch_chunk_impl(
             hash_routing,
             n,
             tokens,
+            weights.expert_paging.as_ref(),
         )?;
         if layer_idx == 0 {
             dump_buf(gpu, "10_l0_ffn_out", &pbs.ffn_out_batch);
@@ -13128,6 +14151,7 @@ pub fn forward_ep_prefill_batch_chunked(
                     layer_idx < cfg.num_hash_layers,
                     batch_size,
                     chunk,
+                    weights.expert_paging.as_ref(),
                 )?;
             }
             let ffn_buffers: Vec<_> = pbs_per_rank
@@ -13803,6 +14827,7 @@ pub fn dspark_forward(
                 /*hash_routing=*/ false,
                 block,
                 &[],
+                None,
             )?;
             hc_ffn_mix_batched(cfg, pbs, gpu, block)?;
         }
@@ -14052,6 +15077,7 @@ pub fn dspark_run_body_and_hc_gate(
                 false,
                 block,
                 &[],
+                None,
             )?;
             hc_ffn_mix_batched(cfg, pbs, gpu, block)?;
         }

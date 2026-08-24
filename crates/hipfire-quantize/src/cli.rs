@@ -149,6 +149,12 @@ pub(crate) struct QuantizeArgs {
     /// Ingest only tensors whose names start with this prefix.
     #[arg(long, value_name = "PREFIX")]
     pub include_prefix: Option<String>,
+
+    /// Skip tensors whose names start with this prefix. Inverse of
+    /// `--include-prefix`; needed to build a trunk-only HFQ whose MTP surface
+    /// is quantized separately at a different precision.
+    #[arg(long, value_name = "PREFIX")]
+    pub exclude_prefix: Option<String>,
 }
 
 /// Refuse an `--arch-id` override that strips a qwen3* model (auto-detected

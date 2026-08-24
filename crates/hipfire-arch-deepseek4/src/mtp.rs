@@ -899,6 +899,8 @@ pub fn mtp_forward_batched(
         /*hash_routing=*/ false,
         n,
         tokens_dummy,
+        // No pager on the MTP path: the addon's experts are resident.
+        None,
     )?;
     hc_ffn_mix_batched(cfg, pbs, gpu, n)?;
 

@@ -128,6 +128,43 @@ pub enum NormKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransferHandle(u64);
 
+/// One range to read into a destination buffer, for
+/// [`Transport::fetch_batch_into`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FetchReq {
+    /// Byte offset in the HFQ file.
+    pub hfq_offset: usize,
+    /// Byte length.
+    pub len: usize,
+    /// Byte offset within the destination tensor.
+    pub dst_byte_offset: usize,
+}
+
+/// Bounds check for [`Transport::fetch_into`], factored out so the arithmetic
+/// is testable without a GPU.
+///
+/// This is the check that stops a cache-slot write from spilling into the
+/// NEIGHBOURING expert's bytes. That failure mode would not crash — it would
+/// silently corrupt a different expert's weights and show up only as degraded
+/// output, which is precisely the class of bug expert paging must not
+/// introduce. Hence: verify before any I/O, and fail closed.
+pub fn check_fetch_into_bounds(
+    dst_bytes: usize,
+    dst_byte_offset: usize,
+    len: usize,
+) -> Result<(), String> {
+    let end = dst_byte_offset
+        .checked_add(len)
+        .ok_or_else(|| format!("fetch_into: offset {dst_byte_offset} + len {len} overflows"))?;
+    if end > dst_bytes {
+        return Err(format!(
+            "fetch_into: write of {len} B at offset {dst_byte_offset} \
+             exceeds destination of {dst_bytes} B"
+        ));
+    }
+    Ok(())
+}
+
 /// Abstraction over how the pager moves bytes from host storage to VRAM.
 ///
 /// **This is the migration seam for the NVMe→VRAM DMA future.** Today's impl
@@ -153,6 +190,42 @@ pub trait Transport: Send {
         len: usize,
         gpu: &mut Gpu,
     ) -> HipResult<(GpuTensor, TransferHandle)>;
+
+    /// Read `len` bytes from `hfq_offset` directly into an EXISTING device
+    /// buffer at `dst_byte_offset`.
+    ///
+    /// Unlike [`Transport::fetch`] this allocates nothing. That is what lets a
+    /// pager guarantee it never calls an allocator after load: a cache miss
+    /// reuses a slot it already owns, so there is no path from a miss to an
+    /// allocation failure — and, on a swapless box, no path to an OOM kill.
+    fn fetch_into(
+        &mut self,
+        hfq_offset: usize,
+        len: usize,
+        dst: &GpuTensor,
+        dst_byte_offset: usize,
+        gpu: &mut Gpu,
+    ) -> HipResult<TransferHandle>;
+
+    /// Read several ranges into ONE destination buffer.
+    ///
+    /// The expert pager fills up to `k_top * segments` slots per layer per
+    /// token, and issuing those one at a time leaves the storage device with a
+    /// single outstanding request — measured at 88-92% of the expert-read
+    /// cost. A batch lets an implementation overlap them; the default is the
+    /// serial loop so existing transports keep working unchanged.
+    fn fetch_batch_into(
+        &mut self,
+        reqs: &[FetchReq],
+        dst: &GpuTensor,
+        gpu: &mut Gpu,
+    ) -> HipResult<TransferHandle> {
+        let mut last = TransferHandle(0);
+        for r in reqs {
+            last = self.fetch_into(r.hfq_offset, r.len, dst, r.dst_byte_offset, gpu)?;
+        }
+        Ok(last)
+    }
 
     /// Block until every handle in `handles` has completed. v0.1 no-op
     /// because `fetch` is synchronous; defined for forward compatibility.
@@ -194,6 +267,22 @@ pub struct PreadH2DTransport {
     /// purely informational; future async impls will key real completion
     /// state on this id.
     next_handle: u64,
+    /// Split of `fetch_into` cost: disk vs host-to-device copy. Decides
+    /// whether a dedicated copy stream (which needs pinned host memory and
+    /// new FFI) is the right optimisation, or whether the pread dominates and
+    /// concurrent reads are.
+    ns_pread: u64,
+    ns_copy: u64,
+    /// Async prefetch side. Allocated lazily on first use so a run that never
+    /// prefetches pays nothing (and never pins unswappable pages).
+    prefetch: Option<AsyncPrefetch>,
+    ns_prefetch_wait: u64,
+    /// Non-owning alias of the destination, held between issue and wait.
+    ///
+    /// An alias rather than the tensor because GpuTensor is not Clone and the
+    /// pager does not own the blob. Valid because the blob outlives the
+    /// prefetch by construction: it is a per-layer pool allocated at load.
+    pending_dst: Option<hip_bridge::DeviceBuffer>,
 }
 
 impl PreadH2DTransport {
@@ -216,6 +305,11 @@ impl PreadH2DTransport {
             path: path.to_path_buf(),
             staging: Vec::new(),
             next_handle: 0,
+            ns_pread: 0,
+            ns_copy: 0,
+            prefetch: None,
+            ns_prefetch_wait: 0,
+            pending_dst: None,
         })
     }
 
@@ -224,6 +318,290 @@ impl PreadH2DTransport {
     /// io_uring SQE buffers.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Read every range into the staging buffer and hand it back, WITHOUT
+    /// touching the device.
+    ///
+    /// Split out from `fetch_batch_into` because a caller may need to
+    /// transform the bytes between disk and slot. Tensor-parallel expert
+    /// slicing (PR #527) is the motivating case: each rank keeps only
+    /// `inter/tp` of every expert, so the bytes read are the FULL expert and
+    /// the bytes written are a row-gathered subset — read length and write
+    /// length differ, which the combined read-and-copy path cannot express.
+    ///
+    /// Returns the staging prefix holding the requests back to back in order.
+    pub fn read_batch(&mut self, reqs: &[FetchReq]) -> Result<&[u8], String> {
+        use rayon::prelude::*;
+
+        if reqs.is_empty() {
+            return Ok(&self.staging[..0]);
+        }
+        let total: usize = reqs.iter().map(|r| r.len).sum();
+        if self.staging.len() < total {
+            self.staging.resize(total, 0);
+        }
+        let mut rest: &mut [u8] = &mut self.staging[..total];
+        let mut parts: Vec<(&mut [u8], usize)> = Vec::with_capacity(reqs.len());
+        for r in reqs {
+            let (head, tail) = rest.split_at_mut(r.len);
+            parts.push((head, r.hfq_offset));
+            rest = tail;
+        }
+        let t = std::time::Instant::now();
+        let file = &self.file;
+        let errs: Vec<String> = parts
+            .into_par_iter()
+            .filter_map(|(buf, offset)| {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::FileExt;
+                    match file.read_exact_at(buf, offset as u64) {
+                        Ok(()) => None,
+                        Err(e) => Some(format!("pread at {offset}: {e}")),
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = (buf, offset, file);
+                    Some("concurrent pread requires unix".to_string())
+                }
+            })
+            .collect();
+        self.ns_pread += t.elapsed().as_nanos() as u64;
+        match errs.first() {
+            Some(e) => Err(e.clone()),
+            None => Ok(&self.staging[..total]),
+        }
+    }
+
+    /// `(pread_ns, h2d_copy_ns)` accumulated across all `fetch_into` calls.
+    pub fn io_split(&self) -> (u64, u64) {
+        (self.ns_pread, self.ns_copy)
+    }
+
+    /// Nanoseconds spent BLOCKED in [`Self::wait_prefetch`].
+    ///
+    /// This is the number that says whether prefetch is working: it is the part
+    /// of the transfer the overlap failed to hide. Near zero means the window
+    /// absorbed the fetch; close to the synchronous cost means it did not.
+    pub fn prefetch_wait_ns(&self) -> u64 {
+        self.ns_prefetch_wait
+    }
+
+    /// Release the optional async-prefetch resources. Every cleanup operation
+    /// is attempted even if an earlier one fails, so pinned memory and HIP
+    /// handles cannot leak merely because a pending transfer reported an error.
+    fn release_prefetch(&mut self, gpu: &Gpu) -> HipResult<()> {
+        let bind_result = gpu.bind_thread();
+        let wait_result = self.wait_prefetch(gpu);
+        self.pending_dst = None;
+        let Some(mut prefetch) = self.prefetch.take() else {
+            return wait_result;
+        };
+        let reader_result = match prefetch.reader.take() {
+            Some(reader) => reader
+                .join()
+                .map(|_| ())
+                .map_err(|_| hip_bridge::HipError::new(0, "prefetch reader panicked during cleanup")),
+            None => Ok(()),
+        };
+        let sync_result = if prefetch.in_flight {
+            gpu.hip.event_synchronize(&prefetch.event)
+        } else {
+            Ok(())
+        };
+        let event_result = gpu.hip.event_destroy(prefetch.event);
+        let stream_result = gpu.hip.stream_destroy(prefetch.stream);
+        let pinned_result = unsafe { gpu.hip.host_free(prefetch.pinned.0) };
+        bind_result
+            .and(wait_result)
+            .and(reader_result)
+            .and(sync_result)
+            .and(event_result)
+            .and(stream_result)
+            .and(pinned_result)
+    }
+
+    /// Explicit model-unload hook for the HIP resources owned by this
+    /// transport. `PreadH2DTransport` cannot clean these up in `Drop` because
+    /// HIP handle destruction requires the owning runtime.
+    pub fn free_gpu(&mut self, gpu: &Gpu) {
+        if let Err(error) = self.release_prefetch(gpu) {
+            eprintln!("weight_pager: async-prefetch cleanup failed: {error}");
+        }
+    }
+
+    /// Lazily set up the async side: page-locked staging, a dedicated copy
+    /// stream, and an event.
+    ///
+    /// Pinning is not an optimisation here. `hipMemcpyAsync` from pageable
+    /// memory degrades to a synchronous bounce-buffer copy, so without this the
+    /// prefetch would appear to work and hide nothing.
+    fn ensure_prefetch(&mut self, gpu: &Gpu, need: usize) -> HipResult<()> {
+        if let Some(p) = self.prefetch.as_ref() {
+            if p.pinned.1 >= need {
+                return Ok(());
+            }
+        }
+        if !gpu.hip.has_pinned_host_alloc() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "prefetch needs hipHostMalloc; runtime does not export it",
+            ));
+        }
+        // Drain and release every resource owned by the smaller async side
+        // before replacing it.
+        if self.prefetch.is_some() {
+            self.release_prefetch(gpu)?;
+        }
+        let ptr = unsafe { gpu.hip.host_malloc(need)? };
+        self.prefetch = Some(AsyncPrefetch {
+            pinned: PinnedBuf(ptr, need),
+            stream: gpu.hip.stream_create()?,
+            event: gpu.hip.event_create()?,
+            in_flight: false,
+            reader: None,
+            pending: Vec::new(),
+        });
+        Ok(())
+    }
+
+    /// Issue a fetch that does NOT block: pread into pinned staging, then
+    /// `hipMemcpyAsync` on the copy stream, then record an event.
+    ///
+    /// Pair with [`Self::wait_prefetch`] before the destination is read. The
+    /// pread is still synchronous on this thread — it is the H2D and the
+    /// caller's subsequent GPU work that overlap.
+    pub fn prefetch_batch_into(
+        &mut self,
+        reqs: &[FetchReq],
+        dst: &GpuTensor,
+        gpu: &mut Gpu,
+    ) -> HipResult<()> {
+        if reqs.is_empty() {
+            return Ok(());
+        }
+        let dst_bytes = dst.byte_size();
+        for r in reqs {
+            check_fetch_into_bounds(dst_bytes, r.dst_byte_offset, r.len)
+                .map_err(|m| hip_bridge::HipError::new(0, &m))?;
+        }
+        let total: usize = reqs.iter().map(|r| r.len).sum();
+        self.ensure_prefetch(gpu, total)?;
+
+        // A copy still reading the staging must finish before we overwrite it.
+        self.wait_prefetch(gpu)?;
+
+        let pinned = {
+            let p = self.prefetch.as_ref().unwrap();
+            // SAFETY: exclusively owned, sized >= total by ensure_prefetch, and
+            // no transfer is in flight (drained immediately above).
+            unsafe { std::slice::from_raw_parts_mut(p.pinned.0 as *mut u8, total) }
+        };
+
+        // Hand the pread to a worker so it overlaps the caller's GPU work.
+        // This is the half that matters: pread is ~60% of expert I/O and pure
+        // host/page-cache work, whereas the H2D on unified memory has little to
+        // hide behind. Doing it inline here is what made the first version
+        // SLOWER -- it added a blocking read of the predicted experts on top of
+        // the real dispatch's own reads.
+        let file = self
+            .file
+            .try_clone()
+            .map_err(|e| hip_bridge::HipError::new(0, &format!("prefetch fd clone: {e}")))?;
+        let plan: Vec<FetchReq> = reqs.to_vec();
+        let base = {
+            let p = self.prefetch.as_ref().unwrap();
+            p.pinned.0 as usize
+        };
+        let work = plan.clone();
+        let handle = std::thread::spawn(move || {
+            // SAFETY: the pinned buffer is exclusively owned by this transport,
+            // sized >= total, and no other reader or writer touches it between
+            // issue and the join in wait_prefetch (which drains before reuse).
+            let span = unsafe { std::slice::from_raw_parts_mut(base as *mut u8, total) };
+            pread_parts_into(&file, span, &work)
+        });
+        let p = self.prefetch.as_mut().unwrap();
+        p.reader = Some(handle);
+        p.pending = plan;
+        p.in_flight = true;
+        // Alias the destination for the deferred copy. Safe: the blob is a
+        // per-layer pool allocated at model load and outlives every prefetch.
+        self.pending_dst = Some(unsafe { dst.buf.alias() });
+        Ok(())
+    }
+
+    /// Join the background pread, issue the H2D, and block until it lands.
+    ///
+    /// Everything the caller did between `prefetch_batch_into` and here ran
+    /// concurrently with the read. `prefetch_wait_ns` is what the overlap
+    /// failed to hide.
+    pub fn wait_prefetch(&mut self, gpu: &Gpu) -> HipResult<()> {
+        if self.prefetch.as_ref().map(|p| !p.in_flight).unwrap_or(true) {
+            return Ok(());
+        }
+        let t = std::time::Instant::now();
+        let (handle, plan, base) = {
+            let p = self.prefetch.as_mut().unwrap();
+            (
+                p.reader.take(),
+                std::mem::take(&mut p.pending),
+                p.pinned.0 as usize,
+            )
+        };
+        if let Some(h) = handle {
+            match h.join() {
+                Ok(Some(e)) => {
+                    self.prefetch.as_mut().unwrap().in_flight = false;
+                    self.pending_dst = None;
+                    self.ns_prefetch_wait += t.elapsed().as_nanos() as u64;
+                    return Err(hip_bridge::HipError::new(0, &e));
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    self.prefetch.as_mut().unwrap().in_flight = false;
+                    self.pending_dst = None;
+                    return Err(hip_bridge::HipError::new(0, "prefetch reader panicked"));
+                }
+            }
+        }
+        if let Some(dstbuf) = self.pending_dst.take() {
+            gpu.bind_thread()?;
+            let total: usize = plan.iter().map(|r| r.len).sum();
+            // SAFETY: reader has joined, so the span is fully written and no
+            // other thread references it.
+            let pinned = unsafe { std::slice::from_raw_parts(base as *const u8, total) };
+            let p = self.prefetch.as_ref().unwrap();
+            let mut at = 0usize;
+            for r in &plan {
+                gpu.hip.memcpy_htod_offset_async(
+                    &dstbuf,
+                    r.dst_byte_offset,
+                    &pinned[at..at + r.len],
+                    &p.stream,
+                )?;
+                at += r.len;
+            }
+            gpu.hip.event_record(&p.event, Some(&p.stream))?;
+            gpu.hip.event_synchronize(&p.event)?;
+        }
+        self.prefetch.as_mut().unwrap().in_flight = false;
+        self.ns_prefetch_wait += t.elapsed().as_nanos() as u64;
+        Ok(())
+    }
+
+    /// Grow the host staging buffer to `len` bytes up front.
+    ///
+    /// [`Transport::fetch_into`] grows `staging` on demand, which would be an
+    /// allocation on the forward path — exactly what a bounded pager promises
+    /// not to do. Calling this once at load with the largest expert size makes
+    /// every later `fetch_into` allocation-free.
+    pub fn reserve_staging(&mut self, len: usize) {
+        if self.staging.len() < len {
+            self.staging.resize(len, 0);
+        }
     }
 
     fn next_handle(&mut self) -> TransferHandle {
@@ -256,6 +634,82 @@ impl PreadH2DTransport {
     }
 }
 
+/// Owning handle to a page-locked host buffer.
+///
+/// Raw because `hipHostMalloc` hands back a bare pointer. Exclusively owned by
+/// the one [`AsyncPrefetch`] that allocated it and never aliased, which is what
+/// makes the `Send` impl sound — [`Transport`] requires `Send`.
+struct PinnedBuf(*mut std::ffi::c_void, usize);
+// SAFETY: sole owner, never shared, never aliased. The only concurrent reader
+// is the GPU's DMA engine, which is ordered by the copy stream + event.
+unsafe impl Send for PinnedBuf {}
+
+/// Async side of the transport: pinned staging + a dedicated copy stream + an
+/// event to wait on.
+///
+/// This is what lets the pager issue a fetch for layer L+1 while layer L+1's
+/// attention is still running on the GPU. Two properties are load bearing:
+///
+/// - **Pinned staging.** `hipMemcpyAsync` from PAGEABLE memory silently
+///   degrades to a synchronous copy through a driver bounce buffer. Without
+///   `hipHostMalloc` this whole path would look correct and deliver no overlap.
+/// - **A separate stream.** Issuing on the null stream would serialise against
+///   the compute we are trying to hide behind.
+///
+/// A single buffer and event suffice because at most one prefetch is in flight:
+/// layer L predicts L+1, and L+1 consumes it before L+1 predicts L+2.
+struct AsyncPrefetch {
+    pinned: PinnedBuf,
+    stream: hip_bridge::Stream,
+    event: hip_bridge::Event,
+    /// True between `issue` and `wait`. Reusing the staging while a copy is
+    /// still reading it would corrupt the destination silently, so `issue`
+    /// drains an outstanding transfer first.
+    in_flight: bool,
+    /// Background pread, if one is outstanding.
+    ///
+    /// The pread is 60% of expert I/O and is pure host/page-cache work, so it
+    /// is the half most worth moving off the critical path. Making only the
+    /// H2D async overlapped the CHEAP half -- and on unified memory the H2D has
+    /// almost nothing to hide behind, which is why the first version measured
+    /// 0.69x.
+    reader: Option<std::thread::JoinHandle<Option<String>>>,
+    /// Copy plan deferred until the pread lands.
+    pending: Vec<FetchReq>,
+}
+
+/// pread `reqs` into `span` in parallel; `span` must be exactly the
+/// concatenation of the request lengths, in request order.
+fn pread_parts_into(file: &File, span: &mut [u8], reqs: &[FetchReq]) -> Option<String> {
+    use rayon::prelude::*;
+    let mut rest: &mut [u8] = span;
+    let mut parts: Vec<(&mut [u8], usize)> = Vec::with_capacity(reqs.len());
+    for r in reqs {
+        let (head, tail) = rest.split_at_mut(r.len);
+        parts.push((head, r.hfq_offset));
+        rest = tail;
+    }
+    let errs: Vec<String> = parts
+        .into_par_iter()
+        .filter_map(|(buf, offset)| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::FileExt;
+                match file.read_exact_at(buf, offset as u64) {
+                    Ok(()) => None,
+                    Err(e) => Some(format!("pread at {offset}: {e}")),
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = (buf, offset, file);
+                Some("concurrent pread requires unix".to_string())
+            }
+        })
+        .collect();
+    errs.into_iter().next()
+}
+
 impl Transport for PreadH2DTransport {
     fn fetch(
         &mut self,
@@ -275,6 +729,135 @@ impl Transport for PreadH2DTransport {
         //    — that interpretation belongs to `WeightTensor` at the call site.
         let tensor = gpu.upload_raw(&self.staging[..len], &[len])?;
         Ok((tensor, self.next_handle()))
+    }
+
+    fn fetch_into(
+        &mut self,
+        hfq_offset: usize,
+        len: usize,
+        dst: &GpuTensor,
+        dst_byte_offset: usize,
+        gpu: &mut Gpu,
+    ) -> HipResult<TransferHandle> {
+        // Bounds-check against the destination BEFORE any I/O. Writing past a
+        // slot would corrupt the neighbouring expert's weights — a silent
+        // quality regression rather than a crash — so fail closed here.
+        check_fetch_into_bounds(dst.byte_size(), dst_byte_offset, len)
+            .map_err(|m| hip_bridge::HipError::new(0, &m))?;
+        let t_pread = std::time::Instant::now();
+        // 1. Host: pread into the staging buffer (same path as `fetch`).
+        self.pread_into_staging(hfq_offset, len).map_err(|e| {
+            hip_bridge::HipError::new(0, &format!("pread {len} bytes at offset {hfq_offset}: {e}"))
+        })?;
+        self.ns_pread += t_pread.elapsed().as_nanos() as u64;
+        // 2. GPU: copy into the caller's existing buffer. No allocation.
+        gpu.bind_thread()?;
+        let t_copy = std::time::Instant::now();
+        gpu.hip
+            .memcpy_htod_offset(&dst.buf, dst_byte_offset, &self.staging[..len])?;
+        self.ns_copy += t_copy.elapsed().as_nanos() as u64;
+        Ok(self.next_handle())
+    }
+
+    /// Concurrent preads, then the host-to-device copies.
+    ///
+    /// io_uring was implemented for this and REMOVED: on the full 43-layer ds4
+    /// model it measured ~1.9x SLOWER on pread and ~17% slower end-to-end,
+    /// consistently across an interleaved A/B/A/B (ring 8122/8512 ms vs pread
+    /// 4119/4656 ms; 6.5-6.6 vs 7.7-7.8 tok/s), so it was not drift.
+    ///
+    /// Hypothesis, unproven: expert fills are a handful of MULTI-MEGABYTE
+    /// buffered reads (18 per layer at 2.4-4.7 MB each) — the shape io_uring
+    /// is worst at. The kernel serves them from its worker pool with no more
+    /// parallelism than rayon already extracts, while each SQE adds submission
+    /// overhead. Where io_uring should win is registered buffers + O_DIRECT,
+    /// which is a different experiment, not a knob on this one.
+    ///
+    /// `pread` is positional and takes `&File`, so N threads can read the same
+    /// descriptor at once with no seek state to race on. The staging buffer is
+    /// carved into one disjoint slice per request, so the threads never
+    /// overlap. Rayon's pool is process-wide and already resident, so this
+    /// spawns nothing per call.
+    ///
+    /// The copies stay serial and on the calling thread: they are only ~8% of
+    /// the cost, and HIP calls from rayon workers would need per-thread device
+    /// binding for no measurable gain.
+    fn fetch_batch_into(
+        &mut self,
+        reqs: &[FetchReq],
+        dst: &GpuTensor,
+        gpu: &mut Gpu,
+    ) -> HipResult<TransferHandle> {
+        use rayon::prelude::*;
+
+        if reqs.is_empty() {
+            return Ok(self.next_handle());
+        }
+        if reqs.len() == 1 {
+            // One request cannot overlap with itself; skip the pool.
+            let r = reqs[0];
+            return self.fetch_into(r.hfq_offset, r.len, dst, r.dst_byte_offset, gpu);
+        }
+        // Bounds-check EVERY request before any I/O — a partially applied
+        // batch would leave some slots holding the wrong expert.
+        let dst_bytes = dst.byte_size();
+        for r in reqs {
+            check_fetch_into_bounds(dst_bytes, r.dst_byte_offset, r.len)
+                .map_err(|m| hip_bridge::HipError::new(0, &m))?;
+        }
+        let total: usize = reqs.iter().map(|r| r.len).sum();
+        if self.staging.len() < total {
+            self.staging.resize(total, 0);
+        }
+
+        // Carve disjoint staging slices, one per request, in request order.
+        let mut rest: &mut [u8] = &mut self.staging[..total];
+        let mut parts: Vec<(&mut [u8], usize)> = Vec::with_capacity(reqs.len());
+        for r in reqs {
+            let (head, tail) = rest.split_at_mut(r.len);
+            parts.push((head, r.hfq_offset));
+            rest = tail;
+        }
+
+        let t_pread = std::time::Instant::now();
+        let file = &self.file;
+        let errs: Vec<String> = parts
+            .into_par_iter()
+            .filter_map(|(buf, offset)| {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::FileExt;
+                    match file.read_exact_at(buf, offset as u64) {
+                        Ok(()) => None,
+                        Err(e) => Some(format!("pread at {offset}: {e}")),
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = (buf, offset, file);
+                    Some("concurrent pread requires unix".to_string())
+                }
+            })
+            .collect();
+        self.ns_pread += t_pread.elapsed().as_nanos() as u64;
+        if let Some(e) = errs.first() {
+            return Err(hip_bridge::HipError::new(0, e));
+        }
+
+        // Copies, in request order, from each request's own staging slice.
+        gpu.bind_thread()?;
+        let t_copy = std::time::Instant::now();
+        let mut at = 0usize;
+        for r in reqs {
+            gpu.hip.memcpy_htod_offset(
+                &dst.buf,
+                r.dst_byte_offset,
+                &self.staging[at..at + r.len],
+            )?;
+            at += r.len;
+        }
+        self.ns_copy += t_copy.elapsed().as_nanos() as u64;
+        Ok(self.next_handle())
     }
 
     fn wait(&mut self, _handles: &[TransferHandle]) -> HipResult<()> {
@@ -708,6 +1291,42 @@ pub fn open_hfq(path: &Path) -> std::io::Result<HfqFile> {
 
 #[cfg(test)]
 mod tests {
+    use super::check_fetch_into_bounds;
+
+    #[test]
+    fn fetch_into_bounds_accepts_an_exact_fit() {
+        // A slot write that ends exactly at the buffer end is legal.
+        assert!(check_fetch_into_bounds(2_359_296 * 4, 2_359_296 * 3, 2_359_296).is_ok());
+    }
+
+    #[test]
+    fn fetch_into_bounds_accepts_slot_zero() {
+        assert!(check_fetch_into_bounds(2_359_296, 0, 2_359_296).is_ok());
+    }
+
+    #[test]
+    fn fetch_into_bounds_rejects_a_write_past_the_end() {
+        // One byte too far: would corrupt whatever follows the pool.
+        let err = check_fetch_into_bounds(2_359_296 * 4, 2_359_296 * 3, 2_359_296 + 1)
+            .expect_err("must reject");
+        assert!(err.contains("exceeds destination"), "got {err}");
+    }
+
+    #[test]
+    fn fetch_into_bounds_rejects_an_off_by_one_slot_index() {
+        // Slot 4 in a 4-slot pool: the classic off-by-one, which would write
+        // into the next blob rather than erroring.
+        let stride = 2_359_296usize;
+        let err = check_fetch_into_bounds(stride * 4, stride * 4, stride).expect_err("must reject");
+        assert!(err.contains("exceeds destination"), "got {err}");
+    }
+
+    #[test]
+    fn fetch_into_bounds_rejects_overflowing_arithmetic() {
+        let err = check_fetch_into_bounds(1024, usize::MAX, 4096).expect_err("must reject");
+        assert!(err.contains("overflows"), "got {err}");
+    }
+
     use super::*;
     use std::io::Write;
 

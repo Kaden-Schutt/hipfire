@@ -313,3 +313,100 @@ pub(crate) fn fixed_tier_dtype_for(name: &str) -> Option<&'static str> {
 pub(crate) fn is_conv1d_tensor(name: &str) -> bool {
     name.ends_with("conv1d.weight")
 }
+
+/// Name-level ingest gate shared by `--include-prefix` / `--exclude-prefix`.
+///
+/// `include` is a whitelist (when set, ONLY matching tensors are ingested);
+/// `exclude` is a blacklist applied after it. Exclusion wins on a tie, so
+/// passing both is well-defined rather than order-dependent.
+///
+/// This is the gate that lets the 0731 trunk and its 3-stage DSpark chain be
+/// quantized in two passes with DIFFERENT recipes: the trunk pass excludes
+/// `mtp.`, the sidecar pass includes it under `deepseek4-mtp-precise`. The
+/// format-level MTP skip cannot express that, because every `deepseek4-*`
+/// format sets `use_deepseek4_source_precision` and so ingests `mtp.`.
+pub(crate) fn passes_prefix_filter(name: &str, include: Option<&str>, exclude: Option<&str>) -> bool {
+    if let Some(p) = include {
+        if !name.starts_with(p) {
+            return false;
+        }
+    }
+    if let Some(p) = exclude {
+        if name.starts_with(p) {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod prefix_filter_tests {
+    use super::*;
+
+    #[test]
+    fn no_filters_passes_everything() {
+        assert!(passes_prefix_filter("model.layers.0.wq.weight", None, None));
+        assert!(passes_prefix_filter("mtp.0.attn_norm.weight", None, None));
+    }
+
+    #[test]
+    fn include_is_a_whitelist() {
+        assert!(passes_prefix_filter(
+            "mtp.0.attn_norm.weight",
+            Some("mtp."),
+            None
+        ));
+        assert!(passes_prefix_filter(
+            "mtp.2.hc_head.weight",
+            Some("mtp."),
+            None
+        ));
+        assert!(!passes_prefix_filter(
+            "model.layers.0.wq.weight",
+            Some("mtp."),
+            None
+        ));
+    }
+
+    /// The trunk pass: everything EXCEPT the DSpark chain.
+    #[test]
+    fn exclude_is_a_blacklist() {
+        assert!(!passes_prefix_filter(
+            "mtp.0.attn_norm.weight",
+            None,
+            Some("mtp.")
+        ));
+        assert!(!passes_prefix_filter(
+            "mtp.2.confidence_head.weight",
+            None,
+            Some("mtp.")
+        ));
+        assert!(passes_prefix_filter(
+            "model.layers.0.wq.weight",
+            None,
+            Some("mtp.")
+        ));
+        assert!(passes_prefix_filter(
+            "model.embed_tokens.weight",
+            None,
+            Some("mtp.")
+        ));
+    }
+
+    /// `mtp.` must not swallow a hypothetical sibling that merely shares a
+    /// stem — the filter is a prefix match, so `mtpx.` is unaffected.
+    #[test]
+    fn prefix_match_is_literal_not_fuzzy() {
+        assert!(passes_prefix_filter("mtpx.0.weight", None, Some("mtp.")));
+        assert!(!passes_prefix_filter("mtpx.0.weight", Some("mtp."), None));
+    }
+
+    #[test]
+    fn exclude_wins_when_both_match() {
+        assert!(!passes_prefix_filter(
+            "mtp.0.w.weight",
+            Some("mtp."),
+            Some("mtp.0.")
+        ));
+    }
+}

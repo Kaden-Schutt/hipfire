@@ -609,3 +609,11 @@ required-features = ["lab"]
 [[example]]
 name = "wmma_fa_spike"
 required-features = ["lab"]
+
+[[example]]
+name = "async_prefetch_smoke"
+required-features = ["lab"]
+
+[[example]]
+name = "fp4_artifact_check"
+required-features = ["lab"]

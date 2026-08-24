@@ -11,6 +11,7 @@ description = "DeepSeek V4 Flash architecture for hipfire (Hyper-Connections + c
 # `deepseek4_chat` example binary.
 
 [dependencies]
+half.workspace = true
 hipfire-config = { path = "../hipfire-config" }
 hipfire-runtime = { path = "../hipfire-runtime" }
 hipfire-ds4-parent = { path = "../hipfire-ds4-parent" }
@@ -113,4 +114,8 @@ required-features = ["lab"]
 
 [[example]]
 name = "ep_dspark_topology_probe"
+required-features = ["lab"]
+
+[[example]]
+name = "expert_policy_sim"
 required-features = ["lab"]

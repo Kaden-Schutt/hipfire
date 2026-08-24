@@ -4122,6 +4122,8 @@ pub const ADD_SRC: &str = include_str!("../../../kernels/src/add.hip");
 
 /// Element-wise in-place add: a[i] += b[i]
 pub const ADD_INPLACE_SRC: &str = include_str!("../../../kernels/src/add_inplace.hip");
+pub const ADD_ROW_INPLACE_BUF_SRC: &str =
+    include_str!("../../../kernels/src/add_row_inplace_buf.hip");
 
 /// Scaled in-place add: y[i] += c * x[i] — one kernel for both
 /// CPU-scalar (c via kernarg) and GPU-scalar (c via device buffer)
@@ -5613,6 +5615,29 @@ pub const GEMV_MQ3G256GL_MOE_GATE_UP_INDEXED_SRC: &str =
 
 pub const GEMV_MQ3G256GL_MOE_DOWN_INDEXED_SRC: &str =
     include_str!("../../../kernels/src/gemv_mq3g256gl_moe_down_indexed.hip");
+
+/// Batched (prefill) HFP4G32 MoE GEMVs. Same "x is PLAIN, not rotated" contract
+/// as the decode pair above.
+pub const GEMV_HFP4G32_MOE_GATE_UP_INDEXED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfp4g32_moe_gate_up_indexed_batched.hip");
+
+pub const GEMV_HFP4G32_MOE_DOWN_INDEXED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfp4g32_moe_down_indexed_batched.hip");
+
+/// HFP4G32 MoE indexed GEMVs — E2M1 nibbles + UE8M0 per-32 block scale.
+///
+/// Unlike the MQ-family siblings above, X must NOT be FWHT-rotated: HFP4G32
+/// carries no baked rotation (format_flags bit 0 clear), so these read the
+/// PLAIN activation vector. Passing a rotated x is silently wrong.
+///
+/// These exist to serve DeepSeek V4's native FP4 experts without
+/// requantization (`--format deepseek4-fp4` repacks them bit-exactly into
+/// HFP4G32).
+pub const GEMV_HFP4G32_MOE_GATE_UP_INDEXED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfp4g32_moe_gate_up_indexed.hip");
+
+pub const GEMV_HFP4G32_MOE_DOWN_INDEXED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfp4g32_moe_down_indexed.hip");
 
 /// Strict superset of fused_rmsnorm_mq_rotate that ALSO writes the
 /// plain (non-FWHT) RMSNormed output to a second buffer. Eliminates the

@@ -214,14 +214,35 @@ pub(crate) fn run() {
         || format == "deepseek4-source-precision"
         || format == "deepseek4-source"
         || format == "deepseek4-mtp-precise"
+        || format == "deepseek4-dense-precise"
         || format == "deepseek4-mq4lloyd"
-        || format == "deepseek4-mq3lloyd";
+        || format == "deepseek4-mq3lloyd"
+        || format == "deepseek4-fp4"
+        || format == "deepseek4-fp4-passthrough";
     let use_deepseek4_mq2rxt_overlay = format == "deepseek4-mq2rxt-overlay";
     // deepseek4-mq4lloyd / deepseek4-mq3lloyd: identical recipe to deepseek4-q8
     // (non-expert 2D → Q8F16, norms/HC → F16) EXCEPT routed experts ship as
     // MQ4G256Lloyd (qt=30, 160 B/group) resp. MQ3G256Lloyd (qt=20, 112 B/group)
     // instead of MQ2G256Lloyd. Both require the matching MoE GEMV kernels in the
     // ds4 forward (MQ3-Lloyd kernels pre-existed; MQ4-Lloyd added alongside).
+    // deepseek4-fp4: routed experts repacked from the checkpoint's native FP4
+    // into HFP4G32 with NO requantization (bit-exact); everything else Q8F16 as
+    // per deepseek4-q8. This is the only ds4 recipe that preserves expert
+    // weights exactly, which is what a KLD/PPL reference needs.
+    let use_deepseek4_fp4_passthrough =
+        format == "deepseek4-fp4" || format == "deepseek4-fp4-passthrough";
+    // deepseek4-dense-precise: the TRUNK analogue of deepseek4-mtp-precise.
+    // Every non-expert 2D trunk weight (attention projections, shared experts,
+    // embed, lm_head, router gates) stays F16 instead of Q8F16; routed experts
+    // remain MQ2-Lloyd, so the MoE GEMV kernel contract is unchanged.
+    //
+    // Purpose is measurement, not shipping. A clean quant-error KLD needs a
+    // higher-precision reference of the SAME checkpoint, and for a 284B model no
+    // full-precision oracle fits on a 128 GB box. The dense classes are only
+    // ~8.2 GB of the 86 GB file, so upgrading JUST those costs ~7 GB and still
+    // loads. KLD(dense-F16 ‖ dense-Q8) then isolates exactly what the dense
+    // quantisation costs, with the expert quantisation held fixed.
+    let use_dense_precise = format == "deepseek4-dense-precise";
     let use_deepseek4_mq4_experts = format == "deepseek4-mq4lloyd";
     let use_deepseek4_mq3_experts = format == "deepseek4-mq3lloyd";
     // deepseek4-mtp-precise: addon-only build (use with --include-prefix mtp.) that
@@ -1565,6 +1586,15 @@ pub(crate) fn run() {
             "  [filter] --include-prefix {p:?} — only tensors with this prefix will be ingested"
         );
     }
+    // --exclude-prefix <prefix>: inverse of --include-prefix. Tensors whose
+    // name starts with this prefix are skipped even when the format would
+    // otherwise ingest them. Needed to build a trunk-only HFQ whose MTP
+    // surface is quantized separately at a different precision — see
+    // `passes_prefix_filter`.
+    let exclude_prefix = args.exclude_prefix.as_deref();
+    if let Some(p) = exclude_prefix {
+        eprintln!("  [filter] --exclude-prefix {p:?} — tensors with this prefix will be skipped");
+    }
     let mut skipped_params = 0u64;
     let mut mq2rxt_overlay_count = 0usize;
     // MiniMax AWQ: shared-per-layer expert scales, cached + sidecars emitted once.
@@ -1586,14 +1616,13 @@ pub(crate) fn run() {
             .any(|(n, _)| n.starts_with("model.language_model."));
     
     for (name, file_idx) in &all_tensors {
-        // --include-prefix filter (highest priority — runs before mtp/vision skips).
-        if let Some(p) = include_prefix {
-            if !name.starts_with(p) {
-                let (meta, _) = st_files[*file_idx].tensor_data(name).unwrap();
-                let n: usize = meta.shape.iter().product();
-                skipped_params += n as u64;
-                continue;
-            }
+        // --include-prefix / --exclude-prefix filter (highest priority — runs
+        // before the mtp/vision skips).
+        if !crate::model_filter::passes_prefix_filter(name, include_prefix, exclude_prefix) {
+            let (meta, _) = st_files[*file_idx].tensor_data(name).unwrap();
+            let n: usize = meta.shape.iter().product();
+            skipped_params += n as u64;
+            continue;
         }
         // Skip MTP head; optionally include vision encoder for VL inference.
         // Qwen3.5-VL names vision tensors `model.visual.*` / `visual.*`;
@@ -2141,6 +2170,46 @@ pub(crate) fn run() {
             // experts.` infix). So everything reaching here is a routed
             // expert → unconditionally FP4 unpack. Logical K dim doubles.
             let name_owned = name.to_string();
+            // FP4 passthrough: the checkpoint is already E2M1 + UE8M0 g32, which
+            // is exactly HFP4G32's container, so repack the bytes instead of
+            // round-tripping through f32 and re-quantizing. Bit-exact, and it
+            // skips the dequant entirely.
+            if use_deepseek4_fp4_passthrough
+                && (meta.dtype == "I8" || meta.dtype == "F8_E4M3")
+                && fp8_scale_for.contains_key(&name_owned)
+            {
+                let (sfi, sname) = &fp8_scale_for[&name_owned];
+                let (smeta, sbytes) = st_files[*sfi]
+                    .tensor_data(sname)
+                    .unwrap_or_else(|| panic!("FP scale tensor missing: {sname}"));
+                let logical_shape = vec![meta.shape[0], meta.shape[1] * 2];
+                let q = repack_e2m1_ue8m0_to_hfp4g32(raw_data, &meta.shape, sbytes, &smeta.shape);
+                let shape: Vec<u32> = logical_shape.iter().map(|&s| s as u32).collect();
+                eprintln!(
+                    "  {:>8}: {} storage{:?} → logical{:?} ({:.1} KB → {:.1} KB, exact)",
+                    "FP4pass",
+                    name,
+                    meta.shape,
+                    logical_shape,
+                    raw_data.len() as f64 / 1024.0,
+                    q.len() as f64 / 1024.0
+                );
+                hfq_tensors.push(HfqTensor {
+                    name: name.to_string(),
+                    quant_type: QuantType::HFP4G32,
+                    shape,
+                    group_size: 32,
+                    data: q,
+                    spilled_len: 0,
+                });
+                quantized_params += (logical_shape[0] * logical_shape[1]) as u64;
+                st_files[*file_idx].drop_tensor_pages(name);
+                if let Some(ref mut s) = spill {
+                    maybe_spill(&mut hfq_tensors, s, 2 * 1024 * 1024 * 1024);
+                }
+                continue;
+            }
+
             let (f32_data, logical_shape) = if (meta.dtype == "I8" || meta.dtype == "F8_E4M3")
                 && fp8_scale_for.contains_key(&name_owned)
             {
@@ -2269,7 +2338,16 @@ pub(crate) fn run() {
             && name.starts_with("mtp.")
             && !name.contains(".ffn.experts.")
             && should_quantize(name);
-        if (use_deepseek4_source_precision && is_deepseek4_keep_f16(name) || keep_f16_mtp)
+        // deepseek4-dense-precise: same rule, applied to the TRUNK instead of the
+        // MTP block. Routed experts stay MQ2-Lloyd (kernel contract), so this
+        // isolates the dense-class quantisation error for KLD.
+        let keep_f16_dense = use_dense_precise
+            && !name.starts_with("mtp.")
+            && !name.contains(".ffn.experts.")
+            && should_quantize(name);
+        if (use_deepseek4_source_precision && is_deepseek4_keep_f16(name)
+            || keep_f16_mtp
+            || keep_f16_dense)
             && n_elements >= 32
         {
             let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
