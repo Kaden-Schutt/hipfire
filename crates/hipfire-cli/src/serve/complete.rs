@@ -9,15 +9,23 @@
 //! normalisation, finishing). Groups the deterministic, heavily-tested
 //! transformations that convert daemon events into OpenAI responses.
 
+use crate::serve::http::request_id;
+use crate::serve::slots;
+use crate::serve::{Admission, AdmissionGuard, ServeMeta, ServeShared};
+use crate::{
+    apply_http_reasoning_request, config_bool, config_string, config_u64, insert_optional_f64,
+    insert_optional_u64, request_f64, request_string, request_u64, unix_timestamp, Paths,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use hipfire_client::ClientError;
 use hipfire_runtime::prompt_frame::ToolCall;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeSet, sync::{Arc, Mutex, mpsc}, thread, time::{Duration, Instant}};
-use crate::serve::{ServeShared, ServeMeta, Admission, AdmissionGuard};
-use crate::serve::slots;
-use crate::{Paths, config_string, config_u64, config_bool, request_string, request_f64, request_u64, insert_optional_f64, insert_optional_u64, apply_http_reasoning_request, unix_timestamp};
-use crate::serve::http::{request_id};
+use std::{
+    collections::BTreeSet,
+    sync::{mpsc, Arc, Mutex},
+    thread,
+    time::{Duration, Instant},
+};
 
 #[derive(Debug)]
 pub(crate) struct Completion {
@@ -30,6 +38,7 @@ pub(crate) struct Completion {
     pub(crate) tool_calls: Vec<ToolCall>,
     pub(crate) done: serde_json::Value,
     pub(crate) logprobs: Option<Vec<serde_json::Value>>,
+    pub(crate) reasoning: Option<crate::ReasoningResolution>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -206,7 +215,9 @@ pub(crate) fn longest_control_prefix_suffix(text: &str) -> usize {
 }
 
 /// Convert a daemon v2 structured tool-call JSON object into canonical [`ToolCall`].
-pub(crate) fn tool_call_from_canonical_value(value: &serde_json::Value) -> Result<ToolCall, String> {
+pub(crate) fn tool_call_from_canonical_value(
+    value: &serde_json::Value,
+) -> Result<ToolCall, String> {
     let obj = value
         .as_object()
         .ok_or_else(|| "tool call must be a JSON object".to_owned())?;
@@ -294,7 +305,9 @@ pub(crate) fn endpoint_adapter_status(kind: EndpointAdapterKind) -> EndpointAdap
 
 /// Gate `/v1/chat/completions` when the request carries a non-empty `tools` array.
 /// Tool-free requests are unchanged. Adapter availability never overrides producer safety.
-pub(crate) fn gate_chat_completions_tools(body: &serde_json::Value) -> Result<(), EndpointAdapterError> {
+pub(crate) fn gate_chat_completions_tools(
+    body: &serde_json::Value,
+) -> Result<(), EndpointAdapterError> {
     let has_tools = body
         .get("tools")
         .and_then(serde_json::Value::as_array)
@@ -447,7 +460,10 @@ impl SemanticEventFold {
     /// Parse canonical `calls` from a staged/final done envelope.
     /// When `finish_reason=tool_calls`, missing/non-array/malformed fails closed.
     /// Other finish reasons ignore `calls` (leave buffer untouched for withhold).
-    pub(crate) fn absorb_terminal_calls(&mut self, done: &serde_json::Value) -> Result<(), SemanticFoldError> {
+    pub(crate) fn absorb_terminal_calls(
+        &mut self,
+        done: &serde_json::Value,
+    ) -> Result<(), SemanticFoldError> {
         let finish = done
             .get("finish_reason")
             .and_then(serde_json::Value::as_str);
@@ -478,7 +494,9 @@ impl SemanticEventFold {
 
     /// Parse attempt_id: JSON numbers only (u64 or non-neg i64). Distinguishes
     /// missing vs malformed (string / null / negative / object).
-    pub(crate) fn parse_event_attempt_id(event: &serde_json::Value) -> Result<Option<u64>, SemanticFoldError> {
+    pub(crate) fn parse_event_attempt_id(
+        event: &serde_json::Value,
+    ) -> Result<Option<u64>, SemanticFoldError> {
         match event.get("attempt_id") {
             None => Ok(None),
             Some(value) => {
@@ -514,7 +532,10 @@ impl SemanticEventFold {
         }
     }
 
-    pub(crate) fn check_correlation(&self, event: &serde_json::Value) -> Result<(), SemanticFoldError> {
+    pub(crate) fn check_correlation(
+        &self,
+        event: &serde_json::Value,
+    ) -> Result<(), SemanticFoldError> {
         let current_attempt = self
             .current_attempt_id
             .ok_or(SemanticFoldError::NoActiveAttempt)?;
@@ -1153,8 +1174,7 @@ pub(crate) fn complete_request_attempt(
     // interval includes admission queueing, which is exactly the component a
     // serving operator needs when latency rises under load.
     let attempt_started = std::time::Instant::now();
-    let first_token_at: std::cell::Cell<Option<std::time::Duration>> =
-        std::cell::Cell::new(None);
+    let first_token_at: std::cell::Cell<Option<std::time::Duration>> = std::cell::Cell::new(None);
 
     // Latch retry-disabling observations on every event bound for the client.
     let mut event_callback = |event: &serde_json::Value| {
@@ -1175,7 +1195,7 @@ pub(crate) fn complete_request_attempt(
     // Acquire runtime, ensure model, and build the generate request while
     // holding the lock. Clone the engine handle before dropping the lock so
     // concurrent eligible requests can share the multiplexed transport.
-    let (generate, resolved, engine_clone) = {
+    let (generate, resolved, engine_clone, reasoning) = {
         let mut runtime = shared
             .runtime
             .lock()
@@ -1191,6 +1211,10 @@ pub(crate) fn complete_request_attempt(
                     // the next request must full-reload rather than trust it.
                     runtime.current_path = None;
                     runtime.current_arch = None;
+                    runtime.current_reasoning_contract =
+                        saddle_core::caps::ReasoningContract::Unsupported;
+                    runtime.current_reasoning_effort_native = false;
+                    runtime.current_reasoning_efforts = Vec::new();
                     runtime.continuous_batch_capable = false;
                     runtime.current_max_seq = 0;
                     runtime.cache_capable = false;
@@ -1277,8 +1301,17 @@ pub(crate) fn complete_request_attempt(
                 );
             }
         }
-        let deepseek4_effort_contract = runtime.current_arch.as_deref() == Some("deepseek4");
-        apply_http_reasoning_request(body, &resolved, &mut generate, deepseek4_effort_contract)?;
+        let contract = runtime.current_reasoning_contract;
+        let effort_native = runtime.current_reasoning_effort_native;
+        let supported_efforts = runtime.current_reasoning_efforts.clone();
+        let reasoning = apply_http_reasoning_request(
+            body,
+            &resolved,
+            &mut generate,
+            contract,
+            effort_native,
+            &supported_efforts,
+        )?;
         let (id, created) = identity.clone();
         generate["id"] = serde_json::Value::String(id.clone());
         generate["attempt_id"] = serde_json::json!(attempt_id);
@@ -1286,10 +1319,9 @@ pub(crate) fn complete_request_attempt(
             generate["serve_continuous_batch"] = serde_json::Value::Bool(true);
         }
         let engine_clone = runtime.engine.clone();
-        (generate, resolved, engine_clone)
+        (generate, resolved, engine_clone, reasoning)
     };
     let (id, created) = identity.clone();
-    // Dual route gated by StreamContractGate:
     // - first event must be gen_start with matching request id + attempt_id
     // - contract_version is read only after correlation succeeds
     // - legacy/v2 latched once; second gen_start and pre-start events rejected
@@ -1366,6 +1398,7 @@ pub(crate) fn complete_request_attempt(
                         tool_calls: fold.executable_tool_calls().to_vec(),
                         done: fold.done().cloned().unwrap_or(staged),
                         logprobs,
+                        reasoning: Some(reasoning.clone()),
                     }
                 }
                 StreamContract::Legacy => {
@@ -1399,6 +1432,7 @@ pub(crate) fn complete_request_attempt(
                         tool_calls,
                         done: staged,
                         logprobs,
+                        reasoning: Some(reasoning.clone()),
                     }
                 }
             };
@@ -1551,6 +1585,7 @@ pub(crate) fn complete_request_attempt(
             tool_calls: fold.executable_tool_calls().to_vec(),
             done,
             logprobs,
+            reasoning: Some(reasoning),
         });
     }
 
@@ -1578,8 +1613,10 @@ pub(crate) fn complete_request_attempt(
         tool_calls,
         done,
         logprobs,
+        reasoning: Some(reasoning),
     })
 }
+
 /// Server-owned one-retry driver over [`complete_request_attempt`].
 
 pub(crate) fn complete_request(
@@ -1597,14 +1634,34 @@ pub(crate) fn complete_request(
     // retry/attempt machinery below is for the daemon Engine's cold-reset
     // semantics and has no analogue here -- the engine either admits a request
     // or rejects it with a reason.
-    if let Some(backend) = shared.slot_engine.clone() {
-        return crate::serve::slots::complete_request_slots(
-            &backend,
-            body,
-            &identity,
-            &mut event_callback,
-            &mut terminal_callback,
-        );
+    //
+    // Reasoning correctness: slot machinery cannot honour the loaded model
+    // contract exactly (template framing, caps, reasoning metadata) without
+    // typed normalization. Route reasoning-capable requests through the
+    // daemon path and preserve slots only for models proven unsupported/plain.
+    // If no model is loaded yet we cannot prove unsupported, so fall through
+    // to the daemon which will load and negotiate the contract.
+    let slot_capable = {
+        let runtime = shared
+            .runtime
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        runtime.current_path.is_some()
+            && matches!(
+                runtime.current_reasoning_contract,
+                saddle_core::caps::ReasoningContract::Unsupported
+            )
+    };
+    if slot_capable {
+        if let Some(backend) = shared.slot_engine.clone() {
+            return crate::serve::slots::complete_request_slots(
+                &backend,
+                body,
+                &identity,
+                &mut event_callback,
+                &mut terminal_callback,
+            );
+        }
     }
 
     let mut attempt_index = 1u32;
@@ -1910,7 +1967,10 @@ pub(crate) fn normalize_openai_messages(
     serde_json::Value::Array(normalized)
 }
 
-pub(crate) fn inject_default_system_message(messages: &mut serde_json::Value, system: Option<&str>) {
+pub(crate) fn inject_default_system_message(
+    messages: &mut serde_json::Value,
+    system: Option<&str>,
+) {
     let Some(system) = system.filter(|value| !value.is_empty()) else {
         return;
     };
@@ -1990,7 +2050,9 @@ pub(crate) fn validate_logprobs_request(body: &serde_json::Value) -> Result<()> 
 /// Returns None if the event lacks `logprob` — some paths do not yet compute
 /// it, and the response must omit `logprobs` entirely rather than emit entries
 /// with null logprob values. `bytes` is the UTF-8 bytes of the token text.
-pub(crate) fn logprob_entry_from_token_event(event: &serde_json::Value) -> Option<serde_json::Value> {
+pub(crate) fn logprob_entry_from_token_event(
+    event: &serde_json::Value,
+) -> Option<serde_json::Value> {
     let text = event.get("text")?.as_str()?;
     let logprob = event.get("logprob")?.as_f64()?;
     let bytes: Vec<serde_json::Value> = text
@@ -2143,13 +2205,27 @@ pub(crate) fn completion_timings(completion: &Completion) -> serde_json::Value {
 /// Shared hipfire evidence projection for normal and streaming terminals.
 pub(crate) fn completion_hipfire(completion: &Completion) -> serde_json::Value {
     let done = &completion.done;
-    serde_json::json!({
+    let mut hip = serde_json::json!({
         "tok_s": done.get("tok_s"),
         "prefill_tok_s": done.get("prefill_tok_s"),
         "decode_tok_s": done.get("decode_tok_s"),
         "execution_mode": done.get("execution_mode"),
         "continuous_batch": done.get("continuous_batch"),
-    })
+    });
+    if let Some(reasoning) = &completion.reasoning {
+        hip["reasoning"] = serde_json::json!({
+            "contract": reasoning.contract.wire_name(),
+            "mode": reasoning.effective_mode,
+            "effort": reasoning.effective_effort,
+            "max_think_tokens": reasoning.effective_cap,
+            "cap_source": reasoning.cap_source,
+        });
+        hip["config_warnings"] = serde_json::json!(reasoning.warnings);
+    } else {
+        hip["reasoning"] = serde_json::Value::Null;
+        hip["config_warnings"] = serde_json::json!([]);
+    }
+    hip
 }
 
 /// One OpenAI-lowered tool call from the shared canonical adapter.
@@ -2164,7 +2240,9 @@ pub(crate) struct OpenAiToolCallAdapterResult {
 
 /// Build the single shared OpenAI adapter result vector for a completion.
 /// Deterministic response-scoped ids `call_{index}`; no filtering/dropping.
-pub(crate) fn openai_tool_call_adapter_results(calls: &[ToolCall]) -> Vec<OpenAiToolCallAdapterResult> {
+pub(crate) fn openai_tool_call_adapter_results(
+    calls: &[ToolCall],
+) -> Vec<OpenAiToolCallAdapterResult> {
     calls
         .iter()
         .enumerate()
@@ -2204,7 +2282,9 @@ pub(crate) fn openai_tool_calls(calls: &[ToolCall]) -> Vec<serde_json::Value> {
 /// Map a folded callback event to an OpenAI stream delta.
 /// Only clean content/reasoning are forwarded mid-stream; structured tool
 /// calls release only via [`openai_stream_terminal_chunks`].
-pub(crate) fn openai_stream_delta_for_event(event: &serde_json::Value) -> Option<serde_json::Value> {
+pub(crate) fn openai_stream_delta_for_event(
+    event: &serde_json::Value,
+) -> Option<serde_json::Value> {
     match event.get("type").and_then(serde_json::Value::as_str) {
         Some("token") => event
             .get("text")
@@ -2293,18 +2373,23 @@ pub(crate) fn openai_stream_terminal_chunks(
     chunks
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::serve::complete::{Completion};
-    use hipfire_runtime::prompt_frame::ToolCall;
-    use hipfire_client::ClientError;
+    use crate::serve::complete::Completion;
     use crate::{Paths, ServeArgs, StopArgs};
-    use hipfire_config::{ConfigLayer, ConfigPaths, ConfigSource, NamedLayer, resolve, load_global};
-    use hipfire_registry::{RegistryV1, RegistryPaths};
-    use std::{env, fs, path::{Path, PathBuf}, time::{Duration, Instant}, sync::{Arc, Mutex}};
+    use hipfire_client::ClientError;
+    use hipfire_config::{
+        load_global, resolve, ConfigLayer, ConfigPaths, ConfigSource, NamedLayer,
+    };
+    use hipfire_registry::{RegistryPaths, RegistryV1};
+    use hipfire_runtime::prompt_frame::ToolCall;
+    use std::{
+        env, fs,
+        path::{Path, PathBuf},
+        sync::{Arc, Mutex},
+        time::{Duration, Instant},
+    };
 
     fn test_paths(label: &str) -> Paths {
         let nonce = std::time::SystemTime::now()
@@ -2361,6 +2446,7 @@ mod tests {
                 "tok_s": 10.0,
             }),
             logprobs: None,
+            reasoning: None,
         }
     }
 
@@ -2387,6 +2473,7 @@ mod tests {
             tool_calls,
             done,
             logprobs: None,
+            reasoning: None,
         }
     }
 
@@ -2422,6 +2509,7 @@ mod tests {
             tool_calls: Vec::new(),
             done,
             logprobs: None,
+            reasoning: None,
         };
 
         let dflash = completion_timings(&completion(serde_json::json!({
@@ -2478,6 +2566,7 @@ mod tests {
                 "tok_s": 20.0,
             }),
             logprobs: None,
+            reasoning: None,
         };
         let timings = completion_timings(&completion);
         assert_eq!(timings["latency_ms"], 250.5);
@@ -2493,6 +2582,7 @@ mod tests {
             tool_calls: Vec::new(),
             done: serde_json::json!({"ttft_ms": 1.0}),
             logprobs: None,
+            reasoning: None,
         });
         assert!(no_lat["latency_ms"].is_null());
     }
@@ -2527,6 +2617,7 @@ mod tests {
                 "prefill_tokens": 8,
             }),
             logprobs: None,
+            reasoning: None,
         };
         let hip = completion_hipfire(&completion);
         assert_eq!(hip["execution_mode"], "continuous_batch_independent");
@@ -2572,6 +2663,7 @@ mod tests {
                 "tokens": 2,
             }),
             logprobs: None,
+            reasoning: None,
         };
         let seq_hip = completion_hipfire(&sequential);
         assert!(seq_hip["execution_mode"].is_null());
@@ -2907,55 +2999,372 @@ mod tests {
 
     #[test]
     fn http_reasoning_and_completion_metadata_match_native_contract() {
+        use hipfire_config::{resolve, ConfigLayer, ConfigSource, NamedLayer};
+        use saddle_core::caps::ReasoningContract;
+        use std::path::PathBuf;
         let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
-        let mut request = serde_json::json!({});
-        apply_http_reasoning_request(
-            &serde_json::json!({ "reasoning_effort": "high" }),
+        let qwen_supported = vec!["low".to_string(), "medium".to_string(), "xhigh".to_string()];
+        for effort in ["low", "medium", "xhigh"] {
+            let mut req = serde_json::json!({});
+            let res = apply_http_reasoning_request(
+                &serde_json::json!({ "reasoning_effort": effort }),
+                &resolved,
+                &mut req,
+                ReasoningContract::QwenJinja,
+                true,
+                &qwen_supported,
+            )
+            .unwrap();
+            assert_eq!(req["reasoning_effort"], effort);
+            assert_eq!(req["thinking_enabled"], true);
+            assert_eq!(req["assistant_prefix"], "open_think");
+            assert!(
+                req.get("max_think_tokens").is_none(),
+                "qwen {effort} must not invent max cap"
+            );
+            assert_eq!(res.effective_mode, "enabled");
+            assert_eq!(res.effective_effort.as_deref(), Some(effort));
+            assert_eq!(res.effective_cap, None);
+            assert_eq!(res.cap_source, "none");
+            assert!(res.warnings.is_empty());
+        }
+        let mut qwen_default = serde_json::json!({});
+        let res_default = apply_http_reasoning_request(
+            &serde_json::json!({}),
             &resolved,
-            &mut request,
+            &mut qwen_default,
+            ReasoningContract::QwenJinja,
+            true,
+            &qwen_supported,
+        )
+        .unwrap();
+        assert_eq!(qwen_default["reasoning_effort"], "xhigh");
+        assert_eq!(res_default.effective_effort.as_deref(), Some("xhigh"));
+        let mut qwen_capped = serde_json::json!({});
+        let res_capped = apply_http_reasoning_request(
+            &serde_json::json!({ "reasoning_effort": "low", "max_think_tokens": 2048 }),
+            &resolved,
+            &mut qwen_capped,
+            ReasoningContract::QwenJinja,
+            true,
+            &qwen_supported,
+        )
+        .unwrap();
+        assert_eq!(qwen_capped["reasoning_effort"], "low");
+        assert_eq!(qwen_capped["max_think_tokens"], 2048);
+        assert_eq!(res_capped.effective_cap, Some(2048));
+        assert_eq!(res_capped.cap_source, "explicit:body:max_think_tokens");
+        let mut qwen36 = serde_json::json!({});
+        let res36 = apply_http_reasoning_request(
+            &serde_json::json!({ "reasoning_effort": "low" }),
+            &resolved,
+            &mut qwen36,
+            ReasoningContract::QwenJinja,
             false,
+            &[],
         )
         .unwrap();
-        assert_eq!(request["reasoning_effort"], "high");
-        assert_eq!(request["max_think_tokens"], 4096);
-
-        let mut deepseek_uncapped = serde_json::json!({});
-        apply_http_reasoning_request(
-            &serde_json::json!({ "reasoning_effort": "max" }),
+        assert!(qwen36.get("reasoning_effort").is_none());
+        assert!(!res36.warnings.is_empty());
+        assert!(res36
+            .warnings
+            .iter()
+            .any(|w| w.contains("does not natively support")));
+        assert_eq!(res36.effective_effort, None);
+        let mut qwen36_cap = serde_json::json!({});
+        let res36cap = apply_http_reasoning_request(
+            &serde_json::json!({ "reasoning_effort": "low", "max_think_tokens": 2048 }),
             &resolved,
-            &mut deepseek_uncapped,
-            true,
+            &mut qwen36_cap,
+            ReasoningContract::QwenJinja,
+            false,
+            &[],
         )
         .unwrap();
-        assert_eq!(deepseek_uncapped["reasoning_effort"], "max");
-        assert_eq!(deepseek_uncapped["max_think_tokens"], 0);
-
-        let mut deepseek_explicitly_capped = serde_json::json!({});
-        apply_http_reasoning_request(
+        assert_eq!(qwen36_cap["max_think_tokens"], 2048);
+        assert_eq!(res36cap.effective_cap, Some(2048));
+        let mut budget_layer = ConfigLayer::default();
+        budget_layer.set_cli("reasoning.budget", "low").unwrap();
+        let budget_resolved = resolve([NamedLayer {
+            source: ConfigSource::GlobalUser {
+                path: PathBuf::from("config.toml"),
+            },
+            layer: budget_layer,
+        }])
+        .unwrap();
+        let mut qwen_nat_budget = serde_json::json!({});
+        let res_nat_budget = apply_http_reasoning_request(
+            &serde_json::json!({}),
+            &budget_resolved,
+            &mut qwen_nat_budget,
+            ReasoningContract::QwenJinja,
+            true,
+            &qwen_supported,
+        )
+        .unwrap();
+        assert!(
+            qwen_nat_budget.get("max_think_tokens").is_none(),
+            "native budget must be dropped"
+        );
+        assert!(!res_nat_budget.warnings.is_empty());
+        assert!(res_nat_budget
+            .warnings
+            .iter()
+            .any(|w| w.contains("thinking_budget") && w.contains("ignored")));
+        let mut qwen_non_budget = serde_json::json!({});
+        let res_non_budget = apply_http_reasoning_request(
+            &serde_json::json!({}),
+            &budget_resolved,
+            &mut qwen_non_budget,
+            ReasoningContract::QwenJinja,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(qwen_non_budget["max_think_tokens"], 512);
+        assert_eq!(res_non_budget.effective_cap, Some(512));
+        assert_eq!(res_non_budget.cap_source, "config:reasoning.budget");
+        let mut qwen_native_body_budget = serde_json::json!({});
+        let native_body_budget = apply_http_reasoning_request(
             &serde_json::json!({
-                "reasoning_effort": "max",
-                "max_think_tokens": 1234
+                "reasoning_effort": "xhigh",
+                "thinking_budget": "high"
             }),
             &resolved,
-            &mut deepseek_explicitly_capped,
+            &mut qwen_native_body_budget,
+            ReasoningContract::QwenJinja,
             true,
+            &qwen_supported,
         )
         .unwrap();
-        assert_eq!(deepseek_explicitly_capped["reasoning_effort"], "max");
-        assert_eq!(deepseek_explicitly_capped["max_think_tokens"], 1234);
-
+        assert!(qwen_native_body_budget.get("max_think_tokens").is_none());
+        assert_eq!(
+            native_body_budget.effective_effort.as_deref(),
+            Some("xhigh")
+        );
+        assert!(native_body_budget.effective_cap.is_none());
+        assert!(native_body_budget.warnings.iter().any(|warning| {
+            warning.contains("thinking_budget") && warning.contains("effort-native")
+        }));
+        let mut qwen36_body_budget = serde_json::json!({});
+        let qwen36_budget_resolution = apply_http_reasoning_request(
+            &serde_json::json!({ "thinking_budget": "high" }),
+            &resolved,
+            &mut qwen36_body_budget,
+            ReasoningContract::QwenJinja,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(qwen36_body_budget["max_think_tokens"], 8192);
+        assert_eq!(qwen36_budget_resolution.effective_cap, Some(8192));
+        assert_eq!(
+            qwen36_budget_resolution.cap_source,
+            "explicit:body:thinking_budget"
+        );
+        let mut qwen_max_and_budget = serde_json::json!({});
+        let qwen_max_resolution = apply_http_reasoning_request(
+            &serde_json::json!({
+                "reasoning_effort": "medium",
+                "thinking_budget": "high",
+                "max_think_tokens": 4096
+            }),
+            &resolved,
+            &mut qwen_max_and_budget,
+            ReasoningContract::QwenJinja,
+            true,
+            &qwen_supported,
+        )
+        .unwrap();
+        assert_eq!(qwen_max_and_budget["max_think_tokens"], 4096);
+        assert_eq!(qwen_max_resolution.effective_cap, Some(4096));
+        assert_eq!(
+            qwen_max_resolution.cap_source,
+            "explicit:body:max_think_tokens"
+        );
+        assert!(qwen_max_resolution
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("takes precedence")));
         let mut disabled = serde_json::json!({});
-        apply_http_reasoning_request(
-            &serde_json::json!({
-                "chat_template_kwargs": { "enable_thinking": false }
-            }),
+        let res_dis = apply_http_reasoning_request(
+            &serde_json::json!({ "thinking": { "type": "disabled" }, "reasoning_effort": "low", "max_think_tokens": 100 }),
             &resolved,
             &mut disabled,
-            false,
+            ReasoningContract::QwenJinja,
+            true,
+            &qwen_supported,
         )
         .unwrap();
-        assert_eq!(disabled["reasoning_effort"], "none");
-
+        assert_eq!(disabled["thinking_enabled"], false);
+        assert!(disabled.get("reasoning_effort").is_none());
+        assert!(disabled.get("max_think_tokens").is_none());
+        assert!(!res_dis.warnings.is_empty());
+        assert!(res_dis
+            .warnings
+            .iter()
+            .any(|w| w.contains("thinking disabled")));
+        assert_eq!(res_dis.effective_mode, "disabled");
+        for (input, expected) in [("minimal", "low"), ("medium", "high"), ("xhigh", "high")] {
+            let mut req = serde_json::json!({});
+            let res = apply_http_reasoning_request(
+                &serde_json::json!({ "reasoning_effort": input }),
+                &resolved,
+                &mut req,
+                ReasoningContract::DeepSeek4,
+                true,
+                &vec!["low".to_string(), "high".to_string(), "max".to_string()],
+            )
+            .unwrap();
+            assert_eq!(
+                req["reasoning_effort"], expected,
+                "deepseek {input} -> {expected}"
+            );
+            assert_eq!(res.effective_effort.as_deref(), Some(expected));
+        }
+        let mut ds_default = serde_json::json!({});
+        let res_ds_def = apply_http_reasoning_request(
+            &serde_json::json!({}),
+            &resolved,
+            &mut ds_default,
+            ReasoningContract::DeepSeek4,
+            true,
+            &vec!["low".to_string(), "high".to_string(), "max".to_string()],
+        )
+        .unwrap();
+        assert_eq!(ds_default["reasoning_effort"], "high");
+        assert_eq!(res_ds_def.effective_effort.as_deref(), Some("high"));
+        let mut gemma_effort = serde_json::json!({});
+        let res_gem_eff = apply_http_reasoning_request(
+            &serde_json::json!({ "reasoning_effort": "low" }),
+            &resolved,
+            &mut gemma_effort,
+            ReasoningContract::GemmaBoolean,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert!(gemma_effort.get("reasoning_effort").is_none());
+        assert!(!res_gem_eff.warnings.is_empty());
+        assert!(res_gem_eff
+            .warnings
+            .iter()
+            .any(|w| w.contains("gemma_boolean")));
+        let mut gemma_max = serde_json::json!({});
+        let res_gem_max = apply_http_reasoning_request(
+            &serde_json::json!({ "max_think_tokens": 100 }),
+            &resolved,
+            &mut gemma_max,
+            ReasoningContract::GemmaBoolean,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert!(gemma_max.get("max_think_tokens").is_none());
+        assert!(!res_gem_max.warnings.is_empty());
+        let mut glimmer_off = serde_json::json!({});
+        let res_glim_off = apply_http_reasoning_request(
+            &serde_json::json!({ "thinking": { "type": "disabled" } }),
+            &resolved,
+            &mut glimmer_off,
+            ReasoningContract::MuseGlimmer,
+            true,
+            &vec![
+                "low".to_string(),
+                "medium".to_string(),
+                "high".to_string(),
+                "xhigh".to_string(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(glimmer_off["thinking_enabled"], true);
+        assert!(!res_glim_off.warnings.is_empty());
+        assert!(res_glim_off
+            .warnings
+            .iter()
+            .any(|w| w.contains("muse_glimmer")));
+        assert_eq!(res_glim_off.effective_mode, "enabled");
+        let mut unsup = serde_json::json!({});
+        let res_unsup = apply_http_reasoning_request(
+            &serde_json::json!({ "reasoning_effort": "low" }),
+            &resolved,
+            &mut unsup,
+            ReasoningContract::Unsupported,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert!(unsup.get("reasoning_effort").is_none());
+        assert!(!res_unsup.warnings.is_empty());
+        assert_eq!(res_unsup.effective_mode, "disabled");
+        let mut unsup_ok = serde_json::json!({});
+        let res_unsup_ok = apply_http_reasoning_request(
+            &serde_json::json!({}),
+            &resolved,
+            &mut unsup_ok,
+            ReasoningContract::Unsupported,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert!(unsup_ok.get("thinking_enabled").is_none());
+        assert!(res_unsup_ok.warnings.is_empty());
+        let mut qwen_unknown = serde_json::json!({});
+        let qwen_unknown_resolution = apply_http_reasoning_request(
+            &serde_json::json!({ "reasoning_effort": "ultra" }),
+            &resolved,
+            &mut qwen_unknown,
+            ReasoningContract::QwenJinja,
+            true,
+            &qwen_supported,
+        )
+        .unwrap();
+        assert_eq!(qwen_unknown["reasoning_effort"], "xhigh");
+        assert_eq!(
+            qwen_unknown_resolution.effective_effort.as_deref(),
+            Some("xhigh")
+        );
+        assert!(!qwen_unknown_resolution.warnings.is_empty());
+        assert!(apply_http_reasoning_request(
+            &serde_json::json!({ "max_think_tokens": 999999 }),
+            &resolved,
+            &mut serde_json::json!({}),
+            ReasoningContract::QwenJinja,
+            true,
+            &qwen_supported,
+        )
+        .is_err());
+        let mut maybe_req = serde_json::json!({});
+        let maybe_res = apply_http_reasoning_request(
+            &serde_json::json!({ "thinking": { "type": "maybe" } }),
+            &resolved,
+            &mut maybe_req,
+            ReasoningContract::QwenJinja,
+            true,
+            &qwen_supported,
+        )
+        .unwrap();
+        assert!(
+            maybe_req.get("thinking_enabled").is_none()
+                || maybe_req["thinking_enabled"] == serde_json::json!(true)
+        );
+        assert!(!maybe_res.warnings.is_empty());
+        assert!(maybe_res
+            .warnings
+            .iter()
+            .any(|w| w.contains("thinking.type") && w.contains("dropped")));
+        let mut qwen_high = serde_json::json!({});
+        let res_qhigh = apply_http_reasoning_request(
+            &serde_json::json!({ "reasoning_effort": "high" }),
+            &resolved,
+            &mut qwen_high,
+            ReasoningContract::QwenJinja,
+            true,
+            &qwen_supported,
+        )
+        .unwrap();
+        assert_eq!(qwen_high["reasoning_effort"], "xhigh");
+        assert!(!res_qhigh.warnings.is_empty());
         let completion = Completion {
             id: "chatcmpl_test".into(),
             created: 7,
@@ -2971,124 +3380,25 @@ mod tests {
                 "ttft_ms": 8.5,
                 "decode_tok_s": 115.0,
                 "finish_reason": "stop",
-                "mtp_ngram": 3,
-                "ngram_mod_windows": 5,
-                "ngram_mod_drafts": 12,
-                "ngram_mod_accepted": 9,
-                "ngram_mod_accept_rate": 0.75,
-                "mtp_windows": 4,
-                "ar_windows": 2,
-                "mtp_retired": true
             }),
             logprobs: None,
+            reasoning: Some(res_default.clone()),
         };
         let json = completion_json(&completion);
-        assert_eq!(json["usage"]["total_tokens"], 19);
-        assert_eq!(json["usage"]["prompt_tokens_details"]["cached_tokens"], 4);
-        assert_eq!(json["timings"]["decode_tok_s"], 115.0);
-        assert_eq!(json["timings"]["mtp_ngram"], 3);
-        assert_eq!(json["timings"]["ngram_mod_windows"], 5);
-        assert_eq!(json["timings"]["ngram_mod_drafts"], 12);
-        assert_eq!(json["timings"]["ngram_mod_accepted"], 9);
-        assert_eq!(json["timings"]["ngram_mod_accept_rate"], 0.75);
-        assert_eq!(json["timings"]["mtp_windows"], 4);
-        assert_eq!(json["timings"]["ar_windows"], 2);
-        assert_eq!(json["timings"]["mtp_retired"], true);
-        assert_eq!(json["created"], 7);
-
-        let qwen_cached = Completion {
-            id: "chatcmpl_qwen_cached".into(),
-            created: 8,
-            model: "qwen:test".into(),
-            content: "answer".into(),
-            reasoning_content: String::new(),
-            preserve_thinking: false,
-            tool_calls: Vec::new(),
-            done: serde_json::json!({
-                "prefill_tokens": 8,
-                "cached_tokens": 12,
-                "tokens": 7
-            }),
-            logprobs: None,
-        };
-        let qwen_json = completion_json(&qwen_cached);
-        assert_eq!(qwen_json["usage"]["prompt_tokens"], 20);
-        assert_eq!(qwen_json["usage"]["total_tokens"], 27);
+        assert_eq!(json["hipfire"]["reasoning"]["contract"], "qwen_jinja");
+        assert_eq!(json["hipfire"]["reasoning"]["mode"], "enabled");
+        assert_eq!(json["hipfire"]["reasoning"]["effort"], "xhigh");
         assert_eq!(
-            qwen_json["usage"]["prompt_tokens_details"]["cached_tokens"],
-            12
+            json["hipfire"]["config_warnings"],
+            serde_json::json!(res_default.warnings)
         );
-
-        let preserved = Completion {
-            preserve_thinking: true,
-            reasoning_content: "private chain".into(),
-            ..qwen_cached
-        };
-        let preserved_json = completion_json(&preserved);
+        let chunks = openai_stream_terminal_chunks(&completion, false);
+        let terminal = chunks.last().unwrap();
+        assert_eq!(terminal["hipfire"]["reasoning"]["contract"], "qwen_jinja");
         assert_eq!(
-            preserved_json["choices"][0]["message"]["content"],
-            "<think>private chain</think>\nanswer"
+            terminal["hipfire"]["config_warnings"],
+            serde_json::json!(res_default.warnings)
         );
-        assert!(preserved_json["choices"][0]["message"]
-            .get("reasoning_content")
-            .is_none());
-    }
-
-    #[test]
-    fn apply_reasoning_request_accepts_medium_and_xhigh() {
-        use hipfire_config::{resolve, ConfigLayer, ConfigSource, NamedLayer};
-        use std::path::PathBuf;
-        for effort in ["low", "medium", "xhigh", "high", "max"] {
-            let mut layer = ConfigLayer::default();
-            layer.set_cli("reasoning.effort", effort).unwrap();
-            layer.set_cli("reasoning.max_tokens", "0").unwrap();
-            let resolved = resolve([NamedLayer {
-                source: ConfigSource::GlobalUser {
-                    path: PathBuf::from("config.toml"),
-                },
-                layer,
-            }])
-            .unwrap();
-            let mut req = serde_json::json!({});
-            crate::apply_reasoning_request(&resolved, &mut req).unwrap();
-            assert_eq!(
-                req["reasoning_effort"], effort,
-                "effort {effort} must pass through unchanged"
-            );
-        }
-        // auto stays unset (no key), none disables
-        let mut auto_layer = ConfigLayer::default();
-        auto_layer.set_cli("reasoning.effort", "auto").unwrap();
-        auto_layer.set_cli("reasoning.max_tokens", "0").unwrap();
-        let auto_resolved = resolve([NamedLayer {
-            source: ConfigSource::GlobalUser {
-                path: PathBuf::from("config.toml"),
-            },
-            layer: auto_layer,
-        }])
-        .unwrap();
-        let mut auto_req = serde_json::json!({});
-        crate::apply_reasoning_request(&auto_resolved, &mut auto_req).unwrap();
-        assert!(
-            auto_req.get("reasoning_effort").is_none(),
-            "auto must stay undefined"
-        );
-
-        let mut none_layer = ConfigLayer::default();
-        none_layer.set_cli("reasoning.effort", "none").unwrap();
-        none_layer.set_cli("reasoning.max_tokens", "0").unwrap();
-        let none_resolved = resolve([NamedLayer {
-            source: ConfigSource::GlobalUser {
-                path: PathBuf::from("config.toml"),
-            },
-            layer: none_layer,
-        }])
-        .unwrap();
-        let mut none_req = serde_json::json!({});
-        crate::apply_reasoning_request(&none_resolved, &mut none_req).unwrap();
-        assert_eq!(none_req["reasoning_effort"], "none");
-        assert_eq!(none_req["max_think_tokens"], 1);
-        assert_eq!(none_req["assistant_prefix"], "closed_think");
     }
 
     #[test]
@@ -3327,6 +3637,7 @@ mod tests {
             tool_calls: fold.executable_tool_calls().to_vec(),
             done: fold.done().cloned().unwrap(),
             logprobs: None,
+            reasoning: None,
         };
         let nonstream = completion_json(&completion);
         assert!(nonstream["choices"][0]["message"]["content"].is_null());
@@ -3400,6 +3711,7 @@ mod tests {
             tool_calls: fold.executable_tool_calls().to_vec(),
             done: fold.done().cloned().unwrap(),
             logprobs: None,
+            reasoning: None,
         };
 
         let nonstream = completion_json(&completion);
@@ -4870,7 +5182,8 @@ mod tests {
             validate_logprobs_request(&body).unwrap_or_else(|e| panic!("{n} should be valid: {e}"));
         }
         // logprobs true alone without top_logprobs is also valid
-        validate_logprobs_request(&serde_json::json!({ "logprobs": true })).expect("logprobs true alone");
+        validate_logprobs_request(&serde_json::json!({ "logprobs": true }))
+            .expect("logprobs true alone");
         // absent fields are valid
         validate_logprobs_request(&serde_json::json!({})).expect("empty");
         validate_logprobs_request(&serde_json::json!({ "logprobs": false })).expect("false");
@@ -4882,15 +5195,27 @@ mod tests {
         let bad = serde_json::json!({ "logprobs": true, "top_logprobs": 21 });
         assert!(validate_logprobs_request(&bad).is_err(), "21 should fail");
         let bad_neg = serde_json::json!({ "logprobs": true, "top_logprobs": -1 });
-        assert!(validate_logprobs_request(&bad_neg).is_err(), "-1 should fail");
+        assert!(
+            validate_logprobs_request(&bad_neg).is_err(),
+            "-1 should fail"
+        );
         // float must fail even if integral value
         let bad_float = serde_json::json!({ "logprobs": true, "top_logprobs": 5.0 });
-        assert!(validate_logprobs_request(&bad_float).is_err(), "5.0 float should fail");
+        assert!(
+            validate_logprobs_request(&bad_float).is_err(),
+            "5.0 float should fail"
+        );
         let bad_str = serde_json::json!({ "logprobs": true, "top_logprobs": "5" });
-        assert!(validate_logprobs_request(&bad_str).is_err(), "string should fail");
+        assert!(
+            validate_logprobs_request(&bad_str).is_err(),
+            "string should fail"
+        );
         // logprobs must be bool
         let bad_logprob_type = serde_json::json!({ "logprobs": "true" });
-        assert!(validate_logprobs_request(&bad_logprob_type).is_err(), "string logprobs should fail");
+        assert!(
+            validate_logprobs_request(&bad_logprob_type).is_err(),
+            "string logprobs should fail"
+        );
     }
 
     #[test]
@@ -4901,8 +5226,13 @@ mod tests {
             serde_json::json!({ "logprobs": null, "top_logprobs": 0 }),
         ];
         for body in &cases {
-            let err = validate_logprobs_request(body).expect_err("should reject top without logprobs true");
-            assert!(err.to_string().contains("top_logprobs requires logprobs"), "err={}", err);
+            let err = validate_logprobs_request(body)
+                .expect_err("should reject top without logprobs true");
+            assert!(
+                err.to_string().contains("top_logprobs requires logprobs"),
+                "err={}",
+                err
+            );
         }
     }
 
@@ -4918,9 +5248,13 @@ mod tests {
             tool_calls: Vec::new(),
             done: serde_json::json!({ "finish_reason": "stop", "tokens": 1 }),
             logprobs: None,
+            reasoning: None,
         };
         let json = completion_json(&completion);
-        assert!(json["choices"][0].get("logprobs").is_none(), "logprobs must be absent, not null");
+        assert!(
+            json["choices"][0].get("logprobs").is_none(),
+            "logprobs must be absent, not null"
+        );
         // empty vec also absent
         let empty = Completion {
             logprobs: Some(vec![]),
@@ -4934,10 +5268,14 @@ mod tests {
                 tool_calls: Vec::new(),
                 done: serde_json::json!({ "finish_reason": "stop", "tokens": 1 }),
                 logprobs: None,
+                reasoning: None,
             }
         };
         let json2 = completion_json(&empty);
-        assert!(json2["choices"][0].get("logprobs").is_none(), "empty content must also be absent");
+        assert!(
+            json2["choices"][0].get("logprobs").is_none(),
+            "empty content must also be absent"
+        );
     }
 
     #[test]
@@ -4956,7 +5294,10 @@ mod tests {
         assert!((entry["logprob"].as_f64().unwrap() - (-0.31)).abs() < 1e-6);
         assert_eq!(entry["bytes"], serde_json::json!([84, 104, 101]));
         assert_eq!(entry["top_logprobs"][0]["token"], "The");
-        assert_eq!(entry["top_logprobs"][0]["bytes"], serde_json::json!([84, 104, 101]));
+        assert_eq!(
+            entry["top_logprobs"][0]["bytes"],
+            serde_json::json!([84, 104, 101])
+        );
         assert_eq!(entry["top_logprobs"][1]["token"], "A");
         assert_eq!(entry["top_logprobs"][1]["bytes"], serde_json::json!([65]));
         // UTF-8 multi-byte
@@ -4982,6 +5323,7 @@ mod tests {
             tool_calls: Vec::new(),
             done: serde_json::json!({ "finish_reason": "stop" }),
             logprobs: None,
+            reasoning: None,
         };
         let json = completion_json(&completion);
         assert!(json["choices"][0].get("logprobs").is_none());
@@ -5004,10 +5346,14 @@ mod tests {
                 tool_calls: Vec::new(),
                 done: serde_json::json!({ "finish_reason": "stop" }),
                 logprobs: None,
+                reasoning: None,
             }
         };
         let json2 = completion_json(&with);
         assert_eq!(json2["choices"][0]["logprobs"]["content"][0]["token"], "hi");
-        assert_eq!(json2["choices"][0]["logprobs"]["content"][0]["bytes"], serde_json::json!([104, 105]));
+        assert_eq!(
+            json2["choices"][0]["logprobs"]["content"][0]["bytes"],
+            serde_json::json!([104, 105])
+        );
     }
 }

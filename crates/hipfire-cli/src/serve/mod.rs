@@ -82,6 +82,9 @@ pub(crate) struct ServeRuntime {
     pub(crate) registry: RegistryV1,
     pub(crate) current_path: Option<PathBuf>,
     pub(crate) current_arch: Option<String>,
+    pub(crate) current_reasoning_contract: saddle_core::caps::ReasoningContract,
+    pub(crate) current_reasoning_effort_native: bool,
+    pub(crate) current_reasoning_efforts: Vec<String>,
     pub(crate) continuous_batch_capable: bool,
     pub(crate) current_max_seq: u64,
     pub(crate) cache_capable: bool,
@@ -750,6 +753,9 @@ pub(crate) fn serve_foreground(
             registry: registry.clone(),
             current_path: None,
             current_arch: None,
+            current_reasoning_contract: saddle_core::caps::ReasoningContract::Unsupported,
+            current_reasoning_effort_native: false,
+            current_reasoning_efforts: Vec::new(),
             continuous_batch_capable: false,
             current_max_seq: 0,
             cache_capable: false,
@@ -861,6 +867,10 @@ pub(crate) fn serve_foreground(
                     if result.is_ok() {
                         runtime.current_path = None;
                         runtime.current_arch = None;
+                        runtime.current_reasoning_contract =
+                            saddle_core::caps::ReasoningContract::Unsupported;
+                        runtime.current_reasoning_effort_native = false;
+                        runtime.current_reasoning_efforts = Vec::new();
                         runtime.current_max_seq = 0;
                         runtime.cache_capable = false;
                     }
@@ -1006,6 +1016,25 @@ impl ServeRuntime {
                 .get("arch")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned);
+            self.current_reasoning_contract = loaded
+                .get("reasoning_contract")
+                .and_then(serde_json::Value::as_str)
+                .and_then(saddle_core::caps::ReasoningContract::from_wire_name)
+                .unwrap_or(saddle_core::caps::ReasoningContract::Unsupported);
+            self.current_reasoning_effort_native = loaded
+                .get("reasoning_effort_native")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            self.current_reasoning_efforts = loaded
+                .get("reasoning_efforts")
+                .and_then(serde_json::Value::as_array)
+                .map(|array| {
+                    array
+                        .iter()
+                        .filter_map(|value| value.as_str().map(|string| string.to_owned()))
+                        .collect()
+                })
+                .unwrap_or_default();
             self.continuous_batch_capable = loaded
                 .get("continuous_batch_capable")
                 .and_then(serde_json::Value::as_bool)
@@ -1682,7 +1711,6 @@ mod tests {
         let qwen = serde_json::json!({ "arch": "qwen3_5_moe" });
         let qwen_dense = serde_json::json!({ "arch": "qwen3_5" });
         let deepseek = serde_json::json!({ "arch": "deepseek4" });
-
         assert!(should_prewarm_qwen_mq4r_decode(
             Path::new("qwen3.6-35b-a3b.mq4r"),
             &qwen,
@@ -1708,5 +1736,92 @@ mod tests {
             &qwen,
             Some(2),
         ));
+    }
+
+    #[test]
+    fn reasoning_contract_handshake_parsing() {
+        use saddle_core::caps::ReasoningContract;
+        assert_eq!(
+            ReasoningContract::from_wire_name("qwen_jinja"),
+            Some(ReasoningContract::QwenJinja)
+        );
+        assert_eq!(
+            ReasoningContract::from_wire_name("deepseek4"),
+            Some(ReasoningContract::DeepSeek4)
+        );
+        assert_eq!(
+            ReasoningContract::from_wire_name("gemma_boolean"),
+            Some(ReasoningContract::GemmaBoolean)
+        );
+        assert_eq!(
+            ReasoningContract::from_wire_name("muse_glimmer"),
+            Some(ReasoningContract::MuseGlimmer)
+        );
+        assert_eq!(
+            ReasoningContract::from_wire_name("unsupported"),
+            Some(ReasoningContract::Unsupported)
+        );
+        assert_eq!(ReasoningContract::from_wire_name("unknown"), None);
+        assert_eq!(
+            ReasoningContract::from_wire_name("").unwrap_or(ReasoningContract::Unsupported),
+            ReasoningContract::Unsupported
+        );
+        let parsed =
+            ReasoningContract::from_wire_name("bogus").unwrap_or(ReasoningContract::Unsupported);
+        assert_eq!(parsed, ReasoningContract::Unsupported);
+        for contract in [
+            ReasoningContract::Unsupported,
+            ReasoningContract::QwenJinja,
+            ReasoningContract::DeepSeek4,
+            ReasoningContract::GemmaBoolean,
+            ReasoningContract::MuseGlimmer,
+        ] {
+            let wire = contract.wire_name();
+            assert_eq!(ReasoningContract::from_wire_name(wire), Some(contract));
+        }
+        let runtime_default = ReasoningContract::Unsupported;
+        assert_eq!(runtime_default, ReasoningContract::Unsupported);
+        let loaded = serde_json::json!({
+            "reasoning_effort_native": true,
+            "reasoning_efforts": ["low", "medium", "xhigh"]
+        });
+        assert_eq!(
+            loaded
+                .get("reasoning_effort_native")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            true
+        );
+        let efforts: Vec<String> = loaded
+            .get("reasoning_efforts")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(|s| s.to_owned()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            efforts,
+            vec!["low".to_string(), "medium".to_string(), "xhigh".to_string()]
+        );
+        let empty_loaded = serde_json::json!({});
+        assert_eq!(
+            empty_loaded
+                .get("reasoning_effort_native")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            false
+        );
+        let empty_efforts: Vec<String> = empty_loaded
+            .get("reasoning_efforts")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(|s| s.to_owned()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(empty_efforts.is_empty());
     }
 }

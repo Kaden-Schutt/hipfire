@@ -22,6 +22,7 @@ hipfire-config = { path = "../hipfire-config" }
 hipfire-client = { path = "../hipfire-client" }
 hipfire-registry = { path = "../hipfire-registry" }
 hipfire-runtime = { path = "../hipfire-runtime", default-features = false, features = ["deltanet"] }
+saddle-core = { path = "../saddle-core" }
 hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35", default-features = false, features = ["deltanet"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

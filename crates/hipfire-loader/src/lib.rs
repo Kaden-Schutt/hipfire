@@ -310,7 +310,9 @@ const REGISTRY: &[&dyn Carrier] = &[
 // ─── Constants ────────────────────────────────────────────────────────
 
 /// Built-in Qwen3.5/3.6 chat template (froggeric/Qwen at HF).
-/// Used when no per-model or env-override template is available.
+/// Fallback when arch 5/6 has no configured/per-model override and the HFQ
+/// lacks an embedded `tokenizer_config.chat_template` (older Qwen3.5/3.6 files).
+/// Qwen3.8 ships an official template with `reasoning_effort` and uses that.
 const FROGGERIC_QWEN35_TEMPLATE: &str =
     include_str!("../../hipfire-runtime/templates/eval/qwen35-froggeric-v20.jinja");
 
@@ -1268,7 +1270,10 @@ fn resolve_chat_template(hfq: &HfqFile, model_path: &str) -> Option<String> {
         return Some(s);
     }
     match hfq.arch_id {
-        5 | 6 => return Some(FROGGERIC_QWEN35_TEMPLATE.to_string()),
+        // Prefer HFQ-embedded tokenizer_config.chat_template (Qwen3.8 official
+        // low/medium/xhigh reasoning_effort). Fall back to froggeric for older
+        // Qwen3.5/3.6 files that lack one.
+        5 | 6 => return Some(qwen35_template_from_embedded(hfq.chat_template())),
         11 => {
             if let Some(t) = hfq.chat_template() {
                 return Some(t);
@@ -1292,6 +1297,12 @@ fn resolve_chat_template(hfq: &HfqFile, model_path: &str) -> Option<String> {
         _ => {}
     }
     hfq.chat_template()
+}
+
+/// Arch 5/6 template after configured/per-model overrides: embedded HFQ
+/// `tokenizer_config.chat_template` when present, else froggeric fallback.
+fn qwen35_template_from_embedded(embedded: Option<String>) -> String {
+    embedded.unwrap_or_else(|| FROGGERIC_QWEN35_TEMPLATE.to_string())
 }
 
 /// Rewrite the Onyx/Harmony chat template for Muse Glimmer (arch 14) so
@@ -1701,7 +1712,11 @@ fn finish_qwen35_load(
         let trunk_path = Path::new(ctx.path);
         let mut head_opt: Option<hipfire_arch_qwen35::mtp_head::Qwen35MtpHead> = None;
         let mut load_err: Option<String> = None;
-        match hipfire_arch_qwen35::mtp_head::load_mtp_head_bundled(trunk_path, ctx.gpu, physical_cap) {
+        match hipfire_arch_qwen35::mtp_head::load_mtp_head_bundled(
+            trunk_path,
+            ctx.gpu,
+            physical_cap,
+        ) {
             Ok(Some(h)) => {
                 eprintln!(
                     "  MTP head loaded (bundled .mq4-mtp): n_embd={} vocab={}",
@@ -1712,7 +1727,11 @@ fn finish_qwen35_load(
             Ok(None) => {
                 let sidecar = trunk_path.with_extension("mtp");
                 if sidecar.exists() {
-                    match hipfire_arch_qwen35::mtp_head::load_mtp_head(&sidecar, ctx.gpu, physical_cap) {
+                    match hipfire_arch_qwen35::mtp_head::load_mtp_head(
+                        &sidecar,
+                        ctx.gpu,
+                        physical_cap,
+                    ) {
                         Ok(h) => {
                             eprintln!(
                                 "  MTP head loaded (sidecar {}): n_embd={} vocab={}",
@@ -1723,7 +1742,8 @@ fn finish_qwen35_load(
                             head_opt = Some(h);
                         }
                         Err(e) => {
-                            load_err = Some(format!("sidecar {} load failed: {e}", sidecar.display()));
+                            load_err =
+                                Some(format!("sidecar {} load failed: {e}", sidecar.display()));
                         }
                     }
                 }
@@ -1732,7 +1752,11 @@ fn finish_qwen35_load(
                 load_err = Some(format!("bundled trailer load failed: {e}"));
                 let sidecar = trunk_path.with_extension("mtp");
                 if sidecar.exists() {
-                    match hipfire_arch_qwen35::mtp_head::load_mtp_head(&sidecar, ctx.gpu, physical_cap) {
+                    match hipfire_arch_qwen35::mtp_head::load_mtp_head(
+                        &sidecar,
+                        ctx.gpu,
+                        physical_cap,
+                    ) {
                         Ok(h) => {
                             eprintln!(
                                 "  MTP head loaded (sidecar {} after bundled error): n_embd={} vocab={}",
@@ -1744,7 +1768,8 @@ fn finish_qwen35_load(
                             load_err = None;
                         }
                         Err(e2) => {
-                            load_err = Some(format!("bundled: {e}; sidecar {}: {e2}", sidecar.display()));
+                            load_err =
+                                Some(format!("bundled: {e}; sidecar {}: {e2}", sidecar.display()));
                         }
                     }
                 }
@@ -1755,7 +1780,9 @@ fn finish_qwen35_load(
                 return Err(rollback_unfinished_qwen35(
                     format!(
                         "MTP head required (mtp=on) but not found: {}",
-                        load_err.unwrap_or_else(|| "no bundled trailer or .mtp sidecar found".to_string())
+                        load_err.unwrap_or_else(
+                            || "no bundled trailer or .mtp sidecar found".to_string()
+                        )
                     ),
                     bundle,
                     vision_weights,
@@ -1814,7 +1841,6 @@ fn finish_qwen35_load(
     };
     model.mtp_weights_present = mtp_present;
     Ok(model)
-
 }
 
 // ─── Main public API ──────────────────────────────────────────────────
@@ -3490,7 +3516,7 @@ mod registry_tests {
             generation_early_route, vision_route, BenchDecodeRoute, ContinuousBatchRoute,
             EpEosRoute, EpPromptRoute, GenerationEarlyRoute, VisionRoute,
         };
-        use saddle_core::caps::{ArchCaps, DflashKind};
+        use saddle_core::caps::{ArchCaps, DflashKind, ReasoningContract};
 
         let caps_of = |name: &str| -> ArchCaps {
             REGISTRY
@@ -3506,6 +3532,7 @@ mod registry_tests {
         assert_eq!(
             caps_of("qwen35"),
             ArchCaps {
+                reasoning_contract: ReasoningContract::QwenJinja,
                 supports_continuous_batch: true,
                 supports_ep_batch: true,
                 dflash: Some(DflashKind::Qwen),
@@ -3530,7 +3557,13 @@ mod registry_tests {
                 ..text_only
             }
         );
-        assert_eq!(caps_of("deepseek4"), text_only);
+        assert_eq!(
+            caps_of("deepseek4"),
+            ArchCaps {
+                reasoning_contract: ReasoningContract::DeepSeek4,
+                ..text_only
+            }
+        );
         assert_eq!(caps_of("minimax"), text_only);
         assert_eq!(
             caps_of("lfm2moe"),
@@ -3540,10 +3573,17 @@ mod registry_tests {
             }
         );
         assert_eq!(caps_of("cohere2moe"), text_only);
-        assert_eq!(caps_of("gemma4"), text_only);
+        assert_eq!(
+            caps_of("gemma4"),
+            ArchCaps {
+                reasoning_contract: ReasoningContract::GemmaBoolean,
+                ..text_only
+            }
+        );
         assert_eq!(
             caps_of("muse_glimmer"),
             ArchCaps {
+                reasoning_contract: ReasoningContract::MuseGlimmer,
                 semantic_contract_version: Some(2),
                 ..text_only
             }
@@ -3728,5 +3768,22 @@ mod registry_tests {
         for arch in ["gfx1030", "gfx942", "gfx1010", "gfx908"] {
             assert!(!is_dflash_lm_head_wmma_arch(arch), "{arch}");
         }
+    }
+
+    #[test]
+    fn qwen_embedded_template_wins_over_froggeric() {
+        // Qwen3.8-style embedded template carries official reasoning_effort.
+        let embedded = "{% if reasoning_effort %}{{ reasoning_effort }}{% endif %}".to_string();
+        let got = super::qwen35_template_from_embedded(Some(embedded.clone()));
+        assert_eq!(got, embedded);
+        assert!(got.contains("reasoning_effort"));
+        assert_ne!(got.as_str(), super::FROGGERIC_QWEN35_TEMPLATE);
+    }
+
+    #[test]
+    fn qwen_missing_template_uses_froggeric_fallback() {
+        // Legacy Qwen3.5/3.6 HFQs without tokenizer_config.chat_template.
+        let got = super::qwen35_template_from_embedded(None);
+        assert_eq!(got.as_str(), super::FROGGERIC_QWEN35_TEMPLATE);
     }
 }

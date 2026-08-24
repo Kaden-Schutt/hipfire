@@ -727,8 +727,9 @@ pub struct EffortCapability {
     /// Rungs from `EFFORT_RUNGS` that render without the template raising.
     pub supported: Vec<&'static str>,
     /// True when `reasoning_effort` actually changes the rendered prompt.
-    /// False means the template ignores it, so the caller should fall back to
-    /// the legacy token-budget ladder instead of pretending the dial works.
+    /// False means the template ignores it, so the caller should drop the
+    /// semantic effort with a warning (never reinterpret as a budget) and
+    /// require an explicit cap if a limit is desired.
     pub native: bool,
 }
 
@@ -741,7 +742,8 @@ impl EffortCapability {
     /// without silently *lowering* the ask.
     ///
     /// Returns `None` when the model is not effort-native or supports nothing,
-    /// which is the caller's signal to use the budget ladder.
+    /// which is the caller's signal to drop the unsupported effort with a
+    /// warning (never reinterpret as a budget cap).
     pub fn project(&self, requested: &str) -> Option<&'static str> {
         if !self.native || self.supported.is_empty() {
             return None;
@@ -771,9 +773,9 @@ impl EffortCapability {
 /// the variable undefined and once per rung.
 ///
 /// Cost is a handful of string renders, paid once at model load. This is the
-/// classifier behind the effort-native / budget-ladder split: a model that
-/// consumes effort gets its own vocabulary, and one that does not keeps the
-/// legacy ladder.
+/// classifier behind the effort-native split: a model that consumes effort
+/// gets its own vocabulary, and one that does not drops unsupported effort
+/// with a warning instead of converting it to a cap.
 pub fn probe_effort_capability(tokenizer: &Tokenizer, template: &str) -> EffortCapability {
     let probe = |effort: Option<&str>| -> Result<String, String> {
         let frame = JinjaChatFrame {
@@ -3678,8 +3680,9 @@ SYS:{{ build_system_message(system_message) }}:END
     #[test]
     fn probe_reports_not_native_when_template_ignores_effort() {
         // A thinking template with no reasoning_effort branch at all: every
-        // rung renders, none changes the output. Must degrade to the legacy
-        // budget ladder rather than pretending the dial works.
+        // rung renders, none changes the output. Must degrade to dropping
+        // the effort with a warning rather than pretending the dial works
+        // or reinterpreting as a budget.
         const IGNORES: &str = "\
 {%- for m in messages %}[{{ m.role }}:{{ m.content }}]{%- endfor -%}\
 {%- if add_generation_prompt -%}{{- '<think>\\n' -}}{%- endif -%}";
@@ -3837,5 +3840,44 @@ SYS:{{ build_system_message(system_message) }}:END
             out1.ends_with("<|im_start|>assistant\n<think>\n"),
             "thinking open: {out1:?}"
         );
+    }
+
+    // ── probe safe fallback and warn/drop invariant ────────────────────
+    #[test]
+    fn probe_broken_baseline_reports_safe_empty() {
+        // Baseline render failure (unrelated to effort) must not be misattributed;
+        // probe degrades to native=false, supported=[] so daemon can emit safe false/[].
+        const BROKEN: &str = "{{ raise_exception('template broken') }}";
+        let t = make_tokenizer();
+        let cap = probe_effort_capability(&t, BROKEN);
+        assert!(!cap.native, "broken baseline must be non-native");
+        assert!(
+            cap.supported.is_empty(),
+            "broken baseline must have no rungs"
+        );
+        assert_eq!(
+            cap.project("low"),
+            None,
+            "empty cap must project to None (drop, not budget)"
+        );
+    }
+
+    #[test]
+    fn probe_native_false_means_drop_not_budget() {
+        // A template that accepts all rungs but never varies (e.g. Qwen3.6) is
+        // not effort-native: project must return None so caller drops with warning
+        // and never reinterprets effort as a token budget.
+        const IGNORES_EFFORT: &str =
+            "{% for m in messages %}[{{ m.role }}:{{ m.content }}]{% endfor %}{% if add_generation_prompt %}GEN{% endif %}";
+        let t = make_tokenizer();
+        let cap = probe_effort_capability(&t, IGNORES_EFFORT);
+        assert!(!cap.native, "ignoring template must be non-native");
+        for rung in EFFORT_RUNGS {
+            assert_eq!(
+                cap.project(rung),
+                None,
+                "non-native must not project {rung} to a budget"
+            );
+        }
     }
 }

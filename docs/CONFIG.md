@@ -205,13 +205,25 @@ startup.
 | `repeat_penalty` | `1.05` | number 1.0–3.0 | Kept low; higher values harm some MQ4 greedy paths (source comment). Stored default only; see send path below. |
 | `max_tokens` | `4096` | int 1–393216 | Per-turn generation cap for run / OpenAI fallback; 384 Ki tokens matches DeepSeek V4 Flash 0731's documented maximum output length. |
 | `max_seq` | `32768` | int 512–1048576 | KV logical capacity at load; the 1 Mi-token ceiling is serviced by VMM growth where supported. |
-| `thinking` | `"on"` | `on` \| `off` | Whether visible `<think>` is kept/stripped in client paths. |
-| `reasoning_effort` | `"auto"` | `auto` \| `none` \| `low` \| `high` \| `max` | Parent-model prompt semantics. It is independent of the reasoning token cap; `max` does not imply a hidden cap. |
-| `thinking_budget` | `"med"` | `low` \| `med` \| `high` \| `xhigh` \| `max` \| `uncapped` | Named preset → effective think cap (below). |
-| `max_think_tokens` | *(absent)* | int 0–393216 when set | Optional explicit raw override. If unset, preset drives. `0` = unlimited. |
+| `thinking` | `"on"` | `on` \| `off` | Thinking **mode** (on/off). Independent of effort and of any hard think-token cap. When off wins, effort and cap controls are dropped with a warning. |
+| `reasoning_effort` | `"auto"` | `auto` \| `none` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | **Semantic** effort only — prompt / framing strength. Field meaning never changes by family and is **never** reinterpreted as a token budget. Unsupported or cross-family values are dropped with a warning (see below). |
+| `thinking_budget` | `"med"` | `low` \| `med` \| `high` \| `xhigh` \| `max` \| `uncapped` | Legacy **named cap preset** only on models that still honor that config route. Not an effort dial. On effort-native models the string is dropped with a warning (no implicit cap). |
+| `max_think_tokens` | *(absent)* | int 0–393216 when set | Explicit **integer** think-span cap (`reasoning.max_tokens`) on Qwen Jinja contracts. `0` or absence = uncapped. Positive N force-closes through the validated Qwen continuation path. DeepSeek, Gemma, Glimmer, and unsupported contracts drop this field with a warning rather than inventing model-specific closure behavior. Independent of mode and effort. |
 | `max_total_think_tokens` | `0` | int 0–1000000 | Cross-reopen total `<think>` budget; `0` = off. |
 
-**Thinking budget map** (`hipfire-config` schema, lowered by `hipfire-cli`):
+### Reasoning contract (three independent axes)
+
+Thinking controls are three orthogonal axes. A field's meaning never depends on
+model family:
+
+| Axis | Keys | Meaning |
+|---|---|---|
+| Mode | `thinking` / `reasoning.mode`; HTTP `chat_template_kwargs.enable_thinking`, `thinking.type` | Whether thinking is on or off for the turn |
+| Effort | `reasoning_effort` / `reasoning.effort`; HTTP `reasoning.effort` / `reasoning_effort` | Semantic prompt strength only — **never** a budget |
+| Cap | `max_think_tokens` / `reasoning.max_tokens`; legacy named `thinking_budget` / `reasoning.budget` | Hard think-token limit on contracts that support one; otherwise dropped+warned |
+
+**Thinking budget map** (legacy named presets → integer, only when the loaded
+model's contract still accepts the named-cap route):
 
 | Preset | Tokens |
 |---|---:|
@@ -222,10 +234,37 @@ startup.
 | `max` | 32768 |
 | `uncapped` | 0 (unlimited) |
 
-`reasoning_effort` and `thinking_budget` are deliberately orthogonal. An
-explicit HTTP `reasoning_effort=low|high|max` is uncapped unless the same
-request also supplies `max_think_tokens`. Registry profiles can select
-`thinking_budget=uncapped`; no effort level silently substitutes a hipfire cap.
+**Rules:**
+
+- Mode, effort, and cap are independent. Setting `reasoning_effort=low` does
+  **not** invent a think-token cap; setting `thinking_budget=high` does **not**
+  change effort.
+- **Effort-native** models (Qwen3.8, DeepSeek V4, Muse Glimmer) have **no**
+  registry or built-in think-token cap by default. Qwen3.8 accepts the explicit
+  integer cap through its validated continuation path. DeepSeek V4 and Muse
+  Glimmer expose effort but no parent-defined independent think-token cap, so
+  integer and named cap fields are dropped with a visible warning.
+- Registry cards may keep intentional `reasoning_effort` defaults. Omitting a
+  budget field is the correct uncapped signal — do not pin effort-native tags
+  to a hipfire named cap.
+- Thinking disabled wins: effort and cap are dropped with a warning.
+- Recognizable unsupported / cross-family values are normalized or dropped with
+  `[WARN: INVALID CONFIG]` (server log + OpenAI response metadata under
+  `hipfire.reasoning` / `hipfire.config_warnings`). Malformed types and
+  out-of-range integers remain hard errors.
+- Template probing only checks whether semantic effort is native; it never
+  changes field meaning.
+
+**Family examples** (full HTTP surface: [`SERVE.md`](SERVE.md)):
+
+| Family | Mode | Effort | Cap |
+|---|---|---|---|
+| **Qwen3.8** | `enable_thinking=false` → native empty closed think | `low` \| `medium` \| `xhigh` (default `xhigh`) | Positive `max_think_tokens` force-closes; 0/absent uncapped. Named `thinking_budget` dropped+warned |
+| **Qwen3.6** (non-effort-native template) | same on/off | Effort **dropped+warned** — never converted to a cap. Set `thinking_budget` or `max_think_tokens` explicitly if you want a limit | Named preset or integer as requested |
+| **DeepSeek V4** | `thinking.type` enabled/disabled (default on) | `low` \| `high` \| `max`; aliases `medium`/`xhigh`→`high`. | No parent-defined independent cap; integer/named cap fields dropped+warned |
+| **Gemma4** | Boolean thinking; official default **off**; Plain/Gemma channel framing | No native effort — unsupported effort/cap dropped+warned | Unsupported; dropped+warned |
+| **Muse Glimmer** | Always reasons (Onyx `to=self`); off dropped+warned | `low` \| `medium` \| `high` \| `xhigh` strength; no Qwen `<think>` framing | No parent-defined independent cap; integer/named cap fields dropped+warned |
+| **Unsupported** | Controls dropped+warned | dropped+warned | dropped+warned |
 
 **Effective sampling send order** (`request_f64` / `request_u64` / `run`): explicit CLI or HTTP request **>** per-model TOML overlay **>** registry `recommended_settings` **>** daemon/HFQ/arch fallback. This applies to `temperature`, `top_p`, `top_k`, `min_p`, `presence_penalty`, and `repeat_penalty`. Bare global sampling values are deliberately not transmitted on the current run/serve path; if one shadows a registry recommendation, the card value is recovered for that model. Registry entry `sampling` blocks are legacy metadata — the resolver reads `recommended_settings`; see [`MODELS.md`](MODELS.md).
 

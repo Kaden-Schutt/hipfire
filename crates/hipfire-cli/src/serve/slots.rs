@@ -9,19 +9,19 @@
 //! isolates the only arch-specific crate (`hipfire-arch-qwen35`) so the CLI
 //! can be built arch-free with `--no-default-features`.
 
+use crate::serve::complete::Completion;
 #[cfg(feature = "multi-slot")]
 use anyhow::{anyhow, bail, Context, Result};
 #[cfg(not(feature = "multi-slot"))]
 use anyhow::{bail, Result};
-use std::sync::{Arc, mpsc};
-#[cfg(feature = "multi-slot")]
-use hipfire_runtime::tokenizer::Tokenizer;
 #[cfg(feature = "multi-slot")]
 use hipfire_runtime::prompt_frame::{AssistantPrefix, ChatFrame, Role};
 #[cfg(feature = "multi-slot")]
 use hipfire_runtime::serve::{Event, SubmitRequest};
+#[cfg(feature = "multi-slot")]
+use hipfire_runtime::tokenizer::Tokenizer;
 use serde_json;
-use crate::serve::complete::Completion;
+use std::sync::{mpsc, Arc};
 
 #[cfg(feature = "multi-slot")]
 pub(crate) struct SlotBackend {
@@ -31,7 +31,6 @@ pub(crate) struct SlotBackend {
 
 #[cfg(not(feature = "multi-slot"))]
 pub(crate) struct SlotBackend;
-
 
 #[cfg(feature = "multi-slot")]
 pub(crate) fn complete_request_slots(
@@ -237,6 +236,14 @@ pub(crate) fn complete_request_slots(
         tool_calls: Vec::new(),
         done: serde_json::json!({ "finish_reason": finish }),
         logprobs: None,
+        reasoning: Some(crate::ReasoningResolution {
+            effective_mode: "disabled".to_string(),
+            effective_effort: None,
+            effective_cap: None,
+            cap_source: "none".to_string(),
+            contract: saddle_core::caps::ReasoningContract::Unsupported,
+            warnings: Vec::new(),
+        }),
     };
     // The terminal callback is what stages the response body and signals the
     // HTTP handler that the request succeeded. Skipping it leaves the handler
@@ -245,7 +252,6 @@ pub(crate) fn complete_request_slots(
     terminal_callback(&completion).map_err(|e| anyhow!("terminal callback: {e}"))?;
     Ok(completion)
 }
-
 
 #[cfg(not(feature = "multi-slot"))]
 pub(crate) fn complete_request_slots(

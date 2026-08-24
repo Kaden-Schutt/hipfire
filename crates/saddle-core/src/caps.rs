@@ -26,6 +26,43 @@ pub enum DflashKind {
     Llama,
 }
 
+/// Native reasoning-control protocol declared by a model architecture.
+///
+/// Effort selects prompt semantics. Any explicit thinking-token limit remains
+/// an independent inference policy and is never derived from this enum.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ReasoningContract {
+    #[default]
+    Unsupported,
+    QwenJinja,
+    DeepSeek4,
+    GemmaBoolean,
+    MuseGlimmer,
+}
+
+impl ReasoningContract {
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Unsupported => "unsupported",
+            Self::QwenJinja => "qwen_jinja",
+            Self::DeepSeek4 => "deepseek4",
+            Self::GemmaBoolean => "gemma_boolean",
+            Self::MuseGlimmer => "muse_glimmer",
+        }
+    }
+
+    pub fn from_wire_name(value: &str) -> Option<Self> {
+        match value {
+            "unsupported" => Some(Self::Unsupported),
+            "qwen_jinja" => Some(Self::QwenJinja),
+            "deepseek4" => Some(Self::DeepSeek4),
+            "gemma_boolean" => Some(Self::GemmaBoolean),
+            "muse_glimmer" => Some(Self::MuseGlimmer),
+            _ => None,
+        }
+    }
+}
+
 /// Declared capabilities of one architecture.
 ///
 /// Every field is set by the carrier that claims the identifier; the daemon
@@ -34,6 +71,8 @@ pub enum DflashKind {
 /// the family name — e.g. `spec_excludes_adaptive` rather than `is_qwen`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArchCaps {
+    /// Native reasoning and thinking control protocol.
+    pub reasoning_contract: ReasoningContract,
     /// Single-GPU continuous batching (independent decode lanes).
     ///
     /// True for Qwen3.5 (5,6) and LFM2.5 (11). See
@@ -119,6 +158,7 @@ impl Default for ArchCaps {
             spec_excludes_adaptive: false,
             semantic_contract_version: None,
             has_deltanet: false,
+            reasoning_contract: ReasoningContract::Unsupported,
             supports_images: false,
         }
     }
@@ -165,7 +205,15 @@ mod tests {
     #[test]
     fn default_is_text_only_no_images() {
         let caps = ArchCaps::default();
-        assert!(!caps.supports_images, "text-only default must not support images");
+        assert!(
+            !caps.supports_images,
+            "text-only default must not support images"
+        );
+        assert_eq!(
+            caps.reasoning_contract,
+            ReasoningContract::Unsupported,
+            "default must not claim a reasoning protocol"
+        );
         // All other caps also false/None for text-only baseline.
         assert!(!caps.supports_continuous_batch);
         assert!(!caps.supports_ep_batch);
@@ -180,6 +228,7 @@ mod tests {
     fn vl_arch_caps_declare_images() {
         // Mirrors Qwen35Carrier and DotsOcrCarrier declarations.
         let qwen35_vl = ArchCaps {
+            reasoning_contract: ReasoningContract::QwenJinja,
             supports_continuous_batch: true,
             supports_ep_batch: true,
             dflash: Some(DflashKind::Qwen),
@@ -193,8 +242,14 @@ mod tests {
             supports_images: true,
             ..ArchCaps::default()
         };
-        assert!(qwen35_vl.supports_images, "Qwen3.5-VL must declare image support");
-        assert!(dots_ocr.supports_images, "dots.ocr must declare image support");
+        assert!(
+            qwen35_vl.supports_images,
+            "Qwen3.5-VL must declare image support"
+        );
+        assert!(
+            dots_ocr.supports_images,
+            "dots.ocr must declare image support"
+        );
 
         // Text-only archetypes must stay false.
         let llama = ArchCaps {
@@ -202,7 +257,30 @@ mod tests {
             ..ArchCaps::default()
         };
         let qwen2 = ArchCaps::default();
-        assert!(!llama.supports_images, "Llama (text-only) must not declare image support");
-        assert!(!qwen2.supports_images, "Qwen2 (text-only) must not declare image support");
+        assert!(
+            !llama.supports_images,
+            "Llama (text-only) must not declare image support"
+        );
+        assert!(
+            !qwen2.supports_images,
+            "Qwen2 (text-only) must not declare image support"
+        );
+    }
+
+    #[test]
+    fn reasoning_contract_wire_names_round_trip() {
+        for contract in [
+            ReasoningContract::Unsupported,
+            ReasoningContract::QwenJinja,
+            ReasoningContract::DeepSeek4,
+            ReasoningContract::GemmaBoolean,
+            ReasoningContract::MuseGlimmer,
+        ] {
+            assert_eq!(
+                ReasoningContract::from_wire_name(contract.wire_name()),
+                Some(contract)
+            );
+        }
+        assert_eq!(ReasoningContract::from_wire_name("unknown"), None);
     }
 }

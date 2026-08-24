@@ -1262,6 +1262,7 @@ dependencies = [
  "hipfire-registry",
  "hipfire-runtime",
  "libc",
+ "saddle-core",
  "serde",
  "serde_json",
  "sha2",

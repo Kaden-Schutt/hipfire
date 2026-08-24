@@ -84,7 +84,7 @@ Local-forcing (skip a healthy serve): `HIPFIRE_LOCAL=1`, `--kv-mode`, or `--imag
 | `hipfire config list\|get\|set\|reset ...` | Scriptable global ops (`--json` on list/get). |
 | `hipfire config <tag> list\|get\|set\|reset ...` | Same, scoped to per-model keys. |
 
-Do not inventory every key here — [CONFIG.md](CONFIG.md) owns defaults and ranges. Notable defaults from source: `dflash_mode=off`, `speculation=auto`, `thinking=on`, `thinking_budget=med`, `max_tokens=4096`, `idle_timeout=300`.
+Do not inventory every key here — [CONFIG.md](CONFIG.md) owns defaults and ranges. Notable defaults from source: `dflash_mode=off`, `speculation=auto`, `thinking=on`, `reasoning_effort=auto`, schema default `thinking_budget=med` (legacy named-cap route only; dropped+warned on effort-native models), `max_tokens=4096`, `idle_timeout=300`. Qwen Jinja contracts additionally accept an explicit integer think cap; other families do not synthesize a force-close mechanism. Reasoning axes and family examples: [CONFIG.md](CONFIG.md), [SERVE.md](SERVE.md).
 
 ## Quantization and calibration
 

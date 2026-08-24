@@ -2009,14 +2009,14 @@ pub fn generate_gemma4(
     top_p: f32,
     max_tokens: usize,
     max_think_tokens: usize,
+    enable_thinking: bool,
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
     // `Some(k)` emits OpenAI logprobs with k candidates per token. `None` is the
     // default and produces exactly the envelope this path emitted before.
     logprobs_top_k: Option<usize>,
 ) {
-    // v1 is non-thinking; the think budget only gates thinking-capable paths.
-    let _ = max_think_tokens;
+    // Gemma4 thinking is explicit boolean (default off); max_think_tokens is orthogonal cap.
 
     if m.tokenizer.is_none() {
         emit_error_with_id(stdout, id, "tokenizer not loaded");
@@ -2056,7 +2056,7 @@ pub fn generate_gemma4(
                 template,
                 system: system_prompt,
                 user: prompt,
-                enable_thinking: max_think_tokens != 1,
+                enable_thinking,
                 bos_token: Some("<bos>"),
                 reasoning_strength: None,
                 reasoning_effort: None,
@@ -2217,6 +2217,7 @@ pub fn generate_gemma4(
         m.conversation_tokens.push(tok);
     }
     let prefill_ms = t0.elapsed().as_millis();
+    let mut gemma_router = GemmaThoughtRouter::new(enable_thinking, max_think_tokens);
 
     // ── EAGLE spec-decode fast path (arch-22 drafter loaded; greedy only) ──
     //
@@ -2339,13 +2340,13 @@ pub fn generate_gemma4(
                     let tokenizer = m.tokenizer.as_ref().unwrap();
                     tokenizer.decode(&[t])
                 };
-                let envelope = serde_json::json!({
-                    "type": "token",
-                    "id": id,
-                    "text": frag,
-                });
-                let _ = writeln!(stdout, "{}", envelope);
-                let _ = stdout.flush();
+                let (emits, _) = gemma_router.push(&frag);
+                for ev in emits {
+                    match ev {
+                        GemmaEmit::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
+                        GemmaEmit::Token(text) => emit_visible_token(stdout, id, &text),
+                    }
+                }
                 m.conversation_tokens.push(t);
                 generated_count += 1;
                 if generated_count >= max_tokens {
@@ -2456,25 +2457,31 @@ pub fn generate_gemma4(
             let tokenizer = m.tokenizer.as_ref().unwrap();
             tokenizer.decode(&[next_tok])
         };
-        let mut envelope = serde_json::json!({
-            "type": "token",
-            "id": id,
-            "text": frag,
-            "attempt_id": active_attempt_id(),
-        });
-        // Logprobs are opt-in per request. When absent, this is exactly the
-        // envelope that was emitted before, so the default path is unchanged.
-        if let Some((lp, top)) = crate::common::token_logprob_fields(
-            &last_logits,
-            next_tok,
-            logprobs_top_k,
-            m.tokenizer.as_ref().unwrap(),
-        ) {
-            envelope["logprob"] = serde_json::json!(lp);
-            envelope["top_logprobs"] = top;
+        let (emits, _) = gemma_router.push(&frag);
+        for ev in emits {
+            match ev {
+                GemmaEmit::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
+                GemmaEmit::Token(text) => {
+                    let mut envelope = serde_json::json!({
+                        "type": "token",
+                        "id": id,
+                        "text": text,
+                        "attempt_id": active_attempt_id(),
+                    });
+                    if let Some((lp, top)) = crate::common::token_logprob_fields(
+                        &last_logits,
+                        next_tok,
+                        logprobs_top_k,
+                        m.tokenizer.as_ref().unwrap(),
+                    ) {
+                        envelope["logprob"] = serde_json::json!(lp);
+                        envelope["top_logprobs"] = top;
+                    }
+                    let _ = writeln!(stdout, "{}", envelope);
+                    let _ = stdout.flush();
+                }
+            }
         }
-        let _ = writeln!(stdout, "{}", envelope);
-        let _ = stdout.flush();
         m.conversation_tokens.push(next_tok);
         generated_count += 1;
 
@@ -2499,6 +2506,21 @@ pub fn generate_gemma4(
             Err(e) => {
                 emit_error_with_id(stdout, id, format!("gemma4 decode failed: {e:?}"));
                 return;
+            }
+        }
+    }
+    for ev in gemma_router.flush() {
+        match ev {
+            GemmaEmit::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
+            GemmaEmit::Token(text) => {
+                let _ = writeln!(
+                    stdout,
+                    r#"{{"type":"token","id":"{}","text":{},"attempt_id":{}}}"#,
+                    id,
+                    serde_json::to_string(&text).unwrap(),
+                    active_attempt_id()
+                );
+                let _ = stdout.flush();
             }
         }
     }
@@ -2606,31 +2628,16 @@ pub enum GlimmerEmit {
 /// force-close one mid-flight, which wastes the tokens it already spent. Asking for a lower
 /// strength up front is what actually shortens the reasoning, so the two are wired together.
 pub fn glimmer_reasoning_strength(
-    think_mode: hipfire_runtime::prompt_frame::ThinkMode,
+    reasoning_effort: Option<&str>,
     max_think_tokens: usize,
 ) -> &'static str {
-    use hipfire_runtime::prompt_frame::ThinkMode;
-    // An EXPLICIT request-level effort wins: the card presents reasoning strength as the
-    // user-facing dial, so `reasoning_effort` must reach the system block directly rather
-    // than being inferred from whatever token cap happens to be set.
-    match think_mode {
-        ThinkMode::High => return "high",
-        ThinkMode::Max => return "xhigh",
-        // `ThinkMode::from_str` folds "medium"/"med" into `Low`, so `Low` cannot distinguish
-        // the card's low from its medium. Fall through to the budget, which can — that keeps
-        // all four levels reachable without redefining `ThinkMode` for the other
-        // architectures that share it.
-        ThinkMode::Low | ThinkMode::NonThink => {}
-    }
-    match max_think_tokens {
-        // `1` is the engine's "no thinking" sentinel. Muse Glimmer has no such mode — the
-        // Onyx system block always carries a strength — so it maps to the minimum, not to off.
-        1 => "low",
-        0 => "high", // uncapped: the template's own default
-        n if n <= 512 => "low",
-        n if n <= 2048 => "medium",
-        n if n <= 8192 => "high",
-        _ => "xhigh",
+    let _ = max_think_tokens;
+    match reasoning_effort {
+        Some(s) if s.eq_ignore_ascii_case("low") => "low",
+        Some(s) if s.eq_ignore_ascii_case("medium") || s.eq_ignore_ascii_case("med") => "medium",
+        Some(s) if s.eq_ignore_ascii_case("high") => "high",
+        Some(s) if s.eq_ignore_ascii_case("xhigh") || s.eq_ignore_ascii_case("max") => "xhigh",
+        _ => "high",
     }
 }
 
@@ -2824,6 +2831,232 @@ impl GlimmerHarmonyRouter {
             GlimmerEmit::Token(text)
         }]
     }
+}
+
+/// Gemma thought-channel router (minimal, follows Glimmer patterns and checked-in Gemma template).
+///
+/// Gemma4 template uses `<|channel>thought\n` ... `\n<channel|>` to wrap reasoning.
+/// When `enable_thinking` is false the Jinja prompt already emits a closed empty
+/// `thought` channel (`<|channel>thought\n<channel|>`), so the router starts in
+/// Answer mode. When true it starts awaiting the thought opening. Content inside
+/// the thought channel is emitted as semantic `reasoning` events;
+/// content outside is visible answer tokens. `max_think_tokens` is an orthogonal
+/// force-close cap (0 = uncapped) that, when reached, flushes pending reasoning
+/// and transitions to Answer, mirroring Glimmer's `max_think_tokens` handling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GemmaChannel {
+    AwaitingThought,
+    Reasoning,
+    Answer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GemmaEmit {
+    Reasoning(String),
+    Token(String),
+}
+
+pub struct GemmaThoughtRouter {
+    pub state: GemmaChannel,
+    pub pending: String,
+    pub reasoning_tokens: usize,
+    pub max_think_tokens: usize,
+    pub enable_thinking: bool,
+    pub just_forced: bool,
+}
+
+impl GemmaThoughtRouter {
+    pub fn new(enable_thinking: bool, max_think_tokens: usize) -> Self {
+        let state = if enable_thinking {
+            GemmaChannel::AwaitingThought
+        } else {
+            GemmaChannel::Answer
+        };
+        Self {
+            state,
+            pending: String::new(),
+            reasoning_tokens: 0,
+            max_think_tokens,
+            enable_thinking,
+            just_forced: false,
+        }
+    }
+
+    pub fn push(&mut self, frag: &str) -> (Vec<GemmaEmit>, bool) {
+        if frag.is_empty() {
+            return (Vec::new(), false);
+        }
+        self.pending.push_str(frag);
+        let mut out = Vec::new();
+        let entered_as_reasoning = self.state == GemmaChannel::Reasoning;
+        loop {
+            match self.state {
+                GemmaChannel::AwaitingThought => {
+                    if let Some(pos) = self.pending.find("<|channel>thought") {
+                        let mut header_end = pos + "<|channel>thought".len();
+                        if self.pending[header_end..].starts_with('\n') {
+                            header_end += 1;
+                        }
+                        if pos > 0 {
+                            let pre = self.pending[..pos].to_string();
+                            self.pending.drain(..pos);
+                            header_end -= pos;
+                            if !pre.is_empty() && !gemma_is_marker_prefix(&pre) {
+                                out.push(GemmaEmit::Token(pre));
+                            }
+                            continue;
+                        }
+                        self.pending.drain(..header_end);
+                        self.state = GemmaChannel::Reasoning;
+                        continue;
+                    } else {
+                        let hold = gemma_longest_marker_suffix(&self.pending);
+                        if hold == 0 || hold >= self.pending.len() {
+                            break;
+                        }
+                        let emit_len = self.pending.len() - hold;
+                        if emit_len > 0 {
+                            let text = self.pending[..emit_len].to_string();
+                            self.pending.drain(..emit_len);
+                            if !text.is_empty() && !gemma_is_marker_prefix(&text) {
+                                out.push(GemmaEmit::Token(text));
+                            }
+                        }
+                        break;
+                    }
+                }
+                GemmaChannel::Reasoning => {
+                    if let Some(pos) = self.pending.find("<channel|>") {
+                        if pos > 0 {
+                            let text = self.pending[..pos].to_string();
+                            self.pending.drain(..pos);
+                            if !text.is_empty() {
+                                out.push(GemmaEmit::Reasoning(text));
+                            }
+                            continue;
+                        }
+                        let end = "<channel|>".len();
+                        self.pending.drain(..end);
+                        if self.pending.starts_with('\n') {
+                            self.pending.drain(..1);
+                        }
+                        self.state = GemmaChannel::Answer;
+                        continue;
+                    } else {
+                        let hold = gemma_longest_marker_suffix(&self.pending);
+                        let emit_len = self.pending.len().saturating_sub(hold);
+                        if emit_len > 0 {
+                            let text = self.pending[..emit_len].to_string();
+                            self.pending.drain(..emit_len);
+                            if !text.is_empty() {
+                                out.push(GemmaEmit::Reasoning(text));
+                            }
+                        }
+                        break;
+                    }
+                }
+                GemmaChannel::Answer => {
+                    if let Some(pos) = self.pending.find("<turn|>") {
+                        if pos > 0 {
+                            let text = self.pending[..pos].to_string();
+                            self.pending.drain(..pos);
+                            if !text.is_empty() {
+                                out.push(GemmaEmit::Token(text));
+                            }
+                            continue;
+                        }
+                        self.pending.drain(.."<turn|>".len());
+                        if !self.pending.is_empty() && !gemma_is_marker_prefix(&self.pending) {
+                            let tail = std::mem::take(&mut self.pending);
+                            out.push(GemmaEmit::Token(tail));
+                        }
+                        break;
+                    }
+                    let hold = gemma_longest_marker_suffix(&self.pending);
+                    let emit_len = self.pending.len().saturating_sub(hold);
+                    if emit_len > 0 {
+                        let text = self.pending[..emit_len].to_string();
+                        self.pending.drain(..emit_len);
+                        if !text.is_empty() {
+                            out.push(GemmaEmit::Token(text));
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        let emitted_reasoning = out.iter().any(|e| matches!(e, GemmaEmit::Reasoning(_)));
+        let should_count = entered_as_reasoning || emitted_reasoning;
+        if should_count
+            && self.max_think_tokens != 0
+            && self.reasoning_tokens < self.max_think_tokens
+        {
+            self.reasoning_tokens += 1;
+            if self.reasoning_tokens >= self.max_think_tokens
+                && self.state == GemmaChannel::Reasoning
+            {
+                if !self.pending.is_empty() {
+                    let tail = std::mem::take(&mut self.pending);
+                    if !gemma_is_marker_prefix(&tail) && !tail.is_empty() {
+                        out.push(GemmaEmit::Reasoning(tail));
+                    }
+                }
+                self.state = GemmaChannel::Answer;
+                self.just_forced = true;
+            }
+        }
+        (out, false)
+    }
+
+    pub fn flush(&mut self) -> Vec<GemmaEmit> {
+        if self.pending.is_empty() {
+            return Vec::new();
+        }
+        if self.state == GemmaChannel::AwaitingThought {
+            self.pending.clear();
+            return Vec::new();
+        }
+        let text = std::mem::take(&mut self.pending);
+        if gemma_is_marker_prefix(&text) {
+            return Vec::new();
+        }
+        vec![if self.state == GemmaChannel::Reasoning {
+            GemmaEmit::Reasoning(text)
+        } else {
+            GemmaEmit::Token(text)
+        }]
+    }
+}
+
+pub fn gemma_is_marker_prefix(s: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "<|channel>thought",
+        "<|channel>",
+        "<channel|>",
+        "<|turn>",
+        "<turn|>",
+    ];
+    MARKERS.iter().any(|m| m.starts_with(s) || s.starts_with(m))
+}
+
+pub fn gemma_longest_marker_suffix(s: &str) -> usize {
+    const MARKERS: &[&str] = &[
+        "<|channel>thought",
+        "<|channel>",
+        "<channel|>",
+        "<|turn>",
+        "<turn|>",
+    ];
+    for len in (1..=s.len()).rev() {
+        if !s.is_char_boundary(s.len() - len) {
+            continue;
+        }
+        let suffix = &s[s.len() - len..];
+        if MARKERS.iter().any(|m| m.starts_with(suffix)) {
+            return len;
+        }
+    }
+    0
 }
 
 pub fn is_marker_prefix(s: &str) -> bool {
@@ -3943,10 +4176,12 @@ pub fn generate_muse_glimmer(
     max_tokens: usize,
     max_think_tokens: usize,
     think_mode: hipfire_runtime::prompt_frame::ThinkMode,
+    reasoning_effort: Option<&str>,
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
 ) {
-    // max_think_tokens semantics: 1=no-think, 0=uncapped, N=cap N reasoning tokens then force-close.
+    let _ = think_mode;
+    // max_think_tokens semantics: 1=no-think (ignored for Glimmer; strength from effort), 0=uncapped, N=cap N reasoning tokens then force-close.
     // Open the stream contract FIRST — before any validation, refusal, or GPU work.
     //
     // The HTTP CLI's StreamContractGate requires `gen_start` to be the first event of a
@@ -4004,9 +4239,12 @@ pub fn generate_muse_glimmer(
                 template,
                 system: system_prompt,
                 user: prompt,
-                enable_thinking: max_think_tokens != 1,
+                enable_thinking: true,
                 bos_token: Some("<bos>"),
-                reasoning_strength: Some(glimmer_reasoning_strength(think_mode, max_think_tokens)),
+                reasoning_strength: Some(glimmer_reasoning_strength(
+                    reasoning_effort,
+                    max_think_tokens,
+                )),
                 reasoning_effort: None,
             };
             if tools.is_some() || messages_history.is_some() {

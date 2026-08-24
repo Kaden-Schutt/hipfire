@@ -95,7 +95,8 @@ pub struct RecommendedSettings {
     #[serde(default)]
     pub reasoning_effort: Option<String>,
     /// Optional named cap policy for reasoning tokens
-    /// (`off|low|med|high|xhigh|max|uncapped`).
+    /// (`off|low|med|high|xhigh|max|uncapped`). Absence means uncapped.
+    /// Effort-native families (Qwen3.8, DeepSeek4, Muse Glimmer) omit this field.
     #[serde(default)]
     pub thinking_budget: Option<String>,
 }
@@ -155,7 +156,7 @@ impl RecommendedSettings {
 
 /// Per-mode sampling profiles for a model, mirroring the model card's
 /// documented modes. Each is a full [`RecommendedSettings`] blob, including
-/// optional reasoning effort and explicit budget policy. `general` is the thinking-mode
+/// optional reasoning effort and optional legacy budget policy. `general` is the thinking-mode
 /// default (equals the entry's `recommended_settings`); `coding` is the precise
 /// thinking-coding profile; `instruct` is the non-thinking profile. Profiles
 /// are entry-level metadata and are selected client-side (e.g. serve_harness
@@ -446,6 +447,29 @@ fn validate_digest(digest: Option<&str>, label: &str) -> std::result::Result<(),
     Ok(())
 }
 
+fn is_effort_native_tag(tag: &str) -> bool {
+    // Mirrors scripts/registry_gen.py:_effort_native_tag and the family/tag
+    // conventions already used by config_layer_for_tag. Effort-native families
+    // (Qwen3.8, DeepSeek V4 Flash/preview, Muse Glimmer product SKUs) have
+    // no registry thinking_budget; absence means uncapped. Draft/dflash
+    // sidecars are excluded.
+    let base = tag.split(" sampling_profiles.").next().unwrap_or(tag);
+    if base.contains("draft") || base.contains("dflash") {
+        return false;
+    }
+    let family = base.split(':').next().unwrap_or(base);
+    if family == "qwen3.8" {
+        return true;
+    }
+    if matches!(family, "deepseek-v4-flash" | "deepseek-v4-flash-preview") {
+        return true;
+    }
+    if base == "muse-glimmer" || base == "muse-glimmer:fast" {
+        return true;
+    }
+    false
+}
+
 fn validate_recommendations(
     tag: &str,
     value: &RecommendedSettings,
@@ -467,6 +491,27 @@ fn validate_recommendations(
         .is_some_and(|value| value == 0 || value > 100_000)
     {
         return Err(format!("model '{tag}' has invalid top_k"));
+    }
+    const REASONING_EFFORTS: &[&str] = &["auto", "none", "low", "medium", "high", "xhigh", "max"];
+    const THINKING_BUDGETS: &[&str] = &["off", "low", "med", "high", "xhigh", "max", "uncapped"];
+    if let Some(effort) = &value.reasoning_effort {
+        if !REASONING_EFFORTS.contains(&effort.as_str()) {
+            return Err(format!(
+                "model '{tag}' has invalid reasoning_effort '{effort}'"
+            ));
+        }
+    }
+    if let Some(budget) = &value.thinking_budget {
+        if is_effort_native_tag(tag) {
+            return Err(format!(
+                "model '{tag}' has unsupported thinking_budget '{budget}' on effort-native model (omit the field; absence means uncapped)"
+            ));
+        }
+        if !THINKING_BUDGETS.contains(&budget.as_str()) {
+            return Err(format!(
+                "model '{tag}' has invalid thinking_budget '{budget}'"
+            ));
+        }
     }
     Ok(())
 }
@@ -730,6 +775,11 @@ mod tests {
         assert_eq!(settings.temperature, Some(1.0));
         assert_eq!(settings.top_p, Some(0.95));
         assert_eq!(settings.top_k, Some(64));
+        assert_eq!(settings.reasoning_effort.as_deref(), Some("xhigh"));
+        assert!(
+            settings.thinking_budget.is_none(),
+            "effort-native: absence means uncapped"
+        );
 
         // `general` must resolve to the same contract, so `--sampling registry:general`
         // and the bare default cannot diverge.
@@ -737,6 +787,11 @@ mod tests {
             .sampling_profile("general")
             .expect("general profile resolves");
         assert_eq!(general.top_k, Some(64));
+        assert_eq!(general.reasoning_effort.as_deref(), Some("xhigh"));
+        assert!(
+            general.thinking_budget.is_none(),
+            "effort-native: absence means uncapped"
+        );
 
         // The card specifies no separate coding/instruct sampling, so those are
         // deliberately absent rather than invented.
@@ -745,7 +800,7 @@ mod tests {
     }
 
     /// Pins Qwen3.8-27B's release contract: aliases, artifact identity, arch/quant,
-    /// default KV, and the upstream sampling card (including reasoning effort/budget).
+    /// default KV, and the upstream sampling card (effort-native; no thinking_budget).
     #[test]
     fn bundled_qwen38_matches_the_release_contract() {
         let registry = bundled().unwrap();
@@ -811,7 +866,10 @@ mod tests {
         assert_eq!(settings.presence_penalty, Some(0.0));
         assert_eq!(settings.repeat_penalty, Some(1.0));
         assert_eq!(settings.reasoning_effort.as_deref(), Some("xhigh"));
-        assert_eq!(settings.thinking_budget.as_deref(), Some("uncapped"));
+        assert!(
+            settings.thinking_budget.is_none(),
+            "effort-native: absence means uncapped"
+        );
 
         // `general` must resolve to the same contract, so `--sampling registry:general`
         // and the bare default cannot diverge.
@@ -825,7 +883,10 @@ mod tests {
         assert_eq!(general.presence_penalty, Some(0.0));
         assert_eq!(general.repeat_penalty, Some(1.0));
         assert_eq!(general.reasoning_effort.as_deref(), Some("xhigh"));
-        assert_eq!(general.thinking_budget.as_deref(), Some("uncapped"));
+        assert!(
+            general.thinking_budget.is_none(),
+            "effort-native: absence means uncapped"
+        );
 
         // Tag policy provides VMM + 262K + 81920 for Qwen3.8 canonical tags.
         let layer =
@@ -924,6 +985,31 @@ mod tests {
             Some("bc695a000643801d26e5ae96c9f4ac4c222a36d9db40566f4cc1de0e9d3d5d2e")
         );
         assert!(registry.model("deepseek4:preview-mq2r").is_none());
+
+        // Effort-native DeepSeek defaults: main low / coding max / instruct none;
+        // no registry thinking_budget (absence = uncapped). Preview defaults high.
+        let settings = default_sku.recommended_settings.as_ref().unwrap();
+        assert_eq!(settings.reasoning_effort.as_deref(), Some("low"));
+        assert!(
+            settings.thinking_budget.is_none(),
+            "effort-native: absence means uncapped"
+        );
+        let general = default_sku.sampling_profile("general").unwrap();
+        assert_eq!(general.reasoning_effort.as_deref(), Some("low"));
+        assert!(general.thinking_budget.is_none());
+        let coding = default_sku.sampling_profile("coding").unwrap();
+        assert_eq!(coding.reasoning_effort.as_deref(), Some("max"));
+        assert!(coding.thinking_budget.is_none());
+        let instruct = default_sku.sampling_profile("instruct").unwrap();
+        assert_eq!(instruct.reasoning_effort.as_deref(), Some("none"));
+        assert!(instruct.thinking_budget.is_none());
+        let (_, preview) = registry.model("deepseek-v4-flash-preview").unwrap();
+        let preview_rs = preview.recommended_settings.as_ref().unwrap();
+        assert_eq!(preview_rs.reasoning_effort.as_deref(), Some("high"));
+        assert!(
+            preview_rs.thinking_budget.is_none(),
+            "effort-native: absence means uncapped"
+        );
     }
 
     #[test]
@@ -992,7 +1078,10 @@ mod tests {
         let (_, default_sku) = registry.model("deepseek4:0731").unwrap();
         let settings = default_sku.recommended_settings.as_ref().unwrap();
         assert_eq!(settings.reasoning_effort.as_deref(), Some("low"));
-        assert_eq!(settings.thinking_budget.as_deref(), Some("uncapped"));
+        assert!(
+            settings.thinking_budget.is_none(),
+            "effort-native: absence means uncapped"
+        );
     }
 
     #[test]
@@ -1511,5 +1600,148 @@ mod tests {
             "aliases":{}
         }"#;
         assert!(RegistryV1::parse(raw, "test").is_err());
+    }
+
+    #[test]
+    fn bundled_registry_passes_reasoning_validation() {
+        // Bundled v1.json must validate under the mirrored generator invariants:
+        // effort-native families have no thinking_budget (absence = uncapped)
+        // and all present enums are recognized.
+        let registry = bundled().unwrap();
+        // Spot-check that effort-native bundled entries indeed omit budget
+        for tag in [
+            "qwen3.8:27b",
+            "qwen3.8:27b-mq4-xt",
+            "deepseek-v4-flash",
+            "deepseek-v4-flash:mq2lloyd",
+            "deepseek-v4-flash-preview",
+            "muse-glimmer",
+            "muse-glimmer:fast",
+        ] {
+            let (_, entry) = registry
+                .model(tag)
+                .unwrap_or_else(|| panic!("{tag} must exist"));
+            if let Some(rs) = &entry.recommended_settings {
+                assert!(
+                    rs.thinking_budget.is_none(),
+                    "{tag} bundled thinking_budget must be absent"
+                );
+            }
+            if let Some(profiles) = &entry.sampling_profiles {
+                for (_, settings) in [
+                    ("general", &profiles.general),
+                    ("coding", &profiles.coding),
+                    ("instruct", &profiles.instruct),
+                ] {
+                    if let Some(settings) = settings {
+                        assert!(
+                            settings.thinking_budget.is_none(),
+                            "{tag} profile thinking_budget must be absent"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn effort_native_thinking_budget_rejected_for_fetched_or_cached_registry() {
+        // Mirrors scripts/registry_gen.py:_effort_native_tag. A fetched/cache
+        // registry that reintroduces a named thinking_budget on effort-native
+        // families must fail validation wholesale so load() falls back to
+        // bundled (network) or discards the cache entry (fresh/stale).
+        let cases = [
+            // Qwen3.8 product SKUs
+            r#"{"schema_version":1,"generated_at":"now","models":{"qwen3.8:27b":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"reasoning_effort":"xhigh","thinking_budget":"high"}}},"aliases":{}}"#,
+            // DeepSeek V4 Flash (also covers :mq2lloyd via family)
+            r#"{"schema_version":1,"generated_at":"now","models":{"deepseek-v4-flash":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"reasoning_effort":"low","thinking_budget":"uncapped"}}},"aliases":{}}"#,
+            r#"{"schema_version":1,"generated_at":"now","models":{"deepseek-v4-flash-preview":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"reasoning_effort":"high","thinking_budget":"med"}}},"aliases":{}}"#,
+            r#"{"schema_version":1,"generated_at":"now","models":{"deepseek-v4-flash:mq2lloyd":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"thinking_budget":"low"}}},"aliases":{}}"#,
+            // Muse Glimmer product SKUs
+            r#"{"schema_version":1,"generated_at":"now","models":{"muse-glimmer":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"reasoning_effort":"xhigh","thinking_budget":"xhigh"}}},"aliases":{}}"#,
+            r#"{"schema_version":1,"generated_at":"now","models":{"muse-glimmer:fast":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"thinking_budget":"max"}}},"aliases":{}}"#,
+            // Effort-native sampling_profiles also rejected
+            r#"{"schema_version":1,"generated_at":"now","models":{"qwen3.8:27b":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","sampling_profiles":{"coding":{"reasoning_effort":"xhigh","thinking_budget":"high"}}}},"aliases":{}}"#,
+            r#"{"schema_version":1,"generated_at":"now","models":{"deepseek-v4-flash":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","sampling_profiles":{"general":{"thinking_budget":"low"}}}},"aliases":{}}"#,
+            r#"{"schema_version":1,"generated_at":"now","models":{"muse-glimmer":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","sampling_profiles":{"general":{"thinking_budget":"uncapped"}}}},"aliases":{}}"#,
+        ];
+        for raw in cases {
+            let err = RegistryV1::parse(raw, "network/cache")
+                .expect_err("must reject effort-native thinking_budget");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("thinking_budget") && msg.contains("effort-native"),
+                "unexpected error for effort-native budget rejection: {msg}"
+            );
+        }
+        // A cache entry that violates the invariant is also rejected via
+        // validate(), causing read_cache to return None and load() to fall back.
+        let stale_raw = r#"{"schema_version":1,"generated_at":"now","models":{"qwen3.8:27b":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"thinking_budget":"high"}}},"aliases":{}}"#;
+        let stale: RegistryV1 = serde_json::from_str(stale_raw).unwrap();
+        assert!(
+            stale.validate("registry cache").is_err(),
+            "stale cache with effort-native thinking_budget must fail validate()"
+        );
+    }
+
+    #[test]
+    fn invalid_reasoning_enums_rejected() {
+        // Mirrors hipfire-config/registry_gen enum allowlists: recognizable
+        // invalid values are rejected with a clear error; malformed types
+        // already fail via surrounding validation and are not re-tested here.
+        let invalid_effort = r#"{"schema_version":1,"generated_at":"now","models":{"m":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"reasoning_effort":"turbo"}}},"aliases":{}}"#;
+        let err = RegistryV1::parse(invalid_effort, "test")
+            .expect_err("invalid reasoning_effort must be rejected");
+        assert!(err.to_string().contains("reasoning_effort"));
+
+        let invalid_effort_profile = r#"{"schema_version":1,"generated_at":"now","models":{"m":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","sampling_profiles":{"coding":{"reasoning_effort":"ultra"}}}},"aliases":{}}"#;
+        let err = RegistryV1::parse(invalid_effort_profile, "test")
+            .expect_err("invalid profile effort must be rejected");
+        assert!(err.to_string().contains("reasoning_effort"));
+
+        // thinking_budget invalid on legacy (non-effort-native) model
+        let invalid_budget = r#"{"schema_version":1,"generated_at":"now","models":{"qwen3.5:9b":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"thinking_budget":"yolo"}}},"aliases":{}}"#;
+        let err = RegistryV1::parse(invalid_budget, "test")
+            .expect_err("invalid thinking_budget must be rejected");
+        assert!(err.to_string().contains("thinking_budget"));
+
+        let invalid_budget_profile = r#"{"schema_version":1,"generated_at":"now","models":{"qwen3.6:35b-a3b":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","sampling_profiles":{"general":{"thinking_budget":"superhigh"}}}},"aliases":{}}"#;
+        let err = RegistryV1::parse(invalid_budget_profile, "test")
+            .expect_err("invalid profile budget must be rejected");
+        assert!(err.to_string().contains("thinking_budget"));
+    }
+
+    #[test]
+    fn legacy_qwen35_qwen36_thinking_budget_accepted() {
+        // Legacy Qwen3.5/3.6 families are not effort-native; named budgets
+        // remain valid and pass validation for both top-level and profiles.
+        let raw = r#"{
+            "schema_version":1,
+            "generated_at":"now",
+            "models":{
+                "qwen3.5:9b":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"reasoning_effort":"high","thinking_budget":"high"}},
+                "qwen3.5:27b":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","sampling_profiles":{"general":{"thinking_budget":"med"},"coding":{"reasoning_effort":"max","thinking_budget":"max"}}},
+                "qwen3.6:35b-a3b":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"thinking_budget":"uncapped"}},
+                "qwen3.6:35b-a3b-mq4r":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","sampling_profiles":{"instruct":{"thinking_budget":"off","reasoning_effort":"none"}}}
+            },
+            "aliases":{}
+        }"#;
+        RegistryV1::parse(raw, "test").expect("legacy thinking_budget must remain valid");
+
+        // Draft/dflash sidecars are excluded from effort-native gating, so they
+        // also accept thinking_budget even when family would otherwise be native.
+        let sidecars = r#"{
+            "schema_version":1,
+            "generated_at":"now",
+            "models":{
+                "qwen3.8:27b-draft":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"thinking_budget":"high"}},
+                "qwen3.8:27b-dflash":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"thinking_budget":"low"}},
+                "deepseek-v4-flash:draft":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"thinking_budget":"xhigh"}},
+                "muse-glimmer:draft":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"thinking_budget":"med"}}
+            },
+            "aliases":{}
+        }"#;
+        RegistryV1::parse(sidecars, "test")
+            .expect("draft/dflash sidecars must allow thinking_budget");
     }
 }

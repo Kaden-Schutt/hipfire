@@ -115,7 +115,30 @@ RECOMMENDED_BOUNDS = {
 # Mirrors hipfire-config's REASONING_EFFORTS. Includes Qwen3.8's ladder
 # (`low|medium|xhigh`) plus generic OpenAI-style values for other parents.
 REASONING_EFFORTS = {"auto", "none", "low", "medium", "high", "xhigh", "max"}
+# Legacy named cap presets for non-effort-native templates (e.g. Qwen3.6).
+# Absence means uncapped. Effort-native families must omit this field.
 THINKING_BUDGETS = {"off", "low", "med", "high", "xhigh", "max", "uncapped"}
+
+
+def _effort_native_tag(tag: str) -> bool:
+    """True for families whose reasoning is effort-semantic with no registry cap.
+
+    Qwen3.8, DeepSeek V4 Flash (+preview/SKU suffixes), and Muse Glimmer product
+    SKUs. Draft/dflash sidecars are excluded. `thinking_budget` is rejected on
+    these tags; absence means uncapped.
+    """
+    # Strip optional "sampling_profiles.<mode>" suffix used by callers.
+    base = tag.split(" sampling_profiles.", 1)[0]
+    family = base.split(":", 1)[0]
+    if "draft" in base or "dflash" in base:
+        return False
+    if family == "qwen3.8":
+        return True
+    if family in {"deepseek-v4-flash", "deepseek-v4-flash-preview"}:
+        return True
+    if family == "muse-glimmer" or base in {"muse-glimmer", "muse-glimmer:fast"}:
+        return True
+    return False
 
 
 def validate_recommended_settings(tag: str, rs: object, errors: list) -> None:
@@ -123,7 +146,12 @@ def validate_recommended_settings(tag: str, rs: object, errors: list) -> None:
 
     Mirrors hipfire-registry's recommended-settings bounds. Adds a
     descriptive error per offending key; does not mutate rs (deepcopy already
-    carries it through)."""
+    carries it through).
+
+    Effort-native tags (Qwen3.8 / DeepSeek4 / Muse Glimmer) must not ship
+    `thinking_budget`; absence means uncapped. Legacy non-native models may
+    still set named budget presets.
+    """
     if rs is None:
         return
     if not isinstance(rs, dict):
@@ -134,6 +162,7 @@ def validate_recommended_settings(tag: str, rs: object, errors: list) -> None:
         "reasoning_effort",
         "thinking_budget",
     }
+    effort_native = _effort_native_tag(tag)
     for key, val in rs.items():
         if key not in allowed:
             errors.append(f"{tag}: recommended_settings has unknown key {key!r} (allowed: {sorted(allowed)})")
@@ -150,6 +179,12 @@ def validate_recommended_settings(tag: str, rs: object, errors: list) -> None:
                 )
             continue
         if key == "thinking_budget":
+            if effort_native:
+                errors.append(
+                    f"{tag}: thinking_budget is unsupported on effort-native models "
+                    f"(omit the field; absence means uncapped), got {val!r}"
+                )
+                continue
             if val not in THINKING_BUDGETS:
                 errors.append(
                     f"{tag}: recommended_settings.thinking_budget must be one of "

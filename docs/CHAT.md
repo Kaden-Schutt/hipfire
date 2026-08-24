@@ -71,15 +71,18 @@ to release it.
 
 Reasoning models may emit a thinking stream before the answer. The HTTP API
 exposes it as `reasoning_content`; visible answer text remains `content`.
-`thinking`, `thinking_budget`, and `max_think_tokens` are owned by
-[`CONFIG.md`](CONFIG.md). Per-request `reasoning_effort` and
-`chat_template_kwargs.enable_thinking` are documented in
-[`SERVE.md`](SERVE.md).
+
+Mode, semantic effort, and hard cap are **independent** — see
+[`CONFIG.md`](CONFIG.md) for keys/defaults and [`SERVE.md`](SERVE.md) for
+per-request HTTP fields (`reasoning_effort`, `enable_thinking`,
+`max_think_tokens`, legacy `thinking_budget`). Effort never maps to a token
+budget. Unsupported or cross-family values are dropped with a warning (server
+log + OpenAI `hipfire` response metadata), not silently reinterpreted.
 
 Chat framing and stop behavior are model-specific. Use the exact registry tag
-and do not assume Qwen `<think>` conventions apply to LFM or other families.
-The LFM framing smoke route is `scripts/serve_harness.py` with the exact
-`lfm2.5:*` tag; see [`VALIDATION.md`](VALIDATION.md).
+and do not assume Qwen `<think>` conventions apply to LFM, Gemma, Glimmer, or
+DeepSeek. The LFM framing smoke route is `scripts/serve_harness.py` with the
+exact `lfm2.5:*` tag; see [`VALIDATION.md`](VALIDATION.md).
 
 ## Troubleshooting
 
@@ -88,7 +91,7 @@ The LFM framing smoke route is `scripts/serve_harness.py` with the exact
 | Model not found | `hipfire list -r`, then `hipfire pull <tag>` |
 | Service will not start | `hipfire diag`; inspect `~/.hipfire/serve.log` |
 | Port conflict | `hipfire ps`; stop the owned service with `hipfire stop` |
-| Truncated answer | Raise `--max-tokens` and check the thinking budget |
+| Truncated answer | Raise `--max-tokens`; on Qwen, if the think span was explicitly force-closed, raise `max_think_tokens` or leave it uncapped |
 | Need richer session controls | Use `hipfire tui` and its Chat tab |
 
 The service has no authentication or TLS. Local chat should use a loopback bind;
