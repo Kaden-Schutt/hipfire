@@ -14,8 +14,6 @@ pub use carriers::*;
 pub mod spec_build;
 
 use hipfire_arch_cohere2moe as cohere2moe;
-use hipfire_runtime::arch_model::ArchModel;
-use hipfire_runtime::llama::KvCacheExt;
 use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_dots_ocr::dots_ocr;
 use hipfire_arch_gemma4 as gemma4;
@@ -26,19 +24,19 @@ use hipfire_arch_qwen35::qwen35::{self};
 use hipfire_arch_qwen35::speculative::DeltaNetSnapshot;
 use hipfire_arch_qwen35::Qwen35Bundle;
 use hipfire_arch_qwen35_vl::qwen35_vl;
+use hipfire_runtime::arch_model::ArchModel;
 use hipfire_runtime::cask::CaskCtx;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::kv_backend::KvBackend;
 use hipfire_runtime::llama;
+use hipfire_runtime::llama::KvCacheExt;
 use hipfire_runtime::loader_api::{CaskConfig, LoadCtx, ModelSource, SpecLoadCfg};
 use hipfire_runtime::multi_gpu::Gpus;
-use hipfire_runtime::ngram_mod::NgramModPool;
 use hipfire_runtime::spec::{SpecEmit, SpecEmitCtx, SpecTargetGuard, Speculator};
 use hipfire_runtime::triattn::{EvictionCtx, TriAttnCenters};
 use rdna_compute::Gpu;
 use std::any::Any;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
 
 pub trait Carrier: Send + Sync {
     fn name(&self) -> &'static str;
@@ -293,7 +291,6 @@ pub fn generation_early_route(arch_id: u32) -> Option<GenerationEarlyRoute> {
         _ => None,
     }
 }
-
 
 // ─── Registry ─────────────────────────────────────────────────────────
 
@@ -590,7 +587,6 @@ impl hipfire_runtime::arch_model::ArchModel for Deepseek4HeterogeneousBundle {
         drop(self);
     }
 }
-
 
 /// Self-owned gfx1100+dense / gfx1151+routed DeepSeek V4 state. The model
 /// owns both HIP devices and tears them down in its `Drop` implementation;
@@ -914,12 +910,6 @@ pub struct LoadedModel {
     pub dflash_checkpoints: Vec<(usize, DeltaNetSnapshot)>,
     pub asst_turn_cache: AsstTurnCache,
     pub decoded_vocab: Option<std::sync::Arc<Vec<String>>>,
-    /// Model-lifetime shared n-gram-mod pool (`HIPFIRE_MTP_NGRAM`). Lazily created
-    /// (or replaced on config mismatch) by the serve path; starts `None` so every
-    /// `skeleton` construction site inherits the opt-in. Host-only — drops with
-    /// `LoadedModel` on unload. Future multi-slot serve must not share one pool
-    /// across concurrent slots without coordination beyond this `Mutex`.
-    pub ngram_mod_pool: Option<Arc<Mutex<NgramModPool>>>,
     pub model_path: String,
     /// The model's speculative-decode drafter+verifier, when a draft model is
     /// loaded (`Box<dyn Speculator>` so the daemon's decode loop is agnostic to
@@ -978,7 +968,6 @@ impl LoadedModel {
             prefill_checkpoints: Vec::new(),
             dflash_checkpoints: Vec::new(),
             decoded_vocab: None,
-            ngram_mod_pool: None,
             model_path,
             speculator: None,
             chat_template,
@@ -1115,9 +1104,9 @@ impl LoadedModel {
     }
 
     pub fn deepseek4_mut(&mut self) -> Option<&mut hipfire_arch_deepseek4::Deepseek4Bundle> {
-        self.state
-            .as_deref_mut()
-            .and_then(|s| (s as &mut dyn Any).downcast_mut::<hipfire_arch_deepseek4::Deepseek4Bundle>())
+        self.state.as_deref_mut().and_then(|s| {
+            (s as &mut dyn Any).downcast_mut::<hipfire_arch_deepseek4::Deepseek4Bundle>()
+        })
     }
 
     /// Qwen35-VL vision config if this model is arch_id=5|6 and was loaded
@@ -1147,13 +1136,15 @@ impl LoadedModel {
     }
 
     pub fn dots_ocr_mut(&mut self) -> Option<&mut hipfire_arch_dots_ocr::DotsOcrBundle> {
-        self.state
-            .as_deref_mut()
-            .and_then(|s| (s as &mut dyn Any).downcast_mut::<hipfire_arch_dots_ocr::DotsOcrBundle>())
+        self.state.as_deref_mut().and_then(|s| {
+            (s as &mut dyn Any).downcast_mut::<hipfire_arch_dots_ocr::DotsOcrBundle>()
+        })
     }
     /// Arch-agnostic view of the loaded model, when any is loaded.
     pub fn as_arch_model(&self) -> Option<&dyn hipfire_runtime::arch_model::ArchModel> {
-        self.state.as_deref().map(|b| b as &dyn hipfire_runtime::arch_model::ArchModel)
+        self.state
+            .as_deref()
+            .map(|b| b as &dyn hipfire_runtime::arch_model::ArchModel)
     }
     pub fn as_arch_model_mut(&mut self) -> Option<&mut dyn hipfire_runtime::arch_model::ArchModel> {
         self.state
@@ -1533,9 +1524,8 @@ fn finish_qwen35_load(
     let config = &bundle.config;
     let dn_state = &bundle.dn_state;
 
-    // Adaptive KV cannot combine with generic (DSpark/DFlash/n-gram/bundled-MTP
-    // build_speculator) drafters. Suppress before any GPU drafter alloc; native
-    // qwen35_mtp_head load below is intentionally left alone.
+    // Adaptive KV cannot combine with generic (DSpark/DFlash/n-gram/MTP via
+    // build_speculator) drafters. Suppress before any GPU drafter alloc.
     let adaptive_blocks_generic_spec = bundle.kv_adaptive.is_some();
     if adaptive_blocks_generic_spec {
         eprintln!(
@@ -1658,6 +1648,24 @@ fn finish_qwen35_load(
             ctx.spec.ddtree_budget,
             ctx.spec.ddtree_topk,
             eviction.is_some(),
+            &bundle.weights,
+            // Exact plain Q8 KV (not asym/fwht variants). Matches design:
+            // flags on the already-built cache — never re-resolve the string.
+            {
+                let kv = &bundle.kv_cache;
+                kv.quant_q8
+                    && !kv.quant_fwht
+                    && !kv.quant_asym2
+                    && !kv.quant_asym3
+                    && !kv.quant_asym4
+                    && matches!(kv.v_mode, llama::VMode::Q8)
+            },
+            // finish_qwen35_load is the single-GPU carrier path.
+            true,
+            // Fail-closed: adaptive KV starts FWHT4 and tier-switches at runtime.
+            // Upstream also suppresses DFlash when adaptive is Some; this keeps
+            // admission honest if a future path reaches load_dflash_state.
+            bundle.kv_adaptive.is_some(),
         ) {
             Ok(s) => {
                 eprintln!(
@@ -1677,63 +1685,96 @@ fn finish_qwen35_load(
     } else {
         None
     };
-    // ── qwen35 MTP head (opt-in, bundled .mq4-mtp only) ────────────
-    // Loaded ONLY when HIPFIRE_QWEN35_MTP=1, the trunk is a bundled `.mq4-mtp`
-    // file, no DFlash draft was requested (DFlash wins), eviction is None (the
-    // MTP head KV is not FlashCASK-compacted), and arch is qwen35 (5/6). Gated
-    // here — not in build_speculator — because this is the only site with a
-    // `&mut Gpu` to free on decline, and the head allocates GPU buffers.
-    let mtp = if !adaptive_blocks_generic_spec
-        && dflash.is_none()
-        && dspark_speculator.is_none()
-        && eviction.is_none()
-        && matches!(arch_id, 5 | 6)
-        && hipfire_config::developer_var("HIPFIRE_QWEN35_MTP")
-            .ok()
-            .as_deref()
-            == Some("1")
-        && ctx.path.ends_with(".mq4-mtp")
+    // ── qwen35 MTP head (single resolver: bundled .mq4-mtp trailer then sibling .mtp sidecar) ──
+    // Precedence: DSpark > DFlash > MTP > n-gram. Gate: only arch 5/6, no adaptive/eviction,
+    // and typed mtp != off. Bundled first then sidecar `.mtp`; physical_cap is the KV
+    // window. On missing/failure errors when forced on (mtp=on), auto logs/falls back.
+    let mtp: Option<hipfire_arch_qwen35::mtp_head::Qwen35MtpHead> = if adaptive_blocks_generic_spec
+        || eviction.is_some()
+        || !matches!(arch_id, 5 | 6)
+        || ctx.spec.mtp == Some(false)
+        || dflash.is_some()
+        || dspark_speculator.is_some()
     {
-        match hipfire_arch_qwen35::mtp_head::load_mtp_head_bundled(
-            std::path::Path::new(ctx.path),
-            ctx.gpu,
-            ctx.max_seq,
-        ) {
-            Ok(Some(head)) => {
+        None
+    } else {
+        let trunk_path = Path::new(ctx.path);
+        let mut head_opt: Option<hipfire_arch_qwen35::mtp_head::Qwen35MtpHead> = None;
+        let mut load_err: Option<String> = None;
+        match hipfire_arch_qwen35::mtp_head::load_mtp_head_bundled(trunk_path, ctx.gpu, physical_cap) {
+            Ok(Some(h)) => {
                 eprintln!(
-                    "  MTP head loaded from bundle: n_embd={} vocab={} (compressed_lm_head_draft={})",
-                    head.config.n_embd,
-                    head.config.vocab_size,
-                    head.weights.lm_head_draft.is_some(),
+                    "  MTP head loaded (bundled .mq4-mtp): n_embd={} vocab={}",
+                    h.config.n_embd, h.config.vocab_size
                 );
-                Some(head)
+                head_opt = Some(h);
             }
             Ok(None) => {
-                eprintln!(
-                    "  HIPFIRE_QWEN35_MTP=1 but {} has no bundled MTP trailer — AR/n-gram only",
-                    ctx.path
-                );
-                None
+                let sidecar = trunk_path.with_extension("mtp");
+                if sidecar.exists() {
+                    match hipfire_arch_qwen35::mtp_head::load_mtp_head(&sidecar, ctx.gpu, physical_cap) {
+                        Ok(h) => {
+                            eprintln!(
+                                "  MTP head loaded (sidecar {}): n_embd={} vocab={}",
+                                sidecar.display(),
+                                h.config.n_embd,
+                                h.config.vocab_size
+                            );
+                            head_opt = Some(h);
+                        }
+                        Err(e) => {
+                            load_err = Some(format!("sidecar {} load failed: {e}", sidecar.display()));
+                        }
+                    }
+                }
             }
             Err(e) => {
-                eprintln!(
-                    "  MTP head load failed ({}): {e} — AR/n-gram only",
-                    ctx.path
-                );
-                None
+                load_err = Some(format!("bundled trailer load failed: {e}"));
+                let sidecar = trunk_path.with_extension("mtp");
+                if sidecar.exists() {
+                    match hipfire_arch_qwen35::mtp_head::load_mtp_head(&sidecar, ctx.gpu, physical_cap) {
+                        Ok(h) => {
+                            eprintln!(
+                                "  MTP head loaded (sidecar {} after bundled error): n_embd={} vocab={}",
+                                sidecar.display(),
+                                h.config.n_embd,
+                                h.config.vocab_size
+                            );
+                            head_opt = Some(h);
+                            load_err = None;
+                        }
+                        Err(e2) => {
+                            load_err = Some(format!("bundled: {e}; sidecar {}: {e2}", sidecar.display()));
+                        }
+                    }
+                }
             }
         }
-    } else {
-        None
+        if head_opt.is_none() {
+            if ctx.spec.mtp == Some(true) {
+                return Err(rollback_unfinished_qwen35(
+                    format!(
+                        "MTP head required (mtp=on) but not found: {}",
+                        load_err.unwrap_or_else(|| "no bundled trailer or .mtp sidecar found".to_string())
+                    ),
+                    bundle,
+                    vision_weights,
+                    ctx.gpu,
+                ));
+            }
+            if let Some(err) = load_err {
+                eprintln!("  MTP head load failed: {err} — falling back to AR/n-gram");
+            }
+        }
+        head_opt
     };
+    let mtp_present = mtp.is_some();
     // Pick the arch-generic speculator: a loaded DFlash draft → DflashSpeculator,
-    // else a bundled MTP head → MtpSpeculator<Qwen35MtpDrafter>, else (opt-in)
-    // the model-free n-gram drafter. `eviction` is borrowed (not moved) here, so
-    // it is still available for the struct literal below; `config`/`dn_state` are
-    // borrowed only for the n-gram arm's scratch construction (snapshot copied to
-    // GPU), released before `bundle` moves into `state`. `None` ⇒ AR-only model.
+    // else an MTP head → MtpSpeculator<Qwen35MtpDrafter>, else (opt-in) the
+    // model-free n-gram drafter. `eviction` is borrowed (not moved) here so it is
+    // still available for the struct literal below; `config`/`dn_state` are
+    // borrowed only for the n-gram arm's scratch construction. `None` ⇒ AR-only.
     // DSpark wins over DFlash/MTP/n-gram when its sidecar loaded.
-    // When adaptive, upstream gates left dspark/dflash/mtp as None — no free needed.
     let speculator = if adaptive_blocks_generic_spec {
         None
     } else {
@@ -1747,65 +1788,6 @@ fn finish_qwen35_load(
                 ctx.spec,
             )
         })
-    };
-
-    // ── Qwen3.5/3.6 native MTP (NextN) head ────────────────────────
-    //
-    // Load the arch_id=21 MTP head when it is present either bundled in the
-    // trunk file (a `.mq4-mtp` trailer, magic HFBNDMTP) or as a sibling `.mtp`
-    // sidecar (`<trunk>.mtp` next to the model path). The head is OPTIONAL:
-    // `Ok(None)` / a missing sidecar just leaves MTP serving unavailable and
-    // the model serves via the unchanged DFlash/AR path. Failures here are
-    // non-fatal — log and continue with `qwen35_mtp_head = None`.
-    //
-    // max_seq mirrors the trunk's KV capacity (the MTP head's KV is a single
-    // F32 layer, so even a 100K window is only a few hundred MB at dim=5120).
-    let qwen35_mtp_head: Option<hipfire_arch_qwen35::mtp_head::Qwen35MtpHead> = {
-        use hipfire_arch_qwen35::mtp_head;
-        let trunk_path = Path::new(ctx.path);
-        // 1. Bundled trailer inside the trunk file?
-        let bundled = match mtp_head::load_mtp_head_bundled(trunk_path, ctx.gpu, physical_cap) {
-            Ok(h) => h,
-            Err(e) => {
-                eprintln!("  MTP head (bundled) load failed: {e} — MTP serving disabled");
-                None
-            }
-        };
-        match bundled {
-            Some(h) => {
-                eprintln!(
-                    "  MTP head loaded (bundled .mq4-mtp): n_embd={} vocab={} K-default=3",
-                    h.config.n_embd, h.config.vocab_size
-                );
-                Some(h)
-            }
-            None => {
-                // 2. Sidecar `<trunk>.mtp` next to the model path?
-                let sidecar = trunk_path.with_extension("mtp");
-                if sidecar.exists() {
-                    match mtp_head::load_mtp_head(&sidecar, ctx.gpu, physical_cap) {
-                        Ok(h) => {
-                            eprintln!(
-                                "  MTP head loaded (sidecar {}): n_embd={} vocab={} K-default=3",
-                                sidecar.display(),
-                                h.config.n_embd,
-                                h.config.vocab_size
-                            );
-                            Some(h)
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "  MTP head (sidecar {}) load failed: {e} — MTP serving disabled",
-                                sidecar.display()
-                            );
-                            None
-                        }
-                    }
-                } else {
-                    None
-                }
-            }
-        }
     };
 
     // Move adaptive controller out of the bundle before parking the rest in
@@ -1830,25 +1812,31 @@ fn finish_qwen35_load(
             chat_template,
         )
     };
-    // `mtp_weights_present` drives the mtp_mode=auto serve decision (mirrors the
-    // dspark probe set in the daemon's load handler). For qwen35 the presence of a
-    // loaded MTP head IS the signal.
-    model.mtp_weights_present = qwen35_mtp_head.is_some();
-    // The head lives on the bundle, not on LoadedModel: per-arch state must not
-    // keep an arch type in the loader's struct, or LoadedModel can never move
-    // into arch-free hipfire-runtime.
-    if let Some(bundle) = model
-        .state
-        .as_mut()
-        .and_then(|s| (s.as_mut() as &mut dyn std::any::Any)
-            .downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>())
-    {
-        bundle.qwen35_mtp_head = qwen35_mtp_head;
-    }
+    model.mtp_weights_present = mtp_present;
     Ok(model)
+
 }
 
 // ─── Main public API ──────────────────────────────────────────────────
+
+/// gfx11 + gfx12 targets with WMMA-backed DFlash batched lm_head GEMM paths.
+fn is_dflash_lm_head_wmma_arch(gpu_arch: &str) -> bool {
+    matches!(
+        gpu_arch,
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" | "gfx1200" | "gfx1201"
+    )
+}
+
+/// Pre-allocation predicate: whether a target lm_head quant_type is admitted
+/// for DFlash on `gpu_arch`. Always admits qt 3/6/13; admits legacy qt17 and
+/// V2 qt44/47/48/49/50 on the gfx11+gfx12 WMMA set only.
+fn dflash_lm_head_quant_supported(lm_qt: Option<u8>, gpu_arch: &str) -> bool {
+    match lm_qt {
+        Some(3 | 6 | 13) => true,
+        Some(17 | 44 | 47 | 48 | 49 | 50) => is_dflash_lm_head_wmma_arch(gpu_arch),
+        _ => false,
+    }
+}
 
 /// Load a model from an HFQ file (or safetensors directory). This is the
 /// single arch-dispatch point via the carrier registry.
@@ -1929,15 +1917,8 @@ pub fn load_model_with_kv_backend(
                 .or_else(|| hfq.tensor_data("model.language_model.embed_tokens.weight"))
                 .or_else(|| hfq.tensor_data("model.embed_tokens.weight"))
                 .map(|(info, _)| info.quant_type);
-            let arch_is_gfx11 = matches!(
-                gpu.arch.as_str(),
-                "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" | "gfx1200" | "gfx1201"
-            );
-            let supported = match lm_qt {
-                Some(3 | 6 | 13) => true,
-                Some(17) => arch_is_gfx11,
-                _ => false,
-            };
+            let arch_is_gfx11 = is_dflash_lm_head_wmma_arch(gpu.arch.as_str());
+            let supported = dflash_lm_head_quant_supported(lm_qt, gpu.arch.as_str());
             if !supported {
                 let qt_desc = match lm_qt {
                     Some(qt) => format!("quant_type={qt}"),
@@ -1946,11 +1927,11 @@ pub fn load_model_with_kv_backend(
                 return Err(format!(
                     "DFlash draft requested but target lm_head {} is not \
                      supported by speculative.rs's batched GEMM paths on this arch \
-                     ({}). Supported: Q8_0 (qt=3), HFQ4G256 (qt=6), MQ4G256 (qt=13) \
-                     always; MQ3G256 (qt=17) on gfx11 only. Other dtypes \
-                     (MQ2 qt=18, MQ6/MQ8, HFQ3/HFQ2, HFQ4G128, HFQ6, F16, …) fall \
-                     through to a per-row GEMV that hangs verify. Reload without a \
-                     draft, or use an MQ4 / HFQ4 / Q8 target.",
+                     ({}). Supported: Q8_0 (qt=3), HFQ4G256 (qt=6), MQ4G256 \
+                     (qt=13) always; MQ3G256 (qt=17) and MQ4/6/5/3/2G256V2 \
+                     (qt=44/47/48/49/50) on gfx11+gfx12 WMMA. Other dtypes fall \
+                     through to unsupported per-row verification. Reload without \
+                     a draft or use a supported target.",
                     qt_desc, gpu.arch
                 ));
             }
@@ -2104,22 +2085,15 @@ pub fn load_model_with_gemma4_drafter(
                 .or_else(|| hfq.tensor_data("model.language_model.embed_tokens.weight"))
                 .or_else(|| hfq.tensor_data("model.embed_tokens.weight"))
                 .map(|(info, _)| info.quant_type);
-            let arch_is_gfx11 = matches!(
-                gpu.arch.as_str(),
-                "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" | "gfx1200" | "gfx1201"
-            );
-            let supported = match lm_qt {
-                Some(3 | 6 | 13) => true,
-                Some(17) => arch_is_gfx11,
-                _ => false,
-            };
+            let supported = dflash_lm_head_quant_supported(lm_qt, gpu.arch.as_str());
             if !supported {
                 let qt_desc = match lm_qt {
                     Some(qt) => format!("quant_type={qt}"),
                     None => "no lm_head/embed_tokens tensor found".to_string(),
                 };
                 return Err(format!(
-                    "DFlash draft requested but target lm_head {} is not supported ({}).",
+                    "DFlash draft requested but target lm_head {} is not supported \
+                     on gfx11+gfx12 WMMA ({}).",
                     qt_desc, gpu.arch
                 ));
             }
@@ -3189,7 +3163,9 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
         if let Some(state) = m.state.take() {
             // multi-GPU resources. Otherwise just drop the box (original match did
             // the same — non-qwen35 pp>1 is unreachable and had an empty arm).
-            if let Ok(mut b) = (state as Box<dyn Any>).downcast::<hipfire_arch_qwen35::Qwen35Bundle>() {
+            if let Ok(mut b) =
+                (state as Box<dyn Any>).downcast::<hipfire_arch_qwen35::Qwen35Bundle>()
+            {
                 if let Some(scratch_set) = b.pp_scratch_set.take() {
                     scratch_set.free_gpu_multi(&mut gpus);
                 }
@@ -3208,7 +3184,19 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
         let _ = gpu;
         return Ok(());
     }
-    if let Some(spec) = m.speculator {
+    // Quiesce retained-PM4 (if any) before freeing any captured owner. Unknown
+    // quiescence → keep model quarantined; daemon restart is containment.
+    if let Some(spec) = &mut m.speculator {
+        if let Err(reason) = spec.quiesce(gpu) {
+            eprintln!("dflash verify PM4: unload refused — unknown quiescence: {reason}");
+            std::mem::forget(m);
+            return Err(format!(
+                "dflash verify PM4: unload refused after unknown quiescence ({reason}); \
+                 model remains quarantined until process restart"
+            ));
+        }
+    }
+    if let Some(spec) = m.speculator.take() {
         // Frees the drafter's GPU buffers (draft weights + scratch) AND its
         // checkpoint ring — a drafter that forgets is a compile error, not a
         // silent VRAM leak. The vestigial `m.dflash_checkpoints` (now always
@@ -3232,7 +3220,9 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
     for (_, snap) in m.dflash_checkpoints {
         snap.free_gpu(gpu);
     }
-    if let Some(state) = m.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()) {
+    if let Some(state) = m.state.as_mut().and_then(|s| {
+        (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
+    }) {
         if let Some(batch_state) = state.qwen35_decode_batch.take() {
             let _ = batch_state.free_gpu(gpu);
         }
@@ -3468,7 +3458,16 @@ mod registry_tests {
         assert_eq!(super::vision_route(7), super::VisionRoute::None);
         assert_eq!(super::vision_route(9), super::VisionRoute::None);
         // Text-only carriers must stay false.
-        for name in ["qwen2", "llama", "deepseek4", "minimax", "lfm2moe", "cohere2moe", "gemma4", "muse_glimmer"] {
+        for name in [
+            "qwen2",
+            "llama",
+            "deepseek4",
+            "minimax",
+            "lfm2moe",
+            "cohere2moe",
+            "gemma4",
+            "muse_glimmer",
+        ] {
             let c = REGISTRY.iter().find(|c| c.name() == name).unwrap();
             assert!(
                 !c.caps().supports_images,
@@ -3486,12 +3485,12 @@ mod registry_tests {
     /// re-route an architecture, update this pin in the same commit.
     #[test]
     fn caps_and_route_tables_are_pinned() {
-        use saddle_core::caps::{ArchCaps, DflashKind};
         use super::{
             bench_decode_route, continuous_batch_route, ep_eos_route, ep_prompt_route,
             generation_early_route, vision_route, BenchDecodeRoute, ContinuousBatchRoute,
             EpEosRoute, EpPromptRoute, GenerationEarlyRoute, VisionRoute,
         };
+        use saddle_core::caps::{ArchCaps, DflashKind};
 
         let caps_of = |name: &str| -> ArchCaps {
             REGISTRY
@@ -3559,7 +3558,11 @@ mod registry_tests {
                 11 => Some(ContinuousBatchRoute::Lfm2Moe),
                 _ => None,
             };
-            assert_eq!(continuous_batch_route(id), want, "continuous_batch_route({id})");
+            assert_eq!(
+                continuous_batch_route(id),
+                want,
+                "continuous_batch_route({id})"
+            );
             // The capability half must stay consistent with the declared cap.
             let declared = super::carrier_for(id)
                 .map(|c| c.caps().supports_continuous_batch)
@@ -3595,13 +3598,21 @@ mod registry_tests {
 
         // ── ep_prompt_route: 9 -> Dsml, everything else Jinja ──
         for id in 0u32..=14 {
-            let want = if id == 9 { EpPromptRoute::Dsml } else { EpPromptRoute::Jinja };
+            let want = if id == 9 {
+                EpPromptRoute::Dsml
+            } else {
+                EpPromptRoute::Jinja
+            };
             assert_eq!(ep_prompt_route(id), want, "ep_prompt_route({id})");
         }
 
         // ── ep_eos_route: 10 -> Minimax, everything else Deepseek4 ──
         for id in 0u32..=14 {
-            let want = if id == 10 { EpEosRoute::Minimax } else { EpEosRoute::Deepseek4 };
+            let want = if id == 10 {
+                EpEosRoute::Minimax
+            } else {
+                EpEosRoute::Deepseek4
+            };
             assert_eq!(ep_eos_route(id), want, "ep_eos_route({id})");
         }
 
@@ -3614,7 +3625,108 @@ mod registry_tests {
                 14 => Some(GenerationEarlyRoute::MuseGlimmer),
                 _ => None,
             };
-            assert_eq!(generation_early_route(id), want, "generation_early_route({id})");
+            assert_eq!(
+                generation_early_route(id),
+                want,
+                "generation_early_route({id})"
+            );
+        }
+    }
+
+    #[test]
+    fn dflash_lm_head_always_admits_qt3_6_13() {
+        use super::dflash_lm_head_quant_supported;
+        for qt in [3u8, 6, 13] {
+            for arch in [
+                "gfx1030", "gfx1100", "gfx1151", "gfx1200", "gfx1201", "gfx942",
+            ] {
+                assert!(
+                    dflash_lm_head_quant_supported(Some(qt), arch),
+                    "qt={qt} must always be admitted on {arch}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dflash_lm_head_qt17_on_wmma_set_only() {
+        use super::dflash_lm_head_quant_supported;
+        for arch in [
+            "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
+        ] {
+            assert!(
+                dflash_lm_head_quant_supported(Some(17u8), arch),
+                "qt=17 must be admitted on WMMA arch {arch}"
+            );
+        }
+        for arch in ["gfx1030", "gfx942", "gfx1010"] {
+            assert!(
+                !dflash_lm_head_quant_supported(Some(17), arch),
+                "qt=17 must be rejected on non-WMMA arch {arch}"
+            );
+        }
+    }
+
+    #[test]
+    fn dflash_lm_head_v2_admitted_on_gfx11_gfx12_wmma() {
+        use super::dflash_lm_head_quant_supported;
+        let v2 = [44u8, 47, 48, 49, 50];
+        for arch in ["gfx1100", "gfx1151", "gfx1200", "gfx1201"] {
+            for qt in v2 {
+                assert!(
+                    dflash_lm_head_quant_supported(Some(qt), arch),
+                    "V2 qt={qt} must be admitted on {arch}"
+                );
+            }
+        }
+        // Full WMMA set beyond the focused four.
+        for arch in ["gfx1101", "gfx1102", "gfx1150"] {
+            for qt in v2 {
+                assert!(
+                    dflash_lm_head_quant_supported(Some(qt), arch),
+                    "V2 qt={qt} must be admitted on {arch}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dflash_lm_head_v2_rejected_on_gfx1030_and_gfx942() {
+        use super::dflash_lm_head_quant_supported;
+        for arch in ["gfx1030", "gfx942"] {
+            for qt in [44u8, 47, 48, 49, 50] {
+                assert!(
+                    !dflash_lm_head_quant_supported(Some(qt), arch),
+                    "V2 qt={qt} must be rejected on {arch}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dflash_lm_head_rejects_unknown_qt_and_missing() {
+        use super::dflash_lm_head_quant_supported;
+        // qt45 MQ4CG256, legacy MQ2 qt18, F16, missing tensor — all rejected.
+        for qt in [None, Some(18u8), Some(45), Some(16), Some(1)] {
+            for arch in ["gfx1100", "gfx1151", "gfx1200", "gfx1201"] {
+                assert!(
+                    !dflash_lm_head_quant_supported(qt, arch),
+                    "qt={qt:?} must be rejected on {arch}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dflash_lm_head_wmma_arch_set() {
+        use super::is_dflash_lm_head_wmma_arch;
+        for arch in [
+            "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
+        ] {
+            assert!(is_dflash_lm_head_wmma_arch(arch), "{arch}");
+        }
+        for arch in ["gfx1030", "gfx942", "gfx1010", "gfx908"] {
+            assert!(!is_dflash_lm_head_wmma_arch(arch), "{arch}");
         }
     }
 }

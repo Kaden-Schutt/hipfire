@@ -133,7 +133,7 @@ impl SchedulerProfile {
         }
     }
 
-    const fn llvm_args(self) -> &'static [&'static str] {
+    pub const fn llvm_args(self) -> &'static [&'static str] {
         match self {
             Self::Default => &[],
             Self::MaxIlp => &["-mllvm", "-misched=gcn-max-ilp"],
@@ -269,6 +269,7 @@ pub struct ExistingCodeObjectRequest {
     pub hipcc: PathBuf,
     pub command: Vec<String>,
     pub manifest: Option<PathBuf>,
+    pub scheduler_profile: SchedulerProfile,
 }
 
 impl ExistingCodeObjectRequest {
@@ -285,6 +286,7 @@ impl ExistingCodeObjectRequest {
             hipcc: resolve_hipcc(),
             command: Vec::new(),
             manifest: None,
+            scheduler_profile: SchedulerProfile::Default,
         }
     }
 
@@ -305,6 +307,11 @@ impl ExistingCodeObjectRequest {
 
     pub fn manifest(mut self, path: impl Into<PathBuf>) -> Self {
         self.manifest = Some(path.into());
+        self
+    }
+
+    pub fn scheduler_profile(mut self, profile: SchedulerProfile) -> Self {
+        self.scheduler_profile = profile;
         self
     }
 }
@@ -638,7 +645,12 @@ impl Compiler {
             output: output.clone(),
             arch: request.arch.clone(),
             wavefront: request.wavefront,
-            scheduler_profile: SchedulerProfile::Default,
+            // Use the caller-supplied profile so the manifest honestly reflects
+            // what produced the object. Previously this was hardcoded to
+            // `Default`, so a `memory-clause` object was silently described as
+            // `default` during measurement and the field could not be used as
+            // evidence of the actual build.
+            scheduler_profile: request.scheduler_profile,
             hipcc: request.hipcc.clone(),
             hipcc_version: tool_version(&request.hipcc),
             command: request.command.clone(),

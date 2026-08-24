@@ -1559,6 +1559,20 @@ pub const GEMV_HFQ4G1024_SRC: &str = include_str!("../../../kernels/src/gemv_hfq
 /// Block: [f32 scale][f32 zero][128B nibbles] = 136 bytes per 256 weights.
 /// Same coalesced width as Q4_K, 14 VGPRs instead of 39.
 pub const GEMV_HFQ4G256_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256.hip");
+pub const GEMV_MQ4CG256_SRC: &str = include_str!("../../../kernels/src/gemv_mq4cg256.hip");
+/// MQ4G256V2: dual-scale HFQ4-G256 (qt=44). Same 136 B stride and nibble payload as
+/// HFQ4-G256, but header holds two fp16 scales/zeros (s0/z0 for w0..127,
+/// s1/z1 for w128..255) instead of one f32 pair. Decode selects s/z by
+/// `tid < 16` (payload `gp+8+tid*4 < gp+8+64`).
+pub const GEMV_MQ4G256V2_SRC: &str = include_str!("../../../kernels/src/gemv_mq4g256v2.hip");
+/// MQ5G256V2: dual-scale 5-bit (qt=48). Same 168 B stride and 5-bit payload as MQ5G256, header dual fp16.
+pub const GEMV_MQ5G256V2_SRC: &str = include_str!("../../../kernels/src/gemv_mq5g256v2.hip");
+/// MQ3G256V2: dual-scale 3-bit (qt=49).
+pub const GEMV_MQ3G256V2_SRC: &str = include_str!("../../../kernels/src/gemv_mq3g256v2.hip");
+/// MQ2G256V2: dual-scale 2-bit (qt=50).
+pub const GEMV_MQ2G256V2_SRC: &str = include_str!("../../../kernels/src/gemv_mq2g256v2.hip");
+/// MQ6G256V2: dual-scale 6-bit (qt=47).
+pub const GEMV_MQ6G256V2_SRC: &str = include_str!("../../../kernels/src/gemv_mq6g256v2.hip");
 /// gfx1151 LM-head one-row candidate. Keep wave-uniform HFQ headers on scalar
 /// loads, lower lane-divergent packed weights to temporal VMEM, and specialize
 /// the hot 248320x2048 shape so the compiler removes dynamic tail control.
@@ -1639,6 +1653,41 @@ pub const GEMV_HFQ4G256_RESIDUAL_SRC: &str = concat!(
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/gemv_hfq4g256_residual.hip")
+);
+pub const GEMV_MQ4G256V2_RESIDUAL_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_mq4g256v2_residual.hip")
+);
+pub const GEMV_MQ5G256V2_RESIDUAL_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_mq5g256v2_residual.hip")
+);
+pub const GEMV_MQ6G256V2_RESIDUAL_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_mq6g256v2_residual.hip")
+);
+pub const GEMV_MQ3G256V2_RESIDUAL_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_mq3g256v2_residual.hip")
+);
+pub const GEMV_MQ2G256V2_RESIDUAL_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_mq2g256v2_residual.hip")
+);
+/// MQ4C / v1.5 (qt=45) residual GEMV: per-256 affine like qt=13, but the header is
+/// one fp16 pair (+ zero pad to keep payload at +8) instead of two f32s; group stays
+/// 136 B/stride. Mirrors the v1 constant's concat exactly so both compile under the same
+/// gfx12 weight-cache policy — otherwise a v1-vs-v1.5 comparison measures the
+/// policy difference rather than the header change.
+pub const GEMV_MQ4CG256_RESIDUAL_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_mq4cg256_residual.hip")
 );
 /// Radiowave gfx1151 probe: preserve the generic dual-row arithmetic while
 /// lowering the weight stream to temporal raw-buffer loads. gfx1151 is not in
@@ -2869,8 +2918,67 @@ pub const GEMM_KSPLIT_DET_FINALIZE_SRC: &str =
 // stuck on the dot2 fp16 fallback before this).
 pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma.gfx12.hip");
+pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_wmma.gfx12.hip");
+/// gfx11 (RDNA3 / RDNA3.5) MQ4V2 residual WMMA — sister of
+/// GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX12_SRC. Same dual-half header contract
+/// (136 B groups, [s0,z0,s1,z1] fp16 headers, payload +8, kt<8 half0) but
+/// gfx11 WMMA contracts (half16_t A/B, __builtin_amdgcn_wmma_f32_16x16x16_f16_w32,
+/// interleaved C mapping `acc[j]=C[2*j+(tid>>4)][tid&15]`). Distinct file so
+/// admitting RDNA3 cannot alter the certified gfx12 code object.
+pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_wmma.hip");
+pub const GEMM_MQ5G256V2_RESIDUAL_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq5g256v2_residual_wmma.hip");
+pub const GEMM_MQ6G256V2_RESIDUAL_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq6g256v2_residual_wmma.hip");
+pub const GEMM_MQ3G256V2_RESIDUAL_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq3g256v2_residual_wmma.hip");
+pub const GEMM_MQ2G256V2_RESIDUAL_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq2g256v2_residual_wmma.hip");
+pub const GEMM_MQ5G256V2_RESIDUAL_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq5g256v2_residual_wmma.gfx12.hip");
+pub const GEMM_MQ6G256V2_RESIDUAL_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq6g256v2_residual_wmma.gfx12.hip");
+pub const GEMM_MQ3G256V2_RESIDUAL_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq3g256v2_residual_wmma.gfx12.hip");
+pub const GEMM_MQ2G256V2_RESIDUAL_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq2g256v2_residual_wmma.gfx12.hip");
+pub const GEMM_MQ4CG256_RESIDUAL_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq4cg256_residual_wmma.gfx12.hip");
 pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_BT_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_gfx12_bt.hip");
+pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX12_BT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_wmma_gfx12_bt.hip");
+/// Exact-gfx1100 production MQ4V2 residual batch-tiled WMMA.
+/// Sister of GEMM_MQ4G256V2_RESIDUAL_WMMA_SRC / GFX12_BT: half16 +
+/// interleaved-C contracts, 136 B dual-half headers, and BT∈{4,6,8} weight
+/// reuse. A distinct file/module leaves the base gfx11 and other-arch objects
+/// unchanged.
+pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX11_BT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_wmma_gfx11_bt.hip");
+/// Shared gfx1100/gfx1151 weight-reuse kernels for MQ{2,3,5,6}V2.
+/// The source compile-time specializes the bit decoder while preserving the
+/// format-specific base WMMA order and gfx11 interleaved-C contract.
+pub const GEMM_MQV2_WMMA_GFX11_BT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mqv2_wmma_gfx11_bt.hip");
+/// Exact-gfx1100 multi-wave same-row LDS residual (production MW4/MW8).
+/// Sister of GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX11_BT_SRC: half16 + interleaved-C,
+/// 136 B dual-half headers, static 8 KiB tile-major LDS, symbols mw{4,8}_lds.
+pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX1100_MW_LDS_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_wmma_gfx1100_mw_lds.hip");
+
+pub const GEMM_MQ5G256V2_RESIDUAL_WMMA_GFX12_BT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq5g256v2_residual_wmma_gfx12_bt.hip");
+pub const GEMM_MQ6G256V2_RESIDUAL_WMMA_GFX12_BT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq6g256v2_residual_wmma_gfx12_bt.hip");
+pub const GEMM_MQ3G256V2_RESIDUAL_WMMA_GFX12_BT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq3g256v2_residual_wmma_gfx12_bt.hip");
+pub const GEMM_MQ2G256V2_RESIDUAL_WMMA_GFX12_BT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq2g256v2_residual_wmma_gfx12_bt.hip");
+
+pub const GEMM_MQ4CG256_RESIDUAL_WMMA_GFX12_BT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq4cg256_residual_wmma_gfx12_bt.hip");
 /// Muse Glimmer-owned batch-tiled gfx12 residual GEMM. Sibling of
 /// `GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_BT_SRC`; same math, register-lean
 /// full-tile variants only. Used exclusively by hipfire-arch-muse-glimmer.
@@ -3072,16 +3180,119 @@ pub const GEMM_GATE_UP_HFQ4G256_WMMA_2TILE_SRC: &str =
 // half8_t operands, K-split via tid>>4, contiguous C-row mapping.
 pub const GEMM_GATE_UP_HFQ4G256_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma.gfx12.hip");
+pub const GEMM_GATE_UP_MQ4G256V2_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma.gfx12.hip");
+/// gfx11 (RDNA3 / RDNA3.5) MQ4V2 gate_up WMMA — sister of
+/// GEMM_GATE_UP_MQ4G256V2_WMMA_GFX12_SRC. Same dual-half header contract
+/// (136 B groups, [s0,z0,s1,z1] fp16 headers, payload +8, kt<8 half0) but
+/// gfx11 WMMA contracts (half16_t A/B, __builtin_amdgcn_wmma_f32_16x16x16_f16_w32,
+/// interleaved C mapping `acc[j]=C[2*j+(tid>>4)][tid&15]`). Distinct file so
+/// admitting RDNA3 cannot alter the certified gfx12 code object.
+pub const GEMM_GATE_UP_MQ4G256V2_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma.hip");
+/// gfx11 (exact gfx1100 candidate) MQ4V2 gate_up batch-tiled WMMA.
+/// Sister of GEMM_GATE_UP_MQ4G256V2_WMMA_SRC / GFX12_BT: half16 + interleaved-C
+/// contracts, 136 B dual-half headers, reuses one dequantized 16-row weight tile
+/// across BT∈{4,8,12} independent N-tiles (64/128/192 batch columns). Distinct
+/// file/module so the opt-in path cannot alter the certified base gfx11 object.
+pub const GEMM_GATE_UP_MQ4G256V2_WMMA_GFX11_BT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_gfx11_bt.hip");
+/// Exact-gfx1100 multi-wave same-row LDS gate+up (MW4/MW8).
+/// Sister of GEMM_GATE_UP_MQ4G256V2_WMMA_GFX11_BT_SRC and residual MW_LDS:
+/// half16 + interleaved-C, 136 B dual-half headers, static 8 KiB tile-major
+/// LDS spanning gate+up rows, symbols mw{4,8}_lds. Production N>=384.
+pub const GEMM_GATE_UP_MQ4G256V2_WMMA_GFX1100_MW_LDS_SRC: &str =
+    include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_gfx1100_mw_lds.hip");
+
+pub const GEMM_GATE_UP_MQ5G256V2_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_gate_up_mq5g256v2_wmma.hip");
+pub const GEMM_GATE_UP_MQ6G256V2_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_gate_up_mq6g256v2_wmma.hip");
+pub const GEMM_GATE_UP_MQ3G256V2_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_gate_up_mq3g256v2_wmma.hip");
+pub const GEMM_GATE_UP_MQ2G256V2_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_gate_up_mq2g256v2_wmma.hip");
+pub const GEMM_GATE_UP_MQ5G256V2_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_gate_up_mq5g256v2_wmma.gfx12.hip");
+pub const GEMM_GATE_UP_MQ6G256V2_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_gate_up_mq6g256v2_wmma.gfx12.hip");
+pub const GEMM_GATE_UP_MQ3G256V2_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_gate_up_mq3g256v2_wmma.gfx12.hip");
+pub const GEMM_GATE_UP_MQ2G256V2_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_gate_up_mq2g256v2_wmma.gfx12.hip");
+
+pub const GEMM_GATE_UP_MQ4CG256_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_gate_up_mq4cg256_wmma.gfx12.hip");
 pub const GEMM_GATE_UP_HFQ4G256_WMMA_GFX12_BT_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma_gfx12_bt.hip");
+pub const GEMM_GATE_UP_MQ4G256V2_WMMA_GFX12_BT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_gfx12_bt.hip");
+pub const GEMM_GATE_UP_MQ5G256V2_WMMA_GFX12_BT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_gate_up_mq5g256v2_wmma_gfx12_bt.hip");
+pub const GEMM_GATE_UP_MQ6G256V2_WMMA_GFX12_BT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_gate_up_mq6g256v2_wmma_gfx12_bt.hip");
+pub const GEMM_GATE_UP_MQ3G256V2_WMMA_GFX12_BT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_gate_up_mq3g256v2_wmma_gfx12_bt.hip");
+pub const GEMM_GATE_UP_MQ2G256V2_WMMA_GFX12_BT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_gate_up_mq2g256v2_wmma_gfx12_bt.hip");
+
+pub const GEMM_GATE_UP_MQ4CG256_WMMA_GFX12_BT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_gate_up_mq4cg256_wmma_gfx12_bt.hip");
 pub const GEMM_QKVZA_HFQ4G256_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_qkvza_hfq4g256_wmma.hip");
 // gfx12 (RDNA4) sister: gfx12 hfq4 recipe + 4-output qkv/z/beta/alpha
 // routing for the DeltaNet LinearAttention preamble.
 pub const GEMM_QKVZA_HFQ4G256_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_qkvza_hfq4g256_wmma.gfx12.hip");
+pub const GEMM_QKVZA_MQ4G256V2_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkvza_mq4g256v2_wmma.gfx12.hip");
+/// gfx11 (RDNA3 / RDNA3.5) MQ4V2 qkvza WMMA — sister of
+/// GEMM_QKVZA_MQ4G256V2_WMMA_GFX12_SRC. Same dual-half header contract but
+/// gfx11 WMMA contracts (half16_t, w32, interleaved C). Distinct file so
+/// admitting RDNA3 cannot alter the certified gfx12 code object.
+pub const GEMM_QKVZA_MQ4G256V2_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkvza_mq4g256v2_wmma.hip");
+/// Exact-gfx1100 production MQ4V2 QKVZA batch-tiled WMMA.
+/// Sister of GEMM_QKVZA_MQ4G256V2_WMMA_SRC / GFX12_BT: half16 +
+/// interleaved-C contracts, 136 B dual-half headers, and BT∈{4,12} weight
+/// reuse. A distinct file/module leaves the base gfx11 and other-arch objects
+/// unchanged.
+pub const GEMM_QKVZA_MQ4G256V2_WMMA_GFX11_BT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkvza_mq4g256v2_wmma_gfx11_bt.hip");
+pub const GEMM_QKVZA_MQ5G256V2_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkvza_mq5g256v2_wmma.hip");
+pub const GEMM_QKVZA_MQ6G256V2_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkvza_mq6g256v2_wmma.hip");
+pub const GEMM_QKVZA_MQ3G256V2_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkvza_mq3g256v2_wmma.hip");
+pub const GEMM_QKVZA_MQ2G256V2_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkvza_mq2g256v2_wmma.hip");
+pub const GEMM_QKVZA_MQ5G256V2_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkvza_mq5g256v2_wmma.gfx12.hip");
+pub const GEMM_QKVZA_MQ6G256V2_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkvza_mq6g256v2_wmma.gfx12.hip");
+pub const GEMM_QKVZA_MQ3G256V2_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkvza_mq3g256v2_wmma.gfx12.hip");
+pub const GEMM_QKVZA_MQ2G256V2_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkvza_mq2g256v2_wmma.gfx12.hip");
+
+pub const GEMM_QKVZA_MQ4CG256_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkvza_mq4cg256_wmma.gfx12.hip");
 pub const GEMM_QKVZA_HFQ4G256_WMMA_GFX12_BT_SRC: &str =
     include_str!("../../../kernels/src/gemm_qkvza_hfq4g256_wmma_gfx12_bt.hip");
+pub const GEMM_QKVZA_MQ4G256V2_WMMA_GFX12_BT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkvza_mq4g256v2_wmma_gfx12_bt.hip");
+pub const GEMM_QKVZA_MQ5G256V2_WMMA_GFX12_BT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkvza_mq5g256v2_wmma_gfx12_bt.hip");
+pub const GEMM_QKVZA_MQ6G256V2_WMMA_GFX12_BT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkvza_mq6g256v2_wmma_gfx12_bt.hip");
+pub const GEMM_QKVZA_MQ3G256V2_WMMA_GFX12_BT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkvza_mq3g256v2_wmma_gfx12_bt.hip");
+pub const GEMM_QKVZA_MQ2G256V2_WMMA_GFX12_BT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkvza_mq2g256v2_wmma_gfx12_bt.hip");
+
+pub const GEMM_QKVZA_MQ4CG256_WMMA_GFX12_BT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkvza_mq4cg256_wmma_gfx12_bt.hip");
 // HFQ3-G256 sister of GEMM_QKVZA_HFQ4G256_WMMA_SRC. Same WMMA shape +
 // lane decomposition; only the inner K-tile unpack differs (3-bit
 // cross-byte vs 4-bit nibble). Used for MQ3 prefill via dispatch
@@ -3123,6 +3334,50 @@ pub const GEMM_QKV_HFQ4G256_WMMA_SRC: &str =
 // validated on R9700 in PR #56's channel-tests.
 pub const GEMM_QKV_HFQ4G256_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_qkv_hfq4g256_wmma.gfx12.hip");
+pub const GEMM_QKV_MQ4G256V2_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkv_mq4g256v2_wmma.gfx12.hip");
+/// gfx11 (RDNA3 / RDNA3.5) MQ4V2 qkv WMMA — sister of
+/// GEMM_QKV_MQ4G256V2_WMMA_GFX12_SRC. Same dual-half header contract but
+/// gfx11 WMMA contracts (half16_t, w32, interleaved C). Distinct file so
+/// admitting RDNA3 cannot alter the certified gfx12 code object.
+pub const GEMM_QKV_MQ4G256V2_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkv_mq4g256v2_wmma.hip");
+/// Exact-gfx1100 production MQ4V2 QKV batch-tiled WMMA.
+/// Sister of GEMM_QKV_MQ4G256V2_WMMA_SRC: half16 + interleaved-C contracts,
+/// 136 B dual-half headers, and BT∈{4,12} weight reuse. A distinct file/module
+/// leaves the base gfx11 and other-arch objects unchanged.
+pub const GEMM_QKV_MQ4G256V2_WMMA_GFX11_BT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkv_mq4g256v2_wmma_gfx11_bt.hip");
+/// Exact-gfx1201 MQ4V2 QKV batch-tiled production kernel (BT8).
+/// Sister of GEMM_QKV_MQ4G256V2_WMMA_GFX11_BT_SRC / gfx12 base: half8 +
+/// gfx12 WMMA, 136 B dual-half headers, with the validated BT8 default.
+pub const GEMM_QKV_MQ4G256V2_WMMA_GFX1201_BT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkv_mq4g256v2_wmma_gfx1201_bt.hip");
+/// Shared exact-gfx1201 QKV BT8 kernels for MQ{2,3,5,6}V2.
+/// The bit-specialized decoder reuses each half8 weight fragment across eight
+/// independent token tiles with the production gfx12 contiguous-C contract.
+pub const GEMM_QKV_MQV2_WMMA_GFX1201_BT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkv_mqv2_wmma_gfx1201_bt.hip");
+
+pub const GEMM_QKV_MQ5G256V2_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkv_mq5g256v2_wmma.hip");
+pub const GEMM_QKV_MQ6G256V2_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkv_mq6g256v2_wmma.hip");
+pub const GEMM_QKV_MQ3G256V2_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkv_mq3g256v2_wmma.hip");
+pub const GEMM_QKV_MQ2G256V2_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkv_mq2g256v2_wmma.hip");
+pub const GEMM_QKV_MQ5G256V2_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkv_mq5g256v2_wmma.gfx12.hip");
+pub const GEMM_QKV_MQ6G256V2_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkv_mq6g256v2_wmma.gfx12.hip");
+pub const GEMM_QKV_MQ3G256V2_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkv_mq3g256v2_wmma.gfx12.hip");
+pub const GEMM_QKV_MQ2G256V2_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkv_mq2g256v2_wmma.gfx12.hip");
+
+pub const GEMM_QKV_MQ4CG256_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkv_mq4cg256_wmma.gfx12.hip");
 
 // Batched 3-way fused HFP4-G32 GEMM (FA preamble: Q + K + V). Sister of
 // GEMM_QKV_HFQ4G256_WMMA_SRC for the FP4 (E2M1 + UE8M0 g32 + FP16 row
@@ -3442,6 +3697,36 @@ pub const GEMV_HFQ4G256_MULTIROW_SRC: &str = concat!(
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/gemv_hfq4g256_multirow.hip")
 );
+pub const GEMV_MQ4G256V2_MULTIROW_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_mq4g256v2_multirow.hip")
+);
+pub const GEMV_MQ5G256V2_MULTIROW_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_mq5g256v2_multirow.hip")
+);
+pub const GEMV_MQ6G256V2_MULTIROW_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_mq6g256v2_multirow.hip")
+);
+pub const GEMV_MQ2G256V2_MULTIROW_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_mq2g256v2_multirow.hip")
+);
+pub const GEMV_MQ3G256V2_MULTIROW_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_mq3g256v2_multirow.hip")
+);
+pub const GEMV_MQ4CG256_MULTIROW_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_mq4cg256_multirow.hip")
+);
 /// Exact gfx1151 LM-head shape specialization with the established global
 /// load path unchanged. This isolates compile-time K=2048 loop/tail/address
 /// simplification from the independently rejected buffer-load experiments.
@@ -3532,6 +3817,37 @@ pub const FUSED_QKVZA_HFQ4G256_SRC: &str = concat!(
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/fused_qkvza_hfq4g256.hip")
+);
+pub const FUSED_QKVZA_MQ4G256V2_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkvza_mq4g256v2.hip")
+);
+pub const FUSED_QKVZA_MQ5G256V2_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkvza_mq5g256v2.hip")
+);
+pub const FUSED_QKVZA_MQ6G256V2_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkvza_mq6g256v2.hip")
+);
+pub const FUSED_QKVZA_MQ3G256V2_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkvza_mq3g256v2.hip")
+);
+pub const FUSED_QKVZA_MQ2G256V2_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkvza_mq2g256v2.hip")
+);
+
+pub const FUSED_QKVZA_MQ4CG256_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkvza_mq4cg256.hip")
 );
 
 /// Exact gfx1151 A3B candidate: preserve the generic one-row schedule while
@@ -3830,6 +4146,80 @@ pub const FUSED_QKV_HFQ4G256_QWEN2_BIAS_SRC: &str = concat!(
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/fused_qkv_hfq4g256.hip")
 );
+pub const FUSED_QKV_MQ4G256V2_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkv_mq4g256v2.hip")
+);
+pub const FUSED_QKV_MQ5G256V2_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkv_mq5g256v2.hip")
+);
+pub const FUSED_QKV_MQ6G256V2_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkv_mq6g256v2.hip")
+);
+pub const FUSED_QKV_MQ3G256V2_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkv_mq3g256v2.hip")
+);
+pub const FUSED_QKV_MQ2G256V2_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkv_mq2g256v2.hip")
+);
+
+pub const FUSED_QKV_MQ4G256V2_QWEN2_BIAS_SRC: &str = concat!(
+    "#define HIPFIRE_QKV_WITH_BIAS 1\n",
+    "#define HIPFIRE_QKV_KERNEL_NAME fused_qkv_mq4g256v2_qwen2_bias\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkv_mq4g256v2.hip")
+);
+pub const FUSED_QKV_MQ5G256V2_QWEN2_BIAS_SRC: &str = concat!(
+    "#define HIPFIRE_QKV_WITH_BIAS 1\n",
+    "#define HIPFIRE_QKV_KERNEL_NAME fused_qkv_mq5g256v2_qwen2_bias\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkv_mq5g256v2.hip")
+);
+pub const FUSED_QKV_MQ6G256V2_QWEN2_BIAS_SRC: &str = concat!(
+    "#define HIPFIRE_QKV_WITH_BIAS 1\n",
+    "#define HIPFIRE_QKV_KERNEL_NAME fused_qkv_mq6g256v2_qwen2_bias\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkv_mq6g256v2.hip")
+);
+pub const FUSED_QKV_MQ3G256V2_QWEN2_BIAS_SRC: &str = concat!(
+    "#define HIPFIRE_QKV_WITH_BIAS 1\n",
+    "#define HIPFIRE_QKV_KERNEL_NAME fused_qkv_mq3g256v2_qwen2_bias\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkv_mq3g256v2.hip")
+);
+pub const FUSED_QKV_MQ2G256V2_QWEN2_BIAS_SRC: &str = concat!(
+    "#define HIPFIRE_QKV_WITH_BIAS 1\n",
+    "#define HIPFIRE_QKV_KERNEL_NAME fused_qkv_mq2g256v2_qwen2_bias\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkv_mq2g256v2.hip")
+);
+
+pub const FUSED_QKV_MQ4CG256_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkv_mq4cg256.hip")
+);
+pub const FUSED_QKV_MQ4CG256_QWEN2_BIAS_SRC: &str = concat!(
+    "#define HIPFIRE_QKV_WITH_BIAS 1\n",
+    "#define HIPFIRE_QKV_KERNEL_NAME fused_qkv_mq4cg256_qwen2_bias\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkv_mq4cg256.hip")
+);
 
 /// gfx1151 fixed-K FullAttention projection with Radiowave temporal buffer
 /// lowering for weights and aligned activation vectors.
@@ -3930,6 +4320,52 @@ pub fn gemv_hfq4g256_for_arch(
     }
 }
 
+/// MQ4G256V2 (qt=44) arch dispatch — mirrors `gemv_hfq4g256_for_arch`.
+/// gfx1100/1101/1102 get the rdna3 module (same dual-scale source, distinct
+/// hsaco cache key); all other archs use the baseline module.
+/// The C symbol is `gemv_mq4g256v2` (and `gemv_mq4g256v2_multirow_r*` for
+/// the multirow file).
+pub fn gemv_mq4g256v2_for_arch(
+    caps: &ArchCaps,
+    _rdna2_variant: Option<u32>,
+) -> (&'static str, &'static str) {
+    let arch = caps.arch();
+    match arch {
+        "gfx1100" | "gfx1101" | "gfx1102" => (GEMV_MQ4G256V2_SRC, "gemv_mq4g256v2_rdna3"),
+        _ => (GEMV_MQ4G256V2_SRC, "gemv_mq4g256v2"),
+    }
+}
+pub fn gemv_mq5g256v2_for_arch(
+    caps: &ArchCaps,
+    _rdna2_variant: Option<u32>,
+) -> (&'static str, &'static str) {
+    let arch = caps.arch();
+    match arch {
+        "gfx1100" | "gfx1101" | "gfx1102" => (GEMV_MQ5G256V2_SRC, "gemv_mq5g256v2_rdna3"),
+        _ => (GEMV_MQ5G256V2_SRC, "gemv_mq5g256v2"),
+    }
+}
+pub fn gemv_mq6g256v2_for_arch(
+    caps: &ArchCaps,
+    _rdna2_variant: Option<u32>,
+) -> (&'static str, &'static str) {
+    let arch = caps.arch();
+    match arch {
+        "gfx1100" | "gfx1101" | "gfx1102" => (GEMV_MQ6G256V2_SRC, "gemv_mq6g256v2_rdna3"),
+        _ => (GEMV_MQ6G256V2_SRC, "gemv_mq6g256v2"),
+    }
+}
+pub fn gemv_mq3g256v2_for_arch(
+    caps: &ArchCaps,
+    _rdna2_variant: Option<u32>,
+) -> (&'static str, &'static str) {
+    let arch = caps.arch();
+    match arch {
+        "gfx1100" | "gfx1101" | "gfx1102" => (GEMV_MQ3G256V2_SRC, "gemv_mq3g256v2_rdna3"),
+        _ => (GEMV_MQ3G256V2_SRC, "gemv_mq3g256v2"),
+    }
+}
+
 /// HFP4-G32 GEMV arch dispatch.
 ///
 /// v1: gfx1100 variant is the byte-exact baseline (currently bit-identical to the
@@ -3958,6 +4394,42 @@ pub fn gemv_hfq4g256_residual_for_arch(caps: &ArchCaps) -> (&'static str, &'stat
             "gemv_hfq4g256_residual_rdna3",
         ),
         _ => (GEMV_HFQ4G256_RESIDUAL_SRC, "gemv_hfq4g256_residual"),
+    }
+}
+pub fn gemv_mq4g256v2_residual_for_arch(caps: &ArchCaps) -> (&'static str, &'static str) {
+    let arch = caps.arch();
+    match arch {
+        "gfx1100" | "gfx1101" | "gfx1102" => {
+            (GEMV_MQ4G256V2_RESIDUAL_SRC, "gemv_mq4g256v2_residual_rdna3")
+        }
+        _ => (GEMV_MQ4G256V2_RESIDUAL_SRC, "gemv_mq4g256v2_residual"),
+    }
+}
+pub fn gemv_mq5g256v2_residual_for_arch(caps: &ArchCaps) -> (&'static str, &'static str) {
+    let arch = caps.arch();
+    match arch {
+        "gfx1100" | "gfx1101" | "gfx1102" => {
+            (GEMV_MQ5G256V2_RESIDUAL_SRC, "gemv_mq5g256v2_residual_rdna3")
+        }
+        _ => (GEMV_MQ5G256V2_RESIDUAL_SRC, "gemv_mq5g256v2_residual"),
+    }
+}
+pub fn gemv_mq6g256v2_residual_for_arch(caps: &ArchCaps) -> (&'static str, &'static str) {
+    let arch = caps.arch();
+    match arch {
+        "gfx1100" | "gfx1101" | "gfx1102" => {
+            (GEMV_MQ6G256V2_RESIDUAL_SRC, "gemv_mq6g256v2_residual_rdna3")
+        }
+        _ => (GEMV_MQ6G256V2_RESIDUAL_SRC, "gemv_mq6g256v2_residual"),
+    }
+}
+pub fn gemv_mq3g256v2_residual_for_arch(caps: &ArchCaps) -> (&'static str, &'static str) {
+    let arch = caps.arch();
+    match arch {
+        "gfx1100" | "gfx1101" | "gfx1102" => {
+            (GEMV_MQ3G256V2_RESIDUAL_SRC, "gemv_mq3g256v2_residual_rdna3")
+        }
+        _ => (GEMV_MQ3G256V2_RESIDUAL_SRC, "gemv_mq3g256v2_residual"),
     }
 }
 
@@ -3990,6 +4462,77 @@ pub fn gemv_hfq3g256_residual_for_arch(caps: &ArchCaps) -> (&'static str, &'stat
 /// [f32 scale (4B)][f32 zero (4B)][2-bit × 128 (32B)] = 40 bytes per 128 weights (0.3125 B/w).
 /// 32 threads × 4 elements = 128 per group. Each thread reads 1 byte.
 pub const GEMV_HFQ2G128_SRC: &str = include_str!("../../../kernels/src/gemv_hfq2g128.hip");
+
+/// TQ2-G128: PrismML Q2_0-layout ternary dequant-to-f16 correctness oracle.
+/// [FP16 d (2B)][2-bit × 128 (32B)] = 34 bytes per 128-weight group.
+/// 32 threads × 4 elements = 128 per group. Each thread reads 1 byte.
+/// code -> (code - 1) * d, i.e. {0,1,2,3} -> {-d, 0, +d, +2d}.
+pub const DEQUANT_TQ2G128_TO_F16_SRC: &str =
+    include_str!("../../../kernels/src/dequant_tq2g128_to_f16.hip");
+
+/// BQ1-G128: PrismML Q1_0-layout binary dequant-to-f16 correctness oracle.
+/// [FP16 d (2B)][1-bit × 128 (16B)] = 18 bytes per 128-weight group.
+/// 32 threads × 4 elements = 128 per group. Each thread reads 4 bits (half a byte).
+/// bit -> {0,1} -> {-d, +d}.
+pub const DEQUANT_BQ1G128_TO_F16_SRC: &str =
+    include_str!("../../../kernels/src/dequant_bq1g128_to_f16.hip");
+
+/// TQ2-G128 GEMV: correctness-first FP decode GEMV for PrismML Q2_0 ternary.
+/// Mirrors GEMV_HFQ2G128_SRC's layout/reduction, swapping the affine
+/// [f32 scale][f32 zero][32B codes] (40B) block for the ternary
+/// [FP16 d (2B)][32B codes] (34B) block and the `scale*code+zero` map for
+/// `(code - 1) * d`.
+pub const GEMV_TQ2G128_SRC: &str = include_str!("../../../kernels/src/gemv_tq2g128.hip");
+
+/// BQ1-G128 GEMV: correctness-first FP decode GEMV for PrismML Q1_0 binary.
+/// Mirrors GEMV_TQ2G128_SRC's layout/reduction, swapping the ternary
+/// [FP16 d (2B)][32B codes] (34B) block for the binary
+/// [FP16 d (2B)][16B codes] (18B) block and the `(code - 1) * d` map for
+/// the 1-bit sign decode `bit ? +d : -d`.
+pub const GEMV_BQ1G128_SRC: &str = include_str!("../../../kernels/src/gemv_bq1g128.hip");
+
+/// x-batched TQ2-G128 GEMV: `y[b] = A . x[b]` for b in 0..B, reading each
+/// weight row ONCE instead of once per b. This is the prefill / multi-stream
+/// path: without it these formats fall back to per-token GEMV, so prefill
+/// runs at decode speed and the batched backend rejects the model outright.
+pub const GEMV_TQ2G128_XBATCH_SRC: &str = concat!(
+    "#define HIPFIRE_TQ2G128_XBATCH 1\n",
+    "#define HIPFIRE_TQ2G128_XBATCH_MAX 4\n",
+    "#define HIPFIRE_TQ2G128_XBATCH_KERNEL gemv_tq2g128_xbatch\n",
+    include_str!("../../../kernels/src/gemv_tq2g128.hip")
+);
+
+/// Binary sibling of [`GEMV_TQ2G128_XBATCH_SRC`].
+pub const GEMV_BQ1G128_XBATCH_SRC: &str = concat!(
+    "#define HIPFIRE_BQ1G128_XBATCH 1\n",
+    "#define HIPFIRE_BQ1G128_XBATCH_MAX 4\n",
+    "#define HIPFIRE_BQ1G128_XBATCH_KERNEL gemv_bq1g128_xbatch\n",
+    include_str!("../../../kernels/src/gemv_bq1g128.hip")
+);
+
+/// Batched 4-way FUSED TQ2-G128 GEMM for the DeltaNet LA preamble: one
+/// launch covering qkv+z+beta+alpha, mirroring GEMM_QKVZA_HFQ4G256_SRC.
+/// The unfused path issues four launches; closing that gap is what remains
+/// between low-bit prefill and the same-size mq4 model.
+pub const GEMM_QKVZA_TQ2G128_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkvza_tq2g128.hip");
+
+/// WMMA prefill GEMM over PACKED TQ2-G128 blocks + F16 activations.
+/// Dequantises each 16-element A fragment straight into registers and feeds
+/// the matrix cores, mirroring GEMM_HFQ4G256_WMMA_SRC. gfx1100+ only.
+pub const GEMM_TQ2G128_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_tq2g128_wmma.hip");
+
+/// Binary sibling of [`GEMM_TQ2G128_WMMA_SRC`].
+pub const GEMM_BQ1G128_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_bq1g128_wmma.hip");
+
+/// Tiled prefill GEMM over PACKED TQ2-G128 blocks — no dequant, no F16 copy.
+/// Decodes each code byte once and reuses it across a tile of TILE_N tokens.
+pub const GEMM_TQ2G128_PREFILL_SRC: &str =
+    include_str!("../../../kernels/src/gemm_tq2g128_prefill.hip");
+
+/// Binary sibling of [`GEMM_TQ2G128_PREFILL_SRC`].
+pub const GEMM_BQ1G128_PREFILL_SRC: &str =
+    include_str!("../../../kernels/src/gemm_bq1g128_prefill.hip");
 
 /// HFQ4-G256 wide GEMV: 2 rows per block (64 threads = 2 warps).
 /// Each warp processes one row independently. Halves grid size.
@@ -4132,6 +4675,16 @@ pub const SCALED_ADD_INPLACE_SRC: &str =
 
 /// Element-wise multiply
 pub const MUL_SRC: &str = include_str!("../../../kernels/src/mul.hip");
+/// Dynamic causal convolution (DFlash2): left-zero-padded grouped per-position kernel.
+/// output[row,c] = sum_{off} (base[off,c] + dynamic[row,off,c/group_size]) * input[row-off,c]
+/// Layouts are row-major F32: input/output [rows,hidden], base [kernel_size,hidden],
+/// dynamic strided [rows, dynamic_row_stride] with window [dynamic_offset, dynamic_offset+kernel_size*groups).
+/// Compact: stride=kernel_size*groups, offset=0. 2-phase (DFlash2 kernel_projection [B,2,kernel_size,groups]):
+/// stride=2*kernel_size*groups, phase 0 offset 0, phase 1 offset kernel_size*groups. See
+/// `crates/rdna-compute/src/norm.rs::dynamic_causal_conv_f32` and `kernels/src/dynamic_conv_f32.hip`.
+pub const DYNAMIC_CONV_F32_SRC: &str = include_str!("../../../kernels/src/dynamic_conv_f32.hip");
+/// Backwards-compatible alias for the compact launch name; same source as DYNAMIC_CONV_F32_SRC.
+pub const DYNAMIC_CAUSAL_CONV_F32_SRC: &str = DYNAMIC_CONV_F32_SRC;
 
 /// SiLU (Sigmoid Linear Unit): silu(x) = x * sigmoid(x)
 pub const SILU_SRC: &str = include_str!("../../../kernels/src/silu.hip");
@@ -4290,6 +4843,37 @@ pub const FUSED_GATE_UP_HFQ4G256_LANE0_HEADERS_GFX1100_SRC: &str = concat!(
     include_str!("../../../kernels/src/fused_gate_up_hfq4g256.hip")
 );
 /// gfx1201 dense decode specialization. The host admits this artifact only
+pub const FUSED_GATE_UP_MQ4G256V2_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_gate_up_mq4g256v2.hip")
+);
+pub const FUSED_GATE_UP_MQ5G256V2_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_gate_up_mq5g256v2.hip")
+);
+pub const FUSED_GATE_UP_MQ6G256V2_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_gate_up_mq6g256v2.hip")
+);
+pub const FUSED_GATE_UP_MQ3G256V2_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_gate_up_mq3g256v2.hip")
+);
+pub const FUSED_GATE_UP_MQ2G256V2_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_gate_up_mq2g256v2.hip")
+);
+
+pub const FUSED_GATE_UP_MQ4CG256_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_gate_up_mq4cg256.hip")
+);
 /// for K=1024, allowing LLVM to remove the generic quad loop and dead tail
 /// bodies while retaining the base kernel's exact load/FMA/reduction order.
 pub const FUSED_GATE_UP_HFQ4G256_K1024_GFX1201_SRC: &str = concat!(
@@ -5478,6 +6062,18 @@ pub const APPLY_ROPE_2D_VISION_SRC: &str =
 /// `kernels/src/attention_dflash.hip` for the full contract.
 pub const ATTENTION_DFLASH_SRC: &str = include_str!("../../../kernels/src/attention_dflash.hip");
 
+/// Faithful non-causal sliding-window DFlash attention (scalar, tiled
+/// online-softmax). Same GQA/tiling/numerical structure as
+/// `ATTENTION_DFLASH_SRC` but applies the DFlash2 is_causal=false mask:
+/// key kj is visible iff abs(ctx_span + qi - kj) < sliding_window,
+/// where ctx_span = L - B, qi is the query's block index, and window
+/// is the training-time `sliding_window`. Context keys are the
+/// contiguous suffix base-ctx_span..base-1; block keys are base..base+B-1.
+/// Grid=[n_heads, B], block = next_pow2(max(L, head_dim)).min(256).
+/// See `kernels/src/attention_dflash_sliding.hip`.
+pub const ATTENTION_DFLASH_SLIDING_SRC: &str =
+    include_str!("../../../kernels/src/attention_dflash_sliding.hip");
+
 /// Bias-add: X[batch, n] += bias[n] (broadcast over batch dim)
 pub const BIAS_ADD_SRC: &str = include_str!("../../../kernels/src/bias_add.hip");
 
@@ -6343,6 +6939,10 @@ pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_EXPANDED_K4_SRC: &str =
 /// ParoQuant Givens rotation: apply learned pairwise rotations + channel scaling
 /// to activations in-place. Called before each ParoQ4G128 GEMV.
 pub const GIVENS_ROTATE_SRC: &str = include_str!("../../../kernels/src/givens_rotate.hip");
+/// Calibration activation reductions (`calib_sumsq_reduce_f32` = per-column Σx²
+/// for imatrix/diag; `calib_hessian_outer_f32` = Σxxᵀ K×K for GPTQ Hessian).
+/// Accumulate-in-place over the calibration corpus. Tier-1 native collector.
+pub const CALIB_REDUCE_SRC: &str = include_str!("../../../kernels/src/calib_reduce.hip");
 
 /// Host-side value-identity proof for the gfx1201 E8 decode rewrite.  These
 /// helpers feed a byte-exact decode route, so close numerical agreement is not

@@ -5,38 +5,12 @@
 //! Qwen3.5 weight loading: HFQ / ParoQuant sources, AWQ repack, packed-MQ4
 //! experts, `load_weights`, and the EP sharded loader.
 
-use hip_bridge::HipError;
-use hip_bridge::HipResult;
-use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::hfq::HfqTensorInfo;
-use hipfire_runtime::hfq_parallel::HfqReadJob;
-use hipfire_runtime::hfq_parallel::read_hfq_jobs_ordered;
-use hipfire_runtime::llama::EmbeddingFormat;
-use hipfire_runtime::llama::ParoRotation;
-use hipfire_runtime::llama::WeightTensor;
-use hipfire_runtime::llama::f16_to_f32;
-use hipfire_runtime::model_load::LoadedWeights;
-use hipfire_runtime::model_load::WeightSource;
-use hipfire_runtime::model_load::load_weights as rt_load_weights;
-use hipfire_runtime::model_source::ModelSource;
-use hipfire_runtime::paro::paro_load_norm;
-use hipfire_runtime::paro::paro_text_prefix;
-use hipfire_runtime::tp_shard::ShardConfig;
-use hipfire_runtime::weight_backend::HfqBackend;
-use hipfire_runtime::weight_backend::ParoBackend;
-use hipfire_runtime::weight_backend::dequant_norm;
-use hipfire_runtime::weight_backend::dequant_weight_raw;
-use hipfire_runtime::weight_backend::load_awq_scale_for;
-use hipfire_runtime::weight_backend::load_embedding;
-use hipfire_runtime::weight_backend::resolve_lm_head;
-use hipfire_runtime::weight_backend::reupload_f16_as_f32;
-use rdna_compute::DType;
-use rdna_compute::Gpu;
-use rdna_compute::GpuTensor;
+use super::config::f16_lm_head_mode_from_config;
 use super::config::F16LmHeadMode;
 use super::config::Qwen35Config;
-use super::config::f16_lm_head_mode_from_config;
 use super::forward::layers_have_mq6_moe;
+use super::weights::dtype_from_quant_type;
+use super::weights::mixed_expert_tag;
 use super::weights::ExpertWeights;
 use super::weights::LayerWeights;
 use super::weights::MoeFfnWeights;
@@ -49,8 +23,34 @@ use super::weights::Qwen35HfqSourceIdentity;
 use super::weights::Qwen35RankSeal;
 use super::weights::Qwen35Weights;
 use super::weights::SharedExpertWeights;
-use super::weights::dtype_from_quant_type;
-use super::weights::mixed_expert_tag;
+use hip_bridge::HipError;
+use hip_bridge::HipResult;
+use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::hfq::HfqTensorInfo;
+use hipfire_runtime::hfq_parallel::read_hfq_jobs_ordered;
+use hipfire_runtime::hfq_parallel::HfqReadJob;
+use hipfire_runtime::llama::f16_to_f32;
+use hipfire_runtime::llama::EmbeddingFormat;
+use hipfire_runtime::llama::ParoRotation;
+use hipfire_runtime::llama::WeightTensor;
+use hipfire_runtime::model_load::load_weights as rt_load_weights;
+use hipfire_runtime::model_load::LoadedWeights;
+use hipfire_runtime::model_load::WeightSource;
+use hipfire_runtime::model_source::ModelSource;
+use hipfire_runtime::paro::paro_load_norm;
+use hipfire_runtime::paro::paro_text_prefix;
+use hipfire_runtime::tp_shard::ShardConfig;
+use hipfire_runtime::weight_backend::dequant_norm;
+use hipfire_runtime::weight_backend::dequant_weight_raw;
+use hipfire_runtime::weight_backend::load_awq_scale_for;
+use hipfire_runtime::weight_backend::load_embedding;
+use hipfire_runtime::weight_backend::resolve_lm_head;
+use hipfire_runtime::weight_backend::reupload_f16_as_f32;
+use hipfire_runtime::weight_backend::HfqBackend;
+use hipfire_runtime::weight_backend::ParoBackend;
+use rdna_compute::DType;
+use rdna_compute::Gpu;
+use rdna_compute::GpuTensor;
 
 /// RMSNorm weight bias for qwen3.5/gemma-style norms: dequant computes `w + norm_bias`.
 /// qwen2/llama use `0.0`. Single source of truth — referenced by the backend constructors
@@ -425,6 +425,206 @@ fn load_weight_tensor_raw(
                 awq_scale: None,
             })
         }
+        44 => {
+            // MQ4-G256 v2 (qt=44): 136 B/group, byte-identical payload to MQ4G256
+            // but per-128 fp16 scale+zero. Validate K%256 and blob length.
+            if k % 256 != 0 {
+                return Err(HipError::new(
+                    0,
+                    &format!("MQ4G256V2 has K={k} but requires K%256==0"),
+                ));
+            }
+            let gpr = k / 256;
+            let expected = m * gpr * 136;
+            if data.len() != expected {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "MQ4G256V2 blob length mismatch: expected {expected}, got {}",
+                        data.len()
+                    ),
+                ));
+            }
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MQ4G256V2,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        45 => {
+            // MQ4C (qt=45), pad layout: 136 B/group — ONE fp16 scale+zero dword at
+            // +0 governing all 256 weights, 4 B of zero padding at +4, and the
+            // 128 B nibble payload at +8, which is byte-for-byte where qt=13 puts
+            // it. Same total size as qt=13; the padding is the deliberate price of
+            // keeping the payload 8-byte aligned.
+            //
+            // Derive the stride from rdna_compute::MQ4C_GROUP_BYTES rather than a
+            // literal. This site previously hardcoded 132 and rejected every valid
+            // file the moment the format moved to 136 — the check was right, the
+            // duplicated constant was not.
+            if k % 256 != 0 {
+                return Err(HipError::new(
+                    0,
+                    &format!("MQ4CG256 has K={k} but requires K%256==0"),
+                ));
+            }
+            let gpr = k / 256;
+            let expected = m * gpr * rdna_compute::MQ4C_GROUP_BYTES;
+            if data.len() != expected {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "MQ4CG256 blob length mismatch: expected {expected}, got {}",
+                        data.len()
+                    ),
+                ));
+            }
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MQ4CG256,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        47 => {
+            // MQ6-G256 v2 (qt=47): 200 B/group, neutral Magnum V2.
+            // Header LE `[0..2)` fp16 s0, `[2..4)` fp16 z0, `[4..6)` fp16 s1,
+            // `[6..8)` fp16 z1, `[8..200)` 192 B 6-bit payload (4/3 B).
+            // Half 0 covers q[0..128), half 1 q[128..256); `w = q*f32(s[h])+f32(z[h])`.
+            // Mirror every qt44 guard: K%256 and exact byte count fail closed.
+            if k % 256 != 0 {
+                return Err(HipError::new(
+                    0,
+                    &format!("MQ6G256V2 has K={k} but requires K%256==0"),
+                ));
+            }
+            let gpr = k / 256;
+            let expected = m * gpr * rdna_compute::MQ6G256V2_GROUP_BYTES;
+            if data.len() != expected {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "MQ6G256V2 blob length mismatch: expected {expected}, got {}",
+                        data.len()
+                    ),
+                ));
+            }
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MQ6G256V2,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        48 => {
+            // MQ5-G256 v2 (qt=48): 168 B/group, neutral Magnum V2.
+            // Header LE `[0..2)` fp16 s0, `[2..4)` fp16 z0, `[4..6)` fp16 s1,
+            // `[6..8)` fp16 z1, `[8..168)` 160 B 5-bit payload (8/5 B).
+            if k % 256 != 0 {
+                return Err(HipError::new(
+                    0,
+                    &format!("MQ5G256V2 has K={k} but requires K%256==0"),
+                ));
+            }
+            let gpr = k / 256;
+            let expected = m * gpr * rdna_compute::MQ5G256V2_GROUP_BYTES;
+            if data.len() != expected {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "MQ5G256V2 blob length mismatch: expected {expected}, got {}",
+                        data.len()
+                    ),
+                ));
+            }
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MQ5G256V2,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        49 => {
+            // MQ3-G256 v2 (qt=49): 104 B/group, neutral Magnum V2.
+            // Header LE `[0..2)` fp16 s0, `[2..4)` fp16 z0, `[4..6)` fp16 s1,
+            // `[6..8)` fp16 z1, `[8..104)` 96 B 3-bit payload (8/3 B).
+            if k % 256 != 0 {
+                return Err(HipError::new(
+                    0,
+                    &format!("MQ3G256V2 has K={k} but requires K%256==0"),
+                ));
+            }
+            let gpr = k / 256;
+            let expected = m * gpr * rdna_compute::MQ3G256V2_GROUP_BYTES;
+            if data.len() != expected {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "MQ3G256V2 blob length mismatch: expected {expected}, got {}",
+                        data.len()
+                    ),
+                ));
+            }
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MQ3G256V2,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        50 => {
+            // MQ2-G256 v2 (qt=50): 72 B/group, neutral Magnum V2.
+            // Header LE `[0..2)` fp16 s0, `[2..4)` fp16 z0, `[4..6)` fp16 s1,
+            // `[6..8)` fp16 z1, `[8..72)` 64 B 2-bit payload (4/B).
+            if k % 256 != 0 {
+                return Err(HipError::new(
+                    0,
+                    &format!("MQ2G256V2 has K={k} but requires K%256==0"),
+                ));
+            }
+            let gpr = k / 256;
+            let expected = m * gpr * rdna_compute::MQ2G256V2_GROUP_BYTES;
+            if data.len() != expected {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "MQ2G256V2 blob length mismatch: expected {expected}, got {}",
+                        data.len()
+                    ),
+                ));
+            }
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MQ2G256V2,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
         38 => {
             // MQ2-G256-GL — 2-bit codes vs the TENSOR-GLOBAL codebook GL_CB2 +
             // per-block fp16 scale. 2.0625 bpw. SoA, TWO regions, no per-group
@@ -465,6 +665,30 @@ fn load_weight_tensor_raw(
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ3G256GL,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        40 => {
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::TQ2G128,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        41 => {
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::BQ1G128,
                 m,
                 k,
                 row_stride: 0,

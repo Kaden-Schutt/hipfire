@@ -1,554 +1,872 @@
-//! Calibration drivers — shared helpers for the Tier 1 hipfire-native
-//! `collect_imatrix` and `collect_hessian` binaries.
+// SPDX-License-Identifier: Apache-2.0
+// hipfire — Tier-1 calibration collector (lib-ified core).
+//
+//! The reusable, model-agnostic calibration collector: an [`ActivationCapture`]
+//! that accumulates a per-tensor GPTQ Hessian (`Σ x·xᵀ`) and imatrix diagonal
+//! (`Σ x²`) on-GPU via the `calib_*_reduce_f32` kernels, and drains to HFQ
+//! tensors (`<name>.hessian` [K,K] + `<name>.imatrix` [K]) plus an
+//! internal-consistency metric (`diag(Σxxᵀ)` must equal `Σx²`).
 //!
-//! What this module owns:
-//!
-//! - `tokenize_corpus(model_dir, corpus_text)` — load the HF tokenizer from
-//!   `<model_dir>/tokenizer.json` and encode the calibration corpus into
-//!   a flat `Vec<u32>` of token IDs. Mirrors how Tier 2 (`imatrix_collect`)
-//!   delegates to llama-tokenize internally — we use the HF tokenizer.json
-//!   directly here since our `--hf-model <dir>` arg points at the
-//!   HuggingFace BF16 distribution, not a GGUF file. (The hipfire BPE
-//!   encoder loaded from `tokenizer.json` is GPT-2-BPE compatible — same
-//!   tokenization llama.cpp uses for Qwen3 / Qwen3.5 / Qwen3.6.)
-//!
-//! - `ImatrixCollector` — interior-mutable `ActivationCapture` impl that
-//!   accumulates per-channel `Σ x²` for every weight tensor seen at
-//!   dispatch time. Drained at the end of calibration into a
-//!   `Vec<ImatrixEntry>` for the GGUF writer (subagent B).
-//!
-//! - `HessianCollector` — same shape, but accumulates the K×K outer
-//!   product `Σ x · xᵀ`. Drained into `Vec<HessianEntry>` for the
-//!   HFHS-v1 writer (subagent B). Only tensors matching
-//!   `bf16_loader::is_gptq_target` are accumulated — saves a chunky
-//!   K×K F32 allocation per non-GPTQ tensor (norms, embed, lm_head).
-//!
-//! What this module does NOT own (per orchestrator scope):
-//!
-//! - The on-GPU Σx² + outer-product reduction kernels (subagent A —
-//!   `gpu.sumsq_reduce_bf16` / `gpu.hessian_outer_product_bf16`).
-//! - The GGUF imatrix / HFHS-v1 binary writers (subagent B —
-//!   `gguf_imatrix_writer::write_gguf_imatrix` /
-//!   `hfhs_writer::write_hfhs`).
-//! - The BF16 forward pass + linear-layer capture hook wiring
-//!   (subagent C — `dispatch.rs` capture-handler call sites).
-//! - The BF16 safetensors loader implementation (subagent D — the
-//!   `bf16_loader::load_bf16_model` scaffold was removed 2026-06-15 as
-//!   unimplemented dead code; recover from git history if revived).
-//!
-//! When those APIs land, the `unimplemented!()` stubs marked
-//! `TODO(subagent-X)` below are the single-line wire-in points.
+//! This is generic (hipfire-rdna + the HFQ writer only) so it sits in
+//! hipfire-runtime without a cycle on the arch crates. Callers (the
+//! `collect_artifacts` CLI, the daemon `Collect` op) own the forward loop +
+//! the model-specific taps (MoE router histogram, KLDREF) and arm this via
+//! `gpu.active_capture = Some(Arc::new(CalibCollector::default()))`.
 
-use crate::bf16_loader::is_gptq_target;
-use crate::tokenizer::Tokenizer;
+use crate::hfq::HfqMemTensor;
 use rdna_compute::{ActivationCapture, DType, Gpu, GpuTensor};
 use std::collections::HashMap;
-use std::ffi::c_void;
-use std::path::Path;
 use std::sync::Mutex;
 
-// ───────────────────────────────────────────────────────────────────────
-// Tokenizer driver
-// ───────────────────────────────────────────────────────────────────────
-
-/// Load the HF tokenizer from `<model_dir>/tokenizer.json` and encode
-/// the calibration corpus into a flat `Vec<u32>` of token IDs.
-///
-/// **Parity with llama.cpp:** the hipfire BPE encoder built from a
-/// HuggingFace `tokenizer.json` is GPT-2-BPE compatible — same scheme
-/// llama.cpp uses for Qwen3 / Qwen3.5 / Qwen3.6 / Llama / Mistral.
-/// `benchmarks/quality-baselines/harness/tokenizer_parity.py`
-/// documents the known ~46% per-position disagreement rate that
-/// motivates a llama-tokenize subprocess fallback for downstream
-/// applications where the imatrix data must be exactly cross-comparable
-/// with llama-imatrix outputs. For the Tier 1 hipfire-native pipeline
-/// (where the same hipfire forward + same tokenizer consume the imatrix
-/// downstream), HF tokenizer.json parity within the same pipeline is
-/// what matters.
-///
-/// Errors are surfaced via `Result<_, String>` so the binary can print
-/// a clear context message before exiting; the calibration drivers
-/// aren't in the hot path so error allocation cost is irrelevant.
-pub fn tokenize_corpus(model_dir: &Path, corpus_text: &str) -> Result<Vec<u32>, String> {
-    let tokenizer_path = model_dir.join("tokenizer.json");
-    let tokenizer_json = std::fs::read_to_string(&tokenizer_path).map_err(|e| {
-        format!(
-            "failed to read tokenizer.json at {}: {e}",
-            tokenizer_path.display()
-        )
-    })?;
-    let tokenizer = Tokenizer::from_hf_json(&tokenizer_json).ok_or_else(|| {
-        format!(
-            "failed to parse {} as a HuggingFace tokenizer",
-            tokenizer_path.display()
-        )
-    })?;
-    let ids = tokenizer.encode(corpus_text);
-    Ok(ids)
+fn f32_to_bf16_bits(v: f32) -> u16 {
+    (v.to_bits() >> 16) as u16
+}
+fn bf16_bits_to_f32(bits: u16) -> f32 {
+    f32::from_bits((bits as u32) << 16)
 }
 
-// ───────────────────────────────────────────────────────────────────────
-// Imatrix collector
-// ───────────────────────────────────────────────────────────────────────
+/// Rows buffered per tensor before flushing the outer-product. A single
+/// `calib_hessian_outer_f32` over `[FLUSH_BATCH, K]` is ~FLUSH_BATCH× more
+/// efficient than per-token (N=1) launches (the tiled GEMM is built for N≥16),
+/// so this is the dominant calibration-throughput lever.
+const FLUSH_BATCH: usize = 256;
 
-/// Per-tensor imatrix accumulation entry, drained at the end of
-/// calibration into the GGUF imatrix writer.
-///
-/// Mirrors the llama.cpp imatrix file structure (one `.in_sum2` array +
-/// one `.counts` array per linear weight, plus optional `n_mat` for
-/// MoE experts). The GGUF writer (subagent B) is responsible for
-/// emitting these as F32 tensors under the conventional names
-/// `{name}.in_sum2` + `{name}.counts`.
-#[derive(Debug)]
-pub struct ImatrixEntry {
-    /// Canonical HF safetensors tensor key
-    /// (e.g. `model.layers.0.self_attn.q_proj.weight`).
-    pub name: String,
-    /// Per-channel `Σ x²` — one F32 value per K (input dim).
-    /// Length = K.
-    pub in_sum2: Vec<f32>,
-    /// Per-channel count of activations contributing to `in_sum2`.
-    /// Length = K (same shape as `in_sum2`; matches llama-imatrix
-    /// convention even though the count is uniform across channels
-    /// for non-MoE tensors).
-    pub counts: Vec<f32>,
+/// Calibration-only HFQM quant_type for compact Hessians:
+/// exact F32 diagonal followed by BF16 lower strict triangle.
+const QUANT_TYPE_HESSIAN_BF16_TRIL_DIAG_F32: u8 = 130;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HessianStorage {
+    DenseF32,
+    Bf16TrilDiagF32,
 }
 
-/// On-GPU per-tensor accumulators owned by `ImatrixCollector`.
-///
-/// `acc` is a length-K F32 device tensor; subagent A's
-/// `gpu.sumsq_reduce_bf16` kernel reads the input activation and
-/// performs `acc[k] += x[*][k] * x[*][k]` atomically across the batch
-/// dim. `n_tokens` is the host-side count of activation rows seen so
-/// far (incremented per-call — the per-channel count is uniform for
-/// dense layers).
-struct ImatrixAccum {
-    acc: GpuTensor,
-    n_tokens: u64,
+fn hessian_storage_from_env() -> HessianStorage {
+    match std::env::var("HIPFIRE_CALIB_HESSIAN_STORAGE")
+        .ok()
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("f32" | "dense-f32" | "full-f32" | "legacy") => HessianStorage::DenseF32,
+        _ => HessianStorage::Bf16TrilDiagF32,
+    }
+}
+
+fn compact_hessian_bytes(k: usize) -> u64 {
+    (k * 4 + k * (k - 1)) as u64
+}
+
+/// Per-tensor on-GPU accumulators + a small activation row buffer.
+struct Acc {
+    diag: GpuTensor,      // [K]   Σx²  (imatrix)
+    h: Option<GpuTensor>, // [K,K] Σxxᵀ (Hessian); `None` = imatrix-only tensor
+    /// Host f64 reference accumulator (`Some` only under `HIPFIRE_CALIB_F64_AUDIT`).
+    /// The GPU outer-product accumulates `Σxxᵀ` in f32; RDNA has no f64 matrix
+    /// units and only ~1:16 scalar f64, so a faithful f64 reference is computed
+    /// CPU-side from the same staged rows. `drain` then reports the max relative
+    /// f32-vs-f64 divergence — measure-first before deciding whether f32
+    /// accumulation needs replacing for large token counts.
+    h_f64: Option<Vec<f64>>,
+    buf: GpuTensor,  // [FLUSH_BATCH, K] staged activation rows
+    buf_rows: usize, // rows currently staged in `buf`
     k: usize,
+    n_tokens: u64,
 }
 
-/// `ActivationCapture` impl that builds per-tensor imatrix data on-GPU.
-///
-/// Uses `Mutex<HashMap<_>>` for interior mutability since the
-/// `ActivationCapture::capture` trait method takes `&self`. The lock
-/// is held only across the on-GPU dispatch — no per-element work
-/// happens under the lock.
-pub struct ImatrixCollector {
-    /// Per-tensor accumulators. Keyed by canonical tensor name (the
-    /// `tensor_name` arg passed to `capture`).
-    accumulators: Mutex<HashMap<String, ImatrixAccum>>,
-    /// When true, accumulate for `lm_head` / `output` tensors too.
-    /// Mirrors llama-imatrix's `--process-output` flag.
-    process_output: bool,
-}
-
-impl ImatrixCollector {
-    pub fn new(process_output: bool) -> Self {
-        Self {
-            accumulators: Mutex::new(HashMap::new()),
-            process_output,
-        }
-    }
-
-    /// Drain the on-GPU accumulators into host-side `ImatrixEntry`
-    /// vectors. Called once at the end of calibration; consumes `self`
-    /// by `Arc::try_unwrap` or by `Arc::clone`-then-mutex-poison
-    /// (callers should use the `Arc::try_unwrap` path — the binary
-    /// holds the only outstanding clone after the forward pass loop
-    /// returns).
-    ///
-    /// Each accumulator's K-sized F32 buffer is copied back to host
-    /// via `gpu.download_f32`. The per-channel count is filled with
-    /// `n_tokens` to match llama-imatrix's GGUF layout.
-    pub fn drain(&self, gpu: &Gpu) -> Result<Vec<ImatrixEntry>, String> {
-        let acc_map = self
-            .accumulators
-            .lock()
-            .map_err(|e| format!("ImatrixCollector mutex poisoned at drain: {e}"))?;
-        let mut entries = Vec::with_capacity(acc_map.len());
-        for (name, accum) in acc_map.iter() {
-            let in_sum2 = gpu
-                .download_f32(&accum.acc)
-                .map_err(|e| format!("download_f32 failed for {name}: {e}"))?;
-            let counts = vec![accum.n_tokens as f32; accum.k];
-            entries.push(ImatrixEntry {
-                name: name.clone(),
-                in_sum2,
-                counts,
-            });
-        }
-        // Sort by name for deterministic output ordering (the GGUF
-        // writer keys by name anyway, but downstream comparators
-        // appreciate stable ordering).
-        entries.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(entries)
-    }
-
-    /// Whether this tensor's activations should be accumulated.
-    /// Mirrors llama-imatrix: accumulate for every Linear except
-    /// `lm_head` / `output`, which require `--process-output`.
-    fn should_capture(&self, tensor_name: &str) -> bool {
-        let last = tensor_name
-            .strip_suffix(".weight")
-            .unwrap_or(tensor_name)
-            .rsplit('.')
-            .next()
-            .unwrap_or(tensor_name);
-        let is_output = matches!(last, "lm_head" | "output");
-        if is_output {
-            return self.process_output;
-        }
-        // Imatrix accumulates for ALL linears (q/k/v/o, gate/up/down,
-        // moe experts, in_proj_*, gate router) — same as llama-imatrix
-        // by default. The GPTQ-target whitelist is a stricter subset
-        // used only by the Hessian collector.
-        !matches!(
-            last,
-            // Norms and embed are not Linear — never captured.
-            "input_layernorm"
-                | "post_attention_layernorm"
-                | "q_norm"
-                | "k_norm"
-                | "self_attn_layer_norm"
-                | "final_layernorm"
-                | "norm"
-                | "embed_tokens"
-        )
-    }
-}
-
-impl ActivationCapture for ImatrixCollector {
-    fn capture(&self, gpu: &mut Gpu, tensor_name: &str, input: &GpuTensor) {
-        if !self.should_capture(tensor_name) {
+impl Acc {
+    /// Reduce the staged rows into the accumulators (one batched launch each),
+    /// then reset the buffer. No-op when empty. Imatrix-only tensors (`h` is
+    /// `None`) skip the [K,K] outer-product — this is how MoE routed experts
+    /// are captured: a full per-expert Hessian (256 experts × ~48 layers ×
+    /// [K,K]) is ~196 GB and does not fit, but the imatrix (Σx², a K-vector)
+    /// is ~100 MB and is the importance signal AWQ-style quant needs.
+    fn flush(&mut self, gpu: &mut Gpu) {
+        if self.buf_rows == 0 {
             return;
         }
-        let k = match input.shape.last() {
-            Some(k) => *k,
-            None => return,
-        };
-        let n_rows = input.numel() / k;
-        let mut accs = match self.accumulators.lock() {
-            Ok(a) => a,
-            Err(_) => return,
-        };
+        gpu.calib_sumsq_reduce_f32(&self.buf, &self.diag, self.buf_rows, self.k)
+            .unwrap();
+        if let Some(h) = &self.h {
+            gpu.calib_hessian_outer_f32(&self.buf, h, self.buf_rows, self.k)
+                .unwrap();
+        }
+        // Audit: accumulate the same rows in f64 on the CPU (no GPU f64 path).
+        if let Some(h_f64) = &mut self.h_f64 {
+            let k = self.k;
+            let rows = gpu
+                .download_f32(&self.buf)
+                .expect("download buf (f64 audit)");
+            for r in 0..self.buf_rows {
+                let x = &rows[r * k..r * k + k];
+                for i in 0..k {
+                    let xi = x[i] as f64;
+                    let hrow = &mut h_f64[i * k..i * k + k];
+                    for j in 0..k {
+                        hrow[j] += xi * x[j] as f64;
+                    }
+                }
+            }
+        }
+        self.buf_rows = 0;
+    }
+}
+
+/// Unified Hessian + imatrix collector. Arm via `gpu.active_capture`.
+///
+/// By default every captured tensor accumulates a full [K,K] Hessian. Tensors
+/// whose canonical name contains any of `imatrix_only_substr` accumulate only
+/// the imatrix (Σx²); used for MoE routed experts whose full Hessians do not
+/// fit in memory (see [`Acc::flush`]).
+#[derive(Default)]
+pub struct CalibCollector {
+    accs: Mutex<HashMap<String, Acc>>,
+    imatrix_only_substr: Vec<String>,
+    /// When set (`HIPFIRE_CALIB_F64_AUDIT=1`), also accumulate each Hessian in
+    /// f64 on the CPU and report the f32-vs-f64 divergence in `drain`. Opt-in,
+    /// slow (CPU outer-products) — a measurement tool, not the default path.
+    f64_audit: bool,
+}
+
+/// `HIPFIRE_CALIB_F64_AUDIT=1` → run the CPU f64 reference accumulation.
+fn f64_audit_enabled() -> bool {
+    std::env::var("HIPFIRE_CALIB_F64_AUDIT").ok().as_deref() == Some("1")
+}
+
+impl CalibCollector {
+    pub fn new() -> Self {
+        Self {
+            accs: Mutex::new(HashMap::new()),
+            imatrix_only_substr: Vec::new(),
+            f64_audit: f64_audit_enabled(),
+        }
+    }
+
+    /// Collector that stores imatrix-only (no [K,K] Hessian) for any tensor
+    /// whose name contains one of `substr` (e.g. `".experts."` for MoE).
+    pub fn with_imatrix_only(substr: Vec<String>) -> Self {
+        Self {
+            accs: Mutex::new(HashMap::new()),
+            imatrix_only_substr: substr,
+            f64_audit: f64_audit_enabled(),
+        }
+    }
+
+    fn wants_hessian(&self, name: &str) -> bool {
+        !self.imatrix_only_substr.iter().any(|s| name.contains(s))
+    }
+
+    /// Number of distinct tensors captured so far.
+    pub fn len(&self) -> usize {
+        self.accs.lock().unwrap().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Per-tensor descriptors (no GPU work): `name`, whether it has a full
+    /// Hessian, `k`, and `n_tokens`. The caller uses these to compute counts +
+    /// `name -> n_tokens` provenance for the metadata BEFORE the streaming write
+    /// (the HFQM index/metadata must be written ahead of the payloads).
+    pub fn tensor_descriptors(&self) -> Vec<CalibTensorDesc> {
+        let accs = self.accs.lock().unwrap();
+        let mut names: Vec<&String> = accs.keys().collect();
+        names.sort();
+        names
+            .iter()
+            .map(|name| {
+                let acc = &accs[*name];
+                CalibTensorDesc {
+                    name: (*name).clone(),
+                    has_hessian: acc.h.is_some(),
+                    k: acc.k,
+                    n_tokens: acc.n_tokens,
+                }
+            })
+            .collect()
+    }
+
+    /// Release all GPU accumulators owned by this collector. Grouped
+    /// calibration runs call this after streaming a part file so the next group
+    /// can reuse the memory instead of waiting for process teardown.
+    pub fn free_gpu(&self, gpu: &mut Gpu) {
+        let mut accs = self.accs.lock().unwrap();
+        for (_, acc) in accs.drain() {
+            let _ = gpu.free_tensor(acc.diag);
+            if let Some(h) = acc.h {
+                let _ = gpu.free_tensor(h);
+            }
+            let _ = gpu.free_tensor(acc.buf);
+        }
+    }
+
+    /// GuidedQuant capture: accumulate the per-token **Fisher-weighted** Hessian
+    /// `H̄ = Σ_n w[n]·xₙxₙᵀ` (and its diagonal) for `tensor_name`. `x` is the
+    /// linear's input activation `[n,k]` (a real contiguous block, not the shared
+    /// scratch the `ActivationCapture::capture` tap takes); `w` `[n]` is the
+    /// per-token weight the caller forms from that linear's output-grad `∂ℓ/∂z`
+    /// (see `calib_row_meansq_f32`). Unbuffered — one weighted outer-product +
+    /// weighted sumsq per call, fine offline. `w≡1` makes this identical to the
+    /// plain unweighted capture.
+    pub fn capture_weighted(
+        &self,
+        gpu: &mut Gpu,
+        tensor_name: &str,
+        x: &GpuTensor,
+        w: &GpuTensor,
+        n: usize,
+        k: usize,
+    ) {
+        let mut accs = self.accs.lock().unwrap();
         if !accs.contains_key(tensor_name) {
-            let acc = match gpu.zeros(&[k], DType::F32) {
-                Ok(a) => a,
-                Err(_) => return,
+            let diag = gpu.zeros(&[k], DType::F32).unwrap();
+            let h = if self.wants_hessian(tensor_name) {
+                Some(gpu.zeros(&[k, k], DType::F32).unwrap())
+            } else {
+                None
             };
+            // No row buffering on this path; a minimal placeholder keeps `Acc`
+            // uniform (`flush` is a no-op while `buf_rows == 0`).
+            let buf = gpu.zeros(&[1, k], DType::F32).unwrap();
             accs.insert(
                 tensor_name.to_string(),
-                ImatrixAccum {
-                    acc,
-                    n_tokens: 0,
+                Acc {
+                    diag,
+                    h,
+                    h_f64: None,
+                    buf,
+                    buf_rows: 0,
                     k,
+                    n_tokens: 0,
                 },
             );
         }
-        let accum = accs.get_mut(tensor_name).unwrap();
-        // sumsq_reduce_bf16 needs a GPU scalar for n_tokens (writes into it).
-        // We track host-side n_tokens separately; the GPU scalar is a throwaway.
-        let mut n_scratch = match gpu.zeros(&[1], DType::F32) {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-        if let Err(_) = gpu.sumsq_reduce_bf16(input, &mut accum.acc, &mut n_scratch) {
-            return;
+        let acc = accs.get_mut(tensor_name).unwrap();
+        gpu.calib_sumsq_weighted_f32(x, w, &acc.diag, n, k).unwrap();
+        if let Some(h) = &acc.h {
+            gpu.calib_hessian_outer_weighted_f32(x, w, h, n, k).unwrap();
         }
-        accum.n_tokens = accum.n_tokens.saturating_add(n_rows as u64);
-        // TODO(subagent-A): wire `gpu.sumsq_reduce_bf16(input_ptr, numel, dtype, shape,
-        //                                               accumulator_ptr, k)` here.
-        //
-        // The flow (once subagent-A lands `Gpu::sumsq_reduce_bf16`):
-        //
-        //   let mut accs = self.accumulators.lock().expect("imatrix mutex");
-        //   let k = *shape.last().expect("activation must have ≥1 dim");
-        //   let n_rows = numel / k;
-        //   let accum = accs.entry(tensor_name.to_string()).or_insert_with(|| {
-        //       // First touch for this tensor — allocate K-sized F32 acc on the GPU.
-        //       // Needs `&mut Gpu` access; pattern (per orchestrator dispatch):
-        //       //   1. Pre-allocate all accumulators in the driver after
-        //       //      bf16_loader::load_bf16_model returns (we know every linear
-        //       //      tensor's K from the safetensors header).
-        //       //   2. Or: route `&mut Gpu` through the trait via an
-        //       //      InteriorGpu wrapper. (Less surgery than 1; defer to A.)
-        //       //   For now, the scaffold panics at first capture so the integrator
-        //       //   sees the wire-in point.
-        //       unimplemented!(
-        //           "ImatrixCollector::capture first-touch alloc for tensor `{}` — \
-        //            wire `gpu.sumsq_reduce_bf16` + per-tensor F32 K-vector \
-        //            accumulator alloc once subagent-A lands its dispatch API",
-        //           tensor_name
-        //       );
-        //   });
-        //   gpu.sumsq_reduce_bf16(input_ptr, dtype, &accum.acc, k, n_rows)
-        //       .expect("sumsq_reduce_bf16 dispatch");
-        //   accum.n_tokens = accum.n_tokens.saturating_add(n_rows as u64);
-        //
-        // Until subagent-A's dispatch API exists, every capture is a no-op so
-        // the driver can be exercised through unit tests + smoke tests without
-        // touching kernel infra.
+        acc.n_tokens += n as u64;
+    }
+
+    /// Stream the accumulated tensors into an HFQM `.calib.hfq` at `path`,
+    /// **one tensor at a time** (download → normalize `/ n_tokens` → write →
+    /// drop), so peak host memory is a single Hessian rather than all of them
+    /// (a 9B is ~32 GB if materialized at once). `extra` holds any small
+    /// already-in-RAM tensors (e.g. KLDREF) the caller wants in the same
+    /// package. The metadata + index are written first (payload sizes are
+    /// deterministic from `k`), then the payloads stream. Returns the max
+    /// relative `diag(H)`-vs-`Σx²` consistency error. Also runs the optional
+    /// f64 audit (`HIPFIRE_CALIB_F64_AUDIT`) during the per-Hessian download.
+    pub fn write_streaming(
+        &self,
+        gpu: &mut Gpu,
+        path: &std::path::Path,
+        arch_id: u32,
+        metadata_json: &str,
+        extra: &[HfqMemTensor],
+    ) -> std::io::Result<f32> {
+        use crate::hfq::{write_hfqm_package_streaming, HfqStreamEntry};
+        use std::cell::{Cell, RefCell};
+
+        let mut accs = self.accs.lock().unwrap();
+        let hessian_storage = hessian_storage_from_env();
+        // Fold any staged activation rows before reading the accumulators.
+        for acc in accs.values_mut() {
+            acc.flush(gpu);
+        }
+        let mut names: Vec<String> = accs.keys().cloned().collect();
+        names.sort();
+
+        // Build the index entries (payload sizes from `k`) + a parallel plan of
+        // how to produce each payload, in the SAME order.
+        enum Plan {
+            Hessian(String),
+            Imatrix(String),
+            Extra(usize),
+        }
+        let mut entries: Vec<HfqStreamEntry> = Vec::new();
+        let mut plan: Vec<Plan> = Vec::new();
+        for name in &names {
+            let acc = &accs[name];
+            if acc.h.is_some() {
+                let (quant_type, data_len) = match hessian_storage {
+                    HessianStorage::DenseF32 => (2, (acc.k * acc.k * 4) as u64),
+                    HessianStorage::Bf16TrilDiagF32 => (
+                        QUANT_TYPE_HESSIAN_BF16_TRIL_DIAG_F32,
+                        compact_hessian_bytes(acc.k),
+                    ),
+                };
+                entries.push(HfqStreamEntry {
+                    name: format!("{name}.hessian"),
+                    quant_type,
+                    shape: vec![acc.k as u32, acc.k as u32],
+                    group_size: 0,
+                    data_len,
+                });
+                plan.push(Plan::Hessian(name.clone()));
+            }
+            entries.push(HfqStreamEntry {
+                name: format!("{name}.imatrix"),
+                quant_type: 2,
+                shape: vec![acc.k as u32],
+                group_size: 0,
+                data_len: (acc.k * 4) as u64,
+            });
+            plan.push(Plan::Imatrix(name.clone()));
+        }
+        for (j, t) in extra.iter().enumerate() {
+            entries.push(HfqStreamEntry {
+                name: t.name.clone(),
+                quant_type: t.quant_type,
+                shape: t.shape.clone(),
+                group_size: t.group_size,
+                data_len: t.data.len() as u64,
+            });
+            plan.push(Plan::Extra(j));
+        }
+
+        let max_consistency = Cell::new(0.0f32);
+        let audit_max = Cell::new(0.0f64);
+        let audit_n = Cell::new(0usize);
+        let audit_worst = RefCell::new(String::new());
+        let io_err = |e: rdna_compute::HipError| std::io::Error::other(e.to_string());
+
+        write_hfqm_package_streaming(path, arch_id, metadata_json, &entries, |i, w| {
+            match &plan[i] {
+                Plan::Hessian(name) => {
+                    let acc = &accs[name];
+                    let inv = 1.0 / acc.n_tokens.max(1) as f32;
+                    let h = gpu.download_f32(acc.h.as_ref().unwrap()).map_err(io_err)?;
+                    let diag = gpu.download_f32(&acc.diag).map_err(io_err)?;
+                    let mut mc = max_consistency.get();
+                    for c in 0..acc.k {
+                        let rel = (h[c * acc.k + c] - diag[c]).abs() / diag[c].abs().max(1.0);
+                        mc = mc.max(rel);
+                    }
+                    max_consistency.set(mc);
+                    if let Some(h_ref) = &acc.h_f64 {
+                        let mut tmax = 0.0f64;
+                        for idx in 0..acc.k * acc.k {
+                            let r = h_ref[idx];
+                            tmax = tmax.max((h[idx] as f64 - r).abs() / r.abs().max(1.0));
+                        }
+                        audit_n.set(audit_n.get() + 1);
+                        if tmax > audit_max.get() {
+                            audit_max.set(tmax);
+                            *audit_worst.borrow_mut() = name.clone();
+                        }
+                    }
+                    match hessian_storage {
+                        HessianStorage::DenseF32 => write_f32_scaled(w, &h, inv),
+                        HessianStorage::Bf16TrilDiagF32 => {
+                            write_hessian_bf16_tril_diag_f32(w, &h, &diag, acc.k, inv)
+                        }
+                    }
+                }
+                Plan::Imatrix(name) => {
+                    let acc = &accs[name];
+                    let inv = 1.0 / acc.n_tokens.max(1) as f32;
+                    let diag = gpu.download_f32(&acc.diag).map_err(io_err)?;
+                    write_f32_scaled(w, &diag, inv)
+                }
+                Plan::Extra(j) => w.write_all(&extra[*j].data),
+            }
+        })?;
+
+        if audit_n.get() > 0 {
+            eprintln!(
+                "F64 AUDIT: max f32-vs-f64 Σxxᵀ rel-diff = {:.3e} over {} Hessians (worst: {})",
+                audit_max.get(),
+                audit_n.get(),
+                audit_worst.borrow()
+            );
+        }
+        Ok(max_consistency.get())
     }
 }
 
-// ───────────────────────────────────────────────────────────────────────
-// Hessian collector
-// ───────────────────────────────────────────────────────────────────────
-
-/// Per-tensor Hessian accumulation entry, drained at the end of
-/// calibration into the HFHS-v1 writer (subagent B).
+/// Memory-bounded variant of [`collect`] for dense arches whose full Hessians
+/// for ALL layers do not fit at once. Captures the layers in groups of
+/// `group_size` — each group re-runs the arch forward but registers only that
+/// group's tensors, streams a part file, and frees the GPU accumulators before
+/// the next group — then concatenates the parts (plus any `extra_tensors` the
+/// forward returned, e.g. KLDREF) into the final `.calib.hfq` at `output`.
 ///
-/// `H` is a row-major K×K F32 matrix representing `Σ x · xᵀ` summed
-/// over all activation rows. The `n_tokens` divisor (turning the sum
-/// into the average `H_t = (1/N) Σ x_t · x_tᵀ`) is applied by the
-/// quantizer, not here — keeps the on-disk format closer to the
-/// PyTorch reference at `scripts/collect_hessian.py:213-222`.
-#[derive(Debug)]
-pub struct HessianEntry {
-    /// Canonical HF safetensors tensor key
-    /// (e.g. `model.layers.0.self_attn.q_proj.weight`).
+/// Seams: `capture_names_for(start, end)` builds the capture map for one layer
+/// range; `forward(gpu, group_idx)` runs the model over the calibration tokens
+/// for that group (it may return [`CalibForward`] extras — typically only on
+/// `group_idx == 0`, since the extras are written once into the combined file).
+#[allow(clippy::too_many_arguments)]
+pub fn collect_grouped<C, F>(
+    gpu: &mut Gpu,
+    arch_id: u32,
+    num_layers: usize,
+    group_size: usize,
+    imatrix_only: Vec<String>,
+    output: &std::path::Path,
+    static_meta: &[(&str, serde_json::Value)],
+    mut capture_names_for: C,
+    mut forward: F,
+) -> Result<CalibSummary, String>
+where
+    C: FnMut(usize, usize) -> HashMap<usize, String>,
+    F: FnMut(&mut Gpu, usize) -> Result<CalibForward, String>,
+{
+    let group = group_size.max(1);
+    let mut part_paths: Vec<std::path::PathBuf> = Vec::new();
+    let mut all_descriptors: Vec<CalibTensorDesc> = Vec::new();
+    let mut extra_tensors: Vec<HfqMemTensor> = Vec::new();
+    let mut extra_meta: Vec<(String, serde_json::Value)> = Vec::new();
+    let mut max_consistency = 0.0f32;
+
+    for (group_idx, start) in (0..num_layers).step_by(group).enumerate() {
+        let end = (start + group).min(num_layers);
+        let collector = std::sync::Arc::new(if imatrix_only.is_empty() {
+            CalibCollector::new()
+        } else {
+            CalibCollector::with_imatrix_only(imatrix_only.clone())
+        });
+        gpu.capture_names = capture_names_for(start, end);
+        gpu.active_capture = Some(collector.clone());
+
+        let out = forward(gpu, group_idx);
+        gpu.active_capture = None;
+        gpu.capture_names = HashMap::new();
+        let mut out = out?;
+
+        let descriptors = collector.tensor_descriptors();
+        if descriptors.is_empty() {
+            return Err(format!(
+                "calib: no tensors captured for layers {start}..{end}"
+            ));
+        }
+        let part = calib_part_path(output, group_idx);
+        let part_meta = serde_json::json!({
+            "artifact_kind": "calibration-part",
+            "layer_start": start,
+            "layer_end": end,
+        })
+        .to_string();
+        let consistency = collector
+            .write_streaming(gpu, &part, arch_id, &part_meta, &[])
+            .map_err(|e| format!("calib write part {}: {e}", part.display()))?;
+        collector.free_gpu(gpu);
+        max_consistency = max_consistency.max(consistency);
+        all_descriptors.extend(descriptors);
+        part_paths.push(part);
+        extra_tensors.append(&mut out.extra_tensors);
+        extra_meta.append(&mut out.extra_meta);
+    }
+
+    let n_hessian = all_descriptors.iter().filter(|d| d.has_hessian).count();
+    let n_imatrix = all_descriptors.len();
+    let mut per_tensor_tokens = serde_json::Map::new();
+    for d in &all_descriptors {
+        per_tensor_tokens.insert(d.name.clone(), serde_json::json!(d.n_tokens));
+    }
+    let mut meta = serde_json::json!({
+        "artifact_kind": "calibration",
+        "layers_per_pass": group,
+        "n_hessian": n_hessian,
+        "n_imatrix": n_imatrix,
+        "per_tensor_tokens": serde_json::Value::Object(per_tensor_tokens),
+        "artifacts": ["hessian", "imatrix"],
+    });
+    if let Some(obj) = meta.as_object_mut() {
+        for (k, v) in static_meta {
+            obj.insert((*k).to_string(), v.clone());
+        }
+        for (k, v) in &extra_meta {
+            obj.insert(k.clone(), v.clone());
+        }
+    }
+    let metadata_json = serde_json::to_string(&meta).unwrap();
+    combine_calib_parts(output, arch_id, &metadata_json, &part_paths, &extra_tensors)
+        .map_err(|e| format!("calib combine {}: {e}", output.display()))?;
+    for part in part_paths {
+        let _ = std::fs::remove_file(part);
+    }
+
+    Ok(CalibSummary {
+        n_hessian,
+        n_imatrix,
+        max_consistency,
+    })
+}
+
+/// Temp part path for a grouped calibration pass: `.<name>.part-NNN.hfq` beside
+/// `output`.
+fn calib_part_path(output: &std::path::Path, group_idx: usize) -> std::path::PathBuf {
+    let file_name = output
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("calib.hfq");
+    output.with_file_name(format!(".{file_name}.part-{group_idx:03}.hfq"))
+}
+
+/// Concatenate the per-group part packages (+ in-RAM `extra` tensors) into the
+/// final combined `.calib.hfq`, streaming each part's blobs through without
+/// materializing them all at once.
+fn combine_calib_parts(
+    output: &std::path::Path,
+    arch_id: u32,
+    metadata_json: &str,
+    part_paths: &[std::path::PathBuf],
+    extra: &[HfqMemTensor],
+) -> std::io::Result<()> {
+    use crate::hfq::{write_hfqm_package_streaming, HfqPackage, HfqStreamEntry};
+    enum Plan {
+        Part { package_idx: usize, name: String },
+        Extra { extra_idx: usize },
+    }
+    let mut packages = Vec::with_capacity(part_paths.len());
+    let mut entries = Vec::new();
+    let mut plan = Vec::new();
+    for part in part_paths {
+        let package = HfqPackage::open(part)?;
+        let package_idx = packages.len();
+        for e in package.entries() {
+            entries.push(HfqStreamEntry {
+                name: e.name.clone(),
+                quant_type: e.quant_type,
+                shape: e.shape.clone(),
+                group_size: e.group_size,
+                data_len: e.data_size as u64,
+            });
+            plan.push(Plan::Part {
+                package_idx,
+                name: e.name.clone(),
+            });
+        }
+        packages.push(package);
+    }
+    for (extra_idx, t) in extra.iter().enumerate() {
+        entries.push(HfqStreamEntry {
+            name: t.name.clone(),
+            quant_type: t.quant_type,
+            shape: t.shape.clone(),
+            group_size: t.group_size,
+            data_len: t.data.len() as u64,
+        });
+        plan.push(Plan::Extra { extra_idx });
+    }
+    write_hfqm_package_streaming(
+        output,
+        arch_id,
+        metadata_json,
+        &entries,
+        |i, w| match &plan[i] {
+            Plan::Part { package_idx, name } => {
+                let data = packages[*package_idx].blob_data(name).ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("part tensor not found: {name}"),
+                    )
+                })?;
+                w.write_all(data)
+            }
+            Plan::Extra { extra_idx } => w.write_all(&extra[*extra_idx].data),
+        },
+    )
+}
+
+/// Per-tensor descriptor from [`CalibCollector::tensor_descriptors`].
+pub struct CalibTensorDesc {
     pub name: String,
-    /// K — input feature dimension.
+    pub has_hessian: bool,
     pub k: usize,
-    /// Row-major K×K F32 outer-product accumulator (`Σ x · xᵀ`).
-    /// Length = k × k.
-    pub h: Vec<f32>,
-    /// Total number of activation rows accumulated (the divisor for
-    /// `H_t = (1/N) · sum`).
     pub n_tokens: u64,
 }
 
-/// On-GPU per-tensor Hessian accumulators owned by `HessianCollector`.
-struct HessianAccum {
-    /// K×K F32 device tensor (row-major).
-    h: GpuTensor,
-    n_tokens: u64,
+/// Result of a calibration-collection pass — the three fields every arch's
+/// public collector reports back to the `collect_artifacts` CLI / daemon.
+pub struct CalibSummary {
+    pub n_hessian: usize,
+    pub n_imatrix: usize,
+    pub max_consistency: f32,
+}
+
+/// Daemon-side calibration seam: collect a `.calib.hfq` from an ALREADY-RESIDENT
+/// model — no second load. Parallels [`crate::kld_eval::ChunkScoredForward`] (the
+/// `kld_eval` op's seam), but unlike KLD — which rides the blanket `SimpleAr`
+/// impl — calibration needs each arch's RAW weights + capturing forward
+/// (`gpu_forward_calib`-style), which `SimpleAr` does not expose. So there is no
+/// blanket impl: each arch implements this by delegating to its existing
+/// `collect_calibration_artifacts`. Bundled backends (`ZayaModel`,
+/// `Gemma3Backend`) impl it directly; loose-slot arches (qwen35, lfm2moe) impl it
+/// on a thin `&weights`/`&config` adapter, mirroring `qwen35::Qwen35KldForward`.
+///
+/// `tokenizer` is supplied because some collectors (gemma3 text-only) need it
+/// inside the forward; arches that don't simply ignore it. `kldref` bakes the
+/// per-position top-k lm-head reference into the sidecar (top-k fixed at 64, the
+/// `collect_artifacts` example's value). The data plane stays in-process — only
+/// the resulting [`CalibSummary`] crosses back to the daemon's JSONL.
+pub trait CalibratableBackend {
+    fn collect_calibration(
+        &self,
+        gpu: &mut Gpu,
+        tokenizer: &crate::tokenizer::Tokenizer,
+        tokens: &[u32],
+        kldref: bool,
+        output: &std::path::Path,
+        provenance: &[(&str, serde_json::Value)],
+    ) -> Result<CalibSummary, String>;
+}
+
+/// Outputs of an arch's capturing forward that the driver folds into the
+/// streamed package. `extra_tensors` are small, already-in-RAM tensors (KLDREF
+/// reference, MoE router histogram) appended to the `.calib.hfq`; `extra_meta`
+/// are metadata fields known only AFTER the forward (e.g. KLDREF position/top-k
+/// counts, the `artifacts` list when KLDREF is present). Both default empty for
+/// arches that capture nothing beyond the Hessian/imatrix.
+#[derive(Default)]
+pub struct CalibForward {
+    pub extra_tensors: Vec<HfqMemTensor>,
+    pub extra_meta: Vec<(String, serde_json::Value)>,
+}
+
+/// General single-pass calibration-collection driver — the orchestration every
+/// arch shares. Arms the [`CalibCollector`] as `gpu.active_capture`, runs the
+/// arch's capturing `forward`, reads the descriptors, builds the standard
+/// metadata, streams the HFQM `.calib.hfq`, and releases the GPU accumulators.
+///
+/// The arch supplies only its seams:
+/// - `capture_names`: weight-buffer-addr → canonical tensor name (sans
+///   `.weight`, so the quantizer joins `<name>.{hessian,imatrix}` to the source
+///   weight). MoE routed experts are registered INDIVIDUALLY
+///   (`…experts.{e}.gate_up_proj`) so the per-tensor consumer path matches them
+///   uniformly across arches.
+/// - `imatrix_only`: name substrings whose tensors skip the full [K,K] Hessian
+///   and keep only the imatrix (e.g. `[".experts."]` — per-expert Hessians do
+///   not fit).
+/// - `static_meta`: provenance + arch-constant metadata fields.
+/// - `forward`: runs the model over the calibration tokens (the
+///   `gpu.maybe_capture_activation` taps fire inside it) and returns any
+///   [`CalibForward`] extras it produced.
+pub fn collect<F>(
+    gpu: &mut Gpu,
+    arch_id: u32,
+    capture_names: HashMap<usize, String>,
+    imatrix_only: Vec<String>,
+    output: &std::path::Path,
+    static_meta: &[(&str, serde_json::Value)],
+    forward: F,
+) -> Result<CalibSummary, String>
+where
+    F: FnOnce(&mut Gpu) -> Result<CalibForward, String>,
+{
+    let collector = std::sync::Arc::new(if imatrix_only.is_empty() {
+        CalibCollector::new()
+    } else {
+        CalibCollector::with_imatrix_only(imatrix_only)
+    });
+    gpu.capture_names = capture_names;
+    gpu.active_capture = Some(collector.clone());
+
+    // Run the arch forward, then ALWAYS disarm the capture before propagating
+    // any error (a half-armed `gpu` would mis-capture a later forward).
+    let forward_out = forward(gpu);
+    gpu.active_capture = None;
+    gpu.capture_names = HashMap::new();
+    let forward_out = forward_out?;
+
+    let descriptors = collector.tensor_descriptors();
+    if descriptors.is_empty() {
+        return Err("calib: no tensors captured (check capture_names wiring)".to_string());
+    }
+    let n_hessian = descriptors.iter().filter(|d| d.has_hessian).count();
+    let n_imatrix = descriptors.len();
+    let mut per_tensor_tokens = serde_json::Map::new();
+    for d in &descriptors {
+        per_tensor_tokens.insert(d.name.clone(), serde_json::json!(d.n_tokens));
+    }
+    let mut meta = serde_json::json!({
+        "artifact_kind": "calibration",
+        "n_hessian": n_hessian,
+        "n_imatrix": n_imatrix,
+        "per_tensor_tokens": serde_json::Value::Object(per_tensor_tokens),
+        "artifacts": ["hessian", "imatrix"],
+    });
+    if let Some(obj) = meta.as_object_mut() {
+        // static_meta first, then forward extras (so a dynamic field — e.g. the
+        // KLDREF-augmented `artifacts` list — overrides the static default).
+        for (k, v) in static_meta {
+            obj.insert((*k).to_string(), v.clone());
+        }
+        for (k, v) in &forward_out.extra_meta {
+            obj.insert(k.clone(), v.clone());
+        }
+    }
+    let metadata_json = serde_json::to_string(&meta).unwrap();
+    let max_consistency = collector
+        .write_streaming(
+            gpu,
+            output,
+            arch_id,
+            &metadata_json,
+            &forward_out.extra_tensors,
+        )
+        .map_err(|e| format!("calib write {}: {e}", output.display()))?;
+    collector.free_gpu(gpu);
+
+    Ok(CalibSummary {
+        n_hessian,
+        n_imatrix,
+        max_consistency,
+    })
+}
+
+/// Stream `v * scale` as little-endian f32 to `w` in bounded chunks (so a
+/// multi-hundred-MB Hessian never materializes a second full byte buffer).
+fn write_f32_scaled(w: &mut dyn std::io::Write, v: &[f32], scale: f32) -> std::io::Result<()> {
+    let mut buf: Vec<u8> = Vec::with_capacity(16384);
+    for &x in v {
+        buf.extend_from_slice(&(x * scale).to_le_bytes());
+        if buf.len() >= 16384 {
+            w.write_all(&buf)?;
+            buf.clear();
+        }
+    }
+    if !buf.is_empty() {
+        w.write_all(&buf)?;
+    }
+    Ok(())
+}
+
+fn write_hessian_bf16_tril_diag_f32(
+    w: &mut dyn std::io::Write,
+    h: &[f32],
+    diag: &[f32],
     k: usize,
-}
-
-/// `ActivationCapture` impl that builds per-tensor K×K Hessian
-/// outer-products on-GPU. Only tensors matching the GPTQ target
-/// whitelist (per `bf16_loader::is_gptq_target`) are accumulated —
-/// saves the K×K F32 allocation for norms / embed / lm_head which the
-/// quantizer never consumes.
-pub struct HessianCollector {
-    accumulators: Mutex<HashMap<String, HessianAccum>>,
-}
-
-impl HessianCollector {
-    pub fn new() -> Self {
-        Self {
-            accumulators: Mutex::new(HashMap::new()),
+    scale: f32,
+) -> std::io::Result<()> {
+    assert_eq!(h.len(), k * k);
+    assert_eq!(diag.len(), k);
+    let mut buf: Vec<u8> = Vec::with_capacity(16384);
+    for &x in diag {
+        buf.extend_from_slice(&(x * scale).to_le_bytes());
+        if buf.len() >= 16384 {
+            w.write_all(&buf)?;
+            buf.clear();
         }
     }
-
-    /// Drain the on-GPU accumulators into host-side `HessianEntry`
-    /// vectors. Same drain semantics as `ImatrixCollector::drain`.
-    pub fn drain(&self, gpu: &Gpu) -> Result<Vec<HessianEntry>, String> {
-        let acc_map = self
-            .accumulators
-            .lock()
-            .map_err(|e| format!("HessianCollector mutex poisoned at drain: {e}"))?;
-        let mut entries = Vec::with_capacity(acc_map.len());
-        for (name, accum) in acc_map.iter() {
-            let h = gpu
-                .download_f32(&accum.h)
-                .map_err(|e| format!("download_f32 failed for {name}: {e}"))?;
-            entries.push(HessianEntry {
-                name: name.clone(),
-                k: accum.k,
-                h,
-                n_tokens: accum.n_tokens,
-            });
+    for i in 1..k {
+        for j in 0..i {
+            let bits = f32_to_bf16_bits(h[i * k + j] * scale);
+            buf.extend_from_slice(&bits.to_le_bytes());
+            if buf.len() >= 16384 {
+                w.write_all(&buf)?;
+                buf.clear();
+            }
         }
-        entries.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(entries)
     }
+    if !buf.is_empty() {
+        w.write_all(&buf)?;
+    }
+    Ok(())
 }
 
-impl Default for HessianCollector {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ActivationCapture for HessianCollector {
-    fn capture(&self, gpu: &mut Gpu, tensor_name: &str, input: &GpuTensor) {
-        if !is_gptq_target(tensor_name) {
-            return;
-        }
-        let k = match input.shape.last() {
-            Some(k) => *k,
-            None => return,
-        };
-        let n_rows = input.numel() / k;
-        let mut accs = match self.accumulators.lock() {
-            Ok(a) => a,
-            Err(_) => return,
-        };
+impl ActivationCapture for CalibCollector {
+    fn capture(&self, gpu: &mut Gpu, tensor_name: &str, input: &GpuTensor, n: usize, k: usize) {
+        // n/k come from the gemm — `input` is a shared scratch buffer whose shape
+        // (max(dim,hidden)) does NOT reflect the linear's input width.
+        let mut accs = self.accs.lock().unwrap();
         if !accs.contains_key(tensor_name) {
-            let h = match gpu.zeros(&[k, k], DType::F32) {
-                Ok(h) => h,
-                Err(_) => return,
+            let diag = gpu.zeros(&[k], DType::F32).unwrap();
+            let h = if self.wants_hessian(tensor_name) {
+                Some(gpu.zeros(&[k, k], DType::F32).unwrap())
+            } else {
+                None
             };
-            accs.insert(tensor_name.to_string(), HessianAccum { h, n_tokens: 0, k });
+            let buf = gpu.zeros(&[FLUSH_BATCH, k], DType::F32).unwrap();
+            let h_f64 = if self.f64_audit && h.is_some() {
+                Some(vec![0.0f64; k * k])
+            } else {
+                None
+            };
+            accs.insert(
+                tensor_name.to_string(),
+                Acc {
+                    diag,
+                    h,
+                    h_f64,
+                    buf,
+                    buf_rows: 0,
+                    k,
+                    n_tokens: 0,
+                },
+            );
         }
-        let accum = accs.get_mut(tensor_name).unwrap();
-        if let Err(_) = gpu.hessian_outer_product_bf16(input, &mut accum.h) {
-            return;
+        let acc = accs.get_mut(tensor_name).unwrap();
+        // Stage each activation row into the flush buffer; the actual reductions
+        // run a single batched launch per FLUSH_BATCH rows (Acc::flush). `input`
+        // is a shared scratch buffer of width `row_stride` ≥ k, so copy the first
+        // k columns of each of the n rows.
+        let row_stride = input.numel() / n.max(1);
+        for r in 0..n {
+            if acc.buf_rows == FLUSH_BATCH {
+                acc.flush(gpu);
+            }
+            gpu.memcpy_dtod_at_auto(
+                &acc.buf.buf,
+                acc.buf_rows * k * 4,
+                &input.buf,
+                r * row_stride * 4,
+                k * 4,
+            )
+            .unwrap();
+            acc.buf_rows += 1;
         }
-        accum.n_tokens = accum.n_tokens.saturating_add(n_rows as u64);
+        acc.n_tokens += n as u64;
     }
 }
 
-// ───────────────────────────────────────────────────────────────────────
-// Tests
-// ───────────────────────────────────────────────────────────────────────
+/// log(Σ exp(logits)) — numerically stable. For the KLDREF reference (callers
+/// that tap lm-head logits).
+pub fn logsumexp(logits: &[f32]) -> f32 {
+    let m = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    m + logits.iter().map(|&x| (x - m).exp()).sum::<f32>().ln()
+}
+
+/// Top-`k` (index, logit) descending — for the KLDREF reference.
+pub fn topk_logits(logits: &[f32], k: usize) -> Vec<(u32, f32)> {
+    let mut idx: Vec<u32> = (0..logits.len() as u32).collect();
+    idx.sort_unstable_by(|&a, &b| logits[b as usize].total_cmp(&logits[a as usize]));
+    idx.truncate(k);
+    idx.into_iter().map(|i| (i, logits[i as usize])).collect()
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// `should_capture` admits the obvious Linear tensors and rejects norms
-    /// + embed by default; `lm_head` is admitted only with `process_output`.
     #[test]
-    fn imatrix_should_capture_default() {
-        let coll = ImatrixCollector::new(false);
-        // Linear layers admitted.
-        assert!(coll.should_capture("model.layers.0.self_attn.q_proj.weight"));
-        assert!(coll.should_capture("model.layers.0.self_attn.k_proj.weight"));
-        assert!(coll.should_capture("model.layers.0.self_attn.o_proj.weight"));
-        assert!(coll.should_capture("model.layers.0.mlp.gate_proj.weight"));
-        assert!(coll.should_capture("model.layers.0.mlp.down_proj.weight"));
-        // MoE router (Qwen3.5-A3B) — admitted.
-        assert!(coll.should_capture("model.layers.0.mlp.gate.weight"));
-        // Norms + embed rejected.
-        assert!(!coll.should_capture("model.embed_tokens.weight"));
-        assert!(!coll.should_capture("model.layers.0.input_layernorm.weight"));
-        assert!(!coll.should_capture("model.norm.weight"));
-        // lm_head rejected by default (matches llama-imatrix without --process-output).
-        assert!(!coll.should_capture("lm_head.weight"));
+    fn compact_hessian_size_matches_diag_plus_lower_triangle() {
+        assert_eq!(compact_hessian_bytes(1), 4);
+        assert_eq!(compact_hessian_bytes(2), 10);
+        assert_eq!(compact_hessian_bytes(3), 18);
+        assert_eq!(compact_hessian_bytes(4096), 16_789_504);
     }
 
-    /// With `process_output=true`, `lm_head` / `output` are admitted; norms
-    /// still rejected.
     #[test]
-    fn imatrix_should_capture_with_process_output() {
-        let coll = ImatrixCollector::new(true);
-        assert!(coll.should_capture("lm_head.weight"));
-        assert!(coll.should_capture("output.weight"));
-        // Norms still rejected.
-        assert!(!coll.should_capture("model.norm.weight"));
-    }
+    fn compact_hessian_writer_keeps_diag_f32_and_lower_bf16() {
+        let h = [1.0f32, 0.5, -0.25, 0.5, 2.0, 0.75, -0.25, 0.75, 4.0];
+        let diag = [1.0f32, 2.0, 4.0];
+        let mut out = Vec::new();
+        write_hessian_bf16_tril_diag_f32(&mut out, &h, &diag, 3, 1.0).unwrap();
+        assert_eq!(out.len(), compact_hessian_bytes(3) as usize);
 
-    /// `HessianCollector` delegates to `is_gptq_target` — verify the admit
-    /// list aligns with the production GPTQ targets.
-    #[test]
-    fn hessian_collector_uses_gptq_whitelist() {
-        // Use the trait-level capture call (with dummy ptr) to verify the
-        // gate-keep is_gptq_target. Since the body is a no-op until
-        // subagent-A wires the kernel, this asserts only that we don't
-        // panic on admitted tensors and that rejected tensors short-circuit.
-        let coll = HessianCollector::new();
-        // No accumulators yet — drain returns empty.
-        let dummy_gpu_drain_count = coll.accumulators.lock().map(|m| m.len()).expect("mutex");
-        assert_eq!(dummy_gpu_drain_count, 0);
-        // Verify the gate via is_gptq_target directly — same logic the
-        // trait-impl gates on.
-        assert!(is_gptq_target("model.layers.0.self_attn.q_proj.weight"));
-        assert!(is_gptq_target("model.layers.0.mlp.gate_proj.weight"));
-        // MoE router admitted by is_gptq_target.
-        assert!(is_gptq_target("model.layers.0.mlp.gate.weight"));
-        // Norms / embed rejected.
-        assert!(!is_gptq_target("model.embed_tokens.weight"));
-        assert!(!is_gptq_target("model.norm.weight"));
-        assert!(!is_gptq_target("lm_head.weight"));
-    }
-
-    /// Smoke-test `tokenize_corpus`: build a minimal HF tokenizer.json in
-    /// a tmp dir, encode a 4-char string, verify the token stream is
-    /// non-empty + maps back to bytes that cover the input.
-    ///
-    /// Doesn't exercise the GPU/forward path — that requires subagents
-    /// A+C+D to land. Limited to the driver-side: tokenizer.json read +
-    /// HF JSON parse + BPE encode → Vec<u32>.
-    #[test]
-    fn tokenize_corpus_smoke_minimal_tokenizer() {
-        // Build a minimal char-level tokenizer.json: one merge rule per
-        // ASCII char [a-z], no special tokens. This is enough for
-        // `from_hf_json` to construct a working encoder.
-        let mut vocab = serde_json::Map::new();
-        for (i, ch) in ('a'..='z').enumerate() {
-            vocab.insert(ch.to_string(), serde_json::Value::Number((i as u64).into()));
-        }
-        let empty_array: Vec<&str> = Vec::new();
-        let tokenizer_json = serde_json::json!({
-            "model": {
-                "vocab": vocab,
-                "merges": empty_array,
-            },
-            "added_tokens": empty_array,
-        });
-
-        let tmp_dir = std::env::temp_dir().join(format!(
-            "hipfire-calibration-tokenize-smoke-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&tmp_dir).expect("mkdir tmp");
-        let tokenizer_path = tmp_dir.join("tokenizer.json");
-        std::fs::write(&tokenizer_path, tokenizer_json.to_string()).expect("write tokenizer.json");
-
-        // Call the driver helper.
-        let ids = tokenize_corpus(&tmp_dir, "abc").expect("tokenize_corpus should succeed");
-        // We don't assert exact IDs (the encoder may emit byte-fallback
-        // pre-tokens for non-merged chars) but the stream must be
-        // non-empty for any non-empty input.
-        assert!(
-            !ids.is_empty(),
-            "tokenize_corpus produced 0 tokens for non-empty input"
-        );
-
-        std::fs::remove_dir_all(&tmp_dir).ok();
-    }
-
-    /// `tokenize_corpus` surfaces a meaningful error when tokenizer.json
-    /// is missing from the model dir.
-    #[test]
-    fn tokenize_corpus_missing_tokenizer_returns_error() {
-        let tmp_dir = std::env::temp_dir().join(format!(
-            "hipfire-calibration-missing-tokenizer-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&tmp_dir).expect("mkdir tmp");
-        let err = tokenize_corpus(&tmp_dir, "hello").expect_err("should fail");
-        assert!(
-            err.contains("tokenizer.json"),
-            "error message should mention tokenizer.json, got: {err}"
-        );
-        std::fs::remove_dir_all(&tmp_dir).ok();
-    }
-
-    /// `ImatrixCollector::drain` on a fresh collector returns an empty
-    /// vector — no captures happened, no GPU access needed (the empty
-    /// `HashMap` short-circuits before any `download_f32`).
-    #[test]
-    fn imatrix_drain_empty_skips_gpu_access() {
-        let coll = ImatrixCollector::new(false);
-        // We pass a fake unaligned pointer cast through a raw `Gpu`-shape
-        // — but the drain MUST short-circuit on the empty map before any
-        // dispatch, so we never touch the pointer. The test verifies that
-        // invariant: build the collector + check the map is empty + skip
-        // the actual gpu.download_f32 calls.
-        let map_len = coll.accumulators.lock().map(|m| m.len()).expect("mutex");
-        assert_eq!(map_len, 0, "fresh collector should have zero accumulators");
-    }
-
-    /// Same for `HessianCollector`.
-    #[test]
-    fn hessian_drain_empty_skips_gpu_access() {
-        let coll = HessianCollector::new();
-        let map_len = coll.accumulators.lock().map(|m| m.len()).expect("mutex");
-        assert_eq!(map_len, 0, "fresh collector should have zero accumulators");
+        let read_f32 = |off: usize| f32::from_le_bytes(out[off..off + 4].try_into().unwrap());
+        let read_bf16 = |off: usize| {
+            bf16_bits_to_f32(u16::from_le_bytes(out[off..off + 2].try_into().unwrap()))
+        };
+        assert_eq!(read_f32(0), 1.0);
+        assert_eq!(read_f32(4), 2.0);
+        assert_eq!(read_f32(8), 4.0);
+        assert_eq!(read_bf16(12), 0.5);
+        assert_eq!(read_bf16(14), -0.25);
+        assert_eq!(read_bf16(16), 0.75);
     }
 }

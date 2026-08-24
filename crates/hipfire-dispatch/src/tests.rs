@@ -369,6 +369,81 @@ fn gemm_q8_0_batched_wide_exact_resolves_on_wmma_only() {
 }
 
 #[test]
+fn gemm_mq4v2_mq4c_keys_resolve_gfx12_only() {
+    use crate::families::gemm::GemmFamily;
+    let fam = GemmFamily::new();
+    // All five V2 widths (MQ4V2 qt44 + MQ6/5/3/2V2 qt47-50) are HasWmma: batched prefill/lm_head WMMA sources exist on both gfx11 and gfx12.
+    // MQ4C (qt45) remains HasWmmaGfx12: gfx12-only.
+    let v2_keys = [
+        KernelKey::GemmMq4G256V2,
+        KernelKey::GemmMq4G256V2Residual,
+        KernelKey::GemmMq4G256V2BatchedLmhead,
+        KernelKey::GemmMq6G256V2,
+        KernelKey::GemmMq6G256V2Residual,
+        KernelKey::GemmMq6G256V2BatchedLmhead,
+        KernelKey::GemmMq5G256V2,
+        KernelKey::GemmMq5G256V2Residual,
+        KernelKey::GemmMq5G256V2BatchedLmhead,
+        KernelKey::GemmMq3G256V2,
+        KernelKey::GemmMq3G256V2Residual,
+        KernelKey::GemmMq3G256V2BatchedLmhead,
+        KernelKey::GemmMq2G256V2,
+        KernelKey::GemmMq2G256V2Residual,
+        KernelKey::GemmMq2G256V2BatchedLmhead,
+    ];
+    let mq4c_keys = [
+        KernelKey::GemmMq4CG256,
+        KernelKey::GemmMq4CG256Residual,
+        KernelKey::GemmMq4CG256BatchedLmhead,
+    ];
+    let rdna4 = ctx_rdna4();
+    let rdna1 = ctx_rdna1();
+    let rdna3 = ctx_rdna3();
+    for &key in &v2_keys {
+        assert!(
+            fam.registry().all_keys().contains(&key),
+            "{key:?} must be registered in gemm_table"
+        );
+        assert_eq!(
+            fam.registry().resolve(key, &rdna4, None).unwrap().key,
+            key,
+            "{key:?} must resolve on gfx1200-class (HasWmma)"
+        );
+        assert_eq!(
+            fam.registry().resolve(key, &rdna3, None).unwrap().key,
+            key,
+            "{key:?} must resolve on gfx1100-class (HasWmma)"
+        );
+        let err_rdna1 = fam.registry().resolve(key, &rdna1, None).unwrap_err();
+        assert!(
+            matches!(err_rdna1, DispatchError::MissingImpl { .. }),
+            "{key:?} must MissingImpl on gfx1010, got {err_rdna1:?}"
+        );
+    }
+    for &key in &mq4c_keys {
+        assert!(
+            fam.registry().all_keys().contains(&key),
+            "{key:?} must be registered in gemm_table"
+        );
+        assert_eq!(
+            fam.registry().resolve(key, &rdna4, None).unwrap().key,
+            key,
+            "{key:?} must resolve on gfx1200-class (HasWmmaGfx12)"
+        );
+        let err_rdna1 = fam.registry().resolve(key, &rdna1, None).unwrap_err();
+        assert!(
+            matches!(err_rdna1, DispatchError::MissingImpl { .. }),
+            "{key:?} must MissingImpl on gfx1010, got {err_rdna1:?}"
+        );
+        let err_rdna3 = fam.registry().resolve(key, &rdna3, None).unwrap_err();
+        assert!(
+            matches!(err_rdna3, DispatchError::MissingImpl { .. }),
+            "{key:?} must MissingImpl on gfx1100 (MQ4C gfx12-only), got {err_rdna3:?}"
+        );
+    }
+}
+
+#[test]
 fn registry_resolve_shape_gate_passes_when_shape_matches() {
     let mut reg = KernelRegistry::new();
     reg.register(KernelVariant {

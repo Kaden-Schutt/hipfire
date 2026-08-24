@@ -41,20 +41,15 @@ pub const LLOYD_MQ3_GROUP_BYTES: usize = 112;
 /// docs/plans/mq-lloyd-batched-prefill-followup.md).
 pub const LLOYD_MQ4_GROUP_BYTES: usize = 160;
 
-// ── MQ*-G256-GL ("global Lloyd") format constants ────────────────────────────
+// ── MQ*-GL ("global Lloyd") format constants ────────────────────────────
 //
-// GL = one codebook shared by the WHOLE tensor + a per-block fp16 scale, laid
-// out as TWO SoA regions rather than the interleaved per-group header the
-// MQ2/MQ3-Lloyd formats use:
+// GL = one codebook shared by the whole tensor plus a per-block fp16 scale,
+// laid out as two SoA regions rather than an interleaved per-group header:
 //
-//   MQ2G256GL (qt 38): [0 .. M*gpr*64)   2-bit indices, 64 B/group
-//                      [M*gpr*64 .. +M*gpr*2)  fp16 per-block scales  → 2.0625 bpw
-//   MQ3G256GL (qt 39): [0 .. M*gpr*96)   3-bit indices, 96 B/group
-//                      [M*gpr*96 .. +M*gpr*2)  fp16 per-block scales  → 3.0625 bpw
+//   MQ2G256GL (qt 38): 64 B indices/group, then fp16 scales
+//   MQ3G256GL (qt 39): 96 B indices/group, then fp16 scales
 //
-// with gpr = K/256. There is no inline per-group header — any loader or size
-// estimator that assumes "one contiguous blob per row with a header" is wrong
-// for these two dtypes.
+// Both use gpr = K/256. There is no inline per-group header.
 
 /// Per-group INDEX bytes for MQ2-G256-GL (2 bits × 256 weights). The fp16
 /// per-block scale lives in a SEPARATE trailing region, NOT in the group.
@@ -63,6 +58,55 @@ pub const GL_MQ2_GROUP_IDX_BYTES: usize = 64;
 /// Per-group INDEX bytes for MQ3-G256-GL (3 bits × 256 weights). Same SoA
 /// split as MQ2-GL — the scale is in the trailing region, not inline.
 pub const GL_MQ3_GROUP_IDX_BYTES: usize = 96;
+
+/// Per-group bytes for MQ4-G256 v2 (qt=44): 136 B/group, byte-identical to
+/// MQ4G256 (qt=13) except the 8 header bytes. Payload unchanged: 128 B of
+/// 4-bit nibbles at offset 8, lane `t` reading the u32 at `8 + 4*t`,
+/// covering weights `8t..8t+7`. Header layout:
+/// `[0..2)` fp16 scale half0 (weights 0-127), `[2..4)` fp16 zero half0,
+/// `[4..6)` fp16 scale half1 (weights 128-255), `[6..8)` fp16 zero half1.
+/// Little-endian, low 16 bits scale, high 16 zero within each dword,
+/// half-wave uniform, lane-invariant scalar loads. `K % 256 == 0`.
+pub const MQ4V2_GROUP_BYTES: usize = 136;
+
+/// Per-group bytes for MQ4-G256-C (qt=45): 136 B/group, 4.25 bpw, byte-identical
+/// payload to MQ4G256 (qt=13) at the same offset. Pad layout (NOT the earlier
+/// 132 B planar layout):
+/// per group, 136 B stride: `[0..4)` fp16 header, `[4..8)` zero padding, `[8..136)` 128 B nibbles.
+/// Header is ONE packed dword, low 16 bits fp16 scale, high 16 bits fp16 zero,
+/// governing all 256 weights (`w = q * scale + zero`), unlike qt=44's dual half-grids.
+/// The 4 padding bytes are the deliberate price of putting the payload at +8 where
+/// v1 has it: a 132 B stride left the payload 4-byte aligned half the time and cost
+/// 7-11% prefill on `global_load_b128`. The pad layout is the same size as v1
+/// (136 B/group, `m*gpr*136` per tensor), so the 2.43% size win is deliberately given up.
+/// Little-endian, lane-invariant scalar loads. See `kernels/src/gemv_mq4cpad_residual.hip`
+/// and `kernels/src/gemm_mq4cpad_residual_wmma_gfx12_bt.hip`.
+pub const MQ4C_GROUP_BYTES: usize = 136;
+
+/// Per-group bytes for MQ6-G256 v2 (qt=47): 200 B/group, 6.25 bpw.
+/// Neutral-size Magnum V2 layout: LE `[0..2)` fp16 s0, `[2..4)` fp16 z0,
+/// `[4..6)` fp16 s1, `[6..8)` fp16 z1, `[8..200)` 192 B legacy 6-bit payload
+/// (4 weights per 3 bytes, `4/3 B`). Half 0 governs q[0..128), half 1
+/// q[128..256); reconstruction `q * f32(s[h]) + f32(z[h])`. `K % 256 == 0`.
+pub const MQ6G256V2_GROUP_BYTES: usize = 200;
+
+/// Per-group bytes for MQ5-G256 v2 (qt=48): 168 B/group, 5.25 bpw.
+/// Neutral-size Magnum V2 layout: LE `[0..2)` fp16 s0, `[2..4)` fp16 z0,
+/// `[4..6)` fp16 s1, `[6..8)` fp16 z1, `[8..168)` 160 B legacy 5-bit payload
+/// (8 weights per 5 bytes, `8/5 B`). Half semantics as MQ6G256V2.
+pub const MQ5G256V2_GROUP_BYTES: usize = 168;
+
+/// Per-group bytes for MQ3-G256 v2 (qt=49): 104 B/group, 3.25 bpw.
+/// Neutral-size Magnum V2 layout: LE `[0..2)` fp16 s0, `[2..4)` fp16 z0,
+/// `[4..6)` fp16 s1, `[6..8)` fp16 z1, `[8..104)` 96 B legacy 3-bit payload
+/// (8 weights per 3 bytes, `8/3 B`). Half semantics as MQ6G256V2.
+pub const MQ3G256V2_GROUP_BYTES: usize = 104;
+
+/// Per-group bytes for MQ2-G256 v2 (qt=50): 72 B/group, 2.25 bpw.
+/// Neutral-size Magnum V2 layout: LE `[0..2)` fp16 s0, `[2..4)` fp16 z0,
+/// `[4..6)` fp16 s1, `[6..8)` fp16 z1, `[8..72)` 64 B legacy 2-bit payload
+/// (4 weights per byte). Half semantics as MQ6G256V2.
+pub const MQ2G256V2_GROUP_BYTES: usize = 72;
 
 /// Bytes per group in the trailing fp16 scale region (both GL dtypes).
 pub const GL_GROUP_SCALE_BYTES: usize = 2;
@@ -231,28 +275,62 @@ impl GpuTensor {
 pub enum DType {
     F32,
     F16,
-    BF16,         // 2 bytes; native bf16 reference (KLD oracle). Widen→f32 = high-16-bit shift.
-    Q4K,          // 144 bytes per 256 elements
-    Q6K,          // 210 bytes per 256 elements
-    Q8_0,         // 34 bytes per 32 elements
-    Q4F16G64,     // 36 bytes per 64 elements (RDNA-native FP16 dequant)
-    Q4F16G32,     // 20 bytes per 32 elements (RDNA-native FP16 dequant)
-    Q8HFQ,        // split-metadata: scales contiguous then values contiguous, 128B-aligned rows
-    HFQ4G256,     // 136 bytes per 256 elements (flat 4-bit, f32 scale+zero, 18 VGPRs)
-    HFQ4G128,     // 72 bytes per 128 elements (flat 4-bit, f32 scale+zero, 14 VGPRs)
-    HFQ3G256,     // 104 bytes per 256 elements (flat 3-bit, f32 scale+zero)
-    HFQ3G128,     // 56 bytes per 128 elements (flat 3-bit, f32 scale+zero)
-    MQ4G256,      // MagnumQuant: FWHT-rotated HFQ4-G256 (136 bytes/group, same as HFQ4G256)
-    MQ4G128,      // MagnumQuant: FWHT-128-rotated INT4 (72 bytes/group, same layout as HFQ4G128)
-    MQ8G256,      // MagnumQuant: FWHT-rotated symmetric INT8, dp4a target (258 bytes/group)
-    MQ6G256,      // MagnumQuant: FWHT-rotated HFQ6-G256 (200 bytes/group, same as HFQ6G256)
-    MQ5G256,      // MagnumQuant: FWHT-rotated 5-bit (168 bytes/group, 5.25 bpw)
-    MQ3G256,      // MagnumQuant: FWHT-rotated HFQ3-G256 (104 bytes/group, same as HFQ3G256)
-    MQ2G256,      // MagnumQuant: FWHT-rotated HFQ2-G256 (72 bytes/group, same as HFQ2G256)
+    BF16,     // 2 bytes; native bf16 reference (KLD oracle). Widen→f32 = high-16-bit shift.
+    Q4K,      // 144 bytes per 256 elements
+    Q6K,      // 210 bytes per 256 elements
+    Q8_0,     // 34 bytes per 32 elements
+    Q4F16G64, // 36 bytes per 64 elements (RDNA-native FP16 dequant)
+    Q4F16G32, // 20 bytes per 32 elements (RDNA-native FP16 dequant)
+    Q8HFQ,    // split-metadata: scales contiguous then values contiguous, 128B-aligned rows
+    HFQ4G256, // 136 bytes per 256 elements (flat 4-bit, f32 scale+zero, 18 VGPRs)
+    HFQ4G128, // 72 bytes per 128 elements (flat 4-bit, f32 scale+zero, 14 VGPRs)
+    HFQ3G256, // 104 bytes per 256 elements (flat 3-bit, f32 scale+zero)
+    HFQ3G128, // 56 bytes per 128 elements (flat 3-bit, f32 scale+zero)
+    MQ4G256,  // MagnumQuant: FWHT-rotated HFQ4-G256 (136 bytes/group, same as HFQ4G256)
+    /// MQ4-G256 v2 (qt=44): FWHT-rotated, 136 B/group, byte-identical payload to
+    /// MQ4G256 except the 8 header bytes: `[0..2)` fp16 scale half0 (w 0-127),
+    /// `[2..4)` fp16 zero half0, `[4..6)` fp16 scale half1 (w 128-255),
+    /// `[6..8)` fp16 zero half1, `[8..136)` 128 B nibbles, identical to qt=13.
+    /// Little-endian, low 16 scale / high 16 zero per dword, half-wave uniform,
+    /// lane-invariant scalar loads. `K % 256 == 0`, 4.25 bpw.
+    MQ4G256V2,
+    /// MQ4-G256-C (qt=45): FWHT-rotated, 136 B/group, 4.25 bpw, pad layout:
+    /// per group 136 B: `[0..4)` fp16 header (low scale, high zero), `[4..8)` zero padding,
+    /// `[8..136)` 128 B nibbles at same offset as v1 (MQ4G256). ONE affine grid per 256
+    /// (`w = q * scale + zero`), half-wave uniform, lane-invariant scalar loads.
+    /// `K % 256 == 0`.
+    MQ4CG256,
+    /// MQ6-G256 v2 (qt=47): FWHT-rotated, 200 B/group, neutral Magnum V2.
+    /// Per-group 200 B: `[0..2)` fp16 s0, `[2..4)` fp16 z0, `[4..6)` fp16 s1,
+    /// `[6..8)` fp16 z1, `[8..200)` 192 B 6-bit payload (4/3 B). Half 0
+    /// q[0..128), half 1 q[128..256); `w = q*f32(s[h])+f32(z[h])`.
+    /// `K % 256 == 0`, 6.25 bpw.
+    MQ6G256V2,
+    /// MQ5-G256 v2 (qt=48): FWHT-rotated, 168 B/group, neutral Magnum V2.
+    /// Per-group 168 B: `[0..2)` fp16 s0, `[2..4)` fp16 z0, `[4..6)` fp16 s1,
+    /// `[6..8)` fp16 z1, `[8..168)` 160 B 5-bit payload (8/5 B). Same half
+    /// semantics as MQ6G256V2. `K % 256 == 0`, 5.25 bpw.
+    MQ5G256V2,
+    /// MQ3-G256 v2 (qt=49): FWHT-rotated, 104 B/group, neutral Magnum V2.
+    /// Per-group 104 B: `[0..2)` fp16 s0, `[2..4)` fp16 z0, `[4..6)` fp16 s1,
+    /// `[6..8)` fp16 z1, `[8..104)` 96 B 3-bit payload (8/3 B). Same half
+    /// semantics as MQ6G256V2. `K % 256 == 0`, 3.25 bpw.
+    MQ3G256V2,
+    /// MQ2-G256 v2 (qt=50): FWHT-rotated, 72 B/group, neutral Magnum V2.
+    /// Per-group 72 B: `[0..2)` fp16 s0, `[2..4)` fp16 z0, `[4..6)` fp16 s1,
+    /// `[6..8)` fp16 z1, `[8..72)` 64 B 2-bit payload (4/B). Same half
+    /// semantics as MQ6G256V2. `K % 256 == 0`, 2.25 bpw.
+    MQ2G256V2,
+    MQ4G128, // MagnumQuant: FWHT-128-rotated INT4 (72 bytes/group, same layout as HFQ4G128)
+    MQ8G256, // MagnumQuant: FWHT-rotated symmetric INT8, dp4a target (258 bytes/group)
+    MQ6G256, // MagnumQuant: FWHT-rotated HFQ6-G256 (200 bytes/group, same as HFQ6G256)
+    MQ5G256, // MagnumQuant: FWHT-rotated 5-bit (168 bytes/group, 5.25 bpw)
+    MQ3G256, // MagnumQuant: FWHT-rotated HFQ3-G256 (104 bytes/group, same as HFQ3G256)
+    MQ2G256, // MagnumQuant: FWHT-rotated HFQ2-G256 (72 bytes/group, same as HFQ2G256)
     MQ2G256Lloyd, // MagnumQuant 2-bit + Lloyd-Max 4-entry fp16 codebook (72 bytes/group)
     MQ3G256Lloyd, // MagnumQuant 3-bit + Lloyd-Max 8-entry fp16 codebook (112 bytes/group)
     MQ4G256Lloyd, // MagnumQuant 4-bit + Lloyd-Max 16-entry fp16 codebook (160 bytes/group)
-    MQ2G256GL,    // MagnumQuant 2-bit + TENSOR-GLOBAL 4-entry codebook (GL_CB2), SoA:
+    MQ2G256GL, // MagnumQuant 2-bit + TENSOR-GLOBAL 4-entry codebook (GL_CB2), SoA:
     // [M*gpr*64 B indices][M*gpr*2 B fp16 per-block scales] = 2.0625 bpw. NOT
     // interleaved — no per-group header. Codebook is a compile-time constant
     // passed as scalar kernel args, not stored in the file. MoE-routed-expert
@@ -263,7 +341,6 @@ pub enum DType {
     // MoE-only scope + scalar-arg codebook as MQ2G256GL.
     HFP4G32, // HFP4: E2M1 element + UE8M0 g32 block scale + FP16 row scale.
     // Per-row header 16 B; per-block payload 17 B (UE8M0 + 16 packed nibbles).
-    // See docs/quant-formats/hfp4.md.
     MFP4G32, // MFP4: HFP4G32 + offline FWHT (drop-in MQ4 replacement). Same byte layout
     // as HFP4G32; format_flags bit 0 + bits 2-3 = 01 stamps the rotation kind.
     // Runtime applies the matching FWHT to x via mq_rotate_x; the kernel itself
@@ -286,7 +363,11 @@ pub enum DType {
     MFP2G32E8, // mfp2-E8: MFP4G32E8 frame, 2-bit lattice (center 2),  9 B/blk,  72 B/grp, 2.25 bpw. Drop-in for MQ2G256Lloyd.
     HFQ2G256,  // 72 bytes per 256 elements (flat 2-bit, f32 scale+zero, ~19 VGPRs)
     HFQ2G128,  // 40 bytes per 128 elements (flat 2-bit, f32 scale+zero)
-    HFQ6G256,  // 200 bytes per 256 elements (6-bit, f32 scale+zero)
+    TQ2G128,   // ternary Bonsai-27B: 34 bytes per 128 elements (flat 2-bit ternary, group 128)
+    // Phase 4: ternary kernels wire GPU decode/dispatch; this Task 7 slice is
+    // CPU-foundation only (variant + byte-size + RawCodec load mapping).
+    BQ1G128,    // binary Bonsai-27B: 18 bytes per 128 elements (flat 1-bit sign, group 128)
+    HFQ6G256,   // 200 bytes per 256 elements (6-bit, f32 scale+zero)
     ParoQ4G128, // ParoQuant: AWQ-packed INT4 G128 repacked to HFQ4G128 layout at load.
     // Weights are standard HFQ4G128 (72 bytes/group); the ParoQuant distinction
     // is that weight_gemv applies Givens rotation to activations before GEMV.
@@ -311,8 +392,16 @@ impl DType {
             | DType::HFQ3G128
             | DType::HFQ2G256
             | DType::HFQ2G128
+            | DType::TQ2G128
+            | DType::BQ1G128
             | DType::HFQ6G256
             | DType::MQ4G256
+            | DType::MQ4G256V2
+            | DType::MQ4CG256
+            | DType::MQ6G256V2
+            | DType::MQ5G256V2
+            | DType::MQ3G256V2
+            | DType::MQ2G256V2
             | DType::MQ4G128
             | DType::MQ6G256
             | DType::MQ5G256
@@ -397,6 +486,24 @@ impl DType {
         matches!(
             self,
             DType::MQ4G256
+                // qt=44 shares qt=13's AWQ contract exactly: the quantizer
+                // pre-scales weights by `s` and emits the sidecar, and the forward
+                // path divides x by `s` in the rotate step, so `(W·s)·(x/s) = W·x`.
+                // Omitting it here does not fail — it silently drops the sidecar and
+                // computes `(W·s)·x`, a per-channel scale error on every projection.
+                // That is the May 2026 regression this predicate was centralised to
+                // prevent; qt=44's artifact carries 496 sidecars.
+                | DType::MQ4G256V2
+                // qt=45 shares qt=13/qt=44's AWQ contract exactly — same failure mode
+                // if omitted: silent sidecar drop → (W·s)·x. Include it.
+                | DType::MQ4CG256
+                // Neutral V2 family (qt47-50): same per-half fp16 scale+zero header,
+                // same AWQ pre-scale contract as qt44. All four must be listed or
+                // their sidecars are silently dropped → same May-2026 regression.
+                | DType::MQ6G256V2
+                | DType::MQ5G256V2
+                | DType::MQ3G256V2
+                | DType::MQ2G256V2
                 | DType::MQ3G256
                 | DType::MQ2G256
                 | DType::MQ3G256Lloyd
@@ -419,17 +526,19 @@ impl DType {
     }
 
     /// Whether this format's GEMV kernel requires K%256==0 (HFP4 family: the
-    /// gemv_hfp4g32 kernel + FWHT both need it). Refuse at load, not first
-    /// dispatch. Centralizes the guard inlined at the weight-decode qt 21/24 arms.
-    ///
-    /// MQ2/MQ3-G256-GL are included because their SoA region split is derived
-    /// from `gpr = K/256` on BOTH sides (encoder and kernel). A K that is not a
-    /// multiple of 256 truncates `gpr`, which silently shifts the scale-region
-    /// base — garbage weights with no error. Fail at load instead.
     pub fn requires_k_mod_256(self) -> bool {
         matches!(
             self,
-            DType::HFP4G32 | DType::MFP4G32 | DType::MQ2G256GL | DType::MQ3G256GL
+            DType::HFP4G32
+                | DType::MFP4G32
+                | DType::MQ2G256GL
+                | DType::MQ3G256GL
+                | DType::MQ4G256V2
+                | DType::MQ4CG256
+                | DType::MQ6G256V2
+                | DType::MQ5G256V2
+                | DType::MQ3G256V2
+                | DType::MQ2G256V2
         )
     }
 }
@@ -461,21 +570,22 @@ impl DType {
 pub trait ActivationCapture: Send + Sync {
     /// Called by linear-layer dispatch arms when calibration is active.
     ///
-    /// `tensor_name` — canonical .hfq / GGUF tensor name.
-    /// `input_ptr`   — device pointer to the input activation tensor.
-    /// `numel`       — number of elements at `input_ptr` (NOT bytes).
-    /// `dtype`       — element type of the captured activation.
-    /// `shape`       — full activation shape (e.g. `[batch, K]` for the
-    ///                 input of a `[K, M]` linear). Borrowed; do NOT
-    ///                 retain past the call.
-    fn capture(
-        &self,
-        tensor_name: &str,
-        input_ptr: *const c_void,
-        numel: usize,
-        dtype: DType,
-        shape: &[usize],
-    );
+    /// `gpu`         — the dispatcher, so the collector can run its on-GPU
+    ///                 reduction kernels (`calib_sumsq_reduce_f32` /
+    ///                 `calib_hessian_outer_f32`). Safe to take `&mut Gpu`:
+    ///                 the dispatch site clones the collector `Arc` before
+    ///                 calling, so `gpu.active_capture` is not aliased here.
+    /// `tensor_name` — canonical .hfq / GGUF tensor name (resolved from the
+    ///                 weight buffer pointer via `gpu.capture_names`).
+    /// `input`       — the input-activation buffer (borrowed; do NOT retain past
+    ///                 the call). NOTE its `.shape` may be a shared scratch sized
+    ///                 to `max(dim, hidden)`, so it is NOT a reliable source of
+    ///                 `k`/`n` — use the passed `n`/`k` instead.
+    /// `n`           — number of activation rows (tokens / batch) this call.
+    /// `k`           — the linear's input dim (the meaningful width of each row).
+    /// Interior mutability (`&self`) lets the collector accumulate without an
+    /// exclusive borrow.
+    fn capture(&self, gpu: &mut Gpu, tensor_name: &str, input: &GpuTensor, n: usize, k: usize);
 }
 
 /// Per-weight MMQ screening state (issue #87).
@@ -486,6 +596,17 @@ pub struct MmqScreenState {
 }
 
 /// High-level GPU context. Owns the HIP runtime, compiler, and loaded kernels.
+///
+/// Tape completeness invariant: for any body executed via `Gpu`,
+/// `self.graphs.capture_blobs.len()` after a HipGraph capture must equal
+/// `self.replay.recorded_launches().len()` after a `ReplayController` capture
+/// of the same body. Every kernel launch reachable from the four
+/// `self.scratch.*` helpers (`ensure_fp16_x`, `convert_fp16_x_uncached`,
+/// `ensure_fp8_x`, `ensure_q8_1_mmq_x`) is recorded through the unified
+/// `launch_maybe_blob` gate so the two tapes stay in lockstep. A future
+/// helper that appends to `capture_blobs` without also recording into
+/// `self.replay` will silently truncate a retained tape — use
+/// `debug_assert_tape_parity` or compare the two counts in a test.
 pub struct Gpu {
     pub hip: HipRuntime,
     pub arch: String,
@@ -532,6 +653,19 @@ pub struct Gpu {
     /// so consumer cards stay on the wave32/64 hand-rolled GEMV path.
     fp16_shadow_cache: HashMap<usize, GpuTensor>,
 
+    /// Calibration activation capture (Tier-1 collector). When `Some`, the
+    /// instrumented linear dispatch arms resolve their weight buffer pointer
+    /// to a tensor name via `capture_names` and invoke `capture()` with the
+    /// input activation. `None` (the default) ⇒ the check is a single
+    /// `is_none()` and forwards are byte-identical. The collector is held by
+    /// `Arc` so the dispatch site can clone it (breaking the borrow on `self`)
+    /// before calling `capture(self, …)`.
+    pub active_capture: Option<Arc<dyn ActivationCapture>>,
+    /// Weight-buffer-pointer → canonical tensor name, populated when calibration
+    /// is armed. Lets capture fire from ANY forward path (hand or lowered,
+    /// fused or not) keyed by the weight the gemv received.
+    pub capture_names: HashMap<usize, String>,
+
     /// Native GPTQ-on-E8 Hessian collection. `None` in production (zero
     /// overhead -- a single `is_some()` branch in the MoE CPU-top-K fallback
     /// per routed expert). The `collect_e8_hessian_native` example sets this to
@@ -543,7 +677,6 @@ pub struct Gpu {
     /// `hipfire-dispatch::pipeline::run_moe_decode_cpu_fallback` for the hook.
     pub hessian_capture: Option<HessianCapture>,
 }
-
 /// Per-256-block XX^T accumulator for ONE weight tensor (one expert), keyed
 /// inside [`HessianCapture`] by the full safetensors name. Byte-for-byte the
 /// same accumulation + `.hblk` layout as
@@ -1037,8 +1170,11 @@ impl Gpu {
             },
             rocblas: None,
             fp16_shadow_cache: HashMap::new(),
+            active_capture: None,
+            capture_names: HashMap::new(),
             hessian_capture: None,
-        }).map(|mut gpu| {
+        })
+        .map(|mut gpu| {
             if gpu.flags.force_blob_path {
                 eprintln!("[diag] HIPFIRE_BLOB_FORCE=1: all kernel launches will use the blob path (kernelParams bypassed). Diagnostic only.");
             }
@@ -1087,6 +1223,89 @@ impl Gpu {
                     e
                 );
             }
+        }
+    }
+
+    /// Dequantize a TQ2-G128 (ternary) weight [M × K] into an FP16 buffer
+    /// [M × K] row-major. The FP16 buffer must be pre-allocated to M*K*2 bytes.
+    ///
+    /// This is the prefill route for the low-bit formats: they have no tiled
+    /// GEMM of their own, so a chunk of N tokens would otherwise re-read every
+    /// weight row N times through the scalar GEMV. Dequantising once into a
+    /// scratch and handing the chunk to the F16 GEMM amortises that read.
+    pub fn dequantize_tq2g128_to_f16(
+        &mut self,
+        w_packed: &DeviceBuffer,
+        w_fp16: &DeviceBuffer,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        // bind_thread: skip — thin delegator; dequantize_lowbit_to_f16 binds.
+        self.dequantize_lowbit_to_f16(
+            "dequant_tq2g128_to_f16",
+            kernels::DEQUANT_TQ2G128_TO_F16_SRC,
+            w_packed,
+            w_fp16,
+            m,
+            k,
+        )
+    }
+
+    /// Binary sibling of [`Self::dequantize_tq2g128_to_f16`].
+    pub fn dequantize_bq1g128_to_f16(
+        &mut self,
+        w_packed: &DeviceBuffer,
+        w_fp16: &DeviceBuffer,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        // bind_thread: skip — thin delegator; dequantize_lowbit_to_f16 binds.
+        self.dequantize_lowbit_to_f16(
+            "dequant_bq1g128_to_f16",
+            kernels::DEQUANT_BQ1G128_TO_F16_SRC,
+            w_packed,
+            w_fp16,
+            m,
+            k,
+        )
+    }
+
+    /// Shared body for the two low-bit dequants. Both kernels take the same
+    /// (A, W_f16, M, K) kernargs and the same [M, groups] × [32] geometry, so
+    /// one body keeps them from drifting.
+    fn dequantize_lowbit_to_f16(
+        &mut self,
+        name: &'static str,
+        src: &'static str,
+        w_packed: &DeviceBuffer,
+        w_fp16: &DeviceBuffer,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(k % 128, 0, "{name}: K must be a multiple of 128 (got {k})");
+        self.ensure_kernel(name, src, name)?;
+        let func = &self.functions[name];
+        let mut w_in = w_packed.as_ptr();
+        let mut w_out = w_fp16.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut w_in as *mut _ as *mut c_void,
+            &mut w_out as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+        ];
+        let groups = (k / 128) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [m as u32, groups, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
         }
     }
 
@@ -2061,6 +2280,69 @@ impl Gpu {
         Ok(())
     }
 
+    /// Position-aware variant of [`Self::replay_recorded_hip_prefix`].
+    ///
+    /// Applies the identical binding set the retained PM4 route applies, so the
+    /// recorded-blob oracle and the PM4 route stay equivalent: a divergence
+    /// between them is then a submission difference, never a patching one.
+    pub fn replay_recorded_hip_prefix_at(&self, count: usize, position: usize) -> HipResult<()> {
+        self.bind_thread()?;
+        let launches = self.replay.recorded_launches();
+        if count > launches.len() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "captured HIP prefix {count} exceeds {} launches",
+                    launches.len()
+                ),
+            ));
+        }
+        let synthesized = self.replay.synthesized_position_bindings();
+        for (index, launch) in launches.iter().take(count).enumerate() {
+            let func = self.functions.get(&launch.kernel).ok_or_else(|| {
+                hip_bridge::HipError::new(
+                    0,
+                    &format!("captured HIP function {:?} is not loaded", launch.kernel),
+                )
+            })?;
+            let mut kernarg = launch.kernarg.clone();
+            let mut bindings: Vec<(usize, crate::replay::ReplayKernargBinding)> = synthesized
+                .iter()
+                .filter(|(idx, _)| *idx == index)
+                .cloned()
+                .collect();
+            if crate::replay::is_gdn_kernel(&launch.kernel) {
+                let frames =
+                    crate::replay::gdn_requant_frames_for_dispatch(&launch.kernarg, launch.grid[2])
+                        .map_err(|reason| hip_bridge::HipError::new(0, &reason))?;
+                bindings.push((
+                    index,
+                    crate::replay::ReplayKernargBinding::GdnFrameU32 { offset: 76, frames },
+                ));
+            }
+            crate::replay::apply_kernarg_bindings_for_dispatch(
+                &mut kernarg,
+                index,
+                position,
+                &bindings,
+            )
+            .map_err(|reason| hip_bridge::HipError::new(0, &reason))?;
+            // SAFETY: the bytes were captured from this exact loaded function
+            // and all pointees remain owned by this Gpu/model instance.
+            unsafe {
+                self.hip.launch_kernel_blob(
+                    func,
+                    launch.grid,
+                    launch.block,
+                    launch.shared_mem,
+                    self.active_stream.as_ref(),
+                    &mut kernarg,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     /// Compile and load a kernel if missing. Public variant of `ensure_kernel`
     /// for callers that need to JIT a kernel by name from outside the crate
     /// (primarily the hipGraph capture/replay path).
@@ -2132,6 +2414,12 @@ impl Gpu {
         x: &GpuTensor,
         n_elems: usize,
     ) -> HipResult<*mut c_void> {
+        // Split borrows so `self.replay` and `self.graphs`/`self.scratch` can be
+        // borrowed simultaneously. The scratch helper will record into replay
+        // when `is_recording()` and push to capture_blobs when `capture_mode`,
+        // using the unified `record || capture_mode || force_blob` gate.
+        let capture_mode = self.graphs.capture_mode;
+        let force_blob = self.flags.force_blob_path;
         self.scratch.ensure_fp16_x(
             &self.hip,
             &mut self.compiler,
@@ -2139,8 +2427,9 @@ impl Gpu {
             &mut self.functions,
             self.active_stream.as_ref(),
             &mut self.graphs.capture_blobs,
-            self.graphs.capture_mode,
-            self.flags.force_blob_path,
+            capture_mode,
+            force_blob,
+            &mut self.replay,
             x,
             n_elems,
         )
@@ -2159,6 +2448,8 @@ impl Gpu {
         x: &GpuTensor,
         n_elems: usize,
     ) -> HipResult<*mut c_void> {
+        let capture_mode = self.graphs.capture_mode;
+        let force_blob = self.flags.force_blob_path;
         self.scratch.convert_fp16_x_uncached(
             &self.hip,
             &mut self.compiler,
@@ -2166,8 +2457,9 @@ impl Gpu {
             &mut self.functions,
             self.active_stream.as_ref(),
             &mut self.graphs.capture_blobs,
-            self.graphs.capture_mode,
-            self.flags.force_blob_path,
+            capture_mode,
+            force_blob,
+            &mut self.replay,
             x,
             n_elems,
         )
@@ -2178,6 +2470,8 @@ impl Gpu {
     /// uses cvt_pk_fp8_f32. Caches by `x.buf.as_ptr()` like its FP16
     /// sibling so back-to-back same-X GEMM dispatches skip reconversion.
     pub(crate) fn ensure_fp8_x(&mut self, x: &GpuTensor, n_elems: usize) -> HipResult<*mut c_void> {
+        let capture_mode = self.graphs.capture_mode;
+        let force_blob = self.flags.force_blob_path;
         self.scratch.ensure_fp8_x(
             &self.hip,
             &mut self.compiler,
@@ -2185,8 +2479,9 @@ impl Gpu {
             &mut self.functions,
             self.active_stream.as_ref(),
             &mut self.graphs.capture_blobs,
-            self.graphs.capture_mode,
-            self.flags.force_blob_path,
+            capture_mode,
+            force_blob,
+            &mut self.replay,
             x,
             n_elems,
         )
@@ -2202,6 +2497,8 @@ impl Gpu {
         k: usize,
     ) -> HipResult<*mut c_void> {
         // bind_thread: skip — delegated to scratch.rs
+        let capture_mode = self.graphs.capture_mode;
+        let force_blob = self.flags.force_blob_path;
         self.scratch.ensure_q8_1_mmq_x(
             &self.hip,
             &mut self.compiler,
@@ -2209,13 +2506,40 @@ impl Gpu {
             &mut self.functions,
             self.active_stream.as_ref(),
             &mut self.graphs.capture_blobs,
-            self.graphs.capture_mode,
-            self.flags.force_blob_path,
+            capture_mode,
+            force_blob,
+            &mut self.replay,
             self.device_id,
             x,
             batch_size,
             k,
         )
+    }
+    /// Returns the number of launches recorded by the `ReplayController`.
+    /// Together with `self.graphs.capture_blobs.len()`, this must agree for
+    /// any body — see the `Gpu` type-level invariant doc.
+    pub fn recorded_launch_count(&self) -> usize {
+        self.replay.recorded_launches().len()
+    }
+
+    /// Returns the number of HipGraph kernarg blobs captured.
+    /// See `recorded_launch_count` and the `Gpu` invariant.
+    pub fn graph_blob_count(&self) -> usize {
+        self.graphs.capture_blobs.len()
+    }
+
+    /// Debug-only assertion that the HipGraph and Replay tapes would agree.
+    /// Call after a body that was captured via both mechanisms (or after two
+    /// separate captures of the same body, passing the other count).
+    /// A mismatch indicates a helper bypassed the replay recorder.
+    pub fn debug_assert_tape_parity(&self, other_blob_count: Option<usize>) {
+        let replay_len = self.recorded_launch_count();
+        let graph_len = other_blob_count.unwrap_or_else(|| self.graph_blob_count());
+        debug_assert_eq!(
+            replay_len, graph_len,
+            "tape parity violated: replay recorded {} launches but HipGraph has {} blobs — a helper bypassed the recorder",
+            replay_len, graph_len
+        );
     }
 
     /// Screen a weight matrix for MMQ safety (#87). Runs a small synthetic
@@ -2477,6 +2801,7 @@ impl Gpu {
     // ── Tensor allocation ───────────────────────────────────────
 
     pub fn ensure_gemv_residual_tmp(&mut self, min_elems: usize) -> HipResult<&GpuTensor> {
+        // bind_thread: skip — delegated to scratch.rs (takes device_id explicitly).
         self.scratch
             .ensure_gemv_residual_tmp(&self.hip, self.device_id, min_elems)
     }
@@ -2587,6 +2912,7 @@ impl Gpu {
     }
 
     pub fn vmm_mapped_bytes(&self, tensor: &GpuTensor) -> Option<usize> {
+        // bind_thread: skip — pure map lookup, touches no device state.
         self.vmm_arenas
             .get(&(tensor.buf.as_ptr() as usize))
             .map(VmmArena::mapped_bytes)
@@ -2594,6 +2920,7 @@ impl Gpu {
 
     /// Return the physical allocation granularity for a registered VMM tensor.
     pub fn vmm_granularity(&self, tensor: &GpuTensor) -> Option<usize> {
+        // bind_thread: skip — pure map lookup, touches no device state.
         self.vmm_arenas
             .get(&(tensor.buf.as_ptr() as usize))
             .map(VmmArena::granularity)
@@ -2603,12 +2930,14 @@ impl Gpu {
     /// reserving an address range. Model-owned VMM planners use this for a
     /// dry-run admission check before mapping any cache pages.
     pub fn vmm_recommended_granularity(&self) -> HipResult<usize> {
+        self.bind_thread()?;
         let prop = HipMemAllocationProp::device_pinned(self.device_id);
         self.hip
             .mem_get_allocation_granularity(&prop, HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED)
     }
 
     pub fn vmm_allocation_count(&self) -> usize {
+        // bind_thread: skip — pure length read, touches no device state.
         self.vmm_arenas.len() + self.orphan_vmm_arenas.len()
     }
 
@@ -2624,6 +2953,7 @@ impl Gpu {
     /// Success means `vmm_allocation_count() == 0`. Any remaining registration
     /// is an error so unload/load cannot claim a clean handoff.
     pub fn ensure_vmm_cleaned(&mut self) -> HipResult<()> {
+        self.bind_thread()?;
         let live = self.vmm_arenas.len();
         if live != 0 {
             return Err(HipError::new(
@@ -2823,6 +3153,266 @@ impl Gpu {
             Ok(())
         }
     }
+    /// Calibration capture hook for an instrumented linear: if a collector is
+    /// armed and `weight`'s buffer pointer is a known calibration target, invoke
+    /// `capture(name, input)`. Zero-cost (`is_none()` + return) when no collector
+    /// is armed, so non-calibration forwards are byte-identical. The collector
+    /// `Arc` is cloned before the call so `self` is not aliased by `active_capture`.
+    #[inline]
+    pub fn maybe_capture_activation(
+        &mut self,
+        weight: &GpuTensor,
+        input: &GpuTensor,
+        n: usize,
+        k: usize,
+    ) {
+        if self.active_capture.is_none() {
+            return;
+        }
+        let ptr = weight.buf.as_ptr() as usize;
+        let name = match self.capture_names.get(&ptr) {
+            Some(nm) => nm.clone(),
+            None => return,
+        };
+        if let Some(cap) = self.active_capture.clone() {
+            cap.capture(self, &name, input, n, k);
+        }
+    }
+
+    /// Calibration: `acc[c] += Σ_n x[n,c]²` (per-column sum-of-squares, the
+    /// imatrix / diag(H) signal). `x` is [N, K] F32; `acc` is [K] F32, ADDED into
+    /// (caller zeroes once, then accumulates across the calibration corpus).
+    pub fn calib_sumsq_reduce_f32(
+        &mut self,
+        x: &GpuTensor,
+        acc: &GpuTensor,
+        n: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "calib_reduce",
+            crate::kernels::CALIB_REDUCE_SRC,
+            "calib_sumsq_reduce_f32",
+        )?;
+        let x_ptr = x.buf.as_ptr();
+        let acc_ptr = acc.buf.as_ptr();
+        let n_i = n as i32;
+        let k_i = k as i32;
+        let block = 256u32;
+        let grid = ((k as u32) + block - 1) / block;
+        let mut params: Vec<*mut c_void> = vec![
+            &x_ptr as *const _ as *mut c_void,
+            &acc_ptr as *const _ as *mut c_void,
+            &n_i as *const _ as *mut c_void,
+            &k_i as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "calib_sumsq_reduce_f32",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(x_ptr);
+                blob.push_ptr(acc_ptr);
+                blob.push_i32(n_i);
+                blob.push_i32(k_i);
+                blob
+            },
+        )
+    }
+
+    /// Calibration: `H[i,j] += Σ_n x[n,i]·x[n,j]` (the K×K GPTQ Hessian, tiled
+    /// GEMM accumulate). `x` is [N, K] F32; `H` is [K, K] F32 row-major, ADDED
+    /// into (caller zeroes once, then accumulates across the calibration corpus).
+    pub fn calib_hessian_outer_f32(
+        &mut self,
+        x: &GpuTensor,
+        h: &GpuTensor,
+        n: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "calib_reduce",
+            crate::kernels::CALIB_REDUCE_SRC,
+            "calib_hessian_outer_f32",
+        )?;
+        let x_ptr = x.buf.as_ptr();
+        let h_ptr = h.buf.as_ptr();
+        let n_i = n as i32;
+        let k_i = k as i32;
+        let tile = 16u32;
+        let grid_x = ((k as u32) + tile - 1) / tile;
+        let grid_y = ((k as u32) + tile - 1) / tile;
+        let mut params: Vec<*mut c_void> = vec![
+            &x_ptr as *const _ as *mut c_void,
+            &h_ptr as *const _ as *mut c_void,
+            &n_i as *const _ as *mut c_void,
+            &k_i as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "calib_hessian_outer_f32",
+            [grid_x, grid_y, 1],
+            [tile, tile, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(x_ptr);
+                blob.push_ptr(h_ptr);
+                blob.push_i32(n_i);
+                blob.push_i32(k_i);
+                blob
+            },
+        )
+    }
+
+    /// `w[n] += (1/k)·Σ_c d[n,c]²` — per-row (per-token) mean-square of an
+    /// output-grad block `d[n,k]`. Used by GuidedQuant calibration to turn a
+    /// linear's output adjoint `∂ℓ/∂z` into a per-token Fisher weight. `w` is
+    /// caller-zeroed `[n]`.
+    pub fn calib_row_meansq_f32(
+        &mut self,
+        d: &GpuTensor,
+        w: &GpuTensor,
+        n: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "calib_reduce",
+            crate::kernels::CALIB_REDUCE_SRC,
+            "calib_row_meansq_f32",
+        )?;
+        let d_ptr = d.buf.as_ptr();
+        let w_ptr = w.buf.as_ptr();
+        let n_i = n as i32;
+        let k_i = k as i32;
+        let block = 64u32;
+        let grid = ((n as u32) + block - 1) / block;
+        let mut params: Vec<*mut c_void> = vec![
+            &d_ptr as *const _ as *mut c_void,
+            &w_ptr as *const _ as *mut c_void,
+            &n_i as *const _ as *mut c_void,
+            &k_i as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "calib_row_meansq_f32",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(d_ptr);
+                blob.push_ptr(w_ptr);
+                blob.push_i32(n_i);
+                blob.push_i32(k_i);
+                blob
+            },
+        )
+    }
+
+    /// `acc[c] += Σ_n w[n]·x[n,c]²` — the per-row-weighted column sum-of-squares,
+    /// i.e. the diagonal of the weighted Hessian. `w≡1` reduces to
+    /// [`Self::calib_sumsq_reduce_f32`].
+    pub fn calib_sumsq_weighted_f32(
+        &mut self,
+        x: &GpuTensor,
+        w: &GpuTensor,
+        acc: &GpuTensor,
+        n: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "calib_reduce",
+            crate::kernels::CALIB_REDUCE_SRC,
+            "calib_sumsq_weighted_f32",
+        )?;
+        let x_ptr = x.buf.as_ptr();
+        let w_ptr = w.buf.as_ptr();
+        let a_ptr = acc.buf.as_ptr();
+        let n_i = n as i32;
+        let k_i = k as i32;
+        let block = 64u32;
+        let grid = ((k as u32) + block - 1) / block;
+        let mut params: Vec<*mut c_void> = vec![
+            &x_ptr as *const _ as *mut c_void,
+            &w_ptr as *const _ as *mut c_void,
+            &a_ptr as *const _ as *mut c_void,
+            &n_i as *const _ as *mut c_void,
+            &k_i as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "calib_sumsq_weighted_f32",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(x_ptr);
+                blob.push_ptr(w_ptr);
+                blob.push_ptr(a_ptr);
+                blob.push_i32(n_i);
+                blob.push_i32(k_i);
+                blob
+            },
+        )
+    }
+
+    /// `H[i,j] += Σ_n w[n]·x[n,i]·x[n,j]` — the per-row-weighted (GuidedQuant /
+    /// empirical-Fisher) Hessian. `w≡1` reduces to [`Self::calib_hessian_outer_f32`].
+    pub fn calib_hessian_outer_weighted_f32(
+        &mut self,
+        x: &GpuTensor,
+        w: &GpuTensor,
+        h: &GpuTensor,
+        n: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "calib_reduce",
+            crate::kernels::CALIB_REDUCE_SRC,
+            "calib_hessian_outer_weighted_f32",
+        )?;
+        let x_ptr = x.buf.as_ptr();
+        let w_ptr = w.buf.as_ptr();
+        let h_ptr = h.buf.as_ptr();
+        let n_i = n as i32;
+        let k_i = k as i32;
+        let tile = 16u32;
+        let grid_x = ((k as u32) + tile - 1) / tile;
+        let grid_y = ((k as u32) + tile - 1) / tile;
+        let mut params: Vec<*mut c_void> = vec![
+            &x_ptr as *const _ as *mut c_void,
+            &w_ptr as *const _ as *mut c_void,
+            &h_ptr as *const _ as *mut c_void,
+            &n_i as *const _ as *mut c_void,
+            &k_i as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "calib_hessian_outer_weighted_f32",
+            [grid_x, grid_y, 1],
+            [tile, tile, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(x_ptr);
+                blob.push_ptr(w_ptr);
+                blob.push_ptr(h_ptr);
+                blob.push_i32(n_i);
+                blob.push_i32(k_i);
+                blob
+            },
+        )
+    }
 
     /// Free a newly allocated ordinary contiguous tensor immediately via HIP
     /// `free`, without returning the buffer to the reusable pool.
@@ -2892,6 +3482,7 @@ impl Gpu {
     /// conversion, silently serving stale F16 data from the previous
     /// layer.
     pub fn invalidate_fp16_cache(&mut self) {
+        // bind_thread: skip — nulls a CPU-side cache pointer, no device call.
         self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
     }
 
@@ -3035,6 +3626,7 @@ impl Gpu {
     /// bucket grows. The allocation change is intentional and recoverable, so
     /// retained replay is re-armed rather than placed in sticky fallback.
     pub fn invalidate_for_layout_growth(&mut self) {
+        // bind_thread: skip — invalidate_graph_state binds; rearm is CPU.
         self.invalidate_graph_state();
         self.replay.rearm_after_layout_growth();
     }
@@ -3937,6 +4529,81 @@ impl Gpu {
             cu_hint,
         )
     }
+
+    /// Bulk F32 → BF16 conversion with round-to-nearest-even.
+    ///
+    /// Elementwise `dst[i] = (bf16)src[i]` for `i < nelems`, matching the
+    /// host reference `round_to_bf16` (`crates/hipfire-arch-deepseek4/src/parent/codec.rs:92-110`).
+    /// Used to stage BF16 activations for `gemm_bf16_mfma_gfx942` under
+    /// `HIPFIRE_CALIB_BF16=1` so calibration GEMMs land on the CDNA3 MFMA
+    /// kernel instead of the scalar F32 kernel.
+    pub fn convert_f32_to_bf16(
+        &mut self,
+        src: &GpuTensor,
+        dst: &GpuTensor,
+        nelems: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if nelems == 0 {
+            return Ok(());
+        }
+        let src_need = nelems
+            .checked_mul(4)
+            .ok_or_else(|| HipError::new(0, "convert_f32_to_bf16: nelems*4 overflow"))?;
+        let dst_need = nelems
+            .checked_mul(2)
+            .ok_or_else(|| HipError::new(0, "convert_f32_to_bf16: nelems*2 overflow"))?;
+        if src.buf.size() < src_need {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "convert_f32_to_bf16: src buffer too small (have {} need {src_need} for nelems={nelems})",
+                    src.buf.size()
+                ),
+            ));
+        }
+        if dst.buf.size() < dst_need {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "convert_f32_to_bf16: dst buffer too small (have {} need {dst_need} for nelems={nelems})",
+                    dst.buf.size()
+                ),
+            ));
+        }
+        if nelems > i32::MAX as usize {
+            return Err(HipError::new(
+                0,
+                &format!("convert_f32_to_bf16: nelems {nelems} exceeds i32::MAX"),
+            ));
+        }
+        const KERNEL: &str = "convert_f32_to_bf16";
+        const SRC: &str = include_str!("../../../kernels/src/convert_f32_to_bf16.hip");
+        self.ensure_kernel(KERNEL, SRC, KERNEL)?;
+        let src_ptr = src.buf.as_ptr();
+        let dst_ptr = dst.buf.as_ptr();
+        let nelems_i32 = nelems as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &src_ptr as *const _ as *mut c_void,
+            &dst_ptr as *const _ as *mut c_void,
+            &nelems_i32 as *const _ as *mut c_void,
+        ];
+        let grid = nelems.div_ceil(256) as u32;
+        let bytes = src_need + dst_need;
+        let timer = crate::profile::begin_timer(&self.hip, "convert", KERNEL, bytes);
+        let result =
+            self.launch_maybe_blob(KERNEL, [grid, 1, 1], [256, 1, 1], 0, &mut params, || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(src_ptr);
+                blob.push_ptr(dst_ptr);
+                blob.push_i32(nelems_i32);
+                blob
+            });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
 }
 
 impl Drop for Gpu {
@@ -3959,6 +4626,10 @@ mod tests {
     use super::gen_fwht_signs;
     use super::DType;
     use super::HessianCapture;
+    use super::MQ2G256V2_GROUP_BYTES;
+    use super::MQ3G256V2_GROUP_BYTES;
+    use super::MQ5G256V2_GROUP_BYTES;
+    use super::MQ6G256V2_GROUP_BYTES;
 
     #[test]
     fn q8hfq_row_stride_matches_legacy_formula() {
@@ -4000,6 +4671,31 @@ mod tests {
         ] {
             assert!(!dt.requires_k_mod_256(), "{dt:?} must NOT require k%256");
         }
+    }
+
+    #[test]
+    fn neutral_v2_requires_k_mod_256_and_awq() {
+        for dt in [
+            DType::MQ4G256V2,
+            DType::MQ4CG256,
+            DType::MQ6G256V2,
+            DType::MQ5G256V2,
+            DType::MQ3G256V2,
+            DType::MQ2G256V2,
+        ] {
+            assert!(dt.requires_k_mod_256(), "{dt:?} must require K%256==0");
+            assert!(dt.supports_awq_sidecar(), "{dt:?} must support AWQ sidecar");
+        }
+        // Legacy counterparts must NOT be confused with V2 at type level.
+        assert_ne!(DType::MQ6G256V2, DType::MQ6G256);
+        assert_ne!(DType::MQ5G256V2, DType::MQ5G256);
+        assert_ne!(DType::MQ3G256V2, DType::MQ3G256);
+        assert_ne!(DType::MQ2G256V2, DType::MQ2G256);
+        // Group bytes match spec one-to-one.
+        assert_eq!(MQ6G256V2_GROUP_BYTES, 200);
+        assert_eq!(MQ5G256V2_GROUP_BYTES, 168);
+        assert_eq!(MQ3G256V2_GROUP_BYTES, 104);
+        assert_eq!(MQ2G256V2_GROUP_BYTES, 72);
     }
 
     /// Deterministic pseudo-random rows (no RNG crate): mix in exact zeros,
@@ -4305,5 +5001,113 @@ mod tests {
         gpu.ensure_vmm_cleaned()
             .expect("clears after faults drained");
         assert_eq!(gpu.vmm_allocation_count(), 0);
+    }
+    #[test]
+    fn scratch_convert_predicate_matches_launch_gate() {
+        // The scratch fast-path `scratch_must_convert` must be exactly
+        // `is_recording || capture_mode || cached != src`, which is the
+        // same predicate `Gpu::launch_maybe_blob_bound` uses for
+        // `record || capture_mode || force_blob` (with force_blob=false here).
+        // If these drift, a helper could skip a kernel that a recorder
+        // expects, or record a kernel the live path elides.
+        use crate::scratch::{scratch_must_convert, use_blob_path};
+        let ptr_a: *mut std::ffi::c_void = 0x1000 as *mut _;
+        let ptr_b: *mut std::ffi::c_void = 0x2000 as *mut _;
+
+        for capture in [false, true] {
+            for recording in [false, true] {
+                // cached == src  -> should convert only if a recorder active
+                assert_eq!(
+                    scratch_must_convert(capture, recording, ptr_a, ptr_a),
+                    recording || capture,
+                    "cached==src capture={capture} recording={recording}"
+                );
+                // cached != src -> always converts regardless of recorders
+                assert_eq!(
+                    scratch_must_convert(capture, recording, ptr_a, ptr_b),
+                    true,
+                    "cached!=src capture={capture} recording={recording}"
+                );
+                // blob path predicate must equal launch_maybe_blob_bound's gate
+                for force in [false, true] {
+                    let scratch_gate = use_blob_path(recording, capture, force);
+                    let dispatch_gate = recording || capture || force;
+                    assert_eq!(
+                        scratch_gate, dispatch_gate,
+                        "use_blob_path(recording={recording}, capture={capture}, force={force})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rotate_helpers_share_recording_gate_with_conversions() {
+        // The 7 rotation helpers (`rotate_x_mq`, `rotate_x_mq_batched`,
+        // `rotate_x_mq_128`, `rotate_x_mq_awq`, `rotate_x_mq_awq_batched`,
+        // `rotate_x_mq_dual_fp8`, `rotate_quantize_x_mq8`) have no
+        // cached-pointer elision — they always launch via `launch_maybe_blob`,
+        // whose gating is `use_blob_path(is_recording, capture_mode, force)`.
+        // That is the same gate `Gpu::launch_maybe_blob_bound` uses, and the
+        // same gate the conversion helpers couple to via `scratch_must_convert`
+        // (with force_blob=false). If a future rotate helper adds a pointer-cache
+        // skip, it must reuse `scratch_must_convert`; otherwise a divergence
+        // reintroduces exactly the 64-launch gap.
+        //
+        // Full helper invocation (allocation, kernel compile, HIP launch)
+        // cannot be exercised without a device; this GPU-free test covers the
+        // only driftable logic — the predicate — which is the invariant that
+        // keeps `capture_blobs.len() == recorded_launches.len()`.
+        use crate::scratch::{scratch_must_convert, use_blob_path};
+        let ptr_a: *mut std::ffi::c_void = 0x1000 as *mut _;
+        let ptr_b: *mut std::ffi::c_void = 0x2000 as *mut _;
+        for capture in [false, true] {
+            for recording in [false, true] {
+                for force in [false, true] {
+                    // Rotate helpers with no cache: must run iff blob path is taken.
+                    let rotate_must_run = use_blob_path(recording, capture, force);
+                    let dispatch_gate = recording || capture || force;
+                    assert_eq!(
+                        rotate_must_run, dispatch_gate,
+                        "rotate gate mismatch recording={recording} capture={capture} force={force}"
+                    );
+                    // If a rotate helper ever gains a cache, it must match the
+                    // conversion helper's `scratch_must_convert`.
+                    assert_eq!(
+                        scratch_must_convert(capture, recording, ptr_a, ptr_a),
+                        recording || capture,
+                        "scratch_must_convert cached==src capture={capture} recording={recording}"
+                    );
+                    assert_eq!(
+                        scratch_must_convert(capture, recording, ptr_a, ptr_b),
+                        true,
+                        "scratch_must_convert cached!=src capture={capture} recording={recording}"
+                    );
+                    // The two predicates coincide when cached==src and force==false:
+                    // both reduce to `recording || capture`. With force==true or
+                    // cached!=src they are trivially true, so they cannot diverge.
+                    if !force {
+                        assert_eq!(
+                            scratch_must_convert(capture, recording, ptr_a, ptr_a),
+                            use_blob_path(recording, capture, force),
+                            "conversion vs rotate gate drift capture={capture} recording={recording} force={force}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tape_parity_accessor_starts_empty() {
+        // GPU-free sanity for the invariant documented on `Gpu`: a recording
+        // and a HipGraph capture of the same body must produce the same launch
+        // count. Only the replay side is constructible without a device, so
+        // this pins the accessor and its empty state; the real invariant is
+        // enforced on hardware by comparing `capture.launches` against the
+        // `[verify-graph] captured ... with N blobs` line.
+        use crate::replay::{ReplayBackendRequest, ReplayController};
+        let ctrl = ReplayController::new(ReplayBackendRequest::Hip);
+        assert_eq!(ctrl.recorded_launches().len(), 0);
     }
 }

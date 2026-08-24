@@ -1917,7 +1917,7 @@ def spawn_serve(cfg, home, log):
                HIPFIRE_DAEMON_BIN=os.environ.get("HIPFIRE_DAEMON_BIN", os.path.join(REPO, "target/release/daemon")),
                HIPFIRE_KV_MODE=cfg["kv"], HIPFIRE_CASK_OFF="1", HIPFIRE_MODEL=cfg["model"])
     if cfg["mtp"] == "on":
-        env.update(HIPFIRE_QWEN_MTP="1", HIPFIRE_MTP_SAMPLED="1", HIPFIRE_MTP_PREFIX_CACHE="1")
+        env.update(HIPFIRE_QWEN_MTP="1", HIPFIRE_MTP_SAMPLED="1")
     # Experimental long-gated ngram-mod inside native MTP (harness-only; no TOML key).
     # Opt-off must clear inherited vars so a parent shell cannot contradict preflight.
     if cfg.get("mtp_ngram") == "on":

@@ -26,18 +26,18 @@ use hipfire_generate::common::*;
             ep: false,
             pp: 1,
             has_speculator: false,
-            qwen_mtp_head: false,
-            qwen_mtp_opt_in: false,
-            mtp_sampled_on: false,
+            speculator_is_mtp: false,
             deepseek4_spec_requested: false,
             ngram_can_sample: false,
             temp: 0.0,
             user_explicit_sampling: false,
             min_p: None,
+            nonneutral_penalties: false,
             force_ar_chat: false,
             temp_spec_env_off: false,
             fast_sample_on: true,
             supports_temp_swor: false,
+            supports_chain_nucleus_verify: false,
             kv_adaptive: false,
         }
     }
@@ -75,17 +75,6 @@ use hipfire_generate::common::*;
                     arch_id: 5,
                     has_speculator: true,
                     temp: 0.0,
-                    ..base()
-                },
-            ),
-            (
-                GenerationRoute::QwenMtp,
-                GenerationRouteInputs {
-                    arch_id: 5,
-                    qwen_mtp_head: true,
-                    qwen_mtp_opt_in: true,
-                    temp: 0.0,
-                    has_speculator: true, // MTP still wins over DFlash
                     ..base()
                 },
             ),
@@ -211,9 +200,7 @@ use hipfire_generate::common::*;
                 GenerationRouteInputs {
                     arch_id: 5,
                     pp: 2,
-                    // PP still beats MTP/DFlash when no arch short-circuit.
-                    qwen_mtp_head: true,
-                    qwen_mtp_opt_in: true,
+                    // PP still beats spec when no arch short-circuit.
                     has_speculator: true,
                     ..base()
                 },
@@ -484,8 +471,6 @@ use hipfire_generate::common::*;
         let i = GenerationRouteInputs {
             arch_id: 5,
             pp: 2,
-            qwen_mtp_head: true,
-            qwen_mtp_opt_in: true,
             temp: 0.0,
             has_speculator: true,
             ..base()
@@ -497,24 +482,145 @@ use hipfire_generate::common::*;
     }
 
     #[test]
-    fn precedence_mtp_before_dflash() {
-        // MTP opt-in + head + greedy beats DFlash even with a loaded speculator.
+    fn mtp_speculator_routes_through_qwen_dflash() {
+        // Greedy MTP uses the generic QwenDflash wrapper.
         let i = GenerationRouteInputs {
             arch_id: 6,
-            qwen_mtp_head: true,
-            qwen_mtp_opt_in: true,
-            temp: 0.0,
             has_speculator: true,
+            speculator_is_mtp: true,
+            temp: 0.0,
             ..base()
         };
-        assert_eq!(select_generation_route(&i), GenerationRoute::QwenMtp);
-        // Without MTP opt-in, same inputs select DFlash.
+        assert_eq!(select_generation_route(&i), GenerationRoute::QwenDflash);
+        // Sampled MTP with user-explicit sampling and min_p stays on spec
+        // when supports_temp_verify — unlike DFlash-specific restrictions.
         let i = GenerationRouteInputs {
-            arch_id: 6,
-            qwen_mtp_head: true,
-            qwen_mtp_opt_in: false,
-            temp: 0.0,
+            arch_id: 5,
             has_speculator: true,
+            speculator_is_mtp: true,
+            supports_temp_swor: true,
+            temp: 0.7,
+            user_explicit_sampling: true,
+            min_p: Some(0.05),
+            ..base()
+        };
+        assert_eq!(select_generation_route(&i), GenerationRoute::QwenDflash);
+        // DDTree SWOR (supports_temp_swor, no chain nucleus) + user-explicit
+        // non-temperature controls still falls to AR.
+        let i = GenerationRouteInputs {
+            arch_id: 5,
+            has_speculator: true,
+            speculator_is_mtp: false,
+            supports_temp_swor: true,
+            supports_chain_nucleus_verify: false,
+            temp: 0.7,
+            user_explicit_sampling: true,
+            ..base()
+        };
+        assert_eq!(select_generation_route(&i), GenerationRoute::QwenAr);
+        // MTP without supports_temp_verify at temp>0 falls to AR.
+        let i = GenerationRouteInputs {
+            arch_id: 5,
+            has_speculator: true,
+            speculator_is_mtp: true,
+            supports_temp_swor: false,
+            temp: 0.7,
+            ..base()
+        };
+        assert_eq!(select_generation_route(&i), GenerationRoute::QwenAr);
+    }
+
+    #[test]
+    fn dflash2_selector_chain_nucleus_routes() {
+        // Registry sampling profile: temp>0 + explicit top_p/top_k + min_p=0
+        // with DFlash2 selector-chain nucleus → QwenDflash (not misclassified
+        // as DDTree SWOR).
+        let i = GenerationRouteInputs {
+            arch_id: 5,
+            has_speculator: true,
+            speculator_is_mtp: false,
+            supports_temp_swor: true,
+            supports_chain_nucleus_verify: true,
+            ngram_can_sample: true,
+            fast_sample_on: true,
+            temp: 1.0,
+            user_explicit_sampling: true,
+            min_p: Some(0.0),
+            ..base()
+        };
+        assert_eq!(select_generation_route(&i), GenerationRoute::QwenDflash);
+
+        // Nonzero min_p still falls to AR (DFlash ignores min_p).
+        let i = GenerationRouteInputs {
+            arch_id: 5,
+            has_speculator: true,
+            supports_temp_swor: true,
+            supports_chain_nucleus_verify: true,
+            ngram_can_sample: true,
+            fast_sample_on: true,
+            temp: 1.0,
+            user_explicit_sampling: true,
+            min_p: Some(0.05),
+            ..base()
+        };
+        assert_eq!(select_generation_route(&i), GenerationRoute::QwenAr);
+
+        // Non-neutral penalties remain on AR because selector-chain verify
+        // does not implement repeat/presence/frequency penalties.
+        let i = GenerationRouteInputs {
+            arch_id: 5,
+            has_speculator: true,
+            supports_temp_swor: true,
+            supports_chain_nucleus_verify: true,
+            ngram_can_sample: true,
+            fast_sample_on: true,
+            temp: 1.0,
+            user_explicit_sampling: true,
+            nonneutral_penalties: true,
+            ..base()
+        };
+        assert_eq!(select_generation_route(&i), GenerationRoute::QwenAr);
+
+        // DDTree SWOR + explicit controls remains QwenAr (no chain nucleus).
+        let i = GenerationRouteInputs {
+            arch_id: 5,
+            has_speculator: true,
+            supports_temp_swor: true,
+            supports_chain_nucleus_verify: false,
+            ngram_can_sample: true,
+            temp: 0.7,
+            user_explicit_sampling: true,
+            min_p: None,
+            ..base()
+        };
+        assert_eq!(select_generation_route(&i), GenerationRoute::QwenAr);
+
+        // Existing sampled MTP still selects QwenDflash with explicit controls.
+        let i = GenerationRouteInputs {
+            arch_id: 5,
+            has_speculator: true,
+            speculator_is_mtp: true,
+            supports_temp_swor: true,
+            supports_chain_nucleus_verify: false,
+            temp: 0.7,
+            user_explicit_sampling: true,
+            min_p: Some(0.05),
+            ..base()
+        };
+        assert_eq!(select_generation_route(&i), GenerationRoute::QwenDflash);
+
+        // Legacy sampled chain (supports_temp_swor=false) unchanged: still
+        // engages with nucleus via ngram_can_sample + fast_sample.
+        let i = GenerationRouteInputs {
+            arch_id: 5,
+            has_speculator: true,
+            supports_temp_swor: false,
+            supports_chain_nucleus_verify: false,
+            ngram_can_sample: true,
+            fast_sample_on: true,
+            temp: 0.7,
+            user_explicit_sampling: true,
+            min_p: None,
             ..base()
         };
         assert_eq!(select_generation_route(&i), GenerationRoute::QwenDflash);
@@ -718,8 +824,8 @@ use hipfire_generate::common::*;
     }
 
     #[test]
-    fn all_variant_count_is_twenty_two() {
+    fn all_variant_count_is_twenty_one() {
         // Pin count so accidental ALL edits surface here too.
-        assert_eq!(GenerationRoute::ALL.len(), 22);
-        assert_eq!(capability_rows().len(), 22);
+        assert_eq!(GenerationRoute::ALL.len(), 21);
+        assert_eq!(capability_rows().len(), 21);
     }

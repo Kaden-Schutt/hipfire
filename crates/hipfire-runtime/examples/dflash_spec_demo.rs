@@ -1393,7 +1393,16 @@ fn main() {
     if let Some(b) = block_size_override {
         let orig = draft_cfg.block_size;
         draft_cfg.block_size = b;
-        eprintln!("block_size override: {orig} -> {b} (draft was trained at {orig}; smaller B lowers per-iter cost but may reduce τ)");
+        eprintln!("block_size override: {orig} -> {b} (checkpoint declares {orig})");
+    } else {
+        let runtime_b = draft_cfg.runtime_block_size();
+        if runtime_b != draft_cfg.block_size {
+            eprintln!(
+                "DFlash2 runtime block: {} -> {} (selector/conv path is length-generic)",
+                draft_cfg.block_size, runtime_b
+            );
+            draft_cfg.block_size = runtime_b;
+        }
     }
     eprintln!(
         "draft: layers={} hidden={} heads={} kv_heads={} block={} target_layers={:?}",
@@ -1453,21 +1462,14 @@ fn main() {
     eprintln!("draft loaded in {:.2}s", t0.elapsed().as_secs_f64());
     vram_report(&gpu.hip, "after draft load");
 
-    // Adaptive-B scratch sizing: the draft was trained at a specific
-    // block_size; going past it is out-of-distribution for its positional
-    // encoding. Measured on 27B MQ4 (2026-04-24, 3-run median) with range
-    // 8:20:
-    //   code: 161.5 → 113.7 tok/s (-30 %) as B grew to 17+, τ only
-    //         dropped 8 % so the loss is dominated by verify cost × B
-    //         at OOD positions, not by τ collapse.
-    //   prose/instr: unchanged (B never grew past 10 on low-τ workloads).
-    // → clamp adaptive_b_max to draft_cfg.block_size with a warning when
-    // the user explicitly widens. Opt out via HIPFIRE_ADAPTIVE_B_UNSAFE=1
-    // for experiments on a refit draft.
+    // Adaptive-B may shrink below the effective runtime width, but it must not
+    // grow past the scratch/model policy unless the diagnostic UNSAFE override
+    // is explicit. For legacy drafts the runtime width is the artifact width;
+    // DFlash2 uses the selector-aware B=16 runtime policy above.
     let unsafe_adaptive = std::env::var("HIPFIRE_ADAPTIVE_B_UNSAFE").ok().as_deref() == Some("1");
     if adaptive_b && adaptive_b_max > draft_cfg.block_size && !unsafe_adaptive {
         eprintln!(
-            "adaptive-b: WARN requested MAX={} > draft trained block_size={}; clamping to {} (past-trained B regresses code by ~30 %; set HIPFIRE_ADAPTIVE_B_UNSAFE=1 to override)",
+            "adaptive-b: WARN requested MAX={} > runtime block_size={}; clamping to {} (set HIPFIRE_ADAPTIVE_B_UNSAFE=1 to override)",
             adaptive_b_max, draft_cfg.block_size, draft_cfg.block_size,
         );
         adaptive_b_max = draft_cfg.block_size;
@@ -1482,17 +1484,17 @@ fn main() {
     };
     if draft_scratch_b > draft_cfg.block_size {
         eprintln!(
-            "adaptive-b: pre-sizing draft scratch for B_MAX={} (trained at {}) [UNSAFE=on]",
+            "adaptive-b: pre-sizing draft scratch for B_MAX={} (runtime width {}) [UNSAFE=on]",
             draft_scratch_b, draft_cfg.block_size,
         );
     }
-    // Windowed draft context (SWA W on layers 0..n-2 + FULL-reach last
-    // layer spanning the entire supported context, `w_full = ctx_capacity`).
+    // Windowed draft context. Legacy split drafts use SWA W on layers 0..n-2
+    // plus a full-reach final layer. DFlash2 all-sliding drafts use W on every
+    // layer and allocate no long-reach final-layer ring.
     // DEFAULTS to the window the draft artifact declares it was trained with
     // (`DflashConfig::declared_window` <- `config.sliding_window`, gated on
-    // `use_sliding_window` and matching `layer_types`); that is the only width
-    // correct by construction. Mirrors `dflash_spec.rs::load_dflash_state` —
-    // keep the two in sync, they are the serve and bench halves of one policy.
+    // `use_sliding_window` and matching `layer_types`). Mirrors
+    // `dflash_spec.rs::load_dflash_state`; keep serve and bench in sync.
     //   HIPFIRE_DFLASH_WINDOW=<rows>  explicit override (warns on mismatch)
     //   HIPFIRE_DFLASH_WINDOW=0       explicit Legacy
     //   unset                         draft-declared window, else Legacy
@@ -1528,24 +1530,30 @@ fn main() {
     };
     let mut draft_scratch = match dflash_window {
         Some(w) => {
-            eprintln!(
-                "draft: windowed mode W={} (last layer reach: full {}){}",
-                w,
-                ctx_capacity,
-                if draft_cfg.declared_window == Some(w) {
-                    " [from draft metadata]"
-                } else {
-                    ""
-                }
-            );
+            let from_meta = if draft_cfg.declared_window == Some(w) {
+                " [from draft metadata]"
+            } else {
+                ""
+            };
+            let w_full = if draft_cfg.all_layers_sliding {
+                eprintln!(
+                    "draft: DFlash2 windowed, all {} layers sliding at W={}{}",
+                    draft_cfg.n_layers, w, from_meta
+                );
+                w
+            } else {
+                eprintln!(
+                    "draft: windowed mode W={} (last layer reach: full {}){}",
+                    w, ctx_capacity, from_meta
+                );
+                ctx_capacity
+            };
             DflashScratch::new_windowed(
                 &mut gpu,
                 &draft_cfg,
                 draft_scratch_b,
                 w,
-                // w_full UNBOUNDED: last (full-attention) layer spans the
-                // whole supported context (mirrors dflash_spec.rs).
-                ctx_capacity,
+                w_full,
                 ctx_capacity,
                 draft_weights.has_mq,
             )
@@ -1634,6 +1642,23 @@ fn main() {
     .expect("alloc verify scratch");
     let mut target_hidden_host: Vec<f32> =
         Vec::with_capacity(ctx_capacity * draft_cfg.num_extract() * draft_cfg.hidden);
+
+    // Retained-PM4 verify route. Same env opt-in and same default-off posture
+    // as the daemon; the demo is the production-faithful parity instrument
+    // because it drives the real chain decode loop with no synthetic oracle,
+    // no fabricated rollback, and no per-window reset.
+    let mut verify_pm4 = if hipfire_config::developer_var("HIPFIRE_DFLASH_VERIFY_PM4")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
+        eprintln!("[dflash-demo] retained verify PM4: armed");
+        hipfire_arch_qwen35::dflash_verify_pm4::DflashVerifyPm4::armed()
+    } else {
+        hipfire_arch_qwen35::dflash_verify_pm4::DflashVerifyPm4::disabled(
+            "HIPFIRE_DFLASH_VERIFY_PM4 is not set to 1",
+        )
+    };
 
     // ── Build FlashCASK policy (opt-in via --cask-sidecar) ──────────
     // The policy evicts target.kv_cache between spec_step cycles.
@@ -2578,6 +2603,7 @@ fn main() {
                     runtime_repeat_penalty,
                     repeat_window,
                     None, // max_accept: uncapped demo
+                    Some(&mut verify_pm4),
                 )
                 .expect("spec step")
             };
@@ -2898,6 +2924,11 @@ fn main() {
         eprintln!("vram_used_mb: {}", vram_used_mb);
         eprintln!("vram_total_mb: {}", vram_total_mb);
         eprintln!("=====================");
+        eprintln!(
+            "dflash_verify_pm4: {}",
+            serde_json::to_string(&verify_pm4.report_json())
+                .unwrap_or_else(|_| "<unserializable>".to_string())
+        );
         eprintln!("accept_rate (accepted / (cycles × (B-1))): {accept_rate:.3}");
         eprintln!(
             "histogram: {:?}",

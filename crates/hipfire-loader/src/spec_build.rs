@@ -167,23 +167,22 @@ pub fn build_speculator(
     mtp: Option<Qwen35MtpHead>,
     eviction_is_none: bool,
     ctx_capacity: usize,
-    ngram: hipfire_runtime::loader_api::SpecLoadCfg,
+    spec: hipfire_runtime::loader_api::SpecLoadCfg,
 ) -> Option<Box<dyn Speculator>> {
     if let Some(df) = dflash {
         return Some(build_dflash_speculator(df, eviction_is_none));
     }
-    // qwen35 MTP head (arch 5/6). The load site only hands us a head when
-    // HIPFIRE_QWEN35_MTP=1, the source is a bundled `.mq4-mtp`, no DFlash draft
-    // was requested, and eviction is None — re-assert the eviction guard here
-    // (the MTP head KV is NOT FlashCASK-compacted, so building under eviction
-    // would desync head/trunk positions). MTP wins over n-gram when present.
+    // qwen35 MTP head (arch 5/6). MTP wins over n-gram when present; the load
+    // site is authoritative for whether a head was loaded (no `&mut Gpu` here
+    // to free it). Re-assert the eviction guard here (the MTP head KV is NOT
+    // FlashCASK-compacted, so building under eviction would desync head/trunk
+    // positions).
     if let Some(head) = mtp {
         if eviction_is_none && matches!(arch_id, 5 | 6) {
-            let max_n = hipfire_config::developer_var("HIPFIRE_QWEN35_MTP_K")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(4usize)
-                .clamp(1, 8);
+            let max_n = spec
+                .mtp_k
+                .unwrap_or(hipfire_runtime::config::get().mtp_k)
+                .clamp(1, 10);
             eprintln!("  qwen35 MTP speculator enabled (compressed-serial, K={max_n})");
             return Some(hipfire_arch_qwen35::build_qwen35_mtp_speculator(
                 head,
@@ -200,7 +199,7 @@ pub fn build_speculator(
     // The CLI resolves per-model and global TOML into this per-load policy.
     // Direct protocol clients inherit the daemon's typed process policy before
     // the carrier is invoked, so the loader never consults ambient env.
-    let ngram_enabled = ngram.ngram_draft.unwrap_or(false);
+    let ngram_enabled = spec.ngram_draft.unwrap_or(false);
     // Spec-capable arches with a `SpecTarget` impl: dense LLaMA family
     // (0 = LLaMA/Mistral, 1 = plain Qwen3), qwen35 DeltaNet (5/6), Qwen2
     // (7 = VibeThinker, own `Qwen2State` KV), dots-ocr (8, VL decode-phase),
@@ -212,8 +211,8 @@ pub fn build_speculator(
         // tok/s, K=16 ties, K≥24 regresses (wasted verify on drafts past the
         // acceptance plateau). Values are already resolved through the TOML
         // ladder. K keeps its `.max(2)` floor.
-        let block_size = ngram.ngram_k.unwrap_or(12usize).max(2);
-        let min_count = ngram.ngram_min_count.unwrap_or(2u32);
+        let block_size = spec.ngram_k.unwrap_or(12usize).max(2);
+        let min_count = spec.ngram_min_count.unwrap_or(2u32);
         eprintln!(
             "  n-gram speculator enabled (model-free, K={}, min_count={})",
             block_size, min_count

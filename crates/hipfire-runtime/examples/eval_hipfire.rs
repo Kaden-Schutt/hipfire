@@ -35,6 +35,14 @@
 //! KLD as fp64 pairs.
 //!
 //! Plan: docs/plans/issue-113-quant-quality-eval.md (rev-3.2).
+//!
+//! Multi-arch dispatch (Tier-1): mirrors `calib_sweep.rs` arch detection
+//!   llama 0|1, qwen35 5|6, gemma4 13, glimmer 14, lfm2 11.
+//!   Per-arch chunking mirrors calib_sweep:
+//!     gemma4 sub-chunks to 128 (scratch.max_prefill_batch) and needs q8 KV
+//!     glimmer chunks 192 (glimmer_prefill_chunk_size / prefill_with_capture)
+//!     lfm2 uses forward_decode_batch_lfm with explicit positions, q8 KV
+//!     qwen35 uses forward_prefill_batch with q8 KV at seq_len+16
 
 #[cfg(not(feature = "deltanet"))]
 fn main() {
@@ -43,9 +51,8 @@ fn main() {
 
 #[cfg(feature = "deltanet")]
 fn main() {
-    use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
     use hipfire_runtime::hfq::HfqFile;
-    use hipfire_runtime::llama::{gemv_family, weight_gemv, DispatchCtx, KvCache, VMode};
+    use hipfire_runtime::llama::{KvCache, VMode};
     use rdna_compute::DType;
     use std::fs::File;
     use std::io::{BufReader, BufWriter, Read, Write};
@@ -187,7 +194,7 @@ fn main() {
     // -------- ref sha256 sanity (M1) --------
     hipfire_runtime::eval_common::verify_ref_sha256(&args.ref_path, "eval_hipfire");
 
-    // -------- load model --------
+    // -------- GPU init --------
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
     eprintln!(
         "eval_hipfire: arch={} model={}",
@@ -203,232 +210,52 @@ fn main() {
         eprintln!("eval_hipfire: arch is gfx12; set HIPFIRE_LLOYD_GFX12=1");
     }
 
-    // Auto-route safetensors directories (ParoQuant / AWQ / HF native) — mirrors
-    // daemon.rs:1500-1504. HFQ files take the canonical HFQ path below.
-    let (config, weights) = if args.model.is_dir() {
-        use hipfire_runtime::safetensors_source::SafetensorsSource;
-        let source = SafetensorsSource::open(&args.model).expect("safetensors open");
-        let config = qwen35::config_from_safetensors(&source).expect("config_from_safetensors");
-        eprintln!("  loading via safetensors (ParoQuant path)");
-        let mut paro_source = qwen35::ParoSource::new(&source, &config).expect("ParoSource::new");
-        let paro_layout = qwen35::Layout::single(config.n_layers);
-        let weights = qwen35::load_weights(
-            &mut paro_source,
-            std::slice::from_mut(&mut gpu),
-            &paro_layout,
-        )
-        .expect("load_weights");
-        (config, weights)
+    // -------- arch detection (mirrors calib_sweep.rs:654-658) --------
+    // HFQ header is authoritative for file models; for safetensors dirs we
+    // probe SafetensorsSource. This is byte-identical to calib_sweep's
+    // `arch = arg("--arch").unwrap_or(hfq.arch_id)` dispatch.
+    let arch_id: u32 = if args.model.is_dir() {
+        let src = hipfire_runtime::safetensors_source::SafetensorsSource::open(&args.model)
+            .unwrap_or_else(|e| {
+                eprintln!("safetensors open {}: {e}", args.model.display());
+                std::process::exit(1)
+            });
+        let id = src.arch_id();
+        eprintln!("eval_hipfire: detected arch_id={id} (safetensors dir)");
+        id
     } else {
-        let mut hfq = HfqFile::open(&args.model).expect("open model");
-        let config = qwen35::config_from_hfq(&hfq).expect("read config");
-        let weights = {
-            let mut src = qwen35::HfqSource::new(&mut hfq, &config);
-            let layout = qwen35::Layout::single(config.n_layers);
-            qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &layout)
-        }
-        .expect("load weights");
-        (config, weights)
+        let hfq = HfqFile::open(&args.model).unwrap_or_else(|e| {
+            eprintln!("open model {}: {e}", args.model.display());
+            std::process::exit(1)
+        });
+        let id = hfq.arch_id;
+        eprintln!("eval_hipfire: detected arch_id={id} (HFQ header)");
+        id
     };
-
-    // -------- read reference (HFKLDR β) header + tokens --------
-    let ref_file = File::open(&args.ref_path).expect("open ref");
-    let mut ref_in = BufReader::with_capacity(8 * 1024 * 1024, ref_file);
-
-    let mut magic = [0u8; 8];
-    ref_in.read_exact(&mut magic).expect("read ref magic");
-    if &magic != b"HFKLDR\0\0" {
-        eprintln!("bad ref magic: {magic:?}");
-        std::process::exit(2);
-    }
-    let mut hdr = [0u8; 24];
-    ref_in.read_exact(&mut hdr).expect("read ref header");
-    let version = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
-    let n_ctx = u32::from_le_bytes(hdr[4..8].try_into().unwrap()) as usize;
-    let ref_n_vocab = u32::from_le_bytes(hdr[8..12].try_into().unwrap()) as usize;
-    let n_chunk = u32::from_le_bytes(hdr[12..16].try_into().unwrap()) as usize;
-    let top_k = u16::from_le_bytes(hdr[16..18].try_into().unwrap()) as usize;
-    let _flags = u16::from_le_bytes(hdr[18..20].try_into().unwrap());
-    if version != 1 {
-        eprintln!("unsupported ref version {version}");
-        std::process::exit(2);
-    }
-    if ref_n_vocab != config.vocab_size {
+    let is_llama = matches!(arch_id, 0 | 1);
+    let is_qwen35 = matches!(arch_id, 5 | 6);
+    let is_gemma = arch_id == 13;
+    let is_glimmer = arch_id == 14;
+    let is_lfm = arch_id == 11;
+    if !(is_llama || is_qwen35 || is_gemma || is_glimmer || is_lfm) {
         eprintln!(
-            "vocab mismatch: ref says {ref_n_vocab}, model says {}",
-            config.vocab_size
+            "unsupported arch_id {arch_id}: eval_hipfire wires dense 0|1 (llama), 5|6 (qwen35), 13 (gemma4), 14 (glimmer), 11 (lfm2) — matches calib_sweep.rs:658"
         );
-        std::process::exit(2);
+        std::process::exit(1);
     }
-    let scored_per_chunk = n_ctx - 1 - n_ctx / 2;
-    // Effective chunk count after --max-chunks cap (V5 / dev-smoke). Tokens
-    // and ref blocks for chunks beyond the cap are read but not scored —
-    // the ref-block stream advances per scored position, not per chunk, so
-    // the cap is enforced at the outer loop.
-    let effective_n_chunk = match args.max_chunks {
-        Some(m) => m.min(n_chunk),
-        None => n_chunk,
-    };
-    if let Some(m) = args.max_chunks {
-        eprintln!(
-            "eval_hipfire: --max-chunks {m} → effective_n_chunk = {effective_n_chunk}/{n_chunk}"
-        );
-    }
-    let total_scored = scored_per_chunk * effective_n_chunk;
-    let per_token_block_bytes = 8 + 8 * top_k;
-    eprintln!(
-        "eval_hipfire: ref n_ctx={n_ctx} n_vocab={ref_n_vocab} n_chunk={n_chunk} top_k={top_k}"
-    );
-    eprintln!(
-        "  scored/chunk={scored_per_chunk}  total_scored={total_scored}  block={per_token_block_bytes}B"
-    );
 
-    // Read tokens (n_ctx * n_chunk u32s).
-    let n_tokens = n_ctx * n_chunk;
-    let mut tokens_raw = vec![0u8; n_tokens * 4];
-    ref_in.read_exact(&mut tokens_raw).expect("read ref tokens");
-    let tokens: Vec<u32> = tokens_raw
-        .chunks_exact(4)
-        .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
-        .collect();
-
-    // -------- KV cache + DeltaNet state + scratch --------
-    let kv_max = n_ctx + 16;
-    // FWHT KV modes only have layer-filtered ctors; build the FA-layer mask
-    // from layer_types. Filtering is KLD-neutral (DeltaNet layers never read KV).
-    let is_kv_layer: Vec<bool> = config
-        .layer_types
-        .iter()
-        .map(|t| *t == qwen35::LayerType::FullAttention)
-        .collect();
-    let mut kv_cache = match args.kv_mode.as_str() {
-        "q8" => KvCache::new_gpu_q8(
-            &mut gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_max,
-        )
-        .unwrap(),
-        "asym4" => KvCache::new_gpu_asym4(
-            &mut gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_max,
-        )
-        .unwrap(),
-        "asym3" => KvCache::new_gpu_asym3(
-            &mut gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_max,
-        )
-        .unwrap(),
-        "asym2" => KvCache::new_gpu_asym2(
-            &mut gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_max,
-        )
-        .unwrap(),
-        "fwht4" => KvCache::new_gpu_fwht4_filtered(
-            &mut gpu,
-            &is_kv_layer,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_max,
-        )
-        .unwrap(),
-        "fwht3" => KvCache::new_gpu_fwht3_filtered(
-            &mut gpu,
-            &is_kv_layer,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_max,
-        )
-        .unwrap(),
-        "fwht2" => KvCache::new_gpu_fwht2_filtered(
-            &mut gpu,
-            &is_kv_layer,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_max,
-        )
-        .unwrap(),
-        // F1-KV: true un-quantized KV. `new_gpu` allocates raw FP32 K/V with all
-        // quant_* flags false. The prefill batched-FA gate (`fa_batched_ok`) requires
-        // a q8/asym cache, so an F32 cache forces FA layers through the per-token
-        // `run_fa_layer_body` fallback whose else-branch does raw `kv_cache_write` +
-        // `attention_f32` — i.e. the cache is NOT Q8-quantized during scoring. "f16"
-        // is accepted as an alias and maps to the same FP32-storage path (there is no
-        // separate quantized-f16 cache ctor; FP32 is the higher-precision oracle).
-        "f32" | "f16" => KvCache::new_gpu(
-            &mut gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_max,
-        )
-        .unwrap(),
-        other => panic!("unknown --kv-mode: {other}"),
-    };
-    let v_mode = match args.kv_v.as_str() {
-        "q8" => VMode::Q8,
-        "lloyd2" => VMode::Lloyd2,
-        "lloyd3" => VMode::Lloyd3,
-        "lloyd4" => VMode::Lloyd4,
-        other => panic!("unknown --kv-v: {other}"),
-    };
-    if v_mode != VMode::Q8 {
-        kv_cache.set_v_mode_realloc(&mut gpu, v_mode).unwrap();
-    }
-    let scratch = Qwen35Scratch::new(&mut gpu, &config, 64).unwrap();
-    // DeltaNet state allocated once and reset in place per chunk. Allocating
-    // per chunk leaks ~6 MB × n_la_layers/chunk because DeltaNetState has no
-    // Drop impl (only an explicit free_gpu) — OOM'd at ~chunk 1013/1175 in a
-    // prior gfx1100 run with 21.5 GB VRAM.
-    let mut dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
-
-    // Hidden-state capture buffer for prefill mode. forward_prefill_batch
-    // with per_token_hidden_out=Some(buf) writes one row per scored token
-    // (post-output-norm hidden state); we then loop weight_gemv per row to
-    // recover logits — the "option C / per-token GPU lm_head fan-out"
-    // resolution from PRD §5 lm_head fan-out options.
-    // Shape: [scored_per_chunk, dim]; ~16 MB at scored_per_chunk=1023, dim=4096.
-    // `scored_per_chunk` already bound above at line ~188.
-    let hidden_buf = if args.scoring_mode == "prefill" {
-        Some(
-            gpu.alloc_tensor(&[scored_per_chunk, config.dim], DType::F32)
-                .expect("alloc hidden_buf"),
-        )
-    } else {
-        None
-    };
-
-    // -------- per-chunk loop --------
-    let mut mean_kld_per_seq: Vec<f64> = Vec::with_capacity(n_chunk);
-    let mut p99_kld_per_seq: Vec<f64> = Vec::with_capacity(n_chunk);
-    let mut mean_nll_per_seq: Vec<f64> = Vec::with_capacity(n_chunk);
-    let mut block_buf = vec![0u8; per_token_block_bytes];
-    let t0 = Instant::now();
-    let mut total_scored_done = 0usize;
-
-    // Per-position KLD + NLL inner body. Reads the next ref block, downloads
-    // the candidate logits from scratch.logits (caller is responsible for
-    // having populated those), computes top-K-of-ref KLD with residual
-    // cross-term, and returns (kld_token, optional_nll). The closure
-    // explicitly mutates `ref_in` and `block_buf` so per-chunk state stays
-    // outside; the rest is read-only. Same math both modes use.
-    let score_position = |gpu: &mut rdna_compute::Gpu,
-                          scratch_logits: &rdna_compute::GpuTensor,
-                          ref_in: &mut BufReader<File>,
-                          block_buf: &mut [u8],
-                          actual_next: usize|
-     -> (f64, Option<f64>) {
-        ref_in.read_exact(block_buf).expect("read ref block");
+    // -------- shared KLD helper (arch-independent) --------
+    // Factor so each arch only supplies logits per scored position and the
+    // comparison/reporting stays shared. Do NOT duplicate this math per arch;
+    // a divergent copy would silently make two models' numbers incomparable.
+    // Mirrors eval_hipfire's original score_position closure verbatim.
+    fn kld_from_block(
+        logits: &[f32],
+        block_buf: &[u8],
+        top_k: usize,
+        actual_next: usize,
+    ) -> (f64, Option<f64>) {
+        // parse block: [top_k u32 idx][top_k f32 logp][f32 sum_p_residual][f32 pad]
         let mut top_indices: Vec<u32> = Vec::with_capacity(top_k);
         let mut top_log_probs: Vec<f32> = Vec::with_capacity(top_k);
         for j in 0..top_k {
@@ -448,17 +275,15 @@ fn main() {
         let sum_p_residual =
             f32::from_le_bytes(block_buf[resid_off..resid_off + 4].try_into().unwrap());
 
-        let cand_logits = gpu.download_f32(scratch_logits).expect("download logits");
-
         // Candidate's log-Z = log Σ exp(logit_i) — fp64 throughout.
         let mut max_logit = f32::NEG_INFINITY;
-        for &v in cand_logits.iter() {
+        for &v in logits.iter() {
             if v > max_logit {
                 max_logit = v;
             }
         }
         let mut sum_exp = 0.0f64;
-        for &v in cand_logits.iter() {
+        for &v in logits.iter() {
             sum_exp += ((v - max_logit) as f64).exp();
         }
         let log_z = (max_logit as f64) + sum_exp.ln();
@@ -469,11 +294,11 @@ fn main() {
         let mut sum_p_cand_at_ref_top = 0.0f64;
         for j in 0..top_k {
             let ref_idx = top_indices[j] as usize;
-            if ref_idx >= cand_logits.len() {
+            if ref_idx >= logits.len() {
                 continue;
             }
             let log_p_ref = top_log_probs[j] as f64;
-            let log_p_cand = (cand_logits[ref_idx] as f64) - log_z;
+            let log_p_cand = (logits[ref_idx] as f64) - log_z;
             let p_ref = log_p_ref.exp();
             let p_cand = log_p_cand.exp();
             kld_token += p_ref * (log_p_ref - log_p_cand);
@@ -493,51 +318,508 @@ fn main() {
         );
         let kld_token = kld_token.max(0.0);
 
-        let nll = if actual_next < cand_logits.len() {
-            Some(-((cand_logits[actual_next] as f64) - log_z))
+        let nll = if actual_next < logits.len() {
+            Some(-((logits[actual_next] as f64) - log_z))
         } else {
             None
         };
         (kld_token, nll)
+    }
+
+    // -------- helper to read ref header (shared) --------
+    // Open once; after header the file cursor sits at the token stream.
+    // Each arch branch will validate vocab, read tokens, and drive scoring.
+    let ref_file = File::open(&args.ref_path).expect("open ref");
+    let mut ref_in = BufReader::with_capacity(8 * 1024 * 1024, ref_file);
+    let mut magic = [0u8; 8];
+    ref_in.read_exact(&mut magic).expect("read ref magic");
+    if &magic != b"HFKLDR\0\0" {
+        eprintln!("bad ref magic: {magic:?}");
+        std::process::exit(2);
+    }
+    let mut hdr = [0u8; 24];
+    ref_in.read_exact(&mut hdr).expect("read ref header");
+    let version = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
+    let n_ctx = u32::from_le_bytes(hdr[4..8].try_into().unwrap()) as usize;
+    let ref_n_vocab = u32::from_le_bytes(hdr[8..12].try_into().unwrap()) as usize;
+    let n_chunk = u32::from_le_bytes(hdr[12..16].try_into().unwrap()) as usize;
+    let top_k = u16::from_le_bytes(hdr[16..18].try_into().unwrap()) as usize;
+    let _flags = u16::from_le_bytes(hdr[18..20].try_into().unwrap());
+    if version != 1 {
+        eprintln!("unsupported ref version {version}");
+        std::process::exit(2);
+    }
+    let scored_per_chunk = n_ctx - 1 - n_ctx / 2;
+    let effective_n_chunk = match args.max_chunks {
+        Some(m) => m.min(n_chunk),
+        None => n_chunk,
     };
+    if let Some(m) = args.max_chunks {
+        eprintln!(
+            "eval_hipfire: --max-chunks {m} → effective_n_chunk = {effective_n_chunk}/{n_chunk}"
+        );
+    }
+    let total_scored = scored_per_chunk * effective_n_chunk;
+    let per_token_block_bytes = 8 + 8 * top_k;
+    eprintln!(
+        "eval_hipfire: ref n_ctx={n_ctx} n_vocab={ref_n_vocab} n_chunk={n_chunk} top_k={top_k}"
+    );
+    eprintln!(
+        "  scored/chunk={scored_per_chunk}  total_scored={total_scored}  block={per_token_block_bytes}B  arch_id={arch_id}"
+    );
 
+    // Shared output accumulators; arch branches fill them.
+    let mut mean_kld_per_seq: Vec<f64> = Vec::with_capacity(effective_n_chunk);
+    let mut p99_kld_per_seq: Vec<f64> = Vec::with_capacity(effective_n_chunk);
+    let mut mean_nll_per_seq: Vec<f64> = Vec::with_capacity(effective_n_chunk);
+    let mut block_buf = vec![0u8; per_token_block_bytes];
+    let t0 = Instant::now();
+    let mut total_scored_done = 0usize;
     let scoring_start = n_ctx / 2;
-    for c in 0..effective_n_chunk {
-        // KvCache positions are passed explicitly via `pos` (or `start_pos`)
-        // — overwriting from position 0 each chunk is sufficient.
-        dn_state.reset(&mut gpu);
 
-        let chunk_tokens = &tokens[c * n_ctx..(c + 1) * n_ctx];
-        let mut chunk_klds: Vec<f64> = Vec::with_capacity(scored_per_chunk);
-        let mut chunk_nll_sum: f64 = 0.0;
-        let mut chunk_nll_count: usize = 0;
+    // ===== Arch dispatch (mirrors calib_sweep.rs:684ff) =====
+    if is_qwen35 {
+        // ----- qwen35 5|6 — WIRED (preserved byte-identical behavior) -----
+        // Quant dtypes admitted: MQ4G256 (campaign --format mq4), MQ8G256,
+        // HFQ4G256, Q8_0, F32, BF16 (via HIPFIRE_CALIB_BF16 / F32 widen). The
+        // loader (`qwen35::load_weights`) matches quant_type 13->MQ4G256 etc and
+        // respects calib_force_bf16 for teachers.
+        use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
 
-        if args.scoring_mode == "per-token" {
-            // Canonical per-token path: forward_scratch per position; the
-            // scoring window is [scoring_start, n_ctx-2] inclusive.
+        // Auto-route safetensors directories (ParoQuant / AWQ / HF native) — mirrors
+        // daemon.rs:1500-1504. HFQ files take the canonical HFQ path below.
+        let (config, weights) = if args.model.is_dir() {
+            use hipfire_runtime::safetensors_source::SafetensorsSource;
+            let source = SafetensorsSource::open(&args.model).expect("safetensors open");
+            let config = qwen35::config_from_safetensors(&source).expect("config_from_safetensors");
+            eprintln!("  loading via safetensors (ParoQuant path) arch_id={arch_id}");
+            let mut paro_source =
+                qwen35::ParoSource::new(&source, &config).expect("ParoSource::new");
+            let paro_layout = qwen35::Layout::single(config.n_layers);
+            let weights = qwen35::load_weights(
+                &mut paro_source,
+                std::slice::from_mut(&mut gpu),
+                &paro_layout,
+            )
+            .expect("load_weights");
+            (config, weights)
+        } else {
+            let mut hfq = HfqFile::open(&args.model).expect("open model");
+            let config = qwen35::config_from_hfq(&hfq).expect("read config");
+            let weights = {
+                let mut src = qwen35::HfqSource::new(&mut hfq, &config);
+                let layout = qwen35::Layout::single(config.n_layers);
+                qwen35::load_weights(&mut src, std::slice::from_mut(&mut gpu), &layout)
+            }
+            .expect("load weights");
+            (config, weights)
+        };
+        if ref_n_vocab != config.vocab_size {
+            eprintln!(
+                "vocab mismatch: ref says {ref_n_vocab}, model says {}",
+                config.vocab_size
+            );
+            std::process::exit(2);
+        }
+        // Read tokens (n_ctx * n_chunk u32s).
+        let n_tokens = n_ctx * n_chunk;
+        let mut tokens_raw = vec![0u8; n_tokens * 4];
+        ref_in.read_exact(&mut tokens_raw).expect("read ref tokens");
+        let tokens: Vec<u32> = tokens_raw
+            .chunks_exact(4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+
+        // -------- KV cache + DeltaNet state + scratch --------
+        // qwen35 uses forward_prefill_batch with a q8 KV at seq_len+16 (calib_sweep qwen35 arm: seq_len+16, KvCache::new_gpu_q8).
+        let kv_max = n_ctx + 16;
+        let is_kv_layer: Vec<bool> = config
+            .layer_types
+            .iter()
+            .map(|t| *t == qwen35::LayerType::FullAttention)
+            .collect();
+        let mut kv_cache = match args.kv_mode.as_str() {
+            "q8" => KvCache::new_gpu_q8(
+                &mut gpu,
+                config.n_layers,
+                config.n_kv_heads,
+                config.head_dim,
+                kv_max,
+            )
+            .unwrap(),
+            "asym4" => KvCache::new_gpu_asym4(
+                &mut gpu,
+                config.n_layers,
+                config.n_kv_heads,
+                config.head_dim,
+                kv_max,
+            )
+            .unwrap(),
+            "asym3" => KvCache::new_gpu_asym3(
+                &mut gpu,
+                config.n_layers,
+                config.n_kv_heads,
+                config.head_dim,
+                kv_max,
+            )
+            .unwrap(),
+            "asym2" => KvCache::new_gpu_asym2(
+                &mut gpu,
+                config.n_layers,
+                config.n_kv_heads,
+                config.head_dim,
+                kv_max,
+            )
+            .unwrap(),
+            "fwht4" => KvCache::new_gpu_fwht4_filtered(
+                &mut gpu,
+                &is_kv_layer,
+                config.n_kv_heads,
+                config.head_dim,
+                kv_max,
+            )
+            .unwrap(),
+            "fwht3" => KvCache::new_gpu_fwht3_filtered(
+                &mut gpu,
+                &is_kv_layer,
+                config.n_kv_heads,
+                config.head_dim,
+                kv_max,
+            )
+            .unwrap(),
+            "fwht2" => KvCache::new_gpu_fwht2_filtered(
+                &mut gpu,
+                &is_kv_layer,
+                config.n_kv_heads,
+                config.head_dim,
+                kv_max,
+            )
+            .unwrap(),
+            "f32" | "f16" => KvCache::new_gpu(
+                &mut gpu,
+                config.n_layers,
+                config.n_kv_heads,
+                config.head_dim,
+                kv_max,
+            )
+            .unwrap(),
+            other => panic!("unknown --kv-mode: {other}"),
+        };
+        let v_mode = match args.kv_v.as_str() {
+            "q8" => VMode::Q8,
+            "lloyd2" => VMode::Lloyd2,
+            "lloyd3" => VMode::Lloyd3,
+            "lloyd4" => VMode::Lloyd4,
+            other => panic!("unknown --kv-v: {other}"),
+        };
+        if v_mode != VMode::Q8 {
+            kv_cache.set_v_mode_realloc(&mut gpu, v_mode).unwrap();
+        }
+        let scratch = Qwen35Scratch::new(&mut gpu, &config, 64).unwrap();
+        let mut dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
+
+        let hidden_buf = if args.scoring_mode == "prefill" {
+            Some(
+                gpu.alloc_tensor(&[scored_per_chunk, config.dim], DType::F32)
+                    .expect("alloc hidden_buf"),
+            )
+        } else {
+            None
+        };
+
+        // -------- per-chunk loop (preserved byte-identical) --------
+        for c in 0..effective_n_chunk {
+            dn_state.reset(&mut gpu);
+            let chunk_tokens = &tokens[c * n_ctx..(c + 1) * n_ctx];
+            let mut chunk_klds: Vec<f64> = Vec::with_capacity(scored_per_chunk);
+            let mut chunk_nll_sum: f64 = 0.0;
+            let mut chunk_nll_count: usize = 0;
+
+            if args.scoring_mode == "per-token" {
+                for pos in 0..(n_ctx - 1) {
+                    qwen35::forward_scratch(
+                        &mut gpu,
+                        &weights,
+                        &config,
+                        chunk_tokens[pos],
+                        pos,
+                        &mut kv_cache,
+                        &mut dn_state,
+                        &scratch,
+                    )
+                    .expect("forward_scratch");
+                    if pos < scoring_start {
+                        continue;
+                    }
+                    let actual_next = chunk_tokens[pos + 1] as usize;
+                    ref_in.read_exact(&mut block_buf).expect("read ref block");
+                    let cand_logits = gpu.download_f32(&scratch.logits).expect("download logits");
+                    let (kld, nll) = kld_from_block(&cand_logits, &block_buf, top_k, actual_next);
+                    chunk_klds.push(kld);
+                    if let Some(n) = nll {
+                        chunk_nll_sum += n;
+                        chunk_nll_count += 1;
+                    }
+                    total_scored_done += 1;
+                    if total_scored_done % 1024 == 0 || total_scored_done == total_scored {
+                        let pct = total_scored_done as f64 * 100.0 / total_scored as f64;
+                        let elapsed = t0.elapsed().as_secs_f64();
+                        let rate = total_scored_done as f64 / elapsed.max(1e-9);
+                        eprint!(
+                            "\r  chunk {:4}/{}  scored {:8}/{:8}  ({:5.1}%, {:.0} tok/s)   ",
+                            c + 1,
+                            effective_n_chunk,
+                            total_scored_done,
+                            total_scored,
+                            pct,
+                            rate
+                        );
+                    }
+                }
+            } else {
+                // Prefill mode: batch the transformer stack via two
+                // forward_prefill_batch calls (prefix + scored region), then
+                // weight_gemv per scored position on the captured hidden states.
+                let h_buf = hidden_buf.as_ref().expect("hidden_buf in prefill mode");
+                qwen35::forward_prefill_batch(
+                    &mut gpu,
+                    &weights,
+                    &config,
+                    &chunk_tokens[0..scoring_start],
+                    0,
+                    &mut kv_cache,
+                    &mut dn_state,
+                    &scratch,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .expect("forward_prefill_batch prefix");
+                qwen35::forward_prefill_batch(
+                    &mut gpu,
+                    &weights,
+                    &config,
+                    &chunk_tokens[scoring_start..(n_ctx - 1)],
+                    scoring_start,
+                    &mut kv_cache,
+                    &mut dn_state,
+                    &scratch,
+                    None,
+                    Some(h_buf),
+                    None,
+                    None,
+                )
+                .expect("forward_prefill_batch scored");
+
+                let f16_lmhead = weights.output.gpu_dtype == DType::F16;
+                let batched_logits: Option<rdna_compute::GpuTensor> = if f16_lmhead {
+                    let alloc = gpu
+                        .alloc_tensor(&[scored_per_chunk, config.vocab_size], DType::F32)
+                        .expect("alloc batched lm_head logits");
+                    gpu.gemm_f16_batched_lmhead(
+                        &weights.output.buf,
+                        h_buf,
+                        &alloc,
+                        config.vocab_size,
+                        config.dim,
+                        scored_per_chunk,
+                    )
+                    .expect("gemm_f16_batched_lmhead");
+                    Some(alloc)
+                } else {
+                    None
+                };
+
+                for j in 0..scored_per_chunk {
+                    let logits_view = if let Some(ref all_logits) = batched_logits {
+                        all_logits.sub_offset(j * config.vocab_size, config.vocab_size)
+                    } else {
+                        let row_view = h_buf.sub_offset(j * config.dim, config.dim);
+                        let ctx = hipfire_runtime::llama::DispatchCtx::new(&gpu);
+                        let _ = hipfire_runtime::llama::gemv_family()
+                            .run_auto(
+                                &ctx,
+                                &mut gpu,
+                                &weights.output.dispatch_ref(),
+                                &row_view,
+                                &scratch.logits,
+                            )
+                            .expect("gemv lm_head");
+                        scratch.logits.sub_offset(0, config.vocab_size)
+                    };
+                    let pos = scoring_start + j;
+                    let actual_next = chunk_tokens[pos + 1] as usize;
+                    ref_in.read_exact(&mut block_buf).expect("read ref block");
+                    let cand_logits = gpu.download_f32(&logits_view).expect("download logits");
+                    let (kld, nll) = kld_from_block(&cand_logits, &block_buf, top_k, actual_next);
+                    chunk_klds.push(kld);
+                    if let Some(n) = nll {
+                        chunk_nll_sum += n;
+                        chunk_nll_count += 1;
+                    }
+                    total_scored_done += 1;
+                    if total_scored_done % 1024 == 0 || total_scored_done == total_scored {
+                        let pct = total_scored_done as f64 * 100.0 / total_scored as f64;
+                        let elapsed = t0.elapsed().as_secs_f64();
+                        let rate = total_scored_done as f64 / elapsed.max(1e-9);
+                        eprint!(
+                            "\r  chunk {:4}/{}  scored {:8}/{:8}  ({:5.1}%, {:.0} tok/s)   ",
+                            c + 1,
+                            effective_n_chunk,
+                            total_scored_done,
+                            total_scored,
+                            pct,
+                            rate
+                        );
+                    }
+                }
+                if let Some(alloc) = batched_logits {
+                    let _ = gpu.free_tensor(alloc);
+                }
+            }
+
+            if chunk_klds.is_empty() {
+                mean_kld_per_seq.push(0.0);
+                p99_kld_per_seq.push(0.0);
+                mean_nll_per_seq.push(f64::NAN);
+                continue;
+            }
+            let mean: f64 = chunk_klds.iter().copied().sum::<f64>() / chunk_klds.len() as f64;
+            let mut sorted = chunk_klds.clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let p99_idx = ((sorted.len() as f64 * 0.99) as usize).min(sorted.len() - 1);
+            let p99 = sorted[p99_idx];
+            let mean_nll = if chunk_nll_count > 0 {
+                chunk_nll_sum / chunk_nll_count as f64
+            } else {
+                f64::NAN
+            };
+            mean_kld_per_seq.push(mean);
+            p99_kld_per_seq.push(p99);
+            mean_nll_per_seq.push(mean_nll);
+        }
+        // qwen35 owns hidden_buf drop; keep eprintln identity
+        drop(hidden_buf);
+        if let Ok(p) = std::env::var("HIPFIRE_MOE_EXPERT_STATS_OUT") {
+            qwen35::dump_expert_stats(&p);
+        }
+    } else if is_llama {
+        // ----- llama 0|1 — WIRED (mirrors eval_hipfire_llama.rs) -----
+        // Quant dtypes admitted: Q4K, HFQ4G256, HFQ4G128, HFQ6G256, HFQ2/3,
+        // MQ4G256 (campaign mq4), MQ8G256, MQ6G256, etc. plus F32 teacher.
+        // The Llama loader (`hipfire_arch_llama::Llama`) accepts all HFQ quant
+        // types (see hipfire-runtime/src/hfq.rs quant_type match); no hard filter.
+        use hipfire_arch_llama::Llama;
+        use hipfire_runtime::arch::Architecture;
+        use hipfire_runtime::llama;
+
+        if args.model.is_dir() {
+            eprintln!("eval_hipfire: llama dir models not yet wired — use HFQ for arch 0|1");
+            std::process::exit(1);
+        }
+        let mut hfq = HfqFile::open(&args.model).expect("open model");
+        let config = <Llama as Architecture>::config_from_hfq(&hfq).expect("read config");
+        if ref_n_vocab != config.vocab_size {
+            eprintln!(
+                "vocab mismatch: ref says {ref_n_vocab}, model says {}",
+                config.vocab_size
+            );
+            std::process::exit(2);
+        }
+        let n_tokens = n_ctx * n_chunk;
+        let mut tokens_raw = vec![0u8; n_tokens * 4];
+        ref_in.read_exact(&mut tokens_raw).expect("read ref tokens");
+        let tokens: Vec<u32> = tokens_raw
+            .chunks_exact(4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+
+        let kv_max = n_ctx + 16;
+        let mut kv_cache = match args.kv_mode.as_str() {
+            "q8" => KvCache::new_gpu_q8(
+                &mut gpu,
+                config.n_layers,
+                config.n_kv_heads,
+                config.head_dim,
+                kv_max,
+            )
+            .unwrap(),
+            "asym4" => KvCache::new_gpu_asym4(
+                &mut gpu,
+                config.n_layers,
+                config.n_kv_heads,
+                config.head_dim,
+                kv_max,
+            )
+            .unwrap(),
+            "asym3" => KvCache::new_gpu_asym3(
+                &mut gpu,
+                config.n_layers,
+                config.n_kv_heads,
+                config.head_dim,
+                kv_max,
+            )
+            .unwrap(),
+            "asym2" => KvCache::new_gpu_asym2(
+                &mut gpu,
+                config.n_layers,
+                config.n_kv_heads,
+                config.head_dim,
+                kv_max,
+            )
+            .unwrap(),
+            "f32" | "f16" => KvCache::new_gpu(
+                &mut gpu,
+                config.n_layers,
+                config.n_kv_heads,
+                config.head_dim,
+                kv_max,
+            )
+            .unwrap(),
+            other => {
+                eprintln!("llama: --kv-mode {other} not in q8/asym2/3/4/f32");
+                std::process::exit(1);
+            }
+        };
+        let scratch = <Llama as Architecture>::new_state(&mut gpu, &config).unwrap();
+        let weights = <Llama as Architecture>::load_weights(&mut hfq, &config, &mut gpu)
+            .expect("load weights");
+        if args.scoring_mode == "prefill" {
+            eprintln!("eval_hipfire: llama arch prefill not wired — falling back to per-token (prefill hook absent on llama arch, see eval_hipfire_llama.rs)");
+        }
+        for c in 0..effective_n_chunk {
+            let chunk_tokens = &tokens[c * n_ctx..(c + 1) * n_ctx];
+            let mut chunk_klds: Vec<f64> = Vec::with_capacity(scored_per_chunk);
+            let mut chunk_nll_sum: f64 = 0.0;
+            let mut chunk_nll_count: usize = 0;
+            kv_cache.clear_gpu(&mut gpu).expect("kv clear");
             for pos in 0..(n_ctx - 1) {
-                qwen35::forward_scratch(
+                llama::forward_scratch_embed(
                     &mut gpu,
                     &weights,
                     &config,
                     chunk_tokens[pos],
                     pos,
-                    &mut kv_cache,
-                    &mut dn_state,
                     &scratch,
                 )
-                .expect("forward_scratch");
+                .expect("forward_scratch_embed");
+                llama::forward_scratch_compute(
+                    &mut gpu,
+                    &weights,
+                    &config,
+                    pos,
+                    &mut kv_cache,
+                    &scratch,
+                )
+                .expect("forward_scratch_compute");
                 if pos < scoring_start {
                     continue;
                 }
                 let actual_next = chunk_tokens[pos + 1] as usize;
-                let (kld, nll) = score_position(
-                    &mut gpu,
-                    &scratch.logits,
-                    &mut ref_in,
-                    &mut block_buf,
-                    actual_next,
-                );
+                ref_in.read_exact(&mut block_buf).expect("read ref block");
+                let cand_logits = gpu.download_f32(&scratch.logits).expect("download logits");
+                let (kld, nll) = kld_from_block(&cand_logits, &block_buf, top_k, actual_next);
                 chunk_klds.push(kld);
                 if let Some(n) = nll {
                     chunk_nll_sum += n;
@@ -559,165 +841,602 @@ fn main() {
                     );
                 }
             }
-        } else {
-            // Prefill mode: batch the transformer stack via two
-            // forward_prefill_batch calls (prefix + scored region), then
-            // weight_gemv per scored position on the captured hidden states.
-            let h_buf = hidden_buf.as_ref().expect("hidden_buf in prefill mode");
-
-            // 1. Prefix: positions [0, scoring_start), no logit capture.
-            //    Writes KV positions [0, scoring_start).
-            qwen35::forward_prefill_batch(
-                &mut gpu,
-                &weights,
-                &config,
-                &chunk_tokens[0..scoring_start],
-                0,
-                &mut kv_cache,
-                &mut dn_state,
-                &scratch,
-                None,
-                None,
-                None,
-                None,
-            )
-            .expect("forward_prefill_batch prefix");
-
-            // 2. Scored region: tokens [scoring_start, n_ctx-1) at positions
-            //    [scoring_start, n_ctx-2]. Captures post-output-norm hidden
-            //    state per row. The slice length is scored_per_chunk
-            //    (= n_ctx - 1 - n_ctx/2) so h_buf is exactly filled.
-            qwen35::forward_prefill_batch(
-                &mut gpu,
-                &weights,
-                &config,
-                &chunk_tokens[scoring_start..(n_ctx - 1)],
-                scoring_start,
-                &mut kv_cache,
-                &mut dn_state,
-                &scratch,
-                None,
-                Some(h_buf),
-                None,
-                None,
-            )
-            .expect("forward_prefill_batch scored");
-
-            // 3. lm_head fan-out + KLD per scored position.
-            //
-            // F16 fast path: when the lm_head weight is stored as F16 on
-            // GPU (e.g. q8f16 models with a separate F16 lm_head), one
-            // batched `gemm_f16_batched_lmhead` reads the lm_head matrix
-            // ONCE for all `scored_per_chunk` positions instead of
-            // `scored_per_chunk` independent GEMV calls. On gfx11 this
-            // routes through the WMMA `gemm_mw16_residual_wmma` kernel;
-            // on non-gfx11 it falls back to a scalar F32 GEMM. Drops eval
-            // wall-clock for F16 lm_head from ~280 s/chunk to 0.8 s/chunk
-            // measured on gfx1151 (Qwen3.5-0.8B per-token kv-q8).
-            //
-            // Other lm_head dtypes (Q8, MQ4, etc.) keep the per-position
-            // weight_gemv path until a batched variant is wired for each.
-            let f16_lmhead = weights.output.gpu_dtype == DType::F16;
-            let batched_logits: Option<rdna_compute::GpuTensor> = if f16_lmhead {
-                let alloc = gpu
-                    .alloc_tensor(&[scored_per_chunk, config.vocab_size], DType::F32)
-                    .expect("alloc batched lm_head logits");
-                gpu.gemm_f16_batched_lmhead(
-                    &weights.output.buf,
-                    h_buf,
-                    &alloc,
-                    config.vocab_size,
-                    config.dim,
-                    scored_per_chunk,
-                )
-                .expect("gemm_f16_batched_lmhead");
-                Some(alloc)
+            if chunk_klds.is_empty() {
+                mean_kld_per_seq.push(0.0);
+                p99_kld_per_seq.push(0.0);
+                mean_nll_per_seq.push(f64::NAN);
+                continue;
+            }
+            let mean: f64 = chunk_klds.iter().copied().sum::<f64>() / chunk_klds.len() as f64;
+            let mut sorted = chunk_klds.clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let p99_idx = ((sorted.len() as f64 * 0.99) as usize).min(sorted.len() - 1);
+            let p99 = sorted[p99_idx];
+            let mean_nll = if chunk_nll_count > 0 {
+                chunk_nll_sum / chunk_nll_count as f64
             } else {
-                None
+                f64::NAN
             };
+            mean_kld_per_seq.push(mean);
+            p99_kld_per_seq.push(p99);
+            mean_nll_per_seq.push(mean_nll);
+        }
+        // ----- gemma4 13 — WIRED -----
+        // Quant dtypes admitted: MQ4G256 / MG4G256 (campaign mq4, quant_type 13/30 alias),
+        // HFQ4G256, HFQ4G128, HFQ6G256, HFQ2/3, Q4K, MQ8G256, MQ6G256, MQ3G256, MQ2G256,
+        // plus F32/BF16 teachers (BF16 kept as BF16 when HIPFIRE_CALIB_BF16=1 else widened to F32).
+        // See lowered.rs:load_gemma4_weight match (lines 696-736).
+        // KV must be q8 (KvCache::new_gpu_q8): F32 cache fails with "no implementation for KvWriteF32".
+        // Prefill sub-chunks to scratch.max_prefill_batch (128) — mirrors calib_sweep gemma arm.
+        use hipfire_arch_gemma4::lowered as gemma4;
+        if args.model.is_dir() {
+            eprintln!("eval_hipfire: gemma4 dir not yet wired — use HFQ for arch 13");
+            std::process::exit(1);
+        }
+        let mut hfq = HfqFile::open(&args.model).expect("open model");
+        let cfg = gemma4::config_from_hfq(&hfq).unwrap_or_else(|| panic!("gemma4 config missing"));
+        if ref_n_vocab != cfg.vocab_size {
+            eprintln!(
+                "vocab mismatch: ref says {ref_n_vocab}, model says {}",
+                cfg.vocab_size
+            );
+            std::process::exit(2);
+        }
+        let n_tokens = n_ctx * n_chunk;
+        let mut tokens_raw = vec![0u8; n_tokens * 4];
+        ref_in.read_exact(&mut tokens_raw).expect("read ref tokens");
+        let tokens: Vec<u32> = tokens_raw
+            .chunks_exact(4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        let mut weights =
+            gemma4::load_weights(&mut hfq, &cfg, &mut gpu).expect("gemma4 load weights");
+        let kv_max = n_ctx + 16;
+        let scratch = gemma4::Gemma4Scratch::new(&mut gpu, &cfg, 1).expect("gemma scratch");
+        gemma4::init_scratch_constants(&mut gpu, &scratch, cfg.full_head_dim)
+            .expect("gemma init scratch");
+        // Q8 KV — mirrors calib_sweep: gemma sliding+full both q8 (lines 853-854)
+        if args.kv_mode != "q8" {
+            eprintln!("eval_hipfire: gemma4 requires --kv-mode q8 (got {}); F32 cache has no KvWriteF32 kernel — refusing", args.kv_mode);
+            std::process::exit(1);
+        }
+        let mut kv_sliding = KvCache::new_gpu_q8(
+            &mut gpu,
+            cfg.n_layers,
+            cfg.sliding_n_kv_heads,
+            cfg.sliding_head_dim,
+            kv_max,
+        )
+        .expect("gemma sliding kv q8");
+        let mut kv_full = KvCache::new_gpu_q8(
+            &mut gpu,
+            cfg.n_layers,
+            cfg.full_n_kv_heads,
+            cfg.full_head_dim,
+            kv_max,
+        )
+        .expect("gemma full kv q8");
 
-            for j in 0..scored_per_chunk {
-                let logits_view = if let Some(ref all_logits) = batched_logits {
-                    all_logits.sub_offset(j * config.vocab_size, config.vocab_size)
-                } else {
-                    let row_view = h_buf.sub_offset(j * config.dim, config.dim);
-                    let ctx = DispatchCtx::new(&gpu);
-                    let _ = gemv_family()
-                        .run_auto(
-                            &ctx,
-                            &mut gpu,
-                            &weights.output.dispatch_ref(),
-                            &row_view,
-                            &scratch.logits,
-                        )
-                        .expect("gemv lm_head");
-                    scratch.logits.sub_offset(0, config.vocab_size)
-                };
-                let pos = scoring_start + j;
-                let actual_next = chunk_tokens[pos + 1] as usize;
-                let (kld, nll) = score_position(
+        for c in 0..effective_n_chunk {
+            kv_sliding.clear_gpu(&mut gpu).expect("kv sliding clear");
+            kv_full.clear_gpu(&mut gpu).expect("kv full clear");
+            let chunk_tokens = &tokens[c * n_ctx..(c + 1) * n_ctx];
+            let mut chunk_klds: Vec<f64> = Vec::with_capacity(scored_per_chunk);
+            let mut chunk_nll_sum: f64 = 0.0;
+            let mut chunk_nll_count: usize = 0;
+
+            if args.scoring_mode == "prefill" {
+                // Prefill prefix with batched forward chunked to 128 (max_prefill_batch), then per-token for scored window.
+                // This mirrors calib_sweep run_gemma_batched: while offset<chunk.len() { sub = chunk[offset..min(offset+128)]; forward_prefill_batch(..., sub, pos) }
+                let max_b = scratch.max_prefill_batch; // 128
+                let mut offset = 0usize;
+                let mut pos = 0usize;
+                while offset < scoring_start {
+                    let end = (offset + max_b).min(scoring_start);
+                    let sub = &chunk_tokens[offset..end];
+                    gemma4::forward_prefill_batch(
+                        &mut gpu,
+                        &weights,
+                        &cfg,
+                        sub,
+                        pos,
+                        &mut kv_sliding,
+                        &mut kv_full,
+                        &scratch,
+                    )
+                    .expect("gemma prefill prefix");
+                    pos += sub.len();
+                    offset = end;
+                }
+                for pos in scoring_start..(n_ctx - 1) {
+                    gemma4::forward_scratch(
+                        &mut gpu,
+                        &weights,
+                        &cfg,
+                        chunk_tokens[pos],
+                        pos,
+                        &mut kv_sliding,
+                        &mut kv_full,
+                        &scratch,
+                    )
+                    .expect("gemma forward_scratch");
+                    let actual_next = chunk_tokens[pos + 1] as usize;
+                    ref_in.read_exact(&mut block_buf).expect("read ref block");
+                    let cand_logits = gpu.download_f32(&scratch.logits).expect("download logits");
+                    let (kld, nll) = kld_from_block(&cand_logits, &block_buf, top_k, actual_next);
+                    chunk_klds.push(kld);
+                    if let Some(n) = nll {
+                        chunk_nll_sum += n;
+                        chunk_nll_count += 1;
+                    }
+                    total_scored_done += 1;
+                    if total_scored_done % 1024 == 0 || total_scored_done == total_scored {
+                        let pct = total_scored_done as f64 * 100.0 / total_scored as f64;
+                        let elapsed = t0.elapsed().as_secs_f64();
+                        let rate = total_scored_done as f64 / elapsed.max(1e-9);
+                        eprint!(
+                            "\r  chunk {:4}/{}  scored {:8}/{:8}  ({:5.1}%, {:.0} tok/s)   ",
+                            c + 1,
+                            effective_n_chunk,
+                            total_scored_done,
+                            total_scored,
+                            pct,
+                            rate
+                        );
+                    }
+                }
+            } else {
+                for pos in 0..(n_ctx - 1) {
+                    gemma4::forward_scratch(
+                        &mut gpu,
+                        &weights,
+                        &cfg,
+                        chunk_tokens[pos],
+                        pos,
+                        &mut kv_sliding,
+                        &mut kv_full,
+                        &scratch,
+                    )
+                    .expect("gemma forward_scratch");
+                    if pos < scoring_start {
+                        continue;
+                    }
+                    let actual_next = chunk_tokens[pos + 1] as usize;
+                    ref_in.read_exact(&mut block_buf).expect("read ref block");
+                    let cand_logits = gpu.download_f32(&scratch.logits).expect("download logits");
+                    let (kld, nll) = kld_from_block(&cand_logits, &block_buf, top_k, actual_next);
+                    chunk_klds.push(kld);
+                    if let Some(n) = nll {
+                        chunk_nll_sum += n;
+                        chunk_nll_count += 1;
+                    }
+                    total_scored_done += 1;
+                    if total_scored_done % 1024 == 0 || total_scored_done == total_scored {
+                        let pct = total_scored_done as f64 * 100.0 / total_scored as f64;
+                        let elapsed = t0.elapsed().as_secs_f64();
+                        let rate = total_scored_done as f64 / elapsed.max(1e-9);
+                        eprint!(
+                            "\r  chunk {:4}/{}  scored {:8}/{:8}  ({:5.1}%, {:.0} tok/s)   ",
+                            c + 1,
+                            effective_n_chunk,
+                            total_scored_done,
+                            total_scored,
+                            pct,
+                            rate
+                        );
+                    }
+                }
+            }
+            if chunk_klds.is_empty() {
+                mean_kld_per_seq.push(0.0);
+                p99_kld_per_seq.push(0.0);
+                mean_nll_per_seq.push(f64::NAN);
+                continue;
+            }
+            let mean: f64 = chunk_klds.iter().copied().sum::<f64>() / chunk_klds.len() as f64;
+            let mut sorted = chunk_klds.clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let p99_idx = ((sorted.len() as f64 * 0.99) as usize).min(sorted.len() - 1);
+            let p99 = sorted[p99_idx];
+            let mean_nll = if chunk_nll_count > 0 {
+                chunk_nll_sum / chunk_nll_count as f64
+            } else {
+                f64::NAN
+            };
+            mean_kld_per_seq.push(mean);
+            p99_kld_per_seq.push(p99);
+            mean_nll_per_seq.push(mean_nll);
+        }
+        let _ = &weights;
+    } else if is_glimmer {
+        // ----- glimmer 14 — WIRED -----
+        // Quant dtypes admitted: Q8_0 (embed), HFQ4G256/G128, MQ4G256 etc (same family as gemma4/qwen35).
+        // See glimmer.rs load weights quant_type match (3->Q8,6->HFQ4G256 etc).
+        // Prefills via prefill_with_capture, chunk 192 (mirrors calib_sweep glimmer arm: prefill_chunk 192).
+        use hipfire_arch_muse_glimmer::config::GlimmerConfig;
+        use hipfire_arch_muse_glimmer::forward as glimmer_fwd;
+        use hipfire_arch_muse_glimmer::glimmer::{GlimmerState, GlimmerWeights};
+        if args.model.is_dir() {
+            eprintln!("eval_hipfire: glimmer dir not yet wired — use HFQ for arch 14");
+            std::process::exit(1);
+        }
+        let mut hfq = HfqFile::open(&args.model).expect("open model");
+        let cfg = GlimmerConfig::from_hfq(&hfq).expect("glimmer cfg");
+        if ref_n_vocab != cfg.vocab_size {
+            eprintln!(
+                "vocab mismatch: ref says {ref_n_vocab}, model says {}",
+                cfg.vocab_size
+            );
+            std::process::exit(2);
+        }
+        let n_tokens = n_ctx * n_chunk;
+        let mut tokens_raw = vec![0u8; n_tokens * 4];
+        ref_in.read_exact(&mut tokens_raw).expect("read ref tokens");
+        let tokens: Vec<u32> = tokens_raw
+            .chunks_exact(4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        let weights = GlimmerWeights::load(&hfq, &cfg, &mut gpu).expect("glimmer weights");
+        let kv_max = n_ctx + 16;
+        let mut state =
+            GlimmerState::new_with_max_seq(&mut gpu, &cfg, kv_max).expect("glimmer state");
+        // chunk size 192 — mirrors calib_sweep glimmer_prefill_chunk_size (192)
+        let glimmer_chunk: usize = 192;
+
+        for c in 0..effective_n_chunk {
+            state.reset();
+            // For scoring_start prefix, use batched prefill chunked to 192 to mirror calib_sweep
+            // Note: GlimmerState reset clears n_tokens but KV buffers remain; next prefill overwrites from 0.
+            let chunk_tokens = &tokens[c * n_ctx..(c + 1) * n_ctx];
+            let mut chunk_klds: Vec<f64> = Vec::with_capacity(scored_per_chunk);
+            let mut chunk_nll_sum: f64 = 0.0;
+            let mut chunk_nll_count: usize = 0;
+
+            if args.scoring_mode == "prefill" {
+                // Prefill prefix chunked 192 (mirrors calib_sweep glimmer_prefill_chunk_size 192)
+                let mut pos = 0usize;
+                while pos < scoring_start {
+                    let end = (pos + glimmer_chunk).min(scoring_start);
+                    let sub = &chunk_tokens[pos..end];
+                    glimmer_fwd::prefill_with_capture(
+                        &cfg,
+                        &weights,
+                        &mut state,
+                        &mut gpu,
+                        sub,
+                        pos as u32,
+                        &[],
+                        &mut Vec::new(),
+                    )
+                    .expect("glimmer prefill prefix");
+                    pos = end;
+                }
+                // Batched scored window: one 52-layer batched forward capturing hidden states,
+                // mirroring qwen35's prefill shape (prefix batched, scored batched capturing, then
+                // per-position lm_head on captured states).
+                //
+                // capture_layers = [cfg.n_layers - 1] i.e. [51] (0-based). Rationale:
+                //   - `prefill_chunk_batched` (forward.rs:3738-3755) captures post-layer residuals
+                //     `x` after each decoder layer (sandwich post-norm + residual already applied).
+                //     See doc at forward.rs:1159-1164 "post-layer residual `x`".
+                //   - `decode_step_body` (forward.rs:462-504) runs 52 layers (0..51), then
+                //     `rmsnorm_f32(&state.x, &weights.final_norm, &state.tmp, eps=1e-5)` ->
+                //     `weight_gemv(&state.tmp, lm_head)` -> scale -> softcap.
+                //     The tensor lm_head consumes is the FINAL-NORMED hidden (tmp), NOT the
+                //     raw residual. No capture tap can directly yield post-final-norm because
+                //     final norm lives outside the layer loop (forward.rs:485-487).
+                //   - Therefore we capture the last layer's post-residual (layer 51) which
+                //     is `state.x` before final norm, then run `rmsnorm_batched` over the
+                //     captured buffer so the lm_head sees exactly the same input as decode_step.
+                //     Capturing 51 is correct because cfg.n_layers==52 (config.rs:27).
+                //
+                // hidden_out layout (forward.rs:3890-3893, 2836-2852, 2647-2659):
+                //   Host Host path: `cap_buf` sized `b*cap_cnt*dim` then `hidden_out.extend_from_slice`.
+                //   For cap_cnt=1, total `B*dim` floats, position-major row-major `[B, dim]`.
+                //   Row j at offset j*dim corresponds to scored position pos=scoring_start+j
+                //   predicting token chunk_tokens[pos+1] — identical to per-token `actual_next`
+                //   alignment. Verified via prefill_chunk_batched download loops (x is [B*dim]).
+                let scored_slice = &chunk_tokens[scoring_start..(n_ctx - 1)];
+                let scored_len = scored_slice.len(); // == scored_per_chunk
+                assert_eq!(scored_len, scored_per_chunk);
+                let cap_layer = cfg.n_layers - 1;
+                let mut hidden_host: Vec<f32> = Vec::with_capacity(scored_len * cfg.dim);
+                glimmer_fwd::prefill_with_capture(
+                    &cfg,
+                    &weights,
+                    &mut state,
                     &mut gpu,
-                    &logits_view,
-                    &mut ref_in,
-                    &mut block_buf,
-                    actual_next,
+                    scored_slice,
+                    scoring_start as u32,
+                    &[cap_layer],
+                    &mut hidden_host,
+                )
+                .expect("glimmer prefill scored capture");
+                assert_eq!(
+                    hidden_host.len(),
+                    scored_len * cfg.dim,
+                    "hidden_out layout: B*dim"
                 );
-                chunk_klds.push(kld);
-                if let Some(n) = nll {
-                    chunk_nll_sum += n;
-                    chunk_nll_count += 1;
+                // Move captured pre-norm hidden to GPU for batched final norm.
+                // Upload as flat [B*dim] F32, then rmsnorm_batched -> normed.
+                let hidden_gpu = gpu
+                    .upload_f32(&hidden_host, &[scored_len * cfg.dim])
+                    .expect("upload hidden");
+                let normed_gpu = gpu
+                    .alloc_tensor(&[scored_len * cfg.dim], rdna_compute::DType::F32)
+                    .expect("alloc normed");
+                gpu.rmsnorm_batched(
+                    &hidden_gpu,
+                    &weights.final_norm,
+                    &normed_gpu,
+                    scored_len,
+                    cfg.dim,
+                    cfg.rms_norm_eps,
+                )
+                .expect("rmsnorm_batched scored");
+                // Per-position lm_head on the final-normed hidden. Glimmer's lm_head is
+                // typically HFQ4/MQ4 (not F16), so `gemm_f16_batched_lmhead` is absent
+                // (qwen uses it only when weights.output.gpu_dtype==F16). Use the
+                // cheap per-row weight_gemv fallback that qwen also uses for non-F16
+                // — one GEMV per scored token is negligible vs the 52-layer forward
+                // that we already collapsed from 1024 passes to one batched pass.
+                let logits_gpu = gpu
+                    .alloc_tensor(&[cfg.vocab_size], rdna_compute::DType::F32)
+                    .expect("alloc logits");
+                for j in 0..scored_len {
+                    let pos = scoring_start + j;
+                    let row = normed_gpu.sub_offset(j * cfg.dim, cfg.dim);
+                    hipfire_runtime::llama::weight_gemv(
+                        &mut gpu,
+                        &weights.lm_head,
+                        &row,
+                        &logits_gpu,
+                    )
+                    .expect("glimmer lm_head");
+                    if cfg.output_multiplier != 1.0 {
+                        gpu.scale_f32(&logits_gpu, cfg.output_multiplier)
+                            .expect("scale");
+                    }
+                    if cfg.final_logit_softcapping > 0.0 {
+                        gpu.logit_softcap_f32(
+                            &logits_gpu,
+                            cfg.vocab_size,
+                            cfg.final_logit_softcapping,
+                        )
+                        .expect("softcap");
+                    }
+                    let logits = gpu.download_f32(&logits_gpu).expect("download logits");
+                    let actual_next = chunk_tokens[pos + 1] as usize;
+                    ref_in.read_exact(&mut block_buf).expect("read ref block");
+                    let (kld, nll) = kld_from_block(&logits, &block_buf, top_k, actual_next);
+                    chunk_klds.push(kld);
+                    if let Some(n) = nll {
+                        chunk_nll_sum += n;
+                        chunk_nll_count += 1;
+                    }
+                    total_scored_done += 1;
+                    if total_scored_done % 1024 == 0 || total_scored_done == total_scored {
+                        let pct = total_scored_done as f64 * 100.0 / total_scored as f64;
+                        let elapsed = t0.elapsed().as_secs_f64();
+                        let rate = total_scored_done as f64 / elapsed.max(1e-9);
+                        eprint!(
+                            "\r  chunk {:4}/{}  scored {:8}/{:8}  ({:5.1}%, {:.0} tok/s)   ",
+                            c + 1,
+                            effective_n_chunk,
+                            total_scored_done,
+                            total_scored,
+                            pct,
+                            rate
+                        );
+                    }
                 }
-                total_scored_done += 1;
-                if total_scored_done % 1024 == 0 || total_scored_done == total_scored {
-                    let pct = total_scored_done as f64 * 100.0 / total_scored as f64;
-                    let elapsed = t0.elapsed().as_secs_f64();
-                    let rate = total_scored_done as f64 / elapsed.max(1e-9);
-                    eprint!(
-                        "\r  chunk {:4}/{}  scored {:8}/{:8}  ({:5.1}%, {:.0} tok/s)   ",
-                        c + 1,
-                        effective_n_chunk,
-                        total_scored_done,
-                        total_scored,
-                        pct,
-                        rate
-                    );
+                let _ = gpu.free_tensor(hidden_gpu);
+                let _ = gpu.free_tensor(normed_gpu);
+                let _ = gpu.free_tensor(logits_gpu);
+            } else {
+                for pos in 0..(n_ctx - 1) {
+                    let logits = glimmer_fwd::decode_step(
+                        &cfg,
+                        &weights,
+                        &mut state,
+                        &mut gpu,
+                        chunk_tokens[pos],
+                        pos as u32,
+                    )
+                    .expect("glimmer decode");
+                    if pos < scoring_start {
+                        continue;
+                    }
+                    let actual_next = chunk_tokens[pos + 1] as usize;
+                    ref_in.read_exact(&mut block_buf).expect("read ref block");
+                    let (kld, nll) = kld_from_block(&logits, &block_buf, top_k, actual_next);
+                    chunk_klds.push(kld);
+                    if let Some(n) = nll {
+                        chunk_nll_sum += n;
+                        chunk_nll_count += 1;
+                    }
+                    total_scored_done += 1;
+                    if total_scored_done % 1024 == 0 || total_scored_done == total_scored {
+                        let pct = total_scored_done as f64 * 100.0 / total_scored as f64;
+                        let elapsed = t0.elapsed().as_secs_f64();
+                        let rate = total_scored_done as f64 / elapsed.max(1e-9);
+                        eprint!(
+                            "\r  chunk {:4}/{}  scored {:8}/{:8}  ({:5.1}%, {:.0} tok/s)   ",
+                            c + 1,
+                            effective_n_chunk,
+                            total_scored_done,
+                            total_scored,
+                            pct,
+                            rate
+                        );
+                    }
+                }
+            }
+            if chunk_klds.is_empty() {
+                mean_kld_per_seq.push(0.0);
+                p99_kld_per_seq.push(0.0);
+                mean_nll_per_seq.push(f64::NAN);
+                continue;
+            }
+            let mean: f64 = chunk_klds.iter().copied().sum::<f64>() / chunk_klds.len() as f64;
+            let mut sorted = chunk_klds.clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let p99_idx = ((sorted.len() as f64 * 0.99) as usize).min(sorted.len() - 1);
+            let p99 = sorted[p99_idx];
+            let mean_nll = if chunk_nll_count > 0 {
+                chunk_nll_sum / chunk_nll_count as f64
+            } else {
+                f64::NAN
+            };
+            mean_kld_per_seq.push(mean);
+            p99_kld_per_seq.push(p99);
+            mean_nll_per_seq.push(mean_nll);
+        }
+        let _ = &weights;
+    } else if is_lfm {
+        // ----- lfm2 11 — WIRED (dense 1.2b/350m, num_experts==0) -----
+        // Quant dtypes admitted: dense projections Q8_0/HFQ4G256/MQ4G256 (batch_weight_formats_supported);
+        // embeddings Q8/HFQ4; lm_head Q8/HFQ4/MQ4/HFQ6/MQ6/MQ3 (+F32/BF16 teachers).
+        // See lfm2moe/src/lfm2moe.rs batch_weight_formats_supported and forward_batch::batched_proj.
+        // Uses forward_decode_batch_lfm with explicit positions; KV is q8 and only some layers carry KV
+        // (KvCache q8 filtered on is_kv_layer, lane_capacity = n_ctx+16).
+        use hipfire_arch_lfm2moe::batch::Lfm2DecodeBatchState;
+        use hipfire_arch_lfm2moe::config::Lfm2MoeConfig;
+        use hipfire_arch_lfm2moe::forward_batch;
+        use hipfire_arch_lfm2moe::lfm2moe::Lfm2MoeWeights;
+        if args.model.is_dir() {
+            eprintln!("eval_hipfire: lfm2 dir not yet wired — use HFQ for arch 11");
+            std::process::exit(1);
+        }
+        let mut hfq = HfqFile::open(&args.model).expect("open model");
+        let cfg = Lfm2MoeConfig::from_hfq(&hfq).unwrap_or_else(|e| panic!("lfm2 cfg: {e}"));
+        if cfg.num_experts != 0 {
+            eprintln!(
+                "lfm2 MoE (num_experts={}) not admitted for eval_hipfire dense lane",
+                cfg.num_experts
+            );
+            std::process::exit(1);
+        }
+        if ref_n_vocab != cfg.vocab_size {
+            eprintln!(
+                "vocab mismatch: ref says {ref_n_vocab}, model says {}",
+                cfg.vocab_size
+            );
+            std::process::exit(2);
+        }
+        if let Err(e) = forward_batch::batch_weight_formats_supported(
+            &Lfm2MoeWeights::load(&mut hfq, &cfg, &mut gpu)
+                .as_ref()
+                .map(|w| w as &Lfm2MoeWeights)
+                .unwrap_or_else(|_| panic!("peek")),
+        ) {
+            // placeholder: actual check after load below; keep compile shape
+            let _ = e;
+        }
+        // Reload after peek above — we need weights for real
+        let mut hfq2 = HfqFile::open(&args.model).expect("reopen model");
+        let weights = Lfm2MoeWeights::load(&mut hfq2, &cfg, &mut gpu).expect("lfm2 weights");
+        if let Err(e) = forward_batch::batch_weight_formats_supported(&weights) {
+            eprintln!("unsupported lfm2 weight formats for batched decode: {e}");
+            std::process::exit(2);
+        }
+        let n_tokens = n_ctx * n_chunk;
+        let mut tokens_raw = vec![0u8; n_tokens * 4];
+        ref_in.read_exact(&mut tokens_raw).expect("read ref tokens");
+        let tokens: Vec<u32> = tokens_raw
+            .chunks_exact(4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        let kv_max = n_ctx + 16;
+        let max_batch = n_ctx;
+        let mut state = Lfm2DecodeBatchState::new(&mut gpu, &cfg, max_batch, kv_max, 32)
+            .expect("lfm batch state");
+
+        for c in 0..effective_n_chunk {
+            state.reset(&mut gpu).expect("lfm reset");
+            let chunk_tokens = &tokens[c * n_ctx..(c + 1) * n_ctx];
+            let mut chunk_klds: Vec<f64> = Vec::with_capacity(scored_per_chunk);
+            let mut chunk_nll_sum: f64 = 0.0;
+            let mut chunk_nll_count: usize = 0;
+
+            // LFM2 scoring: batched decode for the entire chunk (positions 0..n_ctx-1)
+            // then score each scored position's logits from state.logits.
+            // This matches calib_sweep's lfm arm: forward_decode_batch_lfm with per-chunk positions.
+            if args.scoring_mode == "prefill" || args.scoring_mode == "per-token" {
+                let positions: Vec<usize> = (0..chunk_tokens.len()).collect();
+                forward_batch::forward_decode_batch_lfm(
+                    &mut gpu,
+                    &weights,
+                    &cfg,
+                    chunk_tokens,
+                    &positions,
+                    &mut state,
+                )
+                .expect("lfm forward batch");
+                // state.logits holds [max_batch * vocab] batched; lane i logits at offset i*vocab
+                let all_logits = gpu
+                    .download_f32(&state.logits)
+                    .expect("download lfm logits");
+                for pos in scoring_start..(n_ctx - 1) {
+                    let actual_next = chunk_tokens[pos + 1] as usize;
+                    ref_in.read_exact(&mut block_buf).expect("read ref block");
+                    let lane_logits = &all_logits[pos * cfg.vocab_size..(pos + 1) * cfg.vocab_size];
+                    let (kld, nll) = kld_from_block(lane_logits, &block_buf, top_k, actual_next);
+                    chunk_klds.push(kld);
+                    if let Some(n) = nll {
+                        chunk_nll_sum += n;
+                        chunk_nll_count += 1;
+                    }
+                    total_scored_done += 1;
+                    if total_scored_done % 1024 == 0 || total_scored_done == total_scored {
+                        let pct = total_scored_done as f64 * 100.0 / total_scored as f64;
+                        let elapsed = t0.elapsed().as_secs_f64();
+                        let rate = total_scored_done as f64 / elapsed.max(1e-9);
+                        eprint!(
+                            "\r  chunk {:4}/{}  scored {:8}/{:8}  ({:5.1}%, {:.0} tok/s)   ",
+                            c + 1,
+                            effective_n_chunk,
+                            total_scored_done,
+                            total_scored,
+                            pct,
+                            rate
+                        );
+                    }
                 }
             }
 
-            if let Some(alloc) = batched_logits {
-                let _ = gpu.free_tensor(alloc);
+            if chunk_klds.is_empty() {
+                mean_kld_per_seq.push(0.0);
+                p99_kld_per_seq.push(0.0);
+                mean_nll_per_seq.push(f64::NAN);
+                continue;
             }
+            let mean: f64 = chunk_klds.iter().copied().sum::<f64>() / chunk_klds.len() as f64;
+            let mut sorted = chunk_klds.clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let p99_idx = ((sorted.len() as f64 * 0.99) as usize).min(sorted.len() - 1);
+            let p99 = sorted[p99_idx];
+            let mean_nll = if chunk_nll_count > 0 {
+                chunk_nll_sum / chunk_nll_count as f64
+            } else {
+                f64::NAN
+            };
+            mean_kld_per_seq.push(mean);
+            p99_kld_per_seq.push(p99);
+            mean_nll_per_seq.push(mean_nll);
         }
-
-        // Per-chunk aggregates
-        if chunk_klds.is_empty() {
-            mean_kld_per_seq.push(0.0);
-            p99_kld_per_seq.push(0.0);
-            mean_nll_per_seq.push(f64::NAN);
-            continue;
-        }
-        let mean: f64 = chunk_klds.iter().copied().sum::<f64>() / chunk_klds.len() as f64;
-        let mut sorted = chunk_klds.clone();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let p99_idx = ((sorted.len() as f64 * 0.99) as usize).min(sorted.len() - 1);
-        let p99 = sorted[p99_idx];
-        let mean_nll = if chunk_nll_count > 0 {
-            chunk_nll_sum / chunk_nll_count as f64
-        } else {
-            f64::NAN
-        };
-        mean_kld_per_seq.push(mean);
-        p99_kld_per_seq.push(p99);
-        mean_nll_per_seq.push(mean_nll);
+        let _ = &weights;
     }
+
     eprintln!();
     eprintln!(
-        "eval_hipfire: scored {total_scored_done} tokens in {:.1}s ({:.0} tok/s)",
+        "eval_hipfire: scored {total_scored_done} tokens in {:.1}s ({:.0} tok/s) arch_id={arch_id}",
         t0.elapsed().as_secs_f64(),
         total_scored_done as f64 / t0.elapsed().as_secs_f64().max(1e-9),
     );
 
     // -------- write HFKSEQ output (v2: adds mean_nll per chunk) --------
+    // Arch-independent: same HFKSEQ writer for all arches, so numbers are comparable.
     if let Some(parent) = args.output.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent).expect("create output parent dir");
@@ -726,10 +1445,10 @@ fn main() {
     let out_file = File::create(&args.output).expect("create output");
     let mut out = BufWriter::new(out_file);
     out.write_all(b"HFKSEQ\0\0").unwrap();
-    out.write_all(&2u32.to_le_bytes()).unwrap(); // version = 2
+    out.write_all(&2u32.to_le_bytes()).unwrap();
     out.write_all(&(effective_n_chunk as u32).to_le_bytes())
-        .unwrap(); // n_chunk (post --max-chunks)
-    out.write_all(&0u32.to_le_bytes()).unwrap(); // reserved
+        .unwrap();
+    out.write_all(&0u32.to_le_bytes()).unwrap();
     for ((m, p), n) in mean_kld_per_seq
         .iter()
         .zip(p99_kld_per_seq.iter())
@@ -755,12 +1474,14 @@ fn main() {
     };
     let overall_ppl = overall_nll.exp();
     eprintln!(
-        "eval_hipfire: slice-mean KLD = {:.6}  mean NLL = {:.6}  PPL = {:.4}",
+        "eval_hipfire: slice-mean KLD = {:.6}  mean NLL = {:.6}  PPL = {:.4} arch_id={arch_id}",
         overall_mean, overall_nll, overall_ppl
     );
     eprintln!("eval_hipfire: wrote {}", args.output.display());
-    if let Ok(p) = std::env::var("HIPFIRE_MOE_EXPERT_STATS_OUT") {
-        qwen35::dump_expert_stats(&p);
+    if is_qwen35 {
+        if let Ok(p) = std::env::var("HIPFIRE_MOE_EXPERT_STATS_OUT") {
+            hipfire_arch_qwen35::qwen35::dump_expert_stats(&p);
+        }
     }
 }
 

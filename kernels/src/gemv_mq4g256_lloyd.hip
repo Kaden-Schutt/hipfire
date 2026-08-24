@@ -6,9 +6,20 @@
 //                     high nibble = idx[2i+1]), same nibble layout as uniform MQ4.
 //
 // Per-thread work: 8 weights / thread × 32 threads = 256 weights / block.
-// Reconstruction is `cb[q]` — register-resident 16-entry codebook lookup.
+// Reconstruction is `cb[q]` via LDS-indexed lookup (branchless).
 // This is the slow generic chip variant; LDS-codebook fast path mirrors
 // gemv_mq3g256_lloyd.gfx1100.hip.
+//
+// Branchless codebook lookup (gfx1201 lesson, 2026-08):
+// The old 15-deep `?:` chain (CB_LOOKUP4) does NOT lower to cmov/jump-table on
+// gfx1201 — hipcc emits divergent control flow (measured 114 s_cbranch_execz +
+// 105 v_cmpx_lt_i32, ~133 us at m=4096 k=5120). Stage each group's 16 fp16
+// entries into a 16-slot __shared__ float table and index with ds_load_b32.
+// Codebook is PER-GROUP data (unlike MQ4-GL's tensor-global CB), so staging
+// sits inside the K loop. Block is one wave32; one __syncthreads after the
+// cooperative write is required for cross-lane LDS visibility before indexed
+// reads (same pattern as the gfx1100 sibling's TAIL_LOAD_AND_DOT). Measured
+// ~48 us after the fix; double-barrier and no-barrier variants were not faster.
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
@@ -28,29 +39,28 @@ extern "C" __global__ void gemv_mq4g256_lloyd(
     const char* row_ptr = A + (long long)row * groups_per_row * 160;
     const int boff = tid * 4;
 
+    // Fixed 16-slot LDS table. Block is [32,1,1] = one wave; 64 B is trivial.
+    // Prefer fixed over extern __shared__ so the launch wrapper stays sharedMem=0.
+    __shared__ float cbt[16];
+
     float acc = 0.0f;
 
     for (int g = 0; g < groups_per_row; g++) {
         const char* gptr = row_ptr + g * 160;
 
-        // Load 16 fp16 codebook entries → 16 floats (register resident).
-        const __half* cb_h = reinterpret_cast<const __half*>(gptr);
-        float cb0  = __half2float(cb_h[0]);
-        float cb1  = __half2float(cb_h[1]);
-        float cb2  = __half2float(cb_h[2]);
-        float cb3  = __half2float(cb_h[3]);
-        float cb4  = __half2float(cb_h[4]);
-        float cb5  = __half2float(cb_h[5]);
-        float cb6  = __half2float(cb_h[6]);
-        float cb7  = __half2float(cb_h[7]);
-        float cb8  = __half2float(cb_h[8]);
-        float cb9  = __half2float(cb_h[9]);
-        float cb10 = __half2float(cb_h[10]);
-        float cb11 = __half2float(cb_h[11]);
-        float cb12 = __half2float(cb_h[12]);
-        float cb13 = __half2float(cb_h[13]);
-        float cb14 = __half2float(cb_h[14]);
-        float cb15 = __half2float(cb_h[15]);
+        // Stage this group's 16 fp16 codebook entries into LDS (f32).
+        // Lanes 0..15 each write one entry; all 32 lanes index afterward.
+        if (tid < 16) {
+            cbt[tid] = __half2float(((const __half*)gptr)[tid]);
+        }
+        // Cross-lane LDS RAW: writers are a subset of the wave; readers are all
+        // lanes with data-dependent addresses. Wave lockstep does NOT make the
+        // ds_store visible to other lanes — need a barrier (or at least an
+        // lgkmcnt wait + wave sync). __syncthreads is the portable form; on a
+        // single-wave block it is cheap (no multi-wave rendezvous). The next
+        // iteration's write is also gated by this barrier at the top of that
+        // iteration, so a trailing barrier is unnecessary.
+        __syncthreads();
 
         const unsigned char* data = (const unsigned char*)(gptr + 32);
 
@@ -72,26 +82,16 @@ extern "C" __global__ void gemv_mq4g256_lloyd(
 
         int base_idx = g * 256 + tid * 8;
 
-        // 16-entry codebook lookup as a binary chain. Compiler folds to
-        // either a sequence of conditional moves or a small jump table on
-        // RDNA3; either way the lookup stays register-resident.
-        #define CB_LOOKUP4(q) (                                                          \
-            (q) ==  0 ? cb0  : (q) ==  1 ? cb1  : (q) ==  2 ? cb2  : (q) ==  3 ? cb3  :  \
-            (q) ==  4 ? cb4  : (q) ==  5 ? cb5  : (q) ==  6 ? cb6  : (q) ==  7 ? cb7  :  \
-            (q) ==  8 ? cb8  : (q) ==  9 ? cb9  : (q) == 10 ? cb10 : (q) == 11 ? cb11 :  \
-            (q) == 12 ? cb12 : (q) == 13 ? cb13 : (q) == 14 ? cb14 : cb15                \
-        )
-
-        acc += CB_LOOKUP4(q0) * x[base_idx]
-             + CB_LOOKUP4(q1) * x[base_idx + 1]
-             + CB_LOOKUP4(q2) * x[base_idx + 2]
-             + CB_LOOKUP4(q3) * x[base_idx + 3]
-             + CB_LOOKUP4(q4) * x[base_idx + 4]
-             + CB_LOOKUP4(q5) * x[base_idx + 5]
-             + CB_LOOKUP4(q6) * x[base_idx + 6]
-             + CB_LOOKUP4(q7) * x[base_idx + 7];
-
-        #undef CB_LOOKUP4
+        // BRANCHLESS 16-entry lookup via LDS (ds_load_b32). Same reconstruction
+        // as before: w = cb[q]. Semantics unchanged; only the select mechanism.
+        acc += cbt[q0] * x[base_idx]
+             + cbt[q1] * x[base_idx + 1]
+             + cbt[q2] * x[base_idx + 2]
+             + cbt[q3] * x[base_idx + 3]
+             + cbt[q4] * x[base_idx + 4]
+             + cbt[q5] * x[base_idx + 5]
+             + cbt[q6] * x[base_idx + 6]
+             + cbt[q7] * x[base_idx + 7];
     }
 
     for (int offset = 16; offset > 0; offset >>= 1)

@@ -115,6 +115,41 @@ foreach ($arch in $Archs) {
             }
         }
 
+        # RDNA3 (gfx11) lacks dot1-insts: every sdot4/dp4a kernel cannot build.
+        if ($archFamily -eq "gfx11" -and ($name -eq "gemv_mq8g256" -or $name -match '_dp4a$')) {
+            Write-Host "  - $name SKIP (dot1-insts unavailable on $arch)"
+            continue
+        }
+
+        # fwht3 hd512 KV/attention kernels reference fwht/turbo *_512 helpers
+        # that do not exist in turbo_common.h yet (upstream TODO). Other
+        # _hd512 kernels (e.g. asym_k_givens3) build fine and stay.
+        if ($name -match '^(attention_flash_fwht3_tile|kv_cache_write_fwht3)_hd512') {
+            Write-Host "  - $name SKIP (missing _512 helpers in turbo_common.h)"
+            continue
+        }
+
+        # Temporal-buffer GEMVs are opt-in routes assembled by the JIT with
+        # CACHE_ELIGIBLE/OPT_IN defines; without them the source cannot link
+        # against ordinary pointer loads. Not part of the default dispatch.
+        if ($name -eq "gemv_mfp4g32_e8_soa_u4_buffer") {
+            Write-Host "  - $name SKIP (opt-in buffer route; JIT-only)"
+            continue
+        }
+
+        # Skip sources whose name pins them to a different chip
+        # (e.g. *_gfx1151, *_gfx906_*, *_gfx12_*) unless the embedded arch is
+        # this arch or its family (gfx11_dgpu style variants stay).
+        if ($name -match '[._]gfx(\d+)') {
+            $pinned = $Matches[1]
+            $archNum = $arch -replace '^gfx', ''
+            $famNum = $archFamily -replace '^gfx', ''
+            if ($pinned -ne $archNum -and $pinned -ne $famNum) {
+                Write-Host "  - $name SKIP (pinned to gfx$pinned)"
+                continue
+            }
+        }
+
         # Variant precedence
         $chipVariant   = Join-Path $SrcDir "$name.$arch.hip"
         $familyVariant = Join-Path $SrcDir "$name.$archFamily.hip"
@@ -130,13 +165,34 @@ foreach ($arch in $Archs) {
         $outPath = Join-Path $outDir "$name.hsaco"
         $Total++
 
+        # Emulate the JIT's source assembly (crates/rdna-compute/src/kernels.rs
+        # concat!): HFQ4 sources reference the HIPFIRE_WEIGHT_* macros that
+        # gfx12_weight_cache_policy.inc provides, and kernels.rs prepends that
+        # preamble ahead of them. The standalone script must do the same or the
+        # compile fails with undeclared identifiers even though the source is
+        # valid. Only prepend when the file uses the macros but does not define
+        # its own (avoids macro-redefinition in self-contained files).
+        $compilePath = $srcPath
+        $srcText = [System.IO.File]::ReadAllText($srcPath)
+        if (($srcText -match 'HIPFIRE_WEIGHT_(LOAD|RSRC)' -or
+             $srcText -match 'HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS') -and
+            ($srcText -notmatch '#define HIPFIRE_WEIGHT_') -and
+            ($srcText -notmatch 'weight_cache_policy\.inc')) {
+            $incPath = Join-Path $SrcDir "gfx12_weight_cache_policy.inc"
+            if (Test-Path $incPath) {
+                $combined = [System.IO.File]::ReadAllText($incPath) + "`n" + $srcText
+                $compilePath = Join-Path $SrcDir "_concat_$base"
+                [System.IO.File]::WriteAllText($compilePath, $combined)
+            }
+        }
+
         $args = @(
             "--genco",
             "--offload-arch=$arch",
             "-O3",
             "-I", "`"$SrcDir`"",
             "-o", "`"$outPath`"",
-            "`"$srcPath`""
+            "`"$compilePath`""
         )
 
         # On Windows hipcc is typically a .bat; invoke via cmd /c so PowerShell
@@ -165,6 +221,10 @@ foreach ($arch in $Archs) {
                 if ($errText) { Write-Host "    $($errText.Trim())" -ForegroundColor DarkGray }
                 Remove-Item -Path "$outPath.err" -Force -ErrorAction SilentlyContinue
             }
+        }
+
+        if ($compilePath -ne $srcPath) {
+            Remove-Item -Path $compilePath -Force -ErrorAction SilentlyContinue
         }
     }
 }

@@ -572,7 +572,6 @@ def remote_launch_spec(manifest, route, campaign_root, args):
         environment.update(
             HIPFIRE_QWEN_MTP="1",
             HIPFIRE_MTP_SAMPLED="1",
-            HIPFIRE_MTP_PREFIX_CACHE="1",
         )
     serve_argv = [
         f"{remote_root}/bin/hipfire",

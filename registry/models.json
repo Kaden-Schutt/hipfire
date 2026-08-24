@@ -1140,9 +1140,28 @@
       "sha256": "6fc0988e51689abf24c2e43d5b1f44794be3409484f99a115d36484ea0e23d2d",
       "min_vram_gb": 26,
       "desc": "DFlash draft for muse-glimmer (muse_glimmer_assistant, arch 23) — 5-layer block-diffusion head that reuses the target's embed and lm_head. Pairs with either SKU. Attach with HIPFIRE_DFLASH_DRAFT; there is no filename auto-pairing."
+    },
+    "bonsai:27b-bq1": {
+      "repo": "hipfire-models/bonsai-27b",
+      "file": "bonsai-27b.bq1",
+      "size_gb": 3.8,
+      "min_vram_gb": 5,
+      "default_kv_mode": "q8",
+      "desc": "Bonsai-27B 1-bit (Prism ML, BQ1G128 1.14 bpw). Smallest usable 27B: 3.8 GB, native MQ4-teacher KLD 0.621 with f32 KV over the 8-chunk fixture, ~28.2 tok/s decode and ~285 tok/s prefill on gfx1151 (medians of 3, after warmup). Apache-2.0; see the repo NOTICE for attribution and the list of conversion changes.",
+      "quant_recipe": "prismml-bonsai-q1_0-passthrough"
+    },
+    "bonsai:27b-tq2": {
+      "repo": "hipfire-models/bonsai-27b",
+      "file": "bonsai-27b.tq2",
+      "size_gb": 7.16,
+      "min_vram_gb": 8,
+      "default_kv_mode": "q8",
+      "desc": "Bonsai-27B ternary (Prism ML, TQ2G128 2.125 bpw). 7.16 GB, native MQ4-teacher KLD 0.505 with f32 KV over the 8-chunk fixture, ~22.4 tok/s decode and ~258 tok/s prefill on gfx1151 (medians of 3, after warmup). Apache-2.0; see the repo NOTICE.",
+      "quant_recipe": "prismml-bonsai-q2_0-passthrough"
     }
   },
   "aliases": {
+    "bonsai": "bonsai:27b-tq2",
     "qwen3.5": "qwen3.5:4b",
     "qwen3.5:latest": "qwen3.5:9b",
     "qwen3.5:small": "qwen3.5:0.8b",

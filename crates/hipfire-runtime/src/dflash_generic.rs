@@ -59,8 +59,8 @@ use crate::dflash::{draft_forward, DflashConfig, DflashScratch, DflashWeights};
 use crate::hfq::HfqFile;
 use crate::llama;
 use crate::spec::{
-    accept_greedy_prefix, PrefillOutcome, SpecAdvance, SpecGrammar, SpecScratch, SpecStep,
-    SpecTarget, Speculator,
+    accept_greedy_prefix, PrefillOutcome, SpecAdvance, SpecGrammar, SpecRequestConfig, SpecScratch,
+    SpecStep, SpecTarget, Speculator,
 };
 use rdna_compute::Gpu;
 use std::path::Path;
@@ -989,7 +989,7 @@ impl Speculator for GenericDflashSpeculator {
         false
     }
 
-    fn set_sampling(&mut self, temp: f32, top_p: f32, top_k: usize, _cactus_delta: f32) {
+    fn configure_request(&mut self, cfg: SpecRequestConfig) {
         // Store temp + truncation policy for the post-prefill first-token draw and
         // every subsequent chain verify / bonus draw. The chain verify now applies
         // the same temp -> top-k -> nucleus truncation as the AR sampler
@@ -1002,9 +1002,10 @@ impl Speculator for GenericDflashSpeculator {
         // plumbs all three correctly and is not affected.
         // Re-seed RNG to the same fixed value qwen35 uses per request so sampled
         // runs are deterministic given seed; greedy does not consume it.
-        self.sample_temp = temp;
-        self.sample_top_p = top_p;
-        self.sample_top_k = top_k;
+        // New SpecRequestConfig fields (min_p / rng_seed / ngram) are ignored.
+        self.sample_temp = cfg.temp;
+        self.sample_top_p = cfg.top_p;
+        self.sample_top_k = cfg.top_k;
         self.rng_state = 0x13579BDF;
     }
 

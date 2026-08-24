@@ -5,11 +5,21 @@
 //!   * `quantize_to_format` — tier-name → existing `quantize_*` encoder dispatch.
 //!   * `reap_override_for`   — arch-aware tensor-name → override-tier resolver.
 
-use crate::quant_fwht::{gen_fwht_signs, quantize_hfq4g256, quantize_mq4g256, quantize_mq6g256};
-use crate::quant_mq::{quantize_hfq6g256, quantize_mq2g256_lloyd, quantize_mq3g256_lloyd, quantize_mq4g256_lloyd};
-use crate::quant_e8::{load_ds4_head_importance, load_hessian_blocks, quantize_mfp4g32_e8_2d, quantize_mfp4g32_e8_soa_2d, quantize_mfp4g32_e8_soa_awls_2d, quantize_mfp4g32_e8_soa_gptq_2d, quantize_mfp4g32_e8_soa_lsq_2d};
-use crate::quant_q4::quantize_q8f16;
 use crate::hfq::{HfqTensor, QuantType};
+use crate::quant_e8::{
+    load_ds4_head_importance, load_hessian_blocks, quantize_mfp4g32_e8_2d,
+    quantize_mfp4g32_e8_soa_2d, quantize_mfp4g32_e8_soa_awls_2d, quantize_mfp4g32_e8_soa_gptq_2d,
+    quantize_mfp4g32_e8_soa_lsq_2d,
+};
+use crate::quant_fwht::{
+    gen_fwht_signs, quantize_hfq4g256, quantize_mq4g256, quantize_mq5g256v2, quantize_mq6g256,
+    quantize_mq6g256v2,
+};
+use crate::quant_mq::{
+    quantize_hfq6g256, quantize_mq2g256_lloyd, quantize_mq2g256v2, quantize_mq3g256_lloyd,
+    quantize_mq3g256v2, quantize_mq4g256_lloyd,
+};
+use crate::quant_q4::quantize_q8f16;
 use hipfire_reap::plan::{QuantOverride, ReapPlan, Role};
 
 /// Quantize one tensor's f32 data to the named tier, returning the HFQ tensor.
@@ -46,6 +56,70 @@ pub fn quantize_to_format(
                 QuantType::MQ6G256,
                 256,
                 quantize_mq6g256(f32_data, &s1, &s2),
+            )
+        }
+        "mq6v2" | "mq6g256v2" => {
+            let (s1, s2) = signs();
+            let &[m, k] = shape else {
+                return Err(format!("reap: mq6v2 requires rank-2 tensor {name}"));
+            };
+            if k % 256 != 0 {
+                return Err(format!(
+                    "reap: mq6v2 requires K%256==0 for {name}, got K={k}"
+                ));
+            }
+            (
+                QuantType::MQ6G256V2,
+                256,
+                quantize_mq6g256v2(f32_data, m, k, &s1, &s2),
+            )
+        }
+        "mq5v2" | "mq5g256v2" => {
+            let (s1, s2) = signs();
+            let &[m, k] = shape else {
+                return Err(format!("reap: mq5v2 requires rank-2 tensor {name}"));
+            };
+            if k % 256 != 0 {
+                return Err(format!(
+                    "reap: mq5v2 requires K%256==0 for {name}, got K={k}"
+                ));
+            }
+            (
+                QuantType::MQ5G256V2,
+                256,
+                quantize_mq5g256v2(f32_data, m, k, &s1, &s2),
+            )
+        }
+        "mq3v2" | "mq3g256v2" => {
+            let (s1, s2) = signs();
+            let &[m, k] = shape else {
+                return Err(format!("reap: mq3v2 requires rank-2 tensor {name}"));
+            };
+            if k % 256 != 0 {
+                return Err(format!(
+                    "reap: mq3v2 requires K%256==0 for {name}, got K={k}"
+                ));
+            }
+            (
+                QuantType::MQ3G256V2,
+                256,
+                quantize_mq3g256v2(f32_data, m, k, &s1, &s2),
+            )
+        }
+        "mq2v2" | "mq2g256v2" => {
+            let (s1, s2) = signs();
+            let &[m, k] = shape else {
+                return Err(format!("reap: mq2v2 requires rank-2 tensor {name}"));
+            };
+            if k % 256 != 0 {
+                return Err(format!(
+                    "reap: mq2v2 requires K%256==0 for {name}, got K={k}"
+                ));
+            }
+            (
+                QuantType::MQ2G256V2,
+                256,
+                quantize_mq2g256v2(f32_data, m, k, &s1, &s2),
             )
         }
         "mq2lloyd" | "mq2g256lloyd" => {
@@ -453,6 +527,17 @@ mod tests {
             err.contains("unsupported overlay tier 'bogus'"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn rejects_dense_only_anchored_lloyd_tier() {
+        for format in ["mq2lloyd-anchored", "mq2lloyd_anchored"] {
+            let err = quantize_to_format("x", format, &[0.0; 256], &[1, 256]).unwrap_err();
+            assert!(
+                err.contains(&format!("unsupported overlay tier '{format}'")),
+                "got: {err}"
+            );
+        }
     }
 }
 
@@ -883,13 +968,6 @@ mod integ {
     use crate::quant_fwht::quantize_hfq4g256;
     use hipfire_reap::plan::ReapPlan;
     use hipfire_runtime::hfq::HfqFile;
-    use std::sync::Mutex;
-
-    // `HfqFile::open` READS the process-global `HIPFIRE_REAP_PLAN` env var on
-    // every call. The end-to-end test below sets it before `open`, so it must
-    // serialize against any other test in this module that calls `open` (none
-    // today, but keep the guard to mirror SP3 T2's hipfire-runtime test).
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     fn plan_layer0_expert0_hfq4(dir: &std::path::Path) -> ReapPlan {
         std::fs::write(
@@ -910,12 +988,6 @@ mod integ {
 
     #[test]
     fn build_overlay_selects_and_byte_matches_then_round_trips() {
-        // This test calls `HfqFile::open`, which reads the process-global
-        // `HIPFIRE_REAP_PLAN`. Serialize against `sp4_overlay_to_sp3_load_end_to_end`
-        // (which sets/removes that env var) so a concurrent set can't leak a stray
-        // overlay into this `open` (was a latent flake before SP4b T2 added tests
-        // that perturbed scheduling).
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let arch = ReapArch::Deepseek4;
         let d = tempfile::tempdir().unwrap();
         let plan = plan_layer0_expert0_hfq4(d.path());
@@ -985,16 +1057,13 @@ mod integ {
         );
     }
 
-    /// SP3 Task 3: full SP4-overlay → SP3-load round trip on REAL HFQ
-    /// containers. Build a base (expert + attention tensors, both Q8F16),
-    /// build an overlay that re-quantizes ONLY the expert tensor to HFQ4G256,
-    /// point `HIPFIRE_REAP_PLAN` at the overlay dir, then `HfqFile::open` the
-    /// base and assert: overlay attached, expert resolves to the overlay's
-    /// HFQ4G256 bytes, attention falls through to base Q8F16.
+    /// Full SP4-overlay → SP3-load round trip on real HFQ containers.
+    /// Build a base (expert + attention tensors, both Q8F16), build an overlay
+    /// that re-quantizes only the expert tensor to HFQ4G256, attach it through
+    /// the runtime's production splice API, and assert overlay-first lookup plus
+    /// base fallback. Runtime separately tests process-policy auto-discovery.
     #[test]
     fn sp4_overlay_to_sp3_load_end_to_end() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-
         let exp_name = "layers.0.ffn.experts.0.w1.weight";
         let attn_name = "layers.0.self_attn.q_proj.weight";
         // [2, 256] = 512 f32 (multiple of the 256 group for the HFQ4G256 tier).
@@ -1030,9 +1099,13 @@ mod integ {
         // Capture everything we need while the guard is held; remove the env var
         // immediately after `open` (before any assert can unwind) so a failure
         // can't leak the var to a concurrent `open`.
-        std::env::set_var("HIPFIRE_REAP_PLAN", plan_dir.path());
-        let f = HfqFile::open(&base_path).unwrap();
-        std::env::remove_var("HIPFIRE_REAP_PLAN");
+        // Inject the plan rather than set_var + open: process config is a
+        // start-time OnceLock snapshot, so a set_var here is invisible unless
+        // this test happens to be the first in the process to read config.
+        // That made this an order-dependent failure (reproducible on master
+        // with `cargo test -p hipfire-quantize --bin hipfire-quantize
+        // reap_overlay`).
+        let f = HfqFile::open_with_reap_plan(&base_path, Some(plan_dir.path())).unwrap();
 
         // Overlay auto-attached (arch_id 9 matches; expert name is a base subset).
         assert!(

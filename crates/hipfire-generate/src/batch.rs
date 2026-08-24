@@ -121,23 +121,29 @@ pub fn is_batch_request_eligible(
         .speculator
         .as_ref()
         .is_some_and(|s| s.supports_temp_verify());
+    let supports_chain_nucleus_verify = m
+        .speculator
+        .as_ref()
+        .is_some_and(|s| s.supports_chain_nucleus_verify());
     let route_inputs = GenerationRouteInputs {
         arch_id: m.arch_id,
         ep: m.ep.is_some(),
         pp: m.pp,
         has_speculator: has_spec,
-        qwen_mtp_head: m.state.as_ref().and_then(|s| (s.as_ref() as &dyn std::any::Any).downcast_ref::<hipfire_arch_qwen35::Qwen35Bundle>()).map_or(false, |b| b.qwen35_mtp_head.is_some()),
-        qwen_mtp_opt_in: std::env::var("HIPFIRE_QWEN_MTP").ok().as_deref() == Some("1"),
-        mtp_sampled_on: std::env::var("HIPFIRE_MTP_SAMPLED").ok().as_deref() == Some("1"),
+        speculator_is_mtp: m.speculator.as_ref().is_some_and(|s| s.name() == "mtp"),
         deepseek4_spec_requested: false,
         ngram_can_sample,
         temp: sampling.temp,
         user_explicit_sampling: user_explicit,
         min_p: sampling.min_p,
+        nonneutral_penalties: sampling.repeat_penalty != 1.0
+            || sampling.presence_penalty != 0.0
+            || sampling.frequency_penalty != 0.0,
         force_ar_chat: false,
         temp_spec_env_off: std::env::var("HIPFIRE_DFLASH_TEMP_SPEC").ok().as_deref() == Some("0"),
         fast_sample_on: std::env::var("HIPFIRE_FAST_SAMPLE").ok().as_deref() != Some("0"),
         supports_temp_swor,
+        supports_chain_nucleus_verify,
         kv_adaptive: has_adaptive,
     };
     let route = select_generation_route(&route_inputs);
@@ -2444,9 +2450,7 @@ pub fn is_qwen_ep_batch_request_eligible(
         ep: false,
         pp: m.pp,
         has_speculator: m.speculator.is_some(),
-        qwen_mtp_head: m.state.as_ref().and_then(|s| (s.as_ref() as &dyn std::any::Any).downcast_ref::<hipfire_arch_qwen35::Qwen35Bundle>()).map_or(false, |b| b.qwen35_mtp_head.is_some()),
-        qwen_mtp_opt_in: std::env::var("HIPFIRE_QWEN_MTP").ok().as_deref() == Some("1"),
-        mtp_sampled_on: std::env::var("HIPFIRE_MTP_SAMPLED").ok().as_deref() == Some("1"),
+        speculator_is_mtp: m.speculator.as_ref().is_some_and(|s| s.name() == "mtp"),
         deepseek4_spec_requested: false,
         ngram_can_sample: m
             .speculator
@@ -2456,6 +2460,9 @@ pub fn is_qwen_ep_batch_request_eligible(
         temp: sampling.temp,
         user_explicit_sampling: user_explicit,
         min_p: sampling.min_p,
+        nonneutral_penalties: sampling.repeat_penalty != 1.0
+            || sampling.presence_penalty != 0.0
+            || sampling.frequency_penalty != 0.0,
         force_ar_chat: false,
         temp_spec_env_off: std::env::var("HIPFIRE_DFLASH_TEMP_SPEC").ok().as_deref() == Some("0"),
         fast_sample_on: std::env::var("HIPFIRE_FAST_SAMPLE").ok().as_deref() != Some("0"),
@@ -2463,6 +2470,10 @@ pub fn is_qwen_ep_batch_request_eligible(
             .speculator
             .as_ref()
             .is_some_and(|s| s.supports_temp_verify()),
+        supports_chain_nucleus_verify: m
+            .speculator
+            .as_ref()
+            .is_some_and(|s| s.supports_chain_nucleus_verify()),
         kv_adaptive: m.kv_adaptive.is_some(),
     };
     let route = select_generation_route(&route_inputs);

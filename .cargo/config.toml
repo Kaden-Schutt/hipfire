@@ -21,3 +21,9 @@
 # this file — scripts/check-fmt-bomb.sh (pre-commit) still backstops the case.
 [alias]
 fmt = ["use-scripts-fmt-changed-sh-instead-of-cargo-fmt"]
+
+# Windows gives the main thread a 1 MB stack unless the linker says otherwise,
+# which is not enough for the CLI's startup path (hipfire --version
+# stack-overflows). Reserve 32 MB. No effect on other targets.
+[target.'cfg(windows)']
+rustflags = ["-C", "link-args=/STACK:33554432"]

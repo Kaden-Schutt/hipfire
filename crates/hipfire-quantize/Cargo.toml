@@ -10,6 +10,8 @@ lab = []
 
 [dependencies]
 hipfire-config = { path = "../hipfire-config" }
+faer = { version = "0.24", default-features = false, features = ["rayon", "std"] }
+libloading = { workspace = true }
 memmap2 = "0.9"
 safetensors.workspace = true
 half.workspace = true
@@ -57,4 +59,24 @@ rdna-compute = { path = "../rdna-compute" }
 # ---------------------------------------------------------------------------
 [[example]]
 name = "deepseek4_dequant_check"
+required-features = ["lab"]
+
+[[example]]
+name = "mq35_vq_fit"
+required-features = ["lab"]
+
+[[example]]
+name = "mq_composable_bench"
+required-features = ["lab"]
+
+[[example]]
+name = "mq_family_mse"
+required-features = ["lab"]
+
+[[example]]
+name = "mq_kld_proxy"
+required-features = ["lab"]
+
+[[example]]
+name = "poly_fit"
 required-features = ["lab"]

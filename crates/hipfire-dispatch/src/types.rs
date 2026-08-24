@@ -117,13 +117,15 @@ pub enum RotationPlan {
 pub fn dtype_rotation_plan(dtype: DType) -> RotationPlan {
     use DType::*;
     match dtype {
-        // MQ2G256GL / MQ3G256GL: the GL ("global Lloyd") formats are encoded
-        // against FWHT-256-rotated blocks exactly like every other MQ*-G256
-        // dtype (`quantize_mq{2,3}g256gl` calls `cpu_fwht_256` per group), so
-        // x MUST be FwhtG256-rotated before their kernels see it.
-        MQ4G256 | MQ3G256 | MQ2G256 | MQ5G256 | MQ6G256 | MQ2G256Lloyd | MQ3G256Lloyd
-        | MQ4G256Lloyd | MQ2G256GL | MQ3G256GL | MFP4G32 | MFP4G32Lloyd | MFP4G32P | MFP4G32E8
-        | MFP4G32E8SOA | MFP3G32E8 | MFP2G32E8 => RotationPlan::FwhtG256,
+        // MQ2G256GL / MQ3G256GL are encoded against FWHT-256-rotated
+        // blocks exactly like the other MQ*-G256 dtypes.
+        MQ4G256 | MQ4G256V2 | MQ5G256V2 | MQ6G256V2 | MQ3G256V2 | MQ2G256V2 | MQ4CG256
+        | MQ3G256 | MQ2G256 | MQ5G256 | MQ6G256 | MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd
+        | MQ2G256GL | MQ3G256GL | MFP4G32 | MFP4G32Lloyd | MFP4G32P | MFP4G32E8 | MFP4G32E8SOA
+        | MFP3G32E8 | MFP2G32E8 => RotationPlan::FwhtG256,
+        // MQ4G128 and MQ8G256 carry their OWN plans and MUST NOT reach the `_` arm:
+        // falling through to RotationPlan::None leaves x unrotated against weights
+        // that were encoded post-rotation, which is silent garbage, not an error.
         MQ4G128 => RotationPlan::FwhtG128,
         MQ8G256 => RotationPlan::Mq8Internal,
         ParoQ4G128 => RotationPlan::Givens,
@@ -138,13 +140,10 @@ pub fn dtype_post_rotation_variant(dtype: DType) -> GemvVariant {
     use DType::*;
     match dtype {
         ParoQ4G128 => GemvVariant::Plain,
-        // NOTE MQ2G256GL / MQ3G256GL are deliberately NOT listed here. They are
-        // MoE-routed-expert-only formats: the only kernels that exist are the
-        // four indexed MoE GEMVs, so there is no dense "prerotated" GEMV to
-        // dispatch. Claiming Prerotated would make `for_gemv_prerotated` look
-        // resolvable and then fail deeper; leaving them on the `_` arm keeps the
-        // failure at the (correct) `UnsupportedVariant` boundary.
-        MQ4G256 | MQ3G256 | MQ2G256 | MQ5G256 | MQ6G256 | MQ8G256 | MQ2G256Lloyd | MQ3G256Lloyd
+        // GL formats are MoE-indexed-only and intentionally have no dense
+        // prerotated GEMV route.
+        MQ4G256 | MQ4G256V2 | MQ5G256V2 | MQ6G256V2 | MQ3G256V2 | MQ2G256V2 | MQ4CG256
+        | MQ3G256 | MQ2G256 | MQ5G256 | MQ6G256 | MQ8G256 | MQ2G256Lloyd | MQ3G256Lloyd
         | MQ4G256Lloyd | MFP4G32 | MFP4G32Lloyd | MFP4G32P | MFP4G32E8 | MFP4G32E8SOA | MQ4G128 => {
             GemvVariant::Prerotated
         }
@@ -163,12 +162,18 @@ pub fn fused_qkv_variant_for_key(key: KernelKey) -> Option<FusedQkvVariant> {
     use KernelKey::*;
     match key {
         // 3-way Fused QKV (incl. Q4K, Q8_0/HFQ3/HFP4 prefill, and the Paro 4G128T QKV synthesis)
-        FusedQkvHfq4G256 | FusedQkvMq3G256Lloyd | FusedQkvMq4G256Lloyd | FusedQkvHfq6G256
-        | FusedQkvQ4K | FusedQkvQ8_0 | FusedQkvHfq3G256 | FusedQkvHfp4G32 | FusedQkvParo4G128T => {
-            Some(FusedQkvVariant::Qkv)
-        }
+        FusedQkvHfq4G256 | FusedQkvMq4G256V2 | FusedQkvMq6G256V2 | FusedQkvMq5G256V2
+        | FusedQkvMq3G256V2 | FusedQkvMq2G256V2 | FusedQkvMq4CG256 | FusedQkvMq3G256Lloyd
+        | FusedQkvMq4G256Lloyd | FusedQkvHfq6G256 | FusedQkvQ4K | FusedQkvQ8_0
+        | FusedQkvHfq3G256 | FusedQkvHfp4G32 | FusedQkvParo4G128T => Some(FusedQkvVariant::Qkv),
         // 4-way Fused QKVZA (DeltaNet linear attention, incl. Q8_0/HFQ3/HFP4 prefill and Paro 4G128T)
         FusedQkvzaHfq4G256
+        | FusedQkvzaMq4G256V2
+        | FusedQkvzaMq6G256V2
+        | FusedQkvzaMq5G256V2
+        | FusedQkvzaMq3G256V2
+        | FusedQkvzaMq2G256V2
+        | FusedQkvzaMq4CG256
         | FusedQkvzaMq3G256Lloyd
         | FusedQkvzaMq4G256Lloyd
         | FusedQkvzaHfq6G256
@@ -177,8 +182,13 @@ pub fn fused_qkv_variant_for_key(key: KernelKey) -> Option<FusedQkvVariant> {
         | FusedQkvzaHfp4G32
         | FusedQkvzaMfp4G32E8
         | FusedQkvzaParo4G128T => Some(FusedQkvVariant::Qkvza),
-        // 2-way Fused Gate+Up (FFN, incl. Q8_0, HFQ3, HFP4 and Paro 4G128T)
         FusedGateUpHfq4G256
+        | FusedGateUpMq4G256V2
+        | FusedGateUpMq6G256V2
+        | FusedGateUpMq5G256V2
+        | FusedGateUpMq3G256V2
+        | FusedGateUpMq2G256V2
+        | FusedGateUpMq4CG256
         | FusedGateUpMq3G256Lloyd
         | FusedGateUpMq4G256Lloyd
         | FusedGateUpHfq6G256
@@ -209,6 +219,8 @@ pub enum KernelKey {
     GemvHfq3G128,
     GemvHfq2G256,
     GemvHfq2G128,
+    GemvTQ2G128,
+    GemvBQ1G128,
     GemvHfq6G256,
     GemvMq4G256,
     GemvMq4G128,
@@ -233,8 +245,14 @@ pub enum KernelKey {
     GemvQ8HFQ,
     // GEMV prerotated
     GemvMq4G256Prerotated,
-    GemvMq3G256Prerotated,
+    GemvMq4G256V2Prerotated,
+    GemvMq4CG256Prerotated,
+    GemvMq5G256V2Prerotated,
+    GemvMq6G256V2Prerotated,
+    GemvMq3G256V2Prerotated,
+    GemvMq2G256V2Prerotated,
     GemvMq2G256Prerotated,
+    GemvMq3G256Prerotated,
     GemvMq5G256Prerotated,
     GemvMq6G256Prerotated,
     GemvMq8G256Prerotated,
@@ -251,6 +269,12 @@ pub enum KernelKey {
     GemvHfq3G256Residual,
     GemvHfq6G256Residual,
     GemvMq4G256Residual,
+    GemvMq4G256V2Residual,
+    GemvMq4CG256Residual,
+    GemvMq5G256V2Residual,
+    GemvMq6G256V2Residual,
+    GemvMq3G256V2Residual,
+    GemvMq2G256V2Residual,
     GemvMq3G256Residual,
     GemvMq5G256Residual,
     GemvMq6G256Residual,
@@ -261,14 +285,43 @@ pub enum KernelKey {
     GemvHfq3G256SwiGLUResidual,
     GemvHfq6G256SwiGLUResidual,
     GemvMq4G256SwiGLUResidual,
+    GemvMq4G256V2SwiGLUResidual,
+    GemvMq4CG256SwiGLUResidual,
+    GemvMq5G256V2SwiGLUResidual,
+    GemvMq6G256V2SwiGLUResidual,
+    GemvMq3G256V2SwiGLUResidual,
+    GemvMq2G256V2SwiGLUResidual,
     GemvMq3G256SwiGLUResidual,
     GemvMq5G256SwiGLUResidual,
     GemvMq6G256SwiGLUResidual,
     GemvMq3G256LloydSwiGLUResidual,
     GemvMq4G256LloydSwiGLUResidual,
     // GEMM
+    /// Tiled prefill GEMM over PACKED TQ2-G128 blocks. Register-blocked
+    /// 64x64 output tile; beats the per-token GEMV loop from N~32 up.
+    GemmTQ2G128Prefill,
+    /// Binary sibling of `GemmTQ2G128Prefill`.
+    GemmBQ1G128Prefill,
     GemmHfq4G256,
     GemmHfq4G128,
+    GemmMq4G256V2,
+    GemmMq4CG256,
+    GemmMq5G256V2,
+    GemmMq6G256V2,
+    GemmMq3G256V2,
+    GemmMq2G256V2,
+    GemmMq4G256V2Residual,
+    GemmMq4CG256Residual,
+    GemmMq5G256V2Residual,
+    GemmMq6G256V2Residual,
+    GemmMq3G256V2Residual,
+    GemmMq2G256V2Residual,
+    GemmMq4G256V2BatchedLmhead,
+    GemmMq4CG256BatchedLmhead,
+    GemmMq5G256V2BatchedLmhead,
+    GemmMq6G256V2BatchedLmhead,
+    GemmMq3G256V2BatchedLmhead,
+    GemmMq2G256V2BatchedLmhead,
     GemmQ8_0BatchedChunked,
     GemmQ8_0Wmma,
     GemmQ8_0Wmma4W,
@@ -286,6 +339,13 @@ pub enum KernelKey {
     GemmF16WmmaMb4,
     GemmF16WmmaMb8,
     GemmF32Batched,
+    // BF16 x BF16 -> F32 via CDNA3 `v_mfma_f32_16x16x16bf16_1k`
+    // (kernels/src/gemm_bf16_mfma.gfx942.hip). gfx942-only: the wrapper
+    // `Gpu::gemm_bf16_mfma_gfx942` hard-errors on any other arch. This is the
+    // batched path for a native-BF16 reference/teacher model — widening such a
+    // model to F32 would land on `GemmF32Batched`, a warp-per-output-element
+    // dot product with no data reuse, at a fraction of MFMA throughput.
+    GemmBf16Mfma,
     GemmQ8_0WmmaX64,
     GemmQ8_0ResidualWmma,
     GemmQ8_0ResidualWmmaGfx12,
@@ -320,6 +380,12 @@ pub enum KernelKey {
     GemmQ8_0BatchedWideExact,
     // Fused QKV
     FusedQkvHfq4G256,
+    FusedQkvMq4G256V2,
+    FusedQkvMq4CG256,
+    FusedQkvMq5G256V2,
+    FusedQkvMq6G256V2,
+    FusedQkvMq3G256V2,
+    FusedQkvMq2G256V2,
     FusedQkvMq3G256Lloyd,
     FusedQkvMq4G256Lloyd,
     FusedQkvHfq6G256,
@@ -328,8 +394,13 @@ pub enum KernelKey {
     FusedQkvQ8_0,
     FusedQkvHfq3G256,
     FusedQkvHfp4G32,
-    // Fused QKVZA (linear attention)
     FusedQkvzaHfq4G256,
+    FusedQkvzaMq4G256V2,
+    FusedQkvzaMq4CG256,
+    FusedQkvzaMq5G256V2,
+    FusedQkvzaMq6G256V2,
+    FusedQkvzaMq3G256V2,
+    FusedQkvzaMq2G256V2,
     FusedQkvzaMq3G256Lloyd,
     FusedQkvzaMq4G256Lloyd,
     FusedQkvzaHfq6G256,
@@ -339,8 +410,13 @@ pub enum KernelKey {
     FusedQkvzaHfp4G32,
     // Fused QKVZA — mfp4-E8 decode, gfx1151-only (Strix Halo launch-fusion)
     FusedQkvzaMfp4G32E8,
-    // Fused Gate+Up
     FusedGateUpHfq4G256,
+    FusedGateUpMq4G256V2,
+    FusedGateUpMq4CG256,
+    FusedGateUpMq5G256V2,
+    FusedGateUpMq6G256V2,
+    FusedGateUpMq3G256V2,
+    FusedGateUpMq2G256V2,
     FusedGateUpMq3G256Lloyd,
     FusedGateUpMq4G256Lloyd,
     FusedGateUpHfq6G256,
@@ -490,6 +566,11 @@ pub enum ArchPredicate {
     /// Gates the gfx906 wave64 `v_dot4_i32_i8` (sdot4) fused kernels (HFQ6/MQ6).
     /// This IS AMD "dp4a" — `v_dot4_i32_i8` INT8 dot4 accumulate, gfx906/gfx908.
     HasDp4a,
+    /// `is_gfx942()` — CDNA3 MI300-series exactly. Gates kernels built from a
+    /// `.gfx942.hip` source with no sibling for any other arch, currently the
+    /// BF16 MFMA GEMM. Narrower than `is_cdna3()` on purpose: the wrapper
+    /// refuses non-gfx942 outright, so the predicate must match the wrapper.
+    IsGfx942,
 }
 
 #[derive(Clone, Debug)]
@@ -602,6 +683,8 @@ impl KernelKey {
             (HFQ3G128, Plain) => Ok(Self::GemvHfq3G128),
             (HFQ2G256, Plain) => Ok(Self::GemvHfq2G256),
             (HFQ2G128, Plain) => Ok(Self::GemvHfq2G128),
+            (TQ2G128, Plain) => Ok(Self::GemvTQ2G128),
+            (BQ1G128, Plain) => Ok(Self::GemvBQ1G128),
             (HFQ6G256, Plain) => Ok(Self::GemvHfq6G256),
             (MQ4G256, Plain) => Ok(Self::GemvMq4G256),
             (MQ4G128, Plain) => Ok(Self::GemvMq4G128),
@@ -636,8 +719,14 @@ impl KernelKey {
         use DType::*;
         match dtype {
             MQ4G256 => Ok(Self::GemvMq4G256Prerotated),
-            MQ3G256 => Ok(Self::GemvMq3G256Prerotated),
+            MQ4G256V2 => Ok(Self::GemvMq4G256V2Prerotated),
+            MQ4CG256 => Ok(Self::GemvMq4CG256Prerotated),
+            MQ5G256V2 => Ok(Self::GemvMq5G256V2Prerotated),
+            MQ6G256V2 => Ok(Self::GemvMq6G256V2Prerotated),
+            MQ3G256V2 => Ok(Self::GemvMq3G256V2Prerotated),
+            MQ2G256V2 => Ok(Self::GemvMq2G256V2Prerotated),
             MQ2G256 => Ok(Self::GemvMq2G256Prerotated),
+            MQ3G256 => Ok(Self::GemvMq3G256Prerotated),
             MQ5G256 => Ok(Self::GemvMq5G256Prerotated),
             MQ6G256 => Ok(Self::GemvMq6G256Prerotated),
             MQ8G256 => Ok(Self::GemvMq8G256Prerotated),
@@ -684,6 +773,12 @@ impl KernelKey {
             HFQ3G256 => Ok(Self::GemvHfq3G256Residual),
             HFQ6G256 => Ok(Self::GemvHfq6G256Residual),
             MQ4G256 => Ok(Self::GemvMq4G256Residual),
+            MQ4G256V2 => Ok(Self::GemvMq4G256V2Residual),
+            MQ4CG256 => Ok(Self::GemvMq4CG256Residual),
+            MQ5G256V2 => Ok(Self::GemvMq5G256V2Residual),
+            MQ6G256V2 => Ok(Self::GemvMq6G256V2Residual),
+            MQ3G256V2 => Ok(Self::GemvMq3G256V2Residual),
+            MQ2G256V2 => Ok(Self::GemvMq2G256V2Residual),
             MQ3G256 => Ok(Self::GemvMq3G256Residual),
             MQ5G256 => Ok(Self::GemvMq5G256Residual),
             MQ6G256 => Ok(Self::GemvMq6G256Residual),
@@ -705,6 +800,12 @@ impl KernelKey {
             HFQ3G256 => Ok(Self::GemvHfq3G256SwiGLUResidual),
             HFQ6G256 => Ok(Self::GemvHfq6G256SwiGLUResidual),
             MQ4G256 => Ok(Self::GemvMq4G256SwiGLUResidual),
+            MQ4G256V2 => Ok(Self::GemvMq4G256V2SwiGLUResidual),
+            MQ4CG256 => Ok(Self::GemvMq4CG256SwiGLUResidual),
+            MQ5G256V2 => Ok(Self::GemvMq5G256V2SwiGLUResidual),
+            MQ6G256V2 => Ok(Self::GemvMq6G256V2SwiGLUResidual),
+            MQ3G256V2 => Ok(Self::GemvMq3G256V2SwiGLUResidual),
+            MQ2G256V2 => Ok(Self::GemvMq2G256V2SwiGLUResidual),
             MQ3G256 => Ok(Self::GemvMq3G256SwiGLUResidual),
             MQ5G256 => Ok(Self::GemvMq5G256SwiGLUResidual),
             MQ6G256 => Ok(Self::GemvMq6G256SwiGLUResidual),
@@ -741,7 +842,17 @@ impl KernelKey {
             | HFP4G32 | MFP4G32 | MFP4G32Lloyd | MFP4G32P
             | MFP4G32E8 | MFP4G32E8SOA
             | MFP3G32E8 | MFP2G32E8  // mfpN-E8: same RDNA3/4 gating as MFP4G32E8 via e8_with_wmma
-            | ParoQ4G128 => ArchPredicate::Always,
+            | ParoQ4G128
+            // TQ2G128: ternary GEMV kernel (gemv_tq2g128, Task 9) is a generic
+            // wave32/wave64 kernel with no ISA-specific intrinsics, same as its
+            // HFQ2G128 sibling — identical arch gating.
+            | TQ2G128
+            // BQ1G128: binary Bonsai-27B sibling of TQ2G128. Its GEMV kernel
+            // (gemv_bq1g128, fp32-activation, no ISA-specific intrinsics) has the
+            // same generic wave32/wave64 shape as TQ2G128 — identical Always gating.
+            // dtype_arch_predicate matches exhaustively on DType, so this arm is
+            // required for the match to compile.
+            | BQ1G128 => ArchPredicate::Always,
             HFQ3G256 | HFQ3G128 => ArchPredicate::HasSdot4,
             // MQ3G256 + MQ2/MQ3/MQ4-Lloyd: their GEMV kernels are WMMA-free
             // [32,1,1] wave32 scalar (gemv.rs:1004; kernels.rs:420/750 baseline
@@ -755,11 +866,7 @@ impl KernelKey {
             MQ5G256 => ArchPredicate::HasMmq,
             MQ6G256 | HFQ6G256 => ArchPredicate::HasMmq,
             MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd => ArchPredicate::HasWave32,
-            // MQ2/MQ3-G256-GL: the four indexed MoE GEMVs are WMMA-free
-            // [32,1,1] wave32 scalar kernels (plain fp16→f32 converts + a
-            // 5-step `__shfl_down` reduce), so the same HasWave32 gate as the
-            // Lloyd family is correct — RDNA1..RDNA4 in, CDNA wave64 out.
-            MQ2G256GL | MQ3G256GL => ArchPredicate::HasWave32,
+            MQ2G256GL | MQ3G256GL | MQ4G256V2 | MQ2G256V2 | MQ3G256V2 | MQ5G256V2 | MQ6G256V2 | MQ4CG256 => ArchPredicate::HasWave32,
             Q8HFQ | Raw => ArchPredicate::Always,
         }
     }
@@ -777,7 +884,8 @@ impl KernelKey {
             Prerotated => &[PipelineOp::Gemv],
             WithResidual => {
                 let steps: &[PipelineOp] = match dtype {
-                    MQ4G256 | MQ3G256 | MQ5G256 | MQ6G256 | MQ3G256Lloyd | MQ4G256Lloyd => &[
+                    MQ4G256 | MQ4G256V2 | MQ2G256V2 | MQ3G256V2 | MQ5G256V2 | MQ6G256V2
+                    | MQ4CG256 | MQ3G256 | MQ5G256 | MQ6G256 | MQ3G256Lloyd | MQ4G256Lloyd => &[
                         PipelineOp::RotateFwht,
                         PipelineOp::Gemv,
                         PipelineOp::ResidualAdd,
@@ -788,7 +896,8 @@ impl KernelKey {
             }
             WithSwiGLUResidual => {
                 let steps: &[PipelineOp] = match dtype {
-                    MQ4G256 | MQ3G256 | MQ5G256 | MQ6G256 | MQ3G256Lloyd | MQ4G256Lloyd => {
+                    MQ4G256 | MQ4G256V2 | MQ2G256V2 | MQ3G256V2 | MQ5G256V2 | MQ6G256V2
+                    | MQ4CG256 | MQ3G256 | MQ5G256 | MQ6G256 | MQ3G256Lloyd | MQ4G256Lloyd => {
                         &[PipelineOp::SiluMulRotate, PipelineOp::GemvResidual]
                     }
                     _ => &[
@@ -810,6 +919,12 @@ pub fn dtype_needs_rotation(dtype: DType) -> bool {
     matches!(
         dtype,
         MQ4G256
+            | MQ4G256V2
+            | MQ5G256V2
+            | MQ6G256V2
+            | MQ3G256V2
+            | MQ2G256V2
+            | MQ4CG256
             | MQ4G128
             | MQ3G256
             | MQ2G256
@@ -830,4 +945,23 @@ pub fn dtype_needs_rotation(dtype: DType) -> bool {
             | MFP2G32E8
             | ParoQ4G128
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tq2g128_resolves_to_gemv_key() {
+        let k = KernelKey::for_gemv(DType::TQ2G128, GemvVariant::Plain, false)
+            .expect("TQ2G128 should resolve to a GEMV kernel key");
+        assert_eq!(k, KernelKey::GemvTQ2G128);
+    }
+
+    #[test]
+    fn bq1g128_resolves_to_gemv_key() {
+        let k = KernelKey::for_gemv(DType::BQ1G128, GemvVariant::Plain, false)
+            .expect("BQ1G128 should resolve to a GEMV kernel key");
+        assert_eq!(k, KernelKey::GemvBQ1G128);
+    }
 }

@@ -125,6 +125,13 @@ pub struct SpecLoadCfg {
     /// default that would shadow those. Env `HIPFIRE_{QWEN3,DEEPSEEK4}_DSPARK_CONF_THRESHOLD`
     /// still wins over this in the builder.
     pub dspark_conf_threshold: Option<f32>,
+    /// Qwen MTP (NextN) enable, lowered from the `speculation` selector:
+    /// `Some(true)` = `mtp` mode (load + force), `Some(false)` = another
+    /// mechanism selected (skip load + build), `None` = `auto` (load if a
+    /// bundled trailer or `.mtp` sidecar exists).
+    pub mtp: Option<bool>,
+    /// MTP draft window K. `None` = runtime default (`HIPFIRE_MTP_K`).
+    pub mtp_k: Option<usize>,
 }
 
 /// CASK/TriAttention params forwarded by the CLI at load time.

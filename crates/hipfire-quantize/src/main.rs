@@ -11,32 +11,25 @@
 //! `.gguf` file and produces a `.hfq` (HipFire Quantized) file with
 //! RDNA-native quantized weights.
 
+mod calibration;
+mod cli;
+mod dequant;
+#[cfg(test)]
+mod diagnostics;
 mod e8;
 mod e8_gptq;
 mod gguf_input;
-mod reap_overlay;
-mod cli;
-mod dequant;
-mod quant_q4;
-mod quant_fwht;
-mod quant_hfp4;
-mod quant_e8;
-mod quant_mq;
 mod hfq;
 mod model_filter;
-mod calibration;
-mod pipeline_gguf;
-mod pipeline_deepseek;
 mod pipeline;
-#[cfg(test)]
-mod diagnostics;
-
-use clap::Parser;
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
-
-pub(crate) use calibration::{AWQ_ALPHA, IMATRIX};
+mod pipeline_deepseek;
+mod pipeline_gguf;
+mod quant_e8;
+mod quant_fwht;
+mod quant_hfp4;
+mod quant_mq;
+mod quant_q4;
+mod reap_overlay;
 
 fn main() {
     pipeline::run();
