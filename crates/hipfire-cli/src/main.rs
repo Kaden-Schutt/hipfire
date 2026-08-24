@@ -4849,7 +4849,7 @@ fn diag_command(paths: &Paths, output: OutputArgs) -> Result<()> {
                 "path": root.display().to_string(),
                 "device_compiler": hipfire_config::rocm::DEVICE_COMPILERS
                     .iter()
-                    .find(|name| root.join("bin").join(name).is_file()),
+                    .find_map(|name| hipfire_config::rocm::tool_from_selected_root(root, name)),
                 "hip_headers": hipfire_config::rocm::is_complete_root(root),
                 "hip_runtime": hipfire_config::rocm::runtime_library(root)
                     .map(|p| p.display().to_string()),
@@ -5104,13 +5104,35 @@ pub(crate) fn find_daemon(paths: &Paths) -> Option<PathBuf> {
         }
     }
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target");
-    [
-        paths.root.join("bin/daemon"),
-        workspace.join("release/daemon"),
-        workspace.join("debug/daemon"),
-    ]
-    .into_iter()
-    .find(|path| path.is_file())
+    find_daemon_in(paths, &workspace, cfg!(windows))
+}
+
+/// Daemon binary name candidates, most preferred first.
+///
+/// Windows ships the daemon as `daemon.exe`; ELF platforms ship an
+/// extensionless `daemon`. The bare spelling is kept as a fallback so a
+/// future extensionless shim still wins. `windows` is a pure parameter
+/// (mirroring `hipfire_config::rocm::tool_filename_candidates`) so the
+/// policy is unit-testable on any host without process-global env.
+fn daemon_bin_names(windows: bool) -> &'static [&'static str] {
+    if windows {
+        &["daemon.exe", "daemon"]
+    } else {
+        &["daemon"]
+    }
+}
+
+/// Candidate lookup shared by [`find_daemon`] and its platform-shaped tests:
+/// probe the install root (`~/.hipfire/bin/`) and the source-tree target dir
+/// (`release/`, then `debug/`), in that order, for each candidate name.
+fn find_daemon_in(paths: &Paths, workspace: &std::path::Path, windows: bool) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    for name in daemon_bin_names(windows) {
+        candidates.push(paths.root.join("bin").join(name));
+        candidates.push(workspace.join("release").join(name));
+        candidates.push(workspace.join("debug").join(name));
+    }
+    candidates.into_iter().find(|path| path.is_file())
 }
 
 pub(crate) fn request_f64(
@@ -5424,6 +5446,80 @@ mod tests {
             .unwrap()
             .iter()
             .any(|model| model.path == fs::canonicalize(&nested).unwrap()));
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn daemon_discovery_prefers_windows_exe_spelling() {
+        // Windows-shaped policy (runs on any host, like the rocm.rs HIPCC
+        // suffix tests): daemon.exe is probed before the bare name so an
+        // install or source-tree build is found on Windows.
+        assert_eq!(daemon_bin_names(true), &["daemon.exe", "daemon"]);
+        assert_eq!(daemon_bin_names(false), &["daemon"]);
+    }
+
+    #[test]
+    fn find_daemon_discovers_daemon_exe_under_windows_shaped_policy() {
+        // Only the .exe spelling exists — exactly the Windows install layout.
+        let paths = test_paths("daemon-exe");
+        let bin = paths.root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(bin.join("daemon.exe"), b"").unwrap();
+        let workspace = paths.root.join("target");
+        fs::create_dir_all(&workspace).unwrap();
+        assert_eq!(
+            find_daemon_in(&paths, &workspace, true),
+            Some(bin.join("daemon.exe"))
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn find_daemon_windows_policy_accepts_extensionless_shim() {
+        // The bare spelling stays a fallback on Windows for a future shim.
+        let paths = test_paths("daemon-shim");
+        let bin = paths.root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(bin.join("daemon"), b"").unwrap();
+        let workspace = paths.root.join("target");
+        fs::create_dir_all(&workspace).unwrap();
+        assert_eq!(
+            find_daemon_in(&paths, &workspace, true),
+            Some(bin.join("daemon"))
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn find_daemon_prefers_install_dir_over_source_tree() {
+        // Install root (~/.hipfire/bin) wins over the source-tree target dir
+        // even when both carry a candidate (real host: Windows + dev build).
+        let paths = test_paths("daemon-install-vs-target");
+        let bin = paths.root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(bin.join("daemon.exe"), b"install").unwrap();
+        let workspace = paths.root.join("target");
+        fs::create_dir_all(workspace.join("release")).unwrap();
+        fs::write(workspace.join("release").join("daemon.exe"), b"dev").unwrap();
+        assert_eq!(
+            find_daemon_in(&paths, &workspace, true),
+            Some(bin.join("daemon.exe"))
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn find_daemon_falls_back_to_bare_spelling_for_unix_shaped_policy() {
+        // Unix-shaped policy: only the extensionless daemon is probed.
+        let paths = test_paths("daemon-bare");
+        let release = paths.root.join("target").join("release");
+        fs::create_dir_all(&release).unwrap();
+        fs::write(release.join("daemon"), b"").unwrap();
+        let workspace = paths.root.join("target");
+        assert_eq!(
+            find_daemon_in(&paths, &workspace, false),
+            Some(release.join("daemon"))
+        );
         fs::remove_dir_all(&paths.root).unwrap();
     }
 

@@ -17,7 +17,7 @@
 //!   payloads: concatenated tensor bytes in index order from data_offset.
 
 use byteorder::{ByteOrder, LittleEndian};
-use memmap2::{Advice, Mmap};
+use memmap2::Mmap;
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
@@ -234,11 +234,13 @@ impl HfqmPackage {
     pub fn open(path: &Path) -> Result<Self, HfqmError> {
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
+        // Hint sequential access: the quantizer walks tensor-by-tensor.
+        // `memmap2::Advice` only exists on unix; on other platforms the hint
+        // is a no-op and the call is compiled out entirely.
         #[cfg(unix)]
         {
-            mmap.advise(Advice::Sequential).ok();
+            mmap.advise(memmap2::Advice::Sequential).ok();
         }
-        let _ = Advice::Sequential;
 
         if mmap.len() < HEADER_SIZE {
             return Err(HfqmError::TruncatedFile {

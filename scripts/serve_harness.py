@@ -586,7 +586,7 @@ def _kill_serve():
     pgid = _serve_pgid
     if pgid is None and _serve_proc is not None:
         pgid = _serve_proc.pid
-    if pgid is not None:
+    if pgid is not None and hasattr(os, "killpg"):
         # rocprof must observe a normal target shutdown to flush its CSV trace.
         # The default remains the historical exact/fast SIGKILL cleanup; this
         # opt-in is developer tooling for HIPFIRE_DAEMON_BIN wrappers such as
@@ -626,6 +626,13 @@ def _kill_serve():
                         _serve_proc.kill()
                     except Exception:
                         pass
+    elif _serve_proc is not None:
+        # Windows: process groups are POSIX-only (os.killpg does not exist);
+        # kill the direct child and let its daemon child exit with it.
+        try:
+            _serve_proc.kill()
+        except Exception:
+            pass
     _serve_proc = None
     _serve_pgid = None
     _clear_pid_file()
@@ -633,10 +640,11 @@ def _kill_serve():
 
 def _native_cli():
     """Resolve the Rust control-plane binary."""
+    exe = ".exe" if os.name == "nt" else ""
     candidates = [
         os.environ.get("HIPFIRE_CLI_BIN"),
-        os.path.join(REPO, "target", "release", "hipfire"),
-        os.path.expanduser("~/.hipfire/bin/hipfire"),
+        os.path.join(REPO, "target", "release", f"hipfire{exe}"),
+        os.path.expanduser(f"~/.hipfire/bin/hipfire{exe}"),
         shutil.which("hipfire"),
     ]
     for candidate in candidates:
@@ -1914,7 +1922,9 @@ def spawn_serve(cfg, home, log):
     # process comm → the CLI's reapOrphans `pkill -x <name>` stays scoped to THIS
     # instance). HIPFIRE_DAEMON_NAME/ID pass through from os.environ untouched.
     env = dict(os.environ, HOME=home, HIP_VISIBLE_DEVICES=os.environ.get("HIP_VISIBLE_DEVICES","0"),
-               HIPFIRE_DAEMON_BIN=os.environ.get("HIPFIRE_DAEMON_BIN", os.path.join(REPO, "target/release/daemon")),
+               HIPFIRE_DAEMON_BIN=os.environ.get(
+                   "HIPFIRE_DAEMON_BIN",
+                   os.path.join(REPO, "target", "release", "daemon" + (".exe" if os.name == "nt" else ""))),
                HIPFIRE_KV_MODE=cfg["kv"], HIPFIRE_CASK_OFF="1", HIPFIRE_MODEL=cfg["model"])
     if cfg["mtp"] == "on":
         env.update(HIPFIRE_QWEN_MTP="1", HIPFIRE_MTP_SAMPLED="1")
@@ -2105,10 +2115,11 @@ def _tool_result_feedback(tool_call_id, content, feedback_shape=None, name=None)
 
 def _daemon_binary_md5():
     """Return (md5_hex, path) for the daemon binary per AGENTS.md discipline."""
-    cand = os.environ.get("HIPFIRE_DAEMON_BIN") or os.path.join(REPO, "target/release/daemon")
+    exe = ".exe" if os.name == "nt" else ""
+    cand = os.environ.get("HIPFIRE_DAEMON_BIN") or os.path.join(REPO, "target", "release", f"daemon{exe}")
     # Fallback to HIPFIRE_CLI_BIN if daemon not found
     if not os.path.exists(cand):
-        alt = os.environ.get("HIPFIRE_CLI_BIN") or os.path.join(REPO, "target/release/hipfire")
+        alt = os.environ.get("HIPFIRE_CLI_BIN") or os.path.join(REPO, "target", "release", f"hipfire{exe}")
         if os.path.exists(alt):
             cand = alt
     try:
