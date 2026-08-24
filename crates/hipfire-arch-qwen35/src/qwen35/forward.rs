@@ -1091,7 +1091,11 @@ impl Qwen35Scratch {
                 .as_deref()
                 == Some("1")
             {
-                let max_batch = super::prefill::prefill_max_batch(gpu);
+                let max_batch = if gpu.arch == "gfx1151" {
+                    super::prefill::prefill_max_batch(gpu).max(512)
+                } else {
+                    super::prefill::prefill_max_batch(gpu)
+                };
                 s.prefill_batch = Some(PrefillBatchScratch::new(gpu, config, max_batch)?);
             }
             Ok(s)

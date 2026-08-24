@@ -128,6 +128,40 @@ fn prefill_max_batch_for_arch(arch: &str) -> usize {
     }
 }
 
+fn explicit_prefill_max_batch() -> Option<usize> {
+    hipfire_config::developer_var("HIPFIRE_PREFILL_MAX_BATCH")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&v| v >= MIN_BATCH)
+}
+
+fn dense_ffn_is_mq4v2(weights: &Qwen35Weights) -> bool {
+    !weights.layers.is_empty()
+        && weights.layers.iter().all(|layer| match layer {
+            LayerWeights::DeltaNet(layer) => {
+                layer.w_gate.gpu_dtype == DType::MQ4G256V2
+                    && layer.w_up.gpu_dtype == DType::MQ4G256V2
+                    && layer.w_down.gpu_dtype == DType::MQ4G256V2
+            }
+            LayerWeights::FullAttn(layer) => {
+                layer.w_gate.gpu_dtype == DType::MQ4G256V2
+                    && layer.w_up.gpu_dtype == DType::MQ4G256V2
+                    && layer.w_down.gpu_dtype == DType::MQ4G256V2
+            }
+            LayerWeights::DeltaNetMoe(_) | LayerWeights::FullAttnMoe(_) => false,
+        })
+}
+
+fn prefill_max_batch_for_model(gpu: &Gpu, weights: &Qwen35Weights) -> usize {
+    explicit_prefill_max_batch().unwrap_or_else(|| {
+        if gpu.arch == "gfx1151" && dense_ffn_is_mq4v2(weights) {
+            512
+        } else {
+            prefill_max_batch_for_arch(gpu.arch.as_str())
+        }
+    })
+}
+
 /// Resolve the prefill chunk upper bound for `gpu`.
 ///
 /// Honors explicit `HIPFIRE_PREFILL_MAX_BATCH` when it parses as an integer
@@ -136,11 +170,7 @@ fn prefill_max_batch_for_arch(arch: &str) -> usize {
 /// arch string. Capped entry points further min with an explicit caller
 /// ceiling via `prefill_max_batch(gpu).min(max_batch_cap)`.
 pub fn prefill_max_batch(gpu: &Gpu) -> usize {
-    hipfire_config::developer_var("HIPFIRE_PREFILL_MAX_BATCH")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&v| v >= MIN_BATCH)
-        .unwrap_or_else(|| prefill_max_batch_for_arch(gpu.arch.as_str()))
+    explicit_prefill_max_batch().unwrap_or_else(|| prefill_max_batch_for_arch(gpu.arch.as_str()))
 }
 
 /// Effective per-chunk capacity for one prefill call.
@@ -722,7 +752,7 @@ fn forward_prefill_batch_with_pbs_opts_inner(
     // in N either way; raising the batch just amortizes the NON-DeltaNet
     // kernels more.
     let max_batch: usize = {
-        let configured = prefill_max_batch(gpu);
+        let configured = prefill_max_batch_for_model(gpu, weights);
         match max_batch_cap {
             Some(cap) => configured.min(cap),
             None => configured,
