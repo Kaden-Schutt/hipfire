@@ -252,6 +252,10 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `serve_max_queue` | `HIPFIRE_SERVE_MAX_QUEUE` |
 | `serve_queue_timeout_ms` | `HIPFIRE_SERVE_QUEUE_TIMEOUT_MS` |
 | `serve.local` | `HIPFIRE_LOCAL` |
+| `serve.multi_slot` | `HIPFIRE_SERVE_MULTI_SLOT` |
+| `serve.multi_slot_slots` | `HIPFIRE_SERVE_MULTI_SLOT_SLOTS` |
+| `serve.multi_slot_ctx` | `HIPFIRE_SERVE_MULTI_SLOT_CTX` |
+| `serve.multi_slot_prefill_chunk` | `HIPFIRE_SERVE_MULTI_SLOT_PREFILL_CHUNK` |
 | `prefill_*` | matching `HIPFIRE_PREFILL_*` |
 | `mmq_screen*` | `HIPFIRE_MMQ_SCREEN*` |
 | `hardware.devices` | `HIPFIRE_DEVICES`; synchronizes `ROCR_VISIBLE_DEVICES=<physical list>` with `HIP_VISIBLE_DEVICES=0..N-1` before GPU initialization |

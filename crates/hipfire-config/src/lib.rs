@@ -700,6 +700,48 @@ pub static FIELDS: &[ConfigField] = &[
         "Serve requests concurrently on the multi-slot engine instead of one at a time."
     ),
     field!(
+        "serve.multi_slot_slots",
+        "multi_slot_slots",
+        Serve,
+        Process,
+        DefaultValue::Integer(4),
+        ValueRule::Integer { min: 1, max: 64 },
+        false,
+        false,
+        Some("HIPFIRE_SERVE_MULTI_SLOT_SLOTS"),
+        "Concurrent slots for the multi-slot engine."
+    ),
+    field!(
+        "serve.multi_slot_ctx",
+        "multi_slot_ctx",
+        Serve,
+        Process,
+        DefaultValue::Integer(8192),
+        ValueRule::Integer {
+            min: 512,
+            max: 1048576
+        },
+        false,
+        false,
+        Some("HIPFIRE_SERVE_MULTI_SLOT_CTX"),
+        "Per-slot context capacity (tokens) for the multi-slot engine."
+    ),
+    field!(
+        "serve.multi_slot_prefill_chunk",
+        "multi_slot_prefill_chunk",
+        Serve,
+        Process,
+        DefaultValue::Integer(1024),
+        ValueRule::Integer {
+            min: 1,
+            max: 1048576
+        },
+        false,
+        false,
+        Some("HIPFIRE_SERVE_MULTI_SLOT_PREFILL_CHUNK"),
+        "Prefill tokens taken from one slot per multi-slot step; batch scratch is sized n_slots x this."
+    ),
+    field!(
         "generation.temperature",
         "temperature",
         Generation,
