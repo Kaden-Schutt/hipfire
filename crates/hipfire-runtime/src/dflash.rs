@@ -1851,6 +1851,20 @@ fn gemm_dispatch(
             chunked
         }
         DType::MQ3G256V2 => {
+            // Safety quarantine: repeated DFlash2 B=16 runs with an MQ3V2
+            // draft have dropped exact gfx1100 from the PCIe bus, while the
+            // ordinary MQ3V2 AR GEMV path is stable. Do not dispatch the
+            // gfx11 batched residual-WMMA kernel from DFlash on this arch.
+            // Row-wise `weight_gemv` is the same proven kernel path AR uses;
+            // gfx1151/gfx12 retain the batched route below.
+            if gpu.arch_caps.is_gfx1100() {
+                for row in 0..batch {
+                    let x_row = x.sub_offset(row * w.k, w.k);
+                    let y_row = y.sub_offset(row * w.m, w.m);
+                    crate::llama::weight_gemv(gpu, w, &x_row, &y_row)?;
+                }
+                return Ok(());
+            }
             let scratch = mq_x_rot.expect("MQ3V2 dispatch requires mq_x_rot scratch");
             let max_chunk = (scratch.shape[0] / w.k).max(1);
             gpu.scratch.fp16_x_source_ptr = std::ptr::null_mut();
