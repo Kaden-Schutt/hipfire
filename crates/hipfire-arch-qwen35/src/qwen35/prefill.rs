@@ -107,11 +107,9 @@ use rdna_compute::GpuTensor;
 /// smaller than a chunk will assert-fail on prompt seeding of long prompts).
 pub const PREFILL_MAX_BATCH: usize = 256;
 
-/// gfx1100/gfx1151 measured default prefill chunk size (Qwen3.8 MQ V2).
-/// Exact arch strings only; larger chunks improve gfx1151 MQ4V2 MMQ while
-/// leaving the historical path neutral.
+/// gfx1100-measured default prefill chunk size (Qwen3.8 / MQ4V2 gate-up BT path).
+/// Exact `gfx1100` only — not gfx1101/1102/1151 or other gfx11 variants.
 const PREFILL_DEFAULT_BATCH_GFX1100: usize = 512;
-const PREFILL_DEFAULT_BATCH_GFX1151: usize = 512;
 
 /// gfx1201-measured default prefill chunk size (Qwen3.8 prefill sweet spot).
 /// Exact `gfx1201` only — not gfx1200 or other gfx12 variants.
@@ -123,8 +121,6 @@ const PREFILL_DEFAULT_BATCH_GFX1201: usize = 384;
 fn prefill_max_batch_for_arch(arch: &str) -> usize {
     if arch == "gfx1100" {
         PREFILL_DEFAULT_BATCH_GFX1100
-    } else if arch == "gfx1151" {
-        PREFILL_DEFAULT_BATCH_GFX1151
     } else if arch == "gfx1201" {
         PREFILL_DEFAULT_BATCH_GFX1201
     } else {
@@ -135,10 +131,10 @@ fn prefill_max_batch_for_arch(arch: &str) -> usize {
 /// Resolve the prefill chunk upper bound for `gpu`.
 ///
 /// Honors explicit `HIPFIRE_PREFILL_MAX_BATCH` when it parses as an integer
-/// `>= MIN_BATCH` (2); otherwise returns the exact-arch default — 512 on
-/// gfx1100/gfx1151, 384 on gfx1201, [`PREFILL_MAX_BATCH`] (256) elsewhere.
-/// Capped entry points further min with an explicit caller ceiling via
-/// `prefill_max_batch(gpu).min(max_batch_cap)`.
+/// `>= MIN_BATCH` (2); otherwise returns the arch default — 512 on exact
+/// gfx1100, 384 on exact gfx1201, [`PREFILL_MAX_BATCH`] (256) on every other
+/// arch string. Capped entry points further min with an explicit caller
+/// ceiling via `prefill_max_batch(gpu).min(max_batch_cap)`.
 pub fn prefill_max_batch(gpu: &Gpu) -> usize {
     hipfire_config::developer_var("HIPFIRE_PREFILL_MAX_BATCH")
         .ok()
@@ -8073,24 +8069,20 @@ mod tests {
 
     #[test]
     fn prefill_max_batch_arch_defaults() {
-        // Exact gfx1100/gfx1151/gfx1201 get measured defaults. Every other
+        // Exact gfx1100 / gfx1201 alone get the measured defaults; every other
         // string keeps the conservative PREFILL_MAX_BATCH=256 ceiling.
+        // Pure helper — no process env mutation.
         assert_eq!(prefill_max_batch_for_arch("gfx1100"), 512);
         assert_eq!(
             prefill_max_batch_for_arch("gfx1100"),
             PREFILL_DEFAULT_BATCH_GFX1100
-        );
-        assert_eq!(prefill_max_batch_for_arch("gfx1151"), 512);
-        assert_eq!(
-            prefill_max_batch_for_arch("gfx1151"),
-            PREFILL_DEFAULT_BATCH_GFX1151
         );
         assert_eq!(prefill_max_batch_for_arch("gfx1201"), 384);
         assert_eq!(
             prefill_max_batch_for_arch("gfx1201"),
             PREFILL_DEFAULT_BATCH_GFX1201
         );
-        for arch in ["gfx1200", "gfx942", "unknown"] {
+        for arch in ["gfx1200", "gfx1151", "gfx942", "unknown"] {
             assert_eq!(
                 prefill_max_batch_for_arch(arch),
                 PREFILL_MAX_BATCH,
