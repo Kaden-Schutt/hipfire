@@ -227,6 +227,10 @@ def quant_for(file: str) -> str | None:
     m = re.search(r"[-.](mq\d)\.hfq$", file)
     if m:
         return m.group(1)
+    # Product ladder files: model.mq4 / model.mq4-xt / model.mq4-pro → quant mq4
+    m = re.search(r"\.(mq\d)(?:-(?:xt|pro))?$", file)
+    if m:
+        return m.group(1)
     ext = file.rsplit(".", 1)[-1]
     if ext in KNOWN_QUANTS:
         return ext

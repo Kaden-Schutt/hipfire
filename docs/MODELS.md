@@ -83,8 +83,20 @@ Several A3B entries carry an `mtp.file` sidecar name (`qwen3.6-35b-a3b.mtp`). MT
 
 | Tag | File | Size GB | Min VRAM | Default KV | Notes |
 |---|---|---:|---:|---|---|
-| `qwen3.8:27b` | `qwen3.8-27b.mq4` | 15.66 | 17 | q8 | MQ4 quality trunk; default |
-| `qwen3.8:27b-fast` | `qwen3.8-27b.mq4r` | 14.98 | 16 | q8 | MQ4R speed SKU |
+| `qwen3.8:27b-mq3-xt` | `qwen3.8-27b.mq3-xt` | 11.78 | 13 | q8 | MQ3V2 XT |
+| `qwen3.8:27b-mq3` | `qwen3.8-27b.mq3` | 12.62 | 14 | q8 | MQ3V2 base |
+| `qwen3.8:27b-mq3-pro` | `qwen3.8-27b.mq3-pro` | 13.18 | 15 | q8 | MQ3V2 Pro |
+| `qwen3.8:27b-mq4-xt` | `qwen3.8-27b.mq4-xt` | 14.98 | 16 | q8 | MQ4V2 XT (speed; supersedes legacy `.mq4r`) |
+| `qwen3.8:27b` | `qwen3.8-27b.mq4` | 15.66 | 17 | q8 | MQ4V2 base; default |
+| `qwen3.8:27b-mq4-pro` | `qwen3.8-27b.mq4-pro` | 16.46 | 18 | q8 | MQ4V2 Pro |
+| `qwen3.8:27b-mq5-xt` | `qwen3.8-27b.mq5-xt` | 18.18 | 20 | q8 | MQ5V2 XT |
+| `qwen3.8:27b-mq5` | `qwen3.8-27b.mq5` | 18.71 | 20 | q8 | MQ5V2 base |
+| `qwen3.8:27b-mq5-pro` | `qwen3.8-27b.mq5-pro` | 19.32 | 21 | q8 | MQ5V2 Pro |
+| `qwen3.8:27b-mq6-xt` | `qwen3.8-27b.mq6-xt` | 21.39 | 23 | q8 | MQ6V2 XT |
+| `qwen3.8:27b-mq6` | `qwen3.8-27b.mq6` | 21.75 | 23 | q8 | MQ6V2 base |
+| `qwen3.8:27b-mq6-pro` | `qwen3.8-27b.mq6-pro` | 22.17 | 24 | q8 | MQ6V2 Pro |
+
+MQ2V2 is not registered. Explicit `qwen3.8:27b-mq4` aliases to `qwen3.8:27b`. Legacy `qwen3.8:27b-fast` / `qwen3.8:fast` alias to `qwen3.8:27b-mq4-xt`.
 
 ### DFlash draft artifacts (registry)
 
@@ -95,6 +107,10 @@ Several A3B entries carry an `mtp.file` sidecar name (`qwen3.6-35b-a3b.mtp`). MT
 | `qwen3.5:27b-draft-mq3` | `qwen35-27b-dflash-mq3.hfq` | 0.67 | 12 | `qwen3.5:27b` (mq3 draft) |
 | `qwen3.6:27b-draft` | `qwen36-27b-dflash-mq4.hfq` | 0.92 | 16 | `qwen3.6:27b` |
 | `qwen3.6:27b-draft-mq3` | `qwen36-27b-dflash-mq3.hfq` | 0.67 | 12 | `qwen3.6:27b` |
+| `qwen3.8:27b-draft-mq3` | `qwen38-27b-dflash-mq3.hfq` | 0.98 | 16 | `qwen3.8:27b*` (same-bit alt) |
+| `qwen3.8:27b-draft-mq4` | `qwen38-27b-dflash-mq4.hfq` | 1.21 | 16 | `qwen3.8:27b*` (recommended controller) |
+| `qwen3.8:27b-draft-mq5` | `qwen38-27b-dflash-mq5.hfq` | 1.43 | 16 | `qwen3.8:27b*` (same-bit alt) |
+| `qwen3.8:27b-draft-mq6` | `qwen38-27b-dflash-mq6.hfq` | 1.66 | 16 | `qwen3.8:27b*` (same-bit alt) |
 | `muse-glimmer:draft` | `muse-glimmer-30b-dflash.mq4` | 1.36 | 26 | `muse-glimmer` / `muse-glimmer:fast` |
 
 Draft **loading** is controlled by `dflash_mode` / `speculation` / `HIPFIRE_DFLASH_DRAFT` ([`CONFIG.md`](CONFIG.md), [`env-vars.md`](env-vars.md)). Default `dflash_mode` is **off**. Filename auto-match may wire a sibling draft when present; that is discovery, not an admission that DFlash wins on every prompt.
@@ -237,7 +253,9 @@ downloads). **Partial table** — for the complete surface read that file or run
 | `qwen3.5:large` | `qwen3.5:27b` |
 | `qwen3.6` / `qwen3.6:a3b` | `qwen3.6:35b-a3b` |
 | `qwen3.8` / `qwen3.8:latest` | `qwen3.8:27b` |
-| `qwen3.8:fast` | `qwen3.8:27b-fast` |
+| `qwen3.8:fast` / `qwen3.8:27b-fast` | `qwen3.8:27b-mq4-xt` |
+| `qwen3.8:27b-mq4` | `qwen3.8:27b` |
+| `qwen3.8:draft` / `qwen3.8:27b-draft` | `qwen3.8:27b-draft-mq4` |
 | `muse-glimmer:latest` / `muse-glimmer:quality` / `muse-glimmer:30b` | `muse-glimmer` |
 | `qwen3` | `qwen3:8b` |
 | `carnice` | `carnice:9b` |

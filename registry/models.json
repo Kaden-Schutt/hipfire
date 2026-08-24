@@ -1,5 +1,5 @@
 {
-  "_comment": "Curated hipfire model registry overlay. Keep entry shape: { repo, file, size_gb, min_vram_gb, desc }. Empty repo = local-only. Aliases are simple string→string redirects. Run scripts/registry_gen.py after editing.",
+  "_comment": "Curated hipfire model registry overlay. Keep entry shape: { repo, file, size_gb, min_vram_gb, desc }. Empty repo = local-only. Aliases are simple string\u2192string redirects. Run scripts/registry_gen.py after editing.",
   "models": {
     "qwen3.5:0.8b": {
       "repo": "hipfire-models/qwen3.5-0.8b",
@@ -412,7 +412,7 @@
       "file": "qwen3.6-35b-a3b.mq2",
       "size_gb": 11.6,
       "min_vram_gb": 14,
-      "desc": "Floor SKU — smallest, coherent but degraded."
+      "desc": "Floor SKU \u2014 smallest, coherent but degraded."
     },
     "qwen3.6:35b-a3b-mq3p": {
       "recommended_settings": {
@@ -456,7 +456,7 @@
       "file": "qwen3.6-35b-a3b.mq3p",
       "size_gb": 17.2,
       "min_vram_gb": 20,
-      "desc": "MQ3+P graded — MQ4 quality at MQ3 size."
+      "desc": "MQ3+P graded \u2014 MQ4 quality at MQ3 size."
     },
     "qwen3.6:35b-a3b-mq4p": {
       "recommended_settings": {
@@ -500,7 +500,7 @@
       "file": "qwen3.6-35b-a3b.mq4p",
       "size_gb": 19.8,
       "min_vram_gb": 22,
-      "desc": "MQ4+P graded — robust 4-bit default, beats uniform MQ4."
+      "desc": "MQ4+P graded \u2014 robust 4-bit default, beats uniform MQ4."
     },
     "qwen3.6:35b-a3b-mfp4": {
       "recommended_settings": {
@@ -544,7 +544,7 @@
       "file": "qwen3.6-35b-a3b.mfp4",
       "size_gb": 20.2,
       "min_vram_gb": 22,
-      "desc": "MFP4-E8 vector quant — the 4-bit quality leader."
+      "desc": "MFP4-E8 vector quant \u2014 the 4-bit quality leader."
     },
     "qwen3.6:35b-a3b-mq5": {
       "recommended_settings": {
@@ -588,7 +588,7 @@
       "file": "qwen3.6-35b-a3b.mq5",
       "size_gb": 23.7,
       "min_vram_gb": 26,
-      "desc": "Quality SKU — ~80% MQ4->f32."
+      "desc": "Quality SKU \u2014 ~80% MQ4->f32."
     },
     "qwen3.6:35b-a3b-mq6": {
       "recommended_settings": {
@@ -695,13 +695,13 @@
         "file": "qwen3.6-27b.mq4.triattn.blended_v3.bin"
       }
     },
-    "qwen3.8:27b": {
+    "qwen3.8:27b-mq3-xt": {
       "repo": "hipfire-models/qwen3.8-27b",
-      "file": "qwen3.8-27b.mq4",
-      "size_gb": 15.66,
-      "min_vram_gb": 17,
+      "file": "qwen3.8-27b.mq3-xt",
+      "size_gb": 11.78,
+      "min_vram_gb": 13,
       "default_kv_mode": "q8",
-      "desc": "Qwen3.8 27B MQ4 text tower, native 262K context, xhigh thinking default. Quality trunk; qwen3.8:27b-fast is the cheaper MQ4R speed SKU. Validated on gfx1100/gfx1201.",
+      "desc": "Qwen3.8 27B MQ3V2 XT tier. Teacher KLD WT2 0.248 / v6sel 1.412. Smallest admitted V2 cell; native 262K context, xhigh thinking.",
       "recommended_settings": {
         "temperature": 1.0,
         "top_p": 0.95,
@@ -725,13 +725,313 @@
         }
       }
     },
-    "qwen3.8:27b-fast": {
+    "qwen3.8:27b-mq3": {
       "repo": "hipfire-models/qwen3.8-27b",
-      "file": "qwen3.8-27b.mq4r",
+      "file": "qwen3.8-27b.mq3",
+      "size_gb": 12.62,
+      "min_vram_gb": 14,
+      "default_kv_mode": "q8",
+      "desc": "Qwen3.8 27B MQ3V2 base tier. Teacher KLD WT2 0.154 / v6sel 1.032. Compact V2 SKU; native 262K context, xhigh thinking.",
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.0,
+        "reasoning_effort": "xhigh",
+        "thinking_budget": "uncapped"
+      },
+      "sampling_profiles": {
+        "general": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0,
+          "reasoning_effort": "xhigh",
+          "thinking_budget": "uncapped"
+        }
+      }
+    },
+    "qwen3.8:27b-mq3-pro": {
+      "repo": "hipfire-models/qwen3.8-27b",
+      "file": "qwen3.8-27b.mq3-pro",
+      "size_gb": 13.18,
+      "min_vram_gb": 15,
+      "default_kv_mode": "q8",
+      "desc": "Qwen3.8 27B MQ3V2 Pro tier. Teacher KLD WT2 0.130 / v6sel 0.925. Role-lifted MQ3V2; native 262K context, xhigh thinking.",
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.0,
+        "reasoning_effort": "xhigh",
+        "thinking_budget": "uncapped"
+      },
+      "sampling_profiles": {
+        "general": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0,
+          "reasoning_effort": "xhigh",
+          "thinking_budget": "uncapped"
+        }
+      }
+    },
+    "qwen3.8:27b-mq4-xt": {
+      "repo": "hipfire-models/qwen3.8-27b",
+      "file": "qwen3.8-27b.mq4-xt",
       "size_gb": 14.98,
       "min_vram_gb": 16,
       "default_kv_mode": "q8",
-      "desc": "Speed SKU of qwen3.8:27b, 0.68 GB smaller than the quality trunk. The .mq4r suffix marks it an MQ4R Redline SKU, so a single-GPU load on gfx1100/gfx1151/gfx1201 takes the automatic Redline PM4 route.",
+      "desc": "Qwen3.8 27B MQ4V2 XT tier (speed). Teacher KLD WT2 0.057 / v6sel 0.771. Supersedes legacy .mq4r / qwen3.8:27b-fast; native 262K context, xhigh thinking.",
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.0,
+        "reasoning_effort": "xhigh",
+        "thinking_budget": "uncapped"
+      },
+      "sampling_profiles": {
+        "general": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0,
+          "reasoning_effort": "xhigh",
+          "thinking_budget": "uncapped"
+        }
+      }
+    },
+    "qwen3.8:27b": {
+      "repo": "hipfire-models/qwen3.8-27b",
+      "file": "qwen3.8-27b.mq4",
+      "size_gb": 15.66,
+      "min_vram_gb": 17,
+      "default_kv_mode": "q8",
+      "desc": "Qwen3.8 27B MQ4V2 base tier (default). Teacher KLD WT2 0.039 / v6sel 0.545. Quality trunk; native 262K context, xhigh thinking. Pair with qwen3.8:27b-draft (MQ4); same-bit draft alternatives available.",
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.0,
+        "reasoning_effort": "xhigh",
+        "thinking_budget": "uncapped"
+      },
+      "sampling_profiles": {
+        "general": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0,
+          "reasoning_effort": "xhigh",
+          "thinking_budget": "uncapped"
+        }
+      }
+    },
+    "qwen3.8:27b-mq4-pro": {
+      "repo": "hipfire-models/qwen3.8-27b",
+      "file": "qwen3.8-27b.mq4-pro",
+      "size_gb": 16.46,
+      "min_vram_gb": 18,
+      "default_kv_mode": "q8",
+      "desc": "Qwen3.8 27B MQ4V2 Pro tier. Teacher KLD WT2 0.032 / v6sel 0.484. Role-lifted MQ4V2; native 262K context, xhigh thinking.",
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.0,
+        "reasoning_effort": "xhigh",
+        "thinking_budget": "uncapped"
+      },
+      "sampling_profiles": {
+        "general": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0,
+          "reasoning_effort": "xhigh",
+          "thinking_budget": "uncapped"
+        }
+      }
+    },
+    "qwen3.8:27b-mq5-xt": {
+      "repo": "hipfire-models/qwen3.8-27b",
+      "file": "qwen3.8-27b.mq5-xt",
+      "size_gb": 18.18,
+      "min_vram_gb": 20,
+      "default_kv_mode": "q8",
+      "desc": "Qwen3.8 27B MQ5V2 XT tier. Teacher KLD WT2 0.015 / v6sel 0.441. Native 262K context, xhigh thinking.",
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.0,
+        "reasoning_effort": "xhigh",
+        "thinking_budget": "uncapped"
+      },
+      "sampling_profiles": {
+        "general": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0,
+          "reasoning_effort": "xhigh",
+          "thinking_budget": "uncapped"
+        }
+      }
+    },
+    "qwen3.8:27b-mq5": {
+      "repo": "hipfire-models/qwen3.8-27b",
+      "file": "qwen3.8-27b.mq5",
+      "size_gb": 18.71,
+      "min_vram_gb": 20,
+      "default_kv_mode": "q8",
+      "desc": "Qwen3.8 27B MQ5V2 base tier. Teacher KLD WT2 0.010 / v6sel 0.278. Native 262K context, xhigh thinking.",
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.0,
+        "reasoning_effort": "xhigh",
+        "thinking_budget": "uncapped"
+      },
+      "sampling_profiles": {
+        "general": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0,
+          "reasoning_effort": "xhigh",
+          "thinking_budget": "uncapped"
+        }
+      }
+    },
+    "qwen3.8:27b-mq5-pro": {
+      "repo": "hipfire-models/qwen3.8-27b",
+      "file": "qwen3.8-27b.mq5-pro",
+      "size_gb": 19.32,
+      "min_vram_gb": 21,
+      "default_kv_mode": "q8",
+      "desc": "Qwen3.8 27B MQ5V2 Pro tier. Teacher KLD WT2 0.009 / v6sel 0.238. Role-lifted MQ5V2; native 262K context, xhigh thinking.",
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.0,
+        "reasoning_effort": "xhigh",
+        "thinking_budget": "uncapped"
+      },
+      "sampling_profiles": {
+        "general": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0,
+          "reasoning_effort": "xhigh",
+          "thinking_budget": "uncapped"
+        }
+      }
+    },
+    "qwen3.8:27b-mq6-xt": {
+      "repo": "hipfire-models/qwen3.8-27b",
+      "file": "qwen3.8-27b.mq6-xt",
+      "size_gb": 21.39,
+      "min_vram_gb": 23,
+      "default_kv_mode": "q8",
+      "desc": "Qwen3.8 27B MQ6V2 XT tier. Teacher KLD WT2 0.0044 / v6sel 0.221. Native 262K context, xhigh thinking.",
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.0,
+        "reasoning_effort": "xhigh",
+        "thinking_budget": "uncapped"
+      },
+      "sampling_profiles": {
+        "general": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0,
+          "reasoning_effort": "xhigh",
+          "thinking_budget": "uncapped"
+        }
+      }
+    },
+    "qwen3.8:27b-mq6": {
+      "repo": "hipfire-models/qwen3.8-27b",
+      "file": "qwen3.8-27b.mq6",
+      "size_gb": 21.75,
+      "min_vram_gb": 23,
+      "default_kv_mode": "q8",
+      "desc": "Qwen3.8 27B MQ6V2 base tier. Teacher KLD WT2 0.0028 / v6sel 0.153. Highest-quality admitted V2 base; native 262K context, xhigh thinking.",
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.0,
+        "reasoning_effort": "xhigh",
+        "thinking_budget": "uncapped"
+      },
+      "sampling_profiles": {
+        "general": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0,
+          "reasoning_effort": "xhigh",
+          "thinking_budget": "uncapped"
+        }
+      }
+    },
+    "qwen3.8:27b-mq6-pro": {
+      "repo": "hipfire-models/qwen3.8-27b",
+      "file": "qwen3.8-27b.mq6-pro",
+      "size_gb": 22.17,
+      "min_vram_gb": 24,
+      "default_kv_mode": "q8",
+      "desc": "Qwen3.8 27B MQ6V2 Pro tier. Teacher KLD WT2 0.0022 / v6sel 0.137. Top admitted V2 cell; native 262K context, xhigh thinking.",
       "recommended_settings": {
         "temperature": 1.0,
         "top_p": 0.95,
@@ -794,7 +1094,7 @@
       "file": "qwen3.5-9b.mq3",
       "size_gb": 4.57,
       "min_vram_gb": 6.1,
-      "desc": "MQ3 alpha (3.25 bpw, gfx11/gfx12). Smaller than MQ4, comparable decode. Quality eval pending — see issue #113. Sub-9B MQ3 not shipped — see #114.",
+      "desc": "MQ3 alpha (3.25 bpw, gfx11/gfx12). Smaller than MQ4, comparable decode. Quality eval pending \u2014 see issue #113. Sub-9B MQ3 not shipped \u2014 see #114.",
       "default_kv_mode": "q8",
       "quant_recipe": "v3-awq-f1"
     },
@@ -803,7 +1103,7 @@
       "file": "qwen3.5-27b.mq3",
       "size_gb": 10.7,
       "min_vram_gb": 12,
-      "desc": "MQ3 alpha — fits 128K asym3 ctx on 24 GB (MQ4 OOMs at ~98K). gfx11/gfx12 only."
+      "desc": "MQ3 alpha \u2014 fits 128K asym3 ctx on 24 GB (MQ4 OOMs at ~98K). gfx11/gfx12 only."
     },
     "qwen3.6:27b-mq3": {
       "recommended_settings": {
@@ -816,14 +1116,14 @@
       "file": "qwen3.6-27b.mq3",
       "size_gb": 10.7,
       "min_vram_gb": 12,
-      "desc": "MQ3 alpha — fits 128K asym3 ctx on 24 GB. Pairs well with mq4 DFlash draft (126 tok/s τ=7.0)."
+      "desc": "MQ3 alpha \u2014 fits 128K asym3 ctx on 24 GB. Pairs well with mq4 DFlash draft (126 tok/s \u03c4=7.0)."
     },
     "qwen3.5:27b-draft-mq3": {
       "repo": "hipfire-models/qwen3.5-27b",
       "file": "qwen35-27b-dflash-mq3.hfq",
       "size_gb": 0.67,
       "min_vram_gb": 12,
-      "desc": "MQ3 DFlash draft for qwen3.5:27b — 671 MB vs 920 MB MQ4 draft. ~30% lower τ on code prompts; trades draft VRAM for ctx fit."
+      "desc": "MQ3 DFlash draft for qwen3.5:27b \u2014 671 MB vs 920 MB MQ4 draft. ~30% lower \u03c4 on code prompts; trades draft VRAM for ctx fit."
     },
     "qwen3.6:27b-draft-mq3": {
       "recommended_settings": {
@@ -867,19 +1167,47 @@
       "min_vram_gb": 3,
       "desc": "2B, HF6 (legacy 6-bit), higher quality"
     },
+    "qwen3.8:27b-draft-mq3": {
+      "repo": "hipfire-models/qwen3.8-27b",
+      "file": "qwen38-27b-dflash-mq3.hfq",
+      "size_gb": 0.98,
+      "min_vram_gb": 16,
+      "desc": "MQ3 DFlash draft for qwen3.8:27b (arch 20). Same-bit alternative; MQ4 draft is the recommended controller."
+    },
+    "qwen3.8:27b-draft-mq4": {
+      "repo": "hipfire-models/qwen3.8-27b",
+      "file": "qwen38-27b-dflash-mq4.hfq",
+      "size_gb": 1.21,
+      "min_vram_gb": 16,
+      "desc": "MQ4 DFlash draft for qwen3.8:27b (arch 20). Recommended controller draft across the MQ3\u2013MQ6 V2 ladder; same-bit mq3/mq5/mq6 alternatives available."
+    },
+    "qwen3.8:27b-draft-mq5": {
+      "repo": "hipfire-models/qwen3.8-27b",
+      "file": "qwen38-27b-dflash-mq5.hfq",
+      "size_gb": 1.43,
+      "min_vram_gb": 16,
+      "desc": "MQ5 DFlash draft for qwen3.8:27b (arch 20). Same-bit alternative; MQ4 draft is the recommended controller."
+    },
+    "qwen3.8:27b-draft-mq6": {
+      "repo": "hipfire-models/qwen3.8-27b",
+      "file": "qwen38-27b-dflash-mq6.hfq",
+      "size_gb": 1.66,
+      "min_vram_gb": 16,
+      "desc": "MQ6 DFlash draft for qwen3.8:27b (arch 20). Same-bit alternative; MQ4 draft is the recommended controller."
+    },
     "qwen3.5:9b-draft": {
       "repo": "hipfire-models/qwen3.5-9b",
       "file": "qwen35-9b-dflash-mq4.hfq",
       "size_gb": 0.55,
       "min_vram_gb": 6,
-      "desc": "DFlash draft for qwen3.5:9b — pairs with target for 2-3× decode on code/instruct"
+      "desc": "DFlash draft for qwen3.5:9b \u2014 pairs with target for 2-3\u00d7 decode on code/instruct"
     },
     "qwen3.5:27b-draft": {
       "repo": "hipfire-models/qwen3.5-27b",
       "file": "qwen35-27b-dflash-mq4.hfq",
       "size_gb": 0.92,
       "min_vram_gb": 16,
-      "desc": "DFlash draft for qwen3.5:27b — pairs with target for 4× decode on code (212 tok/s peak)"
+      "desc": "DFlash draft for qwen3.5:27b \u2014 pairs with target for 4\u00d7 decode on code (212 tok/s peak)"
     },
     "qwen3.6:27b-draft": {
       "recommended_settings": {
@@ -892,7 +1220,7 @@
       "file": "qwen36-27b-dflash-mq4.hfq",
       "size_gb": 0.92,
       "min_vram_gb": 16,
-      "desc": "DFlash draft for qwen3.6:27b — pairs with target for ~4× decode on code (refreshed 2026-04-27 from z-lab@0919688)"
+      "desc": "DFlash draft for qwen3.6:27b \u2014 pairs with target for ~4\u00d7 decode on code (refreshed 2026-04-27 from z-lab@0919688)"
     },
     "carnice:9b": {
       "repo": "hipfire-models/carnice-9b",
@@ -1108,7 +1436,7 @@
       "sha256": "47ccfccddbef5b8e14040bae567c87129669fa9451f0c6b15d8f35964fce7503",
       "min_vram_gb": 24,
       "default_kv_mode": "q8",
-      "desc": "Speed SKU of muse-glimmer: MQ4 body AND MQ4 attention with a Q8 lm_head, 2.35 GB smaller and ~14% faster AR decode than the quality trunk (32.3 vs 28.4 tok/s, gfx1201, 2026-08-14 — registry text, not a live baseline). The .mq4r suffix marks it an MQ4R Redline SKU, but it is not lowered to Redline PM4 yet, so automatic Redline admission is withheld.",
+      "desc": "Speed SKU of muse-glimmer: MQ4 body AND MQ4 attention with a Q8 lm_head, 2.35 GB smaller and ~14% faster AR decode than the quality trunk (32.3 vs 28.4 tok/s, gfx1201, 2026-08-14 \u2014 registry text, not a live baseline). The .mq4r suffix marks it an MQ4R Redline SKU, but it is not lowered to Redline PM4 yet, so automatic Redline admission is withheld.",
       "recommended_settings": {
         "temperature": 1.0,
         "top_p": 0.95,
@@ -1139,7 +1467,7 @@
       "size_bytes": 1357990400,
       "sha256": "6fc0988e51689abf24c2e43d5b1f44794be3409484f99a115d36484ea0e23d2d",
       "min_vram_gb": 26,
-      "desc": "DFlash draft for muse-glimmer (muse_glimmer_assistant, arch 23) — 5-layer block-diffusion head that reuses the target's embed and lm_head. Pairs with either SKU. Attach with HIPFIRE_DFLASH_DRAFT; there is no filename auto-pairing."
+      "desc": "DFlash draft for muse-glimmer (muse_glimmer_assistant, arch 23) \u2014 5-layer block-diffusion head that reuses the target's embed and lm_head. Pairs with either SKU. Attach with HIPFIRE_DFLASH_DRAFT; there is no filename auto-pairing."
     },
     "bonsai:27b-bq1": {
       "repo": "hipfire-models/bonsai-27b",
@@ -1170,7 +1498,11 @@
     "qwen3.6:a3b": "qwen3.6:35b-a3b",
     "qwen3.8": "qwen3.8:27b",
     "qwen3.8:latest": "qwen3.8:27b",
-    "qwen3.8:fast": "qwen3.8:27b-fast",
+    "qwen3.8:fast": "qwen3.8:27b-mq4-xt",
+    "qwen3.8:27b-fast": "qwen3.8:27b-mq4-xt",
+    "qwen3.8:27b-mq4": "qwen3.8:27b",
+    "qwen3.8:27b-draft": "qwen3.8:27b-draft-mq4",
+    "qwen3.8:draft": "qwen3.8:27b-draft-mq4",
     "qwen3": "qwen3:8b",
     "carnice": "carnice:9b",
     "qwopus": "qwopus:9b",
