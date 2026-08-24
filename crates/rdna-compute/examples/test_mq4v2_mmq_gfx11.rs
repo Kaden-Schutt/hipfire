@@ -27,7 +27,7 @@ const GROUP: usize = 256;
 const HALF: usize = 128;
 const GROUP_BYTES: usize = 136;
 const K: usize = 512;
-const M: usize = 32; // tail of MMQ_Y=128
+const M: usize = 128; // aligned MMQ_Y tile exercises _full_set/_full_add
 const REL_RMS_LIMIT: f64 = 0.002;
 const CANARY: f32 = 7.654_321;
 
@@ -361,7 +361,7 @@ fn main() {
     }
 
     assert_eq!(K % 256, 0);
-    assert!(M % 128 != 0, "M must be a tail of the 128-row MMQ tile");
+    assert_eq!(M % 128, 0, "M must cover an aligned 128-row MMQ tile");
 
     let w = build_disjoint_halves(M, K);
     let blob = pack_mq4g256v2(&w, M, K);
