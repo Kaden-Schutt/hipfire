@@ -135,18 +135,35 @@ fn explicit_prefill_max_batch() -> Option<usize> {
         .filter(|&v| v >= MIN_BATCH)
 }
 
-fn dense_ffn_is_mq4v2(weights: &Qwen35Weights) -> bool {
+fn dense_layers_are_all_mq4v2(weights: &Qwen35Weights) -> bool {
     !weights.layers.is_empty()
         && weights.layers.iter().all(|layer| match layer {
             LayerWeights::DeltaNet(layer) => {
-                layer.w_gate.gpu_dtype == DType::MQ4G256V2
-                    && layer.w_up.gpu_dtype == DType::MQ4G256V2
-                    && layer.w_down.gpu_dtype == DType::MQ4G256V2
+                [
+                    &layer.wqkv,
+                    &layer.wz,
+                    &layer.w_alpha,
+                    &layer.w_beta,
+                    &layer.wo,
+                    &layer.w_gate,
+                    &layer.w_up,
+                    &layer.w_down,
+                ]
+                .iter()
+                .all(|weight| weight.gpu_dtype == DType::MQ4G256V2)
             }
             LayerWeights::FullAttn(layer) => {
-                layer.w_gate.gpu_dtype == DType::MQ4G256V2
-                    && layer.w_up.gpu_dtype == DType::MQ4G256V2
-                    && layer.w_down.gpu_dtype == DType::MQ4G256V2
+                [
+                    &layer.wq,
+                    &layer.wk,
+                    &layer.wv,
+                    &layer.wo,
+                    &layer.w_gate,
+                    &layer.w_up,
+                    &layer.w_down,
+                ]
+                .iter()
+                .all(|weight| weight.gpu_dtype == DType::MQ4G256V2)
             }
             LayerWeights::DeltaNetMoe(_) | LayerWeights::FullAttnMoe(_) => false,
         })
@@ -154,7 +171,7 @@ fn dense_ffn_is_mq4v2(weights: &Qwen35Weights) -> bool {
 
 fn prefill_max_batch_for_model(gpu: &Gpu, weights: &Qwen35Weights) -> usize {
     explicit_prefill_max_batch().unwrap_or_else(|| {
-        if gpu.arch == "gfx1151" && dense_ffn_is_mq4v2(weights) {
+        if gpu.arch == "gfx1151" && dense_layers_are_all_mq4v2(weights) {
             512
         } else {
             prefill_max_batch_for_arch(gpu.arch.as_str())

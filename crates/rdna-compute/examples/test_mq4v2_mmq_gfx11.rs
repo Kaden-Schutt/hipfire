@@ -28,7 +28,7 @@ const HALF: usize = 128;
 const GROUP_BYTES: usize = 136;
 const K: usize = 512;
 const M: usize = 32; // tail of MMQ_Y=128
-const REL_RMS_LIMIT: f64 = 0.01;
+const REL_RMS_LIMIT: f64 = 0.002;
 const CANARY: f32 = 7.654_321;
 
 fn f16_to_f32(bits: u16) -> f32 {

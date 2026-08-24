@@ -3387,23 +3387,9 @@ fn main() {
                 let _ = gpu.hip.device_synchronize();
                 let elapsed = t0.elapsed().as_secs_f64();
                 let capture_summary = if capture {
-                    match gpu.replay.finish_capture() {
-                        Ok(summary) => Some(summary),
-                        Err(reason) => {
-                            emit_uncorrelated_error(
-                                &mut stdout,
-                                None,
-                                &format!("redline prefill capture failed: {reason}"),
-                                "internal",
-                                false,
-                                false,
-                            );
-                            let _ = stdout.flush();
-                            continue;
-                        }
-                    }
+                    gpu.replay.finish_capture().map(Some)
                 } else {
-                    None
+                    Ok(None)
                 };
 
                 // Reset state AFTER measurement — we've written N KV slots and a
@@ -3421,6 +3407,21 @@ fn main() {
                         gpu.invalidate_graph_state();
                     }
                 }
+                let capture_summary = match capture_summary {
+                    Ok(summary) => summary,
+                    Err(reason) => {
+                        emit_uncorrelated_error(
+                            &mut stdout,
+                            None,
+                            &format!("redline prefill capture failed: {reason}"),
+                            "internal",
+                            false,
+                            false,
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                };
 
                 if run_ok {
                     let tok_s = if elapsed > 0.0 {
@@ -3428,17 +3429,28 @@ fn main() {
                     } else {
                         0.0
                     };
-                    let mut response = serde_json::json!({
-                        "type": "prefill_result",
-                        "tokens": n,
-                        "ms": elapsed * 1000.0,
-                        "tok_s": tok_s,
-                    });
                     if let Some(summary) = capture_summary {
-                        response["redline_capture"] =
-                            redline_capture_json(&gpu, summary, capture_detail);
+                        let response = serde_json::json!({
+                            "type": "prefill_result",
+                            "tokens": n,
+                            "ms": elapsed * 1000.0,
+                            "tok_s": tok_s,
+                            "redline_capture": redline_capture_json(
+                                &gpu,
+                                summary,
+                                capture_detail,
+                            ),
+                        });
+                        let _ = writeln!(stdout, "{response}");
+                    } else {
+                        let _ = writeln!(
+                            stdout,
+                            r#"{{"type":"prefill_result","tokens":{},"ms":{:.2},"tok_s":{:.1}}}"#,
+                            n,
+                            elapsed * 1000.0,
+                            tok_s
+                        );
                     }
-                    let _ = writeln!(stdout, "{response}");
                 } else {
                     emit_uncorrelated_error(
                         &mut stdout,
