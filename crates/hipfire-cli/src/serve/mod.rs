@@ -8,15 +8,28 @@
 //! and the `serve` subcommand entrypoints. Centralises all state that must be
 //! shared across HTTP workers so transport changes stay isolated.
 
+use crate::{
+    config_bool, config_f64, config_i64, config_string, config_u64, find_daemon, find_model_path,
+    http_get_json, list_local_models, load_params, probe_host, pull_command, resolved_for_model,
+    resolved_global, ListArgs, Paths, PullArgs, ServeArgs, StopArgs,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use hipfire_client::Engine;
-use hipfire_config::{ConfigLayer, ConfigSource, NamedLayer, resolve, load_global, load_catalog};
+use hipfire_config::{load_catalog, load_global, resolve, ConfigLayer, ConfigSource, NamedLayer};
 use hipfire_registry::{load as load_registry, RegistryV1};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{collections::{BTreeMap, BTreeSet}, env, fs, io::{Read, Write}, path::{Path, PathBuf}, process::{Child, Command}, sync::{Arc, Condvar, Mutex}, thread, time::{Duration, Instant}};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    env, fs,
+    io::{Read, Write},
+    path::{Path, PathBuf},
+    process::{Child, Command},
+    sync::{Arc, Condvar, Mutex},
+    thread,
+    time::{Duration, Instant},
+};
 use tiny_http::Server;
-use crate::{Paths, ServeArgs, StopArgs, PullArgs, ListArgs, config_bool, config_string, config_u64, config_f64, config_i64, resolved_global, find_model_path, resolved_for_model, load_params, pull_command, list_local_models, http_get_json, find_daemon, probe_host};
 
 pub(crate) mod metrics;
 
@@ -446,7 +459,6 @@ pub(crate) fn batch_messages_are_single_user(body: &serde_json::Value) -> bool {
     }
 }
 
-
 pub(crate) fn serve_command(paths: &Paths, mut args: ServeArgs) -> Result<()> {
     let (_, resolved) = resolved_global(paths, true)?;
     let default_host = config_string(&resolved, "serve.host")?;
@@ -682,36 +694,46 @@ pub(crate) fn serve_foreground(
     // Opt-in concurrent backend. Built before ServeShared so a failure here is
     // a clean startup error rather than a half-configured server.
     #[cfg(feature = "multi-slot")]
-    let slot_engine: Option<Arc<slots::SlotBackend>> = match config_bool(&global, "serve.multi_slot") {
-        Ok(true) => {
-            let model_path = find_model_path(paths, &registry, &default_model)
-                .ok_or_else(|| anyhow!("multi_slot: cannot resolve model {default_model}"))?;
-            let n_slots = config_u64(&global, "serve.multi_slot_slots").unwrap_or(4) as usize;
-            let cap_tokens = config_u64(&global, "serve.multi_slot_ctx").unwrap_or(8192) as usize;
-            let mut hfq = hipfire_runtime::hfq::HfqFile::open(&model_path)
-                .with_context(|| format!("multi_slot: open {}", model_path.display()))?;
-            let tokenizer =
-                hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
-                    .map_err(|e| anyhow!("multi_slot: tokenizer: {e}"))?;
-            drop(hfq);
-            let engine = hipfire_arch_qwen35::serve_engine::SlotEngine::spawn(
-                hipfire_arch_qwen35::serve_engine::EngineConfig {
-                    model_path: model_path.clone(),
-                    n_slots,
-                    cap_tokens,
-                    host_budget_bytes: 16 * 1024 * 1024 * 1024,
-                    swap_dir: std::env::temp_dir().join("hipfire-serve-swap"),
-                },
-            )
-            .map_err(|e| anyhow!("multi_slot: {e}"))?;
-            eprintln!(
-                "serve: multi-slot backend up ({} slots, {} ctx) - requests run concurrently",
-                n_slots, cap_tokens
-            );
-            Some(Arc::new(slots::SlotBackend { engine, tokenizer }))
-        }
-        _ => None,
-    };
+    let slot_engine: Option<Arc<slots::SlotBackend>> =
+        match config_bool(&global, "serve.multi_slot") {
+            Ok(true) => {
+                let model_path = find_model_path(paths, &registry, &default_model)
+                    .ok_or_else(|| anyhow!("multi_slot: cannot resolve model {default_model}"))?;
+                let n_slots = config_u64(&global, "serve.multi_slot_slots").unwrap_or(4) as usize;
+                let cap_tokens =
+                    config_u64(&global, "serve.multi_slot_ctx").unwrap_or(8192) as usize;
+                let mut hfq = hipfire_runtime::hfq::HfqFile::open(&model_path)
+                    .with_context(|| format!("multi_slot: open {}", model_path.display()))?;
+                let tokenizer =
+                    hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
+                        .map_err(|e| anyhow!("multi_slot: tokenizer: {e}"))?;
+                drop(hfq);
+                // The engine runs IN this process, so hardware.devices /
+                // HIPFIRE_DEVICES must be applied here — the daemon does this in
+                // its own startup, which an in-process backend never runs.
+                // Without it the engine always lands on device 0.
+                hipfire_config::apply_device_visibility(&process_config)
+                    .map_err(|e| anyhow!("multi_slot: device visibility: {e}"))?;
+                let engine = hipfire_arch_qwen35::serve_engine::SlotEngine::spawn(
+                    hipfire_arch_qwen35::serve_engine::EngineConfig {
+                        model_path: model_path.clone(),
+                        n_slots,
+                        cap_tokens,
+                        prefill_chunk: config_u64(&global, "serve.multi_slot_prefill_chunk")
+                            .unwrap_or(1024) as usize,
+                        host_budget_bytes: 16 * 1024 * 1024 * 1024,
+                        swap_dir: std::env::temp_dir().join("hipfire-serve-swap"),
+                    },
+                )
+                .map_err(|e| anyhow!("multi_slot: {e}"))?;
+                eprintln!(
+                    "serve: multi-slot backend up ({} slots, {} ctx) - requests run concurrently",
+                    n_slots, cap_tokens
+                );
+                Some(Arc::new(slots::SlotBackend { engine, tokenizer }))
+            }
+            _ => None,
+        };
     #[cfg(not(feature = "multi-slot"))]
     let slot_engine: Option<Arc<slots::SlotBackend>> = None;
     let slot_concurrency = if slot_engine.is_some() {
@@ -878,7 +900,6 @@ pub(crate) fn format_bind(host: &str, port: u16) -> String {
         format!("{host}:{port}")
     }
 }
-
 
 pub(crate) fn should_prewarm_qwen_mq4r_decode(
     path: &Path,
@@ -1061,7 +1082,11 @@ pub(crate) fn pid_owns_listen_port(pid: u32, port: u16) -> Option<bool> {
     Some(false)
 }
 
-pub(crate) fn validate_serve_pid(record: &ServePidRecord, host: &str, fallback_port: u16) -> Result<()> {
+pub(crate) fn validate_serve_pid(
+    record: &ServePidRecord,
+    host: &str,
+    fallback_port: u16,
+) -> Result<()> {
     let proc_dir = PathBuf::from(format!("/proc/{}", record.pid));
     if !proc_dir.is_dir() {
         bail!("tracked serve PID {} is no longer alive", record.pid);
@@ -1195,9 +1220,17 @@ mod tests {
     use super::*;
     use crate::{Cli, Commands, Paths, ServeArgs, StopArgs};
     use clap::Parser;
-    use hipfire_config::{ConfigLayer, ConfigPaths, ConfigSource, NamedLayer, resolve, load_global};
-    use hipfire_registry::{RegistryV1, RegistryPaths};
-    use std::{env, fs, path::{Path, PathBuf}, thread, time::{Duration, Instant}, sync::{Arc, Mutex, mpsc}};
+    use hipfire_config::{
+        load_global, resolve, ConfigLayer, ConfigPaths, ConfigSource, NamedLayer,
+    };
+    use hipfire_registry::{RegistryPaths, RegistryV1};
+    use std::{
+        env, fs,
+        path::{Path, PathBuf},
+        sync::{mpsc, Arc, Mutex},
+        thread,
+        time::{Duration, Instant},
+    };
     fn test_paths(label: &str) -> Paths {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
