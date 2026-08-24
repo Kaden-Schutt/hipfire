@@ -1,6 +1,43 @@
 # Changelog
 
-## v0.3.0 — MQ4R + Redline across RDNA
+## v0.3.0 — MQ V2 wire schema, Bonsai, Redline across RDNA
+
+### Quant wire schema (Bonsai + Magnum V2)
+
+This release locks the HFQM quant-type register through qt=50 and lands the
+Magnum V2 header family for dense Qwen3.8 bodies. Authoritative IDs live in
+[`docs/quant-formats/qt-register.txt`](docs/quant-formats/qt-register.txt);
+layout and product boundary in
+[`docs/quant-formats/mq4-v2.md`](docs/quant-formats/mq4-v2.md),
+[`docs/quant-formats/mq-v2-family.md`](docs/quant-formats/mq-v2-family.md), and
+[`docs/quant-formats/ladder.md`](docs/quant-formats/ladder.md).
+
+- **Bonsai (passthrough):** qt=40 `TQ2G128` (ternary), qt=41 `BQ1G128` (1-bit).
+- **Magnum GL (passthrough):** qt=38 `MQ2G256GL`, qt=39 `MQ3G256GL`.
+- **Magnum V2 (passthrough):** dual fp16 scale+zero per 128 weights, same group
+  strides as v1 payloads — qt=44 `MQ4G256V2` (136 B), qt=45 `MQ4CG256` (136 B
+  padded-compat), qt=47 `MQ6G256V2` (200 B), qt=48 `MQ5G256V2` (168 B),
+  qt=49 `MQ3G256V2` (104 B), qt=50 `MQ2G256V2` (72 B). Bits 2/3/4/5/6 group
+  bytes are 72/104/136/168/200.
+- **CLI alias:** `--format mq4` resolves **qt=44 MQ4G256V2**. Legacy v1 MQ4
+  remains `mq4v1` / `mq4g256` / `magnum` (qt=13). Artifacts self-describe by
+  qt; old files are not reinterpreted.
+- **Product ladder:** `mqN` / `mqN-xt` / `mqN pro` name measured model-bpw
+  class and role lifts, not codec generation. Dense Qwen3.8 has measured
+  evidence for MQ3–MQ6 V2 cells. **MQ2V2 is wire- and runtime-supported but
+  quality-rejected** (catastrophic KLD on the dated ladder); do not ship or
+  advertise it as a product body.
+- **Cross-arch runtime (measured policy, not undated tok/s claims):** gfx1151
+  weight-reuse defaults across V2 ops bits 2–6; gfx1201 QKV BT8 for bits
+  2/4/5/6 (MQ3 base); gfx1100 MQ4 adaptive reuse and base V2 WMMA.
+  Capture/replay retain fixed contracts; unsupported surfaces fail closed or
+  fall back rather than inventing routes.
+
+Operator and design docs:
+[`docs/QUANTIZE.md`](docs/QUANTIZE.md),
+[`docs/QUANTIZATION.md`](docs/QUANTIZATION.md).
+
+### Redline across RDNA
 
 Redline is now an in-tree dispatch and retained-replay substrate for the RDNA
 family. It records hipfire's real decode graph, derives resource dependencies,

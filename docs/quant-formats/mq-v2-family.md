@@ -1,9 +1,11 @@
 # MQ V2 family — wire spec (qt 47 / 48 / 49 / 50)
 
 **Status:** qt=47 `MQ6G256V2`, qt=48 `MQ5G256V2`, qt=49 `MQ3G256V2`, and
-qt=50 `MQ2G256V2` are **wired for dense gfx12** (gfx1200/gfx1201) beside
-qt=44 `MQ4G256V2` (see [`mq4-v2.md`](mq4-v2.md)). Register disposition is
-`passthrough` for all four (`qt-register.txt`).
+qt=50 `MQ2G256V2` are **wired for dense WMMA prefill on gfx11 + gfx12**
+(gfx1100/1101/1102/1150/1151 and gfx1200/gfx1201) beside qt=44 `MQ4G256V2`
+(see [`mq4-v2.md`](mq4-v2.md)). Register disposition is `passthrough` for all
+four (`qt-register.txt`). Wire support ≠ product admission: **MQ2V2 remains
+quality-rejected** (§8.2).
 
 **One-line summary:** same **neutral-size Magnum V2** header as MQ4V2 —
 8 B of dual half `fp16 scale + fp16 zero` per 128 weights — on top of the
@@ -213,21 +215,55 @@ qt47–50 vs v1 / cross-V2 key guards). Equal group stride across bit widths is
 
 ## 6 · Support matrix (runtime)
 
+Dense Magnum V2 (qt47–50; qt44 by reference in [`mq4-v2.md`](mq4-v2.md)) is
+**not** gfx12-only. Batched prefill WMMA admits on HasWmma arches (gfx11
+family + gfx12). Production weight-reuse (batch-tile) defaults are measured
+per arch / op / bit-width in `rdna-compute::gemm::mqv2_prefill_batch_tile`.
+Capture and replay **deliberately bypass** that adaptive policy and keep
+fixed launch contracts.
+
 | surface | qt47–50 |
 |---|---|
-| Dense GEMV prerotated / residual / SwiGLU residual | **yes** (wave32 predicate) |
-| Dense fused QKV / QKVZA / gate_up | **yes** (dense gfx12 path) |
-| Dense residual GEMM / plain GEMM keys | **yes, gfx12 WMMA only** (`gemm_table`: explicit V2 GEMM keys are gfx12-only) |
-| Batched lm_head / DFlash verify rotate+GEMM | **yes** on dense qwen35 gfx12 (scratch size asserts per V2 dtype) |
-| Prefill batchable LA | gfx1200/gfx1201 only (`prefill.rs` arch match includes all four V2 dtypes) |
+| Dense GEMV prerotated / residual / SwiGLU residual | **yes** (wave32 predicate; cross-RDNA scalar decode) |
+| Dense fused QKV / QKVZA / gate_up | **yes** (dense path; scalar fused decode cross-RDNA) |
+| Dense residual / plain / batched-lmhead GEMM keys | **yes, HasWmma** — gfx11 **base WMMA** + gfx12 WMMA (`gemm_table`: `GemmMq{2,3,5,6}G256V2*` use `ArchPredicate::HasWmma`) |
+| Batched prefill LA | **yes** on gfx1100/1101/1102/1150/1151 + gfx1200/1201 (`prefill.rs` `mqv2_with_wmma`); gfx11 half opt-out via `HIPFIRE_MQV2_GFX11_WMMA=0` (gfx12 unaffected) |
+| Weight-reuse / batch-tile defaults | see table below (`mqv2_prefill_batch_tile`) |
+| Batched lm_head / DFlash verify rotate+GEMM | **yes** on dense qwen35 HasWmma (scratch size asserts per V2 dtype) |
 | AWQ sidecar | **yes** — `DType::supports_awq_sidecar` lists MQ6/5/3/2G256V2 with the same pre-scale contract as qt=44 |
-| MoE mixed-tier / routed expert path | **no** — `MIXED_SUPPORTED_TIERS` is only `{MQ4G256, MQ6G256, ParoQ4G128}`; V2 dtypes are absent and fail closed up front |
-| Non-gfx12 batched prefill WMMA | **no** — fall back or refuse; do not invent a cross-arch WMMA route |
+| MoE mixed-tier / routed expert path | **no** — fail-closed up front; V2 dtypes are absent from `MIXED_SUPPORTED_TIERS` (`{MQ4G256, MQ6G256, ParoQ4G128}` only) |
+| Non-WMMA arches (e.g. gfx1010) | batched prefill falls back to per-token decode; do not invent a WMMA route |
 | Host RAW_CODECS length check | **yes** — blob must be `M*(K/256)*GROUP_BYTES` |
 
-Parity / kernel gate: `crates/hipfire-runtime/examples/mqv2_family_parity.rs`
-exercises all four formats for byte count, header divergence, sentinel, plain
-GEMV B=1, and B=16 batched lm-head vs CPU dequant.
+### Prefill weight-reuse (production defaults)
+
+Values are independent 16-token output tiles sharing one dequantized weight
+tile. Thresholds are N≥96 unless a band is noted. Source of truth:
+`crates/rdna-compute/src/gemm.rs` (`mqv2_prefill_batch_tile`).
+
+| arch | bits | QKV | QKVZA | gate_up | residual |
+|---|---|---|---|---|---|
+| **gfx1151** | 2 / 3 / 4 / 5 / 6 | BT4 | BT4 | BT12 | BT4 |
+| **gfx1201** | 2 / 5 / 6 | **QKV BT8 only** | base | base | base |
+| **gfx1201** | 3 (MQ3V2) | **base** (no BT promote; neutral/noisy) | base | base | base |
+| **gfx1201** | 4 (MQ4V2) | QKV BT8 | base | base | base |
+| **gfx1100** | 4 (MQ4V2) | adaptive (see bands) | adaptive | adaptive | adaptive |
+| **gfx1100** | 2 / 3 / 5 / 6 | base WMMA | base | base | base |
+
+MQ4V2 adaptive bands on **gfx1100** (fuller narrative in `mq4-v2.md` §9):
+
+- QKV / QKVZA: BT4 @ N≥96, BT12 @ N≥192
+- gate_up: BT6 @ N≥96, BT12 @ N≥384
+- residual: BT4 @ 96–223, BT6 @ 224–287, BT8 @ 288–415
+
+Parity / kernel gates:
+
+- Family wire oracle: `crates/hipfire-runtime/examples/mqv2_family_parity.rs`
+  (byte count, header divergence, sentinel, plain GEMV B=1, B=16 batched
+  lm-head vs CPU dequant).
+- Ladder BT screens: `crates/rdna-compute/examples/test_mqv2_bt_gfx11.rs`,
+  `test_mqv2_qkv_bt_gfx1201.rs`; MQ4V2 per-arch BT suites
+  `test_mq4v2_*_bt_gfx{1100,1151,1201}.rs`.
 
 ---
 
@@ -388,7 +424,7 @@ byte consumption explicit per dtype.
 5. `K % 256 == 0`; blob length = `M*(K/256)*GROUP_BYTES`.
 6. Register RAW_CODECS + `supports_awq_sidecar` for the dtype.
 7. Route only to matching V2 kernel keys; refuse v1/cross-width keys.
-8. Dense gfx12 GEMV/GEMM/DFlash only; MoE mixed path stays fail-closed.
+8. Dense WMMA prefill on HasWmma (gfx11 base + gfx12); apply measured weight-reuse defaults per arch/bits; MoE mixed path stays fail-closed. Capture/replay retain fixed contracts.
 9. Pass `mqv2_family_parity` before claiming wire readiness.
 10. Never promote MQ2V2 as product-quality from wire readiness alone.
 
@@ -400,9 +436,14 @@ byte consumption explicit per dtype.
 - [`mq4-v2.md`](mq4-v2.md) — qt=44/45 detailed sibling
 - [`ladder.md`](ladder.md) — product names / rungs / honesty invariant
 - `docs/perf-checkpoints/2026-08-20-qwen38-mq-v2-product-ladder.md` — immutable
-  ladder checkpoint (peer-owned)
+  ladder checkpoint (peer-owned; historical fixture scope)
+- `docs/perf-checkpoints/2026-08-23-mq-v2-crossarch-prefill-reuse.md` — multi-arch
+  prefill weight-reuse (gfx1151 all ops bits2–6; gfx1201 QKV BT8 bits2/5/6, MQ3 base)
 - `crates/rdna-compute/src/dispatch.rs` — group-byte constants, AWQ allow-list
+- `crates/rdna-compute/src/gemm.rs` — `mqv2_prefill_batch_tile` production policy
 - `crates/hipfire-quantize/src/quant_fwht.rs` — MQ6/5 V2 encoders
 - `crates/hipfire-quantize/src/quant_mq.rs` — MQ3/2 V2 encoders
 - `crates/hipfire-runtime/examples/mqv2_family_parity.rs` — parity gate
+- `crates/rdna-compute/examples/test_mqv2_bt_gfx11.rs`,
+  `test_mqv2_qkv_bt_gfx1201.rs` — ladder BT screens
 - `ssh://hiptrx/home/kaden/qcal/ladder-v2/summary.{json,md,csv}` — measured ladder

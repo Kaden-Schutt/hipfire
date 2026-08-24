@@ -1,6 +1,6 @@
 # MQ4 v2.0 / HFQ4-G256 v2 — spec
 
-**Status:** qt=44 `MQ4G256V2` and qt=45 `MQ4CG256` (padded-compat layout) are **wired for dense gfx12** (gfx1200/gfx1201). Scalar fused decode sources are cross-RDNA and compile on gfx1010; batched prefill and lm_head GEMM remain **gfx12-only**, with unsupported batched prefill falling back to per-token decode rather than a gfx12 WMMA dispatch. Codec, KLD, exact kernel parity, and model generation have been measured on the supported surfaces; see §§ 5, 9, and 10.
+**Status:** qt=44 `MQ4G256V2` is **wired for dense WMMA prefill on gfx11 + gfx12** (gfx1100/1101/1102/1150/1151 and gfx1200/gfx1201) with measured adaptive weight-reuse on gfx1100 / gfx1151 / gfx1201. qt=45 `MQ4CG256` (padded-compat layout) remains **narrower: dense gfx12 batched prefill only** (`HasWmmaGfx12`); do **not** claim gfx11 WMMA for qt=45. Scalar fused decode sources for both are cross-RDNA and compile on gfx1010; unsupported batched prefill falls back to per-token decode rather than inventing a WMMA route. Codec, KLD, exact kernel parity, and model generation have been measured on the supported surfaces; see §§ 5, 9, and 10.
 
 **One-line summary:** keep HFQ4-G256's 136 B/group and its byte-identical 128 B nibble
 payload; re-spend the 8 header bytes from `f32 scale + f32 zero` per **256** weights to
@@ -107,8 +107,8 @@ so no variant needs to restate the rotation.
 
 | `--format` | qt | layout | status |
 |---|---|---|---|
-| `mq4` *(alias)*, `mq4v2` *(canonical)* | **44** | v2 — 136 B, per-128 asym, fp16 scale+zero at +0/`+4`, nibbles at +8 | **implemented / wired** (dense gfx12; gfx1010 scalar decode TU compile, batched prefill falls back) |
-| `mq4c` | **45** | **v1.5 pad — 136 B, per-256 asym, fp16 scale+zero at +0, zero pad +4..8, 128 B nibbles at +8** (padded / v1-compatible geometry; **not** compact 132 B) | **implemented / wired** (same arch split as qt=44) |
+| `mq4` *(alias)*, `mq4v2` *(canonical)* | **44** | v2 — 136 B, per-128 asym, fp16 scale+zero at +0/`+4`, nibbles at +8 | **implemented / wired** (dense HasWmma prefill gfx11+gfx12; adaptive reuse on gfx1100/1151/1201; gfx1010 scalar decode TU compile) |
+| `mq4c` | **45** | **v1.5 pad — 136 B, per-256 asym, fp16 scale+zero at +0, zero pad +4..8, 128 B nibbles at +8** (padded / v1-compatible geometry; **not** compact 132 B) | **implemented / wired** (batched prefill **gfx12-only**; not promoted to gfx11) |
 | `mq4_k` | 46 | hierarchical — per-32 @144 B or per-16 @156 B, 6-bit s+z | specified, § 1c |
 | `mq4v1`, `mq4g256`, `magnum` | 13 | unchanged — 136 B, per-256 asym, f32 scale+zero at +0/+4, nibbles at +8 | shipping |
 | — | 43 | MQ4-G256-SEL, **retired** | burned, never reuse |
@@ -410,41 +410,48 @@ relatively less of the damage. "Codebooks are for the sub-4-bit tier" is defensi
 | area | state |
 |---|---|
 | Codec layout (qt=44 v2 136 B per-128; qt=45 pad 136 B per-256) | specified and implemented |
-| Loader / `RAW_CODECS` / `DType` / quantizer `--format` wiring | done |
+| Loader / `RAW_CODECS` / `DType` / quantizer `--format` wiring | done (`--format mq4` → qt=44; legacy v1 is `mq4v1\|mq4g256\|magnum`) |
 | FWHT-256 rotation plan + prerotated dispatch | done |
 | Dense decode fused QKV / QKVZA / gate_up + residual GEMV | cross-RDNA sources; **compile on gfx1010**; wired |
-| Batched prefill WMMA GEMM + batched lm_head GEMM | **gfx12-only** (gfx1200/gfx1201); all six explicit `GemmMq4*` registry keys are gfx12-only |
-| Unsupported batched prefill on non-gfx12 | **per-token decode fallback** (does not dispatch a gfx12 WMMA kernel) |
+| **qt=44** batched prefill WMMA GEMM + batched lm_head GEMM | **HasWmma** — gfx11 base WMMA + gfx12 WMMA (`GemmMq4G256V2*` registry keys use `ArchPredicate::HasWmma`) |
+| **qt=44** weight-reuse / batch-tile production defaults | **gfx1100 adaptive** (QKV/QKVZA BT4→12, gate BT6→12, residual BT4/6/8 by N); **gfx1151** gate BT12 + QKV/QKVZA/residual BT4 @ N≥96; **gfx1201** QKV BT8 @ N≥96 (other projections base). Source: `mqv2_prefill_batch_tile` |
+| **qt=45** batched prefill WMMA GEMM + batched lm_head GEMM | **gfx12-only** (`HasWmmaGfx12`); **not** admitted on gfx11 |
+| Unsupported batched prefill | **per-token decode fallback** (does not dispatch a foreign-arch WMMA kernel) |
 | FusedQkv / FusedGateUp decode registrations | remain **cross-arch** (not narrowed to gfx12) |
-| gfx1201 exact parity examples | `mq4v2_parity`, `mq4v2_gemm_parity`, `mq4c_parity` |
+| Prefill LA admission (qt=44) | gfx1100/1101/1102/1150/1151 + gfx1200/1201; gfx11 opt-out `HIPFIRE_MQV2_GFX11_WMMA=0` |
+| Exact parity examples | `mq4v2_parity`, `mq4v2_gemm_parity`, `mq4v2_fused_parity`, `mq4v2_residual_parity`, `mq4c_parity`; BT screens `test_mq4v2_*_bt_gfx{1100,1151,1201}.rs` |
 | Qwen3.8 fixture-bound KLD | qt=44 `ctl` WT2 0.039033 / v6 0.544517; `ctl2` WT2 0.032495; `attn` WT2 0.025437 (§ 5) |
 | gfx1010 | scalar fused decode TUs compile; batched prefill falls back as above |
+| Capture / replay | retain **fixed** launch contracts; bypass adaptive weight-reuse policy |
 | qt=40 `TQ2G128` / qt=41 `BQ1G128` | **untouched** by this work |
 | qt=43 SEL | historically retired; id burned, never reuse |
 
 ### Not claimed / out of scope
 
 - **wave64** half-split (§ 4) — not verified; wave64 remains unsupported for these formats.
-- **MoE** paths (`gemv_hfq4g256_moe_*`, `gemm_*_moe_grouped_*`) — out of scope.
-- **gfx1030 default-R decision** (§ 6) — still open if/when gfx1030 ships these dtypes; not a dense-gfx12 blocker.
-- Research-only surfaces: `muse_*`, `.gfx11*` / `.gfx942` / dp4a / cpol / `ldscoop` / `ldsx` / `.v1`–`.v5` / `XBATCH` single-row path.
+- **MoE** paths (`gemv_hfq4g256_moe_*`, `gemm_*_moe_grouped_*`) — out of scope / fail-closed for V2 product tiers.
+- **qt=45 on gfx11** — no gfx11 WMMA sibling; do not promote.
+- **gfx1030 default-R decision** (§ 6) — still open if/when gfx1030 ships these dtypes; not a dense-WMMA blocker.
+- Research-only surfaces: `muse_*`, dp4a / cpol / `ldscoop` / `ldsx` / `.v1`–`.v5` / `XBATCH` single-row path. (gfx11 base/BT WMMA for **qt=44** is production, not research-only.)
 
-### Port surface that landed for dense gfx12
+### Port surface that landed for dense HasWmma (qt=44) / dense gfx12 (qt=45)
 
 Traced through the dispatch tables (`forward_slots.rs`, `families/fused_qkv.rs`,
 `families/gemm.rs`, `families/gemv.rs`, `rdna-compute/src/gemm.rs`, `gemv.rs`), a dense
 Qwen3.5/3.8-27b (arch_id=5) on gfx1201 touches **11 translation units, ~13 header site
 pairs** — not the ~700 sites across ~127 files that the whole HFQ4-G256 family spans.
 
-**Prefill** — gfx12 WMMA fused GEMMs plus residual. `_bt` siblings are separate sources
-selected when `HIPFIRE_GATE_UP_BT` is on and the batch triggers BT:
+**Prefill** — qt=44 has dedicated WMMA sources for **gfx11** (wave32 base + BT
+siblings) and **gfx12**; qt=45 prefill remains **gfx12-only**. Production
+weight-reuse selects BT tile counts via `mqv2_prefill_batch_tile` (capture/replay
+bypass that policy). Representative file families:
 
 | file family | serves |
 |---|---|
-| `gemm_qkvza_{mq4g256v2,mq4cg256}_wmma.gfx12.hip` + `_gfx12_bt` siblings | linear-attn `in_proj_qkv/z/a/b` |
-| `gemm_qkv_{mq4g256v2,mq4cg256}_wmma.gfx12.hip` | full-attn `q/k/v_proj` |
-| `gemm_gate_up_{mq4g256v2,mq4cg256}_wmma.gfx12.hip` + `_gfx12_bt` siblings | `mlp.gate/up_proj` |
-| `gemm_{mq4g256v2,mq4cg256}_residual_wmma.gfx12.hip` + `_gfx12_bt` siblings | `o_proj` / `down_proj` |
+| `gemm_qkvza_mq4g256v2_wmma{.gfx12,.hip,_gfx11_bt,_gfx12_bt,…}` (+ qt=45 `_mq4cg256` gfx12) | linear-attn `in_proj_qkv/z/a/b` |
+| `gemm_qkv_mq4g256v2_wmma*` (+ qt=45 gfx12) | full-attn `q/k/v_proj` |
+| `gemm_gate_up_mq4g256v2_wmma*` (+ qt=45 gfx12) | `mlp.gate/up_proj` |
+| `gemm_mq4g256v2_residual_wmma*` (+ qt=45 gfx12) | `o_proj` / `down_proj` |
 
 **Decode** — fused projections plus residual GEMV (cross-RDNA scalar sources):
 
@@ -483,7 +490,7 @@ files, where the launcher plumbing amortises.
 | `tools/quant-design/` | GPU codec sweep harness (14 configs in 2.9 s) |
 | `crates/hipfire-quantize/examples/mq_composable_bench.rs` | quality metrics per variant, self-checked to 0.11% |
 | `crates/rdna-compute/examples/bench_gemv_paired_throughput.rs` | paired device-side GEMV throughput |
-| `mq4v2_parity`, `mq4v2_gemm_parity`, `mq4c_parity` | gfx1201 exact parity examples (landed) |
+| `mq4v2_parity`, `mq4v2_gemm_parity`, `mq4v2_fused_parity`, `mq4v2_residual_parity`, `mq4c_parity`; `test_mq4v2_*_bt_gfx{1100,1151,1201}.rs` | exact / BT parity examples (landed) |
 
 ---
 
@@ -491,6 +498,10 @@ files, where the launcher plumbing amortises.
 
 - `docs/perf-checkpoints/2026-08-17-mq4-v2-affine-2x128-fp16-header.md` — v2 codec + 5-arch
   throughput, and the gfx1030 Infinity-Cache analysis
+- `docs/perf-checkpoints/2026-08-23-mq-v2-crossarch-prefill-reuse.md` — multi-arch V2
+  prefill weight-reuse (gfx1151 all-ops bits2–6; gfx1201 QKV BT8 bits2/5/6, MQ3 base)
+- `docs/perf-checkpoints/2026-08-23-qwen38-gfx1100-mq4v2-batch-tile.md` and siblings —
+  gfx1100 MQ4V2 adaptive BT / multi-wave screens
 - `docs/perf-checkpoints/2026-08-17-what-predicts-kld-weight-mse-predicts-ppl-not-kld.md` —
   why overall MSE is a PPL proxy and not a KLD proxy; HIGGS linearity theorem
   ([arXiv:2411.17525](https://arxiv.org/abs/2411.17525)); the falsified cross-term prediction
