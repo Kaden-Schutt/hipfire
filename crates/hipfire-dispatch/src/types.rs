@@ -313,6 +313,11 @@ pub enum KernelKey {
     GemmHfq4G256BatchedLmhead,
     GemmHfq3G256BatchedLmhead,
     GemmHfq6G256BatchedLmhead,
+    // GEMM — Gemma4 PLE wide-exact Q8 batched (#592 dispatch routing).
+    // Canonical plain signature `(a, x, y, m, k, batch_size)` via
+    // `gpu.gemm_q8_0_batched_wide_exact`. WMMA-gated; call sites keep the
+    // gfx1100/gfx1201 + shape guards authoritative.
+    GemmQ8_0BatchedWideExact,
     // Fused QKV
     FusedQkvHfq4G256,
     FusedQkvMq3G256Lloyd,

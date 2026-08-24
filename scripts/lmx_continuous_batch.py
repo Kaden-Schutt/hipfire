@@ -875,7 +875,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out", required=True, help="Output report JSON path (atomically written)")
     # Optional
     p.add_argument("--cli", default="target/release/hipfire", help="Path to hipfire CLI binary (default: target/release/hipfire)")
-    p.add_argument("--daemon", default="target/release/examples/daemon", help="Path to daemon binary for HIPFIRE_DAEMON_BIN (default: target/release/examples/daemon)")
+    p.add_argument("--daemon", default="target/release/daemon", help="Path to daemon binary for HIPFIRE_DAEMON_BIN (default: target/release/daemon)")
     p.add_argument(
         "--device",
         default=None,

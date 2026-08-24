@@ -48,6 +48,7 @@
 //! physically moved here without breaking arch-qwen35's pflash branch.
 
 pub mod arch;
+pub mod arch_model;
 pub mod carrier;
 /// DSpark qwen3-8B drafter sidecar loader.
 pub mod dspark_body;

@@ -1,5 +1,6 @@
 use crate::qwen35::{
-    DeltaNetState, LayerType, Qwen35Config, Qwen35Scratch, Qwen35Weights, StateQuant,
+    DeltaNetState, LayerType, Qwen35Config, Qwen35DecodeBatchState, Qwen35Scratch,
+    Qwen35ScratchSet, Qwen35Weights, StateQuant,
 };
 use crate::Qwen35;
 use hipfire_runtime::arch::Architecture;
@@ -8,6 +9,7 @@ use hipfire_runtime::kv_adaptive::{KvAdaptive, Preset};
 use hipfire_runtime::kv_backend::KvBackend;
 use hipfire_runtime::kv_mode::{self, ResolveResult};
 use hipfire_runtime::llama::{self, KvCache, KvDims, KvLayers, KvTarget};
+use hipfire_runtime::llama::KvCacheExt;
 use hipfire_runtime::loader_api::{LoadCtx, ModelSource};
 
 pub struct Qwen35Bundle {
@@ -19,8 +21,30 @@ pub struct Qwen35Bundle {
     /// Adaptive KV controller when engaged at load. Moved into
     /// `LoadedModel.kv_adaptive` by `finish_qwen35_load`.
     pub kv_adaptive: Option<KvAdaptive>,
+    /// Pipeline-parallel per-device scratch set. `Some` only when
+    /// `LoadedModel.pp > 1` — single-GPU loads leave this `None`.
+    /// Freed via `Qwen35ScratchSet::free_gpu_multi(&mut Gpus)` in the pp>1
+    /// unload arm, NOT via `ArchModel::free_gpu` (which takes a single
+    /// `&mut Gpu` and cannot free a per-device set).
+    pub pp_scratch_set: Option<Qwen35ScratchSet>,
+    /// Optional Qwen3.5-VL vision tower — `Some` when the HFQ contained
+    /// `model.visual.patch_embed.proj.weight`. Remains `None` for pure
+    /// text checkpoints; the bundle's text path is unaffected.
+    pub vision_config: Option<hipfire_arch_qwen35_vl::qwen35_vl::VisionConfig>,
+    pub vision_weights: Option<hipfire_arch_qwen35_vl::qwen35_vl::VisionWeights>,
+    /// Native MTP (NextN) head (arch_id=21). Loaded once at model load when
+    /// a bundled `.mq4-mtp` trailer OR a sibling `.mtp` sidecar is present.
+    /// Persistent for the life of the model; `generate_qwen35_mtp` allocates
+    /// a fresh per-request `MtpSpecState` against it. `None` for trunks
+    /// without an MTP head. Previously lived on `LoadedModel`.
+    pub qwen35_mtp_head: Option<crate::mtp_head::Qwen35MtpHead>,
+    /// Continuous-batch decode state for Qwen3.5 (single-GPU). `Some` when
+    /// `HIPFIRE_CONTINUOUS_BATCH` staged a batch (arch 5/6, pp=1, non-EP).
+    /// Freed via `Qwen35DecodeBatchState::free_gpu` in `ArchModel::free_gpu`
+    /// or eagerly via `LoadedModel::qwen35_mut()` in `unload_model` before
+    /// `ArchModel::free_gpu`. Previously lived on `LoadedModel`.
+    pub qwen35_decode_batch: Option<Qwen35DecodeBatchState>,
 }
-
 /// Build the Qwen35 GPU bundle from an HFQ source.
 ///
 /// CPU-only config/compat validation runs **before** weight upload. Every
@@ -79,6 +103,11 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
         kv_cache: kv,
         dn_state: dn,
         kv_adaptive,
+        pp_scratch_set: None,
+        vision_config: None,
+        vision_weights: None,
+        qwen35_mtp_head: None,
+        qwen35_decode_batch: None,
     })
 }
 
@@ -349,7 +378,7 @@ fn construct_kv_cache(
             KvBackend::Contiguous => {
                 // Contiguous: allocate start-tier FWHT4/Q8 then floor-resize in place.
                 // If floor-resize fails, free the start-tier cache explicitly.
-                let mut kv = KvCache::from_mode_with_backend(
+                let mut kv = <KvCache as KvCacheExt>::from_mode_with_backend(
                     start_mode,
                     KvBackend::Contiguous,
                     KvTarget::Single(ctx.gpu),
@@ -397,7 +426,7 @@ fn construct_kv_cache(
                 )
                 .map_err(|e| format!("{e}"))?
             }
-            (KvBackend::Contiguous, llama::VMode::Q8) => KvCache::from_mode_with_backend(
+            (KvBackend::Contiguous, llama::VMode::Q8) => <KvCache as KvCacheExt>::from_mode_with_backend(
                 mode,
                 KvBackend::Contiguous,
                 KvTarget::Single(ctx.gpu),
@@ -405,7 +434,7 @@ fn construct_kv_cache(
             )
             .map_err(|e| format!("{e}"))?,
             (KvBackend::Contiguous, vm) => {
-                let mut kv = KvCache::from_mode_with_backend(
+                let mut kv = <KvCache as KvCacheExt>::from_mode_with_backend(
                     mode,
                     KvBackend::Contiguous,
                     KvTarget::Single(ctx.gpu),
@@ -429,8 +458,6 @@ fn construct_kv_cache(
     }
 }
 
-/// Free a fully constructed bundle. Used by loader finish-path rollback.
-/// Returns the first free error (VMM teardown) if any; always attempts full cleanup.
 pub fn free_qwen35_bundle(bundle: Qwen35Bundle, gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
     let Qwen35Bundle {
         config: _,
@@ -439,8 +466,24 @@ pub fn free_qwen35_bundle(bundle: Qwen35Bundle, gpu: &mut rdna_compute::Gpu) -> 
         kv_cache,
         dn_state,
         kv_adaptive: _,
+        pp_scratch_set,
+        vision_config: _,
+        vision_weights,
+        qwen35_mtp_head,
+        qwen35_decode_batch,
     } = bundle;
-    // Match unload_model Qwen35 order: kv → scratch → weights → dn.
+    debug_assert!(
+        pp_scratch_set.is_none(),
+        "free_qwen35_bundle: pp_scratch_set must be None on single-GPU free"
+    );
+    let _ = pp_scratch_set;
+    if let Some(head) = qwen35_mtp_head {
+        head.free_gpu(gpu);
+    }
+    if let Some(batch) = qwen35_decode_batch {
+        let _ = batch.free_gpu(gpu);
+    }
+    // Match unload_model Qwen35 order: kv → scratch → weights → dn → vision.
     let mut first: Option<String> = None;
     if let Err(e) = kv_cache.free_gpu(gpu) {
         first = Some(e.to_string());
@@ -448,6 +491,9 @@ pub fn free_qwen35_bundle(bundle: Qwen35Bundle, gpu: &mut rdna_compute::Gpu) -> 
     scratch.free_gpu(gpu);
     weights.free_gpu(gpu);
     dn_state.free_gpu(gpu);
+    if let Some(vw) = vision_weights {
+        vw.free_gpu(gpu);
+    }
     let vmm = note_vmm_after_free(gpu);
     match (first, vmm) {
         (None, Ok(())) => Ok(()),

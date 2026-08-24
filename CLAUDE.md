@@ -14,12 +14,19 @@ path, no Vulkan/cross-vendor layer. It runs natively across RDNA generations
 
 ## Architecture
 
-The crate stack layers bottom-up. User-facing entry is the native Rust CLI
-(`crates/hipfire-cli`), backed by shared typed config, registry, and HTTP/JSONL
-client crates. It posts to — or spawns — the inference daemon
-(`crates/hipfire-runtime/examples/daemon.rs`, a JSON-lines stdio server).
-Kernels are HIP source under `kernels/src/`, compiled at runtime via `hipcc`
-and cached as `.hsaco` per GPU arch.
+Full crate map, layering invariants, and request lifecycle live in
+`docs/ARCHITECTURE.md` — this section is the short working summary.
+
+The crate stack layers bottom-up with a strict one-way edge
+`saddle-core -> hipfire-runtime -> hipfire-loader -> hipfire-engine ->
+hipfire-generate -> hipfire-daemon` (`docs/ARCHITECTURE.md` § Layering).
+User-facing entry is the native Rust CLI (`crates/hipfire-cli`),
+backed by shared typed config, registry, and HTTP/JSONL client crates.
+It posts to — or spawns — the inference daemon
+(`crates/hipfire-daemon/src/main.rs`, ~3,879 lines, `[[bin]] name = "daemon"`,
+JSON-lines stdio/HTTP server). Kernels are HIP source under `kernels/src/` —
+see `docs/ARCHITECTURE.md` § Kernel build for precompiled `.hsaco` vs JIT
+cache selection.
 
 - **hip-bridge / hsa-bridge** — safe Rust FFI to the AMD HIP / HSA runtimes via
   `dlopen` (no link-time ROCm dependency).
@@ -27,8 +34,22 @@ and cached as `.hsaco` per GPU arch.
   predicates.
 - **hipfire-dispatch** — unified per-kernel-family dispatch; picks the kernel by
   quant format × arch capability × feature flags resolved at init.
-- **hipfire-runtime** — inference orchestrator: KV cache, sampler, token loop,
-  HFQ loader, tokenizer, and the daemon. Top of the compute DAG.
+- **saddle-core** — the substrate: grammar, KV, caps, sampling policy (depends
+  only on `rdna-compute`, `hip-bridge`, `serde`).
+- **hipfire-runtime** — arch-agnostic infra + `Architecture` trait; HFQ/safetensors,
+  tokenizer, sampler, framing, spec primitives. LLaMA dense forward still lives
+  here (`hipfire-arch-llama` is a facade; see `docs/ARCHITECTURE.md`).
+- **hipfire-loader** — composition root: `Carrier` registry, single
+  `load_model` dispatch, `LoadedModel`, continuous-batch staging. Depends on all
+  arch crates; arch crates MUST NOT depend on it.
+- **hipfire-engine** — arch-free serve engine: scheduler, terminal, emit, prompt.
+  Declares no `hipfire-arch-*` dependency.
+- **hipfire-generate** — generation bodies (`ar`, `qwen`, `dense`, `vision`,
+  `batch`, Redline fixtures) that need both arch types and engine machinery;
+  sits `hipfire-loader -> hipfire-engine -> hipfire-generate -> hipfire-daemon`.
+- **hipfire-daemon** — the product binary. `[[bin]] name = "daemon"` in
+  `crates/hipfire-daemon`; message dispatch and process lifetime only
+  (`docs/ARCHITECTURE.md` § Serve / generate path).
 - **hipfire-quantize** — CPU-side encoder (safetensors/GGUF → `.hfq`/`.mq4`/…);
   builds without a GPU.
 - **hipfire-detect** — GPU-independent observability: attractor / special-token /
@@ -37,14 +58,15 @@ and cached as `.hsaco` per GPU arch.
   TOML configuration, model catalog, dynamic registry, daemon/HTTP client, and
   the native operator/service surface.
 - **hipfire-arch-\*** — one crate per model family's forward pass, keyed by
-  `arch_id` (see `docs/architecture-ids.md`): llama (0/1), qwen35 (5 dense / 6
-  MoE-A3B, also hosts DFlash spec-decode), qwen2 (7), dots-ocr (8), deepseek4 (9,
-  multi-GPU EP), minimax (10), lfm2moe (11), cohere2moe (12). `toy` (0xFF) is the
-  new-port template; the daemon refuses to dispatch it.
-- Support crates: hipfire-loader, hipfire-atlas (perf corpus), hipfire-reap (MoE
+  `arch_id` (see `docs/architecture-ids.md` and `docs/ARCHITECTURE.md` §
+  Architecture crates): llama (0/1), qwen35 (5/6), qwen2 (7), dots-ocr (8),
+  deepseek4 (9, EP), minimax (10, EP), lfm2moe (11), cohere2moe (12), gemma4
+  (13, 22), muse-glimmer (14). `toy` (0xFF) is the new-port template; the
+  daemon refuses to dispatch it.
+- Support crates: hipfire-atlas (perf corpus), hipfire-reap (MoE
   expert pruning), hipfire-tui (chat/settings TUI), redline (experimental
-  direct-KMD compute, not wired into serving).
-
+  direct-KMD compute, not wired into serving) — plus `hipfire-ds4-parent`
+  (provisional) and `hipfire-pflash` (retained legacy, see below).
 
 ### PFlash status
 
@@ -59,8 +81,10 @@ basis for a current performance claim.
 ```
 # Workspace build — no GPU/ROCm needed (HIP is dlopen'd at runtime); CI-required:
 cargo build --release --workspace --all-targets --locked
-# The inference daemon:
-cargo build --release --example daemon --features deltanet -p hipfire-runtime
+# Product binaries — no --features required (required-features is 0):
+cargo build --release
+# → target/release/hipfire  (from crates/hipfire-cli, [[bin]] name = "hipfire")
+# → target/release/daemon   (from crates/hipfire-daemon/src/main.rs, [[bin]] name = "daemon")
 # No-GPU local check (cargo check + Rust tests + pytest):
 ./scripts/no-gpu-ci.sh
 # Wire the pre-commit hook once per clone (sets core.hooksPath=.githooks):
@@ -210,7 +234,7 @@ verify the caller actually sets a stream (fix pattern: create
 `gpu.active_stream` at the top of the caller — see da2753e for
 `spec_step_dflash`).
 
-## Skills (`docs/skills/`)
+## Skills (`.agents/skills/`)
 
 Reusable how-tos kept out of CLAUDE.md to avoid bloat. Each skill is a
 self-contained reference; reach for it by name when the situation
@@ -241,7 +265,7 @@ matches. Index of currently-available skills:
   gotcha). Recall before answering (`scripts/mem.sh recall <terms>`), remember after
   learning (`scripts/mem.sh remember <slug> "<title>" tags`). Project findings go
   here (shared, diffable, travel with the code); personal/fleet notes stay in global
-  memory. See `docs/skills/agent-memory.md`.
+  memory. See `.agent-memory/` and `scripts/mem.sh`.
 
 When adding a new skill, give it a one-line index entry here so future
 sessions find it without grepping.

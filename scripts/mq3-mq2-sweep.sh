@@ -32,14 +32,14 @@
 set -u
 cd "$(dirname "$0")/.."
 
-EXE="./target/release/examples/daemon"
+EXE="./target/release/daemon"
 MODELS_DIR="${HIPFIRE_MODELS_DIR:-$HOME/.hipfire/models}"
 OUT="${HIPFIRE_SWEEP_OUT:-$HOME/.hipfire/mq3-tests/sweep-$(date +%Y%m%d-%H%M%S).md}"
 PROMPTS_DIR="${HIPFIRE_SWEEP_PROMPTS_DIR:-./benchmarks/prompts/sweep}"
 LOCK_SCRIPT="./scripts/gpu-lock.sh"
 
 if [ ! -x "$EXE" ]; then
-    echo "$EXE missing — run: cargo build --release --features deltanet --example daemon -p hipfire-runtime" >&2
+ echo "$EXE missing — run: cargo build --release -p hipfire-daemon" >&2
     exit 2
 fi
 

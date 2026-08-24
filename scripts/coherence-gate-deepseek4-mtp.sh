@@ -55,7 +55,7 @@ if [ "$FAST" -eq 1 ] && [ "$FULL" -eq 1 ]; then
     exit 2
 fi
 
-EXE="./target/release/examples/daemon"
+EXE="./target/release/daemon"
 MODELS_DIR="${HIPFIRE_MODELS_DIR:-$HOME/.hipfire/models}"
 V4F_MODEL="$MODELS_DIR/deepseek-v4-flash.mq2lloyd"
 V4F_ADDON="$MODELS_DIR/deepseek-v4-flash-mtp.mq2lloyd"
@@ -72,7 +72,7 @@ else
                crates/hipfire-arch-deepseek4/src/deepseek4.rs \
                crates/hipfire-arch-deepseek4/src/forward.rs \
                crates/hipfire-arch-deepseek4/src/spec_decode.rs \
-               crates/hipfire-runtime/examples/daemon.rs \
+               crates/hipfire-daemon/src/main.rs \
                crates/rdna-compute/src/dispatch.rs; do
         if [ -f "$src" ] && [ "$src" -nt "$EXE" ]; then
             rebuild=1
@@ -82,7 +82,7 @@ else
 fi
 if [ "$rebuild" -eq 1 ]; then
     echo "coherence-gate-deepseek4-mtp: rebuilding daemon..."
-    if ! cargo build --release --example daemon --features deltanet >&2; then
+ if ! cargo build --release -p hipfire-daemon >&2; then
         echo "coherence-gate-deepseek4-mtp: build failed" >&2
         exit 2
     fi

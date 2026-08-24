@@ -773,11 +773,13 @@ dependencies = [
  "hip-bridge",
  "hipfire-config",
  "hipfire-dispatch",
+ "hipfire-ds4-parent",
  "hipfire-reap",
  "hipfire-runtime",
  "libloading",
  "memmap2",
  "rdna-compute",
+ "saddle-core",
  "serde",
  "serde_json",
 ]
@@ -875,11 +877,13 @@ name = "hipfire-arch-qwen35"
 version = "0.3.0"
 dependencies = [
  "hip-bridge",
+ "hipfire-arch-qwen35-vl",
  "hipfire-config",
  "hipfire-dispatch",
  "hipfire-reap",
  "hipfire-runtime",
  "rdna-compute",
+ "saddle-core",
  "serde",
  "serde_json",
 ]
@@ -956,6 +960,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-daemon"
+version = "0.3.0"
+dependencies = [
+ "base64",
+ "hip-bridge",
+ "hipfire-config",
+ "hipfire-dispatch",
+ "hipfire-engine",
+ "hipfire-generate",
+ "hipfire-loader",
+ "hipfire-pflash",
+ "hipfire-runtime",
+ "libc",
+ "rdna-compute",
+ "saddle-core",
+ "serde",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "hipfire-detect"
 version = "0.3.0"
 dependencies = [
@@ -984,6 +1010,66 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-ds4-parent"
+version = "0.3.0"
+dependencies = [
+ "hip-bridge",
+ "hipfire-config",
+ "hipfire-runtime",
+ "libloading",
+ "memmap2",
+ "rdna-compute",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "hipfire-engine"
+version = "0.3.0"
+dependencies = [
+ "hip-bridge",
+ "hipfire-config",
+ "hipfire-dispatch",
+ "hipfire-loader",
+ "hipfire-runtime",
+ "rdna-compute",
+ "saddle-core",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
+name = "hipfire-generate"
+version = "0.3.0"
+dependencies = [
+ "base64",
+ "hip-bridge",
+ "hipfire-arch-cohere2moe",
+ "hipfire-arch-deepseek4",
+ "hipfire-arch-dots-ocr",
+ "hipfire-arch-gemma4",
+ "hipfire-arch-lfm2moe",
+ "hipfire-arch-llama",
+ "hipfire-arch-minimax",
+ "hipfire-arch-muse-glimmer",
+ "hipfire-arch-qwen2",
+ "hipfire-arch-qwen35",
+ "hipfire-arch-qwen35-vl",
+ "hipfire-config",
+ "hipfire-dispatch",
+ "hipfire-engine",
+ "hipfire-loader",
+ "hipfire-pflash",
+ "hipfire-runtime",
+ "rdna-compute",
+ "saddle-core",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "hipfire-loader"
 version = "0.3.0"
 dependencies = [
@@ -1002,6 +1088,21 @@ dependencies = [
  "hipfire-config",
  "hipfire-runtime",
  "rdna-compute",
+ "saddle-core",
+ "serde_json",
+]
+
+[[package]]
+name = "hipfire-pflash"
+version = "0.3.0"
+dependencies = [
+ "hip-bridge",
+ "hipfire-arch-qwen35",
+ "hipfire-config",
+ "hipfire-dispatch",
+ "hipfire-runtime",
+ "rdna-compute",
+ "serde",
  "serde_json",
 ]
 
@@ -1069,7 +1170,9 @@ dependencies = [
  "hipfire-config",
  "hipfire-detect",
  "hipfire-dispatch",
+ "hipfire-engine",
  "hipfire-loader",
+ "hipfire-pflash",
  "libc",
  "memmap2",
  "minijinja",
@@ -1077,6 +1180,7 @@ dependencies = [
  "rayon",
  "rdna-compute",
  "regex",
+ "saddle-core",
  "safetensors",
  "serde",
  "serde_json",
@@ -2127,6 +2231,57 @@ name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
+
+[[package]]
+name = "saddle-core"
+version = "0.3.0"
+dependencies = [
+ "hip-bridge",
+ "rdna-compute",
+ "serde",
+]
+
+[[package]]
+name = "saddle-lab"
+version = "0.3.0"
+dependencies = [
+ "base64",
+ "byteorder",
+ "half",
+ "hip-bridge",
+ "hipfire-arch-cohere2moe",
+ "hipfire-arch-deepseek4",
+ "hipfire-arch-dots-ocr",
+ "hipfire-arch-gemma4",
+ "hipfire-arch-lfm2moe",
+ "hipfire-arch-llama",
+ "hipfire-arch-minimax",
+ "hipfire-arch-muse-glimmer",
+ "hipfire-arch-qwen2",
+ "hipfire-arch-qwen35",
+ "hipfire-arch-qwen35-vl",
+ "hipfire-atlas",
+ "hipfire-config",
+ "hipfire-detect",
+ "hipfire-dispatch",
+ "hipfire-engine",
+ "hipfire-loader",
+ "hipfire-pflash",
+ "hipfire-runtime",
+ "libc",
+ "memmap2",
+ "minijinja",
+ "minijinja-contrib",
+ "rayon",
+ "rdna-compute",
+ "regex",
+ "saddle-core",
+ "safetensors",
+ "serde",
+ "serde_json",
+ "smallvec",
+ "tracing",
+]
 
 [[package]]
 name = "safetensors"

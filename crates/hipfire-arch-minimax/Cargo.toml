@@ -8,6 +8,8 @@ license.workspace = true
 description = "MiniMax-M2 architecture (Mixtral-style MoE: GQA + per-layer QK-norm + partial rotate_half RoPE + sigmoid+bias 256-expert MoE) for hipfire"
 
 [features]
+# Archived research probes; see the note by the [[example]] blocks.
+lab = []
 default = ["deltanet"]
 # partial rotate_half RoPE (rope_partial_interleaved_f32) is deltanet-gated,
 # matching hipfire-arch-qwen35.
@@ -22,3 +24,36 @@ rdna-compute = { path = "../rdna-compute" }
 hipfire-reap = { path = "../hipfire-reap" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# ---------------------------------------------------------------------------
+# Archived research probes.
+#
+# One-question GPU experiments -- "is GPU argmax faster than downloading logits
+# at vocab 129,280 on gfx1201" -- written at roughly eleven a month since
+# 2026-03. They are the working method for kernel decisions and worth keeping:
+# a HIP kernel cannot be measured by a unit test.
+#
+# Gated because an answer obtained in April should not be type-checked on every
+# build in August. Ungated, they all compile under `cargo build --all-targets`,
+# so every refactor drags every probe with it -- several build breaks during the
+# ModelState removal were in probes nobody had run since the day they were
+# written.
+#
+# Run on demand:  cargo build -p <crate> --examples --features lab
+# The UNGATED example count is ratcheted; see scripts/leanup-ratchets.sh.
+# ---------------------------------------------------------------------------
+[[example]]
+name = "dump_minimax_hidden_states"
+required-features = ["lab"]
+
+[[example]]
+name = "ep_minimax"
+required-features = ["lab"]
+
+[[example]]
+name = "infer_minimax"
+required-features = ["lab"]
+
+[[example]]
+name = "minimax_prefill_bench"
+required-features = ["lab"]

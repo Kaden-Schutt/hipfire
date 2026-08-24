@@ -32,10 +32,10 @@ pub mod config;
 pub mod drafter;
 pub mod forward;
 pub mod gemma4;
-/// Kevin's lowered (execute_steps/superop) gemma4 forward — namespaced; types
-/// like `lowered::Gemma4Weights` collide with `gemma4::*` and are NOT re-exported.
 pub mod lowered;
 pub mod speculative;
+pub mod carrier;
+pub use carrier::{load_gemma4_bundle, Gemma4Bundle, Gemma4EagerBundle, Gemma4LoweredBundle};
 
 pub use arch::{Gemma4, ARCH_ID};
 pub use config::{Gemma4Config, LayerType, RopeType};

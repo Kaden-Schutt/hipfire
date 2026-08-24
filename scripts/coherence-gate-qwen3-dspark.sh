@@ -50,7 +50,7 @@ if [ "$FAST" -eq 1 ] && [ "$FULL" -eq 1 ]; then
     exit 2
 fi
 
-EXE="./target/release/examples/daemon"
+EXE="./target/release/daemon"
 MODELS_DIR="${HIPFIRE_MODELS_DIR:-$HOME/.hipfire/models}"
 MODEL="$MODELS_DIR/qwen3-8b.mq4"
 OUT="${HIPFIRE_COHERENCE_OUT:-/tmp/coherence-qwen3-dspark-$(date +%Y%m%d-%H%M%S).md}"
@@ -67,7 +67,7 @@ else
         crates/hipfire-arch-llama/src/spec_impl.rs \
         crates/hipfire-arch-llama/src/carrier.rs \
         crates/hipfire-runtime/src/dspark_core.rs \
-        crates/hipfire-runtime/examples/daemon.rs \
+        crates/hipfire-daemon/src/main.rs \
         crates/hipfire-loader/src/carriers.rs \
         crates/rdna-compute/src/dispatch.rs; do
         if [ -f "$src" ] && [ "$src" -nt "$EXE" ]; then
@@ -78,7 +78,7 @@ else
 fi
 if [ "$rebuild" -eq 1 ]; then
     echo "coherence-gate-qwen3-dspark: rebuilding daemon..."
-    if ! cargo build --release --example daemon --features deltanet >&2; then
+ if ! cargo build --release -p hipfire-daemon >&2; then
         echo "coherence-gate-qwen3-dspark: build failed" >&2
         exit 2
     fi

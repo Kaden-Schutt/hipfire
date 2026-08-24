@@ -18,7 +18,9 @@
 //!   * LIV conv    -> conv1d_gated_decode_f32 (NEW: K=3, fused B*x / C*conv_out
 //!                    gates + rolling conv-state cache)
 pub mod arch;
+pub mod arch_model;
 pub mod batch;
+pub mod carrier;
 pub mod config;
 pub mod forward;
 pub mod forward_batch;
@@ -27,6 +29,7 @@ pub mod spec_impl;
 
 pub use arch::Lfm2Moe;
 pub use batch::Lfm2DecodeBatchState;
+pub use carrier::load_lfm2moe_bundle;
 pub use config::{config_from_source, Lfm2MoeConfig, MixerKind};
 pub use forward::{decode_step, decode_step_capture};
 pub use forward_batch::{

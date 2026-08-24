@@ -3332,6 +3332,12 @@ impl Gpu {
                     "fused_gate_up_hfq4g256",
                     kernels::FUSED_GATE_UP_HFQ4G256_SRC.to_string(),
                 ));
+                if self.arch_caps.is_gfx1100() {
+                    specs.push((
+                        "fused_gate_up_hfq4g256_stage_x32_gfx1100",
+                        kernels::FUSED_GATE_UP_HFQ4G256_STAGE_X32_GFX1100_SRC.to_string(),
+                    ));
+                }
                 // gfx906/gfx908/gfx94x wave64-native variants — cut
                 // wavefront pressure in half on the hottest kernels. Wave32
                 // block=[32,1,1] kernels otherwise waste the upper 32 lanes
@@ -3445,6 +3451,12 @@ impl Gpu {
                     "fused_gate_up_hfq4g256",
                     kernels::FUSED_GATE_UP_HFQ4G256_SRC.to_string(),
                 ));
+                if self.arch_caps.is_gfx1100() {
+                    specs.push((
+                        "fused_gate_up_hfq4g256_stage_x32_gfx1100",
+                        kernels::FUSED_GATE_UP_HFQ4G256_STAGE_X32_GFX1100_SRC.to_string(),
+                    ));
+                }
                 specs.push((
                     "fused_rmsnorm_mq_rotate",
                     kernels::FUSED_RMSNORM_MQ_ROTATE_SRC.to_string(),
@@ -3666,6 +3678,12 @@ impl Gpu {
                     "kv_cache_write_asym_k_givens3",
                     assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_GIVENS3_SRC),
                 ));
+                if self.arch_caps.is_gfx1100() && head_dim == 256 {
+                    specs.push((
+                        "kv_cache_write_asym3_q8_pair_gfx1100",
+                        assemble_asym(kernels::KV_CACHE_WRITE_ASYM3_Q8_PAIR_GFX1100_SRC),
+                    ));
+                }
                 specs.push((
                     "kv_cache_write_asym_k_givens3_batched",
                     assemble_asym(kernels::KV_CACHE_WRITE_ASYM_K_GIVENS3_BATCHED_SRC),

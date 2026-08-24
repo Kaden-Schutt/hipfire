@@ -13,7 +13,7 @@ Bring-up narrative is historical:
 | Page state | **shipped / ref-pinned** for source-wired multi-device behavior (see [`INDEX.md`](INDEX.md)); performance tables in the appendix are **historical** only |
 | Orchestration | `crates/hipfire-runtime/src/multi_gpu.rs` |
 | PP load path | `crates/hipfire-loader/src/carriers.rs` (`load_qwen35_pp`) |
-| Daemon load / refusals | `crates/hipfire-runtime/examples/daemon.rs` |
+| Daemon load / refusals | `crates/hipfire-daemon/src/main.rs` |
 | Supporting multi-GPU script | [`scripts/pp-gate.sh`](../scripts/pp-gate.sh) (not a VALIDATION selector minimum route) |
 | Admissions | [`admissions.yml`](admissions.yml) — schema v2, exactly one single-GPU retained-PM4 record; no multi-GPU records (fail closed; none inferred) |
 

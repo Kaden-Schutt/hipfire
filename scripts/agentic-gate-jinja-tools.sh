@@ -39,7 +39,7 @@ set -u
 cd "$(dirname "$0")/.."
 
 # ---- Setup -----------------------------------------------------------------
-EXE="./target/release/examples/daemon"
+EXE="./target/release/daemon"
 MODELS_DIR="${HIPFIRE_MODELS_DIR:-${HIPFIRE_DIR:-$HOME/.hipfire}/models}"
 LOCK_SCRIPT="./scripts/gpu-lock.sh"
 
@@ -131,7 +131,7 @@ if [ ! -x "$EXE" ]; then
     rebuild=1
 else
     for src in crates/hipfire-arch-qwen35/src/qwen35.rs crates/hipfire-runtime/src/llama.rs \
-               crates/hipfire-runtime/src/hfq.rs crates/hipfire-runtime/examples/daemon.rs \
+               crates/hipfire-runtime/src/hfq.rs crates/hipfire-daemon/src/main.rs \
                crates/hipfire-runtime/src/prompt_frame.rs \
                crates/rdna-compute/src/dispatch.rs; do
         if [ -f "$src" ] && [ "$src" -nt "$EXE" ]; then
@@ -141,7 +141,7 @@ else
 fi
 if [ "$rebuild" -eq 1 ]; then
     echo "agentic-gate-jinja-tools: rebuilding daemon..."
-    if ! cargo build --release --example daemon --features deltanet >&2; then
+ if ! cargo build --release -p hipfire-daemon >&2; then
         echo "agentic-gate-jinja-tools: build failed" >&2
         exit 2
     fi

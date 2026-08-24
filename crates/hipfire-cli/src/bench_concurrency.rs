@@ -229,6 +229,7 @@ pub fn turn_hash(s: &str) -> u64 {
     h
 }
 
+#[cfg(feature = "multi-slot")]
 pub struct SlotDriver {
     engine: hipfire_arch_qwen35::serve_engine::SlotEngine,
     tokenizer: hipfire_runtime::tokenizer::Tokenizer,
@@ -238,6 +239,13 @@ pub struct SlotDriver {
     seq: usize,
 }
 
+#[cfg(not(feature = "multi-slot"))]
+pub struct SlotDriver {
+    max_concurrency: usize,
+    seq: usize,
+}
+
+#[cfg(feature = "multi-slot")]
 impl SlotDriver {
     pub fn start(model: &Path, max_concurrency: usize, cap_tokens: usize) -> Result<Self> {
         let hfq = hipfire_runtime::hfq::HfqFile::open(model)
@@ -292,6 +300,14 @@ impl SlotDriver {
     }
 }
 
+#[cfg(not(feature = "multi-slot"))]
+impl SlotDriver {
+    pub fn start(_model: &Path, _max_concurrency: usize, _cap_tokens: usize) -> Result<Self> {
+        bail!("multi-slot feature disabled: rebuild with --features multi-slot")
+    }
+}
+
+#[cfg(feature = "multi-slot")]
 impl ConcurrencyBackend for SlotDriver {
     fn label(&self) -> &'static str {
         "slots"
@@ -392,6 +408,15 @@ impl ConcurrencyBackend for SlotDriver {
             rejected,
             prefix_hits,
         })
+    }
+}
+
+#[cfg(not(feature = "multi-slot"))]
+impl ConcurrencyBackend for SlotDriver {
+    fn label(&self) -> &'static str { "slots" }
+    fn max_concurrency(&self) -> usize { self.max_concurrency }
+    fn run(&mut self, _workload: WorkloadSel, _k: usize, _max_tokens: u64) -> Result<ArmResult> {
+        bail!("multi-slot feature disabled")
     }
 }
 

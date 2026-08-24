@@ -29,8 +29,8 @@ use hipfire_dispatch::pipeline::superop::{
 };
 use hipfire_dispatch::types::DispatchError;
 use hipfire_runtime::llama::{
-    fused_silu_mul_rotate_mq_batched_for, rotate_x_mq_for, weight_gemv, weight_gemv_residual,
-};
+    fused_silu_mul_rotate_mq_batched_for, rotate_x_mq_for, weight_gemv, weight_gemv_residual};
+use hipfire_runtime::llama::KvCacheExt;
 use rdna_compute::{DType, Gpu};
 
 /// Decode one token; returns the full logits vector.

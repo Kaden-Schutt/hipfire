@@ -34,7 +34,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--model", required=True)
     parser.add_argument("--session", required=True)
-    parser.add_argument("--daemon", default=str(REPO / "target/release/examples/daemon"))
+    parser.add_argument("--daemon", default=str(REPO / "target/release/daemon"))
     parser.add_argument("--cli", default=str(REPO / "target/release/hipfire"))
     parser.add_argument("--device", default="0")
     parser.add_argument("--kv", choices=("q8", "fwht2", "fwht3", "fwht4"), default="q8")

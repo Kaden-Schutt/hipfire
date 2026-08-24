@@ -282,7 +282,7 @@ Write-Host ""
 Write-Host "Setting up hipfire source..." -ForegroundColor Cyan
 
 # INSTALL-F1: tracks whether the source tree was (re)fetched/cloned/reset this
-# run. When source changed, a repo-side target\release\examples\daemon.exe from
+# run. When source changed, a repo-side target\release\daemon.exe from
 # a prior build is STALE and must not be reused — we force a rebuild.
 $SourceUpdated = $false
 
@@ -391,7 +391,7 @@ if ($SourceUpdated) {
     $PreBuilt = $null
 } else {
     $PreBuilt = @(
-        "$TargetDir\release\examples\daemon.exe",
+        "$TargetDir\release\daemon.exe",
         "$RepoDir\bin\daemon.exe"
     ) | Where-Object { Test-Path $_ } | Select-Object -First 1
 }
@@ -477,7 +477,19 @@ if ($PreBuilt -and $PreBuilt -ne "$BinDir\daemon.exe") {
     Write-Host "  cargo build --release (this may take several minutes)..."
     Push-Location $RepoDir
     try {
-        cargo build --release --features deltanet --example daemon --example infer --example infer_hfq -p hipfire-runtime
+        # The daemon is a [[bin]] in its own crate and needs no --features:
+        # every architecture is an unconditional dependency. This is the
+        # one-command build.
+        cargo build --release -p hipfire-daemon
+        # Optional research helpers. They live in saddle-lab and carry
+        # required-features, so a failure here must not abort the install --
+        # the Test-Path copy further down already treats them as optional.
+        try {
+            cargo build --release -p saddle-lab --example infer_hfq
+            cargo build --release -p saddle-lab --example infer --features arch-qwen35,arch-qwen35-vl
+        } catch {
+            Write-Warning "optional helper examples (infer/infer_hfq) did not build - continuing."
+        }
         cargo build --release -p hipfire-cli
         # OPTIONAL build (terminal UI). Must NOT abort the install if it fails:
         # the mandatory daemon/CLI are installed regardless. Under PowerShell 7
@@ -506,7 +518,7 @@ if ($PreBuilt -and $PreBuilt -ne "$BinDir\daemon.exe") {
         if ($Meta.target_directory) { $TargetDir = $Meta.target_directory }
     } catch {}
 
-    $BuiltExe = "$TargetDir\release\examples\daemon.exe"
+    $BuiltExe = "$TargetDir\release\daemon.exe"
     if (-not (Test-Path $BuiltExe)) {
         Write-Host ""
         Write-Host "  BUILD FAILED." -ForegroundColor Red
@@ -516,7 +528,7 @@ if ($PreBuilt -and $PreBuilt -ne "$BinDir\daemon.exe") {
         Write-Host ""
         Write-Host "  After fixing, re-run this installer or build manually:"
         Write-Host "    cd $RepoDir"
-        Write-Host "    cargo build --release --features deltanet --example daemon -p hipfire-runtime"
+        Write-Host "    cargo build --release -p hipfire-daemon"
         exit 1
     }
     Copy-Item $BuiltExe "$BinDir\daemon.exe" -Force

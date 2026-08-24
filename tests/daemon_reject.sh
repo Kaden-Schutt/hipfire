@@ -8,7 +8,7 @@
 
 set -euo pipefail
 MODEL="${MODEL:-$HOME/.hipfire/models/qwen3.5-0.8b.mq4}"
-DAEMON="target/release/examples/daemon"
+DAEMON="target/release/daemon"
 
 if [[ ! -f "$MODEL" ]]; then echo "missing model: $MODEL"; exit 2; fi
 if [[ ! -x "$DAEMON" ]]; then echo "missing daemon: $DAEMON"; exit 2; fi

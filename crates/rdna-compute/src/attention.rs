@@ -110,6 +110,22 @@ pub fn q8_flash_tile_size(
 
 const V_MODE_Q8: i32 = 8;
 
+fn gfx1100_asym3_q8_pair_enabled(gpu: &Gpu, head_dim: usize) -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    gpu.arch_caps.is_gfx1100()
+        && head_dim == 256
+        && !gpu.replay.is_recording()
+        && *ENABLED.get_or_init(|| {
+            // Qwen3.6-27B graph-on decode: three fresh-process samples per
+            // arm measured +0.61% by median (+0.11/+0.45/+0.61% paired),
+            // while attribution removed exactly 16 dispatches/token.
+            hipfire_config::developer_var("HIPFIRE_GFX1100_ASYM3_Q8_PAIR")
+                .ok()
+                .as_deref()
+                != Some("0")
+        })
+}
+
 #[inline]
 fn replay_stable_tile_count(
     actual_tiles: usize,
@@ -3816,56 +3832,8 @@ impl Gpu {
             let ts = tile_size as i32;
             let mt = max_tiles as i32;
             if let Some(gate) = output_gate {
-                let (module, src, kernel) = if self.arch_caps.is_gfx1151() {
-                    (
-                        "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151",
-                        kernels::ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1151_SRC,
-                        "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151",
-                    )
-                } else {
-                    (
-                        "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100",
-                        kernels::ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1100_SRC,
-                        "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100",
-                    )
-                };
-                self.ensure_kernel(module, src, kernel)?;
-                self.ensure_mq_signs()?;
-                let g_ptr = gate.buf.as_ptr();
-                let s1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
-                let s2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
-                let mut params: Vec<*mut c_void> = vec![
-                    &p_ptr as *const _ as *mut c_void,
-                    &o_ptr as *const _ as *mut c_void,
-                    &g_ptr as *const _ as *mut c_void,
-                    &s1_ptr as *const _ as *mut c_void,
-                    &s2_ptr as *const _ as *mut c_void,
-                    &nh as *const _ as *mut c_void,
-                    &hd as *const _ as *mut c_void,
-                    &pos_ptr as *const _ as *mut c_void,
-                    &ts as *const _ as *mut c_void,
-                    &mt as *const _ as *mut c_void,
-                ];
-                self.launch_maybe_blob(
-                    kernel,
-                    [n_heads as u32, 1, 1],
-                    [256, 1, 1],
-                    ((max_tiles + head_dim) * 4) as u32,
-                    &mut params,
-                    || {
-                        let mut b = hip_bridge::KernargBlob::new();
-                        b.push_ptr(p_ptr);
-                        b.push_ptr(o_ptr);
-                        b.push_ptr(g_ptr);
-                        b.push_ptr(s1_ptr);
-                        b.push_ptr(s2_ptr);
-                        b.push_i32(nh);
-                        b.push_i32(hd);
-                        b.push_ptr(pos_ptr);
-                        b.push_i32(ts);
-                        b.push_i32(mt);
-                        b
-                    },
+                self.attention_flash_reduce_gated_mq_rotate_gfx1100(
+                    partials, out, gate, pos_buf, n_heads, head_dim, tile_size, max_tiles,
                 )?;
             } else {
                 const KERNEL: &str = "attention_flash_q8_0_reduce";
@@ -4202,6 +4170,63 @@ impl Gpu {
         head_dim: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        if gfx1100_asym3_q8_pair_enabled(self, head_dim) {
+            const KERNEL: &str = "kv_cache_write_asym3_q8_pair_gfx1100";
+            self.ensure_givens4_kernel(
+                KERNEL,
+                kernels::KV_CACHE_WRITE_ASYM3_Q8_PAIR_GFX1100_SRC,
+                KERNEL,
+            )?;
+            let kd = k_dst.buf.as_ptr();
+            let vd = v_dst.buf.as_ptr();
+            let ks = k_src.buf.as_ptr();
+            let vs = v_src.buf.as_ptr();
+            let p = pos_buf.as_ptr();
+            let ct = cos_theta.buf.as_ptr();
+            let st = sin_theta.buf.as_ptr();
+            let nkv = n_kv_heads as i32;
+            let hd = head_dim as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &kd as *const _ as *mut c_void,
+                &vd as *const _ as *mut c_void,
+                &ks as *const _ as *mut c_void,
+                &vs as *const _ as *mut c_void,
+                &p as *const _ as *mut c_void,
+                &ct as *const _ as *mut c_void,
+                &st as *const _ as *mut c_void,
+                &nkv as *const _ as *mut c_void,
+                &hd as *const _ as *mut c_void,
+            ];
+            let q8_blocks = n_kv_heads * head_dim / 32;
+            let k_bytes =
+                n_kv_heads * head_dim * 4 + n_kv_heads * (4 + head_dim * 3 / 8) + head_dim * 4;
+            let bytes = k_bytes + crate::profile::kv_cache_write_q8_0_bytes(n_kv_heads, head_dim);
+            let timer = crate::profile::begin_timer(&self.hip, "kv_write", KERNEL, bytes);
+            let result = self.launch_maybe_blob(
+                KERNEL,
+                [(n_kv_heads + q8_blocks) as u32, 1, 1],
+                [32, 1, 1],
+                ((head_dim + 32) * 4) as u32,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(kd);
+                    b.push_ptr(vd);
+                    b.push_ptr(ks);
+                    b.push_ptr(vs);
+                    b.push_ptr(p);
+                    b.push_ptr(ct);
+                    b.push_ptr(st);
+                    b.push_i32(nkv);
+                    b.push_i32(hd);
+                    b
+                },
+            );
+            if let Some(t) = timer {
+                t.finish(&self.hip);
+            }
+            return result;
+        }
         self.ensure_givens4_kernel(
             "kv_cache_write_asym_k_givens3",
             kernels::KV_CACHE_WRITE_ASYM_K_GIVENS3_SRC,
@@ -6273,6 +6298,7 @@ impl Gpu {
         head_dim: usize,
         max_seq: usize,
         partials: &GpuTensor,
+        output_gate: Option<&GpuTensor>,
     ) -> HipResult<()> {
         self.bind_thread()?;
         const TILE_SIZE: usize = 128;
@@ -6334,6 +6360,12 @@ impl Gpu {
             }
         }
 
+        if let Some(gate) = output_gate {
+            return self.attention_flash_reduce_gated_mq_rotate_gfx1100(
+                partials, out, gate, pos_buf, n_heads, head_dim, TILE_SIZE, max_tiles,
+            );
+        }
+
         self.ensure_kernel(
             "attention_flash_q8_0_reduce",
             kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC,
@@ -6369,6 +6401,79 @@ impl Gpu {
             }
         }
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attention_flash_reduce_gated_mq_rotate_gfx1100(
+        &mut self,
+        partials: &GpuTensor,
+        out: &GpuTensor,
+        gate: &GpuTensor,
+        pos_buf: &DeviceBuffer,
+        n_heads: usize,
+        head_dim: usize,
+        tile_size: usize,
+        max_tiles: usize,
+    ) -> HipResult<()> {
+        let (module, src, kernel) = if self.arch_caps.is_gfx1151() {
+            (
+                "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151",
+                kernels::ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1151_SRC,
+                "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151",
+            )
+        } else {
+            (
+                "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100",
+                kernels::ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1100_SRC,
+                "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100",
+            )
+        };
+        self.ensure_kernel(module, src, kernel)?;
+        self.ensure_mq_signs()?;
+
+        let p_ptr = partials.buf.as_ptr();
+        let o_ptr = out.buf.as_ptr();
+        let g_ptr = gate.buf.as_ptr();
+        let s1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let nh = n_heads as i32;
+        let hd = head_dim as i32;
+        let pos_ptr = pos_buf.as_ptr();
+        let ts = tile_size as i32;
+        let mt = max_tiles as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &p_ptr as *const _ as *mut c_void,
+            &o_ptr as *const _ as *mut c_void,
+            &g_ptr as *const _ as *mut c_void,
+            &s1_ptr as *const _ as *mut c_void,
+            &s2_ptr as *const _ as *mut c_void,
+            &nh as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+            &pos_ptr as *const _ as *mut c_void,
+            &ts as *const _ as *mut c_void,
+            &mt as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            kernel,
+            [n_heads as u32, 1, 1],
+            [256, 1, 1],
+            ((max_tiles + head_dim) * 4) as u32,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(p_ptr);
+                b.push_ptr(o_ptr);
+                b.push_ptr(g_ptr);
+                b.push_ptr(s1_ptr);
+                b.push_ptr(s2_ptr);
+                b.push_i32(nh);
+                b.push_i32(hd);
+                b.push_ptr(pos_ptr);
+                b.push_i32(ts);
+                b.push_i32(mt);
+                b
+            },
+        )
     }
 
     /// Fused K+V write for asym2: K at givens2 (rotated 2-bit), V at Q8_0 (normal space).

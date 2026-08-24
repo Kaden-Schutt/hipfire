@@ -54,7 +54,7 @@ while [ $# -gt 0 ]; do
     shift
 done
 
-EXE="./target/release/examples/daemon"
+EXE="./target/release/daemon"
 MODELS_DIR="${HIPFIRE_MODELS_DIR:-${HIPFIRE_DIR:-$HOME/.hipfire}/models}"
 OUT="${HIPFIRE_PARITY_OUT:-/tmp/forward-lowered-parity-$(date +%Y%m%d-%H%M%S).md}"
 LOCK_SCRIPT="./scripts/gpu-lock.sh"
@@ -66,7 +66,7 @@ MAX_TOK="${HIPFIRE_PARITY_MAX_TOK:-256}"
 # (or rm the binary) if you changed forward/dispatch code since the last build.
 if [ ! -x "$EXE" ]; then
     echo "forward-lowered-parity: building daemon (--features deltanet)..." >&2
-    if ! cargo build --release --example daemon --features deltanet >&2; then
+ if ! cargo build --release -p hipfire-daemon >&2; then
         echo "forward-lowered-parity: build failed" >&2
         exit 2
     fi

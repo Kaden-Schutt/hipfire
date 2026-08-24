@@ -27,7 +27,7 @@
 set -u
 cd "$(dirname "$0")/.."
 
-EXE="./target/release/examples/daemon"
+EXE="./target/release/daemon"
 SIM_DIR="${SIM_DIR:-/tmp/mq3-sim/models}"
 SRC_DIR="${HIPFIRE_MODELS_DIR:-$HOME/.hipfire/models}"
 OUT="${OUT:-/tmp/mq3-eval-$(date +%Y%m%d-%H%M%S).md}"

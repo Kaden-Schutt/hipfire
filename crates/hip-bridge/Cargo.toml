@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 description = "Safe Rust FFI to AMD HIP/HSA runtime via dlopen"
 
+[features]
+# Archived research probes; see the note by the [[example]] blocks.
+lab = []
+
 [dependencies]
 hipfire-config = { path = "../hipfire-config" }
 libloading.workspace = true
@@ -12,3 +16,48 @@ thiserror = "2"
 
 [dev-dependencies]
 redline-rocr = { path = "../redline-rocr" }
+
+# ---------------------------------------------------------------------------
+# Archived research probes.
+#
+# One-question GPU experiments -- "is GPU argmax faster than downloading logits
+# at vocab 129,280 on gfx1201" -- written at roughly eleven a month since
+# 2026-03. They are the working method for kernel decisions and worth keeping:
+# a HIP kernel cannot be measured by a unit test.
+#
+# Gated because an answer obtained in April should not be type-checked on every
+# build in August. Ungated, they all compile under `cargo build --all-targets`,
+# so every refactor drags every probe with it -- several build breaks during the
+# ModelState removal were in probes nobody had run since the day they were
+# written.
+#
+# Run on demand:  cargo build -p <crate> --examples --features lab
+# The UNGATED example count is ratcheted; see scripts/leanup-ratchets.sh.
+# ---------------------------------------------------------------------------
+[[example]]
+name = "collect_e8_hessian_rocblas"
+required-features = ["lab"]
+
+[[example]]
+name = "kernel_launch"
+required-features = ["lab"]
+
+[[example]]
+name = "peer_chain"
+required-features = ["lab"]
+
+[[example]]
+name = "peer_smoke"
+required-features = ["lab"]
+
+[[example]]
+name = "rccl_smoke"
+required-features = ["lab"]
+
+[[example]]
+name = "smokeQA"
+required-features = ["lab"]
+
+[[example]]
+name = "vmm_arena_smoke"
+required-features = ["lab"]

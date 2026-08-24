@@ -1914,7 +1914,7 @@ def spawn_serve(cfg, home, log):
     # process comm → the CLI's reapOrphans `pkill -x <name>` stays scoped to THIS
     # instance). HIPFIRE_DAEMON_NAME/ID pass through from os.environ untouched.
     env = dict(os.environ, HOME=home, HIP_VISIBLE_DEVICES=os.environ.get("HIP_VISIBLE_DEVICES","0"),
-               HIPFIRE_DAEMON_BIN=os.environ.get("HIPFIRE_DAEMON_BIN", os.path.join(REPO, "target/release/examples/daemon")),
+               HIPFIRE_DAEMON_BIN=os.environ.get("HIPFIRE_DAEMON_BIN", os.path.join(REPO, "target/release/daemon")),
                HIPFIRE_KV_MODE=cfg["kv"], HIPFIRE_CASK_OFF="1", HIPFIRE_MODEL=cfg["model"])
     if cfg["mtp"] == "on":
         env.update(HIPFIRE_QWEN_MTP="1", HIPFIRE_MTP_SAMPLED="1", HIPFIRE_MTP_PREFIX_CACHE="1")
@@ -2105,7 +2105,7 @@ def _tool_result_feedback(tool_call_id, content, feedback_shape=None, name=None)
 
 def _daemon_binary_md5():
     """Return (md5_hex, path) for the daemon binary per AGENTS.md discipline."""
-    cand = os.environ.get("HIPFIRE_DAEMON_BIN") or os.path.join(REPO, "target/release/examples/daemon")
+    cand = os.environ.get("HIPFIRE_DAEMON_BIN") or os.path.join(REPO, "target/release/daemon")
     # Fallback to HIPFIRE_CLI_BIN if daemon not found
     if not os.path.exists(cand):
         alt = os.environ.get("HIPFIRE_CLI_BIN") or os.path.join(REPO, "target/release/hipfire")
@@ -2558,6 +2558,49 @@ def run(cfg, args):
         rate = (sa / sd) if sd else 0.0
         summary += f" ngram={sa}/{sd}@{rate:.2f}"
     print(summary, flush=True)
+
+    # Coherence is ASSERTED, not merely printed -- but only for `attractor`.
+    #
+    # Until 2026-08-16 all three flags were folded into the summary above and the
+    # process exited 0 regardless, so a battery could print `attractor=2` and pass.
+    #
+    # Only `attractor` is fatal, and the first version of this gate got that wrong
+    # by failing on all three. Reading the decoded text is what corrected it:
+    #
+    #   [code]t1 finish=length gen=192 (think 103/ans 25w) !RUNAWAY | '```python...
+    #
+    # `runaway` is `finish == "length"` -- the turn hit max_tokens. That turn
+    # produced real Python and was truncated because 103 of its 192 tokens went to
+    # thinking. `empty` on the same run was the same budget problem: 150 words of
+    # think, zero visible answer, finish=None. Both are fixture configuration, not
+    # defects, and failing on them breaks every tight-budget benchmark -- qwen3.8
+    # and muse-glimmer, both healthy, tripped it on hiptrx.
+    #
+    # `attractor` is the one signal a token budget cannot explain: the model is
+    # emitting a degenerate repeated token. That is the lfm2.5-8b-a1b `</think>`
+    # shape -- statistically unremarkable, obviously broken to a reader.
+    #
+    # HIPFIRE_SERVE_ALLOW_INCOHERENT=1 opts out and prints what it forgave.
+    _n_attractor = sum(r["attractor"] for r in g)
+    if _n_attractor:
+        _ctx = (
+            f"attractor={_n_attractor}"
+            f" (runaway={sum(r['runaway'] for r in g)},"
+            f" empty={sum(r['empty'] for r in g)} — reported, not fatal)"
+        )
+        if os.environ.get("HIPFIRE_SERVE_ALLOW_INCOHERENT") == "1":
+            print(
+                f"[{label}] ATTRACTOR {_ctx} — forgiven by "
+                f"HIPFIRE_SERVE_ALLOW_INCOHERENT=1",
+                flush=True,
+            )
+        else:
+            raise SystemExit(
+                f"serve_harness: {label} produced a token attractor across "
+                f"{len(g)} turn(s): {_ctx}. Read the decoded text above. Set "
+                f"HIPFIRE_SERVE_ALLOW_INCOHERENT=1 to characterise a known-bad "
+                f"model on purpose."
+            )
     # ---- Glimmer gate: prompt / request / binary identities (AGENTS.md discipline) ----
     for r in g:
         if r.get("prompt_md5"):
@@ -2725,7 +2768,11 @@ def main():
     ap.add_argument("--sampling", default="registry",
                     help="registry | registry:general|coding|instruct | greedy | recipe:general|coding|nothink | json:{...}")
     ap.add_argument("--mode", default="battery", choices=["battery", "chain", "session"])
-    ap.add_argument("--session", default="/home/kaden/mv/session_coding.json")
+    ap.add_argument(
+        "--session",
+        default=os.path.join(REPO, "benchmarks", "prompts", "session_coding.json"),
+        help="Multi-turn session fixture (default: the committed 8-turn coding chain).",
+    )
     ap.add_argument("--port", type=int, default=11520)
     ap.add_argument("--home", default=os.path.expanduser("~/.cache/serve_harness_home"))
     ap.add_argument("--serve-log", default="/tmp/serve_harness.serve.log")

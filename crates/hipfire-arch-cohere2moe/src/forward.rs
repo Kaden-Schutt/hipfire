@@ -36,8 +36,8 @@ use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::families::moe::{MoeDtypes, MoePrefillParams};
 use hipfire_runtime::llama::{
     fused_silu_mul_rotate_mq_batched_for, moe_family, rotate_x_mq_batched_for, rotate_x_mq_for,
-    weight_gemv, weight_gemv_residual,
-};
+    weight_gemv, weight_gemv_residual};
+use hipfire_runtime::llama::KvCacheExt;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Grouped-MoE prefill tiling constant — must match `run_moe_prefill`'s

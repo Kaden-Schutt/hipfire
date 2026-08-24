@@ -314,4 +314,16 @@ pub fn populate(registry: &mut KernelRegistry) {
         has_awq: false,
         tile: TileImpl::None,
     });
+    // Gemma4 PLE Q8 wide-exact batched GEMM. Kernel is the four-way FP32
+    // summation path (`gemm_q8_0_batched_wide_exact`); registered HasWmma so
+    // resolve rejects non-WMMA arches. Call-site feature/arch/shape guards
+    // (gfx1100|gfx1201, k%32, k<=1536) remain authoritative.
+    registry.register(KernelVariant {
+        key: KernelKey::GemmQ8_0BatchedWideExact,
+        arch_required: ArchPredicate::HasWmma,
+        shape_gate: None,
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
+        tile: TileImpl::None,
+    });
 }

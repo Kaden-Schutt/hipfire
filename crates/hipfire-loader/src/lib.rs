@@ -4,23 +4,25 @@
 //! Top-of-DAG model loader. Owns `LoadedModel`, the carrier registry,
 //! and `load_model` — the single arch-dispatch point for the daemon.
 
+pub mod batch_staging;
 mod carriers;
 pub use carriers::*;
 
 /// Speculative-decode build/glue (RAII slot guard now; `DflashSpeculator` +
 /// `build_speculator` at Stages 1-2). Lives here at the top of the DAG where
-/// both `LoadedModel`/`ModelState` and the arch crates are in scope.
+/// both `LoadedModel` and the arch crates are in scope.
 pub mod spec_build;
 
 use hipfire_arch_cohere2moe as cohere2moe;
+use hipfire_runtime::arch_model::ArchModel;
+use hipfire_runtime::llama::KvCacheExt;
 use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_dots_ocr::dots_ocr;
 use hipfire_arch_gemma4 as gemma4;
 use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_minimax as minimax;
 use hipfire_arch_muse_glimmer as glimmer;
-use hipfire_arch_qwen2::qwen2;
-use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35ScratchSet};
+use hipfire_arch_qwen35::qwen35::{self};
 use hipfire_arch_qwen35::speculative::DeltaNetSnapshot;
 use hipfire_arch_qwen35::Qwen35Bundle;
 use hipfire_arch_qwen35_vl::qwen35_vl;
@@ -34,12 +36,10 @@ use hipfire_runtime::ngram_mod::NgramModPool;
 use hipfire_runtime::spec::{SpecEmit, SpecEmitCtx, SpecTargetGuard, Speculator};
 use hipfire_runtime::triattn::{EvictionCtx, TriAttnCenters};
 use rdna_compute::Gpu;
+use std::any::Any;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-// ─── Object-safe Carrier trait ──────────────────────────────────────
-
-/// One arch's complete load contract. Object-safe → usable as `&dyn Carrier`.
 pub trait Carrier: Send + Sync {
     fn name(&self) -> &'static str;
     /// Whether this carrier claims a given `arch_id`. `is_dir` distinguishes
@@ -55,6 +55,37 @@ pub trait Carrier: Send + Sync {
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String>;
 
+    /// Declared capabilities for this arch. Default is the conservative
+    /// “no capability” set — carriers override to declare what they support.
+    fn caps(&self) -> saddle_core::caps::ArchCaps {
+        saddle_core::caps::ArchCaps::default()
+    }
+
+    /// Per-arch sampling defaults (`temp`, `top_p`, `repeat_penalty`).
+    /// Default is the `else` arm of the daemon ladder (`0.3/0.8/1.0`).
+    fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
+        saddle_core::sampling::SamplingDefaults::default()
+    }
+
+    /// Grammar `Config` for constrained tool-call decoding.
+    ///
+    /// The default resolves the two `HIPFIRE_QWEN35_NGRAM_*` operator
+    /// tunables and applies to **every** arch, because that is what the
+    /// daemon's generic AR path did when it called
+    /// `hipfire_arch_qwen35::grammar_config::resolve_qwen35_grammar_config()`
+    /// unconditionally. The variable names are historically qwen-scoped; the
+    /// behaviour never was. Preserved verbatim rather than "fixed", since
+    /// narrowing it to Qwen would silently change decoding for anyone who
+    /// sets those variables against another model.
+    ///
+    /// Resolution lives in `hipfire-arch-qwen35` (its `spec_emit` is the other
+    /// caller) and is *called* here rather than duplicated: the loader already
+    /// depends on every arch crate, so this is a downward call, and it leaves
+    /// exactly one definition of the env contract in the tree.
+    fn grammar_config(&self) -> saddle_core::grammar::json::Config {
+        hipfire_arch_qwen35::grammar_config::resolve_qwen35_grammar_config()
+    }
+
     /// Borrow this model's spec-decode target out of `state`, arch-erased as a
     /// [`SpecTargetGuard`]. This is the daemon's single dispatch for the
     /// spec-decode path — it then only ever sees `&mut dyn SpecTarget`, never an
@@ -62,7 +93,7 @@ pub trait Carrier: Send + Sync {
     /// only an override may `state.take()`.
     fn spec_target_guard<'m>(
         &self,
-        _state: &'m mut Option<ModelState>,
+        _state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
         _model_path: &str,
     ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
         Err(format!("{}: spec-decode target unsupported", self.name()))
@@ -77,6 +108,58 @@ pub trait Carrier: Send + Sync {
         _ctx: SpecEmitCtx<'a>,
     ) -> Result<Box<dyn SpecEmit + 'a>, String> {
         Err(format!("{}: spec emitter unsupported", self.name()))
+    }
+
+    // ── GenDispatch (wave2) — arch-erased generation/bench hooks ──────────
+    // These are ADDITIVE ONLY; CarrierPolicy is concurrently adding caps() and
+    // sampling_defaults() in the same trait. Do not restructure.
+
+    /// Bench-prefill dispatch for `bench_prefill` (daemon.rs:15793-16008).
+    /// The ~215-line `if m.arch_id == 5 { ... } else if ...` selecting a
+    /// per-arch prefill path. Each carrier implements its arch's body
+    /// verbatim; the daemon resolves `carrier_for(arch_id)` and calls this
+    /// once. `None` = not handled (caller falls through), `Some(run_ok)`
+    /// = handled. `prefill_err` is set only by the Glimmer path, mirroring
+    /// the daemon's mutable capture.
+    fn bench_prefill(
+        &self,
+        _m: &mut LoadedModel,
+        _gpu: &mut Gpu,
+        _synthetic: &[u32],
+        _n: usize,
+        _prefill_err: &mut Option<String>,
+    ) -> Option<bool> {
+        None
+    }
+
+    /// Bench-decode prime for the generic Qwen/Glimmer path
+    /// (daemon.rs:16238 `prime_error` if arch_id==14 else Qwen). Return
+    /// `Some(prime_error)` if handled, `None` if not this carrier's arch.
+    /// The outer `Option` is dispatch; the inner `Option<String>` is the
+    /// prime error (None = prime succeeded).
+    fn bench_decode_prime(
+        &self,
+        _m: &mut LoadedModel,
+        _gpu: &mut Gpu,
+        _synthetic: &[u32],
+    ) -> Option<Option<String>> {
+        None
+    }
+
+    /// Bench-decode run for the generic Qwen/Glimmer path
+    /// (daemon.rs:16325 `run_ok` if arch_id==14 else Qwen). Return
+    /// `Some((run_ok, decode_err))` if handled, `None` otherwise.
+    /// `decode_err` captures the first failing iteration's diagnostic for
+    /// Glimmer.
+    fn bench_decode_run(
+        &self,
+        _m: &mut LoadedModel,
+        _gpu: &mut Gpu,
+        _context: usize,
+        _iterations: usize,
+        _decode_err: &mut Option<String>,
+    ) -> Option<bool> {
+        None
     }
 }
 
@@ -93,6 +176,124 @@ pub fn carrier_for(arch_id: u32) -> Option<&'static dyn Carrier> {
         .copied()
         .find(|c| c.claims_arch_id(arch_id, false))
 }
+
+// ─── Typed routing (replaces stringly `c.name() == "..."` predicates) ──────
+// Each route is an exact `arch_id` match — no carrier `name()` or broader
+// `claims_arch_id` set leaks through. Gemma 22 is deliberately excluded from
+// `GenerationEarlyRoute::Gemma4` (arch 22 is a sidecar drafter, never a
+// primary generate target). See blocker 1.
+
+/// Continuous-batch staging route. `None` = not batch-capable (fallback to sequential).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContinuousBatchRoute {
+    Qwen35,
+    Lfm2Moe,
+}
+/// Exact arch_id -> continuous-batch route. Mirrors the two batch-capable
+/// families (qwen35 5|6, lfm2moe 11). No carrier probing — pure id match.
+pub fn continuous_batch_route(arch_id: u32) -> Option<ContinuousBatchRoute> {
+    match arch_id {
+        5 | 6 => Some(ContinuousBatchRoute::Qwen35),
+        11 => Some(ContinuousBatchRoute::Lfm2Moe),
+        _ => None,
+    }
+}
+
+/// Bench-decode redline route. Exhaustive — every arch maps to exactly one
+/// variant, so a `match` without wildcard is a compile error when a new
+/// bench arch is added.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BenchDecodeRoute {
+    Deepseek4,
+    Lfm2Moe,
+    Qwen35,
+    MuseGlimmer,
+    Unsupported,
+}
+pub fn bench_decode_route(arch_id: u32) -> BenchDecodeRoute {
+    match arch_id {
+        9 => BenchDecodeRoute::Deepseek4,
+        11 => BenchDecodeRoute::Lfm2Moe,
+        5 | 6 => BenchDecodeRoute::Qwen35,
+        14 => BenchDecodeRoute::MuseGlimmer,
+        _ => BenchDecodeRoute::Unsupported,
+    }
+}
+
+/// Vision route. `None` = no vision encoder (text-only). The daemon still
+/// gates on `has_image`/`has_vl`; this route only selects the per-arch
+/// vision implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisionRoute {
+    DotsOcr,
+    QwenVl,
+    None,
+}
+pub fn vision_route(arch_id: u32) -> VisionRoute {
+    // Declared-capability gate: text-only arches declare `supports_images == false`
+    // and must return `None` even if the arch_id table would say otherwise.
+    // The table itself cannot be removed: it discriminates *which* vision
+    // implementation to run (QwenVl vs DotsOcr have distinct generate bodies in
+    // `hipfire_generate::vision::{generate_vl, generate_vl_dots_ocr}`), not just
+    // whether vision is present. Consulting caps here makes the gate declarative
+    // without changing behaviour.
+    let caps = carrier_for(arch_id).map(|c| c.caps()).unwrap_or_default();
+    if !caps.supports_images {
+        return VisionRoute::None;
+    }
+    match arch_id {
+        8 => VisionRoute::DotsOcr,
+        5 | 6 => VisionRoute::QwenVl,
+        _ => VisionRoute::None,
+    }
+}
+
+/// EP prompt construction route. DeepSeek4 (arch 9) uses the DSML prompt
+/// builder; all other EP arches (10 MiniMax, etc.) use Jinja.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpPromptRoute {
+    Dsml,
+    Jinja,
+}
+pub fn ep_prompt_route(arch_id: u32) -> EpPromptRoute {
+    match arch_id {
+        9 => EpPromptRoute::Dsml,
+        _ => EpPromptRoute::Jinja,
+    }
+}
+
+/// EP EOS token selection route. MiniMax (10) carries its own EOS; all others
+/// (including DeepSeek4) use `deepseek4_eos_tok`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpEosRoute {
+    Deepseek4,
+    Minimax,
+}
+pub fn ep_eos_route(arch_id: u32) -> EpEosRoute {
+    match arch_id {
+        10 => EpEosRoute::Minimax,
+        _ => EpEosRoute::Deepseek4,
+    }
+}
+
+/// Early generation short-circuit route (Gemma4 eager, Glimmer eager).
+/// `None` = no early short-circuit (fall through to the generic
+/// `select_generation_route` / DFlash/spec dispatch). Critically, arch 22
+/// (Gemma4 EAGLE drafter sidecar) maps to `None` — only arch 13 is a
+/// primary Gemma4 generate target. See blocker 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenerationEarlyRoute {
+    Gemma4,
+    MuseGlimmer,
+}
+pub fn generation_early_route(arch_id: u32) -> Option<GenerationEarlyRoute> {
+    match arch_id {
+        13 => Some(GenerationEarlyRoute::Gemma4),
+        14 => Some(GenerationEarlyRoute::MuseGlimmer),
+        _ => None,
+    }
+}
+
 
 // ─── Registry ─────────────────────────────────────────────────────────
 
@@ -252,28 +453,144 @@ impl AsstTurnCache {
     }
 }
 
-// ─── ModelState ────────────────────────────────────────────────────────
-
-/// Arch-specific core state, dispatched in `LoadedModel.state`.
-/// Shared fields (kv_cache, dn_state) stay on `LoadedModel` directly.
+// `ModelState` was the closed 12-variant enum that stored `LoadedModel.state`.
+// It has been replaced by `Option<Box<dyn ArchModel>>` (see `LoadedModel.state`
+// below). All per-architecture teardown now lives in each bundle's
+// `ArchModel::free_gpu`; there is no central match any more.
+/// `ArchModel` for the one bundle the loader defines itself.
 ///
-/// `unload_model` matches this exhaustively with NO wildcard: adding a variant
-/// without a teardown arm is a compile error, which is the whole point of
-/// folding self-contained arch state in here rather than leaving it as loose
-/// `Option<…>` fields that a reload can silently leak.
-pub enum ModelState {
-    Qwen2(hipfire_arch_qwen2::Qwen2Bundle),
-    Qwen35(hipfire_arch_qwen35::Qwen35Bundle),
-    Llama(hipfire_arch_llama::LlamaBundle),
-    Lfm2Moe(Lfm2MoeBundle),
-    Minimax(MiniMaxBundle),
-    Cohere2Moe(Cohere2MoeBundle),
-    Gemma4(Gemma4Bundle),
-    Gemma4Lowered(Gemma4LoweredBundle),
-    Deepseek4(hipfire_arch_deepseek4::Deepseek4Bundle),
-    Deepseek4Heterogeneous(Deepseek4HeterogeneousBundle),
-    MuseGlimmer(MuseGlimmerBundle),
+/// Every other architecture implements the trait in its own crate. Glimmer's
+/// bundle type lives here rather than in `hipfire-arch-muse-glimmer`, so the
+/// impl has to live here too — the orphan rule leaves no choice. Moving the
+/// type into its crate is Phase 2's job; until then this is the honest place.
+impl hipfire_runtime::arch_model::ArchModel for MuseGlimmerBundle {
+    fn dim(&self) -> usize {
+        self.config.dim
+    }
+    fn n_layers(&self) -> usize {
+        self.config.n_layers
+    }
+    fn vocab_size(&self) -> usize {
+        self.config.vocab_size
+    }
+    fn arch_key(&self) -> &'static str {
+        "muse_glimmer"
+    }
+    fn kv_cache_mut(&mut self) -> Option<&mut hipfire_runtime::llama::KvCache> {
+        // Glimmer keeps its KV inside GlimmerState rather than owning a
+        // runtime `KvCache` directly, so there is nothing to hand back.
+        None
+    }
+    fn reset_session_state(&mut self, _gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
+        // Mirrors daemon reset arms (main.rs:3339 / 3390): `bundle.reset_session_state()`.
+        MuseGlimmerBundle::reset_session_state(self);
+        Ok(())
+    }
+    fn free_gpu(self: Box<Self>, gpu: &mut rdna_compute::Gpu) {
+        // This WAS the `ModelState::MuseGlimmer` arm of `unload_model`, moved
+        // verbatim, drafter first. Per PR #566: freeing only one of
+        // state/weights leaks ~1.3 GB over five load cycles, so both sides
+        // are mandatory.
+        let b = *self;
+        if let Some(drafter) = b.drafter {
+            drafter.scratch.free_gpu(gpu);
+            drafter.weights.free_gpu(gpu);
+        }
+        b.state.free_gpu(gpu);
+        b.weights.free_gpu(gpu);
+    }
 }
+
+/// `ArchModel` for the three bundles the loader defines itself.
+///
+/// `Gemma4Bundle`, `Gemma4LoweredBundle` and `Deepseek4HeterogeneousBundle` are
+/// declared here rather than in their arch crates, so — orphan rule — the impls
+/// must be here too. Each `free_gpu` mirrors its `unload_model` arm exactly;
+/// freeing less leaks, freeing more double-frees.
+impl hipfire_runtime::arch_model::ArchModel for Gemma4Bundle {
+    fn dim(&self) -> usize {
+        self.config.dim
+    }
+    fn n_layers(&self) -> usize {
+        self.config.n_layers
+    }
+    fn vocab_size(&self) -> usize {
+        self.config.vocab_size
+    }
+    fn arch_key(&self) -> &'static str {
+        "gemma4"
+    }
+    fn kv_cache_mut(&mut self) -> Option<&mut hipfire_runtime::llama::KvCache> {
+        None
+    }
+    fn reset_session_state(&mut self, _gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
+        // Mirrors daemon reset arms (main.rs:3336 / 3387): `bundle.state.reset()`.
+        self.state.reset();
+        Ok(())
+    }
+    fn free_gpu(self: Box<Self>, gpu: &mut rdna_compute::Gpu) {
+        let b = *self;
+        if let Some(eagle) = b.eagle {
+            eagle.spec_scratch.free(gpu);
+            eagle.drafter_scratch.free_gpu(gpu);
+            eagle.drafter_weights.free_gpu(gpu);
+        }
+        b.state.free_gpu(gpu);
+        b.weights.free_gpu(gpu);
+    }
+}
+
+impl hipfire_runtime::arch_model::ArchModel for Gemma4LoweredBundle {
+    fn dim(&self) -> usize {
+        self.config.dim
+    }
+    fn n_layers(&self) -> usize {
+        self.config.n_layers
+    }
+    fn vocab_size(&self) -> usize {
+        self.config.vocab_size
+    }
+    fn arch_key(&self) -> &'static str {
+        "gemma4"
+    }
+    fn kv_cache_mut(&mut self) -> Option<&mut hipfire_runtime::llama::KvCache> {
+        // Two caches (q8 sliding + asym3 full) and no basis for preferring
+        // one, so expose neither rather than silently picking.
+        None
+    }
+    fn free_gpu(self: Box<Self>, gpu: &mut rdna_compute::Gpu) {
+        let b = *self;
+        b.scratch.free_gpu(gpu);
+        let _ = b.kv_sliding.free_gpu(gpu);
+        let _ = b.kv_full.free_gpu(gpu);
+        b.weights.free_gpu(gpu);
+    }
+}
+
+impl hipfire_runtime::arch_model::ArchModel for Deepseek4HeterogeneousBundle {
+    fn dim(&self) -> usize {
+        self.model.config.hidden_size
+    }
+    fn n_layers(&self) -> usize {
+        self.model.config.num_hidden_layers
+    }
+    fn vocab_size(&self) -> usize {
+        self.model.config.vocab_size
+    }
+    fn arch_key(&self) -> &'static str {
+        "deepseek4"
+    }
+    fn kv_cache_mut(&mut self) -> Option<&mut hipfire_runtime::llama::KvCache> {
+        None
+    }
+    fn free_gpu(self: Box<Self>, _gpu: &mut rdna_compute::Gpu) {
+        // Self-owned two-device transaction: `Drop` frees each resource on its
+        // exact owner and drains both pools. Calling anything else here would
+        // double-free, which is why this body is a drop and not a sequence.
+        drop(self);
+    }
+}
+
 
 /// Self-owned gfx1100+dense / gfx1151+routed DeepSeek V4 state. The model
 /// owns both HIP devices and tears them down in its `Drop` implementation;
@@ -551,24 +868,18 @@ pub struct LoadedModel {
     pub arch_id: u32,
     pub pp: usize,
     pub pp_gpus: Option<Gpus>,
-    pub pp_scratch_set: Option<Qwen35ScratchSet>,
     pub pp_dn_la_to_device: Option<Vec<u8>>,
     pub ep: Option<EpState>,
-    // Shared arch state
-    pub state: Option<ModelState>,
-    pub qwen35_decode_batch: Option<hipfire_arch_qwen35::qwen35::Qwen35DecodeBatchState>,
-    pub lfm2_decode_batch: Option<hipfire_arch_lfm2moe::batch::Lfm2DecodeBatchState>,
-    pub kv_cache: Option<llama::KvCache>,
-    pub dn_state: Option<DeltaNetState>,
-    // Reusable Qwen2 recurrent state (used by dots_ocr and Qwen2 non-core falcon)
-    pub qwen2_state: Option<qwen2::Qwen2State>,
-    // DeepSeek V4 Flash (arch_id=9) single-GPU config/weights/state/eos now live
-    // in `state` as ModelState::Deepseek4(Deepseek4Bundle) so unload teardown is
-    // compiler-enforced and the bundle can be borrowed as a `SpecTarget`.
-    pub deepseek4_pbs: Option<hipfire_arch_deepseek4::forward::PrefillBatchScratch>,
+    // Shared arch state — every arch lives here as `Box<dyn ArchModel>`.
+    // Previously `ModelState::DotsOcr` / `ModelState::Qwen35` etc; now a
+    // trait object so adding an architecture does not edit a closed enum.
+    // All consumers go through the typed accessors below (`dots_ocr()`,
+    // `qwen35()`, etc.) which downcast via `Any`.
+    pub state: Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
+    // DeepSeek V4 (arch_id=9) single-GPU prefill scratch now lives inside
+    // `Deepseek4Bundle.pbs` (moved from here so `LoadedModel` can become arch-free).
     // DeepSeek V4 (arch_id=9) EP serve eos. The EP path stores model state in
     // `ep` (EpArch::Ds4), NOT in `state`, so there is no Deepseek4Bundle for EP
-    // models — the eos must be carried here (mirrors `minimax_eos_tok`).
     pub deepseek4_eos_tok: u32,
     // MiniMax-M2 (arch_id=10) EP serve eos. The EP path stores model state in
     // `ep` (EpArch::Minimax), NOT in `state`, so `minimax()` is None for EP
@@ -579,8 +890,8 @@ pub struct LoadedModel {
     // (mirrors `deepseek4_eos_tok` / `minimax_eos_tok`).
     pub qwen35_eos_tok: u32,
     // LFM2.5-8B-A1B (arch_id=11) and MiniMax-M2 (arch_id=10) live in
-    // `state` as ModelState::{Lfm2Moe,Minimax} so unload teardown is
-    // compiler-enforced (see ModelState).
+    // `state` as `Box<dyn ArchModel>` so unload teardown is
+    // via `ArchModel::free_gpu` (no central match any more).
     // MTP config
     pub mtp_mode: String,
     pub mtp_k: usize,
@@ -591,13 +902,6 @@ pub struct LoadedModel {
     // `generate_qwen35_mtp` allocates a fresh per-request `MtpSpecState`
     // against it (so the recurrent MTP-KV never bleeds across requests). None
     // for every other arch and for qwen35 trunks without an MTP head.
-    pub qwen35_mtp_head: Option<hipfire_arch_qwen35::mtp_head::Qwen35MtpHead>,
-    // dots.ocr state
-    pub dots_ocr_config: Option<dots_ocr::DotsOcrConfig>,
-    pub dots_ocr_weights: Option<dots_ocr::DotsOcrWeights>,
-    // Vision state
-    pub vision_config: Option<qwen35_vl::VisionConfig>,
-    pub vision_weights: Option<qwen35_vl::VisionWeights>,
     // Shared
     pub tokenizer: Option<hipfire_runtime::tokenizer::Tokenizer>,
     pub seq_pos: usize,
@@ -655,26 +959,14 @@ impl LoadedModel {
             pp: 1,
             ep: None,
             pp_gpus: None,
-            pp_scratch_set: None,
             pp_dn_la_to_device: None,
             state: None,
-            qwen35_decode_batch: None,
-            lfm2_decode_batch: None,
-            kv_cache: None,
-            dn_state: None,
-            qwen2_state: None,
-            deepseek4_pbs: None,
             deepseek4_eos_tok: 0,
             minimax_eos_tok: 0,
             qwen35_eos_tok: 0,
             mtp_mode: "auto".to_string(),
             mtp_k: 3,
             mtp_weights_present: false,
-            qwen35_mtp_head: None,
-            dots_ocr_config: None,
-            dots_ocr_weights: None,
-            vision_config: None,
-            vision_weights: None,
             tokenizer: Some(tokenizer),
             seq_pos: 0,
             max_seq,
@@ -699,81 +991,184 @@ impl LoadedModel {
     }
 
     /// LFM2.5-MoE bundle if this model is arch_id=11, else None.
+    /// Typed accessors for the remaining bundles.
+    ///
+    /// Six of these already existed; these six close the set so EVERY bundle is
+    /// reachable the same way. That uniformity is the point: once every
+    /// consumer goes through an accessor instead of destructuring
+    /// `ModelState` itself, swapping the storage to `Box<dyn ArchModel>`
+    /// changes these bodies and nothing else. Without them, that swap would
+    /// have to rewrite ~143 call sites in `hipfire-generate` at the same time
+    /// as changing the type — one unreviewable change instead of two safe ones.
+    pub fn qwen35(&self) -> Option<&hipfire_arch_qwen35::Qwen35Bundle> {
+        self.state
+            .as_deref()
+            .and_then(|s| (s as &dyn Any).downcast_ref::<hipfire_arch_qwen35::Qwen35Bundle>())
+    }
+
+    pub fn qwen35_mut(&mut self) -> Option<&mut hipfire_arch_qwen35::Qwen35Bundle> {
+        self.state
+            .as_deref_mut()
+            .and_then(|s| (s as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>())
+    }
+
+    pub fn llama(&self) -> Option<&hipfire_arch_llama::LlamaBundle> {
+        self.state
+            .as_deref()
+            .and_then(|s| (s as &dyn Any).downcast_ref::<hipfire_arch_llama::LlamaBundle>())
+    }
+
+    pub fn llama_mut(&mut self) -> Option<&mut hipfire_arch_llama::LlamaBundle> {
+        self.state
+            .as_deref_mut()
+            .and_then(|s| (s as &mut dyn Any).downcast_mut::<hipfire_arch_llama::LlamaBundle>())
+    }
+
+    pub fn gemma4(&self) -> Option<&Gemma4Bundle> {
+        self.state
+            .as_deref()
+            .and_then(|s| (s as &dyn Any).downcast_ref::<Gemma4Bundle>())
+    }
+
+    pub fn gemma4_mut(&mut self) -> Option<&mut Gemma4Bundle> {
+        self.state
+            .as_deref_mut()
+            .and_then(|s| (s as &mut dyn Any).downcast_mut::<Gemma4Bundle>())
+    }
+
+    pub fn gemma4_lowered_mut(&mut self) -> Option<&mut Gemma4LoweredBundle> {
+        self.state
+            .as_deref_mut()
+            .and_then(|s| (s as &mut dyn Any).downcast_mut::<Gemma4LoweredBundle>())
+    }
+
+    pub fn muse_glimmer(&self) -> Option<&MuseGlimmerBundle> {
+        self.state
+            .as_deref()
+            .and_then(|s| (s as &dyn Any).downcast_ref::<MuseGlimmerBundle>())
+    }
+
+    pub fn muse_glimmer_mut(&mut self) -> Option<&mut MuseGlimmerBundle> {
+        self.state
+            .as_deref_mut()
+            .and_then(|s| (s as &mut dyn Any).downcast_mut::<MuseGlimmerBundle>())
+    }
+
+    pub fn deepseek4_heterogeneous_mut(&mut self) -> Option<&mut Deepseek4HeterogeneousBundle> {
+        self.state
+            .as_deref_mut()
+            .and_then(|s| (s as &mut dyn Any).downcast_mut::<Deepseek4HeterogeneousBundle>())
+    }
+
     pub fn lfm2moe(&self) -> Option<&Lfm2MoeBundle> {
-        match &self.state {
-            Some(ModelState::Lfm2Moe(b)) => Some(b),
-            _ => None,
-        }
+        self.state
+            .as_deref()
+            .and_then(|s| (s as &dyn Any).downcast_ref::<Lfm2MoeBundle>())
     }
 
     pub fn lfm2moe_mut(&mut self) -> Option<&mut Lfm2MoeBundle> {
-        match &mut self.state {
-            Some(ModelState::Lfm2Moe(b)) => Some(b),
-            _ => None,
-        }
+        self.state
+            .as_deref_mut()
+            .and_then(|s| (s as &mut dyn Any).downcast_mut::<Lfm2MoeBundle>())
     }
 
     /// MiniMax-M2 bundle if this model is arch_id=10, else None.
     pub fn minimax(&self) -> Option<&MiniMaxBundle> {
-        match &self.state {
-            Some(ModelState::Minimax(b)) => Some(b),
-            _ => None,
-        }
+        self.state
+            .as_deref()
+            .and_then(|s| (s as &dyn Any).downcast_ref::<MiniMaxBundle>())
     }
 
     pub fn minimax_mut(&mut self) -> Option<&mut MiniMaxBundle> {
-        match &mut self.state {
-            Some(ModelState::Minimax(b)) => Some(b),
-            _ => None,
-        }
+        self.state
+            .as_deref_mut()
+            .and_then(|s| (s as &mut dyn Any).downcast_mut::<MiniMaxBundle>())
     }
 
     /// Qwen2 bundle if this model is arch_id=7 (plain qwen2 via `Qwen2Carrier`),
-    /// else None. The live `Qwen2State` is at `.state`. NOTE: this is NOT the
-    /// `qwen2_state` direct field — that is None for plain qwen2 and is only
-    /// populated by dots-ocr (arch_id=8). Reset/checkpoint sites must rewind
-    /// BOTH or the reset silently no-ops (see scripts/qwen2-reset-gate.sh).
+    /// else None.
     pub fn qwen2_mut(&mut self) -> Option<&mut hipfire_arch_qwen2::Qwen2Bundle> {
-        match &mut self.state {
-            Some(ModelState::Qwen2(b)) => Some(b),
-            _ => None,
-        }
+        self.state
+            .as_deref_mut()
+            .and_then(|s| (s as &mut dyn Any).downcast_mut::<hipfire_arch_qwen2::Qwen2Bundle>())
     }
 
     /// Cohere2-MoE bundle if this model is arch_id=12, else None.
     pub fn cohere2moe(&self) -> Option<&Cohere2MoeBundle> {
-        match &self.state {
-            Some(ModelState::Cohere2Moe(b)) => Some(b),
-            _ => None,
-        }
+        self.state
+            .as_deref()
+            .and_then(|s| (s as &dyn Any).downcast_ref::<Cohere2MoeBundle>())
     }
 
     pub fn cohere2moe_mut(&mut self) -> Option<&mut Cohere2MoeBundle> {
-        match &mut self.state {
-            Some(ModelState::Cohere2Moe(b)) => Some(b),
-            _ => None,
-        }
+        self.state
+            .as_deref_mut()
+            .and_then(|s| (s as &mut dyn Any).downcast_mut::<Cohere2MoeBundle>())
     }
 
     /// DeepSeek V4 bundle if this model is a single-GPU arch_id=9, else None.
     /// (EP/pp ds4 keeps its state in `ep` (EpArch::Ds4), so this is None there.)
     pub fn deepseek4(&self) -> Option<&hipfire_arch_deepseek4::Deepseek4Bundle> {
-        match &self.state {
-            Some(ModelState::Deepseek4(b)) => Some(b),
-            _ => None,
-        }
+        self.state
+            .as_deref()
+            .and_then(|s| (s as &dyn Any).downcast_ref::<hipfire_arch_deepseek4::Deepseek4Bundle>())
     }
 
     pub fn deepseek4_mut(&mut self) -> Option<&mut hipfire_arch_deepseek4::Deepseek4Bundle> {
-        match &mut self.state {
-            Some(ModelState::Deepseek4(b)) => Some(b),
-            _ => None,
-        }
+        self.state
+            .as_deref_mut()
+            .and_then(|s| (s as &mut dyn Any).downcast_mut::<hipfire_arch_deepseek4::Deepseek4Bundle>())
     }
 
-    /// pp>1 skeleton — sets all four load-bearing multi-GPU fields together so
-    /// they cannot be set piecemeal (a dropped `pp_scratch_set` is a silent
-    /// VRAM leak; `pp_gpus`/`pp_dn_la_to_device` are `.expect()`ed in unload).
+    /// Qwen35-VL vision config if this model is arch_id=5|6 and was loaded
+    /// with a vision tower (`model.visual.patch_embed.proj.weight` present),
+    /// else None. Text-only Qwen35 returns None.
+    pub fn vision_config(&self) -> Option<&qwen35_vl::VisionConfig> {
+        self.qwen35().and_then(|b| b.vision_config.as_ref())
+    }
+
+    pub fn vision_weights(&self) -> Option<&qwen35_vl::VisionWeights> {
+        self.qwen35().and_then(|b| b.vision_weights.as_ref())
+    }
+
+    pub fn vision_config_mut(&mut self) -> Option<&mut qwen35_vl::VisionConfig> {
+        self.qwen35_mut().and_then(|b| b.vision_config.as_mut())
+    }
+
+    pub fn vision_weights_mut(&mut self) -> Option<&mut qwen35_vl::VisionWeights> {
+        self.qwen35_mut().and_then(|b| b.vision_weights.as_mut())
+    }
+
+    /// DotsOcr bundle if this model is arch_id=8, else None.
+    pub fn dots_ocr(&self) -> Option<&hipfire_arch_dots_ocr::DotsOcrBundle> {
+        self.state
+            .as_deref()
+            .and_then(|s| (s as &dyn Any).downcast_ref::<hipfire_arch_dots_ocr::DotsOcrBundle>())
+    }
+
+    pub fn dots_ocr_mut(&mut self) -> Option<&mut hipfire_arch_dots_ocr::DotsOcrBundle> {
+        self.state
+            .as_deref_mut()
+            .and_then(|s| (s as &mut dyn Any).downcast_mut::<hipfire_arch_dots_ocr::DotsOcrBundle>())
+    }
+    /// Arch-agnostic view of the loaded model, when any is loaded.
+    pub fn as_arch_model(&self) -> Option<&dyn hipfire_runtime::arch_model::ArchModel> {
+        self.state.as_deref().map(|b| b as &dyn hipfire_runtime::arch_model::ArchModel)
+    }
+    pub fn as_arch_model_mut(&mut self) -> Option<&mut dyn hipfire_runtime::arch_model::ArchModel> {
+        self.state
+            .as_deref_mut()
+            .map(|b| b as &mut dyn hipfire_runtime::arch_model::ArchModel)
+    }
+    /// pp>1 skeleton — sets the load-bearing multi-GPU fields together so
+    /// they cannot be set piecemeal (`pp_gpus`/`pp_dn_la_to_device` are
+    /// `.expect()`ed in unload). The per-device `Qwen35ScratchSet` that was
+    /// previously the fourth field here now lives inside `Qwen35Bundle`
+    /// (`b.pp_scratch_set`) and is freed via `free_gpu_multi` in the same
+    /// pp>1 unload arm — co-locating it with the bundle's own `scratch`
+    /// guarantees the set cannot be dropped without the bundle (and vice
+    /// versa), eliminating the silent-VRAM-leak window a standalone
+    /// `LoadedModel.pp_scratch_set: Option<Qwen35ScratchSet>` created.
     pub fn skeleton_pp(
         arch_id: u32,
         tokenizer: hipfire_runtime::tokenizer::Tokenizer,
@@ -783,13 +1178,11 @@ impl LoadedModel {
         chat_template: Option<String>,
         pp: usize,
         pp_gpus: Gpus,
-        pp_scratch_set: Qwen35ScratchSet,
         pp_dn_la_to_device: Vec<u8>,
     ) -> Self {
         LoadedModel {
             pp,
             pp_gpus: Some(pp_gpus),
-            pp_scratch_set: Some(pp_scratch_set),
             pp_dn_la_to_device: Some(pp_dn_la_to_device),
             ..LoadedModel::skeleton(
                 arch_id,
@@ -1416,16 +1809,16 @@ fn finish_qwen35_load(
     };
 
     // Move adaptive controller out of the bundle before parking the rest in
-    // ModelState. LoadedModel.kv_adaptive is the runtime home for downshift hooks.
+    // `Box<dyn ArchModel>`. LoadedModel.kv_adaptive is the runtime home for downshift hooks.
     let mut bundle = bundle;
+    bundle.vision_config = vision_config;
+    bundle.vision_weights = vision_weights;
     let kv_adaptive = bundle.kv_adaptive.take();
-    let state = Some(ModelState::Qwen35(bundle));
+    let state: Option<Box<dyn hipfire_runtime::arch_model::ArchModel>> = Some(Box::new(bundle));
     let mut model = LoadedModel {
         state,
         eviction,
         speculator,
-        vision_config,
-        vision_weights,
         max_seq: ctx.max_seq,
         kv_adaptive,
         ..LoadedModel::skeleton(
@@ -1441,7 +1834,17 @@ fn finish_qwen35_load(
     // dspark probe set in the daemon's load handler). For qwen35 the presence of a
     // loaded MTP head IS the signal.
     model.mtp_weights_present = qwen35_mtp_head.is_some();
-    model.qwen35_mtp_head = qwen35_mtp_head;
+    // The head lives on the bundle, not on LoadedModel: per-arch state must not
+    // keep an arch type in the loader's struct, or LoadedModel can never move
+    // into arch-free hipfire-runtime.
+    if let Some(bundle) = model
+        .state
+        .as_mut()
+        .and_then(|s| (s.as_mut() as &mut dyn std::any::Any)
+            .downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>())
+    {
+        bundle.qwen35_mtp_head = qwen35_mtp_head;
+    }
     Ok(model)
 }
 
@@ -1629,6 +2032,19 @@ pub fn load_model_with_kv_backend(
             carrier.name()
         ));
     }
+    // The allowlist above gates on CARRIER, which let `vmm` + `pp>1` through:
+    // qwen35 is allowlisted, so a pipeline-parallel Qwen3.5 load passed it. But
+    // VMM is strictly per-device — `ensure_vmm_ready_for_load` takes a single
+    // `&mut Gpu`, `multi_gpu.rs` has no VMM path at all, and the pp>1 load tail
+    // never mentions it. Refusing here, BEFORE any allocation, beats letting a
+    // single-device KV backend be half-applied to a model spread across devices.
+    if kv_backend == KvBackend::Vmm && ctx.pp > 1 {
+        return Err(
+            "KV backend 'vmm' is single-device and does not support pipeline parallelism (pp>1); \
+             use a different kv_cache backend or load with pp=1"
+                .to_string(),
+        );
+    }
     let mut result = carrier.load(src, &mut ctx)?;
     if result.pp > 1 && result.pp_gpus.is_none() {
         return Err("pp>1 LoadedModel missing pp_gpus — carrier bug".into());
@@ -1746,6 +2162,19 @@ pub fn load_model_with_gemma4_drafter(
             carrier.name()
         ));
     }
+    // The allowlist above gates on CARRIER, which let `vmm` + `pp>1` through:
+    // qwen35 is allowlisted, so a pipeline-parallel Qwen3.5 load passed it. But
+    // VMM is strictly per-device — `ensure_vmm_ready_for_load` takes a single
+    // `&mut Gpu`, `multi_gpu.rs` has no VMM path at all, and the pp>1 load tail
+    // never mentions it. Refusing here, BEFORE any allocation, beats letting a
+    // single-device KV backend be half-applied to a model spread across devices.
+    if kv_backend == KvBackend::Vmm && ctx.pp > 1 {
+        return Err(
+            "KV backend 'vmm' is single-device and does not support pipeline parallelism (pp>1); \
+             use a different kv_cache backend or load with pp=1"
+                .to_string(),
+        );
+    }
     let mut result = carrier.load(src, &mut ctx)?;
     if result.pp > 1 && result.pp_gpus.is_none() {
         return Err("pp>1 LoadedModel missing pp_gpus — carrier bug".into());
@@ -1786,7 +2215,7 @@ fn load_cohere2moe(
     };
     let chat_template = resolve_chat_template(&hfq, path);
     Ok(LoadedModel {
-        state: Some(ModelState::Cohere2Moe(Cohere2MoeBundle {
+        state: Some(Box::new(Cohere2MoeBundle {
             config,
             weights,
             state,
@@ -2732,17 +3161,13 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
             dev.drain_pool();
         }
         let _ = gpus.free_tp_graph_signals();
-        if let Some(batch_state) = m.lfm2_decode_batch.take() {
-            // Single-GPU dense LFM batch is not expected on EP, but free it on
-            // the provided single gpu before multi-device teardown to avoid
-            // leaking if staging ever leaves residual state.
-            batch_state.free_gpu(gpu);
-        }
-        if let Some(batch_state) = m.qwen35_decode_batch.take() {
-            // Single-GPU Qwen batch is not expected on EP, but free it on the
-            // provided single gpu before multi-device teardown to avoid leaking
-            // if staging ever leaves residual state.
-            batch_state.free_gpu(gpu);
+        if let Some(b) = m.qwen35_mut() {
+            if let Some(batch_state) = b.qwen35_decode_batch.take() {
+                // Single-GPU Qwen batch is not expected on EP, but free it on the
+                // provided single gpu before multi-device teardown to avoid leaking
+                // if staging ever leaves residual state.
+                let _ = batch_state.free_gpu(gpu);
+            }
         }
         let _ = gpu;
         if let Some(err) = ep_first_err {
@@ -2752,45 +3177,28 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
         // `gpus` drops here, tearing down comms + devices.
     }
     if m.pp > 1 {
-        let mut gpus = m.pp_gpus.expect("pp>1 must carry pp_gpus");
-        if let Some(batch_state) = m.qwen35_decode_batch.take() {
-            // Single-GPU batch state is not expected for pp>1, but free it on
-            // the provided single gpu before multi-device teardown to avoid
-            // leaking if a test ever stages it.
-            batch_state.free_gpu(gpu);
+        if let Some(b) = m.qwen35_mut() {
+            if let Some(batch_state) = b.qwen35_decode_batch.take() {
+                // Single-GPU batch state is not expected for pp>1, but free it on
+                // the provided single gpu before multi-device teardown to avoid
+                // leaking if a test ever stages it.
+                let _ = batch_state.free_gpu(gpu);
+            }
         }
-        if let Some(batch_state) = m.lfm2_decode_batch.take() {
-            // Single-GPU batch state is not expected for pp>1, but free it on
-            // the provided single gpu before multi-device teardown to avoid
-            // leaking if a test ever stages it.
-            batch_state.free_gpu(gpu);
-        }
-        if let Some(scratch_set) = m.pp_scratch_set {
-            scratch_set.free_gpu_multi(&mut gpus);
-        }
-        match m.state.take() {
-            Some(ModelState::Qwen35(b)) => {
+        let mut gpus = m.pp_gpus.take().expect("pp>1 must carry pp_gpus");
+        if let Some(state) = m.state.take() {
+            // multi-GPU resources. Otherwise just drop the box (original match did
+            // the same — non-qwen35 pp>1 is unreachable and had an empty arm).
+            if let Ok(mut b) = (state as Box<dyn Any>).downcast::<hipfire_arch_qwen35::Qwen35Bundle>() {
+                if let Some(scratch_set) = b.pp_scratch_set.take() {
+                    scratch_set.free_gpu_multi(&mut gpus);
+                }
                 b.kv_cache.free_gpu_multi(&mut gpus);
                 let la_to_device = m.pp_dn_la_to_device.expect("pp>1 must carry la_to_device");
                 b.dn_state.free_gpu_multi(&mut gpus, &la_to_device);
                 b.weights.free_gpu_multi(&mut gpus);
+                b.scratch.free_gpu(&mut gpus.devices[0]);
             }
-            // Only Qwen35 supports pp>1 today, so the other carriers can never
-            // reach this arm with multi-GPU state to free — dropping is correct.
-            // Listing them explicitly (rather than `_`) makes that a
-            // compiler-enforced invariant: adding a pp>1-capable carrier without
-            // a teardown arm here is a build error, not a silent VRAM leak.
-            Some(ModelState::Qwen2(_))
-            | Some(ModelState::Llama(_))
-            | Some(ModelState::Lfm2Moe(_))
-            | Some(ModelState::Minimax(_))
-            | Some(ModelState::Cohere2Moe(_))
-            | Some(ModelState::Gemma4(_))
-            | Some(ModelState::Gemma4Lowered(_))
-            | Some(ModelState::Deepseek4(_))
-            | Some(ModelState::Deepseek4Heterogeneous(_))
-            | Some(ModelState::MuseGlimmer(_))
-            | None => {}
         }
         for g in gpus.devices.iter_mut() {
             g.invalidate_weight_caches();
@@ -2807,9 +3215,6 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
         // empty) is still drained below for defense-in-depth.
         spec.free(gpu);
     }
-    if let Some(head) = m.qwen35_mtp_head {
-        head.free_gpu(gpu);
-    }
     if let Some(ev) = m.eviction {
         ev.free_gpu(gpu);
     }
@@ -2821,111 +3226,26 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
             }
         }
     };
-    if let Some(kv) = m.kv_cache {
-        note(kv.free_gpu(gpu).map_err(|e| e.to_string()));
-    }
-    if let Some(dn) = m.dn_state {
-        dn.free_gpu(gpu);
-    }
     for (_, snap) in m.prefill_checkpoints {
         snap.free_gpu(gpu);
     }
     for (_, snap) in m.dflash_checkpoints {
         snap.free_gpu(gpu);
     }
-    if let Some(batch_state) = m.qwen35_decode_batch.take() {
-        batch_state.free_gpu(gpu);
-    }
-    if let Some(batch_state) = m.lfm2_decode_batch.take() {
-        batch_state.free_gpu(gpu);
-    }
-    // Free arch-specific GPU state from the carrier bundle
-    if let Some(state) = m.state {
-        match state {
-            ModelState::Qwen2(b) => {
-                b.state.free_gpu(gpu);
-                b.weights.free_gpu(gpu);
-            }
-            ModelState::Qwen35(b) => {
-                note(b.kv_cache.free_gpu(gpu).map_err(|e| e.to_string()));
-                b.scratch.free_gpu(gpu);
-                b.weights.free_gpu(gpu);
-                b.dn_state.free_gpu(gpu);
-            }
-            ModelState::Llama(b) => {
-                b.scratch.free_gpu(gpu);
-                b.weights.free_gpu(gpu);
-                note(b.kv.free_gpu(gpu).map_err(|e| e.to_string()));
-            }
-            ModelState::Lfm2Moe(b) => {
-                b.state.free_gpu(gpu);
-                b.weights.free_gpu(gpu);
-            }
-            ModelState::Minimax(b) => {
-                b.state.free_gpu(gpu);
-                b.weights.free_gpu(gpu);
-            }
-            ModelState::Cohere2Moe(b) => {
-                b.state.free_gpu(gpu);
-                b.weights.free_gpu(gpu);
-            }
-            ModelState::Gemma4(b) => {
-                if let Some(eagle) = b.eagle {
-                    eagle.spec_scratch.free(gpu);
-                    eagle.drafter_scratch.free_gpu(gpu);
-                    eagle.drafter_weights.free_gpu(gpu);
-                }
-                b.state.free_gpu(gpu);
-                b.weights.free_gpu(gpu);
-            }
-            ModelState::Gemma4Lowered(b) => {
-                b.scratch.free_gpu(gpu);
-                note(b.kv_sliding.free_gpu(gpu).map_err(|e| e.to_string()));
-                note(b.kv_full.free_gpu(gpu).map_err(|e| e.to_string()));
-                b.weights.free_gpu(gpu);
-            }
-            ModelState::Deepseek4(b) => {
-                b.state.free_gpu(gpu);
-                b.weights.free_gpu(gpu);
-            }
-            ModelState::Deepseek4Heterogeneous(b) => {
-                // Self-owned two-device transaction. Dropping `model` frees
-                // each resource on its exact owner and drains both pools.
-                drop(b);
-            }
-            ModelState::MuseGlimmer(b) => {
-                // Glimmer teardown is exactly the PR #566 pattern: free BOTH
-                // the per-layer scratch/KV state AND the weight allocations.
-                // Freeing only one side leaks ~1.3 GB over 5 cycles (the
-                // weights are ~650 MB + state ~650 MB; each reload without
-                // the companion free retains the prior cycle's allocation).
-                if let Some(drafter) = b.drafter {
-                    drafter.scratch.free_gpu(gpu);
-                    drafter.weights.free_gpu(gpu);
-                }
-                b.state.free_gpu(gpu);
-                b.weights.free_gpu(gpu);
-            }
+    if let Some(state) = m.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()) {
+        if let Some(batch_state) = state.qwen35_decode_batch.take() {
+            let _ = batch_state.free_gpu(gpu);
         }
     }
-    // Non-core arch weights
-    if let Some(s) = m.qwen2_state {
-        s.free_gpu(gpu);
+    // Free arch-specific GPU state from the carrier bundle via `ArchModel::free_gpu`.
+    if let Some(state) = m.state {
+        state.free_gpu(gpu);
     }
-    // deepseek4 single-GPU scratch lives outside the bundle (relocated later);
-    // its config/weights/state freed via ModelState::Deepseek4 above.
-    if let Some(pbs) = m.deepseek4_pbs {
-        pbs.free_gpu(gpu);
-    }
-    if let Some(w) = m.vision_weights {
-        w.free_gpu(gpu);
-    }
-    // lfm2moe / minimax teardown is now compiler-enforced via the exhaustive
-    // ModelState match above. dots_ocr already had a free_gpu, it just wasn't
-    // called here (still a loose Option — fold in a future pass).
-    if let Some(w) = m.dots_ocr_weights {
-        w.free_gpu(gpu);
-    }
+    // deepseek4 single-GPU scratch now lives inside `Deepseek4Bundle.pbs` and is
+    // freed via `ArchModel::free_gpu` above — no separate `m.deepseek4_pbs` block.
+    // Qwen35 vision tower is now inside the bundle and freed via
+    // `ArchModel::free_gpu` above. Nothing to do here — the old
+    // `m.vision_weights` field is gone.
     gpu.invalidate_weight_caches();
     gpu.invalidate_graph_state();
     gpu.drain_pool();
@@ -3118,5 +3438,183 @@ mod registry_tests {
             err.contains("expected 3 occurrences"),
             "unexpected error for drifted template: {err}"
         );
+    }
+
+    #[test]
+    fn vision_caps_declare_images() {
+        // Text-only arches must not declare image support; the two VL
+        // arches (Qwen3.5-VL 5/6 and dots.ocr 8) must.
+        let qwen35 = REGISTRY
+            .iter()
+            .find(|c| c.name() == "qwen35")
+            .expect("qwen35 carrier missing");
+        let dots = REGISTRY
+            .iter()
+            .find(|c| c.name() == "dots_ocr")
+            .expect("dots_ocr carrier missing");
+        assert!(
+            qwen35.caps().supports_images,
+            "qwen35 (arch 5/6) must declare supports_images"
+        );
+        assert!(
+            dots.caps().supports_images,
+            "dots_ocr (arch 8) must declare supports_images"
+        );
+        // VisionRoute must be declarative via caps, not just arch_id.
+        assert_eq!(super::vision_route(5), super::VisionRoute::QwenVl);
+        assert_eq!(super::vision_route(6), super::VisionRoute::QwenVl);
+        assert_eq!(super::vision_route(8), super::VisionRoute::DotsOcr);
+        assert_eq!(super::vision_route(0), super::VisionRoute::None);
+        assert_eq!(super::vision_route(7), super::VisionRoute::None);
+        assert_eq!(super::vision_route(9), super::VisionRoute::None);
+        // Text-only carriers must stay false.
+        for name in ["qwen2", "llama", "deepseek4", "minimax", "lfm2moe", "cohere2moe", "gemma4", "muse_glimmer"] {
+            let c = REGISTRY.iter().find(|c| c.name() == name).unwrap();
+            assert!(
+                !c.caps().supports_images,
+                "{name} must not declare supports_images"
+            );
+        }
+    }
+
+    /// Pin every carrier's declared `ArchCaps` AND every arch_id route-table
+    /// output. The route tables in `lib.rs` (continuous_batch / bench_decode /
+    /// vision / ep_prompt / ep_eos / generation_early) are ROUTING
+    /// discriminators — each variant selects a distinct function body — so
+    /// they cannot be expressed as a boolean capability and must not drift
+    /// silently when a carrier's caps row is edited. If you intentionally
+    /// re-route an architecture, update this pin in the same commit.
+    #[test]
+    fn caps_and_route_tables_are_pinned() {
+        use saddle_core::caps::{ArchCaps, DflashKind};
+        use super::{
+            bench_decode_route, continuous_batch_route, ep_eos_route, ep_prompt_route,
+            generation_early_route, vision_route, BenchDecodeRoute, ContinuousBatchRoute,
+            EpEosRoute, EpPromptRoute, GenerationEarlyRoute, VisionRoute,
+        };
+
+        let caps_of = |name: &str| -> ArchCaps {
+            REGISTRY
+                .iter()
+                .find(|c| c.name() == name)
+                .unwrap_or_else(|| panic!("{name} carrier missing"))
+                .caps()
+        };
+
+        // ── Per-carrier declared capabilities (11 architectures) ──
+        let text_only = ArchCaps::default();
+        assert_eq!(caps_of("qwen2"), text_only);
+        assert_eq!(
+            caps_of("qwen35"),
+            ArchCaps {
+                supports_continuous_batch: true,
+                supports_ep_batch: true,
+                dflash: Some(DflashKind::Qwen),
+                supports_mtp: true,
+                spec_excludes_adaptive: true,
+                semantic_contract_version: Some(2),
+                has_deltanet: true,
+                supports_images: true,
+            }
+        );
+        assert_eq!(
+            caps_of("llama"),
+            ArchCaps {
+                dflash: Some(DflashKind::Llama),
+                ..text_only
+            }
+        );
+        assert_eq!(
+            caps_of("dots_ocr"),
+            ArchCaps {
+                supports_images: true,
+                ..text_only
+            }
+        );
+        assert_eq!(caps_of("deepseek4"), text_only);
+        assert_eq!(caps_of("minimax"), text_only);
+        assert_eq!(
+            caps_of("lfm2moe"),
+            ArchCaps {
+                supports_continuous_batch: true,
+                ..text_only
+            }
+        );
+        assert_eq!(caps_of("cohere2moe"), text_only);
+        assert_eq!(caps_of("gemma4"), text_only);
+        assert_eq!(
+            caps_of("muse_glimmer"),
+            ArchCaps {
+                semantic_contract_version: Some(2),
+                ..text_only
+            }
+        );
+
+        // ── continuous_batch_route: 5|6 -> Qwen35, 11 -> Lfm2Moe ──
+        // The Some/None half duplicates caps().supports_continuous_batch; the
+        // variant picks between two distinct staging bodies in batch_staging.
+        for id in 0u32..=14 {
+            let want = match id {
+                5 | 6 => Some(ContinuousBatchRoute::Qwen35),
+                11 => Some(ContinuousBatchRoute::Lfm2Moe),
+                _ => None,
+            };
+            assert_eq!(continuous_batch_route(id), want, "continuous_batch_route({id})");
+            // The capability half must stay consistent with the declared cap.
+            let declared = super::carrier_for(id)
+                .map(|c| c.caps().supports_continuous_batch)
+                .unwrap_or(false);
+            assert_eq!(
+                want.is_some(),
+                declared,
+                "continuous_batch_route({id}).is_some() disagrees with carrier caps"
+            );
+        }
+
+        // ── bench_decode_route: 9, 11, 5|6, 14; everything else Unsupported ──
+        for id in 0u32..=14 {
+            let want = match id {
+                9 => BenchDecodeRoute::Deepseek4,
+                11 => BenchDecodeRoute::Lfm2Moe,
+                5 | 6 => BenchDecodeRoute::Qwen35,
+                14 => BenchDecodeRoute::MuseGlimmer,
+                _ => BenchDecodeRoute::Unsupported,
+            };
+            assert_eq!(bench_decode_route(id), want, "bench_decode_route({id})");
+        }
+
+        // ── vision_route: 8 -> DotsOcr, 5|6 -> QwenVl, gated by supports_images ──
+        for id in 0u32..=14 {
+            let want = match id {
+                8 => VisionRoute::DotsOcr,
+                5 | 6 => VisionRoute::QwenVl,
+                _ => VisionRoute::None,
+            };
+            assert_eq!(vision_route(id), want, "vision_route({id})");
+        }
+
+        // ── ep_prompt_route: 9 -> Dsml, everything else Jinja ──
+        for id in 0u32..=14 {
+            let want = if id == 9 { EpPromptRoute::Dsml } else { EpPromptRoute::Jinja };
+            assert_eq!(ep_prompt_route(id), want, "ep_prompt_route({id})");
+        }
+
+        // ── ep_eos_route: 10 -> Minimax, everything else Deepseek4 ──
+        for id in 0u32..=14 {
+            let want = if id == 10 { EpEosRoute::Minimax } else { EpEosRoute::Deepseek4 };
+            assert_eq!(ep_eos_route(id), want, "ep_eos_route({id})");
+        }
+
+        // ── generation_early_route: 13 -> Gemma4, 14 -> MuseGlimmer; arch 22
+        // (Gemma4 EAGLE drafter sidecar) must stay None — it is never a
+        // primary generate target.
+        for id in (0u32..=14).chain([22]) {
+            let want = match id {
+                13 => Some(GenerationEarlyRoute::Gemma4),
+                14 => Some(GenerationEarlyRoute::MuseGlimmer),
+                _ => None,
+            };
+            assert_eq!(generation_early_route(id), want, "generation_early_route({id})");
+        }
     }
 }

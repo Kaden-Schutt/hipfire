@@ -11,6 +11,10 @@ description = "dots.ocr (Qwen2-VL family) — Qwen2 text decoder + 42-block Dots
 # image preprocessing land in subsequent commits. See
 # docs/plans/dots-ocr-prd.md phase 2 for the bring-up plan.
 
+[features]
+# Archived research probes; see the note by the [[example]] blocks.
+lab = []
+
 [dependencies]
 hipfire-config = { path = "../hipfire-config" }
 hipfire-runtime = { path = "../hipfire-runtime" }
@@ -23,3 +27,28 @@ serde_json = "1"
 # build closure small (only PNG + JPEG are needed for dots.ocr's
 # page-image inputs).
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+# ---------------------------------------------------------------------------
+# Archived research probes.
+#
+# One-question GPU experiments -- "is GPU argmax faster than downloading logits
+# at vocab 129,280 on gfx1201" -- written at roughly eleven a month since
+# 2026-03. They are the working method for kernel decisions and worth keeping:
+# a HIP kernel cannot be measured by a unit test.
+#
+# Gated because an answer obtained in April should not be type-checked on every
+# build in August. Ungated, they all compile under `cargo build --all-targets`,
+# so every refactor drags every probe with it -- several build breaks during the
+# ModelState removal were in probes nobody had run since the day they were
+# written.
+#
+# Run on demand:  cargo build -p <crate> --examples --features lab
+# The UNGATED example count is ratcheted; see scripts/leanup-ratchets.sh.
+# ---------------------------------------------------------------------------
+[[example]]
+name = "dump_proj_weight"
+required-features = ["lab"]
+
+[[example]]
+name = "infer_dots_ocr"
+required-features = ["lab"]

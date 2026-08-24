@@ -201,7 +201,7 @@ PROMPT='A train leaves Station A traveling at 60 km/h. Two hours later, a second
 # exiting). The legacy `tail -1 serve.log | grep "warm-up complete"` check is
 # broken because serve.log is opened O_APPEND — a stale "warm-up complete" line
 # from the previous session passes the gate before the new daemon binds. And
-# `pgrep -af "examples/daemon"` doesn't match anymore — the CLI now spawns
+# `pgrep -af "release/daemon"` doesn't match anymore — the CLI now spawns
 # native `hipfire serve <port>`, not a standalone daemon binary.
 wait_for_model_ready() {
     local hfq_path="$1"; local timeout="${2:-120}"

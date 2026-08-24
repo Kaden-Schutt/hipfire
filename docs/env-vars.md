@@ -322,12 +322,12 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_BLOB_FORCE` | crates/rdna-compute/src/dispatch.rs, crates/rdna-compute/src/feature_flags.rs |
 | `HIPFIRE_BRANCH` | scripts/mi300x_bootstrap.sh |
 | `HIPFIRE_B_REF` | scripts/ab-dispatch-validation.sh |
-| `HIPFIRE_C2M_DUMP_PROMPT` | crates/hipfire-runtime/examples/daemon.rs |
-| `HIPFIRE_C2M_EMPTY_TURN_GUARD` | crates/hipfire-arch-cohere2moe/src/spec_emit.rs, crates/hipfire-runtime/examples/daemon.rs |
+| `HIPFIRE_C2M_DUMP_PROMPT` | crates/hipfire-daemon/src/main.rs |
+| `HIPFIRE_C2M_EMPTY_TURN_GUARD` | crates/hipfire-arch-cohere2moe/src/spec_emit.rs, crates/hipfire-daemon/src/main.rs |
 | `HIPFIRE_C2M_NORMDUMP` | crates/hipfire-arch-cohere2moe/src/forward.rs |
-| `HIPFIRE_CACHE_CKPT_INTERVAL` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-runtime/examples/daemon.rs |
-| `HIPFIRE_CACHE_CKPT_MAX` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-runtime/examples/daemon.rs |
-| `HIPFIRE_CACHE_CKPT_RESUME` | crates/hipfire-runtime/examples/daemon.rs |
+| `HIPFIRE_CACHE_CKPT_INTERVAL` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-daemon/src/main.rs |
+| `HIPFIRE_CACHE_CKPT_MAX` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-daemon/src/main.rs |
+| `HIPFIRE_CACHE_CKPT_RESUME` | crates/hipfire-daemon/src/main.rs |
 | `HIPFIRE_CALIB_PROFILE` | crates/hipfire-runtime/examples/triattn_validate.rs |
 | `HIPFIRE_CANARY_MODEL` | scripts/gfx906_fallback_canary.sh |
 | `HIPFIRE_CANARY_PREFILL` | scripts/gfx906_fallback_canary.sh |
@@ -374,7 +374,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_DEEPSEEK4_ATTN_TWIN` | crates/hipfire-arch-deepseek4/src/forward.rs |
 | `HIPFIRE_DEEPSEEK4_BATCH_HEAD` | crates/hipfire-arch-deepseek4/src/forward.rs |
 | `HIPFIRE_DEEPSEEK4_BENCH_RAW` | crates/hipfire-arch-deepseek4/examples/dspark_bench.rs |
-| `HIPFIRE_DEEPSEEK4_CACHE_TRACE` | crates/hipfire-runtime/examples/daemon.rs |
+| `HIPFIRE_DEEPSEEK4_CACHE_TRACE` | crates/hipfire-daemon/src/main.rs |
 | `HIPFIRE_DEEPSEEK4_CACTUS` | crates/hipfire-arch-deepseek4/examples/dspark_bench.rs |
 | `HIPFIRE_DEEPSEEK4_CHAT_RAW` | crates/hipfire-arch-deepseek4/examples/deepseek4_chat.rs |
 | `HIPFIRE_DEEPSEEK4_COMP_F16_WMMA` | crates/hipfire-arch-deepseek4/src/arch.rs, crates/hipfire-arch-deepseek4/src/deepseek4.rs |
@@ -382,7 +382,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_DEEPSEEK4_DSA_WMMA` | crates/hipfire-arch-deepseek4/src/forward.rs |
 | `HIPFIRE_DEEPSEEK4_DSPARK` | crates/hipfire-arch-deepseek4/examples/dspark_bench.rs, crates/hipfire-runtime/src/loader_api.rs |
 | `HIPFIRE_DEEPSEEK4_DSPARK_CONF_THRESHOLD` | crates/hipfire-arch-deepseek4/src/dspark_speculator.rs |
-| `HIPFIRE_DEEPSEEK4_DUMP_PROMPT` | crates/hipfire-runtime/examples/daemon.rs |
+| `HIPFIRE_DEEPSEEK4_DUMP_PROMPT` | crates/hipfire-daemon/src/main.rs |
 | `HIPFIRE_DEEPSEEK4_DUMP_STATE` | crates/hipfire-arch-deepseek4/src/forward.rs |
 | `HIPFIRE_DEEPSEEK4_DUMP_TOPK` | crates/hipfire-dispatch/src/families/moe.rs, crates/hipfire-dispatch/src/pipeline/mod.rs |
 | `HIPFIRE_DEEPSEEK4_E8_U4` | crates/hipfire-arch-deepseek4/src/forward.rs |
@@ -418,7 +418,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_DEEPSEEK4_Q8_WMMA` | crates/rdna-compute/src/feature_flags.rs |
 | `HIPFIRE_DEEPSEEK4_REAP_KEEPMAP` | crates/hipfire-arch-deepseek4/examples/deepseek4_perplexity.rs, crates/hipfire-arch-deepseek4/src/deepseek4.rs |
 | `HIPFIRE_DEEPSEEK4_ROUTE_SCALE` | crates/hipfire-arch-deepseek4/src/forward.rs |
-| `HIPFIRE_DEEPSEEK4_SEED` | crates/hipfire-arch-deepseek4/examples/deepseek4_chat.rs, crates/hipfire-runtime/examples/daemon.rs |
+| `HIPFIRE_DEEPSEEK4_SEED` | crates/hipfire-arch-deepseek4/examples/deepseek4_chat.rs, crates/hipfire-daemon/src/main.rs |
 | `HIPFIRE_DEEPSEEK4_SKIP_FFN` | crates/hipfire-arch-deepseek4/src/forward.rs |
 | `HIPFIRE_DEEPSEEK4_SPEC_DECODE` | crates/hipfire-arch-deepseek4/examples/deepseek4_chat.rs, crates/hipfire-loader/src/carriers.rs |
 | `HIPFIRE_DEEPSEEK4_SPEC_K` | crates/hipfire-arch-deepseek4/examples/deepseek4_chat.rs, crates/hipfire-arch-deepseek4/examples/dspark_bench.rs |
@@ -436,11 +436,11 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_DETECTED_VRAM_GB` | scripts/_detect-gpu.sh |
 | `HIPFIRE_DETERMINISTIC` | autoresearch/ar/certify/serve_runner.py, crates/hipfire-runtime/examples/pp_parity_chatml.rs |
 | `HIPFIRE_DEVICES` | crates/hipfire-runtime/src/config.rs, crates/hipfire-runtime/src/multi_gpu.rs |
-| `HIPFIRE_DFLASH_CHAT` | crates/hipfire-runtime/examples/daemon.rs |
-| `HIPFIRE_DFLASH_CKPT_RESUME` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-runtime/examples/daemon.rs |
-| `HIPFIRE_DFLASH_CTX_CAP` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-runtime/examples/daemon.rs |
+| `HIPFIRE_DFLASH_CHAT` | crates/hipfire-daemon/src/main.rs |
+| `HIPFIRE_DFLASH_CKPT_RESUME` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-daemon/src/main.rs |
+| `HIPFIRE_DFLASH_CTX_CAP` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-daemon/src/main.rs |
 | `HIPFIRE_DFLASH_DRAFT` | crates/hipfire-runtime/src/config.rs, scripts/coherence-gate-dflash.sh |
-| `HIPFIRE_DFLASH_FAST_SAMPLE` | crates/hipfire-arch-qwen35/src/speculative.rs, crates/hipfire-runtime/examples/daemon.rs |
+| `HIPFIRE_DFLASH_FAST_SAMPLE` | crates/hipfire-arch-qwen35/src/speculative.rs, crates/hipfire-daemon/src/main.rs |
 | `HIPFIRE_DFLASH_LOGIT_DUMP` | crates/hipfire-arch-qwen35/src/speculative.rs |
 | `HIPFIRE_DFLASH_LOOP_BREAK` | crates/hipfire-runtime/examples/dflash_spec_demo.rs |
 | `HIPFIRE_DFLASH_LOOP_BREAK_MAX_ESCALATIONS` | crates/hipfire-runtime/examples/dflash_spec_demo.rs |
@@ -458,7 +458,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_DFLASH_REFERENCE` | scripts/dflash_ref_spec_test.py, scripts/dflash_spec_debug.py |
 | `HIPFIRE_DFLASH_SEED_ORACLE` | crates/hipfire-arch-qwen35/src/speculative.rs, scripts/seed_oracle_collect.sh |
 | `HIPFIRE_DFLASH_TARGET` | scripts/coherence-gate-dflash.sh |
-| `HIPFIRE_DFLASH_TEMP_SPEC` | crates/hipfire-runtime/examples/daemon.rs |
+| `HIPFIRE_DFLASH_TEMP_SPEC` | crates/hipfire-daemon/src/main.rs |
 | `HIPFIRE_DFLASH_TREE` | crates/hipfire-runtime/src/dflash_generic.rs, crates/rdna-compute/src/feature_flags.rs |
 | `HIPFIRE_DFLASH_WINDOW` | crates/hipfire-arch-qwen35/src/dflash_spec.rs, crates/hipfire-runtime/examples/dflash_spec_demo.rs, crates/hipfire-runtime/src/dflash.rs |
 | `HIPFIRE_DFLASH_ZLAB_SAFETENSORS` | scripts/dflash_spec_debug.py |
@@ -505,8 +505,8 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_EP_PREFILL_TIMING` | crates/hipfire-arch-qwen35/src/qwen35.rs |
 | `HIPFIRE_EP_PROMPT_REPEAT` | crates/hipfire-runtime/examples/ep_decode_parity.rs |
 | `HIPFIRE_EP_SKIP_ALLREDUCE` | crates/hipfire-arch-qwen35/src/qwen35.rs |
-| `HIPFIRE_EXPERIMENTAL_` | crates/hipfire-runtime/examples/daemon.rs |
-| `HIPFIRE_EXPERIMENTAL_BUDGET_ALERT` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/examples/daemon.rs |
+| `HIPFIRE_EXPERIMENTAL_` | crates/hipfire-daemon/src/main.rs |
+| `HIPFIRE_EXPERIMENTAL_BUDGET_ALERT` | crates/hipfire-config/src/lib.rs, crates/hipfire-daemon/src/main.rs |
 | `HIPFIRE_FLASH_PREFILL` | crates/hipfire-dispatch/src/families/attention.rs |
 | `HIPFIRE_FLASH_PREFILL_FIXED_HD` | crates/rdna-compute/src/attention.rs |
 | `HIPFIRE_FLASH_PREFILL_PREFETCH_V` | crates/rdna-compute/src/attention.rs |
@@ -553,6 +553,15 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_GEMV_ROWS` | crates/rdna-compute/src/dispatch.rs, crates/rdna-compute/src/feature_flags.rs |
 | `HIPFIRE_GEN` | crates/hipfire-runtime/examples/a3b_multiturn_oneshot.rs |
 | `HIPFIRE_GEN_STEPS` | crates/hipfire-runtime/examples/oracle_xcheck.rs |
+| `HIPFIRE_GFX1100_AWQ_NORM_DIRECT` | crates/rdna-compute/src/gemv.rs |
+| `HIPFIRE_GFX1100_ASYM3_Q8_PAIR` | crates/rdna-compute/src/attention.rs |
+| `HIPFIRE_GFX1100_DENSE_GATE_UP_DOT_REFORM` | crates/rdna-compute/src/gemm.rs |
+| `HIPFIRE_GFX1100_DENSE_GATE_UP_LANE0_HEADERS` | crates/rdna-compute/src/gemm.rs |
+| `HIPFIRE_GFX1100_DENSE_GATE_UP_PAIR` | crates/rdna-compute/src/gemm.rs |
+| `HIPFIRE_GFX1100_DENSE_GATE_UP_PAIR2` | crates/rdna-compute/src/gemm.rs |
+| `HIPFIRE_GFX1100_DENSE_GATE_UP_QUAD_PREFETCH` | crates/rdna-compute/src/gemm.rs |
+| `HIPFIRE_GFX1100_DENSE_GATE_UP_SETPRIO` | crates/rdna-compute/src/gemm.rs |
+| `HIPFIRE_GFX1100_DENSE_GATE_UP_STAGE_X32` | crates/rdna-compute/src/gemm.rs |
 | `HIPFIRE_GFX1100_ROUTER_W64` | crates/hipfire-dispatch/src/pipeline/mod.rs |
 | `HIPFIRE_GFX1151_ATTENTION_TILE_DPP` | crates/rdna-compute/src/attention.rs |
 | `HIPFIRE_GFX1151_ATTENTION_TILE_DPP_REDUCE` | crates/rdna-compute/src/kernels.rs |
@@ -669,7 +678,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_HOST_TIMING` | crates/hipfire-runtime/examples/dflash_spec_demo.rs, scripts/ddtree_verify_profile.sh |
 | `HIPFIRE_IDLE_TIMEOUT` | crates/hipfire-config/src/lib.rs |
 | `HIPFIRE_IMAGE` | scripts/container-gate.sh |
-| `HIPFIRE_JINJA_CHAT` | crates/hipfire-runtime/examples/daemon.rs, crates/hipfire-runtime/src/prompt_frame.rs |
+| `HIPFIRE_JINJA_CHAT` | crates/hipfire-daemon/src/main.rs, crates/hipfire-runtime/src/prompt_frame.rs |
 | `HIPFIRE_JINJA_TOOLS_DRAFTER` | scripts/agentic-gate-jinja-tools.sh |
 | `HIPFIRE_JINJA_TOOLS_MODEL` | scripts/agentic-gate-jinja-tools.sh |
 | `HIPFIRE_KERNEL_CACHE` | crates/hipfire-cli/src/main.rs, crates/hipfire-tui/src/hipfire/dashboard.rs |
@@ -689,15 +698,15 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_LM_HEAD_OVERWRITE` | crates/rdna-compute/src/feature_flags.rs |
 | `HIPFIRE_LM_HEAD_WMMA` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemm.rs |
 | `HIPFIRE_LOCAL` | crates/hipfire-cli/src/main.rs, tests/e2e_run_reject.sh |
-| `HIPFIRE_LOG` | crates/hipfire-runtime/examples/daemon.rs |
-| `HIPFIRE_LOG_FORMAT` | crates/hipfire-runtime/examples/daemon.rs |
+| `HIPFIRE_LOG` | crates/hipfire-daemon/src/main.rs |
+| `HIPFIRE_LOG_FORMAT` | crates/hipfire-daemon/src/main.rs |
 | `HIPFIRE_MAGIC` | crates/hipfire-runtime/examples/build_kld_ref.rs, crates/hipfire-runtime/examples/build_kld_ref_native.rs |
 | `HIPFIRE_MAX_REQUEST_BYTES` | crates/hipfire-config/src/lib.rs |
-| `HIPFIRE_MAX_TOTAL_THINK_TOKENS` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/examples/daemon.rs |
+| `HIPFIRE_MAX_TOTAL_THINK_TOKENS` | crates/hipfire-config/src/lib.rs, crates/hipfire-daemon/src/main.rs |
 | `HIPFIRE_MEMSET_DUMP` | crates/hip-bridge/src/ffi.rs |
 | `HIPFIRE_META_MAX` | scripts/ddtree_meta_sweep.sh |
 | `HIPFIRE_META_RUNS` | scripts/ddtree_meta_sweep.sh |
-| `HIPFIRE_MINIMAX_BATCH_PREFILL` | crates/hipfire-runtime/examples/daemon.rs |
+| `HIPFIRE_MINIMAX_BATCH_PREFILL` | crates/hipfire-daemon/src/main.rs |
 | `HIPFIRE_MINIMAX_CAPTURE_POSTATTN` | crates/hipfire-arch-minimax/src/forward.rs |
 | `HIPFIRE_MINIMAX_ENABLE_DOWN_AWQ` | crates/hipfire-arch-minimax/src/minimax.rs |
 | `HIPFIRE_MINIMAX_EXPERT_` | crates/hipfire-quantize/src/main.rs |
@@ -705,7 +714,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_MINIMAX_EXPERT_MQ3L` | crates/hipfire-quantize/src/main.rs |
 | `HIPFIRE_MINIMAX_EXPERT_MQ6` | crates/hipfire-quantize/src/main.rs |
 | `HIPFIRE_MINIMAX_GATE_OUT` | scripts/coherence-gate-minimax.sh |
-| `HIPFIRE_MINIMAX_GRAPH` | crates/hipfire-arch-minimax/src/forward.rs, crates/hipfire-runtime/examples/daemon.rs |
+| `HIPFIRE_MINIMAX_GRAPH` | crates/hipfire-arch-minimax/src/forward.rs, crates/hipfire-daemon/src/main.rs |
 | `HIPFIRE_MINIMAX_MODEL` | scripts/coherence-gate-minimax.sh |
 | `HIPFIRE_MINIMAX_PROMOTE_MQ4` | crates/hipfire-quantize/src/main.rs |
 | `HIPFIRE_MINIMAX_PROMOTE_MQ6` | crates/hipfire-quantize/src/main.rs |
@@ -771,12 +780,12 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_MTP_GPU_ACCEPT` | crates/hipfire-arch-qwen35/src/mtp_spec.rs |
 | `HIPFIRE_MTP_HEAD_LMHEAD_WMMA` | crates/hipfire-arch-qwen35/src/mtp_head.rs |
 | `HIPFIRE_MTP_K` | crates/hipfire-config/src/lib.rs, crates/hipfire-loader/src/carriers.rs |
-| `HIPFIRE_MTP_MODE` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/examples/daemon.rs |
+| `HIPFIRE_MTP_MODE` | crates/hipfire-config/src/lib.rs, crates/hipfire-daemon/src/main.rs |
 | `HIPFIRE_MTP_PREFIX_CACHE` | scripts/serve_harness.py |
 | `HIPFIRE_MTP_PROPOSAL_GRAPH` | crates/hipfire-arch-qwen35/src/mtp_spec.rs |
-| `HIPFIRE_MTP_P_MIN` | crates/hipfire-arch-qwen35/src/mtp_spec.rs, crates/hipfire-runtime/examples/daemon.rs |
+| `HIPFIRE_MTP_P_MIN` | crates/hipfire-arch-qwen35/src/mtp_spec.rs, crates/hipfire-daemon/src/main.rs |
 | `HIPFIRE_MTP_Q8_VERIFY_WMMA` | crates/hipfire-arch-qwen35/src/mtp_spec.rs |
-| `HIPFIRE_MTP_SAMPLED` | crates/hipfire-runtime/examples/daemon.rs, scripts/serve_harness.py |
+| `HIPFIRE_MTP_SAMPLED` | crates/hipfire-daemon/src/main.rs, scripts/serve_harness.py |
 | `HIPFIRE_MTP_SMOKE_HEAD` | crates/hipfire-arch-qwen35/examples/mtp_head_smoke.rs |
 | `HIPFIRE_MTP_SMOKE_TRUNK` | crates/hipfire-arch-qwen35/examples/mtp_head_smoke.rs |
 | `HIPFIRE_MTP_SNAPSHOT_OVERLAP` | crates/hipfire-arch-qwen35/src/mtp_spec.rs |
@@ -785,10 +794,10 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_MW16` | crates/rdna-compute/src/feature_flags.rs |
 | `HIPFIRE_NGRAM_DRAFT` | crates/hipfire-arch-qwen2/src/spec_impl.rs, crates/hipfire-loader/src/carriers.rs |
 | `HIPFIRE_NGRAM_DRAFT_K` | crates/hipfire-loader/src/spec_build.rs, crates/hipfire-runtime/src/loader_api.rs |
-| `HIPFIRE_NGRAM_LOOP_THRESHOLD` | crates/hipfire-runtime/examples/daemon.rs, crates/hipfire-runtime/src/config.rs |
+| `HIPFIRE_NGRAM_LOOP_THRESHOLD` | crates/hipfire-daemon/src/main.rs, crates/hipfire-runtime/src/config.rs |
 | `HIPFIRE_NGRAM_MIN_COUNT` | crates/hipfire-loader/src/spec_build.rs, crates/hipfire-runtime/src/loader_api.rs |
 | `HIPFIRE_NGRAM_THRESHOLD` | crates/hipfire-runtime/src/arch.rs |
-| `HIPFIRE_NGRAM_WINDOW` | crates/hipfire-runtime/examples/daemon.rs, crates/hipfire-runtime/src/arch.rs |
+| `HIPFIRE_NGRAM_WINDOW` | crates/hipfire-daemon/src/main.rs, crates/hipfire-runtime/src/arch.rs |
 | `HIPFIRE_NORMALIZE_PROMPT` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/examples/build_kld_ref_native.rs |
 | `HIPFIRE_NO_REGISTRY_FETCH` | crates/hipfire-registry/src/lib.rs |
 | `HIPFIRE_NO_SPILL` | crates/hipfire-quantize/src/main.rs |
@@ -797,14 +806,14 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_PARITY_OUT` | scripts/forward-lowered-parity.sh |
 | `HIPFIRE_PARO_BATCHED` | crates/hipfire-arch-qwen35/src/qwen35.rs, crates/rdna-compute/src/gemm.rs |
 | `HIPFIRE_PATH_C_OUT` | scripts/path-c-smoke.sh |
-| `HIPFIRE_PFLASH_DEBUG` | crates/hipfire-runtime/examples/daemon.rs |
+| `HIPFIRE_PFLASH_DEBUG` | crates/hipfire-daemon/src/main.rs |
 | `HIPFIRE_PFLASH_DRAFTER` | scripts/pflash-gate.sh |
 | `HIPFIRE_PFLASH_DRAFTER_KV` | crates/hipfire-arch-qwen35/src/pflash.rs |
 | `HIPFIRE_PFLASH_SCORE_LAYER` | crates/hipfire-arch-qwen35/src/pflash.rs |
 | `HIPFIRE_PFLASH_TARGET` | scripts/pflash-gate.sh |
 | `HIPFIRE_PORT` | crates/hipfire-config/src/lib.rs |
-| `HIPFIRE_POST_LATCH_ANSWER_TOKENS` | crates/hipfire-runtime/examples/daemon.rs |
-| `HIPFIRE_PP_DFLASH` | crates/hipfire-runtime/examples/daemon.rs |
+| `HIPFIRE_POST_LATCH_ANSWER_TOKENS` | crates/hipfire-daemon/src/main.rs |
+| `HIPFIRE_PP_DFLASH` | crates/hipfire-daemon/src/main.rs |
 | `HIPFIRE_PP_GATE_HETEROGENEOUS` | scripts/pp-gate.sh |
 | `HIPFIRE_PP_GATE_INCLUDE_IGPU` | scripts/pp-gate.sh |
 | `HIPFIRE_PP_GATE_MODEL` | scripts/pp-gate.sh |
@@ -812,7 +821,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_PP_GATE_TEST_NO_SYSFS` | scripts/pp-gate.sh |
 | `HIPFIRE_PP_LAYERS` | crates/hipfire-loader/src/carriers.rs |
 | `HIPFIRE_PP_PARITY_MODEL` | crates/hipfire-arch-qwen35/tests/pp_parity.rs |
-| `HIPFIRE_PP_PFLASH` | crates/hipfire-runtime/examples/daemon.rs |
+| `HIPFIRE_PP_PFLASH` | crates/hipfire-daemon/src/main.rs |
 | `HIPFIRE_PREFILL_` | crates/hipfire-arch-qwen35/src/pflash.rs |
 | `HIPFIRE_PREFILL_ALPHA` | crates/hipfire-arch-qwen35/src/pflash.rs |
 | `HIPFIRE_PREFILL_BATCHED` | crates/hipfire-arch-qwen35/src/mtp_spec.rs, crates/hipfire-arch-qwen35/src/qwen35.rs |
@@ -834,11 +843,11 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_PROFILE_DECODE` | crates/hipfire-runtime/examples/bench_qwen35_mq4.rs, scripts/kernel_atlas.py |
 | `HIPFIRE_PROFILE_MAX` | scripts/ddtree_verify_profile.sh |
 | `HIPFIRE_PROFILE_RUNS` | scripts/ddtree_verify_profile.sh |
-| `HIPFIRE_PROMPT_CACHE_CAP` | crates/hipfire-loader/src/lib.rs, crates/hipfire-runtime/examples/daemon.rs |
-| `HIPFIRE_PROMPT_CACHE_UNBOUNDED` | crates/hipfire-loader/src/lib.rs, crates/hipfire-runtime/examples/daemon.rs |
+| `HIPFIRE_PROMPT_CACHE_CAP` | crates/hipfire-loader/src/lib.rs, crates/hipfire-daemon/src/main.rs |
+| `HIPFIRE_PROMPT_CACHE_UNBOUNDED` | crates/hipfire-loader/src/lib.rs, crates/hipfire-daemon/src/main.rs |
 | `HIPFIRE_PROMPT_HEAT_JSON` | crates/hipfire-runtime/src/config.rs, crates/hipfire-runtime/src/tokenizer.rs |
 | `HIPFIRE_PROMPT_HEAT_LIMIT` | crates/hipfire-runtime/src/config.rs, crates/hipfire-runtime/src/tokenizer.rs |
-| `HIPFIRE_PROMPT_TOKEN_HEAT` | crates/hipfire-runtime/examples/daemon.rs, crates/hipfire-runtime/examples/dflash_spec_demo.rs |
+| `HIPFIRE_PROMPT_TOKEN_HEAT` | crates/hipfire-daemon/src/main.rs, crates/hipfire-runtime/examples/dflash_spec_demo.rs |
 | `HIPFIRE_Q8_BATCHED_LEGACY` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemm.rs |
 | `HIPFIRE_Q8_FLASH_TILE` | crates/rdna-compute/src/attention.rs |
 | `HIPFIRE_Q8_PREFILL_WMMA` | crates/hipfire-arch-qwen35/src/qwen35.rs |
@@ -861,7 +870,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_QWEN35_FA_PREP_FUSE` | crates/hipfire-arch-qwen35/src/qwen35.rs |
 | `HIPFIRE_QWEN35_FA_PREP_KERNEL` | crates/rdna-compute/src/kernels.rs |
 | `HIPFIRE_QWEN35_FINITE_TRACE` | crates/hipfire-arch-qwen35/src/qwen35.rs |
-| `HIPFIRE_QWEN35_GRAMMAR` | crates/hipfire-runtime/examples/daemon.rs, crates/hipfire-runtime/src/prompt_frame.rs |
+| `HIPFIRE_QWEN35_GRAMMAR` | crates/hipfire-daemon/src/main.rs, crates/hipfire-runtime/src/prompt_frame.rs |
 | `HIPFIRE_QWEN35_MTP` | crates/hipfire-loader/src/lib.rs, crates/hipfire-loader/src/spec_build.rs |
 | `HIPFIRE_QWEN35_MTP_K` | crates/hipfire-loader/src/spec_build.rs |
 | `HIPFIRE_QWEN35_NGRAM_LEN_MIN` | crates/hipfire-arch-qwen35/src/grammar.rs |
@@ -877,10 +886,10 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_QWEN3_TOP_K` | crates/hipfire-arch-llama/examples/qwen3_dspark_bench.rs |
 | `HIPFIRE_QWEN3_TOP_P` | crates/hipfire-arch-llama/examples/qwen3_dspark_bench.rs |
 | `HIPFIRE_QWEN3_WARMUP` | crates/hipfire-arch-llama/examples/qwen3_dspark_bench.rs |
-| `HIPFIRE_QWEN_CACHE_TRACE` | crates/hipfire-runtime/examples/daemon.rs, scripts/test-qwen35-abort-resume.sh |
+| `HIPFIRE_QWEN_CACHE_TRACE` | crates/hipfire-daemon/src/main.rs, scripts/test-qwen35-abort-resume.sh |
 | `HIPFIRE_QWEN_MOE_FINAL_NORM_RAW` | scripts/test_pr228_spiral_check.sh |
-| `HIPFIRE_QWEN_MTP` | crates/hipfire-runtime/examples/daemon.rs, scripts/serve_harness.py |
-| `HIPFIRE_QWEN_PROMPT_CACHE` | crates/hipfire-runtime/examples/daemon.rs |
+| `HIPFIRE_QWEN_MTP` | crates/hipfire-daemon/src/main.rs, scripts/serve_harness.py |
+| `HIPFIRE_QWEN_PROMPT_CACHE` | crates/hipfire-daemon/src/main.rs |
 | `HIPFIRE_RDNA2_VARIANT` | crates/hipfire-cli/src/main.rs, crates/rdna-compute/src/feature_flags.rs |
 | `HIPFIRE_RDNA3_HFQ4_LM_HEAD_K2048` | crates/rdna-compute/src/feature_flags.rs |
 | `HIPFIRE_RDNA3_HFQ4_MOE_GATE_UP_K2048` | crates/rdna-compute/src/feature_flags.rs |
@@ -984,7 +993,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_SWEEP_RUNS` | scripts/ddtree_budget_sweep.sh |
 | `HIPFIRE_TARGET_ARCH` | crates/rdna-compute/src/dispatch.rs, scripts/kernel_atlas.py |
 | `HIPFIRE_TEST_MODEL` | scripts/test-qwen35-abort-resume.sh, scripts/test-qwen35-think-cap.sh |
-| `HIPFIRE_THINK_CONTINUATION` | crates/hipfire-arch-qwen35/src/spec_emit.rs, crates/hipfire-runtime/examples/daemon.rs |
+| `HIPFIRE_THINK_CONTINUATION` | crates/hipfire-arch-qwen35/src/spec_emit.rs, crates/hipfire-daemon/src/main.rs |
 | `HIPFIRE_TIER_RATIO` | crates/hipfire-quantize/src/main.rs |
 | `HIPFIRE_TP_BENCH_ITERS` | crates/hip-bridge/examples/rccl_smoke.rs, crates/hipfire-runtime/examples/tp_allreduce_smoke.rs |
 | `HIPFIRE_TP_BENCH_N` | crates/hip-bridge/examples/rccl_smoke.rs, crates/hipfire-runtime/examples/tp_allreduce_smoke.rs |

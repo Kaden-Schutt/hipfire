@@ -18,6 +18,7 @@ use crate::config::{Lfm2MoeConfig, MixerKind};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::hfq_parallel::{read_hfq_jobs_ordered, HfqReadJob};
 use hipfire_runtime::llama::{f16_to_f32, KvCache, WeightTensor};
+use hipfire_runtime::llama::KvCacheExt;
 use hipfire_runtime::model_source::ModelSource;
 use hipfire_runtime::safetensors_source::{bf16_bytes_to_f16, source_bytes_to_f32_vec};
 use hipfire_runtime::{screen_weight_tensor, MmqScreenable};
@@ -1386,7 +1387,7 @@ impl Lfm2MoeState {
             max_seq,
             physical_cap: None,
         };
-        let kv = hipfire_runtime::llama::KvCache::from_mode(
+        let kv = <hipfire_runtime::llama::KvCache as hipfire_runtime::llama::KvCacheExt>::from_mode(
             hipfire_runtime::kv_mode::resolve(
                 "",
                 &hipfire_runtime::kv_mode::HFQ_Q8_ONLY_POLICY,

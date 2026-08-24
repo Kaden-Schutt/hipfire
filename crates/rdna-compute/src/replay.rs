@@ -104,14 +104,9 @@ fn gfx1010_dependency_policy_from_config(
     device_name: &str,
 ) -> Result<Gfx1010DependencyPolicy, String> {
     let raw = hipfire_config::process_value("HIPFIRE_REPLAY_PM4_GFX1010_DEPENDENCY");
-    let policy =
-        gfx1010_dependency_policy_from_value(architecture, device_name, raw.as_deref())?;
+    let policy = gfx1010_dependency_policy_from_value(architecture, device_name, raw.as_deref())?;
     if gfx1010_release_wait_required(architecture, device_name) {
-        let source = if raw.is_none() {
-            "default"
-        } else {
-            "explicit"
-        };
+        let source = if raw.is_none() { "default" } else { "explicit" };
         eprintln!("[redline] gfx1010 PM4 dependency mode={policy:?} ({source})");
     }
     Ok(policy)
@@ -127,17 +122,21 @@ enum Gfx11EntryAcquirePolicy {
 
 impl Pm4Architecture {
     fn from_device(device: &GpuDevice) -> Result<Self, String> {
-        let name = device.name().to_ascii_lowercase();
+        Self::from_name(device.name())
+    }
+
+    fn from_name(device_name: &str) -> Result<Self, String> {
+        let name = device_name.to_ascii_lowercase();
         if name.starts_with("gfx10") {
             Ok(Self::Gfx10)
         } else if name.starts_with("gfx11") {
             Ok(Self::Gfx11)
-        } else if name.starts_with("gfx12") {
+        } else if matches!(name.as_str(), "gfx1200" | "gfx1201") {
             Ok(Self::Gfx12)
         } else {
             Err(format!(
                 "retained PM4 has no certified register map for HSA agent {:?}",
-                device.name()
+                device_name
             ))
         }
     }
@@ -354,6 +353,18 @@ impl Pm4Commands {
             Self::Gfx12(commands) => {
                 commands.wait_compute_idle();
                 Ok(())
+            }
+        }
+    }
+
+    fn gfx12_system_acquire(&mut self) -> Result<(), String> {
+        match self {
+            Self::Gfx12(commands) => {
+                commands.acquire_system_gfx12();
+                Ok(())
+            }
+            Self::Legacy { .. } => {
+                Err("gfx12 system acquire requested for a legacy PM4 stream".to_owned())
             }
         }
     }
@@ -601,7 +612,16 @@ const fn write(offset: usize) -> PointerEffect {
 fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
     if matches!(
         kernel,
-        "fused_gate_up_hfq4g256" | "fused_gate_up_hfq4g256_k1024_gfx1201"
+        "fused_gate_up_hfq4g256"
+            | "fused_gate_up_hfq4g256_k1024_gfx1201"
+            | "fused_gate_up_hfq4g256_dot_reform_gfx1100"
+            | "fused_gate_up_hfq4g256_dot_prefetch_gfx1100"
+            | "fused_gate_up_hfq4g256_pair_gfx1100"
+            | "fused_gate_up_hfq4g256_pair2_gfx1100"
+            | "fused_gate_up_hfq4g256_quad_prefetch_gfx1100"
+            | "fused_gate_up_hfq4g256_setprio_gfx1100"
+            | "fused_gate_up_hfq4g256_lane0_headers_gfx1100"
+            | "fused_gate_up_hfq4g256_stage_x32_gfx1100"
     ) {
         return Some(vec![read(0), read(8), read(16), write(24), write(32)]);
     }
@@ -715,7 +735,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
     {
         return Some(vec![read(0), write(8), write(16)]);
     }
-    if kernel.starts_with("gated_delta_net_q8_compact2_") {
+    if kernel.starts_with("gated_delta_net_q8_compact") {
         return Some(vec![
             read(0),
             read(8),
@@ -924,8 +944,19 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             write(56),
             write(80),
         ]),
+        "gated_delta_net_f32" => Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            read(32),
+            write(40),
+            write(48),
+        ]),
         "gated_norm_f32" => Some(vec![read(0), read(8), read(16), write(24)]),
-        "gated_norm_mq_rotate_gfx1100" | "gated_norm_mq_rotate_gfx1151" => Some(vec![
+        "gated_norm_mq_rotate_gfx1100"
+        | "gated_norm_mq_rotate_k6144_gfx1100"
+        | "gated_norm_mq_rotate_gfx1151" => Some(vec![
             read(0),
             read(8),
             read(16),
@@ -933,15 +964,17 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             read(32),
             write(40),
         ]),
-        "qwen35_fa_prep_gfx1100" | "qwen35_fa_prep_gfx1151" => Some(vec![
-            read(0),
-            write(8),
-            write(16),
-            write(24),
-            read(32),
-            read(40),
-            read(48),
-        ]),
+        "qwen35_fa_prep_gfx1100" | "qwen36_27b_fa_prep_gfx1100" | "qwen35_fa_prep_gfx1151" => {
+            Some(vec![
+                read(0),
+                write(8),
+                write(16),
+                write(24),
+                read(32),
+                read(40),
+                read(48),
+            ])
+        }
         "kv_cache_write_q8_0_pair" => Some(vec![write(0), write(8), read(16), read(24), read(32)]),
         "mq_rotate_x" => Some(vec![read(0), write(8), read(16), read(24)]),
         "gemv_hfq4g256"
@@ -1040,6 +1073,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             read(48),
         ]),
         "sigmoid_mul_f32" => Some(vec![write(0), read(8)]),
+        "gemma4_ple_gelu_mul_strided_f32" => Some(vec![read(0), read(8), write(16)]),
         _ => None,
     }
 }
@@ -1130,7 +1164,16 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
     }
     if matches!(
         kernel,
-        "fused_gate_up_hfq4g256" | "fused_gate_up_hfq4g256_k1024_gfx1201"
+        "fused_gate_up_hfq4g256"
+            | "fused_gate_up_hfq4g256_k1024_gfx1201"
+            | "fused_gate_up_hfq4g256_dot_reform_gfx1100"
+            | "fused_gate_up_hfq4g256_dot_prefetch_gfx1100"
+            | "fused_gate_up_hfq4g256_pair_gfx1100"
+            | "fused_gate_up_hfq4g256_pair2_gfx1100"
+            | "fused_gate_up_hfq4g256_quad_prefetch_gfx1100"
+            | "fused_gate_up_hfq4g256_setprio_gfx1100"
+            | "fused_gate_up_hfq4g256_lane0_headers_gfx1100"
+            | "fused_gate_up_hfq4g256_stage_x32_gfx1100"
     ) {
         return Some(64);
     }
@@ -1224,7 +1267,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         return Some(80);
     }
 
-    if kernel.starts_with("gated_delta_net_q8_compact2_") {
+    if kernel.starts_with("gated_delta_net_q8_compact") {
         return Some(96);
     }
     if kernel == "conv1d_silu_split_qknorm_b256_scalar_prep" {
@@ -1271,6 +1314,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "rmsnorm_reduce_gfx1100"
         | "hc_input_map_4stream"
         | "sigmoid_mul_f32" => Some(32),
+        "gemma4_ple_gelu_mul_strided_f32" => Some(48),
         "attention_flash_q8_0_reduce"
         | "fused_rmsnorm_mq_rotate"
         | "fused_rmsnorm_mq_rotate_vecsum"
@@ -1300,8 +1344,10 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "conv1d_gated_decode_f32" => Some(48),
         "conv1d_silu_split_f32"
         | "gated_norm_mq_rotate_gfx1100"
+        | "gated_norm_mq_rotate_k6144_gfx1100"
         | "gated_norm_mq_rotate_gfx1151"
         | "qwen35_fa_prep_gfx1100"
+        | "qwen36_27b_fa_prep_gfx1100"
         | "qwen35_fa_prep_gfx1151"
         | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100"
         | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151"
@@ -1323,7 +1369,31 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "fused_qkvza_hfq4g256_ldsx8"
         | "fused_qkvza_hfq4g256_reduce_chain"
         | "gated_delta_net_q8_fast" => Some(96),
+        "gated_delta_net_f32" => Some(80),
         _ => None,
+    }
+}
+
+fn apply_qwen_q8_full_attention_visibility(
+    launches: &[RecordedHipLaunch],
+    headers: &mut [HeaderPolicy],
+) {
+    // The Q8 full-attention body carries intermediate Q/K/V, tile reductions,
+    // and the gated attention result through separate global-memory buffers.
+    // Same-queue barriers alone reproduced stale intermediates on gfx1201;
+    // restoring the captured HIP dispatches' system scopes for this narrow
+    // body makes the multi-position AQL state/logit/KV shadow bit-exact.
+    debug_assert_eq!(launches.len(), headers.len());
+    let mut full_attention_body = false;
+    for (launch, header) in launches.iter().zip(headers) {
+        let kernel = launch.kernel.as_str();
+        full_attention_body |= kernel == "fused_qkv_hfq4g256";
+        if full_attention_body {
+            *header = HeaderPolicy::RECORDED_DISPATCH;
+        }
+        if full_attention_body && kernel == "gemv_hfq4g256_residual" {
+            full_attention_body = false;
+        }
     }
 }
 
@@ -2348,8 +2418,8 @@ impl Pm4MidAcquirePolicy {
 }
 
 fn required_mid_acquire(previous: &str, current: &str) -> bool {
-    if previous.starts_with("gated_delta_net_q8_compact2_")
-        || current.starts_with("gated_delta_net_q8_compact2_")
+    if previous.starts_with("gated_delta_net_q8_compact")
+        || current.starts_with("gated_delta_net_q8_compact")
     {
         return true;
     }
@@ -2376,9 +2446,15 @@ fn required_mid_acquire(previous: &str, current: &str) -> bool {
     )
 }
 
+/// Reused rotate destinations need their stale GC12 vector-cache line
+/// invalidated before the writer executes in a retained IB.
+fn requires_gfx12_pre_dispatch_vmem_acquire(current: &str) -> bool {
+    current == "mq_rotate_x" || current == "fused_silu_mul_mq_rotate"
+}
+
 fn conservative_mid_acquire_except(previous: &str, current: &str, excluded: Option<&str>) -> bool {
-    if previous.starts_with("gated_delta_net_q8_compact2_")
-        || current.starts_with("gated_delta_net_q8_compact2_")
+    if previous.starts_with("gated_delta_net_q8_compact")
+        || current.starts_with("gated_delta_net_q8_compact")
     {
         return true;
     }
@@ -3260,6 +3336,13 @@ impl ReplayController {
         self.request != ReplayBackendRequest::Hip && self.state != ReplayState::Fallback
     }
 
+    /// Whether this controller owns the production one-shot capture lifecycle.
+    /// Manual shadow/profiling controllers deliberately remain available for
+    /// diagnosing routes which are not yet safe for automatic serving.
+    pub fn automatic_lifecycle_enabled(&self) -> bool {
+        self.auto_lifecycle
+    }
+
     pub fn should_auto_finalize_capture(&self) -> bool {
         self.auto_lifecycle && self.is_recording()
     }
@@ -3394,7 +3477,7 @@ impl ReplayController {
                 .with_dynamic_group_bytes(launch.shared_mem)
                 .map_err(|error| format!("{symbol}: {error}"))?;
             if launch.kernel == "gated_delta_net_q8_fast"
-                || launch.kernel.starts_with("gated_delta_net_q8_compact2_")
+                || launch.kernel.starts_with("gated_delta_net_q8_compact")
             {
                 if metadata.kernarg_segment_size < 80 {
                     return Err(format!(
@@ -3467,6 +3550,7 @@ impl ReplayController {
                 _ => {}
             }
         }
+        apply_qwen_q8_full_attention_visibility(&self.recorded[..prefix], &mut headers);
         let graph = if self.request == ReplayBackendRequest::Auto {
             SingleQueueBatchGraph::create_unprofiled_with_dispatch_headers(
                 &device,
@@ -3595,7 +3679,7 @@ impl ReplayController {
                 .validate_geometry(geometry)
                 .map_err(|error| format!("{symbol}: {error}"))?;
             if launch.kernel == "gated_delta_net_q8_fast"
-                || launch.kernel.starts_with("gated_delta_net_q8_compact2_")
+                || launch.kernel.starts_with("gated_delta_net_q8_compact")
             {
                 if metadata.kernarg_segment_size < 80 {
                     return Err(format!(
@@ -3803,7 +3887,13 @@ impl ReplayController {
                         }
                         Pm4WaitPolicy::Resource => resources_independent,
                     };
-                    if !independent {
+                    // GC12 can retain a vector-cache line for the reused
+                    // rotated-output allocation across dispatches in one IB.
+                    // Invalidate it before the writer starts; a consumer-side
+                    // acquire after the writer is too late for this hazard.
+                    let gfx12_pre_dispatch_acquire = pm4_architecture == Pm4Architecture::Gfx12
+                        && requires_gfx12_pre_dispatch_vmem_acquire(current);
+                    if gfx12_pre_dispatch_acquire || !independent {
                         dependency_waits += 1;
                         boundary.wait_compute_idle = true;
                         commands.wait_compute_idle()?;
@@ -3813,7 +3903,11 @@ impl ReplayController {
                         || self
                             .pm4_mid_acquire_policy
                             .acquire_between(previous, current);
-                    if acquire {
+                    if gfx12_pre_dispatch_acquire {
+                        dependency_acquires += 1;
+                        boundary.acquire_vmem = true;
+                        commands.gfx12_system_acquire()?;
+                    } else if acquire {
                         dependency_acquires += 1;
                         boundary.acquire_vmem = pm4_vmem_acquire_enabled(
                             pm4_architecture,
@@ -4523,6 +4617,20 @@ fn put_u32(bytes: &mut [u8], offset: usize, value: u32) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn pm4_architecture_fails_closed_for_unknown_gfx12_devices() {
+        assert_eq!(
+            Pm4Architecture::from_name("gfx1200"),
+            Ok(Pm4Architecture::Gfx12)
+        );
+        assert_eq!(
+            Pm4Architecture::from_name("GFX1201"),
+            Ok(Pm4Architecture::Gfx12)
+        );
+        assert!(Pm4Architecture::from_name("gfx1202").is_err());
+        assert!(Pm4Architecture::from_name("gfx12-future").is_err());
+    }
+
     const A3B_REPLAY_KERNELS: &[&str] = &[
         "fused_rmsnorm_mq_rotate",
         "fused_rmsnorm_mq_rotate_vecsum",
@@ -4547,8 +4655,10 @@ mod tests {
         "gated_delta_net_q8_fast",
         "gated_norm_f32",
         "gated_norm_mq_rotate_gfx1100",
+        "gated_norm_mq_rotate_k6144_gfx1100",
         "gated_norm_mq_rotate_gfx1151",
         "qwen35_fa_prep_gfx1100",
+        "qwen36_27b_fa_prep_gfx1100",
         "qwen35_fa_prep_gfx1151",
         "mq_rotate_x",
         "gemv_hfq4g256_residual",
@@ -4783,8 +4893,7 @@ mod tests {
     #[test]
     fn gfx1010_dependency_policy_defaults_to_release_wait() {
         assert_eq!(
-            gfx1010_dependency_policy_from_value(Pm4Architecture::Gfx10, "gfx1010", None)
-                .unwrap(),
+            gfx1010_dependency_policy_from_value(Pm4Architecture::Gfx10, "gfx1010", None).unwrap(),
             Gfx1010DependencyPolicy::ReleaseWait
         );
         assert_eq!(
@@ -4825,12 +4934,9 @@ mod tests {
             "true",
             "falsé",
         ] {
-            let err = gfx1010_dependency_policy_from_value(
-                Pm4Architecture::Gfx10,
-                "gfx1010",
-                Some(raw),
-            )
-            .unwrap_err();
+            let err =
+                gfx1010_dependency_policy_from_value(Pm4Architecture::Gfx10, "gfx1010", Some(raw))
+                    .unwrap_err();
             assert!(
                 err.contains("HIPFIRE_REPLAY_PM4_GFX1010_DEPENDENCY"),
                 "missing key in error for {raw:?}: {err}"
@@ -5082,6 +5188,73 @@ mod tests {
 
         assert!(expected_kernarg_bytes("unknown_kernel_xyz").is_none());
         assert!(pointer_effects("unknown_kernel_xyz").is_none());
+    }
+
+    #[test]
+    fn deltanet_f32_retained_effect_contract_covers_recurrent_state() {
+        assert_eq!(expected_kernarg_bytes("gated_delta_net_f32"), Some(80));
+        let effects = pointer_effects("gated_delta_net_f32").expect("GDN FP32 contract");
+        assert_eq!(effects.len(), 7);
+        assert_eq!(effects[5].offset, 40);
+        assert_eq!(effects[5].mode, RecordedAccessMode::Write);
+        assert_eq!(effects[6].offset, 48);
+        assert_eq!(effects[6].mode, RecordedAccessMode::Write);
+    }
+
+    #[test]
+    fn qwen_q8_full_attention_aql_body_uses_system_visibility() {
+        let launch = |kernel: &str| RecordedHipLaunch {
+            kernel: kernel.to_owned(),
+            artifact: None,
+            grid: [1; 3],
+            block: [32, 1, 1],
+            shared_mem: 0,
+            grid_binding: None,
+            kernarg: Vec::new(),
+            accesses: None,
+        };
+        let launches = vec![
+            launch("before"),
+            launch("fused_qkv_hfq4g256"),
+            launch("attention_flash_q8_0_tile"),
+            launch("attention_flash_q8_0_reduce"),
+            launch("gemv_hfq4g256_residual"),
+            launch("after"),
+        ];
+        let mut headers = vec![HeaderPolicy::BATCH_BOUNDARY_INTERNAL_SERIAL; launches.len()];
+
+        apply_qwen_q8_full_attention_visibility(&launches, &mut headers);
+
+        assert_eq!(headers[0], HeaderPolicy::BATCH_BOUNDARY_INTERNAL_SERIAL);
+        assert!(headers[1..=4]
+            .iter()
+            .all(|header| *header == HeaderPolicy::RECORDED_DISPATCH));
+        assert_eq!(headers[5], HeaderPolicy::BATCH_BOUNDARY_INTERNAL_SERIAL);
+    }
+
+    #[test]
+    fn gemma4_ple_activation_keeps_padded_replay_contract() {
+        let kernel = "gemma4_ple_gelu_mul_strided_f32";
+        let effects = pointer_effects(kernel).expect("Gemma 4 PLE activation contract");
+        assert_eq!(effects.len(), 3);
+        assert_eq!(effects[0].offset, 0);
+        assert_eq!(effects[0].mode, RecordedAccessMode::Read);
+        assert_eq!(effects[1].offset, 8);
+        assert_eq!(effects[1].mode, RecordedAccessMode::Read);
+        assert_eq!(effects[2].offset, 16);
+        assert_eq!(effects[2].mode, RecordedAccessMode::Write);
+
+        let mut blob = hip_bridge::KernargBlob::new();
+        for _ in 0..3 {
+            blob.push_ptr(std::ptr::null());
+        }
+        for _ in 0..4 {
+            blob.push_i32(0);
+        }
+        assert_eq!(blob.len(), 40, "explicit kernel arguments occupy 40 bytes");
+        blob.pad_to(16);
+        assert_eq!(blob.len(), 48, "recorded launches are padded to 16 bytes");
+        assert_eq!(expected_kernarg_bytes(kernel), Some(blob.len()));
     }
 
     #[test]
@@ -5355,6 +5528,16 @@ mod tests {
     }
 
     #[test]
+    fn gfx12_rotated_vmem_writers_require_a_pre_dispatch_acquire() {
+        for producer in ["mq_rotate_x", "fused_silu_mul_mq_rotate"] {
+            assert!(requires_gfx12_pre_dispatch_vmem_acquire(producer));
+        }
+        assert!(!requires_gfx12_pre_dispatch_vmem_acquire(
+            "gemv_hfq4g256_residual"
+        ));
+    }
+
+    #[test]
     fn pm4_mid_acquire_policies_preserve_required_boundaries() {
         assert_eq!(
             Pm4MidAcquirePolicy::from_value("conservative"),
@@ -5395,6 +5578,10 @@ mod tests {
         assert!(Pm4MidAcquirePolicy::RequiredOnly.acquire_between(
             "fused_qk_l2_norm_scale_f32",
             "gated_delta_net_q8_compact2_b2"
+        ));
+        assert!(Pm4MidAcquirePolicy::RequiredOnly.acquire_between(
+            "fused_qk_l2_norm_scale_f32",
+            "gated_delta_net_q8_compact3_b2"
         ));
         assert_eq!(Pm4MidAcquirePolicy::from_value("invalid"), None);
     }
@@ -5554,6 +5741,21 @@ mod tests {
         );
         assert!(pointer_effects("gated_delta_net_q8_compact2_b2").is_some());
         assert_eq!(
+            expected_kernarg_bytes("gated_delta_net_q8_compact3_b2"),
+            Some(96)
+        );
+        assert!(pointer_effects("gated_delta_net_q8_compact3_b2").is_some());
+        assert_eq!(
+            expected_kernarg_bytes("gated_norm_mq_rotate_k6144_gfx1100"),
+            Some(64)
+        );
+        assert!(pointer_effects("gated_norm_mq_rotate_k6144_gfx1100").is_some());
+        assert_eq!(
+            expected_kernarg_bytes("qwen36_27b_fa_prep_gfx1100"),
+            Some(64)
+        );
+        assert!(pointer_effects("qwen36_27b_fa_prep_gfx1100").is_some());
+        assert_eq!(
             expected_kernarg_bytes("conv1d_silu_split_qknorm_b256"),
             Some(80)
         );
@@ -5583,6 +5785,14 @@ mod tests {
         for kernel in [
             "fused_gate_up_hfq4g256",
             "fused_gate_up_hfq4g256_k1024_gfx1201",
+            "fused_gate_up_hfq4g256_dot_reform_gfx1100",
+            "fused_gate_up_hfq4g256_dot_prefetch_gfx1100",
+            "fused_gate_up_hfq4g256_pair_gfx1100",
+            "fused_gate_up_hfq4g256_pair2_gfx1100",
+            "fused_gate_up_hfq4g256_quad_prefetch_gfx1100",
+            "fused_gate_up_hfq4g256_setprio_gfx1100",
+            "fused_gate_up_hfq4g256_lane0_headers_gfx1100",
+            "fused_gate_up_hfq4g256_stage_x32_gfx1100",
         ] {
             assert_eq!(expected_kernarg_bytes(kernel), Some(64));
             assert_eq!(

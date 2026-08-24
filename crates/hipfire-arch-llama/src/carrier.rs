@@ -1,10 +1,13 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 use crate::dspark_body::Qwen3DrafterAssets;
 use crate::Llama;
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::dspark_core::DsparkWeights;
-use hipfire_runtime::llama::{
-    ForwardScratch, KvCache, KvDims, KvLayers, KvTarget, LlamaConfig, LlamaWeights,
-};
+use hipfire_runtime::llama::{ForwardScratch, KvCache, KvDims, KvLayers, KvTarget, LlamaConfig, LlamaWeights};
+use hipfire_runtime::llama::KvCacheExt;
 use hipfire_runtime::loader_api::{LoadCtx, ModelSource};
 
 pub struct LlamaBundle {
@@ -26,37 +29,83 @@ pub struct LlamaBundle {
     pub dspark_assets: Option<Qwen3DrafterAssets>,
 }
 
-/// Build the LLaMA GPU bundle from an HFQ source.
+/// Build the LLaMA GPU bundle from an HFQ or safetensors-directory source.
+///
+/// Verbatim relocation of the carrier's `(config, weights, kv, scratch)`
+/// seam: HFQ via `Architecture` trait, Dir via ParoQuant loaders. Error
+/// strings are byte-identical to the prior inline carrier block.
 pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<LlamaBundle, String> {
-    let ModelSource::Hfq(mut hfq) = src else {
-        return Err("llama: directory source unsupported".into());
+    let (config, weights, kv, scratch) = match src {
+        ModelSource::Hfq(mut hfq) => {
+            let config = <Llama as Architecture>::config_from_hfq(&hfq).map_err(|e| e.to_string())?;
+            let weights = <Llama as Architecture>::load_weights(&mut hfq, &config, ctx.gpu)?;
+            hipfire_runtime::maybe_screen_mmq(&weights, ctx.gpu);
+            // Size scratch (flash-attention partials) for the runtime KV cap so the
+            // asym/flash attends, which index partials by ceil(physical_cap/128), don't
+            // overflow it (the trait `new_state` only knows the model's declared max).
+            let scratch = ForwardScratch::new_with_max_seq(ctx.gpu, &config, ctx.max_seq)
+                .map_err(|e| format!("llama: ForwardScratch::new_with_max_seq failed: {e:?}"))?;
+            let dims = KvDims {
+                layers: KvLayers::Flat(config.n_layers),
+                n_kv_heads: config.n_kv_heads,
+                head_dim: config.head_dim,
+                max_seq: ctx.max_seq,
+                physical_cap: None,
+            };
+            let kv = <KvCache as KvCacheExt>::from_mode(
+                hipfire_runtime::kv_mode::resolve(
+                    ctx.kv_mode_override.unwrap_or(""),
+                    &hipfire_runtime::kv_mode::LLAMA_HFQ_POLICY,
+                    config.head_dim,
+                )
+                .mode,
+                KvTarget::Single(ctx.gpu),
+                &dims,
+            )
+            .map_err(|e| format!("llama: <KvCache as KvCacheExt>::from_mode failed: {e}"))?;
+            (config, weights, kv, scratch)
+        }
+        ModelSource::Dir(source) => {
+            let config =
+                hipfire_runtime::hfq::config_from_safetensors_llama(&source).map_err(|e| {
+                    format!("failed to parse LLaMA/Qwen3 config from config.json: {e}")
+                })?;
+            let weights =
+                hipfire_runtime::hfq::load_weights_paroquant_llama(&source, &config, ctx.gpu)
+                    .map_err(|e| format!("load_weights_paroquant_llama: {e:?}"))?;
+            hipfire_runtime::maybe_screen_mmq(&weights, ctx.gpu);
+            // Replicate carriers.rs `resolve_kv_mode` warning path verbatim.
+            let kv_mode_str = ctx
+                .kv_mode_override
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| hipfire_runtime::config::get().kv_mode.clone());
+            let rr = hipfire_runtime::kv_mode::resolve(
+                &kv_mode_str,
+                &hipfire_runtime::kv_mode::DIR_SAFETENSORS_POLICY,
+                config.head_dim,
+            );
+            if let Some(w) = rr.warning {
+                eprintln!("  KV cache: {w} (site {})", hipfire_runtime::kv_mode::DIR_SAFETENSORS_POLICY.site);
+            }
+            let dims = KvDims {
+                layers: KvLayers::Flat(config.n_layers),
+                n_kv_heads: config.n_kv_heads,
+                head_dim: config.head_dim,
+                max_seq: ctx.max_seq,
+                physical_cap: Some(ctx.max_seq),
+            };
+            let kv = <KvCache as KvCacheExt>::from_mode(
+                rr.mode,
+                KvTarget::Single(ctx.gpu),
+                &dims,
+            )
+            .map_err(|e| format!("KvCache: {e}"))?;
+            let scratch = ForwardScratch::new_with_max_seq(ctx.gpu, &config, ctx.max_seq)
+                .map_err(|e| format!("ForwardScratch::new_with_max_seq: {e:?}"))?;
+            (config, weights, kv, scratch)
+        }
     };
-    let config = <Llama as Architecture>::config_from_hfq(&hfq).map_err(|e| e.to_string())?;
-    let weights = <Llama as Architecture>::load_weights(&mut hfq, &config, ctx.gpu)?;
-    hipfire_runtime::maybe_screen_mmq(&weights, ctx.gpu);
-    // Size scratch (flash-attention partials) for the runtime KV cap so the
-    // asym/flash attends, which index partials by ceil(physical_cap/128), don't
-    // overflow it (the trait `new_state` only knows the model's declared max).
-    let scratch = ForwardScratch::new_with_max_seq(ctx.gpu, &config, ctx.max_seq)
-        .map_err(|e| format!("llama: ForwardScratch::new_with_max_seq failed: {e:?}"))?;
-    let dims = KvDims {
-        layers: KvLayers::Flat(config.n_layers),
-        n_kv_heads: config.n_kv_heads,
-        head_dim: config.head_dim,
-        max_seq: ctx.max_seq,
-        physical_cap: None,
-    };
-    let kv = KvCache::from_mode(
-        hipfire_runtime::kv_mode::resolve(
-            ctx.kv_mode_override.unwrap_or(""),
-            &hipfire_runtime::kv_mode::LLAMA_HFQ_POLICY,
-            config.head_dim,
-        )
-        .mode,
-        KvTarget::Single(ctx.gpu),
-        &dims,
-    )
-    .map_err(|e| format!("llama: KvCache::from_mode failed: {e}"))?;
     Ok(LlamaBundle {
         config,
         weights,
@@ -67,6 +116,9 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<LlamaBundle, S
         dspark_assets: None,
     })
 }
+
+/// Alias matching the `load_<arch>_bundle` naming convention in the task.
+pub use load_bundle as load_llama_bundle;
 
 impl LlamaBundle {
     /// Set the decoder-layer indices whose residual hidden states the

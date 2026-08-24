@@ -2403,6 +2403,48 @@ pub static FIELDS: &[ConfigField] = &[
         "Use the legacy batched Q8 route."
     ),
     process_bool_field!(
+        "kernel.gemma4_q8_fused_prefill",
+        "gemma4_q8_fused_prefill",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_GEMMA4_Q8_FUSED_PREFILL",
+        "Fuse eligible Gemma 4 Q8 prefill projections on gfx1100."
+    ),
+    process_auto_bool_field!(
+        "kernel.gemma4_batched_embedding_prefill",
+        "gemma4_batched_embedding_prefill",
+        Kernel,
+        true,
+        "HIPFIRE_GEMMA4_BATCHED_EMBEDDING_PREFILL",
+        "Batch eligible Gemma 4 embedding lookups; auto enables validated gfx1100/gfx1201."
+    ),
+    process_bool_field!(
+        "kernel.gemma4_ple_batched_prefill",
+        "gemma4_ple_batched_prefill",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_GEMMA4_PLE_BATCHED_PREFILL",
+        "Batch the Gemma 4 E-series PLE model projection on gfx1100."
+    ),
+    process_auto_bool_field!(
+        "kernel.gemma4_ple_branch_batched_prefill",
+        "gemma4_ple_branch_batched_prefill",
+        Kernel,
+        true,
+        "HIPFIRE_GEMMA4_PLE_BRANCH_BATCHED_PREFILL",
+        "Exact-arithmetic Gemma 4 E-series PLE branch batching; auto-enabled on validated gfx1100/gfx1201 paths."
+    ),
+    process_auto_bool_field!(
+        "kernel.gemma4_ple_activation_fused_prefill",
+        "gemma4_ple_activation_fused_prefill",
+        Kernel,
+        true,
+        "HIPFIRE_GEMMA4_PLE_ACTIVATION_FUSED_PREFILL",
+        "Fuse the Gemma 4 E-series PLE activation and strided multiply; auto enables validated gfx1100/gfx1201."
+    ),
+    process_bool_field!(
         "kernel.deepseek4_q8_wmma",
         "deepseek4_q8_wmma",
         Kernel,

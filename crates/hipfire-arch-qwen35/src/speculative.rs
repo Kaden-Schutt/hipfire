@@ -529,6 +529,15 @@ pub struct ModelSlot {
     /// `set_dflash_extract_layers` / `capture_seed_main_hidden` so the per-window
     /// verify captures hidden at exactly the sidecar's layer ids.
     pub dspark_extract_layers: Vec<usize>,
+    /// Vision tower carried through the slot guard so `Qwen35Bundle` round-trips
+    /// without loss. The slot never drives `vision_forward`; it just parks the
+    /// tower while the bundle is out of `ModelState`.
+    pub vision_config: Option<hipfire_arch_qwen35_vl::qwen35_vl::VisionConfig>,
+    pub vision_weights: Option<hipfire_arch_qwen35_vl::qwen35_vl::VisionWeights>,
+    /// Native MTP head parked through the slot guard so `Qwen35Bundle`
+    /// round-trips without loss. The slot never owns MTP serving; it just
+    /// carries the head while the bundle is out of `LoadedModel.state`.
+    pub qwen35_mtp_head: Option<crate::mtp_head::Qwen35MtpHead>,
 }
 
 impl ModelSlot {
@@ -555,7 +564,22 @@ impl ModelSlot {
             kv_cache,
             dn_state,
             kv_adaptive: _,
+            pp_scratch_set,
+            vision_config,
+            vision_weights,
+            qwen35_mtp_head,
+            qwen35_decode_batch,
         } = bundle;
+        debug_assert!(
+            pp_scratch_set.is_none(),
+            "ModelSlot::from_bundle: pp_scratch_set must be None (pp>1 never enters spec slot)"
+        );
+        let _ = pp_scratch_set;
+        debug_assert!(
+            qwen35_decode_batch.is_none(),
+            "ModelSlot::from_bundle: qwen35_decode_batch must be None (batch staging is outside spec slot)"
+        );
+        let _ = qwen35_decode_batch;
         Ok(Self {
             name: String::from("target"),
             hfq,
@@ -566,6 +590,9 @@ impl ModelSlot {
             scratch,
             slot_config: ModelSlotConfig::default(),
             dspark_extract_layers: Vec::new(),
+            vision_config,
+            vision_weights,
+            qwen35_mtp_head,
         })
     }
 
@@ -582,12 +609,16 @@ impl ModelSlot {
             dn_state: self.dn_state,
             // Controller lives on LoadedModel, not ModelSlot.
             kv_adaptive: None,
+            pp_scratch_set: None,
+            vision_config: self.vision_config,
+            vision_weights: self.vision_weights,
+            qwen35_mtp_head: self.qwen35_mtp_head,
+            qwen35_decode_batch: None,
         }
     }
 }
 
 impl ModelSlot {
-    /// Load a model from `path` into a slot. The caller-supplied `gpu` is used
     /// for all allocations. `name` is a human-readable label used in logs.
     pub fn load(
         gpu: &mut Gpu,
@@ -697,6 +728,9 @@ impl ModelSlot {
             scratch,
             slot_config,
             dspark_extract_layers: Vec::new(),
+            vision_config: None,
+            vision_weights: None,
+            qwen35_mtp_head: None,
         })
     }
 

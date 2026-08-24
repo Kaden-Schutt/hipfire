@@ -3,7 +3,7 @@ name = "hipfire-arch-toy"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Reference template for new arch crates: minimum-viable Architecture trait impl (intentionally a stub, no real model)"
+description = "Reference template for new arch crates: faithful skeleton of the ArchModel + load_<arch>_bundle + Carrier contract (intentionally unshippable, arch_id 0xFF, never loads)"
 
 # This crate is INTENTIONALLY tiny. It exists so contributors adding a new
 # model architecture have a copy-paste starting point with all the pieces
