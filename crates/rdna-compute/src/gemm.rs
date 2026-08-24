@@ -10,7 +10,7 @@ use crate::dispatch::{
 use crate::kernels;
 use hip_bridge::{DeviceBuffer, HipResult};
 use std::ffi::c_void;
-use std::sync::{LazyLock, OnceLock};
+use std::sync::OnceLock;
 
 /// Batch ceilings for the LDS-staged HFQ4-G256 GEMMs (`HIPFIRE_HFQ4G256_LDSSTAGE=1`).
 /// The staged kernels win while the grid is small and lose once the added LDS
@@ -71,44 +71,16 @@ enum MqV2PrefillProjection {
     Residual,
 }
 
-/// Temporary single switch for cross-format gfx11 BT/MW screening. Removed
-/// once per-format policies clear parity and full-model A/B on both arches.
-fn mqv2_gfx11_screen_enabled() -> bool {
-    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
-        hipfire_config::developer_var("HIPFIRE_MQV2_GFX11_SCREEN").as_deref() == Ok("1")
-    });
-    *ENABLED
-}
-
 fn mqv2_gfx11_bt_admitted(arch: &str, bits: u8) -> bool {
     match arch {
         "gfx1151" => matches!(bits, 2 | 3 | 5 | 6),
-        // Exact gfx1100 MQ3 remains quarantined; MQ5/MQ6 are screen-only.
-        "gfx1100" => mqv2_gfx11_screen_enabled() && matches!(bits, 5 | 6),
+        // Exact gfx1100 MQ3 remains quarantined; MQ5/MQ6 are production.
+        "gfx1100" => matches!(bits, 5 | 6),
         _ => false,
     }
 }
 
-fn mqv2_gfx1151_screen_waves() -> Option<usize> {
-    static WAVES: LazyLock<Option<usize>> =
-        LazyLock::new(|| {
-            match hipfire_config::developer_var("HIPFIRE_MQV2_GFX1151_MW_WAVES").as_deref() {
-                Ok("4") => Some(4),
-                Ok("8") => Some(8),
-                _ => None,
-            }
-        });
-    *WAVES
-}
-
-fn mq4v2_gfx11_mmq_screen_enabled() -> bool {
-    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
-        hipfire_config::developer_var("HIPFIRE_MQ4V2_GFX11_MMQ").as_deref() == Ok("1")
-    });
-    *ENABLED
-}
-
-fn mqv2_screen_mw_waves(
+fn mqv2_mw_waves(
     arch: &str,
     bits: u8,
     projection: MqV2PrefillProjection,
@@ -116,25 +88,10 @@ fn mqv2_screen_mw_waves(
 ) -> Option<usize> {
     use MqV2PrefillProjection::{GateUp, Residual};
 
-    if !mqv2_gfx11_screen_enabled() {
+    // Same-row MW was neutral/negative on gfx1151. Keep its generic kernels
+    // available to direct parity harnesses, but production remains BT there.
+    if arch != "gfx1100" || !matches!(bits, 5 | 6) {
         return None;
-    }
-    let admitted = match arch {
-        // MQ3 runtime remains quarantined on gfx1100 until explicitly cleared.
-        "gfx1100" => matches!(bits, 5 | 6),
-        "gfx1151" => matches!(bits, 3 | 4 | 5 | 6),
-        _ => false,
-    };
-    if !admitted {
-        return None;
-    }
-    if arch == "gfx1151" {
-        if let Some(waves) = mqv2_gfx1151_screen_waves() {
-            return match (projection, batch_size) {
-                (GateUp, 384..) | (Residual, 416..) => Some(waves),
-                _ => None,
-            };
-        }
     }
     match (projection, batch_size) {
         (GateUp, 384..) => {
@@ -26134,8 +26091,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        if mq4v2_gfx11_mmq_screen_enabled()
-            && !self.replay.is_recording()
+        if !self.replay.is_recording()
             && !self.graphs.capture_mode
             && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
             && batch_size >= 128
@@ -26624,8 +26580,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        if mq4v2_gfx11_mmq_screen_enabled()
-            && !self.replay.is_recording()
+        if !self.replay.is_recording()
             && !self.graphs.capture_mode
             && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
             && batch_size >= 128
@@ -27260,8 +27215,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        if mq4v2_gfx11_mmq_screen_enabled()
-            && !self.replay.is_recording()
+        if !self.replay.is_recording()
             && !self.graphs.capture_mode
             && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
             && batch_size >= 128
@@ -27284,7 +27238,7 @@ impl Gpu {
                     a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size, waves,
                 );
             }
-            if let Some(waves) = mqv2_screen_mw_waves(
+            if let Some(waves) = mqv2_mw_waves(
                 self.arch.as_str(),
                 4,
                 MqV2PrefillProjection::GateUp,
@@ -27846,8 +27800,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        if mq4v2_gfx11_mmq_screen_enabled()
-            && !self.replay.is_recording()
+        if !self.replay.is_recording()
             && !self.graphs.capture_mode
             && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
             && batch_size >= 128
@@ -27873,7 +27826,7 @@ impl Gpu {
                     );
                 }
             }
-            if let Some(waves) = mqv2_screen_mw_waves(
+            if let Some(waves) = mqv2_mw_waves(
                 self.arch.as_str(),
                 4,
                 MqV2PrefillProjection::Residual,
@@ -28870,7 +28823,7 @@ impl Gpu {
         if self.replay.is_recording() || self.graphs.capture_mode {
             return Ok(false);
         }
-        if let Some(waves) = mqv2_screen_mw_waves(
+        if let Some(waves) = mqv2_mw_waves(
             self.arch.as_str(),
             bits,
             MqV2PrefillProjection::GateUp,
@@ -28911,7 +28864,7 @@ impl Gpu {
         if self.replay.is_recording() || self.graphs.capture_mode {
             return Ok(false);
         }
-        if let Some(waves) = mqv2_screen_mw_waves(
+        if let Some(waves) = mqv2_mw_waves(
             self.arch.as_str(),
             bits,
             MqV2PrefillProjection::Residual,
