@@ -4,22 +4,25 @@
 //! MQ{2,3,5,6}V2 generic gfx11 BT weight-reuse raw-bit parity.
 //!
 //! For bits ∈ {2,3,5,6} and ops {qkvza,qkv,gate_up,residual}, compare the
-//! direct generic candidate launchers
-//!   `gemm_qkvza_mqv2_wmma_gfx11_bt4`,
-//!   `gemm_qkv_mqv2_wmma_gfx11_bt4`,
-//!   `gemm_gate_up_mqv2_wmma_gfx11_bt12`,
-//!   `gemm_mqv2_residual_wmma_gfx11_bt4`
+//! dynamic generic candidate launchers
+//!   `gemm_qkvza_mqv2_wmma_gfx11_bt(bits, batch_tile, …)`,
+//!   `gemm_qkv_mqv2_wmma_gfx11_bt(bits, batch_tile, …)`,
+//!   `gemm_gate_up_mqv2_wmma_gfx11_bt(bits, batch_tile, …)`,
+//!   `gemm_mqv2_residual_wmma_gfx11_bt(bits, batch_tile, …)`
 //! against the exact per-format base entrypoints
 //!   `gemm_*_mq{bits}g256v2_wmma_gfx11`.
 //!
-//! Synthetic V2 writer: group_bytes = 8 + 32*bits, deliberately disjoint dual
-//! FP16 header halves (half0 ∈ [-1,1], half1 ∈ [96,160]), codes packed
-//! contiguously LSB-first across the payload. Deterministic nondegenerate F32
-//! X, tail/projection boundary sizes, K=512, N∈{128,256}. Residual arms start
-//! from identical nonzero Y. Base path forced via capture_mode (no candidate
-//! env). Exact gfx1100 or gfx1151 only; other arches SKIP cleanly.
+//! BT matrix (every listed symbol gets ≥1 raw-bit arm at N∈{128,256}):
+//!   - bits2 research-only: QKVZA/QKV BT4, gate BT12, residual BT4
+//!   - bits{3,5,6}: QKVZA/QKV BT4/BT12, gate BT6/BT12, residual BT4/BT6/BT8
+//! Exact gfx1100 skips bits3 entirely (gfx1151 covers MQ3). Base path forced
+//! via capture_mode (no candidate env). Synthetic V2 writer: group_bytes =
+//! 8 + 32*bits, deliberately disjoint dual FP16 header halves (half0 ∈ [-1,1],
+//! half1 ∈ [96,160]), codes packed contiguously LSB-first. Deterministic
+//! nondegenerate F32 X, tail/projection boundary sizes, K=512. Residual arms
+//! start from identical nonzero Y. Other arches SKIP cleanly.
 //!
-//! 32 raw-bit comparisons: 4 bits × 4 ops × 2 N. Exit 0 PASS / 1 FAIL.
+//! Exit 0 PASS / 1 FAIL.
 
 use rdna_compute::kv_slots::half_from_f32;
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -223,7 +226,7 @@ fn variance(v: &[f32]) -> f64 {
     v.iter().map(|x| (*x as f64 - mean).powi(2)).sum::<f64>() / v.len() as f64
 }
 
-fn check_raw_bits(label: &str, bits: u8, n: usize, got: &[f32], want: &[f32]) -> bool {
+fn check_raw_bits(label: &str, bits: u8, bt: usize, n: usize, got: &[f32], want: &[f32]) -> bool {
     let finite = is_finite(got) && is_finite(want);
     let var_got = variance(got);
     let var_want = variance(want);
@@ -244,7 +247,7 @@ fn check_raw_bits(label: &str, bits: u8, n: usize, got: &[f32], want: &[f32]) ->
             .count()
     };
     eprintln!(
-        "  [bits={bits} {label} N={n}] bitEq={bit_eq} mism={mism} finite={finite} nondeg={nondeg} (var {var_got:.3e}/{var_want:.3e}) [{status}]"
+        "  [bits={bits} {label} BT{bt} N={n}] bitEq={bit_eq} mism={mism} finite={finite} nondeg={nondeg} (var {var_got:.3e}/{var_want:.3e}) [{status}]"
     );
     ok
 }
@@ -439,7 +442,7 @@ fn launch_base_residual(
     r.map_err(|e| format!("{e:?}"))
 }
 
-fn run_qkvza(gpu: &mut Gpu, bits: u8, n: usize, x_host: &[f32]) -> bool {
+fn run_qkvza(gpu: &mut Gpu, bits: u8, batch_tile: usize, n: usize, x_host: &[f32]) -> bool {
     let gb = group_bytes(bits);
     let w_qkv = build_disjoint_halves_seeded(QKVZA_QKV_M, K, 0x1111_2222 ^ (bits as u32) << 16);
     let w_z = build_disjoint_halves_seeded(QKVZA_Z_M, K, 0x3333_4444 ^ (bits as u32) << 16);
@@ -492,7 +495,7 @@ fn run_qkvza(gpu: &mut Gpu, bits: u8, n: usize, x_host: &[f32]) -> bool {
             n,
         )
     }) {
-        eprintln!("  [bits={bits} qkvza N={n}] base launch FAIL: {e}");
+        eprintln!("  [bits={bits} qkvza BT{batch_tile} N={n}] base launch FAIL: {e}");
         return false;
     }
     gpu.hip.device_synchronize().unwrap();
@@ -505,8 +508,9 @@ fn run_qkvza(gpu: &mut Gpu, bits: u8, n: usize, x_host: &[f32]) -> bool {
         t
     });
     gpu.hip.device_synchronize().unwrap();
-    if let Err(e) = gpu.gemm_qkvza_mqv2_wmma_gfx11_bt4(
+    if let Err(e) = gpu.gemm_qkvza_mqv2_wmma_gfx11_bt(
         bits,
+        batch_tile,
         &d_qkv,
         &d_z,
         &d_beta,
@@ -523,7 +527,7 @@ fn run_qkvza(gpu: &mut Gpu, bits: u8, n: usize, x_host: &[f32]) -> bool {
         K,
         n,
     ) {
-        eprintln!("  [bits={bits} qkvza N={n}] candidate launch FAIL: {e:?}");
+        eprintln!("  [bits={bits} qkvza BT{batch_tile} N={n}] candidate launch FAIL: {e:?}");
         return false;
     }
     gpu.hip.device_synchronize().unwrap();
@@ -538,19 +542,19 @@ fn run_qkvza(gpu: &mut Gpu, bits: u8, n: usize, x_host: &[f32]) -> bool {
             .count();
         if cnt != 0 {
             eprintln!(
-                "  [bits={bits} {} N={n}] {cnt} sentinel(s) remain",
+                "  [bits={bits} {} BT{batch_tile} N={n}] {cnt} sentinel(s) remain",
                 labels[i]
             );
             ok = false;
         }
-        if !check_raw_bits(labels[i], bits, n, &y_bt[i], &y_ref[i]) {
+        if !check_raw_bits(labels[i], bits, batch_tile, n, &y_bt[i], &y_ref[i]) {
             ok = false;
         }
     }
     ok
 }
 
-fn run_qkv(gpu: &mut Gpu, bits: u8, n: usize, x_host: &[f32]) -> bool {
+fn run_qkv(gpu: &mut Gpu, bits: u8, batch_tile: usize, n: usize, x_host: &[f32]) -> bool {
     let gb = group_bytes(bits);
     let w_q = build_disjoint_halves_seeded(QKV_Q_M, K, 0xA111_2222 ^ (bits as u32) << 8);
     let w_k = build_disjoint_halves_seeded(QKV_K_M, K, 0xA333_4444 ^ (bits as u32) << 8);
@@ -592,7 +596,7 @@ fn run_qkv(gpu: &mut Gpu, bits: u8, n: usize, x_host: &[f32]) -> bool {
             n,
         )
     }) {
-        eprintln!("  [bits={bits} qkv N={n}] base launch FAIL: {e}");
+        eprintln!("  [bits={bits} qkv BT{batch_tile} N={n}] base launch FAIL: {e}");
         return false;
     }
     gpu.hip.device_synchronize().unwrap();
@@ -605,11 +609,11 @@ fn run_qkv(gpu: &mut Gpu, bits: u8, n: usize, x_host: &[f32]) -> bool {
         t
     });
     gpu.hip.device_synchronize().unwrap();
-    if let Err(e) = gpu.gemm_qkv_mqv2_wmma_gfx11_bt4(
-        bits, &d_q, &d_k, &d_v, &d_x, &d_y_bt[0], &d_y_bt[1], &d_y_bt[2], QKV_Q_M, QKV_K_M,
-        QKV_V_M, K, n,
+    if let Err(e) = gpu.gemm_qkv_mqv2_wmma_gfx11_bt(
+        bits, batch_tile, &d_q, &d_k, &d_v, &d_x, &d_y_bt[0], &d_y_bt[1], &d_y_bt[2], QKV_Q_M,
+        QKV_K_M, QKV_V_M, K, n,
     ) {
-        eprintln!("  [bits={bits} qkv N={n}] candidate launch FAIL: {e:?}");
+        eprintln!("  [bits={bits} qkv BT{batch_tile} N={n}] candidate launch FAIL: {e:?}");
         return false;
     }
     gpu.hip.device_synchronize().unwrap();
@@ -624,19 +628,19 @@ fn run_qkv(gpu: &mut Gpu, bits: u8, n: usize, x_host: &[f32]) -> bool {
             .count();
         if cnt != 0 {
             eprintln!(
-                "  [bits={bits} {} N={n}] {cnt} sentinel(s) remain",
+                "  [bits={bits} {} BT{batch_tile} N={n}] {cnt} sentinel(s) remain",
                 labels[i]
             );
             ok = false;
         }
-        if !check_raw_bits(labels[i], bits, n, &y_bt[i], &y_ref[i]) {
+        if !check_raw_bits(labels[i], bits, batch_tile, n, &y_bt[i], &y_ref[i]) {
             ok = false;
         }
     }
     ok
 }
 
-fn run_gate_up(gpu: &mut Gpu, bits: u8, n: usize, x_host: &[f32]) -> bool {
+fn run_gate_up(gpu: &mut Gpu, bits: u8, batch_tile: usize, n: usize, x_host: &[f32]) -> bool {
     let gb = group_bytes(bits);
     let w_gate = build_disjoint_halves_seeded(GATE_M, K, 0xB111_2222 ^ (bits as u32) << 4);
     let w_up = build_disjoint_halves_seeded(UP_M, K, 0xB333_4444 ^ (bits as u32) << 4);
@@ -659,7 +663,7 @@ fn run_gate_up(gpu: &mut Gpu, bits: u8, n: usize, x_host: &[f32]) -> bool {
     if let Err(e) = with_base_path(gpu, |gpu| {
         launch_base_gate_up(gpu, bits, &d_gate, &d_up, &d_x, &d_yg_ref, &d_yu_ref, n)
     }) {
-        eprintln!("  [bits={bits} gate_up N={n}] base launch FAIL: {e}");
+        eprintln!("  [bits={bits} gate_up BT{batch_tile} N={n}] base launch FAIL: {e}");
         return false;
     }
     gpu.hip.device_synchronize().unwrap();
@@ -671,10 +675,10 @@ fn run_gate_up(gpu: &mut Gpu, bits: u8, n: usize, x_host: &[f32]) -> bool {
     fill_f32(gpu, &d_yg_bt, n * GATE_M, sen_g);
     fill_f32(gpu, &d_yu_bt, n * UP_M, sen_u);
     gpu.hip.device_synchronize().unwrap();
-    if let Err(e) = gpu.gemm_gate_up_mqv2_wmma_gfx11_bt12(
-        bits, &d_gate, &d_up, &d_x, &d_yg_bt, &d_yu_bt, GATE_M, UP_M, K, n,
+    if let Err(e) = gpu.gemm_gate_up_mqv2_wmma_gfx11_bt(
+        bits, batch_tile, &d_gate, &d_up, &d_x, &d_yg_bt, &d_yu_bt, GATE_M, UP_M, K, n,
     ) {
-        eprintln!("  [bits={bits} gate_up N={n}] candidate launch FAIL: {e:?}");
+        eprintln!("  [bits={bits} gate_up BT{batch_tile} N={n}] candidate launch FAIL: {e:?}");
         return false;
     }
     gpu.hip.device_synchronize().unwrap();
@@ -688,17 +692,17 @@ fn run_gate_up(gpu: &mut Gpu, bits: u8, n: usize, x_host: &[f32]) -> bool {
     ] {
         let cnt = got.iter().filter(|x| x.to_bits() == sen.to_bits()).count();
         if cnt != 0 {
-            eprintln!("  [bits={bits} {lab} N={n}] {cnt} sentinel(s) remain");
+            eprintln!("  [bits={bits} {lab} BT{batch_tile} N={n}] {cnt} sentinel(s) remain");
             ok = false;
         }
-        if !check_raw_bits(lab, bits, n, got, want) {
+        if !check_raw_bits(lab, bits, batch_tile, n, got, want) {
             ok = false;
         }
     }
     ok
 }
 
-fn run_residual(gpu: &mut Gpu, bits: u8, n: usize, x_host: &[f32]) -> bool {
+fn run_residual(gpu: &mut Gpu, bits: u8, batch_tile: usize, n: usize, x_host: &[f32]) -> bool {
     let gb = group_bytes(bits);
     let w = build_disjoint_halves_seeded(RESID_M, K, 0xC0DE_F00D ^ (bits as u32));
     let blob = pack_mqv2(bits, &w, RESID_M, K);
@@ -721,13 +725,13 @@ fn run_residual(gpu: &mut Gpu, bits: u8, n: usize, x_host: &[f32]) -> bool {
     if let Err(e) = with_base_path(gpu, |gpu| {
         launch_base_residual(gpu, bits, &d_a, &d_x, &d_y_ref, n)
     }) {
-        eprintln!("  [bits={bits} residual N={n}] base launch FAIL: {e}");
+        eprintln!("  [bits={bits} residual BT{batch_tile} N={n}] base launch FAIL: {e}");
         return false;
     }
     gpu.hip.device_synchronize().unwrap();
     let y_ref = gpu.download_f32(&d_y_ref).expect("dl ref");
     if y_ref.iter().any(|x| x.to_bits() == sen.to_bits()) {
-        eprintln!("  [bits={bits} residual N={n}] base left sentinel");
+        eprintln!("  [bits={bits} residual BT{batch_tile} N={n}] base left sentinel");
         return false;
     }
 
@@ -735,9 +739,10 @@ fn run_residual(gpu: &mut Gpu, bits: u8, n: usize, x_host: &[f32]) -> bool {
     fill_f32(gpu, &d_y_bt, n * RESID_M, sen);
     htod_f32(gpu, &d_y_bt, &y_init);
     gpu.hip.device_synchronize().unwrap();
-    if let Err(e) = gpu.gemm_mqv2_residual_wmma_gfx11_bt4(bits, &d_a, &d_x, &d_y_bt, RESID_M, K, n)
+    if let Err(e) =
+        gpu.gemm_mqv2_residual_wmma_gfx11_bt(bits, batch_tile, &d_a, &d_x, &d_y_bt, RESID_M, K, n)
     {
-        eprintln!("  [bits={bits} residual N={n}] candidate launch FAIL: {e:?}");
+        eprintln!("  [bits={bits} residual BT{batch_tile} N={n}] candidate launch FAIL: {e:?}");
         return false;
     }
     gpu.hip.device_synchronize().unwrap();
@@ -745,13 +750,53 @@ fn run_residual(gpu: &mut Gpu, bits: u8, n: usize, x_host: &[f32]) -> bool {
     let cnt = y_bt.iter().filter(|x| x.to_bits() == sen.to_bits()).count();
     let mut ok = true;
     if cnt != 0 {
-        eprintln!("  [bits={bits} residual N={n}] {cnt} sentinel(s) remain");
+        eprintln!("  [bits={bits} residual BT{batch_tile} N={n}] {cnt} sentinel(s) remain");
         ok = false;
     }
-    if !check_raw_bits("residual", bits, n, &y_bt, &y_ref) {
+    if !check_raw_bits("residual", bits, batch_tile, n, &y_bt, &y_ref) {
         ok = false;
     }
     ok
+}
+
+fn qkvza_bts(bits: u8) -> &'static [usize] {
+    match bits {
+        2 => &[4],
+        _ => &[4, 12],
+    }
+}
+
+fn qkv_bts(bits: u8) -> &'static [usize] {
+    match bits {
+        2 => &[4],
+        _ => &[4, 12],
+    }
+}
+
+fn gate_bts(bits: u8) -> &'static [usize] {
+    match bits {
+        2 => &[12],
+        _ => &[6, 12],
+    }
+}
+
+fn residual_bts(bits: u8) -> &'static [usize] {
+    match bits {
+        2 => &[4],
+        _ => &[4, 6, 8],
+    }
+}
+
+fn expected_arms(include_bits3: bool) -> usize {
+    // Per N: sum of BT variants across ops; ×2 N values.
+    // bits2: 1+1+1+1 = 4 BTs → 8 arms
+    // bits{3,5,6}: 2+2+2+3 = 9 BTs → 18 arms each
+    let mut n = 8; // bits2
+    if include_bits3 {
+        n += 18;
+    }
+    n += 18 * 2; // bits5 + bits6
+    n
 }
 
 fn main() {
@@ -765,15 +810,23 @@ fn main() {
     };
 
     let arch = gpu.arch.clone();
-    let is_gfx11 = (gpu.arch_caps.is_gfx1100() && arch == "gfx1100")
-        || (gpu.arch_caps.is_gfx1151() && arch == "gfx1151");
-    if !is_gfx11 {
+    let is_gfx1100 = gpu.arch_caps.is_gfx1100() && arch == "gfx1100";
+    let is_gfx1151 = gpu.arch_caps.is_gfx1151() && arch == "gfx1151";
+    if !is_gfx1100 && !is_gfx1151 {
         eprintln!("SKIP: arch {arch} is not exact gfx1100 or gfx1151");
         return;
     }
-    eprintln!("arch {arch} confirmed — MQ{{2,3,5,6}}V2 gfx11 BT raw-bit parity");
+    // Exact gfx1100 forbids MQ3 runtime; gfx1151 covers bits3.
+    let include_bits3 = is_gfx1151;
+    eprintln!("arch {arch} confirmed — MQ{{2,3,5,6}}V2 gfx11 multi-BT raw-bit parity");
+    if is_gfx1100 {
+        eprintln!("gfx1100: skipping bits3 (MQ3) — covered on gfx1151 only");
+    }
     eprintln!(
         "shapes: qkvza=({QKVZA_QKV_M},{QKVZA_Z_M},{QKVZA_BETA_M},{QKVZA_ALPHA_M}) qkv=({QKV_Q_M},{QKV_K_M},{QKV_V_M}) gate_up=({GATE_M},{UP_M}) residual={RESID_M} K={K} N={{128,256}}"
+    );
+    eprintln!(
+        "BT matrix: bits2 QKVZA/QKV BT4 gate BT12 residual BT4; bits{{3,5,6}} QKVZA/QKV BT4/12 gate BT6/12 residual BT4/6/8"
     );
     assert_eq!(
         (QKVZA_QKV_M + QKVZA_Z_M + QKVZA_BETA_M + QKVZA_ALPHA_M) % 16,
@@ -790,8 +843,13 @@ fn main() {
 
     let mut all_ok = true;
     let mut arms = 0usize;
+    let want_arms = expected_arms(include_bits3);
 
     for &bits in &BITS {
+        if bits == 3 && !include_bits3 {
+            eprintln!("\n======== bits=3 SKIPPED on {arch} ========");
+            continue;
+        }
         eprintln!(
             "\n======== bits={bits} group_bytes={} ========",
             group_bytes(bits)
@@ -802,44 +860,55 @@ fn main() {
                 .map(|i| prng(i, 0xC0FF_EE00 ^ ((bits as u32) << 20) ^ (n as u32)) * 2.0 - 1.0)
                 .collect();
 
-            let ok_qkvza = run_qkvza(&mut gpu, bits, n, &x_host);
-            arms += 1;
-            eprintln!(
-                "  ARM bits={bits} qkvza N={n}: {}",
-                if ok_qkvza { "PASS" } else { "FAIL" }
-            );
-            all_ok &= ok_qkvza;
+            for &bt in qkvza_bts(bits) {
+                let ok = run_qkvza(&mut gpu, bits, bt, n, &x_host);
+                arms += 1;
+                eprintln!(
+                    "  ARM bits={bits} qkvza BT{bt} N={n}: {}",
+                    if ok { "PASS" } else { "FAIL" }
+                );
+                all_ok &= ok;
+            }
 
-            let ok_qkv = run_qkv(&mut gpu, bits, n, &x_host);
-            arms += 1;
-            eprintln!(
-                "  ARM bits={bits} qkv N={n}: {}",
-                if ok_qkv { "PASS" } else { "FAIL" }
-            );
-            all_ok &= ok_qkv;
+            for &bt in qkv_bts(bits) {
+                let ok = run_qkv(&mut gpu, bits, bt, n, &x_host);
+                arms += 1;
+                eprintln!(
+                    "  ARM bits={bits} qkv BT{bt} N={n}: {}",
+                    if ok { "PASS" } else { "FAIL" }
+                );
+                all_ok &= ok;
+            }
 
-            let ok_gu = run_gate_up(&mut gpu, bits, n, &x_host);
-            arms += 1;
-            eprintln!(
-                "  ARM bits={bits} gate_up N={n}: {}",
-                if ok_gu { "PASS" } else { "FAIL" }
-            );
-            all_ok &= ok_gu;
+            for &bt in gate_bts(bits) {
+                let ok = run_gate_up(&mut gpu, bits, bt, n, &x_host);
+                arms += 1;
+                eprintln!(
+                    "  ARM bits={bits} gate_up BT{bt} N={n}: {}",
+                    if ok { "PASS" } else { "FAIL" }
+                );
+                all_ok &= ok;
+            }
 
-            let ok_res = run_residual(&mut gpu, bits, n, &x_host);
-            arms += 1;
-            eprintln!(
-                "  ARM bits={bits} residual N={n}: {}",
-                if ok_res { "PASS" } else { "FAIL" }
-            );
-            all_ok &= ok_res;
+            for &bt in residual_bts(bits) {
+                let ok = run_residual(&mut gpu, bits, bt, n, &x_host);
+                arms += 1;
+                eprintln!(
+                    "  ARM bits={bits} residual BT{bt} N={n}: {}",
+                    if ok { "PASS" } else { "FAIL" }
+                );
+                all_ok &= ok;
+            }
         }
     }
 
-    assert_eq!(arms, 32, "expected 4 bits × 4 ops × 2 N = 32 arms");
+    assert_eq!(
+        arms, want_arms,
+        "arm count mismatch (gfx1100=44 without bits3, gfx1151=62 with bits3)"
+    );
     if all_ok {
         eprintln!(
-            "\nPASS: all {arms} arms (bits{{2,3,5,6}} × ops{{qkvza,qkv,gate_up,residual}} × N{{128,256}}) raw f32::to_bits equal; finite/nondegenerate; residual Y+= preserved"
+            "\nPASS: all {arms} arms (bits multi-BT × ops{{qkvza,qkv,gate_up,residual}} × N{{128,256}}; bits3 only on gfx1151) raw f32::to_bits equal; finite/nondegenerate; residual Y+= preserved"
         );
     } else {
         eprintln!("\nFAIL: one or more of {arms} raw-bit parity arms failed");

@@ -456,6 +456,8 @@ gemm_mq##BITS##g256v2_residual_wmma_gfx11_bt##BV( \
 }
 
 // Instantiations: BITS ∈ {2,3,5,6}; QKVZA/QKV/residual BT4; gate_up BT12.
+// gfx1100 policy extras (bits 3/5/6 only — no MQ2 production variants):
+//   QKVZA/QKV BT12, gate_up BT6, residual BT6/BT8.
 GEN_QKVZA_BT(2, 4)
 GEN_QKVZA_BT(3, 4)
 GEN_QKVZA_BT(5, 4)
@@ -475,5 +477,26 @@ GEN_RESID_BT(2, 4)
 GEN_RESID_BT(3, 4)
 GEN_RESID_BT(5, 4)
 GEN_RESID_BT(6, 4)
+
+// gfx1100 policy tiles for MQ{3,5,6}V2 (mirror accepted MQ4 BT set).
+GEN_QKVZA_BT(3, 12)
+GEN_QKVZA_BT(5, 12)
+GEN_QKVZA_BT(6, 12)
+
+GEN_QKV_BT(3, 12)
+GEN_QKV_BT(5, 12)
+GEN_QKV_BT(6, 12)
+
+GEN_GATE_UP_BT(3, 6)
+GEN_GATE_UP_BT(5, 6)
+GEN_GATE_UP_BT(6, 6)
+
+GEN_RESID_BT(3, 6)
+GEN_RESID_BT(5, 6)
+GEN_RESID_BT(6, 6)
+
+GEN_RESID_BT(3, 8)
+GEN_RESID_BT(5, 8)
+GEN_RESID_BT(6, 8)
 
 #endif // __gfx1100__ || __gfx1151__
