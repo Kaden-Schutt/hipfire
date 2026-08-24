@@ -755,18 +755,15 @@ mod tests {
         assert_eq!(model.arch_id, Some(5));
         assert_eq!(model.quant.as_deref(), Some("mq4"));
         assert_eq!(model.default_kv_mode.as_deref(), Some("q8"));
-        // Content identity: the entry previously carried the MQ4R artifact's
-        // digest/size under the `.mq4` filename, and every other assertion in
-        // this test still passed. Pin sha256 + size_bytes so that swap cannot
-        // slip through again.
+        // Pin the canonical MQ4V2 body by content as well as filename: MQ4V2
+        // supersedes the former MQ4V1/MQ4R Qwen3.8 products.
         assert_eq!(
             model.sha256.as_deref(),
-            Some("d220334acc374548ad8582ba24d4ca5f7d94622d6f8c10268be75e5ee0aee4f6")
+            Some("5bb556a6cc84035234995c017c9791aa3951ad1eae4cf8c8172b0eaef399e507")
         );
-        assert_eq!(model.size_bytes, Some(15655791616));
+        assert_eq!(model.size_bytes, Some(15662615552));
 
-
-        for alias in ["qwen3.8", "qwen3.8:latest"] {
+        for alias in ["qwen3.8", "qwen3.8:latest", "qwen3.8:27b-mq4"] {
             let (resolved, _) = registry
                 .model(alias)
                 .unwrap_or_else(|| panic!("{alias} must resolve"));
@@ -776,36 +773,32 @@ mod tests {
             );
         }
 
-        // The speed SKU is a distinct entry on the MQ4R artifact, not an alias
-        // of the trunk.
+        // The speed tier is MQ4V2 XT. Both former `fast` tags migrate to it;
+        // the superseded `.mq4r` artifact is no longer in the registry.
         let (fast_tag, fast) = registry.model("qwen3.8:27b-fast").unwrap();
-        assert_eq!(fast_tag, "qwen3.8:27b-fast");
-        assert_eq!(fast.file, "qwen3.8-27b.mq4r");
+        assert_eq!(fast_tag, "qwen3.8:27b-mq4-xt");
+        assert_eq!(fast.file, "qwen3.8-27b.mq4-xt");
         assert_eq!(fast.arch_id, Some(5));
-        assert_eq!(fast.quant.as_deref(), Some("mq4r"));
+        assert_eq!(fast.quant.as_deref(), Some("mq4"));
         assert_eq!(fast.default_kv_mode.as_deref(), Some("q8"));
         assert_eq!(
             fast.sha256.as_deref(),
-            Some("61072980798ac1d3325020a63171d1a9cf99103eaa5bb1675a37845ea7d7762e")
+            Some("9f91556f7e0431a077d03756a7102d0154108757289e6e5fe9a2d204c0c9eeb7")
         );
         assert_eq!(fast.size_bytes, Some(14980361216));
         assert_ne!(
-            fast.file, model.file,
-            "the two SKUs are different artifacts"
-        );
-        assert_ne!(
             fast.sha256, model.sha256,
-            "the two SKUs must not share a content digest"
+            "the two tiers must not share a content digest"
         );
 
-        let (fast_alias, _) = registry
-            .model("qwen3.8:fast")
-            .expect("qwen3.8:fast must resolve");
-        assert_eq!(
-            fast_alias, "qwen3.8:27b-fast",
-            "qwen3.8:fast resolves to the speed SKU"
+        for alias in ["qwen3.8:fast", "qwen3.8:27b-fast"] {
+            let (resolved, _) = registry.model(alias).expect("fast alias must resolve");
+            assert_eq!(resolved, "qwen3.8:27b-mq4-xt");
+        }
+        assert!(
+            registry.model("qwen3.8-27b.mq4r").is_none(),
+            "superseded MQ4R filename must not remain addressable"
         );
-
 
         let settings = model
             .recommended_settings
@@ -942,8 +935,11 @@ mod tests {
             "qwen3.6:35b-a3b-mq4r"
         );
         assert_eq!(registry.resolve_tag("qwen3.8-27b.mq4"), "qwen3.8:27b");
-        assert_eq!(registry.resolve_tag("qwen3.8-27b.mq4r"), "qwen3.8:27b-fast");
-        assert_eq!(registry.resolve_tag("qwen3.8:fast"), "qwen3.8:27b-fast");
+        assert_eq!(
+            registry.resolve_tag("qwen3.8-27b.mq4-xt"),
+            "qwen3.8:27b-mq4-xt"
+        );
+        assert_eq!(registry.resolve_tag("qwen3.8:fast"), "qwen3.8:27b-mq4-xt");
 
         assert_eq!(registry.resolve_tag("deepseek4"), "deepseek-v4-flash");
         assert_eq!(registry.resolve_tag("deepseek4:0731"), "deepseek-v4-flash");

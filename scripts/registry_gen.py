@@ -225,11 +225,11 @@ def arch_id_for(tag: str, entry: dict) -> int | None:
 def quant_for(file: str) -> str | None:
     # DFlash drafts encode their quant in the stem: qwen35-9b-dflash-mq4.hfq
     m = re.search(r"[-.](mq\d)\.hfq$", file)
-    if m:
+    if m and m.group(1) in KNOWN_QUANTS:
         return m.group(1)
     # Product ladder files: model.mq4 / model.mq4-xt / model.mq4-pro → quant mq4
     m = re.search(r"\.(mq\d)(?:-(?:xt|pro))?$", file)
-    if m:
+    if m and m.group(1) in KNOWN_QUANTS:
         return m.group(1)
     ext = file.rsplit(".", 1)[-1]
     if ext in KNOWN_QUANTS:

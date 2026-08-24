@@ -3,7 +3,7 @@
 **Owner:** registry-backed model surface (`docs/INDEX.md`).
 **Machine sources:** curated `registry/models.json`; generated and bundled
 `registry/v1.json` (loaded by `hipfire-registry`).
-**Last checked:** 2026-08-05 against `ds4-beta-staging`.
+**Last checked:** 2026-08-24 against the published Qwen3.8 MQ V2 ladder.
 
 This page projects **registry availability**: tags, default artifact filenames, declared download size, and declared VRAM floor. It is **not** a product admission table and **not** a guarantee that every GPU/route runs every tag.
 

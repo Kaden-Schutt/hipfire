@@ -117,7 +117,7 @@ OpenAI-compatible client.
 
 ## Curated model registry
 
-The registry currently contains 61 pullable model entries. Run
+The registry currently contains 77 pullable model entries. Run
 `hipfire list -r` to see the authoritative live list.
 
 | Registry family | Pull tags and variants |
@@ -126,7 +126,7 @@ The registry currently contains 61 pullable model entries. Run
 | Qwen 3.5 MoE | `qwen3.5:35b-a3b` |
 | Qwen 3.6 dense | `qwen3.6:27b`, `qwen3.6:27b-mq3`, `qwen3.6:27b-draft`, `qwen3.6:27b-draft-mq3` |
 | Qwen 3.6 35B-A3B | `qwen3.6:35b-a3b` (MQ4P default), `qwen3.6:35b-a3b-mq2`, `qwen3.6:35b-a3b-mq3p`, `qwen3.6:35b-a3b-mq4p`, `qwen3.6:35b-a3b-mfp4`, `qwen3.6:35b-a3b-mq4r`, `qwen3.6:35b-a3b-mq5`, `qwen3.6:35b-a3b-mq6` |
-| Qwen 3.8 dense | `qwen3.8:27b` (MQ4 quality trunk, default), `qwen3.8:27b-fast` (MQ4R speed SKU) |
+| Qwen 3.8 dense | MQ V2 ladder: `qwen3.8:27b-mq3-xt`, `qwen3.8:27b-mq3`, `qwen3.8:27b-mq3-pro`; `qwen3.8:27b-mq4-xt`, `qwen3.8:27b` (MQ4V2 default), `qwen3.8:27b-mq4-pro`; corresponding MQ5 and MQ6 `-xt` / base / `-pro` tags; drafts `qwen3.8:27b-draft-mq3` through `-mq6` (MQ4 recommended) |
 | Muse Glimmer | `muse-glimmer` (MQ4 quality trunk), `muse-glimmer:fast` (MQ4R speed SKU), `muse-glimmer:draft` |
 | DeepSeek V4 Flash | `deepseek-v4-flash` |
 | MiniMax-M2.7 | `minimax-m2.7` |
