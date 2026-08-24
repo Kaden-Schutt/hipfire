@@ -115,3 +115,7 @@ required-features = ["lab"]
 [[example]]
 name = "ep_dspark_topology_probe"
 required-features = ["lab"]
+
+[[example]]
+name = "expert_policy_sim"
+required-features = ["lab"]
